@@ -216,7 +216,7 @@ echo "heimdall-fallback harness"
 # rank-2 local-CLI entry. ───────────────────────────────────────────────────
 R="$(fresh_repo)"
 write_cfg "$R" '{"tos_flagged_providers": ["aihorde"]}'
-fb --repo "$R" arm --state on >/dev/null
+fb --repo "$R" arm >/dev/null
 picked="$(sed -n 's/.*"target_provider": "\([^"]*\)".*/\1/p' "$(cfg_path "$R")")"
 case "$picked" in
   aihorde)
@@ -263,7 +263,7 @@ echo "$out" | grep -Eq 'state:[[:space:]]+off' \
   || bad "2b. got: $out"
 
 R="$(fresh_repo)"
-write_cfg "$R" '{"state": "on", "mitm_enabled": true, "operator_key_env": "X", "target_provider": "y", "endpoint": "http://127.0.0.1:20128"}'
+write_cfg "$R" '{"state": "auto", "mitm_enabled": true, "operator_key_env": "X", "target_provider": "y", "endpoint": "http://127.0.0.1:20128"}'
 out="$(fb --repo "$R" status)"
 echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "forbidden" \
   && ok "2c. well-formed JSON but carries a forbidden MITM key -> forced back to off, never on" \
@@ -277,7 +277,7 @@ echo "$out" | grep -Eq 'state:[[:space:]]+off' \
   || bad "2d. got: $out"
 
 R="$(fresh_repo)"
-write_cfg "$R" '{"state": "on", "mitm_enabled": true}'
+write_cfg "$R" '{"state": "auto", "mitm_enabled": true}'
 fb --repo "$R" check >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ] && ok "2e. corrupt+MITM-tainted config -> check never exits 0 (never ROUTE)" \
   || bad "2e. check exited 0 (ROUTE) on a corrupt config! rc=$rc"
@@ -287,7 +287,7 @@ R="$(fresh_repo)"
 export HMD_FB_TEST_KEY="fake-operator-key-value"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "HMD_FB_TEST_KEY",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$TIER1_CLAUDE_DB"'",
@@ -303,7 +303,7 @@ unset ANTHROPIC_MODEL
   || bad "3. rc=$rc out='$out'"
 unset HMD_FB_TEST_KEY
 
-# ── 4. auto + failing preflight -> WAIT, not ROUTE; same failure under on -> REFUSE ─
+# ── 4. auto + failing preflight -> WAIT, not ROUTE; same failure under switch -> REFUSE ─
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
 out="$(fb --repo "$R" check)"; rc=$?
@@ -312,10 +312,10 @@ out="$(fb --repo "$R" check)"; rc=$?
   || bad "4a. rc=$rc out='$out'"
 
 R2="$(fresh_repo)"
-write_cfg "$R2" '{"state": "on"}'
+write_cfg "$R2" '{"state": "switch"}'
 out2="$(fb --repo "$R2" check)"; rc2=$?
 [ "$rc2" -eq 1 ] && echo "$out2" | grep -q "VERDICT: REFUSE" \
-  && ok "4b. identical failing preflight but state=on -> REFUSE, not WAIT (state changes the verdict, not the checks)" \
+  && ok "4b. identical failing preflight but state=switch -> REFUSE, not WAIT (state changes the verdict, not the checks)" \
   || bad "4b. rc=$rc2 out='$out2'"
 
 # ── 5. no subcommand's output ever contains the secret VALUE ────────────────
@@ -330,7 +330,7 @@ write_cfg "$R" '{
   "target_provider": "self-hosted-mixtral"
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-combined="$(fb --repo "$R" status 2>&1; fb --repo "$R" status --json 2>&1; fb --repo "$R" check 2>&1; fb --repo "$R" where 2>&1; fb --repo "$R" set on 2>&1; fb --repo "$R" set auto 2>&1; fb --repo "$R" set off 2>&1)"
+combined="$(fb --repo "$R" status 2>&1; fb --repo "$R" status --json 2>&1; fb --repo "$R" check 2>&1; fb --repo "$R" where 2>&1; fb --repo "$R" set switch 2>&1; fb --repo "$R" set auto 2>&1; fb --repo "$R" set off 2>&1)"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 if printf '%s' "$combined" | grep -qF -- "$SECRET"; then
   bad "5. SECRET VALUE LEAKED into subcommand output"
@@ -345,13 +345,19 @@ out="$(fb --repo "$R" where)"
 [ "$out" = "$(cfg_path "$R")" ] && ok "6. where prints the exact expected config path" \
   || bad "6. got '$out', want '$(cfg_path "$R")'"
 
-# ── 7. set persists across separate process invocations ─────────────────────
+# ── 7. set rejects the removed 'on' value outright -- never persists it, and
+# a pre-existing on-disk state is left untouched by the rejected attempt
+# (owner directive: 'on' is gone, only off/auto/switch survive) ────────────
 R="$(fresh_repo)"
-fb --repo "$R" set on >/dev/null
-out="$(fb --repo "$R" status)"
-echo "$out" | grep -Eq 'state:[[:space:]]+on' \
-  && ok "7. set on persists to disk and is read back by a fresh invocation" \
-  || bad "7. got: $out"
+fb --repo "$R" set auto >/dev/null
+before="$(cat "$(cfg_path "$R")")"
+out="$(fb --repo "$R" set on 2>&1)"; rc=$?
+after="$(cat "$(cfg_path "$R")")"
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "invalid choice: 'on'" \
+  && printf '%s' "$out" | grep -qF "'off', 'auto', 'switch'" \
+  && [ "$before" = "$after" ] \
+  && ok "7. set on is rejected outright (never-fail-caller, names all three surviving states) and never touches the existing on-disk state" \
+  || bad "7. rc=$rc out='$out' before='$before' after='$after'"
 
 # ── 8. set rejects an invalid value; never breaks the caller unless --strict ─
 R="$(fresh_repo)"
@@ -432,7 +438,7 @@ R="$(fresh_repo)"
 export HMD_FB_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "HMD_FB_TEST_KEY",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
@@ -592,7 +598,21 @@ echo "$out" | grep -q "OK.*no_delegated_sidecar" \
   && ok "19c. no sidecar dir, clean DB -> no_delegated_sidecar PASSES" \
   || bad "19c. got: $out"
 
-# ── 20. NEW: state=on is a CAPABILITY-TIER decision -- haiku-tier task ROUTES ─
+# ── 20. NEW: a persisted state=on (removed; owner directive: only
+# off/auto/switch survive) migrates to off on load -- status surfaces the
+# corrected migration NOTE, and check against that SAME, otherwise
+# fully-passing config now REFUSEs: run_preflight's own "state" check hard-
+# fails whenever state=='off' (state != "off" is a required, independent
+# check -- not merely an input to _verdict()'s ROUTE/WAIT choice), so off can
+# never ROUTE under any circumstances, full stop. This makes the migration's
+# real cost concrete rather than hand-waved: old state=on was tier-blind and,
+# like switch, ROUTEd on a fully-passing preflight -- migrating that same
+# persisted value to off means it now hard-refuses until the operator
+# explicitly re-arms to auto or switch. That IS a real, deliberate loss of
+# automatic routing for anyone who had state=on persisted -- traded away on
+# purpose so migration never silently hands out MORE routing than the
+# operator had; off is the one surviving state that guarantees none at all.
+# ────────────────────────────────────────────────────────────────────────────
 R="$(fresh_repo)"
 export HMD_FB_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
@@ -603,62 +623,59 @@ write_cfg "$R" '{
   "omniroute_db_path": "'"$CLEAN_DB"'",
   "target_provider": "self-hosted-mixtral"
 }'
+out_status="$(fb --repo "$R" status)"
+echo "$out_status" | grep -Eq 'state:[[:space:]]+off' \
+  && echo "$out_status" | grep -qi "no longer exists" \
+  && echo "$out_status" | grep -qF "migrated to 'off'" \
+  && ok "20a. persisted state=on migrates to off on load, status surfaces the corrected migration NOTE" \
+  || bad "20a. got: $out_status"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-out="$(fb --repo "$R" check --tier haiku)"; rc=$?
+out="$(fb --repo "$R" check)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
+  && echo "$out" | grep -qF "state -- fallback state is 'off'" \
+  && ok "20b. that same migrated (now off) config REFUSEs even though every OTHER check would pass -- off is a hard disable (its state check fails on state=='off' alone), so on's prior tier-blind ROUTE is genuinely gone: fail-toward-less-egress made concrete, on purpose" \
+  || bad "20b. rc=$rc out='$out'"
+unset HMD_FB_TEST_KEY
+
+# ── 21. NEW: arm --state on is rejected outright too -- arm's OWN --state
+# flag only ever offered a 2-way choice (auto/switch, never off), so its
+# rejection names just those two, distinct from set's 3-way rejection above
+# (test 7). Complements test 7: both surfaces that used to accept 'on' are
+# now regression-tested for rejection. ──────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "switch", "target_provider": "aihorde"}'
+before="$(cat "$(cfg_path "$R")")"
+out="$(fb --repo "$R" arm --state on 2>&1)"; rc=$?
+after="$(cat "$(cfg_path "$R")")"
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "argument --state: invalid choice: 'on'" \
+  && printf '%s' "$out" | grep -qF "'auto', 'switch'" \
+  && [ "$before" = "$after" ] \
+  && ok "21. arm --state on is rejected outright too, naming only arm's own 2 valid choices (auto/switch -- arm never offered off even before this change), and leaves the existing on-disk config untouched" \
+  || bad "21. rc=$rc out='$out' before='$before' after='$after'"
+
+# ── 22. NEW: state=switch routes on a passing preflight alone -- there is no
+# tier axis left to be blind to (--tier itself is gone; see tests 25/28), so
+# this collapses from a tier loop to one direct assertion. ─────────────────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "switch",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
-  && ok "20. falsifier (a): state=on + --tier haiku + passing preflight -> ROUTE" \
-  || bad "20. rc=$rc out='$out'"
+  && ok "22. falsifier (c): state=switch + passing preflight -> ROUTE" \
+  || bad "22. rc=$rc out='$out'"
 unset HMD_FB_TEST_KEY
-
-# ── 21. NEW: state=on + sonnet-tier or adjudication task -> does NOT route ───
-for T in sonnet opus reviewer verifier security-auditor; do
-  R="$(fresh_repo)"
-  export HMD_FB_TEST_KEY="x"
-  export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
-  write_cfg "$R" '{
-    "state": "on",
-    "operator_key_env": "HMD_FB_TEST_KEY",
-    "endpoint": "http://127.0.0.1:20128",
-    "omniroute_db_path": "'"$CLEAN_DB"'",
-    "target_provider": "self-hosted-mixtral"
-  }'
-  export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-  out="$(fb --repo "$R" check --tier "$T")"; rc=$?
-  export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
-  unset ANTHROPIC_MODEL
-  [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "FAIL.*tier_eligible" \
-    && ok "21. falsifier (b): state=on + --tier $T + passing preflight -> REFUSE (not low-level)" \
-    || bad "21. tier=$T rc=$rc out='$out'"
-  unset HMD_FB_TEST_KEY
-done
-
-# ── 22. NEW: state=switch routes EVERYTHING, tier-blind, only if preflight passes ─
-for T in "" haiku sonnet opus reviewer; do
-  R="$(fresh_repo)"
-  export HMD_FB_TEST_KEY="x"
-  export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
-  write_cfg "$R" '{
-    "state": "switch",
-    "operator_key_env": "HMD_FB_TEST_KEY",
-    "endpoint": "http://127.0.0.1:20128",
-    "omniroute_db_path": "'"$CLEAN_DB"'",
-    "target_provider": "self-hosted-mixtral"
-  }'
-  export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-  if [ -n "$T" ]; then
-    out="$(fb --repo "$R" check --tier "$T")"; rc=$?
-  else
-    out="$(fb --repo "$R" check)"; rc=$?
-  fi
-  export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
-  unset ANTHROPIC_MODEL
-  [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
-    && ok "22. falsifier (c): state=switch + tier='$T' + passing preflight -> ROUTE (tier-blind)" \
-    || bad "22. tier='$T' rc=$rc out='$out'"
-  unset HMD_FB_TEST_KEY
-done
 
 # ── 23. NEW: state=switch NEVER bypasses safety -- failing Tier-1 -> REFUSE ──
 R="$(fresh_repo)"
@@ -673,13 +690,11 @@ write_cfg "$R" '{
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
-out_tier="$(fb --repo "$R" check --tier haiku)"; rc_tier=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "FAIL.*tier1_credential_absent" \
-  && [ "$rc_tier" -eq 1 ] && echo "$out_tier" | grep -q "VERDICT: REFUSE" \
   && ok "23. falsifier (d): state=switch + failing Tier-1 check -> still REFUSE (no state bypasses safety)" \
-  || bad "23. rc=$rc rc_tier=$rc_tier out='$out'"
+  || bad "23. rc=$rc out='$out'"
 unset HMD_FB_TEST_KEY
 
 # ── 24. NEW: falsifier (e): a corrupt or near-miss state string still reads off ─
@@ -705,25 +720,17 @@ echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "forbid
   && ok "24c. falsifier (e): state=switch + forbidden MITM key -> forced to off, check never ROUTEs" \
   || bad "24c. got: $out (check rc=$rc)"
 
-# ── 25. NEW: backward compat -- bare `check` (no --tier) under on stays tier-blind ─
+# ── 25. NEW: --tier is not just deprecated, it is GONE -- check --tier <any>
+# is rejected as an UNRECOGNIZED argument (deleted from check's argparse
+# subparser entirely, not merely given fewer valid values). Replaces the old
+# "on stays tier-blind for bin/lib/issue_loop.py's bare-check call shape"
+# test -- issue_loop.py never passed --tier either way (confirmed by a
+# repo-wide grep for real callers), so its call shape is untouched. ────────
 R="$(fresh_repo)"
-export HMD_FB_TEST_KEY="x"
-export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
-write_cfg "$R" '{
-  "state": "on",
-  "operator_key_env": "HMD_FB_TEST_KEY",
-  "endpoint": "http://127.0.0.1:20128",
-  "omniroute_db_path": "'"$CLEAN_DB"'",
-  "target_provider": "self-hosted-mixtral"
-}'
-export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-out="$(fb --repo "$R" check)"; rc=$?
-export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
-unset ANTHROPIC_MODEL
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
-  && ok "25. backward compat: bare check (no --tier) under on + passing preflight -> ROUTE, exactly like before this change (bin/lib/issue_loop.py's own call shape)" \
+out="$(fb --repo "$R" check --tier haiku 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "unrecognized arguments: --tier" \
+  && ok "25. check --tier <anything> is rejected as an unrecognized argument -- the flag no longer exists on check at all" \
   || bad "25. rc=$rc out='$out'"
-unset HMD_FB_TEST_KEY
 
 # ── 26. NEW: set switch persists across invocations ─────────────────────────
 R="$(fresh_repo)"
@@ -744,12 +751,12 @@ echo "$out_text" | grep -q "SWITCH" \
   || bad "27a. text='$out_text' json='$out_json'"
 
 R2="$(fresh_repo)"
-write_cfg "$R2" '{"state": "on"}'
+write_cfg "$R2" '{"state": "auto"}'
 out_text2="$(fb --repo "$R2" status)"
 out_json2="$(fb --repo "$R2" status --json)"
 ! echo "$out_text2" | grep -q "SWITCH" \
   && printf '%s' "$out_json2" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('full_switch') is False else 1)" \
-  && ok "27b. state=on -> no SWITCH banner in text, full_switch:false in json (no false alarm)" \
+  && ok "27b. state=auto -> no SWITCH banner in text, full_switch:false in json (no false alarm)" \
   || bad "27b. text='$out_text2' json='$out_json2'"
 
 R3="$(fresh_repo)"
@@ -759,11 +766,14 @@ echo "$out_check" | grep -q "SWITCH" \
   && ok "27c. check's own VERDICT line also loudly flags switch" \
   || bad "27c. got: $out_check"
 
-# ── 28. NEW: an invalid --tier value is rejected the same way set nonsense is ─
+# ── 28. NEW: even given a value, the (removed) --tier flag still never
+# breaks the caller unless --strict -- same never-fail-caller contract as
+# `set nonsense` (test 8), now reached via the unrecognized-argument path
+# (test 25) rather than an invalid-choice-within-a-declared-flag path. ─────
 R="$(fresh_repo)"
 out="$(fb --repo "$R" check --tier nonsense-tier 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] \
-  && ok "28a. check --tier <bad-value>, no --strict -> exit 0 (never-fail-caller)" \
+  && ok "28a. check --tier <anything>, no --strict -> exit 0 (never-fail-caller, even though the flag is unrecognized)" \
   || bad "28a. rc=$rc out='$out'"
 fb --repo "$R" --strict check --tier nonsense-tier >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ] && ok "28b. same call WITH --strict -> nonzero (opt-in strictness)" \
@@ -773,7 +783,7 @@ fb --repo "$R" --strict check --tier nonsense-tier >/dev/null 2>&1; rc=$?
 R="$(fresh_repo)"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
   "target_provider": "opencode"
@@ -790,7 +800,7 @@ unset ANTHROPIC_MODEL
 R="$(fresh_repo)"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
   "target_provider": "self-hosted-mixtral"
@@ -811,7 +821,7 @@ unset ANTHROPIC_MODEL
 R="$(fresh_repo)"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
   "target_provider": "duckduckgo-web",
@@ -830,7 +840,7 @@ unset ANTHROPIC_MODEL
 R="$(fresh_repo)"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
   "target_provider": "my-future-noauth-provider",
@@ -847,7 +857,7 @@ unset ANTHROPIC_MODEL
 R2="$(fresh_repo)"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R2" '{
-  "state": "on",
+  "state": "switch",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
   "target_provider": "my-future-noauth-provider"
@@ -865,7 +875,7 @@ R="$(fresh_repo)"
 export ANTHROPIC_API_KEY="not-actually-used"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "ANTHROPIC_API_KEY",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
@@ -1172,7 +1182,7 @@ R="$(fresh_repo)"
 export HMD_FB_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "HMD_FB_TEST_KEY",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$TIER1_CLAUDE_DB"'",
@@ -1233,7 +1243,7 @@ write_cfg "$R" '{
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
-out="$(fb --repo "$R" arm --state on)"; rc=$?
+out="$(fb --repo "$R" arm --state switch)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 cfg_out="$(cat "$(cfg_path "$R")")"
@@ -1255,7 +1265,7 @@ write_cfg "$R" '{
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
-out="$(fb --repo "$R" arm --state on)"
+out="$(fb --repo "$R" arm --state switch)"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 echo "$out" | grep -q "export ANTHROPIC_MODEL=aihorde/" \
@@ -1273,7 +1283,7 @@ echo "$out" | grep -q "export ANTHROPIC_MODEL=aihorde/" \
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "off"}'
 before="$(cat "$(cfg_path "$R")")"
-out="$(fb --repo "$R" arm --provider mistral --state on)"; rc=$?
+out="$(fb --repo "$R" arm --provider mistral --state switch)"; rc=$?
 after="$(cat "$(cfg_path "$R")")"
 [ "$rc" -eq 1 ] && echo "$out" | grep -q "REFUSED" && echo "$out" | grep -qi "never invents a credential" \
   && echo "$out" | grep -q "VERDICT: REFUSE" && [ "$before" = "$after" ] \
@@ -1308,11 +1318,11 @@ out="$(fb --repo "$R" arm --provider claude-web)"; rc=$?
 # target_provider once arm has run. ─────────────────────────────────────────
 R="$(fresh_repo)"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "target_provider": "claude",
   "omniroute_db_path": "'"$CLEAN_DB"'"
 }'
-out="$(fb --repo "$R" arm --state on)"
+out="$(fb --repo "$R" arm --state switch)"
 cfg_out="$(cat "$(cfg_path "$R")")"
 echo "$cfg_out" | grep -q '"target_provider": "aihorde"' \
   && ! echo "$cfg_out" | grep -q '"target_provider": "claude"' \
@@ -1328,7 +1338,7 @@ R1="$(fresh_repo)"
 R2="$(fresh_repo)"
 out_status1="$(fb --repo "$R1" status)"
 out_status2="$(fb --repo "$R2" status)"
-out_set1="$(fb --repo "$R1" set on)"
+out_set1="$(fb --repo "$R1" set switch)"
 out_check1="$(fb --repo "$R1" check)"
 echo "$out_status1" | grep -qF "$(cfg_path "$R1")" \
   && echo "$out_status2" | grep -qF "$(cfg_path "$R2")" \
@@ -1355,7 +1365,7 @@ out_check="$(fb --repo "$R" check 2>&1)"; rc_check=$?
   && ok "54a. a partial/old-schema config (missing noauth_providers/omniroute_db_path/cliproxyapi_dir) does not crash check" \
   || bad "54a. rc=$rc_check out='$out_check'"
 
-out_arm="$(fb --repo "$R" arm --state on)"; rc_arm=$?
+out_arm="$(fb --repo "$R" arm --state switch)"; rc_arm=$?
 cfg_out="$(cat "$(cfg_path "$R")")"
 [ "$rc_arm" -eq 1 ] && echo "$out_arm" | grep -q "target_provider:.*opencode" \
   && echo "$out_arm" | grep -q "VERDICT: REFUSE" \
@@ -1374,7 +1384,7 @@ write_cfg "$R" '{
   "omniroute_db_path": "'"$CLEAN_DB"'"
 }'
 db_before="$(md5 -q "$CLEAN_DB" 2>/dev/null || md5sum "$CLEAN_DB" | awk '{print $1}')"
-fb --repo "$R" arm --state on >/dev/null
+fb --repo "$R" arm --state switch >/dev/null
 db_after="$(md5 -q "$CLEAN_DB" 2>/dev/null || md5sum "$CLEAN_DB" | awk '{print $1}')"
 cfg_out="$(cat "$(cfg_path "$R")")"
 [ "$db_before" = "$db_after" ] && echo "$cfg_out" | grep -q '"target_provider": "aihorde"' \
@@ -1391,7 +1401,7 @@ cfg_out="$(cat "$(cfg_path "$R")")"
 # despite OmniRoute storing no key for it. ──────────────────────────────────
 R="$(fresh_repo)"
 write_cfg "$R" '{}'
-fb --repo "$R" arm --state on >/dev/null
+fb --repo "$R" arm --state switch >/dev/null
 picked="$(sed -n 's/.*"target_provider": "\([^"]*\)".*/\1/p' "$(cfg_path "$R")")"
 case "$picked" in
   veoaifree-web)
@@ -1412,7 +1422,7 @@ esac
 # would be worse than obeying them). ───────────────────────────────────────
 R="$(fresh_repo)"
 write_cfg "$R" '{}'
-fb --repo "$R" arm --provider auggie --state on >/dev/null
+fb --repo "$R" arm --provider auggie --state switch >/dev/null
 grep -q '"target_provider": "auggie"' "$(cfg_path "$R")" \
   && ok "57. an explicit --provider auggie is honoured verbatim -- usability ranking governs arm's own pick, never an operator's stated choice" \
   || bad "57. explicit --provider auggie was not honoured: cfg='$(cat "$(cfg_path "$R")")'"
@@ -1424,7 +1434,7 @@ R="$(fresh_repo)"
 export HMD_FB_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "HMD_FB_TEST_KEY",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
@@ -1449,7 +1459,7 @@ unset HMD_FB_TEST_KEY
 # tests that fails (CAP_OUT_BYTES becomes nonzero -- see commit message for
 # the full list, since every non-ROUTE base-url test shares this branch). ──
 R="$(fresh_repo)"
-write_cfg "$R" '{"state": "on"}'
+write_cfg "$R" '{"state": "switch"}'
 run_capture fb --repo "$R" base-url
 [ "$CAP_RC" -eq 1 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
   && ok "60. base-url on a REFUSE verdict: exit 1 AND stdout is byte-empty (reason goes to stderr only)" \
@@ -1490,7 +1500,7 @@ R="$(fresh_repo)"
 export HMD_FB_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "HMD_FB_TEST_KEY",
   "endpoint": "http://evil.example.com:80",
   "omniroute_db_path": "'"$CLEAN_DB"'",
@@ -1515,7 +1525,7 @@ R="$(fresh_repo)"
 export HMD_FB_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "HMD_FB_TEST_KEY",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
@@ -1532,7 +1542,7 @@ unset ANTHROPIC_MODEL
 unset HMD_FB_TEST_KEY
 
 R="$(fresh_repo)"
-write_cfg "$R" '{"state": "on"}'
+write_cfg "$R" '{"state": "switch"}'
 fb --repo "$R" check >/dev/null 2>&1; rc_check=$?
 fb --repo "$R" base-url >/dev/null 2>&1; rc_burl=$?
 [ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 1 ] \

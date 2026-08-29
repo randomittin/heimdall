@@ -101,8 +101,8 @@ boundary from a different angle):
      this tool goes further still: it has no print-the-secret override at
      all, because it never has a reason to print one.
   6. `off` is the default for a fresh install AND for any absent or corrupt
-     config. A corrupt config must never be silently read as `on` -- see
-     load_config()'s fail-closed parse.
+     config. A corrupt config must never be silently read as anything but
+     `off` -- see load_config()'s fail-closed parse.
   7. NEVER treat OmniRoute's `blockedProviders` setting as evidence of
      anything. Its own UI copy is "Hide specific providers from the
      /v1/models response" -- it is consulted only in model-listing/search
@@ -111,29 +111,26 @@ boundary from a different angle):
      silently by load_config()'s allowlist copy; cmd_check additionally
      warns on stderr if it finds one, so that silence is never mistaken for
      the field having done something.
-  8. FOUR STATES, one safety boundary. `off` (default, never route), `on` (a
-     CAPABILITY-TIER routing decision -- route only LOW-LEVEL work, never an
-     exhaustion reaction), `auto` (the ORIGINAL exhaustion/pre-exhaustion
-     reaction -- route only when preflight passes, else WAIT rather than
-     block), and `switch` (route EVERYTHING, tier-blind, still gated by the
-     same preflight as every other state). None of the four ever changes
-     WHETHER routing is safe -- points 1-7 above apply identically in all
-     four; `switch` changes WHAT routes, never whether a failing
-     Tier-1/model-pin/sidecar/ToS check is survivable. "Low-level" reuses
-     this repo's OWN existing task-tier vocabulary rather than inventing a
-     second one -- see agents/heimdall.md's Model Routing table (haiku:
-     "lint, format, rename, simple config") and CLAUDE.md's "Model routing
-     (2026-08-11 directive)" (opus reserved for adjudication:
-     reviewer/verifier/security-auditor; sonnet is the default coding tier).
-     `on` maps to the haiku tier ONLY -- sonnet (default coding) and the
-     adjudication roles (always opus; capability is load-bearing there) NEVER
-     route under `on`, regardless of how the caller spells the tier. `check
-     --tier T` (T in haiku|sonnet|opus|reviewer|verifier|security-auditor,
-     the last three being direct adjudication-role aliases for opus) asks
-     this per-task question; bare `check` (no --tier) asks the ORIGINAL,
-     tier-blind question and is completely unaffected by this whole
-     paragraph -- see bin/lib/issue_loop.py, the one existing caller, which
-     is preserved byte-for-byte (it never passes --tier).
+  8. THREE STATES, one safety boundary. `off` (default, never route), `auto`
+     (the exhaustion/pre-exhaustion reaction -- route only when preflight
+     passes AND heimdall-session-usage confirms the ~95% threshold is
+     crossed, else WAIT rather than block -- see point 11), and `switch`
+     (route EVERYTHING, tier-blind, still gated by the same preflight as
+     every other state). None of the three ever changes WHETHER routing is
+     safe -- points 1-7 above apply identically in all three; `switch`
+     changes WHAT routes, never whether a failing Tier-1/model-pin/sidecar/
+     ToS check is survivable.
+
+     REMOVED (owner directive, 2026-08-28): a fourth state, `on`, used to
+     exist as a CAPABILITY-TIER routing decision -- haiku-tier work only, via
+     `check --tier T` -- entirely independent of exhaustion. That was a
+     genuine, distinct capability, not a switch/auto near-duplicate: no
+     surviving state offers a tier-restricted routing option, so this
+     capability is gone, not renamed. `set on` / `arm --state on` are now
+     REJECTED outright (argparse choices), naming the three valid states. A
+     persisted `state: "on"` from before this change migrates to `off` on
+     load -- never `auto` -- since `auto` is tier-blind and could grant MORE
+     routing than `on`'s haiku-tier-only gate ever did (see load_config()).
   9. `switch` MUST be unmistakable. It is the only state that risks
      quality-sensitive work landing on a provider with no no-train guarantee
      (docs/analysis/2026-08-25-headroom-inpath-measurement.md's 337x
@@ -210,7 +207,7 @@ boundary from a different angle):
       heimdall-session-usage collapses to "unknown" and changes nothing else
       about the OTHER checks -- see _session_pre_exhaustion_verdict().
 
-  12. `arm` (heimdall-fallback arm [--provider P] [--state auto|on|switch])
+  12. `arm` (heimdall-fallback arm [--provider P] [--state auto|switch])
       exists so "turn fallback on" does not mean "hand the operator a
       hand-edited JSON file and a checklist" -- see cmd_arm. It
       self-provisions everything it can HONESTLY justify: a target_provider
@@ -246,19 +243,19 @@ FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
 signal must stay silent (exit quietly, print nothing). This tool's job is
 the opposite: an uncertain SAFETY signal must never say "safe to route". Any
 internal error, missing field, or unparsable config resolves to the LEAST
-permissive verdict available for the current state (REFUSE under off/on,
+permissive verdict available for the current state (REFUSE under off/switch,
 WAIT under auto) -- never to ROUTE. Two inverse philosophies for two
 different problems, not a contradiction: one gates a print statement, the
 other gates unattended, keyed network egress.
 
 NO AUTO-SWITCH CONTRADICTION. heimdall-quota-advisor documents that it
 "never auto-switches ANY provider for the operator. Ever." This tool's
-`on`/`auto` states do not contradict that: (a) `off` is the default
+`auto`/`switch` states do not contradict that: (a) `off` is the default
 everywhere, so a fresh install has zero auto-switch behavior anywhere in
-this repo; (b) `on`/`auto` are reachable ONLY via an explicit
-`heimdall-fallback set on|auto` the operator runs themselves -- hmd never
-flips this on its own; (c) this tool does not even perform a switch -- it
-only computes whether a future transport layer would be ALLOWED to.
+this repo; (b) `auto`/`switch` are reachable ONLY via an explicit
+`heimdall-fallback set auto|switch` the operator runs themselves -- hmd
+never flips this on its own; (c) this tool does not even perform a switch --
+it only computes whether a future transport layer would be ALLOWED to.
 
 EXHAUSTION vs. OVERLOAD -- NOT THE SAME THING, NOT HANDLED HERE. A transient
 529 / overloaded_error / 429 is a RETRYABLE condition with its own mechanism
@@ -271,18 +268,10 @@ latter. It has no opinion on retries and must never be consulted for one.
 USAGE
 -----
   heimdall-fallback status [--json]            current state + would-preflight-pass, secret-free
-  heimdall-fallback set {off,on,auto,switch}   persist a new state (off is always safe)
-  heimdall-fallback check [--tier T]           run the preflight; exit code IS the verdict.
-                                                --tier asks a CAPABILITY-TIER question (only
-                                                meaningful under state=on; T is one of haiku,
-                                                sonnet, opus, or an adjudication-role alias --
-                                                reviewer, verifier, security-auditor -- for
-                                                opus). Omit --tier for the ORIGINAL, tier-blind
-                                                question every existing caller
-                                                (bin/lib/issue_loop.py) already asks -- see
-                                                header point 8.
+  heimdall-fallback set {off,auto,switch}      persist a new state (off is always safe)
+  heimdall-fallback check                      run the preflight; exit code IS the verdict.
   heimdall-fallback arm [--provider P]          self-provision target_provider +
-                        [--state auto|on|switch]  operator_key_env (never inventing a
+                        [--state auto|switch]     operator_key_env (never inventing a
                                                 credential) and write state, then run
                                                 check and report its verdict. See header
                                                 point 12.
@@ -298,8 +287,8 @@ CONFIG  <repo>/.heimdall/fallback.json -- gitignored by the blanket
 field below defaults to the safe value:
   {
     "schema": 1,
-    "state": "off",                        # off | on | auto | switch -- anything else
-                                            # reads as off (header point 6)
+    "state": "off",                        # off | auto | switch -- anything else, including
+                                            # the removed 'on', reads as off (header point 6)
     "operator_key_env": "",                # NAME of an env var holding the operator's
                                             # OWN OmniRoute/provider key -- never a value.
                                             # NOT required when target_provider is a
@@ -324,16 +313,14 @@ field below defaults to the safe value:
 EXIT CODES
   status, where : always 0 (never-fail-caller telemetry reads)
   set           : 0 (even on bad input) unless --strict -> 2 usage / 3 write-fail
-  check         : 0 = ROUTE  (every preflight check passed; under state=on with
-                              --tier given, the tier must also resolve to haiku)
-                  1 = REFUSE (state is 'off'; OR state is 'on' and a preflight
-                              check failed, or --tier was given and does not
-                              resolve to haiku; OR state is 'switch' and a
+  check         : 0 = ROUTE  (every preflight check passed; under state=auto,
+                              heimdall-session-usage must also report "crossed")
+                  1 = REFUSE (state is 'off'; OR state is 'switch' and a
                               preflight check failed)
-                  2 = WAIT   (state is 'auto' and a preflight check failed --
-                              print the reasons, do not route blind; tier is
-                              NEVER consulted here -- auto is an exhaustion
-                              reaction, not a capability decision)
+                  2 = WAIT   (state is 'auto' and either a preflight check
+                              failed, or preflight passed but
+                              heimdall-session-usage did not report "crossed"
+                              -- print the reasons, do not route blind)
   arm           : mirrors check's own contract exactly -- 0 = ROUTE, 1 = REFUSE,
                   2 = WAIT -- because arm always ends by running that exact
                   preflight against whatever config is now on disk (the one it
@@ -341,8 +328,8 @@ EXIT CODES
                   A write failure during arm -> 3 if --strict, else 0 (never-
                   fail-caller, matching set's own contract for the same failure
                   mode).
-  argument-parsing errors (any subcommand, including an unrecognized --tier
-  value) : 0 unless --strict -> 2
+  argument-parsing errors (any subcommand, including an invalid state to `set`
+  or `arm --state`) : 0 unless --strict -> 2
   unexpected internal error (outer safety net; check() fails closed on its
   own and should never actually reach this) : 0 unless --strict -> 3
 """
@@ -360,7 +347,7 @@ import urllib.parse
 import urllib.request
 
 SCHEMA = 1
-VALID_STATES = ("off", "on", "auto", "switch")
+VALID_STATES = ("off", "auto", "switch")
 
 DEFAULT_CFG = {
     "schema": SCHEMA,
@@ -420,7 +407,7 @@ DEFAULT_CFG = {
 # doc flagged ~30 across its "caution" and lower-confidence tiers),
 # target_provider_allowed could never pass and the fallback feature was
 # permanently inert regardless of an operator's own choice. The operator
-# turns fallback on EXPLICITLY (`heimdall-fallback set on|auto|switch` is a
+# turns fallback on EXPLICITLY (`heimdall-fallback set auto|switch` is a
 # deliberate act hmd never performs itself -- see "NO AUTO-SWITCH
 # CONTRADICTION" above) and has already accepted the data-handling tradeoff
 # (2026-08-23-omniroute-assessment.md's disqualifier-1 finding; the
@@ -592,28 +579,6 @@ SIDECAR_DELEGATING_MODES = frozenset({"cliproxyapi", "dario", "fallback"})
 # fails the check. See header point 1c.
 _ENV_FLAG_OFF_VALUES = frozenset({"", "0", "false", "no", "off"})
 
-# "Low-level" reuses THIS repo's existing task-tier vocabulary rather than
-# inventing a second one -- agents/heimdall.md's Model Routing table (haiku:
-# "lint, format, rename, simple config, doc-sync") and CLAUDE.md's "Model
-# routing (2026-08-11 directive)" (opus reserved for adjudication: reviewer,
-# verifier, security-auditor; sonnet is the default coding tier). See header
-# point 8. The adjudication roles are direct opus aliases so "adjudication
-# never routes under on" is an explicit, testable guarantee, not an accident
-# of opus's tier string alone. NOTE: .planning/settings.json's
-# `model_routing` field (an alternate source the original brief also named)
-# does not exist anywhere in this repo -- confirmed by direct search; this
-# vocabulary comes from agents/heimdall.md and CLAUDE.md instead, the only
-# place it is actually defined.
-TIER_ALIASES = {
-    "haiku": "haiku",
-    "sonnet": "sonnet",
-    "opus": "opus",
-    "reviewer": "opus",
-    "verifier": "opus",
-    "security-auditor": "opus",
-}
-LOW_LEVEL_TIER = "haiku"
-
 
 class Rejected(Exception):
     """Raised by _Parser.error() instead of argparse's default sys.exit(2)."""
@@ -631,9 +596,31 @@ def _cfg_path(repo):
 def load_config(repo):
     """Fail-closed config load. Absent, unreadable, non-dict, or containing a
     FORBIDDEN_CONFIG_KEYS entry all resolve to a fresh DEFAULT_CFG copy
-    (state off) -- never a partially-trusted merge. See header point 6.
-    Returns (cfg, corrupt_reason); corrupt_reason is None when the on-disk
-    config (or its absence) was clean.
+    (state off) -- never a partially-trusted merge. See header point 6. A
+    persisted state of 'on' (removed; see header point 8) migrates to 'off',
+    the same landing every other invalid/corrupt state value already gets
+    below -- never 'auto' or 'switch', both of which are live states an
+    operator now has to choose deliberately. This is NOT a lossless landing:
+    'on', as its one real caller (bin/lib/issue_loop.py) ever actually
+    exercised it -- never passing a tier argument -- ROUTEd whenever
+    preflight passed, exactly like 'switch' still does today. 'off' is not
+    that same outcome: off's own "state" check in run_preflight() fails
+    unconditionally whenever state=='off', so a migrated config can never
+    ROUTE again until the operator explicitly re-arms to 'auto' or 'switch'
+    -- 'on's tier-blind ROUTE path is genuinely gone. That loss is
+    deliberate: 'off' is the one landing guaranteed to never silently hand
+    out MORE routing than the operator had, at the cost of not preserving
+    what they did have. The OTHER capability 'on' offered -- refusing
+    non-low-tier work outright regardless of preflight -- had zero live
+    callers to begin with, so that half really does cost nobody anything.
+    'auto' is not a safer substitute for 'off' here either -- it is a
+    differently-natured, exhaustion-reactive gate (header point 11) that
+    would silently substitute session-usage judgment for the tier judgment
+    'on' actually made, and it can WAIT indefinitely rather than give a
+    clear answer when usage cannot be confirmed crossed, a worse landing
+    than a config that now resolves cleanly (REFUSE) every time. Returns
+    (cfg, corrupt_reason); corrupt_reason is None when the on-disk config
+    (or its absence) was clean.
     """
     path = _cfg_path(repo)
     try:
@@ -653,8 +640,28 @@ def load_config(repo):
     for key in DEFAULT_CFG:
         if key in raw:
             cfg[key] = raw[key]
-    if cfg.get("state") not in VALID_STATES:
+    state_corrupt_reason = None
+    raw_state = cfg.get("state")
+    if raw_state == "on":
+        # 'on' was removed (owner directive: only off/auto/switch survive).
+        # Migrate to 'off' -- the same uniform landing every other invalid
+        # state value already gets a few lines below -- rather than guessing
+        # a replacement state on the operator's behalf; see the docstring
+        # above and header point 8.
         cfg["state"] = "off"
+        state_corrupt_reason = (
+            "state 'on' no longer exists (removed; valid states are now "
+            "off/auto/switch) -- migrated to 'off' rather than picking a "
+            "replacement for you: 'off' is a hard, unconditional refuse "
+            "(see run_preflight's own state check), so 'on's prior "
+            "tier-blind ROUTE is genuinely gone here, not preserved -- "
+            "deliberate, since 'off' is the one landing guaranteed to "
+            "never hand out MORE routing than you had; run "
+            "'heimdall-fallback set auto' or 'set switch' to re-arm"
+        )
+    elif raw_state not in VALID_STATES:
+        cfg["state"] = "off"
+        state_corrupt_reason = "state %r is not one of off/auto/switch -- reset to off" % (raw_state,)
     if isinstance(cfg.get("tos_flagged_providers"), list):
         cfg["tos_flagged_providers"] = [p for p in cfg["tos_flagged_providers"] if isinstance(p, str)]
     else:
@@ -666,7 +673,7 @@ def load_config(repo):
     for key in ("operator_key_env", "endpoint", "target_provider", "omniroute_db_path", "cliproxyapi_dir"):
         if not isinstance(cfg.get(key), str):
             cfg[key] = DEFAULT_CFG[key]
-    return cfg, None
+    return cfg, state_corrupt_reason
 
 
 def save_config(repo, cfg):
@@ -975,7 +982,7 @@ def run_preflight(cfg):
     checks.append((
         "state",
         state != "off",
-        "" if state != "off" else "fallback state is 'off' (heimdall-fallback set on|auto|switch)",
+        "" if state != "off" else "fallback state is 'off' (heimdall-fallback set auto|switch)",
     ))
 
     key_env = cfg.get("operator_key_env") or ""
@@ -1208,27 +1215,12 @@ def run_preflight(cfg):
     return checks
 
 
-def _tier_routes_under_on(tier):
-    """Whether a task of the given TIER is eligible for `on`'s capability-tier
-    routing decision. `on` maps to the haiku tier only -- see header point 8,
-    agents/heimdall.md's Model Routing table, and CLAUDE.md's 2026-08-11
-    model-routing directive. tier=None means the caller asked the ORIGINAL,
-    tier-blind question (bin/lib/issue_loop.py, preserved unchanged) and is
-    always eligible, exactly like every state before `on` was redefined."""
-    if tier is None:
-        return True
-    return TIER_ALIASES.get(tier) == LOW_LEVEL_TIER
-
-
-def _verdict(state, checks, tier=None, session_verdict=None):
-    """state decides ROUTE vs REFUSE vs WAIT; `on` additionally consults the
-    task TIER now that it is a capability-tier routing decision, not an
-    exhaustion reaction (auto keeps that job -- see header point 8 -- and
-    still never consults tier). `switch` never WAITs: it is an explicit
-    always-try state, so a failing preflight is a REFUSE, exactly like `on`,
-    never a silent wait (header point 9). run_preflight's checks always run
-    in full regardless of state or tier -- nothing here is ever a
-    short-circuit (header point 1).
+def _verdict(state, checks, session_verdict=None):
+    """state decides ROUTE vs REFUSE vs WAIT. `switch` never WAITs: it is an
+    explicit always-try state, so a failing preflight is a REFUSE, never a
+    silent wait (header point 9). run_preflight's checks always run in full
+    regardless of state -- nothing here is ever a short-circuit (header
+    point 1).
 
     `auto` is the one state that is actually exhaustion-gated (header point
     11): a passing preflight is NECESSARY but no longer SUFFICIENT for ROUTE
@@ -1238,13 +1230,11 @@ def _verdict(state, checks, tier=None, session_verdict=None):
     nothing on its own), and a passing preflight with session_verdict in
     {"under", "unconfigured", "unknown", None} WAITs instead of routing
     (capacity remains, or cannot be confirmed low, so there is nothing to
-    react to yet). off/on/switch never read session_verdict at all -- callers
+    react to yet). off/switch never read session_verdict at all -- callers
     pass None for them and this function never inspects it outside the
     `state == "auto"` branch below.
     """
     preflight_ok = all(ok for _, ok, _ in checks)
-    if state == "on" and not _tier_routes_under_on(tier):
-        return "REFUSE", 1
     if state == "auto":
         if not preflight_ok:
             return "WAIT", 2
@@ -1344,11 +1334,9 @@ def cmd_check(args):
         cfg, _ = load_config(args.repo)
         checks = run_preflight(cfg)
         state = cfg["state"]
-        tier = getattr(args, "tier", None)
         preflight_ok = all(ok for _, ok, _ in checks)
-        tier_ok = _tier_routes_under_on(tier) if state == "on" else True
         session_verdict = _session_pre_exhaustion_verdict(args.repo) if state == "auto" else None
-        verdict, rc = _verdict(state, checks, tier=tier, session_verdict=session_verdict)
+        verdict, rc = _verdict(state, checks, session_verdict=session_verdict)
 
         header = "heimdall-fallback check -- VERDICT: %s" % verdict
         if state == "switch":
@@ -1366,28 +1354,11 @@ def cmd_check(args):
         if state == "auto":
             print("  [INFO] session_usage -- %s" % SESSION_USAGE_NOTE_FMT[session_verdict])
 
-        if state == "on" and tier is not None:
-            resolved = TIER_ALIASES.get(tier, tier)
-            line = "  [%s] tier_eligible (tier=%s)" % ("OK  " if tier_ok else "FAIL", tier)
-            if not tier_ok:
-                line += (
-                    " -- '%s' resolves to the '%s' tier; state=on is a capability-tier "
-                    "routing decision and only routes '%s'-tier work (lint, format, "
-                    "rename, simple config, doc-sync -- agents/heimdall.md's Model "
-                    "Routing table); default coding work (sonnet) and adjudication "
-                    "(reviewer/verifier/security-auditor, always opus) never route "
-                    "under 'on'" % (tier, resolved, LOW_LEVEL_TIER)
-                )
-            print(line)
-
         if verdict == "WAIT" and not preflight_ok:
             print("  (state=auto: preflight failed -> waiting rather than routing blind)")
         elif verdict == "WAIT" and preflight_ok:
             print("  (state=auto: preflight passed but session_usage verdict is not "
                   "crossed -> waiting rather than routing while capacity remains)")
-        elif verdict == "REFUSE" and state == "on" and preflight_ok and not tier_ok:
-            print("  (state=on, preflight passed, but tier is not low-level -> refusing; "
-                  "'on' routes haiku-tier work only, not an exhaustion reaction)")
         elif verdict == "REFUSE" and state != "off":
             print("  (state=%s but a required check failed -> refusing rather than proceeding unsafely)" % state)
 
@@ -1587,8 +1558,7 @@ def _routing_decision(args):
     checks = run_preflight(cfg)
     state = cfg["state"]
     session_verdict = _session_pre_exhaustion_verdict(args.repo) if state == "auto" else None
-    verdict, rc = _verdict(state, checks, tier=getattr(args, "tier", None),
-                           session_verdict=session_verdict)
+    verdict, rc = _verdict(state, checks, session_verdict=session_verdict)
     failed = [name for name, ok, _ in checks if not ok]
     reason = "verdict=%s (state=%s)" % (verdict, state)
     if failed:
@@ -1706,14 +1676,8 @@ def build_parser():
     sp_set = sub.add_parser("set", help="persist a new fallback state")
     sp_set.add_argument("value", choices=VALID_STATES)
 
-    sp_check = sub.add_parser("check", help="run the preflight; exit code is the verdict (0=ROUTE 1=REFUSE 2=WAIT)")
-    sp_check.add_argument(
-        "--tier", default=None, choices=sorted(TIER_ALIASES),
-        help="task tier/role for state=on's capability-tier routing decision "
-             "(haiku|sonnet|opus, or an adjudication-role alias -- reviewer|"
-             "verifier|security-auditor -- for opus). Omit for the original, "
-             "tier-blind question (bin/lib/issue_loop.py's own call shape).",
-    )
+    sub.add_parser("check", help="run the preflight; exit code is the verdict (0=ROUTE 1=REFUSE 2=WAIT)")
+
     sp_arm = sub.add_parser(
         "arm",
         help="self-provision target_provider + operator_key_env (never inventing a "
@@ -1725,18 +1689,14 @@ def build_parser():
              "already-valid configured one, else auto-pick a no-auth provider)",
     )
     sp_arm.add_argument(
-        "--state", default="auto", choices=("auto", "on", "switch"),
+        "--state", default="auto", choices=("auto", "switch"),
         help="fallback state to write once provisioning succeeds (default: auto)",
     )
 
-    sp_burl = sub.add_parser(
+    sub.add_parser(
         "base-url",
         help="print the OmniRoute base URL iff the verdict is ROUTE (stdout stays "
              "empty otherwise); the seam `hmd route` consumes",
-    )
-    sp_burl.add_argument(
-        "--tier", default=None, choices=sorted(TIER_ALIASES),
-        help="same tier argument `check` takes, for state=on's tier decision",
     )
 
     sub.add_parser(

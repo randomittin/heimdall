@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test/heimdall-fallback-command.test.sh — /hmd:fallback slash command static contract.
 #
-# WHAT THIS GATES. bin/heimdall-fallback is a fully working four-state OmniRoute
+# WHAT THIS GATES. bin/heimdall-fallback is a fully working three-state OmniRoute
 # routing gate (see test/heimdall-fallback.test.sh) with, until now, no slash
 # command exposing it — an operator who doesn't already know the raw bin/ tool
 # exists has no way to discover or drive it from Claude Code. This locks the
@@ -20,9 +20,8 @@
 #      a `heimdall-fallback config ...` line as if it were real — AND it
 #      cross-checks the doc's claim against the live source, so the claim
 #      cannot silently go stale if the tool ever grows a real config verb.
-#   4. It documents the four states in operator language, including that
-#      adjudication (reviewer/verifier/security-auditor) never routes under
-#      `on`, and that `auto` reacts to the real ~95% exhaustion threshold.
+#   4. It documents the three states in operator language, and that `auto`
+#      reacts to the real ~95% exhaustion threshold.
 #   5. It documents the operator-facing caveats: operator_key_env holds the
 #      env-var NAME (never the key itself), no-auth providers need no key,
 #      keyless providers can't do real agent work, and routing costs real
@@ -135,12 +134,12 @@ fi
 
 # ── 4. the four states, in operator language ────────────────────────────────
 if grep -q '| `off`' "$CMD_MD"; then ok "fallback.md documents 'off'"; else bad "fallback.md missing 'off' state row"; fi
-if grep -q '| `on`' "$CMD_MD"; then ok "fallback.md documents 'on'"; else bad "fallback.md missing 'on' state row"; fi
+if grep -q '| `on`' "$CMD_MD"; then bad "fallback.md still documents a removed 'on' state row"; else ok "fallback.md correctly has no 'on' state row (removed)"; fi
 if grep -q '| `auto`' "$CMD_MD"; then ok "fallback.md documents 'auto'"; else bad "fallback.md missing 'auto' state row"; fi
 if grep -q '| `switch`' "$CMD_MD"; then ok "fallback.md documents 'switch'"; else bad "fallback.md missing 'switch' state row"; fi
-if grep -qiE 'reviewer, verifier, security-auditor|adjudication' "$CMD_MD"; then
-  ok "fallback.md documents that adjudication roles never route under 'on'"
-else bad "fallback.md missing the adjudication-never-routes-under-on caveat"; fi
+if grep -qiE 'reviewer, verifier, security-auditor|never route under .on.' "$CMD_MD"; then
+  bad "fallback.md still documents the removed on-state's adjudication-tier language"
+else ok "fallback.md correctly has no leftover on-state adjudication-tier language"; fi
 if grep -qiE '95%|five_hour' "$CMD_MD"; then
   ok "fallback.md documents auto's real ~95% exhaustion threshold"
 else bad "fallback.md missing the auto exhaustion-threshold explanation"; fi
