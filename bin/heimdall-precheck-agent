@@ -87,6 +87,60 @@ if [ "${HEIMDALL_ALLOW_NAMED_AGENT:-}" != "1" ]; then
   fi
 fi
 
+# -- adjudication fallback fence (Task 1.1) -----------------------------------
+# D2 (docs/superpowers/plans/2026-08-29-agent-fallback-coverage.md §0.3): an
+# in-process Agent-tool subagent has no exec boundary, so hmd_gate_exec
+# (bin/lib/hmd-gate-endpoint.sh) cannot reach it -- if THIS session's own
+# ANTHROPIC_BASE_URL is the live OmniRoute fallback endpoint, every in-process
+# subagent silently inherits it, including hmd:reviewer/verifier/
+# security-auditor. A judge on a degraded free-tier model emits confident
+# FALSE GREENS. This is the one deliberate deny in this file: it fires only
+# when BOTH conditions below are POSITIVELY confirmed (fail-closed on the
+# safety question); any inability to confirm either one -- no jq, no
+# heimdall-fallback binary, no bin/lib/hmd-adjudication-set.sh, a malformed
+# payload, a heimdall-fallback error or timeout -- falls all the way through
+# to the brief-adoption gate below unchanged (fail-open on the plumbing
+# question). Runs independently of, and ahead of, that gate: no variable
+# computed here is read by it, and none of its variables are read here (the
+# ADJ_ prefix keeps them from colliding by accident).
+if [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
+  ADJ_FALLBACK_BIN="$BIN_DIR/heimdall-fallback"
+  ADJ_SET_LIB="$BIN_DIR/lib/hmd-adjudication-set.sh"
+  if [ -x "$ADJ_FALLBACK_BIN" ] && [ -f "$ADJ_SET_LIB" ]; then
+    if command -v perl >/dev/null 2>&1; then
+      ADJ_FRESH_URL="$(perl -e 'alarm 5; exec @ARGV' -- "$ADJ_FALLBACK_BIN" --repo "$PWD" base-url 2>/dev/null)"
+    else
+      ADJ_FRESH_URL="$("$ADJ_FALLBACK_BIN" --repo "$PWD" base-url 2>/dev/null)"
+    fi
+    # cmd_base_url's own contract (bin/heimdall-fallback): stdout is EMPTY on
+    # every non-ROUTE path, INCLUDING an internal error, and the one case it
+    # ever prints is already verified loopback -- so a non-empty, exact match
+    # against this session's live ANTHROPIC_BASE_URL positively confirms BOTH
+    # "loopback" and "is the fallback's own configured endpoint" in the one
+    # comparison; no separate URL-parsing is needed or invented here.
+    if [ -n "$ADJ_FRESH_URL" ] && [ "$ADJ_FRESH_URL" = "${ANTHROPIC_BASE_URL:-}" ]; then
+      # Disclosure: ALWAYS, for every spawn that reaches this branch, never
+      # silenceable -- no env var opts a caller out of being told its
+      # judgment posture may have changed.
+      printf 'BIFROST - Heimdall fallback-routing disclosure: this spawn inherits ANTHROPIC_BASE_URL=%s, the OmniRoute fallback gateway, not api.anthropic.com. That endpoint may serve a free/no-auth-tier provider whose data-retention posture is not guaranteed to match api.anthropic.com. Generation may run on this path; judgment may not (see bin/lib/hmd-gate-endpoint.sh).\n' "$ADJ_FRESH_URL" >&2
+
+      if . "$ADJ_SET_LIB" 2>/dev/null && command -v hmd_is_adjudication >/dev/null 2>&1; then
+        ADJ_SATYPE="$(printf '%s' "$INPUT" | jq -r '.tool_input.subagent_type // empty' 2>/dev/null)" || ADJ_SATYPE=""
+        if [ -n "$ADJ_SATYPE" ] && hmd_is_adjudication "$ADJ_SATYPE"; then
+          ADJ_REASON="BIFROST - Heimdall adjudication deny: subagent_type '$ADJ_SATYPE' is an adjudication agent (it emits a verdict, score, pass/fail, or approval) and this session's ANTHROPIC_BASE_URL ($ADJ_FRESH_URL) is the live OmniRoute fallback gateway, not api.anthropic.com. A judge running on a degraded/free-tier model emits confident false greens, which this project exists to prevent -- so this spawn is refused outright rather than silently degraded. Remedies: (1) run this judge as a SUBPROCESS through hmd_gate_exec (bin/lib/hmd-gate-endpoint.sh) or bin/lib/hmd-route-claude with HMD_JUDGMENT=1, both of which pin the real provider and scrub every routing var; or (2) restart this session unrouted (fallback gate not at ROUTE) and re-spawn. This deny has no bypass flag."
+          ADJ_JSON="$(jq -cn --arg r "$ADJ_REASON" '{error: $r}' 2>/dev/null)"
+          if [ -z "$ADJ_JSON" ]; then
+            ADJ_JSON='{"error": "BIFROST - Heimdall adjudication deny: an adjudication spawn was refused on a fallback-routed session (the reason text could not be JSON-encoded; see stderr for the full message)."}'
+          fi
+          printf '%s\n' "$ADJ_JSON"
+          printf '%s\n' "$ADJ_REASON" >&2
+          exit 2
+        fi
+      fi
+    fi
+  fi
+fi
+
 # -- brief-adoption gate -------------------------------------------------------
 allow() { exit 0; }
 
