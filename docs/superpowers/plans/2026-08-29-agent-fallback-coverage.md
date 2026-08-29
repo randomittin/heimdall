@@ -487,3 +487,39 @@ Not emitted: 9 tasks total, max 4 per wave, both under the 10-task auto-emit thr
 - **Multi-tenant / TEAM-mode fallback policy** (whether one teammate's fallback state should affect another's). Real question, out of scope; noted for a future cycle.
 - **Adding an `agent-fallback` row to `evals/oracles/registry.json`.** Flagged for a reviewer decision in Task 1.4, scoped to `.planning/NEXT-CYCLES.md` if accepted.
 - **Deployment, rollout, or version-bumping.** Separate plan.
+
+---
+
+## Wave 1 — LANDED, with one measured residual gap
+
+Both tasks merged and verified live on main (2026-08-29).
+
+- **Task 1.2** `bin/lib/hmd-route-claude` — every headless spawner now consults the
+  gate per-process. 15/0; regressions unchanged (hmd-exec 37/0, heimdall-route 46/0,
+  issue-loop-claude-fix-fallback 26/0, heimdall-fallback 131/0). `HMD_JUDGMENT=1`
+  pins `https://api.anthropic.com`, and the shim pins it ITSELF rather than trusting
+  an outer scrub.
+- **Task 1.1** adjudication fence in `bin/heimdall-precheck-agent`. 45/0 + 31/0.
+  Verified live under a forced ROUTE verdict: hmd:verifier / hmd:reviewer /
+  hmd:security-auditor / pr-review-toolkit:code-reviewer all DENIED; hmd:coder and
+  hmd:docs-writer allowed. The third-party reviewer is caught by the
+  `*-review*|*-audit*|*-verif*` glob, not by the exact-name list — over-matching is
+  the deliberate safe direction.
+
+### RESIDUAL GAP (found by orchestrator live-testing, not by the suite)
+
+The fence fires only when `heimdall-fallback base-url` prints — i.e. only on a
+CURRENT ROUTE verdict. But the hole it exists to close is a STALE INHERITED env:
+a session launched while the gate said ROUTE keeps `ANTHROPIC_BASE_URL` pointed at
+the gateway for its whole life.
+
+So there is a window: session launched under ROUTE, quota later resets, gate returns
+to WAIT, `base-url` goes empty — yet the parent's env still points at the gateway and
+in-process subagents still inherit it. In that window an adjudication agent is NOT
+fenced. Measured directly: with `ANTHROPIC_BASE_URL` set to the gateway and the gate
+at WAIT, `hmd:verifier` was ALLOWED.
+
+Narrow (requires a quota reset mid-session) but real, and it fails in the unsafe
+direction. The fix is to key the deny on the ENV ITSELF being a loopback fallback
+endpoint, not on a fresh verdict — the env is the thing that actually routes the
+call. Deferred, not fixed, and recorded here rather than left as folklore.
