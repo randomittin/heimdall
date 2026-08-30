@@ -53,6 +53,12 @@
 #        as the string "unknown" — for a caller (e.g. a git hook) that must
 #        supply something but genuinely has no live model signal to report.
 #        Any OTHER off-ladder value is still dropped exactly as before.
+#   (17) TOKENS — --tokens N records the real spend as an integer (the seam
+#        bin/heimdall-metric-hook's _sum_tokens feeds from a transcript's own
+#        message.usage totals); omitting it records JSON null, matching (15)'s
+#        honest-omission contract (never a fabricated 0); a MEASURED zero stays
+#        a real 0, distinguishable from "unmeasured"; a negative value is
+#        Rejected exactly like any other malformed field (4).
 
 set -euo pipefail
 
@@ -379,6 +385,44 @@ BEFORE16B="$(rows "$R16")"
 "$CLI" --repo "$R16" task --model gpt-4 --outcome pass >/dev/null 2>&1 || true
 [ "$(rows "$R16")" = "$BEFORE16B" ] && ok "(16) a non-\"unknown\" off-ladder tier is still DROPPED" \
   || bad "(16) validation loosened beyond the \"unknown\" carve-out"
+
+# ── (17) TOKENS — real spend recorded; honest null on omission; 0 != unmeasured ─
+# bin/heimdall-metric-hook's _sum_tokens measures real message.usage totals off a
+# dying subagent's own transcript; this proves the CLI seam that spend flows
+# through: --tokens N records the real integer, omitting the flag records JSON
+# null (never a fabricated 0, matching (15)'s honest-omission contract), and a
+# MEASURED zero-token attempt stays a real 0 — distinguishable from "unmeasured".
+R17="$(mk_repo tokens)"
+"$CLI" --repo "$R17" task --type code --model sonnet --outcome pass --tokens 15234 >/dev/null
+L="$(last "$R17")"
+printf '%s' "$L" | jq -e '.tokens==15234' >/dev/null \
+  && ok "(17) --tokens N records the real integer" \
+  || bad "(17) tokens not recorded: $L"
+
+"$CLI" --repo "$R17" task --type code --model sonnet --outcome pass >/dev/null
+L="$(last "$R17")"
+printf '%s' "$L" | jq -e '.tokens==null' >/dev/null \
+  && ok "(17) omitting --tokens records null, never a fabricated 0" \
+  || bad "(17) omission fabricated a value: $L"
+
+"$CLI" --repo "$R17" task --type code --model sonnet --outcome pass --tokens 0 >/dev/null
+L="$(last "$R17")"
+printf '%s' "$L" | jq -e '.tokens==0' >/dev/null \
+  && ok "(17) a MEASURED zero is recorded as 0, not null (0 != unmeasured)" \
+  || bad "(17) measured zero corrupted: $L"
+
+set +e
+OUT="$("$CLI" --repo "$R17" --strict task --model sonnet --outcome pass --tokens -5 2>&1 >/dev/null)"; RC=$?
+set -e
+[ "$RC" = "2" ] && printf '%s' "$OUT" | grep -q -- '--tokens' \
+  && ok "(17) a negative --tokens is REJECTED under --strict (exit 2, names the flag)" \
+  || bad "(17) negative tokens not rejected: rc=$RC out=$OUT"
+
+BEFORE17="$(rows "$R17")"
+"$CLI" --repo "$R17" task --model sonnet --outcome pass --tokens -5 >/dev/null 2>&1 || true
+[ "$(rows "$R17")" = "$BEFORE17" ] \
+  && ok "(17) without --strict, the same bad --tokens is a silent no-op (no row, no crash)" \
+  || bad "(17) bad tokens wrote a row anyway"
 
 echo
 echo "-----------------------------------"

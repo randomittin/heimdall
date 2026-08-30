@@ -37,6 +37,13 @@
 #   (17) THE SAME FIX COVERS experiment evaluate — the falsifier's variant sample
 #       count and pass_rate come from the identical _aggregate() call, so null-
 #       outcome variant records cannot dilute a KEEP/DISCARD verdict either.
+#   (18) TOKENS AGGREGATION — a "task" record's optional `tokens` field (recorded
+#       by bin/heimdall-metric per its own (17)) rolls up into tokens_known/
+#       total_tokens/avg_tokens the same STRICT way (16) already scores pass_rate:
+#       a null or wholly-missing `tokens` key is excluded from the denominator,
+#       never treated as a measured 0, and avg_tokens divides by tokens_known
+#       (not samples/seen). A corpus with a row predating this field entirely
+#       (no "tokens" key) must not crash collect — real backward compatibility.
 
 set -euo pipefail
 
@@ -416,6 +423,45 @@ EV="$("$CLI" --repo "$R" experiment evaluate --id "$EXP")"
 [ "$(echo "$EV" | jq -r '.decision')" = "keep" ] \
   && ok "(17) KEEP correctly reached on the true 3/3 rate — a flawless variant is no longer discarded by null padding" \
   || bad "(17) evaluate wrongly discarded a flawless variant: $(echo "$EV" | jq -c '.result')"
+
+# ── (18) TOKENS AGGREGATION — spend rolls up; a legacy tokens-less row is safe ──
+# bin/heimdall-metric now records --tokens (see test/heimdall-metric.test.sh case
+# 17); this proves _aggregate() folds that spend the same STRICT way it already
+# folds pass_rate: tokens_known/total_tokens/avg_tokens are computed only over
+# records that actually MEASURED a spend (a null or wholly-missing "tokens" key
+# is excluded, never treated as a measured 0), and a corpus row written before
+# this field existed (no "tokens" key at all) must not crash collect.
+R="$(mk_repo tokens-agg)"
+cat > "$R/.planning/metrics.jsonl" <<'EOF'
+{"ts":"2026-07-02T00:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":"pass","retries":0,"wall_secs":10,"tokens":1000}
+{"ts":"2026-07-02T01:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":"pass","retries":0,"wall_secs":10,"tokens":2000}
+{"ts":"2026-07-02T02:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":"fail","retries":1,"wall_secs":10,"tokens":null}
+{"ts":"2026-07-02T03:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":"pass","retries":0,"wall_secs":10}
+{"ts":"2026-07-02T04:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":"pass","retries":0,"wall_secs":10,"tokens":3500}
+{"ts":"2026-07-02T05:00:00Z","metric":"task","task_type":"docs","model":"opus","outcome":"pass","retries":0,"wall_secs":5}
+{"ts":"2026-07-02T06:00:00Z","metric":"task","task_type":"docs","model":"opus","outcome":"pass","retries":0,"wall_secs":6}
+EOF
+C="$("$CLI" --repo "$R" collect)"
+CODE="$(echo "$C" | jq -c '.cells[] | select(.task_type=="code" and .model=="sonnet")')"
+echo "$CODE" | jq -e '.samples==5' >/dev/null \
+  && ok "(18) collect still counts all 5 scorable code/sonnet records (tokens is orthogonal to scoring)" \
+  || bad "(18) samples wrong: $(echo "$CODE" | jq -c .)"
+echo "$CODE" | jq -e '.tokens_known==3' >/dev/null \
+  && ok "(18) tokens_known counts ONLY records with a real measured value (3 of 5: 1 null + 1 key-absent excluded)" \
+  || bad "(18) tokens_known wrong: $(echo "$CODE" | jq -c .)"
+echo "$CODE" | jq -e '.total_tokens==6500' >/dev/null \
+  && ok "(18) total_tokens sums only the 3 measured records (1000+2000+3500=6500)" \
+  || bad "(18) total_tokens wrong: $(echo "$CODE" | jq -c .)"
+echo "$CODE" | jq -e '.avg_tokens==2166.67' >/dev/null \
+  && ok "(18) avg_tokens divides by tokens_known (3), not samples (5): 6500/3=2166.67" \
+  || bad "(18) FALSIFIED: avg_tokens used the wrong denominator: $(echo "$CODE" | jq -c .)"
+DOCS="$(echo "$C" | jq -c '.cells[] | select(.task_type=="docs" and .model=="opus")')"
+echo "$DOCS" | jq -e '.tokens_known==0 and .total_tokens==0 and .avg_tokens==0' >/dev/null \
+  && ok "(18) a cell with ZERO measured tokens (both rows key-absent) reports 0/0/0.0, never divides by zero" \
+  || bad "(18) all-unmeasured cell mishandled: $(echo "$DOCS" | jq -c .)"
+echo "$C" | jq -e '.total_task_records==7' >/dev/null \
+  && ok "(18) a corpus mixing tokened, null-tokened, and key-absent rows collects cleanly (7 total, no crash)" \
+  || bad "(18) collect crashed or miscounted on a backward-compat corpus: $C"
 
 echo "======================="
 printf "self-improve: \033[32m%d passed\033[0m, " "$PASS"
