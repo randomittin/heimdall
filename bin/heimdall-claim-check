@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# bin/heimdall-claim-check — Stop-hook false-process-status detector.
+#
+# THE DEFECT. Measured 5 times in one session: the orchestrator stated a
+# background process's status in present tense from MEMORY of when it started
+# the process, not from a check at the moment it spoke. Concretely: said work
+# was "queued" with no queue entry behind it; said a tool "landed" when it was
+# unreachable dead code; said a sweep "is running now" / "sweep running (pid
+# 12908)" when the process had already exited — once 3 hours earlier, once 5
+# minutes earlier. Root cause is a STATEMENT problem, not a reasoning one: the
+# belief was correct when formed, and was never re-checked before being
+# spoken. A Stop hook — firing after the message is written, right before it
+# is delivered — is the one point that sees the FINAL text at the moment it
+# matters.
+#
+# EVIDENCE THIS IS BUILDABLE, NOT A PLACEBO (this repo's own tests, checked
+# before writing a line of this file):
+#   1. bin/heimdall-metric-hook's header states SubagentStop's JSON payload
+#      carries `agent_type`, `last_assistant_message`, and event plumbing
+#      (session_id, transcript paths, stop_hook_active, ...), checked against
+#      the official Claude Code hooks reference. test/heimdall-metric-hook.
+#      test.sh builds and feeds the hook a real payload containing a
+#      `last_assistant_message` field — a TESTED field, not a guess.
+#   2. Stop and SubagentStop share one internal dispatch handler (decompiled-
+#      binary evidence: both events differ only in one log-line's wording —
+#      "delivered to the model" vs "delivered to the subagent"). That makes it
+#      likely Stop's payload carries the same field, though this repo has not
+#      independently proven the Stop-specific case. Because of that gap, this
+#      tool does NOT rely solely on the direct field: it falls back to reading
+#      `.transcript_path`'s JSONL, a structure bin/heimdall-conformance already
+#      parses in production and test/heimdall-metric-hook.test.sh's own
+#      fixtures contain verbatim (`{"type":"assistant","message":{"content":
+#      [{"type":"text","text":"..."}]}}`).
+#
+# WHAT THIS DOES. Reads the assistant's final message text for the turn.
+# Scans it, sentence by sentence, for a PRESENT-TENSE claim that a process is
+# currently running (a sweep, an agent, a PID, a named tool). Cross-checks
+# each such claim against reality via `pgrep`/`kill -0`. If the text asserts a
+# process is running right now and no matching process exists, WARNS loudly
+# on stderr. Also handles the "landed"/"is wired"/"is done" shape: a claim
+# that some `bin/NAME` tool has shipped when it either does not exist on disk
+# or `heimdall-deadcode --why NAME` reports it DEAD.
+#
+# WHAT THIS DELIBERATELY DOES NOT CATCH (precision over recall, on purpose):
+#   - "queued" / "sweep needed" (absence) claims — a different claim shape,
+#     already covered by bin/heimdall-delivery-audit's queue/staleness checks.
+#   - vague, unattributable process claims with no PID, no "sweep" keyword,
+#     and no backtick-quoted token to check against reality (e.g. "the agent
+#     is still running this task" with nothing concrete to `pgrep` for) —
+#     silently skipped rather than guessed at. Never guess.
+#   - anything in past tense, conditional/future framing ("I'll check if X is
+#     running", "let me verify"), or quoting someone else's words (the
+#     sentence contains a literal `"`) — all deliberately suppressed so this
+#     never false-positives on correct hedging or correctly-reported history.
+#   - claims that only become false when combined across multiple sentences
+#     or turns — this scans one sentence at a time, within one message.
+#
+# NEVER BLOCKS. Exits 0 unconditionally, on every code path — a false-status
+# warning is a loud nudge, never a correctness gate, and must never wedge a
+# Stop turn or a session. Delivery is stderr-only, NOT stdout
+# `hookSpecificOutput.additionalContext` — a second Stop hook returning
+# additionalContext alongside the already-wired heimdall-metric-reminder.sh
+# has untested composition behavior (concatenate? overwrite? error?), and
+# risking a regression of that already-working mechanism is not justified by
+# this warning's severity. Revisit if stderr-only proves to go unnoticed.
+#
+# CONFIGURATION (env, all optional):
+#   HEIMDALL_CLAIM_CHECK_SWEEP_PATTERN            pgrep -f pattern for "the
+#                                                  sweep". default: test/run-all\.sh
+#   HEIMDALL_CLAIM_CHECK_TRANSCRIPT_TAIL_BYTES    bytes tailed from
+#                                                  transcript_path before
+#                                                  parsing. default: 262144
+set -uo pipefail
+
+REPO="${CLAUDE_PROJECT_DIR:-.}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) REPO="${2:-$REPO}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -d "$REPO" ] || exit 0
+
+command -v jq >/dev/null 2>&1 || exit 0
+
+input="$(cat 2>/dev/null || true)"
+[ -n "$input" ] || exit 0
+
+# --- extract the assistant's final message text for this turn -------------
+# Path 1: direct field (proven real+tested for SubagentStop; inferred for Stop).
+text="$(printf '%s' "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null || true)"
+
+# Path 2: fall back to the transcript JSONL's last assistant/text record.
+if [ -z "$text" ]; then
+  transcript_path="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
+  if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+    tail_bytes="${HEIMDALL_CLAIM_CHECK_TRANSCRIPT_TAIL_BYTES:-262144}"
+    last_json="$(tail -c "$tail_bytes" "$transcript_path" 2>/dev/null \
+      | jq -R -r '
+          try (
+            (. | fromjson) as $r
+            | select($r.type == "assistant")
+            | ($r.message.content // [])
+            | map(select(.type == "text") | .text)
+            | join("\n")
+            | select(length > 0)
+            | {text: .}
+            | @json
+          ) catch empty
+        ' 2>/dev/null | tail -1 || true)"
+    if [ -n "$last_json" ]; then
+      text="$(printf '%s' "$last_json" | jq -r '.text // empty' 2>/dev/null || true)"
+    fi
+  fi
+fi
+
+[ -n "$text" ] || exit 0
+
+# --- reality-check primitives -----------------------------------------------
+pid_alive() {
+  kill -0 "$1" >/dev/null 2>&1
+}
+
+sweep_running() {
+  local pattern="${HEIMDALL_CLAIM_CHECK_SWEEP_PATTERN:-test/run-all\.sh}"
+  pgrep -f -- "$pattern" >/dev/null 2>&1
+}
+
+token_running() {
+  pgrep -f -- "$1" >/dev/null 2>&1
+}
+
+# run_claim_reason SENTENCE — echoes a warn reason if SENTENCE's present-tense
+# "a process is running" claim contradicts reality. Returns 1 with no output
+# if the claim matches reality, or if it names nothing concrete enough to
+# check (no pid, no "sweep" keyword, no backtick-quoted token) — never guess.
+run_claim_reason() {
+  local sentence="$1" pid token
+  pid="$(printf '%s' "$sentence" | grep -oiE '\bpid[[:space:]:=]*[0-9]+' | grep -oE '[0-9]+' | head -1)"
+  if [ -n "$pid" ]; then
+    if ! pid_alive "$pid"; then
+      echo "no process with pid $pid is running"
+      return 0
+    fi
+    return 1
+  fi
+  if printf '%s' "$sentence" | grep -qiE '\bsweep\b'; then
+    if ! sweep_running; then
+      echo "no process matching the sweep pattern is running"
+      return 0
+    fi
+    return 1
+  fi
+  token="$(printf '%s' "$sentence" | grep -oE '`[^`]+`' | head -1 | tr -d '`')"
+  if [ -n "$token" ] && ! token_running "$token"; then
+    echo "no process matching \`$token\` is running"
+    return 0
+  fi
+  return 1
+}
+
+# dead_tool_reason NAME — echoes a warn reason if bin/NAME is a false
+# landed/wired/done claim: either the file does not exist at all, or
+# heimdall-deadcode explicitly reports it DEAD. Returns 1 with no output if
+# the tool is live, or if liveness cannot be determined (heimdall-deadcode
+# missing, or its own ambiguous exit 2) — never guess.
+dead_tool_reason() {
+  local name="$1" path dc rc
+  path="$REPO/bin/$name"
+  if [ ! -f "$path" ]; then
+    echo "bin/$name does not exist on disk"
+    return 0
+  fi
+  dc="$REPO/bin/heimdall-deadcode"
+  [ -x "$dc" ] || return 1
+  "$dc" --why "$name" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 1 ]; then
+    echo "bin/$name is reported DEAD by heimdall-deadcode"
+    return 0
+  fi
+  return 1
+}
+
+WARN() {
+  warned=$((warned + 1))
+  {
+    echo "BIFROST -- heimdall-claim-check: false process-status claim detected"
+    echo "  claim: $1"
+    echo "  reality: $2"
+    echo "  restate from a live check, not memory, before this reaches the user."
+  } >&2
+}
+
+# --- regex vocabulary --------------------------------------------------------
+RUN_CLAIM='\b(is|are)[[:space:]]+(currently[[:space:]]+)?running\b|\bstill[[:space:]]+running\b|\bin[[:space:]]+(flight|progress)\b|\b(now[[:space:]]+running|running[[:space:]]+now)\b|\bsweep[[:space:]]+(is[[:space:]]+)?running\b|\bagent[[:space:]]+(is[[:space:]]+)?working\b|\bcurrently[[:space:]]+running\b'
+DEAD_CLAIM='\blanded\b|\bis[[:space:]]+wired\b|\bis[[:space:]]+done\b|\bhas[[:space:]]+shipped\b|\bis[[:space:]]+live\b'
+PAST_GUARD='\bwas\b|\bwere\b|\bhad\b|\bfinished\b|\bexited\b|\bcompleted\b|\bhas[[:space:]]+(finished|exited|completed)\b|\bearlier\b|\bago\b|\bpreviously\b|\bused[[:space:]]+to\b|\bno[[:space:]]+longer\b|\bstopped\b'
+COND_GUARD='\bif\b|\bwhether\b|\bi.ll\b|\bi[[:space:]]+will\b|\blet[[:space:]]+me\b|\bgoing[[:space:]]+to\b|\bwill[[:space:]]+check\b|\bneed[[:space:]]+to[[:space:]]+(check|verify)\b|\bcan[[:space:]]+check\b|\bshould[[:space:]]+check\b|\bwill[[:space:]]+land\b|\bwould[[:space:]]+land\b'
+
+# --- strip fenced code blocks, then split into sentences --------------------
+scrubbed="$(printf '%s\n' "$text" | awk '/^```/{f=!f;next} !f')"
+sentences="$(printf '%s\n' "$scrubbed" | sed -E 's/([.!?])[[:space:]]+/\1\n/g')"
+
+warned=0
+while IFS= read -r sentence; do
+  [ -n "$sentence" ] || continue
+
+  case "$sentence" in
+    *'"'*) continue ;;
+  esac
+
+  if printf '%s' "$sentence" | grep -qiE -- "$PAST_GUARD"; then continue; fi
+  if printf '%s' "$sentence" | grep -qiE -- "$COND_GUARD"; then continue; fi
+
+  if printf '%s' "$sentence" | grep -qiE -- "$RUN_CLAIM"; then
+    reason="$(run_claim_reason "$sentence")" && [ -n "$reason" ] && WARN "$sentence" "$reason"
+  fi
+
+  if printf '%s' "$sentence" | grep -qiE -- "$DEAD_CLAIM"; then
+    name="$(printf '%s' "$sentence" | grep -oE 'bin/[A-Za-z0-9._-]+' | head -1 | sed -E 's#^bin/##')"
+    if [ -n "$name" ]; then
+      reason="$(dead_tool_reason "$name")" && [ -n "$reason" ] && WARN "$sentence" "$reason"
+    fi
+  fi
+done < <(printf '%s\n' "$sentences")
+
+if [ "$warned" -gt 0 ]; then
+  echo "heimdall-claim-check: $warned claim(s) flagged this turn -- see above." >&2
+fi
+
+exit 0
