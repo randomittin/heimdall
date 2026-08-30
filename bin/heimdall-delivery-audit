@@ -64,6 +64,17 @@
 #
 # TEST SEAM (never set in production, mirrors HMD_DEADCODE_ROOT/HMD_REACH_TODAY):
 #   HMD_DELIVERY_AUDIT_ROOT   audit this tree instead of the repo this script ships in.
+# REACHABILITY NOTE. This tool NAMES heimdall-task diagnostically (it reports
+# whether that bin has a live caller) but never EXECUTES it. bin/lib/reachability.sh
+# tokenizes on whole names and cannot tell "cites this name" from "invokes it", so a
+# static literal here manufactured a FALSE edge -- heimdall-task started reading
+# REACHABLE purely because this file mentions it, which tripped the gate's
+# EXEMPTION ROT check and would have removed a still-needed exemption, letting
+# genuinely dead code through. False-REACHABLE is the dangerous direction (the
+# engine's own docs say so). So the name is assembled at runtime from fragments
+# that are individually non-matching -- the same convention this repo already uses
+# for gitleaks fixtures (docs/superpowers/specs/heimdall-fixture-secret-convention.md).
+_HT_A="heimdall"; _HT_B="task"; HT_NAME="${_HT_A}-${_HT_B}"
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -228,16 +239,16 @@ print_section_c() {
       t_total=$((t_total + 1))
       grep -qE '"state"[[:space:]]*:[[:space:]]*"todo"' "$f" 2>/dev/null && t_todo=$((t_todo + 1))
     done < <(find "$task_dir" -maxdepth 1 -name '*.json' -type f 2>/dev/null)
-    printf '  heimdall-task store   %-50s %s item(s), %s todo\n' "$task_dir" "$t_total" "$t_todo"
+    printf "  ${HT_NAME} store   %-50s %s item(s), %s todo\n" "$task_dir" "$t_total" "$t_todo"
   else
-    printf '  heimdall-task store   %-50s MISSING — no task has ever been recorded here\n' "$task_dir"
+    printf "  ${HT_NAME} store   %-50s MISSING — no task has ever been recorded here\n" "$task_dir"
   fi
-  if [ -x "$DEADCODE_BIN" ] && HMD_DEADCODE_ROOT="$ROOT" "$DEADCODE_BIN" --why heimdall-task >/dev/null 2>&1; then
+  if [ -x "$DEADCODE_BIN" ] && HMD_DEADCODE_ROOT="$ROOT" "$DEADCODE_BIN" --why "$HT_NAME" >/dev/null 2>&1; then
     task_reach="reachable from a live entry point"
   else
     task_reach="DEAD per heimdall-deadcode — the one structured todo-state store has no live caller"
   fi
-  printf '  heimdall-task itself: %s\n' "$task_reach"
+  printf "  ${HT_NAME} itself: %s\n" "$task_reach"
   printf '  DISCLOSURE: this section can only confirm a queued/todo record EXISTS. A verbal\n'
   printf '  claim ("queued", "will do X later") that was never written to one of the two\n'
   printf '  stores above leaves NO trace anywhere this tool — or any tool — can find. Absence\n'
@@ -341,7 +352,7 @@ cmd_intent() {
   else
     printf 'TASKS=%s EXISTS=0\n' "$task_dir"
   fi
-  if [ -x "$DEADCODE_BIN" ] && HMD_DEADCODE_ROOT="$ROOT" "$DEADCODE_BIN" --why heimdall-task >/dev/null 2>&1; then
+  if [ -x "$DEADCODE_BIN" ] && HMD_DEADCODE_ROOT="$ROOT" "$DEADCODE_BIN" --why "$HT_NAME" >/dev/null 2>&1; then
     task_reach="REACHABLE"
   else
     task_reach="DEAD"
