@@ -2443,6 +2443,23 @@ case "${1:-}" in
     fi
     exec "$REDUM_BIN" "$@"
     ;;
+  delivery-audit)
+    # Pass-through to bin/heimdall-delivery-audit (delivery-claim falsifier — makes
+    # "queued"/"landed"/"running now" claims checkable: dead-on-arrival reachability
+    # reuse of heimdall-deadcode, background-artifact staleness, and recorded-intent
+    # lookup; see that bin's own --help for report/--json/artifact/intent). Added
+    # after three measured overclaims in one session went uncaught until a human
+    # noticed. All args forward verbatim, so a routed run and a direct bin run are
+    # byte-identical.
+    shift
+    DELIVERY_AUDIT_BIN="$PLUGIN_DIR/bin/heimdall-delivery-audit"
+    if [ ! -x "$DELIVERY_AUDIT_BIN" ]; then
+      echo "  Error: heimdall-delivery-audit not found at $DELIVERY_AUDIT_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$DELIVERY_AUDIT_BIN" "$@"
+    ;;
   wrap|unwrap)
     # §7 Pass-through to heimdall-wrap: ONE command that installs the Layer-0 git
     # hooks, writes the AGENTS.md fenced block, starts presence and launches the
