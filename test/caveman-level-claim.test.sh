@@ -1,36 +1,41 @@
 #!/usr/bin/env bash
 #
 # caveman-level-claim.test.sh — hmd may REPORT the caveman level in force; it may
-# never ASSERT one.
+# never ASSERT one it does not actually have.
 #
 # THE BUG THIS PINS
 # hmd's system preamble hardcoded "CAVEMAN ULTRA (max compression, every
 # response)", and three specialist agent templates carried a "## CAVEMAN ULTRA
-# active" header. None of it was true on any session hmd has ever run. The level
-# is written to `.caveman-active` by the caveman plugin's mode-tracker hook when
-# a human types `/caveman lite|full|ultra`. hmd never writes that file — it is
-# the operator's config — and the observed value is `full`.
+# active" header. None of it was true on any session hmd has ever run.
 #
 # So hmd shipped a declaration with no mechanism behind it: the failure class
 # this repo exists to catch, inside its own prompt. Worse than cosmetic, because
 # a model told "ultra is active" reports ultra behaviour it was never given the
 # rules for, and nothing goes red.
 #
-# UPDATED 2026-08-30: hmd no longer installs the external plugin at all (see
-# CLAUDE.md "Token Efficiency") and owns a level of its own directly
-# (bin/heimdall-caveman). The plugin-present path this file pins is UNCHANGED;
-# what used to be the "absent/corrupt ⇒ claim nothing" path now falls through
-# to hmd's own real level instead (guarantee 1, below) — see
-# heimdall-caveman-no-plugin.test.sh for the dedicated fresh-install proof.
+# OWNERSHIP MOVED IN-HOUSE, 2026-08-30
+# The level used to live in `.caveman-active`, written by an external caveman
+# plugin's own mode-tracker hook — hmd never wrote it, and could only report
+# what it happened to observe there. hmd no longer installs that plugin at all
+# (see CLAUDE.md "Token Efficiency") and now owns the level directly:
+# bin/heimdall-caveman, backed by $HEIMDALL_HOME/caveman-level.
+# bin/heimdall-caveman-block reflects this: it no longer reads `.caveman-active`
+# in any form, not even as a fallback, and unconditionally defers to
+# `heimdall-caveman rules` for the real, currently configured level and text.
+# See heimdall-caveman-no-plugin.test.sh for the dedicated fresh-install proof.
 #
 # Guarantees proved here:
-#   1. The block reports the live level, per state (full / ultra), and for an
-#      absent/corrupt plugin flag falls through to hmd's OWN level instead of
-#      claiming none — a behavioural check, not a grep for a string.
-#   2. Not-ultra is stated as not-ultra, with the command that would change it.
-#   3. No shipped source file asserts a caveman LEVEL as an active fact.
-#   4. The launcher is actually wired to the helper (else 1-2 prove nothing).
-#   5. Fail-open: a broken helper degrades, and the degraded text claims no level.
+#   1. The block reports the live level (full / ultra) hmd itself has set, via
+#      its own real rules text — a behavioural check, not a grep for a string.
+#   2. The block names the real, current way to change level
+#      (`heimdall-caveman set`) and never the retired plugin command or a
+#      disclaimer that hmd does not own the level — it does now.
+#   3. Losing the block's only dependency (bin/heimdall-caveman itself missing)
+#      degrades cleanly and still claims no specific level — fail-open one
+#      layer up from guarantee 6 below.
+#   4. No shipped source file asserts a caveman LEVEL as an active fact.
+#   5. The launcher is actually wired to the helper (else 1-3 prove nothing).
+#   6. Fail-open: a broken helper degrades, and the degraded text claims no level.
 #
 # Usage: test/caveman-level-claim.test.sh   (exit 0 = all guarantees hold)
 set -uo pipefail
@@ -38,6 +43,7 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 BLOCK="$REPO/bin/heimdall-caveman-block"
+CAV="$REPO/bin/heimdall-caveman"
 
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
@@ -45,16 +51,19 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
-# Run the block with a fixture config dir. Empty arg = no flag file at all.
+# Run the block against an isolated hmd state dir. A level of "" leaves hmd's
+# own state unconfigured (fresh install), which bin/heimdall-caveman resolves
+# to its own DEFAULT_LEVEL. There is no plugin flag concept left to seed —
+# bin/heimdall-caveman-block never reads one any more — so seeding now goes
+# through the real `heimdall-caveman set` command against an isolated
+# HEIMDALL_HOME, never a hand-written `.caveman-active` file.
 run_at() {
-  local lvl="$1" dir="$TMP/cfg" hh="$TMP/hh"
-  rm -rf "$dir"; mkdir -p "$dir"
-  [ -n "$lvl" ] && printf '%s\n' "$lvl" > "$dir/.caveman-active"
-  # HEIMDALL_HOME is ALSO isolated + reset every call: once no plugin flag is
-  # recognized, the block falls through to bin/heimdall-caveman, which would
-  # otherwise read/seed the REAL machine's ~/.heimdall/caveman-level.
-  rm -rf "$hh"
-  CLAUDE_CONFIG_DIR="$dir" HEIMDALL_HOME="$hh" "$BLOCK" 2>/dev/null
+  local lvl="$1" hh="$TMP/hh"
+  rm -rf "$hh"; mkdir -p "$hh"
+  if [ -n "$lvl" ]; then
+    HEIMDALL_HOME="$hh" "$CAV" set "$lvl" >/dev/null 2>&1
+  fi
+  HEIMDALL_HOME="$hh" "$BLOCK" 2>/dev/null
 }
 
 echo "caveman-level-claim harness  repo=$REPO"
@@ -64,9 +73,15 @@ echo "--------------------------------------------------------------------"
   || bad "bin/heimdall-caveman-block missing or not executable"
 
 # ── 1. THE BLOCK REPORTS THE LIVE LEVEL ──
+# Matched against the HEADER line specifically ("HMD OUTPUT COMPRESSION —
+# level: <lvl>"), not a bare `level: full` substring: every level's rules text
+# also contains the unrelated boilerplate sentence "Default level: full.
+# Change level: ..." (see bin/heimdall-caveman's _rules_lite/_rules_full/
+# _rules_ultra), so a bare substring match on ultra's own output would
+# false-positive on that sentence and "prove" a bug that is not there.
 out="$(run_at full)"
 case "$out" in
-  *'level `full`'*) ok "level=full is reported as full" ;;
+  *'HMD OUTPUT COMPRESSION — level: full'*) ok "level=full is reported as full" ;;
   *) bad "level=full produced: $out" ;;
 esac
 case "$out" in
@@ -76,46 +91,50 @@ esac
 
 out="$(run_at ultra)"
 case "$out" in
-  *'level `ultra`'*) ok "level=ultra is reported as ultra" ;;
+  *'HMD OUTPUT COMPRESSION — level: ultra'*) ok "level=ultra is reported as ultra" ;;
   *) bad "level=ultra produced: $out" ;;
 esac
-# When ultra IS the live level, the "you are not on ultra" nudge must not appear.
 case "$out" in
-  *'will not set it for you'*) bad "level=ultra still prints the raise-to-ultra nudge" ;;
-  *) ok "level=ultra omits the raise-to-ultra nudge (already there)" ;;
+  *'HMD OUTPUT COMPRESSION — level: full'*) bad "level=ultra still asserts full in its header: $out" ;;
+  *) ok "level=ultra never asserts full in its header" ;;
 esac
 
-# ── 2. NOT-ULTRA SAYS SO, AND SAYS WHO CAN CHANGE IT ──
+# ── 2. THE BLOCK NAMES THE REAL WAY TO CHANGE LEVEL, NEVER THE RETIRED ONE ──
 out="$(run_at lite)"
 case "$out" in
-  *'/caveman ultra'*) ok "a non-ultra level names the command that would raise it" ;;
-  *) bad "non-ultra level does not say how to reach ultra: $out" ;;
+  *'heimdall-caveman set'*) ok "block names the real change-level command" ;;
+  *) bad "block does not say how to change level: $out" ;;
 esac
 case "$out" in
-  *'hmd will not set it'*) ok "block states hmd does not set the level (it is operator config)" ;;
-  *) bad "block does not disclaim ownership of the level: $out" ;;
+  *'/caveman '*) bad "block still references the retired plugin slash command: $out" ;;
+  *) ok "block does not reference the retired /caveman slash command" ;;
+esac
+case "$out" in
+  *'will not set it for you'*|*'does not set the level'*|*'does not restate them'*)
+    bad "block still disclaims hmd ownership of the level, which is now false: $out" ;;
+  *) ok "block does not disclaim ownership of the level — hmd sets it now" ;;
 esac
 
-# ── 3. ABSENT/CORRUPT PLUGIN FLAG FALLS THROUGH TO HMD'S OWN LEVEL ──
-# No recognized plugin flag (missing file, or a value outside
-# lite/full/ultra/wenyan*) no longer means "nothing to say" now that hmd owns
-# its own level directly (bin/heimdall-caveman) -- it falls through to THAT
-# instead of a generic placeholder. See heimdall-caveman-no-plugin.test.sh for
-# the dedicated fresh-install proof; this section only re-confirms the corrupt
-# VALUE itself is never echoed back as if it were real.
-for state in "" MAXIMUM "full; rm -rf /"; do
-  label="${state:-<no flag file>}"
-  out="$(run_at "$state")"
-  case "$out" in
-    *'HMD OUTPUT COMPRESSION'*) ok "state '$label' falls through to hmd's own level + rules" ;;
-    *) bad "state '$label' produced neither a plugin level nor hmd's own rules: $(printf '%s' "$out" | head -1)" ;;
-  esac
-done
-# A corrupt file must not be echoed back as if it were a real setting.
-out="$(run_at MAXIMUM)"
+# ── 3. FAIL-OPEN WHEN heimdall-caveman ITSELF IS MISSING ──
+# The block no longer reads any plugin flag; its only dependency is its sibling
+# heimdall-caveman. Prove that losing that sibling degrades cleanly instead of
+# erroring, by running an isolated copy of ONLY the block (no sibling present).
+ISO="$TMP/iso-no-caveman"
+rm -rf "$ISO"; mkdir -p "$ISO"
+cp "$BLOCK" "$ISO/heimdall-caveman-block"
+out="$(HEIMDALL_HOME="$TMP/hh-iso" "$ISO/heimdall-caveman-block" 2>/dev/null)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+  ok "missing sibling heimdall-caveman degrades instead of erroring (rc=0)"
+else
+  bad "missing sibling heimdall-caveman broke the block (rc=$rc): $out"
+fi
 case "$out" in
-  *MAXIMUM*) bad "corrupt flag value was parroted into the prompt as a live level" ;;
-  *) ok "corrupt flag value is not parroted as a live level" ;;
+  *'no caveman level set'*) ok "degraded output claims no level, per the fail-open contract" ;;
+  *) bad "degraded output did not use the expected no-level fallback text: $out" ;;
+esac
+case "$out" in
+  *'level: full'*|*'level: ultra'*|*'level: lite'*) bad "degraded path invented a level: $out" ;;
+  *) ok "degraded path names no specific level" ;;
 esac
 
 # ── 4. NO SHIPPED FILE ASSERTS A LEVEL ──
@@ -183,25 +202,15 @@ case "$degraded" in
 esac
 
 echo ""
-# ── wenyan-* are real compression levels, not garbage ─────────────────────────
-# caveman-config.js's VALID_MODES includes wenyan, wenyan-lite, wenyan-full and
-# wenyan-ultra. The level parser once matched only lite|full|ultra, so a live
-# wenyan session was reported as "no level set" — the same misreport this whole
-# helper exists to prevent, just for an exotic mode nobody tested.
-for wy in wenyan wenyan-lite wenyan-full wenyan-ultra; do
-  out="$(run_at "$wy")"
-  case "$out" in
-    *"level \`$wy\`"*) ok "$wy reported as its own level" ;;
-    *) bad "$wy was not reported as a level: $out" ;;
-  esac
-done
-
-# wenyan-ultra IS max compression — it must not be told to escalate to ultra.
-out="$(run_at wenyan-ultra)"
-case "$out" in
-  *"Max compression is"*) bad "wenyan-ultra told to escalate — it is already max" ;;
-  *) ok "wenyan-ultra not told to escalate (already max)" ;;
-esac
+# ── wenyan-* modes: DELIBERATELY NO LONGER TESTED HERE ────────────────────────
+# The retired external plugin also supported wenyan / wenyan-lite / wenyan-full
+# / wenyan-ultra modes, tracked via `.caveman-active`. Since ownership moved
+# in-house (2026-08-30), bin/heimdall-caveman-block never reads that flag at
+# all any more (see its own header), and bin/heimdall-caveman does not own
+# those modes either (see its "SCOPE" header — wenyan-*/off are explicitly out
+# of scope). This is a known, accepted scope reduction that came with
+# in-housing ownership, not a gap this suite silently stopped covering by
+# accident.
 
 echo "caveman-level-claim.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1

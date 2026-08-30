@@ -4104,19 +4104,22 @@ fi
 # mechanism behind it — the exact false-declaration class this repo exists to
 # catch, shipped in its own prompt.
 #
-# It was also a duplicate. When the external plugin is installed its own
-# SessionStart hook injects the complete ruleset for the active level. hmd
-# restating a (different, wrong) ruleset underneath it spent tokens to
-# contradict the authority. So: when the plugin is live, name the level and
-# defer.
+# It was also a duplicate. Installed, the external plugin's own SessionStart
+# hook injects the complete ruleset for the active level; hmd restating a
+# (different, wrong) ruleset underneath it spent tokens to contradict the
+# authority on the subject.
 #
-# UPDATED 2026-08-30: hmd no longer installs that plugin (first_run_setup's
-# companion:caveman step is gone) and owns a level of its own directly
-# (bin/heimdall-caveman). So "plugin absent" no longer means "nothing to say"
-# — hmd now supplies its OWN real, currently configured level + rules there
-# instead of a placeholder. Only if bin/heimdall-caveman itself is also
-# missing/broken does the text fall all the way back to claiming no level.
-# See bin/heimdall-caveman-block for the actual fallback logic.
+# UPDATED 2026-08-30: hmd now OWNS the level directly (bin/heimdall-caveman,
+# $HEIMDALL_HOME/caveman-level) and no longer installs that external plugin at
+# all (first_run_setup's companion:caveman step is gone). The text below no
+# longer branches on whether a plugin is "live" — it always defers to hmd's
+# own heimdall-caveman tool for the real, currently configured level and
+# rules, and only falls back to a generic no-level placeholder if that tool
+# itself is missing or broken. It deliberately never reads the plugin's own
+# `.caveman-active` flag any more either: that is the exact file observed to
+# silently reset itself on session restart, which is why ownership moved
+# in-house (see bin/heimdall-caveman's "DIVERGENCE / RESTART SAFETY"). See
+# bin/heimdall-caveman-block for the actual logic.
 #
 # The text lives in bin/heimdall-caveman-block so it can be tested against a
 # given state rather than merely grepped for. Guarded like resolve_model(): under
