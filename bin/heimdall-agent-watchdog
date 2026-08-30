@@ -369,6 +369,87 @@ cmd_run() {
 # payload, no agent_transcript_path, no readable transcript, no top-level
 # "cwd" field on any line, or a cwd that does not resolve to a real git
 # worktree all degrade to "do nothing", never a guess. ALWAYS exits 0.
+# ── cmd_sweep — BROAD preservation, independent of the interrupted list ──────
+# WHY THIS EXISTS, measured 2026-08-30: cmd_run above iterates ONLY the rows
+# heimdall-agent-resume reports, and that tool lists only agents recorded as
+# INTERRUPTED. A 50-turn-limit stop is NOT recorded there. First real use of
+# this watchdog therefore missed a turn-limited agent carrying 1 uncommitted
+# file, and the work was preserved by hand -- the exact manual step this tool
+# exists to remove. Net effect was backwards: cmd_run covered the case that
+# must NEVER be auto-retried (quota) and missed the most common case that
+# SHOULD be resumed (turn limit).
+#
+# Detection breadth and classification breadth are DIFFERENT problems, so they
+# are split here rather than fused:
+#   - PRESERVING is additive and non-destructive (it only ever `git commit`s
+#     inside an agent's own worktree), so it takes the BROADEST signal: any
+#     .claude/worktrees/agent-* directory holding uncommitted changes. Over-
+#     preserving costs one extra commit; under-preserving loses work forever.
+#   - CLASSIFYING drives retry decisions, where a wrong answer burns quota or
+#     repeats a failure, so it stays narrow and keeps using the recorded reason
+#     (cmd_run). Sweep deliberately makes NO retry recommendation at all.
+#
+# LIVENESS -- honest limitation, not a solved problem. There is no reliable way
+# from outside to tell whether an in-process subagent still owns a worktree:
+# these agents have no per-spawn OS pid (a sibling task shipped pid-less pool
+# entries on that assumption today and wedged the tool). So this uses a
+# conservative STALENESS heuristic: a worktree is only swept if nothing in it
+# has been modified for at least HMD_WATCHDOG_STALE_SECS (default 600s, matching
+# the harness stall watchdog). A live agent mid-edit touches files far more
+# often than that, so the window is deliberately wide. This is a HEURISTIC and
+# is documented as one; it is not a liveness proof.
+cmd_sweep() {
+  local as_json="" repo="$PWD" stale="${HMD_WATCHDOG_STALE_SECS:-600}" dry=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      --repo) repo="$2"; shift 2 ;;
+      --stale-secs) stale="$2"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      *) echo "heimdall-agent-watchdog: unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || repo="$PWD"
+  local repo_real; repo_real="$(_wd_realpath "$repo")"
+  local now; now="$(date +%s 2>/dev/null)" || now=0
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+
+  local results="" wt id newest age preserve base
+  for wt in "$repo"/.claude/worktrees/agent-*; do
+    [ -d "$wt" ] || continue
+    _wd_worktree_exists "$wt" || continue
+    # dirty?
+    [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ] || continue
+    id="$(basename "$wt")"; id="${id#agent-}"
+    # staleness: newest mtime of any tracked-or-untracked file in the worktree
+    newest="$(find "$wt" -type f -not -path '*/.git/*' -newermt "@$(( now - stale ))" -print -quit 2>/dev/null)"
+    if [ -n "$newest" ] && [ "$now" -gt 0 ]; then
+      base="$(jq -n --arg id "$id" --arg wt "$wt"         '{id:$id, worktree:$wt, swept:false, reason:"recently_modified_maybe_live"}')"
+      results="$results$base"$'\n'
+      continue
+    fi
+    if [ -n "$dry" ]; then
+      base="$(jq -n --arg id "$id" --arg wt "$wt"         '{id:$id, worktree:$wt, swept:false, reason:"dry_run"}')"
+    else
+      preserve="$(_wd_preserve "$wt" "$repo_real" "$id")"
+      base="$(jq -n --arg id "$id" --arg wt "$wt" --argjson p "$preserve"         '{id:$id, worktree:$wt, swept:($p.committed // false), preserve:$p}')"
+    fi
+    results="$results$base"$'\n'
+  done
+
+  if [ -n "$as_json" ]; then
+    printf '%s' "$results" | jq -s '.'
+    return 0
+  fi
+  local n; n="$(printf '%s' "$results" | grep -c . 2>/dev/null || true)"; [ -n "$n" ] || n=0
+  if [ "$n" = "0" ]; then
+    echo "sweep: no agent worktree carries uncommitted work"
+    return 0
+  fi
+  printf '%s' "$results" | jq -r '"  \(.id[0:12])  swept=\(.swept)  \(.reason // .preserve.reason)"'
+  return 0
+}
+
 cmd_stop_hook() {
   local repo="$PWD"
   while [ $# -gt 0 ]; do
@@ -425,6 +506,7 @@ main() {
   case "$sub" in
     run)       shift; cmd_run "$@" ;;
     stop-hook) shift; cmd_stop_hook "$@" ;;
+    sweep)     shift; cmd_sweep "$@" ;;
     -h|--help|help|'') usage ;;
     *) echo "error: unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
   esac
