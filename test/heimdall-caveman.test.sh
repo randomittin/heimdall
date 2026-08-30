@@ -8,6 +8,10 @@
 # HEIMDALL_HOME and CLAUDE_CONFIG_DIR to a fresh $TMPDIR subdirectory, so the
 # real ~/.heimdall/caveman-level and ~/.claude/.caveman-active are never
 # touched — same convention as test/caveman-level-claim.test.sh's run_at().
+# Also covers a regression the owner observed first-hand mid-build: the
+# plugin silently rewrites its OWN flag file back to its default on session
+# restart, so hmd's resolved level (and a stderr divergence warning when the
+# two disagree) must survive that -- see "restart-survival" below.
 
 set -uo pipefail
 
@@ -144,11 +148,73 @@ printf 'ultra\n' > "$D/claude/.caveman-active"
 out="$(run "$D" get)"
 [ "$out" = "ultra" ] && ok "migration: plugin flag 'ultra' is adopted on first get" || bad "migration: expected 'ultra' from plugin flag, got '$out'"
 [ -f "$D/home/caveman-level" ] && ok "migration seeds hmd's own state file" || bad "migration did not create hmd's own state file"
-# Change the plugin flag AFTER migration — hmd must not look at it again.
+# Change the plugin flag AFTER migration — hmd must not ADOPT it again (it
+# WILL now also emit a stderr divergence warning here, since 'lite' != the
+# already-adopted 'ultra' -- that warning path gets its own dedicated,
+# stdout/stderr-isolated assertions in the "restart-survival" block below,
+# so this block only re-asserts what it always asserted: the resolved VALUE).
 printf 'lite\n' > "$D/claude/.caveman-active"
-out2="$(run "$D" get)"
+out2="$(run "$D" get 2>/dev/null)"
 [ "$out2" = "ultra" ] && ok "migration is one-time: later plugin-flag edits are ignored (still 'ultra', got '$out2')" \
   || bad "migration re-read the plugin flag after the first seed (got '$out2', expected 'ultra')"
+
+# ── restart-survival regression: hmd's level must survive the plugin
+# silently rewriting its OWN flag file, exactly as observed first-hand on
+# this repo's own session (2026-08-30) -- operator set the plugin's flag to
+# "ultra" directly, then simply restarted the session (/login); with no
+# action from hmd or the operator, the plugin's flag file's mtime advanced
+# and its content reverted to "full". Simulated here by writing hmd's level
+# via `set` (the authoritative path), then overwriting the PLUGIN's flag
+# file out from under it (hmd's own state file is never touched), then
+# re-invoking `get` as a brand-new process -- proving hmd's answer is
+# unaffected by what the plugin's file now says. ──
+D="$(fresh)"
+run "$D" set ultra >/dev/null 2>&1
+printf 'full\n' > "$D/claude/.caveman-active"   # simulate the plugin's own silent reset
+out="$(run "$D" get 2>/dev/null)"
+[ "$out" = "ultra" ] && ok "restart-survival: hmd keeps 'ultra' after the plugin's flag silently reverts to 'full'" \
+  || bad "restart-survival: hmd's level was clobbered by the plugin's flag (got '$out', expected 'ultra')"
+
+# Divergence must be surfaced on stderr and MUST NOT pollute stdout -- a hook
+# pipes stdout straight into injected context, so stdout has to stay a bare
+# level string even while the warning fires. `2>&1 1>/dev/null` isolates
+# stderr into the capture (swap trick: dup stderr to the old stdout target,
+# THEN send stdout to /dev/null -- order matters).
+stderr_out="$(run "$D" get 2>&1 1>/dev/null)"
+case "$stderr_out" in
+  *"diverged"*"ultra"*"full"*) ok "restart-survival: divergence warning on stderr names both values" ;;
+  *) bad "restart-survival: no divergence warning on stderr (got: '$stderr_out')" ;;
+esac
+stdout_out="$(run "$D" get 2>/dev/null)"
+[ "$stdout_out" = "ultra" ] && ok "restart-survival: stdout stays a clean 'ultra' even while the warning fires" \
+  || bad "restart-survival: stdout polluted by divergence warning (got '$stdout_out')"
+
+# Negative case: no warning at all when hmd and the plugin AGREE -- proves
+# this isn't an unconditional every-call warning regardless of content.
+D="$(fresh)"
+run "$D" set full >/dev/null 2>&1
+printf 'full\n' > "$D/claude/.caveman-active"
+agree_stderr="$(run "$D" get 2>&1 1>/dev/null)"
+[ -z "$agree_stderr" ] && ok "no divergence warning when hmd and plugin agree" \
+  || bad "spurious divergence warning when hmd and plugin agree (got: '$agree_stderr')"
+
+# Negative case: no warning when there is nothing to disagree WITH -- an
+# absent plugin flag is not a disagreement.
+D="$(fresh)"
+run "$D" set lite >/dev/null 2>&1
+rm -f "$D/claude/.caveman-active" 2>/dev/null
+absent_stderr="$(run "$D" get 2>&1 1>/dev/null)"
+[ -z "$absent_stderr" ] && ok "no divergence warning when plugin flag is absent" \
+  || bad "spurious divergence warning when plugin flag is absent (got: '$absent_stderr')"
+
+# Negative case: an out-of-scope plugin mode is not a disagreement about a
+# level this tool owns.
+D="$(fresh)"
+run "$D" set lite >/dev/null 2>&1
+printf 'wenyan-full\n' > "$D/claude/.caveman-active"
+scope_stderr="$(run "$D" get 2>&1 1>/dev/null)"
+[ -z "$scope_stderr" ] && ok "no divergence warning for an out-of-scope plugin mode (wenyan-full)" \
+  || bad "spurious divergence warning for out-of-scope plugin mode (got: '$scope_stderr')"
 
 # ── migration skip: out-of-scope plugin mode is never adopted ──
 D="$(fresh)"

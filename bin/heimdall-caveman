@@ -422,6 +422,21 @@ guarded by [ -x ]).
   ]
 }
 
+stderr is intentionally left UNSUPPRESSED on the SessionStart `rules` call
+above (the older draft of this fragment redirected it to /dev/null): `get`
+and `rules` write a one-line warning to stderr, never stdout, when hmd's
+stored level disagrees with the plugin's live flag (see this tool's own
+"DIVERGENCE / RESTART SAFETY" header) -- letting that reach the hook's own
+stderr, where an operator or Claude Code's own hook logs can see it, is the
+entire point; suppressing it would silently defeat the warning at exactly
+the "on startup" moment it matters most. The UserPromptSubmit fragment
+deliberately KEEPS `2>/dev/null` on its inner `"$CAV" get` call: without it,
+the same warning would repeat on every single user turn for the rest of the
+session once a divergence exists, which is worse than useless (warning
+fatigue drowns the one signal that matters) -- once per session, at
+SessionStart, is the right cadence, matching this fragment's own established
+pattern of a full per-session dump versus a cheap per-turn reinforcement.
+
 SessionStart prints the full per-level rules ONCE per session (matches the
 plugin's own two-tier design: full dump at session start, short reinforcement
 per turn). UserPromptSubmit re-states only the level name each turn, cheaply,
@@ -445,7 +460,10 @@ Commands:
   -h, --help          Show this help.
 
 Storage: $STATE_FILE (hmd-owned; migrates once from the caveman plugin's flag
-file if present and hmd has no state of its own yet).
+file if present and hmd has no state of its own yet). Every \`get\` also
+compares hmd's stored level against the plugin's LIVE flag and warns on
+stderr -- never stdout -- if they disagree; hmd's value always wins. The
+plugin has been observed to silently reset its own flag on session restart.
 
 Honest limit: this tool INJECTS instruction text; it cannot verify or enforce
 that a model followed it. Run \`hmd caveman-audit <session.jsonl>\` to measure
