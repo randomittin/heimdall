@@ -2428,6 +2428,21 @@ case "${1:-}" in
     if [ -x "$_cev" ]; then exec "$_cev" "$@"; fi
     echo "error: heimdall-caveman-eval not found at $_cev" >&2; exit 2
     ;;
+  plan-verify)
+    # Closes the plan -> execution -> verification loop: bin/decompose emits waves,
+    # agents/planner.md and agents/architect.md write PLAN files with acceptance
+    # criteria, and until this arm nothing ever checked the two against each other --
+    # "wave done" was an assertion, never a verified fact. See
+    # bin/heimdall-plan-verify's own header (and bin/lib/hmd_plan_verify.py's, for the
+    # full design) for the MET/UNMET/NOT_RUNNABLE classification and the
+    # --require-sweep wave-completeness tie-in to .heimdall/receipts/last-sweep.json.
+    # Measures and reports only, like heimdall-deadcode -- cannot force a wave to be
+    # treated as verified.
+    shift
+    _pv="$(cd "$(dirname "$0")" && pwd)/heimdall-plan-verify"
+    if [ -x "$_pv" ]; then exec "$_pv" "$@"; fi
+    echo "error: heimdall-plan-verify not found at $_pv" >&2; exit 2
+    ;;
   metric-audit)
     # READ-BACK for orchestrator metric self-reporting -- the caveman-audit arm's
     # sibling. hooks/heimdall-metric-reminder.sh (Stop hook) can only ever ASK the
