@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# heimdall-delivery-audit — makes an orchestrator's DELIVERY CLAIMS falsifiable.
+#
+# WHY THIS EXISTS. One session produced three measured overclaims, each caught by a
+# human, none by hmd:
+#   1. "queued"   — said three times about work with no queue entry behind it. There
+#                   was no mechanism recording the intent, so nothing could contradict
+#                   the claim until someone thought to ask.
+#   2. "landed"   — a new bin/ executable reported delivered on the strength of its own
+#                   green test suite (38/0). It was DEAD CODE: no live entry point
+#                   invoked it. Tests prove the code WORKS; they never prove anyone CALLS
+#                   it. Caught by bin/heimdall-deadcode's reachability gate, after the claim.
+#   3. "running now" — a test sweep was reported in-flight. It had exited three hours
+#                   earlier. The claim repeated the LAST KNOWN state instead of a fresh
+#                   check.
+# The common shape: reporting the last known state as current, and reporting an
+# ARTIFACT (a green suite, a file on disk) as DELIVERY (wired, invoked, currently
+# running). Tests passing != wired. Wired != invoked. Started != still running.
+#
+# This tool does not stop anyone from making those claims. It gives the next reader — a
+# human or another agent — a fresh, mechanical way to check one before repeating it.
+# Modeled on bin/heimdall-deadcode: read-only, reports a MEASURED number, and refuses
+# to render "could not check" as "clean". It is not one engine — it is three, because
+# the three claim classes are NOT equally checkable, and pretending otherwise (one gate,
+# one green light) would be exactly the overclaim this tool exists to stop:
+#
+#   [a] DEAD-ON-ARRIVAL   — GENUINELY ENFORCEABLE. Reuses bin/heimdall-deadcode's own
+#       reachability engine (bin/lib/reachability.sh) against every bin/ executable
+#       ADDED recently. This is the only section that sets the exit code.
+#   [b] STALE-CLAIM       — MEASURABLE AND REPORTABLE, never a gate. For a background
+#       artifact a claim cites (a sweep log, .planning/metrics.jsonl), reports file age
+#       and whether a matching process is still alive. It hands over the two numbers
+#       "running now" needs to be checked against; it does not decide for you.
+#   [c] UNSTARTED-INTENT  — NOT DETECTABLE beyond two structured stores (heimdall-queue's
+#       work.jsonl, heimdall-task's per-task JSON). There is no enforced queue: a claim
+#       made in prose that never called either tool leaves NO trace anywhere, and this
+#       section says so explicitly every time it runs rather than inventing a signal.
+#
+# SUBCOMMANDS
+#   heimdall-delivery-audit                 report (default): all three sections.
+#   heimdall-delivery-audit report          same, explicit.
+#   heimdall-delivery-audit --json          section [a] structured; [b]/[c] existence only.
+#   heimdall-delivery-audit --since SPEC    window for "recently added" in [a]
+#                                           (git log --since syntax, default "7 days ago").
+#   heimdall-delivery-audit artifact PATH [--pattern PGREP_PATTERN] [--stale-after SECS]
+#                                           check ONE background artifact a claim cites:
+#                                           existence, age, and (if --pattern given)
+#                                           whether a matching process is still alive.
+#                                           Always exits 0 on a successful measurement —
+#                                           "does not exist" is a valid measurement, not
+#                                           a tool failure. [b] never gates.
+#   heimdall-delivery-audit intent [KEYWORD] look for a RECORDED queued/todo item,
+#                                           optionally substring-matched. Always exits 0
+#                                           — this section discloses a gap, it never gates.
+#   -h, --help                              this help.
+#
+# EXIT (report / --json — the ONLY modes with a verdict; artifact/intent never gate):
+#   0  section [a] clean: every bin/ executable added inside the window reaches a live
+#      entry point or carries a valid, in-date exemption. Says NOTHING about [b] or [c].
+#   1  section [a] found an unacknowledged, recently-added dead executable.
+#   2  section [a] REFUSED to run (git unavailable, ROOT not a repo, or
+#      bin/heimdall-deadcode itself missing/refused). Fail-closed: a refusal is never
+#      rendered as a pass.
+#
+# TEST SEAM (never set in production, mirrors HMD_DEADCODE_ROOT/HMD_REACH_TODAY):
+#   HMD_DELIVERY_AUDIT_ROOT   audit this tree instead of the repo this script ships in.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${HMD_DELIVERY_AUDIT_ROOT:-$(cd "$SELF_DIR/.." && pwd)}"
+DEADCODE_BIN="$SELF_DIR/heimdall-deadcode"
+SINCE="7 days ago"
+MODE="report"
+
+# ── shared helpers ─────────────────────────────────────────────────────────────
+
+# _mtime PATH — portable last-modified epoch. Same idiom as bin/heimdall-agents:182 /
+# bin/heimdall-autoupdate:326 / bin/heimdall-claim:97 — reused verbatim, not reinvented.
+_mtime() { stat -L -f%m "$1" 2>/dev/null || stat -L -c%Y "$1" 2>/dev/null || echo 0; }
+
+_human_age() {
+  local s="$1" h m
+  case "$s" in ''|*[!0-9]*) printf 'unknown'; return ;; esac
+  h=$(( s / 3600 )); m=$(( (s % 3600) / 60 )); s=$(( s % 60 ))
+  printf '%dh%dm%ds' "$h" "$m" "$s"
+}
+
+# _measure_artifact PATH PATTERN STALE_AFTER — one stable, grep-able evidence line.
+# Shared by `artifact` and the default report's own [b] section so there is exactly
+# ONE measurement routine, not two that could quietly disagree.
+_measure_artifact() {
+  local path="$1" pattern="$2" stale_after="$3" now mt age human pids proc_state label
+  now="$(date +%s)"
+  if [ ! -e "$path" ]; then
+    printf 'ARTIFACT=%s EXISTS=0 — no evidence was ever produced at this path\n' "$path"
+    return 0
+  fi
+  mt="$(_mtime "$path")"
+  age=$(( now - mt ))
+  [ "$age" -ge 0 ] || age=0
+  human="$(_human_age "$age")"
+  if [ -n "$pattern" ]; then
+    pids="$(pgrep -f -- "$pattern" 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+    if [ -n "$pids" ]; then proc_state="ALIVE(pid=$pids)"; else proc_state="NOT_RUNNING"; fi
+  else
+    proc_state="UNKNOWN(no --pattern given)"
+  fi
+  if [ "$age" -le "$stale_after" ]; then label="FRESH"; else label="STALE"; fi
+  printf 'ARTIFACT=%s EXISTS=1 AGE_S=%s AGE=%s MTIME=%s PROCESS=%s LABEL=%s(threshold=%ss, informational only)\n' \
+    "$path" "$age" "$human" "$mt" "$proc_state" "$label" "$stale_after"
+  return 0
+}
+
+# recent_bin_names ROOT SINCE — currently-existing, currently-executable bin/ basenames
+# either untracked/staged-new in the working tree, or ADDED (git diff-filter=A) to
+# history within SINCE. rc 2 if ROOT is not a git repo (fail-closed, not "found none").
+recent_bin_names() {
+  local root="$1" since="$2"
+  git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || return 2
+  {
+    git -C "$root" status --porcelain=v1 --untracked-files=all -- bin 2>/dev/null | while IFS= read -r line; do
+      case "${line:0:2}" in
+        '??'|'A '|'AM'|' A'|'AD') printf '%s\n' "${line:3}" ;;
+      esac
+    done
+    git -C "$root" log --since="$since" --diff-filter=A --name-only --pretty=format: -- bin 2>/dev/null
+  } | grep -v '^[[:space:]]*$' | sort -u | while IFS= read -r p; do
+    [ -f "$root/$p" ] && [ -x "$root/$p" ] || continue
+    case "$(basename "$p")" in *.c|*.h|*.md|*.json|*.py|*.tsv) continue ;; esac
+    basename "$p"
+  done | sort -u
+  return 0
+}
+
+# ── [a] dead-on-arrival ────────────────────────────────────────────────────────
+A_REFUSED=0; A_RECENT_LIST=""; A_UNACK_LIST=""; A_ACK_LIST=""; A_LIVE_LIST=""
+
+run_check_a() {
+  [ -x "$DEADCODE_BIN" ] || { A_REFUSED=1; return; }
+  A_RECENT_LIST="$(recent_bin_names "$ROOT" "$SINCE")" || { A_REFUSED=1; return; }
+  [ -n "$A_RECENT_LIST" ] || return
+  local name why_out why_rc
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    why_out="$(HMD_DEADCODE_ROOT="$ROOT" "$DEADCODE_BIN" --why "$name" 2>&1)"; why_rc=$?
+    case "$why_rc" in
+      0) A_LIVE_LIST="$A_LIVE_LIST$name
+" ;;
+      1)
+        if printf '%s\n' "$why_out" | grep -q 'unacknowledged dead code' \
+           || printf '%s\n' "$why_out" | grep -q 'ROTTEN (expired or malformed)'; then
+          A_UNACK_LIST="$A_UNACK_LIST$name
+"
+        else
+          A_ACK_LIST="$A_ACK_LIST$name
+"
+        fi
+        ;;
+      *) A_REFUSED=1 ;;
+    esac
+  done <<EOF
+$A_RECENT_LIST
+EOF
+}
+
+# ── report rendering ───────────────────────────────────────────────────────────
+
+print_section_a() {
+  printf '[a] DEAD-ON-ARRIVAL  (ENFORCEABLE — this is the only section that sets the exit code)\n'
+  if [ "$A_REFUSED" -eq 1 ]; then
+    printf '  REFUSED to run (git unavailable, ROOT not a repo, or heimdall-deadcode missing/refused).\n'
+    printf '  NOT VERIFIED — a refusal is never a pass.\n\n'
+    return
+  fi
+  local n_recent n_unack n_ack n_live
+  n_recent="$(printf '%s\n' "$A_RECENT_LIST" | grep -c . || true)"
+  n_unack="$(printf '%s\n' "$A_UNACK_LIST" | grep -c . || true)"
+  n_ack="$(printf '%s\n' "$A_ACK_LIST" | grep -c . || true)"
+  n_live="$(printf '%s\n' "$A_LIVE_LIST" | grep -c . || true)"
+  printf '  bin/ executable(s) added since "%s": %s\n' "$SINCE" "$n_recent"
+  if [ "$n_recent" -gt 0 ]; then
+    printf '%s\n' "$A_UNACK_LIST" | grep . | while IFS= read -r n; do
+      printf '    UNACKNOWLEDGED DEAD  %-28s landed, but no live entry point reaches it (instance-2-shaped)\n' "$n"
+    done
+    printf '%s\n' "$A_ACK_LIST" | grep . | while IFS= read -r n; do
+      printf '    acknowledged dead    %-28s dead, but carries a valid, in-date exemption\n' "$n"
+    done
+    printf '%s\n' "$A_LIVE_LIST" | grep . | while IFS= read -r n; do
+      printf '    reachable            %-28s\n' "$n"
+    done
+  fi
+  if [ "$n_unack" -eq 0 ]; then
+    printf '  verdict: CLEAN — every recently-added bin/ executable is reachable or exempted.\n\n'
+  else
+    printf '  verdict: ROT — %s recently-added executable(s) would be DEAD ON ARRIVAL if reported delivered.\n\n' "$n_unack"
+  fi
+}
+
+print_section_b() {
+  printf '[b] STALE-CLAIM  (MEASURABLE / REPORTABLE ONLY — never changes the exit code)\n'
+  local ev
+  ev="$(ls -dt "${TMPDIR:-/tmp}"/heimdall-run-all-evidence.* 2>/dev/null | head -1)"
+  if [ -n "$ev" ]; then
+    printf '  %s\n' "$(_measure_artifact "$ev" "run-all.sh" 1800)"
+  else
+    printf '  ARTIFACT=%s/heimdall-run-all-evidence.* EXISTS=0 — no sweep evidence dir found (last run was clean, or none has run)\n' "${TMPDIR:-/tmp}"
+  fi
+  printf '  %s\n' "$(_measure_artifact "$ROOT/.planning/metrics.jsonl" "" 1800)"
+  printf '  Check any other path a claim cites: heimdall-delivery-audit artifact <path> [--pattern PGREP_PATTERN]\n\n'
+}
+
+print_section_c() {
+  printf '[c] UNSTARTED-INTENT  (NOT DETECTABLE beyond structured records — never changes the exit code)\n'
+  local queue_file task_dir q_total q_queued t_total t_todo f task_reach
+  queue_file="${HEIMDALL_HOME:-$ROOT/.heimdall}/queue/work.jsonl"
+  task_dir="$ROOT/.planning/ledger/tasks"
+  if [ -f "$queue_file" ]; then
+    q_total="$(grep -c . "$queue_file" 2>/dev/null || echo 0)"
+    q_queued="$(grep -cE '"state"[[:space:]]*:[[:space:]]*"QUEUED"' "$queue_file" 2>/dev/null || echo 0)"
+    printf '  heimdall-queue store  %-50s %s item(s), %s QUEUED\n' "$queue_file" "$q_total" "$q_queued"
+  else
+    printf '  heimdall-queue store  %-50s MISSING — bin/heimdall-queue has never recorded a work item here\n' "$queue_file"
+  fi
+  t_total=0; t_todo=0
+  if [ -d "$task_dir" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      t_total=$((t_total + 1))
+      grep -qE '"state"[[:space:]]*:[[:space:]]*"todo"' "$f" 2>/dev/null && t_todo=$((t_todo + 1))
+    done < <(find "$task_dir" -maxdepth 1 -name '*.json' -type f 2>/dev/null)
+    printf '  heimdall-task store   %-50s %s item(s), %s todo\n' "$task_dir" "$t_total" "$t_todo"
+  else
+    printf '  heimdall-task store   %-50s MISSING — no task has ever been recorded here\n' "$task_dir"
+  fi
+  if [ -x "$DEADCODE_BIN" ] && HMD_DEADCODE_ROOT="$ROOT" "$DEADCODE_BIN" --why heimdall-task >/dev/null 2>&1; then
+    task_reach="reachable from a live entry point"
+  else
+    task_reach="DEAD per heimdall-deadcode — the one structured todo-state store has no live caller"
+  fi
+  printf '  heimdall-task itself: %s\n' "$task_reach"
+  printf '  DISCLOSURE: this section can only confirm a queued/todo record EXISTS. A verbal\n'
+  printf '  claim ("queued", "will do X later") that was never written to one of the two\n'
+  printf '  stores above leaves NO trace anywhere this tool — or any tool — can find. Absence\n'
+  printf '  above is proof no intent was RECORDED, never proof no intent was formed.\n\n'
+}
+
+_jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+print_json() {
+  local n_recent n_unack n_ack n_live queue_file task_dir
+  n_recent="$(printf '%s\n' "$A_RECENT_LIST" | grep -c . || true)"
+  n_unack="$(printf '%s\n' "$A_UNACK_LIST" | grep -c . || true)"
+  n_ack="$(printf '%s\n' "$A_ACK_LIST" | grep -c . || true)"
+  n_live="$(printf '%s\n' "$A_LIVE_LIST" | grep -c . || true)"
+  queue_file="${HEIMDALL_HOME:-$ROOT/.heimdall}/queue/work.jsonl"
+  task_dir="$ROOT/.planning/ledger/tasks"
+  printf '{'
+  printf '"a_dead_on_arrival":{"enforceable":true,"refused":%s,"since":"%s","recent":%s,"unacknowledged":%s,"acknowledged":%s,"reachable":%s,"unacknowledged_names":[' \
+    "$( [ "$A_REFUSED" -eq 1 ] && echo true || echo false )" "$(_jesc "$SINCE")" "$n_recent" "$n_unack" "$n_ack" "$n_live"
+  printf '%s\n' "$A_UNACK_LIST" | grep . | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
+  printf ']},'
+  printf '"b_stale_claim":{"enforceable":false,"note":"reportable only — see: heimdall-delivery-audit artifact <path>"},'
+  printf '"c_unstarted_intent":{"enforceable":false,"queue_store_exists":%s,"task_store_exists":%s,"note":"not detectable beyond structured records"}' \
+    "$( [ -f "$queue_file" ] && echo true || echo false )" "$( [ -d "$task_dir" ] && echo true || echo false )"
+  printf '}\n'
+}
+
+print_report() {
+  printf 'heimdall-delivery-audit — makes 3 delivery-claim classes checkable: dead-on-arrival, stale background claims, unstarted intent.\n\n'
+  print_section_a
+  print_section_b
+  print_section_c
+  printf 'exit code: %s (driven solely by section [a] — [b]/[c] are reports, read them yourself)\n' "$OVERALL_RC"
+}
+
+# ── subcommands with their own argv ─────────────────────────────────────────────
+
+cmd_artifact() {
+  local path="" pattern="" stale_after=1800
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pattern)       pattern="${2:-}"; shift ;;
+      --pattern=*)     pattern="${1#--pattern=}" ;;
+      --stale-after)   stale_after="${2:-1800}"; shift ;;
+      --stale-after=*) stale_after="${1#--stale-after=}" ;;
+      -h|--help)       printf 'Usage: heimdall-delivery-audit artifact <path> [--pattern PGREP_PATTERN] [--stale-after SECONDS]\n'; exit 0 ;;
+      -*)              printf 'heimdall-delivery-audit artifact: unknown flag %s\n' "$1" >&2; exit 2 ;;
+      *)               path="$1" ;;
+    esac
+    shift
+  done
+  case "$stale_after" in ''|*[!0-9]*) printf 'heimdall-delivery-audit artifact: --stale-after must be a whole number of seconds\n' >&2; exit 2 ;; esac
+  [ -n "$path" ] || { printf 'heimdall-delivery-audit artifact: needs a path to check\n' >&2; exit 2; }
+  _measure_artifact "$path" "$pattern" "$stale_after"
+  exit 0
+}
+
+cmd_intent() {
+  local keyword=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) printf 'Usage: heimdall-delivery-audit intent [KEYWORD]\n'; exit 0 ;;
+      -*)        printf 'heimdall-delivery-audit intent: unknown flag %s\n' "$1" >&2; exit 2 ;;
+      *)         keyword="$1" ;;
+    esac
+    shift
+  done
+  local queue_file task_dir q_total q_queued q_match f t_total t_todo t_match task_reach
+  queue_file="${HEIMDALL_HOME:-$ROOT/.heimdall}/queue/work.jsonl"
+  task_dir="$ROOT/.planning/ledger/tasks"
+  q_total=0; q_queued=0; q_match=0
+  if [ -f "$queue_file" ]; then
+    q_total="$(grep -c . "$queue_file" 2>/dev/null || echo 0)"
+    if [ -n "$keyword" ]; then
+      q_match="$(grep -E '"state"[[:space:]]*:[[:space:]]*"QUEUED"' "$queue_file" 2>/dev/null | grep -ic -- "$keyword" || true)"
+      printf 'QUEUE=%s TOTAL=%s QUEUED_MATCHING(%s)=%s\n' "$queue_file" "$q_total" "$keyword" "$q_match"
+    else
+      q_queued="$(grep -cE '"state"[[:space:]]*:[[:space:]]*"QUEUED"' "$queue_file" 2>/dev/null || echo 0)"
+      printf 'QUEUE=%s TOTAL=%s QUEUED=%s\n' "$queue_file" "$q_total" "$q_queued"
+    fi
+  else
+    printf 'QUEUE=%s EXISTS=0\n' "$queue_file"
+  fi
+  t_total=0; t_todo=0; t_match=0
+  if [ -d "$task_dir" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      t_total=$((t_total + 1))
+      grep -qE '"state"[[:space:]]*:[[:space:]]*"todo"' "$f" 2>/dev/null || continue
+      if [ -n "$keyword" ]; then
+        grep -qi -- "$keyword" "$f" 2>/dev/null && t_match=$((t_match + 1))
+      else
+        t_todo=$((t_todo + 1))
+      fi
+    done < <(find "$task_dir" -maxdepth 1 -name '*.json' -type f 2>/dev/null)
+    if [ -n "$keyword" ]; then
+      printf 'TASKS=%s TOTAL=%s TODO_MATCHING(%s)=%s\n' "$task_dir" "$t_total" "$keyword" "$t_match"
+    else
+      printf 'TASKS=%s TOTAL=%s TODO=%s\n' "$task_dir" "$t_total" "$t_todo"
+    fi
+  else
+    printf 'TASKS=%s EXISTS=0\n' "$task_dir"
+  fi
+  if [ -x "$DEADCODE_BIN" ] && HMD_DEADCODE_ROOT="$ROOT" "$DEADCODE_BIN" --why heimdall-task >/dev/null 2>&1; then
+    task_reach="REACHABLE"
+  else
+    task_reach="DEAD"
+  fi
+  printf 'TASK_MECHANISM_REACHABILITY=%s\n' "$task_reach"
+  printf 'DISCLOSURE: only a record actually written to QUEUE or TASKS above is detectable. A claim made in prose alone leaves no trace.\n'
+  exit 0
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    report)     MODE="report" ;;
+    --json)     MODE="json" ;;
+    --since)    SINCE="${2:-}"; shift ;;
+    --since=*)  SINCE="${1#--since=}" ;;
+    artifact)   shift; cmd_artifact "$@" ;;
+    intent)     shift; cmd_intent "$@" ;;
+    -h|--help)  grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'heimdall-delivery-audit: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -x "$DEADCODE_BIN" ] || { printf 'heimdall-delivery-audit: missing engine %s — NOT VERIFIED\n' "$DEADCODE_BIN" >&2; exit 2; }
+
+run_check_a
+
+if [ "$A_REFUSED" -eq 1 ]; then
+  OVERALL_RC=2
+elif [ "$(printf '%s\n' "$A_UNACK_LIST" | grep -c . || true)" -gt 0 ]; then
+  OVERALL_RC=1
+else
+  OVERALL_RC=0
+fi
+
+case "$MODE" in
+  json)   print_json ;;
+  report) print_report ;;
+esac
+
+exit "$OVERALL_RC"
