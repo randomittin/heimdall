@@ -224,9 +224,15 @@ fi
 chmod -R u+w "$TPLUG"                        # restore write for the remaining scenarios
 
 # 1b. Companion plugins installed — the fakes recorded each install call.
-grep -q 'claude plugins install caveman@caveman' "$CALLS" \
-  && ok "companion: caveman install recorded" \
-  || bad "companion: caveman install NOT recorded (calls: $(tr '\n' ';' < "$CALLS"))"
+# caveman is IN-HOUSE (bin/heimdall-caveman) since 2026-08-30 — hmd must NOT
+# call out to the external plugin for it any more (CLAUDE.md "Token
+# Efficiency"); this is the negative/red-proof half of that removal. See
+# heimdall-caveman-no-plugin.test.sh for the dedicated present-vs-absent proof.
+if grep -q 'plugins install caveman@caveman\|marketplace add JuliusBrussee/caveman' "$CALLS"; then
+  bad "companion: caveman plugin install/marketplace-add call still present (calls: $(tr '\n' ';' < "$CALLS"))"
+else
+  ok "companion: caveman plugin NOT installed (ownership is in-house)"
+fi
 grep -q 'claude plugins install superpowers' "$CALLS" \
   && ok "companion: superpowers install recorded" \
   || bad "companion: superpowers install NOT recorded"
@@ -319,7 +325,7 @@ fi
 # POSITIVE CONTROL — the skip proof below is a NEGATIVE assertion, so it is
 # satisfied just as well by a launcher that short-circuited and did nothing. Prove
 # this run genuinely entered first-run setup before trusting the absence.
-grep -q 'claude plugins install caveman@caveman' "$CALLS" \
+grep -q 'claude plugins install superpowers' "$CALLS" \
   && ok "bun-present non-TTY run genuinely entered first-run setup (skip proof is not vacuous)" \
   || bad "bun-present non-TTY run never entered first-run setup — skip proof would be VACUOUS (calls: $(tr '\n' ';' < "$CALLS"))"
 if grep -q 'claude-mem' "$CALLS"; then
@@ -349,7 +355,7 @@ else
   # that was silently red: a short-circuited launcher records NOTHING, so "no npx
   # call" looked like a claude-mem regression when the run had simply never reached
   # first-run setup at all. Fail loudly on that distinction instead of conflating it.
-  grep -q 'claude plugins install caveman@caveman' "$CALLS" \
+  grep -q 'claude plugins install superpowers' "$CALLS" \
     && ok "TTY+bun run genuinely entered first-run setup (claude-mem proof is not vacuous)" \
     || bad "TTY+bun run never entered first-run setup — claude-mem proof would be VACUOUS (calls: $(tr '\n' ';' < "$CALLS"))"
   if grep -q 'npx --yes claude-mem install' "$CALLS"; then
