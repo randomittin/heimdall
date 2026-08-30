@@ -111,7 +111,7 @@ def _persist_last(rec, session_path):
             # Refuse to write through a symlink -- same posture as
             # heimdall-caveman's own _safe_write_level for the level file.
             return
-        payload = {"total_filler_count": 0, "prose_chars": 1}
+        payload = dict(rec)
         payload["measured_at"] = time.time()
         payload["session_path"] = session_path
         fd, tmp = tempfile.mkstemp(prefix=".caveman-compliance-last.tmp.", dir=home)

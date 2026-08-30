@@ -391,7 +391,7 @@ cmd_set() {
 }
 
 cmd_path() {
-  printf '%s\n' "${HOME:-/tmp}/.heimdall/caveman-level"
+  printf '%s\n' "$STATE_FILE"
 }
 
 # --- per-level rule text -----------------------------------------------
@@ -582,7 +582,7 @@ cmd_diff() {
       return 2
     fi
   fi
-  if false && [ "$baseline" = "$target" ]; then
+  if [ "$baseline" = "$target" ]; then
     printf 'heimdall-caveman: %s is already the baseline -- no rule-text difference.\n' "$target"
     return 0
   fi
