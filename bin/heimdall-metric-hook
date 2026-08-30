@@ -207,6 +207,17 @@ TOKEN_SUM_MAX_BYTES="${HMD_METRIC_HOOK_TOKEN_MAX_BYTES:-8388608}"
 # empty output as "unmeasured" (omit --tokens) — exactly like _kill_outcome's
 # own empty-output-means-unknown contract above.
 #
+# Unlike _kill_outcome, this does NOT blind-drop the tail's first line. That
+# trick only makes sense for a raw substring/regex search, where a truncated
+# fragment could still accidentally MATCH and produce a false signal; here
+# every line is parsed as structured JSON behind `try/catch empty`, so a line
+# truncated by the byte-cap boundary simply fails `fromjson` and contributes
+# nothing on its own — the try/catch is already the safety net. Dropping the
+# first line unconditionally would instead throw away one COMPLETE, valid
+# record on every transcript short enough that the byte-cap never truncated
+# anything (the common case), silently undercounting every subagent's total
+# by however many tokens that one record cost. Summing must not do that.
+#
 # Fail-open at every step, same contract as the rest of this file.
 _sum_tokens() {
   local path="$1"
@@ -216,7 +227,6 @@ _sum_tokens() {
   command -v jq >/dev/null 2>&1 || return 0
 
   tail -c "$TOKEN_SUM_MAX_BYTES" "$path" 2>/dev/null \
-      | tail -n +2 \
       | jq -R -r '
           try (
             (. | fromjson) as $r
