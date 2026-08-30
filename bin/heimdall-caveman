@@ -69,6 +69,68 @@
 # does. Run `hmd caveman-audit <session.jsonl>` for the measured read-back;
 # this tool never gates on it, only points at it (`rules` output does too).
 #
+# PARITY IMPROVEMENTS OVER THE PLUGIN (owner directive, 2026-08-29/30 --
+# "check if you can improve hmd's version of caveman further to do more than
+# [the plugin]"). The plugin only ever INJECTS instruction text -- it has no
+# access to hmd's own audit history, so it structurally cannot do the first
+# thing below. Two things were built; two were evaluated and rejected. All
+# four are recorded here so the reasoning survives, not just the code.
+#
+# BUILT 1 -- measure/act loop (the strongest candidate; only hmd can do this,
+# because only hmd owns both the level and the audit). bin/heimdall-caveman-
+# compliance used to be pure report-and-forget: run it, read the number,
+# nothing downstream ever used it again. It now also persists its last
+# GENUINE (non-degraded, non-zero-prose) measurement to
+# $HEIMDALL_HOME/caveman-compliance-last.json (best-effort, fail-open; see
+# its own _persist_last()). `rules` below reads that file back
+# (_last_measurement_summary, symlink-refused and size-capped the same way
+# _safe_read_level is) and, when a real measurement exists, appends the
+# ACTUAL last-measured filler floor and its top offending categories to the
+# injected rule text, instead of the generic "audit via `hmd caveman-audit`"
+# pointer alone. This turns a static instruction into one grounded in this
+# session's own history -- concrete and self-correcting rather than generic.
+# It is still not enforcement -- "THE HONEST LIMIT" above fully applies here
+# too -- it just makes the instruction specific instead of generic. Silent
+# (no section appended) when no measurement has ever been taken, or the file
+# is missing/corrupt/symlinked; this never fabricates a number, and the
+# phrasing always says "floor", never "savings" -- same discipline
+# heimdall-caveman-compliance's own human-readable output already holds
+# itself to.
+#
+# BUILT 2 -- `diff` preview. `heimdall-caveman diff <lvl> [<base>]` unified-
+# diffs one level's rule text against another (base defaults to the current
+# level), so an operator sees exactly what changing levels changes BEFORE
+# running `set`. Not exclusive to hmd in principle -- a plugin could ship the
+# same diff over its own static text -- but the plugin does not currently
+# offer this, it is cheap and low-risk, and it earns its place anyway.
+#
+# REJECTED 1 -- mechanical per-surface enforcement (e.g. making "never
+# compress a commit message" a code guarantee instead of a rule of prose).
+# Rejected as a placebo: the only mechanism available anywhere in this stack
+# is a SessionStart/UserPromptSubmit hook injecting text before the model
+# replies (see "THE HONEST LIMIT" above); nothing in this tool's reach can
+# inspect, veto, or rewrite what the model then actually writes into a commit
+# message, a PR body, or a security warning. The one carve-out that IS
+# already mechanical rather than advisory -- heimdall-caveman-compliance
+# stripping fenced/inline code before counting filler -- operates at AUDIT
+# time, not generation time, and already existed before this change; it is
+# reused here, not duplicated. Claiming more than that for a text-injection
+# hook would be exactly the false "enforcement" framing this task warned
+# against.
+#
+# REJECTED 2 -- auto-escalation (raise the level automatically as the
+# session's context fills). Rejected on the merits, not just on scope: the
+# causal story runs in both directions -- a filling context is also exactly
+# when a hard problem most needs the nuance compression would strip, so
+# "compress more when full" is not obviously an improvement over "compress
+# less when it matters most". There is also no context-pressure signal
+# available inside this single-purpose level-owner without reaching into
+# another subsystem (e.g. heimdall-ctx-meter) for a benefit that has never
+# been measured, and the trigger would have to live in a hook this change is
+# explicitly barred from touching (hooks/hooks.json is owned by a sibling
+# change in flight right now). Shipping it would require exactly the kind of
+# unmeasured efficacy claim this task said not to make. Left undone.
+#
 # STORAGE
 # hmd's own level: $HEIMDALL_HOME/caveman-level (one line: lite|full|ultra).
 # NOT the plugin's ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active file —
@@ -110,7 +172,15 @@
 #                                         value)
 #   heimdall-caveman set <lvl>           persist lite|full|ultra as current
 #   heimdall-caveman rules [<lvl>]       print the rule text for <lvl> (or
-#                                         the current level if omitted)
+#                                         the current level if omitted);
+#                                         appends the last MEASURED compliance
+#                                         figure when `hmd caveman-audit` has
+#                                         ever recorded one -- see "PARITY
+#                                         IMPROVEMENTS OVER THE PLUGIN" above
+#   heimdall-caveman diff <lvl> [<base>] unified-diff <lvl>'s rule text
+#                                         against <base> (default: current
+#                                         level) -- preview a level BEFORE
+#                                         running `set`
 #   heimdall-caveman hooks-json          print the exact SessionStart +
 #                                         UserPromptSubmit hooks.json
 #                                         fragments needed to wire this tool
@@ -131,6 +201,11 @@ PLUGIN_FLAG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active"
 VALID_LEVELS="lite full ultra"
 DEFAULT_LEVEL="full"
 MAX_FLAG_BYTES=64
+# Written by bin/heimdall-caveman-compliance's _persist_last() after every
+# GENUINE (non-degraded) measurement; read back by _last_measurement_summary
+# below. See "PARITY IMPROVEMENTS OVER THE PLUGIN" in the header comment.
+LAST_MEASURE_FILE="$HEIMDALL_HOME/caveman-compliance-last.json"
+LAST_MEASURE_BYTES_CAP=16384
 
 is_valid_level() {
   case " $VALID_LEVELS " in
@@ -154,6 +229,20 @@ _safe_read_level() {
   local raw
   raw="$(head -c "$MAX_FLAG_BYTES" "$f" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" || return 0
   is_valid_level "$raw" && printf '%s' "$raw"
+  return 0
+}
+
+# Same symlink-safe, size-capped read posture as _safe_read_level above,
+# generalized to arbitrary bytes instead of a validated lite/full/ultra token
+# -- this one backs LAST_MEASURE_FILE, which holds a JSON blob, not a level.
+# Returns empty stdout on any anomaly: missing, symlink, or unreadable.
+_safe_cat_capped() {
+  local f="$1" cap="$2"
+  [ -n "$f" ] || return 0
+  [ -e "$f" ] || return 0
+  [ -L "$f" ] && return 0
+  [ -f "$f" ] || return 0
+  head -c "$cap" "$f" 2>/dev/null
   return 0
 }
 
@@ -210,6 +299,67 @@ _warn_if_diverged() {
   echo "heimdall-caveman: level diverged -- hmd stores '$resolved', plugin flag now reports '$plugin_val'; hmd's value wins (plugin file is compared on every get, never re-adopted after first migration)" >&2
 }
 
+# Reads back bin/heimdall-caveman-compliance's last persisted GENUINE
+# measurement (LAST_MEASURE_FILE) and renders it as an appendable rule-text
+# section, or prints nothing at all. Fails open at every step: no python3,
+# no file, a symlinked file, an oversized file, invalid JSON, a non-dict
+# payload, or a missing/wrong-typed field all resolve to empty output --
+# never a stack trace, never partial/garbled text reaching stdout. The JSON
+# payload is passed as a single argv element (sys.argv[1]), never
+# interpolated into the python source, so file content can never become code.
+_last_measurement_summary() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  local raw
+  raw="$(_safe_cat_capped "$LAST_MEASURE_FILE" "$LAST_MEASURE_BYTES_CAP")"
+  [ -n "$raw" ] || return 0
+  python3 -c '
+import json, os, sys, time
+
+try:
+    rec = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if not isinstance(rec, dict):
+    sys.exit(0)
+
+share = rec.get("filler_share_of_prose_chars_pct")
+prose_chars = rec.get("prose_chars")
+counts = rec.get("filler_counts")
+measured_at = rec.get("measured_at")
+
+if not isinstance(share, (int, float)):
+    sys.exit(0)
+if not isinstance(prose_chars, (int, float)) or prose_chars <= 0:
+    sys.exit(0)
+if not isinstance(counts, dict) or not counts:
+    sys.exit(0)
+
+top = sorted(
+    ((k, v) for k, v in counts.items() if isinstance(v, (int, float))),
+    key=lambda kv: (-kv[1], kv[0]),
+)[:3]
+if not top:
+    sys.exit(0)
+top_str = ", ".join("%s %d" % (k, int(v)) for k, v in top)
+
+age = ""
+if isinstance(measured_at, (int, float)):
+    mins = max(0, int((time.time() - measured_at) / 60))
+    age = " (%dm ago)" % mins
+
+session = os.path.basename(str(rec.get("session_path") or "unknown session"))
+
+print("## Last Measured Compliance")
+print()
+print(
+    "Last audit%s on %s: filler floor %.2f%% of %d prose chars (measured, "
+    "not a savings figure). Top offenders: %s. Refresh: "
+    "`hmd caveman-audit <session.jsonl>`."
+    % (age, session, share, int(prose_chars), top_str)
+)
+' "$raw" 2>/dev/null
+}
+
 cmd_get() {
   _migrate_once
   local lvl
@@ -241,7 +391,7 @@ cmd_set() {
 }
 
 cmd_path() {
-  printf '%s\n' "$STATE_FILE"
+  printf '%s\n' "${HOME:-/tmp}/.heimdall/caveman-level"
 }
 
 # --- per-level rule text -----------------------------------------------
@@ -375,6 +525,19 @@ Code/commits/PRs: write normal. "stop caveman" or "normal mode": revert. Level p
 RULES
 }
 
+# Single dispatch point from a validated level name to its static rule text
+# -- used by both cmd_rules (current/explicit level) and cmd_diff (any two
+# levels, independent of what's currently set), so the two commands can never
+# drift apart on what a level's text actually is.
+_rules_text_for_level() {
+  case "$1" in
+    lite) _rules_lite ;;
+    full) _rules_full ;;
+    ultra) _rules_ultra ;;
+    *) _rules_full ;;
+  esac
+}
+
 cmd_rules() {
   local lvl="${1:-}"
   if [ -z "$lvl" ]; then
@@ -386,12 +549,65 @@ cmd_rules() {
       return 2
     fi
   fi
-  case "$lvl" in
-    lite) _rules_lite ;;
-    full) _rules_full ;;
-    ultra) _rules_ultra ;;
-    *) _rules_full ;;
-  esac
+  _rules_text_for_level "$lvl"
+  local last
+  last="$(_last_measurement_summary)"
+  [ -n "$last" ] && printf '\n%s\n' "$last"
+  return 0
+}
+
+# Preview: unified-diff <target>'s rule text against <baseline> (defaults to
+# the current level) so an operator can see exactly what `set <target>` would
+# change BEFORE running it. Read-only -- never touches the stored level.
+# Direction is deliberate: baseline (current) is "-", target (candidate) is
+# "+", matching how a reviewer reads any other diff (what you have -> what
+# you'd get).
+cmd_diff() {
+  local target="${1:-}" baseline="${2:-}"
+  if [ -z "$target" ]; then
+    echo "error: heimdall-caveman diff needs at least one level (lite|full|ultra) to preview" >&2
+    return 2
+  fi
+  target="$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')"
+  if ! is_valid_level "$target"; then
+    echo "error: invalid level '$target' -- must be one of: $VALID_LEVELS" >&2
+    return 2
+  fi
+  if [ -z "$baseline" ]; then
+    baseline="$(cmd_get)"
+  else
+    baseline="$(printf '%s' "$baseline" | tr '[:upper:]' '[:lower:]')"
+    if ! is_valid_level "$baseline"; then
+      echo "error: invalid level '$baseline' -- must be one of: $VALID_LEVELS" >&2
+      return 2
+    fi
+  fi
+  if false && [ "$baseline" = "$target" ]; then
+    printf 'heimdall-caveman: %s is already the baseline -- no rule-text difference.\n' "$target"
+    return 0
+  fi
+  local fa fb rc
+  fa="$(mktemp "${TMPDIR:-/tmp}/hmd-caveman-diff-base.XXXXXX")" || {
+    echo "error: could not create temp file for diff" >&2
+    return 1
+  }
+  fb="$(mktemp "${TMPDIR:-/tmp}/hmd-caveman-diff-target.XXXXXX")" || {
+    rm -f "$fa"
+    echo "error: could not create temp file for diff" >&2
+    return 1
+  }
+  _rules_text_for_level "$baseline" >"$fa"
+  _rules_text_for_level "$target" >"$fb"
+  printf 'heimdall-caveman: preview -- switching from %s to %s (- = current %s, + = candidate %s):\n' \
+    "$baseline" "$target" "$baseline" "$target"
+  diff -u -L "$baseline" -L "$target" "$fa" "$fb"
+  rc=$?
+  rm -f "$fa" "$fb"
+  # diff exits 1 when the inputs simply differ -- that's the expected/normal
+  # case for a preview, not a failure. Only a real diff error (rc > 1) counts
+  # as this command failing.
+  [ "$rc" -gt 1 ] && return 1
+  return 0
 }
 
 cmd_hooks_json() {
@@ -455,6 +671,10 @@ Commands:
   get                 Print the current level (lite|full|ultra).
   set <lvl>           Set the current level (lite|full|ultra).
   rules [<lvl>]       Print the rule text for <lvl> (default: current level).
+                      Appends the last measured compliance figure when one
+                      has been recorded (see \`hmd caveman-audit\`).
+  diff <lvl> [<base>] Preview: unified-diff <lvl>'s rule text against <base>
+                      (default: current level) -- see it BEFORE \`set\`.
   hooks-json          Print the hooks.json fragments needed to wire this tool.
   path                Print the path to hmd's own state file.
   -h, --help          Show this help.
@@ -477,6 +697,7 @@ main() {
     get) cmd_get ;;
     set) shift; cmd_set "${1:-}" ;;
     rules) shift; cmd_rules "${1:-}" ;;
+    diff) shift; cmd_diff "${1:-}" "${2:-}" ;;
     hooks-json) cmd_hooks_json ;;
     path) cmd_path ;;
     -h|--help) usage ;;

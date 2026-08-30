@@ -24,13 +24,36 @@
 # fact — same posture as `heimdall-ctx-meter outshare` / `heimdall-tokens
 # session`: real transcript data, fail-open, --json for machine consumption.
 #
+# CLOSING THE MEASURE/ACT LOOP (owner directive, 2026-08-29/30 -- "check if
+# you can improve hmd's version of caveman further to do more than [the
+# plugin]"): every GENUINE (non-degraded, non-zero-prose) measurement this
+# tool produces is now ALSO persisted, best-effort, to
+# $HEIMDALL_HOME/caveman-compliance-last.json. bin/heimdall-caveman's `rules`
+# command reads that file back and appends the actual last-measured filler
+# floor and its top offending categories to the injected SessionStart rule
+# text -- turning the generic "audit via hmd caveman-audit" pointer into a
+# concrete, session-grounded one. This is the improvement that is
+# structurally impossible for a standalone plugin: a plugin has no access to
+# hmd's own audit history. Persistence is deliberately one-way and
+# best-effort: a write failure (missing HOME, read-only filesystem, a
+# symlink at the target) never raises, never changes this tool's exit code,
+# and never touches stdout -- persistence is bookkeeping for a DIFFERENT
+# tool to read later, not part of this run's own contract. A degraded record
+# (parse error, unreadable transcript, zero prose) is NEVER persisted over a
+# prior good one — see _persist_last's call site in main(). See
+# test/heimdall-caveman-compliance.test.sh's persistence/degraded-does-not-
+# clobber/symlink-refusal cases for the falsifiable proof.
+#
 # Usage:
 #   heimdall-caveman-compliance <session-jsonl-path>
 #   heimdall-caveman-compliance <session-jsonl-path> --json
 
 import json
+import os
 import re
 import sys
+import tempfile
+import time
 
 # Filler categories, verbatim in spirit from the installed caveman plugin's OWN
 # compression rules (skills/compress/SKILL.md "Remove" section) — not this
@@ -50,6 +73,57 @@ FENCE_RE = re.compile(r"```.*?```", re.S)
 INLINE_CODE_RE = re.compile(r"`[^`]*`")
 
 USAGE = "Usage: heimdall-caveman-compliance <session-jsonl-path> [--json]"
+
+LAST_MEASURE_FILENAME = "caveman-compliance-last.json"
+
+
+def _heimdall_home():
+    """Mirrors bin/heimdall-caveman's own
+    HEIMDALL_HOME="${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}" default. Kept in
+    sync by hand since one side is bash and the other Python; each has its
+    own test suite covering this default."""
+    home = os.environ.get("HEIMDALL_HOME")
+    if home:
+        return home
+    return os.path.join(os.environ.get("HOME", "/tmp"), ".heimdall")
+
+
+def _silent_unlink(path):
+    """Best-effort delete of a leftover temp file; never raises."""
+    try:
+        os.unlink(path)
+    except OSError:
+        return
+
+
+def _persist_last(rec, session_path):
+    """Best-effort, symlink-safe, atomic persistence of the last GENUINE
+    measurement, for bin/heimdall-caveman's `rules` command to read back
+    later. Never raises and never affects this process's exit code or
+    stdout -- a persistence failure is not this run's problem to report."""
+    try:
+        home = _heimdall_home()
+        if os.path.islink(home):
+            return  # refuse a symlinked state directory
+        os.makedirs(home, exist_ok=True)
+        target = os.path.join(home, LAST_MEASURE_FILENAME)
+        if os.path.islink(target):
+            # Refuse to write through a symlink -- same posture as
+            # heimdall-caveman's own _safe_write_level for the level file.
+            return
+        payload = {"total_filler_count": 0, "prose_chars": 1}
+        payload["measured_at"] = time.time()
+        payload["session_path"] = session_path
+        fd, tmp = tempfile.mkstemp(prefix=".caveman-compliance-last.tmp.", dir=home)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(payload, fh)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        except Exception:
+            _silent_unlink(tmp)
+    except Exception:
+        return  # fail open -- persistence is bookkeeping, never this run's problem
 
 
 def _empty_result(error=None):
@@ -182,6 +256,8 @@ def main(argv):
         sys.stderr.write(USAGE + "\n")
         return 2
     rec = measure_session(path)
+    if not rec.get("error") and rec.get("prose_chars", 0) > 0:
+        _persist_last(rec, path)
     if json_out:
         print(json.dumps(rec))
     else:
