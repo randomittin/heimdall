@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-# heimdall-caveman-eval -- real, honest, three-arm token-compression eval for
-# hmd's own caveman levels (lite/full/ultra). Measures whether the RULES
-# THEMSELVES, read by a real model, cut real output tokens vs a generic
-# terse instruction -- never vs raw baseline, and never on hand-written
-# examples.
+# heimdall-caveman-eval -- real, honest, multi-arm token-compression eval for
+# hmd's own caveman levels (hmd_lite/hmd_full/hmd_ultra) AND, as of this
+# revision, upstream's own MIT-licensed compression SKILL, measured
+# side-by-side under the identical protocol so the comparison is direct.
+# Measures whether the RULES THEMSELVES, read by a real model, cut real
+# output tokens vs a generic terse instruction -- never vs raw baseline,
+# and never on hand-written examples.
 #
 # ADAPTED FROM (MIT, attributed): github.com/juliusbrussee/caveman
 # (c) 2026 Julius Brussee -- evals/measure.py + evals/llm_run.py. Preserved
-# from upstream: the three-arm design (__baseline__ no system prompt /
-# __terse__ "Answer concisely." control / one arm per compression level);
-# the core insight that the HONEST delta is level-vs-__terse__, never
-# level-vs-__baseline__ -- comparing to raw baseline inflates the number by
-# crediting the level with savings that are really just "any terse
+# from upstream: the multi-arm design (__baseline__ no system prompt /
+# __terse__ "Answer concisely." control / one arm per compression skill or
+# level); the core insight that the HONEST delta is arm-vs-__terse__, never
+# arm-vs-__baseline__ -- comparing to raw baseline inflates the number by
+# crediting the arm with savings that are really just "any terse
 # instruction at all". Upstream's own measure.py computes and reports the
 # terse-vs-baseline number separately for exactly this reason; this file
 # does the same (see terse_vs_baseline_pct below). Also preserved: real LLM
@@ -21,28 +23,73 @@
 # distribution (median/mean/min/max/stdev via stdlib `statistics`), not one
 # headline number.
 #
-# What is DIFFERENT from upstream, and why:
-#   - Arms are hmd's own levels (lite/full/ultra), sourced live from
+# ARMS (6 total): __baseline__, __terse__, upstream_skill, hmd_lite,
+# hmd_full, hmd_ultra.
+#
+# LICENCE PROVENANCE for the upstream_skill arm
+# Its prompt text is evals/caveman/upstream_skill.md, a byte-for-byte
+# vendored copy of github.com/juliusbrussee/caveman's skills/caveman/
+# SKILL.md -- plain MIT, Copyright (c) 2026 Julius Brussee (that repo's
+# root LICENSE; NOT one of the BSL-1.1 "Engine-linked" directories -- see
+# bin/heimdall-caveman's own LICENCE PROVENANCE block and
+# docs/analysis/2026-08-30-caveman-upstream-practices.md SS0 for the
+# license-boundary map this repo already established). MIT permits
+# vendoring with attribution; this comment plus the matching notice in
+# bin/heimdall-caveman IS that attribution -- the vendored .md file itself
+# is left byte-identical to upstream (verified at vendor time, 2026-08-30:
+# MD5 abc3c9e05065e4624d3c3ef489c17ed9, 3653 bytes) because Markdown has no
+# comment syntax that would not itself become part of the measured system
+# prompt; adding a wrapper comment to the vendored file would contaminate
+# the very text being measured. The MIT copyright notice is preserved here
+# instead, per the license's "included in all copies or substantial
+# portions" condition.
+#
+# WHY upstream_skill IS COMPOSED THE WAY IT IS
+# resolve_upstream_skill_prompt() returns TERSE_PREFIX + "\n\n" + the raw
+# vendored file content, frontmatter and all, completely unstripped --
+# because that is EXACTLY what upstream's own evals/llm_run.py does with
+# its own skill (`system = f"{TERSE_PREFIX}\n\n{skill_md}"` over the whole
+# SKILL.md file). Reproducing their own convention means upstream's skill
+# is measured the way its own authors chose to measure it, not a framing
+# hmd invented that could disadvantage (or flatter) it. This is DIFFERENT
+# from how the three hmd_* arms are built (resolve_hmd_level_prompt() uses
+# `heimdall-caveman rules <level>` output UNPREFIXED) -- deliberately: hmd's
+# rules text already instructs terseness directly (see below), so
+# re-prefixing it would be redundant, whereas upstream's SKILL.md body does
+# NOT itself open with a terse-control-style instruction, so upstream's own
+# harness adds one. Each arm is measured the way its own source project
+# actually intends it to run.
+#
+# What else is DIFFERENT from upstream, and why:
+#   - hmd_lite/hmd_full/hmd_ultra are hmd's own levels, sourced live from
 #     `bin/heimdall-caveman rules <level>` -- the SAME text a real session's
 #     SessionStart hook actually injects. This repo's own CLAUDE.md
 #     (2026-08-30, "Token Efficiency") documents that level ownership now
 #     lives in hmd itself, not the external plugin, and that the plugin has
 #     been observed silently resetting its own flag -- so hmd's own `rules`
-#     output is the only source that is both live and stable. A level arm's
-#     system prompt is that output UNMODIFIED (not prefixed with
-#     TERSE_PREFIX the way upstream composes terse+SKILL.md): hmd's rules
-#     text already instructs terseness directly, so re-prefixing it would
-#     be redundant and less faithful to what a real session actually sees.
+#     output is the only source that is both live and stable. Renamed from
+#     bare lite/full/ultra to hmd_lite/hmd_full/hmd_ultra in this revision
+#     so a report can never confuse "whose lite" now that upstream_skill
+#     sits in the same table.
 #   - Token counts are Claude's OWN exact `usage.output_tokens` from
 #     `claude -p --output-format json` (schema per bin/heimdall:3707-3711
 #     and bin/heimdall-tokens' parse_json_blob), not a tiktoken/o200k_base
 #     approximation. Exact beats approximate when the model under test IS
 #     Claude, and this avoids a new external Python dependency this repo
-#     does not otherwise vendor.
+#     does not otherwise vendor. (Upstream's OWN measure.py uses tiktoken
+#     o200k_base -- OpenAI's tokenizer -- as a documented approximation of
+#     Claude's BPE; this file's exact-token approach is a deliberate
+#     improvement, not an oversight, and is why a fair number against
+#     upstream has to be regenerated here rather than read out of
+#     upstream's own snapshot.)
 #   - The expensive step is opt-in and cost-gated: `refresh` refuses to
 #     spend without --confirm-spend (mirrors bin/heimdall-s6-sweep's
 #     --confirm-full posture: safe by default, loud about cost before it
 #     runs); `--dry-run` prints the exact call count and spends nothing.
+#     `refresh` is now equally loud AFTER it runs: it prints the summed
+#     `total_cost_usd` across every real call it just made, and `report`
+#     prints the same total read back from the committed snapshot -- the
+#     cost of a measurement is never a number someone has to go dig for.
 #   - No model is ever hardcoded as a default (CLAUDE.md model-routing
 #     directive, 2026-08-11): --model / HEIMDALL_CAVEMAN_EVAL_MODEL are the
 #     only ways to pick one; unset means "whatever `claude` itself defaults
@@ -52,7 +99,12 @@
 # must never print a savings figure when no real snapshot exists. `report`
 # on a missing snapshot says exactly that -- "no measurement yet" -- and
 # exits 0 (an honest empty state is not a failure, and is never rendered as
-# a zero). See test/heimdall-caveman-eval.test.sh for the red-proof.
+# a zero). The same honesty applies per-arm: if a snapshot lacks the
+# upstream_skill arm (e.g. one generated before this revision), report
+# prints the hmd_*-vs-__terse__ numbers it CAN compute and says plainly
+# that the vs-upstream_skill comparison is unavailable, rather than
+# omitting it silently or rendering a fake zero. See
+# test/heimdall-caveman-eval.test.sh for the red-proof.
 #
 # Usage:
 #   heimdall-caveman-eval [report] [--json] [--snapshot <path>]
@@ -68,16 +120,18 @@ import subprocess
 import sys
 import tempfile
 
-LEVELS = ("lite", "full", "ultra")
+HMD_LEVEL_ARMS = ("hmd_lite", "hmd_full", "hmd_ultra")
+UPSTREAM_SKILL_ARM = "upstream_skill"
 TERSE_PREFIX = "Answer concisely."
 MODEL_ENV = "HEIMDALL_CAVEMAN_EVAL_MODEL"
-ARM_ORDER = ("__baseline__", "__terse__") + LEVELS
+ARM_ORDER = ("__baseline__", "__terse__", UPSTREAM_SKILL_ARM) + HMD_LEVEL_ARMS
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
 CAVEMAN_BIN = os.path.join(_HERE, "heimdall-caveman")
 DEFAULT_PROMPTS = os.path.join(_REPO_ROOT, "evals", "caveman", "prompts.txt")
 DEFAULT_SNAPSHOT = os.path.join(_REPO_ROOT, "evals", "caveman", "snapshot.json")
+UPSTREAM_SKILL_PATH = os.path.join(_REPO_ROOT, "evals", "caveman", "upstream_skill.md")
 
 USAGE = """Usage: heimdall-caveman-eval [report] [--json] [--snapshot <path>]
        heimdall-caveman-eval refresh --confirm-spend [--model <alias>] [--prompts <path>] [--snapshot <path>]
@@ -94,9 +148,13 @@ refresh            Regenerate the snapshot by running every (prompt, arm)
                    snapshot.
 
 Arms: __baseline__ (no system prompt), __terse__ ("Answer concisely."),
-      lite / full / ultra (`heimdall-caveman rules <level>`, unmodified).
-The honest delta for a level is ALWAYS level vs __terse__, never vs
-__baseline__ -- see the file header for why."""
+      upstream_skill (upstream's MIT SKILL.md, vendored verbatim at
+      evals/caveman/upstream_skill.md, composed as TERSE_PREFIX + skill
+      text per upstream's own eval convention), hmd_lite / hmd_full /
+      hmd_ultra (`heimdall-caveman rules <level>`, unmodified).
+The honest delta for an hmd level is ALWAYS level vs __terse__, never vs
+__baseline__ -- see the file header for why. The honest delta for hmd vs
+upstream is hmd_<level> vs upstream_skill, directly."""
 
 
 def eprint(*a, **kw):
@@ -148,12 +206,14 @@ def claude_version():
         return "unknown"
 
 
-def resolve_system_prompt(level):
-    """Real hmd rules text for a level, unmodified -- the same text a real
-    session's SessionStart hook injects. Read-only: calling
+def resolve_hmd_level_prompt(arm):
+    """Real hmd rules text for an hmd_<level> arm, unmodified -- the same
+    text a real session's SessionStart hook injects. Read-only: calling
     `heimdall-caveman rules <level>` WITH an explicit level bypasses the
     get/migration path and only prints static rule text plus a read-only
-    last-measurement trailer."""
+    last-measurement trailer. Accepts either the arm name (hmd_lite) or a
+    bare level (lite); build_snapshot always passes the former."""
+    level = arm[len("hmd_"):] if arm.startswith("hmd_") else arm
     if not os.path.isfile(CAVEMAN_BIN) or not os.access(CAVEMAN_BIN, os.X_OK):
         raise RuntimeError("sibling tool not found or not executable: %s" % CAVEMAN_BIN)
     out = subprocess.run([CAVEMAN_BIN, "rules", level], capture_output=True, text=True)
@@ -163,6 +223,22 @@ def resolve_system_prompt(level):
             % (level, out.returncode, out.stderr.strip())
         )
     return out.stdout
+
+
+def resolve_upstream_skill_prompt():
+    """Upstream's own eval methodology (evals/llm_run.py in
+    github.com/juliusbrussee/caveman, MIT, (c) 2026 Julius Brussee):
+    system = TERSE_PREFIX + "\\n\\n" + <raw SKILL.md text, frontmatter and
+    all, unstripped>. Reproduced exactly so upstream's skill is measured
+    the way its own authors measure it -- not a framing hmd invented that
+    could favor or disadvantage it. See the file header's LICENCE
+    PROVENANCE note and evals/caveman/upstream_skill.md for the vendored
+    text."""
+    if not os.path.isfile(UPSTREAM_SKILL_PATH):
+        raise RuntimeError("upstream skill text not vendored: %s" % UPSTREAM_SKILL_PATH)
+    with open(UPSTREAM_SKILL_PATH, "r", encoding="utf-8") as fh:
+        skill_md = fh.read()
+    return TERSE_PREFIX + "\n\n" + skill_md
 
 
 def run_claude(prompt, system, model):
@@ -213,11 +289,39 @@ def build_snapshot(prompts, model):
             system = None
         elif arm == "__terse__":
             system = TERSE_PREFIX
+        elif arm == UPSTREAM_SKILL_ARM:
+            system = resolve_upstream_skill_prompt()
         else:
-            system = resolve_system_prompt(arm)
+            system = resolve_hmd_level_prompt(arm)
         eprint("  %s (%d prompts)..." % (arm, len(prompts)))
         snapshot["arms"][arm] = [run_claude(p, system, model) for p in prompts]
     return snapshot
+
+
+def _total_cost(arms):
+    """Sum cost_usd across every call entry in an arms dict. Returns
+    (total_or_None, n_missing) -- n_missing is the count of entries whose
+    cost_usd was absent/non-numeric (e.g. an older snapshot, or a `claude`
+    response that omitted total_cost_usd), so a partial sum is never
+    silently presented as complete. Tolerates a malformed (non-list) arm
+    value defensively rather than crashing a `report` on a hand-edited or
+    corrupt snapshot."""
+    total = 0.0
+    seen = 0
+    missing = 0
+    for entries in arms.values():
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            c = e.get("cost_usd") if isinstance(e, dict) else None
+            if isinstance(c, (int, float)):
+                total += c
+                seen += 1
+            else:
+                missing += 1
+    if seen == 0:
+        return None, missing
+    return total, missing
 
 
 def atomic_write_json(path, obj):
@@ -308,7 +412,15 @@ def cmd_refresh(argv):
         return 1
 
     atomic_write_json(snap_path, snapshot)
+    total_cost, missing = _total_cost(snapshot["arms"])
+    if total_cost is None:
+        cost_line = "cost: unknown (claude did not report total_cost_usd for any call)"
+    elif missing:
+        cost_line = "cost: $%.4f (partial -- %d call(s) had no cost_usd reported)" % (total_cost, missing)
+    else:
+        cost_line = "cost: $%.4f" % total_cost
     print("wrote %s (%d calls made)" % (snap_path, total_calls))
+    print(cost_line)
     return 0
 
 
@@ -327,37 +439,73 @@ def compute_report(data):
     baseline_total = sum(baseline_tokens)
     terse_total = sum(terse_tokens)
 
+    upstream_tokens = None
+    upstream_total = None
+    upstream_vs_terse = None
+    if UPSTREAM_SKILL_ARM in arms:
+        try:
+            upstream_tokens = [int(e["output_tokens"]) for e in arms[UPSTREAM_SKILL_ARM]]
+        except (KeyError, TypeError, ValueError) as e:
+            return {"error": "malformed '%s' arm entries: %s" % (UPSTREAM_SKILL_ARM, e)}
+        upstream_total = sum(upstream_tokens)
+        u_savings = [1 - (u / t) if t else 0.0 for u, t in zip(upstream_tokens, terse_tokens)]
+        if u_savings:
+            umed, umean, ulo, uhi, usd = _stats(u_savings)
+            upstream_vs_terse = {"median": umed, "mean": umean, "min": ulo, "max": uhi, "stdev": usd}
+
     levels_out = []
-    for level in LEVELS:
-        if level not in arms:
+    for arm in HMD_LEVEL_ARMS:
+        if arm not in arms:
             continue
         try:
-            level_tokens = [int(e["output_tokens"]) for e in arms[level]]
+            level_tokens = [int(e["output_tokens"]) for e in arms[arm]]
         except (KeyError, TypeError, ValueError) as e:
-            return {"error": "malformed '%s' arm entries: %s" % (level, e)}
+            return {"error": "malformed '%s' arm entries: %s" % (arm, e)}
         savings = [1 - (s / t) if t else 0.0 for s, t in zip(level_tokens, terse_tokens)]
         if not savings:
             continue
         med, mean, lo, hi, sd = _stats(savings)
-        levels_out.append(
-            {
-                "level": level,
-                "median": med,
-                "mean": mean,
-                "min": lo,
-                "max": hi,
-                "stdev": sd,
-                "tokens": sum(level_tokens),
-                "terse_tokens": terse_total,
-            }
-        )
+        row = {
+            "level": arm,
+            "median": med,
+            "mean": mean,
+            "min": lo,
+            "max": hi,
+            "stdev": sd,
+            "tokens": sum(level_tokens),
+            "terse_tokens": terse_total,
+        }
+        if upstream_tokens is not None:
+            u_pair_savings = [
+                1 - (h / u) if u else 0.0 for h, u in zip(level_tokens, upstream_tokens)
+            ]
+            if u_pair_savings:
+                vumed, vumean, vulo, vuhi, vusd = _stats(u_pair_savings)
+                row.update(
+                    {
+                        "vs_upstream_median": vumed,
+                        "vs_upstream_mean": vumean,
+                        "vs_upstream_min": vulo,
+                        "vs_upstream_max": vuhi,
+                        "vs_upstream_stdev": vusd,
+                        "upstream_tokens": upstream_total,
+                    }
+                )
+        levels_out.append(row)
+
+    cost_total, cost_missing = _total_cost(arms)
 
     return {
         "metadata": data.get("metadata") if isinstance(data.get("metadata"), dict) else {},
         "baseline_tokens_total": baseline_total,
         "terse_tokens_total": terse_total,
         "terse_vs_baseline_pct": (1 - terse_total / baseline_total) if baseline_total else None,
-        "levels": levels_out,
+        "upstream_skill_available": upstream_tokens is not None,
+        "upstream_skill_tokens_total": upstream_total,
+        "upstream_skill_vs_terse": upstream_vs_terse,
+        "hmd_levels": levels_out,
+        "cost_usd_total": cost_total,
+        "cost_usd_calls_missing": cost_missing,
     }
 
 
@@ -370,8 +518,13 @@ def _print_human(rep, snap_path):
     print("generated_at              : %s" % meta.get("generated_at", "?"))
     print("model / cli               : %s / %s" % (meta.get("model", "?"), meta.get("claude_cli_version", "?")))
     print("n_prompts                 : %s" % meta.get("n_prompts", "?"))
+    cost_total = rep.get("cost_usd_total")
+    if cost_total is not None:
+        missing = rep.get("cost_usd_calls_missing") or 0
+        suffix = " (partial -- %d call(s) missing cost data)" % missing if missing else ""
+        print("measured cost             : $%.4f%s" % (cost_total, suffix))
     print()
-    print("Reference arms (no caveman level):")
+    print("Reference arms (no caveman level, no skill):")
     print("  baseline (no system prompt)        : %d tokens total" % rep["baseline_tokens_total"])
     tvb = rep["terse_vs_baseline_pct"]
     tvb_s = _fmt_pct(tvb) if tvb is not None else "n/a"
@@ -380,16 +533,34 @@ def _print_human(rep, snap_path):
         % (rep["terse_tokens_total"], tvb_s)
     )
     print()
-    if not rep["levels"]:
+
+    if rep["upstream_skill_available"]:
+        ust = rep["upstream_skill_vs_terse"]
+        print("upstream's MIT skill (evals/caveman/upstream_skill.md), vs terse control:")
+        print(
+            "  median %s  mean %s  min %s  max %s  stdev %.0f%%   tokens (skill/terse): %d / %d"
+            % (
+                _fmt_pct(ust["median"]), _fmt_pct(ust["mean"]), _fmt_pct(ust["min"]),
+                _fmt_pct(ust["max"]), ust["stdev"] * 100,
+                rep["upstream_skill_tokens_total"], rep["terse_tokens_total"],
+            )
+        )
+        print()
+    else:
+        print("upstream_skill arm not present in this snapshot -- upstream comparison unavailable.")
+        print()
+
+    if not rep["hmd_levels"]:
         print("no hmd caveman level arms present in this snapshot.")
         return
+
     print("hmd levels, measured as additional reduction ON TOP OF the terse control")
     print("(never vs baseline directly -- see file header for why):")
     print()
-    print("%-8s%8s%8s%8s%8s%8s   tokens (level/terse)" % ("level", "median", "mean", "min", "max", "stdev"))
-    for row in sorted(rep["levels"], key=lambda r: -r["median"]):
+    print("%-10s%8s%8s%8s%8s%8s   tokens (level/terse)" % ("level", "median", "mean", "min", "max", "stdev"))
+    for row in sorted(rep["hmd_levels"], key=lambda r: -r["median"]):
         print(
-            "%-8s%8s%8s%8s%8s%7.0f%%   %d / %d"
+            "%-10s%8s%8s%8s%8s%7.0f%%   %d / %d"
             % (
                 row["level"],
                 _fmt_pct(row["median"]),
@@ -401,6 +572,29 @@ def _print_human(rep, snap_path):
                 row["terse_tokens"],
             )
         )
+
+    print()
+    if rep["upstream_skill_available"]:
+        print("hmd levels vs upstream's MIT skill DIRECTLY (the actual head-to-head --")
+        print("positive = hmd used fewer tokens than upstream's skill for the same prompt):")
+        print()
+        print("%-10s%8s%8s%8s%8s%8s   tokens (hmd/upstream)" % ("level", "median", "mean", "min", "max", "stdev"))
+        for row in sorted(rep["hmd_levels"], key=lambda r: -r["vs_upstream_median"]):
+            print(
+                "%-10s%8s%8s%8s%8s%7.0f%%   %d / %d"
+                % (
+                    row["level"],
+                    _fmt_pct(row["vs_upstream_median"]),
+                    _fmt_pct(row["vs_upstream_mean"]),
+                    _fmt_pct(row["vs_upstream_min"]),
+                    _fmt_pct(row["vs_upstream_max"]),
+                    row["vs_upstream_stdev"] * 100,
+                    row["tokens"],
+                    row["upstream_tokens"],
+                )
+            )
+    else:
+        print("hmd-vs-upstream_skill head-to-head unavailable (upstream_skill arm not in this snapshot).")
 
 
 def cmd_report(argv):
