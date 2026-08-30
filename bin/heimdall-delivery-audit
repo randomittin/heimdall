@@ -118,7 +118,7 @@ recent_bin_names() {
   local root="$1" since="$2"
   git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || return 2
   {
-    git -C "$root" status --porcelain=v1 -- bin 2>/dev/null | while IFS= read -r line; do
+    git -C "$root" status --porcelain=v1 --untracked-files=all -- bin 2>/dev/null | while IFS= read -r line; do
       case "${line:0:2}" in
         '??'|'A '|'AM'|' A'|'AD') printf '%s\n' "${line:3}" ;;
       esac
