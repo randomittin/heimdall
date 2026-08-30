@@ -225,7 +225,8 @@ def _outcome(r):
 
 
 def _aggregate(recs):
-    """(task_type, model) -> {samples, passes, unknown, pass_rate, avg_retries, avg_secs}.
+    """(task_type, model) -> {samples, passes, unknown, pass_rate, avg_retries, avg_secs,
+    tokens_known, total_tokens, avg_tokens}.
 
     `samples`/`passes`/`pass_rate` cover ONLY records with a SCORABLE outcome
     ("pass" or "fail"). A record with a real task_type/model but a null/missing/
@@ -243,9 +244,19 @@ def _aggregate(recs):
     trade one blind spot for another (e.g. hiding real retry-friction from the
     cheapen hypothesis's `avg_retries == 0.0` check whenever most of a tier's runs
     haven't had --outcome recorded yet).
+
+    total_tokens/avg_tokens are DIFFERENT from avg_retries/avg_secs on this exact
+    point: a record's `tokens` field is null (not 0) whenever it was genuinely
+    unmeasured (see bin/heimdall-metric's own never-guess contract), and
+    conflating "unmeasured" with "measured zero" would be exactly the kind of
+    unearned average this file otherwise refuses to produce. So avg_tokens divides
+    by `tokens_known` (records with a real, non-null tokens value) rather than by
+    `seen` — mirroring pass_rate's own samples-not-seen denominator above, not
+    avg_retries/avg_secs's more permissive one.
     """
     acc = defaultdict(lambda: {"samples": 0, "passes": 0, "unknown": 0,
-                                "retries": 0, "secs": 0.0})
+                                "retries": 0, "secs": 0.0,
+                                "tokens": 0, "tokens_known": 0})
     for r in recs:
         key = (r["task_type"], r["model"])
         a = acc[key]
@@ -258,6 +269,13 @@ def _aggregate(recs):
                 a["passes"] += 1
         a["retries"] += int(r.get("retries", 0) or 0)
         a["secs"] += float(r.get("wall_secs", 0) or 0)
+        tok = r.get("tokens")
+        if tok is not None:
+            try:
+                a["tokens"] += int(tok)
+                a["tokens_known"] += 1
+            except (TypeError, ValueError):
+                pass   # malformed value on an older/hand-written row — skip, never crash
     out = {}
     for (tt, model), a in acc.items():
         n = a["samples"]
@@ -271,6 +289,9 @@ def _aggregate(recs):
             "pass_rate": round(a["passes"] / n, 4) if n else 0.0,
             "avg_retries": round(a["retries"] / seen, 4) if seen else 0.0,
             "avg_secs": round(a["secs"] / seen, 2) if seen else 0.0,
+            "tokens_known": a["tokens_known"],
+            "total_tokens": a["tokens"],
+            "avg_tokens": round(a["tokens"] / a["tokens_known"], 2) if a["tokens_known"] else 0.0,
         }
     return out
 
