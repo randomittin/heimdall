@@ -228,3 +228,56 @@ bin/heimdall-caveman-eval refresh --confirm-spend --model sonnet
 # Estimate the call count / cost shape without spending anything:
 bin/heimdall-caveman-eval refresh --dry-run
 ```
+
+---
+
+## §8 — Ladder hypothesis TESTED and NOT SUPPORTED (2026-08-31)
+
+§6 hypothesised that upstream wins because its skill is one omnibus document
+showing all six levels at once — a visible compression ladder anchoring what
+"more" and "less" compressed mean — while hmd emits only the active level in
+isolation.
+
+**Implemented and re-measured with the same instrument** (same 10 prompts, same
+6 arms, same model, second real paid run). Every level's rules gained an
+`## Intensity Ladder` — a 3-row table plus two 3-way worked examples with the
+active level marked `← ACTIVE`.
+
+### Result: rejected.
+
+vs upstream's MIT skill, median (negative = hmd used MORE tokens):
+
+| level | before | after | change |
+|---|---|---|---|
+| hmd_full  | −22% | **−46%** | 24 pts WORSE |
+| hmd_ultra | −33% | −33% | flat |
+| hmd_lite  | −43% | −31% | 12 pts better |
+
+Run-to-run noise, measured from the control arms: upstream vs terse moved
++20% → +17% between runs with no change to either, so ~3 points is baseline
+variance. hmd_lite's +12 is above that but hmd_full's −24 is larger still and
+in the wrong direction, and stdevs remain 20-46%. Net across three levels:
+no improvement, one clear regression.
+
+**The change was NOT merged.** It lives unmerged on
+`worktree-agent-a660afccd7d9a25c2` should anyone want to re-test it with a
+larger corpus. The main checkout was verified byte-identical to HEAD after the
+agent self-reported (and self-corrected) an accidental write to the shared
+checkout.
+
+### What this rules out, and what it does not
+
+RULED OUT: that hmd's deficit is explained by the missing ladder. It is not —
+adding it did not close the gap and made the most-used level worse.
+
+NOT RULED OUT: everything else about upstream's rule text. The gap is real
+(hmd loses at every level, on two independent runs) and its cause is still
+unidentified. A third guess should not be implemented against n=10 with these
+stdevs; the next honest step is a LARGER corpus first, so a real effect can be
+distinguished from a 30-point standard deviation.
+
+### Cost
+
+Two real runs, 60 `claude -p` calls each. First $3.75; second comparable.
+Roughly $7.50 total to learn that one specific hypothesis is wrong — which is
+the price of not shipping a guess as a fix.
