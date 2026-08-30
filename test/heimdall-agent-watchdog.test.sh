@@ -393,13 +393,24 @@ printf 'unsaved investigation notes\n' > "$WT_G/notes.txt"
 BEFORE_G_HEAD="$(git -C "$WT_G" rev-parse HEAD)"
 
 FAKE_TRANSCRIPT="$WORK/fake-subagent-transcript.jsonl"
-# Mirrors the real <env> block Claude Code injects into every agent's own
-# transcript (the same block visible at the top of THIS tool's own
-# transcript) — embedded as escaped JSON string content, exactly as JSON's
-# own grammar requires any embedded newline to be encoded, so the
-# grep+sed extraction is exercised against realistic noise, not a bare
-# text file.
-printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Here is useful information about the environment you are running in:\n<env>\nWorking directory: '"$WT_G"'\nIs directory a git repo: Yes\nPlatform: darwin\n</env>\n"}]}}' > "$FAKE_TRANSCRIPT"
+# Mirrors the REAL shape confirmed by direct inspection of an actual,
+# previously-failed subagent's own transcript on this repo
+# (.claude/projects/*/subagents/agent-a02ab607fdcc38c40.jsonl): every
+# top-level turn record carries its own "cwd" field as a plain top-level
+# JSON key, constant for the agent's whole lifetime. A "Working directory:
+# <path>" text line was the ORIGINAL (wrong) assumption here; that literal
+# text was confirmed to appear ZERO times in that real file or in the
+# 31MB/16838-line parent session transcript it lives under — the env block
+# is injected fresh into the model's context per request and is never
+# persisted to disk. A second, unrelated top-level-shaped "cwd" is also
+# woven into a nested tool_use.input (a Bash call's own per-call cwd param,
+# exactly as seen live in the real parent transcript) to document that
+# extraction reads the top-level field structurally rather than
+# text-matching the first `"cwd":"..."` byte sequence anywhere in the file.
+{
+  jq -nc --arg wt "$WT_G" '{type:"user", cwd:$wt, message:{role:"user", content:[{type:"text", text:"go"}]}}'
+  jq -nc --arg wt "$WT_G" '{type:"assistant", cwd:$wt, message:{role:"assistant", content:[{type:"tool_use", name:"Bash", input:{command:"ls /private/tmp", cwd:"/private/tmp/unrelated-noise"}}]}}'
+} > "$FAKE_TRANSCRIPT"
 
 HOOK_PAYLOAD="$(jq -n --arg tp "$FAKE_TRANSCRIPT" '{agent_type:"hmd:coder", agent_transcript_path:$tp, effort:{level:"high"}}')"
 printf '%s' "$HOOK_PAYLOAD" | "$WD" stop-hook --repo "$REPO" >/dev/null 2>&1
@@ -411,12 +422,40 @@ AFTER_G_HEAD="$(git -C "$WT_G" rev-parse HEAD)"
   || bad "stop-hook: expected exit 0, got $RC"
 
 [ "$BEFORE_G_HEAD" != "$AFTER_G_HEAD" ] \
-  && ok "stop-hook: resolved worktree from transcript's env block and preserved it (HEAD moved)" \
+  && ok "stop-hook: resolved worktree from transcript's top-level cwd field and preserved it (HEAD moved)" \
   || bad "stop-hook FAILED to preserve: HEAD unchanged ($AFTER_G_HEAD)"
 
 [ -z "$(git -C "$WT_G" status --porcelain)" ] \
   && ok "stop-hook: worktree clean after preserve" \
   || bad "stop-hook: worktree still dirty after preserve"
+
+# ── stop-hook robustness: a truncated/corrupt trailing line (the exact
+# shape a mid-write kill leaves) must not block extraction — must fall back
+# to the latest GOOD line instead of failing closed. ──────────────────────
+WT_G2="$WORK/wt-stophook-truncated"
+mk_wt_repo "$WT_G2"
+git -C "$WT_G2" checkout -q -b worktree-agent-g2
+printf 'unsaved work, killed mid-write\n' > "$WT_G2/notes.txt"
+BEFORE_G2_HEAD="$(git -C "$WT_G2" rev-parse HEAD)"
+
+TRUNC_TRANSCRIPT="$WORK/fake-subagent-transcript-truncated.jsonl"
+{
+  jq -nc --arg wt "$WT_G2" '{type:"user", cwd:$wt, message:{role:"user", content:[{type:"text", text:"go"}]}}'
+  printf '%s' '{"type":"assistant","cwd":"'"$WT_G2"'","message":{"role":"assistant","content":[{"type":"tool_use"'
+} > "$TRUNC_TRANSCRIPT"
+
+HOOK_PAYLOAD_G2="$(jq -n --arg tp "$TRUNC_TRANSCRIPT" '{agent_type:"hmd:coder", agent_transcript_path:$tp, effort:{level:"high"}}')"
+printf '%s' "$HOOK_PAYLOAD_G2" | "$WD" stop-hook --repo "$REPO" >/dev/null 2>&1
+RC=$?
+AFTER_G2_HEAD="$(git -C "$WT_G2" rev-parse HEAD)"
+
+[ "$RC" -eq 0 ] \
+  && ok "stop-hook: truncated trailing line still exits 0" \
+  || bad "stop-hook: truncated trailing line should still exit 0, got $RC"
+
+[ "$BEFORE_G2_HEAD" != "$AFTER_G2_HEAD" ] \
+  && ok "stop-hook: truncated trailing line falls back to the last GOOD line's cwd, still preserves" \
+  || bad "stop-hook: truncated trailing line should not block extraction — HEAD unchanged"
 
 # ── stop-hook negative case: no agent_transcript_path -> no-op, exit 0 ────
 WT_H="$WORK/wt-stophook-negative"
