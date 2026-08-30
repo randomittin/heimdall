@@ -34,6 +34,13 @@
 #   wall_secs     wall-clock seconds this attempt took
 #   source        which lane emitted it (orchestrator | queue | cli | ...)
 #   session       the session id, when the environment exposes one
+#   tokens        total tokens (input+output+cache, summed) this attempt cost,
+#                 when a caller can measure it from a transcript's per-turn
+#                 message.usage blocks (bin/heimdall-metric-hook's _sum_tokens
+#                 does this for a subagent's own transcript). Omitted (null)
+#                 when unmeasured — unlike retries/wall_secs, tokens is NEVER
+#                 defaulted to 0, because a real zero and "nobody measured
+#                 this" must stay distinguishable.
 #
 # One record = one ROUTING OBSERVATION ("how did task_type X do on tier Y"). A
 # task that escalates emits one record per tier it touched, so a two-hop
@@ -76,7 +83,7 @@
 #   heimdall-metric task --type SLUG --model haiku|sonnet|opus|unknown --outcome pass|fail
 #                        [--effort SLUG] [--final pass|fail] [--retries N]
 #                        [--escalated-to haiku|sonnet|opus] [--wall-secs N]
-#                        [--source SLUG] [--repo DIR] [--strict]
+#                        [--tokens N] [--source SLUG] [--repo DIR] [--strict]
 #   heimdall-metric where [--repo DIR]      # print the metrics file path
 #   -h | --help
 #
@@ -270,6 +277,10 @@ def _build(args):
     retries = _int(args.retries, "--retries")
     wall_secs = _int(args.wall_secs, "--wall-secs")
 
+    tokens = None
+    if args.tokens is not None:
+        tokens = _int(args.tokens, "--tokens")   # honest null on omission, never 0
+
     session = _slug(os.environ.get("CLAUDE_SESSION_ID")
                     or os.environ.get("SESSION_ID") or "", EFFORT_MAX) or "default"
 
@@ -289,6 +300,7 @@ def _build(args):
         '"wall_secs":%d' % wall_secs,
         '"source":%s' % _json_str(source),
         '"session":%s' % _json_str(session),
+        '"tokens":%s' % (str(tokens) if tokens is not None else "null"),
     ]
     line = "{" + ",".join(parts) + "}\n"
     raw = line.encode("utf-8")
@@ -399,6 +411,10 @@ def build_parser():
                    help="tier this task escalated to, if any")
     t.add_argument("--wall-secs", dest="wall_secs", default=0,
                    help="wall-clock seconds for this attempt")
+    t.add_argument("--tokens", default=None,
+                   help="total tokens (input+output+cache) this attempt cost, when "
+                        "measurable from a transcript's message.usage; omit when "
+                        "unmeasured (recorded as null, never guessed or defaulted to 0)")
     t.add_argument("--source", default="cli", help="emitting lane slug")
     t.set_defaults(fn=cmd_task)
 
