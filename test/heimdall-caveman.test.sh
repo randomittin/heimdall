@@ -142,6 +142,75 @@ D="$(fresh)"
 run "$D" rules nonsense >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ] && ok "rules nonsense exits non-zero (rc=$rc)" || bad "rules nonsense exits non-zero (rc=$rc)"
 
+# ── rules: appends "Last Measured Compliance" section when a genuine
+# measurement has been persisted by heimdall-caveman-compliance's
+# _persist_last() (the measure/act loop -- see this tool's own "PARITY
+# IMPROVEMENTS OVER THE PLUGIN" header comment). Negative case comes FIRST so
+# the positive case below can't be mistaken for "always prints something". ──
+D="$(fresh)"
+no_measure_out="$(run "$D" rules full)"
+case "$no_measure_out" in
+  *"Last Measured Compliance"*) bad "rules appends a measurement section with no measurement file present" ;;
+  *) ok "rules omits measurement section when no measurement file exists" ;;
+esac
+
+# Positive case: a well-formed measurement file is rendered with its ACTUAL
+# figures, not a placeholder -- red-proof against a stub that always prints
+# the same canned section regardless of file content.
+D="$(fresh)"
+printf '{"assistant_messages_with_text": 1, "prose_chars": 1000, "prose_words": 100, "filler_counts": {"articles": 40, "filler_adverbs": 5, "pleasantries": 1, "hedging": 0, "connectives": 2}, "filler_chars": {"articles": 120, "filler_adverbs": 30, "pleasantries": 5, "hedging": 0, "connectives": 10}, "total_filler_chars": 165, "total_filler_count": 48, "filler_share_of_prose_chars_pct": 16.5, "measured_at": 1788000000, "session_path": "/tmp/some-session-abc123.jsonl"}' > "$D/home/caveman-compliance-last.json"
+measured_out="$(run "$D" rules full)"
+case "$measured_out" in
+  *"Last Measured Compliance"*) ok "rules appends measurement section when a genuine measurement is on disk" ;;
+  *) bad "rules did not append measurement section despite a valid measurement file: $measured_out" ;;
+esac
+case "$measured_out" in
+  *"16.50%"*) ok "rules renders the actual measured filler-share figure (16.50%)" ;;
+  *) bad "rules did not render the measured figure 16.50%: $measured_out" ;;
+esac
+case "$measured_out" in
+  *"some-session-abc123.jsonl"*) ok "rules renders the session basename, not the full path" ;;
+  *) bad "rules did not render session basename: $measured_out" ;;
+esac
+case "$measured_out" in
+  *"articles 40"*) ok "rules renders the top offending category with its real count" ;;
+  *) bad "rules did not render top offender 'articles 40': $measured_out" ;;
+esac
+# hedging is 0 and must lose the top-3 sort to articles/filler_adverbs/
+# connectives -- proves a real sort by count, not a dump of every key.
+case "$measured_out" in
+  *"hedging 0"*) bad "rules rendered a zero-count offender instead of a real top-3 sort" ;;
+  *) ok "rules top-offenders list excludes a zero-count category (real sort, not a dump)" ;;
+esac
+
+# Corrupt measurement file: fails open, no section, no leaked content.
+D="$(fresh)"
+printf 'not json at all {{{ garbage-secret-marker\n' > "$D/home/caveman-compliance-last.json"
+corrupt_out="$(run "$D" rules full)"
+case "$corrupt_out" in
+  *"Last Measured Compliance"*) bad "rules appended a measurement section from a corrupt file" ;;
+  *) ok "rules stays silent on a corrupt measurement file (fails open)" ;;
+esac
+case "$corrupt_out" in
+  *"garbage-secret-marker"*) bad "rules leaked raw corrupt-file content into its output" ;;
+  *) ok "rules does not leak corrupt-file content" ;;
+esac
+
+# Symlinked measurement file: refused, same posture as the state-file read.
+D="$(fresh)"
+OUTSIDE_MEASURE="$(mktemp "$TMPDIR/outside-measure.XXXXXX")"
+printf '{"prose_chars": 999, "filler_share_of_prose_chars_pct": 50.0, "filler_counts": {"articles": 9}, "do_not_leak": "do-not-leak-me"}\n' > "$OUTSIDE_MEASURE"
+ln -s "$OUTSIDE_MEASURE" "$D/home/caveman-compliance-last.json"
+symlink_out="$(run "$D" rules full)"
+case "$symlink_out" in
+  *"Last Measured Compliance"*) bad "rules followed a symlinked measurement file" ;;
+  *) ok "rules refuses to follow a symlinked measurement file" ;;
+esac
+case "$symlink_out" in
+  *"do-not-leak-me"*) bad "rules leaked content through a symlinked measurement file" ;;
+  *) ok "rules does not leak symlinked-file content" ;;
+esac
+
 # ── migration: plugin flag seeds hmd's state exactly once ──
 D="$(fresh)"
 printf 'ultra\n' > "$D/claude/.caveman-active"
@@ -268,11 +337,117 @@ path_out="$(run "$D" path)"
 [ "$path_out" = "$D/home/caveman-level" ] && ok "path prints \$HEIMDALL_HOME/caveman-level exactly" \
   || bad "path printed '$path_out', expected '$D/home/caveman-level'"
 
+# ── path: explicit negative-space assertion -- must NOT print the real,
+# un-overridden $HOME path. The equality check above already implies this
+# (a random mktemp dir can never equal the real $HOME), but a path command
+# that silently ignored the override would still print SOME well-formed
+# path, and that failure mode deserves its own explicit, named assertion. ──
+case "$path_out" in
+  "$HOME"/.heimdall/*) bad "path printed the real \$HOME/.heimdall path despite HEIMDALL_HOME override: $path_out" ;;
+  *) ok "path does not fall back to the real \$HOME/.heimdall path when HEIMDALL_HOME is overridden" ;;
+esac
+
+# ── diff: two DIFFERENT levels emit a real, non-empty unified diff naming
+# both -- red-proof against a stub that always prints the same canned text
+# regardless of which levels were asked for: it must contain content unique
+# to the ultra-only rule text ("Abbreviate") and real unified-diff markers. ──
+D="$(fresh)"
+diff_out="$(run "$D" diff ultra lite)"; rc=$?
+[ "$rc" -eq 0 ] && ok "diff between two different levels exits 0 (rc=$rc)" || bad "diff between two different levels exits 0 (rc=$rc)"
+[ -n "$diff_out" ] && ok "diff between two different levels produces non-empty output" || bad "diff between two different levels produced empty output"
+case "$diff_out" in
+  *"lite"*) ok "diff output names the baseline level (lite)" ;;
+  *) bad "diff output does not name the baseline level 'lite': $diff_out" ;;
+esac
+case "$diff_out" in
+  *"ultra"*) ok "diff output names the target level (ultra)" ;;
+  *) bad "diff output does not name the target level 'ultra': $diff_out" ;;
+esac
+case "$diff_out" in
+  *"Abbreviate"*) ok "diff output contains ultra-only content ('Abbreviate'), proving it diffs real rule text" ;;
+  *) bad "diff output missing ultra-only content 'Abbreviate' -- looks like a stub: $diff_out" ;;
+esac
+case "$diff_out" in
+  *"---"*"+++"*) ok "diff output contains unified-diff markers (---/+++)" ;;
+  *) bad "diff output missing unified-diff markers: $diff_out" ;;
+esac
+
+# ── diff: the SAME level on both sides emits NO differences -- proves this
+# does not just always print "something" regardless of input (a stub that
+# echoes a stray diff or the same boilerplate no matter what would fail this
+# specific case, even though it might pass the "different levels" case above). ──
+D="$(fresh)"
+same_out="$(run "$D" diff full full)"; rc=$?
+[ "$rc" -eq 0 ] && ok "diff between the same level twice exits 0 (rc=$rc)" || bad "diff between the same level twice exits 0 (rc=$rc)"
+case "$same_out" in
+  *"---"*|*"+++"*) bad "diff between identical levels emitted unified-diff markers (should say 'no difference' instead): $same_out" ;;
+  *) ok "diff between identical levels emits no unified-diff markers" ;;
+esac
+case "$same_out" in
+  *"already the baseline"*|*"no rule-text difference"*) ok "diff between identical levels explicitly says there is no difference" ;;
+  *) bad "diff between identical levels does not say so explicitly: $same_out" ;;
+esac
+
+# ── diff: baseline defaults to the CURRENT level when omitted (exercises the
+# internal cmd_get call) -- omitted-baseline output must match the explicit
+# current-level diff exactly. ──
+D="$(fresh)"
+run "$D" set lite >/dev/null 2>&1
+default_baseline_out="$(run "$D" diff ultra)"
+explicit_baseline_out="$(run "$D" diff ultra lite)"
+[ "$default_baseline_out" = "$explicit_baseline_out" ] && ok "diff with omitted baseline matches the explicit current level" \
+  || bad "diff with omitted baseline does not match explicit current-level diff"
+
+# ── diff: invalid TARGET level fails cleanly -- non-zero, no crash, no bogus
+# diff emitted on stdout. ──
+D="$(fresh)"
+bad_target_out="$(run "$D" diff nonsense 2>/dev/null)"; rc=$?
+[ "$rc" -ne 0 ] && ok "diff with invalid target level exits non-zero (rc=$rc)" || bad "diff with invalid target level exits non-zero (rc=$rc)"
+[ -z "$bad_target_out" ] && ok "diff with invalid target level emits nothing on stdout" || bad "diff with invalid target level leaked to stdout: '$bad_target_out'"
+bad_target_err="$(run "$D" diff nonsense 2>&1 1>/dev/null)"
+case "$bad_target_err" in
+  *"invalid level"*) ok "diff with invalid target level reports 'invalid level' on stderr" ;;
+  *) bad "diff with invalid target level did not report 'invalid level' on stderr: $bad_target_err" ;;
+esac
+
+# ── diff: invalid BASELINE level (second arg) also fails cleanly. ──
+D="$(fresh)"
+bad_base_out="$(run "$D" diff full nonsense 2>/dev/null)"; rc=$?
+[ "$rc" -ne 0 ] && ok "diff with invalid baseline level exits non-zero (rc=$rc)" || bad "diff with invalid baseline level exits non-zero (rc=$rc)"
+[ -z "$bad_base_out" ] && ok "diff with invalid baseline level emits nothing on stdout" || bad "diff with invalid baseline level leaked to stdout: '$bad_base_out'"
+
+# ── diff: no arguments at all -- caller error, non-zero, no crash. ──
+D="$(fresh)"
+run "$D" diff >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && ok "diff with no arguments exits non-zero (rc=$rc)" || bad "diff with no arguments exits non-zero (rc=$rc)"
+
+# ── diff: stdout/stderr discipline matches the same divergence-warning
+# contract 'get'/'rules' already enforce -- diff's default-baseline path
+# calls cmd_get internally, so a stored/plugin-flag divergence must still
+# warn on stderr ONLY, never polluting the unified-diff text on stdout. ──
+D="$(fresh)"
+run "$D" set ultra >/dev/null 2>&1
+printf 'full\n' > "$D/claude/.caveman-active"
+diverged_stdout="$(run "$D" diff lite 2>/dev/null)"
+case "$diverged_stdout" in
+  *"diverged"*) bad "diff leaked the divergence warning onto stdout: $diverged_stdout" ;;
+  *) ok "diff keeps stdout clean of the divergence warning even when levels diverge" ;;
+esac
+diverged_stderr="$(run "$D" diff lite 2>&1 1>/dev/null)"
+case "$diverged_stderr" in
+  *"diverged"*"ultra"*"full"*) ok "diff surfaces the divergence warning on stderr, naming both values" ;;
+  *) bad "diff did not surface the divergence warning on stderr: $diverged_stderr" ;;
+esac
+case "$diverged_stdout" in
+  *"ultra"*) ok "diff's default-baseline resolution still uses hmd's stored value ('ultra'), not the diverged plugin flag" ;;
+  *) bad "diff's default-baseline resolution used the wrong value: $diverged_stdout" ;;
+esac
+
 # ── help / usage ──
 D="$(fresh)"
 help_out="$(run "$D" --help)"; rc=$?
 [ "$rc" -eq 0 ] && ok "--help exits 0" || bad "--help exits 0 (rc=$rc)"
-for word in get set rules hooks-json path; do
+for word in get set rules diff hooks-json path; do
   case "$help_out" in
     *"$word"*) ok "--help mentions '$word'" ;;
     *) bad "--help does not mention '$word'" ;;
