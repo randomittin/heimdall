@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+# heimdall-caveman — hmd-native output-compression level owner.
+#
+# WHY THIS EXISTS
+# Output compression ("caveman mode") used to depend entirely on the external
+# `caveman` Claude Code plugin (https://github.com/juliusbrussee/caveman):
+# hmd could only REPORT the plugin's live level (bin/heimdall-caveman-block)
+# for its own agent-spawn preambles, never OWN the level or the rule text,
+# and had nothing of its own if that plugin were ever absent. Per owner
+# directive (2026-08-29/30, delta-brief brief-1788088676-56663): hmd now owns
+# the level get/set and the per-level rule text directly, so output
+# compression is no longer a hard dependency on that external plugin. See
+# CLAUDE.md "Token Efficiency" for the ownership-transfer note this requires
+# there, and bin/heimdall-caveman-block / bin/heimdall-caveman-compliance for
+# the two adjacent, UNCHANGED tools this one does not replace (the former
+# still reports the plugin's own live level for spawn preambles; the latter
+# is still the read-back auditor, reused — not duplicated — below).
+#
+# SCOPE: exactly three levels — lite, full, ultra — the subset of the
+# plugin's VALID_MODES this tool owns. The plugin's other modes (off, the
+# wenyan-* classical-Chinese variants, and the independent commit/review/
+# compress modes) are out of scope for this change and untouched.
+#
+# LICENCE PROVENANCE
+# The caveman plugin (github.com/juliusbrussee/caveman) is MIT-licensed,
+# Copyright (c) 2026 Julius Brussee (that repo's root LICENSE file, byte-
+# identical to the copy bundled in the installed plugin cache). A separate,
+# scoped Business Source License 1.1 carve-out (that repo's LICENSING.md)
+# covers only its "Engine-linked" directories — engine/, proxy/,
+# cacheengine/, rewriter/, browse/, mcp/, shrink/, the cavemem Go core, and
+# shared/platform/ — none of which the caveman SKILL/hook content reused
+# below lives under; skills/caveman/SKILL.md and the two hook scripts it
+# informs are plain MIT. MIT permits vendoring with attribution, which is
+# what the `_rules_*` functions below do: their prose is adapted from that
+# repo's skills/caveman/SKILL.md (the "## Rules" / "## Intensity" / example
+# sections), reformatted per level and with two deliberate, disclosed
+# changes from the source text — see "DISCLOSED ADAPTATIONS" below. The
+# MIT copyright notice above is preserved here per the license's "included
+# in all copies or substantial portions" condition. The hook-wiring SHAPE
+# (SessionStart injects the full per-level rules once; UserPromptSubmit
+# reinforces just the level name every turn) is REIMPLEMENTED FROM OBSERVED
+# BEHAVIOR of that repo's hooks/caveman-activate.js and
+# hooks/caveman-mode-tracker.js — no line of shell code below is copied from
+# either JS file.
+#
+# DISCLOSED ADAPTATIONS (so nobody mistakes these for copy errors)
+#   1. The source SKILL.md's "## Rules" section states "Drop: articles"
+#      unconditionally, directly under an "## Intensity" table whose own
+#      `lite` row says "Keep articles + full sentences" — a real self-
+#      contradiction in the source (the installed hook passes "## Rules"
+#      through unfiltered for every level, so the live plugin actually ships
+#      this contradiction at level lite). Reimplemented here as level-aware
+#      instead: the `lite` block below keeps articles, matching what the
+#      table — the unambiguous source of truth — actually specifies.
+#   2. "Switch: `/caveman lite|full|ultra`" is adapted to point at THIS
+#      tool's own `set` subcommand instead of the plugin's slash command,
+#      since that command may not be installed once this tool owns the
+#      level.
+#
+# THE HONEST LIMIT (read before trusting this as enforcement)
+# Moving level-ownership in-house changes WHO OWNS THE RULES, not WHETHER
+# THEY ARE FOLLOWED. A SessionStart/UserPromptSubmit hook can only INJECT
+# instruction text before the model replies — it cannot rewrite, veto, or
+# even see the model's actual output. Measured on this repo's own session
+# transcript while the EXTERNAL plugin was active at level `full`: 3.25% of
+# assistant prose characters were still caveman-targeted filler (see
+# bin/heimdall-caveman-compliance, wired as `hmd caveman-audit`). In-housing
+# level ownership does NOT fix that gap and this file makes no claim that it
+# does. Run `hmd caveman-audit <session.jsonl>` for the measured read-back;
+# this tool never gates on it, only points at it (`rules` output does too).
+#
+# STORAGE
+# hmd's own level: $HEIMDALL_HOME/caveman-level (one line: lite|full|ultra).
+# NOT the plugin's ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active file —
+# that file is read exactly once, as a migration SEED, only when hmd's own
+# state file does not exist yet AND the plugin's flag holds a value this
+# tool recognizes (lite/full/ultra). After that first read, hmd never
+# ADOPTS a value from the plugin's file again, and never writes to it — but
+# every `get` DOES read it once more, read-only, purely to compare. See
+# "DIVERGENCE / RESTART SAFETY" below for why that comparison exists.
+#
+# DIVERGENCE / RESTART SAFETY
+# Directly observed on this repo's own session (owner report, 2026-08-30):
+# the plugin silently overwrites its OWN flag file back to its default
+# ("full") on session restart, with no warning. Verified first-hand -- write
+# "ultra" to the plugin's .caveman-active at 17:05, restart the session
+# (/login), and the file's mtime advances to 17:18:07 holding "full", not
+# "ultra" -- nobody touched it. An operator who set ultra therefore gets
+# full back with no notice, and a compliance measurement taken afterward
+# would silently be scored against the wrong level. hmd's own state file is
+# immune (a different path the plugin never writes to), but immunity alone
+# leaves an operator staring at two disagreeing files with no signal about
+# which one is real. So `get` (and therefore `rules` with no explicit level,
+# since it resolves through `get`) compares hmd's stored value against the
+# plugin's LIVE flag on every call, not just at migration, and prints a
+# one-line warning to stderr -- never stdout, so a hook's injected text
+# stays clean -- when they disagree. hmd's value always wins; this is a
+# visibility fix, not a new source of truth. See _warn_if_diverged() below.
+#
+# SUBCOMMANDS
+#   heimdall-caveman get                 print the current level (migrates
+#                                         from the plugin's flag once if
+#                                         unset; on every call also compares
+#                                         against the plugin's LIVE flag and
+#                                         warns on stderr, never stdout, if
+#                                         they disagree -- hmd's value always
+#                                         wins; falls back to "full" — the
+#                                         plugin's own documented default —
+#                                         if neither source has a valid
+#                                         value)
+#   heimdall-caveman set <lvl>           persist lite|full|ultra as current
+#   heimdall-caveman rules [<lvl>]       print the rule text for <lvl> (or
+#                                         the current level if omitted)
+#   heimdall-caveman hooks-json          print the exact SessionStart +
+#                                         UserPromptSubmit hooks.json
+#                                         fragments needed to wire this tool
+#                                         (reference text only — this tool
+#                                         never edits hooks.json itself)
+#   heimdall-caveman path                print the path to hmd's state file
+#   heimdall-caveman -h | --help         usage
+#
+# Fails open throughout: a missing/corrupt state file, a missing $HOME, or a
+# missing plugin flag never crashes a session start — `get` always prints a
+# valid level.
+
+set -uo pipefail
+
+HEIMDALL_HOME="${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}"
+STATE_FILE="$HEIMDALL_HOME/caveman-level"
+PLUGIN_FLAG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active"
+VALID_LEVELS="lite full ultra"
+DEFAULT_LEVEL="full"
+MAX_FLAG_BYTES=64
+
+is_valid_level() {
+  case " $VALID_LEVELS " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Symlink-safe, size-capped read. Mirrors the threat model the vendored
+# source's own caveman-config.js readFlag() hardens against (a local writer
+# to the state dir swapping the file for a symlink so whatever later prints
+# the "level" leaks unrelated file content) — same posture, reimplemented in
+# bash rather than copied. Returns nothing (empty stdout) on any anomaly:
+# missing file, symlink, oversized, or a value outside lite/full/ultra.
+_safe_read_level() {
+  local f="$1"
+  [ -n "$f" ] || return 0
+  [ -e "$f" ] || return 0
+  [ -L "$f" ] && return 0
+  [ -f "$f" ] || return 0
+  local raw
+  raw="$(head -c "$MAX_FLAG_BYTES" "$f" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" || return 0
+  is_valid_level "$raw" && printf '%s' "$raw"
+  return 0
+}
+
+# Symlink-safe atomic write: refuses a symlinked parent dir or an existing
+# symlink at the target path, writes to a mktemp file in the SAME directory
+# (guarantees same filesystem so `mv` is atomic) with 0600 perms, then
+# renames into place.
+_safe_write_level() {
+  local f="$1" val="$2" dir tmp
+  dir="$(dirname "$f")"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  [ -L "$dir" ] && return 1
+  if [ -e "$f" ] && [ -L "$f" ]; then return 1; fi
+  tmp="$(mktemp "$dir/.caveman-level.tmp.XXXXXX" 2>/dev/null)" || return 1
+  if ! printf '%s\n' "$val" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$f" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
+# One-time migration: only fires when hmd's own state file does not exist
+# yet. READS (never writes) the plugin's flag; seeds hmd's state only if
+# that value is one of the three levels this tool owns. Silent no-op
+# otherwise — `get`'s own fallback to $DEFAULT_LEVEL covers every other
+# case (plugin absent, plugin flag unset, plugin flag holds an out-of-scope
+# mode like a wenyan-* variant or "off").
+_migrate_once() {
+  [ -f "$STATE_FILE" ] && return 0
+  local seed
+  seed="$(_safe_read_level "$PLUGIN_FLAG")"
+  [ -n "$seed" ] || return 0
+  _safe_write_level "$STATE_FILE" "$seed" || true
+  return 0
+}
+
+# Runs on every `get`, not just at migration -- the plugin has been observed
+# to silently rewrite its OWN flag file back to its default on session
+# restart (see "DIVERGENCE / RESTART SAFETY" above), so a one-time migration
+# read cannot catch a disagreement that appears later. NEVER changes the
+# resolved value; only decides whether to print a heads-up. Silent (no
+# output) when the plugin flag is absent or holds a value outside
+# lite/full/ultra -- that is not a disagreement about a level this tool owns.
+_warn_if_diverged() {
+  local resolved="$1" plugin_val
+  plugin_val="$(_safe_read_level "$PLUGIN_FLAG")"
+  [ -n "$plugin_val" ] || return 0
+  [ "$plugin_val" = "$resolved" ] && return 0
+  echo "heimdall-caveman: level diverged -- hmd stores '$resolved', plugin flag now reports '$plugin_val'; hmd's value wins (plugin file is compared on every get, never re-adopted after first migration)" >&2
+}
+
+cmd_get() {
+  _migrate_once
+  local lvl
+  lvl="$(_safe_read_level "$STATE_FILE")"
+  if [ -z "$lvl" ]; then
+    lvl="$DEFAULT_LEVEL"
+  fi
+  _warn_if_diverged "$lvl"
+  printf '%s\n' "$lvl"
+}
+
+cmd_set() {
+  local lvl="${1:-}"
+  if [ -z "$lvl" ]; then
+    echo "error: heimdall-caveman set needs a level (lite|full|ultra)" >&2
+    return 2
+  fi
+  lvl="$(printf '%s' "$lvl" | tr '[:upper:]' '[:lower:]')"
+  if ! is_valid_level "$lvl"; then
+    echo "error: invalid level '$lvl' -- must be one of: $VALID_LEVELS" >&2
+    return 2
+  fi
+  if _safe_write_level "$STATE_FILE" "$lvl"; then
+    printf 'heimdall-caveman: level set to %s (%s)\n' "$lvl" "$STATE_FILE"
+    return 0
+  fi
+  echo "error: could not write $STATE_FILE" >&2
+  return 1
+}
+
+cmd_path() {
+  printf '%s\n' "$STATE_FILE"
+}
+
+# --- per-level rule text -----------------------------------------------
+# Pre-computed per level rather than parsed from markdown at request time —
+# same justification bin/heimdall-caveman-compliance's own FILLER_PATTERNS
+# constant documents: this content is small and stable, so a markdown-
+# parsing dependency would buy nothing here. See "DISCLOSED ADAPTATIONS"
+# above the shebang header for the two places this deliberately departs
+# from the vendored source's literal wording.
+
+_rules_lite() {
+  cat <<'RULES'
+HMD OUTPUT COMPRESSION — level: lite (rules injected below; not a compliance guarantee — audit via `hmd caveman-audit`)
+
+Respond tight. All technical substance stay. Only fluff die.
+
+## Persistence
+
+ACTIVE EVERY RESPONSE. No revert after many turns. No filler drift. Still active if unsure. Off only: "stop caveman" / "normal mode".
+
+Default level: full. Change level: `heimdall-caveman set lite|full|ultra`.
+
+## Rules
+
+Drop: filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging. Keep articles (a/an/the) and full sentences — professional but tight. Short synonyms (big not extensive, fix not "implement a solution for"). Technical terms exact. Code blocks unchanged. Errors quoted exact.
+
+Pattern: [thing] [action] [reason]. [next step].
+
+Not: "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..."
+Yes (full-level phrasing shown for contrast; lite itself keeps articles/full sentences): "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
+
+## This level (lite)
+
+No filler/hedging. Keep articles + full sentences. Professional but tight.
+
+Example — "Why React component re-render?"
+lite: "Your component re-renders because you create a new object reference each render. Wrap it in `useMemo`."
+
+Example — "Explain database connection pooling."
+lite: "Connection pooling reuses open connections instead of creating new ones per request. Avoids repeated handshake overhead."
+
+## Auto-Clarity
+
+Drop compression for: security warnings, irreversible action confirmations, multi-step sequences where fragment order risks misread, user asks to clarify or repeats question. Resume after the clear part is done.
+
+## Boundaries
+
+Code/commits/PRs: write normal. "stop caveman" or "normal mode": revert. Level persists until changed or session end.
+RULES
+}
+
+_rules_full() {
+  cat <<'RULES'
+HMD OUTPUT COMPRESSION — level: full (rules injected below; not a compliance guarantee — audit via `hmd caveman-audit`)
+
+Respond terse like smart caveman. All technical substance stay. Only fluff die.
+
+## Persistence
+
+ACTIVE EVERY RESPONSE. No revert after many turns. No filler drift. Still active if unsure. Off only: "stop caveman" / "normal mode".
+
+Default level: full. Change level: `heimdall-caveman set lite|full|ultra`.
+
+## Rules
+
+Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging. Fragments OK. Short synonyms (big not extensive, fix not "implement a solution for"). Technical terms exact. Code blocks unchanged. Errors quoted exact.
+
+Pattern: [thing] [action] [reason]. [next step].
+
+Not: "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..."
+Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
+
+## This level (full)
+
+Drop articles, fragments OK, short synonyms. Classic caveman.
+
+Example — "Why React component re-render?"
+full: "New object ref each render. Inline object prop = new ref = re-render. Wrap in `useMemo`."
+
+Example — "Explain database connection pooling."
+full: "Pool reuse open DB connections. No new connection per request. Skip handshake overhead."
+
+## Auto-Clarity
+
+Drop caveman for: security warnings, irreversible action confirmations, multi-step sequences where fragment order risks misread, user asks to clarify or repeats question. Resume caveman after clear part done.
+
+## Boundaries
+
+Code/commits/PRs: write normal. "stop caveman" or "normal mode": revert. Level persists until changed or session end.
+RULES
+}
+
+_rules_ultra() {
+  cat <<'RULES'
+HMD OUTPUT COMPRESSION — level: ultra (rules injected below; not a compliance guarantee — audit via `hmd caveman-audit`)
+
+Respond max terse. All technical substance stay. Only fluff die.
+
+## Persistence
+
+ACTIVE EVERY RESPONSE. No revert after many turns. No filler drift. Still active if unsure. Off only: "stop caveman" / "normal mode".
+
+Default level: full. Change level: `heimdall-caveman set lite|full|ultra`.
+
+## Rules
+
+Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging, conjunctions. Fragments OK. Abbreviate (DB/auth/config/req/res/fn/impl). Arrows for causality (X → Y). One word when one word is enough. Technical terms exact. Code blocks unchanged. Errors quoted exact.
+
+Pattern: [thing] [action] [reason]. [next step].
+
+Not: "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..."
+Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
+
+## This level (ultra)
+
+Abbreviate (DB/auth/config/req/res/fn/impl), strip conjunctions, arrows for causality (X → Y), one word when one word is enough.
+
+Example — "Why React component re-render?"
+ultra: "Inline obj prop → new ref → re-render. `useMemo`."
+
+Example — "Explain database connection pooling."
+ultra: "Pool = reuse DB conn. Skip handshake → fast under load."
+
+## Auto-Clarity
+
+Drop caveman for: security warnings, irreversible action confirmations, multi-step sequences where fragment order risks misread, user asks to clarify or repeats question. Resume caveman after clear part done.
+
+## Boundaries
+
+Code/commits/PRs: write normal. "stop caveman" or "normal mode": revert. Level persists until changed or session end.
+RULES
+}
+
+cmd_rules() {
+  local lvl="${1:-}"
+  if [ -z "$lvl" ]; then
+    lvl="$(cmd_get)"
+  else
+    lvl="$(printf '%s' "$lvl" | tr '[:upper:]' '[:lower:]')"
+    if ! is_valid_level "$lvl"; then
+      echo "error: invalid level '$lvl' -- must be one of: $VALID_LEVELS" >&2
+      return 2
+    fi
+  fi
+  case "$lvl" in
+    lite) _rules_lite ;;
+    full) _rules_full ;;
+    ultra) _rules_ultra ;;
+    *) _rules_full ;;
+  esac
+}
+
+cmd_hooks_json() {
+  cat <<'HOOKSJSON'
+hmd does NOT edit hooks/hooks.json itself (siblings own that file right now).
+The two entries below are what SessionStart and UserPromptSubmit need to wire
+this tool in, in the same style already used by this repo's hooks.json
+(PLUGIN root resolved via ${CLAUDE_PLUGIN_ROOT} with a git-toplevel fallback,
+guarded by [ -x ]).
+
+--- SessionStart (append as one more object in the "SessionStart" array) ---
+{
+  "hooks": [
+    {
+      "type": "command",
+      "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then \"$CAV\" rules; fi; exit 0"
+    }
+  ]
+}
+
+--- UserPromptSubmit (append as one more object in the "UserPromptSubmit" array) ---
+{
+  "hooks": [
+    {
+      "type": "command",
+      "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then LVL=\"$(\"$CAV\" get 2>/dev/null)\"; if [ -n \"$LVL\" ]; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"HMD OUTPUT COMPRESSION - level: %s. Apply this level'\"'\"'s rules (heimdall-caveman rules). Code/commits/security: write normal.\"}}' \"$LVL\"; fi; fi; exit 0"
+    }
+  ]
+}
+
+stderr is intentionally left UNSUPPRESSED on the SessionStart `rules` call
+above (the older draft of this fragment redirected it to /dev/null): `get`
+and `rules` write a one-line warning to stderr, never stdout, when hmd's
+stored level disagrees with the plugin's live flag (see this tool's own
+"DIVERGENCE / RESTART SAFETY" header) -- letting that reach the hook's own
+stderr, where an operator or Claude Code's own hook logs can see it, is the
+entire point; suppressing it would silently defeat the warning at exactly
+the "on startup" moment it matters most. The UserPromptSubmit fragment
+deliberately KEEPS `2>/dev/null` on its inner `"$CAV" get` call: without it,
+the same warning would repeat on every single user turn for the rest of the
+session once a divergence exists, which is worse than useless (warning
+fatigue drowns the one signal that matters) -- once per session, at
+SessionStart, is the right cadence, matching this fragment's own established
+pattern of a full per-session dump versus a cheap per-turn reinforcement.
+
+SessionStart prints the full per-level rules ONCE per session (matches the
+plugin's own two-tier design: full dump at session start, short reinforcement
+per turn). UserPromptSubmit re-states only the level name each turn, cheaply,
+so long sessions do not drift once the SessionStart context gets trimmed —
+same rationale as the plugin's own caveman-mode-tracker.js per-turn
+reinforcement. Neither entry is added by this tool; a human or the siblings
+who own hooks/hooks.json right now must paste these in.
+HOOKSJSON
+}
+
+usage() {
+  cat <<USAGE
+Usage: heimdall-caveman <command> [args]
+
+Commands:
+  get                 Print the current level (lite|full|ultra).
+  set <lvl>           Set the current level (lite|full|ultra).
+  rules [<lvl>]       Print the rule text for <lvl> (default: current level).
+  hooks-json          Print the hooks.json fragments needed to wire this tool.
+  path                Print the path to hmd's own state file.
+  -h, --help          Show this help.
+
+Storage: $STATE_FILE (hmd-owned; migrates once from the caveman plugin's flag
+file if present and hmd has no state of its own yet). Every \`get\` also
+compares hmd's stored level against the plugin's LIVE flag and warns on
+stderr -- never stdout -- if they disagree; hmd's value always wins. The
+plugin has been observed to silently reset its own flag on session restart.
+
+Honest limit: this tool INJECTS instruction text; it cannot verify or enforce
+that a model followed it. Run \`hmd caveman-audit <session.jsonl>\` to measure
+actual compliance after the fact.
+USAGE
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    get) cmd_get ;;
+    set) shift; cmd_set "${1:-}" ;;
+    rules) shift; cmd_rules "${1:-}" ;;
+    hooks-json) cmd_hooks_json ;;
+    path) cmd_path ;;
+    -h|--help) usage ;;
+    "")
+      usage >&2
+      return 2
+      ;;
+    *)
+      echo "error: unknown command '$cmd'" >&2
+      usage >&2
+      return 2
+      ;;
+  esac
+}
+
+main "$@"
