@@ -217,6 +217,29 @@ print_section_b() {
     printf '  ARTIFACT=%s/heimdall-run-all-evidence.* EXISTS=0 — no sweep evidence dir found (last run was clean, or none has run)\n' "${TMPDIR:-/tmp}"
   fi
   printf '  %s\n' "$(_measure_artifact "$ROOT/.planning/metrics.jsonl" "" 1800)"
+  local sweep_receipt sr_repo sr_sha sr_clean sr_rc sr_cur_repo sr_cur_sha sr_verdict
+  sweep_receipt="${HEIMDALL_HOME:-$ROOT/.heimdall}/receipts/last-sweep.json"
+  printf '  %s\n' "$(_measure_artifact "$sweep_receipt" "" 1800)"
+  if command -v jq >/dev/null 2>&1 && [ -f "$sweep_receipt" ] && jq -e . "$sweep_receipt" >/dev/null 2>&1; then
+    sr_repo=$(jq -r '.repo // empty' "$sweep_receipt")
+    sr_sha=$(jq -r '.head_sha // empty' "$sweep_receipt")
+    sr_clean=$(jq -r '.tree_clean // false' "$sweep_receipt")
+    sr_rc=$(jq -r 'if (.exit_code|type)=="number" then .exit_code else -1 end' "$sweep_receipt")
+    sr_cur_repo="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+    sr_cur_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$sr_repo" ] && [ "$sr_repo" != "$sr_cur_repo" ]; then
+      sr_verdict="WOULD-BLOCK: receipt is for a different repo ($sr_repo)"
+    elif [ -z "$sr_sha" ] || [ "$sr_sha" != "$sr_cur_sha" ]; then
+      sr_verdict="WOULD-BLOCK: receipt HEAD ${sr_sha:-<none>} != current HEAD ${sr_cur_sha:-<none>} (stale)"
+    elif [ "$sr_clean" != "true" ]; then
+      sr_verdict="WOULD-BLOCK: receipt recorded a dirty tree"
+    elif [ "$sr_rc" != "0" ]; then
+      sr_verdict="WOULD-BLOCK: receipt recorded a failing run (exit $sr_rc)"
+    else
+      sr_verdict="WOULD-PASS: fresh, matching HEAD, clean tree, exit 0"
+    fi
+    printf '  SWEEP-GATE verdict (bin/heimdall-state check-quality-gates would): %s\n' "$sr_verdict"
+  fi
   printf '  Check any other path a claim cites: heimdall-delivery-audit artifact <path> [--pattern PGREP_PATTERN]\n\n'
 }
 
