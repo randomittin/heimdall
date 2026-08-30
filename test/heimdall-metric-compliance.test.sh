@@ -189,6 +189,29 @@ case "$OUT" in
 esac
 
 # ---------------------------------------------------------------------------
+# Session transcript EXISTS but is UNREADABLE (permission denied) -- the
+# distinct `except OSError as e` branch in measure_session(), separate from
+# the os.path.isfile() missing-path check exercised just above. Different
+# code, different message ("could not read" vs "no such") -- worth its own
+# proof rather than assuming the missing-file test also covers this.
+# ---------------------------------------------------------------------------
+UNREADABLE_SESSION="$TMPDIR/unreadable-session.jsonl"
+cp "$SESSION" "$UNREADABLE_SESSION"
+chmod 000 "$UNREADABLE_SESSION"
+OUT="$(python3 "$TOOL" "$UNREADABLE_SESSION" --metrics-file "$METRICS" --json)"
+RC=$?
+chmod 644 "$UNREADABLE_SESSION"
+[ "$RC" -eq 0 ] && ok "unreadable session transcript still exits 0 (fail-open)" || bad "unreadable session transcript still exits 0 (rc=$RC)"
+if [ "$(id -u)" = "0" ]; then
+  ok "unreadable-session case skipped message assertion under root (chmod 000 has no effect)"
+else
+  case "$OUT" in
+    *'"error"'*'could not read session transcript'*) ok "unreadable session transcript reports the distinct could-not-read error" ;;
+    *) bad "unreadable session transcript reports the distinct could-not-read error (got: $OUT)" ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
 # --all aggregate mode: 2 readable transcripts (2 + 3 = 5 completed) plus one
 # UNREADABLE transcript that must be skipped, not fatal. Metrics file carries
 # 2 qualifying rows total (one with a timestamp WAY outside any transcript's
