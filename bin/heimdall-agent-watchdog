@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+# bin/heimdall-agent-watchdog — the missing ENFORCEMENT layer on top of
+# bin/heimdall-agent-resume's REPORTING. That tool tells you which subagents
+# were interrupted, why, and what is at risk; it never acts. Measured cause
+# breakdown this session: quota 202 | STALL 196 | turn_limit 40 | api_error 2
+# — STALL alone is within noise of quota as the single biggest killer, and the
+# recurring failure shape is an agent that reads/investigates for 10-30
+# minutes, produces ZERO files/commits, then dies to a 600s stream-watchdog
+# stall or a 50-turn cap — losing its entire investigation because nothing
+# preserved it. Recovery so far only happened when a human/orchestrator
+# manually noticed and preserved/resumed it: unreliable, and itself the thing
+# this tool exists to fix.
+#
+# WHAT THIS DOES, IN ORDER, EVERY RUN (see cmd_run):
+#   1. DETECT — reuses bin/heimdall-agent-resume's own `report --json`
+#      verbatim (never re-derives state/cause classification; see that
+#      file's own extensive header for what `hung`/`failed`/`killed`/
+#      `orphaned` and `.cause.class` actually mean and do not mean).
+#   2. PRESERVE, FIRST, ALWAYS — before classifying or recommending anything,
+#      for every interrupted agent with a real worktree: commit whatever is
+#      uncommitted there. This is the single highest-value action this tool
+#      takes: a stall/turn-limit/quota death with committed work survives;
+#      one with only dirty files does not, the instant the worktree is ever
+#      cleaned up. ADDITIVE ONLY — `git add` + `git commit`, nothing else,
+#      ever. Never `reset`, never `checkout .`, never `clean -f`. A clean
+#      worktree gets no commit (no empty commits). Scoped with `git -C
+#      <that worktree>` so this NEVER touches the caller's own checkout or
+#      any worktree other than the one named in the report.
+#   3. CLASSIFY + RECOMMEND — reuses `.cause`/`.quota` from the report
+#      verbatim, with exactly one added rule this tool owns outright: a
+#      quota-suspected death is NEVER recommended for retry, full stop,
+#      regardless of anything `.cause.retry_now` says (quota's own
+#      retry_now is already always false upstream — this is stated as owned
+#      policy, not just inherited, because burning more quota on an
+#      auto-retry is what cascaded five deaths in one session; see that
+#      file's own header). Everything else defers to the upstream
+#      `retry_now` verdict: true -> resumable (emit the ALREADY-BUILT
+#      SendMessage payload verbatim), false/unknown -> surfaced, never
+#      retried, never guessed.
+#
+# THE HONEST GAP — "STALL" and "turn_limit" (the descriptive terms for what
+# killed 196+40 agents this session) are NOT named buckets anywhere in
+# bin/heimdall-agent-resume's `.cause.class` vocabulary (quota / overloaded /
+# network / context_overflow / unknown only, or null when there is no
+# notification text at all to classify — see that file's own cause
+# classification section). Concretely, in this tool's own testing: a
+# stream-watchdog stall or turn-limit cutoff usually leaves NO
+# <task-notification> at all (the harness kills the agent before it can
+# enqueue one) — which upstream classifies as `hung` (STATE, awaiting a tool
+# result past HMD_AGENT_HUNG_SECS) or `orphaned` (STATE, session itself is
+# gone), with `.cause.class == null` ("no termination text available to
+# classify — inspect manually"). This tool does NOT invent a `stall` /
+# `turn_limit` bucket to paper over that gap: a `null` cause is reported here
+# as `undetermined`, exactly as honestly as upstream reports it, never
+# guessed into a friendlier-looking label. If a FUTURE harness version
+# starts enqueuing a real notification for these deaths, upstream's own
+# classifier picks it up automatically and this tool inherits it for free —
+# nothing here would need to change.
+#
+# NO PID-BASED LIVENESS CHECK EXISTS, ANYWHERE, FOR AN IN-PROCESS SUBAGENT —
+# a Task-tool subagent is a coroutine inside the parent session's event loop;
+# there is no PID, no control file, no socket — pgrep/lsof cannot see it,
+# only transcript mtime and last-event shape can (bin/heimdall-agents' own
+# basis for `hung`/`stale`/`orphaned`). This tool inherits that boundary
+# rather than inventing a new liveness probe on top of it — the exact
+# mistake a sibling task on this same repo made with pid-less agent-pool
+# entries. Every "is this agent still doing something" judgment below is
+# bin/heimdall-agents' own age/notification/last-event heuristic, never a
+# process check.
+#
+# SUBAGENTSTOP HOOK FEASIBILITY — see `stop-hook` below. Short version: the
+# PRESERVE side effect (a scoped `git commit`) does NOT require reaching a
+# live orchestrator's conversation at all (bin/heimdall-agent-resume's own
+# header already settled, by CLI binary inspection, that a SubagentStop
+# hook's own additionalContext cannot do that) — it only needs to run a
+# command scoped to the dying agent's own worktree, which a hook absolutely
+# CAN do, PROVIDED it can find that worktree path. `stop-hook` resolves it
+# from `agent_transcript_path` (confirmed real and hook-visible today — see
+# bin/heimdall-metric-hook, the one other SubagentStop consumer that already
+# exists) by locating the "Working directory: <path>" line Claude Code
+# injects into every transcript's own environment block (the same block
+# visible at the top of THIS tool's own transcript, and required by JSON's
+# own grammar to appear as one escaped line, never a raw embedded newline).
+# This is a real, structurally-grounded signal, not a guess about transcript
+# content — but it has been verified here only against a synthetic fixture
+# built to that same structural shape (see the stop-hook section of
+# test/heimdall-agent-watchdog.test.sh), not against a byte-for-byte capture
+# of a real killed subagent's transcript file. That gap is reported here on
+# purpose rather than silently assumed closed. Never guesses: no marker
+# found -> no preserve attempt, exit 0, silent.
+#
+# USAGE
+#   heimdall-agent-watchdog run  [--repo DIR] [--states s1,s2,...]
+#                                [--base REF] [--id ID] [--json] [--no-preserve]
+#   heimdall-agent-watchdog stop-hook [--repo DIR]
+#   heimdall-agent-watchdog help
+#
+# EXIT: 0 always for run/stop-hook (fail-open/degraded, mirrors
+#       bin/heimdall-agent-resume's own contract); 2 only on a real usage
+#       error or a missing/broken heimdall-agent-resume dependency.
+#
+# ENV
+#   HMD_AGENT_WATCHDOG_RESUME_BIN  override path to heimdall-agent-resume
+#                                  (tests).
+#   All bin/heimdall-agent-resume / bin/heimdall-agents HMD_AGENT_*,
+#   HMD_NOW, HEIMDALL_QUOTA_NOW_EPOCH, HEIMDALL_QUOTA_SKEW_SECONDS seams
+#   pass straight through unchanged — this tool never re-implements
+#   discovery or classification, it shells out for both.
+set -uo pipefail
+
+_WD_SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  _WD_SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+WD_BIN_DIR="$(cd "$(dirname "$_WD_SELF")" 2>/dev/null && pwd)"
+RESUME_BIN="${HMD_AGENT_WATCHDOG_RESUME_BIN:-$WD_BIN_DIR/heimdall-agent-resume}"
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+
+DEFAULT_STATES="failed,killed,orphaned,hung"
+
+usage() { sed -n '2,${/^[^#]/q;p;}' "$0" | sed 's/^# \{0,1\}//'; }
+
+# _wd_worktree_exists <path> — identical guard to
+# bin/heimdall-agent-resume's own _worktree_exists: a real directory that is
+# also a real git worktree. Re-declared (not sourced) on purpose — these are
+# two separately-invocable CLI tools, not a shared library, and this is a
+# three-line, side-effect-free predicate.
+_wd_worktree_exists() {
+  local p="$1"
+  [ -n "$p" ] && [ -d "$p" ] && git -C "$p" rev-parse --git-dir >/dev/null 2>&1
+}
+
+# _wd_realpath <path> — portable realpath (macOS ships no `realpath` on some
+# images; `cd ... && pwd -P` resolves symlinks identically without it).
+_wd_realpath() {
+  (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"
+}
+
+# _wd_preserve <worktree_path> <repo_realpath> <agent_id> -> JSON
+# {attempted, reason, committed, commit_sha, before_dirty, after_dirty,
+# error} on stdout. ADDITIVE ONLY: `git add -A` + `git commit`, nothing
+# else, ever. Never touches a worktree that does not independently verify
+# as a real git worktree, and refuses (same_as_repo) if it resolves to the
+# exact path this tool was told is the caller's own repo — belt-and-braces
+# on top of the fact that only a worktree-bearing agent record can reach
+# this function at all.
+_wd_preserve() {
+  local wt="$1" repo_real="$2" id="$3"
+
+  if [ -z "$wt" ]; then
+    jq -n '{attempted:false, reason:"no_worktree", committed:false, commit_sha:null, before_dirty:0, after_dirty:0, error:null}'
+    return 0
+  fi
+  if [ ! -d "$wt" ]; then
+    jq -n '{attempted:false, reason:"worktree_missing", committed:false, commit_sha:null, before_dirty:0, after_dirty:0, error:null}'
+    return 0
+  fi
+  local wt_real; wt_real="$(_wd_realpath "$wt")"
+  if [ "$wt_real" = "$repo_real" ]; then
+    jq -n '{attempted:false, reason:"same_as_repo", committed:false, commit_sha:null, before_dirty:0, after_dirty:0, error:null}'
+    return 0
+  fi
+  if ! _wd_worktree_exists "$wt"; then
+    jq -n '{attempted:false, reason:"not_a_git_worktree", committed:false, commit_sha:null, before_dirty:0, after_dirty:0, error:null}'
+    return 0
+  fi
+
+  local before before_n
+  before="$(git -C "$wt" status --porcelain 2>/dev/null)"
+  before_n="$(printf '%s\n' "$before" | grep -c . 2>/dev/null || true)"
+  [ -n "$before_n" ] || before_n=0
+
+  if [ -z "$before" ]; then
+    jq -n --argjson bn "$before_n" \
+      '{attempted:true, reason:"clean", committed:false, commit_sha:null, before_dirty:$bn, after_dirty:$bn, error:null}'
+    return 0
+  fi
+
+  local add_err rc
+  add_err="$(git -C "$wt" add -A -- . 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    jq -n --argjson bn "$before_n" --arg e "$add_err" \
+      '{attempted:true, reason:"dirty", committed:false, commit_sha:null, before_dirty:$bn, after_dirty:$bn, error:("git add failed: " + $e)}'
+    return 0
+  fi
+
+  local commit_err
+  commit_err="$(git -C "$wt" commit -q --no-verify -m "wip: preserve interrupted agent work ($id) [heimdall-agent-watchdog]" 2>&1)"; rc=$?
+
+  local after after_n
+  after="$(git -C "$wt" status --porcelain 2>/dev/null)"
+  after_n="$(printf '%s\n' "$after" | grep -c . 2>/dev/null || true)"
+  [ -n "$after_n" ] || after_n=0
+
+  if [ "$rc" -ne 0 ]; then
+    jq -n --argjson bn "$before_n" --argjson an "$after_n" --arg e "$commit_err" \
+      '{attempted:true, reason:"dirty", committed:false, commit_sha:null, before_dirty:$bn, after_dirty:$an, error:("git commit failed: " + $e)}'
+    return 0
+  fi
+
+  local sha
+  sha="$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "")"
+  if [ -z "$sha" ]; then
+    jq -n --argjson bn "$before_n" --argjson an "$after_n" \
+      '{attempted:true, reason:"dirty", committed:true, commit_sha:null, before_dirty:$bn, after_dirty:$an, error:"commit succeeded but HEAD could not be read"}'
+    return 0
+  fi
+  jq -n --argjson bn "$before_n" --argjson an "$after_n" --arg sha "$sha" \
+    '{attempted:true, reason:"dirty", committed:true, commit_sha:$sha, before_dirty:$bn, after_dirty:$an, error:null}'
+}
+
+# _wd_recommend <agent_json> -> JSON {action, reason, quota_reset_local,
+# quota_reset_tz, note, payload} on stdout. Reads .quota/.cause/.payload
+# from an ALREADY-BUILT bin/heimdall-agent-resume report object — never
+# re-classifies. The ONE rule this tool adds on top: quota is ALWAYS
+# do_not_retry, unconditionally (see header) even though upstream's own
+# retry_now is already false for quota — this asserts it as owned policy
+# rather than an accident of the upstream value.
+_wd_recommend() {
+  local obj="$1" qsusp cls retry
+
+  qsusp="$(printf '%s' "$obj" | jq -r '.quota.suspected')"
+  cls="$(printf '%s' "$obj" | jq -r '.cause.class')"
+  retry="$(printf '%s' "$obj" | jq -r '.cause.retry_now')"
+
+  if [ "$qsusp" = "true" ] || [ "$cls" = "quota" ]; then
+    printf '%s' "$obj" | jq -c '{
+      action:"do_not_retry", reason:"quota",
+      quota_reset_local:(.quota.reset_local // null),
+      quota_reset_tz:(.quota.reset_tz // null),
+      note:"quota exhaustion — never auto-retry; wait for the reset time above",
+      payload:null
+    }'
+    return 0
+  fi
+
+  if [ "$cls" = "null" ]; then
+    printf '%s' "$obj" | jq -c '{
+      action:"undetermined", reason:"no_signal",
+      quota_reset_local:null, quota_reset_tz:null,
+      note:"no termination text available to classify (orphaned/hung — the measured shape of a stall/turn-limit death with no notification) — reported, not guessed",
+      payload:null
+    }'
+    return 0
+  fi
+
+  if [ "$retry" = "true" ]; then
+    printf '%s' "$obj" | jq -c '{
+      action:"resumable", reason:.cause.class,
+      quota_reset_local:null, quota_reset_tz:null,
+      note:.cause.action,
+      payload:.payload
+    }'
+    return 0
+  fi
+
+  printf '%s' "$obj" | jq -c '{
+    action:"undetermined", reason:.cause.class,
+    quota_reset_local:null, quota_reset_tz:null,
+    note:.cause.action,
+    payload:null
+  }'
+}
+
+cmd_run() {
+  local as_json="" repo="$PWD" states="$DEFAULT_STATES" base="main" only_id="" do_preserve="1"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      --repo) repo="$2"; shift 2 ;;
+      --states) states="$2"; shift 2 ;;
+      --base) base="$2"; shift 2 ;;
+      --id) only_id="$2"; shift 2 ;;
+      --no-preserve) do_preserve="0"; shift ;;
+      *) echo "heimdall-agent-watchdog: unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || repo="$PWD"
+  local repo_real; repo_real="$(_wd_realpath "$repo")"
+
+  [ -x "$RESUME_BIN" ] || { echo "error: heimdall-agent-resume not found or not executable at $RESUME_BIN" >&2; return 2; }
+
+  local args=(report --json --repo "$repo" --states "$states" --base "$base")
+  [ -n "$only_id" ] && args+=(--id "$only_id")
+  local rows
+  rows="$("$RESUME_BIN" "${args[@]}" 2>/dev/null)"
+  printf '%s' "$rows" | jq -e . >/dev/null 2>&1 || rows='[]'
+
+  local n
+  n="$(printf '%s' "$rows" | jq 'length' 2>/dev/null)"; [ -n "$n" ] || n=0
+
+  local results="" obj id wt preserve recommend combined
+  while IFS= read -r obj; do
+    [ -n "$obj" ] || continue
+    id="$(printf '%s' "$obj" | jq -r '.id')"
+    wt="$(printf '%s' "$obj" | jq -r '.worktree_path // ""')"
+
+    if [ "$do_preserve" = "1" ]; then
+      preserve="$(_wd_preserve "$wt" "$repo_real" "$id")"
+    else
+      preserve='{"attempted":false,"reason":"skipped_by_flag","committed":false,"commit_sha":null,"before_dirty":0,"after_dirty":0,"error":null}'
+    fi
+    recommend="$(_wd_recommend "$obj")"
+
+    combined="$(jq -n --argjson base "$obj" --argjson pres "$preserve" --argjson rec "$recommend" \
+      '{id: $base.id, state: $base.state, description: $base.description,
+        worktree_path: ($base.worktree_path // null),
+        preserve: $pres, recommendation: $rec}')"
+    results="$results$combined"$'\n'
+  done < <(printf '%s' "$rows" | jq -c '.[]')
+
+  local out
+  out="$(printf '%s' "$results" | jq -s '.')"
+
+  if [ -n "$as_json" ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+
+  if [ "$n" -eq 0 ]; then
+    echo "heimdall-agent-watchdog: no interrupted subagents (states checked: $states)"
+    return 0
+  fi
+
+  echo "=== heimdall-agent-watchdog: $n interrupted subagent(s) ==="
+  printf '%s' "$out" | jq -r '.[] |
+    "\n--- " + .id + " [" + .state + "] " + (.description // "-") + " ---\n" +
+    "worktree: " + (.worktree_path // "none") + "\n" +
+    "preserve: " + .preserve.reason +
+      (if .preserve.committed then " -> committed " + .preserve.commit_sha
+       elif .preserve.error != null then " -> FAILED: " + .preserve.error
+       else " -> no commit needed" end) + "\n" +
+    "recommendation: " + .recommendation.action + " (" + .recommendation.reason + ") - " + .recommendation.note'
+}
+
+# stop-hook — SubagentStop-invocable: reads the hook's own stdin JSON
+# payload (confirmed real shape: agent_type, agent_transcript_path,
+# effort.level, session plumbing — see bin/heimdall-metric-hook, the one
+# existing consumer of this exact event) and, if (and only if) it can
+# resolve the dying subagent's OWN worktree path from it, runs the SAME
+# preserve step against just that one worktree. Never delivers anything
+# back to a live orchestrator (settled impossible — see
+# bin/heimdall-agent-resume's own header); this only ever runs a scoped
+# side-effecting command. Fails open, silently, on every branch: no
+# payload, no agent_transcript_path, no readable transcript, no "Working
+# directory: " marker, or a marker that does not resolve to a real git
+# worktree all degrade to "do nothing", never a guess. ALWAYS exits 0.
+cmd_stop_hook() {
+  local repo="$PWD"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || repo="$PWD"
+  local repo_real; repo_real="$(_wd_realpath "$repo")"
+
+  local input
+  input="$(cat 2>/dev/null || true)"
+  [ -n "$input" ] || return 0
+  printf '%s' "$input" | jq -e . >/dev/null 2>&1 || return 0
+
+  local tpath
+  tpath="$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty' 2>/dev/null)"
+  [ -n "$tpath" ] || return 0
+  [ -f "$tpath" ] && [ -r "$tpath" ] || return 0
+
+  # The dying subagent's own transcript carries its own <env> block with a
+  # "Working directory: <path>" line — the same block visible at the top
+  # of every agent's own system prompt (this tool's own transcript
+  # included). The character class excludes backslash and double-quote so
+  # the match stops right where the JSON string's own escaped "\n" (or its
+  # closing quote) begins, rather than consuming the rest of the line.
+  local wt
+  wt="$(grep -m1 -o 'Working directory: [^\"]*' "$tpath" 2>/dev/null | sed -E 's/^Working directory: //; s/[[:space:]]+$//')"
+  [ -n "$wt" ] || return 0
+
+  _wd_worktree_exists "$wt" || return 0
+  local wt_real; wt_real="$(_wd_realpath "$wt")"
+  [ "$wt_real" != "$repo_real" ] || return 0
+
+  local agent_id
+  agent_id="$(printf '%s' "$input" | jq -r '.agent_type // "unknown"' 2>/dev/null)"
+  _wd_preserve "$wt" "$repo_real" "$agent_id" >/dev/null 2>&1
+  return 0
+}
+
+main() {
+  local sub="${1:-}"
+  case "$sub" in
+    run)       shift; cmd_run "$@" ;;
+    stop-hook) shift; cmd_stop_hook "$@" ;;
+    -h|--help|help|'') usage ;;
+    *) echo "error: unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
