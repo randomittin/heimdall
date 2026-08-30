@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+# heimdall-metric-compliance -- READ-BACK for orchestrator metric self-reporting.
+# Read-only audit. Never a gate. Modeled directly on bin/heimdall-caveman-compliance
+# (same posture: measure, report, refuse to overclaim -- never block, never rewrite).
+#
+# THE GAP THIS FILLS. hooks/heimdall-metric-reminder.sh (a Stop hook) can ASK the
+# orchestrator to log a real heimdall-metric record when none exists yet this
+# session -- but a hook cannot force a model to invoke a CLI, and, measured against
+# this repo's own real .planning/metrics.jsonl, it cannot even tell WHICH session
+# logged what: heimdall-metric's `session` field is populated from
+# CLAUDE_SESSION_ID/SESSION_ID, and neither is ever exported anywhere in this
+# harness (grep bin/ hooks/ for an assignment: there is none). Every one of the
+# 3890 rows measured in this repo's real corpus at the time this tool was written
+# carried the literal string "default" in that field. So the reminder hook's own
+# "already logged this session" check is really "does ANY qualifying row exist in
+# the tail of the file" -- not "did MY session log one" -- and this tool inherits
+# that same structural limit rather than pretending to have solved it.
+#
+# WHAT THIS MEASURES, for one session transcript (JSONL):
+#   plausibly_completed   -- the number of DISTINCT TodoWrite items the orchestrator
+#                            itself ever marked status=="completed", anywhere in the
+#                            session (unioned across every TodoWrite snapshot, since
+#                            each call replaces the whole list). This is the
+#                            orchestrator's OWN structured claim of finished work --
+#                            available only on orchestrator-tier agents (TodoWrite is
+#                            not in a plain coder/reviewer/etc. subagent's tool list),
+#                            so this tool is meant to be pointed at ORCHESTRATOR
+#                            sessions. A session that never called TodoWrite reads 0
+#                            here -- a measured FLOOR, not proof no work happened.
+#                            Raw todo text is used only as an in-process dedup key
+#                            and is never printed or returned, matching
+#                            bin/heimdall-metric's own no-prompt-content discipline.
+#   qualifying_orchestrator_records -- heimdall-metric rows matching the EXACT same
+#                            predicate hooks/heimdall-metric-reminder.sh already
+#                            uses (metric=="task", source=="orchestrator", truthy
+#                            task_type, outcome in pass|fail), correlated to this
+#                            session by TRANSCRIPT TIMESTAMP WINDOW, because the
+#                            `session` field cannot be trusted (see above). The
+#                            secondary field session_field_exact_matches reports
+#                            what a naive session== match would have found --
+#                            expected to read ~0 on real data, and that is itself
+#                            part of the measurement, not a bug in this tool.
+#   gap                    -- plausibly_completed minus qualifying_orchestrator_records
+#                            (null when qualifying_orchestrator_records could not be
+#                            determined honestly -- see CANNOT-DETERMINE below).
+#
+# --all MODE: given a directory of transcripts (e.g. a Claude Code project's
+# ~/.claude/projects/<slug>/ directory), sums plausibly_completed across every
+# *.jsonl file found and compares it to ONE grand total of qualifying
+# orchestrator records across the WHOLE metrics file -- no per-session time-window
+# attempted. This is deliberate: this repo routinely runs dozens of concurrent
+# worktree-agent sessions, so per-session windows overlap constantly and
+# partitioning metrics.jsonl rows across them would double- and triple-count the
+# same row. Two grand totals is the exact shape of comparison this class of gap
+# was originally measured with (see hooks/heimdall-metric-reminder.sh's own
+# header: "130 hook-wired ... vs 5 prose-instructed ... over the same 83-day
+# window").
+#
+# ENFORCEABILITY VERDICT (this tool's honest answer, not a hope): a hook can
+# remind; nothing can make a model call a CLI. This tool MEASURES and REPORTS the
+# resulting gap. It is not, and structurally cannot be, a gate -- there is no
+# hook event that fires only after the orchestrator "should" have logged a metric
+# and before its session ends that could block anything on this tool's output
+# without also blocking the orchestrator's own ability to finish its turn.
+#
+# CANNOT-DETERMINE cases (qualifying_orchestrator_records is null, never guessed
+# as 0): the metrics file exists but could not be opened (permission denied --
+# unreadable is NOT the same fact as absent, same rule
+# hooks/heimdall-metric-reminder.sh already applies); or the transcript itself
+# carried no parseable top-level "timestamp" field on any line, so no time window
+# exists to correlate against (real Claude Code transcripts always have one --
+# this only happens on a broken/synthetic fixture).
+#
+# NOT ENFORCEMENT. Never blocks, never rewrites, never runs in a request/response
+# path. Fail-open throughout: a missing or malformed input degrades to a reported
+# `error`/null field, never a crash, never a fabricated number.
+#
+# Usage:
+#   heimdall-metric-compliance <session-jsonl-path> [--metrics-file PATH] [--repo DIR] [--json]
+#   heimdall-metric-compliance --all <transcripts-dir> [--metrics-file PATH] [--repo DIR] [--json]
+#   heimdall-metric-compliance -h | --help
+
+import calendar
+import json
+import os
+import sys
+import time
+
+USAGE = (
+    "Usage:\n"
+    "  heimdall-metric-compliance <session-jsonl-path> [--metrics-file PATH] [--repo DIR] [--json]\n"
+    "  heimdall-metric-compliance --all <transcripts-dir> [--metrics-file PATH] [--repo DIR] [--json]\n"
+    "  heimdall-metric-compliance -h | --help"
+)
+
+QUALIFYING_OUTCOMES = ("pass", "fail")
+
+
+def _parse_ts(s):
+    """ISO-8601 UTC 'Z' timestamp, with or without fractional seconds, -> epoch
+    seconds. Truncates to whole seconds, matching bin/heimdall-metric's own emit
+    precision, so a millisecond-precision transcript timestamp and a
+    whole-second metric `ts` compare correctly. Returns None when unparseable
+    -- never guessed."""
+    if not isinstance(s, str) or not s:
+        return None
+    s2 = s.strip()
+    if s2.endswith("Z"):
+        s2 = s2[:-1]
+    if "." in s2:
+        s2 = s2.split(".", 1)[0]
+    try:
+        return calendar.timegm(time.strptime(s2, "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _slug16(value):
+    """Reproduces bin/heimdall-metric's own _slug(value, 16) closely enough to
+    test whether a real session id would ever match what landed in the
+    `session` field. Used only for the secondary session_field_exact_matches
+    signal -- see module header for why this is expected to read ~0 on real
+    data."""
+    out = []
+    prev_dash = False
+    for ch in str(value).lower():
+        if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == "_":
+            out.append(ch)
+            prev_dash = False
+        elif not prev_dash and out:
+            out.append("-")
+            prev_dash = True
+        if len(out) >= 16:
+            break
+    return "".join(out).strip("-_")[:16]
+
+
+def _iter_lines(fh):
+    """Yield parsed dict per valid JSON line of an already-open file handle.
+    Malformed lines are skipped, never raised -- one bad line never aborts
+    the scan (same posture as heimdall-caveman-compliance's measure_session)."""
+    for raw_line in fh:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def _scan_session(path):
+    """One pass over a session transcript. Returns:
+      (plausibly_completed, todo_writes_seen,
+       window_start_epoch, window_end_epoch, window_start_raw, window_end_raw)
+    Raises OSError if the file cannot be opened -- the caller decides what
+    that means (this function makes no absent/unreadable distinction itself).
+    """
+    completed = set()
+    todo_writes_seen = 0
+    lo = hi = None
+    lo_raw = hi_raw = None
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for obj in _iter_lines(fh):
+            ts_raw = obj.get("timestamp")
+            epoch = _parse_ts(ts_raw)
+            if epoch is not None:
+                if lo is None or epoch < lo:
+                    lo, lo_raw = epoch, ts_raw
+                if hi is None or epoch > hi:
+                    hi, hi_raw = epoch, ts_raw
+
+            if obj.get("type") != "assistant":
+                continue
+            message = obj.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if block.get("name") != "TodoWrite":
+                    continue
+                todo_writes_seen += 1
+                tinput = block.get("input")
+                if not isinstance(tinput, dict):
+                    continue
+                todos = tinput.get("todos")
+                if not isinstance(todos, list):
+                    continue
+                for item in todos:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("status") != "completed":
+                        continue
+                    text = item.get("content")
+                    if text is None:
+                        continue
+                    completed.add(str(text))
+    return len(completed), todo_writes_seen, lo, hi, lo_raw, hi_raw
+
+
+def _qualifies(rec):
+    """EXACT same predicate as hooks/heimdall-metric-reminder.sh's own jq
+    filter (metric=="task", source=="orchestrator", truthy task_type, outcome
+    in pass|fail). Kept byte-for-byte equivalent on purpose: this tool
+    measures compliance with THAT filter and must not silently drift from it."""
+    return (
+        rec.get("metric") == "task"
+        and rec.get("source") == "orchestrator"
+        and bool(rec.get("task_type"))
+        and rec.get("outcome") in QUALIFYING_OUTCOMES
+    )
+
+
+def _open_metrics(path):
+    """('absent', None) | ('unreadable', None) | ('ok', filehandle).
+    Absence is a certain fact (zero records for certain); an unreadable file
+    is NOT the same fact as absent -- same distinction
+    hooks/heimdall-metric-reminder.sh already enforces."""
+    if not os.path.exists(path):
+        return "absent", None
+    try:
+        return "ok", open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return "unreadable", None
+
+
+def _count_metrics(metrics_path, window_start, window_end, session_slug):
+    status, fh = _open_metrics(metrics_path)
+    if status == "absent":
+        return {"found": False, "readable": True, "count": 0, "session_exact_matches": 0}
+    if status == "unreadable":
+        return {"found": True, "readable": False, "count": None, "session_exact_matches": None}
+
+    have_window = window_start is not None and window_end is not None
+    count = 0 if have_window else None
+    exact = 0
+    with fh:
+        for rec in _iter_lines(fh):
+            if not _qualifies(rec):
+                continue
+            sess = rec.get("session")
+            if session_slug and isinstance(sess, str) and sess == session_slug:
+                exact += 1
+            if not have_window:
+                continue
+            ts_epoch = _parse_ts(rec.get("ts"))
+            if ts_epoch is None:
+                continue
+            if window_start <= ts_epoch <= window_end:
+                count += 1
+    return {"found": True, "readable": True, "count": count, "session_exact_matches": exact}
+
+
+def measure_session(session_path, metrics_path):
+    if not os.path.isfile(session_path):
+        return {
+            "mode": "session",
+            "session_path": session_path,
+            "error": "no such session transcript: %s" % session_path,
+        }
+    try:
+        plausibly_completed, todo_writes_seen, lo, hi, lo_raw, hi_raw = _scan_session(session_path)
+    except OSError as e:
+        return {
+            "mode": "session",
+            "session_path": session_path,
+            "error": "could not read session transcript %s: %s" % (session_path, e),
+        }
+
+    session_id = os.path.basename(session_path)
+    if session_id.endswith(".jsonl"):
+        session_id = session_id[: -len(".jsonl")]
+    session_slug = _slug16(session_id) if session_id else None
+
+    mrec = _count_metrics(metrics_path, lo, hi, session_slug)
+    gap = None if mrec["count"] is None else (plausibly_completed - mrec["count"])
+
+    return {
+        "mode": "session",
+        "session_path": session_path,
+        "session_id": session_id or None,
+        "window_start_ts": lo_raw,
+        "window_end_ts": hi_raw,
+        "todo_writes_seen": todo_writes_seen,
+        "plausibly_completed": plausibly_completed,
+        "metrics_file": metrics_path,
+        "metrics_file_found": mrec["found"],
+        "metrics_file_readable": mrec["readable"],
+        "qualifying_orchestrator_records": mrec["count"],
+        "session_field_exact_matches": mrec["session_exact_matches"],
+        "gap": gap,
+        "correlation_method": "transcript_timestamp_window",
+        "correlation_caveat": (
+            "a qualifying record from a DIFFERENT, concurrently-running session "
+            "can fall inside this window and be counted here too -- the "
+            "session field cannot rule this out because it is emitted as the "
+            "literal string 'default' whenever CLAUDE_SESSION_ID/SESSION_ID is "
+            "unset, which this tool measured as true for every row in this "
+            "repo's real corpus"
+        ),
+        "error": None,
+    }
+
+
+def measure_all(transcripts_dir, metrics_path):
+    if not os.path.isdir(transcripts_dir):
+        return {
+            "mode": "all",
+            "transcripts_dir": transcripts_dir,
+            "error": "no such directory: %s" % transcripts_dir,
+        }
+    try:
+        names = sorted(n for n in os.listdir(transcripts_dir) if n.endswith(".jsonl"))
+    except OSError as e:
+        return {
+            "mode": "all",
+            "transcripts_dir": transcripts_dir,
+            "error": "could not list %s: %s" % (transcripts_dir, e),
+        }
+
+    total_completed = 0
+    scanned = 0
+    skipped = 0
+    for name in names:
+        path = os.path.join(transcripts_dir, name)
+        try:
+            completed, _seen, _lo, _hi, _lo_raw, _hi_raw = _scan_session(path)
+        except OSError:
+            skipped += 1
+            continue
+        total_completed += completed
+        scanned += 1
+
+    # No per-session time window here, ON PURPOSE -- see module header
+    # "--all MODE". Two grand totals, never a partitioned per-session count.
+    status, fh = _open_metrics(metrics_path)
+    if status == "absent":
+        found, readable, total_qualifying = False, True, 0
+    elif status == "unreadable":
+        found, readable, total_qualifying = True, False, None
+    else:
+        found, readable = True, True
+        total_qualifying = 0
+        with fh:
+            for rec in _iter_lines(fh):
+                if _qualifies(rec):
+                    total_qualifying += 1
+
+    gap = None if total_qualifying is None else (total_completed - total_qualifying)
+
+    return {
+        "mode": "all",
+        "transcripts_dir": transcripts_dir,
+        "transcripts_scanned": scanned,
+        "transcripts_skipped": skipped,
+        "plausibly_completed_total": total_completed,
+        "metrics_file": metrics_path,
+        "metrics_file_found": found,
+        "metrics_file_readable": readable,
+        "qualifying_orchestrator_records_total": total_qualifying,
+        "gap": gap,
+        "correlation_method": "grand_total_no_time_window",
+        "error": None,
+    }
+
+
+def _fmt(v, unknown="UNKNOWN"):
+    return unknown if v is None else str(v)
+
+
+def _print_human(rec):
+    if rec.get("error"):
+        print("NOT_VERIFIED (%s)" % rec["error"])
+        return
+    if rec["mode"] == "all":
+        print("transcripts dir                    : %s" % rec["transcripts_dir"])
+        print("transcripts scanned                : %d (skipped %d unreadable)"
+              % (rec["transcripts_scanned"], rec["transcripts_skipped"]))
+        print("plausibly completed (all, total)   : %d" % rec["plausibly_completed_total"])
+        print("metrics file                       : %s%s"
+              % (rec["metrics_file"], "" if rec["metrics_file_found"] else " (absent)"))
+        print("qualifying orchestrator records     : %s" % _fmt(rec["qualifying_orchestrator_records_total"]))
+        print("measured gap (completed - logged)  : %s" % _fmt(rec["gap"], "n/a"))
+        print("correlation method                 : %s" % rec["correlation_method"])
+        return
+    print("session                            : %s" % rec["session_path"])
+    print("session id (from filename)         : %s" % rec.get("session_id"))
+    print("transcript window                  : %s .. %s" % (rec.get("window_start_ts"), rec.get("window_end_ts")))
+    print("TodoWrite calls seen                : %d" % rec["todo_writes_seen"])
+    print("plausibly completed (todos)        : %d" % rec["plausibly_completed"])
+    print("metrics file                       : %s%s"
+          % (rec["metrics_file"], "" if rec["metrics_file_found"] else " (absent)"))
+    reason = "metrics file unreadable" if not rec["metrics_file_readable"] else "no usable time window in transcript"
+    print("qualifying orchestrator records     : %s" % _fmt(rec["qualifying_orchestrator_records"], "UNKNOWN (%s)" % reason))
+    print("session-field exact matches        : %s (expected ~0 -- see correlation_caveat)"
+          % _fmt(rec["session_field_exact_matches"]))
+    print("measured gap (completed - logged)  : %s" % _fmt(rec["gap"], "n/a"))
+    print("correlation method                 : %s" % rec["correlation_method"])
+    print("correlation caveat                 : %s" % rec["correlation_caveat"])
+
+
+def _default_metrics_path(repo):
+    """Mirrors bin/heimdall-metric's own _metrics_path resolution
+    (HEIMDALL_PLANNING_DIR env override, else <repo>/.planning/metrics.jsonl)
+    so this tool finds the SAME file that binary writes to by default."""
+    planning = os.environ.get("HEIMDALL_PLANNING_DIR")
+    if not planning:
+        planning = os.path.join(os.path.abspath(repo), ".planning")
+    return os.path.join(planning, "metrics.jsonl")
+
+
+def main(argv):
+    if not argv:
+        sys.stderr.write(
+            "error: heimdall-metric-compliance needs a <session-jsonl-path> "
+            "(or, with --all, a <transcripts-dir>)\n"
+        )
+        sys.stderr.write(USAGE + "\n")
+        return 2
+    if argv[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0
+
+    json_out = False
+    all_mode = False
+    repo = "."
+    metrics_file = None
+    path = None
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            json_out = True
+        elif a == "--all":
+            all_mode = True
+        elif a in ("-h", "--help"):
+            print(USAGE)
+            return 0
+        elif a == "--metrics-file":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("error: --metrics-file needs a PATH\n")
+                return 2
+            metrics_file = argv[i]
+        elif a == "--repo":
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write("error: --repo needs a DIR\n")
+                return 2
+            repo = argv[i]
+        elif a.startswith("--"):
+            sys.stderr.write("error: unknown flag %s\n" % a)
+            sys.stderr.write(USAGE + "\n")
+            return 2
+        else:
+            if path is not None:
+                sys.stderr.write("error: unexpected extra argument %r\n" % a)
+                return 2
+            path = a
+        i += 1
+
+    if path is None:
+        sys.stderr.write(
+            "error: heimdall-metric-compliance needs a <session-jsonl-path> "
+            "(or, with --all, a <transcripts-dir>)\n"
+        )
+        sys.stderr.write(USAGE + "\n")
+        return 2
+
+    if metrics_file is None:
+        metrics_file = _default_metrics_path(repo)
+
+    try:
+        if all_mode:
+            rec = measure_all(path, metrics_file)
+        else:
+            rec = measure_session(path, metrics_file)
+    except Exception as exc:  # last-resort guard: an audit tool must never crash
+        rec = {"mode": "all" if all_mode else "session", "error": "unexpected failure: %s" % exc}
+
+    if json_out:
+        print(json.dumps(rec))
+    else:
+        _print_human(rec)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
