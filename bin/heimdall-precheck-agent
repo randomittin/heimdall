@@ -87,6 +87,181 @@ if [ "${HEIMDALL_ALLOW_NAMED_AGENT:-}" != "1" ]; then
   fi
 fi
 
+# -- in-process agent concurrency cap (Task 3.1) -----------------------------
+# WHY bin/agent-pool IS NOT REUSED HERE (read this before touching this
+# section). The original design for this task
+# (docs/superpowers/plans/2026-08-29-agent-fallback-coverage.md, Task 3.1)
+# called for a bin/heimdall-agent-lease wrapper registering in-process spawns
+# into the SAME ~/.heimdall/agent-pool.json ledger bin/session-fork's real
+# subprocess forks share, released via a new hooks.json SubagentStop hook. A
+# first attempt at exactly that shipped and was reverted after a measured
+# production incident: an in-process Agent-tool spawn has no exec boundary
+# (same architectural fact the adjudication fence below documents), so there
+# is no real, liveness-checkable PID to pass to `agent-pool acquire`. Entries
+# registered with pid=null skip agent-pool's dead-pid reap entirely
+# (cmd_health_check's `if pid:` guard in bin/agent-pool is false for null),
+# leaving only the 900s-default stale-idle reap as a backstop. Spawns arrived
+# faster than that reap interval, so the SHARED pool's active count only
+# ever grew: 10 phantom entries stuck "active" against max_agents=4, the
+# statusline rendered them as permanently "working", and -- critically --
+# every OTHER consumer of that same ledger broke too: `agent-pool wait`
+# (bin/agent-pool cmd_wait) has its OWN 300s timeout, shorter than the 900s
+# stale-idle threshold, so it hung its full 300s on every call while the
+# phantom entries were outstanding -- which is what actually turned
+# test/heimdall-maintain-loop.test.sh, heimdall-context-capsule and
+# heimdall-watch-queue red. It also perturbed test/agent-name-gate.test.sh's
+# section-scoped sed heuristic collaterally. Reverted in full; not repaired.
+#
+# The lesson: an agent with no PID must not occupy a slot in a ledger other
+# subsystems trust for liveness, no matter how generous the TTL, because
+# leak-vs-reap is a RACE and a shared, PID-liveness-checked pool is the wrong
+# place to race it. So this section owns its OWN independent, self-expiring
+# lease directory -- never agent-pool.json, never the agent-pool binary,
+# never a hooks.json SubagentStop release (out of this task's file scope
+# regardless) -- so nothing this section does can ever be observed by
+# `agent-pool wait`, `should-scale`, the statusline, or bin/session-fork's
+# real subprocess leases. The failure mode this section CAN produce is
+# bounded to itself only: at worst it refuses (or briefly mis-counts) an
+# in-process spawn -- it can never hang an unrelated consumer, because there
+# is no shared file for one to wait on. This is option (a) of this task's
+# decision list: count in-process agents without occupying agent-pool slots.
+# (b) (register only with a verifiable pid) is unreachable by construction --
+# there is no per-spawn OS pid an in-process subagent could ever supply --
+# and (c) (report this as undoable) is unnecessary once (a) is available.
+#
+# NO RELEASE CALL, STATED PLAINLY: exactly like the shared pool's own gap,
+# there is no exec boundary to hang an active release on, so a lease is
+# NEVER actively freed -- only ever pruned by TTL, by whichever invocation of
+# this hook happens to run next. This is the same trade the original plan
+# accepted as its own fallback ("If U2 is REFUTED or UNMEASURABLE, Task 3.1
+# falls back to TTL-only leasing, which its own spec already covers") --
+# taken here from the start, since this section has no SubagentStop wiring
+# to attempt an active release with in the first place.
+#
+# ANTI-GHOST: pruning runs FIRST, on every single invocation of this hook,
+# before the count that decides allow/deny -- so an abandoned lease (a spawn
+# that crashed, or simply finished with nothing to release it) can never
+# survive longer than HEIMDALL_INPROC_AGENT_TTL past ITS OWN creation,
+# regardless of how many later spawns arrive in the meantime or whether load
+# ever "drains" (that load-dependent recovery is exactly what the incident
+# above lacked -- leases arrived faster than the shared pool's reap
+# interval, so it never caught up; here, every invocation prunes
+# independently of arrival rate, so recovery time is bounded by wall clock,
+# never by traffic).
+#
+# FAIL OPEN ON EVERYTHING except a confirmed at-or-over-capacity count -- the
+# deliberate OPPOSITE of the adjudication fence directly below, which fails
+# CLOSED because it answers a safety question (is this judge on a degraded
+# model?). This section answers a resource-ceiling question (is there
+# room?), and a ceiling that can wrongly refuse every future spawn is worse
+# than no ceiling at all. So: missing jq, missing date, an
+# uncreatable/uninspectable lease directory (e.g. a stray file already
+# occupying that path), an unparsable lease (corrupt content is pruned as
+# expired rather than trusted, so corruption biases toward ALLOW, never
+# toward a phantom hold), and a hung filesystem (perl-alarm-bounded, same
+# idiom the brief-adoption gate below already uses) all fall through to
+# ALLOW with no exit reached. The only exit 2 in this section is a
+# positively counted, in-range at-capacity reading.
+#
+# OPT-IN, NOT ON BY DEFAULT -- measured, not assumed. A default-on cap (max
+# 10, matching bin/agent-pool's own default) was implemented first and run
+# against this repo's own test/agent-fallback-adjudication.test.sh and
+# test/agent-name-gate.test.sh, both of which fire many sequential
+# precheck-agent invocations against ONE shared sandbox HOME within a
+# single fast run. Every ALLOW stakes a lease that (correctly, by design
+# above) only expires after HEIMDALL_INPROC_AGENT_TTL -- so within one
+# sub-second test run none of those leases ever go stale, cumulative count
+# crossed the default max partway through each suite, and later, unrelated
+# assertions in BOTH suites turned red purely from this section's own
+# bookkeeping (measured: 53/0 -> 46/7, 31/0 -> 23/8). That is not a
+# test-harness quirk to work around: it is the SAME usage pattern this
+# repo's own CLAUDE.md mandates ("2+ independent tasks -> spawn ALL agents
+# in ONE message" / "launch parallel forks in one message"), which fires
+# this hook 5-15+ times within a single turn -- far faster than any TTL
+# measured in seconds could ever distinguish from a genuinely hung spawn.
+# A concurrency cap with no release signal (there is none to wire, in or
+# out of this task's scope) can only ever measure "spawns started within
+# the last TTL", never "spawns still running" -- a RATE proxy standing in
+# for a CONCURRENCY question. Defaulting it on would mean every routine
+# batched fan-out in normal, encouraged use of this repo risked a false
+# refusal. So: HEIMDALL_INPROC_AGENT_MAX is unset (disabled) unless an
+# operator opts in explicitly -- the mechanism below is fully real and
+# fully armed the moment it is set; this repo's own measured usage pattern
+# is the reason it does not arm itself.
+if command -v jq >/dev/null 2>&1 && command -v date >/dev/null 2>&1 && command -v bash >/dev/null 2>&1; then
+  CAP_MAX="${HEIMDALL_INPROC_AGENT_MAX:-}"
+  case "$CAP_MAX" in ''|*[!0-9]*) CAP_MAX="" ;; esac
+  CAP_TTL="${HEIMDALL_INPROC_AGENT_TTL:-900}"
+  case "$CAP_TTL" in ''|*[!0-9]*) CAP_TTL=900 ;; esac
+  CAP_DIR="${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}/inproc-agent-leases"
+
+  if [ -n "$CAP_MAX" ]; then
+    # cap_body: the ENTIRE prune -> count -> decide -> stake sequence, as one
+    # function so it can be shipped whole into a guarded subshell below via
+    # `declare -f` + `bash -c` -- one alarm bounds the whole sequence, not
+    # each filesystem call individually, at zero added latency in the
+    # success path (perl execs straight into it; no polling loop).
+    cap_body() {
+      local dir="$1" ttl="$2" max="$3" now f ts age count id
+      mkdir -p "$dir" 2>/dev/null || { echo "OPEN:mkdir"; return 1; }
+      now="$(date +%s 2>/dev/null)" || { echo "OPEN:date"; return 1; }
+      case "$now" in ''|*[!0-9]*) echo "OPEN:date-bad"; return 1 ;; esac
+      # Prune every stale/unparsable lease FIRST (anti-ghost self-heal),
+      # before the count below ever runs -- see header.
+      for f in "$dir"/lease-*; do
+        [ -e "$f" ] || continue
+        ts="$(cat "$f" 2>/dev/null)"
+        case "$ts" in
+          ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue ;;
+        esac
+        age=$(( now - ts ))
+        if [ "$age" -gt "$ttl" ] || [ "$age" -lt 0 ]; then
+          rm -f "$f" 2>/dev/null
+        fi
+      done
+      count=0
+      for f in "$dir"/lease-*; do
+        [ -e "$f" ] || continue
+        count=$((count+1))
+      done
+      if [ "$count" -ge "$max" ]; then
+        echo "DENY:$count:$max"
+        return 2
+      fi
+      # Stake a lease for THIS spawn before allowing it through, so the very
+      # next invocation counts it. A failed write is ignored on purpose --
+      # this spawn simply undercounts itself, which is the fail-open side.
+      id="lease-$$-$now-${RANDOM:-0}"
+      printf '%s' "$now" > "$dir/$id" 2>/dev/null
+      echo "ALLOW:$((count+1)):$max"
+      return 0
+    }
+    CAP_FNSRC="$(declare -f cap_body)"
+    CAP_CALL='
+cap_body "$@"'
+    if command -v perl >/dev/null 2>&1; then
+      CAP_OUT="$(perl -e 'alarm 3; exec @ARGV' -- bash -c "$CAP_FNSRC$CAP_CALL" _ "$CAP_DIR" "$CAP_TTL" "$CAP_MAX" 2>/dev/null)"
+    else
+      CAP_OUT="$(bash -c "$CAP_FNSRC$CAP_CALL" _ "$CAP_DIR" "$CAP_TTL" "$CAP_MAX" 2>/dev/null)"
+    fi
+    CAP_RC=$?
+    if [ "$CAP_RC" -eq 2 ]; then
+      CAP_COUNTS="${CAP_OUT#DENY:}"
+      CAP_REASON="BIFROST - Heimdall in-process agent concurrency cap: ${CAP_COUNTS%%:*}/${CAP_COUNTS##*:} in-process Agent-tool spawns already outstanding (an independent lease count under $CAP_DIR -- never the shared bin/agent-pool ledger, so this cannot wedge agent-pool wait, should-scale, the statusline, or any subprocess lease). Resource ceiling, not a safety gate -- every lease self-expires after HEIMDALL_INPROC_AGENT_TTL=${CAP_TTL}s even though nothing here ever actively releases one (no exec boundary to hang a release on), so this cannot deadlock. Retry shortly, or raise the ceiling: HEIMDALL_INPROC_AGENT_MAX=<n>."
+      CAP_JSON="$(jq -cn --arg r "$CAP_REASON" '{error: $r}' 2>/dev/null)"
+      if [ -z "$CAP_JSON" ]; then
+        CAP_JSON='{"error": "BIFROST - Heimdall in-process agent concurrency cap: at capacity; spawn refused (see stderr for detail)."}'
+      fi
+      printf '%s\n' "$CAP_JSON"
+      printf '%s\n' "$CAP_REASON" >&2
+      exit 2
+    fi
+    # CAP_RC 0 (allowed + leased) or anything else (1 = ambiguous/open path
+    # from inside cap_body, or a perl-alarm signal-kill code) falls through
+    # here on purpose -- no exit, no `else`: silence is allow.
+  fi
+fi
+
 # -- adjudication fallback fence (Task 1.1; trigger fixed post-launch) ------
 # D2 (docs/superpowers/plans/2026-08-29-agent-fallback-coverage.md §0.3): an
 # in-process Agent-tool subagent has no exec boundary, so hmd_gate_exec
