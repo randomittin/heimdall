@@ -233,26 +233,33 @@ mkdir -p "$FAKE_HOME2"
 out="$(PATH="$FAKEBIN:$PATH" HEIMDALL_HOME="$FAKE_HOME2" "$TOOL" refresh --confirm-spend --snapshot "$SNAP_OUT" 2>&1)"; rc=$?
 ncalls="$(wc -l < "$CALLLOG" | tr -d ' ')"
 if [ "$rc" -eq 0 ]; then ok; else bad "refresh --confirm-spend should succeed with a working fake claude (rc=$rc): $out"; fi
-# 10 real prompts (evals/caveman/prompts.txt) x 5 arms = 50 calls, exactly
-if [ "$ncalls" = "50" ]; then ok; else bad "expected exactly 50 claude calls, got $ncalls"; fi
+# 1 claude_version() probe + 10 real prompts (evals/caveman/prompts.txt) x 5
+# arms = 51 calls, exactly.
+if [ "$ncalls" = "51" ]; then ok; else bad "expected exactly 51 claude invocations (1 version probe + 50 arm calls), got $ncalls"; fi
 if [ -f "$SNAP_OUT" ]; then ok; else bad "refresh --confirm-spend must write the snapshot file"; fi
 
 # Call ORDER: strict per-arm blocks of 10 (__baseline__, __terse__, lite,
 # full, ultra) -- each block internally consistent on its own system prompt,
 # baseline's block has none, and all 5 system-prompt values are pairwise
 # distinct (proves the level arms are not accidentally sharing one prompt).
+# The one-off claude_version() probe (a bare ["--version"] call, made once
+# before the arm loop starts) is filtered out first -- it is not one of the
+# 5 arms and would otherwise skew the block boundaries by one.
 order_check="$(python3 -c "
+import json
 lines = open('$CALLLOG').read().splitlines()
-if len(lines) != 50:
-    print('bad-length-%d' % len(lines))
+parsed = [json.loads(l) for l in lines]
+calls = [argv for argv in parsed if argv != ['--version']]
+if len(calls) != 50:
+    print('bad-length-%d' % len(calls))
 else:
     def sysprompt(argv):
         return argv[argv.index('--system-prompt') + 1] if '--system-prompt' in argv else None
-    blocks = [lines[i*10:(i+1)*10] for i in range(5)]
+    blocks = [calls[i*10:(i+1)*10] for i in range(5)]
     flat = []
     bad = False
     for b in blocks:
-        sp = set(sysprompt(line.split(' ')) for line in b)
+        sp = set(sysprompt(argv) for argv in b)
         if len(sp) != 1:
             bad = True
             break

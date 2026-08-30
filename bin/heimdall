@@ -2410,6 +2410,24 @@ case "${1:-}" in
     if [ -x "$_cav" ]; then exec "$_cav" "$@"; fi
     echo "error: heimdall-caveman-compliance not found at $_cav" >&2; exit 2
     ;;
+  caveman-eval)
+    # Real, honest, three-arm token-compression EVAL for the caveman levels
+    # themselves -- a different gap than caveman-audit's read-back above.
+    # caveman-audit measures whether a live SESSION followed the injected
+    # rules; this measures whether the RULES THEMSELVES, fed to a real
+    # model, actually cut output tokens vs a generic terse instruction.
+    # Adapted (MIT, attributed in the file header) from
+    # github.com/juliusbrussee/caveman's evals/. Default `report` reads a
+    # snapshot committed to git -- free, deterministic, no network calls;
+    # if absent it says exactly that ("no measurement yet") rather than
+    # ever showing a fabricated or zero savings figure. `refresh` is the
+    # only path that spends real quota and is opt-in behind
+    # --confirm-spend (--dry-run shows the call-count estimate for free).
+    shift
+    _cev="$(cd "$(dirname "$0")" && pwd)/heimdall-caveman-eval"
+    if [ -x "$_cev" ]; then exec "$_cev" "$@"; fi
+    echo "error: heimdall-caveman-eval not found at $_cev" >&2; exit 2
+    ;;
   metric-audit)
     # READ-BACK for orchestrator metric self-reporting -- the caveman-audit arm's
     # sibling. hooks/heimdall-metric-reminder.sh (Stop hook) can only ever ASK the
