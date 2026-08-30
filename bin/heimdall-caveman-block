@@ -17,8 +17,19 @@
 # injects the complete ruleset for the active level. hmd restating a different
 # (and wrong) ruleset underneath it spent tokens in order to contradict the
 # authority on the subject. So when the plugin is live, hmd names the level and
-# defers. Only when no level is set does hmd supply compression rules of its
-# own — and then it names no level, because there is none to name.
+# defers.
+#
+# UPDATED 2026-08-30: hmd no longer installs that plugin (bin/heimdall's
+# first_run_setup dropped the companion:caveman step; see CLAUDE.md "Token
+# Efficiency") and now owns a level of its own directly (bin/heimdall-caveman).
+# So "no plugin flag" no longer means "nothing to say" — it means "no OTHER
+# authority to defer to," and this now falls through to hmd's OWN real,
+# currently configured level + rule text instead of a generic placeholder. The
+# plugin-present branch above is UNCHANGED and stays first: an operator who
+# still has that plugin installed — including its wenyan-*/off modes, which
+# bin/heimdall-caveman deliberately does not own (see its own "SCOPE" header)
+# — sees exactly what they saw before. Only the previously-dead "absent" path
+# gained a real answer.
 #
 # It is a separate executable so the text is TESTABLE. Inline in the launcher it
 # could only be checked by grepping the launcher's source, which proves the
@@ -29,6 +40,7 @@
 #
 # Usage: heimdall-caveman-block          (level read from the live config dir)
 #        CLAUDE_CONFIG_DIR=<dir> ...     (test fixtures point this at a temp dir)
+#        HEIMDALL_HOME=<dir> ...         (test fixtures isolate hmd's own state too)
 set -uo pipefail
 
 flag="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active"
@@ -48,12 +60,30 @@ if [ -n "$level" ]; then
   if [ "$level" != ultra ] && [ "$level" != wenyan-ultra ]; then
     printf 'Max compression is `/caveman ultra`, a user command. hmd will not set it for you — so do not report ultra as active.\n'
   fi
-else
-  cat <<'NOLEVEL'
+  exit 0
+fi
+
+# No recognized plugin flag -- the increasingly common case now that hmd no
+# longer installs that plugin. Defer to hmd's OWN level owner (this script's
+# sibling in the same bin/ dir) instead of a generic placeholder, so a fresh,
+# plugin-free install still gets its ACTUAL configured level's real rules.
+_dir="$(cd "$(dirname "$0")" && pwd 2>/dev/null || true)"
+_cav="$_dir/heimdall-caveman"
+if [ -n "$_dir" ] && [ -x "$_cav" ]; then
+  rules="$("$_cav" rules 2>/dev/null || true)"
+  if [ -n "$rules" ]; then
+    printf '%s\n' "$rules"
+    exit 0
+  fi
+fi
+
+# Fully degraded path (heimdall-caveman itself missing/broken too): say nothing
+# about compression rather than guess a level. An empty section is honest; an
+# invented "ultra" is the bug this whole file was written to stop.
+cat <<'NOLEVEL'
 OUTPUT COMPRESSION (no caveman level set — these are hmd's own rules, and they claim no level):
 Drop articles, filler, pleasantries, hedging, conjunctions. Fragments default. One word > phrase. Abbrev: DB, auth, cfg, req, res, fn, impl, mw, env, repo, PR, CI. Arrows for causality: X → Y.
 Code + errors + paths: exact, unchanged.
 Drop compression for: security warnings, irreversible ops.
 NOLEVEL
-fi
 exit 0

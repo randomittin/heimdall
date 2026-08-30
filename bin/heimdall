@@ -228,7 +228,7 @@ _tele_now_ms() {
 }
 
 # Emit ONE install_step event. Args:
-#   $1 step      setup|auth|companion:caveman|companion:claude-mem|skills|
+#   $1 step      setup|auth|companion:claude-mem|skills|
 #                path|launch-readiness
 #   $2 outcome   started|succeeded|failed
 #   $3 start_ms  (optional) the _tele_now_ms captured at `started`; when present
@@ -1129,21 +1129,13 @@ first_run_setup() {
   local _setup_t0; _setup_t0="$(_tele_now_ms)"
   _tele_install_step setup started
 
-  # caveman (token compression) — its OWN step (companion:caveman).
-  if ! claude plugins list 2>/dev/null | grep -q "caveman"; then
-    echo "  + caveman (token compression)"
-    local _cav_t0 _cav_rc=0
-    _cav_t0="$(_tele_now_ms)"
-    _tele_install_step companion:caveman started
-    claude plugins marketplace add JuliusBrussee/caveman 2>/dev/null || true
-    claude plugins install caveman@caveman 2>/dev/null || _cav_rc=$?
-    if [ "$_cav_rc" -eq 0 ]; then
-      _tele_install_step companion:caveman succeeded "$_cav_t0"
-    else
-      _tele_install_step companion:caveman failed "$_cav_t0" \
-        plugin-install-failed "claude plugins install caveman exit $_cav_rc"
-    fi
-  fi
+  # caveman (token compression) is IN-HOUSE as of 2026-08-30 (bin/heimdall-caveman,
+  # $HEIMDALL_HOME/caveman-level) — hmd no longer installs, requires, or checks for
+  # the external plugin (github.com/juliusbrussee/caveman) here or anywhere else in
+  # setup, and emits no companion:caveman telemetry step (there is no install left
+  # to time or fail). An operator who still has the external plugin installed is
+  # unaffected — see bin/heimdall-caveman's own migration/divergence-warning logic
+  # for how the two coexist. See CLAUDE.md "Token Efficiency".
 
   # superpowers (brainstorming, debugging) — part of the `skills` step.
   if ! claude plugins list 2>/dev/null | grep -q "superpowers"; then
@@ -3656,7 +3648,7 @@ for skill in reg.get('skills', []):
 #
 # This wrapper makes the whole phase contiguous and ordered:
 #   1. auth        — ensure_auth (login / API key resolved)
-#   2. companion   — first_run_setup (caveman, superpowers, claude-mem, marketplace)
+#   2. companion   — first_run_setup (superpowers, claude-mem, marketplace — caveman is in-house, not a plugin install)
 #   3. skills      — preinstall_plugins + discover_skills (prompt-driven extras)
 # Each phase emits an ordered trace marker (see _trace_order) so the stranger
 # harness can prove setup precedes launch without a live model call.
@@ -3676,7 +3668,8 @@ complete_first_run_setup() {
   # signed in yet — a deferred/^C'd login can no longer abort setup or block the
   # marker, which is what forced the old two-run dance.
 
-  # 1. COMPANION PLUGINS — caveman / superpowers / claude-mem / marketplace.
+  # 1. COMPANION PLUGINS — superpowers / claude-mem / marketplace (caveman is
+  #    in-house now, not a plugin install here — see first_run_setup's body).
   #    git/npm based, need NO Claude auth, so they run first + unconditionally.
   #    Idempotent + marker-gated inside first_run_setup; touches $SETUP_MARKER on
   #    success, so the first-run marker is written before we even reach auth.
@@ -4111,12 +4104,19 @@ fi
 # mechanism behind it — the exact false-declaration class this repo exists to
 # catch, shipped in its own prompt.
 #
-# It was also a duplicate. When the plugin is installed its own SessionStart
-# hook injects the complete ruleset for the active level. hmd restating a
-# (different, wrong) ruleset underneath it spent tokens to contradict the
-# authority. So: when the plugin is live, name the level and defer. Only when
-# it is absent does hmd supply compression rules of its own — and then it
-# claims no level, because there is no level to claim.
+# It was also a duplicate. When the external plugin is installed its own
+# SessionStart hook injects the complete ruleset for the active level. hmd
+# restating a (different, wrong) ruleset underneath it spent tokens to
+# contradict the authority. So: when the plugin is live, name the level and
+# defer.
+#
+# UPDATED 2026-08-30: hmd no longer installs that plugin (first_run_setup's
+# companion:caveman step is gone) and owns a level of its own directly
+# (bin/heimdall-caveman). So "plugin absent" no longer means "nothing to say"
+# — hmd now supplies its OWN real, currently configured level + rules there
+# instead of a placeholder. Only if bin/heimdall-caveman itself is also
+# missing/broken does the text fall all the way back to claiming no level.
+# See bin/heimdall-caveman-block for the actual fallback logic.
 #
 # The text lives in bin/heimdall-caveman-block so it can be tested against a
 # given state rather than merely grepped for. Guarded like resolve_model(): under

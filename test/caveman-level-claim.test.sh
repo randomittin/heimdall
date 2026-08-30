@@ -16,9 +16,17 @@
 # a model told "ultra is active" reports ultra behaviour it was never given the
 # rules for, and nothing goes red.
 #
+# UPDATED 2026-08-30: hmd no longer installs the external plugin at all (see
+# CLAUDE.md "Token Efficiency") and owns a level of its own directly
+# (bin/heimdall-caveman). The plugin-present path this file pins is UNCHANGED;
+# what used to be the "absent/corrupt ⇒ claim nothing" path now falls through
+# to hmd's own real level instead (guarantee 1, below) — see
+# heimdall-caveman-no-plugin.test.sh for the dedicated fresh-install proof.
+#
 # Guarantees proved here:
-#   1. The block reports the live level, per state (full / ultra / absent /
-#      corrupt) — a behavioural check, not a grep for a string.
+#   1. The block reports the live level, per state (full / ultra), and for an
+#      absent/corrupt plugin flag falls through to hmd's OWN level instead of
+#      claiming none — a behavioural check, not a grep for a string.
 #   2. Not-ultra is stated as not-ultra, with the command that would change it.
 #   3. No shipped source file asserts a caveman LEVEL as an active fact.
 #   4. The launcher is actually wired to the helper (else 1-2 prove nothing).
@@ -39,10 +47,14 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
 # Run the block with a fixture config dir. Empty arg = no flag file at all.
 run_at() {
-  local lvl="$1" dir="$TMP/cfg"
+  local lvl="$1" dir="$TMP/cfg" hh="$TMP/hh"
   rm -rf "$dir"; mkdir -p "$dir"
   [ -n "$lvl" ] && printf '%s\n' "$lvl" > "$dir/.caveman-active"
-  CLAUDE_CONFIG_DIR="$dir" "$BLOCK" 2>/dev/null
+  # HEIMDALL_HOME is ALSO isolated + reset every call: once no plugin flag is
+  # recognized, the block falls through to bin/heimdall-caveman, which would
+  # otherwise read/seed the REAL machine's ~/.heimdall/caveman-level.
+  rm -rf "$hh"
+  CLAUDE_CONFIG_DIR="$dir" HEIMDALL_HOME="$hh" "$BLOCK" 2>/dev/null
 }
 
 echo "caveman-level-claim harness  repo=$REPO"
@@ -84,13 +96,19 @@ case "$out" in
   *) bad "block does not disclaim ownership of the level: $out" ;;
 esac
 
-# ── 3. ABSENT AND CORRUPT STATES CLAIM NO LEVEL ──
+# ── 3. ABSENT/CORRUPT PLUGIN FLAG FALLS THROUGH TO HMD'S OWN LEVEL ──
+# No recognized plugin flag (missing file, or a value outside
+# lite/full/ultra/wenyan*) no longer means "nothing to say" now that hmd owns
+# its own level directly (bin/heimdall-caveman) -- it falls through to THAT
+# instead of a generic placeholder. See heimdall-caveman-no-plugin.test.sh for
+# the dedicated fresh-install proof; this section only re-confirms the corrupt
+# VALUE itself is never echoed back as if it were real.
 for state in "" MAXIMUM "full; rm -rf /"; do
   label="${state:-<no flag file>}"
   out="$(run_at "$state")"
   case "$out" in
-    *'no caveman level set'*) ok "state '$label' claims no level" ;;
-    *) bad "state '$label' produced a level claim: $(printf '%s' "$out" | head -1)" ;;
+    *'HMD OUTPUT COMPRESSION'*) ok "state '$label' falls through to hmd's own level + rules" ;;
+    *) bad "state '$label' produced neither a plugin level nor hmd's own rules: $(printf '%s' "$out" | head -1)" ;;
   esac
 done
 # A corrupt file must not be echoed back as if it were a real setting.

@@ -7,9 +7,12 @@
 #   A. PER-STEP EVENTS — driving first_run_setup (bin/heimdall --setup) with MOCKED
 #      step bodies (NO real network install) emits, for each step, a `started` then
 #      a `succeeded` install_step event carrying that step's id AND a duration_ms.
-#      The distinct step ids (setup, companion:caveman, companion:claude-mem,
-#      skills, launch-readiness) are present so aggregate (piece d) can pinpoint
-#      WHERE an install fails.
+#      The distinct step ids (setup, companion:claude-mem, skills,
+#      launch-readiness) are present so aggregate (piece d) can pinpoint WHERE an
+#      install fails. (companion:caveman is retired as of 2026-08-30 — caveman is
+#      in-house now, bin/heimdall-caveman, and emits no install-step telemetry at
+#      all since there is no install left to time; see
+#      heimdall-caveman-no-plugin.test.sh.)
 #
 #   B. SIM-FAILURE AT A STEP — forcing the claude-mem step to FAIL (a mocked `npx`
 #      that exits nonzero) records a `failed` install_step event WITH the step name
@@ -247,7 +250,7 @@ if [ -f "$STORE_A" ]; then
 else
   bad "no telemetry store written at $STORE_A"
 fi
-for step in setup companion:caveman companion:claude-mem skills launch-readiness; do
+for step in setup companion:claude-mem skills launch-readiness; do
   s_started="$(count_events "$STORE_A" "$step" started)"
   s_succ="$(count_events "$STORE_A" "$step" succeeded)"
   if [ "$s_started" -ge 1 ] && [ "$s_succ" -ge 1 ]; then

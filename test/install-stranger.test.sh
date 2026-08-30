@@ -56,7 +56,8 @@ STRANGER_PATH="$CLAUDE_BIN:$NODE_BIN:$GIT_BIN:/usr/bin:/bin"
 # ── Intercept `claude plugins` for the launch-arm trace probes (§5, §6) ───────
 # Those probes drive the launcher's FIRST-RUN path, whose first_run_setup runs
 # `claude plugins marketplace add` + `claude plugins install` for the companion
-# plugins (caveman/superpowers/claude-mem). In a fresh stripped HOME with no
+# plugins (superpowers/claude-mem; caveman is in-house, no plugin call at all
+# as of 2026-08-30). In a fresh stripped HOME with no
 # plugin cache those are real SSH git clones with 120s timeouts each — slow, and
 # on a flaky/offline host they stall the whole harness. We only need the launcher
 # to reach its trace markers, NOT to actually install plugins over the network.
