@@ -2389,6 +2389,22 @@ case "${1:-}" in
     fi
     exec "$TIER_BIN" "$@"
     ;;
+  caveman-audit)
+    # READ-BACK for the caveman compression instruction. The caveman plugin
+    # wires SessionStart + UserPromptSubmit and BOTH only ever INJECT rules
+    # before the model replies; nothing in that plugin, or anywhere in hmd,
+    # ever read back what was actually written. Measured on this repo's own
+    # session: 3.25% of prose characters were still caveman-targeted filler
+    # (12,668 occurrences over 153k words) -- so the instruction was being
+    # delivered every turn and not followed. This subcommand is that missing
+    # read-back. AUDIT ONLY, never a gate: it reports a measured FLOOR on
+    # removable content and deliberately claims nothing about savings, since
+    # a keyword count cannot see paraphrase-level compression.
+    shift
+    _cav="$(cd "$(dirname "$0")" && pwd)/heimdall-caveman-compliance"
+    if [ -x "$_cav" ]; then exec "$_cav" "$@"; fi
+    echo "error: heimdall-caveman-compliance not found at $_cav" >&2; exit 2
+    ;;
   status)
     # Pass-through to heimdall-statusline: the CLI-agnostic HUD renderer shared
     # with Claude Code's registered hooks/statusline.sh (now a thin `exec` wrapper
