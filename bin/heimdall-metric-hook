@@ -183,6 +183,63 @@ _kill_outcome() {
   return 0
 }
 
+# Bound on bytes read from a subagent's own transcript when SUMMING its token
+# usage — distinct from TRANSCRIPT_TAIL_BYTES above, which only needs the last
+# couple of lines for kill-detection. Token summing wants as much of the
+# transcript as practical: undercounting a long agent's true cost is exactly
+# the blindness this hook exists to fix. 8MiB mirrors
+# bin/heimdall-session-usage's own DEFAULT_MAX_BYTES bound for the identical
+# tradeoff (bounded-tail read, accept undercount only on a pathologically
+# large file — transcripts in this repo run tens to hundreds of KB, so in
+# practice this reads the WHOLE file). Override only for tests.
+TOKEN_SUM_MAX_BYTES="${HMD_METRIC_HOOK_TOKEN_MAX_BYTES:-8388608}"
+
+# _sum_tokens <agent_transcript_path> — prints the SUM (and nothing else) of
+# every message.usage.{input_tokens,output_tokens,cache_creation_input_tokens,
+# cache_read_input_tokens} block found in the transcript's tail (see
+# TOKEN_SUM_MAX_BYTES). This is the same message.usage shape
+# bin/heimdall-session-usage's _extract_usage_tokens() already parses in
+# production in this repo — real, measured token spend, never an estimate.
+#
+# Prints NOTHING when the path is empty/missing/unreadable, jq is absent, or
+# no record in the (bounded) transcript carries a usage block at all: absence
+# of measurable data is not the same as a real zero, so the caller must treat
+# empty output as "unmeasured" (omit --tokens) — exactly like _kill_outcome's
+# own empty-output-means-unknown contract above.
+#
+# Unlike _kill_outcome, this does NOT blind-drop the tail's first line. That
+# trick only makes sense for a raw substring/regex search, where a truncated
+# fragment could still accidentally MATCH and produce a false signal; here
+# every line is parsed as structured JSON behind `try/catch empty`, so a line
+# truncated by the byte-cap boundary simply fails `fromjson` and contributes
+# nothing on its own — the try/catch is already the safety net. Dropping the
+# first line unconditionally would instead throw away one COMPLETE, valid
+# record on every transcript short enough that the byte-cap never truncated
+# anything (the common case), silently undercounting every subagent's total
+# by however many tokens that one record cost. Summing must not do that.
+#
+# Fail-open at every step, same contract as the rest of this file.
+_sum_tokens() {
+  local path="$1"
+  [ -n "$path" ] || return 0
+  [ -f "$path" ] || return 0    # excludes missing paths, dirs, pipes, devices
+  [ -r "$path" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  tail -c "$TOKEN_SUM_MAX_BYTES" "$path" 2>/dev/null \
+      | jq -R -r '
+          try (
+            (. | fromjson) as $r
+            | ($r.message.usage // empty) as $u
+            | ([$u.input_tokens, $u.output_tokens,
+                $u.cache_creation_input_tokens, $u.cache_read_input_tokens]
+               | map(select(type == "number")) | add // 0)
+          ) catch empty
+        ' 2>/dev/null \
+      | awk '{s+=$1; n++} END {if (n>0) print s+0}'
+  return 0
+}
+
 cmd_stop() {
   local target_repo="."
   while [ $# -gt 0 ]; do
@@ -242,15 +299,33 @@ cmd_stop() {
 
   [ -x "$METRIC_BIN" ] || return 0
 
-  local transcript_path outcome
+  local transcript_path outcome tokens
   transcript_path="$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty' 2>/dev/null)"
   outcome="$(_kill_outcome "$transcript_path")"
+  tokens="$(_sum_tokens "$transcript_path")"
 
   local args=(task --model "$model" --source subagentstop)
   [ -n "$task_type" ] && args+=(--type "$task_type")
   [ -n "$effort" ] && args+=(--effort "$effort")
   [ "$outcome" = "fail" ] && args+=(--outcome fail)
+  [ -n "$tokens" ] && args+=(--tokens "$tokens")
   "$METRIC_BIN" --repo "$target_repo" "${args[@]}" >/dev/null 2>&1 || true
+
+  # Best-effort: feed the SAME measured total into bin/heimdall-state's own
+  # budget tracker (add-tokens/budget verbs already existed; nothing real fed
+  # them). `heimdall-state budget` becomes the one command that answers "what
+  # did this session cost" — wired to real evidence instead of a parallel
+  # mechanism. heimdall-state needs an already-initialized heimdall-state.json
+  # in target_repo (SessionStart's own `heimdall-state init` call provides
+  # this in a live session); its own ensure_state() exits 1 when absent, which
+  # this subshell swallows exactly like every other failure path here — never
+  # allowed to affect this hook's own always-exit-0 contract.
+  if [ -n "$tokens" ]; then
+    local state_bin="$BIN_DIR/heimdall-state"
+    if [ -x "$state_bin" ]; then
+      ( cd "$target_repo" 2>/dev/null && "$state_bin" add-tokens "$tokens" ) >/dev/null 2>&1 || true
+    fi
+  fi
   return 0
 }
 
