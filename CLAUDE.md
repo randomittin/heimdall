@@ -193,5 +193,6 @@ group, and only where the SAME check fires twice for one action.
 
 ## Token Efficiency
 - Caveman compression active: terse output, abbreviations, arrows for causality
-- The LEVEL is owned by the caveman plugin (`/caveman lite|full|ultra`) and hmd never sets it — so no file here may assert a level. `bin/heimdall` reads the live level from `.caveman-active` and reports that; a hardcoded "ultra" was false on every session hmd has ever run
+- The LEVEL is owned by hmd directly as of 2026-08-30 (`bin/heimdall-caveman`, wired as `hmd caveman get|set|rules`) — ownership moved in-house from the external caveman plugin (github.com/juliusbrussee/caveman, MIT) so compression no longer hard-depends on that plugin being installed. A one-time migration reads the plugin's old `.caveman-active` flag if hmd has no state of its own yet; after that hmd's own `$HEIMDALL_HOME/caveman-level` is authoritative and the plugin's file is never read again
+- This is a change of WHO SETS the level, not of WHETHER a hook can prove compliance — a SessionStart/UserPromptSubmit hook can only inject instruction text, never verify the model followed it. Measured on this repo's own session while the plugin was active at `full`: 3.25% of prose chars were still caveman-targeted filler. Read-back audit: `hmd caveman-audit <session.jsonl>` (measures, never gates)
 - Drop articles, filler, hedging — code and paths stay exact

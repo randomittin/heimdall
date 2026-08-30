@@ -1312,7 +1312,7 @@ ensure_project_claude_md() {
 
 ## Token Efficiency
 - Caveman compression active: terse output, abbreviations, arrows for causality
-- Level is owned by the caveman plugin (\`/caveman lite|full|ultra\`), not by hmd — do not assert a level here
+- Level is owned by hmd directly (`heimdall-caveman get|set|rules`), not by the caveman plugin — do not hardcode a level here; read it live
 - Drop articles, filler, hedging — code and paths stay exact
 CLAUDEMD
 }
@@ -2388,6 +2388,19 @@ case "${1:-}" in
       exit 1
     fi
     exec "$TIER_BIN" "$@"
+    ;;
+  caveman)
+    # hmd-native owner of the output-compression LEVEL and its per-level rule
+    # text (bin/heimdall-caveman). Ownership moved in-house from the external
+    # caveman plugin (github.com/juliusbrussee/caveman, MIT) on 2026-08-30 so
+    # hmd no longer hard-depends on that plugin for compression to function;
+    # see CLAUDE.md "Token Efficiency" for why. This is level OWNERSHIP, not
+    # enforcement -- a hook can only inject text, never verify the model
+    # followed it. For the measured read-back, see `caveman-audit` below.
+    shift
+    _cavl="$(cd "$(dirname "$0")" && pwd)/heimdall-caveman"
+    if [ -x "$_cavl" ]; then exec "$_cavl" "$@"; fi
+    echo "error: heimdall-caveman not found at $_cavl" >&2; exit 2
     ;;
   caveman-audit)
     # READ-BACK for the caveman compression instruction. The caveman plugin
