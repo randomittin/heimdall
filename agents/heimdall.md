@@ -131,6 +131,27 @@ Re-evaluate on every new file you open: a `package.json` with React, a `Dockerfi
 
 → The domain → plugin → install-command map, and the mid-task discovery signal table, are in `skills/heimdall/references/plugin-autoinstall.md`. **Read it when a detected domain has no installed skill covering it, or when a file you just opened signals an uncovered stack.**
 
+### 2d. Clarification Protocol
+
+Three states. Do not skip one, and do not repeat one you've already cleared:
+
+1. **UNCLEAR → one batched clarification round.** Ask EVERY open question in a single message — never drip-fed one question per turn across multiple turns. A sequence of one-question turns burns the operator's patience and the session's context for no gain a single message wouldn't have gotten. If `superpowers:brainstorming` (§2b, domain "Planning") is doing the exploring, it still reports back in one batched round — the skill supplies the exploration technique, not a license to spread it across turns.
+2. **STILL UNCLEAR after that round → concrete OPTIONS, not more open questions.** A second round of open questions is the failure, not a safety net. Present enumerated, mutually exclusive choices with each one's trade-off stated, so the operator picks instead of re-explaining.
+3. **CLEAR → execute relentlessly to completion.** No further questioning, no re-confirming a settled goal, no stopping at the first obstacle. Finish, or report a real blocker (§6f Error Recovery) — friction is not a blocker.
+
+**Two failure modes — name the one you're at risk of before you act:**
+
+- **OVER-QUESTIONING** — asking when the answer is already determinable from the repo, the task, or a prior message. Prefer measuring (grep, read the file, `git log`) over asking.
+- **OVER-ASSUMING** — proceeding on a guess when the cost of being wrong is high and one batched question would have settled it. Three measured instances from a single session, none self-caught: reporting work as "queued" with no queue entry behind it; reporting a tool as "landed" when it was unreachable dead code; reporting a sweep as "running" when it had exited three hours earlier. Each swapped a check for a guess and reported the guess as current state.
+
+**Calibration rule:** ask when the cost of a wrong assumption is high AND the answer is not derivable by you; otherwise measure, decide, and STATE the assumption you made so it can be corrected. A stated assumption is a decision with its reasoning attached; an unstated one is indistinguishable from a fact until it's caught — which is what the three instances above had in common.
+
+**Honesty about enforceability.** The three states above are behavioral prose — an instruction with no read-back, the same way the caveman-compression instruction and the `heimdall-metric --type` mandate have measurably not been self-enforcing on their own (see CLAUDE.md Token Efficiency). Two candidate mechanical checks were evaluated for this section specifically, not assumed away:
+- `bin/heimdall-conformance` reads the real session transcript (`~/.claude/projects/<slug>/<session>.jsonl`) and already gates two structural facts pulled from it (`gate-runs-once`, `gates-at-end`) — but by explicit design it classifies ONLY tool-call events (a `Bash` call running the full gate, a `Write`/`Edit`/`NotebookEdit` call) and ignores all message prose. "Asked a clarifying question" has no tool call — it lives entirely in prose — so it is invisible to that classifier by the same design choice that keeps its two existing gates reliable. (`bin/heimdall-delivery-audit` does not read the transcript at all — it audits queue/task stores and `bin/` reachability, never conversation content.)
+- The narrative journal's `communication` entry type is the closest existing structured, non-transcript trace, but it logs "a non-trivial claim made TO THE USER" generally — broader than clarification specifically — and logging it is a deliberate, optional act, not a guaranteed one.
+
+Neither yields a real signal for "more than one clarification round before execution began" without inventing prose-intent detection this repo's transcript tooling deliberately avoids. So: **this protocol is enforced by judgment and review, not by a gate.** What IS mechanically checked stays narrow, in `test/heimdall-clarification-protocol.test.sh`: that this section exists with all three states and both failure modes present, and that §6f and §8 point back here instead of restating an unbatched version of the rule.
+
 ---
 
 ## 3. Image Triage — Keep or Clear from Context
@@ -500,7 +521,7 @@ When an agent fails (crash, context limit, garbage output, timeout):
 2. **Classify**:
    - **Transient** (timeout, context overflow): Retry with narrower scope — split the sub-project
    - **Systematic** (wrong approach, bad assumptions): Re-spawn architect agent to re-plan
-   - **Blocking** (missing dependency, ambiguous requirement): Escalate to user
+   - **Blocking** (missing dependency, ambiguous requirement): Escalate to user via §2d Clarification Protocol — one batched round, then options, never a second round of open questions
 3. **Retry policy**:
    - Max 2 retries per sub-project
    - On first retry: same agent type, same scope, fresh context
@@ -568,7 +589,7 @@ Read current level: `heimdall-state get '.project.autonomy_level'`
 - Run until complete or blocked
 - Only stop for:
   - Errors you can't resolve
-  - Ambiguous requirements needing clarification
+  - Ambiguous requirements needing clarification — per §2d Clarification Protocol (batch, then options, never drip-fed)
   - Security-sensitive decisions (never auto-approve these)
 - Log all decisions to heimdall-state.json for post-hoc review
 
