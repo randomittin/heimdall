@@ -153,10 +153,11 @@ echo "$OUT_A" | grep -qE '^    UNMET +false$' \
 echo "$OUT_A" | grep -qE '^    NOT_RUNNABLE this criterion is pure prose' \
   && ok "A8 prose with no backtick command -> NOT_RUNNABLE, never guessed" \
   || bad "A8 missing NOT_RUNNABLE line for prose criterion" "$OUT_A"
-echo "$OUT_A" | grep -qE '^    MET +bash -c "exit 3" exits 3$' \
+echo "$OUT_A" | grep -qE '^    MET +bash -c "exit 3"$' \
   && ok "A9 'exits N' (N!=0) with matching exit -> MET" || bad "A9 missing MET line for exits-3 match" "$OUT_A"
-echo "$OUT_A" | grep -qE '^    UNMET +bash -c "exit 3" exits 5$' \
-  && ok "A10 'exits N' with mismatching exit -> UNMET" || bad "A10 missing UNMET line for exits-5 mismatch" "$OUT_A"
+echo "$OUT_A" | grep -A1 -E '^    UNMET +bash -c "exit 3"$' | grep -q "expected exit 5, got 3" \
+  && ok "A10 'exits N' with mismatching exit -> UNMET (expected 5, got 3)" \
+  || bad "A10 missing/wrong UNMET detail for exits-5 mismatch" "$OUT_A"
 echo "$OUT_A" | grep -q "TOTALS: 5 MET, 4 UNMET, 1 NOT-RUNNABLE (across 10 criteria)" \
   && ok "A11 totals line sums exactly right across both waves" \
   || bad "A11 totals line wrong" "$OUT_A"
