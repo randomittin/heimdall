@@ -139,10 +139,23 @@ if [ -x "$HS" ]; then
   grep -qi "GATE FAILED" "$CK" 2>/dev/null && ok "gate-failure reason surfaced" || bad "gate-failure reason missing"
   rm -rf "$P"
 
-  # 3c. init + mark-clean -> PASS.
+  # 3c. init + mark-clean + a fresh matching sweep receipt -> PASS.
+  # bin/heimdall-state's check-quality-gates also requires a fresh/clean/matching
+  # sweep receipt for ANY resolvable git repo (test/sweep-receipt-gate.test.sh
+  # sections B-H prove this is intentional, not a bug). $P IS a real git repo --
+  # make_project() needs one for sections 0/1's branch/HEAD/worktree checks -- so a
+  # legitimate PASS here now needs a receipt too, not just the 4 legacy booleans.
   P="$(make_project)"
   ( cd "$P" && "$HS" init >/dev/null 2>&1 && "$HS" mark-clean >/dev/null 2>&1 )
-  "$CKPT" write "$P" >/dev/null 2>&1
+  P_CANON="$(git -C "$P" rev-parse --show-toplevel)"
+  P_SHA="$(git -C "$P" rev-parse HEAD)"
+  mkdir -p "$P/.heimdall/receipts"
+  jq -n --arg repo "$P_CANON" --arg sha "$P_SHA" \
+    '{finished_at:"2026-01-01T00:00:00Z", repo:$repo, head_sha:$sha, tree_clean:true,
+      exit_code:0, suites_total:1, suites_passed:1, suites_failed:0, suites_timeout:0,
+      suites_discrepancy:0, suites_unparsed:0, assertions_passed:1, assertions_failed:0,
+      duration_s:1}' > "$P/.heimdall/receipts/last-sweep.json"
+  HEIMDALL_HOME="$P/.heimdall" "$CKPT" write "$P" >/dev/null 2>&1
   CK="$P/.planning/CHECKPOINT.md"
   grep -qE "verdict — PASS\)" "$CK" 2>/dev/null && ok "clean gate state reported PASS" || bad "clean gate state not reported PASS"
   rm -rf "$P"

@@ -39,6 +39,16 @@ trap cleanup EXIT
 export PATH="$ROOT/bin:$PATH"
 export HEIMDALL_STATE_FILE="$WORK/heimdall-state.json"
 
+# Run from inside $WORK (a plain mktemp dir, never a git repo) instead of wherever
+# this script happened to be invoked from. bin/heimdall-state's check-quality-gates
+# also consults a sweep receipt for any git repo it can resolve via `git rev-parse
+# --show-toplevel` (test/sweep-receipt-gate.test.sh) -- orthogonal to what THIS file
+# proves (the conflict_reflection_done flag) and unsatisfiable by design from inside
+# this repo's own checkout. A non-git cwd makes that block a documented no-op
+# (test/sweep-receipt-gate.test.sh section I), so only the reflection-flag logic
+# under test can affect the verdict here.
+cd "$WORK"
+
 # ══════════════════════════════════════════════════════════════════════════
 # Setup: fresh state, bypass the tests/lint gates so only reflection is live
 # ══════════════════════════════════════════════════════════════════════════
