@@ -250,6 +250,24 @@ dead_tool_reason() {
   return 1
 }
 
+# siblings_live_count — echoes the number of this orchestrator's own spawned
+# subagents that bin/heimdall-agents currently classifies as live or working.
+# Fails open to "0" (never "can't tell" treated as "live") when the tool is
+# missing, not executable, or its output isn't a plain digit string — a
+# liveness check that can't determine liveness must never cause a warning.
+siblings_live_count() {
+  local tool="$REPO/bin/heimdall-agents" n
+  if [ ! -x "$tool" ]; then
+    printf '0'
+    return 0
+  fi
+  n="$(HMD_AGENT_CWD="$REPO" "$tool" count 2>/dev/null)"
+  case "$n" in
+    ''|*[!0-9]*) printf '0'; return 0 ;;
+  esac
+  printf '%s' "$n"
+}
+
 WARN() {
   warned=$((warned + 1))
   {
@@ -265,6 +283,7 @@ RUN_CLAIM='\b(is|are)[[:space:]]+(currently[[:space:]]+)?running\b|\bstill[[:spa
 DEAD_CLAIM='\blanded\b|\bis[[:space:]]+wired\b|\bis[[:space:]]+done\b|\bhas[[:space:]]+shipped\b|\bis[[:space:]]+live\b'
 PAST_GUARD='\bwas\b|\bwere\b|\bhad\b|\bfinished\b|\bexited\b|\bcompleted\b|\bhas[[:space:]]+(finished|exited|completed)\b|\bearlier\b|\bago\b|\bpreviously\b|\bused[[:space:]]+to\b|\bno[[:space:]]+longer\b|\bstopped\b'
 COND_GUARD='\bif\b|\bwhether\b|\bi.ll\b|\bi[[:space:]]+will\b|\blet[[:space:]]+me\b|\bgoing[[:space:]]+to\b|\bwill[[:space:]]+check\b|\bneed[[:space:]]+to[[:space:]]+(check|verify)\b|\bcan[[:space:]]+check\b|\bshould[[:space:]]+check\b|\bwill[[:space:]]+land\b|\bwould[[:space:]]+land\b'
+REPORT_VOCAB='\bagents?\b|\bsub-?agents?\b|\bteammates?\b'
 
 # --- strip fenced code blocks, then split into sentences --------------------
 scrubbed="$(printf '%s\n' "$text" | awk '/^```/{f=!f;next} !f')"
@@ -292,6 +311,34 @@ while IFS= read -r sentence; do
     fi
   fi
 done < <(printf '%s\n' "$sentences")
+
+# --- [PREMATURE_REPORT] whole-message check ---------------------------------
+# A judgment about the ENTIRE final message, not a single sentence, so this
+# runs once here rather than inside the per-sentence loop above. Uses the
+# original $text (fenced code kept) — a report that pastes command output as
+# evidence is still a report; stripping fences would undercount it.
+report_min_chars="${HEIMDALL_CLAIM_CHECK_REPORT_MIN_CHARS:-}"
+case "$report_min_chars" in
+  ''|*[!0-9]*) report_min_chars=400 ;;
+esac
+
+n_live_siblings="$(siblings_live_count)"
+case "$n_live_siblings" in
+  ''|*[!0-9]*) n_live_siblings=0 ;;
+esac
+
+if [ "$n_live_siblings" -gt 0 ]; then
+  msg_len=${#text}
+  if [ "$msg_len" -ge "$report_min_chars" ] && printf '%s' "$text" | grep -qiE -- "$REPORT_VOCAB"; then
+    warned=$((warned + 1))
+    {
+      echo "BIFROST -- heimdall-claim-check: PREMATURE_REPORT -- reported before sibling agents finished"
+      echo "  signal: $n_live_siblings sibling agent(s) still live/working (bin/heimdall-agents count)"
+      echo "  message: $msg_len chars (>= $report_min_chars threshold), reads as a synthesis report"
+      echo "  batch this: report once after ALL spawned agents finish, not per completion."
+    } >&2
+  fi
+fi
 
 if [ "$warned" -gt 0 ]; then
   echo "heimdall-claim-check: $warned claim(s) flagged this turn -- see above." >&2
