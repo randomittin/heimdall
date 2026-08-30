@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# heimdall-caveman-compliance — measures caveman-targeted filler DENSITY in a
+# session transcript's assistant prose. Read-only audit. Never a gate.
+#
+# THE GAP THIS FILLS (docs/analysis/2026-08-30-caveman-compliance-audit.md, Q3):
+# the installed caveman plugin wires exactly two hooks — SessionStart and
+# UserPromptSubmit (its .claude-plugin/plugin.json) — and both of them INJECT
+# instructions before the model replies. Neither that plugin nor anything in
+# hmd ever reads back what the model actually wrote. This tool is that missing
+# read-back: given a Claude Code session transcript (JSONL), it extracts every
+# top-level assistant "text" content block, strips fenced/inline code first
+# (caveman's own rules exempt those verbatim — the installed
+# skills/compress/SKILL.md "Preserve EXACTLY" section), and counts occurrences
+# of the exact filler categories that SAME skill's "Remove" section names:
+# articles, filler adverbs, pleasantries, hedging phrases, connective fluff.
+#
+# WHAT THE NUMBER MEANS: a MEASURED FLOOR on removable content, not a ceiling
+# and not a savings figure. Caveman's rules also do paraphrase-level
+# compression (short synonyms, fragment restructuring) a keyword count cannot
+# see — this tool does not claim to see that, and reports only what it counted.
+#
+# NOT ENFORCEMENT. This never blocks a response, never rewrites one, and never
+# runs inside the request/response path. It is a report you run after the
+# fact — same posture as `heimdall-ctx-meter outshare` / `heimdall-tokens
+# session`: real transcript data, fail-open, --json for machine consumption.
+#
+# Usage:
+#   heimdall-caveman-compliance <session-jsonl-path>
+#   heimdall-caveman-compliance <session-jsonl-path> --json
+
+import json
+import re
+import sys
+
+# Filler categories, verbatim in spirit from the installed caveman plugin's OWN
+# compression rules (skills/compress/SKILL.md "Remove" section) — not this
+# tool's opinion of what filler is. Kept as a plain constant rather than parsed
+# from the skill file at runtime: this category list is small and stable
+# (unlike the intensity table caveman-activate.js parses live, which changes
+# per level), so a markdown-parsing dependency would buy nothing here.
+FILLER_PATTERNS = {
+    "articles": r"\b(a|an|the)\b",
+    "filler_adverbs": r"\b(just|really|basically|actually|simply|essentially|generally)\b",
+    "pleasantries": r"\b(sure|certainly|of course|happy to|I'd recommend)\b",
+    "hedging": r"\b(it might be worth|you could consider|it would be good to)\b",
+    "connectives": r"\b(however|furthermore|additionally|in addition)\b",
+}
+
+FENCE_RE = re.compile(r"```.*?```", re.S)
+INLINE_CODE_RE = re.compile(r"`[^`]*`")
+
+USAGE = "Usage: heimdall-caveman-compliance <session-jsonl-path> [--json]"
+
+
+def _empty_result(error=None):
+    rec = {
+        "assistant_messages_with_text": 0,
+        "prose_chars": 0,
+        "prose_words": 0,
+        "filler_counts": {k: 0 for k in FILLER_PATTERNS},
+        "filler_chars": {k: 0 for k in FILLER_PATTERNS},
+        "total_filler_chars": 0,
+        "total_filler_count": 0,
+        "filler_share_of_prose_chars_pct": None,
+    }
+    if error:
+        rec["error"] = error
+    return rec
+
+
+def _count_filler(stripped_text, rec):
+    for key, pattern in FILLER_PATTERNS.items():
+        matches = re.findall(pattern, stripped_text, flags=re.I)
+        rec["filler_counts"][key] += len(matches)
+        rec["filler_chars"][key] += sum(len(m) for m in matches)
+
+
+def measure_session(path):
+    """Scan a session transcript JSONL and measure filler density in assistant
+    prose text blocks. Fail-open: any read/parse problem yields a degraded
+    all-zero record with an `error` note — this never raises."""
+    if not path:
+        return _empty_result("no path given")
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError as e:
+        return _empty_result("could not read session transcript %s: %s" % (path, e))
+
+    rec = _empty_result()
+    parsed_any = False
+    with fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, TypeError):
+                # one bad line never aborts the scan — skip it lazily, same
+                # posture as heimdall-tokens' sum_session.
+                continue
+            parsed_any = True
+            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                continue
+            message = obj.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            got_text = False
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                txt = block.get("text") or ""
+                if not txt:
+                    continue
+                got_text = True
+                rec["prose_chars"] += len(txt)
+                rec["prose_words"] += len(txt.split())
+                stripped = FENCE_RE.sub(" ", txt)
+                stripped = INLINE_CODE_RE.sub(" ", stripped)
+                _count_filler(stripped, rec)
+            if got_text:
+                rec["assistant_messages_with_text"] += 1
+
+    if not parsed_any:
+        return _empty_result(
+            "session transcript %s had no parseable JSON lines (degraded)" % path
+        )
+
+    rec["total_filler_chars"] = sum(rec["filler_chars"].values())
+    rec["total_filler_count"] = sum(rec["filler_counts"].values())
+    if rec["prose_chars"] > 0:
+        rec["filler_share_of_prose_chars_pct"] = (
+            100.0 * rec["total_filler_chars"] / rec["prose_chars"]
+        )
+    return rec
+
+
+def _print_human(rec, path):
+    if rec.get("error"):
+        print("NOT_VERIFIED (%s)" % rec["error"])
+        return
+    print("session                                     : %s" % path)
+    print("assistant messages with visible text        : %d" % rec["assistant_messages_with_text"])
+    print("prose characters                            : %d" % rec["prose_chars"])
+    print("prose words                                 : %d" % rec["prose_words"])
+    for key in FILLER_PATTERNS:
+        print(
+            "  %-16s occurrences=%-6d chars=%d"
+            % (key, rec["filler_counts"][key], rec["filler_chars"][key])
+        )
+    print("total filler occurrences                    : %d" % rec["total_filler_count"])
+    print("total filler characters                     : %d" % rec["total_filler_chars"])
+    share = rec["filler_share_of_prose_chars_pct"]
+    print(
+        "filler share of prose chars (measured FLOOR): %s"
+        % (("%.4f%%" % share) if share is not None else "n/a")
+    )
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0
+    if not argv:
+        sys.stderr.write("error: heimdall-caveman-compliance needs a <session-jsonl-path>\n")
+        sys.stderr.write(USAGE + "\n")
+        return 2
+    json_out = False
+    path = None
+    for a in argv:
+        if a == "--json":
+            json_out = True
+        elif a in ("-h", "--help"):
+            continue
+        else:
+            path = a
+    if path is None:
+        sys.stderr.write("error: heimdall-caveman-compliance needs a <session-jsonl-path>\n")
+        sys.stderr.write(USAGE + "\n")
+        return 2
+    rec = measure_session(path)
+    if json_out:
+        print(json.dumps(rec))
+    else:
+        _print_human(rec, path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
