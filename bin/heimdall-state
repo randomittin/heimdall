@@ -196,6 +196,55 @@ cmd_check_quality_gates() {
     failed=1
   fi
 
+  # ── SWEEP RECEIPT — make a stale/absent full sweep mechanically undeniable ──────────
+  # Three real overclaims shipped from reporting LAST-KNOWN state as CURRENT state: work
+  # called "queued" with no queue behind it, a tool called "landed" that was dead code,
+  # a sweep called "running now" that had actually exited three hours earlier. The four
+  # checks above are booleans anyone can flip by hand (`heimdall-state mark-clean`)
+  # without ever running anything — exactly how a stale "tests passing" claim stays
+  # green. This block instead reads the receipt test/run-all.sh writes on EVERY run
+  # (pass or fail) and refuses to trust it unless it is fresh (HEAD matches), clean (no
+  # uncommitted changes while it ran), for THIS repo, and itself exited 0. Only runs
+  # when a git repo can be resolved at all — a real `git push` invocation always can;
+  # the absence case is exercised by the non-git fixtures in
+  # test/pre-push-quality-gate-blocking.test.sh and must stay a no-op there, not a
+  # forced failure unrelated to what that suite is proving.
+  # SWEEP RECEIPT PATH — kept in sync across bin/heimdall-state (here, the gate),
+  # test/run-all.sh (the writer), bin/heimdall-delivery-audit print_section_b (the
+  # reporter). grep 'receipts/last-sweep.json' to find all three call sites.
+  local sweep_repo
+  if sweep_repo="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    local receipt cur_sha
+    receipt="${HEIMDALL_HOME:-$sweep_repo/.heimdall}/receipts/last-sweep.json"
+    cur_sha="$(git -C "$sweep_repo" rev-parse HEAD 2>/dev/null || true)"
+    if [ ! -f "$receipt" ]; then
+      echo "GATE FAILED: no sweep receipt at $receipt — a full sweep has never recorded a result in this checkout. Run: bash test/run-all.sh" >&2
+      failed=1
+    elif ! jq -e . "$receipt" >/dev/null 2>&1; then
+      echo "GATE FAILED: sweep receipt at $receipt is not valid JSON. Re-run: bash test/run-all.sh" >&2
+      failed=1
+    else
+      local r_repo r_sha r_clean r_rc
+      r_repo=$(jq -r '.repo // empty' "$receipt")
+      r_sha=$(jq -r '.head_sha // empty' "$receipt")
+      r_clean=$(jq -r '.tree_clean // false' "$receipt")
+      r_rc=$(jq -r 'if (.exit_code|type)=="number" then .exit_code else -1 end' "$receipt")
+      if [ -n "$r_repo" ] && [ "$r_repo" != "$sweep_repo" ]; then
+        echo "GATE FAILED: sweep receipt at $receipt was recorded for a different repo ($r_repo, this checkout is $sweep_repo). Run: bash test/run-all.sh" >&2
+        failed=1
+      elif [ -z "$r_sha" ] || [ "$r_sha" != "$cur_sha" ]; then
+        echo "GATE FAILED: sweep receipt is STALE — receipt HEAD ${r_sha:-<none>} != current HEAD ${cur_sha:-<none>} (commits landed since the sweep ran). Run: bash test/run-all.sh" >&2
+        failed=1
+      elif [ "$r_clean" != "true" ]; then
+        echo "GATE FAILED: sweep receipt recorded a DIRTY tree — its green does not describe what would be pushed. Commit or stash, then run: bash test/run-all.sh" >&2
+        failed=1
+      elif [ "$r_rc" != "0" ]; then
+        echo "GATE FAILED: sweep receipt recorded a FAILING run (exit $r_rc). Fix the failures, then run: bash test/run-all.sh" >&2
+        failed=1
+      fi
+    fi
+  fi
+
   if [ "$failed" -eq 1 ]; then
     echo "Quality gates not met. Push blocked." >&2
     exit 2

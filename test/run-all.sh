@@ -677,6 +677,70 @@ if [ -n "$EVIDENCE" ]; then
 fi
 
 BAD=$((n_fail + n_timeout + n_discrep + n_treeviol))
+
+# ── SWEEP RECEIPT ─────────────────────────────────────────────────────────────────────────
+# Turns "the sweep is green" into a checkable FACT instead of a claim. Three real
+# overclaims shipped this session from reporting LAST-KNOWN state as CURRENT state: work
+# called "queued" with no queue behind it, a tool called "landed" that was dead code with
+# no live entry point, a sweep called "running now" that had actually exited three hours
+# earlier. bin/heimdall-state check-quality-gates reads this file and BLOCKS `git push`
+# when it is missing, stale (HEAD moved since), recorded a dirty tree, or recorded a
+# nonzero exit code — see cmd_check_quality_gates there. Written UNCONDITIONALLY, pass or
+# fail, so a red run can never leave a stale green receipt sitting in place.
+# SWEEP RECEIPT PATH — kept in sync across test/run-all.sh (here, the writer),
+# bin/heimdall-state cmd_check_quality_gates (the gate), bin/heimdall-delivery-audit
+# print_section_b (the reporter). grep 'receipts/last-sweep.json' to find all three.
+RECEIPT_RC=0; [ "$BAD" -gt 0 ] && RECEIPT_RC=1
+RECEIPT_HOME="${HEIMDALL_HOME:-$REPO/.heimdall}"
+RECEIPT_DIR="$RECEIPT_HOME/receipts"
+RECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"
+if command -v jq >/dev/null 2>&1; then
+  RECEIPT_HEAD_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "")"
+  # Canonical (symlink-resolved) toplevel, NOT a bare `cd && pwd` value: the reader
+  # (bin/heimdall-state, bin/heimdall-delivery-audit) compares against its own
+  # `git rev-parse --show-toplevel`, which resolves symlinks. Under macOS $TMPDIR
+  # (/var/folders/... -> /private/var/folders/...) a logical $REPO and git's
+  # canonical toplevel are the same directory but different strings, which false-
+  # positived the repo-mismatch check in test/sweep-receipt-gate.test.sh case C.
+  RECEIPT_REPO_CANON="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || echo "$REPO")"
+  RECEIPT_TREE_CLEAN=false
+  [ -z "$(_status_snapshot)" ] && RECEIPT_TREE_CLEAN=true
+  if mkdir -p "$RECEIPT_DIR" 2>/dev/null; then
+    RECEIPT_TMP="$(mktemp "$RECEIPT_DIR/.last-sweep.XXXXXX" 2>/dev/null || true)"
+    if [ -n "$RECEIPT_TMP" ] && jq -n \
+      --arg finished_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      --arg repo "$RECEIPT_REPO_CANON" \
+      --arg head_sha "$RECEIPT_HEAD_SHA" \
+      --argjson tree_clean "$RECEIPT_TREE_CLEAN" \
+      --argjson exit_code "$RECEIPT_RC" \
+      --argjson suites_total "$TO_RUN" \
+      --argjson suites_passed "$n_pass" \
+      --argjson suites_failed "$n_fail" \
+      --argjson suites_timeout "$n_timeout" \
+      --argjson suites_discrepancy "$n_discrep" \
+      --argjson suites_unparsed "$n_unparsed" \
+      --argjson assertions_passed "$tot_p" \
+      --argjson assertions_failed "$tot_f" \
+      --argjson duration_s "$ELAPSED" \
+      '{finished_at:$finished_at, repo:$repo, head_sha:$head_sha, tree_clean:$tree_clean,
+        exit_code:$exit_code, suites_total:$suites_total, suites_passed:$suites_passed,
+        suites_failed:$suites_failed, suites_timeout:$suites_timeout,
+        suites_discrepancy:$suites_discrepancy, suites_unparsed:$suites_unparsed,
+        assertions_passed:$assertions_passed, assertions_failed:$assertions_failed,
+        duration_s:$duration_s}' > "$RECEIPT_TMP" 2>/dev/null; then
+      mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null \
+        && echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})" \
+        || echo "${YEL}run-all: could not move sweep receipt into place at ${RECEIPT_FILE}${OFF}" >&2
+    else
+      [ -n "$RECEIPT_TMP" ] && rm -f "$RECEIPT_TMP" 2>/dev/null
+      echo "${YEL}run-all: could not write sweep receipt (jq build failed) — pre-push gate will see this as no receipt${OFF}" >&2
+    fi
+  else
+    echo "${YEL}run-all: could not create ${RECEIPT_DIR} — sweep receipt NOT written${OFF}" >&2
+  fi
+else
+  echo "${YEL}run-all: jq not found — sweep receipt NOT written (pre-push gate will see this as no receipt)${OFF}" >&2
+fi
 if [ "$BAD" -gt 0 ]; then
   if [ "$n_treeviol" -gt 0 ]; then
     echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s)/finding(s) not green, including $n_treeviol TREE INTEGRITY VIOLATION(s)."
