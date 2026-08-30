@@ -232,6 +232,23 @@ else
   [ "$val" = "2" ] && ok "--all qualifying_orchestrator_records_total == 2, no time-window filtering (got $val)" || bad "--all qualifying_orchestrator_records_total == 2 (got $val)"
   val="$(get gap)"
   [ "$val" = "3" ] && ok "--all gap == 5 - 2 == 3 (got $val)" || bad "--all gap == 3 (got $val)"
+
+  # --all's OWN unreadable-metrics-file branch (measure_all's inline use of
+  # _open_metrics), independent of the already-tested single-session one --
+  # same helper, different consumer, worth its own proof.
+  ALLUNREADABLE="$TMPDIR/all-unreadable-metrics.jsonl"
+  cp "$ALLMETRICS" "$ALLUNREADABLE"
+  chmod 000 "$ALLUNREADABLE"
+  OUT="$(python3 "$TOOL" --all "$ALLDIR" --metrics-file "$ALLUNREADABLE" --json)"
+  RC=$?
+  chmod 644 "$ALLUNREADABLE"
+  [ "$RC" -eq 0 ] && ok "--all with unreadable metrics file still exits 0" || bad "--all with unreadable metrics file still exits 0 (rc=$RC)"
+  val="$(get metrics_file_readable)"
+  [ "$val" = "False" ] && ok "--all metrics_file_readable == False (got $val)" || bad "--all metrics_file_readable == False (got $val)"
+  val="$(get qualifying_orchestrator_records_total)"
+  [ "$val" = "None" ] && ok "--all qualifying_orchestrator_records_total == null when metrics unreadable, not 0 (got $val)" || bad "--all qualifying_orchestrator_records_total == null when unreadable (got $val)"
+  val="$(get gap)"
+  [ "$val" = "None" ] && ok "--all gap == null when metrics unreadable (got $val)" || bad "--all gap == null when metrics unreadable (got $val)"
 fi
 chmod 644 "$ALLDIR/three-unreadable.jsonl" 2>/dev/null
 
