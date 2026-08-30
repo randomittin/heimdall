@@ -139,6 +139,34 @@ Three states. Do not skip one, and do not repeat one you've already cleared:
 2. **STILL UNCLEAR after that round → concrete OPTIONS, not more open questions.** A second round of open questions is the failure, not a safety net. Present enumerated, mutually exclusive choices with each one's trade-off stated, so the operator picks instead of re-explaining.
 3. **CLEAR → execute relentlessly to completion.** No further questioning, no re-confirming a settled goal, no stopping at the first obstacle. Finish, or report a real blocker (§6f Error Recovery) — friction is not a blocker.
 
+**CLARITY IS ABOUT THE TASK, NEVER ABOUT PERMISSION.** Operator directive,
+2026-08-31, correcting a reading this section otherwise invites: "when I mentioned
+clarity before executions I didn't mean asking for permissions or approvals -- I
+meant just clarity on tasks."
+
+The only legitimate subject of a clarification round is WHAT the work is — scope,
+target, acceptance criteria, which of two genuinely-ambiguous readings is meant.
+Asking whether you may proceed is not clarification; it is a third failure mode,
+and it is worse than the other two because it looks like diligence.
+
+| Legitimate — asks WHAT | Forbidden — asks WHETHER |
+|---|---|
+| "Which of these two files is the target?" | "May I proceed?" |
+| "Should this cover case X, or is X out of scope?" | "Is it okay if I start?" |
+| "A and B both satisfy this — which do you want?" | "Shall I go ahead and fix it?" |
+| "What is the acceptance criterion for done?" | "Do you want me to continue?" |
+
+The autonomy level already answers the permission question — at Level 3 (this
+repo's setting, `.planning/settings.json`) hmd runs until complete or genuinely
+blocked, and §8 lists the ONLY four things that may interrupt: an unresolvable
+error, a genuinely ambiguous requirement, a security-sensitive decision, and a
+budget breach. "Confirming before starting" is on none of those lists. Re-asking
+a settled goal is state 3's failure, not caution.
+
+Corollary: once the task is clear, an obstacle is not a new ambiguity. Hitting a
+failing test, a merge conflict, or a wrong guess is a thing to FIX and report, not
+a reason to return to the operator for a decision they have already made.
+
 **Two failure modes — name the one you're at risk of before you act:**
 
 - **OVER-QUESTIONING** — asking when the answer is already determinable from the repo, the task, or a prior message. Prefer measuring (grep, read the file, `git log`) over asking.
