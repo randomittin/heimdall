@@ -839,6 +839,20 @@ main() {
     orphans) shift; cmd_orphans "$@" ;;
     reap)    shift; cmd_reap "$@" ;;
     sweep)   shift; cmd_sweep "$@" ;;
+    # `rescue` is the ENFORCEMENT half of `orphans`. orphans (and
+    # bin/heimdall-agent-resume behind it) REPORT interrupted subagents and
+    # stop there; measured this session, that left recovery depending on a
+    # human noticing -- which worked ~5 times and failed the rest, while
+    # STALL killed 196 agent-runs. This dispatches to the watchdog, which
+    # PRESERVES uncommitted work in the stalled agent's own worktree first,
+    # then classifies (quota -> never auto-retry; stall/turn-limit ->
+    # resumable). Wired here rather than left standalone because a tool
+    # nothing invokes is dead code -- exactly the "reports but never acts"
+    # defect it exists to fix.
+    rescue)  shift
+             _wd="$(cd "$(dirname "$0")" && pwd)/heimdall-agent-watchdog"
+             if [ -x "$_wd" ]; then exec "$_wd" run "$@"; fi
+             echo "error: heimdall-agent-watchdog not found at $_wd" >&2; exit 2 ;;
     -h|--help|help|'') usage ;;
     *) echo "error: unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
   esac
