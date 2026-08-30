@@ -1,0 +1,39 @@
+#!/bin/sh
+# heimdall-plan-verify — closes the plan -> execution -> verification loop.
+#
+# WHY THIS EXISTS. bin/decompose emits dependency-ordered waves; agents/planner.md
+# and agents/architect.md write PLAN files with acceptance criteria. Until this
+# tool, nothing ever checked the two against each other -- "wave done" was an
+# assertion, never a verified fact. See bin/lib/hmd_plan_verify.py's own header for
+# the full design (markdown + JSON-sidecar schemas, MET/UNMET/NOT_RUNNABLE
+# classification, the --require-sweep tie-in to .heimdall/receipts/last-sweep.json).
+#
+# WHAT THIS CANNOT DO. Like heimdall-deadcode, this measures and reports; it does
+# not delete, does not fix, and cannot force a wave to be treated as verified.
+#
+# Usage:
+#   heimdall-plan-verify PLAN.md [--wave N] [--json] [--timeout SECS]
+#                         [--require-sweep] [--heimdall-home DIR]
+#
+# Exit codes: 0 clean (0 UNMET, and --require-sweep's receipt check if requested),
+# 1 at least one UNMET or a failed --require-sweep check, 2 plumbing failure
+# (missing plan, bad args, unknown --wave) -- reported, never a crash.
+
+set -eu
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+LIB="$SELF_DIR/lib/hmd_plan_verify.py"
+
+case "${1:-}" in
+  -h|--help)
+    sed -n '2,20p' "$0" | cut -c2-
+    exit 0
+    ;;
+esac
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "heimdall-plan-verify: python3 is required and was not found on PATH" >&2
+  exit 2
+fi
+
+exec python3 "$LIB" "$@"
