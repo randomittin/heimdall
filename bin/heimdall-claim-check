@@ -39,7 +39,11 @@
 # process is running right now and no matching process exists, WARNS loudly
 # on stderr. Also handles the "landed"/"is wired"/"is done" shape: a claim
 # that some `bin/NAME` tool has shipped when it either does not exist on disk
-# or `heimdall-deadcode --why NAME` reports it DEAD.
+# or `heimdall-deadcode --why NAME` reports it DEAD. A third, whole-message
+# check (PREMATURE_REPORT, see below) catches a batched-reporting violation:
+# a substantial synthesis-style report written while sibling agents this same
+# orchestrator spawned are still live, instead of one summary after they all
+# finish.
 #
 # WHAT THIS DELIBERATELY DOES NOT CATCH (precision over recall, on purpose):
 #   - "queued" / "sweep needed" (absence) claims — a different claim shape,
@@ -54,6 +58,11 @@
 #     never false-positives on correct hedging or correctly-reported history.
 #   - claims that only become false when combined across multiple sentences
 #     or turns — this scans one sentence at a time, within one message.
+#   - a PREMATURE_REPORT violation whose wording never says agent/subagent/
+#     teammate (calls them "forks", "tasks", or names them individually with
+#     no collective noun) — the vocabulary gate exists to keep the false-
+#     positive rate at zero for unrelated long answers, and a missed catch on
+#     the wording side is the accepted trade-off, not an oversight.
 #
 # NEVER BLOCKS. Exits 0 unconditionally, on every code path — a false-status
 # warning is a loud nudge, never a correctness gate, and must never wedge a
@@ -64,12 +73,71 @@
 # risking a regression of that already-working mechanism is not justified by
 # this warning's severity. Revisit if stderr-only proves to go unnoticed.
 #
+# THIRD DETECTOR — PREMATURE_REPORT (batched-agent-reporting violation).
+# THE DEFECT (same family — spoke from habit instead of a live check — so it
+# lives in this same Stop-hook slot rather than a new file). Measured this
+# session: the orchestrator spawns N agents for one task, then writes a full
+# multi-paragraph explanation after EACH completion notification instead of
+# one synthesis once all N are done. Already a standing rule in the
+# orchestrator's own persistent memory ("Batch agent reporting — report ONCE
+# when all relevant agents finish; per-completion narration wastes tokens and
+# loses synthesis"), violated repeatedly anyway. An instruction with no
+# read-back needs a mechanical check, same reasoning as the two detectors
+# above.
+#
+# LIVENESS SIGNALS INVESTIGATED — most rejected, one accepted:
+#   - raw pgrep for claude/agent processes: REJECTED. bin/heimdall-agents'
+#     own header documents a MEASURED false "dead" verdict for a genuinely
+#     running session (pid invisible to `pgrep -x claude`/`lsof`). The tool
+#     that owns this exact problem rejected pgrep after measuring it; this
+#     file has no business trusting it either.
+#   - ~/.heimdall/agent-pool.json (bin/agent-pool): REJECTED. Tracks
+#     HEIMDALL'S OWN background workers (bin/session-fork inproc entries,
+#     maintain_loop.py fixers) — confirmed by reading a real populated
+#     instance on this machine (entries named "inproc-…", "maintain-fixer-N").
+#     Claude Code Agent-tool subagents NEVER enter this file — stated in
+#     bin/heimdall-agents' own header and independently confirmed here.
+#     Wrong roster.
+#   - `.claude/worktrees/agent-*` presence/mtime: REJECTED as a primary
+#     signal. A worktree outlives its agent (cleanup is separate); presence
+#     proves creation, not liveness. Strictly weaker than the next option.
+#   - bin/heimdall-agents count: ACCEPTED. The existing, tested, already-
+#     hooked-in (hooks/hooks.json -> heimdall-precheck-agent ->
+#     heimdall-agents) tracker built for exactly this question. Counts only
+#     `live`+`working` subagents, derived from transcript mtimes, an
+#     awaiting-tool-result check, and a completion-notification index — NOT
+#     the process table (see its own "LIVENESS — WHY NOT pgrep" section).
+#     Reusing it means this detector inherits that tool's correctness
+#     instead of re-deriving a worse version of it.
+#   - the Stop hook's own JSON payload: no sibling-agent-roster field is
+#     documented or has been observed on this or the SubagentStop payload.
+#     Not usable.
+#
+# THE CHECK: warn only when BOTH hold —
+#   (a) `HMD_AGENT_CWD=<repo> bin/heimdall-agents count` (fail-open to 0 on
+#       any error, missing binary, or non-numeric output) reports > 0, AND
+#   (b) the message is "substantial": length >=
+#       HEIMDALL_CLAIM_CHECK_REPORT_MIN_CHARS (default 400) chars AND it
+#       mentions agents/subagents/teammates at all.
+# Both thresholds protect the two named false-positive shapes:
+#   - length: a real holding line ("still running, will report when done")
+#     runs well under 100 chars. A genuine multi-agent synthesis report, by
+#     this repo's own DONE-report convention, runs 600+ chars. 400 sits with
+#     margin on both sides.
+#   - vocabulary: gates out a message that only answers a direct, unrelated
+#     user question — such an answer is exceedingly unlikely to use the
+#     words agent/subagent/teammate even if it happens to be long.
+#
 # CONFIGURATION (env, all optional):
 #   HEIMDALL_CLAIM_CHECK_SWEEP_PATTERN            pgrep -f pattern for "the
 #                                                  sweep". default: test/run-all\.sh
 #   HEIMDALL_CLAIM_CHECK_TRANSCRIPT_TAIL_BYTES    bytes tailed from
 #                                                  transcript_path before
 #                                                  parsing. default: 262144
+#   HEIMDALL_CLAIM_CHECK_REPORT_MIN_CHARS         PREMATURE_REPORT's
+#                                                  substantial-message length
+#                                                  threshold, in chars.
+#                                                  default: 400
 set -uo pipefail
 
 REPO="${CLAUDE_PROJECT_DIR:-.}"
