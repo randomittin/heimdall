@@ -24,6 +24,18 @@
 #      the real tally (see "red-proof" section). This proves the suite is
 #      not vacuously true without ever putting the real, committed guard
 #      script into a broken state.
+#   8. FAIL-OPEN HARDENING (2026-08-30, docs/analysis/2026-08-30-secret-
+#      read-guard-crash-blocks-commands.md) — a battery of hostile/
+#      malformed payloads (embedded quotes, backticks, nested $(), embedded
+#      newlines, a ~200KB command, invalid UTF-8, a missing/null/array
+#      `command`, an empty command, no `tool_input`, truncated JSON, jq
+#      unavailable) must NEVER produce a silent non-zero exit — only a
+#      clean exit 0 or an exit 2 that carries its payload. A malformed/
+#      garbage payload specifically must be a clean, SILENT allow (rc=0,
+#      empty stdout AND stderr). Falsifiability is re-proved the same way
+#      as (7), this time against a deliberately-crashing mutant rather than
+#      a no-op one, since the original crash trigger could not be
+#      reproduced against current code (see status report).
 #
 # Usage: bash test/secret-read-guard.test.sh   (exit 0 = all hold)
 set -uo pipefail
@@ -279,6 +291,145 @@ if [ "$_RED_TOTAL" -gt 0 ] && [ "$_RED_FAILS" -eq "$_RED_TOTAL" ]; then
   ok "falsifiability: all $_RED_TOTAL red-proof assertions correctly FAILED against the no-op (always-allow) guard"
 else
   bad "falsifiability BROKEN: only $_RED_FAILS/$_RED_TOTAL red-proof assertions failed against the no-op guard -- assertions may be vacuously true"
+fi
+
+echo "-- 8. hostile-payload fail-open hardening (2026-08-30 crash fix) ------"
+# Every assertion here enforces ONE contract, at this script's own process
+# boundary: the ONLY two reachable outcomes are exit 0 (silent, or with an
+# escape-hatch stderr notice) or exit 2 WITH its {"error":...} payload
+# already on stdout. A non-zero exit that is not 2, or an exit 2 with empty
+# stdout, is exactly the failure mode from docs/analysis/2026-08-30-secret-
+# read-guard-crash-blocks-commands.md and must never happen again.
+expect_never_silent() {
+  desc="$1"; bin="$2"; payload="$3"
+  errfile="$TMP/.stderr.nsi.$$"
+  out="$(printf '%s' "$payload" | perl -e 'alarm(5); exec @ARGV' "$bin" 2>"$errfile")"
+  rc=$?
+  err="$(cat "$errfile" 2>/dev/null || true)"
+  rm -f "$errfile"
+  case "$rc" in
+    0) ok "$desc (allowed cleanly, rc=0)" ;;
+    2)
+      if [ -n "$out" ]; then
+        ok "$desc (blocked WITH payload, rc=2)"
+      else
+        bad "$desc (rc=2 but stdout EMPTY -- exactly the 2026-08-30 failure shape)"
+      fi
+      ;;
+    *)
+      bad "$desc (SILENT non-zero exit rc=$rc -- structurally forbidden; stdout=[$out] stderr=[$err])"
+      ;;
+  esac
+}
+
+CMD_QUOTES=$(cat <<'RAWCMD'
+echo "she said \"hi\" and `whoami` then $(echo done)"
+RAWCMD
+)
+P_QUOTES=$(jq -cn --arg cmd "$CMD_QUOTES" '{tool_name:"Bash", tool_input:{command:$cmd}}')
+expect_never_silent "embedded double quotes + backticks + \$()" "$GUARD" "$P_QUOTES"
+
+P_NESTED=$(jq -cn --arg cmd 'echo $(echo $(echo $(echo inner)))' '{tool_name:"Bash", tool_input:{command:$cmd}}')
+expect_never_silent "deeply nested \$()" "$GUARD" "$P_NESTED"
+
+CMD_MULTILINE=$(cat <<'RAWCMD'
+echo "path: $(grep -c FOO some/file)" && echo "~/.heimdall/agent-pool.json"
+git merge --no-ff -m "merge: issue-loop fixtures off the removed 'on' state" some-branch
+RAWCMD
+)
+P_MULTILINE=$(jq -cn --arg cmd "$CMD_MULTILINE" '{tool_name:"Bash", tool_input:{command:$cmd}}')
+expect_never_silent "multi-line command resembling the reported trigger shape" "$GUARD" "$P_MULTILINE"
+
+LONGCMD="echo $(printf 'a%.0s' $(seq 1 200000))"
+P_LONG=$(jq -cn --arg cmd "$LONGCMD" '{tool_name:"Bash", tool_input:{command:$cmd}}')
+expect_never_silent "very long command (~200KB)" "$GUARD" "$P_LONG"
+
+expect_never_silent "command is a JSON array, not a string" "$GUARD" \
+  '{"tool_name":"Bash","tool_input":{"command":["cat",".env"]}}'
+expect_never_silent "command is JSON null" "$GUARD" \
+  '{"tool_name":"Bash","tool_input":{"command":null}}'
+expect_never_silent "command is empty string" "$GUARD" \
+  '{"tool_name":"Bash","tool_input":{"command":""}}'
+expect_never_silent "tool_input missing entirely" "$GUARD" \
+  '{"tool_name":"Bash"}'
+
+P_EMBEDDED_NL=$(jq -cn --arg cmd "$(printf 'line one\nline two\ncat .env')" '{tool_name:"Bash", tool_input:{command:$cmd}}')
+expect_never_silent "embedded literal newlines in command" "$GUARD" "$P_EMBEDDED_NL"
+
+BADUTF8_FILE="$TMP/.badutf8-payload.json"
+printf '{"tool_name":"Bash","tool_input":{"command":"cat \xc0\x80 .env"}}' > "$BADUTF8_FILE"
+BADUTF8_PAYLOAD="$(cat "$BADUTF8_FILE")"
+rm -f "$BADUTF8_FILE"
+expect_never_silent "invalid UTF-8 bytes embedded in command value" "$GUARD" "$BADUTF8_PAYLOAD"
+
+echo "-- 8b. jq-missing forces fail-open even for a would-be-denied payload -"
+if PATH="$NOJQ_BIN" command -v jq >/dev/null 2>&1; then
+  bad "jq-missing recheck: jq unexpectedly resolvable via isolated PATH -- cannot isolate, counting as FAIL"
+else
+  OUT2="$(printf '%s' "$(read_payload .env)" | PATH="$NOJQ_BIN" "$GUARD" 2>/dev/null)"
+  rc2=$?
+  if [ "$rc2" -eq 0 ] && [ -z "$OUT2" ]; then
+    ok "jq missing -> even a would-be-denied .env read is allowed cleanly (rc=0, no payload)"
+  else
+    bad "jq missing did not cleanly fail open for a would-be-denied payload (rc=$rc2, out=[$OUT2])"
+  fi
+fi
+
+echo "-- 8c. malformed/garbage payload -> clean SILENT allow, not just non-crash --"
+expect_clean_allow() {
+  desc="$1"; bin="$2"; payload="$3"
+  errfile="$TMP/.stderr.ca.$$"
+  out="$(printf '%s' "$payload" | perl -e 'alarm(5); exec @ARGV' "$bin" 2>"$errfile")"
+  rc=$?
+  err="$(cat "$errfile" 2>/dev/null || true)"
+  rm -f "$errfile"
+  if [ "$rc" -eq 0 ] && [ -z "$out" ] && [ -z "$err" ]; then
+    ok "$desc (clean silent allow: rc=0, stdout empty, stderr empty)"
+  else
+    bad "$desc (expected clean silent allow; got rc=$rc stdout=[$out] stderr=[$err])"
+  fi
+}
+P_TRUNCATED='{"tool_name":"Bash", "tool_input": {"command": "cat .env"'
+expect_clean_allow "truncated/malformed JSON" "$GUARD" "$P_TRUNCATED"
+P_GARBAGE=$'\x00\x01\xff\xfe garbage not json at all'
+expect_clean_allow "completely garbage non-JSON bytes" "$GUARD" "$P_GARBAGE"
+
+echo "-- 9. crashing-mutant red-proof (fail-open assertions must go RED) ----"
+# The original 2026-08-30 crash trigger could NOT be reproduced against
+# current code (a bounded battery of hostile payloads above all landed on a
+# clean 0 or a payload-bearing 2). Per the task's fallback instruction,
+# falsifiability of the never-silent assertions is proved instead against a
+# DELIBERATELY crashing mutant -- a standalone script, never the real
+# committed guard -- that dies from an unguarded internal failure under
+# `set -e`, mimicking the reported failure shape: non-zero exit, no
+# payload, no explanation.
+CRASHER="$TMP/crasher-guard"
+cat > "$CRASHER" <<'CRASHEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+INPUT="$(cat)"
+false
+echo "unreachable"
+CRASHEOF
+chmod +x "$CRASHER"
+
+_PASS_SNAPSHOT2=$PASS
+_FAIL_SNAPSHOT2=$FAIL
+
+expect_never_silent "[red-proof] plain Bash payload vs crashing mutant" "$CRASHER" "$(bash_payload "echo hi")"
+expect_never_silent "[red-proof] .env Read payload vs crashing mutant"  "$CRASHER" "$(read_payload .env)"
+expect_never_silent "[red-proof] hostile quotes payload vs crashing mutant" "$CRASHER" "$P_QUOTES"
+
+_RED_FAILS2=$((FAIL - _FAIL_SNAPSHOT2))
+_RED_TOTAL2=$((PASS - _PASS_SNAPSHOT2 + _RED_FAILS2))
+
+PASS=$_PASS_SNAPSHOT2
+FAIL=$_FAIL_SNAPSHOT2
+
+if [ "$_RED_TOTAL2" -gt 0 ] && [ "$_RED_FAILS2" -eq "$_RED_TOTAL2" ]; then
+  ok "falsifiability: all $_RED_TOTAL2 never-silent assertions correctly FAILED against a deliberately-crashing mutant"
+else
+  bad "falsifiability BROKEN: only $_RED_FAILS2/$_RED_TOTAL2 never-silent assertions failed against the crashing mutant -- may be vacuously true"
 fi
 
 echo "--------------------------------------------------------------------"
