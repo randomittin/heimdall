@@ -23,6 +23,21 @@
 # HERMETIC: every reality-check in this suite runs against fixture PIDs and a
 # sweep-pattern override this suite creates and tears down itself — never an
 # ambient real background process this suite does not control.
+#
+# PREMATURE_REPORT sections ([18]+) fixture bin/heimdall-agents' "sibling
+# live" signal directly rather than spawning a real Agent-tool subagent:
+# bin/heimdall-agents' own enumerate() falls back to a candidate .output
+# file's own mtime when no transcript/meta resolves, and an id that doesn't
+# match its "background bash task" shape is never excluded — so one fresh,
+# empty, regular (non-symlink) *.output file under a sandboxed
+# HMD_AGENT_TASKDIR is sufficient to enumerate as exactly one live subagent
+# (verified by reading bin/heimdall-agents' _collect_candidates/enumerate
+# directly, not assumed). HMD_AGENT_SUBAGENTS_DIR/HMD_AGENT_PROJECTS_DIR/
+# HMD_AGENT_REAPED_FILE are also pinned to sandbox paths so this never reads
+# or writes real ~/.heimdall or ~/.claude state. bin/heimdall-agents' own
+# correctness is test/heimdall-agents.test.sh's job, not this file's — this
+# suite only proves heimdall-claim-check reacts correctly to what
+# heimdall-agents reports.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,19 +54,23 @@ command -v jq >/dev/null 2>&1 || { echo "FATAL: jq required for this suite"; exi
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-claim-check-XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 
-# run_raw PAYLOAD_JSON — feeds PAYLOAD_JSON to the tool on stdin, captures
-# stdout/stderr to sandbox files. Exit code propagates to the caller via $?.
+# run_raw PAYLOAD_JSON [REPO] — feeds PAYLOAD_JSON to the tool on stdin,
+# captures stdout/stderr to sandbox files. REPO defaults to $ROOT (a real,
+# tool-bearing repo); tests that need to simulate a missing bin/ tool pass a
+# sandboxed REPO instead. Exit code propagates to the caller via $?.
 run_raw() {
-  printf '%s' "$1" > "$SANDBOX/stdin.json"
-  "$BIN" --repo "$ROOT" < "$SANDBOX/stdin.json" \
+  local payload="$1" repo="${2:-$ROOT}"
+  printf '%s' "$payload" > "$SANDBOX/stdin.json"
+  "$BIN" --repo "$repo" < "$SANDBOX/stdin.json" \
     >"$SANDBOX/stdout.log" 2>"$SANDBOX/stderr.log"
 }
 
-# run MESSAGE — wraps MESSAGE as {last_assistant_message: MESSAGE} and runs it.
+# run MESSAGE [REPO] — wraps MESSAGE as {last_assistant_message: MESSAGE} and
+# runs it. REPO forwards to run_raw (see above).
 run() {
-  local msg="$1" payload
+  local msg="$1" repo="${2:-$ROOT}" payload
   payload="$(jq -cn --arg m "$msg" '{session_id:"t", last_assistant_message:$m}')"
-  run_raw "$payload"
+  run_raw "$payload" "$repo"
 }
 
 stderr_has() { grep -qF -- "$1" "$SANDBOX/stderr.log" 2>/dev/null; }
@@ -248,6 +267,122 @@ if [ "$RC" -eq 0 ] && stderr_has "false process-status claim"; then
 else
   bad "expected exit 0 + stderr warning via transcript_path fallback; got exit=$RC stderr=$(cat "$SANDBOX/stderr.log")"
 fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# PREMATURE_REPORT — batched-agent-reporting detector (see header above for
+# the fixture rationale).
+# ─────────────────────────────────────────────────────────────────────────
+AGENTS_ENV_SANDBOX="$SANDBOX/agents-env"
+mkdir -p "$AGENTS_ENV_SANDBOX/empty-subagents" "$AGENTS_ENV_SANDBOX/empty-projects" "$AGENTS_ENV_SANDBOX/no-siblings-tasks"
+export HMD_AGENT_SUBAGENTS_DIR="$AGENTS_ENV_SANDBOX/empty-subagents"
+export HMD_AGENT_PROJECTS_DIR="$AGENTS_ENV_SANDBOX/empty-projects"
+export HMD_AGENT_REAPED_FILE="$AGENTS_ENV_SANDBOX/reaped.json"
+
+# mk_live_sibling_taskdir — builds a fresh taskdir containing one live-shaped
+# *.output fixture (see header note above) and prints its path.
+mk_live_sibling_taskdir() {
+  local d
+  d="$(mktemp -d "$AGENTS_ENV_SANDBOX/live-tasks-XXXXXX")"
+  : > "$d/afixturesibling00000000.output"
+  printf '%s' "$d"
+}
+
+LONG_REPORT="Agent alpha finished the parser rewrite, replacing three legacy functions with a cleaner recursive-descent implementation; all forty-two unit tests pass. Agent beta wrapped up the renderer overhaul: the new layout engine now handles deeply nested grids correctly, and the visual regression suite shows zero diffs against the baseline snapshots. Agent gamma completed the test-suite expansion, adding twelve new cases that cover the edge conditions flagged during planning. A fourth pass confirmed no lint warnings and no type errors across the affected packages. Every agent's changes are merged into the feature branch and the branch is ready for review."
+
+SHORT_HOLD="Two agents are still working; I'll post one summary once both finish."
+
+LONG_UNRELATED="The capital of France is Paris, which has served as the country's political center since the late tenth century. The city sits on the Seine river in the north of the country and is home to roughly two million residents within its administrative boundary, with several million more across the wider metropolitan area. Paris is known worldwide for landmarks such as the Eiffel Tower, the Louvre museum, and Notre-Dame cathedral, and it remains one of the most visited cities on the planet every single year."
+
+echo "[18] PREMATURE_REPORT: siblings live + substantial agent-synthesis report -> WARNS"
+LIVE_TASKDIR="$(mk_live_sibling_taskdir)"
+export HMD_AGENT_TASKDIR="$LIVE_TASKDIR"
+run "$LONG_REPORT"
+RC=$?
+unset HMD_AGENT_TASKDIR
+if [ "$RC" -eq 0 ] && stderr_has "PREMATURE_REPORT"; then
+  ok "substantial report while siblings are live produces a PREMATURE_REPORT warning and still exits 0"
+else
+  bad "expected exit 0 + PREMATURE_REPORT warning; got exit=$RC stderr=$(cat "$SANDBOX/stderr.log")"
+fi
+
+echo "[19] PREMATURE_REPORT: siblings live + short holding line -> SILENT"
+LIVE_TASKDIR="$(mk_live_sibling_taskdir)"
+export HMD_AGENT_TASKDIR="$LIVE_TASKDIR"
+run "$SHORT_HOLD"
+RC=$?
+unset HMD_AGENT_TASKDIR
+if [ "$RC" -eq 0 ] && [ ! -s "$SANDBOX/stderr.log" ]; then
+  ok "short holding line while siblings are live produces no warning"
+else
+  bad "expected silence; got exit=$RC stderr=$(cat "$SANDBOX/stderr.log")"
+fi
+
+echo "[20] PREMATURE_REPORT: no siblings live + substantial agent-synthesis report -> SILENT"
+export HMD_AGENT_TASKDIR="$AGENTS_ENV_SANDBOX/no-siblings-tasks"
+run "$LONG_REPORT"
+RC=$?
+unset HMD_AGENT_TASKDIR
+if [ "$RC" -eq 0 ] && [ ! -s "$SANDBOX/stderr.log" ]; then
+  ok "substantial report with no siblings live produces no warning"
+else
+  bad "expected silence; got exit=$RC stderr=$(cat "$SANDBOX/stderr.log")"
+fi
+
+echo "[21] PREMATURE_REPORT: plumbing failure (bin/heimdall-agents missing) -> SILENT, exit 0"
+FAKEREPO="$SANDBOX/fake-repo-no-agents-tool"
+mkdir -p "$FAKEREPO"
+LIVE_TASKDIR="$(mk_live_sibling_taskdir)"
+export HMD_AGENT_TASKDIR="$LIVE_TASKDIR"
+run "$LONG_REPORT" "$FAKEREPO"
+RC=$?
+unset HMD_AGENT_TASKDIR
+if [ "$RC" -eq 0 ] && [ ! -s "$SANDBOX/stderr.log" ]; then
+  ok "missing bin/heimdall-agents fails open: silent, exit 0"
+else
+  bad "expected silence; got exit=$RC stderr=$(cat "$SANDBOX/stderr.log")"
+fi
+
+echo "[22] PREMATURE_REPORT: siblings live + substantial but unrelated-topic message -> SILENT"
+LIVE_TASKDIR="$(mk_live_sibling_taskdir)"
+export HMD_AGENT_TASKDIR="$LIVE_TASKDIR"
+run "$LONG_UNRELATED"
+RC=$?
+unset HMD_AGENT_TASKDIR
+if [ "$RC" -eq 0 ] && [ ! -s "$SANDBOX/stderr.log" ]; then
+  ok "long unrelated answer with no agent vocabulary produces no warning even with siblings live"
+else
+  bad "expected silence; got exit=$RC stderr=$(cat "$SANDBOX/stderr.log")"
+fi
+
+echo "[23] PREMATURE_REPORT: HEIMDALL_CLAIM_CHECK_REPORT_MIN_CHARS override is respected"
+LIVE_TASKDIR="$(mk_live_sibling_taskdir)"
+export HMD_AGENT_TASKDIR="$LIVE_TASKDIR"
+export HEIMDALL_CLAIM_CHECK_REPORT_MIN_CHARS=50
+run "$SHORT_HOLD"
+RC=$?
+unset HMD_AGENT_TASKDIR
+unset HEIMDALL_CLAIM_CHECK_REPORT_MIN_CHARS
+if [ "$RC" -eq 0 ] && stderr_has "PREMATURE_REPORT"; then
+  ok "lowering the length threshold makes a shorter message warn -- the env override is wired"
+else
+  bad "expected exit 0 + PREMATURE_REPORT warning; got exit=$RC stderr=$(cat "$SANDBOX/stderr.log")"
+fi
+
+echo "[24] PREMATURE_REPORT: latency bound with a live-sibling fixture present"
+LIVE_TASKDIR="$(mk_live_sibling_taskdir)"
+export HMD_AGENT_TASKDIR="$LIVE_TASKDIR"
+START_S=$(date +%s)
+run "$LONG_REPORT"
+END_S=$(date +%s)
+unset HMD_AGENT_TASKDIR
+ELAPSED_S=$((END_S - START_S))
+if [ "$ELAPSED_S" -le 5 ]; then
+  ok "invocation with a live-sibling fixture completed in ${ELAPSED_S}s (<= 5s bound)"
+else
+  bad "invocation took ${ELAPSED_S}s, exceeding the 5s bound"
+fi
+
+unset HMD_AGENT_SUBAGENTS_DIR HMD_AGENT_PROJECTS_DIR HMD_AGENT_REAPED_FILE
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
