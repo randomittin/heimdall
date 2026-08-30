@@ -77,17 +77,40 @@
 # CAN do, PROVIDED it can find that worktree path. `stop-hook` resolves it
 # from `agent_transcript_path` (confirmed real and hook-visible today — see
 # bin/heimdall-metric-hook, the one other SubagentStop consumer that already
-# exists) by locating the "Working directory: <path>" line Claude Code
-# injects into every transcript's own environment block (the same block
-# visible at the top of THIS tool's own transcript, and required by JSON's
-# own grammar to appear as one escaped line, never a raw embedded newline).
-# This is a real, structurally-grounded signal, not a guess about transcript
-# content — but it has been verified here only against a synthetic fixture
-# built to that same structural shape (see the stop-hook section of
-# test/heimdall-agent-watchdog.test.sh), not against a byte-for-byte capture
-# of a real killed subagent's transcript file. That gap is reported here on
-# purpose rather than silently assumed closed. Never guesses: no marker
-# found -> no preserve attempt, exit 0, silent.
+# exists) by reading the top-level "cwd" field Claude Code stamps on every
+# turn record in a transcript file.
+#
+# THIS WAS VERIFIED AGAINST REAL DATA, NOT JUST A SYNTHETIC FIXTURE, AND THE
+# FIRST CUT WAS WRONG — recorded here rather than quietly fixed, because the
+# failure mode matters more than the fix: an earlier version of this
+# function grepped for a "Working directory: <path>" text line instead,
+# reasoning (correctly, as far as it went) that JSON's own grammar requires
+# that block to appear as one escaped line IF it is persisted at all. What
+# that reasoning never checked is whether it is persisted at all. Checked
+# directly against this repo's own real transcripts — the 31MB/16838-line
+# parent session file this tool's own conversation lives in, AND a genuinely
+# failed subagent's own transcript at
+# .claude/projects/*/<session>/subagents/agent-a02ab607fdcc38c40.jsonl (one
+# of the actually-interrupted agents this same tool exists to recover) — the
+# literal text "Working directory" appears ZERO times in either file: that
+# block is injected fresh into the model's context at request time and is
+# never written back to the persisted transcript. The structural top-level
+# "cwd" field, by contrast, was present on 63/63 lines of that real failed
+# agent's transcript, constant throughout, and exactly equal to that agent's
+# own worktree path — a verified fact, not an inference. A raw text grep for
+# `"cwd":"..."` across the whole byte stream is ALSO not enough on its own:
+# it matches unrelated per-tool-call cwd parameters on a Bash tool_use block
+# too (observed live in that same parent transcript: values like
+# "/private/tmp/..." from unrelated shell commands) — only reading `.cwd`
+# off each line's parsed top-level object, never a text scan of the raw
+# bytes, distinguishes the session's own cwd from that noise (same
+# structural-field-over-prose-regex discipline bin/heimdall-metric-hook's
+# own _kill_outcome already uses). Parsed with jq -R + fromjson wrapped in
+# try/catch per line, so one truncated trailing line — the exact shape a
+# mid-write kill leaves — cannot abort the whole read; takes the LAST valid
+# match, so a corrupt final line falls back to the latest good one instead
+# of failing. Never guesses: no cwd field found on any line -> no preserve
+# attempt, exit 0, silent.
 #
 # USAGE
 #   heimdall-agent-watchdog run  [--repo DIR] [--states s1,s2,...]
@@ -343,8 +366,8 @@ cmd_run() {
 # back to a live orchestrator (settled impossible — see
 # bin/heimdall-agent-resume's own header); this only ever runs a scoped
 # side-effecting command. Fails open, silently, on every branch: no
-# payload, no agent_transcript_path, no readable transcript, no "Working
-# directory: " marker, or a marker that does not resolve to a real git
+# payload, no agent_transcript_path, no readable transcript, no top-level
+# "cwd" field on any line, or a cwd that does not resolve to a real git
 # worktree all degrade to "do nothing", never a guess. ALWAYS exits 0.
 cmd_stop_hook() {
   local repo="$PWD"
@@ -367,14 +390,24 @@ cmd_stop_hook() {
   [ -n "$tpath" ] || return 0
   [ -f "$tpath" ] && [ -r "$tpath" ] || return 0
 
-  # The dying subagent's own transcript carries its own <env> block with a
-  # "Working directory: <path>" line — the same block visible at the top
-  # of every agent's own system prompt (this tool's own transcript
-  # included). The character class excludes backslash and double-quote so
-  # the match stops right where the JSON string's own escaped "\n" (or its
-  # closing quote) begins, rather than consuming the rest of the line.
+  # The dying subagent's own transcript stamps a top-level "cwd" field on
+  # every turn record — verified directly against a real, previously-failed
+  # subagent's transcript on this repo (63/63 lines, constant value, equal
+  # to that agent's own worktree path; see the header above for the full
+  # story of why an earlier "Working directory: <path>" text-marker version
+  # of this line was wrong). Read structurally (jq -R + fromjson per line,
+  # try/catch so one truncated trailing line — the exact shape a mid-write
+  # kill leaves — cannot abort the read; same idiom as
+  # bin/heimdall-metric-hook's own _kill_outcome), never a raw text grep
+  # across the bytes: a raw grep for `"cwd":"..."` also matches unrelated
+  # per-tool-call cwd parameters on a Bash tool_use block, not just the
+  # session's own. Takes the LAST valid match so a corrupt final line falls
+  # back to the latest good one instead of failing.
   local wt
-  wt="$(grep -m1 -o 'Working directory: [^\"]*' "$tpath" 2>/dev/null | sed -E 's/^Working directory: //; s/[[:space:]]+$//')"
+  wt="$(jq -R -r '
+      try ( (. | fromjson) as $r | select(($r|type)=="object") | ($r.cwd // empty) )
+      catch empty
+    ' "$tpath" 2>/dev/null | grep -v '^$' | tail -1)"
   [ -n "$wt" ] || return 0
 
   _wd_worktree_exists "$wt" || return 0
