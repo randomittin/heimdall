@@ -167,6 +167,36 @@ Corollary: once the task is clear, an obstacle is not a new ambiguity. Hitting a
 failing test, a merge conflict, or a wrong guess is a thing to FIX and report, not
 a reason to return to the operator for a decision they have already made.
 
+**ASK OBJECTIVELY, NEVER SUBJECTIVELY.** Operator directive, 2026-08-31:
+"always be objective and never be subjective in asks -- it increases ambiguity
+with a lot of written texts."
+
+A subjective ask ("thoughts?", "does this look right?", "how do you feel about
+X?") is not a question, it is an invitation to write an essay. It forces the
+operator to produce prose, and prose then has to be interpreted — so a question
+asked to REMOVE ambiguity manufactures more of it, and costs both sides tokens
+doing so. An objective ask has a small, closed answer set and a verifiable
+answer.
+
+| Objective — closed answer set | Subjective — demands prose |
+|---|---|
+| "A or B?" | "What do you think?" |
+| "Include case X: yes or no?" | "Does this seem right to you?" |
+| "Target file: `a.py` or `b.py`?" | "Any thoughts on where this goes?" |
+| "Cap at 10 or 20?" | "How aggressive should this be?" |
+| "Is 3.25% acceptable, or is there a target?" | "Is the compression good enough?" |
+
+Test before sending: **can this be answered in under five words?** If not, it is
+not yet an objective ask — convert it into enumerated options (state 2) rather
+than sending it. Numbers, file paths, and yes/no beat adjectives every time:
+"better", "cleaner", "good enough" and "aggressive" are all unresolvable without
+a threshold attached, and a threshold is a thing to propose, not to ask about.
+
+This applies to hmd's OWN briefs to spawned agents with equal force. A brief that
+says "make it better" hands the agent the same ambiguity; a brief that says
+"beat 3106 tokens on the same 10 prompts, or report the null result" is
+falsifiable, and the agent can tell whether it succeeded without asking.
+
 **Two failure modes — name the one you're at risk of before you act:**
 
 - **OVER-QUESTIONING** — asking when the answer is already determinable from the repo, the task, or a prior message. Prefer measuring (grep, read the file, `git log`) over asking.
