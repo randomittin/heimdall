@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+# heimdall-caveman-eval -- real, honest, three-arm token-compression eval for
+# hmd's own caveman levels (lite/full/ultra). Measures whether the RULES
+# THEMSELVES, read by a real model, cut real output tokens vs a generic
+# terse instruction -- never vs raw baseline, and never on hand-written
+# examples.
+#
+# ADAPTED FROM (MIT, attributed): github.com/juliusbrussee/caveman
+# (c) 2026 Julius Brussee -- evals/measure.py + evals/llm_run.py. Preserved
+# from upstream: the three-arm design (__baseline__ no system prompt /
+# __terse__ "Answer concisely." control / one arm per compression level);
+# the core insight that the HONEST delta is level-vs-__terse__, never
+# level-vs-__baseline__ -- comparing to raw baseline inflates the number by
+# crediting the level with savings that are really just "any terse
+# instruction at all". Upstream's own measure.py computes and reports the
+# terse-vs-baseline number separately for exactly this reason; this file
+# does the same (see terse_vs_baseline_pct below). Also preserved: real LLM
+# output as the only source of measured text (hand-written fixtures would
+# make the eval circular and prove nothing); a snapshot committed to git so
+# the default read path is free and deterministic; reporting a full
+# distribution (median/mean/min/max/stdev via stdlib `statistics`), not one
+# headline number.
+#
+# What is DIFFERENT from upstream, and why:
+#   - Arms are hmd's own levels (lite/full/ultra), sourced live from
+#     `bin/heimdall-caveman rules <level>` -- the SAME text a real session's
+#     SessionStart hook actually injects. This repo's own CLAUDE.md
+#     (2026-08-30, "Token Efficiency") documents that level ownership now
+#     lives in hmd itself, not the external plugin, and that the plugin has
+#     been observed silently resetting its own flag -- so hmd's own `rules`
+#     output is the only source that is both live and stable. A level arm's
+#     system prompt is that output UNMODIFIED (not prefixed with
+#     TERSE_PREFIX the way upstream composes terse+SKILL.md): hmd's rules
+#     text already instructs terseness directly, so re-prefixing it would
+#     be redundant and less faithful to what a real session actually sees.
+#   - Token counts are Claude's OWN exact `usage.output_tokens` from
+#     `claude -p --output-format json` (schema per bin/heimdall:3707-3711
+#     and bin/heimdall-tokens' parse_json_blob), not a tiktoken/o200k_base
+#     approximation. Exact beats approximate when the model under test IS
+#     Claude, and this avoids a new external Python dependency this repo
+#     does not otherwise vendor.
+#   - The expensive step is opt-in and cost-gated: `refresh` refuses to
+#     spend without --confirm-spend (mirrors bin/heimdall-s6-sweep's
+#     --confirm-full posture: safe by default, loud about cost before it
+#     runs); `--dry-run` prints the exact call count and spends nothing.
+#   - No model is ever hardcoded as a default (CLAUDE.md model-routing
+#     directive, 2026-08-11): --model / HEIMDALL_CAVEMAN_EVAL_MODEL are the
+#     only ways to pick one; unset means "whatever `claude` itself defaults
+#     to", never a pinned id written here.
+#
+# HONESTY, non-negotiable: this file must never fabricate a snapshot and
+# must never print a savings figure when no real snapshot exists. `report`
+# on a missing snapshot says exactly that -- "no measurement yet" -- and
+# exits 0 (an honest empty state is not a failure, and is never rendered as
+# a zero). See test/heimdall-caveman-eval.test.sh for the red-proof.
+#
+# Usage:
+#   heimdall-caveman-eval [report] [--json] [--snapshot <path>]
+#   heimdall-caveman-eval refresh --confirm-spend [--model M] [--prompts P] [--snapshot S]
+#   heimdall-caveman-eval refresh --dry-run [--prompts P]
+#   heimdall-caveman-eval -h | --help
+
+import datetime
+import json
+import os
+import statistics
+import subprocess
+import sys
+import tempfile
+
+LEVELS = ("lite", "full", "ultra")
+TERSE_PREFIX = "Answer concisely."
+MODEL_ENV = "HEIMDALL_CAVEMAN_EVAL_MODEL"
+ARM_ORDER = ("__baseline__", "__terse__") + LEVELS
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_HERE)
+CAVEMAN_BIN = os.path.join(_HERE, "heimdall-caveman")
+DEFAULT_PROMPTS = os.path.join(_REPO_ROOT, "evals", "caveman", "prompts.txt")
+DEFAULT_SNAPSHOT = os.path.join(_REPO_ROOT, "evals", "caveman", "snapshot.json")
+
+USAGE = """Usage: heimdall-caveman-eval [report] [--json] [--snapshot <path>]
+       heimdall-caveman-eval refresh --confirm-spend [--model <alias>] [--prompts <path>] [--snapshot <path>]
+       heimdall-caveman-eval refresh --dry-run [--prompts <path>]
+       heimdall-caveman-eval -h | --help
+
+report (default)  Read the committed snapshot and print the measured delta.
+                   Free, deterministic, no network/CLI calls. --json for
+                   machine consumption.
+refresh            Regenerate the snapshot by running every (prompt, arm)
+                   pair through a REAL `claude -p` call. Costs real quota.
+                   Requires --confirm-spend; --dry-run shows the call-count
+                   estimate without spending anything or touching the
+                   snapshot.
+
+Arms: __baseline__ (no system prompt), __terse__ ("Answer concisely."),
+      lite / full / ultra (`heimdall-caveman rules <level>`, unmodified).
+The honest delta for a level is ALWAYS level vs __terse__, never vs
+__baseline__ -- see the file header for why."""
+
+
+def eprint(*a, **kw):
+    kw["file"] = sys.stderr
+    print(*a, **kw)
+
+
+def _stats(vals):
+    med = statistics.median(vals)
+    mean = statistics.mean(vals)
+    lo = min(vals)
+    hi = max(vals)
+    sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
+    return med, mean, lo, hi, sd
+
+
+def _fmt_pct(x):
+    sign = "+" if x >= 0 else "−"
+    return "%s%.0f%%" % (sign, abs(x) * 100)
+
+
+def _silent_unlink(path):
+    """Best-effort delete of a leftover temp file; never raises. Mirrors
+    bin/heimdall-caveman-compliance's own _silent_unlink."""
+    try:
+        os.unlink(path)
+    except OSError:
+        return
+
+
+def read_prompts(path):
+    out = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for ln in fh:
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            out.append(s)
+    return out
+
+
+def claude_version():
+    try:
+        out = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, check=True
+        )
+        return out.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def resolve_system_prompt(level):
+    """Real hmd rules text for a level, unmodified -- the same text a real
+    session's SessionStart hook injects. Read-only: calling
+    `heimdall-caveman rules <level>` WITH an explicit level bypasses the
+    get/migration path and only prints static rule text plus a read-only
+    last-measurement trailer."""
+    if not os.path.isfile(CAVEMAN_BIN) or not os.access(CAVEMAN_BIN, os.X_OK):
+        raise RuntimeError("sibling tool not found or not executable: %s" % CAVEMAN_BIN)
+    out = subprocess.run([CAVEMAN_BIN, "rules", level], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(
+            "`heimdall-caveman rules %s` failed (rc=%d): %s"
+            % (level, out.returncode, out.stderr.strip())
+        )
+    return out.stdout
+
+
+def run_claude(prompt, system, model):
+    cmd = ["claude", "-p", "--output-format", "json"]
+    if system is not None:
+        cmd += ["--system-prompt", system]
+    if model:
+        cmd += ["--model", model]
+    cmd.append(prompt)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        raise RuntimeError("`claude` CLI not runnable -- required for refresh: %s" % e)
+    if out.returncode != 0:
+        raise RuntimeError(
+            "claude call failed (rc=%d): %s" % (out.returncode, out.stderr.strip()[:500])
+        )
+    try:
+        obj = json.loads(out.stdout)
+    except (ValueError, TypeError) as e:
+        raise RuntimeError("claude did not return valid JSON: %s: %r" % (e, out.stdout[:200]))
+    usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+    out_tok = usage.get("output_tokens")
+    if not isinstance(out_tok, int):
+        raise RuntimeError("claude json blob missing integer usage.output_tokens: %r" % (obj,))
+    return {
+        "text": obj.get("result", ""),
+        "output_tokens": out_tok,
+        "cost_usd": obj.get("total_cost_usd"),
+    }
+
+
+def build_snapshot(prompts, model):
+    snapshot = {
+        "metadata": {
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "claude_cli_version": claude_version(),
+            "model": model or "default",
+            "n_prompts": len(prompts),
+            "terse_prefix": TERSE_PREFIX,
+            "tool": "heimdall-caveman-eval",
+        },
+        "prompts": prompts,
+        "arms": {},
+    }
+    for arm in ARM_ORDER:
+        if arm == "__baseline__":
+            system = None
+        elif arm == "__terse__":
+            system = TERSE_PREFIX
+        else:
+            system = resolve_system_prompt(arm)
+        eprint("  %s (%d prompts)..." % (arm, len(prompts)))
+        snapshot["arms"][arm] = [run_claude(p, system, model) for p in prompts]
+    return snapshot
+
+
+def atomic_write_json(path, obj):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".heimdall-caveman-eval.tmp.", dir=d)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        _silent_unlink(tmp)
+        raise
+
+
+def cmd_refresh(argv):
+    confirm = False
+    dry_run = False
+    prompts_path = DEFAULT_PROMPTS
+    snap_path = DEFAULT_SNAPSHOT
+    model = os.environ.get(MODEL_ENV)
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--confirm-spend":
+            confirm = True
+        elif a == "--dry-run":
+            dry_run = True
+        elif a == "--prompts" and i + 1 < len(argv):
+            i += 1
+            prompts_path = argv[i]
+        elif a == "--snapshot" and i + 1 < len(argv):
+            i += 1
+            snap_path = argv[i]
+        elif a == "--model" and i + 1 < len(argv):
+            i += 1
+            model = argv[i]
+        elif a in ("-h", "--help"):
+            print(USAGE)
+            return 0
+        else:
+            eprint("error: unknown refresh argument: %s" % a)
+            eprint(USAGE)
+            return 2
+        i += 1
+
+    if not os.path.isfile(prompts_path):
+        eprint("error: prompts file not found: %s" % prompts_path)
+        return 2
+    prompts = read_prompts(prompts_path)
+    if not prompts:
+        eprint("error: prompts file is empty: %s" % prompts_path)
+        return 2
+
+    n_arms = len(ARM_ORDER)
+    total_calls = len(prompts) * n_arms
+    plan = "plan: %d prompts x %d arms (%s) = %d real `claude -p` calls" % (
+        len(prompts),
+        n_arms,
+        ", ".join(ARM_ORDER),
+        total_calls,
+    )
+    cost_note = (
+        "each call spends real quota on whatever model runs "
+        "(--model / %s controls it; unset uses claude's own default)." % MODEL_ENV
+    )
+
+    if dry_run:
+        print(plan)
+        print(cost_note)
+        print("dry run only -- no `claude` calls were made.")
+        return 0
+
+    if not confirm:
+        eprint(plan)
+        eprint(cost_note)
+        eprint("refusing to spend without --confirm-spend. Add it to proceed, or pass")
+        eprint("--dry-run to just see this estimate.")
+        return 2
+
+    eprint(plan)
+    try:
+        snapshot = build_snapshot(prompts, model)
+    except RuntimeError as e:
+        eprint("error: refresh aborted, existing snapshot left untouched: %s" % e)
+        return 1
+
+    atomic_write_json(snap_path, snapshot)
+    print("wrote %s (%d calls made)" % (snap_path, total_calls))
+    return 0
+
+
+def compute_report(data):
+    arms = data.get("arms") if isinstance(data, dict) else None
+    if not isinstance(arms, dict):
+        return {"error": "snapshot has no 'arms' object"}
+    if "__baseline__" not in arms or "__terse__" not in arms:
+        return {"error": "snapshot missing required control arm(s) __baseline__/__terse__"}
+    try:
+        baseline_tokens = [int(e["output_tokens"]) for e in arms["__baseline__"]]
+        terse_tokens = [int(e["output_tokens"]) for e in arms["__terse__"]]
+    except (KeyError, TypeError, ValueError) as e:
+        return {"error": "malformed control-arm entries: %s" % e}
+
+    baseline_total = sum(baseline_tokens)
+    terse_total = sum(terse_tokens)
+
+    levels_out = []
+    for level in LEVELS:
+        if level not in arms:
+            continue
+        try:
+            level_tokens = [int(e["output_tokens"]) for e in arms[level]]
+        except (KeyError, TypeError, ValueError) as e:
+            return {"error": "malformed '%s' arm entries: %s" % (level, e)}
+        savings = [1 - (s / t) if t else 0.0 for s, t in zip(level_tokens, terse_tokens)]
+        if not savings:
+            continue
+        med, mean, lo, hi, sd = _stats(savings)
+        levels_out.append(
+            {
+                "level": level,
+                "median": med,
+                "mean": mean,
+                "min": lo,
+                "max": hi,
+                "stdev": sd,
+                "tokens": sum(level_tokens),
+                "terse_tokens": terse_total,
+            }
+        )
+
+    return {
+        "metadata": data.get("metadata") if isinstance(data.get("metadata"), dict) else {},
+        "baseline_tokens_total": baseline_total,
+        "terse_tokens_total": terse_total,
+        "terse_vs_baseline_pct": (1 - terse_total / baseline_total) if baseline_total else None,
+        "levels": levels_out,
+    }
+
+
+def _print_human(rep, snap_path):
+    if "error" in rep:
+        print("NOT_VERIFIED (%s)" % rep["error"])
+        return
+    meta = rep.get("metadata", {})
+    print("snapshot                  : %s" % snap_path)
+    print("generated_at              : %s" % meta.get("generated_at", "?"))
+    print("model / cli               : %s / %s" % (meta.get("model", "?"), meta.get("claude_cli_version", "?")))
+    print("n_prompts                 : %s" % meta.get("n_prompts", "?"))
+    print()
+    print("Reference arms (no caveman level):")
+    print("  baseline (no system prompt)        : %d tokens total" % rep["baseline_tokens_total"])
+    tvb = rep["terse_vs_baseline_pct"]
+    tvb_s = _fmt_pct(tvb) if tvb is not None else "n/a"
+    print(
+        "  terse control (\"Answer concisely.\") : %d tokens total (%s vs baseline)"
+        % (rep["terse_tokens_total"], tvb_s)
+    )
+    print()
+    if not rep["levels"]:
+        print("no hmd caveman level arms present in this snapshot.")
+        return
+    print("hmd levels, measured as additional reduction ON TOP OF the terse control")
+    print("(never vs baseline directly -- see file header for why):")
+    print()
+    print("%-8s%8s%8s%8s%8s%8s   tokens (level/terse)" % ("level", "median", "mean", "min", "max", "stdev"))
+    for row in sorted(rep["levels"], key=lambda r: -r["median"]):
+        print(
+            "%-8s%8s%8s%8s%8s%7.0f%%   %d / %d"
+            % (
+                row["level"],
+                _fmt_pct(row["median"]),
+                _fmt_pct(row["mean"]),
+                _fmt_pct(row["min"]),
+                _fmt_pct(row["max"]),
+                row["stdev"] * 100,
+                row["tokens"],
+                row["terse_tokens"],
+            )
+        )
+
+
+def cmd_report(argv):
+    json_out = False
+    snap_path = DEFAULT_SNAPSHOT
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            json_out = True
+        elif a == "--snapshot" and i + 1 < len(argv):
+            i += 1
+            snap_path = argv[i]
+        elif a in ("-h", "--help"):
+            print(USAGE)
+            return 0
+        else:
+            eprint("error: unknown report argument: %s" % a)
+            eprint(USAGE)
+            return 2
+        i += 1
+
+    if not os.path.isfile(snap_path):
+        msg = "no measurement yet -- run `heimdall-caveman-eval refresh --confirm-spend` (no snapshot at %s)" % snap_path
+        if json_out:
+            print(json.dumps({"error": msg, "snapshot": snap_path}))
+        else:
+            print(msg)
+        return 0
+
+    try:
+        with open(snap_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        msg = "could not read snapshot %s: %s" % (snap_path, e)
+        if json_out:
+            print(json.dumps({"error": msg, "snapshot": snap_path}))
+        else:
+            print(msg)
+        return 0
+
+    rep = compute_report(data)
+    if json_out:
+        print(json.dumps(rep))
+    else:
+        _print_human(rep, snap_path)
+    return 0 if "error" not in rep else 1
+
+
+def main(argv):
+    if not argv:
+        return cmd_report([])
+    if argv[0] == "refresh":
+        return cmd_refresh(argv[1:])
+    if argv[0] == "report":
+        return cmd_report(argv[1:])
+    if argv[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0
+    return cmd_report(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
