@@ -190,7 +190,7 @@ echo "$OUT_C" | grep -q "All quality gates pass" \
 
 echo "-- D. stale receipt: head_sha != current HEAD ------------------------------------"
 HOME_D="$WORK/home-d"; mkdir -p "$HOME_D"
-write_receipt "$HOME_D" "$RG" "0000000000000000000000000000000000000000" true 0
+write_receipt "$HOME_D" "$RG_CANON" "0000000000000000000000000000000000000000" true 0
 OUT_D="$(gate_run "$RG" "$HOME_D" 2>&1)"; RC_D=$?
 [ "$RC_D" = 2 ] && ok "D1 stale sha => exit 2" || bad "D1 expected exit 2, got $RC_D" "$OUT_D"
 echo "$OUT_D" | grep -qi "STALE" \
@@ -199,7 +199,7 @@ echo "$OUT_D" | grep -qi "STALE" \
 
 echo "-- E. receipt recorded a dirty tree ----------------------------------------------"
 HOME_E="$WORK/home-e"; mkdir -p "$HOME_E"
-write_receipt "$HOME_E" "$RG" "$RG_SHA" false 0
+write_receipt "$HOME_E" "$RG_CANON" "$RG_SHA" false 0
 OUT_E="$(gate_run "$RG" "$HOME_E" 2>&1)"; RC_E=$?
 [ "$RC_E" = 2 ] && ok "E1 dirty-tree receipt => exit 2" || bad "E1 expected exit 2, got $RC_E" "$OUT_E"
 echo "$OUT_E" | grep -qi "DIRTY" \
@@ -207,7 +207,7 @@ echo "$OUT_E" | grep -qi "DIRTY" \
 
 echo "-- F. receipt recorded a nonzero exit code ----------------------------------------"
 HOME_F="$WORK/home-f"; mkdir -p "$HOME_F"
-write_receipt "$HOME_F" "$RG" "$RG_SHA" true 1
+write_receipt "$HOME_F" "$RG_CANON" "$RG_SHA" true 1
 OUT_F="$(gate_run "$RG" "$HOME_F" 2>&1)"; RC_F=$?
 [ "$RC_F" = 2 ] && ok "F1 nonzero-exit receipt => exit 2" || bad "F1 expected exit 2, got $RC_F" "$OUT_F"
 echo "$OUT_F" | grep -qi "FAILING run" \
@@ -247,14 +247,14 @@ OUT_I="$( (cd "$RI" && HEIMDALL_HOME="$WORK/home-i-unused" "$STATE_BIN" check-qu
 # ══════════════════════════════════════════════════════════════════════════════
 echo "-- J. delivery-audit reports the sweep-gate verdict but never gates on it --------"
 HOME_J1="$WORK/home-j1"; mkdir -p "$HOME_J1"
-write_receipt "$HOME_J1" "$RG" "$RG_SHA" true 0
+write_receipt "$HOME_J1" "$RG_CANON" "$RG_SHA" true 0
 OUT_J1="$(HMD_DELIVERY_AUDIT_ROOT="$RG" HEIMDALL_HOME="$HOME_J1" "$AUDIT_BIN" 2>&1)"; RC_J1=$?
 echo "$OUT_J1" | grep -q "SWEEP-GATE verdict.*WOULD-PASS" \
   && ok "J1 delivery-audit reports WOULD-PASS for a fresh matching receipt" \
   || bad "J1 no WOULD-PASS verdict line found" "$OUT_J1"
 
 HOME_J2="$WORK/home-j2"; mkdir -p "$HOME_J2"
-write_receipt "$HOME_J2" "$RG" "0000000000000000000000000000000000000000" true 0
+write_receipt "$HOME_J2" "$RG_CANON" "0000000000000000000000000000000000000000" true 0
 OUT_J2="$(HMD_DELIVERY_AUDIT_ROOT="$RG" HEIMDALL_HOME="$HOME_J2" "$AUDIT_BIN" 2>&1)"; RC_J2=$?
 echo "$OUT_J2" | grep -q "SWEEP-GATE verdict.*WOULD-BLOCK" \
   && ok "J2 delivery-audit reports WOULD-BLOCK for a stale receipt" \
