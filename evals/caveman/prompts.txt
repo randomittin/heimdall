@@ -1,0 +1,17 @@
+# evals/caveman/prompts.txt -- real dev questions used by heimdall-caveman-eval
+# to generate its snapshot. Reused VERBATIM (MIT) from
+# github.com/juliusbrussee/caveman's evals/prompts/en.txt (c) 2026 Julius
+# Brussee -- the same fixed prompt set upstream measures against, so a
+# result here is comparable in spirit to upstream's own numbers. Lines
+# starting with '#' and blank lines are ignored by read_prompts() in
+# bin/heimdall-caveman-eval.
+Why does my React component re-render every time the parent updates?
+Explain database connection pooling.
+What's the difference between TCP and UDP?
+How do I fix a memory leak in a long-running Node.js process?
+What does the SQL EXPLAIN command tell me?
+How does a hash table handle collisions?
+Why am I getting CORS errors in my browser console?
+What's the point of using a debouncer on a search input?
+How does git rebase differ from git merge?
+When should I use a queue vs a topic in messaging systems?
