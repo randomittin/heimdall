@@ -2405,6 +2405,26 @@ case "${1:-}" in
     if [ -x "$_cav" ]; then exec "$_cav" "$@"; fi
     echo "error: heimdall-caveman-compliance not found at $_cav" >&2; exit 2
     ;;
+  metric-audit)
+    # READ-BACK for orchestrator metric self-reporting -- the caveman-audit arm's
+    # sibling. hooks/heimdall-metric-reminder.sh (Stop hook) can only ever ASK the
+    # orchestrator to call heimdall-metric; a hook cannot force a model to invoke a
+    # CLI, and measured against this repo's own .planning/metrics.jsonl it cannot
+    # even attribute a record to a specific session -- heimdall-metric's `session`
+    # field comes from CLAUDE_SESSION_ID/SESSION_ID, and neither is ever exported
+    # anywhere in this harness, so every real row carries the literal string
+    # "default". This subcommand is the missing read-back: given a session
+    # transcript, it counts distinct TodoWrite items the orchestrator itself marked
+    # "completed" against orchestrator-sourced heimdall-metric rows correlated by
+    # the transcript's own timestamp window (the `session` field cannot be used --
+    # see above), and reports the gap as a measured number. AUDIT ONLY, never a
+    # gate -- see bin/heimdall-metric-compliance's own header for the full method,
+    # its --all repo-wide mode, and its honestly-documented correlation limits.
+    shift
+    _mca="$(cd "$(dirname "$0")" && pwd)/heimdall-metric-compliance"
+    if [ -x "$_mca" ]; then exec "$_mca" "$@"; fi
+    echo "error: heimdall-metric-compliance not found at $_mca" >&2; exit 2
+    ;;
   status)
     # Pass-through to heimdall-statusline: the CLI-agnostic HUD renderer shared
     # with Claude Code's registered hooks/statusline.sh (now a thin `exec` wrapper
