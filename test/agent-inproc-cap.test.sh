@@ -96,12 +96,18 @@ else
 fi
 
 # -- fakebins for fail-open proofs --------------------------------------
+# Each fakebin must carry EVERY tool the hook touches on this payload's path
+# (dirname/readlink at the top unconditionally, wc/tr in the brief-adoption
+# gate's word-count check once jq is present) EXCEPT the one tool under
+# test -- otherwise an incidental extra absence (e.g. wc missing) produces
+# an unrelated exit 127 that looks like a fail-open regression but is
+# actually just an incomplete fakebin.
 FAKEBIN_NOJQ="$SANDBOX/bin-nojq"
-make_fakebin "$FAKEBIN_NOJQ" bash date mkdir cat rm perl mktemp grep sed
+make_fakebin "$FAKEBIN_NOJQ" bash date dirname readlink mkdir cat rm perl mktemp wc tr grep sed
 FAKEBIN_NODATE="$SANDBOX/bin-nodate"
-make_fakebin "$FAKEBIN_NODATE" bash jq mkdir cat rm perl mktemp grep sed
+make_fakebin "$FAKEBIN_NODATE" bash jq dirname readlink mkdir cat rm perl mktemp wc tr grep sed
 FAKEBIN_SLOW="$SANDBOX/bin-slowdate"
-make_fakebin "$FAKEBIN_SLOW" bash jq mkdir cat rm perl mktemp grep sed
+make_fakebin "$FAKEBIN_SLOW" bash jq dirname readlink mkdir cat rm perl mktemp wc tr grep sed sleep
 cat > "$FAKEBIN_SLOW/date" <<'EOF'
 #!/bin/sh
 sleep 10
@@ -151,10 +157,17 @@ grep -q '"error"' "$OUT" && ok "deny emits a JSON object with .error on stdout" 
 jq -e '.error' <"$OUT" >/dev/null 2>&1 && ok "deny stdout parses cleanly as JSON" || bad "deny stdout failed jq -e '.error': $(cat "$OUT")"
 grep -q 'in-process agent concurrency cap' "$ERR" && ok "stderr names the cap explicitly" || bad "stderr missing cap name: $(cat "$ERR")"
 grep -q '2/2' "$ERR" && ok "stderr reports the exact count/max (2/2)" || bad "stderr missing count/max: $(cat "$ERR")"
-if grep -q 'agent-pool' "$ERR"; then
-  bad "deny message wrongly mentions agent-pool"
+# The deny message is SUPPOSED to name agent-pool by name -- that is how it
+# explains its independence to a human reader (see the hook's own header
+# comment). What must never happen is the message claiming to touch the
+# concrete shared ledger file itself.
+grep -q 'agent-pool' "$ERR" \
+  && ok "deny message names agent-pool by name (explains independence to the caller, not silent about the relationship)" \
+  || bad "deny message never explains its relationship to agent-pool: $(cat "$ERR")"
+if grep -q 'agent-pool\.json' "$ERR"; then
+  bad "deny message wrongly references agent-pool.json (the shared ledger this cap must never touch)"
 else
-  ok "deny message never mentions agent-pool (independence visible to the caller too)"
+  ok "deny message never references the concrete agent-pool.json shared ledger file"
 fi
 count_after_deny=$(ls -1 "$home/.heimdall/inproc-agent-leases" 2>/dev/null | wc -l | tr -d ' ')
 [ "$count_after_deny" -eq 2 ] \
@@ -235,6 +248,9 @@ elapsed=$(( end_ts - start_ts ))
 [ "$elapsed" -lt 8 ] \
   && ok "fail-open: alarm bounded wall-clock to ${elapsed}s (fake date sleeps 10s -- an unbounded hang would take >=10s)" \
   || bad "fail-open timeout -> took ${elapsed}s, alarm did not bound it"
+[ "$elapsed" -ge 2 ] \
+  && ok "fail-open: timeout took >=2s, proving the fake date's sleep 10 actually ran and the alarm (not an unrelated fast-fail) is what bounded it" \
+  || bad "fail-open timeout -> took only ${elapsed}s, too fast to have engaged the real sleep 10 -- this would be a vacuous pass, not a real timeout proof"
 
 # -- RED-PROOF: neutralize the cap's exit 2, confirm it was load-bearing -
 MUTANT="$SANDBOX/mutant-noop-cap"
