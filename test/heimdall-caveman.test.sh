@@ -209,7 +209,7 @@ case "$ultra_out" in
   *) bad "ultra rule text does not state the shortest-correct-answer objective: $ultra_out" ;;
 esac
 case "$ultra_out" in
-  *"a flat list or plain fragments only, never a sectioned doc"*) ok "ultra rule text bans headers in answers" ;;
+  *"flat fragments only, never a sectioned doc"*) ok "ultra rule text bans headers in answers" ;;
   *) bad "ultra rule text does not ban headers in answers: $ultra_out" ;;
 esac
 case "$ultra_out" in
@@ -231,6 +231,28 @@ esac
 case "$ultra_out" in
   *"Diff CI log vs local run first"*) ok "ultra rule text has the new CI-failure worked example" ;;
   *) bad "ultra rule text missing the new CI-failure worked example: $ultra_out" ;;
+esac
+
+# 2026-09-02 ultra consolidation (docs/analysis/2026-09-02-caveman-ultra-
+# consolidation.md): trims constraint count after the fix above measured a
+# cost (tokens-per-visible-word rose while median tokens improved) -- pin
+# every removal/merge so a future edit can't silently reintroduce the
+# duplication or drop the consolidation, same discipline as the pins above.
+case "$ultra_out" in
+  *"## This level"*) bad "ultra rule text still has the vestigial duplicate This-level section (deleted 2026-09-02, restated Abbreviate/arrows/one-word facts already said once above)" ;;
+  *) ok "ultra rule text dropped the vestigial duplicate This-level section" ;;
+esac
+case "$ultra_out" in
+  *"Compress form, never substance"*) ok "ultra rule text consolidates technical-terms/code/errors exactness into one form-vs-substance clause" ;;
+  *) bad "ultra rule text missing the form-vs-substance consolidation clause: $ultra_out" ;;
+esac
+case "$ultra_out" in
+  *'"stop caveman" or "normal mode": revert.'*) bad "ultra rule text still restates the Persistence exit trigger in Boundaries (redundant -- Persistence already states it once)" ;;
+  *) ok "ultra rule text dropped the redundant Boundaries restatement of the exit trigger" ;;
+esac
+case "$ultra_out" in
+  *'"Why React component re-render?" → "Inline obj prop'*) ok "ultra rule text uses one-line arrow-joined example format, not a separate 'ultra:' labeled line" ;;
+  *) bad "ultra rule text missing the one-line arrow-joined example format: $ultra_out" ;;
 esac
 
 # ── rules with no argument uses the CURRENT level (via get) ──
