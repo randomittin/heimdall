@@ -129,6 +129,25 @@ case "$ultra_out" in
   *) bad "ultra rule text does not mention abbreviation" ;;
 esac
 
+# 2026-09-01 fix: n=30 real-eval text diffing (evals/caveman/) found hmd's
+# actual token-spend mechanism vs upstream_skill was volunteering content
+# nobody asked for (extra examples, product names, failure-mode asides, code
+# samples) -- not phrasing. Each level got a scope-discipline sentence for
+# this; pin it so a future edit can't silently drop the fix this suite exists
+# to protect.
+case "$lite_out" in
+  *"skip extra examples, product names, failure-mode asides, or code samples the question did not request"*) ok "lite rule text forbids volunteering unrequested extras" ;;
+  *) bad "lite rule text does not forbid volunteering unrequested extras: $lite_out" ;;
+esac
+case "$full_out" in
+  *"skip extra examples, product names, failure-mode asides, or code samples not requested"*) ok "full rule text forbids volunteering unrequested extras" ;;
+  *) bad "full rule text does not forbid volunteering unrequested extras: $full_out" ;;
+esac
+case "$ultra_out" in
+  *"skip unrequested examples/names/failure-mode asides/code samples"*) ok "ultra rule text forbids volunteering unrequested extras" ;;
+  *) bad "ultra rule text does not forbid volunteering unrequested extras: $ultra_out" ;;
+esac
+
 # ── rules with no argument uses the CURRENT level (via get) ──
 D="$(fresh)"
 run "$D" set ultra >/dev/null 2>&1

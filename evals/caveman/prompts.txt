@@ -1,10 +1,20 @@
 # evals/caveman/prompts.txt -- real dev questions used by heimdall-caveman-eval
-# to generate its snapshot. Reused VERBATIM (MIT) from
+# to generate its snapshot.
+#
+# Lines 1-10 below the header are reused VERBATIM (MIT) from
 # github.com/juliusbrussee/caveman's evals/prompts/en.txt (c) 2026 Julius
-# Brussee -- the same fixed prompt set upstream measures against, so a
-# result here is comparable in spirit to upstream's own numbers. Lines
-# starting with '#' and blank lines are ignored by read_prompts() in
-# bin/heimdall-caveman-eval.
+# Brussee -- the same fixed prompt set upstream measures against, so a result
+# on just those ten stays comparable in spirit to upstream's own numbers.
+#
+# Lines 11-30 are hmd's own additions (2026-08-31), NOT from upstream's set.
+# docs/analysis/2026-08-30-caveman-eval-measurement.md found n=10 carries a
+# 20-46% stdev -- too noisy to tell a real rule-text effect from run-to-run
+# luck (the doc's own standing conclusion: enlarge the corpus before trying
+# a third hypothesis). This grows it to 30, same style and same four shapes
+# as the original ten (short factual / debugging / explain-a-concept /
+# multi-step), so a later rule change can be judged against a real signal
+# instead of noise. Lines starting with '#' and blank lines are ignored by
+# read_prompts() in bin/heimdall-caveman-eval.
 Why does my React component re-render every time the parent updates?
 Explain database connection pooling.
 What's the difference between TCP and UDP?
@@ -15,3 +25,23 @@ Why am I getting CORS errors in my browser console?
 What's the point of using a debouncer on a search input?
 How does git rebase differ from git merge?
 When should I use a queue vs a topic in messaging systems?
+What's the difference between a process and a thread?
+What is idempotency, and why does it matter for REST APIs?
+What's the difference between authentication and authorization?
+What does HTTP status code 429 mean?
+What's the difference between `==` and `===` in JavaScript?
+Why is my Docker container exiting immediately after it starts?
+Why does my API return a 401 even though I'm sending a valid token?
+Why is my Python script running out of memory on a large CSV file?
+Why do I keep getting "port already in use" when starting my dev server?
+Why does my useEffect hook run twice in development mode?
+Explain how JWT authentication works.
+Explain the CAP theorem in distributed systems.
+How does garbage collection work in a language like Java or Go?
+Explain what a race condition is and why it's hard to reproduce.
+How does DNS resolution work when I type a URL into a browser?
+Walk me through the steps to set up a CI pipeline for a Node.js project.
+What are the steps to safely roll back a bad database migration in production?
+Walk me through setting up blue-green deployment for a web service.
+Walk me through debugging why a production API endpoint suddenly got slow.
+What's the process for rotating a leaked API key without downtime?
