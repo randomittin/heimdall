@@ -12,6 +12,14 @@
 # plugin silently rewrites its OWN flag file back to its default on session
 # restart, so hmd's resolved level (and a stderr divergence warning when the
 # two disagree) must survive that -- see "restart-survival" below.
+#
+# 2026-09-01: hmd collapsed to a single settable level, ultra -- see
+# bin/heimdall-caveman's own "SCOPE" header for the full rationale and the
+# accept-and-map design for a stored/requested legacy lite/full value. This
+# suite's set/get and migration cases below were updated for that; the
+# per-level RULE TEXT cases (lite/full/ultra all still directly renderable
+# by explicit `rules <lvl>`, for heimdall-caveman-eval's committed
+# comparison) were not, because that surface did not change.
 
 set -uo pipefail
 
@@ -65,15 +73,28 @@ run() {
 D="$(fresh)"
 out="$(run "$D" get)"; rc=$?
 [ "$rc" -eq 0 ] && ok "get on totally fresh state exits 0 (rc=$rc)" || bad "get on totally fresh state exits 0 (rc=$rc)"
-[ "$out" = "full" ] && ok "fresh state falls back to documented default 'full' (got '$out')" || bad "fresh state falls back to 'full' (got '$out')"
+[ "$out" = "ultra" ] && ok "fresh state falls back to documented default 'ultra' (got '$out')" || bad "fresh state falls back to 'ultra' (got '$out')"
 
-# ── set/get round-trip, all three owned levels ──
-for lvl in lite full ultra; do
+# ── set/get: ultra round-trips to itself; retired lite/full MAP FORWARD to
+# ultra rather than erroring or wedging (see bin/heimdall-caveman "SCOPE") ──
+D="$(fresh)"
+run "$D" set ultra >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] || bad "set ultra exits 0 (rc=$rc)"
+out="$(run "$D" get)"
+[ "$out" = "ultra" ] && ok "set ultra then get round-trips to ultra" || bad "set ultra then get round-trips to ultra (got '$out')"
+
+for lvl in lite full; do
   D="$(fresh)"
-  run "$D" set "$lvl" >/dev/null 2>&1; rc=$?
-  [ "$rc" -eq 0 ] || bad "set $lvl exits 0 (rc=$rc)"
+  set_err="$(run "$D" set "$lvl" 2>&1 1>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "set $lvl (retired) still exits 0 -- accept-and-map, never a hard error (rc=$rc)" \
+    || bad "set $lvl (retired) exits 0 (rc=$rc)"
   out="$(run "$D" get)"
-  [ "$out" = "$lvl" ] && ok "set $lvl then get round-trips to $lvl" || bad "set $lvl then get round-trips to $lvl (got '$out')"
+  [ "$out" = "ultra" ] && ok "set $lvl maps forward to ultra (got '$out')" \
+    || bad "set $lvl did not map forward to ultra (got '$out') -- a stored legacy value must never wedge or silently emit nothing"
+  case "$set_err" in
+    *"retired"*"ultra"*) ok "set $lvl prints a retirement notice on stderr naming ultra" ;;
+    *) bad "set $lvl gave no retirement notice on stderr: $set_err" ;;
+  esac
 done
 
 # ── invalid set: rejected, does not corrupt existing state ──
@@ -82,7 +103,8 @@ run "$D" set full >/dev/null 2>&1
 run "$D" set bogus >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ] && ok "set bogus exits non-zero (rc=$rc)" || bad "set bogus exits non-zero (rc=$rc)"
 out="$(run "$D" get)"
-[ "$out" = "full" ] && ok "set bogus does not corrupt prior valid state (still 'full', got '$out')" || bad "set bogus left state at '$out', expected 'full' preserved"
+[ "$out" = "ultra" ] && ok "set bogus does not corrupt prior valid state (still 'ultra' via legacy 'full' mapping, got '$out')" \
+  || bad "set bogus left state at '$out', expected 'ultra' preserved"
 
 # ── set with no argument: caller error, non-zero, no crash ──
 D="$(fresh)"
@@ -95,11 +117,36 @@ mkdir -p "$D/home"
 printf 'MAXIMUM; rm -rf /\n' > "$D/home/caveman-level"
 out="$(run "$D" get)"; rc=$?
 [ "$rc" -eq 0 ] && ok "corrupt state file: get still exits 0 (rc=$rc)" || bad "corrupt state file: get still exits 0 (rc=$rc)"
-[ "$out" = "full" ] && ok "corrupt state file falls back to 'full' (got '$out')" || bad "corrupt state file falls back to 'full' (got '$out')"
+[ "$out" = "ultra" ] && ok "corrupt state file falls back to 'ultra' (got '$out')" || bad "corrupt state file falls back to 'ultra' (got '$out')"
 case "$out" in
   *MAXIMUM*) bad "corrupt value was parroted back instead of falling back" ;;
   *) ok "corrupt value is not parroted back" ;;
 esac
+
+# ── HIGHEST-RISK CASE: a value written by a PRE-COLLAPSE hmd binary (literal
+# 'lite'/'full' bytes already sitting in $HEIMDALL_HOME/caveman-level, never
+# touched by today's `set` mapping at all -- this is NOT the same code path
+# as "set lite" below) must still resolve to real, non-empty ultra output --
+# never wedge, never silently emit nothing. This is the one requirement this
+# whole collapse cannot fail on. ──
+for legacy in lite full; do
+  D="$(fresh)"
+  mkdir -p "$D/home"
+  printf '%s\n' "$legacy" > "$D/home/caveman-level"
+  out="$(run "$D" get)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "pre-collapse stored '$legacy': get still exits 0 (rc=$rc)" \
+    || bad "pre-collapse stored '$legacy': get exits 0 (rc=$rc)"
+  [ "$out" = "ultra" ] && ok "pre-collapse stored '$legacy' resolves forward to 'ultra' (got '$out')" \
+    || bad "pre-collapse stored '$legacy' did not resolve to 'ultra' (got '$out') -- must never wedge or emit nothing"
+  rules_out="$(run "$D" rules)"
+  byte_count="${#rules_out}"
+  [ "$byte_count" -gt 0 ] && ok "pre-collapse stored '$legacy': rules still emits real, non-empty text ($byte_count bytes)" \
+    || bad "pre-collapse stored '$legacy': rules emitted nothing"
+  case "$rules_out" in
+    *"level: ultra"*) ok "pre-collapse stored '$legacy': rules header honestly reports 'ultra', not the stale stored value" ;;
+    *) bad "pre-collapse stored '$legacy': rules header did not report 'ultra': $rules_out" ;;
+  esac
+done
 
 # ── rules: each level emits DIFFERENT text (red-proof, not just non-crash) ──
 D="$(fresh)"
@@ -246,6 +293,20 @@ out2="$(run "$D" get 2>/dev/null)"
 [ "$out2" = "ultra" ] && ok "migration is one-time: later plugin-flag edits are ignored (still 'ultra', got '$out2')" \
   || bad "migration re-read the plugin flag after the first seed (got '$out2', expected 'ultra')"
 
+# 2026-09-01: a plugin flag of 'lite' or 'full' is now OUT OF SCOPE for
+# migration seeding -- only 'ultra' is a valid level to migrate TO any more
+# (see bin/heimdall-caveman "SCOPE"). Falls through to DEFAULT_LEVEL exactly
+# like the existing wenyan-full/off out-of-scope cases below; pre-2026-09-01
+# either WAS adopted verbatim, so this is a genuine behavioural change, not
+# a restatement of the case above.
+for legacy in lite full; do
+  D="$(fresh)"
+  printf '%s\n' "$legacy" > "$D/claude/.caveman-active"
+  out="$(run "$D" get)"
+  [ "$out" = "ultra" ] && ok "migration: plugin flag '$legacy' is NOT adopted post-collapse (falls back to 'ultra', got '$out')" \
+    || bad "migration: plugin flag '$legacy' was wrongly adopted or fallback broke (got '$out', expected 'ultra')"
+done
+
 # ── restart-survival regression: hmd's level must survive the plugin
 # silently rewriting its OWN flag file, exactly as observed first-hand on
 # this repo's own session (2026-08-30) -- operator set the plugin's flag to
@@ -279,9 +340,14 @@ stdout_out="$(run "$D" get 2>/dev/null)"
 
 # Negative case: no warning at all when hmd and the plugin AGREE -- proves
 # this isn't an unconditional every-call warning regardless of content.
+# 2026-09-01: must use 'ultra' on both sides now -- `set full` maps forward
+# to ultra (see the set/get coverage above), so a literal plugin flag of
+# 'full' would no longer actually agree with hmd's resolved state and this
+# case would spuriously fire the very divergence warning it is testing the
+# ABSENCE of.
 D="$(fresh)"
-run "$D" set full >/dev/null 2>&1
-printf 'full\n' > "$D/claude/.caveman-active"
+run "$D" set ultra >/dev/null 2>&1
+printf 'ultra\n' > "$D/claude/.caveman-active"
 agree_stderr="$(run "$D" get 2>&1 1>/dev/null)"
 [ -z "$agree_stderr" ] && ok "no divergence warning when hmd and plugin agree" \
   || bad "spurious divergence warning when hmd and plugin agree (got: '$agree_stderr')"
@@ -309,14 +375,14 @@ D="$(fresh)"
 printf 'wenyan-full\n' > "$D/claude/.caveman-active"
 out="$(run "$D" get)"; rc=$?
 [ "$rc" -eq 0 ] && ok "migration skip (wenyan-full): get still exits 0 (rc=$rc)" || bad "migration skip (wenyan-full): get still exits 0 (rc=$rc)"
-[ "$out" = "full" ] && ok "out-of-scope plugin mode 'wenyan-full' is not adopted (falls back to 'full', got '$out')" \
+[ "$out" = "ultra" ] && ok "out-of-scope plugin mode 'wenyan-full' is not adopted (falls back to 'ultra', got '$out')" \
   || bad "out-of-scope plugin mode was adopted or fallback broke (got '$out')"
 
 # ── migration skip: 'off' is never adopted either ──
 D="$(fresh)"
 printf 'off\n' > "$D/claude/.caveman-active"
 out="$(run "$D" get)"
-[ "$out" = "full" ] && ok "plugin mode 'off' is not adopted (falls back to 'full', got '$out')" \
+[ "$out" = "ultra" ] && ok "plugin mode 'off' is not adopted (falls back to 'ultra', got '$out')" \
   || bad "plugin mode 'off' was adopted or fallback broke (got '$out')"
 
 # ── no plugin flag at all: get still succeeds (already covered above, but
@@ -324,7 +390,7 @@ out="$(run "$D" get)"
 D="$(fresh)"
 rm -f "$D/claude/.caveman-active" 2>/dev/null
 out="$(run "$D" get)"; rc=$?
-[ "$rc" -eq 0 ] && [ "$out" = "full" ] && ok "no plugin flag present: get exits 0 and defaults to full" \
+[ "$rc" -eq 0 ] && [ "$out" = "ultra" ] && ok "no plugin flag present: get exits 0 and defaults to ultra" \
   || bad "no plugin flag present: get did not cleanly default (rc=$rc, out='$out')"
 
 # ── symlink refusal on write (security carve-out, not gold-plating) ──
@@ -366,107 +432,25 @@ case "$path_out" in
   *) ok "path does not fall back to the real \$HOME/.heimdall path when HEIMDALL_HOME is overridden" ;;
 esac
 
-# ── diff: two DIFFERENT levels emit a real, non-empty unified diff naming
-# both -- red-proof against a stub that always prints the same canned text
-# regardless of which levels were asked for: it must contain content unique
-# to the ultra-only rule text ("Abbreviate") and real unified-diff markers. ──
+# ── diff: RETIRED 2026-09-01 (see bin/heimdall-caveman's own header comment,
+# the "RETIRED 2026-09-01" note, formerly "BUILT 2"). Its only non-degenerate
+# use -- comparing two DIFFERENT real levels -- no longer exists once there
+# is only one settable level (ultra). Replaced by a negative-space proof of
+# the removal itself: `diff` must now fail cleanly as an unrecognized
+# subcommand, never crash and never silently succeed as if it still did
+# something. ──
 D="$(fresh)"
-diff_out="$(run "$D" diff ultra lite)"; rc=$?
-[ "$rc" -eq 0 ] && ok "diff between two different levels exits 0 (rc=$rc)" || bad "diff between two different levels exits 0 (rc=$rc)"
-[ -n "$diff_out" ] && ok "diff between two different levels produces non-empty output" || bad "diff between two different levels produced empty output"
-case "$diff_out" in
-  *"lite"*) ok "diff output names the baseline level (lite)" ;;
-  *) bad "diff output does not name the baseline level 'lite': $diff_out" ;;
-esac
-case "$diff_out" in
-  *"ultra"*) ok "diff output names the target level (ultra)" ;;
-  *) bad "diff output does not name the target level 'ultra': $diff_out" ;;
-esac
-case "$diff_out" in
-  *"Abbreviate"*) ok "diff output contains ultra-only content ('Abbreviate'), proving it diffs real rule text" ;;
-  *) bad "diff output missing ultra-only content 'Abbreviate' -- looks like a stub: $diff_out" ;;
-esac
-case "$diff_out" in
-  *"---"*"+++"*) ok "diff output contains unified-diff markers (---/+++)" ;;
-  *) bad "diff output missing unified-diff markers: $diff_out" ;;
-esac
-
-# ── diff: the SAME level on both sides emits NO differences -- proves this
-# does not just always print "something" regardless of input (a stub that
-# echoes a stray diff or the same boilerplate no matter what would fail this
-# specific case, even though it might pass the "different levels" case above). ──
-D="$(fresh)"
-same_out="$(run "$D" diff full full)"; rc=$?
-[ "$rc" -eq 0 ] && ok "diff between the same level twice exits 0 (rc=$rc)" || bad "diff between the same level twice exits 0 (rc=$rc)"
-case "$same_out" in
-  *"---"*|*"+++"*) bad "diff between identical levels emitted unified-diff markers (should say 'no difference' instead): $same_out" ;;
-  *) ok "diff between identical levels emits no unified-diff markers" ;;
-esac
-case "$same_out" in
-  *"already the baseline"*|*"no rule-text difference"*) ok "diff between identical levels explicitly says there is no difference" ;;
-  *) bad "diff between identical levels does not say so explicitly: $same_out" ;;
-esac
-
-# ── diff: baseline defaults to the CURRENT level when omitted (exercises the
-# internal cmd_get call) -- omitted-baseline output must match the explicit
-# current-level diff exactly. ──
-D="$(fresh)"
-run "$D" set lite >/dev/null 2>&1
-default_baseline_out="$(run "$D" diff ultra)"
-explicit_baseline_out="$(run "$D" diff ultra lite)"
-[ "$default_baseline_out" = "$explicit_baseline_out" ] && ok "diff with omitted baseline matches the explicit current level" \
-  || bad "diff with omitted baseline does not match explicit current-level diff"
-
-# ── diff: invalid TARGET level fails cleanly -- non-zero, no crash, no bogus
-# diff emitted on stdout. ──
-D="$(fresh)"
-bad_target_out="$(run "$D" diff nonsense 2>/dev/null)"; rc=$?
-[ "$rc" -ne 0 ] && ok "diff with invalid target level exits non-zero (rc=$rc)" || bad "diff with invalid target level exits non-zero (rc=$rc)"
-[ -z "$bad_target_out" ] && ok "diff with invalid target level emits nothing on stdout" || bad "diff with invalid target level leaked to stdout: '$bad_target_out'"
-bad_target_err="$(run "$D" diff nonsense 2>&1 1>/dev/null)"
-case "$bad_target_err" in
-  *"invalid level"*) ok "diff with invalid target level reports 'invalid level' on stderr" ;;
-  *) bad "diff with invalid target level did not report 'invalid level' on stderr: $bad_target_err" ;;
-esac
-
-# ── diff: invalid BASELINE level (second arg) also fails cleanly. ──
-D="$(fresh)"
-bad_base_out="$(run "$D" diff full nonsense 2>/dev/null)"; rc=$?
-[ "$rc" -ne 0 ] && ok "diff with invalid baseline level exits non-zero (rc=$rc)" || bad "diff with invalid baseline level exits non-zero (rc=$rc)"
-[ -z "$bad_base_out" ] && ok "diff with invalid baseline level emits nothing on stdout" || bad "diff with invalid baseline level leaked to stdout: '$bad_base_out'"
-
-# ── diff: no arguments at all -- caller error, non-zero, no crash. ──
-D="$(fresh)"
-run "$D" diff >/dev/null 2>&1; rc=$?
-[ "$rc" -ne 0 ] && ok "diff with no arguments exits non-zero (rc=$rc)" || bad "diff with no arguments exits non-zero (rc=$rc)"
-
-# ── diff: stdout/stderr discipline matches the same divergence-warning
-# contract 'get'/'rules' already enforce -- diff's default-baseline path
-# calls cmd_get internally, so a stored/plugin-flag divergence must still
-# warn on stderr ONLY, never polluting the unified-diff text on stdout. ──
-D="$(fresh)"
-run "$D" set ultra >/dev/null 2>&1
-printf 'full\n' > "$D/claude/.caveman-active"
-diverged_stdout="$(run "$D" diff lite 2>/dev/null)"
-case "$diverged_stdout" in
-  *"diverged"*) bad "diff leaked the divergence warning onto stdout: $diverged_stdout" ;;
-  *) ok "diff keeps stdout clean of the divergence warning even when levels diverge" ;;
-esac
-diverged_stderr="$(run "$D" diff lite 2>&1 1>/dev/null)"
-case "$diverged_stderr" in
-  *"diverged"*"ultra"*"full"*) ok "diff surfaces the divergence warning on stderr, naming both values" ;;
-  *) bad "diff did not surface the divergence warning on stderr: $diverged_stderr" ;;
-esac
-case "$diverged_stdout" in
-  *"ultra"*) ok "diff's default-baseline resolution still uses hmd's stored value ('ultra'), not the diverged plugin flag" ;;
-  *) bad "diff's default-baseline resolution used the wrong value: $diverged_stdout" ;;
-esac
+diff_gone_out="$(run "$D" diff ultra lite 2>/dev/null)"; rc=$?
+[ "$rc" -ne 0 ] && ok "diff is no longer a recognized subcommand (exits non-zero, rc=$rc)" \
+  || bad "diff still succeeds as if it were a live subcommand (rc=$rc): $diff_gone_out"
+[ -z "$diff_gone_out" ] && ok "removed diff subcommand emits nothing on stdout" \
+  || bad "removed diff subcommand still emitted stdout: $diff_gone_out"
 
 # ── help / usage ──
 D="$(fresh)"
 help_out="$(run "$D" --help)"; rc=$?
 [ "$rc" -eq 0 ] && ok "--help exits 0" || bad "--help exits 0 (rc=$rc)"
-for word in get set rules diff hooks-json path; do
+for word in get set rules hooks-json path; do
   case "$help_out" in
     *"$word"*) ok "--help mentions '$word'" ;;
     *) bad "--help does not mention '$word'" ;;

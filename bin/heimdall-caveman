@@ -16,10 +16,33 @@
 # still reports the plugin's own live level for spawn preambles; the latter
 # is still the read-back auditor, reused — not duplicated — below).
 #
-# SCOPE: exactly three levels — lite, full, ultra — the subset of the
-# plugin's VALID_MODES this tool owns. The plugin's other modes (off, the
-# wenyan-* classical-Chinese variants, and the independent commit/review/
-# compress modes) are out of scope for this change and untouched.
+# SCOPE: ONE settable, operator-facing level — ultra. Collapsed from three
+# (lite, full, ultra) on 2026-09-01 per owner directive: hmd's audience is
+# technical, already established at setup by the "are you a coder?" question,
+# so the gentler tiers (lite, full) have no audience of their own. `get`,
+# `set`, the stored state file, and fresh-install default are all ultra-only
+# now — `is_valid_level` accepts nothing else. `set lite` / `set full` are
+# still ACCEPTED (never a hard error) and mapped forward to ultra with a
+# stderr notice, matching this file's existing fail-open posture elsewhere:
+# a legacy level name behaves like any other out-of-scope input this tool
+# already resolves forward instead of wedging on.
+#
+# `rules lite` and `rules full` remain directly callable BY EXPLICIT NAME
+# ONLY (never reachable through get/set/default/migration — see
+# `_is_renderable_level` vs. `is_valid_level` below). This is a deliberate,
+# narrow carve-out, not a partial revert: bin/heimdall-caveman-eval's
+# existing three-arm comparison (hmd_lite/hmd_full/hmd_ultra vs
+# upstream_skill) already spent real, non-trivial API quota producing its
+# committed snapshot, and this task was explicitly told not to trigger a
+# `--confirm-spend` refresh. Ripping the two arms out would either orphan
+# that snapshot or force a refresh to replace it — neither is this task's
+# call to make. Neither name is an operator-facing level any more; `--help`
+# and every settable/gettable path name ultra only. Flagged here for the
+# owner to correct if this reads as scope creep the other way.
+#
+# The plugin's other modes (off, the wenyan-* classical-Chinese variants, and
+# the independent commit/review/compress modes) remain out of scope, exactly
+# as before this change.
 #
 # LICENCE PROVENANCE
 # The caveman plugin (github.com/juliusbrussee/caveman) is MIT-licensed,
@@ -97,12 +120,15 @@
 # heimdall-caveman-compliance's own human-readable output already holds
 # itself to.
 #
-# BUILT 2 -- `diff` preview. `heimdall-caveman diff <lvl> [<base>]` unified-
-# diffs one level's rule text against another (base defaults to the current
-# level), so an operator sees exactly what changing levels changes BEFORE
-# running `set`. Not exclusive to hmd in principle -- a plugin could ship the
-# same diff over its own static text -- but the plugin does not currently
-# offer this, it is cheap and low-risk, and it earns its place anyway.
+# RETIRED 2026-09-01 -- `diff` preview. `heimdall-caveman diff <lvl> [<base>]`
+# used to unified-diff one level's rule text against another, so an operator
+# could see what changing levels would change before running `set`. Its only
+# non-degenerate use was comparing two DIFFERENT real levels; the ultra-only
+# collapse above (see "SCOPE") means every remaining call would diff ultra
+# against ultra -- a command whose one useful case no longer exists. Dropped
+# rather than kept as permanent dead weight; had zero callers outside this
+# file's own tests (verified: no other bin/, hooks/, skills/, or evals/ file
+# invoked it) before removal.
 #
 # REJECTED 1 -- mechanical per-surface enforcement (e.g. making "never
 # compress a commit message" a code guarantee instead of a rule of prose).
@@ -132,14 +158,18 @@
 # unmeasured efficacy claim this task said not to make. Left undone.
 #
 # STORAGE
-# hmd's own level: $HEIMDALL_HOME/caveman-level (one line: lite|full|ultra).
-# NOT the plugin's ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active file —
-# that file is read exactly once, as a migration SEED, only when hmd's own
-# state file does not exist yet AND the plugin's flag holds a value this
-# tool recognizes (lite/full/ultra). After that first read, hmd never
+# hmd's own level: $HEIMDALL_HOME/caveman-level (one line, ultra-only as of
+# 2026-09-01 -- see "SCOPE" above). NOT the plugin's
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active file — that file is
+# read exactly once, as a migration SEED, only when hmd's own state file
+# does not exist yet AND the plugin's flag already holds "ultra" literally —
+# a plugin flag of lite/full is now out of scope for seeding (same bucket as
+# wenyan-*/off below) and falls through to DEFAULT_LEVEL exactly like any
+# other value this tool does not own. After that first read, hmd never
 # ADOPTS a value from the plugin's file again, and never writes to it — but
-# every `get` DOES read it once more, read-only, purely to compare. See
-# "DIVERGENCE / RESTART SAFETY" below for why that comparison exists.
+# every `get` DOES read it once more, read-only, purely to compare (using a
+# wider lite/full/ultra check than the seed check above — see "DIVERGENCE /
+# RESTART SAFETY" below for why).
 #
 # DIVERGENCE / RESTART SAFETY
 # Directly observed on this repo's own session (owner report, 2026-08-30):
@@ -157,37 +187,48 @@
 # plugin's LIVE flag on every call, not just at migration, and prints a
 # one-line warning to stderr -- never stdout, so a hook's injected text
 # stays clean -- when they disagree. hmd's value always wins; this is a
-# visibility fix, not a new source of truth. See _warn_if_diverged() below.
+# visibility fix, not a new source of truth. This comparison deliberately
+# uses a WIDER lite/full/ultra check than `set`/migration's ultra-only gate
+# (see _is_renderable_level vs is_valid_level below): hmd can only ever
+# resolve to "ultra" now, but the plugin, if still installed, can still
+# independently report lite or full, and that mismatch is exactly the
+# "operator staring at two disagreeing tools" case this warning exists for.
+# A plugin flag outside lite/full/ultra (wenyan-*, off, garbage) stays
+# silent, same as always. See _warn_if_diverged() below.
 #
 # SUBCOMMANDS
-#   heimdall-caveman get                 print the current level (migrates
+#   heimdall-caveman get                  print the current level (migrates
 #                                         from the plugin's flag once if
-#                                         unset; on every call also compares
+#                                         unset and the flag already says
+#                                         "ultra"; on every call also compares
 #                                         against the plugin's LIVE flag and
 #                                         warns on stderr, never stdout, if
 #                                         they disagree -- hmd's value always
-#                                         wins; falls back to "full" — the
-#                                         plugin's own documented default —
-#                                         if neither source has a valid
-#                                         value)
-#   heimdall-caveman set <lvl>           persist lite|full|ultra as current
-#   heimdall-caveman rules [<lvl>]       print the rule text for <lvl> (or
+#                                         wins; falls back to "ultra" — the
+#                                         only level this tool has — if no
+#                                         valid value is stored)
+#   heimdall-caveman set <lvl>            persist ultra as current; a legacy
+#                                         lite/full value is ACCEPTED and
+#                                         mapped to ultra with a stderr
+#                                         notice, never a hard error -- an
+#                                         unrecognized value still is
+#   heimdall-caveman rules [<lvl>]        print the rule text for <lvl> (or
 #                                         the current level if omitted);
 #                                         appends the last MEASURED compliance
 #                                         figure when `hmd caveman-audit` has
 #                                         ever recorded one -- see "PARITY
-#                                         IMPROVEMENTS OVER THE PLUGIN" above
-#   heimdall-caveman diff <lvl> [<base>] unified-diff <lvl>'s rule text
-#                                         against <base> (default: current
-#                                         level) -- preview a level BEFORE
-#                                         running `set`
-#   heimdall-caveman hooks-json          print the exact SessionStart +
+#                                         IMPROVEMENTS OVER THE PLUGIN" above.
+#                                         Explicit `rules lite` / `rules full`
+#                                         still render (see "SCOPE" above) —
+#                                         eval-harness compatibility only,
+#                                         not an operator-facing level
+#   heimdall-caveman hooks-json           print the exact SessionStart +
 #                                         UserPromptSubmit hooks.json
 #                                         fragments needed to wire this tool
 #                                         (reference text only — this tool
 #                                         never edits hooks.json itself)
-#   heimdall-caveman path                print the path to hmd's state file
-#   heimdall-caveman -h | --help         usage
+#   heimdall-caveman path                 print the path to hmd's state file
+#   heimdall-caveman -h | --help          usage
 #
 # Fails open throughout: a missing/corrupt state file, a missing $HOME, or a
 # missing plugin flag never crashes a session start — `get` always prints a
@@ -198,8 +239,13 @@ set -uo pipefail
 HEIMDALL_HOME="${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}"
 STATE_FILE="$HEIMDALL_HOME/caveman-level"
 PLUGIN_FLAG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active"
-VALID_LEVELS="lite full ultra"
-DEFAULT_LEVEL="full"
+# VALID_LEVELS gates what can be SET, STORED, MIGRATED-to, or reported by
+# `get` -- ultra-only as of 2026-09-01 (see "SCOPE" above). RENDERABLE_LEVELS
+# is the wider set `rules <lvl>` and the divergence check accept, by explicit
+# name / plugin-flag comparison only -- see _is_renderable_level below.
+VALID_LEVELS="ultra"
+RENDERABLE_LEVELS="lite full ultra"
+DEFAULT_LEVEL="ultra"
 MAX_FLAG_BYTES=64
 # Written by bin/heimdall-caveman-compliance's _persist_last() after every
 # GENUINE (non-degraded) measurement; read back by _last_measurement_summary
@@ -214,21 +260,38 @@ is_valid_level() {
   esac
 }
 
+# Wider than is_valid_level: lite/full/ultra, not ultra-only. Gates two
+# things ONLY -- explicit `rules <lvl>` and the divergence check's read of
+# the plugin's (separate, still three-valued) flag -- never what hmd itself
+# can be SET to, STORE, or MIGRATE to. See "SCOPE" above.
+_is_renderable_level() {
+  case " $RENDERABLE_LEVELS " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Symlink-safe, size-capped read. Mirrors the threat model the vendored
 # source's own caveman-config.js readFlag() hardens against (a local writer
 # to the state dir swapping the file for a symlink so whatever later prints
 # the "level" leaks unrelated file content) — same posture, reimplemented in
 # bash rather than copied. Returns nothing (empty stdout) on any anomaly:
-# missing file, symlink, oversized, or a value outside lite/full/ultra.
+# missing file, symlink, or oversized.
+#
+# Deliberately does NOT gate on is_valid_level (it did, pre-2026-09-01
+# collapse, when there was only one notion of "valid"). Callers now need two
+# different notions of valid from the SAME two files this reads (hmd's own
+# state file and the plugin's flag) -- ultra-only for what hmd can be set to
+# or migrate to, lite/full/ultra for what the divergence check and explicit
+# `rules <lvl>` accept -- so validity is each caller's own decision now
+# (is_valid_level or _is_renderable_level), made explicitly after the read.
 _safe_read_level() {
   local f="$1"
   [ -n "$f" ] || return 0
   [ -e "$f" ] || return 0
   [ -L "$f" ] && return 0
   [ -f "$f" ] || return 0
-  local raw
-  raw="$(head -c "$MAX_FLAG_BYTES" "$f" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" || return 0
-  is_valid_level "$raw" && printf '%s' "$raw"
+  head -c "$MAX_FLAG_BYTES" "$f" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'
   return 0
 }
 
@@ -271,15 +334,16 @@ _safe_write_level() {
 
 # One-time migration: only fires when hmd's own state file does not exist
 # yet. READS (never writes) the plugin's flag; seeds hmd's state only if
-# that value is one of the three levels this tool owns. Silent no-op
-# otherwise — `get`'s own fallback to $DEFAULT_LEVEL covers every other
-# case (plugin absent, plugin flag unset, plugin flag holds an out-of-scope
-# mode like a wenyan-* variant or "off").
+# that value is "ultra" -- the only level this tool still owns as of the
+# 2026-09-01 collapse (see "SCOPE" above). Silent no-op otherwise —
+# `get`'s own fallback to $DEFAULT_LEVEL covers every other case (plugin
+# absent, plugin flag unset, plugin flag holds a now-out-of-scope lite/full
+# value, or an always-out-of-scope mode like a wenyan-* variant or "off").
 _migrate_once() {
   [ -f "$STATE_FILE" ] && return 0
   local seed
   seed="$(_safe_read_level "$PLUGIN_FLAG")"
-  [ -n "$seed" ] || return 0
+  is_valid_level "$seed" || return 0
   _safe_write_level "$STATE_FILE" "$seed" || true
   return 0
 }
@@ -288,13 +352,19 @@ _migrate_once() {
 # to silently rewrite its OWN flag file back to its default on session
 # restart (see "DIVERGENCE / RESTART SAFETY" above), so a one-time migration
 # read cannot catch a disagreement that appears later. NEVER changes the
-# resolved value; only decides whether to print a heads-up. Silent (no
-# output) when the plugin flag is absent or holds a value outside
-# lite/full/ultra -- that is not a disagreement about a level this tool owns.
+# resolved value; only decides whether to print a heads-up. Uses
+# _is_renderable_level (lite/full/ultra), deliberately WIDER than
+# is_valid_level (ultra-only): hmd itself can only ever resolve to "ultra"
+# now, but the plugin, if still installed, can still independently report
+# lite or full, and that is exactly the disagreement this warning exists to
+# surface -- narrowing this to ultra-only would silently stop reporting the
+# one divergence this mechanism was built for. Silent (no output) when the
+# plugin flag is absent or holds a value outside lite/full/ultra (wenyan-*,
+# off, garbage) -- that is not a disagreement about a level this tool owns.
 _warn_if_diverged() {
   local resolved="$1" plugin_val
   plugin_val="$(_safe_read_level "$PLUGIN_FLAG")"
-  [ -n "$plugin_val" ] || return 0
+  _is_renderable_level "$plugin_val" || return 0
   [ "$plugin_val" = "$resolved" ] && return 0
   echo "heimdall-caveman: level diverged -- hmd stores '$resolved', plugin flag now reports '$plugin_val'; hmd's value wins (plugin file is compared on every get, never re-adopted after first migration)" >&2
 }
@@ -364,9 +434,7 @@ cmd_get() {
   _migrate_once
   local lvl
   lvl="$(_safe_read_level "$STATE_FILE")"
-  if [ -z "$lvl" ]; then
-    lvl="$DEFAULT_LEVEL"
-  fi
+  is_valid_level "$lvl" || lvl="$DEFAULT_LEVEL"
   _warn_if_diverged "$lvl"
   printf '%s\n' "$lvl"
 }
@@ -374,10 +442,20 @@ cmd_get() {
 cmd_set() {
   local lvl="${1:-}"
   if [ -z "$lvl" ]; then
-    echo "error: heimdall-caveman set needs a level (lite|full|ultra)" >&2
+    echo "error: heimdall-caveman set needs a level (ultra)" >&2
     return 2
   fi
   lvl="$(printf '%s' "$lvl" | tr '[:upper:]' '[:lower:]')"
+  # lite/full are RETIRED, not unknown -- accept and map forward instead of
+  # hard-erroring, same fail-open posture as everywhere else in this file
+  # (a legacy value resolves forward; it never wedges the tool). An actually
+  # unrecognized value (e.g. "bogus") still hard-errors below, unchanged.
+  case "$lvl" in
+    lite|full)
+      echo "heimdall-caveman: '$lvl' is retired -- hmd runs a single level now (ultra). Storing 'ultra' instead." >&2
+      lvl="ultra"
+      ;;
+  esac
   if ! is_valid_level "$lvl"; then
     echo "error: invalid level '$lvl' -- must be one of: $VALID_LEVELS" >&2
     return 2
@@ -494,7 +572,7 @@ Respond max terse. All technical substance stay. Only fluff die.
 
 ACTIVE EVERY RESPONSE. No revert after many turns. No filler drift. Still active if unsure. Off only: "stop caveman" / "normal mode".
 
-Default level: full. Change level: `heimdall-caveman set lite|full|ultra`.
+Default level: ultra (the only level). Change level: `heimdall-caveman set ultra`.
 
 ## Rules
 
@@ -526,15 +604,21 @@ RULES
 }
 
 # Single dispatch point from a validated level name to its static rule text
-# -- used by both cmd_rules (current/explicit level) and cmd_diff (any two
-# levels, independent of what's currently set), so the two commands can never
-# drift apart on what a level's text actually is.
+# -- used by cmd_rules for both the current/default level and an explicit
+# lite/full/ultra argument (see "SCOPE" above for why lite/full still render
+# on request), so nothing else in this file can drift from what a level's
+# text actually is. The fallback matters: every real caller already validates
+# via _is_renderable_level first, so `*)` should be unreachable in practice,
+# but if it is ever reached anyway, it must resolve to hmd's actual current
+# default (ultra) -- resolving to the RETIRED default (full, pre-2026-09-01)
+# would silently reintroduce the exact false-declaration bug this whole file
+# exists to prevent.
 _rules_text_for_level() {
   case "$1" in
     lite) _rules_lite ;;
     full) _rules_full ;;
     ultra) _rules_ultra ;;
-    *) _rules_full ;;
+    *) _rules_ultra ;;
   esac
 }
 
@@ -544,8 +628,11 @@ cmd_rules() {
     lvl="$(cmd_get)"
   else
     lvl="$(printf '%s' "$lvl" | tr '[:upper:]' '[:lower:]')"
-    if ! is_valid_level "$lvl"; then
-      echo "error: invalid level '$lvl' -- must be one of: $VALID_LEVELS" >&2
+    # Wider than is_valid_level on purpose -- explicit `rules lite`/`rules
+    # full` still render (eval-harness compatibility, see "SCOPE" above)
+    # even though neither is settable/gettable as hmd's own level any more.
+    if ! _is_renderable_level "$lvl"; then
+      echo "error: invalid level '$lvl' -- must be one of: $RENDERABLE_LEVELS" >&2
       return 2
     fi
   fi
@@ -553,60 +640,6 @@ cmd_rules() {
   local last
   last="$(_last_measurement_summary)"
   [ -n "$last" ] && printf '\n%s\n' "$last"
-  return 0
-}
-
-# Preview: unified-diff <target>'s rule text against <baseline> (defaults to
-# the current level) so an operator can see exactly what `set <target>` would
-# change BEFORE running it. Read-only -- never touches the stored level.
-# Direction is deliberate: baseline (current) is "-", target (candidate) is
-# "+", matching how a reviewer reads any other diff (what you have -> what
-# you'd get).
-cmd_diff() {
-  local target="${1:-}" baseline="${2:-}"
-  if [ -z "$target" ]; then
-    echo "error: heimdall-caveman diff needs at least one level (lite|full|ultra) to preview" >&2
-    return 2
-  fi
-  target="$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')"
-  if ! is_valid_level "$target"; then
-    echo "error: invalid level '$target' -- must be one of: $VALID_LEVELS" >&2
-    return 2
-  fi
-  if [ -z "$baseline" ]; then
-    baseline="$(cmd_get)"
-  else
-    baseline="$(printf '%s' "$baseline" | tr '[:upper:]' '[:lower:]')"
-    if ! is_valid_level "$baseline"; then
-      echo "error: invalid level '$baseline' -- must be one of: $VALID_LEVELS" >&2
-      return 2
-    fi
-  fi
-  if [ "$baseline" = "$target" ]; then
-    printf 'heimdall-caveman: %s is already the baseline -- no rule-text difference.\n' "$target"
-    return 0
-  fi
-  local fa fb rc
-  fa="$(mktemp "${TMPDIR:-/tmp}/hmd-caveman-diff-base.XXXXXX")" || {
-    echo "error: could not create temp file for diff" >&2
-    return 1
-  }
-  fb="$(mktemp "${TMPDIR:-/tmp}/hmd-caveman-diff-target.XXXXXX")" || {
-    rm -f "$fa"
-    echo "error: could not create temp file for diff" >&2
-    return 1
-  }
-  _rules_text_for_level "$baseline" >"$fa"
-  _rules_text_for_level "$target" >"$fb"
-  printf 'heimdall-caveman: preview -- switching from %s to %s (- = current %s, + = candidate %s):\n' \
-    "$baseline" "$target" "$baseline" "$target"
-  diff -u -L "$baseline" -L "$target" "$fa" "$fb"
-  rc=$?
-  rm -f "$fa" "$fb"
-  # diff exits 1 when the inputs simply differ -- that's the expected/normal
-  # case for a preview, not a failure. Only a real diff error (rc > 1) counts
-  # as this command failing.
-  [ "$rc" -gt 1 ] && return 1
   return 0
 }
 
@@ -668,13 +701,16 @@ usage() {
 Usage: heimdall-caveman <command> [args]
 
 Commands:
-  get                 Print the current level (lite|full|ultra).
-  set <lvl>           Set the current level (lite|full|ultra).
+  get                 Print the current level (ultra).
+  set <lvl>           Set the current level (ultra). A legacy lite/full
+                      value is accepted and mapped to ultra with a stderr
+                      notice, never a hard error.
   rules [<lvl>]       Print the rule text for <lvl> (default: current level).
                       Appends the last measured compliance figure when one
-                      has been recorded (see \`hmd caveman-audit\`).
-  diff <lvl> [<base>] Preview: unified-diff <lvl>'s rule text against <base>
-                      (default: current level) -- see it BEFORE \`set\`.
+                      has been recorded (see \`hmd caveman-audit\`). Explicit
+                      \`rules lite\`/\`rules full\` still render for
+                      eval-harness compatibility -- neither is an
+                      operator-facing level any more.
   hooks-json          Print the hooks.json fragments needed to wire this tool.
   path                Print the path to hmd's own state file.
   -h, --help          Show this help.
@@ -697,7 +733,6 @@ main() {
     get) cmd_get ;;
     set) shift; cmd_set "${1:-}" ;;
     rules) shift; cmd_rules "${1:-}" ;;
-    diff) shift; cmd_diff "${1:-}" "${2:-}" ;;
     hooks-json) cmd_hooks_json ;;
     path) cmd_path ;;
     -h|--help) usage ;;
