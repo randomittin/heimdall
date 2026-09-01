@@ -202,6 +202,14 @@
             "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-metric-hook\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" stop --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/hooks/heimdall-429-detect.sh\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+          }
+        ]
       }
     ],
     "Stop": [
@@ -218,6 +226,14 @@
           {
             "type": "command",
             "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-claim-check\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/hooks/heimdall-429-detect.sh\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
           }
         ]
       }
