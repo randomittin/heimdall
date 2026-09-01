@@ -246,14 +246,61 @@ if [ -n "$AGENTS_BIN" ]; then
   AGENTS_LOCK_TTL="${HMD_AGENTS_LOCK_TTL:-8}"
   case "$AGENTS_COUNT_TTL" in ''|*[!0-9]*) AGENTS_COUNT_TTL=4 ;; esac
   case "$AGENTS_LOCK_TTL"  in ''|*[!0-9]*) AGENTS_LOCK_TTL=8 ;; esac
-  AC_NOW="$(date +%s 2>/dev/null || echo 0)"
-  case "$AC_NOW" in ''|*[!0-9]*) AC_NOW=0 ;; esac
+  # Sub-second clock for the freshness math below. ROOT CAUSE this fixes: `date
+  # +%s` and `stat %m` both floor to whole seconds, and this bar used to diff
+  # two independently-floored instants. A write and a check that straddle a
+  # wall-clock second boundary (write at x.999s, check at (x+1).001s) can then
+  # compute a delta of a full second even though ~2ms really elapsed. Against a
+  # short TTL that rounding noise can exceed the whole window, so a
+  # just-written, genuinely-fresh cache gets misclassified as stale and a
+  # needless recompute clobbers a perfectly good value — exactly
+  # test/heimdall-statusline-agents-cache.test.sh case 3's intermittent "fresh
+  # cache was overwritten... while still within TTL" (reproduced standalone on
+  # an idle machine, not sweep contention). Widening the TTL or adding a sleep
+  # would only shrink the odds, not close them, so instead the elapsed-time
+  # arithmetic itself moves to nanoseconds, where the same floor/floor skew can
+  # no longer cross a TTL this size. `date +%s.%N` / BSD `stat -f%Fm` / GNU
+  # `stat -c%.9Y` give sub-second precision on every platform this bar already
+  # targets; where a platform's date/stat genuinely lacks it, each helper falls
+  # through to the old whole-second value — re-exposed to the rounding noise
+  # this comment describes, but a transparent degrade, never a crash.
+  _ac_ns_from_secfrac() {
+    # $1 = "SECONDS.FRACTION" (any number of fractional digits) -> integer ns.
+    local whole="${1%%.*}" frac="${1#*.}"
+    frac="${frac}000000000"; frac="${frac:0:9}"
+    case "$whole" in ''|*[!0-9]*) whole=0 ;; esac
+    case "$frac"  in *[!0-9]*)    frac=0 ;; esac
+    printf '%s' "$(( whole * 1000000000 + 10#$frac ))"
+  }
+  _ac_now_ns() {
+    local raw
+    raw="$(date +%s.%N 2>/dev/null)"
+    case "$raw" in [0-9]*.[0-9]*) _ac_ns_from_secfrac "$raw"; return 0 ;; esac
+    local s; s="$(date +%s 2>/dev/null || echo 0)"
+    case "$s" in ''|*[!0-9]*) s=0 ;; esac
+    printf '%s' "$((s * 1000000000))"
+  }
+  _ac_mtime_ns() {
+    local raw
+    raw="$(stat -L -f%Fm "$1" 2>/dev/null)"
+    case "$raw" in [0-9]*.[0-9]*) _ac_ns_from_secfrac "$raw"; return 0 ;; esac
+    raw="$(stat -L -c%.9Y "$1" 2>/dev/null)"
+    case "$raw" in [0-9]*.[0-9]*) _ac_ns_from_secfrac "$raw"; return 0 ;; esac
+    local s; s="$(stat -L -f%m "$1" 2>/dev/null || stat -L -c%Y "$1" 2>/dev/null || echo 0)"
+    case "$s" in ''|*[!0-9]*) s=0 ;; esac
+    printf '%s' "$((s * 1000000000))"
+  }
+
+  AC_NOW_NS="$(_ac_now_ns)"
+  case "$AC_NOW_NS" in ''|*[!0-9]*) AC_NOW_NS=0 ;; esac
+  AC_TTL_NS=$(( AGENTS_COUNT_TTL * 1000000000 ))
+  AC_LOCK_TTL_NS=$(( AGENTS_LOCK_TTL * 1000000000 ))
 
   AC_FRESH=0
   if [ -f "$AC_CACHE" ]; then
-    AC_MTIME="$(stat -L -f%m "$AC_CACHE" 2>/dev/null || stat -L -c%Y "$AC_CACHE" 2>/dev/null || echo 0)"
-    case "$AC_MTIME" in ''|*[!0-9]*) AC_MTIME=0 ;; esac
-    if [ $(( AC_NOW - AC_MTIME )) -lt "$AGENTS_COUNT_TTL" ]; then
+    AC_MTIME_NS="$(_ac_mtime_ns "$AC_CACHE")"
+    case "$AC_MTIME_NS" in ''|*[!0-9]*) AC_MTIME_NS=0 ;; esac
+    if [ $(( AC_NOW_NS - AC_MTIME_NS )) -lt "$AC_TTL_NS" ]; then
       AC_FRESH=1
       IFS= read -r HMD_LIVE_SUBAGENTS <"$AC_CACHE" 2>/dev/null || HMD_LIVE_SUBAGENTS=""
     fi
@@ -261,9 +308,9 @@ if [ -n "$AGENTS_BIN" ]; then
 
   LOCK_FRESH=0
   if [ -f "$AC_LOCK" ]; then
-    LOCK_MTIME="$(stat -L -f%m "$AC_LOCK" 2>/dev/null || stat -L -c%Y "$AC_LOCK" 2>/dev/null || echo 0)"
-    case "$LOCK_MTIME" in ''|*[!0-9]*) LOCK_MTIME=0 ;; esac
-    [ $(( AC_NOW - LOCK_MTIME )) -lt "$AGENTS_LOCK_TTL" ] && LOCK_FRESH=1
+    LOCK_MTIME_NS="$(_ac_mtime_ns "$AC_LOCK")"
+    case "$LOCK_MTIME_NS" in ''|*[!0-9]*) LOCK_MTIME_NS=0 ;; esac
+    [ $(( AC_NOW_NS - LOCK_MTIME_NS )) -lt "$AC_LOCK_TTL_NS" ] && LOCK_FRESH=1
   fi
 
   if [ "$AC_FRESH" = 0 ] && [ "$LOCK_FRESH" = 0 ] && mkdir -p "$AC_DIR" 2>/dev/null; then
