@@ -394,7 +394,7 @@ else:
 out_json="$("$TOOL" report --snapshot "$SNAP_OUT" --json 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && echo "$out_json" | grep -q '"level": "hmd_lite"'; then ok; else bad "generated snapshot must round-trip through report cleanly (rc=$rc): $out_json"; fi
 rt_cost="$(get "$out_json" cost_usd_total)"
-feq "$rt_cost" 0.006 && ok || bad "round-tripped cost_usd_total expected ~0.006 (60 calls x \$0.0001) got $rt_cost"
+feq "$rt_cost" "$EXPECTED_COST_TOTAL" && ok || bad "round-tripped cost_usd_total expected ~$EXPECTED_COST_TOTAL ($EXPECTED_ARM_CALLS calls x \$0.0001) got $rt_cost"
 
 # ---------------------------------------------------------------------------
 # 10. a mid-sweep failure must NOT clobber a pre-existing good snapshot
@@ -413,7 +413,7 @@ exit 1
 FAILEOF
 chmod +x "$FAILBIN/claude"
 
-out="$(PATH="$FAILBIN:$PATH" "$TOOL" refresh --confirm-spend --snapshot "$PRESERVE" 2>&1)"; rc=$?
+out="$(PATH="$FAILBIN:$PATH" "$TOOL" refresh --confirm-spend --prompts "$FIXTURE_PROMPTS" --snapshot "$PRESERVE" 2>&1)"; rc=$?
 after_hash="$(python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$PRESERVE")"
 if [ "$rc" -ne 0 ]; then ok; else bad "a failing refresh must not exit 0"; fi
 if [ "$before_hash" = "$after_hash" ]; then ok; else bad "a failing refresh must not touch the pre-existing snapshot file"; fi
