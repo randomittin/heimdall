@@ -562,11 +562,28 @@ Code/commits/PRs: write normal. "stop caveman" or "normal mode": revert. Level p
 RULES
 }
 
+# 2026-09-01 ultra-parity fix (docs/analysis/2026-09-01-caveman-ultra-parity-
+# research.md): n=30 real-eval structural diffing against evals/caveman/
+# upstream_skill.md found hmd_ultra's remaining token deficit was NOT lexical
+# (abbreviation density was already at parity, §4c) but structural -- 3/30
+# "how does X work" / "steps to" prompts broke into markdown `##` headers
+# with a full prose-register worked example per item, where upstream and
+# hmd's own simpler-question answers stayed in flat fragment style (measured:
+# 0.57 headers/response for hmd_ultra vs 0.13 for upstream_skill; one prompt,
+# a DB-migration-rollback walkthrough, alone accounted for 38% of the net
+# 30-prompt token deficit). The four additions below (objective sentence,
+# header ban, per-item-example ban, self-narration ban, redundant-recap ban,
+# plus one new contrastive pair and one new worked example) are additive
+# only -- nothing existing is deleted or reworded, so the pinned substrings
+# in test/heimdall-caveman.test.sh ("Abbreviate", the scope-discipline
+# sentence) survive verbatim. See the research doc's §8 for the full
+# rationale per clause and §9 for the falsifiable predictions this was
+# measured against.
 _rules_ultra() {
   cat <<'RULES'
 HMD OUTPUT COMPRESSION — level: ultra (rules injected below; not a compliance guarantee — audit via `hmd caveman-audit`)
 
-Respond max terse. All technical substance stay. Only fluff die.
+Respond max terse. All technical substance stay. Only fluff die. Shortest correct answer wins: if cutting a fact doesn't change the answer, cut it.
 
 ## Persistence
 
@@ -576,12 +593,15 @@ Default level: ultra (the only level). Change level: `heimdall-caveman set ultra
 
 ## Rules
 
-Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging, conjunctions. Fragments OK. Abbreviate (DB/auth/config/req/res/fn/impl). Arrows for causality (X → Y). One word when one word is enough. Technical terms exact. Code blocks unchanged. Errors quoted exact. Answer only what's asked: skip unrequested examples/names/failure-mode asides/code samples.
+Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging, conjunctions. Fragments OK. Abbreviate (DB/auth/config/req/res/fn/impl). Arrows for causality (X → Y). One word when one word is enough. Technical terms exact. Code blocks unchanged. Errors quoted exact. Answer only what's asked: skip unrequested examples/names/failure-mode asides/code samples. No headers (`#`/`##`) in answers — a flat list or plain fragments only, never a sectioned doc. Multi-cause or multi-step answers: one line per item, no per-item header, no per-item example — the user asked about the whole thing, not each part separately. Never narrate your own formatting ("writing this clearly", "let me structure this" — banned, just answer). Closing line adds a new fact or is dropped — never restate the opening in different words.
 
 Pattern: [thing] [action] [reason]. [next step].
 
 Not: "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..."
 Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
+
+Not (multi-cause, headered + example per cause — measured: ~2x the tokens of the line below, same content): a "## Cause 1" section with its own bullet list and code sample, repeated per cause.
+Yes (multi-cause, flat): "Causes: server missing CORS header, preflight OPTIONS unhandled, credentials+wildcard origin mismatch. Check response headers first."
 
 ## This level (ultra)
 
@@ -592,6 +612,9 @@ ultra: "Inline obj prop → new ref → re-render. `useMemo`."
 
 Example — "Explain database connection pooling."
 ultra: "Pool = reuse DB conn. Skip handshake → fast under load."
+
+Example — "Why is my build failing in CI but passing locally?"
+ultra: "Causes: env var missing in CI, Node/lang version mismatch, case-sensitive path (CI=Linux, local=Mac/Win), stale lockfile, timezone/locale diff. Diff CI log vs local run first."
 
 ## Auto-Clarity
 

@@ -195,6 +195,44 @@ case "$ultra_out" in
   *) bad "ultra rule text does not forbid volunteering unrequested extras: $ultra_out" ;;
 esac
 
+# 2026-09-01 ultra-parity fix: n=30 real-eval structural diffing
+# (docs/analysis/2026-09-01-caveman-ultra-parity-research.md) found
+# hmd_ultra's remaining token deficit vs upstream_skill was concentrated in
+# 3/30 "how does X work / steps to" prompts that broke into markdown headers
+# plus a per-item worked example instead of staying in flat fragment style
+# (measured: 0.57 headers/response for hmd_ultra vs 0.13 for upstream_skill;
+# one prompt alone was 38% of the net 30-prompt token deficit). Pin every
+# new clause so a future edit can't silently drop this fix, same discipline
+# as the scope-discipline pin directly above.
+case "$ultra_out" in
+  *"Shortest correct answer wins"*) ok "ultra rule text states the shortest-correct-answer objective" ;;
+  *) bad "ultra rule text does not state the shortest-correct-answer objective: $ultra_out" ;;
+esac
+case "$ultra_out" in
+  *"a flat list or plain fragments only, never a sectioned doc"*) ok "ultra rule text bans headers in answers" ;;
+  *) bad "ultra rule text does not ban headers in answers: $ultra_out" ;;
+esac
+case "$ultra_out" in
+  *"no per-item header, no per-item example"*) ok "ultra rule text bans per-item headers/examples on multi-cause answers" ;;
+  *) bad "ultra rule text does not ban per-item headers/examples on multi-cause answers: $ultra_out" ;;
+esac
+case "$ultra_out" in
+  *"Never narrate your own formatting"*) ok "ultra rule text bans self-referential formatting narration" ;;
+  *) bad "ultra rule text does not ban self-referential formatting narration: $ultra_out" ;;
+esac
+case "$ultra_out" in
+  *"never restate the opening in different words"*) ok "ultra rule text bans redundant closing recaps" ;;
+  *) bad "ultra rule text does not ban redundant closing recaps: $ultra_out" ;;
+esac
+case "$ultra_out" in
+  *"Yes (multi-cause, flat)"*) ok "ultra rule text has the new multi-cause flat contrastive example" ;;
+  *) bad "ultra rule text missing the multi-cause flat contrastive example: $ultra_out" ;;
+esac
+case "$ultra_out" in
+  *"Diff CI log vs local run first"*) ok "ultra rule text has the new CI-failure worked example" ;;
+  *) bad "ultra rule text missing the new CI-failure worked example: $ultra_out" ;;
+esac
+
 # ── rules with no argument uses the CURRENT level (via get) ──
 D="$(fresh)"
 run "$D" set ultra >/dev/null 2>&1
