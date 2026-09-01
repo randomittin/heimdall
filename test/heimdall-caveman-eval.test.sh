@@ -261,6 +261,31 @@ upstream_md5="$(md5 -q "$UPSTREAM_MD" 2>/dev/null || md5sum "$UPSTREAM_MD" 2>/de
 if [ "$upstream_md5" = "abc3c9e05065e4624d3c3ef489c17ed9" ]; then ok; else bad "vendored upstream_skill.md drifted from upstream (md5=$upstream_md5)"; fi
 
 # ---------------------------------------------------------------------------
+# Corpus-agnostic fixture for the refresh tests (7-10) below. Built by the
+# test itself instead of reading evals/caveman/prompts.txt, so growing the
+# real corpus (fb8bd95 took it from n=10 to n=30 on purpose -- n=10 measured
+# a 20-46% stdev per docs/analysis/2026-08-30-caveman-eval-measurement.md,
+# and the corpus is meant to keep growing) can never break this suite again.
+# Every expected-call-count/cost value below is DERIVED from
+# N_FIXTURE_PROMPTS, never a magic number re-pinned to whatever the real
+# corpus happens to contain today.
+# ---------------------------------------------------------------------------
+N_FIXTURE_PROMPTS=4
+N_ARMS=6   # mirrors ARM_ORDER in bin/heimdall-caveman-eval (a tool-shape
+           # constant, not a corpus-size one -- see file header)
+FIXTURE_PROMPTS="$TMPDIR_T/fixture-prompts.txt"
+: > "$FIXTURE_PROMPTS"
+i=1
+while [ "$i" -le "$N_FIXTURE_PROMPTS" ]; do
+  echo "fixture prompt $i" >> "$FIXTURE_PROMPTS"
+  i=$((i+1))
+done
+EXPECTED_ARM_CALLS=$((N_FIXTURE_PROMPTS * N_ARMS))
+EXPECTED_TOTAL_CALLS=$((EXPECTED_ARM_CALLS + 1))   # +1 claude_version() probe
+EXPECTED_COST_TOTAL="$(python3 -c "print($EXPECTED_ARM_CALLS * 0.0001)")"
+EXPECTED_COST_FMT="$(printf '%.4f' "$EXPECTED_COST_TOTAL")"
+
+# ---------------------------------------------------------------------------
 # 7. refresh guard: no --confirm-spend, no --dry-run -> refuses, ZERO real
 #    `claude` calls, exits non-zero. `claude` on PATH is a call-logging fake
 #    that would make this test fail loudly if it were ever actually invoked.
@@ -291,7 +316,7 @@ python3 -c "import json,sys; print(json.dumps({'result':'ok','usage':{'output_to
 FAKEEOF
 chmod +x "$FAKEBIN/claude"
 
-out="$(PATH="$FAKEBIN:$PATH" "$TOOL" refresh 2>&1)"; rc=$?
+out="$(PATH="$FAKEBIN:$PATH" "$TOOL" refresh --prompts "$FIXTURE_PROMPTS" 2>&1)"; rc=$?
 ncalls="$(wc -l < "$CALLLOG" | tr -d ' ')"
 if [ "$rc" -ne 0 ] && [ "$ncalls" = "0" ]; then ok; else bad "refresh without --confirm-spend must refuse and make 0 calls (rc=$rc, calls=$ncalls): $out"; fi
 
@@ -299,9 +324,9 @@ if [ "$rc" -ne 0 ] && [ "$ncalls" = "0" ]; then ok; else bad "refresh without --
 # 8. refresh --dry-run: zero calls, exit 0, prints the estimate
 # ---------------------------------------------------------------------------
 : > "$CALLLOG"
-out="$(PATH="$FAKEBIN:$PATH" "$TOOL" refresh --dry-run 2>&1)"; rc=$?
+out="$(PATH="$FAKEBIN:$PATH" "$TOOL" refresh --dry-run --prompts "$FIXTURE_PROMPTS" 2>&1)"; rc=$?
 ncalls="$(wc -l < "$CALLLOG" | tr -d ' ')"
-if [ "$rc" -eq 0 ] && [ "$ncalls" = "0" ] && echo "$out" | grep -q "60 real"; then ok; else bad "refresh --dry-run must make 0 calls and print the estimate (rc=$rc, calls=$ncalls): $out"; fi
+if [ "$rc" -eq 0 ] && [ "$ncalls" = "0" ] && echo "$out" | grep -q "$EXPECTED_ARM_CALLS real"; then ok; else bad "refresh --dry-run must make 0 calls and print the estimate (rc=$rc, calls=$ncalls): $out"; fi
 
 # ---------------------------------------------------------------------------
 # 9. refresh --confirm-spend (fully faked claude): correct call count, order,
@@ -313,16 +338,19 @@ if [ "$rc" -eq 0 ] && [ "$ncalls" = "0" ] && echo "$out" | grep -q "60 real"; th
 SNAP_OUT="$TMPDIR_T/generated-snapshot.json"
 FAKE_HOME2="$TMPDIR_T/home2"
 mkdir -p "$FAKE_HOME2"
-out="$(PATH="$FAKEBIN:$PATH" HEIMDALL_HOME="$FAKE_HOME2" "$TOOL" refresh --confirm-spend --snapshot "$SNAP_OUT" 2>&1)"; rc=$?
+out="$(PATH="$FAKEBIN:$PATH" HEIMDALL_HOME="$FAKE_HOME2" "$TOOL" refresh --confirm-spend --prompts "$FIXTURE_PROMPTS" --snapshot "$SNAP_OUT" 2>&1)"; rc=$?
 ncalls="$(wc -l < "$CALLLOG" | tr -d ' ')"
 if [ "$rc" -eq 0 ]; then ok; else bad "refresh --confirm-spend should succeed with a working fake claude (rc=$rc): $out"; fi
-# 1 claude_version() probe + 10 real prompts (evals/caveman/prompts.txt) x 6
-# arms = 61 calls, exactly.
-if [ "$ncalls" = "61" ]; then ok; else bad "expected exactly 61 claude invocations (1 version probe + 60 arm calls), got $ncalls"; fi
+# 1 claude_version() probe + N_FIXTURE_PROMPTS real prompts (the fixture
+# corpus built above, NOT evals/caveman/prompts.txt) x N_ARMS arms =
+# EXPECTED_TOTAL_CALLS calls, exactly -- derived from the fixture size so
+# growing the real corpus can never desync this count again.
+if [ "$ncalls" = "$EXPECTED_TOTAL_CALLS" ]; then ok; else bad "expected exactly $EXPECTED_TOTAL_CALLS claude invocations (1 version probe + $EXPECTED_ARM_CALLS arm calls), got $ncalls"; fi
 if [ -f "$SNAP_OUT" ]; then ok; else bad "refresh --confirm-spend must write the snapshot file"; fi
-# refresh's own stdout must be loud about what it just spent (60 calls x the
-# fake's $0.0001 = $0.0060), not silent about a real spend.
-if echo "$out" | grep -q "cost: \$0.0060"; then ok; else bad "refresh --confirm-spend must print the total cost it just spent: $out"; fi
+# refresh's own stdout must be loud about what it just spent
+# (EXPECTED_ARM_CALLS calls x the fake's $0.0001 = $EXPECTED_COST_FMT), not
+# silent about a real spend.
+if echo "$out" | grep -qF "cost: \$${EXPECTED_COST_FMT}"; then ok; else bad "refresh --confirm-spend must print the total cost it just spent (expected \$${EXPECTED_COST_FMT}): $out"; fi
 
 # Call ORDER: strict per-arm blocks of 10 (__baseline__, __terse__,
 # upstream_skill, hmd_lite, hmd_full, hmd_ultra) -- each block internally
@@ -337,12 +365,14 @@ import json
 lines = open('$CALLLOG').read().splitlines()
 parsed = [json.loads(l) for l in lines]
 calls = [argv for argv in parsed if argv != ['--version']]
-if len(calls) != 60:
+n_prompts = $N_FIXTURE_PROMPTS
+n_arms = $N_ARMS
+if len(calls) != n_prompts * n_arms:
     print('bad-length-%d' % len(calls))
 else:
     def sysprompt(argv):
         return argv[argv.index('--system-prompt') + 1] if '--system-prompt' in argv else None
-    blocks = [calls[i*10:(i+1)*10] for i in range(6)]
+    blocks = [calls[i*n_prompts:(i+1)*n_prompts] for i in range(n_arms)]
     flat = []
     bad = False
     for b in blocks:
@@ -353,7 +383,7 @@ else:
         flat.append(next(iter(sp)))
     if not bad and flat[0] is not None:
         bad = True
-    if not bad and len(set(flat)) != 6:
+    if not bad and len(set(flat)) != n_arms:
         bad = True
     print('bad' if bad else 'ok')
 ")"
@@ -364,7 +394,7 @@ else:
 out_json="$("$TOOL" report --snapshot "$SNAP_OUT" --json 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && echo "$out_json" | grep -q '"level": "hmd_lite"'; then ok; else bad "generated snapshot must round-trip through report cleanly (rc=$rc): $out_json"; fi
 rt_cost="$(get "$out_json" cost_usd_total)"
-feq "$rt_cost" 0.006 && ok || bad "round-tripped cost_usd_total expected ~0.006 (60 calls x \$0.0001) got $rt_cost"
+feq "$rt_cost" "$EXPECTED_COST_TOTAL" && ok || bad "round-tripped cost_usd_total expected ~$EXPECTED_COST_TOTAL ($EXPECTED_ARM_CALLS calls x \$0.0001) got $rt_cost"
 
 # ---------------------------------------------------------------------------
 # 10. a mid-sweep failure must NOT clobber a pre-existing good snapshot
@@ -383,7 +413,7 @@ exit 1
 FAILEOF
 chmod +x "$FAILBIN/claude"
 
-out="$(PATH="$FAILBIN:$PATH" "$TOOL" refresh --confirm-spend --snapshot "$PRESERVE" 2>&1)"; rc=$?
+out="$(PATH="$FAILBIN:$PATH" "$TOOL" refresh --confirm-spend --prompts "$FIXTURE_PROMPTS" --snapshot "$PRESERVE" 2>&1)"; rc=$?
 after_hash="$(python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$PRESERVE")"
 if [ "$rc" -ne 0 ]; then ok; else bad "a failing refresh must not exit 0"; fi
 if [ "$before_hash" = "$after_hash" ]; then ok; else bad "a failing refresh must not touch the pre-existing snapshot file"; fi
