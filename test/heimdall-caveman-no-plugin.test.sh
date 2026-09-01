@@ -163,8 +163,8 @@ fi
 C_HH="$(mktemp -d)/.heimdall"
 C_GET="$(HEIMDALL_HOME="$C_HH" "$REPO/bin/heimdall-caveman" get 2>/dev/null)"
 case "$C_GET" in
-  lite|full|ultra) ok "fresh heimdall-caveman get resolves a sane default ('$C_GET')" ;;
-  *) bad "fresh heimdall-caveman get did not resolve a valid level: '$C_GET'" ;;
+  ultra) ok "fresh heimdall-caveman get resolves the documented default ('$C_GET')" ;;
+  *) bad "fresh heimdall-caveman get did not resolve to 'ultra': '$C_GET'" ;;
 esac
 
 C_RULES="$(HEIMDALL_HOME="$C_HH" "$REPO/bin/heimdall-caveman" rules 2>/dev/null)"
