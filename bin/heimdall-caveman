@@ -562,38 +562,45 @@ Code/commits/PRs: write normal. "stop caveman" or "normal mode": revert. Level p
 RULES
 }
 
-# 2026-09-01 ultra-parity fix (docs/analysis/2026-09-01-caveman-ultra-parity-
-# research.md): n=30 real-eval structural diffing against evals/caveman/
-# upstream_skill.md found hmd_ultra's remaining token deficit was NOT lexical
-# (abbreviation density was already at parity, §4c) but structural -- 3/30
-# "how does X work" / "steps to" prompts broke into markdown `##` headers
-# with a full prose-register worked example per item, where upstream and
-# hmd's own simpler-question answers stayed in flat fragment style (measured:
-# 0.57 headers/response for hmd_ultra vs 0.13 for upstream_skill; one prompt,
-# a DB-migration-rollback walkthrough, alone accounted for 38% of the net
-# 30-prompt token deficit). The four additions below (objective sentence,
-# header ban, per-item-example ban, self-narration ban, redundant-recap ban,
-# plus one new contrastive pair and one new worked example) are additive
-# only -- nothing existing is deleted or reworded, so the pinned substrings
-# in test/heimdall-caveman.test.sh ("Abbreviate", the scope-discipline
-# sentence) survive verbatim. See the research doc's §8 for the full
-# rationale per clause and §9 for the falsifiable predictions this was
-# measured against.
+# 2026-09-02 ultra consolidation (docs/analysis/2026-09-02-caveman-ultra-
+# consolidation.md has full before/after counts + methodology): the
+# 2026-09-01 patch above raised hmd_ultra's median tokens past
+# upstream_skill (330 vs 359) but also measured a cost -- tokens-per-
+# visible-word rose 2.88->3.54 while an untouched control held flat, i.e.
+# piling on negative constraints was inflating hidden generation even as
+# it won the visible metric. This pass trims constraint COUNT instead of
+# adding more, per that measurement's own recommendation. Three cuts, zero
+# coverage loss: (1) the duplicate "## This level (ultra)" section, four
+# facts already stated once above, is deleted rather than restated; (2)
+# "Technical terms exact. Code blocks unchanged. Errors quoted exact."
+# (3 clauses) becomes one "Compress form, never substance" clause covering
+# the same ground -- grounded in two cross-layer reviews that independently
+# converge on this framing without either mechanism transferring: RTK's
+# silent-corruption disqualifier (docs/analysis/rtk-incorporation-
+# assessment-2026-08-22.md) and headroom's "generation may run compressed;
+# judgment never does" split (modules/headroom/manifest.json); (3) each
+# worked example's per-line "ultra: " label -- a level-disambiguator left
+# over from before caveman collapsed to one settable level (2026-09-01,
+# see this repo's CLAUDE.md) -- is dropped and the example reformatted to
+# one-line "Example -- "Q" -> "A"", dogfooding the arrow-for-causality/
+# flat-fragment rules the text itself teaches. All pinned substrings in
+# test/heimdall-caveman.test.sh survive verbatim except the header-ban
+# wording, updated alongside this change.
 _rules_ultra() {
   cat <<'RULES'
 HMD OUTPUT COMPRESSION — level: ultra (rules injected below; not a compliance guarantee — audit via `hmd caveman-audit`)
 
-Respond max terse. All technical substance stay. Only fluff die. Shortest correct answer wins: if cutting a fact doesn't change the answer, cut it.
+Respond max terse. Shortest correct answer wins: cut what doesn't change the answer, keep what does — technical substance always stays.
 
 ## Persistence
 
-ACTIVE EVERY RESPONSE. No revert after many turns. No filler drift. Still active if unsure. Off only: "stop caveman" / "normal mode".
+ACTIVE EVERY RESPONSE — no revert after many turns, no filler drift, active even if unsure. Off only: "stop caveman" / "normal mode".
 
 Default level: ultra (the only level). Change level: `heimdall-caveman set ultra`.
 
 ## Rules
 
-Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging, conjunctions. Fragments OK. Abbreviate (DB/auth/config/req/res/fn/impl). Arrows for causality (X → Y). One word when one word is enough. Technical terms exact. Code blocks unchanged. Errors quoted exact. Answer only what's asked: skip unrequested examples/names/failure-mode asides/code samples. No headers (`#`/`##`) in answers — a flat list or plain fragments only, never a sectioned doc. Multi-cause or multi-step answers: one line per item, no per-item header, no per-item example — the user asked about the whole thing, not each part separately. Never narrate your own formatting ("writing this clearly", "let me structure this" — banned, just answer). Closing line adds a new fact or is dropped — never restate the opening in different words.
+Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging, conjunctions. Fragments OK. Abbreviate (DB/auth/config/req/res/fn/impl). Arrows for causality (X → Y). One word when one word is enough. Compress form, never substance: technical terms/code/errors stay exact. Answer only what's asked: skip unrequested examples/names/failure-mode asides/code samples. No headers (`#`/`##`) — flat fragments only, never a sectioned doc. Multi-cause or multi-step: one line per item, no per-item header, no per-item example — the whole thing, not each part separately. Never narrate your own formatting — just answer. Closing line adds a new fact or is dropped — never restate the opening in different words.
 
 Pattern: [thing] [action] [reason]. [next step].
 
@@ -603,18 +610,11 @@ Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
 Not (multi-cause, headered + example per cause — measured: ~2x the tokens of the line below, same content): a "## Cause 1" section with its own bullet list and code sample, repeated per cause.
 Yes (multi-cause, flat): "Causes: server missing CORS header, preflight OPTIONS unhandled, credentials+wildcard origin mismatch. Check response headers first."
 
-## This level (ultra)
+Example — "Why React component re-render?" → "Inline obj prop → new ref → re-render. `useMemo`."
 
-Abbreviate (DB/auth/config/req/res/fn/impl), strip conjunctions, arrows for causality (X → Y), one word when one word is enough.
+Example — "Explain database connection pooling." → "Pool = reuse DB conn. Skip handshake → fast under load."
 
-Example — "Why React component re-render?"
-ultra: "Inline obj prop → new ref → re-render. `useMemo`."
-
-Example — "Explain database connection pooling."
-ultra: "Pool = reuse DB conn. Skip handshake → fast under load."
-
-Example — "Why is my build failing in CI but passing locally?"
-ultra: "Causes: env var missing in CI, Node/lang version mismatch, case-sensitive path (CI=Linux, local=Mac/Win), stale lockfile, timezone/locale diff. Diff CI log vs local run first."
+Example — "Why is my build failing in CI but passing locally?" → "Causes: env var missing in CI, Node/lang version mismatch, case-sensitive path (CI=Linux, local=Mac/Win), stale lockfile, timezone/locale diff. Diff CI log vs local run first."
 
 ## Auto-Clarity
 
@@ -622,7 +622,7 @@ Drop caveman for: security warnings, irreversible action confirmations, multi-st
 
 ## Boundaries
 
-Code/commits/PRs: write normal. "stop caveman" or "normal mode": revert. Level persists until changed or session end.
+Code/commits/PRs: write normal. Level persists until changed or session end.
 RULES
 }
 
