@@ -281,3 +281,48 @@ distinguished from a 30-point standard deviation.
 Two real runs, 60 `claude -p` calls each. First $3.75; second comparable.
 Roughly $7.50 total to learn that one specific hypothesis is wrong — which is
 the price of not shipping a guess as a fix.
+
+---
+
+## §9 — `output_tokens` folds in thinking, and it is NOT separable (2026-09-02)
+
+§8's ultra-parity run raised a question that outranks any further tuning: after the
+header-ban rule landed, hmd_ultra's `output_tokens`-per-VISIBLE-WORD rose 2.88 → 3.54
+(max 6.74) while the untouched `upstream_skill` control held flat at 2.85 → 2.80.
+Four prompts produced SHORTER visible text but MORE billed tokens (i=18: 103 → 56
+visible words, ratio 3.10 → 5.45). Hypothesis: added negative-constraint density
+inflated hidden thinking tokens, offsetting a real visible-text compression win.
+
+**Answer, from Anthropic's own documented usage object — not measured, and it did not
+need to be:** there is NO separate thinking/reasoning token field. The usage object
+exposes exactly `input_tokens`, `cache_creation_input_tokens`,
+`cache_read_input_tokens`, `output_tokens`. Extended thinking is "billed the same
+under every setting" regardless of whether it is displayed.
+
+So thinking tokens ARE inside `output_tokens`, and the API gives no way to decompose
+them. A paid probe was planned to measure the gap; it was CANCELLED as pointless —
+no amount of sampling separates two quantities the provider reports as one number.
+(~$2 saved; the agent stalled before spending, which was the lucky part, not the
+disciplined part.)
+
+### What this means for every number in this document
+
+- The harness measures **BILLED tokens**. That is the correct metric for COST, and
+  every cost claim here stands.
+- It is NOT a clean metric for **conciseness of output**. "hmd_ultra uses fewer
+  tokens than upstream" is a valid cost statement; "hmd_ultra writes more concise
+  answers" is NOT established by it, because a rule change can move visible text one
+  way and thinking the other.
+- The tokens-per-visible-word ratio (visible words counted from the snapshot text,
+  billed tokens from usage) is the only available proxy for the split. It is a proxy,
+  not a decomposition. Treat a rise in it as a WARNING that a constraint may be
+  buying visible brevity with hidden thinking.
+
+### The design rule this hardens
+
+Two independent findings now point the same way: the rejected intensity-ladder
+hypothesis, and this one. **Prefer FEWER constraints covering more ground over more
+negative rules.** Added constraint density plausibly costs thinking tokens, and
+thinking tokens are billed and invisible — the worst combination. Any future ultra
+work should report constraint COUNT alongside byte count, and treat a rising
+tokens-per-visible-word ratio as a regression signal even when total tokens fall.
