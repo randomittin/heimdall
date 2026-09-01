@@ -72,21 +72,32 @@ echo "--------------------------------------------------------------------"
 [ -x "$BLOCK" ] && ok "bin/heimdall-caveman-block is executable" \
   || bad "bin/heimdall-caveman-block missing or not executable"
 
-# ── 1. THE BLOCK REPORTS THE LIVE LEVEL ──
+# ── 1. THE BLOCK REPORTS THE LIVE LEVEL, NEVER A HARDCODED ONE ──
 # Matched against the HEADER line specifically ("HMD OUTPUT COMPRESSION —
-# level: <lvl>"), not a bare `level: full` substring: every level's rules text
-# also contains the unrelated boilerplate sentence "Default level: full.
-# Change level: ..." (see bin/heimdall-caveman's _rules_lite/_rules_full/
-# _rules_ultra), so a bare substring match on ultra's own output would
-# false-positive on that sentence and "prove" a bug that is not there.
+# level: <lvl>"), not a bare `level: ultra` substring: the rules text also
+# contains the unrelated boilerplate sentence "Default level: ultra (the
+# only level). Change level: ..." (see bin/heimdall-caveman's _rules_ultra),
+# so a bare substring match on ultra's own output would false-positive on
+# that sentence and "prove" a bug that is not there.
+#
+# 2026-09-01: hmd collapsed to a single settable level, ultra (see
+# bin/heimdall-caveman "SCOPE"). 'full'/'lite' are no longer states hmd can
+# actually be in -- `set full`/`set lite` now MAP FORWARD to ultra rather
+# than erroring (see test/heimdall-caveman.test.sh's coverage of that
+# mapping). So feeding run_at a RETIRED name is now the STRONGER version of
+# this guarantee, not a weaker one: it proves the block reports the TRUE
+# resolved state (ultra) even when fed a legacy name, rather than parroting
+# the raw input back or freezing on a stale claim -- exactly the failure
+# class this file exists to catch, just triggered from the input side now
+# instead of from a hardcoded template.
 out="$(run_at full)"
 case "$out" in
-  *'HMD OUTPUT COMPRESSION — level: full'*) ok "level=full is reported as full" ;;
-  *) bad "level=full produced: $out" ;;
+  *'HMD OUTPUT COMPRESSION — level: ultra'*) ok "legacy level=full maps forward and is honestly reported as ultra" ;;
+  *) bad "level=full (legacy) produced: $out" ;;
 esac
 case "$out" in
-  *'ULTRA'*|*'ultra is active'*) bad "level=full still asserts ultra somewhere: $out" ;;
-  *) ok "level=full never asserts ultra (the original bug)" ;;
+  *'HMD OUTPUT COMPRESSION — level: full'*) bad "level=full (legacy) was falsely asserted verbatim instead of the true resolved level: $out" ;;
+  *) ok "level=full (legacy) is never asserted verbatim -- the true resolved level (ultra) wins" ;;
 esac
 
 out="$(run_at ultra)"
@@ -95,8 +106,8 @@ case "$out" in
   *) bad "level=ultra produced: $out" ;;
 esac
 case "$out" in
-  *'HMD OUTPUT COMPRESSION — level: full'*) bad "level=ultra still asserts full in its header: $out" ;;
-  *) ok "level=ultra never asserts full in its header" ;;
+  *'HMD OUTPUT COMPRESSION — level: full'*|*'HMD OUTPUT COMPRESSION — level: lite'*) bad "level=ultra still asserts a retired level in its header: $out" ;;
+  *) ok "level=ultra never asserts a retired level (full/lite) in its header" ;;
 esac
 
 # ── 2. THE BLOCK NAMES THE REAL WAY TO CHANGE LEVEL, NEVER THE RETIRED ONE ──
