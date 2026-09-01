@@ -355,10 +355,22 @@ JSON_OK() { # stdin -> exit 0 iff stdin parses as JSON
 if ! command -v python3 >/dev/null 2>&1; then
   bad "python3 unavailable — cannot verify --json payload purity"
 else
-  # Force the rebuild path: make the source newer than the binary.
-  touch "$SRC"
-  [ "$SRC" -nt "$TRACKER" ] \
-    && ok "rebuild path armed (edit-tracker.c newer than the binary)" \
+  # Force the rebuild path deterministically: remove the binary so verify-edits'
+  # own "missing OR stale" check (bin/verify-edits: `[ ! -x "$TRACKER" ] || [ ...
+  # -nt ... ]`) is unambiguously true. This used to `touch "$SRC"` and rely on
+  # `-nt` mtime comparison, which is a real race: if $TRACKER's mtime is ever >=
+  # "now" at the moment $SRC is touched (clock adjustment, coalesced filesystem
+  # timestamp writeback under load, or just an unlucky scheduling gap), the arm
+  # silently fails and verify-edits correctly, faithfully takes the "nothing is
+  # stale" branch -- silence that looks like a bug but isn't one. Only 8d below
+  # actually proves the rebuild fired (it requires stderr content); 8a/8b/8c never
+  # check for it, which is why a silent arming failure surfaces as exactly one red
+  # assertion here, not several. `rm -f` has no such window: existence is a
+  # boolean the filesystem reports immediately and consistently, not a comparison
+  # of two independently-recorded timestamps.
+  rm -f "$TRACKER"
+  [ ! -x "$TRACKER" ] \
+    && ok "rebuild path armed (edit-tracker binary removed)" \
     || bad "could not arm the rebuild path — the next assertions prove nothing"
 
   # 8a. rebuild path + ABSENT ledger: the NON_VERIFIED payload must still parse.
@@ -376,9 +388,13 @@ else
                     || bad "rebuild path: expected exit 2, got $jbrc"
 
   # 8b. rebuild path + PRESENT ledger with a real edit: the normal payload too.
-  touch "$SRC"
+  # Set up the ledger state first (trk calls the binary directly -- see trk() --
+  # so it needs $TRACKER to still exist), then remove the binary right before the
+  # vfy call that must observe it missing. Order matters here in a way it didn't
+  # for the old touch-based arm, which never destroyed the binary.
   trk init >/dev/null 2>&1
   trk log Write "$EDITED" >/dev/null 2>&1
+  rm -f "$TRACKER"
   jbuild2="$(vfy --json 2>/dev/null)"; jb2rc=$?
   printf '%s' "$jbuild2" | JSON_OK \
     && ok "rebuild path: --json stdout is valid JSON (present ledger, real edit)" \
@@ -396,7 +412,7 @@ else
   # 8d. the chatter is not merely deleted — it still reaches STDERR, so a human
   #     rebuilding the tracker is still told. Silencing it would trade one bug
   #     for a quieter one.
-  touch "$SRC"
+  rm -f "$TRACKER"
   errout="$(vfy --json 2>&1 >/dev/null)"
   case "$errout" in
     *"Building"*) ok "rebuild path: build chatter still reported on STDERR" ;;
