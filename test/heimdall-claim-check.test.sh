@@ -22,7 +22,13 @@
 #
 # HERMETIC: every reality-check in this suite runs against fixture PIDs and a
 # sweep-pattern override this suite creates and tears down itself — never an
-# ambient real background process this suite does not control.
+# ambient real background process this suite does not control. This includes
+# the FALSE-claim sweep sections ([1], [17]): they override
+# HEIMDALL_CLAIM_CHECK_SWEEP_PATTERN to $NO_SWEEP_PATTERN, a sentinel
+# guaranteed to match nothing, rather than relying on the tool's default
+# pattern (`test/run-all\.sh`) being ambiently absent — a real test/run-all.sh
+# sweep's own parent process stays alive and pgrep-visible for its whole run,
+# which is exactly what this suite is commonly invoked from inside of.
 #
 # PREMATURE_REPORT sections ([18]+) fixture bin/heimdall-agents' "sibling
 # live" signal directly rather than spawning a real Agent-tool subagent:
@@ -54,6 +60,22 @@ command -v jq >/dev/null 2>&1 || { echo "FATAL: jq required for this suite"; exi
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-claim-check-XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 
+# NO_SWEEP_PATTERN — a sweep-pattern value guaranteed to match no real
+# process, on this machine or any other: it embeds this run's own unique
+# sandbox dir name. Sections [1] and [17] assert that a FALSE "sweep is
+# running" claim gets flagged; that only holds if nothing matches the pattern
+# being checked. The tool's own default pattern (`test/run-all\.sh`) is NOT
+# safe to assume absent, because this suite is itself routinely invoked AS A
+# CHILD of a real test/run-all.sh sweep, whose parent process stays alive and
+# `pgrep -f`-visible for the sweep's entire run — matching the literal
+# default and silently flipping the claim from false to true. Confirmed by
+# reproduction: backgrounding a fixture process with argv0 "test/run-all.sh"
+# reproduces this exact failure (sections [1] and [17] only) with no other
+# change. Overriding to this sentinel, the same technique section [2] already
+# uses for the TRUE-claim path ("sleep 30"), makes the false-claim path
+# hermetic too.
+NO_SWEEP_PATTERN="hmd-claim-check-no-such-sweep-$(basename "$SANDBOX")"
+
 # run_raw PAYLOAD_JSON [REPO] — feeds PAYLOAD_JSON to the tool on stdin,
 # captures stdout/stderr to sandbox files. REPO defaults to $ROOT (a real,
 # tool-bearing repo); tests that need to simulate a missing bin/ tool pass a
@@ -76,8 +98,10 @@ run() {
 stderr_has() { grep -qF -- "$1" "$SANDBOX/stderr.log" 2>/dev/null; }
 
 echo "[1] false 'sweep is running' claim (no such process) -> WARNS, still exits 0"
+export HEIMDALL_CLAIM_CHECK_SWEEP_PATTERN="$NO_SWEEP_PATTERN"
 run "The sweep is running now."
 RC=$?
+unset HEIMDALL_CLAIM_CHECK_SWEEP_PATTERN
 if [ "$RC" -eq 0 ] && stderr_has "false process-status claim"; then
   ok "false sweep-running claim produces a stderr warning and still exits 0"
 else
@@ -260,8 +284,10 @@ TRANSCRIPT="$SANDBOX/transcript.jsonl"
   printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The sweep is running now."}]}}'
 } > "$TRANSCRIPT"
 PAYLOAD="$(jq -cn --arg tp "$TRANSCRIPT" '{session_id:"t", transcript_path:$tp}')"
+export HEIMDALL_CLAIM_CHECK_SWEEP_PATTERN="$NO_SWEEP_PATTERN"
 run_raw "$PAYLOAD"
 RC=$?
+unset HEIMDALL_CLAIM_CHECK_SWEEP_PATTERN
 if [ "$RC" -eq 0 ] && stderr_has "false process-status claim"; then
   ok "transcript_path fallback extracts the LAST assistant turn's text and warns on its false claim"
 else
