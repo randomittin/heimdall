@@ -89,7 +89,11 @@ active session are turn-boundary, not long-idle):
 | output | 5,911,035 | 5.0× | 29,555,175 | **6.64%** |
 | **TOTAL** | 2,642,921,317 | — | **444,983,249** | **100%** |
 
-(Sanity check: 848,317 + 250,488,930 + 164,090,826 + 29,555,175 = 444,983,249. ✓)
+(Sanity check on the precise, pre-rounding values: 848,317 + 250,488,930.4 +
+164,090,826.25 + 29,555,175 = 444,983,248.65 → 444,983,249. The whole-number cells
+shown in the table above are each rounded independently, so summing THOSE rounded
+integers gives 444,983,248, one less than the rounded total — a display-rounding
+artifact, not an arithmetic error.)
 
 **Cache-read's DOLLAR share is 56.29%, not 94.8%.** The 94.8% figure is a real, correctly
 computed TOKEN share — it is just not a cost share, because it ignores the 0.1×/1.25×/
@@ -126,7 +130,7 @@ absolute dollar figure needs a mix assumption:
 |---|---|---|
 | Pure Sonnet 5 ($2/$10) | input $2, output $10 | **$889.97** |
 | Pure Opus-tier ($5/$25) | input $5, output $25 | **$2,224.92** |
-| Blended (RTK doc's own machine-mix: opus-5 71.2%, opus-4-8 17.7%, sonnet-5 8.6%, `rtk-incorporation-assessment-2026-08-22.md:145`) | ~$4.62 in / $23.09 out (weighted, un-normalized on the stated 97.5%; 2.5% residual unallocated in the source and immaterial here) | **~$2,054.60** |
+| Blended (RTK doc's own machine-mix: opus-5 71.2%, opus-4-8 17.7%, sonnet-5 8.6%, `rtk-incorporation-assessment-2026-08-22.md:145`) | $4.617/MTok-in equiv. (weighted, un-normalized on the stated 97.5%; 2.5% residual unallocated in the source and immaterial here) | **~$2,054.49** |
 
 (Method: total-input-equivalent-tokens × $/MTok-in ÷ 1,000,000, since every field above
 was already expressed as an input-equivalent token count; output-equivalent tokens
