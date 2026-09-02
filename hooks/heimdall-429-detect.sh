@@ -105,6 +105,44 @@ transcript_path="$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty
 if [ -z "$transcript_path" ]; then
   transcript_path="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
 fi
+# MEASURED 2026-09-02: SubagentStop does NOT fire when a subagent dies from
+# a 429. Three real 429 deaths this session; .planning/metrics.jsonl (written
+# by the SubagentStop metric handler) shows ZERO subagentstop rows at any of
+# them. So the SubagentStop path above is real but never reached for THIS
+# failure mode -- the detector was dead-on-arrival for its own purpose.
+#
+# The orchestrator's Stop hook DOES fire. But the parent transcript carries a
+# 429 only as PROSE inside a task-notification string -- zero structural
+# matches. The structural record lives solely in the dead SUBAGENT's own
+# transcript, under <tmp>/<slug>/<session>/tasks/<agentId>.output.
+#
+# So on the Stop path we additionally scan sibling task transcripts. Bounded
+# three ways so this can never become an unbounded scan on every turn:
+#   - only files MODIFIED within the same recency window,
+#   - at most HMD_429_DETECT_MAX_SIBLINGS files (newest first),
+#   - the same bounded-tail read per file as the primary path.
+# Fails open exactly like everything else here: any error yields no marker.
+sibling_paths=""
+if [ -z "$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty' 2>/dev/null || true)" ]; then
+  _win="${HMD_429_DETECT_WINDOW_SECS:-300}"
+  case "$_win" in ''|*[!0-9]*) _win=300 ;; esac
+  _max="${HMD_429_DETECT_MAX_SIBLINGS:-12}"
+  case "$_max" in ''|*[!0-9]*) _max=12 ;; esac
+  _mins=$(( (_win + 59) / 60 )); [ "$_mins" -ge 1 ] || _mins=1
+  _tdir="${HMD_429_DETECT_TASKS_DIR:-}"
+  if [ -z "$_tdir" ] && [ -n "$transcript_path" ]; then
+    _sess="$(basename "$transcript_path" .jsonl 2>/dev/null || true)"
+    if [ -n "$_sess" ]; then
+      for _c in "${TMPDIR:-/tmp}"/claude-*/*/"$_sess"/tasks /private/tmp/claude-*/*/"$_sess"/tasks; do
+        [ -d "$_c" ] && { _tdir="$_c"; break; }
+      done
+    fi
+  fi
+  if [ -n "$_tdir" ] && [ -d "$_tdir" ]; then
+    sibling_paths="$(find "$_tdir" -maxdepth 1 -type f -name '*.output' -mmin "-${_mins}" 2>/dev/null | head -n "$_max" || true)"
+  fi
+fi
+
 [ -n "$transcript_path" ] || exit 0
 [ -f "$transcript_path" ] || exit 0
 [ -r "$transcript_path" ] || exit 0
@@ -135,6 +173,27 @@ match_ts="$(tail -c "$tail_bytes" "$transcript_path" 2>/dev/null \
         | $ts
       ) catch empty
     ' 2>/dev/null | tail -1 || true)"
+# Primary path found nothing -- try the bounded sibling set (Stop path only).
+if [ -z "$match_ts" ] && [ -n "$sibling_paths" ]; then
+  for _sp in $sibling_paths; do
+    [ -f "$_sp" ] && [ -r "$_sp" ] || continue
+    match_ts="$(tail -c "$tail_bytes" "$_sp" 2>/dev/null \
+      | jq -R -r --argjson window "$window_secs" '
+          try (
+            (. | fromjson) as $r
+            | select($r.isApiErrorMessage == true and $r.error == "rate_limit" and $r.apiErrorStatus == 429)
+            | ($r.timestamp // empty) as $ts
+            | select($ts != "")
+            | ($ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $ts_epoch
+            | (now - $ts_epoch) as $age
+            | select($age >= 0 and $age <= $window)
+            | $ts
+          ) catch empty
+        ' 2>/dev/null | tail -1 || true)"
+    if [ -n "$match_ts" ]; then safe_event="${safe_event}-sibling"; break; fi
+  done
+fi
+
 [ -n "$match_ts" ] || exit 0
 
 "$MARK_BIN" mark --reason "$safe_event-transcript-429" >/dev/null 2>&1 || true
