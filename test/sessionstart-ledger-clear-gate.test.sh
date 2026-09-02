@@ -299,14 +299,32 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# G9/G10 — the other 8 SessionStart entries are undisturbed: same count, and
+# G9/G10 — the other SessionStart entries are undisturbed: same count, and
 #          entry [5]'s own pre-existing INPUT=$(cat) precedent is untouched.
+#
+# The count is pinned ON PURPOSE, as a tripwire: appending a SessionStart entry
+# must be a deliberate act that trips this and gets reviewed, never a silent
+# drive-by. It has already done its job once -- 9 -> 10 when the
+# heimdall-caveman `rules` entry was wired (2026-09-03), which is what actually
+# delivers hmd's ultra rule text into a session. The UserPromptSubmit entry
+# carries only a per-turn pointer, so without this entry ultra was a pointer to
+# nothing. Bumping this number is correct; bumping it WITHOUT knowing which
+# entry arrived is the thing to refuse.
 # ══════════════════════════════════════════════════════════════════════════
 SS_COUNT="$(jq '.hooks.SessionStart | length' "$HOOKS_JSON")"
-if [ "$SS_COUNT" -eq 9 ]; then
-  ok "G9 all 9 SessionStart entries still present"
+if [ "$SS_COUNT" -eq 10 ]; then
+  ok "G9 all 10 SessionStart entries still present"
 else
-  bad "G9 expected 9 SessionStart entries, found $SS_COUNT"
+  bad "G9 expected 10 SessionStart entries, found $SS_COUNT"
+fi
+
+# The caveman `rules` entry specifically: it is the ONLY thing that puts hmd's
+# real compression rules into a session, so silently losing it would revert
+# ultra to a no-op with every other assertion here still green.
+if jq -e '[.hooks.SessionStart[].hooks[]?.command] | map(select(test("heimdall-caveman"))) | length == 1' "$HOOKS_JSON" >/dev/null 2>&1; then
+  ok "G9b the heimdall-caveman rules entry is wired exactly once"
+else
+  bad "G9b heimdall-caveman rules entry missing or duplicated in SessionStart"
 fi
 
 ENTRY5_CMD="$(jq -r '.hooks.SessionStart[5].hooks[0].command' "$HOOKS_JSON")"

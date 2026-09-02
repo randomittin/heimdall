@@ -200,6 +200,14 @@
             "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; SCRUB=\"$PLUGIN/bin/heimdall-scrub-claude-mem\"; if [ -x \"$SCRUB\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 10; exec @ARGV' \"$SCRUB\" 2>/dev/null; else \"$SCRUB\" 2>/dev/null; fi; fi; exit 0"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then \"$CAV\" rules; fi; exit 0"
+          }
+        ]
       }
     ],
     "SubagentStop": [
