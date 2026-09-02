@@ -98,7 +98,14 @@ def measure(paths, max_lines=None):
                     elif btype == "thinking":
                         # Claude API thinking blocks carry content under
                         # "thinking", not "text" -- {"type":"thinking",
-                        # "thinking":"...","signature":"..."}.
+                        # "thinking":"...","signature":"..."}. Verified against
+                        # a real Claude Code transcript: the key is present,
+                        # but its value is stored as "" (only the opaque
+                        # "signature" is persisted) -- so thinking char totals
+                        # are ~0 by design in this harness's own transcripts,
+                        # not a parse gap. Thinking token cost still shows up
+                        # correctly in usage_totals (billed as output tokens),
+                        # this only affects the block-chars histogram.
                         text_val = block.get("thinking")
                     else:
                         text_val = block.get("text")
