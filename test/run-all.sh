@@ -703,8 +703,30 @@ if command -v jq >/dev/null 2>&1; then
   # canonical toplevel are the same directory but different strings, which false-
   # positived the repo-mismatch check in test/sweep-receipt-gate.test.sh case C.
   RECEIPT_REPO_CANON="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || echo "$REPO")"
+  # tree_clean means "no uncommitted CODE" -- not "zero bytes of git-status
+  # output". A modified/staged/deleted TRACKED entry always counts, in ANY
+  # directory, with no exemption: that is exactly "this green does not describe
+  # committed code". A brand-new UNTRACKED entry normally counts too, for the
+  # same reason (an uncommitted new source file that made the run pass is the
+  # textbook stale green this receipt exists to catch) -- EXCEPT the TEAM MODE
+  # coordination-substrate directories .gitignore itself carves out as shared,
+  # git-backed runtime state (see the `!.planning/ledger/checkpoints/` etc.
+  # blocks there): ledger/activity, ledger/collisions, ledger/verdicts,
+  # ledger/checkpoints, and journal/. Hooks publish scrubbed, secret-free
+  # snapshots there continuously and INDEPENDENTLY of any sweep, then a
+  # separate "session-end checkpoint" commit lands them later -- not code any
+  # suite reads as input. Without this carve-out, tree_clean can go
+  # permanently false the moment any hook happens to publish mid-sweep, for a
+  # repo state nothing is actually wrong with -- a gate that can never be
+  # green is as useless as one that's always green. Only the UNTRACKED (`??`)
+  # form of these exact paths is exempt; a MODIFIED entry (`M`, ` M`, etc.)
+  # under the same directories is a real edit to already-committed state and
+  # still fails, same as anywhere else.
+  _receipt_dirty_lines() {
+    _status_snapshot | grep -Ev '^\?\? \.planning/(ledger/(activity|collisions|verdicts|checkpoints)/|journal/)'
+  }
   RECEIPT_TREE_CLEAN=false
-  [ -z "$(_status_snapshot)" ] && RECEIPT_TREE_CLEAN=true
+  [ -z "$(_receipt_dirty_lines)" ] && RECEIPT_TREE_CLEAN=true
   if mkdir -p "$RECEIPT_DIR" 2>/dev/null; then
     RECEIPT_TMP="$(mktemp "$RECEIPT_DIR/.last-sweep.XXXXXX" 2>/dev/null || true)"
     if [ -n "$RECEIPT_TMP" ] && jq -n \
