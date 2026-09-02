@@ -1,0 +1,7 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"start"}]}}
+{"type":"assistant","message":{"id":"msg_A","role":"assistant","usage":{"input_tokens":100,"cache_read_input_tokens":5000,"cache_creation_input_tokens":200,"output_tokens":50},"content":[{"type":"text","text":"hi"}]}}
+{"type":"assistant","message":{"id":"msg_A","role":"assistant","usage":{"input_tokens":100,"cache_read_input_tokens":5000,"cache_creation_input_tokens":200,"output_tokens":50},"content":[{"type":"tool_use","name":"Bash","input":{}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"0123456789"}]}}
+{"type":"assistant","message":{"id":"msg_B","role":"assistant","usage":{"input_tokens":10,"cache_read_input_tokens":6000,"cache_creation_input_tokens":0,"output_tokens":20},"content":[{"type":"text","text":"bye"},{"type":"thinking","thinking":"think"}]}}
+not valid json at all {{{
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"y","content":[{"type":"text","text":"ABCDEFGHIJKLMNO"}]}]}}
