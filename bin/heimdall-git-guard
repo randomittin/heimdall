@@ -117,11 +117,34 @@ _heal_core_config
 gitdir="$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null || printf '%s/.git' "$repo")"
 lock="$gitdir/index.lock"
 
-# Is a git process alive (i.e. might legitimately own the lock)? Overridable via
+# Is a git process alive AND plausibly the owner of THIS lock? Overridable via
 # HMD_GIT_GUARD_PGREP for testing the conservative wait/preserve path deterministically
-# (a copied `git`-named binary can't be spawned on a code-signed OS). Default: real pgrep.
+# (a copied `git`-named binary can't be spawned on a code-signed OS).
+#
+# Default: `lsof` on the exact lock PATH, not a machine-wide `pgrep -x git`. Git's own
+# lockfile.c opens the lock's fd and holds it for the whole operation, only closing (and
+# renaming) it at commit/rollback time — so "is $lock open by anyone" is both necessary
+# and sufficient, and unlike `pgrep -x git` it is naturally SCOPED to this lock. A bare
+# `pgrep -x git` matches ANY process named git anywhere on the machine — a read-only
+# `git log` holding no lock at all, or another agent's completely unrelated worktree —
+# so on a box running many concurrent hmd agents (each with its own background git
+# activity: autoupdate checks, context-sync, sibling worktree writes) some git process
+# is running almost continuously, making the old check TRUE nearly all the time. The
+# guard then "conservatively" waited out its whole budget and left every stale lock in
+# place forever — indistinguishable from the bug it exists to fix. Measured root cause
+# of test/git-guard-routing.test.sh's "stale index.lock SURVIVED" / "auto-checkpoint
+# silently lost" / "PreToolUse Bash left a stale lock in place", test/git-guard-worktree
+# .test.sh's "worktree end-to-end failed", and test/heimdall-git-guard.test.sh's "stale
+# lock NOT cleared" — all four hit the SAME default (non-overridden) code path. Falls
+# back to the old global pgrep only when lsof itself is unavailable, which is no worse
+# than the previous behaviour.
 _git_alive() {
-  if [ -n "${HMD_GIT_GUARD_PGREP:-}" ]; then eval "$HMD_GIT_GUARD_PGREP"; else pgrep -x git >/dev/null 2>&1; fi
+  if [ -n "${HMD_GIT_GUARD_PGREP:-}" ]; then eval "$HMD_GIT_GUARD_PGREP"; return; fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -- "$lock" >/dev/null 2>&1
+  else
+    pgrep -x git >/dev/null 2>&1
+  fi
 }
 
 # fast path: no lock → nothing to do.
