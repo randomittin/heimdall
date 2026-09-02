@@ -23,6 +23,18 @@
 #       then, re-run after the fixture suite is made to fail, OVERWRITES exit_code to
 #       1 rather than leaving the prior green receipt in place (this is defect #3
 #       reproduced exactly: a stale green claim outliving the run it described).
+#   (A2) WRITER — TEAM MODE CARVE-OUT — an untracked file under a documented TEAM
+#       MODE coordination-substrate directory (.planning/ledger/checkpoints/, the
+#       exact shape hmd's own checkpoint-share hook publishes mid-sweep) does NOT
+#       flip tree_clean to false; the identical receipt-write, with a genuinely
+#       MODIFIED TRACKED file also present at the same time, DOES still flip
+#       tree_clean to false and check-quality-gates still blocks with the same
+#       DIRTY message section E proves — and an untracked file OUTSIDE the
+#       allowlist still dirties the tree too, unchanged. This closes a real
+#       release blocker: a sweep that finished 9275/9280 green recorded
+#       tree_clean=false solely because hmd's own coordination hook had written an
+#       untracked checkpoint file mid-run — a receipt that can never legitimately
+#       be green is exactly as useless as one that is always green.
 #   (B) GATE FAILS — no receipt at all => exit 2, message names the absence (defect #4
 #       reproduced exactly: "sweep needed" with nothing started, nothing to check).
 #   (C) GATE PASSES — a fresh receipt matching current HEAD, clean tree, exit_code=0
@@ -154,6 +166,85 @@ A2_RC=$?
 [ "$(jq -r '.exit_code' "$RW_RECEIPT" 2>/dev/null)" = "1" ] \
   && ok "A7 receipt exit_code updated to 1 -- a red run cannot leave the prior green receipt in place (defect #3, reproduced and closed)" \
   || bad "A7 receipt still shows a stale exit_code" "$(cat "$RW_RECEIPT" 2>/dev/null)"
+
+echo "-- A2. WRITER: TEAM MODE substrate carve-out (untracked-exempt, tracked-not) ----"
+RWS="$WORK/writer-repo-substrate"
+newrepo "$RWS"
+mkdir -p "$RWS/test"
+cp "$RUN_ALL" "$RWS/test/run-all.sh"
+cat > "$RWS/test/dummy.test.sh" <<'DUMMYEOF'
+#!/usr/bin/env bash
+# throwaway fixture suite for test/sweep-receipt-gate.test.sh -- deliberately trivial.
+set -uo pipefail
+echo "1 passed, 0 failed"
+exit 0
+DUMMYEOF
+chmod +x "$RWS/test/dummy.test.sh"
+echo "v1" > "$RWS/TRACKED.txt"
+# Seed an ALREADY-TRACKED sibling under ledger/checkpoints/, mirroring the real repo
+# (git ls-files .planning/ledger/checkpoints/ there returns ~58 tracked files already).
+# Without this, .planning/ has never been tracked at all in this from-scratch fixture,
+# so git's default (non -uall) untracked-files mode collapses the whole new tree into
+# one directory-level line (`?? .planning/`) instead of listing the file underneath --
+# an artifact of an empty fixture repo, not of the real target repo, where the
+# directory is always already known to git because of its many tracked siblings.
+mkdir -p "$RWS/.planning/ledger/checkpoints"
+echo '{"haid":"existing.placeholder-machine-0000"}' \
+  > "$RWS/.planning/ledger/checkpoints/haid_existing.placeholder-machine-0000.json"
+git -C "$RWS" add -A
+git -C "$RWS" commit -q -m "fixture: dummy suite + run-all.sh copy + tracked file"
+RWS_RECEIPT="$RWS/.heimdall/receipts/last-sweep.json"
+# Isolated OUTSIDE $RWS on purpose: heimdall-state.json is unrelated legacy-flag
+# bookkeeping (see mk_state), and if it were written INSIDE $RWS via the default
+# cwd-relative path it would itself become a second, allowlist-outside untracked
+# file -- confounding exactly the carve-out this block exists to prove in isolation.
+RWS_STATE="$WORK/rws-heimdall-state.json"
+
+# -- untracked TEAM MODE substrate file only: must NOT dirty the tree --------------
+mkdir -p "$RWS/.planning/ledger/checkpoints"
+echo '{"haid":"unknown.test-machine-0001","note":"mid-sweep publish, not source"}' \
+  > "$RWS/.planning/ledger/checkpoints/haid_unknown.test-machine-0001.json"
+( cd "$RWS" && bash test/run-all.sh --min 1 ) >"$WORK/sub-a.out" 2>&1
+SUB_A_RC=$?
+[ "$SUB_A_RC" = 0 ] && ok "A8 hermetic run exits 0 with an untracked TEAM MODE substrate file present" \
+  || bad "A8 expected exit 0, got $SUB_A_RC" "$(cat "$WORK/sub-a.out")"
+[ "$(jq -r '.tree_clean' "$RWS_RECEIPT" 2>/dev/null)" = "true" ] \
+  && ok "A9 receipt tree_clean stays true -- untracked .planning/ledger/checkpoints/ file is the documented TEAM MODE carve-out, not a stale-green code change" \
+  || bad "A9 tree_clean flipped false for an untracked substrate-only file" "$(cat "$RWS_RECEIPT" 2>/dev/null)"
+( cd "$RWS" && HEIMDALL_STATE_FILE="$RWS_STATE" "$STATE_BIN" init >/dev/null 2>&1 \
+  && HEIMDALL_STATE_FILE="$RWS_STATE" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
+SUB_GATE1_OUT="$(cd "$RWS" && HEIMDALL_HOME="$RWS/.heimdall" HEIMDALL_STATE_FILE="$RWS_STATE" "$STATE_BIN" check-quality-gates 2>&1)"; SUB_GATE1_RC=$?
+[ "$SUB_GATE1_RC" = 0 ] \
+  && ok "A10 check-quality-gates PASSES against this receipt -- an untracked runtime/coordination file alone never blocks the gate" \
+  || bad "A10 expected exit 0, got $SUB_GATE1_RC" "$SUB_GATE1_OUT"
+
+# -- SAME substrate file still present, PLUS a modified TRACKED file: must dirty ---
+echo "v2 -- uncommitted edit" > "$RWS/TRACKED.txt"
+( cd "$RWS" && bash test/run-all.sh --min 1 ) >"$WORK/sub-b.out" 2>&1
+SUB_B_RC=$?
+[ "$SUB_B_RC" = 0 ] && ok "A11 hermetic run still exits 0 (dummy suite itself still passes)" \
+  || bad "A11 expected exit 0, got $SUB_B_RC" "$(cat "$WORK/sub-b.out")"
+[ "$(jq -r '.tree_clean' "$RWS_RECEIPT" 2>/dev/null)" = "false" ] \
+  && ok "A12 receipt tree_clean flips to false -- a MODIFIED TRACKED file (TRACKED.txt) is never exempt, even with an exempt substrate file also present (the carve-out does not swallow real dirtiness)" \
+  || bad "A12 tree_clean stayed true with a modified tracked file present" "$(cat "$RWS_RECEIPT" 2>/dev/null)"
+SUB_GATE2_OUT="$(cd "$RWS" && HEIMDALL_HOME="$RWS/.heimdall" HEIMDALL_STATE_FILE="$RWS_STATE" "$STATE_BIN" check-quality-gates 2>&1)"; SUB_GATE2_RC=$?
+[ "$SUB_GATE2_RC" = 2 ] \
+  && ok "A13 check-quality-gates BLOCKS against this receipt -- a modified tracked file must still fail the gate (hard constraint, must never regress)" \
+  || bad "A13 expected exit 2, got $SUB_GATE2_RC" "$SUB_GATE2_OUT"
+echo "$SUB_GATE2_OUT" | grep -qi "DIRTY" \
+  && ok "A14 block message names the dirty tree explicitly, same wording the hand-built dirty-tree case in section E checks" \
+  || bad "A14 block message does not name the dirty tree" "$SUB_GATE2_OUT"
+
+# -- extra rigor: an untracked file OUTSIDE the substrate allowlist still dirties --
+git -C "$RWS" checkout -q -- TRACKED.txt
+echo "stray" > "$RWS/some-new-source-file.txt"
+( cd "$RWS" && bash test/run-all.sh --min 1 ) >"$WORK/sub-c.out" 2>&1
+SUB_C_RC=$?
+[ "$SUB_C_RC" = 0 ] && ok "A15 hermetic run still exits 0" \
+  || bad "A15 expected exit 0, got $SUB_C_RC" "$(cat "$WORK/sub-c.out")"
+[ "$(jq -r '.tree_clean' "$RWS_RECEIPT" 2>/dev/null)" = "false" ] \
+  && ok "A16 receipt tree_clean is still false for an untracked file OUTSIDE the TEAM MODE allowlist -- the original stale-green protection for ordinary new files is unchanged" \
+  || bad "A16 tree_clean stayed true for a stray untracked file outside the substrate allowlist" "$(cat "$RWS_RECEIPT" 2>/dev/null)"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # B-H. GATE — bin/heimdall-state check-quality-gates against hand-built receipts.
