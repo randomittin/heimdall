@@ -361,8 +361,32 @@ _migrate_once() {
 # one divergence this mechanism was built for. Silent (no output) when the
 # plugin flag is absent or holds a value outside lite/full/ultra (wenyan-*,
 # off, garbage) -- that is not a disagreement about a level this tool owns.
+# Is the external caveman plugin actually INSTALLED, as opposed to merely
+# having left files behind? The divergence warning below exists to catch the
+# plugin silently rewriting its own flag to "full" while live -- the exact
+# behaviour that made hmd take ownership. But once the operator uninstalls the
+# plugin, `~/.claude/.caveman-active` and the plugin's cache dir BOTH survive
+# the removal (measured 2026-09-03: marketplace removed, cache + flag still
+# present, flag still reading "full"). Warning off a stale flag then becomes
+# permanent noise about a dead file, and noise is precisely how a real warning
+# gets ignored -- a failure mode this repo has measured more than once.
+#
+# The authoritative signal is Claude Code's own installed-plugin registry, NOT
+# the presence of files: an uninstall clears the registry entry and leaves the
+# cache orphaned. Fails OPEN toward warning (returns true) when the registry
+# cannot be read at all, since a missing registry is not evidence of absence
+# and suppressing a real divergence is worse than one spurious line.
+_plugin_is_installed() {
+  local reg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
+  [ -n "${HMD_CAVEMAN_PLUGIN_REGISTRY:-}" ] && reg="$HMD_CAVEMAN_PLUGIN_REGISTRY"
+  [ -f "$reg" ] || return 0
+  [ -r "$reg" ] || return 0
+  grep -qi 'caveman' "$reg" 2>/dev/null
+}
+
 _warn_if_diverged() {
   local resolved="$1" plugin_val
+  _plugin_is_installed || return 0
   plugin_val="$(_safe_read_level "$PLUGIN_FLAG")"
   _is_renderable_level "$plugin_val" || return 0
   [ "$plugin_val" = "$resolved" ] && return 0

@@ -206,6 +206,59 @@ rm -rf "$A_WD" "$(dirname "$A_HH")" "$(dirname "$A_TRACE")" "$(dirname "$A_LOG")
        "$(dirname "$C_HH")" "$D_HOME" 2>/dev/null || true
 
 echo "--------------------------------------------------------------------"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# E — divergence warning is gated on the plugin being genuinely INSTALLED,
+#     not merely on files it left behind.
+#
+# THE BUG THIS PINS: the operator uninstalled the caveman plugin (marketplace
+# removed) and BOTH ~/.claude/.caveman-active (still reading "full") and the
+# plugin's cache dir survived. hmd then warned "level diverged" on every
+# `get`, forever, about a dead file. Noise is how real warnings get ignored;
+# this repo has measured that failure mode more than once.
+# ══════════════════════════════════════════════════════════════════════════
+E_HOME="$(mktemp -d)"; E_FLAG="$(mktemp -d)"
+printf 'ultra' > "$E_HOME/caveman-level"
+printf 'full'  > "$E_FLAG/.caveman-active"
+
+E_REG_ON="$(mktemp)";  printf '{"plugins":[{"name":"caveman"}]}' > "$E_REG_ON"
+E_REG_OFF="$(mktemp)"; printf '{"plugins":[]}'                   > "$E_REG_OFF"
+
+_e_stderr() {
+  HEIMDALL_HOME="$E_HOME" CLAUDE_CONFIG_DIR="$E_FLAG" \
+    HMD_CAVEMAN_PLUGIN_REGISTRY="$1" "$REPO/bin/heimdall-caveman" get 2>&1 >/dev/null
+}
+
+if printf '%s' "$(_e_stderr "$E_REG_ON")" | grep -q 'diverged'; then
+  ok "E1 plugin INSTALLED + level mismatch still WARNS (real divergence preserved)"
+else
+  bad "E1 installed plugin with a mismatched flag failed to warn — the check is now blind"
+fi
+
+if [ -z "$(_e_stderr "$E_REG_OFF")" ]; then
+  ok "E2 plugin UNINSTALLED + stale flag is SILENT (no noise about a dead file)"
+else
+  bad "E2 warned about an orphaned flag from an uninstalled plugin"
+fi
+
+if printf '%s' "$(_e_stderr /nonexistent/registry.json)" | grep -q 'diverged'; then
+  ok "E3 unreadable registry FAILS OPEN toward warning (absence is not evidence)"
+else
+  bad "E3 unreadable registry suppressed the warning — silently blind"
+fi
+
+E_LVL="$(HEIMDALL_HOME="$E_HOME" CLAUDE_CONFIG_DIR="$E_FLAG" \
+  HMD_CAVEMAN_PLUGIN_REGISTRY="$E_REG_OFF" "$REPO/bin/heimdall-caveman" get 2>/dev/null)"
+if [ "$E_LVL" = "ultra" ]; then
+  ok "E4 hmd's own level stays authoritative regardless of the stale flag"
+else
+  bad "E4 expected ultra, got '$E_LVL' — a stale plugin flag changed hmd's level"
+fi
+
+rm -rf "$E_HOME" "$E_FLAG" "$E_REG_ON" "$E_REG_OFF"
+
+
 echo "heimdall-caveman-no-plugin.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
