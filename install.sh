@@ -679,6 +679,47 @@ ensure_crypto_backend() {
 #   configured  — opted in: registered the marketplace + installed the plugin (enabled)
 #   skipped     — the `claude` CLI is absent, so no plugin registration is possible
 #   failed      — opted in, but a register/install step failed and it's still absent (LOUD)
+# ── Retire the legacy external caveman plugin ──────────────────────────────────
+# hmd USED to install this as a companion:
+#     claude plugins marketplace add JuliusBrussee/caveman
+#     claude plugins install caveman@caveman
+# Compression has since moved IN-HOUSE (bin/heimdall-caveman, wired via
+# hooks.json SessionStart + UserPromptSubmit). Every user who installed hmd
+# before that move still has the plugin, and leaving it is actively harmful
+# rather than merely redundant: BOTH now inject a compression instruction, at
+# levels that disagree. The plugin resets ITSELF to "full" on restart -- the
+# documented defect that caused the move -- while hmd holds "ultra". Two
+# conflicting instructions are worse than either alone, and they silently
+# invalidate any compression measurement taken afterwards.
+#
+# So an update RETIRES it. Scoped tightly and reversibly:
+#   * touches ONLY caveman@caveman and the JuliusBrussee marketplace, never
+#     any other plugin or marketplace;
+#   * fast no-op when already absent (the steady state after one update);
+#   * opt out with HEIMDALL_KEEP_CAVEMAN_PLUGIN=1 for anyone who genuinely
+#     prefers the upstream plugin to hmd own in-house level;
+#   * NON-FATAL, fail-open -- a failed uninstall must never break an update.
+# Reinstalling by hand is one documented command, so this stays recoverable.
+#
+# Prints ONE state word: absent | kept | retired | failed | skipped
+ensure_caveman_plugin_retired() {
+  command -v claude >/dev/null 2>&1 || { printf 'skipped'; return 0; }
+  if ! claude plugins list 2>/dev/null | grep -qi 'caveman'; then
+    printf 'absent'; return 0
+  fi
+  if [ "${HEIMDALL_KEEP_CAVEMAN_PLUGIN:-0}" = "1" ]; then
+    printf 'kept'; return 0
+  fi
+  claude plugins uninstall caveman@caveman >/dev/null 2>&1 || true
+  # Drop the marketplace too, but ONLY once nothing from it remains installed:
+  # removing a marketplace another plugin still needs would break its updates.
+  if ! claude plugins list 2>/dev/null | grep -qi 'caveman'; then
+    claude plugins marketplace remove JuliusBrussee >/dev/null 2>&1 || true
+    printf 'retired'; return 0
+  fi
+  printf 'failed'
+}
+
 ensure_claude_mem() {
   command -v claude >/dev/null 2>&1 || { printf 'skipped'; return 0; }
   local mkt="thedotmack/claude-mem" mkt_name="thedotmack" plugin="claude-mem@thedotmack"
@@ -1449,6 +1490,12 @@ main() {
   local CM_T0; CM_T0="$(_tele_now_ms)"
   _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem started
   step_begin "Setting up claude-mem (memory)"
+  local CAV_STATE; CAV_STATE="$(ensure_caveman_plugin_retired)"
+  if [ "$CAV_STATE" = "retired" ]; then
+    printf '   %s  retired the legacy caveman plugin (compression is in-house: hmd caveman get)\n' "$OK"
+  elif [ "$CAV_STATE" = "failed" ]; then
+    printf '   %s  caveman plugin still installed and will conflict. Remove: claude plugins uninstall caveman@caveman\n' "$WARN"
+  fi
   local CM_STATE; CM_STATE="$(ensure_claude_mem)"
   case "$CM_STATE" in
     present)
