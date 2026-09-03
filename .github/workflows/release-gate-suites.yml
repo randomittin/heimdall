@@ -1,0 +1,145 @@
+# release-gate-suites — run the suites that themselves enforce the release-blocking gates.
+#
+# THE GAP THIS CLOSES. Until this file, .github/workflows/ held exactly one job
+# (public-repo-no-secrets.yml, a gitleaks backstop). The actual correctness suite for this
+# repo — test/run-all.sh, ~400 suites / 9000+ assertions — has only ever run on a
+# maintainer's own machine. Every agent-driven commit in this repo lands with
+# `git commit --no-verify` (see CLAUDE.md "Commit attribution"), so the repo's own native
+# git hooks never fire for that path either. A push from a freshly cloned, unconfigured
+# checkout was therefore verified by NOTHING once it left a maintainer's laptop. This
+# workflow is the first check that runs on GitHub's own infrastructure, against the exact
+# bytes GitHub holds, on every push and every pull request.
+#
+# WHAT THIS DOES NOT REPLACE. The full local sweep (`bash test/run-all.sh`, every suite,
+# measured 30-75 minutes at --jobs 6 on an M-series mac) stays the authoritative
+# pre-landing gate — see CLAUDE.md "When the full gate runs — ONCE, immediately before the
+# landing commit". Running the full sweep here on every push would either make CI too slow
+# for anyone to wait for, or need a large parallel matrix this repo has no evidence it
+# needs yet. Instead this workflow runs a curated, principled SUBSET: the suites that
+# enforce the MECHANISMS the rest of the gate stack depends on. If one of these is broken,
+# every other gate's "green" is untrustworthy too, which makes "eventually, on a
+# maintainer's machine" the least acceptable answer for exactly these suites. Named
+# explicitly, never a keyword guess:
+#   sweep-receipt-gate, gate-receipt-truth   — the sweep receipt this repo's OWN push gate
+#                                              (bin/heimdall-state check-quality-gates)
+#                                              reads is honest, fresh, and not forged.
+#   heimdall-run-receipt                     — a run's own receipt-of-having-run holds up.
+#   gate-echo-parser-guard                   — the gate-output parser this repo's tooling
+#                                              reads is not silently fooled by lookalike
+#                                              output.
+#   edit-hook-matcher                        — the PreToolUse edit hook fires on the tool
+#                                              calls it claims to match.
+#   sessionstart-ledger-clear-gate           — session-boundary ledger state does not leak
+#                                              across sessions.
+#   caveman-hook-wire, heimdall-caveman,
+#   caveman-plugin-retire                    — the caveman compression hook is actually
+#                                              wired at the level it claims, and the
+#                                              retired external plugin stays retired.
+#   heimdall-429-detect                      — rate-limit detection the fallback routing
+#                                              stack depends on still fires.
+#   git-guard-routing, git-guard-worktree,
+#   heimdall-git-guard, heimdall-git-guard-selfheal
+#                                             — every git-guard-* suite: the guard that
+#                                              keeps a worktree-isolated agent's git
+#                                              commands inside its own worktree (the exact
+#                                              mechanism that fired mid-session on this
+#                                              workflow's own author).
+# Deliberately excluded from the "heimdall-caveman" entry above: heimdall-caveman-
+# compliance / -eval / -no-plugin. They share the filename prefix but test different,
+# non-gate-blocking behavior, and the filter below is anchored so it cannot pull them in
+# by accident (see the comment on the filter itself).
+#
+# RUNNER OS — macos-latest, deliberately, not the usual ubuntu-latest default. This repo is
+# macOS-developed and macOS-tested: test/run-all.sh's own timeout_run() exists BECAUSE
+# macOS has no timeout(1) (it forks a perl-alarm'd process group instead); bin/heimdall-
+# statusline carries a GNU `stat -c%.9Y` fallback branch for Linux that branch's own commit
+# documents as never having been executed; other suites in this repo shell out to
+# launchctl, sw_vers, and `stat -f`. Running even a careful subset on ubuntu-latest risks
+# going red for PLATFORM reasons that have nothing to do with the correctness this workflow
+# exists to check — which is exactly the "a red nobody trusts becomes a red nobody reads"
+# failure mode this repo's own caveman-compliance and gate-truth docs keep measuring
+# elsewhere. macos-latest costs roughly 10x the per-minute multiplier ubuntu-latest does in
+# GitHub's billing model, but the absolute cost stays small because the SCOPE below is a
+# 14-suite subset, not the full sweep: minutes, not hours. Each of the 14 suites was read
+# in full before this file was written specifically to check for exotic host dependencies:
+# none of them shell out to launchctl, sw_vers, docker, or the network; jq, perl, and
+# python3 are the only external tools they use, and GitHub's macos-latest image ships all
+# three.
+#
+# CHECKOUT DEPTH — left at the default shallow (depth-1) checkout, unlike the sibling
+# secrets workflow's explicit `fetch-depth: 0`. That workflow needs full history because it
+# scans the whole commit graph. The only real-repo git calls found across all 14 suites
+# here are `git rev-parse` (--show-toplevel / HEAD) in git-guard-worktree,
+# heimdall-git-guard-selfheal, and sweep-receipt-gate — resolving the current ref, never
+# walking ancestor history — so a single-commit checkout is sufficient and faster.
+#
+# FAILURE SEMANTICS — test/run-all.sh is the source of truth: it exits 1 if any suite is
+# FAIL / TIMEOUT / DISCREPANCY (printed failures but exited 0 anyway — a silent red hiding
+# in plain sight) or if the working tree was mutated mid-run. Nothing in this file sets
+# `continue-on-error`, so a red suite fails this job, which fails the check on the push/PR.
+# `timeout-minutes` below is a hard backstop independent of run-all.sh's own per-suite
+# alarm — it exists for failure modes a per-suite timeout cannot catch, such as a hung
+# checkout step or a wedged runner.
+#
+# WHAT THIS DOES NOT COVER — stated plainly rather than left to be discovered. This runs 14
+# of the ~400+ suites under test/. It does not run anything test/run-all.sh's own
+# live_reason() classifies as live/credentialed — suites that deploy, publish, or
+# read/mutate the deployed control plane, which need --include-live and real credentials
+# that neither this runner nor a public CI job should hold — and it does not run the other
+# ~390 suites covering everything else in this repo. A green run here is a fast, principled
+# SMOKE signal that the mechanisms the release gate itself depends on are intact. It is not
+# a substitute for the full local sweep before landing work, and is not claimed to be one.
+#
+# No artifact upload on failure (unlike the sibling secrets workflow, which uploads a
+# redacted SARIF report because that structured output is otherwise unreadable). Here,
+# test/run-all.sh's own stdout already IS the full human-readable diagnostic — the
+# FAILED / TIMEOUT / DISCREPANCY sections and the summary table — so the job log is
+# sufficient and a second copy in an artifact would add nothing.
+name: release-gate-suites
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gate-suites-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate-suites:
+    name: gate suites (macOS, curated subset)
+    runs-on: macos-latest
+    # Backstop only — see "FAILURE SEMANTICS" above. Normal runtime for 14 short suites is
+    # expected in the low single-digit minutes; this bounds the pathological case (e.g. a
+    # wedged runner) without being tight enough to false-fail on ordinary CI noise.
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # The filter is a single anchored alternation. It was verified before this file was
+      # written to select exactly these 14 files out of the full test/*.test.sh glob and
+      # nothing else — in particular it does NOT also pull in
+      # heimdall-caveman-compliance.test.sh / heimdall-caveman-eval.test.sh /
+      # heimdall-caveman-no-plugin.test.sh, which share the "heimdall-caveman" prefix but
+      # are deliberately outside this curated set. Each alternative is anchored with
+      # `\.test\.sh$`, so a branch only matches when it is the LAST path segment before the
+      # suffix — "heimdall-caveman" cannot match "heimdall-caveman-compliance.test.sh"
+      # because "-compliance" sits between the two. test/release-gate-suites-workflow.test.sh
+      # re-derives this exact property against the live test/ directory on every run, so
+      # drift (a renamed suite, a new same-prefixed sibling) fails a test instead of
+      # silently over- or under-matching here.
+      #
+      # --timeout 240 (run-all.sh's own default is 180s) gives a shared CI runner headroom
+      # over a warmed-up dev laptop; none of these 14 carries a slow-suite override in
+      # run-all.sh's own suite_timeout(), so this is margin, not a tuned budget for a
+      # suite known to run long.
+      - name: Run curated release-gate suites
+        run: |
+          set -euo pipefail
+          bash test/run-all.sh --timeout 240 --filter \
+            '/(caveman-hook-wire|caveman-plugin-retire|edit-hook-matcher|gate-echo-parser-guard|gate-receipt-truth|git-guard-routing|git-guard-worktree|heimdall-429-detect|heimdall-caveman|heimdall-git-guard-selfheal|heimdall-git-guard|heimdall-run-receipt|sessionstart-ledger-clear-gate|sweep-receipt-gate)\.test\.sh$'
