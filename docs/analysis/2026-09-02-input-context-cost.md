@@ -401,3 +401,66 @@ being worse. This is presented as a corrected hypothesis, not a claim.
    tentative "reduce it" hypothesis to a measured "keep it, it's what prevents #1 from
    being worse." Headroom is rejected. Caveman/output-side levers are capped low by the
    6.64% output cost ceiling regardless of technique.
+
+---
+
+## §7 — The #1 lever was already built, already firing, and ignored (2026-09-03)
+
+§5 ranks context/compaction discipline first: **33.5%, $369.50 measured-recoverable**,
+an order of magnitude above every tool option combined. The obvious next question is
+"what should we build?" The answer is NOTHING — it already exists and it already works.
+
+`bin/heimdall-ctx-meter` is wired at `UserPromptSubmit[1]` and fires correctly.
+Run against this very session, as the hook invokes it:
+
+```
+[heimdall] CONTEXT 422,199 tokens — past the 150,000 ceiling. Checkpoint and
+           restart: run /hmd:save, then start a fresh session.
+[heimdall]     $0.366/req at 731K context vs $0.0593/req at 118K — 6.17x.
+               A restart re-pays ~35K of preamble (~$0.02); staying here cost
+               $369.50 over one session.
+```
+
+It fired on every prompt of this session. Context still reached 422,199 tokens —
+2.8x the ceiling — and the session continued for a full day past it.
+
+**So the gap is not detection. It is that the orchestrator kept working.** The meter
+is advisory: it prints, and nothing stops the turn. This is the identical class of
+defect this session catalogued three other times — the caveman instruction that was
+injected every turn while 3.25% filler survived; `heimdall-metric --type`, mandated in
+CLAUDE.md with ~895 of 900 rows missing it; and the "report once when all agents
+finish" rule sitting in the orchestrator's own persistent memory while it narrated
+after nearly every completion. An instruction with no read-back does not bind, and an
+advisory warning is an instruction with no read-back.
+
+### Why this one is worth more than the others
+
+The three cases above cost tokens. This one costs **$369.50 per occurrence**, measured
+on this repo, by the owner's own two days of identical working style:
+
+```
+2026-08-05 · 476 reqs · 731,707 mean ctx -> $0.366  / request
+2026-08-07 · 153 reqs · 118,678 mean ctx -> $0.0593 / request   = 6.17x cheaper
+```
+
+It is also the cheapest to fix: a restart re-pays ~35K of preamble, about $0.02.
+The ratio between the cost of compliance and the cost of non-compliance is roughly
+18,000:1, and the session still ran past it.
+
+### What would actually bind
+
+Unresolved, and stated as a question rather than a plan, because this document should
+not repeat the mistake of proposing an unenforceable fix for an unenforceable fix:
+
+- A `UserPromptSubmit` hook CAN return a blocking decision, not merely text. Whether it
+  SHOULD hard-block a turn at the ceiling is a judgement call with a real failure mode —
+  a wrongly-tuned block would strand an operator mid-task with no override.
+- The honest interim: the ceiling is the OPERATOR's to enforce, and the meter's job is
+  to make ignoring it a conscious act rather than an oversight. It does that correctly.
+
+### The measurement this session is
+
+Every number in §1-§5 was produced by a session that was itself the worst case in the
+corpus. The 2.64B cache-read total, the $2,054.49, and the 422K context above are the
+same event described three ways. That is not a caveat to the analysis — it is the
+strongest single data point in it.
