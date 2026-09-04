@@ -111,15 +111,17 @@ boundary from a different angle):
      silently by load_config()'s allowlist copy; cmd_check additionally
      warns on stderr if it finds one, so that silence is never mistaken for
      the field having done something.
-  8. THREE STATES, one safety boundary. `off` (default, never route), `auto`
+  8. FOUR STATES, one safety boundary. `off` (default, never route), `auto`
      (the exhaustion/pre-exhaustion reaction -- route only when preflight
      passes AND heimdall-session-usage confirms the ~95% threshold is
-     crossed, else WAIT rather than block -- see point 11), and `switch`
+     crossed, else WAIT rather than block -- see point 11), `switch`
      (route EVERYTHING, tier-blind, still gated by the same preflight as
-     every other state). None of the three ever changes WHETHER routing is
-     safe -- points 1-7 above apply identically in all three; `switch`
-     changes WHAT routes, never whether a failing Tier-1/model-pin/sidecar/
-     ToS check is survivable.
+     every other state), and `coop` (a deliberate, standing, PER-ROLE
+     allowlist -- never quota-reactive, never WAITs; see point 13). None of
+     the four ever changes WHETHER routing is safe -- points 1-7 above apply
+     identically in all four; each state only changes WHAT routes and WHEN,
+     never whether a failing Tier-1/model-pin/sidecar/ToS check is
+     survivable.
 
      REMOVED (owner directive, 2026-08-28): a fourth state, `on`, used to
      exist as a CAPABILITY-TIER routing decision -- haiku-tier work only, via
@@ -238,6 +240,51 @@ boundary from a different angle):
       whatever is now on disk, and returns that exact exit code -- arm is
       self-verifying, never a "trust me" tool.
 
+  13. `coop` is deliberate, per-role, standing division of labour -- NOT a
+      quota-reactive state like `auto`/`switch`. The MAIN agent (the
+      operator's own Claude Code / Cursor session) NEVER routes under
+      `coop` and stays on api.anthropic.com unconditionally -- that is
+      coop's defining property, and the reason it cannot be implemented by
+      simply widening `switch`'s allowlist. Only SPECIFIC named subagent
+      roles the operator has explicitly opted in via `coop add <role>`
+      route, and only because the operator chose to divide labour that
+      way, never because a quota threshold tripped. Default allowlist is
+      EMPTY: `coop` with no roles configured routes NOTHING -- the
+      operator names roles in one at a time, never a guessed or inherited
+      default set (see cmd_coop_add). Judgment roles
+      (bin/lib/hmd-adjudication-set.sh's hmd_is_adjudication -- reviewer,
+      verifier, security-auditor, incident-responder, plus any
+      *-review*/*-audit*/*-verif* type) can NEVER be added to the
+      allowlist -- refused at CONFIG TIME (cmd_coop_add), with a clear
+      reason, not merely skipped later at check time; run_preflight's own
+      coop_role_allowed check re-verifies this independently at
+      check/route time too, so a hand-edited config that smuggled an
+      adjudication role onto disk still cannot route it (defense in
+      depth, not a single gate). Role resolution for `check` is
+      `--role ROLE`, falling back to the HMD_AGENT_TYPE environment
+      variable when --role is omitted -- the same variable
+      bin/lib/hmd-route-claude already reads for its own judgment pin, and
+      the only channel available at all for `base-url` (bin/heimdall-route
+      calls it with no --role argument, and this file must never require
+      that caller to change). A bare `check` under `coop` with no
+      resolvable role (no --role, no HMD_AGENT_TYPE) reports REFUSE, never
+      a misleading global ROUTE -- there is no such thing as "coop routes
+      by default" for an unidentified caller. `coop` never sets a
+      session-wide ANTHROPIC_BASE_URL and never can: cmd_base_url only
+      ever prints an endpoint for THIS invocation's resolved role, and the
+      main session's own launch never calls through this per-role path at
+      all -- routing the main agent would destroy the entire point of the
+      state. `coop` NEVER WAITs (mirrors `switch`'s always-decide shape,
+      not `auto`'s exhaustion-gated one) -- a role is either on the
+      allowlist and preflight-clean (ROUTE) or it is not (REFUSE); there
+      is no "capacity not yet crossed" concept for a standing per-role
+      division of labour. See run_preflight's `coop_role_allowed` check
+      and _coop_role_allowed() for the exact allow/deny logic, and
+      bin/heimdall-precheck-agent's own coop section for why an in-process
+      Agent-tool spawn (no exec boundary) can never actually be routed
+      even for an allowlisted role, and is refused outright rather than
+      silently left on Anthropic while a caller believes it was routed.
+
 MUST FAIL CLOSED -- the deliberate inverse of heimdall-quota-advisor's "MUST
 FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
 signal must stay silent (exit quietly, print nothing). This tool's job is
@@ -267,15 +314,22 @@ latter. It has no opinion on retries and must never be consulted for one.
 
 USAGE
 -----
-  heimdall-fallback status [--json]            current state + would-preflight-pass, secret-free
-  heimdall-fallback set {off,auto,switch}      persist a new state (off is always safe)
-  heimdall-fallback check                      run the preflight; exit code IS the verdict.
-  heimdall-fallback arm [--provider P]          self-provision target_provider +
-                        [--state auto|switch]     operator_key_env (never inventing a
-                                                credential) and write state, then run
-                                                check and report its verdict. See header
-                                                point 12.
-  heimdall-fallback where                      print the config file path
+  heimdall-fallback status [--json]              current state + would-preflight-pass, secret-free
+  heimdall-fallback set {off,auto,switch,coop}   persist a new state (off is always safe)
+  heimdall-fallback check [--role ROLE]          run the preflight; exit code IS the verdict.
+                                                  --role only matters under state=coop (falls
+                                                  back to $HMD_AGENT_TYPE when omitted); ignored
+                                                  under off/auto/switch.
+  heimdall-fallback coop add ROLE                add/remove ROLE from the coop allowlist (add is
+                        remove ROLE                 refused for an adjudication role -- header
+                        list                        point 13) / print the current allowlist
+  heimdall-fallback arm [--provider P]            self-provision target_provider +
+                        [--state auto|switch]       operator_key_env (never inventing a
+                                                  credential) and write state, then run
+                                                  check and report its verdict. See header
+                                                  point 12 (coop is deliberately not an
+                                                  arm --state choice -- see point 13).
+  heimdall-fallback where                        print the config file path
 
 Global flags (before the subcommand -- matches bin/heimdall-pressure /
 bin/heimdall-metric):
@@ -287,8 +341,9 @@ CONFIG  <repo>/.heimdall/fallback.json -- gitignored by the blanket
 field below defaults to the safe value:
   {
     "schema": 1,
-    "state": "off",                        # off | auto | switch -- anything else, including
-                                            # the removed 'on', reads as off (header point 6)
+    "state": "off",                        # off | auto | switch | coop -- anything else,
+                                            # including the removed 'on', reads as off
+                                            # (header point 6)
     "operator_key_env": "",                # NAME of an env var holding the operator's
                                             # OWN OmniRoute/provider key -- never a value.
                                             # NOT required when target_provider is a
@@ -305,9 +360,14 @@ field below defaults to the safe value:
     "target_provider": "",                 # provider name; checked against the deny list
     "tos_flagged_providers": [],           # operator ADDITIONS to the built-in deny
                                             # list only -- can never remove a built-in
-    "noauth_providers": []                 # operator ADDITIONS to the built-in no-auth
+    "noauth_providers": [],                # operator ADDITIONS to the built-in no-auth
                                             # (keyless) provider list only -- see header
                                             # point 10; never removes a built-in entry
+    "coop_roles": []                       # explicit per-role allowlist for state=coop,
+                                            # EMPTY BY DEFAULT -- an operator names roles
+                                            # in one at a time via `coop add`; an
+                                            # adjudication role can never be added (see
+                                            # header point 13)
   }
 
 EXIT CODES
