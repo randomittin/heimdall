@@ -117,7 +117,7 @@ Always produce a structured plan:
 - **Wave:** [1|2|3...]
 - **Dependencies:** [list of task names, or "none"]
 - **Agent:** `hmd:coder` | `hmd:design` | `hmd:database-architect` | `hmd:test-runner` | `hmd:docs-writer` | `hmd:lint-quality` | `hmd:reviewer` | `hmd:verifier` (NAMESPACED — bare names fail dispatch). Use `hmd:database-architect` for any task whose domain is "database — schemas, migrations, queries, ORMs" instead of routing it to `hmd:coder`.
-- **Model + effort:** `opus` + `max` | `opus` + `high` | `sonnet` + `default` | `haiku` + `low` (see Model & Effort Assignment below)
+- **Model + effort:** `sonnet` + `default` | `opus` + `high` | `opus` + `max` | `haiku` + `low` | `fable` + `max` (escalation-only; see Model & Effort Assignment below)
 - **Read first:** [exact file paths the agent must Read before editing]
 - **Files:** Create: `<paths>`. Modify: `<path>:<line-range>`.
 - **Skills:** [skill names the agent must invoke, in precedence order]
@@ -138,13 +138,14 @@ Write the full plan to `.planning/PLAN-<phase>.md`. Emit `.planning/waves.json` 
 | Tier | `--model` string | Effort | Use for |
 |---|---|---|---|
 | `haiku` | `haiku` | low | lint, format, rename, simple config |
-| `sonnet` | `sonnet` | default | docs, test writing, research, analysis |
-| `opus` | `opus` | high | code writing, architecture, design, review, DB schema |
-| `opus` | `opus` | max | security audit, incident response, irreversible decisions |
+| `sonnet` | `sonnet` | default | code writing, architecture, design, docs, test writing, research, analysis, DB schema |
+| `opus` | `opus` | high | adjudication — review, verification |
+| `opus` | `opus` | max | adjudication — security audit, irreversible decisions |
+| `fable` | `fable` | max | escalation-only, after sonnet AND opus both failed the same step (non-ZDR; needs repo-policy `allow_non_zdr_models`) |
 
 **The model string is a TIER ALIAS, never a full model id.** One alias carries a suffix: `sonnet` resolves to `sonnet[1m]` — the 1M-context window, still an alias and still current-gen. It exists because a compaction is a lossy rewrite of the very context the agent is reasoning over, and compacting repeatedly through one task is how an agent forgets its own acceptance criteria. `opus` already defaults to a 1M window and no `haiku[1m]` exists (200K window), so neither is suffixed. Claude Code maps `opus` / `sonnet` / `haiku` to the current generation of that tier, so every spawn gets the latest model of the tier you asked for. A full id is correct on the day it is typed and silently last-generation on the day after — a failure nothing goes red for. Obtain the string from `bin/heimdall-model-resolve <tier>`; that resolver is also the only legitimate way to pin one, via `HEIMDALL_MODEL_<TIER>=<full-id>`, and pinning exists for bench/eval reproducibility alone. Never write a full model id into a plan you emit.
 
-Default to `opus` + `high` for code changes. Reserve `max` for decisions expensive to undo. Use `sonnet` + `default` for routine work. Use `haiku` + `low` for mechanical tasks. On task failure, escalate one tier (haiku → sonnet → opus); never retry the same tier.
+Default to `sonnet` + `default` for code changes — architecture, design, docs, tests, research, DB schema. Reserve `opus` for adjudication (`high` for review/verification, `max` for security audit) and for decisions expensive to undo. Use `haiku` + `low` for mechanical tasks. On task failure, escalate one tier (haiku → sonnet → opus → fable); fable requires repo-policy `allow_non_zdr_models` — if denied, narrow scope and retry on opus instead. Never retry the same tier.
 
 ## No Incomplete Code in Emitted Plans
 
@@ -218,7 +219,7 @@ Format:
     {
       "id": 1,
       "tasks": [
-        { "id": "auth-api", "agent": "hmd:coder", "model": "opus", "effort": "high", "scope": "src/auth/api.ts", "skills": ["claude-api"], "acceptance": ["grep -q 'export const login' src/auth/api.ts", "npm test -- auth"], "prompt": "<self-contained spawn prompt>" },
+        { "id": "auth-api", "agent": "hmd:coder", "model": "sonnet", "effort": "default", "scope": "src/auth/api.ts", "skills": ["claude-api"], "acceptance": ["grep -q 'export const login' src/auth/api.ts", "npm test -- auth"], "prompt": "<self-contained spawn prompt>" },
         { "id": "auth-ui",  "agent": "hmd:coder", "model": "sonnet", "effort": "default", "scope": "src/auth/components/", "skills": ["ui-ux-pro-max"], "acceptance": ["test -f src/auth/components/LoginForm.tsx"], "prompt": "<self-contained spawn prompt>" }
       ]
     }
