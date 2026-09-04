@@ -524,19 +524,37 @@ def _parse_window(window, now, payload_observed_at, stale_ttl_secs):
     return {"used_percentage": float(up), "resets_at": None}
 
 
+RESERVED_PAYLOAD_KEYS = ("observed_at", "five_hour", "seven_day", "windows_seen")
+
+
 def read_real_usage(path, now):
     """Read a statusline-persisted rate_limits snapshot ->
-    {"five_hour": {...}|None, "seven_day": {...}|None, "observed_at": float|None}
+    {"five_hour": {...}|None, "seven_day": {...}|None, "observed_at": float|None,
+     "windows_seen": [name,...]|None, "extra": {name: {...}}}
     or None. None covers every whole-file failure mode identically (no path,
-    unreadable, malformed JSON, not a dict) AND the case where BOTH windows
-    parse to None — this tool degrades to the budget path on any of them,
-    never a crash, matching the NEVER-FAILS CONTRACT above.
+    unreadable, malformed JSON, not a dict) AND the case where five_hour,
+    seven_day, AND every extra window are all None/empty — this tool degrades
+    to the budget path on any of them, never a crash, matching the
+    NEVER-FAILS CONTRACT above.
 
     Returning a dict as soon as EITHER window is present+fresh (rather than
     requiring both, or requiring five_hour specifically) is the whole point
     of PHASE 3: a fresh, crossed seven_day must be reported even when
     five_hour is absent/expired, and vice versa — see module docstring
     PHASE 3 for the production incident this fixes.
+
+    PHASE 5 (2026-09-05): `extra` generically covers any OTHER top-level key
+    in the persisted payload (besides RESERVED_PAYLOAD_KEYS) whose value
+    parses as a window — i.e. a rate_limits key sentinels/hmd-statusline.py's
+    _extra_windows never heard of by name until it appeared there. Held to
+    the STRICTER five_hour freshness rule (mandatory resets_at,
+    stale_ttl_secs=None) because an unknown window's own staleness semantics
+    are, by construction, unverified — never assume seven_day's lenient TTL
+    fallback is safe for a window this tool has never seen before.
+    `windows_seen` is a pure passthrough of whatever sentinels/hmd-
+    statusline.py recorded (None when the persisted file predates PHASE 5,
+    e.g. an old install that has not re-rendered since upgrading) —
+    informational only, never itself consulted for verdict/crossed.
     """
     if not path:
         return None
@@ -552,9 +570,20 @@ def read_real_usage(path, now):
         observed_at = None
     five = _parse_window(payload.get("five_hour"), now, observed_at, None)
     seven = _parse_window(payload.get("seven_day"), now, observed_at, SEVEN_DAY_STALE_TTL_SECS)
-    if five is None and seven is None:
+    windows_seen = payload.get("windows_seen")
+    if not (isinstance(windows_seen, list) and all(isinstance(x, str) for x in windows_seen)):
+        windows_seen = None
+    extra = {}
+    for k, v in payload.items():
+        if not isinstance(k, str) or k in RESERVED_PAYLOAD_KEYS:
+            continue
+        snap = _parse_window(v, now, observed_at, None)
+        if snap is not None:
+            extra[k] = snap
+    if five is None and seven is None and not extra:
         return None
-    return {"five_hour": five, "seven_day": seven, "observed_at": observed_at}
+    return {"five_hour": five, "seven_day": seven, "observed_at": observed_at,
+            "windows_seen": windows_seen, "extra": extra}
 
 
 def read_reactive_429_mark(path, now, ttl_secs):
@@ -609,11 +638,15 @@ def cmd_status(args):
     seven_resets_at = None
     five_crossed = False
     seven_crossed = False
+    windows_seen = None
+    extra_windows_out = {}
+    extra_crossed_names = []
 
     if real is not None:
         source = SOURCE_REAL
         five = real["five_hour"]
         seven = real["seven_day"]
+        windows_seen = real.get("windows_seen")
         if five is not None:
             percent_real = round(five["used_percentage"], 2)
             five_resets_at = five["resets_at"]
@@ -622,8 +655,23 @@ def cmd_status(args):
             percent_real_seven_day = round(seven["used_percentage"], 2)
             seven_resets_at = seven["resets_at"]
             seven_crossed = seven["used_percentage"] >= threshold
-        verdict = CROSSED if (five_crossed or seven_crossed) else UNDER
+        # PHASE 5 -- any OTHER window read_real_usage found (module docstring
+        # PHASE 5): additive, exactly like seven_day was added to five_hour in
+        # PHASE 3. Sorted so crossed_window's suffix ordering is deterministic
+        # across runs, not dict-iteration-order dependent.
+        for extra_name, w in sorted(real.get("extra", {}).items()):
+            extra_crossed = w["used_percentage"] >= threshold
+            extra_windows_out[extra_name] = {
+                "used_percentage": round(w["used_percentage"], 2),
+                "resets_at": w["resets_at"],
+                "crossed": extra_crossed,
+            }
+            if extra_crossed:
+                extra_crossed_names.append(extra_name)
+        verdict = CROSSED if (five_crossed or seven_crossed or extra_crossed_names) else UNDER
         note = REAL_NOTE
+        if extra_crossed_names:
+            note = note + EXTRA_WINDOW_NOTE_SUFFIX
     else:
         source = SOURCE_BUDGET
         verdict = budget_verdict
@@ -662,6 +710,16 @@ def cmd_status(args):
     else:
         crossed_window = None
 
+    # PHASE 5 -- fold any crossed extra/unknown window(s) into crossed_window
+    # as a NEW suffix, appended AFTER the PHASE 3/4 ladder above rather than
+    # woven into it: this guarantees every one of the 8 literals that ladder
+    # can already produce (including None) is completely unchanged when no
+    # extra window crossed, and the "+extra:<name>" suffix can never collide
+    # with any of those existing pinned literal strings.
+    if extra_crossed_names:
+        extra_suffix = "+".join("extra:%s" % n for n in extra_crossed_names)
+        crossed_window = ("%s+%s" % (crossed_window, extra_suffix)) if crossed_window else extra_suffix
+
     latency_ms = round((time.monotonic() - start) * 1000, 2)
 
     result = {
@@ -675,6 +733,8 @@ def cmd_status(args):
         "real_usage_resets_at": five_resets_at,
         "real_usage_seven_day_resets_at": seven_resets_at,
         "real_usage_observed_at": real["observed_at"] if real is not None else None,
+        "windows_seen": windows_seen,
+        "extra_windows": extra_windows_out,
         "rate_limit_state_path": rate_limit_path,
         "reactive_429_marked": reactive_crossed,
         "reactive_429_marked_at": reactive["marked_at"] if reactive is not None else None,
@@ -715,6 +775,12 @@ def cmd_status(args):
             if percent_real_seven_day is not None:
                 print("  real quota: %.2f%% of Anthropic's seven-day (weekly) limit (threshold %.1f%%)" % (percent_real_seven_day, threshold))
                 print("  seven_day resets_at: %s" % result["real_usage_seven_day_resets_at"])
+            if windows_seen is not None:
+                print("  windows_seen (PHASE 5, what the harness actually exposed this render): %s" % ", ".join(windows_seen))
+            if extra_windows_out:
+                for extra_name, w in sorted(extra_windows_out.items()):
+                    flag = " -- CROSSED" if w["crossed"] else ""
+                    print("  extra window %r: %.2f%% (threshold %.1f%%)%s" % (extra_name, w["used_percentage"], threshold, flag))
             if crossed_window is not None:
                 print("  CROSSED WINDOW: %s" % crossed_window)
         elif result["budget_configured"]:

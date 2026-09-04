@@ -61,6 +61,29 @@
 #  43-44. --reactive-429-file (CLI) outranks HEIMDALL_429_MARKER_FILE (env),
 #      which is itself honored absent a CLI flag -- same precedence shape as
 #      every other path override in this file
+# PHASE 5 -- generic extra/unknown rate-limit windows (2026-09-05, fifth
+# production report of a live "session limit" reading under threshold while
+# blocked): read_real_usage now ALSO captures any top-level payload key
+# outside five_hour/seven_day/observed_at/windows_seen, held to five_hour's
+# OWN strict freshness rule (mandatory resets_at) since an unnamed window's
+# staleness semantics are unverified. Cases 45-50:
+#  45. an extra window ALONE crosses threshold (five_hour under, no
+#      seven_day) -> verdict=crossed, window='extra:<name>'
+#  46. an extra window crosses ALONGSIDE an already-crossed five_hour ->
+#      window='five_hour+extra:<name>' (additive suffix, same shape as
+#      PHASE 4's five_hour+reactive_429)
+#  47. an extra window is present but UNDER threshold, base also under ->
+#      verdict=under, window=null, extra_windows still reports it with
+#      crossed=false -- captured is not the same claim as crossed
+#  48. a malformed extra window (dict but missing used_percentage) plus a
+#      stray NON-dict top-level key -> no crash, extra_windows == {} exactly
+#  49. rate-limit file missing entirely AND no budget configured ->
+#      verdict=unconfigured, NEVER a confident 'under' when blind to real
+#      usage -- the literal acceptance criterion this phase exists to pin
+#  50. REGRESSION PIN: PHASE 3's "both crossed" (case 22) reproduced with an
+#      extra UNDER-threshold window and windows_seen also present in the same
+#      fixture -> window stays EXACTLY 'both', proving old behavior is
+#      unchanged even when the new fields coexist
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -508,6 +531,62 @@ usage_line "$(now_ts)" 10 10 > "$f"
 write_marker "$mk" "$(epoch_offset 5)"
 out=$(HEIMDALL_429_MARKER_FILE="$mk" python3 "$BIN" status --file "$f" --budget 1000000 --json); rc=$?
 if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "reactive_429"'; then ok; else bad "case44 rc=$rc out=$out"; fi
+
+echo "=== 45. PHASE 5: an extra/unknown rate-limit window ALONE crosses threshold -- five_hour under, no seven_day -> verdict=crossed, window='extra:session' ==="
+d=$(case_dir c45); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 3600}, 'session': {'used_percentage': 97.0, 'resets_at': time.time() + 1800}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "extra:session"' && printf '%s' "$out" | grep -q '"used_percentage": 97.0'; then ok; else bad "case45 rc=$rc out=$out"; fi
+
+echo "=== 46. PHASE 5: extra window crosses ALONGSIDE an already-crossed five_hour -> window='five_hour+extra:session' (additive, same shape as PHASE 4's five_hour+reactive_429) ==="
+d=$(case_dir c46); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 99.0, 'resets_at': time.time() + 3600}, 'session': {'used_percentage': 97.0, 'resets_at': time.time() + 1800}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "five_hour+extra:session"'; then ok; else bad "case46 rc=$rc out=$out"; fi
+
+echo "=== 47. PHASE 5: extra window present but UNDER threshold, base also under -> verdict=under, window=null, extra_windows still reports it (captured != crossed) ==="
+d=$(case_dir c47); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 3600}, 'session': {'used_percentage': 5.0, 'resets_at': time.time() + 1800}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"window": null' && printf '%s' "$out" | grep -q '"used_percentage": 5.0' && printf '%s' "$out" | grep -q '"crossed": false'; then ok; else bad "case47 rc=$rc out=$out"; fi
+
+echo "=== 48. PHASE 5: malformed extra window (dict but missing used_percentage) + a stray NON-dict top-level key -> no crash, extra_windows == {} exactly ==="
+d=$(case_dir c48); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 3600}, 'session': {'resets_at': time.time() + 1800}, 'weird_stray_key': 12345}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"extra_windows": {}'; then ok; else bad "case48 rc=$rc out=$out"; fi
+
+echo "=== 49. PHASE 5 acceptance pin: rate-limit file missing entirely AND no budget configured -> verdict=unconfigured, NEVER a confident 'under' when blind to real usage ==="
+d=$(case_dir c49); f="$d/t.jsonl"
+usage_line "$(now_ts)" 10 10 > "$f"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$d/does-not-exist.json" --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "unconfigured"' && ! printf '%s' "$out" | grep -q '"verdict": "under"'; then ok; else bad "case49 rc=$rc out=$out"; fi
+
+echo "=== 50. REGRESSION PIN: PHASE 3's 'both crossed' (case 22) reproduced with an extra UNDER-threshold window AND windows_seen also present -> window stays EXACTLY 'both', unchanged ==="
+d=$(case_dir c50); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 96.0, 'resets_at': time.time() + 3600}, 'seven_day': {'used_percentage': 97.0, 'resets_at': time.time() + 500000}, 'session': {'used_percentage': 5.0, 'resets_at': time.time() + 1800}, 'windows_seen': ['five_hour', 'seven_day', 'session']}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "both"' && printf '%s' "$out" | grep -qF '"windows_seen": ["five_hour", "seven_day", "session"]'; then ok; else bad "case50 rc=$rc out=$out"; fi
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
