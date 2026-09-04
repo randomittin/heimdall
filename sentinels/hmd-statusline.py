@@ -1012,6 +1012,32 @@ def five_hour_pct(data):
 # an observation timestamp. Best-effort: wrapped so a failure here can NEVER slow or
 # break what renders (matches this module's own NEVER-FAILS contract: always exits 0,
 # never writes stderr).
+#
+# PHASE 5 — 2026-09-05. A fifth production report of an agent dying on a "session
+# limit" while this bridge's OWN persisted five_hour/seven_day both read low (~3%/0%)
+# raised a direct question: does Claude Code's rate_limits object carry a THIRD window
+# this file never named? MEASURED, not assumed: every real ~/.heimdall/rate-
+# limits.json this repo has ever produced, every fixture in every test in this repo,
+# and this file's own parsing code (which only ever did rl.get("five_hour") /
+# rl.get("seven_day") — never a dynamic walk of rl's keys) agree: no third window has
+# EVER been observed. The "session limit · resets HH:MM" text operators see traces to
+# a DIFFERENT signal entirely — an error STRING from a rejected request (see
+# bin/heimdall-429-mark, bin/lib/hmd-claude-retry.sh, and docs/analysis/2026-08-29-
+# fallback-did-not-fire-rootcause.md) — not a rate_limits JSON key at all.
+#
+# That is a negative result, not a proof for all time — Anthropic could add a window
+# tomorrow, silently, with no changelog this repo would see first. So rather than
+# re-assert "only two windows exist" as a claim that goes stale the instant it's
+# wrong, KNOWN_WINDOWS below is a documented default, not a hard filter:
+# _extra_windows() generically captures ANY OTHER dict-shaped rate_limits key, under
+# its own literal name, held to the exact same used_percentage/resets_at-only
+# allowlist five_hour/seven_day already use — never a raw per-window dump.
+# `windows_seen` records every window key NAME actually present this render,
+# parseable or not, so "what does the harness expose" is re-answered on every real
+# render instead of asserted once here and left to rot.
+KNOWN_WINDOWS = ("five_hour", "seven_day")
+_RESERVED_PAYLOAD_KEYS = ("observed_at", "windows_seen")
+
 RATE_LIMIT_STATE_ENV = "HEIMDALL_RATE_LIMIT_STATE"
 
 def _rate_limit_state_path():
@@ -1025,15 +1051,13 @@ def _rate_limit_state_path():
         return override
     return os.path.expanduser(os.path.join("~", ".heimdall", "rate-limits.json"))
 
-def _window_snapshot(data, window):
-    """rate_limits.<window>.{used_percentage,resets_at} -> {"used_percentage": float,
-    "resets_at": float} or None. resets_at is OPTIONAL (seven_day does not always carry
-    one) but used_percentage is required — mirrors five_hour_pct's own null-safety
-    exactly, never fabricates a value for either key."""
-    rl = data.get("rate_limits")
-    if not isinstance(rl, dict):
-        return None
-    w = rl.get(window)
+def _parse_window_dict(w):
+    """{"used_percentage","resets_at"?} -> {"used_percentage": float, "resets_at":
+    float} or None. resets_at is OPTIONAL (seven_day does not always carry one) but
+    used_percentage is required — never fabricates a value for either key. Shared by
+    EVERY window, known or newly-observed (PHASE 5): a window this file has never
+    heard of by name is held to the exact same never-fabricate rule five_hour/
+    seven_day always were."""
     if not isinstance(w, dict):
         return None
     up = w.get("used_percentage")
@@ -1045,24 +1069,74 @@ def _window_snapshot(data, window):
         snap["resets_at"] = float(ra)
     return snap
 
+def _window_snapshot(data, window):
+    """rate_limits.<window>.{used_percentage,resets_at} -> allowlisted snapshot or
+    None (also None when rate_limits itself is absent/not a dict). Thin wrapper over
+    _parse_window_dict for the two KNOWN_WINDOWS call sites."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return None
+    return _parse_window_dict(rl.get(window))
+
+def _extra_windows(data):
+    """-> (extras: {name: snapshot}, windows_seen: [name, ...]) — always a dict and a
+    list, never None, so callers never need a None-check. PHASE 5: the generic,
+    name-agnostic counterpart to _window_snapshot's two hardcoded lookups.
+
+    windows_seen names every rate_limits key (other than this module's own
+    _RESERVED_PAYLOAD_KEYS metadata names) whose value is itself a dict — i.e.
+    structurally a window object — REGARDLESS of whether its own used_percentage
+    parsed; this is the raw "what did the harness send this render" inventory. extras
+    holds only the ones OTHER than KNOWN_WINDOWS that parsed cleanly via
+    _parse_window_dict, in the same allowlisted shape five_hour/seven_day already use.
+    A window whose value is a non-dict (e.g. "not-an-object") counts as neither seen
+    nor extra — matching five_hour's own existing malformed-input handling exactly, so
+    a payload that only ever had a malformed known window still persists nothing."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return {}, []
+    seen = sorted(
+        k for k, v in rl.items()
+        if isinstance(k, str) and k not in _RESERVED_PAYLOAD_KEYS and isinstance(v, dict)
+    )
+    extras = {}
+    for k in seen:
+        if k in KNOWN_WINDOWS:
+            continue
+        snap = _parse_window_dict(rl.get(k))
+        if snap is not None:
+            extras[k] = snap
+    return extras, seen
+
 def persist_rate_limits(data, now):
     """Best-effort, allowlist-only persist of rate_limits to disk. Writes NOTHING when
-    both windows are absent — a run with no rate_limits in stdin is a true no-op,
-    silent and harmless. Never raises: ANY failure (permissions, disk full, a race with
-    another concurrent render) is swallowed via contextlib.suppress — the same idiom
-    this module's own top-level fallback already uses — so the render path is never
-    affected. Called before all rendering in main(); must never be able to slow or
-    break what the operator sees."""
+    five_hour, seven_day, and every other rate_limits key are ALL absent/unparseable —
+    a run with no rate_limits in stdin (or nothing recognizable in it) is a true
+    no-op, silent and harmless. Never raises: ANY failure (permissions, disk full, a
+    race with another concurrent render) is swallowed via contextlib.suppress — the
+    same idiom this module's own top-level fallback already uses — so the render path
+    is never affected. Called before all rendering in main(); must never be able to
+    slow or break what the operator sees.
+
+    PHASE 5: also persists windows_seen (every window key NAME observed this render)
+    and any window OTHER than five_hour/seven_day that parses cleanly, under its own
+    literal name — see the module comment above KNOWN_WINDOWS for why this changed
+    from two hardcoded lookups to a name-agnostic capture."""
     with contextlib.suppress(Exception):
         five = _window_snapshot(data, "five_hour")
         seven = _window_snapshot(data, "seven_day")
-        if five is None and seven is None:
+        extras, windows_seen = _extra_windows(data)
+        if five is None and seven is None and not extras and not windows_seen:
             return
         payload = {"observed_at": now}
         if five is not None:
             payload["five_hour"] = five
         if seven is not None:
             payload["seven_day"] = seven
+        if windows_seen:
+            payload["windows_seen"] = windows_seen
+        for k, snap in extras.items():
+            payload[k] = snap
         path = _rate_limit_state_path()
         d = os.path.dirname(path)
         if d:
