@@ -283,18 +283,33 @@ own argument parsing below (see Instructions) — they are a programmatic seam
      third-party provider. State that plainly, then run
      `heimdall-fallback arm --state <value>` — it self-provisions a
      target_provider (and operator_key_env, for a keyed one) and reports the
-     resulting verdict in one step. Relay arm's own output verbatim,
-     including the `export ANTHROPIC_MODEL=` line if it prints one — that
-     step genuinely cannot be automated. Only fall back to the manual
-     `heimdall-fallback set <value>` + `heimdall-fallback check` sequence if
-     arm refuses and the operator wants to supply their own provider/key by
-     hand; never report "armed" without also showing the preflight result.
+     resulting verdict in one step. Before relaying or saying anything
+     else, check arm's own output for a line starting `REFUSED:` — arm
+     always prints a full gateway/verdict block afterward regardless of
+     whether it refused, so a buried REFUSED line reads, at a glance, like
+     part of a successful run unless you check for it first.
+     - **A `REFUSED:` line is present** → state was NOT changed. Say so
+       plainly, first, before relaying anything else: state is still
+       whatever it was, and why arm refused. Then relay arm's own output
+       verbatim, then proactively offer the manual fallback — do not wait
+       to be asked: run `heimdall-fallback set <value>` yourself to force
+       it despite the refusal, then `heimdall-fallback check` to confirm.
+     - **No `REFUSED:` line** → state changed. Say state is now `<value>`
+       first, then relay arm's own output verbatim, including the
+       `export ANTHROPIC_MODEL=` line if it prints one — that step
+       genuinely cannot be automated.
+     Never report "armed" without first checking for that `REFUSED:` line —
+     relaying arm's output verbatim is not enough on its own, since a
+     buried refusal reads like success unless you check for it before
+     saying anything.
    - **`on`** → refuse: `on` was removed (owner directive) and no longer
      exists. Say so plainly and offer `auto` or `switch` instead — never
      silently substitute one.
    - **`arm`** → run `heimdall-fallback arm` (forward `--provider <p>` /
-     `--state <s>` if the operator named either), and relay its full output
-     verbatim, including any REFUSED reason.
+     `--state <s>` if the operator named either). Check its output for a
+     `REFUSED:` line before relaying anything — if present, say plainly
+     that state was left unchanged and why, first; if absent, say what
+     changed, first. Then relay the rest verbatim either way.
    - **`off`** → run `heimdall-fallback set off`. Always safe, no
      confirmation needed.
    - **`where`** → run `heimdall-fallback where` and print the path.
