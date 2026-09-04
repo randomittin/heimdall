@@ -22,6 +22,15 @@
 #  4. malformed rate_limits (wrong types) -> no crash, no file written
 #  5. persistence never changes stdout (the render is byte-identical whether
 #     the persist write can succeed or not)
+#  6. PHASE 5 (2026-09-05): an extra/unknown rate_limits window (name other
+#     than five_hour/seven_day) is captured under its own literal name, and
+#     every window key NAME seen this render (parseable or not) is recorded
+#     in windows_seen
+#  7. an extra window that is dict-shaped but unparseable (no used_percentage)
+#     is named in windows_seen but never persisted as data — "seen" != "captured"
+#  8. today's real harness payload shape (five_hour+seven_day only) is pinned
+#     explicitly: windows_seen is EXACTLY these two, nothing named
+#     session/opus/weekly — the investigation finding PHASE 5 is built on
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -130,6 +139,61 @@ if [ "$OUT_OK" = "$OUT_BROKEN" ]; then
 else
   bad "render output differs based on persist success — persistence is leaking into what renders"
 fi
+
+echo "== 6) PHASE 5: an extra/unknown rate_limits window (name outside five_hour/seven_day) is captured under its own name, and windows_seen lists all three =="
+RL="$(mktemp -u)"
+JSON='{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Opus"},"context_window":{"used_percentage":10},"session_id":"p6","rate_limits":{"five_hour":{"used_percentage":12,"resets_at":9999999999},"seven_day":{"used_percentage":13},"session":{"used_percentage":88,"resets_at":9999999999}}}'
+run_sl "$JSON" "$RL" >/dev/null
+ERR="$(mktemp)"
+if [ -f "$RL" ] && python3 -c "
+import json
+d = json.load(open('$RL'))
+assert d['five_hour']['used_percentage'] == 12, d
+assert d['seven_day']['used_percentage'] == 13, d
+assert d['session']['used_percentage'] == 88, d
+assert d['session']['resets_at'] == 9999999999, d
+assert d['windows_seen'] == ['five_hour', 'session', 'seven_day'], d
+" 2>"$ERR"; then
+  ok "extra window 'session' persisted under its own name; windows_seen lists all three"
+else
+  bad "extra window/windows_seen wrong/missing: $(cat "$RL" 2>/dev/null) err=$(cat "$ERR")"
+fi
+rm -f "$RL" "$ERR"
+
+echo "== 7) PHASE 5: an extra window that is dict-shaped but missing used_percentage is named in windows_seen but never persisted as data (seen != captured) =="
+RL="$(mktemp -u)"
+JSON='{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Opus"},"context_window":{"used_percentage":10},"session_id":"p7","rate_limits":{"five_hour":{"used_percentage":20,"resets_at":9999999999},"session":{"resets_at":9999999999}}}'
+run_sl "$JSON" "$RL" >/dev/null
+ERR="$(mktemp)"
+if [ -f "$RL" ] && python3 -c "
+import json
+d = json.load(open('$RL'))
+assert d['five_hour']['used_percentage'] == 20, d
+assert 'session' not in d, d
+assert d['windows_seen'] == ['five_hour', 'session'], d
+" 2>"$ERR"; then
+  ok "unparseable extra window named in windows_seen but not persisted as data"
+else
+  bad "seen-vs-captured distinction wrong: $(cat "$RL" 2>/dev/null) err=$(cat "$ERR")"
+fi
+rm -f "$RL" "$ERR"
+
+echo "== 8) PHASE 5 investigation pin: today's real harness payload shape (five_hour+seven_day only) -> windows_seen is EXACTLY these two, nothing named session/opus/weekly =="
+RL="$(mktemp -u)"
+JSON='{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Opus"},"context_window":{"used_percentage":10},"session_id":"p8","rate_limits":{"five_hour":{"used_percentage":4.0,"resets_at":9999999999},"seven_day":{"used_percentage":1.0,"resets_at":9999999999}}}'
+run_sl "$JSON" "$RL" >/dev/null
+ERR="$(mktemp)"
+if [ -f "$RL" ] && python3 -c "
+import json
+d = json.load(open('$RL'))
+assert d['windows_seen'] == ['five_hour', 'seven_day'], d
+assert 'session' not in d and 'opus' not in d and 'weekly' not in d, d
+" 2>"$ERR"; then
+  ok "real-shaped payload -> windows_seen == [five_hour, seven_day] exactly, no session/opus/weekly key"
+else
+  bad "real-shape pin failed: $(cat "$RL" 2>/dev/null) err=$(cat "$ERR")"
+fi
+rm -f "$RL" "$ERR"
 
 echo
 echo "$pass passed, $fail failed"
