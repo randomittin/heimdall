@@ -54,6 +54,26 @@
 # 18. HMD_429_DETECT_TRANSCRIPT_TAIL_BYTES override is honored (shrinking it
 #     enough to miss a record the default tail size would have found, with a
 #     same-fixture default-settings baseline proving it isn't just broken).
+# 19. SYMLINKED sibling .output -- the real on-disk shape for every
+#     Task/Agent-tool spawn (MEASURED 2026-09-05 via `ls -la` on a live
+#     production tasks/ dir: 12/12 agent-id-named .output files were
+#     lrwxr-xr-x symlinks, 0 were regular files) -- plain `-type f` (no -L)
+#     cannot see it; -L is required. Isolated from claim 20 via
+#     HMD_429_DETECT_TASKS_DIR (a known dir, no auto-discovery involved).
+# 20. The sibling tasks/ dir does NOT share a name with transcript_path's
+#     own session id (MEASURED 2026-09-05 against the real incident this
+#     hook exists for -- request req_011Cei32DAJf4WeXHXtwfENa, sibling
+#     agent a9a055b1063cfd6f6: the tmp-dir folder actually holding that
+#     agent's tasks/*.output lived under a DIFFERENT id than the one in
+#     every JSONL record's own sessionId/transcript-path) -- an exact
+#     "$_sess" match finds nothing even though the real sibling dir exists
+#     one level over; auto-discovery must scan every sibling run dir for
+#     THIS repo (anchored by repo-slug, wildcarded by run id), never just
+#     the one guessed from transcript_path.
+# 21. End-to-end combination of 19+20 -- the exact real production shape:
+#     parent transcript is pure prose (no structural record), the fresh 429
+#     lives only in a SYMLINKED sibling .output under a run-id directory
+#     that does not match "$_sess".
 #
 # Usage: bash test/heimdall-429-detect.test.sh   (exit 0 = all guarantees hold)
 set -uo pipefail
@@ -432,6 +452,76 @@ if marker_exists; then
   bad "HMD_429_DETECT_TRANSCRIPT_TAIL_BYTES=5 still marked -- override had no effect on the bounded read"
 else
   ok "HMD_429_DETECT_TRANSCRIPT_TAIL_BYTES=5 correctly misses the record (override genuinely bounds the read)"
+fi
+
+# --- 19. symlinked sibling .output (real on-disk shape) -> -L required ------
+# Isolates the -type f vs -L question alone: HMD_429_DETECT_TASKS_DIR points
+# straight at a known sandbox dir (no auto-discovery involved), containing
+# ONLY a symlinked *.output -- exactly the shape `ls -la` showed for every
+# real Task/Agent-tool sibling on 2026-09-05 (12/12 were lrwxr-xr-x, 0 were
+# regular files).
+reset_marker
+SYMLINK_SANDBOX="$SANDBOX/symlink-tasks"
+mkdir -p "$SYMLINK_SANDBOX"
+SYMLINK_TARGET="$SANDBOX/symlink-target.jsonl"
+write_fresh_429 "$SYMLINK_TARGET"
+ln -sf "$SYMLINK_TARGET" "$SYMLINK_SANDBOX/some-agent-id.output"
+PROSE_PARENT_19="$TRANSCRIPTS/prose-parent-19.jsonl"; write_clean "$PROSE_PARENT_19"
+PAYLOAD=$(jq -cn --arg tp "$PROSE_PARENT_19" '{hook_event_name:"Stop", transcript_path:$tp}')
+( cd "$SANDBOX" && unset HEIMDALL_HOME && export CLAUDE_PLUGIN_ROOT="$PLUGIN" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" HMD_429_DETECT_TASKS_DIR="$SYMLINK_SANDBOX"; printf '%s' "$PAYLOAD" | bash "$STOP_CMD_FILE" >/dev/null 2>&1 )
+if marker_exists; then
+  ok "symlinked sibling .output (real Task/Agent-tool shape) is followed and marks (-L)"
+else
+  bad "symlinked sibling .output was NOT followed -- plain -type f (no -L) silently excludes every real sibling"
+fi
+
+# --- 20. sibling tasks/ dir named differently than "\$_sess" -> found anyway -
+# Isolates the directory-RESOLUTION question alone: real auto-discovery (no
+# HMD_429_DETECT_TASKS_DIR override), a fake TMPDIR root under full test
+# control, sibling is a plain regular file (not a symlink, so claim 19 can't
+# leak into this one), living under a run-id directory whose name does NOT
+# match transcript_path's own basename -- MEASURED 2026-09-05 against the
+# real req_011Cei32DAJf4WeXHXtwfENa incident: the tmp-dir folder holding the
+# real siblings never shared a name with any persisted session id.
+reset_marker
+PROJECT_ABS="$(cd "$PROJECT" && pwd)"
+PROJECT_SLUG="$(printf '%s' "$PROJECT_ABS" | tr '/' '-')"
+FAKE_TMPDIR_20="$SANDBOX/faketmp20"
+OTHER_RUN_TASKS_20="$FAKE_TMPDIR_20/claude-9999/$PROJECT_SLUG/other-run-id-000/tasks"
+mkdir -p "$OTHER_RUN_TASKS_20"
+write_fresh_429 "$OTHER_RUN_TASKS_20/some-agent-id.output"
+# A dir matching "$_sess" exactly exists too, but with no tasks/ at all --
+# proves the OLD exact-match code has somewhere to look and still finds
+# nothing; this isn't passing merely because no directory existed there.
+mkdir -p "$FAKE_TMPDIR_20/claude-9999/$PROJECT_SLUG/orchestrator-session-real-20"
+PROSE_PARENT_20="$TRANSCRIPTS/orchestrator-session-real-20.jsonl"; write_clean "$PROSE_PARENT_20"
+PAYLOAD=$(jq -cn --arg tp "$PROSE_PARENT_20" '{hook_event_name:"Stop", transcript_path:$tp}')
+( cd "$SANDBOX" && unset HEIMDALL_HOME && export CLAUDE_PLUGIN_ROOT="$PLUGIN" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" TMPDIR="$FAKE_TMPDIR_20"; printf '%s' "$PAYLOAD" | bash "$STOP_CMD_FILE" >/dev/null 2>&1 )
+if marker_exists; then
+  ok "sibling run dir named differently than transcript_path's basename is still found (repo-slug-anchored wildcard scan)"
+else
+  bad "sibling run dir with a different name than \"\$_sess\" was NOT found -- exact-session-id match misses the real production shape"
+fi
+
+# --- 21. end-to-end real production shape: 19+20 combined -------------------
+# The exact shape measured for req_011Cei32DAJf4WeXHXtwfENa / agent
+# a9a055b1063cfd6f6 on 2026-09-05: prose-only parent transcript, fresh 429
+# only in a SYMLINKED sibling .output under a run-id dir that does not match
+# "$_sess".
+reset_marker
+FAKE_TMPDIR_21="$SANDBOX/faketmp21"
+OTHER_RUN_TASKS_21="$FAKE_TMPDIR_21/claude-9999/$PROJECT_SLUG/other-run-id-111/tasks"
+mkdir -p "$OTHER_RUN_TASKS_21"
+SYMLINK_TARGET_21="$SANDBOX/symlink-target-21.jsonl"
+write_fresh_429 "$SYMLINK_TARGET_21"
+ln -sf "$SYMLINK_TARGET_21" "$OTHER_RUN_TASKS_21/a9a055b1063cfd6f6.output"
+PROSE_PARENT_21="$TRANSCRIPTS/orchestrator-session-real-21.jsonl"; write_clean "$PROSE_PARENT_21"
+PAYLOAD=$(jq -cn --arg tp "$PROSE_PARENT_21" '{hook_event_name:"Stop", transcript_path:$tp}')
+( cd "$SANDBOX" && unset HEIMDALL_HOME && export CLAUDE_PLUGIN_ROOT="$PLUGIN" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" TMPDIR="$FAKE_TMPDIR_21"; printf '%s' "$PAYLOAD" | bash "$STOP_CMD_FILE" >/dev/null 2>&1 )
+if marker_exists; then
+  ok "end-to-end real production shape (prose parent + symlinked sibling under a differently-named run dir) marks correctly"
+else
+  bad "end-to-end real production shape did NOT mark -- this is the exact incident req_011Cei32DAJf4WeXHXtwfENa reproduced"
 fi
 
 # --- collateral: every other live hook event still present -------------------
