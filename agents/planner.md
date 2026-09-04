@@ -100,17 +100,18 @@ Assign each task a model tier AND effort level:
 | Tier | `--model` string | Effort | Use for |
 |---|---|---|---|
 | `haiku` | `haiku` | low | lint, format, simple config, file rename |
-| `sonnet` | `sonnet` | default | docs, test writing, research, analysis |
-| `opus` | `opus` | high | code writing, architecture, design, review, DB schema |
-| `opus` | `opus` | max | security audit, incident response, critical architecture decisions |
+| `sonnet` | `sonnet` | default | code writing, architecture, design, docs, test writing, research, analysis, DB schema |
+| `opus` | `opus` | high | adjudication — review, verification |
+| `opus` | `opus` | max | adjudication — security audit, critical architecture decisions |
+| `fable` | `fable` | max | escalation-only, after sonnet AND opus both failed the same step (non-ZDR; needs repo-policy `allow_non_zdr_models`) |
 
 **The model string is a TIER ALIAS, never a full model id.** One alias carries a suffix: `sonnet` resolves to `sonnet[1m]` — the 1M-context window, still an alias and still current-gen. It exists because a compaction is a lossy rewrite of the very context the agent is reasoning over, and compacting repeatedly through one task is how an agent forgets its own acceptance criteria. `opus` already defaults to a 1M window and no `haiku[1m]` exists (200K window), so neither is suffixed. Claude Code maps `opus` / `sonnet` / `haiku` to the current generation of that tier, so every spawn gets the latest model of the tier you asked for. A full id is correct on the day it is typed and silently last-generation on the day after — a failure nothing goes red for. Obtain the string from `bin/heimdall-model-resolve <tier>`; that resolver is also the only legitimate way to pin one, via `HEIMDALL_MODEL_<TIER>=<full-id>`, and pinning exists for bench/eval reproducibility alone. Write the TIER into each task spec, never a full model id.
 
-**Default to opus/high for code changes. Reserve max effort for decisions that are expensive to undo (security, architecture, incident response). Use sonnet/default for routine work (docs, tests). Use haiku/low for mechanical tasks (lint, format).**
+**Default to sonnet/default for code changes (architecture, design, docs, tests). Reserve opus for adjudication (high for review/verification, max for security audit) and for decisions that are expensive to undo (critical architecture). Use haiku/low for mechanical tasks (lint, format).**
 
 ### Escalation Rule
 
-If a task fails verification, the orchestrator will retry with the next model tier up (haiku->sonnet->opus). Plan for this by marking the initial tier in each task specification.
+If a task fails verification, the orchestrator will retry with the next model tier up (haiku->sonnet->opus->fable). fable requires repo-policy `allow_non_zdr_models`; if denied, narrow scope and retry on opus instead. Plan for this by marking the initial tier in each task specification.
 
 ## Oracle Gate on the Correctness Wave
 

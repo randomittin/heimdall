@@ -334,18 +334,19 @@ Assign model tiers to minimize cost while maximizing code quality:
 | Tier | `--model` string | Use for | Effort |
 |---|---|---|---|
 | haiku | `haiku` | lint, format, rename, simple config | default |
-| sonnet | `sonnet` | docs, tests, research, analysis | default |
-| opus | `opus` | ALL code, architecture, planning, design, review, security, verification | max |
+| sonnet | `sonnet` | ALL code, architecture, planning, design, docs, tests, research, analysis | default |
+| opus | `opus` | adjudication only — `hmd:reviewer`, `hmd:verifier`, `hmd:security-auditor` | high–max |
+| fable | `fable` | escalation-only, after sonnet AND opus both failed the same step (non-ZDR; needs repo-policy `allow_non_zdr_models`) | max |
 
 **The model string is a TIER ALIAS, never a full model id.** One alias carries a suffix: `sonnet` resolves to `sonnet[1m]` — the 1M-context window, still an alias and still current-gen. It exists because a compaction is a lossy rewrite of the very context the agent is reasoning over, and compacting repeatedly through one task is how an agent forgets its own acceptance criteria. `opus` already defaults to a 1M window and no `haiku[1m]` exists (200K window), so neither is suffixed. Claude Code maps `opus` / `sonnet` / `haiku` to the current generation of that tier, so every spawn gets the latest model of the tier you asked for. A full id is correct on the day it is typed and silently last-generation on the day after — a failure nothing goes red for, and one that quietly costs quality on every code task. Obtain the string from `bin/heimdall-model-resolve <tier>`; that resolver is also the only legitimate way to pin one, via `HEIMDALL_MODEL_<TIER>=<full-id>`, and pinning exists for bench/eval reproducibility alone. Never pass a full model id to a spawn.
 
-**Opus is the default for anything that writes or reviews code.** Heimdall must be amazing at code — never compromise quality to save tokens on coding tasks.
+**Sonnet is the default for anything that writes or reviews code** (2026-08-11 directive). Opus is reserved for adjudication — `hmd:reviewer`, `hmd:verifier`, `hmd:security-auditor` — where judging work justifies the extra cost. Heimdall must still be amazing at code — never compromise quality to save tokens on coding tasks — but the lever for that is sonnet's full 1M-context window, not a blanket opus default that ages every coding spawn onto the priciest tier regardless of need.
 
 **Escalation on failure:**
 When a task fails verification:
 1. If it ran on haiku → retry on sonnet
 2. If it ran on sonnet → retry on opus
-3. If it ran on opus → retry on opus with narrower scope (break task into smaller pieces)
+3. If it ran on opus → retry on `fable` (escalation-only; requires repo-policy `allow_non_zdr_models` — if denied, narrow scope and retry on opus instead)
 4. If still failing → escalate to user
 
 Never retry on the same tier — always escalate.
