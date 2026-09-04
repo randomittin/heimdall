@@ -2135,10 +2135,22 @@ unset HMD_FB_TEST_KEY
 # held to (see 43c/43d upstream). Note "crossed" itself is UNAFFECTED --
 # window-string safety is metadata-only and never feeds the verdict. ──────
 R="$(fresh_repo)"
-write_cfg "$R" '{"state": "auto"}'
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "auto",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"extra:../../etc/passwd"}')"
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+unset HMD_FB_TEST_KEY
 [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && ! echo "$out" | grep -q "(window:" \
   && ok "92. PHASE 5: an adversarial path-traversal-shaped window token fails closed to no window shown at all (never trusted onto the printed line)" \
   || bad "92. got rc=$rc out='$out'"
