@@ -526,10 +526,66 @@ SESSION_USAGE_NOTE_FMT = {
         "checks above are still the ONLY thing that decides ROUTE/WAIT/"
         "REFUSE; this authorizes nothing on its own"
     ),
-    "under": "under the pre-exhaustion threshold",
     "unconfigured": "tracking not configured (see heimdall-session-usage)",
     "unknown": "could not be determined -- NOT assumed to be under threshold",
 }
+
+# PHASE 5 (2026-09-05) -- a live operator 429 (HTTP 429, session limit,
+# resets 2:30pm) landed at the EXACT moment this line printed a flat "under
+# the pre-exhaustion threshold" with full confidence: five_hour/seven_day
+# were genuinely low, and no OTHER window had ever been observed in the
+# harness's own rate_limits payload before now (see bin/heimdall-session-
+# usage's own PHASE 5 docstring). A bare "under the pre-exhaustion
+# threshold" reads as an unqualified "you are safe" -- the true claim this
+# tool can stand behind is narrower: "not crossed among the windows this
+# render could see". heimdall-session-usage's PHASE 5 names exactly that
+# set as `windows_seen`; "under" is now generated FROM that field (see
+# _session_usage_under_note) instead of living as a static dict entry that
+# cannot express it -- that is why "under" was pulled out of
+# SESSION_USAGE_NOTE_FMT above while the other three verdicts, which never
+# claimed a positive "you have capacity" in the first place, stay exactly
+# as they were.
+def _session_usage_under_note(windows_seen):
+    if windows_seen:
+        return (
+            "under the pre-exhaustion threshold FOR THE WINDOWS THIS CHECK "
+            "CAN SEE (%s) -- a limit under a different name is NOT ruled "
+            "out and would be invisible here" % ", ".join(windows_seen)
+        )
+    return (
+        "BLIND -- no rate-limit window was observed at all, so this is NOT "
+        "confirmation of remaining capacity; a session/weekly/other limit "
+        "may already be exhausted without this check ever seeing it"
+    )
+
+
+# Structural check for the "window" field heimdall-session-usage's PHASE 5
+# can now emit ("extra:<name>", and "<...>+extra:<name>" combos -- see its
+# own module docstring). `<name>` is an arbitrary dict key lifted straight
+# from an external rate_limits payload with no sanitization at that layer;
+# `window` only ever reaches this file to be interpolated into a printed
+# line (never executed, never used as a path), but "only ever printed" is
+# not a reason to skip validating untrusted input at a trust boundary
+# (header's own "MUST FAIL CLOSED" standard). A window string is accepted
+# only if EVERY "+"-separated token is either a fixed PHASE 3/4 literal or
+# an "extra:" token with a short, safe charset; anything else fails closed
+# to None, same as the fixed allow-list already did below pre-PHASE-5.
+_BASE_WINDOW_TOKENS = frozenset({"five_hour", "seven_day", "reactive_429", "all", "both"})
+
+
+def _session_window_token_ok(tok):
+    if tok in _BASE_WINDOW_TOKENS:
+        return True
+    if tok.startswith("extra:"):
+        name = tok[len("extra:"):]
+        return 1 <= len(name) <= 64 and all(c.isalnum() or c in "_.-" for c in name)
+    return False
+
+
+def _session_window_is_safe(window):
+    if not isinstance(window, str) or not window or len(window) > 256:
+        return False
+    return all(_session_window_token_ok(tok) for tok in window.split("+"))
 
 # Any of these keys appearing in an on-disk config (any value) is how
 # OmniRoute's MITM mode or a blind trust of its advisory ToS flag would be
@@ -895,17 +951,23 @@ def _session_pre_exhaustion_verdict(repo):
     ROUTE. It does NOT feed anything for off/on/switch -- those states never
     call this function at all (see cmd_check).
 
-    Returns a (verdict, window) TUPLE. `window` (2026-08-29, heimdall-
-    session-usage PHASE 3; extended 2026-08-30 PHASE 4) names WHICH
-    observation(s) crossed -- "five_hour" / "seven_day" / "both" /
-    "reactive_429" / "five_hour+reactive_429" / "seven_day+reactive_429" /
-    "all" -- or None. It is METADATA ONLY: _verdict()'s
-    ROUTE/WAIT/REFUSE decision reacts to `verdict` alone, exactly as before;
-    `window` is surfaced only in cmd_check's [INFO] line so an operator can
-    see which limit actually crossed. A missing/unrecognized "window" (a
-    legacy session-usage build that predates PHASE 3, or any malformed
-    value) degrades to None -- the same fail-open standard `verdict` itself
-    already holds to below.
+    Returns a (verdict, window, windows_seen) TUPLE. `window` (2026-08-29,
+    heimdall-session-usage PHASE 3; extended 2026-08-30 PHASE 4; extended
+    2026-09-05 PHASE 5 to also allow an "extra:<name>" token -- see
+    _session_window_is_safe) names WHICH observation(s) crossed, or None.
+    `windows_seen` (2026-09-05, heimdall-session-usage PHASE 5) names every
+    window the harness actually exposed this render (e.g. ["five_hour",
+    "seven_day"]), independent of whether any of them crossed -- or None
+    when heimdall-session-usage predates PHASE 5, or never had a real
+    snapshot to name windows from. Both are METADATA ONLY: _verdict()'s
+    ROUTE/WAIT/REFUSE decision reacts to `verdict` alone, exactly as before.
+    `window` is surfaced in cmd_check's [INFO] line so an operator can see
+    which limit actually crossed; `windows_seen` is surfaced in the "under"
+    note text itself (_session_usage_under_note) so an "under" reading is
+    never mistaken for an unqualified "you are safe" (PHASE 5's whole reason
+    for existing -- see the note above SESSION_USAGE_NOTE_FMT). A
+    missing/unrecognized value for either degrades to None -- the same
+    fail-open standard `verdict` itself already holds to below.
 
     Every failure mode (missing binary, non-executable, timeout, non-JSON
     stdout, a JSON body with no recognized "verdict") is swallowed HERE,
@@ -932,19 +994,25 @@ def _session_pre_exhaustion_verdict(repo):
             capture_output=True, text=True, timeout=3,
         )
     except Exception:
-        return "unknown", None
+        return "unknown", None, None
     try:
         payload = json.loads(proc.stdout)
     except (ValueError, TypeError):
-        return "unknown", None
+        return "unknown", None, None
     verdict = payload.get("verdict") if isinstance(payload, dict) else None
     if verdict not in SESSION_USAGE_VERDICTS:
-        return "unknown", None
+        return "unknown", None, None
     window = payload.get("window") if isinstance(payload, dict) else None
-    if window not in ("five_hour", "seven_day", "both", "reactive_429",
-                       "five_hour+reactive_429", "seven_day+reactive_429", "all"):
+    if not _session_window_is_safe(window):
         window = None
-    return verdict, window
+    windows_seen = payload.get("windows_seen") if isinstance(payload, dict) else None
+    if not (
+        isinstance(windows_seen, list)
+        and 1 <= len(windows_seen) <= 32
+        and all(isinstance(w, str) and 1 <= len(w) <= 64 for w in windows_seen)
+    ):
+        windows_seen = None
+    return verdict, window, windows_seen
 
 
 TIER1_MODEL_PREFIXES = ("claude", "claude-web")
@@ -1351,7 +1419,9 @@ def cmd_check(args):
         checks = run_preflight(cfg)
         state = cfg["state"]
         preflight_ok = all(ok for _, ok, _ in checks)
-        session_verdict, session_window = _session_pre_exhaustion_verdict(args.repo) if state == "auto" else (None, None)
+        session_verdict, session_window, session_windows_seen = (
+            _session_pre_exhaustion_verdict(args.repo) if state == "auto" else (None, None, None)
+        )
         verdict, rc = _verdict(state, checks, session_verdict=session_verdict)
 
         header = "heimdall-fallback check -- VERDICT: %s" % verdict
@@ -1368,7 +1438,11 @@ def cmd_check(args):
             print(line)
 
         if state == "auto":
-            info_line = "  [INFO] session_usage -- %s" % SESSION_USAGE_NOTE_FMT[session_verdict]
+            note_text = (
+                _session_usage_under_note(session_windows_seen)
+                if session_verdict == "under" else SESSION_USAGE_NOTE_FMT[session_verdict]
+            )
+            info_line = "  [INFO] session_usage -- %s" % note_text
             if session_verdict == "crossed" and session_window:
                 info_line += "  (window: %s)" % session_window
             print(info_line)
@@ -1576,7 +1650,9 @@ def _routing_decision(args):
     cfg, _ = load_config(args.repo)
     checks = run_preflight(cfg)
     state = cfg["state"]
-    session_verdict, _session_window = _session_pre_exhaustion_verdict(args.repo) if state == "auto" else (None, None)
+    session_verdict, _session_window, _session_windows_seen = (
+        _session_pre_exhaustion_verdict(args.repo) if state == "auto" else (None, None, None)
+    )
     verdict, rc = _verdict(state, checks, session_verdict=session_verdict)
     failed = [name for name, ok, _ in checks if not ok]
     reason = "verdict=%s (state=%s)" % (verdict, state)

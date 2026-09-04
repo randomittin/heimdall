@@ -2023,6 +2023,139 @@ printf '%s' "$PROXY_OUT" | grep -q '^dead=False$' \
   && ok "87b. proxy immunity does not blanket-pass: nothing bound is still unreachable with the same vars set" \
   || bad "87b. proxy output: $PROXY_OUT"
 
+# ── 88. PHASE 5 (2026-09-05): an extra/unknown window ALONE crosses --
+# five_hour/seven_day both genuinely under, but a THIRD window (e.g. a
+# session-scoped limit Anthropic has never exposed by that name before) is
+# at/above the pre-exhaustion threshold. This is the exact defect this wave
+# closes: heimdall-session-usage's own PHASE 5 already folds an
+# unknown-window crossing into verdict="crossed" (see its own suite); this
+# proves that CROSSED reaches all the way through bin/heimdall-fallback's
+# gate to an actual ROUTE, with a fully passing preflight, and that the
+# window name surfaces in [INFO] rather than collapsing to the old fixed
+# 7-literal allow-list's None. ───────────────────────────────────────────────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "auto",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"extra:session","windows_seen":["five_hour","seven_day","session"]}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+unset HMD_FB_TEST_KEY
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: extra:session)" \
+  && ok "88. PHASE 5: an extra/unknown window ALONE crossing (five_hour/seven_day both under) still reaches ROUTE end-to-end, and [INFO] names it -- the literal defect this wave closes" \
+  || bad "88. got rc=$rc out='$out'"
+
+# ── 89. PHASE 5: the HONEST 'under' wording. Before this wave, a genuine
+# 'under' verdict rendered as a flat, unqualified "under the pre-exhaustion
+# threshold" -- read by an operator as "you are safe", full stop. That
+# reading is what produced repeated false-confidence operator reports: the
+# windows this check actually saw could be genuinely under threshold while
+# a DIFFERENT, unseen window was already exhausted. windows_seen names
+# exactly what was actually observed; the note must say so, must still read
+# as "under" (not "unknown", not "crossed" -- verdict/routing is
+# unaffected), and must NOT borrow unknown's "could not be determined"
+# wording (39b/39c's own distinctness contract, still binding). ────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","windows_seen":["five_hour","seven_day"]}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+[ "$rc" -eq 2 ] \
+  && echo "$out" | grep -q "VERDICT: WAIT" \
+  && echo "$out" | grep -q "five_hour" \
+  && echo "$out" | grep -q "seven_day" \
+  && ! echo "$out" | grep -qi "could not be determined" \
+  && ! echo "$out" | grep -q "(window:" \
+  && ok "89. PHASE 5: an honest 'under' names the windows_seen (five_hour, seven_day) instead of an unqualified 'under the pre-exhaustion threshold'" \
+  || bad "89. got rc=$rc out='$out'"
+
+# ── 90. PHASE 5 acceptance pin (the literal production incident): 'under'
+# with NO windows_seen at all -- heimdall-session-usage saw no rate-limit
+# window whatsoever, exactly as measured live at an operator's own 429
+# ("3.00% / 0.00%" while a SESSION limit blocked them). The old flat 'under
+# the pre-exhaustion threshold' wording is a confident, false-positive
+# safety claim in this exact case. Must read BLIND, never a confident
+# 'under' or 'fine', and must still WAIT exactly as 'under' always has --
+# this changes the WORDING, never the verdict or the routing rc. ──────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"budget"}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+[ "$rc" -eq 2 ] \
+  && echo "$out" | grep -q "VERDICT: WAIT" \
+  && echo "$out" | grep -qi "BLIND" \
+  && ! echo "$out" | grep -qi "could not be determined" \
+  && ! echo "$out" | grep -q "(window:" \
+  && ok "90. PHASE 5 acceptance pin: 'under' with no windows_seen at all reads BLIND, never a confident bare 'under the pre-exhaustion threshold' -- the exact production incident (session-limit 429 while this line read 'under')" \
+  || bad "90. got rc=$rc out='$out'"
+
+# ── 91. PHASE 5: the window validator accepts the ADDITIVE combo form (a
+# base window already crossed + an extra window also crossed), the same
+# shape PHASE 4 already proved for '+reactive_429' -- proving the PHASE-5
+# upgrade to the window-string check is additive to the old fixed
+# allow-list, never a replacement that narrows what used to work. ─────────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "auto",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"five_hour+extra:session","windows_seen":["five_hour","seven_day","session"]}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+unset HMD_FB_TEST_KEY
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: five_hour+extra:session)" \
+  && ok "91. PHASE 5: additive window combo 'five_hour+extra:session' surfaces in full -- upgrade is additive to the old fixed allow-list, not a narrowing" \
+  || bad "91. got rc=$rc out='$out'"
+
+# ── 92. PHASE 5: the window validator still FAILS CLOSED on an adversarial
+# window string -- an external, unsanitized rate_limits dict key reaching
+# this file must never be trusted onto a printed line just because it
+# happens to start with a plausible "extra:" prefix. A path-traversal-
+# shaped name (containing "/", outside the allowed alnum/_/./- charset)
+# must degrade window to None -- no crash, no stray text -- the same
+# fail-open-to-metadata-only standard the old fixed 7-literal check already
+# held to (see 43c/43d upstream). Note "crossed" itself is UNAFFECTED --
+# window-string safety is metadata-only and never feeds the verdict. ──────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"extra:../../etc/passwd"}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && ! echo "$out" | grep -q "(window:" \
+  && ok "92. PHASE 5: an adversarial path-traversal-shaped window token fails closed to no window shown at all (never trusted onto the printed line)" \
+  || bad "92. got rc=$rc out='$out'"
+
+# ── 93. PHASE 5: windows_seen itself fails closed on malformed input (not a
+# list) -- degrades to the same BLIND wording as a genuinely absent
+# windows_seen, never a crash and never a partial/garbled value
+# interpolated into the printed note. ──────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","windows_seen":"not-a-list"}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+[ "$rc" -eq 2 ] && echo "$out" | grep -qi "BLIND" && ! echo "$out" | grep -qi "could not be determined" \
+  && ok "93. PHASE 5: a malformed (non-list) windows_seen degrades to the same honest BLIND wording, never a crash" \
+  || bad "93. got rc=$rc out='$out'"
+
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
