@@ -85,3 +85,4 @@ Rate each task 0.0-1.0 based on criteria pass rate. Report in summary table:
 - Report exact command output for failures
 - Requirement with no covering task = FAIL
 - Exit with clear PASS or FAIL. No ambiguity.
+- This is an adjudication role — opus only, never degraded. `bin/heimdall-precheck-agent` refuses to spawn this agent through a loopback/non-`api.anthropic.com` route; there is no bypass.

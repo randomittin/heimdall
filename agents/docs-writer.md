@@ -1,7 +1,7 @@
 ---
 name: docs-writer
 description: Documentation agent. Use for writing and updating documentation, README files, API docs, and keeping docs in sync with implementation changes.
-tools: Read, Write, Edit, Grep, Glob
+tools: Read, Write, Edit, Grep, Glob, Skill
 model: sonnet
 tier: sonnet
 color: cyan
