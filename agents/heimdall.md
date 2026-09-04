@@ -446,8 +446,17 @@ average session's real spend on this repo, and an *active* per-task query on top
 (~40 calls/session) would add ~0.22% more — both inside the rounding-error band this repo
 already used to reject Headroom's compression fork (0.5583%/0.271% aggregate). Full measurement:
 `docs/analysis/2026-08-22-reasoning-bank-wiring-decision.md`; reusable lesson:
-`.planning/skills/reasoning-bank-claude-mem-wiring.md`. claude-mem itself stays installed and its
-passive injection is unaffected — only the *active per-task query mandate* is removed.
+`.planning/skills/reasoning-bank-claude-mem-wiring.md`. **SUPERSEDED 2026-09-04 — claude-mem is now RETIRED, not merely unqueried.** Its own
+`UserPromptSubmit` hook was observed BLOCKING an operator's prompt outright ("claude-mem worker
+unreachable for 5 consecutive hooks"): it fails CLOSED on a strictly optional dependency, the
+inverse of this repo's rule that a hook exits 0 so a broken accessory can never wedge a
+session. That, plus the 0% measured usage above, is why hmd no longer installs or advertises
+it and `install.sh`'s `ensure_claude_mem_plugin_retired()` uninstalls it on every update (opt
+out: `HEIMDALL_KEEP_CLAUDE_MEM=1`). The scrubber (`bin/heimdall-scrub-claude-mem`) is
+deliberately KEPT and no-ops when claude-mem is absent — hmd cannot guarantee the plugin is
+gone from an operator's machine, and deleting a privacy control while the thing it protects
+may still run would be a security regression. The cost figures above are historical: they are
+the evidence for this decision, not stale text.
 
 The success/failure-count tracking and auto-archiving once described here were never
 implemented — nothing in this repo increments those counters. Step 1 above is the only
