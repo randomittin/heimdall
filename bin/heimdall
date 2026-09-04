@@ -3624,7 +3624,7 @@ for skill in reg.get('skills', []):
 #
 # This wrapper makes the whole phase contiguous and ordered:
 #   1. auth        — ensure_auth (login / API key resolved)
-#   2. companion   — first_run_setup (superpowers, claude-mem, marketplace — caveman is in-house, not a plugin install)
+#   2. companion   — first_run_setup (superpowers, marketplace — caveman is in-house and claude-mem is retired; neither is a plugin install here)
 #   3. skills      — preinstall_plugins + discover_skills (prompt-driven extras)
 # Each phase emits an ordered trace marker (see _trace_order) so the stranger
 # harness can prove setup precedes launch without a live model call.
@@ -3644,8 +3644,8 @@ complete_first_run_setup() {
   # signed in yet — a deferred/^C'd login can no longer abort setup or block the
   # marker, which is what forced the old two-run dance.
 
-  # 1. COMPANION PLUGINS — superpowers / claude-mem / marketplace (caveman is
-  #    in-house now, not a plugin install here — see first_run_setup's body).
+  # 1. COMPANION PLUGINS — superpowers / marketplace (caveman is in-house and
+  #    claude-mem is retired — neither is a plugin install here; see first_run_setup's body).
   #    git/npm based, need NO Claude auth, so they run first + unconditionally.
   #    Idempotent + marker-gated inside first_run_setup; touches $SETUP_MARKER on
   #    success, so the first-run marker is written before we even reach auth.
@@ -4175,7 +4175,7 @@ YOUR CAPABILITIES (use all of these aggressively):
 - Wave execution: group tasks into dependency waves, max 10 parallel per wave, fresh context per wave
 - Asked for in agent prompts, NOT enforced by code — no scheduler, timer, scorer or vote-counter runs, so check the outcome yourself rather than assuming it happened: work-stealing, idle nudging and majority-vote conflict resolution (agents/wave-executor.md); factchecking claimed outputs against files on disk, and the 0.0-1.0 per-task truth score with its 0.8 phase floor (agents/verifier.md).
 - Skill extraction: after complex tasks → save patterns to .planning/skills/
-- Reasoning bank: before starting → search .planning/skills/ + claude-mem for proven patterns
+- Reasoning bank: before starting → search .planning/skills/ for proven patterns
 - Metrics: \`heimdall-metric\` appends task outcomes to .planning/metrics.jsonl. A SubagentStop hook now emits a record per spawned agent automatically, so the baseline arrives without you; call it yourself only to add what a hook cannot truthfully know (task type, whether acceptance criteria passed on the FIRST try at this tier) — never guess those, an invented outcome poisons the routing decision the data exists to inform. \`heimdall-self-improve\` reads those outcomes and writes .planning/routing-overrides.json, but nothing consumes that file yet, so model routing does not adjust on its own.
 - Governance: hierarchical (default) / democratic (trade-offs) / emergency (incidents)
 - Tier 0: format, lint-fix, sort imports → run bash directly, skip LLM

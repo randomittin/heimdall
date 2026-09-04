@@ -22,8 +22,8 @@
 #         at; the top failing surfaces.
 #       - TOKEN trends           — per-run total_tokens over time + the cache-read
 #         ratio (cache_read / total), rolling — the spend curve.
-#       - INSTALL drop-off       — per install step: failed/started ratio. THE
-#         claude-mem evidence row (where installs fail across runs).
+#       - INSTALL drop-off       — per install step: failed/started ratio — the
+#         top failing install surfaces across runs.
 #
 #   • HONESTY (§6, critical): any savings/cost figure is sourced ONLY from a token
 #     event's MEASURED total_cost_usd carrying its cost_source provenance. This
@@ -297,8 +297,8 @@ def _token_trends(events):
 
 def _install_dropoff(events):
     """Per install step: started / succeeded / failed counts + the failed/started
-    drop-off ratio (§5: where installs fail across runs — THE claude-mem evidence
-    row). Returns:
+    drop-off ratio (§5: where installs fail across runs — the top failing install
+    surfaces). Returns:
       {step: {started, succeeded, failed, dropoff: float|None}, ...}
     `dropoff` is failed/started, or None when a step was never started (a ratio over
     zero is undefined — honest, never faked). A store with no install events yields
@@ -462,7 +462,7 @@ def render_aggregate(agg):
             ("%.1f%%" % (mcr * 100)) if mcr is not None else DASH))
 
     lines.append("")
-    lines.append("Install drop-off (where installs fail — the claude-mem evidence):")
+    lines.append("Install drop-off (where installs fail across runs):")
     drop = agg.get("install_dropoff") or {}
     if not drop:
         lines.append("  %s no install data yet" % DASH)
