@@ -1,7 +1,6 @@
 {
   "permanent": [
     "caveman@caveman",
-    "claude-mem@thedotmack",
     "superpowers@claude-plugins-official"
   ],
   "detection": {
