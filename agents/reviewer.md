@@ -95,3 +95,4 @@ Do not rationalize skipping verification or waving a change through. If you catc
 - A CRITICAL issue must be fixed before push
 - A WARNING should be addressed but doesn't block
 - A SUGGESTION is optional improvement
+- This is an adjudication role — opus only, never degraded. `bin/heimdall-precheck-agent` refuses to spawn this agent through a loopback/non-`api.anthropic.com` route; there is no bypass.
