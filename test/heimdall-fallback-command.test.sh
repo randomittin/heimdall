@@ -262,6 +262,41 @@ else
   bad "fallback.md does not cross-reference the Tier-1 boundary from the new context-exposure section"
 fi
 
+# ── 11. arm refusal must be unambiguous: checked and stated BEFORE relaying,
+#        never left to a REFUSED: line buried in a verbatim relay -- this is
+#        the exact ambiguity that let `/hmd:fallback switch` silently leave
+#        state unchanged (operator ran `switch`; .heimdall/fallback.json's
+#        state stayed `auto` afterward with no error surfaced) ────────────
+if grep -qF 'arm refuses and the operator wants to supply their own provider/key by' "$CMD_MD"; then
+  bad "fallback.md still gates the manual-set fallback behind the old ambiguous 'if arm refuses AND the operator wants' conditional -- this let /hmd:fallback switch silently leave state unchanged"
+else
+  ok "fallback.md no longer gates the manual-set fallback behind the old ambiguous conditional clause"
+fi
+
+if grep -qF 'state was NOT changed' "$CMD_MD"; then
+  ok "fallback.md states plainly that a REFUSED arm means state was NOT changed"
+else
+  bad "fallback.md does not plainly state that a refusal leaves state unchanged"
+fi
+
+if grep -qF 'Before relaying or saying anything' "$CMD_MD"; then
+  ok "fallback.md instructs checking arm's output for REFUSED: before relaying or saying anything else"
+else
+  bad "fallback.md does not instruct checking for REFUSED: before relaying anything else"
+fi
+
+if grep -qF 'proactively offer the manual fallback' "$CMD_MD"; then
+  ok "fallback.md proactively offers the manual set fallback on an arm refusal, rather than waiting to be asked"
+else
+  bad "fallback.md does not proactively offer the manual fallback on an arm refusal"
+fi
+
+if grep -qF 'state was left unchanged and why' "$CMD_MD"; then
+  ok "fallback.md's bare 'arm' subcommand branch also states plainly when state was left unchanged"
+else
+  bad "fallback.md's bare 'arm' subcommand branch does not plainly state when state was left unchanged"
+fi
+
 echo
 echo "  Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

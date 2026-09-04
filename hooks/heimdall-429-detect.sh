@@ -130,16 +130,41 @@ if [ -z "$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty' 2>/dev
   case "$_max" in ''|*[!0-9]*) _max=12 ;; esac
   _mins=$(( (_win + 59) / 60 )); [ "$_mins" -ge 1 ] || _mins=1
   _tdir="${HMD_429_DETECT_TASKS_DIR:-}"
-  if [ -z "$_tdir" ] && [ -n "$transcript_path" ]; then
-    _sess="$(basename "$transcript_path" .jsonl 2>/dev/null || true)"
-    if [ -n "$_sess" ]; then
-      for _c in "${TMPDIR:-/tmp}"/claude-*/*/"$_sess"/tasks /private/tmp/claude-*/*/"$_sess"/tasks; do
-        [ -d "$_c" ] && { _tdir="$_c"; break; }
+  _tdir_list=()
+  if [ -n "$_tdir" ]; then
+    # Explicit override: honor it exactly, never widen it, never fall
+    # through to auto-discovery if it doesn't exist -- matches the old
+    # behavior of this branch precisely.
+    [ -d "$_tdir" ] && _tdir_list=("$_tdir")
+  elif [ -n "$transcript_path" ]; then
+    # Auto-discovery. Two independent, MEASURED bugs fixed together here
+    # (2026-09-05, against the real req_011Cei32DAJf4WeXHXtwfENa incident) --
+    # fixing only one leaves this dead-on-arrival for the other reason:
+    #   1. Every real Task/Agent-tool sibling .output is a SYMLINK to the
+    #      persistent transcript, never a regular file (`ls -la` on a live
+    #      tasks/ dir: 12/12 agent-id-named .output entries were lrwxr-xr-x
+    #      symlinks, 0 were regular files) -- `-type f` alone (no -L) uses
+    #      lstat() and excludes every single one of them, unconditionally.
+    #   2. The tmp-dir folder that actually holds a run's tasks/ dir does
+    #      NOT reliably share a name with "$_sess" (transcript_path's own
+    #      basename) -- confirmed directly against the real incident: the
+    #      folder holding the dying subagent's sibling .output had no
+    #      corresponding persisted .jsonl transcript AT ALL under that same
+    #      name, while the JSONL records' own sessionId and the real
+    #      persisted transcript filename both read a DIFFERENT id entirely.
+    #      Only the repo/project slug is stable; the run/session-id segment
+    #      must be wildcarded, and every match collected -- never just the
+    #      first, never `break` on an exact-name guess that may not exist.
+    _repo_abs="$(cd "$REPO" 2>/dev/null && pwd || true)"
+    if [ -n "$_repo_abs" ]; then
+      _slug="$(printf '%s' "$_repo_abs" | tr '/' '-')"
+      for _c in "${TMPDIR:-/tmp}"/claude-*/"$_slug"/*/tasks /private/tmp/claude-*/"$_slug"/*/tasks; do
+        [ -d "$_c" ] && _tdir_list+=("$_c")
       done
     fi
   fi
-  if [ -n "$_tdir" ] && [ -d "$_tdir" ]; then
-    sibling_paths="$(find "$_tdir" -maxdepth 1 -type f -name '*.output' -mmin "-${_mins}" 2>/dev/null | head -n "$_max" || true)"
+  if [ "${#_tdir_list[@]}" -gt 0 ]; then
+    sibling_paths="$(find -L "${_tdir_list[@]}" -maxdepth 1 -type f -name '*.output' -mmin "-${_mins}" 2>/dev/null | sort -u | head -n "$_max" || true)"
   fi
 fi
 
