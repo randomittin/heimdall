@@ -198,7 +198,7 @@ resolve_model() {
 # NEVER fails the caller (always exit 0), and a disabled/absent telemetry world is
 # a perfect no-op. Every call is additionally `|| true`-guarded so a telemetry
 # fault can never abort setup. This is data-gathering ONLY — it pinpoints WHERE an
-# install fails (the claude-mem question) and changes install behaviour not at all.
+# install fails (which step is the dominant failure point) and changes install behaviour not at all.
 TELEMETRY_BIN="$PLUGIN_DIR/bin/heimdall-telemetry"
 
 # A stable run id for THIS launcher invocation, shared across every step event so
@@ -228,7 +228,7 @@ _tele_now_ms() {
 }
 
 # Emit ONE install_step event. Args:
-#   $1 step      setup|auth|companion:claude-mem|skills|
+#   $1 step      setup|auth|skills|
 #                path|launch-readiness
 #   $2 outcome   started|succeeded|failed
 #   $3 start_ms  (optional) the _tele_now_ms captured at `started`; when present
@@ -1153,68 +1153,13 @@ first_run_setup() {
     fi
   fi
 
-  # claude-mem (persistent cross-session memory) — OPTIONAL companion.
-  #
-  # GRACEFUL-SKIP CONTRACT (friction removal): claude-mem is the single most
-  # failure-prone install step (it shells out to npx → a network npm install).
-  # A failed OR impossible install must NEVER hard-fail or hang the launcher —
-  # Heimdall works without it. So every outcome here is narrated and recovers:
-  #   - npx absent           → can't install → print the optional-skip line, move on
-  #   - npx install nonzero  → print the optional-skip line, move on (no cryptic err)
-  #   - npx install succeeds → confirm it
-  # We do NOT swap claude-mem here (a later data-driven decision). The npx exit
-  # code is still captured at npm-exec granularity for the install_step telemetry
-  # so piece (d) can answer "is claude-mem's npm-exec the dominant failure point?".
-  # The skip line is the EXACT user-facing message the friction-removal spec pins.
-  if ! command -v claude-mem &>/dev/null; then
-    echo "  + claude-mem (persistent memory across sessions)"
-    local _cm_t0; _cm_t0="$(_tele_now_ms)"
-    _tele_install_step companion:claude-mem started
-    # TTY+BUN GATE (LIVE-VM #2 fix): claude-mem's `npx claude-mem install` is an
-    # interactive multi-prompt wizard (email/IDE/runtime/provider/model) that ALSO
-    # requires `bun`. On a headless box force-feeding stdin still ran the wizard and
-    # aborted mid-way (`bun-missing-after-install`). So ATTEMPT the installer ONLY
-    # when BOTH a real TTY (stdin AND stdout) AND bun are present; otherwise SKIP
-    # cleanly WITHOUT ever launching it. This is the dominant first-run friction.
-    if ! { [ -t 0 ] && [ -t 1 ]; } || ! command -v bun &>/dev/null; then
-      # No interactive terminal and/or no bun → the wizard can't complete. Skip
-      # without invoking the installer (never hang, never a cryptic mid-wizard abort).
-      echo "  claude-mem is an optional companion — skipped (needs an interactive terminal + bun; Heimdall works without it)"
-      echo "    (re-enable anytime in a terminal with bun installed: 'npx claude-mem install')"
-      _tele_install_step companion:claude-mem skipped "$_cm_t0" \
-        no-tty-or-bun "tty=$([ -t 0 ] && [ -t 1 ] && echo 1 || echo 0) bun=$(command -v bun >/dev/null 2>&1 && echo 1 || echo 0)"
-    elif ! command -v npx &>/dev/null; then
-      # No npx → cannot install. This is not an error to halt on: skip gracefully.
-      echo "  claude-mem is an optional companion — skipped (Heimdall works without it)"
-      echo "    (npm/npx not found; install Node.js then run 'npx claude-mem install' to enable it)"
-      _tele_install_step companion:claude-mem failed "$_cm_t0" \
-        npx-absent "npx not on PATH"
-    else
-      local _cm_rc=0
-      # HEADLESS-SAFE ATTEMPT (the live-VM fix, done right): run the installer with
-      # stdin from /dev/null so a wizard prompt can NEVER hang the launcher — on a
-      # headless box (no TTY / no bun) the wizard reads EOF and aborts FAST, which
-      # surfaces as a nonzero exit → the graceful-skip path below. `</dev/null` (NOT
-      # the old `< <(yes)`) means one clean EOF: no prompt-spam, no pipefail SIGPIPE.
-      # `npx --yes` auto-confirms npx's OWN package-fetch prompt; the exit code stays
-      # that of npx, so the npm-exec outcome is captured at npm-exec granularity
-      # (dossier §3 piece d: "is claude-mem's npm-exec the dominant failure point?" —
-      # a pre-emptive skip would emit no npm-exec datum at all). A nonzero exit is
-      # NON-FATAL; a real TTY + bun let the wizard run to completion → succeeded.
-      npx --yes claude-mem install </dev/null || _cm_rc=$?
-      if [ "$_cm_rc" -eq 0 ]; then
-        _tele_install_step companion:claude-mem succeeded "$_cm_t0"
-      else
-        # Declined or failed (incl. no-TTY / bun-absent fast-abort) → graceful skip
-        # with the pinned message + the exact manual step, never a cryptic error or a
-        # hang.
-        echo "  claude-mem is an optional companion — skipped (Heimdall works without it)"
-        echo "    (re-enable anytime: 'npx claude-mem install')"
-        _tele_install_step companion:claude-mem failed "$_cm_t0" \
-          npm-exec-nonzero "npm exec exit $_cm_rc"
-      fi
-    fi
-  fi
+  # claude-mem — RETIRED (2026-09-04). hmd no longer attempts `npx claude-mem
+  # install` here at all: claude-mem ships its own UserPromptSubmit hook that can
+  # fail CLOSED (observed blocking a real prompt with "claude-mem worker
+  # unreachable for 5 consecutive hooks") — the inverse of hmd's fail-open hook
+  # policy, and reason enough to stop advertising it, not merely leave it opt-in.
+  # install.sh's ensure_claude_mem_plugin_retired ACTIVELY removes an existing
+  # install on update (opt out: HEIMDALL_KEEP_CLAUDE_MEM=1); see CLAUDE.md.
 
   # heimdall marketplace — part of the `skills` step (marketplace registration).
   if ! claude plugins marketplace list 2>/dev/null | grep -q "heimdall-marketplace"; then
@@ -1539,7 +1484,6 @@ print_banner() {
   printf "  ${V}│${R}  ${C}▸${R} wave-based parallel execution     ${V}│${R}\n"; sleep 0.05
   printf "  ${V}│${R}  ${C}▸${R} smart skill management            ${V}│${R}\n"; sleep 0.05
   printf "  ${V}│${R}  ${C}▸${R} caveman      ${G}terser output${R}      ${V}│${R}\n"; sleep 0.05
-  printf "  ${V}│${R}  ${C}▸${R} claude-mem     ${G}persistent memory${R}  ${V}│${R}\n"; sleep 0.05
   printf "  ${V}╰─────────────────────────────────────╯${R}\n"
   local short_cwd; short_cwd=$(echo "$WORK_DIR" | sed "s|$HOME|~|")
   printf "  ${D}cwd:${R} ${C}%s${R}" "$short_cwd"
@@ -2974,9 +2918,9 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     # Arrow-key confirm (↑/↓ + Enter, default No); guarded typed fallback.
     plugins=n
     if command -v hmd_confirm >/dev/null 2>&1; then
-      hmd_confirm "  Also uninstall companion plugins (caveman, claude-mem)?" && plugins=y
+      hmd_confirm "  Also uninstall companion plugins (caveman)?" && plugins=y
     else
-      read -p "  Also uninstall companion plugins (caveman, claude-mem)? [y/N] " plugins
+      read -p "  Also uninstall companion plugins (caveman)? [y/N] " plugins
     fi
     if [[ "${plugins:-n}" == [yY]* ]]; then
       claude plugins uninstall caveman 2>/dev/null && printf "  ${D}×${R} caveman removed\n" || true
@@ -3171,7 +3115,6 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  --agent heimdall                   CTO-level orchestrator"
   echo "  + caveman (output compression)   terser wording"
   echo "  + superpowers (brainstorming)    design + debug skills"
-  echo "  + claude-mem (persistent memory) cross-session context"
   echo ""
   echo "All files are written to the current directory."
   exit 0

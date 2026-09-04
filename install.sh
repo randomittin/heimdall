@@ -33,10 +33,10 @@
 #                          deployment → 0600 cp-endpoint.json; never echoed/tracked.
 #                          Unneeded on the open-bounded public CP — see OPERATORS.md.
 #   HEIMDALL_FORCE      rewrite cp-endpoint.json even if values are unchanged
-#   HEIMDALL_INSTALL_CLAUDE_MEM  opt in to installing the claude-mem plugin (default:
-#                                off — zero measured invocations + a 30GB index that
-#                                blocked a build; stays a one-command manual install
-#                                otherwise — see ensure_claude_mem below)
+#   HEIMDALL_KEEP_CLAUDE_MEM    opt out of retiring the legacy claude-mem plugin on
+#                               update (default: retire it — it ships its own
+#                               fail-CLOSED UserPromptSubmit hook; see
+#                               ensure_claude_mem_plugin_retired below)
 #
 set -euo pipefail
 
@@ -654,31 +654,6 @@ ensure_crypto_backend() {
   printf 'failed'
 }
 
-# ── claude-mem memory plugin — set up PER HMD's expectations ──────────────────
-#
-# hmd drives cross-session memory through the Claude Code PLUGIN claude-mem@thedotmack
-# (marketplace `thedotmack` → thedotmack/claude-mem). THAT plugin — not the standalone
-# npm tool — is what provides the /mem-search skill and the SessionStart memory-injection
-# hooks it wires. The legacy first-run path (`npx claude-mem install` in bin/heimdall)
-# wires claude-mem's OWN npm hooks, which DIVERGE from the CC-plugin hmd expects; this
-# reconciles that by registering the marketplace + installing the plugin the plugin way.
-#
-# NOT installed by default (2026-08-22). Measured: zero invocations across ~40 spawns,
-# its "98% savings" figure is a compression ratio, not session savings (falsified — see
-# docs/analysis/2026-08-22-reasoning-bank-wiring-decision.md), and its Chroma index
-# bloated to 30GB (link_lists.bin alone) and blocked a build. That is ongoing harm, not
-# one-time setup pain, so it drops out of the default preinstall. It stays a ONE-command
-# manual install for anyone who wants it — opt in per-install with
-# HEIMDALL_INSTALL_CLAUDE_MEM=1, or run the fix command this prints later.
-#
-# IDEMPOTENT (fast no-op when already enabled — never re-installs), NON-FATAL (claude-mem
-# is an optional companion Heimdall works without), LOUD on failure. The caller renders
-# the ✓/⚠ line + the exact manual fix. Prints ONE state word:
-#   present     — the plugin is already registered/enabled; nothing done
-#   declined    — not enabled and NOT opted in (the default) — nothing attempted
-#   configured  — opted in: registered the marketplace + installed the plugin (enabled)
-#   skipped     — the `claude` CLI is absent, so no plugin registration is possible
-#   failed      — opted in, but a register/install step failed and it's still absent (LOUD)
 # ── Retire the legacy external caveman plugin ──────────────────────────────────
 # hmd USED to install this as a companion:
 #     claude plugins marketplace add JuliusBrussee/caveman
@@ -720,27 +695,44 @@ ensure_caveman_plugin_retired() {
   printf 'failed'
 }
 
-ensure_claude_mem() {
+# ── Retire the legacy claude-mem memory plugin ─────────────────────────────
+# hmd used to set up claude-mem (the Claude Code PLUGIN claude-mem@thedotmack, opt-in
+# via HEIMDALL_INSTALL_CLAUDE_MEM=1 — never on by default since 2026-08-22, after zero
+# measured invocations across ~40 spawns and a 30GB Chroma index that blocked a build).
+#
+# It is now retired outright, not merely left opt-in: claude-mem ships its own
+# UserPromptSubmit hook that can fail CLOSED (observed: "claude-mem worker unreachable
+# for 5 consecutive hooks" blocked a real prompt) — the exact inverse of hmd's own
+# fail-open hook policy. An optional companion that can block a session on its own
+# outage is worse than one that simply does nothing, so hmd stops installing AND
+# advertising it, and an update actively retires an existing install.
+#
+# Scoped tightly and reversibly, same shape as ensure_caveman_plugin_retired above:
+#   * touches ONLY claude-mem@thedotmack and the thedotmack marketplace, never any
+#     other plugin or marketplace;
+#   * fast no-op when already absent (the steady state after one update);
+#   * opt out with HEIMDALL_KEEP_CLAUDE_MEM=1 for anyone who wants to keep it anyway;
+#   * NON-FATAL, fail-open — a failed uninstall must never break an update.
+# Reinstalling by hand (claude plugins marketplace add thedotmack/claude-mem && claude
+# plugins install claude-mem@thedotmack) stays possible, so this is recoverable.
+#
+# Prints ONE state word: absent | kept | retired | failed | skipped
+ensure_claude_mem_plugin_retired() {
   command -v claude >/dev/null 2>&1 || { printf 'skipped'; return 0; }
-  local mkt="thedotmack/claude-mem" mkt_name="thedotmack" plugin="claude-mem@thedotmack"
-  # Already present? Fast idempotent path — never touch the CLI again.
-  if claude plugins list 2>/dev/null | grep -qi 'claude-mem'; then printf 'present'; return 0; fi
-  # Default is OFF (see the block above) — opt in per-install with this var. Checked
-  # AFTER the presence check above, so a plugin already installed some other way is
-  # always reported, and left alone, regardless of this flag.
-  if [ "${HEIMDALL_INSTALL_CLAUDE_MEM:-0}" != "1" ]; then printf 'declined'; return 0; fi
-  local rc=0
-  # Register the marketplace (idempotent — `add` is a no-op when already known).
-  if ! claude plugins marketplace list 2>/dev/null | grep -q "$mkt_name"; then
-    claude plugins marketplace add "$mkt" >/dev/null 2>&1 || rc=$?
+  if ! claude plugins list 2>/dev/null | grep -qi 'claude-mem'; then
+    printf 'absent'; return 0
   fi
-  # Install the plugin from that marketplace.
-  claude plugins install "$plugin" >/dev/null 2>&1 || rc=$?
-  # Re-check: the CLI's own listing is the sole arbiter (never trust the exit alone).
-  if claude plugins list 2>/dev/null | grep -qi 'claude-mem'; then printf 'configured'; return 0; fi
-  # Not listed. If every step still returned 0 (e.g. a quiet CLI that defers the write),
-  # report configured optimistically; only a nonzero step is a hard `failed`.
-  if [ "$rc" -eq 0 ]; then printf 'configured'; else printf 'failed'; fi
+  if [ "${HEIMDALL_KEEP_CLAUDE_MEM:-0}" = "1" ]; then
+    printf 'kept'; return 0
+  fi
+  claude plugins uninstall claude-mem@thedotmack >/dev/null 2>&1 || true
+  # Drop the marketplace too, but ONLY once nothing from it remains installed:
+  # removing a marketplace another plugin still needs would break its updates.
+  if ! claude plugins list 2>/dev/null | grep -qi 'claude-mem'; then
+    claude plugins marketplace remove thedotmack >/dev/null 2>&1 || true
+    printf 'retired'; return 0
+  fi
+  printf 'failed'
 }
 
 # ── Nightly /dream auto-schedule (the overnight maintainer sweep, hands-free) ──
@@ -1480,50 +1472,40 @@ main() {
   step_begin "Wiring secret-scan + bloat gates"
   step_ok "Wiring secret-scan + bloat gates"
 
-  # Step: set up claude-mem PER HMD's expectations (the CC plugin, not the npm tool),
-  # IF opted in — /mem-search + the SessionStart memory-injection hooks it provides.
-  # NOT installed by default (2026-08-22): zero invocations across ~40 measured spawns,
-  # its "98% savings" is a compression ratio not session savings, and its Chroma index
-  # bloated to 30GB and blocked a build — see
-  # docs/analysis/2026-08-22-reasoning-bank-wiring-decision.md. OPTIONAL/graceful either
-  # way — a failure is LOUD but never aborts the install.
+  # Step: retire legacy companion plugins hmd no longer installs — compression
+  # moved in-house (caveman) and claude-mem is retired outright: it ships its own
+  # fail-CLOSED UserPromptSubmit hook (observed blocking a real prompt) — see
+  # ensure_claude_mem_plugin_retired above. OPTIONAL/graceful either way — a
+  # failure here is LOUD but never aborts the install.
   local CM_T0; CM_T0="$(_tele_now_ms)"
   _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem started
-  step_begin "Setting up claude-mem (memory)"
+  step_begin "Retiring legacy companion plugins"
   local CAV_STATE; CAV_STATE="$(ensure_caveman_plugin_retired)"
   if [ "$CAV_STATE" = "retired" ]; then
     printf '   %s  retired the legacy caveman plugin (compression is in-house: hmd caveman get)\n' "$OK"
   elif [ "$CAV_STATE" = "failed" ]; then
     printf '   %s  caveman plugin still installed and will conflict. Remove: claude plugins uninstall caveman@caveman\n' "$WARN"
   fi
-  local CM_STATE; CM_STATE="$(ensure_claude_mem)"
+  local CM_STATE; CM_STATE="$(ensure_claude_mem_plugin_retired)"
   case "$CM_STATE" in
-    present)
+    retired)
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem succeeded "$CM_T0"
-      step_ok "Setting up claude-mem (memory)" "already enabled" ;;
-    configured)
+      printf '   %s  retired the legacy claude-mem plugin (it can fail CLOSED — see CLAUDE.md)\n' "$OK"
+      step_ok "Retiring legacy companion plugins" ;;
+    absent)
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem succeeded "$CM_T0"
-      step_ok "Setting up claude-mem (memory)" "plugin registered" ;;
-    declined)
+      step_ok "Retiring legacy companion plugins" ;;
+    kept)
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem succeeded "$CM_T0"
-      step_ok "Setting up claude-mem (memory)" \
-        "not installed by default — opt in with HEIMDALL_INSTALL_CLAUDE_MEM=1" ;;
+      step_ok "Retiring legacy companion plugins" "claude-mem kept (HEIMDALL_KEEP_CLAUDE_MEM=1)" ;;
     skipped)
-      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem failed "$CM_T0" \
-        claude-cli-absent "no claude CLI on PATH"
-      step_ok "Setting up claude-mem (memory)" "skipped (no claude CLI)" ;;
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem succeeded "$CM_T0"
+      step_ok "Retiring legacy companion plugins" "skipped (no claude CLI)" ;;
     *)  # failed — LOUD, non-fatal.
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem failed "$CM_T0" \
-        claude-mem-plugin-install-failed "marketplace add / plugin install returned nonzero"
-      step_ok "Setting up claude-mem (memory)" "unavailable"
-      blank
-      printf '   %s⚠ claude-mem plugin setup failed — cross-session memory is OFF.%s\n' \
-        "$C_GOLD" "$C_RESET"
-      printf '   %s  hmd uses the claude-mem PLUGIN for /mem-search + memory injection. Enable it:%s\n' \
-        "$C_DIM" "$C_RESET"
-      printf '       %sclaude plugins marketplace add thedotmack/claude-mem \&\& claude plugins install claude-mem@thedotmack%s\n' \
-        "$C_CYAN" "$C_RESET"
-      blank
+        claude-mem-plugin-uninstall-failed "plugin uninstall returned nonzero / still listed"
+      step_ok "Retiring legacy companion plugins" "claude-mem still installed"
+      printf '   %s  claude-mem still installed and can fail CLOSED. Remove: claude plugins uninstall claude-mem@thedotmack \&\& claude plugins marketplace remove thedotmack\n' "$WARN"
       ;;
   esac
 
