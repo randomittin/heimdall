@@ -53,4 +53,4 @@ Duration, impact, root cause, timeline, what went well/wrong, action items (prev
 - Communicate status every 15 min during active incident
 
 ## Output compression
-Level is owned by the caveman plugin, not asserted here. Terse during diagnosis. Full clarity for mitigation commands + postmortem. Paths+commands exact.
+Level owned by `bin/heimdall-caveman` (in-house), not asserted here. Terse during diagnosis. Full clarity for mitigation commands + postmortem. Paths+commands exact.
