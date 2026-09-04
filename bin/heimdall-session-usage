@@ -113,6 +113,43 @@ requires the ORCHESTRATOR to call `heimdall-429-mark mark` itself; this is a
 real, documented gap, not an oversight papered over by a claim of automatic
 coverage.
 
+PHASE 5 — 2026-09-05. A FIFTH production report of this exact defect class:
+operator hit a real, live "session limit" (not five_hour, not seven_day) and
+at that moment this tool reported UNDER at 3.00%/0.00%. Question asked
+directly this time, not re-derived from the prior three phases' conclusions:
+does Claude Code's rate_limits object actually carry a THIRD window this
+tool never looked at? MEASURED: the real ~/.heimdall/rate-limits.json on
+this machine, every fixture in test/heimdall-session-usage.test.sh and
+test/heimdall-statusline-rate-limit-persist.test.sh, and
+sentinels/hmd-statusline.py's own persistence code (which, before this
+phase, only ever did rl.get("five_hour") / rl.get("seven_day") — never a
+dynamic walk of rl's keys) all agree: no third window has EVER been
+observed, here or in this repo's history. The "session limit · resets
+HH:MM" text traces to a DIFFERENT signal — an error STRING from a rejected
+request (see bin/heimdall-429-mark, bin/lib/hmd-claude-retry.sh, and
+docs/analysis/2026-08-29-fallback-did-not-fire-rootcause.md), not a
+rate_limits JSON key.
+
+That is a negative result, not a proof for all time. So rather than hardcode
+"only five_hour/seven_day exist" more deeply, read_real_usage below now ALSO
+captures any OTHER top-level key sentinels/hmd-statusline.py persisted (see
+its own PHASE 5 section) under `extra`, generically, by literal name, held
+to five_hour's OWN stricter freshness rule (an unknown window's staleness
+semantics are, by construction, unverified — never assume seven_day's
+lenient TTL fallback is safe for a window never seen before). A crossing on
+ANY window in `extra` promotes verdict to CROSSED exactly like PHASE 3's
+seven_day already does — additive, never a replacement. `windows_seen` is
+reported alongside as an honesty field: PROOF, refreshed on every real
+render, of exactly which window names the harness is currently exposing —
+not a claim frozen in this docstring. Deliberately still only FOUR verdict
+states (see below) — a fifth "blind" state was considered and rejected: the
+existing collapse-to-"unknown" behavior already in bin/heimdall-fallback's
+_session_pre_exhaustion_verdict() (its own defensive handling of any
+verdict/window string this tool might emit) means a real, novel window can
+be wired WITHOUT touching that sibling file at all, and honesty about
+coverage lives in `note`/`windows_seen` instead of a new enum value
+competing with "unknown"'s existing meaning.
+
 FOUR VERDICT STATES, ON PURPOSE — collapsing "unknown" into either neighbor
 is exactly the failure mode this tool exists to prevent:
   unconfigured — no operator budget set; a percentage is mathematically
@@ -207,7 +244,15 @@ REAL_NOTE = (
     "percent_real_seven_day carries that figure and 'window' names which "
     "one crossed (five_hour / seven_day / both) — verdict/crossed above are "
     "driven by whichever real figure(s) are fresh, never the operator "
-    "budget; percent_of_budget is still reported alongside it, unchanged."
+    "budget; percent_of_budget is still reported alongside it, unchanged. "
+    "COVERAGE (PHASE 5): 'windows_seen' names every rate_limits window key "
+    "the harness sent this render -- read it before trusting this verdict "
+    "for a window whose name you don't see listed there; 'extra_windows' "
+    "carries any window other than five_hour/seven_day that parsed and can "
+    "also cross (folded into verdict/window as '+extra:<name>'). As of "
+    "2026-09-05 no such extra window has ever been observed -- see module "
+    "docstring PHASE 5 -- so an empty extra_windows here is the expected, "
+    "not a broken, result."
 )
 
 REACTIVE_NOTE_SUFFIX = (
@@ -215,6 +260,12 @@ REACTIVE_NOTE_SUFFIX = (
     "observation -- see reactive_429_* fields. This can only ever ADD a "
     "crossing on top of the figures above, never remove one, and is "
     "independent of both percent_real and percent_of_budget."
+)
+
+EXTRA_WINDOW_NOTE_SUFFIX = (
+    " ADDITIONALLY (PHASE 5): a window other than five_hour/seven_day "
+    "crossed the threshold -- see extra_windows. This can only ever ADD a "
+    "crossing on top of the figures above, never remove one."
 )
 
 
