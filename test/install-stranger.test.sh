@@ -56,8 +56,8 @@ STRANGER_PATH="$CLAUDE_BIN:$NODE_BIN:$GIT_BIN:/usr/bin:/bin"
 # ── Intercept `claude plugins` for the launch-arm trace probes (§5, §6) ───────
 # Those probes drive the launcher's FIRST-RUN path, whose first_run_setup runs
 # `claude plugins marketplace add` + `claude plugins install` for the companion
-# plugins (superpowers/claude-mem; caveman is in-house, no plugin call at all
-# as of 2026-08-30). In a fresh stripped HOME with no
+# plugins (superpowers only; caveman is in-house and claude-mem is retired, no
+# plugin call at all as of 2026-09-04, see CLAUDE.md). In a fresh stripped HOME with no
 # plugin cache those are real SSH git clones with 120s timeouts each — slow, and
 # on a flaky/offline host they stall the whole harness. We only need the launcher
 # to reach its trace markers, NOT to actually install plugins over the network.
@@ -659,7 +659,7 @@ rm -rf "$DEMO_NOTTY_TGT" 2>/dev/null || true
 reserved_notty "$TMPH" 30 "$LAUNCHER" demo "$DEMO_NOTTY_TGT" --dry; RSV_RC=$?
 if [ "$RSV_RC" -eq 124 ]; then
   bad "non-TTY \`hmd demo --dry\` HUNG (watchdog killed it) — reserved path ran the launch preamble"
-elif grep -qiE 'watchman wakes|npx claude-mem install' <<<"$RSV_OUT"; then
+elif grep -qiE 'watchman wakes' <<<"$RSV_OUT"; then
   bad "non-TTY \`hmd demo --dry\` ran the launch preamble (persona/companion leaked) — reserved dispatch regressed"
 elif [ "$RSV_RC" -eq 0 ]; then
   ok "non-TTY \`hmd demo --dry\` completes promptly via the dry path, no preamble/hang"

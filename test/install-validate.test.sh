@@ -10,7 +10,6 @@
 #     A. GREEN            — every part healthy → "all systems go", exit 0.
 #     B. RED crypto       — Ed25519 backend missing → ✗ crypto + the pip fix, exit 1.
 #     C. RED statusline   — HUD unregistered → ✗ statusline + the register fix, exit 1.
-#     D. RED claude-mem   — plugin misconfigured → ✗ claude-mem + the register fix, exit 1.
 #
 #   FIRST-RUN = HEADLESS, BACKGROUND, BOUNDED (--cc-verify):
 #     E. BOUNDED          — a hung first-cc (sleeps forever) is KILLED at the deadline;
@@ -217,17 +216,6 @@ if [ "$RC" -ne 0 ] \
   ok "RED statusline: detected, exits nonzero, prints the register fix"
 else
   bad "RED statusline: not detected/gated (rc=$RC): $(grep -iE 'statusline' <<<"$OUT" | tr '\n' ' ' | cut -c1-160)"
-fi
-
-# ══ D. RED claude-mem — misconfigured (mkt known, plugin not enabled) → ✗ ═════
-HD="$TMP_ROOT/D"; seed_home "$HD" y misconfigured
-OUT="$(run_doctor "$HD" FAKE_CRYPTO_OK=1 --)"; RC=$?
-if [ "$RC" -ne 0 ] \
-   && grep -qiE 'claude-mem .*MISCONFIGURED' <<<"$OUT" \
-   && grep -qi 'claude plugins install claude-mem@thedotmack' <<<"$OUT"; then
-  ok "RED claude-mem: misconfig detected, exits nonzero, prints the register+install fix"
-else
-  bad "RED claude-mem: not detected/gated (rc=$RC): $(grep -iE 'claude-mem' <<<"$OUT" | tr '\n' ' ' | cut -c1-160)"
 fi
 
 # ══ E. BOUNDED + HEADLESS — a hung first-cc is killed at the deadline ══════════

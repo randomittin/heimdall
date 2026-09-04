@@ -150,16 +150,19 @@ suite_timeout() {
     # under a 180s default, a timeout means something genuinely hung.
     # measured 56s solo / 102s under --jobs 6 — the closest suite to the old 120s cliff.
     heimdall-context-capsule.test.sh) override=300 ;;
-    # measured 428s SOLO (57 passed, 0 failed) on an M-series mac, 2026-08-04.
+    # measured 428s SOLO (57 passed, 0 failed) on an M-series mac, 2026-08-04 — BEFORE
+    # claude-mem's install step was retired 2026-09-04 (see CLAUDE.md); the real total is
+    # now lower than this by roughly the ~21s/install claude-mem line below, which no
+    # install.sh run pays any more, making the existing budget more conservative, not less.
     # It drives FIVE real installs — the primary stranger HOME, the idempotency re-run,
     # a fresh first-run-ordering HOME, and the two graceful-degrade variants — then a
     # real uninstall + re-uninstall and ~29 launchd/settings sandbox probes.
-    # WHERE THE TIME GOES, because "install" sounds cheap and is not: ONE install.sh run
-    # is ~77s — git clone 4s, marketplace register 7s, plugin install 8s, Ed25519 crypto
-    # backend 4s, claude-mem setup 21s, and the post-install validation gate ~23s (it
-    # boots Claude Code HEADLESS via --cc-verify and runs presence doctor). Five of those
-    # is ~385s of the 428s; every sandbox probe added since the last budget is only ~44s.
-    # So this is IO/network/subprocess-bound real work, not a hang: it exits 0.
+    # WHERE THE TIME WENT AT MEASUREMENT TIME, because "install" sounds cheap and is not:
+    # ONE install.sh run was ~77s — git clone 4s, marketplace register 7s, plugin install
+    # 8s, Ed25519 crypto backend 4s, claude-mem setup 21s, and the post-install validation
+    # gate ~23s (it boots Claude Code HEADLESS via --cc-verify and runs presence doctor).
+    # Five of those was ~385s of the 428s; every sandbox probe added since the last budget
+    # is only ~44s. So this was IO/network/subprocess-bound real work, not a hang.
     #
     # The previous note here read "measured 93s SOLO (28 passed, 0 failed)" and set 300s.
     # That figure does not reproduce — the suite now reports 57 assertions and a SINGLE
