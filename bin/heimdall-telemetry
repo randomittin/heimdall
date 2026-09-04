@@ -14,7 +14,7 @@
 #         --type     install_step|phase|gate|token|outcome|commit|issue_state  (req)
 #         --run-id   stable id per hmd/install invocation (run-<uuid4hex>)
 #         --phase    planning|waves|gates|install
-#         --step     setup|auth|companion:caveman|companion:claude-mem|skills|path|…
+#         --step     setup|auth|companion:caveman|skills|path|…
 #         --outcome  started|succeeded|failed|passed|blocked
 #         --gate     secret-scan|oracle|lint|test|bloat|reuse
 #         --duration-ms N      wall-clock of the step/phase

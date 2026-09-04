@@ -20,29 +20,34 @@
 #   LIVE-VM #2 (claude-mem interactive wizard + bun): `npx claude-mem install`
 #   launches a multi-prompt wizard (email/IDE/runtime/provider/model) and needs
 #   `bun`. Force-feeding `yes` still ran the wizard and aborted
-#   `bun-missing-after-install`. FIX: attempt claude-mem ONLY when a real TTY AND
-#   bun are both present; otherwise SKIP cleanly WITHOUT launching the installer.
+#   `bun-missing-after-install`. ORIGINAL FIX: attempt claude-mem ONLY when a real
+#   TTY AND bun are both present; otherwise SKIP cleanly WITHOUT launching the
+#   installer. SUPERSEDED 2026-09-04: that TTY+bun gate is retired along with the
+#   installer call it guarded — claude-mem is never attempted at all any more, and
+#   install.sh actively retires an existing install on update instead (opt out:
+#   HEIMDALL_KEEP_CLAUDE_MEM=1). See CLAUDE.md. Proofs 2/5/6 below, which pinned the
+#   gate's on/off behaviour, are removed accordingly (there is no gate left to pin);
+#   proofs 1/3/4 keep their original numbers rather than being renumbered, so this
+#   history stays legible against the code.
 #
-# THE PROOFS HERE (all hermetic — `claude`/`npx`/`bun` are recording PATH fakes;
-# claude-mem is absent so its branch runs; the launcher short-circuits at the
-# `launch:task` trace marker before any real `claude … -p`; every run is under a
-# watchdog so a re-introduced blocking prompt fails as a HANG, not a wedge):
+# THE PROOFS HERE (all hermetic — `claude`/`npx` are recording PATH fakes; the
+# launcher short-circuits at the `launch:task` trace marker before any real
+# `claude … -p`; every run is under a watchdog so a re-introduced blocking prompt
+# fails as a HANG, not a wedge):
 #   1. FRESH first run — READ-ONLY install dir, unauthenticated, non-TTY — ONE
 #      invocation installs companions, writes the marker to the USER home (NOT the
 #      repo dir), and defers auth without aborting.
-#   2. claude-mem is SKIPPED on a non-TTY box — the installer is NEVER invoked.
 #   3. IDEMPOTENT re-run (same home) — companion setup does NOT re-run.
 #   4. LEGACY-marker MIGRATION — an old repo-dir marker is honored as already-set-up.
-#   5. claude-mem SKIPPED even when bun IS present but there is no TTY (the TTY is
-#      required, not just bun).
-#   6. claude-mem IS attempted when a real TTY (pty) AND bun are both present.
 #
 # HARNESS HERMETICITY — every scenario that must observe FIRST-RUN behaviour calls
 # cold_install_state first, and every "X was NOT invoked" proof is paired with a
 # POSITIVE CONTROL proving first-run setup actually ran in that same scenario. See
 # cold_install_state below for the cross-scenario leak this defends against; the
 # controls exist because a negative assertion is trivially satisfied by a launcher
-# that did nothing at all — which is exactly how proof 6 sat red unnoticed.
+# that did nothing at all — which is exactly how the old claude-mem TTY-gate proof
+# (formerly numbered 6, removed 2026-09-04 along with the gate it pinned) sat red
+# unnoticed.
 #
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 
@@ -87,41 +92,18 @@ echo "claude \$*" >> "$CALLS"
 exit 0
 EOF
 
-# `npx` — records argv, then reads one line of stdin with a hard timeout so the
-# fake itself can NEVER hang the suite, and exits 0. It is only ever reached when
-# the launcher's TTY+bun gate has ALREADY decided claude-mem may be attempted.
-cat > "$FAKE_DIR/npx" <<EOF
-#!/usr/bin/env bash
-echo "npx \$*" >> "$CALLS"
-reply=""
-if IFS= read -r -t 5 reply; then
-  echo "npx-stdin:\$reply" >> "$CALLS"
-else
-  echo "npx-stdin:NONE" >> "$CALLS"
-fi
-exit 0
-EOF
-chmod +x "$FAKE_DIR/claude" "$FAKE_DIR/npx"
-# NOTE: NO `claude-mem` fake ⇒ `command -v claude-mem` fails ⇒ the claude-mem
-# branch (the step under test) runs.
+chmod +x "$FAKE_DIR/claude"
+# NOTE: no `npx`/`bun`/`claude-mem` fakes — bin/heimdall no longer has any code path
+# that shells out to any of the three (claude-mem's TTY+bun-gated `npx claude-mem
+# install` is retired; see CLAUDE.md), so nothing left under test would ever invoke
+# them.
 
-# `bun` fake lives in its OWN dir so PATH can include or EXCLUDE it independently —
-# that is how we flip the "bun present / absent" half of the claude-mem gate.
-BUN_DIR="$(mktemp -d)"
-cat > "$BUN_DIR/bun" <<EOF
-#!/usr/bin/env bash
-echo "bun \$*" >> "$CALLS"
-exit 0
-EOF
-chmod +x "$BUN_DIR/bun"
-
-# PATH: fakes FIRST, then the real dirs holding python3 + git + coreutils. No real
-# claude/npx/claude-mem/bun is reachable. PATH_NOBUN omits bun; PATH_BUN prepends it.
+# PATH: the one fake dir FIRST, then the real dirs holding python3 + git + coreutils.
+# No real claude/npx/claude-mem/bun is reachable.
 SYS="$(dirname "$(command -v python3)"):$(dirname "$(command -v git)"):/usr/bin:/bin"
 PATH_NOBUN="$FAKE_DIR:$SYS"
-PATH_BUN="$BUN_DIR:$FAKE_DIR:$SYS"
 
-trap 'chmod -R u+w "$TPLUG" 2>/dev/null || true; rm -rf "$TPLUG" "$FAKE_DIR" "$BUN_DIR" 2>/dev/null || true' EXIT
+trap 'chmod -R u+w "$TPLUG" 2>/dev/null || true; rm -rf "$TPLUG" "$FAKE_DIR" 2>/dev/null || true' EXIT
 
 # cold_install_state — return the INSTALL DIR to a genuine never-set-up state.
 #
@@ -250,18 +232,6 @@ grep -qi 'Running claude login' "$OUT1" \
   || ok "deferred-auth: did NOT drop into interactive 'claude login'"
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 2. claude-mem SKIPPED on a non-TTY box — the installer is NEVER invoked.   ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-if grep -q 'claude-mem' "$CALLS"; then
-  bad "claude-mem installer was INVOKED on a non-TTY box (calls: $(grep -i 'npx\|claude-mem' "$CALLS" | tr '\n' ';'))"
-else
-  ok "claude-mem installer NOT invoked on a non-TTY box (zero claude-mem calls)"
-fi
-grep -q "optional companion — skipped" "$OUT1" \
-  && ok "claude-mem: graceful one-line skip note printed (never fatal)" \
-  || bad "claude-mem: skip note missing (out: $(tr '\n' ' ' < "$OUT1" | tail -c 200))"
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 3. IDEMPOTENT RE-RUN — SAME home ⇒ companion setup does NOT re-run.        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 WD2="$(mktemp -d)"
@@ -274,7 +244,7 @@ if [ "$RC2" -eq 124 ] || [ "$HANG2" = "HANG" ]; then
 else
   ok "re-run completed without blocking (exit $RC2)"
 fi
-if grep -q 'plugins install caveman\|claude-mem' "$CALLS"; then
+if grep -q 'plugins install caveman' "$CALLS"; then
   bad "re-run RE-TRIGGERED companion setup (calls: $(tr '\n' ';' < "$CALLS"))"
 else
   ok "re-run did NOT re-run companion setup (idempotent, marker-gated on the user home)"
@@ -298,7 +268,7 @@ if [ "$RC3" -eq 124 ] || [ "$HANG3" = "HANG" ]; then
 else
   ok "migration run completed without blocking (exit $RC3)"
 fi
-if grep -q 'plugins install caveman\|claude-mem' "$CALLS"; then
+if grep -q 'plugins install caveman' "$CALLS"; then
   bad "migration: companion setup RE-RAN (legacy marker not honored) (calls: $(tr '\n' ';' < "$CALLS"))"
 else
   ok "migration: legacy repo-dir marker honored — companion setup did NOT re-run"
@@ -307,63 +277,6 @@ fi
   && ok "migration: user-home marker written from the legacy marker" \
   || bad "migration: user-home marker NOT written"
 cold_install_state
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 5. claude-mem SKIPPED with bun PRESENT but NO TTY (the TTY is required).   ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-WD4="$(mktemp -d)"; HOME4="$(mktemp -d)"; HH4="$HOME4/.heimdall"
-cold_install_state                           # scenario 4 set up an install — start cold again
-OUT4="$FAKE_DIR/run4.out"
-: > "$CALLS"
-HANG4="$(run_launcher notty "$WD4" "$HH4" "$OUT4" "$PATH_BUN")"; RC4=$?  # bun ON path, non-TTY
-
-if [ "$RC4" -eq 124 ] || [ "$HANG4" = "HANG" ]; then
-  bad "bun-present non-TTY run BLOCKED/hung"
-else
-  ok "bun-present non-TTY run completed (exit $RC4)"
-fi
-# POSITIVE CONTROL — the skip proof below is a NEGATIVE assertion, so it is
-# satisfied just as well by a launcher that short-circuited and did nothing. Prove
-# this run genuinely entered first-run setup before trusting the absence.
-grep -q 'claude plugins install superpowers' "$CALLS" \
-  && ok "bun-present non-TTY run genuinely entered first-run setup (skip proof is not vacuous)" \
-  || bad "bun-present non-TTY run never entered first-run setup — skip proof would be VACUOUS (calls: $(tr '\n' ';' < "$CALLS"))"
-if grep -q 'claude-mem' "$CALLS"; then
-  bad "claude-mem invoked with bun present but NO TTY (TTY must be required too)"
-else
-  ok "claude-mem SKIPPED with bun present but no TTY — TTY is required, not just bun"
-fi
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 6. claude-mem ATTEMPTED when a real TTY (pty) AND bun are both present.    ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-if ! command -v script >/dev/null 2>&1; then
-  note "TTY case skipped — 'script' (pty allocator) not on PATH"
-else
-  WD5="$(mktemp -d)"; HOME5="$(mktemp -d)"; HH5="$HOME5/.heimdall"
-  cold_install_state                         # scenario 5 set up an install — start cold again
-  OUT5="$FAKE_DIR/run5.out"
-  : > "$CALLS"
-  HANG5="$(run_launcher tty "$WD5" "$HH5" "$OUT5" "$PATH_BUN")"; RC5=$?  # bun + pty
-
-  if [ "$HANG5" = "HANG" ] || [ "$RC5" -eq 124 ]; then
-    bad "TTY+bun run BLOCKED/hung"
-  else
-    ok "TTY+bun run completed without blocking (exit $RC5)"
-  fi
-  # POSITIVE CONTROL — same reasoning as scenario 5, and this is the exact assertion
-  # that was silently red: a short-circuited launcher records NOTHING, so "no npx
-  # call" looked like a claude-mem regression when the run had simply never reached
-  # first-run setup at all. Fail loudly on that distinction instead of conflating it.
-  grep -q 'claude plugins install superpowers' "$CALLS" \
-    && ok "TTY+bun run genuinely entered first-run setup (claude-mem proof is not vacuous)" \
-    || bad "TTY+bun run never entered first-run setup — claude-mem proof would be VACUOUS (calls: $(tr '\n' ';' < "$CALLS"))"
-  if grep -q 'npx --yes claude-mem install' "$CALLS"; then
-    ok "claude-mem ATTEMPTED (npx --yes claude-mem install) when TTY + bun both present"
-  else
-    bad "claude-mem NOT attempted despite TTY + bun (calls: $(grep -i 'npx\|bun\|claude-mem' "$CALLS" | tr '\n' ';'))"
-  fi
-fi
 
 echo "--------------------------------------------------------------------"
 printf 'hmd-bootstrap: %d passed, %d failed\n' "$PASS" "$FAIL"

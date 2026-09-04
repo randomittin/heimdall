@@ -62,7 +62,6 @@ superx can now **show you exactly what changed** on `--update` — commit messag
 
 ### Companion Plugins
 - **caveman** at ultra mode (~75% token savings)
-- **claude-mem** for persistent cross-session memory
 - **superpowers** for brainstorming + debugging
 
 ### Inspired By

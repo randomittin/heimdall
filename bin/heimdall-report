@@ -21,8 +21,8 @@
 #           at; the top failing gates/steps.
 #         - TOKEN trends           — per-run total_tokens over time + the cache-hit
 #           ratio; the spend curve.
-#         - INSTALL drop-off       — per install step: failed/started ratio. The
-#           claude-mem evidence row (where installs fail across runs).
+#         - INSTALL drop-off       — per install step: failed/started ratio — the
+#           top failing install surfaces across runs.
 #       Human report by default; --json for structured output.
 #
 # HONESTY (§6): any cost/savings figure is sourced ONLY from a token event's

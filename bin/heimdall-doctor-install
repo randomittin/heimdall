@@ -3,12 +3,11 @@
 #
 # WHY THIS EXISTS. A fresh install used to hand the dev straight into an interactive
 # Claude Code session while parts were SILENTLY broken — crypto backend missing,
-# presence dead, statusline blank, claude-mem misconfigured. Hours were lost chasing
-# breakages a first-run check should have caught. This harness exercises EVERY part
-# of the install AFTER it lands (and after claude-mem setup), reports a per-check
-# ✓/⚠/✗ with an actionable fix on every failure, and — critically — gates the
-# "ready" hand-off: install.sh withholds the go-ahead and NEVER drops into an
-# interactive session while a critical check is red.
+# presence dead, statusline blank. Hours were lost chasing breakages a first-run
+# check should have caught. This harness exercises EVERY part of the install AFTER
+# it lands, reports a per-check ✓/⚠/✗ with an actionable fix on every failure, and
+# — critically — gates the "ready" hand-off: install.sh withholds the go-ahead and
+# NEVER drops into an interactive session while a critical check is red.
 #
 # EXIT CODE is the gate: 0 = all systems go (no ✗); 1 = at least one ✗ (NOT READY).
 # A ⚠ (degraded — e.g. control-plane offline, python absent) is NON-gating: it is
@@ -19,10 +18,9 @@
 #   2. presence    a real beat lands and the caller appears in their own roster.
 #   3. statusline  the watchman HUD is registered in the user's Claude settings.
 #   4. gates       hooks.json parses and every enforced gate is wired (N/N).
-#   5. claude-mem  the memory plugin is registered + enabled per hmd's expectations.
-#   6. hooks       SessionStart/SessionEnd keeper + statusline entries present + valid.
-#   7. path        hmd/heimdall on PATH resolves to THIS install (no stale shadow).
-#   8. runtime     (--cc-verify only) the FIRST cc/claude run — HEADLESS, in the
+#   5. hooks       SessionStart/SessionEnd keeper + statusline entries present + valid.
+#   6. path        hmd/heimdall on PATH resolves to THIS install (no stale shadow).
+#   7. runtime     (--cc-verify only) the FIRST cc/claude run — HEADLESS, in the
 #                  BACKGROUND, BOUNDED — completes so SessionStart wiring fires.
 #
 # USAGE:
@@ -310,50 +308,7 @@ check_gates() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHECK 5 — claude-mem configured + operational, PER HMD's expectations.
-# hmd drives claude-mem through the Claude Code PLUGIN (claude-mem@thedotmack from
-# the thedotmack marketplace) — that is what provides the /mem-search skill and the
-# SessionStart memory-injection hooks hmd relies on. Tiers:
-#   PASS  — plugin enabled in settings OR listed by `claude plugins list`.
-#   FAIL  — evidence of a setup ATTEMPT (marketplace known or a plugin cache) but the
-#           plugin is NOT enabled → genuinely MISCONFIGURED (the falsifier target).
-#   WARN  — no trace at all → simply not set up (offline/CI/stub) — non-gating, since
-#           claude-mem is an optional companion Heimdall works without.
-# ══════════════════════════════════════════════════════════════════════════════
-check_claude_mem() {
-  local mkt_repo="thedotmack/claude-mem" mkt_name="thedotmack" plugin_id="claude-mem@thedotmack"
-  local fix="claude plugins marketplace add $mkt_repo && claude plugins install $plugin_id"
-  local enabled="" mkt_known="" cache="" listed=""
-
-  if command -v jq >/dev/null 2>&1 && [ -f "$SETTINGS" ]; then
-    enabled="$(jq -r --arg k "$plugin_id" '.enabledPlugins[$k] // empty' "$SETTINGS" 2>/dev/null || true)"
-    mkt_known="$(jq -r --arg m "$mkt_name" 'if (.extraKnownMarketplaces // {}) | has($m) then "y" else "" end' "$SETTINGS" 2>/dev/null || true)"
-  fi
-  # Marketplace registry (written by `claude plugins marketplace add`).
-  if [ -z "$mkt_known" ] && command -v jq >/dev/null 2>&1 && [ -f "$CFG_DIR/plugins/known_marketplaces.json" ]; then
-    mkt_known="$(jq -r --arg m "$mkt_name" 'if has($m) then "y" else "" end' "$CFG_DIR/plugins/known_marketplaces.json" 2>/dev/null || true)"
-  fi
-  # Installed plugin cache (thedotmack/claude-mem/<ver>).
-  if [ -d "$CFG_DIR/plugins/cache/$mkt_name/claude-mem" ]; then cache="y"; fi
-  # Live listing (bounded — `claude plugins list` can be slow/offline).
-  if command -v "${HMD_DOCTOR_CLAUDE:-claude}" >/dev/null 2>&1; then
-    local tmp; tmp="$(mktemp 2>/dev/null || echo /tmp/hmd-doctor-cm.$$)"
-    run_capped 15 "$tmp" "${HMD_DOCTOR_CLAUDE:-claude}" plugins list || true
-    grep -qi 'claude-mem' "$tmp" 2>/dev/null && listed="y"
-    rm -f "$tmp" 2>/dev/null || true
-  fi
-
-  if [ "$enabled" = "true" ] || [ -n "$listed" ]; then
-    record "claude-mem" pass "plugin $plugin_id registered + enabled (mem-search + memory hooks live)"
-  elif [ -n "$mkt_known" ] || [ -n "$cache" ]; then
-    record "claude-mem" fail "claude-mem MISCONFIGURED — marketplace/cache present but plugin not enabled" "$fix"
-  else
-    record "claude-mem" warn "claude-mem not set up (optional companion) — memory across sessions is off" "$fix"
-  fi
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CHECK 6 — the SessionStart/SessionEnd hooks hmd's runtime depends on are present
+# CHECK 5 — the SessionStart/SessionEnd hooks hmd's runtime depends on are present
 # AND the file is valid JSON: the keeper beat (SessionStart keeper-start / SessionEnd
 # keeper-stop) and the statusline self-register (SessionStart). Missing any → ✗.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -386,7 +341,7 @@ check_hooks() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHECK 7 — hmd/heimdall on PATH resolves to THIS install (no stale shadow). The
+# CHECK 6 — hmd/heimdall on PATH resolves to THIS install (no stale shadow). The
 # shadow bug: `hmd` answers from an older tree earlier on PATH → the dev runs a stale
 # version despite reinstalling. Not-on-PATH yet → ⚠ (profile just needs sourcing).
 # ══════════════════════════════════════════════════════════════════════════════
@@ -411,7 +366,7 @@ check_path() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHECK 8 — the FIRST cc/claude run, HEADLESS + BACKGROUND + BOUNDED. RJ's directive:
+# CHECK 7 — the FIRST cc/claude run, HEADLESS + BACKGROUND + BOUNDED. RJ's directive:
 # the installer must NOT drop into an interactive session before verification — the
 # first invocation is a headless probe (claude -p, stdin /dev/null, no TTY) whose ONLY
 # job is to fire the SessionStart wiring (keeper beat, statusline register, mem hook).
@@ -480,7 +435,6 @@ check_crypto
 check_presence
 check_statusline
 check_gates
-check_claude_mem
 check_hooks
 check_path
 check_runtime
