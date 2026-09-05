@@ -210,11 +210,21 @@ start_proxy() {
   return 1
 }
 
+# A config-free sandbox for every guarantee below that invokes "$ROUTE" without already
+# controlling its own cwd. bin/heimdall-route resolves the fallback gate via
+# `heimdall-fallback --repo "$PWD" ...`, so whatever directory this suite happens to be
+# INVOKED FROM leaks straight into guarantees 2, 3, 4, 5 and 9 — including a real
+# operator's own .heimdall/fallback.json, if one exists at that cwd. Pinning cwd to this
+# empty, throwaway directory for those five guarantees makes them pass or fail on
+# headroom precedence alone, never on whatever fallback state happens to be ambient on
+# the host running the suite. Mirrors the NOFB_REPO pattern guarantee 10 already uses.
+FALLBACK_FREE_REPO="$TMP/fallback-free-repo"; mkdir -p "$FALLBACK_FREE_REPO"
+
 echo
 echo "2 — --url prints the chain's base URL against a verified-lossless proxy"
 PID1="$(start_proxy "$PORT1" --lossless)" && LIVE_PIDS="$LIVE_PIDS $PID1"
 if [ -n "${PID1:-}" ]; then
-  URL1="$(HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+  URL1="$(cd "$FALLBACK_FREE_REPO" && HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
           HEIMDALL_HOME="$TMP/home1" HEADROOM_PORT="$PORT1" "$ROUTE" --url 2>/dev/null)"
   [ "$URL1" = "http://127.0.0.1:$PORT1" ] \
     && ok "--url prints $URL1" \
@@ -227,7 +237,7 @@ echo
 echo "3 — --url fails, and prints nothing, when the chain refuses the live proxy"
 PID2="$(unset HEADROOM_LOSSLESS; start_proxy "$PORT2")" && LIVE_PIDS="$LIVE_PIDS $PID2"
 if [ -n "${PID2:-}" ]; then
-  OUT2="$(HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+  OUT2="$(cd "$FALLBACK_FREE_REPO" && HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
           HEIMDALL_HOME="$TMP/home2" HEADROOM_PORT="$PORT2" "$ROUTE" --url 2>"$TMP/err2")"
   RC2=$?
   if [ "$RC2" != "0" ] && [ -z "$OUT2" ]; then
@@ -246,10 +256,10 @@ echo
 echo "4 — a launched tool receives ANTHROPIC_BASE_URL in its OWN environment"
 ENV4="$TMP/env4"
 if [ -n "${PID1:-}" ]; then
-  PATH="$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV4" \
+  ( cd "$FALLBACK_FREE_REPO" && PATH="$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV4" \
     HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
     HEIMDALL_HOME="$TMP/home4" HEADROOM_PORT="$PORT1" \
-    "$ROUTE" faketool --some-flag value >"$TMP/out4" 2>"$TMP/err4"
+    "$ROUTE" faketool --some-flag value >"$TMP/out4" 2>"$TMP/err4" )
   RC4=$?
   [ "$RC4" = "0" ] && ok "the tool ran (exit 0)" || bad "the tool did not run cleanly (rc=$RC4): $(cat "$TMP/err4")"
   grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV4" 2>/dev/null \
@@ -269,10 +279,10 @@ echo
 echo "5 — FAIL-OPEN: with the module absent, the tool still launches, unproxied"
 ENV5="$TMP/env5"
 EMPTY_STATE="$TMP/empty-modstate"; mkdir -p "$EMPTY_STATE"
-PATH="$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV5" \
+( cd "$FALLBACK_FREE_REPO" && PATH="$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV5" \
   HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$EMPTY_STATE" \
   HEIMDALL_HOME="$TMP/home5" HEADROOM_PORT="$PORT_FAILOPEN" \
-  "$ROUTE" faketool >"$TMP/out5" 2>"$TMP/err5"
+  "$ROUTE" faketool >"$TMP/out5" 2>"$TMP/err5" )
 RC5=$?
 [ "$RC5" = "0" ] && ok "the tool launched anyway (exit 0)" \
   || bad "an unavailable proxy blocked the launch (rc=$RC5) — fail-open is the contract"
@@ -344,14 +354,14 @@ fi
 echo
 echo "9 — --status answers 'am I routed' without launching anything"
 if [ -n "${PID1:-}" ]; then
-  ST="$(HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+  ST="$(cd "$FALLBACK_FREE_REPO" && HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
         HEADROOM_PORT="$PORT1" "$ROUTE" --status 2>/dev/null)"
   case "$ST" in
     ROUTED*)     ok "--status reports: $ST" ;;
     "NOT ROUTED"*) bad "--status says NOT ROUTED against a live verified proxy: $ST" ;;
     *)           bad "--status printed something unrecognised: '$ST'" ;;
   esac
-  ST2="$(HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+  ST2="$(cd "$FALLBACK_FREE_REPO" && HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
          HEADROOM_PORT="$PORT_UNUSED" "$ROUTE" --status 2>/dev/null)"
   case "$ST2" in
     "NOT ROUTED"*) ok "--status reports NOT ROUTED when no proxy is listening" ;;
