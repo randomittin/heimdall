@@ -111,15 +111,17 @@ boundary from a different angle):
      silently by load_config()'s allowlist copy; cmd_check additionally
      warns on stderr if it finds one, so that silence is never mistaken for
      the field having done something.
-  8. THREE STATES, one safety boundary. `off` (default, never route), `auto`
+  8. FOUR STATES, one safety boundary. `off` (default, never route), `auto`
      (the exhaustion/pre-exhaustion reaction -- route only when preflight
      passes AND heimdall-session-usage confirms the ~95% threshold is
-     crossed, else WAIT rather than block -- see point 11), and `switch`
+     crossed, else WAIT rather than block -- see point 11), `switch`
      (route EVERYTHING, tier-blind, still gated by the same preflight as
-     every other state). None of the three ever changes WHETHER routing is
-     safe -- points 1-7 above apply identically in all three; `switch`
-     changes WHAT routes, never whether a failing Tier-1/model-pin/sidecar/
-     ToS check is survivable.
+     every other state), and `coop` (a deliberate, standing, PER-ROLE
+     allowlist -- never quota-reactive, never WAITs; see point 13). None of
+     the four ever changes WHETHER routing is safe -- points 1-7 above apply
+     identically in all four; each state only changes WHAT routes and WHEN,
+     never whether a failing Tier-1/model-pin/sidecar/ToS check is
+     survivable.
 
      REMOVED (owner directive, 2026-08-28): a fourth state, `on`, used to
      exist as a CAPABILITY-TIER routing decision -- haiku-tier work only, via
@@ -238,6 +240,51 @@ boundary from a different angle):
       whatever is now on disk, and returns that exact exit code -- arm is
       self-verifying, never a "trust me" tool.
 
+  13. `coop` is deliberate, per-role, standing division of labour -- NOT a
+      quota-reactive state like `auto`/`switch`. The MAIN agent (the
+      operator's own Claude Code / Cursor session) NEVER routes under
+      `coop` and stays on api.anthropic.com unconditionally -- that is
+      coop's defining property, and the reason it cannot be implemented by
+      simply widening `switch`'s allowlist. Only SPECIFIC named subagent
+      roles the operator has explicitly opted in via `coop add <role>`
+      route, and only because the operator chose to divide labour that
+      way, never because a quota threshold tripped. Default allowlist is
+      EMPTY: `coop` with no roles configured routes NOTHING -- the
+      operator names roles in one at a time, never a guessed or inherited
+      default set (see cmd_coop_add). Judgment roles
+      (bin/lib/hmd-adjudication-set.sh's hmd_is_adjudication -- reviewer,
+      verifier, security-auditor, incident-responder, plus any
+      *-review*/*-audit*/*-verif* type) can NEVER be added to the
+      allowlist -- refused at CONFIG TIME (cmd_coop_add), with a clear
+      reason, not merely skipped later at check time; run_preflight's own
+      coop_role_allowed check re-verifies this independently at
+      check/route time too, so a hand-edited config that smuggled an
+      adjudication role onto disk still cannot route it (defense in
+      depth, not a single gate). Role resolution for `check` is
+      `--role ROLE`, falling back to the HMD_AGENT_TYPE environment
+      variable when --role is omitted -- the same variable
+      bin/lib/hmd-route-claude already reads for its own judgment pin, and
+      the only channel available at all for `base-url` (bin/heimdall-route
+      calls it with no --role argument, and this file must never require
+      that caller to change). A bare `check` under `coop` with no
+      resolvable role (no --role, no HMD_AGENT_TYPE) reports REFUSE, never
+      a misleading global ROUTE -- there is no such thing as "coop routes
+      by default" for an unidentified caller. `coop` never sets a
+      session-wide ANTHROPIC_BASE_URL and never can: cmd_base_url only
+      ever prints an endpoint for THIS invocation's resolved role, and the
+      main session's own launch never calls through this per-role path at
+      all -- routing the main agent would destroy the entire point of the
+      state. `coop` NEVER WAITs (mirrors `switch`'s always-decide shape,
+      not `auto`'s exhaustion-gated one) -- a role is either on the
+      allowlist and preflight-clean (ROUTE) or it is not (REFUSE); there
+      is no "capacity not yet crossed" concept for a standing per-role
+      division of labour. See run_preflight's `coop_role_allowed` check
+      and _coop_role_allowed() for the exact allow/deny logic, and
+      bin/heimdall-precheck-agent's own coop section for why an in-process
+      Agent-tool spawn (no exec boundary) can never actually be routed
+      even for an allowlisted role, and is refused outright rather than
+      silently left on Anthropic while a caller believes it was routed.
+
 MUST FAIL CLOSED -- the deliberate inverse of heimdall-quota-advisor's "MUST
 FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
 signal must stay silent (exit quietly, print nothing). This tool's job is
@@ -267,15 +314,22 @@ latter. It has no opinion on retries and must never be consulted for one.
 
 USAGE
 -----
-  heimdall-fallback status [--json]            current state + would-preflight-pass, secret-free
-  heimdall-fallback set {off,auto,switch}      persist a new state (off is always safe)
-  heimdall-fallback check                      run the preflight; exit code IS the verdict.
-  heimdall-fallback arm [--provider P]          self-provision target_provider +
-                        [--state auto|switch]     operator_key_env (never inventing a
-                                                credential) and write state, then run
-                                                check and report its verdict. See header
-                                                point 12.
-  heimdall-fallback where                      print the config file path
+  heimdall-fallback status [--json]              current state + would-preflight-pass, secret-free
+  heimdall-fallback set {off,auto,switch,coop}   persist a new state (off is always safe)
+  heimdall-fallback check [--role ROLE]          run the preflight; exit code IS the verdict.
+                                                  --role only matters under state=coop (falls
+                                                  back to $HMD_AGENT_TYPE when omitted); ignored
+                                                  under off/auto/switch.
+  heimdall-fallback coop add ROLE                add/remove ROLE from the coop allowlist (add is
+                        remove ROLE                 refused for an adjudication role -- header
+                        list                        point 13) / print the current allowlist
+  heimdall-fallback arm [--provider P]            self-provision target_provider +
+                        [--state auto|switch]       operator_key_env (never inventing a
+                                                  credential) and write state, then run
+                                                  check and report its verdict. See header
+                                                  point 12 (coop is deliberately not an
+                                                  arm --state choice -- see point 13).
+  heimdall-fallback where                        print the config file path
 
 Global flags (before the subcommand -- matches bin/heimdall-pressure /
 bin/heimdall-metric):
@@ -287,8 +341,9 @@ CONFIG  <repo>/.heimdall/fallback.json -- gitignored by the blanket
 field below defaults to the safe value:
   {
     "schema": 1,
-    "state": "off",                        # off | auto | switch -- anything else, including
-                                            # the removed 'on', reads as off (header point 6)
+    "state": "off",                        # off | auto | switch | coop -- anything else,
+                                            # including the removed 'on', reads as off
+                                            # (header point 6)
     "operator_key_env": "",                # NAME of an env var holding the operator's
                                             # OWN OmniRoute/provider key -- never a value.
                                             # NOT required when target_provider is a
@@ -305,29 +360,46 @@ field below defaults to the safe value:
     "target_provider": "",                 # provider name; checked against the deny list
     "tos_flagged_providers": [],           # operator ADDITIONS to the built-in deny
                                             # list only -- can never remove a built-in
-    "noauth_providers": []                 # operator ADDITIONS to the built-in no-auth
+    "noauth_providers": [],                # operator ADDITIONS to the built-in no-auth
                                             # (keyless) provider list only -- see header
                                             # point 10; never removes a built-in entry
+    "coop_roles": []                       # explicit per-role allowlist for state=coop,
+                                            # EMPTY BY DEFAULT -- an operator names roles
+                                            # in one at a time via `coop add`; an
+                                            # adjudication role can never be added (see
+                                            # header point 13)
   }
 
 EXIT CODES
   status, where : always 0 (never-fail-caller telemetry reads)
   set           : 0 (even on bad input) unless --strict -> 2 usage / 3 write-fail
   check         : 0 = ROUTE  (every preflight check passed; under state=auto,
-                              heimdall-session-usage must also report "crossed")
-                  1 = REFUSE (state is 'off'; OR state is 'switch' and a
-                              preflight check failed)
+                              heimdall-session-usage must also report "crossed";
+                              under state=coop, the resolved role must also be
+                              on the coop allowlist -- see header point 13)
+                  1 = REFUSE (state is 'off'; OR state is 'switch'/'coop' and a
+                              preflight check failed -- for coop this includes
+                              an unresolvable, non-allowlisted, or adjudication
+                              role)
                   2 = WAIT   (state is 'auto' and either a preflight check
                               failed, or preflight passed but
                               heimdall-session-usage did not report "crossed"
-                              -- print the reasons, do not route blind)
+                              -- print the reasons, do not route blind; `coop`
+                              never returns WAIT -- see header point 13)
+  coop add/remove/list : add/remove exit 0 on success; add exits 1 (2 if
+                  --strict) refusing an adjudication role or an unresolvable
+                  argument, never writing the config in that case. list is a
+                  never-fail-caller telemetry read, matching status/where.
   arm           : mirrors check's own contract exactly -- 0 = ROUTE, 1 = REFUSE,
                   2 = WAIT -- because arm always ends by running that exact
                   preflight against whatever config is now on disk (the one it
                   just wrote, or the untouched original if it refused to write).
                   A write failure during arm -> 3 if --strict, else 0 (never-
                   fail-caller, matching set's own contract for the same failure
-                  mode).
+                  mode). coop is deliberately not an arm --state choice (header
+                  point 13) -- arm's target_provider/operator_key_env
+                  self-provisioning is an orthogonal axis to coop's per-role
+                  allowlist; use `set coop` + `coop add` instead.
   argument-parsing errors (any subcommand, including an invalid state to `set`
   or `arm --state`) : 0 unless --strict -> 2
   unexpected internal error (outer safety net; check() fails closed on its
@@ -347,7 +419,7 @@ import urllib.parse
 import urllib.request
 
 SCHEMA = 1
-VALID_STATES = ("off", "auto", "switch")
+VALID_STATES = ("off", "auto", "switch", "coop")
 
 DEFAULT_CFG = {
     "schema": SCHEMA,
@@ -373,6 +445,15 @@ DEFAULT_CFG = {
     # _model_pin_reject_reason for why an unset ANTHROPIC_MODEL was, until this
     # field existed, an unconditional veto on every unattended launch.
     "fallback_model": "",
+    # Explicit, per-role allowlist for state=="coop" -- see header point 13.
+    # EMPTY BY DEFAULT: coop with no roles configured routes NOTHING. Only
+    # `coop add <role>` (cmd_coop_add) may append to this list, and it refuses
+    # outright -- never silently skips -- an adjudication role (reuses
+    # bin/lib/hmd-adjudication-set.sh's hmd_is_adjudication, the single source
+    # of truth also used by bin/heimdall-precheck-agent and
+    # bin/lib/hmd-route-claude, never re-declared here). Sanitized on load to a
+    # sorted list of unique, non-empty strings -- see load_config().
+    "coop_roles": [],
 }
 
 # EMPTY BY DESIGN (owner decision, 2026-08-26). hmd's OWN gate is unchanged --
@@ -717,7 +798,7 @@ def load_config(repo):
         )
     elif raw_state not in VALID_STATES:
         cfg["state"] = "off"
-        state_corrupt_reason = "state %r is not one of off/auto/switch -- reset to off" % (raw_state,)
+        state_corrupt_reason = "state %r is not one of off/auto/switch/coop -- reset to off" % (raw_state,)
     if isinstance(cfg.get("tos_flagged_providers"), list):
         cfg["tos_flagged_providers"] = [p for p in cfg["tos_flagged_providers"] if isinstance(p, str)]
     else:
@@ -726,6 +807,12 @@ def load_config(repo):
         cfg["noauth_providers"] = [p for p in cfg["noauth_providers"] if isinstance(p, str)]
     else:
         cfg["noauth_providers"] = []
+    if isinstance(cfg.get("coop_roles"), list):
+        cfg["coop_roles"] = sorted({
+            p.strip() for p in cfg["coop_roles"] if isinstance(p, str) and p.strip()
+        })
+    else:
+        cfg["coop_roles"] = []
     for key in ("operator_key_env", "endpoint", "target_provider", "omniroute_db_path", "cliproxyapi_dir"):
         if not isinstance(cfg.get(key), str):
             cfg[key] = DEFAULT_CFG[key]
@@ -1054,11 +1141,95 @@ def _model_pin_reject_reason(model, origin):
     return None
 
 
-def run_preflight(cfg):
+def _adjudication_lib_path():
+    """Path to bin/lib/hmd-adjudication-set.sh, the single source of truth
+    for judgment-role classification (hmd_is_adjudication()). Resolved
+    relative to THIS file's own location -- same pattern
+    _session_pre_exhaustion_verdict already uses to find its sibling
+    heimdall-session-usage -- so it is correct regardless of --repo or any
+    sandboxed HEIMDALL_HOME a caller (or a hermetic test) sets."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "lib", "hmd-adjudication-set.sh"
+    )
+
+
+def _is_adjudication_role(role):
+    """True iff `role` is a judgment role per hmd_is_adjudication() (bin/lib/
+    hmd-adjudication-set.sh) -- reviewer, verifier, security-auditor,
+    incident-responder, or the *-review*/*-audit*/*-verif* glob. Shelled
+    out to, never re-declared: two independent copies of "what counts as
+    judgment" is how a coop allowlist quietly drifts from the adjudication
+    fence that is supposed to be its hard backstop (header point 13).
+
+    Fails CLOSED on any plumbing failure (library missing, bash missing, an
+    unexpected non-zero exit) by treating an unclassifiable role AS
+    adjudication -- i.e. barred from coop. This is the opposite fail
+    direction from most plumbing checks in this file (which fail closed on
+    ROUTING but open on unrelated plumbing errors), because the unsafe
+    outcome here is the same either way: a role that cannot be PROVEN safe
+    must never be admitted to a standing OmniRoute allowlist on the
+    strength of "the classifier was unavailable".
+    """
+    role = (role or "").strip()
+    if not role:
+        return False  # empty/absent is never a positive match -- nothing to bar
+    lib = _adjudication_lib_path()
+    if not os.path.isfile(lib):
+        return True  # fail closed: cannot prove NOT adjudication
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", '. "$1" && hmd_is_adjudication "$2"', "_", lib, role],
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        return True  # fail closed: classifier unavailable
+    return proc.returncode == 0
+
+
+def _coop_role_allowed(cfg, role):
+    """Whether `role` may route under state=="coop". Returns (allowed, reason).
+
+    Three gates, in order -- see header point 13:
+      1. role must be non-empty -- a bare, unidentified `check` can never
+         silently ROUTE under coop; there is nothing to consult the
+         allowlist against.
+      2. role must never be a judgment role, REGARDLESS of the on-disk
+         allowlist -- re-enforced HERE, not just at `coop add` config time,
+         because a config file can be hand-edited, or predate a later
+         hmd_is_adjudication() classification change. check-time is the
+         last line of defense and must never trust the write-time gate
+         alone.
+      3. role must be on cfg["coop_roles"] -- default empty, so coop with
+         no roles configured routes NOTHING.
+    """
+    if not role:
+        return False, ("no role identified for this check -- coop requires --role (or "
+                        "HMD_AGENT_TYPE) to know which allowlist entry to consult; a bare, "
+                        "unidentified check can never silently ROUTE under coop")
+    if _is_adjudication_role(role):
+        return False, ("role '%s' is a judgment/adjudication role -- coop can never route "
+                        "judgment traffic, regardless of the on-disk allowlist (see "
+                        "bin/lib/hmd-adjudication-set.sh)" % role)
+    roles = cfg.get("coop_roles") or []
+    if role not in roles:
+        return False, ("role '%s' is not on the coop allowlist (coop_roles=%s) -- coop "
+                        "routes ONLY explicitly allowlisted roles; use 'heimdall-fallback "
+                        "coop add %s' to add it" % (role, roles, role))
+    return True, ""
+
+
+def run_preflight(cfg, role=None):
     """Every gated check runs and reports independently, in a fixed order --
     a failure at 3am names exactly what to fix, never just "preflight
     failed". Order mirrors the header's numbered safety boundary. Returns a
     list of (name, ok, reason) triples; reason is "" when ok is True.
+
+    `role` is optional and consulted ONLY for the trailing coop_role_allowed
+    check, appended when cfg["state"] == "coop" (header point 13) -- every
+    check above it runs identically regardless of role, exactly as it
+    always has for off/auto/switch. Passing role=None (or omitting it)
+    under coop is exactly the bare, unidentified `check` case and must FAIL
+    that check, never skip it.
     """
     checks = []
 
@@ -1066,7 +1237,7 @@ def run_preflight(cfg):
     checks.append((
         "state",
         state != "off",
-        "" if state != "off" else "fallback state is 'off' (heimdall-fallback set auto|switch)",
+        "" if state != "off" else "fallback state is 'off' (heimdall-fallback set auto|switch|coop)",
     ))
 
     key_env = cfg.get("operator_key_env") or ""
@@ -1296,6 +1467,10 @@ def run_preflight(cfg):
     else:
         checks.append(("target_provider_allowed", True, ""))
 
+    if cfg.get("state") == "coop":
+        coop_ok, coop_reason = _coop_role_allowed(cfg, role)
+        checks.append(("coop_role_allowed", coop_ok, coop_reason))
+
     return checks
 
 
@@ -1416,8 +1591,15 @@ def cmd_check(args):
     try:
         config_path = _cfg_path(args.repo)
         cfg, _ = load_config(args.repo)
-        checks = run_preflight(cfg)
         state = cfg["state"]
+        # --role wins when given (explicit, deliberate -- lets an operator or a
+        # test ask "would role X route?" without setting the env var); falls
+        # back to HMD_AGENT_TYPE, the same variable bin/lib/hmd-route-claude's
+        # own judgment pin reads, and the ONLY channel base-url's caller
+        # (bin/heimdall-route, via _routing_decision) has at all. Irrelevant
+        # outside state=="coop" -- run_preflight only ever consults it there.
+        role = (getattr(args, "role", None) or "").strip() or (os.environ.get("HMD_AGENT_TYPE") or "").strip()
+        checks = run_preflight(cfg, role=role)
         preflight_ok = all(ok for _, ok, _ in checks)
         session_verdict, session_window, session_windows_seen = (
             _session_pre_exhaustion_verdict(args.repo) if state == "auto" else (None, None, None)
@@ -1430,6 +1612,9 @@ def cmd_check(args):
                        "capability tier is NOT consulted ***")
         print("  config:                %s" % config_path)
         print(header)
+        if state == "coop":
+            print("  role:                  %s" % (
+                role or "(none identified -- coop_role_allowed will FAIL; pass --role or set HMD_AGENT_TYPE)"))
 
         for name, ok, reason in checks:
             line = "  [%s] %s" % ("OK  " if ok else "FAIL", name)
@@ -1452,6 +1637,8 @@ def cmd_check(args):
         elif verdict == "WAIT" and preflight_ok:
             print("  (state=auto: preflight passed but session_usage verdict is not "
                   "crossed -> waiting rather than routing while capacity remains)")
+        elif verdict == "REFUSE" and state == "coop":
+            print("  (state=coop: role is not routable -> refusing rather than silently leaving it unrouted)")
         elif verdict == "REFUSE" and state != "off":
             print("  (state=%s but a required check failed -> refusing rather than proceeding unsafely)" % state)
 
@@ -1646,9 +1833,23 @@ def _routing_decision(args):
     """The verdict, computed exactly as cmd_check computes it. Returns
     (rc, endpoint, reason). Shared so `base-url` can never drift from
     `check` -- two independent copies of a routing decision is how a gate
-    starts saying ROUTE while the real gate says REFUSE."""
+    starts saying ROUTE while the real gate says REFUSE.
+
+    Role resolution here is deliberately HMD_AGENT_TYPE-only, never a
+    --role flag: base-url is the seam bin/lib/hmd-route-claude's generation
+    branch calls fresh on every spawn (via bin/heimdall-route), and neither
+    of those callers ever passes one -- see header point 13. HMD_AGENT_TYPE
+    set on a process survives exec automatically, so it is already present
+    by the time this runs, with zero upstream changes needed. The MAIN
+    agent identifies itself only by NOT carrying a coop-allowlisted
+    HMD_AGENT_TYPE -- there is no separate, positive "this is the main
+    session" marker, mirroring how bin/lib/hmd-route-claude's own
+    _hrc_is_judgment() already treats an absent/non-matching HMD_AGENT_TYPE
+    as "not judgment" with no affirmative signal of its own.
+    """
     cfg, _ = load_config(args.repo)
-    checks = run_preflight(cfg)
+    role = (os.environ.get("HMD_AGENT_TYPE") or "").strip()
+    checks = run_preflight(cfg, role=role)
     state = cfg["state"]
     session_verdict, _session_window, _session_windows_seen = (
         _session_pre_exhaustion_verdict(args.repo) if state == "auto" else (None, None, None)
@@ -1756,6 +1957,112 @@ def cmd_where(args):
     return 0
 
 
+def cmd_coop_list(args):
+    """Print the coop allowlist. Never-fail-caller telemetry read, matching
+    status/where -- always exits 0."""
+    cfg, _ = load_config(args.repo)
+    roles = cfg.get("coop_roles") or []
+    if args.json:
+        print(json.dumps({"coop_roles": roles}, sort_keys=True))
+        return 0
+    print("heimdall-fallback coop list")
+    print("  config:                %s" % _cfg_path(args.repo))
+    if not roles:
+        print("  (empty -- coop routes NOTHING until a role is added; see 'coop add')")
+    for role in roles:
+        print("  %s" % role)
+    return 0
+
+
+def cmd_coop_add(args):
+    """Add `role` to the coop allowlist. Refuses -- at CONFIG TIME, not just
+    check time -- a judgment/adjudication role (header point 13): coop is a
+    standing, deliberate allowlist, and a judgment role added to it today
+    would silently start routing judgment traffic the moment
+    hmd_is_adjudication's own classification is (correctly) trusted
+    elsewhere, with no further action from the operator. Refusing here, on
+    top of _coop_role_allowed's own check-time re-verification, means the
+    unsafe entry can never even be written to disk in the first place.
+
+    Exit 1 by default (2 under --strict) on refusal -- a deliberate
+    departure from this file's usual "OSError only" default-0 pattern (see
+    save_config's other callers): a deliberate safety refusal must be
+    observable without requiring --strict, since real callers never pass it
+    (see the top-level --strict help text) -- unlike a transient write
+    failure, which stays default-0. See EXIT CODES above.
+    """
+    role = (args.role or "").strip()
+    print("heimdall-fallback coop add")
+    print("  config:                %s" % _cfg_path(args.repo))
+    if not role:
+        sys.stderr.write("heimdall-fallback coop add: refusing -- empty/unresolvable role argument\n")
+        print("  REFUSED:               empty/unresolvable role argument")
+        return 2 if args.strict else 1
+    if _is_adjudication_role(role):
+        reason = ("'%s' is a judgment/adjudication role -- coop can never route judgment "
+                   "traffic, at config time or check time (see bin/lib/hmd-adjudication-set.sh)" % role)
+        sys.stderr.write("heimdall-fallback coop add: refusing -- %s\n" % reason)
+        print("  REFUSED:               %s" % reason)
+        return 2 if args.strict else 1
+    cfg, _ = load_config(args.repo)
+    roles = set(cfg.get("coop_roles") or [])
+    already_present = role in roles
+    roles.add(role)
+    cfg["coop_roles"] = sorted(roles)
+    try:
+        save_config(args.repo, cfg)
+    except OSError as exc:
+        sys.stderr.write("heimdall-fallback coop add: failed to write config: %s\n" % exc)
+        print("  REFUSED:               failed to write config: %s" % exc)
+        return 3 if args.strict else 0
+    if already_present:
+        print("  '%s' is already on the coop allowlist" % role)
+    else:
+        print("  '%s' added to the coop allowlist" % role)
+    return 0
+
+
+def cmd_coop_remove(args):
+    """Remove `role` from the coop allowlist. Removing a role that was
+    never present is not an error -- the end state (role absent) is
+    identical either way, so this is naturally idempotent and, unlike add,
+    has no refusal path of its own: there is nothing unsafe about shrinking
+    an allowlist. Exits 0 on a successful write, matching add/list's own
+    success contract; a write failure mirrors set's 3-if-strict-else-0."""
+    role = (args.role or "").strip()
+    print("heimdall-fallback coop remove")
+    print("  config:                %s" % _cfg_path(args.repo))
+    cfg, _ = load_config(args.repo)
+    roles = set(cfg.get("coop_roles") or [])
+    was_present = role in roles
+    roles.discard(role)
+    cfg["coop_roles"] = sorted(roles)
+    try:
+        save_config(args.repo, cfg)
+    except OSError as exc:
+        sys.stderr.write("heimdall-fallback coop remove: failed to write config: %s\n" % exc)
+        print("  REFUSED:               failed to write config: %s" % exc)
+        return 3 if args.strict else 0
+    if was_present:
+        print("  '%s' removed from the coop allowlist" % role)
+    else:
+        print("  '%s' was not on the coop allowlist (nothing to remove)" % role)
+    return 0
+
+
+def cmd_coop(args):
+    """Dispatch coop's own nested subcommand (add/remove/list).
+    build_parser wires coop_cmd as required, so args.coop_cmd is always one
+    of these three -- argparse itself rejects anything else before this
+    ever runs."""
+    handlers = {
+        "add": cmd_coop_add,
+        "remove": cmd_coop_remove,
+        "list": cmd_coop_list,
+    }
+    return handlers[args.coop_cmd](args)
+
+
 def build_parser():
     p = _Parser(
         prog="heimdall-fallback",
@@ -1771,7 +2078,13 @@ def build_parser():
     sp_set = sub.add_parser("set", help="persist a new fallback state")
     sp_set.add_argument("value", choices=VALID_STATES)
 
-    sub.add_parser("check", help="run the preflight; exit code is the verdict (0=ROUTE 1=REFUSE 2=WAIT)")
+    sp_check = sub.add_parser("check", help="run the preflight; exit code is the verdict (0=ROUTE 1=REFUSE 2=WAIT)")
+    sp_check.add_argument(
+        "--role", default=None,
+        help="subagent role to evaluate under state=coop (default: read HMD_AGENT_TYPE "
+             "from the environment); ignored under every other state. A bare check with "
+             "no resolvable role under coop always REFUSEs -- never a silent ROUTE",
+    )
 
     sp_arm = sub.add_parser(
         "arm",
@@ -1785,7 +2098,9 @@ def build_parser():
     )
     sp_arm.add_argument(
         "--state", default="auto", choices=("auto", "switch"),
-        help="fallback state to write once provisioning succeeds (default: auto)",
+        help="fallback state to write once provisioning succeeds (default: auto); coop "
+             "is deliberately not an arm target -- it is a hand-curated allowlist, never "
+             "something to auto-provision (see 'coop add')",
     )
 
     sub.add_parser(
@@ -1808,6 +2123,22 @@ def build_parser():
 
     sub.add_parser("where", help="print the config file path")
 
+    sp_coop = sub.add_parser(
+        "coop",
+        help="manage the coop per-role allowlist (state=coop routes ONLY these roles; "
+             "empty by default, judgment roles can never be added)",
+    )
+    coop_sub = sp_coop.add_subparsers(dest="coop_cmd", required=True)
+
+    sp_coop_add = coop_sub.add_parser("add", help="add a role to the coop allowlist")
+    sp_coop_add.add_argument("role", help="subagent role name, e.g. hmd:coder")
+
+    sp_coop_remove = coop_sub.add_parser("remove", help="remove a role from the coop allowlist")
+    sp_coop_remove.add_argument("role", help="subagent role name, e.g. hmd:coder")
+
+    sp_coop_list = coop_sub.add_parser("list", help="print the current coop allowlist")
+    sp_coop_list.add_argument("--json", action="store_true")
+
     return p
 
 
@@ -1829,6 +2160,7 @@ def main(argv):
         "token-file": cmd_token_file,
         "model": cmd_model,
         "where": cmd_where,
+        "coop": cmd_coop,
     }
     return handlers[args.cmd](args)
 
