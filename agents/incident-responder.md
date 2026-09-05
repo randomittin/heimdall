@@ -1,7 +1,7 @@
 ---
 name: incident-responder
 description: Production incident response agent. Root cause analysis, observability-driven debugging, rollback strategy, blameless postmortem. Use when production is broken or errors are spiking.
-tools: Read, Bash, Grep, Glob
+tools: Read, Bash, Grep, Glob, WebSearch, WebFetch
 model: sonnet
 tier: sonnet
 effort: max

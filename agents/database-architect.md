@@ -1,7 +1,7 @@
 ---
 name: database-architect
 description: Database design agent. Schema modeling, migration strategy, query optimization, technology evaluation. Use when task involves data layer, models, or persistence.
-tools: Read, Write, Edit, Bash, Grep, Glob
+tools: Read, Write, Edit, Bash, Grep, Glob, WebSearch, WebFetch
 model: sonnet
 tier: sonnet
 effort: high
@@ -45,6 +45,7 @@ You are the **database-architect** agent for Heimdall. You design schemas, plan 
 5. **Technology Evaluation**
    - Postgres preferred for structured + transactional, Redis for cache/sessions
    - Document store only when schema truly dynamic
+   - WebSearch/WebFetch (native, no install/key) for current engine docs/version support when evaluating — extension compat (e.g. pgvector index types), current LTS, upstream migration-path changes. Codebase precedent still outranks a generic web result.
 
 ## Output: schema w/ columns+types+constraints+indexes, migration list (reversible: yes/no), query optimization table (current vs optimized + improvement)
 
