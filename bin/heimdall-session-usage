@@ -150,6 +150,35 @@ be wired WITHOUT touching that sibling file at all, and honesty about
 coverage lives in `note`/`windows_seen` instead of a new enum value
 competing with "unknown"'s existing meaning.
 
+PHASE 6 -- 2026-09-05 (same day as PHASE 5, operator directive), verbatim:
+"maybe a better execution could be changing auto in omni fallback to work
+when limits are 90% consumed on cc -- and thus the remaining 10% can be
+solely used for orchestration". DEFAULT_THRESHOLD_PCT moves 95.0 -> 90.0 on
+that instruction. The mechanism this exploits: bin/heimdall-fallback's
+"auto" state is CHILD-ONLY -- it gates routed/subagent work, never the
+orchestrating session itself (see that file's header point 11). Firing the
+crossed-and-may-route signal five points earlier means the final ~10% of
+whatever this tool can see is deliberately left unspent by routed work, and
+so in practice stays available to the orchestrator for judgment rather than
+being burned on generation that could have moved to OmniRoute sooner. Pure
+default change: --threshold and HEIMDALL_SESSION_USAGE_THRESHOLD_PCT (both
+pre-existing) still override it exactly as before.
+
+WHAT THIS DOES NOT BUY, STATED PLAINLY: it only ever helps for windows
+Anthropic actually exposes on the wire -- five_hour, seven_day, and (PHASE 5)
+anything surfacing under extra. PHASE 5's own finding is unchanged by moving
+the number: no SESSION-scoped limit has ever been observed in a rate_limits
+payload, here or in this repo's history. The operator's own most recent
+block was exactly that kind of session limit, at a moment this tool
+reported comfortably UNDER on both five_hour and seven_day -- a 90%
+threshold would NOT have caught it, and neither would 50%: the blindness is
+categorical (the signal is never sent on that dimension), not a question of
+where the number sits. Moving the default earlier narrows exposure only for
+windows this tool CAN see; it does nothing for the one it structurally
+cannot. The reactive 429 marker (PHASE 4) remains the only signal here that
+reacts to that dimension, because it is driven by the rejection itself,
+never by a rate_limits snapshot.
+
 FOUR VERDICT STATES, ON PURPOSE — collapsing "unknown" into either neighbor
 is exactly the failure mode this tool exists to prevent:
   unconfigured — no operator budget set; a percentage is mathematically
@@ -203,7 +232,7 @@ from pathlib import Path
 
 DEFAULT_WINDOW_SECS = 18000  # 5h — matches Claude Code's own five_hour rate-limit window
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024  # 8 MiB tail cap
-DEFAULT_THRESHOLD_PCT = 95.0  # the operator's own stated target, not invented here
+DEFAULT_THRESHOLD_PCT = 90.0  # 2026-09-05 operator directive (supersedes the prior 95.0) -- see module docstring PHASE 6
 SEVEN_DAY_STALE_TTL_SECS = 18000  # fallback freshness bound ONLY when seven_day carries no resets_at of its own (PHASE 3)
 
 BUDGET_ENV = "HEIMDALL_SESSION_TOKEN_BUDGET"

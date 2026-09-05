@@ -143,8 +143,27 @@ if grep -qiE 'reviewer, verifier, security-auditor|never route under .on.' "$CMD
   bad "fallback.md still documents the removed on-state's adjudication-tier language"
 else ok "fallback.md correctly has no leftover on-state adjudication-tier language"; fi
 if grep -qiE '95%|five_hour' "$CMD_MD"; then
-  ok "fallback.md documents auto's real ~95% exhaustion threshold"
+  ok "fallback.md documents auto's real ~90% exhaustion threshold"
 else bad "fallback.md missing the auto exhaustion-threshold explanation"; fi
+if grep -qiE '~90%|90%' "$CMD_MD"; then
+  ok "fallback.md's auto explanation uses the current ~90% default, not a stale ~95%"
+else bad "fallback.md still reads ~95% without an updated ~90% reference"; fi
+# flattened (newlines -> spaces): these three checks assert on multi-word
+# prose phrases, and commands/fallback.md hard-wraps its paragraphs at ~80
+# cols for readability -- a phrase can legitimately straddle a source line
+# break (markdown treats consecutive lines as one soft-wrapped paragraph)
+# even though the rendered document reads fine. Matching on the flattened
+# text checks the actual document content, not incidental wrap position.
+CMD_MD_FLAT=$(tr '\n' ' ' < "$CMD_MD")
+if printf '%s' "$CMD_MD_FLAT" | grep -qiF "reserve the final"; then
+  ok "fallback.md explains WHY 90% (reserves quota for orchestration)"
+else bad "fallback.md is missing the why-90%-not-95% rationale"; fi
+if printf '%s' "$CMD_MD_FLAT" | grep -qiF "session limit is never exposed"; then
+  ok "fallback.md states the session-limit blindness caveat plainly"
+else bad "fallback.md is missing the session-limit blindness caveat"; fi
+if printf '%s' "$CMD_MD_FLAT" | grep -qiF "would not have prevented it"; then
+  ok "fallback.md explicitly says the lower threshold would not have prevented the operator's own session-limit block"
+else bad "fallback.md is missing the concrete would-not-have-prevented-it claim"; fi
 
 # ── 5. keys: no-auth needs none, keyed needs the env var NAME not the value ──
 if grep -qiE 'no-auth|no key' "$CMD_MD"; then ok "fallback.md documents no-auth/keyless providers"; else bad "fallback.md missing no-auth provider documentation"; fi

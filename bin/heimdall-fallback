@@ -113,7 +113,7 @@ boundary from a different angle):
      the field having done something.
   8. FOUR STATES, one safety boundary. `off` (default, never route), `auto`
      (the exhaustion/pre-exhaustion reaction -- route only when preflight
-     passes AND heimdall-session-usage confirms the ~95% threshold is
+     passes AND heimdall-session-usage confirms the ~90% threshold is
      crossed, else WAIT rather than block -- see point 11), `switch`
      (route EVERYTHING, tier-blind, still gated by the same preflight as
      every other state), and `coop` (a deliberate, standing, PER-ROLE
@@ -168,7 +168,7 @@ boundary from a different angle):
 
   11. state=="auto" is the one state that is actually exhaustion-gated.
       It best-effort-consults bin/heimdall-session-usage's own
-      ~95%-of-session-limit pre-exhaustion verdict and treats it as a
+      ~90%-of-session-limit pre-exhaustion verdict and treats it as a
       SECOND, NECESSARY condition for ROUTE: `check` prints VERDICT: ROUTE
       under auto only when the preflight passes AND heimdall-session-usage
       reports "crossed". A passing preflight with capacity still available
@@ -178,10 +178,25 @@ boundary from a different angle):
       cache_control; see
       docs/analysis/2026-08-25-headroom-inpath-measurement.md). This is a
       NECESSARY condition ADDED to the existing gate, never a substitute for
-      it: crossing 95% still authorizes nothing on its own -- every
+      it: crossing 90% still authorizes nothing on its own -- every
       preflight check above (Tier-1, model pin, sidecar, provider
       allow-list, all of it) still has to pass first, exactly as before; a
       failing preflight WAITs regardless of session_usage, crossed or not.
+
+      The ~90% figure (2026-09-05 operator directive, down from a prior 95%)
+      is deliberately NOT hardcoded here -- it lives as bin/heimdall-
+      session-usage's own DEFAULT_THRESHOLD_PCT (module docstring PHASE 6
+      has the full rationale: reserving the final ~10% of Anthropic's own
+      quota for the orchestrator's own judgment, since `auto` only ever
+      gates CHILD/routed work, never the main session). PHASE 6 also states
+      the same limitation plainly, and it is repeated here because it
+      matters: this narrows exposure only for windows Anthropic actually
+      exposes (five_hour, seven_day, any future `extra`) -- it does nothing
+      for a SESSION-scoped limit, which has never once appeared in a
+      rate_limits payload under any name. A lower threshold would not have
+      caught the operator's own most recent session-limit block either;
+      only the reactive 429 marker (bin/heimdall-429-mark, PHASE 4) reacts
+      to that dimension at all.
 
       heimdall-session-usage's own verdict is one of four: "unconfigured" /
       "unknown" / "under" / "crossed" -- all four are load-bearing and kept
@@ -603,7 +618,7 @@ NOAUTH_ROUTE_NOTE_FMT = (
 SESSION_USAGE_VERDICTS = ("unconfigured", "unknown", "under", "crossed")
 SESSION_USAGE_NOTE_FMT = {
     "crossed": (
-        "pre-exhaustion threshold CROSSED (~95% of session limit) -- the "
+        "pre-exhaustion threshold CROSSED (~90% of session limit) -- the "
         "checks above are still the ONLY thing that decides ROUTE/WAIT/"
         "REFUSE; this authorizes nothing on its own"
     ),
@@ -1032,7 +1047,7 @@ def _blocked_providers_note(repo):
 
 def _session_pre_exhaustion_verdict(repo):
     """Best-effort consult of bin/heimdall-session-usage's own pre-exhaustion
-    verdict (~95% of session limit) -- see header point 11. Feeds TWO things
+    verdict (~90% of session limit) -- see header point 11. Feeds TWO things
     for state=="auto": the [INFO] line, AND _verdict()'s own ROUTE-vs-WAIT
     decision, where "crossed" is a necessary (not sufficient) condition for
     ROUTE. It does NOT feed anything for off/on/switch -- those states never
@@ -1485,7 +1500,7 @@ def _verdict(state, checks, session_verdict=None):
     11): a passing preflight is NECESSARY but no longer SUFFICIENT for ROUTE
     under auto -- it additionally requires session_verdict == "crossed".
     Both conditions are necessary; neither is sufficient alone: a failing
-    preflight WAITs regardless of session_verdict (95% crossed authorizes
+    preflight WAITs regardless of session_verdict (90% crossed authorizes
     nothing on its own), and a passing preflight with session_verdict in
     {"under", "unconfigured", "unknown", None} WAITs instead of routing
     (capacity remains, or cannot be confirmed low, so there is nothing to

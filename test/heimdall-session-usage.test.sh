@@ -6,7 +6,7 @@
 #
 # FALSIFIABLE CLAIMS TESTED:
 #  1. consumption below threshold        -> verdict=under, exit 0
-#  2. consumption above 95% threshold    -> verdict=crossed, exit 1
+#  2. consumption above the 90% default threshold (2026-09-05, was 95%) -> verdict=crossed, exit 1
 #  3. consumption exactly at threshold (>=) -> crossed
 #  4. missing transcript file            -> verdict=unknown (exit 0), NOT under
 #  5. malformed JSON lines are skipped, not fatal
@@ -84,6 +84,21 @@
 #      extra UNDER-threshold window and windows_seen also present in the same
 #      fixture -> window stays EXACTLY 'both', proving old behavior is
 #      unchanged even when the new fields coexist
+# PHASE 6 -- 2026-09-05 (operator directive: reserve the final ~10% of
+# Anthropic's own quota for orchestration). DEFAULT_THRESHOLD_PCT moves
+# 95.0 -> 90.0; --threshold and HEIMDALL_SESSION_USAGE_THRESHOLD_PCT are
+# unaffected and still override it. Cases 51-54:
+#  51. 92% real five_hour usage -> crossed at the NEW default (would have
+#      been under at the old 95%)
+#  52. 88% real five_hour usage -> under, at the new default
+#  53. explicit --threshold 95 at 92% usage -> under (CLI override intact)
+#  54. env HEIMDALL_SESSION_USAGE_THRESHOLD_PCT=95 at 92% usage -> under
+#      (env override intact)
+# BLIND-vs-under (no window observed at all must never read as a confident
+# "under") is a bin/heimdall-fallback notice-text concern, not a verdict
+# this tool itself emits -- see that file's _session_usage_under_note() and
+# test/heimdall-fallback.test.sh cases 89/90/93, which this threshold
+# change does not touch.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -176,7 +191,7 @@ usage_line "$(now_ts)" 100 50 > "$f"
 out=$(python3 "$BIN" status --file "$f" --budget 1000 --json); rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"'; then ok; else bad "case1 rc=$rc out=$out"; fi
 
-echo "=== 2. above 95% threshold -> crossed ==="
+echo "=== 2. above 90% threshold -> crossed ==="
 d=$(case_dir c2); f="$d/t.jsonl"
 usage_line "$(now_ts)" 900 60 > "$f"   # 960/1000 = 96%
 out=$(python3 "$BIN" status --file "$f" --budget 1000 --json); rc=$?
@@ -184,7 +199,7 @@ if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"'; then 
 
 echo "=== 3. exactly at threshold (>=) -> crossed ==="
 d=$(case_dir c3); f="$d/t.jsonl"
-usage_line "$(now_ts)" 900 50 > "$f"   # 950/1000 = 95.0% exactly, default threshold 95.0
+usage_line "$(now_ts)" 850 50 > "$f"   # 900/1000 = 90.0% exactly, default threshold 90.0 (2026-09-05)
 out=$(python3 "$BIN" status --file "$f" --budget 1000 --json); rc=$?
 if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"'; then ok; else bad "case3 rc=$rc out=$out"; fi
 
@@ -587,6 +602,46 @@ json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 96.0, 'r
 "
 out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
 if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "both"' && printf '%s' "$out" | grep -qF '"windows_seen": ["five_hour", "seven_day", "session"]'; then ok; else bad "case50 rc=$rc out=$out"; fi
+
+echo "=== 51. PHASE 6 (2026-09-05 default change, 95->90): 92% real five_hour usage CROSSES the new default (would have been UNDER at the prior 95%) ==="
+d=$(case_dir c51); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 92.0, 'resets_at': time.time() + 3600}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"threshold_pct": 90.0'; then ok; else bad "case51 rc=$rc out=$out"; fi
+
+echo "=== 52. PHASE 6: 88% real five_hour usage stays UNDER the new 90% default ==="
+d=$(case_dir c52); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 88.0, 'resets_at': time.time() + 3600}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"threshold_pct": 90.0'; then ok; else bad "case52 rc=$rc out=$out"; fi
+
+echo "=== 53. PHASE 6: explicit --threshold 95 at 92% usage -> UNDER (CLI override still beats the new default) ==="
+d=$(case_dir c53); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 92.0, 'resets_at': time.time() + 3600}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --threshold 95 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"threshold_pct": 95.0'; then ok; else bad "case53 rc=$rc out=$out"; fi
+
+echo "=== 54. PHASE 6: env HEIMDALL_SESSION_USAGE_THRESHOLD_PCT=95 at 92% usage -> UNDER (env override still beats the new default) ==="
+d=$(case_dir c54); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 92.0, 'resets_at': time.time() + 3600}}, open('$rl', 'w'))
+"
+out=$(HEIMDALL_SESSION_USAGE_THRESHOLD_PCT=95 python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"threshold_pct": 95.0'; then ok; else bad "case54 rc=$rc out=$out"; fi
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"

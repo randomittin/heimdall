@@ -44,8 +44,29 @@ needs to do about it.
 | state    | what it actually does |
 |----------|------------------------|
 | `off`    | Never routes. Every task stays on Claude. |
-| `auto`   | The exhaustion reaction: routes ONLY once THIS session's real usage crosses ~95% of Anthropic's 5-hour window (`rate_limits.five_hour.used_percentage` — the same number Claude Code's own statusline shows). Below that, or if it can't be measured, `auto` WAITs rather than routing blind — there's no reason to leave Anthropic while quota remains. |
+| `auto`   | The exhaustion reaction: routes ONLY once THIS session's real usage crosses ~90% of Anthropic's 5-hour window (`rate_limits.five_hour.used_percentage` — the same number Claude Code's own statusline shows). Below that, or if it can't be measured, `auto` WAITs rather than routing blind — there's no reason to leave Anthropic while quota remains. |
 | `switch` | Everything routes, every tier, tier is never consulted. `status` and `check` both print an impossible-to-miss warning while you're in this state — it's the one state where quality-sensitive work can land on a provider with no no-train guarantee. |
+
+**Why ~90%, not ~95% — and what it does NOT cover.** The threshold moved
+down (2026-09-05 operator directive) to deliberately reserve the final ~10%
+of Anthropic's own quota for the orchestrating session's own judgment:
+`auto` only ever gates CHILD/routed work (`heimdall-fallback check --role`,
+never the main agent) — so quota `auto` no longer spends on routed
+generation between 90% and 95% is quota the orchestrator still has, later,
+for its own reasoning. That reservation only ever helps for windows
+Anthropic actually exposes on the wire: confirmed by direct inspection, the
+`rate_limits` payload carries ONLY `five_hour` and `seven_day`
+(`extra_windows` is empty in every sample this repo has ever captured — see
+`bin/heimdall-session-usage`'s own module docstring, PHASE 5). A SESSION
+limit is never exposed there at all, under any name. The operator's own
+most recent block was exactly a session limit, at a moment
+`heimdall-session-usage` reported comfortably UNDER threshold on both
+five_hour and seven_day — a 90% threshold would NOT have prevented it, and
+neither would a lower one; the blindness is categorical, not a matter of
+where the number sits. Arming `auto` is not protection against a session
+limit. The reactive 429 marker (`bin/heimdall-429-mark`) is the only signal
+in this repo that reacts to that dimension, because it fires off the
+rejection itself rather than a `rate_limits` snapshot.
 
 **Removed (owner directive):** a fourth state, `on`, used to exist as a
 **capability-tier** decision — routing ONLY low-level work (lint, format,
@@ -139,7 +160,7 @@ Verified end-to-end against a live local OmniRoute gateway:
    heimdall-fallback check
    ```
    Expect `VERDICT: ROUTE` (under `auto`, expect `WAIT` until the session
-   actually crosses ~95% — that's correct behavior, not a bug). `check`'s
+   actually crosses ~90% — that's correct behavior, not a bug). `check`'s
    exit code IS the verdict: `0` = ROUTE, `1` = REFUSE, `2` = WAIT.
 
 ## Automatic model pinning — the `fallback_model` config field
