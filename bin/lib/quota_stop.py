@@ -18,7 +18,11 @@ WHY THIS EXISTS
     this module is deliberately conservative: it requires TWO independent
     signals to agree before calling anything a quota stop —
       1. the Claude-specific "hit your ... limit" phrase (ANCHOR_RE), and
-      2. a well-formed "resets H:MMam/pm (TZ)" wall-clock clause (RESET_RE).
+      2. a well-formed "resets H[:MM]am/pm (TZ)" wall-clock clause (RESET_RE).
+         Minutes are OPTIONAL — production text omits them entirely on the
+         hour ("resets 2pm (Asia/Calcutta)"), not just when non-zero
+         ("resets 2:30pm (Asia/Calcutta)"). Both are real, observed shapes;
+         neither is fabricated to make a test pass.
     Either signal alone classifies as "unknown", and "unknown" is the safe
     default: the caller (bin/heimdall-quota-resume record) refuses to write a
     resume record for "unknown" text. That refusal is the do-nothing default
@@ -74,11 +78,15 @@ except ImportError:  # pragma: no cover - this repo targets Python >= 3.9
 # text this classifier must never fire on by itself (see module docstring).
 ANCHOR_RE = re.compile(r"hit your [a-z0-9][a-z0-9\- ]{0,24}limit", re.IGNORECASE)
 
-# A wall-clock reset clause: "resets 5:40pm (Asia/Calcutta)". The timezone
-# token's charset is permissive (IANA names use '/', '_', '+', '-') but
-# length-bounded.
+# A wall-clock reset clause: "resets 5:40pm (Asia/Calcutta)" OR, just as
+# real, "resets 2pm (Asia/Calcutta)" with no minutes at all when the reset
+# lands on the hour — the ":MM" group is OPTIONAL (measured 2026-09-06
+# against actual Claude Code termination text; a fixed-minutes-required regex
+# silently mis-marked every on-the-hour reset as "unknown" in production).
+# The timezone token's charset is permissive (IANA names use '/', '_', '+',
+# '-') but length-bounded.
 RESET_RE = re.compile(
-    r"resets?\s+(\d{1,2}):(\d{2})\s*([ap]m)\s*\(\s*([A-Za-z0-9_+\-/]{2,64})\s*\)",
+    r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(\s*([A-Za-z0-9_+\-/]{2,64})\s*\)",
     re.IGNORECASE,
 )
 
@@ -106,10 +114,19 @@ def classify(text):
     }
     if reset_m:
         hour, minute, ampm, tz_name = reset_m.groups()
-        out["reset_local"] = "%d:%02d%s" % (int(hour), int(minute), ampm.lower())
+        # minute is None when the source text omitted ":MM" (an on-the-hour
+        # reset, e.g. "resets 2pm"). Resolve to 0 for arithmetic, but DISPLAY
+        # exactly what appeared in the source — "2pm", never a fabricated
+        # "2:00pm" — since reset_local's job is to echo the real text, not
+        # manufacture false minute-precision.
+        minute_i = int(minute) if minute is not None else 0
+        if minute is not None:
+            out["reset_local"] = "%d:%02d%s" % (int(hour), minute_i, ampm.lower())
+        else:
+            out["reset_local"] = "%d%s" % (int(hour), ampm.lower())
         out["reset_tz"] = tz_name
         out["_hour12"] = int(hour)
-        out["_minute"] = int(minute)
+        out["_minute"] = minute_i
         out["_ampm"] = ampm.lower()
     return out
 

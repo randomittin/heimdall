@@ -62,6 +62,27 @@ out="$(printf '%s' "$REAL_MSG_2" | "$PY_BIN" "$LIB" classify)"; rc=$?
   && ok "real msg 2 (usage limit) classifies quota, exit 0" \
   || bad "real msg 2 classify — got rc=$rc out=$out"
 
+# DEFECT (2026-09-06): the REAL text Claude Code emits omits minutes entirely
+# when the reset lands on the hour — "resets 2pm", never "resets 2:00pm".
+# REAL_MSG_3 is the VERBATIM production string; this must never again pass on
+# a fabricated/rounded shape. REAL_MSG_4 is the same real shape WITH minutes,
+# proving the fix adds a case rather than replacing one (no regression).
+REAL_MSG_3="You've hit your session limit · resets 2pm (Asia/Calcutta)"
+REAL_MSG_4="You've hit your session limit · resets 2:30pm (Asia/Calcutta)"
+
+out="$(printf '%s' "$REAL_MSG_3" | "$PY_BIN" "$LIB" classify)"; rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.class')" = "quota" ] \
+  && [ "$(printf '%s' "$out" | jq -r '.reset_local')" = "2pm" ] \
+  && [ "$(printf '%s' "$out" | jq -r '.reset_tz')" = "Asia/Calcutta" ] \
+  && ok "REAL PRODUCTION STRING real msg 3 (hour-only reset, no :MM) classifies quota, exit 0" \
+  || bad "real msg 3 (hour-only) classify — got rc=$rc out=$out"
+
+out="$(printf '%s' "$REAL_MSG_4" | "$PY_BIN" "$LIB" classify)"; rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.class')" = "quota" ] \
+  && [ "$(printf '%s' "$out" | jq -r '.reset_local')" = "2:30pm" ] \
+  && ok "real msg 4 (minutes-present reset) still classifies quota, exit 0 (no regression)" \
+  || bad "real msg 4 (minutes-present) classify — got rc=$rc out=$out"
+
 # FALSIFIER: anchor phrase present, reset clause absent — must NOT classify
 # quota. Proves the reset-clause requirement is load-bearing, not vestigial.
 out="$(printf '%s' "You've hit your session limit for this billing period." | "$PY_BIN" "$LIB" classify)"; rc=$?
