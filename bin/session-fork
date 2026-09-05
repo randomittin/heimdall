@@ -37,9 +37,15 @@ Usage:
 
 Task JSON format (array of waves, each wave is array of tasks):
   [
-    [{"id": "t1", "prompt": "..."}, {"id": "t2", "prompt": "..."}],
+    [{"id": "t1", "prompt": "..."}, {"id": "t2", "prompt": "...", "role": "hmd:coder"}],
     [{"id": "t3", "prompt": "...", "depends": ["t1"]}]
   ]
+
+Optional per-task "role" sets HMD_AGENT_TYPE (via hmd-exec's own --role) on
+that task's own exec'd child, for bin/heimdall-fallback's coop routing. A
+task that omits it falls back to this invocation's HEIMDALL_FORK_ROLE /
+SUPERX_FORK_ROLE env var, which may itself be unset -- never invented, only
+ever inherited from one of those two explicit sources.
 EOF
 }
 
@@ -151,8 +157,8 @@ cmd_wave() {
 import json, sys
 tasks = json.load(sys.stdin)
 for t in tasks:
-    print(t['id'] + '|' + t['prompt'])
-" 2>/dev/null | while IFS='|' read -r tid tprompt; do
+    print(t['id'] + '|' + t.get('role', '') + '|' + t['prompt'])
+" 2>/dev/null | while IFS='|' read -r tid trole tprompt; do
     while [ "$active" -ge "$MAX_PARALLEL" ]; do
       sleep 1
       active=0
@@ -163,7 +169,7 @@ for t in tasks:
         kill -0 "$p" 2>/dev/null && active=$((active + 1))
       done
     done
-    fork_one "$tid" "$tprompt"
+    fork_one "$tid" "$tprompt" "" "$trole"
     active=$((active + 1))
   done
 
@@ -196,10 +202,10 @@ for i, wave in enumerate(waves):
         dep_results = ''
         for dep in task.get('depends', []):
             dep_results += f'dep:{dep}|'
-        print(f'{i}|{task[\"id\"]}|{task[\"prompt\"]}|{dep_results}')
+        print(f'{i}|{task[\"id\"]}|{task.get(\"role\", \"\")}|{task[\"prompt\"]}|{dep_results}')
 " 2>/dev/null | {
     current_wave=-1
-    while IFS='|' read -r widx tid tprompt tdeps; do
+    while IFS='|' read -r widx tid trole tprompt tdeps; do
       if [ "$widx" -ne "$current_wave" ]; then
         if [ "$current_wave" -ge 0 ]; then
           echo "run: waiting for wave $current_wave..."
@@ -223,7 +229,7 @@ $(tail -20 "$RESULTS_DIR/outputs/${dep}.txt")
         done
       fi
 
-      fork_one "$tid" "$tprompt" "$context"
+      fork_one "$tid" "$tprompt" "$context" "$trole"
     done
 
     if [ "$current_wave" -ge 0 ]; then
