@@ -2483,6 +2483,29 @@ case "${1:-}" in
     if [ -x "$_cev" ]; then exec "$_cev" "$@"; fi
     echo "error: heimdall-caveman-eval not found at $_cev" >&2; exit 2
     ;;
+  web)
+    # Dependency-light fetch/crawl/batch/meta engine that replicates what
+    # Firecrawl gives you, without adopting Firecrawl (AGPL-3.0's
+    # network-use clause on modification; the OSS self-host build also
+    # needs a browser pool + Redis + Postgres and is feature-behind the
+    # hosted tier). Native WebFetch already fetches one URL and summarizes
+    # it through a model; native WebSearch returns results but never
+    # fetches a page body -- neither crawls, batches, caches, or extracts
+    # structured metadata. bin/lib/web_fetch.py (stdlib only, no install)
+    # covers that gap: fetch -> clean markdown, bounded same-domain-by-
+    # default crawl, concurrent batch fetch, JSON-LD/OG/canonical metadata
+    # extraction, URL cache. Every request is bounded (timeout, wall
+    # clock, max bytes, max pages), refuses non-http(s) schemes and
+    # private/loopback addresses unless explicitly opted in (SSRF guard),
+    # honours robots.txt by default, and never sends a credential header
+    # or reads a key-shaped env var. See bin/lib/web_fetch.py's own module
+    # docstring for the full security model and test/heimdall-web.test.sh
+    # for the falsifiable red-proofs (hermetic, local fixture servers only).
+    shift
+    _web="$(cd "$(dirname "$0")" && pwd)/heimdall-web"
+    if [ -x "$_web" ]; then exec "$_web" "$@"; fi
+    echo "error: heimdall-web not found at $_web" >&2; exit 2
+    ;;
   plan-verify)
     # Closes the plan -> execution -> verification loop: bin/decompose emits waves,
     # agents/planner.md and agents/architect.md write PLAN files with acceptance

@@ -36,12 +36,15 @@ If the user passes you a spec file path, read it verbatim and skip the brainstor
 4. **Risk Assessment**: Identify potential blockers, conflicts, and technical debt
 5. **Skill Recommendation**: Identify which skills should be assigned to each sub-project's agent
 
-## Web Research — when to reach for WebSearch/WebFetch
+## Web Research — WebSearch/WebFetch, and when to reach for `hmd web` instead
 
 Native Claude Code tools: no install, no key, no third-party service. Scope: Technology Evaluation and risk assessment only — never a substitute for reading this codebase first.
 
 - **WebSearch** — no known URL yet (e.g. "current best rate-limiter for Node", "is there a maintained fork of X"). Use to find candidates, not to settle a debate codebase precedent already settles.
 - **WebFetch** — once you have a specific doc/README/release-notes URL (from search, from `package.json`'s `homepage`, from an issue link), fetch it to verify current API shape/version before a plan commits to it.
+- **`hmd web crawl <url>`** — WebFetch only reads the one URL you give it; when a technology evaluation needs several pages of the same doc site (a multi-page migration guide, a versioned API reference split across sections), crawl the seed bounded (`--max-depth`, `--max-pages`, same-domain by default) instead of guessing individual URLs one WebFetch at a time.
+- **`hmd web batch <url...>`** — comparing N candidate libraries means N doc pages; fetch them concurrently instead of one sequential WebFetch per candidate.
+- **`hmd web meta <url>`** — when what you need is the page's OWN structured facts (canonical URL, title, JSON-LD) rather than a model's prose summary of it, this is more precise than WebFetch's summarization pass.
 - Cite what you fetched (URL + why) in the PLAN file's Risks or Patterns section — a reviewer should see the plan didn't invent an API that doesn't exist.
 - An in-repo `file:line` precedent always outranks a generic web result.
 
