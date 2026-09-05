@@ -42,6 +42,8 @@ n=$(cat "$STUB_COUNTER" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$STUB
 case "$STUB_MODE" in
   success)        echo "STUB-OK-OUTPUT"; exit 0 ;;
   real_error)     echo "Error: invalid prompt — malformed request" >&2; exit 1 ;;
+  real_429)       echo "error type rate_limit, HTTP 429" >&2; exit 1 ;;
+  real_quota)     echo "Agent terminated early due to an API error: You've hit your session limit · resets 11:30pm (Asia/Calcutta)" >&2; exit 1 ;;
   always_overload) echo "API Error: 529 Overloaded · Retrying ${n}/10" >&2; exit 1 ;;
   recover_after)
     if [ "$n" -le "${STUB_FAIL_TIMES:-2}" ]; then
@@ -185,6 +187,60 @@ check "G3 non-strict run w/ zero args does NOT hit hmd-exec's own usage error (f
 
 rcG4=0; "$EXEC" --help >/dev/null 2>"$WORK/g4.err" || rcG4=$?
 check "G4 --help exits 0"                               "[ '$rcG4' -eq 0 ]"
+
+# ── Case H: 429/quota-shaped failures mark the reactive exhaustion gate
+# (bin/heimdall-429-mark, fed by bin/lib/hmd-claude-retry.sh's
+# _hmd_is_429_text / _hmd_is_quota_text); an unrelated real error, a clean
+# success, and a pure server-overload give-up must NOT (red-proofs).
+# HEIMDALL_HOME is already per-case-sandboxed by reset_case() above (a fresh
+# "$WORK/hmdhome-$RANDOM" every call), so marker_fresh() below never touches
+# a real ~/.heimdall/429-marker.json.
+echo "Case H — 429/quota detection marks the exhaustion gate (unrelated failure/success/pure-529 do not):"
+marker_fresh() { "$ROOT/bin/heimdall-429-mark" check --ttl-secs 900 >/dev/null 2>&1; }
+
+# H1: raw "429 / rate_limit" text (Anthropic API-shaped) also satisfies
+# _hmd_is_overload_text (it literally contains "429"), so this is genuinely
+# indistinguishable from a transient overload by that gate and retries to
+# exhaustion like Case D -- proving the (pre-existing) 429 mark fires even
+# on the give-up path, not only on an immediate fail-fast.
+reset_case real_429
+export HMD_OVERLOAD_MAX_ATTEMPTS=3
+rcH1=0; "$EXEC" run -p "x" --model m >/dev/null 2>"$WORK/h1.err" || rcH1=$?
+check "H1 exhausts retries and gives up loudly (75)"     "[ '$rcH1' -eq 75 ] && [ '$(count)' -eq 3 ]"
+check "H1 (raw 429/rate_limit text) marks the gate"      "marker_fresh"
+
+# H2: Claude-Code session-limit shape ("hit your … limit … resets H:MMam/pm
+# (TZ)") -> marker written even though it contains NONE of H1's markers and
+# fails _hmd_is_overload_text entirely (fails fast, exit 1, no retry -- see
+# hmd-claude-retry.sh's _hmd_is_quota_text comment).
+reset_case real_quota
+export HMD_OVERLOAD_MAX_ATTEMPTS=6
+rcH2=0; "$EXEC" run -p "x" --model m >/dev/null 2>"$WORK/h2.err" || rcH2=$?
+check "H2 propagates claude's real exit (1), no retry"   "[ '$rcH2' -eq 1 ] && [ '$(count)' -eq 1 ]"
+check "H2 (session-limit text) marks the gate"           "marker_fresh"
+
+# H3 (red-proof #1): unrelated non-zero failure -> NO marker.
+reset_case real_error
+export HMD_OVERLOAD_MAX_ATTEMPTS=6
+rcH3=0; "$EXEC" run -p "x" --model m >/dev/null 2>"$WORK/h3.err" || rcH3=$?
+check "H3 unrelated failure propagates exit 1"           "[ '$rcH3' -eq 1 ]"
+check "H3 (unrelated failure) does NOT mark the gate"    "! marker_fresh"
+
+# H4 (red-proof #2): clean success -> NO marker.
+reset_case success
+rcH4=0; "$EXEC" run -p "x" --model m >/dev/null 2>"$WORK/h4.err" || rcH4=$?
+check "H4 clean run exits 0"                             "[ '$rcH4' -eq 0 ]"
+check "H4 (clean success) does NOT mark the gate"        "! marker_fresh"
+
+# H5 (red-proof #3): pure server-overload (529, no 429/rate-limit/session-
+# limit wording at all) gives up loudly -- must NOT be mistaken for an
+# account-quota signal. Proves both the old and new text checks stay silent
+# on generic capacity-overload text, not just on ordinary real errors.
+reset_case always_overload
+export HMD_OVERLOAD_MAX_ATTEMPTS=2
+rcH5=0; "$EXEC" run -p "x" --model m >/dev/null 2>"$WORK/h5.err" || rcH5=$?
+check "H5 pure-529 give-up exits the distinct overload code (75)" "[ '$rcH5' -eq 75 ]"
+check "H5 (529 overload, no 429/quota wording) does NOT mark"     "! marker_fresh"
 
 echo
 echo "── result: $PASS passed, $FAIL failed ──"

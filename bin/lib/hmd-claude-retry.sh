@@ -41,13 +41,30 @@
 #   HEIMDALL_HOME               state home (default ~/.heimdall).
 #   HMD_429_MARK_BIN            bin/heimdall-429-mark override (default: sibling ../heimdall-429-mark). TEST seam.
 #
-# REACTIVE QUOTA-EXHAUSTION MARK (2026-08-30): a confirmed 429/rate-limit signal
-# (narrower than the overload marker above -- see _hmd_is_429_text) calls
+# REACTIVE QUOTA-EXHAUSTION MARK (2026-08-30, extended 2026-09-05): a confirmed
+# 429/rate-limit OR Claude-Code session/usage-limit signal calls
 # bin/heimdall-429-mark, which bin/heimdall-session-usage reads as a bounded-TTL
 # crossed condition so the NEXT spawn routes to the fallback instead of
-# repeating the same failure. Best-effort: a missing/broken recorder cannot
-# affect this retry loop. See docs/analysis/2026-08-29-fallback-did-not-fire-
-# rootcause.md for why this exists and what it does not cover (in-process
+# repeating the same failure. Two INDEPENDENT text signals feed it -- disjoint
+# shapes, zero keyword overlap:
+#   * _hmd_is_429_text   -- raw HTTP/API wording ("429", "rate limit", "too
+#                           many requests"). Narrower than the overload marker
+#                           above; only checked once overload is confirmed.
+#   * _hmd_is_quota_text -- Claude-Code's OWN "You've hit your session limit
+#                           · resets 5:40pm (Asia/Calcutta)" wording, which
+#                           contains NONE of the above and is the empirically
+#                           DOMINANT real-world shape (five production
+#                           incidents 2026-08-24..2026-09-05 -- see
+#                           docs/analysis/2026-08-29-fallback-did-not-fire-
+#                           rootcause.md and sentinels/hmd-statusline.py PHASE
+#                           5). Delegates to bin/lib/quota_stop.py's own
+#                           already-conservative two-signal classifier rather
+#                           than a third regex, and is checked unconditionally
+#                           on any non-zero exit -- BEFORE the overload gate --
+#                           since this shape never satisfies that gate at all.
+# Best-effort: a missing/broken recorder (or missing python3) cannot affect
+# this retry loop either way. See docs/analysis/2026-08-29-fallback-did-not-fire-
+# rootcause.md for why this exists and what it still does not cover (in-process
 # Agent-tool spawns need the ORCHESTRATOR to call the recorder directly).
 
 # double-source guard (functions are idempotent; skip re-defining on re-source).
@@ -81,6 +98,31 @@ _hmd_is_overload_text() {
 # See docs/analysis/2026-08-29-fallback-did-not-fire-rootcause.md.
 _hmd_is_429_text() {
   printf '%s' "$1" | grep -qiE '429|too many requests|rate.?limit'
+}
+
+# Claude-Code's OWN session/usage-limit stop text ("You've hit your session
+# limit · resets 5:40pm (Asia/Calcutta)") -- disjoint from every marker
+# _hmd_is_overload_text/_hmd_is_429_text look for (no "529"/"429"/"rate
+# limit"/"overloaded"/"retrying"), so it would otherwise never be seen at all,
+# and yet it is the empirically DOMINANT real-world quota-stop shape (five
+# separate production incidents 2026-08-24 through 2026-09-05 -- see
+# docs/analysis/2026-08-29-fallback-did-not-fire-rootcause.md and
+# sentinels/hmd-statusline.py PHASE 5). Delegates to bin/lib/quota_stop.py's
+# classify (never reimplemented here): it requires the Claude-specific "hit
+# your … limit" anchor phrase AND a well-formed "resets H:MMam/pm (TZ)" clause
+# to BOTH match before calling anything "quota" -- the same two-signal
+# discipline _hmd_is_429_text is held to above, so a bare "limit" or a bare
+# "resets" mention can never fire this alone (see that module's own docstring
+# for why). Fails closed if python3 is missing or the sibling script is
+# unreadable -- this only ever ADDS a marking signal, so its absence must
+# never touch the retry/return decision.
+_hmd_is_quota_text() {
+  local py qs_lib
+  py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+  [ -n "$py" ] || return 1
+  qs_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/quota_stop.py"
+  [ -r "$qs_lib" ] || return 1
+  printf '%s' "$1" | "$py" "$qs_lib" classify >/dev/null 2>&1
 }
 
 # resolve the recorder binary: env override (tests), else sibling of this
@@ -119,6 +161,18 @@ $err"
       rm -f "$errfile" 2>/dev/null || true
       printf '%s\n' "$out"
       return 0
+    fi
+
+    # A Claude-Code session/usage-limit stop is its own disjoint shape (see
+    # _hmd_is_quota_text above) that never satisfies _hmd_is_overload_text at
+    # all -- check it FIRST, unconditionally on any non-zero exit, so it is
+    # still marked even on the fail-fast path immediately below. Retrying
+    # THIS attempt against an hours-away reset would be pointless (see
+    # docs/analysis/2026-08-29-fallback-did-not-fire-rootcause.md), but the
+    # marker exists purely to route the NEXT spawn -- independent of whether
+    # this one retries.
+    if _hmd_is_quota_text "$combined"; then
+      "$(_hmd_429_mark_bin)" mark --reason hmd-claude-retry-quota >/dev/null 2>&1 || true
     fi
 
     # non-zero exit. overload iff a marker is present; otherwise a REAL error -> fail fast.
