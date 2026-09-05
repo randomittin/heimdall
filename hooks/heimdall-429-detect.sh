@@ -111,16 +111,41 @@ fi
 # them. So the SubagentStop path above is real but never reached for THIS
 # failure mode -- the detector was dead-on-arrival for its own purpose.
 #
-# The orchestrator's Stop hook DOES fire. But the parent transcript carries a
-# 429 only as PROSE inside a task-notification string -- zero structural
-# matches. The structural record lives solely in the dead SUBAGENT's own
-# transcript, under <tmp>/<slug>/<session>/tasks/<agentId>.output.
+# The orchestrator's Stop hook DOES fire. RE-CHECKED FRESH (2026-09-05,
+# incident req_011CejtBFAa4za5rx5wou8FP), not inherited: the parent transcript
+# is NOT universally prose-only -- it also accumulates genuine structural
+# isApiErrorMessage records of its OWN direct API calls (this session's own
+# parent transcript held 46 of them, spanning 2026-08-18 through the
+# present), so the primary scan above already catches a 429 that hits the
+# top-level agent directly. What the parent NEVER carries structurally is a
+# 429 that killed a Task/Agent-tool SUBAGENT -- that surfaces in the parent
+# only as PROSE inside a task-notification string (confirmed again directly
+# against req_011CejtBFAa4za5rx5wou8FP: present as a task-notification's
+# summary text in the parent, absent from every one of that same file's own
+# isApiErrorMessage records). The structural record for THAT death lives
+# solely in the dying SUBAGENT's own transcript, which Claude Code persists
+# at a location derivable with CERTAINTY from transcript_path alone -- no
+# guessing required:
+#   <dirname transcript_path>/<basename transcript_path .jsonl>/subagents/agent-<agentId>.jsonl
+# (confirmed directly: req_011CejtBFAa4za5rx5wou8FP's own structural record
+# lives at exactly that path, sibling agent-ad5c54bf1ae335de3.jsonl, under
+# this same session's own subagents/ dir). This is the PREFERRED sibling
+# source below -- a stable parent/child directory relationship, not a
+# wildcarded guess -- tried before the legacy <tmp>/<slug>/<session>/tasks/
+# location, which needed two rounds of real bug fixes (symlink-following,
+# repo-slug-wildcarded run-id discovery) and may still not exist on every
+# setup.
 #
-# So on the Stop path we additionally scan sibling task transcripts. Bounded
-# three ways so this can never become an unbounded scan on every turn:
+# So on the Stop path we scan sibling transcripts from BOTH sources, bounded
+# four ways so this can never become an unbounded scan on every turn:
 #   - only files MODIFIED within the same recency window,
-#   - at most HMD_429_DETECT_MAX_SIBLINGS files (newest first),
-#   - the same bounded-tail read per file as the primary path.
+#   - at most HMD_429_DETECT_MAX_SIBLINGS files per source (newest first for
+#     the preferred source -- see below for why lexical order is not safe
+#     here),
+#   - the same bounded-tail read per file as the primary path,
+#   - preferred-source candidates are gathered before legacy ones, but BOTH
+#     are always gathered -- only a genuine MATCH (found by the shared scan
+#     loop further down) ends the search, never merely finding candidates.
 # Fails open exactly like everything else here: any error yields no marker.
 sibling_paths=""
 if [ -z "$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty' 2>/dev/null || true)" ]; then
@@ -129,6 +154,37 @@ if [ -z "$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty' 2>/dev
   _max="${HMD_429_DETECT_MAX_SIBLINGS:-12}"
   case "$_max" in ''|*[!0-9]*) _max=12 ;; esac
   _mins=$(( (_win + 59) / 60 )); [ "$_mins" -ge 1 ] || _mins=1
+
+  # PREFERRED source: ~/.claude/projects/<slug>/<session>/subagents/*.jsonl,
+  # derived directly from transcript_path's own dirname/basename above.
+  # NEWEST-FIRST (ls -t), never lexical: this directory accumulates across a
+  # session's ENTIRE lifetime -- a live production subagents/ dir was
+  # measured directly holding 600+ files -- unlike the legacy tasks/ dir
+  # below, which is bounded to one run. A lexical sort-then-cap could
+  # silently drop the one fresh file a busy parallel wave (this repo's own
+  # mandatory spawn-many-agents-at-once convention, and exactly the shape a
+  # shared rate limit kills several siblings under at once) produces
+  # alongside hundreds of older, unrelated files.
+  _pref=""
+  if [ -n "$transcript_path" ]; then
+    _sess_dir="$(dirname "$transcript_path" 2>/dev/null || true)"
+    _sess_base="$(basename "$transcript_path" .jsonl 2>/dev/null || true)"
+    if [ -n "$_sess_dir" ] && [ -n "$_sess_base" ]; then
+      _subagents_dir="$_sess_dir/$_sess_base/subagents"
+      if [ -d "$_subagents_dir" ]; then
+        _found="$(find -L "$_subagents_dir" -maxdepth 1 -type f -name '*.jsonl' -mmin "-${_mins}" 2>/dev/null || true)"
+        if [ -n "$_found" ]; then
+          _pref="$(printf '%s\n' "$_found" | xargs ls -1t -- 2>/dev/null | head -n "$_max" || true)"
+        fi
+      fi
+    fi
+  fi
+
+  # SECONDARY/legacy source, always also gathered regardless of whether the
+  # preferred source above found candidate FILES (a genuine MATCH is what
+  # ends the search, decided later by the shared scan loop -- not this
+  # discovery step): <tmp>/<slug>/<session-run-id>/tasks/<agentId>.output.
+  _legacy=""
   _tdir="${HMD_429_DETECT_TASKS_DIR:-}"
   _tdir_list=()
   if [ -n "$_tdir" ]; then
@@ -164,7 +220,16 @@ if [ -z "$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty' 2>/dev
     fi
   fi
   if [ "${#_tdir_list[@]}" -gt 0 ]; then
-    sibling_paths="$(find -L "${_tdir_list[@]}" -maxdepth 1 -type f -name '*.output' -mmin "-${_mins}" 2>/dev/null | sort -u | head -n "$_max" || true)"
+    _legacy="$(find -L "${_tdir_list[@]}" -maxdepth 1 -type f -name '*.output' -mmin "-${_mins}" 2>/dev/null | sort -u | head -n "$_max" || true)"
+  fi
+
+  # Preferred first, legacy second -- the shared scan loop below tries every
+  # candidate in order and stops at the first genuine structural match.
+  if [ -n "$_pref" ] && [ -n "$_legacy" ]; then
+    sibling_paths="$_pref
+$_legacy"
+  else
+    sibling_paths="${_pref}${_legacy}"
   fi
 fi
 
