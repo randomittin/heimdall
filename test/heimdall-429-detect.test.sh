@@ -74,6 +74,30 @@
 #     parent transcript is pure prose (no structural record), the fresh 429
 #     lives only in a SYMLINKED sibling .output under a run-id directory
 #     that does not match "$_sess".
+# 22. REAL PRODUCTION LAYOUT: transcript_path is <root>/<slug>/<session>.jsonl
+#     and the fresh 429 lives ONLY in the sibling <root>/<slug>/<session>/
+#     subagents/agent-x.jsonl -- the exact shape MEASURED against incident
+#     req_011CejtBFAa4za5rx5wou8FP (2026-09-05, sibling
+#     agent-ad5c54bf1ae335de3.jsonl) -- derived from transcript_path alone,
+#     no slug/run-id guessing. Marker written, reason reflects the
+#     sibling-scan path.
+# 23. Same real layout, STALE 429 in subagents/ -> no marker. The claim that
+#     matters most: this session's own parent transcript was MEASURED
+#     holding 46 accumulated structural 429 records (spanning 2026-08-18
+#     through the present) and its subagents/ dir hundreds of files -- none
+#     of them fresh right now. Recency must hold at this exact scale.
+# 24. Same real layout, 529/server_error in subagents/ -> no marker (never a
+#     heuristic, even via the new sibling source).
+# 25. Real layout with the <session>/subagents/ dir missing entirely -> exit
+#     0, no marker, no crash (falls through to the legacy tasks/ source).
+# 26. Newest-first selection: 20 lexically-EARLIER, fresh-mtime, non-matching
+#     files plus one lexically-LATER, later-mtime, genuinely fresh 429 file,
+#     together exceeding HMD_429_DETECT_MAX_SIBLINGS -- still marks. Proves
+#     selection is by MODIFICATION TIME, never alphabetical: the subagents/
+#     dir accumulates for a session's entire lifetime (hundreds of files
+#     measured directly in a live session), unlike the legacy tasks/ dir
+#     which is bounded to one run -- a lexical sort-then-cap would silently
+#     drop the one fresh file here.
 #
 # Usage: bash test/heimdall-429-detect.test.sh   (exit 0 = all guarantees hold)
 set -uo pipefail
@@ -522,6 +546,91 @@ if marker_exists; then
   ok "end-to-end real production shape (prose parent + symlinked sibling under a differently-named run dir) marks correctly"
 else
   bad "end-to-end real production shape did NOT mark -- this is the exact incident req_011Cei32DAJf4WeXHXtwfENa reproduced"
+fi
+
+# --- 22. REAL PRODUCTION LAYOUT: <root>/<slug>/<session>.jsonl parent +
+#     <root>/<slug>/<session>/subagents/agent-x.jsonl sibling, derived
+#     purely from transcript_path -- the exact shape measured for incident
+#     req_011CejtBFAa4za5rx5wou8FP (2026-09-05) -----------------------------
+reset_marker
+PROJECTS_ROOT="$SANDBOX/claude-projects"
+SLUG_DIR_22="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-22"
+SESSION_22="session-2200000000000000000000001"
+mkdir -p "$SLUG_DIR_22/$SESSION_22/subagents"
+PARENT_22="$SLUG_DIR_22/$SESSION_22.jsonl"; write_clean "$PARENT_22"
+write_fresh_429 "$SLUG_DIR_22/$SESSION_22/subagents/agent-aaa000.jsonl"
+PAYLOAD=$(jq -cn --arg tp "$PARENT_22" '{hook_event_name:"Stop", transcript_path:$tp}')
+run_hook "$PAYLOAD" Stop
+if marker_exists; then
+  ok "real layout: fresh 429 in <session>/subagents/agent-x.jsonl (derived from transcript_path) writes a marker"
+  R=$(marker_reason)
+  [ "$R" = "stop-sibling-transcript-429" ] && ok "marker reason reflects the sibling-scan path (got: $R)" \
+    || bad "marker reason unexpected for subagents-dir sibling match (got: $R)"
+else
+  bad "real layout: fresh 429 in <session>/subagents/ did NOT write a marker"
+fi
+
+# --- 23. same real layout, STALE 429 in subagents/ -> NO marker -- the claim
+#     that matters most given the real parent transcript's 46 accumulated
+#     structural 429 records ----------------------------------------------
+reset_marker
+SLUG_DIR_23="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-23"
+SESSION_23="session-2300000000000000000000001"
+mkdir -p "$SLUG_DIR_23/$SESSION_23/subagents"
+PARENT_23="$SLUG_DIR_23/$SESSION_23.jsonl"; write_clean "$PARENT_23"
+write_stale_429 "$SLUG_DIR_23/$SESSION_23/subagents/agent-bbb000.jsonl"
+PAYLOAD=$(jq -cn --arg tp "$PARENT_23" '{hook_event_name:"Stop", transcript_path:$tp}')
+run_hook "$PAYLOAD" Stop
+marker_exists && bad "STALE 429 in <session>/subagents/ incorrectly wrote a marker -- recency bound violated against the exact accumulation shape (46 old records) this must survive" \
+  || ok "STALE 429 in <session>/subagents/ writes no marker -- recency bound holds against the real accumulation shape"
+
+# --- 24. same real layout, 529/server_error in subagents/ -> NO marker ------
+reset_marker
+SLUG_DIR_24="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-24"
+SESSION_24="session-2400000000000000000000001"
+mkdir -p "$SLUG_DIR_24/$SESSION_24/subagents"
+PARENT_24="$SLUG_DIR_24/$SESSION_24.jsonl"; write_clean "$PARENT_24"
+write_fresh_529 "$SLUG_DIR_24/$SESSION_24/subagents/agent-ccc000.jsonl"
+PAYLOAD=$(jq -cn --arg tp "$PARENT_24" '{hook_event_name:"Stop", transcript_path:$tp}')
+run_hook "$PAYLOAD" Stop
+marker_exists && bad "529/server_error in <session>/subagents/ incorrectly wrote a marker" \
+  || ok "529/server_error in <session>/subagents/ writes no marker -- never a heuristic, even via the new sibling source"
+
+# --- 25. missing <session>/subagents/ dir entirely -> exit 0, no marker -----
+reset_marker
+SLUG_DIR_25="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-25"
+SESSION_25="session-2500000000000000000000001"
+mkdir -p "$SLUG_DIR_25"
+PARENT_25="$SLUG_DIR_25/$SESSION_25.jsonl"; write_clean "$PARENT_25"
+# deliberately NOT creating $SLUG_DIR_25/$SESSION_25/subagents at all
+PAYLOAD=$(jq -cn --arg tp "$PARENT_25" '{hook_event_name:"Stop", transcript_path:$tp}')
+RC=0
+run_hook "$PAYLOAD" Stop || RC=$?
+[ "$RC" -eq 0 ] && ok "missing <session>/subagents/ dir exits 0" || bad "missing subagents dir exited $RC, expected 0"
+marker_exists && bad "missing subagents dir incorrectly wrote a marker" || ok "missing <session>/subagents/ dir writes no marker (falls through cleanly)"
+
+# --- 26. newest-first selection: 20 lexically-EARLIER, fresh-mtime,
+#     non-matching files plus one lexically-LATER, later-mtime, genuinely
+#     fresh 429 file, together exceeding HMD_429_DETECT_MAX_SIBLINGS -- still
+#     marks. Proves selection is by modification time, never alphabetical --
+#     see claim 26 above for why this matters at the real accumulation
+#     scale --------------------------------------------------------------
+reset_marker
+SLUG_DIR_26="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-26"
+SESSION_26="session-2600000000000000000000001"
+mkdir -p "$SLUG_DIR_26/$SESSION_26/subagents"
+PARENT_26="$SLUG_DIR_26/$SESSION_26.jsonl"; write_clean "$PARENT_26"
+for i in $(seq 1 20); do
+  write_clean "$SLUG_DIR_26/$SESSION_26/subagents/agent-aaa-$i.jsonl"
+done
+sleep 1
+write_fresh_429 "$SLUG_DIR_26/$SESSION_26/subagents/agent-zzz-fresh.jsonl"
+PAYLOAD=$(jq -cn --arg tp "$PARENT_26" '{hook_event_name:"Stop", transcript_path:$tp}')
+( cd "$SANDBOX" && unset HEIMDALL_HOME && export CLAUDE_PLUGIN_ROOT="$PLUGIN" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" HMD_429_DETECT_MAX_SIBLINGS=12; printf '%s' "$PAYLOAD" | bash "$STOP_CMD_FILE" >/dev/null 2>&1 )
+if marker_exists; then
+  ok "newest-first selection finds the one fresh file even when 20 lexically-earlier files exceed the MAX_SIBLINGS cap"
+else
+  bad "newest-first selection FAILED -- a lexical sort-then-cap would silently drop the real fresh file here"
 fi
 
 # --- collateral: every other live hook event still present -------------------
