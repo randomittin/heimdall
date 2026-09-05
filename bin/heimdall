@@ -190,6 +190,117 @@ resolve_model() {
   printf '%s\n' "${out:-$tier}"
 }
 
+# ── SWITCH-ONLY session-wide fallback routing ──
+#
+# bin/heimdall-route (its own FALLBACK PRECEDENCE block) sets ANTHROPIC_BASE_URL
+# on a newly exec'd CHILD process -- a child can never setenv its own parent, so
+# that mechanism only ever routes work hmd LAUNCHES, never the operator's own
+# Claude Code session. A SESSION-level rate limit blocks that session itself,
+# and Anthropic's rate_limits payload never exposes a session window to detect
+# it proactively either way (bin/heimdall-session-usage). This wrapper IS the
+# parent of the `claude` process it is about to launch, so it is the one place
+# that can legitimately set the endpoint for the WHOLE session, not just one
+# spawned child.
+#
+# SWITCH ONLY -- switch is already the explicit, operator-typed "route
+# everything, every tier" opt-in (heimdall-fallback's own header); this reuses
+# that exact meaning rather than inventing a fourth state. `off` never routes.
+# `auto` keeps its existing CHILD-ONLY behaviour (heimdall-route's own
+# precedence block, unaffected by this function) -- auto is a quota-usage
+# reaction with no session-limit visibility, so widening it here would not
+# even address the problem it would be routing around. For every state other
+# than `switch` this function returns immediately after one read-only status
+# check: no env var is touched, nothing is printed, the launch that follows is
+# byte-for-byte what it was before this function existed.
+#
+# THE VERDICT IS NEVER RE-IMPLEMENTED HERE. Every safety-relevant check
+# (Tier-1 credential absence, ToS-flagged providers, the model-pin rule, etc.)
+# lives in heimdall-fallback and ONLY there; this function reads its
+# `status --json` for the persisted state (data, not a check) and its
+# base-url/token-file/model subcommands for the actual values -- the exact
+# seam heimdall-route already consumes. A REFUSE or WAIT verdict (base-url's
+# stdout is empty, or not loopback-shaped) always means "launch unrouted" --
+# fail CLOSED toward not-routing, never toward routing on an unclear answer.
+#
+# WARN LOUDLY. This puts the OPERATOR'S ENTIRE SESSION on a third-party model:
+# prompt-cache hits are lost (OmniRoute drops cache_control) and session
+# context goes to that provider, not Anthropic. Every routed launch prints the
+# banner below; there is no quiet mode for this one.
+#
+# THE ADJUDICATION CONSEQUENCE. bin/heimdall-precheck-agent's own adjudication
+# fallback fence already DENIES every hmd:reviewer/verifier/security-auditor
+# spawn outright once it sees a loopback-shaped ANTHROPIC_BASE_URL inherited
+# from the session that spawned it -- by design, because a judge running on a
+# degraded/free-tier model would emit confident false greens. This function
+# does not touch that guard and must not: it is surfaced in the banner below
+# so the operator is not surprised mid-task by a denied reviewer spawn.
+apply_switch_fallback_env() {
+  command -v heimdall-fallback >/dev/null 2>&1 || return 0
+
+  # State is DATA, read once, never re-derived: only a persisted 'switch' may
+  # ever reach a session-wide export below. Anything else (off/auto/an unknown
+  # string) returns here -- no base-url/token-file/model call is even made.
+  local fb_state_json fb_state
+  fb_state_json="$(heimdall-fallback --repo "$WORK_DIR" status --json 2>/dev/null || true)"
+  [ -n "$fb_state_json" ] || return 0
+  fb_state="$(printf '%s' "$fb_state_json" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("state", ""))
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+  [ "$fb_state" = "switch" ] || return 0
+
+  # THE VERDICT: reused verbatim from heimdall-fallback, never re-implemented.
+  # base-url's own stdout contract is empty on every non-ROUTE path (its own
+  # docstring) -- re-validated here against the same loopback shape
+  # heimdall-route matches, so this can never export a base URL that isn't one.
+  local fb_url=""
+  fb_url="$(heimdall-fallback --repo "$WORK_DIR" base-url 2>/dev/null || true)"
+  case "$fb_url" in
+    http://127.0.0.1:*|http://localhost:*|http://'['::1']':*) ;;
+    *)
+      printf "  \033[38;2;255;200;80m▸ fallback:\033[0m state is 'switch' but the preflight did not return ROUTE — launching this session unrouted (hmd fallback check)\n" >&2
+      return 0
+      ;;
+  esac
+
+  # Auth token: same read-the-path-then-the-file discipline as heimdall-route.
+  local fb_token_file=""
+  fb_token_file="$(heimdall-fallback --repo "$WORK_DIR" token-file 2>/dev/null || true)"
+  if [ -n "$fb_token_file" ] && [ -r "$fb_token_file" ]; then
+    ANTHROPIC_AUTH_TOKEN="$(cat "$fb_token_file")"
+    export ANTHROPIC_AUTH_TOKEN
+  fi
+
+  # Model pin: an operator-set ANTHROPIC_MODEL always outranks the fallback pin.
+  # heimdall-fallback model already refuses a bare id or a claude/claude-web one.
+  local fb_model=""
+  if [ -z "${ANTHROPIC_MODEL:-}" ]; then
+    fb_model="$(heimdall-fallback --repo "$WORK_DIR" model 2>/dev/null || true)"
+    [ -n "$fb_model" ] && export ANTHROPIC_MODEL="$fb_model"
+  fi
+
+  export ANTHROPIC_BASE_URL="$fb_url"
+
+  local Y O R D
+  Y='\033[38;2;255;200;80m'; O='\033[1m'; R='\033[0m'; D='\033[2m'
+  {
+    printf "\n  ${Y}${O}⚠ SWITCH — this ENTIRE session is now routed to a third-party model${R}\n"
+    printf "    endpoint: %s\n" "$fb_url"
+    printf "    model:    %s\n" "${ANTHROPIC_MODEL:-(none pinned -- OmniRoute receives bare claude-* ids)}"
+    printf "    ${D}Prompt-cache is lost on this path (OmniRoute drops cache_control; Anthropic's${R}\n"
+    printf "    ${D}own cache is measured at ~91-95%% of the value on the table), and this${R}\n"
+    printf "    ${D}session's context goes to that provider, not Anthropic -- a measured live run${R}\n"
+    printf "    ${D}carried ~41,000 tokens of local context in a single request.${R}\n"
+    printf "    ${D}Judge subagents (hmd:reviewer / hmd:verifier / hmd:security-auditor) will be${R}\n"
+    printf "    ${D}DENIED for the rest of this session -- bin/heimdall-precheck-agent's own${R}\n"
+    printf "    ${D}adjudication fence working as designed, not a bug.${R}\n"
+    printf "    ${D}Undo: heimdall-fallback set off${R}\n\n"
+  } >&2
+}
+
 # ── Install-step telemetry (dossier §3 + §8) ──
 #
 # Each install/first-run step emits a `started` then a `succeeded`/`failed`
@@ -3018,6 +3129,11 @@ except: pass
   }
   trap cleanup_resume EXIT
 
+  # SWITCH-only session-wide fallback routing (see apply_switch_fallback_env's
+  # own doc comment above resolve_model) -- a resumed session is still "the
+  # operator's session", so it is routed under the identical switch-only rule.
+  apply_switch_fallback_env
+
   # Main Claude Code agent: never pinned (CLAUDE.md "Model routing" directive) —
   # a resumed session runs on the operator's own configured default, same as a
   # fresh launch (select_model() below), so no --model flag is passed here.
@@ -4481,6 +4597,11 @@ ${USER_TASK}"
   # task produces. Empty when WORK_DIR is not a git repo (metric self-skips).
   REUSE_BASE="$(git -C "$WORK_DIR" rev-parse HEAD 2>/dev/null || echo '')"
 
+  # SWITCH-only session-wide fallback routing -- must run before the launch
+  # below so a 'switch' verdict's exported env reaches the claude process
+  # capture_and_emit_usage is about to start. No-op for every other state.
+  apply_switch_fallback_env
+
   # SOURCE METER + run: capture_and_emit_usage runs `claude` (injecting the right
   # --output-format), surfaces its output to the user (UX preserved — interactive
   # gets a tee'd stream-json render, the automated/usage-out path gets the json
@@ -4516,6 +4637,10 @@ ${USER_TASK}"
 
   exit "$TASK_RC"
 else
+  # SWITCH-only session-wide fallback routing -- see apply_switch_fallback_env's
+  # doc comment above resolve_model. No-op for every state except 'switch'.
+  apply_switch_fallback_env
+
   # Interactive mode: preamble injected via system prompt file, Claude stays interactive
   claude \
     --agent heimdall \
