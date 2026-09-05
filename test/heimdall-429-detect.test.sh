@@ -89,6 +89,18 @@
 # Usage: bash test/heimdall-429-detect.test.sh   (exit 0 = all guarantees hold)
 set -uo pipefail
 
+# Diagnostic tracing (added alongside the hook's trace_emit) now defaults ON
+# and writes to ${HEIMDALL_HOME:-$HOME/.heimdall} -- but every run_hook-style
+# subshell below does `unset HEIMDALL_HOME` for its OWN hermeticity (never
+# touch the real marker file), which would otherwise leave tracing pointed
+# straight at the real $HOME/.heimdall. This suite tests marking behaviour,
+# never tracing behaviour (that lives in
+# test/heimdall-429-detect-trace.test.sh, which DOES sandbox HEIMDALL_HOME
+# for every trace assertion) -- so tracing is simply turned off here, in one
+# place, rather than threading a sandboxed HEIMDALL_HOME through six subshells
+# that have no other reason to need one.
+export HMD_429_DETECT_TRACE=0
+
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 HOOKS="$REPO/hooks/hooks.json"
