@@ -131,8 +131,11 @@ cat > "$STUBDIR/heimdall-fallback" <<'STUB'
 while [ "${1:-}" = "--repo" ]; do shift 2; done
 case "${1:-}" in
   status)
-    printf '{"state":"%s"}\n' "${STUB_FB_STATE:-off}"
-    exit 0
+    case "${STUB_FB_STATUS_MODE:-normal}" in
+      empty) exit 0 ;;
+      malformed) printf 'not json at all {{{\n'; exit 0 ;;
+      *) printf '{"state":"%s"}\n' "${STUB_FB_STATE:-off}"; exit 0 ;;
+    esac
     ;;
   base-url)
     if [ -n "${STUB_FB_URL:-}" ]; then printf '%s\n' "$STUB_FB_URL"; exit 0; fi
@@ -297,6 +300,44 @@ if [ "$(field "$B12_OUT" BASE_URL)" = "[]" ] && [ "$(field "$B12_OUT" RC_MARKER)
   ok "B12 heimdall-fallback absent from PATH -> fails open, no export, no crash"
 else
   bad "B12 heimdall-fallback absent from PATH -> fails open" "$B12_OUT"
+fi
+
+# B13 -- status --json exits 0 but stdout is byte-empty -> the [ -n "$fb_state_json" ]
+# guard (line 245) returns before any python3 JSON parse is even attempted.
+run_status_mode_case() { # run_status_mode_case <status_mode>
+  local mode="$1" home; home="$(mktemp -d)"
+  local out
+  out="$(
+    cd "$WORK" || exit 1
+    export HEIMDALL_HOME="$home"
+    export PATH="$STUBDIR:/usr/bin:/bin"
+    export STUB_FB_STATUS_MODE="$mode" STUB_FB_URL="http://127.0.0.1:9105" STUB_FB_MODEL="oc/m"
+    unset ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
+    HEIMDALL_LIB_ONLY=1 bash -c "
+      source \"$HMD\"
+      apply_switch_fallback_env
+      echo \"BASE_URL=[\${ANTHROPIC_BASE_URL:-}]\"
+      echo \"RC_MARKER=ok\"
+    " 2>/dev/null
+  )"
+  rm -rf "$home"
+  printf '%s\n' "$out"
+}
+B13_OUT="$(run_status_mode_case empty)"
+if [ "$(field "$B13_OUT" BASE_URL)" = "[]" ] && [ "$(field "$B13_OUT" RC_MARKER)" = "ok" ]; then
+  ok "B13 status --json exits 0 with byte-empty stdout -> no export, no crash (line 245's own guard)"
+else
+  bad "B13 status --json byte-empty stdout -> no export, no crash" "$B13_OUT"
+fi
+
+# B14 -- status --json exits 0 but stdout is non-empty, non-JSON garbage -> the
+# python3 try/except (lines 246-252) prints "" on exception, so fb_state="" and
+# the switch-only guard (line 253) still returns before any export.
+B14_OUT="$(run_status_mode_case malformed)"
+if [ "$(field "$B14_OUT" BASE_URL)" = "[]" ] && [ "$(field "$B14_OUT" RC_MARKER)" = "ok" ]; then
+  ok "B14 status --json returns malformed non-JSON garbage -> no export, no crash (JSON-parse exception path)"
+else
+  bad "B14 status --json malformed garbage -> no export, no crash" "$B14_OUT"
 fi
 
 echo "== Section C: literal acceptance proof -- env-dump through a stub claude =="
