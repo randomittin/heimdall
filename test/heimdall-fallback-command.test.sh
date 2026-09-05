@@ -12,8 +12,10 @@
 #      base-url / token-file / model / where.
 #   3. THE CORRECTION THAT MATTERS MOST: there is NO `heimdall-fallback
 #      config` subcommand. build_parser() in bin/heimdall-fallback defines
-#      exactly eight subparsers; an earlier, unverified assumption asserted a
-#      `config target_provider <x>` subcommand existed. This test locks in
+#      exactly twelve subparsers (the original eight operator/seam commands
+#      plus `coop` and its three nested `add`/`remove`/`list` subparsers,
+#      added when the coop state landed); an earlier, unverified assumption
+#      asserted a `config target_provider <x>` subcommand existed. This test locks in
 #      the truth two ways — the doc must say plainly that no config
 #      subcommand exists (target_provider/operator_key_env are set by
 #      editing the JSON file directly), and the doc must never itself invoke
@@ -104,10 +106,10 @@ fi
 # Cross-check against the live source so this claim cannot silently go stale.
 if [ -x "$FALLBACK_BIN" ]; then
   SUBCOUNT="$(grep -c 'add_parser(' "$FALLBACK_BIN" || true)"
-  if [ "$SUBCOUNT" = "8" ]; then
-    ok "bin/heimdall-fallback still defines exactly 8 subparsers (status/set/check/arm/base-url/token-file/model/where) — the doc's 'no config subcommand' claim still holds"
+  if [ "$SUBCOUNT" = "12" ]; then
+    ok "bin/heimdall-fallback still defines exactly 12 subparsers (status/set/check/arm/base-url/token-file/model/where/coop/coop-add/coop-remove/coop-list) — the doc's 'no config subcommand' claim still holds"
   else
-    bad "bin/heimdall-fallback now defines $SUBCOUNT subparser(s) (expected 8) — re-check fallback.md's 'no config subcommand' claim against the live source"
+    bad "bin/heimdall-fallback now defines $SUBCOUNT subparser(s) (expected 12) — re-check fallback.md's 'no config subcommand' claim against the live source"
   fi
 else
   bad "bin/heimdall-fallback is missing or not executable — cannot cross-check the subparser count"
