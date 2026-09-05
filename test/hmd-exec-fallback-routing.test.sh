@@ -327,8 +327,32 @@ echo "== Section F: bin/hmd-exec --role -> HMD_AGENT_TYPE -> real coop routing (
 # bin/heimdall-route -> bin/heimdall-fallback resolution -- so, per that
 # suite's own "ONE WRINKLE" header comment, REPO_ROOT/bin must be on PATH
 # (heimdall-route resolves heimdall-fallback via bare `command -v`, never
-# repo-relative) and every case must `cd` into the sandbox first
-# (heimdall-route reads $PWD for --repo; it has no --repo flag of its own).
+# repo-relative).
+#
+# Hermeticity: bin/heimdall-fallback resolves its config as a plain
+# os.path.join(repo, ".heimdall", "fallback.json") off whatever directory the
+# call happened to run from (args.repo defaults to ".") -- it never searches
+# upward and has no env-var override. EVERY case below therefore `cd`s into
+# F_SANDBOX *inside its own subshell*, at the point of the real hmd-exec
+# invocation, rather than relying on one long-lived outer `cd` for the whole
+# section: a case that instead inherited whatever directory the SUITE ITSELF
+# was invoked from would silently read THAT directory's own
+# .heimdall/fallback.json instead (e.g. an operator's live repo-root config)
+# -- this is exactly how F2/F3/F4 leaked previously. To prove the isolation
+# actually holds rather than merely assert it, this section's own ambient/
+# outer cwd is deliberately left pointed at F_DECOY_AMBIENT below: an
+# adversarial state=switch config (routes ANY/no role -- see
+# bin/heimdall-fallback's _verdict, which only consults coop_roles when
+# state=="coop") whose endpoint (29999) matches neither F_SANDBOX's (20128)
+# nor DEFAULT_CFG's own built-in default (also, notably, 20128 -- the two
+# must never be allowed to collide, or a leak straight to the ambient config
+# could silently pass by coincidence instead of failing loudly; F1 in
+# particular would have been exposed to exactly that coincidental-pass risk
+# under the single-outer-cd design, since its expected endpoint is the same
+# 20128 default). Any case below that forgot its own `cd "$F_SANDBOX"` would
+# now read the decoy instead and fail visibly: a routed case would report the
+# tell-tale 29999 endpoint instead of 20128, and an untouched-assertion case
+# would incorrectly observe a ROUTE (switch routes unconditionally).
 F_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-exec-role-coop-test.XXXXXX")"
 mkdir -p "$F_SANDBOX/.heimdall"
 F_OMNIDB="$(mktemp "${TMPDIR:-/tmp}/hmd-exec-role-coop-test-db.XXXXXX")"
@@ -350,6 +374,21 @@ printf '%s' '{
   "coop_roles": ["hmd:coder"]
 }' > "$F_SANDBOX/.heimdall/fallback.json"
 
+# Adversarial decoy (see hermeticity note above): same throwaway DB so
+# preflight succeeds identically, but state=switch and a distinct endpoint --
+# this is what the SECTION's ambient cwd sits in for the entire block below,
+# never F_SANDBOX itself.
+F_DECOY_AMBIENT="$(mktemp -d "${TMPDIR:-/tmp}/hmd-exec-role-coop-test-decoy.XXXXXX")"
+mkdir -p "$F_DECOY_AMBIENT/.heimdall"
+printf '%s' '{
+  "state": "switch",
+  "operator_key_env": "HMD_FEXEC_TEST_KEY",
+  "endpoint": "http://127.0.0.1:29999",
+  "omniroute_db_path": "'"$F_OMNIDB"'",
+  "target_provider": "self-hosted-mixtral",
+  "coop_roles": []
+}' > "$F_DECOY_AMBIENT/.heimdall/fallback.json"
+
 F_OLDPWD="$(pwd)"
 F_OLDPATH="$PATH"
 export PATH="$REPO_ROOT/bin:$PATH"
@@ -358,13 +397,16 @@ export CLIPROXYAPI_CONFIG_DIR="/nonexistent-hmd-exec-role-coop-test-cliproxyapi"
 export HMD_FEXEC_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-cd "$F_SANDBOX"
+cd "$F_DECOY_AMBIENT"
 
 # F1 -- routed role: --role hmd:coder (coop-listed) -> the real child (the
 # stub claude, reached only after the real shim + real heimdall-route/
-# -fallback resolve it) carries the gateway endpoint.
+# -fallback resolve it) carries the gateway endpoint. `cd`s into F_SANDBOX
+# inside its own subshell -- never relies on the section's ambient cwd, which
+# is deliberately F_DECOY_AMBIENT (see hermeticity note above).
 RECORDER_ENV_FILE="$WORK/f1.env"
-( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL 2>/dev/null
+( cd "$F_SANDBOX" || exit 1
+  unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL 2>/dev/null
   export RECORDER_ENV_FILE
   "$HMD_EXEC_BIN" --role hmd:coder run -p "f1 task" --output-format text >/dev/null 2>&1
 )
@@ -378,7 +420,8 @@ fi
 # F2 -- no --role given at all (main-session-equivalent): never routes,
 # child env byte-identical to the genuinely unrouted baseline from Section C.
 RECORDER_ENV_FILE="$WORK/f2.env"
-( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
+( cd "$F_SANDBOX" || exit 1
+  unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
   export RECORDER_ENV_FILE
   "$HMD_EXEC_BIN" run -p "f2 task" --output-format text >/dev/null 2>&1
 )
@@ -386,7 +429,8 @@ assert_untouched "F2 no --role given at all -> child env byte-identical to unrou
 
 # F3 -- role given but NOT on the coop allowlist: same guarantee as F2.
 RECORDER_ENV_FILE="$WORK/f3.env"
-( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
+( cd "$F_SANDBOX" || exit 1
+  unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
   export RECORDER_ENV_FILE
   "$HMD_EXEC_BIN" --role hmd:test-runner run -p "f3 task" --output-format text >/dev/null 2>&1
 )
@@ -397,7 +441,8 @@ assert_untouched "F3 --role hmd:test-runner (not coop-listed) -> child env byte-
 # shim's non-route branch must scrub it (child ends up byte-identical to the
 # clean baseline), never pass it through.
 RECORDER_ENV_FILE="$WORK/f4.env"
-( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
+( cd "$F_SANDBOX" || exit 1
+  unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
   export RECORDER_ENV_FILE
   export ANTHROPIC_BASE_URL="http://evil.example:6666"
   "$HMD_EXEC_BIN" --role hmd:test-runner run -p "f4 task" --output-format text >/dev/null 2>&1
@@ -410,7 +455,8 @@ assert_untouched "F4 poisoned inherited ANTHROPIC_BASE_URL is SCRUBBED on an unr
 # re-declared list here) pins the real Anthropic endpoint outright -- it
 # never even reaches the coop allowlist check.
 RECORDER_ENV_FILE="$WORK/f5.env"
-( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL 2>/dev/null
+( cd "$F_SANDBOX" || exit 1
+  unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL 2>/dev/null
   export RECORDER_ENV_FILE
   "$HMD_EXEC_BIN" --role hmd:reviewer run -p "f5 task" --output-format text >/dev/null 2>&1
 )
@@ -423,7 +469,8 @@ fi
 
 # F6 -- HMD_JUDGMENT=1 overrides even a coop-LISTED, otherwise-routable role.
 RECORDER_ENV_FILE="$WORK/f6.env"
-( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE ANTHROPIC_BASE_URL 2>/dev/null
+( cd "$F_SANDBOX" || exit 1
+  unset HMD_CLAUDE_BIN HMD_AGENT_TYPE ANTHROPIC_BASE_URL 2>/dev/null
   export RECORDER_ENV_FILE
   export HMD_JUDGMENT=1
   "$HMD_EXEC_BIN" --role hmd:coder run -p "f6 task" --output-format text >/dev/null 2>&1
@@ -439,7 +486,8 @@ fi
 # (no local claude binary / API-key fallback of its own -- see
 # bin/lib/hmd_api_backend.py's header), so it hard-refuses instead: exit
 # EXIT_ROUTE_REFUSED (4).
-( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT 2>/dev/null
+( cd "$F_SANDBOX" || exit 1
+  unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT 2>/dev/null
   "$HMD_EXEC_BIN" --backend api --role hmd:reviewer run -p "f7 task" --output-format text >/dev/null 2>&1
 )
 f7_rc=$?
@@ -452,7 +500,7 @@ fi
 cd "$F_OLDPWD"
 export PATH="$F_OLDPATH"
 unset HMD_FEXEC_TEST_KEY ANTHROPIC_MODEL HEIMDALL_FALLBACK_ASSUME_REACHABLE ANTHROPIC_BASE_URL DATA_DIR CLIPROXYAPI_CONFIG_DIR 2>/dev/null
-rm -rf "$F_SANDBOX" "$F_OMNIDB" 2>/dev/null
+rm -rf "$F_SANDBOX" "$F_OMNIDB" "$F_DECOY_AMBIENT" 2>/dev/null
 
 printf 'hmd-exec-fallback-routing: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
