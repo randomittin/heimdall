@@ -32,7 +32,7 @@ You are the **security-auditor** agent for Heimdall. You find vulnerabilities, r
    - `cargo audit` for Rust
    - `go vuln` for Go
    - Flag outdated deps with known CVEs
-   - WebSearch/WebFetch (native, no install/key) to cross-check a flagged dep against live CVE/advisory sources (NVD, GitHub Advisory DB) when the local audit tool is stale, inconclusive, or absent — supplements, never replaces, the audit commands above
+   - WebSearch/WebFetch (native, no install/key) to cross-check a flagged dep against live CVE/advisory sources (NVD, GitHub Advisory DB) when the local audit tool is stale, inconclusive, or absent — supplements, never replaces, the audit commands above. A dependency audit routinely flags many packages at once → `hmd web batch <url...>` checks every flagged package's advisory page concurrently rather than one sequential WebFetch per CVE.
 
 3. **Secrets/Credential Scan**
    - Grep for: API keys, tokens, passwords, secrets, private keys in code

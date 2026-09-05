@@ -95,5 +95,6 @@ Pull logs from pods, analyze, raise issues on GitHub.
 - **Issue creation**: when raising N issues, batch the `gh issue create` calls in one message so they go out concurrently.
 - **Verification pass**: when checking which open issues are now resolved, run all `gh issue list` + log-grep commands in parallel batches.
 - **Heavy log fetches** (>30s, large `--tail`): `run_in_background: true`, scan other sources while it streams.
+- **Upstream checks for N unique errors**: WebSearch/WebFetch cover a single lookup; when dedup yields multiple distinct error signatures each needing an upstream check, `hmd web batch <url...>` fetches all the candidate advisory/issue pages concurrently in one call instead of one sequential WebFetch per signature.
 
 Sequential tool calls for independent operations is a bug. Default to parallel.

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# heimdall-web -- dependency-light web fetch/crawl/extract, built in-house.
+#
+# Replicates the specific capabilities Firecrawl provides that neither
+# WebFetch nor WebSearch cover on their own: clean-markdown extraction,
+# bounded multi-page crawl, concurrent batch fetch, structured metadata
+# (OpenGraph/Twitter/JSON-LD/canonical), and same-session URL caching.
+# Firecrawl itself was evaluated twice and rejected as a DEPENDENCY (AGPL-3.0
+# network-use clause on modification; self-host needs a browser pool + Redis
+# + Postgres) -- see docs/analysis/2026-08-23-firecrawl-assessment.md and
+# docs/analysis/2026-09-05-web-research-tools-rollout.md. This tool is an
+# independent, stdlib-only implementation: no Firecrawl code or config shape
+# is vendored anywhere here.
+#
+# Safety (see bin/lib/web_fetch.py's module docstring for the full model):
+# robots.txt respected by default, no credentials ever sent, private/loopback
+# addresses refused by default (SSRF guard), everything bounded (timeout,
+# byte caps, page caps, wall clock).
+#
+# usage: heimdall-web <command> [options]
+#   fetch <url>     fetch one URL, print clean markdown
+#   crawl <url>     bounded crawl from a seed URL, same-domain by default
+#   batch <url...>  fetch many URLs concurrently (or --list FILE)
+#   meta <url>      structured metadata (title/OG/Twitter/JSON-LD/headings)
+#   see `heimdall-web --help` for the full flag reference.
+set -euo pipefail
+
+SELF_SRC="$0"
+case "$SELF_SRC" in
+  */*) : ;;
+  *)
+    RESOLVED="$(command -v "$SELF_SRC" 2>/dev/null || true)"
+    [ -n "$RESOLVED" ] && SELF_SRC="$RESOLVED"
+    ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF_SRC")" 2>/dev/null && pwd)"
+LIB="$BIN_DIR/lib/web_fetch.py"
+
+if [ ! -f "$LIB" ]; then
+  echo "heimdall-web: cannot find lib/web_fetch.py next to $BIN_DIR (broken install?)" >&2
+  exit 2
+fi
+
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$PY" ]; then
+  echo "heimdall-web: python not found -- web fetch/crawl skipped (optional feature; base install does not require python)." >&2
+  exit 0
+fi
+
+exec "$PY" "$LIB" "$@"
