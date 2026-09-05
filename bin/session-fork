@@ -13,6 +13,13 @@ WORK_DIR="${HEIMDALL_WORK_DIR:-${SUPERX_WORK_DIR:-$(pwd)}}"
 MODEL="${HEIMDALL_MODEL:-${SUPERX_MODEL:-$("$PLUGIN_DIR/bin/heimdall-model-resolve" sonnet)}}"
 RESULTS_DIR="${HEIMDALL_FORK_DIR:-${SUPERX_FORK_DIR:-/tmp/heimdall-forks-$$}}"
 MAX_PARALLEL="${HEIMDALL_MAX_PARALLEL:-${SUPERX_MAX_PARALLEL:-10}}"
+# ROLE identifies every fork spawned by this invocation to hmd-exec's own --role flag
+# (bin/hmd-exec), which exports HMD_AGENT_TYPE on the exec'd child so bin/heimdall-fallback's
+# coop state can route it per-role. Deliberately WITHOUT a default, unlike MODEL/WORK_DIR
+# above: an unset ROLE must leave hmd-exec's --role unpassed entirely (never guess a
+# role), so an unidentified fork keeps failing closed to api.anthropic.com exactly as
+# before this variable existed.
+ROLE="${HEIMDALL_FORK_ROLE:-${SUPERX_FORK_ROLE:-}}"
 SM="$PLUGIN_DIR/bin/shared-memory"
 AP="$PLUGIN_DIR/bin/agent-pool"
 
@@ -68,7 +75,15 @@ Task: $prompt"
     # 529/overload with backoff, fails fast on a real error, and returns a distinct
     # non-zero exit on give-up. `|| rc=$?` captures the code without tripping `set -e` —
     # the old `|| true` silently masked failures.
-    output=$("$PLUGIN_DIR/bin/hmd-exec" run -p "$full_prompt" --model "$MODEL" --output-format text) || rc=$?
+    # ROLE (opt-in only, see the global above) threads through as hmd-exec's own --role
+    # flag, which must precede `run` in hmd-exec's own arg order. Unset ROLE -> the plain
+    # form below, so an unidentified fork's HMD_AGENT_TYPE stays untouched, exactly as
+    # before this flag existed.
+    if [ -n "$ROLE" ]; then
+      output=$("$PLUGIN_DIR/bin/hmd-exec" --role "$ROLE" run -p "$full_prompt" --model "$MODEL" --output-format text) || rc=$?
+    else
+      output=$("$PLUGIN_DIR/bin/hmd-exec" run -p "$full_prompt" --model "$MODEL" --output-format text) || rc=$?
+    fi
     if [ "$rc" -eq 0 ]; then
       echo "$output" > "$RESULTS_DIR/outputs/${task_id}.txt"
       status_word="done"

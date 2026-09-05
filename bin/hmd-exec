@@ -209,6 +209,18 @@ fi
 
 printf 'hmd-exec: backend=%s\n' "$BACKEND" >&2
 
+# ROLE -> HMD_AGENT_TYPE, the one channel every downstream consumer (heimdall-fallback's
+# _routing_decision/cmd_base_url, hmd-route-claude's _hrc_is_judgment) reads to resolve
+# per-spawn coop routing. Deliberately conditional: an unset --role must leave
+# HMD_AGENT_TYPE completely untouched (never defaulted, never cleared) — "explicit flag
+# beats inferring; an unset role must remain unset" (never guess a default), so an
+# unidentified spawn keeps failing closed to api.anthropic.com exactly as before this
+# flag existed. See bin/heimdall-fallback's coop state and bin/heimdall-precheck-agent's
+# coop native-spawn refusal fence for the two consumers this feeds.
+if [ -n "$ROLE" ]; then
+  export HMD_AGENT_TYPE="$ROLE"
+fi
+
 case "$BACKEND" in
   claude-code)
     # shellcheck source=lib/hmd-claude-retry.sh
