@@ -449,7 +449,9 @@ if [ -z "$match_ts" ] && [ -z "$(printf '%s' "$input" | jq -r '.agent_transcript
   fi
 fi
 
-[ -n "$match_ts" ] || exit 0
+[ -n "$match_ts" ] || { _trace_outcome="no-match"; exit 0; }
 
+_trace_outcome="marked"
+_trace_detail="$safe_event-transcript-429"
 "$MARK_BIN" mark --reason "$safe_event-transcript-429" >/dev/null 2>&1 || true
 exit 0
