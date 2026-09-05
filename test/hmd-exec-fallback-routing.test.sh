@@ -318,6 +318,142 @@ else
   bad "E2 literal: HMD_JUDGMENT=1 --print-endpoint reports api.anthropic.com" "grep did not match"
 fi
 
+echo "== Section F: bin/hmd-exec --role -> HMD_AGENT_TYPE -> real coop routing (env-dump proof) =="
+# Real coop-configured sandbox repo, same fixture shape as
+# test/heimdall-fallback-coop.test.sh's PROOF 1 (state=coop, coop_roles=
+# [hmd:coder], a throwaway sqlite omniroute db, assumed-reachable). Unlike
+# Sections B-E above (which only exercise the judgment short-circuit, never
+# the real routing chain), these cases go all the way through the real
+# bin/heimdall-route -> bin/heimdall-fallback resolution -- so, per that
+# suite's own "ONE WRINKLE" header comment, REPO_ROOT/bin must be on PATH
+# (heimdall-route resolves heimdall-fallback via bare `command -v`, never
+# repo-relative) and every case must `cd` into the sandbox first
+# (heimdall-route reads $PWD for --repo; it has no --repo flag of its own).
+F_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-exec-role-coop-test.XXXXXX")"
+mkdir -p "$F_SANDBOX/.heimdall"
+F_OMNIDB="$(mktemp "${TMPDIR:-/tmp}/hmd-exec-role-coop-test-db.XXXXXX")"
+python3 -c "
+import sqlite3, sys
+db = sys.argv[1]
+conn = sqlite3.connect(db)
+conn.execute('CREATE TABLE IF NOT EXISTS provider_connections (id INTEGER PRIMARY KEY, provider TEXT, mode TEXT)')
+conn.execute(\"CREATE TABLE IF NOT EXISTS upstream_proxy_config (id INTEGER PRIMARY KEY, provider_id TEXT, mode TEXT NOT NULL DEFAULT 'native', fallback_backend TEXT NOT NULL DEFAULT 'cliproxyapi')\")
+conn.commit()
+conn.close()
+" "$F_OMNIDB"
+printf '%s' '{
+  "state": "coop",
+  "operator_key_env": "HMD_FEXEC_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$F_OMNIDB"'",
+  "target_provider": "self-hosted-mixtral",
+  "coop_roles": ["hmd:coder"]
+}' > "$F_SANDBOX/.heimdall/fallback.json"
+
+F_OLDPWD="$(pwd)"
+F_OLDPATH="$PATH"
+export PATH="$REPO_ROOT/bin:$PATH"
+export DATA_DIR="/nonexistent-hmd-exec-role-coop-test-datadir"
+export CLIPROXYAPI_CONFIG_DIR="/nonexistent-hmd-exec-role-coop-test-cliproxyapi"
+export HMD_FEXEC_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+cd "$F_SANDBOX"
+
+# F1 -- routed role: --role hmd:coder (coop-listed) -> the real child (the
+# stub claude, reached only after the real shim + real heimdall-route/
+# -fallback resolve it) carries the gateway endpoint.
+RECORDER_ENV_FILE="$WORK/f1.env"
+( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL 2>/dev/null
+  export RECORDER_ENV_FILE
+  "$HMD_EXEC_BIN" --role hmd:coder run -p "f1 task" --output-format text >/dev/null 2>&1
+)
+if [ -f "$RECORDER_ENV_FILE" ] && [ "$(extract_key "$RECORDER_ENV_FILE" ANTHROPIC_BASE_URL)" = "ANTHROPIC_BASE_URL=http://127.0.0.1:20128" ]; then
+  ok "F1 --role hmd:coder (coop-listed) -> real child env carries the gateway endpoint"
+else
+  bad "F1 --role hmd:coder (coop-listed) -> real child env carries the gateway endpoint" \
+    "$(extract_key "$RECORDER_ENV_FILE" ANTHROPIC_BASE_URL 2>/dev/null || echo 'recorder never ran')"
+fi
+
+# F2 -- no --role given at all (main-session-equivalent): never routes,
+# child env byte-identical to the genuinely unrouted baseline from Section C.
+RECORDER_ENV_FILE="$WORK/f2.env"
+( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
+  export RECORDER_ENV_FILE
+  "$HMD_EXEC_BIN" run -p "f2 task" --output-format text >/dev/null 2>&1
+)
+assert_untouched "F2 no --role given at all -> child env byte-identical to unrouted baseline (never routed)" "$WORK/baseline.env" "$RECORDER_ENV_FILE"
+
+# F3 -- role given but NOT on the coop allowlist: same guarantee as F2.
+RECORDER_ENV_FILE="$WORK/f3.env"
+( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
+  export RECORDER_ENV_FILE
+  "$HMD_EXEC_BIN" --role hmd:test-runner run -p "f3 task" --output-format text >/dev/null 2>&1
+)
+assert_untouched "F3 --role hmd:test-runner (not coop-listed) -> child env byte-identical to unrouted baseline" "$WORK/baseline.env" "$RECORDER_ENV_FILE"
+
+# F4 -- poisoned-inheritance scrub: the CALLING shell exports a hostile
+# ANTHROPIC_BASE_URL before invoking hmd-exec with an unlisted role; the real
+# shim's non-route branch must scrub it (child ends up byte-identical to the
+# clean baseline), never pass it through.
+RECORDER_ENV_FILE="$WORK/f4.env"
+( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN 2>/dev/null
+  export RECORDER_ENV_FILE
+  export ANTHROPIC_BASE_URL="http://evil.example:6666"
+  "$HMD_EXEC_BIN" --role hmd:test-runner run -p "f4 task" --output-format text >/dev/null 2>&1
+)
+assert_untouched "F4 poisoned inherited ANTHROPIC_BASE_URL is SCRUBBED on an unrouted child (byte-identical to clean baseline)" "$WORK/baseline.env" "$RECORDER_ENV_FILE"
+
+# F5 -- adjudication role (--role hmd:reviewer), even though this sandbox's
+# coop config only lists hmd:coder: hmd-route-claude's OWN judgment branch
+# (bin/lib/hmd-adjudication-set.sh's hmd_is_adjudication(), never a
+# re-declared list here) pins the real Anthropic endpoint outright -- it
+# never even reaches the coop allowlist check.
+RECORDER_ENV_FILE="$WORK/f5.env"
+( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT ANTHROPIC_BASE_URL 2>/dev/null
+  export RECORDER_ENV_FILE
+  "$HMD_EXEC_BIN" --role hmd:reviewer run -p "f5 task" --output-format text >/dev/null 2>&1
+)
+if [ -f "$RECORDER_ENV_FILE" ] && [ "$(extract_key "$RECORDER_ENV_FILE" ANTHROPIC_BASE_URL)" = "ANTHROPIC_BASE_URL=https://api.anthropic.com" ]; then
+  ok "F5 --role hmd:reviewer (adjudication) pins the real Anthropic endpoint, never the gateway"
+else
+  bad "F5 --role hmd:reviewer (adjudication) pins the real Anthropic endpoint, never the gateway" \
+    "$(extract_key "$RECORDER_ENV_FILE" ANTHROPIC_BASE_URL 2>/dev/null || echo 'recorder never ran')"
+fi
+
+# F6 -- HMD_JUDGMENT=1 overrides even a coop-LISTED, otherwise-routable role.
+RECORDER_ENV_FILE="$WORK/f6.env"
+( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE ANTHROPIC_BASE_URL 2>/dev/null
+  export RECORDER_ENV_FILE
+  export HMD_JUDGMENT=1
+  "$HMD_EXEC_BIN" --role hmd:coder run -p "f6 task" --output-format text >/dev/null 2>&1
+)
+if [ -f "$RECORDER_ENV_FILE" ] && [ "$(extract_key "$RECORDER_ENV_FILE" ANTHROPIC_BASE_URL)" = "ANTHROPIC_BASE_URL=https://api.anthropic.com" ]; then
+  ok "F6 HMD_JUDGMENT=1 pins real Anthropic even for a coop-listed --role hmd:coder"
+else
+  bad "F6 HMD_JUDGMENT=1 pins real Anthropic even for a coop-listed --role hmd:coder" \
+    "$(extract_key "$RECORDER_ENV_FILE" ANTHROPIC_BASE_URL 2>/dev/null || echo 'recorder never ran')"
+fi
+
+# F7 -- api backend, adjudication role, under coop: structurally cannot pin
+# (no local claude binary / API-key fallback of its own -- see
+# bin/lib/hmd_api_backend.py's header), so it hard-refuses instead: exit
+# EXIT_ROUTE_REFUSED (4).
+( unset HMD_CLAUDE_BIN HMD_AGENT_TYPE HMD_JUDGMENT 2>/dev/null
+  "$HMD_EXEC_BIN" --backend api --role hmd:reviewer run -p "f7 task" --output-format text >/dev/null 2>&1
+)
+f7_rc=$?
+if [ "$f7_rc" -eq 4 ]; then
+  ok "F7 api backend, --role hmd:reviewer (adjudication), under coop -> hard refuses (exit 4)"
+else
+  bad "F7 api backend, --role hmd:reviewer (adjudication), under coop -> hard refuses (exit 4)" "rc=$f7_rc"
+fi
+
+cd "$F_OLDPWD"
+export PATH="$F_OLDPATH"
+unset HMD_FEXEC_TEST_KEY ANTHROPIC_MODEL HEIMDALL_FALLBACK_ASSUME_REACHABLE ANTHROPIC_BASE_URL DATA_DIR CLIPROXYAPI_CONFIG_DIR 2>/dev/null
+rm -rf "$F_SANDBOX" "$F_OMNIDB" 2>/dev/null
+
 printf 'hmd-exec-fallback-routing: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
