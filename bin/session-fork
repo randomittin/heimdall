@@ -153,12 +153,17 @@ cmd_wave() {
   count=$(echo "$tasks" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)
   echo "wave: $count tasks, max_parallel=$MAX_PARALLEL"
 
-  echo "$tasks" | python3 -c "
-import json, sys
-tasks = json.load(sys.stdin)
-for t in tasks:
-    print(t['id'] + '|' + t.get('role', '') + '|' + t['prompt'])
-" 2>/dev/null | while IFS='|' read -r tid trole tprompt; do
+  # Fed via process substitution (< <(...)) below, deliberately NOT a pipe
+  # (cmd | while ...; done). A pipe's RHS runs the while loop in its OWN
+  # subshell; fork_one's "( ... ) &" background jobs started inside that
+  # subshell would be invisible to the "wait" further down (which runs in
+  # THIS function's shell, not the pipe's) -- that wait would return almost
+  # immediately, having nothing of its own to wait for, while the real forks
+  # kept running orphaned in the background, so callers (and this test suite)
+  # would observe "wave: complete" before the forks had actually written their
+  # output. Process substitution keeps the loop, and every fork_one it calls,
+  # in this same shell, so the plain "wait" below genuinely blocks on them.
+  while IFS='|' read -r tid trole tprompt; do
     while [ "$active" -ge "$MAX_PARALLEL" ]; do
       sleep 1
       active=0
@@ -171,7 +176,12 @@ for t in tasks:
     done
     fork_one "$tid" "$tprompt" "" "$trole"
     active=$((active + 1))
-  done
+  done < <(echo "$tasks" | python3 -c "
+import json, sys
+tasks = json.load(sys.stdin)
+for t in tasks:
+    print(t['id'] + '|' + t.get('role', '') + '|' + t['prompt'])
+" 2>/dev/null)
 
   echo "wave: waiting for all tasks..."
   wait
