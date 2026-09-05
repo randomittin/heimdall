@@ -358,6 +358,104 @@ if [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
   fi
 fi
 
+# -- coop native-spawn refusal fence -----------------------------------------
+# coop (4th fallback state, beside off/auto/switch -- bin/heimdall-fallback
+# header point 13) routes ONLY an explicit, hand-curated allowlist of
+# subagent roles (`heimdall-fallback coop add/remove/list`) to the OmniRoute
+# gateway, while the MAIN session never routes at all -- that asymmetry is
+# coop's entire defining property. Per-role divergence is real, but only on
+# ONE path: bin/lib/hmd-route-claude's generation branch threads
+# HMD_AGENT_TYPE through `heimdall-route claude` -> `heimdall-fallback
+# base-url` -> _routing_decision, and each headless `claude -p` spawn
+# (bin/hmd-exec and its callers: session-fork, decompose, heimdall-drain,
+# benchmark) is a fresh `exec` with its own env block -- so one such spawn
+# CAN see the gateway while another, in the same repo at the same moment,
+# sees api.anthropic.com.
+#
+# The Agent tool is a DIFFERENT mechanism and cannot do this. Every spawn
+# that reaches this hook at all is, by construction, the in-process/native
+# Task-tool path -- there is no other tool_name this file is wired to gate
+# (see hooks/hooks.json). A native subagent shares this session's own
+# process env wholesale (no exec boundary of its own -- the same fact the
+# adjudication fence above already depends on); nothing in the documented
+# PreToolUse contract (hookSpecificOutput.updatedInput rewrites tool_input
+# fields only -- prompt, description, etc, never a per-child env block) or
+# in the Agent tool's own parameter schema (description/isolation/mode/
+# model/name/prompt/subagent_type/team_name -- no env field at all) gives a
+# hook any way to hand one native child a different ANTHROPIC_BASE_URL than
+# its sibling. So a coop-listed role spawned THIS way cannot actually route,
+# no matter what bin/heimdall-fallback's config says -- it would silently
+# inherit the unrouted main session's env and run on api.anthropic.com
+# while the operator, having deliberately added it to the coop allowlist,
+# reasonably believes it is on the gateway. Silently doing the wrong thing
+# in a correct-looking way is worse than refusing outright: this fence
+# refuses instead.
+#
+# A role that is NOT coop-listed (or is adjudication, or coop is not even
+# the active state) needs no refusal -- it was always going to inherit the
+# main session's own env and land on api.anthropic.com, which is exactly
+# correct for it. So this only ever denies the one combination that is
+# actually broken: state==coop AND this subagent_type would positively
+# resolve to ROUTE if only the env divergence were possible -- never
+# anything else.
+#
+# Verdict by delegation, not a second copy of the allowlist:
+# `heimdall-fallback check --role <type>` runs the exact same
+# run_preflight/_verdict/_coop_role_allowed chain cmd_base_url itself uses
+# for a real routed spawn (that file's own words: "two independent copies
+# of a routing decision is how a gate starts saying ROUTE while the real
+# gate says REFUSE" -- applies here too). rc==0 (ROUTE) is the only thing
+# that ever denies; REFUSE (not listed, is adjudication, or any other
+# preflight check failing) or WAIT is always allowed through, matching
+# what actually happens to its env either way.
+#
+# Cheap gate first: a raw on-disk `.state` read (`heimdall-fallback where`
+# + a local jq parse -- no run_preflight, no DB query, no HTTP reachability
+# probe) decides whether the heavier `check --role` call is worth paying
+# for at all, so the overwhelmingly common case (coop never configured, or
+# fallback tooling entirely absent) costs one cheap subprocess plus one
+# local file read, nothing more. This can only ever OVER-trigger the
+# heavier call relative to the fully-validated config (load_config's own
+# corruption handling migrates an invalid state to 'off', never invents
+# 'coop' from anything else -- see that function's docstring), so a
+# mismatch here can never cause a wrong deny: the heavier, authoritative
+# call is always what actually decides.
+#
+# Fails OPEN on every plumbing gap (missing jq, missing binary, unreadable/
+# corrupt config, unresolvable subagent_type, a `check --role` call that
+# errors) -- same direction the adjudication fence above takes, and for the
+# same reason: the unsafe outcome of a broken fence here is "coop's routing
+# silently doesn't happen for a listed role" (a strictly SMALLER harm than
+# today, before this fence existed), never "the Agent tool stops working
+# for every spawn on any machine where heimdall-fallback is momentarily
+# unavailable." Only a POSITIVELY confirmed state==coop + ROUTE verdict
+# ever denies.
+if [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
+  COOP_FALLBACK_BIN="$BIN_DIR/heimdall-fallback"
+  if [ -x "$COOP_FALLBACK_BIN" ]; then
+    COOP_CFG_PATH="$("$COOP_FALLBACK_BIN" --repo "$PWD" where 2>/dev/null)" || COOP_CFG_PATH=""
+    if [ -n "$COOP_CFG_PATH" ] && [ -f "$COOP_CFG_PATH" ]; then
+      COOP_STATE="$(jq -r '.state // empty' "$COOP_CFG_PATH" 2>/dev/null)" || COOP_STATE=""
+      if [ "$COOP_STATE" = "coop" ]; then
+        COOP_SATYPE="$(printf '%s' "$INPUT" | jq -r '.tool_input.subagent_type // empty' 2>/dev/null)" || COOP_SATYPE=""
+        if [ -n "$COOP_SATYPE" ]; then
+          if "$COOP_FALLBACK_BIN" --repo "$PWD" check --role "$COOP_SATYPE" >/dev/null 2>&1; then
+            COOP_REASON="BIFROST - Heimdall coop deny: subagent_type '$COOP_SATYPE' is on the coop allowlist (heimdall-fallback coop list) and would ROUTE to the OmniRoute gateway -- but the Agent tool's native spawn mechanism shares this session's own process env wholesale and has no per-child env-injection point, so it cannot actually honor that routing. Spawning it this way would silently leave it on api.anthropic.com while coop's own config says it should be on the gateway. Remedy: dispatch this role through hmd's headless path instead (bin/hmd-exec / bin/session-fork, which set HMD_AGENT_TYPE on a genuinely separate exec'd process before bin/lib/hmd-route-claude ever runs) -- that path is where coop's per-role divergence actually works. This deny has no bypass flag."
+            COOP_JSON="$(jq -cn --arg r "$COOP_REASON" '{error: $r}' 2>/dev/null)"
+            if [ -z "$COOP_JSON" ]; then
+              COOP_JSON='{"error": "BIFROST - Heimdall coop deny: a coop-listed role was refused on the native Agent-tool spawn path (the reason text could not be JSON-encoded; see stderr for the full message)."}'
+            fi
+            printf '%s\n' "$COOP_JSON"
+            printf '%s\n' "$COOP_REASON" >&2
+            exit 2
+          fi
+        fi
+      fi
+    fi
+  fi
+fi
+# -- end coop native-spawn refusal fence --------------------------------------
+
 # -- brief-adoption gate -------------------------------------------------------
 allow() { exit 0; }
 
