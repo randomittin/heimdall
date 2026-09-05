@@ -49,6 +49,13 @@ ensure_dirs() {
 
 fork_one() {
   local task_id="$1" prompt="$2" context="${3:-}"
+  # Per-task role (4th positional, wired from an optional "role" field in
+  # wave/run task JSON -- see cmd_wave/cmd_run below) overrides the
+  # invocation-wide ROLE global. A task that omits it falls back to that
+  # global, which may itself be unset -- never invented, only ever inherited
+  # from one of those two explicit sources, same "no guessing" rule ROLE
+  # itself follows above.
+  local task_role="${4:-$ROLE}"
   ensure_dirs
 
   local full_prompt="$prompt"
@@ -79,8 +86,8 @@ Task: $prompt"
     # flag, which must precede `run` in hmd-exec's own arg order. Unset ROLE -> the plain
     # form below, so an unidentified fork's HMD_AGENT_TYPE stays untouched, exactly as
     # before this flag existed.
-    if [ -n "$ROLE" ]; then
-      output=$("$PLUGIN_DIR/bin/hmd-exec" --role "$ROLE" run -p "$full_prompt" --model "$MODEL" --output-format text) || rc=$?
+    if [ -n "$task_role" ]; then
+      output=$("$PLUGIN_DIR/bin/hmd-exec" --role "$task_role" run -p "$full_prompt" --model "$MODEL" --output-format text) || rc=$?
     else
       output=$("$PLUGIN_DIR/bin/hmd-exec" run -p "$full_prompt" --model "$MODEL" --output-format text) || rc=$?
     fi

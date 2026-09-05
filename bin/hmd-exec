@@ -162,7 +162,7 @@ while [ $# -gt 0 ]; do
     --backend=*) BACKEND="${1#--backend=}"; shift ;;
     --strict) STRICT=1; shift ;;
     --role) ROLE="${2:?--role needs a ROLE}"; shift 2 ;;
-    --role=*) ROLE="${1#--role=}"; shift ;;
+    --role=*) ROLE="${1#--role=}"; : "${ROLE:?--role= needs a non-empty ROLE}"; shift ;;
     -h|--help) usage; exit 0 ;;
     run)
       SAW_SUBCOMMAND="run"
