@@ -354,14 +354,14 @@ fi
 echo
 echo "9 — --status answers 'am I routed' without launching anything"
 if [ -n "${PID1:-}" ]; then
-  ST="$(HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+  ST="$(cd "$FALLBACK_FREE_REPO" && HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
         HEADROOM_PORT="$PORT1" "$ROUTE" --status 2>/dev/null)"
   case "$ST" in
     ROUTED*)     ok "--status reports: $ST" ;;
     "NOT ROUTED"*) bad "--status says NOT ROUTED against a live verified proxy: $ST" ;;
     *)           bad "--status printed something unrecognised: '$ST'" ;;
   esac
-  ST2="$(HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+  ST2="$(cd "$FALLBACK_FREE_REPO" && HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
          HEADROOM_PORT="$PORT_UNUSED" "$ROUTE" --status 2>/dev/null)"
   case "$ST2" in
     "NOT ROUTED"*) ok "--status reports NOT ROUTED when no proxy is listening" ;;
