@@ -1,7 +1,7 @@
 ---
 name: incident-responder
 description: Production incident response agent. Root cause analysis, observability-driven debugging, rollback strategy, blameless postmortem. Use when production is broken or errors are spiking.
-tools: Read, Bash, Grep, Glob
+tools: Read, Bash, Grep, Glob, WebSearch, WebFetch
 model: sonnet
 tier: sonnet
 effort: max
@@ -27,6 +27,7 @@ You are the **incident-responder** agent for Heimdall. Production is broken. Fix
 - Check dependencies: DB connections, redis, external APIs, DNS
 - Reproduce: curl/httpie the failing endpoint, check response codes
 - Binary search: which commit introduced the break? `git bisect`
+- Check upstream: WebSearch/WebFetch (native, no install/key) for known issues/status pages on an implicated dependency — "is this a known bug in <lib> <version>" — before assuming novel root cause
 
 ### 3. MITIGATE (stop bleeding)
 - Rollback if recent deploy caused it: `git revert` or redeploy last-known-good

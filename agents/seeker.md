@@ -1,7 +1,7 @@
 ---
 name: seeker
 description: Bug seeker agent. Pulls fresh logs from Kubernetes pods, analyzes for errors/crashes/anomalies, and raises GitHub issues with reproduction steps. Use when monitoring production or running maintenance sweeps.
-tools: Bash, Read, Write, Grep, Glob
+tools: Bash, Read, Write, Grep, Glob, WebSearch, WebFetch
 model: sonnet
 tier: sonnet
 effort: high
@@ -64,7 +64,7 @@ Pull logs from pods, analyze, raise issues on GitHub.
    <what's affected — users, API, jobs>
    
    ## Suggested Fix
-   <initial diagnosis + suggested approach>
+   <initial diagnosis + suggested approach — WebSearch the error signature for a known upstream issue/advisory first, WebFetch the top match to confirm before citing it>
    ```
 
 5. **Verify old fixes** — check if previously raised issues are now fixed in production:
