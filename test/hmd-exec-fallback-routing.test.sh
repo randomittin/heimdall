@@ -353,6 +353,31 @@ echo "== Section F: bin/hmd-exec --role -> HMD_AGENT_TYPE -> real coop routing (
 # now read the decoy instead and fail visibly: a routed case would report the
 # tell-tale 29999 endpoint instead of 20128, and an untouched-assertion case
 # would incorrectly observe a ROUTE (switch routes unconditionally).
+#
+# A SECOND, independent leak vector exists and is NOT fixed by any of the cwd
+# control above, because it is not cwd-keyed at all: bin/heimdall-route falls
+# through to bin/lib/hmd-headroom-chain.sh's Headroom compression-proxy chain
+# whenever the OmniRoute fallback gate above returns no verdict -- exactly
+# what F2/F3/F4 expect to happen. That chain resolves its OWN per-repo state
+# (whether the Headroom module is "installed") from $PLUGIN_DIR, which
+# bin/hmd-exec / bin/heimdall-route / bin/lib/hmd-route-claude all derive
+# from their OWN script path ($0), never from cwd -- so no amount of `cd`ing
+# this suite's cwd around touches it. On a machine where the checkout this
+# suite's own files live in has ever run `hmd modules add headroom` for
+# real, $PLUGIN_DIR/.heimdall/modules/headroom/receipt.json exists; if a
+# real Headroom proxy is separately live on its hardcoded default port
+# (127.0.0.1:8787 -- HMD_HEADROOM_DEFAULT_PORT in that file) the chain
+# reuses it and exports a live ANTHROPIC_BASE_URL. Measured: this is a real,
+# legitimate feature firing exactly as designed, not a config-file leak --
+# running this exact suite from inside a real, Headroom-enrolled checkout
+# reproduces it with no --role and a clean coop config, zero relation to
+# F_DECOY_AMBIENT above. The fix is Headroom's own documented kill switch,
+# HMD_HEADROOM_DISABLE (hmd_headroom_opted_out in that file checks it FIRST,
+# before ever touching $PLUGIN_DIR or the port), exported below for this
+# whole section alongside the other ambient-state exports. Headroom has its
+# own dedicated suite (test/headroom-wrap-chain.test.sh) -- this section
+# tests OmniRoute coop-routing only, so disabling Headroom here narrows
+# scope; it does not weaken any assertion below.
 F_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-exec-role-coop-test.XXXXXX")"
 mkdir -p "$F_SANDBOX/.heimdall"
 F_OMNIDB="$(mktemp "${TMPDIR:-/tmp}/hmd-exec-role-coop-test-db.XXXXXX")"
@@ -397,6 +422,12 @@ export CLIPROXYAPI_CONFIG_DIR="/nonexistent-hmd-exec-role-coop-test-cliproxyapi"
 export HMD_FEXEC_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+# Kill the Headroom compression-chain fallback for this whole section (see
+# the hermeticity note above) -- it is not cwd-keyed, so no `cd` below can
+# neutralize it, and a real Headroom-enrolled checkout running this suite
+# would otherwise leak a live ANTHROPIC_BASE_URL into F2/F3/F4's supposedly
+# unrouted children.
+export HMD_HEADROOM_DISABLE=1
 cd "$F_DECOY_AMBIENT"
 
 # F1 -- routed role: --role hmd:coder (coop-listed) -> the real child (the
