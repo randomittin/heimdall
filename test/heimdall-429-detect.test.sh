@@ -54,50 +54,37 @@
 # 18. HMD_429_DETECT_TRANSCRIPT_TAIL_BYTES override is honored (shrinking it
 #     enough to miss a record the default tail size would have found, with a
 #     same-fixture default-settings baseline proving it isn't just broken).
-# 19. SYMLINKED sibling .output -- the real on-disk shape for every
-#     Task/Agent-tool spawn (MEASURED 2026-09-05 via `ls -la` on a live
-#     production tasks/ dir: 12/12 agent-id-named .output files were
-#     lrwxr-xr-x symlinks, 0 were regular files) -- plain `-type f` (no -L)
-#     cannot see it; -L is required. Isolated from claim 20 via
-#     HMD_429_DETECT_TASKS_DIR (a known dir, no auto-discovery involved).
-# 20. The sibling tasks/ dir does NOT share a name with transcript_path's
-#     own session id (MEASURED 2026-09-05 against the real incident this
-#     hook exists for -- request req_011Cei32DAJf4WeXHXtwfENa, sibling
-#     agent a9a055b1063cfd6f6: the tmp-dir folder actually holding that
-#     agent's tasks/*.output lived under a DIFFERENT id than the one in
-#     every JSONL record's own sessionId/transcript-path) -- an exact
-#     "$_sess" match finds nothing even though the real sibling dir exists
-#     one level over; auto-discovery must scan every sibling run dir for
-#     THIS repo (anchored by repo-slug, wildcarded by run id), never just
-#     the one guessed from transcript_path.
-# 21. End-to-end combination of 19+20 -- the exact real production shape:
-#     parent transcript is pure prose (no structural record), the fresh 429
-#     lives only in a SYMLINKED sibling .output under a run-id directory
-#     that does not match "$_sess".
-# 22. REAL PRODUCTION LAYOUT: transcript_path is <root>/<slug>/<session>.jsonl
-#     and the fresh 429 lives ONLY in the sibling <root>/<slug>/<session>/
-#     subagents/agent-x.jsonl -- the exact shape MEASURED against incident
-#     req_011CejtBFAa4za5rx5wou8FP (2026-09-05, sibling
-#     agent-ad5c54bf1ae335de3.jsonl) -- derived from transcript_path alone,
-#     no slug/run-id guessing. Marker written, reason reflects the
-#     sibling-scan path.
-# 23. Same real layout, STALE 429 in subagents/ -> no marker. The claim that
-#     matters most: this session's own parent transcript was MEASURED
-#     holding 46 accumulated structural 429 records (spanning 2026-08-18
-#     through the present) and its subagents/ dir hundreds of files -- none
-#     of them fresh right now. Recency must hold at this exact scale.
-# 24. Same real layout, 529/server_error in subagents/ -> no marker (never a
-#     heuristic, even via the new sibling source).
-# 25. Real layout with the <session>/subagents/ dir missing entirely -> exit
-#     0, no marker, no crash (falls through to the legacy tasks/ source).
-# 26. Newest-first selection: 20 lexically-EARLIER, fresh-mtime, non-matching
-#     files plus one lexically-LATER, later-mtime, genuinely fresh 429 file,
-#     together exceeding HMD_429_DETECT_MAX_SIBLINGS -- still marks. Proves
-#     selection is by MODIFICATION TIME, never alphabetical: the subagents/
-#     dir accumulates for a session's entire lifetime (hundreds of files
-#     measured directly in a live session), unlike the legacy tasks/ dir
-#     which is bounded to one run -- a lexical sort-then-cap would silently
-#     drop the one fresh file here.
+#
+# TIER 3 (2026-09-06): parent-transcript PROSE scan, the one exception to
+# "structural only" -- classified via the real bin/lib/quota_stop.py
+# classifier, never a bash/jq substring match. Closes the gap where seven
+# real subagent-death 429s left NO structural record anywhere and the only
+# trace was PROSE in the orchestrator's own Stop-triggered transcript (180
+# accumulated occurrences measured via a direct grep against a real session
+# jsonl).
+# 19. FRESH prose-only 429 -- the REAL verbatim hour-only string ("resets
+#     2pm", no minutes), zero structural record anywhere -- writes a marker
+#     via the Stop path, reason carries the -prose suffix.
+# 20. FRESH prose-only 429 with a minutes-present reset clause also writes a
+#     marker (no regression against the hour-only fix).
+# 21. STALE prose-only 429 (older than the recency window) -> no marker --
+#     the single most important case given 180 already-accumulated
+#     historical occurrences: recency is enforced per CANDIDATE LINE, not
+#     just once per hook invocation.
+# 22. Prose anchor present, reset clause absent -> no marker (the
+#     classifier's reset-clause requirement holds all the way through the
+#     hook, not just at the classify() level).
+# 23. 529/overload prose (no quota anchor at all) -> no marker.
+# 24. SubagentStop path (agent_transcript_path present) never runs the Tier
+#     3 prose scan, even given byte-identical fresh prose content -- a dying
+#     subagent's own transcript cannot structurally contain a
+#     task-notification about itself, so this stays Stop-only.
+# 25. HMD_QUOTA_STOP_PY override is honored -- a fake classifier is actually
+#     invoked (proven by a sentinel file), and the hook honors its "unknown"
+#     verdict rather than silently falling back to the real classifier.
+# 26. Tier 3 is strictly last-resort: a fresh STRUCTURAL 429 alongside an
+#     unrelated fresh PROSE 429 in the same transcript marks via Tier 1
+#     (reason has no -prose suffix) -- tier order is real, not incidental.
 #
 # Usage: bash test/heimdall-429-detect.test.sh   (exit 0 = all guarantees hold)
 set -uo pipefail
@@ -107,6 +94,7 @@ REPO="$(cd "$SELF_DIR/.." && pwd)"
 HOOKS="$REPO/hooks/hooks.json"
 HOOK_SRC="$REPO/hooks/heimdall-429-detect.sh"
 MARK_SRC="$REPO/bin/heimdall-429-mark"
+QUOTA_STOP_SRC="$REPO/bin/lib/quota_stop.py"
 
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
@@ -203,10 +191,12 @@ trap 'chmod -R u+w "$SANDBOX" 2>/dev/null || true; rm -rf "$SANDBOX"' EXIT
 PLUGIN="$SANDBOX/plugin"
 PROJECT="$SANDBOX/project"
 TRANSCRIPTS="$SANDBOX/transcripts"
-mkdir -p "$PLUGIN/hooks" "$PLUGIN/bin" "$PROJECT" "$TRANSCRIPTS"
+mkdir -p "$PLUGIN/hooks" "$PLUGIN/bin/lib" "$PROJECT" "$TRANSCRIPTS"
 
 cp "$HOOK_SRC" "$PLUGIN/hooks/heimdall-429-detect.sh"
 cp "$MARK_SRC" "$PLUGIN/bin/heimdall-429-mark"
+cp "$QUOTA_STOP_SRC" "$PLUGIN/bin/lib/quota_stop.py"
+[ -f "$PLUGIN/bin/lib/quota_stop.py" ] || { echo "FATAL: quota_stop.py failed to stage into sandbox" >&2; exit 1; }
 chmod +x "$PLUGIN/hooks/heimdall-429-detect.sh" "$PLUGIN/bin/heimdall-429-mark"
 
 MARKER="$SANDBOX/429-marker.json"
@@ -304,6 +294,59 @@ CLEAN_TRANSCRIPT="$TRANSCRIPTS/clean.jsonl";           write_clean "$CLEAN_TRANS
 FRESH_529_TRANSCRIPT="$TRANSCRIPTS/fresh-529.jsonl";  write_fresh_529 "$FRESH_529_TRANSCRIPT"
 FRESH_403_TRANSCRIPT="$TRANSCRIPTS/fresh-403.jsonl";  write_fresh_403 "$FRESH_403_TRANSCRIPT"
 MIXED_TRANSCRIPT="$TRANSCRIPTS/mixed.jsonl";           write_mixed "$MIXED_TRANSCRIPT"
+
+# --- Tier 3 fixtures: PROSE-ONLY transcripts, zero structural records at all,
+# shaped exactly like a real queue-operation task-notification (the same
+# shape test/heimdall-agent-resume.test.sh's mk_notif2() already models for
+# this repo's real parent-transcript records).
+write_prose_transcript() {
+  # $1 = output path, $2 = timestamp (ISO), $3 = summary text, $4 = task id
+  local path="$1" ts="$2" summary="$3" id="$4" body
+  body="$(printf '<task-notification>\n<task-id>%s</task-id>\n<tool-use-id>toolu_01FixtureToolUseId00</tool-use-id>\n<output-file>%s/%s.output</output-file>\n<status>failed</status>\n<summary>%s</summary>\n<note>A task-notification fires each time this agent stops.</note>' \
+    "$id" "$TRANSCRIPTS" "$id" "$summary")"
+  jq -nc --arg c "$body" --arg s "test-session-fixture" --arg ts "$ts" \
+    '{type:"queue-operation", operation:"enqueue", timestamp:$ts, sessionId:$s, content:$c}' > "$path"
+}
+
+PROSE_FRESH_TS=$(iso_ts_offset -10)
+PROSE_STALE_TS=$(iso_ts_offset -999999)
+
+# REAL verbatim production string (2026-09-06): hour-only reset, no ":MM" --
+# the exact shape that was silently un-classifiable before the quota_stop.py
+# RESET_RE fix landed.
+FRESH_PROSE_429_SUMMARY="Agent terminated early due to an API error: You've hit your session limit · resets 2pm (Asia/Calcutta)"
+FRESH_PROSE_MINUTES_SUMMARY="Agent terminated early due to an API error: You've hit your usage limit · resets 5:40pm (Asia/Calcutta)"
+PROSE_NO_RESET_SUMMARY="Agent terminated early due to an API error: You've hit your session limit for this billing period."
+PROSE_529_SUMMARY="Agent terminated early due to an API error: 529 Overloaded, please retry your request"
+
+FRESH_PROSE_429_TRANSCRIPT="$TRANSCRIPTS/fresh-prose-429.jsonl"
+write_prose_transcript "$FRESH_PROSE_429_TRANSCRIPT" "$PROSE_FRESH_TS" "$FRESH_PROSE_429_SUMMARY" "task-fresh-prose-429"
+
+STALE_PROSE_429_TRANSCRIPT="$TRANSCRIPTS/stale-prose-429.jsonl"
+write_prose_transcript "$STALE_PROSE_429_TRANSCRIPT" "$PROSE_STALE_TS" "$FRESH_PROSE_429_SUMMARY" "task-stale-prose-429"
+
+FRESH_PROSE_MINUTES_TRANSCRIPT="$TRANSCRIPTS/fresh-prose-minutes.jsonl"
+write_prose_transcript "$FRESH_PROSE_MINUTES_TRANSCRIPT" "$PROSE_FRESH_TS" "$FRESH_PROSE_MINUTES_SUMMARY" "task-fresh-prose-minutes"
+
+PROSE_NO_RESET_TRANSCRIPT="$TRANSCRIPTS/prose-no-reset.jsonl"
+write_prose_transcript "$PROSE_NO_RESET_TRANSCRIPT" "$PROSE_FRESH_TS" "$PROSE_NO_RESET_SUMMARY" "task-prose-no-reset"
+
+PROSE_529_TRANSCRIPT="$TRANSCRIPTS/prose-529.jsonl"
+write_prose_transcript "$PROSE_529_TRANSCRIPT" "$PROSE_FRESH_TS" "$PROSE_529_SUMMARY" "task-prose-529"
+
+# A fresh STRUCTURAL 429 alongside an unrelated fresh PROSE 429 in the same
+# file -- Tier 1 must win; Tier 3 must never even be consulted once Tier 1
+# already found a match (tier order is real, not incidental).
+write_structural_plus_prose() {
+  local path="$1" prose_body
+  write_fresh_429 "$path"
+  prose_body="$(printf '<task-notification>\n<task-id>task-mixed-tier</task-id>\n<tool-use-id>toolu_01FixtureToolUseId00</tool-use-id>\n<output-file>%s/task-mixed-tier.output</output-file>\n<status>failed</status>\n<summary>%s</summary>\n<note>A task-notification fires each time this agent stops.</note>' \
+    "$TRANSCRIPTS" "$FRESH_PROSE_429_SUMMARY")"
+  jq -nc --arg c "$prose_body" --arg s "test-session-fixture" --arg ts "$PROSE_FRESH_TS" \
+    '{type:"queue-operation", operation:"enqueue", timestamp:$ts, sessionId:$s, content:$c}' >> "$path"
+}
+STRUCTURAL_PLUS_PROSE_TRANSCRIPT="$TRANSCRIPTS/structural-plus-prose.jsonl"
+write_structural_plus_prose "$STRUCTURAL_PLUS_PROSE_TRANSCRIPT"
 
 # --- 3. real 429 via agent_transcript_path -> marker written -----------------
 reset_marker
@@ -478,159 +521,85 @@ else
   ok "HMD_429_DETECT_TRANSCRIPT_TAIL_BYTES=5 correctly misses the record (override genuinely bounds the read)"
 fi
 
-# --- 19. symlinked sibling .output (real on-disk shape) -> -L required ------
-# Isolates the -type f vs -L question alone: HMD_429_DETECT_TASKS_DIR points
-# straight at a known sandbox dir (no auto-discovery involved), containing
-# ONLY a symlinked *.output -- exactly the shape `ls -la` showed for every
-# real Task/Agent-tool sibling on 2026-09-05 (12/12 were lrwxr-xr-x, 0 were
-# regular files).
+# --- 19. FRESH prose-only 429 (real hour-only string, zero structural record) -
 reset_marker
-SYMLINK_SANDBOX="$SANDBOX/symlink-tasks"
-mkdir -p "$SYMLINK_SANDBOX"
-SYMLINK_TARGET="$SANDBOX/symlink-target.jsonl"
-write_fresh_429 "$SYMLINK_TARGET"
-ln -sf "$SYMLINK_TARGET" "$SYMLINK_SANDBOX/some-agent-id.output"
-PROSE_PARENT_19="$TRANSCRIPTS/prose-parent-19.jsonl"; write_clean "$PROSE_PARENT_19"
-PAYLOAD=$(jq -cn --arg tp "$PROSE_PARENT_19" '{hook_event_name:"Stop", transcript_path:$tp}')
-( cd "$SANDBOX" && unset HEIMDALL_HOME && export CLAUDE_PLUGIN_ROOT="$PLUGIN" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" HMD_429_DETECT_TASKS_DIR="$SYMLINK_SANDBOX"; printf '%s' "$PAYLOAD" | bash "$STOP_CMD_FILE" >/dev/null 2>&1 )
-if marker_exists; then
-  ok "symlinked sibling .output (real Task/Agent-tool shape) is followed and marks (-L)"
-else
-  bad "symlinked sibling .output was NOT followed -- plain -type f (no -L) silently excludes every real sibling"
-fi
-
-# --- 20. sibling tasks/ dir named differently than "\$_sess" -> found anyway -
-# Isolates the directory-RESOLUTION question alone: real auto-discovery (no
-# HMD_429_DETECT_TASKS_DIR override), a fake TMPDIR root under full test
-# control, sibling is a plain regular file (not a symlink, so claim 19 can't
-# leak into this one), living under a run-id directory whose name does NOT
-# match transcript_path's own basename -- MEASURED 2026-09-05 against the
-# real req_011Cei32DAJf4WeXHXtwfENa incident: the tmp-dir folder holding the
-# real siblings never shared a name with any persisted session id.
-reset_marker
-PROJECT_ABS="$(cd "$PROJECT" && pwd)"
-PROJECT_SLUG="$(printf '%s' "$PROJECT_ABS" | tr '/' '-')"
-FAKE_TMPDIR_20="$SANDBOX/faketmp20"
-OTHER_RUN_TASKS_20="$FAKE_TMPDIR_20/claude-9999/$PROJECT_SLUG/other-run-id-000/tasks"
-mkdir -p "$OTHER_RUN_TASKS_20"
-write_fresh_429 "$OTHER_RUN_TASKS_20/some-agent-id.output"
-# A dir matching "$_sess" exactly exists too, but with no tasks/ at all --
-# proves the OLD exact-match code has somewhere to look and still finds
-# nothing; this isn't passing merely because no directory existed there.
-mkdir -p "$FAKE_TMPDIR_20/claude-9999/$PROJECT_SLUG/orchestrator-session-real-20"
-PROSE_PARENT_20="$TRANSCRIPTS/orchestrator-session-real-20.jsonl"; write_clean "$PROSE_PARENT_20"
-PAYLOAD=$(jq -cn --arg tp "$PROSE_PARENT_20" '{hook_event_name:"Stop", transcript_path:$tp}')
-( cd "$SANDBOX" && unset HEIMDALL_HOME && export CLAUDE_PLUGIN_ROOT="$PLUGIN" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" TMPDIR="$FAKE_TMPDIR_20"; printf '%s' "$PAYLOAD" | bash "$STOP_CMD_FILE" >/dev/null 2>&1 )
-if marker_exists; then
-  ok "sibling run dir named differently than transcript_path's basename is still found (repo-slug-anchored wildcard scan)"
-else
-  bad "sibling run dir with a different name than \"\$_sess\" was NOT found -- exact-session-id match misses the real production shape"
-fi
-
-# --- 21. end-to-end real production shape: 19+20 combined -------------------
-# The exact shape measured for req_011Cei32DAJf4WeXHXtwfENa / agent
-# a9a055b1063cfd6f6 on 2026-09-05: prose-only parent transcript, fresh 429
-# only in a SYMLINKED sibling .output under a run-id dir that does not match
-# "$_sess".
-reset_marker
-FAKE_TMPDIR_21="$SANDBOX/faketmp21"
-OTHER_RUN_TASKS_21="$FAKE_TMPDIR_21/claude-9999/$PROJECT_SLUG/other-run-id-111/tasks"
-mkdir -p "$OTHER_RUN_TASKS_21"
-SYMLINK_TARGET_21="$SANDBOX/symlink-target-21.jsonl"
-write_fresh_429 "$SYMLINK_TARGET_21"
-ln -sf "$SYMLINK_TARGET_21" "$OTHER_RUN_TASKS_21/a9a055b1063cfd6f6.output"
-PROSE_PARENT_21="$TRANSCRIPTS/orchestrator-session-real-21.jsonl"; write_clean "$PROSE_PARENT_21"
-PAYLOAD=$(jq -cn --arg tp "$PROSE_PARENT_21" '{hook_event_name:"Stop", transcript_path:$tp}')
-( cd "$SANDBOX" && unset HEIMDALL_HOME && export CLAUDE_PLUGIN_ROOT="$PLUGIN" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" TMPDIR="$FAKE_TMPDIR_21"; printf '%s' "$PAYLOAD" | bash "$STOP_CMD_FILE" >/dev/null 2>&1 )
-if marker_exists; then
-  ok "end-to-end real production shape (prose parent + symlinked sibling under a differently-named run dir) marks correctly"
-else
-  bad "end-to-end real production shape did NOT mark -- this is the exact incident req_011Cei32DAJf4WeXHXtwfENa reproduced"
-fi
-
-# --- 22. REAL PRODUCTION LAYOUT: <root>/<slug>/<session>.jsonl parent +
-#     <root>/<slug>/<session>/subagents/agent-x.jsonl sibling, derived
-#     purely from transcript_path -- the exact shape measured for incident
-#     req_011CejtBFAa4za5rx5wou8FP (2026-09-05) -----------------------------
-reset_marker
-PROJECTS_ROOT="$SANDBOX/claude-projects"
-SLUG_DIR_22="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-22"
-SESSION_22="session-2200000000000000000000001"
-mkdir -p "$SLUG_DIR_22/$SESSION_22/subagents"
-PARENT_22="$SLUG_DIR_22/$SESSION_22.jsonl"; write_clean "$PARENT_22"
-write_fresh_429 "$SLUG_DIR_22/$SESSION_22/subagents/agent-aaa000.jsonl"
-PAYLOAD=$(jq -cn --arg tp "$PARENT_22" '{hook_event_name:"Stop", transcript_path:$tp}')
+PAYLOAD=$(jq -cn --arg tp "$FRESH_PROSE_429_TRANSCRIPT" '{hook_event_name:"Stop", transcript_path:$tp, last_assistant_message:"done"}')
 run_hook "$PAYLOAD" Stop
 if marker_exists; then
-  ok "real layout: fresh 429 in <session>/subagents/agent-x.jsonl (derived from transcript_path) writes a marker"
+  ok "FRESH prose-only 429 (real hour-only 'resets 2pm' string, zero structural record anywhere) writes a marker"
   R=$(marker_reason)
-  [ "$R" = "stop-sibling-transcript-429" ] && ok "marker reason reflects the sibling-scan path (got: $R)" \
-    || bad "marker reason unexpected for subagents-dir sibling match (got: $R)"
+  [ "$R" = "stop-prose-transcript-429" ] && ok "marker reason exactly reflects the -prose tier (got: $R)" \
+    || bad "marker reason mismatch for Tier 3 prose match (got: $R)"
 else
-  bad "real layout: fresh 429 in <session>/subagents/ did NOT write a marker"
+  bad "FRESH prose-only 429 did NOT write a marker -- the Tier 3 gap is not actually closed"
 fi
 
-# --- 23. same real layout, STALE 429 in subagents/ -> NO marker -- the claim
-#     that matters most given the real parent transcript's 46 accumulated
-#     structural 429 records ----------------------------------------------
+# --- 20. FRESH prose-only 429, minutes-present reset -> marker written -------
 reset_marker
-SLUG_DIR_23="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-23"
-SESSION_23="session-2300000000000000000000001"
-mkdir -p "$SLUG_DIR_23/$SESSION_23/subagents"
-PARENT_23="$SLUG_DIR_23/$SESSION_23.jsonl"; write_clean "$PARENT_23"
-write_stale_429 "$SLUG_DIR_23/$SESSION_23/subagents/agent-bbb000.jsonl"
-PAYLOAD=$(jq -cn --arg tp "$PARENT_23" '{hook_event_name:"Stop", transcript_path:$tp}')
+PAYLOAD=$(jq -cn --arg tp "$FRESH_PROSE_MINUTES_TRANSCRIPT" '{hook_event_name:"Stop", transcript_path:$tp}')
 run_hook "$PAYLOAD" Stop
-marker_exists && bad "STALE 429 in <session>/subagents/ incorrectly wrote a marker -- recency bound violated against the exact accumulation shape (46 old records) this must survive" \
-  || ok "STALE 429 in <session>/subagents/ writes no marker -- recency bound holds against the real accumulation shape"
+marker_exists && ok "FRESH prose-only 429 (minutes-present reset clause) also writes a marker (no regression)" \
+  || bad "FRESH prose-only 429 (minutes-present) failed to mark"
 
-# --- 24. same real layout, 529/server_error in subagents/ -> NO marker ------
+# --- 21. STALE prose-only 429 -> NO marker (180 accumulated records) --------
 reset_marker
-SLUG_DIR_24="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-24"
-SESSION_24="session-2400000000000000000000001"
-mkdir -p "$SLUG_DIR_24/$SESSION_24/subagents"
-PARENT_24="$SLUG_DIR_24/$SESSION_24.jsonl"; write_clean "$PARENT_24"
-write_fresh_529 "$SLUG_DIR_24/$SESSION_24/subagents/agent-ccc000.jsonl"
-PAYLOAD=$(jq -cn --arg tp "$PARENT_24" '{hook_event_name:"Stop", transcript_path:$tp}')
+PAYLOAD=$(jq -cn --arg tp "$STALE_PROSE_429_TRANSCRIPT" '{hook_event_name:"Stop", transcript_path:$tp}')
 run_hook "$PAYLOAD" Stop
-marker_exists && bad "529/server_error in <session>/subagents/ incorrectly wrote a marker" \
-  || ok "529/server_error in <session>/subagents/ writes no marker -- never a heuristic, even via the new sibling source"
+marker_exists && bad "STALE prose-only 429 incorrectly wrote a marker -- with 180 accumulated historical occurrences this is the most dangerous possible failure" \
+  || ok "STALE prose-only 429 (999999s old) writes no marker -- recency is enforced per candidate line, not just once per hook call"
 
-# --- 25. missing <session>/subagents/ dir entirely -> exit 0, no marker -----
+# --- 22. prose anchor present, NO reset clause -> NO marker ------------------
 reset_marker
-SLUG_DIR_25="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-25"
-SESSION_25="session-2500000000000000000000001"
-mkdir -p "$SLUG_DIR_25"
-PARENT_25="$SLUG_DIR_25/$SESSION_25.jsonl"; write_clean "$PARENT_25"
-# deliberately NOT creating $SLUG_DIR_25/$SESSION_25/subagents at all
-PAYLOAD=$(jq -cn --arg tp "$PARENT_25" '{hook_event_name:"Stop", transcript_path:$tp}')
-RC=0
-run_hook "$PAYLOAD" Stop || RC=$?
-[ "$RC" -eq 0 ] && ok "missing <session>/subagents/ dir exits 0" || bad "missing subagents dir exited $RC, expected 0"
-marker_exists && bad "missing subagents dir incorrectly wrote a marker" || ok "missing <session>/subagents/ dir writes no marker (falls through cleanly)"
+PAYLOAD=$(jq -cn --arg tp "$PROSE_NO_RESET_TRANSCRIPT" '{hook_event_name:"Stop", transcript_path:$tp}')
+run_hook "$PAYLOAD" Stop
+marker_exists && bad "prose anchor-only (no reset clause) incorrectly wrote a marker" \
+  || ok "prose anchor-only (no reset clause) writes no marker -- the classifier's reset-clause requirement holds through the hook"
 
-# --- 26. newest-first selection: 20 lexically-EARLIER, fresh-mtime,
-#     non-matching files plus one lexically-LATER, later-mtime, genuinely
-#     fresh 429 file, together exceeding HMD_429_DETECT_MAX_SIBLINGS -- still
-#     marks. Proves selection is by modification time, never alphabetical --
-#     see claim 26 above for why this matters at the real accumulation
-#     scale --------------------------------------------------------------
+# --- 23. 529/overload prose -> NO marker -------------------------------------
 reset_marker
-SLUG_DIR_26="$PROJECTS_ROOT/-Users-rj-Downloads-heimdall-26"
-SESSION_26="session-2600000000000000000000001"
-mkdir -p "$SLUG_DIR_26/$SESSION_26/subagents"
-PARENT_26="$SLUG_DIR_26/$SESSION_26.jsonl"; write_clean "$PARENT_26"
-for i in $(seq 1 20); do
-  write_clean "$SLUG_DIR_26/$SESSION_26/subagents/agent-aaa-$i.jsonl"
-done
-sleep 1
-write_fresh_429 "$SLUG_DIR_26/$SESSION_26/subagents/agent-zzz-fresh.jsonl"
-PAYLOAD=$(jq -cn --arg tp "$PARENT_26" '{hook_event_name:"Stop", transcript_path:$tp}')
-( cd "$SANDBOX" && unset HEIMDALL_HOME && export CLAUDE_PLUGIN_ROOT="$PLUGIN" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" HMD_429_DETECT_MAX_SIBLINGS=12; printf '%s' "$PAYLOAD" | bash "$STOP_CMD_FILE" >/dev/null 2>&1 )
-if marker_exists; then
-  ok "newest-first selection finds the one fresh file even when 20 lexically-earlier files exceed the MAX_SIBLINGS cap"
+PAYLOAD=$(jq -cn --arg tp "$PROSE_529_TRANSCRIPT" '{hook_event_name:"Stop", transcript_path:$tp}')
+run_hook "$PAYLOAD" Stop
+marker_exists && bad "529/overload prose incorrectly wrote a marker" \
+  || ok "529/overload prose (no quota anchor at all) writes no marker"
+
+# --- 24. SubagentStop path never runs the Tier 3 prose scan ------------------
+reset_marker
+PAYLOAD=$(jq -cn --arg tp "$FRESH_PROSE_429_TRANSCRIPT" '{hook_event_name:"SubagentStop", agent_transcript_path:$tp}')
+run_hook "$PAYLOAD" SubagentStop
+marker_exists && bad "SubagentStop path incorrectly ran the Tier 3 prose scan (should be Stop-only)" \
+  || ok "SubagentStop path does not run the Tier 3 prose scan even given byte-identical fresh prose (agent_transcript_path present, correctly Stop-gated)"
+
+# --- 25. HMD_QUOTA_STOP_PY override is honored -------------------------------
+reset_marker
+FAKE_QUOTA_STOP_PY="$SANDBOX/fake-quota-stop.py"
+FAKE_QUOTA_STOP_SENTINEL="$SANDBOX/fake-quota-stop-called.txt"
+rm -f "$FAKE_QUOTA_STOP_SENTINEL"
+cat > "$FAKE_QUOTA_STOP_PY" <<FAKEPYEOF
+import sys
+open("$FAKE_QUOTA_STOP_SENTINEL", "w").write("called")
+print('{"class": "unknown"}')
+sys.exit(1)
+FAKEPYEOF
+PAYLOAD=$(jq -cn --arg tp "$FRESH_PROSE_429_TRANSCRIPT" '{hook_event_name:"Stop", transcript_path:$tp}')
+( cd "$SANDBOX" && unset HEIMDALL_HOME && export CLAUDE_PLUGIN_ROOT="$PLUGIN" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" HMD_QUOTA_STOP_PY="$FAKE_QUOTA_STOP_PY"; printf '%s' "$PAYLOAD" | bash "$STOP_CMD_FILE" >/dev/null 2>&1 )
+if [ -f "$FAKE_QUOTA_STOP_SENTINEL" ]; then
+  ok "HMD_QUOTA_STOP_PY override is honored -- the override classifier was actually invoked"
 else
-  bad "newest-first selection FAILED -- a lexical sort-then-cap would silently drop the real fresh file here"
+  bad "HMD_QUOTA_STOP_PY override was NOT invoked -- env var ignored"
+fi
+marker_exists && bad "HMD_QUOTA_STOP_PY override case: marker written despite the override reporting 'unknown' -- verdict ignored downstream" \
+  || ok "HMD_QUOTA_STOP_PY override case: no marker written, matching the override's honest 'unknown' verdict"
+
+# --- 26. Tier 3 is strictly last-resort (structural + unrelated prose) ------
+reset_marker
+PAYLOAD=$(jq -cn --arg tp "$STRUCTURAL_PLUS_PROSE_TRANSCRIPT" '{hook_event_name:"Stop", transcript_path:$tp}')
+run_hook "$PAYLOAD" Stop
+if marker_exists; then
+  R=$(marker_reason)
+  [ "$R" = "stop-transcript-429" ] && ok "structural 429 alongside an unrelated fresh prose 429 marks via Tier 1, never Tier 3 (got: $R)" \
+    || bad "tier-order violated -- expected stop-transcript-429, got: $R"
+else
+  bad "structural+prose transcript failed to mark at all"
 fi
 
 # --- collateral: every other live hook event still present -------------------

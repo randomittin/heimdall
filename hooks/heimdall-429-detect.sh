@@ -40,7 +40,8 @@
 # lives in the DYING entity's own transcript -- agent_transcript_path /
 # transcript_path -- never the parent's.
 #
-# NEVER A HEURISTIC. Matches ONLY the closed, structural triple
+# STRUCTURAL-FIRST, ALWAYS. Tier 1 (primary transcript) and Tier 2 (sibling
+# task-output files) match ONLY the closed, structural triple
 # (isApiErrorMessage==true AND error=="rate_limit" AND apiErrorStatus==429).
 # Never a text/regex match on prose -- the sibling 2026-08-25 investigation
 # measured a naive text search producing 162 false positives and zero true
@@ -49,6 +50,21 @@
 # rate-limit signals and must never mark (mirrors bin/heimdall-529-scan's own
 # deliberate exclusion of rate_limit from ITS classification -- the two
 # tools are each other's photographic negative, on purpose).
+#
+# TIER 3 IS THE ONE EXCEPTION, AND IT IS NOT THAT NAIVE SEARCH. Measured
+# 2026-09-06 across seven real subagent-death 429s: none left a structural
+# record ANYWHERE (not the subagent's own transcript, not a sibling
+# task-output file) -- the only trace was PROSE inside a queue-operation
+# task-notification's <summary>, in the ORCHESTRATOR's own Stop-triggered
+# transcript (180 accumulated occurrences confirmed via a direct grep
+# against a real session jsonl). Tier 3 below (Stop path only) scans for
+# that prose, but the classification decision is never a bash/jq substring
+# match -- it runs through the SAME conservative, two-signal (anchor phrase
+# AND wall-clock reset clause) bin/lib/quota_stop.py classifier every other
+# quota-detection tool in this repo already uses, never a second
+# implementation of it. A bare "hit your ... limit" substring alone, or a
+# 529/overload string, still never marks -- see the Tier 3 block for the
+# recency and classification gates that make this true.
 #
 # RECENCY-BOUNDED, on purpose. A transcript can be long-lived; an old,
 # already-recovered-from 429 sitting in history must never re-mark a session
@@ -282,6 +298,65 @@ if [ -z "$match_ts" ] && [ -n "$sibling_paths" ]; then
         ' 2>/dev/null | tail -1 || true)"
     if [ -n "$match_ts" ]; then safe_event="${safe_event}-sibling"; break; fi
   done
+fi
+
+# Tier 3 (2026-09-06): the FINAL fallback -- scan for PROSE, never
+# structural, evidence of a 429. See the TIER 3 header comment above for why
+# this exists. Gated to the Stop path only (agent_transcript_path absent) --
+# a SubagentStop's own transcript is the DYING agent's, which cannot
+# structurally contain a task-notification about itself. Only runs at all
+# when Tier 1 and Tier 2 found nothing ($match_ts still empty) -- this is
+# strictly a last resort, never a parallel check.
+#
+# The raw (still JSON-encoded) line text is piped into quota_stop.py as-is:
+# neither ANCHOR_RE nor RESET_RE need to span a JSON-escaped character, so
+# this needs no per-field extraction and matches exactly how the
+# 180-occurrence count above was itself confirmed (a literal grep against
+# the raw transcript file).
+#
+# RECENCY IS EVERYTHING with 180 accumulated historical occurrences already
+# sitting in a real transcript: each CANDIDATE LINE's OWN `timestamp` is
+# checked against the identical jq age computation used twice above --
+# never the hook's firing time alone, and never a bare substring match. A
+# match without a fresh timestamp on that exact line never marks. Candidates
+# are prefiltered by a cheap case-insensitive grep (never the actual
+# classification decision -- that is quota_stop.py's job alone) and capped
+# at HMD_429_DETECT_MAX_PROSE_LINES (default 20, newest last) so a long
+# history of stale hits can never turn into an unbounded number of python
+# invocations. Fails open exactly like everything else here: no python3, no
+# readable quota_stop.py, or any parse error yields no marker.
+if [ -z "$match_ts" ] && [ -z "$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty' 2>/dev/null || true)" ]; then
+  QUOTA_STOP_PY="${HMD_QUOTA_STOP_PY:-$PLUGIN_DIR/bin/lib/quota_stop.py}"
+  PROSE_PY_BIN="$(command -v python3 2>/dev/null || true)"
+  _prose_max="${HMD_429_DETECT_MAX_PROSE_LINES:-20}"
+  case "$_prose_max" in ''|*[!0-9]*) _prose_max=20 ;; esac
+  if [ -n "$PROSE_PY_BIN" ] && [ -r "$QUOTA_STOP_PY" ]; then
+    _prose_candidates="$(tail -c "$tail_bytes" "$transcript_path" 2>/dev/null \
+      | grep -a -i -F 'hit your' 2>/dev/null | tail -n "$_prose_max" || true)"
+    if [ -n "$_prose_candidates" ]; then
+      while IFS= read -r _prose_line; do
+        [ -n "$_prose_line" ] || continue
+        _prose_ts="$(printf '%s' "$_prose_line" | jq -R -r --argjson window "$window_secs" '
+            try (
+              (. | fromjson) as $r
+              | ($r.timestamp // empty) as $ts
+              | select($ts != "")
+              | ($ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $ts_epoch
+              | (now - $ts_epoch) as $age
+              | select($age >= 0 and $age <= $window)
+              | $ts
+            ) catch empty
+          ' 2>/dev/null || true)"
+        [ -n "$_prose_ts" ] || continue
+        _prose_class="$(printf '%s' "$_prose_line" | "$PROSE_PY_BIN" "$QUOTA_STOP_PY" classify 2>/dev/null \
+          | jq -r '.class // empty' 2>/dev/null || true)"
+        if [ "$_prose_class" = "quota" ]; then
+          match_ts="$_prose_ts"
+          safe_event="${safe_event}-prose"
+        fi
+      done <<< "$_prose_candidates"
+    fi
+  fi
 fi
 
 [ -n "$match_ts" ] || exit 0
