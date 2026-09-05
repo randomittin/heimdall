@@ -859,7 +859,7 @@ def crawl(seed_url, max_depth=DEFAULT_CRAWL_MAX_DEPTH, max_pages=DEFAULT_CRAWL_M
         ))
         if len(pages) >= max_pages or total_bytes >= max_total_bytes:
             break
-        if depth < max_depth and _looks_like_html(result.content_type):
+        if depth < max_depth and result.status < 400 and _looks_like_html(result.content_type):
             for link in extract_links(text, result.final_url):
                 lp = urllib.parse.urlsplit(link)
                 if lp.scheme.lower() not in ALLOWED_SCHEMES:
