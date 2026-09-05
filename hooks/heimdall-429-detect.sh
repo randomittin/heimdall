@@ -91,6 +91,87 @@
 # `printf '%s'` into jq, never `echo` (test/gate-echo-parser-guard.test.sh).
 set -uo pipefail
 
+# --- Diagnostic tracing ---------------------------------------------------
+# THE OPEN QUESTION this file cannot otherwise answer: does Stop/SubagentStop
+# actually fire when a subagent dies to a 429? Every guard below has been
+# verified by driving this script directly with a constructed payload --
+# none of that proves the MECHANISM runs in a real session. One line per
+# invocation, appended below, is the only thing that can distinguish, from
+# OUTSIDE this process, the three cases that otherwise look identical: hook
+# never invoked (no trace line at all), hook invoked but found nothing (line
+# present, outcome=no-match or skipped-<why>), hook invoked and marked (line
+# present, outcome=marked).
+#
+# DEFAULT ON -- a deliberate reversal of the naive opt-in default. This exact
+# defect has failed eight times in production, and this repo's own operator
+# was told twice it was fixed and was wrong both times, because "the logic is
+# correct" was mistaken for "the mechanism runs". An operator who has to
+# remember to set a flag BEFORE an unpredictable 429 will, with very high
+# probability, still have nothing to look at after failure #9 -- that is the
+# exact failure mode an opt-in default reproduces. Disable with
+# HMD_429_DETECT_TRACE=0. The write costs one small bounded append per
+# Stop/SubagentStop call, guarded exactly like every other guard in this
+# file: fails open, never blocks, never throws, and does not depend on jq --
+# so it still fires in the exact scenario ("jq unavailable") that is one of
+# the specific outcomes this trace exists to distinguish.
+#
+# BOUNDED, always. HMD_429_DETECT_TRACE_MAX_BYTES (default 256KiB) caps
+# growth: once exceeded, the file is trimmed to its own last half before the
+# new line lands -- the same bounded-tail philosophy this file already
+# applies to transcript reads (HMD_429_DETECT_TRANSCRIPT_TAIL_BYTES above),
+# so a long-lived, noisy session can never turn this into unbounded disk
+# growth.
+#
+# NEVER VIA jq -- built with printf alone. Every embedded field is either a
+# fixed-vocabulary literal this script writes itself, an integer counter, or
+# a value already sanitized through the same `tr 'A-Za-z0-9_-'` transform
+# safe_event uses below -- so this needs no generic JSON escaping, and it
+# still works when jq itself is the thing missing.
+#
+# NEVER changes the hook's own exit code or control flow: trace_emit runs
+# only via `trap ... EXIT`, strictly AFTER the real detection logic (mark or
+# no-mark) has already completed, and its own body always resolves to a
+# successful return regardless of what it encounters internally.
+_trace_enabled=1
+[ "${HMD_429_DETECT_TRACE:-}" = "0" ] && _trace_enabled=0
+_trace_file="${HMD_429_DETECT_TRACE_FILE:-${HEIMDALL_HOME:-$HOME/.heimdall}/429-detect-trace.jsonl}"
+_trace_had_agent_tp="null"
+_trace_had_tp="null"
+_trace_tier1_examined=0
+_trace_tier2_examined=0
+_trace_tier3_examined=0
+_trace_outcome="unknown"
+_trace_detail=""
+_trace_event_name=""
+
+trace_emit() {
+  [ "$_trace_enabled" = "1" ] || return 0
+  {
+    _trace_dir="$(dirname "$_trace_file" 2>/dev/null || true)"
+    [ -n "$_trace_dir" ] && mkdir -p "$_trace_dir" 2>/dev/null
+    _trace_max_bytes="${HMD_429_DETECT_TRACE_MAX_BYTES:-262144}"
+    case "$_trace_max_bytes" in ''|*[!0-9]*) _trace_max_bytes=262144 ;; esac
+    if [ -f "$_trace_file" ]; then
+      _trace_sz="$(wc -c < "$_trace_file" 2>/dev/null | tr -d ' ')"
+      case "$_trace_sz" in ''|*[!0-9]*) _trace_sz=0 ;; esac
+      if [ "$_trace_sz" -gt "$_trace_max_bytes" ]; then
+        _trace_half=$(( _trace_max_bytes / 2 ))
+        tail -c "$_trace_half" "$_trace_file" > "$_trace_file.trim.$$" 2>/dev/null \
+          && mv "$_trace_file.trim.$$" "$_trace_file" 2>/dev/null
+        rm -f "$_trace_file.trim.$$" 2>/dev/null
+      fi
+    fi
+    _trace_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+    printf '{"ts":"%s","hook_event_name":"%s","had_agent_transcript_path":%s,"had_transcript_path":%s,"tier1_examined":%s,"tier2_examined":%s,"tier3_examined":%s,"outcome":"%s","detail":"%s"}\n' \
+      "$_trace_ts" "$_trace_event_name" "$_trace_had_agent_tp" "$_trace_had_tp" \
+      "$_trace_tier1_examined" "$_trace_tier2_examined" "$_trace_tier3_examined" \
+      "$_trace_outcome" "$_trace_detail" >> "$_trace_file" 2>/dev/null
+  } 2>/dev/null || true
+  return 0
+}
+trap 'trace_emit' EXIT
+# --- end diagnostic tracing header; state updates continue inline below ---
+
 SELF="$0"
 if command -v readlink >/dev/null 2>&1; then
   SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
@@ -106,12 +187,17 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
-[ -d "$REPO" ] || exit 0
+[ -d "$REPO" ] || { _trace_outcome="skipped-no-repo-dir"; exit 0; }
 
 input="$(cat 2>/dev/null || true)"
-[ -n "$input" ] || exit 0
-command -v jq >/dev/null 2>&1 || exit 0
-[ -x "$MARK_BIN" ] || exit 0
+[ -n "$input" ] || { _trace_outcome="skipped-empty-input"; exit 0; }
+command -v jq >/dev/null 2>&1 || { _trace_outcome="skipped-no-jq"; exit 0; }
+[ -x "$MARK_BIN" ] || { _trace_outcome="skipped-no-mark-bin"; exit 0; }
+
+_trace_v="$(printf '%s' "$input" | jq -r 'if (.agent_transcript_path // "") != "" then "true" else "false" end' 2>/dev/null || true)"
+case "$_trace_v" in true|false) _trace_had_agent_tp="$_trace_v" ;; esac
+_trace_v="$(printf '%s' "$input" | jq -r 'if (.transcript_path // "") != "" then "true" else "false" end' 2>/dev/null || true)"
+case "$_trace_v" in true|false) _trace_had_tp="$_trace_v" ;; esac
 
 # Prefer SubagentStop's own field name; fall back to Stop's -- the same
 # dual-field-name fallback bin/heimdall-claim-check already uses for the
@@ -257,6 +343,7 @@ event_name="$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/nu
 [ -n "$event_name" ] || event_name="hook"
 safe_event="$(printf '%s' "$event_name" | tr -c 'A-Za-z0-9_-' '-' | tr '[:upper:]' '[:lower:]')"
 [ -n "$safe_event" ] || safe_event="hook"
+_trace_event_name="$safe_event"
 
 window_secs="${HMD_429_DETECT_WINDOW_SECS:-300}"
 case "$window_secs" in ''|*[!0-9]*) window_secs=300 ;; esac
@@ -264,6 +351,7 @@ case "$window_secs" in ''|*[!0-9]*) window_secs=300 ;; esac
 tail_bytes="${HMD_429_DETECT_TRANSCRIPT_TAIL_BYTES:-262144}"
 case "$tail_bytes" in ''|*[!0-9]*) tail_bytes=262144 ;; esac
 
+_trace_tier1_examined=1
 # Bounded-tail read, structural-only match, recency-bounded. try/catch
 # discards any single malformed line without aborting the whole scan.
 match_ts="$(tail -c "$tail_bytes" "$transcript_path" 2>/dev/null \
@@ -282,6 +370,7 @@ match_ts="$(tail -c "$tail_bytes" "$transcript_path" 2>/dev/null \
 # Primary path found nothing -- try the bounded sibling set (Stop path only).
 if [ -z "$match_ts" ] && [ -n "$sibling_paths" ]; then
   for _sp in $sibling_paths; do
+    _trace_tier2_examined=$((_trace_tier2_examined + 1))
     [ -f "$_sp" ] && [ -r "$_sp" ] || continue
     match_ts="$(tail -c "$tail_bytes" "$_sp" 2>/dev/null \
       | jq -R -r --argjson window "$window_secs" '
@@ -336,6 +425,7 @@ if [ -z "$match_ts" ] && [ -z "$(printf '%s' "$input" | jq -r '.agent_transcript
     if [ -n "$_prose_candidates" ]; then
       while IFS= read -r _prose_line; do
         [ -n "$_prose_line" ] || continue
+        _trace_tier3_examined=$((_trace_tier3_examined + 1))
         _prose_ts="$(printf '%s' "$_prose_line" | jq -R -r --argjson window "$window_secs" '
             try (
               (. | fromjson) as $r
