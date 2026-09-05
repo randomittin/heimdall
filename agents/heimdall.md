@@ -82,6 +82,7 @@ Analyze the prompt to identify required domains. Common domains include:
 - **security** — input validation, CSRF, XSS, injection prevention
 - **performance** — caching, optimization, profiling
 - **design** — UI/UX, design systems, accessibility
+- **research/web** — a URL in the prompt; "look up" / "research" / "what does X's docs say" / "latest version of" / "is there a CVE for" / "compare library A vs B" / "why is this API returning"; a library/framework/vendor name absent from this repo
 
 ### 2b. Skill Matching
 
@@ -104,6 +105,7 @@ Match identified domains against the FULL installed skill inventory from `detect
 | Team comms | `slack:draft-announcement`, `slack:channel-digest`, `slack:standup`, `slack:find-discussions` |
 | API development | `claude-api` (when building Claude/Anthropic integrations) |
 | MCP servers | `mcp-server-dev:build-mcp-server`, `mcp-server-dev:build-mcp-app` |
+| Research/web lookups | Native `WebSearch`/`WebFetch` for a single lookup; `hmd web fetch`, `hmd web crawl`, `hmd web batch`, `hmd web meta` when one page isn't enough (multi-page docs, N candidates, N status pages, N CVEs). Delegate to the role that carries the tool — see 4a. Agent Types below for which one. |
 
 For each domain:
 1. Check if an installed skill covers it — use the table above as a starting point, but also scan `detect-skills` output for any skill whose description matches
@@ -495,6 +497,14 @@ Spawn the right agent for each task.
 | Wave execution, >3 parallel tasks needing coordination | `hmd:wave-executor` | Byzantine-consensus conflict resolution, merge-tree preview, work-stealing across the wave |
 | Wave execution, ≤3 independent tasks | `hmd:coder` per task | Simpler wave — spawn one coder per task directly, no coordinator overhead |
 | Post-execution verification | `hmd:verifier` + `hmd:reviewer` | Runs all acceptance criteria, confirms coverage |
+| Research: library/approach evaluation | `hmd:architect` | Carries `WebSearch`/`WebFetch` for Technology Evaluation |
+| Research: engine/extension comparison | `hmd:database-architect` | Carries `WebSearch`/`WebFetch` for its Technology Evaluation item |
+| Research: CVE/advisory lookup | `hmd:security-auditor` | Carries `WebSearch`/`WebFetch`, supplements dependency audits |
+| Research: upstream API docs | `hmd:docs-writer` | Carries `WebSearch`/`WebFetch` for API-doc accuracy |
+| Research: status page, time-pressured | `hmd:incident-responder` | Carries `WebSearch`/`WebFetch` for the DIAGNOSE step |
+| Research: upstream issue signature | `hmd:seeker` | Carries `WebSearch`/`WebFetch` to match known issues |
+
+The orchestrator itself carries no `WebSearch`/`WebFetch` — §0 already forbids reading files before delegating, and browsing the web mid-triage is the same violation in a different medium. Route every research task above, including a "quick" one: a fact-check is still delegation, not an exception. Never route research to `hmd:verifier`, `hmd:reviewer`, `hmd:lint-quality`, or `hmd:test-runner` — none of them carry these tools, and that is deliberate (a judge browsing mid-verdict is a new nondeterminism source).
 
 Full roster (all require `hmd:` prefix): `hmd:architect`, `hmd:planner`, `hmd:wave-executor`, `hmd:verifier`, `hmd:coder`, `hmd:design`, `hmd:security-auditor`, `hmd:database-architect`, `hmd:incident-responder`, `hmd:reviewer`, `hmd:test-runner`, `hmd:docs-writer`, `hmd:lint-quality`, `hmd:seeker`, `hmd:fixer`.
 
