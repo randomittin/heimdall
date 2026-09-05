@@ -380,7 +380,7 @@ pages_out="$(webh "$H" crawl "$MAIN/chain0" --allow-private --max-depth 100 --ma
 pages_count="$(printf '%s' "$pages_out" | grep -o '"depth"' | wc -l | tr -d ' ')"
 [ "$pages_count" -eq 2 ] && ok "max-pages 2 from chain0 visits exactly 2 pages, got $pages_count" \
   || bad "max-pages 2 from chain0 visited $pages_count pages, expected 2"
-assert_not_contains "page-capped crawl excludes chain2 (depth budget unused)" "$pages_out" "/chain2"
+assert_not_contains "page-capped crawl excludes chain2 (depth budget unused)" "$pages_out" "\"url\": \"$MAIN/chain2\""
 
 # ── Case I: crawl same-domain-only default vs --allow-external ─────────────
 echo "Case I — crawl same-domain-only by default, --allow-external opts in:"
@@ -388,7 +388,7 @@ H="$(fresh_home)"
 samedomain_out="$(webh "$H" crawl "$MAIN/index" --allow-private --max-depth 2 --max-pages 20)"; rc=$?
 [ "$rc" -eq 0 ] && ok "same-domain crawl exits 0 (rc=$rc)" || bad "same-domain crawl exits 0 (rc=$rc)"
 assert_contains     "same-domain crawl includes page2 (same origin)" "$samedomain_out" "/page2"
-assert_not_contains "same-domain-only crawl excludes the external origin" "$samedomain_out" "127.0.0.1:$ext_PORT"
+assert_not_contains "same-domain-only crawl excludes the external origin" "$samedomain_out" "\"url\": \"$EXT/index\""
 
 H="$(fresh_home)"
 external_out="$(webh "$H" crawl "$MAIN/index" --allow-private --allow-external --max-depth 2 --max-pages 20)"; rc=$?
@@ -401,7 +401,7 @@ H="$(fresh_home)"
 err_crawl_out="$(webh "$H" crawl "$MAIN/errorpage" --allow-private --max-depth 5 --max-pages 20)"; rc=$?
 [ "$rc" -eq 0 ] && ok "crawl of a 404 seed still exits 0 (never crashes)" || bad "crawl of a 404 seed exits 0 (rc=$rc)"
 assert_contains     "errorpage itself is recorded with status 404" "$err_crawl_out" '"status": 404'
-assert_not_contains "link embedded in the 404 body is never visited" "$err_crawl_out" "should-never-visit"
+assert_not_contains "link embedded in the 404 body is never visited" "$err_crawl_out" "\"url\": \"$MAIN/should-never-visit\""
 
 # ── Case K: redirect is followed, final_url reflects the target ────────────
 echo "Case K — redirect is followed to its target:"
@@ -446,25 +446,29 @@ assert_contains     "the fixture did see a real User-Agent header" "$headers_out
 # ── Case O: URL cache — hit avoids re-fetch (content AND robots.txt) ───────
 echo "Case O — same-session cache avoids re-fetching an already-fetched URL:"
 H="$(fresh_home)"
+baseline_count="$(counter_of main)"
 first_out="$(webh "$H" fetch "$MAIN/index" --allow-private --json)"
 first_count="$(counter_of main)"
+first_delta=$((first_count - baseline_count))
 assert_contains "first fetch of a URL reports cached:false" "$first_out" '"cached": false'
-[ "$first_count" -eq 2 ] && ok "first fetch made exactly 2 real requests (robots.txt + index), got $first_count" \
-  || bad "first fetch made $first_count real requests to the server, expected 2"
+[ "$first_delta" -eq 2 ] && ok "first fetch made exactly 2 real requests (robots.txt + index), got $first_delta" \
+  || bad "first fetch made $first_delta real requests to the server, expected 2"
 
 second_out="$(webh "$H" fetch "$MAIN/index" --allow-private --json)"
 second_count="$(counter_of main)"
+second_delta=$((second_count - first_count))
 assert_contains "second fetch of the same URL reports cached:true" "$second_out" '"cached": true'
-[ "$second_count" -eq "$first_count" ] && ok "second fetch made NO additional real requests (still $second_count)" \
-  || bad "second fetch made additional real requests ($first_count -> $second_count), cache did not hit"
+[ "$second_delta" -eq 0 ] && ok "second fetch made NO additional real requests (delta $second_delta)" \
+  || bad "second fetch made additional real requests (delta $second_delta), cache did not hit"
 
 nocache_out1="$(webh "$H" fetch "$MAIN/index" --allow-private --json --no-cache)"
 nocache_out2="$(webh "$H" fetch "$MAIN/index" --allow-private --json --no-cache)"
 nocache_count="$(counter_of main)"
+nocache_delta=$((nocache_count - second_count))
 assert_contains "--no-cache fetch #1 reports cached:false" "$nocache_out1" '"cached": false'
 assert_contains "--no-cache fetch #2 (same URL) still reports cached:false" "$nocache_out2" '"cached": false'
-[ "$nocache_count" -eq "$((second_count + 4))" ] && ok "--no-cache made 2 more real round trips each call (4 total), got $((nocache_count - second_count))" \
-  || bad "--no-cache request count unexpected: went from $second_count to $nocache_count"
+[ "$nocache_delta" -eq 4 ] && ok "--no-cache made 2 more real round trips each call (4 total), got $nocache_delta" \
+  || bad "--no-cache request count unexpected: delta $nocache_delta, expected 4"
 
 # ── Case P: batch fetch preserves input order regardless of completion order ──
 echo "Case P — batch fetch returns results in original input order; --list reads a file:"
