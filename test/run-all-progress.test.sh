@@ -184,6 +184,102 @@ grep -qF "RUN GREEN" "$OUTFILE" \
   && ok "3g process exit code unchanged semantics (0 on an all-green fixture run)" \
   || bad "3g expected exit 0, got $RUN_RC" "$(cat "$OUTFILE")"
 
+echo "-- 4. STATUS MATRIX + RETRY PHASE: every outcome renders; retry only fires for real reds --"
+# Sections 1-3 only ever exercise PASS (every fixture suite there is green), which leaves the
+# FAIL/UNPARSED/DISCREP/TIMEOUT branches of _progress_fields, and the retry-phase call to
+# _progress_line entirely unexercised — retry only re-runs suites with a genuinely nonzero
+# exit (rc=124 or other), never UNPARSED/DISCREP (both rc=0 by definition), so this is the
+# only place that path gets proven at all.
+PW2="$WORK/repo2"
+mkdir -p "$PW2/test"
+( cd "$PW2" && git init -q && git config user.email dev@example.com && git config user.name Dev )
+cp "$RUN_ALL" "$PW2/test/run-all.sh"
+
+cat > "$PW2/test/r-pass.test.sh" <<'EOF'
+#!/usr/bin/env bash
+# fixture: control — a plain green suite alongside the four non-green shapes below.
+set -uo pipefail
+echo "1 passed, 0 failed"
+exit 0
+EOF
+
+cat > "$PW2/test/r-fail.test.sh" <<'EOF'
+#!/usr/bin/env bash
+# fixture: a genuine, deterministic red — still red alone, so it is retried and stays FAIL.
+set -uo pipefail
+echo "0 passed, 1 failed"
+exit 1
+EOF
+
+cat > "$PW2/test/r-unparsed.test.sh" <<'EOF'
+#!/usr/bin/env bash
+# fixture: exits 0 but prints no "N passed, M failed" line at all.
+set -uo pipefail
+echo "done, no parseable summary line"
+exit 0
+EOF
+
+cat > "$PW2/test/r-discrep.test.sh" <<'EOF'
+#!/usr/bin/env bash
+# fixture: a SILENT red — prints a failure but exits 0 (DISCREPANCY, not FAIL).
+set -uo pipefail
+echo "0 passed, 1 failed"
+exit 0
+EOF
+
+cat > "$PW2/test/r-timeout.test.sh" <<'EOF'
+#!/usr/bin/env bash
+# fixture: outlives the (deliberately shrunk) --timeout budget below.
+set -uo pipefail
+sleep 5
+echo "1 passed, 0 failed"
+exit 0
+EOF
+chmod +x "$PW2/test/"*.test.sh
+
+git -C "$PW2" add -A
+git -C "$PW2" commit -q -m "fixture: PASS/FAIL/UNPARSED/DISCREP/TIMEOUT + retry-phase coverage"
+
+OUT2="$WORK/prog2.out"
+( cd "$PW2" && bash test/run-all.sh --min 1 --jobs 5 --timeout 2 >"$OUT2" 2>&1 )
+RC2=$?
+
+grep -qE '^progress \[[0-9]+s elapsed\] run [0-9]+/5 PASS +r-pass\.test\.sh' "$OUT2" \
+  && ok "4a run-phase progress line renders PASS" \
+  || bad "4a PASS status line missing" "$(grep '^progress ' "$OUT2")"
+
+grep -qE '^progress \[[0-9]+s elapsed\] run [0-9]+/5 FAIL +r-fail\.test\.sh' "$OUT2" \
+  && ok "4b run-phase progress line renders FAIL" \
+  || bad "4b FAIL status line missing" "$(grep '^progress ' "$OUT2")"
+
+grep -qE '^progress \[[0-9]+s elapsed\] run [0-9]+/5 UNPARSED +r-unparsed\.test\.sh' "$OUT2" \
+  && ok "4c run-phase progress line renders UNPARSED" \
+  || bad "4c UNPARSED status line missing" "$(grep '^progress ' "$OUT2")"
+
+grep -qE '^progress \[[0-9]+s elapsed\] run [0-9]+/5 DISCREP +r-discrep\.test\.sh' "$OUT2" \
+  && ok "4d run-phase progress line renders DISCREP" \
+  || bad "4d DISCREP status line missing" "$(grep '^progress ' "$OUT2")"
+
+grep -qE '^progress \[[0-9]+s elapsed\] run [0-9]+/5 TIMEOUT +r-timeout\.test\.sh' "$OUT2" \
+  && ok "4e run-phase progress line renders TIMEOUT" \
+  || bad "4e TIMEOUT status line missing" "$(grep '^progress ' "$OUT2")"
+
+grep -qE '^progress \[[0-9]+s elapsed\] retry [0-9]+/[0-9]+ FAIL +r-fail\.test\.sh' "$OUT2" \
+  && ok "4f retry-phase progress line fires for the genuine FAIL red" \
+  || bad "4f retry-phase FAIL line missing" "$(grep '^progress ' "$OUT2")"
+
+grep -qE '^progress \[[0-9]+s elapsed\] retry [0-9]+/[0-9]+ TIMEOUT +r-timeout\.test\.sh' "$OUT2" \
+  && ok "4g retry-phase progress line fires for the genuine TIMEOUT red" \
+  || bad "4g retry-phase TIMEOUT line missing" "$(grep '^progress ' "$OUT2")"
+
+grep -E '^progress .* retry ' "$OUT2" | grep -qE 'r-unparsed|r-discrep' \
+  && bad "4h retry phase must NOT touch UNPARSED/DISCREP (both exit 0, never retried)" "$(grep '^progress .* retry ' "$OUT2")" \
+  || ok "4h retry phase correctly skips UNPARSED/DISCREP (rc=0, never a red to retry)"
+
+[ "$RC2" != 0 ] \
+  && ok "4i overall exit code still reflects RED when real failures exist (unchanged verdict semantics)" \
+  || bad "4i expected nonzero exit, got $RC2" "$(cat "$OUT2")"
+
 echo
 printf "  Results: %d passed, %d failed\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
