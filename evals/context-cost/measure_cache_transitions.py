@@ -122,6 +122,20 @@ def collect_requests(path, max_lines=None):
     return rows, lines_seen, malformed
 
 
+def bucket_label(row, ttl_seconds):
+    """Classify a single CREATE-bearing row into its explanatory bucket.
+    Caller must already have checked cache_creation_input_tokens > 0."""
+    if row["position"] == 1:
+        return "first_in_thread"
+    if row["gap_seconds"] is None:
+        return "unknown_gap"  # missing/unparseable timestamp -- never silently folded into a real bucket
+    if row["gap_seconds"] >= ttl_seconds:
+        return "ttl_expiry"
+    if row["class"] == "CREATE_ONLY":
+        return "unexplained"
+    return "incremental"  # MIXED, gap < ttl
+
+
 def bucket_creates(rows, ttl_seconds):
     """Bucket every CREATE-bearing row into exactly one explanatory bucket."""
     buckets = Counter()
@@ -129,20 +143,19 @@ def bucket_creates(rows, ttl_seconds):
     for row in rows:
         if row["cache_creation_input_tokens"] <= 0:
             continue
-        create_tok = row["cache_creation_input_tokens"]
-        if row["position"] == 1:
-            b = "first_in_thread"
-        elif row["gap_seconds"] is None:
-            b = "unknown_gap"  # missing/unparseable timestamp -- never silently folded into a real bucket
-        elif row["gap_seconds"] >= ttl_seconds:
-            b = "ttl_expiry"
-        elif row["class"] == "CREATE_ONLY":
-            b = "unexplained"
-        else:  # MIXED, gap < ttl
-            b = "incremental"
+        b = bucket_label(row, ttl_seconds)
         buckets[b] += 1
-        bucket_tokens[b] += create_tok
+        bucket_tokens[b] += row["cache_creation_input_tokens"]
     return buckets, bucket_tokens
+
+
+def find_unexplained(path, ttl_seconds, max_lines=None):
+    """Full row detail for the 'unexplained' bucket only (small by construction)."""
+    rows, _, _ = collect_requests(path, max_lines=max_lines)
+    return [
+        r for r in rows
+        if r["cache_creation_input_tokens"] > 0 and bucket_label(r, ttl_seconds) == "unexplained"
+    ]
 
 
 def measure(paths, max_lines=None, ttl_seconds=300):
@@ -263,8 +276,27 @@ def main():
     ap.add_argument("--max-lines", type=int, default=None, help="stop after N lines per file")
     ap.add_argument("--ttl-seconds", type=int, default=300, help="cache TTL to test gaps against (default 300 = 5min ephemeral)")
     ap.add_argument("--per-file", action="store_true", help="include a per-file breakdown (for comparing e.g. subagent transcripts to the main thread)")
+    ap.add_argument("--list-unexplained", action="store_true", help="print position/timestamp/gap/tokens for every 'unexplained' CREATE event (no aggregate report)")
     ap.add_argument("--json", action="store_true", help="emit machine-readable JSON instead of the text report")
     args = ap.parse_args()
+
+    if args.list_unexplained:
+        rows = []
+        for path in args.transcripts:
+            for r in find_unexplained(path, args.ttl_seconds, max_lines=args.max_lines):
+                r = dict(r, path=path)
+                rows.append(r)
+        if args.json:
+            print(json.dumps(rows, indent=2, sort_keys=True))
+        else:
+            print(f"=== {len(rows)} unexplained CREATE event(s) (gap < {args.ttl_seconds}s, not first-in-thread, no accompanying read) ===")
+            for r in rows:
+                print(
+                    f"{os.path.basename(r['path']):40s} pos={r['position']:>5,d} "
+                    f"ts={r['timestamp']} gap={r['gap_seconds']:.1f}s "
+                    f"create_tokens={r['cache_creation_input_tokens']:>10,d}"
+                )
+        return
 
     stats = measure(args.transcripts, max_lines=args.max_lines, ttl_seconds=args.ttl_seconds)
     if args.json:
