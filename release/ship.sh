@@ -354,30 +354,12 @@ sync_release_artifacts() {
   [ -x "$sync" ] || [ -f "$sync" ] || die "sync_release_artifacts: $sync not found — cannot sync release artifacts for $tag"
   bash "$sync" "$tag" || die "sync_release_artifacts: release/sync-release.sh $tag failed — artifacts would drift from the tag"
   git add "${REPO_ROOT:-$PWD}/packages/runheimdall/package.json" \
+          "${REPO_ROOT:-$PWD}/packages/runheimdall/README.md" \
           "${REPO_ROOT:-$PWD}/vercel.json" \
           "${REPO_ROOT:-$PWD}/_redirects" \
           "${REPO_ROOT:-$PWD}/install.sh" \
           "$PLUGIN_MANIFEST" 2>/dev/null || true
   ok "synced release artifacts (npx wrapper, vanity 302) → $tag"
-}
-
-# bump_readme_sha — SHA-pin README's install one-liner(s) to $1 (a 40-hex commit SHA) and
-# `git add` it. Tags are FORCE-MOVABLE; a full commit SHA is immutable, so a fresh
-# `curl|bash` fetches EXACTLY the reviewed bytes (supply-chain hardening). Rewrites EVERY
-# raw.githubusercontent .../install.sh ref (the one-liner AND the inspect-first fetch),
-# matching whatever ref is currently pinned (tag OR a prior SHA) → idempotent. No-op
-# (returns 0) if the file or a matching URL is absent so a layout change never blocks release.
-bump_readme_sha() {
-  local sha="$1"
-  local file="${SHIP_README:-${REPO_ROOT:-$PWD}/README.md}"
-  printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' || { warn "bump_readme_sha: '$sha' is not a 40-hex SHA — skipping"; return 0; }
-  [ -f "$file" ] || { warn "bump_readme_sha: $file not found — skipping"; return 0; }
-  grep -Eq 'raw\.githubusercontent\.com/randomittin/heimdall/[^/]+/install\.sh' "$file" \
-    || { warn "bump_readme_sha: no install URL in $file — skipping"; return 0; }
-  sed -E -i.bak "s#(raw\.githubusercontent\.com/randomittin/heimdall/)[^/]+(/install\.sh)#\1${sha}\2#g" "$file" \
-    && rm -f "$file.bak"
-  git add "$file" 2>/dev/null || true
-  ok "SHA-pinned README install URL → ${sha:0:12}…"
 }
 
 # ── npm publication (the npx wrapper) ────────────────────────────────────────
@@ -920,11 +902,6 @@ if [ -n "$TAG" ]; then
   # gated by test/version-drift.test.sh, so the release commit cannot carry a stale surface.
   render_version_surfaces "$NEW_VERSION"
   sync_release_artifacts "$TAG"
-  # SHA-pin README's install one-liner to the CURRENT verified HEAD (tags are force-movable; a
-  # full commit SHA is immutable). That is the last R9-verified commit — the release commit has
-  # no SHA until AFTER this commit is made (chicken-and-egg), and pinning fresh installs to
-  # already-verified history is the safer supply-chain choice. Folded into the release commit.
-  bump_readme_sha "$(git rev-parse HEAD)"
   git commit --no-verify -q -m "chore(release): $TAG" || die "bump commit failed"
   ok "bumped $CUR_VERSION → $NEW_VERSION (commit $(git rev-parse --short HEAD))"
 fi

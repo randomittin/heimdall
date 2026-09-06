@@ -49,10 +49,18 @@
 # Digest surfaces are therefore DISCOVERED BY SHAPE — an exactly-64-char hex token within
 # DIGEST_WINDOW lines of a raw.githubusercontent install URL — and never from a hardcoded file
 # list. A hardcoded list is the mechanism of the original defect: README.md would have been on
-# it; netlify.toml and llms-full.txt would not. Two independent assertions run per discovery:
-#   (a) CROSS-SURFACE — every digest pinned against the same ref must be identical. Pure string
+# it; netlify.toml and llms-full.txt would not. Three independent assertions run per discovery:
+#   (a) REF SHAPE     — the pinned ref itself must be an immutable release tag (vX.Y.Z), never
+#       a branch name or a bare commit SHA. This is the exact defect v2.4.2 shipped: ship.sh's
+#       README SHA-pin step captured `git rev-parse HEAD` — the release commit's PARENT,
+#       indistinguishable by shape from any other 40-hex string — instead of the tag
+#       sync-release.sh had just written, permanently downgrading the pin (the semver rewrite
+#       in bin/heimdall-render-version only ever matches vX.Y.Z-shaped tokens, so a SHA pin can
+#       never repair itself on a later render). Checked directly on the ref token, independent
+#       of whether its bytes happen to also match the pinned digest.
+#   (b) CROSS-SURFACE — every digest pinned against the same ref must be identical. Pure string
 #       comparison: no network, no git, catches the shipped defect on a plane.
-#   (b) DIGEST↔BYTES  — each digest must equal the real sha256 of install.sh at the ref its own
+#   (c) DIGEST↔BYTES  — each digest must equal the real sha256 of install.sh at the ref its own
 #       URL fetches. Resolved OFFLINE from local git objects when the ref is in the checkout
 #       (works in CI, offline, and when GitHub is rate-limited); a bounded network fetch is the
 #       fallback ONLY for a ref this checkout does not have. An unreachable network yields a
@@ -254,6 +262,19 @@ NORM
 $(VERSION_DRIFT_REPO="$TMP" HEIMDALL_SITE_DIR="$NO_SITE" bash "$SELF_DIR/version-drift.test.sh" --list-digests 2>/dev/null | awk -F'|' 'NF&&$4=="repo"{print $5}' | sort -u)
 VOID
   assert_red "every pinned digest removed" "VACUOUS"
+
+  # Mutant 9b — THE REF ITSELF IS NOT A TAG. A branch name (here `main`) is force-movable —
+  # exactly what pinning a release install command exists to prevent — and this is precisely
+  # how the pin can regress the moment something captures a moving ref instead of the tag that
+  # was just created (release/ship.sh's old bump_readme_sha step did exactly that via a
+  # premature `git rev-parse HEAD`, fixed in the same change that added this mutant). Proven
+  # directly on the ref token so it is caught even if a moved ref's bytes still happen to match
+  # the digest — a case the digest↔bytes check alone cannot see.
+  fresh_copy
+  MUT_SITE="$NO_SITE"
+  sed -E "s#(raw\.githubusercontent\.com/[^/]+/heimdall/)${SELF_TAG}(/install\.sh)#\1main\2#g" "$TMP/README.md" > "$TMP/README.md.mut" \
+    && mv "$TMP/README.md.mut" "$TMP/README.md"
+  assert_red "README install ref pinned to branch 'main' instead of $SELF_TAG" "is NOT a release tag"
 
   # ── Scaffolding-exclusion mutants (surface 7) ────────────────────────────────
   # These three pin the FALSE-POSITIVE class, in all three directions: the fixture must be
@@ -714,7 +735,20 @@ else
     DREF_DIGESTS="$(digest_records | awk -F'|' -v r="$dref" 'NF&&$1==r{print $2}' | sort -u)"
     DREF_COUNT="$(printf '%s\n' "$DREF_DIGESTS" | grep -c .)"
 
-    # (a) CROSS-SURFACE — offline, string-only. This alone catches the shipped defect:
+    # (a) REF SHAPE — the ref itself must be an immutable release tag, never a movable branch
+    # name or a bare commit SHA. This is exactly the defect this session shipped and fixed:
+    # release/ship.sh's old bump_readme_sha step pinned `git rev-parse HEAD` (the release
+    # commit's PARENT) instead of the tag release/sync-release.sh had just written. Asserted
+    # directly on $dref so it fails even if a moved ref's bytes still happen to match the
+    # pinned digest — a case check (c) below cannot see.
+    if printf '%s' "$dref" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+      ok "pinned install ref '$dref' is an immutable release tag"
+    else
+      bad "pinned install ref '$dref' is NOT a release tag — branch names are force-movable and bare commit SHAs are opaque/unverifiable; every pinned install one-liner must freeze to vX.Y.Z:"
+      digest_records | awk -F'|' -v r="$dref" 'NF&&$1==r{printf "         pinned at %s:%s:%s\n", $4, $5, $6}' | sort -u
+    fi
+
+    # (b) CROSS-SURFACE — offline, string-only. This alone catches the shipped defect:
     # README said fafe31e3… while netlify.toml said 28bbdcd… for the same install.sh.
     if [ "$DREF_COUNT" -gt 1 ]; then
       bad "pinned install digest DISAGREEMENT for ref $dref — $DREF_COUNT different digests describe the SAME file; at most one can be right and every surface pinning the others aborts the install:"
@@ -723,7 +757,7 @@ else
       ok "pinned install digests agree across all surfaces for ref $dref ($DREF_DIGESTS)"
     fi
 
-    # (b) DIGEST↔BYTES — local git objects first: offline, immune to rate limits, and the
+    # (c) DIGEST↔BYTES — local git objects first: offline, immune to rate limits, and the
     # blob at a given ref is content-addressed, so it is byte-identical to what the URL serves.
     DACTUAL=""; DSRC=""
     if git -C "$REPO" cat-file -e "$dref:install.sh" 2>/dev/null; then
