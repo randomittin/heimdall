@@ -86,7 +86,7 @@ No sudo. Idempotent — re-run to upgrade. `hmd uninstall` reverses all of it.
 
 <!-- HEIMDALL:PIN:TAG,SHA256:BEGIN -->
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/af7e195ffba3ddcb1098ea942dfd798d4b1ed26c/install.sh -o heimdall-install.sh \
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.4.2/install.sh -o heimdall-install.sh \
   && echo "1f725f40dcba17544c254f051e4f11770544792dab6810d2f2188a23b4c96ffa  heimdall-install.sh" | shasum -a 256 -c - \
   && bash heimdall-install.sh
 ```
@@ -100,7 +100,7 @@ digest. Re-derive it yourself any time:
 
 <!-- HEIMDALL:PIN:TAG,SHA256:BEGIN -->
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/af7e195ffba3ddcb1098ea942dfd798d4b1ed26c/install.sh | shasum -a 256
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.4.2/install.sh | shasum -a 256
 # 1f725f40dcba17544c254f051e4f11770544792dab6810d2f2188a23b4c96ffa
 ```
 <!-- HEIMDALL:PIN:END -->
@@ -115,7 +115,7 @@ hmd uninstall    # removes everything; nothing else was touched
 
 <!-- HEIMDALL:PIN:TAG,SHA256:BEGIN -->
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/af7e195ffba3ddcb1098ea942dfd798d4b1ed26c/install.sh -o heimdall-install.sh
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.4.2/install.sh -o heimdall-install.sh
 echo "1f725f40dcba17544c254f051e4f11770544792dab6810d2f2188a23b4c96ffa  heimdall-install.sh" | shasum -a 256 -c -
 less heimdall-install.sh  # function-wrapped, no eval, no base64 — what you read is what runs
 bash heimdall-install.sh
