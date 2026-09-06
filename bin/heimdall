@@ -2465,6 +2465,27 @@ case "${1:-}" in
     if [ -x "$_cav" ]; then exec "$_cav" "$@"; fi
     echo "error: heimdall-caveman-compliance not found at $_cav" >&2; exit 2
     ;;
+  cost-forensics)
+    # Portable Claude-API token/cost forensics over YOUR OWN local session
+    # transcripts (bin/heimdall-cost-forensics). Productionizes what used to
+    # be a single-repo, single-operator ad hoc analysis
+    # (docs/analysis/token-spend-forensics.{py,md}) into a zero-config tool:
+    # scans ~/.claude/projects by default (--root / HMD_COST_FORENSICS_ROOT
+    # to point elsewhere), dedups by message.id, prices per-model against a
+    # sourced table, and reports token-share vs dollar-share plus a
+    # high-vs-low-context cost comparison gated by sparse-data guards. Never
+    # sends data anywhere, never needs a key, never writes a file, never
+    # prints anything but aggregates -- see its own --help for the full
+    # privacy guarantee. Named "cost-forensics" rather than "cost-report" to
+    # avoid colliding with bin/heimdall-cost-report (an unrelated, existing
+    # tool that governs hmd's OWN GCP infra spend -- Firestore/Cloud Run
+    # billing, not Claude API token spend); that tool is invoked directly by
+    # path and has no arm in this dispatcher.
+    shift
+    _costf="$(cd "$(dirname "$0")" && pwd)/heimdall-cost-forensics"
+    if [ -x "$_costf" ]; then exec "$_costf" "$@"; fi
+    echo "error: heimdall-cost-forensics not found at $_costf" >&2; exit 2
+    ;;
   caveman-eval)
     # Real, honest, three-arm token-compression EVAL for the caveman levels
     # themselves -- a different gap than caveman-audit's read-back above.
