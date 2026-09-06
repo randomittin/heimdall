@@ -344,24 +344,95 @@ run_one() {
   printf '%s\n' "$t1" >"$WORK/$idx.t1"
 }
 
+# ── INCREMENTAL PROGRESS + HEARTBEAT ─────────────────────────────────────────────────────
+# WHY THIS EXISTS: with no output between the startup banner above and the final
+# table/summary/receipt far below, a healthy sweep 20+ minutes into one slow suite is
+# byte-identical, piped to a log, to a DEAD one — both show a handful of startup lines and
+# nothing since. That measurably caused "nothing is running" misreports on a healthy sweep,
+# and "sweep is running" misreports on one that had already exited, in the same session.
+# One line per suite completion, plus a heartbeat naming whatever is still in flight, fixes
+# that without changing a single byte of CLASSIFY RESULTS / TABLE / SUMMARY / SWEEP RECEIPT
+# below (see test/run-all-progress.test.sh section 3 for the byte-for-byte proof) —
+# deliberately DUPLICATING their tiny rc/counts -> status classification here rather than
+# sharing it, so this stays purely additive and can never perturb that byte-sensitive block.
+#
+# _progress_fields IDX — sets PROG_P / PROG_F / PROG_STATUS from suite IDX's recorded rc
+# and parsed output. Plain printf is already a direct unbuffered write(2) — nothing extra
+# (e.g. stdbuf) is needed for a line to land the instant it is produced, including into a
+# piped logfile.
+_progress_fields() {
+  local idx="$1" rc counts
+  rc="$(cat "$WORK/$idx.rc" 2>/dev/null || echo 99)"
+  counts="$(parse_counts "$WORK/$idx.out")"
+  if [ -n "$counts" ]; then PROG_P="${counts% *}"; PROG_F="${counts#* }"; else PROG_P="?"; PROG_F="?"; fi
+  if [ "$rc" = "124" ]; then PROG_STATUS="TIMEOUT"
+  elif [ "$rc" != "0" ]; then PROG_STATUS="FAIL"
+  elif [ "$PROG_P" = "?" ]; then PROG_STATUS="UNPARSED"
+  elif [ "$PROG_F" != "0" ]; then PROG_STATUS="DISCREP"
+  else PROG_STATUS="PASS"
+  fi
+}
+# _progress_line PHASE DONE TOTAL IDX — one line the instant suite IDX finishes.
+_progress_line() {
+  local phase="$1" d="$2" tot="$3" idx="$4" name dur el
+  name="$(basename "${RUN[$idx]}")"
+  dur="$(cat "$WORK/$idx.dur" 2>/dev/null || echo 0)"
+  _progress_fields "$idx"
+  el=$(( $(date +%s) - START ))
+  printf 'progress [%ss elapsed] %s %d/%d %-9s %-52s %ss  %s passed, %s failed\n' \
+    "$el" "$phase" "$d" "$tot" "$PROG_STATUS" "$name" "$dur" "$PROG_P" "$PROG_F"
+}
+# _heartbeat_check — piggybacks on the EXECUTE loop's own `sleep 0.2` poll tick below; adds
+# no timer, no background process, no polling loop of its own. HEIMDALL_HEARTBEAT_SECS lets
+# a test shrink the ~30s production silence threshold; unset in production, default 30.
+_heartbeat_check() {
+  local now threshold n k names
+  threshold="${HEIMDALL_HEARTBEAT_SECS:-30}"
+  now=$(date +%s)
+  [ $((now - LAST_PROGRESS_T)) -ge "$threshold" ] || return 0
+  n=${#alive_idx[@]}
+  [ "$n" -gt 0 ] || return 0
+  names=""
+  for ((k=0; k<n; k++)); do
+    names="$names $(basename "${RUN[${alive_idx[$k]}]}")"
+  done
+  printf 'heartbeat [%ss elapsed] still running (%d):%s\n' "$((now - START))" "$n" "$names"
+  LAST_PROGRESS_T=$now
+}
+
 START=$(date +%s)
 PIDS=()
+PIDIDX=()
 next=0
 launched=0
+NDONE=0
+LAST_PROGRESS_T=$START
 while [ "$next" -lt "$TO_RUN" ] || [ ${#PIDS[@]} -gt 0 ]; do
   while [ ${#PIDS[@]} -lt "$JOBS" ] && [ "$next" -lt "$TO_RUN" ]; do
     run_one "$next" "${RUN[$next]}" &
     PIDS+=($!)
+    PIDIDX+=("$next")
     next=$((next + 1))
     launched=$((launched + 1))
     if [ -t 1 ]; then printf '\r  running %d/%d ...' "$launched" "$TO_RUN"; fi
   done
   sleep 0.2
-  alive=()
-  for p in ${PIDS[@]+"${PIDS[@]}"}; do
-    kill -0 "$p" 2>/dev/null && alive+=("$p")
+  alive=(); alive_idx=()
+  n_pids=${#PIDS[@]}
+  for ((k=0; k<n_pids; k++)); do
+    p="${PIDS[$k]}"
+    if kill -0 "$p" 2>/dev/null; then
+      alive+=("$p")
+      alive_idx+=("${PIDIDX[$k]}")
+    else
+      NDONE=$((NDONE + 1))
+      _progress_line run "$NDONE" "$TO_RUN" "${PIDIDX[$k]}"
+      LAST_PROGRESS_T=$(date +%s)
+    fi
   done
   PIDS=(${alive[@]+"${alive[@]}"})
+  PIDIDX=(${alive_idx[@]+"${alive_idx[@]}"})
+  _heartbeat_check
 done
 [ -t 1 ] && printf '\r%*s\r' 44 ''
 
@@ -370,6 +441,14 @@ done
 # is therefore never reported until it has been reproduced with the suite running by itself.
 FLAKY=()
 if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
+  # Cheap prepass (just reads already-written tiny .rc files, same pattern CLASSIFY RESULTS
+  # below already does 3x per suite) so each retry's progress line can carry a real N/total
+  # instead of an unknown denominator.
+  total_reds=0
+  for i in $(seq 0 $((TO_RUN - 1))); do
+    rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
+    [ "$rc" != "0" ] && total_reds=$((total_reds + 1))
+  done
   retried=0
   for i in $(seq 0 $((TO_RUN - 1))); do
     rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
@@ -387,6 +466,7 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
     run_one "$i" "${RUN[$i]}"
     newrc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
     [ "$newrc" = "0" ] && FLAKY+=("${RUN[$i]}")
+    _progress_line retry "$retried" "$total_reds" "$i"
   done
   [ -t 1 ] && printf '\r%*s\r' 44 ''
 fi
