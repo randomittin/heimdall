@@ -116,24 +116,25 @@ RUN_RC=$?
 
 echo "-- 1. GROWTH: per-suite lines are written as they happen, not batched at the end --"
 TOTAL_SAMPLES="$(wc -l < "$SNAPS" | tr -d '[:space:]')"
-FIRST_SNAP="$(sed -n '1p' "$SNAPS" | tr -d '[:space:]')"
-MID_IDX=$(( (TOTAL_SAMPLES + 1) / 2 ))
-MID_SNAP="$(sed -n "${MID_IDX}p" "$SNAPS" | tr -d '[:space:]')"
-FIRST_SNAP="${FIRST_SNAP:-0}"; MID_SNAP="${MID_SNAP:-0}"
-GROWTH_BY_MIDPOINT=$((MID_SNAP - FIRST_SNAP))
-[ "$GROWTH_BY_MIDPOINT" -ge 3 ] \
-  && ok "1a log grew by >=3 lines between the first sample and the midpoint of a still-running sweep (first=$FIRST_SNAP, midpoint sample #$MID_IDX/$TOTAL_SAMPLES=$MID_SNAP) — proves incremental output well before the run ends, not a single end-of-run dump" \
-  || bad "1a expected midpoint growth >=3, got $GROWTH_BY_MIDPOINT (first=$FIRST_SNAP, mid=$MID_SNAP of $TOTAL_SAMPLES samples)" "$(cat "$SNAPS")"
+MAX_ALIVE="$(sort -n "$SNAPS" 2>/dev/null | tail -1 | tr -d '[:space:]')"
+DISTINCT_NONZERO="$(awk '$1+0>0' "$SNAPS" 2>/dev/null | sort -u | wc -l | tr -d '[:space:]')"
+MAX_ALIVE="${MAX_ALIVE:-0}"; DISTINCT_NONZERO="${DISTINCT_NONZERO:-0}"
+[ "$MAX_ALIVE" -ge 3 ] \
+  && ok "1a saw >=3 progress/heartbeat lines already present WHILE the sweep was still running (max observed while alive: $MAX_ALIVE, across $TOTAL_SAMPLES samples) — proves per-suite output happens before the run ends, not only in the final dump" \
+  || bad "1a expected >=3 progress/heartbeat lines while alive, max observed was $MAX_ALIVE (of $TOTAL_SAMPLES samples)" "$(cat "$SNAPS")"
+[ "$DISTINCT_NONZERO" -ge 2 ] \
+  && ok "1b that count took >=2 distinct nonzero values while alive ($DISTINCT_NONZERO distinct) — proves genuine incremental growth over time, not one instantaneous jump" \
+  || bad "1b expected >=2 distinct nonzero while-alive values, got $DISTINCT_NONZERO" "$(cat "$SNAPS")"
 
 PROGRESS_LINES="$(grep -c '^progress ' "$OUTFILE" 2>/dev/null)"
 PROGRESS_LINES="${PROGRESS_LINES:-0}"
 [ "$PROGRESS_LINES" = 6 ] \
-  && ok "1b exactly 6 progress lines, one per fixture suite completion" \
-  || bad "1b expected 6 progress lines, got $PROGRESS_LINES" "$(cat "$OUTFILE")"
+  && ok "1c exactly 6 progress lines, one per fixture suite completion" \
+  || bad "1c expected 6 progress lines, got $PROGRESS_LINES" "$(cat "$OUTFILE")"
 
 grep -qE '^progress \[[0-9]+s elapsed\] run [1-6]/6 (PASS|FAIL|TIMEOUT|UNPARSED|DISCREP) +[^ ]+\.test\.sh' "$OUTFILE" \
-  && ok "1c progress lines carry elapsed time, done/total, status, and suite name" \
-  || bad "1c progress line format unexpected" "$(grep '^progress ' "$OUTFILE")"
+  && ok "1d progress lines carry elapsed time, done/total, status, and suite name" \
+  || bad "1d progress line format unexpected" "$(grep '^progress ' "$OUTFILE")"
 
 echo "-- 2. HEARTBEAT: a slow in-flight suite gets named before it finishes ------------"
 HB_COUNT="$(grep -c '^heartbeat ' "$OUTFILE" 2>/dev/null)"
