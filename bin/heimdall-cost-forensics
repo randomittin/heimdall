@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+# heimdall-cost-forensics — portable Claude-API token/cost forensics over your
+# OWN local session transcripts.
+#
+# WHY THIS EXISTS: every cost/token analysis this project had produced before
+# this tool (docs/analysis/token-spend-forensics.{py,md}) was n=1 — one repo,
+# one operator, one machine, with hardcoded transcript roots and a single-tier
+# pricing table. A stranger reading those docs had no way to reproduce the
+# analysis on their OWN repo. This tool is that ad hoc script, productionized:
+# zero-config, per-model pricing, honest degradation on sparse data.
+#
+# PRIVACY GUARANTEE (mechanical, not a promise): this tool reads local Claude
+# Code session transcripts (JSONL under ~/.claude/projects/**, or --root paths
+# you name) and NEVER sends anything anywhere, NEVER requires an API key or
+# network access, and NEVER writes any file. From each transcript record it
+# reads ONLY message.id, message.model, message.usage (token counts) and the
+# record timestamp — it never reads or prints message.content, tool inputs or
+# outputs, file contents, or any other prompt/transcript text. Every number
+# this tool prints is an aggregate (a sum, a mean, a percentile, a ratio) —
+# never a verbatim excerpt of anything you or Claude wrote. This is proven,
+# not just asserted: test/heimdall-cost-forensics.test.sh plants a distinctive
+# secret-looking string inside a fixture's message.content and asserts it
+# never appears in this tool's stdout, stderr, or --json output.
+#
+# PRICING SOURCE: the claude-api skill's pricing table (cached 2026-06-24) —
+# see PRICING / PRICING_SOURCE below for the exact $/MTok figures and cache
+# multipliers cited. If a transcript names a model this table doesn't know,
+# this tool NEVER invents a price for it: that model's tokens are still
+# counted and reported, but excluded from every dollar figure, and the model
+# is named in an "unpriced models" list so you know your dollar totals are a
+# floor, not a ceiling.
+#
+# HONEST DEGRADATION ON SPARSE DATA: this repo has already been burned once by
+# an n=10 measurement that turned out to be 20-46% sampling noise (see
+# docs/analysis/2026-08-30-caveman-eval-measurement.md, and the corpus grown
+# n=10 -> n=30 in commit fb8bd95 as a direct result). The high-vs-low-context
+# cost comparison below refuses to run at all under MIN_REQUESTS_FOR_REGIME
+# requests, and refuses again if the two operating points it finds aren't at
+# least MIN_SPREAD_RATIO apart — printing an explicit "not enough data" or
+# "not enough spread" message instead of a confident-looking but noise-driven
+# ratio.
+#
+# USAGE:
+#   heimdall-cost-forensics [--root PATH]... [--json] [--min-requests N]
+#
+#   --root PATH        Scan PATH (a directory, walked recursively for *.jsonl,
+#                       or a single *.jsonl file). Repeatable. Default: scan
+#                       $HMD_COST_FORENSICS_ROOT (colon-separated paths) if
+#                       set, else ~/.claude/projects (ALL projects — this
+#                       tool is not hardcoded to any one repo's slug).
+#   --json              Emit a single machine-readable JSON object instead of
+#                       the human-readable report.
+#   --min-requests N    Minimum distinct requests required before the
+#                       high-vs-low-context regime comparison will run.
+#                       Default 30 (see "HONEST DEGRADATION" above).
+#   -h, --help          Print this header and exit 0.
+#
+# Exit status: 0 on a successful run (including the honest "no transcripts
+# found" / "not enough data" cases — those are valid outcomes, not failures).
+# 2 on a bad CLI invocation (unrecognized flag, missing argument).
+
+import json
+import os
+import re
+import sys
+
+# ── Pricing table ($/MTok) ────────────────────────────────────────────────
+# Source: the claude-api skill's pricing table, cached 2026-06-24. Cache
+# multipliers (documented there and cross-checked against
+# docs/analysis/2026-09-02-input-context-cost.md): cache READ = 0.1x the
+# model's own input price, cache WRITE at the 5-minute TTL = 1.25x input,
+# cache WRITE at the 1-hour TTL = 2.0x input, OUTPUT = 5x input — uniform
+# across every current model with one documented exception: Claude Fable 5.1
+# prices cache reads at a flat $0.25/MTok rather than 0.1x its $10 input rate.
+# Claude Mythos 5.1's cache-read rate was explicitly UNCONFIRMED at launch
+# (may or may not share Fable 5.1's flat rate) — left unpriced (None) rather
+# than assumed, so it shows up in "unpriced" rather than silently guessed.
+PRICING_SOURCE = (
+    "claude-api skill pricing table (cached 2026-06-24); cache multipliers "
+    "vs that model's own input price: read=0.1x (Claude Fable 5.1 is a "
+    "documented flat-rate exception at $0.25/MTok; Claude Mythos 5.1's read "
+    "rate was unconfirmed at launch and is left unpriced here), "
+    "write-5m-TTL=1.25x, write-1h-TTL=2.0x, output=5x."
+)
+PRICING = {
+    "claude-fable-5-1": dict(input=10.00, output=50.00, cache_read=0.25, cache_write_5m=12.50, cache_write_1h=20.00),
+    "claude-mythos-5-1": dict(input=10.00, output=50.00, cache_read=None, cache_write_5m=12.50, cache_write_1h=20.00),
+    "claude-fable-5": dict(input=10.00, output=50.00, cache_read=1.00, cache_write_5m=12.50, cache_write_1h=20.00),
+    "claude-opus-5": dict(input=5.00, output=25.00, cache_read=0.50, cache_write_5m=6.25, cache_write_1h=10.00),
+    "claude-opus-4-8": dict(input=5.00, output=25.00, cache_read=0.50, cache_write_5m=6.25, cache_write_1h=10.00),
+    "claude-opus-4-7": dict(input=5.00, output=25.00, cache_read=0.50, cache_write_5m=6.25, cache_write_1h=10.00),
+    "claude-opus-4-6": dict(input=5.00, output=25.00, cache_read=0.50, cache_write_5m=6.25, cache_write_1h=10.00),
+    "claude-sonnet-5": dict(input=2.00, output=10.00, cache_read=0.20, cache_write_5m=2.50, cache_write_1h=4.00),
+    "claude-sonnet-4-6": dict(input=3.00, output=15.00, cache_read=0.30, cache_write_5m=3.75, cache_write_1h=6.00),
+    "claude-haiku-4-5": dict(input=1.00, output=5.00, cache_read=0.10, cache_write_5m=1.25, cache_write_1h=2.00),
+}
+_MTOK = 1_000_000.0
+_DATE_SUFFIX_RE = re.compile(r"-\d{8}$")
+_FIELDS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+
+# Sparse-data guards for the high-vs-low-context regime comparison. See the
+# "HONEST DEGRADATION" header comment above for the incident these calibrate
+# against.
+MIN_REQUESTS_FOR_REGIME = 30
+MIN_GROUP_FOR_REGIME = 5
+MIN_SPREAD_RATIO = 2.0
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def usage(code):
+    here = os.path.abspath(__file__)
+    try:
+        with open(here, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        for ln in lines[1:]:
+            if not ln.startswith("#"):
+                break
+            eprint(ln[1:].rstrip("\n").lstrip(" "))
+    except OSError:
+        eprint("heimdall-cost-forensics — portable Claude-API token/cost forensics")
+    sys.exit(code)
+
+
+def _as_int(v):
+    """Robust non-negative int coercion: bad/missing values count as 0."""
+    try:
+        n = int(v)
+        return n if n >= 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_model(model):
+    """Strip a trailing dated-snapshot suffix (-YYYYMMDD) to match PRICING's
+    bare model ids. e.g. claude-sonnet-5-20260301 -> claude-sonnet-5.
+    """
+    if not model or not isinstance(model, str):
+        return None
+    return _DATE_SUFFIX_RE.sub("", model)
+
+
+def price_for(model):
+    """Return (rate_dict_or_None, canonical_name_or_None). Never invents a
+    price for a model PRICING doesn't list — returns None so the caller must
+    treat that model's tokens as unpriced.
+    """
+    canon = normalize_model(model)
+    return PRICING.get(canon), canon
+
+
+def extract_request(record):
+    """Return (message_id, model, ctx) for one usage-bearing assistant record,
+    or None if this record carries no usage.
+
+    ctx keys: input, output, cache_read, cache_write_5m, cache_write_1h,
+    cache_write_fallback (True if cache_write_5m came from the flat legacy
+    `cache_creation_input_tokens` field because the nested 5m/1h breakdown was
+    absent — assumed 5m-TTL priced; documented, never silent).
+
+    PRIVACY: reads ONLY message.id / message.model / message.usage from the
+    record. Never touches message.content or any other field — this is the
+    mechanical enforcement of the privacy guarantee in the header comment.
+    """
+    if not isinstance(record, dict) or record.get("type") != "assistant":
+        return None
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+    usage_obj = message.get("usage")
+    if not isinstance(usage_obj, dict):
+        return None
+    message_id = message.get("id")
+    model = message.get("model")
+    creation = usage_obj.get("cache_creation")
+    fallback = False
+    if isinstance(creation, dict) and (
+        creation.get("ephemeral_5m_input_tokens") or creation.get("ephemeral_1h_input_tokens")
+    ):
+        write_5m = _as_int(creation.get("ephemeral_5m_input_tokens"))
+        write_1h = _as_int(creation.get("ephemeral_1h_input_tokens"))
+    else:
+        flat = _as_int(usage_obj.get("cache_creation_input_tokens"))
+        write_5m = flat
+        write_1h = 0
+        fallback = flat > 0
+    ctx = {
+        "input": _as_int(usage_obj.get("input_tokens")),
+        "output": _as_int(usage_obj.get("output_tokens")),
+        "cache_read": _as_int(usage_obj.get("cache_read_input_tokens")),
+        "cache_write_5m": write_5m,
+        "cache_write_1h": write_1h,
+        "cache_write_fallback": fallback,
+    }
+    return message_id, model, ctx
+
+
+def iter_requests(path):
+    """Yield (model, ctx, timestamp) once per DISTINCT API request in a
+    transcript JSONL, deduped by message.id.
+
+    WHY dedup matters (a proven correctness trap in this codebase): one API
+    request is serialized as MULTIPLE JSONL lines (one per content block —
+    thinking / text / each tool_use), and every line repeats the identical
+    message.usage object. Counting every line instead of every distinct
+    message.id overstates every usage figure by however many content blocks
+    the average request has (documented elsewhere in this repo at ~2.3x).
+    This is exactly the dedup docs/analysis/token-spend-forensics.py's
+    iter_requests() does; bin/heimdall-tokens:sum_session (line ~290) was
+    considered for reuse per this project's pattern-discipline convention but
+    was NOT reused here because it has no message.id dedup at all — it sums
+    every usage-bearing JSONL line, so reusing it would silently reintroduce
+    the overcounting bug this function exists to avoid.
+    """
+    seen = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                extracted = extract_request(record)
+                if extracted is None:
+                    continue
+                message_id, model, ctx = extracted
+                if message_id is not None:
+                    if message_id in seen:
+                        continue
+                    seen.add(message_id)
+                ts = record.get("timestamp") if isinstance(record, dict) else None
+                yield model, ctx, ts
+    except OSError as e:
+        eprint("warning: could not read %s: %s" % (path, e))
+        return
+
+
+def discover_roots(cli_roots):
+    if cli_roots:
+        return list(cli_roots)
+    env = os.environ.get("HMD_COST_FORENSICS_ROOT")
+    if env:
+        return [p for p in env.split(":") if p]
+    return [os.path.join(os.path.expanduser("~"), ".claude", "projects")]
+
+
+def discover_files(roots):
+    """Walk every root for *.jsonl files. A root may itself be a single
+    *.jsonl file (handy for pointing at one fixture/transcript directly).
+    Never raises on a missing/unreadable root — just yields nothing for it.
+    """
+    files = []
+    for root in roots:
+        if os.path.isfile(root):
+            if root.endswith(".jsonl"):
+                files.append(root)
+            continue
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, names in os.walk(root):
+            for name in names:
+                if name.endswith(".jsonl"):
+                    files.append(os.path.join(dirpath, name))
+    return sorted(files)
+
+
+def request_cost(ctx, prices, field_dollars):
+    """Return (cost_or_None, unpriced_tokens) for one request, accumulating
+    the EXACT per-field dollar contribution of this one request into the
+    caller's running field_dollars dict (keyed by the _FIELDS names).
+
+    prices is the rate dict for this request's model, or None if the model is
+    entirely unknown to PRICING. Even when prices IS known, an individual
+    field's rate can still be None (e.g. Mythos 5.1's cache_read) — that
+    field's tokens are counted but excluded from the dollar total, and
+    reported back via unpriced_tokens rather than silently dropped.
+    """
+    unpriced = 0
+    if prices is None:
+        for field in _FIELDS:
+            unpriced += ctx[field]
+        return None, unpriced
+    cost = 0.0
+    for field in _FIELDS:
+        n = ctx[field]
+        rate = prices.get(field)
+        if rate is None:
+            unpriced += n
+        else:
+            d = n * rate / _MTOK
+            cost += d
+            field_dollars[field] += d
+    return cost, unpriced
+
+
+def percentile(sorted_vals, pct):
+    """Nearest-rank-with-interpolation percentile. No numpy/statistics dep —
+    a small, auditable implementation the report can point at directly.
+    """
+    if not sorted_vals:
+        return None
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    k = (len(sorted_vals) - 1) * (pct / 100.0)
+    f = int(k)
+    c = min(f + 1, len(sorted_vals) - 1)
+    if f == c:
+        return sorted_vals[f]
+    return sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f)
+
+
+def mean(vals):
+    return sum(vals) / len(vals) if vals else None
+
+
+def stdev(vals):
+    if len(vals) < 2:
+        return None
+    m = mean(vals)
+    var = sum((v - m) ** 2 for v in vals) / (len(vals) - 1)
+    return var ** 0.5
+
+
+def regime_comparison(contexts, min_requests):
+    """contexts: list of (context_tokens, cost_or_None, model_key), one per
+    request. Returns a dict describing the high-vs-low-context comparison, OR
+    an honest-degradation dict with reason=... and no ratio, if either
+    sparse-data guard fails. Never fabricates a ratio from a population too
+    small or too narrow to support one.
+    """
+    n = len(contexts)
+    if n < min_requests:
+        return {
+            "available": False,
+            "reason": (
+                "only %d distinct request(s) found; need at least %d before "
+                "computing a high-vs-low-context comparison (see the "
+                "HONEST DEGRADATION note in --help)." % (n, min_requests)
+            ),
+        }
+    by_ctx = sorted(contexts, key=lambda t: t[0])
+    quartile = max(1, n // 4)
+    low_group = by_ctx[:quartile]
+    high_group = by_ctx[-quartile:]
+    if len(low_group) < MIN_GROUP_FOR_REGIME or len(high_group) < MIN_GROUP_FOR_REGIME:
+        return {
+            "available": False,
+            "reason": (
+                "quartile groups too small (%d each) to compare; need at "
+                "least %d per group." % (min(len(low_group), len(high_group)), MIN_GROUP_FOR_REGIME)
+            ),
+        }
+    low_ctx_mean = mean([c for c, _cost, _m in low_group])
+    high_ctx_mean = mean([c for c, _cost, _m in high_group])
+    if not low_ctx_mean or (high_ctx_mean / low_ctx_mean) < MIN_SPREAD_RATIO:
+        spread = (high_ctx_mean / low_ctx_mean) if low_ctx_mean else float("inf")
+        return {
+            "available": False,
+            "reason": (
+                "high-context group's mean (%d tok) is only %.2fx the "
+                "low-context group's mean (%d tok); need at least %.1fx "
+                "spread for the two groups to represent meaningfully "
+                "different operating points, not noise inside one "
+                "population." % (high_ctx_mean, spread, low_ctx_mean, MIN_SPREAD_RATIO)
+            ),
+        }
+    low_costs = [cost for _c, cost, _m in low_group if cost is not None]
+    high_costs = [cost for _c, cost, _m in high_group if cost is not None]
+    if len(low_costs) < MIN_GROUP_FOR_REGIME or len(high_costs) < MIN_GROUP_FOR_REGIME:
+        return {
+            "available": False,
+            "reason": (
+                "not enough priced requests in one or both context groups "
+                "(low=%d, high=%d priced) to compare cost/request — some "
+                "requests use a model outside the pricing table." % (len(low_costs), len(high_costs))
+            ),
+        }
+    low_cost_mean = mean(low_costs)
+    high_cost_mean = mean(high_costs)
+    low_sd = stdev(low_costs)
+    high_sd = stdev(high_costs)
+    return {
+        "available": True,
+        "low_context_mean_tokens": round(low_ctx_mean),
+        "high_context_mean_tokens": round(high_ctx_mean),
+        "low_cost_mean_usd": round(low_cost_mean, 4),
+        "high_cost_mean_usd": round(high_cost_mean, 4),
+        "low_cost_stdev_usd": round(low_sd, 4) if low_sd is not None else None,
+        "high_cost_stdev_usd": round(high_sd, 4) if high_sd is not None else None,
+        "low_n": len(low_costs),
+        "high_n": len(high_costs),
+        "ratio": round(high_cost_mean / low_cost_mean, 2) if low_cost_mean else None,
+    }
+
+
+def scan(files, min_requests):
+    totals = {k: 0 for k in _FIELDS}
+    field_dollars = {k: 0.0 for k in _FIELDS}
+    fallback_tokens = 0
+    priced_cost_total = 0.0
+    unpriced_tokens_total = 0
+    unpriced_models = {}
+    per_model = {}
+    contexts = []
+    n_requests = 0
+    n_sessions = 0
+    ts_min = None
+    ts_max = None
+
+    for path in files:
+        file_had_request = False
+        for model, ctx, ts in iter_requests(path):
+            n_requests += 1
+            file_had_request = True
+            for k in _FIELDS:
+                totals[k] += ctx[k]
+            if ctx["cache_write_fallback"]:
+                fallback_tokens += ctx["cache_write_5m"]
+            prices, canon = price_for(model)
+            cost, unpriced = request_cost(ctx, prices, field_dollars)
+            key = canon or "(unknown model)"
+            slot = per_model.setdefault(
+                key, {"requests": 0, "tokens": 0, "cost": 0.0, "unpriced_tokens": 0}
+            )
+            slot["requests"] += 1
+            slot["tokens"] += sum(ctx[f] for f in _FIELDS)
+            slot["unpriced_tokens"] += unpriced
+            if cost is not None:
+                slot["cost"] += cost
+                priced_cost_total += cost
+            if unpriced:
+                unpriced_models[key] = unpriced_models.get(key, 0) + unpriced
+            unpriced_tokens_total += unpriced
+            context_tokens = ctx["input"] + ctx["cache_read"] + ctx["cache_write_5m"] + ctx["cache_write_1h"]
+            contexts.append((context_tokens, cost, key))
+            if ts:
+                if ts_min is None or ts < ts_min:
+                    ts_min = ts
+                if ts_max is None or ts > ts_max:
+                    ts_max = ts
+        if file_had_request:
+            n_sessions += 1
+
+    return {
+        "n_files": len(files),
+        "n_sessions": n_sessions,
+        "n_requests": n_requests,
+        "totals": totals,
+        "total_tokens": sum(totals.values()),
+        "field_dollars": field_dollars,
+        "fallback_tokens": fallback_tokens,
+        "priced_cost_total": priced_cost_total,
+        "unpriced_tokens_total": unpriced_tokens_total,
+        "unpriced_models": unpriced_models,
+        "per_model": per_model,
+        "contexts": contexts,
+        "ts_min": ts_min,
+        "ts_max": ts_max,
+        "min_requests": min_requests,
+    }
+
+
+def render_text(agg):
+    out = []
+    out.append("heimdall-cost-forensics")
+    out.append("pricing source: %s" % PRICING_SOURCE)
+    out.append(
+        "privacy: aggregates only (token counts, model ids, timestamps) — "
+        "never prompt/file/tool content. See --help for the full guarantee."
+    )
+    out.append("")
+    if agg["n_requests"] == 0:
+        out.append(
+            "No transcripts with usage data found under the scanned root(s) "
+            "(%d file(s) scanned). Nothing to report — this is an honest "
+            "empty result, not an error." % agg["n_files"]
+        )
+        return "\n".join(out)
+
+    out.append(
+        "scope: %d file(s), %d session(s), %d distinct request(s)%s"
+        % (
+            agg["n_files"], agg["n_sessions"], agg["n_requests"],
+            "" if not agg["ts_min"] else " (%s .. %s)" % (agg["ts_min"], agg["ts_max"]),
+        )
+    )
+    out.append("")
+
+    t = agg["totals"]
+    total_tok = agg["total_tokens"] or 1
+    out.append("── token totals ──")
+    for field, label in (
+        ("input", "input"), ("output", "output"),
+        ("cache_read", "cache read"),
+        ("cache_write_5m", "cache write (5m TTL)"),
+        ("cache_write_1h", "cache write (1h TTL)"),
+    ):
+        n = t[field]
+        out.append("  %-22s %14d tok  (%5.1f%% of tokens)" % (label, n, 100.0 * n / total_tok))
+    if agg["fallback_tokens"]:
+        out.append(
+            "  note: %d cache-write tok priced at the 5m-TTL assumption "
+            "(transcript lacked the nested 5m/1h breakdown)." % agg["fallback_tokens"]
+        )
+    out.append("")
+
+    out.append("── dollar totals (priced requests only) ──")
+    out.append("  total priced cost: $%.4f" % agg["priced_cost_total"])
+    if agg["unpriced_tokens_total"]:
+        models = ", ".join(sorted(agg["unpriced_models"]))
+        out.append(
+            "  %d tok excluded from every dollar figure above — model(s) not "
+            "in the pricing table: %s. Dollar totals here are a FLOOR, not a "
+            "ceiling." % (agg["unpriced_tokens_total"], models)
+        )
+    out.append(
+        "  note: cache-read's TOKEN share above overstates its true $ "
+        "weight (it prices at ~0.1x input); cache-write's token share "
+        "understates its $ weight (it prices at 1.25x-2.0x input)."
+    )
+    out.append("")
+
+    out.append("── ranked cost levers (by priced $, exact per-model) ──")
+    priced_total = sum(agg["field_dollars"].values()) or 1.0
+    ranked = sorted(agg["field_dollars"].items(), key=lambda kv: kv[1], reverse=True)
+    for field, dollars in ranked:
+        n = t[field]
+        if dollars == 0 and n == 0:
+            continue
+        out.append(
+            "  %-22s $%10.4f  (%5.1f%% of priced $)  %14d tok"
+            % (field.replace("_", " "), dollars, 100.0 * dollars / priced_total, n)
+        )
+    out.append("")
+
+    ctx_vals = sorted(c for c, _cost, _m in agg["contexts"])
+    if ctx_vals:
+        out.append("── context/request (input + cache_read + cache_write; excludes output) ──")
+        out.append("  mean:   %d tok" % round(mean(ctx_vals)))
+        for p in (50, 90, 99):
+            out.append("  p%-3d:   %d tok" % (p, round(percentile(ctx_vals, p))))
+        priced_costs = [cost for _c, cost, _m in agg["contexts"] if cost is not None]
+        if priced_costs:
+            out.append("  mean cost/request (priced requests only): $%.4f" % mean(priced_costs))
+        out.append("")
+
+    out.append("── spend by model ──")
+    for key in sorted(agg["per_model"], key=lambda k: agg["per_model"][k]["cost"], reverse=True):
+        slot = agg["per_model"][key]
+        unpriced_note = ""
+        if slot["unpriced_tokens"]:
+            unpriced_note = "  (%d tok unpriced)" % slot["unpriced_tokens"]
+        out.append(
+            "  %-24s %6d req  $%10.4f%s" % (key, slot["requests"], slot["cost"], unpriced_note)
+        )
+    out.append("")
+
+    out.append("── high-vs-low context regime comparison ──")
+    regime = regime_comparison(agg["contexts"], agg["min_requests"])
+    if not regime["available"]:
+        out.append("  not available: %s" % regime["reason"])
+    else:
+        out.append(
+            "  low-context group:  mean %d tok, mean cost $%.4f (stdev $%s, n=%d)"
+            % (
+                regime["low_context_mean_tokens"], regime["low_cost_mean_usd"],
+                "%.4f" % regime["low_cost_stdev_usd"] if regime["low_cost_stdev_usd"] is not None else "n/a",
+                regime["low_n"],
+            )
+        )
+        out.append(
+            "  high-context group: mean %d tok, mean cost $%.4f (stdev $%s, n=%d)"
+            % (
+                regime["high_context_mean_tokens"], regime["high_cost_mean_usd"],
+                "%.4f" % regime["high_cost_stdev_usd"] if regime["high_cost_stdev_usd"] is not None else "n/a",
+                regime["high_n"],
+            )
+        )
+        if regime["ratio"] is not None:
+            out.append("  ratio (high/low cost-per-request): %.2fx" % regime["ratio"])
+    return "\n".join(out)
+
+
+def render_json(agg):
+    regime = regime_comparison(agg["contexts"], agg["min_requests"]) if agg["n_requests"] else {
+        "available": False, "reason": "no requests found",
+    }
+    payload = {
+        "pricing_source": PRICING_SOURCE,
+        "privacy": (
+            "aggregates only (token counts, model ids, timestamps) — never "
+            "prompt/file/tool content"
+        ),
+        "n_files": agg["n_files"],
+        "n_sessions": agg["n_sessions"],
+        "n_requests": agg["n_requests"],
+        "ts_min": agg["ts_min"],
+        "ts_max": agg["ts_max"],
+        "totals_tokens": agg["totals"],
+        "total_tokens": agg["total_tokens"],
+        "fallback_cache_write_tokens": agg["fallback_tokens"],
+        "field_dollars": {k: round(v, 6) for k, v in agg["field_dollars"].items()},
+        "priced_cost_total_usd": round(agg["priced_cost_total"], 6),
+        "unpriced_tokens_total": agg["unpriced_tokens_total"],
+        "unpriced_models": agg["unpriced_models"],
+        "per_model": {
+            k: {
+                "requests": v["requests"],
+                "tokens": v["tokens"],
+                "cost_usd": round(v["cost"], 6),
+                "unpriced_tokens": v["unpriced_tokens"],
+            }
+            for k, v in agg["per_model"].items()
+        },
+        "regime_comparison": regime,
+    }
+    if agg["contexts"]:
+        ctx_vals = sorted(c for c, _cost, _m in agg["contexts"])
+        payload["context_mean_tokens"] = round(mean(ctx_vals))
+        payload["context_percentiles"] = {
+            "p50": round(percentile(ctx_vals, 50)),
+            "p90": round(percentile(ctx_vals, 90)),
+            "p99": round(percentile(ctx_vals, 99)),
+        }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def main(argv):
+    roots = []
+    as_json = False
+    min_requests = MIN_REQUESTS_FOR_REGIME
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            usage(0)
+        elif a == "--root":
+            i += 1
+            if i >= len(argv):
+                eprint("error: --root requires a path argument")
+                return 2
+            roots.append(argv[i])
+        elif a == "--json":
+            as_json = True
+        elif a == "--min-requests":
+            i += 1
+            if i >= len(argv):
+                eprint("error: --min-requests requires an integer argument")
+                return 2
+            try:
+                min_requests = int(argv[i])
+            except ValueError:
+                eprint("error: --min-requests must be an integer")
+                return 2
+        else:
+            eprint("error: unrecognized argument: %s" % a)
+            return 2
+        i += 1
+
+    resolved_roots = discover_roots(roots)
+    files = discover_files(resolved_roots)
+    agg = scan(files, min_requests)
+    if as_json:
+        print(render_json(agg))
+    else:
+        print(render_text(agg))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
