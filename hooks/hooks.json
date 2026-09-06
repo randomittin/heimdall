@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; \"$PLUGIN/bin/parallelism-tracker\" check Agent 2>&1 || true; printf '%s' \"$INPUT\" | \"$PLUGIN/bin/heimdall-precheck-agent\""
+            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; \"$PLUGIN/bin/parallelism-tracker\" check Agent || true; printf '%s' \"$INPUT\" | \"$PLUGIN/bin/heimdall-precheck-agent\""
           }
         ]
       },
