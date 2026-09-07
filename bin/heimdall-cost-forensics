@@ -135,7 +135,8 @@ def _as_int(v):
 
 def normalize_model(model):
     """Strip a trailing dated-snapshot suffix (-YYYYMMDD) to match PRICING's
-    bare model ids. e.g. claude-sonnet-5-20260301 -> claude-sonnet-5.
+    bare model ids — e.g. an id ending in -20260301 has that date suffix
+    removed, leaving the bare id PRICING keys on.
     """
     if not model or not isinstance(model, str):
         return None

@@ -85,9 +85,17 @@ SWEPT_PATHSPECS=(bin hooks agents commands skills modules sentinels deploy .clau
 #                               a pin in its CODE is still caught.
 #   bin/lib/tier-table.json     the no_pinned_ids note, which quotes the exact id
 #                               that rotted as its cautionary example.
+#   bin/heimdall-cost-forensics the PRICING dict ($/MTok rate table). It must
+#                               name each model id to PRICE it from a transcript
+#                               — this is data, never a spawn: the tool looks up
+#                               a rate for an id it already read, it launches
+#                               nothing. Scoped to the dict's own line shape
+#                               (`"claude-...": dict(input=`) only — a pin
+#                               anywhere else in the file is still caught.
 ALLOW_ROWS='bin/heimdall-bench|--model <id>|PIN_PROBE=claude-opus-4-8|heimdall-bench --live --model claude-
 bin/heimdall-model-resolve|HEIMDALL_MODEL_OPUS|PIN_PROBE=claude-opus-4-8|^#
-bin/lib/tier-table.json|no_pinned_ids|  "probe_pin": "claude-opus-4-8",|"no_pinned_ids"'
+bin/lib/tier-table.json|no_pinned_ids|  "probe_pin": "claude-opus-4-8",|"no_pinned_ids"
+bin/heimdall-cost-forensics|PRICING = {|PIN_PROBE=claude-opus-4-8|^    "claude-[a-z0-9-]+": dict\(input='
 
 # The agent templates whose routing tables an orchestrator reads before it spawns.
 ROUTING_TEMPLATES="agents/heimdall.md agents/architect.md agents/planner.md"
@@ -155,7 +163,16 @@ while IFS='|' read -r rel anchor probe ere; do
   # bench harness's own `--model <id>` help line), and without -e grep parses it as
   # an option and dies — which this gate then reported as a STALE exemption, a red
   # for entirely the wrong reason.
-  if ! grep -v '^[[:space:]]*#' "$REPO/$rel" | grep -Fq -e "$anchor"; then
+  #
+  # The downstream grep deliberately omits -q. Under `set -o pipefail` (above), a
+  # -q reader exits the instant it finds a match, which races the upstream
+  # `grep -v`: on a large file with an early anchor line, the writer can still have
+  # hundreds of lines left to emit when the reader closes the pipe early, the
+  # writer gets SIGPIPE, and pipefail reports THAT (exit 141) over the reader's
+  # real exit 0 — a STALE false-positive against a perfectly live anchor. Letting
+  # grep run to EOF (output discarded to /dev/null) keeps the identical
+  # 0-if-matched/1-if-not contract without the race.
+  if ! grep -v '^[[:space:]]*#' "$REPO/$rel" | grep -F -e "$anchor" >/dev/null; then
     bad "allowlist entry for $rel is STALE: no NON-COMMENT line contains '$anchor', so nothing proves this file is still the surface the exemption describes"
     ALLOW_OK=0; continue
   fi
