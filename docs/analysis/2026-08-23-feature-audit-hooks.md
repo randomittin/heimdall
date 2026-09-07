@@ -219,3 +219,14 @@ this audit's safety rules exclude.
    finding #2 predicts, caught in the act rather than inferred. No data was lost, because git stayed authoritative
    throughout and the file content was never in question — only the ledger's own count was false for that window.
    Recovered via the tool's own suggested remedy, `edit-tracker init`.
+8. **Items 5 and 6 in the "registered but never fired" list above were false negatives — both hooks DO fire,
+   confirmed by checking the primary working directory instead of an isolated worktree.** `.planning/` is
+   gitignored (`.gitignore:115`; confirmed further by `bin/heimdall-checkpoint:48`'s own header: "`.planning/` is
+   gitignored — we write to disk only, never `git add`"), so a fast-forwarded or freshly-created worktree never
+   receives these artifacts regardless of whether the hook ever ran — the original absence-check was structurally
+   blind for exactly this pair, independent of hook health. Checked directly: `/Users/rj/Downloads/heimdall/.planning/CHECKPOINT.md`
+   exists, 30011 bytes, mtime 2026-08-24 00:28 (same day) — real, fresh, **FIRES**.
+   `/Users/rj/Downloads/heimdall/.planning/reels/` holds 149 real files (`run-YYYYMMDD-HHMMSS.{json,txt}` pairs
+   spanning 2026-06-15 through 2026-08-20) — real, historical, **FIRES**. Reclassify both from
+   REGISTERED-NOT-FIRED to FIRES (artifact-proven, primary-repo evidence); the remaining 4 of the original 6 stand
+   as originally written (correctly-idle-by-design or session-scoped blind spot).
