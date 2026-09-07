@@ -53,6 +53,24 @@
 #     marker's reason carries the -prose suffix (reusing the real verbatim
 #     production reset-clause string this repo already fixed a classifier bug
 #     for).
+# 12. THE FIX: the three transcript-path-validity guards were, until
+#     2026-09-07, the one place this hook could exit with NEITHER outcome
+#     NOR hook_event_name set (confirmed against the real production trace:
+#     198/225 lines were outcome=unknown, hook_event_name="" -- every one a
+#     genuine Stop/SubagentStop firing this trace silently failed to label).
+#     Each of the three now sets a distinct, documented outcome AND still
+#     captures hook_event_name (proving the fix, not just the symptom):
+#       - neither agent_transcript_path nor transcript_path resolved non-empty
+#         -> skipped-no-transcript-path
+#       - resolved path does not exist -> skipped-transcript-not-found
+#       - resolved path exists but is not readable -> skipped-transcript-unreadable
+# 13. The three guards that already had correct outcomes before this fix
+#     (skipped-no-repo-dir, skipped-empty-input, skipped-no-mark-bin) are
+#     each independently reachable here too, asserting hook_event_name ==
+#     null in every case (none of the three reach far enough to jq-parse
+#     the payload) -- completing this suite's coverage of the full
+#     documented outcome vocabulary (see hooks/heimdall-429-detect.sh's own
+#     OUTCOME VOCABULARY comment for the authoritative list).
 #
 # Usage: bash test/heimdall-429-detect-trace.test.sh   (exit 0 = all guarantees hold)
 set -uo pipefail
@@ -280,7 +298,7 @@ marker_exists && bad "jq-unavailable case incorrectly wrote a marker" || ok "jq-
 if [ -f "$TRACE_FILE_DEFAULT" ]; then
   ok "jq unavailable: trace line still written (printf + redirection are PATH-independent bash builtins)"
   field_is "$TRACE_FILE_DEFAULT" '.outcome == "skipped-no-jq"' "trace line: outcome == skipped-no-jq"
-  field_is "$TRACE_FILE_DEFAULT" '.hook_event_name == ""' "trace line: hook_event_name == \"\" (script exited before it could be read)"
+  field_is "$TRACE_FILE_DEFAULT" '.hook_event_name == null' "trace line: hook_event_name == null (JSON null; jq itself was unavailable so parsing could not even be attempted)"
   field_is "$TRACE_FILE_DEFAULT" '.had_agent_transcript_path == null' "trace line: had_agent_transcript_path == null (JSON null, never computed)"
   field_is "$TRACE_FILE_DEFAULT" '.had_transcript_path == null' "trace line: had_transcript_path == null"
   field_is "$TRACE_FILE_DEFAULT" '.tier1_examined == 0 and .tier2_examined == 0 and .tier3_examined == 0' "trace line: all tier counters 0"
@@ -388,6 +406,125 @@ if [ -f "$TRACE_FILE_DEFAULT" ]; then
   field_is "$TRACE_FILE_DEFAULT" '.detail == "stop-prose-transcript-429"' "tier3 prose scan: trace detail == stop-prose-transcript-429"
 else
   bad "tier3 prose scan: no trace line was written at all"
+fi
+
+# --- 12a. skipped-no-transcript-path -> hook_event_name POPULATED (the fix) -
+#         neither agent_transcript_path nor transcript_path present at all.
+reset_marker; reset_trace
+PAYLOAD=$(jq -cn '{hook_event_name:"Stop", last_assistant_message:"DONE"}')
+run_hook "$PAYLOAD"
+marker_exists && bad "skipped-no-transcript-path: incorrectly wrote a marker" \
+  || ok "skipped-no-transcript-path: writes no marker"
+if [ -f "$TRACE_FILE_DEFAULT" ]; then
+  field_is "$TRACE_FILE_DEFAULT" '.outcome == "skipped-no-transcript-path"' \
+    "skipped-no-transcript-path: trace outcome is correct (previously: unknown)"
+  field_is "$TRACE_FILE_DEFAULT" '.hook_event_name == "stop"' \
+    "skipped-no-transcript-path: hook_event_name == stop (previously: \"\", the exact bug)"
+  field_is "$TRACE_FILE_DEFAULT" '.had_agent_transcript_path == false' \
+    "skipped-no-transcript-path: had_agent_transcript_path == false"
+  field_is "$TRACE_FILE_DEFAULT" '.had_transcript_path == false' \
+    "skipped-no-transcript-path: had_transcript_path == false"
+  field_is "$TRACE_FILE_DEFAULT" '.tier1_examined == 0' \
+    "skipped-no-transcript-path: tier1_examined == 0 (never reached the scan)"
+else
+  bad "skipped-no-transcript-path: no trace line was written at all"
+fi
+
+# --- 12b. skipped-transcript-not-found -> hook_event_name POPULATED --------
+#         a path is given (transcript_path) but no file exists there.
+reset_marker; reset_trace
+MISSING_TRANSCRIPT="$TRANSCRIPTS/does-not-exist-$$.jsonl"
+rm -f "$MISSING_TRANSCRIPT"
+PAYLOAD=$(jq -cn --arg tp "$MISSING_TRANSCRIPT" '{hook_event_name:"Stop", transcript_path:$tp}')
+run_hook "$PAYLOAD"
+marker_exists && bad "skipped-transcript-not-found: incorrectly wrote a marker" \
+  || ok "skipped-transcript-not-found: writes no marker"
+if [ -f "$TRACE_FILE_DEFAULT" ]; then
+  field_is "$TRACE_FILE_DEFAULT" '.outcome == "skipped-transcript-not-found"' \
+    "skipped-transcript-not-found: trace outcome is correct (previously: unknown)"
+  field_is "$TRACE_FILE_DEFAULT" '.hook_event_name == "stop"' \
+    "skipped-transcript-not-found: hook_event_name == stop (previously: \"\")"
+  field_is "$TRACE_FILE_DEFAULT" '.had_transcript_path == true' \
+    "skipped-transcript-not-found: had_transcript_path == true (path WAS given, just doesn't exist)"
+  field_is "$TRACE_FILE_DEFAULT" '.tier1_examined == 0' \
+    "skipped-transcript-not-found: tier1_examined == 0 (never reached the scan)"
+else
+  bad "skipped-transcript-not-found: no trace line was written at all"
+fi
+
+# --- 12c. skipped-transcript-unreadable -> hook_event_name POPULATED -------
+#         the file exists (-f true) but its permission bits deny read (-r false).
+reset_marker; reset_trace
+UNREADABLE_TRANSCRIPT="$TRANSCRIPTS/unreadable.jsonl"
+write_clean "$UNREADABLE_TRANSCRIPT"
+chmod 000 "$UNREADABLE_TRANSCRIPT"
+if [ -r "$UNREADABLE_TRANSCRIPT" ]; then
+  echo "  SKIP skipped-transcript-unreadable case -- chmod 000 did not block reads (running as root?)"
+else
+  PAYLOAD=$(jq -cn --arg tp "$UNREADABLE_TRANSCRIPT" '{hook_event_name:"SubagentStop", agent_transcript_path:$tp}')
+  run_hook "$PAYLOAD"
+  marker_exists && bad "skipped-transcript-unreadable: incorrectly wrote a marker" \
+    || ok "skipped-transcript-unreadable: writes no marker"
+  if [ -f "$TRACE_FILE_DEFAULT" ]; then
+    field_is "$TRACE_FILE_DEFAULT" '.outcome == "skipped-transcript-unreadable"' \
+      "skipped-transcript-unreadable: trace outcome is correct (previously: unknown)"
+    field_is "$TRACE_FILE_DEFAULT" '.hook_event_name == "subagentstop"' \
+      "skipped-transcript-unreadable: hook_event_name == subagentstop (previously: \"\")"
+    field_is "$TRACE_FILE_DEFAULT" '.had_agent_transcript_path == true' \
+      "skipped-transcript-unreadable: had_agent_transcript_path == true"
+    field_is "$TRACE_FILE_DEFAULT" '.had_transcript_path == false' \
+      "skipped-transcript-unreadable: had_transcript_path == false"
+    field_is "$TRACE_FILE_DEFAULT" '.tier1_examined == 0' \
+      "skipped-transcript-unreadable: tier1_examined == 0 (never reached the scan)"
+  else
+    bad "skipped-transcript-unreadable: no trace line was written at all"
+  fi
+fi
+chmod 644 "$UNREADABLE_TRANSCRIPT" 2>/dev/null || true
+
+# --- 13a. skipped-no-repo-dir -> hook_event_name null (stdin never read) ----
+reset_marker; reset_trace
+NOPE_DIR="$SANDBOX/does-not-exist-repo-dir"
+PAYLOAD=$(jq -cn '{hook_event_name:"Stop"}')
+( cd "$SANDBOX" && export HEIMDALL_HOME="$HEIMDALL_HOME_SANDBOX" CLAUDE_PROJECT_DIR="$NOPE_DIR" HEIMDALL_429_MARKER_FILE="$MARKER"; printf '%s' "$PAYLOAD" | bash "$PLUGIN/hooks/heimdall-429-detect.sh" --repo "$NOPE_DIR" >/dev/null 2>&1 )
+marker_exists && bad "skipped-no-repo-dir: incorrectly wrote a marker" \
+  || ok "skipped-no-repo-dir: writes no marker"
+if [ -f "$TRACE_FILE_DEFAULT" ]; then
+  field_is "$TRACE_FILE_DEFAULT" '.outcome == "skipped-no-repo-dir"' \
+    "skipped-no-repo-dir: trace outcome is correct"
+  field_is "$TRACE_FILE_DEFAULT" '.hook_event_name == null' \
+    "skipped-no-repo-dir: hook_event_name is JSON null (exited before stdin was even read)"
+else
+  bad "skipped-no-repo-dir: no trace line was written at all"
+fi
+
+# --- 13b. skipped-empty-input -> hook_event_name null -----------------------
+reset_marker; reset_trace
+run_hook ""
+marker_exists && bad "skipped-empty-input: incorrectly wrote a marker" \
+  || ok "skipped-empty-input: writes no marker"
+if [ -f "$TRACE_FILE_DEFAULT" ]; then
+  field_is "$TRACE_FILE_DEFAULT" '.outcome == "skipped-empty-input"' \
+    "skipped-empty-input: trace outcome is correct"
+  field_is "$TRACE_FILE_DEFAULT" '.hook_event_name == null' \
+    "skipped-empty-input: hook_event_name is JSON null (no payload to parse)"
+else
+  bad "skipped-empty-input: no trace line was written at all"
+fi
+
+# --- 13c. skipped-no-mark-bin -> hook_event_name null -----------------------
+reset_marker; reset_trace
+PAYLOAD=$(jq -cn --arg tp "$CLEAN_TRANSCRIPT" '{hook_event_name:"Stop", transcript_path:$tp}')
+( cd "$SANDBOX" && export HEIMDALL_HOME="$HEIMDALL_HOME_SANDBOX" CLAUDE_PROJECT_DIR="$PROJECT" HEIMDALL_429_MARKER_FILE="$MARKER" HMD_429_MARK_BIN="$SANDBOX/does-not-exist-mark-bin"; printf '%s' "$PAYLOAD" | bash "$PLUGIN/hooks/heimdall-429-detect.sh" --repo "$PROJECT" >/dev/null 2>&1 )
+marker_exists && bad "skipped-no-mark-bin: incorrectly wrote a marker" \
+  || ok "skipped-no-mark-bin: writes no marker"
+if [ -f "$TRACE_FILE_DEFAULT" ]; then
+  field_is "$TRACE_FILE_DEFAULT" '.outcome == "skipped-no-mark-bin"' \
+    "skipped-no-mark-bin: trace outcome is correct"
+  field_is "$TRACE_FILE_DEFAULT" '.hook_event_name == null' \
+    "skipped-no-mark-bin: hook_event_name is JSON null (never reached the parse)"
+else
+  bad "skipped-no-mark-bin: no trace line was written at all"
 fi
 
 echo "--------------------------------------------------------------------"
