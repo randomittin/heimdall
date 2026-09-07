@@ -1086,7 +1086,7 @@ unset HMD_FB_TEST_KEY
 
 # ── 42. NEW (2026-08-26 correction): state=auto + a FAILING preflight +
 # heimdall-session-usage reporting CROSSED -> still WAIT, never ROUTE. Proves
-# crossing the 95% threshold authorizes nothing on its own: even a confirmed
+# crossing the 90% threshold (2026-09-05, was 95%) authorizes nothing on its own: even a confirmed
 # pre-exhaustion signal cannot overcome a failing preflight check. ──────────
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
@@ -1094,7 +1094,7 @@ export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 [ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
-  && ok "42. auto + failing preflight + session-usage CROSSED -> still WAIT, crossing 95% authorizes nothing alone" \
+  && ok "42. auto + failing preflight + session-usage CROSSED -> still WAIT, crossing 90% authorizes nothing alone" \
   || bad "42. got rc=$rc out='$out'"
 
 # ── 43. NEW (2026-08-26 correction): state=auto + a FULLY PASSING preflight
