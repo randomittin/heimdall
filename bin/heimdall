@@ -2486,6 +2486,103 @@ case "${1:-}" in
     if [ -x "$_costf" ]; then exec "$_costf" "$@"; fi
     echo "error: heimdall-cost-forensics not found at $_costf" >&2; exit 2
     ;;
+  branch-context)
+    # SI-3 -- git-backed branch-context reader (own-first), team mode's cheap
+    # git-mechanical (merge-base/diff --name-only/rev-list; NO LLM) answer to
+    # "which OTHER branches also touched this target, framed relative to MY
+    # branch?" `own` is the primary default; `query <target>` surfaces siblings
+    # ON DEMAND, never dumped. Solo repo -> own-context-only, no crash. Engine:
+    # bin/lib/branch_context.py. 8/8 test/si3-branch-context.test.sh.
+    shift
+    _bctx="$(cd "$(dirname "$0")" && pwd)/heimdall-branch-context"
+    if [ -x "$_bctx" ]; then exec "$_bctx" "$@"; fi
+    echo "error: heimdall-branch-context not found at $_bctx" >&2; exit 2
+    ;;
+  collision)
+    # TEAM MODE P3 (F4) -- the same-target-CHANGED collision detector, built on
+    # SI-3 (branch-context above) + bin/lib/collision.py. Classifies each
+    # cross-branch overlap safe-textual (disjoint or identical edits, auto-
+    # resolvable) or flag-human (a divergent same-symbol body -- NEVER
+    # auto-merged). Distinct from redum (F3): redum dedupes redundant NEW work,
+    # this surfaces a coordination conflict on the SAME existing thing. Writes
+    # no merged file -- the verdict is the job, not the merge. 11/11
+    # test/team-collision.test.sh.
+    shift
+    _coll="$(cd "$(dirname "$0")" && pwd)/heimdall-collision"
+    if [ -x "$_coll" ]; then exec "$_coll" "$@"; fi
+    echo "error: heimdall-collision not found at $_coll" >&2; exit 2
+    ;;
+  task)
+    # TEAM MODE -- the task record primitive: one file per task under
+    # .planning/ledger/tasks/{id}.json (one writer per file, the same
+    # conflict-free git-merge pattern as claim/activity/verdicts). add/assign/
+    # state/gate subcommands; `surfaces` links a task to the same surface
+    # strings heimdall-claim uses so a board can JOIN task to live claim.
+    # Cooperative tracking among consenting hmd instances -- records intent,
+    # never enforces. Consumed by heimdall-team-board (board/leaderboard).
+    # 23/23 test/heimdall-team-board.test.sh.
+    shift
+    _task="$(cd "$(dirname "$0")" && pwd)/heimdall-task"
+    if [ -x "$_task" ]; then exec "$_task" "$@"; fi
+    echo "error: heimdall-task not found at $_task" >&2; exit 2
+    ;;
+  land)
+    # the land-to-shared-main flow: reversible-destination (own branch, force-
+    # with-lease) is autonomous and ungated; irreversible-destination (shared
+    # main) is gated on the MERGED result's own verdict, never the agent's
+    # self-assessment. Fetches current shared main, merges the branch onto it
+    # in a throwaway worktree, runs redum consolidation (Class 1: redundancy)
+    # then the configurable gate command (Class 2: semantic incompatibility --
+    # e.g. a dangling rename only the merged code running catches). Non-fast-
+    # forward / history rewrite / credential ops always STOP for a human.
+    # 18/18 test/land-flow.test.sh; conformance/gates/land-reversibility.
+    shift
+    _land="$(cd "$(dirname "$0")" && pwd)/heimdall-land"
+    if [ -x "$_land" ]; then exec "$_land" "$@"; fi
+    echo "error: heimdall-land not found at $_land" >&2; exit 2
+    ;;
+  issue)
+    # hmd issue emit|status|purge|flush -- the Anonymized Issue Collection
+    # local emit + control CLI, a thin bash front over bin/lib/issue_corpus.py
+    # (sibling of heimdall-telemetry-corpus / pmr_corpus.py). Zero-content:
+    # a path/source-line/secret-shaped payload is BLOCKED + alarmed, never
+    # spooled; consent OFF is a pure no-op; a security-sensitive signal routes
+    # to the PRIVATE .planning/security-signals/ lane and is NEVER sent.
+    # NOTHING transmits in this build -- the outbox IS the local queue. 48/48
+    # across the four test/heimdall-issue-corpus-*.test.sh falsifier suites.
+    shift
+    _issc="$(cd "$(dirname "$0")" && pwd)/heimdall-issue-corpus"
+    if [ -x "$_issc" ]; then exec "$_issc" "$@"; fi
+    echo "error: heimdall-issue-corpus not found at $_issc" >&2; exit 2
+    ;;
+  memory)
+    # Verified-Memory CLI (VM piece B) -- write/get/list/verify/reconcile over
+    # bin/lib/verified_memory.py. Staleness is DECIDED by git, not estimated by
+    # a decay timer: every entry is a checkable claim, and every READ
+    # re-verifies it against git ground truth at read time -- a stored
+    # status=live is never trusted; a since-gone-stale entry reads back
+    # status=stale, weight=0, and --live-only drops it from served context.
+    # Secret-shaped claims are rejected (exit 3), never stored. 24/24
+    # test/verified-memory.test.sh, 59/59 test/memory-codec.test.sh, 18/18
+    # test/vm-readpath.test.sh.
+    shift
+    _vmem="$(cd "$(dirname "$0")" && pwd)/heimdall-memory"
+    if [ -x "$_vmem" ]; then exec "$_vmem" "$@"; fi
+    echo "error: heimdall-memory not found at $_vmem" >&2; exit 2
+    ;;
+  vm-bench)
+    # Verified-Memory BENCHMARK (VM piece C) -- run|methods. Scores
+    # verified-memory (git-grounded, above) against three baselines (decay,
+    # llm-judge, drift) on stale-retrieval error + conflict accuracy over a
+    # real throwaway git fixture. Every number carries a provenance tag
+    # (measured|est.|blank); require_provenance structurally refuses a
+    # fabricated delta, and a non-win prints the null verdict rather than
+    # burying it. 29/29 test/vm-bench.test.sh.
+    shift
+    _vmb="$(cd "$(dirname "$0")" && pwd)/heimdall-vm-bench"
+    if [ -x "$_vmb" ]; then exec "$_vmb" "$@"; fi
+    echo "error: heimdall-vm-bench not found at $_vmb" >&2; exit 2
+    ;;
   caveman-eval)
     # Real, honest, three-arm token-compression EVAL for the caveman levels
     # themselves -- a different gap than caveman-audit's read-back above.
