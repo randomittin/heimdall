@@ -47,6 +47,10 @@ heimdall-seed-demo-wall	2027-02-08	BY DESIGN — one-shot demo seeding a human r
 heimdall-team-converge	2027-02-08	BY DESIGN — one-shot forward migration healing an existing team split; run once, by hand
 heimdall-render-version	2027-02-08	BY DESIGN (graph-invisible dependency, not standalone) — genuinely invoked by release/ship.sh:334-336 (SHIP_RENDERER; ship.sh `die`s if the renderer is missing or fails) as the single renderer for every version-bearing surface at release time. release/ is not a reach_root_seeds() entry nor a reach_nodes() scanned directory, so this real, hard-dependency caller is structurally invisible to the graph — not dead, a scanner blind spot. Revisit only if release/ is ever added as a scanned surface.
 heimdall-face-test	2027-02-08	BY DESIGN — manual wcwidth acceptance harness for the Watchman (sibling of heimdall-banner-test, the same harness shape for the launch banner); named only by its own bare module docstring (heimdall-face-test:2 self-naming, :18-19 its own Usage: examples) and by bin/heimdall-face's header prose (bin/heimdall-face:16) — a human runs it directly and eyeballs the six stacked emotion frames.
+heimdall-cost-report	2027-02-08	BY DESIGN — THE DAILY COST JOB governing the $10k/mo GCP spend (Firestore ops + Cloud Run); bin/lib/liveness-subsystems.conf declares it operator-scope with the remedy "run heimdall-cost-report by hand" — a human runs it directly on purpose, not a scheduler or hook. Distinct from heimdall-cost-forensics (Claude-API token cost, already wired as the `cost-forensics` dispatcher arm — see that arm's own comment in bin/heimdall for the naming note).
+heimdall-cost-model-refresh	2027-02-08	BY DESIGN — THE WEEKLY unit-cost-model re-validation feeding heimdall-cost-report above; bin/lib/liveness-subsystems.conf declares it operator-scope the same way — a human re-runs it by hand on its own cadence, never a dispatcher arm.
+heimdall-s6-manifest	2027-02-08	BY DESIGN — the S-6 C3 breadth-sweep manifest adapter (repo-spec array -> sha-pinned entries heimdall-s6-sweep consumes). The specific S-6 C3 popular-10 study concluded (docs/archive/INDEX.md: findings archived, proposal superseded), but the adapter is a reusable, safe-by-default pair with the sweep harness below, not a one-shot script — a human re-invokes it for the next breadth study. 8/8 test/s6-manifest.test.sh.
+heimdall-s6-sweep	2027-02-08	BY DESIGN — the S-6 C3 breadth-sweep runner: pinned-sha clone, soft-budget-gated real token spend, working-output verification, an unattended-sweep guard requiring --confirm-full for a full paid run. Same reusable-harness story as heimdall-s6-manifest above: the one completed study is archived, the harness itself is what a human re-runs for the next one. 25/25 test/s6-sweep.test.sh.
 #
 # ── KNOWN GAP ────────────────────────────────────────────────────────────────────
 heimdall-board	2026-11-08	KNOWN GAP — a read-only view whose siblings (watch/dashboard/verdict/badge/clip) all have hmd case arms; this one has none
@@ -62,17 +66,24 @@ heimdall-portable-brief	2026-11-26	KNOWN GAP — turns .planning/CHECKPOINT.md i
 # Each of these passed the OLD flat "something mentions it" rule and fails the transitive
 # one. In every case the only mouths naming them are themselves unreachable: their own
 # implementation library, a sibling that is equally dead, or each other.
-heimdall-branch-context	2026-09-07	DEAD — named only by its own bin/lib/branch_context.py and by bin/heimdall-collision, which is itself dead. No live entry point reaches it.
-heimdall-collision	2026-09-07	DEAD — named only by bin/heimdall-land and its own bin/lib/collision.py, both unreachable.
-heimdall-cost-model-refresh	2026-09-07	DEAD — named only by its own bin/lib/cp_cost_model.py. No scheduler, hook or dispatcher arm refreshes the cost model.
-heimdall-cost-report	2026-09-07	DEAD — named only by bin/lib/cp_cost_model.py and bin/heimdall-cost-model-refresh, both unreachable.
-heimdall-issue-corpus	2026-09-07	DEAD — named only by its own bin/lib/issue_corpus.py; the anonymized-issue-collection plan that specified it never wired a caller.
-heimdall-land	2026-09-07	DEAD — named by NOTHING outside itself, not even a library. Last edited 2026-08-05, so this is freshly-touched code with no invoker.
-heimdall-memory	2026-09-07	DEAD — the verified-memory CLI, named only by its own bin/lib/verified_memory.py.
-heimdall-s6-manifest	2026-09-07	DEAD — mutual citation with bin/heimdall-s6-sweep and nothing else. Two corpses vouching for each other, built the same week as heimdall-brief.
-heimdall-s6-sweep	2026-09-07	DEAD — mutual citation with bin/heimdall-s6-manifest and nothing else. The S-6 C3 breadth harness has no live caller.
-heimdall-task	2026-09-07	DEAD — named only by bin/heimdall-board, which is itself a recorded KNOWN GAP with no dispatch arm.
-heimdall-vm-bench	2026-09-07	DEAD — named only by its own bin/lib/vm_bench.py.
+#
+# ALL ELEVEN triaged 2026-09-08 on their FIRST recheck-by expiry (2026-09-07) — the
+# mechanism did its job (56 passed/0 failed -> 54 passed/22 failed, exactly 11 x the
+# two failure-instances this file's own header documents) and forced a real re-triage
+# instead of a blanket renewal. Each was checked via `heimdall-deadcode --why <name>`
+# (never assumed from a passing test alone — see this file's own re-verify-before-
+# deleting note above) plus a full, unstubbed run of its dedicated test suite:
+#   WIRED — a real dispatcher arm now lives in bin/heimdall, so the row here is
+#   removed (an exemption row for a now-reachable name is itself STALE per this
+#   file's own rot rule): heimdall-branch-context, heimdall-collision, heimdall-task,
+#   heimdall-land, heimdall-issue-corpus, heimdall-memory, heimdall-vm-bench.
+#   RECLASSIFIED to BY DESIGN above — genuinely human/operator-run, not dead (see
+#   each row there for why): heimdall-cost-model-refresh, heimdall-cost-report,
+#   heimdall-s6-manifest, heimdall-s6-sweep.
+# Nothing in this batch was actually dead code — every one was real, tested, wanted
+# capability missing only its wiring or its category. This section stays empty as
+# the historical record of that audit; the next transitive-liveness finding starts
+# a new dated section below it, it does not reuse this one.
 #
 # ── DEAD — the 2026-08-22 comment-stripping + dispatcher-hop-ceiling audit ───────
 # Found after bin/lib/reachability.sh stopped counting comment-only mentions as
