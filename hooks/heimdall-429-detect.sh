@@ -140,9 +140,36 @@ _trace_had_tp="null"
 _trace_tier1_examined=0
 _trace_tier2_examined=0
 _trace_tier3_examined=0
+# OUTCOME VOCABULARY -- every guard below that can exit sets exactly one of
+# these before it does (grep this file for _trace_outcome= to audit the
+# claim). If a line ever reaches disk with outcome=unknown, a NEW exit path
+# exists that forgot to set one -- that is exactly what happened here
+# (found 2026-09-07): three transcript-path guards below exited bare, and
+# 198 of 225 real trace lines came back outcome=unknown / hook_event_name=""
+# as the visible symptom, silently swallowing what were real, meaningful
+# Stop/SubagentStop firings (confirmed against the live trace: those lines
+# had had_agent_transcript_path=true, had_transcript_path=true, and
+# tier1_examined=0 -- i.e. a transcript_path WAS resolved but never passed
+# the -f/-r validity check just below).
+#   skipped-no-repo-dir           -- --repo/CLAUDE_PROJECT_DIR is not a dir
+#   skipped-empty-input           -- stdin was empty
+#   skipped-no-jq                 -- jq not on PATH
+#   skipped-no-mark-bin           -- bin/heimdall-429-mark missing/not +x
+#   skipped-no-transcript-path    -- neither agent_transcript_path nor
+#                                     transcript_path resolved non-empty
+#   skipped-transcript-not-found  -- resolved path does not exist (-f false)
+#   skipped-transcript-unreadable -- resolved path exists but unreadable (-r false)
+#   no-match                      -- tier1(/2/3) scanned, no fresh 429 found
+#   marked                        -- a fresh 429 was found and mark_bin ran
 _trace_outcome="unknown"
 _trace_detail=""
-_trace_event_name=""
+# hook_event_name is JSON null (bare/unquoted -- see the printf below) until
+# the payload has actually been jq-parsed for it; it becomes a quoted,
+# sanitized string only once that parse genuinely ran, so a reader can tell
+# "never attempted" (null) apart from "attempted, payload just didn't name
+# one" (the literal string "hook" -- see the safe_event fallback below).
+# Collapsing both into "" was the other half of the same 2026-09-07 bug.
+_trace_event_name="null"
 
 trace_emit() {
   [ "$_trace_enabled" = "1" ] || return 0
@@ -162,7 +189,7 @@ trace_emit() {
       fi
     fi
     _trace_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
-    printf '{"ts":"%s","hook_event_name":"%s","had_agent_transcript_path":%s,"had_transcript_path":%s,"tier1_examined":%s,"tier2_examined":%s,"tier3_examined":%s,"outcome":"%s","detail":"%s"}\n' \
+    printf '{"ts":"%s","hook_event_name":%s,"had_agent_transcript_path":%s,"had_transcript_path":%s,"tier1_examined":%s,"tier2_examined":%s,"tier3_examined":%s,"outcome":"%s","detail":"%s"}\n' \
       "$_trace_ts" "$_trace_event_name" "$_trace_had_agent_tp" "$_trace_had_tp" \
       "$_trace_tier1_examined" "$_trace_tier2_examined" "$_trace_tier3_examined" \
       "$_trace_outcome" "$_trace_detail" >> "$_trace_file" 2>/dev/null
@@ -198,6 +225,19 @@ _trace_v="$(printf '%s' "$input" | jq -r 'if (.agent_transcript_path // "") != "
 case "$_trace_v" in true|false) _trace_had_agent_tp="$_trace_v" ;; esac
 _trace_v="$(printf '%s' "$input" | jq -r 'if (.transcript_path // "") != "" then "true" else "false" end' 2>/dev/null || true)"
 case "$_trace_v" in true|false) _trace_had_tp="$_trace_v" ;; esac
+
+# Parsed here, deliberately BEFORE the transcript_path resolution/validation
+# below -- moved 2026-09-07 from immediately before window_secs (its
+# original spot) specifically so hook_event_name is captured even when
+# what ends this invocation is one of the transcript-path guards further
+# down (skipped-no-transcript-path / -not-found / -unreadable). jq is
+# already confirmed present above, so nothing here can fail for a reason
+# those guards would also need to check.
+event_name="$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null || true)"
+[ -n "$event_name" ] || event_name="hook"
+safe_event="$(printf '%s' "$event_name" | tr -c 'A-Za-z0-9_-' '-' | tr '[:upper:]' '[:lower:]')"
+[ -n "$safe_event" ] || safe_event="hook"
+_trace_event_name="\"$safe_event\""
 
 # Prefer SubagentStop's own field name; fall back to Stop's -- the same
 # dual-field-name fallback bin/heimdall-claim-check already uses for the
@@ -335,15 +375,9 @@ $_legacy"
   fi
 fi
 
-[ -n "$transcript_path" ] || exit 0
-[ -f "$transcript_path" ] || exit 0
-[ -r "$transcript_path" ] || exit 0
-
-event_name="$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null || true)"
-[ -n "$event_name" ] || event_name="hook"
-safe_event="$(printf '%s' "$event_name" | tr -c 'A-Za-z0-9_-' '-' | tr '[:upper:]' '[:lower:]')"
-[ -n "$safe_event" ] || safe_event="hook"
-_trace_event_name="$safe_event"
+[ -n "$transcript_path" ] || { _trace_outcome="skipped-no-transcript-path"; exit 0; }
+[ -f "$transcript_path" ] || { _trace_outcome="skipped-transcript-not-found"; exit 0; }
+[ -r "$transcript_path" ] || { _trace_outcome="skipped-transcript-unreadable"; exit 0; }
 
 window_secs="${HMD_429_DETECT_WINDOW_SECS:-300}"
 case "$window_secs" in ''|*[!0-9]*) window_secs=300 ;; esac
