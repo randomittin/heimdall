@@ -32,10 +32,10 @@
 #     tracing, yet a line still appears.
 #  5. jq unavailable on PATH -> the hook still fails open (no marker) but ALSO
 #     still emits a trace line (outcome=skipped-no-jq, had_agent_transcript_
-#     path=null, had_transcript_path=null, all tier counters 0, empty
-#     hook_event_name) -- proving trace_emit's own printf-only construction
-#     does not depend on jq, which matters precisely because "jq missing" is
-#     one of the outcomes this trace exists to distinguish.
+#     path=null, had_transcript_path=null, all tier counters 0,
+#     hook_event_name=JSON null) -- proving trace_emit's own printf-only
+#     construction does not depend on jq, which matters precisely because
+#     "jq missing" is one of the outcomes this trace exists to distinguish.
 #  6. Unwritable trace path (a real file occupies the directory component the
 #     trace file would need) -> the hook still exits 0 and STILL marks
 #     correctly; the trace write fails silently and never surfaces as a
