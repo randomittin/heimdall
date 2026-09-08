@@ -472,8 +472,8 @@ p() { printf '[heimdall] %s\n' "$*" >&2; }
 render_ceiling() {
   local tok="$1"
   e ""
-  p "CONTEXT $(_commas "$tok") tokens — past the ${CEILING_H} ceiling. Checkpoint and restart: run /hmd:save, then start a fresh session."
-  p "    measured on this repo, same working style: \$0.366/req at 731K context vs \$0.0593/req at 118K — 6.17x. A restart re-pays ~35K of preamble (~\$0.02); staying here cost \$369.50 over one session."
+  p "CONTEXT $(_commas "$tok") tokens — past the ${CEILING_H} ceiling. Run /hmd:save now, then /compact — save first: compaction rewrites context lossily, and a checkpoint taken before it is what makes that loss recoverable."
+  p "    measured on this repo, same working style: \$0.366/req at 731K context vs \$0.0593/req at 118K — 6.17x. Compacting keeps the session going at a fraction of that cost."
   e ""
 }
 
@@ -502,15 +502,18 @@ render_cliff() {
   fi
   e "  Every request here bills \$0.366 instead of \$0.0593 — 6.17x, from your own two days."
   e ""
-  e "  STOP AND RESTART:   /hmd:save     then exit and open a fresh session."
-  e "  Resuming costs ~35K of preamble, about \$0.02. Not restarting cost \$913.54 once."
+  e "  RUN /hmd:save NOW, THEN /compact:  save first — compaction is a lossy rewrite of"
+  e "  the very context you're reasoning over, and a checkpoint taken before it is what"
+  e "  makes that loss recoverable."
   if [ "$state" = "CLIFF" ]; then
     _boundary_decision
     if [ "$BOUND_DECISION" = "refuse" ]; then
-      e "  ⛔ REFUSE NEW WORK — ${BOUND_REASON}. Do not start anything new here; restart first."
+      e "  ⛔ REFUSE NEW WORK — ${BOUND_REASON}. Do not start anything new here; compact first."
     else
       e "  DEFERRING new-work refusal — ${BOUND_REASON}."
     fi
+    e "  If compacting doesn't bring you back under $(_commas "$CLIFF"), a fresh session is"
+    e "  the fallback: resuming re-pays ~35K of preamble (~\$0.02); staying here cost \$913.54 once."
   else
     e "  STRONG NOTICE — checkpoint recommended now. This tier never refuses new"
     e "  work; only the hard ceiling ($(_commas "$CLIFF") tokens) can."

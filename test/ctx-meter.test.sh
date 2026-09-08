@@ -128,7 +128,11 @@ has "$CEIL" '0.366'  && ok "states \$0.366/req (measured at 731K context)"   || 
 has "$CEIL" '0.0593' && ok "states \$0.0593/req (measured at 118K context)"  || bad "missing the \$0.0593 figure"
 has "$CEIL" '6.17'   && ok "states the 6.17x multiple"                        || bad "missing the 6.17x multiple"
 hasre "$CEIL" '150|150,000|150K' && ok "names the 150K ceiling"               || bad "never names the ceiling"
-hasre "$CEIL" 'save|checkpoint'  && ok "tells the operator to checkpoint/restart" || bad "no restart instruction"
+hasre "$CEIL" 'save|checkpoint'  && ok "tells the operator to save/checkpoint" || bad "no save/checkpoint instruction"
+has    "$CEIL" '/hmd:save' && ok "names /hmd:save explicitly (mandatory at every tier that speaks)" || bad "does not explicitly name /hmd:save"
+has    "$CEIL" '/compact'  && ok "recommends /compact as the primary remedy"  || bad "does not recommend /compact"
+hasrei "$CEIL" 'restart'   && bad "CEILING notice still defaults to a restart (compact should be primary here)" \
+                            || ok "CEILING notice does not default to a restart (compact is primary; fresh session is CLIFF-only)"
 hasre "$CEIL" '214,000|214000'   && ok "reports the ACTUAL current reading"   || bad "does not report the reading"
 
 # ── C. approaching the cliff — LOUD ──────────────────────────────────────────────
@@ -139,6 +143,10 @@ NEAR="$(both)"
 [ -n "$NEAR" ] && ok "720,000 tok -> speaks" || bad "silent at 720,000 tok"
 has "$NEAR" '━'    && ok "renders a ruled block (visually distinct)" || bad "no ruled block near the cliff"
 hasre "$NEAR" '800' && ok "names the 800K cliff it is approaching"   || bad "does not name the cliff"
+has    "$NEAR" '/hmd:save' && ok "CLIFF_NEAR notice names /hmd:save (mandatory at every tier that speaks)" || bad "CLIFF_NEAR notice missing /hmd:save"
+has    "$NEAR" '/compact'  && ok "CLIFF_NEAR notice recommends /compact as the primary remedy" || bad "CLIFF_NEAR notice does not recommend /compact"
+hasrei "$NEAR" 'restart'   && bad "CLIFF_NEAR notice mentions a restart -- reserved for the CLIFF extreme case only" \
+                            || ok "CLIFF_NEAR notice correctly never mentions a restart (fresh session is CLIFF-only)"
 
 # ── D. past the cliff — LOUD, with the measured 3.2x ─────────────────────────────
 sec "D. PAST THE 800K CLIFF — loud, and quotes the cache-write measurement:"
@@ -150,6 +158,10 @@ has "$CLIFF" '━'      && ok "renders a ruled block"                     || bad
 has "$CLIFF" '42,183' && ok "states 42,183 cache-create tok/req (q5)"   || bad "missing the 42,183 figure"
 has "$CLIFF" '13,320' && ok "states the 13,320 baseline (q2-q4)"        || bad "missing the 13,320 baseline"
 has "$CLIFF" '3.2'    && ok "states the measured 3.2x jump"             || bad "missing the 3.2x jump"
+has    "$CLIFF" '/hmd:save' && ok "CLIFF notice names /hmd:save (mandatory at every tier that speaks)" || bad "CLIFF notice missing /hmd:save"
+has    "$CLIFF" '/compact'  && ok "CLIFF notice recommends /compact first, even at the hard ceiling" || bad "CLIFF notice does not recommend /compact"
+hasrei "$CLIFF" 'fresh session' && ok "CLIFF notice offers a fresh session as fallback -- the one tier where that is appropriate" \
+                                 || bad "CLIFF notice dropped the fresh-session fallback for the one tier that should keep it"
 
 # ── E. the severe case is STRUCTURALLY distinct from the routine one ─────────────
 sec "E. ESCALATION IS VISIBLE (severe != more of the same):"
