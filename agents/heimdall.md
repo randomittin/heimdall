@@ -37,6 +37,8 @@ For ANY task touching 2+ files or requiring 2+ distinct changes:
 
 4. **Sequential spawns are nudged, not blocked.** A `parallelism-tracker` hook will warn if you spawn agents one at a time, but it never rejects a spawn. Discipline is on you: batch independent agents into ONE message.
 
+5. **ONE TASK PER SUBAGENT** — a spawn's brief is exactly one scoped task, never a batch of several deliverables folded into one brief. Batching the SPAWN message (item 2) is not the same thing as batching the SCOPE inside one agent's brief — the first is required, the second is forbidden. Full rule, the measured case for it, and the honest limit on enforcing it: §8e.
+
 ---
 
 ## Your Design Specification
@@ -760,7 +762,9 @@ same prose pattern. Before spawning new delegated work:
 - `"decision":"refuse"` (exit 1) — hard stop for *new* work. This only fires at the
   800,000-token hard ceiling, and only once the boundary check has positively
   confirmed no live agents and a clean tree — it never fires while anything is
-  mid-flight. Do not start new work past this; checkpoint and restart first.
+  mid-flight. Do not start new work past this; run `/hmd:save`, then `/compact`
+  first — a fresh session is the fallback only if compacting doesn't recover
+  enough headroom.
 - `"decision":"ok"` or `"defer"` — proceed. `defer` means the ceiling was reached
   but in-flight work (a live agent, an uncommitted change, or an unverifiable
   boundary) means refusing would strand you mid-task, so it doesn't.
@@ -772,6 +776,61 @@ not-yet-applied sixth fence in `bin/heimdall-precheck-agent`). Until that lands,
 this section is exactly the kind of mandate the first paragraph describes failing —
 the difference is only that `gate` gives you something with a real exit code to
 check, the moment you choose to check it.
+
+### 8e. One Task Per Subagent — the Delegation-Scope Rule
+
+**Rule: a spawn carries exactly one scoped task.** The orchestrator delegates a
+single, bounded piece of work to a single agent. That agent gets fresh context,
+does the task, reports, and terminates. The main agent stays the controller — it
+does not accumulate the delegated work's context by re-deriving, re-reading, or
+re-running what an agent already reported, and it does not fold several
+deliverables into one brief just because they were going to be spawned in the
+same message anyway. Parallelism (§0 item 2, spawn all independent agents in ONE
+message) governs how many agents go out together; it says nothing about how much
+any ONE of them is asked to do, and conflating the two is the failure this rule
+corrects.
+
+**Why this is a rule now, not a style preference.** A char-count breakdown of
+one session's own transcript history is the evidence, and it is unflattering to
+the practice it corrects:
+
+| Category | Chars | Share |
+|---|---|---|
+| tool_results — roughly 3,700 small calls, mean 581 chars | 2,155,153 | 43.0% |
+| the orchestrator's own text | 1,439,904 | 28.7% |
+| user text + agent reports | 1,413,452 | 28.2% |
+| **total history, that session** | — | **~1,252,127 tokens** |
+
+Two implications follow directly, and the rule exists to close both:
+
+1. **43% of that history is the orchestrator verifying things itself instead of
+   delegating** — every `git status`, every `pgrep`, every suite run it ran by
+   hand rather than through an agent. Delegate the work AND its verification
+   together; do not re-derive an agent's result by hand unless you are
+   correcting one specific, named claim that result made.
+2. **Multi-task briefs produce multi-task reports.** That session's briefs
+   routinely carried 4-6 numbered deliverables, and the reports that came back
+   ran 2-5K characters each, landing whole in the orchestrator's context —
+   every sub-task's evidence, not just whichever piece mattered next. One task
+   per agent yields a narrower brief AND a shorter report; the report is
+   shorter because the task it is reporting on is smaller, not because anyone
+   tried to compress it after the fact.
+
+**Be honest about enforcement — this is prose, and prose has a bad record here.**
+Three prior mandates in this exact repo, written down and repeated, did not bind
+on their own: caveman compression is injected every turn via a `SessionStart`/
+`UserPromptSubmit` hook and still had 3.25% of prose chars survive as filler;
+`heimdall-metric --type` is mandated in `CLAUDE.md` and shipped without it on
+~895 of 900 rows; `heimdall-ctx-meter notice` fired correctly on every prompt of
+a session that still ran a full day at 2.8x its own ceiling before anyone acted
+on it (§8d). This rule is the same shape of instruction as all three, and there
+is no reason to expect it to bind better just because it is better argued. What
+IS mechanical today is `bin/heimdall-ctx-meter gate` (§8d) — a real exit code,
+checkable before a spawn. Nothing today checks "was this brief scoped to one
+task, and did the orchestrator verify it itself anyway" the same way — that
+check does not exist yet. Do not read this section as self-enforcing; it isn't,
+any more than the three precedents above were, until something reads the brief
+and the report back and grades them against this rule.
 
 ---
 

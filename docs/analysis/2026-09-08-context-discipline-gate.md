@@ -4,11 +4,12 @@ Operator's ask, verbatim: *"prepare a better version of execution for context
 discipline and standardize it to not impact the work quality while ensuring token
 saving as much as possible."*
 
-This doc covers what was built (`bin/heimdall-ctx-meter gate`, tiered, tested — 110
-passed, 0 failed), what it reuses (zero new thresholds), what it cannot do (a real,
-named limit), and an honest verdict on binding vs. advisory. No savings figure in
-this doc is new; every number below already exists in `token-spend-forensics.md`,
-`2026-09-02-input-context-cost.md`, or `2026-09-07-cost-forensics-tool.md`.
+This doc covers what was built (`bin/heimdall-ctx-meter gate`, tiered, tested — 119
+passed, 0 failed as of the 2026-09-08b wording addendum, §11), what it reuses (zero
+new thresholds), what it cannot do (a real, named limit), and an honest verdict on
+binding vs. advisory. No savings figure in this doc is new; every number below
+already exists in `token-spend-forensics.md`, `2026-09-02-input-context-cost.md`,
+or `2026-09-07-cost-forensics-tool.md`.
 
 ## 1. The problem was never detection
 
@@ -23,6 +24,11 @@ recorded the output verbatim:
                A restart re-pays ~35K of preamble (~$0.02); staying here cost
                $369.50 over one session.
 ```
+
+*(Superseded 2026-09-08 — see §11: this wording, defaulting to a restart, was
+replaced by a compact-first notice with `/hmd:save` mandatory at every tier.
+Kept verbatim above because the quote is the historical evidence this
+section's argument rests on, not a description of current behavior.)*
 
 "It fired on every prompt of this session. Context still reached 422,199 tokens —
 2.8x the ceiling — and the session continued for a full day past it." (§7, lines
@@ -225,19 +231,28 @@ meter never blocks new work on its own blind spot"* — the same fail-open postu
 tier-specific — only `CLIFF` ever shows refuse-capable language:
 
 ```
-⛔ REFUSE NEW WORK — <reason>. Do not start anything new here; restart first.
+⛔ REFUSE NEW WORK — <reason>. Do not start anything new here; compact first.
 ```
 or (also `CLIFF`, boundary not clean)
 ```
 DEFERRING new-work refusal — <reason>.
 ```
-or (`CLIFF_NEAR`, unconditionally — proven by test R8b to never show the above two)
+Either way, `CLIFF` alone then adds a fallback line neither other tier shows:
+```
+If compacting doesn't bring you back under 800,000, a fresh session is
+the fallback: resuming re-pays ~35K of preamble (~$0.02); staying here cost
+$913.54 once.
+```
+or (`CLIFF_NEAR`, unconditionally — proven by test R8b to never show the above)
 ```
 STRONG NOTICE — checkpoint recommended now. This tier never refuses new
 work; only the hard ceiling (800,000 tokens) can.
 ```
 
-(`bin/heimdall-ctx-meter`, `render_cliff`, tail.) This is the one place `gate`'s
+(`bin/heimdall-ctx-meter`, `render_cliff`, tail — rewritten 2026-09-08, see §11:
+`/hmd:save` then `/compact` is now the shared instruction above this branch at
+every tier that speaks, and "restart"/"fresh session" wording is now confined to
+`CLIFF` alone.) This is the one place `gate`'s
 logic runs inside the per-prompt path — but it only *renders* a decision already
 computed for display; it changes nothing about `notice`'s own exit-0-always
 contract, and it only executes at all once a session is already at
@@ -447,6 +462,77 @@ two different layers that move independently:
   dollar and every ratio above already existed in `token-spend-forensics.md`,
   `2026-09-02-input-context-cost.md`, or `2026-09-07-cost-forensics-tool.md`
   before this task started.
+
+---
+
+## 11. Addendum (2026-09-08b) — Compact Over Restart, Mandatory Save, One Task Per Subagent
+
+Three operator corrections landed after the design above shipped, verbatim:
+*"compact is better than starting a new session -- however, hmd save is a must
+to recommend the user; per task session could be the sub agent that the main
+agent is starting and controlling to ensure the control by giving only one task
+to one sub agent."* All three are wording/policy changes to the SAME mechanism
+this doc already describes — none touch the tier thresholds (`150,000` /
+`700,000` / `800,000`) or the boundary definition in §5, both of which stay
+exactly as derived above.
+
+**1. Compact, not restart, is now the primary remedy.** Every notice this file
+quoted above (`render_ceiling`, and `render_cliff`'s CLIFF_NEAR framing) told
+the operator to restart as the default action. That is reversed: `/hmd:save`
+then `/compact` is the primary instruction at every tier that speaks; a fresh
+session is now mentioned ONLY at the `CLIFF` tier itself, as the fallback for
+when compaction does not recover enough headroom — never at `CEILING` or
+`CLIFF_NEAR`. The cost evidence that justified the old wording (`$0.366` vs
+`$0.0593`, 6.17x; the ~35K/`$0.02` restart-repreamble cost; the `$913.54`
+one-session disaster figure) is unchanged and still quoted in full — this is a
+change to which remedy is recommended FIRST, not a deletion of the numbers that
+justify caring at all.
+
+**2. `/hmd:save` is mandatory in the recommendation, at every tier that speaks,
+regardless of remedy.** The reasoning is stated inline in the notice, briefly:
+compaction is a lossy rewrite of the very context being reasoned over, and a
+checkpoint written BEFORE it is what makes that rewrite recoverable rather than
+destructive. §7 above already carries the hard evidence for this asymmetry, not
+invented for this addendum: `bin/heimdall-resume-probe run` in the main
+checkout returned **GREEN — 6/6 never-lose categories recovered** because a
+`.planning/CHECKPOINT.md` existed there; the identical probe run in a worktree
+carrying no checkpoint of its own returned **RED**. The checkpoint is the
+measured difference between a lossless and a lossy rewrite — that is the
+argument, and it is now load-bearing in the notice text, not just in this doc.
+
+**3. One task per subagent** is a new rule, not a change to this gate — it
+lives in `agents/heimdall.md` §8e, not in `bin/heimdall-ctx-meter`. It is
+documented here because the evidence for it is a context-discipline argument of
+the exact same shape as §1 of this doc: a session transcript breakdown showing
+43.0% of history was the orchestrator verifying work itself instead of
+delegating it, and 28.7%+28.2% more was the orchestrator's own text plus
+multi-task reports landing whole in its context. Full rule text, the breakdown
+table, and the same honesty disclosure this doc applies to itself (§10) are in
+`agents/heimdall.md` §8e — not duplicated here, to avoid the two copies
+drifting apart the way `bin/heimdall-ctx-meter` and this doc's own quotes of it
+already had to be reconciled once (see the `docs(analysis): reconcile
+context-discipline gate doc with shipped 3-tier design` commit this repo
+already carries).
+
+**Test evidence, re-run after the wording change**: 9 new assertions were added
+to `test/ctx-meter.test.sh` (3 each in sections B, C, D) checking that
+`/hmd:save` is named and `/compact` is recommended at every speaking tier, and
+that `restart`/`fresh session` wording is absent below `CLIFF` and present only
+at `CLIFF`:
+
+```
+$ bash -n bin/heimdall-ctx-meter && echo SYNTAX_OK
+SYNTAX_OK
+$ bash test/ctx-meter.test.sh 2>&1 | grep -E "FAIL|passed"
+ctx-meter.test.sh: 119 passed, 0 failed.
+```
+
+The quoted `render_cliff` tail in §6 above and the top-of-document assertion
+count are both updated to match this run, not left as a stale quote of code
+that no longer says what the quote claims. The one exception is the §1 quote,
+left verbatim on purpose (it is a dated historical recording from another
+document, not a live description of this code) and instead marked superseded
+inline where it appears.
 
 Related: [`2026-09-02-input-context-cost.md`](2026-09-02-input-context-cost.md),
 [`2026-09-07-cost-forensics-tool.md`](2026-09-07-cost-forensics-tool.md).
