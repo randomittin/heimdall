@@ -163,38 +163,66 @@ down" for why that matters.
 | `worktree-agent-aebc508075abe7eff` | main already cites `docs/analysis/2026-08-25-omniroute-credential-isolation.md` sections S3/S5/S6 by name, more granular than the branch's own positive-verification rewrite |
 | `worktree-agent-aee583bb0c20a831e` | main's `test/heimdall-route.test.sh` already has "Ports are OS-assigned, not PID-derived"; `test/heimdall-watch.test.sh` already uses `"$WORK/wt_pyc.txt"` instead of a hardcoded `/tmp` path |
 
-### Why the count below goes UP, not down
+### Why the final re-run shows 21, not 17 — and why that is NOT this task's doing
 
-`bin/heimdall unconnected` re-run after landing the 2 merges reports **20** real
-branches, not 17. This is not a regression — it is a direct, mechanical
-consequence of the harness's own worktree-isolation guard, which blocked every
-attempt (both a `cd` into the shared checkout and any git invocation shaped in a
-way the guard could not statically verify stays inside this task's own worktree)
-to write directly to `main`. Both merges landed on this task's OWN branch,
-`worktree-agent-aa794acff37a0f0b5` — content-identical to `main` at task start,
-now 4 commits ahead of it. The tool counts ANY branch carrying a real commit not
-on `main` as unlanded, and this task's own staging branch now qualifies, while
-the two branches it absorbed still independently qualify too (merging branch A
-into branch B does not change branch A's own ahead-of-main status). Net: +1 (this
-task's branch, newly ahead) against 0 change to the other two (still separately
-ahead, as before) = 19 -> 20.
+Final `bin/heimdall unconnected` re-run, captured after both merges, the abort,
+and this doc's own commit: **FACE A real/gating count = 21** (self-consistent —
+header count and the printed list both say 21). Naive arithmetic would predict
+17 (19 minus the 2 landed). The actual number is higher, for two reasons, both
+verified directly rather than assumed:
+
+1. **The 2 landed branches still each appear in the list, individually** —
+   `heimdall/issue-2-mcp-path` and `worktree-agent-aea7bcce848550497` are still
+   printed as "N commit(s) ahead of main". Expected: merging branch A into this
+   task's staging branch does not change branch A's *own* ref — it is still,
+   correctly, N commits ahead of the real `main`. It stops appearing only once
+   `main` itself is fast-forwarded past it (see handoff command below).
+2. **Two branches with zero connection to this task's 19-branch worklist
+   appeared during the run and are now in the list**: `truth-pass` (3 commits
+   ahead) and `worktree-agent-ae8ca838ea1f29ff8` (2 commits ahead). Neither was
+   part of the brief's original 19, neither was touched, neither was evaluated
+   — they are concurrent work from other agents in this same multi-agent
+   session, landing in the shared local-branch namespace this scanner reads.
+   19 (original) + 2 (unrelated arrivals) = 21. This is the exact "concurrent
+   multi-agent churn" the brief itself already named as the reason its own
+   145 -> 21 -> 19 count moved between brief-writing and task-start; it kept
+   moving during task execution too, for the same reason.
+
+**This task's own staging branch, `worktree-agent-aa794acff37a0f0b5`, does NOT
+appear in the real/gating 21 at all** — verified directly against the raw
+output, not inferred. It appears instead under WIP-ONLY (5 commits ahead,
+informational, "does not gate"), alongside every other currently-checked-out
+agent worktree in this session. Read literally: the scanner does not treat a
+live, in-progress worktree's own ref as a gating "unlanded branch" candidate —
+so the two merges landed here added zero to the gating count. An earlier draft
+of this section, written before this final measurement, predicted a +1 for
+exactly that reason (this branch joining the gating list); the actual data
+contradicts that prediction, so the prediction is corrected here rather than
+left in place — the number that matters is the one measured, not the one
+guessed in advance.
+
+All 19 branches from this task's worklist are still present in the final scan,
+individually checked by name — none dropped, none newly conflicting, none
+reclassified by the churn. Verdicts in the tables above stand as measured.
 
 `git merge-base --is-ancestor main worktree-agent-aa794acff37a0f0b5` confirms a
-clean fast-forward is available. The one remaining mechanical step —
-outside this task's own sandbox, since git itself refuses to update a branch
-checked out in another worktree — is:
+clean fast-forward is available. The one remaining mechanical step — outside
+this task's own sandbox, since git refuses to update a branch checked out in
+another worktree — is, from the primary checkout:
 
 ```
-cd /Users/rj/Downloads/heimdall && git merge --ff-only worktree-agent-aa794acff37a0f0b5
+cd /Users/rj/Downloads/heimdall
+git merge --ff-only worktree-agent-aa794acff37a0f0b5
 ```
 
 Projected (not measured — this task cannot perform the fast-forward itself)
-result after that step: the 2 landed branches flip from real to clean (their
-content becomes reachable from `main`), and this task's own branch flips back to
-0-ahead. Real count: 19 -> 17. All 17 remaining are exactly the categories
-above: 14 already-landed (content-safe, but not byte-identical to main, so this
-mechanical tool will keep flagging them — the same "cry wolf" limitation the
-2026-09-08 correction already named, now reconfirmed against 14 more data
-points), 1 genuinely conflicted, 2 blocked on file ownership alone. Zero of the
-17 are a case of real work sitting unrecovered for no reason.
+effect: the 2 landed branches flip from real to clean once `main` reaches them.
+The other 19 real-list entries are untouched by that step either way — 14
+already-landed (content-safe, but not byte-identical to main, so this
+mechanical tool will keep flagging them regardless of any fast-forward — the
+same "cry wolf" limitation the 2026-09-08 correction named, now reconfirmed
+against 14 more data points), 1 genuinely conflicted, 2 blocked on file
+ownership alone. Zero of those 17 are a case of real work sitting unrecovered
+for no reason. `truth-pass` and `worktree-agent-ae8ca838ea1f29ff8` remain
+out of scope for this task and were left for whoever picks up the backlog next.
 
