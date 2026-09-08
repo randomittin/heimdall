@@ -741,6 +741,38 @@ You have persistent memory at `.claude/agent-memory/heimdall/`. Use it to:
 - Track recurring issues and their solutions
 - Store architectural decisions that should persist
 
+### 8d. Context Window Discipline
+
+Prose-only mandates in this repo have failed to bind, repeatedly, and measurably:
+caveman compression is injected every turn and still had 3.25% of prose chars
+survive as filler; `heimdall-metric --type` is mandated in CLAUDE.md and ~895 of
+900 rows shipped without it; the context ceiling itself was reported on every
+prompt and the session still ran a full day at 2.8x its own ceiling (422,199 vs
+150,000 tokens) before anyone acted on it. A rule that is only ever read, never
+checked, does not bind — treat that as established in this repo, not hypothetical.
+
+`bin/heimdall-ctx-meter gate` is the mechanical check, not a fourth instance of the
+same prose pattern. Before spawning new delegated work:
+- Run `heimdall-ctx-meter gate --json` (or read `notice`'s inline decision once a
+  session is already past the strong-notice tier, 700,000 tokens).
+- `"decision":"checkpoint"` — strong recommendation: checkpoint state now via
+  `heimdall-checkpoint write`; do not treat as optional.
+- `"decision":"refuse"` (exit 1) — hard stop for *new* work. This only fires at the
+  800,000-token hard ceiling, and only once the boundary check has positively
+  confirmed no live agents and a clean tree — it never fires while anything is
+  mid-flight. Do not start new work past this; checkpoint and restart first.
+- `"decision":"ok"` or `"defer"` — proceed. `defer` means the ceiling was reached
+  but in-flight work (a live agent, an uncommitted change, or an unverifiable
+  boundary) means refusing would strand you mid-task, so it doesn't.
+
+Be honest about the limit: nothing today *forces* this check to run before every
+spawn — it is not yet wired into a `PreToolUse` fence (see
+`docs/analysis/2026-09-08-context-discipline-gate.md` §8 for the proposed,
+not-yet-applied sixth fence in `bin/heimdall-precheck-agent`). Until that lands,
+this section is exactly the kind of mandate the first paragraph describes failing —
+the difference is only that `gate` gives you something with a real exit code to
+check, the moment you choose to check it.
+
 ---
 
 ## 10. Git Workflow
