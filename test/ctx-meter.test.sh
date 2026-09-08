@@ -537,8 +537,12 @@ fi
 # a session that reached 422,199 tokens -- 2.8x its own ceiling -- and the session
 # ran a full day past it anyway. `gate` is the first machine-checkable decision: a
 # real exit code (0=proceed, 1=refuse), gated on process/filesystem facts an
-# operator cannot talk their way past. It must satisfy three things at once:
-#   - never refuse below the hard ceiling (CLIFF_NEAR/CLIFF, >=700K)
+# operator cannot talk their way past. THREE TIERS, same thresholds as always:
+#   - CEILING (150K)     -> soft floor, advisory only, gate always "ok"
+#   - CLIFF_NEAR (700K)  -> strong notice, gate always "checkpoint", ALWAYS
+#     exit 0 -- this tier never consults the boundary and never refuses
+#   - CLIFF (800K)       -> hard ceiling, the ONLY tier that can refuse
+# At CLIFF alone, it must satisfy three things at once:
 #   - never refuse while ANY agent is live, or the tree carries an uncommitted
 #     change -- interrupting in-flight work to save tokens is a net loss
 #   - never refuse on a fact it could not verify (missing heimdall-agents binary,
@@ -590,39 +594,57 @@ HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
 [ "$RC" = 0 ] && ok "no reading (NON_VERIFIED) -> gate exits 0 (fails open)" \
              || bad "gate exited $RC on an unverified reading -- must never block on its own blind spot"
 
-# R3: past the hard ceiling + a CONFIRMED clean boundary (no live agents, clean
-#     tree) -> the one and only path that REFUSES.
+# R3: CLIFF_NEAR (>=700K, <800K) is the STRONG-NOTICE tier -- it recommends a
+#     checkpoint but NEVER refuses, regardless of live agents or a dirty tree.
+#     Only CLIFF (>=800K, R4 below) can ever refuse.
 rm -rf "$HEIMDALL_HOME"; publish 720000
 HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
-[ "$RC" = 1 ] && ok "720,000 tok + 0 live agents + clean tree -> gate REFUSES (exit 1)" \
+[ "$RC" = 0 ] && ok "720,000 tok (CLIFF_NEAR, clean boundary) -> gate still exits 0 (checkpoint, not refuse)" \
+             || bad "gate refused at CLIFF_NEAR (exit $RC) -- only CLIFF may ever refuse"
+hasrei "$OUT" 'checkpoint' && ok "decision names the strong-notice/checkpoint tier" || bad "CLIFF_NEAR decision not named: $OUT"
+
+# R3b: CLIFF_NEAR ignores the boundary entirely -- it must not even flip to
+#      "defer" when agents are live or the tree is dirty, because it never
+#      calls the boundary check in the first place.
+rm -rf "$HEIMDALL_HOME"; publish 720000
+HMD_CTX_AGENTS_BIN="$TWO_AGENTS" HMD_CTX_REPO="$DIRTY_REPO" gate
+[ "$RC" = 0 ] && ok "720,000 tok + live agents + dirty tree -> still just checkpoint, never refuse" \
+             || bad "gate refused at CLIFF_NEAR even with agents live and a dirty tree (exit $RC)"
+hasrei "$OUT" 'checkpoint' && ok "CLIFF_NEAR decision unaffected by boundary state" || bad "CLIFF_NEAR decision drifted: $OUT"
+
+# R4: past the TRUE hard ceiling (CLIFF, >=800K) + a CONFIRMED clean boundary (no
+#     live agents, clean tree) -> the one and only path that REFUSES.
+rm -rf "$HEIMDALL_HOME"; publish 812000
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
+[ "$RC" = 1 ] && ok "812,000 tok + 0 live agents + clean tree -> gate REFUSES (exit 1)" \
              || bad "gate did not refuse on a fully clean hard-ceiling boundary (exit $RC): $OUT$ERR"
 has "$OUT" 'refuse' && ok "decision field says refuse" || bad "refuse decision not named: $OUT"
 
-rm -rf "$HEIMDALL_HOME"; publish 812000
+rm -rf "$HEIMDALL_HOME"; publish 900000
 HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
-[ "$RC" = 1 ] && ok "812,000 tok (past CLIFF) + clean boundary -> gate REFUSES too" \
-             || bad "gate did not refuse past the cliff with a clean boundary (exit $RC)"
+[ "$RC" = 1 ] && ok "900,000 tok (well past CLIFF) + clean boundary -> gate REFUSES too" \
+             || bad "gate did not refuse well past the cliff with a clean boundary (exit $RC)"
 
-# R4: past the hard ceiling but an agent is LIVE -> DEFER, never refuse. In-flight
-#     work is never interrupted, full stop -- this is the non-negotiable case.
-rm -rf "$HEIMDALL_HOME"; publish 720000
+# R5: past CLIFF but an agent is LIVE -> DEFER, never refuse. In-flight work is
+#     never interrupted, full stop -- this is the non-negotiable case.
+rm -rf "$HEIMDALL_HOME"; publish 812000
 HMD_CTX_AGENTS_BIN="$TWO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
-[ "$RC" = 0 ] && ok "720,000 tok + 2 live agents -> gate DEFERS (exit 0, never interrupts)" \
+[ "$RC" = 0 ] && ok "812,000 tok + 2 live agents -> gate DEFERS (exit 0, never interrupts)" \
              || bad "gate refused while agents were live -- would interrupt in-flight work (exit $RC)"
 has "$OUT" 'defer' && ok "decision field says defer" || bad "defer decision not named: $OUT"
 hasre "$OUT" '2 agent'  && ok "names the live-agent count in the reason" || bad "reason does not cite the live agents: $OUT"
 
-# R5: past the hard ceiling, no live agents, but an UNCOMMITTED change sits in
-#     the tree -> DEFER. Uncommitted work is a mid-flight signal too.
-rm -rf "$HEIMDALL_HOME"; publish 720000
+# R6: past CLIFF, no live agents, but an UNCOMMITTED change sits in the tree ->
+#     DEFER. Uncommitted work is a mid-flight signal too.
+rm -rf "$HEIMDALL_HOME"; publish 812000
 HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$DIRTY_REPO" gate
-[ "$RC" = 0 ] && ok "720,000 tok + 0 agents + DIRTY tree -> gate DEFERS, does not refuse" \
+[ "$RC" = 0 ] && ok "812,000 tok + 0 agents + DIRTY tree -> gate DEFERS, does not refuse" \
              || bad "gate refused on a dirty tree (exit $RC) -- uncommitted work is mid-flight too"
 hasrei "$OUT" 'uncommitted' && ok "reason names the uncommitted change" || bad "reason silent on why: $OUT"
 
-# R6: the boundary itself is UNRESOLVABLE -> fail OPEN, defer, never refuse. Three
-#     independent ways it can be unresolvable, all must defer:
-rm -rf "$HEIMDALL_HOME"; publish 720000
+# R6b: the boundary itself is UNRESOLVABLE at CLIFF -> fail OPEN, defer, never
+#      refuse. Three independent ways it can be unresolvable, all must defer:
+rm -rf "$HEIMDALL_HOME"; publish 812000
 NO_SUCH_BIN="$TMP/does-not-exist-$$"
 HMD_CTX_AGENTS_BIN="$NO_SUCH_BIN" HMD_CTX_REPO="$CLEAN_REPO" gate
 [ "$RC" = 0 ] && ok "missing heimdall-agents binary -> gate DEFERS (fails open on the boundary)" \
@@ -655,6 +677,15 @@ rm -rf "$HEIMDALL_HOME"; publish 850000
 HMD_CTX_AGENTS_BIN="$TWO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" notice
 hasrei "$(both)" 'deferring' && ok "the cliff notice names DEFERRING when agents are live" \
                               || bad "cliff notice does not carry the defer decision: $(both)"
+
+# R8b: at CLIFF_NEAR the notice shows STRONG NOTICE framing and must NEVER claim
+#      refuse capability -- the tier separation has to hold in rendered text too.
+rm -rf "$HEIMDALL_HOME"; publish 720000
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" notice
+hasrei "$(both)" 'strong notice' && ok "CLIFF_NEAR notice shows STRONG NOTICE framing" \
+                                  || bad "CLIFF_NEAR notice missing strong-notice framing: $(both)"
+hasrei "$(both)" 'refuse new work' && bad "CLIFF_NEAR notice must never claim REFUSE NEW WORK" \
+                                    || ok "CLIFF_NEAR notice correctly never claims refuse capability"
 
 # R9: gate is on the machine-checkable path, not the hot path -- still fast.
 rm -rf "$HEIMDALL_HOME"; publish 812000

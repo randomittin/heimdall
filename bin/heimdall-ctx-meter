@@ -54,28 +54,46 @@
 # orchestrator, before spawning new work) and CHECKED — exit 0 vs 1 — not
 # merely read.
 #
-# gate only ever escalates past "proceed" at the hard ceiling (CLIFF_NEAR /
-# CLIFF, >=700K), and only when a BOUNDARY is mechanically provable:
-#   1. a LIVE agent (`heimdall-agents count` > 0)   -> DEFER. In-flight work
-#      is never interrupted by this or any other check, full stop.
-#   2. an unresolvable boundary (no git, no repo,
-#      no heimdall-agents binary)                   -> DEFER. This meter
-#      fails open on its OWN inputs, unconditionally; a fact it could not
-#      verify is never a reason to refuse.
-#   3. an uncommitted change in the tracked tree
-#      (`git status --porcelain`)                   -> DEFER. Uncommitted
-#      work is itself a mid-flight signal, live agent process or not.
-#   4. none of the above                             -> REFUSE. No live
-#      agent, clean tree, past the hard ceiling: a clean place to stop.
-# These are process/filesystem facts, not self-reported prose — ungameable by
-# construction — and cheap enough (two subprocess calls) to matter only at
-# the rare hard-ceiling tier; the low-context hot path never pays for them.
+# THREE TIERS, reusing the meter's existing thresholds — zero new numbers:
+#   1. SOFT FLOOR    (CEILING, 150K)     -> advisory only (render_ceiling).
+#      gate: always "ok". The cost curve here is mild; a plain reminder is
+#      proportionate, and this tier never touches the boundary check below.
+#   2. STRONG NOTICE (CLIFF_NEAR, 700K)  -> gate: always "checkpoint", ALWAYS
+#      exit 0. This tier NEVER consults the boundary and NEVER refuses, no
+#      matter how many agents are live or how dirty the tree is — it exists
+#      to make checkpointing an insistent, named recommendation, not a block.
+#   3. HARD CEILING  (CLIFF, 800K)       -> the ONLY tier that can refuse,
+#      and only when a BOUNDARY is mechanically provable:
+#        a. a LIVE agent (`heimdall-agents count` > 0)   -> DEFER. In-flight
+#           work is never interrupted by this or any other check, full stop.
+#        b. an unresolvable boundary (no git, no repo,
+#           no heimdall-agents binary)                   -> DEFER. This meter
+#           fails open on its OWN inputs, unconditionally; a fact it could
+#           not verify is never a reason to refuse.
+#        c. an uncommitted change in the tracked tree
+#           (`git status --porcelain`)                   -> DEFER. Uncommitted
+#           work is itself a mid-flight signal, live agent process or not.
+#        d. none of the above                             -> REFUSE. No live
+#           agent, clean tree, past the hard ceiling: a clean place to stop.
+# The boundary check is process/filesystem facts, not self-reported prose —
+# ungameable by construction — and cheap enough (two subprocess calls) to
+# matter only at the rarest tier; everything below CLIFF_NEAR never pays for
+# it, and CLIFF_NEAR pays only for a notice, never the boundary check itself.
+#
+# WHY THE NUMBERS DIDN'T CHANGE: 150K/700K/800K already ran past unchecked —
+# 422,199 tokens is 2.8x the 150K ceiling — but that was a failure of
+# ENFORCEMENT, not calibration. 150K is the figure that recovers $369.50,
+# measured on this repo (see above); 700K/800K bracket the measured
+# cache-write cliff (804,141, a 3.2x surcharge) — also already measured, not
+# guessed. Moving either number without new measurement would be exactly the
+# invented-figure move this design forbids itself; adding real tiers to a
+# number that was already right is what was actually missing.
 #
 # USAGE
 #   heimdall-ctx-meter publish [--session SID]   # stdin: the statusLine JSON blob
 #   heimdall-ctx-meter read    [--session SID] [--json]
 #   heimdall-ctx-meter notice  [--session SID]   # stdin: the UserPromptSubmit JSON
-#   heimdall-ctx-meter gate    [--session SID] [--json]  # may NEW work start? exit 0=proceed, 1=refuse
+#   heimdall-ctx-meter gate    [--session SID] [--json]  # may NEW work start? exit 0=proceed(ok/checkpoint/defer), 1=refuse
 #   heimdall-ctx-meter outshare [--json]         # local output-token share vs input (see ENVIRONMENT)
 #
 # ENVIRONMENT (defaults are the measured figures, not taste)
@@ -386,19 +404,28 @@ do_read() {
 # ── gate — THE machine-checkable decision: may NEW work start? ──────────────────
 # Distinct from notice: this is the one verb in this file allowed a REAL exit
 # code, because it exists to be CHECKED, not merely read (see header comment).
-#   exit 0  -> proceed  (below the hard ceiling, an unverifiable reading, OR a
-#              hard-ceiling reading that DEFERS because in-flight work exists)
-#   exit 1  -> refuse   (at/past the hard ceiling AND a clean, provable boundary)
+# Three tiers (see "WHY gate IS A SEPARATE VERB" above) map onto ONE exit-code
+# contract:
+#   exit 0  -> proceed  (soft-floor "ok", strong-notice "checkpoint", OR a
+#              hard-ceiling reading that "defer"s because in-flight work
+#              exists or the boundary was unresolvable — an unverifiable
+#              reading always resolves here too)
+#   exit 1  -> refuse   (ONLY at the hard ceiling (CLIFF) AND a clean,
+#              provable boundary — CLIFF_NEAR can never reach this)
 do_gate() {
   if [ -z "$SESSION" ] && [ -z "${CLAUDE_SESSION_ID:-}" ]; then _slurp; fi
   _resolve
   local decision="ok" reason
-  reason="below the hard ceiling ($(_commas "$CLIFF_NEAR"))"
+  reason="below the strong-notice tier ($(_commas "$CLIFF_NEAR")) — soft floor only"
   case "$STATE" in
-    CLIFF_NEAR|CLIFF)
+    CLIFF)
       _boundary_decision
       decision="$BOUND_DECISION"
       reason="$BOUND_REASON"
+      ;;
+    CLIFF_NEAR)
+      decision="checkpoint"
+      reason="strong notice — at the strong-notice tier ($(_commas "$CLIFF_NEAR")); checkpoint now. Never refuses on its own — only the hard ceiling ($(_commas "$CLIFF")) can."
       ;;
     NON_VERIFIED)
       decision="ok"
@@ -477,11 +504,16 @@ render_cliff() {
   e ""
   e "  STOP AND RESTART:   /hmd:save     then exit and open a fresh session."
   e "  Resuming costs ~35K of preamble, about \$0.02. Not restarting cost \$913.54 once."
-  _boundary_decision
-  if [ "$BOUND_DECISION" = "refuse" ]; then
-    e "  ⛔ REFUSE NEW WORK — ${BOUND_REASON}. Do not start anything new here; restart first."
+  if [ "$state" = "CLIFF" ]; then
+    _boundary_decision
+    if [ "$BOUND_DECISION" = "refuse" ]; then
+      e "  ⛔ REFUSE NEW WORK — ${BOUND_REASON}. Do not start anything new here; restart first."
+    else
+      e "  DEFERRING new-work refusal — ${BOUND_REASON}."
+    fi
   else
-    e "  DEFERRING new-work refusal — ${BOUND_REASON}."
+    e "  STRONG NOTICE — checkpoint recommended now. This tier never refuses new"
+    e "  work; only the hard ceiling ($(_commas "$CLIFF") tokens) can."
   fi
   e "$RULE"
   e ""
