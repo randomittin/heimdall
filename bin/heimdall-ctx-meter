@@ -44,10 +44,38 @@
 #   - Every verb exits 0 on garbage. It runs in the prompt path; it must never be able
 #     to break a turn.
 #
+# WHY `gate` IS A SEPARATE VERB FROM notice
+# ------------------------------------------
+# notice's one hard invariant is "exits 0 on garbage, always" — it runs on
+# EVERY prompt and must never be able to break a turn. That invariant cannot
+# also be the verb that refuses new work, because refusing needs a REAL exit
+# code, a different contract. `gate` carries that contract instead: it is not
+# on the per-prompt hot path, it exists to be invoked deliberately (by the
+# orchestrator, before spawning new work) and CHECKED — exit 0 vs 1 — not
+# merely read.
+#
+# gate only ever escalates past "proceed" at the hard ceiling (CLIFF_NEAR /
+# CLIFF, >=700K), and only when a BOUNDARY is mechanically provable:
+#   1. a LIVE agent (`heimdall-agents count` > 0)   -> DEFER. In-flight work
+#      is never interrupted by this or any other check, full stop.
+#   2. an unresolvable boundary (no git, no repo,
+#      no heimdall-agents binary)                   -> DEFER. This meter
+#      fails open on its OWN inputs, unconditionally; a fact it could not
+#      verify is never a reason to refuse.
+#   3. an uncommitted change in the tracked tree
+#      (`git status --porcelain`)                   -> DEFER. Uncommitted
+#      work is itself a mid-flight signal, live agent process or not.
+#   4. none of the above                             -> REFUSE. No live
+#      agent, clean tree, past the hard ceiling: a clean place to stop.
+# These are process/filesystem facts, not self-reported prose — ungameable by
+# construction — and cheap enough (two subprocess calls) to matter only at
+# the rare hard-ceiling tier; the low-context hot path never pays for them.
+#
 # USAGE
 #   heimdall-ctx-meter publish [--session SID]   # stdin: the statusLine JSON blob
 #   heimdall-ctx-meter read    [--session SID] [--json]
 #   heimdall-ctx-meter notice  [--session SID]   # stdin: the UserPromptSubmit JSON
+#   heimdall-ctx-meter gate    [--session SID] [--json]  # may NEW work start? exit 0=proceed, 1=refuse
 #   heimdall-ctx-meter outshare [--json]         # local output-token share vs input (see ENVIRONMENT)
 #
 # ENVIRONMENT (defaults are the measured figures, not taste)
@@ -61,6 +89,10 @@
 #   HMD_CTX_PROJECTS_ROOT  outshare: root walked for *.jsonl transcripts (default ~/.claude/projects)
 #   HMD_HEADROOM_LEDGER    outshare: headroom ledger read for lifetime.total_input_tokens
 #                          (default ~/.headroom/proxy_savings.json)
+#   HMD_CTX_REPO        gate: override repo root the boundary check inspects
+#                       (default: git rev-parse --show-toplevel from this script's own directory)
+#   HMD_CTX_AGENTS_BIN  gate: override heimdall-agents binary for the live-agent check
+#                       (default: alongside this script)
 
 set -uo pipefail
 
@@ -107,7 +139,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --session) SESSION="${2:-}"; shift 2 ;;
     --json)    JSON_OUT=1; shift ;;
-    --help|-h) sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h) sed -n '2,108p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) shift ;;
   esac
 done
@@ -274,6 +306,65 @@ _resolve() {
   fi
 }
 
+# ── boundary — mechanical, ungameable, checkable in milliseconds ────────────────
+# See the header comment ("WHY gate IS A SEPARATE VERB") for the full rationale.
+# Sets BOUND_DECISION (refuse|defer) and BOUND_REASON (one line, human-readable).
+# Every branch that cannot POSITIVELY confirm "no live agent, clean tree" defers —
+# this fails open on the boundary signal itself, the same way the meter fails
+# open on its own primary reading.
+_repo_root() {
+  if [ -n "${HMD_CTX_REPO:-}" ]; then printf '%s' "$HMD_CTX_REPO"; return 0; fi
+  git -C "$(dirname "$_CTXM_SELF")" rev-parse --show-toplevel 2>/dev/null
+}
+
+_agents_bin() {
+  if [ -n "${HMD_CTX_AGENTS_BIN:-}" ]; then printf '%s' "$HMD_CTX_AGENTS_BIN"; return 0; fi
+  printf '%s/heimdall-agents' "$(cd "$(dirname "$_CTXM_SELF")" && pwd)"
+}
+
+BOUND_DECISION=""; BOUND_REASON=""
+_boundary_decision() {
+  local agents_bin live repo
+  BOUND_DECISION=""; BOUND_REASON=""
+  agents_bin="$(_agents_bin)"
+  if [ ! -x "$agents_bin" ]; then
+    BOUND_DECISION="defer"
+    BOUND_REASON="boundary unresolvable (no heimdall-agents binary) — deferring, never refusing on an unverifiable fact"
+    return 0
+  fi
+  live="$("$agents_bin" count 2>/dev/null)"
+  if ! _is_int "$live"; then
+    BOUND_DECISION="defer"
+    BOUND_REASON="boundary unresolvable (heimdall-agents count gave no number) — deferring, never refusing on an unverifiable fact"
+    return 0
+  fi
+  if [ "$live" -gt 0 ]; then
+    BOUND_DECISION="defer"
+    BOUND_REASON="${live} agent(s) live — in-flight work is never interrupted"
+    return 0
+  fi
+
+  repo="$(_repo_root)"
+  if [ -z "$repo" ] || [ ! -d "$repo" ]; then
+    BOUND_DECISION="defer"
+    BOUND_REASON="boundary unresolvable (no repo) — deferring, never refusing on an unverifiable fact"
+    return 0
+  fi
+  if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+    BOUND_DECISION="defer"
+    BOUND_REASON="boundary unresolvable (not a git repo) — deferring, never refusing on an unverifiable fact"
+    return 0
+  fi
+  if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+    BOUND_DECISION="defer"
+    BOUND_REASON="uncommitted changes present — work is mid-flight even without a live agent"
+    return 0
+  fi
+
+  BOUND_DECISION="refuse"
+  BOUND_REASON="no live agents, clean tree — a clean boundary to stop new work at"
+}
+
 # ── read ─────────────────────────────────────────────────────────────────────────
 do_read() {
   # A query verb must not touch stdin it does not need. When the session is already
@@ -289,6 +380,38 @@ do_read() {
   else
     printf '%s %s tokens\n' "$STATE" "$(_commas "$TOKENS")"
   fi
+  exit 0
+}
+
+# ── gate — THE machine-checkable decision: may NEW work start? ──────────────────
+# Distinct from notice: this is the one verb in this file allowed a REAL exit
+# code, because it exists to be CHECKED, not merely read (see header comment).
+#   exit 0  -> proceed  (below the hard ceiling, an unverifiable reading, OR a
+#              hard-ceiling reading that DEFERS because in-flight work exists)
+#   exit 1  -> refuse   (at/past the hard ceiling AND a clean, provable boundary)
+do_gate() {
+  if [ -z "$SESSION" ] && [ -z "${CLAUDE_SESSION_ID:-}" ]; then _slurp; fi
+  _resolve
+  local decision="ok" reason
+  reason="below the hard ceiling ($(_commas "$CLIFF_NEAR"))"
+  case "$STATE" in
+    CLIFF_NEAR|CLIFF)
+      _boundary_decision
+      decision="$BOUND_DECISION"
+      reason="$BOUND_REASON"
+      ;;
+    NON_VERIFIED)
+      decision="ok"
+      reason="unverified ($REASON) — the meter never blocks new work on its own blind spot"
+      ;;
+  esac
+  if [ "$JSON_OUT" = 1 ]; then
+    printf '{"decision":"%s","state":"%s","tokens":%s,"reason":"%s"}\n' \
+      "$decision" "$STATE" "${TOKENS:-null}" "$reason"
+  else
+    printf '%s (%s)\n' "$decision" "$reason"
+  fi
+  [ "$decision" = "refuse" ] && exit 1
   exit 0
 }
 
@@ -354,6 +477,12 @@ render_cliff() {
   e ""
   e "  STOP AND RESTART:   /hmd:save     then exit and open a fresh session."
   e "  Resuming costs ~35K of preamble, about \$0.02. Not restarting cost \$913.54 once."
+  _boundary_decision
+  if [ "$BOUND_DECISION" = "refuse" ]; then
+    e "  ⛔ REFUSE NEW WORK — ${BOUND_REASON}. Do not start anything new here; restart first."
+  else
+    e "  DEFERRING new-work refusal — ${BOUND_REASON}."
+  fi
   e "$RULE"
   e ""
 }
@@ -569,10 +698,11 @@ case "$VERB" in
   publish)  do_publish ;;
   read)     do_read ;;
   notice)   do_notice ;;
+  gate)     do_gate ;;
   outshare) do_outshare ;;
-  ''|--help|-h|help) sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  ''|--help|-h|help) sed -n '2,108p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *)
-    printf 'heimdall-ctx-meter: unknown verb "%s" (expected publish|read|notice|outshare)\n' "$VERB" >&2
+    printf 'heimdall-ctx-meter: unknown verb "%s" (expected publish|read|notice|gate|outshare)\n' "$VERB" >&2
     exit 64
     ;;
 esac

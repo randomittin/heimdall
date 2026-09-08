@@ -48,6 +48,11 @@
 #   O. NEVER ERRORS               — garbage on stdin still exits 0 on every verb. This
 #      runs in the prompt path; it must never be able to break a turn.
 #   P. HERMETIC                   — the real ~/.heimdall is never touched.
+#   R. GATE                       — a NEW machine-checkable verb (2026-09-08): may
+#      NEW work start? Real exit code (0=proceed, 1=refuse), gated on REAL process/
+#      filesystem facts (a live agent, an uncommitted change) — never refuses below
+#      the hard ceiling, never refuses while work is in flight, and fails OPEN the
+#      instant the boundary itself cannot be verified.
 #
 # Usage:  bash test/ctx-meter.test.sh    (exit 0 = every proof holds)
 
@@ -522,6 +527,173 @@ else
   has "$OJ_NOPY" 'output_share_of_local_total' \
     && bad "a NON_VERIFIED outshare response still carried a share number" "$OJ_NOPY" \
     || ok "the NON_VERIFIED response carries no share figure at all (nothing to mistake for real)"
+fi
+
+# ── R. GATE — refuse NEW work only at the hard ceiling with a clean, ungameable
+#    boundary; never interrupt in-flight work; fail open on anything unresolvable ──
+# THE NEW BEHAVIOR THIS GUARDS (docs/analysis/2026-09-08-context-discipline-gate.md)
+# ------------------------------------------------------------------------------
+# The meter above is PURELY advisory: it rendered the cliff notice every prompt of
+# a session that reached 422,199 tokens -- 2.8x its own ceiling -- and the session
+# ran a full day past it anyway. `gate` is the first machine-checkable decision: a
+# real exit code (0=proceed, 1=refuse), gated on process/filesystem facts an
+# operator cannot talk their way past. It must satisfy three things at once:
+#   - never refuse below the hard ceiling (CLIFF_NEAR/CLIFF, >=700K)
+#   - never refuse while ANY agent is live, or the tree carries an uncommitted
+#     change -- interrupting in-flight work to save tokens is a net loss
+#   - never refuse on a fact it could not verify (missing heimdall-agents binary,
+#     no git, no repo) -- fail OPEN on the boundary signal itself, same as the
+#     meter's own NON_VERIFIED philosophy for its primary reading
+sec "R. GATE — mechanical, ungameable refuse-vs-defer at the hard ceiling:"
+
+fake_agents() { # <count> -> prints path to an executable stub reporting <count>
+  local f; f="$(mktemp "$TMP/fake-agents-XXXXXX")"
+  printf '#!/bin/sh\necho %s\n' "$1" > "$f"
+  chmod +x "$f"
+  printf '%s' "$f"
+}
+git_repo_clean() { # -> prints path to a fresh, committed, clean git repo
+  local d; d="$(mktemp -d "$TMP/repo-clean-XXXXXX")"
+  git -C "$d" init -q
+  git -C "$d" -c user.email=t@t.test -c user.name=t commit -q --allow-empty -m init
+  printf '%s' "$d"
+}
+git_repo_dirty() { # -> prints path to a committed git repo with an uncommitted file
+  local d; d="$(git_repo_clean)"
+  printf 'x' > "$d/dirty.txt"
+  printf '%s' "$d"
+}
+gate() { # extra args...
+  OUT="$("$METER" gate --session "$SID" "$@" 2>"$TMP/err.txt")"; RC=$?
+  ERR="$(cat "$TMP/err.txt" 2>/dev/null)"
+}
+
+ZERO_AGENTS="$(fake_agents 0)"
+TWO_AGENTS="$(fake_agents 2)"
+CLEAN_REPO="$(git_repo_clean)"
+DIRTY_REPO="$(git_repo_dirty)"
+
+# R1: below the hard ceiling -> always proceed, regardless of boundary state.
+rm -rf "$HEIMDALL_HOME"; publish 118678
+HMD_CTX_AGENTS_BIN="$TWO_AGENTS" HMD_CTX_REPO="$DIRTY_REPO" gate
+[ "$RC" = 0 ] && ok "118,678 tok (below ceiling) -> gate exits 0" || bad "gate exited $RC below the ceiling"
+hasre "$OUT" '^ok \(' && ok "decision=ok below the ceiling" || bad "gate did not report ok: $OUT$ERR"
+
+rm -rf "$HEIMDALL_HOME"; publish 400000
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
+[ "$RC" = 0 ] && ok "400,000 tok (CEILING, below hard ceiling) -> gate exits 0" \
+             || bad "gate exited $RC at CEILING tier"
+
+# R2: NON_VERIFIED (no reading at all) -> gate fails OPEN, never refuses.
+rm -rf "$HEIMDALL_HOME"
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
+[ "$RC" = 0 ] && ok "no reading (NON_VERIFIED) -> gate exits 0 (fails open)" \
+             || bad "gate exited $RC on an unverified reading -- must never block on its own blind spot"
+
+# R3: past the hard ceiling + a CONFIRMED clean boundary (no live agents, clean
+#     tree) -> the one and only path that REFUSES.
+rm -rf "$HEIMDALL_HOME"; publish 720000
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
+[ "$RC" = 1 ] && ok "720,000 tok + 0 live agents + clean tree -> gate REFUSES (exit 1)" \
+             || bad "gate did not refuse on a fully clean hard-ceiling boundary (exit $RC): $OUT$ERR"
+has "$OUT" 'refuse' && ok "decision field says refuse" || bad "refuse decision not named: $OUT"
+
+rm -rf "$HEIMDALL_HOME"; publish 812000
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
+[ "$RC" = 1 ] && ok "812,000 tok (past CLIFF) + clean boundary -> gate REFUSES too" \
+             || bad "gate did not refuse past the cliff with a clean boundary (exit $RC)"
+
+# R4: past the hard ceiling but an agent is LIVE -> DEFER, never refuse. In-flight
+#     work is never interrupted, full stop -- this is the non-negotiable case.
+rm -rf "$HEIMDALL_HOME"; publish 720000
+HMD_CTX_AGENTS_BIN="$TWO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate
+[ "$RC" = 0 ] && ok "720,000 tok + 2 live agents -> gate DEFERS (exit 0, never interrupts)" \
+             || bad "gate refused while agents were live -- would interrupt in-flight work (exit $RC)"
+has "$OUT" 'defer' && ok "decision field says defer" || bad "defer decision not named: $OUT"
+hasre "$OUT" '2 agent'  && ok "names the live-agent count in the reason" || bad "reason does not cite the live agents: $OUT"
+
+# R5: past the hard ceiling, no live agents, but an UNCOMMITTED change sits in
+#     the tree -> DEFER. Uncommitted work is a mid-flight signal too.
+rm -rf "$HEIMDALL_HOME"; publish 720000
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$DIRTY_REPO" gate
+[ "$RC" = 0 ] && ok "720,000 tok + 0 agents + DIRTY tree -> gate DEFERS, does not refuse" \
+             || bad "gate refused on a dirty tree (exit $RC) -- uncommitted work is mid-flight too"
+hasrei "$OUT" 'uncommitted' && ok "reason names the uncommitted change" || bad "reason silent on why: $OUT"
+
+# R6: the boundary itself is UNRESOLVABLE -> fail OPEN, defer, never refuse. Three
+#     independent ways it can be unresolvable, all must defer:
+rm -rf "$HEIMDALL_HOME"; publish 720000
+NO_SUCH_BIN="$TMP/does-not-exist-$$"
+HMD_CTX_AGENTS_BIN="$NO_SUCH_BIN" HMD_CTX_REPO="$CLEAN_REPO" gate
+[ "$RC" = 0 ] && ok "missing heimdall-agents binary -> gate DEFERS (fails open on the boundary)" \
+             || bad "gate refused when it could not even check for live agents (exit $RC)"
+
+NOT_A_REPO="$(mktemp -d "$TMP/not-a-repo-XXXXXX")"
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$NOT_A_REPO" gate
+[ "$RC" = 0 ] && ok "HMD_CTX_REPO is not a git repo -> gate DEFERS (fails open)" \
+             || bad "gate refused with no git repo to check (exit $RC)"
+
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$TMP/nonexistent-dir-$$" gate
+[ "$RC" = 0 ] && ok "HMD_CTX_REPO points nowhere -> gate DEFERS (fails open)" \
+             || bad "gate refused with an unresolvable repo path (exit $RC)"
+
+# R7: --json is well-formed and carries state + tokens alongside the decision.
+rm -rf "$HEIMDALL_HOME"; publish 812000
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate --json
+hasre "$OUT" '"decision"[[:space:]]*:[[:space:]]*"refuse"' && ok "JSON decision=refuse" || bad "JSON missing decision=refuse: $OUT"
+hasre "$OUT" '"state"[[:space:]]*:[[:space:]]*"CLIFF"'     && ok "JSON carries the underlying state (CLIFF)" || bad "JSON missing state: $OUT"
+hasre "$OUT" '"tokens"[[:space:]]*:[[:space:]]*812000'     && ok "JSON carries the actual token reading"    || bad "JSON missing tokens: $OUT"
+
+# R8: render_cliff (the existing per-prompt notice) now ALSO carries the same
+#     decision inline -- an operator reading stderr sees it without a second call.
+rm -rf "$HEIMDALL_HOME"; publish 850000
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" notice
+hasrei "$(both)" 'refuse new work' && ok "the cliff notice itself names REFUSE on a clean boundary" \
+                                    || bad "cliff notice does not carry the refuse decision: $(both)"
+
+rm -rf "$HEIMDALL_HOME"; publish 850000
+HMD_CTX_AGENTS_BIN="$TWO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" notice
+hasrei "$(both)" 'deferring' && ok "the cliff notice names DEFERRING when agents are live" \
+                              || bad "cliff notice does not carry the defer decision: $(both)"
+
+# R9: gate is on the machine-checkable path, not the hot path -- still fast.
+rm -rf "$HEIMDALL_HOME"; publish 812000
+S=$(date +%s)
+HMD_CTX_AGENTS_BIN="$ZERO_AGENTS" HMD_CTX_REPO="$CLEAN_REPO" gate >/dev/null 2>&1
+E=$(date +%s)
+D=$((E - S))
+[ "$D" -le 5 ] && ok "gate resolves in ${D}s (two subprocess calls, not a hang)" \
+               || bad "gate took ${D}s -- too slow for something the orchestrator checks before every spawn"
+
+# R10: --help documents gate (discoverability, and proves the widened comment
+#      range was NOT silently truncated by this change).
+HELP="$("$METER" --help 2>/dev/null)"
+has "$HELP" 'gate' && ok "--help documents the gate verb" || bad "--help does not mention gate"
+
+# R11: never errors -- garbage stdin/session still exits 0 or 1, never crashes,
+#      and an unknown verb still lists gate among the expected verbs.
+RC3=0; printf 'garbage \x01\x02' | "$METER" gate --session "$SID" >/dev/null 2>&1 || RC3=$?
+{ [ "$RC3" = 0 ] || [ "$RC3" = 1 ]; } && ok "gate exits 0 or 1 on garbage stdin, never crashes" \
+                                       || bad "gate exited $RC3 on garbage stdin (expected 0 or 1)"
+ERRMSG="$("$METER" no-such-verb 2>&1 >/dev/null)"
+has "$ERRMSG" 'gate' && ok "unknown-verb error message lists gate among the expected verbs" \
+                      || bad "unknown-verb message was not updated: $ERRMSG"
+
+# R12: DEFAULT resolution (no override) -- the real fallback path must be sane,
+#      not just the test seam. Never drives gate's DECISION against the real
+#      tree here (this worktree is being edited live by this very task, so its
+#      git-clean state is not a stable thing to assert on).
+DEFAULT_REPO="$(cd "$REPO" && git rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$DEFAULT_REPO" ] && ok "default repo resolution: git rev-parse --show-toplevel works from here" \
+                        || bad "could not confirm the real repo resolves via git rev-parse"
+[ -x "$REPO/bin/heimdall-agents" ] && ok "default agents-bin sibling path exists and is executable" \
+                                    || bad "bin/heimdall-agents missing next to the meter -- default resolution would fail"
+
+# R13: hermetic -- none of this touched the real ~/.heimdall.
+if [ -d "$REAL_HOME_CTX" ] && find "$REAL_HOME_CTX" -name "*$SID*" 2>/dev/null | grep -q .; then
+  bad "section R leaked a record for $SID into the real ~/.heimdall"
+else
+  ok "section R never touched the real ~/.heimdall"
 fi
 
 printf '\nctx-meter.test.sh: %s passed, %s failed.\n' "$PASS" "$FAIL"
