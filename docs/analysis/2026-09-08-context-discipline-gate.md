@@ -4,10 +4,10 @@ Operator's ask, verbatim: *"prepare a better version of execution for context
 discipline and standardize it to not impact the work quality while ensuring token
 saving as much as possible."*
 
-This doc covers what was built (`bin/heimdall-ctx-meter gate`, tested — 104 passed, 0
-failed), what it reuses (zero new thresholds), what it cannot do (a real, named
-limit), and an honest verdict on binding vs. advisory. No savings figure in this doc
-is new; every number below already exists in `token-spend-forensics.md`,
+This doc covers what was built (`bin/heimdall-ctx-meter gate`, tiered, tested — 110
+passed, 0 failed), what it reuses (zero new thresholds), what it cannot do (a real,
+named limit), and an honest verdict on binding vs. advisory. No savings figure in
+this doc is new; every number below already exists in `token-spend-forensics.md`,
 `2026-09-02-input-context-cost.md`, or `2026-09-07-cost-forensics-tool.md`.
 
 ## 1. The problem was never detection
@@ -57,9 +57,9 @@ window, different sample size — and both land in the same several-fold band.
 Per `2026-09-07-cost-forensics-tool.md`'s own framing: *"neither is 'the' definitive
 ratio, both say the same thing: operating at high context costs several times more
 per request."* That convergence, not either single number, is what this design
-treats as ground truth. The restart cost both docs independently agree on: **~35K
-tokens of re-paid preamble, about $0.02** — the number the gate below is sized
-around not disturbing.
+treats as ground truth and what the tiering in §4 derives from directly. The
+restart cost both docs independently agree on: **~35K tokens of re-paid preamble,
+about $0.02** — the number the gate below is sized around not disturbing.
 
 ## 3. Why a hard block was declined once already, and what changes now
 
@@ -78,13 +78,15 @@ below (§5) is built so that it **structurally cannot** do that: it only ever re
 at a moment it has mechanically confirmed there is no mid-task state to strand. If
 there is live agent work or an uncommitted change, it defers — always, no exception.
 The 2026-09-02 doc's objection was to blocking *a turn*, keyed to a token count.
-This design never blocks a turn, and is not keyed to a token count alone — it is
-keyed to token count **and** a proof of idleness.
+This design never blocks a turn, is not keyed to a token count alone (it is keyed to
+token count **and** a proof of idleness), and — after the tiering in §4 — reserves
+even the *possibility* of refusing for one tier out of three, not the first one an
+operator crosses.
 
-## 4. The design: reuse the existing thresholds, add one verb
+## 4. The design: three tiers, the same thresholds, zero new numbers
 
-Zero new numbers. `bin/heimdall-ctx-meter`'s own `ENVIRONMENT` block (lines 81–95)
-already carries every threshold this gate uses, each with its derivation inline:
+`bin/heimdall-ctx-meter`'s own `ENVIRONMENT` block already carries every threshold
+this gate uses, each with its derivation inline — unchanged by this task:
 
 ```
 HMD_CTX_CEILING     150000  target ceiling — the cap that recovers $369.50
@@ -92,11 +94,33 @@ HMD_CTX_CLIFF_NEAR  700000  ~7 requests of headroom at the measured 13,320 tok/r
 HMD_CTX_CLIFF       800000  measured quintile-5 boundary (804,141): cache-write 3.2x
 ```
 
+**Why the numbers didn't change even though 150,000 was already being ignored at
+422,199 (2.8×over):** that overshoot is a failure of enforcement, not calibration.
+150K is the figure that independently reproduces the $369.50 recoverable number in
+§1-§2; 700K/800K bracket the measured cache-write cliff (804,141, a 3.2× surcharge)
+— also already measured, not guessed. Moving either number without new measurement
+would be exactly the invented-figure move this task was told never to make.
+Re-deriving them from the two ratios in §2 instead of inheriting them unquestioned:
+at 5.19–6.17× the cost multiple between low and high context, the marginal cost of
+*not* enforcing anything below 700K is small (a soft floor is proportionate), while
+the marginal cost of staying past 800K compounds two ways at once — the per-request
+multiple AND the cache-write cliff — which is exactly why 800K, and only 800K, is
+where this design allows a refusal at all. What was missing was never the number;
+it was giving each of the three existing thresholds a distinct, honest behavior
+instead of collapsing them into one binary "notice vs. don't":
+
+| Tier | Threshold | Behavior | Can it refuse new work? |
+|---|---|---|---|
+| 1. Soft floor | `CEILING` (150,000) | Advisory only (`render_ceiling`) | No — `gate` always returns `ok` |
+| 2. Strong notice | `CLIFF_NEAR` (700,000) | Firm checkpoint instruction | **Never** — `gate` always returns `checkpoint`, exit 0, and never even calls the boundary check below |
+| 3. Hard ceiling | `CLIFF` (800,000) | Boundary-gated refusal | **Only here** — `gate` calls `_boundary_decision`; refuses only on a confirmed-clean boundary, else `defer` |
+
 `notice` (existing, unchanged) stays exactly what it was: a per-prompt, stderr-only,
-always-exit-0 advisory. Its one hard invariant — *"exits 0 on garbage, always"* —
-runs on every prompt and must never be able to break a turn, and that invariant is
-incompatible with also being the verb that refuses new work. `gate` (new) is the
-verb built for the different contract that refusing requires:
+always-exit-0 advisory covering tiers 1 and 2's *display*. Its one hard invariant —
+*"exits 0 on garbage, always"* — runs on every prompt and must never be able to
+break a turn, and that invariant is incompatible with also being the verb that
+refuses new work. `gate` (new) is the verb built for the different contract that
+refusing requires — see the header comment, `bin/heimdall-ctx-meter:47–79`:
 
 ```
 WHY `gate` IS A SEPARATE VERB FROM notice
@@ -104,24 +128,20 @@ WHY `gate` IS A SEPARATE VERB FROM notice
 notice's one hard invariant is "exits 0 on garbage, always" — it runs on
 EVERY prompt and must never be able to break a turn. That invariant cannot
 also be the verb that refuses new work, because refusing needs a REAL exit
-code, a different contract. `gate` carries that contract instead: it is not
-on the per-prompt hot path, it exists to be invoked deliberately (by the
-orchestrator, before spawning new work) and CHECKED — exit 0 vs 1 — not
-merely read.
+code, a different contract. `gate` carries that contract instead...
 ```
-(`bin/heimdall-ctx-meter`, header comment, lines 47–55.)
 
-`gate` only ever escalates past "proceed" at `CLIFF_NEAR`/`CLIFF` — the identical
-existing thresholds `notice` already renders against. Below them, `gate` always
-exits 0 without touching the boundary check at all, so the low-context hot path
-never pays for it.
+Below `CLIFF_NEAR`, `gate` always exits 0 without touching the boundary check at
+all — the low-context hot path never pays for it. At `CLIFF_NEAR` itself, `gate`
+still never touches the boundary check (tier 2 is display-only escalation, proven
+by tests R3/R3b below). Only at `CLIFF` does the boundary check run at all.
 
-## 5. The boundary: mechanical, ungameable, cheap, and only invoked when it matters
+## 5. The boundary: mechanical, ungameable, cheap, and only invoked at CLIFF
 
-**Definition**: `heimdall-agents count == 0` AND `git status --porcelain` empty.
-Both are process/filesystem facts, not self-reported prose, and both are cheap
-enough (two subprocess calls) to matter only at the rare hard-ceiling tier — never
-on the per-prompt path `notice` still owns.
+**Chosen definition**: `heimdall-agents count == 0` AND `git status --porcelain`
+empty. Both are process/filesystem facts, not self-reported prose, and both are
+cheap enough (two subprocess calls) to matter only at the rarest tier (`CLIFF`) —
+never on the per-prompt path `notice` still owns, and never even at `CLIFF_NEAR`.
 
 `_boundary_decision()` (`bin/heimdall-ctx-meter:326–366`) resolves to exactly one of
 four outcomes, and every branch that cannot **positively** confirm "no live agent,
@@ -147,46 +167,100 @@ look clean. The shipped version returns immediately on every unconfirmable path,
 before any git check runs, so "I could not verify" and "I verified it's safe" can
 never be confused with each other.
 
+**Why `git status --porcelain` empty, not just "no uncommitted TRACKED files"**:
+porcelain output also reports untracked files (`??` lines). An agent's
+freshly-written-but-not-yet-`git add`ed file is exactly as mid-flight as a modified
+tracked one, and a check that ignored it would let `gate` refuse while real,
+unrecorded work sat in the tree — precisely the "strand the operator" failure mode
+§3 exists to rule out. The chosen check is deliberately the superset, not the
+narrower tracked-only diff.
+
+**Two other candidate signals were considered and rejected:**
+
+- **A green full-sweep receipt present.** Rejected: the full sweep
+  (`test/run-all.sh`, ~1600s per this repo's own `CLAUDE.md`) is far too expensive
+  to gate a check that fires at every `CLIFF` reading across every session — using
+  it would force either paying half an hour per gate call (violating "millisecond-
+  cheap") or trusting a stale receipt from hours or days earlier that says nothing
+  about whether the *current* tree is safe to abandon. It also conflates two
+  different questions this repo's own `CLAUDE.md` deliberately keeps separate: "is
+  it safe to stop here" (this gate's job) vs. "is the code correct" (the pre-push
+  quality gate's job, already covered independently). If the tree is clean, there
+  is nothing new to lose regardless of what the last sweep said; a sweep receipt
+  adds cost without adding safety to *this* question.
+- **`.planning/CHECKPOINT.md` fresher than the last commit.** Rejected: mtime
+  freshness is a weak, accidentally-gameable proxy, not a positive proof. A
+  CHECKPOINT.md can be touched (bumping mtime) without its content changing
+  meaningfully, and can go stale the instant an agent resumes work AFTER writing an
+  accurate one — the mtime comparison has no way to detect that new work started
+  since. It also answers a different question than "is anything mid-flight right
+  now" — it answers "was a checkpoint written at some point after the last
+  commit," which is neither necessary (a clean tree with no checkpoint can still be
+  a perfectly safe boundary) nor sufficient (a checkpoint can predate live,
+  unrelated agent activity). `heimdall-agents count` answers the liveness question
+  directly instead of inferring it from a timestamp.
+
 ## 6. The `gate` verb's contract
 
 ```
-exit 0  -> proceed  (below the hard ceiling, an unverifiable reading, OR a
-           hard-ceiling reading that DEFERS because in-flight work exists)
-exit 1  -> refuse   (at/past the hard ceiling AND a clean, provable boundary)
+exit 0  -> proceed  (soft-floor "ok", strong-notice "checkpoint", OR a
+           hard-ceiling reading that "defer"s because in-flight work
+           exists or the boundary was unresolvable — an unverifiable
+           reading always resolves here too)
+exit 1  -> refuse   (ONLY at the hard ceiling (CLIFF) AND a clean,
+           provable boundary — CLIFF_NEAR can never reach this)
 ```
 
-`NON_VERIFIED` readings always resolve to `proceed` — *"the meter never blocks new
-work on its own blind spot"* (`do_gate`, `bin/heimdall-ctx-meter:403–406`) — the
-same fail-open posture `notice` already holds for its own primary reading, applied
-consistently to the new verb.
+Four decision strings, one for each reachable state: `ok` (tiers below
+`CLIFF_NEAR`, and `NON_VERIFIED`), `checkpoint` (tier 2, `CLIFF_NEAR`, always —
+proven never to vary with boundary state by test R3b, which forces two live agents
+and a dirty tree simultaneously and still gets `checkpoint`), `defer` (tier 3,
+boundary unclean or unresolvable), `refuse` (tier 3, boundary confirmed clean —
+the only exit-1 case). `NON_VERIFIED` readings always resolve to `ok` — *"the
+meter never blocks new work on its own blind spot"* — the same fail-open posture
+`notice` already holds for its own primary reading.
 
 `render_cliff` (the existing severe-escalation renderer `notice` calls at
-`CLIFF`/`CLIFF_NEAR`) now names the live decision inline, so an operator watching
-the existing notice sees the gate's verdict without invoking a second command:
+`CLIFF`/`CLIFF_NEAR`) now names the live decision inline, and the framing is
+tier-specific — only `CLIFF` ever shows refuse-capable language:
 
 ```
 ⛔ REFUSE NEW WORK — <reason>. Do not start anything new here; restart first.
 ```
-or
+or (also `CLIFF`, boundary not clean)
 ```
 DEFERRING new-work refusal — <reason>.
 ```
+or (`CLIFF_NEAR`, unconditionally — proven by test R8b to never show the above two)
+```
+STRONG NOTICE — checkpoint recommended now. This tier never refuses new
+work; only the hard ceiling (800,000 tokens) can.
+```
 
-(`bin/heimdall-ctx-meter:480–485`.) This is the one place `gate`'s logic runs
-inside the per-prompt path — but it only *renders* the decision already computed
-for display; it changes nothing about `notice`'s own exit-0-always contract, and it
-only executes at all once a session is already at `CLIFF_NEAR`/`CLIFF`, the same
-rare tier `gate` itself is gated to.
+(`bin/heimdall-ctx-meter`, `render_cliff`, tail.) This is the one place `gate`'s
+logic runs inside the per-prompt path — but it only *renders* a decision already
+computed for display; it changes nothing about `notice`'s own exit-0-always
+contract, and it only executes at all once a session is already at
+`CLIFF_NEAR`/`CLIFF`, the same rare tier `gate` itself is scoped to.
 
-**Test evidence**: `test/ctx-meter.test.sh`, Section R, 26 new assertions covering
-below-ceiling always-proceed, `NON_VERIFIED` fail-open, confirmed-clean-boundary
-refuse (at both `CLIFF_NEAR`-adjacent and `CLIFF` readings), live-agent defer,
-dirty-tree defer, all three unresolvable-boundary defer sub-cases, `--json` shape,
-`render_cliff`'s inline decision text, timing, `--help` discoverability, and
-garbage-input robustness:
+**Test evidence**: `test/ctx-meter.test.sh`, Section R, 32 assertions (up from 26
+pre-tiering) covering below-ceiling always-proceed, `NON_VERIFIED` fail-open, the
+`CLIFF_NEAR` checkpoint tier proven immune to boundary state (R3, R3b — the direct
+test for "never interrupt in-flight work," since it forces live agents AND a dirty
+tree simultaneously at `CLIFF_NEAR` and still gets `checkpoint`, never `defer` or
+`refuse`), confirmed-clean-boundary refuse only at `CLIFF` (R4), live-agent defer
+at `CLIFF` (R5 — the direct proof for the hard-ceiling tier itself: two live
+agents force `defer`, never `refuse`, regardless of tree state), dirty-tree defer
+at `CLIFF` (R6), all three unresolvable-boundary defer sub-cases (R6b), `--json`
+shape (R7), `render_cliff`'s tier-specific inline text including the new
+`CLIFF_NEAR` strong-notice framing (R8, R8b), timing, `--help` discoverability,
+and garbage-input robustness:
 
 ```
-RESULT: 104 passed, 0 failed
+$ bash -n bin/heimdall-ctx-meter && echo "SYNTAX OK"
+SYNTAX OK
+$ bash test/ctx-meter.test.sh 2>&1 | tail -1
+ctx-meter.test.sh: 110 passed, 0 failed.
 ```
 
 ## 7. What must carry across a restart — the resume contract
@@ -218,46 +292,52 @@ no hasher is available anywhere on the machine). Three physical artifacts carry 
 six categories across a restart: `.planning/RESUME-KEY.json`, `$HEIMDALL_HOME/
 resume-notes.ndjson`, `.planning/CHECKPOINT.md` — plus a third, architecturally
 distinct layer: the orphan `hmd/context` git branch, read only via `git show`
-against `refs/heads/hmd/context`, never checked out, carrying a `worklog.json` with
-its own `generated_ts`. Three of the six categories (`in_progress`,
-`gated_decisions`, `refuted_claims`) exist only in a session's own head — no git
-command can derive "what's the next step" or "we're waiting on a human" — which is
-why `rc_note_category()` exists as a recording seam at all: without it those three
-fields could only ever read "none," and a probe that grades three permanent blanks
-proves nothing.
+against `refs/heads/hmd/context`, never checked out.
 
-**Is resume provably lossless? Honest answer: not provable for this worktree, right
-now, and that gap is real, not hypothetical.** The SessionStart hook this session
-has been reporting *"resume probe GREEN — 6/6 never-lose categories recovered...
-Streak: 100 green"* on every compaction. Checked directly, in this worktree, as
-part of writing this doc:
+**Is resume provably lossless? Two real, first-hand, DIRECTLY CONFLICTING readings
+exist, and both are reported here rather than picking the convenient one.** The
+orchestrator running this task reported, having run `bin/heimdall-resume-probe run`
+themselves: *"GREEN — 6/6 never-lose categories recovered from the stack (checkpoint
+ok · index n/a · context-branch ok)"*, rc=0. Independently, run again here, fresh,
+in the course of writing this doc, in **this worktree specifically**:
 
 ```
-$ test -f .heimdall/probe.ndjson && echo PRESENT || echo ABSENT
-ABSENT
-$ ls .heimdall/
-.activity-stamp  .agents-count-cache  .repo-roster-*.json  .wall-cache.json
-cp-endpoint.json.example  hooks -> /Users/rj/Downloads/heimdall/.heimdall/hooks
-issue-loop.config.json.example  receipts/  team.json
+$ bin/heimdall-resume-probe run
+[heimdall] resume probe RED — 0 of 0 never-lose categories did NOT survive the
+restart. This is a bug in the MEMORY STACK, not a probe failure:
+  - checkpoint — layer=checkpoint: .../agent-aed7a05870e308e45/.planning/
+    CHECKPOINT.md does not exist — there is no forward state to resume from
 ```
 
-No `probe.ndjson`, no `resume-notes.ndjson`, in **this** worktree's own
-`.heimdall/`. `HEIMDALL_HOME` is unset in this shell, so `rc_home()` resolves to
-`<repo>/.heimdall` — this worktree's own directory, confirmed empty of both files.
-The "100 green" streak being reported is near-certainly accumulated against the
-**main checkout's** transcript/session history, not this isolated worktree's — the
-two are different repos on disk (a `git worktree`, not a clone, but with its own
-independent `.heimdall/` state directory apart from the symlinked `hooks/`). A
-gate that gains teeth makes this gap matter more than it did when everything was
-advisory: the whole argument for "a restart here is cheap and safe" rests on the
-resume contract actually being checked in the environment the restart happens in,
-and right now the green streak an operator sees is not proof of that for every
-worktree they might be sitting in when `gate` refuses. This should be closed
-before `gate` is wired into anything that fires unattended — the honest fix is
-making sure `heimdall-resume-probe` runs (and is checked, not just displayed)
-against the same `HEIMDALL_HOME`/repo root the gate itself resolved, every time,
-rather than relying on a cached streak from whatever session happened to run it
-last.
+Both runs are real; they are not measuring the same root. This worktree's own
+`.heimdall/` (confirmed directly: `ls .heimdall/` lists `.activity-stamp`,
+`.agents-count-cache`, roster caches, `team.json`, a `hooks` symlink to the MAIN
+checkout's hooks — no `probe.ndjson`, no `resume-notes.ndjson`) has never had a
+`.planning/CHECKPOINT.md` written into it at all. The most likely, and most
+mundane, reconciliation: `heimdall-checkpoint write` is an *orchestrator*-level
+action — it is the main session's job to checkpoint its own overall state — and
+this worktree is a narrow-scope coder sandbox spawned for one delta-brief, never
+expected to carry an independent checkpoint of its own. The orchestrator's GREEN
+almost certainly reflects the main checkout, where a real orchestrator session has
+in fact been checkpointing; this worktree's RED reflects a probe run against a
+root that was never supposed to have its own checkpoint in the first place, not a
+broken memory stack.
+
+That reconciliation is plausible and probably right — but it is still an inference,
+not a proof, and it points at a real, sharp design requirement for anything built
+on top of `gate` going forward: **a boundary/resume check has to resolve against
+one consistent root, chosen deliberately, not whichever root happens to be the
+caller's cwd.** `gate` itself sidesteps this cleanly — `_repo_root()` always
+resolves relative to the script's own installed location (or `HMD_CTX_REPO` for
+tests), which for a coder worktree correctly means "this worktree," not "the main
+checkout" — so `gate`'s own refuse/defer decision is unaffected by this ambiguity.
+But if `gate`'s refusal is ever meant to imply "and resuming afterward is lossless,"
+that implication is only as strong as whichever `HEIMDALL_HOME`/repo root the
+resume-probe was actually run against, and the two are not automatically the same
+thing. This should be closed before any hard-binding wiring (§8) goes live
+unattended: run and check `heimdall-resume-probe` against the *same* root `gate`
+itself resolved, at the point `gate` would refuse, rather than trusting a cached
+streak from a different session or a different root.
 
 ## 8. Where true hard-binding would live — corrected finding, reported not applied
 
@@ -288,9 +368,10 @@ pattern — deny by printing `{"error": "<reason>"}` (via `jq -cn --arg r "$REAS
 No new `hooks.json` entry is needed for a real bind on new Agent spawns. The
 natural home is a **sixth fence inside `bin/heimdall-precheck-agent`**, following
 the same shape as the five above: call `heimdall-ctx-meter gate --json` before
-allowing a spawn through, and when `.decision` reads `"refuse"`, deny in the same
-way fence 3/4 already deny — `exit 2`, `{"error": "<the gate's own reason
-string>"}` on stdout, the identical text on stderr. This is **reported, not
+allowing a spawn through, and when `.decision` reads `"refuse"` (i.e. the CLIFF
+tier, confirmed-clean boundary — never `"checkpoint"`, which must keep proceeding),
+deny in the same way fence 3/4 already deny — `exit 2`, `{"error": "<the gate's own
+reason string>"}` on stdout, the identical text on stderr. This is **reported, not
 applied** — the brief for this task scoped `bin/heimdall-precheck-agent` and
 `hooks/hooks.json` as report-only, and a change to either is a decision for
 whoever owns that file, not something to land silently as a side effect of a
@@ -311,46 +392,59 @@ edge of what a `PreToolUse`-based mechanism can reach.
 Written as its own subsection (`### 8d. Context Window Discipline`, see that file)
 stating the operating rule and pointing at the mechanical check by name, rather
 than repeating a fourth instance of prose-only enforcement: it says outright that
-prose mandates in this repo have failed to bind three times over (caveman, `metric
---type`, the report-once rule) and that this rule is different only insofar as
+prose mandates in this repo have failed to bind repeatedly — caveman compression
+(3.25% filler survived full injection), `heimdall-metric --type` (~895/900 rows
+missing it despite a CLAUDE.md mandate), and this very meter (ignored for a full
+day at 2.8× its own ceiling) — and that this rule is different only insofar as
 `bin/heimdall-ctx-meter gate` exists to be *run and checked*, not read. It commits
 to checking `gate` before spawning new delegated work once a session is already
-past `CLIFF_NEAR`, and to treating `exit 1` as a hard stop for *new* work — not a
-suggestion — while being explicit that nothing today enforces the orchestrator
-running that check any more than it enforced the prior three mandates. §8 closes
-the loop honestly rather than overclaiming: standardizing the text is necessary but
-not, by itself, sufficient; §8 of this doc is what would make it sufficient.
+past `CLIFF_NEAR`, treating a `checkpoint` decision as a strong recommendation and
+an `exit 1` (`refuse`) as a hard stop for *new* work — never a suggestion — while
+being explicit that nothing today enforces the orchestrator running that check any
+more than it enforced the prior three mandates, short of §8's proposed fence
+actually being built. §10 closes the loop honestly rather than overclaiming.
 
-## 10. Honest verdict
+## 10. Honest verdict — does this bind, or is it still advisory?
+
+**A well-argued mixed answer, not a single word**, because the honest picture has
+two different layers that move independently:
 
 - **Detection was never the gap.** `notice` already existed and already fired
   correctly, every time, including on the exact session that ignored it.
-- **Binding is new, but narrow and named.** `gate` gives the orchestrator (and,
-  if §8's proposed fence is built, `heimdall-precheck-agent`) a real exit code to
-  check before starting new delegated work at the hard ceiling. That is a
-  genuine, mechanical improvement over pure advisory — it is ungameable
-  (process/filesystem facts, not self-report) and cheap (two subprocess calls,
-  paid only at the rare hard-ceiling tier).
-- **It is not, today, a hard block on anything.** Until a fence like the one in
-  §8 is actually built and wired, `gate` is a tool that must still be *invoked*
-  by something — currently `render_cliff`'s inline display, and whatever the
-  orchestrator's own discipline (§9) chooses to run. That is strictly better than
-  an advisory that only prints, because the exit code exists to fail a build or
-  a script the moment anything actually checks it — but "something must still
-  call it" is a real, stated limit, not a solved problem.
-- **Quality protection holds up under its own acceptance bar.** The boundary
-  check defers on any live agent and on any uncommitted change, unconditionally.
-  A restart this gate ever actually forces happens only at a moment already
-  confirmed to hold no in-flight reasoning state and no uncommitted work — so
-  the "restart destroys the plan/acceptance-criteria/task-list" regression the
-  brief named as worse than the $369.50 it's trying to save cannot occur through
-  this mechanism, by construction of §5, not by hope.
-- **One real gap, disclosed, not hidden**: resume being "provably lossless" is
-  not true for this worktree today (§7) — the green streak an operator sees is
-  most likely scoped to the main checkout, not every worktree. A gate with real
-  teeth should not go live anywhere unattended until that is fixed.
-- **No new savings figure is claimed anywhere in this document.** Every dollar
-  and every ratio above already existed in `token-spend-forensics.md`,
+- **The primitive is now genuinely binding-capable, and that is new.** `gate`
+  gives anything that calls it a real exit code — 0 or 1 — computed from
+  ungameable process/filesystem facts, not self-report. That is a real
+  qualitative change from pure advisory: an exit code can fail a script,
+  block a `&&` chain, or (per §8) deny a hook — an advisory string cannot do
+  any of those things no matter how loudly it is worded.
+- **Whether the SYSTEM binds today depends on who calls it, and today the
+  answer is: only a human or an agent that chooses to.** Nothing currently
+  invokes `gate` automatically before every Agent spawn — §8's fence is
+  reported, not applied. `render_cliff`'s inline display surfaces the
+  decision to a reader, but reading is exactly the advisory failure mode
+  this whole doc is about; a displayed decision that nothing enforces is
+  not meaningfully different from `notice` on its own. **So: still advisory
+  at the system level, and this doc says so plainly rather than overclaiming
+  a win.** What has changed is the SIZE of the remaining gap — from "invent
+  and wire an entire enforcement mechanism" to "add one sixth fence, in one
+  named file, following a pattern that already exists five times over."
+- **The tiering makes the eventual bind safer, not just narrower.** Only the
+  `CLIFF` tier (800K, the true hard ceiling) can ever produce a `refuse` —
+  `CLIFF_NEAR` (700K) is a `checkpoint` decision that is, by test R3b,
+  provably immune to boundary state. A future caller that wires §8's fence
+  cannot accidentally block work at the softer tier; the blast radius of
+  "wire this in and something goes wrong" is already fenced down to the one
+  tier where a clean-boundary refusal is, by construction, a moment nothing
+  was mid-flight.
+- **One real gap, disclosed, not hidden**: whether "resuming after a refusal
+  is lossless" is provable depends on which root the resume-probe is run
+  against, and §7 shows two real, correct, DIFFERENT answers for the main
+  checkout (GREEN) vs. this worktree (RED) at the same moment. A gate wired
+  to refuse unattended should resolve its resume-check against the same
+  root it resolved its boundary check against, and nothing today guarantees
+  that alignment.
+- **No new savings figure is claimed anywhere in this document.** Every
+  dollar and every ratio above already existed in `token-spend-forensics.md`,
   `2026-09-02-input-context-cost.md`, or `2026-09-07-cost-forensics-tool.md`
   before this task started.
 
