@@ -2910,6 +2910,26 @@ case "${1:-}" in
     fi
     exec "$DELIVERY_AUDIT_BIN" "$@"
     ;;
+  unconnected)
+    # The CONNECTION audit (bin/heimdall-unconnected) -- ONE command answering
+    # both faces of a single defect measured this session: branches with a
+    # real feat:/fix:/test:/docs: commit that nobody merged (reap-idle
+    # refused to delete 61 worktrees for exactly this reason -- see
+    # docs/analysis/2026-09-07-stranded-branch-inventory.md), and tested bin/
+    # executables reachability.sh finds DEAD with no valid exemption row (the
+    # same session: 11 reachability exemptions expired overnight, and 7 of
+    # them were real tools missing only a dispatcher line). Classifies
+    # branches by CONTENT (diff, excluding .planning), never by commit
+    # identity, so a branch merged long ago and later given a journal-only
+    # commit is not a false positive. Read-only: reports, never merges,
+    # deletes, or wires anything itself. report/--json exit 1 on a finding;
+    # --advise never exits nonzero (SessionStart notice, TTL-cached). 33/33
+    # test/heimdall-unconnected.test.sh.
+    shift
+    _unconn="$(cd "$(dirname "$0")" && pwd)/heimdall-unconnected"
+    if [ -x "$_unconn" ]; then exec "$_unconn" "$@"; fi
+    echo "error: heimdall-unconnected not found at $_unconn" >&2; exit 2
+    ;;
   wrap|unwrap)
     # §7 Pass-through to heimdall-wrap: ONE command that installs the Layer-0 git
     # hooks, writes the AGENTS.md fenced block, starts presence and launches the

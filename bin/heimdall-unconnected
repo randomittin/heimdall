@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# heimdall-unconnected -- the CONNECTION audit: finished work nobody merged
+# (Face A), and finished tools nobody wired (Face B), reported by ONE command
+# because one session showed they are the same defect wearing two faces.
+#
+# WHY THIS EXISTS. Face A: `heimdall-reap-idle --apply` refused to delete 61
+# worktrees because their branches carry commits main doesn't have. Of 44
+# branches ahead of main, 37 carried a real feat:/fix:/test:/docs: commit whose
+# code differs from main -- including an EXPLICIT operator directive
+# ("lower auto exhaustion threshold 95% -> 90%") implemented, tested, and
+# stranded for days while reported done. Full inventory:
+# docs/analysis/2026-09-07-stranded-branch-inventory.md. Face B: in the SAME
+# session, 11 reachability exemptions expired overnight; triage found 7 real,
+# tested, wanted tools missing only a dispatcher line in bin/heimdall. In both
+# cases a safety mechanism HELD the finished work -- reap-idle's refusal to
+# delete, the exemption registry's grace period -- but nothing ever said "this
+# is finished and unconnected." The work was invisible, not broken.
+#
+# FACE A -- unmerged branches. For every local branch, is there a conventional
+# commit (feat/fix/test/docs/refactor/perf/chore) whose CONTENT differs from
+# main? Classified by CONTENT (git diff main...branch, excluding .planning),
+# NEVER by commit identity -- a branch merged long ago and then given a new
+# journal commit is still "ahead of main" by raw commit count, and that alone
+# is exactly the false positive this audit exists to not produce (excluding
+# .planning neutralizes the journal-commit tail; see the "SUPERSEDED" bucket in
+# the inventory doc above). wip:-only branches (agent-watchdog snapshots, no
+# real commit) are reported in their own bucket and do NOT gate: there may be
+# nothing finished there to land.
+#
+# FACE B -- unconnected executables. Reuses bin/lib/reachability.sh (the same
+# engine behind heimdall-deadcode) to find every bin/ executable no live entry
+# point can reach, then narrows to the ones that ALSO have a test suite --
+# proof someone built and finished it on purpose, not scaffolding nobody ever
+# completed. An unexpired, honest row in bin/lib/reachability-exemptions.tsv is
+# not a finding; an EXPIRED one is.
+#
+# READ-ONLY. This command never merges a branch, never deletes a worktree,
+# never edits reachability-exemptions.tsv, and never wires a dispatcher arm.
+# It reports; connecting the work is a human's (or the next agent's) call.
+#
+# SUBCOMMANDS
+#   heimdall-unconnected [--repo PATH]      the full read-only report.
+#   heimdall-unconnected --json             {branches_scanned,branches_real,...}
+#   heimdall-unconnected --advise [--force] ONE line for the SessionStart
+#                                            budget, only when something is
+#                                            wrong. Throttled: recomputes at
+#                                            most once per HMD_UNCONNECTED_TTL
+#                                            (default 86400s = 1 day -- shorter
+#                                            than heimdall-deadcode's 7-day
+#                                            default on purpose: this repo's own
+#                                            numbers show branches stranding in
+#                                            hours and exemptions expiring
+#                                            OVERNIGHT, so a week-old cache
+#                                            would miss the exact failure mode
+#                                            this tool exists to catch).
+#                                            --force ignores the cache.
+#   --repo PATH                             audit PATH instead of this
+#                                            script's own repo (also
+#                                            HMD_UNCONNECTED_REPO) -- the test
+#                                            seam, and how a linked worktree
+#                                            still audits its shared repo.
+#   -h, --help                              this help.
+#
+# EXIT CODES. Face A's wip-only bucket and Face B's validly-exempted dead
+# tools never gate -- reported for visibility, not action: there is no
+# finished, wanted deliverable behind either one to connect.
+#   0  clean -- zero unlanded real branches AND zero unconnected tools.
+#   1  attention -- at least one of either (report/--json only; --advise never
+#      exits nonzero -- it is a SessionStart notice, not a push gate).
+#   2  refused to run (bad --repo, missing engine, engine refused).
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB="$SELF_DIR/lib/reachability.sh"
+
+[ -f "$LIB" ] || { printf 'heimdall-unconnected: missing engine %s -- NOT VERIFIED\n' "$LIB" >&2; exit 2; }
+# shellcheck source=lib/reachability.sh
+. "$LIB"
+
+HMD_HOME="${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}"
+CACHE="$HMD_HOME/unconnected-advice"
+TTL="${HMD_UNCONNECTED_TTL:-86400}"
+MAX_BRANCHES="${HMD_UNCONNECTED_MAX_BRANCHES:-300}"
+CONV_RE='^(feat|fix|test|docs|refactor|perf|chore)(\([^)]*\))?!?:'
+TAB="$(printf '\t')"
+
+usage() {
+  cat <<'EOF'
+heimdall-unconnected -- the CONNECTION audit: finished work nobody merged
+(Face A: unmerged branches), finished tools nobody wired (Face B: unconnected,
+tested bin/ executables). Read-only -- reports, never merges/deletes/wires.
+
+Usage:
+  heimdall-unconnected [--repo PATH]             full report, both faces
+  heimdall-unconnected [--repo PATH] --json      machine-readable report
+  heimdall-unconnected [--repo PATH] --advise [--force]
+                                                  one SessionStart line,
+                                                  throttled by
+                                                  HMD_UNCONNECTED_TTL
+                                                  (default 86400s)
+  heimdall-unconnected -h | --help               this help
+
+Env:
+  HMD_UNCONNECTED_REPO          same as --repo
+  HMD_UNCONNECTED_TTL           --advise cache lifetime, seconds (default 86400)
+  HMD_UNCONNECTED_MAX_BRANCHES  cap on branches content-diffed per run (default 300)
+
+Exit: 0 clean * 1 real unlanded branch(es) or unconnected tool(s) found *
+      2 refused to run (bad --repo, missing engine, engine refused).
+EOF
+}
+
+resolve_main_ref() {
+  local root="$1" cand
+  for cand in main master; do
+    git -C "$root" rev-parse --verify -q "refs/heads/$cand" >/dev/null 2>&1 && { printf '%s\n' "$cand"; return 0; }
+  done
+  git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || printf 'HEAD\n'
+}
+
+# ---------- FACE A -- unmerged branches ----------
+
+FA_SCANNED=0
+FA_REAL_N=0
+FA_WIP_N=0
+FA_CLEAN_N=0
+FA_TRUNCATED=0
+FA_REAL_LIST=""
+FA_WIP_LIST=""
+
+face_a() {
+  local root="$1" main_sha="$2" branch tip ahead
+  while IFS= read -r branch; do
+    [ -n "$branch" ] || continue
+    tip="$(git -C "$root" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null)" || continue
+    [ "$tip" = "$main_sha" ] && continue
+    if [ "$FA_SCANNED" -ge "$MAX_BRANCHES" ]; then
+      FA_TRUNCATED=$((FA_TRUNCATED + 1))
+      continue
+    fi
+    FA_SCANNED=$((FA_SCANNED + 1))
+
+    # RULE 1 -- identity: tip is literally in main's history already.
+    if git -C "$root" merge-base --is-ancestor "$tip" "$main_sha" 2>/dev/null; then
+      FA_CLEAN_N=$((FA_CLEAN_N + 1))
+      continue
+    fi
+
+    # RULE 2 -- content: what this branch changed since its fork point,
+    # EXCLUDING .planning, is empty. Catches "merged, then gained a
+    # journal-only commit" precisely -- classify by bytes, never by commit
+    # identity. Three-dot diff = diff(merge-base(main,tip), tip): exactly
+    # "what did this branch add over the fork point", which a journal commit
+    # landed strictly after the real merge collapses to nothing once
+    # .planning is excluded.
+    if git -C "$root" diff --quiet "$main_sha...$tip" -- . ':(exclude).planning' 2>/dev/null; then
+      FA_CLEAN_N=$((FA_CLEAN_N + 1))
+      continue
+    fi
+
+    ahead="$(git -C "$root" rev-list --count "$main_sha..$tip" 2>/dev/null || printf '?')"
+    if git -C "$root" log --format='%s' "$main_sha..$tip" 2>/dev/null | grep -qE "$CONV_RE"; then
+      FA_REAL_N=$((FA_REAL_N + 1))
+      FA_REAL_LIST="${FA_REAL_LIST}${branch}${TAB}${ahead}
+"
+    else
+      FA_WIP_N=$((FA_WIP_N + 1))
+      FA_WIP_LIST="${FA_WIP_LIST}${branch}${TAB}${ahead}
+"
+    fi
+  done < <(git -C "$root" for-each-ref refs/heads --format='%(refname:short)' 2>/dev/null)
+  return 0
+}
+
+# ---------- FACE B -- unconnected executables ----------
+
+FB_AUDITED=0
+FB_DEAD=0
+FB_EXEMPT_VALID=0
+FB_UNCONNECTED=0
+FB_LIST=""
+
+# has_test_coverage ROOT NAME -- prints the covering suite's relative path and
+# returns 0 if NAME has a test suite; rc 1 with no output otherwise. Exact
+# `test/NAME.test.sh` is checked first; otherwise every test/*.test.sh is
+# searched for NAME as a whole, exact token (grep -oE over the same
+# [A-Za-z0-9_.-]+ alphabet reachability.sh uses, then an exact -xF compare) --
+# never a substring/`-w` match, which a hyphenated name defeats (e.g.
+# "heimdall-git-guard" vs "heimdall-git-guard-DISABLED": a hyphen is not a
+# `-w` word-boundary character, so a naive `grep -w` would still hit the
+# longer name). Deliberately does NOT strip comments before searching: a
+# false NEGATIVE here (missing real coverage) silently hides exactly the kind
+# of finding this tool exists to surface, which is worse than the low-harm
+# false positive of crediting a comment-only mention.
+has_test_coverage() {
+  local root="$1" name="$2" f
+  if [ -f "$root/test/$name.test.sh" ]; then
+    printf 'test/%s.test.sh\n' "$name"
+    return 0
+  fi
+  [ -d "$root/test" ] || return 1
+  for f in "$root"/test/*.test.sh; do
+    [ -f "$f" ] || continue
+    if LC_ALL=C grep -oE '[A-Za-z0-9_.-]+' "$f" | LC_ALL=C grep -qxF "$name"; then
+      printf 'test/%s\n' "$(basename "$f")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+face_b() {
+  local root="$1" w="$2" name suite row reason
+  reach_build "$root" "$w" || return 2
+  FB_AUDITED="$(reach_subject_count "$w")"
+  FB_DEAD="$(wc -l < "$w/dead" 2>/dev/null | tr -d ' ')"
+  : "${FB_AUDITED:=0}"
+  : "${FB_DEAD:=0}"
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    suite="$(has_test_coverage "$root" "$name")" || continue
+    FB_UNCONNECTED=$((FB_UNCONNECTED + 1))
+    if row="$(reach_exempt_row "$root" "$name" 2>/dev/null)"; then
+      reason="EXPIRED -- $(printf '%s' "$row" | cut -f3)"
+    else
+      reason="none"
+    fi
+    FB_LIST="${FB_LIST}${name}${TAB}${suite}${TAB}${reason}
+"
+  done < <(reach_unacknowledged "$root" "$w")
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    reach_exempt_valid "$root" "$name" 2>/dev/null && FB_EXEMPT_VALID=$((FB_EXEMPT_VALID + 1))
+  done < "$w/dead"
+  return 0
+}
+
+# ---------- rendering ----------
+
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+json_names_col1() {
+  local first=1 name rest esc
+  printf '['
+  while IFS="$TAB" read -r name rest; do
+    [ -n "$name" ] || continue
+    [ "$first" -eq 1 ] || printf ','
+    first=0
+    esc="$(json_escape "$name")"
+    printf '"%s"' "$esc"
+  done
+  printf ']'
+}
+
+render_report() {
+  local main_ref="$1" main_sha8 verdict
+  main_sha8="$(git -C "$ROOT" rev-parse --short "$MAIN_SHA" 2>/dev/null)"
+  printf 'heimdall-unconnected -- unmerged branches + unconnected tools (main=%s@%s)\n\n' "$main_ref" "$main_sha8"
+
+  printf 'FACE A -- unmerged branches\n'
+  printf '  scanned:  %d local branch(es)\n' "$FA_SCANNED"
+  printf '  real:     %d branch(es) carry a real feat/fix/test/docs/refactor/perf/chore commit not on main\n' "$FA_REAL_N"
+  printf '  wip-only: %d branch(es) carry ONLY wip: snapshots (may never have been valid; not gated)\n' "$FA_WIP_N"
+  printf '  clean:    %d branch(es) already fully reflected in main (content-identical after excluding .planning)\n' "$FA_CLEAN_N"
+  if [ "$FA_TRUNCATED" -gt 0 ]; then
+    printf '  NOTE: scan capped at %d branches -- %d branch(es) not examined (raise HMD_UNCONNECTED_MAX_BRANCHES)\n' "$MAX_BRANCHES" "$FA_TRUNCATED"
+  fi
+  printf '\n'
+
+  if [ "$FA_REAL_N" -gt 0 ]; then
+    printf '  UNLANDED (real, conventional commit, content not on main):\n'
+    printf '%s' "$FA_REAL_LIST" | while IFS="$TAB" read -r b a; do
+      [ -n "$b" ] || continue
+      printf '    %-40s %s commit(s) ahead of main\n' "$b" "$a"
+    done
+    printf '\n'
+  fi
+  if [ "$FA_WIP_N" -gt 0 ]; then
+    printf '  WIP-ONLY (watchdog snapshots only -- informational, does not gate):\n'
+    printf '%s' "$FA_WIP_LIST" | while IFS="$TAB" read -r b a; do
+      [ -n "$b" ] || continue
+      printf '    %-40s %s commit(s) ahead of main\n' "$b" "$a"
+    done
+    printf '\n'
+  fi
+
+  printf 'FACE B -- unconnected executables (tested, but no live entry point)\n'
+  printf '  audited:     %d bin/ executable(s)\n' "$FB_AUDITED"
+  printf '  dead:        %d unreachable from any live entry point\n' "$FB_DEAD"
+  printf '  exempt:      %d dead tool(s) covered by a valid, unexpired exemption (suppressed)\n' "$FB_EXEMPT_VALID"
+  printf '  unconnected: %d of those are TESTED but unreachable, with no valid exemption\n' "$FB_UNCONNECTED"
+  printf '\n'
+
+  if [ "$FB_UNCONNECTED" -gt 0 ]; then
+    printf '  UNCONNECTED (has test coverage, no live entry point, no valid exemption):\n'
+    printf '%s' "$FB_LIST" | while IFS="$TAB" read -r n s r; do
+      [ -n "$n" ] || continue
+      printf '    %-28s tests: %-32s exempt: %s\n' "$n" "$s" "$r"
+    done
+    printf '\n'
+  fi
+
+  verdict="CLEAN"
+  if [ "$FA_REAL_N" -gt 0 ] || [ "$FB_UNCONNECTED" -gt 0 ]; then
+    verdict="ATTENTION"
+  fi
+  printf 'verdict: %s -- %d unlanded branch(es), %d unconnected tool(s) (wip-only branches not gated)\n' \
+    "$verdict" "$FA_REAL_N" "$FB_UNCONNECTED"
+}
+
+render_json() {
+  printf '{'
+  printf '"branches_scanned":%d,' "$FA_SCANNED"
+  printf '"branches_real":%d,' "$FA_REAL_N"
+  printf '"branches_wip_only":%d,' "$FA_WIP_N"
+  printf '"branches_clean":%d,' "$FA_CLEAN_N"
+  printf '"real_names":'; printf '%s' "$FA_REAL_LIST" | json_names_col1; printf ','
+  printf '"wip_only_names":'; printf '%s' "$FA_WIP_LIST" | json_names_col1; printf ','
+  printf '"bin_audited":%d,' "$FB_AUDITED"
+  printf '"bin_dead":%d,' "$FB_DEAD"
+  printf '"bin_exempt_valid":%d,' "$FB_EXEMPT_VALID"
+  printf '"bin_unconnected":%d,' "$FB_UNCONNECTED"
+  printf '"unconnected_names":'; printf '%s' "$FB_LIST" | json_names_col1
+  printf '}\n'
+}
+
+# ================= MAIN =================
+
+MODE="report"
+REPO_OVERRIDE="${HMD_UNCONNECTED_REPO:-}"
+FORCE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) MODE="json"; shift ;;
+    --advise) MODE="advise"; shift ;;
+    --force) FORCE=1; shift ;;
+    --repo) REPO_OVERRIDE="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'heimdall-unconnected: unrecognized argument %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+
+ROOT="${REPO_OVERRIDE:-$(cd "$SELF_DIR/.." && pwd)}"
+[ -d "$ROOT" ] || { printf 'heimdall-unconnected: --repo %s does not exist -- NOT VERIFIED\n' "$ROOT" >&2; exit 2; }
+ROOT="$(cd "$ROOT" && pwd)"
+git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || { printf 'heimdall-unconnected: %s is not a git repo -- NOT VERIFIED\n' "$ROOT" >&2; exit 2; }
+
+# --advise cache short-circuit: BEFORE any git/reachability work, so a fresh
+# cache costs a stat(2), matching heimdall-deadcode's own --advise budget.
+if [ "$MODE" = "advise" ] && [ "$FORCE" -eq 0 ] && [ -f "$CACHE" ]; then
+  _now="$(date +%s)"
+  _mtime="$(stat -f '%m' "$CACHE" 2>/dev/null || stat -c '%Y' "$CACHE" 2>/dev/null || printf '0')"
+  _age=$((_now - _mtime))
+  if [ "$_age" -lt "$TTL" ]; then
+    _cached="$(cat "$CACHE" 2>/dev/null)"
+    [ -n "$_cached" ] && printf '%s\n' "$_cached"
+    exit 0
+  fi
+fi
+
+MAIN_REF="$(resolve_main_ref "$ROOT")"
+MAIN_SHA="$(git -C "$ROOT" rev-parse --verify -q "refs/heads/$MAIN_REF" 2>/dev/null)"
+[ -n "$MAIN_SHA" ] || MAIN_SHA="$(git -C "$ROOT" rev-parse --verify -q "$MAIN_REF" 2>/dev/null)"
+if [ -z "$MAIN_SHA" ]; then
+  printf 'heimdall-unconnected: cannot resolve a main ref in %s -- NOT VERIFIED\n' "$ROOT" >&2
+  exit 2
+fi
+
+face_a "$ROOT" "$MAIN_SHA"
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/hmd-unconnected.XXXXXX")" || { printf 'heimdall-unconnected: mktemp failed -- NOT VERIFIED\n' >&2; exit 2; }
+trap 'rm -rf "$WORKDIR"' EXIT
+face_b "$ROOT" "$WORKDIR" || { printf 'heimdall-unconnected: bin/ reachability scan refused to run -- NOT VERIFIED\n' >&2; exit 2; }
+
+case "$MODE" in
+  json) render_json ;;
+  advise)
+    _line=""
+    if [ "$FA_REAL_N" -gt 0 ] || [ "$FB_UNCONNECTED" -gt 0 ]; then
+      _line="[heimdall] ${FA_REAL_N} unlanded branch(es) with real, unmerged work; ${FB_UNCONNECTED} tested tool(s) wired to nothing -- run bin/heimdall-unconnected for detail."
+    fi
+    mkdir -p "$HMD_HOME" 2>/dev/null || true
+    printf '%s' "$_line" > "$CACHE" 2>/dev/null || true
+    [ -n "$_line" ] && printf '%s\n' "$_line"
+    ;;
+  report) render_report "$MAIN_REF" ;;
+esac
+
+if [ "$MODE" = "advise" ]; then
+  exit 0
+fi
+if [ "$FA_REAL_N" -gt 0 ] || [ "$FB_UNCONNECTED" -gt 0 ]; then
+  exit 1
+fi
+exit 0
