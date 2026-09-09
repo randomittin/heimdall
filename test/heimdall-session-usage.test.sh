@@ -256,12 +256,27 @@ if [ "$rc" -eq 0 ]; then ok; else bad "case10(default) rc=$rc"; fi
 
 echo "=== 11. --max-bytes bounds the tail read ==="
 d=$(case_dir c11); f="$d/t.jsonl"
-: > "$f"
-i=0
-while [ $i -lt 200 ]; do
-  usage_line "$(now_ts)" 1 1 >> "$f"
-  i=$((i+1))
-done
+# Single-process bulk write (was: a 200-iteration loop spawning now_ts + usage_line
+# as two separate python3 processes each -- 400 interpreter startups for one setup
+# step). Byte-for-byte equivalent to 200x `usage_line "$(now_ts)" 1 1`: same schema,
+# same key order, same fixed-width timestamp format, so the tail-cap byte math this
+# case asserts on (bytes_read=500) is unchanged -- only the spawn count drops (400->1),
+# which is what made this case the dominant wall-clock cost of the whole suite and the
+# suite's exposure point to timeout under concurrent CPU contention (--jobs N).
+python3 -c "
+import json, sys
+from datetime import datetime, timezone
+path, n = sys.argv[1], int(sys.argv[2])
+ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+line = json.dumps({
+    'type': 'assistant',
+    'timestamp': ts,
+    'sessionId': 'test-session',
+    'message': {'role': 'assistant', 'usage': {'input_tokens': 1, 'output_tokens': 1}},
+}) + '\n'
+with open(path, 'w') as fh:
+    fh.write(line * n)
+" "$f" 200
 out=$(python3 "$BIN" status --file "$f" --budget 1000000 --max-bytes 500 --json)
 if printf '%s' "$out" | grep -q '"window_truncated_by_byte_cap": true' && printf '%s' "$out" | grep -q '"bytes_read": 500'; then ok; else bad "case11 out=$out"; fi
 
