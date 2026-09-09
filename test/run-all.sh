@@ -77,6 +77,53 @@ case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
 [ "$JOBS" -gt 6 ] && JOBS=6
 [ "$JOBS" -lt 1 ] && JOBS=1
 
+# ── SYSTEM LOAD / CORE CAPTURE (instrumentation only — never a gate) ─────────────────────
+# WHY THIS EXISTS: a real sweep went RED (6 FAIL, 8 TIMEOUT, 7410s wall clock) on a box
+# measured AFTERWARD at load averages 17.28/25.09/26.14 on 10 cores (~2.5x oversubscribed)
+# -- but nothing recorded that at the time, so a red sweep and a load-contaminated sweep
+# were indistinguishable after the fact. This records load/cpu so that distinction can be
+# made later; it decides nothing and gates nothing itself -- any policy built on top of it
+# (refusing to run under load, auto-adjusting timeouts) is a separate, later decision.
+#
+# macOS-first (this repo's primary target) via sysctl, with a Linux fallback that must
+# never hard-fail the sweep: an unreadable metric on some platform writes null/absent and
+# the run carries on exactly as it did before this existed.
+NCPU="$( { sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null; } | head -1 )"
+case "$NCPU" in ''|*[!0-9]*) NCPU="" ;; esac
+
+# _load_avg — emits "L1 L5 L15" (space-separated) on success, empty string if this
+# platform offers neither `sysctl -n vm.loadavg` (macOS/BSD) nor /proc/loadavg (Linux).
+# Every branch degrades to a plain empty echo -- never errors, never exits the sweep.
+_load_avg() {
+  local raw
+  if command -v sysctl >/dev/null 2>&1 && raw="$(sysctl -n vm.loadavg 2>/dev/null)" && [ -n "$raw" ]; then
+    printf '%s' "$raw" | tr -d '{}' | awk '{print $1, $2, $3}'
+    return 0
+  fi
+  if [ -r /proc/loadavg ]; then
+    awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null
+    return 0
+  fi
+  printf ''
+}
+# _load_field RAW IDX — the IDXth (1|2|3) number out of RAW, or the JSON literal "null"
+# (never a shell-empty string) when RAW is empty or malformed. --argjson requires a
+# parseable JSON token per value; a missing metric must degrade to null, never abort the
+# whole receipt write.
+_load_field() {
+  local s="$1" idx="$2" v
+  [ -z "$s" ] && { printf 'null'; return 0; }
+  v="$(printf '%s' "$s" | awk -v i="$idx" '{print $i}')"
+  case "$v" in
+    ''|*[!0-9.]*) printf 'null' ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+# _load_disp RAW — "1.23/4.56/7.89" for the human summary line, or "n/a".
+_load_disp() {
+  [ -n "$1" ] && printf '%s' "$1" | awk '{printf "%s/%s/%s", $1, $2, $3}' || printf 'n/a'
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --include-live) INCLUDE_LIVE=1; shift ;;
@@ -401,6 +448,8 @@ _heartbeat_check() {
 }
 
 START=$(date +%s)
+LOAD_START="$(_load_avg)"
+LOAD_START_DISP="$(_load_disp "$LOAD_START")"
 PIDS=()
 PIDIDX=()
 next=0
@@ -471,6 +520,8 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
   [ -t 1 ] && printf '\r%*s\r' 44 ''
 fi
 END=$(date +%s)
+LOAD_END="$(_load_avg)"
+LOAD_END_DISP="$(_load_disp "$LOAD_END")"
 ELAPSED=$((END - START))
 
 # ── REPO INTEGRITY, AFTER SIDE (guarantee #8 in the header) ─────────────────────────────
