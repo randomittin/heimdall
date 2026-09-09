@@ -23,6 +23,27 @@
 # do_init() is idempotent (create-if-absent, O_CREAT without O_TRUNC, never
 # destroys existing content) so running it every SessionStart is always safe.
 #
+# THE SECOND BUG (found live, on this repo's own session, well after the fix
+# above had already shipped as d7447c28): `verify-edits --quick` still
+# reported NON-VERIFIED, with `.clears` showing dozens of loss events dated
+# AFTER d7447c28's timestamp — proving `source == "startup"` alone was
+# insufficient. Root cause: a Task/Agent-tool subagent shares its parent
+# session's process env WHOLESALE (no exec boundary of its own — see
+# bin/heimdall-precheck-agent's "coop native-spawn refusal fence"), so it
+# shares $CLAUDE_CODE_SESSION_ID, and therefore this same ledger FILE, with
+# its parent and siblings. A subagent's own, perfectly legitimate SessionStart
+# `source == "startup"` firing still satisfied the gate above and cleared a
+# ledger its parent (or a sibling) was mid-flight relying on — the measured
+# `.clears` signature was a tight "small batch logged, then wiped a few
+# hundred ms later" pair, repeated dozens of times.
+#
+# THE SECOND FIX: entry [0] additionally requires CLAUDE_CODE_CHILD_SESSION to
+# be UNSET (`[ -z "$CLAUDE_CODE_CHILD_SESSION" ]`) before it will clear. Fails
+# safe in the same direction as the first fix: absence of the variable (the
+# common case — a genuine top-level session) preserves the original,
+# already-tested clear-on-startup behavior; ANY non-empty value (not just
+# "1") skips the clear, erring toward preserving a ledger over wiping one.
+#
 # This test drives the REAL SessionStart[0] command, extracted verbatim from
 # hooks/hooks.json (the same technique test/heimdall-team-clone-join.test.sh
 # uses for this identical entry), under /bin/sh — the actual shell hooks run
@@ -30,9 +51,18 @@
 # stdin and observing the REAL bin/edit-tracker.c ledger, built fresh into a
 # sandboxed $PLUGIN (never the tracked repo binary).
 #
+# CALLER ISOLATION: run_ss() pins CLAUDE_CODE_CHILD_SESSION="" so every
+# existing G1-G6 case deterministically represents a non-child startup
+# regardless of what the OUTER calling shell has set — this suite is itself
+# routinely run from inside a subagent (CLAUDE_CODE_CHILD_SESSION=1 in that
+# shell), and without this pin G1 would silently inherit that and fail here,
+# not because the gate is wrong but because the test forgot to isolate it.
+#
 # RED-WITHOUT-FIX: G7 reconstructs the ORIGINAL unconditional-clear segment as
-# a mutant and proves it DOES wipe a `compact` ledger — demonstrating this
-# suite would have caught the real bug, not just rubber-stamped the fix.
+# a mutant and proves it DOES wipe a `compact` ledger; G12 reconstructs the
+# source-gated-only (post-d7447c28, pre-CLAUDE_CODE_CHILD_SESSION) segment and
+# proves IT wipes a child-session `startup`'s ledger — demonstrating this
+# suite would have caught both real bugs, not just rubber-stamped the fixes.
 #
 # Hermetic: everything lives under a mktemp sandbox; TMPDIR and
 # CLAUDE_CODE_SESSION_ID are overridden throughout, so this NEVER reads or
@@ -115,9 +145,17 @@ trk() { env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$TRACKER" "$@"; }
 # SessionStart[0] command under /bin/sh (the actual hook shell), in the
 # sandboxed plugin + a throwaway cwd. Never touches any real ledger.
 run_ss() {
+  # CLAUDE_CODE_CHILD_SESSION="" pinned explicitly (not just left to
+  # inherit): this suite is itself frequently run from inside a subagent,
+  # where the OUTER shell already has CLAUDE_CODE_CHILD_SESSION=1 set. `env`
+  # (unlike `env -i`) inherits everything not named here, so without this
+  # pin G1's "non-child startup" scenario would silently become a "child
+  # startup" scenario whenever this file runs inside a subagent, and G1
+  # would fail for a reason that has nothing to do with the gate being wrong.
   ( cd "$WORKDIR" && printf '%s' "$1" | env \
       CLAUDE_PLUGIN_ROOT="$PLUGIN_SANDBOX" TMPDIR="$SANDBOX" \
       CLAUDE_CODE_SESSION_ID="$SID" CLAUDE_PROJECT_DIR="$WORKDIR" \
+      CLAUDE_CODE_CHILD_SESSION="" \
       sh -c "$SS_CMD" ) >"$SANDBOX/last.out" 2>"$SANDBOX/last.err"
 }
 
@@ -254,6 +292,27 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
+# G11 — CLAUDE_CODE_CHILD_SESSION=1 + source=startup: clear must NOT run. A
+#      Task/Agent-tool subagent shares its parent's CLAUDE_CODE_SESSION_ID
+#      (and therefore this exact ledger file) wholesale, so its own, entirely
+#      legitimate "startup" must not clear a ledger its parent or siblings
+#      may still be relying on. This is the second, POST-d7447c28 defect this
+#      suite now covers.
+# ══════════════════════════════════════════════════════════════════════════
+reset_round
+( cd "$WORKDIR" && printf '%s' '{"source":"startup","session_id":"abc"}' | env \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_SANDBOX" TMPDIR="$SANDBOX" \
+    CLAUDE_CODE_SESSION_ID="$SID" CLAUDE_PROJECT_DIR="$WORKDIR" \
+    CLAUDE_CODE_CHILD_SESSION=1 \
+    sh -c "$SS_CMD" ) >"$SANDBOX/last.out" 2>"$SANDBOX/last.err"
+after="$(ledger_lines)"
+if [ "$after" -eq 3 ]; then
+  ok "G11 source=startup + CLAUDE_CODE_CHILD_SESSION=1 skips the clear — all 3 entries survive (subagent sharing parent's ledger)"
+else
+  bad "G11 a child-session startup should NOT clear a shared ledger (expected 3, got $after)"; cat "$SANDBOX/last.err" >&2
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
 # G7 — RED-WITHOUT-FIX mutant: re-inject the ORIGINAL unconditional-clear
 #      segment and confirm the compact case now LOSES all 3 entries —
 #      proving this suite actually catches the defect it was written for.
@@ -268,7 +327,7 @@ fi
 import sys
 cmd = sys.argv[1]
 old = ('SRC=$(printf \'%s\' "$INPUT" | jq -r \'.source // empty\' 2>/dev/null || true); '
-       'if [ "$SRC" = "startup" ]; then "$ETRACKER" clear 2>/dev/null || true; fi; '
+       'if [ "$SRC" = "startup" ] && [ -z "$CLAUDE_CODE_CHILD_SESSION" ]; then "$ETRACKER" clear 2>/dev/null || true; fi; '
        '"$ETRACKER" init 2>/dev/null || true;')
 new = '"$ETRACKER" clear 2>/dev/null || true; "$ETRACKER" init 2>/dev/null || true;'
 assert cmd.count(old) == 1, f"fixed segment not found exactly once (found {cmd.count(old)})"
@@ -287,6 +346,40 @@ if [ "$mutant_after" -eq 0 ]; then
   ok "G7 RED-WITHOUT-FIX proof: the ORIGINAL unconditional-clear segment DOES wipe a compact's ledger (mutant_after=0) — this suite would have caught the real bug"
 else
   bad "G7 mutant did not reproduce the original bug (mutant_after=$mutant_after, expected 0) — this suite may be vacuous"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# G12 — RED-WITHOUT-FIX mutant #2: re-inject the source-gated-ONLY segment
+#      (the state as of d7447c28, before the CLAUDE_CODE_CHILD_SESSION gate
+#      existed) and confirm a child-session startup now WIPES the ledger —
+#      proving this suite would have caught the second real bug too.
+# ══════════════════════════════════════════════════════════════════════════
+"$PY" - "$SS_CMD" >"$SANDBOX/mutant_cmd2.txt" <<'PYEOF'
+import sys
+cmd = sys.argv[1]
+old = ('SRC=$(printf \'%s\' "$INPUT" | jq -r \'.source // empty\' 2>/dev/null || true); '
+       'if [ "$SRC" = "startup" ] && [ -z "$CLAUDE_CODE_CHILD_SESSION" ]; then "$ETRACKER" clear 2>/dev/null || true; fi; '
+       '"$ETRACKER" init 2>/dev/null || true;')
+new = ('SRC=$(printf \'%s\' "$INPUT" | jq -r \'.source // empty\' 2>/dev/null || true); '
+       'if [ "$SRC" = "startup" ]; then "$ETRACKER" clear 2>/dev/null || true; fi; '
+       '"$ETRACKER" init 2>/dev/null || true;')
+assert cmd.count(old) == 1, f"fixed segment not found exactly once (found {cmd.count(old)})"
+sys.stdout.write(cmd.replace(old, new, 1))
+PYEOF
+MUTANT2_SS_CMD="$(cat "$SANDBOX/mutant_cmd2.txt")"
+[ -n "$MUTANT2_SS_CMD" ] || { echo "FATAL: could not build mutant2 command (fixed segment shape drifted)" >&2; exit 2; }
+
+reset_round
+( cd "$WORKDIR" && printf '%s' '{"source":"startup","session_id":"abc"}' | env \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_SANDBOX" TMPDIR="$SANDBOX" \
+    CLAUDE_CODE_SESSION_ID="$SID" CLAUDE_PROJECT_DIR="$WORKDIR" \
+    CLAUDE_CODE_CHILD_SESSION=1 \
+    sh -c "$MUTANT2_SS_CMD" ) >"$SANDBOX/last.out" 2>"$SANDBOX/last.err"
+mutant2_after="$(ledger_lines)"
+if [ "$mutant2_after" -eq 0 ]; then
+  ok "G12 RED-WITHOUT-FIX proof: the source-gated-only (pre-CLAUDE_CODE_CHILD_SESSION) segment DOES wipe a child-session startup's ledger (mutant2_after=0) — this suite would have caught this defect too"
+else
+  bad "G12 mutant2 did not reproduce the child-session bug (mutant2_after=$mutant2_after, expected 0) — this suite may be vacuous"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
