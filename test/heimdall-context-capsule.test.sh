@@ -26,7 +26,9 @@
 #   (8) AUTO-DETECT — a shipped capsule under ~/.heimdall/rr-context/<slug> is picked
 #       up with NO --context flag.
 #   (9) NO-REGRESSION — maintain-loop WITHOUT --context is unchanged: plan has no
-#       context key, and the existing heimdall-maintain-loop.test.sh still passes.
+#       context key. heimdall-maintain-loop.test.sh is ALSO re-run nested here as a
+#       belt-and-suspenders check, gated behind HEIMDALL_TEST_SLOW=1 (default off —
+#       it already runs on the board in its own right, with its own verdict).
 
 set -euo pipefail
 
@@ -289,10 +291,35 @@ if ! printf '%s' "$PLANNONE" | jq -e 'has("context")' >/dev/null 2>&1; then
 else
   bad "plan added a context key with no capsule present (regression)"
 fi
-if bash "$ROOT/test/heimdall-maintain-loop.test.sh" >/dev/null 2>&1; then
-  ok "the existing heimdall-maintain-loop.test.sh still passes (no regression)"
+# THE MAINTAIN-LOOP REGRESSION CHECK IS A WHOLE NESTED SUITE, run unconditionally with
+# no different flags or fixture — bash "$ROOT/test/heimdall-maintain-loop.test.sh" is a
+# bare re-run of the exact same file test/run-all.sh's own glob discovery already runs
+# on the board, with its own verdict. That is PURE DUPLICATION in the same shape already
+# fixed in test/issue-loop-integration.test.sh for install-stranger.test.sh: nesting a
+# *.test.sh file buys no signal the board lacks, it only pays for that suite's growth a
+# second time and couples THIS suite's own timeout budget to a sibling's, with no line
+# of context-capsule code changing. Confirmed here empirically, not assumed: a solo run
+# of this file on 2026-09-10 took 203s against this override's own "measured 56s solo"
+# comment above, and the gap tracks directly to this one nested call — the machine was
+# under ~2x its normal load at measurement time, so the precise seconds are not load-
+# clean and are NOT the basis for this fix; the duplication argument holds at any load.
+#
+# Gated behind HEIMDALL_TEST_SLOW=1 — the same gate test/issue-loop-integration.test.sh
+# and test/telemetry-install.test.sh:327 already use for an identical nested-suite shape.
+# Skipping is LOUD (never silent), and names where the coverage actually lives: nothing
+# is lost by skipping, because test/heimdall-maintain-loop.test.sh runs on the board in
+# its own right, with its own verdict, in every test/run-all.sh sweep already.
+if [ "${HEIMDALL_TEST_SLOW:-0}" != "1" ]; then
+  echo "  [SKIP] HEIMDALL_TEST_SLOW not set — nested maintain-loop suite omitted"
+  echo "         coverage is NOT lost: test/heimdall-maintain-loop.test.sh runs on the"
+  echo "         board in its own right, with its own verdict"
+  echo "         Run with HEIMDALL_TEST_SLOW=1 to also nest it here"
 else
-  bad "the existing maintain-loop suite FAILED after the --context change"
+  if bash "$ROOT/test/heimdall-maintain-loop.test.sh" >/dev/null 2>&1; then
+    ok "the existing heimdall-maintain-loop.test.sh still passes (no regression)"
+  else
+    bad "the existing maintain-loop suite FAILED after the --context change"
+  fi
 fi
 
 echo
