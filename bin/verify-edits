@@ -24,14 +24,19 @@
 #                       cannot be trusted (see the ledger-git cross-check
 #                       below); or (c) `edit-tracker clears` shows this
 #                       ledger was reset mid-session while it held real
-#                       entries — a resume/compact SessionStart firing `clear`
-#                       unconditionally (no gate on `source`), or a concurrent
-#                       agent sharing this session id and ledger, can each
-#                       destroy entries another part of the session already
-#                       logged, committed or not (see the mid-session-clear
-#                       cross-check below). Distinct from 1 so "nothing was
-#                       checked" can never be mistaken for "everything is
-#                       fine".
+#                       entries — hooks.json's SessionStart gates the clear on
+#                       `source == "startup"` (fixed 2026-09-02, d7447c28) AND
+#                       on CLAUDE_CODE_CHILD_SESSION being unset, since a
+#                       Task/Agent-tool subagent shares its parent's
+#                       CLAUDE_CODE_SESSION_ID — and therefore this same
+#                       ledger file — wholesale, so its own "startup" must not
+#                       clear a ledger its parent or siblings still rely on.
+#                       Even so, concurrent agents sharing one session id
+#                       share one ledger, so one can still destroy entries
+#                       another part of the session already logged, committed
+#                       or not (see the mid-session-clear cross-check below).
+#                       Distinct from 1 so "nothing was checked" can never be
+#                       mistaken for "everything is fine".
 set -euo pipefail
 
 PLUGIN_DIR="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -109,17 +114,24 @@ fi
 
 # Mid-session clear evidence: `edit-tracker clear` records "<ts>|<entries_lost>"
 # whenever it wiped a ledger that held real entries (bin/edit-tracker.c
-# do_clear()). hooks.json's SessionStart hook fires `edit-tracker clear`
-# UNCONDITIONALLY on every session-start event — startup, resume, AND compact
-# alike, with no gate on `source` (confirmed by reading hooks/hooks.json: the
-# SessionStart command never inspects its own stdin JSON before calling
-# clear). Concurrent agents that share one $CLAUDE_CODE_SESSION_ID share one
-# ledger file too (confirmed directly: a sibling worktree agent's edits have
-# been observed landing in this exact session's ledger) — so ANY one of them
-# starting, resuming, or compacting can clear entries another is still relying
-# on. clears_lost > 0 means the ledger's current contents are a
-# KNOWN-INCOMPLETE record, not a trustworthy one, regardless of what it
-# currently shows.
+# do_clear()). hooks.json's SessionStart hook gates the clear on
+# `source == "startup"` (fixed 2026-09-02, d7447c28 — a resume/compact no
+# longer wipes it) AND on CLAUDE_CODE_CHILD_SESSION being unset (fixed
+# alongside this comment): a Task/Agent-tool subagent shares its parent's
+# process env wholesale, so it shares $CLAUDE_CODE_SESSION_ID — and this same
+# ledger file — too; without this second gate, a subagent's own legitimate
+# "startup" would still clear a ledger its parent or siblings were relying on.
+# Measured on one long-lived session here: 42 recorded clear-loss events, 597
+# entries total, in the tight "small batch logged, then wiped a few hundred ms
+# later" pattern this second gate targets. Concurrent agents that share one
+# $CLAUDE_CODE_SESSION_ID share one ledger file regardless (confirmed
+# directly: a sibling worktree agent's edits have been observed landing in
+# this exact session's ledger) — so even with both gates, a genuine non-child
+# startup racing a sibling can still clear entries another is relying on.
+# clears_lost > 0 means the ledger's current contents are a KNOWN-INCOMPLETE
+# record, not a trustworthy one, regardless of what it currently shows — and
+# because .clears is never pruned, this can reflect history from well before
+# either gate existed, not necessarily a live, ongoing problem.
 clear_events=$("$TRACKER" clears 2>/dev/null || true)
 clears_lost=0
 if [ -n "$clear_events" ]; then
@@ -136,9 +148,10 @@ if [ -z "$paths" ]; then
   # --- ledger-git cross-check: begin ---
   # The ledger claims zero edits. Before trusting that, cross-check against
   # git: a ledger can go from "correctly tracking real edits" to "present and
-  # empty" if something clears it mid-session (e.g. a SessionStart hook
-  # re-firing on compaction/resume without gating on `source` — see
-  # hooks/hooks.json). A dirty working tree while the ledger says zero is
+  # empty" if something clears it mid-session (e.g. a subagent sharing this
+  # session's ledger reporting its own SessionStart `source == "startup"` —
+  # see hooks/hooks.json's CLAUDE_CODE_CHILD_SESSION gate). A dirty working
+  # tree while the ledger says zero is
   # exactly that contradiction: report NON-VERIFIED, not a confident pass.
   #
   # `git rev-parse --is-inside-work-tree` (not `[ -d .git ]`) on purpose: in a
@@ -222,17 +235,19 @@ if [ -z "$paths" ]; then
     echo "  $ledger_file"
     echo ""
     echo "...but it was reset at least once while it held real entries"
-    echo "($clears_lost total lost). That happens when hooks.json's SessionStart"
-    echo "hook fires \`edit-tracker clear\` on a resume/compact boundary, not"
-    echo "just a true fresh session start — or when a concurrent agent sharing"
-    echo "this ledger starts, resumes, or compacts."
+    echo "($clears_lost total lost). hooks.json's SessionStart gates the clear"
+    echo "on source==startup AND on CLAUDE_CODE_CHILD_SESSION being unset, but"
+    echo "a concurrent agent sharing this ledger (same \$CLAUDE_CODE_SESSION_ID)"
+    echo "starting, resuming, or compacting can still race it — or this may be"
+    echo "older history: .clears is cumulative and never pruned."
     echo ""
     echo "Edits made before that clear are gone from this ledger even if they"
     echo "are already committed. Treat this session's edit history as"
     echo "UNVERIFIED, not zero."
     echo ""
-    echo "Fix: find out why the clear fired (hooks.json's SessionStart ->"
-    echo "edit-tracker clear has no gate on \`source\`). To resume tracking:"
+    echo "Fix: check bin/edit-tracker clears for timing, and hooks.json's"
+    echo "SessionStart gate (source==startup && !CLAUDE_CODE_CHILD_SESSION)."
+    echo "To resume tracking:"
     echo "  $TRACKER init"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "VERDICT: NON-VERIFIED"
@@ -293,9 +308,10 @@ if [ "$clears_lost" -gt 0 ]; then
   echo "lost). This report can only cover what was logged AFTER that clear —"
   echo "edits made before it are not included here, verified or not."
   echo ""
-  echo "Fix: find out why the clear fired (hooks.json's SessionStart ->"
-  echo "edit-tracker clear has no gate on \`source\`, so it re-fires on"
-  echo "resume/compact — or a concurrent agent sharing this ledger cleared it)."
+  echo "Fix: hooks.json's SessionStart already gates the clear on"
+  echo "source==startup && !CLAUDE_CODE_CHILD_SESSION — this is likely a"
+  echo "concurrent agent sharing this ledger (same \$CLAUDE_CODE_SESSION_ID),"
+  echo "or older history (.clears is cumulative and never pruned)."
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "VERDICT: NON-VERIFIED"
   exit 2
