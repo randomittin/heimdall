@@ -707,6 +707,16 @@ if [ "${#NONGREEN[@]}" -gt 0 ] || [ "$n_treeviol" -gt 0 ]; then
     cp "$WORK/$ei.out" "$EVIDENCE/${ename%.test.sh}.$estatus.out" 2>/dev/null || true
     [ -f "$WORK/$ei.out.parallel" ] && \
       cp "$WORK/$ei.out.parallel" "$EVIDENCE/${ename%.test.sh}.$estatus.parallel.out" 2>/dev/null || true
+    # Cheap (already-captured, small file): pull the first few actionable lines out of the
+    # suite's own output so the summary can name WHICH assertion failed instead of just
+    # "N passed, M failed". Matches the ok()/bad() harness convention nearly every suite in
+    # this repo uses (bad() prints "  <red>FAIL<reset> <msg>"), stripping colour codes the
+    # same way parse_counts() already does above (identical sed expression, line ~215),
+    # plus a literal "bad " match for any suite that prints that literally instead.
+    LC_ALL=C sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$WORK/$ei.out" 2>/dev/null \
+      | grep -E '^[[:space:]]*(FAIL|bad)[[:space:]]' \
+      | head -n 3 \
+      > "$EVIDENCE/${ename%.test.sh}.$estatus.badlines.txt" 2>/dev/null || true
   done
   if [ "$n_treeviol" -gt 0 ]; then
     cp "$WORK/tree-report.txt" "$EVIDENCE/TREE-INTEGRITY-VIOLATION.txt" 2>/dev/null || true
@@ -801,6 +811,7 @@ echo "suites: ${TO_RUN} ran, ${#SKIP[@]} skipped (live), ${DISCOVERED} discovere
 echo "        ${GRN}${n_pass} pass${OFF}  ${RED}${n_fail} fail${OFF}  ${RED}${n_timeout} timeout${OFF}  ${RED}${n_discrep} discrepancy${OFF}  ${YEL}${n_unparsed} unparsed${OFF}"
 echo "assertions: ${tot_p} passed, ${tot_f} failed  (parsed detail; exit codes above are authoritative)"
 echo "wall clock: ${ELAPSED}s"
+echo "load avg:   start ${LOAD_START_DISP} (1m/5m/15m) -> end ${LOAD_END_DISP} (1m/5m/15m)   cpu_count=${NCPU:-n/a}"
 if [ "$n_treeviol" -eq 0 ]; then
   echo "tree-integrity: clean (before/after git status match; no tracked file touched, no root litter, no new stash)"
 else
@@ -808,6 +819,13 @@ else
 fi
 if [ -n "$EVIDENCE" ]; then
   echo "evidence:   ${EVIDENCE}   (${#NONGREEN[@]} non-green suite output(s) + INDEX.txt — kept, not deleted)"
+  for e in ${NONGREEN[@]+"${NONGREEN[@]}"}; do
+    ei="${e%%|*}"; erest="${e#*|}"; ename="${erest%%|*}"; estatus="${erest#*|}"
+    printf '  %-9s %-52s %s\n' "$estatus" "$ename" "${EVIDENCE}/${ename%.test.sh}.${estatus}.out"
+    if [ -s "${EVIDENCE}/${ename%.test.sh}.${estatus}.badlines.txt" ]; then
+      sed 's/^/        /' "${EVIDENCE}/${ename%.test.sh}.${estatus}.badlines.txt"
+    fi
+  done
 fi
 
 BAD=$((n_fail + n_timeout + n_discrep + n_treeviol))
@@ -878,12 +896,22 @@ if command -v jq >/dev/null 2>&1; then
       --argjson assertions_passed "$tot_p" \
       --argjson assertions_failed "$tot_f" \
       --argjson duration_s "$ELAPSED" \
+      --argjson load_start_1m "$(_load_field "$LOAD_START" 1)" \
+      --argjson load_start_5m "$(_load_field "$LOAD_START" 2)" \
+      --argjson load_start_15m "$(_load_field "$LOAD_START" 3)" \
+      --argjson load_end_1m "$(_load_field "$LOAD_END" 1)" \
+      --argjson load_end_5m "$(_load_field "$LOAD_END" 2)" \
+      --argjson load_end_15m "$(_load_field "$LOAD_END" 3)" \
+      --argjson cpu_count "${NCPU:-null}" \
       '{finished_at:$finished_at, repo:$repo, head_sha:$head_sha, tree_clean:$tree_clean,
         exit_code:$exit_code, suites_total:$suites_total, suites_passed:$suites_passed,
         suites_failed:$suites_failed, suites_timeout:$suites_timeout,
         suites_discrepancy:$suites_discrepancy, suites_unparsed:$suites_unparsed,
         assertions_passed:$assertions_passed, assertions_failed:$assertions_failed,
-        duration_s:$duration_s}' > "$RECEIPT_TMP" 2>/dev/null; then
+        duration_s:$duration_s,
+        load_start_1m:$load_start_1m, load_start_5m:$load_start_5m, load_start_15m:$load_start_15m,
+        load_end_1m:$load_end_1m, load_end_5m:$load_end_5m, load_end_15m:$load_end_15m,
+        cpu_count:$cpu_count}' > "$RECEIPT_TMP" 2>/dev/null; then
       mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null \
         && echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})" \
         || echo "${YEL}run-all: could not move sweep receipt into place at ${RECEIPT_FILE}${OFF}" >&2
