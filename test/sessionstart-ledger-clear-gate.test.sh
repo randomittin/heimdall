@@ -349,6 +349,40 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
+# G12 — RED-WITHOUT-FIX mutant #2: re-inject the source-gated-ONLY segment
+#      (the state as of d7447c28, before the CLAUDE_CODE_CHILD_SESSION gate
+#      existed) and confirm a child-session startup now WIPES the ledger —
+#      proving this suite would have caught the second real bug too.
+# ══════════════════════════════════════════════════════════════════════════
+"$PY" - "$SS_CMD" >"$SANDBOX/mutant_cmd2.txt" <<'PYEOF'
+import sys
+cmd = sys.argv[1]
+old = ('SRC=$(printf \'%s\' "$INPUT" | jq -r \'.source // empty\' 2>/dev/null || true); '
+       'if [ "$SRC" = "startup" ] && [ -z "$CLAUDE_CODE_CHILD_SESSION" ]; then "$ETRACKER" clear 2>/dev/null || true; fi; '
+       '"$ETRACKER" init 2>/dev/null || true;')
+new = ('SRC=$(printf \'%s\' "$INPUT" | jq -r \'.source // empty\' 2>/dev/null || true); '
+       'if [ "$SRC" = "startup" ]; then "$ETRACKER" clear 2>/dev/null || true; fi; '
+       '"$ETRACKER" init 2>/dev/null || true;')
+assert cmd.count(old) == 1, f"fixed segment not found exactly once (found {cmd.count(old)})"
+sys.stdout.write(cmd.replace(old, new, 1))
+PYEOF
+MUTANT2_SS_CMD="$(cat "$SANDBOX/mutant_cmd2.txt")"
+[ -n "$MUTANT2_SS_CMD" ] || { echo "FATAL: could not build mutant2 command (fixed segment shape drifted)" >&2; exit 2; }
+
+reset_round
+( cd "$WORKDIR" && printf '%s' '{"source":"startup","session_id":"abc"}' | env \
+    CLAUDE_PLUGIN_ROOT="$PLUGIN_SANDBOX" TMPDIR="$SANDBOX" \
+    CLAUDE_CODE_SESSION_ID="$SID" CLAUDE_PROJECT_DIR="$WORKDIR" \
+    CLAUDE_CODE_CHILD_SESSION=1 \
+    sh -c "$MUTANT2_SS_CMD" ) >"$SANDBOX/last.out" 2>"$SANDBOX/last.err"
+mutant2_after="$(ledger_lines)"
+if [ "$mutant2_after" -eq 0 ]; then
+  ok "G12 RED-WITHOUT-FIX proof: the source-gated-only (pre-CLAUDE_CODE_CHILD_SESSION) segment DOES wipe a child-session startup's ledger (mutant2_after=0) — this suite would have caught this defect too"
+else
+  bad "G12 mutant2 did not reproduce the child-session bug (mutant2_after=$mutant2_after, expected 0) — this suite may be vacuous"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
 # G8 — hooks.json stays valid JSON.
 # ══════════════════════════════════════════════════════════════════════════
 if jq . "$HOOKS_JSON" >/dev/null 2>"$SANDBOX/jq.err"; then
