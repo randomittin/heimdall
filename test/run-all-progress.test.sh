@@ -206,7 +206,11 @@ EOF
 cat > "$PW2/test/r-fail.test.sh" <<'EOF'
 #!/usr/bin/env bash
 # fixture: a genuine, deterministic red — still red alone, so it is retried and stays FAIL.
+# The FAIL line mirrors the real ok()/bad() harness convention nearly every suite in this
+# repo uses (bad() prints "  <red>FAIL<reset> <msg>") — section 5 below proves run-all.sh
+# surfaces this exact line in its own summary, not an invented format.
 set -uo pipefail
+printf '  \033[31mFAIL\033[0m assertion X: expected 2 got 3\n'
 echo "0 passed, 1 failed"
 exit 1
 EOF
@@ -279,6 +283,57 @@ grep -E '^progress .* retry ' "$OUT2" | grep -qE 'r-unparsed|r-discrep' \
 [ "$RC2" != 0 ] \
   && ok "4i overall exit code still reflects RED when real failures exist (unchanged verdict semantics)" \
   || bad "4i expected nonzero exit, got $RC2" "$(cat "$OUT2")"
+
+echo "-- 5. EVIDENCE ENRICHMENT + LOAD INSTRUMENTATION: per-suite path, bad/FAIL-line surfacing, load/cpu receipt keys --"
+# r-fail.test.sh (built above) emits a realistic ok()/bad()-harness FAIL line before its
+# roll-up count -- this proves run-all.sh's summary surfaces that exact line (not just the
+# shared evidence directory), and that Task 2's load/cpu receipt keys land as NEW keys
+# alongside every existing one, never replacing them.
+grep -qE 'r-fail\.test\.sh.*r-fail\.FAIL\.out' "$OUT2" \
+  && ok "5a per-suite evidence file path is printed for a non-green suite (one cat away, not just the shared dir)" \
+  || bad "5a per-suite evidence path line missing for r-fail.test.sh" "$(grep -A20 '^evidence:' "$OUT2")"
+
+grep -qF "assertion X: expected 2 got 3" "$OUT2" \
+  && ok "5b the suite's own FAIL-marker line is echoed directly in the summary (the actionable line, not just the pass/fail count)" \
+  || bad "5b FAIL-marker line not surfaced in summary" "$(grep -A20 '^evidence:' "$OUT2")"
+
+WALLCLOCK_LINE="$(grep -n '^wall clock:' "$OUT2" | head -1 | cut -d: -f1)"
+LOADAVG_LINE="$(grep -n '^load avg:' "$OUT2" | head -1 | cut -d: -f1)"
+if [ -n "${WALLCLOCK_LINE:-}" ] && [ -n "${LOADAVG_LINE:-}" ] && [ "$LOADAVG_LINE" -eq $((WALLCLOCK_LINE + 1)) ]; then
+  ok "5c load-average summary line immediately follows wall clock (line $LOADAVG_LINE right after $WALLCLOCK_LINE)"
+else
+  bad "5c load-average line not printed immediately next to wall clock" "wallclock@${WALLCLOCK_LINE:-?} loadavg@${LOADAVG_LINE:-?}: $(grep '^wall clock:\|^load avg:' "$OUT2")"
+fi
+
+grep -qE '^load avg:' "$OUTFILE" \
+  && ok "5d load-average line also present on a fully GREEN run (unconditional instrumentation, not gated on non-green)" \
+  || bad "5d load-average line missing from the all-green fixture run" "$(grep '^wall clock:\|^load avg:' "$OUTFILE")"
+
+RECEIPT2="$PW2/.heimdall/receipts/last-sweep.json"
+if [ -f "$RECEIPT2" ]; then
+  KEYS_OK="$(jq -e 'has("finished_at") and has("repo") and has("head_sha") and has("tree_clean")
+    and has("exit_code") and has("suites_total") and has("suites_passed") and has("suites_failed")
+    and has("suites_timeout") and has("suites_discrepancy") and has("suites_unparsed")
+    and has("assertions_passed") and has("assertions_failed") and has("duration_s")
+    and has("load_start_1m") and has("load_start_5m") and has("load_start_15m")
+    and has("load_end_1m") and has("load_end_5m") and has("load_end_15m")
+    and has("cpu_count")' "$RECEIPT2" 2>/dev/null)"
+  [ "$KEYS_OK" = "true" ] \
+    && ok "5e sweep receipt carries every pre-existing key UNCHANGED plus the new load/cpu keys" \
+    || bad "5e sweep receipt missing an existing or a new load/cpu key" "$(cat "$RECEIPT2" 2>/dev/null)"
+else
+  bad "5e sweep receipt not found at $RECEIPT2"
+fi
+
+RECEIPT1="$PW/.heimdall/receipts/last-sweep.json"
+if [ -f "$RECEIPT1" ]; then
+  KEYS_OK1="$(jq -e 'has("load_start_1m") and has("load_end_1m") and has("cpu_count")' "$RECEIPT1" 2>/dev/null)"
+  [ "$KEYS_OK1" = "true" ] \
+    && ok "5f load/cpu keys also present on the all-green receipt (both branches write them)" \
+    || bad "5f load/cpu keys missing from the all-green receipt" "$(cat "$RECEIPT1" 2>/dev/null)"
+else
+  bad "5f all-green receipt not found at $RECEIPT1"
+fi
 
 echo
 printf "  Results: %d passed, %d failed\n" "$PASS" "$FAIL"

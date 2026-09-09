@@ -77,6 +77,53 @@ case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
 [ "$JOBS" -gt 6 ] && JOBS=6
 [ "$JOBS" -lt 1 ] && JOBS=1
 
+# ── SYSTEM LOAD / CORE CAPTURE (instrumentation only — never a gate) ─────────────────────
+# WHY THIS EXISTS: a real sweep went RED (6 FAIL, 8 TIMEOUT, 7410s wall clock) on a box
+# measured AFTERWARD at load averages 17.28/25.09/26.14 on 10 cores (~2.5x oversubscribed)
+# -- but nothing recorded that at the time, so a red sweep and a load-contaminated sweep
+# were indistinguishable after the fact. This records load/cpu so that distinction can be
+# made later; it decides nothing and gates nothing itself -- any policy built on top of it
+# (refusing to run under load, auto-adjusting timeouts) is a separate, later decision.
+#
+# macOS-first (this repo's primary target) via sysctl, with a Linux fallback that must
+# never hard-fail the sweep: an unreadable metric on some platform writes null/absent and
+# the run carries on exactly as it did before this existed.
+NCPU="$( { sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null; } | head -1 )"
+case "$NCPU" in ''|*[!0-9]*) NCPU="" ;; esac
+
+# _load_avg — emits "L1 L5 L15" (space-separated) on success, empty string if this
+# platform offers neither `sysctl -n vm.loadavg` (macOS/BSD) nor /proc/loadavg (Linux).
+# Every branch degrades to a plain empty echo -- never errors, never exits the sweep.
+_load_avg() {
+  local raw
+  if command -v sysctl >/dev/null 2>&1 && raw="$(sysctl -n vm.loadavg 2>/dev/null)" && [ -n "$raw" ]; then
+    printf '%s' "$raw" | tr -d '{}' | awk '{print $1, $2, $3}'
+    return 0
+  fi
+  if [ -r /proc/loadavg ]; then
+    awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null
+    return 0
+  fi
+  printf ''
+}
+# _load_field RAW IDX — the IDXth (1|2|3) number out of RAW, or the JSON literal "null"
+# (never a shell-empty string) when RAW is empty or malformed. --argjson requires a
+# parseable JSON token per value; a missing metric must degrade to null, never abort the
+# whole receipt write.
+_load_field() {
+  local s="$1" idx="$2" v
+  [ -z "$s" ] && { printf 'null'; return 0; }
+  v="$(printf '%s' "$s" | awk -v i="$idx" '{print $i}')"
+  case "$v" in
+    ''|*[!0-9.]*) printf 'null' ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+# _load_disp RAW — "1.23/4.56/7.89" for the human summary line, or "n/a".
+_load_disp() {
+  [ -n "$1" ] && printf '%s' "$1" | awk '{printf "%s/%s/%s", $1, $2, $3}' || printf 'n/a'
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --include-live) INCLUDE_LIVE=1; shift ;;
@@ -440,6 +487,8 @@ _heartbeat_check() {
 }
 
 START=$(date +%s)
+LOAD_START="$(_load_avg)"
+LOAD_START_DISP="$(_load_disp "$LOAD_START")"
 PIDS=()
 PIDIDX=()
 next=0
@@ -510,6 +559,8 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
   [ -t 1 ] && printf '\r%*s\r' 44 ''
 fi
 END=$(date +%s)
+LOAD_END="$(_load_avg)"
+LOAD_END_DISP="$(_load_disp "$LOAD_END")"
 ELAPSED=$((END - START))
 
 # ── REPO INTEGRITY, AFTER SIDE (guarantee #8 in the header) ─────────────────────────────
@@ -695,6 +746,16 @@ if [ "${#NONGREEN[@]}" -gt 0 ] || [ "$n_treeviol" -gt 0 ]; then
     cp "$WORK/$ei.out" "$EVIDENCE/${ename%.test.sh}.$estatus.out" 2>/dev/null || true
     [ -f "$WORK/$ei.out.parallel" ] && \
       cp "$WORK/$ei.out.parallel" "$EVIDENCE/${ename%.test.sh}.$estatus.parallel.out" 2>/dev/null || true
+    # Cheap (already-captured, small file): pull the first few actionable lines out of the
+    # suite's own output so the summary can name WHICH assertion failed instead of just
+    # "N passed, M failed". Matches the ok()/bad() harness convention nearly every suite in
+    # this repo uses (bad() prints "  <red>FAIL<reset> <msg>"), stripping colour codes the
+    # same way parse_counts() already does above (identical sed expression, line ~215),
+    # plus a literal "bad " match for any suite that prints that literally instead.
+    LC_ALL=C sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$WORK/$ei.out" 2>/dev/null \
+      | grep -E '^[[:space:]]*(FAIL|bad)[[:space:]]' \
+      | head -n 3 \
+      > "$EVIDENCE/${ename%.test.sh}.$estatus.badlines.txt" 2>/dev/null || true
   done
   if [ "$n_treeviol" -gt 0 ]; then
     cp "$WORK/tree-report.txt" "$EVIDENCE/TREE-INTEGRITY-VIOLATION.txt" 2>/dev/null || true
@@ -789,6 +850,7 @@ echo "suites: ${TO_RUN} ran, ${#SKIP[@]} skipped (live), ${DISCOVERED} discovere
 echo "        ${GRN}${n_pass} pass${OFF}  ${RED}${n_fail} fail${OFF}  ${RED}${n_timeout} timeout${OFF}  ${RED}${n_discrep} discrepancy${OFF}  ${YEL}${n_unparsed} unparsed${OFF}"
 echo "assertions: ${tot_p} passed, ${tot_f} failed  (parsed detail; exit codes above are authoritative)"
 echo "wall clock: ${ELAPSED}s"
+echo "load avg:   start ${LOAD_START_DISP} (1m/5m/15m) -> end ${LOAD_END_DISP} (1m/5m/15m)   cpu_count=${NCPU:-n/a}"
 if [ "$n_treeviol" -eq 0 ]; then
   echo "tree-integrity: clean (before/after git status match; no tracked file touched, no root litter, no new stash)"
 else
@@ -796,6 +858,13 @@ else
 fi
 if [ -n "$EVIDENCE" ]; then
   echo "evidence:   ${EVIDENCE}   (${#NONGREEN[@]} non-green suite output(s) + INDEX.txt — kept, not deleted)"
+  for e in ${NONGREEN[@]+"${NONGREEN[@]}"}; do
+    ei="${e%%|*}"; erest="${e#*|}"; ename="${erest%%|*}"; estatus="${erest#*|}"
+    printf '  %-9s %-52s %s\n' "$estatus" "$ename" "${EVIDENCE}/${ename%.test.sh}.${estatus}.out"
+    if [ -s "${EVIDENCE}/${ename%.test.sh}.${estatus}.badlines.txt" ]; then
+      sed 's/^/        /' "${EVIDENCE}/${ename%.test.sh}.${estatus}.badlines.txt"
+    fi
+  done
 fi
 
 BAD=$((n_fail + n_timeout + n_discrep + n_treeviol))
@@ -866,12 +935,22 @@ if command -v jq >/dev/null 2>&1; then
       --argjson assertions_passed "$tot_p" \
       --argjson assertions_failed "$tot_f" \
       --argjson duration_s "$ELAPSED" \
+      --argjson load_start_1m "$(_load_field "$LOAD_START" 1)" \
+      --argjson load_start_5m "$(_load_field "$LOAD_START" 2)" \
+      --argjson load_start_15m "$(_load_field "$LOAD_START" 3)" \
+      --argjson load_end_1m "$(_load_field "$LOAD_END" 1)" \
+      --argjson load_end_5m "$(_load_field "$LOAD_END" 2)" \
+      --argjson load_end_15m "$(_load_field "$LOAD_END" 3)" \
+      --argjson cpu_count "${NCPU:-null}" \
       '{finished_at:$finished_at, repo:$repo, head_sha:$head_sha, tree_clean:$tree_clean,
         exit_code:$exit_code, suites_total:$suites_total, suites_passed:$suites_passed,
         suites_failed:$suites_failed, suites_timeout:$suites_timeout,
         suites_discrepancy:$suites_discrepancy, suites_unparsed:$suites_unparsed,
         assertions_passed:$assertions_passed, assertions_failed:$assertions_failed,
-        duration_s:$duration_s}' > "$RECEIPT_TMP" 2>/dev/null; then
+        duration_s:$duration_s,
+        load_start_1m:$load_start_1m, load_start_5m:$load_start_5m, load_start_15m:$load_start_15m,
+        load_end_1m:$load_end_1m, load_end_5m:$load_end_5m, load_end_15m:$load_end_15m,
+        cpu_count:$cpu_count}' > "$RECEIPT_TMP" 2>/dev/null; then
       mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null \
         && echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})" \
         || echo "${YEL}run-all: could not move sweep receipt into place at ${RECEIPT_FILE}${OFF}" >&2
