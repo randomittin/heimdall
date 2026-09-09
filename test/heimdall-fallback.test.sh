@@ -1962,6 +1962,18 @@ printf '%s' "$PROBE_OUT" | grep -q '^dead=False$' \
   || bad "85c. probe output: $PROBE_OUT"
 
 # ── 86. The probe is BOUNDED. A wedged server must not hang the gate. ─────
+# PARALLEL-FLAKY (root-caused 2026-09-10): this measures REAL wall-clock time around a
+# 1s internal timeout (HEIMDALL_FALLBACK_PROBE_TIMEOUT=1) and used to require <5s back.
+# Caught live in a full sweep: run-all's classifier checks rc=124 first and exclusively,
+# so a FAIL-labeled suite never timed out -- it exited on its own, and the sweep showed
+# exactly that: 139 passed, 1 failed at 136s (well under the suite's own budget). This
+# suite's solo runs measure ~20% avg cpu (mostly scheduling wait, not compute), so a 5x
+# margin on a 1s timeout is exactly what a --jobs 6 sibling's contention eats. 30s follows
+# this repo's own precedent for "time-bounded, did not hang" checks
+# (test/heimdall-autoupdate.test.sh:202, same "Xs < 30s" shape) and stays falsifiable: the
+# wedged listener never sends a byte, so a genuinely broken/ignored timeout free-runs on
+# the read far past 30s -- there is no path by which "broken" lands under 30s, only
+# "correct but scheduled late" does.
 BOUND_OUT="$(env -u HEIMDALL_FALLBACK_ASSUME_REACHABLE HEIMDALL_FALLBACK_PROBE_TIMEOUT=1 python3 - "$CLI" <<'PYBOUND'
 import socket, sys, threading, time
 ns = {"__name__": "fb"}
@@ -1978,7 +1990,7 @@ PYBOUND
 BOUND_SECS="$(printf '%s' "$BOUND_OUT" | sed -n 's/.*elapsed=\([0-9.]*\).*/\1/p')"
 printf '%s' "$BOUND_OUT" | grep -q '^rc=False' \
   && [ -n "$BOUND_SECS" ] \
-  && awk -v s="$BOUND_SECS" 'BEGIN{exit !(s < 5)}' \
+  && awk -v s="$BOUND_SECS" 'BEGIN{exit !(s < 30)}' \
   && ok "86. liveness probe honours HEIMDALL_FALLBACK_PROBE_TIMEOUT: wedged server refused in ${BOUND_SECS}s, not hung" \
   || bad "86. bound output: $BOUND_OUT"
 
