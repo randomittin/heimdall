@@ -456,6 +456,93 @@ if [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
 fi
 # -- end coop native-spawn refusal fence --------------------------------------
 
+# -- context gate fence -------------------------------------------------------
+# bin/heimdall-ctx-meter gate (119 assertions, test/ctx-meter.test.sh) already
+# decides, correctly and conservatively, whether this session has room left to
+# start NEW work: ok/checkpoint below the hard ceiling (CLIFF=800000 tokens),
+# defer at-or-past it whenever the boundary isn't provably clean (a live agent
+# still running, or `git status --porcelain` non-empty), refuse only at-or-past
+# it AND with 0 live agents AND a clean tree. That refuse case is the ONLY exit
+# 1 the meter ever produces, and it means precisely "nothing is in flight to
+# protect and this is the one clean place to stop" -- the meter has already
+# done the hard part; this fence only has to consume that verdict at the right
+# granularity. A spawn (new work starting) is that granularity; a mid-task tool
+# call is not (interrupting work already in flight is exactly what "boundary
+# not clean" exists to prevent, and the meter's own defer path already refuses
+# to refuse there -- this fence trusts that completely and never re-derives
+# live-agent-count or git-dirty itself, so the two checks can never drift).
+#
+# FAILS OPEN, direction chosen deliberately opposite the adjudication fence
+# above (which fails closed on an unclassifiable spawn): a missing/broken
+# context meter is a plumbing gap, not a safety signal, and a spawn is never
+# denied over one. Every one of the following falls through with no exit:
+# ctx-meter absent or not executable, jq absent, stdin empty, session id not
+# extractable, the call times out (bounded below, same perl-alarm idiom the
+# brief-adoption gate already uses), or its output is anything other than
+# exactly {"decision":"refuse",...} -- including a real exit-1 whose body
+# fails to parse as that. Only a clean, positive "refuse" ever denies.
+#
+# SESSION ID: extracted from this hook's own payload (already sitting in
+# $INPUT) via jq, and passed explicitly with --session. Never rely on
+# heimdall-ctx-meter's own no-session-given fallback here: that fallback reads
+# the newest record in a directory shared by every session on the machine
+# (bin/heimdall-ctx-meter's _newest_record, default ~/.heimdall/ctx), which is
+# the wrong answer under the parallel multi-agent usage this project
+# encourages -- two sessions racing would let one borrow the other's reading.
+# Omitted only if the payload has no session_id to give (falls open, per the
+# fail-open rule above, back to the meter's own fallback).
+#
+# ESCAPE HATCH: HMD_CTX_GATE_OFF=1 skips this fence for that one spawn call,
+# same shape as HEIMDALL_ALLOW_NAMED_AGENT/HEIMDALL_ALLOW_LONG_BRIEF above --
+# unlike the adjudication and coop fences (deliberately no bypass: both guard
+# a correctness/routing question a human override could get wrong), a stalled
+# context gate blocks forward progress on a live session with nothing left to
+# check it against, so this one keeps an operator escape hatch.
+if [ "${HMD_CTX_GATE_OFF:-}" = "1" ]; then
+  : # escape hatch -- fence skipped entirely for this spawn
+elif [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
+  CTXGATE_BIN="$BIN_DIR/heimdall-ctx-meter"
+  if [ -x "$CTXGATE_BIN" ]; then
+    CTXGATE_SID="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)" || CTXGATE_SID=""
+    if command -v perl >/dev/null 2>&1; then
+      if [ -n "$CTXGATE_SID" ]; then
+        CTXGATE_OUT="$(perl -e 'alarm 5; exec @ARGV' -- "$CTXGATE_BIN" gate --session "$CTXGATE_SID" --json </dev/null 2>/dev/null)"
+      else
+        CTXGATE_OUT="$(perl -e 'alarm 5; exec @ARGV' -- "$CTXGATE_BIN" gate --json </dev/null 2>/dev/null)"
+      fi
+    else
+      if [ -n "$CTXGATE_SID" ]; then
+        CTXGATE_OUT="$("$CTXGATE_BIN" gate --session "$CTXGATE_SID" --json </dev/null 2>/dev/null)"
+      else
+        CTXGATE_OUT="$("$CTXGATE_BIN" gate --json </dev/null 2>/dev/null)"
+      fi
+    fi
+    CTXGATE_RC=$?
+    if [ "$CTXGATE_RC" -eq 1 ]; then
+      CTXGATE_DECISION="$(printf '%s' "$CTXGATE_OUT" | jq -r '.decision // empty' 2>/dev/null)" || CTXGATE_DECISION=""
+      if [ "$CTXGATE_DECISION" = "refuse" ]; then
+        CTXGATE_TOKENS="$(printf '%s' "$CTXGATE_OUT" | jq -r '.tokens // empty' 2>/dev/null)" || CTXGATE_TOKENS=""
+        CTXGATE_WHY="$(printf '%s' "$CTXGATE_OUT" | jq -r '.reason // empty' 2>/dev/null)" || CTXGATE_WHY=""
+        [ -n "$CTXGATE_TOKENS" ] || CTXGATE_TOKENS="this session's"
+        [ -n "$CTXGATE_WHY" ] || CTXGATE_WHY="past the hard context ceiling with a clean, confirmed boundary (no live agents, clean tree)"
+        CTXGATE_REASON="BIFROST - Heimdall context gate: spawn REFUSED -- ${CTXGATE_TOKENS} tokens, ${CTXGATE_WHY}. This is the one clean place to stop: no work in flight to protect, and starting new work now would commit fresh context to a session already past the hard ceiling. Run /hmd:save NOW -- it writes .planning/CHECKPOINT.md, the file heimdall-resume-probe checks for before it will call a restart GREEN -- THEN /compact (save first: compaction rewrites context lossily, and the checkpoint /hmd:save just wrote is what makes that rewrite recoverable afterward). Re-spawn once compacted. To override just this one spawn: HMD_CTX_GATE_OFF=1."
+        CTXGATE_JSON="$(jq -cn --arg r "$CTXGATE_REASON" '{error: $r}' 2>/dev/null)"
+        if [ -z "$CTXGATE_JSON" ]; then
+          CTXGATE_JSON='{"error": "BIFROST - Heimdall context gate: spawn REFUSED -- past the hard context ceiling with a clean, confirmed boundary. Run /hmd:save, then /compact, then re-spawn. Override just this spawn: HMD_CTX_GATE_OFF=1."}'
+        fi
+        printf '%s\n' "$CTXGATE_JSON"
+        printf '%s\n' "$CTXGATE_REASON" >&2
+        exit 2
+      fi
+    fi
+    # Any other CTXGATE_RC (0 = ok/checkpoint/defer; anything else = a
+    # perl-alarm signal-kill code, or the call itself failed to run) falls
+    # through here on purpose -- no exit, matching every fail-open path
+    # documented above.
+  fi
+fi
+# -- end context gate fence ----------------------------------------------------
+
 # -- brief-adoption gate -------------------------------------------------------
 allow() { exit 0; }
 

@@ -482,13 +482,44 @@ AFTER_H_HEAD="$(git -C "$WT_H" rev-parse HEAD)"
   || bad "stop-hook: empty stdin should still exit 0"
 
 # ── regression: heimdall-agent-resume's own suite must still pass ────────
+# THIS NESTED CALL IS A WHOLE SIBLING SUITE, run bare/unmodified with no
+# distinguishing fixture or flag: bash "$ROOT/test/heimdall-agent-resume.test.sh"
+# is the exact same file test/run-all.sh's own glob discovery already runs on
+# the board, with its own verdict. That is PURE DUPLICATION, in the identical
+# shape already fixed for heimdall-maintain-loop.test.sh in
+# test/heimdall-context-capsule.test.sh case 9, and for install-stranger.test.sh
+# in test/issue-loop-integration.test.sh and test/telemetry-install.test.sh:327.
+# The coupling is not hypothetical: in one sweep both this file AND
+# test/heimdall-agent-resume.test.sh independently hit TIMEOUT at 182s —
+# plausibly one root cause counted twice because of exactly this nesting.
+#
+# Gating loses NO interaction coverage. The actual watchdog<->resume
+# interaction — that heimdall-agent-watchdog correctly drives
+# heimdall-agent-resume's own quota/resumable/undetermined classification into
+# its own .recommendation — is already asserted above by fixtures A, C and D of
+# THIS suite, independent of this nested call. This block only re-runs
+# resume's OWN suite wholesale; nothing about the interaction changes if it is
+# skipped.
+#
+# Gated behind HEIMDALL_TEST_SLOW=1 — the same gate the precedents above use.
+# Skipping is LOUD (never silent), and names where the coverage actually lives:
+# nothing is lost by skipping, because test/heimdall-agent-resume.test.sh runs
+# on the board in its own right, with its own verdict, in every
+# test/run-all.sh sweep already.
 echo
 echo "── regression: bash test/heimdall-agent-resume.test.sh ──"
-if bash "$ROOT/test/heimdall-agent-resume.test.sh" >"$WORK/ar-regression.out" 2>&1; then
-  ok "bash test/heimdall-agent-resume.test.sh still green after this change"
+if [ "${HEIMDALL_TEST_SLOW:-0}" != "1" ]; then
+  echo "  [SKIP] HEIMDALL_TEST_SLOW not set — nested agent-resume suite omitted"
+  echo "         coverage is NOT lost: test/heimdall-agent-resume.test.sh runs on the"
+  echo "         board in its own right, with its own verdict"
+  echo "         Run with HEIMDALL_TEST_SLOW=1 to also nest it here"
 else
-  bad "REGRESSION: test/heimdall-agent-resume.test.sh now fails — see tail below"
-  tail -40 "$WORK/ar-regression.out" >&2
+  if bash "$ROOT/test/heimdall-agent-resume.test.sh" >"$WORK/ar-regression.out" 2>&1; then
+    ok "bash test/heimdall-agent-resume.test.sh still green after this change"
+  else
+    bad "REGRESSION: test/heimdall-agent-resume.test.sh now fails — see tail below"
+    tail -40 "$WORK/ar-regression.out" >&2
+  fi
 fi
 
 echo

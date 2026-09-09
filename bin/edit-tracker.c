@@ -18,11 +18,15 @@
  *                             entries. Lets consumers (bin/verify-edits) tell
  *                             "genuinely zero edits" apart from "edits
  *                             happened, then the ledger got wiped mid-session"
- *                             — e.g. hooks.json's SessionStart hook fires
- *                             `edit-tracker clear` unconditionally on every
- *                             resume/compact, not just a true fresh start, and
+ *                             — hooks.json's SessionStart gates the clear on
+ *                             `source == "startup"` (fixed 2026-09-02,
+ *                             d7447c28) AND on CLAUDE_CODE_CHILD_SESSION
+ *                             being unset, since a Task/Agent-tool subagent
+ *                             shares its parent's CLAUDE_CODE_SESSION_ID (and
+ *                             this same ledger file) wholesale. Even so,
  *                             concurrent agents that share one session id
- *                             share one ledger file too.
+ *                             share one ledger file too, so a genuine
+ *                             non-child startup can still race a sibling.
  *
  * The ledger file's EXISTENCE is proof the tracker ran. An ABSENT ledger means
  * the PostToolUse hook never fired, so "no edits" is unknowable — consumers

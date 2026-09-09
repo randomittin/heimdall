@@ -219,6 +219,45 @@ suite_timeout() {
     # 900s ~= 2.1x the measured solo, keeping the documented ~1.8x parallel-contention
     # factor inside the budget, and sits in the same tier as selfscan (203->600 = 2.96x).
     install-stranger.test.sh)        override=900 ;;
+    # PARALLEL-FLAKY (2026-09-10): red under --jobs 6, green alone, retried to a pass by
+    # run-all's own flaky-retry every time -- i.e. never a wrong assertion, always a
+    # timeout. Root-caused by direct measurement, not guessed: this suite makes 147
+    # separate `python3 bin/heimdall-fallback ...` CLI invocations (one or more per
+    # assertion, each a real interpreter start), and on THIS box python3 resolves through
+    # a pyenv shim (a bash script doing version-resolution before it execs the real
+    # interpreter) -- confirmed via `ps aux` mid-run, not assumed. State isolation was
+    # investigated first and ruled out, not skipped: every one of the 147 invocations
+    # already passes --repo pointed at a unique mktemp dir (verified: zero invocations
+    # found missing --repo), HEIMDALL_HOME is never read by bin/heimdall-fallback (grep
+    # finds exactly one hit, a docstring comment, no live os.environ.get), and the single
+    # code path that would shell out to the real heimdall-session-usage binary is guarded
+    # by a test-only override pointed at a fake script or a deliberately-nonexistent path
+    # in all 13 reachable call sites -- so there is no shared file for a --jobs 6 sibling
+    # to collide with. `time bash test/heimdall-fallback.test.sh` solo measured 194s wall
+    # (only 38.9s user+sys -- 20% avg CPU, i.e. mostly waiting on scheduling, not doing
+    # work) already past the 180s default on its own before any --jobs 6 sibling adds a
+    # single cycle of contention. 450s applies roughly the same ~2x margin used above.
+    heimdall-fallback.test.sh)        override=450 ;;
+    # PARALLEL-FLAKY (2026-09-10), same investigation and same non-guessed conclusion as
+    # heimdall-fallback.test.sh just above: a timeout, never a wrong assertion, and no
+    # shared file to isolate. Ruled out concretely: no keychain/security usage anywhere in
+    # install.sh; no fixed-path lockfile (grepped for flock/.lock/a fixed /tmp path -- none
+    # found); ensure_crypto_backend's `pip install --user cryptography` (install.sh:650)
+    # is conditional on the backend not already importing, and it DOES already import from
+    # this machine's global site-packages even under a from-scratch $HOME (verified
+    # directly: a python3 -c check that forces HOME to a fresh mktemp dir before the import
+    # still succeeds) -- so that pip-install branch is a no-op here, not a live cost or a
+    # network dependency; profile writes (ensure_path_on_profile) and PLUGIN_DIR are both
+    # $HOME-scoped and HOME is a fresh mktemp dir per run_install call (env -u HEIMDALL_HOME
+    # ... HOME="$2"), never the live worktree. What IS real: 4 full `bash install.sh`
+    # executions per test run (env/idempotent-re-run/solo/noenv), each its own git clone
+    # plus telemetry/marketplace/crypto-check subprocesses -- the heaviest per-invocation
+    # cost of the three PARALLEL-FLAKY suites. `time bash test/install-team-secret.test.sh`
+    # solo measured 228s wall (55.8s user+sys, 24% avg CPU) -- already past the 180s
+    # default alone, same shape as install-stranger above (multiple real installs), just
+    # fewer of them (4 vs. 5) and without the claude-mem/headless-verify tail that suite
+    # carries, so a lower tier than its 900s is proportionate.
+    install-team-secret.test.sh)     override=450 ;;
   esac
   [ "$override" -gt "$TIMEOUT" ] && { echo "$override"; return 0; }
   echo "$TIMEOUT"
