@@ -45,12 +45,29 @@
 #   3. Nothing in the named-agent notice path blocks: no exit 2 anywhere in
 #      that code, on any input, ever. (The same delegate script also runs one
 #      or more unrelated LATER sections — currently an adjudication fallback
-#      fence (Wave 1 Task 1.1) and a brief-adoption gate with its own
-#      legitimate exit 2, for a NON_VERIFIED protocol store — different
-#      concerns, out of this suite's scope; structural checks below scope to
-#      the named-agent section by stopping at the next section marker,
-#      whichever section that turns out to be, so a future section added the
-#      same way does not need this file edited again.)
+#      fence (Wave 1 Task 1.1), a coop native-spawn refusal fence, a context
+#      gate fence (bin/heimdall-ctx-meter gate), and a brief-adoption gate
+#      with its own legitimate exit 2, for a NON_VERIFIED protocol store —
+#      different concerns, out of this suite's scope; structural checks below
+#      scope to the named-agent section by stopping at the next section
+#      marker, whichever section that turns out to be, so a future section
+#      added the same way does not need this file edited again. The context
+#      gate fence is the one exception that needs active neutralizing rather
+#      than passive non-triggering: the adjudication and coop fences stay
+#      inert here because this suite's minimal payloads never match their
+#      trigger shape, but the context gate fence fires on EVERY spawn
+#      regardless of payload shape and, when a payload omits session_id
+#      (exactly what these fixtures do), consults whatever real, ambient,
+#      cross-session state bin/heimdall-ctx-meter's own ordinary fallback
+#      happens to find on this machine — observed directly: this suite ran
+#      31/0 while the tree was dirty (ctx-meter's own contract can only ever
+#      return ok/checkpoint/defer on a dirty tree) and 29/2 immediately after
+#      an unrelated commit made the tree clean, with zero edits to this file
+#      or to bin/heimdall-precheck-agent in between. `fire()`/`fire_muted()`
+#      below set HMD_CTX_GATE_OFF=1 — the fence's own documented escape
+#      hatch — for exactly this reason, mirroring how ANTHROPIC_BASE_URL is
+#      pinned in test/agent-fallback-coop.test.sh to keep a different,
+#      unrelated fence inert while testing yet another one.)
 #   4. An ordinary unnamed spawn is silent — a warning on every spawn is noise,
 #      and noise gets muted, which is how a signal dies.
 #   5. HEIMDALL_ALLOW_NAMED_AGENT=1 SUPPRESSES the warning ("I know what I'm
@@ -111,10 +128,16 @@ AGENT_MATCHERS=$(jq -r '[.hooks.PreToolUse[] | select(.matcher == "Agent")] | le
 # fire <payload-file> — runs the shipped command under /bin/sh, exactly as the
 # harness does. /bin/sh (not bash) is the point: that is the escape-expanding
 # shell where the echo|jq defect lives.
+#
+# HMD_CTX_GATE_OFF=1 is set in both helpers below: this suite tests the
+# named-agent notice fence, not the context gate fence, and the context gate
+# fence (unlike adjudication/coop) fires unconditionally and would otherwise
+# reach the real bin/heimdall-ctx-meter against this machine's real, ambient,
+# cross-session context state — see the long note in section 3 above.
 fire() {
   (
     cd "$SANDBOX" || exit 99
-    CLAUDE_PLUGIN_ROOT="$REPO" sh "$GATE" < "$1" >"$OUT" 2>"$ERR"
+    CLAUDE_PLUGIN_ROOT="$REPO" HMD_CTX_GATE_OFF=1 sh "$GATE" < "$1" >"$OUT" 2>"$ERR"
   )
   RC=$?
 }
@@ -123,7 +146,7 @@ fire() {
 fire_muted() {
   (
     cd "$SANDBOX" || exit 99
-    CLAUDE_PLUGIN_ROOT="$REPO" HEIMDALL_ALLOW_NAMED_AGENT=1 sh "$GATE" < "$1" >"$OUT" 2>"$ERR"
+    CLAUDE_PLUGIN_ROOT="$REPO" HEIMDALL_ALLOW_NAMED_AGENT=1 HMD_CTX_GATE_OFF=1 sh "$GATE" < "$1" >"$OUT" 2>"$ERR"
   )
   RC=$?
 }
