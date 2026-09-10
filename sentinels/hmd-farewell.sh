@@ -165,11 +165,24 @@ if is_tty && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ] && [ -x "$FACE_BIN" ]; then
   done < <("$FACE_BIN" --frame sleep "$face_flag" 2>/dev/null)
 fi
 
-# ── the close: title -> receipt (if any) -> tagline ──
+# ── resume block: hmd --resume + checkpoint path ─────────────────────────────
+# Surfaces the correct resume command (not `claude --resume`) and the checkpoint
+# location. `hmd --resume` auto-loads the latest checkpoint — no session ID needed.
+resume_line=""
+ckpt_line=""
+_top="$(git rev-parse --show-toplevel 2>/dev/null || true)"; [ -n "$_top" ] || _top="$PWD"
+if [ -f "$_top/.planning/CHECKPOINT.md" ]; then
+  resume_line="${B}hmd --resume${X}"
+  ckpt_line="${DIM}checkpoint → ${X}${B}.planning/CHECKPOINT.md${X}"
+fi
+
+# ── the close: title -> receipt (if any) -> resume -> tagline ──
 printf '  %b\n' "${CY}${B}▸${X} ${DIM}the watchman sleeps.${X}"
 [ -n "$receipt" ]     && printf '  %b\n' "$receipt"
 [ -n "$unlock_line" ] && printf '  %b\n' "$unlock_line"
 [ -n "$share_line" ]  && printf '  %b\n' "$share_line"
 [ -n "$invite_line" ] && printf '  %b\n' "$invite_line"
+[ -n "$resume_line" ] && printf '  %b\n' "  ${DIM}▸ resume:${X} $resume_line"
+[ -n "$ckpt_line" ]   && printf '  %b\n' "  ${DIM}▸ ${X}$ckpt_line"
 printf '  %b\n' "${CY}${B}HEIMDALL${X} ${DIM}· what shipped, shipped proven.${X}"
 printf '\n'
