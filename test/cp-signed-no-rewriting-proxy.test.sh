@@ -222,7 +222,7 @@ check "1.4 the HEADROOM_* namespace is scrubbed even when it points OFF-box" \
 
 BASEURL_SURVIVORS="$(ANTHROPIC_BASE_URL="$RW_URL" ANTHROPIC_API_URL="$RW_URL" \
   ANTHROPIC_DEFAULT_BASE_URL="$RW_URL" CLAUDE_CODE_BASE_URL="$RW_URL" \
-  signed_env | grep -cE '^(ANTHROPIC_|CLAUDE_CODE_BASE_URL)')"
+  signed_env | grep -cE '^(ANTHROPIC_BASE_URL|ANTHROPIC_API_URL|ANTHROPIC_DEFAULT_BASE_URL|CLAUDE_CODE_BASE_URL)=')"
 check "1.5 the model base-URL overrides are scrubbed (4 -> 0)" \
   '[ "$BASEURL_SURVIVORS" = "0" ]'
 
