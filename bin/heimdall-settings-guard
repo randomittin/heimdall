@@ -285,8 +285,14 @@ def build_parser():
     # the real SessionStart hook command rather than by the unit tests, which
     # happened to use the other order; a usage error inside a hook is exactly
     # the silent-no-op class of failure this tool exists to end.
+    # default=SUPPRESS, not ".": a shared parent's default is re-applied by the
+    # SUBparser, which would clobber a --repo given BEFORE the subcommand back
+    # to "." and silently scan the wrong tree. SUPPRESS leaves the attribute
+    # unset when the flag is absent, so whichever parser actually saw it wins
+    # and main() falls back to "." itself.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--repo", default=".", help="repo root whose .claude/ is also scanned")
+    common.add_argument("--repo", default=argparse.SUPPRESS,
+                        help="repo root whose .claude/ is also scanned (default: .)")
 
     parser = argparse.ArgumentParser(
         parents=[common],
@@ -304,7 +310,7 @@ def build_parser():
 
 def main(argv):
     args = build_parser().parse_args(argv)
-    args.repo = os.path.abspath(os.path.expanduser(args.repo))
+    args.repo = os.path.abspath(os.path.expanduser(getattr(args, "repo", ".")))
     if args.cmd == "fix":
         return cmd_fix(args)
     if args.cmd is None:
