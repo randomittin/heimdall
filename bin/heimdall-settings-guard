@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""heimdall-settings-guard -- detect ANTHROPIC_* routing overrides persisted
+into a Claude Code settings.json `env` block.
+
+WHY THIS EXISTS
+---------------
+On 2026-09-11 this machine's ~/.claude/settings.json was found carrying:
+
+    "env": {
+      "ANTHROPIC_BASE_URL":   "http://127.0.0.1:20128",
+      "ANTHROPIC_MODEL":      "oc/big-pickle",
+      "ANTHROPIC_AUTH_TOKEN": "sk-..."
+    }
+
+Claude Code applies that block ITSELF, on every launch, in every repo, before
+any hmd code runs. The effects were: the entire main session routed to a
+third-party gateway; claude.ai connectors silently disabled (an auth token
+outranks the browser login); and, when that gateway's upstream ran out of
+credits, an unbreakable 401 retry loop -- unbreakable because a slash command
+queues BEHIND the in-flight request that is doing the looping, so the operator
+could not even type the fix.
+
+The reason it went unnoticed is the part that matters here:
+
+  * `env | grep -i anthropic` shows NOTHING. The block is applied by Claude
+    Code to its own process, not exported by the shell, so every ordinary
+    "is my environment clean?" check comes back clean.
+  * It survives restarts, re-logins, and `hmd unwrap` -- it is not session
+    state, it is persisted config.
+  * hmd's own routing is PROCESS-SCOPED by design (bin/heimdall-route exports
+    ANTHROPIC_BASE_URL onto exactly one child and drops it again on any launch
+    that is not routed). Nothing in hmd writes a settings.json env block --
+    verified across heimdall-route, heimdall, heimdall-fallback, heimdall-wrap.
+    That design is sound, and it is precisely why nothing in hmd was LOOKING at
+    the one file that can violate it globally. An assumption nothing verifies
+    is not an invariant; it is a blind spot.
+
+So this tool verifies it. It is the machine-checked half of a property hmd
+previously only assumed: *the only thing that re-points a Claude Code session's
+endpoint is hmd, per-launch, per-child.*
+
+FAILS OPEN, ALWAYS, ON EVERYTHING
+---------------------------------
+A missing file, unreadable file, malformed JSON, a settings file that is a
+directory, a symlink loop -- every one of those exits 0 with no finding. This
+tool's entire job is to WARN about a config defect; it must never itself become
+the reason a session cannot start. That direction is deliberate and is the
+opposite of a gate: there is no failure mode here worth blocking a launch over,
+and a guard that can wedge a session is a worse bug than the one it detects.
+`check` therefore separates "found something" (exit 1, advisory) from "could
+not look" (exit 0, silent).
+
+NEVER PRINTS A SECRET
+---------------------
+A finding names the FILE and the KEY, and renders the value redacted --
+`ANTHROPIC_AUTH_TOKEN = sk-d...(redacted, 36 chars)`. The whole point of the
+2026-09-11 incident was a bearer token sitting in a world-readable file; a
+detector that echoes it into a terminal, a hook log, or a session transcript
+would re-commit the original sin at a new address. Non-secret keys
+(ANTHROPIC_BASE_URL, ANTHROPIC_MODEL) print in full because their VALUE is the
+diagnostic -- knowing it says `127.0.0.1:20128` is the finding.
+
+`--fix` REMOVES ONLY THE ENV KEYS
+---------------------------------
+It deletes the offending ANTHROPIC_* keys from `.env`, drops `env` entirely if
+that empties it, and leaves every other setting intact -- the incident file also
+held 264 permission rules that had to survive. It writes a 0600 backup first
+(the original may be 0644 and may contain a token; a backup must never widen
+that exposure), then rewrites via a temp file in the same directory + atomic
+rename, so an interrupted run can never leave a truncated settings.json -- an
+unparseable settings.json IS a broken Claude Code, which is exactly what this
+tool exists to prevent.
+"""
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+
+# The prefix is the whole rule. Not an enumerated list of the three keys seen
+# in the 2026-09-11 incident: ANTHROPIC_API_KEY, ANTHROPIC_DEFAULT_*, and
+# whatever Claude Code adds next are the same defect wearing a different name,
+# and an enumerated list silently stops covering the case the day upstream
+# ships a new variable. Prefix-matching cannot lag a rename.
+WATCHED_PREFIX = "ANTHROPIC_"
+
+# Keys whose VALUE is a bearer credential and must never be rendered in full.
+# Matched as a substring so ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY and any
+# future *_TOKEN/*_KEY/*_SECRET spelling all redact by default.
+SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+
+
+def _is_secret_key(key):
+    upper = key.upper()
+    return any(marker in upper for marker in SECRET_MARKERS)
+
+
+def _render(key, value):
+    """Render a finding's value: full for diagnostics, redacted for secrets."""
+    text = value if isinstance(value, str) else json.dumps(value)
+    if not _is_secret_key(key):
+        return text
+    return "%s...(redacted, %d chars)" % (text[:5], len(text))
+
+
+def settings_paths(repo):
+    """Every settings file Claude Code merges an `env` block from.
+
+    Ordered widest-blast-radius first: the user-level files apply to EVERY repo
+    on the machine (the 2026-09-11 incident was here), the project files only to
+    one. Deduplicated by realpath, because ~/.claude may itself be a symlink
+    into a dotfiles checkout and reporting the same physical file twice would
+    read as two separate defects.
+    """
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, ".claude", "settings.json"),
+        os.path.join(home, ".claude", "settings.local.json"),
+        os.path.join(repo, ".claude", "settings.json"),
+        os.path.join(repo, ".claude", "settings.local.json"),
+    ]
+    seen = set()
+    ordered = []
+    for path in candidates:
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            real = path
+        if real not in seen:
+            seen.add(real)
+            ordered.append(path)
+    return ordered
+
+
+def scan_file(path):
+    """Return (findings, mode) for one settings file.
+
+    findings: list of (key, rendered_value) for every ANTHROPIC_* key in .env
+    mode:     the file's permission bits, or None when unreadable
+
+    Every failure to look returns ([], None) -- see the fail-open contract in
+    the module docstring. A file that is absent, unparseable, or whose `env` is
+    not an object is NOT a finding: this tool reports a defect it can positively
+    see, never the absence of evidence.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return [], None
+
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = None
+
+    env = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return [], mode
+
+    findings = [
+        (key, _render(key, env[key]))
+        for key in sorted(env)
+        if key.upper().startswith(WATCHED_PREFIX)
+    ]
+    return findings, mode
+
+
+def _remediation(path, keys):
+    """The exact jq one-liner that removes these keys from this file."""
+    dels = ", ".join(".env.%s" % key for key in keys)
+    return ("jq 'del(%s)' %s > /tmp/hmd-settings.json && "
+            "mv /tmp/hmd-settings.json %s" % (dels, path, path))
+
+
+def cmd_check(args):
+    results = []
+    for path in settings_paths(args.repo):
+        findings, mode = scan_file(path)
+        if findings:
+            results.append({"path": path, "mode": mode, "findings": findings})
+
+    if args.json:
+        print(json.dumps([
+            {
+                "path": item["path"],
+                "mode": ("%04o" % item["mode"]) if item["mode"] is not None else None,
+                "world_readable": bool(item["mode"] is not None and item["mode"] & 0o077),
+                "keys": [{"key": key, "value": value} for key, value in item["findings"]],
+            }
+            for item in results
+        ], indent=2))
+        return 1 if results else 0
+
+    if not results:
+        if not args.quiet:
+            print("heimdall-settings-guard: clean -- no ANTHROPIC_* override in any "
+                  "Claude Code settings env block")
+        return 0
+
+    for item in results:
+        keys = [key for key, _ in item["findings"]]
+        sys.stderr.write(
+            "[heimdall] SETTINGS OVERRIDE in %s -- this env block is applied by Claude "
+            "Code on EVERY launch, in every repo, and is invisible to `env`:\n" % item["path"])
+        for key, value in item["findings"]:
+            sys.stderr.write("    %s = %s\n" % (key, value))
+        if item["mode"] is not None and item["mode"] & 0o077 and any(
+                _is_secret_key(key) for key in keys):
+            sys.stderr.write(
+                "    file mode is %04o (group/world readable) and holds a bearer "
+                "credential -- rotate it, do not just delete it\n" % item["mode"])
+        sys.stderr.write("    remove: %s\n" % _remediation(item["path"], keys))
+        sys.stderr.write("    or:     heimdall-settings-guard fix\n")
+    return 1
+
+
+def cmd_fix(args):
+    fixed = 0
+    for path in settings_paths(args.repo):
+        findings, original_mode = scan_file(path)
+        if not findings:
+            continue
+        keys = [key for key, _ in findings]
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            sys.stderr.write("heimdall-settings-guard fix: skipping %s (%s)\n" % (path, exc))
+            continue
+
+        backup = path + ".hmd-bak"
+        try:
+            # 0600 backup, written before the rewrite. The source may be 0644
+            # and may hold a token; a backup must never widen that exposure.
+            handle_fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+                handle.write("\n")
+        except OSError as exc:
+            sys.stderr.write("heimdall-settings-guard fix: cannot write backup %s (%s) -- "
+                             "leaving %s untouched\n" % (backup, exc, path))
+            continue
+
+        for key in keys:
+            data["env"].pop(key, None)
+        if not data["env"]:
+            data.pop("env", None)
+
+        # Temp file in the SAME directory, then atomic rename: a rename within
+        # one filesystem is the only write that cannot leave a half-written
+        # settings.json behind, and a truncated settings.json is a bricked
+        # Claude Code -- the exact outcome this tool exists to prevent.
+        directory = os.path.dirname(path) or "."
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".hmd-settings-")
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+                handle.write("\n")
+            os.chmod(tmp_path, original_mode if original_mode is not None else 0o600)
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            sys.stderr.write("heimdall-settings-guard fix: cannot rewrite %s (%s) -- "
+                             "original left intact, backup at %s\n" % (path, exc, backup))
+            continue
+
+        print("heimdall-settings-guard: removed %s from %s (backup: %s)"
+              % (", ".join(keys), path, backup))
+        if any(_is_secret_key(key) for key in keys):
+            print("  a credential was among them -- ROTATE it; deleting the copy does not "
+                  "un-leak the value, and the backup above still contains it")
+        fixed += 1
+
+    if fixed == 0:
+        print("heimdall-settings-guard: nothing to fix")
+    return 0
+
+
+def build_parser():
+    # --repo is declared on BOTH the top-level parser and every subcommand, via
+    # a shared parent. argparse otherwise accepts it only BEFORE the subcommand,
+    # and `guard check --repo X` -- the spelling any operator or hook author
+    # reaches for first -- dies with "unrecognized arguments". Caught by running
+    # the real SessionStart hook command rather than by the unit tests, which
+    # happened to use the other order; a usage error inside a hook is exactly
+    # the silent-no-op class of failure this tool exists to end.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repo", default=".", help="repo root whose .claude/ is also scanned")
+
+    parser = argparse.ArgumentParser(
+        parents=[common],
+        description="Detect ANTHROPIC_* routing overrides persisted into a Claude Code "
+                    "settings.json env block (invisible to `env`, applied every launch).")
+    sub = parser.add_subparsers(dest="cmd")
+    sp_check = sub.add_parser("check", parents=[common],
+                              help="report findings (exit 1 if any); never modifies")
+    sp_check.add_argument("--json", action="store_true", help="machine-readable findings")
+    sp_check.add_argument("--quiet", action="store_true",
+                          help="print nothing when clean (for hook use)")
+    sub.add_parser("fix", parents=[common], help="remove the offending keys, 0600 backup first")
+    return parser
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    args.repo = os.path.abspath(os.path.expanduser(args.repo))
+    if args.cmd == "fix":
+        return cmd_fix(args)
+    if args.cmd is None:
+        args.json = False
+        args.quiet = False
+    return cmd_check(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as exc:  # fail-open: never wedge a session over a warning
+        sys.stderr.write("heimdall-settings-guard: unexpected error: %s\n" % exc)
+        sys.exit(0)
