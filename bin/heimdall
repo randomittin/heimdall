@@ -2449,6 +2449,15 @@ case "${1:-}" in
     if [ -x "$_cavl" ]; then exec "$_cavl" "$@"; fi
     echo "error: heimdall-caveman not found at $_cavl" >&2; exit 2
     ;;
+  settings-guard)
+    # Detect ANTHROPIC_* routing overrides persisted into a Claude Code
+    # settings.json env block, which are applied on every launch and
+    # invisible to `env` (bin/heimdall-settings-guard).
+    shift
+    _sg="$(cd "$(dirname "$0")" && pwd)/heimdall-settings-guard"
+    if [ -x "$_sg" ]; then exec "$_sg" "$@"; fi
+    echo "error: heimdall-settings-guard not found at $_sg" >&2; exit 2
+    ;;
   caveman-audit)
     # READ-BACK for the caveman compression instruction. The caveman plugin
     # wires SessionStart + UserPromptSubmit and BOTH only ever INJECT rules
@@ -3385,6 +3394,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall authenticity-check <npm|github|plugin> <id>  Publisher trust score 0-100"
   echo "  heimdall queue <add|pick|complete|fail|reap|get|list|status|serve>  Local work queue"
   echo "  heimdall queue drain [--forever|--drain-empty]  Drain the local work queue"
+  echo "  heimdall settings-guard <check|fix>  Find ANTHROPIC_* overrides hidden in settings.json"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
