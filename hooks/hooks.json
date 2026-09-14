@@ -216,6 +216,14 @@
             "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; SG=\"$PLUGIN/bin/heimdall-settings-guard\"; if [ -x \"$SG\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 5; exec @ARGV' \"$SG\" check --quiet --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; else \"$SG\" check --quiet --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; fi; fi; exit 0"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; VG=\"$PLUGIN/bin/heimdall-volatile-repo-guard\"; if [ -x \"$VG\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 5; exec @ARGV' \"$VG\" check --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; else \"$VG\" check --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; fi; fi; exit 0"
+          }
+        ]
       }
     ],
     "SubagentStop": [

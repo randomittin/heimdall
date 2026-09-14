@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""heimdall-volatile-repo-guard -- detect a git clone sitting in a location the
+OS can wipe out from under it, especially one still holding commits no remote
+has ever seen.
+
+WHY THIS EXISTS
+---------------
+A developer worked all day inside a clone at /private/tmp/rally-cc-aggregator,
+made 16 commits, never pushed any of them, and then rebooted. macOS clears
+/tmp (of which /private/tmp is the real, symlink-resolved location) on every
+reboot by design -- it is explicitly OS-documented scratch space, not storage.
+All 16 commits were gone. An agent had flagged "unpushed branches" on that repo
+earlier in the day and nobody acted on it, because an unpushed branch in a
+NORMAL clone is unremarkable -- WIP sitting on disk overnight is the ordinary
+case, not an incident. The thing that made this one fatal was invisible to
+that flag alone: the clone's *location* was volatile. Unpushed work is only a
+countdown timer when the disk under it can be reclaimed without warning.
+
+So this tool checks the combination, not either signal alone:
+
+  1. VOLATILE LOCATION -- does the repo's real, symlink-resolved path sit
+     under /tmp, /private/tmp, /var/tmp, /private/var/folders, or anywhere
+     under a `Caches` directory? All of these are OS or user documented as
+     "may be cleared without notice": macOS empties /tmp and /var/folders
+     (the backing store for $TMPDIR) across reboots and periodically via
+     periodic(8); Caches directories are, by every platform convention,
+     first in line for space-reclamation tools and OS cache-pressure eviction.
+     Checked via os.path.realpath(), not the path as given -- /tmp on macOS
+     IS a symlink to /private/tmp, so a plain string-prefix check against the
+     literal argument would silently miss the exact incident this guard
+     exists to catch. The clone in the incident was reported as "/tmp/..." by
+     the operator and would have sailed past a check that did not resolve it.
+
+  2. UNPUSHED WORK AT RISK -- commits that exist on a local branch but are
+     unreachable from every remote-tracking ref (`git log --branches --not
+     --remotes`), and, independently, whether the repo has ANY remote
+     configured at all. A repo with zero remotes is not "zero unpushed
+     commits" -- it is a clone with no offsite copy of ANYTHING, which is the
+     same exposure at a larger scale, so it counts as risk on its own even
+     before counting individual commits.
+
+SEVERITY IS THE COMBINATION, NOT EITHER FLAG ALONE
+---------------------------------------------------
+  * volatile location AND work at risk  -> CRITICAL. This is the exact
+    incident shape: disk that can vanish, holding the only copy of something.
+  * volatile location, nothing at risk  -> HIGH. The location is still a
+    standing hazard (the next commit made there inherits the risk instantly,
+    with no further action from the operator), but nothing is lost *yet*.
+  * work at risk, durable location      -> INFO, not an alarm. A branch you
+    have not pushed yet, sitting in ~/code where reboots do not touch it, is
+    completely ordinary WIP. Alarming on this would train operators to ignore
+    the tool -- exactly what happened with the "unpushed branches" flag that
+    preceded this incident. The lesson of that miss is not "warn more", it is
+    "warn about the right thing": the combination, not the commit count.
+
+FAILS OPEN, ALWAYS, ON EVERYTHING
+----------------------------------
+No git binary, a path that is not a repository, a git command that errors,
+a repo with no commits yet, a permissions problem walking the directory --
+every one of those is "cannot determine" and exits 0 with no finding and no
+noise. This tool's entire job is advisory; a guard that can itself fail a
+session, or spam a hook's stderr on every ordinary non-repo directory it is
+pointed at, is a worse defect than the data loss it exists to prevent.
+
+NEVER PRINTS A SECRET
+----------------------
+A remote URL can carry embedded credentials (`https://user:pass@host/repo`).
+Any URL this tool prints has that `user:pass@` segment stripped first,
+unconditionally, before it reaches stdout, stderr, or --json output -- the
+same discipline heimdall-settings-guard applies to ANTHROPIC_* tokens, applied
+here to remote URLs instead.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+# Prefixes are checked against the REALPATH of the repo, never the path as
+# given. On macOS, /tmp -> /private/tmp and /var -> /private/var are symlinks;
+# resolving first is the whole point, since the incident repo was reported as
+# living under the un-resolved "/tmp/..." spelling.
+VOLATILE_PREFIXES = (
+    "/tmp",
+    "/private/tmp",
+    "/var/tmp",
+    "/private/var/folders",
+)
+
+# Any path with a Caches directory anywhere in it is first-in-line for OS or
+# user cache-eviction tools, regardless of which top-level volume it sits on.
+CACHES_MARKER = "/Caches/"
+
+# Matches a credentials segment in a URL authority, e.g. the "user:pass@" in
+# "https://user:pass@github.com/org/repo.git", so it can be stripped before
+# any remote URL is ever printed.
+_CREDENTIAL_RE = re.compile(r'(://)[^/@\s]+@')
+
+
+def redact_url(url):
+    """Strip any embedded user:pass@ credentials from a remote URL."""
+    if not url:
+        return url
+    return _CREDENTIAL_RE.sub(r'\1', url)
+
+
+def volatile_reason(real_path):
+    """Return the matched volatile prefix/marker, or None if the path is
+    durable. Callers must pass an already-realpath()'d path."""
+    for prefix in VOLATILE_PREFIXES:
+        if real_path == prefix or real_path.startswith(prefix + "/"):
+            return prefix
+    if CACHES_MARKER in real_path:
+        return CACHES_MARKER
+    return None
+
+
+def run_git(repo, args, timeout=10):
+    """Run a git command rooted at repo. Returns stdout lines on success, or
+    None on ANY failure -- missing git binary, timeout, non-repo path, a git
+    error. None means "cannot determine", never "no results"; callers must
+    not treat None as an empty answer.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo] + args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.splitlines()
+
+
+def is_git_repo(repo):
+    lines = run_git(repo, ["rev-parse", "--is-inside-work-tree"])
+    return bool(lines) and lines[0].strip() == "true"
+
+
+def current_branch(repo):
+    lines = run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
+    if not lines:
+        return None
+    branch = lines[0].strip()
+    return None if branch == "HEAD" else branch
+
+
+def remote_names(repo):
+    """List of configured remote names, or None if it could not be
+    determined (fail-open: treat as unknown, not as zero)."""
+    return run_git(repo, ["remote"])
+
+
+def remote_url(repo, name):
+    lines = run_git(repo, ["remote", "get-url", name])
+    return lines[0].strip() if lines else None
+
+
+def unpushed_commit_count(repo):
+    """Commits reachable from a local branch but from no remote-tracking ref.
+    None means "could not determine" (fail-open), not "zero"."""
+    lines = run_git(repo, ["log", "--branches", "--not", "--remotes", "--oneline"])
+    if lines is None:
+        return None
+    return len(lines)
+
+
+def assess(repo):
+    """Gather everything this guard knows about one repo. Returns a dict, or
+    None if repo is not a git repository at all (the silent, exit-0 case)."""
+    real = os.path.realpath(repo)
+    if not is_git_repo(repo):
+        return None
+
+    reason = volatile_reason(real)
+    remotes = remote_names(repo)
+    unpushed = unpushed_commit_count(repo)
+
+    remotes_known = remotes is not None
+    unpushed_known = unpushed is not None
+    has_remote = bool(remotes) if remotes_known else None
+
+    # "Work at risk" folds together both unpushed-work signals: individual
+    # commits no remote has, and having no remote at all to receive any commit
+    # in the future. Either one alone is the same underlying exposure. If
+    # either half is undeterminable, the combined signal is undeterminable
+    # too -- fail open rather than guess.
+    if remotes_known and unpushed_known:
+        at_risk = (not has_remote) or unpushed > 0
+    else:
+        at_risk = None
+
+    if reason and at_risk:
+        severity = "CRITICAL"
+    elif reason:
+        severity = "HIGH"
+    elif at_risk:
+        severity = "INFO"
+    elif at_risk is None:
+        severity = "UNKNOWN"
+    else:
+        severity = "CLEAN"
+
+    return {
+        "repo": repo,
+        "realpath": real,
+        "volatile": reason is not None,
+        "volatile_reason": reason,
+        "remotes": remotes if remotes_known else None,
+        "has_remote": has_remote,
+        "unpushed_count": unpushed,
+        "severity": severity,
+    }
+
+
+def cmd_check(args):
+    result = assess(args.repo)
+
+    if result is None or result["severity"] == "UNKNOWN":
+        # Not a repo, or plumbing could not answer -- fail open, silently.
+        # A guard that narrates every ordinary non-repo directory it is
+        # pointed at trains operators to ignore its stderr entirely.
+        if args.json:
+            print(json.dumps(result if result is not None else {"repo": args.repo,
+                                                                  "severity": "UNKNOWN"}, indent=2))
+        return 0
+
+    if args.json:
+        payload = dict(result)
+        print(json.dumps(payload, indent=2))
+        return 1 if result["severity"] in ("HIGH", "CRITICAL") else 0
+
+    severity = result["severity"]
+    if severity == "CLEAN":
+        if not args.quiet:
+            print("heimdall-volatile-repo-guard: clean -- %s is in a durable "
+                  "location with no unpushed work at risk" % result["repo"])
+        return 0
+
+    label = {
+        "INFO": "INFO",
+        "HIGH": "HIGH RISK",
+        "CRITICAL": "CRITICAL",
+    }[severity]
+    stream = sys.stderr if severity in ("HIGH", "CRITICAL") else sys.stdout
+    stream.write("[heimdall] %s -- %s\n" % (label, result["repo"]))
+
+    if result["volatile"]:
+        stream.write("    location is volatile: %s resolves under %s, which the OS "
+                      "may clear without warning\n" % (result["realpath"], result["volatile_reason"]))
+
+    if result["has_remote"] is False:
+        stream.write("    no remote configured at all -- there is no offsite copy of "
+                      "anything in this clone\n")
+    elif result["unpushed_count"]:
+        n = result["unpushed_count"]
+        stream.write("    %d commit%s present locally that no remote has\n"
+                      % (n, "" if n == 1 else "s"))
+        for name in (result["remotes"] or []):
+            url = remote_url(result["repo"], name)
+            if url:
+                stream.write("    remote %s -> %s\n" % (name, redact_url(url)))
+
+    if severity == "CRITICAL":
+        stream.write("    this is the exact shape of the /private/tmp/rally-cc-aggregator "
+                      "incident: volatile disk holding the only copy of real work\n")
+    stream.write("    remedy: heimdall-volatile-repo-guard explain --repo %s\n" % result["repo"])
+
+    return 1 if severity in ("HIGH", "CRITICAL") else 0
+
+
+def cmd_explain(args):
+    repo = args.repo
+    real = os.path.realpath(repo)
+    result = assess(repo)
+
+    print("heimdall-volatile-repo-guard: remedy")
+    print()
+    print("A clone under /tmp, /var/tmp, /private/var/folders, or any Caches")
+    print("directory can be deleted by the OS without warning -- on macOS, /tmp")
+    print("is cleared on reboot. The only durable fix is to move the WORKING")
+    print("COPY out of that location and make sure a remote has every commit.")
+    print()
+
+    branch = current_branch(repo) if (result is not None) else None
+    branch = branch or "main"
+
+    dest_parent = os.path.expanduser("~/code")
+    dest_name = os.path.basename(real.rstrip("/")) or "repo"
+    dest = os.path.join(dest_parent, dest_name)
+
+    existing_remote = None
+    if result and result.get("remotes"):
+        existing_remote = redact_url(remote_url(repo, result["remotes"][0]) or "")
+
+    print("1. Clone the volatile copy into a durable location (this preserves")
+    print("   every local commit, including ones no remote has seen):")
+    print()
+    print("     mkdir -p %s" % dest_parent)
+    print("     git clone %s %s" % (real, dest))
+    print("     cd %s" % dest)
+    print()
+
+    if existing_remote:
+        print("2. This repo already has a remote. From the new durable clone,")
+        print("   push everything it has that the remote does not:")
+        print()
+        print("     git push --all %s" % (existing_remote or "origin"))
+        print("     git push --tags %s" % (existing_remote or "origin"))
+    else:
+        print("2. This repo has no remote at all. Create one, then push:")
+        print()
+        print("     git remote add origin <your-git-host-url>")
+        print("     git push -u origin %s" % branch)
+
+    print()
+    print("3. Only once the push above completes and `git log --branches --not")
+    print("   --remotes` is empty, delete the volatile original:")
+    print()
+    print("     rm -rf %s" % real)
+    return 0
+
+
+def build_parser():
+    # Same shared-parent trick as heimdall-settings-guard: --repo is declared
+    # on both the top-level parser and every subcommand (default=SUPPRESS so
+    # a value given before the subcommand is not clobbered back to "." by the
+    # subparser's own default) so `guard check --repo X` and
+    # `guard --repo X check` both work -- a hook author reaching for the
+    # wrong order should never be the reason this silently never runs.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repo", default=argparse.SUPPRESS,
+                        help="repo to inspect (default: .)")
+
+    parser = argparse.ArgumentParser(
+        parents=[common],
+        description="Detect a git clone sitting in a volatile location (/tmp, /var/tmp, "
+                    "Caches, ...) that also holds commits no remote has seen -- the exact "
+                    "shape of a clone the OS can wipe out with no copy anywhere else.")
+    sub = parser.add_subparsers(dest="cmd")
+    sp_check = sub.add_parser("check", parents=[common],
+                              help="report findings (exit 1 on HIGH/CRITICAL); never modifies")
+    sp_check.add_argument("--json", action="store_true", help="machine-readable findings")
+    sp_check.add_argument("--quiet", action="store_true",
+                          help="print nothing when clean (for hook use)")
+    sub.add_parser("explain", parents=[common],
+                   help="print the exact commands to move the repo and push its work")
+    return parser
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    args.repo = os.path.abspath(os.path.expanduser(getattr(args, "repo", ".")))
+    if args.cmd == "explain":
+        return cmd_explain(args)
+    if args.cmd is None:
+        args.json = False
+        args.quiet = False
+    return cmd_check(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as exc:  # fail-open: never wedge a session over a warning
+        sys.stderr.write("heimdall-volatile-repo-guard: unexpected error: %s\n" % exc)
+        sys.exit(0)

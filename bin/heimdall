@@ -2449,6 +2449,16 @@ case "${1:-}" in
     if [ -x "$_cavl" ]; then exec "$_cavl" "$@"; fi
     echo "error: heimdall-caveman not found at $_cavl" >&2; exit 2
     ;;
+  volatile-repo-guard)
+    # Detect a clone living on disk the OS may clear without warning (/tmp,
+    # /private/tmp, /var/folders, Caches) while holding commits no remote has.
+    # That pairing destroyed 16 unpushed commits on 2026-09-14
+    # (/private/tmp/rally-cc-aggregator, cleared on reboot).
+    shift
+    _vrg="$(cd "$(dirname "$0")" && pwd)/heimdall-volatile-repo-guard"
+    if [ -x "$_vrg" ]; then exec "$_vrg" "$@"; fi
+    echo "error: heimdall-volatile-repo-guard not found at $_vrg" >&2; exit 2
+    ;;
   settings-guard)
     # Detect ANTHROPIC_* routing overrides persisted into a Claude Code
     # settings.json env block, which are applied on every launch and
@@ -3395,6 +3405,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall queue <add|pick|complete|fail|reap|get|list|status|serve>  Local work queue"
   echo "  heimdall queue drain [--forever|--drain-empty]  Drain the local work queue"
   echo "  heimdall settings-guard <check|fix>  Find ANTHROPIC_* overrides hidden in settings.json"
+  echo "  heimdall volatile-repo-guard <check|explain>  Warn if this clone is on disk the OS may wipe"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
