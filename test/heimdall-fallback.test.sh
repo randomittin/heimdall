@@ -231,6 +231,53 @@ esac
 
 echo "--------------------------------------------------------------------"
 
+# ── 59. NEW: a CLAUDE-BRANDED model on a non-Anthropic provider is REFUSED ──
+# Measured live 2026-09-18: opencode's own https://opencode.ai/zen/v1/models
+# advertises 12 claude-* ids (claude-opus-5, claude-sonnet-5, claude-fable-5,
+# ...) that are not Anthropic's to serve. The provider/ prefix rule was written
+# to stop a BARE claude-* id matching OmniRoute's provider-'claude' routing
+# branch; it never considered '<thirdparty>/claude-*', which SATISFIES that
+# rule while still pinning a model whose every log line, usage row and metric
+# would read claude-opus-5 for text an unrelated provider generated.
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "coop", "fallback_model": "oc/claude-opus-5"}'
+out="$(fb --repo "$R" model 2>&1)"; rc=$?
+if [ -z "$(fb --repo "$R" model 2>/dev/null)" ] && [ "$rc" -ne 0 ]; then
+  ok "59a. oc/claude-opus-5 is never handed out as a pin (stdout empty, non-zero rc)"
+else
+  bad "59a. a third-party claude-branded model was handed out as a pin: [$out] rc=$rc"
+fi
+
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q 'CLAUDE-BRANDED'; then
+  ok "59b. check names the claude-branding problem in its refusal reason"
+else
+  bad "59b. check did not explain the claude-branding refusal: $out"
+fi
+
+# 59c. the LEGITIMATE case must still pass. anthropic/claude-* is a real paid
+# API key, not the operator's subscription -- rejecting it would be a false
+# positive, and this check's own docstring calls that out explicitly.
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "coop", "fallback_model": "anthropic/claude-3-5-sonnet"}'
+if [ "$(fb --repo "$R" model 2>/dev/null)" = "anthropic/claude-3-5-sonnet" ]; then
+  ok "59c. anthropic/claude-3-5-sonnet still allowed (licensed provider, not a relabel)"
+else
+  bad "59c. false positive -- anthropic/claude-3-5-sonnet was rejected"
+fi
+
+# 59d. a NON-claude model on the same third-party provider is unaffected --
+# the rule targets brand relabelling, not the provider itself.
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "coop", "fallback_model": "oc/kimi-k3"}'
+if [ "$(fb --repo "$R" model 2>/dev/null)" = "oc/kimi-k3" ]; then
+  ok "59d. oc/kimi-k3 still allowed -- the rule targets branding, not the provider"
+else
+  bad "59d. over-broad: a non-claude model on oc/ was rejected"
+fi
+
+echo "--------------------------------------------------------------------"
+
 # ── 0. the tool is executable and is valid Python ────────────────────────────
 [ -x "$CLI" ] && ok "0a. $CLI is executable" || bad "0a. not executable: $CLI"
 ast_out="$(python3 -c "import ast; ast.parse(open('$CLI').read())" 2>&1)"; ast_rc=$?

@@ -1119,6 +1119,16 @@ def _session_pre_exhaustion_verdict(repo):
 
 TIER1_MODEL_PREFIXES = ("claude", "claude-web")
 
+# Providers that are actually LICENSED to serve Claude-branded models, so a
+# `claude-*` MODEL segment under them is legitimate rather than a relabel.
+# Deliberately small and explicit: Anthropic's own API, plus the two clouds
+# Anthropic itself ships Claude through. Anything else claiming to serve a
+# model called `claude-*` is asserting a brand it has no established right to,
+# and hmd must not pin it -- see _model_pin_reject_reason's third rejection.
+CLAUDE_BRANDED_OK_PROVIDERS = (
+    "anthropic", "bedrock", "aws-bedrock", "vertex", "google-vertex",
+)
+
 
 def _model_pin_reject_reason(model, origin):
     """-> a reason string if `model` is unsafe to route with, else None.
@@ -1153,6 +1163,19 @@ def _model_pin_reject_reason(model, origin):
         return ("%s='%s' names Tier-1 provider '%s' explicitly -- routing fallback traffic "
                 "at the operator's OWN Claude subscription is the exact boundary this tool "
                 "exists to hold" % (origin, model, provider_segment))
+    model_segment = model.split("/", 1)[1].strip().lower()
+    if model_segment.startswith("claude") and provider_segment not in CLAUDE_BRANDED_OK_PROVIDERS:
+        return ("%s='%s' asks provider '%s' for a CLAUDE-BRANDED model -- measured live on "
+                "2026-09-18, opencode's own /zen/v1/models advertises 12 claude-* ids "
+                "(claude-opus-5, claude-sonnet-5, claude-fable-5, ...) it is not Anthropic's "
+                "to serve. The provider/ prefix rule above was written to stop a BARE "
+                "claude-* id matching OmniRoute's provider-'claude' branch; it never "
+                "considered '<thirdparty>/claude-*', which satisfies that rule while still "
+                "producing output labelled as a Claude model. Every log line, every usage "
+                "row and every metric would then say claude-opus-5 for text an unrelated "
+                "provider generated, which is exactly the attribution lie this repo exists "
+                "to prevent. Legitimate Claude-serving providers: %s"
+                % (origin, model, provider_segment, ", ".join(CLAUDE_BRANDED_OK_PROVIDERS)))
     return None
 
 
