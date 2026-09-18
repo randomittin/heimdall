@@ -704,6 +704,20 @@ LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 # OAuth and a claude.ai session cookie respectively). See header point 1a.
 TIER1_DB_PROVIDERS = ("claude", "claude-web")
 
+# provider_connections.test_status values that mean "this connection cannot
+# serve a request right now". Read off a live OmniRoute 3.8.51 (d82b682)
+# install on 2026-09-19, where the opencode row sat at 'credits_exhausted'
+# while hmd's preflight still said ROUTE.
+#
+# An UNRECOGNIZED status is deliberately treated as healthy, never as broken:
+# this list cannot be exhaustive for a third-party schema hmd does not own, and
+# the failure mode of guessing wrong in the other direction is refusing a route
+# that would have worked. Only these known-bad values refuse.
+UNHEALTHY_CONN_STATUS = frozenset({
+    "credits_exhausted", "quota_exhausted", "expired", "revoked",
+    "invalid", "unauthorized", "disabled", "failed",
+})
+
 # upstream_proxy_config.mode values that mean the retry/primary leg for a
 # provider is handled by a delegated sidecar (CLIProxyAPI or Dario) rather
 # than OmniRoute's own native call -- OmniRoute itself can hold zero Tier-1
@@ -1437,6 +1451,68 @@ def run_preflight(cfg, role=None):
                 sidecar_db_reason = ""
 
     checks.append(("tier1_credential_absent", tier1_ok, tier1_reason))
+
+    # connection_health -- does the target provider's connection actually have
+    # capacity RIGHT NOW? OmniRoute already knows and already wrote it down;
+    # until 2026-09-19 hmd simply never looked.
+    #
+    # Measured that day: provider_connections held test_status='credits_exhausted',
+    # last_error_type='quota_exhausted', last_error='[402]: This model requires an
+    # opencode API key', and hmd's preflight still returned ROUTE. A routed child
+    # was launched, paid the full startup cost, and only then died on
+    # "401 All 1 connection(s) credits exhausted -- please reconnect in the
+    # dashboard". Every other check in this preflight is positively verified
+    # against real state; this one property was asserted by omission.
+    #
+    # FAIL-OPEN, the OPPOSITE polarity to tier1_credential_absent directly above,
+    # and the difference is deliberate. Tier-1 is a SAFETY property: an unreadable
+    # DB cannot prove a credential is absent, so it refuses. Connection health is a
+    # LIVENESS property: an unreadable DB says nothing about whether the provider
+    # will serve, and refusing on it would break routing that worked fine before
+    # this check existed -- a check that can only ever remove capability is a
+    # regression wearing a safety hat. So only a POSITIVELY READ unhealthy status
+    # refuses; missing DB, missing row, missing column, unreadable DB, or an
+    # unrecognized status all PASS with the reason recording what could not be
+    # verified.
+    health_ok, health_reason = True, ""
+    if target_provider_raw and os.path.exists(db_path):
+        health_rows, health_err = _query_omniroute(
+            db_path,
+            "SELECT test_status, last_error_type, last_error FROM provider_connections "
+            "WHERE provider = ? AND is_active = 1",
+            (target_provider_raw,),
+        )
+        if health_err is not None:
+            health_reason = ("connection health not verified -- OmniRoute DB unreadable (%s); "
+                             "passing rather than blocking a route that may well work" % health_err)
+        elif not health_rows:
+            health_reason = ("no active provider_connections row for '%s' -- OmniRoute has no "
+                             "health to report, so this cannot refuse on it" % target_provider_raw)
+        else:
+            unhealthy = [r for r in health_rows if (r[0] or "").strip().lower() in UNHEALTHY_CONN_STATUS]
+            if unhealthy and len(unhealthy) == len(health_rows):
+                status = (unhealthy[0][0] or "").strip()
+                err_type = (unhealthy[0][1] or "").strip()
+                last_err = (unhealthy[0][2] or "").strip()
+                health_ok = False
+                health_reason = (
+                    "OmniRoute reports EVERY active '%s' connection as '%s'%s -- routing now "
+                    "would launch a child that dies on the provider's own 401/402 after paying "
+                    "full startup cost. Fix it where it is broken: reconnect the account or add "
+                    "an API key in the OmniRoute dashboard%s"
+                    % (target_provider_raw, status,
+                       " (%s)" % err_type if err_type else "",
+                       " -- last error: %s" % last_err[:120] if last_err else "")
+                )
+            elif unhealthy:
+                health_reason = ("%d of %d active '%s' connections are unhealthy, but at least one "
+                                 "is not -- OmniRoute may still route via a healthy sibling"
+                                 % (len(unhealthy), len(health_rows), target_provider_raw))
+    elif target_provider_raw:
+        health_reason = ("OmniRoute DB not found at '%s' -- connection health unverifiable; "
+                         "passing, since absence of the DB is not evidence the provider is down"
+                         % db_path)
+    checks.append(("connection_health", health_ok, health_reason))
 
     # An id the OPERATOR pinned outranks a configured one: their explicit choice is
     # never silently overridden, and if it is unsafe they get told so rather than

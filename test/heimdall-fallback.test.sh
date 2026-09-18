@@ -78,6 +78,25 @@ conn.close()
 " "$db" "$provider" "$mode"
 }
 
+# make_health_db <db_file> <provider> <test_status> -- provider_connections
+# with the REAL health columns (test_status/last_error_type/last_error/
+# is_active), as read off a live OmniRoute 3.8.51 install. The older
+# make_omniroute_db fixture deliberately lacks them, which is what exercises
+# connection_health's fail-open path.
+make_health_db() {
+  local db="$1" provider="$2" status="$3"
+  python3 -c "
+import sqlite3, sys
+db, provider, status = sys.argv[1], sys.argv[2], sys.argv[3]
+conn = sqlite3.connect(db)
+conn.execute('CREATE TABLE IF NOT EXISTS provider_connections (id INTEGER PRIMARY KEY, provider TEXT, mode TEXT, test_status TEXT, last_error_type TEXT, last_error TEXT, is_active INTEGER DEFAULT 1)')
+conn.execute(\"CREATE TABLE IF NOT EXISTS upstream_proxy_config (id INTEGER PRIMARY KEY, provider_id TEXT, mode TEXT NOT NULL DEFAULT 'native', fallback_backend TEXT NOT NULL DEFAULT 'cliproxyapi')\")
+if provider:
+    conn.execute('INSERT INTO provider_connections (provider, test_status, last_error_type, last_error, is_active) VALUES (?, ?, ?, ?, 1)', (provider, status, 'quota_exhausted', '[402]: needs an API key'))
+conn.commit(); conn.close()
+" "$db" "$provider" "$status"
+}
+
 # add_proxy_config_row <db_file> <provider_id> <mode> [fallback_backend]
 # Inserts one upstream_proxy_config row -- for the delegated-sidecar-in-DB
 # falsifiers. `mode` vocabulary ('native'|'cliproxyapi'|'dario'|'fallback')
@@ -274,6 +293,62 @@ if [ "$(fb --repo "$R" model 2>/dev/null)" = "oc/kimi-k3" ]; then
   ok "59d. oc/kimi-k3 still allowed -- the rule targets branding, not the provider"
 else
   bad "59d. over-broad: a non-claude model on oc/ was rejected"
+fi
+
+echo "--------------------------------------------------------------------"
+
+# ── 60. NEW: connection_health -- hmd must read the health OmniRoute already
+# wrote down. Measured 2026-09-19: provider_connections said
+# test_status='credits_exhausted' while hmd's preflight still said ROUTE, so a
+# routed child paid full startup cost only to die on the provider's own 401.
+R="$(fresh_repo)"; DB="$R/health.sqlite"
+make_health_db "$DB" "opencode" "credits_exhausted"
+write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"opencode\", \"omniroute_db_path\": \"$DB\"}"
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q '\[FAIL\] connection_health'; then
+  ok "60a. a credits_exhausted connection FAILS connection_health"
+else
+  bad "60a. credits_exhausted connection was not caught: $out"
+fi
+if printf '%s' "$out" | grep -qi 'reconnect the account or add an API key'; then
+  ok "60b. the refusal names the real remedy (the OmniRoute dashboard)"
+else
+  bad "60b. refusal did not name a remedy: $out"
+fi
+
+# 60c. a HEALTHY connection must not be flagged -- this check only ever
+# subtracts capability, so a false positive is a pure regression.
+R="$(fresh_repo)"; DB="$R/health.sqlite"
+make_health_db "$DB" "opencode" "active"
+write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"opencode\", \"omniroute_db_path\": \"$DB\"}"
+if ! fb --repo "$R" check 2>&1 | grep -q '\[FAIL\] connection_health'; then
+  ok "60c. an active connection passes connection_health"
+else
+  bad "60c. false positive -- a healthy connection was flagged unhealthy"
+fi
+
+# 60d. FAIL-OPEN, the opposite polarity to tier1_credential_absent: a DB whose
+# provider_connections has no health columns at all (the older fixture shape)
+# must PASS, not refuse. Connection health is a liveness property -- refusing
+# on what cannot be read would break routing that previously worked.
+R="$(fresh_repo)"; DB="$R/old.sqlite"
+make_omniroute_db "$DB" "opencode" ""
+write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"opencode\", \"omniroute_db_path\": \"$DB\"}"
+if ! fb --repo "$R" check 2>&1 | grep -q '\[FAIL\] connection_health'; then
+  ok "60d. a DB with no health columns fails OPEN (passes), never blocks"
+else
+  bad "60d. fail-open violated -- an unreadable health column refused the route"
+fi
+
+# 60e. an UNRECOGNIZED status is treated as healthy. hmd does not own this
+# third-party schema, so the known-bad list can never be exhaustive.
+R="$(fresh_repo)"; DB="$R/health.sqlite"
+make_health_db "$DB" "opencode" "some_future_status_hmd_has_never_seen"
+write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"opencode\", \"omniroute_db_path\": \"$DB\"}"
+if ! fb --repo "$R" check 2>&1 | grep -q '\[FAIL\] connection_health'; then
+  ok "60e. an unrecognized test_status is treated as healthy, not as broken"
+else
+  bad "60e. an unknown status refused the route -- over-broad"
 fi
 
 echo "--------------------------------------------------------------------"
