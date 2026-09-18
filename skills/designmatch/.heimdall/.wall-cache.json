@@ -1,0 +1,28 @@
+[
+  {
+    "haid": "haid:rj.rishabhs-macbook-air-46d5",
+    "handle": "rj",
+    "last_branch": "main",
+    "last_commit_ts": 1789219338.0,
+    "last_seen_ts": 1789233909.755117,
+    "online": true,
+    "sources": [
+      "presence",
+      "git",
+      "github"
+    ],
+    "tier": "online"
+  },
+  {
+    "haid": null,
+    "handle": "ritesh7792",
+    "last_branch": "",
+    "last_commit_ts": null,
+    "last_seen_ts": null,
+    "online": false,
+    "sources": [
+      "github"
+    ],
+    "tier": "member"
+  }
+]

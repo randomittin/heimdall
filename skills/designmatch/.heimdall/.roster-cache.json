@@ -1,0 +1,15 @@
+[
+  {
+    "activity_ts": 1789219341.0,
+    "age_seconds": 0.8,
+    "branch": "main",
+    "file": null,
+    "haid": "haid:rj.rishabhs-macbook-air-46d5",
+    "handle": "rj",
+    "online": true,
+    "project": "github.com/randomittin/heimdall",
+    "state": "idle",
+    "ts": 1789234021.858868,
+    "verdict": "watching"
+  }
+]
