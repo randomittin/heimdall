@@ -18,8 +18,9 @@
 #
 # SCOPE: ONE settable, operator-facing level — ultra. Collapsed from three
 # (lite, full, ultra) on 2026-09-01 per owner directive: hmd's audience is
-# technical, already established at setup by the "are you a coder?" question,
-# so the gentler tiers (lite, full) have no audience of their own. `get`,
+# assumed technical — a fixed assumption baked into this level, not a setup
+# question (no code anywhere asks one) — so the gentler tiers (lite, full)
+# have no audience of their own. `get`,
 # `set`, the stored state file, and fresh-install default are all ultra-only
 # now — `is_valid_level` accepts nothing else. `set lite` / `set full` are
 # still ACCEPTED (never a hard error) and mapped forward to ultra with a

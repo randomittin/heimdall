@@ -317,7 +317,7 @@ The seed is your **HAID by default** — automatic, stable, no PII in the art. W
 
 **The team watch wall — the headline, and the moat.** When teammates also run `hmd` in the same repo, the bottom row becomes a live wall of their watchmen and what each agent is doing — gate state colored in, a teammate's cell flashing red the instant their gate denies. Nobody else can render this; it needs Heimdall's coordination substrate. The wall is empty until your team joins, so the feature recruits your team for you.
 
-Presence is **opt-in per repo** — each running `hmd` heartbeats `<repo>/.heimdall/team/<haid>.json` (TTL ~30s; a stale file means the agent left). Names live in the repo's team dir and never leave it; default off for non-team repos. The watchman watches your gates, not your team. At squad scale the wall caps at the **~6 most-recently-active** teammates plus a `+N more` tail so a wide terminal never wraps.
+Two presence channels, two defaults. The **control-plane presence** (the signed heartbeat described under *Network posture* above) is **on by default**: `hmd presence off` silences this repo (`<repo>/.heimdall/presence.json` → `{"enabled": false}`), `hmd presence off --global` is the machine-wide kill switch (`~/.heimdall/presence-off`), and `hmd presence sever` is the zero-egress opt-out. The **file-based wall heartbeat** is separate and off until you ask for it: `sentinels/hmd-gate-event.sh` writes `<repo>/.heimdall/team/<haid>.json` (TTL ~30s; a stale file means the agent left) only when `<repo>/.heimdall/team/CONSENT` exists, and the statusline reads those files only when the server roster is empty. Names in that dir never leave the repo. The watchman watches your gates, not your team. At squad scale the wall caps at the **~6 most-recently-active** teammates plus a `+N more` tail so a wide terminal never wraps.
 
 **The deny flash — the clip.** When a gate blocks, `hmd-gate-anim.sh` redraws the big watchman inline: a scanning pulse settling to a green sparkle on pass, or three red beats and `✗ BIFRÖST CLOSED` on deny. TTY-only — in CI or a pipe it collapses to one clean final frame so logs stay readable.
 
@@ -375,7 +375,7 @@ cd /path/to/your/project
 heimdall --auto "build a real-time dashboard with auth and charts"
 ```
 
-`--auto` runs a background safety classifier that blocks prompt injection and risky escalation. It is the default. `--dangerously-skip-permissions` exists but is not the default — only use it in a throwaway sandbox.
+`--auto` runs Claude Code's auto permission mode (`--permission-mode auto`): a background safety classifier that blocks prompt injection and risky escalation. It is **not** the default. With no flag, `heimdall` launches Claude Code with `--dangerously-skip-permissions` (full autonomy) — `bin/heimdall` sets `PERMISSION_FLAG="--dangerously-skip-permissions"` and only a leading `--auto` overrides it. Pass `--auto` as the first argument for the safer opt-in; run the bare default only where you would accept a fully autonomous agent.
 
 ---
 
