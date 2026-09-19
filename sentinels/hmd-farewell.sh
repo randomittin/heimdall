@@ -6,10 +6,14 @@
 # REAL session stats (never fabricated) + a punchy "unproven → proven" tagline.
 # Designed to feel like a satisfying, screenshot-worthy end to the run.
 #
-# Where it runs: the SessionEnd hook, in the FOREGROUND, AFTER the fast
-# checkpoint + autocommit have landed — so "clean tree" on the receipt is a TRUE
-# proof, not a promise. It stays cheap on purpose: the heavy reel/summary-card
-# render is backgrounded by the hook and must never be re-introduced here.
+# Where it runs: the SessionEnd hook, in the FOREGROUND, AFTER the checkpoint
+# write has landed (that write is synchronous and alarm-bounded in the hook —
+# since 2026-09-19; 5acd427c had briefly backgrounded it and a session could end
+# without the CHECKPOINT.md heimdall-resume-probe needs). Autocommit and the
+# heavy reel/summary-card render ARE backgrounded by the hook and may still be
+# running when this prints — so "clean tree" below is an observation of the tree
+# at this instant, never a claim that autocommit already ran. It stays cheap on
+# purpose: never re-introduce the heavy work here.
 #
 # Stats are REAL or ABSENT — never invented:
 #   - files edited this session  <- bin/edit-tracker paths   (session-scoped ledger)
@@ -59,8 +63,10 @@ if [ -x "$PTRACKER" ]; then
   [ -n "$_a" ] && [ "$_a" -gt 0 ] && agents="$_a"
 fi
 
-# Clean tree = the session-end checkpoint/autocommit already landed everything.
-# This is a TRUE proof of "committed", cheap (one porcelain call).
+# Clean tree = `git status --porcelain` is empty RIGHT NOW. A true observation,
+# cheap (one porcelain call) — but only an observation: the hook's autocommit
+# is backgrounded and may not have run yet, so a dirty tree here is not a fault
+# and the stat is simply dropped from the receipt rather than reported as dirty.
 if git rev-parse --git-dir >/dev/null 2>&1; then
   if [ -z "$(git status --porcelain 2>/dev/null)" ]; then clean="yes"; fi
 fi
