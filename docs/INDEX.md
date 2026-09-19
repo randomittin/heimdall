@@ -13,6 +13,7 @@ The single map of Heimdall's knowledge tree. Every committed Markdown doc earns 
 | Doc | Purpose | Status |
 | --- | --- | --- |
 | [../README.md](../README.md) | Project front door — what Heimdall is and how to install/use it. | Load-bearing |
+| [INVENTORY.md](INVENTORY.md) | Inventory of the current version — every shipped part, what it does, how it is proven; every count derived from a shown command. | Current (2026-09-19) |
 | [../IDENTITY.md](../IDENTITY.md) | Canonical identity — single source of truth for naming/positioning. | Load-bearing |
 | [superpowers/specs/2026-07-06-teams-growth-strategy.md](superpowers/specs/2026-07-06-teams-growth-strategy.md) | Heimdall Teams growth strategy (Slack-playbook → Cursor-for-teams revenue). | Current (draft) |
 | [../DECISION-GATE.md](../DECISION-GATE.md) | Pre-launch decision gate — written before launch, frozen. | Reference |
