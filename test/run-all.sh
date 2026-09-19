@@ -913,8 +913,36 @@ if command -v jq >/dev/null 2>&1; then
   # form of these exact paths is exempt; a MODIFIED entry (`M`, ` M`, etc.)
   # under the same directories is a real edit to already-committed state and
   # still fails, same as anywhere else.
+  # REVISED 2026-09-19 -- the "only the UNTRACKED form is exempt" rule above
+  # was measured to make the gate permanently red on this repo, so the
+  # exemption now covers the MODIFIED form of the same paths too. Mechanism:
+  # bin/heimdall-checkpoint writes .planning/ledger/checkpoints/{slug}.json
+  # with the CURRENT head_sha + updated_at, and this repo's own PostToolUse
+  # hooks run it after every commit. Once any commit has tracked that file
+  # (the heimdall-wip checkpoints do exactly that), the sequence is: commit ->
+  # hook rewrites the file for the new HEAD -> ` M` -> commit it -> hook
+  # rewrites it again for THAT HEAD -> ` M`. Three consecutive full sweeps
+  # (10,124/0 each) were refused as "DIRTY tree" over this one file, whose
+  # only diff was head_sha/updated_at. A file whose content is a function of
+  # HEAD is structurally one commit behind and can never be clean AT HEAD; the
+  # argument that a modified tracked entry "is a real edit to committed state"
+  # does not hold when the modification IS the publishing the carve-out was
+  # written for. Deletions (` D`) under these paths still count as dirty --
+  # nothing publishes by deleting a record. Everything outside these exact
+  # directories is unchanged: a modified bin/, test/, or hooks/ entry still
+  # fails, which is the property test/sweep-receipt-gate.test.sh pins.
+  # Also exempt: this script's OWN receipt directory when it lives inside the repo
+  # (`.heimdall/receipts/`, surfacing as `?? .heimdall/` when nothing else is in
+  # there yet). The grader creating its output dir must never count as dirt in the
+  # tree it is grading -- in the real repo .gitignore hides it, but a hermetic
+  # fixture without that ignore saw tree_clean go false on every run after the
+  # first, purely from the previous run's receipt (found via
+  # test/sweep-receipt-gate.test.sh A14b, 2026-09-19). Untracked form only: a
+  # tracked, modified file under .heimdall/ is still someone's edit.
   _receipt_dirty_lines() {
-    _status_snapshot | grep -Ev '^\?\? \.planning/(ledger/(activity|collisions|verdicts|checkpoints)/|journal/)'
+    _status_snapshot \
+      | grep -Ev '^(\?\?|.M|M.|A.|.A) \.planning/(ledger/(activity|collisions|verdicts|checkpoints)/|journal/)' \
+      | grep -Ev '^\?\? \.heimdall/(receipts/)?$'
   }
   RECEIPT_TREE_CLEAN=false
   [ -z "$(_receipt_dirty_lines)" ] && RECEIPT_TREE_CLEAN=true

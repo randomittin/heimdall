@@ -237,6 +237,31 @@ echo "$SUB_GATE2_OUT" | grep -qi "DIRTY" \
 
 # -- extra rigor: an untracked file OUTSIDE the substrate allowlist still dirties --
 git -C "$RWS" checkout -q -- TRACKED.txt
+# -- a MODIFIED TRACKED ledger checkpoint must NOT dirty (2026-09-19) -------------
+# bin/heimdall-checkpoint rewrites .planning/ledger/checkpoints/{slug}.json with the
+# current head_sha after every commit (this repo's own PostToolUse hooks run it), so
+# once the file is tracked it is ` M` at every HEAD, structurally one commit behind.
+# Three consecutive 10,124/0 sweeps were refused as DIRTY over exactly this file.
+# The modification IS the continuous publishing the carve-out exists for.
+echo '{"haid":"existing.placeholder-machine-0000","head_sha":"deadbeef","updated_at":"2026-09-19T00:00:00Z"}' \
+  > "$RWS/.planning/ledger/checkpoints/haid_existing.placeholder-machine-0000.json"
+( cd "$RWS" && bash test/run-all.sh --min 1 ) >"$WORK/sub-m.out" 2>&1
+[ "$(jq -r '.tree_clean' "$RWS_RECEIPT" 2>/dev/null)" = "true" ] \
+  && ok "A14b receipt tree_clean stays true -- a MODIFIED tracked ledger/checkpoints/ record is hmd's own post-commit publishing, not a code change" \
+  || bad "A14b tree_clean flipped false for a modified tracked ledger checkpoint (the gate would be permanently red after any commit)" "porcelain: $(git -C "$RWS" status --porcelain=v1 --no-renames 2>/dev/null | tr '\n' '|')"
+SUB_GATEM_OUT="$(cd "$RWS" && HEIMDALL_HOME="$RWS/.heimdall" HEIMDALL_STATE_FILE="$RWS_STATE" "$STATE_BIN" check-quality-gates 2>&1)"; SUB_GATEM_RC=$?
+[ "$SUB_GATEM_RC" = 0 ] \
+  && ok "A14c check-quality-gates PASSES with only a modified tracked ledger checkpoint dirty" \
+  || bad "A14c expected exit 0, got $SUB_GATEM_RC" "$SUB_GATEM_OUT"
+git -C "$RWS" checkout -q -- .planning/ledger/checkpoints/haid_existing.placeholder-machine-0000.json
+# -- but a DELETED ledger record still dirties: nothing publishes by deleting -------
+git -C "$RWS" rm -q --cached .planning/ledger/checkpoints/haid_existing.placeholder-machine-0000.json 2>/dev/null \
+  || rm -f "$RWS/.planning/ledger/checkpoints/haid_existing.placeholder-machine-0000.json"
+( cd "$RWS" && bash test/run-all.sh --min 1 ) >"$WORK/sub-d.out" 2>&1
+[ "$(jq -r '.tree_clean' "$RWS_RECEIPT" 2>/dev/null)" = "false" ] \
+  && ok "A14d receipt tree_clean flips false -- a DELETED ledger record is not exempt (the carve-out covers publishing, not removal)" \
+  || bad "A14d a deleted ledger record was treated as clean" "$(cat "$RWS_RECEIPT" 2>/dev/null)"
+git -C "$RWS" reset -q --hard HEAD
 echo "stray" > "$RWS/some-new-source-file.txt"
 ( cd "$RWS" && bash test/run-all.sh --min 1 ) >"$WORK/sub-c.out" 2>&1
 SUB_C_RC=$?
