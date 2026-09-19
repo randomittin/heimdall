@@ -43,9 +43,11 @@
 #        .quality_gates.lint_clean      true  ⇔ every file checked, 0 findings
 #                                       false ⇔ any finding
 #                                       UNCHANGED when the run was incomplete
-#                                       (budget exhausted) with no finding yet
+#                                       (budget exhausted or a checker timed
+#                                       out) with no finding yet
 #        .quality_gates.lint_last_run   {at, files, checked, findings, tools,
-#                                        complete}  — the receipt. Additive
+#                                        complete, timeouts, skipped, source}
+#                                        — the receipt. Additive
 #                                        key; `set` creates it, nothing in the
 #                                        schema enumerates quality_gates keys.
 #
@@ -60,10 +62,11 @@
 # BOUNDED RUNTIME
 # ---------------
 # Two layers, both the repo's perl-alarm idiom (macOS ships no `timeout`):
-#   * per-invocation: each linter call is wrapped in
-#       perl -e 'alarm N; exec @ARGV' <linter> ...
-#     with N = min(per-call cap, remaining budget), so one hung tool cannot
-#     eat the whole budget.
+#   * per-invocation: each linter call runs under a perl alarm (fork + wait +
+#     `alarm N`, exit 124 on expiry) with N = min(per-call cap, remaining
+#     budget), so one hung tool cannot eat the whole budget. A timed-out call
+#     is a NON-verdict: it is reported, counted in the receipt's `timeouts`,
+#     and forces complete=false — it is never counted as "ok".
 #   * whole run: `--budget S` (default 60) is tracked against wall clock;
 #     once spent, remaining files are listed as "skipped (budget)" and the
 #     receipt records complete=false. The hooks.json entry wraps the whole
@@ -166,6 +169,7 @@ remaining() { local now; now=$(date +%s); echo $(( BUDGET - (now - START_TS) ));
 # moment the direct child dies. RUN_RC is set in THIS shell, not a subshell,
 # which is the other reason this is not a `$(...)`.
 RUN_RC=0
+RUN_TIMEOUT=0
 TIMEOUTS=0
 RUN_OUT="$(mktemp "${TMPDIR:-/tmp}/hmd-stop-lint.XXXXXX" 2>/dev/null || echo /dev/null)"
 trap 'rm -f "$RUN_OUT"' EXIT
@@ -176,21 +180,34 @@ run_bounded() {
   [ "$rem" -lt "$cap" ] && cap=$rem
   [ "$cap" -lt 1 ] && cap=1
   : > "$RUN_OUT" 2>/dev/null
-  # The inner subshell is what receives bash's "Alarm clock: 14" job notice
-  # when the alarm fires; dropping ITS stderr keeps that noise out of the
-  # hook output while the tool's own output still lands in $RUN_OUT.
+  # perl forks the tool and WAITS rather than exec-ing it: with a plain
+  # `alarm N; exec @ARGV` the process bash owns dies by SIGALRM, and bash
+  # prints "Alarm clock: 14" to the hook's stderr for every timeout (a
+  # `( ... ) 2>/dev/null` wrapper does not help — bash exec-optimises a
+  # single-command subshell into the command itself). Here perl catches the
+  # alarm, TERMs then KILLs the child, and exits NORMALLY with 124 (GNU
+  # timeout's code), so nothing the script owns ever dies by signal. A child
+  # that dies by signal on its own is surfaced as 128+signo.
   if [ "$HAVE_PERL" -eq 1 ]; then
-    ( perl -e 'alarm shift; exec @ARGV' "$cap" "$@" >"$RUN_OUT" 2>&1 </dev/null ) 2>/dev/null
+    perl -e '
+      my $t = shift; my $pid = fork;
+      if (!defined $pid) { exit 125 }
+      if ($pid == 0) { exec @ARGV; exit 127 }
+      local $SIG{ALRM} = sub { kill "TERM", $pid; select undef,undef,undef,0.2; kill "KILL", $pid; waitpid $pid, 0; exit 124 };
+      alarm $t; waitpid $pid, 0; alarm 0;
+      exit(($? & 127) ? 128 + ($? & 127) : ($? >> 8));
+    ' "$cap" "$@" >"$RUN_OUT" 2>&1 </dev/null
   else
-    ( "$@" >"$RUN_OUT" 2>&1 </dev/null ) 2>/dev/null
+    "$@" >"$RUN_OUT" 2>&1 </dev/null
   fi
   RUN_RC=$?
-  [ "$RUN_RC" -gt 128 ] && TIMEOUTS=$((TIMEOUTS + 1))
+  RUN_TIMEOUT=0
+  if [ "$RUN_RC" -eq 124 ] || [ "$RUN_RC" -gt 128 ]; then RUN_TIMEOUT=1; TIMEOUTS=$((TIMEOUTS + 1)); fi
 }
 # run_in_repo <cmd...> → run_bounded with cwd = $REPO (RUN_RC still set here)
 run_in_repo() {
   local prev; prev="$PWD"
-  cd "$REPO" 2>/dev/null || { RUN_RC=1; : > "$RUN_OUT"; return; }
+  cd "$REPO" 2>/dev/null || { RUN_RC=1; RUN_TIMEOUT=0; : > "$RUN_OUT"; return; }
   run_bounded "$@"
   cd "$prev" 2>/dev/null || true
 }
@@ -274,12 +291,12 @@ for f in "${SHELL_FILES[@]:-}"; do
   parts=(); detail=""; fcount=0
   run_bounded bash -n "$f"; out="$(tool_out)"; add_tool "bash -n"
   if [ "$RUN_RC" -eq 0 ]; then parts+=("bash -n ok")
-  elif [ "$RUN_RC" -gt 128 ]; then parts+=("bash -n timed out")
+  elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("bash -n timed out")
   else fcount=$((fcount + 1)); parts+=("bash -n FAIL"); detail="$out"; fi
   if [ -n "$SHELLCHECK" ] && budget_left; then
     run_bounded "$SHELLCHECK" -f gcc "$f"; out="$(tool_out)"; add_tool shellcheck
     if [ "$RUN_RC" -eq 0 ]; then parts+=("shellcheck ok")
-    elif [ "$RUN_RC" -gt 128 ]; then parts+=("shellcheck timed out")
+    elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("shellcheck timed out")
     else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
       fcount=$((fcount + n)); parts+=("shellcheck $n"); detail="${detail}${detail:+$'\n'}$out"; fi
   fi
@@ -296,13 +313,13 @@ for f in "${PY_FILES[@]:-}"; do
   if [ -n "$PY" ]; then
     run_bounded "$PY" -c 'import ast,sys; ast.parse(open(sys.argv[1],"rb").read(), sys.argv[1])' "$f"; out="$(tool_out)"; add_tool "python3 ast"
     if [ "$RUN_RC" -eq 0 ]; then parts+=("ast ok")
-    elif [ "$RUN_RC" -gt 128 ]; then parts+=("ast timed out")
+    elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("ast timed out")
     else fcount=$((fcount + 1)); parts+=("ast FAIL"); detail="$(printf '%s\n' "$out" | grep -E 'SyntaxError|line [0-9]+' | tail -n 3)"; [ -z "$detail" ] && detail="$out"; fi
   fi
   if [ -n "$RUFF" ] && budget_left; then
     run_bounded "$RUFF" check --no-fix --output-format concise "$f"; out="$(tool_out)"; add_tool ruff
     if [ "$RUN_RC" -eq 0 ]; then parts+=("ruff ok")
-    elif [ "$RUN_RC" -gt 128 ]; then parts+=("ruff timed out")
+    elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("ruff timed out")
     else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
       fcount=$((fcount + n)); parts+=("ruff $n"); detail="${detail}${detail:+$'\n'}$out"; fi
   fi
@@ -319,7 +336,7 @@ if [ "${#JS_FILES[@]}" -gt 0 ]; then
     TSC_OUT=""
     if [ -n "$TSC" ] && budget_left; then
       run_in_repo "$TSC" --noEmit -p tsconfig.json --pretty false; TSC_OUT="$(tool_out)"; add_tool tsc
-      [ "$RUN_RC" -gt 128 ] && say "tsc timed out after ${PER_CALL}s — type results omitted"
+      [ "$RUN_TIMEOUT" -eq 1 ] && say "tsc timed out after ${PER_CALL}s — type results omitted"
     fi
     for f in "${JS_FILES[@]}"; do
       if ! budget_left; then SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); report "$f" "skipped (budget)"; continue; fi
@@ -327,13 +344,13 @@ if [ "${#JS_FILES[@]}" -gt 0 ]; then
       if [ -n "$BIOME" ] && budget_left; then
         run_in_repo "$BIOME" lint --reporter=summary "$f"; out="$(tool_out)"; add_tool biome
         if [ "$RUN_RC" -eq 0 ]; then parts+=("biome ok")
-        elif [ "$RUN_RC" -gt 128 ]; then parts+=("biome timed out")
+        elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("biome timed out")
         else fcount=$((fcount + 1)); parts+=("biome FAIL"); detail="$out"; fi
       fi
       if [ -n "$ESLINT" ] && budget_left; then
         run_in_repo "$ESLINT" --no-fix -f unix "$f"; out="$(tool_out)"; add_tool eslint
         if [ "$RUN_RC" -eq 0 ]; then parts+=("eslint ok")
-        elif [ "$RUN_RC" -gt 128 ]; then parts+=("eslint timed out")
+        elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("eslint timed out")
         else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
           fcount=$((fcount + n)); parts+=("eslint $n"); detail="${detail}${detail:+$'\n'}$out"; fi
       fi

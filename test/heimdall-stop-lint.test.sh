@@ -171,16 +171,17 @@ elapsed=$((t1 - t0))
 err="$(cat "$TMPROOT/err")"
 S="$D/repo/heimdall-state.json"
 if [ "$rc" = "0" ] && [ "$elapsed" -le 15 ] && grep -q 'timed out\|skipped (budget)' <<<"$err" \
-   && [ "$(lint_clean "$D")" = "false" ]; then
-  ok "7. hung shellcheck: exit 0 in ${elapsed}s, timeout/skip reported, lint_clean stays false"
+   && ! grep -q 'Alarm clock' <<<"$err"; then
+  ok "7. hung shellcheck: exit 0 in ${elapsed}s, timeout/skip reported, no bash job-notice leaked"
 else
-  bad "7. hung linter escaped the alarm (rc=$rc elapsed=${elapsed}s lint_clean=$(lint_clean "$D")): $err"
+  bad "7. hung linter escaped the alarm (rc=$rc elapsed=${elapsed}s): $err"
 fi
-if [ "$(jq -r '.quality_gates.lint_last_run.complete // "missing"' "$S")" != "true" ] \
-   || [ "$(lint_clean "$D")" != "true" ]; then
-  ok "8. a budget-cut run never records lint_clean=true with complete=true"
+if [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" = "false" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run.timeouts // 0' "$S")" -ge 1 ] \
+   && [ "$(lint_clean "$D")" = "true" ]; then
+  ok "8. incomplete run: receipt complete=false, timeouts>=1, pre-armed lint_clean left UNCHANGED"
 else
-  bad "8. incomplete run was recorded as a complete clean pass"
+  bad "8. incomplete run misrecorded: $(jq -c '.quality_gates' "$S")"
 fi
 
 # ── 9. no state file → still runs, reports, exits 0, creates nothing ───────
