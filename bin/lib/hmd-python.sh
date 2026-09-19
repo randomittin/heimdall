@@ -61,28 +61,48 @@ hmd_python() {
 
   cache="$(_hmd_python_cache_file)"
   if [ -r "$cache" ]; then
-    cand="$(cat "$cache" 2>/dev/null)"
-    # -x only, deliberately: re-running `-c pass` here would reintroduce the very cost the
-    # cache exists to remove. A path that is executable but broken falls through to the
-    # caller's own error handling, exactly as a bare `python3` would have.
-    if [ -n "$cand" ] && [ -x "$cand" ]; then
+    # Pure bash read: this lib runs inside hooks whose PATH may not carry coreutils,
+    # and a resolver that needs `cat` to find python is a resolver with two failure
+    # modes instead of one.
+    cand=""; IFS= read -r cand < "$cache" 2>/dev/null || cand=""
+    # RUN it, do not just stat it. An earlier revision checked `-x` only, to save the
+    # ~31ms a `-c pass` costs, on the theory that a broken-but-executable path "falls
+    # through to the caller's own error handling". Measured 2026-09-19, that theory
+    # failed in the field: a macOS CLT update re-armed the Xcode license prompt and
+    # /usr/bin/python3 became a stub that is executable, exits 69, and prints a license
+    # nag. The cache named it; `-x` blessed it; every consumer -- the statusline
+    # watchman, its face fallback, ctx-meter -- died silently and the status bar read
+    # "[ heimdall ]" for the rest of the day. The callers' "error handling" is to fall
+    # back to nothing, because a resolver that returns a path is asserting the path
+    # works. 31ms is the price of that assertion being true; the cache still saves
+    # the ~400ms shim launch it was built to avoid. A cached path that no longer runs
+    # is deleted so the probe below runs fresh and the cache cannot outlive the
+    # interpreter it names.
+    if _hmd_python_works "$cand"; then
       _HMD_PYTHON_RESOLVED="$cand"
       printf '%s' "$_HMD_PYTHON_RESOLVED"; return 0
     fi
+    rm -f "$cache" 2>/dev/null || true
   fi
 
   cand=""
-  if _hmd_python_works /usr/bin/python3; then
-    cand=/usr/bin/python3
-  else
-    cand="$(command -v python3 2>/dev/null || true)"
-  fi
+  # Probe order: the system interpreter (fastest, present on every macOS/Linux), then
+  # Homebrew's -- a real binary, not a shim, in the same ~30ms class -- and only then
+  # whatever PATH resolves, which on a pyenv machine is the ~400ms shim. Every
+  # candidate is RUN before it is accepted, the PATH one included: a shim pointing at a
+  # broken version is the same defect as the license-nag stub above, and the PATH
+  # fallback is the last line -- if it is broken too, the honest answer is "no
+  # interpreter", which every caller already handles.
+  for cand in /usr/bin/python3 /opt/homebrew/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
+    if _hmd_python_works "$cand"; then break; fi
+    cand=""
+  done
 
   if [ -n "$cand" ]; then
     _HMD_PYTHON_RESOLVED="$cand"
     # Best-effort cache. A read-only or absent HEIMDALL_HOME costs correctness nothing —
     # the next process simply probes again.
-    mkdir -p "$(dirname "$cache")" 2>/dev/null && printf '%s\n' "$cand" > "$cache" 2>/dev/null || true
+    mkdir -p "${cache%/*}" 2>/dev/null && printf '%s\n' "$cand" > "$cache" 2>/dev/null || true
     printf '%s' "$cand"
     return 0
   fi
