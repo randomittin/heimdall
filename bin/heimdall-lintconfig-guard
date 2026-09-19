@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# heimdall-lintconfig-guard -- PreToolUse gate that refuses agent edits to
+# linter / formatter / typechecker configuration.
+#
+# WHY THIS EXISTS
+# ---------------
+# CLAUDE.md says "Lint clean (zero warnings)" and the pre-push gate enforces
+# it. The cheapest way to satisfy that gate is not to fix the code: it is to
+# add the failing rule to `.eslintrc.json` "rules": {"...": "off"}, widen
+# `ruff.toml` ignore = [...], flip `tsconfig.json` "strict": false, or bump
+# `.prettierrc` printWidth until the diff is quiet. Every one of those makes
+# the gate go green while making the code no better, and an agent under
+# pressure to finish reaches for exactly that -- ECC's `config-protection.js`
+# exists because its authors watched it happen (see
+# docs/analysis/2026-09-19-ecc-harness-gap-analysis.md, ranked item #4).
+# hmd had nothing here. This is that gate.
+#
+# WHAT IT GATES
+# -------------
+# Three tool shapes, all from the PreToolUse payload on stdin:
+#
+#   Write / Edit / MultiEdit  -> .tool_input.file_path
+#   Bash                      -> .tool_input.command, scanned for the WRITE
+#                                idioms only: `>` / `>>` / `&>` redirects,
+#                                `tee`, `sed -i` / `perl -i`, and the
+#                                destructive movers rm / mv / cp / ln /
+#                                truncate. `cat ruff.toml`, `grep x
+#                                .eslintrc.json`, `eslint --print-config`
+#                                are reads and pass untouched.
+#
+# The match is on the BASENAME, never a substring of the path:
+# `notes-about-tsconfig.md` and `docs/eslintrc-history.txt` are prose about a
+# config, not the config, and must never trip this. `packages/web/tsconfig
+# .build.json` IS the config (nearest-file resolution means a nested config
+# overrides the root one -- that is itself an evasion vector, which is also
+# why CREATING a protected file is refused, not only modifying one: a fresh
+# `.eslintrc.json` dropped into `src/legacy/` silently turns rules off for
+# that subtree. The gap analysis proposed allowing first-time creation; this
+# guard deliberately does not, for that reason).
+#
+# pyproject.toml IS SECTION-AWARE, NOT WHOLE-FILE
+# ----------------------------------------------
+# ECC excludes pyproject.toml entirely, because it is also where dependencies,
+# build config and project metadata live and a whole-file deny would fire on
+# every version bump -- an override that has to be set for routine work is an
+# override that ends up exported globally, which kills the gate. But in a
+# Python repo pyproject.toml is where ruff / mypy / pyright / black / isort /
+# pylint config MOST OFTEN lives; excluding it leaves the most common Python
+# evasion open. So for Write / Edit / MultiEdit this guard reads the TOML
+# section structure: a change is refused only when it touches a protected
+# `[tool.<linter>]` table (header appears in old/new text, the edited text
+# sits inside such a table in the current file, or a Write's protected tables
+# differ from the on-disk ones). Editing `[project] dependencies` passes.
+# For Bash the command text is opaque -- a `sed -i` into pyproject.toml is
+# refused whole and the message says to use the Edit tool for non-lint
+# sections.
+#
+# FAIL-OPEN ON PLUMBING, FAIL-CLOSED ON THE MATCH
+# ----------------------------------------------
+# The ONLY exit 2 in this file follows a positive filename (or pyproject
+# section) match. Empty stdin, malformed JSON, no jq, an unknown tool_name,
+# an unreadable file -- every one of those exits 0 silently. A gate that can
+# wedge a session over its own plumbing is a worse defect than the evasion it
+# blocks, and there is no plumbing failure here worth stopping work over.
+#
+# DENY CONTRACT (matches bin/heimdall-precheck-agent exactly)
+# -----------------------------------------------------------
+#   stdout: one line of JSON  {"error": "BIFROST - ..."}
+#   stderr: the same reason, plain text
+#   exit 2
+# The reason is JSON-encoded through jq; if that somehow fails, a static
+# fallback JSON is printed so the deny is never a non-JSON line that Claude
+# Code would render as garbage.
+#
+# OPERATOR OVERRIDE
+# -----------------
+#   HMD_ALLOW_LINTCONFIG_EDIT=1   in the hook's PROCESS environment
+# (exported before launching claude, or in a settings.json `env` block) makes
+# this guard exit 0 with a one-line stderr notice. Prefixing a Bash command's
+# TEXT with the assignment does not count -- the hook never sees that env,
+# and the override is for a human deciding the config should change (new
+# rule, tool migration), not for the agent making a red check pass.
+set -uo pipefail
+# No `set -e`, on purpose: see FAIL-OPEN above. Under -e a failed jq / awk /
+# grep on an odd payload would kill the script with THAT command's exit code,
+# and a nonzero exit from a PreToolUse hook reads to Claude Code as a deny.
+# The only deny this script may produce is the deliberate one in `deny`.
+
+allow() { exit 0; }
+
+if [ "${HMD_ALLOW_LINTCONFIG_EDIT:-}" = "1" ]; then
+  printf 'heimdall-lintconfig-guard: HMD_ALLOW_LINTCONFIG_EDIT=1 -- operator override, lint/format/typecheck config edits allowed this session\n' >&2
+  allow
+fi
+
+command -v jq >/dev/null 2>&1 || allow
+
+INPUT="$(cat 2>/dev/null || true)"
+[ -n "$INPUT" ] || allow
+
+TOOL="$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)" || TOOL=""
+[ -n "$TOOL" ] || allow
+
+# ---------------------------------------------------------------------------
+# The protected set. Basenames only. Every entry is a file a linter,
+# formatter or typechecker reads to decide what counts as a violation.
+# ---------------------------------------------------------------------------
+lintconfig_protected_basename() {
+  case "$1" in
+    .eslintrc|.eslintrc.*|eslint.config.*) return 0 ;;
+    biome.json|biome.jsonc) return 0 ;;
+    .prettierrc|.prettierrc.*|prettier.config.*) return 0 ;;
+    .stylelintrc|.stylelintrc.*|stylelint.config.*) return 0 ;;
+    .markdownlint.*|.markdownlintrc|.markdownlint-cli2.*) return 0 ;;
+    ruff.toml|.ruff.toml) return 0 ;;
+    mypy.ini|.mypy.ini|pyrightconfig.json) return 0 ;;
+    tsconfig*.json) return 0 ;;
+    .editorconfig|.shellcheckrc) return 0 ;;
+    .golangci.yml|.golangci.yaml|.golangci.toml|.golangci.json) return 0 ;;
+    rustfmt.toml|.rustfmt.toml|clippy.toml|.clippy.toml) return 0 ;;
+  esac
+  return 1
+}
+
+# pyproject.toml tables whose contents configure a linter / formatter /
+# typechecker. Matches `[tool.ruff]`, `[tool.ruff.lint]`, and the
+# array-of-tables form `[[tool.mypy.overrides]]`.
+PYPROJECT_TABLE_RE='^[[:space:]]*\[\[?tool\.(ruff|mypy|pyright|black|isort|pylint)(\]|\.)'
+
+# Print only the lines of a TOML body that sit inside a protected table.
+pyproject_protected_text() {
+  awk -v re="$PYPROJECT_TABLE_RE" '
+    /^[[:space:]]*\[/ { prot = ($0 ~ re) ? 1 : 0 }
+    prot { print }
+  ' 2>/dev/null
+}
+
+strip_quotes() {
+  local s="$1"
+  s="${s#\"}"; s="${s%\"}"
+  s="${s#\'}"; s="${s%\'}"
+  printf '%s' "$s"
+}
+
+path_basename() {
+  local p
+  p="$(strip_quotes "$1")"
+  p="${p%/}"
+  printf '%s' "${p##*/}"
+}
+
+# ---------------------------------------------------------------------------
+# The one deny.
+# ---------------------------------------------------------------------------
+deny() {
+  local what="$1" target="$2" detail="$3"
+  local reason json
+  reason="BIFROST - Heimdall lintconfig guard: refused ${what} -> ${target}. ${detail} Fix the code, not the gate: a lint/format/type failure is evidence about the code, and loosening the rule that surfaced it turns the gate green without making the code right. If this config genuinely should change (a new rule the team agreed on, a tool migration, a fresh project scaffold), that is an operator decision: export HMD_ALLOW_LINTCONFIG_EDIT=1 in the environment claude was launched from (or a settings.json env block) and retry -- putting the assignment in a Bash command's text does not count, the hook never sees it. Never edit this file to make a red check pass."
+  json="$(jq -cn --arg r "$reason" '{error: $r}' 2>/dev/null)"
+  if [ -z "$json" ]; then
+    json='{"error": "BIFROST - Heimdall lintconfig guard: refused an edit to linter/formatter/typechecker configuration (see stderr for detail). Fix the code, not the gate. Operator override: export HMD_ALLOW_LINTCONFIG_EDIT=1."}'
+  fi
+  printf '%s\n' "$json"
+  printf '%s\n' "$reason" >&2
+  exit 2
+}
+
+# ---------------------------------------------------------------------------
+# Write / Edit / MultiEdit
+# ---------------------------------------------------------------------------
+gate_file_tool() {
+  local fpath base
+  fpath="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)" || fpath=""
+  [ -n "$fpath" ] || allow
+  base="$(path_basename "$fpath")"
+
+  if lintconfig_protected_basename "$base"; then
+    deny "$TOOL" "$fpath" "'$base' is linter/formatter/typechecker configuration, and a nested copy overrides the root one, so creating it is refused as well as modifying it."
+  fi
+
+  [ "$base" = "pyproject.toml" ] || allow
+
+  local on_disk=""
+  if [ -f "$fpath" ] && [ -r "$fpath" ]; then
+    on_disk="$(pyproject_protected_text < "$fpath")"
+  fi
+  local section_note="the change touches a protected [tool.ruff|mypy|pyright|black|isort|pylint] table in pyproject.toml (edits to [project], [build-system] and other tables pass this gate)."
+
+  case "$TOOL" in
+    Write)
+      local content proposed
+      content="$(printf '%s' "$INPUT" | jq -r '.tool_input.content // empty' 2>/dev/null)" || content=""
+      [ -n "$content" ] || allow
+      proposed="$(printf '%s\n' "$content" | pyproject_protected_text)"
+      if [ "$proposed" != "$on_disk" ]; then
+        deny "$TOOL" "$fpath" "$section_note"
+      fi
+      allow
+      ;;
+    Edit|MultiEdit)
+      local n i old new first
+      if [ "$TOOL" = "Edit" ]; then
+        n=1
+      else
+        n="$(printf '%s' "$INPUT" | jq -r '.tool_input.edits | if type == "array" then length else 0 end' 2>/dev/null)" || n=0
+        case "$n" in ''|*[!0-9]*) n=0 ;; esac
+      fi
+      i=0
+      while [ "$i" -lt "$n" ]; do
+        if [ "$TOOL" = "Edit" ]; then
+          old="$(printf '%s' "$INPUT" | jq -r '.tool_input.old_string // empty' 2>/dev/null)" || old=""
+          new="$(printf '%s' "$INPUT" | jq -r '.tool_input.new_string // empty' 2>/dev/null)" || new=""
+        else
+          old="$(printf '%s' "$INPUT" | jq -r --argjson i "$i" '.tool_input.edits[$i].old_string // empty' 2>/dev/null)" || old=""
+          new="$(printf '%s' "$INPUT" | jq -r --argjson i "$i" '.tool_input.edits[$i].new_string // empty' 2>/dev/null)" || new=""
+        fi
+        # A protected table header in either side: the edit adds, removes or
+        # renames a linter table.
+        if printf '%s\n' "$old" | grep -Eq "$PYPROJECT_TABLE_RE" 2>/dev/null \
+           || printf '%s\n' "$new" | grep -Eq "$PYPROJECT_TABLE_RE" 2>/dev/null; then
+          deny "$TOOL" "$fpath" "$section_note"
+        fi
+        # The edited text sits inside a protected table of the current file.
+        # Whole old_string first; then its first non-blank line, which
+        # catches an old_string that starts inside a protected table and
+        # runs past its end.
+        if [ -n "$on_disk" ] && [ -n "$old" ]; then
+          if [[ "$on_disk" == *"$old"* ]]; then
+            deny "$TOOL" "$fpath" "$section_note"
+          fi
+          first="$(printf '%s\n' "$old" | grep -m1 -v '^[[:space:]]*$' 2>/dev/null)" || first=""
+          if [ -n "$first" ] && [[ "$on_disk" == *"$first"* ]]; then
+            deny "$TOOL" "$fpath" "$section_note"
+          fi
+        fi
+        i=$((i + 1))
+      done
+      allow
+      ;;
+  esac
+  allow
+}
+
+# ---------------------------------------------------------------------------
+# Bash: only the write idioms.
+# ---------------------------------------------------------------------------
+gate_bash() {
+  local cmd
+  cmd="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)" || cmd=""
+  [ -n "$cmd" ] || allow
+
+  local bash_note_named="'%s' is linter/formatter/typechecker configuration; this command writes to it (redirect, tee, in-place edit, or remove/move/copy)."
+  local bash_note_pyproject="a shell write into pyproject.toml cannot be checked section-by-section; use the Edit tool for its non-lint tables ([project], [build-system], ...), which this gate lets through."
+
+  check_target() {
+    local t b
+    t="$1"
+    [ -n "$t" ] || return 0
+    b="$(path_basename "$t")"
+    if lintconfig_protected_basename "$b"; then
+      # shellcheck disable=SC2059
+      deny "Bash write" "$(strip_quotes "$t")" "$(printf "$bash_note_named" "$b")"
+    fi
+    if [ "$b" = "pyproject.toml" ]; then
+      deny "Bash write" "$(strip_quotes "$t")" "$bash_note_pyproject"
+    fi
+    return 0
+  }
+
+  # 1. Redirect targets: `> f`, `>> f`, `2> f`, `&> f`, `>| f`. `>&2` and
+  #    `2>&1` have no path after the `>` and never match; `<<EOF` has no `>`.
+  local targets t
+  targets="$(printf '%s\n' "$cmd" \
+    | grep -oE '(^|[^<>])&?[0-9]*>{1,2}\|?[[:space:]]*[^[:space:];&|<>]+' 2>/dev/null \
+    | sed -E 's/^.*>\|?[[:space:]]*//' 2>/dev/null)" || targets=""
+  while IFS= read -r t; do
+    check_target "$t"
+  done <<< "$targets"
+
+  # 2. Writer commands. Split into simple commands on ; && || | & and
+  #    newlines, then look at the command word after any env assignments /
+  #    wrappers.
+  local seg word tokens tok has_inplace
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    # shellcheck disable=SC2206
+    tokens=($seg)
+    word=""
+    has_inplace=0
+    local idx=0
+    for tok in "${tokens[@]}"; do
+      idx=$((idx + 1))
+      case "$tok" in
+        [A-Za-z_]*=*|sudo|env|command|exec|nohup|time|xargs|builtin|nice|ionice|-*) continue ;;
+      esac
+      word="${tok##*/}"
+      break
+    done
+    [ -n "$word" ] || continue
+    case "$word" in
+      tee|rm|mv|cp|ln|truncate)
+        for tok in "${tokens[@]:$idx}"; do
+          case "$tok" in -*) continue ;; esac
+          check_target "$tok"
+        done
+        ;;
+      sed|perl)
+        for tok in "${tokens[@]:$idx}"; do
+          case "$tok" in
+            -i*|--in-place*|-[a-zA-Z]*i[a-zA-Z]*) has_inplace=1 ;;
+          esac
+        done
+        [ "$has_inplace" = 1 ] || continue
+        for tok in "${tokens[@]:$idx}"; do
+          case "$tok" in -*) continue ;; esac
+          check_target "$tok"
+        done
+        ;;
+    esac
+  done <<< "$(printf '%s\n' "$cmd" | sed -E 's/(\|\||&&|;|\||&)/\
+/g' 2>/dev/null)"
+
+  allow
+}
+
+case "$TOOL" in
+  Write|Edit|MultiEdit) gate_file_tool ;;
+  Bash) gate_bash ;;
+esac
+allow

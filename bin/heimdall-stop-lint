@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# bin/heimdall-stop-lint — run the project's REAL linter over this session's
+# edited files at Stop, and make the lint gate reflect that run.
+#
+# WHY THIS EXISTS
+# ---------------
+# `heimdall-state check-quality-gates` reads `.quality_gates.lint_clean` — a
+# boolean that, until this tool, was only ever flipped by hand
+# (`heimdall-state mark-clean` sets it true without running anything). A gate
+# whose green can be produced without evidence is not a gate; it is a claim.
+# docs/analysis/2026-09-19-ecc-harness-gap-analysis.md ranked closing this
+# gap #2: ECC (everything-claude-code) catches type/lint breakage on the very
+# turn that introduced it by running linters per edit and again, batched, at
+# Stop. ECC had to build an accumulator of edited paths to do that
+# (post-edit-accumulator.js). hmd already has one — `bin/edit-tracker paths`
+# lists every file the session's Write/Edit calls touched — so the missing
+# piece is only the consumer.
+#
+# WHAT IT DOES
+# ------------
+#   1. `edit-tracker paths` → keep the ones that still exist as regular files.
+#      Nothing edited → exit 0, print nothing.
+#   2. Group by language on extension: shell (.sh/.bash), python (.py),
+#      js/ts (.js/.jsx/.mjs/.cjs/.ts/.tsx).
+#   3. Detect what the REPO already uses; never install anything:
+#        shell   bash -n (always)  +  shellcheck if on PATH
+#        python  python3 -c ast.parse (always)  +  ruff if on PATH AND the repo
+#                carries ruff.toml / .ruff.toml / pyproject.toml
+#        js/ts   biome  if biome.json(c) present and node_modules/.bin/biome
+#                       (or PATH biome) exists
+#                eslint if an eslint config is present and node_modules/.bin/
+#                       eslint (or PATH eslint) exists; package.json
+#                       scripts.lint naming "eslint"/"biome" is an accepted
+#                       hint when the config file lives elsewhere
+#                tsc    if tsconfig.json present and node_modules/.bin/tsc (or
+#                       PATH tsc) exists — runs ONCE, project-wide, `--noEmit`;
+#                       only diagnostics naming an edited file are counted
+#      A group with NO usable checker is reported to stderr once and skipped.
+#   4. Run each checker per file, print one compact line per file to stderr,
+#      then a one-line total.
+#   5. Record via `heimdall-state` (only when a state file already exists —
+#      `hmd init` owns creating it):
+#        .quality_gates.lint_clean      true  ⇔ every file checked, 0 findings
+#                                       false ⇔ any finding
+#                                       UNCHANGED when the run was incomplete
+#                                       (budget exhausted) with no finding yet
+#        .quality_gates.lint_last_run   {at, files, checked, findings, tools,
+#                                        complete}  — the receipt. Additive
+#                                        key; `set` creates it, nothing in the
+#                                        schema enumerates quality_gates keys.
+#
+# ADVISORY, FAIL OPEN, ALWAYS EXIT 0
+# ----------------------------------
+# This is a Stop hook. A Stop hook that exits non-zero, hangs, or dies on its
+# own plumbing turns a warning into a wedged session. So: every branch exits
+# 0; a missing tracker, missing state file, unreadable file, absent linter,
+# or crashed linter is at most one stderr line, never a failure. Findings are
+# the signal; the exit code is not.
+#
+# BOUNDED RUNTIME
+# ---------------
+# Two layers, both the repo's perl-alarm idiom (macOS ships no `timeout`):
+#   * per-invocation: each linter call is wrapped in
+#       perl -e 'alarm N; exec @ARGV' <linter> ...
+#     with N = min(per-call cap, remaining budget), so one hung tool cannot
+#     eat the whole budget.
+#   * whole run: `--budget S` (default 60) is tracked against wall clock;
+#     once spent, remaining files are listed as "skipped (budget)" and the
+#     receipt records complete=false. The hooks.json entry wraps the whole
+#     tool in one more alarm as the last line of defence.
+# perl absent → linters run unwrapped; the hook-level alarm still applies.
+#
+# NEVER TOUCHES THE OPERATOR'S REAL LEDGER IN TESTS
+# -------------------------------------------------
+# edit-tracker keys its ledger on $TMPDIR/heimdall-edits/$CLAUDE_CODE_SESSION_ID
+# .log. test/heimdall-stop-lint.test.sh sets both to a private temp dir + a
+# unique session id, so it can only ever read a ledger it wrote itself.
+#
+# Usage:
+#   heimdall-stop-lint [--repo DIR] [--budget SECONDS] [--per-call SECONDS]
+#                      [--tracker PATH] [--quiet]
+#   HEIMDALL_STATE_FILE overrides the state file (default <repo>/heimdall-
+#   state.json, falling back to <repo>/superx-state.json, matching
+#   bin/heimdall-state).
+
+set -u
+
+REPO="."
+BUDGET=60
+PER_CALL=20
+TRACKER=""
+QUIET=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)     REPO="${2:-.}"; shift 2 ;;
+    --budget)   BUDGET="${2:-60}"; shift 2 ;;
+    --per-call) PER_CALL="${2:-20}"; shift 2 ;;
+    --tracker)  TRACKER="${2:-}"; shift 2 ;;
+    --quiet)    QUIET=1; shift ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+case "$BUDGET" in ''|*[!0-9]*) BUDGET=60 ;; esac
+case "$PER_CALL" in ''|*[!0-9]*) PER_CALL=20 ;; esac
+[ "$BUDGET" -lt 1 ] && BUDGET=1
+[ "$PER_CALL" -lt 1 ] && PER_CALL=1
+
+REPO="$(cd "$REPO" 2>/dev/null && pwd -P || echo "$REPO")"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+[ -z "$TRACKER" ] && TRACKER="$HERE/edit-tracker"
+STATE_TOOL="$HERE/heimdall-state"
+
+TAG="[heimdall] stop-lint:"
+say() { [ "$QUIET" -eq 1 ] && return 0; printf '%s %s\n' "$TAG" "$*" >&2; }
+
+# ── 1. edited paths ──────────────────────────────────────────────────────────
+[ -x "$TRACKER" ] || exit 0
+
+FILES=()
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  case "$p" in /*) ;; *) p="$REPO/$p" ;; esac
+  [ -f "$p" ] || continue
+  FILES+=("$p")
+done < <("$TRACKER" paths 2>/dev/null || true)
+
+[ "${#FILES[@]}" -gt 0 ] || exit 0
+
+# ── 2. group by language ─────────────────────────────────────────────────────
+SHELL_FILES=(); PY_FILES=(); JS_FILES=(); OTHER=0
+for f in "${FILES[@]}"; do
+  case "$f" in
+    *.sh|*.bash)                         SHELL_FILES+=("$f") ;;
+    *.py)                                PY_FILES+=("$f") ;;
+    *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx)   JS_FILES+=("$f") ;;
+    *)
+      # extensionless files with a bash/sh shebang are shell too (bin/ tools)
+      if [ "${f##*/}" = "${f##*/}" ] && [ "${f%.*}" = "$f" ] \
+         && head -c 64 "$f" 2>/dev/null | head -1 | grep -qE '^#!.*\b(ba)?sh\b'; then
+        SHELL_FILES+=("$f")
+      elif head -c 64 "$f" 2>/dev/null | head -1 | grep -qE '^#!.*python'; then
+        PY_FILES+=("$f")
+      else
+        OTHER=$((OTHER + 1))
+      fi ;;
+  esac
+done
+
+# ── 3. detect checkers (never install) ───────────────────────────────────────
+HAVE_PERL=0; command -v perl >/dev/null 2>&1 && HAVE_PERL=1
+START_TS=$(date +%s)
+remaining() { local now; now=$(date +%s); echo $(( BUDGET - (now - START_TS) )); }
+
+# run_bounded <label> <cmd...>  → stdout+stderr of the tool; rc in RUN_RC
+RUN_RC=0
+run_bounded() {
+  local rem cap
+  rem=$(remaining)
+  cap=$PER_CALL
+  [ "$rem" -lt "$cap" ] && cap=$rem
+  [ "$cap" -lt 1 ] && cap=1
+  if [ "$HAVE_PERL" -eq 1 ]; then
+    perl -e 'alarm shift; exec @ARGV' "$cap" "$@" 2>&1
+  else
+    "$@" 2>&1
+  fi
+  RUN_RC=$?
+}
+
+# node tool resolution: repo-local first, PATH second, never npx-install
+node_bin() {
+  local name="$1"
+  if [ -x "$REPO/node_modules/.bin/$name" ]; then
+    printf '%s' "$REPO/node_modules/.bin/$name"
+  elif command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+  fi
+}
+
+SHELLCHECK=""; command -v shellcheck >/dev/null 2>&1 && SHELLCHECK="$(command -v shellcheck)"
+
+RUFF=""
+if command -v ruff >/dev/null 2>&1; then
+  for cfg in ruff.toml .ruff.toml pyproject.toml; do
+    [ -f "$REPO/$cfg" ] && { RUFF="$(command -v ruff)"; break; }
+  done
+fi
+
+PKG_LINT=""
+if [ -f "$REPO/package.json" ] && command -v jq >/dev/null 2>&1; then
+  PKG_LINT="$(jq -r '.scripts.lint // empty' "$REPO/package.json" 2>/dev/null || true)"
+fi
+
+BIOME=""
+if [ -f "$REPO/biome.json" ] || [ -f "$REPO/biome.jsonc" ] || [[ "$PKG_LINT" == *biome* ]]; then
+  BIOME="$(node_bin biome)"
+fi
+
+ESLINT=""
+if [ -f "$REPO/eslint.config.js" ] || [ -f "$REPO/eslint.config.mjs" ] || [ -f "$REPO/eslint.config.cjs" ] \
+   || [ -f "$REPO/eslint.config.ts" ] || ls "$REPO"/.eslintrc* >/dev/null 2>&1 || [[ "$PKG_LINT" == *eslint* ]]; then
+  ESLINT="$(node_bin eslint)"
+fi
+
+TSC=""
+if [ -f "$REPO/tsconfig.json" ]; then
+  TSC="$(node_bin tsc)"
+fi
+
+TOOLS_USED=()
+add_tool() { local t; for t in "${TOOLS_USED[@]:-}"; do [ "$t" = "$1" ] && return; done; TOOLS_USED+=("$1"); }
+
+# ── 4. run ───────────────────────────────────────────────────────────────────
+CHECKED=0
+FINDINGS=0
+SKIPPED_BUDGET=0
+MAX_DETAIL_LINES=6
+
+rel() { case "$1" in "$REPO"/*) printf '%s' "${1#"$REPO"/}" ;; *) printf '%s' "$1" ;; esac; }
+
+# report <file> <summary> [detail-text]
+report() {
+  local f="$1" summary="$2" detail="${3:-}"
+  say "$(rel "$f") — $summary"
+  [ -n "$detail" ] || return 0
+  [ "$QUIET" -eq 1 ] && return 0
+  printf '%s\n' "$detail" | grep -v '^[[:space:]]*$' | head -n "$MAX_DETAIL_LINES" | sed 's/^/    /' >&2
+}
+
+budget_left() { [ "$(remaining)" -gt 0 ]; }
+
+# --- shell -------------------------------------------------------------------
+for f in "${SHELL_FILES[@]:-}"; do
+  [ -n "$f" ] || continue
+  if ! budget_left; then SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); report "$f" "skipped (budget)"; continue; fi
+  parts=(); detail=""; fcount=0
+  out="$(run_bounded bash -n "$f")"; add_tool "bash -n"
+  if [ "$RUN_RC" -eq 0 ]; then parts+=("bash -n ok")
+  else fcount=$((fcount + 1)); parts+=("bash -n FAIL"); detail="$out"; fi
+  if [ -n "$SHELLCHECK" ] && budget_left; then
+    out="$(run_bounded "$SHELLCHECK" -f gcc "$f")"; add_tool shellcheck
+    if [ "$RUN_RC" -eq 0 ]; then parts+=("shellcheck ok")
+    elif [ "$RUN_RC" -eq 142 ] || [ "$RUN_RC" -gt 128 ]; then parts+=("shellcheck timed out")
+    else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
+      fcount=$((fcount + n)); parts+=("shellcheck $n"); detail="${detail}${detail:+$'\n'}$out"; fi
+  fi
+  CHECKED=$((CHECKED + 1)); FINDINGS=$((FINDINGS + fcount))
+  report "$f" "$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')" "$detail"
+done
+
+# --- python ------------------------------------------------------------------
+PY=""; command -v python3 >/dev/null 2>&1 && PY=python3
+for f in "${PY_FILES[@]:-}"; do
+  [ -n "$f" ] || continue
+  if ! budget_left; then SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); report "$f" "skipped (budget)"; continue; fi
+  parts=(); detail=""; fcount=0
+  if [ -n "$PY" ]; then
+    out="$(run_bounded "$PY" -c 'import ast,sys; ast.parse(open(sys.argv[1],"rb").read(), sys.argv[1])' "$f")"; add_tool "python3 ast"
+    if [ "$RUN_RC" -eq 0 ]; then parts+=("ast ok")
+    else fcount=$((fcount + 1)); parts+=("ast FAIL"); detail="$(printf '%s\n' "$out" | grep -E 'SyntaxError|line [0-9]+' | tail -n 3)"; [ -z "$detail" ] && detail="$out"; fi
+  fi
+  if [ -n "$RUFF" ] && budget_left; then
+    out="$(run_bounded "$RUFF" check --no-fix --output-format concise "$f")"; add_tool ruff
+    if [ "$RUN_RC" -eq 0 ]; then parts+=("ruff ok")
+    elif [ "$RUN_RC" -gt 128 ]; then parts+=("ruff timed out")
+    else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
+      fcount=$((fcount + n)); parts+=("ruff $n"); detail="${detail}${detail:+$'\n'}$out"; fi
+  fi
+  if [ "${#parts[@]}" -eq 0 ]; then report "$f" "no python checker available"; continue; fi
+  CHECKED=$((CHECKED + 1)); FINDINGS=$((FINDINGS + fcount))
+  report "$f" "$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')" "$detail"
+done
+
+# --- js / ts -----------------------------------------------------------------
+if [ "${#JS_FILES[@]}" -gt 0 ]; then
+  if [ -z "$BIOME" ] && [ -z "$ESLINT" ] && [ -z "$TSC" ]; then
+    say "no js/ts linter found in $(rel "$REPO") (${#JS_FILES[@]} edited file(s) skipped; looked for biome, eslint, tsc — nothing installed)"
+  else
+    TSC_OUT=""
+    if [ -n "$TSC" ] && budget_left; then
+      TSC_OUT="$(cd "$REPO" && run_bounded "$TSC" --noEmit -p tsconfig.json --pretty false)"; add_tool tsc
+      [ "$RUN_RC" -gt 128 ] && say "tsc timed out after ${PER_CALL}s — type results omitted"
+    fi
+    for f in "${JS_FILES[@]}"; do
+      if ! budget_left; then SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); report "$f" "skipped (budget)"; continue; fi
+      parts=(); detail=""; fcount=0
+      if [ -n "$BIOME" ] && budget_left; then
+        out="$(cd "$REPO" && run_bounded "$BIOME" lint --reporter=summary "$f")"; add_tool biome
+        if [ "$RUN_RC" -eq 0 ]; then parts+=("biome ok")
+        elif [ "$RUN_RC" -gt 128 ]; then parts+=("biome timed out")
+        else fcount=$((fcount + 1)); parts+=("biome FAIL"); detail="$out"; fi
+      fi
+      if [ -n "$ESLINT" ] && budget_left; then
+        out="$(cd "$REPO" && run_bounded "$ESLINT" --no-fix -f unix "$f")"; add_tool eslint
+        if [ "$RUN_RC" -eq 0 ]; then parts+=("eslint ok")
+        elif [ "$RUN_RC" -gt 128 ]; then parts+=("eslint timed out")
+        else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
+          fcount=$((fcount + n)); parts+=("eslint $n"); detail="${detail}${detail:+$'\n'}$out"; fi
+      fi
+      if [ -n "$TSC" ] && [ -n "$TSC_OUT" ]; then
+        rf="$(rel "$f")"
+        hits="$(printf '%s\n' "$TSC_OUT" | grep -F "$rf" | grep -E 'error TS[0-9]+')"
+        if [ -n "$hits" ]; then n=$(printf '%s\n' "$hits" | wc -l | tr -d ' ')
+          fcount=$((fcount + n)); parts+=("tsc $n"); detail="${detail}${detail:+$'\n'}$hits"
+        else parts+=("tsc ok"); fi
+      elif [ -n "$TSC" ]; then parts+=("tsc ok"); fi
+      if [ "${#parts[@]}" -eq 0 ]; then report "$f" "skipped (budget)"; SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); continue; fi
+      CHECKED=$((CHECKED + 1)); FINDINGS=$((FINDINGS + fcount))
+      report "$f" "$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')" "$detail"
+    done
+  fi
+fi
+
+[ "$OTHER" -gt 0 ] && say "$OTHER edited file(s) of other types not linted"
+
+COMPLETE=true
+[ "$SKIPPED_BUDGET" -gt 0 ] && COMPLETE=false
+
+if [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ]; then
+  verdict="clean"; [ "$FINDINGS" -gt 0 ] && verdict="$FINDINGS finding(s)"
+  extra=""; [ "$SKIPPED_BUDGET" -gt 0 ] && extra=", $SKIPPED_BUDGET skipped (budget ${BUDGET}s exhausted)"
+  say "$CHECKED file(s) checked, $verdict$extra"
+fi
+
+# ── 5. record ────────────────────────────────────────────────────────────────
+STATE="${HEIMDALL_STATE_FILE:-}"
+if [ -z "$STATE" ]; then
+  if [ -f "$REPO/heimdall-state.json" ]; then STATE="$REPO/heimdall-state.json"
+  elif [ -f "$REPO/superx-state.json" ]; then STATE="$REPO/superx-state.json"; fi
+fi
+
+if [ -n "$STATE" ] && [ -f "$STATE" ] && [ -x "$STATE_TOOL" ] && command -v jq >/dev/null 2>&1 \
+   && { [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ]; }; then
+  tools_json="$(printf '%s\n' "${TOOLS_USED[@]:-}" | grep -v '^$' | jq -R . | jq -sc .)"
+  receipt="$(jq -nc \
+    --arg at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    --argjson files "${#FILES[@]}" \
+    --argjson checked "$CHECKED" \
+    --argjson findings "$FINDINGS" \
+    --argjson tools "$tools_json" \
+    --argjson complete "$COMPLETE" \
+    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, source:"heimdall-stop-lint"}')"
+  # Never let a state-tool hiccup (lock contention, malformed file) escape.
+  HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_last_run' "$receipt" >/dev/null 2>&1 || true
+  if [ "$FINDINGS" -gt 0 ]; then
+    HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_clean' false >/dev/null 2>&1 || true
+  elif [ "$COMPLETE" = true ]; then
+    HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_clean' true >/dev/null 2>&1 || true
+  fi
+fi
+
+exit 0

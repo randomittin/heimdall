@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""heimdall-hooks -- ids, fingerprints and a per-hook kill switch for the
+matcher groups in hooks/hooks.json.
+
+WHY THIS EXISTS
+---------------
+hooks/hooks.json is wiring: ~30 anonymous matcher groups, each an inline shell
+command, fired in EVERY project hmd is loaded into (--plugin-dir). Until this
+tool there was no way to refer to one of them except by array position, no way
+to notice that one had been edited, and no way to turn one off short of editing
+the JSON by hand -- which is exactly how a hook that misfires in one operator's
+environment ends up either tolerated or deleted wholesale.
+
+This tool gives every group three things, kept in the sidecar
+hooks/hooks.metadata.json:
+
+  id          short kebab-case name derived from what the command DOES
+              (secret-read-guard, stub-gate, caveman-rules, ...)
+  fingerprint sha256 of  matcher + "\\n" + command  -- so `check` can prove the
+              live hooks.json still matches what the sidecar describes
+  locked      true for FAIL-CLOSED gates. Disabling one of those would weaken a
+              correctness or safety guarantee CLAUDE.md protects (the stub gate,
+              the secret gates, the push gates, the brief-adoption gate, the
+              edit tracker that arms the push gate). `disable` REFUSES them with
+              exit 2, and bin/lib/hook-enabled.sh treats them as enabled even if
+              someone hand-edits the disabled-list. Everything else is advisory
+              and gets a switch.
+
+THE SIDECAR IS DESCRIPTIVE, NEVER PRESCRIPTIVE
+----------------------------------------------
+This tool NEVER writes hooks.json. `regen` is the ONLY writer of the sidecar,
+and it writes nothing else. Wiring stays in hooks.json; naming lives here.
+
+EXIT CODES
+----------
+  check    0 clean; 1 on any drift, any live group with no metadata entry, any
+           metadata entry with no live group, or a duplicate id. Fails OPEN
+           (exit 0, reason on stderr) ONLY when hooks.json itself cannot be
+           read -- a broken plugin file is Claude Code's problem to report and
+           this checker must not be the second thing that dies over it.
+  disable  0 written; 1 unknown id; 2 REFUSED because the id is locked.
+  enable   0 always (removing an id that is not there is a no-op).
+  regen    0 written; 1 hooks.json unreadable.
+  list     0.
+
+STATE
+-----
+$HEIMDALL_HOME/hooks-disabled, one id per line, default HEIMDALL_HOME is
+${HOME:-/tmp}/.heimdall -- the same resolution bin/heimdall-caveman and the
+other bin/ tools use. Per-operator, never committed, never in the repo.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+DEFAULT_HOOKS = os.path.join(REPO, "hooks", "hooks.json")
+DEFAULT_METADATA = os.path.join(REPO, "hooks", "hooks.metadata.json")
+DISABLED_BASENAME = "hooks-disabled"
+
+# Same resolution as `HEIMDALL_HOME="${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}"`
+# in bin/heimdall-caveman, so a disable written here is read by the shell lib
+# from the same file.
+def heimdall_home():
+    override = os.environ.get("HEIMDALL_HOME")
+    if override:
+        return override
+    return os.path.join(os.environ.get("HOME") or "/tmp", ".heimdall")
+
+
+def disabled_path():
+    return os.path.join(heimdall_home(), DISABLED_BASENAME)
+
+
+def fingerprint(matcher, command):
+    """sha256 of matcher + "\\n" + command. The matcher is part of the identity:
+    widening `Read|Grep|Glob` to `Read|Grep|Glob|Bash` changes WHERE a gate
+    fires just as much as editing its command changes WHAT it does."""
+    payload = (matcher or "") + "\n" + command
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def load_json(path):
+    """Return (data, error). error is a human-readable string on any failure."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle), None
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return None, "%s: %s" % (path, exc)
+
+
+def live_groups(hooks_data):
+    """Flatten hooks.json into [(event, index, matcher, command)].
+
+    A group with several `hooks` entries joins their commands with "\\n" so one
+    fingerprint still covers the whole group; hooks.json has one command per
+    group today, and the join keeps that a non-event if it ever changes.
+    """
+    groups = []
+    events = hooks_data.get("hooks") if isinstance(hooks_data, dict) else None
+    if not isinstance(events, dict):
+        return groups
+    for event, matcher_groups in events.items():
+        if not isinstance(matcher_groups, list):
+            continue
+        for index, group in enumerate(matcher_groups):
+            if not isinstance(group, dict):
+                continue
+            matcher = group.get("matcher") or ""
+            commands = [
+                hook.get("command", "")
+                for hook in group.get("hooks", [])
+                if isinstance(hook, dict) and hook.get("type", "command") == "command"
+            ]
+            groups.append((event, index, matcher, "\n".join(commands)))
+    return groups
+
+
+def metadata_entries(meta_data):
+    entries = meta_data.get("hooks") if isinstance(meta_data, dict) else None
+    return [e for e in (entries or []) if isinstance(e, dict)]
+
+
+def read_disabled():
+    try:
+        with open(disabled_path(), "r", encoding="utf-8") as handle:
+            return [line.strip() for line in handle if line.strip()]
+    except OSError:
+        return []
+
+
+def write_disabled(ids):
+    path = disabled_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as handle:
+        for item in ids:
+            handle.write(item + "\n")
+    os.replace(tmp, path)
+
+
+def load_metadata_or_die(path):
+    meta, err = load_json(path)
+    if err:
+        sys.stderr.write("heimdall-hooks: cannot read metadata %s\n" % err)
+        sys.exit(1)
+    return meta
+
+
+# ── list ────────────────────────────────────────────────────────────────────
+
+def cmd_list(args):
+    meta = load_metadata_or_die(args.metadata)
+    entries = metadata_entries(meta)
+    disabled = set(read_disabled())
+    rows = []
+    for entry in entries:
+        locked = bool(entry.get("locked"))
+        hid = entry.get("id", "?")
+        if locked:
+            state = "locked"
+        elif hid in disabled:
+            state = "DISABLED"
+        else:
+            state = "enabled"
+        rows.append((
+            hid,
+            "%s[%d]" % (entry.get("event", "?"), entry.get("index", -1)),
+            entry.get("matcher") or "*",
+            state,
+            entry.get("description", ""),
+        ))
+    if args.json:
+        print(json.dumps([
+            {"id": r[0], "where": r[1], "matcher": r[2], "state": r[3], "description": r[4]}
+            for r in rows
+        ], indent=2))
+        return 0
+    header = ("ID", "WHERE", "MATCHER", "STATE", "DESCRIPTION")
+    widths = [len(h) for h in header]
+    for row in rows:
+        for i in range(4):
+            widths[i] = max(widths[i], len(row[i]))
+    fmt = "  ".join("%%-%ds" % w for w in widths[:4]) + "  %s"
+    print(fmt % header)
+    for row in rows:
+        print(fmt % row)
+    stale = sorted(disabled - {e.get("id") for e in entries})
+    if stale:
+        sys.stderr.write("heimdall-hooks: %s names unknown id(s): %s\n"
+                         % (disabled_path(), ", ".join(stale)))
+    return 0
+
+
+# ── check ───────────────────────────────────────────────────────────────────
+
+def cmd_check(args):
+    hooks, err = load_json(args.hooks)
+    if err:
+        # Fail-open by contract: the ONE case where this checker steps aside.
+        sys.stderr.write("heimdall-hooks check: hooks.json unreadable, cannot check "
+                         "(exit 0, fail-open) -- %s\n" % err)
+        return 0
+    meta = load_metadata_or_die(args.metadata)
+
+    by_key = {}
+    ids_seen = {}
+    problems = []
+    for entry in metadata_entries(meta):
+        key = (entry.get("event"), entry.get("index"))
+        hid = entry.get("id", "<no id>")
+        if key in by_key:
+            problems.append("duplicate metadata entry for %s[%s] (%s and %s)"
+                            % (key[0], key[1], by_key[key].get("id"), hid))
+        by_key[key] = entry
+        if hid in ids_seen:
+            problems.append("duplicate id %r (%s[%s] and %s[%s])"
+                            % (hid, ids_seen[hid][0], ids_seen[hid][1], key[0], key[1]))
+        ids_seen[hid] = key
+
+    live = live_groups(hooks)
+    live_keys = set()
+    for event, index, matcher, command in live:
+        live_keys.add((event, index))
+        entry = by_key.get((event, index))
+        if entry is None:
+            problems.append("%s[%d] (matcher %r) has NO metadata entry -- run "
+                            "`heimdall-hooks regen` and give it an id"
+                            % (event, index, matcher or "*"))
+            continue
+        want = fingerprint(matcher, command)
+        have = entry.get("fingerprint")
+        if have != want:
+            problems.append("DRIFT %s (%s[%d]): fingerprint %s != live %s -- the "
+                            "matcher or command changed since the sidecar was written; "
+                            "review, then `heimdall-hooks regen`"
+                            % (entry.get("id"), event, index,
+                               (have or "<none>")[:12], want[:12]))
+    for key, entry in by_key.items():
+        if key not in live_keys:
+            problems.append("metadata entry %s (%s[%s]) has no live group in hooks.json "
+                            "-- stale; `heimdall-hooks regen` removes it"
+                            % (entry.get("id"), key[0], key[1]))
+
+    if problems:
+        for line in problems:
+            sys.stderr.write("heimdall-hooks check: %s\n" % line)
+        sys.stderr.write("heimdall-hooks check: %d problem(s)\n" % len(problems))
+        return 1
+    if not args.quiet:
+        print("heimdall-hooks check: clean -- %d group(s), all fingerprints match" % len(live))
+    return 0
+
+
+# ── disable / enable ────────────────────────────────────────────────────────
+
+def find_entry(meta, hid):
+    for entry in metadata_entries(meta):
+        if entry.get("id") == hid:
+            return entry
+    return None
+
+
+def cmd_disable(args):
+    meta = load_metadata_or_die(args.metadata)
+    entry = find_entry(meta, args.id)
+    if entry is None:
+        sys.stderr.write("heimdall-hooks disable: unknown hook id %r (see `heimdall-hooks list`)\n"
+                         % args.id)
+        return 1
+    if entry.get("locked"):
+        sys.stderr.write(
+            "heimdall-hooks disable: REFUSED -- %r is a LOCKED fail-closed gate "
+            "(%s[%s]: %s). Disabling it would weaken a guarantee CLAUDE.md protects; "
+            "there is no switch for it, by design.\n"
+            % (args.id, entry.get("event"), entry.get("index"), entry.get("description", "")))
+        return 2
+    current = read_disabled()
+    if args.id in current:
+        print("heimdall-hooks: %s already disabled (%s)" % (args.id, disabled_path()))
+        return 0
+    current.append(args.id)
+    write_disabled(current)
+    print("heimdall-hooks: disabled %s -> %s" % (args.id, disabled_path()))
+    return 0
+
+
+def cmd_enable(args):
+    current = read_disabled()
+    if args.id not in current:
+        print("heimdall-hooks: %s is not disabled" % args.id)
+        return 0
+    write_disabled([item for item in current if item != args.id])
+    print("heimdall-hooks: enabled %s (removed from %s)" % (args.id, disabled_path()))
+    return 0
+
+
+# ── regen ───────────────────────────────────────────────────────────────────
+
+def derive_id(event, command):
+    """A best-effort id for a group that has none yet: the first bin/ or hooks/
+    program the command invokes, minus the `heimdall-` prefix and extension.
+    Printed as NEW so the author renames it if the guess is poor."""
+    import re
+    match = re.search(r'/(?:bin|hooks)/([A-Za-z0-9_.-]+)', command)
+    if match:
+        name = match.group(1)
+        name = re.sub(r'\.(sh|py)$', '', name)
+        name = re.sub(r'^heimdall-', '', name)
+        return name.lower()
+    return event.lower()
+
+
+def cmd_regen(args):
+    hooks, err = load_json(args.hooks)
+    if err:
+        sys.stderr.write("heimdall-hooks regen: hooks.json unreadable -- %s\n" % err)
+        return 1
+    existing, _ = load_json(args.metadata)
+    by_key = {}
+    for entry in metadata_entries(existing) if existing else []:
+        by_key[(entry.get("event"), entry.get("index"))] = entry
+
+    new_entries = []
+    changes = []
+    for event, index, matcher, command in live_groups(hooks):
+        want = fingerprint(matcher, command)
+        old = by_key.pop((event, index), None)
+        if old is None:
+            entry = {
+                "event": event,
+                "index": index,
+                "id": derive_id(event, command),
+                "description": "NEW -- describe what this hook does",
+                "matcher": matcher,
+                "fingerprint": want,
+                "locked": False,
+            }
+            changes.append("NEW   %s (%s[%d]) -- set id/description/locked by hand"
+                           % (entry["id"], event, index))
+        else:
+            entry = {
+                "event": event,
+                "index": index,
+                "id": old.get("id") or derive_id(event, command),
+                "description": old.get("description", ""),
+                "matcher": matcher,
+                "fingerprint": want,
+                "locked": bool(old.get("locked")),
+            }
+            if old.get("fingerprint") != want:
+                changes.append("FP    %s (%s[%d]) %s -> %s"
+                               % (entry["id"], event, index,
+                                  (old.get("fingerprint") or "<none>")[:12], want[:12]))
+            if (old.get("matcher") or "") != matcher:
+                changes.append("MATCH %s (%s[%d]) %r -> %r"
+                               % (entry["id"], event, index, old.get("matcher") or "*",
+                                  matcher or "*"))
+        new_entries.append(entry)
+    for key, old in by_key.items():
+        changes.append("GONE  %s (%s[%s]) -- no live group, entry dropped"
+                       % (old.get("id"), key[0], key[1]))
+
+    out = {
+        "_comment": "Generated by bin/heimdall-hooks regen -- the ONLY writer of this file. "
+                    "fingerprint = sha256(matcher + \"\\n\" + command). Edit id/description/"
+                    "locked by hand, never fingerprint. `heimdall-hooks check` fails on drift.",
+        "hooks": new_entries,
+    }
+    tmp = args.metadata + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(out, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    os.replace(tmp, args.metadata)
+
+    if changes:
+        for line in changes:
+            print("heimdall-hooks regen: %s" % line)
+    else:
+        print("heimdall-hooks regen: no changes (%d group(s))" % len(new_entries))
+    return 0
+
+
+# ── cli ─────────────────────────────────────────────────────────────────────
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--hooks", default=argparse.SUPPRESS,
+                        help="hooks.json to read (default: <plugin>/hooks/hooks.json)")
+    common.add_argument("--metadata", default=argparse.SUPPRESS,
+                        help="sidecar to read/write (default: <plugin>/hooks/hooks.metadata.json)")
+
+    parser = argparse.ArgumentParser(
+        parents=[common],
+        description="Hook ids, fingerprint drift check and per-hook kill switch for "
+                    "hooks/hooks.json. Never writes hooks.json.")
+    sub = parser.add_subparsers(dest="cmd")
+    sp = sub.add_parser("list", parents=[common], help="table of every hook: id, place, state")
+    sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("check", parents=[common],
+                        help="recompute fingerprints; exit 1 on drift or missing metadata")
+    sp.add_argument("--quiet", action="store_true", help="print nothing when clean")
+    sp = sub.add_parser("disable", parents=[common],
+                        help="add an advisory hook id to $HEIMDALL_HOME/hooks-disabled (exit 2 if locked)")
+    sp.add_argument("id")
+    sp = sub.add_parser("enable", parents=[common], help="remove an id from hooks-disabled")
+    sp.add_argument("id")
+    sub.add_parser("regen", parents=[common],
+                   help="rewrite sidecar fingerprints from live hooks.json (the only writer)")
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.hooks = os.path.abspath(getattr(args, "hooks", DEFAULT_HOOKS))
+    args.metadata = os.path.abspath(getattr(args, "metadata", DEFAULT_METADATA))
+    if args.cmd is None:
+        parser.print_help()
+        return 0
+    return {
+        "list": cmd_list,
+        "check": cmd_check,
+        "disable": cmd_disable,
+        "enable": cmd_enable,
+        "regen": cmd_regen,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)

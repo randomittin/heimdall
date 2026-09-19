@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# heimdall-precompact-checkpoint — PreCompact hook entrypoint: take a mechanical
+# checkpoint BEFORE Claude Code rewrites the context window.
+#
+# WHY THIS EXISTS
+#   hmd's whole cost thesis (bin/heimdall-ctx-meter, header) is: compaction is
+#   lossy, so checkpoint FIRST. Until this file, that thesis rested entirely on the
+#   operator obeying a stderr notice — ctx-meter's render_ceiling says "Run /hmd:save
+#   now, then /compact", and nothing enforced the order. Worse, AUTO-compaction fires
+#   with no operator in the loop at all: the window fills, Claude Code compacts, and
+#   whatever forward state lived only in the conversation is gone before anyone
+#   could type a slash command. hmd had zero PreCompact hooks (docs/analysis/
+#   2026-09-19-ecc-harness-gap-analysis.md, ranked item #1).
+#
+#   Claude Code fires `PreCompact` for BOTH `/compact` (trigger "manual") and the
+#   auto-compact window (trigger "auto"), so a hook here makes the save mechanical.
+#   This script is that hook. It does NOT reimplement a checkpoint — it drives the
+#   EXISTING writer, bin/heimdall-checkpoint, which is already LLM-free, idempotent,
+#   completeness-gated, and what SessionEnd already runs. Two calls:
+#
+#     heimdall-checkpoint note in-progress "compaction (<trigger>) …"
+#         records, in the session-only notes store, that a compaction happened and
+#         which kind — the next `write` folds it into the checkpoint's IN-PROGRESS
+#         field, so the resuming reader sees "this state was taken because context
+#         was about to be rewritten", not a bare timestamp.
+#     heimdall-checkpoint write <project_dir>
+#         writes/updates .planning/CHECKPOINT.md, verifies all six resume-contract
+#         fields survived, publishes the resume key.
+#
+# PAYLOAD (verified 2026-09-19 against code.claude.com/docs/en/hooks.md, "PreCompact
+# input"): stdin JSON with the common fields `session_id`, `transcript_path`, `cwd`,
+# `hook_event_name` ("PreCompact") plus `trigger` ("manual" | "auto") and
+# `custom_instructions` (string for a manual /compact with text, else null). The
+# matcher filters on trigger; this script reads trigger from the payload so one
+# unmatched entry covers both.
+#
+# FAILS OPEN, ALWAYS, ON EVERYTHING — this hook must never block or slow compaction
+#   The docs are explicit: a PreCompact hook that exits 2 BLOCKS compaction, and if
+#   the compaction was the recovery path for a context-limit error already returned
+#   by the API, blocking it surfaces that error and fails the request. A checkpoint
+#   is bookkeeping; the operator's session is the thing that must survive. So:
+#     * exit 0 on every path — malformed JSON, empty stdin, no jq, no git, missing
+#       heimdall-checkpoint, unwritable .planning, a writer that reports INCOMPLETE.
+#     * bounded runtime — every child runs under perl's alarm+exec (macOS ships no
+#       timeout(1)); a hung git, a hung jq, a hung writer is killed, not waited on.
+#       HMD_PRECOMPACT_BUDGET (seconds, default 8) caps the writer; the note gets a
+#       fixed 3s. hooks/hooks.json wraps the whole command in a further alarm.
+#     * NOTHING on stdout. For most events Claude Code sends hook stdout to the
+#       debug log only, but the contract this script keeps is stricter than what
+#       the runtime happens to do today: stdout is redirected to /dev/null at the
+#       top, so no child's chatter can ever leak as context. Status goes to stderr,
+#       one line, the same voice as ctx-meter's own compaction advice.
+#   "Could not save" and "saved" are both exit 0. The DIFFERENCE is on stderr,
+#   never in the exit code, because the exit code is the only thing that can hurt.
+#
+# GATE — only projects hmd already manages
+#   Mirrors the SessionEnd hook's own condition: write only when `.planning/` or a
+#   heimdall-state.json / superx-state.json exists in the project dir. A repo hmd
+#   has never touched must not grow a .planning/ directory because its operator
+#   pressed /compact.
+#
+# USAGE
+#   heimdall-precompact-checkpoint [--repo <dir>]     # payload on stdin
+#   heimdall-precompact-checkpoint help
+#   Project dir resolution: --repo > CLAUDE_PROJECT_DIR > payload .cwd > $PWD.
+#
+# EXIT STATUS
+#   0  always (see FAILS OPEN). `help` also exits 0.
+
+set -u
+
+# stdout is context-adjacent on a hook; nothing this script or its children print
+# may reach it. Keep a handle to the original stderr for our own status line.
+exec 1>/dev/null
+
+BUDGET="${HMD_PRECOMPACT_BUDGET:-8}"
+case "$BUDGET" in ''|*[!0-9]*) BUDGET=8 ;; esac
+[ "$BUDGET" -ge 1 ] 2>/dev/null || BUDGET=8
+
+say() { printf '[heimdall] %s\n' "$*" >&2; }
+
+_timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown"; }
+
+# Wall-clock ceiling for one child. perl alarm+exec is the portable substitute for
+# timeout(1) on macOS. If perl is missing we still run the child — the enclosing
+# hooks.json command carries its own alarm, and an unbounded run is still exit 0.
+_bounded() {
+  local secs="$1"; shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Sibling bin/ tool by THIS script's location, never PATH — a PATH shim must not be
+# able to redirect the writer, and a copy of this file with no sibling must fail
+# open (that is the missing-binary test).
+_sibling_tool() {
+  local self bindir
+  self="$0"
+  command -v readlink >/dev/null 2>&1 && self="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+  bindir="$(cd "$(dirname "$self")" 2>/dev/null && pwd)"
+  [ -x "$bindir/$1" ] && printf '%s' "$bindir/$1"
+}
+
+# Pull one string field out of the payload. jq when present (bounded — jq on a
+# hostile payload must not stall us); a sed fallback otherwise. Empty on any miss.
+_field() { # <json> <key>
+  local json="$1" key="$2" v=""
+  if command -v jq >/dev/null 2>&1; then
+    v="$(printf '%s' "$json" | _bounded 3 jq -r --arg k "$key" '.[$k] // empty | select(type=="string")' 2>/dev/null)" || v=""
+  else
+    v="$(printf '%s' "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' 2>/dev/null | head -1)" || v=""
+  fi
+  printf '%s' "$v"
+}
+
+_help() {
+  cat >&2 <<'USAGE'
+heimdall-precompact-checkpoint — PreCompact hook: checkpoint before context is compacted
+
+Usage:
+  heimdall-precompact-checkpoint [--repo <dir>]   Read the PreCompact payload on stdin,
+                                                  record a compaction note, then run
+                                                  `heimdall-checkpoint write <dir>`.
+  heimdall-precompact-checkpoint help
+
+Always exits 0; status on stderr only; stdout is always empty.
+Env: HMD_PRECOMPACT_BUDGET  seconds allowed for the writer (default 8).
+USAGE
+}
+
+main() {
+  local repo_arg="" input trigger sid cwd project_dir ckpt ts rc
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo_arg="${2:-}"; shift 2 || break ;;
+      --repo=*) repo_arg="${1#--repo=}"; shift ;;
+      help|--help|-h) _help; return 0 ;;
+      *) shift ;;
+    esac
+  done
+
+  # Read the payload. Capped so a runaway stdin cannot hold us; a closed/empty
+  # stdin yields an empty string, which every step below tolerates.
+  input="$(head -c 262144 2>/dev/null)" || input=""
+
+  trigger="$(_field "$input" trigger)"
+  case "$trigger" in manual|auto) ;; *) trigger="unknown" ;; esac
+  sid="$(_field "$input" session_id)"
+  cwd="$(_field "$input" cwd)"
+
+  if [ -n "$repo_arg" ]; then project_dir="$repo_arg"
+  elif [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then project_dir="$CLAUDE_PROJECT_DIR"
+  elif [ -n "$cwd" ]; then project_dir="$cwd"
+  else project_dir="$PWD"
+  fi
+  project_dir="$(cd "$project_dir" 2>/dev/null && pwd)" || {
+    say "compaction ($trigger) — no checkpoint: project dir unresolvable; compaction proceeds"
+    return 0
+  }
+
+  if ! { [ -d "$project_dir/.planning" ] || [ -f "$project_dir/heimdall-state.json" ] || [ -f "$project_dir/superx-state.json" ]; }; then
+    say "compaction ($trigger) — no checkpoint: $project_dir has no .planning/ (not an hmd-managed project); compaction proceeds"
+    return 0
+  fi
+
+  ckpt="$(_sibling_tool heimdall-checkpoint)"
+  if [ -z "$ckpt" ]; then
+    say "compaction ($trigger) — no checkpoint: bin/heimdall-checkpoint not found beside this hook; compaction proceeds (run /hmd:save after)"
+    return 0
+  fi
+
+  ts="$(_timestamp)"
+
+  # The note store is keyed by the writer's $PWD (bin/lib/resume-contract.sh
+  # rc_home), so the note is recorded FROM the project dir. Non-fatal: a lost note
+  # costs one line of provenance, not the checkpoint.
+  ( cd "$project_dir" 2>/dev/null && _bounded 3 "$ckpt" note in-progress \
+      "compaction ($trigger) at $ts${sid:+ session $sid} — checkpoint auto-taken by the PreCompact hook before context was rewritten; if the resumed session feels thin, this is where the detail went" \
+      >/dev/null 2>&1 ) || true
+
+  _bounded "$BUDGET" "$ckpt" write "$project_dir" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0)   say "compaction ($trigger) — checkpoint saved to $project_dir/.planning/CHECKPOINT.md before context rewrite" ;;
+    3)   say "compaction ($trigger) — checkpoint written but INCOMPLETE (a resume field did not survive; see .planning/CHECKPOINT.md); compaction proceeds — run /hmd:save after" ;;
+    142) say "compaction ($trigger) — checkpoint writer exceeded ${BUDGET}s and was stopped; compaction proceeds — run /hmd:save after" ;;
+    *)   say "compaction ($trigger) — checkpoint writer exited $rc; compaction proceeds — run /hmd:save after" ;;
+  esac
+  return 0
+}
+
+main "$@" || true
+exit 0
