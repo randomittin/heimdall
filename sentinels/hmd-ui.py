@@ -17,7 +17,7 @@ Auth, in this order, on EVERY route:
     1. Host header must be 127.0.0.1:<port> or localhost:<port>   -> else 403
        (DNS-rebinding defence: a page on evil.example resolving to 127.0.0.1 still
        sends Host: evil.example, and is refused before the token is even looked at)
-    2. per-launch token (`?t=` query or X-Heimdall-UI-Token header), compared with
+    2. per-launch token (`?token=` query or X-Heimdall-UI-Token header), compared with
        hmac.compare_digest                                          -> else 401
 
 Never read, in any form: .heimdall/team.json, *.key/*.pem/*.seed, ~/.omniroute/*,
@@ -67,6 +67,14 @@ SOURCE_FILES = (
     ".heimdall/receipts/last-sweep.json", # full-sweep receipt
     ".planning/CHECKPOINT.md",            # header fields only, first 8 KB
     ".planning/reels/",                   # directory listing: name + mtime only
+    ".planning/metrics.jsonl",            # last graded parallelism row (tail only)
+)
+# Under $TMPDIR: parallelism-tracker's live per-session counters (key=value text).
+# READ ONLY. `parallelism-tracker grade` is deliberately NOT called: it is the
+# SessionEnd action -- it appends a metrics.jsonl row and unlinks the session state,
+# so polling it every 2s would wipe the counters the real SessionEnd grade reads.
+SOURCE_TMP_FILES = (
+    "heimdall-parallel/<session>.state",
 )
 # Outside the repo: hmd_ledger's per-repo mirror under $HEIMDALL_HOME/ledger/.
 SOURCE_HOME_FILES = (
@@ -75,7 +83,6 @@ SOURCE_HOME_FILES = (
 )
 SOURCE_COMMANDS = (
     ("heimdall-hooks", "list", "--json"),
-    ("parallelism-tracker", "grade"),
     ("edit-tracker", "paths"),
     ("heimdall-state", "check-quality-gates"),
     ("heimdall-fallback", "status", "--json"),
@@ -197,15 +204,21 @@ def collect_identity(root):
     return {"handle": handle or None, "haid": haid or None, "branch": branch or None}
 
 
+LEDGER_EMPTY = {"daemon": None, "gates": [], "verdict": None, "team": [], "team_overflow": 0}
+
+
 def collect_ledger(root):
     if LEDGER is None:
-        return None
+        return dict(LEDGER_EMPTY)
+    # Session id keyed by ROOT: hmd_ledger's 5s file cache is per session id, and two
+    # `hmd ui` instances on different repos must never serve each other's ledger.
+    sid = "hmd-ui-" + hashlib.sha256(root.encode("utf-8")).hexdigest()[:12]
     try:
-        st = LEDGER.read_status("hmd-ui", repo=root)
+        st = LEDGER.read_status(sid, repo=root)
     except Exception:
-        return None
+        return dict(LEDGER_EMPTY)
     if not isinstance(st, dict):
-        return None
+        return dict(LEDGER_EMPTY)
     return {
         "daemon": st.get("daemon", "down"),
         "gates": list(st.get("gates") or []),
@@ -243,7 +256,7 @@ def collect_roster(root):
 def collect_quality_gate(root):
     rc, out, err = _run(("heimdall-state", "check-quality-gates"), root)
     if rc is None:
-        return None
+        return {"clear_to_push": None, "reason": None}
     text = (out or "") + "\n" + (err or "")
     reason = ""
     for line in text.splitlines():
@@ -272,41 +285,114 @@ HOOK_KEYS = ("id", "event", "locked", "enabled", "description")
 def collect_hooks(root):
     data = _run_json(("heimdall-hooks", "list", "--json"), root)
     if not isinstance(data, list):
-        return None
+        return []
     return [{k: h.get(k) for k in HOOK_KEYS} for h in data if isinstance(h, dict)]
 
 
 def collect_fallback(root):
     data = _run_json(("heimdall-fallback", "status", "--json"), root)
     if not isinstance(data, dict):
-        return None
+        return {k: None for k in FALLBACK_ALLOWED_KEYS}
     # Decision 4: never forward endpoint / operator_key_* / config_path.
     return {k: data.get(k) for k in FALLBACK_ALLOWED_KEYS}
 
 
-_PAR_RE = re.compile(
-    r"(\d+)\s+batched\s*/\s*(\d+)\s+turns\s*\(ratio\s+([\d.]+),\s*(\d+)\s+calls\)"
-    r"(?:\s*\|\s*agents:\s*(\d+)\s+calls?(?:,\s*(\d+)\s+batched)?)?"
-)
+PARALLELISM_KEYS = ("batched", "turns", "ratio", "calls", "agent_calls", "agent_batched")
+METRICS_TAIL_BYTES = 65536
 
 
-def parse_parallelism(line):
-    m = _PAR_RE.search(line or "")
-    if not m:
+def parallelism_empty():
+    out = {k: None for k in PARALLELISM_KEYS}
+    out["source"] = None
+    return out
+
+
+def _parallelism_shape(batched, turns, calls, agent_calls, agent_batched, source):
+    ratio = round(batched / turns, 2) if turns else 0.0
+    return {"batched": batched, "turns": turns, "ratio": ratio, "calls": calls,
+            "agent_calls": agent_calls, "agent_batched": agent_batched, "source": source}
+
+
+def _tracker_state_dir():
+    tmp = os.environ.get("TMPDIR") or "/tmp"
+    return os.path.join(tmp, "heimdall-parallel")
+
+
+def _tracker_state_path():
+    """The live counters file parallelism-tracker maintains (state_path() in
+    bin/parallelism-tracker.c). With no session id in our env, the most recently
+    touched session's file is the one the operator is looking at."""
+    sid = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("SESSION_ID")
+    d = _tracker_state_dir()
+    if sid:
+        return os.path.join(d, sid + ".state")
+    try:
+        cands = [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".state")]
+        return max(cands, key=os.path.getmtime) if cands else None
+    except (OSError, ValueError):
         return None
-    g = m.groups()
-    return {
-        "batched": int(g[0]), "turns": int(g[1]), "ratio": float(g[2]), "calls": int(g[3]),
-        "agent_calls": int(g[4]) if g[4] is not None else 0,
-        "agent_batched": int(g[5]) if g[5] is not None else 0,
-    }
+
+
+def parse_tracker_state(text):
+    """`key=value` lines, exactly what write_state_atomic() emits. Unknown keys ignored."""
+    vals = {}
+    for line in (text or "").splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        try:
+            vals[k.strip()] = int(v.strip())
+        except ValueError:
+            continue
+    if "total_turns" not in vals or "calls" not in vals:
+        return None
+    if vals.get("calls", 0) == 0:
+        return None
+    return _parallelism_shape(vals.get("batch_turns", 0), vals["total_turns"], vals["calls"],
+                              vals.get("agent_calls", 0), vals.get("agent_batched", 0), "live")
+
+
+def parse_metrics_tail(text):
+    """The LAST `metric: parallelism` row of .planning/metrics.jsonl -- the most recent
+    graded session, used when no live counters exist."""
+    for line in reversed((text or "").splitlines()):
+        line = line.strip()
+        if not line or '"parallelism"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("metric") == "parallelism":
+            try:
+                return _parallelism_shape(int(row.get("batch_turns", 0)), int(row.get("total_turns", 0)),
+                                          int(row.get("total_calls", 0)), int(row.get("agent_calls", 0)),
+                                          int(row.get("agent_batched", 0)), "last_graded")
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _read_tail(path, nbytes):
+    if path_is_denied(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            return f.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
 
 
 def collect_parallelism(root):
-    rc, out, _ = _run(("parallelism-tracker", "grade"), root)
-    if rc is None:
-        return None
-    return parse_parallelism(_first_line(out))
+    spath = _tracker_state_path()
+    live = parse_tracker_state(_read_text(spath)) if spath else None
+    if live:
+        return live
+    graded = parse_metrics_tail(_read_tail(os.path.join(root, ".planning", "metrics.jsonl"), METRICS_TAIL_BYTES))
+    return graded if graded else parallelism_empty()
 
 
 def collect_edits(root):
@@ -330,8 +416,12 @@ _CKPT_FIELD_RE = re.compile(r"^-\s+\*\*(Branch|HEAD|Phase|Uncommitted files|Open
 
 
 def parse_checkpoint_header(text):
-    """Header fields of the auto-checkpoint block only -- never the free-text body.
-    Stops at the first `###` sub-heading, which is where the body begins."""
+    """The five mechanically-written fields of the auto-checkpoint block -- never the
+    free-text body. Only lines matching `- **<Field>:** value` for exactly those
+    field names are consumed; every other line in the block (In progress, Refuted
+    claims, the worktree ledger ...) is skipped unread. Scanning ends at the block's
+    `:end` marker. `Open warnings` sits under the first `###` sub-heading in the real
+    writer's output, which is why the scan is field-keyed rather than heading-bounded."""
     if not text or "heimdall-auto-checkpoint:begin" not in text:
         return None
     fields = {}
@@ -342,10 +432,10 @@ def parse_checkpoint_header(text):
             continue
         if not started:
             continue
-        if line.startswith("### "):
+        if "heimdall-auto-checkpoint:end" in line:
             break
         m = _CKPT_FIELD_RE.match(line.strip())
-        if m:
+        if m and m.group(1) not in fields:
             fields[m.group(1)] = m.group(2).strip()
     if not fields:
         return None
@@ -385,26 +475,28 @@ def collect_reels(root):
 
 
 def collect_state(root):
-    """The section-4 contract. Each slice degrades to null independently."""
-    def safe(fn):
+    """The section-4 contract. Each slice degrades independently: object-typed
+    slices keep their keys with null values, array slices go empty, and the two
+    `| null` slices (sweep_receipt, checkpoint) go null -- never an error."""
+    def safe(fn, empty=None):
         try:
             return fn(root)
         except Exception:
-            return None
+            return empty() if callable(empty) else empty
     return {
         "schema_version": SCHEMA_VERSION,
         "ts": time.time(),
         "repo": root,
-        "identity": safe(collect_identity),
-        "ledger": safe(collect_ledger),
-        "roster": safe(collect_roster),
-        "quality_gate": safe(collect_quality_gate),
+        "identity": safe(collect_identity, lambda: {"handle": None, "haid": None, "branch": None}),
+        "ledger": safe(collect_ledger, lambda: dict(LEDGER_EMPTY)),
+        "roster": safe(collect_roster, list),
+        "quality_gate": safe(collect_quality_gate, lambda: {"clear_to_push": None, "reason": None}),
         "sweep_receipt": safe(collect_sweep_receipt),
-        "hooks": safe(collect_hooks),
-        "fallback": safe(collect_fallback),
-        "parallelism": safe(collect_parallelism),
+        "hooks": safe(collect_hooks, list),
+        "fallback": safe(collect_fallback, lambda: {k: None for k in FALLBACK_ALLOWED_KEYS}),
+        "parallelism": safe(collect_parallelism, parallelism_empty),
         "checkpoint": safe(collect_checkpoint),
-        "reels": safe(collect_reels),
+        "reels": safe(collect_reels, list),
         "edits": safe(collect_edits),
     }
 
@@ -524,7 +616,7 @@ class UIHandler(BaseHTTPRequestHandler):
     def _token_ok(self, query):
         presented = self.headers.get("X-Heimdall-UI-Token") or ""
         if not presented:
-            vals = query.get("t") or []
+            vals = query.get("token") or []
             presented = vals[0] if vals else ""
         if not presented:
             return False
@@ -561,7 +653,9 @@ class UIHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._serve_page()
         elif path == "/api/state":
-            state, _digest = self.server.cache.latest()
+            # Always a FRESH collection: a source deleted a moment ago must read as
+            # null now, not after the next poll tick (no caching beyond the digest).
+            state, _digest = self.server.cache.refresh()
             self._send_json(200, state)
         elif path == "/api/events":
             self._serve_events()
@@ -621,6 +715,8 @@ def print_sources(root):
         print("file %s" % os.path.join(root, rel))
     for rel in SOURCE_HOME_FILES:
         print("file %s" % os.path.join(home, rel))
+    for rel in SOURCE_TMP_FILES:
+        print("file %s" % os.path.join(os.environ.get("TMPDIR") or "/tmp", rel))
     print("file %s" % PAGE_PATH)
     for argv in SOURCE_COMMANDS:
         print("exec %s" % shlex.join([os.path.join(BIN_DIR, argv[0])] + list(argv[1:])))
@@ -668,7 +764,7 @@ def main(argv=None):
         sys.stderr.write("hmd ui: cannot bind 127.0.0.1:%d: %s\n" % (args.port, e))
         return 2
     cache.start()
-    url = "http://127.0.0.1:%d/?t=%s" % (server.port, token)
+    url = "http://127.0.0.1:%d/?token=%s" % (server.port, token)
     print(url, flush=True)
     if not args.no_open:
         threading.Thread(target=webbrowser.open_new_tab, args=(url,), daemon=True).start()

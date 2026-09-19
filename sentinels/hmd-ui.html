@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>hmd ui</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #5f6b7a; --line: #dfe4ea;
+    --pass: #1f8a4c; --run: #b9770e; --deny: #c0392b; --accent: #2f6fed; --flash: #fff4c2;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1218; --panel: #171b23; --ink: #e6e9ef; --muted: #98a2b3; --line: #2a3140;
+      --pass: #3ddc84; --run: #f5b942; --deny: #ff6b5e; --accent: #7aa2ff; --flash: #3a3413;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--sans); }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline;
+           padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { margin: 0; font-size: 16px; letter-spacing: .04em; }
+  header .who { font-family: var(--mono); color: var(--muted); }
+  header .live { margin-left: auto; font-family: var(--mono); font-size: 12px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px;
+         background: var(--muted); vertical-align: middle; }
+  .dot.on { background: var(--pass); }
+  .dot.off { background: var(--deny); }
+  main { display: grid; gap: 14px; padding: 16px 20px 32px;
+         grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+            padding: 12px 14px; min-height: 96px; transition: background .9s ease; }
+  section.changed { background: var(--flash); transition: none; }
+  section h2 { margin: 0 0 8px; font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+               color: var(--muted); display: flex; justify-content: space-between; }
+  section h2 .src { font-weight: normal; letter-spacing: 0; text-transform: none; font-family: var(--mono); }
+  .big { font-size: 22px; font-weight: 600; }
+  .pass { color: var(--pass); } .running { color: var(--run); } .deny { color: var(--deny); }
+  .muted { color: var(--muted); }
+  .nodata { color: var(--muted); font-style: italic; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { text-align: left; padding: 3px 6px 3px 0; vertical-align: top; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  tr:last-child td { border-bottom: none; }
+  .tag { display: inline-block; font-family: var(--mono); font-size: 11px; padding: 1px 6px;
+         border: 1px solid var(--line); border-radius: 4px; color: var(--muted); }
+  .tag.locked { border-color: var(--run); color: var(--run); }
+  .tag.off { border-color: var(--deny); color: var(--deny); }
+  .tag.on { border-color: var(--pass); color: var(--pass); }
+  ul.plain { margin: 0; padding: 0; list-style: none; }
+  ul.plain li { padding: 2px 0; }
+  footer { padding: 8px 20px 24px; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  footer .diff { word-break: break-word; }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#9881; HEIMDALL &middot; hmd ui</h1>
+  <span class="who" id="identity">&mdash;</span>
+  <span class="who" id="repo"></span>
+  <span class="live"><span class="dot" id="livedot"></span><span id="livetext">connecting</span></span>
+</header>
+
+<main>
+  <section id="p-verdict"><h2>Gate verdict <span class="src">ledger.verdict</span></h2><div id="verdict" class="nodata">no data</div></section>
+  <section id="p-quality"><h2>Quality gate (push) <span class="src">quality_gate</span></h2><div id="quality" class="nodata">no data</div></section>
+  <section id="p-sweep"><h2>Sweep receipt <span class="src">sweep_receipt</span></h2><div id="sweep" class="nodata">no data</div></section>
+  <section id="p-gates"><h2>Gates <span class="src">ledger.gates</span></h2><div id="gates" class="nodata">no data</div></section>
+  <section id="p-team"><h2>Team <span class="src">roster &middot; ledger.team</span></h2><div id="team" class="nodata">no data</div></section>
+  <section id="p-agents"><h2>Agents / parallelism <span class="src">parallelism &middot; edits</span></h2><div id="agents" class="nodata">no data</div></section>
+  <section id="p-hooks" style="grid-column: 1 / -1"><h2>Hooks <span class="src">hooks</span></h2><div id="hooks" class="nodata">no data</div></section>
+  <section id="p-checkpoint"><h2>Checkpoint <span class="src">checkpoint</span></h2><div id="checkpoint" class="nodata">no data</div></section>
+  <section id="p-fallback"><h2>Fallback / routing <span class="src">fallback</span></h2><div id="fallback" class="nodata">no data</div></section>
+  <section id="p-reels"><h2>Reels <span class="src">reels</span></h2><div id="reels" class="nodata">no data</div></section>
+</main>
+
+<footer>
+  <div id="stamp">waiting for the first frame&hellip;</div>
+  <div class="diff" id="diff"></div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  var token = new URLSearchParams(location.search).get("token") || "";
+  var prev = null;
+  var flashTimers = {};
+
+  function esc(v) {
+    return String(v == null ? "" : v)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function el(id) { return document.getElementById(id); }
+  function setHTML(id, html) {
+    var node = el(id);
+    if (html == null || html === "") {
+      node.className = "nodata";
+      node.textContent = "no data";
+      return;
+    }
+    node.className = "";
+    node.innerHTML = html;
+  }
+  function stateClass(s) {
+    s = String(s || "").toLowerCase();
+    if (s === "pass" || s === "ok" || s === "green") { return "pass"; }
+    if (s === "running" || s === "run" || s === "pending") { return "running"; }
+    if (s === "deny" || s === "fail" || s === "red") { return "deny"; }
+    return "muted";
+  }
+  function glyph(s) {
+    var c = stateClass(s);
+    return c === "pass" ? "✓" : c === "running" ? "▶" : c === "deny" ? "✗" : "○";
+  }
+  function fmtAge(sec) {
+    if (sec == null || isNaN(sec)) { return ""; }
+    sec = Math.round(sec);
+    if (sec < 60) { return sec + "s"; }
+    if (sec < 3600) { return Math.round(sec / 60) + "m"; }
+    return (sec / 3600).toFixed(1) + "h";
+  }
+
+  // ── panel renderers: each takes its slice of the contract ────────────────
+  function renderHeader(s) {
+    var id = s.identity || {};
+    var parts = [id.handle, id.haid, id.branch].filter(Boolean).map(esc);
+    el("identity").innerHTML = parts.length ? parts.join(" &middot; ") : "identity unknown";
+    el("repo").textContent = s.repo || "";
+  }
+  function renderVerdict(led) {
+    if (!led || !led.verdict || !led.verdict.state) { return null; }
+    var v = led.verdict;
+    return '<div class="big ' + stateClass(v.state) + '">' + glyph(v.state) + " " + esc(v.state) + "</div>" +
+           '<div class="mono">' + esc(v.label || "") + "</div>" +
+           '<div class="muted">daemon ' + esc(led.daemon || "unknown") + "</div>";
+  }
+  function renderQuality(q) {
+    if (!q || q.clear_to_push == null) { return null; }
+    var cls = q.clear_to_push ? "pass" : "deny";
+    return '<div class="big ' + cls + '">' + glyph(q.clear_to_push ? "pass" : "deny") + " " +
+           (q.clear_to_push ? "clear to push" : "push blocked") + "</div>" +
+           '<div class="mono">' + esc(q.reason || "") + "</div>";
+  }
+  function renderSweep(r) {
+    if (!r) { return null; }
+    var cls = (r.suites_failed === 0 && r.suites_total > 0) ? "pass" : (r.suites_failed > 0 ? "deny" : "muted");
+    return '<div class="big ' + cls + '">' + esc(r.suites_passed) + "/" + esc(r.suites_total) + "</div>" +
+           '<div class="mono">' + esc(r.duration_s) + "s &middot; head " + esc(String(r.head_sha || "").slice(0, 8)) +
+           " &middot; tree " + (r.tree_clean ? "clean" : "dirty") + "</div>" +
+           '<div class="muted mono">' + esc(r.finished_at || "") + "</div>";
+  }
+  function renderGates(led) {
+    if (!led || !led.gates || !led.gates.length) { return null; }
+    return '<ul class="plain mono">' + led.gates.map(function (g) {
+      return '<li><span class="' + stateClass(g.state) + '">' + glyph(g.state) + "</span> " +
+             esc(g.id) + ' <span class="muted">' + esc(g.detail || "") + "</span></li>";
+    }).join("") + "</ul>";
+  }
+  function renderTeam(roster, led) {
+    var rows = [];
+    (roster || []).forEach(function (m) {
+      rows.push("<tr><td>" + (m.online ? '<span class="dot on"></span>' : '<span class="dot"></span>') +
+                esc(m.handle || m.haid) + '</td><td class="mono">' + esc(m.branch || "") + "</td><td>" +
+                esc(m.state || "") + '</td><td class="mono muted">' + fmtAge(m.age_seconds) + "</td></tr>");
+    });
+    var have = {};
+    (roster || []).forEach(function (m) { have[m.handle] = true; });
+    ((led && led.team) || []).forEach(function (t) {
+      if (have[t.user]) { return; }
+      rows.push('<tr><td><span class="dot"></span>' + esc(t.user) + '</td><td class="mono">' +
+                esc(t.branch || "") + "</td><td>" + esc(t.state || "") + '</td><td class="mono muted">' +
+                esc(t.sigil || "") + "</td></tr>");
+    });
+    if (!rows.length) { return null; }
+    var more = led && led.team_overflow ? '<div class="muted">+' + esc(led.team_overflow) + " more</div>" : "";
+    return "<table><tr><th>who</th><th>branch</th><th>state</th><th>age</th></tr>" + rows.join("") + "</table>" + more;
+  }
+  function renderAgents(p, e) {
+    var hasGrade = p && p.batched != null;
+    if (!hasGrade && !e) { return null; }
+    var out = "";
+    if (hasGrade) {
+      out += '<div class="big">' + esc(p.batched) + ' <span class="muted">batched /</span> ' + esc(p.turns) +
+             ' <span class="muted">turns</span></div>' +
+             '<div class="mono">ratio ' + esc(p.ratio) + " &middot; " + esc(p.calls) + " calls &middot; agents: " +
+             esc(p.agent_calls) + " calls, " + esc(p.agent_batched) + " batched</div>";
+    } else {
+      out += '<div class="nodata">no parallelism grade</div>';
+    }
+    if (e) {
+      out += '<div class="muted" style="margin-top:6px">' + esc(e.count) + " file(s) edited this session</div>";
+      if (e.paths && e.paths.length) {
+        out += '<ul class="plain mono">' + e.paths.slice(0, 12).map(function (x) { return "<li>" + esc(x) + "</li>"; }).join("") +
+               (e.paths.length > 12 ? '<li class="muted">+' + (e.paths.length - 12) + " more</li>" : "") + "</ul>";
+      }
+    }
+    return out;
+  }
+  function renderHooks(hooks) {
+    if (!hooks || !hooks.length) { return null; }
+    return "<table><tr><th>id</th><th>event</th><th>locked</th><th>enabled</th><th>description</th></tr>" +
+      hooks.map(function (h) {
+        return '<tr><td class="mono">' + esc(h.id) + '</td><td class="mono muted">' + esc(h.event) + "</td><td>" +
+               (h.locked ? '<span class="tag locked">locked</span>' : '<span class="tag">advisory</span>') + "</td><td>" +
+               (h.enabled ? '<span class="tag on">on</span>' : '<span class="tag off">off</span>') + "</td><td>" +
+               esc(h.description || "") + "</td></tr>";
+      }).join("") + "</table>";
+  }
+  function renderCheckpoint(c) {
+    if (!c) { return null; }
+    var warn = c.push_gate_open_warning ? '<div class="deny">' + esc(c.push_gate_open_warning) + "</div>" : "";
+    return '<div class="mono">branch ' + esc(c.branch || "?") + " &middot; HEAD " + esc(c.head || "?") + "</div>" +
+           '<div class="mono">phase ' + esc(c.phase || "unknown") + " &middot; " +
+           esc(c.uncommitted_files == null ? "?" : c.uncommitted_files) + " uncommitted</div>" + warn;
+  }
+  function renderFallback(f) {
+    if (!f || f.state == null) { return null; }
+    var cls = f.state === "full_switch" ? "deny" : "pass";
+    return '<div class="big ' + cls + '">' + esc(f.state || "unknown") + "</div>" +
+           '<div class="mono">target provider: ' + esc(f.target_provider || "none") + "</div>";
+  }
+  function renderReels(r) {
+    if (!r || !r.length) { return null; }
+    return '<ul class="plain mono">' + r.slice(0, 8).map(function (x) {
+      return "<li>" + esc(x.name) + ' <span class="muted">' + new Date(x.mtime * 1000).toLocaleString() + "</span></li>";
+    }).join("") + "</ul>";
+  }
+
+  // ── diff-and-patch: only panels whose slice changed are re-rendered ──────
+  var panels = [
+    { id: "verdict",    pick: function (s) { return s.ledger && s.ledger.verdict; },       draw: function (s) { return renderVerdict(s.ledger); } },
+    { id: "quality",    pick: function (s) { return s.quality_gate; },                     draw: function (s) { return renderQuality(s.quality_gate); } },
+    { id: "sweep",      pick: function (s) { return s.sweep_receipt; },                    draw: function (s) { return renderSweep(s.sweep_receipt); } },
+    { id: "gates",      pick: function (s) { return s.ledger && s.ledger.gates; },         draw: function (s) { return renderGates(s.ledger); } },
+    { id: "team",       pick: function (s) { return [s.roster, s.ledger && s.ledger.team]; }, draw: function (s) { return renderTeam(s.roster, s.ledger); } },
+    { id: "agents",     pick: function (s) { return [s.parallelism, s.edits]; },           draw: function (s) { return renderAgents(s.parallelism, s.edits); } },
+    { id: "hooks",      pick: function (s) { return s.hooks; },                            draw: function (s) { return renderHooks(s.hooks); } },
+    { id: "checkpoint", pick: function (s) { return s.checkpoint; },                       draw: function (s) { return renderCheckpoint(s.checkpoint); } },
+    { id: "fallback",   pick: function (s) { return s.fallback; },                         draw: function (s) { return renderFallback(s.fallback); } },
+    { id: "reels",      pick: function (s) { return s.reels; },                            draw: function (s) { return renderReels(s.reels); } }
+  ];
+
+  function flash(panelId) {
+    var sec = el("p-" + panelId);
+    sec.classList.add("changed");
+    clearTimeout(flashTimers[panelId]);
+    flashTimers[panelId] = setTimeout(function () { sec.classList.remove("changed"); }, 1400);
+  }
+
+  function apply(state) {
+    renderHeader(state);
+    var changed = [];
+    panels.forEach(function (p) {
+      var now = JSON.stringify(p.pick(state) === undefined ? null : p.pick(state));
+      var before = prev ? JSON.stringify(p.pick(prev) === undefined ? null : p.pick(prev)) : undefined;
+      if (before === now) { return; }
+      setHTML(p.id, p.draw(state));
+      if (prev) { changed.push(p.id); flash(p.id); }
+    });
+    var when = new Date((state.ts || Date.now() / 1000) * 1000).toLocaleTimeString();
+    el("stamp").textContent = (prev ? "frame " : "first frame ") + when + " · schema v" + esc(state.schema_version);
+    if (prev && changed.length) { el("diff").textContent = "changed: " + changed.join(", "); }
+    prev = state;
+  }
+
+  function setLive(on, text) {
+    el("livedot").className = "dot " + (on ? "on" : "off");
+    el("livetext").textContent = text;
+  }
+
+  function connect() {
+    if (!token) {
+      setLive(false, "no token in URL");
+      el("stamp").textContent = "open the exact URL `hmd ui` printed (it carries ?token=...)";
+      return;
+    }
+    var es = new EventSource("/api/events?token=" + encodeURIComponent(token));
+    es.onopen = function () { setLive(true, "live (2s)"); };
+    es.onmessage = function (ev) {
+      var data;
+      try { data = JSON.parse(ev.data); } catch (err) { setLive(false, "bad frame"); return; }
+      apply(data);
+    };
+    es.onerror = function () {
+      setLive(false, "reconnecting");
+      // EventSource retries on its own; a closed socket (server gone) stays CLOSED.
+      if (es.readyState === EventSource.CLOSED) { setLive(false, "disconnected"); }
+    };
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>
