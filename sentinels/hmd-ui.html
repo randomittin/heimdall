@@ -283,7 +283,8 @@
     Object.keys(attrs || {}).forEach(function (k) {
       var v = attrs[k];
       if (typeof v === "number") { v = isFinite(v) ? String(Math.round(v * 100) / 100) : "0"; }
-      n.setAttribute(k, String(v));
+      // paint goes through style so the CSS custom properties (theme-aware) resolve
+      if (k === "fill" || k === "stroke") { n.style[k] = String(v); } else { n.setAttribute(k, String(v)); }
     });
     return n;
   }

@@ -472,6 +472,322 @@ relied on throughout this very plan's own Wave 1/2 acceptance criteria and
 test tasks, and a real "graph my database" job would use whatever DB client
 the operator's own project already has, not one `hmd` ships.
 
+### Decision 7 — Companion mobile app: relay + QR pairing
+
+> Amendment (2026-09-19). Operator's words: "the app will be communicating
+> with the server and the server will be communicating with the locally
+> running app — like Claude Code remote control; to connect an app session
+> the app should have a QR code scanner that the local running session of
+> hmd shows (terminal or browser) that the app scans and binds to that
+> particular session." Audience: the developer and their dev team. This
+> decision governs a NEW surface layered on top of Decisions 1-6 (unchanged)
+> — the local dashboard stays exactly as landed through Wave 4; this adds a
+> second, independent outbound leg from `hmd` to the existing presence
+> control plane, and a mobile client in a separate repo.
+
+**7.1 — Relay = the existing presence control plane, hmd connects outbound.**
+Chosen: the relay is `bin/lib/cp_server.py`'s dispatch/route seam plus
+`bin/lib/cp_auth.py`'s HAID PKI plus the enrolled Ed25519 identity
+`bin/heimdall-presence beat` already signs with — no new server, no new
+identity system. `hmd` opens an authenticated outbound `GET
+/relay/session/<session_id>/stream` (`text/event-stream`), verified through
+the SAME §3 auth chokepoint (`cp_auth.verify` over a signed per-request
+assertion) every other CP route already requires. The laptop never binds a
+public port; Decision 5's loopback-only local server is unchanged and
+orthogonal — this is a second, independent leg.
+Transport refinement (found, not assumed): a grep of `bin/lib/cp_*.py`
+shows zero existing `text/event-stream`/EventSource usage anywhere in the
+CP; every existing route (`beat`, `enroll`, `dashboard/session/*`) is a
+short bounded request/response, and `cp_worker.py`'s own design note states
+jobs are parented to the SERVER, not to any one client connection, exactly
+because a client can disconnect at any time. Given the relay is
+Cloud-Run-hosted (`cp_state_firestore.py`, `cp_jobrunner.py`'s
+`CloudRunJobRunner`), the stream is a BOUNDED-lifetime SSE connection
+(auto-closes at ~20 minutes) that hmd's own client loop reconnects on
+close/drop — the same "stay attached, tolerate drops, resume" shape
+`heimdall-presence keeper-start`'s detached beat-keeper already uses for a
+fixed-interval beat, re-pointed at a stream-open instead.
+New routes register through the EXISTING seam, no `cp_server.py` route
+logic is rewritten: `register_extended_routes()` (`cp_server.py:726-745`)
+already lazy-imports `cp_session`/`cp_god` and calls each module's own
+`register(home=home)` — a new `cp_relay.register(home=home)` is added
+there, one import line and one dict entry, mirroring exactly how `cp_god`
+was added alongside `cp_session`.
+*Rejected — WebSocket:* no stdlib support, same reason Decision 2 already
+rejected it for the local server; would add a new dependency to a CP that
+is stdlib `http.server`-based end to end.
+*Rejected — short-interval poll instead of streaming:* satisfies
+"outbound-only, no listener" equally well, but the operator's own language
+("like Claude Code remote control") wants near-real-time delivery; SSE is
+chosen for that, poll is noted as the fallback this repo already has
+precedent for (`heimdall-presence beat`) if Cloud Run's connection cost
+model ever makes long-lived GETs impractical (tracked as a risk below, not
+silently assumed away).
+
+**7.2 — QR content and rendering.** Chosen: QR payload is
+`{"v":1,"relay":"<https url>","session_id":"<uuid>","pairing_code":"<26-char base32, ≥128 bits>","exp":<unix epoch, now+60>,"hmd_pubkey":"<base64 X25519 public key>"}`,
+JSON-encoded then QR-encoded, shown two ways by `hmd ui`:
+- **Browser:** an inline `<canvas>` render in `sentinels/hmd-ui.html`, drawn
+  from the JSON string served at a new loopback-only `/api/pair` route
+  (gated by the SAME Decision 5 token as every other companion-UI route),
+  by a small vendored pure-JS QR encoder checked into `sentinels/` as a
+  static file (`sentinels/companion-qr.js`) — no CDN fetch, no npm install,
+  matching Decision 1's "one static HTML file" posture.
+- **Terminal:** a vendored PURE-PYTHON QR encoder (no `qrcode`/`Pillow` pip
+  dependency), `bin/lib/companion_qr.py`, rendering the same payload as
+  half-block Unicode (▀/▄) directly to stdout. Feasibility, evaluated
+  honestly: a dependency-free QR encoder (Reed-Solomon ECC + matrix
+  placement) is roughly 300-500 lines, the same size class this repo
+  already accepts for `bin/lib/watch_data.py` (283 lines); the payload
+  above is ~140 bytes of JSON, comfortably inside QR Version 5-M (134
+  bytes) to Version 6-M (154 bytes) capacity, so ECC level M (15% recovery)
+  fits without needing a symbol too dense to render legibly in a terminal.
+- App scans → sends `{pairing_code, device_pubkey, device_name}` to the
+  relay's claim route (protocol below) → relay binds device↔session, issues
+  a session-scoped token.
+*Rejected — terminal QR via a pip `qrcode` dependency:* reintroduces the
+"new pip dependency for a CLI convenience" problem Decision 1 rejected for
+the whole companion-UI surface.
+*Rejected — browser-only QR:* fails the operator's own stated requirement
+("terminal or browser") and this repo's SSH-headless pattern (Decision 3) —
+an operator on `hmd ui --remote` with no local browser needs the terminal
+path.
+
+**7.3 — End-to-end encryption.** Chosen: **reuse `bin/lib/cp_auth.py`'s own
+guarded-import degrade pattern**, not a fresh `modules/` entry. Finding:
+`cp_auth.py:71-82` already imports `cryptography`'s Ed25519 primitives
+behind a `try/except`, falls back to `pynacl`, else `_BACKEND = None`
+(`crypto_available()` False) — `heimdall-presence` (part of the SAME relay
+this decision extends) already ships this soft dependency today, as a plain
+guarded import with a fail-CLOSED contract (`AuthError('crypto_unavailable')`,
+never a silent allow, `cp_auth.py:122-125`), with no manifest, no
+permission_class, no consent gate. A new sibling `bin/lib/cp_e2e.py` extends
+the SAME pattern with X25519 (ECDH) + ChaCha20Poly1305 (AEAD): same two
+candidate libraries, same probing order, same fail-closed contract
+(`e2e_available()` mirrors `crypto_available()`; when False, pairing
+refuses to complete rather than silently downgrading to relay-plaintext).
+Key agreement: hmd generates an ephemeral X25519 keypair per pairing — the
+public half rides in the QR itself (7.2), NEVER through the relay, so a
+compromised relay cannot substitute its own key without the phone's camera
+seeing a different QR than the one hmd rendered; the phone generates its
+own ephemeral keypair and sends its public half at claim time; both derive
+a shared secret via ECDH + HKDF, and every command/state envelope (schema
+below) is ChaCha20Poly1305-sealed under that session key. The relay only
+ever handles ciphertext plus a plaintext routing envelope (session_id, seq,
+sender) — a dumb pipe, per DATA.md's posture.
+**Cost:** a REAL new dependency surface, but scoped narrowly to the new
+relay-pairing code path only (`bin/lib/cp_e2e.py` and whatever calls it) —
+`sentinels/hmd-ui.py`'s LOCAL loopback server stays stdlib-only exactly as
+landed through Wave 4. An install with neither `cryptography` nor `pynacl`
+present gets E2E refused outright (an actionable error naming both
+packages), never a silent plaintext fallback.
+*Rejected — (a) `openssl` CLI via subprocess:* zero in-repo precedent for
+shelling to `openssl`; X25519+AEAD via subprocess means shipping the
+session key itself through argv/temp-file/stdin plumbing per operation —
+more attack surface (a temp file racing another local process for the key
+material, the exact class of risk `bin/heimdall-presence`'s own atomic
+tmp-rename discipline exists to avoid) than one guarded Python import, for
+no benefit since the destination process is Python either way.
+*Rejected — (b) a fresh opt-in MODULE (`modules/cp-e2e/manifest.json`,
+`omniroute`/`headroom`-shaped):* `modules/` is scoped to THIRD-PARTY
+EXTERNAL TOOLS/SERVICES this repo optionally installs and pins by
+commit/version (a separate process or package with its own
+permission_class, consent gate, invariants suite) — `cryptography`/`pynacl`
+are neither; they are the exact soft-Python-dependency shape `cp_auth.py`
+already imports inline with no manifest at all, because PKI/HAID signing
+needed it and a guarded import with a fail-closed contract was judged
+sufficient ceremony on its own. Wrapping E2E in a `modules/` manifest
+invents new ceremony for a dependency shape this repo has already decided
+doesn't need it.
+*Rejected — (c) no E2E in v1, relay trusted:* violates DATA.md's stated
+posture ("what leaves the machine is opaque") for a channel carrying live
+workflow commands/state through a THIRD LEG (relay) the local dashboard
+never had. Rejected outright, matching every other hard-no in this plan
+(Decision 5's "no auth," Decision 6's "no scrub").
+
+**7.4 — Actions, staged.** **V1 (this cycle, Wave 5a):** read-only mirror of
+the same §4 `/api/state` contract plus the Decision 6 panels array,
+delivered as encrypted `state` frames, plus push notifications for four
+events — gate red↔green transition, "agent done," "needs human," "coop
+routed" — sourced from the SAME `collect_state()` fields Wave 1-4 already
+compute, never a second collection path; plus the Decision 4 Wave 2 safe
+actions (`save-checkpoint`, `view-receipt`, `hook-toggle`-advisory-only,
+`open-reel`), remotely invoked by calling the SAME
+`bin/lib/companion_ui_actions.dispatch(action, params)` Wave 2 already
+built — no second action-dispatch implementation, one allowlist, one place
+it's enforced. **V2 (future cycle, NOT built here):** free-text remote
+prompt-send, gated on a device-trust signal this cycle does not build (a
+persisted, operator-approved device fingerprint or an explicit `hmd ui pair
+--trust`) — a NEXT-CYCLES item. **Never** (identical to Decision 4,
+extended to the relay path because it is a new way to reach the same
+actions): routing/fallback state, `git push`/`git commit`, secrets/PKI/team
+secret, locked hooks. The relay-side dispatcher imports
+`companion_ui_actions.ALLOWED_ACTIONS` directly rather than re-declaring a
+second allowlist.
+
+**7.5 — Binding semantics.** Chosen: one QR = one session — a fresh
+`session_id` per `hmd ui pair` invocation, never reused across attempts.
+When the local `hmd ui` session ends, the relay marks it `ended`; any live
+phone connection receives `{"type":"session_ended"}` (a mobile-side
+"show ended, offer rebind" requirement, specified not built here, Wave
+5b). `hmd ui devices` lists bound device_name/first-paired/last-seen; `hmd
+ui revoke <device_id>` invalidates that device's token relay-side
+immediately — the relay re-validates the token on EVERY request (not
+merely "stop sending new frames"), so revocation takes effect on the very
+next command. The team secret (`X-Heimdall-Team-Secret`) is never read,
+sent, or derived from for pairing — a pairing code is a single-use,
+60-second-window, per-session capability, structurally incapable of being
+replayed into a second binding or reused as a standing credential.
+*Rejected — team-secret-as-pairing-credential:* the team secret is
+long-lived and shared across every enrolled machine, revocable only by
+rotating it for everyone; using it to pair one phone would mean a leaked QR
+screenshot leaks the WHOLE team's standing credential, not one session's
+capability. Rejected outright.
+
+**7.6 — Mobile app repo boundary.** Chosen: the mobile app (Android/iOS)
+lives in a SEPARATE repository, Expo/React Native — matching the
+operator's existing RN work and this repo's own
+`skills/stacks/react-native/PACK.md` stack pack (cold-start RN/Expo
+conventions already written for exactly this agent/repo situation). hmd's
+side of the contract — the ONLY things Wave 5 builds in THIS repo — are the
+relay protocol (7.1), the QR (7.2, both render paths), the encrypted
+channel (7.3), and a `hmd ui pair` subcommand tying them together locally.
+Wave 5b is a SPEC document, not code.
+*Rejected — building the mobile app inside this repo:* a Node/RN toolchain
+(Metro, native Android/iOS build tooling, Xcode/Gradle) is categorically
+heavier than anything else here, which tops out at "python3 stdlib +
+occasional guarded pip import" (7.3) today — vendoring a mobile build chain
+for a client hmd itself never runs or tests in CI would be the largest
+toolchain addition this repo has ever taken on.
+
+**Pairing protocol** (H = hmd, R = relay, P = phone app):
+
+1. Operator runs `hmd ui pair` (or "Pair a device" in the browser). H
+   generates a fresh ephemeral X25519 keypair (`hmd_pub`/`hmd_priv` —
+   `hmd_priv` never leaves the process) and a `session_id` (uuid4).
+2. H signs `{session_id, hmd_haid, ts}` with its own registered Ed25519
+   HAID key (the same key `heimdall-presence beat` signs with) and POSTs it
+   to `POST /relay/pair/init`, authenticated via the existing §3 chokepoint
+   — no new auth mechanism.
+3. R verifies the HAID signature (`cp_auth.verify`, rejects unknown/revoked
+   HAID exactly like every other CP route), mints a `pairing_code`
+   (26-char base32, ≥128 bits, `os.urandom`-sourced) bound to
+   `{session_id, hmd_haid}`, records it in a `cp_state`-backed record (the
+   SAME `put_record`/`get_record` shape `cp_session.py`'s device-code store
+   already uses) with a 60-second expiry, and returns
+   `{session_id, pairing_code, exp}`.
+4. H composes the QR payload and renders it (browser canvas or terminal
+   half-block, per 7.2); `hmd_pub` is embedded directly — it never transits
+   the relay. H immediately opens its `/relay/session/<id>/stream` SSE
+   connection (step 2's aftermath) — already listening before any scan.
+5. Operator opens the app, taps "Scan." P parses the QR JSON, generates its
+   own ephemeral X25519 keypair (`device_pub`/`device_priv`), and derives
+   its shared-secret candidate — held pending, not yet trusted.
+6. P POSTs `{session_id, pairing_code, device_pubkey, device_name}` to
+   `POST /relay/pair/claim` — a PRE-AUTH public route (the phone has no
+   HAID/PKI identity), the same public seam `cp_session.py`'s browser-facing
+   init/status routes already ride.
+7. R validates: `pairing_code` exists, matches `session_id`, has not
+   expired, and has not already been claimed (single-use — the same
+   window-based replay discipline `cp_nonce.py` already applies to signed
+   requests, extended here to a durable "consumed" flag on the record).
+   Any failure returns a generic 401/410 — never a message distinguishing
+   "wrong code" from "expired" from "already claimed," so a replay attempt
+   learns nothing about why it failed.
+8. On success, R: (a) marks `pairing_code` consumed permanently; (b) binds
+   `device_pubkey`↔`session_id` durably; (c) mints a session-scoped
+   CP-signed device token — the EXACT shape `cp_session.py`'s dashboard
+   tokens already use: `base64url(canonical json payload) + "." +
+   base64(sig)`, payload `{session_id, device_pubkey_fp, scope:
+   "session-limited", owner:false, exp: now+SESSION_TTL}`, signed with the
+   CP's own Ed25519 identity via `cp_auth.sign`; (d) pushes
+   `{"type":"device_bound","device_pubkey":...,"device_name":...}` down H's
+   already-open stream.
+9. P receives `{device_token, exp}`. H, on the `device_bound` frame,
+   derives the same shared secret via ECDH(`hmd_priv`, `device_pub`) +
+   HKDF and marks the session bound locally too — both sides now hold an
+   identical session key derived independently; the relay never sees it.
+10. Every subsequent command (phone→hmd) and state frame (hmd→phone) is
+    sealed under that session key before it touches the relay; the relay
+    authenticates the TRANSPORT (device_token per phone→relay request,
+    HAID signature per hmd→relay request) but never decrypts the PAYLOAD.
+11. Session end: H exiting (or re-running `hmd ui`, minting a new session)
+    triggers a signed `POST /relay/session/<id>/end`; R marks it `ended`,
+    and the NEXT frame either open stream receives is
+    `{"type":"session_ended"}`; the device_token is invalidated at the same
+    moment, re-checked on every request — no "eventually expires" gap.
+
+**Message envelope schema** (JSON outer envelope; `ciphertext` is opaque
+ChaCha20Poly1305 output over the inner payload, `null` only for the two
+relay-authored control types):
+
+```json
+{
+  "v": 1,
+  "session_id": "uuid",
+  "seq": 42,
+  "sender": "hmd | device",
+  "type": "state | command | ack | device_bound | session_ended",
+  "nonce": "base64 (12-byte ChaCha20Poly1305 nonce, null for control types)",
+  "ciphertext": "base64 (AEAD-sealed inner payload, opaque to the relay; null for control types)"
+}
+```
+
+Inner payload (post-decrypt), by `type`:
+- `state` — `{"state": <the §4 /api/state JSON shape>, "panels": [...]}`; a
+  new frame is sealed+sent only when the canonical-JSON digest changes,
+  mirroring Decision 2's digest-diff discipline over the encrypted channel
+  too.
+- `command` — `{"action": "save-checkpoint"|"view-receipt"|"hook-toggle"|"open-reel", "params": {...}}`;
+  the relay sees only that a `command`-typed ciphertext arrived, never the
+  action name — hmd's own decrypt-then-dispatch step is the single point
+  that calls `companion_ui_actions.dispatch`.
+- `ack` — `{"of_seq": 42, "ok": true|false, "detail": "..."}`, hmd's reply
+  translating the dispatched action's 200/409/422 into `ok`+`detail`.
+- `device_bound` / `session_ended` — no encrypted inner payload; these are
+  relay-authored control frames the relay legitimately needs to originate,
+  the only two `type` values a client accepts unsealed.
+
+**Threat model.** (1) *Stolen QR screenshot* — the QR is a bearer
+credential for exactly 60 seconds and exactly one claim; a screenshot found
+after expiry is inert, and within the window it is single-use, so a second
+claim hits step 7's "already claimed" branch — the worst a successful race
+achieves is binding the ATTACKER's device instead of the operator's,
+visible immediately in `hmd ui devices` and revocable in one command. (2)
+*Malicious relay* — the relay only ever handles ciphertext for
+`state`/`command`/`ack`; a compromised relay can drop, delay, reorder
+(mitigated by `seq`), or DoS the channel, but cannot read or forge a
+payload without the session key, which it never possesses (`hmd_pub`
+travels only through the QR, step 4). A malicious relay COULD forge
+`device_bound`/`session_ended` (intentionally unencrypted) — worst case is
+a spurious "session ended" (an availability annoyance) or a spoofed
+"device bound" notification the operator can see doesn't match a real scan
+and revoke; neither forgery grants read/write access to real state or
+commands. (3) *Stolen phone* — the device_token is session-scoped,
+TTL-bounded, and `hmd ui revoke` invalidates it relay-side immediately,
+re-checked on every request; the session key lives in the phone's app
+storage — Wave 5b's mobile contract specifies platform secure storage
+(iOS Keychain / Android Keystore) as a REQUIREMENT, the one place this
+design does not control the phone-side implementation. (4) *Replay* —
+every command carries a monotonic `seq`; hmd's stream-consumer rejects a
+`command` whose `seq` does not exceed the last-accepted `seq` for that
+session — a captured-and-replayed ciphertext, even through a fully
+cooperative relay, is refused as stale, the same "check on every request"
+discipline `cp_nonce.py` already applies to the presence beat, extended
+here to a strictly-increasing counter because a command channel, unlike a
+beat, must never re-execute an old instruction.
+
+**No CONFLICT with the zero-toolchain posture — except one, named
+explicitly.** The relay-side routes (`cp_relay.py`) and the terminal/browser
+QR encoders stay stdlib/vendored-JS, zero new dependency. The ONE real
+conflict is 7.3's E2E crypto: `bin/lib/cp_e2e.py` and its callers carry a
+guarded, fail-closed dependency on `cryptography` or `pynacl` — scoped to
+the new relay-pairing code path only, never touching
+`sentinels/hmd-ui.py`'s local loopback server (Decision 1, unchanged
+through Wave 4). This is the same soft-dependency shape `cp_auth.py`
+already carries for HAID PKI, not a new class of risk this repo hasn't
+already accepted once.
+
 ## 4. Data contract — the exact JSON `GET /api/state` and each SSE `data:` frame carry
 
 ```json
@@ -736,6 +1052,151 @@ waves reaches L).
 - **Done when:** every accept/reject pair above is green, the XSS assertion is green, and the falsifiability proof (secret-scrub disabled → red) has been performed and reported once.
 - **Risks & Mitigation:** see table (`impl-authored-gate` — same row as Wave 1's instance, applied here).
 
+### Wave 5 — Relay + QR pairing for the mobile companion app
+
+- **Task:** `companion-relay-invariants`
+- **Wave:** 5a-i
+- **Size:** S
+- **Dependencies:** none (reads only this PLAN's Decision 7, already settled)
+- **Agent:** `hmd:docs-writer`
+- **Model + effort:** `sonnet` + `default`
+- **Read first:** this PLAN's Decision 7 (verbatim), `evals/oracles/companion-ui/INVARIANTS.md` (the sibling to mirror), `bin/lib/cp_nonce.py`, `bin/lib/cp_auth.py:1-140`, `bin/lib/cp_session.py:1-130`
+- **Files:** Create: `evals/oracles/companion-ui/RELAY-INVARIANTS.md`. Modify: `evals/oracles/companion-ui/COVERAGE.md` (append the relay rows from §7 below).
+- **Skills:** `superpowers:writing-plans`
+- **Patterns:** `evals/oracles/companion-ui/INVARIANTS.md`, `evals/oracles/companion-ui/PANEL-INVARIANTS.md` (same transcribe-the-contract shape)
+- **Acceptance criteria:**
+  - [ ] `test -f evals/oracles/companion-ui/RELAY-INVARIANTS.md`
+  - [ ] `grep -q "pairing_code" evals/oracles/companion-ui/RELAY-INVARIANTS.md`
+  - [ ] `grep -qi "single-use\|single use" evals/oracles/companion-ui/RELAY-INVARIANTS.md`
+  - [ ] `grep -q "60" evals/oracles/companion-ui/RELAY-INVARIANTS.md`
+  - [ ] `grep -qi "X25519" evals/oracles/companion-ui/RELAY-INVARIANTS.md`
+  - [ ] `grep -qi "ChaCha20\|AEAD" evals/oracles/companion-ui/RELAY-INVARIANTS.md`
+  - [ ] `grep -qi "seq" evals/oracles/companion-ui/RELAY-INVARIANTS.md`
+  - [ ] `grep -qi "relay" evals/oracles/companion-ui/COVERAGE.md`
+- **Done when:** the pairing-code single-use+60s-expiry rule, the QR payload shape, the E2E key-agreement rule (hmd_pubkey rides the QR, never the relay), the envelope schema, the replay/seq rule, and the never-exposed action list are transcribed as checkable statements, not prose.
+- **Risks & Mitigation:** see table (`INV-drift`, same row as Wave 0/4a, this is its Wave-5 instance).
+
+- **Task:** `companion-mobile-contract`
+- **Wave:** 5b
+- **Size:** S
+- **Dependencies:** none (spec-only, reads this PLAN's Decision 7)
+- **Agent:** `hmd:docs-writer`
+- **Model + effort:** `sonnet` + `default`
+- **Read first:** this PLAN's Decision 7 (verbatim, all of it — protocol, envelope schema, threat model), `skills/stacks/react-native/PACK.md`
+- **Files:** Create: `docs/companion-app/MOBILE-CONTRACT.md`.
+- **Skills:** `superpowers:writing-plans`
+- **Patterns:** none new — this is a spec document, not code; it transcribes Decision 7's protocol into "what the separate mobile repo must implement," mirroring `evals/oracles/companion-ui/INVARIANTS.md`'s transcribe-not-invent discipline
+- **Acceptance criteria:**
+  - [ ] `test -f docs/companion-app/MOBILE-CONTRACT.md`
+  - [ ] `grep -q "pairing_code" docs/companion-app/MOBILE-CONTRACT.md`
+  - [ ] `grep -q "hmd_pubkey" docs/companion-app/MOBILE-CONTRACT.md`
+  - [ ] `grep -qi "keychain\|keystore" docs/companion-app/MOBILE-CONTRACT.md`
+  - [ ] `grep -qi "react-native\|expo" docs/companion-app/MOBILE-CONTRACT.md`
+  - [ ] `grep -q "session_ended" docs/companion-app/MOBILE-CONTRACT.md`
+  - [ ] `grep -q "device_bound" docs/companion-app/MOBILE-CONTRACT.md`
+  - [ ] `grep -qi "X25519" docs/companion-app/MOBILE-CONTRACT.md`
+  - [ ] `grep -qi "V1\|V2" docs/companion-app/MOBILE-CONTRACT.md` (the staged-actions rule, 7.4)
+- **Done when:** a mobile-repo engineer with zero context on this repo can implement QR-scan → claim → derive-shared-secret → open-encrypted-stream → render 13-key state+panels → send the 4 whitelisted V1 actions, entirely from this one document, including the secure-storage requirement (Keychain/Keystore) and the "never build V2 prompt-send / never build routing-fallback / push-commit / secrets / locked-hooks actions" boundary.
+- **Risks & Mitigation:** see table (`mobile-contract-drift`).
+
+- **Task:** `companion-relay-server`
+- **Wave:** 5a-ii
+- **Size:** M
+- **Dependencies:** `companion-relay-invariants`
+- **Agent:** `hmd:coder`
+- **Model + effort:** `sonnet` + `default`
+- **Read first:** `evals/oracles/companion-ui/RELAY-INVARIANTS.md`, this PLAN's Decision 7, `bin/lib/cp_session.py` (whole file — the direct structural precedent: device-code store, pre-auth claim route, CP-signed token mint), `bin/lib/cp_auth.py:1-140` (`verify`, `sign`, `crypto_available`), `bin/lib/cp_nonce.py` (single-use+window precedent), `bin/lib/cp_server.py:1-60,120-170,726-810` (`register_route`, `register_public_route`, `register_extended_routes`), `bin/lib/cp_state.py:1-60,215-345` (`put_record`/`get_record`, Firestore-safe)
+- **Files:** Create: `bin/lib/cp_relay.py` (a `register(home=home)` function mirroring `cp_session.register`'s shape, registering: `POST /relay/pair/init` on the authenticated seam via `register_route` — verifies the caller's HAID signature via `cp_auth.verify`, mints `pairing_code` via `os.urandom`, stores `{session_id, hmd_haid, pairing_code, exp, consumed:false}` via `cp_state.put_record`; `POST /relay/pair/claim` on the PRE-AUTH seam via `register_public_route` — validates the record (exists, matches session_id, unexpired, unconsumed), marks `consumed:true`, stores `device_pubkey`+`device_name` on the session record, mints the CP-signed device token via `cp_auth.sign` in the exact `base64url(payload)+"."+base64(sig)` shape `cp_session.mint_token` already uses; `GET /relay/session/<id>/stream` on the authenticated seam — SSE, verifies the caller's HAID signature, sends queued envelope frames for that session, pushes `device_bound` on claim; `POST /relay/session/<id>/command` on a device-token-authenticated seam — validates the device token (`exp`, `scope`, session binding), enqueues the envelope durably via `cp_state`; `POST /relay/session/<id>/end` on the authenticated seam — marks the session `ended`, invalidates the device token, and the next read either side attempts returns `session_ended`). Modify: `bin/lib/cp_server.py:726-745` (`register_extended_routes`: add `import cp_relay` and `"relay": cp_relay.register(home=home)` to the returned dict, alongside the existing `session`/`god` entries — no other line in this function changes).
+- **Skills:** none (mechanical extension of an existing, well-precedented seam)
+- **Patterns:** `bin/lib/cp_session.py:334-438` (`init_route`/`approve_route`/`status_route` — the exact pre-auth-route-plus-self-gating shape to copy for `pair/init`/`pair/claim`), `bin/lib/cp_session.py:172-198` (`mint_token` — the CP-signed token construction to copy verbatim for the device token)
+- **Acceptance criteria:**
+  - [ ] `grep -q "def register" bin/lib/cp_relay.py`
+  - [ ] `grep -q "pair/init" bin/lib/cp_relay.py`
+  - [ ] `grep -q "pair/claim" bin/lib/cp_relay.py`
+  - [ ] `grep -q "cp_nonce\|consumed" bin/lib/cp_relay.py`
+  - [ ] `grep -q "cp_auth" bin/lib/cp_relay.py`
+  - [ ] `grep -q "cp_state" bin/lib/cp_relay.py`
+  - [ ] `grep -q "text/event-stream" bin/lib/cp_relay.py`
+  - [ ] `grep -q "session_ended" bin/lib/cp_relay.py`
+  - [ ] `python3 -c "import ast; ast.parse(open('bin/lib/cp_relay.py').read())"` exits 0
+  - [ ] `grep -q "cp_relay" bin/lib/cp_server.py`
+  - [ ] `python3 -c "import ast; ast.parse(open('bin/lib/cp_server.py').read())"` exits 0
+- **Done when:** a signed `pair/init` mints a single-use, 60s-expiry pairing code; a valid `pair/claim` binds a device and mints a session-scoped device token; an already-consumed or expired code is refused with an indistinguishable 401/410; `stream`/`command`/`end` round-trip opaque envelopes without ever inspecting `ciphertext`.
+- **Risks & Mitigation:** see table (`pairing-code-race`, `relay-cost-longlived-sse`).
+
+- **Task:** `companion-qr`
+- **Wave:** 5a-ii
+- **Size:** M
+- **Dependencies:** `companion-relay-invariants`
+- **Agent:** `hmd:coder`
+- **Model + effort:** `sonnet` + `default`
+- **Read first:** `evals/oracles/companion-ui/RELAY-INVARIANTS.md`, this PLAN's Decision 7.2, `bin/lib/watch_data.py` (whole file — the size/style precedent for a dependency-free ~300-line stdlib module)
+- **Files:** Create: `bin/lib/companion_qr.py` (a dependency-free QR encoder: Reed-Solomon ECC generation, data/ECC codeword interleaving, matrix placement with the standard finder/alignment/timing patterns and mask selection, fixed to ECC level M; a `render_terminal(payload_bytes) -> str` function producing half-block Unicode (▀/▄) output, and a `__main__` CLI `companion_qr.py --data-json FILE_OR_DASH` that prints the terminal render). Create: `sentinels/companion-qr.js` (a vendored, dependency-free JS QR encoder exposing one function `renderQRToCanvas(text, canvasElement)`, same algorithm, no CDN reference, no build step, checked in as plain static JS matching Decision 1's single-file posture).
+- **Skills:** none (a well-defined, standard, bounded algorithm — QR encoding is a published spec, not an open design question)
+- **Patterns:** `bin/lib/watch_data.py` (module size/style precedent), Decision 1 (no build step, no CDN, no new dependency)
+- **Acceptance criteria:**
+  - [ ] `test -f bin/lib/companion_qr.py`
+  - [ ] `grep -q "def render_terminal" bin/lib/companion_qr.py`
+  - [ ] `python3 -c "import ast; ast.parse(open('bin/lib/companion_qr.py').read())"` exits 0
+  - [ ] `echo '{"v":1,"relay":"https://example.test","session_id":"s","pairing_code":"AAAAAAAAAAAAAAAAAAAAAAAAAA","exp":9999999999,"hmd_pubkey":"AAAA"}' | python3 bin/lib/companion_qr.py --data-json -` exits 0 and prints non-empty output
+  - [ ] `test -f sentinels/companion-qr.js`
+  - [ ] `grep -q "renderQRToCanvas" sentinels/companion-qr.js`
+  - [ ] `grep -qv "cdn\.\|unpkg\.\|jsdelivr" sentinels/companion-qr.js` (no CDN reference)
+- **Done when:** `bin/lib/companion_qr.py --data-json <the QR payload>` prints a scannable terminal QR for a real phone camera (manually verified once at task completion, per Decision 7.2's ECC/capacity sizing), and `sentinels/companion-qr.js`'s `renderQRToCanvas` draws the identical payload to a `<canvas>` with zero external fetches.
+- **Risks & Mitigation:** see table (`qr-encoder-loc`).
+
+- **Task:** `companion-relay-client`
+- **Wave:** 5a-iii
+- **Size:** M
+- **Dependencies:** `companion-relay-server`, `companion-qr` (needs both the live routes to call and the QR renderers to display — sequencing, not file overlap: disjoint file sets from both)
+- **Agent:** `hmd:coder`
+- **Model + effort:** `sonnet` + `default`
+- **Read first:** `evals/oracles/companion-ui/RELAY-INVARIANTS.md`, this PLAN's Decision 7 in full, `bin/lib/cp_relay.py` (as landed), `bin/lib/companion_qr.py` and `sentinels/companion-qr.js` (as landed), `bin/heimdall-ui` (as landed through Wave 4), `sentinels/hmd-ui.py` (as landed through Wave 4), `sentinels/hmd-ui.html` (as landed through Wave 4), `bin/lib/cp_auth.py:1-140` (`sign`, `crypto_available`, `backend_name`)
+- **Files:** Create: `bin/lib/cp_e2e.py` (mirrors `cp_auth.py`'s guarded-import pattern: try `cryptography`'s `X25519PrivateKey`/`ChaCha20Poly1305`, else `pynacl`'s `Box`, else `_BACKEND=None`; `e2e_available()`, `backend_name()`; `generate_keypair()`, `derive_shared_key(priv, peer_pub) -> bytes` via ECDH+HKDF, `seal(key, plaintext) -> (nonce, ciphertext)`, `open_sealed(key, nonce, ciphertext) -> plaintext`; every function raises a structured `E2EUnavailable` when `_BACKEND is None` — fail closed, never silent plaintext). Modify: `bin/heimdall-ui` (add a `pair` subcommand guard clause after the existing `panel` guard clause, before the server-launch flag parser: signs the `pair/init` assertion via `cp_auth.sign`, POSTs it, generates the QR payload, renders it via `bin/lib/companion_qr.py` in the terminal or opens the browser to `/api/pair` per `--browser`/default TTY detection; also add `devices` and `revoke <device_id>` subcommands calling the relay's session-list/end routes). Modify: `sentinels/hmd-ui.py` (add loopback-gated `GET /api/pair` route serving the current pending pairing payload as JSON for the browser QR renderer; add the relay-stream consumer: on receiving a `device_bound` frame, derive the shared key via `cp_e2e.derive_shared_key`; on each poll tick, if a session is bound, seal the current `collect_state()` digest-diffed frame and POST it as a `state` envelope; on receiving a sealed `command` envelope, open it, dispatch via `companion_ui_actions.dispatch`, seal and send the `ack`). Modify: `sentinels/hmd-ui.html` (add a "Pair a device" panel rendering the QR via `companion-qr.js`'s `renderQRToCanvas`, and a bound-devices list with a revoke button per device, calling the new `devices`/`revoke` surface).
+- **Skills:** none
+- **Patterns:** `cp_auth.py:71-93` (the guarded-import + fail-closed shape to copy verbatim for `cp_e2e.py`), `bin/lib/companion_ui_panels.py`'s guard-clause-before-flag-parser shape in `bin/heimdall-ui` (already landed in Wave 4, copy the identical shape for `pair`/`devices`/`revoke`)
+- **Acceptance criteria:**
+  - [ ] `test -f bin/lib/cp_e2e.py`
+  - [ ] `grep -q "e2e_available" bin/lib/cp_e2e.py`
+  - [ ] `grep -q "X25519" bin/lib/cp_e2e.py`
+  - [ ] `grep -q "ChaCha20Poly1305\|pynacl" bin/lib/cp_e2e.py`
+  - [ ] `grep -q "E2EUnavailable" bin/lib/cp_e2e.py`
+  - [ ] `python3 -c "import ast; ast.parse(open('bin/lib/cp_e2e.py').read())"` exits 0
+  - [ ] `grep -q "pair" bin/heimdall-ui`
+  - [ ] `grep -q "devices" bin/heimdall-ui`
+  - [ ] `grep -q "revoke" bin/heimdall-ui`
+  - [ ] `bash -n bin/heimdall-ui` exits 0
+  - [ ] `grep -q "cp_e2e" sentinels/hmd-ui.py`
+  - [ ] `grep -q "api/pair" sentinels/hmd-ui.py`
+  - [ ] `python3 -c "import ast; ast.parse(open('sentinels/hmd-ui.py').read())"` exits 0
+  - [ ] `grep -qi "companion-qr\|renderQRToCanvas" sentinels/hmd-ui.html`
+- **Done when:** `hmd ui pair` prints/shows a QR that a real phone (per Wave 5b's contract) can scan, claim, and derive a shared key against; a bound device receives encrypted `state` frames and can send one of the four V1 actions end-to-end; `hmd ui revoke <id>` cuts a device off within one request cycle.
+- **Risks & Mitigation:** see table (`e2e-dependency-missing`, `hmd-ui-file-overlap`).
+
+- **Task:** `companion-relay-test`
+- **Wave:** 5c
+- **Size:** M
+- **Dependencies:** `companion-relay-server`, `companion-relay-client`
+- **Agent:** `hmd:test-runner` (independent-reference author, same author≠tester rule as `companion-ui-oracle-test`/`companion-ui-panels-test`)
+- **Model + effort:** `sonnet` + `default`
+- **Read first:** `evals/oracles/companion-ui/RELAY-INVARIANTS.md` and this PLAN's Decision 7 ONLY — do not read `bin/lib/cp_relay.py`/`bin/lib/cp_e2e.py`'s implementations before writing assertions
+- **Files:** Create: `test/heimdall-relay-pairing.test.sh`, `test/fixtures/companion-relay/`
+- **Skills:** `superpowers:systematic-debugging`
+- **Patterns:** `test/heimdall-ui-panels.test.sh` (hermetic fixture + token-capture pattern), `test/heimdall-watch-live.test.sh:83-84` (macOS `timeout`/`gtimeout` portability)
+- **Acceptance criteria** (every line is the test script's own body):
+  - [ ] a signed `pair/init` against a local test instance of the relay returns a `pairing_code` and the pairing record is retrievable server-side but the code is NOT yet consumed
+  - [ ] `pair/claim` with the correct code+session_id inside the 60s window succeeds and returns a valid CP-signed device token (verified via `cp_auth.verify_raw`-equivalent check against the CP's known test public key)
+  - [ ] `pair/claim` with the SAME code a second time (after a first successful claim) returns 401/410, never 200 — the single-use assertion
+  - [ ] `pair/claim` with a code whose `exp` has passed returns 401/410
+  - [ ] **race assertion (seeded, jittered, not fixed-yield):** fire N=20 concurrent `pair/claim` requests carrying the SAME valid unexpired code, each request preceded by a randomized `sleep` of 0-50ms drawn from a per-run seed printed to stdout for reproducibility, swept over at least 5 distinct seeds; assert exactly ONE of the 20 ever receives 200 across every seed, and the other 19 receive 401/410 — never zero successes, never more than one
+  - [ ] a `command` envelope sent with a `seq` less than or equal to the last-accepted `seq` for that session is refused (replay assertion)
+  - [ ] a `device_bound` frame delivered on the stream is unencrypted (`ciphertext:null`) and a client that receives ANY other `type` with `ciphertext:null` rejects it (control-frame-forgery-surface assertion, mirroring the threat model's point 2)
+  - [ ] falsifiability proof (performed once, not committed): in a LOCAL COPY of `bin/lib/cp_relay.py`, comment out the `consumed` check inside the claim handler, re-run the single-use and race assertions above, confirm BOTH go RED (a second claim and/or more than one concurrent claim succeeds), then discard the edit — report this red-then-green proof in the completion summary
+- **Oracle gate:** No `evals/oracles/registry.json` domain matches (`jq -r '.oracles|keys[]' evals/oracles/registry.json` lists `emulator-gb, exchange-lob, issue-collection, ponytail-underdelivery, rr-multitenant-isolation, symbol-reuse, team-checkpoint, team-copilot, triage-coord` — none is a pairing/relay-protocol domain, same absence already flagged for `companion-ui-oracle-test`/`companion-ui-panels-test`). `gate_type` is `example`+`verdict` (planted accept/reject/expiry fixtures plus HTTP-status verdicts) PLUS the seeded concurrent-race assertion above, which is the falsifiable stand-in for a `property` check on this target's one genuinely concurrent invariant (single-use-under-contention) — swept over multiple random seeds rather than a fixed-yield dispatch, per the Oracle-Gate Protocol's tautological-concurrency-gate rule. `independent: true` — authored by `hmd:test-runner` from `RELAY-INVARIANTS.md` and Decision 7 only, in a separate wave-slot from `hmd:coder`'s `companion-relay-server`/`companion-relay-client`.
+- **Verify:** `bash test/heimdall-relay-pairing.test.sh`
+- **Done when:** every assertion above is green across all swept seeds, and the falsifiability proof (consumed-check disabled → single-use AND race assertions both red) has been performed and reported once.
+- **Risks & Mitigation:** see table (`impl-authored-gate` — same row as Wave 1/4's instance, applied here; `race-assertion-flake`).
+
 ## 7. Coverage matrix
 
 | Subsystem | In scope? | Oracle row affected | Expected result |
@@ -757,6 +1218,15 @@ waves reaches L).
 | Per-panel access control (viewing panel A but not panel B) | descoped this cycle | none | not built — every panel visible to whoever holds the Decision 5 token, same as every other `/api/state` field |
 | In-browser panel authoring/editing | descoped (publish is CLI-only, per Decision 6) | none | not built |
 | Historical panel data / time-travel across updates | descoped (only the latest `data` per `id` is ever shown) | none | not built |
+| Relay pairing: init/claim/single-use/expiry | yes | `companion-relay-test` (Wave 5) | green |
+| Relay pairing: concurrent-claim race (exactly one winner) | yes | `companion-relay-test`'s seeded race assertion | green |
+| E2E channel: X25519+ChaCha20Poly1305 seal/open, replay-by-seq rejection | yes | `companion-relay-test` | green |
+| V1 mobile actions: read-only state+panels mirror, 4 notifications, 4 whitelisted safe actions | yes | `companion-relay-test` + manual end-to-end check against a real device (Wave 5c) | green |
+| Mobile app itself (Android/iOS binaries, UI, native build) | descoped — separate repo (Decision 7.6) | none in this repo | not built here; `docs/companion-app/MOBILE-CONTRACT.md` is the only deliverable |
+| V2 remote free-text prompt-send | descoped this cycle (Decision 7.4) | none | not built |
+| Push notification delivery transport (APNs/FCM registration) | descoped this cycle — Wave 5b's contract specifies WHAT to notify, not HOW the mobile OS delivers it | none | not built; a NEXT-CYCLES item if the separate mobile repo needs it |
+| A true two-device (real phone + real laptop) network test in CI | descoped — no phone hardware in CI, same "self-loopback proof only" honesty already applied to Wave 3's SSH test | `companion-relay-test`'s assertions run against a local test harness, not a physical phone | expected-skip of the physical-device leg, documented not silent |
+| Device-trust persistence for V2 gating | descoped this cycle (no V2 built) | none | not built |
 
 ## 8. Risks
 
