@@ -172,5 +172,16 @@ fi
   && ok "16. state lives in \$HEIMDALL_HOME/hooks-disabled only" \
   || bad "16. state written elsewhere"
 
+# ── 17. list --json outputs valid JSON with correct keys and values ───────────
+out="$("$TOOL" list --json --metadata "$META" 2>/dev/null)"
+meta_count="$(jq '.hooks | length' "$META")"
+if jq -e --argjson count "$meta_count" \
+      'length == $count and ([.[] | select(.id == "stub-gate") | .locked] | .[0] == true)' \
+      <<<"$out" >/dev/null 2>&1; then
+  ok "17. list --json: valid JSON, correct count, stub-gate locked"
+else
+  bad "17. list --json: jq validation failed (count=$meta_count, out_len=${#out})"
+fi
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

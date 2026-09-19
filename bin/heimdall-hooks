@@ -169,26 +169,35 @@ def cmd_list(args):
             state = "enabled"
         rows.append((
             hid,
-            "%s[%d]" % (entry.get("event", "?"), entry.get("index", -1)),
+            entry.get("event", "?"),
+            entry.get("index", -1),
             entry.get("matcher") or "*",
-            state,
+            locked,
+            locked or (hid not in disabled),
             entry.get("description", ""),
         ))
     if args.json:
         print(json.dumps([
-            {"id": r[0], "where": r[1], "matcher": r[2], "state": r[3], "description": r[4]}
+            {"id": r[0], "event": r[1], "index": r[2], "matcher": r[3],
+             "locked": r[4], "enabled": r[5], "description": r[6]}
             for r in rows
         ], indent=2))
         return 0
     header = ("ID", "WHERE", "MATCHER", "STATE", "DESCRIPTION")
     widths = [len(h) for h in header]
     for row in rows:
+        display = (row[0], "%s[%d]" % (row[1], row[2]), row[3],
+                   (row[4] and "locked") or ("DISABLED" if not row[5] else "enabled"),
+                   row[6])
         for i in range(4):
-            widths[i] = max(widths[i], len(row[i]))
+            widths[i] = max(widths[i], len(display[i]))
     fmt = "  ".join("%%-%ds" % w for w in widths[:4]) + "  %s"
     print(fmt % header)
     for row in rows:
-        print(fmt % row)
+        display = (row[0], "%s[%d]" % (row[1], row[2]), row[3],
+                   (row[4] and "locked") or ("DISABLED" if not row[5] else "enabled"),
+                   row[6])
+        print(fmt % display)
     stale = sorted(disabled - {e.get("id") for e in entries})
     if stale:
         sys.stderr.write("heimdall-hooks: %s names unknown id(s): %s\n"
