@@ -54,6 +54,35 @@
   .tag.on { border-color: var(--pass); color: var(--pass); }
   ul.plain { margin: 0; padding: 0; list-style: none; }
   ul.plain li { padding: 2px 0; }
+  /* ── job panels (Wave 4): dataviz reference palette -- categorical slots in fixed
+     order (never cycled), status colours reserved for the number delta only ── */
+  :root {
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300;
+    --good: #006300; --critical: #d03b3b; --grid: #e1e0d9; --axis: #c3c2b7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300;
+      --good: #0ca30c; --critical: #d03b3b; --grid: #2c2c2a; --axis: #383835;
+    }
+  }
+  .panel-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .jp { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; min-width: 0; }
+  .jp.stale { opacity: .55; border-style: dashed; }
+  .jp h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+  .jp h3 .meta { margin-left: auto; font-family: var(--mono); font-size: 11px; font-weight: normal; color: var(--muted); white-space: nowrap; }
+  .jp .tag.stale { border-color: var(--run); color: var(--run); }
+  .jp pre { margin: 0; max-height: 240px; overflow: auto; font: 12px/1.4 var(--mono); white-space: pre-wrap; word-break: break-word; }
+  .jp .delta { font-family: var(--mono); font-size: 13px; margin-left: 8px; }
+  .jp .delta.up { color: var(--good); } .jp .delta.down { color: var(--critical); }
+  .jp svg { width: 100%; height: 150px; display: block; overflow: visible; }
+  .jp svg text { font: 10px var(--mono); fill: var(--muted); }
+  .jp .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .jp .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .jp .md ul { margin: 2px 0; padding-left: 18px; }
+  .jp .md code { font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 0 4px; border-radius: 3px; }
+  .jp .unsupported { color: var(--deny); font-style: italic; }
+  .jp table td { max-width: 260px; overflow-wrap: anywhere; }
   footer { padding: 8px 20px 24px; color: var(--muted); font-family: var(--mono); font-size: 12px; }
   footer .diff { word-break: break-word; }
 </style>
@@ -77,6 +106,7 @@
   <section id="p-checkpoint"><h2>Checkpoint <span class="src">checkpoint</span></h2><div id="checkpoint" class="nodata">no data</div></section>
   <section id="p-fallback"><h2>Fallback / routing <span class="src">fallback</span></h2><div id="fallback" class="nodata">no data</div></section>
   <section id="p-reels"><h2>Reels <span class="src">reels</span></h2><div id="reels" class="nodata">no data</div></section>
+  <section id="p-jobpanels" style="grid-column: 1 / -1"><h2>Job panels <span class="src">panels &middot; .heimdall/ui/panels/&lt;id&gt;.json</span></h2><div id="jobpanels" class="nodata">no panels &mdash; publish one with <code>hmd ui panel set &lt;id&gt; --type &lt;t&gt; --title &lt;s&gt; --data-json &lt;file|-&gt;</code></div></section>
 </main>
 
 <footer>
@@ -231,6 +261,290 @@
     }).join("") + "</ul>";
   }
 
+  // ── job panels (Wave 4, Decision 6) ──────────────────────────────────────
+  // Every renderer below builds DOM nodes and sets textContent. No panel-supplied
+  // string is ever concatenated into an HTML string or assigned to innerHTML, so
+  // the escape-first-then-substitute invariant holds by construction: the only
+  // tags in the output are the ones this code creates. Numbers reach SVG only
+  // after Number() coercion; labels reach it only through textContent.
+  var PANEL_TYPES = ["kv", "table", "number", "timeseries", "bars", "markdown", "log-tail"];
+  var SERIES_VARS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6"];   // fixed order, never cycled
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  var MAX_MARKER_POINTS = 40;
+
+  function mk(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) { n.className = cls; }
+    if (text != null) { n.textContent = String(text); }
+    return n;
+  }
+  function svgEl(tag, attrs) {
+    var n = document.createElementNS(SVG_NS, tag);
+    Object.keys(attrs || {}).forEach(function (k) {
+      var v = attrs[k];
+      if (typeof v === "number") { v = isFinite(v) ? String(Math.round(v * 100) / 100) : "0"; }
+      n.setAttribute(k, String(v));
+    });
+    return n;
+  }
+  function num(v) { var n = Number(v); return isFinite(n) ? n : 0; }
+  function seriesColor(i) { return "var(" + SERIES_VARS[Math.min(i, SERIES_VARS.length - 1)] + ")"; }
+  function shortLabel(v, n) { var s = String(v == null ? "" : v); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+  function fmtNumber(v, format) {
+    if (typeof v === "string") { return v; }
+    var n = num(v);
+    if (format === "duration_s") {
+      if (n < 60) { return Math.round(n) + "s"; }
+      if (n < 3600) { return Math.floor(n / 60) + "m " + Math.round(n % 60) + "s"; }
+      return (n / 3600).toFixed(1) + "h";
+    }
+    if (format === "bytes") {
+      var u = ["B", "KB", "MB", "GB", "TB"], i = 0;
+      while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+      return (i ? n.toFixed(1) : String(Math.round(n))) + " " + u[i];
+    }
+    if (format === "percent") { return (Math.round(n * 10) / 10) + "%"; }
+    return n.toLocaleString();
+  }
+  function scalarText(v) {
+    if (v == null) { return "—"; }
+    if (typeof v === "boolean") { return v ? "true" : "false"; }
+    if (typeof v === "number") { return fmtNumber(v, "count"); }
+    return String(v);
+  }
+
+  function drawKv(d) {
+    var t = mk("table");
+    (d.rows || []).forEach(function (r) {
+      var tr = mk("tr");
+      tr.appendChild(mk("td", "muted", r[0]));
+      tr.appendChild(mk("td", "mono", scalarText(r[1])));
+      t.appendChild(tr);
+    });
+    return t;
+  }
+  function drawTable(d) {
+    var t = mk("table"), head = mk("tr");
+    (d.columns || []).forEach(function (c) { head.appendChild(mk("th", null, c)); });
+    t.appendChild(head);
+    (d.rows || []).forEach(function (r) {
+      var tr = mk("tr");
+      r.forEach(function (c) { tr.appendChild(mk("td", typeof c === "number" ? "mono" : null, scalarText(c))); });
+      t.appendChild(tr);
+    });
+    return t;
+  }
+  function drawNumber(d) {
+    var box = mk("div");
+    var big = mk("span", "big", fmtNumber(d.value, d.format));
+    box.appendChild(big);
+    if (d.delta != null && isFinite(Number(d.delta))) {
+      // dataviz status palette + icon + label: a delta never carries meaning by colour alone.
+      var dv = num(d.delta);
+      var cls = dv > 0 ? "delta up" : dv < 0 ? "delta down" : "delta muted";
+      var glyphTxt = dv > 0 ? "▲ " : dv < 0 ? "▼ " : "▬ ";
+      box.appendChild(mk("span", cls, glyphTxt + (dv > 0 ? "+" : "") + fmtNumber(dv, d.format)));
+    }
+    return box;
+  }
+  function seriesOf(d, xKey, yKey) {
+    // Normalise single-series {x,y} / {labels,values} and multi-series {series:[...]}
+    // into [{name, x, y}], capped at the six categorical slots.
+    if (Array.isArray(d.series)) {
+      return d.series.slice(0, SERIES_VARS.length).map(function (s) {
+        return { name: String(s.name || ""), x: s.x || [], y: (s.y || []).map(num) };
+      });
+    }
+    return [{ name: "", x: d[xKey] || [], y: (d[yKey] || []).map(num) }];
+  }
+  function yDomain(series) {
+    var lo = 0, hi = 0, any = false;
+    series.forEach(function (s) { s.y.forEach(function (v) { any = true; lo = Math.min(lo, v); hi = Math.max(hi, v); }); });
+    if (!any) { return [0, 1]; }
+    if (hi === lo) { hi = lo + 1; }
+    return [lo, hi];
+  }
+  function chartFrame(series, dom) {
+    // One axis, three recessive hairlines with y labels, a baseline. W=320 H=150 viewBox.
+    var W = 320, H = 150, L = 40, R = 8, T = 8, B = 22;
+    var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, preserveAspectRatio: "none", role: "img" });
+    var g = { svg: svg, W: W, H: H, L: L, R: R, T: T, B: B, dom: dom,
+              y: function (v) { return T + (H - T - B) * (1 - (v - dom[0]) / (dom[1] - dom[0])); } };
+    [0, 0.5, 1].forEach(function (f) {
+      var v = dom[0] + (dom[1] - dom[0]) * f, yy = g.y(v);
+      svg.appendChild(svgEl("line", { x1: L, x2: W - R, y1: yy, y2: yy, stroke: "var(--grid)", "stroke-width": 1 }));
+      var lab = svgEl("text", { x: L - 4, y: yy + 3, "text-anchor": "end" });
+      lab.textContent = fmtNumber(v, "count");
+      svg.appendChild(lab);
+    });
+    if (dom[0] < 0 && dom[1] > 0) {
+      svg.appendChild(svgEl("line", { x1: L, x2: W - R, y1: g.y(0), y2: g.y(0), stroke: "var(--axis)", "stroke-width": 1 }));
+    }
+    return g;
+  }
+  function legendFor(series) {
+    // dataviz: a legend for >= 2 series, none for one (the title names it).
+    if (series.length < 2) { return null; }
+    var lg = mk("div", "legend");
+    series.forEach(function (s, i) {
+      var item = mk("span"), sw = mk("i");
+      sw.style.background = seriesColor(i);
+      item.appendChild(sw);
+      item.appendChild(document.createTextNode(s.name || ("series " + (i + 1))));
+      lg.appendChild(item);
+    });
+    return lg;
+  }
+  function drawTimeseries(d) {
+    var series = seriesOf(d, "x", "y"), g = chartFrame(series, yDomain(series));
+    var maxN = Math.max.apply(null, series.map(function (s) { return s.y.length; }).concat([1]));
+    var xAt = function (i) { return g.L + (g.W - g.L - g.R) * (maxN > 1 ? i / (maxN - 1) : 0.5); };
+    series.forEach(function (s, si) {
+      if (!s.y.length) { return; }
+      var pts = s.y.map(function (v, i) { return xAt(i) + "," + g.y(v); }).join(" ");
+      g.svg.appendChild(svgEl("polyline", { points: pts, fill: "none", stroke: seriesColor(si), "stroke-width": 2,
+                                            "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      if (s.y.length <= MAX_MARKER_POINTS) {
+        s.y.forEach(function (v, i) {
+          var c = svgEl("circle", { cx: xAt(i), cy: g.y(v), r: 4, fill: seriesColor(si), stroke: "var(--panel)", "stroke-width": 2 });
+          var tip = svgEl("title", {});
+          tip.textContent = (s.name ? s.name + " · " : "") + scalarText(s.x[i]) + ": " + fmtNumber(v, "count");
+          c.appendChild(tip);
+          g.svg.appendChild(c);
+        });
+      }
+      // selective direct label: the latest value only, in ink not series colour
+      var last = s.y.length - 1, lab = svgEl("text", { x: Math.min(xAt(last) + 4, g.W - 2), y: g.y(s.y[last]) - 5, "text-anchor": xAt(last) > g.W * 0.8 ? "end" : "start" });
+      lab.textContent = fmtNumber(s.y[last], "count");
+      g.svg.appendChild(lab);
+    });
+    var first = series[0].x[0], lastX = series[0].x[series[0].x.length - 1];
+    if (first != null) { var a = svgEl("text", { x: g.L, y: g.H - 6 }); a.textContent = shortLabel(first, 22); g.svg.appendChild(a); }
+    if (lastX != null && series[0].x.length > 1) { var b = svgEl("text", { x: g.W - g.R, y: g.H - 6, "text-anchor": "end" }); b.textContent = shortLabel(lastX, 22); g.svg.appendChild(b); }
+    var wrap = mk("div"); wrap.appendChild(g.svg);
+    var lg = legendFor(series); if (lg) { wrap.appendChild(lg); }
+    return wrap;
+  }
+  function drawBars(d) {
+    var series = seriesOf(d, "labels", "values"), g = chartFrame(series, yDomain(series));
+    var n = Math.max.apply(null, series.map(function (s) { return s.y.length; }).concat([1]));
+    var slot = (g.W - g.L - g.R) / n, gap = 2, inner = Math.max(1, (slot - gap) / series.length - gap);
+    var base = g.y(Math.max(0, g.dom[0]));
+    series.forEach(function (s, si) {
+      s.y.forEach(function (v, i) {
+        var x = g.L + slot * i + gap / 2 + si * (inner + gap), y0 = g.y(v);
+        var top = Math.min(y0, base), h = Math.max(1, Math.abs(base - y0));
+        var r = svgEl("rect", { x: x, y: top, width: inner, height: h, rx: 2, fill: seriesColor(si) });
+        var tip = svgEl("title", {});
+        tip.textContent = (s.name ? s.name + " · " : "") + scalarText(s.x[i]) + ": " + fmtNumber(v, "count");
+        r.appendChild(tip);
+        g.svg.appendChild(r);
+      });
+    });
+    var labels = series[0].x, step = Math.max(1, Math.ceil(n / 8));
+    labels.forEach(function (lab, i) {
+      if (i % step) { return; }
+      var t = svgEl("text", { x: g.L + slot * i + slot / 2, y: g.H - 6, "text-anchor": "middle" });
+      t.textContent = shortLabel(lab, Math.max(3, Math.floor(slot * step / 6)));
+      g.svg.appendChild(t);
+    });
+    var wrap = mk("div"); wrap.appendChild(g.svg);
+    var lg = legendFor(series); if (lg) { wrap.appendChild(lg); }
+    return wrap;
+  }
+  function mdInline(parent, text) {
+    // Exactly two inline substitutions (**bold**, `code`), applied as DOM nodes over
+    // plain text -- no link syntax, no raw HTML pass-through.
+    var re = /(\*\*[^*\n]+?\*\*|`[^`\n]+?`)/g, last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) { parent.appendChild(document.createTextNode(text.slice(last, m.index))); }
+      var tok = m[0];
+      if (tok.charAt(0) === "`") { parent.appendChild(mk("code", null, tok.slice(1, -1))); }
+      else { parent.appendChild(mk("strong", null, tok.slice(2, -2))); }
+      last = m.index + tok.length;
+    }
+    if (last < text.length) { parent.appendChild(document.createTextNode(text.slice(last))); }
+  }
+  function drawMarkdown(d) {
+    // Decision 6's four substitutions -- bold, code, leading "- " to <li>, newline to
+    // <br> -- realised as node construction, which is escape-first by definition.
+    var box = mk("div", "md"), ul = null, prevText = false;
+    String(d.text == null ? "" : d.text).split("\n").forEach(function (line) {
+      if (line.indexOf("- ") === 0) {
+        if (!ul) { ul = mk("ul"); box.appendChild(ul); }
+        var li = mk("li"); mdInline(li, line.slice(2)); ul.appendChild(li);
+        prevText = false;
+        return;
+      }
+      ul = null;
+      if (prevText) { box.appendChild(mk("br")); }
+      mdInline(box, line);
+      prevText = true;
+    });
+    return box;
+  }
+  function drawLogTail(d) {
+    return mk("pre", null, (d.lines || []).map(function (l) { return String(l); }).join("\n"));
+  }
+  var PANEL_DRAW = { kv: drawKv, table: drawTable, number: drawNumber, timeseries: drawTimeseries,
+                     bars: drawBars, markdown: drawMarkdown, "log-tail": drawLogTail };
+
+  function drawJobPanel(p, nowS) {
+    var art = mk("article", "jp" + (p.stale ? " stale" : ""));
+    art.setAttribute("data-id", String(p.id));
+    var h = mk("h3", null, p.title);
+    var meta = mk("span", "meta", String(p.type) + " · " + fmtAge(nowS - num(p.updated_at)) + " ago");
+    if (p.stale) { meta.appendChild(document.createTextNode(" ")); meta.appendChild(mk("span", "tag stale", "stale")); }
+    h.appendChild(meta);
+    art.appendChild(h);
+    var draw = PANEL_DRAW[p.type];
+    var body;
+    if (!draw || PANEL_TYPES.indexOf(p.type) < 0) {
+      body = mk("div", "unsupported", "unsupported type: " + shortLabel(p.type, 40));
+    } else {
+      try { body = draw(p.data || {}); }
+      catch (err) { body = mk("div", "unsupported", "could not render this panel's data"); }
+    }
+    art.appendChild(body);
+    return art;
+  }
+  var jobPanelPrev = {};
+  function renderJobPanels(list, nowS) {
+    var host = el("jobpanels");
+    list = Array.isArray(list) ? list : [];
+    if (!list.length) {
+      if (host.className !== "nodata") {
+        host.className = "nodata";
+        host.textContent = "no panels — publish one with hmd ui panel set <id> --type <t> --title <s> --data-json <file|->";
+        jobPanelPrev = {};
+      }
+      return;
+    }
+    host.className = "panel-grid";
+    var seen = {}, keys = {};
+    list.forEach(function (p) {
+      var id = String(p.id);
+      seen[id] = true;
+      keys[id] = JSON.stringify([p.title, p.type, p.data, p.stale, Math.floor(num(p.updated_at) / 30)]);
+    });
+    Array.prototype.slice.call(host.children).forEach(function (child) {
+      var id = child.getAttribute("data-id");
+      if (!seen[id] || jobPanelPrev[id] !== keys[id]) { host.removeChild(child); delete jobPanelPrev[id]; }
+    });
+    var cursor = host.firstChild;
+    list.forEach(function (p) {
+      var id = String(p.id);
+      if (jobPanelPrev[id] === keys[id]) {
+        // unchanged: keep the existing node, advance past it
+        while (cursor && cursor.getAttribute("data-id") !== id) { cursor = cursor.nextSibling; }
+        if (cursor) { cursor = cursor.nextSibling; }
+        return;
+      }
+      host.insertBefore(drawJobPanel(p, nowS), cursor);
+      jobPanelPrev[id] = keys[id];
+    });
+  }
+
   // ── diff-and-patch: only panels whose slice changed are re-rendered ──────
   var panels = [
     { id: "verdict",    pick: function (s) { return s.ledger && s.ledger.verdict; },       draw: function (s) { return renderVerdict(s.ledger); } },
@@ -262,7 +576,14 @@
       setHTML(p.id, p.draw(state));
       if (prev) { changed.push(p.id); flash(p.id); }
     });
-    var when = new Date((state.ts || Date.now() / 1000) * 1000).toLocaleTimeString();
+    var nowS = state.ts || Date.now() / 1000;
+    var panelsNow = JSON.stringify(state.panels || []);
+    var panelsBefore = prev ? JSON.stringify(prev.panels || []) : undefined;
+    if (panelsNow !== panelsBefore) {
+      renderJobPanels(state.panels, nowS);
+      if (prev) { changed.push("panels"); flash("jobpanels"); }
+    }
+    var when = new Date(nowS * 1000).toLocaleTimeString();
     el("stamp").textContent = (prev ? "frame " : "first frame ") + when + " · schema v" + esc(state.schema_version);
     if (prev && changed.length) { el("diff").textContent = "changed: " + changed.join(", "); }
     prev = state;

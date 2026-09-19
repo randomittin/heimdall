@@ -11,7 +11,12 @@ tester can assert the deny-list against it.
 Routes (all GET):
     /                 the single static page (sentinels/hmd-ui.html)
     /api/state        the section-4 JSON contract, built fresh from the sources
+                      (+ Wave 4's additive `panels` array: .heimdall/ui/panels/<id>.json
+                      through bin/lib/companion_ui_panels.read_panels -- validated,
+                      secret-scrubbed, capped, `stale`-flagged, TTL-reaped)
     /api/events       text/event-stream; a `data:` frame only when the digest changes
+                      (the digest covers `panels`, so a `hmd ui panel set` lands within
+                      one poll)
 
 Auth, in this order, on EVERY route:
     1. Host header must be 127.0.0.1:<port> or localhost:<port>   -> else 403
@@ -752,7 +757,7 @@ class UIHandler(BaseHTTPRequestHandler):
         try:
             while True:
                 if digest != seen:
-                    frame = "id: %s\ndata: %s\n\n" % (digest, json.dumps(state, ensure_ascii=False))
+                    frame = "id: %s\ndata: %s\n\n" % (digest, json_for_wire(state))
                     self.wfile.write(frame.encode("utf-8"))
                     self.wfile.flush()
                     seen = digest
