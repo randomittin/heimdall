@@ -7,9 +7,9 @@
 
 # Heimdall 🛡️
 
-**Every PR ships the runnable evidence that the fix passes.**
+**Heimdall makes your coding agent's work pass a test it didn't write — and proves that test can fail — before the push lands.**
 
-A cloud bot that fixes your GitHub issues and opens a proven PR. You review, you merge. The bot opens it on a `heimdall/*` branch **as a scoped GitHub App** — never as you, never on `main`, and it never self-merges. A human always gates the merge.
+A Claude Code plugin. One prompt in, a gated, receipted change out. The gate is a plain git pre-push hook, so it holds in any repo and also gates [Cursor CLI](#also-gates-cursor-cli). Your agent's own tests are a claim; the oracle Heimdall wires is external, and it is first shown to go red on a planted defect before its green is trusted.
 
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-e056a0?style=flat-square)](https://code.claude.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-9b59b6?style=flat-square)](LICENSE)
@@ -17,33 +17,54 @@ A cloud bot that fixes your GitHub issues and opens a proven PR. You review, you
 [![Version](https://img.shields.io/badge/version-2.4.3-00d4ff?style=flat-square)](CHANGELOG.md)
 <!-- HEIMDALL:VERSION:END -->
 
----
+**Install** — pinned to a tag and sha256-checked; if the digest fails, nothing runs ([what it writes to your machine](#install) · [what leaves it](DATA.md)):
 
-## Get a bot PR on your repo
+<!-- HEIMDALL:PIN:TAG,SHA256:BEGIN -->
+```bash
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.4.3/install.sh -o heimdall-install.sh \
+  && echo "a03c15bfdddd096f3152204c047dbf6888b34194592b0707ee82a892da147a67  heimdall-install.sh" | shasum -a 256 -c - \
+  && bash heimdall-install.sh
+```
+<!-- HEIMDALL:PIN:END -->
 
-Once you've installed the Heimdall Maintainer GitHub App on your repo and run `claude setup-token`, it's two commands:
+**Run first:**
 
 ```bash
-rr connect                                    # registers your App install + captures your Claude cred
-rr "fix the flaky test in payments and open a PR"
+hmd demo
 ```
 
-**What happens:** `rr` signs your task with your own Ed25519 key and enqueues it. A gated worker clones your repo with **your team's** Claude subscription and **your** GitHub App installation, runs the issue-resolution loop until the fix passes the gates, and opens a `heimdall/*` PR on your repo. You review it. You merge it.
+Dry by default — scaffolds a fully-specified full-stack task into `./heimdall-demo-app` and prints the paste-ready next step; it executes nothing until you add `--run`. On a terminal, the first-ever run also plays the narrated build in which a planted credential is caught by the real `bin/secret-scan` gate — deny → fix → pass — the same arc every gated change goes through.
 
-**Nothing to paste — no token, no URL.** The public control plane is baked in and enrollment is automatic: your first signed call registers this device on first use. Just `rr connect` and go. (Running your own deployment, or need to re-gate enrollment behind a bootstrap token? That's an operator concern — see [`OPERATORS.md`](OPERATORS.md).)
+**Check the proof yourself, no trust required (~1 min, network-free after the clone):**
 
-### Why it's safe to point at your repo
+```bash
+git clone https://github.com/randomittin/heimdall && cd heimdall
+bin/falsify exchange-lob --assert-score 1.0   # every mutant must turn the gate RED, or exit non-zero
+bin/falsify emulator-gb  --assert-score 1.0
+```
 
-- **Tenant isolation is a falsifiable oracle, not a promise.** Every cross-tenant attack — IDOR by repo slug, cred read across teams, queue drain, installation-id swap, signed-request replay — has a named invariant and a red-line mutant test. Drop any gate and [`test/heimdall-cp-authz-gate.test.sh`](test/heimdall-cp-authz-gate.test.sh) goes red; the keystone suite passes **only** when every mutant is caught. Full invariant + attack matrix: [`docs/specs/2026-07-03-rr-isolation-invariants.md`](docs/specs/2026-07-03-rr-isolation-invariants.md).
-- **BYOC — no shared keys.** You pay your own Claude tokens; your credential lands in **your own** per-team Secret Manager secret and is injected env-only into your job — never logged, never echoed, never readable by another tenant.
-- **Least-privilege bot.** The App holds exactly Contents + Issues + Pull requests — **no** Administration, **no** Actions/Workflows, **no** merge capability. It can open a PR; it cannot touch branch protection or push to `main`.
-- **Honest bring-up.** This loop was hardened over a live multi-tenant bring-up that shook out a run of production-only failures — Google's GFE rejecting GET-with-a-body, cold-start identity drift, jobs starving under scale-to-zero — each now documented as fixed in [`deploy/cloud-run/README.md`](deploy/cloud-run/README.md) and the runbook.
+Real output from this tree (2026-09-19), last lines of each run — a survived mutant would print `REJECTED` and fail the assert:
+
+```text
+SCORE: 6/6 = 1.0000 (golden passing) (incl. 2 guard, gate-invoked)
+ASSERT PASS: score 1.0000 >= target 1.0 (golden passed, no mutant survived)
+
+SCORE: 3/3 = 1.0000 (golden passing)
+ASSERT PASS: score 1.0000 >= target 1.0 (golden passed, no mutant survived)
+```
+
+`bin/corpus run` replays the 13 real shipped-failure cases through the same gates and appends a per-version catch-rate row to [`evals/corpus/CORPUS-STATUS.md`](evals/corpus/CORPUS-STATUS.md) — it writes to the tree, so it is not in the read-only block above. Its current score and the ❌ rows that are kept in view: [`evals/flagship/STATUS.md`](evals/flagship/STATUS.md).
+
+| Number | Reproduce it |
+|---|---|
+| **427** test suites | `ls test/*.test.sh \| wc -l` |
+| **10,127** assertions passed, **412/412** suites, 0 failed — last full sweep, at commit `b43c4f4b` (suites added since account for 427 on disk) | `bash test/run-all.sh` (~17 min) writes `.heimdall/receipts/last-sweep.json`; then `jq .assertions_passed .heimdall/receipts/last-sweep.json` |
+| **13/13** corpus cases caught (100%) | `bin/corpus run` (mutates `CORPUS-STATUS.md`); scoreboard row in [`evals/flagship/STATUS.md`](evals/flagship/STATUS.md) |
+| **1.0** falsifiability on both flagship oracles (6/6, 3/3) | the two `bin/falsify … --assert-score 1.0` commands above |
+
+Then: `hmd invite` puts a teammate on your team wall in one paste · cloud bot that opens gated PRs on your repo: [`rr`](#get-a-bot-pr-on-your-repo) · a default module is a local proxy that reads your prompts — disclosed in full under [Install](#install).
 
 ---
-
-## Under the hood — the verification orchestrator
-
-The bot is powered by Heimdall's local engine: a Claude Code plugin that turns one prompt into finished, **proven** work. Every plan wires an external, falsifiable oracle so the implementation can never grade its own homework, and the merge stays blocked until the work is proven correct. Install it to run the same gates on your own machine.
 
 ## Install
 
@@ -196,6 +217,32 @@ Scaffolds a real full-stack task, builds it, ends with a summary card and a foll
 - **Falsifiable gates** — every gate is proven able to go red before it is trusted green. The corpus of real failure cases replays on every change; a regression that once shipped can never ship twice.
 - **Proof of correctness, not just generation** — the delta Heimdall sells is the receipt that proves the proof can fail. [Generalizes: 0.50 median reuse across 8 cold repos.](https://runheimdall.dev/proof)
 - **Full audit trail** — `hmd report` produces a machine-readable telemetry report of every gate, mutation score, and corpus catch-rate from the last run.
+
+---
+
+## Get a bot PR on your repo
+
+`rr` is the same gate, run in the cloud: a bot that fixes your GitHub issues and opens a PR whose fix has already passed a check the agent never wrote. You review, you merge. The bot opens it on a `heimdall/*` branch **as a scoped GitHub App** — never as you, never on `main`, and it never self-merges. A human always gates the merge.
+
+Once you've installed the Heimdall Maintainer GitHub App on your repo and run `claude setup-token`, it's two commands:
+
+```bash
+rr connect                                    # registers your App install + captures your Claude cred
+rr "fix the flaky test in payments and open a PR"
+```
+
+**What happens:** `rr` signs your task with your own Ed25519 key and enqueues it. A gated worker clones your repo with **your team's** Claude subscription and **your** GitHub App installation, runs the issue-resolution loop until the fix passes the gates, and opens a `heimdall/*` PR on your repo. You review it. You merge it.
+
+**Nothing to paste — no token, no URL.** The public control plane is baked in and enrollment is automatic: your first signed call registers this device on first use. Just `rr connect` and go. (Running your own deployment, or need to re-gate enrollment behind a bootstrap token? That's an operator concern — see [`OPERATORS.md`](OPERATORS.md).)
+
+### Why it's safe to point at your repo
+
+- **Tenant isolation is a falsifiable oracle, not a promise.** Every cross-tenant attack — IDOR by repo slug, cred read across teams, queue drain, installation-id swap, signed-request replay — has a named invariant and a red-line mutant test. Drop any gate and [`test/heimdall-cp-authz-gate.test.sh`](test/heimdall-cp-authz-gate.test.sh) goes red; the keystone suite passes **only** when every mutant is caught. Full invariant + attack matrix: [`docs/specs/2026-07-03-rr-isolation-invariants.md`](docs/specs/2026-07-03-rr-isolation-invariants.md).
+- **BYOC — no shared keys.** You pay your own Claude tokens; your credential lands in **your own** per-team Secret Manager secret and is injected env-only into your job — never logged, never echoed, never readable by another tenant.
+- **Least-privilege bot.** The App holds exactly Contents + Issues + Pull requests — **no** Administration, **no** Actions/Workflows, **no** merge capability. It can open a PR; it cannot touch branch protection or push to `main`.
+- **Honest bring-up.** This loop was hardened over a live multi-tenant bring-up that shook out a run of production-only failures — Google's GFE rejecting GET-with-a-body, cold-start identity drift, jobs starving under scale-to-zero — each now documented as fixed in [`deploy/cloud-run/README.md`](deploy/cloud-run/README.md) and the runbook.
+
+Under the hood the bot runs the local engine installed above: every plan wires an external, falsifiable oracle so the implementation can never grade its own homework, and the merge stays blocked until that oracle is green — after it has been proven able to go red.
 
 ---
 
