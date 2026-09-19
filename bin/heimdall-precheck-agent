@@ -489,8 +489,9 @@ fi
 # (bin/heimdall-ctx-meter's _newest_record, default ~/.heimdall/ctx), which is
 # the wrong answer under the parallel multi-agent usage this project
 # encourages -- two sessions racing would let one borrow the other's reading.
-# Omitted only if the payload has no session_id to give (falls open, per the
-# fail-open rule above, back to the meter's own fallback).
+# If the payload has no session_id the fence is SKIPPED (fail-open): it must never
+# fall back to the meter's newest-record default, which grades this spawn against some
+# OTHER session's reading (measured 2026-09-19: it did, refusing three hermetic suites).
 #
 # ESCAPE HATCH: HMD_CTX_GATE_OFF=1 skips this fence for that one spawn call,
 # same shape as HEIMDALL_ALLOW_NAMED_AGENT/HEIMDALL_ALLOW_LONG_BRIEF above --
@@ -508,13 +509,21 @@ elif [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
       if [ -n "$CTXGATE_SID" ]; then
         CTXGATE_OUT="$(perl -e 'alarm 5; exec @ARGV' -- "$CTXGATE_BIN" gate --session "$CTXGATE_SID" --json </dev/null 2>/dev/null)"
       else
-        CTXGATE_OUT="$(perl -e 'alarm 5; exec @ARGV' -- "$CTXGATE_BIN" gate --json </dev/null 2>/dev/null)"
+        # No session_id in the payload -> SKIP the fence. Never fall back to the
+        # meter's newest-record default: on 2026-09-19 that borrowed the operator's
+        # own 807k-token session and refused spawns in three unrelated hermetic
+        # test suites -- a fail-open fence turned into a cross-session false deny.
+        CTXGATE_OUT=""
       fi
     else
       if [ -n "$CTXGATE_SID" ]; then
         CTXGATE_OUT="$("$CTXGATE_BIN" gate --session "$CTXGATE_SID" --json </dev/null 2>/dev/null)"
       else
-        CTXGATE_OUT="$("$CTXGATE_BIN" gate --json </dev/null 2>/dev/null)"
+        # No session_id in the payload -> SKIP the fence. Never fall back to the
+        # meter's newest-record default: on 2026-09-19 that borrowed the operator's
+        # own 807k-token session and refused spawns in three unrelated hermetic
+        # test suites -- a fail-open fence turned into a cross-session false deny.
+        CTXGATE_OUT=""
       fi
     fi
     CTXGATE_RC=$?

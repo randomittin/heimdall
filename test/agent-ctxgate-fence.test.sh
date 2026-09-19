@@ -332,6 +332,17 @@ case "$ARGV_SEEN" in
   *"--session"*) bad "no session_id in payload but --session was still passed (argv was: $ARGV_SEEN)" ;;
   *) ok "no session_id in payload -> no --session flag fabricated (argv was: $ARGV_SEEN)" ;;
 esac
+# (m) session_id absent AND the meter would REFUSE (its newest-record default) ->
+#     the fence is SKIPPED, not borrowed. Measured 2026-09-19: the operator's own
+#     807k-token session was the machine's newest record, and three hermetic suites
+#     firing the real hook without a session_id were refused on ITS reading. A
+#     fail-open fence that grades against another session's context is a
+#     cross-session false deny; with no session to grade, the fence must stand down.
+fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:coder)" refuse 1
+[ "$RC" -eq 0 ] && ok "no session_id + meter primed to refuse -> allowed (exit 0): the fence never borrows another session's reading" \
+                || bad "no session_id + meter primed to refuse -> exit $RC, expected 0 (cross-session false deny is back)"
+[ ! -f "$ARGVMARK" ] && ok "no session_id -> ctx-meter is not invoked at all (argv marker absent)" \
+                      || bad "no session_id -> ctx-meter was still invoked (argv: $(cat "$ARGVMARK" 2>/dev/null))"
 
 # ── 3. RED-PROOFS: mutation tests. A check that cannot fail is not a check. ──
 # Mutants are built by scanning ONLY the context gate fence's own section
