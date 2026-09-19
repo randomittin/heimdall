@@ -74,6 +74,12 @@ trap 'rm -rf "$WORK"' EXIT
 # falsify/corpus section under test.
 FAKE_PLUGIN="$WORK/plugin"
 mkdir -p "$FAKE_PLUGIN/bin" "$FAKE_PLUGIN/evals/oracles/demo-domain/fixtures/mutants" "$FAKE_PLUGIN/evals/corpus"
+# The chain itself now lives in bin/heimdall-precheck-bash (hooks.json only pipes
+# the payload into "$PLUGIN/bin/heimdall-precheck-bash"), so the fake plugin must
+# carry the REAL script or the wrapper resolves to nothing. It is the code under
+# test, not a fake — the gate bins it calls are still the fakes below.
+cp "$REPO/bin/heimdall-precheck-bash" "$FAKE_PLUGIN/bin/heimdall-precheck-bash"
+chmod +x "$FAKE_PLUGIN/bin/heimdall-precheck-bash"
 
 MARKERS="$WORK/markers"
 mkdir -p "$MARKERS"

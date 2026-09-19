@@ -43,7 +43,7 @@
       "id": "bash-gate-chain",
       "description": "git-guard stale-lock clear, commit secret scan, pre-push quality/secret/selfscan/oracle/corpus gates (exit 2 blocks).",
       "matcher": "Bash",
-      "fingerprint": "1206e2f98d6df534b2f7095e0b3ef3cf2f2cf3f5bcf728643e1be6e059d9f6b6",
+      "fingerprint": "89380acf14f0081e868dab8f447a2373f1f9484050da491c18dd422e2d3bead9",
       "locked": true
     },
     {

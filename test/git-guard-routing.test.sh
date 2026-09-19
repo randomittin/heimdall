@@ -66,7 +66,11 @@ routes_to_guard() {
   local body="$1"
   printf '%s\n' "$body" | grep -q 'heimdall-git-guard' && return 0
   printf '%s\n' "$body" | grep -q 'heimdall-autocommit' \
-    && grep -q 'heimdall-git-guard' "$ROOT/bin/heimdall-autocommit" 2>/dev/null
+    && grep -q 'heimdall-git-guard' "$ROOT/bin/heimdall-autocommit" 2>/dev/null && return 0
+  # PreToolUse Bash delegates the whole chain to bin/heimdall-precheck-bash (the
+  # inline string moved there verbatim); the guard call is the first thing in it.
+  printf '%s\n' "$body" | grep -q 'heimdall-precheck-bash' \
+    && grep -q 'heimdall-git-guard' "$ROOT/bin/heimdall-precheck-bash" 2>/dev/null
 }
 
 # mkrepo — a throwaway git repo with 6 tracked files, all dirty (so the autocommit

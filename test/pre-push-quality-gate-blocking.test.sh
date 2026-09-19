@@ -78,6 +78,12 @@ trap 'rm -rf "$WORK"' EXIT
 # A plugin root containing ONLY the gate under test.
 FAKE_PLUGIN="$WORK/plugin"
 mkdir -p "$FAKE_PLUGIN/bin"
+# The chain body lives in bin/heimdall-precheck-bash; hooks.json's command is
+# just the stdin-pipe wrapper into "$PLUGIN/bin/heimdall-precheck-bash". The
+# fake plugin therefore carries the REAL script (the code under test) alongside
+# the one gate bin whose verdict this file is about.
+cp "$REPO/bin/heimdall-precheck-bash" "$FAKE_PLUGIN/bin/heimdall-precheck-bash"
+chmod +x "$FAKE_PLUGIN/bin/heimdall-precheck-bash"
 cp "$STATE_BIN" "$FAKE_PLUGIN/bin/heimdall-state"
 chmod +x "$FAKE_PLUGIN/bin/heimdall-state"
 
@@ -180,10 +186,17 @@ else
 fi
 
 # === CASE 7: regression lock — the bare-statement form must not come back ====
+# The structural greps below read the CHAIN TEXT. hooks.json used to carry it
+# inline; it now delegates to bin/heimdall-precheck-bash, so when the shipped
+# command does not itself contain check-quality-gates, read the script it names.
+CHAIN_TEXT="$HOOK_CMD"
+if ! grep -q 'check-quality-gates' <<<"$HOOK_CMD" && grep -q 'heimdall-precheck-bash' <<<"$HOOK_CMD"; then
+  CHAIN_TEXT="$(grep -v '^[[:space:]]*#' "$REPO/bin/heimdall-precheck-bash")"
+fi
 # The defect was `; heimdall-state check-quality-gates;` with its exit code
 # discarded. Assert the command never invokes check-quality-gates as a bare
 # statement again (it must be captured into a variable or tested in a condition).
-if grep -qE '(^|;|then|else|do|&&|\|\|)[[:space:]]+"?\$?(HSTATE|heimdall-state)"?[[:space:]]+check-quality-gates[[:space:]]*;' <<<"$HOOK_CMD"; then
+if grep -qE '(^|;|then|else|do|&&|\|\|)[[:space:]]+"?\$?(HSTATE|heimdall-state)"?[[:space:]]+check-quality-gates[[:space:]]*;' <<<"$CHAIN_TEXT"; then
   bad "check-quality-gates is not a bare fire-and-forget statement" "found the discarded-exit-code form in hooks.json"
 else
   ok "check-quality-gates is not a bare fire-and-forget statement"
@@ -191,7 +204,7 @@ fi
 
 # The positive half of the same lock: the verdict must actually be CAPTURED.
 # Without this, deleting the call entirely would satisfy the negative check above.
-if grep -qE '\$\([^)]*check-quality-gates' <<<"$HOOK_CMD"; then
+if grep -qE '\$\([^)]*check-quality-gates' <<<"$CHAIN_TEXT"; then
   ok "check-quality-gates verdict is captured into a variable (exit code observable)"
 else
   bad "check-quality-gates verdict is captured into a variable" "no \$( ... check-quality-gates ... ) capture found"
