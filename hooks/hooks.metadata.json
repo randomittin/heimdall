@@ -7,7 +7,7 @@
       "id": "parallel-gate",
       "description": "Injects a delegation directive when a prompt looks multi-part (heuristic, ~1ms).",
       "matcher": "",
-      "fingerprint": "a3bb48a74b3c1ef56a297a2894525be72baeace91cb03e131e4f65c3f472c884",
+      "fingerprint": "f80665a729244616f95ecd0a2f68dc1a26a1864be48a60911ba1c87611e8e30f",
       "locked": false
     },
     {
@@ -16,7 +16,7 @@
       "id": "ctx-meter-notice",
       "description": "Prints the context-window meter notice from heimdall-ctx-meter.",
       "matcher": "",
-      "fingerprint": "b770870c532c40da79da65a269c627b67cf0c968baca0f5b1820ae27f5865b80",
+      "fingerprint": "b4ec5067ce255dd6706497e87e9ccc30b0c433c06d4795b556f3b8fdbdb640e5",
       "locked": false
     },
     {
@@ -34,7 +34,7 @@
       "id": "caveman-level-context",
       "description": "Adds the current caveman compression level as additionalContext on every prompt.",
       "matcher": "",
-      "fingerprint": "3261495a15decfb2c03ad8ffe4067dbdc42210f4818c95c96dd5da3ea5629ea7",
+      "fingerprint": "d573a9aed96110192381b8a50ef55662d9fdf9f1e786cc247a82ed8f0ee5d370",
       "locked": false
     },
     {
@@ -52,7 +52,7 @@
       "id": "parallelism-tracker-read",
       "description": "Counts Read/Grep/Glob calls for the parallelism grade.",
       "matcher": "Read|Grep|Glob",
-      "fingerprint": "2eeb0c0a89270ba399fa2c25b094ee5ab468783ff83b295a9914e8b58bbd81e0",
+      "fingerprint": "3334862e18768af3c358c7de8b132c453c5c48bf8f74d676ac6fc3ab8b83a962",
       "locked": false
     },
     {
@@ -79,7 +79,7 @@
       "id": "edit-claim-prewarn",
       "description": "Advisory collision pre-warning when a live teammate holds a claim on the file (heimdall-precheck-edit).",
       "matcher": "Edit|MultiEdit|Write",
-      "fingerprint": "3a9e4ae2291403dbeb9903ea3ca6162e15686b8c0303552c439f59ec08248265",
+      "fingerprint": "040330e1f87513058b30939367db18949e3633e61064dd4b4d555c91b1d8a4f1",
       "locked": false
     },
     {
@@ -92,12 +92,21 @@
       "locked": true
     },
     {
+      "event": "PreToolUse",
+      "index": 6,
+      "id": "lintconfig-guard",
+      "description": "Deny edits to linter/formatter/typechecker config (anti-evasion; operator override HMD_ALLOW_LINTCONFIG_EDIT=1)",
+      "matcher": "Write|Edit|MultiEdit|Bash",
+      "fingerprint": "add8171bbbe6d7011a8216cf17c98d0ef772f830f6d07bff5d68183b573dfd84",
+      "locked": true
+    },
+    {
       "event": "PostToolUse",
       "index": 0,
       "id": "corpus-capture",
       "description": "Captures a failed oracle report into the regression corpus after a Bash call.",
       "matcher": "Bash",
-      "fingerprint": "172d409d22d9bef2df8c91404e1a684a199fa3eab6672c41c296b04661a77587",
+      "fingerprint": "72e1d9cdb35228d6a1a1076a3b601c119689a56032387a4aa50c3e468ca9e769",
       "locked": false
     },
     {
@@ -115,7 +124,7 @@
       "id": "context-sync",
       "description": "Background, throttled heimdall-context-sync after a Write/Edit.",
       "matcher": "Write|Edit",
-      "fingerprint": "bab1d3a89827001cf72ec9fc7122928b192ffe074a779c81f37bcf200097f290",
+      "fingerprint": "ba1bacbb6baa0f5f1a9186094e82114f862f4cbee51cccb20dcf365e0300d8b8",
       "locked": false
     },
     {
@@ -124,7 +133,7 @@
       "id": "journal-commit",
       "description": "Writes a journal entry when a Bash call landed a new git commit.",
       "matcher": "Bash",
-      "fingerprint": "64c63882d09e86ca5990174aa71c23864f5133127006074986d5857304239b0a",
+      "fingerprint": "ef3ec6696a95f634e842131b2a0603de618224864080790b0d50ba31af1a5e70",
       "locked": false
     },
     {
@@ -133,7 +142,7 @@
       "id": "session-bootstrap",
       "description": "Autoupdate check, statusline register, selfheal, tracker builds, state init, stack detect, team/presence beat, reap/cleanup advice, checkpoint notice.",
       "matcher": "",
-      "fingerprint": "a362c47e51d8979052615c89c36a1ae9f90cc8e44a6549cde1123c24b7c005bd",
+      "fingerprint": "e8234fe30341fdc7f5bb0d6102853dcaca25404fcc23c2664e77ae969f33a213",
       "locked": false
     },
     {
@@ -142,7 +151,7 @@
       "id": "resume-probe",
       "description": "Runs heimdall-resume-probe (10s alarm) when a CHECKPOINT.md exists and prints its head.",
       "matcher": "",
-      "fingerprint": "556bd40634a7d0cc4d6d857fd72b35f15535f0492b0e6dc8f52e8e222f6ee845",
+      "fingerprint": "43b61c54637592aefbbc49d10faadf73974816ef5b4011c2044671ebe4089160",
       "locked": false
     },
     {
@@ -151,7 +160,7 @@
       "id": "maintain-resume-hint",
       "description": "heimdall-maintain-loop resume-hint.",
       "matcher": "",
-      "fingerprint": "d9d9a5b46ffda278ea1afcd830bf18c5f905cf3ad8f931a745dcd821ab089534",
+      "fingerprint": "255dc069d5993a1f505f99ae99410e8989a3ef024f67924c5aa34ec48cf10884",
       "locked": false
     },
     {
@@ -160,7 +169,7 @@
       "id": "quota-resume-hint",
       "description": "heimdall-quota-resume resume-hint.",
       "matcher": "",
-      "fingerprint": "2379491d2c25019706d4a152fd17e8293a73a73c9fec6d8b363ccd3eb40e77ed",
+      "fingerprint": "92bb68d091d58f77c8b198142ef2d67e6cc2437ced0db63c78cb4e23aca86bb0",
       "locked": false
     },
     {
@@ -169,7 +178,7 @@
       "id": "dream-notice",
       "description": "heimdall-dream-notice for the repo.",
       "matcher": "",
-      "fingerprint": "a3c512b4c62297b7dcdd9fa5097c733e80025992a809846108d323a1edf79f6d",
+      "fingerprint": "e99050636e047e42bf9ed6cde01fdb15ba42b9d7a0da215964416b2e67ba7aa4",
       "locked": false
     },
     {
@@ -178,7 +187,7 @@
       "id": "presence-keeper-start",
       "description": "Starts the presence keeper for this session in the background (paired with presence-keeper-stop).",
       "matcher": "",
-      "fingerprint": "f5853c0021c91fb4b1ed5938d0a0c8d44efbd7e6e95fa6adcbd79e283a83a7d0",
+      "fingerprint": "5ac2bdaddce4896ff26b93eb7160f252945bb4a59e10bbe316073ff999f54946",
       "locked": false
     },
     {
@@ -187,7 +196,7 @@
       "id": "presence-connect-prompt",
       "description": "heimdall-presence connect-prompt.",
       "matcher": "",
-      "fingerprint": "de57c1144ff12dca2a6706c7612e1928d0237535b7d40dde910dd449fa6f45f0",
+      "fingerprint": "467e89bcab759e9834fdad3e5e17bac128ddb4c742608feae3c7822b166771b2",
       "locked": false
     },
     {
@@ -196,7 +205,7 @@
       "id": "ai-select",
       "description": "heimdall-ai-select session-start.",
       "matcher": "",
-      "fingerprint": "8c339081adae1da075a3783831338d99ed6d5e78db1e9b93d21f769a611f5251",
+      "fingerprint": "a0401ff9f4709db8b107a388b24fe01d5b939e4ef095a8344714757e4938a52e",
       "locked": false
     },
     {
@@ -214,7 +223,7 @@
       "id": "caveman-rules",
       "description": "Prints the caveman compression rules into session context.",
       "matcher": "",
-      "fingerprint": "fc02951bbc90a9eebb08005cc4fa0803b9612e0dd7b88e22b27f4bf959c8746c",
+      "fingerprint": "167e83fc43c2004d52548b72d74c002483e4f13d335f12e67371fd5681a1a212",
       "locked": false
     },
     {
@@ -223,7 +232,7 @@
       "id": "settings-guard",
       "description": "Advisory: warns about ANTHROPIC_* overrides persisted in a Claude Code settings.json env block (5s alarm).",
       "matcher": "",
-      "fingerprint": "7a30e893f32d45568c0702426f65337dec2e506fd22b3a0bcfb3485755e5ca6b",
+      "fingerprint": "7868c341d50697b5e914cbc3c1103642a45480b5c98e02e397aef96e6b5b2114",
       "locked": false
     },
     {
@@ -232,7 +241,7 @@
       "id": "volatile-repo-guard",
       "description": "Advisory: warns when the clone sits on volatile disk holding unpushed work (5s alarm).",
       "matcher": "",
-      "fingerprint": "b205f809e411a76a6afbc06e6adcd2633c6dadf5b60a77e1f709ee45afef1a37",
+      "fingerprint": "c8aa653659fb8e14c718fc38194e79ca00cb7af82d1b344b045ca58109e9323f",
       "locked": false
     },
     {
@@ -241,7 +250,7 @@
       "id": "subagent-metric",
       "description": "Records a heimdall-metric task outcome for the finished subagent.",
       "matcher": "",
-      "fingerprint": "eb8cc3f15c4dd87fdfbe4e0ab4ca2e5be3707d3067c81cba0a225d1729b50122",
+      "fingerprint": "e631cbb84435f3b2b30f2968040cdd0d93a05759ba2d8fc41e7bc9b7e12b9df6",
       "locked": false
     },
     {
@@ -250,7 +259,7 @@
       "id": "subagent-429-detect",
       "description": "Scans the subagent transcript for a 429/rate-limit and marks it for fallback routing.",
       "matcher": "",
-      "fingerprint": "ea4f717c28b216fc86b1dbdbffcdcf3467dcf77dbc6de37530ef32000a1e54eb",
+      "fingerprint": "9b1d7cd7e6b6ebada6d666ec2bfad86513a0cbe5856c850b3f84f67e43a0e6bb",
       "locked": false
     },
     {
@@ -259,7 +268,7 @@
       "id": "stop-metric-reminder",
       "description": "Metric reminder at main-agent Stop.",
       "matcher": "",
-      "fingerprint": "81c3a519dbab3d12c03d7a67a5a20fef65b7154e5783332b3dfd58dc22b11a37",
+      "fingerprint": "900027c81a27da24c394012aebbc844e519ccffe74ddaa4a74ad2ba1cdeda030",
       "locked": false
     },
     {
@@ -268,7 +277,7 @@
       "id": "stop-claim-check",
       "description": "Detects a stale present-tense process-status claim in the final message (heimdall-claim-check).",
       "matcher": "",
-      "fingerprint": "3b7eacd3792a1507c5848d49fc2f4cf5df2dc0ee25297e41353004ccef8fc32f",
+      "fingerprint": "7346d00e5258a0c354697045aeabc1f3c63b524e4302127608c355b26f27cddc",
       "locked": false
     },
     {
@@ -277,7 +286,16 @@
       "id": "stop-429-detect",
       "description": "Scans the main transcript for a 429/rate-limit and marks it for fallback routing.",
       "matcher": "",
-      "fingerprint": "ea4f717c28b216fc86b1dbdbffcdcf3467dcf77dbc6de37530ef32000a1e54eb",
+      "fingerprint": "7cfa765e629c950551529d021ea8659f6a49b229e2787e03fa202c3a794cd14c",
+      "locked": false
+    },
+    {
+      "event": "Stop",
+      "index": 3,
+      "id": "stop-lint",
+      "description": "Batch-lint every path edited this session at Stop; records a real lint receipt into heimdall-state",
+      "matcher": "",
+      "fingerprint": "aaba0ca672f9b367eefd7a1c2b1d0425affbcd493cbe8093868d23f12fb37e26",
       "locked": false
     },
     {
@@ -286,7 +304,7 @@
       "id": "presence-keeper-stop",
       "description": "Stops this session's presence keeper (disabling it with presence-keeper-start enabled leaks a keeper process).",
       "matcher": "",
-      "fingerprint": "9c984015d0bb9a02f3f4b07858673fa7c187008548021ba7dc0e92fc95b9a49f",
+      "fingerprint": "1e6f5fee065e40ff17de9c6da3463e11c19ac1d95ba815ab911a798537f36448",
       "locked": false
     },
     {
@@ -295,7 +313,16 @@
       "id": "session-end-sweep",
       "description": "Background: checkpoint write, parallelism grade, verify-edits --quick, autocommit, cleanup, reel, summary-card, context-sync; then the farewell.",
       "matcher": "",
-      "fingerprint": "98de60d9909a663ef22aa82b02fb0db1dfccd24f6ec246453958e26bdeb758d3",
+      "fingerprint": "c223d3c74c9119897c67ce6f1f4718ee7e21b2be87f5e45ac9fc02dc21f497ef",
+      "locked": false
+    },
+    {
+      "event": "PreCompact",
+      "index": 0,
+      "id": "precompact-checkpoint",
+      "description": "Auto-checkpoint .planning/CHECKPOINT.md before compaction rewrites context (fail-open, stdout suppressed)",
+      "matcher": "",
+      "fingerprint": "c009fdfc1feebe12b88ceaa061bc25d583924ba9ad443cd804f1896021a4bb9b",
       "locked": false
     }
   ]

@@ -83,9 +83,14 @@ else
 fi
 
 # ── 6. stale metadata entry (no live group) -> exit 1 ───────────────────────
-jq 'del(.hooks.Stop[2])' "$HOOKS" > "$TMPROOT/fewer.json"
+# Drop the LAST Stop group so no surviving entry shifts index; the stale id is
+# read from metadata rather than hardcoded, so adding a Stop hook later cannot
+# break this case (it did once: a 4th Stop hook turned a fixed Stop[2] into a
+# fingerprint mismatch instead of the stale report this asserts).
+LAST_STOP_ID="$(jq -r '[.hooks[] | select(.event=="Stop")] | max_by(.index) | .id' "$TMPROOT/meta.json")"
+jq 'del(.hooks.Stop[-1])' "$HOOKS" > "$TMPROOT/fewer.json"
 rc="$(run_tool check --hooks "$TMPROOT/fewer.json" --metadata "$TMPROOT/meta.json")"
-if [ "$rc" = "1" ] && grep -q 'stop-429-detect.*stale' "$TMPROOT/err"; then
+if [ "$rc" = "1" ] && grep -q "$LAST_STOP_ID.*stale" "$TMPROOT/err"; then
   ok "6. metadata entry with no live group -> exit 1 (stale)"
 else
   bad "6. stale entry not reported (rc=$rc)"
@@ -118,8 +123,9 @@ jq '.hooks.Stop += [{"hooks":[{"type":"command","command":"\"$P/bin/heimdall-new
   "$HOOKS" > "$TMPROOT/more.json"
 cp "$TMPROOT/meta.json" "$TMPROOT/meta-more.json"
 rc="$(run_tool regen --hooks "$TMPROOT/more.json" --metadata "$TMPROOT/meta-more.json")"
-if [ "$rc" = "0" ] && grep -q 'NEW   new-thing (Stop\[3\])' "$TMPROOT/out" \
-   && [ "$(jq -r '.hooks[] | select(.event=="Stop" and .index==3) | .locked' "$TMPROOT/meta-more.json")" = "false" ]; then
+NEW_IDX="$(jq '.hooks.Stop | length' "$HOOKS")"   # appended group lands at the old length
+if [ "$rc" = "0" ] && grep -q "NEW   new-thing (Stop\[$NEW_IDX\])" "$TMPROOT/out" \
+   && [ "$(jq -r --argjson i "$NEW_IDX" '.hooks[] | select(.event=="Stop" and .index==$i) | .locked' "$TMPROOT/meta-more.json")" = "false" ]; then
   ok "9. regen adds a NEW, unlocked entry for a group with no metadata"
 else
   bad "9. regen did not add the new group (rc=$rc): $(cat "$TMPROOT/out")"

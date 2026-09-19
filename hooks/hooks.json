@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/parallel-gate\" 2>/dev/null || true"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled parallel-gate && exit 0; \"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/parallel-gate\" 2>/dev/null || true"
           }
         ]
       },
@@ -13,7 +13,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "CTX=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/heimdall-ctx-meter\"; if [ -x \"$CTX\" ]; then \"$CTX\" notice; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled ctx-meter-notice && exit 0; CTX=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/heimdall-ctx-meter\"; if [ -x \"$CTX\" ]; then \"$CTX\" notice; fi; exit 0"
           }
         ]
       },
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then LVL=\"$(\"$CAV\" get 2>/dev/null)\"; if [ -n \"$LVL\" ]; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"HMD OUTPUT COMPRESSION - level: %s. Apply this level'\"'\"'s rules (heimdall-caveman rules). Code/commits/security: write normal.\"}}' \"$LVL\"; fi; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled caveman-level-context && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then LVL=\"$(\"$CAV\" get 2>/dev/null)\"; if [ -n \"$LVL\" ]; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"HMD OUTPUT COMPRESSION - level: %s. Apply this level'\"'\"'s rules (heimdall-caveman rules). Code/commits/security: write normal.\"}}' \"$LVL\"; fi; fi; exit 0"
           }
         ]
       }
@@ -49,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); TOOL=$(printf '%s' \"$INPUT\" | jq -r '.tool_name // \"unknown\"' 2>/dev/null || echo unknown); \"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/parallelism-tracker\" check \"$TOOL\" 2>&1 || true"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled parallelism-tracker-read && exit 0; INPUT=$(cat); TOOL=$(printf '%s' \"$INPUT\" | jq -r '.tool_name // \"unknown\"' 2>/dev/null || echo unknown); \"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/parallelism-tracker\" check \"$TOOL\" 2>&1 || true"
           }
         ]
       },
@@ -76,7 +76,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; printf '%s' \"$INPUT\" | \"$PLUGIN/bin/heimdall-precheck-edit\" || true"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled edit-claim-prewarn && exit 0; INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; printf '%s' \"$INPUT\" | \"$PLUGIN/bin/heimdall-precheck-edit\" || true"
           }
         ]
       },
@@ -88,6 +88,15 @@
             "command": "P=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; G=\"$P/bin/secret-read-guard\"; [ -x \"$G\" ] || exit 0; exec \"$G\""
           }
         ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; LCG=\"$PLUGIN/bin/heimdall-lintconfig-guard\"; if [ -x \"$LCG\" ]; then printf '%s' \"$INPUT\" | \"$LCG\"; else exit 0; fi"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -96,7 +105,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAP=\"$PLUGIN/bin/corpus-capture\"; if [ -x \"$CAP\" ] && [ -d evals/oracles ] && command -v jq >/dev/null 2>&1; then for R in evals/oracles/*/report.json; do [ -f \"$R\" ] || continue; if [ \"$(jq -r '.status // empty' \"$R\" 2>/dev/null)\" = \"fail\" ]; then \"$CAP\" --report \"$R\" 2>/dev/null || true; fi; done; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled corpus-capture && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAP=\"$PLUGIN/bin/corpus-capture\"; if [ -x \"$CAP\" ] && [ -d evals/oracles ] && command -v jq >/dev/null 2>&1; then for R in evals/oracles/*/report.json; do [ -f \"$R\" ] || continue; if [ \"$(jq -r '.status // empty' \"$R\" 2>/dev/null)\" = \"fail\" ]; then \"$CAP\" --report \"$R\" 2>/dev/null || true; fi; done; fi; exit 0"
           }
         ]
       },
@@ -114,7 +123,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CTXSYNC=\"$PLUGIN/bin/heimdall-context-sync\"; if [ -x \"$CTXSYNC\" ] && [ -d .git ]; then ( \"$CTXSYNC\" sync --repo \"${CLAUDE_PROJECT_DIR:-.}\" --throttle 900 >/dev/null 2>&1 & ) ; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled context-sync && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CTXSYNC=\"$PLUGIN/bin/heimdall-context-sync\"; if [ -x \"$CTXSYNC\" ] && [ -d .git ]; then ( \"$CTXSYNC\" sync --repo \"${CLAUDE_PROJECT_DIR:-.}\" --throttle 900 >/dev/null 2>&1 & ) ; fi; exit 0"
           }
         ]
       },
@@ -123,7 +132,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-journal-hook\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" commit --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled journal-commit && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-journal-hook\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" commit --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
           }
         ]
       }
@@ -133,7 +142,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat 2>/dev/null || true); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; AUTOUP=\"$PLUGIN/bin/heimdall-autoupdate\"; [ -x \"$AUTOUP\" ] && (\"$AUTOUP\" check >/dev/null 2>&1 &) || true; SLREG=\"$PLUGIN/bin/heimdall-statusline-register\"; [ -x \"$SLREG\" ] && \"$SLREG\" register >/dev/null || true; HEAL=\"$PLUGIN/bin/heimdall-cc-selfheal\"; if [ -x \"$HEAL\" ]; then (\"$HEAL\" check >/dev/null 2>&1 &) || true; \"$HEAL\" pin-notice 2>/dev/null || true; fi; TRACKER=\"$PLUGIN/bin/parallelism-tracker\"; if [ -f \"$PLUGIN/bin/parallelism-tracker.c\" ] && { [ ! -x \"$TRACKER\" ] || ! \"$TRACKER\" check probe >/dev/null 2>&1; }; then \"$PLUGIN/bin/build-tracker.sh\" >/dev/null 2>&1 || true; fi; ETRACKER=\"$PLUGIN/bin/edit-tracker\"; if [ -f \"$PLUGIN/bin/edit-tracker.c\" ] && { [ ! -x \"$ETRACKER\" ] || [ \"$PLUGIN/bin/edit-tracker.c\" -nt \"$ETRACKER\" ]; }; then clang -O2 -Wall -Wextra -o \"$ETRACKER\" \"$PLUGIN/bin/edit-tracker.c\" 2>/dev/null || true; fi; SRC=$(printf '%s' \"$INPUT\" | jq -r '.source // empty' 2>/dev/null || true); if [ \"$SRC\" = \"startup\" ] && [ -z \"$CLAUDE_CODE_CHILD_SESSION\" ]; then \"$ETRACKER\" clear 2>/dev/null || true; fi; \"$ETRACKER\" init 2>/dev/null || true; if [ ! -f heimdall-state.json ] && [ ! -f superx-state.json ]; then heimdall-state init 2>/dev/null || true; fi; if [ -f heimdall-state.json ] || [ -f superx-state.json ] || [ -d .planning ]; then mkdir -p .planning 2>/dev/null && \"$PLUGIN/bin/stack-pack\" detect 2>/dev/null > .planning/detected-stack.json || true; fi; HMDTEAM=\"$PLUGIN/bin/heimdall-team\"; HMDPRES=\"$PLUGIN/bin/heimdall-presence\"; if [ -x \"$HMDTEAM\" ] || [ -x \"$HMDPRES\" ]; then ( [ -x \"$HMDTEAM\" ] && \"$HMDTEAM\" auto >/dev/null 2>&1; [ -x \"$HMDPRES\" ] && \"$HMDPRES\" beat >/dev/null 2>&1; ) >/dev/null 2>&1 & fi; REAP=\"$PLUGIN/bin/heimdall-reap-idle\"; if [ -x \"$REAP\" ] && [ -d .git ]; then RN=$(\"$REAP\" 2>/dev/null | grep -cE '^\\[REAP' || true); [ \"${RN:-0}\" -gt 0 ] && echo \"[heimdall] $RN agent worktree(s) reapable \u2014 run bin/heimdall-reap-idle --apply to reclaim disk (a worktree holding uncommitted changes, untracked files, agent memory, or unmerged commits is never removed).\"; fi; CLEAN=\"$PLUGIN/bin/heimdall-cleanup\"; GC=\"$PLUGIN/bin/heimdall-gc\"; if [ -x \"$CLEAN\" ]; then \"$CLEAN\" --advise --quick --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true; (\"$CLEAN\" --auto --quick --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1 &) || true; elif [ -x \"$GC\" ]; then (\"$GC\" run --quick --quiet >/dev/null 2>&1 &) || true; fi; if [ -f .planning/CHECKPOINT.md ]; then echo \"[heimdall] Checkpoint found \u2014 read .planning/CHECKPOINT.md to resume.\"; elif [ -f .planning/STATE.md ]; then echo \"[heimdall] State found \u2014 read .planning/STATE.md for prior context.\"; fi"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled session-bootstrap && exit 0; INPUT=$(cat 2>/dev/null || true); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; AUTOUP=\"$PLUGIN/bin/heimdall-autoupdate\"; [ -x \"$AUTOUP\" ] && (\"$AUTOUP\" check >/dev/null 2>&1 &) || true; SLREG=\"$PLUGIN/bin/heimdall-statusline-register\"; [ -x \"$SLREG\" ] && \"$SLREG\" register >/dev/null || true; HEAL=\"$PLUGIN/bin/heimdall-cc-selfheal\"; if [ -x \"$HEAL\" ]; then (\"$HEAL\" check >/dev/null 2>&1 &) || true; \"$HEAL\" pin-notice 2>/dev/null || true; fi; TRACKER=\"$PLUGIN/bin/parallelism-tracker\"; if [ -f \"$PLUGIN/bin/parallelism-tracker.c\" ] && { [ ! -x \"$TRACKER\" ] || ! \"$TRACKER\" check probe >/dev/null 2>&1; }; then \"$PLUGIN/bin/build-tracker.sh\" >/dev/null 2>&1 || true; fi; ETRACKER=\"$PLUGIN/bin/edit-tracker\"; if [ -f \"$PLUGIN/bin/edit-tracker.c\" ] && { [ ! -x \"$ETRACKER\" ] || [ \"$PLUGIN/bin/edit-tracker.c\" -nt \"$ETRACKER\" ]; }; then clang -O2 -Wall -Wextra -o \"$ETRACKER\" \"$PLUGIN/bin/edit-tracker.c\" 2>/dev/null || true; fi; SRC=$(printf '%s' \"$INPUT\" | jq -r '.source // empty' 2>/dev/null || true); if [ \"$SRC\" = \"startup\" ] && [ -z \"$CLAUDE_CODE_CHILD_SESSION\" ]; then \"$ETRACKER\" clear 2>/dev/null || true; fi; \"$ETRACKER\" init 2>/dev/null || true; if [ ! -f heimdall-state.json ] && [ ! -f superx-state.json ]; then heimdall-state init 2>/dev/null || true; fi; if [ -f heimdall-state.json ] || [ -f superx-state.json ] || [ -d .planning ]; then mkdir -p .planning 2>/dev/null && \"$PLUGIN/bin/stack-pack\" detect 2>/dev/null > .planning/detected-stack.json || true; fi; HMDTEAM=\"$PLUGIN/bin/heimdall-team\"; HMDPRES=\"$PLUGIN/bin/heimdall-presence\"; if [ -x \"$HMDTEAM\" ] || [ -x \"$HMDPRES\" ]; then ( [ -x \"$HMDTEAM\" ] && \"$HMDTEAM\" auto >/dev/null 2>&1; [ -x \"$HMDPRES\" ] && \"$HMDPRES\" beat >/dev/null 2>&1; ) >/dev/null 2>&1 & fi; REAP=\"$PLUGIN/bin/heimdall-reap-idle\"; if [ -x \"$REAP\" ] && [ -d .git ]; then RN=$(\"$REAP\" 2>/dev/null | grep -cE '^\\[REAP' || true); [ \"${RN:-0}\" -gt 0 ] && echo \"[heimdall] $RN agent worktree(s) reapable \u2014 run bin/heimdall-reap-idle --apply to reclaim disk (a worktree holding uncommitted changes, untracked files, agent memory, or unmerged commits is never removed).\"; fi; CLEAN=\"$PLUGIN/bin/heimdall-cleanup\"; GC=\"$PLUGIN/bin/heimdall-gc\"; if [ -x \"$CLEAN\" ]; then \"$CLEAN\" --advise --quick --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true; (\"$CLEAN\" --auto --quick --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1 &) || true; elif [ -x \"$GC\" ]; then (\"$GC\" run --quick --quiet >/dev/null 2>&1 &) || true; fi; if [ -f .planning/CHECKPOINT.md ]; then echo \"[heimdall] Checkpoint found \u2014 read .planning/CHECKPOINT.md to resume.\"; elif [ -f .planning/STATE.md ]; then echo \"[heimdall] State found \u2014 read .planning/STATE.md for prior context.\"; fi"
           }
         ]
       },
@@ -141,7 +150,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; RPROBE=\"$PLUGIN/bin/heimdall-resume-probe\"; RPDIR=\"${CLAUDE_PROJECT_DIR:-.}\"; if [ -x \"$RPROBE\" ] && [ -f \"$RPDIR/.planning/CHECKPOINT.md\" ]; then RPOUT=\"$(mktemp 2>/dev/null || printf '/tmp/hmd-resume-probe.%s' \"$$\")\"; if command -v perl >/dev/null 2>&1; then perl -e 'alarm 10; exec @ARGV' \"$RPROBE\" run --repo \"$RPDIR\" >\"$RPOUT\" 2>/dev/null; else \"$RPROBE\" run --repo \"$RPDIR\" >\"$RPOUT\" 2>/dev/null; fi; head -8 \"$RPOUT\" 2>/dev/null; rm -f \"$RPOUT\"; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled resume-probe && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; RPROBE=\"$PLUGIN/bin/heimdall-resume-probe\"; RPDIR=\"${CLAUDE_PROJECT_DIR:-.}\"; if [ -x \"$RPROBE\" ] && [ -f \"$RPDIR/.planning/CHECKPOINT.md\" ]; then RPOUT=\"$(mktemp 2>/dev/null || printf '/tmp/hmd-resume-probe.%s' \"$$\")\"; if command -v perl >/dev/null 2>&1; then perl -e 'alarm 10; exec @ARGV' \"$RPROBE\" run --repo \"$RPDIR\" >\"$RPOUT\" 2>/dev/null; else \"$RPROBE\" run --repo \"$RPDIR\" >\"$RPOUT\" 2>/dev/null; fi; head -8 \"$RPOUT\" 2>/dev/null; rm -f \"$RPOUT\"; fi; exit 0"
           }
         ]
       },
@@ -149,7 +158,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/heimdall-maintain-loop\" resume-hint --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled maintain-resume-hint && exit 0; \"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/heimdall-maintain-loop\" resume-hint --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
           }
         ]
       },
@@ -157,7 +166,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/heimdall-quota-resume\" resume-hint --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled quota-resume-hint && exit 0; \"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/heimdall-quota-resume\" resume-hint --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
           }
         ]
       },
@@ -165,7 +174,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; NOTICE=\"$PLUGIN/bin/heimdall-dream-notice\"; [ -x \"$NOTICE\" ] && \"$NOTICE\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled dream-notice && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; NOTICE=\"$PLUGIN/bin/heimdall-dream-notice\"; [ -x \"$NOTICE\" ] && \"$NOTICE\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
           }
         ]
       },
@@ -173,7 +182,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; if [ -x \"$HP\" ]; then SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); (\"$HP\" keeper-start --session \"$SID\" >/dev/null 2>&1 &) ; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled presence-keeper-start && exit 0; INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; if [ -x \"$HP\" ]; then SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); (\"$HP\" keeper-start --session \"$SID\" >/dev/null 2>&1 &) ; fi; exit 0"
           }
         ]
       },
@@ -181,7 +190,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; [ -x \"$HP\" ] && \"$HP\" connect-prompt 2>/dev/null || true"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled presence-connect-prompt && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; [ -x \"$HP\" ] && \"$HP\" connect-prompt 2>/dev/null || true"
           }
         ]
       },
@@ -189,7 +198,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; AISEL=\"$PLUGIN/bin/heimdall-ai-select\"; [ -x \"$AISEL\" ] && \"$AISEL\" session-start \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled ai-select && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; AISEL=\"$PLUGIN/bin/heimdall-ai-select\"; [ -x \"$AISEL\" ] && \"$AISEL\" session-start \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
           }
         ]
       },
@@ -205,7 +214,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then \"$CAV\" rules; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled caveman-rules && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then \"$CAV\" rules; fi; exit 0"
           }
         ]
       },
@@ -213,7 +222,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; SG=\"$PLUGIN/bin/heimdall-settings-guard\"; if [ -x \"$SG\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 5; exec @ARGV' \"$SG\" check --quiet --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; else \"$SG\" check --quiet --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; fi; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled settings-guard && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; SG=\"$PLUGIN/bin/heimdall-settings-guard\"; if [ -x \"$SG\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 5; exec @ARGV' \"$SG\" check --quiet --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; else \"$SG\" check --quiet --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; fi; fi; exit 0"
           }
         ]
       },
@@ -221,7 +230,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; VG=\"$PLUGIN/bin/heimdall-volatile-repo-guard\"; if [ -x \"$VG\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 5; exec @ARGV' \"$VG\" check --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; else \"$VG\" check --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; fi; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled volatile-repo-guard && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; VG=\"$PLUGIN/bin/heimdall-volatile-repo-guard\"; if [ -x \"$VG\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 5; exec @ARGV' \"$VG\" check --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; else \"$VG\" check --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; fi; fi; exit 0"
           }
         ]
       }
@@ -231,7 +240,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-metric-hook\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" stop --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled subagent-metric && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-metric-hook\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" stop --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
           }
         ]
       },
@@ -239,7 +248,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/hooks/heimdall-429-detect.sh\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled subagent-429-detect && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/hooks/heimdall-429-detect.sh\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
           }
         ]
       }
@@ -249,7 +258,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/hooks/heimdall-metric-reminder.sh\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled stop-metric-reminder && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/hooks/heimdall-metric-reminder.sh\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
           }
         ]
       },
@@ -257,7 +266,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-claim-check\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled stop-claim-check && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-claim-check\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
           }
         ]
       },
@@ -265,7 +274,15 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/hooks/heimdall-429-detect.sh\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled stop-429-detect && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/hooks/heimdall-429-detect.sh\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled stop-lint && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-stop-lint\"; if [ -x \"$HOOK\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 90; exec @ARGV' \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" --budget 60 2>&1 >/dev/null; else \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" --budget 60 2>&1 >/dev/null; fi; fi; exit 0"
           }
         ]
       }
@@ -275,7 +292,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; if [ -x \"$HP\" ]; then SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); \"$HP\" keeper-stop --session \"$SID\" >/dev/null 2>&1 || true; fi; exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled presence-keeper-stop && exit 0; INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; if [ -x \"$HP\" ]; then SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); \"$HP\" keeper-stop --session \"$SID\" >/dev/null 2>&1 || true; fi; exit 0"
           }
         ]
       },
@@ -283,7 +300,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; export PLUGIN; (CKPT=\"$PLUGIN/bin/heimdall-checkpoint\"; if [ -x \"$CKPT\" ] && { [ -d .planning ] || [ -f heimdall-state.json ] || [ -f superx-state.json ]; }; then \"$CKPT\" write . >/dev/null 2>&1 || true; fi; \"$PLUGIN/bin/parallelism-tracker\" grade 2>&1 || true; \"$PLUGIN/bin/verify-edits\" --quick 2>&1 || true; if [ ! -f .heimdall-no-autocommit ] && [ ! -f .superx-no-autocommit ] && git rev-parse --git-dir >/dev/null 2>&1 && [ -n \"$(git status --porcelain 2>/dev/null)\" ]; then if [ -x \"$PLUGIN/bin/heimdall-autocommit\" ]; then \"$PLUGIN/bin/heimdall-autocommit\" \"session-end checkpoint\" >/dev/null 2>&1 || true; fi; fi; CLEAN=\"$PLUGIN/bin/heimdall-cleanup\"; GC=\"$PLUGIN/bin/heimdall-gc\"; if [ -x \"$CLEAN\" ]; then \"$CLEAN\" --auto --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1; elif [ -x \"$GC\" ]; then \"$GC\" run --quiet >/dev/null 2>&1; fi; if [ -x \"$PLUGIN/bin/heimdall-reel\" ] && { [ -d .planning ] || [ -f heimdall-state.json ] || [ -f superx-state.json ]; }; then \"$PLUGIN/bin/heimdall-reel\" record . --name \"run-$(date +%Y%m%d-%H%M%S 2>/dev/null || echo run)\" >/dev/null 2>&1; fi; \"$PLUGIN/bin/summary-card\" --receipt . >/dev/null 2>&1; CTXSYNC=\"$PLUGIN/bin/heimdall-context-sync\"; if [ -x \"$CTXSYNC\" ] && [ -d .git ]; then \"$CTXSYNC\" sync --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1 || true; fi) >/dev/null 2>&1 & FAREWELL=\"$PLUGIN/sentinels/hmd-farewell.sh\"; [ -x \"$FAREWELL\" ] && bash \"$FAREWELL\" 2>/dev/null || true"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled session-end-sweep && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; export PLUGIN; (CKPT=\"$PLUGIN/bin/heimdall-checkpoint\"; if [ -x \"$CKPT\" ] && { [ -d .planning ] || [ -f heimdall-state.json ] || [ -f superx-state.json ]; }; then \"$CKPT\" write . >/dev/null 2>&1 || true; fi; \"$PLUGIN/bin/parallelism-tracker\" grade 2>&1 || true; \"$PLUGIN/bin/verify-edits\" --quick 2>&1 || true; if [ ! -f .heimdall-no-autocommit ] && [ ! -f .superx-no-autocommit ] && git rev-parse --git-dir >/dev/null 2>&1 && [ -n \"$(git status --porcelain 2>/dev/null)\" ]; then if [ -x \"$PLUGIN/bin/heimdall-autocommit\" ]; then \"$PLUGIN/bin/heimdall-autocommit\" \"session-end checkpoint\" >/dev/null 2>&1 || true; fi; fi; CLEAN=\"$PLUGIN/bin/heimdall-cleanup\"; GC=\"$PLUGIN/bin/heimdall-gc\"; if [ -x \"$CLEAN\" ]; then \"$CLEAN\" --auto --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1; elif [ -x \"$GC\" ]; then \"$GC\" run --quiet >/dev/null 2>&1; fi; if [ -x \"$PLUGIN/bin/heimdall-reel\" ] && { [ -d .planning ] || [ -f heimdall-state.json ] || [ -f superx-state.json ]; }; then \"$PLUGIN/bin/heimdall-reel\" record . --name \"run-$(date +%Y%m%d-%H%M%S 2>/dev/null || echo run)\" >/dev/null 2>&1; fi; \"$PLUGIN/bin/summary-card\" --receipt . >/dev/null 2>&1; CTXSYNC=\"$PLUGIN/bin/heimdall-context-sync\"; if [ -x \"$CTXSYNC\" ] && [ -d .git ]; then \"$CTXSYNC\" sync --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1 || true; fi) >/dev/null 2>&1 & FAREWELL=\"$PLUGIN/sentinels/hmd-farewell.sh\"; [ -x \"$FAREWELL\" ] && bash \"$FAREWELL\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled precompact-checkpoint && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; PC=\"$PLUGIN/bin/heimdall-precompact-checkpoint\"; if [ -x \"$PC\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 15; exec @ARGV' \"$PC\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; else \"$PC\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; fi; fi; exit 0"
           }
         ]
       }
