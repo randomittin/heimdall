@@ -5,21 +5,20 @@ All notable changes to Heimdall (formerly superx) will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Changelog status — plugin version 2.4.3 (2026-09-19)
+## Changelog status
 
-This file was not maintained between `[1.1.0]` (2026-04-19, when the project was still
-called superx) and the current plugin version, `2.4.3` (`.claude-plugin/plugin.json`,
-mirrored in `VERSION` and the README badge by `bin/heimdall-render-version`). No release
-notes for 1.1.0 → 2.4.3 have been reconstructed here, deliberately: writing them after the
-fact would be invention. The real history is in git:
+This file was not maintained between the last curated entry below (from when the
+project was still called superx) and the current plugin version. The version of
+record is `.claude-plugin/plugin.json`, mirrored into `VERSION` and the README badge
+by `bin/heimdall-render-version` -- it is deliberately not repeated here, because a
+hand-typed version drifts on the next bump (test/version-pin-conformance.test.sh
+exists for exactly that reason). No release notes for the gap have been
+reconstructed, deliberately: writing them after the fact would be invention. The
+real history is in git:
 
-- `git log --oneline v1.1.0..HEAD`, or `bin/generate-changelog --since <tag> --version <ver>`
-  (groups conventional commits in Keep a Changelog form; `release/ship.sh` uses the same
-  generator for GitHub Release bodies whenever this file has no curated `## [X.Y.Z]` section
-  for the version being shipped)
-- `hmd weekly-log` — the weekly digest
-
-Everything below this section is the pre-rename superx history, kept verbatim.
+- `git log --oneline <tag-of-the-last-curated-entry-below>..HEAD`
+- `bin/generate-changelog` (renders from commits, never hand-typed)
+- `hmd weekly-log` (drafts only)
 
 ## [Unreleased]
 
