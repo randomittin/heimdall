@@ -311,9 +311,9 @@
       "event": "SessionEnd",
       "index": 1,
       "id": "session-end-sweep",
-      "description": "Foreground, alarm-bounded (10s): checkpoint write — the never-lose contract, must land before the hook returns. Background: parallelism grade, verify-edits --quick, autocommit, cleanup, reel, summary-card, context-sync; then the farewell.",
+      "description": "Foreground, each alarm-bounded (10s): checkpoint write, then autocommit — the never-lose contract; both must land before the hook returns (a checkpoint written but not committed is lost on `git worktree remove`). Background: parallelism grade, verify-edits --quick, cleanup, reel, summary-card, context-sync; then the farewell.",
       "matcher": "",
-      "fingerprint": "dd7c4f8855f13b8d023e8d3f3ab8a5ac52221412572b298a44758a5b5fc493b8",
+      "fingerprint": "b6ac5b343006ce0e541f7ac3c352d6fccd75c8b3899adfa0bb547969f84994da",
       "locked": false
     },
     {
