@@ -2459,6 +2459,15 @@ case "${1:-}" in
     if [ -x "$_vrg" ]; then exec "$_vrg" "$@"; fi
     echo "error: heimdall-volatile-repo-guard not found at $_vrg" >&2; exit 2
     ;;
+  ui)
+    # Pass-through to heimdall-ui: the loopback companion web UI
+    # (.planning/plans/PLAN-companion-ui.md, Wave 1). A READ-ONLY renderer over
+    # the state hmd already writes; binds 127.0.0.1 with a per-launch token.
+    shift
+    _ui="$(cd "$(dirname "$0")" && pwd)/heimdall-ui"
+    if [ -x "$_ui" ]; then exec "$_ui" "$@"; fi
+    echo "error: heimdall-ui not found at $_ui" >&2; exit 2
+    ;;
   settings-guard)
     # Detect ANTHROPIC_* routing overrides persisted into a Claude Code
     # settings.json env block, which are applied on every launch and
@@ -3406,6 +3415,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall queue drain [--forever|--drain-empty]  Drain the local work queue"
   echo "  heimdall settings-guard <check|fix>  Find ANTHROPIC_* overrides hidden in settings.json"
   echo "  heimdall volatile-repo-guard <check|explain>  Warn if this clone is on disk the OS may wipe"
+  echo "  heimdall ui [--repo D] [--port N]  Live companion web UI for this session (loopback + token)"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
