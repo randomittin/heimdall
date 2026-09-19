@@ -128,8 +128,13 @@ lintconfig_protected_basename() {
 PYPROJECT_TABLE_RE='^[[:space:]]*\[\[?tool\.(ruff|mypy|pyright|black|isort|pylint)(\]|\.)'
 
 # Print only the lines of a TOML body that sit inside a protected table.
+# The regex reaches awk through ENVIRON, not `-v`: awk applies backslash
+# escape processing to -v values, which turns `\[` into `[` and silently
+# breaks the pattern (verified on macOS awk -- every table then read as
+# protected and [project] edits were refused).
 pyproject_protected_text() {
-  awk -v re="$PYPROJECT_TABLE_RE" '
+  HMD_LINTCONFIG_TABLE_RE="$PYPROJECT_TABLE_RE" awk '
+    BEGIN { re = ENVIRON["HMD_LINTCONFIG_TABLE_RE"] }
     /^[[:space:]]*\[/ { prot = ($0 ~ re) ? 1 : 0 }
     prot { print }
   ' 2>/dev/null
