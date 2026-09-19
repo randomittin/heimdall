@@ -2,7 +2,7 @@
   "plan": ".planning/plans/PLAN-companion-ui.md",
   "oracle": {
     "registry_domain": null,
-    "note": "No evals/oracles/registry.json domain matches a local dashboard/companion-UI target (jq -r '.oracles|keys[]' lists emulator-gb, exchange-lob, issue-collection, ponytail-underdelivery, rr-multitenant-isolation, symbol-reuse, team-checkpoint, team-copilot, triage-coord). Gates are independent example+verdict falsifiers authored by hmd:test-runner in a separate wave-slot from hmd:coder, proven capable of going red via a two-state fixture-mutation assertion (see companion-ui-oracle-test). Flagged for a reviewer to decide whether to add a 'companion-ui' or 'local-http-tool' registry domain. The same absence applies to Wave 4's job-panels surface (companion-ui-panels-test): its gate is example+verdict (planted accept/reject fixture pairs plus an XSS-non-execution assertion), independently authored from evals/oracles/companion-ui/PANEL-INVARIANTS.md only."
+    "note": "No evals/oracles/registry.json domain matches a local dashboard/companion-UI target (jq -r '.oracles|keys[]' lists emulator-gb, exchange-lob, issue-collection, ponytail-underdelivery, rr-multitenant-isolation, symbol-reuse, team-checkpoint, team-copilot, triage-coord). Gates are independent example+verdict falsifiers authored by hmd:test-runner in a separate wave-slot from hmd:coder, proven capable of going red via a two-state fixture-mutation assertion (see companion-ui-oracle-test). Flagged for a reviewer to decide whether to add a 'companion-ui' or 'local-http-tool' registry domain. The same absence applies to Wave 4's job-panels surface (companion-ui-panels-test): its gate is example+verdict (planted accept/reject fixture pairs plus an XSS-non-execution assertion), independently authored from evals/oracles/companion-ui/PANEL-INVARIANTS.md only. Wave 5's relay+pairing surface (companion-relay-test) has the same registry absence; its gate is example+verdict PLUS a seeded multi-seed concurrent-claim race assertion (never a fixed-yield dispatch) standing in for a property check on the one genuinely concurrent invariant (single-use-under-contention), independently authored from evals/oracles/companion-ui/RELAY-INVARIANTS.md and PLAN-companion-ui.md's Decision 7 only."
   },
   "waves": [
     {
@@ -184,6 +184,143 @@
             "bash test/heimdall-ui-panels.test.sh"
           ],
           "prompt": "Read ONLY evals/oracles/companion-ui/PANEL-INVARIANTS.md and .planning/plans/PLAN-companion-ui.md's Decision 6 section (the panel contract) and section 6's Wave 4 companion-ui-panels-test task body. Do NOT read bin/lib/companion_ui_panels.py's implementation before writing your assertions -- derive every assertion from the contract documents only. Also read test/heimdall-ui.test.sh (Wave 1's sibling test) purely for its hermetic HOME/HEIMDALL_HOME-redirection and token-capture bash pattern, and test/heimdall-watch-live.test.sh:83-84 for the macOS timeout/gtimeout portability pattern -- reuse both verbatim, do not re-derive. Create test/fixtures/companion-ui-panels/ with a planted valid timeseries panel payload and a planted invalid payload set (unrecognized type, a 'source' key, a secret-shaped string, an oversized data array exceeding 200 items) used inline by the script. Create test/heimdall-ui-panels.test.sh (bash) that, against a running bin/heimdall-ui instance over the fixture root, asserts in sequence: (1) 'hmd ui panel set demo --type timeseries --title Demo --data-json -' with a valid piped payload exits 0 and .heimdall/ui/panels/demo.json exists; (2) the same command with --type chart3d exits nonzero and no file is written; (3) a payload carrying a top-level 'source' key exits nonzero and no file is written; (4) a payload whose data contains a secret-shaped string (e.g. 'a Stripe-live-shaped token (the sk_live_ prefix followed by 24 alphanumerics -- written out in words here on purpose: GitHub push protection and gitleaks both flag the literal shape, correctly)') exits nonzero and no file is written; (5) a markdown panel whose data.text is '<script>alert(1)</script>' is accepted (markdown text itself is not secret-shaped) but curling the running server's served page/state never contains the literal unescaped substring '<script>alert' -- assert via grep -c on the curl output that the raw substring count is zero; (6) a payload with a data list exceeding MAX_LIST_ITEMS=200 entries is rejected; (7) 'hmd ui panel rm demo' removes the file and the next /api/state poll's panels array no longer contains id 'demo'; kills the server and its process group on exit via a trap; exits 0 only if every assertion passed. Before marking this task done, perform the falsifiability proof once: in a LOCAL COPY of bin/lib/companion_ui_panels.py, comment out the secret_shaped() call inside validate_panel, re-run assertion (4) above, confirm it goes RED (the secret-shaped panel is wrongly accepted), then discard that temporary edit without committing it. Report the red-then-green proof in your completion summary."
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-relay-invariants",
+          "agent": "hmd:docs-writer",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "evals/oracles/companion-ui/RELAY-INVARIANTS.md, evals/oracles/companion-ui/COVERAGE.md",
+          "skills": ["superpowers:writing-plans"],
+          "acceptance": [
+            "test -f evals/oracles/companion-ui/RELAY-INVARIANTS.md",
+            "grep -q 'pairing_code' evals/oracles/companion-ui/RELAY-INVARIANTS.md",
+            "grep -qi 'single-use\\|single use' evals/oracles/companion-ui/RELAY-INVARIANTS.md",
+            "grep -q '60' evals/oracles/companion-ui/RELAY-INVARIANTS.md",
+            "grep -qi 'X25519' evals/oracles/companion-ui/RELAY-INVARIANTS.md",
+            "grep -qi 'ChaCha20\\|AEAD' evals/oracles/companion-ui/RELAY-INVARIANTS.md",
+            "grep -qi 'relay' evals/oracles/companion-ui/COVERAGE.md"
+          ],
+          "prompt": "Read .planning/plans/PLAN-companion-ui.md's Decision 7 section verbatim (do not paraphrase from memory), evals/oracles/companion-ui/INVARIANTS.md (the Wave 0 sibling, same shape to mirror), bin/lib/cp_nonce.py, bin/lib/cp_auth.py:1-140, bin/lib/cp_session.py:1-130. Create evals/oracles/companion-ui/RELAY-INVARIANTS.md transcribing as CHECKABLE statements, not prose: the QR payload shape {v, relay, session_id, pairing_code, exp, hmd_pubkey}; the pairing_code single-use + 60-second-expiry rule; that hmd_pubkey rides the QR only, never the relay; the X25519 ECDH + HKDF key derivation and ChaCha20Poly1305 AEAD sealing rule for every command/state/ack envelope; the message envelope schema (v, session_id, seq, sender, type, nonce, ciphertext) exactly as specified in Decision 7; the rule that device_bound/session_ended are the only two unencrypted control-frame types and a client must reject any other type with ciphertext:null; the monotonic-seq replay-rejection rule; the fail-closed e2e_available() contract (mirroring cp_auth.py's crypto_available()); and the Decision 7.4 V1 action whitelist (identical to Decision 4's four safe actions) plus the never-exposed list. Append a 'Relay + pairing' section to evals/oracles/companion-ui/COVERAGE.md transcribing this PLAN's Decision-7-related coverage rows verbatim (in-scope: pairing init/claim/single-use/expiry, concurrent-claim race, E2E seal/open + replay rejection, V1 actions; permanently descoped: the mobile app itself, V2 prompt-send, push notification transport, a physical two-device CI test). Do NOT write any code."
+        },
+        {
+          "id": "companion-mobile-contract",
+          "agent": "hmd:docs-writer",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "docs/companion-app/MOBILE-CONTRACT.md",
+          "skills": ["superpowers:writing-plans"],
+          "acceptance": [
+            "test -f docs/companion-app/MOBILE-CONTRACT.md",
+            "grep -q 'pairing_code' docs/companion-app/MOBILE-CONTRACT.md",
+            "grep -q 'hmd_pubkey' docs/companion-app/MOBILE-CONTRACT.md",
+            "grep -qi 'keychain\\|keystore' docs/companion-app/MOBILE-CONTRACT.md",
+            "grep -qi 'react-native\\|expo' docs/companion-app/MOBILE-CONTRACT.md",
+            "grep -q 'session_ended' docs/companion-app/MOBILE-CONTRACT.md",
+            "grep -q 'device_bound' docs/companion-app/MOBILE-CONTRACT.md",
+            "grep -qi 'X25519' docs/companion-app/MOBILE-CONTRACT.md",
+            "grep -qi 'V1\\|V2' docs/companion-app/MOBILE-CONTRACT.md"
+          ],
+          "prompt": "Read .planning/plans/PLAN-companion-ui.md's Decision 7 section in full (all six sub-decisions, the numbered pairing protocol, the message envelope schema, and the threat model paragraph) verbatim, and skills/stacks/react-native/PACK.md. Create docs/companion-app/MOBILE-CONTRACT.md as a spec document (not code) for an engineer in a SEPARATE Expo/React Native repository who has zero context on this repo, covering: (1) the QR payload shape and how to parse it after a camera scan; (2) the exact pairing sequence the app must implement -- generate an ephemeral X25519 keypair, POST {session_id, pairing_code, device_pubkey, device_name} to <relay>/relay/pair/claim, receive {device_token, exp}, derive the shared session key via ECDH(device_priv, hmd_pubkey-from-QR) + HKDF; (3) the message envelope schema verbatim (v, session_id, seq, sender, type, nonce, ciphertext) and the per-type inner payload shapes (state, command, ack, device_bound, session_ended); (4) the requirement to store the device_token and the derived session key in platform secure storage (iOS Keychain / Android Keystore) as a HARD REQUIREMENT, not a suggestion; (5) how to open the authenticated SSE-equivalent read channel to receive state/panels frames and render the 13-key state contract (reference PLAN-companion-ui.md section 4) plus the closed panel type set (reference Decision 6); (6) the four notification types to surface (gate red/green transition, agent done, needs human, coop routed) and the four V1 whitelisted actions the app may send as command envelopes (save-checkpoint, view-receipt, hook-toggle, open-reel) with their params shapes; (7) an explicit 'DO NOT BUILD' section listing V2 free-text prompt-send (deferred, gated on device-trust not yet built), and the permanent never-exposed list (routing/fallback state changes, git push/commit, secrets/PKI/team-secret material, locked hooks) -- the app must never construct a command envelope naming any action outside the V1 whitelist; (8) session-lifecycle handling: on receiving {\"type\":\"session_ended\"} show an ended state and offer rebind (new QR scan), and reject as invalid any received frame whose type is not one of state/command/ack/device_bound/session_ended or whose ciphertext is null for a type other than device_bound/session_ended. Do NOT write any code -- this is a specification document only."
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-relay-server",
+          "agent": "hmd:coder",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "bin/lib/cp_relay.py, bin/lib/cp_server.py",
+          "skills": [],
+          "acceptance": [
+            "grep -q 'def register' bin/lib/cp_relay.py",
+            "grep -q 'pair/init' bin/lib/cp_relay.py",
+            "grep -q 'pair/claim' bin/lib/cp_relay.py",
+            "grep -q 'cp_nonce\\|consumed' bin/lib/cp_relay.py",
+            "grep -q 'cp_auth' bin/lib/cp_relay.py",
+            "grep -q 'cp_state' bin/lib/cp_relay.py",
+            "grep -q 'text/event-stream' bin/lib/cp_relay.py",
+            "grep -q 'session_ended' bin/lib/cp_relay.py",
+            "python3 -c \"import ast; ast.parse(open('bin/lib/cp_relay.py').read())\"",
+            "grep -q 'cp_relay' bin/lib/cp_server.py",
+            "python3 -c \"import ast; ast.parse(open('bin/lib/cp_server.py').read())\""
+          ],
+          "prompt": "Read evals/oracles/companion-ui/RELAY-INVARIANTS.md, .planning/plans/PLAN-companion-ui.md's Decision 7 section in full, bin/lib/cp_session.py (whole file -- the direct structural precedent), bin/lib/cp_auth.py:1-140 (verify, sign, crypto_available), bin/lib/cp_nonce.py (single-use+window precedent), bin/lib/cp_server.py:1-60,120-170,726-810 (register_route, register_public_route, register_extended_routes), bin/lib/cp_state.py:1-60,215-345 (put_record/get_record, Firestore-safe). Create bin/lib/cp_relay.py with a register(home=home) function mirroring cp_session.register's shape, registering these routes: POST /relay/pair/init on the authenticated seam (register_route) -- verifies the caller's HAID signature via cp_auth.verify, mints a pairing_code via os.urandom (26-char base32, >=128 bits), stores {session_id, hmd_haid, pairing_code, exp: now+60, consumed:false} via cp_state.put_record, returns {session_id, pairing_code, exp}; POST /relay/pair/claim on the PRE-AUTH seam (register_public_route) -- looks up the record by pairing_code, validates it exists/matches session_id/is unexpired/is unconsumed atomically (the read-check-mark-consumed must happen as a single guarded operation to prevent a concurrent-claim race), on success marks consumed:true, stores device_pubkey+device_name on the session record, mints a CP-signed device token in the EXACT base64url(payload)+'.'+base64(sig) shape cp_session.mint_token already uses (payload: {session_id, device_pubkey_fp, scope:'session-limited', owner:false, exp: now+SESSION_TTL}, signed via cp_auth.sign with the CP's own key), returns {device_token, exp}; on any validation failure returns a GENERIC 401 (never distinguishing wrong-code from expired from already-claimed in the response body or status code choice); GET /relay/session/<id>/stream on the authenticated seam -- SSE (text/event-stream), verifies the caller's HAID signature, sends queued envelope frames for that session_id, pushes a device_bound control frame ({type:'device_bound', device_pubkey, device_name}, ciphertext:null) immediately when a claim binds a device; POST /relay/session/<id>/command authenticated by the device_token (validate exp, scope=='session-limited', session_id match) -- enqueues the received envelope durably via cp_state for the stream consumer; POST /relay/session/<id>/end on the authenticated seam -- marks the session ended, invalidates the device token, and the next read on either the stream or a command attempt against this session_id returns a session_ended control frame/error. Modify bin/lib/cp_server.py's register_extended_routes function (lines 726-745): add 'import cp_relay' alongside the existing cp_session/cp_god imports, and add '\"relay\": cp_relay.register(home=home)' to the returned dict alongside the existing session/god entries -- no other line in this function changes."
+        },
+        {
+          "id": "companion-qr",
+          "agent": "hmd:coder",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "bin/lib/companion_qr.py, sentinels/companion-qr.js",
+          "skills": [],
+          "acceptance": [
+            "test -f bin/lib/companion_qr.py",
+            "grep -q 'def render_terminal' bin/lib/companion_qr.py",
+            "python3 -c \"import ast; ast.parse(open('bin/lib/companion_qr.py').read())\"",
+            "test -f sentinels/companion-qr.js",
+            "grep -q 'renderQRToCanvas' sentinels/companion-qr.js"
+          ],
+          "prompt": "Read evals/oracles/companion-ui/RELAY-INVARIANTS.md, .planning/plans/PLAN-companion-ui.md's Decision 7.2 section, bin/lib/watch_data.py (whole file, as a size/style precedent for a dependency-free ~300-line stdlib module). Create bin/lib/companion_qr.py: a dependency-free QR code encoder implementing Reed-Solomon error-correction codeword generation, data/ECC codeword interleaving, and standard QR matrix placement (finder patterns, alignment patterns, timing patterns, format/version information, and mask-pattern selection choosing the mask that minimizes the standard QR penalty score), fixed to error-correction level M (15% recovery), supporting at minimum QR versions 1 through 10 (enough capacity for the ~140-byte pairing payload with comfortable margin). Expose render_terminal(payload_bytes: bytes) -> str returning a string that prints the QR code to a terminal using half-block Unicode characters (▀ U+2580, ▄ U+2584, space) so two QR module-rows render per terminal text-row. Add a __main__ CLI block: `python3 companion_qr.py --data-json FILE_OR_DASH` reads the given file (or stdin for '-'), treats its content as the raw bytes/string to encode (JSON-encode it if it's parsed as a JSON object, else encode the raw bytes), and prints the terminal render. Create sentinels/companion-qr.js: a vendored, dependency-free JavaScript QR encoder (same algorithm: Reed-Solomon + matrix placement + masking, ECC level M) exposing exactly one global function `renderQRToCanvas(text, canvasElement)` that computes the QR matrix for `text` and draws it onto the given HTML canvas element (black/white modules, sized to fill the canvas). No CDN reference, no import statement, no build step, no external fetch -- pure vendored JS matching the rest of sentinels/'s single-static-file posture. Before marking this task done, manually verify once that a real phone camera (or a QR-scanning app) can successfully scan a QR rendered by both the terminal and canvas paths for a realistic ~140-byte JSON payload matching the Decision 7.2 pairing payload shape; report this manual verification in the completion summary."
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-relay-client",
+          "agent": "hmd:coder",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "bin/lib/cp_e2e.py, bin/heimdall-ui, sentinels/hmd-ui.py, sentinels/hmd-ui.html",
+          "skills": [],
+          "acceptance": [
+            "test -f bin/lib/cp_e2e.py",
+            "grep -q 'e2e_available' bin/lib/cp_e2e.py",
+            "grep -q 'X25519' bin/lib/cp_e2e.py",
+            "grep -q 'ChaCha20Poly1305\\|pynacl' bin/lib/cp_e2e.py",
+            "grep -q 'E2EUnavailable' bin/lib/cp_e2e.py",
+            "python3 -c \"import ast; ast.parse(open('bin/lib/cp_e2e.py').read())\"",
+            "grep -q 'pair' bin/heimdall-ui",
+            "grep -q 'devices' bin/heimdall-ui",
+            "grep -q 'revoke' bin/heimdall-ui",
+            "bash -n bin/heimdall-ui",
+            "grep -q 'cp_e2e' sentinels/hmd-ui.py",
+            "grep -q 'api/pair' sentinels/hmd-ui.py",
+            "python3 -c \"import ast; ast.parse(open('sentinels/hmd-ui.py').read())\"",
+            "grep -qi 'companion-qr\\|renderQRToCanvas' sentinels/hmd-ui.html"
+          ],
+          "prompt": "Read evals/oracles/companion-ui/RELAY-INVARIANTS.md, .planning/plans/PLAN-companion-ui.md's Decision 7 in full (all sub-decisions, the numbered protocol, envelope schema, threat model), bin/lib/cp_relay.py (as landed), bin/lib/companion_qr.py and sentinels/companion-qr.js (as landed), bin/heimdall-ui (as landed through Wave 4, including the panel subcommand guard clause), sentinels/hmd-ui.py (as landed through Wave 4), sentinels/hmd-ui.html (as landed through Wave 4), bin/lib/cp_auth.py:1-140 (sign, crypto_available, backend_name -- the guarded-import shape to mirror). Create bin/lib/cp_e2e.py mirroring cp_auth.py's guarded-import pattern exactly: try importing cryptography's X25519PrivateKey/X25519PublicKey and ChaCha20Poly1305, on failure try pynacl's Box/PrivateKey, on failure set _BACKEND=None; expose e2e_available() -> bool and backend_name() -> str|None (mirroring crypto_available()/backend_name()); generate_keypair() -> (private, public_b64); derive_shared_key(private, peer_public_b64) -> bytes via ECDH then HKDF-SHA256 to a 32-byte key; seal(key, plaintext_bytes) -> (nonce_b64, ciphertext_b64) using a fresh random 12-byte nonce per call; open_sealed(key, nonce_b64, ciphertext_b64) -> plaintext_bytes; every function raises a new E2EUnavailable exception (defined in this module) when _BACKEND is None -- fail closed, never a silent plaintext passthrough. Modify bin/heimdall-ui: add a 'pair' subcommand guard clause after the existing 'panel' guard clause (same shift-and-dispatch shape) that signs a pair/init assertion via cp_auth.sign using the local enrolled HAID key, POSTs it to the configured relay URL, receives {session_id, pairing_code, exp}, generates an ephemeral X25519 keypair via cp_e2e.generate_keypair(), composes the Decision-7.2 QR JSON payload {v:1, relay, session_id, pairing_code, exp, hmd_pubkey}, and renders it via bin/lib/companion_qr.py's render_terminal() to stdout when running in a TTY, or prints the /api/pair URL for the browser to render via companion-qr.js otherwise; add 'devices' (lists bound devices by calling the relay) and 'revoke <device_id>' (calls the relay's session end/device-revoke path) subcommands. Modify sentinels/hmd-ui.py: add a loopback-gated GET /api/pair route (same Decision 5 token gate as every other route) serving the current pending pairing payload as JSON for the browser's QR renderer; add a relay-stream consumer that, once a device_bound frame is received, derives the shared key via cp_e2e.derive_shared_key(hmd_ephemeral_private, device_pubkey_from_frame); on each existing poll tick, if a session is bound, seal the current digest-diffed collect_state() frame via cp_e2e.seal and POST it to the relay as a state envelope; on receiving a sealed command envelope from the relay, open it via cp_e2e.open_sealed, dispatch the named action via companion_ui_actions.dispatch (import already present from Wave 2), seal the result and send it back as an ack envelope; reject as invalid any envelope whose seq does not exceed the last-accepted seq for the session. Modify sentinels/hmd-ui.html: add a 'Pair a device' panel that fetches /api/pair and renders the QR via companion-qr.js's renderQRToCanvas, and a bound-devices list (name, first-paired, last-seen) with a revoke button per row wired to the new devices/revoke surface."
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-relay-test",
+          "agent": "hmd:test-runner",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "test/heimdall-relay-pairing.test.sh, test/fixtures/companion-relay/",
+          "skills": ["superpowers:systematic-debugging"],
+          "acceptance": [
+            "bash test/heimdall-relay-pairing.test.sh"
+          ],
+          "prompt": "Read ONLY evals/oracles/companion-ui/RELAY-INVARIANTS.md and .planning/plans/PLAN-companion-ui.md's Decision 7 section (all sub-decisions, the numbered pairing protocol, the envelope schema, the threat model) and section 6's Wave 5 companion-relay-test task body. Do NOT read bin/lib/cp_relay.py or bin/lib/cp_e2e.py's implementations before writing your assertions -- derive every assertion from the contract documents only, so the test is an independent reference. Also read test/heimdall-ui-panels.test.sh purely for its hermetic fixture-and-token-capture bash pattern and test/heimdall-watch-live.test.sh:83-84 for the macOS timeout/gtimeout portability pattern -- reuse both verbatim. Create test/fixtures/companion-relay/ with whatever minimal local-test-instance configuration the relay needs to run hermetically (a test HAID keypair for the signed pair/init caller, a test CP signing seed). Create test/heimdall-relay-pairing.test.sh (bash) asserting, against a locally-run instance of the relay routes: (1) a signed pair/init returns a pairing_code and the server-side record is NOT yet consumed; (2) pair/claim with the correct code+session_id inside the 60s window returns 200 and a device token that verifies against the CP's known test public key; (3) pair/claim with the SAME code a second time (after step 2's successful claim) returns 401 or 410, never 200; (4) pair/claim with an expired code returns 401 or 410; (5) a seeded race assertion: fire 20 concurrent pair/claim requests carrying the SAME valid unexpired code, each preceded by a randomized 0-50ms sleep drawn from a per-run seed printed to stdout, swept over at least 5 distinct seeds -- assert exactly ONE of the 20 receives 200 in every single seed run, never zero, never more than one; (6) a command envelope with seq <= the last-accepted seq for its session is refused; (7) a device_bound frame has ciphertext:null and a client-side check rejects any OTHER type value that also carries ciphertext:null. Kill any started server process/process group on exit via a trap; exit 0 only if every assertion passes across all swept seeds. Before marking this task done, perform the falsifiability proof once: in a LOCAL COPY of bin/lib/cp_relay.py, comment out the consumed-check inside the claim handler, re-run assertions (3) and (5) above, confirm BOTH go RED (a second claim succeeds, and/or more than one concurrent claim succeeds in at least one seed), then discard that temporary edit without committing it. Report the red-then-green proof in your completion summary."
         }
       ]
     }
