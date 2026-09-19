@@ -1,0 +1,7 @@
+{
+  "id": "planted-no-updated-at",
+  "title": "Missing updated_at",
+  "type": "number",
+  "data": { "value": 1 },
+  "refresh_s": 60
+}

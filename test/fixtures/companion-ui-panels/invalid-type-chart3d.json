@@ -1,0 +1,8 @@
+{
+  "id": "planted-chart3d",
+  "title": "Not a real type",
+  "type": "chart3d",
+  "data": { "x": [1, 2], "y": [3, 4] },
+  "refresh_s": 60,
+  "updated_at": 0
+}

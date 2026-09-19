@@ -1,0 +1,8 @@
+{
+  "id": "planted-xss",
+  "title": "Planted markdown",
+  "type": "markdown",
+  "data": { "text": "<script>alert(1)</script>**bold** `code`\n- item" },
+  "refresh_s": 60,
+  "updated_at": 0
+}

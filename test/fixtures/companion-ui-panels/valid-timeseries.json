@@ -1,0 +1,8 @@
+{
+  "id": "planted-ts",
+  "title": "Planted timeseries",
+  "type": "timeseries",
+  "data": { "x": ["2026-09-19T09:00:00Z", "2026-09-19T10:00:00Z", "2026-09-19T11:00:00Z"], "y": [12, 31, 7] },
+  "refresh_s": 60,
+  "updated_at": 0
+}

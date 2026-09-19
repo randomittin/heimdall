@@ -1,0 +1,9 @@
+{
+  "id": "planted-source",
+  "title": "RCE attempt",
+  "type": "number",
+  "data": { "value": 1 },
+  "source": "touch __CANARY__",
+  "refresh_s": 1,
+  "updated_at": 0
+}

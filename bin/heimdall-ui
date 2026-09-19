@@ -15,6 +15,11 @@
 #   hmd ui --print-sources     list every file/command the server reads (tester hook)
 #   hmd ui --print-deny-list   list the never-read patterns (team.json, *.key, .env* ...)
 #   hmd ui --print-state       collect the JSON contract once and print it
+#   hmd ui panel set <id> --type <t> --title <s> --data-json <file|-> [--refresh-s N]
+#                              publish a job panel tile (Wave 4, Decision 6): closed type set
+#                              kv|table|number|timeseries|bars|markdown|log-tail, inline data
+#                              only -- a `source` command is refused, so is a secret-shaped value
+#   hmd ui panel rm <id>       remove a panel;  hmd ui panel ls [--json]  list live panels
 #   hmd ui -h|--help           this help
 #
 # Auth: loopback bind + Host-header allowlist (403) + per-launch token (401). The
@@ -32,7 +37,7 @@ BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 SERVER="$BIN_DIR/../sentinels/hmd-ui.py"
 PAGE="$BIN_DIR/../sentinels/hmd-ui.html"
 
-usage() { sed -n '2,24p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,29p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -48,6 +53,14 @@ if [ -z "$PY3" ]; then
   echo "hmd ui needs a working python3 (none resolved by bin/lib/hmd-python.sh)." >&2
   echo "Install python3, or set HMD_PYTHON=/path/to/python3, then re-run: hmd ui" >&2
   exit 2
+fi
+# `hmd ui panel ...` -- the Wave 4 publish CLI. Same interpreter resolution as the
+# server, one shared module (bin/lib/companion_ui_panels.py) for the contract, and
+# it never reaches the server-launch flag parser below.
+LIB_DIR="$BIN_DIR/lib"
+if [ "${1:-}" = "panel" ]; then
+  shift
+  exec "$PY3" "$LIB_DIR/companion_ui_panels.py" "$@"
 fi
 if [ ! -f "$SERVER" ] || [ ! -f "$PAGE" ]; then
   echo "error: hmd ui server files not found at $SERVER / $PAGE" >&2

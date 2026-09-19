@@ -68,6 +68,7 @@ SOURCE_FILES = (
     ".planning/CHECKPOINT.md",            # header fields only, first 8 KB
     ".planning/reels/",                   # directory listing: name + mtime only
     ".planning/metrics.jsonl",            # last graded parallelism row (tail only)
+    ".heimdall/ui/panels/",               # job panels: <id>.json via companion_ui_panels.read_panels
 )
 # Under $TMPDIR: parallelism-tracker's live per-session counters (key=value text).
 # READ ONLY. `parallelism-tracker grade` is deliberately NOT called: it is the
