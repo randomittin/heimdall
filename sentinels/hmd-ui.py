@@ -155,6 +155,16 @@ def _load_module(name, path):
 
 WATCH_DATA = _load_module("watch_data", os.path.join(LIB_DIR, "watch_data.py"))
 LEDGER = _load_module("hmd_ledger", os.path.join(HERE, "hmd_ledger.py"))
+# Wave 4: the ONE place the job-panel contract lives (type set, caps, scrub, atomic
+# write). The `hmd ui panel` CLI imports the same module, so writer and reader agree.
+PANELS = _load_module("companion_ui_panels", os.path.join(LIB_DIR, "companion_ui_panels.py"))
+
+LIVE_USERS_PANEL_ID = "hmd-live-users"
+LIVE_USERS_REFRESH_S = 2
+# Republish the self-panel when its value changes or its age nears the stale
+# threshold (max(2*3, 30) = 30s) -- never every tick, or the digest would change
+# every 2s and the SSE stream could never be quiet.
+LIVE_USERS_REWRITE_AFTER_S = 15.0
 
 
 def _run(argv, cwd, timeout=CMD_TIMEOUT_S):
@@ -475,6 +485,43 @@ def collect_reels(root):
     return out[:REELS_LIMIT]
 
 
+def collect_panels(root):
+    """Wave 4 addendum: the `panels` array, always via companion_ui_panels.read_panels
+    (validated, scrubbed, capped, TTL-reaped) -- never a raw directory listing.
+    A missing panels dir, or a missing module, is simply []."""
+    if PANELS is None:
+        return []
+    return PANELS.read_panels(root)
+
+
+def publish_live_users(root, roster_count, previous, now=None):
+    """hmd dogfoods the panel publish path: the roster count /api/state already
+    computes becomes the `hmd-live-users` number tile, written in-process through
+    the exact companion_ui_panels.write_panel an agent's `hmd ui panel set` uses --
+    no subprocess, no second read of any presence file, never team.json.
+    `previous` is (value, written_at) or None; returns the new tuple, or `previous`
+    unchanged when nothing needed rewriting (value same, age under the rewrite bound)."""
+    if PANELS is None:
+        return previous
+    now = time.time() if now is None else now
+    if previous is not None and previous[0] == roster_count \
+            and now - previous[1] < LIVE_USERS_REWRITE_AFTER_S:
+        return previous
+    try:
+        PANELS.write_panel(root, LIVE_USERS_PANEL_ID, {
+            "id": LIVE_USERS_PANEL_ID,
+            "title": "hmd — live users",
+            "type": "number",
+            "data": {"value": int(roster_count), "format": "count"},
+            "refresh_s": LIVE_USERS_REFRESH_S,
+            "updated_at": now,
+        })
+    except (OSError, ValueError) as e:
+        sys.stderr.write("hmd-ui: could not publish %s: %s\n" % (LIVE_USERS_PANEL_ID, e.__class__.__name__))
+        return previous
+    return (roster_count, now)
+
+
 def collect_state(root):
     """The section-4 contract. Each slice degrades independently: object-typed
     slices keep their keys with null values, array slices go empty, and the two
@@ -499,11 +546,21 @@ def collect_state(root):
         "checkpoint": safe(collect_checkpoint),
         "reels": safe(collect_reels, list),
         "edits": safe(collect_edits),
+        "panels": safe(collect_panels, list),
     }
 
 
 def canonical_json(state):
     return json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def json_for_wire(obj):
+    """JSON for the HTTP body / SSE frame with `<`, `>` and `&` written as \\uXXXX
+    escapes. Identical value after JSON.parse; but no job-supplied panel string can
+    ever put a literal `<script` or `</` byte sequence on the wire, so the served
+    bytes are inert even if a consumer other than this page's JSON.parse sees them."""
+    return (json.dumps(obj, ensure_ascii=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
 
 
 def digest_of(state):
@@ -526,9 +583,21 @@ class StateCache:
         self._state = None
         self._digest = None
         self._stop = threading.Event()
+        self._live_users = None   # (value, written_at) of the self-published panel
 
-    def refresh(self):
+    def refresh(self, publish=False):
         state = collect_state(self.root)
+        if publish:
+            # Poll-tick only (never on a GET): publish hmd's own live-users tile from
+            # the roster count just collected, then re-read panels so THIS frame
+            # already carries the fresh value instead of waiting one more tick.
+            before = self._live_users
+            self._live_users = publish_live_users(self.root, len(state.get("roster") or []), before)
+            if self._live_users is not before:
+                try:
+                    state["panels"] = collect_panels(self.root)
+                except Exception:
+                    state["panels"] = []
         digest = digest_of(state)
         with self._cond:
             self._state = state
@@ -554,7 +623,7 @@ class StateCache:
 
     def run(self):
         while not self._stop.is_set():
-            self.refresh()
+            self.refresh(publish=True)
             self._stop.wait(POLL_INTERVAL_S)
 
     def start(self):
@@ -608,7 +677,7 @@ class UIHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _send_json(self, code, obj):
-        self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
+        self._send(code, json_for_wire(obj), "application/json; charset=utf-8")
 
     def _host_ok(self):
         host = (self.headers.get("Host") or "").strip().lower()
