@@ -27,6 +27,18 @@ ok()  { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 
 TMPROOT="$(mktemp -d)"
+# HERMETICITY GUARD (2026-09-19). The hook's project resolution ends in `$PWD`
+# (--repo > CLAUDE_PROJECT_DIR > payload cwd > cwd). A case that gives it none of
+# the first three, run from the repo root as test/run-all.sh does, made it write
+# .planning/ledger/checkpoints/<haid>.json into the REAL repo -- the full sweep's
+# tree-integrity check caught a tracked file changing mid-run. Two defences:
+# run every case from a scratch cwd with no .planning (a $PWD fallback then finds
+# nothing to act on), and assert at the end that no ledger checkpoint under the
+# real repo changed during this suite.
+cd "$TMPROOT"
+unset CLAUDE_PROJECT_DIR
+LEDGER_GLOB="$REPO/.planning/ledger/checkpoints/*.json"
+LEDGER_BEFORE="$(shasum -a 256 $LEDGER_GLOB 2>/dev/null | sort)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
 # A fresh throwaway git project with a .planning dir (same shape the autosave
@@ -224,6 +236,14 @@ case "$codes" in
   *" 2"*) bad "18. some input produced exit 2 (would BLOCK compaction): codes=$codes" ;;
   *)      ok  "18. no input produced exit 2 (codes:$codes)" ;;
 esac
+
+# ── 19. the REAL repo's ledger checkpoints are byte-identical to when we started ──
+LEDGER_AFTER="$(shasum -a 256 $LEDGER_GLOB 2>/dev/null | sort)"
+if [ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ]; then
+  ok "19. no case wrote into the real repo's .planning/ledger/checkpoints (hermetic)"
+else
+  bad "19. a case wrote into the REAL repo's ledger checkpoints -- the tree-integrity class of bug"
+fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
