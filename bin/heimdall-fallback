@@ -1068,6 +1068,26 @@ def _parse_allowed_connections(raw):
     return [str(x) for x in parsed if isinstance(x, str) and x.strip()]
 
 
+def _iso_timestamp_is_past(value):
+    """True iff `value` is a positively parseable ISO-8601 timestamp that is
+    already in the past. OmniRoute writes e.g. '2026-09-19T03:01:21.653Z'.
+    NULL, empty, or anything the parser rejects -> False: an expiry hmd cannot
+    read is not evidence the key has expired."""
+    if value in (None, ""):
+        return False
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        import datetime as _dt
+        when = _dt.datetime.fromisoformat(text)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_dt.timezone.utc)
+        return when < _dt.datetime.now(_dt.timezone.utc)
+    except (ValueError, TypeError):
+        return False
+
+
 def _gateway_key_scope(cfg, provider):
     """The gateway_key_scope preflight check -- returns (ok, reason).
 
@@ -1107,8 +1127,8 @@ def _gateway_key_scope(cfg, provider):
                       "since absence of the DB is not evidence the key is mis-scoped" % db_path)
     rows, err = _query_omniroute(
         db_path,
-        "SELECT id, name, allowed_connections, is_active, revoked_at, is_banned FROM api_keys "
-        "WHERE COALESCE(key_prefix, substr(key, 1, %d)) = ?" % GATEWAY_KEY_PREFIX_LEN,
+        "SELECT id, name, allowed_connections, is_active, revoked_at, is_banned, expires_at "
+        "FROM api_keys WHERE COALESCE(key_prefix, substr(key, 1, %d)) = ?" % GATEWAY_KEY_PREFIX_LEN,
         (prefix,),
     )
     if err is not None:
@@ -1122,20 +1142,25 @@ def _gateway_key_scope(cfg, provider):
             "update the token file")
     live = []
     for row in rows:
-        row_id, name, allowed_raw, is_active, revoked_at, is_banned = row
+        row_id, name, allowed_raw, is_active, revoked_at, is_banned, expires_at = row
         try:
             active = int(is_active if is_active is not None else 1) == 1
             banned = int(is_banned or 0) == 1
         except (TypeError, ValueError):
             active, banned = True, False
-        if active and not banned and revoked_at in (None, ""):
+        # expires_at: a key past its expiry 401s exactly like a revoked one, so it
+        # is dead for routing purposes. Only a POSITIVELY parsed, positively past
+        # timestamp counts; NULL, empty, or an unparseable value is treated as
+        # not-expired (fail-open on a format hmd does not own).
+        if active and not banned and revoked_at in (None, "") and not _iso_timestamp_is_past(expires_at):
             live.append((str(row_id), str(name or ""), allowed_raw))
     if not live:
         row_id, name = str(rows[0][0]), str(rows[0][1] or "")
         return False, (
-            "gateway key '%s' (api_keys id %s) matches the token but is revoked, inactive, or "
-            "banned in OmniRoute -- the gateway will 401 it. Fix: re-enable it in OmniRoute's "
-            "dashboard, or regenerate the key and update the token file" % (name, row_id))
+            "gateway key '%s' (api_keys id %s) matches the token but is revoked, inactive, "
+            "banned, or expired in OmniRoute -- the gateway will 401 it. Fix: re-enable or "
+            "extend it in OmniRoute's dashboard, or regenerate the key and update the token "
+            "file" % (name, row_id))
     parsed = []
     for row_id, name, allowed_raw in live:
         allowed = _parse_allowed_connections(allowed_raw)

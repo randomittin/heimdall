@@ -114,6 +114,41 @@ conn.commit(); conn.close()
 " "$db" "$provider" "$key"
 }
 
+# make_scope_db <db_file> <provider> <conn_id> <key_prefix> <allowed_json> [revoked_at]
+# provider_connections (TEXT uuid id, as on a real install -- the allowlist
+# holds these ids) + api_keys with the REAL column names read off a live
+# OmniRoute install 2026-09-19 (id, name, key, key_prefix, allowed_connections,
+# is_active, revoked_at, expires_at, is_banned). The stored `key` is a fake
+# whose first 12 chars equal key_prefix, exactly as the live rows are shaped
+# (`key_prefix = substr(key,1,12)` verified true on every row). The api key
+# row id is a fixed fake UUID so tests can assert it is named in a FAIL.
+SCOPE_KEY_ROW_ID="4b3c2d1e-0000-4000-8000-feedfacecafe"
+make_scope_db() {
+  local db="$1" provider="$2" conn_id="$3" prefix="$4" allowed="$5" revoked="${6:-}"
+  python3 -c "
+import sqlite3, sys
+db, provider, conn_id, prefix, allowed, revoked, row_id = sys.argv[1:8]
+conn = sqlite3.connect(db)
+conn.execute('CREATE TABLE IF NOT EXISTS provider_connections (id TEXT PRIMARY KEY, provider TEXT, mode TEXT, test_status TEXT, last_error_type TEXT, last_error TEXT, is_active INTEGER DEFAULT 1, api_key TEXT)')
+conn.execute(\"CREATE TABLE IF NOT EXISTS upstream_proxy_config (id INTEGER PRIMARY KEY, provider_id TEXT, mode TEXT NOT NULL DEFAULT 'native', fallback_backend TEXT NOT NULL DEFAULT 'cliproxyapi')\")
+conn.execute('CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, key TEXT NOT NULL UNIQUE, key_prefix TEXT, allowed_connections TEXT, is_active INTEGER NOT NULL DEFAULT 1, revoked_at TEXT, expires_at TEXT, is_banned INTEGER NOT NULL DEFAULT 0, created_at TEXT)')
+conn.execute('INSERT INTO provider_connections (id, provider, test_status, is_active, api_key) VALUES (?, ?, ?, 1, ?)', (conn_id, provider, 'active', 'enc:fixture-not-a-secret'))
+conn.execute('INSERT INTO api_keys (id, name, key, key_prefix, allowed_connections, is_active, revoked_at, is_banned, created_at) VALUES (?, ?, ?, ?, ?, 1, ?, 0, ?)',
+             (row_id, 'heimdall-fallback', prefix + '-stored-fake-remainder', prefix, allowed or None, revoked or None, '2026-09-19T00:00:00Z'))
+conn.commit(); conn.close()
+" "$db" "$provider" "$conn_id" "$prefix" "$allowed" "$revoked" "$SCOPE_KEY_ROW_ID"
+}
+
+# write_token_file <path> -- a 0600 fake gateway token whose first 12 chars
+# are SCOPE_TOKEN_PREFIX; the remainder is a sentinel the suite asserts NEVER
+# appears in any output.
+SCOPE_TOKEN_PREFIX="ombx_test123"
+SCOPE_TOKEN_TAIL="FAKE-REMAINDER-NEVER-PRINTED"
+write_token_file() {
+  printf '%s-%s\n' "$SCOPE_TOKEN_PREFIX" "$SCOPE_TOKEN_TAIL" > "$1"
+  chmod 600 "$1"
+}
+
 # add_proxy_config_row <db_file> <provider_id> <mode> [fallback_backend]
 # Inserts one upstream_proxy_config row -- for the delegated-sidecar-in-DB
 # falsifiers. `mode` vocabulary ('native'|'cliproxyapi'|'dario'|'fallback')
@@ -419,6 +454,164 @@ else
 fi
 
 echo "--------------------------------------------------------------------"
+
+# ── 62. NEW: gateway_key_scope -- the gateway KEY must allow the target's
+# connection. Measured 2026-09-19 (cost days): api_keys.allowed_connections
+# was pinned to one connection id; OmniRoute filters by that allowlist BEFORE
+# credential lookup, so every other provider failed 'No active credentials'
+# while connection_health and operator_key both passed. Only the 12-char
+# key_prefix is ever compared; the `key` column is never selected. ──────────
+DAHL_CONN="9507c052-ef9f-45d1-b6f7-97e214595ff8"
+OTHER_CONN="cc65e288-0bac-408d-bd6b-c0edc6bc0e05"
+scope_cfg() { # $1=repo $2=db $3=token_path
+  write_cfg "$1" "{\"state\": \"switch\", \"target_provider\": \"dahl\", \"operator_key_env\": \"\", \"omniroute_db_path\": \"$2\", \"gateway_token_file\": \"$3\"}"
+}
+
+# 62a. unscoped key (allowed_connections NULL) -> PASS
+R="$(fresh_repo)"; DB="$R/scope.sqlite"; TK="$R/gw.tok"; write_token_file "$TK"
+make_scope_db "$DB" "dahl" "$DAHL_CONN" "$SCOPE_TOKEN_PREFIX" ""
+scope_cfg "$R" "$DB" "$TK"
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q '\[OK  \] gateway_key_scope' && printf '%s' "$out" | grep -q 'unscoped'; then
+  ok "62a. unscoped gateway key passes gateway_key_scope"
+else
+  bad "62a. unscoped key did not pass: $out"
+fi
+
+# 62b. scoped to the TARGET's connection -> PASS naming that connection prefix
+R="$(fresh_repo)"; DB="$R/scope.sqlite"; TK="$R/gw.tok"; write_token_file "$TK"
+make_scope_db "$DB" "dahl" "$DAHL_CONN" "$SCOPE_TOKEN_PREFIX" "[\"$OTHER_CONN\",\"$DAHL_CONN\"]"
+scope_cfg "$R" "$DB" "$TK"
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q '\[OK  \] gateway_key_scope' && printf '%s' "$out" | grep -q "connection 9507c052"; then
+  ok "62b. key scoped to the target's connection passes and names the connection prefix"
+else
+  bad "62b. scoped-to-target key did not pass/name it: $out"
+fi
+
+# 62c. scoped to a DIFFERENT connection only -> FAIL naming remedy + api key row id
+R="$(fresh_repo)"; DB="$R/scope.sqlite"; TK="$R/gw.tok"; write_token_file "$TK"
+make_scope_db "$DB" "dahl" "$DAHL_CONN" "$SCOPE_TOKEN_PREFIX" "[\"$OTHER_CONN\"]"
+scope_cfg "$R" "$DB" "$TK"
+out="$(fb --repo "$R" check 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '\[FAIL\] gateway_key_scope' \
+   && printf '%s' "$out" | grep -q "PATCH /api/keys/$SCOPE_KEY_ROW_ID" \
+   && printf '%s' "$out" | grep -q "adding $DAHL_CONN" \
+   && printf '%s' "$out" | grep -q "BEFORE credential lookup"; then
+  ok "62c. key scoped to another connection FAILS, naming the PATCH remedy, api key row id, and the connection to add"
+else
+  bad "62c. mis-scoped key not refused with remedy (rc=$rc): $out"
+fi
+if printf '%s' "$out" | grep -q "scoped to 1 connection(s) and none of them is a 'dahl' connection"; then
+  ok "62c2. FAIL reason states the allowlist size and the excluded provider"
+else
+  bad "62c2. reason wording missing: $out"
+fi
+
+# 62d. no api_keys row matches the token prefix -> FAIL (gateway would 401)
+R="$(fresh_repo)"; DB="$R/scope.sqlite"; TK="$R/gw.tok"; write_token_file "$TK"
+make_scope_db "$DB" "dahl" "$DAHL_CONN" "ombx_other99" ""
+scope_cfg "$R" "$DB" "$TK"
+out="$(fb --repo "$R" check 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '\[FAIL\] gateway_key_scope' && printf '%s' "$out" | grep -q 'no api_keys row.*matches' && printf '%s' "$out" | grep -q 'regenerate'; then
+  ok "62d. token with no matching api_keys row FAILS (fail-closed: gateway will 401 it)"
+else
+  bad "62d. unmatched token not refused (rc=$rc): $out"
+fi
+
+# 62e. matching row but REVOKED -> FAIL
+R="$(fresh_repo)"; DB="$R/scope.sqlite"; TK="$R/gw.tok"; write_token_file "$TK"
+make_scope_db "$DB" "dahl" "$DAHL_CONN" "$SCOPE_TOKEN_PREFIX" "" "2026-09-18T12:00:00Z"
+scope_cfg "$R" "$DB" "$TK"
+out="$(fb --repo "$R" check 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '\[FAIL\] gateway_key_scope' && printf '%s' "$out" | grep -q 'revoked, inactive, banned, or expired' && printf '%s' "$out" | grep -q "$SCOPE_KEY_ROW_ID"; then
+  ok "62e. revoked api_keys row FAILS and names the row id"
+else
+  bad "62e. revoked key not refused (rc=$rc): $out"
+fi
+
+# 62f. DB WITHOUT an api_keys table -> PASS (fail-open on plumbing) saying so
+R="$(fresh_repo)"; DB="$R/keyed.sqlite"; TK="$R/gw.tok"; write_token_file "$TK"
+make_keyed_db "$DB" "dahl" "enc:not-a-real-secret"
+scope_cfg "$R" "$DB" "$TK"
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q '\[OK  \] gateway_key_scope' && printf '%s' "$out" | grep -qi 'not verified'; then
+  ok "62f. missing api_keys table passes fail-open with a 'not verified' reason"
+else
+  bad "62f. missing table did not fail open: $out"
+fi
+
+# 62g. the full token value NEVER appears in output -- across the FAIL path
+# (the most verbose), `status`, and the PASS path
+R="$(fresh_repo)"; DB="$R/scope.sqlite"; TK="$R/gw.tok"; write_token_file "$TK"
+make_scope_db "$DB" "dahl" "$DAHL_CONN" "$SCOPE_TOKEN_PREFIX" "[\"$OTHER_CONN\"]"
+scope_cfg "$R" "$DB" "$TK"
+out_fail="$(fb --repo "$R" check 2>&1)"
+out_status="$(fb --repo "$R" status 2>&1)"
+make_scope_db "$R/scope2.sqlite" "dahl" "$DAHL_CONN" "$SCOPE_TOKEN_PREFIX" ""
+scope_cfg "$R" "$R/scope2.sqlite" "$TK"
+out_pass="$(fb --repo "$R" check 2>&1)"
+if ! printf '%s%s%s' "$out_fail" "$out_status" "$out_pass" | grep -q "$SCOPE_TOKEN_TAIL" \
+   && ! printf '%s%s%s' "$out_fail" "$out_status" "$out_pass" | grep -q 'stored-fake-remainder'; then
+  ok "62g. neither the token file's value nor the stored key column ever appears in output"
+else
+  bad "62g. token/key material leaked into output"
+fi
+# Static guard: no SELECT in the tool may project the bare api_keys.key
+# column -- the only permitted mention is inside substr(key, 1, N) in a WHERE.
+if ! grep -E 'SELECT[^"]*\bkey\b' "$CLI" | grep -vq 'substr(key'; then
+  ok "62g2. no SELECT in the tool projects the raw api_keys.key column"
+else
+  bad "62g2. a SELECT names the raw key column: $(grep -nE 'SELECT[^"]*\bkey\b' "$CLI" | grep -v 'substr(key')"
+fi
+
+# 62h. token file missing -> PASS fail-open naming the missing path
+R="$(fresh_repo)"; DB="$R/scope.sqlite"
+make_scope_db "$DB" "dahl" "$DAHL_CONN" "$SCOPE_TOKEN_PREFIX" "[\"$OTHER_CONN\"]"
+scope_cfg "$R" "$DB" "$R/does-not-exist.tok"
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q '\[OK  \] gateway_key_scope' && printf '%s' "$out" | grep -q 'does not exist'; then
+  ok "62h. missing token file passes fail-open (nothing to match; token-file reports the absence itself)"
+else
+  bad "62h. missing token file did not fail open: $out"
+fi
+
+# 62i. token file NOT 0600 -> PASS with reason (token-file owns that refusal),
+# even though the DB would positively show a mis-scope
+R="$(fresh_repo)"; DB="$R/scope.sqlite"; TK="$R/gw.tok"; write_token_file "$TK"; chmod 644 "$TK"
+make_scope_db "$DB" "dahl" "$DAHL_CONN" "$SCOPE_TOKEN_PREFIX" "[\"$OTHER_CONN\"]"
+scope_cfg "$R" "$DB" "$TK"
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q '\[OK  \] gateway_key_scope' && printf '%s' "$out" | grep -q 'not 0600'; then
+  ok "62i. a group/world-readable token file is not read -- passes with the 0600 reason"
+else
+  bad "62i. non-0600 token file handling wrong: $out"
+fi
+
+echo "--------------------------------------------------------------------"
+
+# ── 62j. NEW: an EXPIRED (but not revoked) key is dead for routing -> FAIL ──
+# The gateway 401s an expired key exactly like a revoked one; scope alone would
+# have said PASS. Only a positively-past, parseable expires_at counts.
+R="$(fresh_repo)"; DB="$R/scope.sqlite"; TOK="$R/gw.tok"
+make_scope_db "$DB" "dahl" "9507c052-ef9f-45d1-b6f7-97e214595ff8" "ombx_test123" '[]'
+sqlite3 "$DB" "UPDATE api_keys SET expires_at='2020-01-01T00:00:00.000Z';"
+write_token_file "$TOK"
+write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"dahl\", \"omniroute_db_path\": \"$DB\", \"gateway_token_file\": \"$TOK\"}"
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q '\[FAIL\] gateway_key_scope' && printf '%s' "$out" | grep -q 'expired'; then
+  ok "62j. expired key FAILS gateway_key_scope and says so"
+else
+  bad "62j. expired key was treated as live: $out"
+fi
+# 62k. an unparseable expires_at is NOT treated as expired (fail-open on format)
+sqlite3 "$DB" "UPDATE api_keys SET expires_at='not-a-timestamp';"
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q '\[OK  \] gateway_key_scope'; then
+  ok "62k. unparseable expires_at is not treated as expired"
+else
+  bad "62k. unparseable expires_at caused a false FAIL: $out"
+fi
 
 # ── 0. the tool is executable and is valid Python ────────────────────────────
 [ -x "$CLI" ] && ok "0a. $CLI is executable" || bad "0a. not executable: $CLI"
