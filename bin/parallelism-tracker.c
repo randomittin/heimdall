@@ -2,9 +2,20 @@
  * parallelism-tracker — measure and nudge parallel-vs-sequential tool usage.
  *
  * Modes:
- *   check <tool_name>  — called from PreToolUse hook. Logs the call.
+ *   check <tool_name> [input|-]
+ *                      — called from PreToolUse hook. Logs the call.
  *                        Detects 3+ consecutive solo turns (>=500ms apart)
  *                        and writes a nudge to stderr.
+ *                        With a third argument the call's tool_input is
+ *                        hashed (FNV-1a 64 over tool_name + NUL + input; `-`
+ *                        reads the input from stdin so a large Write payload
+ *                        never hits ARG_MAX). The same tool called with a
+ *                        byte-identical input HMD_LOOP_THRESHOLD times in a
+ *                        row (default 5) writes a one-line LOOP warning to
+ *                        stderr. Any different input resets the run. Without
+ *                        a third argument the loop detector is inert and the
+ *                        binary behaves exactly as before. Advisory only:
+ *                        exit code is never changed by the detector.
  *   grade              — called from SessionEnd hook. Tallies session log,
  *                        appends a record to .planning/metrics.jsonl,
  *                        prints summary to stdout.
@@ -39,6 +50,9 @@
 #define BATCH_THRESHOLD_MS 500
 #define SOLO_TRIGGER 3
 #define AGENT_SOLO_TRIGGER 2
+#define LOOP_THRESHOLD_DEFAULT 5
+#define LOOP_TOOL_CAP 64
+#define STATE_VERSION 2
 
 typedef struct {
     long long last_ts;
@@ -50,7 +64,58 @@ typedef struct {
     long agent_solo;
     long agent_calls;
     long agent_batched;
+    /* v2: live identical-call loop detector. An old (v1) state file simply
+     * lacks these keys; read_state zeroes them, so the first call after an
+     * upgrade starts a fresh run of 1 rather than misreading anything. */
+    uint64_t loop_hash;
+    long loop_run;
+    char loop_tool[LOOP_TOOL_CAP];
 } state_t;
+
+/* FNV-1a 64-bit. Stable across runs and platforms; not cryptographic, and it
+ * does not need to be: a collision only means a different input is mistaken
+ * for a repeat, and the detector is advisory. */
+#define FNV1A64_OFFSET 0xcbf29ce484222325ULL
+#define FNV1A64_PRIME  0x100000001b3ULL
+
+static uint64_t fnv1a_update(uint64_t h, const void *buf, size_t len) {
+    const unsigned char *p = (const unsigned char *)buf;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)p[i];
+        h *= FNV1A64_PRIME;
+    }
+    return h;
+}
+
+/* Hash tool name + NUL + input. `input` of "-" streams stdin in chunks so the
+ * payload never has to fit in memory or on the command line. Returns 0 on
+ * success, -1 if stdin could not be read (detector then stays inert). */
+static int hash_call(const char *tool, const char *input, uint64_t *out) {
+    uint64_t h = FNV1A64_OFFSET;
+    h = fnv1a_update(h, tool, strlen(tool));
+    h = fnv1a_update(h, "", 1);
+    if (strcmp(input, "-") == 0) {
+        unsigned char buf[8192];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) {
+            h = fnv1a_update(h, buf, n);
+        }
+        if (ferror(stdin)) return -1;
+    } else {
+        h = fnv1a_update(h, input, strlen(input));
+    }
+    *out = h;
+    return 0;
+}
+
+static long loop_threshold(void) {
+    const char *env = getenv("HMD_LOOP_THRESHOLD");
+    if (!env || !*env) return LOOP_THRESHOLD_DEFAULT;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env || (end && *end != '\0') || v < 2) return LOOP_THRESHOLD_DEFAULT;
+    return v;
+}
 
 static long long now_ms(void) {
     struct timeval tv;
@@ -121,7 +186,13 @@ static int read_state(const char *path, state_t *s) {
         else if (strcmp(key, "agent_solo") == 0)    s->agent_solo        = strtol(val, NULL, 10);
         else if (strcmp(key, "agent_calls") == 0)   s->agent_calls       = strtol(val, NULL, 10);
         else if (strcmp(key, "agent_batched") == 0)  s->agent_batched     = strtol(val, NULL, 10);
+        else if (strcmp(key, "loop_hash") == 0)     s->loop_hash         = strtoull(val, NULL, 16);
+        else if (strcmp(key, "loop_run") == 0)      s->loop_run          = strtol(val, NULL, 10);
+        else if (strcmp(key, "loop_tool") == 0)     snprintf(s->loop_tool, sizeof(s->loop_tool), "%s", val);
+        /* state_version and any unknown key: ignored, so a newer or older
+         * file never trips the parser. */
     }
+    if (s->loop_run < 0) s->loop_run = 0;
     fclose(f);
     return 0;
 }
@@ -140,6 +211,10 @@ static int write_state_atomic(const char *path, const state_t *s) {
     fprintf(f, "agent_solo=%ld\n", s->agent_solo);
     fprintf(f, "agent_calls=%ld\n", s->agent_calls);
     fprintf(f, "agent_batched=%ld\n", s->agent_batched);
+    fprintf(f, "state_version=%d\n", STATE_VERSION);
+    fprintf(f, "loop_hash=%016llx\n", (unsigned long long)s->loop_hash);
+    fprintf(f, "loop_run=%ld\n", s->loop_run);
+    fprintf(f, "loop_tool=%s\n", s->loop_tool);
     fflush(f);
     fclose(f);
     if (rename(tmp, path) != 0) {
@@ -149,8 +224,16 @@ static int write_state_atomic(const char *path, const state_t *s) {
     return 0;
 }
 
-static int do_check(const char *tool) {
+static int do_check(const char *tool, const char *input) {
     char dir[1024], spath[1024], lpath[1024];
+
+    /* Hash before taking the lock: reading stdin may take a moment for a
+     * large payload and the lock should protect only the state update. */
+    int have_hash = 0;
+    uint64_t call_hash = 0;
+    if (input && hash_call(tool ? tool : "unknown", input, &call_hash) == 0) {
+        have_hash = 1;
+    }
     state_dir(dir, sizeof(dir));
     if (mkdir_p(dir) != 0) return 1;
     state_path(spath, sizeof(spath), "state");
@@ -195,6 +278,18 @@ static int do_check(const char *tool) {
         }
     }
 
+    long loop_warn = 0;
+    if (have_hash) {
+        if (s.loop_run > 0 && s.loop_hash == call_hash) {
+            s.loop_run += 1;
+        } else {
+            s.loop_hash = call_hash;
+            s.loop_run = 1;
+            snprintf(s.loop_tool, sizeof(s.loop_tool), "%s", tool ? tool : "unknown");
+        }
+        if (s.loop_run >= loop_threshold()) loop_warn = s.loop_run;
+    }
+
     int nudge = 0;
     int agent_nudge = 0;
     if (s.solo >= SOLO_TRIGGER) {
@@ -210,6 +305,14 @@ static int do_check(const char *tool) {
 
     flock(lock_fd, LOCK_UN);
     close(lock_fd);
+
+    if (loop_warn > 0) {
+        fprintf(stderr,
+                "[heimdall] LOOP: %s called %ldx in a row with byte-identical input "
+                "— the same call will give the same result. Change approach: "
+                "different input, different tool, or stop and report the blocker.\n",
+                s.loop_tool, loop_warn);
+    }
 
     if (agent_nudge) {
         fprintf(stderr,
@@ -282,16 +385,18 @@ static int do_grade(void) {
 }
 
 int main(int argc, char **argv) {
+    static const char usage[] = "usage: parallelism-tracker check <tool> [input|-]|grade\n";
     if (argc < 2) {
-        fprintf(stderr, "usage: parallelism-tracker check <tool>|grade\n");
+        fputs(usage, stderr);
         return 1;
     }
     if (strcmp(argv[1], "check") == 0) {
         const char *tool = (argc >= 3) ? argv[2] : "unknown";
-        return do_check(tool);
+        const char *input = (argc >= 4) ? argv[3] : NULL;
+        return do_check(tool, input);
     } else if (strcmp(argv[1], "grade") == 0) {
         return do_grade();
     }
-    fprintf(stderr, "usage: parallelism-tracker check <tool>|grade\n");
+    fputs(usage, stderr);
     return 1;
 }
