@@ -110,6 +110,7 @@ case "$PER_CALL" in ''|*[!0-9]*) PER_CALL=20 ;; esac
 [ "$BUDGET" -lt 1 ] && BUDGET=1
 [ "$PER_CALL" -lt 1 ] && PER_CALL=1
 
+REPO_RAW="$(cd "$REPO" 2>/dev/null && pwd || echo "$REPO")"
 REPO="$(cd "$REPO" 2>/dev/null && pwd -P || echo "$REPO")"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 [ -z "$TRACKER" ] && TRACKER="$HERE/edit-tracker"
@@ -140,7 +141,7 @@ for f in "${FILES[@]}"; do
     *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx)   JS_FILES+=("$f") ;;
     *)
       # extensionless files with a bash/sh shebang are shell too (bin/ tools)
-      if [ "${f##*/}" = "${f##*/}" ] && [ "${f%.*}" = "$f" ] \
+      if [ "${f%.*}" = "$f" ] \
          && head -c 64 "$f" 2>/dev/null | head -1 | grep -qE '^#!.*\b(ba)?sh\b'; then
         SHELL_FILES+=("$f")
       elif head -c 64 "$f" 2>/dev/null | head -1 | grep -qE '^#!.*python'; then
@@ -165,6 +166,7 @@ remaining() { local now; now=$(date +%s); echo $(( BUDGET - (now - START_TS) ));
 # moment the direct child dies. RUN_RC is set in THIS shell, not a subshell,
 # which is the other reason this is not a `$(...)`.
 RUN_RC=0
+TIMEOUTS=0
 RUN_OUT="$(mktemp "${TMPDIR:-/tmp}/hmd-stop-lint.XXXXXX" 2>/dev/null || echo /dev/null)"
 trap 'rm -f "$RUN_OUT"' EXIT
 run_bounded() {
@@ -174,12 +176,16 @@ run_bounded() {
   [ "$rem" -lt "$cap" ] && cap=$rem
   [ "$cap" -lt 1 ] && cap=1
   : > "$RUN_OUT" 2>/dev/null
+  # The inner subshell is what receives bash's "Alarm clock: 14" job notice
+  # when the alarm fires; dropping ITS stderr keeps that noise out of the
+  # hook output while the tool's own output still lands in $RUN_OUT.
   if [ "$HAVE_PERL" -eq 1 ]; then
-    perl -e 'alarm shift; exec @ARGV' "$cap" "$@" >"$RUN_OUT" 2>&1 </dev/null
+    ( perl -e 'alarm shift; exec @ARGV' "$cap" "$@" >"$RUN_OUT" 2>&1 </dev/null ) 2>/dev/null
   else
-    "$@" >"$RUN_OUT" 2>&1 </dev/null
+    ( "$@" >"$RUN_OUT" 2>&1 </dev/null ) 2>/dev/null
   fi
   RUN_RC=$?
+  [ "$RUN_RC" -gt 128 ] && TIMEOUTS=$((TIMEOUTS + 1))
 }
 # run_in_repo <cmd...> → run_bounded with cwd = $REPO (RUN_RC still set here)
 run_in_repo() {
@@ -268,11 +274,12 @@ for f in "${SHELL_FILES[@]:-}"; do
   parts=(); detail=""; fcount=0
   run_bounded bash -n "$f"; out="$(tool_out)"; add_tool "bash -n"
   if [ "$RUN_RC" -eq 0 ]; then parts+=("bash -n ok")
+  elif [ "$RUN_RC" -gt 128 ]; then parts+=("bash -n timed out")
   else fcount=$((fcount + 1)); parts+=("bash -n FAIL"); detail="$out"; fi
   if [ -n "$SHELLCHECK" ] && budget_left; then
     run_bounded "$SHELLCHECK" -f gcc "$f"; out="$(tool_out)"; add_tool shellcheck
     if [ "$RUN_RC" -eq 0 ]; then parts+=("shellcheck ok")
-    elif [ "$RUN_RC" -eq 142 ] || [ "$RUN_RC" -gt 128 ]; then parts+=("shellcheck timed out")
+    elif [ "$RUN_RC" -gt 128 ]; then parts+=("shellcheck timed out")
     else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
       fcount=$((fcount + n)); parts+=("shellcheck $n"); detail="${detail}${detail:+$'\n'}$out"; fi
   fi
@@ -289,6 +296,7 @@ for f in "${PY_FILES[@]:-}"; do
   if [ -n "$PY" ]; then
     run_bounded "$PY" -c 'import ast,sys; ast.parse(open(sys.argv[1],"rb").read(), sys.argv[1])' "$f"; out="$(tool_out)"; add_tool "python3 ast"
     if [ "$RUN_RC" -eq 0 ]; then parts+=("ast ok")
+    elif [ "$RUN_RC" -gt 128 ]; then parts+=("ast timed out")
     else fcount=$((fcount + 1)); parts+=("ast FAIL"); detail="$(printf '%s\n' "$out" | grep -E 'SyntaxError|line [0-9]+' | tail -n 3)"; [ -z "$detail" ] && detail="$out"; fi
   fi
   if [ -n "$RUFF" ] && budget_left; then
@@ -345,12 +353,17 @@ fi
 
 [ "$OTHER" -gt 0 ] && say "$OTHER edited file(s) of other types not linted"
 
+# A run is complete only if every file was reached AND every checker finished.
+# A timed-out checker produced no verdict; counting it as "ok" would let a hung
+# linter manufacture a green gate, which is the hand-flip this tool replaces.
 COMPLETE=true
 [ "$SKIPPED_BUDGET" -gt 0 ] && COMPLETE=false
+[ "$TIMEOUTS" -gt 0 ] && COMPLETE=false
 
 if [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ]; then
   verdict="clean"; [ "$FINDINGS" -gt 0 ] && verdict="$FINDINGS finding(s)"
   extra=""; [ "$SKIPPED_BUDGET" -gt 0 ] && extra=", $SKIPPED_BUDGET skipped (budget ${BUDGET}s exhausted)"
+  [ "$TIMEOUTS" -gt 0 ] && extra="$extra, $TIMEOUTS checker call(s) timed out (per-call cap ${PER_CALL}s) — verdict incomplete"
   say "$CHECKED file(s) checked, $verdict$extra"
 fi
 
@@ -371,7 +384,9 @@ if [ -n "$STATE" ] && [ -f "$STATE" ] && [ -x "$STATE_TOOL" ] && command -v jq >
     --argjson findings "$FINDINGS" \
     --argjson tools "$tools_json" \
     --argjson complete "$COMPLETE" \
-    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, source:"heimdall-stop-lint"}')"
+    --argjson timeouts "$TIMEOUTS" \
+    --argjson skipped "$SKIPPED_BUDGET" \
+    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, skipped:$skipped, source:"heimdall-stop-lint"}')"
   # Never let a state-tool hiccup (lock contention, malformed file) escape.
   HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_last_run' "$receipt" >/dev/null 2>&1 || true
   if [ "$FINDINGS" -gt 0 ]; then

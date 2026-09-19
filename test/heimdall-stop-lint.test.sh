@@ -152,6 +152,9 @@ fi
 # must return well inside 15s (per-call alarm = min(per-call, remaining)),
 # exit 0, and the receipt must NOT claim a complete clean run.
 D="$(mk_case slow)"
+# Pre-arm the gate green: an INCOMPLETE run with no finding must leave it
+# untouched (no evidence either way) — never upgrade, never downgrade.
+HEIMDALL_STATE_FILE="$D/repo/heimdall-state.json" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
 mkdir -p "$D/fakebin"
 cat > "$D/fakebin/shellcheck" <<'EOF'
 #!/bin/sh
