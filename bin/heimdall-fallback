@@ -1012,6 +1012,166 @@ def _gateway_holds_credential(cfg, provider):
         return False
 
 
+GATEWAY_KEY_PREFIX_LEN = 12
+
+
+def _read_gateway_key_prefix(cfg):
+    """Return (prefix, unverifiable_reason). Reads ONLY the first
+    GATEWAY_KEY_PREFIX_LEN characters of the gateway token file -- the same
+    length OmniRoute stores in api_keys.key_prefix (verified live 2026-09-19:
+    `key_prefix = substr(key,1,12)` on every row). The full token never
+    enters this process beyond those 12 bytes; nothing here may ever print
+    or log it. Path resolution and the 0600 refusal mirror cmd_token_file
+    exactly, so this check can never accept a file token-file would refuse.
+    A reason (not a prefix) means the check cannot be verified -- the caller
+    passes with that reason, it never refuses on it."""
+    path = (cfg.get("gateway_token_file") or "").strip()
+    if not path:
+        return None, "no gateway_token_file configured -- nothing to match against api_keys"
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        return None, "gateway token file '%s' does not exist -- key scope unverifiable" % path
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError as exc:
+        return None, "gateway token file unreadable (%s) -- key scope unverifiable" % exc
+    if mode & 0o077:
+        return None, ("gateway token file '%s' is mode %04o (not 0600) -- token-file refuses it, "
+                      "so its scope is not checked here" % (path, mode))
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(GATEWAY_KEY_PREFIX_LEN * 4).strip()
+    except OSError as exc:
+        return None, "gateway token file unreadable (%s) -- key scope unverifiable" % exc
+    if len(head) < GATEWAY_KEY_PREFIX_LEN:
+        return None, ("gateway token file holds fewer than %d characters -- too short to match "
+                      "api_keys.key_prefix" % GATEWAY_KEY_PREFIX_LEN)
+    return head[:GATEWAY_KEY_PREFIX_LEN], None
+
+
+def _parse_allowed_connections(raw):
+    """api_keys.allowed_connections is a JSON array of provider_connections
+    ids, or NULL/''/'[]' for an unscoped key. Anything unparseable is
+    reported as None so the caller can fail OPEN on it -- a malformed
+    allowlist is plumbing, not a positively-read mismatch."""
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [str(x) for x in parsed if isinstance(x, str) and x.strip()]
+
+
+def _gateway_key_scope(cfg, provider):
+    """The gateway_key_scope preflight check -- returns (ok, reason).
+
+    Does the gateway API key hmd presents (gateway_token_file) actually
+    ALLOW the target provider's connection? OmniRoute's api_keys row carries
+    an `allowed_connections` allowlist, and the gateway filters connections
+    by it BEFORE credential lookup -- so a key pinned to one provider's
+    connection fails every other provider as 'No active credentials' even
+    while that provider's connection is healthy and keyed.
+
+    Measured 2026-09-19 (cost days): the heimdall-fallback key had
+    allowed_connections pinned to a single connection id; connection_health
+    and operator_key both PASSED for the new target, preflight said ROUTE,
+    and every routed child died at the gateway. This check is the positive
+    verification that was missing.
+
+    Polarity, same split as connection_health: fail-OPEN on plumbing (no
+    token file, non-0600 file, DB missing/unreadable, api_keys table or
+    columns missing, malformed allowlist, no active connection to compare)
+    -- each PASSES with a reason naming what could not be verified. Fail-
+    CLOSED only on a POSITIVELY READ answer: no live api_keys row matches
+    the token (the gateway will 401 it), or the live row's allowlist
+    excludes every active connection of the target provider. Only
+    key_prefix (12 chars) is ever compared; the `key` column is never
+    selected into this process -- the NULL-key_prefix fallback compares
+    substr(key,1,12) inside SQL only.
+    """
+    provider = (provider or "").strip().lower()
+    if not provider:
+        return True, "no target_provider configured -- nothing to check the key scope against"
+    prefix, unverifiable = _read_gateway_key_prefix(cfg)
+    if prefix is None:
+        return True, "gateway key scope not verified -- %s" % unverifiable
+    db_path = _resolve_omniroute_db_path(cfg)
+    if not os.path.exists(db_path):
+        return True, ("OmniRoute DB not found at '%s' -- gateway key scope unverifiable; passing, "
+                      "since absence of the DB is not evidence the key is mis-scoped" % db_path)
+    rows, err = _query_omniroute(
+        db_path,
+        "SELECT id, name, allowed_connections, is_active, revoked_at, is_banned FROM api_keys "
+        "WHERE COALESCE(key_prefix, substr(key, 1, %d)) = ?" % GATEWAY_KEY_PREFIX_LEN,
+        (prefix,),
+    )
+    if err is not None:
+        return True, ("gateway key scope not verified -- OmniRoute api_keys unreadable (%s); "
+                      "passing rather than blocking a route that may well work" % err)
+    if not rows:
+        return False, (
+            "no api_keys row in OmniRoute matches the gateway token in gateway_token_file "
+            "(key_prefix lookup) -- the gateway will 401 this token before any provider is "
+            "consulted. Fix: check the key in OmniRoute's dashboard, or regenerate it and "
+            "update the token file")
+    live = []
+    for row in rows:
+        row_id, name, allowed_raw, is_active, revoked_at, is_banned = row
+        try:
+            active = int(is_active if is_active is not None else 1) == 1
+            banned = int(is_banned or 0) == 1
+        except (TypeError, ValueError):
+            active, banned = True, False
+        if active and not banned and revoked_at in (None, ""):
+            live.append((str(row_id), str(name or ""), allowed_raw))
+    if not live:
+        row_id, name = str(rows[0][0]), str(rows[0][1] or "")
+        return False, (
+            "gateway key '%s' (api_keys id %s) matches the token but is revoked, inactive, or "
+            "banned in OmniRoute -- the gateway will 401 it. Fix: re-enable it in OmniRoute's "
+            "dashboard, or regenerate the key and update the token file" % (name, row_id))
+    parsed = []
+    for row_id, name, allowed_raw in live:
+        allowed = _parse_allowed_connections(allowed_raw)
+        if allowed is None:
+            return True, ("gateway key '%s' (api_keys id %s) has an unparseable allowed_connections "
+                          "value -- scope unverifiable, passing" % (name, row_id))
+        if not allowed:
+            return True, "gateway key '%s' is unscoped (allowed_connections empty) -- every connection is reachable" % name
+        parsed.append((row_id, name, allowed))
+    conn_rows, conn_err = _query_omniroute(
+        db_path,
+        "SELECT id FROM provider_connections WHERE lower(provider) = ? AND is_active = 1",
+        (provider,),
+    )
+    if conn_err is not None:
+        return True, ("gateway key scope not verified -- provider_connections unreadable (%s); "
+                      "passing rather than blocking a route that may well work" % conn_err)
+    conn_ids = [str(r[0]) for r in conn_rows if r and r[0] is not None]
+    if not conn_ids:
+        return True, ("no active provider_connections row for '%s' to compare the key's allowlist "
+                      "against -- connection_health owns that finding; scope unverifiable" % provider)
+    for row_id, name, allowed in parsed:
+        hit = [c for c in conn_ids if c in allowed]
+        if hit:
+            return True, ("gateway key '%s' allows '%s' connection %s (%d of %d allowlisted)"
+                          % (name, provider, hit[0][:8], len(hit), len(allowed)))
+    # Multiple live rows and none covers the target: report the most permissive.
+    row_id, name, allowed = max(parsed, key=lambda t: len(t[2]))
+    return False, (
+        "gateway key '%s' is scoped to %d connection(s) and none of them is a '%s' connection -- "
+        "OmniRoute filters by this allowlist BEFORE credential lookup, so routing will fail as "
+        "'No active credentials' regardless of provider health. Fix: PATCH /api/keys/%s "
+        "{allowedConnections:[...]} adding %s, or clear the allowlist"
+        % (name, len(allowed), provider, row_id, conn_ids[0]))
+
+
 def _resolve_noauth_providers(cfg):
     """The built-in NOAUTH_PROVIDERS set plus any operator ADDITIONS from
     config's `noauth_providers` -- same additions-only shape as
@@ -1562,6 +1722,16 @@ def run_preflight(cfg, role=None):
                          "passing, since absence of the DB is not evidence the provider is down"
                          % db_path)
     checks.append(("connection_health", health_ok, health_reason))
+
+    # gateway_key_scope -- does the gateway API key hmd presents actually ALLOW
+    # the target provider's connection? Same fail-OPEN-on-plumbing / fail-
+    # CLOSED-on-positive-read split as connection_health above; the full
+    # rationale, the 2026-09-19 measurement, and the polarity note live on
+    # _gateway_key_scope. Appended right after connection_health so a healthy
+    # connection the KEY cannot reach is named as exactly that, never as a
+    # health problem.
+    scope_ok, scope_reason = _gateway_key_scope(cfg, target_provider_raw)
+    checks.append(("gateway_key_scope", scope_ok, scope_reason))
 
     # An id the OPERATOR pinned outranks a configured one: their explicit choice is
     # never silently overridden, and if it is unsafe they get told so rather than

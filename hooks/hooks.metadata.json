@@ -311,9 +311,9 @@
       "event": "SessionEnd",
       "index": 1,
       "id": "session-end-sweep",
-      "description": "Background: checkpoint write, parallelism grade, verify-edits --quick, autocommit, cleanup, reel, summary-card, context-sync; then the farewell.",
+      "description": "Foreground, alarm-bounded (10s): checkpoint write — the never-lose contract, must land before the hook returns. Background: parallelism grade, verify-edits --quick, autocommit, cleanup, reel, summary-card, context-sync; then the farewell.",
       "matcher": "",
-      "fingerprint": "c223d3c74c9119897c67ce6f1f4718ee7e21b2be87f5e45ac9fc02dc21f497ef",
+      "fingerprint": "dd7c4f8855f13b8d023e8d3f3ab8a5ac52221412572b298a44758a5b5fc493b8",
       "locked": false
     },
     {
