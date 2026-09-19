@@ -1,0 +1,191 @@
+{
+  "plan": ".planning/plans/PLAN-companion-ui.md",
+  "oracle": {
+    "registry_domain": null,
+    "note": "No evals/oracles/registry.json domain matches a local dashboard/companion-UI target (jq -r '.oracles|keys[]' lists emulator-gb, exchange-lob, issue-collection, ponytail-underdelivery, rr-multitenant-isolation, symbol-reuse, team-checkpoint, team-copilot, triage-coord). Gates are independent example+verdict falsifiers authored by hmd:test-runner in a separate wave-slot from hmd:coder, proven capable of going red via a two-state fixture-mutation assertion (see companion-ui-oracle-test). Flagged for a reviewer to decide whether to add a 'companion-ui' or 'local-http-tool' registry domain. The same absence applies to Wave 4's job-panels surface (companion-ui-panels-test): its gate is example+verdict (planted accept/reject fixture pairs plus an XSS-non-execution assertion), independently authored from evals/oracles/companion-ui/PANEL-INVARIANTS.md only."
+  },
+  "waves": [
+    {
+      "id": 0,
+      "status": "in-progress",
+      "tasks": [
+        {
+          "id": "companion-ui-invariants",
+          "agent": "hmd:docs-writer",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "evals/oracles/companion-ui/INVARIANTS.md, evals/oracles/companion-ui/COVERAGE.md",
+          "skills": ["superpowers:writing-plans"],
+          "acceptance": [
+            "test -f evals/oracles/companion-ui/INVARIANTS.md",
+            "grep -q 'schema_version' evals/oracles/companion-ui/INVARIANTS.md",
+            "grep -q '127.0.0.1' evals/oracles/companion-ui/INVARIANTS.md",
+            "grep -q 'Host header' evals/oracles/companion-ui/INVARIANTS.md",
+            "grep -qi 'digest' evals/oracles/companion-ui/INVARIANTS.md",
+            "test -f evals/oracles/companion-ui/COVERAGE.md"
+          ],
+          "prompt": "Read .planning/plans/PLAN-companion-ui.md sections 2-6 verbatim (do not paraphrase from memory). Read sentinels/hmd_ledger.py:1-60,476-520; bin/lib/watch_data.py:1-30,80-135,175-220; bin/heimdall-hooks:1-60; bin/heimdall-checkpoint:1-40. Create evals/oracles/companion-ui/INVARIANTS.md transcribing PLAN-companion-ui.md's data contract (section 4), auth rule (section 3 Decision 5: loopback bind, per-launch random token via hmac.compare_digest, Host-header allowlist rejecting any Host other than 127.0.0.1:<port>/localhost:<port>), the SSE digest-diff emission rule (section 3 Decision 2: SHA-256 over the canonical JSON, a new data: frame only on digest change, poll every 2s), and the safe-action allowlist (section 3 Decision 4: exactly save-checkpoint/view-receipt/hook-toggle-advisory-only/open-reel, with the never-exposed list) as CHECKABLE statements, not prose. Create evals/oracles/companion-ui/COVERAGE.md transcribing section 7's coverage matrix verbatim. Do NOT write any code."
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "status": "in-progress",
+      "tasks": [
+        {
+          "id": "companion-ui-server-core",
+          "agent": "hmd:coder",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "bin/heimdall-ui, sentinels/hmd-ui.py, sentinels/hmd-ui.html, bin/heimdall",
+          "skills": [],
+          "acceptance": [
+            "test -x bin/heimdall-ui",
+            "test -f sentinels/hmd-ui.py",
+            "test -f sentinels/hmd-ui.html",
+            "grep -q 'ui)' bin/heimdall",
+            "grep -q 'watch_data' sentinels/hmd-ui.py",
+            "grep -q 'hmd_ledger' sentinels/hmd-ui.py",
+            "grep -q '127.0.0.1' sentinels/hmd-ui.py",
+            "grep -q 'compare_digest' sentinels/hmd-ui.py",
+            "grep -qi 'Host' sentinels/hmd-ui.py",
+            "bash -n bin/heimdall-ui",
+            "python3 -c \"import ast; ast.parse(open('sentinels/hmd-ui.py').read())\""
+          ],
+          "prompt": "Read evals/oracles/companion-ui/INVARIANTS.md, .planning/plans/PLAN-companion-ui.md sections 2-6, bin/lib/cp_server.py:1-60,120-140, sentinels/hmd_ledger.py:476-520, bin/lib/watch_data.py:80-135, bin/heimdall-watch-tui (whole file), bin/lib/hmd-python.sh (whole file), bin/heimdall:2358-2372. Build bin/heimdall-ui (bash launcher mirroring bin/heimdall-watch-tui's structure: source bin/lib/hmd-python.sh for hmd_python(), parse --port/--no-browser/--print-token/--print-url-only flags, pick a free port via python3 socket bind-to-0 when --port absent, generate a 32-byte os.urandom hex token, exec sentinels/hmd-ui.py with the resolved interpreter, print the URL as http://127.0.0.1:<port>/?token=<token>, open it in the default browser unless --no-browser). Build sentinels/hmd-ui.py as a stdlib http.server.ThreadingHTTPServer with a pure collect_state(root) function (imports bin/lib/watch_data.py's read_roster/read_feed and sentinels/hmd_ledger.py's read_status, subprocess-calls 'heimdall-hooks list --json', 'heimdall-fallback status --json' filtered to state+target_provider only, 'parallelism-tracker grade' regex-parsed, 'heimdall-state check-quality-gates' for exit code+first line, reads .heimdall/receipts/last-sweep.json raw, reads .planning/CHECKPOINT.md's auto-checkpoint header fields only (Branch/HEAD/Phase/Uncommitted files/Open warnings via regex, never the free-text body), lists .planning/reels/ name+mtime) producing EXACTLY the JSON shape in PLAN-companion-ui.md section 4. Implement three routes: GET / serves sentinels/hmd-ui.html; GET /api/state returns collect_state() as JSON; GET /api/events is text/event-stream, sends an immediate frame then re-polls every 2s and sends a new data: frame only when sha256(canonical json) changes. Auth on every route: bind 127.0.0.1 only (never 0.0.0.0); check Host header against {127.0.0.1:<port>, localhost:<port>} and return 400 on mismatch BEFORE any token check; require the token via ?token= query param on / and /api/events, or X-Heimdall-UI-Token header on /api/state, compared with hmac.compare_digest; return 401 on a missing/wrong token. Set Referrer-Policy: no-referrer on every response. Build sentinels/hmd-ui.html as one static file (inline <style>/<script>, no framework, no build step) that reads its own token from the URL, opens an EventSource to /api/events?token=..., and renders the wireframe panels from PLAN-companion-ui.md section 5 (gate verdict, quality gate, sweep receipt, ledger gates, team roster, hooks list with locked ids greyed out, checkpoint summary, parallelism line) by patching DOM elements keyed to the JSON field names in section 4 — read-only in this wave, no action buttons yet. Modify bin/heimdall: add a ui) case immediately after the existing watch) case (ends at line 2372), copying its exact structure (shift, resolve $PLUGIN_DIR/bin/heimdall-ui, error-and-reinstall-message if missing, exec with forwarded args)."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-ui-oracle-test",
+          "agent": "hmd:test-runner",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "test/heimdall-ui.test.sh, test/fixtures/companion-ui/",
+          "skills": ["superpowers:systematic-debugging"],
+          "acceptance": [
+            "bash test/heimdall-ui.test.sh"
+          ],
+          "prompt": "Read ONLY evals/oracles/companion-ui/INVARIANTS.md and .planning/plans/PLAN-companion-ui.md section 4 (the data contract) and section 6's Wave 1 companion-ui-oracle-test task body. Do NOT read sentinels/hmd-ui.py's implementation before writing your assertions -- derive every assertion from the contract documents only, so the test is an independent reference, not a mirror of the implementation's choices. Create test/fixtures/companion-ui/ as a minimal fixture repo directory containing .heimdall/receipts/last-sweep.json with a planted \"suites_total\": 999, .heimdall/.roster-cache.json with one planted roster row, and .planning/CHECKPOINT.md with a planted Branch/HEAD/Phase header block matching the real auto-checkpoint format (see .planning/CHECKPOINT.md in this repo for the exact header shape to mimic). Create test/heimdall-ui.test.sh (bash, following test/heimdall-watch-live.test.sh:83-84's TIMEOUT=\"$(command -v timeout || command -v gtimeout || true)\" macOS-portable pattern) that: picks a free port via python3 socket bind-to-0; starts HEIMDALL_WATCH_ROOT=test/fixtures/companion-ui bin/heimdall-ui --port \"$PORT\" --no-open backgrounded, capturing the printed token; asserts curl with no token against /api/state returns HTTP 401; asserts curl with the correct token via X-Heimdall-UI-Token returns HTTP 200 and jq -e '.sweep_receipt.suites_total == 999' (the planted value, proving derivation from the fixture, not a hardcoded stub); asserts curl with the correct token but Host: evil.example returns HTTP 400; opens /api/events with the token (bounded by $TIMEOUT or a read -t 8 loop), captures the first data: frame and asserts suites_total==999, then mutates the fixture's last-sweep.json to suites_total: 111, waits 3 seconds, captures the next data: frame and asserts suites_total==111 (retry the read up to 3 times with 1s backoff before failing, to tolerate poll-timing jitter); kills the server and its process group on exit via a trap; exits 0 only if every assertion passed. Before marking this task done, manually prove falsifiability once: temporarily edit a LOCAL COPY of the server to hardcode suites_total as a constant instead of reading the file, re-run the test, confirm the second SSE assertion fails (goes red), then discard that temporary edit -- do not commit or leave that edit in place. Report the red-then-green proof in your completion summary."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-ui-actions",
+          "agent": "hmd:coder",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "bin/lib/companion_ui_actions.py, sentinels/hmd-ui.py, sentinels/hmd-ui.html",
+          "skills": [],
+          "acceptance": [
+            "grep -q 'ALLOWED_ACTIONS' bin/lib/companion_ui_actions.py",
+            "grep -q 'save-checkpoint' bin/lib/companion_ui_actions.py",
+            "grep -q 'hook-toggle' bin/lib/companion_ui_actions.py",
+            "python3 -c \"import ast; ast.parse(open('bin/lib/companion_ui_actions.py').read())\"",
+            "bash test/heimdall-ui-actions.test.sh"
+          ],
+          "prompt": "Read evals/oracles/companion-ui/INVARIANTS.md, bin/lib/watch_data.py:236-283 (build_shell_argv, _safe_ref, _REF_RE -- the allowlist-then-terminator pattern to copy), bin/heimdall-checkpoint:1-40, bin/heimdall-hooks:1-50, .planning/plans/PLAN-companion-ui.md section 3 Decision 4 and section 6 Wave 2. Create bin/lib/companion_ui_actions.py with ALLOWED_ACTIONS = {'save-checkpoint','view-receipt','hook-toggle','open-reel'} and a dispatch(action, params) function returning an argv list for save-checkpoint (['heimdall-checkpoint','write']) and hook-toggle (['heimdall-hooks', 'enable'|'disable', '--', <validated hook id>] using the same _safe_ref-style charset allowlist and '--' terminator watch_data.py uses for ref-consuming actions), and direct confined file reads for view-receipt and open-reel (reusing watch_data.py's _confined_realpath pattern, scoped to .heimdall/ and .planning/reels/ respectively). Any action not in ALLOWED_ACTIONS returns a refusal tuple, runs nothing. Modify sentinels/hmd-ui.py to add POST /api/action: parse JSON body {action, params}, call companion_ui_actions.dispatch, run the returned argv via subprocess with shell=False, map a CLI exit code of 2 (heimdall-hooks' locked-id refusal) to HTTP 409, an unknown action to HTTP 422, success to HTTP 200 with the CLI's stdout. Modify sentinels/hmd-ui.html to add an Actions panel (Save checkpoint / View last receipt / Open latest reel buttons) and a toggle switch per non-locked row in the Hooks panel, each firing fetch('/api/action', {method:'POST', headers:{'X-Heimdall-UI-Token':TOKEN}, body: JSON.stringify({action, params})}). As a second, disjoint-file task within this same wave slot, write test/heimdall-ui-actions.test.sh (separate file, written independently of this task's implementation choices, reading only the ALLOWED_ACTIONS contract from INVARIANTS.md) asserting: an unknown action returns 422 and touches no marker file that only a real action would create; hook-toggle on a known-locked id (e.g. secret-paste-filter) returns 409, not 200; hook-toggle on an advisory id actually flips heimdall-hooks list --json's enabled field for that id (and is reverted at test teardown)."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-ui-remote",
+          "agent": "hmd:coder",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "bin/heimdall-ui, test/heimdall-ui-remote.test.sh",
+          "skills": [],
+          "acceptance": [
+            "grep -q -- '--remote' bin/heimdall-ui",
+            "grep -q 'ssh -N -L\\|ssh -L' bin/heimdall-ui",
+            "bash -n bin/heimdall-ui",
+            "bash test/heimdall-ui-remote.test.sh"
+          ],
+          "prompt": "Read bin/heimdall-ui as landed in Wave 1, .planning/plans/PLAN-companion-ui.md section 3 Decision 3 and section 6 Wave 3. Add --remote user@host [--remote-port N] flag handling to bin/heimdall-ui: pick a local free port via the same python3 socket bind-to-0 helper already used for --port; run `ssh -N -L \"$LOCAL_PORT:127.0.0.1:$REMOTE_PORT\" \"$REMOTE_HOST\" \"hmd ui --port $REMOTE_PORT --print-url-only --no-browser\"` in the background, capturing its stdout via a FIFO or process substitution to read the remote-printed token/URL line; rewrite the printed port to $LOCAL_PORT; open the rewritten URL locally unless --no-browser; write the ssh child's PID to ${HEIMDALL_HOME:-$HOME/.heimdall}/.ui-remote-<port>.pid and trap EXIT/INT/TERM to kill it, reaping any stale pidfile from a prior crashed run on startup. Write test/heimdall-ui-remote.test.sh: check for ssh on PATH and a reachable local sshd via `ssh -o BatchMode=yes -o ConnectTimeout=2 127.0.0.1 true`; if either precondition fails, print the reason and exit 0 (a documented skip, not a silent pass); if both hold, run a real self-loopback SSH tunnel test (using 127.0.0.1 as the 'remote') and assert the locally forwarded port serves byte-identical /api/state JSON to a direct local run against the same fixture root."
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-ui-panel-invariants",
+          "agent": "hmd:docs-writer",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "evals/oracles/companion-ui/PANEL-INVARIANTS.md, evals/oracles/companion-ui/COVERAGE.md",
+          "skills": ["superpowers:writing-plans"],
+          "acceptance": [
+            "test -f evals/oracles/companion-ui/PANEL-INVARIANTS.md",
+            "grep -q 'kv|table|number|timeseries|bars|markdown|log-tail' evals/oracles/companion-ui/PANEL-INVARIANTS.md",
+            "grep -qi 'source' evals/oracles/companion-ui/PANEL-INVARIANTS.md",
+            "grep -qi 'secret_shaped\\|reject_if_secret' evals/oracles/companion-ui/PANEL-INVARIANTS.md",
+            "grep -qi '65536\\|MAX_FILE_BYTES' evals/oracles/companion-ui/PANEL-INVARIANTS.md",
+            "grep -qi 'job panel' evals/oracles/companion-ui/COVERAGE.md"
+          ],
+          "prompt": "Read .planning/plans/PLAN-companion-ui.md's Decision 6 section verbatim (do not paraphrase from memory), evals/oracles/companion-ui/INVARIANTS.md (the Wave 0 sibling, same shape to mirror), bin/heimdall-activity:1-40,155-192 (secret_shaped/reject_if_secret/SCRUB_MAX=120), bin/lib/watch_data.py:174-193 (read_feed's limit=200 precedent). Create evals/oracles/companion-ui/PANEL-INVARIANTS.md transcribing as CHECKABLE statements, not prose: the closed type set kv|table|number|timeseries|bars|markdown|log-tail; that an unrecognized type is refused; that a 'source' key in a panel file is a hard validation failure rejecting the WHOLE panel; every size cap (MAX_FILE_BYTES=65536, MAX_TITLE_CHARS=120, MAX_STRING_CHARS=500, MAX_LIST_ITEMS=200, MAX_SERIES=6, id regex ^[A-Za-z0-9_-]{1,64}$); the staleness formula stale = now-updated_at > max(refresh_s*3, 30); the one-writer-per-file atomic tmp+rename write convention (mirroring bin/heimdall-presence's .roster-cache.json.<pid>.tmp pattern); the secret-scrub rule (every string leaf in title/data checked via bin/heimdall-activity's secret_shaped()/reject_if_secret(), a hit rejects the whole panel fail-closed); and the PANEL_TTL_SECONDS=86400 auto-delete-on-poll cleanup rule. Append a 'Job panels' section to evals/oracles/companion-ui/COVERAGE.md transcribing this PLAN's section 7 job-panel coverage rows verbatim (in-scope: closed-type render, secret-scrub/size-caps/TTL, hmd-live-users self-publish; permanently descoped: source-field rejection as an expected-green negative test, per-panel ACL, in-browser authoring, historical/time-travel data). Do NOT write any code."
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-ui-panels",
+          "agent": "hmd:coder",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "bin/lib/companion_ui_panels.py, bin/heimdall-ui, sentinels/hmd-ui.py, sentinels/hmd-ui.html",
+          "skills": ["dataviz"],
+          "acceptance": [
+            "grep -q 'PANEL_TYPES' bin/lib/companion_ui_panels.py",
+            "grep -q '\"kv\"' bin/lib/companion_ui_panels.py",
+            "grep -q 'source' bin/lib/companion_ui_panels.py",
+            "grep -q 'MAX_FILE_BYTES' bin/lib/companion_ui_panels.py",
+            "grep -q 'secret_shaped' bin/lib/companion_ui_panels.py",
+            "grep -q 'os.replace\\|os\\.rename' bin/lib/companion_ui_panels.py",
+            "python3 -c \"import ast; ast.parse(open('bin/lib/companion_ui_panels.py').read())\"",
+            "grep -q 'panel' bin/heimdall-ui",
+            "bash -n bin/heimdall-ui",
+            "grep -q 'companion_ui_panels' sentinels/hmd-ui.py",
+            "python3 -c \"import ast; ast.parse(open('sentinels/hmd-ui.py').read())\"",
+            "grep -qi 'panels' sentinels/hmd-ui.html"
+          ],
+          "prompt": "Read evals/oracles/companion-ui/PANEL-INVARIANTS.md, .planning/plans/PLAN-companion-ui.md's Decision 6 section in full, bin/heimdall-ui as landed through Wave 3, sentinels/hmd-ui.py as landed through Wave 2, bin/lib/watch_data.py:174-283 (read_feed, _confined_realpath, _safe_ref, build_shell_argv), bin/heimdall-activity:1-40,155-192, bin/heimdall-presence:275-304 (the .roster-cache.json.<pid>.tmp atomic-write-and-reap precedent). Invoke the dataviz skill before writing any chart-rendering code for the timeseries/bars/number-delta panel types. Create bin/lib/companion_ui_panels.py: constants PANEL_TYPES={'kv','table','number','timeseries','bars','markdown','log-tail'}, MAX_FILE_BYTES=65536, MAX_TITLE_CHARS=120, MAX_STRING_CHARS=500, MAX_LIST_ITEMS=200, MAX_SERIES=6, PANEL_TTL_SECONDS=86400, ID_RE=re.compile(r'^[A-Za-z0-9_-]{1,64}$'); secret_shaped(v) ported verbatim from bin/heimdall-activity's regex family (token/secret/password/apikey/auth/bearer/credential assigned-value shape, GitHub PAT, AWS key id, Stripe secret, Slack token, PEM key header, JWT); validate_panel(obj) enforcing the closed type set, per-type data shape, all size caps, ID_RE, REJECTING the whole panel if a top-level 'source' key is present OR if secret_shaped() fires on the title or any string leaf inside data (table cells, kv values, markdown text, log-tail lines, series/bar labels -- never numeric x/y values); write_panel(root,id,obj) writing to .heimdall/ui/panels/<id>.json.<pid>.tmp then os.replace into place; remove_panel(root,id); read_panels(root,now=None) reading all non-tmp files under .heimdall/ui/panels/, dropping invalid/rejected/TTL-expired entries (deleting TTL-expired files), annotating each surviving entry with stale=(now-updated_at > max(refresh_s or 0)*3, 30)); and a __main__ CLI block parsing 'set <id> --type T --title S --data-json FILE_OR_DASH [--refresh-s N]' (reads FILE_OR_DASH, '-' means stdin, JSON-decodes it as data, calls validate_panel+write_panel, nonzero exit and no file written on any rejection) and 'rm <id>' (calls remove_panel). Modify bin/heimdall-ui: add a guard clause immediately after its existing hmd_python()/interpreter resolution and before its own flag parsing begins: if the first argument is 'panel', shift it off and exec the resolved python interpreter against bin/lib/companion_ui_panels.py with the remaining arguments, never reaching the server-launch flag parser. Modify sentinels/hmd-ui.py: import companion_ui_panels; in collect_state(root), add a 'panels' key set to companion_ui_panels.read_panels(root); in the existing poll loop, once per tick, call companion_ui_panels.write_panel(root, 'hmd-live-users', {'id':'hmd-live-users','title':'hmd — live users','type':'number','data':{'value': len(state.get('roster') or [])},'refresh_s':2,'updated_at': time.time()}) directly in-process (no subprocess) so the built-in panel dogfoods the exact same publish path an agent uses. Modify sentinels/hmd-ui.html: add one render function per type in PANEL_TYPES rendered from the new panels array; the markdown renderer MUST escape the entire string first (map < > & \" ' to HTML entities) and only THEN substitute exactly four patterns against the already-escaped text: **bold** to <strong>, `code` to <code>, a leading '- ' line to <li> wrapped in <ul>, and newline to <br> -- no link syntax is supported; table/kv/log-tail cells are always plain-escaped text, never markdown-substituted; timeseries/bars assign colors via the dataviz skill's fixed categorical hue order up to MAX_SERIES=6 and never use a dual y-axis; number's delta is colored via the dataviz skill's reserved status palette (good/warning/serious/critical), never an ad hoc hue."
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "status": "pending",
+      "tasks": [
+        {
+          "id": "companion-ui-panels-test",
+          "agent": "hmd:test-runner",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "test/heimdall-ui-panels.test.sh, test/fixtures/companion-ui-panels/",
+          "skills": ["superpowers:systematic-debugging"],
+          "acceptance": [
+            "bash test/heimdall-ui-panels.test.sh"
+          ],
+          "prompt": "Read ONLY evals/oracles/companion-ui/PANEL-INVARIANTS.md and .planning/plans/PLAN-companion-ui.md's Decision 6 section (the panel contract) and section 6's Wave 4 companion-ui-panels-test task body. Do NOT read bin/lib/companion_ui_panels.py's implementation before writing your assertions -- derive every assertion from the contract documents only. Also read test/heimdall-ui.test.sh (Wave 1's sibling test) purely for its hermetic HOME/HEIMDALL_HOME-redirection and token-capture bash pattern, and test/heimdall-watch-live.test.sh:83-84 for the macOS timeout/gtimeout portability pattern -- reuse both verbatim, do not re-derive. Create test/fixtures/companion-ui-panels/ with a planted valid timeseries panel payload and a planted invalid payload set (unrecognized type, a 'source' key, a secret-shaped string, an oversized data array exceeding 200 items) used inline by the script. Create test/heimdall-ui-panels.test.sh (bash) that, against a running bin/heimdall-ui instance over the fixture root, asserts in sequence: (1) 'hmd ui panel set demo --type timeseries --title Demo --data-json -' with a valid piped payload exits 0 and .heimdall/ui/panels/demo.json exists; (2) the same command with --type chart3d exits nonzero and no file is written; (3) a payload carrying a top-level 'source' key exits nonzero and no file is written; (4) a payload whose data contains a secret-shaped string (e.g. 'a Stripe-live-shaped token (the sk_live_ prefix followed by 24 alphanumerics -- written out in words here on purpose: GitHub push protection and gitleaks both flag the literal shape, correctly)') exits nonzero and no file is written; (5) a markdown panel whose data.text is '<script>alert(1)</script>' is accepted (markdown text itself is not secret-shaped) but curling the running server's served page/state never contains the literal unescaped substring '<script>alert' -- assert via grep -c on the curl output that the raw substring count is zero; (6) a payload with a data list exceeding MAX_LIST_ITEMS=200 entries is rejected; (7) 'hmd ui panel rm demo' removes the file and the next /api/state poll's panels array no longer contains id 'demo'; kills the server and its process group on exit via a trap; exits 0 only if every assertion passed. Before marking this task done, perform the falsifiability proof once: in a LOCAL COPY of bin/lib/companion_ui_panels.py, comment out the secret_shaped() call inside validate_panel, re-run assertion (4) above, confirm it goes RED (the secret-shaped panel is wrongly accepted), then discard that temporary edit without committing it. Report the red-then-green proof in your completion summary."
+        }
+      ]
+    }
+  ]
+}

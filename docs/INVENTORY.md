@@ -218,7 +218,7 @@ Spawn discipline (CLAUDE.md "Parallelism"): batch independent calls; one agent p
 | `stacks` | Stack-specific knowledge packs (`ls skills/stacks/` → fastapi, nextjs, react-native, spring-boot) loaded onto a role agent |
 | `system-health` | Disk/memory cleanup advisor; catches hmd's own runaway presence keeper; hands off to mac-deep-clean |
 
-**Commands** (`commands/*.md`, 19 — `docs/INDEX.md` still says 15):
+**Commands** (`commands/*.md`, 19 — `docs/INDEX.md` was corrected from 15 to 19 on 2026-09-19):
 
 `autocommit` · `autonomy` (1 Guided / 2 Checkpoint / 3 Full Auto) · `bench` · `debloat` · `demo` · `designmatch` · `dream` · `fallback` · `feedback` · `invite` · `level` (deprecated alias of autonomy) · `maintain-check` · `maintain` · `reflect` · `report-bug` · `save` · `status` · `switch-ai` · `team`.
 
@@ -507,7 +507,7 @@ Credential-egress hardening of record: `.planning/security/2026-08-29-credential
 
 ## 13. In flight — companion UI (`hmd ui`)
 
-Plan: `.planning/plans/PLAN-companion-ui.md` (847 lines) + `.planning/plans/companion-ui.waves.json`. Landed so far: `bin/heimdall-ui`, `sentinels/hmd-ui.py`, `sentinels/hmd-ui.html`, `test/heimdall-ui.test.sh` (Wave 1). `evals/oracles/companion-ui/` (Wave 0 invariant ledger) does not exist yet.
+Plan: `.planning/plans/PLAN-companion-ui.md` (847 lines) + `.planning/plans/PLAN-companion-ui.waves.json`. Landed so far: `bin/heimdall-ui`, `sentinels/hmd-ui.py`, `sentinels/hmd-ui.html`, `test/heimdall-ui.test.sh` (Wave 1). `evals/oracles/companion-ui/` (Wave 0 invariant ledger) does not exist yet.
 
 Decisions:
 1. **Runtime** — python3-stdlib `ThreadingHTTPServer`, single file, pure `collect_state(root)`; zero build step.
@@ -517,7 +517,7 @@ Decisions:
 5. **Auth** — loopback bind + per-launch random token (401) + Host-header allowlist (403); token appears only in the printed URL.
 6. **Job panels (Wave 4)** — a job publishes closed-type descriptors under caps (`MAX_FILE_BYTES=65536`, `MAX_TITLE_CHARS=120`…), the renderer draws them, `source` is OUT (no iframe, no per-panel build).
 
-Waves (`jq -c '.waves[] | {wave, tasks: [.tasks[].id]}' .planning/plans/companion-ui.waves.json`): 0 invariants · 1 server-core · 2 oracle-test · 3 actions · 4 remote · 5 panel-invariants · 6 panels · 7 panels-test. Status field is null on every wave — landing state is inferred from files on disk, not recorded in the plan.
+Waves (`jq -c '.waves[] | {wave, tasks: [.tasks[].id]}' .planning/plans/PLAN-companion-ui.waves.json`): 0 invariants · 1 server-core · 2 oracle-test · 3 actions · 4 remote · 5 panel-invariants · 6 panels · 7 panels-test. Status field set 2026-09-19 (waves 0-1 in-progress, 2-7 pending; vocabulary from bin/lib/dispatch.sh) — landing state is inferred from files on disk, not recorded in the plan.
 
 ---
 
@@ -534,7 +534,7 @@ From `docs/analysis/2026-09-19-go-live-virality-eval.md` (gitignored, local-only
 | 19 test suites hardcode the maintainer's personal clone path; `modules/omniroute/manifest.json:21` wording (now fixed in `8d0ed617`) | row B9; fix row 12 — `grep -rl '/Users/rj' test modules \| wc -l` |
 | 12 SessionStart hooks, no timeouts, unmeasured startup tax | Sev-2; fix row 11 |
 | `hmd --help` lists ~30 subcommands; the router dispatches many more that help does not show | section 9 above; eval "216 bin scripts" |
-| `docs/INDEX.md` says 15 commands; `ls commands/*.md \| wc -l` → 19 | this inventory |
+| `docs/INDEX.md` said 15 commands; `ls commands/*.md \| wc -l` → 19 (corrected 2026-09-19) | this inventory |
 
 Other gaps this inventory surfaced: `.heimdall/receipts/last-sweep.json` describes 412 suites while 427 exist on disk (15 suites unswept since `b43c4f4b`); `evals/oracles/README.md` lists 6 oracles while `registry.json` has 9 (`team-checkpoint`, `team-copilot`, `triage-coord` undocumented there); the companion-UI waves.json carries no status per wave.
 

@@ -68,7 +68,7 @@ The single map of Heimdall's knowledge tree. Every committed Markdown doc earns 
 | [../skills/self-improve/SKILL.md](../skills/self-improve/SKILL.md) | Self-improvement skill. | Load-bearing (runtime) |
 | [../skills/stacks/README.md](../skills/stacks/README.md) | Stack skill packs (fastapi, nextjs, react-native, spring-boot). | Load-bearing (runtime) |
 | [../agents/](../agents) | 16 agent definitions (architect, coder, reviewer, seeker, fixer, …) loaded by path. | Load-bearing (runtime) |
-| [../commands/](../commands) | 15 slash-command definitions (maintain, team, demo, save, …) loaded by path. | Load-bearing (runtime) |
+| [../commands/](../commands) | 19 slash-command definitions (maintain, team, demo, save, …) loaded by path. | Load-bearing (runtime) |
 | [../conformance/README.md](../conformance/README.md) | Parity-conformance fixtures. | Load-bearing |
 
 ## Test & Verification
