@@ -29,6 +29,19 @@ title = "Heimdall secret-scan config"
 # we never remove or weaken a rule.
 useDefault = true
 
+# ── Parity with GitHub push protection (added 2026-09-19) ─────────────────────
+# GitHub blocked a push over a Stripe-shaped example token in a PLAN doc:
+# `sk_live_` followed by 24 alphanumerics that were all the same letter. gitleaks'
+# built-in stripe rule skipped it on entropy; GitHub's does not weigh entropy. A
+# gate that passes locally and fails at the remote is the worst kind of gate, so
+# hmd now flags the SHAPE unconditionally. Illustrating a secret in docs means
+# describing its shape in words, never writing one -- even a fake one.
+[[rules]]
+id = "hmd-stripe-shaped-token"
+description = "Stripe live/test/restricted key shape, entropy-agnostic (parity with GitHub push protection)"
+regex = '''\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{20,}\b'''
+keywords = ["sk_live_", "sk_test_", "rk_live_", "rk_test_", "pk_live_", "pk_test_"]
+
 [allowlist]
 description = "Heimdall's own secret-detection fixtures — test material, not real credentials."
 
