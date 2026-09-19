@@ -239,7 +239,16 @@ FINDINGS=0
 SKIPPED_BUDGET=0
 MAX_DETAIL_LINES=6
 
-rel() { case "$1" in "$REPO"/*) printf '%s' "${1#"$REPO"/}" ;; *) printf '%s' "$1" ;; esac; }
+# Strip the repo prefix for display. Both the physical path (pwd -P) and the
+# as-given one are tried: macOS TMPDIR is /var/... → /private/var/..., and the
+# tracker records whichever spelling the editing tool used.
+rel() {
+  case "$1" in
+    "$REPO"/*)     printf '%s' "${1#"$REPO"/}" ;;
+    "$REPO_RAW"/*) printf '%s' "${1#"$REPO_RAW"/}" ;;
+    *)             printf '%s' "$1" ;;
+  esac
+}
 
 # report <file> <summary> [detail-text]
 report() {
@@ -278,12 +287,12 @@ for f in "${PY_FILES[@]:-}"; do
   if ! budget_left; then SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); report "$f" "skipped (budget)"; continue; fi
   parts=(); detail=""; fcount=0
   if [ -n "$PY" ]; then
-    out="$(run_bounded "$PY" -c 'import ast,sys; ast.parse(open(sys.argv[1],"rb").read(), sys.argv[1])' "$f")"; add_tool "python3 ast"
+    run_bounded "$PY" -c 'import ast,sys; ast.parse(open(sys.argv[1],"rb").read(), sys.argv[1])' "$f"; out="$(tool_out)"; add_tool "python3 ast"
     if [ "$RUN_RC" -eq 0 ]; then parts+=("ast ok")
     else fcount=$((fcount + 1)); parts+=("ast FAIL"); detail="$(printf '%s\n' "$out" | grep -E 'SyntaxError|line [0-9]+' | tail -n 3)"; [ -z "$detail" ] && detail="$out"; fi
   fi
   if [ -n "$RUFF" ] && budget_left; then
-    out="$(run_bounded "$RUFF" check --no-fix --output-format concise "$f")"; add_tool ruff
+    run_bounded "$RUFF" check --no-fix --output-format concise "$f"; out="$(tool_out)"; add_tool ruff
     if [ "$RUN_RC" -eq 0 ]; then parts+=("ruff ok")
     elif [ "$RUN_RC" -gt 128 ]; then parts+=("ruff timed out")
     else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
@@ -301,20 +310,20 @@ if [ "${#JS_FILES[@]}" -gt 0 ]; then
   else
     TSC_OUT=""
     if [ -n "$TSC" ] && budget_left; then
-      TSC_OUT="$(cd "$REPO" && run_bounded "$TSC" --noEmit -p tsconfig.json --pretty false)"; add_tool tsc
+      run_in_repo "$TSC" --noEmit -p tsconfig.json --pretty false; TSC_OUT="$(tool_out)"; add_tool tsc
       [ "$RUN_RC" -gt 128 ] && say "tsc timed out after ${PER_CALL}s — type results omitted"
     fi
     for f in "${JS_FILES[@]}"; do
       if ! budget_left; then SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); report "$f" "skipped (budget)"; continue; fi
       parts=(); detail=""; fcount=0
       if [ -n "$BIOME" ] && budget_left; then
-        out="$(cd "$REPO" && run_bounded "$BIOME" lint --reporter=summary "$f")"; add_tool biome
+        run_in_repo "$BIOME" lint --reporter=summary "$f"; out="$(tool_out)"; add_tool biome
         if [ "$RUN_RC" -eq 0 ]; then parts+=("biome ok")
         elif [ "$RUN_RC" -gt 128 ]; then parts+=("biome timed out")
         else fcount=$((fcount + 1)); parts+=("biome FAIL"); detail="$out"; fi
       fi
       if [ -n "$ESLINT" ] && budget_left; then
-        out="$(cd "$REPO" && run_bounded "$ESLINT" --no-fix -f unix "$f")"; add_tool eslint
+        run_in_repo "$ESLINT" --no-fix -f unix "$f"; out="$(tool_out)"; add_tool eslint
         if [ "$RUN_RC" -eq 0 ]; then parts+=("eslint ok")
         elif [ "$RUN_RC" -gt 128 ]; then parts+=("eslint timed out")
         else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1

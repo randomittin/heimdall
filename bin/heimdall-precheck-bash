@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# heimdall-precheck-bash — the PreToolUse/Bash enforcement chain (git-guard
+# self-heal, commit secret gate, and the whole `git push` gate stack: quality
+# gates, push-range secret gate, full-history self-scan, native-hook dedup,
+# oracle falsifiability, corpus regression, parallelism-tracker). Moved out of
+# hooks/hooks.json into a real script for the same reason bin/heimdall-precheck-edit
+# and bin/heimdall-precheck-agent exist: hooks.json is wiring, this is the logic.
+#
+# WHY THE EXTRACTION (2026-09-19, ECC harness gap analysis item #3 (iv)):
+#   - The chain lived as ONE ~5,000-char shell string embedded in a JSON value.
+#     A JSON string cannot be `bash -n`-checked, shellcheck'd, or unit-tested in
+#     place — every edit was verified only by running the whole hook, and only
+#     on the paths that edit happened to exercise. ECC's single largest issue
+#     class is hooks misfiring in someone's environment (#240, #264, #1435,
+#     #1548, #1590, #3062); a hook you cannot syntax-check is exactly how that
+#     class is manufactured. Here it is a file: `bash -n` it, run
+#     test/heimdall-precheck-bash.test.sh against it, read it with line numbers.
+#   - hooks/hooks.json shrinks to the same one-liner shape the other two
+#     precheck hooks use (read stdin, resolve PLUGIN, pipe the payload in), so
+#     the per-hook fingerprint/kill-switch work in the same item has a stable,
+#     short command string to fingerprint.
+#
+# ZERO LOGIC CHANGE. The body below is the hooks.json string, verbatim, split
+# at its top-level `; ` boundaries and indented — nothing added, removed or
+# reordered. test/heimdall-precheck-bash.test.sh proves it: for every branch of
+# the chain it runs the historical inline string (bash -c) and this script under
+# one identical environment and asserts byte-identical stdout, stderr, exit code
+# and even the `bash -x` execution trace. Anything that changes the chain's
+# behaviour belongs in a SEPARATE commit against this file, with that test
+# updated on purpose.
+#
+# CONTRACT (unchanged from the inline form):
+#   stdin   the PreToolUse JSON payload; `.tool_input.command` is the Bash
+#           command about to run. An empty or malformed payload is treated as an
+#           empty command (jq's own parse error goes to stderr, nothing blocks).
+#   stdout  ONLY a `{"error": "BLOCKED: ..."}` JSON object, and only on a deny.
+#           (Plus whatever parallelism-tracker prints — its stderr is folded into
+#           stdout by the trailing `2>&1`, exactly as the inline did.)
+#   stderr  every advisory: gate verdicts, "UNAVAILABLE" notices, the native-hook
+#           delegation line, falsify/corpus output.
+#   exit 2  DENY — a gate failed (secret in staged diff, quality gate rc 2, push
+#           secret gate, self-scan, non-falsifiable oracle, corpus regression).
+#   exit 0  everything else, including "gate never evaluated" (the quality-gate
+#           verdict UNAVAILABLE branch warns and allows, as before).
+#
+# ENV honoured (unchanged):
+#   CLAUDE_PLUGIN_ROOT  plugin root; falls back to the cwd's git toplevel, then pwd.
+#   HMD_SKIP            the NATIVE pre-push hook's own bypass. It does NOT bypass
+#                       this layer: `HMD_SKIP=1` only prevents the dedup guard from
+#                       DELEGATING the oracle+corpus gates to .heimdall/hooks/pre-push,
+#                       so this layer runs them inline instead. Widening HMD_SKIP to
+#                       reach here would be a silent gate weakening — see
+#                       test/pre-push-gate-dedup.test.sh case 4.
+#   SECRET_SCAN_REQUIRE is SET (=1) by this script for the push-range scan.
+#   Anything the delegated bins read (HMD_GIT_GUARD_PGREP, HEIMDALL_HOME, ...)
+#   passes straight through.
+#
+# Deliberately NO `set -e`, `set -u` or `pipefail`: the inline string ran under
+# Claude Code's plain `sh -c`/`bash -c` defaults, and its logic depends on them —
+# `QGOUT=$(...); QGRC=$?` must survive a nonzero, and `printf | grep -q` must not
+# turn a SIGPIPE'd printf into a false gate verdict under pipefail.
+#
+# -h, --help   print this header (the hook never passes arguments).
+case "${1:-}" in
+  -h|--help) sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+INPUT=$(cat)
+CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty')
+PLUGIN="${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+SCAN="$PLUGIN/bin/secret-scan"
+GITGUARD="$PLUGIN/bin/heimdall-git-guard"
+if [ -x "$GITGUARD" ] && printf '%s\n' "$CMD" | grep -qE '(^|[;&|]|[[:space:]])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+(add|commit|merge|rebase|stash|cherry-pick|revert|am|apply|pull)([[:space:]]|$)'; then
+  "$GITGUARD"
+fi
+if printf '%s\n' "$CMD" | grep -qE '(^|[;&|]\s*)git\s+commit'; then
+  if [ -x "$SCAN" ]; then
+    if ! OUT=$("$SCAN" 2>&1); then
+      ESC=$(printf '%s' "$OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+      printf '{"error": "BLOCKED: secret detected in staged changes by gitleaks. A credential must never enter history. Remove it from the staged diff before committing. --- %s"}' "$ESC"
+      exit 2
+    else
+      printf '%s\n' "$OUT" >&2
+    fi
+  fi
+fi
+if printf '%s\n' "$CMD" | grep -qE '^git\s+push'; then
+  HSTATE="$PLUGIN/bin/heimdall-state"
+  [ -x "$HSTATE" ] || HSTATE=heimdall-state
+  QGOUT=$("$HSTATE" check-quality-gates 2>&1)
+  QGRC=$?
+  if [ "$QGRC" = 2 ]; then
+    ESC=$(printf '%s' "$QGOUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+    printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing. --- %s"}' "$ESC"
+    exit 2
+  elif [ "$QGRC" = 0 ]; then
+    printf '%s\n' "$QGOUT" >&2
+  else
+    printf 'heimdall: quality-gate verdict UNAVAILABLE (exit %s) - the gates were NEVER EVALUATED, which is not a pass. Run `heimdall-state init` then `heimdall-state mark-clean` in this checkout to arm the pre-push gate. Allowing push to proceed. --- %s\n' "$QGRC" "$QGOUT" >&2
+  fi
+  if [ -x "$SCAN" ]; then
+    if ! OUT=$(SECRET_SCAN_REQUIRE=1 "$SCAN" --require 2>&1); then
+      ESC=$(printf '%s' "$OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+      printf '{"error": "BLOCKED: pre-push secret gate failed (gitleaks). A secret in the push range or a missing scanner blocks the push — gitleaks must be present and the range clean. --- %s"}' "$ESC"
+      exit 2
+    else
+      printf '%s\n' "$OUT" >&2
+    fi
+  fi
+  SELFSCAN="$PLUGIN/bin/heimdall-selfscan"
+  if [ -x "$SELFSCAN" ]; then
+    if ! OUT=$("$SELFSCAN" 2>&1); then
+      ESC=$(printf '%s' "$OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+      printf '{"error": "BLOCKED: pre-push self-scan failed (gitleaks over Heimdall OWN full history). A secret anywhere in this repo history, or a missing scanner, blocks the push. Agents commit --no-verify (bypassing the pre-commit gate), so this full-history self-scan is the backstop. Scrub the secret from history (git filter-repo) or install gitleaks. --- %s"}' "$ESC"
+      exit 2
+    else
+      printf '%s\n' "$OUT" >&2
+    fi
+  fi
+  NHP=$(git config --get core.hooksPath 2>/dev/null || true)
+  NATIVE_GATE=0
+  if [ "${HMD_SKIP:-0}" != "1" ] && [ "$NHP" = ".heimdall/hooks" ] && [ -x ".heimdall/hooks/pre-push" ]; then
+    NATIVE_GATE=1
+    printf 'heimdall: oracle+corpus gates delegated to the native pre-push hook (.heimdall/hooks/pre-push runs heimdall-gate-run) — skipping the duplicate inline run.\n' >&2
+  fi
+  FALSIFY="$PLUGIN/bin/falsify"
+  ORACLES="$PLUGIN/evals/oracles"
+  if [ "$NATIVE_GATE" = 0 ] && [ -x "$FALSIFY" ] && [ -d "$ORACLES" ]; then
+    for D in "$ORACLES"/*/; do
+      DOM=$(basename "$D")
+      if [ -d "$D/fixtures/mutants" ]; then
+        APPLIES=0
+        if [ -f .planning/detected-stack.json ] && grep -q "$DOM" .planning/detected-stack.json 2>/dev/null; then
+          APPLIES=1
+        fi
+        if [ -d "evals/oracles/$DOM" ]; then
+          APPLIES=1
+        fi
+        if [ "$APPLIES" = 1 ]; then
+          if ! "$FALSIFY" "$DOM" --assert-score 1.0 >&2; then
+            STAMP="$PLUGIN/bin/heimdall-stamp"
+            REP="evals/oracles/$DOM/report.json"
+            if [ -x "$STAMP" ]; then
+              if [ -f "$REP" ]; then
+                "$STAMP" --report "$REP" --branch "heimdall/blocked/$DOM" >&2 2>/dev/null || true
+              else
+                "$STAMP" --violation "oracle gate $DOM is not falsifiable (score < 1.0)" --branch "heimdall/blocked/$DOM" >&2 2>/dev/null || true
+              fi
+            fi
+            printf '{"error": "BLOCKED: oracle gate %s is not falsifiable (score < 1.0). A green test suite over a non-falsifiable gate must not pass push. Harden the gate until bin/falsify reports 1.0."}' "$DOM"
+            exit 2
+          fi
+        fi
+      fi
+    done
+  fi
+  CORPUS="$PLUGIN/bin/corpus"
+  if [ "$NATIVE_GATE" = 0 ] && [ -f evals/corpus/INDEX.json ] && [ -x "$CORPUS" ]; then
+    if ! "$CORPUS" run >&2; then
+      STAMP="$PLUGIN/bin/heimdall-stamp"
+      [ -x "$STAMP" ] && "$STAMP" --violation "corpus regression — a case the gates once caught is no longer caught" --branch "heimdall/blocked/corpus" >&2 2>/dev/null || true
+      printf '{"error": "BLOCKED: corpus regression — bin/corpus run is nonzero. A case the gates once caught is no longer caught (CI inversion, H-8). The gates are regression-tested by the failures they once caught; restore 100%% catch before push."}'
+      exit 2
+    fi
+  fi
+fi
+"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/parallelism-tracker" check Bash 2>&1 || true
