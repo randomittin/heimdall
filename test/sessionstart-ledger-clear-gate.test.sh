@@ -403,12 +403,26 @@ fi
 # carries only a per-turn pointer, so without this entry ultra was a pointer to
 # nothing. Bumping this number is correct; bumping it WITHOUT knowing which
 # entry arrived is the thing to refuse.
+#
+# 10 -> 12 on 2026-09-19, two entries, both known and both advisory:
+#   SessionStart[10] settings-guard      -- bin/heimdall-settings-guard: warns when
+#                                           ~/.claude/settings.json carries an
+#                                           ANTHROPIC_* env override (the 09-11
+#                                           incident that routed every session to
+#                                           a dead third-party gateway)
+#   SessionStart[11] volatile-repo-guard -- bin/heimdall-volatile-repo-guard: warns
+#                                           when the clone sits under /tmp,
+#                                           /private/tmp, /var/folders or Caches
+#                                           while holding commits no remote has
+#                                           (the 09-14 loss of 16 commits)
+# Both are registered in hooks/hooks.metadata.json (ids above) and covered by
+# their own suites, so this tripwire fired for exactly the reason it exists.
 # ══════════════════════════════════════════════════════════════════════════
 SS_COUNT="$(jq '.hooks.SessionStart | length' "$HOOKS_JSON")"
-if [ "$SS_COUNT" -eq 10 ]; then
-  ok "G9 all 10 SessionStart entries still present"
+if [ "$SS_COUNT" -eq 12 ]; then
+  ok "G9 all 12 SessionStart entries still present"
 else
-  bad "G9 expected 10 SessionStart entries, found $SS_COUNT"
+  bad "G9 expected 12 SessionStart entries, found $SS_COUNT"
 fi
 
 # The caveman `rules` entry specifically: it is the ONLY thing that puts hmd's

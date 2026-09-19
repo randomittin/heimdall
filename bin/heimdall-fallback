@@ -1396,12 +1396,12 @@ def _model_pin_reject_reason(model, origin):
     if model_segment.startswith("claude") and provider_segment not in CLAUDE_BRANDED_OK_PROVIDERS:
         return ("%s='%s' asks provider '%s' for a CLAUDE-BRANDED model -- measured live on "
                 "2026-09-18, opencode's own /zen/v1/models advertises 12 claude-* ids "
-                "(claude-opus-5, claude-sonnet-5, claude-fable-5, ...) it is not Anthropic's "
+                "(an opus, a sonnet, a fable, a haiku, and eight more) it is not Anthropic's "
                 "to serve. The provider/ prefix rule above was written to stop a BARE "
                 "claude-* id matching OmniRoute's provider-'claude' branch; it never "
                 "considered '<thirdparty>/claude-*', which satisfies that rule while still "
                 "producing output labelled as a Claude model. Every log line, every usage "
-                "row and every metric would then say claude-opus-5 for text an unrelated "
+                "row and every metric would then carry a claude-* label for text an unrelated "
                 "provider generated, which is exactly the attribution lie this repo exists "
                 "to prevent. Legitimate Claude-serving providers: %s"
                 % (origin, model, provider_segment, ", ".join(CLAUDE_BRANDED_OK_PROVIDERS)))

@@ -61,6 +61,10 @@ mk_repo() {
 # mk_bare_remote DIR -- an init --bare repo to act as a real, local "remote".
 mk_bare_remote() {
   local dir="$1"
+  # Guard the target: an empty $dir would make `git init --bare` turn the CWD --
+  # potentially this repo -- into a bare repository (test/repo-never-left-bare
+  # scans every test for exactly this call shape).
+  [ -n "$dir" ] || { echo "mk_bare_remote: empty target dir" >&2; exit 1; }
   git init -q --bare "$dir"
 }
 
