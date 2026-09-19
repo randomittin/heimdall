@@ -190,7 +190,8 @@ wait_for() {
 
 # The publish CLI, run the way the PLAN's worked examples run it (L797, L809, L822):
 # from the repo root, with HEIMDALL_WATCH_ROOT pointing at it. stdin passes through.
-panel() { ( cd "$FIX" && HEIMDALL_WATCH_ROOT="$FIX" exec "$UI" panel "$@" ); }
+panel() { ( cd "$FIX" && HEIMDALL_WATCH_ROOT="$FIX" exec "$UI" panel "$@" ) >/dev/null; }
+panel_out() { ( cd "$FIX" && HEIMDALL_WATCH_ROOT="$FIX" exec "$UI" panel "$@" ); }
 
 # Fetch /api/state into $1; echo http code.
 STATE="$TMPROOT/state.json"
@@ -321,12 +322,20 @@ done
 # multi-series shapes (L316-317, L326-327) and --refresh-s (L451, L516)
 if printf '{"series":[{"name":"a","x":[1,2],"y":[3,4]},{"name":"b","x":[1,2],"y":[5,6]}]}' \
      | panel set rt-multi --type timeseries --title "Multi" --data-json - --refresh-s 60 2>/dev/null \
-   && printf '{"series":[{"name":"a","labels":["p","q"],"values":[1,2]}]}' \
-     | panel set rt-multibars --type bars --title "Multi bars" --data-json - 2>/dev/null \
-   && state_until '(.panels[] | select(.id=="rt-multi") | .data.series|length)==2 and (.panels[] | select(.id=="rt-multi") | .refresh_s)==60 and ([.panels[].id]|index("rt-multibars"))!=null' 6; then
-  ok "1.8 multi-series timeseries + bars accepted; --refresh-s 60 surfaces as refresh_s==60"
+   && state_until '((.panels[] | select(.id=="rt-multi") | .data.series | length) == 2) and ((.panels[] | select(.id=="rt-multi") | .refresh_s) == 60)' 6; then
+  ok "1.8 multi-series timeseries accepted (2 series); --refresh-s 60 surfaces as refresh_s==60 (L316-317, L451)"
 else
-  bad "1.8 multi-series / --refresh-s: $(jq -c '[.panels[]|select(.id=="rt-multi" or .id=="rt-multibars")|{id,refresh_s,n:(.data.series|length)}]' "$STATE" 2>/dev/null)"
+  bad "1.8 multi-series timeseries / --refresh-s: $(jq -c '[.panels[]|select(.id=="rt-multi")|{id,refresh_s,n:(.data.series|length)}]' "$STATE" 2>/dev/null)"
+fi
+# bars multi-series: PLAN L326-327 says "the same multi-series shape as timeseries",
+# read literally as series of {name,x,y} (x = category labels). A shape of
+# {name,labels,values} inside series is NOT in the PLAN and is not asserted.
+if printf '{"series":[{"name":"a","x":["p","q"],"y":[1,2]},{"name":"b","x":["p","q"],"y":[3,4]}]}' \
+     | panel set rt-multibars --type bars --title "Multi bars" --data-json - 2>"$TMPROOT/multibars.err" \
+   && state_until '((.panels[] | select(.id=="rt-multibars") | .data.series | length) == 2)' 6; then
+  ok "1.8b multi-series bars accepted in the timeseries series shape {name,x,y} (L326-327)"
+else
+  bad "1.8b multi-series bars {series:[{name,x,y}]} refused or not served: $(head -c 200 "$TMPROOT/multibars.err") served=$(jq -c '[.panels[]|select(.id=="rt-multibars")|.data]' "$STATE" 2>/dev/null)"
 fi
 # --data-json FILE (not just '-') (L450-451)
 printf '{"value":7}' > "$TMPROOT/file-payload.json"
@@ -620,7 +629,7 @@ else
   bad "8. demo set/serve failed"
 fi
 LS_OUT="$TMPROOT/ls.out"
-if panel ls >"$LS_OUT" 2>&1; then
+if panel_out ls >"$LS_OUT" 2>&1; then
   if grep -q '^demo$\|"demo"\|\bdemo\b' "$LS_OUT" && grep -q 'rt-kv' "$LS_OUT"; then
     ok "8b. panel ls exists and lists ids (demo, rt-kv)"
   else
@@ -645,7 +654,7 @@ touch -t 202001010000 "$PANELS/rt-kv.json.99999.tmp"
 live_before="$(cat "$PANELS/rt-kv.json")"
 sleep 4.5
 get_state >/dev/null
-if jq -e '[.panels[] | select(.id=="rt-kv")] | length == 1 and .[0].data.rows|length == 3' "$STATE" >/dev/null 2>&1 \
+if jq -e '(([.panels[] | select(.id=="rt-kv")] | length) == 1) and ((.panels[] | select(.id=="rt-kv") | .data.rows | length) == 3)' "$STATE" >/dev/null 2>&1 \
    && [ "$(cat "$PANELS/rt-kv.json")" = "$live_before" ]; then
   ok "8d. an orphaned rt-kv.json.99999.tmp is not served as a panel and the live rt-kv.json is untouched (L379-386)"
 else
@@ -692,12 +701,17 @@ if wait_for "$EV_BODY" '^data: ' 6; then
     ok "9c. idle 4.5s (> two 2s polls) produced NO extra frame -- digest-diff holds with panels present (L110-113)"
   else
     # diagnose: is the churn ONLY the server's own hmd-live-users updated_at?
-    a="$(grep '^data: ' "$EV_BODY" | tail -2 | head -1 | sed 's/^data: //' | jq -c 'del(.ts) | .panels |= map(select(.id!="hmd-live-users"))' 2>/dev/null)"
-    b="$(grep '^data: ' "$EV_BODY" | tail -1 | sed 's/^data: //' | jq -c 'del(.ts) | .panels |= map(select(.id!="hmd-live-users"))' 2>/dev/null)"
-    if [ -n "$a" ] && [ "$a" = "$b" ]; then
-      bad "9c. $((n2 - n1)) idle frame(s): consecutive frames differ ONLY in hmd-live-users -- PLAN L697 (updated_at=now every tick) contradicts Decision 2's digest-diff (L110-113); the self-published panel must not churn the digest"
+    grep '^data: ' "$EV_BODY" | tail -2 | head -1 | sed 's/^data: //' > "$TMPROOT/frame-a.json"
+    grep '^data: ' "$EV_BODY" | tail -1 | sed 's/^data: //' > "$TMPROOT/frame-b.json"
+    keys_diff="$(jq -cn --slurpfile a "$TMPROOT/frame-a.json" --slurpfile b "$TMPROOT/frame-b.json" \
+      '[($a[0]|keys[]) as $k | select($a[0][$k] != $b[0][$k]) | $k]' 2>/dev/null)"
+    panels_diff="$(jq -cn --slurpfile a "$TMPROOT/frame-a.json" --slurpfile b "$TMPROOT/frame-b.json" \
+      '($a[0].panels // [] | map({(.id): .}) | add // {}) as $pa | ($b[0].panels // [] | map({(.id): .}) | add // {}) as $pb
+       | [(($pa|keys) + ($pb|keys) | unique[]) as $id | select($pa[$id] != $pb[$id]) | $id]' 2>/dev/null)"
+    if { [ "$keys_diff" = '["panels"]' ] || [ "$keys_diff" = '["panels","ts"]' ]; } && [ "$panels_diff" = '["hmd-live-users"]' ]; then
+      bad "9c. $((n2 - n1)) idle frame(s): consecutive frames differ ONLY in panels[hmd-live-users] -- PLAN L697 (updated_at=now every tick) contradicts Decision 2's digest-diff (L110-113); the self-published panel must not churn the digest"
     else
-      bad "9c. $((n2 - n1)) frame(s) arrived while nothing changed (digest-diff broken)"
+      bad "9c. $((n2 - n1)) frame(s) arrived while nothing changed (digest-diff, L110-113); differing top-level keys=$keys_diff differing panel ids=$panels_diff"
     fi
   fi
   if leak="$(contains_sentinel "$EV_BODY")"; then
@@ -769,7 +783,7 @@ sqlite3 "$DB" "create table orders(id integer primary key, created_at text);
   insert into orders(created_at) values ('2026-09-19 09:05:00'),('2026-09-19 09:40:00'),('2026-09-19 10:10:00');"
 if sqlite3 -json "$DB" "select strftime('%Y-%m-%dT%H:00:00Z',created_at) h, count(*) c from orders group by h order by h" \
      | jq -c '{x:[.[].h], y:[.[].c]}' \
-     | HEIMDALL_WATCH_ROOT="$FIX" "$UI" panel set db-orders-per-hour --type timeseries --title "Orders / hour" --data-json - 2>"$TMPROOT/ex-a.err" \
+     | HEIMDALL_WATCH_ROOT="$FIX" "$UI" panel set db-orders-per-hour --type timeseries --title "Orders / hour" --data-json - >/dev/null 2>"$TMPROOT/ex-a.err" \
    && test -f "$FIX/.heimdall/ui/panels/db-orders-per-hour.json" \
    && jq -e '.type=="timeseries" and (.data.x|length)==(.data.y|length)' "$FIX/.heimdall/ui/panels/db-orders-per-hour.json" >/dev/null \
    && state_until '.panels[] | select(.id=="db-orders-per-hour") | .data.y == [2,1]' 6; then
@@ -781,7 +795,7 @@ fi
 # the server already computes; in this hermetic fixture the same count comes
 # from the planted roster-cache (1 entry), piped through L809's jq verbatim.
 if ( cd "$FIX" && jq -c '{value: length}' .heimdall/roster-cache.json \
-       | "$UI" panel set hmd-live-users --type number --title "hmd — live users" --data-json - ) 2>"$TMPROOT/ex-b.err" \
+       | "$UI" panel set hmd-live-users --type number --title "hmd — live users" --data-json - ) >/dev/null 2>"$TMPROOT/ex-b.err" \
    && ( cd "$FIX" && jq -e '.type=="number" and (.data.value|type=="number") and .data.value>=0' .heimdall/ui/panels/hmd-live-users.json >/dev/null ); then
   ok "11b. worked example (b) roster-count->number, cwd-rooted, manual publish to hmd-live-users (L807-810)"
 else
@@ -792,10 +806,10 @@ if ( cd "$FIX" \
      && BR="$(git rev-parse --abbrev-ref HEAD)" && HD="$(git rev-parse --short HEAD)" \
      && PH="$(grep -m1 '^- \*\*Phase:\*\*\|^Phase:' .planning/CHECKPOINT.md | sed 's/^- \*\*Phase:\*\* *//; s/^Phase: *//')" \
      && jq -cn --arg b "$BR" --arg h "$HD" --arg p "$PH" '{rows:[["Branch",$b],["HEAD",$h],["Phase",$p]]}' \
-        | "$UI" panel set task-progress --type kv --title "Task progress" --data-json - \
+        | "$UI" panel set task-progress --type kv --title "Task progress" --data-json - >/dev/null \
      && jq -e '.type=="kv" and (.data.rows|length)==3' .heimdall/ui/panels/task-progress.json >/dev/null \
      && jq -cs '{lines: (map("\(.active_task // "-") @ \(.branch // "-")") | .[:200])}' .planning/ledger/activity/*.json 2>/dev/null \
-        | "$UI" panel set task-log --type log-tail --title "Recent activity" --data-json - \
+        | "$UI" panel set task-log --type log-tail --title "Recent activity" --data-json - >/dev/null \
      && jq -e '.type=="log-tail" and (.data.lines|length) <= 200' .heimdall/ui/panels/task-log.json >/dev/null ) 2>"$TMPROOT/ex-c.err" \
    && state_until '(.panels[] | select(.id=="task-progress") | .data.rows[2][1]) == "fixture-phase"
                    and (.panels[] | select(.id=="task-log") | .data.lines[0]) == "fixture-task @ fixture-branch"' 6; then

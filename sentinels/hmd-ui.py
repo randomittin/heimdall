@@ -573,6 +573,14 @@ def digest_of(state):
     every poll would differ and the SSE stream would never be quiet."""
     body = dict(state)
     body.pop("ts", None)
+    # A panel's `updated_at` bump alone is a heartbeat, not a state change (contract
+    # decision, Wave 4): the digest sees id/type/title/data/refresh_s and the `stale`
+    # flip, never the timestamp -- so hmd's own periodic hmd-live-users rewrite, or a
+    # job re-publishing identical numbers, keeps the SSE stream quiet.
+    panels = body.get("panels")
+    if isinstance(panels, list):
+        body["panels"] = [{k: v for k, v in p.items() if k != "updated_at"} if isinstance(p, dict) else p
+                          for p in panels]
     return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
 
