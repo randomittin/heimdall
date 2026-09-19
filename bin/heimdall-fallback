@@ -982,6 +982,36 @@ def _resolve_cliproxyapi_dir(cfg):
     return os.path.expanduser(os.path.join("~", ".cli-proxy-api"))
 
 
+def _gateway_holds_credential(cfg, provider):
+    """True iff OmniRoute's own DB shows an ACTIVE provider_connections row for
+    `provider` with a non-empty stored api_key.
+
+    Positive verification, fail-CLOSED: a missing DB, an unreadable DB, a
+    missing row, or an empty key all return False and let run_preflight fall
+    through to the pre-existing operator_key_env requirement -- so behaviour
+    for every provider that is NOT gateway-credentialed is unchanged. Only a
+    key that is positively present passes. The value is never read.
+    """
+    provider = (provider or "").strip().lower()
+    if not provider:
+        return False
+    db_path = _resolve_omniroute_db_path(cfg)
+    if not os.path.exists(db_path):
+        return False
+    rows, err = _query_omniroute(
+        db_path,
+        "SELECT COUNT(*) FROM provider_connections WHERE lower(provider) = ? "
+        "AND is_active = 1 AND api_key IS NOT NULL AND api_key <> ''",
+        (provider,),
+    )
+    if err is not None or not rows:
+        return False
+    try:
+        return int(rows[0][0]) > 0
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
 def _resolve_noauth_providers(cfg):
     """The built-in NOAUTH_PROVIDERS set plus any operator ADDITIONS from
     config's `noauth_providers` -- same additions-only shape as
@@ -1305,6 +1335,25 @@ def run_preflight(cfg, role=None):
         ))
     elif _target_provider_is_noauth(cfg):
         checks.append(("operator_key", True, NOAUTH_ROUTE_NOTE_FMT % target_provider_raw))
+    elif _gateway_holds_credential(cfg, target_provider_raw):
+        # The credential lives INSIDE OmniRoute, not in hmd's environment.
+        # Measured 2026-09-19 with provider 'dahl': OmniRoute mints the token
+        # itself (POST /api/dahl/tokens, no signup) and stores it encrypted on
+        # the provider_connections row; hmd's routed child never sees or sends
+        # it -- the gateway injects it upstream. Demanding an operator_key_env
+        # here would force the operator to export a variable nothing reads,
+        # purely to satisfy a check whose premise (the key is hmd-resident)
+        # is false for this class of provider. Positive verification instead:
+        # an ACTIVE row for this provider carrying a non-empty api_key, read
+        # from the gateway's own DB. The key's VALUE is never read -- only
+        # its presence -- so this adds no secret-handling surface.
+        checks.append((
+            "operator_key", True,
+            "credential for '%s' is held by the OmniRoute gateway itself (active "
+            "provider_connections row with a stored key -- presence verified, value "
+            "never read); no operator_key_env is needed because hmd never transmits "
+            "this key" % target_provider_raw,
+        ))
     elif not key_env:
         checks.append(("operator_key", False, "no operator_key_env configured -- an operator-owned key is required"))
     elif not os.environ.get(key_env):

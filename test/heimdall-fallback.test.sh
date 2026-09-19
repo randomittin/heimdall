@@ -97,6 +97,23 @@ conn.commit(); conn.close()
 " "$db" "$provider" "$status"
 }
 
+# make_keyed_db <db_file> <provider> <api_key_or_empty> -- an ACTIVE keyed
+# provider_connections row, the shape a gateway-managed credential (dahl's
+# auto-minted token, 2026-09-19) takes: the key lives on the row, never in
+# hmd's environment. Column set mirrors make_health_db plus api_key.
+make_keyed_db() {
+  local db="$1" provider="$2" key="$3"
+  python3 -c "
+import sqlite3, sys
+db, provider, key = sys.argv[1], sys.argv[2], sys.argv[3]
+conn = sqlite3.connect(db)
+conn.execute('CREATE TABLE IF NOT EXISTS provider_connections (id INTEGER PRIMARY KEY, provider TEXT, mode TEXT, test_status TEXT, last_error_type TEXT, last_error TEXT, is_active INTEGER DEFAULT 1, api_key TEXT)')
+conn.execute(\"CREATE TABLE IF NOT EXISTS upstream_proxy_config (id INTEGER PRIMARY KEY, provider_id TEXT, mode TEXT NOT NULL DEFAULT 'native', fallback_backend TEXT NOT NULL DEFAULT 'cliproxyapi')\")
+conn.execute('INSERT INTO provider_connections (provider, test_status, is_active, api_key) VALUES (?, ?, 1, ?)', (provider, 'active', key or None))
+conn.commit(); conn.close()
+" "$db" "$provider" "$key"
+}
+
 # add_proxy_config_row <db_file> <provider_id> <mode> [fallback_backend]
 # Inserts one upstream_proxy_config row -- for the delegated-sidecar-in-DB
 # falsifiers. `mode` vocabulary ('native'|'cliproxyapi'|'dario'|'fallback')
@@ -321,7 +338,8 @@ fi
 R="$(fresh_repo)"; DB="$R/health.sqlite"
 make_health_db "$DB" "opencode" "active"
 write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"opencode\", \"omniroute_db_path\": \"$DB\"}"
-if ! fb --repo "$R" check 2>&1 | grep -q '\[FAIL\] connection_health'; then
+out="$(fb --repo "$R" check 2>&1)"
+if ! printf \'%s\' "$out" | grep -q '\[FAIL\] connection_health'; then
   ok "60c. an active connection passes connection_health"
 else
   bad "60c. false positive -- a healthy connection was flagged unhealthy"
@@ -334,7 +352,8 @@ fi
 R="$(fresh_repo)"; DB="$R/old.sqlite"
 make_omniroute_db "$DB" "opencode" ""
 write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"opencode\", \"omniroute_db_path\": \"$DB\"}"
-if ! fb --repo "$R" check 2>&1 | grep -q '\[FAIL\] connection_health'; then
+out="$(fb --repo "$R" check 2>&1)"
+if ! printf \'%s\' "$out" | grep -q '\[FAIL\] connection_health'; then
   ok "60d. a DB with no health columns fails OPEN (passes), never blocks"
 else
   bad "60d. fail-open violated -- an unreadable health column refused the route"
@@ -345,10 +364,58 @@ fi
 R="$(fresh_repo)"; DB="$R/health.sqlite"
 make_health_db "$DB" "opencode" "some_future_status_hmd_has_never_seen"
 write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"opencode\", \"omniroute_db_path\": \"$DB\"}"
-if ! fb --repo "$R" check 2>&1 | grep -q '\[FAIL\] connection_health'; then
+out="$(fb --repo "$R" check 2>&1)"
+if ! printf \'%s\' "$out" | grep -q '\[FAIL\] connection_health'; then
   ok "60e. an unrecognized test_status is treated as healthy, not as broken"
 else
   bad "60e. an unknown status refused the route -- over-broad"
+fi
+
+echo "--------------------------------------------------------------------"
+
+# ── 61. NEW: operator_key passes when the GATEWAY holds the credential ──────
+# Measured 2026-09-19: OmniRoute mints dahl's token itself and stores it on
+# the connection row; hmd's child never sends it. Demanding operator_key_env
+# for that class of provider forces the operator to export a variable nothing
+# reads. Positive verification against the gateway DB instead -- key VALUE
+# never read, only presence.
+R="$(fresh_repo)"; DB="$R/keyed.sqlite"
+make_keyed_db "$DB" "dahl" "enc:not-a-real-secret"
+write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"dahl\", \"operator_key_env\": \"\", \"omniroute_db_path\": \"$DB\"}"
+out="$(fb --repo "$R" check 2>&1)"
+if printf '%s' "$out" | grep -q '\[OK  \] operator_key' && printf '%s' "$out" | grep -q 'held by the OmniRoute gateway'; then
+  ok "61a. keyed provider with a gateway-held key passes operator_key without operator_key_env"
+else
+  bad "61a. gateway-held credential was not recognized: $out"
+fi
+if ! printf '%s' "$out" | grep -q 'not-a-real-secret'; then
+  ok "61b. the stored key value is never echoed"
+else
+  bad "61b. key value leaked into check output"
+fi
+
+# 61c. FAIL-CLOSED: an active row with an EMPTY key must NOT pass -- that is
+# a provider with no credential, and the old env-var requirement must apply.
+R="$(fresh_repo)"; DB="$R/keyed.sqlite"
+make_keyed_db "$DB" "dahl" ""
+write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"dahl\", \"operator_key_env\": \"\", \"omniroute_db_path\": \"$DB\"}"
+out="$(fb --repo "$R" check 2>&1)"
+if printf \'%s\' "$out" | grep -q '\[FAIL\] operator_key'; then
+  ok "61c. empty stored key falls through to the operator_key_env requirement (fail-closed)"
+else
+  bad "61c. an empty key was treated as a credential"
+fi
+
+# 61d. a DB with NO api_key column at all (older fixture) also falls through --
+# an unreadable answer is never a pass on a credential-presence question.
+R="$(fresh_repo)"; DB="$R/old.sqlite"
+make_omniroute_db "$DB" "dahl" ""
+write_cfg "$R" "{\"state\": \"switch\", \"target_provider\": \"dahl\", \"operator_key_env\": \"\", \"omniroute_db_path\": \"$DB\"}"
+out="$(fb --repo "$R" check 2>&1)"
+if printf \'%s\' "$out" | grep -q '\[FAIL\] operator_key'; then
+  ok "61d. missing api_key column falls through to operator_key_env (fail-closed on plumbing)"
+else
+  bad "61d. unreadable key column was treated as a pass"
 fi
 
 echo "--------------------------------------------------------------------"
