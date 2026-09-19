@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# heimdall-ui — `hmd ui`, the loopback companion web UI (PLAN-companion-ui.md, Wave 1).
+#
+# A READ-ONLY browser view over the state hmd already writes to disk: gate verdict,
+# quality gate, sweep receipt, hooks, roster, checkpoint header, fallback badge,
+# parallelism grade. Zero new daemons, zero build step, zero external requests —
+# sentinels/hmd-ui.py is python3-stdlib only and serves ONE static page.
+#
+# Usage:
+#   hmd ui                     bind 127.0.0.1 on a random free port, print the URL
+#                              (carries a per-launch token), open the browser
+#   hmd ui --port N            bind a fixed port instead of a random one
+#   hmd ui --repo DIR          render DIR instead of the current git toplevel
+#   hmd ui --no-open           print the URL only, never launch a browser
+#   hmd ui --print-sources     list every file/command the server reads (tester hook)
+#   hmd ui --print-deny-list   list the never-read patterns (team.json, *.key, .env* ...)
+#   hmd ui --print-state       collect the JSON contract once and print it
+#   hmd ui -h|--help           this help
+#
+# Auth: loopback bind + Host-header allowlist (403) + per-launch token (401). The
+# URL printed on stdout is the only place the token appears; it is never logged.
+#
+# Interpreter: resolved through bin/lib/hmd-python.sh's hmd_python (cached, shim-
+# avoiding), never a bare `python3` — same convention as heimdall-statusline.
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+SERVER="$BIN_DIR/../sentinels/hmd-ui.py"
+PAGE="$BIN_DIR/../sentinels/hmd-ui.html"
+
+usage() { sed -n '2,24p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+PY3=""
+if [ -r "$BIN_DIR/lib/hmd-python.sh" ]; then
+  # shellcheck source=lib/hmd-python.sh
+  . "$BIN_DIR/lib/hmd-python.sh"
+  PY3="$(hmd_python 2>/dev/null || true)"
+fi
+if [ -z "$PY3" ]; then
+  echo "hmd ui needs a working python3 (none resolved by bin/lib/hmd-python.sh)." >&2
+  echo "Install python3, or set HMD_PYTHON=/path/to/python3, then re-run: hmd ui" >&2
+  exit 2
+fi
+if [ ! -f "$SERVER" ] || [ ! -f "$PAGE" ]; then
+  echo "error: hmd ui server files not found at $SERVER / $PAGE" >&2
+  echo "Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+  exit 2
+fi
+
+exec "$PY3" "$SERVER" "$@"
