@@ -472,6 +472,25 @@ relied on throughout this very plan's own Wave 1/2 acceptance criteria and
 test tasks, and a real "graph my database" job would use whatever DB client
 the operator's own project already has, not one `hmd` ships.
 
+> **Wave 4 adjudications (2026-09-19, from the independent oracle + author report):**
+> 1. **`updated_at` is a heartbeat, not a state change.** The SSE digest is computed
+>    with top-level `ts` and every `panels[i].updated_at` removed; `stale`, `id`,
+>    `type`, `title`, `data`, `refresh_s` stay in. The server's own `hmd-live-users`
+>    keepalive rewrite therefore never emits a frame unless the value or `stale`
+>    changes. This resolves the contradiction between Decision 2 (frame only on
+>    digest change) and the self-publish rule (rewrite every tick); oracle 9c is
+>    deterministic (4/4).
+> 2. **`hmd-live-users` is OWNED by the server** (rewritten in-process on value
+>    change or age >= 15s). Worked example (b) is renamed to publish
+>    `hmd-live-users-manual`; a manual `set` on the server-owned id is overwritten
+>    and must not be relied on.
+> 3. **bars multi-series shape** is exactly `{"series":[{"name","x","y"}]}` -- the
+>    literal reading of "same shape as timeseries" (x = category labels).
+>    `{name,labels,values}` inside `series` is refused. Single-series bars stay
+>    `{labels,values}`.
+> 4. **`panel ls` exists** (built this cycle despite the earlier "not this cycle"
+>    note); the oracle treats it as optional-but-must-list-ids.
+
 ### Decision 7 — Companion mobile app: relay + QR pairing
 
 > Amendment (2026-09-19). Operator's words: "the app will be communicating
@@ -1284,7 +1303,7 @@ jq -e '.type=="timeseries" and (.data.x|length)==(.data.y|length)' "$REPO/.heimd
 ```bash
 # manual proof the publish path works end-to-end with a real presence-derived number:
 bin/heimdall-presence roster --json | jq -c '{value: length}' \
-  | bin/heimdall-ui panel set hmd-live-users --type number --title "hmd — live users" --data-json -
+  | bin/heimdall-ui panel set hmd-live-users-manual --type number --title "hmd — live users"  # publishes hmd-live-users-manual; the bare id is server-owned --data-json -
 jq -e '.type=="number" and (.data.value|type=="number") and .data.value>=0' .heimdall/ui/panels/hmd-live-users.json
 # the shipped behavior: hmd's own poll loop does this automatically every 2s using
 # len(collect_state(root)["roster"]) in-process — never re-reading team.json, never
