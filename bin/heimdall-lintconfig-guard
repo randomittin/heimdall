@@ -307,7 +307,7 @@ gate_bash() {
       sed|perl)
         for tok in "${tokens[@]:$idx}"; do
           case "$tok" in
-            -i*|--in-place*|-[a-zA-Z]*i[a-zA-Z]*) has_inplace=1 ;;
+            -i*|--in-place*|-[a-zA-Z]*i*) has_inplace=1 ;;
           esac
         done
         [ "$has_inplace" = 1 ] || continue

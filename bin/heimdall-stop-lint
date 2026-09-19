@@ -156,21 +156,39 @@ HAVE_PERL=0; command -v perl >/dev/null 2>&1 && HAVE_PERL=1
 START_TS=$(date +%s)
 remaining() { local now; now=$(date +%s); echo $(( BUDGET - (now - START_TS) )); }
 
-# run_bounded <label> <cmd...>  → stdout+stderr of the tool; rc in RUN_RC
+# run_bounded <cmd...> → tool stdout+stderr in the file $RUN_OUT, rc in RUN_RC.
+# Output goes to a FILE, not a `$(...)` pipe, on purpose: a `$(...)` capture
+# waits for the pipe to CLOSE, and a linter that forks a child (a `sh` wrapper
+# around a real binary, a daemonised worker) leaves that child holding the
+# pipe after the alarm kills the parent — measured 60s on a 3s budget before
+# this was changed. A file has no reader to keep waiting; `wait` returns the
+# moment the direct child dies. RUN_RC is set in THIS shell, not a subshell,
+# which is the other reason this is not a `$(...)`.
 RUN_RC=0
+RUN_OUT="$(mktemp "${TMPDIR:-/tmp}/hmd-stop-lint.XXXXXX" 2>/dev/null || echo /dev/null)"
+trap 'rm -f "$RUN_OUT"' EXIT
 run_bounded() {
   local rem cap
   rem=$(remaining)
   cap=$PER_CALL
   [ "$rem" -lt "$cap" ] && cap=$rem
   [ "$cap" -lt 1 ] && cap=1
+  : > "$RUN_OUT" 2>/dev/null
   if [ "$HAVE_PERL" -eq 1 ]; then
-    perl -e 'alarm shift; exec @ARGV' "$cap" "$@" 2>&1
+    perl -e 'alarm shift; exec @ARGV' "$cap" "$@" >"$RUN_OUT" 2>&1 </dev/null
   else
-    "$@" 2>&1
+    "$@" >"$RUN_OUT" 2>&1 </dev/null
   fi
   RUN_RC=$?
 }
+# run_in_repo <cmd...> → run_bounded with cwd = $REPO (RUN_RC still set here)
+run_in_repo() {
+  local prev; prev="$PWD"
+  cd "$REPO" 2>/dev/null || { RUN_RC=1; : > "$RUN_OUT"; return; }
+  run_bounded "$@"
+  cd "$prev" 2>/dev/null || true
+}
+tool_out() { cat "$RUN_OUT" 2>/dev/null; }
 
 # node tool resolution: repo-local first, PATH second, never npx-install
 node_bin() {
@@ -239,11 +257,11 @@ for f in "${SHELL_FILES[@]:-}"; do
   [ -n "$f" ] || continue
   if ! budget_left; then SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); report "$f" "skipped (budget)"; continue; fi
   parts=(); detail=""; fcount=0
-  out="$(run_bounded bash -n "$f")"; add_tool "bash -n"
+  run_bounded bash -n "$f"; out="$(tool_out)"; add_tool "bash -n"
   if [ "$RUN_RC" -eq 0 ]; then parts+=("bash -n ok")
   else fcount=$((fcount + 1)); parts+=("bash -n FAIL"); detail="$out"; fi
   if [ -n "$SHELLCHECK" ] && budget_left; then
-    out="$(run_bounded "$SHELLCHECK" -f gcc "$f")"; add_tool shellcheck
+    run_bounded "$SHELLCHECK" -f gcc "$f"; out="$(tool_out)"; add_tool shellcheck
     if [ "$RUN_RC" -eq 0 ]; then parts+=("shellcheck ok")
     elif [ "$RUN_RC" -eq 142 ] || [ "$RUN_RC" -gt 128 ]; then parts+=("shellcheck timed out")
     else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
