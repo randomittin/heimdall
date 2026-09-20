@@ -19,11 +19,22 @@ Routes (all GET):
                       one poll)
 
 Auth, in this order, on EVERY route:
-    1. Host header must be 127.0.0.1:<port> or localhost:<port>   -> else 403
+    0. per-IP backoff: 5 auth failures (401 w/ a presented-but-wrong token, or any 403)
+       from one client IP within a rolling 60s window -> 429 + Retry-After for 30s,
+       even to a request that would otherwise pass (a successful auth resets the count)
+    1. Host header must be 127.0.0.1:<port>, localhost:<port>, or one of --allow-host's
+       names (bare, or with ANY numeric port, e.g. ":443"/":8443"/":10000" --
+       case-insensitive, no wildcard/suffix matching on the hostname)  -> else 403
        (DNS-rebinding defence: a page on evil.example resolving to 127.0.0.1 still
        sends Host: evil.example, and is refused before the token is even looked at)
     2. per-launch token (`?token=` query or X-Heimdall-UI-Token header), compared with
        hmac.compare_digest                                          -> else 401
+
+--allow-host <name> (repeatable) extends the Host allowlist for a reverse proxy (e.g.
+a Tailscale Funnel hostname); the bind stays 127.0.0.1 regardless. --trust-proxy makes
+per-IP accounting (backoff, /api/state.transport) use X-Forwarded-For's first value
+instead of the socket peer -- only meaningful behind a proxy that sets it, so it is
+opt-in and ignored entirely when the flag is absent.
 
 Never read, in any form: .heimdall/team.json, *.key/*.pem/*.seed, ~/.omniroute/*,
 .env*, settings.json env blocks, hooks-disabled contents. `_read_text` refuses a
@@ -47,6 +58,7 @@ import sys
 import threading
 import time
 import webbrowser
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -62,6 +74,10 @@ CMD_TIMEOUT_S = 8
 CHECKPOINT_HEAD_BYTES = 8192   # the auto-checkpoint header lives in the first few KB
 REELS_LIMIT = 20
 MAX_SEND_BODY_BYTES = 4096     # POST /api/send request body cap (413 above this)
+BACKOFF_MAX_FAILURES = 5       # auth failures from one IP inside the window trips a lockout
+BACKOFF_WINDOW_S = 60.0        # rolling window the failures must fall inside
+BACKOFF_LOCKOUT_S = 30.0       # lockout duration once tripped
+BACKOFF_CAP = 4096             # max tracked IPs; oldest evicted first past this
 
 # ── sources: the complete list of what this process reads ────────────────────
 # Relative to the target repo root. `--print-sources` prints exactly these (made
@@ -542,7 +558,7 @@ def publish_live_users(root, roster_count, previous, now=None):
     return (roster_count, now)
 
 
-def collect_state(root):
+def collect_state(root, transport=None):
     """The section-4 contract. Each slice degrades independently: object-typed
     slices keep their keys with null values, array slices go empty, and the two
     `| null` slices (sweep_receipt, checkpoint) go null -- never an error."""
@@ -551,7 +567,7 @@ def collect_state(root):
             return fn(root)
         except Exception:
             return empty() if callable(empty) else empty
-    return {
+    state = {
         "schema_version": SCHEMA_VERSION,
         "ts": time.time(),
         "repo": root,
@@ -569,6 +585,9 @@ def collect_state(root):
         "panels": safe(collect_panels, list),
         "inbox": safe(collect_inbox, lambda: {"pending": 0}),
     }
+    if transport is not None:
+        state["transport"] = transport
+    return state
 
 
 def canonical_json(state):
@@ -606,8 +625,9 @@ class StateCache:
     publishes (state, digest). SSE clients wait on the condition for a digest change,
     so N open tabs cost one collection per tick, not N."""
 
-    def __init__(self, root):
+    def __init__(self, root, transport=None):
         self.root = root
+        self.transport = transport
         self._cond = threading.Condition()
         self._state = None
         self._digest = None
@@ -615,7 +635,7 @@ class StateCache:
         self._live_users = None   # (value, written_at) of the self-published panel
 
     def refresh(self, publish=False):
-        state = collect_state(self.root)
+        state = collect_state(self.root, self.transport)
         if publish:
             # Poll-tick only (never on a GET): publish hmd's own live-users tile from
             # the roster count just collected, then re-read panels so THIS frame
@@ -669,12 +689,60 @@ class UIServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False   # a stale reuse could hand another process our port
 
-    def __init__(self, port, token, cache):
+    def __init__(self, port, token, cache, allow_hosts=(), trust_proxy=False):
         super().__init__(("127.0.0.1", port), UIHandler)
         self.token = token
         self.cache = cache
         self.port = self.server_address[1]
-        self.allowed_hosts = frozenset({"127.0.0.1:%d" % self.port, "localhost:%d" % self.port})
+        self.trust_proxy = bool(trust_proxy)
+        self.public_host = None
+        hosts = {"127.0.0.1:%d" % self.port, "localhost:%d" % self.port}
+        names = set()
+        for name in allow_hosts or ():
+            n = (name or "").strip().lower()
+            if not n:
+                continue
+            if self.public_host is None:
+                self.public_host = n
+            hosts.add(n)
+            names.add(n)
+        self.allowed_hosts = frozenset(hosts)
+        self.allow_host_names = frozenset(names)  # bare names; _host_ok matches these w/ ANY port
+        self._backoff_lock = threading.Lock()
+        self._backoff = OrderedDict()   # ip -> {"count", "window_start", "locked_until"}
+
+    def backoff_seconds_left(self, ip):
+        """>0 if `ip` is currently locked out; the caller need not hold any lock."""
+        now = time.time()
+        with self._backoff_lock:
+            rec = self._backoff.get(ip)
+            if rec and rec["locked_until"] > now:
+                return rec["locked_until"] - now
+        return 0.0
+
+    def backoff_record_failure(self, ip):
+        """Count one auth failure for `ip`; returns True the instant a lockout trips
+        (so the caller logs exactly once per lockout, not once per blocked request)."""
+        now = time.time()
+        tripped = False
+        with self._backoff_lock:
+            rec = self._backoff.get(ip)
+            if rec is None or now - rec["window_start"] > BACKOFF_WINDOW_S:
+                rec = {"count": 0, "window_start": now, "locked_until": 0.0}
+            rec["count"] += 1
+            if rec["count"] >= BACKOFF_MAX_FAILURES and rec["locked_until"] <= now:
+                rec["locked_until"] = now + BACKOFF_LOCKOUT_S
+                tripped = True
+            self._backoff[ip] = rec
+            self._backoff.move_to_end(ip)
+            while len(self._backoff) > BACKOFF_CAP:
+                self._backoff.popitem(last=False)
+        return tripped
+
+    def backoff_clear(self, ip):
+        """A successful auth resets `ip`'s failure count entirely."""
+        with self._backoff_lock:
+            self._backoff.pop(ip, None)
 
 
 class UIHandler(BaseHTTPRequestHandler):
@@ -697,29 +765,56 @@ class UIHandler(BaseHTTPRequestHandler):
         )
         self.send_header("Connection", "close")
 
-    def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+    def _send(self, code, body, ctype="text/plain; charset=utf-8", extra_headers=None):
         data = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
         self._common_headers(ctype, len(data))
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _send_json(self, code, obj):
-        self._send(code, json_for_wire(obj), "application/json; charset=utf-8")
+    def _send_json(self, code, obj, extra_headers=None):
+        self._send(code, json_for_wire(obj), "application/json; charset=utf-8", extra_headers)
 
     def _host_ok(self):
         host = (self.headers.get("Host") or "").strip().lower()
-        return host in self.server.allowed_hosts
+        if host in self.server.allowed_hosts:
+            return True
+        # An --allow-host name also matches with ANY numeric port (a Funnel-fronted
+        # proxy may terminate on 443, 8443, or 10000) -- exact hostname required,
+        # no suffix/wildcard matching; only the port half is a wildcard.
+        name, sep, port = host.rpartition(":")
+        return bool(sep) and port.isdigit() and name in self.server.allow_host_names
 
-    def _token_ok(self, query):
+    def _presented_token(self, query):
         presented = self.headers.get("X-Heimdall-UI-Token") or ""
         if not presented:
             vals = query.get("token") or []
             presented = vals[0] if vals else ""
+        return presented
+
+    def _token_ok(self, query):
+        presented = self._presented_token(query)
         if not presented:
             return False
         return hmac.compare_digest(presented.encode("utf-8"), self.server.token.encode("utf-8"))
+
+    def _client_ip(self):
+        if self.server.trust_proxy:
+            xff = self.headers.get("X-Forwarded-For") or ""
+            first = xff.split(",")[0].strip()
+            if first:
+                return first
+        return self.client_address[0]
+
+    def _send_backoff_429(self):
+        self._send_json(429, {"error": "backoff", "retry_after_s": int(BACKOFF_LOCKOUT_S)},
+                         extra_headers={"Retry-After": str(int(BACKOFF_LOCKOUT_S))})
+
+    def _log_lockout(self, ip):
+        sys.stderr.write("hmd-ui: backoff lockout ip=%s\n" % ip)
 
     def log_message(self, fmt, *args):
         # Never log the query string: it carries the token.
@@ -791,12 +886,25 @@ class UIHandler(BaseHTTPRequestHandler):
     def _gate_then(self, handler):
         parts = urlsplit(self.path)
         query = parse_qs(parts.query, keep_blank_values=False)
+        ip = self._client_ip()
+        if self.server.backoff_seconds_left(ip) > 0:
+            self._send_backoff_429()
+            return
         if not self._host_ok():
+            if self.server.backoff_record_failure(ip):
+                self._log_lockout(ip)
             self._send(403, "forbidden: Host header is not this server's loopback origin")
             return
-        if not self._token_ok(query):
+        presented = self._presented_token(query)
+        if not presented or not hmac.compare_digest(presented.encode("utf-8"), self.server.token.encode("utf-8")):
+            # Only a presented-but-wrong token counts toward backoff: a client that simply
+            # has not sent one yet must not trip the same lockout a brute-force guesser would.
+            if presented:
+                if self.server.backoff_record_failure(ip):
+                    self._log_lockout(ip)
             self._send(401, "unauthorized: missing or invalid token")
             return
+        self.server.backoff_clear(ip)
         handler(query)
 
     def _route(self, _query):
@@ -894,9 +1002,22 @@ def main(argv=None):
     ap.add_argument("--print-sources", action="store_true", help="list every file/command the server reads, then exit")
     ap.add_argument("--print-deny-list", action="store_true", help="list the never-read patterns, then exit")
     ap.add_argument("--print-state", action="store_true", help="collect the contract once, print it, then exit")
+    ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                     help="extend the Host allowlist with NAME (repeatable) -- a reverse proxy's "
+                          "public hostname (e.g. a Tailscale Funnel *.ts.net name); matches "
+                          "NAME bare or NAME:<any port>, exactly, case-insensitive; bind stays 127.0.0.1")
+    ap.add_argument("--trust-proxy", action="store_true",
+                     help="use X-Forwarded-For's first value for per-IP accounting (backoff, "
+                          "/api/state.transport) instead of the socket peer; only meaningful "
+                          "behind a proxy that sets it -- ignored entirely when absent")
     args = ap.parse_args(argv)
 
     root = resolve_root(args.repo)
+    transport = {
+        "bind": "loopback",
+        "public_host": (args.allow_host[0].strip().lower() if args.allow_host else None),
+        "trust_proxy": bool(args.trust_proxy),
+    }
     if args.print_sources:
         print_sources(root)
         return 0
@@ -904,19 +1025,23 @@ def main(argv=None):
         print_deny_list()
         return 0
     if args.print_state:
-        print(json.dumps(collect_state(root), indent=2, ensure_ascii=False))
+        print(json.dumps(collect_state(root, transport), indent=2, ensure_ascii=False))
         return 0
 
     token = secrets.token_urlsafe(32)
-    cache = StateCache(root)
+    cache = StateCache(root, transport)
     try:
-        server = UIServer(args.port, token, cache)
+        server = UIServer(args.port, token, cache, allow_hosts=args.allow_host, trust_proxy=args.trust_proxy)
     except OSError as e:
         sys.stderr.write("hmd ui: cannot bind 127.0.0.1:%d: %s\n" % (args.port, e))
         return 2
     cache.start()
     url = "http://127.0.0.1:%d/?token=%s" % (server.port, token)
     print(url, flush=True)
+    if server.public_host:
+        print("hmd ui: public hostname allowed: %s" % server.public_host, flush=True)
+        print("hmd ui: WARNING -- once reachable via that hostname (e.g. a Tailscale Funnel), "
+              "this server is reachable beyond this machine", flush=True)
     if not args.no_open:
         threading.Thread(target=webbrowser.open_new_tab, args=(url,), daemon=True).start()
     try:
