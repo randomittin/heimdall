@@ -39,7 +39,11 @@ fi
 # ── fake tailscale CLI ──────────────────────────────────────────────────────────────
 # One script, behaviour switched by $FAKE_TS_MODE. Never touches the real tailscaled.
 # Modes: not-installed, daemon-down, offline, online-with-DNSName, modern-funnel,
-# legacy-funnel, no-funnel, policy-hint-on-funnel-start, bad-https-port.
+# legacy-funnel, no-funnel, policy-hint-on-funnel-start, bad-https-port,
+# modern-funnel-scoped-off. FAKE_FUNNEL_STATUS_JSON, when set, overrides the canned
+# `funnel status` payload (used by the A13 foreign/only-ours/force/scoped tests).
+# FAKE_CALL_LOG, when set, appends every invocation's full argv (one line each) to
+# that file so a test can assert reset was/wasn't actually called.
 FAKE_BIN="$TMPROOT/tailscale"
 cat > "$FAKE_BIN" <<'FAKE_EOF'
 #!/usr/bin/env bash
@@ -48,6 +52,10 @@ mode="${FAKE_TS_MODE:-online-with-DNSName}"
 if [ "$mode" = "not-installed" ]; then
   echo "fake-tailscale: command not found" >&2
   exit 127
+fi
+
+if [ -n "${FAKE_CALL_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_CALL_LOG"
 fi
 
 cmd="${1:-}"; shift || true
@@ -95,6 +103,23 @@ EOF
             echo 'tailscale: unknown command "funnel"' >&2
             exit 1
             ;;
+          modern-funnel-scoped-off)
+            cat <<'EOF'
+USAGE
+  tailscale funnel <target>
+  tailscale funnel status [--json]
+  tailscale funnel reset
+
+FLAGS
+  --bg, --bg=false
+        Run the command as a background process
+  --https value
+        Expose an HTTPS server at the specified port (default mode)
+  --https=PORT off
+        Disable Funnel for the specified port only, leaving others untouched
+EOF
+            exit 0
+            ;;
           *)
             cat <<'EOF'
 USAGE
@@ -113,7 +138,11 @@ EOF
         esac
         ;;
       status)
-        echo '{"Funnel":{}}'
+        if [ -n "${FAKE_FUNNEL_STATUS_JSON:-}" ]; then
+          printf '%s' "$FAKE_FUNNEL_STATUS_JSON"
+        else
+          echo '{"Funnel":{}}'
+        fi
         exit 0
         ;;
       reset)
