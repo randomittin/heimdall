@@ -13,7 +13,13 @@ Message file: one JSON object per line, appended to
     {"id": str (uuid4), "ts": float (epoch), "text": str, "source": "companion"}
 
 Validation (append() -- nothing is ever written on a failure):
-    - text must be a string, non-empty after stripping whitespace
+    - text is first run through _strip_control_chars() (control/escape bytes
+      gone, \n and \t kept) -- the same byte class bin/heimdall-inbox-deliver's
+      own sanitize() strips, so a phone message can never carry a raw ANSI/OSC
+      escape into a terminal via `hmd ui inbox ls|peek` (_print_rows and
+      _cmd_peek sanitize again on the read side, as defense in depth for a
+      row written by an older version)
+    - text must be a string, and non-empty after stripping whitespace
     - text must be <= MAX_TEXT_CHARS characters
     - text must not be secret_shaped() (bin/heimdall-activity's own family, ported
       the same way companion_ui_panels.py ports it -- see secret_shaped() below)
@@ -29,6 +35,13 @@ Locking: one exclusive flock over a dedicated `<inbox>.jsonl.lock` file (never t
 data file itself), held for the whole read-modify-write -- the exact convention
 bin/lib/work_queue.py's _FlockCtx and bin/lib/cp_team_queue.py's _PartitionLock
 already use.
+
+Filesystem permissions: the .heimdall/ui directory is forced to 0700 and
+inbox.jsonl / inbox-delivered.jsonl / the lock file to 0600 -- on every
+directory-create and every file-open, not just the first, so a directory or
+file that predates this fix (0755/0644) self-heals the next time it's touched.
+Phone messages are private to the repo owner; no other local account should be
+able to read them.
 
 Stdlib only (json, os, re, sys, time, uuid, fcntl, argparse, subprocess) --
 Decision 1's zero-toolchain posture, matching companion_ui_panels.py. This file is
@@ -75,6 +88,24 @@ def secret_shaped(v):
     return any(rx.search(v) for rx in _SECRET_RES)
 
 
+# ── control-char / ANSI-OSC scrub (A8): the single write choke-point for a
+# phone message strips every non-printable byte before it ever reaches
+# inbox.jsonl or a terminal (`hmd ui inbox ls|peek`) -- same byte class
+# bin/heimdall-inbox-deliver's own sanitize() strips, so the two halves of
+# the pipe agree on one sanitized shape instead of disagreeing (the exact
+# A8 finding). \r\n / \r collapse to \n first (never kept as a bare CR,
+# which could otherwise hide or overwrite a terminal line); \n and \t
+# survive untouched.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _strip_control_chars(text):
+    """Neutralize ANSI/OSC and other control-byte injection (e.g. an OSC 52
+    clipboard write or a title-bar rewrite via `hmd ui inbox ls|peek`)."""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL_CHARS_RE.sub("", t)
+
+
 class InboxError(ValueError):
     """A message failed validation. `code` is the short machine-readable reason
     (empty|too-long|secret-shaped|invalid-type) the HTTP layer maps onto a status
@@ -98,19 +129,48 @@ def _lock_path(root):
     return _inbox_path(root) + ".lock"
 
 
+# ── filesystem permissions (A10): the .heimdall/ui directory and everything
+# in it are forced to 0700/0600 on every touch, not just first creation, so
+# a directory/file that predates this fix (0755/0644, from os.makedirs()'s
+# and open()'s own defaults) self-heals the next time it's touched. Phone
+# messages are private to the repo owner -- no other local account should be
+# able to read them.
+def _ensure_dir(path, mode=0o700):
+    """Create `path` (and parents) if missing, then force its mode to `mode`
+    regardless of umask or a wider pre-existing mode."""
+    os.makedirs(path, exist_ok=True)
+    os.chmod(path, mode)
+
+
+def _open_append_0600(path):
+    """Open `path` for text append, creating it at mode 0600 if missing, and
+    forcing 0600 even when it already exists (O_CREAT's mode argument is
+    only applied -- and only umask-limited -- on the create branch, so a
+    file left over from before this fix would otherwise keep its old, wider
+    mode forever)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.chmod(path, 0o600)
+    return os.fdopen(fd, "a", encoding="utf-8")
+
+
 class _FlockCtx:
     """A minimal exclusive-flock context manager on a dedicated lock file --
     mirrors bin/lib/work_queue.py's _FlockCtx and bin/lib/cp_team_queue.py's
     _PartitionLock. Held for the whole read-modify-write so append() and
-    pop_all() can never interleave."""
+    pop_all() can never interleave. The lock file itself is kept at mode
+    0600 (A10), same self-healing chmod-on-every-open as the data files --
+    it lives in the same directory and is just as readable by any local
+    user if left at a default 0644."""
 
     def __init__(self, lock_path):
         self.lock_path = lock_path
         self._fh = None
 
     def __enter__(self):
-        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
-        self._fh = open(self.lock_path, "w")
+        _ensure_dir(os.path.dirname(self.lock_path))
+        fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.chmod(self.lock_path, 0o600)
+        self._fh = os.fdopen(fd, "w")
         fcntl.flock(self._fh, fcntl.LOCK_EX)
         return self
 
@@ -170,6 +230,7 @@ def append(root, text):
     written on a validation failure, and the exception never carries `text`."""
     if not isinstance(text, str):
         raise InboxError("invalid-type", "text must be a string")
+    text = _strip_control_chars(text)
     if not text.strip():
         raise InboxError("empty", "text must be non-empty after stripping whitespace")
     if len(text) > MAX_TEXT_CHARS:
@@ -181,9 +242,9 @@ def append(root, text):
     record = {"id": str(uuid.uuid4()), "ts": time.time(), "text": text, "source": "companion"}
     line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
     path = _inbox_path(root)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _ensure_dir(os.path.dirname(path))
     with _FlockCtx(_lock_path(root)):
-        with open(path, "a", encoding="utf-8") as f:
+        with _open_append_0600(path) as f:
             f.write(line)
             f.flush()
             os.fsync(f.fileno())
@@ -201,16 +262,19 @@ def pop_all(root):
         records, raw_lines = _read_all(path)
         if not raw_lines:
             return []
-        os.makedirs(os.path.dirname(delivered_path), exist_ok=True)
-        with open(delivered_path, "a", encoding="utf-8") as df:
+        _ensure_dir(os.path.dirname(delivered_path))
+        with _open_append_0600(delivered_path) as df:
             df.writelines(raw_lines)
             df.flush()
             os.fsync(df.fileno())
         # Truncate in place, still inside the lock so nothing can land between
         # the read above and this truncate. open(..., "w") already truncates on
-        # open; the explicit truncate(0) just says so out loud.
+        # open; the explicit truncate(0) just says so out loud. chmod after, in
+        # case inbox.jsonl predates this fix and still carries a wider mode
+        # (A10) -- truncating alone never changes a file's permission bits.
         with open(path, "w", encoding="utf-8") as f:
             f.truncate(0)
+        os.chmod(path, 0o600)
     return records
 
 
@@ -243,7 +307,8 @@ def _print_rows(rows, as_json):
         return
     for r in rows:
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r.get("ts", 0)))
-        print("%s  %s  %s" % (r.get("id", "?"), ts, r.get("text", "")))
+        text = _strip_control_chars(str(r.get("text", "")))
+        print("%s  %s  %s" % (r.get("id", "?"), ts, text))
 
 
 def _cmd_ls(args):
@@ -265,7 +330,7 @@ def _cmd_peek(args):
         print("no pending messages")
         return 0
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r.get("ts", 0)))
-    print("%s  %s  %s" % (r.get("id", "?"), ts, r.get("text", "")))
+    print("%s  %s  %s" % (r.get("id", "?"), ts, _strip_control_chars(str(r.get("text", "")))))
     return 0
 
 

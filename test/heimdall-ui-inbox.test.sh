@@ -143,6 +143,27 @@ else
   bad "2b. id mismatch: response=$SENT_ID file=$(jq -r '.id' "$INBOX_FILE" 2>/dev/null)"
 fi
 
+# ═══ 2c/2d/2e. filesystem perms after the first append: dir 700, file 600,
+# lock 600 (A10) -- portable stat idiom per test/heimdall-team.test.sh:115 ═══
+DIR_PERM="$(stat -f '%Lp' "$FIX/.heimdall/ui" 2>/dev/null || stat -c '%a' "$FIX/.heimdall/ui" 2>/dev/null || echo '?')"
+if [ "$DIR_PERM" = "700" ]; then
+  ok "2c. .heimdall/ui directory is mode 700 after the first append"
+else
+  bad "2c. .heimdall/ui directory mode is $DIR_PERM, expected 700"
+fi
+INBOX_PERM="$(stat -f '%Lp' "$INBOX_FILE" 2>/dev/null || stat -c '%a' "$INBOX_FILE" 2>/dev/null || echo '?')"
+if [ "$INBOX_PERM" = "600" ]; then
+  ok "2d. inbox.jsonl is mode 600 after the first append"
+else
+  bad "2d. inbox.jsonl mode is $INBOX_PERM, expected 600"
+fi
+LOCK_PERM="$(stat -f '%Lp' "$FIX/.heimdall/ui/inbox.jsonl.lock" 2>/dev/null || stat -c '%a' "$FIX/.heimdall/ui/inbox.jsonl.lock" 2>/dev/null || echo '?')"
+if [ "$LOCK_PERM" = "600" ]; then
+  ok "2e. inbox.jsonl.lock is mode 600 after the first append"
+else
+  bad "2e. inbox.jsonl.lock mode is $LOCK_PERM, expected 600"
+fi
+
 # ═══ 3/4. auth: same gate as every other route ═════════════════════════════
 rc_notoken="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" \
              -d '{"text":"x"}' "$BASE/api/send")"
@@ -329,11 +350,55 @@ else
   bad "15. inbox.pending did not return to 0: $(jq -c '.inbox' "$STATE2" 2>/dev/null)"
 fi
 
-# ═══ 16. server survived every malformed/oversize/secret payload ══════════
-if kill -0 "$SRV_PID" 2>/dev/null; then
-  ok "16. server still alive after every case"
+# ═══ 16. control chars / OSC-52 escape + CR are stripped before write or
+# print -- ANSI/OSC terminal injection via `hmd ui inbox ls|peek` (A8) ══════
+OSC_RAW="$(printf '\x1b]52;c;dGVzdA==\x07before\rafter')"
+OSCBODY="$(jq -cn --arg t "$OSC_RAW" '{text:$t}')"
+OSCOUT="$TMPROOT/osc.json"
+rc_osc="$(curl -s -o "$OSCOUT" -w '%{http_code}' -X POST -H "Content-Type: application/json" \
+         -d "$OSCBODY" "$BASE/api/send?$AUTH")"
+if [ "$rc_osc" = "202" ]; then
+  ok "16. POST /api/send with an embedded ESC/OSC-52 sequence + \\r -> 202 (sanitized, not rejected)"
 else
-  bad "16. server died during the run; tail of its output:"; tail -5 "$SRV_OUT" | sed 's/^/       | /'
+  bad "16. OSC/\\r text -> $rc_osc, expected 202 (body: $(cat "$OSCOUT" 2>/dev/null))"
+fi
+if [ "$(grep -c $'\x1b' "$INBOX_FILE" 2>/dev/null)" = "0" ]; then
+  ok "16b. inbox.jsonl carries no raw ESC (\\x1b) byte"
+else
+  bad "16b. inbox.jsonl still contains a raw ESC byte"
+fi
+if [ "$(grep -c $'\r' "$INBOX_FILE" 2>/dev/null)" = "0" ]; then
+  ok "16c. inbox.jsonl carries no raw CR (\\r) byte"
+else
+  bad "16c. inbox.jsonl still contains a raw CR byte"
+fi
+PEEK_RAW="$TMPROOT/peek-osc.out"
+inbox_cli peek >"$PEEK_RAW" 2>&1
+if [ "$(grep -c $'\x1b' "$PEEK_RAW" 2>/dev/null)" = "0" ]; then
+  ok "16d. hmd ui inbox peek (plain) output has no raw ESC byte"
+else
+  bad "16d. peek output leaked a raw ESC byte"
+fi
+LS_RAW="$TMPROOT/ls-osc.out"
+inbox_cli ls >"$LS_RAW" 2>&1
+if [ "$(grep -c $'\x1b' "$LS_RAW" 2>/dev/null)" = "0" ]; then
+  ok "16e. hmd ui inbox ls (plain) output has no raw ESC byte"
+else
+  bad "16e. ls output leaked a raw ESC byte"
+fi
+if [ "$(grep -c $'\r' "$LS_RAW" 2>/dev/null)" = "0" ]; then
+  ok "16f. hmd ui inbox ls (plain) output has no raw CR byte"
+else
+  bad "16f. ls output leaked a raw CR byte"
+fi
+inbox_cli pop --json >/dev/null 2>&1   # drain -- leave the inbox clean for section 17
+
+# ═══ 17. server survived every malformed/oversize/secret/control-char
+# payload ═══════════════════════════════════════════════════════════════════
+if kill -0 "$SRV_PID" 2>/dev/null; then
+  ok "17. server still alive after every case"
+else
+  bad "17. server died during the run; tail of its output:"; tail -5 "$SRV_OUT" | sed 's/^/       | /'
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
