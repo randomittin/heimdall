@@ -13,28 +13,36 @@ Routes (all GET):
     /api/state        the section-4 JSON contract, built fresh from the sources
                       (+ Wave 4's additive `panels` array: .heimdall/ui/panels/<id>.json
                       through bin/lib/companion_ui_panels.read_panels -- validated,
-                      secret-scrubbed, capped, `stale`-flagged, TTL-reaped)
+                      secret-scrubbed, capped, `stale`-flagged, TTL-reaped). When
+                      transport.public_host is set (--allow-host), `repo`/`edits.paths`
+                      go to basenames and `roster`/`ledger.team` strings are scrubbed of
+                      email-shaped substrings and absolute paths (loopback is unaffected)
     /api/events       text/event-stream; a `data:` frame only when the digest changes
                       (the digest covers `panels`, so a `hmd ui panel set` lands within
                       one poll)
 
 Auth, in this order, on EVERY route:
-    0. per-IP backoff: 5 auth failures (401 w/ a presented-but-wrong token, or any 403)
-       from one client IP within a rolling 60s window -> 429 + Retry-After for 30s,
-       even to a request that would otherwise pass (a successful auth resets the count)
-    1. Host header must be 127.0.0.1:<port>, localhost:<port>, or one of --allow-host's
+    0. Host header must be 127.0.0.1:<port>, localhost:<port>, or one of --allow-host's
        names (bare, or with ANY numeric port, e.g. ":443"/":8443"/":10000" --
        case-insensitive, no wildcard/suffix matching on the hostname)  -> else 403
        (DNS-rebinding defence: a page on evil.example resolving to 127.0.0.1 still
        sends Host: evil.example, and is refused before the token is even looked at)
-    2. per-launch token (`?token=` query or X-Heimdall-UI-Token header), compared with
+    1. per-launch token (`?token=` query or X-Heimdall-UI-Token header), compared with
        hmac.compare_digest                                          -> else 401
+    2. per-IP backoff, but ONLY on the failure path above: 5 auth failures (401 w/ a
+       presented-but-wrong token, or any 403) from one client IP within a rolling 60s
+       window -> 429 + Retry-After for 30s. A request presenting the CORRECT token on
+       an allowed Host is NEVER denied by backoff -- lockout exists to slow a guesser,
+       not to lock out the legitimate phone behind a shared carrier NAT, a spoofed
+       X-Forwarded-For, or (--trust-proxy off, behind a real proxy) the single peer
+       address every request shares. A successful auth resets the count.
 
 --allow-host <name> (repeatable) extends the Host allowlist for a reverse proxy (e.g.
 a Tailscale Funnel hostname); the bind stays 127.0.0.1 regardless. --trust-proxy makes
-per-IP accounting (backoff, /api/state.transport) use X-Forwarded-For's first value
-instead of the socket peer -- only meaningful behind a proxy that sets it, so it is
-opt-in and ignored entirely when the flag is absent.
+per-IP accounting (backoff, /api/state.transport) use X-Forwarded-For's LAST value --
+the one appended by the single trusted hop itself, never a client-supplied earlier
+hop -- instead of the socket peer; only meaningful behind a proxy that sets it, so it
+is opt-in and ignored entirely when the flag is absent.
 
 Never read, in any form: .heimdall/team.json, *.key/*.pem/*.seed, ~/.omniroute/*,
 .env*, settings.json env blocks, hooks-disabled contents. `_read_text` refuses a
@@ -77,7 +85,13 @@ MAX_SEND_BODY_BYTES = 4096     # POST /api/send request body cap (413 above this
 BACKOFF_MAX_FAILURES = 5       # auth failures from one IP inside the window trips a lockout
 BACKOFF_WINDOW_S = 60.0        # rolling window the failures must fall inside
 BACKOFF_LOCKOUT_S = 30.0       # lockout duration once tripped
-BACKOFF_CAP = 4096             # max tracked IPs; oldest evicted first past this
+BACKOFF_CAP = 4096             # max tracked IPs; a live lockout is never evicted to make room (A7)
+HEADER_READ_TIMEOUT_S = 10.0   # A2: UIHandler.timeout -- bounds the pre-auth header read
+                                # (slow-loris defence); cleared once a request is confirmed
+                                # to be a long-lived /api/events stream
+MAX_CONNECTIONS = 64           # A2: hard cap on concurrent connections/threads, server-wide
+MAX_SSE_STREAMS = 8            # A2: lower cap on live /api/events streams specifically
+SSE_RETRY_AFTER_S = 5          # A2: Retry-After seconds on the 503 an over-cap SSE request gets
 
 # ── sources: the complete list of what this process reads ────────────────────
 # Relative to the target repo root. `--print-sources` prints exactly these (made
@@ -558,6 +572,51 @@ def publish_live_users(root, roster_count, previous, now=None):
     return (roster_count, now)
 
 
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _scrub_public_string(value):
+    """A9: a public-mode string must carry no email-shaped substring and no
+    absolute path -- either would hand the operator's identity or a `$HOME`-adjacent
+    username to anyone Tailscale Funnel's --allow-host exposes this server to.
+    Non-strings (bool/int/float/None) pass through untouched."""
+    if not isinstance(value, str):
+        return value
+    if _EMAIL_RE.search(value):
+        value = _EMAIL_RE.sub("[redacted]", value)
+    if os.path.isabs(value):
+        value = os.path.basename(value) or value
+    return value
+
+
+def _redact_state_for_public(state):
+    """A9: called only when transport.public_host is set. Three fields go from
+    "everything" to "enough to render the UI": `repo` to its basename (no home-dir
+    username), `edits.paths`' out-of-repo entries (already absolute -- in-repo
+    entries are already relative and untouched) to their basename, and every string
+    value inside each `roster` / `ledger.team` row scrubbed of email-shaped
+    substrings and absolute paths. Loopback (no --allow-host) never calls this, so
+    its output stays byte-for-byte what it was before A9."""
+    repo = state.get("repo")
+    if isinstance(repo, str) and repo:
+        state["repo"] = os.path.basename(os.path.normpath(repo)) or repo
+
+    edits = state.get("edits")
+    if isinstance(edits, dict) and isinstance(edits.get("paths"), list):
+        edits["paths"] = [os.path.basename(p) if isinstance(p, str) and os.path.isabs(p) else p
+                           for p in edits["paths"]]
+
+    roster = state.get("roster")
+    if isinstance(roster, list):
+        state["roster"] = [{k: _scrub_public_string(v) for k, v in row.items()} if isinstance(row, dict) else row
+                            for row in roster]
+
+    ledger = state.get("ledger")
+    if isinstance(ledger, dict) and isinstance(ledger.get("team"), list):
+        ledger["team"] = [{k: _scrub_public_string(v) for k, v in row.items()} if isinstance(row, dict) else row
+                           for row in ledger["team"]]
+
+
 def collect_state(root, transport=None):
     """The section-4 contract. Each slice degrades independently: object-typed
     slices keep their keys with null values, array slices go empty, and the two
@@ -587,6 +646,8 @@ def collect_state(root, transport=None):
     }
     if transport is not None:
         state["transport"] = transport
+        if transport.get("public_host"):
+            _redact_state_for_public(state)
     return state
 
 
@@ -710,6 +771,37 @@ class UIServer(ThreadingHTTPServer):
         self.allow_host_names = frozenset(names)  # bare names; _host_ok matches these w/ ANY port
         self._backoff_lock = threading.Lock()
         self._backoff = OrderedDict()   # ip -> {"count", "window_start", "locked_until"}
+        # A2: hard caps so a burst of idle/slow connections (pre-auth slow-loris) or a
+        # pile of open streams can never grow thread/resource use without bound.
+        # BoundedSemaphore so a mismatched extra release() raises loudly instead of
+        # silently letting the effective cap drift upward over the server's lifetime.
+        self.conn_semaphore = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.sse_semaphore = threading.BoundedSemaphore(MAX_SSE_STREAMS)
+
+    def process_request(self, request, client_address):
+        """A2: a connection past MAX_CONNECTIONS concurrent is closed immediately --
+        no thread spawned, nothing read or written. True pre-auth: routing/auth only
+        starts once a handler thread exists, which this refuses to create. `_threads`
+        bookkeeping (block_on_close / server_close()'s .join()) is left entirely to
+        the real ThreadingMixIn.process_request, only reached once a slot is held."""
+        if not self.conn_semaphore.acquire(blocking=False):
+            self._reject_over_capacity(request)
+            return
+        super().process_request(request, client_address)
+
+    def _reject_over_capacity(self, request):
+        # Mirrors _serve_events' except-and-return idiom: a socket this far past its
+        # useful life raising on close is expected, not exceptional.
+        try:
+            request.close()
+        except OSError:
+            return
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.conn_semaphore.release()
 
     def backoff_seconds_left(self, ip):
         """>0 if `ip` is currently locked out; the caller need not hold any lock."""
@@ -722,22 +814,43 @@ class UIServer(ThreadingHTTPServer):
 
     def backoff_record_failure(self, ip):
         """Count one auth failure for `ip`; returns True the instant a lockout trips
-        (so the caller logs exactly once per lockout, not once per blocked request)."""
+        (so the caller logs exactly once per lockout, not once per blocked request).
+        At capacity, room for a brand-new ip is made by evicting the oldest tracked
+        record that is NOT currently a live lockout; if every tracked record is
+        presently locked, this ip's failure goes untracked rather than bumping a real
+        lockout off early (A7) -- plain `popitem(last=False)` evicted whichever record
+        was oldest even if its lock was still counting down, so a burst of fresh
+        distinct ips (trivial under a spoofed X-Forwarded-For) could free an
+        attacker's own lockout well before BACKOFF_LOCKOUT_S actually elapsed."""
         now = time.time()
         tripped = False
         with self._backoff_lock:
             rec = self._backoff.get(ip)
+            is_new = rec is None
             if rec is None or now - rec["window_start"] > BACKOFF_WINDOW_S:
                 rec = {"count": 0, "window_start": now, "locked_until": 0.0}
+            if is_new and len(self._backoff) >= BACKOFF_CAP:
+                if not self._evict_oldest_unlocked(now):
+                    return False   # every tracked record is a live lockout -- refuse, don't evict one
             rec["count"] += 1
             if rec["count"] >= BACKOFF_MAX_FAILURES and rec["locked_until"] <= now:
                 rec["locked_until"] = now + BACKOFF_LOCKOUT_S
                 tripped = True
             self._backoff[ip] = rec
             self._backoff.move_to_end(ip)
-            while len(self._backoff) > BACKOFF_CAP:
-                self._backoff.popitem(last=False)
         return tripped
+
+    def _evict_oldest_unlocked(self, now):
+        """Caller already holds `_backoff_lock`. Evicts the least-recently-touched
+        record whose lockout isn't currently live; returns whether it found one to
+        evict. Plain `OrderedDict` iteration order is insertion/move-to-end order, so
+        this is the same oldest-first policy as before, just skipping over any
+        record that is still a live lockout."""
+        for k, v in self._backoff.items():
+            if v["locked_until"] <= now:
+                del self._backoff[k]
+                return True
+        return False
 
     def backoff_clear(self, ip):
         """A successful auth resets `ip`'s failure count entirely."""
@@ -748,6 +861,13 @@ class UIServer(ThreadingHTTPServer):
 class UIHandler(BaseHTTPRequestHandler):
     server_version = "hmd-ui"
     sys_version = ""
+    # A2: socketserver.StreamRequestHandler.setup() applies this to the connection
+    # before the first read -- an idle pre-auth socket (classic slow-loris: connect,
+    # send nothing) now gets its header read timed out and closed by the stdlib's own
+    # TimeoutError handling in handle_one_request, instead of parking a thread on
+    # that socket forever. _serve_events clears it back to None once a stream
+    # actually starts, so a long-lived SSE tab is never at risk of being cut by this.
+    timeout = HEADER_READ_TIMEOUT_S
 
     # -- helpers --------------------------------------------------------------
     def _common_headers(self, ctype, length=None):
@@ -804,9 +924,14 @@ class UIHandler(BaseHTTPRequestHandler):
     def _client_ip(self):
         if self.server.trust_proxy:
             xff = self.headers.get("X-Forwarded-For") or ""
-            first = xff.split(",")[0].strip()
-            if first:
-                return first
+            # A1: key on the LAST value -- the one the single trusted hop in front of
+            # this server appended itself. Everything before it came from the client
+            # (or an attacker) and must never be trusted. Keying on the FIRST value let
+            # an attacker pick their own backoff identity at will, just by varying it
+            # request to request, without ever affecting the real lockout.
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                return parts[-1]
         return self.client_address[0]
 
     def _send_backoff_429(self):
@@ -817,9 +942,12 @@ class UIHandler(BaseHTTPRequestHandler):
         sys.stderr.write("hmd-ui: backoff lockout ip=%s\n" % ip)
 
     def log_message(self, fmt, *args):
-        # Never log the query string: it carries the token.
-        path = urlsplit(self.path).path
-        sys.stderr.write("hmd-ui %s %s %s\n" % (self.command, path, args[1] if len(args) > 1 else ""))
+        # Never log the query string: it carries the token. `path`/`command` may not
+        # exist yet if this fires before a request line was ever parsed -- e.g. the
+        # A2 header-read timeout closing an idle connection that sent nothing at all.
+        path = urlsplit(getattr(self, "path", "") or "").path
+        sys.stderr.write("hmd-ui %s %s %s\n" % (getattr(self, "command", None), path,
+                                                 args[1] if len(args) > 1 else ""))
 
     # -- routing --------------------------------------------------------------
     def do_HEAD(self):
@@ -887,25 +1015,31 @@ class UIHandler(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         query = parse_qs(parts.query, keep_blank_values=False)
         ip = self._client_ip()
+        host_ok = self._host_ok()
+        if host_ok and self._token_ok(query):
+            # A7: a request presenting the CORRECT token on an allowed Host is NEVER
+            # denied by backoff. Lockout exists to slow a guesser; it must not also
+            # lock out the legitimate phone behind a shared carrier NAT, an
+            # attacker-chosen X-Forwarded-For, or -- with --trust-proxy off behind a
+            # real proxy -- the single peer address (127.0.0.1) every request shares.
+            self.server.backoff_clear(ip)
+            handler(query)
+            return
         if self.server.backoff_seconds_left(ip) > 0:
             self._send_backoff_429()
             return
-        if not self._host_ok():
+        if not host_ok:
             if self.server.backoff_record_failure(ip):
                 self._log_lockout(ip)
             self._send(403, "forbidden: Host header is not this server's loopback origin")
             return
         presented = self._presented_token(query)
-        if not presented or not hmac.compare_digest(presented.encode("utf-8"), self.server.token.encode("utf-8")):
-            # Only a presented-but-wrong token counts toward backoff: a client that simply
-            # has not sent one yet must not trip the same lockout a brute-force guesser would.
-            if presented:
-                if self.server.backoff_record_failure(ip):
-                    self._log_lockout(ip)
-            self._send(401, "unauthorized: missing or invalid token")
-            return
-        self.server.backoff_clear(ip)
-        handler(query)
+        # Only a presented-but-wrong token counts toward backoff: a client that simply
+        # has not sent one yet must not trip the same lockout a brute-force guesser would.
+        if presented:
+            if self.server.backoff_record_failure(ip):
+                self._log_lockout(ip)
+        self._send(401, "unauthorized: missing or invalid token")
 
     def _route(self, _query):
         path = urlsplit(self.path).path
@@ -929,16 +1063,29 @@ class UIHandler(BaseHTTPRequestHandler):
         self._send(200, html, "text/html; charset=utf-8")
 
     def _serve_events(self):
-        self.send_response(200)
-        self._common_headers("text/event-stream; charset=utf-8")
-        self.end_headers()
-        if self.command == "HEAD":
+        if not self.server.sse_semaphore.acquire(blocking=False):
+            # A2: a separate, lower cap than MAX_CONNECTIONS -- an authenticated
+            # client can still open only so many concurrent held-open streams before
+            # they, specifically, get pushed back; the caller can retry shortly.
+            self._send_json(503, {"error": "too-many-streams", "retry_after_s": SSE_RETRY_AFTER_S},
+                             extra_headers={"Retry-After": str(SSE_RETRY_AFTER_S)})
             return
-        cache = self.server.cache
-        state, digest = cache.latest()
-        seen = None
-        last_write = time.monotonic()
         try:
+            self.send_response(200)
+            self._common_headers("text/event-stream; charset=utf-8")
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            # A2: UIHandler.timeout governs the pre-auth header read; a stream that
+            # made it this far is authenticated and expected to sit open a long time,
+            # writing only every POLL_INTERVAL_S/KEEPALIVE_S -- clear it so that
+            # normal long idle gaps are never mistaken for the slow-loris case it was
+            # added for.
+            self.connection.settimeout(None)
+            cache = self.server.cache
+            state, digest = cache.latest()
+            seen = None
+            last_write = time.monotonic()
             while True:
                 if digest != seen:
                     frame = "id: %s\ndata: %s\n\n" % (digest, json_for_wire(state))
@@ -953,6 +1100,8 @@ class UIHandler(BaseHTTPRequestHandler):
                     last_write = time.monotonic()
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
+        finally:
+            self.server.sse_semaphore.release()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1007,9 +1156,10 @@ def main(argv=None):
                           "public hostname (e.g. a Tailscale Funnel *.ts.net name); matches "
                           "NAME bare or NAME:<any port>, exactly, case-insensitive; bind stays 127.0.0.1")
     ap.add_argument("--trust-proxy", action="store_true",
-                     help="use X-Forwarded-For's first value for per-IP accounting (backoff, "
-                          "/api/state.transport) instead of the socket peer; only meaningful "
-                          "behind a proxy that sets it -- ignored entirely when absent")
+                     help="use X-Forwarded-For's last value (the one the trusted hop itself "
+                          "appended) for per-IP accounting (backoff, /api/state.transport) "
+                          "instead of the socket peer; only meaningful behind a proxy that "
+                          "sets it -- ignored entirely when absent")
     args = ap.parse_args(argv)
 
     root = resolve_root(args.repo)
