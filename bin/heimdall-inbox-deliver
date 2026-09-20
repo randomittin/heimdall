@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+# bin/heimdall-inbox-deliver — deliver queued hmdapp companion messages INTO
+# a running Claude Code session.
+#
+# WHY THIS EXISTS. hmdapp (the phone companion) queues a message for hmd by
+# appending to <repo>/.heimdall/ui/inbox.jsonl. Nothing about that append
+# reaches the Claude Code session on its own -- something has to notice the
+# queue and inject the text at a point Claude Code will actually read it.
+# This is that something, with three independent injection points:
+#
+#   stop    Claude Code's Stop hook. If a message is already queued, pops it
+#           and returns {"decision":"block","reason":"<text>"} -- the
+#           documented Stop-hook contract for feeding text back to the model
+#           as its next instruction. If the queue is empty but the turn just
+#           ended on a question to the user, long-polls the queue (every 2s,
+#           up to $HMD_INBOX_WAIT_S) so a same-session phone reply still
+#           reaches this turn instead of being stranded until the next Stop.
+#   tmux    Best-effort delivery into a tmux pane running Claude Code
+#           interactively, via `tmux send-keys`, for setups that don't use
+#           the Stop-hook path at all.
+#   prompt  UserPromptSubmit-hook fallback: folds any pending messages into
+#           that turn's additionalContext instead of waiting for a Stop.
+#
+# CONTRACT SOURCES VERIFIED LOCALLY (no WebFetch available to this tool; see
+# --help's note). `stop_hook_active` / `transcript_path` / a message field on
+# Stop-family hooks: bin/heimdall-claim-check's header (this repo's own prior
+# research against the official hooks reference) plus the real fixtures in
+# test/heimdall-metric-hook.test.sh. `hookSpecificOutput.additionalContext`
+# for UserPromptSubmit: hooks/hooks.json's live, already-wired
+# caveman-level-context hook (bin/heimdall-caveman), not just documentation.
+# The Stop `{"decision":"block","reason":...}` shape is the long-standing
+# public Claude Code hooks contract for making Claude continue on the given
+# text instead of stopping.
+#
+# THE INBOX FILE PROTOCOL. One JSON object per line, in
+# <repo>/.heimdall/ui/inbox.jsonl: {"id","ts","text","source"}. A sibling
+# tool, bin/lib/companion_ui_inbox.py, owns writing that file for real and
+# exposes append(root,text) / list_pending(root) / pop_all(root) /
+# peek(root). This script imports it when present; when it is not (so this
+# script's own tests run standalone, and so a fresh checkout missing that
+# file still works), it falls back to an inline implementation of the same
+# protocol: read lines, and pop atomically via `rename` (under an exclusive
+# `fcntl.flock` on inbox.jsonl.lock) followed by appending the renamed
+# content onto inbox-delivered.jsonl -- the archive of what was delivered.
+#
+# EVERY MODE EXITS 0. A delivery-mechanism bug must never block or crash a
+# Stop/UserPromptSubmit turn. Message text is sanitized (control characters
+# stripped, capped at 2000 chars) and is never written anywhere except the
+# one intended channel per mode (stdout JSON, or the tmux pane) -- never to
+# stderr, never logged.
+#
+# No `hmd inbox deliver` subcommand exists. bin/hmd is a plain "exec"
+# forwarder into bin/heimdall (no subcommand dispatch of its own -- see its
+# own header); the dispatch table lives in bin/heimdall, out of this tool's
+# scope. Invoke this script directly, or via a hooks.json/settings.json
+# `command` entry (see --help).
+set -uo pipefail
+
+MODE="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$MODE" in
+  ""|-h|--help|help)
+    cat <<'HELP'
+Usage: heimdall-inbox-deliver <mode> [--repo DIR]
+
+Delivers messages queued by the hmd companion app
+(<repo>/.heimdall/ui/inbox.jsonl) into a running Claude Code session.
+
+Modes:
+  stop     Claude Code Stop-hook contract (hook JSON on stdin). If a message
+           is queued, pops it and prints {"decision":"block","reason":"..."}
+           so Claude Code continues with it as the next instruction. If the
+           queue is empty and the assistant's last message ends with "?",
+           long-polls the queue every 2s for up to HMD_INBOX_WAIT_S seconds
+           (default 240) and delivers the same way the moment a reply
+           arrives. If stop_hook_active is true, exits silently (loop
+           guard) without touching the queue. Otherwise: no output.
+
+  tmux     Sends each pending message into a tmux pane with
+           `tmux send-keys -t <target> -l "<text>"` followed by an Enter
+           keystroke, then pops the queue. Target: $HMD_TMUX_TARGET, else
+           the contents of .heimdall/ui/tmux-target if present. No-op
+           (exit 0, nothing popped) if no target is configured or `tmux`
+           is not on PATH.
+
+  prompt   UserPromptSubmit-hook fallback (hook JSON on stdin). Pops any
+           pending messages and prints them as
+           hookSpecificOutput.additionalContext. No output if the queue is
+           empty.
+
+  status   Prints {"pending": N, "waiting": bool} and exits. Never pops.
+           --json is accepted (output is always JSON either way).
+
+Env:
+  HMD_INBOX_WAIT_S   seconds to long-poll in `stop` mode. Default 240.
+  HMD_TMUX_TARGET    tmux target (session:window.pane) for `tmux` mode.
+
+IMPORTANT: a Stop hook wired to `stop` mode can run for up to
+HMD_INBOX_WAIT_S seconds waiting on a reply. The hook's own `timeout` in
+settings.json MUST be larger than that, or Claude Code kills this script
+before a late reply can be delivered. Ready-to-paste snippet for
+.claude/settings.json (HMD_INBOX_WAIT_S=240 -> timeout 300, a 60s margin):
+
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command",
+          "command": "bin/heimdall-inbox-deliver stop", "timeout": 300 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command",
+          "command": "bin/heimdall-inbox-deliver prompt", "timeout": 10 } ] }
+    ]
+  }
+}
+
+No `hmd inbox deliver` subcommand exists yet: bin/hmd only execs into
+bin/heimdall and does no subcommand dispatch of its own, and bin/heimdall's
+dispatch table is out of this tool's scope. Invoke this script by path
+(above) until that wiring lands.
+HELP
+    exit 0
+    ;;
+esac
+
+REPO_EXPLICIT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)
+      REPO_EXPLICIT="${2:-}"
+      if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+DEFAULT_REPO="${CLAUDE_PROJECT_DIR:-}"
+if [ -z "$DEFAULT_REPO" ]; then
+  DEFAULT_REPO="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+fi
+[ -n "$DEFAULT_REPO" ] || DEFAULT_REPO="$(pwd)"
+
+command -v python3 >/dev/null 2>&1 || exit 0
+
+# Only stop/prompt carry a hook JSON payload on stdin. tmux/status never read
+# stdin at all, so a manual/interactive invocation of those two modes can
+# never block waiting on a terminal.
+INPUT=""
+case "$MODE" in
+  stop|prompt) INPUT="$(cat 2>/dev/null || true)" ;;
+esac
+
+PY_SRC=$(cat <<'PYEOF'
+import fcntl, json, os, re, shutil, subprocess, sys, time
+
+MODE, REPO_EXPLICIT, DEFAULT_REPO = sys.argv[1], sys.argv[2], sys.argv[3]
+
+MAX_MSG_CHARS = 2000
+POLL_INTERVAL_S = 2.0
+TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024  # only the last message matters
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def truncate(s, cap):
+    if len(s) <= cap:
+        return s
+    return s[:max(0, cap - 1)] + "…"
+
+
+def sanitize(text):
+    t = str(text or "")
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = _CONTROL_CHARS_RE.sub("", t)
+    return truncate(t, MAX_MSG_CHARS)
+
+
+def tmux_safe(text):
+    # tmux send-keys -l sends bytes literally, including an embedded newline
+    # as a real Enter keystroke mid-message -- flatten to one line for tmux
+    # specifically. stop/prompt carry text inside a JSON string, where "\n"
+    # round-trips safely, so this flattening is NOT applied there.
+    return text.replace("\n", " ").replace("\r", " ")
+
+
+def _silently(fn):
+    # Runs fn() for its side effect and swallows any exception -- used only
+    # for best-effort cleanup (unlink a temp file, release a lock, close a
+    # handle, send a tmux keystroke) where the outcome cannot change what we
+    # do next and every code path in this tool must still exit 0.
+    try:
+        fn()
+    except Exception:
+        return False
+    return True
+
+
+def read_stdin_json(raw):
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def resolve_repo(hook):
+    if REPO_EXPLICIT:
+        return REPO_EXPLICIT
+    if MODE in ("stop", "prompt"):
+        cwd = hook.get("cwd")
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd.strip()
+    return DEFAULT_REPO
+
+
+def paths_for(root):
+    d = os.path.join(root, ".heimdall", "ui")
+    return {
+        "dir": d,
+        "inbox": os.path.join(d, "inbox.jsonl"),
+        "delivered": os.path.join(d, "inbox-delivered.jsonl"),
+        "lock": os.path.join(d, "inbox.jsonl.lock"),
+        "state": os.path.join(d, "inbox-state.json"),
+    }
+
+
+class _Flock(object):
+    """Exclusive fcntl flock, held for one read/mutate critical section."""
+
+    def __init__(self, lock_path):
+        self.lock_path = lock_path
+        self.fh = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        self.fh = open(self.lock_path, "a+")
+        fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        fh, self.fh = self.fh, None
+        if fh is None:
+            return False
+        _silently(lambda: fcntl.flock(fh.fileno(), fcntl.LOCK_UN))
+        _silently(fh.close)
+        return False
+
+
+def _parse_lines(raw):
+    items = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            items.append(obj)
+    return items
+
+
+# --- inline fallback: same file protocol as bin/lib/companion_ui_inbox.py ---
+
+def inline_append(root, text, source="companion"):
+    p = paths_for(root)
+    os.makedirs(p["dir"], exist_ok=True)
+    with _Flock(p["lock"]):
+        obj = {"id": "%x" % (int(time.time() * 1e6) ^ os.getpid()),
+               "ts": time.time(), "text": sanitize(text),
+               "source": str(source or "companion")}
+        with open(p["inbox"], "a") as f:
+            f.write(json.dumps(obj) + "\n")
+
+
+def inline_list_pending(root):
+    p = paths_for(root)
+    os.makedirs(p["dir"], exist_ok=True)
+    with _Flock(p["lock"]):
+        try:
+            with open(p["inbox"], "r") as f:
+                raw = f.read()
+        except OSError:
+            raw = ""
+    return _parse_lines(raw)
+
+
+def inline_peek(root):
+    items = inline_list_pending(root)
+    return items[0] if items else None
+
+
+def inline_pop_all(root):
+    p = paths_for(root)
+    os.makedirs(p["dir"], exist_ok=True)
+    with _Flock(p["lock"]):
+        tmp = "%s.popped.%d.%d" % (p["inbox"], os.getpid(), int(time.time() * 1000))
+        try:
+            os.rename(p["inbox"], tmp)
+        except OSError:
+            return []  # nothing queued to pop
+        try:
+            with open(tmp, "r") as f:
+                raw = f.read()
+        except OSError:
+            raw = ""
+        if raw.strip():
+            with open(p["delivered"], "a") as d:
+                d.write(raw if raw.endswith("\n") else raw + "\n")
+        _silently(lambda: os.remove(tmp))
+        return _parse_lines(raw)
+
+
+def load_inbox_module(root):
+    lib_dir = os.path.join(root, "bin", "lib")
+    if os.path.isdir(lib_dir) and lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    m = None
+    try:
+        import companion_ui_inbox as _m
+        m = _m
+    except Exception:
+        m = None  # sibling module absent/broken -- inline fallback covers it
+    if m is not None and all(hasattr(m, fn) for fn in ("append", "list_pending", "pop_all", "peek")):
+        return m
+    return None
+
+
+def get_ops(root):
+    m = load_inbox_module(root)
+    if m is not None:
+        return m.append, m.list_pending, m.pop_all, m.peek
+    return inline_append, inline_list_pending, inline_pop_all, inline_peek
+
+
+def write_state(root, waiting):
+    p = paths_for(root)
+    os.makedirs(p["dir"], exist_ok=True)
+    tmp = "%s.tmp.%d" % (p["state"], os.getpid())
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"waiting": bool(waiting), "since": time.time()}, f)
+        os.replace(tmp, p["state"])
+    except Exception:
+        _silently(lambda: os.remove(tmp))
+
+
+def texts_of(items):
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        t = sanitize(it.get("text", ""))
+        if t.strip():
+            out.append(t)
+    return out
+
+
+def read_last_assistant_text(path):
+    # Ported from hmdapp's scripts/hmd-chat-panel.sh (read_last_assistant_text):
+    # last main-chain ("isSidechain" false/absent) assistant entry's text
+    # content blocks, tail-bounded since only the latest message matters.
+    if not path:
+        return ""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            if size > TRANSCRIPT_TAIL_BYTES:
+                f.seek(size - TRANSCRIPT_TAIL_BYTES)
+            chunk = f.read()
+    except OSError:
+        return ""
+    for raw in reversed(chunk.split(b"\n")):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        if obj.get("isSidechain"):
+            continue
+        msg = obj.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            return ""
+        parts = [it.get("text") for it in content
+                 if isinstance(it, dict) and it.get("type") == "text" and isinstance(it.get("text"), str)]
+        return "\n".join(parts)
+    return ""
+
+
+def is_question(text):
+    # "\x60" is a backtick -- spelled as an escape, not a literal character,
+    # because this source lives inside a `<<'PYEOF'` heredoc nested in a
+    # $(...) command substitution: bash's paren-matching scan for $(...)
+    # still tracks backtick balance through a heredoc body even though the
+    # body is otherwise literal, so an unpaired literal backtick here would
+    # break the OUTER script's parse. Same constraint, same fix, as
+    # hmdapp's scripts/hmd-chat-panel.sh.
+    t = (text or "").strip().rstrip("*_\x60~ \t\r\n")
+    return t.endswith("?")
+
+
+def env_float(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def cmd_stop(hook, root):
+    if hook.get("stop_hook_active") is True:
+        return  # silent loop guard: no output, no queue mutation at all
+
+    _, _, pop_all_fn, _ = get_ops(root)
+
+    write_state(root, False)  # clear any stale "waiting" left by a prior run
+
+    items = pop_all_fn(root)
+    texts = texts_of(items)
+    if texts:
+        print(json.dumps({"decision": "block", "reason": "\n\n".join(texts)}))
+        return
+
+    last_msg = hook.get("last_assistant_message")
+    if not isinstance(last_msg, str) or not last_msg.strip():
+        last_msg = read_last_assistant_text(hook.get("transcript_path"))
+    if not is_question(last_msg):
+        return  # nothing queued, nothing being asked -- no output
+
+    wait_s = env_float("HMD_INBOX_WAIT_S", 240.0)
+    deadline = time.time() + max(0.0, wait_s)
+    write_state(root, True)
+    delivered_texts = []
+    while True:
+        items = pop_all_fn(root)
+        texts = texts_of(items)
+        if texts:
+            delivered_texts = texts
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(POLL_INTERVAL_S)
+    write_state(root, False)
+    if delivered_texts:
+        print(json.dumps({"decision": "block", "reason": "\n\n".join(delivered_texts)}))
+
+
+def resolve_tmux_target(root):
+    t = os.environ.get("HMD_TMUX_TARGET", "").strip()
+    if t:
+        return t
+    try:
+        with open(os.path.join(root, ".heimdall", "ui", "tmux-target"), "r") as f:
+            t = f.read().strip()
+    except OSError:
+        t = ""
+    return t
+
+
+def _tmux_send(args):
+    return _silently(lambda: subprocess.run(
+        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5))
+
+
+def cmd_tmux(root):
+    target = resolve_tmux_target(root)
+    if not target or not shutil.which("tmux"):
+        return  # no target configured, or tmux unavailable -- no-op
+    _, list_pending_fn, pop_all_fn, _ = get_ops(root)
+    items = list_pending_fn(root)
+    texts = texts_of(items)
+    if not texts:
+        return
+    for text in texts:
+        _tmux_send(["tmux", "send-keys", "-t", target, "-l", tmux_safe(text)])
+        _tmux_send(["tmux", "send-keys", "-t", target, "Enter"])
+    pop_all_fn(root)
+
+
+def cmd_prompt(hook, root):
+    _, _, pop_all_fn, _ = get_ops(root)
+    items = pop_all_fn(root)
+    texts = texts_of(items)
+    if not texts:
+        return
+    ctx = "Messages from the hmd companion app while you were away:\n" + \
+          "\n".join("- " + t for t in texts)
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
+
+
+def cmd_status(root):
+    _, list_pending_fn, _, _ = get_ops(root)
+    items = list_pending_fn(root)
+    waiting = False
+    try:
+        with open(paths_for(root)["state"], "r") as f:
+            st = json.load(f)
+        if isinstance(st, dict):
+            waiting = bool(st.get("waiting"))
+    except Exception:
+        waiting = False
+    print(json.dumps({"pending": len(items), "waiting": waiting}))
+
+
+def main():
+    raw_stdin = sys.stdin.read() if MODE in ("stop", "prompt") else ""
+    hook = read_stdin_json(raw_stdin)
+    root = resolve_repo(hook)
+    if not root:
+        return
+    root = os.path.abspath(root)
+    if MODE == "stop":
+        cmd_stop(hook, root)
+    elif MODE == "tmux":
+        cmd_tmux(root)
+    elif MODE == "prompt":
+        cmd_prompt(hook, root)
+    elif MODE == "status":
+        cmd_status(root)
+    # any other/unknown mode: no-op
+
+
+try:
+    main()
+except Exception:
+    sys.exit(0)  # every path exits 0 -- a delivery bug must never block a hook
+sys.exit(0)
+PYEOF
+)
+
+printf '%s' "$INPUT" | python3 -c "$PY_SRC" "$MODE" "$REPO_EXPLICIT" "$DEFAULT_REPO"
+exit 0
