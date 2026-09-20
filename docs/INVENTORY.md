@@ -290,11 +290,12 @@ Default posture is **network-on**: presence beats to the public control plane fr
 | Sigil / badge | `bin/heimdall-sigil`, `heimdall-sigil-png`, `heimdall-identity`, `heimdall-badge` | deterministic per-identity sigil; shields-style "N proven merges" badge counted from `.heimdall/receipts/beats.log`, offline SVG |
 | Demo | `bin/heimdall-demo` (`hmd demo [--run]`) | dry by default; first-run narrated wake-up + a planted credential caught by the real `bin/secret-scan` (deny → fix → pass) |
 | Companion UI | `bin/heimdall-ui` (`hmd ui`) | loopback read-only web view (section 13) |
+| Companion app | `bin/heimdall-app` (`hmd app connect/status/disconnect/doctor`) | publishes `hmd ui` over Tailscale Funnel for the phone companion app (section 13) |
 | Watch TUI | `bin/heimdall-watch-tui` (`hmd watch`), `bin/heimdall-watch` | live dashboard; sentinels on human commits |
 | Sentinels (spec H-3) | `sentinels/bloat.sh`, `doc-sync.sh`, `sanity.sh`, `security.sh`, `spec-drift.sh` | harness sentinels run per wave / pre-push |
 | Summary card | `bin/summary-card` | end-of-run card |
 
-`hmd --help` (`bin/heimdall --help`) subcommands: run a task · interactive · `--resume` · `--auto` · `--no-goal` · `--skip-checkpoint` · `--no-autocommit`/`--autocommit` · `--skills` · `--update` · `--setup` · `--team N` · `--reinstall` · `--uninstall` · `team` · `invite` · `join` · `connect` · `presence` · `tier` · `status` · `weekly-log` · `sla` · `report-issue` · `authenticity-check` · `queue …` · `queue drain` · `settings-guard` · `volatile-repo-guard`. The `bin/heimdall` router also dispatches many more verbs (`init`, `wrap`, `route`, `modules`, `fallback`, `ui`, `inbox`, `demo`, `sigil`, `funnel`, `hooks`, `caveman`, `verdict`, …) that `--help` does not list — see section 14.
+`hmd --help` (`bin/heimdall --help`) subcommands: run a task · interactive · `--resume` · `--auto` · `--no-goal` · `--skip-checkpoint` · `--no-autocommit`/`--autocommit` · `--skills` · `--update` · `--setup` · `--team N` · `--reinstall` · `--uninstall` · `team` · `invite` · `join` · `connect` · `presence` · `tier` · `status` · `weekly-log` · `sla` · `report-issue` · `authenticity-check` · `queue …` · `queue drain` · `settings-guard` · `volatile-repo-guard`. The `bin/heimdall` router also dispatches many more verbs (`init`, `wrap`, `route`, `modules`, `fallback`, `ui`, `inbox`, `app`, `demo`, `sigil`, `funnel`, `hooks`, `caveman`, `verdict`, …) that `--help` does not list — see section 14.
 
 ---
 
@@ -450,6 +451,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-sigil` / `heimdall-sigil-png` / `heimdall-badge` | deterministic sigil; PNG render; proven-merges badge |
 | `heimdall-demo` | first-five-minutes demo |
 | `heimdall-ui` | `hmd ui` companion web UI |
+| `heimdall-app` | `hmd app connect/status/disconnect/doctor` — Tailscale Funnel publish for the companion app |
 | `heimdall-weekly-log` / `generate-changelog` / `heimdall-render-version` | weekly changelog draft; changelog from conventional commits; render every version surface from plugin.json |
 
 ### Skills, stacks, design

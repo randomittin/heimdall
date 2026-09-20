@@ -2478,6 +2478,16 @@ case "${1:-}" in
     if [ -x "$_inbox" ]; then exec "$_inbox" "$@"; fi
     echo "error: heimdall-inbox-deliver not found at $_inbox" >&2; exit 2
     ;;
+  app)
+    # Pass-through to heimdall-app: publishes `hmd ui` to the public internet
+    # over Tailscale Funnel for the phone companion app
+    # (.planning/plans/PLAN-hmd-app-connect.md, Wave 2). Subcommands:
+    # connect|status|disconnect|doctor -- see bin/heimdall-app --help.
+    shift
+    _app="$(cd "$(dirname "$0")" && pwd)/heimdall-app"
+    if [ -x "$_app" ]; then exec "$_app" "$@"; fi
+    echo "error: heimdall-app not found at $_app" >&2; exit 2
+    ;;
   settings-guard)
     # Detect ANTHROPIC_* routing overrides persisted into a Claude Code
     # settings.json env block, which are applied on every launch and
