@@ -42,6 +42,10 @@
 #   5.  CLI edge cases: no text and explicit empty text both error cleanly;
 #       non-UTF8-safe argv bytes never produce an uncaught traceback;
 #       --ascii renders without error
+#   6.  stdin input: piping text on stdin (no positional arg) renders
+#       identically to the same text passed as an argv positional (A5 in
+#       bin/heimdall-app's audit: keeps the pairing URL/token off argv & out
+#       of `ps`)
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -348,6 +352,16 @@ if python3 "$QR" "ascii fallback check" --ascii >"$TMPROOT/case5d.out" 2>"$TMPRO
 else
   bad "5d. --ascii render failed or produced no '#' characters:"
   sed 's/^/       | /' "$TMPROOT/case5d.err"
+fi
+
+# ═══ 6. stdin input (A5: keeps the pairing URL/token off argv & out of `ps`) ═
+STDIN_OUT="$(printf '%s' 'hmd fixture text' | python3 "$QR" --ecc M 2>"$TMPROOT/case6.err")"
+ARGV_OUT="$(python3 "$QR" 'hmd fixture text' --ecc M 2>"$TMPROOT/case6b.err")"
+if [ -n "$STDIN_OUT" ] && [ "$STDIN_OUT" = "$ARGV_OUT" ]; then
+  ok "6. text piped on stdin (no positional arg) renders identically to the same text as an argv positional"
+else
+  bad "6. stdin input didn't match the positional-arg equivalent:"
+  sed 's/^/       | /' "$TMPROOT/case6.err"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

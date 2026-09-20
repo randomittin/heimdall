@@ -675,6 +675,15 @@ def main(argv=None):
                          help="render with ##/space instead of half-block characters")
     args = parser.parse_args(argv)
 
+    # A5 (bin/heimdall-app audit): when no positional text is given and stdin
+    # isn't an interactive terminal, read the text there instead -- lets a
+    # caller (e.g. `hmd app connect`) pipe a secret-bearing string in without
+    # ever putting it on argv, where `ps` would expose it to any local user.
+    # Never triggered by an explicit "" argument (nargs="?" gives None only
+    # when the arg is omitted entirely), so that still errors below as before.
+    if args.text is None and not sys.stdin.isatty():
+        args.text = sys.stdin.read()
+
     if not args.text:
         print("error: input text must not be empty", file=sys.stderr)
         return 1
