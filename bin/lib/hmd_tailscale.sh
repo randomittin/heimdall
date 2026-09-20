@@ -7,10 +7,15 @@
 # ts_install_prompt function is explicitly invoked.
 #
 # ── ENV / OVERRIDES (test-injection seams) ──────────────────────────────────────────
-#   HMD_TAILSCALE_BIN   overrides the resolved tailscale binary path. Honoured verbatim
-#                        by ts_bin, without probing — this is what test/hmd-tailscale.
-#                        test.sh points at its fake tailscale script.
-#   HMD_ASSUME_NO        if "1", ts_install_prompt never installs (see Decision D1).
+#   HMD_TAILSCALE_BIN      overrides the resolved tailscale binary path. Honoured
+#                          verbatim by ts_bin, without probing — this is what
+#                          test/hmd-tailscale.test.sh points at its fake tailscale
+#                          script.
+#   HMD_ASSUME_NO          if "1", ts_install_prompt never installs (see Decision D1).
+#   HMD_FUNNEL_FORCE_RESET if "1", ts_funnel_stop resets unconditionally even when
+#                          other Funnel/Serve targets are configured (see D6). Off by
+#                          default — the safe default is to refuse, not to silently
+#                          wipe someone else's config.
 #
 # ── DECISIONS THIS FILE ENCODES ──────────────────────────────────────────────────────
 #   D1: install is never silent — ts_install_prompt always prints the prompt and the
@@ -18,6 +23,18 @@
 #   D4: the funnel HTTPS port is restricted to 443|8443|10000; a tailnet-policy hint
 #       from the real CLI's stderr (HTTPS certs / funnel node attribute not enabled)
 #       is surfaced VERBATIM on stderr, never paraphrased.
+#   D5: (security audit A11) ts_install_prompt never hands a dynamically-built string
+#       back to the shell for re-interpretation. What actually executes is always a
+#       fixed argv array: literal words for the brew/open/visit cases, and for Linux a
+#       fixed `sh -c '<the exact literal one-liner>'` that never has any variable
+#       spliced into it. The prompt still SHOWS the operator the official one-liner
+#       verbatim; only what gets EXECUTED is constrained.
+#   D6: (security audit A13) ts_funnel_stop never lets the modern CLI's all-or-nothing
+#       `funnel reset` silently wipe someone else's Funnel/Serve config. It reads
+#       ts_funnel_status_json first; if anything other than hmd's own target is
+#       configured it refuses (exit 7) unless HMD_FUNNEL_FORCE_RESET=1 is set, or it
+#       uses a per-port scoped stop instead when the installed CLI actually exposes one
+#       (see ts_funnel_scoped_off_supported — real tailscale 1.94.2 does not).
 #
 # JSON parsing uses the `jq -r '.path // empty' 2>/dev/null` idiom already established
 # in bin/lib/hmd-headroom-chain.sh:122 and friends — jq is precedented, not a new dep.
@@ -137,6 +154,39 @@ ts_funnel_supported() {
   return 0
 }
 
+# ts_funnel_scoped_off_supported — probe `tailscale funnel --help` for a per-port stop
+# flag/subcommand, as distinct from ts_funnel_supported's on/off *syntax generation*
+# check above. Some CLI generations expose a scoped `tailscale funnel --https=PORT
+# off` that only touches hmd's own mapping; the modern generation checked empirically
+# on this machine (real tailscale 1.94.2 — see `tailscale funnel --help`) does NOT:
+# its only funnel subcommands are `status` and `reset`, and the word "off" does not
+# appear anywhere in that output.
+#   `tailscale serve --help` was inspected too, same machine, same 1.94.2 -- Funnel
+#   piggybacks on Serve's config, so a scoped-off form could plausibly live there
+#   instead. It doesn't either: serve's subcommands are status/reset/drain/clear/
+#   advertise/get-config/set-config, and "off" appears nowhere in that output.
+#   This probe (and ts_funnel_stop's scoped call) deliberately only ever looks at,
+#   and shells out to, `funnel`, never `serve`, even if some future CLI adds a
+#   scoped `serve --https=PORT off`: that would drop the underlying Serve mapping
+#   too, a bigger blast radius than "stop hmd's own Funnel exposure".
+# ts_funnel_stop (D6 / security audit A13) uses this probe's result to decide
+# whether it can avoid the all-or-nothing `reset`. Kept as a live probe rather than
+# a hardcoded "no" so a future CLI that adds scoped support is picked up
+# automatically, with no code change here.
+# Always prints exactly "yes" or "no". Exit 0 always — same contract as
+# ts_funnel_supported above.
+ts_funnel_scoped_off_supported() {
+  local bin help
+  bin="$(ts_bin 2>/dev/null)" || { printf 'no'; return 0; }
+  help="$("$bin" funnel --help 2>&1)"
+  if printf '%s' "$help" | grep -qw 'off'; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
+  return 0
+}
+
 # ts_funnel_start PORT HTTPS_PORT — start funnel using the syntax matching
 # ts_funnel_supported's probe.
 # Exit 0: funnel started. Exit 64: HTTPS_PORT is not one of 443|8443|10000 (Decision
@@ -190,16 +240,52 @@ ts_funnel_start() {
   return 0
 }
 
-# ts_funnel_stop HTTPS_PORT — stop funnel using the syntax matching
-# ts_funnel_supported's probe. Modern stop uses `funnel reset` (the real CLI's only
-# stop-shaped subcommand — confirmed via `tailscale funnel --help`: modern has no
-# per-port off flag, only `status` and `reset`); legacy stop mirrors the brief's start
-# recipe's second half, `funnel PORT off`.
+# ts_funnel_foreign_targets JSON TARGET — print, one per line, every proxy/TCP target
+# in a `funnel status --json`-shaped blob (ipn.ServeConfig: .Web.<hostport>.Handlers.
+# <path>.{Proxy,Path,Text}, .TCP.<port>) that is NOT exactly TARGET. TARGET is normally
+# "http://127.0.0.1:<hmd's own backend port>" (the same string ts_funnel_start builds);
+# pass "" when that port is unknown so nothing can match and every configured target is
+# conservatively treated as foreign — this is what makes ts_funnel_stop's one-arg
+# compatibility mode safe. Prints nothing (i.e. "no foreign targets") when the blob has
+# no Web/TCP entries at all, when every entry matches TARGET, or when JSON parsing
+# fails outright — a malformed/empty blob is treated the same as "nothing configured",
+# consistent with ts_funnel_status_json's own tolerant style elsewhere in this file.
+ts_funnel_foreign_targets() {
+  local json="$1" target="$2"
+  printf '%s' "$json" | jq -r --arg want "$target" '
+    [
+      ( .Web // {} | to_entries[]? | .value.Handlers // {} | to_entries[]?
+        | (.value.Proxy // .value.Path // .value.Text // empty) ),
+      ( .TCP // {} | keys[]? | "tcp:" + . )
+    ]
+    | map(select(. != "" and . != $want))
+    | unique
+    | .[]
+  ' 2>/dev/null
+}
+
+# ts_funnel_stop HTTPS_PORT [PORT] — stop funnel using the syntax matching
+# ts_funnel_supported's probe. PORT is hmd's own backend port (the same one passed to
+# ts_funnel_start) and is OPTIONAL, for backward compatibility with existing one-arg
+# callers; when omitted it is treated as unknown (see ts_funnel_foreign_targets).
+# Legacy stop is already scoped to just this HTTPS_PORT (`funnel PORT off`, mirroring
+# the start recipe's second half) so it is unaffected by D6 below.
+# Modern stop (D6 / security audit A13): the real CLI's only stop-shaped funnel
+# subcommand is `reset`, which wipes ALL Funnel/Serve config on the node, not just
+# hmd's mapping — confirmed via `tailscale funnel --help`, which lists only `status`
+# and `reset`. Before calling it, this reads ts_funnel_status_json and refuses to reset
+# when it finds any target other than hmd's own (see ts_funnel_foreign_targets), unless
+# HMD_FUNNEL_FORCE_RESET=1. When PORT is known and the installed CLI actually exposes a
+# per-port scoped stop (ts_funnel_scoped_off_supported — not true for real tailscale
+# 1.94.2, but checked live in case a future CLI adds it), that scoped stop is used
+# instead of `reset`, even when foreign targets exist, since it never touches them.
 # Exit 0: stopped. Exit 64: HTTPS_PORT invalid (Decision D4, checked before the binary
-# is invoked). Exit 1: tailscale unresolvable, or funnel unsupported. Other nonzero:
-# passed through from the underlying tailscale invocation.
+# is invoked). Exit 7: refusing to reset — other Funnel/Serve targets are configured
+# and neither a scoped stop nor HMD_FUNNEL_FORCE_RESET=1 was available (D6). Exit 1:
+# tailscale unresolvable, or funnel unsupported. Other nonzero: passed through from the
+# underlying tailscale invocation.
 ts_funnel_stop() {
-  local https_port="$1"
+  local https_port="$1" port="${2:-}"
   case "$https_port" in
     443|8443|10000) ;;
     *)
@@ -208,14 +294,42 @@ ts_funnel_stop() {
       ;;
   esac
 
-  local bin mode rc
+  local bin mode rc target foreign scoped
   bin="$(ts_bin 2>/dev/null)" || return 1
   mode="$(ts_funnel_supported)"
 
   case "$mode" in
     modern)
-      "$bin" funnel reset >/dev/null 2>&1
-      rc=$?
+      if [ "${HMD_FUNNEL_FORCE_RESET:-0}" = "1" ]; then
+        "$bin" funnel reset >/dev/null 2>&1
+        rc=$?
+      else
+        target=""
+        if [ -n "$port" ]; then
+          target="http://127.0.0.1:${port}"
+        fi
+        foreign="$(ts_funnel_foreign_targets "$(ts_funnel_status_json 2>/dev/null)" "$target")"
+        scoped="no"
+        if [ -n "$port" ] && [ "$(ts_funnel_scoped_off_supported)" = "yes" ]; then
+          scoped="yes"
+        fi
+
+        if [ -n "$foreign" ] && [ "$scoped" = "no" ]; then
+          printf 'hmd_tailscale: refusing to reset Funnel -- other targets are configured, reset would wipe them too:\n%s\n' "$foreign" >&2
+          printf 'hmd_tailscale: set HMD_FUNNEL_FORCE_RESET=1 to reset anyway, or remove those targets first.\n' >&2
+          return 7
+        fi
+        if [ -n "$foreign" ]; then
+          printf 'hmd_tailscale: other Funnel targets are configured; using a scoped stop (--https=%s off) instead of reset, leaving them untouched:\n%s\n' "$https_port" "$foreign" >&2
+        fi
+
+        if [ "$scoped" = "yes" ]; then
+          "$bin" funnel "--https=${https_port}" off >/dev/null 2>&1
+        else
+          "$bin" funnel reset >/dev/null 2>&1
+        fi
+        rc=$?
+      fi
       ;;
     legacy)
       "$bin" funnel "${https_port}" off >/dev/null 2>&1
@@ -259,27 +373,36 @@ ts_funnel_status_json() {
 # — either HMD_ASSUME_NO=1, or the user answered anything but y/Y. Other nonzero: user
 # consented but the install command itself failed; that exit code is passed through.
 ts_install_prompt() {
-  local os cmd ans
+  local os cmd_display ans
+  local -a cmd
 
   os="$(uname -s 2>/dev/null || echo unknown)"
   case "$os" in
     Darwin)
       if command -v brew >/dev/null 2>&1; then
-        cmd="brew install --cask tailscale"
+        cmd=(brew install --cask tailscale)
+        cmd_display="brew install --cask tailscale"
       else
-        cmd="open https://tailscale.com/download/mac"
+        cmd=(open https://tailscale.com/download/mac)
+        cmd_display="open https://tailscale.com/download/mac"
       fi
       ;;
     Linux)
-      cmd="curl -fsSL https://tailscale.com/install.sh | sh"
+      # Fixed literal argv (D5 / security audit A11): $cmd_display below is for
+      # display ONLY and is never the thing that gets run, so nothing can be spliced
+      # into what actually executes. The official one-liner is still shown to the
+      # operator verbatim; it is just never handed back to a shell as a built string.
+      cmd=(sh -c 'curl -fsSL https://tailscale.com/install.sh | sh')
+      cmd_display='curl -fsSL https://tailscale.com/install.sh | sh'
       ;;
     *)
-      cmd="visit https://tailscale.com/download"
+      cmd=(visit https://tailscale.com/download)
+      cmd_display="visit https://tailscale.com/download"
       ;;
   esac
 
   printf 'Tailscale is not installed.\n' >&2
-  printf 'hmd would run:\n  %s\n' "$cmd" >&2
+  printf 'hmd would run:\n  %s\n' "$cmd_display" >&2
 
   if [ "${HMD_ASSUME_NO:-0}" = "1" ]; then
     printf 'HMD_ASSUME_NO=1 -- skipping install.\n' >&2
@@ -290,7 +413,7 @@ ts_install_prompt() {
   IFS= read -r ans
   case "$ans" in
     y|Y)
-      eval "$cmd"
+      "${cmd[@]}"
       return $?
       ;;
     *)

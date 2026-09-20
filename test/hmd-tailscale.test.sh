@@ -39,7 +39,11 @@ fi
 # ── fake tailscale CLI ──────────────────────────────────────────────────────────────
 # One script, behaviour switched by $FAKE_TS_MODE. Never touches the real tailscaled.
 # Modes: not-installed, daemon-down, offline, online-with-DNSName, modern-funnel,
-# legacy-funnel, no-funnel, policy-hint-on-funnel-start, bad-https-port.
+# legacy-funnel, no-funnel, policy-hint-on-funnel-start, bad-https-port,
+# modern-funnel-scoped-off. FAKE_FUNNEL_STATUS_JSON, when set, overrides the canned
+# `funnel status` payload (used by the A13 foreign/only-ours/force/scoped tests).
+# FAKE_CALL_LOG, when set, appends every invocation's full argv (one line each) to
+# that file so a test can assert reset was/wasn't actually called.
 FAKE_BIN="$TMPROOT/tailscale"
 cat > "$FAKE_BIN" <<'FAKE_EOF'
 #!/usr/bin/env bash
@@ -48,6 +52,10 @@ mode="${FAKE_TS_MODE:-online-with-DNSName}"
 if [ "$mode" = "not-installed" ]; then
   echo "fake-tailscale: command not found" >&2
   exit 127
+fi
+
+if [ -n "${FAKE_CALL_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_CALL_LOG"
 fi
 
 cmd="${1:-}"; shift || true
@@ -95,6 +103,23 @@ EOF
             echo 'tailscale: unknown command "funnel"' >&2
             exit 1
             ;;
+          modern-funnel-scoped-off)
+            cat <<'EOF'
+USAGE
+  tailscale funnel <target>
+  tailscale funnel status [--json]
+  tailscale funnel reset
+
+FLAGS
+  --bg, --bg=false
+        Run the command as a background process
+  --https value
+        Expose an HTTPS server at the specified port (default mode)
+  --https=PORT off
+        Disable Funnel for the specified port only, leaving others untouched
+EOF
+            exit 0
+            ;;
           *)
             cat <<'EOF'
 USAGE
@@ -113,7 +138,11 @@ EOF
         esac
         ;;
       status)
-        echo '{"Funnel":{}}'
+        if [ -n "${FAKE_FUNNEL_STATUS_JSON:-}" ]; then
+          printf '%s' "$FAKE_FUNNEL_STATUS_JSON"
+        else
+          echo '{"Funnel":{}}'
+        fi
         exit 0
         ;;
       reset)
@@ -125,6 +154,12 @@ EOF
           echo "$POLICY_HINT" >&2
           exit 1
         fi
+        exit 0
+        ;;
+      --https=*)
+        # modern scoped stop: funnel --https=PORT off (A13 fake support for D6's
+        # scoped-off path -- real tailscale 1.94.2 has no such form; see
+        # ts_funnel_scoped_off_supported's doc comment in bin/lib/hmd_tailscale.sh).
         exit 0
         ;;
       *)
@@ -580,6 +615,129 @@ if (
   ok "36. ts_funnel_stop fails cleanly when funnel is unavailable"
 else
   bad "36. ts_funnel_stop fails cleanly when funnel is unavailable"
+fi
+
+# ── 37. bin/lib/hmd_tailscale.sh contains zero eval usage (A11 security audit) ────
+if [ "$(grep -c '\beval\b' "$LIB")" -eq 0 ]; then
+  ok "37. hmd_tailscale.sh has zero eval usage (A11)"
+else
+  bad "37. hmd_tailscale.sh has zero eval usage (A11)"
+fi
+
+# ── 38. ts_install_prompt: consent path hands brew a fixed 3-word argv -- no eval,
+#         no string re-interpretation (A11 security audit) ───────────────────────
+if (
+  unset HMD_ASSUME_NO
+  mkdir -p "$TMPROOT/brewbin38"
+  ARGV_LOG="$TMPROOT/brew-argv.log"
+  rm -f "$ARGV_LOG"
+  cat > "$TMPROOT/brewbin38/brew" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$ARGV_LOG"
+exit 0
+EOF
+  chmod +x "$TMPROOT/brewbin38/brew"
+  PATH="$TMPROOT/brewbin38:$PATH"
+  export PATH
+  out="$(printf 'y\n' | ts_install_prompt 2>&1)"; rc=$?
+  [ $rc -eq 0 ] && [ "$(cat "$ARGV_LOG")" = "$(printf 'install\n--cask\ntailscale')" ]
+); then
+  ok "38. ts_install_prompt: consent path passes brew an exact argv (A11)"
+else
+  bad "38. ts_install_prompt: consent path passes brew an exact argv (A11)"
+fi
+
+# ── 39. ts_funnel_stop: a foreign Funnel target -> exit 7, warning names it, never
+#         calls reset (A13 / D6) ──────────────────────────────────────────────────
+if (
+  export FAKE_TS_MODE=modern-funnel
+  export FAKE_FUNNEL_STATUS_JSON='{"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:5000"}}}},"TCP":{}}'
+  CALL_LOG="$TMPROOT/calls-39.log"
+  rm -f "$CALL_LOG"
+  export FAKE_CALL_LOG="$CALL_LOG"
+  unset HMD_FUNNEL_FORCE_RESET
+  out="$(ts_funnel_stop 443 3000 2>&1)"; rc=$?
+  [ "$rc" -eq 7 ] \
+    && printf '%s' "$out" | grep -qF 'http://127.0.0.1:5000' \
+    && ! grep -q 'funnel reset' "$CALL_LOG"
+); then
+  ok "39. ts_funnel_stop: foreign target -> exit 7, warns, never resets (A13/D6)"
+else
+  bad "39. ts_funnel_stop: foreign target -> exit 7, warns, never resets (A13/D6)"
+fi
+
+# ── 40. ts_funnel_stop: only hmd's own target configured -> succeeds via reset
+#         (A13 / D6 happy path) ───────────────────────────────────────────────────
+if (
+  export FAKE_TS_MODE=modern-funnel
+  export FAKE_FUNNEL_STATUS_JSON='{"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}},"TCP":{}}'
+  CALL_LOG="$TMPROOT/calls-40.log"
+  rm -f "$CALL_LOG"
+  export FAKE_CALL_LOG="$CALL_LOG"
+  unset HMD_FUNNEL_FORCE_RESET
+  ts_funnel_stop 443 3000 >/dev/null 2>/dev/null
+  rc=$?
+  [ "$rc" -eq 0 ] && grep -q 'funnel reset' "$CALL_LOG"
+); then
+  ok "40. ts_funnel_stop: only hmd's own target -> succeeds, resets (A13/D6)"
+else
+  bad "40. ts_funnel_stop: only hmd's own target -> succeeds, resets (A13/D6)"
+fi
+
+# ── 41. ts_funnel_stop: HMD_FUNNEL_FORCE_RESET=1 resets despite a foreign target
+#         (A13 / D6 force override) ───────────────────────────────────────────────
+if (
+  export FAKE_TS_MODE=modern-funnel
+  export FAKE_FUNNEL_STATUS_JSON='{"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:5000"}}}},"TCP":{}}'
+  CALL_LOG="$TMPROOT/calls-41.log"
+  rm -f "$CALL_LOG"
+  export FAKE_CALL_LOG="$CALL_LOG"
+  export HMD_FUNNEL_FORCE_RESET=1
+  ts_funnel_stop 443 3000 >/dev/null 2>/dev/null
+  rc=$?
+  [ "$rc" -eq 0 ] && grep -q 'funnel reset' "$CALL_LOG"
+); then
+  ok "41. ts_funnel_stop: HMD_FUNNEL_FORCE_RESET=1 overrides, resets anyway (A13/D6)"
+else
+  bad "41. ts_funnel_stop: HMD_FUNNEL_FORCE_RESET=1 overrides, resets anyway (A13/D6)"
+fi
+
+# ── 42. ts_funnel_stop: CLI advertises a scoped off -> uses --https=PORT off
+#         instead of reset, even with a foreign target present (A13 / D6 scoped) ──
+if (
+  export FAKE_TS_MODE=modern-funnel-scoped-off
+  export FAKE_FUNNEL_STATUS_JSON='{"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:5000"}}}},"TCP":{}}'
+  CALL_LOG="$TMPROOT/calls-42.log"
+  rm -f "$CALL_LOG"
+  export FAKE_CALL_LOG="$CALL_LOG"
+  unset HMD_FUNNEL_FORCE_RESET
+  ts_funnel_stop 443 3000 >/dev/null 2>/dev/null
+  rc=$?
+  [ "$rc" -eq 0 ] \
+    && grep -q -- '--https=443 off' "$CALL_LOG" \
+    && ! grep -q 'funnel reset' "$CALL_LOG"
+); then
+  ok "42. ts_funnel_stop: scoped CLI support -> --https=PORT off, never reset (A13/D6)"
+else
+  bad "42. ts_funnel_stop: scoped CLI support -> --https=PORT off, never reset (A13/D6)"
+fi
+
+# ── 43. ts_funnel_stop: one-arg form treats PORT as unknown -> conservative refusal
+#         when anything at all is configured (A13 / D6 back-compat mode) ─────────
+if (
+  export FAKE_TS_MODE=modern-funnel
+  export FAKE_FUNNEL_STATUS_JSON='{"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}},"TCP":{}}'
+  CALL_LOG="$TMPROOT/calls-43.log"
+  rm -f "$CALL_LOG"
+  export FAKE_CALL_LOG="$CALL_LOG"
+  unset HMD_FUNNEL_FORCE_RESET
+  ts_funnel_stop 443 >/dev/null 2>/dev/null
+  rc=$?
+  [ "$rc" -eq 7 ] && ! grep -q 'funnel reset' "$CALL_LOG"
+); then
+  ok "43. ts_funnel_stop: one-arg form is conservative when anything is configured (A13/D6)"
+else
+  bad "43. ts_funnel_stop: one-arg form is conservative when anything is configured (A13/D6)"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
