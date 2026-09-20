@@ -2468,6 +2468,16 @@ case "${1:-}" in
     if [ -x "$_ui" ]; then exec "$_ui" "$@"; fi
     echo "error: heimdall-ui not found at $_ui" >&2; exit 2
     ;;
+  inbox)
+    # Pass-through to heimdall-inbox-deliver: drains the companion phone
+    # app's queued messages (<repo>/.heimdall/ui/inbox.jsonl, written by
+    # `hmd ui`'s POST /api/send) into this session. Modes: stop|prompt|tmux|
+    # status -- see bin/heimdall-inbox-deliver --help.
+    shift
+    _inbox="$(cd "$(dirname "$0")" && pwd)/heimdall-inbox-deliver"
+    if [ -x "$_inbox" ]; then exec "$_inbox" "$@"; fi
+    echo "error: heimdall-inbox-deliver not found at $_inbox" >&2; exit 2
+    ;;
   settings-guard)
     # Detect ANTHROPIC_* routing overrides persisted into a Claude Code
     # settings.json env block, which are applied on every launch and
@@ -3416,6 +3426,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall settings-guard <check|fix>  Find ANTHROPIC_* overrides hidden in settings.json"
   echo "  heimdall volatile-repo-guard <check|explain>  Warn if this clone is on disk the OS may wipe"
   echo "  heimdall ui [--repo D] [--port N]  Live companion web UI for this session (loopback + token)"
+  echo "  heimdall inbox <stop|prompt|tmux|status> [--repo D]  Deliver companion-app inbox messages into this session"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
