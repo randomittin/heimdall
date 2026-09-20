@@ -567,5 +567,20 @@ else
   ok "35. real tailscale not present on this machine (skipped, not a failure)"
 fi
 
+# ── 36. ts_funnel_stop: funnel unavailable -> exit 1, no crash ─────────────────────
+# Closes the one asymmetry with ts_funnel_start's case 20: no-funnel is a required
+# FAKE_TS_MODE and ts_funnel_stop is a required function, so this pairing belongs in
+# "every function x every relevant mode" even though it wasn't in the original batch.
+if (
+  export FAKE_TS_MODE=no-funnel
+  ts_funnel_stop 443 >/dev/null 2>/dev/null
+  rc=$?
+  [ "$rc" -eq 1 ]
+); then
+  ok "36. ts_funnel_stop fails cleanly when funnel is unavailable"
+else
+  bad "36. ts_funnel_stop fails cleanly when funnel is unavailable"
+fi
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
