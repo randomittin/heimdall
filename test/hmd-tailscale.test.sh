@@ -335,8 +335,9 @@ fi
 # ── 17. ts_funnel_start: bad HTTPS port -> exit 64, no binary invocation needed ────
 if (
   export FAKE_TS_MODE=modern-funnel
-  ! ts_funnel_start 3000 9999 >/dev/null 2>/tmp/hmd-ts-17.$$
-  [ $? -eq 64 ] && grep -qi 'port' /tmp/hmd-ts-17.$$
+  ts_funnel_start 3000 9999 >/dev/null 2>/tmp/hmd-ts-17.$$
+  rc=$?
+  [ "$rc" -eq 64 ] && grep -qi 'port' /tmp/hmd-ts-17.$$
 ); then
   ok "17. ts_funnel_start exits 64 on an out-of-whitelist HTTPS port (D4)"
 else
@@ -400,8 +401,9 @@ fi
 # ── 23. ts_funnel_stop: bad HTTPS port -> exit 64 ───────────────────────────────────
 if (
   export FAKE_TS_MODE=modern-funnel
-  ! ts_funnel_stop 9999 >/dev/null 2>/dev/null
-  [ $? -eq 64 ]
+  ts_funnel_stop 9999 >/dev/null 2>/dev/null
+  rc=$?
+  [ "$rc" -eq 64 ]
 ); then
   ok "23. ts_funnel_stop exits 64 on an out-of-whitelist HTTPS port (D4)"
 else
