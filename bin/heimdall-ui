@@ -20,6 +20,9 @@
 #                              kv|table|number|timeseries|bars|markdown|log-tail, inline data
 #                              only -- a `source` command is refused, so is a secret-shaped value
 #   hmd ui panel rm <id>       remove a panel;  hmd ui panel ls [--json]  list live panels
+#   hmd ui inbox ls|pop|peek [--json]
+#                              companion -> session messages: list/deliver/peek the
+#                              undelivered queue (written by the one write path, POST /api/send)
 #   hmd ui -h|--help           this help
 #
 # Auth: loopback bind + Host-header allowlist (403) + per-launch token (401). The
@@ -37,7 +40,7 @@ BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 SERVER="$BIN_DIR/../sentinels/hmd-ui.py"
 PAGE="$BIN_DIR/../sentinels/hmd-ui.html"
 
-usage() { sed -n '2,29p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,32p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -61,6 +64,12 @@ LIB_DIR="$BIN_DIR/lib"
 if [ "${1:-}" = "panel" ]; then
   shift
   exec "$PY3" "$LIB_DIR/companion_ui_panels.py" "$@"
+fi
+# `hmd ui inbox ...` -- list/deliver/peek the POST /api/send queue. Same
+# interpreter resolution, same one-module-owns-the-contract shape as `panel` above.
+if [ "${1:-}" = "inbox" ]; then
+  shift
+  exec "$PY3" "$LIB_DIR/companion_ui_inbox.py" "$@"
 fi
 if [ ! -f "$SERVER" ] || [ ! -f "$PAGE" ]; then
   echo "error: hmd ui server files not found at $SERVER / $PAGE" >&2

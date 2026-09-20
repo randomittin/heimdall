@@ -61,6 +61,7 @@ KEEPALIVE_S = 15.0
 CMD_TIMEOUT_S = 8
 CHECKPOINT_HEAD_BYTES = 8192   # the auto-checkpoint header lives in the first few KB
 REELS_LIMIT = 20
+MAX_SEND_BODY_BYTES = 4096     # POST /api/send request body cap (413 above this)
 
 # ── sources: the complete list of what this process reads ────────────────────
 # Relative to the target repo root. `--print-sources` prints exactly these (made
@@ -74,6 +75,7 @@ SOURCE_FILES = (
     ".planning/reels/",                   # directory listing: name + mtime only
     ".planning/metrics.jsonl",            # last graded parallelism row (tail only)
     ".heimdall/ui/panels/",               # job panels: <id>.json via companion_ui_panels.read_panels
+    ".heimdall/ui/inbox.jsonl",           # undelivered companion messages: companion_ui_inbox.list_pending
 )
 # Under $TMPDIR: parallelism-tracker's live per-session counters (key=value text).
 # READ ONLY. `parallelism-tracker grade` is deliberately NOT called: it is the
@@ -163,6 +165,10 @@ LEDGER = _load_module("hmd_ledger", os.path.join(HERE, "hmd_ledger.py"))
 # Wave 4: the ONE place the job-panel contract lives (type set, caps, scrub, atomic
 # write). The `hmd ui panel` CLI imports the same module, so writer and reader agree.
 PANELS = _load_module("companion_ui_panels", os.path.join(LIB_DIR, "companion_ui_panels.py"))
+# The write path's ONE place the message contract lives (validation, caps, secret
+# scrub, atomic append). sentinels/hmd-ui.py's POST handler and `hmd ui inbox` both
+# import it, so writer and reader agree -- mirrors PANELS immediately above.
+INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_inbox.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -499,6 +505,15 @@ def collect_panels(root):
     return PANELS.read_panels(root)
 
 
+def collect_inbox(root):
+    """The `inbox` addendum: the count of undelivered companion -> session messages,
+    always via companion_ui_inbox.list_pending -- never a raw line count of a file
+    the server hasn't parsed. A missing inbox file, or a missing module, is simply 0."""
+    if INBOX is None:
+        return {"pending": 0}
+    return {"pending": len(INBOX.list_pending(root))}
+
+
 def publish_live_users(root, roster_count, previous, now=None):
     """hmd dogfoods the panel publish path: the roster count /api/state already
     computes becomes the `hmd-live-users` number tile, written in-process through
@@ -552,6 +567,7 @@ def collect_state(root):
         "reels": safe(collect_reels, list),
         "edits": safe(collect_edits),
         "panels": safe(collect_panels, list),
+        "inbox": safe(collect_inbox, lambda: {"pending": 0}),
     }
 
 
@@ -715,10 +731,62 @@ class UIHandler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_POST(self):
-        self._gate_then(lambda _q: self._send(405, "method not allowed"))
+        self._gate_then(self._route_post)
 
     def do_GET(self):
         self._gate_then(self._route)
+
+    def _route_post(self, _query):
+        path = urlsplit(self.path).path
+        if path == "/api/send":
+            self._handle_send()
+        else:
+            self._send(405, "method not allowed")
+
+    def _handle_send(self):
+        """POST /api/send: companion -> session message, appended to
+        .heimdall/ui/inbox.jsonl (bin/lib/companion_ui_inbox.append). Auth already
+        passed -- _gate_then ran first. The text is never logged (log_message only
+        ever sees the path, see its comment above) and never echoed back on any
+        failure path -- only a field/rule name is."""
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            self._send_json(415, {"error": "unsupported-media-type"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._send_json(400, {"error": "invalid-content-length"})
+            return
+        if length < 0:
+            self._send_json(400, {"error": "invalid-content-length"})
+            return
+        if length > MAX_SEND_BODY_BYTES:
+            self._send_json(413, {"error": "payload-too-large"})
+            return
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            obj = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"error": "invalid-json"})
+            return
+        if not isinstance(obj, dict) or not isinstance(obj.get("text"), str):
+            self._send_json(400, {"error": "text field (string) is required"})
+            return
+        if INBOX is None:
+            self._send_json(500, {"error": "inbox module unavailable"})
+            return
+        root = self.server.cache.root
+        try:
+            record = INBOX.append(root, obj["text"])
+        except INBOX.InboxError as e:
+            self._send_json(422, {"error": e.code})
+            return
+        except OSError:
+            self._send_json(500, {"error": "write-failed"})
+            return
+        queued = len(INBOX.list_pending(root))
+        self._send_json(202, {"id": record["id"], "queued": queued})
 
     def _gate_then(self, handler):
         parts = urlsplit(self.path)
