@@ -15,6 +15,12 @@
 #   hmd ui --print-sources     list every file/command the server reads (tester hook)
 #   hmd ui --print-deny-list   list the never-read patterns (team.json, *.key, .env* ...)
 #   hmd ui --print-state       collect the JSON contract once and print it
+#   hmd ui --allow-host NAME   extend the Host allowlist with NAME (repeatable) -- a
+#                              reverse proxy's public hostname (e.g. a Tailscale Funnel
+#                              *.ts.net name); bind stays 127.0.0.1
+#   hmd ui --trust-proxy       use X-Forwarded-For's first value for per-IP accounting
+#                              (backoff, /api/state.transport) instead of the socket peer;
+#                              only meaningful behind a proxy that sets it
 #   hmd ui panel set <id> --type <t> --title <s> --data-json <file|-> [--refresh-s N]
 #                              publish a job panel tile (Wave 4, Decision 6): closed type set
 #                              kv|table|number|timeseries|bars|markdown|log-tail, inline data
@@ -25,8 +31,9 @@
 #                              undelivered queue (written by the one write path, POST /api/send)
 #   hmd ui -h|--help           this help
 #
-# Auth: loopback bind + Host-header allowlist (403) + per-launch token (401). The
-# URL printed on stdout is the only place the token appears; it is never logged.
+# Auth: loopback bind + Host-header allowlist (403) + per-launch token (401) + per-IP
+# backoff (5 auth failures/60s -> 429 w/ Retry-After for 30s, on every route). The URL
+# printed on stdout is the only place the token appears; it is never logged.
 #
 # Interpreter: resolved through bin/lib/hmd-python.sh's hmd_python (cached, shim-
 # avoiding), never a bare `python3` — same convention as heimdall-statusline.
@@ -40,7 +47,7 @@ BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 SERVER="$BIN_DIR/../sentinels/hmd-ui.py"
 PAGE="$BIN_DIR/../sentinels/hmd-ui.html"
 
-usage() { sed -n '2,32p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,39p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
