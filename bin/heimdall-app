@@ -181,7 +181,12 @@ cmd_connect() {
       ( HMD_ASSUME_NO=1 ts_install_prompt ) || true
       return 4
     fi
-    ts_install_prompt </dev/tty >/dev/null 2>&1 <&- || true
+    # No redirection: D1 requires the prompt to never be silent, and read -r
+    # inside ts_install_prompt must see connect's real stdin. In a
+    # non-interactive context (closed/empty stdin) the read fails and
+    # ts_install_prompt takes its own decline branch -- exit 4 below either
+    # way, since "still not installed" is exit 4 regardless of why.
+    ts_install_prompt || true
     if ! ts_installed; then
       return 4
     fi
