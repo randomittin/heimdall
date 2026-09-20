@@ -58,6 +58,7 @@ rm -f "$SYN_ERR"
 
 # ── sandbox ──────────────────────────────────────────────────────────────
 TMPROOT="$(mktemp -d)"
+export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 mkdir -p "$HOME/.claude"
@@ -130,9 +131,8 @@ JSON
         exit 0
         ;;
       *)
-        cat <<'JSON'
-{"BackendState":"Running","Self":{"Online":true,"DNSName":"my-machine.tail1a2b3.ts.net."},"AuthURL":""}
-JSON
+        dns="${FAKE_TS_DNSNAME:-my-machine.tail1a2b3.ts.net.}"
+        printf '{"BackendState":"Running","Self":{"Online":true,"DNSName":"%s"},"AuthURL":""}\n' "$dns"
         exit 0
         ;;
     esac
@@ -171,7 +171,11 @@ EOF
         esac
         ;;
       status)
-        echo '{"Funnel":{}}'
+        if [ "$mode" = "funnel-still-up" ]; then
+          echo '{"Funnel":{"443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9999"}}}}}'
+        else
+          echo '{"Funnel":{}}'
+        fi
         exit 0
         ;;
       reset)
@@ -214,7 +218,7 @@ FAKE_EOF
 chmod +x "$FAKE_BIN"
 
 export HMD_TAILSCALE_BIN="$FAKE_BIN"
-unset HMD_ASSUME_NO FAKE_TS_MODE FAKE_TS_LOG
+unset HMD_ASSUME_NO FAKE_TS_MODE FAKE_TS_LOG FAKE_TS_DNSNAME
 
 # ── 2-5. bare dispatch / usage / unknown subcommand ─────────────────────
 OUT="$("$APP" 2>&1)"; RC=$?
@@ -278,7 +282,7 @@ rm -rf "$D"
 # ── 11-25. modern funnel, online: the full success path ─────────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-online.out"
-FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg >"$OUT_FILE" 2>&1
+FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && ok "connect --bg (modern funnel, online) exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
 
@@ -359,7 +363,7 @@ rm -rf "$D"
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-policy.out"
 ERR_FILE="$TMPROOT/connect-policy.err"
-FAKE_TS_MODE=policy-hint-on-funnel-start "$APP" connect --repo "$D" --bg >"$OUT_FILE" 2>"$ERR_FILE"
+FAKE_TS_MODE=policy-hint-on-funnel-start "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
 [ "$RC" -eq 3 ] && ok "connect under a tailnet policy block exits 3" || bad "exit $RC"
 if grep -qF 'funnel: HTTPS is not enabled for your tailnet. To enable HTTPS certificates and Funnel, visit the admin console: https://login.tailscale.com/admin/dns' "$ERR_FILE"; then
@@ -380,7 +384,7 @@ rm -rf "$D"
 # ── 31-35. status redacts the token ──────────────────────────────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-for-status.out"
-FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg >"$OUT_FILE" 2>&1
+FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
 if [ "$RC" -ne 0 ]; then
   bad "setup: connect --bg for the status test failed (exit $RC): $(cat "$OUT_FILE")"
@@ -404,7 +408,7 @@ rm -rf "$D"
 # ── 36-40. disconnect kills the ui and is idempotent ─────────────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-for-disconnect.out"
-FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg >"$OUT_FILE" 2>&1
+FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
 if [ "$RC" -ne 0 ]; then
   bad "setup: connect --bg for the disconnect test failed: $(cat "$OUT_FILE")"
@@ -487,7 +491,7 @@ D="$(make_repo)"
 LOG="$TMPROOT/ts-legacy.log"
 : > "$LOG"
 OUT_FILE="$TMPROOT/connect-legacy.out"
-FAKE_TS_MODE=legacy-funnel FAKE_TS_LOG="$LOG" "$APP" connect --repo "$D" --bg >"$OUT_FILE" 2>&1
+FAKE_TS_MODE=legacy-funnel FAKE_TS_LOG="$LOG" "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && ok "connect --bg (legacy funnel CLI) exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
 if grep -Eq 'https://my-machine\.tail1a2b3\.ts\.net/\?token=[A-Za-z0-9_-]+' "$OUT_FILE"; then
@@ -504,7 +508,7 @@ rm -rf "$D"
 # ── 68-72. foreground wait + signal-based teardown ───────────────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-fg.out"
-( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" >"$OUT_FILE" 2>&1 ) &
+( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
 FG_PID=$!
 PIDS+=("$FG_PID")
 
@@ -558,6 +562,271 @@ else
   kill "$FG_PID" 2>/dev/null
 fi
 wait "$FG_PID" 2>/dev/null
+rm -rf "$D"
+
+# ── A4(a). disconnect with no state file still stops any orphaned funnel ──
+D="$(make_repo)"
+LOG="$TMPROOT/ts-a4a.log"
+: > "$LOG"
+OUT="$(FAKE_TS_MODE=legacy-funnel FAKE_TS_LOG="$LOG" "$APP" disconnect --repo "$D" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "A4a. disconnect w/ no state file still exits 0" || bad "exit $RC: $OUT"
+grep -q '^funnel 443 off$' "$LOG" && ok "A4a. disconnect w/ no state file still calls funnel-stop (no orphaned funnel survives disconnect)" || bad "ts invocation log: $(cat "$LOG")"
+rm -rf "$D"
+
+# ── A4(b). connect defaults to the fixed port 8710; busy -> exit 6 ───────
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-a4b-default.out"
+FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg >"$OUT_FILE" 2>&1
+RC=$?
+if [ "$RC" -eq 0 ]; then
+  SF="$D/.heimdall/app/connect.json"
+  DP="$(jq -r '.port // empty' "$SF" 2>/dev/null)"
+  [ "$DP" = "8710" ] && ok "A4b. connect w/ no --port defaults to the fixed port 8710" || bad "port=$DP (want 8710)"
+  FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
+else
+  bad "A4b setup: connect (no --port) failed: $(cat "$OUT_FILE")"
+fi
+rm -rf "$D"
+
+D="$(make_repo)"
+python3 - <<'PYEOF' &
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 8710))
+s.listen(1)
+time.sleep(20)
+PYEOF
+HOLD_PID=$!
+PIDS+=("$HOLD_PID")
+sleep 0.3
+OUT="$(FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg 2>&1)"; RC=$?
+[ "$RC" -eq 6 ] && ok "A4b. connect w/ the fixed default port (8710) busy exits 6" || bad "exit $RC (want 6): $OUT"
+kill "$HOLD_PID" 2>/dev/null
+wait "$HOLD_PID" 2>/dev/null
+rm -rf "$D"
+
+# ── A4(c). status detects an orphaned funnel (ui dead, funnel still up) ──
+D="$(make_repo)"
+mkdir -p "$D/.heimdall/app"
+cat > "$D/.heimdall/app/connect.json" <<JSON
+{"pid_ui": 1, "port": 9999, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
+JSON
+OUT="$(FAKE_TS_MODE=funnel-still-up "$APP" status --repo "$D" 2>&1)"; RC=$?
+[ "$RC" -ne 0 ] && ok "A4c. status w/ a stale pid + funnel still up exits nonzero" || bad "exit $RC (want nonzero)"
+printf '%s' "$OUT" | grep -qi 'ORPHANED FUNNEL' && ok "A4c. status prints an ORPHANED FUNNEL warning" || bad "$OUT"
+rm -rf "$D"
+
+# ── A4(d). connect tears down a pre-existing funnel before starting a new one ──
+D0="$(make_repo)"
+LOG0="$TMPROOT/ts-a4d-baseline.log"
+: > "$LOG0"
+FAKE_TS_MODE=modern-funnel FAKE_TS_LOG="$LOG0" "$APP" connect --repo "$D0" --bg --port 0 >/dev/null 2>&1
+BASELINE_COUNT="$(grep -c '^funnel' "$LOG0")"
+FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D0" >/dev/null 2>&1
+rm -rf "$D0"
+
+D="$(make_repo)"
+LOG="$TMPROOT/ts-a4d.log"
+: > "$LOG"
+OUT_FILE="$TMPROOT/connect-a4d.out"
+FAKE_TS_MODE=funnel-still-up FAKE_TS_LOG="$LOG" "$APP" connect --repo "$D" --bg --port 0 >"$OUT_FILE" 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && ok "A4d. connect w/ a pre-existing funnel still exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
+grep -qi 'tearing it down' "$OUT_FILE" && ok "A4d. connect announces tearing down the pre-existing funnel" || bad "$(cat "$OUT_FILE")"
+A4D_COUNT="$(grep -c '^funnel' "$LOG")"
+[ "$A4D_COUNT" -gt "$BASELINE_COUNT" ] && ok "A4d. connect issued an extra tailscale funnel call to tear it down ($A4D_COUNT calls vs $BASELINE_COUNT baseline)" || bad "no extra funnel call: $A4D_COUNT vs baseline $BASELINE_COUNT"
+FAKE_TS_MODE=funnel-still-up "$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
+# ── A4(e). foreground wait also tears down on SIGHUP ──────────────────────
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-hup.out"
+( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+HUP_FG_PID=$!
+PIDS+=("$HUP_FG_PID")
+
+SF="$D/.heimdall/app/connect.json"
+HUP_WAITED=0
+while [ ! -f "$SF" ] && [ "$HUP_WAITED" -lt 50 ]; do
+  sleep 0.2
+  HUP_WAITED=$((HUP_WAITED + 1))
+done
+
+if [ -f "$SF" ]; then
+  ok "A4e setup: foreground connect wrote a state file before SIGHUP"
+  HUP_UI_PID="$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)"
+
+  kill -HUP "$HUP_FG_PID" 2>/dev/null
+  HTERM_WAITED=0
+  while kill -0 "$HUP_FG_PID" 2>/dev/null && [ "$HTERM_WAITED" -lt 50 ]; do
+    sleep 0.2
+    HTERM_WAITED=$((HTERM_WAITED + 1))
+  done
+  if kill -0 "$HUP_FG_PID" 2>/dev/null; then
+    bad "A4e. connect process did not exit within 10s of SIGHUP"
+    kill -9 "$HUP_FG_PID" 2>/dev/null
+  else
+    ok "A4e. connect process exits on SIGHUP (foreground trap fired)"
+  fi
+
+  sleep 0.3
+  if [ -n "$HUP_UI_PID" ] && kill -0 "$HUP_UI_PID" 2>/dev/null; then
+    bad "A4e. ui process still alive after connect received SIGHUP -- trap cleanup leaked it"
+    kill -9 "$HUP_UI_PID" 2>/dev/null
+  else
+    ok "A4e. ui process reaped by the SIGHUP trap's cleanup()"
+  fi
+else
+  bad "A4e setup: foreground connect never wrote a state file within 10s: $(cat "$OUT_FILE" 2>/dev/null)"
+  bad "A4e. skipped: SIGHUP exit check (setup failed)"
+  bad "A4e. skipped: ui-reaped check (setup failed)"
+  kill "$HUP_FG_PID" 2>/dev/null
+fi
+wait "$HUP_FG_PID" 2>/dev/null
+rm -rf "$D"
+
+# ── A5. the pairing URL/token is never visible in hmd_qr.py's argv (ps) ───
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-a5.out"
+( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+A5_FG_PID=$!
+PIDS+=("$A5_FG_PID")
+
+SF="$D/.heimdall/app/connect.json"
+A5_WAITED=0
+while [ ! -f "$SF" ] && [ "$A5_WAITED" -lt 50 ]; do
+  sleep 0.05
+  A5_WAITED=$((A5_WAITED + 1))
+done
+
+A5_SAW_HMD_QR=false
+A5_LEAKED=false
+A5_POLLS=0
+while [ "$A5_POLLS" -lt 400 ]; do
+  A5_PS="$(ps -eo command= 2>/dev/null | grep hmd_qr.py | grep -v grep || true)"
+  if [ -n "$A5_PS" ]; then
+    A5_SAW_HMD_QR=true
+    if printf '%s' "$A5_PS" | grep -q 'token='; then
+      A5_LEAKED=true
+    fi
+  fi
+  A5_POLLS=$((A5_POLLS + 1))
+done
+
+if [ "$A5_SAW_HMD_QR" = true ]; then
+  if [ "$A5_LEAKED" = true ]; then
+    bad "A5. hmd_qr.py argv LEAKS the token during connect"
+  else
+    ok "A5. hmd_qr.py argv never shows token= while connect runs (observed it live, clean)"
+  fi
+else
+  bad "A5. never observed a live hmd_qr.py process to check (inconclusive -- widen the poll window)"
+fi
+
+kill -TERM "$A5_FG_PID" 2>/dev/null
+wait "$A5_FG_PID" 2>/dev/null
+rm -rf "$D"
+
+# ── A6. ui log temp file is 0600 (mktemp + umask 077) ─────────────────────
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-a6-mode.out"
+( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+A6_FG_PID=$!
+PIDS+=("$A6_FG_PID")
+
+SF="$D/.heimdall/app/connect.json"
+A6_WAITED=0
+while [ ! -f "$SF" ] && [ "$A6_WAITED" -lt 50 ]; do
+  sleep 0.2
+  A6_WAITED=$((A6_WAITED + 1))
+done
+
+if [ -f "$SF" ]; then
+  A6_UI_PID="$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)"
+  # heimdall-app's UI_OUT is an internal, unexported mktemp path -- macOS's
+  # native mktemp ignores $TMPDIR for a template-less call (confirmed
+  # empirically: TMPDIR=/tmp mktemp still lands under the Darwin per-user
+  # temp dir, never under the requested TMPDIR), so a before/after directory
+  # listing diff under $TMPROOT can never find it. Resolve it directly
+  # instead, the same way test/heimdall-ui.test.sh:424 confirms a listening
+  # port -- via lsof against the live process -- here its stdout fd (1),
+  # which is exactly where connect redirects UI_OUT.
+  if command -v lsof >/dev/null 2>&1 && [ -n "$A6_UI_PID" ]; then
+    UI_OUT_PATH="$(lsof -a -p "$A6_UI_PID" -d 1 -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+    if [ -n "$UI_OUT_PATH" ] && [ -f "$UI_OUT_PATH" ]; then
+      MODE="$(stat -f '%Lp' "$UI_OUT_PATH" 2>/dev/null || stat -c '%a' "$UI_OUT_PATH" 2>/dev/null)"
+      [ "$MODE" = "600" ] && ok "A6. ui log temp file created with mode 0600" || bad "A6. ui log temp file mode=$MODE (want 600): $UI_OUT_PATH"
+    else
+      bad "A6. lsof found no resolvable stdout path for ui pid $A6_UI_PID"
+    fi
+  else
+    ok "A6. (skipped: no lsof, or no ui pid to inspect)"
+  fi
+  kill -TERM "$A6_FG_PID" 2>/dev/null
+  wait "$A6_FG_PID" 2>/dev/null
+else
+  bad "A6. setup: foreground connect never wrote a state file within 10s: $(cat "$OUT_FILE" 2>/dev/null)"
+  kill "$A6_FG_PID" 2>/dev/null
+  wait "$A6_FG_PID" 2>/dev/null
+fi
+rm -rf "$D"
+
+# ── A6. die-race stderr redacts the token instead of raw-catting it ──────
+FAKE_UI_DIES="$TMPROOT/fake-ui-dies.sh"
+cat > "$FAKE_UI_DIES" <<'EOF'
+#!/usr/bin/env bash
+echo "hmd-ui: fatal startup error, last known token=SECRETVALUE12345 discarded" >&2
+exit 1
+EOF
+chmod +x "$FAKE_UI_DIES"
+
+D="$(make_repo)"
+ERR_FILE="$TMPROOT/connect-a6-race.err"
+OUT_FILE="$TMPROOT/connect-a6-race.out"
+HEIMDALL_UI_BIN="$FAKE_UI_DIES" FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>"$ERR_FILE"
+RC=$?
+[ "$RC" -eq 6 ] && ok "A6. connect w/ a ui that dies before printing a URL exits 6" || bad "exit $RC (want 6): $(cat "$ERR_FILE")"
+if grep -q 'SECRETVALUE12345' "$ERR_FILE"; then
+  bad "A6. die-race stderr LEAKS the raw token: $(cat "$ERR_FILE")"
+else
+  ok "A6. die-race stderr never contains the raw token"
+fi
+grep -q 'token=<redacted>' "$ERR_FILE" && ok "A6. die-race stderr shows the redacted placeholder instead" || bad "$(cat "$ERR_FILE")"
+rm -rf "$D"
+
+# ── A12. DNSName is validated before use as --allow-host ─────────────────
+D="$(make_repo)"
+OUT="$(FAKE_TS_DNSNAME='evil.example.com' FAKE_TS_MODE=online-with-DNSName "$APP" connect --repo "$D" --bg --port 0 2>&1)"; RC=$?
+[ "$RC" -eq 5 ] && ok "A12. connect w/ a non-ts.net DNSName exits 5" || bad "exit $RC (want 5): $OUT"
+printf '%s' "$OUT" | grep -qF 'evil.example.com' && ok "A12. bad-DNSName error quotes the offending value" || bad "$OUT"
+[ ! -f "$D/.heimdall/app/connect.json" ] && ok "A12. no state file written on bad-DNSName failure" || bad "state file leaked"
+rm -rf "$D"
+
+D="$(make_repo)"
+OUT="$(FAKE_TS_DNSNAME='bad host.ts.net' FAKE_TS_MODE=online-with-DNSName "$APP" connect --repo "$D" --bg --port 0 2>&1)"; RC=$?
+[ "$RC" -eq 5 ] && ok "A12. connect w/ a DNSName containing a space exits 5" || bad "exit $RC (want 5): $OUT"
+rm -rf "$D"
+
+# ── A14. disconnect never kills a pid that isn't actually heimdall-ui ────
+D="$(make_repo)"
+sleep 60 &
+SLEEP_PID=$!
+PIDS+=("$SLEEP_PID")
+mkdir -p "$D/.heimdall/app"
+cat > "$D/.heimdall/app/connect.json" <<JSON
+{"pid_ui": $SLEEP_PID, "port": 9999, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
+JSON
+OUT="$(FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "A14. disconnect w/ a non-heimdall-ui pid in state file still exits 0" || bad "exit $RC: $OUT"
+if kill -0 "$SLEEP_PID" 2>/dev/null; then
+  ok "A14. disconnect does NOT kill a pid whose command isn't heimdall-ui (recycled-pid guard)"
+else
+  bad "A14. disconnect killed an unrelated sleep process -- pid-identity guard missing"
+fi
+printf '%s' "$OUT" | grep -qi 'not a heimdall-ui process' && ok "A14. disconnect warns when skipping a non-matching pid" || bad "$OUT"
+kill "$SLEEP_PID" 2>/dev/null
+wait "$SLEEP_PID" 2>/dev/null
 rm -rf "$D"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

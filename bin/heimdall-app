@@ -13,11 +13,15 @@
 #   hmd app connect [--repo DIR] [--port N] [--https-port 443|8443|10000]
 #                    [--no-install] [--bg]
 #                              Ensure tailscale is installed and online, start
-#                              `hmd ui` on loopback, then `tailscale funnel` it
-#                              to the public internet. Prints the pairing URL,
-#                              a QR code of that URL, and the exposure warning,
-#                              then waits in the foreground -- Ctrl-C (or a
-#                              TERM) tears down the funnel, the ui process, and
+#                              `hmd ui` on loopback (fixed port 8710 unless
+#                              --port says otherwise -- exit 6 if that port is
+#                              busy rather than silently picking another), then
+#                              `tailscale funnel` it to the public internet. A
+#                              funnel already up from a previous session is
+#                              torn down first. Prints the pairing URL, a QR
+#                              code of that URL, and the exposure warning,
+#                              then waits in the foreground -- Ctrl-C, TERM, or
+#                              HUP tears down the funnel, the ui process, and
 #                              the state file. --bg returns immediately instead
 #                              of waiting, leaving both running (tear down
 #                              later with `hmd app disconnect`).
@@ -26,11 +30,15 @@
 #                              the state file's contents, the public URL with
 #                              its token REDACTED, and the pending companion-
 #                              inbox count. Never touches or requires the real
-#                              token.
+#                              token. Exits nonzero and prints ORPHANED FUNNEL
+#                              if the funnel is still up but its ui process is
+#                              gone or was never on record.
 #   hmd app disconnect [--repo DIR]
 #                              Stop the funnel, kill the `hmd ui` this started,
 #                              remove the state file. Idempotent: a second call
-#                              with nothing connected still exits 0.
+#                              with nothing connected still exits 0 -- and even
+#                              then a funnel-stop is always attempted, so a
+#                              funnel never outlives this command.
 #   hmd app doctor [--repo DIR] [--https-port 443|8443|10000]
 #                              One line per check, a fix hint on every failure.
 #                              Exits 0 only if every check passes.
@@ -38,10 +46,11 @@
 #
 # Exit codes (connect): 64 bad --https-port, 4 tailscale not installed
 # (declined the install prompt, or --no-install), 5 tailscale installed but
-# not online, 3 the tailnet's policy blocks Funnel (HTTPS certs / the Funnel
-# node attribute aren't granted -- the CLI's own hint is printed VERBATIM on
-# stderr, per hmd_tailscale.sh's ts_funnel_start contract), 6 `hmd ui` did not
-# come up in time, 2 a required file/flag is missing or malformed.
+# not online, or its DNSName fails validation, 3 the tailnet's policy blocks
+# Funnel (HTTPS certs / the Funnel node attribute aren't granted -- the CLI's
+# own hint is printed VERBATIM on stderr, per hmd_tailscale.sh's
+# ts_funnel_start contract), 6 `hmd ui` did not come up in time (including a
+# busy fixed port), 2 a required file/flag/tool is missing or malformed.
 #
 # State file: <repo>/.heimdall/app/connect.json
 #   {"pid_ui": N, "port": N, "https_port": N, "host": "...", "started_at": "..."}
@@ -105,6 +114,7 @@ fi
 # immediately" -- here the "caller" is the trap itself, not another function.
 UI_PID=""
 HTTPS_PORT=""
+ACTUAL_PORT=""
 FUNNEL_UP=false
 STATE_WRITTEN=false
 STATE_FILE=""
@@ -115,7 +125,10 @@ cleanup() {
   [ "$CLEANED_UP" = true ] && return 0
   CLEANED_UP=true
   if [ "$FUNNEL_UP" = true ] && [ -n "$HTTPS_PORT" ]; then
-    ts_funnel_stop "$HTTPS_PORT" >/dev/null 2>&1 || true
+    # A11/A13 (bin/lib/hmd_tailscale.sh D6): pass hmd's own backend port so
+    # ts_funnel_stop can recognize its own target instead of conservatively
+    # refusing (exit 7) to reset when it can't tell "mine" from "foreign".
+    ts_funnel_stop "$HTTPS_PORT" "$ACTUAL_PORT" >/dev/null 2>&1 || true
   fi
   if [ -n "$UI_PID" ] && kill -0 "$UI_PID" 2>/dev/null; then
     kill "$UI_PID" >/dev/null 2>&1 || true
@@ -139,8 +152,50 @@ resolve_repo_value() {
   pwd
 }
 
+# A14: verify a pid is actually one of ours before signaling it. A bare
+# `kill -0 $pid` only proves SOME process holds that number -- pids recycle,
+# so a stale state file can point at an unrelated process the OS handed the
+# same number to later. Same `ps -o command=` / `comm=` fallback idiom as
+# bin/heimdall-gc:175. heimdall-ui execs into sentinels/hmd-ui.py partway
+# through startup (see bin/heimdall-ui), so a live process shows either name
+# depending on how far it got.
+_pid_is_heimdall_ui() {
+  local pid="$1" cmd
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(ps -o command= -p "$pid" 2>/dev/null || ps -o comm= -p "$pid" 2>/dev/null || true)"
+  case "$cmd" in
+    *heimdall-ui*|*hmd-ui.py*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A4: "is a public funnel actually configured right now" -- real
+# `tailscale funnel status --json` (and the legacy `serve status --json`
+# fallback) reports an empty `{}` object under Funnel/Serve when nothing is
+# exposed, and a populated one when something is. $1, if given, is an
+# already-fetched ts_funnel_status_json payload (cmd_status has one on hand);
+# omitted, this fetches its own.
+_funnel_looks_up() {
+  local json="${1:-}"
+  if [ -z "$json" ]; then
+    json="$(ts_funnel_status_json 2>/dev/null)" || return 1
+  fi
+  printf '%s' "$json" | jq -e '
+    (.Funnel // {} | length > 0) or (.Serve // {} | length > 0)
+  ' >/dev/null 2>&1
+}
+
+# A6: print a file to stderr with any pairing token redacted. heimdall-ui's
+# own stdout/stderr can legitimately contain the live token it just minted
+# (it is the process that owns it), so any path that surfaces this file's
+# contents on a failure must never echo it raw.
+_print_redacted() {
+  sed -E 's/token=[^ &"]+/token=<redacted>/g' "$1" 2>/dev/null || true
+}
+
 cmd_connect() {
-  local REPO="" PORT="0" NO_INSTALL=false BG=false
+  local REPO="" PORT="8710" NO_INSTALL=false BG=false
   HTTPS_PORT="443"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -203,11 +258,51 @@ cmd_connect() {
     echo "hmd app connect: tailscale is online but has no DNSName yet -- wait a few seconds and retry, or check 'tailscale status'" >&2
     return 5
   fi
+  # A12: DNSName comes back from `tailscale status`, an external process --
+  # it becomes an --allow-host value passed straight to heimdall-ui, so it is
+  # validated as a trust-boundary input, not assumed well-formed.
+  if ! printf '%s' "$host" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.ts\.net$'; then
+    echo "hmd app connect: tailscale returned a DNSName that fails validation: '$host'" >&2
+    return 5
+  fi
+
+  # A4(d): a funnel can already be up from a session this repo's state file
+  # no longer knows about (a crash, a manual rm, a prior bug) -- connect must
+  # never layer a new funnel on top of a stale one.
+  if _funnel_looks_up; then
+    echo "hmd app connect: a funnel from a previous session is still up -- tearing it down first" >&2
+    # A11/A13: the stale session's own backend port, if this repo's state
+    # file still names one -- lets ts_funnel_stop recognize it as hmd's own
+    # target rather than conservatively refusing (exit 7) to reset it. Same
+    # empty-on-miss jq idiom as cmd_disconnect/cmd_status below; no -f guard
+    # needed since jq's own "file not found" stderr is redirected away and
+    # an empty result behaves identically to the port being unknown.
+    local stale_port=""
+    stale_port="$(jq -r '.port // empty' "$REPO/.heimdall/app/connect.json" 2>/dev/null)"
+    ts_funnel_stop "$HTTPS_PORT" "$stale_port" >/dev/null 2>&1 || true
+  fi
 
   mkdir -p "$REPO/.heimdall/app" 2>/dev/null || true
   STATE_FILE="$REPO/.heimdall/app/connect.json"
 
-  UI_OUT="$(mktemp 2>/dev/null || echo "/tmp/hmd-app-ui.$$.out")"
+  # A6: mktemp is required, not best-effort -- the old fallback
+  # (/tmp/hmd-app-ui.$$.out) is a predictable, symlink-plantable path. umask
+  # 077 while it's created means the file is 0600 even if mktemp's own
+  # default were ever looser than that on some platform.
+  if ! command -v mktemp >/dev/null 2>&1; then
+    echo "hmd app connect: required tool missing: mktemp" >&2
+    return 2
+  fi
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  UI_OUT="$(mktemp)"
+  local mktemp_rc=$?
+  umask "$old_umask"
+  if [ "$mktemp_rc" -ne 0 ] || [ -z "$UI_OUT" ]; then
+    echo "hmd app connect: mktemp failed to create a temp file" >&2
+    return 2
+  fi
   (
     cd "$REPO" 2>/dev/null || exit 2
     HEIMDALL_WATCH_ROOT="$REPO" exec "$UI_BIN" --repo "$REPO" --port "$PORT" --no-open --allow-host "$host" --trust-proxy
@@ -217,6 +312,7 @@ cmd_connect() {
   # From here on, teardown must happen even on Ctrl-C / kill / normal exit.
   trap 'cleanup; exit 130' INT
   trap 'cleanup; exit 143' TERM
+  trap 'cleanup; exit 129' HUP
   trap cleanup EXIT
 
   local url_re='^http://127\.0\.0\.1:[0-9]+/\?token='
@@ -224,7 +320,7 @@ cmd_connect() {
   while [ "$waited" -lt 100 ]; do
     if ! kill -0 "$UI_PID" 2>/dev/null; then
       echo "hmd app connect: heimdall-ui exited before it started listening:" >&2
-      cat "$UI_OUT" >&2 2>/dev/null || true
+      _print_redacted "$UI_OUT" >&2
       return 6
     fi
     url_line="$(grep -E "$url_re" "$UI_OUT" 2>/dev/null | head -1)"
@@ -234,13 +330,14 @@ cmd_connect() {
   done
   if [ -z "$url_line" ]; then
     echo "hmd app connect: heimdall-ui did not print a URL within 10s:" >&2
-    cat "$UI_OUT" >&2 2>/dev/null || true
+    _print_redacted "$UI_OUT" >&2
     return 6
   fi
 
   local actual_port token
   actual_port="$(printf '%s' "$url_line" | sed -E 's#^http://127\.0\.0\.1:([0-9]+)/.*#\1#')"
   token="$(printf '%s' "$url_line" | sed -E 's#^[^?]*\?token=##')"
+  ACTUAL_PORT="$actual_port"
 
   ts_funnel_start "$actual_port" "$HTTPS_PORT"
   local frc=$?
@@ -275,7 +372,9 @@ cmd_connect() {
   echo "  $pub_url"
   echo ""
   if [ -n "$PY3" ] && [ -r "$QR_PY" ]; then
-    "$PY3" "$QR_PY" "$pub_url" --ascii || true
+    # A5: the pairing URL (with its live token) goes on stdin, never argv --
+    # argv is visible to any local user via `ps`, stdin is not.
+    printf '%s' "$pub_url" | "$PY3" "$QR_PY" --ascii || true
     echo ""
   fi
   echo "WARNING: this URL is reachable from the public internet. Anyone who has"
@@ -336,6 +435,7 @@ cmd_status() {
   fi
 
   local state_file="$REPO/.heimdall/app/connect.json"
+  local orphaned=false
   if [ -f "$state_file" ]; then
     local host port https_port pid_ui started_at alive
     host="$(jq -r '.host // empty' "$state_file" 2>/dev/null)"
@@ -344,7 +444,7 @@ cmd_status() {
     pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
     started_at="$(jq -r '.started_at // empty' "$state_file" 2>/dev/null)"
     alive="not running"
-    [ -n "$pid_ui" ] && kill -0 "$pid_ui" 2>/dev/null && alive="running"
+    _pid_is_heimdall_ui "$pid_ui" && alive="running"
     echo "connected: yes"
     echo "  ui pid: ${pid_ui:-?} ($alive)"
     echo "  local port: ${port:-?}"
@@ -358,8 +458,21 @@ cmd_status() {
         echo "  public URL: https://$host:$https_port/?token=<redacted>"
       fi
     fi
+    # A4(c): the ui process is the only thing that can ever tear the funnel
+    # down again (cmd_disconnect reads its pid from this same state file) --
+    # once it's gone, a funnel that's still up is orphaned: publicly
+    # reachable with no local process left that a normal disconnect would
+    # find anything to kill for.
+    if [ "$alive" = "not running" ] && _funnel_looks_up; then
+      orphaned=true
+      echo "ORPHANED FUNNEL -- ui process is gone but the tailnet funnel is still up. Run: hmd app disconnect" >&2
+    fi
   else
     echo "connected: no"
+    if _funnel_looks_up; then
+      orphaned=true
+      echo "ORPHANED FUNNEL -- no connect state on record but the tailnet funnel is still up. Run: hmd app disconnect" >&2
+    fi
   fi
 
   if [ -x "$INBOX_DELIVER_BIN" ]; then
@@ -369,6 +482,7 @@ cmd_status() {
     echo "inbox pending: ${pending:-0}"
   fi
 
+  [ "$orphaned" = true ] && return 1
   return 0
 }
 
@@ -387,18 +501,27 @@ cmd_disconnect() {
   local state_file="$REPO/.heimdall/app/connect.json"
 
   if [ ! -f "$state_file" ]; then
+    # A4(a): a funnel can outlive its state file (crash, a manual rm, a prior
+    # bug) -- disconnect is the one command that guarantees no funnel
+    # survives it, so it always attempts a stop, never conditional on state.
+    ts_funnel_stop 443 >/dev/null 2>&1 || true
     echo "hmd app disconnect: not connected (no state file)"
     return 0
   fi
 
-  local pid_ui https_port
+  local pid_ui https_port port
   pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
   https_port="$(jq -r '.https_port // empty' "$state_file" 2>/dev/null)"
+  port="$(jq -r '.port // empty' "$state_file" 2>/dev/null)"
   [ -n "$https_port" ] || https_port=443
 
-  ts_funnel_stop "$https_port" >/dev/null 2>&1 || true
+  # A11/A13: pass hmd's own backend port so ts_funnel_stop recognizes its
+  # own target instead of conservatively refusing (exit 7) to reset it.
+  ts_funnel_stop "$https_port" "$port" >/dev/null 2>&1 || true
 
-  if [ -n "$pid_ui" ] && kill -0 "$pid_ui" 2>/dev/null; then
+  # A14: verify identity before signaling -- a recycled pid must never take
+  # an unrelated process down with it.
+  if _pid_is_heimdall_ui "$pid_ui"; then
     kill "$pid_ui" 2>/dev/null || true
     local waited=0
     while kill -0 "$pid_ui" 2>/dev/null && [ "$waited" -lt 30 ]; do
@@ -406,6 +529,8 @@ cmd_disconnect() {
       waited=$((waited + 1))
     done
     kill -9 "$pid_ui" 2>/dev/null || true
+  elif [ -n "$pid_ui" ] && kill -0 "$pid_ui" 2>/dev/null; then
+    echo "hmd app disconnect: pid $pid_ui in state file is not a heimdall-ui process -- not killing it" >&2
   fi
 
   rm -f "$state_file" 2>/dev/null || true
