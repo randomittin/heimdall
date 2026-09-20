@@ -11,17 +11,30 @@
 #     NAME:<any numeric port> match exactly, case-insensitive, no wildcard/suffix
 #     matching; bind stays 127.0.0.1; default (no flag) behaviour is byte-for-byte
 #     unchanged                                                                (D3)
-#   - --trust-proxy: per-IP accounting (backoff) uses X-Forwarded-For's first value
-#     ONLY when the flag is set AND the header is present; otherwise the socket
-#     peer, with X-Forwarded-* ignored entirely when the flag is absent        (D2/D3)
+#   - --trust-proxy: per-IP accounting (backoff) uses X-Forwarded-For's LAST value --
+#     the one the trusted hop itself appended -- ONLY when the flag is set AND the
+#     header is present; otherwise the socket peer, with X-Forwarded-* ignored
+#     entirely when the flag is absent                                     (D2/D3, A1)
 #   - per-IP backoff: 5 auth failures (401 from a presented-but-wrong token, or any
 #     403) inside a rolling 60s window -> 429 + `Retry-After: 30` header + body
 #     {"error":"backoff","retry_after_s":30}, on EVERY route incl. /api/send and
-#     /api/events; a successful auth resets the count                          (D2)
+#     /api/events. A request presenting the CORRECT token is NEVER denied by this,
+#     even while its ip is presently locked -- lockout exists to slow a guesser, not
+#     to lock out the legitimate phone behind a shared carrier NAT, a spoofed XFF, or
+#     a --trust-proxy-off peer collision; a successful auth also resets the count
+#                                                                             (D2, A7)
 #   - /api/state gains "transport": {"bind":"loopback","public_host":<name>|null,
 #     "trust_proxy":bool}, additive only
 #   - the startup banner names the allowed public hostname + an exposure warning
 #     when --allow-host is set, and prints neither when it is not
+#   - A2: UIHandler.timeout=10s bounds the pre-auth header read (an idle connection
+#     that sends nothing is closed within it); MAX_CONNECTIONS=64 caps concurrent
+#     connections server-wide; MAX_SSE_STREAMS=8 caps concurrent /api/events streams
+#     specifically -> 503 + `Retry-After: 5` past that narrower cap
+#   - A9: when --allow-host is set, /api/state.repo and out-of-repo edits.paths
+#     entries become basenames, and every roster/ledger.team string is scrubbed of
+#     email-shaped substrings and absolute paths; loopback output is byte-for-byte
+#     unaffected (the redaction is gated strictly on transport.public_host)
 #
 # Hermetic: HOME/HEIMDALL_HOME redirected to a temp dir. Every server this file
 # starts is its OWN process on its OWN port -- in-memory backoff state must never
@@ -67,6 +80,10 @@ export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 FIX="$TMPROOT/fixture-repo"
 mkdir -p "$HOME/.claude" "$FIX"
+# hmd-ui's resolve_root() canonicalises via os.path.realpath, which on macOS resolves
+# /var (and /tmp) through their /private symlink; comparing a raw $FIX would then
+# never match a real "repo" field even on an entirely unredacted, correct response.
+FIX_REAL="$(cd "$FIX" && pwd -P)"
 
 PIDS=()
 cleanup() {
@@ -229,30 +246,35 @@ else
   bad "15. banner missing/wrong; server output:"; sed 's/^/       | /' "$OUT_T"
 fi
 
-# 5 bad-token attempts carrying a spoofed XFF chain; under --trust-proxy the FIRST
-# XFF value (10.9.8.7) is what gets accounted, not the real peer.
-rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.7, 127.0.0.1" "$BASE_T/api/state?token=$BADTOK")"
-if [ "$rc" = "401" ]; then ok "16a. XFF-attributed bad-token attempt 1 -> 401"
+# 6 bad-token attempts carrying a spoofed XFF chain whose FIRST value (attacker-
+# controlled) changes on every request; under --trust-proxy only the LAST value
+# (9.9.9.9 -- the one a real single trusted hop would itself append) is what gets
+# accounted (A1). If the first value were still trusted, each of these would look
+# like a distinct, never-before-seen ip and none of them would ever lock.
+rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.7, 9.9.9.9" "$BASE_T/api/state?token=$BADTOK")"
+if [ "$rc" = "401" ]; then ok "16a. XFF-attributed bad-token attempt 1 (first hop 10.9.8.7) -> 401"
 else bad "16a. XFF-attributed bad-token attempt 1 -> $rc, expected 401"; fi
-rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.7, 127.0.0.1" "$BASE_T/api/state?token=$BADTOK")"
-if [ "$rc" = "401" ]; then ok "16b. XFF-attributed bad-token attempt 2 -> 401"
+rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.8, 9.9.9.9" "$BASE_T/api/state?token=$BADTOK")"
+if [ "$rc" = "401" ]; then ok "16b. XFF-attributed bad-token attempt 2 (first hop varied to 10.9.8.8) -> 401"
 else bad "16b. XFF-attributed bad-token attempt 2 -> $rc, expected 401"; fi
-rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.7, 127.0.0.1" "$BASE_T/api/state?token=$BADTOK")"
-if [ "$rc" = "401" ]; then ok "16c. XFF-attributed bad-token attempt 3 -> 401"
+rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.9, 9.9.9.9" "$BASE_T/api/state?token=$BADTOK")"
+if [ "$rc" = "401" ]; then ok "16c. XFF-attributed bad-token attempt 3 (first hop varied to 10.9.8.9) -> 401"
 else bad "16c. XFF-attributed bad-token attempt 3 -> $rc, expected 401"; fi
-rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.7, 127.0.0.1" "$BASE_T/api/state?token=$BADTOK")"
-if [ "$rc" = "401" ]; then ok "16d. XFF-attributed bad-token attempt 4 -> 401"
+rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.10, 9.9.9.9" "$BASE_T/api/state?token=$BADTOK")"
+if [ "$rc" = "401" ]; then ok "16d. XFF-attributed bad-token attempt 4 (first hop varied to 10.9.8.10) -> 401"
 else bad "16d. XFF-attributed bad-token attempt 4 -> $rc, expected 401"; fi
-rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.7, 127.0.0.1" "$BASE_T/api/state?token=$BADTOK")"
-if [ "$rc" = "401" ]; then ok "16e. XFF-attributed bad-token attempt 5 -> 401"
+rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.11, 9.9.9.9" "$BASE_T/api/state?token=$BADTOK")"
+if [ "$rc" = "401" ]; then ok "16e. XFF-attributed bad-token attempt 5 (first hop varied to 10.9.8.11) -> 401"
 else bad "16e. XFF-attributed bad-token attempt 5 -> $rc, expected 401"; fi
-rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.7, 127.0.0.1" "$BASE_T/api/state?token=$BADTOK")"
-if [ "$rc" = "429" ]; then ok "16f. 6th XFF-attributed bad-token attempt -> 429 (ip=10.9.8.7 locked, --trust-proxy)"
+rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.12, 9.9.9.9" "$BASE_T/api/state?token=$BADTOK")"
+if [ "$rc" = "429" ]; then ok "16f. 6th XFF-attributed bad-token attempt (first hop varied again, 10.9.8.12) -> 429 (ip=9.9.9.9 locked on the LAST value, despite 6 different first values)"
 else bad "16f. 6th XFF-attributed bad-token attempt -> $rc, expected 429"; fi
 
-rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.7, 127.0.0.1" "$BASE_T/api/state?$AUTH_T")"
-if [ "$rc" = "429" ]; then ok "17. locked XFF ip=10.9.8.7: even a GOOD token -> 429 while locked"
-else bad "17. locked XFF ip + good token -> $rc, expected 429"; fi
+# A7: a CORRECT token on an allowed Host is never denied by backoff, even while the
+# ip it maps to (9.9.9.9, the trusted last-hop value) is presently locked out.
+rc="$(code_of -H "Host: demo.tail1234.ts.net" -H "X-Forwarded-For: 10.9.8.7, 9.9.9.9" "$BASE_T/api/state?$AUTH_T")"
+if [ "$rc" = "200" ]; then ok "17. locked XFF ip=9.9.9.9: a GOOD token -> 200 despite the lockout (A7)"
+else bad "17. locked XFF ip + good token -> $rc, expected 200 (A7: correct token bypasses backoff)"; fi
 
 rc="$(code_of -H "Host: demo.tail1234.ts.net" "$BASE_T/api/state?$AUTH_T")"
 if [ "$rc" = "200" ]; then ok "18. same server, request WITHOUT X-Forwarded-For (real peer 127.0.0.1) still passes -> 200"
@@ -287,18 +309,39 @@ else
   bad "19f. 6th bad-token attempt: rc=$rc hdr=$(tr -d '\r' <"$HDR" | grep -i retry-after) body=$(cat "$BODY" 2>/dev/null)"
 fi
 
-rc="$(code_of "$BASE_L1/api/state?$AUTH_L1")"
-if [ "$rc" = "429" ]; then ok "20. locked out: even a VALID token -> 429 (lockout blocks everyone, not just guessers)"
-else bad "20. locked out + good token -> $rc, expected 429"; fi
+# A7: the failure path is untouched -- a BAD token on an ip that is still locked must
+# still be refused by backoff, on every route. Checked BEFORE any good-token request
+# below touches this ip: a successful auth always resets the count (it did before A7
+# too), so proving this AFTER 20/21/22 would only be exercising a fresh, already-
+# unlocked counter, not the lockout these two are meant to test.
+rc="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" \
+      -d '{"text":"x"}' "$BASE_L1/api/send?token=$BADTOK")"
+if [ "$rc" = "429" ]; then ok "19g. POST /api/send while locked out, BAD token -> 429 (failure path gated on every route)"
+else bad "19g. /api/send bad-token while locked -> $rc, expected 429"; fi
 
+rc="$(curl -s -m 2 -o /dev/null -w '%{http_code}' "$BASE_L1/api/events?token=$BADTOK")"
+if [ "$rc" = "429" ]; then ok "19h. GET /api/events while locked out, BAD token -> 429 (failure path gated on every route)"
+else bad "19h. /api/events bad-token while locked -> $rc, expected 429"; fi
+
+# A7: reversed from the old "lockout blocks everyone" semantics -- a request
+# presenting the CORRECT token must NEVER be denied by backoff, since backoff exists
+# to slow a guesser, not to lock out the legitimate phone sharing an ip with one.
+rc="$(code_of "$BASE_L1/api/state?$AUTH_L1")"
+if [ "$rc" = "200" ]; then ok "20. locked out ip, but a VALID token -> 200 (A7: correct token is never denied by backoff)"
+else bad "20. locked out + good token -> $rc, expected 200 (A7)"; fi
+
+# A7, same gate on /api/send -- by this point 20's successful auth already reset this
+# ip's count (a successful auth always does, so the lockout genuinely is gone now),
+# which is exactly why 19g proved the failure path on this same route FIRST: this
+# shows the route was never itself what gated it, not that this ip is still locked.
 rc="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" \
       -d '{"text":"x"}' "$BASE_L1/api/send?$AUTH_L1")"
-if [ "$rc" = "429" ]; then ok "21. POST /api/send while locked out -> 429 (same gate, every route)"
-else bad "21. /api/send while locked out -> $rc, expected 429"; fi
+if [ "$rc" = "202" ]; then ok "21. POST /api/send with a good token -> 202 (A7: same gate, every route)"
+else bad "21. /api/send with a good token -> $rc, expected 202 (A7)"; fi
 
 rc="$(curl -s -m 2 -o /dev/null -w '%{http_code}' "$BASE_L1/api/events?$AUTH_L1")"
-if [ "$rc" = "429" ]; then ok "22. GET /api/events while locked out -> 429 (same gate, every route)"
-else bad "22. /api/events while locked out -> $rc, expected 429"; fi
+if [ "$rc" = "200" ]; then ok "22. GET /api/events with a good token -> 200 (A7: same gate, every route)"
+else bad "22. /api/events with a good token -> $rc, expected 200 (A7)"; fi
 
 # ═══ Group E -- XFF ignored entirely without --trust-proxy (SRV_LOCKOUT_NOTRUST) ═
 launch_server lockout-notrust || exit 1
@@ -323,9 +366,12 @@ rc="$(code_of -H "X-Forwarded-For: 10.9.8.7" "$BASE_L2/api/state?token=$BADTOK")
 if [ "$rc" = "429" ]; then ok "23f. 6th bad-token+XFF attempt -> 429 (counting still works with XFF present but untrusted)"
 else bad "23f. 6th bad-token+XFF attempt -> $rc, expected 429"; fi
 
+# A7: same bypass as test 20, reached via a different route -- --trust-proxy is OFF
+# here, so the real peer (127.0.0.1) is what got locked (XFF was never trusted), but
+# a request presenting the CORRECT token is still never denied by that lockout.
 rc="$(code_of "$BASE_L2/api/state?$AUTH_L2")"
-if [ "$rc" = "429" ]; then ok "24. without --trust-proxy, XFF was ignored: the real peer (127.0.0.1) got locked, not the fake XFF ip -- a good token with NO XFF header still gets 429"
-else bad "24. without --trust-proxy, real peer should be locked -> $rc, expected 429"; fi
+if [ "$rc" = "200" ]; then ok "24. without --trust-proxy, real peer (127.0.0.1) is locked, but a good token with NO XFF header -> 200 (A7)"
+else bad "24. without --trust-proxy, good token should bypass the peer's lockout -> $rc, expected 200 (A7)"; fi
 
 # ═══ Group F -- a successful auth resets the counter (SRV_RESET, no flags) ══
 launch_server reset || exit 1
@@ -360,6 +406,114 @@ else bad "26c. post-reset bad-token attempt 3 -> $rc, expected 401"; fi
 rc="$(code_of "$BASE_R/api/state?token=$BADTOK")"
 if [ "$rc" = "401" ]; then ok "26d. post-reset bad-token attempt 4 -> still plain 401, NOT 429 (proves the reset in 25e actually happened -- had it not, cumulative failures would be 4+4=8 and this request would already be locked)"
 else bad "26d. post-reset bad-token attempt 4 -> $rc, expected 401 (reset must have failed)"; fi
+
+# ═══ Group G -- A2: connection/stream caps + pre-auth header-read timeout ═══
+launch_server caps || exit 1
+PORT_G="$PORT"; BASE_G="$BASE"; AUTH_G="$AUTH"
+
+# Hold MAX_SSE_STREAMS(8) concurrent /api/events connections open; a 9th, while all
+# 8 are still held, must be refused with 503 + Retry-After: 5 instead of queued or
+# left to hang -- a cap strictly narrower than the server-wide connection cap.
+SSE_PIDS=()
+sse_i=1
+while [ "$sse_i" -le 8 ]; do
+  curl -s -N --max-time 6 -o /dev/null "$BASE_G/api/events?$AUTH_G" 2>/dev/null &
+  SSE_PIDS+=("$!")
+  sse_i=$((sse_i + 1))
+done
+PIDS+=("${SSE_PIDS[@]}")
+
+# Give the 8 held streams time to actually clear _gate_then and acquire their
+# semaphore slot (each is a real handshake) before the 9th is sent, so the cap is
+# measured with all 8 slots genuinely occupied, not raced against connection setup.
+sleep 1
+
+HDR9="$TMPROOT/sse-9.hdr"; BODY9="$TMPROOT/sse-9.json"
+rc9="$(curl -s -D "$HDR9" -o "$BODY9" -w '%{http_code}' "$BASE_G/api/events?$AUTH_G")"
+if [ "$rc9" = "503" ] && grep -qi '^retry-after: *5' "$HDR9" \
+   && jq -e '.error=="too-many-streams" and .retry_after_s==5' "$BODY9" >/dev/null 2>&1; then
+  ok "27. 9th concurrent /api/events past MAX_SSE_STREAMS(8) -> 503, Retry-After: 5, body {\"error\":\"too-many-streams\",\"retry_after_s\":5}"
+else
+  bad "27. 9th concurrent /api/events: rc=$rc9 hdr=$(tr -d '\r' <"$HDR9" 2>/dev/null | grep -i retry-after) body=$(cat "$BODY9" 2>/dev/null)"
+fi
+
+for p in "${SSE_PIDS[@]}"; do kill "$p" 2>/dev/null; done
+for p in "${SSE_PIDS[@]}"; do wait "$p" 2>/dev/null; done
+
+# A2: a pre-auth connection that sends nothing at all must not park a thread
+# forever -- UIHandler.timeout (10s) bounds the header read, so the socket is closed
+# by the server itself well inside a generous margin above it. Measured with a raw
+# socket that never sends an HTTP request line at all.
+IDLE_ELAPSED="$(python3 - "$PORT_G" <<'PYEOF'
+import socket, sys, time
+port = int(sys.argv[1])
+s = socket.create_connection(("127.0.0.1", port), timeout=25)
+s.settimeout(25)
+start = time.monotonic()
+try:
+    data = s.recv(1)   # blocks until the server closes it (EOF -> b"") or we time out
+except socket.timeout:
+    data = None
+elapsed = time.monotonic() - start
+s.close()
+print(elapsed if data == b"" else -1)
+PYEOF
+)"
+if python3 -c "import sys; v=float('$IDLE_ELAPSED'); sys.exit(0 if 0 <= v <= 18 else 1)" 2>/dev/null; then
+  ok "28. idle pre-auth connection (no request ever sent) closed by the server within 18s (elapsed=${IDLE_ELAPSED}s) -- slow-loris bound"
+else
+  bad "28. idle pre-auth connection: elapsed=${IDLE_ELAPSED}s (expected a server-initiated close, 0-18s)"
+fi
+
+# ═══ Group H -- A9: public-mode redaction of /api/state (SRV_HOST, --allow-host) ═
+# A roster row whose "handle" is email-shaped and whose "project" is an absolute
+# path -- exactly the two shapes _scrub_public_string exists to strip -- so 29-31
+# exercise the real redaction logic rather than an incidentally-empty roster.
+mkdir -p "$FIX/.heimdall"
+cat > "$FIX/.heimdall/roster-cache.json" <<'JSON'
+[{"haid":"haid:fixture.box-0001","handle":"alice@example.com","branch":"main",
+  "project":"/Users/alice/work/fixture-repo","state":"active","verdict":"pass",
+  "online":true,"age_seconds":1.0}]
+JSON
+
+BODY="$TMPROOT/state-h-public.json"
+rc="$(curl -s -o "$BODY" -w '%{http_code}' -H "Host: demo.tail1234.ts.net" "$BASE_H/api/state?$AUTH_H")"
+REPO_PUB="$(jq -r '.repo // empty' "$BODY" 2>/dev/null)"
+if [ "$rc" = "200" ] && [ -n "$REPO_PUB" ] && ! printf '%s' "$REPO_PUB" | grep -q '/'; then
+  ok "29. public mode (--allow-host): /api/state.repo is a basename, no '/' (repo=$REPO_PUB) (A9)"
+else
+  bad "29. public mode .repo: rc=$rc repo=$REPO_PUB"
+fi
+
+ROSTER_PUB="$(jq -c '.roster' "$BODY" 2>/dev/null)"
+if [ "$rc" = "200" ] && ! printf '%s' "$ROSTER_PUB" | grep -q '@'; then
+  ok "30. public mode (--allow-host): no '@' appears anywhere in /api/state.roster (roster=$ROSTER_PUB) (A9)"
+else
+  bad "30. public mode .roster: rc=$rc roster=$ROSTER_PUB"
+fi
+
+EDITS_PUB="$(jq -r '.edits.paths[]? // empty' "$BODY" 2>/dev/null)"
+if [ "$rc" = "200" ] && ! printf '%s\n' "$EDITS_PUB" | grep -q '^/'; then
+  ok "31. public mode (--allow-host): /api/state.edits.paths has no leading '/' entries (A9)"
+else
+  bad "31. public mode .edits.paths: rc=$rc paths=$(jq -c '.edits.paths' "$BODY" 2>/dev/null)"
+fi
+
+# Loopback (no --allow-host) must be byte-for-byte unaffected by A9 -- SRV_NOHOST's
+# own repo is the real, absolute $FIX path and its roster keeps its '@' verbatim.
+BODY="$TMPROOT/state-n-loopback.json"
+rc="$(curl -s -o "$BODY" -w '%{http_code}' "$BASE_N/api/state?$AUTH_N")"
+if [ "$rc" = "200" ] && [ "$(jq -r '.repo' "$BODY" 2>/dev/null)" = "$FIX_REAL" ]; then
+  ok "32. loopback (no --allow-host): /api/state.repo is still the full absolute path, unredacted (A9 is gated on public_host)"
+else
+  bad "32. loopback .repo should be unredacted: rc=$rc repo=$(jq -r '.repo' "$BODY" 2>/dev/null), expected $FIX_REAL"
+fi
+
+if [ "$rc" = "200" ] && jq -r '.roster[0].handle // empty' "$BODY" 2>/dev/null | grep -q '@'; then
+  ok "33. loopback (no --allow-host): /api/state.roster is still unredacted (handle keeps its '@') (A9 is gated on public_host)"
+else
+  bad "33. loopback roster should be unredacted: rc=$rc roster=$(jq -c '.roster' "$BODY" 2>/dev/null)"
+fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
