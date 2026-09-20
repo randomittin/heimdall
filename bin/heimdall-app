@@ -1,0 +1,572 @@
+#!/usr/bin/env bash
+# heimdall-app — `hmd app`, Tailscale Funnel publishing for the companion phone app
+# (.planning/plans/PLAN-hmd-app-connect.md, Wave 2).
+#
+# Composes three Wave-1 pieces, never re-implementing their logic:
+#   bin/lib/hmd_tailscale.sh   Tailscale CLI wrapper (ts_bin, ts_status_json,
+#                              ts_online, ts_dns_name, ts_funnel_start/stop,
+#                              ts_install_prompt, ts_login_hint, ...)
+#   bin/lib/hmd_qr.py          stdlib-only QR encoder + terminal renderer
+#   bin/heimdall-ui            the loopback companion web UI this publishes
+#
+# Usage:
+#   hmd app connect [--repo DIR] [--port N] [--https-port 443|8443|10000]
+#                    [--no-install] [--bg]
+#                              Ensure tailscale is installed and online, start
+#                              `hmd ui` on loopback, then `tailscale funnel` it
+#                              to the public internet. Prints the pairing URL,
+#                              a QR code of that URL, and the exposure warning,
+#                              then waits in the foreground -- Ctrl-C (or a
+#                              TERM) tears down the funnel, the ui process, and
+#                              the state file. --bg returns immediately instead
+#                              of waiting, leaving both running (tear down
+#                              later with `hmd app disconnect`).
+#   hmd app status [--repo DIR]
+#                              Tailscale install/online/DNSName, funnel state,
+#                              the state file's contents, the public URL with
+#                              its token REDACTED, and the pending companion-
+#                              inbox count. Never touches or requires the real
+#                              token.
+#   hmd app disconnect [--repo DIR]
+#                              Stop the funnel, kill the `hmd ui` this started,
+#                              remove the state file. Idempotent: a second call
+#                              with nothing connected still exits 0.
+#   hmd app doctor [--repo DIR] [--https-port 443|8443|10000]
+#                              One line per check, a fix hint on every failure.
+#                              Exits 0 only if every check passes.
+#   hmd app -h|--help          This help.
+#
+# Exit codes (connect): 64 bad --https-port, 4 tailscale not installed
+# (declined the install prompt, or --no-install), 5 tailscale installed but
+# not online, 3 the tailnet's policy blocks Funnel (HTTPS certs / the Funnel
+# node attribute aren't granted -- the CLI's own hint is printed VERBATIM on
+# stderr, per hmd_tailscale.sh's ts_funnel_start contract), 6 `hmd ui` did not
+# come up in time, 2 a required file/flag is missing or malformed.
+#
+# State file: <repo>/.heimdall/app/connect.json
+#   {"pid_ui": N, "port": N, "https_port": N, "host": "...", "started_at": "..."}
+# The token is NEVER written here -- it lives only in the one line `hmd ui`
+# printed at startup and inside that process's own memory.
+#
+# Auth model: unchanged from `hmd ui` -- loopback bind, a Host allowlist
+# extended with the Funnel hostname, the per-launch token, and --trust-proxy
+# so the per-IP 401/403 backoff keys off Funnel's X-Forwarded-For. Funnel is a
+# public TLS-terminating reverse proxy: anyone holding the printed URL's token
+# can read this session and post to its inbox. Rotate by disconnecting (Ctrl-C
+# or `hmd app disconnect`) and reconnecting -- that mints a fresh token.
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+
+# Self-extracting help: print the shebang-less leading comment block above, so
+# the usage text lives in exactly one place. No hardcoded line range (compare
+# bin/heimdall-init) -- it just prints comment lines until the first non-#
+# line, which is the blank line right before `set -uo pipefail`.
+usage() { awk 'NR==1{next} /^#/{print; next} {exit}' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+TAILSCALE_LIB="$LIB_DIR/hmd_tailscale.sh"
+if [ ! -r "$TAILSCALE_LIB" ]; then
+  echo "hmd app: required library not found: $TAILSCALE_LIB" >&2
+  exit 2
+fi
+# shellcheck source=lib/hmd_tailscale.sh
+. "$TAILSCALE_LIB"
+
+UI_BIN="${HEIMDALL_UI_BIN:-$BIN_DIR/heimdall-ui}"
+INBOX_DELIVER_BIN="${HEIMDALL_INBOX_DELIVER_BIN:-$BIN_DIR/heimdall-inbox-deliver}"
+QR_PY="$LIB_DIR/hmd_qr.py"
+
+PY3=""
+if [ -r "$LIB_DIR/hmd-python.sh" ]; then
+  # shellcheck source=lib/hmd-python.sh
+  . "$LIB_DIR/hmd-python.sh"
+  PY3="$(hmd_python 2>/dev/null || true)"
+fi
+
+# ── connect()'s teardown state -- GLOBAL on purpose, never `local` ─────────
+# A trap registered inside a function fires later, at actual process exit,
+# after that function has already `return`ed and bash has popped its locals.
+# cleanup() below is called from an EXIT/INT/TERM trap set inside cmd_connect,
+# so every variable it reads must survive past cmd_connect's own return. Same
+# pattern documented in test/heimdall-ui-allowhost.test.sh's launch_server(),
+# which sets PORT/TOKEN/BASE/AUTH/OUT as globals "for the caller to copy out
+# immediately" -- here the "caller" is the trap itself, not another function.
+UI_PID=""
+HTTPS_PORT=""
+FUNNEL_UP=false
+STATE_WRITTEN=false
+STATE_FILE=""
+UI_OUT=""
+CLEANED_UP=false
+
+cleanup() {
+  [ "$CLEANED_UP" = true ] && return 0
+  CLEANED_UP=true
+  if [ "$FUNNEL_UP" = true ] && [ -n "$HTTPS_PORT" ]; then
+    ts_funnel_stop "$HTTPS_PORT" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$UI_PID" ] && kill -0 "$UI_PID" 2>/dev/null; then
+    kill "$UI_PID" >/dev/null 2>&1 || true
+    wait "$UI_PID" 2>/dev/null || true
+  fi
+  if [ "$STATE_WRITTEN" = true ] && [ -n "$STATE_FILE" ]; then
+    rm -f "$STATE_FILE" 2>/dev/null || true
+  fi
+  if [ -n "$UI_OUT" ]; then
+    rm -f "$UI_OUT" 2>/dev/null || true
+  fi
+}
+
+resolve_repo_value() {
+  # $1: --repo flag value, may be empty
+  if [ -n "$1" ]; then printf '%s' "$1"; return 0; fi
+  if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then printf '%s' "$CLAUDE_PROJECT_DIR"; return 0; fi
+  local top
+  top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$top" ]; then printf '%s' "$top"; return 0; fi
+  pwd
+}
+
+cmd_connect() {
+  local REPO="" PORT="0" NO_INSTALL=false BG=false
+  HTTPS_PORT="443"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)
+        REPO="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      --port)
+        PORT="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      --https-port)
+        HTTPS_PORT="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      --no-install) NO_INSTALL=true; shift ;;
+      --bg) BG=true; shift ;;
+      *) echo "hmd app connect: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+  REPO="$(resolve_repo_value "$REPO")"
+
+  case "$HTTPS_PORT" in
+    443|8443|10000) : ;;
+    *)
+      echo "hmd app connect: --https-port must be 443, 8443, or 10000 (got '$HTTPS_PORT')" >&2
+      return 64
+      ;;
+  esac
+
+  if [ ! -x "$UI_BIN" ]; then
+    echo "hmd app connect: heimdall-ui not found at $UI_BIN" >&2
+    return 2
+  fi
+
+  if ! ts_installed; then
+    if [ "$NO_INSTALL" = true ]; then
+      ( HMD_ASSUME_NO=1 ts_install_prompt ) || true
+      return 4
+    fi
+    ts_install_prompt </dev/tty >/dev/null 2>&1 <&- || true
+    if ! ts_installed; then
+      return 4
+    fi
+  fi
+
+  if ! ts_online; then
+    ts_login_hint
+    return 5
+  fi
+
+  local host
+  host="$(ts_dns_name 2>/dev/null || true)"
+  if [ -z "$host" ]; then
+    echo "hmd app connect: tailscale is online but has no DNSName yet -- wait a few seconds and retry, or check 'tailscale status'" >&2
+    return 5
+  fi
+
+  mkdir -p "$REPO/.heimdall/app" 2>/dev/null || true
+  STATE_FILE="$REPO/.heimdall/app/connect.json"
+
+  UI_OUT="$(mktemp 2>/dev/null || echo "/tmp/hmd-app-ui.$$.out")"
+  (
+    cd "$REPO" 2>/dev/null || exit 2
+    HEIMDALL_WATCH_ROOT="$REPO" exec "$UI_BIN" --repo "$REPO" --port "$PORT" --no-open --allow-host "$host" --trust-proxy
+  ) >"$UI_OUT" 2>&1 &
+  UI_PID=$!
+
+  # From here on, teardown must happen even on Ctrl-C / kill / normal exit.
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  trap cleanup EXIT
+
+  local url_re='^http://127\.0\.0\.1:[0-9]+/\?token='
+  local waited=0 url_line=""
+  while [ "$waited" -lt 100 ]; do
+    if ! kill -0 "$UI_PID" 2>/dev/null; then
+      echo "hmd app connect: heimdall-ui exited before it started listening:" >&2
+      cat "$UI_OUT" >&2 2>/dev/null || true
+      return 6
+    fi
+    url_line="$(grep -E "$url_re" "$UI_OUT" 2>/dev/null | head -1)"
+    [ -n "$url_line" ] && break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if [ -z "$url_line" ]; then
+    echo "hmd app connect: heimdall-ui did not print a URL within 10s:" >&2
+    cat "$UI_OUT" >&2 2>/dev/null || true
+    return 6
+  fi
+
+  local actual_port token
+  actual_port="$(printf '%s' "$url_line" | sed -E 's#^http://127\.0\.0\.1:([0-9]+)/.*#\1#')"
+  token="$(printf '%s' "$url_line" | sed -E 's#^[^?]*\?token=##')"
+
+  ts_funnel_start "$actual_port" "$HTTPS_PORT"
+  local frc=$?
+  if [ "$frc" -eq 3 ]; then
+    echo "hmd app connect: run 'hmd app doctor' for diagnostics." >&2
+    return 3
+  elif [ "$frc" -ne 0 ]; then
+    echo "hmd app connect: tailscale funnel failed (exit $frc)" >&2
+    return "$frc"
+  fi
+  FUNNEL_UP=true
+
+  local pub_url
+  if [ "$HTTPS_PORT" = "443" ]; then
+    pub_url="https://$host/?token=$token"
+  else
+    pub_url="https://$host:$HTTPS_PORT/?token=$token"
+  fi
+
+  jq -n \
+    --argjson pid_ui "$UI_PID" \
+    --argjson port "$actual_port" \
+    --argjson https_port "$HTTPS_PORT" \
+    --arg host "$host" \
+    --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{pid_ui: $pid_ui, port: $port, https_port: $https_port, host: $host, started_at: $started_at}' \
+    >"$STATE_FILE" 2>/dev/null
+  [ -s "$STATE_FILE" ] && STATE_WRITTEN=true
+
+  echo ""
+  echo "hmd app: connected -- public URL:"
+  echo "  $pub_url"
+  echo ""
+  if [ -n "$PY3" ] && [ -r "$QR_PY" ]; then
+    "$PY3" "$QR_PY" "$pub_url" --ascii || true
+    echo ""
+  fi
+  echo "WARNING: this URL is reachable from the public internet. Anyone who has"
+  echo "it can read this session and post messages to its inbox. Rotate access"
+  echo "by disconnecting (Ctrl-C, or 'hmd app disconnect') and reconnecting --"
+  echo "that mints a fresh token."
+  echo ""
+
+  if [ "$BG" = true ]; then
+    echo "hmd app: running in background (ui pid $UI_PID). Tear down with: hmd app disconnect"
+    trap - INT TERM EXIT
+    disown "$UI_PID" 2>/dev/null || true
+    rm -f "$UI_OUT" 2>/dev/null || true
+    return 0
+  fi
+
+  echo "hmd app: waiting -- press Ctrl-C to disconnect and stop."
+  local ui_rc=0
+  wait "$UI_PID"
+  ui_rc=$?
+  return "$ui_rc"
+}
+
+cmd_status() {
+  local REPO=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)
+        REPO="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      *) echo "hmd app status: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+  REPO="$(resolve_repo_value "$REPO")"
+
+  if ts_installed; then
+    echo "tailscale installed: yes"
+  else
+    echo "tailscale installed: no"
+  fi
+
+  if ts_online; then
+    echo "tailscale online: yes"
+  else
+    echo "tailscale online: no"
+  fi
+
+  local dns
+  dns="$(ts_dns_name 2>/dev/null || true)"
+  echo "DNSName: ${dns:-(none)}"
+
+  local funnel_json
+  if funnel_json="$(ts_funnel_status_json 2>/dev/null)"; then
+    echo "funnel status: $funnel_json"
+  else
+    echo "funnel status: unavailable"
+  fi
+
+  local state_file="$REPO/.heimdall/app/connect.json"
+  if [ -f "$state_file" ]; then
+    local host port https_port pid_ui started_at alive
+    host="$(jq -r '.host // empty' "$state_file" 2>/dev/null)"
+    port="$(jq -r '.port // empty' "$state_file" 2>/dev/null)"
+    https_port="$(jq -r '.https_port // empty' "$state_file" 2>/dev/null)"
+    pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
+    started_at="$(jq -r '.started_at // empty' "$state_file" 2>/dev/null)"
+    alive="not running"
+    [ -n "$pid_ui" ] && kill -0 "$pid_ui" 2>/dev/null && alive="running"
+    echo "connected: yes"
+    echo "  ui pid: ${pid_ui:-?} ($alive)"
+    echo "  local port: ${port:-?}"
+    echo "  https port: ${https_port:-?}"
+    echo "  host: ${host:-?}"
+    echo "  started at: ${started_at:-?}"
+    if [ -n "$host" ] && [ -n "$https_port" ]; then
+      if [ "$https_port" = "443" ]; then
+        echo "  public URL: https://$host/?token=<redacted>"
+      else
+        echo "  public URL: https://$host:$https_port/?token=<redacted>"
+      fi
+    fi
+  else
+    echo "connected: no"
+  fi
+
+  if [ -x "$INBOX_DELIVER_BIN" ]; then
+    local inbox_json pending
+    inbox_json="$("$INBOX_DELIVER_BIN" status --repo "$REPO" 2>/dev/null)"
+    pending="$(printf '%s' "$inbox_json" | jq -r '.pending // empty' 2>/dev/null)"
+    echo "inbox pending: ${pending:-0}"
+  fi
+
+  return 0
+}
+
+cmd_disconnect() {
+  local REPO=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)
+        REPO="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      *) echo "hmd app disconnect: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+  REPO="$(resolve_repo_value "$REPO")"
+  local state_file="$REPO/.heimdall/app/connect.json"
+
+  if [ ! -f "$state_file" ]; then
+    echo "hmd app disconnect: not connected (no state file)"
+    return 0
+  fi
+
+  local pid_ui https_port
+  pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
+  https_port="$(jq -r '.https_port // empty' "$state_file" 2>/dev/null)"
+  [ -n "$https_port" ] || https_port=443
+
+  ts_funnel_stop "$https_port" >/dev/null 2>&1 || true
+
+  if [ -n "$pid_ui" ] && kill -0 "$pid_ui" 2>/dev/null; then
+    kill "$pid_ui" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$pid_ui" 2>/dev/null && [ "$waited" -lt 30 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    kill -9 "$pid_ui" 2>/dev/null || true
+  fi
+
+  rm -f "$state_file" 2>/dev/null || true
+  echo "hmd app disconnect: stopped"
+  return 0
+}
+
+cmd_doctor() {
+  local REPO="" HTTPS_PORT="443"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)
+        REPO="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      --https-port)
+        HTTPS_PORT="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      *) echo "hmd app doctor: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+  REPO="$(resolve_repo_value "$REPO")"
+
+  echo "hmd app doctor"
+  local failed=0 installed=false online=false
+
+  if ts_installed; then
+    echo "ok    tailscale installed"
+    installed=true
+  else
+    echo "FAIL  tailscale installed"
+    echo "      fix: run 'hmd app connect' to be offered an install, or see https://tailscale.com/download"
+    failed=$((failed + 1))
+  fi
+
+  local daemon_rc=99
+  if [ "$installed" = true ]; then
+    ts_status_json >/dev/null 2>/dev/null
+    daemon_rc=$?
+  fi
+  if [ "$daemon_rc" -eq 0 ]; then
+    echo "ok    tailscale daemon running"
+  elif [ "$installed" = false ]; then
+    echo "FAIL  tailscale daemon running"
+    echo "      fix: resolve the tailscale-installed check above first"
+    failed=$((failed + 1))
+  else
+    echo "FAIL  tailscale daemon running"
+    echo "      fix: start tailscaled (Linux: sudo systemctl start tailscaled; macOS: open the Tailscale app)"
+    failed=$((failed + 1))
+  fi
+
+  if [ "$daemon_rc" -eq 0 ] && ts_online; then
+    echo "ok    logged in / online"
+    online=true
+  else
+    echo "FAIL  logged in / online"
+    echo "      fix: run 'tailscale up' and complete login"
+    failed=$((failed + 1))
+  fi
+
+  if [ "$online" = true ]; then
+    local dns
+    dns="$(ts_dns_name 2>/dev/null || true)"
+    if [ -n "$dns" ]; then
+      echo "ok    DNSName resolvable ($dns)"
+    else
+      echo "FAIL  DNSName resolvable"
+      echo "      fix: wait a few seconds for tailscaled to register a name, then retry"
+      failed=$((failed + 1))
+    fi
+  else
+    echo "FAIL  DNSName resolvable"
+    echo "      fix: resolve the checks above first"
+    failed=$((failed + 1))
+  fi
+
+  if [ "$installed" = true ]; then
+    local mode
+    mode="$(ts_funnel_supported)"
+    case "$mode" in
+      modern|legacy)
+        echo "ok    funnel capability ($mode)"
+        ;;
+      *)
+        echo "FAIL  funnel capability (none)"
+        echo "      fix: upgrade the tailscale client -- this version doesn't expose funnel"
+        failed=$((failed + 1))
+        ;;
+    esac
+  else
+    echo "FAIL  funnel capability"
+    echo "      fix: resolve the tailscale-installed check above first"
+    failed=$((failed + 1))
+  fi
+
+  if [ "$installed" = true ]; then
+    if ts_funnel_status_json >/dev/null 2>/dev/null; then
+      echo "ok    HTTPS certs / funnel node attribute (best-effort -- the CLI answered a"
+      echo "      funnel/serve status query; this does NOT prove Funnel will start. Run"
+      echo "      'hmd app connect' to fully confirm.)"
+    else
+      echo "FAIL  HTTPS certs / funnel node attribute"
+      echo "      fix: run 'tailscale funnel status' to see the underlying error, or grant"
+      echo "      HTTPS certs + the Funnel node attribute in the tailnet admin console"
+      echo "      (https://login.tailscale.com/admin/dns)"
+      failed=$((failed + 1))
+    fi
+  else
+    echo "FAIL  HTTPS certs / funnel node attribute"
+    echo "      fix: resolve the tailscale-installed check above first"
+    failed=$((failed + 1))
+  fi
+
+  case "$HTTPS_PORT" in
+    443|8443|10000)
+      echo "ok    https-port allowed ($HTTPS_PORT)"
+      ;;
+    *)
+      echo "FAIL  https-port allowed ($HTTPS_PORT)"
+      echo "      fix: use one of 443, 8443, 10000 -- the only ports Tailscale Funnel allows"
+      failed=$((failed + 1))
+      ;;
+  esac
+
+  if [ -n "$PY3" ]; then
+    echo "ok    python3 resolvable ($PY3)"
+  else
+    echo "FAIL  python3 resolvable"
+    echo "      fix: install python3, or set HMD_PYTHON=/path/to/python3"
+    failed=$((failed + 1))
+  fi
+
+  if [ -x "$UI_BIN" ]; then
+    echo "ok    bin/heimdall-ui present"
+  else
+    echo "FAIL  bin/heimdall-ui present"
+    echo "      fix: reinstall heimdall -- bin/heimdall-ui is missing or not executable at $UI_BIN"
+    failed=$((failed + 1))
+  fi
+
+  echo ""
+  if [ "$failed" -eq 0 ]; then
+    echo "hmd app doctor: all checks passed"
+    return 0
+  fi
+  echo "hmd app doctor: $failed check(s) failed"
+  return 1
+}
+
+CMD="${1:-}"
+if [ $# -gt 0 ]; then shift; fi
+
+case "$CMD" in
+  ""|help)
+    usage
+    exit 0
+    ;;
+  connect) cmd_connect "$@"; exit $? ;;
+  status) cmd_status "$@"; exit $? ;;
+  disconnect) cmd_disconnect "$@"; exit $? ;;
+  doctor) cmd_doctor "$@"; exit $? ;;
+  *)
+    echo "hmd app: unknown subcommand: $CMD" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
