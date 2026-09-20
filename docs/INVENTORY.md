@@ -294,7 +294,7 @@ Default posture is **network-on**: presence beats to the public control plane fr
 | Sentinels (spec H-3) | `sentinels/bloat.sh`, `doc-sync.sh`, `sanity.sh`, `security.sh`, `spec-drift.sh` | harness sentinels run per wave / pre-push |
 | Summary card | `bin/summary-card` | end-of-run card |
 
-`hmd --help` (`bin/heimdall --help`) subcommands: run a task · interactive · `--resume` · `--auto` · `--no-goal` · `--skip-checkpoint` · `--no-autocommit`/`--autocommit` · `--skills` · `--update` · `--setup` · `--team N` · `--reinstall` · `--uninstall` · `team` · `invite` · `join` · `connect` · `presence` · `tier` · `status` · `weekly-log` · `sla` · `report-issue` · `authenticity-check` · `queue …` · `queue drain` · `settings-guard` · `volatile-repo-guard`. The `bin/heimdall` router also dispatches many more verbs (`init`, `wrap`, `route`, `modules`, `fallback`, `ui`, `demo`, `sigil`, `funnel`, `hooks`, `caveman`, `verdict`, …) that `--help` does not list — see section 14.
+`hmd --help` (`bin/heimdall --help`) subcommands: run a task · interactive · `--resume` · `--auto` · `--no-goal` · `--skip-checkpoint` · `--no-autocommit`/`--autocommit` · `--skills` · `--update` · `--setup` · `--team N` · `--reinstall` · `--uninstall` · `team` · `invite` · `join` · `connect` · `presence` · `tier` · `status` · `weekly-log` · `sla` · `report-issue` · `authenticity-check` · `queue …` · `queue drain` · `settings-guard` · `volatile-repo-guard`. The `bin/heimdall` router also dispatches many more verbs (`init`, `wrap`, `route`, `modules`, `fallback`, `ui`, `inbox`, `demo`, `sigil`, `funnel`, `hooks`, `caveman`, `verdict`, …) that `--help` does not list — see section 14.
 
 ---
 

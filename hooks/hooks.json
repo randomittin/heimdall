@@ -32,6 +32,15 @@
             "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled caveman-level-context && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then LVL=\"$(\"$CAV\" get 2>/dev/null)\"; if [ -n \"$LVL\" ]; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"HMD OUTPUT COMPRESSION - level: %s. Apply this level'\"'\"'s rules (heimdall-caveman rules). Code/commits/security: write normal.\"}}' \"$LVL\"; fi; fi; exit 0"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled inbox-deliver-prompt && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-inbox-deliver\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" prompt --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -283,6 +292,15 @@
           {
             "type": "command",
             "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled stop-lint && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-stop-lint\"; if [ -x \"$HOOK\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 90; exec @ARGV' \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" --budget 60 2>&1 >/dev/null; else \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" --budget 60 2>&1 >/dev/null; fi; fi; exit 0"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled inbox-deliver-stop && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-inbox-deliver\"; REPO=\"${CLAUDE_PROJECT_DIR:-.}\"; if [ -x \"$HOOK\" ]; then if [ -f \"$REPO/.heimdall/ui/inbox.wait\" ]; then \"$HOOK\" stop --repo \"$REPO\"; else HMD_INBOX_WAIT_S=0 \"$HOOK\" stop --repo \"$REPO\"; fi; fi; exit 0",
+            "timeout": 300
           }
         ]
       }

@@ -38,6 +38,15 @@
       "locked": false
     },
     {
+      "event": "UserPromptSubmit",
+      "index": 4,
+      "id": "inbox-deliver-prompt",
+      "description": "Fallback delivery of companion-app inbox messages via heimdall-inbox-deliver prompt: pops immediately at UserPromptSubmit, never waits, no-op when the inbox is empty.",
+      "matcher": "",
+      "fingerprint": "078cef18503cc09afdc17ac8c6b12016fbb54d950ba5dbd3f4452b1de9106dd8",
+      "locked": false
+    },
+    {
       "event": "PreToolUse",
       "index": 0,
       "id": "bash-gate-chain",
@@ -296,6 +305,15 @@
       "description": "Batch-lint every path edited this session at Stop; records a real lint receipt into heimdall-state",
       "matcher": "",
       "fingerprint": "aaba0ca672f9b367eefd7a1c2b1d0425affbcd493cbe8093868d23f12fb37e26",
+      "locked": false
+    },
+    {
+      "event": "Stop",
+      "index": 4,
+      "id": "inbox-deliver-stop",
+      "description": "Delivers companion-app inbox messages via heimdall-inbox-deliver stop. Long-poll only fires when the inbox is empty AND hmd's last message ended in a question; even then HMD_INBOX_WAIT_S is forced to 0 (near-instant return) unless <repo>/.heimdall/ui/inbox.wait exists, so opting in to the full 240s wait requires that marker file.",
+      "matcher": "",
+      "fingerprint": "b2c276692191b1b88db835cdfc368a353270aeab50bdde7deadaffaffb50f5de",
       "locked": false
     },
     {
