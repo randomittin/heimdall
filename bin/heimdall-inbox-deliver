@@ -403,10 +403,20 @@ def get_ops(root):
 
 def write_state(root, waiting):
     p = paths_for(root)
-    os.makedirs(p["dir"], exist_ok=True)
+    _ensure_dir(p["dir"])
     tmp = "%s.tmp.%d" % (p["state"], os.getpid())
     try:
-        with open(tmp, "w") as f:
+        # Same self-healing 0600 pattern as _open_append_0600 / _Flock above:
+        # O_CREAT's mode argument is umask-limited and only applied on the
+        # create branch, so the explicit chmod forces 0600 even if a prior
+        # crashed run left this exact tmp path behind at a wider mode. The
+        # final path (p["state"]) inherits tmp's mode via os.replace's
+        # rename semantics, so a pre-existing 0644 state file from before
+        # this fix is fully replaced -- old mode included -- on the next
+        # write, not just newly-created ones.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.chmod(tmp, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump({"waiting": bool(waiting), "since": time.time()}, f)
         os.replace(tmp, p["state"])
     except Exception:
