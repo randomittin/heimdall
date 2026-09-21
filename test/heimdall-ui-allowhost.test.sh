@@ -531,8 +531,15 @@ DATA_JSON="$TMPROOT/panel-secret-data.json"
 cat > "$DATA_JSON" <<'JSON'
 {"rows":[["contact","someone@example.com"],["home","~/private-notes"]]}
 JSON
-"$UI" panel set secret-panel --type kv --title "/Users/rj/secret/project" \
-      --data-json "$DATA_JSON" --repo "$FIX" >/dev/null 2>&1
+# N4 CLI-usage note: `panel set` has no --repo of its OWN (only the top-level
+# `panel` command does, and only BEFORE the subcommand -- see PLAN L450-452 /
+# heimdall-ui-panels.test.sh:45); passing --repo AFTER `set ...` lands in the
+# "set" subparser, which doesn't recognize it, so argparse exits 2 with
+# "unrecognized arguments" -- silently, under this line's own 2>&1. HEIMDALL_
+# WATCH_ROOT (same env var launch_server already sets for the server itself)
+# is the established pattern every other test in heimdall-ui-panels.test.sh uses.
+HEIMDALL_WATCH_ROOT="$FIX" "$UI" panel set secret-panel --type kv --title "/Users/rj/secret/project" \
+      --data-json "$DATA_JSON" >/dev/null 2>&1
 
 mkdir -p "$FIX/.planning"
 cat > "$FIX/.planning/CHECKPOINT.md" <<'MD'
@@ -553,8 +560,21 @@ cat > "$FIX/.planning/CHECKPOINT.md" <<'MD'
 <!-- heimdall-auto-checkpoint:end -->
 MD
 
+# Panel files are picked up by /api/state's OWN fresh collect_state() call (no
+# poll-interval staleness there -- see sentinels/hmd-ui.py's "/api/state" route,
+# "Always a FRESH collection"), but polling instead of a single shot costs
+# nothing on the fast path and removes any dependency on exactly how fast the
+# CLI process above has exited and flushed its rename(2) before this line runs.
+# Deadline 6s, 0.2s steps (matches wait_for()'s cadence elsewhere in this file).
 BODY="$TMPROOT/state-i-public.json"
-rc="$(curl -s -o "$BODY" -w '%{http_code}' -H "Host: demo.tail1234.ts.net" "$BASE_H/api/state?$AUTH_H")"
+POLL_I=0
+while [ "$POLL_I" -lt 30 ]; do
+  rc="$(curl -s -o "$BODY" -w '%{http_code}' -H "Host: demo.tail1234.ts.net" "$BASE_H/api/state?$AUTH_H")"
+  if [ "$rc" = "200" ] && grep -q '"secret-panel"' "$BODY" 2>/dev/null; then
+    break
+  fi
+  sleep 0.2; POLL_I=$((POLL_I + 1))
+done
 RAW="$(cat "$BODY" 2>/dev/null)"
 
 if [ "$rc" = "200" ] && ! printf '%s' "$RAW" | grep -q '/Users/'; then
