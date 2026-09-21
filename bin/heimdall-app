@@ -50,7 +50,17 @@
 # Funnel (HTTPS certs / the Funnel node attribute aren't granted -- the CLI's
 # own hint is printed VERBATIM on stderr, per hmd_tailscale.sh's
 # ts_funnel_start contract), 6 `hmd ui` did not come up in time (including a
-# busy fixed port), 2 a required file/flag/tool is missing or malformed.
+# busy fixed port), 2 a required file/flag/tool is missing or malformed, 9
+# the installed tailscale build is macsys/App Store -- ts_variant identifies
+# it and Funnel is refused before the ui ever starts (2026-09-21
+# tailscale-macsys-funnel-cli-error-3: --help advertises the modern funnel
+# flags on that build too, but Funnel only ever works on the open-source
+# tailscaled build), 10 tailscale funnel start did not return within
+# HMD_FUNNEL_START_TIMEOUT_S seconds (default 45) -- the funnel process is
+# killed and torn down before returning, same as a normal Ctrl-C. Every
+# ts_funnel_stop call (disconnect, and teardown after any of the above) is
+# time-boxed too (HMD_FUNNEL_STOP_TIMEOUT_S, default 20), so nothing here
+# can hang forever regardless of what the tailscale CLI itself does.
 #
 # State file: <repo>/.heimdall/app/connect.json
 #   {"pid_ui": N, "port": N, "https_port": N, "host": "...", "started_at": "..."}
@@ -212,14 +222,26 @@ _funnel_looks_up() {
 # "hmd app disconnect"). $2: https_port. $3: backend port, may be empty.
 # Returns 0 only once verified down; 7 if ts_funnel_stop itself refused and
 # the funnel is still up; 8 if the stop reported success but verification
-# still finds it up (e.g. a target ts_funnel_stop didn't know to clear).
+# still finds it up (e.g. a target ts_funnel_stop didn't know to clear) OR
+# the stop itself timed out (HMD_FUNNEL_STOP_TIMEOUT_S, default 20s --
+# 2026-09-21 tailscale-macsys-funnel-cli-error-3 established that a hung
+# funnel CLI can't be trusted to fail fast either, so this can't just wait
+# forever the way it used to).
 _funnel_stop_and_verify() {
-  local prefix="$1" https_port="$2" port="${3:-}" err rc
-  err="$(ts_funnel_stop "$https_port" "$port" 2>&1 >/dev/null)"
+  local prefix="$1" https_port="$2" port="${3:-}" err rc errfile
+  local stop_timeout="${HMD_FUNNEL_STOP_TIMEOUT_S:-20}"
+  errfile="$(mktemp 2>/dev/null || echo "/tmp/hmd-app-stop.$$.err")"
+  _run_with_timeout "$stop_timeout" ts_funnel_stop "$https_port" "$port" >/dev/null 2>"$errfile"
   rc=$?
+  err="$(cat "$errfile" 2>/dev/null || true)"
+  rm -f "$errfile" 2>/dev/null || true
   [ -n "$err" ] && printf '%s\n' "$err" >&2
   if ! _funnel_looks_up; then
     return 0
+  fi
+  if [ "$rc" -eq 124 ]; then
+    printf '%s: FUNNEL STILL PUBLIC -- stop timed out after %ss -- run: HMD_FUNNEL_FORCE_RESET=1 hmd app disconnect\n' "$prefix" "$stop_timeout" >&2
+    return 8
   fi
   if [ "$rc" -eq 7 ]; then
     echo "$prefix: FUNNEL STILL PUBLIC -- refused (exit 7) -- run: HMD_FUNNEL_FORCE_RESET=1 hmd app disconnect" >&2
@@ -235,6 +257,72 @@ _funnel_stop_and_verify() {
 # contents on a failure must never echo it raw.
 _print_redacted() {
   sed -E 's/token=[^ &"]+/token=<redacted>/g' "$1" 2>/dev/null || true
+}
+
+# List every live descendant of $1 (children, grandchildren, ...), one pid
+# per line. Order is unspecified -- the caller signals the whole set
+# together, so discovery order doesn't matter. `pgrep -P` (already relied on
+# elsewhere in this file via `pkill -P`) is the same portable BSD/macOS
+# primitive, just walked recursively instead of one level.
+_pid_descendants() {
+  local parent="$1" kid
+  for kid in $(pgrep -P "$parent" 2>/dev/null || true); do
+    printf '%s\n' "$kid"
+    _pid_descendants "$kid"
+  done
+}
+
+# Signal $2 and every descendant of it with signal $1. Best-effort
+# throughout -- a pid that already exited between enumeration and kill is
+# not an error.
+_kill_tree() {
+  local sig="$1" root="$2" p
+  for p in $(_pid_descendants "$root"); do
+    kill "-$sig" "$p" 2>/dev/null || true
+  done
+  kill "-$sig" "$root" 2>/dev/null || true
+}
+
+# 2026-09-21 tailscale-macsys-funnel-cli-error-3: a funnel start/stop can
+# hang indefinitely on some tailscale builds instead of failing fast, so
+# every call into the CLI that can block needs a hard wall-clock deadline.
+# macOS ships neither GNU coreutils `timeout` nor `setsid`, so this can't
+# rely on either -- it backgrounds the command, polls `kill -0` once a
+# second, and on expiry kills the whole subtree: $pid (the wrapper subshell)
+# plus every descendant it has forked by then, recursively (_kill_tree /
+# _pid_descendants above) -- "$@" can itself be a function (ts_funnel_start)
+# that shells out more than once, so the process actually stuck can be a
+# grandchild or deeper, not just $pid's direct child (this file's own fake
+# `tailscale` test fixture is one such case: its `--bg` mode hangs in a
+# `sleep` that is a child of the fake binary's own shell, which is $pid's
+# child -- two hops down, and a plain `pkill -P "$pid"` alone would miss
+# it and leak it). TERM first, a 1s grace period, then KILL, matching
+# cleanup()'s own kill-then-verify style elsewhere in this file.
+# $1: budget in seconds. $2..: command + args, run with whatever
+# stdout/stderr the caller already has (no redirection of its own -- a
+# caller that wants output captured redirects the call itself).
+# Returns the command's own exit code, or 124 (matching GNU timeout's
+# convention) if the deadline hit first.
+_run_with_timeout() {
+  local budget="$1"
+  shift
+  local pid rc waited=0
+  ( "$@" ) &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$budget" ]; then
+      _kill_tree TERM "$pid"
+      sleep 1
+      _kill_tree KILL "$pid"
+      wait "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid"
+  rc=$?
+  return "$rc"
 }
 
 cmd_connect() {
@@ -308,6 +396,20 @@ cmd_connect() {
     echo "hmd app connect: tailscale returned a DNSName that fails validation: '$host'" >&2
     return 5
   fi
+
+  # 2026-09-21 tailscale-macsys-funnel-cli-error-3: --help still advertises
+  # the modern funnel flag syntax on the macsys/App Store Tailscale build,
+  # but Funnel only ever works on the open-source tailscaled build -- refuse
+  # here, before the ui (or anything else) ever starts, rather than let
+  # ts_funnel_start hang or fail deep into a connect attempt. ts_funnel_start
+  # itself refuses too (exit 9), but only after the ui is already up; this
+  # is what keeps that case from ever reaching the ui at all.
+  case "$(ts_variant 2>/dev/null || echo unknown)" in
+    macsys|appstore)
+      echo "hmd app connect: tailscale build variant does not support Funnel -- install the open-source build: brew install tailscale (then: tailscale up)" >&2
+      return 9
+      ;;
+  esac
 
   # A4(d): a funnel can already be up from a session this repo's state file
   # no longer knows about (a crash, a manual rm, a prior bug) -- connect must
@@ -386,9 +488,18 @@ cmd_connect() {
   token="$(printf '%s' "$url_line" | sed -E 's#^[^?]*\?token=##')"
   ACTUAL_PORT="$actual_port"
 
-  ts_funnel_start "$actual_port" "$HTTPS_PORT"
+  local start_timeout="${HMD_FUNNEL_START_TIMEOUT_S:-45}"
+  _run_with_timeout "$start_timeout" ts_funnel_start "$actual_port" "$HTTPS_PORT"
   local frc=$?
-  if [ "$frc" -eq 3 ]; then
+  if [ "$frc" -eq 124 ]; then
+    # The start hung past its budget -- we can't tell whether tailscaled
+    # partially applied it before being killed, so assume it might have
+    # (FUNNEL_UP=true) and let cleanup()'s own time-boxed stop-and-verify
+    # settle it, same as a Ctrl-C mid-connect would.
+    echo "hmd app connect: funnel start timed out after ${start_timeout}s -- run hmd app doctor" >&2
+    FUNNEL_UP=true
+    return 10
+  elif [ "$frc" -eq 3 ]; then
     echo "hmd app connect: run 'hmd app doctor' for diagnostics." >&2
     return 3
   elif [ "$frc" -ne 0 ]; then
@@ -463,6 +574,9 @@ cmd_status() {
   else
     echo "tailscale installed: no"
   fi
+
+  echo "tailscale build variant: $(ts_variant 2>/dev/null || echo unknown)"
+  echo "tailscale binary: $(ts_bin 2>/dev/null || echo '(unresolved)')"
 
   if ts_online; then
     echo "tailscale online: yes"
@@ -652,6 +766,37 @@ cmd_doctor() {
     failed=$((failed + 1))
   fi
 
+  # 2026-09-21 tailscale-macsys-funnel-cli-error-3: the macsys/App Store
+  # build advertises the same modern funnel flags in --help as the
+  # open-source build, but Funnel only ever works on open-source tailscaled
+  # -- this machine can easily have both installed (Homebrew AND the App
+  # Store GUI) at once, so the resolved binary PATH is printed alongside the
+  # variant, not just the classification, so a "why does it say macsys" ever
+  # comes down to one visible fact instead of a guess.
+  local variant="" variant_failed=false bin_path=""
+  if [ "$installed" = true ]; then
+    bin_path="$(ts_bin 2>/dev/null || echo '(unresolved)')"
+    variant="$(ts_variant 2>/dev/null || echo unknown)"
+    case "$variant" in
+      oss)
+        echo "ok    tailscale build variant ($variant, $bin_path)"
+        ;;
+      macsys|appstore)
+        echo "FAIL  tailscale build variant ($variant, $bin_path)"
+        echo "      fix: install the open-source build: brew install tailscale (then: tailscale up)"
+        failed=$((failed + 1))
+        variant_failed=true
+        ;;
+      *)
+        echo "warn  tailscale build variant (unknown, $bin_path) -- Funnel support could not be confirmed"
+        ;;
+    esac
+  else
+    echo "FAIL  tailscale build variant"
+    echo "      fix: resolve the tailscale-installed check above first"
+    failed=$((failed + 1))
+  fi
+
   local daemon_rc=99
   if [ "$installed" = true ]; then
     ts_status_json >/dev/null 2>/dev/null
@@ -694,7 +839,16 @@ cmd_doctor() {
     failed=$((failed + 1))
   fi
 
-  if [ "$installed" = true ]; then
+  if [ "$installed" = true ] && [ "$variant_failed" = true ]; then
+    # The variant check above already failed (macsys/App Store) -- Funnel
+    # never works there regardless of what --help advertises, so this must
+    # FAIL too, with the same brew-install fix, rather than trust
+    # ts_funnel_supported's content-sniffed "upgrade the client" hint (which
+    # is correct for a genuinely outdated CLI, but wrong for this case).
+    echo "FAIL  funnel capability (blocked by unsupported tailscale build)"
+    echo "      fix: install the open-source build: brew install tailscale (then: tailscale up)"
+    failed=$((failed + 1))
+  elif [ "$installed" = true ]; then
     local mode
     mode="$(ts_funnel_supported)"
     case "$mode" in
