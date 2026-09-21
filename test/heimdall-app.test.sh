@@ -171,14 +171,51 @@ EOF
         esac
         ;;
       status)
-        if [ "$mode" = "funnel-still-up" ]; then
-          echo '{"Funnel":{"443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9999"}}}}}'
-        else
-          echo '{"Funnel":{}}'
+        # N1: two new stateful modes let a test observe the *after* of a
+        # stop, not just its exit code -- FAKE_TS_RESET_MARKER names a file
+        # this same script touches from the reset) case below when set, so
+        # a test can prove "stop ran, and status now agrees it's down"
+        # instead of trusting rc alone (rc=0 never meant "actually down" --
+        # that's the bug N1 fixes). Every pre-existing mode ignores the
+        # marker entirely, unchanged.
+        marker_down=false
+        if [ -n "${FAKE_TS_RESET_MARKER:-}" ] && [ -f "${FAKE_TS_RESET_MARKER:-}" ]; then
+          marker_down=true
         fi
+        case "$mode" in
+          funnel-still-up)
+            echo '{"Funnel":{"443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9999"}}}}}'
+            ;;
+          one-foreign-target)
+            # Populates .Web (what ts_funnel_foreign_targets reads) AND
+            # .Funnel (what _funnel_looks_up reads) so the two agree --
+            # unlike funnel-still-up above, which deliberately only sets
+            # .Funnel to model the "rc=0 but no foreign-target info" case.
+            if [ "$marker_down" = true ]; then
+              echo '{"Funnel":{}}'
+            else
+              jq -n --arg p "${FAKE_TS_TARGET_PORT:-5601}" \
+                '{Funnel:{"443":{Handlers:{"/":{Proxy:"http://127.0.0.1:9999"}}}}, Web:{h1:{Handlers:{"/":{Proxy:("http://127.0.0.1:"+$p)}}}}}'
+            fi
+            ;;
+          two-foreign-targets)
+            if [ "$marker_down" = true ]; then
+              echo '{"Funnel":{}}'
+            else
+              jq -n \
+                '{Funnel:{"443":{Handlers:{"/":{Proxy:"http://127.0.0.1:9999"}}}}, Web:{h1:{Handlers:{"/":{Proxy:"http://127.0.0.1:5601"}}},h2:{Handlers:{"/":{Proxy:"http://127.0.0.1:5602"}}}}}'
+            fi
+            ;;
+          *)
+            echo '{"Funnel":{}}'
+            ;;
+        esac
         exit 0
         ;;
       reset)
+        if [ -n "${FAKE_TS_RESET_MARKER:-}" ]; then
+          : > "${FAKE_TS_RESET_MARKER:-}" 2>/dev/null || true
+        fi
         exit 0
         ;;
       --bg)
@@ -351,7 +388,11 @@ else
 fi
 
 FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
-sleep 0.3
+SF_REAP_WAITED=0
+while kill -0 "$SF_PID" 2>/dev/null && [ "$SF_REAP_WAITED" -lt 30 ]; do
+  sleep 0.1
+  SF_REAP_WAITED=$((SF_REAP_WAITED + 1))
+done
 if kill -0 "$SF_PID" 2>/dev/null; then
   bad "teardown: ui pid still alive after disconnect"
 else
@@ -373,7 +414,11 @@ else
 fi
 printf '%s' "$(cat "$ERR_FILE")" | grep -qi 'hmd app doctor' && ok "policy-block stderr points at 'hmd app doctor' for diagnostics" || bad "missing doctor pointer: $(cat "$ERR_FILE")"
 [ ! -f "$D/.heimdall/app/connect.json" ] && ok "no state file left behind after a policy-block failure" || bad "state file leaked"
-sleep 0.3
+POLICY_UI_WAITED=0
+while pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1 && [ "$POLICY_UI_WAITED" -lt 30 ]; do
+  sleep 0.1
+  POLICY_UI_WAITED=$((POLICY_UI_WAITED + 1))
+done
 if pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1; then
   bad "a heimdall-ui process for $D is still running after the policy-block failure"
 else
@@ -419,7 +464,11 @@ else
   DISC_OUT="$(FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" 2>&1)"
   DRC=$?
   [ "$DRC" -eq 0 ] && ok "disconnect exits 0" || bad "exit $DRC: $DISC_OUT"
-  sleep 0.3
+  DC_WAITED=0
+  while kill -0 "$DC_PID" 2>/dev/null && [ "$DC_WAITED" -lt 30 ]; do
+    sleep 0.1
+    DC_WAITED=$((DC_WAITED + 1))
+  done
   if kill -0 "$DC_PID" 2>/dev/null; then bad "ui pid still alive after disconnect"; else ok "disconnect kills the ui pid"; fi
   CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 2 "http://127.0.0.1:${DC_PORT}/" 2>/dev/null)"
   [ "$CODE" = "000" ] && ok "ui port no longer accepts connections after disconnect" || bad "port $DC_PORT still answering (code=$CODE)"
@@ -541,7 +590,11 @@ if [ -f "$SF" ]; then
     ok "connect process exits on SIGTERM (foreground trap fired)"
   fi
 
-  sleep 0.3
+  FG_UI_REAP_WAITED=0
+  while [ -n "$FG_UI_PID" ] && kill -0 "$FG_UI_PID" 2>/dev/null && [ "$FG_UI_REAP_WAITED" -lt 30 ]; do
+    sleep 0.1
+    FG_UI_REAP_WAITED=$((FG_UI_REAP_WAITED + 1))
+  done
   if [ -n "$FG_UI_PID" ] && kill -0 "$FG_UI_PID" 2>/dev/null; then
     bad "ui process still alive after connect received SIGTERM -- trap cleanup leaked it"
     kill -9 "$FG_UI_PID" 2>/dev/null
@@ -599,7 +652,12 @@ time.sleep(20)
 PYEOF
 HOLD_PID=$!
 PIDS+=("$HOLD_PID")
-sleep 0.3
+HOLD_WAITED=0
+while ! exec 3<>/dev/tcp/127.0.0.1/8710 2>/dev/null && [ "$HOLD_WAITED" -lt 50 ]; do
+  sleep 0.1
+  HOLD_WAITED=$((HOLD_WAITED + 1))
+done
+exec 3<&- 2>/dev/null || true
 OUT="$(FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg 2>&1)"; RC=$?
 [ "$RC" -eq 6 ] && ok "A4b. connect w/ the fixed default port (8710) busy exits 6" || bad "exit $RC (want 6): $OUT"
 kill "$HOLD_PID" 2>/dev/null
@@ -670,7 +728,11 @@ if [ -f "$SF" ]; then
     ok "A4e. connect process exits on SIGHUP (foreground trap fired)"
   fi
 
-  sleep 0.3
+  HUP_UI_REAP_WAITED=0
+  while [ -n "$HUP_UI_PID" ] && kill -0 "$HUP_UI_PID" 2>/dev/null && [ "$HUP_UI_REAP_WAITED" -lt 30 ]; do
+    sleep 0.1
+    HUP_UI_REAP_WAITED=$((HUP_UI_REAP_WAITED + 1))
+  done
   if [ -n "$HUP_UI_PID" ] && kill -0 "$HUP_UI_PID" 2>/dev/null; then
     bad "A4e. ui process still alive after connect received SIGHUP -- trap cleanup leaked it"
     kill -9 "$HUP_UI_PID" 2>/dev/null
@@ -827,6 +889,118 @@ fi
 printf '%s' "$OUT" | grep -qi 'not a heimdall-ui process' && ok "A14. disconnect warns when skipping a non-matching pid" || bad "$OUT"
 kill "$SLEEP_PID" 2>/dev/null
 wait "$SLEEP_PID" 2>/dev/null
+rm -rf "$D"
+
+# ── N1(a). ts_funnel_stop refuses (exit 7) -- loud, never claims "stopped" ──
+D="$(make_repo)"
+mkdir -p "$D/.heimdall/app"
+cat > "$D/.heimdall/app/connect.json" <<JSON
+{"pid_ui": 1, "port": 6000, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
+JSON
+LOG="$TMPROOT/ts-n1a.log"
+: > "$LOG"
+N1A_OUT="$(FAKE_TS_MODE=one-foreign-target FAKE_TS_TARGET_PORT=5601 FAKE_TS_LOG="$LOG" "$APP" disconnect --repo "$D" 2>&1)"; N1A_RC=$?
+[ "$N1A_RC" -eq 7 ] && ok "N1a. disconnect refuses (exit 7) when a foreign target doesn't match hmd's own port" || bad "exit $N1A_RC (want 7): $N1A_OUT"
+printf '%s' "$N1A_OUT" | grep -qF 'FUNNEL STILL PUBLIC' && ok "N1a. refusal prints the loud FUNNEL STILL PUBLIC line" || bad "$N1A_OUT"
+printf '%s' "$N1A_OUT" | grep -qi 'stopped' && bad "N1a. refusal must never claim success: $N1A_OUT" || ok "N1a. refusal never prints 'stopped'"
+grep -q '^funnel reset$' "$LOG" && bad "N1a. refused stop must not have attempted a reset: $(cat "$LOG")" || ok "N1a. refusal never attempted a reset"
+rm -rf "$D"
+
+# ── N1(b). stop's own rc says success but status still shows it up -> 8 ──
+D="$(make_repo)"
+mkdir -p "$D/.heimdall/app"
+cat > "$D/.heimdall/app/connect.json" <<JSON
+{"pid_ui": 1, "port": 6000, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
+JSON
+N1B_OUT="$(FAKE_TS_MODE=funnel-still-up "$APP" disconnect --repo "$D" 2>&1)"; N1B_RC=$?
+[ "$N1B_RC" -eq 8 ] && ok "N1b. disconnect exits 8 when the stop's own exit code says success but the funnel is still up" || bad "exit $N1B_RC (want 8): $N1B_OUT"
+printf '%s' "$N1B_OUT" | grep -qF 'FUNNEL STILL PUBLIC' && ok "N1b. exit-8 case prints the loud FUNNEL STILL PUBLIC line" || bad "$N1B_OUT"
+printf '%s' "$N1B_OUT" | grep -qi 'stopped' && bad "N1b. must never claim 'stopped' while still public: $N1B_OUT" || ok "N1b. never prints 'stopped'"
+rm -rf "$D"
+
+# ── N1(c). clean stop verifies down -> exit 0, prints 'stopped' ──────────
+D="$(make_repo)"
+mkdir -p "$D/.heimdall/app"
+cat > "$D/.heimdall/app/connect.json" <<JSON
+{"pid_ui": 1, "port": 6000, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
+JSON
+N1C_OUT="$(FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" 2>&1)"; N1C_RC=$?
+[ "$N1C_RC" -eq 0 ] && ok "N1c. clean stop (verified down) exits 0" || bad "exit $N1C_RC: $N1C_OUT"
+printf '%s' "$N1C_OUT" | grep -qi 'stopped' && ok "N1c. clean stop prints 'stopped'" || bad "$N1C_OUT"
+rm -rf "$D"
+
+# ── N1(d). no state file, exactly one loopback target -> that port is
+# inferred and used instead of refusing (contrast N1e below: two targets
+# under otherwise-identical conditions refuse). The port itself never
+# appears in a tailscale argv for this call shape (it's a hmd-side JSON
+# filter, not a CLI arg) -- what the log CAN and does prove is that the
+# stop actually proceeded (funnel reset attempted) rather than being
+# refused, which is exactly what a wrong/absent inference would break ────
+D="$(make_repo)"
+LOG="$TMPROOT/ts-n1d.log"
+: > "$LOG"
+N1D_OUT="$(FAKE_TS_MODE=one-foreign-target FAKE_TS_TARGET_PORT=5601 FAKE_TS_LOG="$LOG" FAKE_TS_RESET_MARKER="$TMPROOT/n1d.marker" "$APP" disconnect --repo "$D" 2>&1)"; N1D_RC=$?
+[ "$N1D_RC" -eq 0 ] && ok "N1d. no state file + a single loopback target infers that port and stops cleanly" || bad "exit $N1D_RC: $N1D_OUT"
+grep -q '^funnel reset$' "$LOG" && ok "N1d. the discovered single target let the stop proceed (funnel reset attempted, not refused)" || bad "ts invocation log: $(cat "$LOG")"
+rm -rf "$D"
+
+# ── N1(e). no state file, two loopback targets -> ambiguous, refuses ─────
+D="$(make_repo)"
+LOG="$TMPROOT/ts-n1e.log"
+: > "$LOG"
+N1E_OUT="$(FAKE_TS_MODE=two-foreign-targets FAKE_TS_LOG="$LOG" "$APP" disconnect --repo "$D" 2>&1)"; N1E_RC=$?
+[ "$N1E_RC" -eq 7 ] && ok "N1e. no state file + two loopback targets is ambiguous, refuses (exit 7)" || bad "exit $N1E_RC (want 7): $N1E_OUT"
+grep -q '^funnel reset$' "$LOG" && bad "N1e. ambiguous case must not attempt a stop: $(cat "$LOG")" || ok "N1e. ambiguous case never attempted a stop"
+rm -rf "$D"
+
+# ── N1(f). HMD_FUNNEL_FORCE_RESET=1 forces past the N1e ambiguity ────────
+D="$(make_repo)"
+LOG="$TMPROOT/ts-n1f.log"
+: > "$LOG"
+N1F_OUT="$(HMD_FUNNEL_FORCE_RESET=1 FAKE_TS_MODE=two-foreign-targets FAKE_TS_LOG="$LOG" FAKE_TS_RESET_MARKER="$TMPROOT/n1f.marker" "$APP" disconnect --repo "$D" 2>&1)"; N1F_RC=$?
+[ "$N1F_RC" -eq 0 ] && ok "N1f. HMD_FUNNEL_FORCE_RESET=1 forces the reset through the same ambiguity, exits 0" || bad "exit $N1F_RC: $N1F_OUT"
+printf '%s' "$N1F_OUT" | grep -qi 'stopped' && ok "N1f. forced reset prints 'stopped'" || bad "$N1F_OUT"
+grep -q '^funnel reset$' "$LOG" && ok "N1f. forced reset actually called funnel reset" || bad "ts invocation log: $(cat "$LOG")"
+rm -rf "$D"
+
+# ── N1(g). foreground connect's SIGTERM cleanup exits non-zero (not the
+# signal's own code) when its own stop can't be verified down ────────────
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-n1g.out"
+( FAKE_TS_MODE=funnel-still-up "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+N1G_PID=$!
+PIDS+=("$N1G_PID")
+
+SF="$D/.heimdall/app/connect.json"
+N1G_WAITED=0
+while [ ! -f "$SF" ] && [ "$N1G_WAITED" -lt 50 ]; do
+  sleep 0.2
+  N1G_WAITED=$((N1G_WAITED + 1))
+done
+
+if [ -f "$SF" ]; then
+  kill -TERM "$N1G_PID" 2>/dev/null
+  N1G_TERM_WAITED=0
+  while kill -0 "$N1G_PID" 2>/dev/null && [ "$N1G_TERM_WAITED" -lt 50 ]; do
+    sleep 0.1
+    N1G_TERM_WAITED=$((N1G_TERM_WAITED + 1))
+  done
+  if kill -0 "$N1G_PID" 2>/dev/null; then
+    bad "N1g. connect process did not exit within 5s of SIGTERM"
+    kill -9 "$N1G_PID" 2>/dev/null
+    wait "$N1G_PID" 2>/dev/null
+  else
+    wait "$N1G_PID" 2>/dev/null
+    N1G_RC=$?
+    [ "$N1G_RC" -eq 8 ] && ok "N1g. SIGTERM cleanup exits 8 (not the signal's own code) when the funnel can't be verified down" || bad "exit $N1G_RC (want 8): $(cat "$OUT_FILE")"
+    grep -qF 'FUNNEL STILL PUBLIC' "$OUT_FILE" && ok "N1g. SIGTERM teardown prints the loud FUNNEL STILL PUBLIC line" || bad "$(cat "$OUT_FILE")"
+  fi
+else
+  bad "N1g setup: foreground connect never wrote a state file within 10s: $(cat "$OUT_FILE" 2>/dev/null)"
+  bad "N1g. skipped: SIGTERM exit-code check (setup failed)"
+  kill "$N1G_PID" 2>/dev/null
+  wait "$N1G_PID" 2>/dev/null
+fi
 rm -rf "$D"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
