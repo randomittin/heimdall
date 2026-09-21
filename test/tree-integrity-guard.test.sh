@@ -387,12 +387,92 @@ grep -q 'bin/whatever' "$OUT9" && ok "non-hook-owned-fixture run NAMES bin/whate
   || bad "non-hook-owned-fixture run did not name bin/whatever"
 
 # ════════════════════════════════════════════════════════════════════════════════════════
-# 10 — sanity bound: this whole guard (10 sandboxed sub-runs of a 3-suite runner) should be
+# 10 — EXPLOIT SHAPES (2026-09-21 second finding, security review): the pre-fix
+# _hook_owned_path matched by PATH PREFIX ONLY, with no filename shape and no trailing
+# anchor. NOTE the tracked-diff below (run-all.sh:631-634) categorically excludes ALL
+# untracked (`??`) lines BEFORE _hook_owned_path ever runs — that boundary is deliberate
+# and pre-existing (a suite creating new `.planning/` state is not corruption), so it is
+# NOT the exploit surface and a brand-new untracked exploit file would never reach this
+# check regardless of the regex. The REAL exploit surface here is an ALREADY-TRACKED file
+# living under a hook-owned directory that a suite then MODIFIES (` M`/`M ` — never `??`,
+# so it passes the untracked-exclusion straight through to _hook_owned_path): a non-json
+# script, a nested path, or a real-shaped name with a trailing suffix all used to hide
+# behind the prefix-only match exactly like a legitimate publish. Anchoring to the exact
+# shape each real writer emits (haid_<slug>.json for activity/verdicts/checkpoints,
+# YYYY-MM-DD-haid_<slug>.md for journal) plus a trailing `$` must catch all three once
+# they're tracked and mutated — mirroring case 9's tracked-modify shape, scoped to these
+# three hook-owned-adjacent paths specifically.
+# ════════════════════════════════════════════════════════════════════════════════════════
+echo
+echo "10 — exploit shapes from the 2026-09-21 finding (non-json / nested / wrong-suffix TRACKED files under hook-owned dirs) still fail the run when modified"
+SBX10="$(build_sandbox case10)"
+mkdir -p "$SBX10/.planning/ledger/checkpoints" "$SBX10/.planning/journal/sub/dir"
+printf '#!/usr/bin/env bash\necho original\n' > "$SBX10/.planning/ledger/checkpoints/dropper.sh"
+printf 'original\n' > "$SBX10/.planning/journal/sub/dir/x.md"
+printf '{"original":true}\n' > "$SBX10/.planning/ledger/checkpoints/haid_bar.json.bak"
+cat > "$SBX10/test/fake-exploit.test.sh" <<'FIXEOF'
+#!/usr/bin/env bash
+echo pwned >> .planning/ledger/checkpoints/dropper.sh
+echo pwned >> .planning/journal/sub/dir/x.md
+echo pwned >> .planning/ledger/checkpoints/haid_bar.json.bak
+echo "fake-exploit: 1 passed, 0 failed."
+exit 0
+FIXEOF
+chmod +x "$SBX10/test/fake-exploit.test.sh"
+commit_all "$SBX10" "TRACK exploit-shaped files under hook-owned dirs + add fixture that mutates them"
+OUT10="$WORK/case10.out"
+run_sandbox "$SBX10" "$OUT10"; RC10=$?
+[ "$RC10" -ne 0 ] && ok "exploit-shape run fails (got $RC10)" || bad "exploit-shape run should fail, got $RC10"
+grep -q 'TREE INTEGRITY VIOLATION' "$OUT10" && ok "exploit-shape run raises TREE INTEGRITY VIOLATION" \
+  || bad "exploit-shape run did not raise TREE INTEGRITY VIOLATION"
+grep -q 'ledger/checkpoints/dropper.sh' "$OUT10" && ok "exploit-shape run NAMES a modified non-json script under checkpoints/ (dropper.sh)" \
+  || bad "exploit-shape run did not name ledger/checkpoints/dropper.sh"
+grep -q 'journal/sub/dir/x.md' "$OUT10" && ok "exploit-shape run NAMES a modified nested tracked file under journal/ (journal/sub/dir/x.md)" \
+  || bad "exploit-shape run did not name journal/sub/dir/x.md"
+grep -q 'checkpoints/haid_bar.json.bak' "$OUT10" && ok "exploit-shape run NAMES a modified real-prefix file with a trailing suffix (haid_bar.json.bak)" \
+  || bad "exploit-shape run did not name haid_bar.json.bak"
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# 11 — REAL SHAPES STAY EXEMPT after anchoring: a NEW checkpoints haid_ file, a NEW dated
+# journal file, and — the one directory with a genuinely DIFFERENT real shape — an UPDATED
+# ledger/collisions/ file, which bin/heimdall-collision keys off the BRANCH NAME via its
+# own branch_slug, never off a haid, so it is deliberately NOT required to start "haid_"
+# the way the other three directories are. Proves the anchoring didn't overreach into
+# breaking the one shape it must NOT constrain the same way.
+# ════════════════════════════════════════════════════════════════════════════════════════
+echo
+echo "11 — real hook-emitted shapes (including collisions' non-haid_ branch-slug shape) stay exempt after anchoring"
+SBX11="$(build_sandbox case11)"
+mkdir -p "$SBX11/.planning/ledger/checkpoints" "$SBX11/.planning/ledger/collisions" "$SBX11/.planning/journal"
+printf '{"haid":"seed.machine-0000"}\n' > "$SBX11/.planning/ledger/checkpoints/haid_seed.machine-0000.json"
+printf '{"branch":"main"}\n' > "$SBX11/.planning/ledger/collisions/main.json"
+printf '# seed\n' > "$SBX11/.planning/journal/2026-01-01-haid_seed.machine-0000.md"
+cat > "$SBX11/test/fake-real-shapes.test.sh" <<'FIXEOF'
+#!/usr/bin/env bash
+printf '{"haid":"bar.machine-0001"}\n' > .planning/ledger/checkpoints/haid_bar.json
+printf '{"branch":"main","updated":true}\n' > .planning/ledger/collisions/main.json
+printf '# line from fake journal hook\n' > .planning/journal/2026-09-21-haid_foo.md
+echo "fake-real-shapes: 1 passed, 0 failed."
+exit 0
+FIXEOF
+chmod +x "$SBX11/test/fake-real-shapes.test.sh"
+commit_all "$SBX11" "seed tracked hook-owned files + add real-shapes fixture suite"
+OUT11="$WORK/case11.out"
+run_sandbox "$SBX11" "$OUT11"; RC11=$?
+[ "$RC11" -eq 0 ] && ok "real-shapes run exits 0 (got $RC11)" || bad "real-shapes run should exit 0, got $RC11"
+grep -q 'tree-integrity: clean' "$OUT11" && ok "real-shapes run reports tree-integrity: clean" \
+  || bad "real-shapes run did not report tree-integrity: clean"
+grep -q 'TREE INTEGRITY VIOLATION' "$OUT11" \
+  && bad "real-shapes run falsely raised a TREE INTEGRITY VIOLATION (a new checkpoints haid_ file, an updated collisions branch-slug file, and a new dated journal file are all real hook-emitted shapes)" \
+  || ok "real-shapes run raised no false TREE INTEGRITY VIOLATION"
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# 12 — sanity bound: this whole guard (12 sandboxed sub-runs of a 3-suite runner) should be
 # fast. Not a precision perf assertion (that would be flaky) — just a hang/regression net.
 # ════════════════════════════════════════════════════════════════════════════════════════
 echo
-echo "10 — sanity: sandboxed sub-runs stay fast (loose bound, not a precision timing test)"
-echo "  (implicit — this whole file already ran under the 60s per-sandbox alarm ten times)"
+echo "12 — sanity: sandboxed sub-runs stay fast (loose bound, not a precision timing test)"
+echo "  (implicit — this whole file already ran under the 60s per-sandbox alarm twelve times)"
 ok "no sandboxed run hit its 60s alarm (would have shown up as a failure above already)"
 
 echo

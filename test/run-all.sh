@@ -434,8 +434,42 @@ git -C "$REPO" stash list > "$WORK/stash-before.txt" 2>/dev/null
 # Only add/modify-shaped status codes are exempt (`??`, `.M`, `M.`, `A.`, `.A`) — a DELETE
 # or typechange under these same paths still counts as a real violation: nothing legitimate
 # deletes a hook-owned record, so that keeps failing, same as everywhere else.
+#
+# SECOND 2026-09-21 finding (EXPLOITABLE, contained — a security review the same day as the
+# incident above): the path half of this pattern was PREFIX-ONLY — no trailing anchor, no
+# filename shape — so anything landing under one of these four directories, however it got
+# there, was silently exempted. A suite (buggy or malicious) could drop
+# `ledger/checkpoints/dropper.sh`, nest arbitrary depth (`journal/sub/dir/x.bin`), or tamper
+# a past journal entry under a made-up name, and both this tracked-diff AND the receipt's
+# tree_clean stayed green throughout. Fixed by anchoring each branch to the exact shape its
+# real writer emits, terminated with `$`:
+#   journal/YYYY-MM-DD-haid_<slug>.md       — bin/heimdall-journal (haid_slug = its haid via
+#                                              tr '/:' '__' — always "haid_"-prefixed, since
+#                                              every haid literal starts "haid:").
+#   ledger/{activity,verdicts,checkpoints}/haid_<slug>.json
+#                                          — bin/heimdall-activity, bin/heimdall-gate-surface,
+#                                            bin/heimdall-checkpoint: all three key their
+#                                            record's filename off the CURRENT haid via that
+#                                            same haid_slug, so all three are "haid_"-prefixed
+#                                            on disk (verified against every real file
+#                                            currently under activity/checkpoints/verdicts).
+#   ledger/collisions/<slug>.json           — bin/heimdall-collision keys OFF THE BRANCH NAME
+#                                              via its own branch_slug (same tr '/:' '__', but
+#                                              never "haid:"-prefixed input) — deliberately
+#                                              NOT required to start "haid_" here, unlike the
+#                                              other three, because its real writer genuinely
+#                                              doesn't; requiring it would just break real
+#                                              collision records. `[^/]+` still forbids
+#                                              nesting and the mandatory `\.json$` still
+#                                              forbids any other extension, which is the
+#                                              actual exploit surface for this directory.
+# RESIDUAL SCOPE, accepted: this is a filename-SHAPE allowlist, not a content check. A file
+# that already matches one of these real shapes — e.g. today's own
+# journal/2026-09-21-haid_*.md — can still be tampered in place undetected, because the hook
+# that owns it rewrites/appends to that exact path on every reply anyway, so content can't be
+# used to tell a legitimate publish from tampering apart. Only the shape is guarded.
 _hook_owned_path() {
-  printf '%s' '^(\?\?|.M|M.|A.|.A) \.planning/(ledger/(activity|collisions|verdicts|checkpoints)/|journal/)'
+  printf '%s' '^(\?\?|.M|M.|A.|.A) \.planning/(ledger/(activity|verdicts|checkpoints)/haid_[^/]+\.json|ledger/collisions/[^/]+\.json|journal/[0-9]{4}-[0-9]{2}-[0-9]{2}-haid_[^/]+\.md)$'
 }
 
 # ── EXECUTE (bounded parallelism; bash 3.2 has no `wait -n`, so poll with kill -0) ─────────

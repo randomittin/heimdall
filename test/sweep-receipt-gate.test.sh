@@ -262,6 +262,17 @@ git -C "$RWS" rm -q --cached .planning/ledger/checkpoints/haid_existing.placehol
   && ok "A14d receipt tree_clean flips false -- a DELETED ledger record is not exempt (the carve-out covers publishing, not removal)" \
   || bad "A14d a deleted ledger record was treated as clean" "$(cat "$RWS_RECEIPT" 2>/dev/null)"
 git -C "$RWS" reset -q --hard HEAD
+# -- a DROPPED non-json file under ledger/checkpoints/ must still dirty the tree
+# (2026-09-21 exploitable-gap finding: pre-fix, _hook_owned_path in test/run-all.sh
+# matched by PATH PREFIX ONLY -- no filename shape, no trailing anchor -- so ANY
+# filename under ledger/checkpoints/, not just a real haid_<slug>.json record, hid
+# behind the carve-out. A stray, non-json "dropper.sh" must flip tree_clean false.) --
+printf '#!/usr/bin/env bash\necho pwned\n' > "$RWS/.planning/ledger/checkpoints/dropper.sh"
+( cd "$RWS" && bash test/run-all.sh --min 1 ) >"$WORK/sub-e.out" 2>&1
+[ "$(jq -r '.tree_clean' "$RWS_RECEIPT" 2>/dev/null)" = "false" ] \
+  && ok "A14e receipt tree_clean flips false -- a non-json file dropped under ledger/checkpoints/ is not a real hook-emitted record and must not hide behind the carve-out" \
+  || bad "A14e a dropped non-json file under ledger/checkpoints/ was treated as clean (the 2026-09-21 exploitable gap)" "$(cat "$RWS_RECEIPT" 2>/dev/null)"
+rm -f "$RWS/.planning/ledger/checkpoints/dropper.sh"
 echo "stray" > "$RWS/some-new-source-file.txt"
 ( cd "$RWS" && bash test/run-all.sh --min 1 ) >"$WORK/sub-c.out" 2>&1
 SUB_C_RC=$?
