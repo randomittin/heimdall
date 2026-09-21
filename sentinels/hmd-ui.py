@@ -10,8 +10,16 @@ tester can assert the deny-list against it.
 
 Routes (all GET):
     /                 the single static page (sentinels/hmd-ui.html)
-    /api/state        the section-4 JSON contract, built fresh from the sources
-                      (+ Wave 4's additive `panels` array: .heimdall/ui/panels/<id>.json
+    /api/state        the section-4 JSON contract, served from the SAME background-
+                      polled StateCache snapshot /api/events reads (perf: a GET is a
+                      dict->JSON serialize, not a fresh collect -- the cache recomputes
+                      itself at least every POLL_INTERVAL_S, or synchronously on demand
+                      if empty/stale; see StateCache.latest()). `?digest=<sha>` (or an
+                      `If-None-Match: "<sha>"` header) matching the current digest gets
+                      a bodyless 304 with `ETag: "<sha>"`; otherwise 200 with that same
+                      ETag -- the identical digest_of() value an /api/events frame's
+                      `id:` line carries, so a client can share one digest between both
+                      routes. (+ Wave 4's additive `panels` array: .heimdall/ui/panels/<id>.json
                       through bin/lib/companion_ui_panels.read_panels -- validated,
                       secret-scrubbed, capped, `stale`-flagged, TTL-reaped). When
                       transport.public_host is set (--allow-host), `repo`/`edits.paths`
@@ -242,6 +250,48 @@ def _run_json(argv, cwd):
         return None
 
 
+# perf (HANDOFF-TO-HEIMDALL-2026-09-21.md item 1): /api/state measured 1.5-3.0s per
+# request on loopback. Reproduced locally with HMD_UI_PROFILE=1 -- collect_fallback
+# ~310ms, collect_hooks ~290ms, collect_identity ~255ms, collect_quality_gate ~10ms,
+# every other collector sub-millisecond: seven subprocess spawns per collect_state()
+# call account for nearly all of it. _run_cached/_run_json_cached memoize by the
+# exact (argv, cwd) pair for SUBPROCESS_CACHE_TTL_S (one poll interval), so a burst
+# of GETs -- or a GET landing next to the poller's own tick -- never spawns the same
+# command twice within it; no caller ends up with an answer staler than the
+# un-cached code already tolerated (StateCache only refreshed once per tick anyway).
+SUBPROCESS_CACHE_TTL_S = POLL_INTERVAL_S
+_subprocess_cache = {}
+_subprocess_cache_lock = threading.Lock()
+
+
+def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S):
+    """Same contract as `_run`, memoized by the exact (argv, cwd) pair for
+    SUBPROCESS_CACHE_TTL_S. The lock spans the whole miss path (not just the dict
+    read/write): two concurrent /api/state requests racing a cold cache must never
+    both spawn the same command -- the second blocks on the lock and then hits the
+    now-warm entry instead of racing its own subprocess (perf item 2d: never spawn
+    `git` more than once per poll interval, even under concurrent load)."""
+    key = (tuple(argv), cwd)
+    with _subprocess_cache_lock:
+        now = time.monotonic()
+        hit = _subprocess_cache.get(key)
+        if hit is not None and now - hit[0] < SUBPROCESS_CACHE_TTL_S:
+            return hit[1]
+        result = _run(argv, cwd, timeout=timeout)
+        _subprocess_cache[key] = (time.monotonic(), result)
+        return result
+
+
+def _run_json_cached(argv, cwd):
+    rc, out, _ = _run_cached(argv, cwd)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
 def _first_line(text):
     for line in (text or "").splitlines():
         s = line.strip()
@@ -272,11 +322,11 @@ def collect_session_code(root):
 
 
 def collect_identity(root):
-    ident = _run_json(("heimdall-identity", "--json"), root)
+    ident = _run_json_cached(("heimdall-identity", "--json"), root)
     handle = ident.get("handle") if isinstance(ident, dict) else None
-    rc, out, _ = _run(("heimdall-haid", "current"), root)
+    rc, out, _ = _run_cached(("heimdall-haid", "current"), root)
     haid = _first_line(out) if rc == 0 else None
-    rc, out, _ = _run(("git", "rev-parse", "--abbrev-ref", "HEAD"), root, timeout=3)
+    rc, out, _ = _run_cached(("git", "rev-parse", "--abbrev-ref", "HEAD"), root, timeout=3)
     branch = _first_line(out) if rc == 0 else None
     return {"handle": handle or None, "haid": haid or None, "branch": branch or None,
             "session_code": collect_session_code(root)}
@@ -332,7 +382,7 @@ def collect_roster(root):
 
 
 def collect_quality_gate(root):
-    rc, out, err = _run(("heimdall-state", "check-quality-gates"), root)
+    rc, out, err = _run_cached(("heimdall-state", "check-quality-gates"), root)
     if rc is None:
         return {"clear_to_push": None, "reason": None}
     text = (out or "") + "\n" + (err or "")
@@ -361,14 +411,14 @@ HOOK_KEYS = ("id", "event", "locked", "enabled", "description")
 
 
 def collect_hooks(root):
-    data = _run_json(("heimdall-hooks", "list", "--json"), root)
+    data = _run_json_cached(("heimdall-hooks", "list", "--json"), root)
     if not isinstance(data, list):
         return []
     return [{k: h.get(k) for k in HOOK_KEYS} for h in data if isinstance(h, dict)]
 
 
 def collect_fallback(root):
-    data = _run_json(("heimdall-fallback", "status", "--json"), root)
+    data = _run_json_cached(("heimdall-fallback", "status", "--json"), root)
     if not isinstance(data, dict):
         return {k: None for k in FALLBACK_ALLOWED_KEYS}
     # Decision 4: never forward endpoint / operator_key_* / config_path.
@@ -464,17 +514,41 @@ def _read_tail(path, nbytes):
         return None
 
 
+_file_cache = {}
+_file_cache_lock = threading.Lock()
+
+
+def _cached_by_mtime(path, compute):
+    """Memoize compute() (a parse) by path's (mtime_ns, size) -- perf: e.g.
+    collect_parallelism's metrics.jsonl tail-parse only re-runs when the file
+    actually changed, not on every poll tick or GET. Lock spans the compute step
+    too, so concurrent callers racing an unchanged path never both re-parse it."""
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    with _file_cache_lock:
+        hit = _file_cache.get(path)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        result = compute()
+        _file_cache[path] = (stamp, result)
+        return result
+
+
 def collect_parallelism(root):
     spath = _tracker_state_path()
     live = parse_tracker_state(_read_text(spath)) if spath else None
     if live:
         return live
-    graded = parse_metrics_tail(_read_tail(os.path.join(root, ".planning", "metrics.jsonl"), METRICS_TAIL_BYTES))
+    mpath = os.path.join(root, ".planning", "metrics.jsonl")
+    graded = _cached_by_mtime(mpath, lambda: parse_metrics_tail(_read_tail(mpath, METRICS_TAIL_BYTES)))
     return graded if graded else parallelism_empty()
 
 
 def collect_edits(root):
-    rc, out, _ = _run(("edit-tracker", "paths"), root)
+    rc, out, _ = _run_cached(("edit-tracker", "paths"), root)
     if rc is None:
         return None
     paths = []
@@ -667,12 +741,24 @@ def _redact_state_for_public(state):
 def collect_state(root, transport=None):
     """The section-4 contract. Each slice degrades independently: object-typed
     slices keep their keys with null values, array slices go empty, and the two
-    `| null` slices (sweep_receipt, checkpoint) go null -- never an error."""
+    `| null` slices (sweep_receipt, checkpoint) go null -- never an error.
+
+    HMD_UI_PROFILE=1 (env, read fresh on every call so a test can toggle it
+    without restarting the server) logs `hmd-ui: profile <collector> <ms>ms` to
+    stderr for each collector below -- how this file's perf work
+    (test/heimdall-ui-perf.test.sh) was measured. Off by default: one
+    os.environ.get() plus a branch per call, no timer ever started."""
+    profile = os.environ.get("HMD_UI_PROFILE") == "1"
+
     def safe(fn, empty=None):
+        started = time.monotonic() if profile else None
         try:
             return fn(root)
         except Exception:
             return empty() if callable(empty) else empty
+        finally:
+            if profile:
+                sys.stderr.write("hmd-ui: profile %s %.1fms\n" % (fn.__name__, (time.monotonic() - started) * 1000))
     state = {
         "schema_version": SCHEMA_VERSION,
         "ts": time.time(),
@@ -731,14 +817,20 @@ def digest_of(state):
 class StateCache:
     """A single background thread re-reads the sources every POLL_INTERVAL_S and
     publishes (state, digest). SSE clients wait on the condition for a digest change,
-    so N open tabs cost one collection per tick, not N."""
+    so N open tabs cost one collection per tick, not N. UIHandler._route's /api/state
+    branch shares this SAME object (state, digest, lock) via refresh() -- perf comes
+    from the lower-level subprocess/file caches making each refresh() cheap, not from
+    skipping it; a GET can also be what wakes an idle SSE stream, since refresh()
+    notifies the same condition variable wait_for_change() blocks on."""
 
     def __init__(self, root, transport=None):
         self.root = root
         self.transport = transport
         self._cond = threading.Condition()
+        self._refresh_lock = threading.Lock()  # only one collect_state() in flight at a time
         self._state = None
         self._digest = None
+        self._refreshed_at = None   # time.monotonic() of the last completed refresh, or None
         self._stop = threading.Event()
         self._live_users = None   # (value, written_at) of the self-published panel
 
@@ -752,22 +844,50 @@ class StateCache:
             self._live_users = publish_live_users(self.root, len(state.get("roster") or []), before)
             if self._live_users is not before:
                 try:
-                    state["panels"] = collect_panels(self.root)
+                    panels = collect_panels(self.root)
+                    # collect_panels() is called directly here (not through another
+                    # collect_state()), so it bypasses collect_state()'s own A9/N4
+                    # redaction gate -- re-apply it so a public-mode server can never
+                    # emit one unredacted panel per live-users publish tick.
+                    if self.transport and self.transport.get("public_host"):
+                        panels = _redact_public(panels)
+                    state["panels"] = panels
                 except Exception:
                     state["panels"] = []
         digest = digest_of(state)
         with self._cond:
             self._state = state
+            self._refreshed_at = time.monotonic()
             if digest != self._digest:
                 self._digest = digest
                 self._cond.notify_all()
         return state, digest
 
+    def _fresh_locked(self):
+        """True if there's a state newer than one poll interval. Caller holds _cond."""
+        return (self._state is not None and self._refreshed_at is not None
+                and time.monotonic() - self._refreshed_at < POLL_INTERVAL_S)
+
     def latest(self):
+        """perf: the common case is a lock, a freshness check, and a return -- no
+        collection at all. Recomputes synchronously, at most once per
+        POLL_INTERVAL_S, only when empty (first request) or stale (poller fell
+        behind, or invalidate() was just called)."""
         with self._cond:
-            if self._state is not None:
+            if self._fresh_locked():
                 return self._state, self._digest
-        return self.refresh()
+        with self._refresh_lock:
+            with self._cond:
+                if self._fresh_locked():
+                    return self._state, self._digest
+            return self.refresh()
+
+    def invalidate(self):
+        """Force the next latest() to recompute rather than serve a cached snapshot --
+        for a write THIS process just made (POST /api/send) that latest()'s own
+        POLL_INTERVAL_S staleness window would otherwise mask for up to one tick."""
+        with self._cond:
+            self._refreshed_at = None
 
     def wait_for_change(self, seen_digest, timeout):
         """Block until the digest differs from `seen_digest` or `timeout` elapses.
@@ -780,7 +900,8 @@ class StateCache:
 
     def run(self):
         while not self._stop.is_set():
-            self.refresh(publish=True)
+            with self._refresh_lock:
+                self.refresh(publish=True)
             self._stop.wait(POLL_INTERVAL_S)
 
     def start(self):
@@ -1055,6 +1176,10 @@ class UIHandler(BaseHTTPRequestHandler):
         except OSError:
             self._send_json(500, {"error": "write-failed"})
             return
+        # This write changes /api/state's inbox.pending in THIS process -- invalidate
+        # so the very next GET recomputes instead of serving a snapshot up to
+        # POLL_INTERVAL_S stale (see StateCache.invalidate).
+        self.server.cache.invalidate()
         queued = len(INBOX.list_pending(root))
         self._send_json(202, {"id": record["id"], "queued": queued})
 
@@ -1088,19 +1213,52 @@ class UIHandler(BaseHTTPRequestHandler):
                 self._log_lockout(ip)
         self._send(401, "unauthorized: missing or invalid token")
 
-    def _route(self, _query):
+    def _route(self, query):
         path = urlsplit(self.path).path
         if path == "/":
             self._serve_page()
         elif path == "/api/state":
-            # Always a FRESH collection: a source deleted a moment ago must read as
-            # null now, not after the next poll tick (no caching beyond the digest).
-            state, _digest = self.server.cache.refresh()
-            self._send_json(200, state)
+            # perf: always a fresh collect_state() -- same invariant the pre-cache
+            # code documented: a source deleted a moment ago must read as null NOW,
+            # not after the next poll tick. refresh() is cheap now because the slow
+            # parts (subprocess spawns, metrics.jsonl parses) are cached below it at
+            # SUBPROCESS_CACHE_TTL_S / by mtime -- not because the whole snapshot is
+            # served stale. refresh() also updates the SAME (state, digest) pair
+            # /api/events waits on, so a GET here can wake an idle SSE stream sooner.
+            state, digest = self.server.cache.refresh()
+            etag = '"%s"' % digest
+            if self._state_not_modified(query, digest):
+                self._send_not_modified(etag)
+            else:
+                self._send_json(200, state, extra_headers={"ETag": etag})
         elif path == "/api/events":
             self._serve_events()
         else:
             self._send(404, "not found")
+
+    def _state_not_modified(self, query, digest):
+        """True when the client already has this exact snapshot: `?digest=` or
+        `If-None-Match` (quoted or bare) matches the current digest -- the same
+        digest_of() value an /api/events frame's `id:` line carries, so a client can
+        reuse either as the other's cache key. Pattern: _presented_token above."""
+        vals = query.get("digest") or []
+        requested = vals[0] if vals else ""
+        if requested and requested == digest:
+            return True
+        inm = (self.headers.get("If-None-Match") or "").strip()
+        if inm.startswith('"') and inm.endswith('"') and len(inm) >= 2:
+            inm = inm[1:-1]
+        return bool(inm) and inm == digest
+
+    def _send_not_modified(self, etag):
+        """304, no body. RFC 7232 section 4.1 permits only a handful of headers on a
+        304 and forbids a representation header like Content-Type, so this does not
+        go through _common_headers()."""
+        self.send_response(304)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
 
     def _serve_page(self):
         html = _read_text(PAGE_PATH)
