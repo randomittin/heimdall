@@ -574,47 +574,68 @@ def publish_live_users(root, roster_count, previous, now=None):
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
+# N4: a path TOKEN -- '/' or '~/' at the start of the string or right after
+# whitespace (never mid-word, so "a/b" and "http://x" are left alone -- their '/'
+# is preceded by a non-space character), running to the next whitespace/quote.
+# Matches wherever the token sits in a larger string, so a value that IS nothing
+# but a path and a warning message that merely MENTIONS one both lose it.
+_ABS_PATH_TOKEN_RE = re.compile(r"""(?<!\S)(?:/|~/)[^\s"']*""")
+
+
+def _redact_public_token(token):
+    """One matched path token -> its basename. `os.path.normpath` first so a
+    trailing slash (or an embedded '.'/'..' segment) still collapses to a real
+    last-component name instead of the empty string `basename()` would otherwise
+    give it; falls back to the original token on the rare all-slashes value (e.g.
+    a bare '/') rather than emptying it."""
+    bn = os.path.basename(os.path.normpath(token))
+    return bn if bn else token
+
 
 def _scrub_public_string(value):
-    """A9: a public-mode string must carry no email-shaped substring and no
-    absolute path -- either would hand the operator's identity or a `$HOME`-adjacent
-    username to anyone Tailscale Funnel's --allow-host exposes this server to.
-    Non-strings (bool/int/float/None) pass through untouched."""
+    """N4: a public-mode string LEAF must carry no email-shaped substring and no
+    absolute-or-home path token -- either would hand the operator's identity, a
+    `$HOME`-adjacent username, or a private filesystem layout to anyone Tailscale
+    Funnel's --allow-host exposes this server to. Non-strings (bool/int/float/
+    None) pass through untouched. A leaf transform only -- see `_redact_public`
+    for the recursive walk that reaches every leaf in the first place."""
     if not isinstance(value, str):
         return value
     if _EMAIL_RE.search(value):
-        value = _EMAIL_RE.sub("[redacted]", value)
-    if os.path.isabs(value):
-        value = os.path.basename(value) or value
+        value = _EMAIL_RE.sub("[email]", value)
+    if _ABS_PATH_TOKEN_RE.search(value):
+        value = _ABS_PATH_TOKEN_RE.sub(lambda m: _redact_public_token(m.group(0)), value)
     return value
 
 
+def _redact_public(obj):
+    """N4: the single recursive walk applied to the WHOLE /api/state body in
+    public mode -- replacing the old 4-key allowlist (repo/edits.paths/roster/
+    ledger.team), which left panels, checkpoint, sweep_receipt, identity.handle
+    and every other string-valued field reaching an --allow-host listener
+    unscrubbed. Every string leaf at any depth, including inside lists, goes
+    through `_scrub_public_string`; dict KEYS and non-string leaves (numbers,
+    bools, None) come back exactly as-is -- never scrubbed, never recursed into
+    as if they were containers. Rebuilds dicts/lists rather than mutating them in
+    place, so a structure another part of the process still holds a reference to
+    (e.g. a cached panel dict) is never mutated behind its back."""
+    if isinstance(obj, dict):
+        return {k: _redact_public(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_public(v) for v in obj]
+    return _scrub_public_string(obj)
+
+
 def _redact_state_for_public(state):
-    """A9: called only when transport.public_host is set. Three fields go from
-    "everything" to "enough to render the UI": `repo` to its basename (no home-dir
-    username), `edits.paths`' out-of-repo entries (already absolute -- in-repo
-    entries are already relative and untouched) to their basename, and every string
-    value inside each `roster` / `ledger.team` row scrubbed of email-shaped
-    substrings and absolute paths. Loopback (no --allow-host) never calls this, so
-    its output stays byte-for-byte what it was before A9."""
-    repo = state.get("repo")
-    if isinstance(repo, str) and repo:
-        state["repo"] = os.path.basename(os.path.normpath(repo)) or repo
-
-    edits = state.get("edits")
-    if isinstance(edits, dict) and isinstance(edits.get("paths"), list):
-        edits["paths"] = [os.path.basename(p) if isinstance(p, str) and os.path.isabs(p) else p
-                           for p in edits["paths"]]
-
-    roster = state.get("roster")
-    if isinstance(roster, list):
-        state["roster"] = [{k: _scrub_public_string(v) for k, v in row.items()} if isinstance(row, dict) else row
-                            for row in roster]
-
-    ledger = state.get("ledger")
-    if isinstance(ledger, dict) and isinstance(ledger.get("team"), list):
-        ledger["team"] = [{k: _scrub_public_string(v) for k, v in row.items()} if isinstance(row, dict) else row
-                           for row in ledger["team"]]
+    """A9/N4: called only when transport.public_host is set. Walks EVERY slice of
+    `state` -- repo, edits, roster, ledger, panels, checkpoint, sweep_receipt,
+    identity, hooks, fallback, parallelism, quality_gate, reels, inbox, transport
+    itself, and whatever the section-4 contract carries next -- so a newly added
+    field is covered automatically instead of needing to be remembered here by
+    name. Loopback (no --allow-host) never calls this, so its output stays
+    byte-for-byte what it was before A9/N4."""
+    for key, value in list(state.items()):
+        state[key] = _redact_public(value)
 
 
 def collect_state(root, transport=None):
