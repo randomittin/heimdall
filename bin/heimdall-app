@@ -341,6 +341,31 @@ _run_with_timeout() {
   return "$rc"
 }
 
+# _dns_suffix_hint DNSNAME — print a hint when DNSNAME carries a Tailscale
+# disambiguating "-N" numeric suffix on this box's own hostname label (an
+# older node registered under the same base name is still listed, offline,
+# in the tailnet -- see hmdapp docs/HANDOFF-TO-HEIMDALL-2026-09-21.md item 4:
+# switching tailscaled builds got this machine a "-1" suffix instead of
+# reclaiming its bare name). Hostname normalization follows the slugify
+# idiom at bin/heimdall-agents:190 -- lowercased, every non-alnum char ->
+# '-'. Exit 0 with the hint line on stdout when DNSNAME's first label is
+# exactly "<host>-<digits>"; exit 1, silent, otherwise (no hostname
+# resolved, or no suffix match).
+_dns_suffix_hint() {
+  local dnsname="${1:-}" raw_host host lower_dns reclaim
+  [ -n "$dnsname" ] || return 1
+  raw_host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null)"
+  [ -n "$raw_host" ] || return 1
+  host="$(printf '%s' "$raw_host" | tr '[:upper:]' '[:lower:]')"
+  host="${host//[^a-z0-9]/-}"
+  [ -n "$host" ] || return 1
+  lower_dns="$(printf '%s' "$dnsname" | tr '[:upper:]' '[:lower:]')"
+  printf '%s' "$lower_dns" | grep -Eq -- "^${host}-[0-9]+\.[a-z0-9.-]+\.ts\.net$" || return 1
+  reclaim="${host}.${lower_dns#*.}"
+  printf '%s' "DNSName carries a -N suffix: an older node named ${host} is probably still registered (offline) in the tailnet admin console — remove it at https://login.tailscale.com/admin/machines and re-run 'tailscale up' to reclaim ${reclaim}"
+  return 0
+}
+
 cmd_connect() {
   local REPO="" PORT="8710" NO_INSTALL=false BG=false
   HTTPS_PORT="443"
@@ -545,6 +570,12 @@ cmd_connect() {
   echo "hmd app: connected -- public URL:"
   echo "  $pub_url"
   echo ""
+  local dns_hint
+  dns_hint="$(_dns_suffix_hint "$host")"
+  if [ -n "$dns_hint" ]; then
+    echo "$dns_hint"
+    echo ""
+  fi
   if [ -n "$PY3" ] && [ -r "$QR_PY" ]; then
     # A5: the pairing URL (with its live token) goes on stdin, never argv --
     # argv is visible to any local user via `ps`, stdin is not.
@@ -840,10 +871,12 @@ cmd_doctor() {
   fi
 
   if [ "$online" = true ]; then
-    local dns
+    local dns dns_hint
     dns="$(ts_dns_name 2>/dev/null || true)"
     if [ -n "$dns" ]; then
       echo "ok    DNSName resolvable ($dns)"
+      dns_hint="$(_dns_suffix_hint "$dns")"
+      [ -n "$dns_hint" ] && echo "info  $dns_hint"
     else
       echo "FAIL  DNSName resolvable"
       echo "      fix: wait a few seconds for tailscaled to register a name, then retry"

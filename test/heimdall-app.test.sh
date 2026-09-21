@@ -520,6 +520,62 @@ printf '%s' "$DOC_BADPORT" | grep -q 'FAIL.*https-port allowed' && ok "doctor fl
 
 rm -rf "$D"
 
+# ── DNSName -N suffix hint (2026-09-21, hmdapp docs/HANDOFF-TO-HEIMDALL-
+# 2026-09-21.md item 4): a second node registering under the same base
+# hostname while an older one is still listed offline in the tailnet gets a
+# "-N"-suffixed DNSName -- doctor points the operator at the admin console
+# instead of leaving the "-N" a silent mystery. HOST_NORM uses the real
+# test-machine hostname (same scutil/hostname fallback the app itself uses)
+# so the first two cases prove actual normalization, not a stand-in.
+HOST_RAW="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null)"
+HOST_NORM="$(printf '%s' "$HOST_RAW" | tr '[:upper:]' '[:lower:]')"
+HOST_NORM="${HOST_NORM//[^a-z0-9]/-}"
+
+if [ -n "$HOST_NORM" ]; then
+  D="$(make_repo)"
+  DOC_SUFFIX="$(FAKE_TS_DNSNAME="${HOST_NORM}-1.tail1234.ts.net." FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
+  [ "$DRC" -eq 0 ] && ok "doctor (DNSName w/ -N suffix) still exits 0 -- info, not FAIL" || bad "exit $DRC: $DOC_SUFFIX"
+  printf '%s' "$DOC_SUFFIX" | grep -q 'all checks passed' && ok "doctor (DNSName w/ -N suffix) still reports all checks passed" || bad "$DOC_SUFFIX"
+  EXPECT_SUFFIX_LINE="info  DNSName carries a -N suffix: an older node named ${HOST_NORM} is probably still registered (offline) in the tailnet admin console — remove it at https://login.tailscale.com/admin/machines and re-run 'tailscale up' to reclaim ${HOST_NORM}.tail1234.ts.net"
+  printf '%s' "$DOC_SUFFIX" | grep -qF "$EXPECT_SUFFIX_LINE" && ok "doctor prints the exact -N suffix info line" || bad "$DOC_SUFFIX"
+  rm -rf "$D"
+
+  D="$(make_repo)"
+  DOC_NOSUFFIX="$(FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
+  if printf '%s' "$DOC_NOSUFFIX" | grep -q -- '-N suffix'; then
+    bad "doctor w/ a plain DNSName (no suffix) unexpectedly prints the -N suffix hint: $DOC_NOSUFFIX"
+  else
+    ok "doctor w/ a plain DNSName (no suffix) prints no -N suffix hint"
+  fi
+  rm -rf "$D"
+
+  FAKE_HOSTBIN="$TMPROOT/fakehostbin"
+  mkdir -p "$FAKE_HOSTBIN"
+  cat > "$FAKE_HOSTBIN/scutil" <<'HOSTEOF'
+#!/usr/bin/env bash
+echo "RJ Test Host"
+HOSTEOF
+  chmod +x "$FAKE_HOSTBIN/scutil"
+  cat > "$FAKE_HOSTBIN/hostname" <<'HOSTEOF'
+#!/usr/bin/env bash
+echo "wrong-fallback-should-not-be-used"
+HOSTEOF
+  chmod +x "$FAKE_HOSTBIN/hostname"
+
+  D="$(make_repo)"
+  DOC_NORM="$(PATH="$FAKE_HOSTBIN:$PATH" FAKE_TS_DNSNAME='rj-test-host-1.tail1234.ts.net.' FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
+  printf '%s' "$DOC_NORM" | grep -qF 'an older node named rj-test-host is' && ok "doctor normalizes a hostname with capitals/spaces (scutil 'RJ Test Host' -> rj-test-host)" || bad "$DOC_NORM"
+  if printf '%s' "$DOC_NORM" | grep -qF 'wrong-fallback-should-not-be-used'; then
+    bad "doctor used the hostname(1) fallback instead of scutil: $DOC_NORM"
+  else
+    ok "doctor prefers scutil over the hostname(1) fallback"
+  fi
+  rm -rf "$D"
+else
+  ok "doctor -N suffix hint: skipped (no local hostname resolvable in this environment)"
+fi
+
+
 # ── 56-59. unknown flags rejected on every subcommand ────────────────────
 OUT="$("$APP" connect --bogus-flag 2>&1)"; RC=$?
 [ "$RC" -eq 2 ] && ok "connect rejects an unknown flag, exit 2" || bad "exit $RC: $OUT"
@@ -1126,6 +1182,36 @@ else
 fi
 grep -qE '^funnel (reset|--https=[0-9]+ off)$' "$LOG" && ok "connect (timeout) still invoked funnel-stop during teardown" || bad "no stop invocation in log: $(cat "$LOG" 2>/dev/null)"
 rm -rf "$D"
+
+# ── connect prints the same -N suffix hint once in its banner (2026-09-21,
+# hmdapp docs/HANDOFF-TO-HEIMDALL-2026-09-21.md item 4) ──────────────────────
+if [ -n "$HOST_NORM" ]; then
+  D="$(make_repo)"
+  OUT_FILE="$TMPROOT/connect-dns-suffix.out"
+  FAKE_TS_DNSNAME="${HOST_NORM}-1.tail1234.ts.net." FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
+  RC=$?
+  [ "$RC" -eq 0 ] && ok "connect --bg (DNSName w/ -N suffix) still exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
+  EXPECT_CONNECT_LINE="DNSName carries a -N suffix: an older node named ${HOST_NORM} is probably still registered (offline) in the tailnet admin console — remove it at https://login.tailscale.com/admin/machines and re-run 'tailscale up' to reclaim ${HOST_NORM}.tail1234.ts.net"
+  CONNECT_HINT_COUNT="$(grep -cF "$EXPECT_CONNECT_LINE" "$OUT_FILE")"
+  [ "$CONNECT_HINT_COUNT" -eq 1 ] && ok "connect banner prints the -N suffix hint exactly once" || bad "count=$CONNECT_HINT_COUNT: $(cat "$OUT_FILE")"
+  FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
+  rm -rf "$D"
+
+  D="$(make_repo)"
+  OUT_FILE2="$TMPROOT/connect-dns-nosuffix.out"
+  FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE2" 2>&1
+  RC=$?
+  if grep -qF -- '-N suffix' "$OUT_FILE2"; then
+    bad "connect banner unexpectedly prints the -N suffix hint for a plain DNSName: $(cat "$OUT_FILE2")"
+  else
+    ok "connect banner prints no -N suffix hint for a plain DNSName"
+  fi
+  FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
+  rm -rf "$D"
+else
+  ok "connect -N suffix hint: skipped (no local hostname resolvable in this environment)"
+fi
+
 
 # ── A6: errfile security (no predictable /tmp fallback) ───────────────────
 [ "$(grep -c 'echo "/tmp/' "$APP")" -eq 0 ] && ok "no hardcoded /tmp fallback patterns in bin/heimdall-app" || bad "/tmp fallback pattern found in code"
