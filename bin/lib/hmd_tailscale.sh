@@ -467,7 +467,11 @@ _ts_funnel_await() {
 
   if [ "$url_seen" -eq 0 ]; then
     line="$(grep -i 'login\.tailscale\.com' "$out" 2>/dev/null | head -1)"
-    [ -n "$line" ] && url_seen=1
+    if [ -n "$line" ]; then
+      url_seen=1
+      printf '%s\n' "$line" >&2
+      printf 'hmd_tailscale: open that URL to approve Funnel for this node; waiting up to %ss...\n' "$wait_s" >&2
+    fi
   fi
 
   if [ "$rc" -eq 0 ]; then
@@ -475,9 +479,6 @@ _ts_funnel_await() {
   fi
 
   if [ "$url_seen" -eq 1 ]; then
-    [ -n "$line" ] || line="$(grep -i 'login\.tailscale\.com' "$out" 2>/dev/null | head -1)"
-    [ -n "$line" ] && printf '%s\n' "$line" >&2
-    printf 'hmd_tailscale: open that URL to approve Funnel for this node; waiting up to %ss...\n' "$wait_s" >&2
     return 3
   fi
 
