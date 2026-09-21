@@ -254,6 +254,35 @@ def paths_for(root):
     }
 
 
+# N2: bin/lib/companion_ui_inbox.py's own _ensure_dir/_open_append_0600 force
+# the .heimdall/ui directory to 0700 and every file in it to 0600, on every
+# touch (not just first creation), because phone messages are private to the
+# repo owner. The inline fallback below implements the SAME on-disk protocol
+# as that module (append/list_pending/pop_all/peek over the same files) and
+# must carry the same permission floor -- otherwise a repo running the
+# fallback (no bin/lib/companion_ui_inbox.py importable) writes
+# inbox.jsonl/inbox-delivered.jsonl/the lock file at os.makedirs()'s and
+# open()'s own defaults (0755/0644), world-readable. These two helpers are
+# mirrored verbatim from that module so both paths agree on the permission
+# model.
+def _ensure_dir(path, mode=0o700):
+    """Create the directory (and parents) if missing, then force its mode to
+    the given mode regardless of umask or a wider pre-existing mode."""
+    os.makedirs(path, exist_ok=True)
+    os.chmod(path, mode)
+
+
+def _open_append_0600(path):
+    """Open path for text append, creating it at mode 0600 if missing, and
+    forcing 0600 even when it already exists (O_CREAT's mode argument is
+    only applied -- and only umask-limited -- on the create branch, so a
+    file left over from before this fix would otherwise keep its old, wider
+    mode forever)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.chmod(path, 0o600)
+    return os.fdopen(fd, "a", encoding="utf-8")
+
+
 class _Flock(object):
     """Exclusive fcntl flock, held for one read/mutate critical section."""
 
@@ -262,8 +291,16 @@ class _Flock(object):
         self.fh = None
 
     def __enter__(self):
-        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
-        self.fh = open(self.lock_path, "a+")
+        # Same 0600 self-healing fix as _open_append_0600 above -- this lock
+        # file lives in the same directory and is just as readable by any
+        # local user if left at a default 0644. Content is never read back
+        # (the file exists only to hold the flock), so truncating it on
+        # every acquisition -- the same approach companion_ui_inbox.py's own
+        # _FlockCtx uses for its lock file -- is harmless.
+        _ensure_dir(os.path.dirname(self.lock_path))
+        fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.chmod(self.lock_path, 0o600)
+        self.fh = os.fdopen(fd, "w")
         fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
         return self
 
@@ -295,18 +332,18 @@ def _parse_lines(raw):
 
 def inline_append(root, text, source="companion"):
     p = paths_for(root)
-    os.makedirs(p["dir"], exist_ok=True)
+    _ensure_dir(p["dir"])
     with _Flock(p["lock"]):
         obj = {"id": "%x" % (int(time.time() * 1e6) ^ os.getpid()),
                "ts": time.time(), "text": sanitize(text),
                "source": str(source or "companion")}
-        with open(p["inbox"], "a") as f:
+        with _open_append_0600(p["inbox"]) as f:
             f.write(json.dumps(obj) + "\n")
 
 
 def inline_list_pending(root):
     p = paths_for(root)
-    os.makedirs(p["dir"], exist_ok=True)
+    _ensure_dir(p["dir"])
     with _Flock(p["lock"]):
         try:
             with open(p["inbox"], "r") as f:
@@ -323,7 +360,7 @@ def inline_peek(root):
 
 def inline_pop_all(root):
     p = paths_for(root)
-    os.makedirs(p["dir"], exist_ok=True)
+    _ensure_dir(p["dir"])
     with _Flock(p["lock"]):
         tmp = "%s.popped.%d.%d" % (p["inbox"], os.getpid(), int(time.time() * 1000))
         try:
@@ -336,7 +373,7 @@ def inline_pop_all(root):
         except OSError:
             raw = ""
         if raw.strip():
-            with open(p["delivered"], "a") as d:
+            with _open_append_0600(p["delivered"]) as d:
                 d.write(raw if raw.endswith("\n") else raw + "\n")
         _silently(lambda: os.remove(tmp))
         return _parse_lines(raw)
@@ -397,11 +434,28 @@ def format_delivery(texts):
     # backticks here (a 3-backtick fence is odd) would break the OUTER
     # script's parse.
     fence = "\x60" * 3
+    bt = fence[0]
     n = len(texts)
-    joined = truncate("\n\n".join(texts), MAX_REASON_CHARS)
+    joined = "\n\n".join(texts)
+    # N5: sanitize() strips control characters but deliberately leaves
+    # backtick characters alone -- they are ordinary printable text. An
+    # untrusted phone message containing its own run of 3+ backticks could
+    # therefore close the fence built above early, so the remainder of the
+    # message (or an instruction appended right after the run) would render
+    # as if it sat outside the quoted/untrusted block instead of inside it.
+    # Collapse any such run to three backticks separated by spaces -- built
+    # from bt above, same reason -- so a delivered message can never
+    # reassemble into, or extend, a fence, no matter where truncate() below
+    # ends up cutting it.
+    joined = re.sub(bt + "{3,}", bt + " " + bt + " " + bt, joined)
+    joined = truncate(joined, MAX_REASON_CHARS)
+    # Every message line is indented 4 spaces so delivered text can never
+    # itself start a line at column 0 -- the only column the marker, the
+    # count line, and the two fence lines are allowed to use.
+    body = "\n".join("    " + line for line in joined.split("\n"))
     count_line = "%d message%s folded:" % (n, "" if n == 1 else "s")
     return "%s\n\n%s\n%s\n%s\n%s" % (
-        INBOX_PROVENANCE_MARKER, count_line, fence, joined, fence)
+        INBOX_PROVENANCE_MARKER, count_line, fence, body, fence)
 
 
 def read_last_assistant_text(path):
