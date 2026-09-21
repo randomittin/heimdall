@@ -1127,5 +1127,9 @@ fi
 grep -qE '^funnel (reset|--https=[0-9]+ off)$' "$LOG" && ok "connect (timeout) still invoked funnel-stop during teardown" || bad "no stop invocation in log: $(cat "$LOG" 2>/dev/null)"
 rm -rf "$D"
 
+# ── A6: errfile security (no predictable /tmp fallback) ───────────────────
+[ "$(grep -c 'echo "/tmp/' "$APP")" -eq 0 ] && ok "no hardcoded /tmp fallback patterns in bin/heimdall-app" || bad "/tmp fallback pattern found in code"
+grep -B3 'errfile=' "$APP" | grep -q 'umask 077' && ok "errfile mktemp is protected by umask 077" || bad "umask 077 not found before errfile mktemp"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -230,7 +230,23 @@ _funnel_looks_up() {
 _funnel_stop_and_verify() {
   local prefix="$1" https_port="$2" port="${3:-}" err rc errfile
   local stop_timeout="${HMD_FUNNEL_STOP_TIMEOUT_S:-20}"
-  errfile="$(mktemp 2>/dev/null || echo "/tmp/hmd-app-stop.$$.err")"
+  # A6: mktemp is required, not best-effort -- no predictable /tmp fallback
+  # umask 077 while it's created ensures the file is 0600 even if mktemp's own
+  # default were ever looser than that on some platform.
+  if ! command -v mktemp >/dev/null 2>&1; then
+    echo "hmd app disconnect: required tool missing: mktemp" >&2
+    return 2
+  fi
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  errfile="$(mktemp)"
+  local mktemp_rc=$?
+  umask "$old_umask"
+  if [ "$mktemp_rc" -ne 0 ] || [ -z "$errfile" ]; then
+    echo "hmd app disconnect: mktemp failed to create a temp file" >&2
+    return 2
+  fi
   _run_with_timeout "$stop_timeout" ts_funnel_stop "$https_port" "$port" >/dev/null 2>"$errfile"
   rc=$?
   err="$(cat "$errfile" 2>/dev/null || true)"
