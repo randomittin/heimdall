@@ -302,12 +302,97 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════════════════════════
-# 7 — sanity bound: this whole guard (7 sandboxed sub-runs of a 3-suite runner) should be
+# 7 — HOOK-OWNED EXEMPTION (journal): a suite that appends to a TRACKED
+# .planning/journal/ file mid-run — exactly hmd's own journal hook's shape (a
+# Stop/communication hook appending a line whenever the orchestrating session replies,
+# never a suite) — must NOT fail the run. This is the 2026-09-21 incident that motivated
+# sharing test/run-all.sh's _hook_owned_path between the tracked-diff and
+# _receipt_dirty_lines: before the fix, this exact shape raised a false TREE INTEGRITY
+# VIOLATION even though the sweep receipt's tree_clean already exempted it.
+# ════════════════════════════════════════════════════════════════════════════════════════
+echo
+echo "7 — a suite that appends to a tracked .planning/journal/ file (hook-owned) does NOT fail the run"
+SBX7="$(build_sandbox case7)"
+mkdir -p "$SBX7/.planning/journal"
+printf '# journal\n' > "$SBX7/.planning/journal/2026-09-21-haid_fake.md"
+cat > "$SBX7/test/fake-journal-hook.test.sh" <<'FIXEOF'
+#!/usr/bin/env bash
+echo "line from fake journal hook" >> .planning/journal/2026-09-21-haid_fake.md
+echo "fake-journal-hook: 1 passed, 0 failed."
+exit 0
+FIXEOF
+chmod +x "$SBX7/test/fake-journal-hook.test.sh"
+commit_all "$SBX7" "add tracked journal file + fake journal-hook suite"
+OUT7="$WORK/case7.out"
+run_sandbox "$SBX7" "$OUT7"; RC7=$?
+[ "$RC7" -eq 0 ] && ok "journal-exemption run exits 0 (got $RC7)" || bad "journal-exemption run should exit 0, got $RC7"
+grep -q 'tree-integrity: clean' "$OUT7" && ok "journal-exemption run reports tree-integrity: clean" \
+  || bad "journal-exemption run did not report tree-integrity: clean"
+grep -q 'TREE INTEGRITY VIOLATION' "$OUT7" \
+  && bad "journal-exemption run falsely raised a TREE INTEGRITY VIOLATION for a hook-owned journal file" \
+  || ok "journal-exemption run raised no false TREE INTEGRITY VIOLATION"
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# 8 — HOOK-OWNED EXEMPTION (ledger/checkpoints): same shape as 7, for
+# .planning/ledger/checkpoints/ — bin/heimdall-checkpoint's own publish target and the
+# other half of the shared _hook_owned_path allowlist.
+# ════════════════════════════════════════════════════════════════════════════════════════
+echo
+echo "8 — a suite that modifies a tracked .planning/ledger/checkpoints/ file (hook-owned) does NOT fail the run"
+SBX8="$(build_sandbox case8)"
+mkdir -p "$SBX8/.planning/ledger/checkpoints"
+printf '{"head_sha":"aaa"}\n' > "$SBX8/.planning/ledger/checkpoints/haid_fake.json"
+cat > "$SBX8/test/fake-checkpoint-hook.test.sh" <<'FIXEOF'
+#!/usr/bin/env bash
+printf '{"head_sha":"bbb"}\n' > .planning/ledger/checkpoints/haid_fake.json
+echo "fake-checkpoint-hook: 1 passed, 0 failed."
+exit 0
+FIXEOF
+chmod +x "$SBX8/test/fake-checkpoint-hook.test.sh"
+commit_all "$SBX8" "add tracked ledger checkpoint + fake checkpoint-hook suite"
+OUT8="$WORK/case8.out"
+run_sandbox "$SBX8" "$OUT8"; RC8=$?
+[ "$RC8" -eq 0 ] && ok "ledger-checkpoint-exemption run exits 0 (got $RC8)" || bad "ledger-checkpoint-exemption run should exit 0, got $RC8"
+grep -q 'tree-integrity: clean' "$OUT8" && ok "ledger-checkpoint-exemption run reports tree-integrity: clean" \
+  || bad "ledger-checkpoint-exemption run did not report tree-integrity: clean"
+grep -q 'TREE INTEGRITY VIOLATION' "$OUT8" \
+  && bad "ledger-checkpoint-exemption run falsely raised a TREE INTEGRITY VIOLATION for a hook-owned ledger/checkpoints file" \
+  || ok "ledger-checkpoint-exemption run raised no false TREE INTEGRITY VIOLATION"
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# 9 — NOT HOOK-OWNED: a modification to an ordinary tracked file OUTSIDE the hook-owned
+# paths (bin/whatever) must still fail the run — proves the exemption is scoped to exactly
+# the two hook-owned directories and does not overreach into unrelated tracked paths.
+# ════════════════════════════════════════════════════════════════════════════════════════
+echo
+echo "9 — a suite that modifies an ordinary tracked file (bin/whatever, NOT hook-owned) still fails the run"
+SBX9="$(build_sandbox case9)"
+mkdir -p "$SBX9/bin"
+printf '#!/usr/bin/env bash\necho whatever\n' > "$SBX9/bin/whatever"
+chmod +x "$SBX9/bin/whatever"
+cat > "$SBX9/test/bad-modify-bin.test.sh" <<'FIXEOF'
+#!/usr/bin/env bash
+echo "# junk" >> bin/whatever
+echo "bad-modify-bin: 1 passed, 0 failed."
+exit 0
+FIXEOF
+chmod +x "$SBX9/test/bad-modify-bin.test.sh"
+commit_all "$SBX9" "add tracked bin/whatever + fixture that mutates it"
+OUT9="$WORK/case9.out"
+run_sandbox "$SBX9" "$OUT9"; RC9=$?
+[ "$RC9" -ne 0 ] && ok "non-hook-owned-fixture run exits non-zero (got $RC9)" || bad "non-hook-owned-fixture run should fail, got $RC9"
+grep -q 'TREE INTEGRITY VIOLATION' "$OUT9" && ok "non-hook-owned-fixture run raises TREE INTEGRITY VIOLATION for bin/whatever" \
+  || bad "non-hook-owned-fixture run did not raise TREE INTEGRITY VIOLATION"
+grep -q 'bin/whatever' "$OUT9" && ok "non-hook-owned-fixture run NAMES bin/whatever" \
+  || bad "non-hook-owned-fixture run did not name bin/whatever"
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# 10 — sanity bound: this whole guard (10 sandboxed sub-runs of a 3-suite runner) should be
 # fast. Not a precision perf assertion (that would be flaky) — just a hang/regression net.
 # ════════════════════════════════════════════════════════════════════════════════════════
 echo
-echo "7 — sanity: sandboxed sub-runs stay fast (loose bound, not a precision timing test)"
-echo "  (implicit — this whole file already ran under the 60s per-sandbox alarm seven times)"
+echo "10 — sanity: sandboxed sub-runs stay fast (loose bound, not a precision timing test)"
+echo "  (implicit — this whole file already ran under the 60s per-sandbox alarm ten times)"
 ok "no sandboxed run hit its 60s alarm (would have shown up as a failure above already)"
 
 echo
