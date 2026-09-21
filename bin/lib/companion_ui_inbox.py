@@ -31,6 +31,27 @@ Delivery: `pop_all()` moves every pending line to
 empty, under the SAME lock append() takes -- a message can never be observed as
 both pending and delivered, and a message appended mid-pop is never lost.
 
+Capacity (N3): a token holder could otherwise POST unbounded 2000-char messages
+forever, forcing every /api/state 2s poll and every /api/send to re-parse an
+ever-growing inbox.jsonl (O(N^2), unbounded disk). append() now refuses a new
+message once MAX_PENDING are already pending -- InboxError("inbox-full"), which
+the server's existing `except INBOX.InboxError as e: self._send_json(422,
+{"error": e.code})` already maps to 422 with no server-side change needed.
+inbox.jsonl itself can never near MAX_INBOX_BYTES this way (MAX_PENDING x
+MAX_TEXT_CHARS stays well under it); inbox-delivered.jsonl has no such
+structural ceiling (pop_all() is called far more times over a repo's life than
+the file is ever read), so it is the one rotated: once it reaches
+MAX_INBOX_BYTES, pop_all() moves it to inbox-delivered.jsonl.1 (clobbering any
+previous .1 -- single-generation rotation, not a numbered series) before
+appending the batch being delivered, so a delivery's own messages always land
+in the fresh active file. list_pending()/pending_count() are backed by a
+per-process cache keyed on inbox.jsonl's (mtime_ns, size) (_cached_records) --
+the 2s /api/state poll and the post-append recount in POST /api/send skip the
+reopen+reparse entirely when the file hasn't changed since this process's last
+call; any append()/pop_all() from any process changes the file's size, so the
+very next call always sees it (the cache can serve one call stale, never
+longer).
+
 Locking: one exclusive flock over a dedicated `<inbox>.jsonl.lock` file (never the
 data file itself), held for the whole read-modify-write -- the exact convention
 bin/lib/work_queue.py's _FlockCtx and bin/lib/cp_team_queue.py's _PartitionLock
@@ -60,6 +81,8 @@ import time
 import uuid
 
 MAX_TEXT_CHARS = 2000
+MAX_PENDING = 200                    # N3: append() refuses a new message at/above this many pending
+MAX_INBOX_BYTES = 2 * 1024 * 1024    # N3: inbox-delivered.jsonl rotation threshold (2 MiB)
 INBOX_REL = os.path.join(".heimdall", "ui", "inbox.jsonl")
 DELIVERED_REL = os.path.join(".heimdall", "ui", "inbox-delivered.jsonl")
 GIT_TIMEOUT_S = 3
@@ -107,9 +130,10 @@ def _strip_control_chars(text):
 
 
 class InboxError(ValueError):
-    """A message failed validation. `code` is the short machine-readable reason
-    (empty|too-long|secret-shaped|invalid-type) the HTTP layer maps onto a status
-    code; the message names the rule, never echoes the offending text."""
+    """A message failed validation, or the queue is full. `code` is the short
+    machine-readable reason (empty|too-long|secret-shaped|invalid-type|inbox-full)
+    the HTTP layer maps onto a status code; the message names the rule, never
+    echoes the offending text."""
 
     def __init__(self, code, message):
         super().__init__(message)
@@ -207,12 +231,48 @@ def _read_all(path):
     return records, raw_lines
 
 
+_READ_CACHE = {}  # path -> ((mtime_ns, size), records) -- see _cached_records
+
+
+def _cached_records(path):
+    """The records _read_all(path) would return, skipping the reopen+reparse
+    when `path`'s (mtime_ns, size) match the last read done by THIS process --
+    the O(1)-ish path behind list_pending()/pending_count() (N3): /api/state's
+    2s poll and the post-append recount in POST /api/send both call one of
+    those on every hit, far more often than inbox.jsonl actually changes.
+    Correctness: append()/pop_all() always change the file's size, so a change
+    from ANY process is visible on this process's very next call -- the cache
+    can serve at most one call stale, never indefinitely. Returns the cached
+    list object itself (not a copy) -- internal use only; list_pending() and
+    pending_count() are the copy-safe public API built on top of this."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        _READ_CACHE.pop(path, None)
+        return []
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _READ_CACHE.get(path)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    records, _ = _read_all(path)
+    _READ_CACHE[path] = (key, records)
+    return records
+
+
 def list_pending(root):
     """Every valid pending message, oldest first (inbox.jsonl is append-only, so
     file order IS delivery order). Never mutates the file; a corrupt or
-    non-object line is dropped, never raised."""
-    records, _ = _read_all(_inbox_path(root))
-    return records
+    non-object line is dropped, never raised. Returns fresh dict copies every
+    call, even when served from the _cached_records cache, so a caller can
+    never mutate a cached structure."""
+    return [dict(r) for r in _cached_records(_inbox_path(root))]
+
+
+def pending_count(root):
+    """len(list_pending(root)) without the per-call dict copies -- the cheap
+    count MAX_PENDING enforcement (append()) and an /api/state-style summary
+    actually need; O(1)-ish via the same _cached_records cache."""
+    return len(_cached_records(_inbox_path(root)))
 
 
 def peek(root):
@@ -227,7 +287,8 @@ def peek(root):
 def append(root, text):
     """Validate `text` and atomically append one message to inbox.jsonl. Returns
     the new record {id, ts, text, source}. Raises InboxError -- nothing is ever
-    written on a validation failure, and the exception never carries `text`."""
+    written on a validation failure (including the queue already being at
+    MAX_PENDING), and the exception never carries `text`."""
     if not isinstance(text, str):
         raise InboxError("invalid-type", "text must be a string")
     text = _strip_control_chars(text)
@@ -244,6 +305,14 @@ def append(root, text):
     path = _inbox_path(root)
     _ensure_dir(os.path.dirname(path))
     with _FlockCtx(_lock_path(root)):
+        # N3: reject before writing once MAX_PENDING is already reached -- checked
+        # under the SAME lock the write itself takes, so two concurrent senders
+        # (different threads or processes) can never both observe "under the cap"
+        # and jointly push it over.
+        if pending_count(root) >= MAX_PENDING:
+            raise InboxError("inbox-full",
+                             "pending queue is at the %d-message cap; drain it (delivery, or "
+                             "`hmd ui inbox pop`) before sending more" % MAX_PENDING)
         with _open_append_0600(path) as f:
             f.write(line)
             f.flush()
@@ -251,11 +320,30 @@ def append(root, text):
     return record
 
 
+def _rotate_if_oversized(path, max_bytes):
+    """If `path` already exists at/above `max_bytes`, move it to `<path>.1`
+    (clobbering any previous `.1` -- single-generation rotation, not a numbered
+    log1/log2/... series) so the next writer starts a fresh file. Called with
+    the caller's lock already held, so the rename can never race a concurrent
+    writer of the same path. N3: inbox-delivered.jsonl has no structural size
+    ceiling the way inbox.jsonl does (MAX_PENDING already bounds that one);
+    pop_all() calls this before appending each new batch so the archive can't
+    grow without bound over a repo's lifetime."""
+    try:
+        if os.path.getsize(path) < max_bytes:
+            return
+    except OSError:
+        return
+    os.replace(path, path + ".1")
+
+
 def pop_all(root):
     """Deliver every pending message: append the current inbox.jsonl content to
-    inbox-delivered.jsonl and truncate inbox.jsonl to empty, under the SAME lock
-    append() takes. Returns the list of delivered records (oldest first); []
-    when nothing was pending (and nothing is touched on disk in that case)."""
+    inbox-delivered.jsonl (rotating it to inbox-delivered.jsonl.1 first if it's
+    already at MAX_INBOX_BYTES -- see _rotate_if_oversized) and truncate
+    inbox.jsonl to empty, under the SAME lock append() takes. Returns the list
+    of delivered records (oldest first); [] when nothing was pending (and
+    nothing is touched on disk, including rotation, in that case)."""
     path = _inbox_path(root)
     delivered_path = _delivered_path(root)
     with _FlockCtx(_lock_path(root)):
@@ -263,6 +351,7 @@ def pop_all(root):
         if not raw_lines:
             return []
         _ensure_dir(os.path.dirname(delivered_path))
+        _rotate_if_oversized(delivered_path, MAX_INBOX_BYTES)
         with _open_append_0600(delivered_path) as df:
             df.writelines(raw_lines)
             df.flush()
