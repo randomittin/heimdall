@@ -124,11 +124,16 @@ CLEANED_UP=false
 cleanup() {
   [ "$CLEANED_UP" = true ] && return 0
   CLEANED_UP=true
+  local funnel_stop_rc=0
   if [ "$FUNNEL_UP" = true ] && [ -n "$HTTPS_PORT" ]; then
     # A11/A13 (bin/lib/hmd_tailscale.sh D6): pass hmd's own backend port so
     # ts_funnel_stop can recognize its own target instead of conservatively
     # refusing (exit 7) to reset when it can't tell "mine" from "foreign".
-    ts_funnel_stop "$HTTPS_PORT" "$ACTUAL_PORT" >/dev/null 2>&1 || true
+    # N1: capture + verify like every other call site -- a Ctrl-C/kill/HUP
+    # that fails to actually take the funnel down must never look like a
+    # clean exit.
+    _funnel_stop_and_verify "hmd app connect" "$HTTPS_PORT" "$ACTUAL_PORT"
+    funnel_stop_rc=$?
   fi
   if [ -n "$UI_PID" ] && kill -0 "$UI_PID" 2>/dev/null; then
     kill "$UI_PID" >/dev/null 2>&1 || true
@@ -139,6 +144,16 @@ cleanup() {
   fi
   if [ -n "$UI_OUT" ]; then
     rm -f "$UI_OUT" 2>/dev/null || true
+  fi
+  # N1: an explicit exit is the only way to change the process's final exit
+  # code from inside an EXIT-trap handler (a plain `return` here would not
+  # override whatever code was already pending) -- and for the INT/TERM/HUP
+  # compound traps ("cleanup; exit N"), this short-circuits their trailing
+  # exit N so a still-public funnel always wins over the signal's own code.
+  # CLEANED_UP above guards the re-entry this exit triggers (calling exit
+  # always re-fires the EXIT trap too) from attempting a second stop.
+  if [ "$funnel_stop_rc" -ne 0 ]; then
+    exit "$funnel_stop_rc"
   fi
 }
 
@@ -184,6 +199,34 @@ _funnel_looks_up() {
   printf '%s' "$json" | jq -e '
     (.Funnel // {} | length > 0) or (.Serve // {} | length > 0)
   ' >/dev/null 2>&1
+}
+
+# N1: every ts_funnel_stop call site used to swallow its result entirely
+# (`>/dev/null 2>&1 || true`) -- a refusal (exit 7, D6's foreign-target
+# guard), or any other failure, looked identical to success, so `disconnect`
+# could print "stopped" and exit 0 while the funnel stayed publicly
+# reachable. This is the one place that decides "stopped" vs "still up" for
+# every call site: run the stop, show whatever it printed (never redirected
+# away), then re-check reality with _funnel_looks_up instead of trusting the
+# stop's own exit code. $1: a prefix for the message ("hmd app connect" /
+# "hmd app disconnect"). $2: https_port. $3: backend port, may be empty.
+# Returns 0 only once verified down; 7 if ts_funnel_stop itself refused and
+# the funnel is still up; 8 if the stop reported success but verification
+# still finds it up (e.g. a target ts_funnel_stop didn't know to clear).
+_funnel_stop_and_verify() {
+  local prefix="$1" https_port="$2" port="${3:-}" err rc
+  err="$(ts_funnel_stop "$https_port" "$port" 2>&1 >/dev/null)"
+  rc=$?
+  [ -n "$err" ] && printf '%s\n' "$err" >&2
+  if ! _funnel_looks_up; then
+    return 0
+  fi
+  if [ "$rc" -eq 7 ]; then
+    echo "$prefix: FUNNEL STILL PUBLIC -- refused (exit 7) -- run: HMD_FUNNEL_FORCE_RESET=1 hmd app disconnect" >&2
+    return 7
+  fi
+  printf '%s: FUNNEL STILL PUBLIC -- stop ran (exit %d) but the funnel is still reachable -- run: HMD_FUNNEL_FORCE_RESET=1 hmd app disconnect\n' "$prefix" "$rc" >&2
+  return 8
 }
 
 # A6: print a file to stderr with any pairing token redacted. heimdall-ui's
@@ -279,7 +322,11 @@ cmd_connect() {
     # an empty result behaves identically to the port being unknown.
     local stale_port=""
     stale_port="$(jq -r '.port // empty' "$REPO/.heimdall/app/connect.json" 2>/dev/null)"
-    ts_funnel_stop "$HTTPS_PORT" "$stale_port" >/dev/null 2>&1 || true
+    # N1: best-effort here, deliberately -- surfaces the same loud warning
+    # and never claims success it doesn't have, but a stale funnel that
+    # won't clear must not block a fresh connect attempt; cmd_status's
+    # ORPHANED FUNNEL check is the backstop for whatever this can't.
+    _funnel_stop_and_verify "hmd app connect" "$HTTPS_PORT" "$stale_port" || true
   fi
 
   mkdir -p "$REPO/.heimdall/app" 2>/dev/null || true
@@ -499,14 +546,45 @@ cmd_disconnect() {
   done
   REPO="$(resolve_repo_value "$REPO")"
   local state_file="$REPO/.heimdall/app/connect.json"
+  local vrc
 
   if [ ! -f "$state_file" ]; then
     # A4(a): a funnel can outlive its state file (crash, a manual rm, a prior
     # bug) -- disconnect is the one command that guarantees no funnel
     # survives it, so it always attempts a stop, never conditional on state.
-    ts_funnel_stop 443 >/dev/null 2>&1 || true
-    echo "hmd app disconnect: not connected (no state file)"
-    return 0
+    # N1: with no state file there's no known backend port either -- but if
+    # exactly one loopback Funnel/Serve target is configured, nothing else
+    # on this machine would plausibly own it, so treat it as ours instead of
+    # leaving the port unknown (which ts_funnel_stop's own foreign-target
+    # check -- D6 -- would then conservatively refuse). Two or more targets
+    # really is ambiguous: refuse rather than guess whose is whose.
+    local status_json targets target_count=0 inferred_port="" was_up=false
+    status_json="$(ts_funnel_status_json 2>/dev/null)"
+    targets="$(ts_funnel_foreign_targets "$status_json" "")"
+    if [ -n "$targets" ]; then
+      was_up=true
+      target_count="$(printf '%s\n' "$targets" | grep -c .)"
+      if [ "$target_count" -eq 1 ]; then
+        case "$targets" in
+          http://127.0.0.1:*) inferred_port="${targets#http://127.0.0.1:}" ;;
+        esac
+      fi
+    fi
+    # _funnel_looks_up reads .Funnel/.Serve -- a different view of the same
+    # status than ts_funnel_foreign_targets's .Web/.TCP above (D6) -- a
+    # target can show in one and not the other, so check both before
+    # deciding whether there was actually anything to report on.
+    _funnel_looks_up "$status_json" && was_up=true
+    _funnel_stop_and_verify "hmd app disconnect" 443 "$inferred_port"
+    vrc=$?
+    if [ "$vrc" -eq 0 ]; then
+      if [ "$was_up" = true ]; then
+        echo "hmd app disconnect: stopped (no state file, but an orphaned funnel was found and cleared)"
+      else
+        echo "hmd app disconnect: not connected (no state file)"
+      fi
+    fi
+    return "$vrc"
   fi
 
   local pid_ui https_port port
@@ -517,7 +595,8 @@ cmd_disconnect() {
 
   # A11/A13: pass hmd's own backend port so ts_funnel_stop recognizes its
   # own target instead of conservatively refusing (exit 7) to reset it.
-  ts_funnel_stop "$https_port" "$port" >/dev/null 2>&1 || true
+  _funnel_stop_and_verify "hmd app disconnect" "$https_port" "$port"
+  vrc=$?
 
   # A14: verify identity before signaling -- a recycled pid must never take
   # an unrelated process down with it.
@@ -534,8 +613,14 @@ cmd_disconnect() {
   fi
 
   rm -f "$state_file" 2>/dev/null || true
-  echo "hmd app disconnect: stopped"
-  return 0
+  # N1: disconnect must never claim success while the funnel is still
+  # publicly reachable -- only print "stopped" (and only exit 0) once
+  # _funnel_stop_and_verify has actually confirmed it's down. The ui
+  # kill/state-file removal above still happen unconditionally either way --
+  # a bad Funnel teardown must not leave the ui process or state file behind
+  # too.
+  [ "$vrc" -eq 0 ] && echo "hmd app disconnect: stopped"
+  return "$vrc"
 }
 
 cmd_doctor() {
