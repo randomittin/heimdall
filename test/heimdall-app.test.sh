@@ -223,6 +223,15 @@ EOF
           echo "$POLICY_HINT" >&2
           exit 1
         fi
+        if [ "$mode" = "funnel-start-hangs" ]; then
+          # Models a macsys/App Store CLIError-3-style hang (2026-09-21
+          # tailscale-macsys-funnel-cli-error-3): the process never returns,
+          # so heimdall-app's own start-side timeout
+          # (HMD_FUNNEL_START_TIMEOUT_S) is what has to save this, not
+          # anything the fake CLI does.
+          sleep 999999
+          exit 0
+        fi
         exit 0
         ;;
       *)
@@ -1001,6 +1010,121 @@ else
   kill "$N1G_PID" 2>/dev/null
   wait "$N1G_PID" 2>/dev/null
 fi
+rm -rf "$D"
+
+# ── 2026-09-21 tailscale-macsys-funnel-cli-error-3: doctor / status /
+# connect reaction to ts_variant (bin/lib/hmd_tailscale.sh, merged from
+# main 79708218 -- oss|macsys|appstore|unknown). This suite's own scope is
+# heimdall-app's REACTION to each variant, not ts_variant's own tiering
+# correctness (see test/hmd-tailscale.test.sh #46-49 for that). A plain
+# fake binary with no HMD_TAILSCALE_APP_PLIST override lives at an
+# arbitrary tmp path that matches none of ts_variant's hardcoded oss
+# patterns, so it resolves to "unknown", not "oss" -- there is no hermetic
+# way to get a real "oss" classification here without the fake binary
+# sitting at one of the real hardcoded paths (or under `brew --prefix`),
+# which is out of scope for a sandboxed suite and is that other file's job.
+MACSYS_PLIST="$TMPROOT/macsys.plist"
+cat > "$MACSYS_PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macsys</string>
+</dict>
+</plist>
+EOF
+
+APPSTORE_PLIST="$TMPROOT/appstore.plist"
+cat > "$APPSTORE_PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macos</string>
+</dict>
+</plist>
+EOF
+
+D="$(make_repo)"
+
+DOC_MACSYS="$(HMD_TAILSCALE_APP_PLIST="$MACSYS_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
+[ "$DRC" -ne 0 ] && ok "doctor (macsys variant) exits nonzero" || bad "exit $DRC: $DOC_MACSYS"
+printf '%s' "$DOC_MACSYS" | grep -q 'FAIL.*tailscale build variant (macsys' && ok "doctor (macsys) flags 'tailscale build variant'" || bad "$DOC_MACSYS"
+printf '%s' "$DOC_MACSYS" | grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)' && ok "doctor (macsys) prints the exact brew-install fix line" || bad "$DOC_MACSYS"
+printf '%s' "$DOC_MACSYS" | grep -q 'FAIL.*funnel capability' && ok "doctor (macsys) also flags 'funnel capability'" || bad "$DOC_MACSYS"
+
+DOC_APPSTORE="$(HMD_TAILSCALE_APP_PLIST="$APPSTORE_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
+[ "$DRC" -ne 0 ] && ok "doctor (appstore variant) exits nonzero" || bad "exit $DRC: $DOC_APPSTORE"
+printf '%s' "$DOC_APPSTORE" | grep -q 'FAIL.*tailscale build variant (appstore' && ok "doctor (appstore) flags 'tailscale build variant'" || bad "$DOC_APPSTORE"
+printf '%s' "$DOC_APPSTORE" | grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)' && ok "doctor (appstore) prints the exact brew-install fix line" || bad "$DOC_APPSTORE"
+printf '%s' "$DOC_APPSTORE" | grep -q 'FAIL.*funnel capability' && ok "doctor (appstore) also flags 'funnel capability'" || bad "$DOC_APPSTORE"
+
+DOC_UNKNOWN="$(FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
+[ "$DRC" -eq 0 ] && ok "doctor (unrecognized variant) still exits 0" || bad "exit $DRC: $DOC_UNKNOWN"
+printf '%s' "$DOC_UNKNOWN" | grep -q 'warn.*tailscale build variant (unknown' && ok "doctor (unrecognized variant) warns, does not FAIL, 'tailscale build variant'" || bad "$DOC_UNKNOWN"
+printf '%s' "$DOC_UNKNOWN" | grep -q 'ok.*funnel capability' && ok "doctor (unrecognized variant) still passes 'funnel capability'" || bad "$DOC_UNKNOWN"
+
+STATUS_VARIANT="$(HMD_TAILSCALE_APP_PLIST="$MACSYS_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" status --repo "$D" 2>&1)"
+printf '%s' "$STATUS_VARIANT" | grep -q '^tailscale build variant: macsys$' && ok "status prints 'tailscale build variant: macsys'" || bad "$STATUS_VARIANT"
+printf '%s' "$STATUS_VARIANT" | grep -q '^tailscale binary: ' && ok "status prints the resolved 'tailscale binary:' path" || bad "$STATUS_VARIANT"
+
+rm -rf "$D"
+
+# ── connect: macsys/appstore build refuses BEFORE the ui starts, exit 9 ──
+# (--help still advertises modern funnel flags on this build too, so only
+# a variant check -- not a --help sniff -- can catch it; ts_funnel_start's
+# own variant guard also returns 9, but only after the ui is already
+# running, so this early refusal is what keeps the ui from starting at all)
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-macsys.out"
+ERR_FILE="$TMPROOT/connect-macsys.err"
+HMD_TAILSCALE_APP_PLIST="$MACSYS_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
+RC=$?
+[ "$RC" -eq 9 ] && ok "connect on a macsys build exits 9" || bad "exit $RC (want 9): $(cat "$ERR_FILE")"
+grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)' "$ERR_FILE" && ok "connect (macsys) prints the exact brew-install fix line" || bad "$(cat "$ERR_FILE")"
+[ ! -f "$D/.heimdall/app/connect.json" ] && ok "connect (macsys) writes no state file" || bad "state file unexpectedly written"
+MACSYS_UI_WAITED=0
+while pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1 && [ "$MACSYS_UI_WAITED" -lt 30 ]; do
+  sleep 0.1
+  MACSYS_UI_WAITED=$((MACSYS_UI_WAITED + 1))
+done
+if pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1; then
+  bad "a heimdall-ui process for $D is running after the macsys refusal (should never have started)"
+else
+  ok "connect (macsys) never started heimdall-ui"
+fi
+rm -rf "$D"
+
+# ── connect: a funnel-start that never returns is time-boxed, not left to
+# hang forever (2026-09-21 tailscale-macsys-funnel-cli-error-3). Budget is
+# forced to 3s (HMD_FUNNEL_START_TIMEOUT_S) so the test doesn't wait out
+# the real 45s default; the fake `tailscale funnel --bg` sleeps 999999s.
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-hang.out"
+ERR_FILE="$TMPROOT/connect-hang.err"
+LOG="$TMPROOT/connect-hang.log"
+C10_START=$(date +%s)
+HMD_FUNNEL_START_TIMEOUT_S=3 FAKE_TS_MODE=funnel-start-hangs FAKE_TS_LOG="$LOG" "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
+RC=$?
+C10_ELAPSED=$(( $(date +%s) - C10_START ))
+[ "$RC" -eq 10 ] && ok "connect w/ a hung funnel-start exits 10 instead of hanging" || bad "exit $RC (want 10): $(cat "$ERR_FILE")"
+[ "$C10_ELAPSED" -le 8 ] && ok "connect w/ a hung funnel-start returns within timeout+5s (${C10_ELAPSED}s elapsed)" || bad "took ${C10_ELAPSED}s, want <=8s"
+grep -qF 'funnel start timed out after 3s' "$ERR_FILE" && ok "connect (timeout) prints the exact timeout message" || bad "$(cat "$ERR_FILE")"
+grep -qi 'hmd app doctor' "$ERR_FILE" && ok "connect (timeout) points at 'hmd app doctor'" || bad "$(cat "$ERR_FILE")"
+[ ! -f "$D/.heimdall/app/connect.json" ] && ok "connect (timeout) leaves no state file after teardown" || bad "state file unexpectedly present"
+HANG_UI_WAITED=0
+while pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1 && [ "$HANG_UI_WAITED" -lt 30 ]; do
+  sleep 0.1
+  HANG_UI_WAITED=$((HANG_UI_WAITED + 1))
+done
+if pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1; then
+  bad "a heimdall-ui process for $D is still running after the funnel-start timeout"
+else
+  ok "connect (timeout) tore down heimdall-ui after the timeout"
+fi
+grep -qE '^funnel (reset|--https=[0-9]+ off)$' "$LOG" && ok "connect (timeout) still invoked funnel-stop during teardown" || bad "no stop invocation in log: $(cat "$LOG" 2>/dev/null)"
 rm -rf "$D"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
