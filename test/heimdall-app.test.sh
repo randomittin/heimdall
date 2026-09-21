@@ -763,6 +763,47 @@ FAKE_TS_MODE=funnel-still-up "$APP" disconnect --repo "$D" >/dev/null 2>&1
 rm -rf "$D"
 
 # ── A4(e). foreground wait also tears down on SIGHUP ──────────────────────
+# Whether a freshly-started non-interactive bash can actually arm a SIGHUP
+# trap is environment-dependent: POSIX shells refuse to re-arm a signal that
+# was already SIG_IGN when the shell started (the same mechanism that makes
+# nohup/disown transitive through nested shells) -- if the harness running
+# this suite itself has HUP ignored (e.g. detached from a controlling
+# terminal), bin/heimdall-app's own `trap ... HUP` (bin/heimdall-app:505) is
+# silently a no-op BY DESIGN: the tool cannot un-ignore a signal its own
+# parent ignored, and no product change can fix that. Verified directly with
+# a throwaway bash rather than assumed either way -- same one-shot-probe-
+# then-branch shape as HOST_NORM above (used by the -N-suffix-hint cases).
+# The ready-marker handshake (touch AFTER `trap` installs, wait for it
+# before signalling) rules out the OTHER environment-dependence this class
+# of test can suffer -- a HUP delivered before the trap is even installed.
+HUP_TRAPPABLE=false
+HUP_PROBE_READY="$TMPROOT/hup-probe.ready"
+HUP_PROBE_FIRED="$TMPROOT/hup-probe.fired"
+rm -f "$HUP_PROBE_READY" "$HUP_PROBE_FIRED"
+bash -c "trap 'touch \"$HUP_PROBE_FIRED\"; exit 77' HUP; touch \"$HUP_PROBE_READY\"; i=0; while [ \"\$i\" -lt 30 ]; do sleep 0.1; i=\$((i + 1)); done" &
+HUP_PROBE_PID=$!
+PIDS+=("$HUP_PROBE_PID")
+HUP_PROBE_WAITED=0
+while [ ! -f "$HUP_PROBE_READY" ] && [ "$HUP_PROBE_WAITED" -lt 20 ]; do
+  sleep 0.1
+  HUP_PROBE_WAITED=$((HUP_PROBE_WAITED + 1))
+done
+kill -HUP "$HUP_PROBE_PID" 2>/dev/null
+HUP_PROBE_WAITED=0
+while kill -0 "$HUP_PROBE_PID" 2>/dev/null && [ "$HUP_PROBE_WAITED" -lt 20 ]; do
+  sleep 0.1
+  HUP_PROBE_WAITED=$((HUP_PROBE_WAITED + 1))
+done
+if kill -0 "$HUP_PROBE_PID" 2>/dev/null; then
+  # still alive after 2s of an ignored-by-design HUP -- never trapped
+  kill -9 "$HUP_PROBE_PID" 2>/dev/null
+  wait "$HUP_PROBE_PID" 2>/dev/null
+else
+  wait "$HUP_PROBE_PID" 2>/dev/null
+  [ -f "$HUP_PROBE_FIRED" ] && HUP_TRAPPABLE=true
+fi
+rm -f "$HUP_PROBE_READY" "$HUP_PROBE_FIRED"
+
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-hup.out"
 ( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
@@ -780,29 +821,43 @@ if [ -f "$SF" ]; then
   ok "A4e setup: foreground connect wrote a state file before SIGHUP"
   HUP_UI_PID="$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)"
 
-  kill -HUP "$HUP_FG_PID" 2>/dev/null
-  HTERM_WAITED=0
-  while kill -0 "$HUP_FG_PID" 2>/dev/null && [ "$HTERM_WAITED" -lt 50 ]; do
-    sleep 0.2
-    HTERM_WAITED=$((HTERM_WAITED + 1))
-  done
-  if kill -0 "$HUP_FG_PID" 2>/dev/null; then
-    bad "A4e. connect process did not exit within 10s of SIGHUP"
-    kill -9 "$HUP_FG_PID" 2>/dev/null
-  else
-    ok "A4e. connect process exits on SIGHUP (foreground trap fired)"
-  fi
+  if [ "$HUP_TRAPPABLE" = true ]; then
+    kill -HUP "$HUP_FG_PID" 2>/dev/null
+    HTERM_WAITED=0
+    while kill -0 "$HUP_FG_PID" 2>/dev/null && [ "$HTERM_WAITED" -lt 50 ]; do
+      sleep 0.2
+      HTERM_WAITED=$((HTERM_WAITED + 1))
+    done
+    if kill -0 "$HUP_FG_PID" 2>/dev/null; then
+      bad "A4e. connect process did not exit within 10s of SIGHUP"
+      kill -9 "$HUP_FG_PID" 2>/dev/null
+    else
+      ok "A4e. connect process exits on SIGHUP (foreground trap fired)"
+    fi
 
-  HUP_UI_REAP_WAITED=0
-  while [ -n "$HUP_UI_PID" ] && kill -0 "$HUP_UI_PID" 2>/dev/null && [ "$HUP_UI_REAP_WAITED" -lt 30 ]; do
-    sleep 0.1
-    HUP_UI_REAP_WAITED=$((HUP_UI_REAP_WAITED + 1))
-  done
-  if [ -n "$HUP_UI_PID" ] && kill -0 "$HUP_UI_PID" 2>/dev/null; then
-    bad "A4e. ui process still alive after connect received SIGHUP -- trap cleanup leaked it"
-    kill -9 "$HUP_UI_PID" 2>/dev/null
+    HUP_UI_REAP_WAITED=0
+    while [ -n "$HUP_UI_PID" ] && kill -0 "$HUP_UI_PID" 2>/dev/null && [ "$HUP_UI_REAP_WAITED" -lt 30 ]; do
+      sleep 0.1
+      HUP_UI_REAP_WAITED=$((HUP_UI_REAP_WAITED + 1))
+    done
+    if [ -n "$HUP_UI_PID" ] && kill -0 "$HUP_UI_PID" 2>/dev/null; then
+      bad "A4e. ui process still alive after connect received SIGHUP -- trap cleanup leaked it"
+      kill -9 "$HUP_UI_PID" 2>/dev/null
+    else
+      ok "A4e. ui process reaped by the SIGHUP trap's cleanup()"
+    fi
   else
-    ok "A4e. ui process reaped by the SIGHUP trap's cleanup()"
+    # SIGHUP is ignored-at-exec in this harness (see the HUP-trap capability
+    # probe above) -- bin/heimdall-app's `trap ... HUP` can never fire here,
+    # by the same POSIX rule the probe just exercised against a throwaway
+    # bash. Skip visibly (never silently pass) instead of failing on a
+    # signal this process was never able to receive, and instead of
+    # weakening bin/heimdall-app to paper over an environment limit it has
+    # no power to change.
+    ok "A4e. connect process exits on SIGHUP: skipped (SIGHUP is ignored-at-exec in this harness)"
+    ok "A4e. ui process reaped by the SIGHUP trap's cleanup(): skipped (SIGHUP is ignored-at-exec in this harness)"
+    kill -9 "$HUP_FG_PID" 2>/dev/null
+    [ -n "$HUP_UI_PID" ] && kill -9 "$HUP_UI_PID" 2>/dev/null
   fi
 else
   bad "A4e setup: foreground connect never wrote a state file within 10s: $(cat "$OUT_FILE" 2>/dev/null)"
