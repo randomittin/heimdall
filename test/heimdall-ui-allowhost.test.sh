@@ -621,14 +621,19 @@ fi
 
 # /api/events' first frame is built from the exact same collect_state() call as
 # /api/state (StateCache.refresh() redacts before digest_of()) -- 40 proves that
-# in practice, not just by reading the code.
+# in practice, not just by reading the code. Checked via the panel's OWN title
+# field (jq), not a bare `grep -q '"project"'`: Group H's roster fixture already
+# puts a literal `"project"` JSON KEY on the wire unredacted (N4 never touches
+# keys), so a substring grep would pass even if this panel never arrived.
 SSE_OUT="$TMPROOT/sse-public.out"
 curl -s -N --max-time 2 -H "Host: demo.tail1234.ts.net" "$BASE_H/api/events?$AUTH_H" -o "$SSE_OUT" 2>/dev/null
-if [ -s "$SSE_OUT" ] && grep -q '"project"' "$SSE_OUT" \
-   && ! grep -q '/Users/' "$SSE_OUT" && ! grep -q '@example.com' "$SSE_OUT"; then
+SSE_JSON="$(grep '^data: ' "$SSE_OUT" 2>/dev/null | head -1 | sed 's/^data: //')"
+SSE_TITLE="$(printf '%s' "$SSE_JSON" | jq -r '.panels[]? | select(.id=="secret-panel") | .title' 2>/dev/null)"
+if [ -n "$SSE_JSON" ] && [ "$SSE_TITLE" = "project" ] \
+   && ! printf '%s' "$SSE_JSON" | grep -q '/Users/' && ! printf '%s' "$SSE_JSON" | grep -q '@example.com'; then
   ok "40. public mode: /api/events first frame is equally redacted (same source as /api/state) (N4)"
 else
-  bad "40. public mode: /api/events frame not redacted as expected"; sed 's/^/       | /' "$SSE_OUT" 2>/dev/null | head -5
+  bad "40. public mode: /api/events frame not redacted as expected (panel title in frame: '$SSE_TITLE')"; sed 's/^/       | /' "$SSE_OUT" 2>/dev/null | head -5
 fi
 
 # Loopback (no --allow-host), SAME underlying panel+checkpoint fixtures (shared
