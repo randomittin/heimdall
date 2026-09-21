@@ -16,6 +16,14 @@
 #                          other Funnel/Serve targets are configured (see D6). Off by
 #                          default — the safe default is to refuse, not to silently
 #                          wipe someone else's config.
+#   HMD_FUNNEL_APPROVE_WAIT_S bounds, in whole seconds (default 40), how long
+#                          ts_funnel_start waits once the underlying CLI is
+#                          running before giving up on a pending tailnet-Funnel
+#                          approval (see Decision D8). Kept below bin/heimdall-
+#                          app's own 45s _run_with_timeout budget around the
+#                          whole call, so the lib itself returns a precise exit
+#                          3 instead of being killed first and reported as an
+#                          ambiguous 124.
 #   HMD_TAILSCALE_APP_PLIST overrides which Info.plist ts_variant reads for the
 #                          macsys/appstore bundle-id check, AND stands in for the
 #                          "resolved binary lives under /Applications/Tailscale.app/"
@@ -52,6 +60,26 @@
 #       exists to close). ts_funnel_start refuses the same way, before ever invoking
 #       the CLI, with a new exit code — 9 — distinct from every other ts_funnel_start
 #       exit path.
+#   D8: (hmdapp handoff, docs/HANDOFF-TO-HEIMDALL-2026-09-21.md item 2) the real CLI
+#       prints "Funnel is not enabled on your tailnet. To enable, visit:
+#       https://login.tailscale.com/f/funnel?node=…" to STDOUT, then blocks polling
+#       for approval. The pre-fix ts_funnel_start only ever captured stderr
+#       (`>/dev/null 2>"$err"`), so that hint was never read and `hmd app connect`
+#       looked hung with no output until the operator found the link elsewhere.
+#       Fix: stdout and stderr are now captured together into one combined temp
+#       file (mktemp, umask 077 — no `/tmp/$$` fallback, same hardening bin/
+#       heimdall-app already applies to its own UI_OUT), and while the CLI runs
+#       that file is tailed for a login.tailscale.com URL; the moment one appears
+#       it is printed to the caller's stderr verbatim (D4: never paraphrased),
+#       plus a one-line "open that URL…" follow-up (see _ts_funnel_await). If the
+#       CLI hasn't finished by HMD_FUNNEL_APPROVE_WAIT_S, ts_funnel_start gives up
+#       and returns exit 3 — the same family as the pre-existing tailnet-policy
+#       hint exit, since both mean "a human has to go approve something first" —
+#       rather than let bin/heimdall-app's own outer timeout kill it and report
+#       an ambiguous 124. The CLI process itself is deliberately left running in
+#       that case: it is tailscaled's own poll for approval, which resolves on
+#       its own the moment the operator clicks the link, and killing it here
+#       would only force a clean retry to repeat the same wait for nothing.
 #
 # JSON parsing uses the `jq -r '.path // empty' 2>/dev/null` idiom already established
 # in bin/lib/hmd-headroom-chain.sh:122 and friends — jq is precedented, not a new dep.
@@ -388,18 +416,90 @@ ts_funnel_scoped_off_supported() {
   return 0
 }
 
+# _ts_funnel_await OUT WAIT_S CMD... — run CMD... (a `tailscale funnel ...`
+# invocation) backgrounded, with its combined stdout+stderr appended to OUT, and
+# TAIL that combined output for a Tailscale tailnet-Funnel approval URL
+# (login.tailscale.com) while it runs (D8). The moment that URL is seen, this
+# prints the CLI's own matching line verbatim to the caller's stderr (D4: never
+# paraphrased) plus a one-line "open that URL…" follow-up — exactly once, even if
+# CMD keeps running past that point.
+# Polling idiom (kill -0 / sleep 1) matches bin/heimdall-app's own
+# _run_with_timeout (bin/heimdall-app:322); WAIT_S is a budget in whole seconds,
+# not a hard preemptive kill — CMD is never killed on expiry (see D8: it is
+# tailscaled's own poll for approval, which resolves asynchronously the moment
+# the operator clicks the link).
+# Exit 0: CMD exited 0 inside the window. Exit 3: WAIT_S elapsed while CMD was
+# still running, or CMD exited nonzero, and the approval URL was seen at some
+# point — the caller (ts_funnel_start) treats this the same as its own
+# pre-existing tailnet-policy-hint exit. Exit 1: CMD exited nonzero and no
+# approval URL was ever seen — the caller falls back to its own existing
+# rc/hint handling, unchanged.
+_ts_funnel_await() {
+  local out="$1" wait_s="$2"
+  shift 2
+  local pid rc line url_seen=0 waited=0
+
+  ( "$@" >>"$out" 2>&1 ) &
+  pid=$!
+
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$url_seen" -eq 0 ]; then
+      line="$(grep -i 'login\.tailscale\.com' "$out" 2>/dev/null | head -1)"
+      if [ -n "$line" ]; then
+        url_seen=1
+        printf '%s\n' "$line" >&2
+        printf 'hmd_tailscale: open that URL to approve Funnel for this node; waiting up to %ss...\n' "$wait_s" >&2
+      fi
+    fi
+    if [ "$waited" -ge "$wait_s" ]; then
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    rc=124
+  else
+    wait "$pid" 2>/dev/null
+    rc=$?
+  fi
+
+  if [ "$url_seen" -eq 0 ]; then
+    line="$(grep -i 'login\.tailscale\.com' "$out" 2>/dev/null | head -1)"
+    [ -n "$line" ] && url_seen=1
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    return 0
+  fi
+
+  if [ "$url_seen" -eq 1 ]; then
+    [ -n "$line" ] || line="$(grep -i 'login\.tailscale\.com' "$out" 2>/dev/null | head -1)"
+    [ -n "$line" ] && printf '%s\n' "$line" >&2
+    printf 'hmd_tailscale: open that URL to approve Funnel for this node; waiting up to %ss...\n' "$wait_s" >&2
+    return 3
+  fi
+
+  return 1
+}
+
 # ts_funnel_start PORT HTTPS_PORT — start funnel using the syntax matching
 # ts_funnel_supported's probe.
-# Exit 0: funnel started. Exit 64: HTTPS_PORT is not one of 443|8443|10000 (Decision
-# D4 — EX_USAGE; checked BEFORE the binary is ever invoked). Exit 9: the resolved
+# Exit 0: funnel started (the underlying CLI exited 0, tailnet-approval wait or
+# not — see D8). Exit 64: HTTPS_PORT is not one of 443|8443|10000 (Decision D4 —
+# EX_USAGE; checked BEFORE the binary is ever invoked). Exit 9: the resolved
 # build is macsys/appstore (D7) — Funnel does not run on either, so this refuses
 # before ever invoking the CLI; a stderr hint names the brew-install fix. Checked
 # after the HTTPS_PORT validation (a malformed call is still a malformed call
 # regardless of the installed build) but before resolving/invoking the tailscale
-# binary for real. Exit 3: tailscale refused with a tailnet-policy hint (HTTPS certs
-# / funnel attribute not enabled); the hint is printed VERBATIM on stderr, per D4,
-# never paraphrased. Exit 1: tailscale unresolvable, or funnel unsupported on this
-# CLI. Other nonzero: passed through from the underlying tailscale invocation.
+# binary for real. Exit 3: EITHER tailscale refused outright with a tailnet-policy
+# hint (HTTPS certs / funnel attribute not enabled), OR (D8) a tailnet-Funnel
+# approval URL was seen and HMD_FUNNEL_APPROVE_WAIT_S elapsed before the CLI
+# itself finished — in both cases the hint/URL is printed VERBATIM on stderr, per
+# D4, never paraphrased. Exit 1: tailscale unresolvable, or funnel unsupported on
+# this CLI. Other nonzero: passed through from the underlying tailscale
+# invocation.
 ts_funnel_start() {
   local port="$1" https_port="$2"
   case "$https_port" in
@@ -419,39 +519,74 @@ ts_funnel_start() {
       ;;
   esac
 
-  local bin mode err rc
+  local bin mode
   bin="$(ts_bin 2>/dev/null)" || return 1
   mode="$(ts_funnel_supported)"
-  err="$(mktemp 2>/dev/null || echo "/tmp/hmd-tailscale.$$.err")"
+  case "$mode" in
+    modern|legacy) ;;
+    *) return 1 ;;
+  esac
+
+  # D8 / A6-style hardening (matches bin/heimdall-app's own UI_OUT): mktemp is
+  # required, not best-effort — a `/tmp/$$` fallback is a predictable,
+  # symlink-plantable path. umask 077 means the file is 0600 even if mktemp's
+  # own default were ever looser than that on some platform.
+  if ! command -v mktemp >/dev/null 2>&1; then
+    printf 'hmd_tailscale: required tool missing: mktemp\n' >&2
+    return 1
+  fi
+  local out old_umask mktemp_rc
+  old_umask="$(umask)"
+  umask 077
+  out="$(mktemp 2>/dev/null)"
+  mktemp_rc=$?
+  umask "$old_umask"
+  if [ "$mktemp_rc" -ne 0 ] || [ -z "$out" ]; then
+    printf 'hmd_tailscale: mktemp failed to create a temp file\n' >&2
+    return 1
+  fi
+
+  local wait_s rc
+  wait_s="${HMD_FUNNEL_APPROVE_WAIT_S:-40}"
 
   case "$mode" in
     modern)
-      "$bin" funnel --bg "--https=${https_port}" "http://127.0.0.1:${port}" >/dev/null 2>"$err"
+      _ts_funnel_await "$out" "$wait_s" \
+        "$bin" funnel --bg "--https=${https_port}" "http://127.0.0.1:${port}"
       rc=$?
       ;;
     legacy)
-      "$bin" serve https / "http://127.0.0.1:${port}" >/dev/null 2>"$err" \
-        && "$bin" funnel "${https_port}" on >/dev/null 2>>"$err"
+      "$bin" serve https / "http://127.0.0.1:${port}" >"$out" 2>&1
       rc=$?
-      ;;
-    *)
-      rm -f "$err" 2>/dev/null || true
-      return 1
+      if [ "$rc" -eq 0 ]; then
+        _ts_funnel_await "$out" "$wait_s" "$bin" funnel "${https_port}" on
+        rc=$?
+      fi
       ;;
   esac
 
-  if [ "$rc" -ne 0 ]; then
-    if grep -qi 'funnel' "$err" 2>/dev/null && grep -qi -E 'enable|attribute|policy|acl' "$err" 2>/dev/null; then
-      cat "$err" >&2
-      rm -f "$err" 2>/dev/null || true
-      return 3
-    fi
-    cat "$err" >&2
-    rm -f "$err" 2>/dev/null || true
-    return "$rc"
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$out" 2>/dev/null || true
+    return 0
   fi
-  rm -f "$err" 2>/dev/null || true
-  return 0
+
+  if [ "$rc" -eq 3 ]; then
+    # _ts_funnel_await already printed the approval URL + follow-up verbatim.
+    rm -f "$out" 2>/dev/null || true
+    return 3
+  fi
+
+  # Same case-insensitive matcher for a policy/approval hint regardless of
+  # which stream it arrived on, now that both are captured together (D8):
+  # `funnel` plus one of enable/attribute/policy/acl/visit/login.tailscale.com.
+  if grep -qi 'funnel' "$out" 2>/dev/null && grep -qi -E 'enable|attribute|policy|acl|visit|login\.tailscale\.com' "$out" 2>/dev/null; then
+    cat "$out" >&2
+    rm -f "$out" 2>/dev/null || true
+    return 3
+  fi
+  cat "$out" >&2
+  rm -f "$out" 2>/dev/null || true
+  return "$rc"
 }
 
 # ts_funnel_foreign_targets JSON TARGET — print, one per line, every proxy/TCP target

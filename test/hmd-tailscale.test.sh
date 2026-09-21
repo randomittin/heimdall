@@ -40,7 +40,10 @@ fi
 # One script, behaviour switched by $FAKE_TS_MODE. Never touches the real tailscaled.
 # Modes: not-installed, daemon-down, offline, online-with-DNSName, modern-funnel,
 # legacy-funnel, no-funnel, policy-hint-on-funnel-start, bad-https-port,
-# modern-funnel-scoped-off. FAKE_FUNNEL_STATUS_JSON, when set, overrides the canned
+# modern-funnel-scoped-off, funnel-approval-url, funnel-approval-then-ok (D8 --
+# hmdapp handoff item 2: the real CLI prints its tailnet-approval hint to STDOUT,
+# then blocks; these two simulate that on the `--bg` modern-start path).
+# FAKE_FUNNEL_STATUS_JSON, when set, overrides the canned
 # `funnel status` payload (used by the A13 foreign/only-ours/force/scoped tests).
 # FAKE_CALL_LOG, when set, appends every invocation's full argv (one line each) to
 # that file so a test can assert reset was/wasn't actually called.
@@ -153,6 +156,21 @@ EOF
         if [ "$mode" = "policy-hint-on-funnel-start" ]; then
           echo "$POLICY_HINT" >&2
           exit 1
+        fi
+        if [ "$mode" = "funnel-approval-url" ]; then
+          # D8 fixture: real CLI behaviour is to print this to STDOUT, then
+          # block polling for tailnet approval -- sleep stands in for "blocks
+          # indefinitely" so the caller's HMD_FUNNEL_APPROVE_WAIT_S window
+          # elapses first every time.
+          echo "Funnel is not enabled on your tailnet. To enable, visit: https://login.tailscale.com/f/funnel?node=nodeid123abc"
+          sleep 30
+          exit 1
+        fi
+        if [ "$mode" = "funnel-approval-then-ok" ]; then
+          # D8 fixture: approval arrives before the wait window elapses.
+          echo "Funnel is not enabled on your tailnet. To enable, visit: https://login.tailscale.com/f/funnel?node=nodeid123abc"
+          sleep 1
+          exit 0
         fi
         exit 0
         ;;
