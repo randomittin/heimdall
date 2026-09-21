@@ -235,6 +235,7 @@ RC=$?
 [ "$(mode_of "$D/.heimdall/ui")" = "700" ] && ok "ui dir is 0700" || bad "ui dir mode is $(mode_of "$D/.heimdall/ui") (want 700)"
 [ "$(mode_of "$(delivered_of "$D")")" = "600" ] && ok "inbox-delivered.jsonl is 0600" || bad "delivered mode is $(mode_of "$(delivered_of "$D")") (want 600)"
 [ "$(mode_of "$(lock_of "$D")")" = "600" ] && ok "inbox.jsonl.lock is 0600" || bad "lock mode is $(mode_of "$(lock_of "$D")") (want 600)"
+[ "$(mode_of "$(state_of "$D")")" = "600" ] && ok "inbox-state.json is 0600" || bad "state mode is $(mode_of "$(state_of "$D")") (want 600)"
 rm -rf "$D"
 
 # N5 (LOW): format_delivery fences delivered text with a 3-backtick marker,
@@ -300,6 +301,23 @@ BTRUN="$(printf '%s\n' "$CHK_OUTPUT" | grep '^backtick_run_count=' | cut -d= -f2
 [ "$BTRUN" = "2" ] && ok "only the two structural fences remain 3+ backticks long -- the message's own fence was collapsed" || bad "backtick run count is $BTRUN (want exactly 2)"
 rm -rf "$D"
 rm -f "$MSGFILE" "$SEEDPY" "$OUTFILE" "$CHKPY"
+
+# N-state (inbox-state.json parity): write_state() used to go through plain
+# open(tmp, "w") -- default-mode create, umask-limited only, unlike every
+# other file this tool writes (inbox.jsonl / inbox-delivered.jsonl / the
+# lock, all forced to 0600 via _open_append_0600 / _Flock). A state file
+# left over from before this fix (0644) must not stay wide forever -- the
+# next write must replace it at 0600, same self-healing floor as the rest.
+echo "16. STOP mode self-heals a pre-existing 0644 inbox-state.json to 0600 on next write:"
+D="$(make_project)"
+printf '{"waiting":false,"since":0}' > "$(state_of "$D")"
+chmod 644 "$(state_of "$D")"
+[ "$(mode_of "$(state_of "$D")")" = "644" ] && ok "fixture starts at 0644 (pre-fix legacy mode)" || bad "fixture setup failed, mode is $(mode_of "$(state_of "$D")")"
+OUT="$(printf '%s' "$(stop_payload "$D" false "working on it")" | "$BIN" stop --repo "$D")"
+RC=$?
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
+[ "$(mode_of "$(state_of "$D")")" = "600" ] && ok "inbox-state.json is 0600 after write, even though it pre-existed at 0644" || bad "state mode is $(mode_of "$(state_of "$D")") (want 600)"
+rm -rf "$D"
 
 echo ""
 echo "heimdall-inbox-deliver.test.sh: $PASS passed, $FAIL failed."
