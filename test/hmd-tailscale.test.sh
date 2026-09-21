@@ -193,7 +193,7 @@ FAKE_EOF
 chmod +x "$FAKE_BIN"
 
 export HMD_TAILSCALE_BIN="$FAKE_BIN"
-unset HMD_ASSUME_NO FAKE_TS_MODE
+unset HMD_ASSUME_NO FAKE_TS_MODE HMD_TAILSCALE_APP_PLIST
 
 # shellcheck source=/dev/null
 source "$LIB"
@@ -738,6 +738,276 @@ if (
   ok "43. ts_funnel_stop: one-arg form is conservative when anything is configured (A13/D6)"
 else
   bad "43. ts_funnel_stop: one-arg form is conservative when anything is configured (A13/D6)"
+fi
+
+# ── 44. ts_variant: Homebrew static path match -> oss ──────────────────────────────
+if (
+  export HMD_TAILSCALE_BIN=/opt/homebrew/bin/tailscale
+  [ "$(ts_variant)" = "oss" ]
+); then
+  ok "44. ts_variant: Homebrew path -> oss"
+else
+  bad "44. ts_variant: Homebrew path -> oss"
+fi
+
+# ── 45. ts_variant: Linux system path match -> oss ─────────────────────────────────
+if (
+  export HMD_TAILSCALE_BIN=/usr/bin/tailscale
+  [ "$(ts_variant)" = "oss" ]
+); then
+  ok "45. ts_variant: Linux system path (/usr/bin) -> oss"
+else
+  bad "45. ts_variant: Linux system path (/usr/bin) -> oss"
+fi
+
+# ── 46. ts_variant: HMD_TAILSCALE_APP_PLIST seam, macsys bundle id -> macsys ───────
+if (
+  PLIST="$TMPROOT/variant-46.plist"
+  cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macsys</string>
+</dict>
+</plist>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  [ "$(ts_variant)" = "macsys" ]
+); then
+  ok "46. ts_variant: app-plist seam with macsys bundle id -> macsys"
+else
+  bad "46. ts_variant: app-plist seam with macsys bundle id -> macsys"
+fi
+
+# ── 47. ts_variant: HMD_TAILSCALE_APP_PLIST seam, appstore bundle id -> appstore ───
+if (
+  PLIST="$TMPROOT/variant-47.plist"
+  cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macos</string>
+</dict>
+</plist>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  [ "$(ts_variant)" = "appstore" ]
+); then
+  ok "47. ts_variant: app-plist seam with appstore bundle id -> appstore"
+else
+  bad "47. ts_variant: app-plist seam with appstore bundle id -> appstore"
+fi
+
+# ── 48. ts_variant: malformed/bare plist -> grep/sed scrape fallback still recovers
+#         the bundle id (defaults read and PlistBuddy both reject this shape) ─────
+if (
+  PLIST="$TMPROOT/variant-48.plist"
+  cat > "$PLIST" <<'EOF'
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macsys</string>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  [ "$(ts_variant)" = "macsys" ]
+); then
+  ok "48. ts_variant: malformed plist recovered via text-scrape fallback"
+else
+  bad "48. ts_variant: malformed plist recovered via text-scrape fallback"
+fi
+
+# ── 49. ts_variant: app-plist seam set, but bundle id matches neither known Tailscale
+#         id -> falls through past tier 1 to unknown, no false positive ──────────
+if (
+  PLIST="$TMPROOT/variant-49.plist"
+  cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.example.other</string>
+</dict>
+</plist>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  [ "$(ts_variant)" = "unknown" ]
+); then
+  ok "49. ts_variant: unrecognized bundle id under the plist seam -> unknown"
+else
+  bad "49. ts_variant: unrecognized bundle id under the plist seam -> unknown"
+fi
+
+# ── 50. ts_funnel_supported: macsys -> none even though --help advertises modern
+#         flags (D7 -- variant check runs before the --help sniff) ────────────────
+if (
+  export FAKE_TS_MODE=modern-funnel
+  PLIST="$TMPROOT/fs-50.plist"
+  cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macsys</string>
+</dict>
+</plist>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  [ "$(ts_funnel_supported 2>/dev/null)" = "none" ]
+); then
+  ok "50. ts_funnel_supported: macsys -> none despite modern --help (D7)"
+else
+  bad "50. ts_funnel_supported: macsys -> none despite modern --help (D7)"
+fi
+
+# ── 51. ts_funnel_supported: macsys prints the brew-install hint on stderr ─────────
+if (
+  export FAKE_TS_MODE=modern-funnel
+  PLIST="$TMPROOT/fs-51.plist"
+  cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macsys</string>
+</dict>
+</plist>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  out="$(ts_funnel_supported 2>&1 1>/dev/null)"
+  printf '%s' "$out" | grep -qF 'brew install tailscale'
+); then
+  ok "51. ts_funnel_supported: macsys prints the brew-install hint on stderr (D7)"
+else
+  bad "51. ts_funnel_supported: macsys prints the brew-install hint on stderr (D7)"
+fi
+
+# ── 52. ts_funnel_supported: appstore -> none even though --help advertises modern
+#         flags (D7) ───────────────────────────────────────────────────────────────
+if (
+  export FAKE_TS_MODE=modern-funnel
+  PLIST="$TMPROOT/fs-52.plist"
+  cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macos</string>
+</dict>
+</plist>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  [ "$(ts_funnel_supported 2>/dev/null)" = "none" ]
+); then
+  ok "52. ts_funnel_supported: appstore -> none despite modern --help (D7)"
+else
+  bad "52. ts_funnel_supported: appstore -> none despite modern --help (D7)"
+fi
+
+# ── 53. ts_funnel_start: macsys -> exit 9, brew hint on stderr, CLI never invoked ──
+if (
+  export FAKE_TS_MODE=modern-funnel
+  PLIST="$TMPROOT/start-53.plist"
+  cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macsys</string>
+</dict>
+</plist>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  CALL_LOG="$TMPROOT/calls-53.log"
+  rm -f "$CALL_LOG"
+  export FAKE_CALL_LOG="$CALL_LOG"
+  out="$(ts_funnel_start 3000 443 2>&1)"; rc=$?
+  [ "$rc" -eq 9 ] \
+    && printf '%s' "$out" | grep -qF 'brew install tailscale' \
+    && [ ! -s "$CALL_LOG" ]
+); then
+  ok "53. ts_funnel_start: macsys -> exit 9, brew hint, never invokes the CLI (D7)"
+else
+  bad "53. ts_funnel_start: macsys -> exit 9, brew hint, never invokes the CLI (D7)"
+fi
+
+# ── 54. ts_funnel_start: appstore -> exit 9 ─────────────────────────────────────────
+if (
+  export FAKE_TS_MODE=modern-funnel
+  PLIST="$TMPROOT/start-54.plist"
+  cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macos</string>
+</dict>
+</plist>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  ts_funnel_start 3000 443 >/dev/null 2>/dev/null
+  rc=$?
+  [ "$rc" -eq 9 ]
+); then
+  ok "54. ts_funnel_start: appstore -> exit 9 (D7)"
+else
+  bad "54. ts_funnel_start: appstore -> exit 9 (D7)"
+fi
+
+# ── 55. ts_funnel_start: bad HTTPS port still wins (exit 64) even on macsys --
+#         port validation happens before the D7 guard ─────────────────────────────
+if (
+  export FAKE_TS_MODE=modern-funnel
+  PLIST="$TMPROOT/start-55.plist"
+  cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.tailscale.ipn.macsys</string>
+</dict>
+</plist>
+EOF
+  export HMD_TAILSCALE_APP_PLIST="$PLIST"
+  ts_funnel_start 3000 9999 >/dev/null 2>/dev/null
+  rc=$?
+  [ "$rc" -eq 64 ]
+); then
+  ok "55. ts_funnel_start: bad HTTPS port -> exit 64 even on macsys (checked before D7)"
+else
+  bad "55. ts_funnel_start: bad HTTPS port -> exit 64 even on macsys (checked before D7)"
+fi
+
+# ── 56. oss path unchanged: a genuinely oss-classified binary (brew --prefix match)
+#         still gets "modern" from ts_funnel_supported -- D7 doesn't touch this path ─
+if (
+  export FAKE_TS_MODE=modern-funnel
+  unset HMD_TAILSCALE_APP_PLIST
+  mkdir -p "$TMPROOT/fakebrewbin56"
+  cat > "$TMPROOT/fakebrewbin56/brew" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "--prefix" ]; then
+  cd "$TMPROOT" && pwd -P
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$TMPROOT/fakebrewbin56/brew"
+  PATH="$TMPROOT/fakebrewbin56:$PATH"
+  export PATH
+  [ "$(ts_variant)" = "oss" ] && [ "$(ts_funnel_supported)" = "modern" ]
+); then
+  ok "56. oss path unchanged: brew-prefix-matched binary -> oss, funnel_supported still modern"
+else
+  bad "56. oss path unchanged: brew-prefix-matched binary -> oss, funnel_supported still modern"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
