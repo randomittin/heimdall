@@ -516,5 +516,113 @@ else
   bad "33. loopback roster should be unredacted: rc=$rc roster=$(jq -c '.roster' "$BODY" 2>/dev/null)"
 fi
 
+# ═══ Group I -- N4: recursion covers EVERY string leaf, not a 4-key allowlist ══
+# Before N4, _redact_state_for_public only ever touched repo/edits.paths/roster/
+# ledger.team -- panels, checkpoint, sweep_receipt, identity.handle and every
+# other string-valued field reached a --allow-host listener unscrubbed. 34-40
+# publish a panel whose TITLE is nothing but an absolute path and whose kv data
+# carries an email plus a ~/-relative path, and a CHECKPOINT.md whose Branch
+# field is an absolute path while its Open warnings field EMBEDS one mid-
+# sentence -- proving a path token is stripped wherever it sits, not only when
+# the whole value is nothing but a path. Shares $FIX with every server above, so
+# the same fixture is read by both the public (SRV_HOST) and loopback (SRV_
+# NOHOST) servers already running.
+DATA_JSON="$TMPROOT/panel-secret-data.json"
+cat > "$DATA_JSON" <<'JSON'
+{"rows":[["contact","someone@example.com"],["home","~/private-notes"]]}
+JSON
+"$UI" panel set secret-panel --type kv --title "/Users/rj/secret/project" \
+      --data-json "$DATA_JSON" --repo "$FIX" >/dev/null 2>&1
+
+mkdir -p "$FIX/.planning"
+cat > "$FIX/.planning/CHECKPOINT.md" <<'MD'
+<!-- heimdall-auto-checkpoint:begin -->
+## Auto-checkpoint — 2026-09-21T00:00:00Z
+
+> Written automatically at session end (mechanical, no LLM).
+
+- **Branch:** /Users/rj/secret/branch-info
+- **HEAD:** f1x7u4e0
+- **Phase:** fixture-phase
+- **Active goal:** none
+- **Uncommitted files:** 2
+- **Open warnings:** push gate blocked by /Users/rj/secret/dirty-file
+
+### What must never be lost (the resume contract)
+- **In progress:** none
+<!-- heimdall-auto-checkpoint:end -->
+MD
+
+BODY="$TMPROOT/state-i-public.json"
+rc="$(curl -s -o "$BODY" -w '%{http_code}' -H "Host: demo.tail1234.ts.net" "$BASE_H/api/state?$AUTH_H")"
+RAW="$(cat "$BODY" 2>/dev/null)"
+
+if [ "$rc" = "200" ] && ! printf '%s' "$RAW" | grep -q '/Users/'; then
+  ok "34. public mode: /api/state has NO '/Users/' substring anywhere in the whole body (N4: recursive, not a 4-key allowlist)"
+else
+  bad "34. public mode: '/Users/' still present somewhere in /api/state body: rc=$rc"
+fi
+
+if [ "$rc" = "200" ] && ! printf '%s' "$RAW" | grep -q '@example.com'; then
+  ok "35. public mode: /api/state has NO '@example.com' substring anywhere in the whole body (N4)"
+else
+  bad "35. public mode: '@example.com' still present somewhere in /api/state body: rc=$rc"
+fi
+
+TITLE_PUB="$(jq -r '.panels[]? | select(.id=="secret-panel") | .title' "$BODY" 2>/dev/null)"
+if [ "$rc" = "200" ] && [ "$TITLE_PUB" = "project" ]; then
+  ok "36. public mode: panel title '/Users/rj/secret/project' -> 'project' (N4: panels were never one of the old 4 keys)"
+else
+  bad "36. public mode: panel title -> '$TITLE_PUB', expected 'project'"
+fi
+
+HOME_PUB="$(jq -r '.panels[]? | select(.id=="secret-panel") | .data.rows[]? | select(.[0]=="home") | .[1]' "$BODY" 2>/dev/null)"
+if [ "$rc" = "200" ] && [ "$HOME_PUB" = "private-notes" ]; then
+  ok "37. public mode: panel kv value '~/private-notes' -> 'private-notes' (N4: ~/ token, not just os.path.isabs)"
+else
+  bad "37. public mode: panel kv 'home' value -> '$HOME_PUB', expected 'private-notes'"
+fi
+
+BRANCH_PUB="$(jq -r '.checkpoint.branch // empty' "$BODY" 2>/dev/null)"
+if [ "$rc" = "200" ] && [ "$BRANCH_PUB" = "branch-info" ]; then
+  ok "38. public mode: checkpoint.branch (absolute path) -> basename 'branch-info' (N4: checkpoint was never one of the old 4 keys)"
+else
+  bad "38. public mode: checkpoint.branch -> '$BRANCH_PUB', expected 'branch-info'"
+fi
+
+WARN_PUB="$(jq -r '.checkpoint.push_gate_open_warning // empty' "$BODY" 2>/dev/null)"
+if [ "$rc" = "200" ] && printf '%s' "$WARN_PUB" | grep -q 'push gate' \
+   && printf '%s' "$WARN_PUB" | grep -q 'dirty-file' \
+   && ! printf '%s' "$WARN_PUB" | grep -q '/Users/'; then
+  ok "39. public mode: checkpoint.push_gate_open_warning keeps its prose, embedded path token -> basename ('$WARN_PUB')"
+else
+  bad "39. public mode: checkpoint.push_gate_open_warning -> '$WARN_PUB'"
+fi
+
+# /api/events' first frame is built from the exact same collect_state() call as
+# /api/state (StateCache.refresh() redacts before digest_of()) -- 40 proves that
+# in practice, not just by reading the code.
+SSE_OUT="$TMPROOT/sse-public.out"
+curl -s -N --max-time 2 -H "Host: demo.tail1234.ts.net" "$BASE_H/api/events?$AUTH_H" -o "$SSE_OUT" 2>/dev/null
+if [ -s "$SSE_OUT" ] && grep -q '"project"' "$SSE_OUT" \
+   && ! grep -q '/Users/' "$SSE_OUT" && ! grep -q '@example.com' "$SSE_OUT"; then
+  ok "40. public mode: /api/events first frame is equally redacted (same source as /api/state) (N4)"
+else
+  bad "40. public mode: /api/events frame not redacted as expected"; sed 's/^/       | /' "$SSE_OUT" 2>/dev/null | head -5
+fi
+
+# Loopback (no --allow-host), SAME underlying panel+checkpoint fixtures (shared
+# $FIX): N4 must never fire when transport.public_host is unset.
+BODY="$TMPROOT/state-i-loopback.json"
+rc="$(curl -s -o "$BODY" -w '%{http_code}' "$BASE_N/api/state?$AUTH_N")"
+TITLE_LOOP="$(jq -r '.panels[]? | select(.id=="secret-panel") | .title' "$BODY" 2>/dev/null)"
+BRANCH_LOOP="$(jq -r '.checkpoint.branch // empty' "$BODY" 2>/dev/null)"
+if [ "$rc" = "200" ] && [ "$TITLE_LOOP" = "/Users/rj/secret/project" ] \
+   && [ "$BRANCH_LOOP" = "/Users/rj/secret/branch-info" ]; then
+  ok "41. loopback (no --allow-host): panel title and checkpoint.branch stay full absolute paths, unredacted (N4 gated on public_host)"
+else
+  bad "41. loopback should be unredacted: title=$TITLE_LOOP branch=$BRANCH_LOOP"
+fi
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
