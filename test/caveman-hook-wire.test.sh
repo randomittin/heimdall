@@ -25,10 +25,11 @@
 # GUARANTEES PROVED
 #   1. hooks/hooks.json stays valid JSON (jq . exit 0).
 #   2. Exactly one UserPromptSubmit entry wires bin/heimdall-caveman.
-#   3. All 3 pre-existing UserPromptSubmit entries (parallel-gate,
-#      heimdall-ctx-meter, heimdall-secret-filter) survive, in their
-#      original order, with the new entry appended after them — never
-#      inserted in the middle, never replacing one.
+#   3. All pre-existing UserPromptSubmit entries survive in their
+#      original order, with new entries appended after them — never
+#      inserted in the middle, never replacing one. Count is derived from
+#      hooks.metadata.json, not hardcoded, so it stays accurate as hooks are
+#      added (e.g., inbox-deliver-prompt joined at index 4).
 #   4. The new entry carries no stray "matcher" key, consistent with the
 #      other 3 UserPromptSubmit entries (matchers only appear under
 #      PreToolUse / PostToolUse in this file).
@@ -88,11 +89,13 @@ else
 fi
 
 # --- 3. pre-existing entries + order survive --------------------------------
+METADATA="$REPO/hooks/hooks.metadata.json"
+EXPECTED_TOTAL=$(jq -r '[.hooks[] | select(.event == "UserPromptSubmit")] | length' "$METADATA")
 TOTAL=$(jq -r '(.hooks.UserPromptSubmit // []) | length' "$HOOKS")
-if [ "${TOTAL:-0}" = "4" ]; then
-  ok "UserPromptSubmit now has exactly 4 entries (3 pre-existing + hmd caveman)"
+if [ "${TOTAL:-0}" = "$EXPECTED_TOTAL" ]; then
+  ok "UserPromptSubmit count matches metadata ($EXPECTED_TOTAL entries: parallel-gate, ctx-meter-notice, secret-paste-filter, caveman-level-context, inbox-deliver-prompt)"
 else
-  bad "expected exactly 4 UserPromptSubmit entries, found ${TOTAL:-0}"
+  bad "expected $EXPECTED_TOTAL UserPromptSubmit entries (from metadata), found ${TOTAL:-0}"
 fi
 
 IDX0=$(jq -r '.hooks.UserPromptSubmit[0].hooks[0].command // ""' "$HOOKS")

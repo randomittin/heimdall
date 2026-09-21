@@ -417,7 +417,7 @@ PORT_G="$PORT"; BASE_G="$BASE"; AUTH_G="$AUTH"
 SSE_PIDS=()
 sse_i=1
 while [ "$sse_i" -le 8 ]; do
-  curl -s -N --max-time 6 -o /dev/null "$BASE_G/api/events?$AUTH_G" 2>/dev/null &
+  curl -s -N --max-time 12 -o /dev/null "$BASE_G/api/events?$AUTH_G" 2>/dev/null &
   SSE_PIDS+=("$!")
   sse_i=$((sse_i + 1))
 done
@@ -426,7 +426,7 @@ PIDS+=("${SSE_PIDS[@]}")
 # Give the 8 held streams time to actually clear _gate_then and acquire their
 # semaphore slot (each is a real handshake) before the 9th is sent, so the cap is
 # measured with all 8 slots genuinely occupied, not raced against connection setup.
-sleep 1
+sleep 0.5
 
 HDR9="$TMPROOT/sse-9.hdr"; BODY9="$TMPROOT/sse-9.json"
 rc9="$(curl -s -D "$HDR9" -o "$BODY9" -w '%{http_code}' "$BASE_G/api/events?$AUTH_G")"
@@ -437,6 +437,7 @@ else
   bad "27. 9th concurrent /api/events: rc=$rc9 hdr=$(tr -d '\r' <"$HDR9" 2>/dev/null | grep -i retry-after) body=$(cat "$BODY9" 2>/dev/null)"
 fi
 
+# Kill SSE streams promptly instead of waiting for timeout
 for p in "${SSE_PIDS[@]}"; do kill "$p" 2>/dev/null; done
 for p in "${SSE_PIDS[@]}"; do wait "$p" 2>/dev/null; done
 
@@ -447,8 +448,8 @@ for p in "${SSE_PIDS[@]}"; do wait "$p" 2>/dev/null; done
 IDLE_ELAPSED="$(python3 - "$PORT_G" <<'PYEOF'
 import socket, sys, time
 port = int(sys.argv[1])
-s = socket.create_connection(("127.0.0.1", port), timeout=25)
-s.settimeout(25)
+s = socket.create_connection(("127.0.0.1", port), timeout=12)
+s.settimeout(12)
 start = time.monotonic()
 try:
     data = s.recv(1)   # blocks until the server closes it (EOF -> b"") or we time out
@@ -459,10 +460,10 @@ s.close()
 print(elapsed if data == b"" else -1)
 PYEOF
 )"
-if python3 -c "import sys; v=float('$IDLE_ELAPSED'); sys.exit(0 if 0 <= v <= 18 else 1)" 2>/dev/null; then
-  ok "28. idle pre-auth connection (no request ever sent) closed by the server within 18s (elapsed=${IDLE_ELAPSED}s) -- slow-loris bound"
+if python3 -c "import sys; v=float('$IDLE_ELAPSED'); sys.exit(0 if 0 <= v <= 12 else 1)" 2>/dev/null; then
+  ok "28. idle pre-auth connection (no request ever sent) closed by the server within 12s (elapsed=${IDLE_ELAPSED}s) -- slow-loris bound"
 else
-  bad "28. idle pre-auth connection: elapsed=${IDLE_ELAPSED}s (expected a server-initiated close, 0-18s)"
+  bad "28. idle pre-auth connection: elapsed=${IDLE_ELAPSED}s (expected a server-initiated close, 0-12s)"
 fi
 
 # ═══ Group H -- A9: public-mode redaction of /api/state (SRV_HOST, --allow-host) ═
