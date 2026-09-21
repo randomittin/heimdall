@@ -199,6 +199,11 @@ PANELS = _load_module("companion_ui_panels", os.path.join(LIB_DIR, "companion_ui
 # scrub, atomic append). sentinels/hmd-ui.py's POST handler and `hmd ui inbox` both
 # import it, so writer and reader agree -- mirrors PANELS immediately above.
 INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_inbox.py"))
+# The ONE place the session-code derivation lives (deterministic sha256-based 5-char
+# code, stdlib only) -- sentinels/hmd-statusline.py's `_session_code()` loads this exact
+# same file, so the code shown here in identity.session_code and the code shown on the
+# statusline can never disagree.
+SESSION_CODE = _load_module("hmd_session_code", os.path.join(LIB_DIR, "hmd_session_code.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -246,6 +251,26 @@ def _first_line(text):
 
 
 # ── per-field collectors (each returns its contract slice, or None) ──────────
+def collect_session_code(root):
+    """identity.session_code -- the same 5-char code the companion app shows for this
+    paired session (bin/lib/hmd_session_code.py, the one source both this file and
+    sentinels/hmd-statusline.py read). `hmd app connect` pairs ONE `hmd ui` instance
+    per repo (.planning/plans/PLAN-hmd-app-connect.md; its state file
+    <repo>/.heimdall/app/connect.json is repo-keyed, not per-Claude-session), so this
+    is REPO-scoped here -- the live Claude Code session_id, when this process happens
+    to have inherited one (CLAUDE_SESSION_ID/SESSION_ID, the same env precedence
+    `_tracker_state_path()` elsewhere in this file already uses), wins when present;
+    otherwise `root` is the input. Never raises."""
+    if SESSION_CODE is None:
+        return None
+    sid = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("SESSION_ID")
+    try:
+        code, _source = SESSION_CODE.session_code_for(session_id=sid or None, repo=root)
+    except Exception:
+        return None
+    return code if isinstance(code, str) and code else None
+
+
 def collect_identity(root):
     ident = _run_json(("heimdall-identity", "--json"), root)
     handle = ident.get("handle") if isinstance(ident, dict) else None
@@ -253,7 +278,8 @@ def collect_identity(root):
     haid = _first_line(out) if rc == 0 else None
     rc, out, _ = _run(("git", "rev-parse", "--abbrev-ref", "HEAD"), root, timeout=3)
     branch = _first_line(out) if rc == 0 else None
-    return {"handle": handle or None, "haid": haid or None, "branch": branch or None}
+    return {"handle": handle or None, "haid": haid or None, "branch": branch or None,
+            "session_code": collect_session_code(root)}
 
 
 LEDGER_EMPTY = {"daemon": None, "gates": [], "verdict": None, "team": [], "team_overflow": 0}
@@ -651,7 +677,7 @@ def collect_state(root, transport=None):
         "schema_version": SCHEMA_VERSION,
         "ts": time.time(),
         "repo": root,
-        "identity": safe(collect_identity, lambda: {"handle": None, "haid": None, "branch": None}),
+        "identity": safe(collect_identity, lambda: {"handle": None, "haid": None, "branch": None, "session_code": None}),
         "ledger": safe(collect_ledger, lambda: dict(LEDGER_EMPTY)),
         "roster": safe(collect_roster, list),
         "quality_gate": safe(collect_quality_gate, lambda: {"clear_to_push": None, "reason": None}),

@@ -281,7 +281,7 @@ Default posture is **network-on**: presence beats to the public control plane fr
 
 | Surface | File | What it shows |
 |---|---|---|
-| Statusline HUD | `sentinels/hmd-statusline.py` (via `hooks/statusline.sh`; `bin/heimdall-statusline` is the CLI-agnostic renderer) | 4-row composite: hero sigil · identity/branch/verdict · context gauge with cost · gates row (secrets/tests/designmatch) · 5h/7d micro-gauges · team eye-strips; width tiers full/mid/narrow/tiny; modules `hmd_gauge`, `hmd_layout`, `hmd_sigil`, `hmd_ledger`; `bin/heimdall-status-json` is the producer; `bin/heimdall-statusline-register[-cursor]` wires it |
+| Statusline HUD | `sentinels/hmd-statusline.py` (via `hooks/statusline.sh`; `bin/heimdall-statusline` is the CLI-agnostic renderer) | 4-row composite: hero sigil · identity/branch/verdict · context gauge with cost · gates row (secrets/tests/designmatch) · 5h/7d micro-gauges · team eye-strips; width tiers full/mid/narrow/tiny; modules `hmd_gauge`, `hmd_layout`, `hmd_sigil`, `hmd_ledger`; `bin/heimdall-status-json` is the producer; `bin/heimdall-statusline-register[-cursor]` wires it; Row1 identity also renders the 5-char session code from `bin/lib/hmd_session_code.py` (same code `/api/state.identity.session_code` and the companion app expose) |
 | Subagent statusline | `sentinels/hmd-subagent-statusline.sh`, `subagent-statusline.py` | per-subagent line |
 | Banner | `sentinels/hmd-banner.sh` (`--share`) | wake animation; identity card |
 | Farewell | `sentinels/hmd-farewell.sh` (SessionEnd, foreground, after checkpoint + autocommit) | resting watchman + receipt from real stats only (files edited, agents spawned, clean tree) + share line |

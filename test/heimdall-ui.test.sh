@@ -270,7 +270,7 @@ fi
 if jq -e '.schema_version == 1
           and (.ts|type) == "number"
           and (.repo|type) == "string"
-          and (.identity|type) == "object" and (.identity|has("handle") and has("haid") and has("branch"))
+          and (.identity|type) == "object" and (.identity|has("handle") and has("haid") and has("branch") and has("session_code"))
           and (.ledger|type) == "object" and (.ledger|has("daemon") and has("gates") and has("verdict") and has("team") and has("team_overflow"))
           and (.roster|type) == "array"
           and (.quality_gate|type) == "object" and (.quality_gate|has("clear_to_push") and has("reason"))

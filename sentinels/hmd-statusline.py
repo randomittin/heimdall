@@ -461,6 +461,30 @@ def _github_handle(cwd, fallback):
         return fallback
     return login.strip() if isinstance(login, str) and login.strip() else fallback
 
+_SESSION_CODE_LIB = os.path.join(BIN_DIR, "lib", "hmd_session_code.py")
+
+
+def _session_code(session_id, cwd):
+    """The 5-char code identifying this session on the statusline — the SAME code
+    the companion app shows for the paired `hmd ui` backend on this repo
+    (bin/lib/hmd_session_code.py is the one place both this file and
+    sentinels/hmd-ui.py's /api/state read it from, so they can never disagree).
+
+    `session_id` first (the live Claude Code conversation id riding statusline's
+    stdin JSON — see `data.get("session_id")` in main() below); falls back to
+    `cwd` when there is none, mirroring `session_code_for()`'s own precedence.
+    Never raises: a missing/broken lib, or neither input being a usable string,
+    is just another way to have no code — the caller renders nothing rather than
+    guess (fail OPEN, never a blank statusline over it)."""
+    try:
+        spec = importlib.util.spec_from_file_location("hmd_session_code", _SESSION_CODE_LIB)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        code, _source = mod.session_code_for(session_id=session_id or None, repo=cwd)
+    except Exception:
+        return None
+    return code if isinstance(code, str) and code else None
+
 
 def _sigil_override_seed(seed):
     """Honor `hmd sigil set <hero>` (unlocked after >=5 runs — matches the heimdall-sigil CLI
@@ -2069,7 +2093,7 @@ def subagent_ghost(agents):
 
 # ── Row1 identity — WHOLE-SEGMENT drop (Spec v2 §2/§7: text drops per tier, NEVER
 # mid-token) ─────────────────────────────────────────────────────────────────────
-def row1_left(handle, model, repo_seg, cseg, avail):
+def row1_left(handle, model, repo_seg, cseg, avail, code=None):
     """The Row1 identity left run — `⛭ HEIMDALL │ rj · Opus 4.8 │ heimdall:branch +2 ~1`
     — reduced to fit `avail` cells by dropping WHOLE segments, never slicing a token with
     an ellipsis (the `rj · Opus …` / `heimdall:statu…` mid-word clip from the 80c render).
@@ -2080,6 +2104,16 @@ def row1_left(handle, model, repo_seg, cseg, avail):
     every tier ≥ narrow the brand fits). Dependencies fall out of the order: the model
     never renders without its handle, git counts never render without their repo.
 
+    `code` — the 5-char session code (bin/lib/hmd_session_code.py via `_session_code()`
+    above), appended after the handle/model as `rj · Opus 4.8 · K7QMX`. Rides the SAME
+    `handle_on` bit as the rest of the identity text rather than getting its own combo
+    entry: it only ever disappears together with the handle (the brand-only fallback),
+    never dangles alone. `None`/`""` → the whole clause is skipped and the run is
+    BYTE-IDENTICAL to before this param existed, so the density goldens for a stdin
+    payload with no resolvable code are unaffected. Uses the existing `·` separator
+    (already ASCII-safe — see hmd_termcaps.py's `_ASCII_MAP`) rather than a new bracket
+    glyph, so the code degrades correctly on ascii-tier terminals too.
+
     `avail` None → no width pressure, the full run is returned."""
     brand = f"{BLUE}{BOLD}⛭ HEIMDALL{X}"
 
@@ -2087,6 +2121,8 @@ def row1_left(handle, model, repo_seg, cseg, avail):
         s = brand
         if handle_on:
             idt = f"{handle} · {model}" if model_on else str(handle)
+            if code:
+                idt += f" · {code}"
             s += f"{SEP}{DIM}{idt}{X}"
         if repo_on:
             s += f"{SEP}{repo_seg}" + (cseg if counts_on else "")
@@ -2284,7 +2320,8 @@ def main():
     # wall — because those match on what the ledger and the roster already know him as.
     # Row1 is the one place a human is being INTRODUCED, so it is the one place that spends
     # a lookup on the name that human answers to in public.
-    left1 = row1_left(_github_handle(cwd, handle), model, repo_seg, cseg, avail1)
+    left1 = row1_left(_github_handle(cwd, handle), model, repo_seg, cseg, avail1,
+                       code=_session_code(session_id, cwd))
 
     # ── Row2 — the context gauge (CTX%·↓tokens on the fill, $cost on the track end) ──
     # narrow → bar-only (labels off). render_gauge splices the labels inside the bar's cell
