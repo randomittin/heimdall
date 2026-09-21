@@ -1028,5 +1028,74 @@ else
   bad "56. oss path unchanged: brew-prefix-matched binary -> oss, funnel_supported still modern"
 fi
 
+# ── 57. ts_funnel_start: funnel-approval-url -- CLI prints the tailnet-approval
+#         URL to STDOUT then blocks; HMD_FUNNEL_APPROVE_WAIT_S bounds the wait
+#         and the URL is surfaced verbatim on stderr (D8 / hmdapp handoff #2) ──
+if (
+  export FAKE_TS_MODE=funnel-approval-url
+  export HMD_FUNNEL_APPROVE_WAIT_S=2
+  start_ts=$(date +%s)
+  ts_funnel_start 3000 443 >/dev/null 2>/tmp/hmd-ts-57.$$
+  rc=$?
+  end_ts=$(date +%s)
+  elapsed=$((end_ts - start_ts))
+  [ "$rc" -eq 3 ] \
+    && [ "$elapsed" -le 4 ] \
+    && grep -qF 'https://login.tailscale.com/f/funnel?node=' /tmp/hmd-ts-57.$$
+); then
+  ok "57. ts_funnel_start: funnel-approval-url -> exit 3 within the wait window, URL surfaced verbatim (D8)"
+else
+  bad "57. ts_funnel_start: funnel-approval-url -> exit 3 within the wait window, URL surfaced verbatim (D8)"
+fi
+rm -f /tmp/hmd-ts-57.$$ 2>/dev/null || true
+
+# ── 58. ts_funnel_start: funnel-approval-then-ok -- URL seen, CLI then exits 0
+#         inside the window -> success, but the URL was still surfaced (D8) ───
+if (
+  export FAKE_TS_MODE=funnel-approval-then-ok
+  export HMD_FUNNEL_APPROVE_WAIT_S=5
+  ts_funnel_start 3000 443 >/dev/null 2>/tmp/hmd-ts-58.$$
+  rc=$?
+  [ "$rc" -eq 0 ] && grep -qF 'https://login.tailscale.com/f/funnel?node=' /tmp/hmd-ts-58.$$
+); then
+  ok "58. ts_funnel_start: funnel-approval-then-ok -> exit 0, URL still surfaced (D8)"
+else
+  bad "58. ts_funnel_start: funnel-approval-then-ok -> exit 0, URL still surfaced (D8)"
+fi
+rm -f /tmp/hmd-ts-58.$$ 2>/dev/null || true
+
+# ── 59. ts_funnel_start: no leftover temp files across success, failure, and
+#         approval-wait paths -- the combined stdout+stderr capture file is
+#         always rm'd, even when the backgrounded CLI is still running when
+#         the wait window elapses (D8) ─────────────────────────────────────
+if (
+  TMPDIR="$TMPROOT/tmpdir-59"
+  mkdir -p "$TMPDIR"
+  export TMPDIR
+  before="$(ls -A "$TMPDIR")"
+
+  export FAKE_TS_MODE=modern-funnel
+  ts_funnel_start 3000 443 >/dev/null 2>/dev/null
+
+  export FAKE_TS_MODE=policy-hint-on-funnel-start
+  ts_funnel_start 3000 443 >/dev/null 2>/dev/null
+
+  export FAKE_TS_MODE=funnel-approval-url
+  export HMD_FUNNEL_APPROVE_WAIT_S=1
+  ts_funnel_start 3000 443 >/dev/null 2>/dev/null
+
+  export FAKE_TS_MODE=funnel-approval-then-ok
+  export HMD_FUNNEL_APPROVE_WAIT_S=5
+  ts_funnel_start 3000 443 >/dev/null 2>/dev/null
+  unset HMD_FUNNEL_APPROVE_WAIT_S
+
+  after="$(ls -A "$TMPDIR")"
+  [ "$before" = "$after" ]
+); then
+  ok "59. ts_funnel_start: no leftover temp files across success/failure/approval-wait paths (D8)"
+else
+  bad "59. ts_funnel_start: no leftover temp files across success/failure/approval-wait paths (D8)"
+fi
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
