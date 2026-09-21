@@ -16,6 +16,12 @@
 #                          other Funnel/Serve targets are configured (see D6). Off by
 #                          default — the safe default is to refuse, not to silently
 #                          wipe someone else's config.
+#   HMD_TAILSCALE_APP_PLIST overrides which Info.plist ts_variant reads for the
+#                          macsys/appstore bundle-id check, AND stands in for the
+#                          "resolved binary lives under /Applications/Tailscale.app/"
+#                          gate itself (see ts_variant, tier 1) — the only way to
+#                          exercise that tier without a real Tailscale.app on disk.
+#                          Never set in real usage.
 #
 # ── DECISIONS THIS FILE ENCODES ──────────────────────────────────────────────────────
 #   D1: install is never silent — ts_install_prompt always prints the prompt and the
@@ -35,6 +41,17 @@
 #       configured it refuses (exit 7) unless HMD_FUNNEL_FORCE_RESET=1 is set, or it
 #       uses a per-port scoped stop instead when the installed CLI actually exposes one
 #       (see ts_funnel_scoped_off_supported — real tailscale 1.94.2 does not).
+#   D7: (bug analysis, hmdapp docs/analysis/2026-09-21-tailscale-macsys-funnel-cli-
+#       error-3.md) the macsys (Mac App Store system-extension) and appstore (Mac App
+#       Store GUI) builds cannot run Funnel at all — confirmed against Tailscale's own
+#       macOS-variants comparison table, which lists Funnel as supported on the
+#       open-source `tailscaled` build only. ts_funnel_supported reports "none" for
+#       these two variants UNCONDITIONALLY, even when the CLI's own `--help` still
+#       advertises modern flags (macsys/appstore ship the same CLI binary as oss; the
+#       --help text alone can't tell them apart — that gap is exactly what ts_variant
+#       exists to close). ts_funnel_start refuses the same way, before ever invoking
+#       the CLI, with a new exit code — 9 — distinct from every other ts_funnel_start
+#       exit path.
 #
 # JSON parsing uses the `jq -r '.path // empty' 2>/dev/null` idiom already established
 # in bin/lib/hmd-headroom-chain.sh:122 and friends — jq is precedented, not a new dep.
@@ -132,17 +149,201 @@ ts_dns_name() {
   return 0
 }
 
+# _ts_realpath PATH — print PATH with symlinks resolved to their real target.
+# Internal helper (not part of the public ts_* API, hence the leading underscore —
+# mirrors this file's own _HMD_TAILSCALE_SH guard-variable convention). `readlink -f`
+# and `realpath` are both extras — present on this machine (macOS 27) and on GNU
+# coreutils, but not POSIX — so this falls back, in order, to: readlink -f, realpath,
+# then a bounded manual symlink walk for a shell with neither. The manual walk mirrors
+# bin/lib/real-home.sh:136 heimdall_physical_path's hop loop, capped at 16 hops so a
+# symlink cycle terminates instead of hanging. When PATH doesn't exist at all, all
+# three tiers naturally fall through to printing it unchanged (verified empirically:
+# `readlink -f`/`realpath` both fail cleanly, non-zero, on a missing path, and the
+# manual loop's `[ -L ]` test is simply false for it) — callers treat "didn't resolve
+# under Tailscale.app" as "not macsys/appstore", which is already the safe default.
+_ts_realpath() {
+  local p="$1" out hops=0 target
+  out="$(readlink -f "$p" 2>/dev/null || true)"
+  if [ -n "$out" ]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  out="$(realpath "$p" 2>/dev/null || true)"
+  if [ -n "$out" ]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  while [ -L "$p" ] && [ "$hops" -lt 16 ]; do
+    target="$(readlink "$p" 2>/dev/null)" || break
+    [ -n "$target" ] || break
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+    hops=$((hops + 1))
+  done
+  printf '%s' "$p"
+  return 0
+}
+
+# _ts_bundle_id PLIST — print PLIST's CFBundleIdentifier. Internal helper. Three-tier
+# fallback, each only tried if the previous produced nothing: `defaults read` (the
+# normal macOS way), `/usr/libexec/PlistBuddy` (present on every macOS; handles a
+# plist `defaults` won't touch), then a raw `grep -A1 ... | tail -1 | sed` scrape of
+# the XML for a plist neither structured tool accepts as a complete property list
+# (verified empirically: a bare `<key>/<string>` pair with no enclosing
+# `<plist><dict>` wrapper makes BOTH `defaults read` and PlistBuddy fail outright,
+# while the text scrape still finds it). Prints empty on total failure.
+_ts_bundle_id() {
+  local plist="$1" bid
+  [ -n "$plist" ] && [ -e "$plist" ] || return 0
+  bid="$(defaults read "$plist" CFBundleIdentifier 2>/dev/null || true)"
+  if [ -n "$bid" ]; then
+    printf '%s' "$bid"
+    return 0
+  fi
+  if [ -x /usr/libexec/PlistBuddy ]; then
+    bid="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null || true)"
+    if [ -n "$bid" ]; then
+      printf '%s' "$bid"
+      return 0
+    fi
+  fi
+  bid="$(grep -A1 'CFBundleIdentifier' "$plist" 2>/dev/null | tail -1 | sed -e 's/^[[:space:]]*<string>//' -e 's/<\/string>[[:space:]]*$//')"
+  printf '%s' "$bid"
+  return 0
+}
+
+# _ts_app_bundle_gate REAL_PATH — should ts_variant attempt the plist-based
+# macsys/appstore lookup? True in production when REAL_PATH genuinely lives under the
+# real Tailscale.app bundle; true in tests whenever HMD_TAILSCALE_APP_PLIST is set,
+# since that is the documented seam for exercising this tier without a real
+# /Applications/Tailscale.app on disk. Internal helper.
+_ts_app_bundle_gate() {
+  local real="$1"
+  [ -n "${HMD_TAILSCALE_APP_PLIST:-}" ] && return 0
+  case "$real" in
+    /Applications/Tailscale.app/*) return 0 ;;
+  esac
+  return 1
+}
+
+# ts_variant — classify which Tailscale build ts_bin resolves to. Fix for the hmdapp
+# bug analysis (docs/analysis/2026-09-21-tailscale-macsys-funnel-cli-error-3.md): the
+# Mac App Store / macsys build advertises the same modern `--bg`/`--https` flags in
+# `tailscale funnel --help` as the open-source build (same CLI binary, different
+# packaging), so ts_funnel_supported's help-text sniff alone cannot tell them apart —
+# and Funnel silently fails/hangs on macsys regardless of what the help text says (see
+# D7). ts_variant exists to make that distinction from something --help can't lie
+# about: which build is actually installed.
+#
+# Always prints exactly one of:
+#   oss       the open-source `tailscaled` build (Homebrew, or a Linux system
+#             package) — the only variant Tailscale documents as supporting Funnel.
+#   macsys    Mac App Store system-extension variant, bundle id io.tailscale.ipn.macsys.
+#   appstore  Mac App Store GUI variant, bundle id io.tailscale.ipn.macos.
+#   unknown   none of the above could be determined.
+# Exit 0 always — the printed word is the result, not the exit status (same contract
+# as ts_funnel_supported/ts_funnel_scoped_off_supported).
+#
+# Detection order — each tier runs only if the previous one found nothing:
+#   1. Resolve ts_bin's REAL path (_ts_realpath). If it lives under
+#      /Applications/Tailscale.app/ (or HMD_TAILSCALE_APP_PLIST is set — see
+#      _ts_app_bundle_gate), read that bundle's CFBundleIdentifier (_ts_bundle_id)
+#      from /Applications/Tailscale.app/Contents/Info.plist (or the override path).
+#      io.tailscale.ipn.macsys -> macsys; io.tailscale.ipn.macos -> appstore;
+#      anything else (unreadable, unrecognized) falls through to tier 2, same as not
+#      being under Tailscale.app at all.
+#   2. A Homebrew path (/opt/homebrew/bin/tailscale, /opt/homebrew/Cellar/tailscale/*,
+#      /usr/local/bin/tailscale, or anything under `brew --prefix`) or a Linux system
+#      path (/usr/bin/tailscale, /usr/sbin/tailscale) -> oss.
+#   3. `tailscale version --json`, scanned recursively (jq's `..`) for either known
+#      bundle-id string appearing ANYWHERE in the JSON, not a fixed field name —
+#      checked for real on this machine, 2026-09-21, real Homebrew tailscale 1.102.4:
+#        {"majorMinorPatch":"1.102.4","short":"1.102.4","long":"1.102.4-t...",
+#         "gitCommit":"...","osVariant":"darwin","gitCommitTime":"...","cap":142}
+#      No field distinguishes oss/macsys/appstore here (osVariant is the OS family,
+#      not the packaging variant) — this tier is a live forward-compatible probe,
+#      matching this file's existing philosophy (see ts_funnel_scoped_off_supported's
+#      comment), not a check known to fire on any build tested so far. It costs one
+#      already-resolved-binary invocation and, today, always falls through to tier 4.
+#   4. unknown.
+ts_variant() {
+  local bin real plist bid json brew_prefix
+
+  bin="$(ts_bin 2>/dev/null)" || { printf 'unknown'; return 0; }
+  real="$(_ts_realpath "$bin")"
+  [ -n "$real" ] || real="$bin"
+
+  if _ts_app_bundle_gate "$real"; then
+    plist="${HMD_TAILSCALE_APP_PLIST:-/Applications/Tailscale.app/Contents/Info.plist}"
+    bid="$(_ts_bundle_id "$plist")"
+    case "$bid" in
+      io.tailscale.ipn.macsys) printf 'macsys'; return 0 ;;
+      io.tailscale.ipn.macos)  printf 'appstore'; return 0 ;;
+    esac
+  fi
+
+  case "$real" in
+    /opt/homebrew/bin/tailscale|/opt/homebrew/Cellar/tailscale/*|/usr/local/bin/tailscale|/usr/bin/tailscale|/usr/sbin/tailscale)
+      printf 'oss'
+      return 0
+      ;;
+  esac
+  if command -v brew >/dev/null 2>&1; then
+    brew_prefix="$(brew --prefix 2>/dev/null || true)"
+    if [ -n "$brew_prefix" ]; then
+      case "$real" in
+        "$brew_prefix"/*) printf 'oss'; return 0 ;;
+      esac
+    fi
+  fi
+
+  json="$("$bin" version --json 2>/dev/null || true)"
+  if [ -n "$json" ]; then
+    bid="$(printf '%s' "$json" | jq -r '.. | strings | select(. == "io.tailscale.ipn.macsys" or . == "io.tailscale.ipn.macos")' 2>/dev/null | head -1)"
+    case "$bid" in
+      io.tailscale.ipn.macsys) printf 'macsys'; return 0 ;;
+      io.tailscale.ipn.macos)  printf 'appstore'; return 0 ;;
+    esac
+  fi
+
+  printf 'unknown'
+  return 0
+}
+
+# _ts_funnel_unsupported_variant VARIANT — print the shared macsys/appstore Funnel
+# refusal line on stderr (D7). Internal helper shared by ts_funnel_supported (which
+# then prints "none" and returns 0) and ts_funnel_start's guard (which then returns
+# 9), so the wording can never drift between the two call sites.
+_ts_funnel_unsupported_variant() {
+  printf 'funnel: %s build does not support Funnel; install the open-source build: brew install tailscale\n' "$1" >&2
+}
+
 # ts_funnel_supported — probe `tailscale funnel --help` and classify the CLI's funnel
 # syntax generation by content, not exit code (exit code varies across CLI versions;
-# the help text's shape doesn't). Always prints exactly one of:
+# the help text's shape doesn't). VARIANT-AWARE (D7): macsys/appstore builds print the
+# same modern --help text as oss (same CLI binary, different packaging) but cannot run
+# Funnel at all, so ts_variant is checked FIRST and short-circuits to "none" for those
+# two, regardless of what --help says. Always prints exactly one of:
 #   modern   --bg / --https flags (current CLI, confirmed via a real `tailscale
 #            funnel --help` on this machine: v1.94.2 shows both)
 #   legacy   the older `funnel <port> on|off` form
-#   none     funnel subcommand unavailable, or tailscale itself unresolvable
+#   none     funnel subcommand unavailable, tailscale itself unresolvable, or the
+#            resolved build is macsys/appstore (D7 — a stderr hint names the
+#            brew-install fix; see _ts_funnel_unsupported_variant)
 # Exit 0 always — the printed word is the result, not the exit status.
 ts_funnel_supported() {
-  local bin help
+  local bin help variant
   bin="$(ts_bin 2>/dev/null)" || { printf 'none'; return 0; }
+  variant="$(ts_variant)"
+  case "$variant" in
+    macsys|appstore)
+      _ts_funnel_unsupported_variant "$variant"
+      printf 'none'
+      return 0
+      ;;
+  esac
   help="$("$bin" funnel --help 2>&1)"
   if printf '%s' "$help" | grep -q -- '--bg'; then
     printf 'modern'
@@ -190,11 +391,15 @@ ts_funnel_scoped_off_supported() {
 # ts_funnel_start PORT HTTPS_PORT — start funnel using the syntax matching
 # ts_funnel_supported's probe.
 # Exit 0: funnel started. Exit 64: HTTPS_PORT is not one of 443|8443|10000 (Decision
-# D4 — EX_USAGE; checked BEFORE the binary is ever invoked). Exit 3: tailscale refused
-# with a tailnet-policy hint (HTTPS certs / funnel attribute not enabled); the hint is
-# printed VERBATIM on stderr, per D4, never paraphrased. Exit 1: tailscale unresolvable,
-# or funnel unsupported on this CLI. Other nonzero: passed through from the underlying
-# tailscale invocation.
+# D4 — EX_USAGE; checked BEFORE the binary is ever invoked). Exit 9: the resolved
+# build is macsys/appstore (D7) — Funnel does not run on either, so this refuses
+# before ever invoking the CLI; a stderr hint names the brew-install fix. Checked
+# after the HTTPS_PORT validation (a malformed call is still a malformed call
+# regardless of the installed build) but before resolving/invoking the tailscale
+# binary for real. Exit 3: tailscale refused with a tailnet-policy hint (HTTPS certs
+# / funnel attribute not enabled); the hint is printed VERBATIM on stderr, per D4,
+# never paraphrased. Exit 1: tailscale unresolvable, or funnel unsupported on this
+# CLI. Other nonzero: passed through from the underlying tailscale invocation.
 ts_funnel_start() {
   local port="$1" https_port="$2"
   case "$https_port" in
@@ -202,6 +407,15 @@ ts_funnel_start() {
     *)
       printf 'hmd_tailscale: HTTPS_PORT must be one of 443, 8443, 10000 (got: %s)\n' "$https_port" >&2
       return 64
+      ;;
+  esac
+
+  local variant
+  variant="$(ts_variant)"
+  case "$variant" in
+    macsys|appstore)
+      _ts_funnel_unsupported_variant "$variant"
+      return 9
       ;;
   esac
 
