@@ -15,6 +15,10 @@
 #     <repo>/.heimdall/ui/inbox.jsonl: {"id","ts","text","source":"companion"}
 #   - /api/state gains a top-level "inbox": {"pending": <n>}, additive
 #   - `hmd ui inbox ls|pop|peek` list/deliver/peek the same queue
+#   - pending queue capped at MAX_PENDING=200 -> 422 {"error":"inbox-full"};
+#     draining (pop) makes room again (N3)
+#   - inbox-delivered.jsonl rotates to .1 once it reaches MAX_INBOX_BYTES
+#     (2 MiB), then a fresh delivery starts a new file (N3)
 #
 # Hermetic: HOME/HEIMDALL_HOME redirected to a temp dir, fixture repo is a temp
 # dir, background processes reaped on EXIT. No `timeout` on macOS -- every wait
@@ -393,12 +397,162 @@ else
 fi
 inbox_cli pop --json >/dev/null 2>&1   # drain -- leave the inbox clean for section 17
 
-# ═══ 17. server survived every malformed/oversize/secret/control-char
-# payload ═══════════════════════════════════════════════════════════════════
-if kill -0 "$SRV_PID" 2>/dev/null; then
-  ok "17. server still alive after every case"
+# ═══ 17. capacity cap (N3): MAX_PENDING=200 -- the 200th POST succeeds, the
+# 201st is refused with 422 {"error":"inbox-full"} ═════════════════════════
+TS="$(date +%s)"
+CAP_FAILS=0
+CAP_FAIL_DETAIL=""
+for i in $(seq 1 200); do
+  rc="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Content-Type: application/json" \
+       -d "$(printf '{"text":"cap message %d %s"}' "$i" "$TS")" "$BASE/api/send?$AUTH")"
+  if [ "$rc" != "202" ]; then
+    CAP_FAILS=$((CAP_FAILS + 1))
+    [ -n "$CAP_FAIL_DETAIL" ] || CAP_FAIL_DETAIL="first failure at i=$i rc=$rc"
+  fi
+done
+if [ "$CAP_FAILS" -eq 0 ]; then
+  ok "17. 200 POSTs to /api/send (inbox drained beforehand) all return 202"
 else
-  bad "17. server died during the run; tail of its output:"; tail -5 "$SRV_OUT" | sed 's/^/       | /'
+  bad "17. $CAP_FAILS/200 POSTs failed to return 202 ($CAP_FAIL_DETAIL)"
+fi
+if [ "$(wc -l < "$INBOX_FILE" | tr -d ' ')" = "200" ]; then
+  ok "17a. inbox.jsonl has exactly 200 lines after the 200 accepted POSTs"
+else
+  bad "17a. inbox.jsonl line count is $(wc -l < "$INBOX_FILE" | tr -d ' '), expected 200"
+fi
+i=0; got200=0
+while [ "$i" -lt 15 ]; do
+  curl -s -o "$STATE2" "$BASE/api/state?$AUTH"
+  if jq -e '.inbox.pending == 200' "$STATE2" >/dev/null 2>&1; then got200=1; break; fi
+  sleep 0.2; i=$((i + 1))
+done
+if [ "$got200" = "1" ]; then
+  ok "17b. /api/state inbox.pending reaches 200 after 200 accepted POSTs"
+else
+  bad "17b. inbox.pending did not reach 200: $(jq -c '.inbox' "$STATE2" 2>/dev/null)"
+fi
+CAPOUT="$TMPROOT/cap-201.json"
+rc_cap="$(curl -s -o "$CAPOUT" -w '%{http_code}' -X POST -H "Content-Type: application/json" \
+         -d "$(printf '{"text":"cap message 201 %s"}' "$TS")" "$BASE/api/send?$AUTH")"
+if [ "$rc_cap" = "422" ] && jq -e '.error == "inbox-full"' "$CAPOUT" >/dev/null 2>&1; then
+  ok "17c. the 201st POST (queue at 200) -> 422 {\"error\":\"inbox-full\"}"
+else
+  bad "17c. 201st POST -> rc=$rc_cap body=$(cat "$CAPOUT" 2>/dev/null), expected 422 inbox-full"
+fi
+if [ "$(wc -l < "$INBOX_FILE" | tr -d ' ')" = "200" ]; then
+  ok "17d. the refused 201st POST wrote nothing (inbox.jsonl still 200 lines)"
+else
+  bad "17d. inbox.jsonl line count changed after the refused POST: $(wc -l < "$INBOX_FILE")"
+fi
+curl -s -o "$STATE2" "$BASE/api/state?$AUTH"
+if jq -e '.inbox.pending == 200' "$STATE2" >/dev/null 2>&1; then
+  ok "17e. /api/state inbox.pending is still 200 after the refused 201st POST"
+else
+  bad "17e. inbox.pending changed after the refused POST: $(jq -c '.inbox' "$STATE2" 2>/dev/null)"
+fi
+
+# ═══ 18. drain the full queue -> posting works again, pending count tracks ═
+POP200_OUT="$TMPROOT/pop200.out"
+if inbox_cli pop --json >"$POP200_OUT" 2>&1 && jq -e 'length == 200' "$POP200_OUT" >/dev/null 2>&1; then
+  ok "18. hmd ui inbox pop --json drains all 200 messages at once"
+else
+  bad "18. pop at capacity wrong: length=$(jq 'length' "$POP200_OUT" 2>/dev/null)"
+fi
+i=0; got0b=0
+while [ "$i" -lt 15 ]; do
+  curl -s -o "$STATE2" "$BASE/api/state?$AUTH"
+  if jq -e '.inbox.pending == 0' "$STATE2" >/dev/null 2>&1; then got0b=1; break; fi
+  sleep 0.2; i=$((i + 1))
+done
+if [ "$got0b" = "1" ]; then
+  ok "18a. /api/state inbox.pending drops to 0 after draining the full queue"
+else
+  bad "18a. inbox.pending did not return to 0 after drain: $(jq -c '.inbox' "$STATE2" 2>/dev/null)"
+fi
+MSG3="post-drain message $TS"
+POST3_OUT="$TMPROOT/post3.json"
+rc_post3="$(curl -s -o "$POST3_OUT" -w '%{http_code}' -X POST -H "Content-Type: application/json" \
+           -d "$(jq -cn --arg t "$MSG3" '{text:$t}')" "$BASE/api/send?$AUTH")"
+if [ "$rc_post3" = "202" ]; then
+  ok "18b. posting works again immediately after draining a full (200/200) queue"
+else
+  bad "18b. post-drain POST -> $rc_post3, expected 202 (body: $(cat "$POST3_OUT" 2>/dev/null))"
+fi
+i=0; got1c=0
+while [ "$i" -lt 15 ]; do
+  curl -s -o "$STATE2" "$BASE/api/state?$AUTH"
+  if jq -e '.inbox.pending == 1' "$STATE2" >/dev/null 2>&1; then got1c=1; break; fi
+  sleep 0.2; i=$((i + 1))
+done
+if [ "$got1c" = "1" ]; then
+  ok "18c. /api/state inbox.pending is 1 after the post-drain message"
+else
+  bad "18c. inbox.pending did not reach 1 after the post-drain message: $(jq -c '.inbox' "$STATE2" 2>/dev/null)"
+fi
+
+# ═══ 19. inbox-delivered.jsonl rotation at MAX_INBOX_BYTES (2 MiB) ═════════
+# Fabricate an oversized delivered archive directly on disk, then deliver the
+# one message left pending by section 18 -- pop_all() must rotate the
+# existing (fake) archive to .1 before writing the fresh batch.
+MARKER="OLDDELIVEREDFAKE-$TS"
+python3 -c '
+import sys
+marker, path, target = sys.argv[1], sys.argv[2], int(sys.argv[3])
+line = (marker + "\n").encode()
+n = target // len(line) + 1
+open(path, "wb").write(line * n)
+' "$MARKER" "$DELIVERED_FILE" "$((2 * 1024 * 1024 + 100000))"
+FAKE_SIZE="$(wc -c < "$DELIVERED_FILE" | tr -d ' ')"
+if [ "$FAKE_SIZE" -ge "$((2 * 1024 * 1024))" ]; then
+  ok "19a. harness: fake inbox-delivered.jsonl is >= 2 MiB ($FAKE_SIZE bytes) before delivery"
+else
+  bad "19a. harness bug: fake delivered file only $FAKE_SIZE bytes, expected >= 2 MiB"
+fi
+ROT_OUT="$TMPROOT/pop-rotate.out"
+if inbox_cli pop --json >"$ROT_OUT" 2>&1 && jq -e --arg t "$MSG3" 'length == 1 and .[0].text == $t' "$ROT_OUT" >/dev/null 2>&1; then
+  ok "19b. delivering the pending message while the archive is oversized still returns it"
+else
+  bad "19b. rotation-triggering pop wrong: $(cat "$ROT_OUT")"
+fi
+if [ -f "${DELIVERED_FILE}.1" ] && grep -qF "$MARKER" "${DELIVERED_FILE}.1"; then
+  ok "19c. inbox-delivered.jsonl.1 exists and carries the rotated-out fake content"
+else
+  bad "19c. inbox-delivered.jsonl.1 missing or missing the fake marker"
+fi
+if grep -qF "$MARKER" "$DELIVERED_FILE" 2>/dev/null; then
+  bad "19d. the live inbox-delivered.jsonl still carries the old (rotated-out) content"
+else
+  ok "19d. the live inbox-delivered.jsonl no longer carries the old content (fresh file)"
+fi
+if grep -qF "$MSG3" "$DELIVERED_FILE" 2>/dev/null; then
+  ok "19e. the live inbox-delivered.jsonl carries the newly delivered message"
+else
+  bad "19e. the newly delivered message is missing from the live inbox-delivered.jsonl"
+fi
+LIVE_SIZE="$(wc -c < "$DELIVERED_FILE" | tr -d ' ')"
+if [ "$LIVE_SIZE" -lt 100000 ]; then
+  ok "19f. the live inbox-delivered.jsonl is small after rotation ($LIVE_SIZE bytes)"
+else
+  bad "19f. the live inbox-delivered.jsonl is still large after rotation: $LIVE_SIZE bytes"
+fi
+i=0; got0c=0
+while [ "$i" -lt 15 ]; do
+  curl -s -o "$STATE2" "$BASE/api/state?$AUTH"
+  if jq -e '.inbox.pending == 0' "$STATE2" >/dev/null 2>&1; then got0c=1; break; fi
+  sleep 0.2; i=$((i + 1))
+done
+if [ "$got0c" = "1" ]; then
+  ok "19g. /api/state inbox.pending is back to 0 after the rotation-triggering delivery"
+else
+  bad "19g. inbox.pending did not return to 0: $(jq -c '.inbox' "$STATE2" 2>/dev/null)"
+fi
+
+# ═══ 20. server survived every malformed/oversize/secret/control-char/
+# capacity/rotation payload ═════════════════════════════════════════════════
+if kill -0 "$SRV_PID" 2>/dev/null; then
+  ok "20. server still alive after every case"
+else
+  bad "20. server died during the run; tail of its output:"; tail -5 "$SRV_OUT" | sed 's/^/       | /'
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
