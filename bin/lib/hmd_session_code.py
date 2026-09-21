@@ -53,9 +53,7 @@ CLI
 --session-id wins when both are given, matching session_code_for()'s own
 precedence below.
 """
-import argparse
 import hashlib
-import json
 import sys
 
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -93,6 +91,14 @@ def session_code_for(session_id=None, repo=None):
 
 
 def main(argv=None):
+    # Lazy: session_code_for() (the hot render path, loaded in-process by
+    # sentinels/hmd-statusline.py's _session_code()) never touches argparse or
+    # json -- only this CLI entry point does. Importing them here instead of at
+    # module top keeps every statusline render from paying for a stdlib import
+    # (argparse pulls in re/textwrap/warnings) it never uses.
+    import argparse
+    import json
+
     parser = argparse.ArgumentParser(
         prog="hmd_session_code.py",
         description="Deterministic 5-char hmd session code (stdlib only).",
