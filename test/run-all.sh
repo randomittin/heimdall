@@ -412,6 +412,32 @@ _status_snapshot() { git -C "$REPO" status --porcelain=v1 --no-renames 2>/dev/nu
 _status_snapshot > "$WORK/status-before.txt"
 git -C "$REPO" stash list > "$WORK/stash-before.txt" 2>/dev/null
 
+# _hook_owned_path — the single `grep -Ev` pattern (status-code prefix + path) matching a
+# `git status --porcelain` line that this repo's OWN hooks produce, never a suite. Shared
+# verbatim by BOTH the tracked-diff below (REPO INTEGRITY, AFTER SIDE) and
+# _receipt_dirty_lines further down (the sweep receipt's tree_clean) so the two checks can
+# never again disagree about the same path the way they did on 2026-09-21: a full sweep on
+# an otherwise-clean tree went RED with exactly one finding — TREE INTEGRITY VIOLATION for
+# that day's .planning/journal/<haid>.md, appended mid-run by hmd's own journal hook (a
+# Stop/communication hook that appends a line whenever the orchestrating session replies —
+# hooks/hooks.metadata.json id "journal-commit"), never by any suite — while that SAME run's
+# own sweep receipt said tree_clean=true for that exact file, because _receipt_dirty_lines
+# already carried this exemption and the tracked-diff carried its own separate, un-synced
+# copy that didn't. One function, two call sites, can no longer drift apart.
+#   .planning/journal/                          — the journal-commit hook above.
+#   .planning/ledger/{activity,collisions,verdicts,checkpoints}/
+#                                                — bin/heimdall-checkpoint and the
+#                                                  ledger-writing hooks publish scrubbed
+#                                                  snapshots here continuously, independent
+#                                                  of any sweep (see the fuller history at
+#                                                  _receipt_dirty_lines below).
+# Only add/modify-shaped status codes are exempt (`??`, `.M`, `M.`, `A.`, `.A`) — a DELETE
+# or typechange under these same paths still counts as a real violation: nothing legitimate
+# deletes a hook-owned record, so that keeps failing, same as everywhere else.
+_hook_owned_path() {
+  printf '%s' '^(\?\?|.M|M.|A.|.A) \.planning/(ledger/(activity|collisions|verdicts|checkpoints)/|journal/)'
+}
+
 # ── EXECUTE (bounded parallelism; bash 3.2 has no `wait -n`, so poll with kill -0) ─────────
 run_one() {
   local idx="$1" suite="$2" t0 t1 rc budget
@@ -573,6 +599,13 @@ ELAPSED=$((END - START))
 # state, and mktemp dirs outside the repo; none of that is corruption. The floor is "did a
 # suite touch a file that was ALREADY git's business."
 #
+# THE HOOK-OWNED EXCEPTION: an add/modify-shaped git-status line under a path this repo's
+# OWN hooks write to — never a suite — is excluded too, via the shared _hook_owned_path
+# pattern (defined next to _status_snapshot above; see its comment there for the full
+# 2026-09-21 incident and the exact path list). Applied below to tracked-before.txt /
+# tracked-after.txt — the same pattern _receipt_dirty_lines applies to the sweep receipt's
+# tree_clean, so the two checks can't disagree again.
+#
 # THE ONE EXCEPTION: an untracked entry with no path separator — a bare name, or for a
 # directory "name/" (git does not recurse into an untracked dir to list it) — sitting loose
 # in the REPO ROOT. Nothing legitimate creates a new top-level sibling of .planning/, test/,
@@ -605,8 +638,8 @@ ELAPSED=$((END - START))
 _status_snapshot > "$WORK/status-after.txt"
 git -C "$REPO" stash list > "$WORK/stash-after.txt" 2>/dev/null
 
-grep -Ev '^(\?\?|!!)' "$WORK/status-before.txt" > "$WORK/tracked-before.txt"
-grep -Ev '^(\?\?|!!)' "$WORK/status-after.txt"  > "$WORK/tracked-after.txt"
+grep -Ev '^(\?\?|!!)' "$WORK/status-before.txt" | grep -Ev "$(_hook_owned_path)" > "$WORK/tracked-before.txt"
+grep -Ev '^(\?\?|!!)' "$WORK/status-after.txt"  | grep -Ev "$(_hook_owned_path)" > "$WORK/tracked-after.txt"
 diff "$WORK/tracked-before.txt" "$WORK/tracked-after.txt" 2>/dev/null | grep -E '^[<>] ' \
   > "$WORK/tree-violations.txt"
 
@@ -939,9 +972,12 @@ if command -v jq >/dev/null 2>&1; then
   # first, purely from the previous run's receipt (found via
   # test/sweep-receipt-gate.test.sh A14b, 2026-09-19). Untracked form only: a
   # tracked, modified file under .heimdall/ is still someone's edit.
+  # This first grep's pattern now comes from the shared _hook_owned_path (defined next to
+  # _status_snapshot above) instead of a separately hand-maintained copy — see that
+  # function's own comment for the full 2026-09-21 incident this de-duplication fixes.
   _receipt_dirty_lines() {
     _status_snapshot \
-      | grep -Ev '^(\?\?|.M|M.|A.|.A) \.planning/(ledger/(activity|collisions|verdicts|checkpoints)/|journal/)' \
+      | grep -Ev "$(_hook_owned_path)" \
       | grep -Ev '^\?\? \.heimdall/(receipts/)?$'
   }
   RECEIPT_TREE_CLEAN=false
