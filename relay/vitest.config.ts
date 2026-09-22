@@ -2,6 +2,10 @@ import { defineConfig } from "vitest/config";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 
 export default defineConfig({
+  test: {
+    // Slow, seeded trace-diff suites run via `npm run test:trace` only.
+    exclude: ["node_modules/**", "test/trace/**"],
+  },
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.toml" },
