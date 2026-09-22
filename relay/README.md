@@ -161,3 +161,20 @@ frame's `payload`.
   `*.tsbuildinfo`) was added instead of one `relay/node_modules` line in the root `.gitignore` —
   keeps this self-contained package's ignore rules with the package itself; the root
   `.gitignore` is untouched.
+- INV-25's relay-side WS close-code `1013` deviation: the relay's only throttle mechanism
+  (`MAX_CLAIM_ATTEMPTS` in `src/session.ts`'s `handlePairingCodeClaim`) fires strictly
+  pre-upgrade — the throttled request never completes a WebSocket handshake, so there is no
+  live WebSocket to emit a `1013` close frame on. The relay already reports this throttle via
+  HTTP `429` + `Retry-After: 60` + a matching `retry_after_s` body field
+  (`test/trace/mutants-ack-retry.spec.ts`'s `MUT-INV-25-ignore-retry-after` case covers this). A
+  `1013`-carrying close frame would require throttling an already-open device WebSocket, which
+  no code path in this relay does today; adding one only to exercise an otherwise-untriggered
+  deviation would be new, untested scope beyond this fix.
+- The hmd-leg `GET /session/:id/stream` response now closes server-side on `POST
+  /session/:id/revoke` (`src/session.ts`'s `handleRevoke` calls `hmdStreamController.close()`).
+  It still has no close hook tied to Durable Object hibernation/eviction: Cloudflare's
+  Hibernation API preserves accepted WebSockets (`ctx.acceptWebSocket`, used for the device leg)
+  across eviction, but this stream is a plain in-memory `ReadableStreamDefaultController` on a
+  chunked HTTP response, which has no equivalent user-code "about to evict" hook to run cleanup
+  in. Absent revoke, a long-idle session's stream can still only be ended by the client
+  disconnecting.

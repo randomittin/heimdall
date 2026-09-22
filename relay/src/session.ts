@@ -80,11 +80,16 @@ export class SessionDO {
     return timingSafeEqual(auth, `Bearer ${record.relay_session_token}`);
   }
 
-  /** Internal contract, invoked only by worker.ts's `/pair/init` handler
-   * (Durable Objects are never reachable directly from the internet). Accepts
-   * an optional `pairing_ttl_s` override — production callers never set it
-   * (default 60s applies); tests use it to construct an already-expired
-   * session deterministically, without waiting or mocking the clock. */
+  /** Internal contract, invoked only by worker.ts's `/pair/init` handler via
+   * its own direct `stub.fetch("http://do-internal/init", ...)` call — never
+   * reachable from a public request, since worker.ts's
+   * PUBLIC_SESSION_SUBPATHS whitelist excludes "init" from the set of
+   * subpaths it will ever forward here (a public `POST /session/:id/init`
+   * now gets a 404 from worker.ts before this Durable Object is even
+   * touched). Accepts an optional `pairing_ttl_s` override — production
+   * callers never set it (default 60s applies); tests use it to construct an
+   * already-expired session deterministically, without waiting or mocking
+   * the clock. */
   private async handleInit(request: Request): Promise<Response> {
     const body = (await request.json()) as {
       session_id: string;
@@ -324,6 +329,21 @@ export class SessionDO {
       }
       socket.close(4001, "revoked");
     }
+
+    // hmd's GET /stream leg (handleStream, above) is a long-lived response
+    // this Durable Object otherwise never ends on its own — only the client
+    // aborting ever closed it. A revoked session is fully over, so end that
+    // side too instead of leaving it open indefinitely with nothing left to
+    // ever write to it.
+    if (this.hmdStreamController) {
+      try {
+        this.hmdStreamController.close();
+      } catch {
+        // Already closed/errored (e.g. client already disconnected) — no-op.
+      }
+      this.hmdStreamController = null;
+    }
+
     return jsonResponse(200, { ok: true });
   }
 

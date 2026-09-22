@@ -344,4 +344,12 @@ describe("session id validation", () => {
     });
     expect(res.status).toBe(404);
   });
+
+  it("rejects a subpath outside the public surface (e.g. the DO-internal /init) with 404", async () => {
+    const init = await pairInit();
+    const res = await SELF.fetch(`${BASE}/session/${init.session_id}/init`, { method: "POST" });
+    expect(res.status).toBe(404);
+    const res2 = await SELF.fetch(`${BASE}/session/${init.session_id}/not-a-real-subpath`);
+    expect(res2.status).toBe(404);
+  });
 });

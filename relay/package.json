@@ -9,7 +9,8 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/check-no-logged-urls.mjs && vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:trace": "node scripts/trace-diff.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
