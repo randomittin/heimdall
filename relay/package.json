@@ -1,0 +1,21 @@
+{
+  "name": "hmd-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workers + Durable Object relay for hmd's phone companion (Wave 1 hmdapp relay track). See docs/superpowers/specs/2026-09-21-hmd-relay-design.md.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/check-no-logged-urls.mjs && vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260921.1",
+    "typescript": "~6.0.3",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.136.1"
+  }
+}
