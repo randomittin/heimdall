@@ -178,3 +178,109 @@ frame's `payload`.
   chunked HTTP response, which has no equivalent user-code "about to evict" hook to run cleanup
   in. Absent revoke, a long-idle session's stream can still only be ended by the client
   disconnecting.
+
+## fake-hmd.mjs
+
+A plain-Node dev/test tool that plays the laptop (hmd) side of the relay protocol against a
+real deployed relay — for interop testing without a real hmd client or a real phone. Lives
+under `relay/scripts/`, alongside `check-no-logged-urls.mjs`/`trace-diff.mjs`, not under `src/`:
+it needs real filesystem and outbound-network access, which `@cloudflare/vitest-pool-workers`'
+`workerd` runtime doesn't provide.
+
+```
+node relay/scripts/fake-hmd.mjs --relay https://hmd-relay.therishabh16.workers.dev \
+  [--state docs/samples/state.json] [--phone-pubkey <base64>]
+```
+
+It calls `POST /pair/init`, generates an X25519 keypair, prints the pairing payload (the
+`RelayPayload` shape `src/store/relayPayload.ts` parses) as one JSON line on stdout, opens
+`GET /session/:id/stream`, waits for `device_bound`, derives the session key, then seals and
+POSTs a `state` envelope (the `--state` file, default `docs/samples/state.json`) every 5s with
+an increasing seq, decrypts incoming `command` envelopes (printing a `send-message`'s text to
+stderr as `[phone] <text>`), and answers each with an `ack` envelope. Ctrl-C POSTs `/revoke`
+before exiting. It never logs `relay_session_token` or `device_token`.
+
+`node --test scripts/__tests__/fake-hmd.test.mjs` (wired into `npm test`, run via the glob
+`scripts/__tests__/*.test.mjs` — a bare directory argument doesn't auto-discover test files
+under this Node version) covers `lib/relay-crypto.mjs` against the same golden vector
+`src/relay/__tests__/vectors.test.ts` uses (`src/relay/__tests__/fixtures/vectors.json`), plus a
+full phone-seals / hmd-opens-and-acks / phone-opens-ack round trip.
+
+Verified against the live relay above: `/pair/init`, keypair generation, the printed payload
+line, and `GET /stream` all open successfully. It then blocks on `device_bound`, for the reason
+in "Confirmed gaps," below.
+
+### Decisions (disclosed)
+
+- **The three `@noble/*` packages are relay's own `devDependencies`** (`ciphers`/`curves`/
+  `hashes`, all `^2.4.0`, matching root's pin), installed via `npm --prefix relay install` —
+  not a `createRequire(import.meta.url)` reach into root's `node_modules`. Reaching into root
+  would contradict this directory's own stated self-containment (top of this file: "its own
+  `package.json`... never imported by the rest of this repo"); relay already declares and
+  installs its own dependencies for everything else.
+- **`relay-crypto.mjs` and `envelope.mjs` are reimplementations, not imports,** of
+  `src/relay/crypto.ts` and `src/relay/protocol.ts`. `crypto.ts` imports `@/relay/randomBytes` →
+  `react-native-get-random-values`, unavailable in plain Node; `protocol.ts`'s inner-frame shape
+  (`{type, seq, ciphertext}`, no `nonce`/`session_id`/`sender` — direction is implicit on a
+  single persistent WebSocket) is the *phone* leg's, one level narrower than hmd's leg
+  (`Envelope`, `relay/src/types.ts:32-41` — richer because `POST /frames` and `GET /stream` are
+  separate HTTP exchanges with no persistent connection to make direction implicit).
+  `relay-crypto.mjs` is verified byte-exact against the same shared fixture
+  `src/relay/__tests__/vectors.test.ts` checks.
+- **QR printing is skipped, deliberately.** A correct QR encoder needs Reed-Solomon GF(256) ECC,
+  correct finder/alignment/timing module placement, and BCH-encoded format/version info — none
+  of that is achievable correctly in a small dependency-free encoder, and an incorrect QR (one
+  that *looks* like a QR code but doesn't decode, or decodes to the wrong bytes) is worse than
+  none. The tool prints the same payload as one JSON line instead and says so on stderr.
+- **The wire `nonce` field is real, derived data, not a placeholder.** `crypto.ts`'s own `open()`
+  already anticipates "a wire-supplied nonce, if any" and says it is never trusted on decode —
+  the true nonce is always reconstructed from `(sender tag, seq)` alone (INV-13). So
+  `envelope.mjs` computes the true nonce for display, and no decoder anywhere reads it back.
+- **`scripts/**` was added to `vitest.config.ts`'s `exclude`.** Vitest's default include glob
+  otherwise also collects `scripts/__tests__/fake-hmd.test.mjs` and fails on it (its `test` comes
+  from `node:test`, not vitest) — the same "plain Node script needs real fs/network" reasoning
+  that keeps `check-no-logged-urls.mjs` out of the vitest suite.
+- **State is sent unconditionally every 5s** (immediately on key derivation, then every 5s
+  after), per the brief, not gated on a digest-of-state change (INV-22, which governs a real hmd
+  client's traffic — not this interop tool, whose `--state` file is static for the run anyway).
+- **Ack `ok:false` fires only for a structurally-malformed command payload**
+  (`detail: "malformed-command"`) — it does not reproduce `/api/send`'s four real rejection
+  reasons (`empty`/`too-long`/`secret-shaped`/`inbox-full`, INV-23), since this tool never runs
+  `/api/send`'s own validation.
+- **No `device_token`-based reconnect, no backoff/retry on stream drop, and only Ctrl-C/SIGINT
+  is handled** (not `SIGTERM`) — the brief's 10-step flow asks for none of these; adding them
+  would be new, unrequested scope for an interop-testing tool.
+
+### Confirmed gaps (outside this tool's scope — reported, not fixed)
+
+Exercising steps 1-5 against the live relay surfaced two real mismatches between
+`relay/src/**` and `src/transport/RelayTransport.ts`, neither of which this task's scope
+(`relay/scripts/**`) covers:
+
+1. **Query param name mismatch on the phone's claim WS.** `RelayTransport.ts`'s
+   `buildConnectUrl()` (`src/transport/RelayTransport.ts:338`) sends
+   `?claim=<pairing_code>&device_pubkey=<b64>&device_name=<name>`; `session.ts`'s
+   `handleWsUpgrade` (`relay/src/session.ts:198-199`) reads only `pairing_code`/`device_token`
+   and never `claim` at all. `RelayTransport.ts`'s own comment directly above that call
+   (`:321-328`) already flags `claim` as "a documented assumption pending a live
+   relay-service-core to verify against" — this confirms the assumption doesn't hold against
+   the deployed relay.
+2. **hmd never learns the phone's pubkey, even independent of (1).** `handleWsUpgrade` never
+   reads a `device_pubkey` param under any name (`relay/src/session.ts:186-210`);
+   `PairInitResponse` (`relay/src/types.ts:43-48`) and `handleInit`'s actual response body
+   (`relay/src/session.ts:109-114`) carry no pubkey field either; and `acceptDeviceSocket`
+   (`relay/src/session.ts:273-296`) sends the plaintext `device_bound` control frame only to the
+   phone's own just-accepted WebSocket — it never touches `hmdStreamController`, which only
+   `webSocketMessage` (`relay/src/session.ts:350-364`) ever writes to, and only by forwarding a
+   phone-*sent* envelope verbatim. `RelayTransport.ts`'s `handleDeviceBound`
+   (`src/transport/RelayTransport.ts:402-416`) doesn't send its pubkey as such an envelope
+   either — it derives its session key from its own secret key plus `hmd_pubkey` (already known
+   from the QR payload) and stops there. No code path, on either side of this relay as it
+   stands today, ever moves a phone's pubkey to hmd.
+
+Together: a real phone client and this real deployed relay cannot complete pairing with each
+other today, with or without `fake-hmd.mjs`. `fake-hmd.mjs` still needs some way to reach step 6
+to exercise steps 7-9, so it accepts `--phone-pubkey <base64>` as a disclosed manual bridge —
+pass the base64 of a real or test X25519 public key and the tool proceeds exactly as if
+`device_bound` had carried it. Without that flag, and without either gap above being fixed, it
+prints a diagnostic naming both issues and exits `1` rather than hanging or fabricating a key.
