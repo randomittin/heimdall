@@ -512,7 +512,7 @@ N1="$(ls_pgrep_calls)"
   || bad "override still triggered a probe ($N0 -> $N1 calls)"
 [ ! -f "$LS_CACHE" ] && ok "override never writes the cache file" \
   || bad "override unexpectedly created a cache file"
-case "$OV" in ''|*[!0-9]*) bad "count not numeric under override: '$OV'" ;; esac
+case "$OV" in ''|*[!0-9]*) bad "count not numeric under override: '$OV'" ;; *) ok "count numeric under override ($OV)" ;; esac
 
 echo
 echo "  ${PASS} passed, ${FAIL} failed"
