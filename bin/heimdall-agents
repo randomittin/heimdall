@@ -141,6 +141,20 @@
 # is a reliable, read-only liveness signal and is consulted FIRST. The pgrep/lsof
 # probe remains as a fallback for sessions that are idle but still resident.
 #
+# THE PROBE ITSELF GOT CHEAPER, TWICE, MEASURED 2026-09-24 — 3 concurrent
+# sessions' statuslines were each re-invoking `count` every few seconds; every
+# call re-ran pgrep + a per-pid lsof from scratch (`count` cost 8.1s wall, 1.36s
+# user / 2.64s sys, at a load average of 40-50 this very fan-out caused). Fix 1:
+# `_pid_cwd` asks for exactly the cwd file descriptor (Linux: read the
+# /proc/<pid>/cwd symlink directly, no fork at all; macOS: `lsof -a -d cwd -p
+# <pid> -Fn`, never a full-table `lsof -p`) instead of formatting every open fd
+# on a process that may hold hundreds. Fix 2, the one that matters at this fan-
+# out: the result is cached to disk (see live_slugs below), so N independent
+# `count` invocations within the TTL window pay the probe ONCE between them, not
+# N times — the in-process memo a few lines down only ever saved a second call
+# within the SAME process, which is not the shape of the problem 3 separate
+# statuslines create.
+#
 # ENV ─────────────────────────────────────────────────────────────────────────
 #   HMD_AGENT_STALE_SECS    live/stale threshold, seconds (default 900)
 #   HMD_AGENT_HUNG_SECS     awaiting-a-tool-result wedge threshold (default 3600)
@@ -153,9 +167,17 @@
 #   HMD_AGENT_PROJECTS_DIR  override ~/.claude/projects (tests)
 #   HMD_AGENT_LIVE_SLUGS    if DEFINED (even empty), used verbatim as the list of
 #                           project slugs whose session process is alive, instead
-#                           of probing pgrep/lsof. Empty ⇒ no session alive.
-#                           Hermetic tests set this; production leaves it unset.
-#   HMD_AGENT_CWD           cwd whose slug drives task-dir discovery (default PWD)
+#                           of probing pgrep/lsof (or the disk cache below).
+#                           Empty ⇒ no session alive. Hermetic tests set this;
+#                           production leaves it unset.
+#   HMD_AGENT_LIVE_SLUGS_TTL  seconds a cached live_slugs probe stays fresh
+#                           before the next caller re-probes (default 15). Cache
+#                           lives at $HMD_AGENT_CWD/.heimdall/.live-slugs-cache —
+#                           see live_slugs. Ignored when HMD_AGENT_LIVE_SLUGS is
+#                           set (the override never touches the cache).
+#   HMD_AGENT_CWD           cwd whose slug drives task-dir discovery (default
+#                           PWD); also the root the live_slugs disk cache is
+#                           keyed under (see HMD_AGENT_LIVE_SLUGS_TTL)
 #   HMD_NOW                 override "now" epoch seconds (deterministic tests)
 #   HMD_AGENT_NO_SWEEP      if set to 1, `sweep` is an explicit opt-out no-op
 #
@@ -233,26 +255,94 @@ load_reaped() {
 # SAFETY: this is deliberately CONSERVATIVE. If ANY live claude process maps to
 # the slug, every agent under it is treated as possibly-alive and is NEVER
 # orphan-reaped. We only ever declare "orphaned" when NO process for that project
-# exists at all. Probing is LAZY (only when a candidate exists) and cached, so the
-# statusline's `count` never pays for pgrep/lsof in the common case.
+# exists at all. Probing is LAZY (only when a candidate exists), memoized once
+# per process, AND cached to disk across processes (see live_slugs below) — the
+# statusline's `count` never pays for a real pgrep/lsof except once per
+# HMD_AGENT_LIVE_SLUGS_TTL seconds, no matter how many callers ask.
 _LIVE_SLUGS=""
 _LIVE_SLUGS_LOADED=""
+
+# One process's cwd, as cheaply as this platform allows. A full `lsof -p <pid>`
+# formats EVERY open fd on that process before we pick "cwd" back out with awk —
+# on a process holding hundreds of fds, under load, that is seconds, and it is
+# the only thing the loop below actually needs. Linux can skip forking a helper
+# at all (the kernel already maintains /proc/<pid>/cwd as a symlink to it); macOS
+# has no /proc, but its lsof can be asked for exactly the cwd descriptor instead
+# of the whole table. Both fall through to the original full-table scan so a
+# platform where neither applies still gets a correct, just slower, answer.
+_pid_cwd() {
+  local pid="$1" out
+  out="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+  [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  out="$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)"
+  [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  lsof -p "$pid" 2>/dev/null | awk '$4=="cwd"{print $NF; exit}'
+}
+
+# live_slugs: which project slugs currently have a live `claude` process, per
+# `_pid_cwd` above. ON-DISK CACHE, MEASURED 2026-09-24: 3 concurrent sessions'
+# statuslines were each re-invoking `heimdall-agents count` every few seconds,
+# and EVERY call re-ran this probe from scratch — `count` cost 8.1s wall (1.36s
+# user / 2.64s sys) at a load average of 40-50 this very fan-out caused. The
+# in-process memo above (`_LIVE_SLUGS_LOADED`) only ever saved a SECOND call
+# within the SAME process; it did nothing for N independent processes each
+# calling `count` once, which is exactly what 3 statuslines are. A short-TTL
+# file keyed under the invoking project's own `.heimdall` dir (same root, same
+# atomic tmp+rename write as bin/heimdall-statusline's `.agents-count-cache`,
+# which wraps THIS command from outside) means only one process anywhere pays
+# the pgrep/lsof cost per TTL window; everyone else reads a plain file.
+# HMD_AGENT_LIVE_SLUGS keeps its EXACT prior precedence: an explicit/test
+# override is checked FIRST, before the cache is read OR written — hermetic
+# tests never touch disk here.
+# No lock file: two processes racing past a stale cache both run the same real
+# probe and both atomic-rename a near-identical fresh result in. Redundant
+# work, never a torn read — a lock would only save CPU on an already-rare race,
+# not close a correctness gap.
 live_slugs() {
   if [ -n "$_LIVE_SLUGS_LOADED" ]; then printf '%s' "$_LIVE_SLUGS"; return 0; fi
   _LIVE_SLUGS_LOADED=1
   if [ "${HMD_AGENT_LIVE_SLUGS+defined}" = "defined" ]; then
-    # Test/explicit override: use verbatim, never probe the real process table.
+    # Test/explicit override: use verbatim, never probe the real process table,
+    # never read or write the disk cache below.
     _LIVE_SLUGS=" $(printf '%s' "$HMD_AGENT_LIVE_SLUGS" | tr '\n' ' ') "
     printf '%s' "$_LIVE_SLUGS"; return 0
   fi
+
+  local cache_dir cache_file ttl mt
+  cache_dir="${HMD_AGENT_CWD:-$PWD}/.heimdall"
+  cache_file="$cache_dir/.live-slugs-cache"
+  ttl="${HMD_AGENT_LIVE_SLUGS_TTL:-}"
+  case "$ttl" in ''|*[!0-9]*) ttl=15 ;; esac
+  if [ -f "$cache_file" ]; then
+    mt="$(_mtime "$cache_file")"
+    if [ $(( NOW - mt )) -lt "$ttl" ] 2>/dev/null; then
+      _LIVE_SLUGS="$(cat "$cache_file" 2>/dev/null)"
+      [ -n "$_LIVE_SLUGS" ] || _LIVE_SLUGS=" "
+      printf '%s' "$_LIVE_SLUGS"; return 0
+    fi
+  fi
+
   local pid cwd acc=""
   for pid in $(pgrep -x claude 2>/dev/null); do
     case "$pid" in ''|*[!0-9]*) continue ;; esac
-    cwd="$(lsof -p "$pid" 2>/dev/null | awk '$4=="cwd"{print $NF; exit}')"
+    cwd="$(_pid_cwd "$pid")"
     [ -n "$cwd" ] || continue
     acc="$acc $(_slug_for_cwd "$cwd")"
   done
   _LIVE_SLUGS=" ${acc# } "
+
+  # Best-effort write-through: a failed mkdir/mktemp/mv NEVER blocks the answer
+  # (this is a perf cache, not a correctness gate — same fail-open posture as
+  # the rest of this file; see header "Exit: 0 always... never crashes").
+  # Atomic tmp+rename so a concurrent reader never observes a partial file.
+  if mkdir -p "$cache_dir" 2>/dev/null; then
+    local tmp
+    tmp="$(mktemp "$cache_dir/.live-slugs-cache.XXXXXX" 2>/dev/null)" && {
+      printf '%s' "$_LIVE_SLUGS" > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$cache_file" 2>/dev/null \
+        || rm -f "$tmp" 2>/dev/null
+    }
+  fi
   printf '%s' "$_LIVE_SLUGS"
 }
 
