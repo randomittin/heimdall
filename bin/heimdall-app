@@ -25,6 +25,23 @@
 #                              the state file. --bg returns immediately instead
 #                              of waiting, leaving both running (tear down
 #                              later with `hmd app disconnect`).
+#   hmd app connect [--repo DIR] [--port N] --relay URL [--bg]
+#                              Publish through a Cloudflare relay instead of
+#                              Tailscale Funnel -- mutually exclusive with
+#                              --https-port (exit 2 if both are given). Skips
+#                              every tailscale step entirely: no install/login
+#                              checks, no Funnel. Starts `hmd ui` loopback-only
+#                              (no --allow-host/--trust-proxy -- the relay
+#                              never proxies HTTP to it) and spawns
+#                              `bin/heimdall-relay-client` against it. Prints a
+#                              QR code + pairing code from the client's
+#                              `pair_init` event, "phone paired" on
+#                              `device_bound`, then waits in the foreground --
+#                              Ctrl-C, TERM, or HUP sends the client SIGTERM
+#                              (it revokes the session itself) before tearing
+#                              down the ui and state files. --bg returns once
+#                              pairing has started, leaving both running (tear
+#                              down later with `hmd app disconnect`).
 #   hmd app status [--repo DIR]
 #                              Tailscale install/online/DNSName, funnel state,
 #                              the state file's contents, the public URL with
@@ -39,9 +56,13 @@
 #                              with nothing connected still exits 0 -- and even
 #                              then a funnel-stop is always attempted, so a
 #                              funnel never outlives this command.
-#   hmd app doctor [--repo DIR] [--https-port 443|8443|10000]
+#   hmd app doctor [--repo DIR] [--https-port 443|8443|10000] [--relay URL]
 #                              One line per check, a fix hint on every failure.
-#                              Exits 0 only if every check passes.
+#                              Exits 0 only if every check passes. With
+#                              --relay (or when connect.json records relay
+#                              mode), the tailscale-specific checks are
+#                              skipped and a relay-reachability check runs
+#                              instead.
 #   hmd app -h|--help          This help.
 #
 # Exit codes (connect): 64 bad --https-port, 4 tailscale not installed
@@ -60,12 +81,25 @@
 # killed and torn down before returning, same as a normal Ctrl-C. Every
 # ts_funnel_stop call (disconnect, and teardown after any of the above) is
 # time-boxed too (HMD_FUNNEL_STOP_TIMEOUT_S, default 20), so nothing here
-# can hang forever regardless of what the tailscale CLI itself does.
+# can hang forever regardless of what the tailscale CLI itself does. --relay
+# mode has its own two, both meaning the relay client exited before pairing
+# could start: 11 relay E2E crypto is unavailable, 12 the relay was
+# unreachable or pair-init failed (bin/heimdall-relay-client's own contract).
 #
 # State file: <repo>/.heimdall/app/connect.json
 #   {"pid_ui": N, "port": N, "https_port": N, "host": "...", "started_at": "..."}
-# The token is NEVER written here -- it lives only in the one line `hmd ui`
-# printed at startup and inside that process's own memory.
+# In --relay mode the same file instead holds:
+#   {"mode": "relay", "pid_ui": N, "pid_client": N, "port": N, "relay": "...",
+#    "started_at": "..."}
+# and bin/heimdall-relay-client maintains its own status file,
+# <repo>/.heimdall/app/relay.json:
+#   {"session_id": "...", "relay": "...", "paired": bool, "bound_at": N|null,
+#    "last_seq": N, "frames_sent": N, "last_delivered": "...", "pid": N,
+#    "last_command_at": N|null, "started_at": N}
+# The token (tailscale mode) is NEVER written to connect.json -- it lives
+# only in the one line `hmd ui` printed at startup and inside that process's
+# own memory. The relay mode's pairing code / hmd_pubkey are likewise never
+# written there -- only in the client's pair_init event and its own memory.
 #
 # Auth model: unchanged from `hmd ui` -- loopback bind, a Host allowlist
 # extended with the Funnel hostname, the per-launch token, and --trust-proxy
@@ -105,6 +139,7 @@ fi
 
 UI_BIN="${HEIMDALL_UI_BIN:-$BIN_DIR/heimdall-ui}"
 INBOX_DELIVER_BIN="${HEIMDALL_INBOX_DELIVER_BIN:-$BIN_DIR/heimdall-inbox-deliver}"
+RELAY_CLIENT_BIN="${HEIMDALL_RELAY_CLIENT_BIN:-$BIN_DIR/heimdall-relay-client}"
 QR_PY="$LIB_DIR/hmd_qr.py"
 
 PY3=""
@@ -130,12 +165,30 @@ STATE_WRITTEN=false
 STATE_FILE=""
 UI_OUT=""
 CLEANED_UP=false
+# --relay mode's own teardown state, same "GLOBAL, never local" rule as
+# above -- cleanup() branches on RELAY_MODE to decide which of this block or
+# the tailscale fields above it actually applies.
+RELAY_MODE=false
+CLIENT_PID=""
+RELAY_STATE_FILE=""
+CLIENT_OUT=""
+CLIENT_ERR=""
 
 cleanup() {
   [ "$CLEANED_UP" = true ] && return 0
   CLEANED_UP=true
   local funnel_stop_rc=0
-  if [ "$FUNNEL_UP" = true ] && [ -n "$HTTPS_PORT" ]; then
+  if [ "$RELAY_MODE" = true ]; then
+    # Relay's own analogue of the funnel-stop-and-verify branch below: TERM,
+    # a bounded wait, then kill-tree if it didn't leave on its own. Unlike a
+    # still-public funnel, a forced kill here does NOT override this
+    # process's own pending exit code -- a relay pairing session's lifetime
+    # is the relay's call, not this process's. (cmd_disconnect_relay is the
+    # one place a failed revoke DOES change the exit code, to 8.)
+    if ! _relay_stop_client "$CLIENT_PID"; then
+      echo "hmd app connect: relay client had to be force-killed -- the pairing session stays open until its token expires" >&2
+    fi
+  elif [ "$FUNNEL_UP" = true ] && [ -n "$HTTPS_PORT" ]; then
     # A11/A13 (bin/lib/hmd_tailscale.sh D6): pass hmd's own backend port so
     # ts_funnel_stop can recognize its own target instead of conservatively
     # refusing (exit 7) to reset when it can't tell "mine" from "foreign".
@@ -152,8 +205,17 @@ cleanup() {
   if [ "$STATE_WRITTEN" = true ] && [ -n "$STATE_FILE" ]; then
     rm -f "$STATE_FILE" 2>/dev/null || true
   fi
+  if [ -n "$RELAY_STATE_FILE" ]; then
+    rm -f "$RELAY_STATE_FILE" 2>/dev/null || true
+  fi
   if [ -n "$UI_OUT" ]; then
     rm -f "$UI_OUT" 2>/dev/null || true
+  fi
+  if [ -n "$CLIENT_OUT" ]; then
+    rm -f "$CLIENT_OUT" 2>/dev/null || true
+  fi
+  if [ -n "$CLIENT_ERR" ]; then
+    rm -f "$CLIENT_ERR" 2>/dev/null || true
   fi
   # N1: an explicit exit is the only way to change the process's final exit
   # code from inside an EXIT-trap handler (a plain `return` here would not
@@ -191,6 +253,19 @@ _pid_is_heimdall_ui() {
   cmd="$(ps -o command= -p "$pid" 2>/dev/null || ps -o comm= -p "$pid" 2>/dev/null || true)"
   case "$cmd" in
     *heimdall-ui*|*hmd-ui.py*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Relay analogue of _pid_is_heimdall_ui above -- same recycled-pid safety
+# rationale (A14), for bin/heimdall-relay-client instead of heimdall-ui.
+_pid_is_relay_client() {
+  local pid="$1" cmd
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(ps -o command= -p "$pid" 2>/dev/null || ps -o comm= -p "$pid" 2>/dev/null || true)"
+  case "$cmd" in
+    *heimdall-relay-client*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -265,6 +340,32 @@ _funnel_stop_and_verify() {
   fi
   printf '%s: FUNNEL STILL PUBLIC -- stop ran (exit %d) but the funnel is still reachable -- run: HMD_FUNNEL_FORCE_RESET=1 hmd app disconnect\n' "$prefix" "$rc" >&2
   return 8
+}
+
+# Relay analogue of _funnel_stop_and_verify above: SIGTERM the relay client
+# so it gets a chance to POST /revoke itself, wait up to
+# HMD_RELAY_STOP_TIMEOUT_S (default 15) for it to exit on its own, then kill
+# its whole process tree if it didn't. $1: the client's pid (may be empty --
+# a no-op then, same as a pid that's already gone). Returns 0 once the
+# client is confirmed gone on its own, 8 if it had to be force-killed --
+# same 0/8 convention as _funnel_stop_and_verify, so callers can treat "had
+# to force it" as a soft failure without a separate code to remember.
+_relay_stop_client() {
+  local pid="${1:-}" timeout="${HMD_RELAY_STOP_TIMEOUT_S:-15}" waited=0
+  [ -n "$pid" ] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$timeout" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    _kill_tree KILL "$pid"
+    wait "$pid" 2>/dev/null || true
+    return 8
+  fi
+  wait "$pid" 2>/dev/null || true
+  return 0
 }
 
 # A6: print a file to stderr with any pairing token redacted. heimdall-ui's
@@ -368,6 +469,7 @@ _dns_suffix_hint() {
 
 cmd_connect() {
   local REPO="" PORT="8710" NO_INSTALL=false BG=false
+  local RELAY_URL="" HTTPS_PORT_SET=false
   HTTPS_PORT="443"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -381,6 +483,11 @@ cmd_connect() {
         ;;
       --https-port)
         HTTPS_PORT="${2:-}"
+        HTTPS_PORT_SET=true
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      --relay)
+        RELAY_URL="${2:-}"
         if [ $# -ge 2 ]; then shift 2; else shift 1; fi
         ;;
       --no-install) NO_INSTALL=true; shift ;;
@@ -389,6 +496,17 @@ cmd_connect() {
     esac
   done
   REPO="$(resolve_repo_value "$REPO")"
+
+  if [ -n "$RELAY_URL" ] && [ "$HTTPS_PORT_SET" = true ]; then
+    echo "hmd app connect: --relay and --https-port are mutually exclusive" >&2
+    return 2
+  fi
+
+  if [ -n "$RELAY_URL" ]; then
+    RELAY_MODE=true
+    cmd_connect_relay "$REPO" "$PORT" "$BG" "$RELAY_URL"
+    return $?
+  fi
 
   case "$HTTPS_PORT" in
     443|8443|10000) : ;;
@@ -603,6 +721,188 @@ cmd_connect() {
   return "$ui_rc"
 }
 
+# cmd_connect_relay: the --relay counterpart to cmd_connect's tailscale path
+# above -- publish through the Cloudflare relay instead of Tailscale Funnel.
+# Never reimplements bin/heimdall-relay-client's own logic (E2E crypto, the
+# relay HTTP contract) -- this only spawns it, renders what it reports on
+# its own stdout, and tears it down. $1: REPO (already resolved). $2: PORT.
+# $3: BG (true/false). $4: RELAY_URL.
+cmd_connect_relay() {
+  local REPO="$1" PORT="$2" BG="$3" RELAY_URL="$4"
+
+  if [ ! -x "$UI_BIN" ]; then
+    echo "hmd app connect: heimdall-ui not found at $UI_BIN" >&2
+    return 2
+  fi
+  if [ ! -x "$RELAY_CLIENT_BIN" ]; then
+    echo "hmd app connect: heimdall-relay-client not found at $RELAY_CLIENT_BIN" >&2
+    return 2
+  fi
+  if ! command -v mktemp >/dev/null 2>&1; then
+    echo "hmd app connect: required tool missing: mktemp" >&2
+    return 2
+  fi
+
+  mkdir -p "$REPO/.heimdall/app" 2>/dev/null || true
+  STATE_FILE="$REPO/.heimdall/app/connect.json"
+  RELAY_STATE_FILE="$REPO/.heimdall/app/relay.json"
+
+  # A6: mktemp required, not a predictable /tmp fallback; umask 077 so every
+  # temp file that can carry pairing/session data (the client's own stdout
+  # is the QR payload -- session_id, pairing_code, hmd_pubkey) is 0600 from
+  # creation, same discipline as UI_OUT below.
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  UI_OUT="$(mktemp)"; local ui_out_rc=$?
+  CLIENT_OUT="$(mktemp)"; local client_out_rc=$?
+  CLIENT_ERR="$(mktemp)"; local client_err_rc=$?
+  umask "$old_umask"
+  if [ "$ui_out_rc" -ne 0 ] || [ -z "$UI_OUT" ] || [ "$client_out_rc" -ne 0 ] || [ -z "$CLIENT_OUT" ] || [ "$client_err_rc" -ne 0 ] || [ -z "$CLIENT_ERR" ]; then
+    echo "hmd app connect: mktemp failed to create a temp file" >&2
+    return 2
+  fi
+
+  # Loopback only -- no --allow-host/--trust-proxy. Unlike the tailscale
+  # path, nothing ever proxies public HTTP traffic to this port: the relay
+  # client talks to the relay itself and reads ui state over loopback, so
+  # heimdall-ui's trust boundary never needs extending to a public hostname.
+  (
+    cd "$REPO" 2>/dev/null || exit 2
+    HEIMDALL_WATCH_ROOT="$REPO" exec "$UI_BIN" --repo "$REPO" --port "$PORT" --no-open
+  ) >"$UI_OUT" 2>&1 &
+  UI_PID=$!
+
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  trap 'cleanup; exit 129' HUP
+  trap cleanup EXIT
+
+  local url_re='^http://127\.0\.0\.1:[0-9]+/\?token='
+  local waited=0 url_line=""
+  while [ "$waited" -lt 100 ]; do
+    if ! kill -0 "$UI_PID" 2>/dev/null; then
+      echo "hmd app connect: heimdall-ui exited before it started listening:" >&2
+      _print_redacted "$UI_OUT" >&2
+      return 6
+    fi
+    url_line="$(grep -E "$url_re" "$UI_OUT" 2>/dev/null | head -1)"
+    [ -n "$url_line" ] && break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if [ -z "$url_line" ]; then
+    echo "hmd app connect: heimdall-ui did not print a URL within 10s:" >&2
+    _print_redacted "$UI_OUT" >&2
+    return 6
+  fi
+  local actual_port
+  actual_port="$(printf '%s' "$url_line" | sed -E 's#^http://127\.0\.0\.1:([0-9]+)/.*#\1#')"
+  ACTUAL_PORT="$actual_port"
+
+  local relay_host
+  relay_host="$(printf '%s' "$RELAY_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*$##; s#:.*$##')"
+
+  "$RELAY_CLIENT_BIN" --relay "$RELAY_URL" --repo "$REPO" --ui-port "$actual_port" --public-host "$relay_host" >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
+  CLIENT_PID=$!
+
+  jq -n \
+    --argjson pid_ui "$UI_PID" \
+    --argjson pid_client "$CLIENT_PID" \
+    --argjson port "$actual_port" \
+    --arg relay "$RELAY_URL" \
+    --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{mode: "relay", pid_ui: $pid_ui, pid_client: $pid_client, port: $port, relay: $relay, started_at: $started_at}' \
+    >"$STATE_FILE" 2>/dev/null
+  [ -s "$STATE_FILE" ] && STATE_WRITTEN=true
+
+  local pair_init_seen=false warned_expired=false pairing_exp=0 seen_lines=0 client_rc=0
+
+  while :; do
+    if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
+      wait "$CLIENT_PID" 2>/dev/null
+      client_rc=$?
+      break
+    fi
+
+    local line ev
+    while IFS= read -r line; do
+      seen_lines=$((seen_lines + 1))
+      [ -n "$line" ] || continue
+      ev="$(printf '%s' "$line" | jq -r '.event // empty' 2>/dev/null)"
+      case "$ev" in
+        pair_init)
+          pair_init_seen=true
+          local qr_json code exp remain now
+          qr_json="$(printf '%s' "$line" | jq -c '.qr // empty' 2>/dev/null)"
+          exp="$(printf '%s' "$line" | jq -r '.exp // empty' 2>/dev/null)"
+          code="$(printf '%s' "$qr_json" | jq -r '.pairing_code // empty' 2>/dev/null)"
+          [ -n "$exp" ] && pairing_exp="$exp"
+          echo ""
+          echo "hmd app: scan to pair a device --"
+          echo ""
+          if [ -n "$PY3" ] && [ -r "$QR_PY" ]; then
+            # A5: the QR payload (session id, pairing code, pubkey) goes on
+            # stdin, never argv -- same rationale as the Funnel URL above.
+            printf '%s' "$qr_json" | "$PY3" "$QR_PY" --ascii || true
+            echo ""
+          fi
+          if [ -n "$code" ]; then
+            echo "  PAIRING CODE: $code"
+            echo ""
+          fi
+          now="$(date +%s)"
+          remain=60
+          [ -n "$exp" ] && remain=$((exp - now))
+          echo "WARNING: anyone who scans this code within ${remain}s binds a device to"
+          echo "this session -- E2E-encrypted; the relay sees only ciphertext."
+          echo ""
+          ;;
+        device_bound)
+          echo "hmd app: phone paired"
+          ;;
+        stream_drop)
+          echo "hmd app: relay stream dropped -- the client will attempt to reconnect" >&2
+          ;;
+        error)
+          local msg
+          msg="$(printf '%s' "$line" | jq -r '.message // .error // empty' 2>/dev/null)"
+          echo "hmd app connect: relay client error: ${msg:-$line}" >&2
+          ;;
+        *) : ;;
+      esac
+    done < <(tail -n +"$((seen_lines + 1))" "$CLIENT_OUT" 2>/dev/null)
+
+    if [ "$pair_init_seen" = true ] && [ "$BG" = true ]; then
+      echo "hmd app: running in background (ui pid $UI_PID, relay client pid $CLIENT_PID). Tear down with: hmd app disconnect"
+      trap - INT TERM HUP EXIT
+      disown "$UI_PID" 2>/dev/null || true
+      disown "$CLIENT_PID" 2>/dev/null || true
+      rm -f "$UI_OUT" "$CLIENT_OUT" "$CLIENT_ERR" 2>/dev/null || true
+      return 0
+    fi
+
+    if [ "$pair_init_seen" = true ] && [ "$warned_expired" = false ] && [ "$pairing_exp" -gt 0 ]; then
+      local now2
+      now2="$(date +%s)"
+      if [ "$now2" -gt $((pairing_exp + 5)) ]; then
+        echo "hmd app connect: pairing code expired -- Ctrl-C and reconnect to mint a new one" >&2
+        warned_expired=true
+      fi
+    fi
+    sleep 0.2
+  done
+
+  if [ "$pair_init_seen" != true ]; then
+    echo "hmd app connect: relay client exited before pairing could start:" >&2
+    _print_redacted "$CLIENT_ERR" >&2
+    return "$client_rc"
+  fi
+
+  echo "hmd app: relay session ended (client exit $client_rc)"
+  return "$client_rc"
+}
+
 cmd_status() {
   local REPO=""
   while [ $# -gt 0 ]; do
@@ -615,6 +915,12 @@ cmd_status() {
     esac
   done
   REPO="$(resolve_repo_value "$REPO")"
+
+  local connect_state_file="$REPO/.heimdall/app/connect.json"
+  if [ -f "$connect_state_file" ] && [ "$(jq -r '.mode // empty' "$connect_state_file" 2>/dev/null)" = "relay" ]; then
+    cmd_status_relay "$REPO" "$connect_state_file"
+    return $?
+  fi
 
   if ts_installed; then
     echo "tailscale installed: yes"
@@ -694,6 +1000,72 @@ cmd_status() {
   return 0
 }
 
+# cmd_status_relay: the --relay counterpart to cmd_status's tailscale report
+# above. $1: REPO (already resolved). $2: connect.json's path (already
+# confirmed to exist with mode "relay" by the caller).
+cmd_status_relay() {
+  local REPO="$1" state_file="$2"
+  local relay pid_ui pid_client port started_at
+  relay="$(jq -r '.relay // empty' "$state_file" 2>/dev/null)"
+  pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
+  pid_client="$(jq -r '.pid_client // empty' "$state_file" 2>/dev/null)"
+  port="$(jq -r '.port // empty' "$state_file" 2>/dev/null)"
+  started_at="$(jq -r '.started_at // empty' "$state_file" 2>/dev/null)"
+
+  local relay_state_file="$REPO/.heimdall/app/relay.json"
+  local session_id="" paired="" bound_at="" frames_sent="" last_seq="" last_delivered=""
+  if [ -f "$relay_state_file" ]; then
+    session_id="$(jq -r '.session_id // empty' "$relay_state_file" 2>/dev/null)"
+    paired="$(jq -r '.paired // empty' "$relay_state_file" 2>/dev/null)"
+    bound_at="$(jq -r '.bound_at // empty' "$relay_state_file" 2>/dev/null)"
+    frames_sent="$(jq -r '.frames_sent // empty' "$relay_state_file" 2>/dev/null)"
+    last_seq="$(jq -r '.last_seq // empty' "$relay_state_file" 2>/dev/null)"
+    last_delivered="$(jq -r '.last_delivered // empty' "$relay_state_file" 2>/dev/null)"
+  fi
+
+  local ui_alive="not running" client_alive="not running"
+  _pid_is_heimdall_ui "$pid_ui" && ui_alive="running"
+  _pid_is_relay_client "$pid_client" && client_alive="running"
+
+  echo "mode: relay"
+  echo "connected: yes"
+  echo "  relay: ${relay:-?}"
+  echo "  session id: ${session_id:-?}"
+  if [ "$paired" = "true" ]; then
+    echo "  paired: yes (bound at ${bound_at:-?})"
+  else
+    echo "  paired: no"
+  fi
+  echo "  frames sent: ${frames_sent:-0}"
+  echo "  last seq: ${last_seq:-0}"
+  echo "  last delivered: ${last_delivered:-(none)}"
+  echo "  ui pid: ${pid_ui:-?} ($ui_alive)"
+  echo "  client pid: ${pid_client:-?} ($client_alive)"
+  echo "  local port: ${port:-?}"
+  echo "  started at: ${started_at:-?}"
+
+  # Orphan rules, mirroring cmd_status's ORPHANED FUNNEL check above: the
+  # relay client is the only thing that can revoke the session, so its death
+  # while the ui lingers (or both gone but state left behind) both need a
+  # human to run disconnect rather than silently look "connected".
+  if [ "$client_alive" = "not running" ] && [ "$ui_alive" = "running" ]; then
+    echo "WARNING: relay client is not running but heimdall-ui still is -- run: hmd app disconnect" >&2
+    return 1
+  fi
+  if [ "$client_alive" = "not running" ] && [ "$ui_alive" = "not running" ]; then
+    echo "stale -- run hmd app disconnect" >&2
+    return 1
+  fi
+
+  if [ -x "$INBOX_DELIVER_BIN" ]; then
+    local inbox_json pending
+    inbox_json="$("$INBOX_DELIVER_BIN" status --repo "$REPO" 2>/dev/null)"
+    pending="$(printf '%s' "$inbox_json" | jq -r '.pending // empty' 2>/dev/null)"
+    echo "inbox pending: ${pending:-0}"
+  fi
+  return 0
+}
+
 cmd_disconnect() {
   local REPO=""
   while [ $# -gt 0 ]; do
@@ -708,6 +1080,11 @@ cmd_disconnect() {
   REPO="$(resolve_repo_value "$REPO")"
   local state_file="$REPO/.heimdall/app/connect.json"
   local vrc
+
+  if [ -f "$state_file" ] && [ "$(jq -r '.mode // empty' "$state_file" 2>/dev/null)" = "relay" ]; then
+    cmd_disconnect_relay "$REPO" "$state_file"
+    return $?
+  fi
 
   if [ ! -f "$state_file" ]; then
     # A4(a): a funnel can outlive its state file (crash, a manual rm, a prior
@@ -784,8 +1161,54 @@ cmd_disconnect() {
   return "$vrc"
 }
 
+# cmd_disconnect_relay: the --relay counterpart to cmd_disconnect above.
+# $1: REPO (already resolved). $2: connect.json's path (already confirmed to
+# exist with mode "relay" by the caller).
+cmd_disconnect_relay() {
+  local REPO="$1" state_file="$2"
+  local pid_ui pid_client
+  pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
+  pid_client="$(jq -r '.pid_client // empty' "$state_file" 2>/dev/null)"
+  local relay_state_file="$REPO/.heimdall/app/relay.json"
+  local rc=0
+
+  # A14: verify identity before signaling -- a recycled pid must never take
+  # an unrelated process down with it.
+  if _pid_is_relay_client "$pid_client"; then
+    _relay_stop_client "$pid_client"
+    rc=$?
+  elif [ -n "$pid_client" ] && kill -0 "$pid_client" 2>/dev/null; then
+    echo "hmd app disconnect: pid $pid_client in state file is not a heimdall-relay-client process -- not killing it" >&2
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    echo "hmd app disconnect: revoke may not have reached the relay -- the pairing session stays open until its token expires" >&2
+  fi
+
+  if _pid_is_heimdall_ui "$pid_ui"; then
+    kill "$pid_ui" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$pid_ui" 2>/dev/null && [ "$waited" -lt 30 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    kill -9 "$pid_ui" 2>/dev/null || true
+  elif [ -n "$pid_ui" ] && kill -0 "$pid_ui" 2>/dev/null; then
+    echo "hmd app disconnect: pid $pid_ui in state file is not a heimdall-ui process -- not killing it" >&2
+  fi
+
+  # Unconditional either way, matching cmd_disconnect's own documented
+  # rationale above: a bad revoke must not leave the ui process or either
+  # state file behind too.
+  rm -f "$state_file" 2>/dev/null || true
+  rm -f "$relay_state_file" 2>/dev/null || true
+
+  [ "$rc" -eq 0 ] && echo "hmd app disconnect: stopped"
+  return "$rc"
+}
+
 cmd_doctor() {
-  local REPO="" HTTPS_PORT="443"
+  local REPO="" HTTPS_PORT="443" RELAY_URL=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo)
@@ -796,15 +1219,35 @@ cmd_doctor() {
         HTTPS_PORT="${2:-}"
         if [ $# -ge 2 ]; then shift 2; else shift 1; fi
         ;;
+      --relay)
+        RELAY_URL="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
       *) echo "hmd app doctor: unknown flag: $1" >&2; return 2 ;;
     esac
   done
   REPO="$(resolve_repo_value "$REPO")"
 
+  # relay mode: --relay wins if given; otherwise inferred from a live
+  # connect.json, so `hmd app doctor` alone still diagnoses the session
+  # that's actually running -- same inference cmd_status/cmd_disconnect use.
+  local relay_mode=false
+  if [ -n "$RELAY_URL" ]; then
+    relay_mode=true
+  else
+    local doctor_state_file="$REPO/.heimdall/app/connect.json"
+    if [ -f "$doctor_state_file" ] && [ "$(jq -r '.mode // empty' "$doctor_state_file" 2>/dev/null)" = "relay" ]; then
+      relay_mode=true
+      RELAY_URL="$(jq -r '.relay // empty' "$doctor_state_file" 2>/dev/null)"
+    fi
+  fi
+
   echo "hmd app doctor"
   local failed=0 installed=false online=false
 
-  if ts_installed; then
+  if [ "$relay_mode" = true ]; then
+    echo "skip  tailscale installed (relay mode)"
+  elif ts_installed; then
     echo "ok    tailscale installed"
     installed=true
   else
@@ -813,137 +1256,163 @@ cmd_doctor() {
     failed=$((failed + 1))
   fi
 
-  # 2026-09-21 tailscale-macsys-funnel-cli-error-3: the macsys/App Store
-  # build advertises the same modern funnel flags in --help as the
-  # open-source build, but Funnel only ever works on open-source tailscaled
-  # -- this machine can easily have both installed (Homebrew AND the App
-  # Store GUI) at once, so the resolved binary PATH is printed alongside the
-  # variant, not just the classification, so a "why does it say macsys" ever
-  # comes down to one visible fact instead of a guess.
-  local variant="" variant_failed=false bin_path=""
-  if [ "$installed" = true ]; then
-    bin_path="$(ts_bin 2>/dev/null || echo '(unresolved)')"
-    variant="$(ts_variant 2>/dev/null || echo unknown)"
-    case "$variant" in
-      oss)
-        echo "ok    tailscale build variant ($variant, $bin_path)"
-        ;;
-      macsys|appstore)
-        echo "FAIL  tailscale build variant ($variant, $bin_path)"
-        echo "      fix: install the open-source build: brew install tailscale (then: tailscale up)"
+  if [ "$relay_mode" = true ]; then
+    echo "skip  tailscale build variant (relay mode)"
+    echo "skip  tailscale daemon running (relay mode)"
+    echo "skip  logged in / online (relay mode)"
+    echo "skip  DNSName resolvable (relay mode)"
+    echo "skip  funnel capability (relay mode)"
+    echo "skip  HTTPS certs / funnel node attribute (relay mode)"
+    echo "skip  https-port allowed (relay mode)"
+
+    if [ -n "$RELAY_URL" ]; then
+      local relay_code
+      relay_code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -X GET "${RELAY_URL%/}/pair/init" 2>/dev/null)"
+      if [ -n "$relay_code" ] && [ "$relay_code" != "000" ]; then
+        echo "ok    relay reachable ($RELAY_URL, HTTP $relay_code)"
+      else
+        echo "FAIL  relay reachable"
+        echo "      fix: relay unreachable -- carrier or DNS blackhole? try another network"
         failed=$((failed + 1))
-        variant_failed=true
-        ;;
-      *)
-        echo "warn  tailscale build variant (unknown, $bin_path) -- Funnel support could not be confirmed"
-        ;;
-    esac
+      fi
+    else
+      echo "FAIL  relay reachable"
+      echo "      fix: pass --relay <url>, or connect first so doctor can read it from connect.json"
+      failed=$((failed + 1))
+    fi
   else
-    echo "FAIL  tailscale build variant"
-    echo "      fix: resolve the tailscale-installed check above first"
-    failed=$((failed + 1))
-  fi
+    # 2026-09-21 tailscale-macsys-funnel-cli-error-3: the macsys/App Store
+    # build advertises the same modern funnel flags in --help as the
+    # open-source build, but Funnel only ever works on open-source tailscaled
+    # -- this machine can easily have both installed (Homebrew AND the App
+    # Store GUI) at once, so the resolved binary PATH is printed alongside the
+    # variant, not just the classification, so a "why does it say macsys" ever
+    # comes down to one visible fact instead of a guess.
+    local variant="" variant_failed=false bin_path=""
+    if [ "$installed" = true ]; then
+      bin_path="$(ts_bin 2>/dev/null || echo '(unresolved)')"
+      variant="$(ts_variant 2>/dev/null || echo unknown)"
+      case "$variant" in
+        oss)
+          echo "ok    tailscale build variant ($variant, $bin_path)"
+          ;;
+        macsys|appstore)
+          echo "FAIL  tailscale build variant ($variant, $bin_path)"
+          echo "      fix: install the open-source build: brew install tailscale (then: tailscale up)"
+          failed=$((failed + 1))
+          variant_failed=true
+          ;;
+        *)
+          echo "warn  tailscale build variant (unknown, $bin_path) -- Funnel support could not be confirmed"
+          ;;
+      esac
+    else
+      echo "FAIL  tailscale build variant"
+      echo "      fix: resolve the tailscale-installed check above first"
+      failed=$((failed + 1))
+    fi
 
-  local daemon_rc=99
-  if [ "$installed" = true ]; then
-    ts_status_json >/dev/null 2>/dev/null
-    daemon_rc=$?
-  fi
-  if [ "$daemon_rc" -eq 0 ]; then
-    echo "ok    tailscale daemon running"
-  elif [ "$installed" = false ]; then
-    echo "FAIL  tailscale daemon running"
-    echo "      fix: resolve the tailscale-installed check above first"
-    failed=$((failed + 1))
-  else
-    echo "FAIL  tailscale daemon running"
-    echo "      fix: start tailscaled (Linux: sudo systemctl start tailscaled; macOS: open the Tailscale app)"
-    failed=$((failed + 1))
-  fi
+    local daemon_rc=99
+    if [ "$installed" = true ]; then
+      ts_status_json >/dev/null 2>/dev/null
+      daemon_rc=$?
+    fi
+    if [ "$daemon_rc" -eq 0 ]; then
+      echo "ok    tailscale daemon running"
+    elif [ "$installed" = false ]; then
+      echo "FAIL  tailscale daemon running"
+      echo "      fix: resolve the tailscale-installed check above first"
+      failed=$((failed + 1))
+    else
+      echo "FAIL  tailscale daemon running"
+      echo "      fix: start tailscaled (Linux: sudo systemctl start tailscaled; macOS: open the Tailscale app)"
+      failed=$((failed + 1))
+    fi
 
-  if [ "$daemon_rc" -eq 0 ] && ts_online; then
-    echo "ok    logged in / online"
-    online=true
-  else
-    echo "FAIL  logged in / online"
-    echo "      fix: run 'tailscale up' and complete login"
-    failed=$((failed + 1))
-  fi
+    if [ "$daemon_rc" -eq 0 ] && ts_online; then
+      echo "ok    logged in / online"
+      online=true
+    else
+      echo "FAIL  logged in / online"
+      echo "      fix: run 'tailscale up' and complete login"
+      failed=$((failed + 1))
+    fi
 
-  if [ "$online" = true ]; then
-    local dns dns_hint
-    dns="$(ts_dns_name 2>/dev/null || true)"
-    if [ -n "$dns" ]; then
-      echo "ok    DNSName resolvable ($dns)"
-      dns_hint="$(_dns_suffix_hint "$dns")"
-      [ -n "$dns_hint" ] && echo "info  $dns_hint"
+    if [ "$online" = true ]; then
+      local dns dns_hint
+      dns="$(ts_dns_name 2>/dev/null || true)"
+      if [ -n "$dns" ]; then
+        echo "ok    DNSName resolvable ($dns)"
+        dns_hint="$(_dns_suffix_hint "$dns")"
+        [ -n "$dns_hint" ] && echo "info  $dns_hint"
+      else
+        echo "FAIL  DNSName resolvable"
+        echo "      fix: wait a few seconds for tailscaled to register a name, then retry"
+        failed=$((failed + 1))
+      fi
     else
       echo "FAIL  DNSName resolvable"
-      echo "      fix: wait a few seconds for tailscaled to register a name, then retry"
+      echo "      fix: resolve the checks above first"
       failed=$((failed + 1))
     fi
-  else
-    echo "FAIL  DNSName resolvable"
-    echo "      fix: resolve the checks above first"
-    failed=$((failed + 1))
-  fi
 
-  if [ "$installed" = true ] && [ "$variant_failed" = true ]; then
-    # The variant check above already failed (macsys/App Store) -- Funnel
-    # never works there regardless of what --help advertises, so this must
-    # FAIL too, with the same brew-install fix, rather than trust
-    # ts_funnel_supported's content-sniffed "upgrade the client" hint (which
-    # is correct for a genuinely outdated CLI, but wrong for this case).
-    echo "FAIL  funnel capability (blocked by unsupported tailscale build)"
-    echo "      fix: install the open-source build: brew install tailscale (then: tailscale up)"
-    failed=$((failed + 1))
-  elif [ "$installed" = true ]; then
-    local mode
-    mode="$(ts_funnel_supported)"
-    case "$mode" in
-      modern|legacy)
-        echo "ok    funnel capability ($mode)"
+    if [ "$installed" = true ] && [ "$variant_failed" = true ]; then
+      # The variant check above already failed (macsys/App Store) -- Funnel
+      # never works there regardless of what --help advertises, so this must
+      # FAIL too, with the same brew-install fix, rather than trust
+      # ts_funnel_supported's content-sniffed "upgrade the client" hint (which
+      # is correct for a genuinely outdated CLI, but wrong for this case).
+      echo "FAIL  funnel capability (blocked by unsupported tailscale build)"
+      echo "      fix: install the open-source build: brew install tailscale (then: tailscale up)"
+      failed=$((failed + 1))
+    elif [ "$installed" = true ]; then
+      local mode
+      mode="$(ts_funnel_supported)"
+      case "$mode" in
+        modern|legacy)
+          echo "ok    funnel capability ($mode)"
+          ;;
+        *)
+          echo "FAIL  funnel capability (none)"
+          echo "      fix: upgrade the tailscale client -- this version doesn't expose funnel"
+          failed=$((failed + 1))
+          ;;
+      esac
+    else
+      echo "FAIL  funnel capability"
+      echo "      fix: resolve the tailscale-installed check above first"
+      failed=$((failed + 1))
+    fi
+
+    if [ "$installed" = true ]; then
+      if ts_funnel_status_json >/dev/null 2>/dev/null; then
+        echo "ok    HTTPS certs / funnel node attribute (best-effort -- the CLI answered a"
+        echo "      funnel/serve status query; this does NOT prove Funnel will start. Run"
+        echo "      'hmd app connect' to fully confirm.)"
+      else
+        echo "FAIL  HTTPS certs / funnel node attribute"
+        echo "      fix: run 'tailscale funnel status' to see the underlying error, or grant"
+        echo "      HTTPS certs + the Funnel node attribute in the tailnet admin console"
+        echo "      (https://login.tailscale.com/admin/dns)"
+        failed=$((failed + 1))
+      fi
+    else
+      echo "FAIL  HTTPS certs / funnel node attribute"
+      echo "      fix: resolve the tailscale-installed check above first"
+      failed=$((failed + 1))
+    fi
+
+    case "$HTTPS_PORT" in
+      443|8443|10000)
+        echo "ok    https-port allowed ($HTTPS_PORT)"
         ;;
       *)
-        echo "FAIL  funnel capability (none)"
-        echo "      fix: upgrade the tailscale client -- this version doesn't expose funnel"
+        echo "FAIL  https-port allowed ($HTTPS_PORT)"
+        echo "      fix: use one of 443, 8443, 10000 -- the only ports Tailscale Funnel allows"
         failed=$((failed + 1))
         ;;
     esac
-  else
-    echo "FAIL  funnel capability"
-    echo "      fix: resolve the tailscale-installed check above first"
-    failed=$((failed + 1))
   fi
-
-  if [ "$installed" = true ]; then
-    if ts_funnel_status_json >/dev/null 2>/dev/null; then
-      echo "ok    HTTPS certs / funnel node attribute (best-effort -- the CLI answered a"
-      echo "      funnel/serve status query; this does NOT prove Funnel will start. Run"
-      echo "      'hmd app connect' to fully confirm.)"
-    else
-      echo "FAIL  HTTPS certs / funnel node attribute"
-      echo "      fix: run 'tailscale funnel status' to see the underlying error, or grant"
-      echo "      HTTPS certs + the Funnel node attribute in the tailnet admin console"
-      echo "      (https://login.tailscale.com/admin/dns)"
-      failed=$((failed + 1))
-    fi
-  else
-    echo "FAIL  HTTPS certs / funnel node attribute"
-    echo "      fix: resolve the tailscale-installed check above first"
-    failed=$((failed + 1))
-  fi
-
-  case "$HTTPS_PORT" in
-    443|8443|10000)
-      echo "ok    https-port allowed ($HTTPS_PORT)"
-      ;;
-    *)
-      echo "FAIL  https-port allowed ($HTTPS_PORT)"
-      echo "      fix: use one of 443, 8443, 10000 -- the only ports Tailscale Funnel allows"
-      failed=$((failed + 1))
-      ;;
-  esac
 
   if [ -n "$PY3" ]; then
     echo "ok    python3 resolvable ($PY3)"

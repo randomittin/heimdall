@@ -72,14 +72,20 @@ cleanup() {
   for p in "${PIDS[@]:-}"; do
     [ -n "$p" ] && wait "$p" 2>/dev/null
   done
-  # Safety net: reap any --bg-started heimdall-ui a test case forgot to
-  # disconnect, found via its own state file (PIDS never tracks these --
-  # cmd_connect --bg disowns them from its own job table on purpose).
-  local sf leak_pid
+  # Safety net: reap any --bg-started heimdall-ui (and, in relay mode, the
+  # relay client too) a test case forgot to disconnect, found via its own
+  # state file (PIDS never tracks these -- cmd_connect --bg disowns them
+  # from its own job table on purpose).
+  local sf leak_pid leak_mode leak_client_pid
   for sf in "$TMPROOT"/repo.*/.heimdall/app/connect.json; do
     [ -f "$sf" ] || continue
     leak_pid="$(jq -r '.pid_ui // empty' "$sf" 2>/dev/null)"
     [ -n "$leak_pid" ] && kill -9 "$leak_pid" 2>/dev/null
+    leak_mode="$(jq -r '.mode // empty' "$sf" 2>/dev/null)"
+    if [ "$leak_mode" = "relay" ]; then
+      leak_client_pid="$(jq -r '.pid_client // empty' "$sf" 2>/dev/null)"
+      [ -n "$leak_client_pid" ] && kill -9 "$leak_client_pid" 2>/dev/null
+    fi
   done
   rm -rf "$TMPROOT"
 }
@@ -1271,6 +1277,338 @@ fi
 # ── A6: errfile security (no predictable /tmp fallback) ───────────────────
 [ "$(grep -c 'echo "/tmp/' "$APP")" -eq 0 ] && ok "no hardcoded /tmp fallback patterns in bin/heimdall-app" || bad "/tmp fallback pattern found in code"
 grep -B3 'errfile=' "$APP" | grep -q 'umask 077' && ok "errfile mktemp is protected by umask 077" || bad "umask 077 not found before errfile mktemp"
+
+# ── relay mode: --relay and --https-port are mutually exclusive ──────────
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-relay-excl.out"
+"$APP" connect --repo "$D" --relay "https://relay.example.com" --https-port 8443 >"$OUT_FILE" 2>&1
+RC=$?
+[ "$RC" -eq 2 ] && ok "connect --relay with --https-port exits 2" || bad "exit $RC (want 2): $(cat "$OUT_FILE")"
+grep -qi 'mutually exclusive' "$OUT_FILE" && ok "connect --relay+--https-port prints a mutually-exclusive message" || bad "$(cat "$OUT_FILE")"
+rm -rf "$D"
+
+# ── fake bin/heimdall-relay-client -- drives every relay-mode assertion below.
+# The real bin/heimdall-relay-client is python, built and tested separately
+# against its own contract (--relay/--repo/--ui-port/--public-host/
+# --status-file flags, NDJSON events on stdout, exit 2/11/12/0, SIGTERM ->
+# revoke -> exit 0, the relay.json status-file shape) -- this suite only
+# proves bin/heimdall-app composes that contract correctly (never re-tests
+# the client's own internals), so this fixture fakes exactly the contract,
+# nothing more. Mode selected by FAKE_RELAY_MODE; FAKE_RELAY_LOG (if set)
+# gets one line per invocation logging the flags it was called with;
+# FAKE_RELAY_TERM_MARKER (if set) is touched only when the fake's own TERM
+# handler actually ran (proves the signal was caught, not just that the
+# process later died some other way).
+FAKE_RELAY_BIN="$TMPROOT/heimdall-relay-client"
+cat > "$FAKE_RELAY_BIN" <<'FAKE_RELAY_EOF'
+#!/usr/bin/env bash
+set -u
+RELAY_URL="" REPO="" UI_PORT="" PUBLIC_HOST="" STATUS_FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --relay) RELAY_URL="${2:-}"; shift 2 ;;
+    --repo) REPO="${2:-}"; shift 2 ;;
+    --ui-port) UI_PORT="${2:-}"; shift 2 ;;
+    --public-host) PUBLIC_HOST="${2:-}"; shift 2 ;;
+    --status-file) STATUS_FILE="${2:-}"; shift 2 ;;
+    *) echo "fake-relay-client: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$STATUS_FILE" ] || STATUS_FILE="$REPO/.heimdall/app/relay.json"
+mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null || true
+
+if [ -n "${FAKE_RELAY_LOG:-}" ]; then
+  printf 'relay=%s repo=%s ui_port=%s public_host=%s\n' \
+    "$RELAY_URL" "$REPO" "$UI_PORT" "$PUBLIC_HOST" >>"$FAKE_RELAY_LOG"
+fi
+
+mode="${FAKE_RELAY_MODE:-pair-bind}"
+session_id="fake-session-0001"
+pairing_code="ABCDEFGHIJKLMNOPQRSTUVWXY0"
+now="$(date +%s)"
+exp="$((now + 60))"
+
+case "$mode" in
+  exit-e2e)
+    sleep 0.3
+    echo "fake-relay-client: relay E2E unavailable: pyca/cryptography not installed" >&2
+    exit 11
+    ;;
+  exit-unreachable)
+    sleep 0.3
+    echo "fake-relay-client: relay unreachable: connection refused" >&2
+    exit 12
+    ;;
+  ignore-term)
+    trap '' TERM
+    printf '{"event":"pair_init","qr":{"v":1,"relay":"%s","session_id":"%s","pairing_code":"%s","exp":%s,"hmd_pubkey":"ZmFrZS1wdWJrZXk="},"exp":%s}\n' \
+      "$RELAY_URL" "$session_id" "$pairing_code" "$exp" "$exp"
+    while :; do sleep 0.2; done
+    ;;
+  pair-bind|*)
+    printf '{"session_id":"%s","relay":"%s","paired":false,"bound_at":null,"last_seq":0,"frames_sent":0,"last_delivered":null,"last_command_at":null,"started_at":%s,"pid":%s}\n' \
+      "$session_id" "$RELAY_URL" "$now" "$$" >"$STATUS_FILE"
+    printf '{"event":"pair_init","qr":{"v":1,"relay":"%s","session_id":"%s","pairing_code":"%s","exp":%s,"hmd_pubkey":"ZmFrZS1wdWJrZXk="},"exp":%s}\n' \
+      "$RELAY_URL" "$session_id" "$pairing_code" "$exp" "$exp"
+    sleep 0.2
+    bound_at="$(date +%s)"
+    printf '{"session_id":"%s","relay":"%s","paired":true,"bound_at":%s,"last_seq":7,"frames_sent":3,"last_delivered":"2026-09-23T00:00:00Z","last_command_at":null,"started_at":%s,"pid":%s}\n' \
+      "$session_id" "$RELAY_URL" "$bound_at" "$now" "$$" >"$STATUS_FILE"
+    printf '{"event":"device_bound"}\n'
+    term_marker() {
+      [ -n "${FAKE_RELAY_TERM_MARKER:-}" ] && : >"${FAKE_RELAY_TERM_MARKER}"
+      printf '{"event":"session_ended"}\n'
+      exit 0
+    }
+    trap term_marker TERM
+    while :; do sleep 0.2; done
+    ;;
+esac
+FAKE_RELAY_EOF
+chmod +x "$FAKE_RELAY_BIN"
+
+# ── relay mode: full success path -- pair_init, device_bound, status, and a
+# cooperative disconnect (client catches TERM and revokes itself) ─────────
+D="$(make_repo)"
+RELAY_URL="https://relay.example.com"
+OUT_FILE="$TMPROOT/connect-relay-online.out"
+TERM_MARKER="$TMPROOT/relay-term-marker"
+RELAY_LOG="$TMPROOT/relay-invoke.log"
+rm -f "$TERM_MARKER" "$RELAY_LOG"
+# NOT --bg: --bg returns as soon as pair_init is seen (by design, so a caller
+# gets its shell back right after the QR renders) and disowns+rm's the
+# client's own stdout capture -- device_bound ("phone paired") only ever
+# shows up on a session that keeps polling in the foreground. So this one
+# session runs in the foreground and is backgrounded at the shell level
+# instead (same pattern as the exit-11/exit-12 groups below), which lets us
+# observe both pair_init and device_bound before we tear it down ourselves.
+( HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=pair-bind \
+    FAKE_RELAY_TERM_MARKER="$TERM_MARKER" FAKE_RELAY_LOG="$RELAY_LOG" \
+    "$APP" connect --repo "$D" --port 0 --relay "$RELAY_URL" >"$OUT_FILE" 2>&1 ) &
+FG_PID=$!
+PIDS+=("$FG_PID")
+
+SF="$D/.heimdall/app/connect.json"
+FG_WAITED=0
+while [ ! -f "$SF" ] && [ "$FG_WAITED" -lt 100 ]; do
+  sleep 0.1
+  FG_WAITED=$((FG_WAITED + 1))
+done
+[ -f "$SF" ] && ok "relay connect (foreground) writes connect.json" || bad "connect.json never appeared: $(cat "$OUT_FILE")"
+
+PB_WAITED=0
+while ! grep -q 'phone paired' "$OUT_FILE" 2>/dev/null && [ "$PB_WAITED" -lt 100 ]; do
+  sleep 0.1
+  PB_WAITED=$((PB_WAITED + 1))
+done
+
+grep -q '##' "$OUT_FILE" && ok "relay connect prints a QR code block (ascii glyphs)" || bad "no QR block: $(cat "$OUT_FILE")"
+grep -q 'PAIRING CODE: ABCDEFGHIJKLMNOPQRSTUVWXY0' "$OUT_FILE" && ok "relay connect prints the pairing code" || bad "pairing code missing: $(cat "$OUT_FILE")"
+grep -qi 'E2E-encrypted' "$OUT_FILE" && ok "relay connect prints the E2E exposure note" || bad "E2E note missing: $(cat "$OUT_FILE")"
+grep -q 'phone paired' "$OUT_FILE" && ok "relay connect prints 'phone paired' on device_bound" || bad "phone-paired message missing: $(cat "$OUT_FILE")"
+grep -q 'public_host=relay.example.com' "$RELAY_LOG" 2>/dev/null && ok "relay client spawned with --public-host <relay hostname>" || bad "public-host not propagated: $(cat "$RELAY_LOG" 2>/dev/null)"
+
+SF="$D/.heimdall/app/connect.json"
+if [ -f "$SF" ]; then
+  ok "connect.json written for relay mode"
+  [ "$(jq -r '.mode // empty' "$SF" 2>/dev/null)" = "relay" ] && ok "connect.json mode == relay" || bad "mode=$(jq -r '.mode // empty' "$SF" 2>/dev/null)"
+  [ "$(jq -r '.relay // empty' "$SF" 2>/dev/null)" = "$RELAY_URL" ] && ok "connect.json relay == $RELAY_URL" || bad "relay mismatch: $(jq -c . "$SF" 2>/dev/null)"
+  if grep -q '"token"' "$SF" 2>/dev/null; then bad "connect.json LEAKS a token key"; else ok "connect.json never contains a token key"; fi
+else
+  bad "connect.json missing at $SF"
+fi
+
+RSF="$D/.heimdall/app/relay.json"
+if [ -f "$RSF" ]; then
+  ok "relay.json status file written"
+  [ "$(jq -r '.session_id // empty' "$RSF" 2>/dev/null)" = "fake-session-0001" ] && ok "relay.json session_id readable" || bad "session_id mismatch: $(jq -c . "$RSF" 2>/dev/null)"
+  [ "$(jq -r '.paired // empty' "$RSF" 2>/dev/null)" = "true" ] && ok "relay.json paired == true after device_bound" || bad "paired=$(jq -r '.paired // empty' "$RSF" 2>/dev/null)"
+else
+  bad "relay.json missing at $RSF"
+fi
+
+STATUS_OUT="$("$APP" status --repo "$D" 2>&1)"
+SRC=$?
+[ "$SRC" -eq 0 ] && ok "status exits 0 for a healthy relay session" || bad "status exit $SRC: $STATUS_OUT"
+printf '%s' "$STATUS_OUT" | grep -q 'mode: relay' && ok "status prints mode: relay" || bad "status missing mode line: $STATUS_OUT"
+printf '%s' "$STATUS_OUT" | grep -q "relay: $RELAY_URL" && ok "status prints the relay URL" || bad "status missing relay URL: $STATUS_OUT"
+printf '%s' "$STATUS_OUT" | grep -q 'session id: fake-session-0001' && ok "status prints the session id" || bad "status missing session id: $STATUS_OUT"
+printf '%s' "$STATUS_OUT" | grep -q 'paired: yes' && ok "status prints paired: yes" || bad "status missing paired: $STATUS_OUT"
+printf '%s' "$STATUS_OUT" | grep -q 'frames sent: 3' && ok "status prints frames_sent from relay.json" || bad "status missing frames_sent: $STATUS_OUT"
+printf '%s' "$STATUS_OUT" | grep -q 'last seq: 7' && ok "status prints last_seq from relay.json" || bad "status missing last_seq: $STATUS_OUT"
+printf '%s' "$STATUS_OUT" | grep -q '2026-09-23T00:00:00Z' && ok "status prints last_delivered from relay.json" || bad "status missing last_delivered: $STATUS_OUT"
+printf '%s' "$STATUS_OUT" | grep -q 'client pid:.*running' && ok "status shows the relay client as running" || bad "status client-alive mismatch: $STATUS_OUT"
+printf '%s' "$STATUS_OUT" | grep -q 'ui pid:.*running' && ok "status shows heimdall-ui as running" || bad "status ui-alive mismatch: $STATUS_OUT"
+
+DISC_OUT="$TMPROOT/disconnect-relay-online.out"
+"$APP" disconnect --repo "$D" >"$DISC_OUT" 2>&1
+DRC=$?
+[ "$DRC" -eq 0 ] && ok "disconnect exits 0 for a cooperative relay client" || bad "disconnect exit $DRC: $(cat "$DISC_OUT")"
+
+DISC_WAITED=0
+while [ ! -f "$TERM_MARKER" ] && [ "$DISC_WAITED" -lt 30 ]; do
+  sleep 0.1
+  DISC_WAITED=$((DISC_WAITED + 1))
+done
+[ -f "$TERM_MARKER" ] && ok "relay client's TERM handler ran (marker file written)" || bad "TERM marker never appeared"
+[ -f "$SF" ] && bad "connect.json still present after disconnect" || ok "connect.json removed after disconnect"
+[ -f "$RSF" ] && bad "relay.json still present after disconnect" || ok "relay.json removed after disconnect"
+
+wait "$FG_PID"
+RC=$?
+[ "$RC" -eq 0 ] && ok "relay connect (foreground) exits 0 once the client session ends" || bad "exit $RC: $(cat "$OUT_FILE")"
+rm -rf "$D"
+
+# ── relay mode: client exits 11 (E2E unavailable) before pair_init ────────
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-relay-e2e.out"
+( HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=exit-e2e \
+    "$APP" connect --repo "$D" --port 0 --relay "https://relay.example.com" >"$OUT_FILE" 2>&1 ) &
+FG_PID=$!
+PIDS+=("$FG_PID")
+
+SF="$D/.heimdall/app/connect.json"
+FG_WAITED=0
+while [ ! -f "$SF" ] && [ "$FG_WAITED" -lt 100 ]; do
+  sleep 0.1
+  FG_WAITED=$((FG_WAITED + 1))
+done
+FG_UI_PID=""
+[ -f "$SF" ] && FG_UI_PID="$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)"
+if [ -n "$FG_UI_PID" ] && kill -0 "$FG_UI_PID" 2>/dev/null; then
+  ok "relay connect's ui is alive while the client is still starting (exit-11 case)"
+else
+  bad "could not observe a live ui pid before the client failed (exit-11 case)"
+fi
+
+wait "$FG_PID"
+RC=$?
+[ "$RC" -eq 11 ] && ok "connect exits 11 when the relay client can't start (E2E unavailable)" || bad "exit $RC (want 11): $(cat "$OUT_FILE")"
+grep -q 'relay E2E unavailable' "$OUT_FILE" && ok "connect surfaces the client's stderr on exit 11" || bad "stderr not surfaced: $(cat "$OUT_FILE")"
+if [ -n "$FG_UI_PID" ] && kill -0 "$FG_UI_PID" 2>/dev/null; then
+  bad "ui process still alive after connect exited 11"
+else
+  ok "ui process stopped after connect exited 11"
+fi
+[ -f "$SF" ] && bad "connect.json still present after exit 11" || ok "connect.json removed after exit 11"
+rm -rf "$D"
+
+# ── relay mode: client exits 12 (relay unreachable) before pair_init ──────
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-relay-unreachable.out"
+( HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=exit-unreachable \
+    "$APP" connect --repo "$D" --port 0 --relay "https://relay.example.com" >"$OUT_FILE" 2>&1 ) &
+FG_PID=$!
+PIDS+=("$FG_PID")
+
+SF="$D/.heimdall/app/connect.json"
+FG_WAITED=0
+while [ ! -f "$SF" ] && [ "$FG_WAITED" -lt 100 ]; do
+  sleep 0.1
+  FG_WAITED=$((FG_WAITED + 1))
+done
+FG_UI_PID=""
+[ -f "$SF" ] && FG_UI_PID="$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)"
+if [ -n "$FG_UI_PID" ] && kill -0 "$FG_UI_PID" 2>/dev/null; then
+  ok "relay connect's ui is alive while the client is still starting (exit-12 case)"
+else
+  bad "could not observe a live ui pid before the client failed (exit-12 case)"
+fi
+
+wait "$FG_PID"
+RC=$?
+[ "$RC" -eq 12 ] && ok "connect exits 12 when the relay is unreachable" || bad "exit $RC (want 12): $(cat "$OUT_FILE")"
+grep -q 'relay unreachable' "$OUT_FILE" && ok "connect surfaces the client's stderr on exit 12" || bad "stderr not surfaced: $(cat "$OUT_FILE")"
+if [ -n "$FG_UI_PID" ] && kill -0 "$FG_UI_PID" 2>/dev/null; then
+  bad "ui process still alive after connect exited 12"
+else
+  ok "ui process stopped after connect exited 12"
+fi
+[ -f "$SF" ] && bad "connect.json still present after exit 12" || ok "connect.json removed after exit 12"
+rm -rf "$D"
+
+# ── relay mode: disconnect when the client ignores TERM -> force-kill,
+# exit 8, and the revoke-may-not-have-landed warning ──────────────────────
+D="$(make_repo)"
+OUT_FILE="$TMPROOT/connect-relay-ignoreterm.out"
+HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=ignore-term \
+  "$APP" connect --repo "$D" --port 0 --relay "https://relay.example.com" --bg >"$OUT_FILE" 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && ok "relay connect --bg (ignore-term client) exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
+
+SF="$D/.heimdall/app/connect.json"
+IT_CLIENT_PID="$(jq -r '.pid_client // empty' "$SF" 2>/dev/null)"
+IT_UI_PID="$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)"
+if [ -n "$IT_CLIENT_PID" ] && kill -0 "$IT_CLIENT_PID" 2>/dev/null; then
+  ok "relay client (ignore-term) is alive before disconnect"
+else
+  bad "relay client pid $IT_CLIENT_PID not alive before disconnect"
+fi
+
+DISC_OUT="$TMPROOT/disconnect-relay-ignoreterm.out"
+HMD_RELAY_STOP_TIMEOUT_S=2 "$APP" disconnect --repo "$D" >"$DISC_OUT" 2>&1
+DRC=$?
+[ "$DRC" -eq 8 ] && ok "disconnect exits 8 when the relay client ignores TERM" || bad "disconnect exit $DRC (want 8): $(cat "$DISC_OUT")"
+grep -q 'revoke may not have reached the relay' "$DISC_OUT" && ok "disconnect prints the revoke-may-not-have-reached warning" || bad "warning missing: $(cat "$DISC_OUT")"
+
+if [ -n "$IT_CLIENT_PID" ] && kill -0 "$IT_CLIENT_PID" 2>/dev/null; then
+  bad "relay client still alive after force-kill disconnect"
+else
+  ok "relay client force-killed by disconnect (ignore-term path)"
+fi
+if [ -n "$IT_UI_PID" ] && kill -0 "$IT_UI_PID" 2>/dev/null; then
+  bad "ui process still alive after force-kill disconnect"
+else
+  ok "ui process stopped by force-kill disconnect"
+fi
+[ -f "$SF" ] && bad "connect.json still present after disconnect" || ok "connect.json removed after disconnect"
+[ -f "$D/.heimdall/app/relay.json" ] && bad "relay.json still present after disconnect" || ok "relay.json removed after disconnect"
+rm -rf "$D"
+
+# ── doctor --relay: reachable relay (loopback python http.server) -> ok ──
+D="$(make_repo)"
+DOCTOR_SRV_OUT="$TMPROOT/doctor-relay-srv.out"
+python3 - <<'PYEOF' >"$DOCTOR_SRV_OUT" 2>&1 &
+import http.server
+srv = http.server.HTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYEOF
+DOCTOR_SRV_PID=$!
+PIDS+=("$DOCTOR_SRV_PID")
+DOCTOR_SRV_WAITED=0
+DOCTOR_SRV_PORT=""
+while [ -z "$DOCTOR_SRV_PORT" ] && [ "$DOCTOR_SRV_WAITED" -lt 100 ]; do
+  DOCTOR_SRV_PORT="$(head -1 "$DOCTOR_SRV_OUT" 2>/dev/null)"
+  if [ -z "$DOCTOR_SRV_PORT" ]; then
+    sleep 0.1
+    DOCTOR_SRV_WAITED=$((DOCTOR_SRV_WAITED + 1))
+  fi
+done
+
+if [ -n "$DOCTOR_SRV_PORT" ]; then
+  DOUT="$TMPROOT/doctor-relay-ok.out"
+  "$APP" doctor --repo "$D" --relay "http://127.0.0.1:${DOCTOR_SRV_PORT}" >"$DOUT" 2>&1
+  DRC=$?
+  [ "$DRC" -eq 0 ] && ok "doctor --relay exits 0 against a reachable loopback server" || bad "doctor exit $DRC: $(cat "$DOUT")"
+  grep -Eq '^ok +relay reachable' "$DOUT" && ok "doctor prints 'ok relay reachable'" || bad "relay-reachable ok line missing: $(cat "$DOUT")"
+  grep -Eq '^skip +tailscale installed \(relay mode\)' "$DOUT" && ok "doctor skips tailscale checks in relay mode" || bad "tailscale skip line missing: $(cat "$DOUT")"
+else
+  bad "loopback python http.server never printed a port"
+fi
+kill "$DOCTOR_SRV_PID" 2>/dev/null
+wait "$DOCTOR_SRV_PID" 2>/dev/null
+rm -rf "$D"
+
+# ── doctor --relay: unreachable relay -> FAIL ─────────────────────────────
+D="$(make_repo)"
+DOUT="$TMPROOT/doctor-relay-fail.out"
+"$APP" doctor --repo "$D" --relay "https://127.0.0.1:1" >"$DOUT" 2>&1
+DRC=$?
+[ "$DRC" -eq 1 ] && ok "doctor --relay exits 1 (FAIL) against an unreachable relay" || bad "doctor exit $DRC (want 1): $(cat "$DOUT")"
+grep -Eq '^FAIL +relay reachable' "$DOUT" && ok "doctor prints 'FAIL relay reachable'" || bad "FAIL line missing: $(cat "$DOUT")"
+grep -qi 'relay unreachable' "$DOUT" && ok "doctor prints the relay-unreachable fix hint" || bad "fix hint missing: $(cat "$DOUT")"
+rm -rf "$D"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
