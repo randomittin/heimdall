@@ -531,7 +531,7 @@ _batch_meta_lookup() {
         | (try ($blob | fromjson) catch null) as $obj
         | (if ($obj|type)=="object" then ($obj.name // "") else "" end) as $name
         | (if ($obj|type)=="object" then ($obj.taskKind // "") else "" end) as $kind
-        | [$path, $name, $kind] | @tsv
+        | [$path, $name, $kind] | join($sep)
       end
   '
 }
@@ -546,11 +546,11 @@ _batch_meta_lookup() {
 _batch_awaiting_lookup() {
   [ "$#" -gt 0 ] || return 0
   local sep=$'\x01'
-  awk -v SEP="$sep" '
+  printf '%s\0' "$@" | xargs -0 awk -v SEP="$sep" '
     FNR==1 { if (prevf != "") print prevf SEP lastline; prevf=FILENAME }
     { lastline = $0 }
     END { if (prevf != "") print prevf SEP lastline }
-  ' "$@" | jq -R -c --arg sep "$sep" '
+  ' | jq -R -c --arg sep "$sep" '
     index($sep) as $i
     | if $i == null then empty else
         .[0:$i] as $path
@@ -559,7 +559,7 @@ _batch_awaiting_lookup() {
         | (if ($obj|type)=="object" then $obj.message else null end) as $m
         | (if ($m|type)=="object" then ($m.content // null) else null end) as $c
         | (($c|type) == "array" and ([ $c[] | select(.type? == "tool_use") ] | length) > 0) as $working
-        | [$path, ($working|tostring)] | @tsv
+        | [$path, ($working|tostring)] | join($sep)
       end
   '
 }
@@ -583,7 +583,7 @@ _join_batches() {
       kind = (mp in kd) ? kd[mp] : ""
       wk   = (tr in aw) ? aw[tr] : "false"
       reap = (index(REAPED, " " id " ") > 0) ? "1" : "0"
-      print id "\t" tr "\t" mt "\t" name "\t" kind "\t" wk "\t" mp "\t" reap
+      print id SEP tr SEP mt SEP name SEP kind SEP wk SEP mp SEP reap
     }
   ' "$metaf" "$awaitf" "$candf"
 }
@@ -806,7 +806,7 @@ enumerate() {
 
   [ -n "$joined" ] || return 0
 
-  while IFS=$'\t' read -r id tr mt name kind awaiting meta is_reaped; do
+  while IFS=$'\x01' read -r id tr mt name kind awaiting meta is_reaped; do
     [ -n "$id" ] || continue
     age=$(( NOW - mt ))
     [ "$age" -lt 0 ] && age=0
@@ -874,7 +874,8 @@ _enumerate_classify_slow() {
     meta=""; name=""; kind=""
     if [ -n "$tr" ] && [ -f "${tr%.jsonl}.meta.json" ]; then
       meta="${tr%.jsonl}.meta.json"
-      IFS=$'\t' read -r name kind <<< "$(jq -r '[(.name // ""), (.taskKind // "")] | @tsv' "$meta" 2>/dev/null)"
+      name="$(jq -r '.name // ""' "$meta" 2>/dev/null)"
+      kind="$(jq -r '.taskKind // ""' "$meta" 2>/dev/null)"
     fi
     awaiting=false
     if [ -n "$tr" ] && [ -f "$tr" ]; then
@@ -890,7 +891,7 @@ _enumerate_classify_slow() {
     fi
     is_reaped=0
     case "$reaped" in *" $id "*) is_reaped=1 ;; esac
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$tr" "$mt" "$name" "$kind" "$awaiting" "$meta" "$is_reaped"
+    printf '%s\n' "$id$SOH$tr$SOH$mt$SOH$name$SOH$kind$SOH$awaiting$SOH$meta$SOH$is_reaped"
   done
 }
 
