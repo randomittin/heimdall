@@ -15,10 +15,10 @@
 //   3. print the QR/pairing payload as one JSON line on stdout
 //   4. open GET /session/:id/stream (Bearer)
 //   5. wait for a `device_bound` frame
-//   6. derive the session key (needs the phone's pubkey -- see the
-//      "device_bound has no phone pubkey" branch below for a disclosed,
-//      confirmed gap in the deployed relay, and the --phone-pubkey escape
-//      hatch around it)
+//   6. derive the session key from the phone's pubkey, which the relay now
+//      forwards in device_bound's payload (relay/src/session.ts
+//      deliverToHmdStream); --phone-pubkey remains as a manual override for
+//      testing without a real phone client
 //   7. seal + POST a `state` envelope (the --state file) every 5s
 //   8. decrypt incoming `command` envelopes, print send-message text to
 //      stderr as `[phone] <text>`, POST an `ack` envelope back
@@ -52,9 +52,9 @@ const USAGE = `Usage: node relay/scripts/fake-hmd.mjs --relay <https://...> [--s
   --relay <url>          relay base URL, e.g. https://hmd-relay.therishabh16.workers.dev
   --state <path>         sample state JSON to send (default: ${DEFAULT_STATE_RELATIVE_PATH},
                           resolved from the repo root regardless of cwd)
-  --phone-pubkey <b64>   manual override for the phone's X25519 public key --
-                          see relay/README.md's "fake-hmd.mjs" section for why
-                          this is currently required against the live relay
+  --phone-pubkey <b64>   override the phone's X25519 public key instead of using
+                          the one the relay forwards in device_bound's payload
+                          (see relay/README.md's "fake-hmd.mjs" section)
   --help, -h             print this message
 `;
 
@@ -122,6 +122,20 @@ export function decodeSendMessageCommand(bytes) {
 /** Builds the plaintext (pre-`seal`) body of an `ack` frame (INV-24). */
 export function buildAckPayload(ofSeq, ok, detail) {
   return JSON.stringify(detail === undefined ? { of_seq: ofSeq, ok } : { of_seq: ofSeq, ok, detail });
+}
+
+/** Resolves the phone's X25519 pubkey for a device_bound frame: an explicit
+ *  --phone-pubkey override always wins (useful for testing without a real
+ *  phone client); otherwise falls back to the pubkey the relay forwards in
+ *  the frame's own payload (relay/src/session.ts's deliverToHmdStream).
+ *  Returns null if neither is present -- the caller treats that as fatal. */
+export function resolvePhonePubkey(envelope, phonePubkeyArg) {
+  const overridePub = phonePubkeyArg ? base64Decode(phonePubkeyArg) : null;
+  const payloadPub =
+    envelope.payload && typeof envelope.payload.device_pubkey === 'string'
+      ? base64Decode(envelope.payload.device_pubkey)
+      : null;
+  return overridePub ?? payloadPub;
 }
 
 async function readJsonOrNull(res) {
@@ -280,19 +294,13 @@ async function main() {
 
       if (envelope.type === 'device_bound') {
         if (sessionKey !== null) continue; // already bound; ignore a duplicate frame
-        const overridePub = args.phonePubkey ? base64Decode(args.phonePubkey) : null;
-        const payloadPub =
-          envelope.payload && typeof envelope.payload.device_pubkey === 'string'
-            ? base64Decode(envelope.payload.device_pubkey)
-            : null;
-        const phonePub = overridePub ?? payloadPub;
+        const phonePub = resolvePhonePubkey(envelope, args.phonePubkey);
         if (!phonePub) {
           console.error(
-            '[fake-hmd] device_bound has no phone pubkey: the deployed relay ' +
-              '(relay/src/session.ts acceptDeviceSocket) never forwards device_pubkey to ' +
-              "hmd's leg, and RelayTransport.ts sends ?claim= while the relay reads " +
-              '?pairing_code= -- see relay/README.md\'s "fake-hmd.mjs" section for detail. ' +
-              'Pass --phone-pubkey <base64> to continue.'
+            '[fake-hmd] device_bound has no phone pubkey: neither --phone-pubkey nor ' +
+              "the frame's payload.device_pubkey was present. Pass --phone-pubkey " +
+              '<base64> to continue, or check that the phone client is sending ' +
+              'device_pubkey on its claim (relay/src/session.ts handlePairingCodeClaim).'
           );
           await revoke();
           process.exit(1);

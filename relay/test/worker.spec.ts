@@ -1,6 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { Env, Envelope } from "../src/types";
+import { base64UrlEncode } from "../src/pairing";
 
 // `cloudflare:test`'s `env` is typed against the ambient (unaugmented)
 // `Cloudflare.Env`; this project's own `Env` (src/types.ts) is the real
@@ -9,6 +10,11 @@ import type { Env, Envelope } from "../src/types";
 const typedEnv = env as unknown as Env;
 
 const BASE = "https://relay.test";
+
+/** Not a secret — a deterministic 32-byte fixture (CLAUDE.md: "no
+ * secret-shaped literals"; this is filler bytes, not a credential, same
+ * pattern as RelayTransport.test.ts's generated test keypairs). */
+const TEST_DEVICE_PUBKEY = base64UrlEncode(new Uint8Array(32).fill(7));
 
 interface PairInitBody {
   session_id: string;
@@ -29,11 +35,13 @@ function wsUrl(sessionId: string, query: string): string {
 
 async function claimDevice(
   sessionId: string,
-  pairingCode: string
+  pairingCode: string,
+  devicePubkey: string = TEST_DEVICE_PUBKEY
 ): Promise<{ response: Response; socket: WebSocket }> {
-  const response = await SELF.fetch(wsUrl(sessionId, `pairing_code=${pairingCode}`), {
-    headers: { Upgrade: "websocket" },
-  });
+  const response = await SELF.fetch(
+    wsUrl(sessionId, `pairing_code=${pairingCode}&device_pubkey=${devicePubkey}`),
+    { headers: { Upgrade: "websocket" } }
+  );
   expect(response.status).toBe(101);
   const socket = response.webSocket;
   if (!socket) throw new Error("expected a websocket in the 101 response");
@@ -150,6 +158,102 @@ describe("claim lifecycle errors", () => {
     const eleventh = responses[10];
     expect(eleventh?.status).toBe(429);
     expect(eleventh?.headers.get("Retry-After")).toBe("60");
+  });
+});
+
+describe("device_pubkey reaches hmd's stream (relay/README.md 'Confirmed gaps' #2)", () => {
+  it("delivers device_bound with the phone's pubkey to the hmd stream immediately when the stream is already open", async () => {
+    const init = await pairInit();
+    const streamRes = await SELF.fetch(`${BASE}/session/${init.session_id}/stream`, {
+      headers: { Authorization: `Bearer ${init.relay_session_token}` },
+    });
+    expect(streamRes.status).toBe(200);
+    const reader = streamRes.body?.getReader();
+    if (!reader) throw new Error("expected a readable stream body");
+
+    await claimDevice(init.session_id, init.pairing_code);
+
+    const { value } = await reader.read();
+    if (!value) throw new Error("expected stream bytes");
+    const received = JSON.parse(new TextDecoder().decode(value).trim());
+    expect(received.type).toBe("device_bound");
+    expect(received.sender).toBe("relay");
+    expect(received.payload.device_pubkey).toBe(TEST_DEVICE_PUBKEY);
+    expect(typeof received.payload.bound_at).toBe("number");
+  });
+
+  it("buffers device_bound for the hmd stream when the claim happens before the stream opens, and delivers it on connect", async () => {
+    const init = await pairInit();
+    await claimDevice(init.session_id, init.pairing_code);
+
+    const streamRes = await SELF.fetch(`${BASE}/session/${init.session_id}/stream`, {
+      headers: { Authorization: `Bearer ${init.relay_session_token}` },
+    });
+    expect(streamRes.status).toBe(200);
+    const reader = streamRes.body?.getReader();
+    if (!reader) throw new Error("expected a readable stream body");
+
+    const { value } = await reader.read();
+    if (!value) throw new Error("expected stream bytes");
+    const received = JSON.parse(new TextDecoder().decode(value).trim());
+    expect(received.type).toBe("device_bound");
+    expect(received.payload.device_pubkey).toBe(TEST_DEVICE_PUBKEY);
+  });
+
+  it("does not re-emit device_bound to the hmd stream on a device_token reconnect", async () => {
+    const init = await pairInit();
+    const streamRes = await SELF.fetch(`${BASE}/session/${init.session_id}/stream`, {
+      headers: { Authorization: `Bearer ${init.relay_session_token}` },
+    });
+    const reader = streamRes.body?.getReader();
+    if (!reader) throw new Error("expected a readable stream body");
+
+    const { socket } = await claimDevice(init.session_id, init.pairing_code);
+    const bound = await nextMessage(socket);
+    const deviceToken = (bound.payload as { device_token: string }).device_token;
+
+    await reader.read(); // consume the one device_bound the claim just delivered
+
+    const reconnectRes = await SELF.fetch(wsUrl(init.session_id, `device_token=${deviceToken}`), {
+      headers: { Upgrade: "websocket" },
+    });
+    expect(reconnectRes.status).toBe(101);
+
+    let extra: unknown = "none";
+    await Promise.race([
+      reader.read().then((r) => {
+        extra = r.value ? new TextDecoder().decode(r.value) : "none";
+      }),
+      new Promise((resolve) => setTimeout(resolve, 50)),
+    ]);
+    expect(extra).toBe("none");
+  });
+
+  it("rejects a pairing_code claim missing device_pubkey with 400", async () => {
+    const init = await pairInit();
+    const res = await SELF.fetch(wsUrl(init.session_id, `pairing_code=${init.pairing_code}`), {
+      headers: { Upgrade: "websocket" },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a pairing_code claim with a wrong-length device_pubkey with 400", async () => {
+    const init = await pairInit();
+    const shortPubkey = base64UrlEncode(new Uint8Array(16).fill(1));
+    const res = await SELF.fetch(
+      wsUrl(init.session_id, `pairing_code=${init.pairing_code}&device_pubkey=${shortPubkey}`),
+      { headers: { Upgrade: "websocket" } }
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a pairing_code claim with a non-base64 device_pubkey with 400 (not a crash)", async () => {
+    const init = await pairInit();
+    const res = await SELF.fetch(
+      wsUrl(init.session_id, `pairing_code=${init.pairing_code}&device_pubkey=not-valid-base64!!`),
+      { headers: { Upgrade: "websocket" } }
+    );
+    expect(res.status).toBe(400);
   });
 });
 
@@ -282,6 +386,11 @@ describe("frames", () => {
     expect(streamRes.status).toBe(200);
     const reader = streamRes.body?.getReader();
     if (!reader) throw new Error("expected a readable stream body");
+    // The claim above happened before this stream existed, so the
+    // device_bound control frame it wrote for hmd (device_pubkey/bound_at)
+    // was buffered and is flushed as this stream's first line — consume it
+    // before looking for the phone's own forwarded command frame.
+    await reader.read();
 
     const commandEnvelope = makeEnvelope({
       session_id: init.session_id,

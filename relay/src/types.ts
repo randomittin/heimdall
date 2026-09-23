@@ -47,6 +47,24 @@ export interface PairInitResponse {
   exp: number;
 }
 
+/** Sent to the phone as device_bound's payload on a fresh pairing-code claim
+ *  (never on a device_token reconnect — see acceptDeviceSocket's
+ *  hmdControlPayload parameter, which the reconnect path never passes). */
+export interface DeviceBoundToPhonePayload {
+  device_token: string;
+  exp: number; // epoch seconds
+}
+
+/** Written into hmd's GET /stream as a plaintext device_bound control frame
+ *  once per session (buffered if the stream isn't open yet — see
+ *  SessionDO.deliverToHmdStream) so hmd can derive the session key without
+ *  the phone ever needing to send its own pubkey back through an encrypted
+ *  frame. */
+export interface DeviceBoundToHmdPayload {
+  device_pubkey: string; // whatever encoding the phone sent verbatim, forwarded unchanged
+  bound_at: number; // epoch seconds
+}
+
 export interface ErrorResponse {
   error: string;
   retry_after_s?: number;

@@ -17,6 +17,7 @@ import {
   resolveStatePath,
   decodeSendMessageCommand,
   buildAckPayload,
+  resolvePhonePubkey,
 } from '../fake-hmd.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url)); // .../relay/scripts/__tests__/
@@ -209,6 +210,26 @@ test('decodeSendMessageCommand is fail-closed on structural mismatches', () => {
 test('buildAckPayload omits detail on success and includes it on failure', () => {
   assert.equal(buildAckPayload(3, true), JSON.stringify({ of_seq: 3, ok: true }));
   assert.equal(buildAckPayload(3, false, 'malformed-command'), JSON.stringify({ of_seq: 3, ok: false, detail: 'malformed-command' }));
+});
+
+test('resolvePhonePubkey prefers --phone-pubkey over the payload when both are present', () => {
+  const override = new Uint8Array(32).fill(1);
+  const payload = new Uint8Array(32).fill(2);
+  const envelope = { payload: { device_pubkey: base64Encode(payload) } };
+  const resolved = resolvePhonePubkey(envelope, base64Encode(override));
+  assert.deepEqual(Array.from(resolved), Array.from(override));
+});
+
+test('resolvePhonePubkey falls back to payload.device_pubkey when no override is given', () => {
+  const payload = new Uint8Array(32).fill(3);
+  const envelope = { payload: { device_pubkey: base64Encode(payload) } };
+  const resolved = resolvePhonePubkey(envelope, undefined);
+  assert.deepEqual(Array.from(resolved), Array.from(payload));
+});
+
+test('resolvePhonePubkey returns null when neither override nor payload is present', () => {
+  assert.equal(resolvePhonePubkey({ payload: undefined }, undefined), null);
+  assert.equal(resolvePhonePubkey({ payload: { bound_at: 123 } }, undefined), null);
 });
 
 // --- end-to-end: seal a command as the phone would, open+ack as hmd does -

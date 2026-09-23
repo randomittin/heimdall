@@ -7,7 +7,7 @@
 // through byte-identical; only the two relay-originated control frame types
 // (`device_bound`, `session_ended`) carry a plaintext `payload`.
 
-import type { Env } from "./types";
+import type { Env, DeviceBoundToPhonePayload, DeviceBoundToHmdPayload } from "./types";
 import { isEnvelope } from "./types";
 import {
   jsonResponse,
@@ -22,6 +22,7 @@ import {
   mintDeviceToken,
   verifyDeviceToken,
   timingSafeEqual,
+  base64UrlDecode,
   PAIRING_CODE_TTL_S,
   CLAIM_THROTTLE_RETRY_AFTER_S,
   DEVICE_TOKEN_TTL_S,
@@ -40,9 +41,27 @@ interface SessionRecord {
 }
 
 const DEVICE_TAG = "device";
+const DEVICE_PUBKEY_BYTES = 32;
+
+/** Fail-closed: a malformed (non-base64) value must 400, never throw past
+ * this boundary and crash the isolate — base64UrlDecode's atob call throws
+ * on invalid input, and this is attacker-controlled query-string data. */
+function isValidDevicePubkey(value: string | null): value is string {
+  if (!value) return false;
+  try {
+    return base64UrlDecode(value).length === DEVICE_PUBKEY_BYTES;
+  } catch {
+    return false;
+  }
+}
 
 export class SessionDO {
   private hmdStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+  // The one control frame that may need buffering (spec: device_bound to
+  // hmd's stream can arrive before hmd's GET /stream is even open) — never
+  // more than one, since a session binds at most once (handleDeviceTokenClaim's
+  // reconnect path never calls deliverToHmdStream again).
+  private pendingHmdControlFrame: string | null = null;
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -127,6 +146,10 @@ export class SessionDO {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         owner.hmdStreamController = controller;
+        if (owner.pendingHmdControlFrame !== null) {
+          controller.enqueue(new TextEncoder().encode(owner.pendingHmdControlFrame));
+          owner.pendingHmdControlFrame = null;
+        }
       },
       cancel() {
         owner.hmdStreamController = null;
@@ -179,10 +202,14 @@ export class SessionDO {
     return jsonResponse(200, { ok: true, delivered: true });
   }
 
-  /** Phone leg: `GET /ws?pairing_code=...` (first claim) or
-   * `?device_token=...` (reconnect). Must be a real `wss://` WebSocket
-   * upgrade — checked via Upgrade header presence and an explicit
-   * plaintext-scheme signal (INV: "ws without wss -> 400"). */
+  /** Phone leg: `GET /ws?pairing_code=...&device_pubkey=<base64url 32 bytes>`
+   * (first claim) or `?device_token=...` (reconnect). Must be a real `wss://`
+   * WebSocket upgrade — checked via Upgrade header presence and an explicit
+   * plaintext-scheme signal (INV: "ws without wss -> 400"). `device_pubkey`
+   * is validated only on the pairing_code path (handlePairingCodeClaim) —
+   * a device_token reconnect already proves the phone bound previously, and
+   * hmd already learned its pubkey the first time (INV-7/8: this query
+   * string, including both credentials, is never logged). */
   private async handleWsUpgrade(request: Request): Promise<Response> {
     if (!isWebSocketUpgrade(request)) {
       return jsonResponse(400, { error: "expected websocket upgrade" });
@@ -206,7 +233,8 @@ export class SessionDO {
     if (deviceToken) {
       return this.handleDeviceTokenClaim(record, deviceToken);
     }
-    return this.handlePairingCodeClaim(record, pairingCode as string);
+    const devicePubkey = url.searchParams.get("device_pubkey");
+    return this.handlePairingCodeClaim(record, pairingCode as string, devicePubkey);
   }
 
   private async handleDeviceTokenClaim(
@@ -228,7 +256,8 @@ export class SessionDO {
 
   private async handlePairingCodeClaim(
     record: SessionRecord,
-    pairingCode: string
+    pairingCode: string,
+    devicePubkey: string | null
   ): Promise<Response> {
     if (record.status !== "pending") {
       return jsonResponse(410, { error: "session no longer claimable" });
@@ -258,7 +287,14 @@ export class SessionDO {
       return jsonResponse(401, { error: "invalid pairing code" });
     }
 
-    const exp = Math.floor(now / 1000) + DEVICE_TOKEN_TTL_S;
+    if (!isValidDevicePubkey(devicePubkey)) {
+      return jsonResponse(400, {
+        error: `device_pubkey is required and must decode to ${DEVICE_PUBKEY_BYTES} bytes`,
+      });
+    }
+
+    const nowS = Math.floor(now / 1000);
+    const exp = nowS + DEVICE_TOKEN_TTL_S;
     const deviceToken = await mintDeviceToken(this.env.RELAY_SIGNING_SECRET, {
       session_id: record.session_id,
       role: "device",
@@ -267,12 +303,17 @@ export class SessionDO {
     record.status = "bound";
     await this.saveRecord(record);
 
-    return this.acceptDeviceSocket(record.session_id, { device_token: deviceToken, exp });
+    return this.acceptDeviceSocket(
+      record.session_id,
+      { device_token: deviceToken, exp },
+      { device_pubkey: devicePubkey, bound_at: nowS }
+    );
   }
 
   private acceptDeviceSocket(
     sessionId: string,
-    bindPayload?: Record<string, unknown>
+    bindPayload?: DeviceBoundToPhonePayload,
+    hmdControlPayload?: DeviceBoundToHmdPayload
   ): Response {
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -292,7 +333,37 @@ export class SessionDO {
         })
       );
     }
+    if (hmdControlPayload) {
+      this.deliverToHmdStream(sessionId, hmdControlPayload);
+    }
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** Writes device_bound's hmd-facing payload (device_pubkey, bound_at) into
+   * hmd's GET /stream as a plaintext control frame — the one frame this
+   * relay ever buffers (see pendingHmdControlFrame's own comment): if hmd's
+   * stream isn't open yet, this parks the encoded line until handleStream's
+   * `start()` flushes it, rather than dropping it because no one is
+   * currently listening (unlike a `state`/`command`/`ack` frame's fire-once
+   * `/frames` semantics, this control frame's only delivery describes a
+   * one-time event that already happened and must eventually reach hmd). */
+  private deliverToHmdStream(sessionId: string, payload: DeviceBoundToHmdPayload): void {
+    const line =
+      JSON.stringify({
+        v: 1,
+        session_id: sessionId,
+        seq: 0,
+        sender: "relay",
+        type: "device_bound",
+        nonce: null,
+        ciphertext: null,
+        payload,
+      }) + "\n";
+    if (this.hmdStreamController) {
+      this.hmdStreamController.enqueue(new TextEncoder().encode(line));
+    } else {
+      this.pendingHmdControlFrame = line;
+    }
   }
 
   /** hmd-initiated kill switch (INV-29/30): ends the session, closes the

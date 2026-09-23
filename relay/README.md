@@ -100,11 +100,21 @@ retried.
 
 Must be a real WebSocket upgrade (`Upgrade: websocket`) over an effectively-`wss` connection —
 `400` if the `Upgrade` header is missing, or if `X-Forwarded-Proto: http` /
-`cf-visitor: {"scheme":"http"}` signal a plaintext hop in front of the Worker.
+`cf-visitor: {"scheme":"http"}` signal a plaintext hop in front of the Worker. A `pairing_code`
+claim also requires `&device_pubkey=<base64url, 32 bytes>` in the query string — not required
+(and not re-validated) on a `device_token` reconnect.
 
 - `101` — upgraded; the first frame sent on the socket is always `device_bound`
   (`{"type": "device_bound", "sender": "relay", "payload": {"device_token": "...", "exp":
-  1234567890}}`, plaintext, relay-originated).
+  1234567890}}`, plaintext, relay-originated). On a fresh `pairing_code` claim only, the relay
+  also writes a second `device_bound` frame — differently shaped — into hmd's `GET /stream`:
+  `{"type": "device_bound", "sender": "relay", "payload": {"device_pubkey": "<echoed back
+  exactly as sent>", "bound_at": 1234567890}}`, so hmd can derive the session key without the
+  phone ever sending its pubkey through an encrypted frame. Buffered (at most this one control
+  frame, per session) if hmd's stream isn't open yet, and flushed as the first line the moment
+  it connects.
+- `400` — `device_pubkey` is missing, or doesn't decode to exactly 32 bytes (`pairing_code`
+  claim only).
 - `401` — `pairing_code` doesn't match, or `device_token` is invalid/expired.
 - `410` — pairing code already claimed, or expired.
 - `429` + `Retry-After: 60` — more than 10 claim attempts against one session within 60s.
@@ -131,10 +141,12 @@ turns any further `pairing_code` claim into `410`.
 
 `nonce` / `ciphertext` are forwarded byte-identical in both directions — the relay does not
 decode, validate, or transform them. `payload` is a relay-side addition (never present on
-`state` / `command` / `ack`) that carries the one piece of legitimately-plaintext data
-(`device_bound`'s `device_token`); client tracks should only trust a relay-minted field (e.g.
-`device_token`) when it arrives via `device_bound`, never inside a `state`/`command`/`ack`
-frame's `payload`.
+`state` / `command` / `ack`) that carries plaintext relay-originated data — a `device_bound` sent
+to the *phone* carries `{device_token, exp}`; a `device_bound` written into *hmd's* `GET /stream`
+carries `{device_pubkey, bound_at}` instead (see the `ws` endpoint above) — the two are the same
+frame `type` on two different legs, never both fields at once. Client tracks should only trust a
+relay-minted field this way when it arrives via `device_bound`, never inside a
+`state`/`command`/`ack` frame's `payload`.
 
 ## Deviations / scope decisions from the delta brief (disclosed)
 
@@ -194,21 +206,26 @@ node relay/scripts/fake-hmd.mjs --relay https://hmd-relay.therishabh16.workers.d
 
 It calls `POST /pair/init`, generates an X25519 keypair, prints the pairing payload (the
 `RelayPayload` shape `src/store/relayPayload.ts` parses) as one JSON line on stdout, opens
-`GET /session/:id/stream`, waits for `device_bound`, derives the session key, then seals and
-POSTs a `state` envelope (the `--state` file, default `docs/samples/state.json`) every 5s with
-an increasing seq, decrypts incoming `command` envelopes (printing a `send-message`'s text to
-stderr as `[phone] <text>`), and answers each with an `ack` envelope. Ctrl-C POSTs `/revoke`
-before exiting. It never logs `relay_session_token` or `device_token`.
+`GET /session/:id/stream`, waits for `device_bound`, derives the session key from the phone's
+pubkey the relay forwards in that frame's `payload.device_pubkey` (`--phone-pubkey <base64>`
+overrides this), then seals and POSTs a `state` envelope (the `--state` file, default
+`docs/samples/state.json`) every 5s with an increasing seq, decrypts incoming `command`
+envelopes (printing a `send-message`'s text to stderr as `[phone] <text>`), and answers each
+with an `ack` envelope. Ctrl-C POSTs `/revoke` before exiting. It never logs
+`relay_session_token` or `device_token`.
 
 `node --test scripts/__tests__/fake-hmd.test.mjs` (wired into `npm test`, run via the glob
 `scripts/__tests__/*.test.mjs` — a bare directory argument doesn't auto-discover test files
 under this Node version) covers `lib/relay-crypto.mjs` against the same golden vector
-`src/relay/__tests__/vectors.test.ts` uses (`src/relay/__tests__/fixtures/vectors.json`), plus a
-full phone-seals / hmd-opens-and-acks / phone-opens-ack round trip.
+`src/relay/__tests__/vectors.test.ts` uses (`src/relay/__tests__/fixtures/vectors.json`),
+`resolvePhonePubkey`'s override-vs-payload-fallback priority, plus a full phone-seals /
+hmd-opens-and-acks / phone-opens-ack round trip.
 
 Verified against the live relay above: `/pair/init`, keypair generation, the printed payload
-line, and `GET /stream` all open successfully. It then blocks on `device_bound`, for the reason
-in "Confirmed gaps," below.
+line, and `GET /stream` all open successfully, and `device_bound` now carries a usable
+`device_pubkey` end-to-end — `resolvePhonePubkey` derives the session key from it without
+needing `--phone-pubkey` at all (the flag remains as a manual override for testing without a
+real phone client).
 
 ### Decisions (disclosed)
 
@@ -250,37 +267,3 @@ in "Confirmed gaps," below.
 - **No `device_token`-based reconnect, no backoff/retry on stream drop, and only Ctrl-C/SIGINT
   is handled** (not `SIGTERM`) — the brief's 10-step flow asks for none of these; adding them
   would be new, unrequested scope for an interop-testing tool.
-
-### Confirmed gaps (outside this tool's scope — reported, not fixed)
-
-Exercising steps 1-5 against the live relay surfaced two real mismatches between
-`relay/src/**` and `src/transport/RelayTransport.ts`, neither of which this task's scope
-(`relay/scripts/**`) covers:
-
-1. **Query param name mismatch on the phone's claim WS.** `RelayTransport.ts`'s
-   `buildConnectUrl()` (`src/transport/RelayTransport.ts:338`) sends
-   `?claim=<pairing_code>&device_pubkey=<b64>&device_name=<name>`; `session.ts`'s
-   `handleWsUpgrade` (`relay/src/session.ts:198-199`) reads only `pairing_code`/`device_token`
-   and never `claim` at all. `RelayTransport.ts`'s own comment directly above that call
-   (`:321-328`) already flags `claim` as "a documented assumption pending a live
-   relay-service-core to verify against" — this confirms the assumption doesn't hold against
-   the deployed relay.
-2. **hmd never learns the phone's pubkey, even independent of (1).** `handleWsUpgrade` never
-   reads a `device_pubkey` param under any name (`relay/src/session.ts:186-210`);
-   `PairInitResponse` (`relay/src/types.ts:43-48`) and `handleInit`'s actual response body
-   (`relay/src/session.ts:109-114`) carry no pubkey field either; and `acceptDeviceSocket`
-   (`relay/src/session.ts:273-296`) sends the plaintext `device_bound` control frame only to the
-   phone's own just-accepted WebSocket — it never touches `hmdStreamController`, which only
-   `webSocketMessage` (`relay/src/session.ts:350-364`) ever writes to, and only by forwarding a
-   phone-*sent* envelope verbatim. `RelayTransport.ts`'s `handleDeviceBound`
-   (`src/transport/RelayTransport.ts:402-416`) doesn't send its pubkey as such an envelope
-   either — it derives its session key from its own secret key plus `hmd_pubkey` (already known
-   from the QR payload) and stops there. No code path, on either side of this relay as it
-   stands today, ever moves a phone's pubkey to hmd.
-
-Together: a real phone client and this real deployed relay cannot complete pairing with each
-other today, with or without `fake-hmd.mjs`. `fake-hmd.mjs` still needs some way to reach step 6
-to exercise steps 7-9, so it accepts `--phone-pubkey <base64>` as a disclosed manual bridge —
-pass the base64 of a real or test X25519 public key and the tool proceeds exactly as if
-`device_bound` had carried it. Without that flag, and without either gap above being fixed, it
-prints a diagnostic naming both issues and exits `1` rather than hanging or fabricating a key.
