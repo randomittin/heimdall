@@ -600,8 +600,16 @@ enumerate() {
     meta=""; name=""; kind=""
     if [ -n "$tr" ] && [ -f "${tr%.jsonl}.meta.json" ]; then
       meta="${tr%.jsonl}.meta.json"
-      name="$(jq -r '.name // ""' "$meta" 2>/dev/null)"
-      kind="$(jq -r '.taskKind // ""' "$meta" 2>/dev/null)"
+      # ONE jq call, not two — under load a fork costs far more than asking jq
+      # for one extra field. @tsv (not raw multi-line -r output) because a
+      # trailing empty field's newline is stripped by "$(...)" the same as any
+      # other trailing newline, which would silently shift kind into name for
+      # every regular (non-teammate) subagent — @tsv keeps both fields on the
+      # one line jq actually prints, so nothing is lost to that stripping.
+      # MEASURED 2026-09-24: this loop cost ~66ms/candidate under load, forks
+      # dominating; halving the jq calls here is a direct cut shared by every
+      # caller of enumerate() — list/count/orphans/reap/sweep alike.
+      IFS=$'\t' read -r name kind <<< "$(jq -r '[(.name // ""), (.taskKind // "")] | @tsv' "$meta" 2>/dev/null)"
     fi
     [ -n "$name" ] || name="-"
     sess="$(_session_of_transcript "$tr")"
@@ -712,6 +720,14 @@ cmd_list() {
 cmd_count() {
   # LIVE only — the statusline's authoritative count. `working` counts as live
   # (it is genuinely running); stale/hung/terminal/orphaned/mailbox/reaped do not.
+  # Deliberately still shares enumerate() with list/orphans/reap/sweep rather
+  # than a leaner count-only walk: MEASURED 2026-09-24, the only per-candidate
+  # cost enumerate() paid that classification never needed was a second jq
+  # fork to fetch `name` — folded into ONE call together with `kind` (which IS
+  # load-bearing for count: a fresh in_process_teammate must classify
+  # `mailbox`, not `live`), so every caller of enumerate() benefits, not just
+  # this one. There is no whole-transcript read left to trim: _awaiting_tool_
+  # result already reads only the last line (`tail -n 1`), never the whole file.
   local n
   n="$(enumerate | awk -F'\t' '$3=="live" || $3=="working"' | wc -l | tr -d ' ')"
   printf '%s\n' "${n:-0}"

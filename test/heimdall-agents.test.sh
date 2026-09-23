@@ -399,6 +399,121 @@ printf '{"type":"queue-operation","content":"<task-notification>\n<task-id>trunc
 CPOUT="$(HMD_AGENT_PROJECTS_DIR="$CORRUPTP" HMD_AGENT_REAPED_FILE="$WORK/reaped-cp.json" "$AGENTS" list --json 2>/dev/null)"
 [ "$(printf '%s' "$CPOUT" | jq -r 'type')" = "array" ] && ok "truncated parent transcript → valid JSON, no crash" || bad "truncated parent transcript broke list"
 
+# ═════════════════════════════════════════════════════════════════════════════
+# (13) live_slugs ON-DISK CACHE — a fresh cache is read without re-probing; a
+# cache past its TTL re-probes; HMD_AGENT_LIVE_SLUGS_TTL is actually honoured;
+# HMD_AGENT_LIVE_SLUGS still bypasses BOTH the probe and the cache entirely.
+# Regression guard for: 3 concurrent statuslines each re-invoking `count` every
+# few seconds, each paying a fresh pgrep+lsof cost on EVERY call (measured
+# 8.1s wall at load 40-50, 2026-09-24). This proves the caching MECHANISM —
+# wall-clock improvement is reported separately; asserting timing thresholds
+# on a shared, variably-loaded box is exactly the flake this suite avoids.
+#
+# A fake `pgrep` goes on PATH so no real process table is ever touched, and so
+# every real invocation of live_slugs()'s probe leaves a countable trace. It
+# emits NO pids (a fully valid "nobody's alive" probe result), which keeps the
+# fixture from also needing a fake `lsof`.
+# ═════════════════════════════════════════════════════════════════════════════
+LS_DIR="$WORK/liveslugs"
+LS_CWD="$LS_DIR/cwd"; LS_PROJ="$LS_DIR/projects"; LS_FAKEBIN="$LS_DIR/fakebin"
+LS_SLUG="-Users-fake-liveslugs-project"
+LS_SESS="11111111-1111-1111-1111-111111111111"
+LS_TASKDIR="$LS_DIR/claude-501/$LS_SLUG/$LS_SESS/tasks"
+LS_SUBDIR="$LS_PROJ/$LS_SLUG/$LS_SESS/subagents"
+LS_CACHE="$LS_CWD/.heimdall/.live-slugs-cache"
+LS_PGREP_LOG="$LS_DIR/pgrep.log"
+mkdir -p "$LS_CWD" "$LS_TASKDIR" "$LS_SUBDIR" "$LS_FAKEBIN"
+: > "$LS_PGREP_LOG"
+{
+  echo '#!/usr/bin/env bash'
+  printf 'echo "call $$ $*" >> %q\n' "$LS_PGREP_LOG"
+  echo 'exit 0'
+} > "$LS_FAKEBIN/pgrep"
+chmod +x "$LS_FAKEBIN/pgrep"
+ls_pgrep_calls() { wc -l < "$LS_PGREP_LOG" 2>/dev/null | tr -d ' '; }
+
+# Reuse the existing stale fixture agent's shape (id, transcript, meta) rather
+# than inventing a new one — same pattern as the (11b) liveness-evidence block
+# above. Deliberately NO parent-session transcript at
+# "$LS_PROJ/$LS_SLUG/$LS_SESS.jsonl": session_is_alive's mtime fast-path
+# requires that file to EXIST, so leaving it absent is what forces the
+# fall-through into live_slugs() on every call below — the only way a plain
+# `count` invocation ever reaches the code this section exists to test.
+cp "$SUBDIR/agent-$A_STALE.jsonl" "$LS_SUBDIR/" 2>/dev/null
+cp "$SUBDIR/agent-$A_STALE.meta.json" "$LS_SUBDIR/" 2>/dev/null
+set_mtime "$LS_SUBDIR/agent-$A_STALE.jsonl" $(( NOW - 5000 ))
+ln -sf "$LS_SUBDIR/agent-$A_STALE.jsonl" "$LS_TASKDIR/$A_STALE.output"
+
+# $1 (optional): HMD_AGENT_LIVE_SLUGS_TTL value; defaults to the tool's own
+# default (15) so callers not exercising the TTL itself get ordinary behaviour.
+# Override is explicitly UNSET (env -u) so the real cache/probe path runs.
+ls_count() {
+  env -u HMD_AGENT_LIVE_SLUGS \
+    HMD_AGENT_TASKDIR="$LS_TASKDIR" HMD_AGENT_PROJECTS_DIR="$LS_PROJ" \
+    HMD_AGENT_REAPED_FILE="$LS_DIR/reaped.json" HMD_AGENT_CWD="$LS_CWD" \
+    HMD_AGENT_LIVE_SLUGS_TTL="${1:-15}" \
+    PATH="$LS_FAKEBIN:$PATH" "$AGENTS" count
+}
+
+# (13a) no cache file on disk yet ⇒ the real probe runs (fake pgrep invoked)
+# and the result is written through to the cache.
+rm -f "$LS_CACHE"
+N0="$(ls_pgrep_calls)"
+C1="$(ls_count)"
+N1="$(ls_pgrep_calls)"
+[ "$N1" -gt "$N0" ] && ok "missing cache -> live_slugs probes (pgrep invoked)" \
+  || bad "missing cache should have probed pgrep ($N0 -> $N1 calls)"
+[ -f "$LS_CACHE" ] && ok "probe result written through to the on-disk cache" \
+  || bad "cache file not created after a real probe"
+case "$C1" in ''|*[!0-9]*) bad "count not numeric after cold probe: '$C1'" ;; esac
+
+# (13b) cache just written -> pin its mtime to the fictional test clock (the
+# code stamps a REAL wall-clock mtime; HMD_NOW is a fictional pinned epoch, so
+# without this the file would misread as ancient no matter how recently it was
+# actually written) -> a fresh cache must be served WITHOUT touching pgrep.
+set_mtime "$LS_CACHE" "$NOW"
+N0="$(ls_pgrep_calls)"
+C2="$(ls_count)"
+N1="$(ls_pgrep_calls)"
+[ "$N1" = "$N0" ] && ok "fresh cache served without re-probing pgrep" \
+  || bad "fresh cache still re-probed pgrep ($N0 -> $N1 calls)"
+[ "$C1" = "$C2" ] && ok "cached count matches the freshly-probed count" \
+  || bad "count changed between fresh-cache reads ($C1 vs $C2)"
+
+# (13c) HMD_AGENT_LIVE_SLUGS_TTL is actually honoured, not just the hardcoded
+# default: age the cache PAST a short override TTL while still well inside the
+# 15s default — that alone must be enough to force a re-probe.
+set_mtime "$LS_CACHE" $(( NOW - 10 ))
+N0="$(ls_pgrep_calls)"
+ls_count 5 >/dev/null
+N1="$(ls_pgrep_calls)"
+[ "$N1" -gt "$N0" ] \
+  && ok "HMD_AGENT_LIVE_SLUGS_TTL shortens freshness (age 10s, ttl 5s -> re-probe)" \
+  || bad "TTL override not honoured ($N0 -> $N1 calls)"
+
+# (13d) cache aged past even the default TTL -> re-probes.
+set_mtime "$LS_CACHE" $(( NOW - 9999 ))
+N0="$(ls_pgrep_calls)"
+C3="$(ls_count)"
+N1="$(ls_pgrep_calls)"
+[ "$N1" -gt "$N0" ] && ok "stale cache (past default TTL) triggers a fresh probe" \
+  || bad "stale cache did not re-probe ($N0 -> $N1 calls)"
+case "$C3" in ''|*[!0-9]*) bad "count not numeric after stale re-probe: '$C3'" ;; esac
+
+# (13e) HMD_AGENT_LIVE_SLUGS override still bypasses the cache ENTIRELY — never
+# probes, never reads, never writes it — even with no cache file present.
+rm -f "$LS_CACHE"
+N0="$(ls_pgrep_calls)"
+OV="$(HMD_AGENT_TASKDIR="$LS_TASKDIR" HMD_AGENT_PROJECTS_DIR="$LS_PROJ" \
+      HMD_AGENT_REAPED_FILE="$LS_DIR/reaped-ov.json" HMD_AGENT_CWD="$LS_CWD" \
+      HMD_AGENT_LIVE_SLUGS="" PATH="$LS_FAKEBIN:$PATH" "$AGENTS" count)"
+N1="$(ls_pgrep_calls)"
+[ "$N1" = "$N0" ] && ok "HMD_AGENT_LIVE_SLUGS override bypasses the disk cache entirely (no probe)" \
+  || bad "override still triggered a probe ($N0 -> $N1 calls)"
+[ ! -f "$LS_CACHE" ] && ok "override never writes the cache file" \
+  || bad "override unexpectedly created a cache file"
+case "$OV" in ''|*[!0-9]*) bad "count not numeric under override: '$OV'" ;; esac
+
 echo
 echo "  ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ] || exit 1
