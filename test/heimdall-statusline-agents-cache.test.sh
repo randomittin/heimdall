@@ -22,9 +22,13 @@
 # purely so the staleness/expiry assertions don't need multi-second sleeps at
 # the production default (4s/8s); the production constants are exercised by
 # their own doc comment cross-referencing the roster cache's identical 4s/8s,
-# not by this suite's timing. Cases 6-7 additionally override
-# HMD_AGENTS_COUNT_CEIL/HMD_AGENTS_FAIL_BACKOFF small for the same reason,
-# and replace the real heimdall-agents with a fake one (path_forcing_perl
+# not by this suite's timing. Case 6 additionally overrides
+# HMD_AGENTS_COUNT_CEIL small for the same reason. Case 7 overrides
+# HMD_AGENTS_FAIL_BACKOFF too, but to a fixed value LARGE relative to
+# per-invocation overhead (100s) rather than small, driven with marker-mtime
+# control (old_touch) instead of a live sleep -- the same technique cases
+# 9-10 use for HMD_CACHE_SWEEP_EVERY; see case 7's own comment for why. Both
+# cases replace the real heimdall-agents with a fake one (path_forcing_perl
 # plus a PATH-shadowed fake binary) so the process-tree-kill and backoff
 # mechanics are deterministic instead of depending on this host's actual
 # subagent count or its actual timeout/gtimeout availability.
@@ -314,7 +318,7 @@ render7() {
       HEIMDALL_CP_URL="http://127.0.0.1:1" TERM=xterm-256color \
       HEIMDALL_STATUSLINE_MODE=truecolor HMD_AGENT_CWD="$WS" \
       HMD_AGENTS_COUNT_TTL=1 HMD_AGENTS_LOCK_TTL=2 HMD_AGENTS_COUNT_CEIL=1 \
-      HMD_AGENTS_FAIL_BACKOFF=2 \
+      HMD_AGENTS_FAIL_BACKOFF=100 \
       CALL_COUNT_FILE="$CALL_COUNT_FILE" CALL_LOG_FILE="$CALL_LOG_FILE" \
       PATH="$FORCED_PATH" \
       "$BASH_BIN" "$CLI" >/dev/null 2>&1
@@ -325,7 +329,15 @@ if poll_for_file "$WS/$FAIL_REL" 15; then
 else
   bad "fail marker never appeared after a failing refresh"
 fi
-sleep 0.8   # well inside the 2s backoff
+# 100s (not the small 2s this used to be), plus marker-mtime control below
+# instead of a live sleep racing a small window: render7 itself forks bash
+# plus a background refresh subprocess tree, and under this host's actual
+# concurrent multi-agent load that fork/exec chain alone was observed
+# pushing the SECOND render7's own "still within backoff?" check past a 2s
+# cap (log showed 2 calls instead of 1) -- not a product bug, a test margin
+# too tight for host load. 100s makes ordinary per-invocation overhead (at
+# most a couple of seconds even under heavy load) irrelevant here.
+sleep 0.8   # comfortably inside the 100s backoff regardless of host load
 render7
 sleep 0.5
 CALLS_DURING_BACKOFF="$(wc -l <"$CALL_LOG_FILE" 2>/dev/null | tr -d ' ')"
@@ -334,7 +346,7 @@ if [ "$CALLS_DURING_BACKOFF" = "1" ]; then
 else
   bad "expected exactly 1 call while inside the backoff window, log shows $CALLS_DURING_BACKOFF"
 fi
-sleep 2   # cumulative time since the first failure is now comfortably past the 2s backoff
+old_touch "$WS/$FAIL_REL"   # deterministically 10min old -> unambiguously past the 100s backoff
 render7
 if poll_for_file "$WS/$CACHE_REL" 15; then
   NEWVAL="$(cat "$WS/$CACHE_REL" 2>/dev/null || echo '')"

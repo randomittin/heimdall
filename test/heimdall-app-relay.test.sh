@@ -123,6 +123,32 @@ wait_for_count() {
   return 1
 }
 
+# Polls FILE's line count until it stops changing for STABLE_S consecutive
+# seconds (0.1s steps), up to MAX_S total. For draining an in-flight
+# background write (e.g. the relay-client's own periodic state-tick) before
+# a caller snapshots a "before" count -- so a later before/after comparison
+# measures the effect being tested, not a race against something already en
+# route. Returns 0 once quiescent; 1 if the count was still moving at MAX_S
+# (the caller decides whether that itself is worth flagging).
+wait_for_quiescent_count() {
+  local file="$1" stable_s="${2:-3}" max_s="${3:-20}"
+  local stable_ticks=$(( stable_s * 10 )) max_ticks=$(( max_s * 10 ))
+  local last="" same=0 i=0 c
+  while [ "$i" -lt "$max_ticks" ]; do
+    c="$(wc -l < "$file" 2>/dev/null | tr -d ' ')"
+    [ -z "$c" ] && c=0
+    if [ "$c" = "$last" ]; then
+      same=$((same + 1))
+      [ "$same" -ge "$stable_ticks" ] && return 0
+    else
+      last="$c"
+      same=0
+    fi
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+
 count_matching() {
   grep -E "$2" "$1" 2>/dev/null | wc -l | tr -d ' '
 }
@@ -530,6 +556,22 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
 
   # claim 3b (INV-15): replay of seq=1 (already seen) is rejected -- no
   # second inbox record, no new ack.
+  #
+  # INV-15 is about the REPLAY's own effect, not the client's independent
+  # state-tick loop -- but that loop (bin/heimdall-relay-client's tick_s and
+  # sentinels/hmd-ui.py's POLL_INTERVAL_S are both 2s) notices, on its own
+  # schedule, that the FIRST (legitimate) send-message above just changed
+  # on-disk state (collect_inbox()'s pending count, sentinels/hmd-ui.py:638,
+  # 0 -> 1) and republishes a "state" frame once that lands -- anywhere up to
+  # ~4s after the write. Sampling FRAMES_BEFORE_REPLAY immediately, before
+  # that fallout has necessarily landed, raced it against the replay's own
+  # ~1-7s check-plus-sleep window below: under load the legitimate frame
+  # could land inside that window and get blamed on the replay (observed:
+  # "4 -> 5" with the replay itself still correctly rejected per case 23/24).
+  # Draining the frame stream to quiescence here -- rather than a fixed
+  # sleep -- makes the before/after comparison isolate the replay's effect
+  # regardless of how long that unrelated fallout takes to arrive.
+  wait_for_quiescent_count "$LOG_A/frames.ndjson" 3 20
   FRAMES_BEFORE_REPLAY="$(wc -l < "$LOG_A/frames.ndjson" | tr -d ' ')"
   INBOX_COUNT_BEFORE="$(grep '"hello from claim4"' "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
   python3 "$FAKE_RELAY" device envelope --session-id "$SID_A" --seq 1 --sender device \
