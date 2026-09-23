@@ -89,6 +89,7 @@
 #   HMD_GC_CC_LSOF          path to an `lsof -t <file>`-style stub (test seam)
 #   HMD_GC_LIVE_PIDS        space-separated "alive" pids (test seam; replaces kill -0)
 #   HMD_GC_PROC_CMD         path to a `cmd <pid>`-echoing stub (test seam; replaces ps)
+#   HMD_GC_PRESENCE_BIN     path to heimdall-presence (test seam; default $SELF_DIR/heimdall-presence)
 #   HMD_GC_BREAK            name of a step to force-fail (test seam for non-fatal proof)
 #
 # Exit: always 0 for `run` (best-effort). 2 on a usage error.
@@ -263,6 +264,28 @@ gc_procs() {
       PROC_REAPED=$((PROC_REAPED + 1))
     fi
   done
+  return 0
+}
+
+# ── 2b. KEEPER ORPHANS (owner-liveness sweep — delegates to `heimdall-presence
+# keeper-gc`; the necessary backstop for keeper loops spawned before that self-exit
+# shipped, since an already-running loop executes the old script text already loaded
+# into its process image and can never pick up a new check without being restarted).
+# gc_procs (above) only ever removes a pidfile on pid-liveness grounds (corrupt/dead/
+# recycled); a keeper whose OWNER (session or subagent) is gone but whose pid is still
+# alive is exactly what gc_procs keeps as PROC_KEPT_LIVE, and this step exists to catch.
+# Reaped counts fold into PROC_REAPED (same receipt field — same kind of leak, a
+# different detection method) rather than adding a new receipt field.
+gc_keeper_orphans() {
+  [ "${HMD_GC_BREAK:-}" = keeper_orphans ] && { _report "proc" "forced break (test seam)"; return 1; }
+  [ "$DRYRUN" = 1 ] && return 0   # keeper-gc has no dry-run mode; never kill under --dry-run.
+  local presence="${HMD_GC_PRESENCE_BIN:-$SELF_DIR/heimdall-presence}" out n
+  [ -x "$presence" ] || return 0
+  out="$(HEIMDALL_KEEPER_DIR="$KEEPER_DIR" "$presence" keeper-gc 2>/dev/null || true)"
+  n="$(printf '%s' "$out" | sed -n 's/.*reaped \([0-9][0-9]*\) orphaned keeper.*/\1/p' | head -1)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  PROC_REAPED=$((PROC_REAPED + n))
+  [ "$n" -gt 0 ] && _report "proc" "reaped $n orphaned keeper(s) via heimdall-presence keeper-gc (owner session/subagent gone)"
   return 0
 }
 
@@ -499,12 +522,13 @@ print_receipt() {
 # ── dispatch (each step non-fatal: `|| true` keeps run going) ────────────────────
 case "$SUB" in
   worktrees)  gc_worktrees || true;   print_receipt ;;
-  procs)      gc_procs || true;       print_receipt ;;
+  procs)      gc_procs || true;       gc_keeper_orphans || true;  print_receipt ;;
   temp)       gc_temp || true;        print_receipt ;;
   ccversions) gc_ccversions || true;  print_receipt ;;
   run)
     gc_worktrees || true
     gc_procs || true
+    gc_keeper_orphans || true
     gc_temp || true
     gc_ccversions || true
     print_receipt ;;
