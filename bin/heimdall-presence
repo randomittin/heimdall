@@ -16,6 +16,10 @@
 #                                     a second keeper for the same session/repo); consent-gated
 #                                     (OFF -> no keeper); silent-safe (failures never fatal).
 #   heimdall-presence keeper-stop     kill THIS session's keeper + reap its pidfile (no leak).
+#   heimdall-presence keeper-gc       sweep EVERY pidfile in the keeper dir and kill any whose
+#                                     owner (session or subagent) is provably gone — an external
+#                                     backstop for keepers spawned before this self-exit existed.
+#                                     Fail-open + silent on success; wired into `heimdall-gc run`.
 #
 # DURABLE PRESENCE (why the keeper exists). A single SessionStart beat AGES OUT past the ~45s
 # TTL on an idle-but-live session, and the statusline beat only fires when Claude Code REDRAWS
@@ -27,6 +31,11 @@
 # ~/.claude/settings.json SessionStart/SessionEnd hooks (see USAGE below) — or run install.sh,
 # which registers the plugin whose hooks call them for you. The runtime home + this bin are
 # resolved DYNAMICALLY (never a hardcoded path), so the same wiring works on any machine.
+# ORPHAN SELF-EXIT: a crashed/force-killed session skips keeper-stop, so every cycle the loop
+# also checks whether the session (or subagent) it beats FOR is still alive (transcript mtime —
+# see the "DURABLE PRESENCE KEEPER" section below) and exits + retires itself if not, instead of
+# beating for nobody until the 24h wallclock backstop. `keeper-gc` sweeps existing pre-fix
+# keepers the same way from the outside.
 #
 # ZERO-CONFIG. A dev's FIRST beat/roster auto-resolves everything — the dev exports
 # NOTHING. The CP url comes from a shipped local config, the signing key is auto-generated
@@ -1144,6 +1153,47 @@ _try_retire() {
 # started, and a stale-pid guard + a wallclock backstop mean a crashed session never
 # orphans a loop forever. Everything is best-effort + silent-safe: a keeper fault (offline,
 # CP down, no place to persist) never breaks the session.
+#
+# OWNER LIVENESS (self-exit before the 24h backstop). MEASURED 2026-09-24: 15 keeper
+# loops alive (ages 40m-23h54m), 12 of them subagent keepers whose worktrees were merged
+# hours earlier — each still beating every ~20s for an owner that no longer exists. A
+# keeper's pidfile is named <owner>__<session>.pid (see _keeper_pidfile): <owner> is
+# either a plain project id (a top-level session) or literally "agent-<hexid>" (a
+# subagent's own keeper). The respawned `keeper-loop` process receives ONLY
+# --pidfile/--interval (confirmed via `ps` — no --session/--project survive the detach),
+# so the PIDFILE'S OWN NAME is the only reliable owner evidence available inside the
+# loop; _keeper_owner_alive parses it once at loop start (split on the LAST "__").
+#
+# EVIDENCE: transcript MTIME ONLY, per owner shape:
+#   • top-level session <sess> -> newest ~/.claude/projects/*/<sess>.jsonl
+#   • subagent "agent-<id>"    -> newest ~/.claude/projects/*/<sess>/subagents/agent-<id>.jsonl
+# (glob'd across every project SLUG rather than resolved to one: presence's own $PROJECT
+# — used in the pidfile name — is a DIFFERENT namespace than the Claude Code project slug
+# derived from cwd, and conflating them would silently break resolution). A transcript
+# younger than HMD_KEEPER_ORPHAN_SECS (default 900s, mirroring the
+# HMD_AGENT_SESSION_LIVE_SECS convention in bin/lib/session-liveness.sh without sourcing
+# that file — this keeper stays self-contained rather than coupling to a lib two other
+# owned tools depend on) counts as alive. FAILS OPEN throughout: no transcript found, an
+# unreadable mtime, or an unparseable owner/session all count as ALIVE — a false-dead
+# drops a real dev off the wall, a false-alive costs one more cheap 20s beat.
+#
+# REJECTED evidence (both suggested, both falsified before use): a subagent's
+# `.meta.json` carries no status field at all (spawn metadata only — agentType,
+# worktreePath, model, ... — no place to read "done" from); and "parent session gone" as
+# an OR-trigger is UNSAFE independent of the subagent's own evidence — measured on a real
+# pair, the subagent transcript was 8h46m stale while its PARENT session's transcript was
+# 29s fresh (an idle-but-live parent watching a slow background subagent), and the
+# dangerous inverse (a quiet parent, a still-working subagent) would falsely kill live
+# work if "parent gone" alone could trigger an exit. Each owner is judged on ITS OWN
+# transcript only.
+#
+# On a provably-gone owner the loop fires ONE best-effort _try_retire beat (the existing
+# off/sever protocol primitive — never a new one) before exiting, so the dev drops off
+# teammates' walls now rather than waiting out the TTL. `keeper-gc` (below) applies the
+# identical rule from OUTSIDE, once, to every pidfile — the necessary backstop for
+# keepers already running BEFORE this self-exit shipped: an already-running loop is
+# executing the old script text already loaded into its process image and can never pick
+# up this check without being restarted.
 
 # runtime keeper dir (under the runtime home; overridable for tests — never hardcoded).
 _keeper_dir() { printf '%s' "${HEIMDALL_KEEPER_DIR:-$HMD_DIR/presence-keeper}"; }
@@ -1353,6 +1403,7 @@ _keeper_start() {
   pidfile="$(_keeper_pidfile)"
   interval="${INTERVAL:-${HMD_KEEPER_INTERVAL:-20}}"
   mkdir -p "$(_keeper_dir)" 2>/dev/null || true
+  _keeper_reap_tmp_leftovers "$(_keeper_dir)"    # sweep *.pid.tmp.* leftovers older than 1h.
   if _keeper_alive "$pidfile"; then
     printf 'presence keeper: already running (pid %s) — not spawning a second\n' "$(cat "$pidfile" 2>/dev/null)"
     return 0
@@ -1714,6 +1765,11 @@ runs a detached loop that re-beats on a timer (reusing `beat` + its consent gate
 keeper-stop reaps it at SessionEnd. The pid lives in ONE file under the runtime home
 (~/.heimdall/presence-keeper/<project>__<session>.pid, or $HEIMDALL_KEEPER_DIR); a stale-pid
 guard + a 24h wallclock backstop mean a crashed session never orphans a loop. OFF -> no keeper.
+Each cycle also checks that the session (or subagent, for an "agent-<id>" owner) it beats FOR
+is still alive (its OWN transcript mtime vs HMD_KEEPER_ORPHAN_SECS, default 900s) and
+self-exits + retires well before the 24h backstop if not; `keeper-gc` applies the identical
+check from outside, once, to every pidfile — the backstop for keepers spawned before this
+self-exit shipped.
 
 DEV-CHECKOUT (heimdall on PATH but NOT a registered plugin -> the plugin's SessionStart hook
 never fires): wire the two subcommands into your OWN ~/.claude/settings.json so the keeper still
