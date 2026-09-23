@@ -275,10 +275,15 @@ if [ -n "$AGENTS_BIN" ]; then
   # was exactly the death spiral's own re-arm path. Once _ac_refresh records
   # a failure below, no new spawn is attempted until this many seconds pass.
   AGENTS_FAIL_BACKOFF="${HMD_AGENTS_FAIL_BACKOFF:-30}"
+  # Cadence for the stale-tmp-leftover sweep (_ac_sweep_stale below) — bounded
+  # to once per this many seconds regardless of how often a refresh itself
+  # spawns. Independent of the TTLs above: this gates a `find`, not the count.
+  CACHE_SWEEP_EVERY="${HMD_CACHE_SWEEP_EVERY:-300}"
   case "$AGENTS_COUNT_TTL" in ''|*[!0-9]*) AGENTS_COUNT_TTL=4 ;; esac
   case "$AGENTS_LOCK_TTL"  in ''|*[!0-9]*) AGENTS_LOCK_TTL=8 ;; esac
   case "$AGENTS_COUNT_CEIL" in ''|*[!0-9]*) AGENTS_COUNT_CEIL=5 ;; esac
   case "$AGENTS_FAIL_BACKOFF" in ''|*[!0-9]*) AGENTS_FAIL_BACKOFF=30 ;; esac
+  case "$CACHE_SWEEP_EVERY" in ''|*[!0-9]*) CACHE_SWEEP_EVERY=300 ;; esac
   # Sub-second clock for the freshness math below. ROOT CAUSE this fixes: `date
   # +%s` and `stat %m` both floor to whole seconds, and this bar used to diff
   # two independently-floored instants. A write and a check that straddle a
@@ -370,8 +375,25 @@ if [ -n "$AGENTS_BIN" ]; then
     # below — writes AC_FAIL with the exit code instead of publishing, so the
     # FAIL_FRESH gate above can back off; a clean publish removes any AC_FAIL
     # a prior failure left behind.
+    #
+    # LEAK FIX (found 2026-09-24: 9,683 orphaned .agents-count-cache.<pid>.tmp
+    # files piled up in .heimdall/, slowing every stat/mkdir/mktemp under it
+    # for every hook): the `trap` below registers the SAME "$AC_TMP"/"$AC_LOCK"
+    # cleanup as the explicit `rm -f` at the end of this function, on EXIT TERM
+    # INT, so it also fires if this subshell is torn down before reaching that
+    # line — e.g. an external TERM landing on this refresh's whole process
+    # group, which kills "$@" directly and thereby unblocks the wait below, so
+    # the now-pending trap runs the moment bash regains control. It does NOT
+    # cover SIGKILL: that signal's disposition can't be caught by any process,
+    # trap or otherwise, by design. _ac_sweep_stale below is the backstop for
+    # exactly that gap — it runs after this function returns, in the same
+    # backgrounded subshell, and removes anything a SIGKILL left behind once
+    # it's old enough to be unambiguously abandoned. Running both the trap and
+    # the tail `rm -f` on the same normal-exit path is a harmless no-op the
+    # second time — they target the identical two paths, never a glob.
     _ac_refresh() {
       local rc
+      trap 'rm -f "$AC_TMP" "$AC_LOCK"' EXIT TERM INT
       "$@" >"$AC_TMP" 2>/dev/null
       rc=$?
       if [ "$rc" -eq 0 ] && mv -f "$AC_TMP" "$AC_CACHE" 2>/dev/null; then
@@ -381,6 +403,38 @@ if [ -n "$AGENTS_BIN" ]; then
         printf '%s' "$rc" >"$AC_FAIL" 2>/dev/null
       fi
       rm -f "$AC_TMP" "$AC_LOCK"
+    }
+    # Bounded stale-leftover sweep — the SIGKILL backstop the trap above can't
+    # cover. Runs ONLY here, inside the already-backgrounded, disowned refresh
+    # subshell (never on the synchronous render path above it), and at most
+    # once per CACHE_SWEEP_EVERY seconds regardless of how often a refresh
+    # itself spawns: a marker file's mtime is the gate, touched BEFORE the
+    # scan runs so two refreshes racing at the same moment cost at most one
+    # harmless extra `find`, never a correctness bug. Scope is deliberately
+    # narrow — maxdepth 1 (never descends into anything under .heimdall/),
+    # exactly the three known leak-pattern globs, and only files already
+    # older than 2 minutes — so this can only ever remove tmp files this
+    # file's own agents-count refresh (above) or the wall/roster caches'
+    # identically-shaped tmp-then-rename writers (sentinels/hmd-statusline.py)
+    # are known to leak, never anything else living in .heimdall/. Fail-open
+    # throughout: a missing AC_DIR, a `find` that errors, anything — silently
+    # swallowed, since this must never be able to affect a render, only tidy
+    # up after one.
+    _ac_sweep_stale() {
+      local marker="$AC_DIR/.cache-sweep-marker" now_ns marker_ns every_ns
+      now_ns="$(_ac_now_ns)"
+      case "$now_ns" in ''|*[!0-9]*) now_ns=0 ;; esac
+      every_ns=$(( CACHE_SWEEP_EVERY * 1000000000 ))
+      if [ -f "$marker" ]; then
+        marker_ns="$(_ac_mtime_ns "$marker")"
+        case "$marker_ns" in ''|*[!0-9]*) marker_ns=0 ;; esac
+        [ $(( now_ns - marker_ns )) -lt "$every_ns" ] && return 0
+      fi
+      : >"$marker" 2>/dev/null || return 0
+      find "$AC_DIR" -maxdepth 1 \
+        \( -name '.agents-count-cache.*.tmp' -o -name '.wall-cache.json.*.tmp' -o -name '.roster-cache*.tmp' \) \
+        -mmin +2 -delete 2>/dev/null
+      return 0
     }
     TO=""
     command -v timeout  >/dev/null 2>&1 && TO="timeout $AGENTS_COUNT_CEIL"
@@ -392,7 +446,7 @@ if [ -n "$AGENTS_BIN" ]; then
       # grandchildren the same as the perl branch below — never add
       # --foreground here, that opts back into the single-process signalling
       # this whole fix removes (see the DEATH-SPIRAL POSTMORTEM above).
-      ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh $TO "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
+      ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh $TO "$AGENTS_BIN" count; _ac_sweep_stale ) >/dev/null 2>&1 </dev/null &
     elif command -v perl >/dev/null 2>&1; then
       # This machine's stand-in for timeout(1)/gtimeout (this repo's dev Mac
       # ships neither). Unlike the old `alarm 1; exec @ARGV` one-liner —
@@ -420,9 +474,9 @@ if [ -n "$AGENTS_BIN" ]; then
           alarm $ceil;
           waitpid $pid, 0;
           exit $? >> 8;
-        ' "$AGENTS_COUNT_CEIL" "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
+        ' "$AGENTS_COUNT_CEIL" "$AGENTS_BIN" count; _ac_sweep_stale ) >/dev/null 2>&1 </dev/null &
     else
-      ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
+      ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh "$AGENTS_BIN" count; _ac_sweep_stale ) >/dev/null 2>&1 </dev/null &
     fi
     disown 2>/dev/null || true
   fi

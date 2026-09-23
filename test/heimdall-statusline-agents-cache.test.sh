@@ -121,6 +121,29 @@ poll_for_pid_gone() {
   ! kill -0 "$1" 2>/dev/null
 }
 
+poll_for_absence() {
+  # $1 = path, $2 = max attempts (each 0.2s) — bounded wait for a path to
+  # disappear (the inverse of poll_for_file). Never hangs, same shape as
+  # every other poll_for_* helper above.
+  local n=0
+  while [ "$n" -lt "$2" ]; do
+    [ -e "$1" ] || return 0
+    sleep 0.2
+    n=$((n+1))
+  done
+  [ ! -e "$1" ]
+}
+
+old_touch() {
+  # $@ = paths -> backdates mtime by 10 minutes, portably (BSD/macOS `date -v`
+  # vs GNU `date -d`), so the sweep's `-mmin +2` floor sees them as stale
+  # without an actual 10-minute sleep in this suite.
+  local ts
+  ts="$(date -v-10M +%Y%m%d%H%M.%S 2>/dev/null)"
+  [ -n "$ts" ] || ts="$(date -d '10 minutes ago' +%Y%m%d%H%M.%S 2>/dev/null)"
+  [ -n "$ts" ] && touch -t "$ts" "$@" 2>/dev/null
+}
+
 path_forcing_perl() {
   # Emits a PATH with every directory containing an executable timeout or
   # gtimeout removed, so bin/heimdall-statusline's `command -v timeout` /
@@ -330,6 +353,139 @@ else
 fi
 rm -rf "$WS" "$HOMED" "$FAKEBIN"
 rm -f "$CALL_COUNT_FILE" "$CALL_LOG_FILE"
+
+echo "== 8) NO LEAK AT CEILING: a refresh killed at the ceiling leaves no .agents-count-cache.*.tmp behind =="
+# 2026-09-24 leak fix, item 1: pins that a refresh whose "$@" is killed once
+# HMD_AGENTS_COUNT_CEIL expires still leaves AC_TMP cleaned up — the exact
+# shape of the 9,683 orphaned .agents-count-cache.<pid>.tmp files measured in
+# .heimdall/ before this fix.
+TRIPLE="$(mkws)"; IFS='|' read -r WS HOMED <<<"$TRIPLE"
+FAKEBIN="$(mktemp -d)"
+cat >"$FAKEBIN/heimdall-agents" <<'FAKE_EOF'
+#!/usr/bin/env bash
+[ "$1" = "count" ] && sleep 30
+FAKE_EOF
+chmod +x "$FAKEBIN/heimdall-agents"
+FORCED_PATH="$FAKEBIN:$(path_forcing_perl)"
+printf '%s' "$BLOB" | HOME="$HOMED" HEIMDALL_IDENTITY_DIR="$WS/.heimdall" HMD_HAID=rj \
+    HEIMDALL_CP_URL="http://127.0.0.1:1" TERM=xterm-256color \
+    HEIMDALL_STATUSLINE_MODE=truecolor HMD_AGENT_CWD="$WS" \
+    HMD_AGENTS_COUNT_TTL=1 HMD_AGENTS_LOCK_TTL=2 HMD_AGENTS_COUNT_CEIL=1 \
+    PATH="$FORCED_PATH" \
+    "$BASH_BIN" "$CLI" >/dev/null 2>&1
+# Poll (never a blind sleep) for the tmp glob to go empty — ceiling (1s) +
+# TERM/KILL grace (0.3s) + _ac_refresh's own cleanup all have to land first.
+NLEFT=1; ATT=0
+while [ "$ATT" -lt 25 ]; do
+  NLEFT="$(find "$WS/.heimdall" -maxdepth 1 -name '.agents-count-cache.*.tmp' 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$NLEFT" = "0" ] && break
+  sleep 0.2
+  ATT=$((ATT+1))
+done
+if [ "$NLEFT" = "0" ]; then
+  ok "no .agents-count-cache.*.tmp left behind after a ceiling-killed refresh"
+else
+  bad "leaked tmp file(s) after ceiling kill ($NLEFT remaining)"
+fi
+rm -rf "$WS" "$HOMED" "$FAKEBIN"
+
+echo "== 9) SWEEP: stale tmp leftovers are removed on the next background refresh; fresh tmp + unrelated files are spared =="
+# 2026-09-24 leak fix, item 2: the bounded backstop sweep. Covers all three
+# measured leak shapes (.agents-count-cache.*.tmp written by THIS file,
+# .wall-cache.json.*.tmp / .roster-cache*.tmp written by the wall/roster cache
+# path in sentinels/hmd-statusline.py) even though only the first is written
+# by this file — the sweep is a general .heimdall/ janitor for all three known
+# shapes, not just the one this file itself produces.
+TRIPLE="$(mkws)"; IFS='|' read -r WS HOMED <<<"$TRIPLE"
+STALE_AC="$WS/.heimdall/.agents-count-cache.99999.tmp"
+STALE_WALL="$WS/.heimdall/.wall-cache.json.12345.tmp"
+STALE_ROSTER="$WS/.heimdall/.roster-cache-foo.tmp"
+FRESH_AC="$WS/.heimdall/.agents-count-cache.11111.tmp"
+UNRELATED="$WS/.heimdall/keepme.txt"
+: > "$STALE_AC"; : > "$STALE_WALL"; : > "$STALE_ROSTER"; : > "$FRESH_AC"; : > "$UNRELATED"
+old_touch "$STALE_AC" "$STALE_WALL" "$STALE_ROSTER" "$UNRELATED"   # UNRELATED is also
+                                                                    # backdated, so its
+                                                                    # survival proves the
+                                                                    # NAME, not the age,
+                                                                    # is what spares it
+run_cli "$WS" "$HOMED"
+SWEPT_OK=1
+for f in "$STALE_AC" "$STALE_WALL" "$STALE_ROSTER"; do
+  poll_for_absence "$f" 20 || SWEPT_OK=0
+done
+if [ "$SWEPT_OK" = 1 ]; then
+  ok "stale (10min old) .agents-count-cache/.wall-cache.json/.roster-cache tmp leftovers were swept"
+else
+  bad "one or more stale tmp leftovers survived the background sweep"
+fi
+sleep 0.5
+if [ -f "$FRESH_AC" ]; then
+  ok "a fresh (<2min) tmp file matching the same name pattern was left alone"
+else
+  bad "a fresh tmp file was incorrectly swept — sweep is not honoring the 2-minute floor"
+fi
+if [ -f "$UNRELATED" ]; then
+  ok "an unrelated (also 10min old) file in .heimdall/ was left alone by the sweep"
+else
+  bad "an unrelated file was incorrectly removed — sweep scope leaked beyond its three name patterns"
+fi
+rm -rf "$WS" "$HOMED"
+
+echo "== 10) SWEEP DEDUP: the sweep does not re-run within HMD_CACHE_SWEEP_EVERY, then resumes once it elapses =="
+# FAKEBIN (same reason as cases 6-8) removes the real heimdall-agents count's
+# own latency (measured ~0.4s/call standalone on this host, more under this
+# host's actual concurrent multi-agent load) from the critical path, since
+# _ac_refresh always runs before _ac_sweep_stale in the same subshell.
+#
+# Controls "time since last sweep" via direct marker mtime manipulation
+# (touch -t, the same technique old_touch already uses for the tmp leftovers
+# in case 9) instead of racing real sleeps against CLI/subprocess overhead: a
+# fixed, generously large HMD_CACHE_SWEEP_EVERY=100 makes ordinary overhead
+# (at most a couple of seconds even under heavy host load) irrelevant to the
+# "still within window" assertion, and old_touch's 10-minute backdate is
+# unambiguously past that 100s cadence for the "window elapsed" assertion —
+# both now test the marker-gate math itself, never a race against however
+# long any one CLI invocation happens to take on this host right now.
+TRIPLE="$(mkws)"; IFS='|' read -r WS HOMED <<<"$TRIPLE"
+FAKEBIN="$(mktemp -d)"
+cat >"$FAKEBIN/heimdall-agents" <<'FAKE_EOF'
+#!/usr/bin/env bash
+[ "$1" = "count" ] && echo 0
+FAKE_EOF
+chmod +x "$FAKEBIN/heimdall-agents"
+FORCED_PATH="$FAKEBIN:$PATH"
+run_cli_sweep() {  # $1=workspace $2=homed — like run_cli, plus a fixed, large sweep cadence
+  printf '%s' "$BLOB" | HOME="$2" HEIMDALL_IDENTITY_DIR="$1/.heimdall" HMD_HAID=rj \
+    HEIMDALL_CP_URL="http://127.0.0.1:1" TERM=xterm-256color \
+    HEIMDALL_STATUSLINE_MODE=truecolor HMD_AGENT_CWD="$1" \
+    HMD_AGENTS_COUNT_TTL=1 HMD_AGENTS_LOCK_TTL=2 HMD_CACHE_SWEEP_EVERY=100 \
+    PATH="$FORCED_PATH" \
+    bash "$CLI" >/dev/null 2>&1
+}
+SWEEP_MARKER="$WS/.heimdall/.cache-sweep-marker"
+STALE2="$WS/.heimdall/.agents-count-cache.22222.tmp"
+
+run_cli_sweep "$WS" "$HOMED"           # cold -> first sweep creates the marker fresh
+poll_for_file "$SWEEP_MARKER" 15
+: > "$STALE2"; old_touch "$STALE2"
+sleep 2                                 # past the 1s count TTL -> next call spawns its own refresh
+run_cli_sweep "$WS" "$HOMED"            # marker is only ~seconds old vs the 100s cadence -> skip
+sleep 2
+if [ -f "$STALE2" ]; then
+  ok "a leftover added after the first sweep survives a second refresh still inside HMD_CACHE_SWEEP_EVERY"
+else
+  bad "sweep re-ran before its HMD_CACHE_SWEEP_EVERY window elapsed"
+fi
+
+old_touch "$SWEEP_MARKER"               # deterministically 10min old -> unambiguously past
+                                         # the 100s cadence regardless of real elapsed wall time
+run_cli_sweep "$WS" "$HOMED"
+if poll_for_absence "$STALE2" 20; then
+  ok "sweep resumed and removed the leftover once HMD_CACHE_SWEEP_EVERY elapsed — gate is not wedged forever"
+else
+  bad "leftover was never swept even after HMD_CACHE_SWEEP_EVERY elapsed"
+fi
+rm -rf "$WS" "$HOMED" "$FAKEBIN"
 
 echo
 echo "$pass passed, $fail failed"
