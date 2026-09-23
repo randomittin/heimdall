@@ -101,7 +101,7 @@ heimdall-portable-brief	2026-11-26	KNOWN GAP — turns .planning/CHECKPOINT.md i
 # assumed from the commit message alone). That row, heimdall-drain's KNOWN GAP row
 # above, and the two heimdall-issue-* KNOWN GAP rows above (independently made
 # REACHABLE the same day via the new commands/maintain-check.md) are gone.
-heimdall-spawn	2026-09-21	DEAD — Background Spawn Framework orchestrator (spec H-3); its one real (non-comment) caller is bin/heimdall-watch (recorded above as KNOWN GAP — see that row for its own stated integration plan), which nothing yet triggers.
+heimdall-spawn	2026-10-23	DEAD — Background Spawn Framework orchestrator (spec H-3); its one real (non-comment) caller is bin/heimdall-watch (recorded above as KNOWN GAP — see that row for its own stated integration plan), which nothing yet triggers. RE-VERIFIED 2026-09-23 on this row's own recheck-by expiry (2026-09-21): the same-day merge landing bin/heimdall-app, bin/heimdall-relay-client, bin/heimdall-inbox-deliver and the new `app`/`inbox` dispatch arms touches neither heimdall-watch nor heimdall-spawn (checked via `heimdall-deadcode --why heimdall-spawn` / `--why heimdall-watch`, and by grepping both names across bin/ hooks/ .github/ commands/ agents/ skills/) — same two-corpse chain, still genuinely dead.
 #
 # ── DEAD — the 2026-08-28 python-docstring-stripping audit ──────────────────────
 # Found after bin/lib/reachability.sh learned to stop tokenizing the CONTENT of a
