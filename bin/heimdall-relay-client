@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+"""bin/heimdall-relay-client -- publishes hmd's `hmd ui` state through the
+Cloudflare relay (see hmdapp's docs/HANDOFF-TO-HEIMDALL-relay.md and
+docs/superpowers/specs/relay/INVARIANTS.md -- both read-only inputs from the
+hmdapp repo, never edited here) and accepts a `send-message` command back from
+the paired phone.
+
+Spawned by `bin/heimdall-app connect --relay <url>` as a sibling process to a
+local `hmd ui`; this process owns the ONE relay session for its lifetime and is
+torn down by `hmd app disconnect` sending it SIGTERM.
+
+Zero second state-collection path: state is read directly from
+sentinels/hmd-ui.py's collect_state/digest_of/StateCache (imported by path --
+the same convention that module itself uses for bin/lib/*.py, see
+`_load_module` below) -- never over a second HTTP hop to a locally running
+`hmd ui`. `--ui-port` is carried only for the transport dict (so a phone-side
+viewer can show which local port `hmd ui` is actually bound to); the state
+read path never opens a socket to it.
+
+WAVE-1 KEY-EXCHANGE CONVENTION (not in the design spec; resolved here --
+heimdall-app's RelayTransport MUST implement this identically):
+    The relay's `/session/:id/ws` upgrade always pushes an unencrypted
+    `device_bound` control frame down BOTH legs first (INV-20) -- that frame
+    never carries the phone's X25519 public key, only an opaque
+    `device_token`. Since `hmd_pub` travels only inside the QR payload
+    (INV-12: never through the relay), the phone is the side that has NOT yet
+    told the relay anything cryptographic, and this client cannot derive the
+    shared session key until it does. Wave 1 defines one bootstrap exchange,
+    layered on top of the normal Envelope/frame plumbing:
+        1. Immediately after observing `device_bound` (sender "relay"), the
+           PHONE sends exactly one frame: sender "device", type "command",
+           seq 0, nonce the LITERAL string "hello" (not a derived nonce --
+           there is no session key yet to derive one from), ciphertext the
+           base64 encoding of its raw 32-byte X25519 public key (NOT
+           AEAD-sealed -- there is nothing to seal with yet; the field is
+           reused as a plain carrier at this one bootstrap step only).
+        2. This client decodes that pubkey, calls
+           `derive_session_key(hmd_priv, device_pub, session_id)` (INV-11:
+           HKDF-SHA256(ECDH(hmd_priv, device_pub), salt=session_id,
+           info="hmd-relay-v1")) and replies with sender "hmd", type "ack",
+           seq 0, AEAD-sealed with the now-derived key, plaintext
+           `{"ok": true, "of_seq": 0}`.
+        3. Only after that ack is sent does this client start sending `state`
+           frames (seq 1, 2, 3, ... -- INV-14: one shared strictly-increasing
+           `seq` counter across every hmd-SENT frame, ack or state alike,
+           matching INV-14's per-SENDER-not-per-type wording).
+    Any device-sent frame received before a device_bound, or received as the
+    first device-sent frame after device_bound that does not match the shape
+    above (wrong type/nonce, or a pubkey that fails to decode), is a loud
+    `error` event, ignored -- never crashes, never derives a key from it
+    (INV-33: a relay-injected or malformed control/bootstrap frame must never
+    be silently trusted). This client keeps waiting for a valid hello on every
+    subsequent device-sent frame until one validates -- one bad frame does not
+    permanently wedge the session.
+
+STDOUT CONTRACT: newline-delimited JSON, one compact (sorted-key) object per
+line, flushed immediately -- the ONLY channel `hmd app connect --relay` reads
+to drive its own UI; nothing else is ever written to stdout.
+    {"event":"pair_init","qr":{"v":1,"relay":..,"session_id":..,
+     "pairing_code":..,"exp":..,"hmd_pubkey":..},"exp":..}
+        `qr`, serialized compact+sorted (which this whole line already is), IS
+        the exact QR payload string heimdall-app renders (Decision 7.2 shape).
+    {"event":"device_bound","exp":..}                 a phone claimed the session
+    {"event":"state_sent","seq":N,"bytes":B,"delivered":bool}
+    {"event":"command","action":"send-message","ok":bool,"detail":..}
+        one line per inbound command frame that reaches decrypted-payload
+        handling (the Wave-1 hello bootstrap itself is silent -- see
+        device_bound above)
+    {"event":"stream_drop","retry_ms":N}              GET stream disconnected;
+                                                       reconnecting after N ms
+    {"event":"session_ended","reason":..}             terminal; process exits 0
+    {"event":"error","detail":..}                     non-fatal unless followed
+                                                       by one of the two exit
+                                                       paths below
+
+Never printed, logged, or written to disk: `relay_session_token`, the derived
+session key, either private key, or any command/state plaintext.
+
+EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
+11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
+to import -- both mean the same thing: refuse to start a plaintext relay
+session); 12 relay unreachable or `/pair/init` did not return 200; 1 an
+unexpected local fault outside all four of the above (e.g. sentinels/hmd-ui.py
+itself failed to import).
+
+STATUS FILE (default <repo>/.heimdall/app/relay.json, atomic 0600 write, 0700
+dir, rewritten on every state change -- never holds a token or key):
+    {session_id, relay, paired, bound_at, last_seq, frames_sent,
+     last_delivered, last_command_at, started_at, pid}
+"""
+
+import argparse
+import http.client
+import json
+import os
+import signal
+import ssl
+import sys
+import threading
+import time
+import urllib.parse
+from importlib.util import module_from_spec, spec_from_file_location
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LIB_DIR = os.path.join(HERE, "lib")
+SENTINELS_DIR = os.path.normpath(os.path.join(HERE, "..", "sentinels"))
+
+
+def _load_module(name, path):
+    """Import a sibling module by path -- the same convention sentinels/hmd-ui.py
+    uses for its own bin/lib/*.py imports (see that file's `_load_module`).
+    Returns None on any failure (missing file, syntax error, ...) rather than
+    raising, so a caller can degrade explicitly instead of the whole process
+    dying on import."""
+    try:
+        spec = spec_from_file_location(name, path)
+        mod = module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+UI = _load_module("hmd_ui", os.path.join(SENTINELS_DIR, "hmd-ui.py"))
+INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_inbox.py"))
+E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
+
+MAX_ENVELOPE_BYTES = 131072
+BACKOFF_BASE_MS = 2000
+BACKOFF_CAP_MS = 30000
+CONNECT_TIMEOUT_S = 15
+STREAM_TIMEOUT_S = None  # long-lived by design -- reconnect logic reacts to an
+                          # observed EOF/error, never a client-side idle timeout
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _atomic_write_json(path, obj):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o700)
+    tmp = path + ".tmp-%d" % os.getpid()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(obj, sort_keys=True, separators=(",", ":")))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        os.unlink(tmp)
+        raise
+
+
+def _split_relay(url):
+    parsed = urllib.parse.urlsplit(url or "")
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    return parsed
+
+
+def _connect(parsed, timeout=CONNECT_TIMEOUT_S):
+    if parsed.scheme == "https":
+        ctx = ssl.create_default_context()
+        return http.client.HTTPSConnection(parsed.hostname, parsed.port or 443,
+                                            context=ctx, timeout=timeout)
+    return http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=timeout)
+
+
+def _base_path(parsed):
+    return parsed.path.rstrip("/")
+
+
+def _body_head(raw, limit=200):
+    try:
+        text = raw.decode("utf-8", "replace")
+    except Exception:
+        text = repr(raw)
+    return text[:limit]
+
+
+class RelayClient:
+    def __init__(self, args):
+        self.args = args
+        self.relay_url = args.relay
+        self.parsed = _split_relay(args.relay)
+        self.root = os.path.realpath(os.path.expanduser(args.repo))
+        self.status_path = args.status_file or os.path.join(self.root, ".heimdall", "app", "relay.json")
+        self.tick_s = args.tick_s
+        # A relay session is public by construction (state leaves the machine) --
+        # public_host is always truthy so sentinels/hmd-ui.py's own public-mode
+        # redaction (_redact_state_for_public) always applies, regardless of
+        # whether the operator supplied a friendly --public-host name.
+        self.public_host = (args.public_host.strip().lower() if args.public_host else "relay")
+        self.transport = {"bind": "relay", "public_host": self.public_host,
+                           "trust_proxy": False, "port": args.ui_port}
+
+        self.session_id = None
+        self.token = None
+        self.exp = None
+        self.priv = None
+        self.pub = None
+        self.session_key = None
+
+        self.lock = threading.Lock()
+        self.hmd_seq = 0
+        self.last_device_seq = -1
+        self.stop_event = threading.Event()
+        self.state_ready = threading.Event()
+        self._stopping = False
+
+        self.started_at = time.time()
+        self.paired = False
+        self.bound_at = None
+        self.last_seq = None
+        self.frames_sent = 0
+        self.last_delivered = None
+        self.last_command_at = None
+
+        self.last_sent_digest = None
+        self.cache = None
+
+    # -- status ------------------------------------------------------------
+    def _status_snapshot(self):
+        return {
+            "session_id": self.session_id,
+            "relay": self.relay_url,
+            "paired": self.paired,
+            "bound_at": self.bound_at,
+            "last_seq": self.last_seq,
+            "frames_sent": self.frames_sent,
+            "last_delivered": self.last_delivered,
+            "last_command_at": self.last_command_at,
+            "started_at": self.started_at,
+            "pid": os.getpid(),
+        }
+
+    def write_status(self):
+        try:
+            _atomic_write_json(self.status_path, self._status_snapshot())
+        except OSError as e:
+            # bookkeeping only -- surfaced, never fatal to the caller
+            emit({"event": "error", "detail": "status write failed: %s" % e})
+
+    # -- HTTP: one-shot requests --------------------------------------------
+    def _request(self, method, path, headers=None, body=None):
+        conn = _connect(self.parsed)
+        try:
+            conn.request(method, _base_path(self.parsed) + path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            raw = resp.read()
+            return resp.status, raw
+        finally:
+            conn.close()
+
+    def pair_init(self):
+        try:
+            status, raw = self._request("POST", "/pair/init", headers={"Content-Length": "0"}, body=b"")
+        except (OSError, http.client.HTTPException) as e:
+            emit({"event": "error", "detail": "pair/init unreachable: %s" % e})
+            return 12
+        if status != 200:
+            emit({"event": "error", "detail": "pair/init HTTP %d: %s" % (status, _body_head(raw))})
+            return 12
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            emit({"event": "error", "detail": "pair/init returned invalid JSON: %s" % e})
+            return 12
+        for key in ("session_id", "pairing_code", "relay_session_token", "exp"):
+            if key not in data:
+                emit({"event": "error", "detail": "pair/init response missing %r" % key})
+                return 12
+        self.session_id = data["session_id"]
+        self.token = data["relay_session_token"]
+        self.exp = data["exp"]
+        qr = {
+            "v": 1,
+            "relay": self.relay_url,
+            "session_id": self.session_id,
+            "pairing_code": data["pairing_code"],
+            "exp": self.exp,
+            "hmd_pubkey": E2E.pub_b64(self.pub),
+        }
+        emit({"event": "pair_init", "qr": qr, "exp": self.exp})
+        self.write_status()
+        return 0
+
+    def _auth_headers(self, extra=None):
+        h = {"Authorization": "Bearer %s" % self.token}
+        if extra:
+            h.update(extra)
+        return h
+
+    def send_frame_envelope(self, type_, nonce, ciphertext, seq):
+        envelope = {
+            "v": 1,
+            "session_id": self.session_id,
+            "seq": seq,
+            "sender": "hmd",
+            "type": type_,
+            "nonce": nonce,
+            "ciphertext": ciphertext,
+            "payload": None,
+        }
+        body = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(body) > MAX_ENVELOPE_BYTES:
+            emit({"event": "error", "detail": "%s frame seq=%d dropped: %d bytes exceeds %d cap"
+                                              % (type_, seq, len(body), MAX_ENVELOPE_BYTES)})
+            return None, len(body)
+        try:
+            status, raw = self._request("POST", "/session/%s/frames" % self.session_id,
+                                         headers=self._auth_headers({"Content-Type": "application/json"}),
+                                         body=body)
+        except (OSError, http.client.HTTPException) as e:
+            emit({"event": "error", "detail": "%s frame seq=%d post failed: %s" % (type_, seq, e)})
+            return None, len(body)
+        if status == 413:
+            emit({"event": "error", "detail": "%s frame seq=%d rejected 413 (>%d bytes)"
+                                              % (type_, seq, MAX_ENVELOPE_BYTES)})
+            return None, len(body)
+        if status != 200:
+            emit({"event": "error", "detail": "%s frame seq=%d post HTTP %d: %s"
+                                              % (type_, seq, status, _body_head(raw))})
+            return None, len(body)
+        try:
+            resp = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            resp = {}
+        return bool(resp.get("delivered")), len(body)
+
+    def send_hmd_frame(self, type_, plaintext_obj):
+        """Allocate the next shared hmd-side seq, seal, POST, update status --
+        the ONE path both the state-tick loop (main thread) and the
+        stream-reader thread use to send anything as sender 'hmd', so the seq
+        counter (INV-14, strictly increasing per sender) is never raced
+        between the two."""
+        plaintext = json.dumps(plaintext_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        with self.lock:
+            seq = self.hmd_seq
+            self.hmd_seq += 1
+            nonce, ciphertext = E2E.seal(self.session_key, seq, "hmd", plaintext)
+            delivered, nbytes = self.send_frame_envelope(type_, nonce, ciphertext, seq)
+            self.last_seq = seq
+            if delivered is not None:
+                self.frames_sent += 1
+                self.last_delivered = delivered
+            self.write_status()
+        if type_ == "state":
+            emit({"event": "state_sent", "seq": seq, "bytes": nbytes, "delivered": bool(delivered)})
+        return seq, delivered
+
+    def revoke(self):
+        if not self.session_id or not self.token:
+            return
+        try:
+            self._request("POST", "/session/%s/revoke" % self.session_id,
+                           headers=self._auth_headers({"Content-Length": "0"}), body=b"")
+        except (OSError, http.client.HTTPException) as e:
+            # best-effort shutdown courtesy call -- surfaced, never blocks process exit
+            emit({"event": "error", "detail": "revoke call failed: %s" % e})
+
+    # -- stream --------------------------------------------------------------
+    def _open_stream(self):
+        conn = _connect(self.parsed, timeout=STREAM_TIMEOUT_S)
+        conn.request("GET", _base_path(self.parsed) + "/session/%s/stream" % self.session_id,
+                      headers=self._auth_headers())
+        resp = conn.getresponse()
+        return conn, resp
+
+    def _handle_hello(self, env):
+        if not (env.get("type") == "command" and env.get("nonce") == "hello" and env.get("seq") == 0):
+            emit({"event": "error", "detail": "expected hello key-exchange frame, got type=%r nonce=%r seq=%r"
+                                              % (env.get("type"), env.get("nonce"), env.get("seq"))})
+            return
+        try:
+            device_pub = E2E.pub_from_b64(env.get("ciphertext") or "")
+            self.session_key = E2E.derive_session_key(self.priv, device_pub, self.session_id)
+        except Exception as e:
+            emit({"event": "error", "detail": "hello key exchange failed: %s" % e})
+            self.session_key = None
+            return
+        self.last_device_seq = 0
+        self.send_hmd_frame("ack", {"ok": True, "of_seq": 0})
+        self.state_ready.set()
+
+    def _handle_command(self, env):
+        seq = env.get("seq")
+        if not isinstance(seq, int) or seq <= self.last_device_seq:
+            emit({"event": "error", "detail": "non-increasing seq from device (got %r, last %r) -- rejected"
+                                              % (seq, self.last_device_seq)})
+            return
+        try:
+            plaintext = E2E.open_(self.session_key, seq, "device", env.get("nonce"), env.get("ciphertext"))
+        except E2E.E2EError:
+            self.last_device_seq = seq
+            emit({"event": "command", "action": None, "ok": False, "detail": "decrypt-failed"})
+            self.send_hmd_frame("ack", {"ok": False, "detail": "decrypt-failed", "of_seq": seq})
+            return
+        self.last_device_seq = seq
+        self.last_command_at = time.time()
+        try:
+            obj = json.loads(plaintext.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            obj = None
+        action = obj.get("action") if isinstance(obj, dict) else None
+        extra = {}
+        if action == "send-message":
+            if INBOX is None:
+                ok, detail = False, "inbox-unavailable"
+            else:
+                try:
+                    record = INBOX.append(self.root, obj.get("text"))
+                    ok, detail, extra = True, None, {"id": record["id"]}
+                except INBOX.InboxError as e:
+                    ok, detail = False, e.code
+                except OSError:
+                    ok, detail = False, "write-failed"
+        else:
+            ok, detail = False, "not-implemented"
+        emit({"event": "command", "action": action, "ok": ok, "detail": detail})
+        ack_payload = {"ok": ok, "of_seq": seq}
+        if detail is not None:
+            ack_payload["detail"] = detail
+        ack_payload.update(extra)
+        self.send_hmd_frame("ack", ack_payload)
+
+    def _handle_envelope(self, env):
+        sender = env.get("sender")
+        type_ = env.get("type")
+        if sender == "relay" and type_ == "device_bound":
+            if self.paired:
+                emit({"event": "error", "detail": "unexpected device_bound (already bound) -- ignored"})
+                return
+            self.paired = True
+            self.bound_at = time.time()
+            self.write_status()
+            payload = env.get("payload") or {}
+            emit({"event": "device_bound", "exp": payload.get("exp")})
+            return
+        if sender == "relay" and type_ == "session_ended":
+            payload = env.get("payload") or {}
+            self.write_status()
+            emit({"event": "session_ended", "reason": payload.get("reason", "unknown")})
+            self.stop_event.set()
+            return
+        if sender == "device" and type_ == "command":
+            if self.session_key is None:
+                self._handle_hello(env)
+            else:
+                self._handle_command(env)
+            return
+        emit({"event": "error", "detail": "unexpected frame sender=%r type=%r -- ignored" % (sender, type_)})
+
+    def _stream_loop(self):
+        backoff_ms = BACKOFF_BASE_MS
+        while not self.stop_event.is_set():
+            try:
+                conn, resp = self._open_stream()
+            except (OSError, http.client.HTTPException) as e:
+                emit({"event": "error", "detail": "stream connect failed: %s" % e})
+                emit({"event": "stream_drop", "retry_ms": backoff_ms})
+                if self.stop_event.wait(backoff_ms / 1000.0):
+                    return
+                backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
+                continue
+
+            if resp.status in (401, 404, 410):
+                self.write_status()
+                emit({"event": "session_ended", "reason": "stream-%d" % resp.status})
+                self.stop_event.set()
+                conn.close()
+                return
+
+            if resp.status == 429:
+                retry_after = resp.getheader("Retry-After")
+                try:
+                    wait_s = float(retry_after)
+                except (TypeError, ValueError):
+                    wait_s = backoff_ms / 1000.0
+                conn.close()
+                if self.stop_event.wait(wait_s):
+                    return
+                continue
+
+            if resp.status != 200:
+                emit({"event": "error", "detail": "stream open HTTP %d" % resp.status})
+                emit({"event": "stream_drop", "retry_ms": backoff_ms})
+                conn.close()
+                if self.stop_event.wait(backoff_ms / 1000.0):
+                    return
+                backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
+                continue
+
+            backoff_ms = BACKOFF_BASE_MS  # reset on a successful (re)connect
+            try:
+                while not self.stop_event.is_set():
+                    line = resp.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        env = json.loads(line.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        emit({"event": "error", "detail": "malformed frame from stream (not JSON)"})
+                        continue
+                    self._handle_envelope(env)
+            except (OSError, http.client.HTTPException) as e:
+                emit({"event": "error", "detail": "stream read failed: %s" % e})
+            finally:
+                conn.close()
+
+            if self.stop_event.is_set():
+                return
+            emit({"event": "stream_drop", "retry_ms": backoff_ms})
+            if self.stop_event.wait(backoff_ms / 1000.0):
+                return
+            backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
+
+    # -- state tick loop (main thread) ---------------------------------------
+    def _tick_once(self):
+        state, digest = self.cache.latest()
+        if digest == self.last_sent_digest:
+            return
+        self.last_sent_digest = digest
+        self.send_hmd_frame("state", {"state": state})
+
+    def run_state_loop(self):
+        self.cache = UI.StateCache(self.root, self.transport)
+        self.cache.start()
+        try:
+            while not self.stop_event.wait(self.tick_s):
+                if not self.state_ready.is_set():
+                    continue
+                try:
+                    self._tick_once()
+                except Exception as e:
+                    emit({"event": "error", "detail": "state tick failed: %s" % e})
+        finally:
+            self.cache.stop()
+
+    # -- shutdown --------------------------------------------------------------
+    def shutdown(self, reason):
+        if self._stopping:
+            return
+        self._stopping = True
+        self.stop_event.set()
+        self.revoke()
+        self.write_status()
+        emit({"event": "session_ended", "reason": reason})
+
+
+def build_argparser():
+    ap = argparse.ArgumentParser(prog="heimdall-relay-client",
+                                  description="publish hmd ui state through the Cloudflare relay, "
+                                              "E2E sealed, accepting a send-message command back")
+    ap.add_argument("--relay", required=True, metavar="URL",
+                     help="relay base URL, e.g. https://hmd-relay.example.workers.dev")
+    ap.add_argument("--repo", required=True, metavar="DIR", help="repo root to render (passed to collect_state)")
+    ap.add_argument("--ui-port", required=True, type=int, metavar="N",
+                     help="port a local `hmd ui` is bound to (informational -- carried in the "
+                          "transport dict, never dialed by this process)")
+    ap.add_argument("--public-host", default=None, metavar="NAME",
+                     help="friendly name shown in the transport dict; public-mode redaction is "
+                          "always applied for a relay session regardless of this flag")
+    ap.add_argument("--status-file", default=None, metavar="PATH",
+                     help="default <repo>/.heimdall/app/relay.json")
+    ap.add_argument("--tick-s", type=float, default=2.0, metavar="N",
+                     help="state poll/send cadence in seconds (default 2)")
+    return ap
+
+
+def main(argv=None):
+    ap = build_argparser()
+    args = ap.parse_args(argv)
+    parsed = _split_relay(args.relay)
+    if parsed is None:
+        ap.error("--relay must be an http:// or https:// URL")
+
+    if UI is None:
+        emit({"event": "error",
+              "detail": "cannot import sentinels/hmd-ui.py -- collect_state/digest_of/StateCache unavailable"})
+        return 1
+
+    e2e_ok = E2E is not None
+    if e2e_ok:
+        try:
+            e2e_ok = bool(E2E.e2e_available())
+        except Exception:
+            e2e_ok = False
+    if not e2e_ok:
+        msg = "relay E2E unavailable -- refusing to start a plaintext relay session"
+        emit({"event": "error", "detail": msg})
+        sys.stderr.write("heimdall-relay-client: %s\n" % msg)
+        return 11
+
+    client = RelayClient(args)
+    client.priv, client.pub = E2E.generate_keypair()
+
+    rc = client.pair_init()
+    if rc != 0:
+        return rc
+
+    def _on_signal(_signum, _frame):
+        client.shutdown("local-disconnect")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    stream_thread = threading.Thread(target=client._stream_loop, name="relay-stream", daemon=True)
+    stream_thread.start()
+
+    client.run_state_loop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
