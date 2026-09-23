@@ -50,6 +50,32 @@ export function base64Decode(value) {
   return new Uint8Array(Buffer.from(value, 'base64'));
 }
 
+// URL-safe base64 (RFC 4648 §5), no padding -- device_pubkey (the phone's
+// claim query param, forwarded verbatim into hmd's stream by
+// relay/src/session.ts's deliverToHmdStream) is this alphabet, unlike
+// ciphertext/nonce above which stay standard base64. Node has had a native
+// 'base64url' Buffer encoding since v15.7 -- unlike src/relay/protocol.ts's
+// dependency-free base64Encode/base64Decode (which avoid Buffer/atob for
+// Hermes/RN portability), this is a plain-Node dev script with no such
+// constraint, so it uses the built-in encoding directly rather than
+// hand-rolling one.
+const BASE64URL_SHAPE = /^[A-Za-z0-9_-]*$/;
+
+export function base64UrlEncode(bytes) {
+  return Buffer.from(bytes).toString('base64url');
+}
+
+/** Fail-closed, same house style as base64Decode above: a character outside
+ *  the URL-safe alphabet, or a length with no valid base64(url) encoding
+ *  (`% 4 === 1` -- one leftover char can never represent a whole byte),
+ *  returns `null` rather than handing Buffer.from's lenient decode a value
+ *  it would otherwise accept. */
+export function base64UrlDecode(value) {
+  if (typeof value !== 'string' || !BASE64URL_SHAPE.test(value)) return null;
+  if (value.length % 4 === 1) return null;
+  return new Uint8Array(Buffer.from(value, 'base64url'));
+}
+
 /** Mirrors src/relay/crypto.ts's private `buildNonce` exactly (same 4-byte
  *  tag + 8-byte big-endian seq layout, INV-13) so the wire `nonce` field
  *  carries real, correct data -- never a placeholder -- even though no

@@ -11,7 +11,14 @@ import { fileURLToPath } from 'node:url';
 import { x25519 } from '@noble/curves/ed25519.js';
 
 import { deriveSessionKey, seal, open, RelayCryptoError } from '../lib/relay-crypto.mjs';
-import { encodeHmdEnvelope, decodeEnvelope, base64Encode, base64Decode } from '../lib/envelope.mjs';
+import {
+  encodeHmdEnvelope,
+  decodeEnvelope,
+  base64Encode,
+  base64Decode,
+  base64UrlEncode,
+  base64UrlDecode,
+} from '../lib/envelope.mjs';
 import {
   parseArgs,
   resolveStatePath,
@@ -149,6 +156,16 @@ test('base64Encode/base64Decode round-trip and reject malformed input', () => {
   assert.equal(base64Decode('AB'), null); // not a multiple of 4
 });
 
+test('base64UrlEncode/base64UrlDecode round-trip and reject malformed input', () => {
+  const bytes = new Uint8Array([0, 1, 2, 253, 254, 255]);
+  const encoded = base64UrlEncode(bytes);
+  assert.doesNotMatch(encoded, /[+/=]/);
+  const decoded = base64UrlDecode(encoded);
+  assert.deepEqual(Array.from(decoded), Array.from(bytes));
+  assert.equal(base64UrlDecode('not base64url!!'), null);
+  assert.equal(base64UrlDecode('a'), null); // length % 4 === 1, no valid encoding
+});
+
 // --- fake-hmd.mjs: parseArgs / resolveStatePath / command+ack codecs ----
 
 test('parseArgs requires --relay', () => {
@@ -215,16 +232,27 @@ test('buildAckPayload omits detail on success and includes it on failure', () =>
 test('resolvePhonePubkey prefers --phone-pubkey over the payload when both are present', () => {
   const override = new Uint8Array(32).fill(1);
   const payload = new Uint8Array(32).fill(2);
-  const envelope = { payload: { device_pubkey: base64Encode(payload) } };
-  const resolved = resolvePhonePubkey(envelope, base64Encode(override));
+  const envelope = { payload: { device_pubkey: base64UrlEncode(payload) } };
+  const resolved = resolvePhonePubkey(envelope, base64UrlEncode(override));
   assert.deepEqual(Array.from(resolved), Array.from(override));
 });
 
 test('resolvePhonePubkey falls back to payload.device_pubkey when no override is given', () => {
   const payload = new Uint8Array(32).fill(3);
-  const envelope = { payload: { device_pubkey: base64Encode(payload) } };
+  const envelope = { payload: { device_pubkey: base64UrlEncode(payload) } };
   const resolved = resolvePhonePubkey(envelope, undefined);
   assert.deepEqual(Array.from(resolved), Array.from(payload));
+});
+
+test('resolvePhonePubkey decodes a base64url device_pubkey containing bytes standard base64 would render as +///= (live-relay regression)', () => {
+  const pubkey = new Uint8Array(32);
+  pubkey.fill(0xfb, 0, 16);
+  pubkey.fill(0xff, 16, 32);
+  const encoded = base64UrlEncode(pubkey);
+  assert.match(encoded, /^[A-Za-z0-9_-]{43}$/);
+  const envelope = { payload: { device_pubkey: encoded } };
+  const resolved = resolvePhonePubkey(envelope, undefined);
+  assert.deepEqual(Array.from(resolved), Array.from(pubkey));
 });
 
 test('resolvePhonePubkey returns null when neither override nor payload is present', () => {

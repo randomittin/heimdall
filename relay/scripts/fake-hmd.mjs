@@ -40,22 +40,22 @@ import {
   open,
   RelayCryptoError,
 } from './lib/relay-crypto.mjs';
-import { encodeHmdEnvelope, decodeEnvelope, base64Encode, base64Decode } from './lib/envelope.mjs';
+import { encodeHmdEnvelope, decodeEnvelope, base64Encode, base64UrlDecode } from './lib/envelope.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url)); // .../relay/scripts/
 const REPO_ROOT = join(HERE, '..', '..');
 const DEFAULT_STATE_RELATIVE_PATH = 'docs/samples/state.json';
 const STATE_SEND_INTERVAL_MS = 5000;
 
-const USAGE = `Usage: node relay/scripts/fake-hmd.mjs --relay <https://...> [--state <path>] [--phone-pubkey <base64>]
+const USAGE = `Usage: node relay/scripts/fake-hmd.mjs --relay <https://...> [--state <path>] [--phone-pubkey <base64url>]
 
-  --relay <url>          relay base URL, e.g. https://hmd-relay.therishabh16.workers.dev
-  --state <path>         sample state JSON to send (default: ${DEFAULT_STATE_RELATIVE_PATH},
-                          resolved from the repo root regardless of cwd)
-  --phone-pubkey <b64>   override the phone's X25519 public key instead of using
-                          the one the relay forwards in device_bound's payload
-                          (see relay/README.md's "fake-hmd.mjs" section)
-  --help, -h             print this message
+  --relay <url>               relay base URL, e.g. https://hmd-relay.therishabh16.workers.dev
+  --state <path>               sample state JSON to send (default: ${DEFAULT_STATE_RELATIVE_PATH},
+                               resolved from the repo root regardless of cwd)
+  --phone-pubkey <base64url>   override the phone's X25519 public key instead of using
+                               the one the relay forwards in device_bound's payload
+                               (see relay/README.md's "fake-hmd.mjs" section)
+  --help, -h                   print this message
 `;
 
 export function parseArgs(argv) {
@@ -130,10 +130,10 @@ export function buildAckPayload(ofSeq, ok, detail) {
  *  the frame's own payload (relay/src/session.ts's deliverToHmdStream).
  *  Returns null if neither is present -- the caller treats that as fatal. */
 export function resolvePhonePubkey(envelope, phonePubkeyArg) {
-  const overridePub = phonePubkeyArg ? base64Decode(phonePubkeyArg) : null;
+  const overridePub = phonePubkeyArg ? base64UrlDecode(phonePubkeyArg) : null;
   const payloadPub =
     envelope.payload && typeof envelope.payload.device_pubkey === 'string'
-      ? base64Decode(envelope.payload.device_pubkey)
+      ? base64UrlDecode(envelope.payload.device_pubkey)
       : null;
   return overridePub ?? payloadPub;
 }
@@ -299,7 +299,7 @@ async function main() {
           console.error(
             '[fake-hmd] device_bound has no phone pubkey: neither --phone-pubkey nor ' +
               "the frame's payload.device_pubkey was present. Pass --phone-pubkey " +
-              '<base64> to continue, or check that the phone client is sending ' +
+              '<base64url> to continue, or check that the phone client is sending ' +
               'device_pubkey on its claim (relay/src/session.ts handlePairingCodeClaim).'
           );
           await revoke();
