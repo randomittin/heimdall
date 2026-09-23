@@ -1165,12 +1165,102 @@ _keeper_pidfile() {
   printf '%s/%s__%s.pid' "$(_keeper_dir)" "$proj" "$sess"
 }
 # is a LIVE keeper recorded in $1? (pidfile present, numeric pid, process alive).
+# is a LIVE keeper recorded in $1? (pidfile present, numeric pid, process alive).
 _keeper_alive() {
   local pf="$1" pid
   [ -f "$pf" ] || return 1
   pid="$(cat "$pf" 2>/dev/null || true)"
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$pid" 2>/dev/null
+}
+
+# ── owner liveness (shared by the loop's own self-check AND keeper-gc's external sweep) ──
+# See the "DURABLE PRESENCE KEEPER" header above for the evidence choice + rejected
+# alternatives. Kept as small self-contained functions (NOT sourced from
+# bin/lib/session-liveness.sh) so this keeper never couples to a lib two other owned tools
+# (heimdall-agents, heimdall-conformance) depend on — only the HMD_KEEPER_ORPHAN_SECS /
+# HMD_KEEPER_PROJECTS_DIR naming MIRRORS that lib's HMD_AGENT_* convention for consistency;
+# nothing is shared at runtime. HMD_NOW is reused as-is (already a generic, tool-agnostic
+# "now" override used elsewhere in this repo, not something owned by that lib).
+_keeper_orphan_secs() {
+  local s="${HMD_KEEPER_ORPHAN_SECS:-}"
+  case "$s" in ''|*[!0-9]*) s=900 ;; esac
+  printf '%s' "$s"
+}
+_keeper_projects_dir() { printf '%s' "${HMD_KEEPER_PROJECTS_DIR:-${HOME:-}/.claude/projects}"; }
+_keeper_now() {
+  local n="${HMD_NOW:-}"
+  case "$n" in ''|*[!0-9]*) date +%s 2>/dev/null || echo 0 ;; *) printf '%s' "$n" ;; esac
+}
+# newest transcript for a plain top-level-session owner, globbed across every project slug:
+# presence's own $PROJECT (baked into the pidfile name) is a DIFFERENT namespace than the
+# Claude Code project slug derived from cwd, so this never tries to resolve one.
+_keeper_session_transcript() {
+  local sess="$1" pd t best="" best_mt=-1 mt
+  [ -n "$sess" ] || return 0
+  pd="$(_keeper_projects_dir)"
+  for t in "$pd"/*/"$sess.jsonl"; do
+    [ -f "$t" ] || continue
+    mt="$(_stamp_mtime "$t" 2>/dev/null)"
+    case "$mt" in ''|*[!0-9]*) continue ;; esac
+    [ "$mt" -gt "$best_mt" ] && { best_mt="$mt"; best="$t"; }
+  done
+  printf '%s' "$best"
+}
+# newest transcript for a subagent owner "agent-<hexid>", scoped to the ONE session dir the
+# pidfile names (the pidfile's session component IS the parent session's directory name, so
+# only the slug needs wildcarding).
+_keeper_subagent_transcript() {
+  local owner="$1" sess="$2" pd id t best="" best_mt=-1 mt
+  [ -n "$owner" ] && [ -n "$sess" ] || return 0
+  id="${owner#agent-}"
+  [ -n "$id" ] && [ "$id" != "$owner" ] || return 0
+  pd="$(_keeper_projects_dir)"
+  for t in "$pd"/*/"$sess"/subagents/"agent-$id.jsonl"; do
+    [ -f "$t" ] || continue
+    mt="$(_stamp_mtime "$t" 2>/dev/null)"
+    case "$mt" in ''|*[!0-9]*) continue ;; esac
+    [ "$mt" -gt "$best_mt" ] && { best_mt="$mt"; best="$t"; }
+  done
+  printf '%s' "$best"
+}
+# _keeper_owner_alive <owner> <session>  -> 0 alive-or-unknown, 1 provably gone. <owner> is
+# "agent-<hexid>" for a subagent keeper, else a plain (slugified) project id — see
+# _keeper_pidfile. FAILS OPEN: no session key, no transcript found, or an unreadable mtime
+# all count as alive (a false-dead drops a real dev off the wall; a false-alive costs one
+# more cheap 20s beat — see the header for why the asymmetry is deliberate).
+_keeper_owner_alive() {
+  local owner="$1" sess="$2" t mt now
+  [ -n "$sess" ] || return 0
+  case "$owner" in
+    agent-*) t="$(_keeper_subagent_transcript "$owner" "$sess")" ;;
+    *)       t="$(_keeper_session_transcript "$sess")" ;;
+  esac
+  [ -n "$t" ] || return 0
+  mt="$(_stamp_mtime "$t" 2>/dev/null)"
+  case "$mt" in ''|*[!0-9]*) return 0 ;; esac
+  now="$(_keeper_now)"
+  [ "$((now - mt))" -lt "$(_keeper_orphan_secs)" ]
+}
+
+# ── *.pid.tmp.* leftover reaper (mirrors _reap_roster_cache_tmps' age-guard idiom) ────────
+# A loop killed between its `printf > pidfile.tmp.$$` claim and the `mv -f` that follows
+# (see _keeper_loop below) leaves <owner>__<session>.pid.tmp.<pid> behind forever — nothing
+# else globs for it. AGE-ONLY, no pid-liveness secondary check: at a 1h threshold (3600x the
+# millisecond-scale claim-to-rename window) nothing legitimate can still be "in flight".
+# FAILS OPEN: this is housekeeping, never correctness.
+_KEEPER_TMP_ORPHAN_AGE_S=3600
+_keeper_reap_tmp_leftovers() {
+  local dir="${1:-$(_keeper_dir)}" f mtime now
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  now="$(_keeper_now)"
+  for f in "$dir"/*.pid.tmp.*; do
+    [ -f "$f" ] || continue
+    mtime="$(_stamp_mtime "$f" 2>/dev/null)"
+    case "$mtime" in ''|*[!0-9]*) continue ;; esac
+    [ "$((now - mtime))" -gt "$_KEEPER_TMP_ORPHAN_AGE_S" ] && rm -f "$f" 2>/dev/null
+  done
+  return 0
 }
 
 # The loop itself. Claims the pidfile with its OWN pid, then beats every INTERVAL until it is
@@ -1183,13 +1273,19 @@ _keeper_loop() {
   local beat_bin="${HMD_KEEPER_BEAT_BIN:-$SELF}"      # test seam: inject a recording beat stub.
   local max_cycles="${HMD_KEEPER_MAX_CYCLES:-0}"      # 0 = unbounded (a positive N = test seam).
   local max_seconds="${HMD_KEEPER_MAX_SECONDS:-86400}" # 24h orphan backstop (0 = unbounded).
-  local start_ts now cycles=0 swait=""
+  local start_ts now cycles=0 swait="" owner sess kbase
   start_ts="$(date +%s 2>/dev/null || echo 0)"
   mkdir -p "$(dirname "$pidfile")" 2>/dev/null || true
   # claim ownership atomically (last writer wins; the loser sees the mismatch + exits below).
   printf '%s\n' "$$" > "$pidfile.tmp.$$" 2>/dev/null && mv -f "$pidfile.tmp.$$" "$pidfile" 2>/dev/null
   # shellcheck disable=SC2064 — expand $pidfile/$swait/$$ at trap-fire time, not define time.
   trap 'rm -f "$pidfile.tmp.$$" 2>/dev/null; [ -n "$swait" ] && kill "$swait" 2>/dev/null; [ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile" 2>/dev/null; exit 0' TERM INT
+  # owner identity, parsed ONCE from the pidfile's OWN name (see _keeper_owner_alive's header
+  # comment above for why: no other evidence survives the detach — a respawned keeper-loop
+  # process receives only --pidfile/--interval, confirmed via `ps`). Split on the LAST "__" so
+  # a subagent hex id or project id can never itself collide with the separator.
+  kbase="$(basename "$pidfile" 2>/dev/null)"; kbase="${kbase%.pid}"
+  sess="${kbase##*__}"; owner="${kbase%__*}"
   while :; do
     "$beat_bin" beat >/dev/null 2>&1 || true          # REUSE beat (its consent gate applies).
     # Refresh the statusline's ledger status.json on the SAME beat cadence (HMD Statusline
@@ -1220,6 +1316,15 @@ _keeper_loop() {
     # soft-stop / stale-pid guard: if the pidfile no longer names us, a stop (rm) or a newer
     # keeper claimed it -> exit so there is ever only ONE live keeper per session.
     [ "$(cat "$pidfile" 2>/dev/null || true)" = "$$" ] || break
+    # ORPHAN guard: the owner (session or subagent) this loop beats FOR is provably gone (see
+    # _keeper_owner_alive above) -> stop beating for nobody NOW instead of waiting up to
+    # max_seconds (24h) for the wallclock backstop below. Fires ONE best-effort retire beat
+    # first (the existing off/sever protocol primitive — never a new one) so the dev drops off
+    # teammates' walls promptly instead of waiting out the TTL.
+    if ! _keeper_owner_alive "$owner" "$sess"; then
+      _try_retire
+      break
+    fi
     now="$(date +%s 2>/dev/null || echo 0)"           # wallclock backstop against an orphan.
     [ "$max_seconds" != "0" ] && [ "$((now - start_ts))" -ge "$max_seconds" ] && break
     sleep "$interval" & swait=$!; wait "$swait" 2>/dev/null; swait=""
