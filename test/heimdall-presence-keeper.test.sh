@@ -29,6 +29,14 @@
 #      pidfile, no process) — consent is honored, mirroring the off beat gate.
 #   D. DOUBLE-START → SINGLE keeper: a second keeper-start for the same session does NOT spawn a
 #      second loop — the pid is unchanged (idempotent; never leaks a duplicate loop).
+#   F. OWNER LIVENESS self-exit: a STALE owner transcript (provably-gone session/subagent) makes
+#      keeper-loop exit within ONE interval instead of waiting out the 24h backstop; a FRESH
+#      transcript never triggers a false self-exit (the loop keeps running).
+#   G. KEEPER-GC external sweep: applying the identical owner-liveness rule from OUTSIDE, once,
+#      to every pidfile kills an orphan (owner gone) and leaves a live one (owner alive) untouched
+#      — the backstop for keepers spawned before the in-loop self-exit shipped.
+#   H. *.pid.tmp.* LEFTOVERS: an interrupted claim-then-rename leftover older than 1h is swept on
+#      keeper-start; a fresh one is kept (nothing legitimate is still "in flight" at 1h).
 #
 # Exit 0 = every proof holds.
 
@@ -372,10 +380,101 @@ else
 fi
 "$BIN" keeper-stop --session E3 --project "$PROJECT" >/dev/null 2>&1
 case "$DOC_PID_E3" in ''|*[!0-9]*) : ;; *) kill "$DOC_PID_E3" 2>/dev/null || true ;; esac
-"$PY" -c "import time;time.sleep(1.2)"   # let the bounded doctor (MAX_CYCLES=1s) finish naturally too
 rm -rf "$E3_HOME"; E3_HOME=""
 
+# ══════════════════════════════════════════════════════════════════════════════
+# F. OWNER LIVENESS SELF-EXIT — keeper-loop checks whether the session/subagent it
+#    beats FOR is still alive (its own transcript mtime vs HMD_KEEPER_ORPHAN_SECS,
+#    default 900s). A STALE transcript (owner provably gone) makes the loop exit
+#    within ONE interval instead of waiting out the 24h wallclock backstop; a FRESH
+#    transcript never triggers a false self-exit. HMD_KEEPER_PROJECTS_DIR points the
+#    lookup at a throwaway fixture tree (never ~/.claude/projects in tests).
+# ══════════════════════════════════════════════════════════════════════════════
 echo
+echo "F. owner-liveness self-exit: STALE owner transcript exits within one interval; FRESH keeps running"
+PROJ_FIX="$TMP/projects/proj1"
+mkdir -p "$PROJ_FIX"
+
+: > "$COUNTER"
+touch -t 202001010000 "$PROJ_FIX/F1.jsonl"      # decades stale -> provably-gone owner
+HMD_KEEPER_PROJECTS_DIR="$TMP/projects" HMD_KEEPER_MAX_CYCLES=5 \
+  "$BIN" keeper-loop --pidfile "$HEIMDALL_KEEPER_DIR/acme_widget__F1.pid" --interval 0 >/dev/null 2>&1
+F1_BEATS="$(wc -l < "$COUNTER" | tr -d ' ')"
+if [ "$F1_BEATS" = "1" ]; then
+  ok "F1 STALE owner transcript: loop self-exited after exactly 1 beat (of a 5-cycle cap) — within one interval"
+else
+  bad "F1 loop did not self-exit on a stale owner transcript (beats=$F1_BEATS, expected 1 of 5 — hit the cap instead) — RED"
+fi
+[ -f "$HEIMDALL_KEEPER_DIR/acme_widget__F1.pid" ] \
+  && bad "F2 orphaned pidfile was NOT reaped on self-exit" \
+  || ok "F2 orphaned pidfile self-reaped on exit (no leak)"
+
+: > "$COUNTER"
+touch "$PROJ_FIX/Ffresh.jsonl"                   # mtime "now" -> owner clearly alive
+HMD_KEEPER_PROJECTS_DIR="$TMP/projects" HMD_KEEPER_MAX_CYCLES=3 \
+  "$BIN" keeper-loop --pidfile "$HEIMDALL_KEEPER_DIR/acme_widget__Ffresh.pid" --interval 0 >/dev/null 2>&1
+F3_BEATS="$(wc -l < "$COUNTER" | tr -d ' ')"
+[ "$F3_BEATS" = "3" ] \
+  && ok "F3 FRESH owner transcript: loop ran the full 3-cycle cap (no false self-exit)" \
+  || bad "F3 loop exited early despite a FRESH owner transcript (beats=$F3_BEATS, expected 3) — false-positive, RED"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# G. KEEPER-GC — the identical owner-liveness rule applied ONCE, from OUTSIDE, to
+#    every pidfile: the backstop for keeper loops already running before this
+#    self-exit shipped (an in-flight loop executes the old script text already
+#    loaded into its process image and can never pick up the in-loop check without
+#    being restarted). Uses REAL processes (kill -0/kill are not test-seamed inside
+#    _keeper_gc — it is meant to run against real keepers) that this test starts
+#    and owns; never touches a keeper whose owner transcript is fresh.
+# ══════════════════════════════════════════════════════════════════════════════
+echo
+echo "G. keeper-gc: external sweep kills an orphan (owner gone), leaves a live one (owner alive) untouched"
+sleep 300 & G_ORPHAN_PID=$!
+sleep 300 & G_LIVE_PID=$!
+printf '%s\n' "$G_ORPHAN_PID" > "$HEIMDALL_KEEPER_DIR/acme_widget__Gorphan.pid"
+printf '%s\n' "$G_LIVE_PID"   > "$HEIMDALL_KEEPER_DIR/acme_widget__Glive.pid"
+touch -t 202001010000 "$PROJ_FIX/Gorphan.jsonl"  # stale -> provably gone
+touch                  "$PROJ_FIX/Glive.jsonl"    # fresh -> alive
+HMD_KEEPER_PROJECTS_DIR="$TMP/projects" "$BIN" keeper-gc >/dev/null 2>&1
+"$PY" -c "import time;time.sleep(0.4)"   # let the TERM/KILL land
+if ! kill -0 "$G_ORPHAN_PID" 2>/dev/null && [ ! -f "$HEIMDALL_KEEPER_DIR/acme_widget__Gorphan.pid" ]; then
+  ok "G1 keeper-gc reaped the orphan (owner gone: pid $G_ORPHAN_PID killed, pidfile removed)"
+else
+  bad "G1 keeper-gc did not reap the orphan (RED)"
+fi
+if kill -0 "$G_LIVE_PID" 2>/dev/null && [ -f "$HEIMDALL_KEEPER_DIR/acme_widget__Glive.pid" ]; then
+  ok "G2 keeper-gc left the LIVE keeper untouched (pid $G_LIVE_PID still alive, pidfile intact)"
+else
+  bad "G2 FALSIFIER — keeper-gc touched a keeper whose owner is still alive"
+fi
+kill "$G_LIVE_PID" 2>/dev/null || true
+kill "$G_ORPHAN_PID" 2>/dev/null || true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# H. *.pid.tmp.* LEFTOVERS — an interrupted claim-then-rename (see _keeper_loop's
+#    printf > pidfile.tmp.$$ + mv -f) can leave <owner>__<session>.pid.tmp.<pid>
+#    behind forever; keeper-start sweeps any such leftover older than 1h, and never
+#    touches a fresh one (nothing legitimate is still "in flight" at 1h).
+# ══════════════════════════════════════════════════════════════════════════════
+echo
+echo "H. *.pid.tmp.* leftovers: swept on keeper-start when older than 1h, kept when fresh"
+OLD_TMP="$HEIMDALL_KEEPER_DIR/acme_widget__Hold.pid.tmp.99999"
+FRESH_TMP="$HEIMDALL_KEEPER_DIR/acme_widget__Hfresh.pid.tmp.99998"
+: > "$OLD_TMP"; touch -t 202001010000 "$OLD_TMP"
+: > "$FRESH_TMP"
+"$BIN" keeper-start --session H --project "$PROJECT" --interval 5 >/dev/null 2>&1
+"$PY" -c "import time;time.sleep(0.3)"
+[ -f "$OLD_TMP" ] \
+  && bad "H1 stale *.pid.tmp.* leftover (>1h) survived keeper-start — leak" \
+  || ok "H1 stale *.pid.tmp.* leftover (>1h) swept on keeper-start"
+[ -f "$FRESH_TMP" ] \
+  && ok "H2 fresh *.pid.tmp.* leftover KEPT (below the 1h age guard)" \
+  || bad "H2 FALSIFIER — a fresh tmp leftover was reaped (age guard too aggressive)"
+"$BIN" keeper-stop --session H --project "$PROJECT" >/dev/null 2>&1
+rm -f "$OLD_TMP" "$FRESH_TMP" 2>/dev/null
+
+echo
+echo "============================================================"
 echo "============================================================"
 printf "heimdall-presence-keeper: %d passed, %d failed\n" "$PASS" "$FAIL"
 echo "============================================================"

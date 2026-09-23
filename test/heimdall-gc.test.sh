@@ -67,6 +67,13 @@ export HMD_GC_TMP_ROOTS="$TMPR"
 # small cap so an oversize log is easy to build.
 export HMD_GC_LOG_MAX_BYTES=50
 
+# gc_keeper_orphans (P step) delegates to the REAL heimdall-presence keeper-gc, which
+# checks owner liveness against ~/.claude/projects transcripts — fake HOME so that
+# lookup never touches the real dev machine's transcripts (hermetic; matches the
+# fake-pid P/L fixtures below, which fail open here since no transcript exists at all).
+export HOME="$WORK/fakehome"
+mkdir -p "$HOME"
+
 # ── keeper pidfiles: one dead, one live ─────────────────────────────────────────
 DEAD_PID=4000001         # NOT alive (absent from HMD_GC_LIVE_PIDS)
 LIVE_PID=4000002         # alive + a genuine heimdall keeper
