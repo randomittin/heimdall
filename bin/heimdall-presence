@@ -1451,6 +1451,39 @@ _keeper_stop() {
   return 0
 }
 
+# keeper-gc: apply the SAME owner-liveness rule as the loop's own self-check, ONCE, to every
+# pidfile in the keeper dir — the external backstop for keepers that predate this fix (an
+# already-running loop is executing the OLD script text already loaded into its process
+# image; it can never pick up the new self-check without being restarted) or that somehow
+# missed their own exit. Also reaps *.pid.tmp.* leftovers (see _keeper_reap_tmp_leftovers).
+# FAIL-OPEN + SILENT ON SUCCESS: this is housekeeping, never correctness, and must never spam
+# a normal, all-live run — heimdall-gc's `run` delegates here (never re-implementing this rule
+# itself) and forwards any output through its own `_report`, so this stays to AT MOST one
+# summary line.
+_keeper_gc() {
+  local dir pf pid base owner sess killed=0 i
+  dir="$(_keeper_dir)"
+  _keeper_reap_tmp_leftovers "$dir"
+  [ -d "$dir" ] || return 0
+  for pf in "$dir"/*.pid; do
+    [ -f "$pf" ] || continue
+    pid="$(cat "$pf" 2>/dev/null | tr -d '[:space:]')"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac      # corrupt — heimdall-gc's own pass handles it
+    kill -0 "$pid" 2>/dev/null || continue            # already dead — heimdall-gc's own pass handles it
+    base="$(basename "$pf" 2>/dev/null)"; base="${base%.pid}"
+    sess="${base##*__}"; owner="${base%__*}"
+    _keeper_owner_alive "$owner" "$sess" && continue  # owner alive (or unknown) — NEVER touch
+    kill "$pid" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do i=$((i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    [ "$(cat "$pf" 2>/dev/null)" = "$pid" ] && rm -f "$pf" 2>/dev/null || true
+    killed=$((killed + 1))
+  done
+  [ "$killed" -gt 0 ] && printf 'presence keeper-gc: reaped %d orphaned keeper(s) (owner session/subagent gone)\n' "$killed"
+  return 0
+}
+
 case "$SUB" in
   beat)
     # Effectively-on here (the OFF guard above already no-op'd an off beat). Honor the
@@ -1476,6 +1509,7 @@ case "$SUB" in
     _resolve_activity_ts; printf '\n' ;;
   keeper-start) _keeper_start ;;
   keeper-stop)  _keeper_stop ;;
+  keeper-gc)    _keeper_gc ;;   # external sweep: same owner-liveness rule, applied once, to every pidfile.
   keeper-loop)  # INTERNAL: run one keeper loop in-process. Used by keeper-start's detached
                 # spawn and by the falsifier test to drive N deterministic cycles.
     _keeper_loop "$(_keeper_pidfile)" "${INTERVAL:-${HMD_KEEPER_INTERVAL:-20}}" ;;
@@ -1667,6 +1701,9 @@ heimdall-presence — server-synced team presence (with consent opt-out)
                                       the wall. Idempotent + consent-gated + silent-safe.
   heimdall-presence keeper-stop  [--session ID]
                                       kill this session's keeper + reap its pidfile (no leak)
+  heimdall-presence keeper-gc         sweep every keeper pidfile and kill any whose owner
+                                      session/subagent is provably gone (external backstop;
+                                      fail-open + silent on success; heimdall-gc run calls this)
   heimdall-presence doctor            SELF-HEAL: diagnose+remediate+verify autoenroll once
   heimdall-presence doctor --bg       detached background self-heal loop (keeper-start runs it)
   heimdall-presence doctor --status   print the self-heal doctor's last diagnosis
@@ -1716,5 +1753,5 @@ dev exports NOTHING. Overrides still win:
 Offline/unconfigured degrades cleanly (empty roster, no-op beat, exit 0).
 USAGE
     ;;
-  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: connect | sever | cp-status | beat | roster | on | off | status | retire | activity | doctor | keeper-start | keeper-stop)" >&2; exit 2 ;;
+  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: connect | sever | cp-status | beat | roster | on | off | status | retire | activity | doctor | keeper-start | keeper-stop | keeper-gc)" >&2; exit 2 ;;
 esac
