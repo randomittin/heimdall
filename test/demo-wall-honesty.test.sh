@@ -100,6 +100,20 @@ stamp_of() { stat -f '%N %m %z' "$1" 2>/dev/null || stat -c '%n %Y %s' "$1" 2>/d
 #     sampled every 2s with nothing else running, ticks every sample) even
 #     though the connection never writes a row. The main .db file's content
 #     is untouched by this reader — only the two WAL side-files move.
+#   - hooks/heimdall-429-detect.sh's trace_emit() appends one bounded JSONL
+#     line to ~/.heimdall/429-detect-trace.jsonl on EVERY Stop/SubagentStop
+#     hook firing. The path defaults to $HOME/.heimdall regardless of which
+#     repo/worktree fired the hook (--repo/CLAUDE_PROJECT_DIR only gates
+#     whether the hook runs at all, never where it writes), so it is a single
+#     machine-wide file, never scoped to this repo, this worktree, or this
+#     seeder — and it is DEFAULT ON (that file's own header explains why;
+#     HMD_429_DETECT_TRACE=0 disables it). Caught live: a 15-25-way
+#     concurrent `test/run-all.sh` sweep failed C3 with the seeder's dry-run
+#     producing zero writes of its own — some unrelated concurrent session's
+#     subagent stopped mid-snapshot-window and appended a line. Rotates in
+#     place past HMD_429_DETECT_TRACE_MAX_BYTES (default 256KiB) via
+#     tail+rename to "$file".trim.$$, same tmp+rename shape as the writers
+#     above.
 # A tmp+rename INSIDE a directory bumps that directory's OWN mtime too (not
 # just the file's) — so a bare `ls -lTd ~/.heimdall` before/after false-
 # positived on all of these, none of which have anything to do with the seeder
@@ -129,6 +143,7 @@ home_heimdall_snapshot() {
   local ctx="$HOME/.heimdall/ctx"
   local smshm="$HOME/.heimdall/shared-memory.db-shm"
   local smwal="$HOME/.heimdall/shared-memory.db-wal"
+  local tr429="$HOME/.heimdall/429-detect-trace.jsonl"
   find "$HOME/.heimdall" -mindepth 1 2>/dev/null | sort | while IFS= read -r f; do
     case "$f" in
       "$rl"|"$rl".*.tmp) continue ;;  # statusline rate-limit persister
@@ -138,6 +153,7 @@ home_heimdall_snapshot() {
                                              # dynamic per-repo filename, like ctx/ below)
       "$ctx"|"$ctx"/*) continue ;;    # per-session ctx-meter hook writes
       "$smshm"|"$smwal") continue ;;  # statusline swarm_shared()'s read-only WAL reader lock
+      "$tr429"|"$tr429".trim.*) continue ;;  # heimdall-429-detect.sh trace_emit() (Stop/SubagentStop, machine-wide)
     esac
     stamp_of "$f"
   done
