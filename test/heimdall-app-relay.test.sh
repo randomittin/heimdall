@@ -137,6 +137,101 @@ wait_pid_exit() {
   return 1
 }
 
+# of_seq/ok/id/detail live INSIDE the sealed payload, never as plaintext keys
+# in the envelope JSON that lands in frames.ndjson (that line only ever has
+# the 8 fixed envelope keys -- v/session_id/seq/sender/type/nonce/ciphertext/
+# payload -- see bin/heimdall-relay-client's send_frame_envelope()). So an ack
+# for a given device seq can only be found by decrypting each sender=hmd
+# envelope and checking its plaintext of_seq -- never by grepping the raw
+# ciphertext line. Polls FILE up to SECS seconds; on match prints the
+# decrypted plaintext object as one JSON line on stdout and returns 0;
+# returns 1 on timeout with nothing printed.
+wait_for_ack_of_seq() {
+  local file="$1" key_b64="$2" want="$3" secs="${4:-10}"
+  python3 - "$file" "$key_b64" "$want" "$secs" "$E2E_MOD" <<'PYEOF'
+import sys, json, time, base64
+from importlib.util import spec_from_file_location, module_from_spec
+
+file_path, key_b64, want_s, secs_s, e2e_path = sys.argv[1:6]
+want = int(want_s)
+deadline = time.time() + float(secs_s)
+
+spec = spec_from_file_location("hmd_relay_e2e", e2e_path)
+e2e = module_from_spec(spec)
+spec.loader.exec_module(e2e)
+key = base64.b64decode(key_b64)
+
+while True:
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            env = json.loads(line)
+        except ValueError:
+            continue
+        if env.get("sender") != "hmd":
+            continue
+        try:
+            plaintext = e2e.open_(key, env["seq"], "hmd", env.get("nonce"), env.get("ciphertext"))
+            obj = json.loads(plaintext.decode("utf-8"))
+        except Exception:
+            continue
+        if obj.get("of_seq") == want:
+            sys.stdout.write(json.dumps(obj) + "\n")
+            sys.exit(0)
+    if time.time() >= deadline:
+        sys.exit(1)
+    time.sleep(0.1)
+PYEOF
+}
+
+# Polls FILE (an NDJSON event stream) up to SECS seconds for a line that
+# parses as JSON with event==WANT_EVENT and (DETAIL_SUBSTR empty, or
+# DETAIL_SUBSTR found in that object's "detail" string) -- never an ordered
+# regex like '"event":"error".*non-increasing seq', since emit() writes keys
+# sort_keys=True (alphabetical), so field order in the line is NOT the order
+# fields were set in code (e.g. {"detail": ..., "event": "error"}, "detail"
+# first because 'd' < 'e' -- an ordered regex expecting "event" before the
+# detail text would never match). No eval/exec: only literal json.loads and
+# a plain substring test, both over data this process itself wrote.
+wait_for_event() {
+  local file="$1" want_event="$2" detail_substr="$3" secs="${4:-10}"
+  python3 - "$file" "$want_event" "$detail_substr" "$secs" <<'PYEOF'
+import sys, json, time
+
+file_path, want_event, detail_substr, secs_s = sys.argv[1:5]
+deadline = time.time() + float(secs_s)
+while True:
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("event") != want_event:
+            continue
+        if detail_substr and detail_substr not in (o.get("detail") or ""):
+            continue
+        sys.exit(0)
+    if time.time() >= deadline:
+        sys.exit(1)
+    time.sleep(0.1)
+PYEOF
+}
+
 # ── 1. syntax / static shape (claims 9-12, 14) ──────────────────────────────
 if [ -x "$RELAY_CLIENT" ]; then
   ok "test -x bin/heimdall-relay-client"
@@ -419,19 +514,14 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
     bad "INV-23: inbox record shape mismatch ($RECORD_KEYS)"
   fi
 
-  if wait_for_count "$LOG_A/frames.ndjson" 1 '"of_seq":1' 10; then
+  ACK1_JSON="$(wait_for_ack_of_seq "$LOG_A/frames.ndjson" "$SESSION_KEY_A" 1 10)"
+  if [ -n "$ACK1_JSON" ]; then
     ok "scenario A: ack for seq=1 appeared in frames.ndjson"
   else
     bad "scenario A: no ack for seq=1 ever appeared"
   fi
-  ACK1_ENV="$(grep '"of_seq":1' "$LOG_A/frames.ndjson" 2>/dev/null | tail -1)"
-  ACK1_SEQ="$(printf '%s' "$ACK1_ENV" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["seq"])')"
-  ACK1_NONCE="$(printf '%s' "$ACK1_ENV" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["nonce"])')"
-  ACK1_CT="$(printf '%s' "$ACK1_ENV" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["ciphertext"])')"
-  ACK1_OPEN="$(python3 "$FAKE_RELAY" device open --key-b64 "$SESSION_KEY_A" --seq "$ACK1_SEQ" --sender hmd \
-    --nonce-b64 "$ACK1_NONCE" --ciphertext-b64 "$ACK1_CT" 2>/dev/null)"
-  ACK1_OK="$(printf '%s' "$ACK1_OPEN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["plaintext_json"].get("ok"))' 2>/dev/null)"
-  ACK1_ID="$(printf '%s' "$ACK1_OPEN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["plaintext_json"].get("id",""))' 2>/dev/null)"
+  ACK1_OK="$(printf '%s' "$ACK1_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null)"
+  ACK1_ID="$(printf '%s' "$ACK1_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)"
   if [ "$ACK1_OK" = "True" ] && [ -n "$ACK1_ID" ]; then
     ok "INV-23: sealed ack decrypts to {ok:true, id:<uuid>} ($ACK1_ID)"
   else
@@ -444,7 +534,7 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   INBOX_COUNT_BEFORE="$(grep '"hello from claim4"' "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
   python3 "$FAKE_RELAY" device envelope --session-id "$SID_A" --seq 1 --sender device \
     --type command --nonce "$NONCE1" --ciphertext "$CT1" > "$CTL_A/003.json"
-  if wait_for "$CLIENT_A_OUT" '"event":"error".*non-increasing seq' 6; then
+  if wait_for_event "$CLIENT_A_OUT" "error" "non-increasing seq" 6; then
     ok "INV-15: replayed device seq=1 produced a non-increasing-seq error"
   else
     bad "INV-15: replayed device seq=1 was not rejected with an error event"
@@ -472,19 +562,14 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   python3 "$FAKE_RELAY" device envelope --session-id "$SID_A" --seq 2 --sender device \
     --type command --nonce "$NONCE2" --ciphertext "$CT2" > "$CTL_A/004.json"
 
-  if wait_for_count "$LOG_A/frames.ndjson" 1 '"of_seq":2' 10; then
+  ACK2_JSON="$(wait_for_ack_of_seq "$LOG_A/frames.ndjson" "$SESSION_KEY_A" 2 10)"
+  if [ -n "$ACK2_JSON" ]; then
     ok "scenario A: ack for seq=2 (too-long) appeared in frames.ndjson"
   else
     bad "scenario A: no ack for seq=2 ever appeared"
   fi
-  ACK2_ENV="$(grep '"of_seq":2' "$LOG_A/frames.ndjson" 2>/dev/null | tail -1)"
-  ACK2_SEQ="$(printf '%s' "$ACK2_ENV" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["seq"])')"
-  ACK2_NONCE="$(printf '%s' "$ACK2_ENV" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["nonce"])')"
-  ACK2_CT="$(printf '%s' "$ACK2_ENV" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["ciphertext"])')"
-  ACK2_OPEN="$(python3 "$FAKE_RELAY" device open --key-b64 "$SESSION_KEY_A" --seq "$ACK2_SEQ" --sender hmd \
-    --nonce-b64 "$ACK2_NONCE" --ciphertext-b64 "$ACK2_CT" 2>/dev/null)"
-  ACK2_OK="$(printf '%s' "$ACK2_OPEN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["plaintext_json"].get("ok"))' 2>/dev/null)"
-  ACK2_DETAIL="$(printf '%s' "$ACK2_OPEN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["plaintext_json"].get("detail"))' 2>/dev/null)"
+  ACK2_OK="$(printf '%s' "$ACK2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null)"
+  ACK2_DETAIL="$(printf '%s' "$ACK2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("detail"))' 2>/dev/null)"
   if [ "$ACK2_OK" = "False" ] && [ "$ACK2_DETAIL" = "too-long" ]; then
     ok "INV-23: too-long send-message acked {ok:false, detail:too-long}"
   else
