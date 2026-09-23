@@ -16,11 +16,19 @@
 #
 # bin/lib/hmd_relay_e2e.py (the E2E crypto module bin/heimdall-relay-client and
 # this suite's own `fake-relay.py device` subcommands both import BY PATH) is
-# being built by a sibling task and may not exist yet on this branch. Claims
-# 3, 4 and 9/10 (the two that need `device seal/open/derive` and the
-# e2e_available grep) are SKIPPED, loudly and counted, when the module is
-# absent -- never silently passed. Claims 1, 2, 5, 6, 7, 8, 11-14 do not need
-# it and always run.
+# being built by a sibling task and may not exist yet on this branch.
+# bin/heimdall-relay-client's own main() gates e2e_available() BEFORE
+# pair_init, so EVERY claim that starts a real relay-client process needs
+# something at that path answering e2e_available()==True. When the real
+# module is absent this suite falls back to a minimal local stub (see
+# "RELAY_CLIENT_RUN" below) that only ever provides generate_keypair/pub_b64
+# -- enough to get claims 1, 5, 6 and 7 running for real (none of them reach
+# the Wave-1 hello handshake). Claims 2, 3 and 4 (state-dedup, seq/replay,
+# send-message round-trip) DO reach that handshake (seal/open/
+# derive_session_key) and are SKIPPED, loudly and counted, whenever the real
+# module is absent -- never faked. The e2e_available grep acceptance line is
+# skipped the same way. Claim 8 always runs regardless (it deliberately
+# forces e2e_available()==False itself, real module or not).
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -108,7 +116,7 @@ wait_for_count() {
   local file="$1" n="$2" re="${3:-.}" secs="${4:-10}" i=0 max c
   max=$(( secs * 10 ))
   while [ "$i" -lt "$max" ]; do
-    c="$(grep -Ec "$re" "$file" 2>/dev/null || echo 0)"
+    c="$(grep -E "$re" "$file" 2>/dev/null | wc -l | tr -d ' ')"
     [ "$c" -ge "$n" ] && return 0
     sleep 0.1; i=$((i + 1))
   done
@@ -116,7 +124,7 @@ wait_for_count() {
 }
 
 count_matching() {
-  grep -Ec "$2" "$1" 2>/dev/null || echo 0
+  grep -E "$2" "$1" 2>/dev/null | wc -l | tr -d ' '
 }
 
 wait_pid_exit() {
@@ -194,6 +202,54 @@ else
   bad "bin/heimdall-relay-client BACKOFF_CAP_MS constant not found as 30000"
 fi
 
+# bin/heimdall-relay-client's own main() gates e2e_available() BEFORE
+# pair_init -- so even claims that never touch real crypto (1, 5, 6, 7, all
+# below the Wave-1 hello handshake) still need SOME module at
+# bin/lib/hmd_relay_e2e.py answering e2e_available()==True just to get the
+# process past that gate. When the real module is present it is used
+# as-is, unshadowed. When it is absent, a full copy of bin/ + sentinels/ is
+# made with ONLY hmd_relay_e2e.py swapped for a minimal stub that provides
+# e2e_available/generate_keypair/pub_b64 (the only calls made before a real
+# hello handshake) and nothing else -- claims 2/3/4, which DO reach the hello
+# handshake (seal/open/derive_session_key), stay gated on $E2E_PRESENT and
+# are skipped, loudly, whenever this stub is in play.
+if [ "$E2E_PRESENT" = true ]; then
+  RELAY_CLIENT_RUN="$RELAY_CLIENT"
+else
+  MINSTUB_LIB="$TMPROOT/stub-min-e2e"
+  mkdir -p "$MINSTUB_LIB"
+  cat > "$MINSTUB_LIB/hmd_relay_e2e.py" <<'MINSTUB_EOF'
+"""Minimal e2e_available()==True stand-in used ONLY when the real
+bin/lib/hmd_relay_e2e.py has not landed on this branch yet, so claims 1, 5,
+6 and 7 (none of which reach the Wave-1 hello handshake -- generate_keypair
+and pub_b64 are the only calls bin/heimdall-relay-client makes before that
+point) can still run against a real, unmodified bin/heimdall-relay-client
+process instead of being skipped outright. seal/open/derive_session_key are
+deliberately absent: claims 2/3/4 (which DO need them, via the hello
+handshake) are skipped whenever this stub is in use -- never faked."""
+import base64
+import os
+
+
+def e2e_available():
+    return True
+
+
+def generate_keypair():
+    return os.urandom(32), os.urandom(32)
+
+
+def pub_b64(pub):
+    return base64.b64encode(pub).decode("ascii")
+MINSTUB_EOF
+  MINSTUB_ROOT="$TMPROOT/stub-min-e2e-root"
+  mkdir -p "$MINSTUB_ROOT"
+  cp -R "$REPO/bin" "$MINSTUB_ROOT/bin"
+  cp -R "$REPO/sentinels" "$MINSTUB_ROOT/sentinels"
+  cp "$MINSTUB_LIB/hmd_relay_e2e.py" "$MINSTUB_ROOT/bin/lib/hmd_relay_e2e.py"
+  RELAY_CLIENT_RUN="$MINSTUB_ROOT/bin/heimdall-relay-client"
+fi
+
 # ── Scenario A: claims 1, 2, 3, 4, 5 (single long-lived session) ───────────
 REPO_A="$(make_repo)"
 PORT_A_RELAY="$(free_port)"
@@ -211,7 +267,7 @@ done
 
 CLIENT_A_OUT="$TMPROOT/a.client.out"
 CLIENT_A_ERR="$TMPROOT/a.client.err"
-"$RELAY_CLIENT" --relay "http://127.0.0.1:$PORT_A_RELAY" --repo "$REPO_A" --ui-port "$PORT_A_UI" \
+"$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_A_RELAY" --repo "$REPO_A" --ui-port "$PORT_A_UI" \
   >"$CLIENT_A_OUT" 2>"$CLIENT_A_ERR" &
 CLIENT_A=$!
 PIDS+=("$CLIENT_A")
@@ -385,7 +441,7 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   # claim 3b (INV-15): replay of seq=1 (already seen) is rejected -- no
   # second inbox record, no new ack.
   FRAMES_BEFORE_REPLAY="$(wc -l < "$LOG_A/frames.ndjson" | tr -d ' ')"
-  INBOX_COUNT_BEFORE="$(grep -c '"hello from claim4"' "$INBOX_A" 2>/dev/null || echo 0)"
+  INBOX_COUNT_BEFORE="$(grep '"hello from claim4"' "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
   python3 "$FAKE_RELAY" device envelope --session-id "$SID_A" --seq 1 --sender device \
     --type command --nonce "$NONCE1" --ciphertext "$CT1" > "$CTL_A/003.json"
   if wait_for "$CLIENT_A_OUT" '"event":"error".*non-increasing seq' 6; then
@@ -394,7 +450,7 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
     bad "INV-15: replayed device seq=1 was not rejected with an error event"
   fi
   sleep 1
-  INBOX_COUNT_AFTER="$(grep -c '"hello from claim4"' "$INBOX_A" 2>/dev/null || echo 0)"
+  INBOX_COUNT_AFTER="$(grep '"hello from claim4"' "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
   FRAMES_AFTER_REPLAY="$(wc -l < "$LOG_A/frames.ndjson" | tr -d ' ')"
   if [ "$INBOX_COUNT_AFTER" -eq "$INBOX_COUNT_BEFORE" ]; then
     ok "INV-15: replay produced no second inbox record ($INBOX_COUNT_BEFORE == $INBOX_COUNT_AFTER)"
@@ -434,7 +490,7 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   else
     bad "INV-23: too-long send-message ack mismatch (ok=$ACK2_OK detail=$ACK2_DETAIL)"
   fi
-  TOOLONG_INBOX_COUNT="$(grep -c "$(printf '%s' "$LONG_TEXT" | head -c 40)" "$INBOX_A" 2>/dev/null || echo 0)"
+  TOOLONG_INBOX_COUNT="$(grep -F "$(printf '%s' "$LONG_TEXT" | head -c 40)" "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
   if [ "$TOOLONG_INBOX_COUNT" -eq 0 ]; then
     ok "INV-23: too-long send-message produced no inbox record"
   else
@@ -446,7 +502,7 @@ fi
 
 # claim 5 (INV-21): end-session -> client emits session_ended and exits 0;
 # no frame posted after.
-FRAMES_BEFORE_END="$(wc -l < "$LOG_A/frames.ndjson" 2>/dev/null | tr -d ' ')"
+FRAMES_BEFORE_END="$(cat "$LOG_A/frames.ndjson" 2>/dev/null | wc -l | tr -d ' ')"
 : > "$CTL_A/end-session"
 if wait_pid_exit "$CLIENT_A" 10; then
   wait "$CLIENT_A" 2>/dev/null
@@ -466,7 +522,7 @@ else
   bad "INV-21: relay-client never emitted session_ended"
 fi
 sleep 0.5
-FRAMES_AFTER_END="$(wc -l < "$LOG_A/frames.ndjson" 2>/dev/null | tr -d ' ')"
+FRAMES_AFTER_END="$(cat "$LOG_A/frames.ndjson" 2>/dev/null | wc -l | tr -d ' ')"
 if [ "${FRAMES_AFTER_END:-0}" -eq "${FRAMES_BEFORE_END:-0}" ]; then
   ok "INV-21: no frame posted after session_ended ($FRAMES_BEFORE_END == $FRAMES_AFTER_END)"
 else
@@ -493,7 +549,7 @@ done
 
 CLIENT_B_OUT="$TMPROOT/b.client.out"
 : > "$CTL_B/drop-stream"  # refuse the client's very first stream attempt
-"$RELAY_CLIENT" --relay "http://127.0.0.1:$PORT_B_RELAY" --repo "$REPO_B" --ui-port "$PORT_B_UI" \
+"$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_B_RELAY" --repo "$REPO_B" --ui-port "$PORT_B_UI" \
   >"$CLIENT_B_OUT" 2>"$TMPROOT/b.client.err" &
 CLIENT_B=$!
 PIDS+=("$CLIENT_B")
@@ -543,7 +599,7 @@ done
 
 CLIENT_C_OUT="$TMPROOT/c.client.out"
 : > "$CTL_C/rate-limit-next=3"  # rate-limit the client's very first stream attempt
-"$RELAY_CLIENT" --relay "http://127.0.0.1:$PORT_C_RELAY" --repo "$REPO_C" --ui-port "$PORT_C_UI" \
+"$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_C_RELAY" --repo "$REPO_C" --ui-port "$PORT_C_UI" \
   >"$CLIENT_C_OUT" 2>"$TMPROOT/c.client.err" &
 CLIENT_C=$!
 PIDS+=("$CLIENT_C")
@@ -613,12 +669,10 @@ cat > "$STUB_CLIENT" <<STUB2_EOF
 set -u
 STUBROOT="$TMPROOT/stub-relay-root"
 if [ ! -d "\$STUBROOT" ]; then
-  mkdir -p "\$STUBROOT/bin/lib" "\$STUBROOT/sentinels"
-  cp "$RELAY_CLIENT" "\$STUBROOT/bin/heimdall-relay-client"
-  cp "$REPO/bin/lib/companion_ui_inbox.py" "\$STUBROOT/bin/lib/companion_ui_inbox.py"
-  cp "$REPO/sentinels/hmd-ui.py" "\$STUBROOT/sentinels/hmd-ui.py"
+  mkdir -p "\$STUBROOT"
+  cp -R "$REPO/bin" "\$STUBROOT/bin"
+  cp -R "$REPO/sentinels" "\$STUBROOT/sentinels"
   cp "$STUB_LIB_DIR/hmd_relay_e2e.py" "\$STUBROOT/bin/lib/hmd_relay_e2e.py"
-  chmod +x "\$STUBROOT/bin/heimdall-relay-client"
 fi
 exec "\$STUBROOT/bin/heimdall-relay-client" "\$@"
 STUB2_EOF
