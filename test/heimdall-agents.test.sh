@@ -465,7 +465,7 @@ N1="$(ls_pgrep_calls)"
   || bad "missing cache should have probed pgrep ($N0 -> $N1 calls)"
 [ -f "$LS_CACHE" ] && ok "probe result written through to the on-disk cache" \
   || bad "cache file not created after a real probe"
-case "$C1" in ''|*[!0-9]*) bad "count not numeric after cold probe: '$C1'" ;; esac
+case "$C1" in ''|*[!0-9]*) bad "count not numeric after cold probe: '$C1'" ;; *) ok "count numeric after cold probe ($C1)" ;; esac
 
 # (13b) cache just written -> pin its mtime to the fictional test clock (the
 # code stamps a REAL wall-clock mtime; HMD_NOW is a fictional pinned epoch, so
@@ -498,7 +498,7 @@ C3="$(ls_count)"
 N1="$(ls_pgrep_calls)"
 [ "$N1" -gt "$N0" ] && ok "stale cache (past default TTL) triggers a fresh probe" \
   || bad "stale cache did not re-probe ($N0 -> $N1 calls)"
-case "$C3" in ''|*[!0-9]*) bad "count not numeric after stale re-probe: '$C3'" ;; esac
+case "$C3" in ''|*[!0-9]*) bad "count not numeric after stale re-probe: '$C3'" ;; *) ok "count numeric after stale re-probe ($C3)" ;; esac
 
 # (13e) HMD_AGENT_LIVE_SLUGS override still bypasses the cache ENTIRELY — never
 # probes, never reads, never writes it — even with no cache file present.
