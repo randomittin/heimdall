@@ -9,12 +9,14 @@ Never logs the payload (it contains a single-use pairing code).
 import json, sys, pathlib, subprocess
 import qrcode
 
-raw = sys.argv[1] if len(sys.argv) > 1 else sys.stdin.readline()
+args = [a for a in sys.argv[1:] if a != "--no-open"]
+# Payload: first arg if it looks like JSON, else stdin. Remaining arg = output path.
+raw = args.pop(0) if args and args[0].lstrip().startswith("{") else sys.stdin.readline()
 payload = json.loads(raw)
 for k in ("v", "relay", "session_id", "pairing_code", "exp", "hmd_pubkey"):
     if k not in payload:
         sys.exit(f"payload missing {k}")
-out = pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else "/tmp/hmd-relay-pair.png")
+out = pathlib.Path(args[0] if args else "/tmp/hmd-relay-pair.png")
 img = qrcode.make(json.dumps(payload, separators=(",", ":")), box_size=10, border=2)
 img.save(out)
 print(f"QR written to {out} (expires at {payload['exp']})", file=sys.stderr)
