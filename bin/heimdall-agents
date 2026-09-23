@@ -864,7 +864,7 @@ enumerate() {
 # cannot tell which path produced its input.
 _enumerate_classify_slow() {
   local taskdir="$1" reaped="$2"
-  local id tr meta mt name kind line is_reaped awaiting
+  local id tr meta mt name kind line is_reaped awaiting SOH=$'\x01'
   while IFS=$'\t' read -r id tr; do
     [ -n "$id" ] || continue
     mt=0
