@@ -231,10 +231,25 @@ strip_matches() {
   STRIPPED="$kept$s"
 }
 
-# Does this file run under strict mode (set -e and/or pipefail)? Class 1 only
-# bites when the pipeline's nonzero status can abort the script.
+# Does this file run under strict mode in the way class 1 actually needs — BOTH
+# errexit AND pipefail, never either alone? Found 2026-09-24 as a false positive
+# on bin/heimdall-agents:277 (`set -uo pipefail`, no errexit): the two flags do
+# DIFFERENT jobs in the abort chain and neither substitutes for the other.
+#   * pipefail WITHOUT errexit — pipefail makes the pipeline's exit status
+#     reflect an upstream SIGPIPE, but with no errexit nothing INSPECTS that
+#     status, so the assignment just proceeds with whatever partial/empty
+#     output it captured. No abort. This is bin/heimdall-agents' actual case.
+#   * errexit WITHOUT pipefail — without pipefail the pipeline's exit status is
+#     the LAST command's own status (`head` exits 0 having read what it
+#     needed), so an upstream stage's SIGPIPE never surfaces to errexit at all.
+# This used to be a 3-way OR (any one of the three greps was enough), which
+# misclassified either flag alone as "strict" and fired class 1 on a line that
+# cannot possibly abort in that file. Require the errexit grep AND (either
+# pipefail grep) — the `||` between the two pipefail spellings is fine (they
+# detect the SAME single condition two different ways), but errexit is a
+# separate, mandatory, second condition.
 file_is_strict() {
-  grep -qE '^[[:space:]]*set[[:space:]]+-[a-z]*e[a-z]*' "$1" 2>/dev/null && return 0
+  grep -qE '^[[:space:]]*set[[:space:]]+-[a-z]*e[a-z]*' "$1" 2>/dev/null || return 1
   grep -qE '^[[:space:]]*set[[:space:]]+-o[[:space:]]+pipefail' "$1" 2>/dev/null && return 0
   grep -qE '^[[:space:]]*set[[:space:]]+-[a-z]*o[a-z]*[[:space:]]+pipefail' "$1" 2>/dev/null && return 0
   return 1

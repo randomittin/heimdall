@@ -193,6 +193,87 @@ if [ "$c4_count" = "3" ]; then ok "exactly 3 class-4 findings (the 3 unguarded p
   else bad "expected 3 class-4 findings, got $c4_count"; fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# A3. CLASS-1 STRICT-MODE DISCRIMINATOR — errexit AND pipefail, never OR.
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression fence for a real false positive caught 2026-09-24: bin/heimdall-
+# agents:277 carries `out="$(lsof … | sed … | head -n 1)"` in a file whose ONLY
+# strict-mode declaration is `set -uo pipefail` — pipefail, no errexit. Class
+# 1's own documented mechanism is a TWO-STEP chain: pipefail makes an upstream
+# SIGPIPE surface as the pipeline's exit status; errexit is what turns THAT
+# nonzero status into an abort. Either alone is inert for this class:
+#   * pipefail WITHOUT errexit — the assignment's exit status changes, but
+#     nothing inspects it, so nothing aborts (bin/heimdall-agents' actual case).
+#   * errexit WITHOUT pipefail — the pipeline's exit status is `head`'s OWN
+#     status (it exits 0 having read what it needed), so an upstream SIGPIPE
+#     never surfaces to errexit in the first place.
+# `file_is_strict()` previously OR'd three greps (e-flag / `-o pipefail` /
+# combined-cluster pipefail), so a pipefail-ONLY file — or an errexit-ONLY one
+# — was misclassified "strict" and class 1 fired on a line that cannot
+# possibly abort. This section plants each half in isolation (must NOT fire)
+# plus a same-file control with both (must still fire).
+echo "A3. CLASS-1 STRICT-MODE DISCRIMINATOR (errexit AND pipefail, not OR):"
+
+FIX5="$FIX_DIR/heimdall-fixture5"
+cat > "$FIX5" <<'FIXTURE5'
+#!/usr/bin/env bash
+set -uo pipefail
+# CLASS-1 shape below has NO errexit in this file (pipefail only) — a SIGPIPE
+# from the upstream stage changes $? but nothing checks it, so it cannot abort.
+out="$(printf 'abcdefgh' | head -c 4)"
+echo "$out"
+FIXTURE5
+chmod +x "$FIX5"
+
+FIX6="$FIX_DIR/heimdall-fixture6"
+cat > "$FIX6" <<'FIXTURE6'
+#!/usr/bin/env bash
+set -e
+# CLASS-1 shape below has NO pipefail in this file (errexit only) — without
+# pipefail the pipeline's exit status is head's OWN status (it exits 0 having
+# read what it needed), so an upstream SIGPIPE never surfaces to errexit.
+out="$(printf 'abcdefgh' | head -c 4)"
+echo "$out"
+FIXTURE6
+chmod +x "$FIX6"
+
+FIX7="$FIX_DIR/heimdall-fixture7"
+cat > "$FIX7" <<'FIXTURE7'
+#!/usr/bin/env bash
+set -euo pipefail
+# CLASS-1 shape below has BOTH errexit and pipefail — the real landmine shape;
+# same-file positive control, must still be flagged.
+out="$(printf 'abcdefgh' | head -c 4)"
+echo "$out"
+FIXTURE7
+chmod +x "$FIX7"
+
+LINT5_OUT="$("$LINT" "$FIX5" 2>/dev/null || true)"
+LINT6_OUT="$("$LINT" "$FIX6" 2>/dev/null || true)"
+LINT7_OUT="$("$LINT" "$FIX7" 2>/dev/null || true)"
+
+assert_class_absent() {
+  # assert_class_absent LINT-OUTPUT CLASS-TAG HUMAN-LABEL
+  local out="$1" tag="$2" label="$3"
+  if grep -qF "  $tag  " <<<"$out"; then
+    bad "$label — class $tag WAS flagged (cannot actually abort; should not be)"
+  else
+    ok "$label — class $tag correctly NOT flagged"
+  fi
+}
+assert_class_present() {
+  # assert_class_present LINT-OUTPUT CLASS-TAG HUMAN-LABEL
+  local out="$1" tag="$2" label="$3"
+  if grep -qF "  $tag  " <<<"$out"; then
+    ok "$label — class $tag correctly flagged"
+  else
+    bad "$label — class $tag NOT flagged (should be — this is the real landmine shape)"
+  fi
+}
+assert_class_absent  "$LINT5_OUT" "1-SIGPIPE" "pipefail-only, no errexit (bin/heimdall-agents:277 shape)"
+assert_class_absent  "$LINT6_OUT" "1-SIGPIPE" "errexit-only, no pipefail"
+assert_class_present "$LINT7_OUT" "1-SIGPIPE" "errexit AND pipefail together (positive control)"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # B. CLEAN-TREE — zero false positives on the real shipped scripts.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "B. CLEAN-TREE (no false positives on the real current tree):"
