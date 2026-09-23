@@ -528,7 +528,7 @@ _batch_meta_lookup() {
     FNR==1 { if (prevf != "") print prevf SEP buf; buf=""; prevf=FILENAME }
     { buf = buf $0 }
     END { if (prevf != "") print prevf SEP buf }
-  ' | jq -R -c --arg sep "$sep" '
+  ' | jq -R -r --arg sep "$sep" '
     index($sep) as $i
     | if $i == null then empty else
         .[0:$i] as $path
@@ -539,6 +539,13 @@ _batch_meta_lookup() {
         | [$path, $name, $kind] | join($sep)
       end
   '
+  # NOTE: -r (raw output), NOT just -c, is load-bearing: `join($sep)` embeds a
+  # real 0x1f BYTE in the jq string value, but `-c` alone still JSON-ENCODES
+  # that string on the way out — a control byte gets escaped to the literal
+  # 6 characters ``, not emitted raw. Without -r, _join_batches's awk
+  # (FS=SEP, an actual 0x1f byte) finds NO real separator in the line at all,
+  # NF==1 always, and every name/kind lookup misses. Verified empirically
+  # 2026-09-24 via od -c on this function's own output (repro6.sh).
 }
 
 # ── batched "awaiting a tool result" lookup (fault-isolated, path-keyed) ──────
@@ -555,7 +562,7 @@ _batch_awaiting_lookup() {
     FNR==1 { if (prevf != "") print prevf SEP lastline; prevf=FILENAME }
     { lastline = $0 }
     END { if (prevf != "") print prevf SEP lastline }
-  ' | jq -R -c --arg sep "$sep" '
+  ' | jq -R -r --arg sep "$sep" '
     index($sep) as $i
     | if $i == null then empty else
         .[0:$i] as $path
@@ -567,6 +574,7 @@ _batch_awaiting_lookup() {
         | [$path, ($working|tostring)] | join($sep)
       end
   '
+  # -r load-bearing here too — see _batch_meta_lookup's comment.
 }
 
 # THE single join: candidate rows (id, tr, mt, meta path) meet the two keyed
