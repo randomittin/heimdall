@@ -232,6 +232,26 @@ fi
 # cache's own cadence (fresh<4s / lock<8s): comfortably longer than a Claude
 # Code redraw (>=300ms) or Cursor's updateIntervalMs poll (3000ms), short
 # enough that staleness is never more than a few seconds.
+#
+# DEATH-SPIRAL POSTMORTEM (found 2026-09-24, fixed here): the perl-alarm
+# ceiling described above only ever killed the single exec'd PID. `alarm`
+# delivers SIGALRM to exactly the process that called it, and `exec @ARGV`
+# replaces that process's own image — so the signal's default terminate
+# action reached the top-level `heimdall-agents count` shell and nothing
+# else. But `enumerate` (inside heimdall-agents) does its own work in `$( )`
+# command-substitution subshells (pgrep, `lsof -p` per candidate pid) —
+# separate PIDs a single-PID kill never touches. Orphaned, they kept running
+# on their own clock (~8s measured under load) even after the "ceiling" hit,
+# so on a machine with neither `timeout` nor `gtimeout` (this repo's own dev
+# Mac has neither) the 1s ceiling fired on every render without ever
+# actually freeing anything: 39 distinct `heimdall-agents count` trees were
+# observed alive at once, load average 40-50 on 10 cores. The pile-up starves
+# EVERYTHING on the box, including this refresh's own lock-file cleanup, so
+# the lock outlives its TTL too and the next render spawns yet another
+# orphaned tree — the storm sustains itself. Fixed by killing the whole
+# PROCESS GROUP instead of one PID (see the perl branch below), plus the
+# failure/timeout backoff below so a wedged `count` is retried on a schedule
+# instead of once per render.
 HMD_LIVE_SUBAGENTS=0
 AGENTS_BIN=""
 if command -v heimdall-agents >/dev/null 2>&1; then AGENTS_BIN="heimdall-agents"
@@ -242,10 +262,23 @@ if [ -n "$AGENTS_BIN" ]; then
   AC_DIR="$AC_CWD/.heimdall"
   AC_CACHE="$AC_DIR/.agents-count-cache"
   AC_LOCK="$AC_CACHE.lock"
+  AC_FAIL="$AC_CACHE.fail"
   AGENTS_COUNT_TTL="${HMD_AGENTS_COUNT_TTL:-4}"
   AGENTS_LOCK_TTL="${HMD_AGENTS_LOCK_TTL:-8}"
+  # Off the render path entirely (this ceiling only ever bounds the
+  # BACKGROUND refresh subshell below, never the cache read above), so
+  # raising it costs this bar nothing: 5s gives a loaded box's pgrep/lsof
+  # enumeration room to finish cleanly instead of getting cut off mid-work
+  # on every single render (see the DEATH-SPIRAL POSTMORTEM above).
+  AGENTS_COUNT_CEIL="${HMD_AGENTS_COUNT_CEIL:-5}"
+  # A refresh that failed or timed out is not retried on every render — that
+  # was exactly the death spiral's own re-arm path. Once _ac_refresh records
+  # a failure below, no new spawn is attempted until this many seconds pass.
+  AGENTS_FAIL_BACKOFF="${HMD_AGENTS_FAIL_BACKOFF:-30}"
   case "$AGENTS_COUNT_TTL" in ''|*[!0-9]*) AGENTS_COUNT_TTL=4 ;; esac
   case "$AGENTS_LOCK_TTL"  in ''|*[!0-9]*) AGENTS_LOCK_TTL=8 ;; esac
+  case "$AGENTS_COUNT_CEIL" in ''|*[!0-9]*) AGENTS_COUNT_CEIL=5 ;; esac
+  case "$AGENTS_FAIL_BACKOFF" in ''|*[!0-9]*) AGENTS_FAIL_BACKOFF=30 ;; esac
   # Sub-second clock for the freshness math below. ROOT CAUSE this fixes: `date
   # +%s` and `stat %m` both floor to whole seconds, and this bar used to diff
   # two independently-floored instants. A write and a check that straddle a
@@ -295,6 +328,7 @@ if [ -n "$AGENTS_BIN" ]; then
   case "$AC_NOW_NS" in ''|*[!0-9]*) AC_NOW_NS=0 ;; esac
   AC_TTL_NS=$(( AGENTS_COUNT_TTL * 1000000000 ))
   AC_LOCK_TTL_NS=$(( AGENTS_LOCK_TTL * 1000000000 ))
+  AC_FAIL_BACKOFF_NS=$(( AGENTS_FAIL_BACKOFF * 1000000000 ))
 
   AC_FRESH=0
   if [ -f "$AC_CACHE" ]; then
@@ -313,26 +347,80 @@ if [ -n "$AGENTS_BIN" ]; then
     [ $(( AC_NOW_NS - LOCK_MTIME_NS )) -lt "$AC_LOCK_TTL_NS" ] && LOCK_FRESH=1
   fi
 
-  if [ "$AC_FRESH" = 0 ] && [ "$LOCK_FRESH" = 0 ] && mkdir -p "$AC_DIR" 2>/dev/null; then
+  # Same idea as LOCK_FRESH, gating on the failure marker instead of the
+  # lock: a refresh that just failed or timed out stays un-retried until
+  # AGENTS_FAIL_BACKOFF seconds have passed, so a permanently-broken or
+  # perpetually-slow `count` gets retried once per backoff window, never
+  # once per render.
+  FAIL_FRESH=0
+  if [ -f "$AC_FAIL" ]; then
+    AC_FAIL_MTIME_NS="$(_ac_mtime_ns "$AC_FAIL")"
+    case "$AC_FAIL_MTIME_NS" in ''|*[!0-9]*) AC_FAIL_MTIME_NS=0 ;; esac
+    [ $(( AC_NOW_NS - AC_FAIL_MTIME_NS )) -lt "$AC_FAIL_BACKOFF_NS" ] && FAIL_FRESH=1
+  fi
+
+  if [ "$AC_FRESH" = 0 ] && [ "$LOCK_FRESH" = 0 ] && [ "$FAIL_FRESH" = 0 ] && mkdir -p "$AC_DIR" 2>/dev/null; then
     : >"$AC_LOCK" 2>/dev/null
     AC_TMP="$AC_CACHE.$$.tmp"
-    # Same timeout(1)/gtimeout/perl-alarm/bare fallback chain as the prior fix,
-    # just relocated off the render path: a hard 1s ceiling still bounds a hung
-    # `count` so it can never wedge holding the lock forever. Publishes via a
-    # tmp-write + rename + unconditional lock/tmp cleanup (`;` after `&&`, not
-    # chained) so a failed refresh never leaves an orphaned tmp file (the exact
-    # bug already fixed elsewhere in this repo for the roster/wall caches).
+    # Publishes via a tmp-write + rename + unconditional lock/tmp cleanup (the
+    # final `rm` below runs no matter which branch of the if/else just ran) so
+    # a failed refresh never leaves an orphaned tmp file (the exact bug
+    # already fixed elsewhere in this repo for the roster/wall caches). A
+    # nonzero exit — a real failure, or 124 from either timeout mechanism
+    # below — writes AC_FAIL with the exit code instead of publishing, so the
+    # FAIL_FRESH gate above can back off; a clean publish removes any AC_FAIL
+    # a prior failure left behind.
     _ac_refresh() {
-      "$@" >"$AC_TMP" 2>/dev/null && mv -f "$AC_TMP" "$AC_CACHE"
+      local rc
+      "$@" >"$AC_TMP" 2>/dev/null
+      rc=$?
+      if [ "$rc" -eq 0 ] && mv -f "$AC_TMP" "$AC_CACHE" 2>/dev/null; then
+        rm -f "$AC_FAIL" 2>/dev/null
+      else
+        [ "$rc" -eq 0 ] && rc=1   # "succeeded" but the tmp->cache publish failed
+        printf '%s' "$rc" >"$AC_FAIL" 2>/dev/null
+      fi
       rm -f "$AC_TMP" "$AC_LOCK"
     }
     TO=""
-    command -v timeout  >/dev/null 2>&1 && TO="timeout 1"
-    [ -z "$TO" ] && command -v gtimeout >/dev/null 2>&1 && TO="gtimeout 1"
+    command -v timeout  >/dev/null 2>&1 && TO="timeout $AGENTS_COUNT_CEIL"
+    [ -z "$TO" ] && command -v gtimeout >/dev/null 2>&1 && TO="gtimeout $AGENTS_COUNT_CEIL"
     if [ -n "$TO" ]; then
+      # GNU timeout's default behavior (i.e. WITHOUT --foreground) already
+      # runs the monitored command in its own process group and signals that
+      # whole group on expiry, so it already reaches count's pgrep/lsof
+      # grandchildren the same as the perl branch below — never add
+      # --foreground here, that opts back into the single-process signalling
+      # this whole fix removes (see the DEATH-SPIRAL POSTMORTEM above).
       ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh $TO "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
     elif command -v perl >/dev/null 2>&1; then
-      ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh perl -e 'alarm 1; exec @ARGV' -- "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
+      # This machine's stand-in for timeout(1)/gtimeout (this repo's dev Mac
+      # ships neither). Unlike the old `alarm 1; exec @ARGV` one-liner —
+      # whose single-PID SIGALRM left count's own pgrep/lsof grandchildren
+      # orphaned and running past the ceiling (see the DEATH-SPIRAL
+      # POSTMORTEM above) — this forks, makes the CHILD its own
+      # process-group leader before it execs into "$AGENTS_BIN" count, and on
+      # ALRM signals that whole group: TERM, a 0.3s grace period, then KILL
+      # for anything that ignored TERM. Every subshell count forks inherits
+      # that same group (nothing it does changes its own pgid), so nothing in
+      # that tree can outlive the ceiling. The ceiling arrives as argv[0]
+      # (shifted off before the real command runs), not baked into the
+      # script, so HMD_AGENTS_COUNT_CEIL controls it exactly like the
+      # timeout/gtimeout branch above.
+      ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh perl -e '
+          $ceil = shift @ARGV;
+          $SIG{ALRM} = sub {
+            kill TERM => -$pid;
+            select undef, undef, undef, 0.3;
+            kill KILL => -$pid;
+            exit 124;
+          };
+          $pid = fork;
+          if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
+          alarm $ceil;
+          waitpid $pid, 0;
+          exit $? >> 8;
+        ' "$AGENTS_COUNT_CEIL" "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
     else
       ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
     fi
