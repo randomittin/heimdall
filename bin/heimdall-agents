@@ -580,7 +580,7 @@ _batch_awaiting_lookup() {
   fi
   local i
   for i in "${!paths[@]}"; do
-    printf '%s\x1f%s\n' "${paths[$i]}" "${lines[$i]:-}"
+    printf '%s%s%s\n' "${paths[$i]}" "$sep" "${lines[$i]:-}"
   done | jq -R -r --arg sep "$sep" '
     index($sep) as $i
     | if $i == null then empty else
@@ -737,13 +737,29 @@ _collect_candidates() {
 
   for d in $subdirs; do
     [ -d "$d" ] || continue
-    for m in $(grep -lF 'in_process_teammate' "$d"/*.meta.json 2>/dev/null); do
+    # find -print0 | xargs -0, NOT "$d"/*.meta.json as grep's argv directly —
+    # a glob expanded straight into one command's argv is exactly what this
+    # file's ARG_MAX discipline forbids everywhere else; a subagents dir can
+    # accumulate meta.json sidecars across a project's whole history (a real
+    # sample measured 702 files in one session alone). find -print0/xargs -0
+    # keep the FIND -> GREP handoff NUL-delimited (the actual ARG_MAX risk
+    # surface); grep's own `-l` match-list output is deliberately consumed as
+    # plain newline-terminated text, NOT `-Z`/NUL — verified empirically
+    # 2026-09-24 that `-Z` is silently NOT honored by this box's /usr/bin/grep
+    # (BSD grep 2.6.0-FreeBSD: `od -c` on `-lZF` output shows `\n`, never
+    # `\0`), which desynced `read -d ''` into treating the whole match list as
+    # one unterminated record. A harness-minted id (hex/alnum, "agent-"
+    # prefix) never contains a newline, so a plain `read -r` line loop is
+    # exactly as filename-safe as this file's pre-single-pass `for m in
+    # $(grep -l ...)` already was — only the ARG_MAX-unsafe glob is fixed.
+    while IFS= read -r m; do
       id="${m##*/}"; id="${id%.meta.json}"; id="${id#agent-}"
       [ -n "$id" ] || continue
       case "$seen" in *" $id "*) continue ;; esac
       seen="$seen$id "
       printf '%s\t%s\n' "$id" "${m%.meta.json}.jsonl"
-    done
+    done < <(find "$d" -maxdepth 1 -type f -name '*.meta.json' -print0 2>/dev/null \
+      | xargs -0 grep -lF 'in_process_teammate' 2>/dev/null)
   done
 }
 
