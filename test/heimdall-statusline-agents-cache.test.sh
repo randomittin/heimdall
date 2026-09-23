@@ -22,7 +22,12 @@
 # purely so the staleness/expiry assertions don't need multi-second sleeps at
 # the production default (4s/8s); the production constants are exercised by
 # their own doc comment cross-referencing the roster cache's identical 4s/8s,
-# not by this suite's timing.
+# not by this suite's timing. Cases 6-7 additionally override
+# HMD_AGENTS_COUNT_CEIL/HMD_AGENTS_FAIL_BACKOFF small for the same reason,
+# and replace the real heimdall-agents with a fake one (path_forcing_perl
+# plus a PATH-shadowed fake binary) so the process-tree-kill and backoff
+# mechanics are deterministic instead of depending on this host's actual
+# subagent count or its actual timeout/gtimeout availability.
 #
 # FALSIFIER (verified by hand for this task): reverting bin/heimdall-statusline
 # to its pre-fix synchronous form makes cases 2, 4b and 5 go RED — no code
@@ -30,6 +35,15 @@
 # populated" and "stale cache gets overwritten" time out. Cases 3 and 4a stay
 # green under the old code too (nothing to dedup against), which is expected:
 # they exist to pin behavior going forward, not to distinguish old from new.
+#
+# Cases 6-7 pin the 2026-09-24 death-spiral fix specifically. FALSIFIER:
+# reverting just the perl branch to the old single-PID `alarm 1; exec @ARGV`
+# (while keeping the rest of this fix) makes case 6 go RED — the grandchild
+# `sleep 30 &` a hung `count` forks is never in a killable process group, so
+# it is still alive long after the ceiling. Reverting _ac_refresh to the old
+# two-line publish (no AC_FAIL bookkeeping) makes case 7 go RED on its second
+# assertion — with no fail marker there is nothing to gate a respawn on, so a
+# second spawn happens immediately instead of waiting out the backoff.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -58,6 +72,9 @@ mkws() {
 BLOB='{"model":{"display_name":"Auto"}}'
 CACHE_REL=".heimdall/.agents-count-cache"
 LOCK_REL=".heimdall/.agents-count-cache.lock"
+FAIL_REL=".heimdall/.agents-count-cache.fail"
+BASH_BIN="$(command -v bash)"   # absolute path: bypasses PATH lookup for
+                                # bash itself once cases 6-7 restrict PATH
 
 run_cli() {
   # $1 = workspace (becomes HMD_AGENT_CWD); $2 = homed
@@ -91,6 +108,47 @@ poll_for_change() {
     n=$((n+1))
   done
   return 1
+}
+
+poll_for_pid_gone() {
+  # $1 = pid, $2 = max attempts (each 0.2s) — bounded wait for a process to die.
+  local n=0
+  while [ "$n" -lt "$2" ]; do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.2
+    n=$((n+1))
+  done
+  ! kill -0 "$1" 2>/dev/null
+}
+
+path_forcing_perl() {
+  # Emits a PATH with every directory containing an executable timeout or
+  # gtimeout removed, so bin/heimdall-statusline's `command -v timeout` /
+  # `command -v gtimeout` checks both genuinely fail and it falls through to
+  # the perl branch — this repo's own dev Mac already lacks both tools
+  # natively, so this is a no-op safety net there; it makes the same forcing
+  # explicit and portable to a host that does have them. KNOWN LIMITATION:
+  # on a merged-/usr Linux where perl and coreutils' timeout share one
+  # directory, filtering that directory out would take perl down with it —
+  # detected below (perl no longer resolves in the filtered result) and, in
+  # that one case, the ORIGINAL PATH is returned unchanged rather than a
+  # PATH broken for everything else the script needs too: this helper's
+  # guarantee is "forces perl where that's possible without collateral
+  # breakage," not "forces perl unconditionally on every host."
+  local dir out="" real_perl
+  local -a dirs
+  IFS=':' read -ra dirs <<<"$PATH"
+  for dir in "${dirs[@]}"; do
+    [ -x "$dir/timeout" ] && continue
+    [ -x "$dir/gtimeout" ] && continue
+    out="${out:+$out:}$dir"
+  done
+  real_perl="$(PATH="$out" command -v perl 2>/dev/null)"
+  if [ -n "$real_perl" ]; then
+    printf '%s' "$out"
+  else
+    printf '%s' "$PATH"
+  fi
 }
 
 echo "== 1) COLD: render with no cache/lock present completes cleanly (never hangs/errors) =="
@@ -169,6 +227,109 @@ else
   bad "stale cache (99) was never refreshed — staleness is not being detected"
 fi
 rm -rf "$WS" "$HOMED"
+
+echo "== 6) PERL BRANCH KILLS GRANDCHILDREN: a hung count's whole tree dies at the ceiling =="
+TRIPLE="$(mkws)"; IFS='|' read -r WS HOMED <<<"$TRIPLE"
+FAKEBIN="$(mktemp -d)"
+GCHILD_PID_FILE="$(mktemp -u)"
+cat >"$FAKEBIN/heimdall-agents" <<'FAKE_EOF'
+#!/usr/bin/env bash
+if [ "$1" = "count" ]; then
+  sleep 30 &
+  echo $! > "$GCHILD_PID_FILE"
+  sleep 30
+fi
+FAKE_EOF
+chmod +x "$FAKEBIN/heimdall-agents"
+FORCED_PATH="$FAKEBIN:$(path_forcing_perl)"
+printf '%s' "$BLOB" | HOME="$HOMED" HEIMDALL_IDENTITY_DIR="$WS/.heimdall" HMD_HAID=rj \
+    HEIMDALL_CP_URL="http://127.0.0.1:1" TERM=xterm-256color \
+    HEIMDALL_STATUSLINE_MODE=truecolor HMD_AGENT_CWD="$WS" \
+    HMD_AGENTS_COUNT_TTL=1 HMD_AGENTS_LOCK_TTL=2 HMD_AGENTS_COUNT_CEIL=1 \
+    GCHILD_PID_FILE="$GCHILD_PID_FILE" \
+    PATH="$FORCED_PATH" \
+    "$BASH_BIN" "$CLI" >/dev/null 2>&1
+if poll_for_file "$GCHILD_PID_FILE" 15; then
+  GPID="$(cat "$GCHILD_PID_FILE" 2>/dev/null || echo '')"
+  if [ -z "$GPID" ]; then
+    bad "grandchild pid file appeared but was empty"
+  elif poll_for_pid_gone "$GPID" 40; then
+    ok "grandchild sleep 30 (pid $GPID) was killed along with the rest of the tree at the ceiling"
+  else
+    bad "grandchild sleep 30 (pid $GPID) survived well past the ceiling — process tree leaked"
+  fi
+else
+  bad "fake heimdall-agents never recorded a grandchild pid — case did not exercise the perl branch as expected"
+fi
+rm -rf "$WS" "$HOMED" "$FAKEBIN"
+rm -f "$GCHILD_PID_FILE"
+
+echo "== 7) FAILURE BACKOFF: a failed refresh is not retried inside the window, success clears the marker =="
+TRIPLE="$(mkws)"; IFS='|' read -r WS HOMED <<<"$TRIPLE"
+FAKEBIN="$(mktemp -d)"
+CALL_COUNT_FILE="$(mktemp -u)"
+CALL_LOG_FILE="$(mktemp -u)"
+cat >"$FAKEBIN/heimdall-agents" <<'FAKE_EOF'
+#!/usr/bin/env bash
+if [ "$1" = "count" ]; then
+  n=0
+  [ -f "$CALL_COUNT_FILE" ] && n="$(cat "$CALL_COUNT_FILE")"
+  n=$((n+1))
+  echo "$n" > "$CALL_COUNT_FILE"
+  printf 'call %s\n' "$n" >> "$CALL_LOG_FILE"
+  if [ "$n" -eq 1 ]; then
+    exit 1
+  fi
+  echo 7
+  exit 0
+fi
+FAKE_EOF
+chmod +x "$FAKEBIN/heimdall-agents"
+FORCED_PATH="$FAKEBIN:$(path_forcing_perl)"
+render7() {
+  printf '%s' "$BLOB" | HOME="$HOMED" HEIMDALL_IDENTITY_DIR="$WS/.heimdall" HMD_HAID=rj \
+      HEIMDALL_CP_URL="http://127.0.0.1:1" TERM=xterm-256color \
+      HEIMDALL_STATUSLINE_MODE=truecolor HMD_AGENT_CWD="$WS" \
+      HMD_AGENTS_COUNT_TTL=1 HMD_AGENTS_LOCK_TTL=2 HMD_AGENTS_COUNT_CEIL=1 \
+      HMD_AGENTS_FAIL_BACKOFF=2 \
+      CALL_COUNT_FILE="$CALL_COUNT_FILE" CALL_LOG_FILE="$CALL_LOG_FILE" \
+      PATH="$FORCED_PATH" \
+      "$BASH_BIN" "$CLI" >/dev/null 2>&1
+}
+render7
+if poll_for_file "$WS/$FAIL_REL" 15; then
+  ok "first (failing) refresh recorded a fail marker"
+else
+  bad "fail marker never appeared after a failing refresh"
+fi
+sleep 0.8   # well inside the 2s backoff
+render7
+sleep 0.5
+CALLS_DURING_BACKOFF="$(wc -l <"$CALL_LOG_FILE" 2>/dev/null | tr -d ' ')"
+if [ "$CALLS_DURING_BACKOFF" = "1" ]; then
+  ok "no second spawn happened while the fail marker was still within its backoff window"
+else
+  bad "expected exactly 1 call while inside the backoff window, log shows $CALLS_DURING_BACKOFF"
+fi
+sleep 2   # cumulative time since the first failure is now comfortably past the 2s backoff
+render7
+if poll_for_file "$WS/$CACHE_REL" 15; then
+  NEWVAL="$(cat "$WS/$CACHE_REL" 2>/dev/null || echo '')"
+  if [ "$NEWVAL" = "7" ]; then
+    ok "refresh retried once the backoff elapsed and published the new count ('7')"
+  else
+    bad "post-backoff refresh published unexpected content: '$NEWVAL'"
+  fi
+else
+  bad "post-backoff refresh never populated the cache — backoff never releases the gate"
+fi
+if [ -f "$WS/$FAIL_REL" ]; then
+  bad "fail marker still present after a successful refresh — success did not clear it"
+else
+  ok "fail marker was removed once the refresh succeeded"
+fi
+rm -rf "$WS" "$HOMED" "$FAKEBIN"
+rm -f "$CALL_COUNT_FILE" "$CALL_LOG_FILE"
 
 echo
 echo "$pass passed, $fail failed"
