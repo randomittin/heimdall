@@ -518,7 +518,12 @@ _batch_output_targets() {
 # "no data" defaults rather than deriving a value from nothing.
 _batch_meta_lookup() {
   [ "$#" -gt 0 ] || return 0
-  local sep=$'\x01'
+  # 0x1f (Unit Separator), NOT 0x01 (SOH): bash 3.2's `read` builtin (macOS's
+  # shipped /bin/bash) silently fails to split IFS=$'\x01' at all — verified
+  # empirically 2026-09-24 (comma/pipe/semicolon/0x02/0x1f all split correctly;
+  # 0x01 alone concatenates every field into $1). This byte crosses into a
+  # bash `read` downstream (_join_batches -> enumerate), so it must be 3.2-safe.
+  local sep=$'\x1f'
   printf '%s\0' "$@" | xargs -0 awk -v SEP="$sep" '
     FNR==1 { if (prevf != "") print prevf SEP buf; buf=""; prevf=FILENAME }
     { buf = buf $0 }
@@ -545,7 +550,7 @@ _batch_meta_lookup() {
 # THAT transcript only, never the whole batch.
 _batch_awaiting_lookup() {
   [ "$#" -gt 0 ] || return 0
-  local sep=$'\x01'
+  local sep=$'\x1f'   # 0x1f, not 0x01 — see _batch_meta_lookup's comment
   printf '%s\0' "$@" | xargs -0 awk -v SEP="$sep" '
     FNR==1 { if (prevf != "") print prevf SEP lastline; prevf=FILENAME }
     { lastline = $0 }
@@ -572,7 +577,7 @@ _batch_awaiting_lookup() {
 # and the corresponding map simply stays empty, never an error.
 _join_batches() {
   local candf="$1" metaf="$2" awaitf="$3" reaped="$4"
-  awk -v SEP=$'\x01' -v REAPED="$reaped" -v METAF="$metaf" -v AWAITF="$awaitf" '
+  awk -v SEP=$'\x1f' -v REAPED="$reaped" -v METAF="$metaf" -v AWAITF="$awaitf" '
     BEGIN { FS = SEP }
     FILENAME == METAF  { if (NF >= 3) { nm[$1] = $2; kd[$1] = $3 }; next }
     FILENAME == AWAITF { if (NF >= 2) { aw[$1] = $2 }; next }
@@ -806,7 +811,7 @@ enumerate() {
 
   [ -n "$joined" ] || return 0
 
-  while IFS=$'\x01' read -r id tr mt name kind awaiting meta is_reaped; do
+  while IFS=$'\x1f' read -r id tr mt name kind awaiting meta is_reaped; do
     [ -n "$id" ] || continue
     age=$(( NOW - mt ))
     [ "$age" -lt 0 ] && age=0
@@ -864,7 +869,7 @@ enumerate() {
 # cannot tell which path produced its input.
 _enumerate_classify_slow() {
   local taskdir="$1" reaped="$2"
-  local id tr meta mt name kind line is_reaped awaiting SOH=$'\x01'
+  local id tr meta mt name kind line is_reaped awaiting US=$'\x1f'
   while IFS=$'\t' read -r id tr; do
     [ -n "$id" ] || continue
     mt=0
@@ -891,7 +896,7 @@ _enumerate_classify_slow() {
     fi
     is_reaped=0
     case "$reaped" in *" $id "*) is_reaped=1 ;; esac
-    printf '%s\n' "$id$SOH$tr$SOH$mt$SOH$name$SOH$kind$SOH$awaiting$SOH$meta$SOH$is_reaped"
+    printf '%s\n' "$id$US$tr$US$mt$US$name$US$kind$US$awaiting$US$meta$US$is_reaped"
   done
 }
 
