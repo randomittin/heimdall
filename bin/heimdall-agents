@@ -549,20 +549,39 @@ _batch_meta_lookup() {
 }
 
 # ── batched "awaiting a tool result" lookup (fault-isolated, path-keyed) ──────
-# ONE process pair replaces a `tail -n1` (+ conditional jq) fork per candidate:
-# awk pulls the last line of every transcript in one pass (same FNR==1-boundary
-# idiom as _batch_meta_lookup), tagged with its path; ONE `jq -R` then applies
-# the exact classification the old per-candidate _awaiting_tool_result used,
-# with try/catch, so a torn or mid-write line degrades to "not awaiting" for
-# THAT transcript only, never the whole batch.
+# NOT an awk full-file scan (unlike _batch_meta_lookup — a meta.json is a few
+# hundred bytes, but a transcript reaches 16MB, per build_notif_index's own
+# comment above). awk's FNR==1/lastline idiom must stream every byte of every
+# input to find each file's last line; MEASURED 2026-09-24 against this
+# project's real subagents dir (80 candidates): that scan alone cost 3.76s
+# wall / 3.55s user — nearly the entire single-pass implementation's
+# regression against main's one-`tail`-per-candidate fork loop, because `tail
+# -n1` SEEKS from EOF instead of reading forward from byte 0. Fix: batch the
+# seek-based tool `tail` was already using, not the byte-scanning one awk
+# forces — `tail -q -n1` over every path in ONE (ARG_MAX-safe, xargs-batched)
+# invocation, positional not path-keyed (tail -q prints one line per file, in
+# argv order, with no filename); paths are zipped back onto those lines in
+# bash (cheap — no fork per candidate) before the single jq classification
+# pass, so _join_batches's path-keyed contract on this function's output is
+# unchanged. A `tail`/input COUNT mismatch (e.g. a zero-byte transcript emits
+# no line at all, desyncing every position after it) falls back to one `tail`
+# per candidate rather than risk zipping a line to the wrong path — same
+# fail-closed posture as _batch_mtimes/_batch_output_targets above.
 _batch_awaiting_lookup() {
   [ "$#" -gt 0 ] || return 0
   local sep=$'\x1f'   # 0x1f, not 0x01 — see _batch_meta_lookup's comment
-  printf '%s\0' "$@" | xargs -0 awk -v SEP="$sep" '
-    FNR==1 { if (prevf != "") print prevf SEP lastline; prevf=FILENAME }
-    { lastline = $0 }
-    END { if (prevf != "") print prevf SEP lastline }
-  ' | jq -R -r --arg sep "$sep" '
+  local -a paths=("$@") lines=()
+  local out f
+  out="$(printf '%s\0' "$@" | xargs -0 tail -q -n 1 2>/dev/null)"
+  while IFS= read -r out_line; do lines+=("$out_line"); done <<< "$out"
+  if [ "${#lines[@]}" -ne "$#" ]; then
+    lines=()
+    for f in "${paths[@]}"; do lines+=("$(tail -n 1 "$f" 2>/dev/null)"); done
+  fi
+  local i
+  for i in "${!paths[@]}"; do
+    printf '%s\x1f%s\n' "${paths[$i]}" "${lines[$i]:-}"
+  done | jq -R -r --arg sep "$sep" '
     index($sep) as $i
     | if $i == null then empty else
         .[0:$i] as $path
@@ -574,7 +593,6 @@ _batch_awaiting_lookup() {
         | [$path, ($working|tostring)] | join($sep)
       end
   '
-  # -r load-bearing here too — see _batch_meta_lookup's comment.
 }
 
 # THE single join: candidate rows (id, tr, mt, meta path) meet the two keyed
