@@ -425,15 +425,11 @@ resolve_subagentsdirs() {
 }
 
 # ── transcript + metadata resolution ──────────────────────────────────────────
-# The `.output` is normally a symlink straight to the transcript. If not, derive
-# the canonical projects path. Returns "" when nothing resolves.
-_transcript_for() {
-  local taskdir="$1" id="$2" out tgt sess slug cand d
-  out="$taskdir/$id.output"
-  if [ -L "$out" ]; then
-    tgt="$(readlink "$out" 2>/dev/null)"
-    case "$tgt" in /*) printf '%s' "$tgt"; return 0 ;; esac
-  fi
+# Fork-free fallback for ONE candidate: the projects-dir derivation used when a
+# `.output` isn't a symlink to an absolute path (or batch resolution below could
+# not confirm one). Never calls readlink — that's the caller's job, batched.
+_transcript_fallback() {
+  local taskdir="$1" id="$2" sess slug cand d
   sess="$(_session_of_taskdir "$taskdir")"
   slug="$(_slug_of_taskdir "$taskdir")"
   [ -n "$sess" ] && [ -n "$slug" ] || return 0
@@ -448,25 +444,155 @@ _transcript_for() {
   printf '%s' "$cand"
 }
 
+# ── portable stat dialect, probed once per process ────────────────────────────
+# BSD stat (macOS) takes `-f FORMAT`; GNU stat (Linux) takes `-c FORMAT`, and
+# the two format-letter alphabets diverge (BSD %m / GNU %Y = mtime; BSD's plain
+# %Y = raw symlink target, a field GNU has no equivalent for). Every batch
+# helper below branches on this once-per-process result rather than re-probing.
+_STAT_DIALECT=""
+_stat_dialect() {
+  [ -n "$_STAT_DIALECT" ] && { printf '%s' "$_STAT_DIALECT"; return 0; }
+  if stat -f '%N' "$0" >/dev/null 2>&1; then _STAT_DIALECT=bsd; else _STAT_DIALECT=gnu; fi
+  printf '%s' "$_STAT_DIALECT"
+}
+
+# Batched, ARG_MAX-safe DEREFERENCING mtime lookup (like _mtime, one fork total
+# instead of one per path). Every path passed in has already been bash-confirmed
+# to exist (or is a caller-supplied placeholder — see enumerate()), so mtime is
+# never the empty string; unlike the raw-target lookup below, there is nothing
+# here for BSD stat to omit a line for. One line per input, in argv order —
+# xargs preserves order across ARG_MAX batches even when it must fork more than
+# once. Caller cross-checks the line count before trusting position.
+_batch_mtimes() {
+  [ "$#" -gt 0 ] || return 0
+  if [ "$(_stat_dialect)" = bsd ]; then
+    printf '%s\0' "$@" | xargs -0 stat -L -f '%m' 2>/dev/null
+  else
+    printf '%s\0' "$@" | xargs -0 stat -L -c '%Y' 2>/dev/null
+  fi
+}
+
+# Batched, ARG_MAX-safe resolution of `.output` -> transcript symlink TARGETS
+# (non-dereferencing: the raw link text, like `readlink`, NOT the file it names).
+# BSD's plain (non -L) %Y IS that raw target, empty string for a regular file.
+# GNU has no equivalent field; its %N instead embeds the target as
+# `'name' -> 'target'` for a symlink, plain `'name'` otherwise — parsed below.
+# %N rides along in the BSD call purely to keep every line non-empty: a lone %Y
+# is SILENTLY OMITTED for a regular file (empirically verified 2026-09-24: 3
+# mixed inputs — file/symlink/dangling-symlink — with bare %Y produced 2 lines,
+# not 3), which would desync position for every following candidate; %N's own
+# value is discarded once it has done that job. One line per input, in argv
+# order — every path here already passed `[ -e ]` in the caller's own glob.
+_batch_output_targets() {
+  [ "$#" -gt 0 ] || return 0
+  local sep line tgt
+  sep=$'\x01'
+  if [ "$(_stat_dialect)" = bsd ]; then
+    printf '%s\0' "$@" | xargs -0 stat -f "%N${sep}%Y" 2>/dev/null | while IFS= read -r line; do
+      printf '%s\n' "${line#*"$sep"}"
+    done
+  else
+    printf '%s\0' "$@" | xargs -0 stat -c '%N' 2>/dev/null | while IFS= read -r line; do
+      case "$line" in
+        *"' -> '"*)
+          tgt="${line##*"' -> '"}"
+          printf '%s\n' "${tgt%\'}"
+          ;;
+        *) printf '\n' ;;
+      esac
+    done
+  fi
+}
+
+# ── batched .meta.json name/kind lookup (fault-isolated, path-keyed) ──────────
+# ONE process pair replaces one jq fork per candidate. awk concatenates each
+# (pretty-printed, multi-line) meta.json into a single SOH-tagged blob per file
+# — FNR==1 marks the boundary between files, flushing the previous blob — then
+# ONE `jq -R` parses every blob with try/catch: a malformed file yields
+# name="" kind="" for THAT path only, never aborting the batch (unlike handing
+# many files to jq directly, where one parse error aborts every file still
+# queued behind it in the same argv — verified empirically 2026-09-24). Output
+# is path-keyed, not positional, because a zero-byte meta.json never triggers
+# FNR==1 and so never appears in the batch at all — deliberately: that matches
+# this file's own existing empty-file handling elsewhere, degrading to the same
+# "no data" defaults rather than deriving a value from nothing.
+_batch_meta_lookup() {
+  [ "$#" -gt 0 ] || return 0
+  local sep=$'\x01'
+  printf '%s\0' "$@" | xargs -0 awk -v SEP="$sep" '
+    FNR==1 { if (prevf != "") print prevf SEP buf; buf=""; prevf=FILENAME }
+    { buf = buf $0 }
+    END { if (prevf != "") print prevf SEP buf }
+  ' | jq -R -c --arg sep "$sep" '
+    index($sep) as $i
+    | if $i == null then empty else
+        .[0:$i] as $path
+        | .[$i+1:] as $blob
+        | (try ($blob | fromjson) catch null) as $obj
+        | (if ($obj|type)=="object" then ($obj.name // "") else "" end) as $name
+        | (if ($obj|type)=="object" then ($obj.taskKind // "") else "" end) as $kind
+        | [$path, $name, $kind] | @tsv
+      end
+  '
+}
+
+# ── batched "awaiting a tool result" lookup (fault-isolated, path-keyed) ──────
+# ONE process pair replaces a `tail -n1` (+ conditional jq) fork per candidate:
+# awk pulls the last line of every transcript in one pass (same FNR==1-boundary
+# idiom as _batch_meta_lookup), tagged with its path; ONE `jq -R` then applies
+# the exact classification the old per-candidate _awaiting_tool_result used,
+# with try/catch, so a torn or mid-write line degrades to "not awaiting" for
+# THAT transcript only, never the whole batch.
+_batch_awaiting_lookup() {
+  [ "$#" -gt 0 ] || return 0
+  local sep=$'\x01'
+  awk -v SEP="$sep" '
+    FNR==1 { if (prevf != "") print prevf SEP lastline; prevf=FILENAME }
+    { lastline = $0 }
+    END { if (prevf != "") print prevf SEP lastline }
+  ' "$@" | jq -R -c --arg sep "$sep" '
+    index($sep) as $i
+    | if $i == null then empty else
+        .[0:$i] as $path
+        | .[$i+1:] as $line
+        | (try ($line | fromjson) catch null) as $obj
+        | (if ($obj|type)=="object" then $obj.message else null end) as $m
+        | (if ($m|type)=="object" then ($m.content // null) else null end) as $c
+        | (($c|type) == "array" and ([ $c[] | select(.type? == "tool_use") ] | length) > 0) as $working
+        | [$path, ($working|tostring)] | @tsv
+      end
+  '
+}
+
+# THE single join: candidate rows (id, tr, mt, meta path) meet the two keyed
+# batch lookups above (name/kind by meta path, awaiting by transcript path) and
+# the reaped set, in one process. AWK does the keying, not bash — bash 3.2
+# (macOS's /bin/bash) has no associative arrays; awk has always had them. metaf/
+# awaitf may be /dev/null (nothing to look up) — awk reads that as zero lines
+# and the corresponding map simply stays empty, never an error.
+_join_batches() {
+  local candf="$1" metaf="$2" awaitf="$3" reaped="$4"
+  awk -v SEP=$'\x01' -v REAPED="$reaped" -v METAF="$metaf" -v AWAITF="$awaitf" '
+    BEGIN { FS = SEP }
+    FILENAME == METAF  { if (NF >= 3) { nm[$1] = $2; kd[$1] = $3 }; next }
+    FILENAME == AWAITF { if (NF >= 2) { aw[$1] = $2 }; next }
+    {
+      n = split($0, f, "\t")
+      id = f[1]; tr = f[2]; mt = f[3]; mp = f[4]
+      name = (mp in nm) ? nm[mp] : ""
+      kind = (mp in kd) ? kd[mp] : ""
+      wk   = (tr in aw) ? aw[tr] : "false"
+      reap = (index(REAPED, " " id " ") > 0) ? "1" : "0"
+      print id "\t" tr "\t" mt "\t" name "\t" kind "\t" wk "\t" mp "\t" reap
+    }
+  ' "$metaf" "$awaitf" "$candf"
+}
+
 # Session that OWNS a transcript: <projects>/<slug>/<session>/subagents/agent-x.jsonl
 _session_of_transcript() {
   local d="${1%/*}"          # strip /agent-x.jsonl  -> .../<session>/subagents
   d="${d%/subagents}"        # -> .../<session>
   case "$d" in */*) printf '%s' "${d##*/}" ;; esac
-}
-
-# TRUE when the agent is AWAITING A TOOL RESULT ⇒ genuinely alive regardless of
-# mtime. A cheap substring prefilter on the last line skips a jq spawn for the
-# overwhelming majority of transcripts, keeping `count` fast for the statusline.
-_awaiting_tool_result() {
-  local f="$1" line
-  [ -n "$f" ] && [ -f "$f" ] || return 1
-  line="$(tail -n 1 "$f" 2>/dev/null)"
-  case "$line" in *'"type":"tool_use"'*) ;; *) return 1 ;; esac
-  [ "$(printf '%s' "$line" | jq -r '
-      (.message.content? // null) as $c
-      | if ($c|type) == "array" and ([ $c[] | select(.type? == "tool_use") ] | length) > 0
-        then "tool_use" else "" end' 2>/dev/null | head -n 1)" = "tool_use" ]
 }
 
 # ── the notification index: AUTHORITATIVE completion evidence ────────────────
@@ -520,29 +646,64 @@ _terminal_state() {
 # Source 1 is the task dir. Source 2 is the subagents dir, restricted to parked
 # mailbox teammates — the class that never gets an `.output` entry. A `grep -l`
 # over the sidecars narrows 157 files to the handful that matter in one process.
+#
+# Source 1's transcript targets resolve via ONE batched, non-dereferencing stat
+# (_batch_output_targets) instead of one readlink() fork per candidate —
+# MEASURED 2026-09-24: this was the single largest fork source in enumerate(),
+# ~66ms/candidate under load. A whole-batch count mismatch (dialect
+# misdetection, or a file removed mid-call) falls back to the original
+# per-candidate readlink + _transcript_fallback derivation; never seen in
+# testing, kept for the fail-closed posture this file promises throughout.
 _collect_candidates() {
-  local taskdir="$1" subdirs="$2" f d m id tr meta seen=" "
+  local taskdir="$1" subdirs="$2" f d m id tr meta seen=" " i
+  local -a ids=() outs=() trs=()
   if [ -n "$taskdir" ] && [ -d "$taskdir" ]; then
     for f in "$taskdir"/*.output; do
       [ -e "$f" ] || continue
       id="${f##*/}"; id="${id%.output}"
-      tr="$(_transcript_for "$taskdir" "$id")"
-      meta=""
-      [ -n "$tr" ] && [ -f "${tr%.jsonl}.meta.json" ] && meta="${tr%.jsonl}.meta.json"
-      # NOT AN AGENT: a background Bash task. The harness writes those into the
-      # very same dir with a b+8/9 id and no agent metadata at all.
-      if [ -z "$meta" ] && { [ -z "$tr" ] || [ ! -f "$tr" ]; }; then
-        case "$id" in
-          b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]|\
-          b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z])
-            continue ;;
-        esac
-      fi
-      case "$seen" in *" $id "*) continue ;; esac
-      seen="$seen$id "
-      printf '%s\t%s\n' "$id" "$tr"
+      ids+=("$id"); outs+=("$f")
     done
   fi
+
+  if [ "${#outs[@]}" -gt 0 ]; then
+    while IFS= read -r tr; do trs+=("$tr"); done < <(_batch_output_targets "${outs[@]}")
+    if [ "${#trs[@]}" -ne "${#outs[@]}" ]; then
+      trs=()
+      for f in "${outs[@]}"; do
+        tr=""
+        if [ -L "$f" ]; then
+          tr="$(readlink "$f" 2>/dev/null)"
+          case "$tr" in /*) ;; *) tr="" ;; esac
+        fi
+        trs+=("$tr")
+      done
+    fi
+    for i in "${!outs[@]}"; do
+      case "${trs[$i]}" in
+        /*) ;;
+        *) trs[$i]="$(_transcript_fallback "$taskdir" "${ids[$i]}")" ;;
+      esac
+    done
+  fi
+
+  for i in "${!ids[@]}"; do
+    id="${ids[$i]}"; tr="${trs[$i]}"
+    meta=""
+    [ -n "$tr" ] && [ -f "${tr%.jsonl}.meta.json" ] && meta="${tr%.jsonl}.meta.json"
+    # NOT AN AGENT: a background Bash task. The harness writes those into the
+    # very same dir with a b+8/9 id and no agent metadata at all.
+    if [ -z "$meta" ] && { [ -z "$tr" ] || [ ! -f "$tr" ]; }; then
+      case "$id" in
+        b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]|\
+        b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z])
+          continue ;;
+      esac
+    fi
+    case "$seen" in *" $id "*) continue ;; esac
+    seen="$seen$id "
+    printf '%s\t%s\n' "$id" "$tr"
+  done
+
   for d in $subdirs; do
     [ -d "$d" ] || continue
     for m in $(grep -lF 'in_process_teammate' "$d"/*.meta.json 2>/dev/null); do
@@ -558,6 +719,8 @@ _collect_candidates() {
 enumerate() {
   local taskdir subdirs reaped cands sessions tsess slug
   local id tr meta mt age term state name kind nstat sess row
+  local workdir metaf awaitf candf joined j line
+  local -a c_id=() c_tr=() c_meta=() c_mtsrc=() c_mt=() mvals=() metapaths=() trpaths=()
   taskdir="$(resolve_taskdir)"
   subdirs="$(resolve_subagentsdirs current)"
   cands="$(_collect_candidates "$taskdir" "$subdirs")"
@@ -573,10 +736,20 @@ enumerate() {
 
   # Every session that could hold a task-notification for these agents: the task
   # dir's own session plus the session that actually owns each transcript (they
-  # differ in practice).
+  # differ in practice). Folded into the same pass as candidate-array building
+  # below, since both only need id/tr per candidate.
   sessions=" "
   [ -n "$tsess" ] && sessions=" $tsess "
   while IFS=$'\t' read -r id tr; do
+    [ -n "$id" ] || continue
+    c_id+=("$id"); c_tr+=("$tr")
+    meta=""
+    [ -n "$tr" ] && [ -f "${tr%.jsonl}.meta.json" ] && meta="${tr%.jsonl}.meta.json"
+    c_meta+=("$meta")
+    if [ -n "$tr" ] && [ -e "$tr" ]; then c_mtsrc+=("$tr")
+    elif [ -n "$taskdir" ] && [ -e "$taskdir/$id.output" ]; then c_mtsrc+=("$taskdir/$id.output")
+    else c_mtsrc+=("$0")   # placeholder: always exists, its mtime discarded below
+    fi
     [ -n "$tr" ] || continue
     sess="$(_session_of_transcript "$tr")"
     [ -n "$sess" ] || continue
@@ -588,40 +761,66 @@ enumerate() {
   done
   build_notif_index "$notif_files"
 
-  while IFS=$'\t' read -r id tr; do
-    [ -n "$id" ] || continue
-    mt=0
-    if [ -n "$tr" ] && [ -e "$tr" ]; then mt="$(_mtime "$tr")"
-    elif [ -n "$taskdir" ] && [ -e "$taskdir/$id.output" ]; then mt="$(_mtime "$taskdir/$id.output")"
+  # ── single-pass data gathering ────────────────────────────────────────────
+  # Every per-candidate FORK the old implementation paid here (one _mtime, one
+  # jq for name+kind, one tail(+jq) for awaiting-tool-result) is replaced by
+  # THREE batched passes over the full candidate set, joined once below. The
+  # classification chain further down is untouched — only where mt/name/kind/
+  # awaiting come from changes.
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/hmd-agents.XXXXXX" 2>/dev/null)" || workdir=""
+
+  if [ -n "$workdir" ]; then
+    trap 'rm -rf "$workdir"' RETURN
+
+    while IFS= read -r line; do mvals+=("$line"); done < <(_batch_mtimes "${c_mtsrc[@]}")
+    if [ "${#mvals[@]}" -ne "${#c_mtsrc[@]}" ]; then
+      for j in "${!c_mtsrc[@]}"; do mvals[$j]="$(_mtime "${c_mtsrc[$j]}")"; done
     fi
+    for j in "${!c_mtsrc[@]}"; do
+      if [ "${c_mtsrc[$j]}" = "$0" ]; then c_mt+=(0); else c_mt+=("${mvals[$j]}"); fi
+    done
+
+    for j in "${!c_id[@]}"; do
+      [ -n "${c_meta[$j]}" ] && metapaths+=("${c_meta[$j]}")
+      [ -n "${c_tr[$j]}" ] && [ -f "${c_tr[$j]}" ] && trpaths+=("${c_tr[$j]}")
+    done
+
+    candf="$workdir/cand"
+    : > "$candf"
+    for j in "${!c_id[@]}"; do
+      printf '%s\t%s\t%s\t%s\n' "${c_id[$j]}" "${c_tr[$j]}" "${c_mt[$j]}" "${c_meta[$j]}" >> "$candf"
+    done
+    metaf="/dev/null"
+    [ "${#metapaths[@]}" -gt 0 ] && { metaf="$workdir/meta"; _batch_meta_lookup "${metapaths[@]}" > "$metaf"; }
+    awaitf="/dev/null"
+    [ "${#trpaths[@]}" -gt 0 ] && { awaitf="$workdir/await"; _batch_awaiting_lookup "${trpaths[@]}" > "$awaitf"; }
+
+    joined="$(_join_batches "$candf" "$metaf" "$awaitf" "$reaped")"
+  else
+    # mktemp failed (disk full / unwritable tmp) — degrade to the pre-batch,
+    # one-fork-per-candidate path rather than lose classification correctness.
+    # Never expected to run; kept for the "Exit: 0 always... never crashes"
+    # guarantee this file promises everywhere else.
+    joined="$(_enumerate_classify_slow "$taskdir" "$reaped" <<< "$cands")"
+  fi
+
+  [ -n "$joined" ] || return 0
+
+  while IFS=$'\t' read -r id tr mt name kind awaiting meta is_reaped; do
+    [ -n "$id" ] || continue
     age=$(( NOW - mt ))
     [ "$age" -lt 0 ] && age=0
-
-    meta=""; name=""; kind=""
-    if [ -n "$tr" ] && [ -f "${tr%.jsonl}.meta.json" ]; then
-      meta="${tr%.jsonl}.meta.json"
-      # ONE jq call, not two — under load a fork costs far more than asking jq
-      # for one extra field. @tsv (not raw multi-line -r output) because a
-      # trailing empty field's newline is stripped by "$(...)" the same as any
-      # other trailing newline, which would silently shift kind into name for
-      # every regular (non-teammate) subagent — @tsv keeps both fields on the
-      # one line jq actually prints, so nothing is lost to that stripping.
-      # MEASURED 2026-09-24: this loop cost ~66ms/candidate under load, forks
-      # dominating; halving the jq calls here is a direct cut shared by every
-      # caller of enumerate() — list/count/orphans/reap/sweep alike.
-      IFS=$'\t' read -r name kind <<< "$(jq -r '[(.name // ""), (.taskKind // "")] | @tsv' "$meta" 2>/dev/null)"
-    fi
     [ -n "$name" ] || name="-"
     sess="$(_session_of_transcript "$tr")"
     [ -n "$sess" ] || sess="$tsess"
 
     state=""
-    case "$reaped" in *" $id "*) state="reaped" ;; esac
+    [ "$is_reaped" = "1" ] && state="reaped"
 
     # THE GUARD, FIRST: an agent awaiting a tool result is alive regardless of
     # age, of a dead session, or of any earlier notification (it may have been
     # resumed). This is what makes a 40-minute build safe from the reaper.
-    if [ -z "$state" ] && _awaiting_tool_result "$tr"; then
+    if [ -z "$state" ] && [ "$awaiting" = "true" ]; then
       if [ "$age" -ge "$HUNG_SECS" ]; then state="hung"; else state="working"; fi
     fi
 
@@ -655,7 +854,44 @@ enumerate() {
       fi
     fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$age" "$state" "$name" "$meta"
-  done <<< "$cands" | sort
+  done <<< "$joined" | sort
+}
+
+# Fallback classification identical in outcome to the pre-batch implementation
+# — one fork per candidate. Used only when mktemp fails; see the comment at its
+# one call site in enumerate(). Reads `id<TAB>tr` rows on stdin, emits the same
+# 8-column shape _join_batches produces so the shared classifier loop above
+# cannot tell which path produced its input.
+_enumerate_classify_slow() {
+  local taskdir="$1" reaped="$2"
+  local id tr meta mt name kind line is_reaped awaiting
+  while IFS=$'\t' read -r id tr; do
+    [ -n "$id" ] || continue
+    mt=0
+    if [ -n "$tr" ] && [ -e "$tr" ]; then mt="$(_mtime "$tr")"
+    elif [ -n "$taskdir" ] && [ -e "$taskdir/$id.output" ]; then mt="$(_mtime "$taskdir/$id.output")"
+    fi
+    meta=""; name=""; kind=""
+    if [ -n "$tr" ] && [ -f "${tr%.jsonl}.meta.json" ]; then
+      meta="${tr%.jsonl}.meta.json"
+      IFS=$'\t' read -r name kind <<< "$(jq -r '[(.name // ""), (.taskKind // "")] | @tsv' "$meta" 2>/dev/null)"
+    fi
+    awaiting=false
+    if [ -n "$tr" ] && [ -f "$tr" ]; then
+      line="$(tail -n 1 "$tr" 2>/dev/null)"
+      case "$line" in
+        *'"type":"tool_use"'*)
+          [ "$(printf '%s' "$line" | jq -r '
+              (.message.content? // null) as $c
+              | if ($c|type) == "array" and ([ $c[] | select(.type? == "tool_use") ] | length) > 0
+                then "tool_use" else "" end' 2>/dev/null)" = "tool_use" ] && awaiting=true
+          ;;
+      esac
+    fi
+    is_reaped=0
+    case "$reaped" in *" $id "*) is_reaped=1 ;; esac
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$tr" "$mt" "$name" "$kind" "$awaiting" "$meta" "$is_reaped"
+  done
 }
 
 # ── subcommands ───────────────────────────────────────────────────────────────
@@ -721,13 +957,13 @@ cmd_count() {
   # LIVE only — the statusline's authoritative count. `working` counts as live
   # (it is genuinely running); stale/hung/terminal/orphaned/mailbox/reaped do not.
   # Deliberately still shares enumerate() with list/orphans/reap/sweep rather
-  # than a leaner count-only walk: MEASURED 2026-09-24, the only per-candidate
-  # cost enumerate() paid that classification never needed was a second jq
-  # fork to fetch `name` — folded into ONE call together with `kind` (which IS
-  # load-bearing for count: a fresh in_process_teammate must classify
-  # `mailbox`, not `live`), so every caller of enumerate() benefits, not just
-  # this one. There is no whole-transcript read left to trim: _awaiting_tool_
-  # result already reads only the last line (`tail -n 1`), never the whole file.
+  # than a leaner count-only walk: since 2026-09-24 enumerate() pays ZERO forks
+  # per candidate at all (batched stat/awk/jq passes over the whole candidate
+  # set, joined once — see _collect_candidates and enumerate()), there is no
+  # per-candidate cost left for a count-only path to avoid; `name` (which
+  # count() never uses) comes along for free in the same batched meta.json
+  # lookup that `kind` does, and `kind` IS load-bearing here (a fresh
+  # in_process_teammate must classify `mailbox`, not `live`).
   local n
   n="$(enumerate | awk -F'\t' '$3=="live" || $3=="working"' | wc -l | tr -d ' ')"
   printf '%s\n' "${n:-0}"
