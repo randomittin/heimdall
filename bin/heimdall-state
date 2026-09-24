@@ -14,7 +14,20 @@ set -euo pipefail
 # that has many other jq-only responsibilities unrelated to this one check.
 HMD_STATE_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/hook-owned-path.sh
-. "$HMD_STATE_SELF_DIR/lib/hook-owned-path.sh" 2>/dev/null || true
+# Existence-checked BEFORE sourcing, not `|| true`-guarded after: under
+# `set -e`, bash treats `.`/`source` failing to OPEN a missing file as a hard
+# abort of the whole script that a trailing `|| true` does NOT catch (this is
+# not "defensive but redundant" -- it silently un-does the defensiveness this
+# block documents above). A fake-plugin root carrying heimdall-state without
+# its bin/lib/ sibling therefore killed EVERY subcommand -- init, mark-clean,
+# check-quality-gates, all of it -- since the `.` runs before the case
+# dispatch even sees which subcommand was requested. Proved by
+# test/pre-push-quality-gate-blocking.test.sh case 1, which isolates
+# heimdall-state exactly this way on purpose. See also
+# test/heimdall-state-lib-isolation.test.sh (the regression lock).
+if [ -r "$HMD_STATE_SELF_DIR/lib/hook-owned-path.sh" ]; then
+  . "$HMD_STATE_SELF_DIR/lib/hook-owned-path.sh"
+fi
 
 # State file: prefer HEIMDALL_STATE_FILE, fall back to legacy SUPERX_STATE_FILE.
 # Default to heimdall-state.json, but adopt a pre-existing legacy superx-state.json
