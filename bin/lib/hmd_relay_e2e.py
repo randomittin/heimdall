@@ -183,10 +183,24 @@ def pub_b64(pub: bytes) -> str:
 
 
 def pub_from_b64(s: str) -> bytes:
+    """Accepts both alphabets this module actually receives: standard, padded
+    base64 (this module's own pub_b64() output, e.g. hmd's pubkey as decoded
+    back by test/lib/fake-relay.py's `device envelope` helper) and URL-safe,
+    unpadded base64 -- the wire shape of a real device_pubkey, which the app
+    encodes via protocol.ts's base64UrlEncode (query strings can't safely
+    carry '+'/'/'/'=') and the relay forwards byte-for-byte into device_bound.
+    A 32-byte value always has exactly one trailing '=' in standard form
+    (32 % 3 == 2), so every real device_pubkey arrives URL-safe *and*
+    unpadded -- not a rare edge case, the only shape a real device ever sends.
+    Swapping the two differing characters back before padding is safe for
+    already-standard input too: '-'/'_' never appear there, so the replace
+    is a no-op and padding-if-needed is idempotent on already-padded input."""
     if not isinstance(s, str):
         raise E2EError(f"pub_from_b64: expected str, got {type(s).__name__}")
+    normalized = s.replace("-", "+").replace("_", "/")
+    padded = normalized + "=" * (-len(normalized) % 4)
     try:
-        raw = base64.b64decode(s, validate=True)
+        raw = base64.b64decode(padded, validate=True)
     except (ValueError, TypeError) as exc:
         raise E2EError(f"pub_from_b64: invalid base64: {exc}") from exc
     if len(raw) != 32:
