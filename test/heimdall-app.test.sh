@@ -698,22 +698,45 @@ grep -q '^funnel 443 off$' "$LOG" && ok "A4a. disconnect w/ no state file still 
 rm -rf "$D"
 
 # ── A4(b). connect defaults to the fixed port 8710; busy -> exit 6 ───────
-D="$(make_repo)"
-OUT_FILE="$TMPROOT/connect-a4b-default.out"
-FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg >"$OUT_FILE" 2>&1
-RC=$?
-if [ "$RC" -eq 0 ]; then
-  SF="$D/.heimdall/app/connect.json"
-  DP="$(jq -r '.port // empty' "$SF" 2>/dev/null)"
-  [ "$DP" = "8710" ] && ok "A4b. connect w/ no --port defaults to the fixed port 8710" || bad "port=$DP (want 8710)"
-  FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
-else
-  bad "A4b setup: connect (no --port) failed: $(cat "$OUT_FILE")"
+# 8710 is a fixed, non-configurable default (see bin/heimdall-app's usage
+# banner) -- every other "$APP" connect call in this file passes --port 0
+# specifically to stay off it, so nothing *we* run can be the occupant.
+# That means both assertions below only hold if 8710 is free on the host
+# before we touch it: a real, concurrent `hmd app connect` elsewhere on the
+# same machine legitimately owns it sometimes, which corrupts the first
+# assertion (connect fails outright) and starves the second (its own probe
+# listener never gets to be the reason exit 6 happens). Probe first --
+# reusing this block's own /dev/tcp idiom below, a real connect attempt,
+# not a sleep -- and if something external already holds it, skip both
+# loudly via ok(), same pattern as the SIGHUP/-N-suffix skips elsewhere in
+# this file. Falsifiability of the two real assertions is untouched: the
+# "free" branch below is byte-for-byte the original code.
+A4B_PORT_BUSY_EXTERNALLY=0
+if exec 3<>/dev/tcp/127.0.0.1/8710 2>/dev/null; then
+  exec 3<&- 2>/dev/null || true
+  A4B_PORT_BUSY_EXTERNALLY=1
 fi
-rm -rf "$D"
 
-D="$(make_repo)"
-python3 - <<'PYEOF' &
+if [ "$A4B_PORT_BUSY_EXTERNALLY" -eq 1 ]; then
+  ok "A4b. connect w/ no --port defaults to the fixed port 8710: skipped (port 8710 already in use by another process on this machine)"
+  ok "A4b. connect w/ the fixed default port (8710) busy exits 6: skipped (port 8710 already in use by another process on this machine)"
+else
+  D="$(make_repo)"
+  OUT_FILE="$TMPROOT/connect-a4b-default.out"
+  FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg >"$OUT_FILE" 2>&1
+  RC=$?
+  if [ "$RC" -eq 0 ]; then
+    SF="$D/.heimdall/app/connect.json"
+    DP="$(jq -r '.port // empty' "$SF" 2>/dev/null)"
+    [ "$DP" = "8710" ] && ok "A4b. connect w/ no --port defaults to the fixed port 8710" || bad "port=$DP (want 8710)"
+    FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
+  else
+    bad "A4b setup: connect (no --port) failed: $(cat "$OUT_FILE")"
+  fi
+  rm -rf "$D"
+
+  D="$(make_repo)"
+  python3 - <<'PYEOF' &
 import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -721,19 +744,20 @@ s.bind(("127.0.0.1", 8710))
 s.listen(1)
 time.sleep(20)
 PYEOF
-HOLD_PID=$!
-PIDS+=("$HOLD_PID")
-HOLD_WAITED=0
-while ! exec 3<>/dev/tcp/127.0.0.1/8710 2>/dev/null && [ "$HOLD_WAITED" -lt 50 ]; do
-  sleep 0.1
-  HOLD_WAITED=$((HOLD_WAITED + 1))
-done
-exec 3<&- 2>/dev/null || true
-OUT="$(FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg 2>&1)"; RC=$?
-[ "$RC" -eq 6 ] && ok "A4b. connect w/ the fixed default port (8710) busy exits 6" || bad "exit $RC (want 6): $OUT"
-kill "$HOLD_PID" 2>/dev/null
-wait "$HOLD_PID" 2>/dev/null
-rm -rf "$D"
+  HOLD_PID=$!
+  PIDS+=("$HOLD_PID")
+  HOLD_WAITED=0
+  while ! exec 3<>/dev/tcp/127.0.0.1/8710 2>/dev/null && [ "$HOLD_WAITED" -lt 50 ]; do
+    sleep 0.1
+    HOLD_WAITED=$((HOLD_WAITED + 1))
+  done
+  exec 3<&- 2>/dev/null || true
+  OUT="$(FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg 2>&1)"; RC=$?
+  [ "$RC" -eq 6 ] && ok "A4b. connect w/ the fixed default port (8710) busy exits 6" || bad "exit $RC (want 6): $OUT"
+  kill "$HOLD_PID" 2>/dev/null
+  wait "$HOLD_PID" 2>/dev/null
+  rm -rf "$D"
+fi
 
 # ── A4(c). status detects an orphaned funnel (ui dead, funnel still up) ──
 D="$(make_repo)"
