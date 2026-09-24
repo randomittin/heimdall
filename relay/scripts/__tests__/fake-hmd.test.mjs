@@ -27,9 +27,13 @@ import {
   resolvePhonePubkey,
   nextBackoffMs,
   runStreamWithReconnect,
+  readWithIdleTimeout,
   FatalStreamError,
+  StreamIdleError,
   BACKOFF_BASE_MS,
   BACKOFF_CAP_MS,
+  STREAM_IDLE_TIMEOUT_MS,
+  RELAY_KEEPALIVE_INTERVAL_MS,
 } from '../fake-hmd.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url)); // .../relay/scripts/__tests__/
@@ -408,6 +412,242 @@ test('runStreamWithReconnect retries an ordinary error thrown by runOnce', async
   // undici raises a bare TypeError('terminated') when the response body is
   // cut mid-stream -- the exact 2026-09-24 failure. It must not be fatal.
   const fakes = makeFakes({ outcomes: [new TypeError('terminated'), 'session-ended'] });
+  assert.equal(await runStreamWithReconnect(fakes), 'session-ended');
+  assert.equal(fakes.callCount(), 2);
+  assert.deepEqual(fakes.slept, [1000]);
+});
+
+// --- stream idle watchdog (an orphaned stream that never closes) ---------
+
+/** An async iterable whose chunks are pushed by the test, so "no bytes
+ *  arrive" is a state the test can hold indefinitely rather than simulate.
+ *  Records whether the consumer released the iterator (`return()`), which is
+ *  what actually aborts a real undici response body. */
+function controllableSource() {
+  let pendingResolve = null;
+  const queued = [];
+  let ended = false;
+  let returned = false;
+
+  function settle() {
+    if (!pendingResolve) return;
+    if (queued.length > 0) {
+      const resolve = pendingResolve;
+      pendingResolve = null;
+      resolve({ value: queued.shift(), done: false });
+    } else if (ended) {
+      const resolve = pendingResolve;
+      pendingResolve = null;
+      resolve({ value: undefined, done: true });
+    }
+  }
+
+  return {
+    push(value) {
+      queued.push(value);
+      settle();
+    },
+    end() {
+      ended = true;
+      settle();
+    },
+    get returned() {
+      return returned;
+    },
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          if (queued.length > 0) return Promise.resolve({ value: queued.shift(), done: false });
+          if (ended) return Promise.resolve({ value: undefined, done: true });
+          return new Promise((resolve) => {
+            pendingResolve = resolve;
+          });
+        },
+        return() {
+          returned = true;
+          return Promise.resolve({ value: undefined, done: true });
+        },
+      };
+    },
+  };
+}
+
+/** A promise that never settles — models a read, or a release, that cannot
+ *  complete because the stream behind it has stopped producing. */
+function pending() {
+  return new Promise(() => undefined);
+}
+
+/** The shape a real `Readable.fromWeb(res.body)` iterator takes on a stream
+ *  that has gone silent: it is suspended inside its own internal `await`, so
+ *  neither `next()` nor `return()` will ever settle. Verified against Node
+ *  24: calling `return()` on such an iterator leaves the returned promise
+ *  pending indefinitely, because an async generator only acts on `return()`
+ *  at a `yield` point, never mid-`await`. */
+function stalledSource() {
+  let releaseRequested = false;
+  return {
+    get releaseRequested() {
+      return releaseRequested;
+    },
+    [Symbol.asyncIterator]() {
+      return {
+        next: pending,
+        return() {
+          releaseRequested = true;
+          return pending();
+        },
+      };
+    },
+  };
+}
+
+test('readWithIdleTimeout times out even when releasing the iterator would never settle', { timeout: 5000 }, async () => {
+  // The bug this guards: awaiting the release in the exit path hangs forever
+  // on precisely the stream this function exists to rescue — a silent one.
+  // With a fake iterator whose return() resolves, the suite passed while the
+  // real client still hung against a live silent response body.
+  const source = stalledSource();
+  const started = Date.now();
+  await assert.rejects(async () => {
+    for await (const _chunk of readWithIdleTimeout(source, 40)) {
+      /* the stream never produces, so this body never runs */
+    }
+  }, StreamIdleError);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 2000, `expected a prompt timeout, took ${elapsed}ms`);
+  assert.equal(source.releaseRequested, true, 'the iterator must still be released');
+});
+
+test('readWithIdleTimeout tears the source down through onIdle before it throws', { timeout: 5000 }, async () => {
+  // Releasing the iterator cannot unblock a stalled read (see above), so the
+  // caller is handed the one hook that can: aborting the fetch behind it.
+  const source = stalledSource();
+  let tornDown = 0;
+  await assert.rejects(async () => {
+    for await (const _chunk of readWithIdleTimeout(source, 40, () => {
+      tornDown += 1;
+    })) {
+      /* never reached */
+    }
+  }, StreamIdleError);
+  assert.equal(tornDown, 1);
+});
+
+test('readWithIdleTimeout does not call onIdle for a stream that ends normally', async () => {
+  const source = controllableSource();
+  let tornDown = 0;
+  const drain = (async () => {
+    const seen = [];
+    for await (const chunk of readWithIdleTimeout(source, 500, () => {
+      tornDown += 1;
+    })) {
+      seen.push(chunk);
+    }
+    return seen;
+  })();
+  source.push('a');
+  source.end();
+  assert.deepEqual(await drain, ['a']);
+  assert.equal(tornDown, 0);
+});
+
+test('STREAM_IDLE_TIMEOUT_MS leaves headroom over the relay keepalive interval', () => {
+  // The relay writes a keepalive every 20s of idleness
+  // (relay/src/session.ts KEEPALIVE_INTERVAL_MS), so silence past a safe
+  // multiple of that is proof the writer is gone -- not merely a quiet
+  // session. Too tight and an ordinary scheduling hiccup reconnects a
+  // healthy stream.
+  assert.ok(
+    STREAM_IDLE_TIMEOUT_MS >= RELAY_KEEPALIVE_INTERVAL_MS * 2,
+    `expected at least two missed keepalives of headroom, got ${STREAM_IDLE_TIMEOUT_MS}ms over ${RELAY_KEEPALIVE_INTERVAL_MS}ms`
+  );
+});
+
+test('readWithIdleTimeout passes chunks straight through while the stream produces', async () => {
+  const source = controllableSource();
+  const seen = [];
+  const drain = (async () => {
+    for await (const chunk of readWithIdleTimeout(source, 200)) seen.push(chunk);
+  })();
+
+  source.push('a');
+  source.push('b');
+  source.end();
+  await drain;
+
+  assert.deepEqual(seen, ['a', 'b']);
+});
+
+test('readWithIdleTimeout does not fire while chunks keep arriving inside the deadline', async () => {
+  const source = controllableSource();
+  const seen = [];
+  const drain = (async () => {
+    for await (const chunk of readWithIdleTimeout(source, 120)) seen.push(chunk);
+  })();
+
+  // Three gaps, each comfortably under the deadline, totalling more than it:
+  // an idle *deadline* must reset on every chunk, never accumulate.
+  for (const chunk of ['a', 'b', 'c']) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    source.push(chunk);
+  }
+  source.end();
+  await drain;
+
+  assert.deepEqual(seen, ['a', 'b', 'c']);
+});
+
+test('readWithIdleTimeout throws StreamIdleError when no chunk arrives within the deadline', async () => {
+  // The 2026-09-24 failure: the Durable Object that was writing hmd's stream
+  // went away (a deploy), but the chunked response to hmd stayed open. With
+  // no bytes and no close, `for await` waits forever, hmd never reopens
+  // GET /stream, and so the relay never gets a new stream controller --
+  // every phone `command` is dropped at session.ts's webSocketMessage from
+  // then on, while POST /frames keeps working.
+  const source = controllableSource();
+  await assert.rejects(
+    async () => {
+      for await (const _chunk of readWithIdleTimeout(source, 40)) {
+        /* the stream never produces, so this body never runs */
+      }
+    },
+    (err) => {
+      assert.ok(err instanceof StreamIdleError, `expected StreamIdleError, got ${err?.name}`);
+      assert.match(err.message, /40ms/);
+      return true;
+    }
+  );
+});
+
+test('readWithIdleTimeout releases the underlying iterator when it times out', async () => {
+  // Releasing is what aborts the real response body and frees the socket --
+  // without it the reconnect would stack a second stream on a leaked first.
+  const source = controllableSource();
+  await assert.rejects(async () => {
+    for await (const _chunk of readWithIdleTimeout(source, 30)) {
+      /* never reached */
+    }
+  }, StreamIdleError);
+  assert.equal(source.returned, true);
+});
+
+test('readWithIdleTimeout releases the underlying iterator when the consumer breaks early', async () => {
+  const source = controllableSource();
+  source.push('only-one');
+  for await (const chunk of readWithIdleTimeout(source, 500)) {
+    assert.equal(chunk, 'only-one');
+    break;
+  }
+  assert.equal(source.returned, true);
+});
+
+test('a StreamIdleError is retried by the reconnect ladder, not treated as fatal', async () => {
+  // It must land in the same bucket as undici's TypeError('terminated'):
+  // reopen with backoff, and reset the ladder because the stream had opened.
+  const fakes = makeFakes({
+    outcomes: [new StreamIdleError(60000, 20000), 'session-ended'],
+  });
   assert.equal(await runStreamWithReconnect(fakes), 'session-ended');
   assert.equal(fakes.callCount(), 2);
   assert.deepEqual(fakes.slept, [1000]);

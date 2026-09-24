@@ -132,6 +132,21 @@ Two independent mitigations, because either alone is insufficient:
    relay adds no retry path. The one exception remains the single `device_bound` control frame,
    which is parked until hmd's stream opens.
 
+   **hmd must reconnect on silence too, not only on close** — and the keepalive above is what
+   makes that decidable. `hmdStreamController` is in-memory state that no storage can hold, so a
+   Durable Object restart (any deploy, any eviction) destroys it; the chunked response to hmd can
+   stay open at the client regardless, carrying nothing. A client that only reacts to a *closed*
+   stream then waits forever, never reopens `GET /stream`, and the restarted Durable Object never
+   gets a controller back — so `webSocketMessage` drops every phone `command` from then on while
+   `POST /frames` keeps delivering hmd→phone perfectly, since that direction re-derives the
+   device socket from `getWebSockets` on every call. Confirmed live 2026-09-24 after redeploying
+   `8a6e821e` over a 2.5h-old session: state flowed to the phone the whole time and every
+   phone→hmd send timed out. The keepalive created this trap as much as it mitigates the idle
+   cut — before it, Cloudflare's ~5-minute cut forced the reconnect that healed an orphaned
+   stream by accident. `fake-hmd.mjs` bounds stream silence at three missed keepalives
+   (`STREAM_IDLE_TIMEOUT_MS`); `docs/HANDOFF-TO-HEIMDALL-relay.md`'s "Stream lifetime" rule 5 is
+   the contract hmd implements against.
+
    `relay/scripts/fake-hmd.mjs` implements exactly this contract and is the reference for
    `bin/heimdall-relay-client` (see `docs/HANDOFF-TO-HEIMDALL-relay.md`'s "Stream lifetime").
 

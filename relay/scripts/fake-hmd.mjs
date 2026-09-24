@@ -75,6 +75,132 @@ export class FatalStreamError extends Error {
   }
 }
 
+/** How often the relay writes a `keepalive` control frame down an otherwise
+ *  idle `GET /stream` (relay/src/session.ts's KEEPALIVE_INTERVAL_MS).
+ *  Restated here rather than read off the wire, because the deadline below
+ *  exists precisely to notice a stream that has stopped producing -- a value
+ *  learned from the stream is worthless once the stream goes quiet. */
+export const RELAY_KEEPALIVE_INTERVAL_MS = 20000;
+
+/**
+ * How long `GET /stream` may produce *nothing at all* before this client
+ * gives up on it and reconnects.
+ *
+ * A stream that carries no bytes and never closes is not a quiet session --
+ * it is a dead writer. The relay keepalives an idle stream every
+ * `RELAY_KEEPALIVE_INTERVAL_MS`, so on a healthy stream a line arrives at
+ * least that often; prolonged silence is the one thing that cannot happen
+ * while the Durable Object writing it is alive.
+ *
+ * Observed live on 2026-09-24. The SessionDO restarted (a deploy) and took
+ * `hmdStreamController` with it -- a ReadableStream controller is in-memory
+ * state no storage can hold. hmd's chunked response stayed open at the client
+ * anyway, so this loop sat in `for await` forever, never reopened
+ * `GET /stream`, and so the restarted Durable Object never got a controller
+ * back. `POST /frames` (hmd -> phone) kept working perfectly -- it re-derives
+ * the device socket from `getWebSockets` on every call -- while every phone
+ * `command` was dropped at `webSocketMessage`. A one-way dead session that
+ * looked healthy from both ends.
+ *
+ * Note what closed the trap: before the keepalive existed, Cloudflare cut any
+ * stream idle for ~5 minutes, which forced a reconnect and healed an orphaned
+ * stream by accident. Adding the keepalive stopped those cuts -- and the
+ * keepalive timer dies with the Durable Object too. The relay now emits a
+ * liveness signal every 20s, so something has to actually read it as one.
+ *
+ * Three missed keepalives: loose enough that a scheduling hiccup or a slow
+ * write never reconnects a healthy stream, tight enough that a session
+ * recovers in about a minute rather than never.
+ */
+export const STREAM_IDLE_TIMEOUT_MS = 3 * RELAY_KEEPALIVE_INTERVAL_MS;
+
+/** A stream that stopped producing without ever closing. Retried exactly
+ *  like an ordinary drop (`runStreamWithReconnect` reopens with backoff) --
+ *  it is emphatically not fatal, and the session on the other side is still
+ *  alive and still bound. */
+export class StreamIdleError extends Error {
+  constructor(idleMs, keepaliveMs = RELAY_KEEPALIVE_INTERVAL_MS) {
+    super(
+      `no bytes for ${idleMs}ms on a stream the relay keepalives every ${keepaliveMs}ms -- treating it as dead`
+    );
+    this.name = 'StreamIdleError';
+    this.idleMs = idleMs;
+  }
+}
+
+/** Marker resolved by the idle timer below. A resolving sentinel rather than
+ *  a rejecting timer, so the losing branch of the race never leaves a
+ *  rejected promise behind for the runtime to complain about. */
+const IDLE_SENTINEL = Symbol('stream-idle');
+
+/**
+ * Observes a promise this module has deliberately stopped awaiting, and
+ * reports whether it succeeded. Node terminates the process on an unhandled
+ * rejection, so a read abandoned by the idle timeout still has to be looked
+ * at; its outcome carries no information for the caller, which has already
+ * timed out on that read and is about to destroy the stream it belongs to.
+ */
+function discardOutcome(promise) {
+  return Promise.resolve(promise).then(
+    () => true,
+    () => false
+  );
+}
+
+/**
+ * Yields `source`'s chunks, throwing `StreamIdleError` if any single gap
+ * between them exceeds `idleMs`.
+ *
+ * The deadline resets on every chunk -- it bounds silence, not total
+ * duration, so a long healthy stream never trips it.
+ *
+ * `onIdle` is the teardown that actually frees the connection, and it exists
+ * because releasing the iterator cannot do it. An async iterator acts on
+ * `return()` only at a `yield`, never mid-`await` -- and a
+ * `Readable.fromWeb(res.body)` iterator over a silent response body is
+ * suspended inside exactly such an `await`, so both its `next()` and its
+ * `return()` stay pending forever. Verified against Node 24, and this bit
+ * first: an earlier cut of this function awaited the release on the way out
+ * and hung indefinitely on precisely the stream it was written to rescue,
+ * while a unit test using a well-behaved fake iterator passed.
+ *
+ * So the release is requested but never awaited, and the caller is handed the
+ * one hook that can unblock a stalled read: aborting the fetch behind it.
+ */
+export async function* readWithIdleTimeout(source, idleMs, onIdle) {
+  const iterator = source[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      const next = iterator.next();
+      let timer = null;
+      const idle = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(IDLE_SENTINEL), idleMs);
+      });
+
+      let result;
+      try {
+        result = await Promise.race([next, idle]);
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+
+      if (result === IDLE_SENTINEL) {
+        discardOutcome(next);
+        if (onIdle) onIdle();
+        throw new StreamIdleError(idleMs);
+      }
+      if (result.done) return;
+      yield result.value;
+    }
+  } finally {
+    // Requested, deliberately not awaited -- see above. On a stream that
+    // ended or was broken out of, this settles immediately anyway; on a
+    // stalled one it never would, and `onIdle` has already torn the
+    // connection down.
+    discardOutcome(iterator.return?.());
+  }
+}
+
 /**
  * Runs `runOnce` for as long as the session lives, reconnecting with backoff
  * whenever the stream drops.
@@ -417,10 +543,15 @@ async function main() {
    *  back here after a drop. A fresh `buffer` per connection: a partial line
    *  from a cut stream is not a prefix of the reopened one. */
   async function streamOnce(isReconnect) {
+    // Aborting the fetch is the only thing that frees a response body which
+    // has stopped producing: destroying the Readable wrapped around it would
+    // queue behind a read that will never settle (see readWithIdleTimeout).
+    const abort = new AbortController();
     let res;
     try {
       res = await fetch(`${relayBase}/session/${sessionId}/stream`, {
         headers: { Authorization: `Bearer ${relaySessionToken}` },
+        signal: abort.signal,
       });
     } catch (err) {
       console.error(`[fake-hmd] could not reach the relay stream: ${err.message}`);
@@ -439,7 +570,11 @@ async function main() {
 
     let buffer = '';
     try {
-      for await (const chunk of Readable.fromWeb(res.body)) {
+      for await (const chunk of readWithIdleTimeout(
+        Readable.fromWeb(res.body),
+        STREAM_IDLE_TIMEOUT_MS,
+        () => abort.abort()
+      )) {
         buffer += chunk.toString('utf8');
         let newlineIndex;
         while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
@@ -450,8 +585,14 @@ async function main() {
         }
       }
     } catch (err) {
-      // Cloudflare cutting the response body surfaces here as undici's bare
-      // TypeError('terminated') -- the 2026-09-24 failure. Reconnect.
+      // Two shapes land here, and both mean "reopen the stream":
+      //   * undici's bare TypeError('terminated') -- Cloudflare cut the
+      //     response body, the ordinary 5-minute-idle case.
+      //   * StreamIdleError -- the body never closed but stopped producing,
+      //     so the Durable Object writing it is gone (see
+      //     STREAM_IDLE_TIMEOUT_MS). Nothing else will ever end this stream,
+      //     and until it ends, the relay has no controller to forward phone
+      //     `command` frames into.
       console.error(`[fake-hmd] stream dropped (${err.message}), reconnecting`);
       return 'closed';
     }
