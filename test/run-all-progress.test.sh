@@ -196,6 +196,8 @@ PW2="$WORK/repo2"
 mkdir -p "$PW2/test"
 ( cd "$PW2" && git init -q && git config user.email dev@example.com && git config user.name Dev )
 cp "$RUN_ALL" "$PW2/test/run-all.sh"
+mkdir -p "$PW2/bin/lib"
+cp "$ROOT/bin/lib/hook-owned-path.sh" "$PW2/bin/lib/hook-owned-path.sh"
 
 cat > "$PW2/test/r-pass.test.sh" <<'EOF'
 #!/usr/bin/env bash

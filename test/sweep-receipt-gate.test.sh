@@ -125,6 +125,10 @@ RW="$WORK/writer-repo"
 newrepo "$RW"
 mkdir -p "$RW/test"
 cp "$RUN_ALL" "$RW/test/run-all.sh"
+mkdir -p "$RW/bin/lib"
+cp "$ROOT/bin/lib/hook-owned-path.sh" "$RW/bin/lib/hook-owned-path.sh"
+cp "$STATE_BIN" "$RW/bin/heimdall-state"
+chmod +x "$RW/bin/heimdall-state"
 cat > "$RW/test/dummy.test.sh" <<'DUMMYEOF'
 #!/usr/bin/env bash
 # throwaway fixture suite for test/sweep-receipt-gate.test.sh -- deliberately trivial.
@@ -141,8 +145,17 @@ git -C "$RW" add -A
 git -C "$RW" commit -q -m "fixture: dummy suite + run-all.sh copy"
 RW_SHA="$(git -C "$RW" rev-parse HEAD)"
 RW_RECEIPT="$RW/.heimdall/receipts/last-sweep.json"
+# Deliberately OUTSIDE $RW, same reason $RWS_STATE further down is: a
+# heimdall-state.json written via the default cwd-relative path would itself be a
+# second, allowlist-outside untracked file, confounding the tree_clean assertions
+# this section checks. HEIMDALL_STATE_FILE travels with every run-all.sh
+# invocation below so the mark-tests-clean call run-all.sh now makes internally
+# lands here too, not at $RW/heimdall-state.json.
+RW_STATE="$WORK/rw-heimdall-state.json"
+( cd "$RW" && HEIMDALL_STATE_FILE="$RW_STATE" "$STATE_BIN" init >/dev/null 2>&1 \
+  && HEIMDALL_STATE_FILE="$RW_STATE" "$STATE_BIN" mark-dirty >/dev/null 2>&1 )
 
-( cd "$RW" && bash test/run-all.sh --min 1 ) >"$WORK/a.out" 2>&1
+( cd "$RW" && HEIMDALL_STATE_FILE="$RW_STATE" bash test/run-all.sh --min 1 ) >"$WORK/a.out" 2>&1
 A_RC=$?
 [ "$A_RC" = 0 ] && ok "A1 hermetic 1-suite green run exits 0" \
   || bad "A1 expected exit 0, got $A_RC" "$(cat "$WORK/a.out")"
@@ -157,21 +170,39 @@ A_RC=$?
 [ "$(jq -r '.exit_code' "$RW_RECEIPT" 2>/dev/null)" = "0" ] \
   && ok "A5 receipt exit_code=0 on an all-green run" \
   || bad "A5 exit_code not 0" "$(cat "$RW_RECEIPT" 2>/dev/null)"
+[ "$(jq -r '.quality_gates.tests_passing' "$RW_STATE" 2>/dev/null)" = "true" ] \
+  && ok "A5b a green sweep also marks the legacy tests_passing flag true" \
+  || bad "A5b tests_passing not flipped true after a green sweep" "$(cat "$RW_STATE" 2>/dev/null)"
+[ "$(jq -r '.quality_gates.dirty' "$RW_STATE" 2>/dev/null)" = "false" ] \
+  && ok "A5c a green sweep also clears the legacy dirty flag" \
+  || bad "A5c dirty flag not cleared after a green sweep" "$(cat "$RW_STATE" 2>/dev/null)"
+[ "$(jq -r '.quality_gates.lint_clean' "$RW_STATE" 2>/dev/null)" != "true" ] \
+  && ok "A5d a green TEST sweep does NOT also claim lint_clean -- only bin/heimdall-stop-lint's real linter run may set that" \
+  || bad "A5d green sweep incorrectly claimed lint_clean=true with no linter ever run" "$(cat "$RW_STATE" 2>/dev/null)"
 
 echo "-- A(red). WRITER overwrites a prior green receipt on a failing run ------------"
-( cd "$RW" && DUMMY_SHOULD_FAIL=1 bash test/run-all.sh --min 1 ) >"$WORK/a2.out" 2>&1
+( cd "$RW" && HEIMDALL_STATE_FILE="$RW_STATE" "$STATE_BIN" mark-dirty >/dev/null 2>&1 )
+( cd "$RW" && DUMMY_SHOULD_FAIL=1 HEIMDALL_STATE_FILE="$RW_STATE" bash test/run-all.sh --min 1 ) >"$WORK/a2.out" 2>&1
 A2_RC=$?
 [ "$A2_RC" != 0 ] && ok "A6 hermetic 1-suite RED run exits nonzero" \
   || bad "A6 expected nonzero exit, got $A2_RC" "$(cat "$WORK/a2.out")"
 [ "$(jq -r '.exit_code' "$RW_RECEIPT" 2>/dev/null)" = "1" ] \
   && ok "A7 receipt exit_code updated to 1 -- a red run cannot leave the prior green receipt in place (defect #3, reproduced and closed)" \
   || bad "A7 receipt still shows a stale exit_code" "$(cat "$RW_RECEIPT" 2>/dev/null)"
+[ "$(jq -r '.quality_gates.dirty' "$RW_STATE" 2>/dev/null)" = "true" ] \
+  && ok "A7b a RED sweep must NOT clear the legacy dirty flag (mark-tests-clean is green-only)" \
+  || bad "A7b dirty flag was cleared after a RED sweep" "$(cat "$RW_STATE" 2>/dev/null)"
+[ "$(jq -r '.quality_gates.tests_passing' "$RW_STATE" 2>/dev/null)" != "true" ] \
+  && ok "A7c a RED sweep must NOT flip tests_passing true" \
+  || bad "A7c tests_passing was true after a RED sweep" "$(cat "$RW_STATE" 2>/dev/null)"
 
 echo "-- A2. WRITER: TEAM MODE substrate carve-out (untracked-exempt, tracked-not) ----"
 RWS="$WORK/writer-repo-substrate"
 newrepo "$RWS"
 mkdir -p "$RWS/test"
 cp "$RUN_ALL" "$RWS/test/run-all.sh"
+mkdir -p "$RWS/bin/lib"
+cp "$ROOT/bin/lib/hook-owned-path.sh" "$RWS/bin/lib/hook-owned-path.sh"
 cat > "$RWS/test/dummy.test.sh" <<'DUMMYEOF'
 #!/usr/bin/env bash
 # throwaway fixture suite for test/sweep-receipt-gate.test.sh -- deliberately trivial.
