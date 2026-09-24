@@ -79,7 +79,10 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 REPO_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 E2E_PATH = os.path.join(REPO_ROOT, "bin", "lib", "hmd_relay_e2e.py")
 
-MAX_ENVELOPE_BYTES = 131072
+# Mirrors the real Cloudflare relay's INV-16 cap -- see
+# bin/heimdall-relay-client's own MAX_ENVELOPE_BYTES comment for the
+# 2026-09-24 128 KiB -> 1 MiB raise this fixture stands in for.
+MAX_ENVELOPE_BYTES = 1048576
 NUM_JSON_RE = re.compile(r"^\d+\.json$")
 
 # A fixed, valid (non-low-order), obviously-fake X25519 public key -- used as

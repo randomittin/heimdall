@@ -328,6 +328,20 @@ else
   bad "bin/heimdall-relay-client BACKOFF_CAP_MS constant not found as 30000"
 fi
 
+ENVCAP_ENV_CONST="$(grep -n 'HMD_RELAY_MAX_ENVELOPE_BYTES' "$RELAY_CLIENT" || true)"
+if [ -n "$ENVCAP_ENV_CONST" ]; then
+  ok "INV-16: bin/heimdall-relay-client MAX_ENVELOPE_BYTES is env-overridable via HMD_RELAY_MAX_ENVELOPE_BYTES ($ENVCAP_ENV_CONST)"
+else
+  bad "INV-16: bin/heimdall-relay-client does not reference HMD_RELAY_MAX_ENVELOPE_BYTES"
+fi
+
+ENVCAP_DEFAULT_CONST="$(grep -n 'MAX_ENVELOPE_BYTES.*1048576\|1048576.*MAX_ENVELOPE_BYTES' "$RELAY_CLIENT" || true)"
+if [ -n "$ENVCAP_DEFAULT_CONST" ]; then
+  ok "INV-16: bin/heimdall-relay-client default envelope cap is 1048576 / 1 MiB ($ENVCAP_DEFAULT_CONST)"
+else
+  bad "INV-16: bin/heimdall-relay-client 1048576 default cap not found"
+fi
+
 # bin/heimdall-relay-client's own main() gates e2e_available() BEFORE
 # pair_init -- so even claims that never touch real crypto directly (1, 5, 6,
 # 7) still need SOME module at bin/lib/hmd_relay_e2e.py answering
@@ -928,6 +942,183 @@ kill "$CLIENT_E" 2>/dev/null
 wait "$CLIENT_E" 2>/dev/null
 kill "$SRV_E" 2>/dev/null
 wait "$SRV_E" 2>/dev/null
+
+# ── Scenario F: INV-16 -- sender-side envelope cap raised 128 KiB -> 1 MiB,
+# HMD_RELAY_MAX_ENVELOPE_BYTES override, loud error (never a silent drop) ──
+# Exercises the REAL RelayClient.send_frame_envelope directly -- imported by
+# path via importlib (bin/heimdall-relay-client has no .py suffix, so
+# spec_from_file_location cannot infer a loader for it the way this suite's
+# other python3 heredocs import .py-suffixed modules; an explicit
+# SourceFileLoader is required instead) -- against the REAL fake relay over
+# HTTP. Not a subprocess + tick-loop this time: producing a real, oversized
+# `state` frame would mean inflating actual repo state (panels/roster/etc,
+# capped well under 1 MiB and owned by a sibling task's state-payload work,
+# never touched here). send_frame_envelope's cap check is agnostic to
+# nonce/ciphertext content -- it only measures the serialized envelope's byte
+# length -- so a synthetic, precisely-sized (never real AEAD) ciphertext
+# exercises the exact same code path a real oversized state frame would,
+# without needing real crypto or real state. Runs unconditionally (not gated
+# on $E2E_PRESENT, unlike claims 2-4): $RELAY_CLIENT_RUN's own E2E module --
+# real or the minstub swapped in above -- always answers
+# generate_keypair()/pub_b64(), all pair_init() needs; seal/open_ (the only
+# calls the minstub lacks) are never exercised by this scenario.
+REPO_F="$(make_repo)"
+PORT_F_RELAY="$(free_port)"
+LOG_F="$TMPROOT/f.log"; CTL_F="$TMPROOT/f.ctl"
+mkdir -p "$LOG_F" "$CTL_F"
+
+python3 "$FAKE_RELAY" serve "$PORT_F_RELAY" --log "$LOG_F" --ctl "$CTL_F" >"$TMPROOT/f.srv.out" 2>&1 &
+SRV_F=$!
+PIDS+=("$SRV_F")
+for _ in $(seq 1 50); do
+  python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_F_RELAY))==0 else 1)" && break
+  sleep 0.1
+done
+
+CAP_OUT="$TMPROOT/f.cap.out"
+python3 - "$RELAY_CLIENT_RUN" "http://127.0.0.1:$PORT_F_RELAY" "$REPO_F" >"$CAP_OUT" 2>"$TMPROOT/f.cap.err" <<'PYEOF'
+import argparse, importlib.util, json, os, sys
+from importlib.machinery import SourceFileLoader
+
+client_path, relay_url, repo_dir = sys.argv[1:4]
+
+
+def load_client(name, env_value):
+    if env_value is None:
+        os.environ.pop("HMD_RELAY_MAX_ENVELOPE_BYTES", None)
+    else:
+        os.environ["HMD_RELAY_MAX_ENVELOPE_BYTES"] = env_value
+    loader = SourceFileLoader(name, client_path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def new_client(mod):
+    args = argparse.Namespace(relay=relay_url, repo=repo_dir, ui_port=0,
+                               public_host=None, status_file=None, tick_s=2.0)
+    client = mod.RelayClient(args)
+    client.priv, client.pub = mod.E2E.generate_keypair()
+    rc = client.pair_init()
+    if rc != 0:
+        print("RESULT setup_failed rc=%d" % rc)
+        sys.exit(2)
+    return client
+
+
+def base_envelope_len(client, type_, seq):
+    env = {"v": 1, "session_id": client.session_id, "seq": seq, "sender": "hmd",
+           "type": type_, "nonce": "A" * 16, "ciphertext": "", "payload": None}
+    return len(json.dumps(env, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def sized_nonce_ciphertext(client, type_, seq, target_bytes):
+    pad = max(0, target_bytes - base_envelope_len(client, type_, seq))
+    return "A" * 16, "B" * pad
+
+
+# ── case a: ~600 KiB envelope, default cap (1 MiB) -- must be POSTED ────────
+mod_default = load_client("hmd_relay_client_capcheck_default", None)
+print("RESULT case_a_cap_constant %d" % mod_default.MAX_ENVELOPE_BYTES)
+client_a = new_client(mod_default)
+nonce_a, ct_a = sized_nonce_ciphertext(client_a, "state", 0, 600000)
+delivered_a, nbytes_a = client_a.send_frame_envelope("state", nonce_a, ct_a, 0)
+print("RESULT case_a_delivered %r" % (delivered_a,))
+print("RESULT case_a_bytes %d" % nbytes_a)
+print("RESULT case_a_over_old_cap %r" % (nbytes_a > 131072,))
+print("RESULT case_a_under_new_cap %r" % (nbytes_a < mod_default.MAX_ENVELOPE_BYTES,))
+
+# ── case b: > default 1 MiB cap -- must be refused LOCALLY, loudly ──────────
+nonce_b, ct_b = sized_nonce_ciphertext(client_a, "state", 1, 1100000)
+delivered_b, nbytes_b = client_a.send_frame_envelope("state", nonce_b, ct_b, 1)
+print("RESULT case_b_delivered %r" % (delivered_b,))
+print("RESULT case_b_bytes %d" % nbytes_b)
+print("RESULT case_b_over_new_cap %r" % (nbytes_b > mod_default.MAX_ENVELOPE_BYTES,))
+
+# ── case c: same ~600 KiB envelope as (a), but HMD_RELAY_MAX_ENVELOPE_BYTES
+# overridden small -- must now fail loudly where (a) succeeded ──────────────
+mod_small = load_client("hmd_relay_client_capcheck_small", "1000")
+print("RESULT case_c_cap_constant %d" % mod_small.MAX_ENVELOPE_BYTES)
+client_c = new_client(mod_small)
+nonce_c, ct_c = sized_nonce_ciphertext(client_c, "state", 0, 600000)
+delivered_c, nbytes_c = client_c.send_frame_envelope("state", nonce_c, ct_c, 0)
+print("RESULT case_c_delivered %r" % (delivered_c,))
+print("RESULT case_c_bytes %d" % nbytes_c)
+
+sys.exit(0)
+PYEOF
+CAP_RC=$?
+
+if [ "$CAP_RC" -eq 0 ]; then
+  ok "INV-16: cap-check harness (pair_init + send_frame_envelope x3) exited 0"
+else
+  bad "INV-16: cap-check harness exited $CAP_RC -- $(cat "$TMPROOT/f.cap.err")"
+fi
+
+CAP_A_CONST="$(grep -o 'RESULT case_a_cap_constant [0-9]*' "$CAP_OUT" | awk '{print $3}')"
+if [ "$CAP_A_CONST" = "1048576" ]; then
+  ok "INV-16: default MAX_ENVELOPE_BYTES is 1048576 (1 MiB) at import time"
+else
+  bad "INV-16: default MAX_ENVELOPE_BYTES was '$CAP_A_CONST', expected 1048576"
+fi
+
+if grep -q 'RESULT case_a_delivered True' "$CAP_OUT"; then
+  ok "case a: ~600 KiB state envelope (previously dropped under the 128 KiB cap) is now posted"
+else
+  bad "case a: ~600 KiB state envelope was not delivered -- $(grep case_a "$CAP_OUT")"
+fi
+
+if grep -q 'RESULT case_a_over_old_cap True' "$CAP_OUT" && grep -q 'RESULT case_a_under_new_cap True' "$CAP_OUT"; then
+  ok "case a: envelope size is genuinely between the old 128 KiB cap and the new 1 MiB cap"
+else
+  bad "case a: envelope size fixture is not between the old and new caps -- $(grep case_a "$CAP_OUT")"
+fi
+
+NBYTES_B="$(grep -o 'RESULT case_b_bytes [0-9]*' "$CAP_OUT" | awk '{print $3}')"
+if grep -q 'RESULT case_b_delivered None' "$CAP_OUT"; then
+  ok "case b: over-cap (>1 MiB) envelope is refused locally (never reaches the network)"
+else
+  bad "case b: over-cap envelope was not refused -- $(grep case_b "$CAP_OUT")"
+fi
+
+if [ -n "$NBYTES_B" ] && wait_for_event "$CAP_OUT" "error" "dropped: ${NBYTES_B} bytes exceeds 1048576 cap" 2; then
+  ok "case b: error event names both the frame's size ($NBYTES_B) and the cap (1048576)"
+else
+  bad "case b: no error event naming size+cap for the over-cap frame -- $(grep '\"event\":\"error\"' "$CAP_OUT")"
+fi
+
+CAP_C_CONST="$(grep -o 'RESULT case_c_cap_constant [0-9]*' "$CAP_OUT" | awk '{print $3}')"
+if [ "$CAP_C_CONST" = "1000" ]; then
+  ok "case c: HMD_RELAY_MAX_ENVELOPE_BYTES=1000 override took effect on the module constant"
+else
+  bad "case c: cap override did not take effect, saw '$CAP_C_CONST' instead of 1000"
+fi
+
+NBYTES_C="$(grep -o 'RESULT case_c_bytes [0-9]*' "$CAP_OUT" | awk '{print $3}')"
+if grep -q 'RESULT case_c_delivered None' "$CAP_OUT"; then
+  ok "case c: the SAME ~600 KiB envelope that succeeded in case a now fails loudly under the small override"
+else
+  bad "case c: envelope was not rejected under the small cap override -- $(grep case_c "$CAP_OUT")"
+fi
+
+if [ -n "$NBYTES_C" ] && wait_for_event "$CAP_OUT" "error" "dropped: ${NBYTES_C} bytes exceeds 1000 cap" 2; then
+  ok "case c: error event names both the frame's size ($NBYTES_C) and the overridden cap (1000)"
+else
+  bad "case c: no error event naming size+overridden-cap -- $(grep '\"event\":\"error\"' "$CAP_OUT")"
+fi
+
+wait_for_count "$LOG_F/frames.ndjson" 1 '.' 3 >/dev/null 2>&1 || true
+FRAMES_F_COUNT="$(wc -l < "$LOG_F/frames.ndjson" 2>/dev/null | tr -d ' ')"
+[ -z "$FRAMES_F_COUNT" ] && FRAMES_F_COUNT=0
+if [ "$FRAMES_F_COUNT" -eq 1 ]; then
+  ok "INV-16: exactly one frame reached the relay (case a's ~600 KiB frame) -- cases b and c never posted"
+else
+  bad "INV-16: expected exactly 1 posted frame (case a only), got $FRAMES_F_COUNT"
+fi
+
+kill "$SRV_F" 2>/dev/null
+wait "$SRV_F" 2>/dev/null
 
 echo
 printf '%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"

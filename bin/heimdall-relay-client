@@ -122,7 +122,19 @@ UI = _load_module("hmd_ui", os.path.join(SENTINELS_DIR, "hmd-ui.py"))
 INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_inbox.py"))
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
 
-MAX_ENVELOPE_BYTES = 131072
+# HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
+# envelope this client will POST to /session/:id/frames -- one named constant,
+# matching the relay's and hmdapp's own INV-16 cap. Raised from the original
+# 128 KiB on 2026-09-24: the app side reported this client silently dropping
+# outbound state frames once a real hmd state payload (~136 KB) exceeded the
+# old cap, while the relay/app had already moved to 1 MiB. A frame still over
+# cap after this raise is refused HERE, locally, before ever reaching the
+# network -- loudly, via an `error` event naming both the frame's size and the
+# cap (see send_frame_envelope below), never a silent drop.
+try:
+    MAX_ENVELOPE_BYTES = int(os.environ.get("HMD_RELAY_MAX_ENVELOPE_BYTES", "1048576"))
+except (TypeError, ValueError):
+    MAX_ENVELOPE_BYTES = 1048576
 BACKOFF_BASE_MS = 2000
 BACKOFF_CAP_MS = 30000
 CONNECT_TIMEOUT_S = 15
