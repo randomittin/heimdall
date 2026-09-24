@@ -801,6 +801,10 @@ describe("stream lifetime", () => {
   const keepaliveMs = Number(
     (env as unknown as { RELAY_KEEPALIVE_MS?: string }).RELAY_KEEPALIVE_MS ?? ""
   );
+  const maxLifetimeMs = Number(
+    (env as unknown as { RELAY_STREAM_MAX_LIFETIME_MS?: string })
+      .RELAY_STREAM_MAX_LIFETIME_MS ?? ""
+  );
 
   it("is configured with a test-scale keepalive interval", () => {
     // Guards the two timing tests below: without the vitest.config.ts
@@ -809,6 +813,16 @@ describe("stream lifetime", () => {
     // broken test setup.
     expect(Number.isFinite(keepaliveMs)).toBe(true);
     expect(keepaliveMs).toBeGreaterThan(0);
+  });
+
+  it("is configured with a test-scale stream lifetime", () => {
+    // Same guard as the keepalive one above, for the same reason: without
+    // the vitest.config.ts binding the two lifetime tests below would wait
+    // on the 10-minute production default and fail as timeouts. The
+    // lifetime must also stay well clear of the keepalive cadence, or a
+    // stream would be cut before it ever carried one.
+    expect(Number.isFinite(maxLifetimeMs)).toBe(true);
+    expect(maxLifetimeMs).toBeGreaterThan(keepaliveMs * 2);
   });
 
   it("emits a keepalive control frame on an otherwise-idle hmd stream", async () => {
@@ -974,6 +988,97 @@ describe("stream lifetime", () => {
 
     await secondReader.cancel();
   }, 15_000);
+
+  // Observed live on 2026-09-25 against the deployed relay, and the reason a
+  // stream needs a bound on its LIFE and not just on its silence.
+  //
+  // A deploy rolls the Durable Object to a new generation. Hibernatable
+  // device sockets are re-delivered to that new generation — so `POST
+  // /frames` keeps answering `delivered: true` and every operator-visible
+  // signal reads healthy — but hmd's in-flight `GET /stream` response stays
+  // pinned to the OLD generation, which keeps feeding it keepalives off its
+  // own `setTimeout`. hmd's client watches for silence
+  // (HMD_RELAY_STREAM_IDLE_S, 60s) and never sees any, so it never
+  // reconnects; meanwhile the new generation — the one actually holding the
+  // phone — has `hmdStreamController === null` and drops every inbound
+  // `command` as `no_hmd_stream_connected`. Phone→hmd stays dead until
+  // something cuts that orphaned response, and nothing outside its isolate
+  // can reach it. So it has to end itself.
+  it("closes an hmd stream once its bounded lifetime expires", async () => {
+    const init = await pairInit();
+    const streamRes = await openHmdStream(init.session_id, init.relay_session_token);
+    expect(streamRes.status).toBe(200);
+    const reader = streamRes.body?.getReader();
+    if (!reader) throw new Error("expected a readable stream body");
+
+    const TIMED_OUT = Symbol("timed-out");
+    const deadline = Date.now() + maxLifetimeMs * 2;
+    let closed = false;
+    let keepalives = 0;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const result = await Promise.race([
+        reader.read(),
+        new Promise<typeof TIMED_OUT>((resolve) =>
+          setTimeout(() => resolve(TIMED_OUT), remaining)
+        ),
+      ]);
+      if (result === TIMED_OUT) break;
+      if (result.done) {
+        closed = true;
+        break;
+      }
+      keepalives += new TextDecoder()
+        .decode(result.value)
+        .split("\n")
+        .filter((line) => line.includes('"keepalive"')).length;
+    }
+
+    // Both halves matter. The stream was never silent — it carried
+    // keepalives the entire time, which is exactly why hmd's idle guard
+    // cannot be what detects this — and it ended anyway.
+    expect(keepalives).toBeGreaterThan(0);
+    expect(closed).toBe(true);
+  }, 30_000);
+
+  it("gives a reconnected hmd stream its own full lifetime", async () => {
+    const init = await pairInit();
+    const first = await openHmdStream(init.session_id, init.relay_session_token);
+    const firstReader = first.body?.getReader();
+    if (!firstReader) throw new Error("expected a readable stream body");
+
+    // Hold the first stream most of the way through its life, then replace
+    // it. A lifetime timer left armed by the superseded stream would fire
+    // while the new one is live and cut hmd off early — trading the
+    // orphaned-stream bug for a worse, self-inflicted one.
+    await new Promise((resolve) => setTimeout(resolve, maxLifetimeMs * 0.6));
+    await firstReader.cancel();
+
+    const second = await openHmdStream(init.session_id, init.relay_session_token);
+    expect(second.status).toBe(200);
+    const secondReader = second.body?.getReader();
+    if (!secondReader) throw new Error("expected a readable stream body");
+
+    const TIMED_OUT = Symbol("timed-out");
+    const result = await Promise.race([
+      (async () => {
+        for (;;) {
+          const { done } = await secondReader.read();
+          if (done) return "closed" as const;
+        }
+      })(),
+      new Promise<typeof TIMED_OUT>((resolve) =>
+        setTimeout(() => resolve(TIMED_OUT), maxLifetimeMs * 0.6)
+      ),
+    ]);
+
+    // 0.6 + 0.6 lifetimes is past the FIRST stream's original deadline, so a
+    // stale timer would have closed this one by now.
+    expect(result).toBe(TIMED_OUT);
+
+    await secondReader.cancel();
+  }, 30_000);
 });
 
 describe("session id validation", () => {

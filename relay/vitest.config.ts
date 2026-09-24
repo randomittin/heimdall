@@ -30,6 +30,14 @@ export default defineConfig({
           // binding and the suite drives it at 1s instead. Production and
           // local dev declare no such binding and run on the 20s default.
           RELAY_KEEPALIVE_MS: "1000",
+          // src/session.ts's MAX_STREAM_LIFETIME_MS default is 10 minutes —
+          // the bound that stops an orphaned stream outliving a deploy, and
+          // far longer than a test should sit waiting. Same constraint as
+          // the keepalive above (workerd's timers are real), so the suite
+          // drives it at 8s: comfortably longer than the longest stream any
+          // other test holds open (~2.6s, the keepalive-reconnect test) and
+          // short enough to observe twice inside one test's budget.
+          RELAY_STREAM_MAX_LIFETIME_MS: "8000",
         },
       },
     }),

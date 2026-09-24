@@ -15,6 +15,12 @@ export interface Env {
    *  only the vitest suite binds it (vitest.config.ts), so the interval is
    *  observable inside a test's lifetime. Not a secret. */
   RELAY_KEEPALIVE_MS?: string;
+  /** Optional override, in milliseconds, for the longest a single hmd `GET
+   *  /stream` may live before the relay closes it (src/session.ts's
+   *  MAX_STREAM_LIFETIME_MS). Bound on the same terms as
+   *  RELAY_KEEPALIVE_MS above — vitest-only, absent in wrangler.toml, not a
+   *  secret. */
+  RELAY_STREAM_MAX_LIFETIME_MS?: string;
 }
 
 /** "relay" is not in the spec's sender enum — it is used only for the two

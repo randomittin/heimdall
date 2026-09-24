@@ -133,7 +133,7 @@ frames flowing, then sat idle and was closed server-side at 08:38:54 — 5m01s l
 session is idle by nature (hmd sends `state` only on a digest change, INV-22), so this is the
 steady state, not an edge case.
 
-Two independent mitigations, because either alone is insufficient:
+Three independent mitigations, because no two of them are sufficient:
 
 1. **`keepalive`** — while hmd's stream has written nothing for `KEEPALIVE_INTERVAL_MS`
    (`src/session.ts`, 20s), the relay writes one plaintext control frame:
@@ -181,6 +181,30 @@ Two independent mitigations, because either alone is insufficient:
    stream by accident. `fake-hmd.mjs` bounds stream silence at three missed keepalives
    (`STREAM_IDLE_TIMEOUT_MS`); `docs/HANDOFF-TO-HEIMDALL-relay.md`'s "Stream lifetime" rule 5 is
    the contract hmd implements against.
+
+3. **Every stream carries its own deadline** (`MAX_STREAM_LIFETIME_MS`, `src/session.ts`, 10
+   minutes), because mitigation 2 has a blind spot that mitigation 1 opens.
+
+   Measured live on 2026-09-25, on a session orphaned by the `e7025229` deploy: the orphaned
+   stream was **not** carrying nothing. It was still being written to — the socket took 191
+   bytes with zero bytes out over a 15s window, which is one `keepalive` line (163B) plus
+   chunked framing and one TLS record, and its `Recv-Q` stayed at 0. hmd's client had emitted
+   **zero** `stream_drop` in 80 minutes. A deploy rolls the Durable Object to a new generation,
+   and hibernatable device sockets are re-delivered to that new one — so `POST /frames` keeps
+   answering `delivered: true` — while hmd's in-flight response stays pinned to the OLD
+   generation, whose `keepaliveTimer` is still running in its isolate. A silence bound cannot
+   fire on a stream that is not silent, so `HMD_RELAY_STREAM_IDLE_S` never tripped and hmd never
+   reconnected, while the generation actually holding the phone dropped every `command` as
+   `no_hmd_stream_connected`.
+
+   Nothing outside that orphaned isolate can close the response: the controller is in its
+   memory, not in storage, and the live generation has no handle to it. So the stream ends
+   itself. hmd already treats a closed stream as routine (mitigation 2), which lands it on the
+   live generation; the cost is one reconnect (~2s, hmd's `BACKOFF_BASE_MS`) per stream per 10
+   minutes, and the bound on a post-deploy phone→hmd outage becomes the lifetime rather than
+   unbounded. Emits `stream_lifetime_expired`. Overridable with an optional
+   `RELAY_STREAM_MAX_LIFETIME_MS` binding on the same terms as `RELAY_KEEPALIVE_MS` above
+   (vitest binds it at 8s; nothing declares it in `wrangler.toml`).
 
    `relay/scripts/fake-hmd.mjs` implements exactly this contract and is the reference for
    `bin/heimdall-relay-client` (see `docs/HANDOFF-TO-HEIMDALL-relay.md`'s "Stream lifetime").

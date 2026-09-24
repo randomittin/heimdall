@@ -195,6 +195,34 @@ function deviceSocketGeneration(socket: WebSocket): number {
  */
 const KEEPALIVE_INTERVAL_MS = 20_000;
 
+/**
+ * The upper bound on how long a single `GET /stream` response may live,
+ * however healthy it looks.
+ *
+ * Observed live on 2026-09-25, and the failure `KEEPALIVE_INTERVAL_MS` above
+ * made possible. A deploy rolls this Durable Object to a new generation.
+ * Hibernatable device sockets are re-delivered to that new generation, so
+ * `POST /frames` keeps answering `delivered: true` and every operator-visible
+ * signal reads healthy — but hmd's in-flight streaming Response stays pinned
+ * to the OLD generation, whose `keepaliveTimer` keeps writing into it. hmd's
+ * client bounds *silence* (`HMD_RELAY_STREAM_IDLE_S`, 60s) and that stream is
+ * never silent, so it never reconnects, while the new generation — the one
+ * holding the phone — has `hmdStreamController === null` and drops every
+ * inbound `command` as `no_hmd_stream_connected`. Phone→hmd stays dead
+ * indefinitely.
+ *
+ * Nothing outside that orphaned isolate can reach the response to close it:
+ * the controller is in its memory, not in storage, and the generation now
+ * serving the session has no handle to it. The only actor that can end it is
+ * the stream itself, so every stream carries its own deadline. hmd treats a
+ * closed stream as routine and reconnects with backoff (see `handleStream`),
+ * which lands it on the live generation.
+ *
+ * 10 minutes bounds the post-deploy outage while costing one reconnect —
+ * ~2s, hmd's `BACKOFF_BASE_MS` — per stream per 10 minutes.
+ */
+const MAX_STREAM_LIFETIME_MS = 10 * 60_000;
+
 /** Fail-closed: a malformed (non-base64) value must 400, never throw past
  * this boundary and crash the isolate — base64UrlDecode's atob call throws
  * on invalid input, and this is attacker-controlled query-string data. */
@@ -221,6 +249,10 @@ export class SessionDO {
   // `gen !== this.generation` check on its socket callbacks.
   private hmdStreamGeneration = 0;
   private keepaliveTimer: ReturnType<typeof setTimeout> | null = null;
+  // Deadline for the stream currently open, armed once per `GET /stream` and
+  // never re-armed by traffic — unlike the keepalive, whose whole job is to
+  // be pushed back. See MAX_STREAM_LIFETIME_MS.
+  private streamLifetimeTimer: ReturnType<typeof setTimeout> | null = null;
   // The session id from the last record read or written. The keepalive timer
   // fires outside any request and still has to stamp `session_id` on the
   // frame it writes; caching it here keeps that path free of a storage read
@@ -312,6 +344,18 @@ export class SessionDO {
     return parsed;
   }
 
+  /** Milliseconds a single `GET /stream` may live. Same fail-safe parse as
+   * `keepaliveIntervalMs`: an absent or nonsensical binding falls back to the
+   * compiled-in default rather than disabling the bound that keeps an
+   * orphaned stream from outliving a deploy. */
+  private streamMaxLifetimeMs(): number {
+    const raw = this.env.RELAY_STREAM_MAX_LIFETIME_MS;
+    if (raw === undefined) return MAX_STREAM_LIFETIME_MS;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) return MAX_STREAM_LIFETIME_MS;
+    return parsed;
+  }
+
   /** The single writer for hmd's `GET /stream`. Returns false when the line
    * could not be delivered: no stream open, or a controller the runtime has
    * already torn down. That second case is the real one — Cloudflare can
@@ -330,6 +374,7 @@ export class SessionDO {
     } catch {
       this.hmdStreamController = null;
       this.clearKeepalive();
+      this.clearStreamLifetime();
       return false;
     }
     this.armKeepalive();
@@ -343,6 +388,7 @@ export class SessionDO {
     const controller = this.hmdStreamController;
     this.hmdStreamController = null;
     this.clearKeepalive();
+    this.clearStreamLifetime();
     if (!controller) return;
     try {
       controller.close();
@@ -381,6 +427,29 @@ export class SessionDO {
     if (this.keepaliveTimer === null) return;
     clearTimeout(this.keepaliveTimer);
     this.keepaliveTimer = null;
+  }
+
+  /** Arms the deadline for the stream at `generation`. The generation guard
+   * is the same one `handleStream`'s `cancel()` uses and matters for the same
+   * reason: this timer must never end a stream that has already superseded
+   * the one that armed it. Cutting hmd off early would be a worse bug than
+   * the orphaned stream this bounds. */
+  private armStreamLifetime(generation: number): void {
+    this.clearStreamLifetime();
+    this.streamLifetimeTimer = setTimeout(() => {
+      this.streamLifetimeTimer = null;
+      if (this.hmdStreamGeneration !== generation) return;
+      logEvent("stream_lifetime_expired", {
+        session_id: this.cachedSessionId ?? "unknown",
+      });
+      this.closeHmdStream();
+    }, this.streamMaxLifetimeMs());
+  }
+
+  private clearStreamLifetime(): void {
+    if (this.streamLifetimeTimer === null) return;
+    clearTimeout(this.streamLifetimeTimer);
+    this.streamLifetimeTimer = null;
   }
 
   private checkBearer(request: Request, record: SessionRecord): boolean {
@@ -457,6 +526,7 @@ export class SessionDO {
           if (!owner.writeToHmdStream(pending)) owner.pendingHmdControlFrame = pending;
         }
         owner.armKeepalive();
+        owner.armStreamLifetime(generation);
       },
       cancel() {
         // Only tear down if this is still the live stream — a newer
@@ -465,6 +535,7 @@ export class SessionDO {
         if (owner.hmdStreamGeneration !== generation) return;
         owner.hmdStreamController = null;
         owner.clearKeepalive();
+        owner.clearStreamLifetime();
       },
     });
     return new Response(stream, {
