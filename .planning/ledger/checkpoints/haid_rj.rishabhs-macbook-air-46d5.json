@@ -10,12 +10,12 @@
     "app/api/reviews/**"
   ],
   "haid": "haid:rj.rishabhs-macbook-air-46d5",
-  "head_sha": "88d107f3",
+  "head_sha": "346fb4de",
   "human": "rj",
   "phase": "unknown",
   "progress_pct": 0,
   "resumable": true,
   "schema": "team_checkpoint_v1",
   "task_ref": "read-endpoints-and-jobs (Wave 2) (via heimdall-ledger-mcp:haid:rj.rishabhs-macbook-air-46d5/claude-code)",
-  "updated_at": "2026-09-23T12:28:10Z"
+  "updated_at": "2026-09-24T10:42:52Z"
 }
