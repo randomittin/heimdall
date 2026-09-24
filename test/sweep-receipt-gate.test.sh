@@ -422,6 +422,74 @@ echo "$OUT_J2" | grep -q "SWEEP-GATE verdict.*WOULD-BLOCK" \
   && ok "J3 section [b] is genuinely advisory-only: exit code identical ($RC_J1) regardless of which sweep-gate verdict is shown" \
   || bad "J3 delivery-audit exit code changed with receipt content ($RC_J1 vs $RC_J2) -- section [b] must never gate" "$OUT_J1 / $OUT_J2"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# K. GATE — hook-owned-only commits after the receipt do not go stale (the actual
+#    bug this file's task exists to fix: this repo's own journal/ledger hooks
+#    auto-commit on main after every sweep, so a green receipt used to go stale
+#    within seconds of being written).
+# ══════════════════════════════════════════════════════════════════════════════
+echo "-- K. hook-owned commits after the receipt do not go stale ------------------------"
+RK="$WORK/hook-owned-repo"
+newrepo "$RK"
+echo base > "$RK/f.txt"
+git -C "$RK" add -A; git -C "$RK" commit -q -m base
+RK_BASE_SHA="$(git -C "$RK" rev-parse HEAD)"
+RK_CANON="$(git -C "$RK" rev-parse --show-toplevel)"
+mk_state "$RK"
+
+# (a) receipt HEAD + one commit touching ONLY a real journal-shaped hook-owned
+#     file => NOT stale, notice printed.
+mkdir -p "$RK/.planning/journal"
+echo "entry" > "$RK/.planning/journal/2026-09-24-haid_x.md"
+git -C "$RK" add -A; git -C "$RK" commit -q -m "journal: hook-owned entry"
+RK_SHA_A="$(git -C "$RK" rev-parse HEAD)"
+HOME_K1="$WORK/home-k1"; mkdir -p "$HOME_K1"
+write_receipt "$HOME_K1" "$RK_CANON" "$RK_BASE_SHA" true 0
+OUT_K1="$(gate_run "$RK" "$HOME_K1" 2>&1)"; RC_K1=$?
+[ "$RC_K1" = 0 ] && ok "K1 receipt behind by one hook-owned-only commit still PASSES" \
+  || bad "K1 expected exit 0, got $RC_K1" "$OUT_K1"
+echo "$OUT_K1" | grep -qi "hook-owned" \
+  && ok "K2 a one-line notice names the hook-owned skip" \
+  || bad "K2 no hook-owned notice printed" "$OUT_K1"
+
+# (b) + one more commit touching bin/anything (NOT hook-owned) => STALE, path named.
+mkdir -p "$RK/bin"
+echo "echo hi" > "$RK/bin/anything"
+git -C "$RK" add -A; git -C "$RK" commit -q -m "code: touch bin/anything"
+OUT_K3="$(gate_run "$RK" "$HOME_K1" 2>&1)"; RC_K3=$?
+[ "$RC_K3" = 2 ] && ok "K3 a non-hook-owned commit in the same span goes STALE" \
+  || bad "K3 expected exit 2, got $RC_K3" "$OUT_K3"
+echo "$OUT_K3" | grep -qi "STALE" \
+  && ok "K4 message still says STALE" || bad "K4 message does not say STALE" "$OUT_K3"
+echo "$OUT_K3" | grep -q "bin/anything" \
+  && ok "K5 message names the non-hook-owned path (bin/anything)" \
+  || bad "K5 message does not name bin/anything" "$OUT_K3"
+
+# (c) falsifiability of the anchor: journal/evil.md does not match the required
+#     dated-haid filename shape => still STALE.
+git -C "$RK" reset -q --hard "$RK_SHA_A"
+echo "not a real journal entry" > "$RK/.planning/journal/evil.md"
+git -C "$RK" add -A; git -C "$RK" commit -q -m "journal: wrong shape"
+HOME_K2="$WORK/home-k2"; mkdir -p "$HOME_K2"
+write_receipt "$HOME_K2" "$RK_CANON" "$RK_BASE_SHA" true 0
+OUT_K6="$(gate_run "$RK" "$HOME_K2" 2>&1)"; RC_K6=$?
+[ "$RC_K6" = 2 ] && ok "K6 a wrongly-shaped journal/evil.md still goes STALE (anchor falsifiability)" \
+  || bad "K6 expected exit 2, got $RC_K6" "$OUT_K6"
+echo "$OUT_K6" | grep -q "evil.md" \
+  && ok "K7 message names evil.md" || bad "K7 message does not name evil.md" "$OUT_K6"
+
+# (d) receipt HEAD not an ancestor of current HEAD (history rewritten) => STALE.
+git -C "$RK" reset -q --hard "$RK_BASE_SHA"
+echo "rewritten" > "$RK/f.txt"
+git -C "$RK" commit -q -am "rewrite history"
+HOME_K3="$WORK/home-k3"; mkdir -p "$HOME_K3"
+write_receipt "$HOME_K3" "$RK_CANON" "$RK_SHA_A" true 0
+OUT_K8="$(gate_run "$RK" "$HOME_K3" 2>&1)"; RC_K8=$?
+[ "$RC_K8" = 2 ] && ok "K8 a receipt HEAD that is no longer an ancestor (rewritten history) goes STALE" \
+  || bad "K8 expected exit 2, got $RC_K8" "$OUT_K8"
+echo "$OUT_K8" | grep -qi "STALE" \
+  && ok "K9 message says STALE" || bad "K9 message does not say STALE" "$OUT_K8"
+
 echo
 printf "  Results: %d passed, %d failed\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
