@@ -58,6 +58,28 @@ NUMBER_FORMATS = ("count", "duration_s", "bytes", "percent")
 PANELS_REL = os.path.join(".heimdall", "ui", "panels")
 GIT_TIMEOUT_S = 3
 
+# -- bounded log-tail (serve-side only) -----------------------------------------
+# write_panel()'s caps above (MAX_LIST_ITEMS/MAX_STRING_CHARS/MAX_FILE_BYTES) are
+# UNCHANGED: a `panel set` that is over-cap is still refused whole (P20) -- good
+# hygiene at the point of authorship. But read_panels() (-> /api/state, SSE, and
+# the relay frames -- all three sourced from the same read path) must never
+# blank out an entire log-tail panel just because content that reached disk by
+# some OTHER route (not the CLI: e.g. hand-placed, or a producer other than
+# `hmd ui panel set`) is wider than limits sized for short structured
+# job-progress lines, not prose-heavy chat turns: losing 100% of a transcript
+# because it is over-cap is worse than serving the newest slice with a visible
+# "N older lines omitted" marker. So the server applies its OWN, wider bound to
+# log-tail `lines` specifically, BEFORE validating -- length/line-count only.
+# Every other invariant (closed type set, `source` rejection, secret scrub, the
+# raw MAX_FILE_BYTES gate, MAX_TITLE_CHARS, MAX_SERIES, ...) is unaffected and
+# still refuses the whole panel, at both write time and read time.
+HMD_UI_LOG_TAIL_LINES = "HMD_UI_LOG_TAIL_LINES"   # env; default 200 (== MAX_LIST_ITEMS)
+HMD_UI_LOG_TAIL_BYTES = "HMD_UI_LOG_TAIL_BYTES"   # env; default 65536 (== MAX_FILE_BYTES)
+HMD_UI_LOG_LINE_MAX = "HMD_UI_LOG_LINE_MAX"       # env; default 2000 chars/line
+_LOG_TAIL_LINES_DEFAULT = 200
+_LOG_TAIL_BYTES_DEFAULT = 65536
+_LOG_LINE_MAX_DEFAULT = 2000
+
 # ── secret scrub: bin/heimdall-activity:167-179, ported regex for regex ───────
 # Order and families are the activity record's own; a hit on ANY rejects the value.
 _SECRET_RES = (
@@ -233,11 +255,75 @@ def _validate_markdown(data):
     _check_str(data.get("text"), "data.text")
 
 
-def _validate_log_tail(data):
-    _check_keys(data, ("lines",), "data")
-    lines = _check_list(data.get("lines"), "data.lines")
+def _log_tail_env_int(name, default):
+    """Read `name` fresh from the environment on every call (never cached at
+    import time), so a test -- or an operator -- can retune a running server's
+    next read without a restart. Malformed or non-positive values fall back to
+    `default` rather than raising: this bound is a resilience feature, so a bad
+    env var must never crash a read."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+def _cut_line(line, max_chars):
+    """Cut `line` to exactly `max_chars` characters, the last being an
+    ellipsis, when it is longer; returned unchanged otherwise. Never raises:
+    `max_chars` <= 0 (unreachable via the env reader above, but not via a
+    direct call) degrades to an empty string rather than a negative slice."""
+    if max_chars <= 0:
+        return ""
+    if len(line) <= max_chars:
+        return line
+    return line[:max_chars - 1] + "…"
+
+
+def bound_log_tail(lines, max_lines=None, max_bytes=None, max_line_chars=None):
+    """Bound a log-tail's `lines` for SERVING -- never for publish-time
+    validation, which stays exactly as strict as before (write_panel() never
+    calls this). Any bound left None is read fresh from its HMD_UI_LOG_TAIL_*
+    env var. Applies, in order: (1) a per-line character cut, oldest content
+    kept, a trailing ellipsis marks a cut line; (2) a trim from the OLD end
+    (the front of the list) on whole-line boundaries -- never mid-line --
+    until BOTH the line-count and UTF-8-byte-total budgets are satisfied.
+    Returns (bounded_lines, dropped_count); dropped_count is 0 when nothing
+    was cut, so a caller adds `truncated`/`dropped_lines` only when something
+    really happened -- an untouched small log stays byte-identical."""
+    if max_lines is None:
+        max_lines = _log_tail_env_int(HMD_UI_LOG_TAIL_LINES, _LOG_TAIL_LINES_DEFAULT)
+    if max_bytes is None:
+        max_bytes = _log_tail_env_int(HMD_UI_LOG_TAIL_BYTES, _LOG_TAIL_BYTES_DEFAULT)
+    if max_line_chars is None:
+        max_line_chars = _log_tail_env_int(HMD_UI_LOG_LINE_MAX, _LOG_LINE_MAX_DEFAULT)
+    cut = [_cut_line(ln, max_line_chars) if isinstance(ln, str) else ln for ln in lines]
+    kept = []
+    total_bytes = 0
+    for ln in reversed(cut):
+        ln_bytes = len(ln.encode("utf-8")) if isinstance(ln, str) else 0
+        if len(kept) >= max_lines or total_bytes + ln_bytes > max_bytes:
+            break
+        kept.append(ln)
+        total_bytes += ln_bytes
+    kept.reverse()
+    return kept, len(cut) - len(kept)
+
+
+def _validate_log_tail(data, max_line_chars=MAX_STRING_CHARS, max_lines=MAX_LIST_ITEMS):
+    _check_keys(data, ("lines", "truncated", "dropped_lines"), "data")
+    lines = _check_list(data.get("lines"), "data.lines", cap=max_lines)
     for i, line in enumerate(lines):
-        _check_str(line, "data.lines[%d]" % i)
+        _check_str(line, "data.lines[%d]" % i, max_chars=max_line_chars)
+    if "truncated" in data and not isinstance(data["truncated"], bool):
+        raise PanelError("data.truncated must be a boolean")
+    if "dropped_lines" in data:
+        dl = data["dropped_lines"]
+        if isinstance(dl, bool) or not isinstance(dl, int) or dl < 0:
+            raise PanelError("data.dropped_lines must be a non-negative integer")
 
 
 _VALIDATORS = {
@@ -251,11 +337,18 @@ _VALIDATORS = {
 }
 
 
-def validate_panel(obj):
+def validate_panel(obj, log_tail_bounds=None):
     """Enforce the whole Decision 6 contract on a decoded panel object. Returns a
     normalised copy {id, title, type, data, refresh_s, updated_at}; raises
     PanelError (message names the field, never the value) on the first violation.
-    Nothing partial is ever honoured: one bad leaf rejects the whole panel."""
+    Nothing partial is ever honoured: one bad leaf rejects the whole panel.
+
+    `log_tail_bounds` is an internal knob for the read path ONLY: when the type
+    is log-tail and it is given, it overrides `_validate_log_tail`'s
+    max_line_chars/max_lines (see bound_log_tail) so already-trimmed content
+    validates against the SAME bound the trim used, rather than the stricter
+    publish-time default. `write_panel()` never passes it -- every write-time
+    caller keeps the original MAX_STRING_CHARS/MAX_LIST_ITEMS caps verbatim."""
     if not isinstance(obj, dict):
         raise PanelError("panel must be a JSON object")
     if "source" in obj:
@@ -276,7 +369,10 @@ def validate_panel(obj):
     data = obj.get("data")
     if not isinstance(data, dict):
         raise PanelError("data must be an object")
-    _VALIDATORS[ptype](data)
+    if ptype == "log-tail" and log_tail_bounds:
+        _validate_log_tail(data, **log_tail_bounds)
+    else:
+        _VALIDATORS[ptype](data)
     refresh_s = obj.get("refresh_s")
     if refresh_s is not None:
         if isinstance(refresh_s, bool) or not isinstance(refresh_s, (int, float)) or refresh_s < 0 \
@@ -397,7 +493,14 @@ def remove_panel(root, pid):
 def _read_panel_file(path, now):
     """One file -> ("ok", panel) | ("expired", None) | ("invalid", reason).
     Symlinks and non-regular files are refused so a crafted link under the panels
-    dir can never make the server read a file outside it (team.json, a key...)."""
+    dir can never make the server read a file outside it (team.json, a key...).
+    A log-tail panel's `data.lines` is bounded (bound_log_tail) BEFORE
+    validation, to whatever HMD_UI_LOG_TAIL_LINES/_BYTES/HMD_UI_LOG_LINE_MAX
+    currently say -- read fresh every call so a test (or an operator) can
+    retune it without a restart. This is the ONLY place serve-time content is
+    ever reshaped; every other invariant (secret scrub, source-rejection,
+    MAX_FILE_BYTES, the closed type set, ...) is enforced completely
+    unchanged, below, by validate_panel."""
     try:
         st = os.lstat(path)
     except OSError as e:
@@ -417,8 +520,21 @@ def _read_panel_file(path, now):
         obj = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return "invalid", "not valid UTF-8 JSON"
+    log_tail_bounds = None
+    if isinstance(obj, dict) and obj.get("type") == "log-tail" and isinstance(obj.get("data"), dict) \
+            and isinstance(obj["data"].get("lines"), list):
+        max_lines = _log_tail_env_int(HMD_UI_LOG_TAIL_LINES, _LOG_TAIL_LINES_DEFAULT)
+        max_bytes = _log_tail_env_int(HMD_UI_LOG_TAIL_BYTES, _LOG_TAIL_BYTES_DEFAULT)
+        max_chars = _log_tail_env_int(HMD_UI_LOG_LINE_MAX, _LOG_LINE_MAX_DEFAULT)
+        bounded, dropped = bound_log_tail(obj["data"]["lines"], max_lines, max_bytes, max_chars)
+        obj["data"] = dict(obj["data"])
+        obj["data"]["lines"] = bounded
+        if dropped > 0:
+            obj["data"]["truncated"] = True
+            obj["data"]["dropped_lines"] = dropped
+        log_tail_bounds = {"max_line_chars": max_chars, "max_lines": max_lines}
     try:
-        panel = validate_panel(obj)
+        panel = validate_panel(obj, log_tail_bounds=log_tail_bounds)
     except PanelError as e:
         return "invalid", str(e)
     expected = os.path.splitext(os.path.basename(path))[0]

@@ -856,5 +856,155 @@ else
   bad "15. server died during the run; tail of its output:"; tail -5 "$SRV_OUT" | sed 's/^/       | /'
 fi
 
+# ═══ 16. bounded log-tail (serve-side trim) — HMD_UI_LOG_TAIL_LINES/_BYTES,
+#         HMD_UI_LOG_LINE_MAX. PANEL-INVARIANTS.md P39-P42: write_panel (the
+#         CLI) is UNCHANGED -- it still refuses an over-cap log-tail whole,
+#         see the "size caps" cases above. read_panels applies an ADDITIONAL,
+#         wider bound to a log-tail already on disk, BEFORE validating, so
+#         content that reached disk by some route other than `panel set`
+#         degrades to a marked "newest slice" instead of being dropped whole.
+#         Two dedicated servers (own fixture root/port, explicit env) keep
+#         every case deterministic and independent of sections 1-15 above.
+FIX_B="$TMPROOT/fixture-bound-b"
+PANELS_B="$FIX_B/.heimdall/ui/panels"
+mkdir -p "$PANELS_B"
+NOW_B="$(date +%s)"
+
+# (a) 2000 short lines, no per-line/byte pressure -> the 200-line cap binds
+jq -cn --argjson n "$NOW_B" '{id:"bound-a", title:"Bound A", type:"log-tail",
+  data:{lines:[range(2000) | "line-\(.)"]}, updated_at:$n}' > "$PANELS_B/bound-a.json"
+
+# (c) one 10000-char line -> cut to exactly 2000 chars ending in an ellipsis
+LONGLINE="$(python3 -c 'print("v" * 10000)')"
+jq -cn --argjson n "$NOW_B" --arg s "$LONGLINE" '{id:"bound-c", title:"Bound C", type:"log-tail",
+  data:{lines:[$s]}, updated_at:$n}' > "$PANELS_B/bound-c.json"
+
+# (d) small log, nowhere near any cap -> byte-identical, no truncated key
+jq -cn --argjson n "$NOW_B" '{id:"bound-d", title:"Bound D", type:"log-tail",
+  data:{lines:["one","two","three"]}, updated_at:$n}' > "$PANELS_B/bound-d.json"
+
+PORT_B="$(free_port)"
+SRV_B_OUT="$TMPROOT/server-bound-b.out"
+( cd "$FIX_B" && HEIMDALL_WATCH_ROOT="$FIX_B" \
+    HMD_UI_LOG_TAIL_LINES=200 HMD_UI_LOG_TAIL_BYTES=65536 HMD_UI_LOG_LINE_MAX=2000 \
+    exec "$UI" --repo "$FIX_B" --port "$PORT_B" --no-open ) >"$SRV_B_OUT" 2>&1 &
+SRV_B_PID=$!
+PIDS+=("$SRV_B_PID")
+URL_RE_B="^http://127\.0\.0\.1:$PORT_B/\?(t|token)=[A-Za-z0-9_-]+\$"
+if wait_for "$SRV_B_OUT" "$URL_RE_B" 10; then
+  URL_B="$(grep -E "$URL_RE_B" "$SRV_B_OUT" | head -1)"
+  QB="${URL_B#*\?}"; TPB="${QB%%=*}"; TOKB="${QB#*=}"
+  BASE_B="http://127.0.0.1:$PORT_B"
+  AUTH_B="$TPB=$TOKB"
+  STATE_B="$TMPROOT/state-bound-b.json"
+  get_state_b() { curl -s -o "${1:-$STATE_B}" -w '%{http_code}' "$BASE_B/api/state?$AUTH_B"; }
+  state_until_b() {
+    local expr="$1" secs="${2:-6}" i=0 max
+    max=$(( secs * 5 ))
+    while [ "$i" -lt "$max" ]; do
+      get_state_b >/dev/null 2>&1
+      jq -e "$expr" "$STATE_B" >/dev/null 2>&1 && return 0
+      sleep 0.2; i=$((i + 1))
+    done
+    return 1
+  }
+
+  if state_until_b '(.panels[] | select(.id=="bound-a") | .data.lines | length) == 200
+                    and (.panels[] | select(.id=="bound-a") | .data.truncated) == true
+                    and (.panels[] | select(.id=="bound-a") | .data.dropped_lines) == 1800' 6; then
+    ok "16a. 2000-line log-tail bounded to 200 lines (HMD_UI_LOG_TAIL_LINES default), truncated:true, dropped_lines:1800"
+  else
+    bad "16a. bound-a not bounded as expected: $(jq -c '.panels[]|select(.id=="bound-a")|{n:(.data.lines|length),truncated:.data.truncated,dropped:.data.dropped_lines}' "$STATE_B" 2>/dev/null)"
+  fi
+  if jq -e '(.panels[] | select(.id=="bound-a") | .data.lines[0]) == "line-1800"
+            and (.panels[] | select(.id=="bound-a") | .data.lines[-1]) == "line-1999"' "$STATE_B" >/dev/null 2>&1; then
+    ok "16a2. trim drops the OLD end and keeps the newest lines (line-1800..line-1999)"
+  else
+    bad "16a2. wrong slice kept: $(jq -c '.panels[]|select(.id=="bound-a")|{first:.data.lines[0],last:.data.lines[-1]}' "$STATE_B" 2>/dev/null)"
+  fi
+
+  if state_until_b '[.panels[].id] | index("bound-c")' 6; then
+    EXPECT_CUT="$(python3 -c 'print("v" * 1999 + "…")')"
+    if jq -e --arg want "$EXPECT_CUT" '(.panels[] | select(.id=="bound-c") | .data.lines[0]) == $want
+                                       and (.panels[] | select(.id=="bound-c") | .data.lines[0] | length) == 2000' "$STATE_B" >/dev/null 2>&1; then
+      ok "16c. a 10000-char line is cut to exactly 2000 chars ending in an ellipsis, oldest content kept"
+    else
+      bad "16c. long-line cut wrong: $(jq -c '.panels[]|select(.id=="bound-c")|{len:(.data.lines[0]|length),tail:(.data.lines[0][-3:])}' "$STATE_B" 2>/dev/null)"
+    fi
+  else
+    bad "16c. bound-c panel never appeared in /api/state"
+  fi
+
+  if state_until_b '[.panels[].id] | index("bound-d")' 6; then
+    if jq -e '(.panels[] | select(.id=="bound-d") | .data.lines) == ["one","two","three"]
+              and ((.panels[] | select(.id=="bound-d") | .data | has("truncated")) | not)
+              and ((.panels[] | select(.id=="bound-d") | .data | has("dropped_lines")) | not)' "$STATE_B" >/dev/null 2>&1; then
+      ok "16d. a small log-tail (3 short lines) is served byte-identical, no truncated/dropped_lines key added"
+    else
+      bad "16d. small log-tail altered: $(jq -c '.panels[]|select(.id=="bound-d")|.data' "$STATE_B" 2>/dev/null)"
+    fi
+  else
+    bad "16d. bound-d panel never appeared in /api/state"
+  fi
+else
+  bad "16a/c/d. bound-b server never came up within 10s; output:"; sed 's/^/       | /' "$SRV_B_OUT"
+fi
+kill "$SRV_B_PID" 2>/dev/null; wait "$SRV_B_PID" 2>/dev/null
+
+# (b) byte budget binds BEFORE the line-count cap: 100 lines x 100 bytes each,
+# HMD_UI_LOG_TAIL_BYTES=3000 -> floor(3000/100)=30 lines survive, not all 100
+# and nowhere near the 200-line cap -- proves the byte dimension, not the line
+# dimension, is what bound this case.
+FIX_C="$TMPROOT/fixture-bound-c"
+PANELS_C="$FIX_C/.heimdall/ui/panels"
+mkdir -p "$PANELS_C"
+BYTE_LINES="$(python3 -c '
+import json
+lines = []
+for i in range(100):
+    head = "byte-%03d-" % i
+    lines.append(head + ("x" * (100 - len(head))))
+print(json.dumps(lines))
+')"
+jq -cn --argjson n "$(date +%s)" --argjson lines "$BYTE_LINES" \
+  '{id:"bound-b", title:"Bound B", type:"log-tail", data:{lines:$lines}, updated_at:$n}' > "$PANELS_C/bound-b.json"
+
+PORT_C="$(free_port)"
+SRV_C_OUT="$TMPROOT/server-bound-c.out"
+( cd "$FIX_C" && HEIMDALL_WATCH_ROOT="$FIX_C" \
+    HMD_UI_LOG_TAIL_LINES=200 HMD_UI_LOG_TAIL_BYTES=3000 HMD_UI_LOG_LINE_MAX=2000 \
+    exec "$UI" --repo "$FIX_C" --port "$PORT_C" --no-open ) >"$SRV_C_OUT" 2>&1 &
+SRV_C_PID=$!
+PIDS+=("$SRV_C_PID")
+URL_RE_C="^http://127\.0\.0\.1:$PORT_C/\?(t|token)=[A-Za-z0-9_-]+\$"
+if wait_for "$SRV_C_OUT" "$URL_RE_C" 10; then
+  URL_C="$(grep -E "$URL_RE_C" "$SRV_C_OUT" | head -1)"
+  QC="${URL_C#*\?}"; TPC="${QC%%=*}"; TOKC="${QC#*=}"
+  BASE_C="http://127.0.0.1:$PORT_C"
+  AUTH_C="$TPC=$TOKC"
+  STATE_C="$TMPROOT/state-bound-c.json"
+  get_state_c() { curl -s -o "${1:-$STATE_C}" -w '%{http_code}' "$BASE_C/api/state?$AUTH_C"; }
+  state_until_c() {
+    local expr="$1" secs="${2:-6}" i=0 max
+    max=$(( secs * 5 ))
+    while [ "$i" -lt "$max" ]; do
+      get_state_c >/dev/null 2>&1
+      jq -e "$expr" "$STATE_C" >/dev/null 2>&1 && return 0
+      sleep 0.2; i=$((i + 1))
+    done
+    return 1
+  }
+  if state_until_c '(.panels[] | select(.id=="bound-b") | .data.lines | length) == 30
+                    and (.panels[] | select(.id=="bound-b") | .data.truncated) == true
+                    and (.panels[] | select(.id=="bound-b") | .data.dropped_lines) == 70' 6; then
+    ok "16b. HMD_UI_LOG_TAIL_BYTES=3000 binds before the 200-line cap: 30 of 100 lines kept, truncated:true, dropped_lines:70"
+  else
+    bad "16b. byte-cap-first case wrong: $(jq -c '.panels[]|select(.id=="bound-b")|{n:(.data.lines|length),truncated:.data.truncated,dropped:.data.dropped_lines}' "$STATE_C" 2>/dev/null)"
+  fi
+else
+  bad "16b. bound-c server never came up within 10s; output:"; sed 's/^/       | /' "$SRV_C_OUT"
+fi
+kill "$SRV_C_PID" 2>/dev/null; wait "$SRV_C_PID" 2>/dev/null
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
