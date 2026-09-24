@@ -40,6 +40,10 @@
 #   16. pub_from_b64() rejects a 31-byte key -> E2EError
 #   17. nonce_for_seq() uniqueness: seq 0..1000 x {hmd,device} -> 2002 unique
 #   18. 64 KiB seal()+open_() round-trip completes in < 5000ms (loose bound)
+#   19. pub_from_b64() accepts URL-safe, unpadded base64 -- the real
+#       device_pubkey wire shape (app's protocol.ts base64UrlEncode, forwarded
+#       byte-for-byte by the relay into device_bound), not just this module's
+#       own standard/padded pub_b64() output
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -380,6 +384,37 @@ if [ "$TIMING_STATUS" = "OK" ]; then
   ok "18. 64 KiB seal()+open_() round-trip in ${TIMING_MS}ms (< 5000ms)"
 else
   bad "18. 64 KiB seal/open timing or correctness failed: $TIMING_OUT"
+fi
+
+# ═══ 19. pub_from_b64() accepts the real device_pubkey wire shape: URL-safe, ═
+# ═══     unpadded base64 -- not just this module's own standard/padded form ═
+if python3 - "$MOD" <<'PYEOF' 2>"$TMPROOT/case19.err"
+import importlib.util, sys, base64
+spec = importlib.util.spec_from_file_location("hmd_relay_e2e", sys.argv[1])
+e2e = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(e2e)
+
+# A 32-byte value always has exactly one trailing '=' in standard base64
+# (32 % 3 == 2), so every real device_pubkey -- URL-safe-encoded and
+# padding-stripped by the app's protocol.ts:base64UrlEncode, then forwarded
+# byte-for-byte by the relay into device_bound's payload -- arrives unpadded.
+# A leading 0xFF also forces a '/' in the standard encoding, so this fixture
+# exercises the alphabet swap, not just the padding restoration.
+raw = bytes([0xFF]) + bytes(31)
+std_padded = base64.b64encode(raw).decode("ascii")
+urlsafe_unpadded = std_padded.replace("+", "-").replace("/", "_").rstrip("=")
+if "_" not in urlsafe_unpadded or urlsafe_unpadded.endswith("="):
+    sys.exit(2)  # fixture itself is wrong, not the thing under test
+
+from_std = e2e.pub_from_b64(std_padded)
+from_urlsafe = e2e.pub_from_b64(urlsafe_unpadded)
+sys.exit(0 if (from_std == raw and from_urlsafe == raw) else 1)
+PYEOF
+then
+  ok "19. pub_from_b64() accepts URL-safe unpadded base64 (real device_pubkey wire shape), still matches standard-padded decode"
+else
+  bad "19. pub_from_b64 url-safe/unpadded decode failed:"
+  sed 's/^/       | /' "$TMPROOT/case19.err"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

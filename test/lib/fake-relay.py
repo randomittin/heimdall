@@ -15,8 +15,10 @@ Two independent modes, selected by argv[1]:
 
   fake-relay.py device <action> ...
       One-shot helper subcommands standing in for the paired PHONE, so the
-      bash test can drive the Wave-1 hello key-exchange and later
-      send-message commands step by step without a real device. Imports
+      bash test can drive the session-key bootstrap (a real device pubkey
+      written to ctl/bind-device before the client's first stream connect --
+      see RelayState.device_pubkey_b64 below) and later send-message
+      commands step by step without a real device. Imports
       bin/lib/hmd_relay_e2e.py BY PATH (the same convention
       bin/heimdall-relay-client itself uses) -- never re-implements the
       crypto. See device_main() below for the action list.
@@ -27,6 +29,15 @@ CONTROL PROTOCOL (the --ctl DIR the "serve" stream handler polls):
                    stream connection -- built by `device envelope` below and
                    written to CTLDIR by the bash test, standing in for a
                    frame the paired phone "sent".
+  bind-device   -- (written ONCE, before the server is asked to start a
+                   stream -- NOT polled mid-stream) the paired phone's X25519
+                   public key, base64, embedded in every device_bound frame's
+                   payload.device_pubkey for this run. Absent -> a fixed,
+                   valid, non-low-order fallback key is used instead (see
+                   RelayState.device_pubkey_b64), so scenarios that never
+                   drive a real device handshake (backoff/rate-limit timing)
+                   still get a device_bound the client can derive a session
+                   key from.
   drop-stream   -- (no content needed) consumed ONCE by the very next
                    /session/:id/stream connection ATTEMPT: that attempt is
                    refused before any response line is written (the raw
@@ -70,6 +81,14 @@ E2E_PATH = os.path.join(REPO_ROOT, "bin", "lib", "hmd_relay_e2e.py")
 
 MAX_ENVELOPE_BYTES = 131072
 NUM_JSON_RE = re.compile(r"^\d+\.json$")
+
+# A fixed, valid (non-low-order), obviously-fake X25519 public key -- used as
+# the device_bound payload's device_pubkey whenever a scenario never writes
+# ctl/bind-device (see RelayState.device_pubkey_b64). Never a real key: the
+# bytes 1..32 fill point is far from every documented X25519 low-order point
+# (RFC 7748 section 5.9), so derive_session_key() never sees an all-zero
+# shared secret from it.
+_DEFAULT_DEVICE_PUBKEY = base64.b64encode(bytes(range(1, 33))).decode("ascii")
 
 
 def _load_e2e():
@@ -152,6 +171,21 @@ class RelayState:
         os.makedirs(ctl_dir, exist_ok=True)
         self._req_log_lock = threading.Lock()
         self._frames_log_lock = threading.Lock()
+
+    def device_pubkey_b64(self):
+        """The device pubkey to embed in this session's `device_bound` frame --
+        whatever the test wrote to ctl/bind-device (a real handshake scenario),
+        or a fixed, valid, non-low-order fallback pubkey (any scenario that
+        never calls a real device handshake, e.g. backoff/rate-limit timing
+        tests) so `device_bound` -- and therefore this client's own successful
+        key derivation -- is never gated on a bind that will never come."""
+        p = os.path.join(self.ctl_dir, "bind-device")
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+            if val:
+                return val
+        return _DEFAULT_DEVICE_PUBKEY
 
     def new_session(self):
         sid = str(uuid.uuid4())
@@ -386,7 +420,7 @@ class Handler(BaseHTTPRequestHandler):
             self._chunk_send(_envelope_bytes({
                 "v": 1, "session_id": sess.id, "seq": 0, "sender": "relay",
                 "type": "device_bound", "nonce": None, "ciphertext": None,
-                "payload": {"device_token": "fake", "exp": sess.exp},
+                "payload": {"device_pubkey": STATE.device_pubkey_b64(), "bound_at": int(time.time())},
             }))
             seen = set()
             while True:

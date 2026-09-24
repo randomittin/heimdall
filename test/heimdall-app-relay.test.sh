@@ -4,7 +4,9 @@
 # test/lib/fake-relay.py, a stdlib stand-in for the Cloudflare relay described in
 # hmdapp's docs/HANDOFF-TO-HEIMDALL-relay.md ("Implemented relay API",
 # "Envelope", "Tests", "Acceptance criteria" -- read-only inputs, never edited
-# here) and docs/RELAY-CLIENT-CONTRACT.md (the hello key-exchange convention).
+# here) and docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md (the session-key
+# bootstrap convention -- docs/RELAY-CLIENT-CONTRACT.md, formerly cited here,
+# is retracted; see that file's own banner).
 #
 # This suite drives the REAL bin/heimdall-relay-client (claims 1-7) and the
 # REAL `bin/heimdall app connect --relay` (claim 8) against the fake relay --
@@ -19,16 +21,19 @@
 # being built by a sibling task and may not exist yet on this branch.
 # bin/heimdall-relay-client's own main() gates e2e_available() BEFORE
 # pair_init, so EVERY claim that starts a real relay-client process needs
-# something at that path answering e2e_available()==True. When the real
-# module is absent this suite falls back to a minimal local stub (see
-# "RELAY_CLIENT_RUN" below) that only ever provides generate_keypair/pub_b64
-# -- enough to get claims 1, 5, 6 and 7 running for real (none of them reach
-# the Wave-1 hello handshake). Claims 2, 3 and 4 (state-dedup, seq/replay,
-# send-message round-trip) DO reach that handshake (seal/open/
-# derive_session_key) and are SKIPPED, loudly and counted, whenever the real
-# module is absent -- never faked. The e2e_available grep acceptance line is
-# skipped the same way. Claim 8 always runs regardless (it deliberately
-# forces e2e_available()==False itself, real module or not).
+# something at that path answering e2e_available()==True. test/lib/fake-relay.py
+# sends an unconditional `device_bound` frame as the FIRST line of every
+# stream connection (no gated "hello" handshake), so even claims that never
+# touch the device side directly (1, 5, 6, 7) exercise
+# pub_from_b64/derive_session_key just by connecting. When the real module is
+# absent this suite falls back to a minimal local stub (see "RELAY_CLIENT_RUN"
+# below) that fakes those two calls too (never real X25519/HKDF) so claims 1,
+# 5, 6 and 7 still run for real. Claims 2, 3 and 4 (state-dedup, seq/replay,
+# send-message round-trip) need the REAL crypto (seal/open_ against a real
+# session key) and are SKIPPED, loudly and counted, whenever the real module
+# is absent -- never faked. The e2e_available grep acceptance line is skipped
+# the same way. Claim 8 always runs regardless (it deliberately forces
+# e2e_available()==False itself, real module or not).
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -324,16 +329,18 @@ else
 fi
 
 # bin/heimdall-relay-client's own main() gates e2e_available() BEFORE
-# pair_init -- so even claims that never touch real crypto (1, 5, 6, 7, all
-# below the Wave-1 hello handshake) still need SOME module at
-# bin/lib/hmd_relay_e2e.py answering e2e_available()==True just to get the
-# process past that gate. When the real module is present it is used
-# as-is, unshadowed. When it is absent, a full copy of bin/ + sentinels/ is
-# made with ONLY hmd_relay_e2e.py swapped for a minimal stub that provides
-# e2e_available/generate_keypair/pub_b64 (the only calls made before a real
-# hello handshake) and nothing else -- claims 2/3/4, which DO reach the hello
-# handshake (seal/open/derive_session_key), stay gated on $E2E_PRESENT and
-# are skipped, loudly, whenever this stub is in play.
+# pair_init -- so even claims that never touch real crypto directly (1, 5, 6,
+# 7) still need SOME module at bin/lib/hmd_relay_e2e.py answering
+# e2e_available()==True just to get the process past that gate, AND (since
+# fake-relay.py's serve mode sends an unconditional device_bound on the very
+# first stream connect) answering pub_from_b64/derive_session_key too, just
+# to reach a successful device_bound instead of an error event. When the real
+# module is present it is used as-is, unshadowed. When it is absent, a full
+# copy of bin/ + sentinels/ is made with ONLY hmd_relay_e2e.py swapped for a
+# minimal stub that fakes those calls (never real X25519/HKDF) and nothing
+# else -- claims 2/3/4, which DO need REAL crypto (seal/open_ against a real
+# session key), stay gated on $E2E_PRESENT and are skipped, loudly, whenever
+# this stub is in play.
 if [ "$E2E_PRESENT" = true ]; then
   RELAY_CLIENT_RUN="$RELAY_CLIENT"
 else
@@ -342,13 +349,17 @@ else
   cat > "$MINSTUB_LIB/hmd_relay_e2e.py" <<'MINSTUB_EOF'
 """Minimal e2e_available()==True stand-in used ONLY when the real
 bin/lib/hmd_relay_e2e.py has not landed on this branch yet, so claims 1, 5,
-6 and 7 (none of which reach the Wave-1 hello handshake -- generate_keypair
-and pub_b64 are the only calls bin/heimdall-relay-client makes before that
-point) can still run against a real, unmodified bin/heimdall-relay-client
-process instead of being skipped outright. seal/open/derive_session_key are
-deliberately absent: claims 2/3/4 (which DO need them, via the hello
-handshake) are skipped whenever this stub is in use -- never faked."""
+6 and 7 can still run against a real, unmodified bin/heimdall-relay-client
+process instead of being skipped outright. fake-relay.py's `serve` mode sends
+an unconditional device_bound on every stream connect now (no gated "hello"
+frame), so pub_from_b64/derive_session_key are needed even for those four
+claims just to reach a successful device_bound instead of an error event --
+faked here with plain, clearly-non-cryptographic stand-ins (never real
+X25519/HKDF). seal/open are deliberately still absent: claims 2/3/4 (which DO
+need real AEAD sealing against a real session key) are skipped whenever this
+stub is in use -- never faked."""
 import base64
+import hashlib
 import os
 
 
@@ -362,6 +373,14 @@ def generate_keypair():
 
 def pub_b64(pub):
     return base64.b64encode(pub).decode("ascii")
+
+
+def pub_from_b64(s):
+    return base64.b64decode(s)
+
+
+def derive_session_key(priv, pub, session_id):
+    return hashlib.sha256(bytes(pub) + session_id.encode("utf-8")).digest()
 MINSTUB_EOF
   MINSTUB_ROOT="$TMPROOT/stub-min-e2e-root"
   mkdir -p "$MINSTUB_ROOT"
@@ -385,6 +404,18 @@ for _ in $(seq 1 50); do
   python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_A_RELAY))==0 else 1)" && break
   sleep 0.1
 done
+
+# Device keygen + bind happen BEFORE the client starts: fake-relay.py's serve
+# mode sends device_bound unconditionally on the very FIRST stream connection,
+# so the real device pubkey has to already be on disk at ctl/bind-device
+# before that connection can happen -- a poll/grace-period on the server side
+# would race the client's own near-instant loopback connect.
+if [ "$E2E_PRESENT" = true ]; then
+  DEV_KEY_JSON="$(python3 "$FAKE_RELAY" device keygen)"
+  DEV_PRIV_B64="$(printf '%s' "$DEV_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["priv_b64"])')"
+  DEV_PUB_B64="$(printf '%s' "$DEV_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pub_b64"])')"
+  printf '%s' "$DEV_PUB_B64" > "$CTL_A/bind-device"
+fi
 
 CLIENT_A_OUT="$TMPROOT/a.client.out"
 CLIENT_A_ERR="$TMPROOT/a.client.err"
@@ -438,21 +469,33 @@ else
 fi
 
 if [ "$E2E_PRESENT" = true ]; then
-  DEV_KEY_JSON="$(python3 "$FAKE_RELAY" device keygen)"
-  DEV_PRIV_B64="$(printf '%s' "$DEV_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["priv_b64"])')"
-  DEV_PUB_B64="$(printf '%s' "$DEV_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pub_b64"])')"
-
   KEY_JSON="$(python3 "$FAKE_RELAY" device derive --dev-priv-b64 "$DEV_PRIV_B64" --hmd-pub-b64 "$HMD_PUB_A" --session-id "$SID_A")"
   SESSION_KEY_A="$(printf '%s' "$KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["key_b64"])')"
 
-  # Wave-1 hello: unsealed device pubkey as ciphertext, nonce literally "hello", seq 0.
-  python3 "$FAKE_RELAY" device envelope --session-id "$SID_A" --seq 0 --sender device \
-    --type command --nonce hello --ciphertext "$DEV_PUB_B64" > "$CTL_A/001.json"
-
-  if wait_for_count "$LOG_A/frames.ndjson" 1 '"type":"ack"' 10; then
-    ok "scenario A: hello key-exchange produced a sealed ack frame"
+  if wait_for "$CLIENT_A_OUT" '"event":"device_bound"' 10; then
+    ok "scenario A: device_bound bootstrap derived a session key (no hello frame needed)"
   else
-    bad "scenario A: no ack frame ever appeared in frames.ndjson after hello"
+    bad "scenario A: relay-client never emitted device_bound"
+  fi
+
+  # delta 4: a keepalive control frame (real wire shape: nonce/ciphertext both
+  # JSON null) must be silently recognized, never logged as an error --
+  # constructed inline (not via `device envelope`, whose --nonce/--ciphertext
+  # argparse args are required non-null strings and can't represent this).
+  ERR_COUNT_BEFORE_KEEPALIVE="$(count_matching "$CLIENT_A_OUT" '"event":"error"')"
+  python3 -c "
+import json, sys
+env = {'v': 1, 'session_id': sys.argv[1], 'seq': 0, 'sender': 'relay', 'type': 'keepalive',
+       'nonce': None, 'ciphertext': None, 'payload': {'ts': 1758700000}}
+with open(sys.argv[2], 'w', encoding='utf-8') as f:
+    json.dump(env, f)
+" "$SID_A" "$CTL_A/001.json"
+  sleep 1
+  ERR_COUNT_AFTER_KEEPALIVE="$(count_matching "$CLIENT_A_OUT" '"event":"error"')"
+  if [ "$ERR_COUNT_AFTER_KEEPALIVE" -eq "$ERR_COUNT_BEFORE_KEEPALIVE" ]; then
+    ok "delta 4: keepalive control frame produced no error event ($ERR_COUNT_BEFORE_KEEPALIVE == $ERR_COUNT_AFTER_KEEPALIVE)"
+  else
+    bad "delta 4: keepalive control frame produced an unexpected error event ($ERR_COUNT_BEFORE_KEEPALIVE -> $ERR_COUNT_AFTER_KEEPALIVE)"
   fi
 
   # claim 2 (INV-22): exactly one state frame across >=3 idle ticks, then
@@ -511,7 +554,7 @@ print(' '.join(str(s) for s in seqs))
   # claim 4 (INV-23): send-message round-trips into inbox.jsonl with the same
   # record shape companion_ui_inbox.append() produces; sealed ack {ok:true,id}.
   SEAL_JSON="$(python3 "$FAKE_RELAY" device seal --key-b64 "$SESSION_KEY_A" --seq 1 --sender device \
-    --text '{"action":"send-message","text":"hello from claim4"}')"
+    --text '{"action":"send-message","params":{"text":"hello from claim4"}}')"
   NONCE1="$(printf '%s' "$SEAL_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nonce_b64"])')"
   CT1="$(printf '%s' "$SEAL_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ciphertext_b64"])')"
   python3 "$FAKE_RELAY" device envelope --session-id "$SID_A" --seq 1 --sender device \
@@ -598,7 +641,7 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   # claim 4b (INV-23): too-long text -> ack {ok:false, detail:"too-long"}, no inbox record.
   LONG_TEXT="$(python3 -c 'print("x" * 2001)')"
   SEAL2_JSON="$(python3 "$FAKE_RELAY" device seal --key-b64 "$SESSION_KEY_A" --seq 2 --sender device \
-    --text "{\"action\":\"send-message\",\"text\":\"$LONG_TEXT\"}")"
+    --text "{\"action\":\"send-message\",\"params\":{\"text\":\"$LONG_TEXT\"}}")"
   NONCE2="$(printf '%s' "$SEAL2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nonce_b64"])')"
   CT2="$(printf '%s' "$SEAL2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ciphertext_b64"])')"
   python3 "$FAKE_RELAY" device envelope --session-id "$SID_A" --seq 2 --sender device \
@@ -624,7 +667,7 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
     bad "INV-23: too-long send-message unexpectedly produced an inbox record"
   fi
 else
-  skip "INV-22/14/15/23 (claims 2-4): bin/lib/hmd_relay_e2e.py absent -- hello handshake needs device seal/open/derive"
+  skip "INV-22/14/15/23 (claims 2-4): bin/lib/hmd_relay_e2e.py absent -- session-key bootstrap needs device seal/open/derive"
 fi
 
 # claim 5 (INV-21): end-session -> client emits session_ended and exits 0;
@@ -841,6 +884,50 @@ done
 
 kill "$SRV_D" 2>/dev/null
 wait "$SRV_D" 2>/dev/null
+
+# ── Scenario E: delta 5 -- silent GET /stream body times out and reconnects ─
+REPO_E="$(make_repo)"
+PORT_E_RELAY="$(free_port)"
+PORT_E_UI="$(free_port)"
+LOG_E="$TMPROOT/e.log"; CTL_E="$TMPROOT/e.ctl"
+mkdir -p "$LOG_E" "$CTL_E"
+
+python3 "$FAKE_RELAY" serve "$PORT_E_RELAY" --log "$LOG_E" --ctl "$CTL_E" >"$TMPROOT/e.srv.out" 2>&1 &
+SRV_E=$!
+PIDS+=("$SRV_E")
+for _ in $(seq 1 50); do
+  python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_E_RELAY))==0 else 1)" && break
+  sleep 0.1
+done
+
+CLIENT_E_OUT="$TMPROOT/e.client.out"
+HMD_RELAY_STREAM_IDLE_S=2 "$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_E_RELAY" --repo "$REPO_E" --ui-port "$PORT_E_UI" \
+  >"$CLIENT_E_OUT" 2>"$TMPROOT/e.client.err" &
+CLIENT_E=$!
+PIDS+=("$CLIENT_E")
+
+if wait_for "$CLIENT_E_OUT" '"event":"device_bound"' 10; then
+  ok "scenario E: initial stream opened and bound before going silent"
+else
+  bad "scenario E: relay-client never bound on the first (soon-to-go-silent) stream"
+fi
+
+if wait_for "$CLIENT_E_OUT" '"event":"stream_drop".*"reason":"idle"' 8; then
+  ok "delta 5: silent stream (no keepalive, no close) produced stream_drop reason=idle within HMD_RELAY_STREAM_IDLE_S"
+else
+  bad "delta 5: silent stream never produced an idle stream_drop"
+fi
+
+if wait_for_count "$LOG_E/requests.log" 2 'GET /session/.*/stream' 8; then
+  ok "delta 5: relay-client reopened GET /stream after the idle drop"
+else
+  bad "delta 5: relay-client never reopened the stream after the idle drop"
+fi
+
+kill "$CLIENT_E" 2>/dev/null
+wait "$CLIENT_E" 2>/dev/null
+kill "$SRV_E" 2>/dev/null
+wait "$SRV_E" 2>/dev/null
 
 echo
 printf '%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"

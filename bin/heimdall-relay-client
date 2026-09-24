@@ -17,41 +17,32 @@ the same convention that module itself uses for bin/lib/*.py, see
 viewer can show which local port `hmd ui` is actually bound to); the state
 read path never opens a socket to it.
 
-WAVE-1 KEY-EXCHANGE CONVENTION (not in the design spec; resolved here --
-heimdall-app's RelayTransport MUST implement this identically):
-    The relay's `/session/:id/ws` upgrade always pushes an unencrypted
-    `device_bound` control frame down BOTH legs first (INV-20) -- that frame
-    never carries the phone's X25519 public key, only an opaque
-    `device_token`. Since `hmd_pub` travels only inside the QR payload
-    (INV-12: never through the relay), the phone is the side that has NOT yet
-    told the relay anything cryptographic, and this client cannot derive the
-    shared session key until it does. Wave 1 defines one bootstrap exchange,
-    layered on top of the normal Envelope/frame plumbing:
-        1. Immediately after observing `device_bound` (sender "relay"), the
-           PHONE sends exactly one frame: sender "device", type "command",
-           seq 0, nonce the LITERAL string "hello" (not a derived nonce --
-           there is no session key yet to derive one from), ciphertext the
-           base64 encoding of its raw 32-byte X25519 public key (NOT
-           AEAD-sealed -- there is nothing to seal with yet; the field is
-           reused as a plain carrier at this one bootstrap step only).
-        2. This client decodes that pubkey, calls
-           `derive_session_key(hmd_priv, device_pub, session_id)` (INV-11:
-           HKDF-SHA256(ECDH(hmd_priv, device_pub), salt=session_id,
-           info="hmd-relay-v1")) and replies with sender "hmd", type "ack",
-           seq 0, AEAD-sealed with the now-derived key, plaintext
-           `{"ok": true, "of_seq": 0}`.
-        3. Only after that ack is sent does this client start sending `state`
-           frames (seq 1, 2, 3, ... -- INV-14: one shared strictly-increasing
-           `seq` counter across every hmd-SENT frame, ack or state alike,
-           matching INV-14's per-SENDER-not-per-type wording).
-    Any device-sent frame received before a device_bound, or received as the
-    first device-sent frame after device_bound that does not match the shape
-    above (wrong type/nonce, or a pubkey that fails to decode), is a loud
-    `error` event, ignored -- never crashes, never derives a key from it
-    (INV-33: a relay-injected or malformed control/bootstrap frame must never
-    be silently trusted). This client keeps waiting for a valid hello on every
-    subsequent device-sent frame until one validates -- one bad frame does not
-    permanently wedge the session.
+SESSION-KEY BOOTSTRAP (matches hmdapp's RelayTransport / fake-hmd.mjs exactly
+-- see hmdapp's docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md Section 1;
+this section previously documented a "Wave-1 hello" handshake the real app
+never implements, retired 2026-09-24):
+    The relay's `GET /session/:id/stream` pushes an unencrypted `device_bound`
+    control frame (sender "relay") down this leg once the phone has completed
+    pairing -- `payload` on THIS leg is `{"device_pubkey": <b64 X25519
+    pubkey>, "bound_at": <epoch seconds>}` (the phone leg's own `device_bound`
+    carries a different, unrelated payload -- `{device_token, exp}` -- never
+    seen here). There is no second frame, no "hello": as soon as
+    `device_bound` arrives, this client decodes `device_pubkey`, calls
+    `derive_session_key(hmd_priv, device_pub, session_id)` (INV-11:
+    HKDF-SHA256(ECDH(hmd_priv, device_pub), salt=session_id,
+    info="hmd-relay-v1")), and is immediately ready to open `command` frames
+    -- no ack is sent for `device_bound` itself (unlike a real `command`
+    frame, it is a control frame, INV-20). `device_bound` may arrive more
+    than once per process lifetime (e.g. after a stream reconnect); each
+    occurrence re-derives the same key from the same inputs and is treated as
+    success, never as an error.
+    A `device_bound` whose `device_pubkey` is missing or fails to decode
+    (INV-33: a relay-injected or malformed control frame must never be
+    silently trusted) is a loud `error` event, ignored -- never crashes,
+    never derives a key, never marks the session paired. A `command` frame
+    from sender "device" arriving before any `device_bound` has succeeded is
+    likewise a loud `error` event, ignored, never a crash on a null session
+    key.
 
 STDOUT CONTRACT: newline-delimited JSON, one compact (sorted-key) object per
 line, flushed immediately -- the ONLY channel `hmd app connect --relay` reads
@@ -60,13 +51,18 @@ to drive its own UI; nothing else is ever written to stdout.
      "pairing_code":..,"exp":..,"hmd_pubkey":..},"exp":..}
         `qr`, serialized compact+sorted (which this whole line already is), IS
         the exact QR payload string heimdall-app renders (Decision 7.2 shape).
-    {"event":"device_bound","exp":..}                 a phone claimed the session
+    {"event":"device_bound","bound_at":..}            session key derived --
+                                                       may repeat across a
+                                                       stream reconnect
     {"event":"state_sent","seq":N,"bytes":B,"delivered":bool}
     {"event":"command","action":"send-message","ok":bool,"detail":..}
         one line per inbound command frame that reaches decrypted-payload
-        handling (the Wave-1 hello bootstrap itself is silent -- see
-        device_bound above)
-    {"event":"stream_drop","retry_ms":N}              GET stream disconnected;
+        handling (a `keepalive` control frame is always silent -- never
+        logged, not even at this level)
+    {"event":"stream_drop","retry_ms":N[,"reason":"idle"]}
+                                                       GET stream disconnected
+                                                       (or silent past
+                                                       HMD_RELAY_STREAM_IDLE_S);
                                                        reconnecting after N ms
     {"event":"session_ended","reason":..}             terminal; process exits 0
     {"event":"error","detail":..}                     non-fatal unless followed
@@ -94,6 +90,7 @@ import http.client
 import json
 import os
 import signal
+import socket
 import ssl
 import sys
 import threading
@@ -129,8 +126,22 @@ MAX_ENVELOPE_BYTES = 131072
 BACKOFF_BASE_MS = 2000
 BACKOFF_CAP_MS = 30000
 CONNECT_TIMEOUT_S = 15
-STREAM_TIMEOUT_S = None  # long-lived by design -- reconnect logic reacts to an
-                          # observed EOF/error, never a client-side idle timeout
+STREAM_TIMEOUT_S = None  # unbounded connect + response-header wait for GET
+                          # /stream -- the long-lived body that follows has
+                          # its own bound, STREAM_IDLE_S below; this constant
+                          # only ever governed (and still only governs) the
+                          # phase before the first line of that body exists.
+
+# HMD_RELAY_STREAM_IDLE_S (default 60s -- three missed keepalives at the
+# relay's own 20s cadence): bounds silence on an ALREADY-OPEN GET /stream
+# body. A dead SessionDO can leave this client's chunked response open and
+# empty forever otherwise (docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md
+# Section 6). On expiry: abort the read, reconnect through the normal retry
+# path, emit stream_drop with reason "idle" -- see _stream_loop.
+try:
+    STREAM_IDLE_S = float(os.environ.get("HMD_RELAY_STREAM_IDLE_S", "60"))
+except (TypeError, ValueError):
+    STREAM_IDLE_S = 60.0
 
 
 def emit(obj):
@@ -372,22 +383,6 @@ class RelayClient:
         resp = conn.getresponse()
         return conn, resp
 
-    def _handle_hello(self, env):
-        if not (env.get("type") == "command" and env.get("nonce") == "hello" and env.get("seq") == 0):
-            emit({"event": "error", "detail": "expected hello key-exchange frame, got type=%r nonce=%r seq=%r"
-                                              % (env.get("type"), env.get("nonce"), env.get("seq"))})
-            return
-        try:
-            device_pub = E2E.pub_from_b64(env.get("ciphertext") or "")
-            self.session_key = E2E.derive_session_key(self.priv, device_pub, self.session_id)
-        except Exception as e:
-            emit({"event": "error", "detail": "hello key exchange failed: %s" % e})
-            self.session_key = None
-            return
-        self.last_device_seq = 0
-        self.send_hmd_frame("ack", {"ok": True, "of_seq": 0})
-        self.state_ready.set()
-
     def _handle_command(self, env):
         seq = env.get("seq")
         if not isinstance(seq, int) or seq <= self.last_device_seq:
@@ -408,13 +403,15 @@ class RelayClient:
         except (ValueError, UnicodeDecodeError):
             obj = None
         action = obj.get("action") if isinstance(obj, dict) else None
+        params = obj.get("params") if isinstance(obj, dict) else None
+        text = params.get("text") if isinstance(params, dict) else None
         extra = {}
         if action == "send-message":
             if INBOX is None:
                 ok, detail = False, "inbox-unavailable"
             else:
                 try:
-                    record = INBOX.append(self.root, obj.get("text"))
+                    record = INBOX.append(self.root, text)
                     ok, detail, extra = True, None, {"id": record["id"]}
                 except INBOX.InboxError as e:
                     ok, detail = False, e.code
@@ -433,14 +430,18 @@ class RelayClient:
         sender = env.get("sender")
         type_ = env.get("type")
         if sender == "relay" and type_ == "device_bound":
-            if self.paired:
-                emit({"event": "error", "detail": "unexpected device_bound (already bound) -- ignored"})
+            payload = env.get("payload") or {}
+            try:
+                device_pub = E2E.pub_from_b64(payload.get("device_pubkey") or "")
+                self.session_key = E2E.derive_session_key(self.priv, device_pub, self.session_id)
+            except Exception as e:
+                emit({"event": "error", "detail": "device_bound key derivation failed: %s" % e})
                 return
             self.paired = True
-            self.bound_at = time.time()
+            self.bound_at = payload.get("bound_at")
             self.write_status()
-            payload = env.get("payload") or {}
-            emit({"event": "device_bound", "exp": payload.get("exp")})
+            emit({"event": "device_bound", "bound_at": self.bound_at})
+            self.state_ready.set()
             return
         if sender == "relay" and type_ == "session_ended":
             payload = env.get("payload") or {}
@@ -448,11 +449,13 @@ class RelayClient:
             emit({"event": "session_ended", "reason": payload.get("reason", "unknown")})
             self.stop_event.set()
             return
+        if type_ == "keepalive":
+            return
         if sender == "device" and type_ == "command":
             if self.session_key is None:
-                self._handle_hello(env)
-            else:
-                self._handle_command(env)
+                emit({"event": "error", "detail": "command frame received before device_bound -- no session key yet, ignored"})
+                return
+            self._handle_command(env)
             return
         emit({"event": "error", "detail": "unexpected frame sender=%r type=%r -- ignored" % (sender, type_)})
 
@@ -497,6 +500,8 @@ class RelayClient:
                 continue
 
             backoff_ms = BACKOFF_BASE_MS  # reset on a successful (re)connect
+            conn.sock.settimeout(STREAM_IDLE_S)
+            idle_drop = False
             try:
                 while not self.stop_event.is_set():
                     line = resp.readline()
@@ -511,6 +516,8 @@ class RelayClient:
                         emit({"event": "error", "detail": "malformed frame from stream (not JSON)"})
                         continue
                     self._handle_envelope(env)
+            except socket.timeout:
+                idle_drop = True
             except (OSError, http.client.HTTPException) as e:
                 emit({"event": "error", "detail": "stream read failed: %s" % e})
             finally:
@@ -518,7 +525,10 @@ class RelayClient:
 
             if self.stop_event.is_set():
                 return
-            emit({"event": "stream_drop", "retry_ms": backoff_ms})
+            if idle_drop:
+                emit({"event": "stream_drop", "retry_ms": backoff_ms, "reason": "idle"})
+            else:
+                emit({"event": "stream_drop", "retry_ms": backoff_ms})
             if self.stop_event.wait(backoff_ms / 1000.0):
                 return
             backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
