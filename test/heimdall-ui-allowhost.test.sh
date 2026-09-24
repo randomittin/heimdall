@@ -36,7 +36,18 @@
 #     email-shaped substrings and absolute paths; loopback output is byte-for-byte
 #     unaffected (the redaction is gated strictly on transport.public_host)
 #
-# Hermetic: HOME/HEIMDALL_HOME redirected to a temp dir. Every server this file
+# Hermetic: HOME/HEIMDALL_HOME/TMPDIR redirected to a temp dir -- TMPDIR matters
+#   as much as HOME here: sentinels/hmd-ui.py's collect_parallelism() falls back to
+#   the most-recently-touched *.state file under $TMPDIR/heimdall-parallel when no
+#   session id is set (which is always true for the server this file launches), so
+#   an unpinned TMPDIR reads whichever REAL Claude Code session on the machine last
+#   made a tool call -- live counters that keep changing for reasons having nothing
+#   to do with this fixture. No case here diffs two /api/state snapshots the way
+#   heimdall-ui-panels.test.sh's case 9c does, so this leak was not observed to flip
+#   an assertion in this file, but it was reproduced breaking that panels case under
+#   3-way concurrent load (same server, same leak) -- pinned here too so this file
+#   can never become the next one to grow a snapshot/idle assertion that trips on it.
+#   Every server this file
 # starts is its OWN process on its OWN port -- in-memory backoff state must never
 # leak between test groups, so each group that needs a clean failure count gets a
 # fresh launch. Every background process is reaped on EXIT. No `timeout` on macOS
@@ -76,6 +87,11 @@ done
 
 # ── sandbox ─────────────────────────────────────────────────────────────────
 TMPROOT="$(mktemp -d)"
+# TMPDIR before HOME: parallelism-tracker (see Hermetic note above) is keyed off
+# $TMPDIR, not $HOME -- without this, this server's /api/state.parallelism reads
+# whatever real, concurrently-running Claude Code session most recently touched
+# $TMPDIR/heimdall-parallel, which is never stable across a test run.
+export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 FIX="$TMPROOT/fixture-repo"

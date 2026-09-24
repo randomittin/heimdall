@@ -20,7 +20,12 @@
 #   - inbox-delivered.jsonl rotates to .1 once it reaches MAX_INBOX_BYTES
 #     (2 MiB), then a fresh delivery starts a new file (N3)
 #
-# Hermetic: HOME/HEIMDALL_HOME redirected to a temp dir, fixture repo is a temp
+# Hermetic: HOME/HEIMDALL_HOME/TMPDIR redirected to a temp dir, fixture repo is a temp
+#   dir -- TMPDIR is pinned too: sentinels/hmd-ui.py's collect_parallelism() falls back
+#   to the most-recently-touched *.state file under $TMPDIR/heimdall-parallel when no
+#   session id is set (always true for the server this file launches), so an unpinned
+#   TMPDIR would read whichever real Claude Code session on the machine last made a
+#   tool call instead of this fixture's own (empty) state.
 # dir, background processes reaped on EXIT. No `timeout` on macOS -- every wait
 # is a bounded sleep-0.2 poll. The secret-shaped fixture is assembled at RUNTIME
 # (never a literal) -- same discipline as heimdall-ui-panels.test.sh.
@@ -58,6 +63,8 @@ done
 
 # ── sandbox ─────────────────────────────────────────────────────────────────
 TMPROOT="$(mktemp -d)"
+# TMPDIR before HOME -- see the Hermetic note above (parallelism-tracker leak).
+export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 FIX="$TMPROOT/fixture-repo"

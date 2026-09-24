@@ -53,8 +53,8 @@
 #     hmd-live-users every tick, so the dir is never absent while it runs; case
 #     12 asserts "no panel but the server's own" instead.
 #
-# Hermetic: HOME and HEIMDALL_HOME are redirected to a temp dir, the fixture repo
-# is a temp dir, every background process is reaped on EXIT. macOS has no
+# Hermetic: HOME, HEIMDALL_HOME and TMPDIR are redirected to a temp dir, the
+# fixture repo is a temp dir, every background process is reaped on EXIT. macOS has no
 # `timeout`; every wait is a bounded sleep-0.2 poll. Secret-shaped strings are
 # assembled at RUNTIME from parts (never a literal): .gitleaks.toml flags the
 # shape in any tracked file, and a full-history scan runs on push.
@@ -100,6 +100,16 @@ done
 
 # ── sandbox ─────────────────────────────────────────────────────────────────
 TMPROOT="$(mktemp -d)"
+# TMPDIR before HOME: collect_parallelism() (sentinels/hmd-ui.py) falls back to the
+# most-recently-touched *.state file under $TMPDIR/heimdall-parallel when no session
+# id is set (always true for the server this file launches) -- unpinned, /api/state
+# .parallelism (and therefore every SSE frame, incl. the digest case 9c checks) reads
+# whichever real, concurrently-running Claude Code session on the machine last made a
+# tool call. Reproduced: case 9c failed under 3-way concurrent load
+# (heimdall-ui-allowhost + -inbox + -panels) with differing top-level keys
+# ["parallelism","ts"] during an asserted-idle 4.5s window; disappeared once TMPDIR
+# was pinned. Pattern: test/heimdall-app.test.sh:60-61 / test/heimdall-app-relay.test.sh:78.
+export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 FIX="$TMPROOT/fixture-repo"
