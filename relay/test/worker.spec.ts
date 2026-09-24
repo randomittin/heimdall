@@ -1,4 +1,4 @@
-import { env, SELF } from "cloudflare:test";
+import { env, SELF, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { Env, Envelope } from "../src/types";
 import { base64UrlEncode } from "../src/pairing";
@@ -450,15 +450,35 @@ describe("frames", () => {
 });
 
 /**
- * A phone that loses Wi-Fi sends no close frame and no TCP reset, so the
- * relay keeps its socket for as long as Cloudflare's own timeout takes —
- * minutes. The phone reconnects with `?device_token=` in seconds. Before
- * `supersedeDeviceSockets`, that produced two device sockets and delivery
- * went to `getWebSockets(DEVICE_TAG)[0]`, the dead one: reproduced live
- * against the deployed relay on 2026-09-24, where the reconnected socket sat
- * open and silent for 22s while every `state` frame went to the socket the
- * dropped Wi-Fi session had left behind — and `POST /frames` answered
- * `delivered: true` for every one of them, so neither end could see it.
+ * A phone that loses Wi-Fi — or is force-stopped by Android — sends no close
+ * frame and no TCP reset, so the relay keeps its socket for as long as
+ * Cloudflare's own timeout takes: minutes. The phone reconnects with
+ * `?device_token=` in seconds, so a session routinely holds more device
+ * sockets than the one the app is actually on, and "which one is live" has to
+ * be answered from the socket set itself.
+ *
+ * Two live failures shaped these tests, in order:
+ *
+ * 1. Delivery went to `getWebSockets(DEVICE_TAG)[0]`, the socket the dropped
+ *    Wi-Fi session had left behind. Reproduced against the deployed relay on
+ *    2026-09-24: the reconnected socket sat open and silent for 22s while
+ *    every `state` frame went to the dead one, and `POST /frames` answered
+ *    `delivered: true` for all of them, so neither end could see it.
+ *
+ * 2. The first fix closed *every* tagged socket on each accept, before the
+ *    new one existed — so a second `/ws?device_token=` upgrade that was then
+ *    discarded (an app retry, a relaunch racing two connects) closed the
+ *    socket the app was actually using. Its TCP stayed up, so the app still
+ *    showed `live` and still pushed `command` frames, while the relay's pool
+ *    held no OPEN socket at all and answered `delivered: false` for every
+ *    frame from then on — permanently, not intermittently. Reproduced against
+ *    a local `wrangler dev` on 2026-09-24; the in-DO trace ended at
+ *    `count=0 states=[]` while the phone leg was still connected.
+ *
+ * What both share: `readyState` alone cannot say which socket is the phone's.
+ * The generation stamped into each socket's hibernation attachment can, and
+ * unlike a field on the Durable Object it survives the instance being evicted
+ * and rebuilt underneath a still-connected socket.
  */
 describe("device socket supersede (reconnect after a network drop)", () => {
   async function claimAndReadToken(
@@ -482,25 +502,70 @@ describe("device socket supersede (reconnect after a network drop)", () => {
     return socket;
   }
 
-  it("closes the previous device socket with 4002, not revoke's 4001", async () => {
-    const init = await pairInit();
-    const { socket: first, deviceToken } = await claimAndReadToken(init);
+  /** The generation stamped on each device socket still attached to the
+   *  session, newest last — read the same way `SessionDO` reads it, straight
+   *  off `getWebSockets` + `deserializeAttachment`. */
+  async function deviceSocketGenerations(sessionId: string): Promise<number[]> {
+    const stub = typedEnv.SESSION.get(typedEnv.SESSION.idFromName(sessionId));
+    return runInDurableObject(stub, (_instance, state: DurableObjectState) =>
+      state
+        .getWebSockets("device")
+        .map((socket) => (socket.deserializeAttachment() as { gen: number } | null)?.gen ?? 0)
+        .sort((a, b) => a - b)
+    );
+  }
 
-    const firstClosed = nextCloseCode(first);
-    await reconnectDevice(init.session_id, deviceToken);
+  /**
+   * Blocks until the session's device sockets are exactly `expected`.
+   *
+   * A client-initiated close has no client-visible completion here to await:
+   * `SessionDO.webSocketClose` does not close its own half back, so the
+   * closing handshake never finishes and the client's own `close` event never
+   * fires. The Durable Object's socket set is the honest signal, and it is
+   * what delivery reads anyway — so poll that, and fail loudly rather than
+   * racing on a sleep.
+   */
+  async function waitForDeviceGenerations(sessionId: string, expected: number[]): Promise<void> {
+    let seen: number[] = [];
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      seen = await deviceSocketGenerations(sessionId);
+      if (seen.length === expected.length && seen.every((gen, i) => gen === expected[i])) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(
+      `device sockets never settled to [${expected.join(",")}] — last saw [${seen.join(",")}]`
+    );
+  }
 
-    // 4001 would tell the app the session was revoked and to stop
-    // reconnecting; this session is very much alive.
-    expect(await firstClosed).toBe(4002);
-  });
-
-  it("delivers a frame to the reconnected socket, never the superseded one", async () => {
+  it("closes a superseded device socket with 4002, not revoke's 4001", async () => {
     const init = await pairInit();
     const { socket: first, deviceToken } = await claimAndReadToken(init);
 
     const firstClosed = nextCloseCode(first);
     const second = await reconnectDevice(init.session_id, deviceToken);
-    await firstClosed;
+
+    // The older socket is ended when a frame confirms which socket is live —
+    // never on the bare accept, which is what used to close the socket the
+    // app was on. 4001 would tell the app the session was revoked and to stop
+    // reconnecting; this session is very much alive.
+    const delivered = nextMessage(second);
+    await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({ session_id: init.session_id, ciphertext: "picks-the-live-socket" })
+    );
+    await delivered;
+    expect(await firstClosed).toBe(4002);
+  });
+
+  it("delivers a frame to the reconnected socket, never the superseded one", async () => {
+    const init = await pairInit();
+    // The older socket is still wide open when the frame is posted — exactly
+    // the state a Wi-Fi drop leaves behind — so this pins that delivery ranks
+    // by generation rather than settling for the first open socket it finds.
+    const { socket: first, deviceToken } = await claimAndReadToken(init);
+    const firstClosed = nextCloseCode(first);
+    const second = await reconnectDevice(init.session_id, deviceToken);
 
     const delivered = nextMessage(second);
     const res = await postFrame(
@@ -510,20 +575,100 @@ describe("device socket supersede (reconnect after a network drop)", () => {
     );
     expect(await res.json()).toEqual({ ok: true, delivered: true });
     expect((await delivered).ciphertext).toBe("to-the-live-socket");
+    expect(await firstClosed).toBe(4002);
+  });
+
+  it("delivers to the reconnect when the abandoned socket never closes", async () => {
+    const init = await pairInit();
+    // Never closed, never read from: an Android force-stop leaves the relay
+    // holding a socket it still believes is OPEN. Nothing below waits for it
+    // to go away, because in production it does not.
+    const { socket: abandoned, deviceToken } = await claimAndReadToken(init);
+
+    const reconnected = await reconnectDevice(init.session_id, deviceToken);
+
+    const delivered = nextMessage(reconnected);
+    const res = await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({ session_id: init.session_id, ciphertext: "past-the-ghost" })
+    );
+    expect(await res.json()).toEqual({ ok: true, delivered: true });
+    expect((await delivered).ciphertext).toBe("past-the-ghost");
+    expect(abandoned.readyState).not.toBe(WebSocket.OPEN);
+  });
+
+  it("delivers a frame posted immediately after the reconnect's 101", async () => {
+    const init = await pairInit();
+    const { deviceToken } = await claimAndReadToken(init);
+
+    // No pause, no waiting on the old socket's teardown: the very next thing
+    // after the upgrade is hmd pushing a frame, which is exactly what a
+    // digest change looks like when a phone reconnects mid-run.
+    const reconnected = await reconnectDevice(init.session_id, deviceToken);
+    const delivered = nextMessage(reconnected);
+    const res = await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({ session_id: init.session_id, ciphertext: "immediately-after-101" })
+    );
+
+    expect(await res.json()).toEqual({ ok: true, delivered: true });
+    expect((await delivered).ciphertext).toBe("immediately-after-101");
+  });
+
+  it("keeps delivering after a duplicate upgrade is opened and discarded", async () => {
+    const init = await pairInit();
+    // The live regression, in order: a ghost the app can no longer read, the
+    // socket the app is actually on, and a duplicate upgrade the app throws
+    // away. Closing every tagged socket on the duplicate's accept left the
+    // session with no OPEN socket at all and `delivered: false` forever.
+    const { deviceToken } = await claimAndReadToken(init);
+    const kept = await reconnectDevice(init.session_id, deviceToken);
+
+    const duplicate = await reconnectDevice(init.session_id, deviceToken);
+    duplicate.close(1000, "discarded by the app");
+    await waitForDeviceGenerations(init.session_id, [1, 2]);
+
+    const delivered = nextMessage(kept);
+    const res = await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({ session_id: init.session_id, ciphertext: "still-reaches-the-phone" })
+    );
+    expect(await res.json()).toEqual({ ok: true, delivered: true });
+    expect((await delivered).ciphertext).toBe("still-reaches-the-phone");
+  });
+
+  it("stamps a strictly increasing generation on each accepted socket", async () => {
+    const init = await pairInit();
+    const { deviceToken } = await claimAndReadToken(init);
+    expect(await deviceSocketGenerations(init.session_id)).toEqual([1]);
+
+    await reconnectDevice(init.session_id, deviceToken);
+    expect(await deviceSocketGenerations(init.session_id)).toEqual([1, 2]);
+
+    await reconnectDevice(init.session_id, deviceToken);
+    // Every generation lives on the socket's own hibernation attachment, so
+    // the ordering is still readable after the Durable Object has been
+    // evicted and rebuilt under these sockets — which no field on the
+    // instance would survive.
+    expect(await deviceSocketGenerations(init.session_id)).toEqual([1, 2, 3]);
   });
 
   it("forwards a command from the reconnected socket to hmd's stream", async () => {
     const init = await pairInit();
-    const { socket: first, deviceToken } = await claimAndReadToken(init);
+    // The claimed socket is left open and never waited on: the phone leg has
+    // to work from the moment the reconnect is accepted, not from whenever
+    // Cloudflare gets round to reaping the one it replaced.
+    const { deviceToken } = await claimAndReadToken(init);
 
     const streamRes = await openHmdStream(init.session_id, init.relay_session_token);
     const reader = streamRes.body?.getReader();
     if (!reader) throw new Error("expected a readable stream body");
     await readDataFrame(reader); // the buffered device_bound control frame
 
-    const firstClosed = nextCloseCode(first);
     const second = await reconnectDevice(init.session_id, deviceToken);
-    await firstClosed;
 
     second.send(
       JSON.stringify(
@@ -539,6 +684,46 @@ describe("device socket supersede (reconnect after a network drop)", () => {
     const forwarded = await readDataFrame(reader);
     expect(forwarded.ciphertext).toBe("command-from-the-reconnected-socket");
     expect(forwarded.sender).toBe("device");
+  });
+
+  it("survives an hmd stream reconnect interleaved with a device reconnect", async () => {
+    const init = await pairInit();
+    const { deviceToken } = await claimAndReadToken(init);
+
+    const firstStream = await openHmdStream(init.session_id, init.relay_session_token);
+    const firstReader = firstStream.body?.getReader();
+    if (!firstReader) throw new Error("expected a readable stream body");
+    await readDataFrame(firstReader); // the buffered device_bound control frame
+
+    // Both legs turn over, laptop first: hmd's stream is cut and reopened
+    // while the phone is also swapping sockets.
+    const secondStream = await openHmdStream(init.session_id, init.relay_session_token);
+    const secondReader = secondStream.body?.getReader();
+    if (!secondReader) throw new Error("expected a readable stream body");
+
+    const reconnected = await reconnectDevice(init.session_id, deviceToken);
+
+    const delivered = nextMessage(reconnected);
+    const res = await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({ session_id: init.session_id, ciphertext: "both-legs-turned-over" })
+    );
+    expect(await res.json()).toEqual({ ok: true, delivered: true });
+    expect((await delivered).ciphertext).toBe("both-legs-turned-over");
+
+    reconnected.send(
+      JSON.stringify(
+        makeEnvelope({
+          session_id: init.session_id,
+          sender: "device",
+          type: "command",
+          ciphertext: "up-the-reopened-stream",
+        })
+      )
+    );
+    const forwarded = await readDataFrame(secondReader);
+    expect(forwarded.ciphertext).toBe("up-the-reopened-stream");
   });
 });
 

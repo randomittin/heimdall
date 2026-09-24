@@ -49,6 +49,44 @@ const DEVICE_TAG = "device";
 const DEVICE_PUBKEY_BYTES = 32;
 
 /**
+ * Stamped onto every accepted device socket via `serializeAttachment`, so
+ * "which socket is the phone actually on" is a property of the socket set
+ * itself rather than of anything this instance holds in memory.
+ *
+ * That distinction is the whole point. A Durable Object is evicted and
+ * rebuilt freely while its hibernatable sockets stay connected, so a field on
+ * `this` — a `deviceSocket` ref, a counter, a Map — is gone by the time the
+ * next `POST /frames` arrives, while `getWebSockets(DEVICE_TAG)` still hands
+ * back every socket and `deserializeAttachment()` still hands back this. Every
+ * read below therefore re-derives from those two calls and caches nothing.
+ */
+interface DeviceSocketAttachment {
+  /** Per-session, strictly increasing across accepts: the highest generation
+   *  still attached is the socket the phone most recently connected. */
+  gen: number;
+}
+
+/**
+ * The generation of one device socket, or 0 for a socket accepted before this
+ * attachment existed — a deploy rolling over live sessions leaves those
+ * connected, and any socket accepted afterwards outranks them.
+ *
+ * Never throws: a malformed or absent attachment must degrade to "oldest
+ * possible", never cost a frame.
+ */
+function deviceSocketGeneration(socket: WebSocket): number {
+  let attachment: unknown;
+  try {
+    attachment = socket.deserializeAttachment();
+  } catch {
+    return 0;
+  }
+  if (typeof attachment !== "object" || attachment === null) return 0;
+  const gen = (attachment as Partial<DeviceSocketAttachment>).gen;
+  return typeof gen === "number" && Number.isFinite(gen) ? gen : 0;
+}
+
+/**
  * How long hmd's `GET /stream` may sit idle before the relay writes a
  * `keepalive` control frame down it.
  *
@@ -337,44 +375,96 @@ export class SessionDO {
       return jsonResponse(200, { ok: true, delivered: false });
     }
     target.send(JSON.stringify(envelope));
+    // Only now — with a frame actually on its way to a known-live socket —
+    // is it safe to end the older ones. See supersedeOlderDeviceSockets.
+    this.supersedeOlderDeviceSockets(target);
     return jsonResponse(200, { ok: true, delivered: true });
   }
 
-  /**
-   * The device socket to deliver to: one that is actually open.
-   *
-   * This used to be `getWebSockets(DEVICE_TAG)[0]`, and that index is what
-   * broke a phone that had reconnected. A phone losing Wi-Fi sends no close
-   * frame and no TCP reset, so Cloudflare keeps the old socket for as long
-   * as its own timeout takes — minutes. The phone, meanwhile, notices
-   * immediately and reconnects with `?device_token=`, which (before
-   * `supersedeDeviceSockets` below) simply *added* a second socket. Every
-   * `state` frame then went to `[0]`, the dead one, and `POST /frames`
-   * answered `delivered: true` for all of them. Reproduced live against the
-   * deployed relay on 2026-09-24: the reconnected socket sat open and silent
-   * for 22s while the superseded one took seq 3,4,5,6,7.
-   *
-   * Superseding on bind means this list holds one entry in the steady state,
-   * so this makes no assumption about `getWebSockets`' ordering (which is
-   * undocumented) — it only skips a socket that is closing or closed, which
-   * a just-superseded one briefly is.
-   */
-  private liveDeviceSocket(): WebSocket | undefined {
+  /** Every device socket still attached to this session, highest generation
+   *  first. Re-derived from `getWebSockets` on every call — see
+   *  `DeviceSocketAttachment` for why none of this may be cached on the
+   *  instance. */
+  private deviceSocketsNewestFirst(): { socket: WebSocket; gen: number }[] {
     return this.ctx
       .getWebSockets(DEVICE_TAG)
-      .find((socket) => socket.readyState === WebSocket.OPEN);
+      .map((socket) => ({ socket, gen: deviceSocketGeneration(socket) }))
+      .sort((a, b) => b.gen - a.gen);
   }
 
-  /** Ends every device socket already attached to this session, so the one
-   *  being accepted right now is the only one left. The phone leg's
-   *  counterpart to `closeHmdStream` (which `handleStream` has always called
-   *  for exactly this reason on hmd's leg): one session, one live device
-   *  socket, newest wins. Close code 4002 is deliberately distinct from
-   *  `handleRevoke`'s 4001 — this session is emphatically NOT over, and a
-   *  client that conflated the two would stop reconnecting after a routine
-   *  network change. */
-  private supersedeDeviceSockets(): void {
-    for (const socket of this.ctx.getWebSockets(DEVICE_TAG)) {
+  /** The generation to stamp on the socket being accepted right now: one
+   *  above every socket currently attached. A socket that has left the set
+   *  can never rejoin it, so "highest still attached, plus one" is all the
+   *  monotonicity the comparisons below need — and it costs no storage write
+   *  on the connect path. */
+  private nextDeviceGeneration(): number {
+    let highest = 0;
+    for (const { gen } of this.deviceSocketsNewestFirst()) {
+      if (gen > highest) highest = gen;
+    }
+    return highest + 1;
+  }
+
+  /**
+   * The device socket to deliver to: the newest one that is open.
+   *
+   * Two live failures are pinned here, and the second is why generations
+   * exist at all.
+   *
+   * This was once `getWebSockets(DEVICE_TAG)[0]`, and that index is what
+   * broke a phone that had reconnected. A phone losing Wi-Fi sends no close
+   * frame and no TCP reset, so Cloudflare keeps the old socket for as long
+   * as its own timeout takes — minutes — while the phone notices immediately
+   * and reconnects with `?device_token=`. Every `state` frame then went to
+   * `[0]`, the dead one, and `POST /frames` answered `delivered: true` for
+   * all of them. Reproduced live against the deployed relay on 2026-09-24:
+   * the reconnected socket sat open and silent for 22s while the superseded
+   * one took seq 3,4,5,6,7.
+   *
+   * The fix for that closed *every* tagged socket on each accept, which
+   * traded an intermittent failure for a permanent one: a second
+   * `/ws?device_token=` upgrade that the app then discarded (a retry, a
+   * relaunch racing two connects) closed the socket the app was actually
+   * using. Its TCP stayed up, so the phone still showed `live` and still
+   * pushed `command` frames up, while this set held nothing open and every
+   * frame came back `delivered: false` from then on. Reproduced against a
+   * local `wrangler dev` on 2026-09-24, where the in-Durable-Object trace
+   * ended at an empty socket set with the phone leg still connected.
+   *
+   * So: rank by generation, not by position and not by `readyState` alone.
+   * `getWebSockets`' ordering is undocumented and a superseded socket can sit
+   * in CLOSING for minutes, but the generation says outright which socket the
+   * phone connected last — and it says it just as well after a hibernation
+   * wake, since it lives on the socket rather than on this instance.
+   */
+  private liveDeviceSocket(): WebSocket | undefined {
+    return this.deviceSocketsNewestFirst().find(
+      (entry) => entry.socket.readyState === WebSocket.OPEN
+    )?.socket;
+  }
+
+  /**
+   * Ends every device socket older than the one now known to be live — the
+   * phone leg's counterpart to `closeHmdStream` (which `handleStream` has
+   * always called for exactly this reason on hmd's leg): one session, one
+   * live device socket, newest wins.
+   *
+   * Deliberately driven by delivery rather than by `acceptDeviceSocket`. An
+   * accept only proves a socket was *offered*; a delivered frame proves which
+   * socket is being used. Closing on the accept is what let a discarded
+   * duplicate upgrade take the app's real socket down with it (see
+   * `liveDeviceSocket`), and nothing needs it earlier: delivery already
+   * refuses to target anything but the newest open socket, so a lingering
+   * older one is untidy, never wrong.
+   *
+   * Close code 4002 is deliberately distinct from `handleRevoke`'s 4001 —
+   * this session is emphatically NOT over, and a client that conflated the
+   * two would stop reconnecting after a routine network change.
+   */
+  private supersedeOlderDeviceSockets(live: WebSocket): void {
+    const liveGen = deviceSocketGeneration(live);
+    for (const { socket, gen } of this.deviceSocketsNewestFirst()) {
+      if (gen >= liveGen) continue;
       try {
         socket.close(4002, "superseded");
       } catch {
@@ -497,15 +587,20 @@ export class SessionDO {
     bindPayload?: DeviceBoundToPhonePayload,
     hmdControlPayload?: DeviceBoundToHmdPayload
   ): Response {
-    // Newest device socket wins: whatever was attached before this bind is
-    // ended first, so `liveDeviceSocket` can never hand a frame to the
-    // socket a dropped Wi-Fi session left behind (see its doc comment).
-    this.supersedeDeviceSockets();
+    // Newest device socket wins, and this is where "newest" is recorded:
+    // one above every generation currently attached, written onto the socket
+    // so `liveDeviceSocket` can rank it against the others without this
+    // instance remembering anything (see DeviceSocketAttachment). Nothing
+    // already attached is closed here — see supersedeOlderDeviceSockets for
+    // why that has to wait for a delivered frame.
+    const generation = this.nextDeviceGeneration();
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [DEVICE_TAG]);
+    const attachment: DeviceSocketAttachment = { gen: generation };
+    server.serializeAttachment(attachment);
     if (bindPayload) {
       server.send(
         JSON.stringify({
