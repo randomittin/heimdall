@@ -19,10 +19,10 @@
 import { describe, expect, it } from "vitest";
 import { makeEnvelope, pairInit, postFrame } from "./helpers";
 
-const MAX_ENVELOPE_BYTES = 131072;
+const MAX_ENVELOPE_BYTES = 1048576;
 
 describe("MUT-INV-16-no-size-cap", () => {
-  it("rejects an envelope over 128 KiB with 413", async () => {
+  it("rejects an envelope over 1 MiB with 413", async () => {
     const init = await pairInit();
     const oversized = makeEnvelope({
       session_id: init.session_id,

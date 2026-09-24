@@ -23,7 +23,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { chacha20poly1305 } from '@noble/ciphers/chacha.js';
 
 /** Relay never buffers or forwards a larger envelope (spec §2.3, INV-16). */
-export const MAX_ENVELOPE_BYTES = 131072;
+export const MAX_ENVELOPE_BYTES = 1048576;
 
 /** ChaCha20-Poly1305 auth tag length appended to the plaintext (RFC 8439). */
 const TAG_BYTES = 16;

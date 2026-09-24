@@ -349,11 +349,11 @@ export class SessionDO {
 
     const contentLength = request.headers.get("content-length");
     if (contentLength && Number(contentLength) > MAX_ENVELOPE_BYTES) {
-      return jsonResponse(413, { error: "frame exceeds 128 KiB limit" });
+      return jsonResponse(413, { error: "frame exceeds 1 MiB limit" });
     }
     const bodyText = await request.text();
     if (new TextEncoder().encode(bodyText).byteLength > MAX_ENVELOPE_BYTES) {
-      return jsonResponse(413, { error: "frame exceeds 128 KiB limit" });
+      return jsonResponse(413, { error: "frame exceeds 1 MiB limit" });
     }
 
     let envelope: unknown;

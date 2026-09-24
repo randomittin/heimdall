@@ -12,7 +12,7 @@ export function jsonResponse(
   });
 }
 
-export const MAX_ENVELOPE_BYTES = 131072; // 128 KiB — INV-16
+export const MAX_ENVELOPE_BYTES = 1048576; // 1 MiB — INV-16 (raised 2026-09-24: real hmd state ~136 KB exceeded the old 128 KiB cap)
 
 /** True when a phone-leg upgrade request is provably plaintext (never TLS).
  * Absence of both headers is treated as the local-dev fallback (delta brief:

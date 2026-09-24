@@ -336,14 +336,25 @@ describe("websocket upgrade guards", () => {
 });
 
 describe("frames", () => {
-  it("rejects a frame over 128 KiB with 413", async () => {
+  it("rejects a frame over 1 MiB with 413", async () => {
     const init = await pairInit();
     const oversized = makeEnvelope({
       session_id: init.session_id,
-      ciphertext: "a".repeat(140_000),
+      ciphertext: "a".repeat(1_100_000),
     });
     const res = await postFrame(init.session_id, init.relay_session_token, oversized);
     expect(res.status).toBe(413);
+  });
+
+  it("accepts a frame over the old 128 KiB cap but under the new 1 MiB cap (INV-16 raised 2026-09-24 — real hmd state is ~136 KB)", async () => {
+    const init = await pairInit();
+    const envelope = makeEnvelope({
+      session_id: init.session_id,
+      ciphertext: "a".repeat(136_159),
+    });
+    const res = await postFrame(init.session_id, init.relay_session_token, envelope);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, delivered: false });
   });
 
   it("forwards ciphertext byte-identical hmd -> phone", async () => {

@@ -156,7 +156,7 @@ Body: one `Envelope` (JSON). Response `200 {"ok": true, "delivered": <bool>}` �
 false` (not an error) when no phone is currently connected; the frame is not buffered or
 retried.
 
-- `413` — envelope exceeds 128 KiB.
+- `413` — envelope exceeds 1 MiB.
 - `401` / `400` / `404` — same as `/stream`.
 
 ### `GET /session/:id/ws?pairing_code=<code>` or `?device_token=<token>` — phone leg
