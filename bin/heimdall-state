@@ -3,6 +3,19 @@
 # Used by the heimdall orchestrator and hooks to manage project state.
 set -euo pipefail
 
+# Shared hook-owned path allowlist (bin/lib/hook-owned-path.sh), used by the
+# sweep-receipt STALENESS check in cmd_check_quality_gates below to tell this
+# repo's own hook auto-commits (journal entries, ledger checkpoints) apart from
+# real code changes. DEFENSIVE, not required: unlike test/run-all.sh (which
+# treats a missing copy as unsafe to run at all), a missing lib here just means
+# cmd_check_quality_gates falls back to its OLDER, already-safe, merely-more-
+# strict behavior (any commit past the receipt = STALE) via `command -v
+# hmd_hook_owned_path` below -- never a reason to abort a state-management tool
+# that has many other jq-only responsibilities unrelated to this one check.
+HMD_STATE_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/hook-owned-path.sh
+. "$HMD_STATE_SELF_DIR/lib/hook-owned-path.sh" 2>/dev/null || true
+
 # State file: prefer HEIMDALL_STATE_FILE, fall back to legacy SUPERX_STATE_FILE.
 # Default to heimdall-state.json, but adopt a pre-existing legacy superx-state.json
 # in the cwd for back-compat (older projects keep working without a migration step).
