@@ -172,10 +172,14 @@ claim also requires `&device_pubkey=<base64url, 32 bytes>` in the query string �
   1234567890}}`, plaintext, relay-originated). On a fresh `pairing_code` claim only, the relay
   also writes a second `device_bound` frame — differently shaped — into hmd's `GET /stream`:
   `{"type": "device_bound", "sender": "relay", "payload": {"device_pubkey": "<echoed back
-  exactly as sent>", "bound_at": 1234567890}}`, so hmd can derive the session key without the
-  phone ever sending its pubkey through an encrypted frame. Buffered (at most this one control
-  frame, per session) if hmd's stream isn't open yet, and flushed as the first line the moment
-  it connects.
+  exactly as sent>", "bound_at": 1234567890}}`. `device_pubkey` here is still base64url,
+  unpadded — the same alphabet as the `&device_pubkey=` query param above, never re-encoded to
+  standard/padded base64; a consumer that decodes it as standard base64 only will fail key
+  derivation on every real device (found live 2026-09-24 against a real heimdall client — see
+  `docs/HANDBACK-FROM-HEIMDALL-relay-client-fixes.md` item 6). This lets hmd derive the session
+  key without the phone ever sending its pubkey through an encrypted frame. Buffered (at most
+  this one control frame, per session) if hmd's stream isn't open yet, and flushed as the first
+  line the moment it connects.
 - **A bind supersedes the previous device socket.** Every accepted upgrade (claim *or*
   `device_token` reconnect) first closes whatever device socket the session already had, with
   close code **`4002` / `"superseded"`** — deliberately distinct from `/revoke`'s `4001`, since

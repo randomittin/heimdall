@@ -13,17 +13,25 @@
 // from this repo -- nothing here ever edits it. Per
 // docs/analysis/2026-09-24-relay-phone-leg-contract-diff.md and
 // docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md, heimdall's real client
-// disagrees with this repo/relay/fake-hmd (which all agree with each other
-// and with the deployed relay Worker) on four points: it bootstraps the
-// session key via a "hello" frame the real app never sends, it tags its
-// nonces "dev\0" instead of "phn\0", it reads a flat `text` field instead of
-// a nested `params.text`, and it logs an `error` event for every `keepalive`
-// control frame instead of ignoring it. So most tests below encode the
-// CONTRACT heimdall's client should satisfy once that handoff lands, not
-// its current buggy behavior -- they are expected to be RED today and green
-// once bin/lib/hmd_relay_e2e.py and bin/heimdall-relay-client get the fixes
-// the handoff doc lists, by design (the falsifiability its "Runnable
-// acceptance" section asks for).
+// USED TO disagree with this repo/relay/fake-hmd (which all agree with each
+// other and with the deployed relay Worker) on four points: it bootstrapped
+// the session key via a "hello" frame the real app never sends, it tagged
+// its nonces "dev\0" instead of "phn\0", it read a flat `text` field
+// instead of a nested `params.text`, and it logged an `error` event for
+// every `keepalive` control frame instead of ignoring it. A fifth
+// divergence surfaced only while heimdall applied the fix for those four
+// (not in the original handoff): `device_pubkey` arrives base64url,
+// unpadded (protocol.ts's real `base64UrlEncode`), and heimdall decoded
+// standard-only base64 -- breaking key derivation on every real device
+// connection, since the first test below hands `derive_session_key` raw
+// hex bytes directly and never exercised heimdall's own decode step.
+//
+// STATUS: APPLIED in heimdall `e21204cf` -- all five fixes above landed
+// (docs/HANDBACK-FROM-HEIMDALL-relay-client-fixes.md). Tests below are
+// expected GREEN against that commit or later, not red -- they stay in
+// this file as regression coverage: a heimdall change that reintroduces
+// any of the five divergences goes red here before it ever reaches a real
+// phone.
 //
 // Opt-in only: HMD_RELAY_INTEROP=1 to run (see relay/package.json's
 // test:interop:heimdall script). Skipped, not failed, otherwise -- and
@@ -39,7 +47,11 @@ import { x25519 } from '@noble/curves/ed25519.js';
 
 import { deriveSessionKey, seal, open } from '../lib/relay-crypto.mjs';
 import { buildDisplayNonce, base64Decode } from '../lib/envelope.mjs';
-import { encodeEncryptedFrame, encodeSendMessageCommand } from '../../../src/relay/protocol.ts';
+import {
+  encodeEncryptedFrame,
+  encodeSendMessageCommand,
+  base64UrlEncode,
+} from '../../../src/relay/protocol.ts';
 
 const HEIMDALL_DIR = process.env.HEIMDALL_DIR || '/Users/rj/Downloads/heimdall';
 const E2E_MODULE_PATH = path.join(HEIMDALL_DIR, 'bin/lib/hmd_relay_e2e.py');
@@ -139,6 +151,58 @@ except Exception as e:
       result.key_hex,
       Buffer.from(HMD_KEY).toString('hex'),
       "heimdall's derived session key bytes differ from the app's deriveSessionKey"
+    );
+  }
+);
+
+test(
+  'derives the same session key from a real base64url-unpadded device_pubkey, exactly as device_bound.payload carries it',
+  { skip: skipReason },
+  () => {
+    // relay/src/session.ts's deliverToHmdStream forwards the phone's claim
+    // device_pubkey into device_bound.payload byte-for-byte, and the app
+    // only ever produces that value via protocol.ts's real base64UrlEncode
+    // (RFC 4648 §5, no padding) -- never standard/padded base64. The test
+    // above hands heimdall's derive_session_key raw hex bytes directly,
+    // which never exercises heimdall's own decode step (E2E.pub_from_b64)
+    // -- exactly the gap that let heimdall decode device_pubkey as
+    // standard-only, breaking key derivation on every real device
+    // connection (docs/HANDBACK-FROM-HEIMDALL-relay-client-fixes.md item 6).
+    const devicePubkeyB64Url = base64UrlEncode(PHONE.publicKey);
+    assert.ok(
+      !devicePubkeyB64Url.includes('='),
+      'fixture bug: a real device_pubkey is never padded -- check base64UrlEncode'
+    );
+
+    const script = `${IMPORT_E2E}
+priv = bytes.fromhex(${JSON.stringify(Buffer.from(HMD.secretKey).toString('hex'))})
+device_pubkey_b64url = ${JSON.stringify(devicePubkeyB64Url)}
+session_id = ${JSON.stringify(SESSION_ID)}
+
+try:
+    device_pub = E2E.pub_from_b64(device_pubkey_b64url)
+    key = E2E.derive_session_key(priv, device_pub, session_id)
+    print(json.dumps({"ok": True, "device_pub_hex": device_pub.hex(), "key_hex": key.hex()}))
+except Exception as e:
+    print(json.dumps({"ok": False, "error": str(e), "errorType": type(e).__name__}))
+`;
+    const result = runPython(script);
+    assert.equal(
+      result.ok,
+      true,
+      `heimdall's pub_from_b64/derive_session_key rejected the app's real base64url ` +
+        `device_pubkey: ${result.error}`
+    );
+    assert.equal(
+      result.device_pub_hex,
+      Buffer.from(PHONE.publicKey).toString('hex'),
+      "heimdall's pub_from_b64 decoded a different pubkey than the app's base64UrlEncode input"
+    );
+    assert.equal(
+      result.key_hex,
+      Buffer.from(HMD_KEY).toString('hex'),
+      "heimdall's derived session key differs from the app's when device_pubkey arrives " +
+        'base64url-unpadded, exactly as the relay forwards it in device_bound.payload'
     );
   }
 );
