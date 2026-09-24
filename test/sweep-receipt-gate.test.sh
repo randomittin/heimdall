@@ -441,7 +441,7 @@ mk_state "$RK"
 #     file => NOT stale, notice printed.
 mkdir -p "$RK/.planning/journal"
 echo "entry" > "$RK/.planning/journal/2026-09-24-haid_x.md"
-git -C "$RK" add -A; git -C "$RK" commit -q -m "journal: hook-owned entry"
+git -C "$RK" add .planning/journal/2026-09-24-haid_x.md; git -C "$RK" commit -q -m "journal: hook-owned entry"
 RK_SHA_A="$(git -C "$RK" rev-parse HEAD)"
 HOME_K1="$WORK/home-k1"; mkdir -p "$HOME_K1"
 write_receipt "$HOME_K1" "$RK_CANON" "$RK_BASE_SHA" true 0
@@ -455,7 +455,7 @@ echo "$OUT_K1" | grep -qi "hook-owned" \
 # (b) + one more commit touching bin/anything (NOT hook-owned) => STALE, path named.
 mkdir -p "$RK/bin"
 echo "echo hi" > "$RK/bin/anything"
-git -C "$RK" add -A; git -C "$RK" commit -q -m "code: touch bin/anything"
+git -C "$RK" add bin/anything; git -C "$RK" commit -q -m "code: touch bin/anything"
 OUT_K3="$(gate_run "$RK" "$HOME_K1" 2>&1)"; RC_K3=$?
 [ "$RC_K3" = 2 ] && ok "K3 a non-hook-owned commit in the same span goes STALE" \
   || bad "K3 expected exit 2, got $RC_K3" "$OUT_K3"
@@ -469,7 +469,7 @@ echo "$OUT_K3" | grep -q "bin/anything" \
 #     dated-haid filename shape => still STALE.
 git -C "$RK" reset -q --hard "$RK_SHA_A"
 echo "not a real journal entry" > "$RK/.planning/journal/evil.md"
-git -C "$RK" add -A; git -C "$RK" commit -q -m "journal: wrong shape"
+git -C "$RK" add .planning/journal/evil.md; git -C "$RK" commit -q -m "journal: wrong shape"
 HOME_K2="$WORK/home-k2"; mkdir -p "$HOME_K2"
 write_receipt "$HOME_K2" "$RK_CANON" "$RK_BASE_SHA" true 0
 OUT_K6="$(gate_run "$RK" "$HOME_K2" 2>&1)"; RC_K6=$?
