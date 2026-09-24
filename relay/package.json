@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node scripts/check-no-logged-urls.mjs && node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test scripts/__tests__/*.test.mjs && vitest run",
     "test:watch": "vitest",
-    "test:trace": "node scripts/trace-diff.mjs"
+    "test:trace": "node scripts/trace-diff.mjs",
+    "test:interop:heimdall": "HMD_RELAY_INTEROP=1 node --test scripts/__tests__/heimdall-client-interop.test.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
