@@ -13,16 +13,18 @@ import type {
   DeviceBoundToHmdPayload,
   KeepalivePayload,
 } from "./types";
-import { isEnvelope } from "./types";
+import { isDeviceFrame, isHmdFrame } from "./types";
 import {
   jsonResponse,
   MAX_ENVELOPE_BYTES,
+  SECURITY_HEADERS,
   isPlaintextUpgrade,
   isWebSocketUpgrade,
 } from "./http";
 import {
   generatePairingCode,
   generateSessionToken,
+  recordAttempt,
   recordClaimAttempt,
   mintDeviceToken,
   verifyDeviceToken,
@@ -31,6 +33,9 @@ import {
   PAIRING_CODE_TTL_S,
   CLAIM_THROTTLE_RETRY_AFTER_S,
   DEVICE_TOKEN_TTL_S,
+  PAIR_INIT_MAX_PER_WINDOW,
+  PAIR_INIT_WINDOW_MS,
+  PAIR_INIT_RETRY_AFTER_S,
 } from "./pairing";
 import { logEvent } from "./logging";
 
@@ -43,10 +48,79 @@ interface SessionRecord {
   relay_session_token: string;
   claim_attempts: number[]; // epoch ms, sliding window
   status: SessionStatus;
+  /**
+   * `exp` (epoch seconds) of the `device_token` minted at bind — the point
+   * past which this session can no longer be reconnected to, and therefore the
+   * point its storage is reclaimable (see `alarm`). Absent on a record written
+   * before this field existed; such a session is never purged early, only
+   * re-scheduled a full TTL out.
+   */
+  device_token_exp?: number;
 }
 
 const DEVICE_TAG = "device";
 const DEVICE_PUBKEY_BYTES = 32;
+
+/** Storage key for a session's record. */
+const RECORD_KEY = "state";
+/**
+ * Storage key for a `/pair/init` throttle bucket. A bucket lives in its own
+ * Durable Object instance (`idFromName("pair-init-throttle:<ip>")`, see
+ * worker.ts) — the same class, never a session: the two key spaces are
+ * disjoint and an instance only ever holds one of them.
+ *
+ * Reusing `SessionDO` rather than declaring a second class is deliberate. A
+ * new class needs a `[[migrations]]` entry, and a migration on the deploy that
+ * ships this hardening would put a live paired session at risk for no
+ * behavioural gain — the Durable Object is just "one serialization point per
+ * name", which is exactly what a per-IP counter needs.
+ */
+const PAIR_INIT_KEY = "pair_init_attempts";
+
+/**
+ * Grace added to a purge deadline so a client that is merely late — a phone
+ * reconnecting seconds after its token lapsed, hmd re-reading a just-revoked
+ * session — meets a truthful `410`/`401` rather than a bare `404` from a
+ * record that has already been deleted.
+ */
+const PURGE_GRACE_MS = 60_000;
+
+/** How long an `ended` session's record is kept before it is reclaimed. */
+const ENDED_GRACE_MS = 5 * 60_000;
+
+/**
+ * WebSocket close codes this relay originates on the phone leg, alongside
+ * `4001` (revoked) and `4002` (superseded) which predate this file's hardening
+ * pass. Both below tell the app the same thing operationally — reconnect, and
+ * the upgrade will answer honestly (`401` for a lapsed token, `410` for an
+ * ended session) — rather than leaving it pushing frames into a socket the
+ * relay has stopped serving.
+ */
+const CLOSE_SESSION_ENDED = 4001;
+const CLOSE_TOKEN_EXPIRED = 4003;
+/** RFC 6455's "message too big" — INV-16 on the phone leg. */
+const CLOSE_MESSAGE_TOO_BIG = 1009;
+
+/**
+ * A rejected frame's `sender`/`type` are attacker-controlled and unbounded, so
+ * only a value from the closed set is ever echoed into a log line; anything
+ * else logs as `"other"`. Keeps a dropped frame diagnosable without letting it
+ * write an arbitrary (or megabyte-long) string into the relay's logs.
+ */
+function loggableSender(value: unknown): string {
+  return value === "hmd" || value === "device" || value === "relay" ? value : "other";
+}
+
+function loggableType(value: unknown): string {
+  return value === "state" ||
+    value === "command" ||
+    value === "ack" ||
+    value === "device_bound" ||
+    value === "session_ended" ||
+    value === "keepalive"
+    ? value
+    : "other";
+}
 
 /**
  * Stamped onto every accepted device socket via `serializeAttachment`, so
@@ -64,6 +138,19 @@ interface DeviceSocketAttachment {
   /** Per-session, strictly increasing across accepts: the highest generation
    *  still attached is the socket the phone most recently connected. */
   gen: number;
+  /**
+   * `exp` (epoch seconds) of the `device_token` this socket was admitted on.
+   * INV-9 requires the token to be re-validated on every phone→relay request
+   * post-bind rather than cached as "already trusted this connection"; a
+   * socket that simply never drops would otherwise outlive its own token
+   * indefinitely, turning a 30-day credential into an unbounded one (finding
+   * 9). Stored on the socket, not on the instance, for the same reason `gen`
+   * is: it has to survive the Durable Object being evicted underneath a
+   * still-connected socket. Absent on a socket accepted before this field
+   * existed — such a socket is served until it drops, since the relay has no
+   * honest expiry to apply to it.
+   */
+  token_exp?: number;
 }
 
 /**
@@ -74,15 +161,19 @@ interface DeviceSocketAttachment {
  * Never throws: a malformed or absent attachment must degrade to "oldest
  * possible", never cost a frame.
  */
-function deviceSocketGeneration(socket: WebSocket): number {
+function deviceSocketAttachment(socket: WebSocket): Partial<DeviceSocketAttachment> {
   let attachment: unknown;
   try {
     attachment = socket.deserializeAttachment();
   } catch {
-    return 0;
+    return {};
   }
-  if (typeof attachment !== "object" || attachment === null) return 0;
-  const gen = (attachment as Partial<DeviceSocketAttachment>).gen;
+  if (typeof attachment !== "object" || attachment === null) return {};
+  return attachment as Partial<DeviceSocketAttachment>;
+}
+
+function deviceSocketGeneration(socket: WebSocket): number {
+  const gen = deviceSocketAttachment(socket).gen;
   return typeof gen === "number" && Number.isFinite(gen) ? gen : 0;
 }
 
@@ -154,20 +245,60 @@ export class SessionDO {
         return this.handleWsUpgrade(request);
       case "/revoke":
         return this.handleRevoke(request);
+      case "/throttle":
+        return this.handlePairInitThrottle();
       default:
         return jsonResponse(404, { error: "not found" });
     }
   }
 
   private async loadRecord(): Promise<SessionRecord | undefined> {
-    const record = await this.ctx.storage.get<SessionRecord>("state");
+    const record = await this.ctx.storage.get<SessionRecord>(RECORD_KEY);
     if (record) this.cachedSessionId = record.session_id;
     return record;
   }
 
   private async saveRecord(record: SessionRecord): Promise<void> {
     this.cachedSessionId = record.session_id;
-    await this.ctx.storage.put("state", record);
+    await this.ctx.storage.put(RECORD_KEY, record);
+  }
+
+  /**
+   * Internal contract, invoked only by worker.ts's `/pair/init` handler
+   * against a per-IP instance — never reachable publicly (`throttle` is absent
+   * from worker.ts's `PUBLIC_SESSION_SUBPATHS`, and an IP bucket's instance
+   * name is not a UUID, so the public `/session/:id/*` route cannot address it
+   * at all).
+   *
+   * Counts one attempt in a sliding window and reports whether it crossed the
+   * bound. The bucket re-arms its own purge alarm on every call, so an IP that
+   * stops calling reclaims its storage one window later instead of leaving a
+   * row behind forever — the throttle must not itself become the unbounded
+   * storage growth it exists to prevent.
+   */
+  private async handlePairInitThrottle(): Promise<Response> {
+    const now = Date.now();
+    const previous = (await this.ctx.storage.get<number[]>(PAIR_INIT_KEY)) ?? [];
+    const { attempts, throttled } = recordAttempt(
+      previous,
+      now,
+      PAIR_INIT_WINDOW_MS,
+      PAIR_INIT_MAX_PER_WINDOW
+    );
+    await this.ctx.storage.put(PAIR_INIT_KEY, attempts);
+    await this.ctx.storage.setAlarm(now + PAIR_INIT_WINDOW_MS + PURGE_GRACE_MS);
+    return jsonResponse(200, { throttled });
+  }
+
+  /**
+   * Schedules the next storage-reclamation pass. Last writer wins, deliberately:
+   * every caller is a state transition that knows its own correct deadline —
+   * a bind pushes the deadline out to the device token's expiry, an end pulls
+   * it in to a short grace — and `alarm()` re-derives from the record anyway,
+   * so an alarm that fires early only costs one re-schedule.
+   */
+  private async armPurgeAlarm(atMs: number): Promise<void> {
+    await this.ctx.storage.setAlarm(atMs);
   }
 
   /** Milliseconds of stream idleness before the next `keepalive`. Falls back
@@ -283,6 +414,11 @@ export class SessionDO {
       status: "pending",
     };
     await this.saveRecord(record);
+    // An unclaimed session is the cheap half of the abuse case in finding 7:
+    // one Durable Object with a persistent row per `/pair/init`, previously
+    // with no reaping path at all. Arm the reclamation pass now, while this is
+    // the only thing that has ever written to this instance.
+    await this.armPurgeAlarm(record.pair_exp + PURGE_GRACE_MS);
     return jsonResponse(200, {
       session_id: record.session_id,
       pairing_code: record.pairing_code,
@@ -333,7 +469,7 @@ export class SessionDO {
     });
     return new Response(stream, {
       status: 200,
-      headers: { "content-type": "application/x-ndjson" },
+      headers: { "content-type": "application/x-ndjson", ...SECURITY_HEADERS },
     });
   }
 
@@ -362,7 +498,20 @@ export class SessionDO {
     } catch {
       return jsonResponse(400, { error: "invalid JSON" });
     }
-    if (!isEnvelope(envelope)) {
+    // Provenance, not just shape (finding 1). hmd's bearer token authorises it
+    // to speak *as hmd*, and nothing more: a `sender:"relay"` control frame or
+    // a `sender:"device"` frame posted here would be forwarded to the phone as
+    // if the relay or the phone's peer had sent it. `state` and `ack` are the
+    // only frames hmd originates.
+    if (!isHmdFrame(envelope)) {
+      const rejected = envelope as Record<string, unknown>;
+      logEvent("frame_rejected", {
+        session_id: record.session_id,
+        leg: "hmd",
+        reason: "sender_or_type_not_hmd_originated",
+        frame_sender: loggableSender(rejected.sender),
+        frame_type: loggableType(rejected.type),
+      });
       return jsonResponse(400, { error: "invalid envelope" });
     }
 
@@ -502,28 +651,43 @@ export class SessionDO {
       });
     }
 
-    if (deviceToken) {
-      return this.handleDeviceTokenClaim(record, deviceToken);
-    }
     const devicePubkey = url.searchParams.get("device_pubkey");
+    if (deviceToken) {
+      return this.handleDeviceTokenClaim(record, deviceToken, devicePubkey);
+    }
     return this.handlePairingCodeClaim(record, pairingCode as string, devicePubkey);
   }
 
+  /**
+   * Reconnect path. `device_pubkey` is now read here too: a token minted since
+   * the finding-6 fix carries the claiming device's public key in its signed
+   * claims, and `verifyDeviceToken` refuses the reconnect unless the same key
+   * is re-presented — so an exfiltrated token is useless to a holder who
+   * cannot also present the bound key.
+   *
+   * A token minted *before* that change carries no such claim and is accepted
+   * with or without the query param, unbound, until its own expiry. That
+   * tolerance is mandatory, not cosmetic: a phone paired before the deploy has
+   * no way to obtain a bound token except a physical re-scan of a QR that
+   * nobody is standing in front of.
+   */
   private async handleDeviceTokenClaim(
     record: SessionRecord,
-    deviceToken: string
+    deviceToken: string,
+    devicePubkey: string | null
   ): Promise<Response> {
-    const ok = await verifyDeviceToken(
+    const claims = await verifyDeviceToken(
       this.env.RELAY_SIGNING_SECRET,
       deviceToken,
       record.session_id,
-      Date.now()
+      Date.now(),
+      devicePubkey
     );
-    if (!ok) return jsonResponse(401, { error: "invalid device token" });
+    if (!claims) return jsonResponse(401, { error: "invalid device token" });
     if (record.status === "ended") {
       return jsonResponse(410, { error: "session ended" });
     }
-    return this.acceptDeviceSocket(record.session_id);
+    return this.acceptDeviceSocket(record.session_id, claims.exp);
   }
 
   private async handlePairingCodeClaim(
@@ -539,6 +703,7 @@ export class SessionDO {
     if (now > record.pair_exp) {
       record.status = "ended";
       await this.saveRecord(record);
+      await this.armPurgeAlarm(now + ENDED_GRACE_MS);
       return jsonResponse(410, { error: "pairing code expired" });
     }
 
@@ -547,6 +712,7 @@ export class SessionDO {
     if (throttled) {
       record.status = "ended";
       await this.saveRecord(record);
+      await this.armPurgeAlarm(now + ENDED_GRACE_MS);
       return jsonResponse(
         429,
         { error: "too many claim attempts", retry_after_s: CLAIM_THROTTLE_RETRY_AFTER_S },
@@ -567,16 +733,26 @@ export class SessionDO {
 
     const nowS = Math.floor(now / 1000);
     const exp = nowS + DEVICE_TOKEN_TTL_S;
+    // `device_pubkey` goes into the signed claims, so the token is only usable
+    // by the device that claimed the code (finding 6). It is the same
+    // base64url string the phone sent and hmd is about to receive — the relay
+    // never re-encodes it anywhere on this path.
     const deviceToken = await mintDeviceToken(this.env.RELAY_SIGNING_SECRET, {
       session_id: record.session_id,
       role: "device",
       exp,
+      device_pubkey: devicePubkey,
     });
     record.status = "bound";
+    record.device_token_exp = exp;
     await this.saveRecord(record);
+    // The session is now reachable for as long as that token is valid, so the
+    // reclamation deadline moves out to match it.
+    await this.armPurgeAlarm(exp * 1000 + PURGE_GRACE_MS);
 
     return this.acceptDeviceSocket(
       record.session_id,
+      exp,
       { device_token: deviceToken, exp },
       { device_pubkey: devicePubkey, bound_at: nowS }
     );
@@ -584,6 +760,7 @@ export class SessionDO {
 
   private acceptDeviceSocket(
     sessionId: string,
+    tokenExp: number,
     bindPayload?: DeviceBoundToPhonePayload,
     hmdControlPayload?: DeviceBoundToHmdPayload
   ): Response {
@@ -599,7 +776,7 @@ export class SessionDO {
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [DEVICE_TAG]);
-    const attachment: DeviceSocketAttachment = { gen: generation };
+    const attachment: DeviceSocketAttachment = { gen: generation, token_exp: tokenExp };
     server.serializeAttachment(attachment);
     if (bindPayload) {
       server.send(
@@ -659,6 +836,10 @@ export class SessionDO {
 
     record.status = "ended";
     await this.saveRecord(record);
+    // An ended session is dead weight, but not instantly: the grace keeps the
+    // record long enough that a phone reconnecting right after the revoke gets
+    // a truthful 410 rather than a 404 that reads like "wrong session id".
+    await this.armPurgeAlarm(Date.now() + ENDED_GRACE_MS);
 
     const sockets = this.ctx.getWebSockets(DEVICE_TAG);
     for (const socket of sockets) {
@@ -691,15 +872,84 @@ export class SessionDO {
     return jsonResponse(200, { ok: true });
   }
 
-  async webSocketMessage(_ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  /**
+   * The phone leg's inbound path — and, before the 2026-09-24 audit, the
+   * relay's single most dangerous line: it re-serialized anything that passed
+   * a *structural* check straight into hmd's stream. Four gates now stand
+   * between a phone socket and that stream, in cost order.
+   */
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== "string") return;
+
+    // 1. INV-16, the half that was only ever enforced on `POST /frames`
+    //    (finding 8). Checked before `JSON.parse` so an oversize message is
+    //    never parsed, and length-first so the encode below is itself bounded:
+    //    UTF-8 is never fewer bytes than characters, so a string longer than
+    //    the cap is over it regardless of contents.
+    if (
+      message.length > MAX_ENVELOPE_BYTES ||
+      new TextEncoder().encode(message).byteLength > MAX_ENVELOPE_BYTES
+    ) {
+      logEvent("frame_rejected", {
+        session_id: this.cachedSessionId ?? "unknown",
+        leg: "device",
+        reason: "envelope_exceeds_size_cap",
+      });
+      this.closeDeviceSocket(ws, CLOSE_MESSAGE_TOO_BIG, "frame exceeds size cap");
+      return;
+    }
+
     let envelope: unknown;
     try {
       envelope = JSON.parse(message);
     } catch {
       return;
     }
-    if (!isEnvelope(envelope)) return;
+
+    // 2. Provenance (finding 1). `command` is the only frame a device
+    //    originates; `sender:"relay"` control frames forwarded from here were
+    //    a full end-to-end break, since hmd re-derives its session key from
+    //    any `device_bound` it reads off its stream.
+    if (!isDeviceFrame(envelope)) {
+      const rejected = envelope as Record<string, unknown>;
+      logEvent("frame_rejected", {
+        session_id: this.cachedSessionId ?? "unknown",
+        leg: "device",
+        reason: "sender_or_type_not_device_originated",
+        frame_sender: loggableSender(rejected.sender),
+        frame_type: loggableType(rejected.type),
+      });
+      return;
+    }
+
+    // 3. INV-9/INV-10 (finding 9): the session's current state, re-read per
+    //    frame rather than cached as "this connection was trusted at upgrade".
+    //    A `close()` that threw or raced — `handleRevoke`'s catch swallows one
+    //    — otherwise leaves a socket whose frames are still forwarded.
+    const record = await this.loadRecord();
+    if (!record || record.status !== "bound") {
+      logEvent("frame_rejected", {
+        session_id: record?.session_id ?? "unknown",
+        leg: "device",
+        reason: "session_not_bound",
+      });
+      this.closeDeviceSocket(ws, CLOSE_SESSION_ENDED, "session ended");
+      return;
+    }
+
+    // 4. And the token's own expiry, which nothing re-checked once a socket
+    //    was open: a phone that never drops would have kept a 30-day
+    //    credential working indefinitely.
+    const tokenExp = deviceSocketAttachment(ws).token_exp;
+    if (typeof tokenExp === "number" && Date.now() / 1000 > tokenExp) {
+      logEvent("frame_rejected", {
+        session_id: record.session_id,
+        leg: "device",
+        reason: "device_token_expired",
+      });
+      this.closeDeviceSocket(ws, CLOSE_TOKEN_EXPIRED, "device token expired");
+      return;
+    }
 
     if (this.writeToHmdStream(JSON.stringify(envelope) + "\n")) return;
 
@@ -709,11 +959,69 @@ export class SessionDO {
     // persisted frame buffering"). The phone's own `ack` timeout is what
     // surfaces this to the operator (INV-28); the relay does not invent a
     // retry path it has no test for.
-    const record = await this.loadRecord();
     logEvent("frame_undelivered", {
-      session_id: record?.session_id ?? "unknown",
+      session_id: record.session_id,
       reason: "no_hmd_stream_connected",
     });
+  }
+
+  /** Ends a device socket the relay has decided to stop serving. Never throws
+   * past this boundary: a socket already closing or gone is exactly the state
+   * the caller wanted, and a throw here would take its `return` with it. */
+  private closeDeviceSocket(socket: WebSocket, code: number, reason: string): void {
+    try {
+      socket.close(code, reason);
+    } catch {
+      // Already closing or gone — the frame is dropped either way.
+    }
+  }
+
+  /**
+   * Storage reclamation (finding 7). Before this, `SessionDO` wrote its record
+   * at bind and deleted it on no path at all — not on revoke, not on pairing
+   * expiry — so every `/pair/init`, including one from an unauthenticated
+   * abuse loop, left a persistent row behind forever.
+   *
+   * Three deadlines, re-derived from the record on every pass rather than
+   * trusted from whenever the alarm was set:
+   * - unclaimed → purge once the pairing window plus grace has passed;
+   * - bound → keep until the `device_token` that could reconnect it expires;
+   * - ended → purge, the short grace having been the alarm's own schedule.
+   *
+   * A Durable Object instance holding a `/pair/init` throttle bucket rather
+   * than a session has no record, and falls through to the same `deleteAll`.
+   */
+  async alarm(): Promise<void> {
+    const record = await this.ctx.storage.get<SessionRecord>(RECORD_KEY);
+    const now = Date.now();
+
+    if (record) {
+      if (record.status === "bound") {
+        const expMs = (record.device_token_exp ?? 0) * 1000;
+        // A record written before `device_token_exp` existed gives no honest
+        // deadline, so it gets a full TTL from now rather than an early purge
+        // — a live paired phone must never lose its session to this pass.
+        if (expMs === 0) {
+          await this.armPurgeAlarm(now + DEVICE_TOKEN_TTL_S * 1000);
+          return;
+        }
+        if (now < expMs) {
+          await this.armPurgeAlarm(expMs + PURGE_GRACE_MS);
+          return;
+        }
+      } else if (record.status === "pending" && now <= record.pair_exp) {
+        await this.armPurgeAlarm(record.pair_exp + PURGE_GRACE_MS);
+        return;
+      }
+
+      logEvent("session_purged", { session_id: record.session_id, status: record.status });
+      for (const socket of this.ctx.getWebSockets(DEVICE_TAG)) {
+        this.closeDeviceSocket(socket, CLOSE_SESSION_ENDED, "session ended");
+      }
+      this.closeHmdStream();
+    }
+
+    await this.ctx.storage.deleteAll();
   }
 
   async webSocketClose(

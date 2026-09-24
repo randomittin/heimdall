@@ -8,6 +8,7 @@
 
 import type { Env } from "./types";
 import { jsonResponse } from "./http";
+import { PAIR_INIT_RETRY_AFTER_S } from "./pairing";
 
 export { SessionDO } from "./session";
 
@@ -33,7 +34,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "POST" && url.pathname === "/pair/init") {
-      return handlePairInit(env);
+      return handlePairInit(request, env);
     }
 
     const match = SESSION_PATH_RE.exec(url.pathname);
@@ -57,7 +58,41 @@ export default {
   },
 };
 
-async function handlePairInit(env: Env): Promise<Response> {
+/**
+ * The throttle bucket for one source IP.
+ *
+ * `CF-Connecting-IP` is set by Cloudflare's own edge on every request that
+ * reaches a Worker and cannot be spoofed by the client — an inbound header of
+ * that name is overwritten, not forwarded. Its absence therefore means "not
+ * behind the edge", i.e. `wrangler dev` or the vitest pool, which share the
+ * `"unknown"` bucket and are throttled like any other caller. Fail closed:
+ * treating an absent header as "unlimited" would hand the bypass to anyone who
+ * ever found a path to the Worker that skipped the edge.
+ */
+function throttleBucket(request: Request, env: Env): DurableObjectStub {
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  return env.SESSION.get(env.SESSION.idFromName(`pair-init-throttle:${ip}`));
+}
+
+async function handlePairInit(request: Request, env: Env): Promise<Response> {
+  // INV-5 keeps this endpoint identity-free on purpose, and the throttle does
+  // not change that: no credential is asked for, no caller is identified
+  // beyond the edge-supplied IP that Cloudflare already routes on. It supplies
+  // the "bounded by ... throttle" half of INV-5 that the 2026-09-24 audit
+  // (finding 7) found missing — an unauthenticated loop here minted one
+  // Durable Object with a persistent row per request, with no reaping path.
+  const throttleRes = await throttleBucket(request, env).fetch("http://do-internal/throttle", {
+    method: "POST",
+  });
+  const { throttled } = (await throttleRes.json()) as { throttled: boolean };
+  if (throttled) {
+    return jsonResponse(
+      429,
+      { error: "too many pairing requests", retry_after_s: PAIR_INIT_RETRY_AFTER_S },
+      { "Retry-After": String(PAIR_INIT_RETRY_AFTER_S) }
+    );
+  }
+
   const sessionId = crypto.randomUUID();
   const id = env.SESSION.idFromName(sessionId);
   const stub = env.SESSION.get(id);

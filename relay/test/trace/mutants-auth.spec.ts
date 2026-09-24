@@ -28,6 +28,7 @@ import {
   postFrame,
   revoke,
   wsUpgrade,
+  reconnectQuery,
 } from "./helpers";
 
 describe("MUT-INV-6-token-in-query", () => {
@@ -103,7 +104,7 @@ describe("MUT-INV-10-delayed-revoke", () => {
     // Baseline: prove the token actually works for reconnect BEFORE revoke —
     // otherwise a mutant that rejects every device_token unconditionally
     // would also make the "fails after revoke" assertion below vacuously pass.
-    const preRevoke = await wsUpgrade(init.session_id, `device_token=${deviceToken}`);
+    const preRevoke = await wsUpgrade(init.session_id, reconnectQuery(deviceToken));
     expect(preRevoke.status).toBe(101);
     preRevoke.webSocket?.accept();
     preRevoke.webSocket?.close();
@@ -112,7 +113,7 @@ describe("MUT-INV-10-delayed-revoke", () => {
     expect(revokeRes.status).toBe(200);
 
     // Immediately — no delay, no sleep — attempt reconnect with the old token.
-    const reconnect = await wsUpgrade(init.session_id, `device_token=${deviceToken}`);
+    const reconnect = await wsUpgrade(init.session_id, reconnectQuery(deviceToken));
     expect(reconnect.status).toBe(410);
   });
 });

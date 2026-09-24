@@ -23,8 +23,18 @@ interface PairInitBody {
   exp: number;
 }
 
+/** Each test is logically a separate client, so each gets its own source IP.
+ * `/pair/init` is throttled per `CF-Connecting-IP` (10/60s — src/pairing.ts's
+ * PAIR_INIT_MAX_PER_WINDOW, added for the 2026-09-24 audit's finding 7), and
+ * the pool sends no such header, so without this every suite would share the
+ * one `"unknown"` bucket and start 429ing partway through the file. The
+ * throttle's own coverage lives in test/hardening.spec.ts, where a fixed IP is
+ * hammered deliberately. */
 async function pairInit(): Promise<PairInitBody> {
-  const res = await SELF.fetch(`${BASE}/pair/init`, { method: "POST" });
+  const res = await SELF.fetch(`${BASE}/pair/init`, {
+    method: "POST",
+    headers: { "CF-Connecting-IP": crypto.randomUUID() },
+  });
   expect(res.status).toBe(200);
   return (await res.json()) as PairInitBody;
 }
@@ -252,9 +262,13 @@ describe("device_pubkey reaches hmd's stream (relay/README.md 'Confirmed gaps' #
 
     await reader.read(); // consume the one device_bound the claim just delivered
 
-    const reconnectRes = await SELF.fetch(wsUrl(init.session_id, `device_token=${deviceToken}`), {
-      headers: { Upgrade: "websocket" },
-    });
+    const reconnectRes = await SELF.fetch(
+      wsUrl(
+        init.session_id,
+        `device_token=${encodeURIComponent(deviceToken)}&device_pubkey=${TEST_DEVICE_PUBKEY}`
+      ),
+      { headers: { Upgrade: "websocket" } }
+    );
     expect(reconnectRes.status).toBe(101);
 
     let extra: unknown = "none";
@@ -501,9 +515,18 @@ describe("device socket supersede (reconnect after a network drop)", () => {
     return { socket, deviceToken: payload.device_token };
   }
 
+  /** Presents `device_pubkey` alongside the token, which is what the app now
+   * puts on a reconnect URL: a `device_token` minted since the 2026-09-24
+   * audit's finding 6 carries the claiming device's public key in its signed
+   * claims, and the relay refuses the reconnect unless the same key comes
+   * back. (Tokens minted before that change carry no such claim and still
+   * reconnect without it — covered in test/hardening.spec.ts.) */
   async function reconnectDevice(sessionId: string, deviceToken: string): Promise<WebSocket> {
     const response = await SELF.fetch(
-      wsUrl(sessionId, `device_token=${encodeURIComponent(deviceToken)}`),
+      wsUrl(
+        sessionId,
+        `device_token=${encodeURIComponent(deviceToken)}&device_pubkey=${TEST_DEVICE_PUBKEY}`
+      ),
       { headers: { Upgrade: "websocket" } }
     );
     expect(response.status).toBe(101);

@@ -38,10 +38,19 @@ npx wrangler secret put RELAY_SIGNING_SECRET
 npx wrangler deploy
 ```
 
-`RELAY_SIGNING_SECRET` HMAC-signs every `relay_session_token` / `device_token` (session id, role,
-and expiry are baked into the signed payload) — generate it with any high-entropy random-string
-tool; it is never a literal in this repo, only a Workers secret. Durable Objects require the
-Workers Paid plan (~$5/mo) — the free plan cannot bind them.
+`RELAY_SIGNING_SECRET` HMAC-signs the **`device_token` only** — session id, role, expiry and the
+bound device public key are baked into the signed payload. `relay_session_token` is *not* signed
+with it: `generateSessionToken` (`src/pairing.ts`) is 32 raw random bytes compared
+constant-time against the stored value, so hmd's bearer credential does not depend on this
+secret at all. Generate the secret with any high-entropy random-string tool; it is never a
+literal in this repo, only a Workers secret. Durable Objects require the Workers Paid plan
+(~$5/mo) — the free plan cannot bind them.
+
+**Rotation invalidates every outstanding `device_token`** (and nothing else — hmd's bearer
+tokens survive, per the paragraph above). The token format carries no key id and
+`verifyDeviceToken` accepts exactly one secret, so every paired phone must re-scan a QR after a
+rotation. A key-id prefix plus an overlap window (`RELAY_SIGNING_SECRET_PREVIOUS`) would remove
+that cliff; it is not implemented, so plan a rotation as a re-pair event.
 
 ## Local dev
 
@@ -68,7 +77,33 @@ relay must never log a full request URL, since the phone-leg URL carries `pairin
 
 ## HTTP / WS API for client tracks
 
-### `POST /pair/init` — unauthenticated
+### `POST /pair/init` — unauthenticated, throttled per source IP
+
+Rate limit: **10 per 60s sliding window, keyed on `CF-Connecting-IP`**
+(`PAIR_INIT_MAX_PER_WINDOW` / `PAIR_INIT_WINDOW_MS`, `src/pairing.ts`). The attempt that
+crosses the bound gets `429` + `Retry-After: 60` + `{"retry_after_s": 60}`; the window is
+sliding, so the caller is serving again 60s after its tenth accepted request. This is INV-5's
+"bounded by mint + TTL + **throttle**" clause — the endpoint stays identity-free (no bearer, no
+prior relationship, nothing asked of the caller but the IP the edge already routes on).
+
+The counter lives in a Durable Object instance named `pair-init-throttle:<ip>` — the same
+`SessionDO` class, a disjoint storage key (`pair_init_attempts`), never a session. A second DO
+class would have needed a `[[migrations]]` entry on the deploy that ships this, which is not
+worth the risk to a live paired session for a per-name counter. The bucket re-arms its own
+purge alarm on every call, so an IP that stops calling reclaims its row one window later.
+
+`CF-Connecting-IP` is set by Cloudflare's edge and cannot be spoofed (an inbound header of that
+name is overwritten). Its absence means the request did not come through the edge — `wrangler
+dev` or the vitest pool — and those share one `"unknown"` bucket and are throttled like any
+other caller. Fail-closed on purpose: treating a missing header as "unlimited" would hand the
+bypass to anyone who found a path to the Worker that skipped the edge. Tests therefore pass
+their own `CF-Connecting-IP` per logical client (`test/worker.spec.ts`'s `pairInit` helper).
+
+Not covered by this: `GET /session/<random-uuid>/ws` still instantiates a Durable Object per
+distinct id before answering `404`, so a spray over random UUIDs is a DO-instantiation
+amplifier with no storage write to show for it. Recorded as a known, accepted cost — bounding
+it needs a KV/bloom of live session ids in the Worker, which is more machinery than the
+exposure justifies while session ids are UUIDv4.
 
 Response `200`:
 ```json
@@ -156,16 +191,49 @@ Body: one `Envelope` (JSON). Response `200 {"ok": true, "delivered": <bool>}` �
 false` (not an error) when no phone is currently connected; the frame is not buffered or
 retried.
 
+**Only hmd-originated frames are accepted here**: `sender: "hmd"` and `type` of `state` or
+`ack` (`isHmdFrame`, `src/types.ts`). The bearer token authorises the holder to speak *as hmd*
+and nothing more — a `sender:"relay"` `device_bound`/`session_ended`, or a `sender:"device"`
+frame, is `400`, never forwarded to the phone. Symmetric to the phone leg's gate below.
+
 - `413` — envelope exceeds 1 MiB.
-- `401` / `400` / `404` — same as `/stream`.
+- `400` — invalid JSON, or an envelope that is not an hmd-originated frame.
+- `401` / `404` — same as `/stream`.
+
+One residue, disclosed: the size check reads `Content-Length` first and only then measures the
+decoded body, so a chunked POST with no `Content-Length` is fully buffered in the Durable Object
+before it can be measured. Streaming-and-counting, or refusing a body with no `Content-Length`,
+would close that — both change what a legitimate hmd client must send, so neither ships here
+without a coordinated contract change.
 
 ### `GET /session/:id/ws?pairing_code=<code>` or `?device_token=<token>` — phone leg
 
 Must be a real WebSocket upgrade (`Upgrade: websocket`) over an effectively-`wss` connection —
 `400` if the `Upgrade` header is missing, or if `X-Forwarded-Proto: http` /
 `cf-visitor: {"scheme":"http"}` signal a plaintext hop in front of the Worker. A `pairing_code`
-claim also requires `&device_pubkey=<base64url, 32 bytes>` in the query string — not required
-(and not re-validated) on a `device_token` reconnect.
+claim requires `&device_pubkey=<base64url, 32 bytes>` in the query string.
+
+#### `device_token` is bound to the device's public key
+
+A `device_token` minted on a `pairing_code` claim carries that claim's `device_pubkey` inside
+its HMAC-signed payload. **A reconnect must present the same `&device_pubkey=` value**, and the
+relay compares the two constant-time; a mismatch or an omission is `401`. Before this, the
+token was bound to nothing but `session_id`: a copy exfiltrated from a device backup, a rooted
+handset, or the relay's own memory was a 30-day bearer credential, and presenting it opened a
+higher-generation socket that *evicted the real phone* on the next `POST /frames`. It is now
+useless to a holder who cannot also present the bound key.
+
+> **DEPRECATED — pubkey-less `device_token`s.** Tokens minted *before* this change carry no
+> `device_pubkey` claim. They keep working, unbound, with or without a `&device_pubkey=` param,
+> **until their own `exp`** — at most `DEVICE_TOKEN_TTL_S` (30 days) after the deploy that
+> shipped this. The tolerance is mandatory, not cosmetic: a phone paired beforehand has no way
+> to obtain a bound token except a physical re-scan of a QR nobody is standing in front of.
+> Once the last such token has expired, the `boundPubkey === undefined` branch in
+> `verifyDeviceToken` (`src/pairing.ts`) can be deleted and the claim made required.
+
+Note what this does *not* add: there is still no per-device revocation. `POST /revoke` is
+session-wide (INV-29's `{device_pubkey_fp}` parameter remains unimplemented), and the token
+carries no `jti`, so revoking one device means ending the session.
 
 - `101` — upgraded; the first frame sent on the socket is always `device_bound`
   (`{"type": "device_bound", "sender": "relay", "payload": {"device_token": "...", "exp":
@@ -197,14 +265,71 @@ claim also requires `&device_pubkey=<base64url, 32 bytes>` in the query string �
   supersede (reconnect after a network drop)" suite.
 - `400` — `device_pubkey` is missing, or doesn't decode to exactly 32 bytes (`pairing_code`
   claim only).
-- `401` — `pairing_code` doesn't match, or `device_token` is invalid/expired.
+- `401` — `pairing_code` doesn't match; or `device_token` is invalid/expired; or the token is
+  pubkey-bound and `device_pubkey` is absent or does not match the bound key.
 - `410` — pairing code already claimed, or expired.
-- `429` + `Retry-After: 60` — more than 10 claim attempts against one session within 60s.
+- `429` + `Retry-After: 60` — more than 10 claim attempts against one session within 60s. On
+  this leg the status is not observable to a React Native client (see INV-25 under
+  "Deviations"); it is reported honestly for any other caller.
+
+#### What the relay accepts *on* the socket
+
+Every message is gated four ways before a byte reaches hmd's stream:
+
+1. **Size (INV-16, both legs).** A message over `MAX_ENVELOPE_BYTES` (1 MiB) is never parsed;
+   the socket is closed with **`1009`** ("message too big") and the frame logged as
+   `frame_rejected` / `envelope_exceeds_size_cap`. Until this, the cap existed only on `POST
+   /frames`, and Cloudflare's own ~1 MiB WebSocket limit was the sole thing standing between a
+   phone and the relay here.
+2. **Provenance.** Only `sender: "device"` with `type: "command"` is forwarded (`isDeviceFrame`,
+   `src/types.ts`). Anything else — `sender:"relay"`, `device_bound`, `session_ended`,
+   `keepalive`, `state`, `ack`, `sender:"hmd"` — is dropped and logged, never forwarded. This is
+   the single most important gate in the file: hmd re-derives its session key from *any*
+   `device_bound` it reads off its stream, so forwarding a phone-sent one rebound the session to
+   the sender's own X25519 key — a full end-to-end break by a party holding no credential at all.
+3. **Session state (INV-9/INV-10).** The record is re-read *per frame*, not cached as "this
+   connection was trusted at upgrade". A session that is not `bound` drops the frame and closes
+   the socket with **`4001`**. This is what makes revocation immediate even when `handleRevoke`'s
+   `close()` throws (its `catch` swallows one) or races a hibernated socket.
+4. **Token expiry.** The admitting token's `exp` is stamped onto the socket's hibernation
+   attachment and checked per frame; past it, the frame is dropped and the socket closed with
+   **`4003`** ("device token expired"). Without this a phone that never dropped kept a 30-day
+   credential working indefinitely. A socket accepted before this field existed carries no
+   `token_exp` and is served until it drops — the relay has no honest expiry to apply to it.
+
+Close codes on this leg: `1009` oversize, `4001` session ended/revoked, `4002` superseded,
+`4003` device token expired. All four mean "reconnect" to the app except `4001`; a reconnect
+after `4001`/`4003` meets a truthful `410`/`401` at the upgrade, which is how the operator
+learns to re-pair.
 
 ### `POST /session/:id/revoke` — hmd leg, requires the same bearer
 
 Response `200 {"ok": true}`. Closes the bound device's WebSocket with close code `4001` and
-turns any further `pairing_code` claim into `410`.
+turns any further `pairing_code` claim into `410`. Arms the purge alarm below at a 5-minute
+grace.
+
+## Storage reclamation (purge schedule)
+
+`SessionDO` used to write its record and delete it on no path at all — not on revoke, not on
+pairing expiry — so every `/pair/init` left a persistent row behind forever. A Durable Object
+alarm now reclaims storage, re-deriving the deadline from the record on every pass rather than
+trusting whenever the alarm happened to be set:
+
+| Session state | Reclaimed at |
+|---|---|
+| `pending`, unclaimed | `pair_exp` + 60s grace (i.e. ~2 minutes after `/pair/init`) |
+| `bound` | the `device_token`'s `exp` + 60s grace — 30 days, the last moment it could reconnect |
+| `ended` (revoked, expired, or claim-throttled) | 5 minutes after it ended |
+| `/pair/init` throttle bucket | one window + grace after the IP's last request |
+
+The grace exists so a client that is merely late — a phone reconnecting seconds after its token
+lapsed, hmd re-reading a just-revoked session — meets a truthful `410`/`401` instead of a bare
+`404` that reads like "wrong session id". Purging closes any attached device socket (`4001`) and
+hmd's stream, then `deleteAll()`s; it logs `session_purged` with the `session_id` and status.
+
+**A `bound` record written before `device_token_exp` existed is never purged early** — it has no
+honest deadline, so each pass re-arms a full TTL out. A session live across the deploy that
+shipped this keeps running.
 
 ### `Envelope` (wire shape, both directions)
 
@@ -236,6 +361,45 @@ A client that does not recognise a control `type` should skip that line, not tre
 error — that is how `keepalive` was added without breaking the phone leg (`decodeRelayFrame` in
 `src/relay/protocol.ts` already returns `null` for an unknown type and `RelayTransport` drops
 it silently).
+
+## Security hardening pass — 2026-09-24 audit
+
+Every response this Worker builds carries
+`Strict-Transport-Security: max-age=31536000; includeSubDomains` (no `preload` — that is a
+one-way door owned by whoever operates the domain, not by this Worker). TLS interception does
+not break end-to-end confidentiality, but the phone-leg upgrade URL carries `pairing_code` /
+`device_token` in its query string, which is enough to claim a session or evict the bound phone.
+
+Audited findings addressed here: **1** (per-leg sender/type allowlist), **6** (pubkey-bound
+`device_token`, legacy-tolerant), **7** (`/pair/init` throttle + storage reclamation), **8**
+(INV-16 on the phone leg), **9** (per-frame re-validation), **13** (fail-closed token claims),
+**15** (the secret-signing sentence above, corrected), **18** (HSTS).
+
+Deliberately **not** changed here, with reasons:
+
+- **Finding 17 — `isPlaintextUpgrade` fails open on absence of both scheme headers.** Gating the
+  dev fallback on an explicit `RELAY_ALLOW_PLAINTEXT_DEV` binding is the textbook fix, and in
+  front of Cloudflare both headers are always set, so INV-7 already holds in production. That
+  cuts both ways: the change can only matter where it cannot occur, and getting it wrong breaks
+  the reconnect of a phone that is paired right now. Left as the documented deviation it already
+  was.
+- **Finding 12 — INV-25's `1013` close code on the phone leg.** Still not emitted; the claim
+  throttle fires strictly pre-upgrade, so there is no live WebSocket to close. Making it visible
+  to React Native would mean accepting the upgrade purely to close it, changing a response shape
+  documented in `docs/HANDOFF-TO-HEIMDALL-relay.md`. Recorded honestly in `INVARIANTS.md`
+  instead — an invariant ledger that lists guarantees the code does not provide is worse than one
+  that lists fewer.
+- **Finding 12's session-kill** — 11 wrong claims against a known `session_id` end the pairing
+  before the legitimate phone scans it. That is INV-4 exactly as specified, so it is a design
+  consequence, not a code bug; accepted risk. The new `/pair/init` throttle bounds session
+  *creation* but not this.
+- **Finding 14 — signing-secret rotation.** No key id, no overlap window; see "Deploy" above for
+  what a rotation costs. Adding a versioned token format is a wire change, not a ≤10-line fix.
+- **Finding 16 — session-existence oracle** (`404`/`410`/`401`/`400` distinguishable to an
+  unauthenticated caller). Session ids are UUIDv4, so this is not practically enumerable;
+  accepted, as the audit recommends.
+- **Finding 19 — `session_id` in logs** is a correlation handle. Left as-is: it is the only
+  field that makes a log line actionable, and the relay already holds everything it addresses.
 
 ## Deviations / scope decisions from the delta brief (disclosed)
 

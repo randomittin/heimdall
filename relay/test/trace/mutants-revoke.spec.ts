@@ -14,6 +14,8 @@ import {
   postFrame,
   revoke,
   wsUpgrade,
+  reconnectQuery,
+  TEST_DEVICE_PUBKEY,
 } from "./helpers";
 
 describe("MUT-INV-29-partial-revoke", () => {
@@ -27,12 +29,12 @@ describe("MUT-INV-29-partial-revoke", () => {
     expect(revokeRes.status).toBe(200);
 
     // 1. New device_token reconnect attempts are blocked.
-    const byToken = await wsUpgrade(init.session_id, `device_token=${deviceToken}`);
+    const byToken = await wsUpgrade(init.session_id, reconnectQuery(deviceToken));
     expect(byToken.status).toBe(410);
 
     // 2. The ORIGINAL pairing_code is also blocked — revoke is not scoped to
     //    "reconnect" alone, it kills every entry point into the session.
-    const byOriginalCode = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}`);
+    const byOriginalCode = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}&device_pubkey=${TEST_DEVICE_PUBKEY}`);
     expect(byOriginalCode.status).toBe(410);
 
     // 3. Frame delivery is blocked too (the device socket was force-closed).
@@ -50,7 +52,7 @@ describe("MUT-INV-30-token-resurrection", () => {
     const { device_token: oldDeviceToken } = bound.payload as { device_token: string };
 
     // Baseline: prove the token actually worked for reconnect BEFORE revoke.
-    const preRevoke = await wsUpgrade(init.session_id, `device_token=${oldDeviceToken}`);
+    const preRevoke = await wsUpgrade(init.session_id, reconnectQuery(oldDeviceToken));
     expect(preRevoke.status).toBe(101);
     preRevoke.webSocket?.accept();
     preRevoke.webSocket?.close();
@@ -58,9 +60,9 @@ describe("MUT-INV-30-token-resurrection", () => {
     await revoke(init.session_id, init.relay_session_token);
 
     // Retry the old token twice — proving permanence, not a transient blip.
-    const attempt1 = await wsUpgrade(init.session_id, `device_token=${oldDeviceToken}`);
+    const attempt1 = await wsUpgrade(init.session_id, reconnectQuery(oldDeviceToken));
     expect(attempt1.status).toBe(410);
-    const attempt2 = await wsUpgrade(init.session_id, `device_token=${oldDeviceToken}`);
+    const attempt2 = await wsUpgrade(init.session_id, reconnectQuery(oldDeviceToken));
     expect(attempt2.status).toBe(410);
 
     // The only forward path is an entirely fresh pairing cycle.

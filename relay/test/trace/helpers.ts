@@ -11,8 +11,16 @@
 import { env, SELF } from "cloudflare:test";
 import { expect } from "vitest";
 import type { Env, Envelope } from "../../src/types";
+import { base64UrlEncode } from "../../src/pairing";
 
 export const typedEnv = env as unknown as Env;
+
+/** Not a secret — deterministic 32-byte filler standing in for a device's
+ * X25519 public key, the same fixture idiom test/worker.spec.ts uses. A
+ * `pairing_code` claim has always required `&device_pubkey=` (400 without it),
+ * and since the 2026-09-24 audit's finding 6 a `device_token` reconnect must
+ * re-present the same key the token was minted for. */
+export const TEST_DEVICE_PUBKEY = base64UrlEncode(new Uint8Array(32).fill(7));
 
 export const BASE = "https://relay-trace.test";
 
@@ -23,8 +31,15 @@ export interface PairInitBody {
   exp: number;
 }
 
+/** Own source IP per call — `/pair/init` is throttled per `CF-Connecting-IP`
+ * (src/pairing.ts's PAIR_INIT_MAX_PER_WINDOW), and the pool sends no such
+ * header, so every trace session would otherwise share one bucket and start
+ * 429ing partway through a seeded run. */
 export async function pairInit(): Promise<PairInitBody> {
-  const res = await SELF.fetch(`${BASE}/pair/init`, { method: "POST" });
+  const res = await SELF.fetch(`${BASE}/pair/init`, {
+    method: "POST",
+    headers: { "CF-Connecting-IP": crypto.randomUUID() },
+  });
   expect(res.status).toBe(200);
   return (await res.json()) as PairInitBody;
 }
@@ -76,13 +91,26 @@ async function acceptedSocket(response: Response): Promise<ClaimedSocket> {
 }
 
 export async function claimDevice(sessionId: string, pairingCode: string): Promise<ClaimedSocket> {
-  const response = await wsUpgrade(sessionId, `pairing_code=${pairingCode}`);
+  const response = await wsUpgrade(
+    sessionId,
+    `pairing_code=${pairingCode}&device_pubkey=${TEST_DEVICE_PUBKEY}`
+  );
   return acceptedSocket(response);
 }
 
-export async function reconnectDevice(sessionId: string, deviceToken: string): Promise<ClaimedSocket> {
-  const response = await wsUpgrade(sessionId, `device_token=${deviceToken}`);
+export async function reconnectDevice(
+  sessionId: string,
+  deviceToken: string
+): Promise<ClaimedSocket> {
+  const response = await wsUpgrade(sessionId, reconnectQuery(deviceToken));
   return acceptedSocket(response);
+}
+
+/** The query string a real reconnect carries: the token plus the public key it
+ * is bound to. Shared so the inline `wsUpgrade` call sites in the mutant specs
+ * cannot drift from `reconnectDevice`. */
+export function reconnectQuery(deviceToken: string): string {
+  return `device_token=${encodeURIComponent(deviceToken)}&device_pubkey=${TEST_DEVICE_PUBKEY}`;
 }
 
 export function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> {

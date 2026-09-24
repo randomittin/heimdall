@@ -32,7 +32,7 @@ import { deriveSessionKey, seal, open } from '../lib/relay-crypto.mjs';
 import { decodeEnvelope, buildDisplayNonce } from '../lib/envelope.mjs';
 import { decodeSendMessageCommand } from '../fake-hmd.mjs';
 import { encodeEncryptedFrame, encodeSendMessageCommand } from '../../../src/relay/protocol.ts';
-import { isEnvelope } from '../../src/types.ts';
+import { isEnvelope, isDeviceFrame } from '../../src/types.ts';
 
 // Deterministic filler bytes, not credentials (CLAUDE.md: "no secret-shaped
 // literals") -- the same 0xaa/0xbb seeds fake-hmd.test.mjs's own end-to-end
@@ -56,12 +56,16 @@ function phoneCommandWire(text, seq) {
   });
 }
 
-test("the app's outbound command frame passes the relay's isEnvelope gate", () => {
-  // relay/src/session.ts's webSocketMessage drops anything isEnvelope
-  // rejects, silently and before any logging -- the live failure.
+test("the app's outbound command frame passes the relay's device-leg gate", () => {
+  // relay/src/session.ts's webSocketMessage drops anything isDeviceFrame
+  // rejects, silently and before any logging -- the live failure. The gate is
+  // isDeviceFrame rather than the looser isEnvelope since the 2026-09-24
+  // security audit's finding 1: it additionally requires sender "device" and
+  // type "command", so this asserts the app's real encoder still clears the
+  // hardened bar, not just the structural one.
   const wire = phoneCommandWire('hello from the phone', 1);
   assert.ok(
-    isEnvelope(JSON.parse(wire)),
+    isDeviceFrame(JSON.parse(wire)),
     `the relay would drop this frame: ${Object.keys(JSON.parse(wire)).join(',')}`
   );
 });

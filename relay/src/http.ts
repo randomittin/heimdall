@@ -1,6 +1,21 @@
 // Tiny shared HTTP helpers used by both the top-level Worker router
 // (src/worker.ts) and the per-session Durable Object (src/session.ts).
 
+/**
+ * Sent on every response this relay builds.
+ *
+ * HSTS is cheap defence-in-depth for the one thing TLS interception actually
+ * costs here (2026-09-24 audit, finding 18): end-to-end confidentiality
+ * survives a user-installed CA or an MDM profile, but the phone-leg upgrade
+ * URL carries `pairing_code` / `device_token` in its query string, which is
+ * enough to claim a session or evict the bound phone. A year's max-age with
+ * `includeSubDomains`, no `preload` — preloading is a one-way door owned by
+ * whoever operates the domain, not by this Worker.
+ */
+export const SECURITY_HEADERS: Record<string, string> = {
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+};
+
 export function jsonResponse(
   status: number,
   body: unknown,
@@ -8,7 +23,7 @@ export function jsonResponse(
 ): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json", ...extraHeaders },
+    headers: { "content-type": "application/json", ...SECURITY_HEADERS, ...extraHeaders },
   });
 }
 

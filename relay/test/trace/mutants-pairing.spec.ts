@@ -6,14 +6,14 @@
 // by this harness; see relay/README.md for the API this drives).
 import { describe, expect, it } from "vitest";
 import { SELF } from "cloudflare:test";
-import { BASE, claimDevice, directInit, pairInit, wsUpgrade } from "./helpers";
+import { BASE, claimDevice, directInit, pairInit, wsUpgrade, TEST_DEVICE_PUBKEY} from "./helpers";
 
 describe("MUT-INV-1-double-claim", () => {
   it("relay rejects a 2nd claim against an already-consumed pairing_code", async () => {
     const init = await pairInit();
     await claimDevice(init.session_id, init.pairing_code);
 
-    const second = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}`);
+    const second = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}&device_pubkey=${TEST_DEVICE_PUBKEY}`);
     expect(second.status).toBe(410);
     expect(second.webSocket).toBeNull();
   });
@@ -24,7 +24,7 @@ describe("MUT-INV-2-no-ttl", () => {
     const sessionId = crypto.randomUUID();
     const init = await directInit(sessionId, -1); // already-expired by construction
 
-    const claim = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}`);
+    const claim = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}&device_pubkey=${TEST_DEVICE_PUBKEY}`);
     expect(claim.status).toBe(410);
   });
 });
@@ -99,12 +99,12 @@ describe("MUT-INV-4-no-throttle", () => {
 
     // 11th attempt uses the CORRECT code. If the throttle only rejected
     // wrong codes, this would succeed (101); it must not.
-    const eleventh = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}`);
+    const eleventh = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}&device_pubkey=${TEST_DEVICE_PUBKEY}`);
     expect(eleventh.status).toBe(429);
     expect(eleventh.headers.get("Retry-After")).toBe("60");
 
     // The session is now permanently dead — even a later correct attempt fails.
-    const twelfth = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}`);
+    const twelfth = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}&device_pubkey=${TEST_DEVICE_PUBKEY}`);
     expect(twelfth.status).toBe(410);
   });
 });
@@ -150,7 +150,7 @@ describe("regression: POST /session/:id/init is not reachable from a public requ
 
     // The original pairing_code was never touched — a legitimate claim
     // against it still succeeds.
-    const claim = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}`);
+    const claim = await wsUpgrade(init.session_id, `pairing_code=${init.pairing_code}&device_pubkey=${TEST_DEVICE_PUBKEY}`);
     expect(claim.status).toBe(101);
     claim.webSocket?.accept();
     claim.webSocket?.close();

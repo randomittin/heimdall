@@ -89,12 +89,19 @@ export interface ErrorResponse {
 }
 
 /**
- * Validates an envelope arriving *from* a client — hmd's `POST /frames` body
- * or a phone WebSocket message. `keepalive` is deliberately absent from the
- * accepted `type` set below: it is relay-originated only, on the one leg
- * (hmd's `GET /stream`) the relay itself writes, so accepting one inbound
- * would only widen the surface with a frame that has no meaning in that
- * direction.
+ * Structural validation only — shape, not provenance. `keepalive` is
+ * deliberately absent from the accepted `type` set below: it is
+ * relay-originated only, on the one leg (hmd's `GET /stream`) the relay itself
+ * writes, so accepting one inbound would only widen the surface with a frame
+ * that has no meaning in that direction.
+ *
+ * **This is not a leg gate on its own, and must never be used as one.** It
+ * accepts `sender: "relay"` and the two relay-originated control types, which
+ * is exactly the hole finding 1 of the 2026-09-24 security audit exploited:
+ * `webSocketMessage` used to forward anything that passed here straight into
+ * hmd's stream, so a phone could push a `sender:"relay"` `device_bound` and
+ * rebind hmd's session key to its own X25519 key. Every client-facing path
+ * goes through `isDeviceFrame` / `isHmdFrame` below instead.
  */
 export function isEnvelope(value: unknown): value is Envelope {
   if (typeof value !== "object" || value === null) return false;
@@ -112,4 +119,33 @@ export function isEnvelope(value: unknown): value is Envelope {
     (v.nonce === null || typeof v.nonce === "string") &&
     (v.ciphertext === null || typeof v.ciphertext === "string")
   );
+}
+
+/**
+ * The phone leg's gate: a frame the *device* is allowed to originate.
+ *
+ * `command` is the whole set. The app emits nothing else — `RelayTransport`
+ * has one `ws.send`, always `sender: "device"`, `type: "command"` — and
+ * `state`/`ack` are hmd's to originate, while `device_bound`/`session_ended`/
+ * `keepalive` are the relay's. A frame claiming any of those from the phone
+ * socket is a forgery attempt by definition, never a client that drifted.
+ */
+export function isDeviceFrame(value: unknown): value is Envelope {
+  if (!isEnvelope(value)) return false;
+  return value.sender === "device" && value.type === "command";
+}
+
+/**
+ * The laptop leg's gate: a frame *hmd* is allowed to originate, checked on
+ * `POST /frames`.
+ *
+ * `state` and `ack` are the set — `send_hmd_frame` in
+ * `bin/heimdall-relay-client` is the single call site on that side and passes
+ * only those two. Symmetric to `isDeviceFrame`: holding hmd's bearer token
+ * must not let a caller mint a control frame the relay itself owns, nor
+ * impersonate the device on the leg that feeds the phone.
+ */
+export function isHmdFrame(value: unknown): value is Envelope {
+  if (!isEnvelope(value)) return false;
+  return value.sender === "hmd" && (value.type === "state" || value.type === "ack");
 }

@@ -88,7 +88,7 @@ describe("mintDeviceToken / verifyDeviceToken", () => {
       role: "device",
       exp: 9_999_999_999,
     });
-    await expect(verifyDeviceToken(secret, token, "s1", 0)).resolves.toBe(true);
+    await expect(verifyDeviceToken(secret, token, "s1", 0, null)).resolves.not.toBeNull();
   });
 
   it("rejects a token checked against a different session_id", async () => {
@@ -97,7 +97,7 @@ describe("mintDeviceToken / verifyDeviceToken", () => {
       role: "device",
       exp: 9_999_999_999,
     });
-    await expect(verifyDeviceToken(secret, token, "s2", 0)).resolves.toBe(false);
+    await expect(verifyDeviceToken(secret, token, "s2", 0, null)).resolves.toBeNull();
   });
 
   it("rejects a token verified with a different secret", async () => {
@@ -106,16 +106,16 @@ describe("mintDeviceToken / verifyDeviceToken", () => {
       role: "device",
       exp: 9_999_999_999,
     });
-    await expect(verifyDeviceToken("wrong-secret", token, "s1", 0)).resolves.toBe(false);
+    await expect(verifyDeviceToken("wrong-secret", token, "s1", 0, null)).resolves.toBeNull();
   });
 
   it("rejects an expired token", async () => {
     const token = await mintDeviceToken(secret, { session_id: "s1", role: "device", exp: 1000 });
-    await expect(verifyDeviceToken(secret, token, "s1", 1_000_001 * 1000)).resolves.toBe(false);
+    await expect(verifyDeviceToken(secret, token, "s1", 1_000_001 * 1000, null)).resolves.toBeNull();
   });
 
   it("rejects a malformed token", async () => {
-    await expect(verifyDeviceToken(secret, "not-a-real-token", "s1", 0)).resolves.toBe(false);
+    await expect(verifyDeviceToken(secret, "not-a-real-token", "s1", 0, null)).resolves.toBeNull();
   });
 
   it("rejects a token with a tampered payload", async () => {
@@ -126,6 +126,6 @@ describe("mintDeviceToken / verifyDeviceToken", () => {
     });
     const [payload] = token.split(".");
     const tampered = `${payload}.not-the-real-signature`;
-    await expect(verifyDeviceToken(secret, tampered, "s1", 0)).resolves.toBe(false);
+    await expect(verifyDeviceToken(secret, tampered, "s1", 0, null)).resolves.toBeNull();
   });
 });
