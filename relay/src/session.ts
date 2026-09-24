@@ -328,7 +328,7 @@ export class SessionDO {
       return jsonResponse(400, { error: "invalid envelope" });
     }
 
-    const target = this.ctx.getWebSockets(DEVICE_TAG)[0];
+    const target = this.liveDeviceSocket();
     if (!target) {
       logEvent("frame_undelivered", {
         session_id: record.session_id,
@@ -338,6 +338,50 @@ export class SessionDO {
     }
     target.send(JSON.stringify(envelope));
     return jsonResponse(200, { ok: true, delivered: true });
+  }
+
+  /**
+   * The device socket to deliver to: one that is actually open.
+   *
+   * This used to be `getWebSockets(DEVICE_TAG)[0]`, and that index is what
+   * broke a phone that had reconnected. A phone losing Wi-Fi sends no close
+   * frame and no TCP reset, so Cloudflare keeps the old socket for as long
+   * as its own timeout takes — minutes. The phone, meanwhile, notices
+   * immediately and reconnects with `?device_token=`, which (before
+   * `supersedeDeviceSockets` below) simply *added* a second socket. Every
+   * `state` frame then went to `[0]`, the dead one, and `POST /frames`
+   * answered `delivered: true` for all of them. Reproduced live against the
+   * deployed relay on 2026-09-24: the reconnected socket sat open and silent
+   * for 22s while the superseded one took seq 3,4,5,6,7.
+   *
+   * Superseding on bind means this list holds one entry in the steady state,
+   * so this makes no assumption about `getWebSockets`' ordering (which is
+   * undocumented) — it only skips a socket that is closing or closed, which
+   * a just-superseded one briefly is.
+   */
+  private liveDeviceSocket(): WebSocket | undefined {
+    return this.ctx
+      .getWebSockets(DEVICE_TAG)
+      .find((socket) => socket.readyState === WebSocket.OPEN);
+  }
+
+  /** Ends every device socket already attached to this session, so the one
+   *  being accepted right now is the only one left. The phone leg's
+   *  counterpart to `closeHmdStream` (which `handleStream` has always called
+   *  for exactly this reason on hmd's leg): one session, one live device
+   *  socket, newest wins. Close code 4002 is deliberately distinct from
+   *  `handleRevoke`'s 4001 — this session is emphatically NOT over, and a
+   *  client that conflated the two would stop reconnecting after a routine
+   *  network change. */
+  private supersedeDeviceSockets(): void {
+    for (const socket of this.ctx.getWebSockets(DEVICE_TAG)) {
+      try {
+        socket.close(4002, "superseded");
+      } catch {
+        // Already closing or gone — either way it is not the live socket
+        // any more, which is all this needs to guarantee.
+      }
+    }
   }
 
   /** Phone leg: `GET /ws?pairing_code=...&device_pubkey=<base64url 32 bytes>`
@@ -453,6 +497,11 @@ export class SessionDO {
     bindPayload?: DeviceBoundToPhonePayload,
     hmdControlPayload?: DeviceBoundToHmdPayload
   ): Response {
+    // Newest device socket wins: whatever was attached before this bind is
+    // ended first, so `liveDeviceSocket` can never hand a frame to the
+    // socket a dropped Wi-Fi session left behind (see its doc comment).
+    this.supersedeDeviceSockets();
+
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];

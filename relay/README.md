@@ -161,6 +161,21 @@ claim also requires `&device_pubkey=<base64url, 32 bytes>` in the query string �
   phone ever sending its pubkey through an encrypted frame. Buffered (at most this one control
   frame, per session) if hmd's stream isn't open yet, and flushed as the first line the moment
   it connects.
+- **A bind supersedes the previous device socket.** Every accepted upgrade (claim *or*
+  `device_token` reconnect) first closes whatever device socket the session already had, with
+  close code **`4002` / `"superseded"`** — deliberately distinct from `/revoke`'s `4001`, since
+  the session is still very much alive and the client should go on reconnecting. One session,
+  one live device socket, newest wins. This is the phone leg's counterpart to `GET /stream`'s
+  long-standing "a reconnect closes the stream it replaces".
+
+  Why it matters: a phone that loses Wi-Fi sends no close frame and no TCP reset, so this relay
+  keeps its socket for as long as Cloudflare's own timeout takes (minutes), while the phone
+  notices in seconds and reconnects. Without superseding, the session accumulated two device
+  sockets and `POST /frames` delivered to the *older* one — the dead one — answering
+  `delivered: true` for every frame. Reproduced live on 2026-09-24 against the deployed relay:
+  the reconnected socket sat open and silent for 22s while `state` seq 3-7 went to the socket
+  the dropped Wi-Fi session had left behind. Covered by `test/worker.spec.ts`'s "device socket
+  supersede (reconnect after a network drop)" suite.
 - `400` — `device_pubkey` is missing, or doesn't decode to exactly 32 bytes (`pairing_code`
   claim only).
 - `401` — `pairing_code` doesn't match, or `device_token` is invalid/expired.
@@ -310,12 +325,21 @@ real phone client).
 - **`relay-crypto.mjs` and `envelope.mjs` are reimplementations, not imports,** of
   `src/relay/crypto.ts` and `src/relay/protocol.ts`. `crypto.ts` imports `@/relay/randomBytes` →
   `react-native-get-random-values`, unavailable in plain Node; `protocol.ts`'s inner-frame shape
-  (`{type, seq, ciphertext}`, no `nonce`/`session_id`/`sender` — direction is implicit on a
-  single persistent WebSocket) is the *phone* leg's, one level narrower than hmd's leg
-  (`Envelope`, `relay/src/types.ts:32-41` — richer because `POST /frames` and `GET /stream` are
-  separate HTTP exchanges with no persistent connection to make direction implicit).
+  is `src/relay/protocol.ts`'s own encode/decode, reimplemented.
   `relay-crypto.mjs` is verified byte-exact against the same shared fixture
   `src/relay/__tests__/vectors.test.ts` checks.
+
+  **Both legs encode the same full `Envelope`** (`relay/src/types.ts`). `protocol.ts` used to
+  emit a narrower phone-leg frame (`{type, seq, ciphertext}`, no `v`/`session_id`/`sender`/
+  `nonce`, on the reasoning that the WS URL already scopes the session and direction is
+  implicit on a 1:1 socket). The relay does not read the wire that way: `isEnvelope` requires
+  all four, so every phone-sent `command` was dropped by `webSocketMessage` before any logging,
+  and hmd's own `decodeEnvelope` would have rejected it again. Fixed 2026-09-24 — see
+  `src/relay/protocol.ts`'s header for the live evidence, and
+  `scripts/__tests__/phone-leg-interop.test.mjs` for the test that now runs the app's real
+  encoder through the relay's real validator and hmd's real decoder. `decodeRelayFrame` stays
+  deliberately lenient in the other direction; that asymmetry is what let `keepalive` ship
+  relay-side with no coordinated app release.
 - **QR printing is skipped, deliberately.** A correct QR encoder needs Reed-Solomon GF(256) ECC,
   correct finder/alignment/timing module placement, and BCH-encoded format/version info — none
   of that is achievable correctly in a small dependency-free encoder, and an incorrect QR (one
