@@ -76,6 +76,8 @@ build_sandbox() {
   ( cd "$sbx" && git init -q . ) >/dev/null 2>&1
   cp "$REAL_RUNALL" "$sbx/test/run-all.sh"
   chmod +x "$sbx/test/run-all.sh"
+  mkdir -p "$sbx/bin/lib"
+  cp "$REPO/bin/lib/hook-owned-path.sh" "$sbx/bin/lib/hook-owned-path.sh"
   printf 'tracked-a\n' > "$sbx/tracked-a.txt"
   printf 'tracked-b\n' > "$sbx/tracked-b.txt"
   cat > "$sbx/test/good-1.test.sh" <<'FIXEOF'
