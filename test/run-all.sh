@@ -66,6 +66,17 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 
+# Shared hook-owned path allowlist (_hook_owned_path below, and the receipt's own
+# tree_clean check further down, both build on this). REQUIRED, not defensive: this
+# is the one guarantee run-all.sh exists to enforce (guarantee #8, REPO INTEGRITY),
+# so a missing/broken copy must stop the sweep loudly here rather than silently
+# treat every hook-owned commit as a violation (or worse, every path as exempt).
+# shellcheck source=lib/hook-owned-path.sh
+if ! . "$REPO/bin/lib/hook-owned-path.sh" 2>/dev/null; then
+  echo "run-all.sh: missing/unreadable $REPO/bin/lib/hook-owned-path.sh -- cannot safely evaluate REPO INTEGRITY or the sweep receipt's tree_clean. Aborting." >&2
+  exit 2
+fi
+
 # ── defaults ──
 TIMEOUT=180
 MIN_SUITES=100
@@ -469,7 +480,11 @@ git -C "$REPO" stash list > "$WORK/stash-before.txt" 2>/dev/null
 # that owns it rewrites/appends to that exact path on every reply anyway, so content can't be
 # used to tell a legitimate publish from tampering apart. Only the shape is guarded.
 _hook_owned_path() {
-  printf '%s' '^(\?\?|.M|M.|A.|.A) \.planning/(ledger/(activity|verdicts|checkpoints)/haid_[^/]+\.json|ledger/collisions/[^/]+\.json|journal/[0-9]{4}-[0-9]{2}-[0-9]{2}-haid_[^/]+\.md)$'
+  # Composes the SHARED path body (bin/lib/hook-owned-path.sh, sourced above) with
+  # this call site's own git-status-code prefix. The two must produce the exact
+  # same string this function returned before extraction -- see
+  # test/tree-integrity-guard.test.sh cases 7-11, which pin this regex's behavior.
+  printf '%s' '^(\?\?|.M|M.|A.|.A) '"${HMD_HOOK_OWNED_PATH_RE}"'$'
 }
 
 # ── EXECUTE (bounded parallelism; bash 3.2 has no `wait -n`, so poll with kill -0) ─────────
@@ -1062,6 +1077,26 @@ if command -v jq >/dev/null 2>&1; then
 else
   echo "${YEL}run-all: jq not found — sweep receipt NOT written (pre-push gate will see this as no receipt)${OFF}" >&2
 fi
+
+# ── LEGACY QUALITY-GATE FLAGS — best-effort, GREEN-only ─────────────────────────────────
+# heimdall-state.json's tests_passing/dirty flags (bin/heimdall-state
+# cmd_check_quality_gates reads both these AND the receipt above) predate the sweep
+# receipt and are still checked alongside it. A green sweep genuinely means tests
+# passed on this exact tree, so record that here too -- scoped to ONLY
+# tests_passing/dirty, deliberately NOT the pre-existing `mark-clean` subcommand:
+# `mark-clean` also force-sets lint_clean=true, which this sweep has no evidence
+# for. bin/heimdall-stop-lint is the only honest writer of that flag (it runs a
+# real linter over edited files at Stop) -- reusing `mark-clean` here would
+# silently overwrite a real lint_clean=false finding with an unearned green,
+# exactly the overclaim the receipt mechanism above exists to prevent. Gated on
+# RECEIPT_RC (0 = BAD was 0 when that was computed), matching the receipt's own
+# exit_code semantics exactly. Best-effort and silent when there is no
+# heimdall-state.json in this checkout or the binary is missing -- state tracking
+# is opt-in (`hmd init` owns creating it), never a reason to fail the sweep itself.
+if [ "$RECEIPT_RC" = 0 ] && [ -x "$REPO/bin/heimdall-state" ]; then
+  ( cd "$REPO" && "$REPO/bin/heimdall-state" mark-tests-clean >/dev/null 2>&1 ) || true
+fi
+
 if [ "$BAD" -gt 0 ]; then
   if [ "$n_treeviol" -gt 0 ]; then
     echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s)/finding(s) not green, including $n_treeviol TREE INTEGRITY VIOLATION(s)."
