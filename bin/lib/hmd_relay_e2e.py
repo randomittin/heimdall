@@ -23,18 +23,17 @@ from here):
     deterministic seq-derived nonces, seq monotonicity, replay rejection,
     envelope size cap -- this module is what a caller relies on to hold them)
 
-NAMING DISCREPANCY (documented per this task's brief, not a bug)
+TAG ALIGNMENT (2026-09-24 -- resolves the naming discrepancy this section
+used to document under the old "dev\x00" device-side tag)
 INVARIANTS.md's INV-13 names the device-side nonce sender tag as the 4 bytes
-"phn" plus a trailing zero byte (as in "phone"). This module instead uses
-"hmd" / "dev" (each also plus a trailing zero byte -- see _SENDER_TAGS
-below), matching the sender strings "hmd"/"device" the relay client actually
-calls nonce_for_seq() with. The relay client is coded against THIS module's
-tags, not INV-13's example string, so this file follows the brief/client
-rather than the invariants doc's illustrative literal. What INV-13 actually
-requires -- that the two directions never share a nonce space, so a seq
-number replayed from one sender can never be mistaken for the other -- holds
-regardless of which literal 4 bytes each side uses; only the doc's example
-string is out of sync with this implementation, not the invariant itself.
+"phn" plus a trailing zero byte (as in "phone") -- see _SENDER_TAGS below.
+Earlier revisions of this module used "dev\x00" instead, reasoning that the
+relay client called nonce_for_seq() with the sender string "device" and so
+should get a "dev"-derived tag; hmdapp's own relay stack (RelayTransport,
+fake-hmd.mjs) was already shipping "phn\x00" for this exact direction, so
+that mismatch broke cross-language interop rather than being cosmetic -- two
+processes computing DIFFERENT nonces for what both call the SAME (seq,
+sender) pair. Aligned to INV-13 and hmdapp in both directions, permanently.
 
 PRIMITIVES (each implemented directly from its RFC's normative text)
   - X25519 scalar multiplication        RFC 7748 S5 (Montgomery ladder, u-only)
@@ -348,13 +347,11 @@ def _aead_mac_data(aad: bytes, ciphertext: bytes) -> bytes:
 # Nonces -- deterministic, seq-derived, direction-separated (INV-13, INV-14)
 # ─────────────────────────────────────────────────────────────────────────
 
-# See the NAMING DISCREPANCY note in the module docstring: INVARIANTS.md's
-# INV-13 names the device tag "phn\x00"; this module and the relay client
-# it serves both use "dev\x00". The invariant -- disjoint nonce spaces per
-# direction -- holds either way; only the doc's illustrative literal differs.
+# See the TAG ALIGNMENT note in the module docstring: both directions now
+# match INV-13 and hmdapp's RelayTransport/fake-hmd.mjs exactly.
 _SENDER_TAGS = {
     "hmd": b"hmd\x00",
-    "device": b"dev\x00",
+    "device": b"phn\x00",
 }
 
 
