@@ -40,7 +40,7 @@
 // no write access to fix.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { x25519 } from '@noble/curves/ed25519.js';
@@ -48,6 +48,7 @@ import { x25519 } from '@noble/curves/ed25519.js';
 import { deriveSessionKey, seal, open } from '../lib/relay-crypto.mjs';
 import { buildDisplayNonce, base64Decode } from '../lib/envelope.mjs';
 import {
+  decodeStateFramePlaintext,
   encodeEncryptedFrame,
   encodeSendMessageCommand,
   base64UrlEncode,
@@ -282,6 +283,98 @@ except Exception as e:
     assert.ok(ciphertext, 'heimdall returned a ciphertext that is not valid base64');
     const plaintext = open(HMD_KEY, 'hmd', { seq, ciphertext }, 0);
     assert.deepEqual(JSON.parse(Buffer.from(plaintext).toString('utf8')), statePayload);
+  }
+);
+
+test(
+  "the app's state-frame parser accepts a REAL-shape state frame sealed by heimdall's real client",
+  { skip: skipReason },
+  () => {
+    // The test above proves only that the bytes survive the crypto. It never
+    // asked whether the app could USE what comes out -- which is exactly how
+    // the 2026-09-24 live session shipped: heimdall's client sealed the
+    // contract's `{"state": ...}` wrapper (bin/heimdall-relay-client's
+    // `send_hmd_frame("state", {"state": state})`), every frame delivered and
+    // decrypted on the phone, and the app rendered an entirely empty state
+    // because it handed the wrapper to `parseState` unopened.
+    //
+    // This case closes that gap end to end: the payload is the real captured
+    // /api/state (docs/samples/state-real-hmdapp.json, content scrubbed,
+    // shape and ~103 KB scale preserved), sealed by heimdall's OWN python
+    // crypto, opened by the app's crypto, and read by the app's OWN
+    // `decodeStateFramePlaintext` -- the function that was missing. The
+    // assertion is byte-level fidelity of the /api/state object, so a
+    // re-divergence on either side goes red here before it reaches a phone.
+    const seq = 4;
+    const sampleText = readFileSync(
+      path.join(import.meta.dirname, '../../../docs/samples/state-real-hmdapp.json'),
+      'utf8'
+    );
+    const realState = JSON.parse(sampleText);
+    // Exactly what bin/heimdall-relay-client's _tick_once builds.
+    const statePayload = { state: realState };
+
+    const script = `${IMPORT_E2E}
+import sys
+key = bytes.fromhex(${JSON.stringify(Buffer.from(HMD_KEY).toString('hex'))})
+seq = ${JSON.stringify(seq)}
+plaintext_obj = json.loads(sys.stdin.read())
+# Byte-for-byte the serialization send_hmd_frame uses before sealing.
+plaintext = json.dumps(plaintext_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+try:
+    nonce_b64, ciphertext_b64 = E2E.seal(key, seq, "hmd", plaintext)
+    print(json.dumps({"ok": True, "nonce_b64": nonce_b64, "ciphertext_b64": ciphertext_b64,
+                      "plaintext_bytes": len(plaintext)}))
+except Exception as e:
+    print(json.dumps({"ok": False, "error": str(e), "errorType": type(e).__name__}))
+`;
+    // The driver reads the payload from stdin, so the sealed script itself
+    // stays small no matter how large the captured state grows.
+    const res = spawnSync('python3', ['-c', script], {
+      input: JSON.stringify(statePayload),
+      cwd: HEIMDALL_DIR,
+      encoding: 'utf8',
+      timeout: 30000,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    assert.ok(!res.error, `python3 spawn failed: ${res.error?.message}`);
+    const result = JSON.parse(res.stdout.trim().split('\n').filter(Boolean).pop());
+    assert.equal(result.ok, true, `heimdall's seal raised on a real-size state frame: ${result.error}`);
+
+    // Real /api/state is ~100 KB+ -- far past the 128 KiB cap that silently
+    // dropped every frame before MAX_ENVELOPE_BYTES became 1 MiB, so this
+    // also pins that the current cap admits a real payload.
+    assert.ok(
+      result.plaintext_bytes > 100000,
+      `fixture too small to be representative (${result.plaintext_bytes} bytes) -- ` +
+        'a real /api/state for this repo is ~103 KB'
+    );
+
+    const ciphertext = base64Decode(result.ciphertext_b64);
+    assert.ok(ciphertext, 'heimdall returned a ciphertext that is not valid base64');
+    const plaintext = open(HMD_KEY, 'hmd', { seq, ciphertext }, 0);
+
+    const decoded = decodeStateFramePlaintext(plaintext);
+    assert.equal(
+      decoded.ok,
+      true,
+      `the app's decodeStateFramePlaintext rejected heimdall's real state frame: ${decoded.error}`
+    );
+    assert.deepEqual(
+      decoded.state,
+      realState,
+      "the app unwrapped heimdall's state frame to something other than the /api/state object"
+    );
+    // The precise failure mode of the live bug: the wrapper reaching the app
+    // still carrying its `state` key means parseState would read every
+    // contract field off the wrapper and default all of them.
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(decoded.state, 'state'),
+      'the wrapper was not unwrapped -- parseState would default every field of this'
+    );
+    assert.equal(decoded.state.repo, realState.repo);
+    assert.equal(decoded.state.panels.length, realState.panels.length);
   }
 );
 

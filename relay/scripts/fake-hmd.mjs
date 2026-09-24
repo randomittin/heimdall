@@ -447,8 +447,25 @@ async function main() {
     }
   }
 
+  // The `state` frame plaintext is the contract's WRAPPER --
+  // `{"state": <the object /api/state serves>}`
+  // (docs/RELAY-CLIENT-CONTRACT.md §4, docs/HANDOFF-TO-HEIMDALL-relay.md's
+  // client section), which is what heimdall's real client seals in
+  // `send_hmd_frame("state", {"state": state})`.
+  //
+  // This script sent the bare `--state` file instead, and since
+  // docs/HANDOFF-TO-HEIMDALL-relay.md names it the reference implementation
+  // heimdall's client "should mirror", that divergence is what taught the
+  // app to expect a flat payload -- so a phone driven by this script
+  // rendered perfectly while a phone driven by real hmd rendered an empty
+  // state (2026-09-24). Wrapping here makes the reference actually
+  // reference-grade; the app accepts both shapes
+  // (`decodeStateFramePlaintext`), so an older copy of this script still
+  // works against a current app.
+  const stateFramePlaintext = JSON.stringify({ state: JSON.parse(stateJsonText) });
+
   function sendState() {
-    return enqueueSend(() => sendEnvelope('state', new TextEncoder().encode(stateJsonText)));
+    return enqueueSend(() => sendEnvelope('state', new TextEncoder().encode(stateFramePlaintext)));
   }
 
   function sendAck(ofSeq, ok, detail) {
