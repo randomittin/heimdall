@@ -75,6 +75,7 @@ Commands:
   check-quality-gates           Exit 0 if all gates pass, exit 2 if not
   mark-dirty                    Mark tests as needing re-run
   mark-clean                    Mark all quality gates as passing
+  mark-tests-clean              Mark only tests_passing=true/dirty=false (leaves lint_clean alone)
   add-agent <id> <type>         Track an agent in agent_history
   add-tokens <count>            Add tokens to budget tracker (warns if over limit)
   set-budget <limit>            Set token budget limit
@@ -242,11 +243,54 @@ cmd_check_quality_gates() {
       r_sha=$(jq -r '.head_sha // empty' "$receipt")
       r_clean=$(jq -r '.tree_clean // false' "$receipt")
       r_rc=$(jq -r 'if (.exit_code|type)=="number" then .exit_code else -1 end' "$receipt")
+      # sha_stale is computed FIRST, separately from the message-priority chain
+      # below, so that a hook-owned-only exemption (sha_stale stays empty) still
+      # falls through to the r_clean/r_rc checks -- an old receipt that was itself
+      # dirty or failing must not be waved through just because the only commits
+      # since it ran happen to be hook-owned.
+      local sha_stale=""
+      if [ -z "$r_sha" ]; then
+        sha_stale="receipt HEAD <none> != current HEAD ${cur_sha:-<none>} (commits landed since the sweep ran)"
+      elif [ "$r_sha" != "$cur_sha" ]; then
+        # A commit landed after the receipt. Before crying STALE, ask: is every
+        # changed path one this repo's OWN hooks write (journal entries, ledger
+        # activity/verdicts/checkpoints/collisions records)? If so, nothing a
+        # human or an agent wrote changed -- the receipt still describes the code
+        # that would be pushed, so treat it as fresh (with a visible notice, never
+        # silently). Any non-hook-owned path anywhere in the range still means
+        # STALE, exactly as before. See bin/lib/hook-owned-path.sh for the shared
+        # rule (the same one test/run-all.sh's tree-integrity guard uses) and
+        # test/sweep-receipt-gate.test.sh section K for the falsifying cases.
+        local stale_reason changed_paths non_hook_paths shown hook_n hook_classes
+        stale_reason=""
+        if ! git -C "$sweep_repo" merge-base --is-ancestor "$r_sha" "$cur_sha" 2>/dev/null; then
+          stale_reason="receipt HEAD is not an ancestor of current HEAD -- history was rewritten since the sweep ran"
+        elif ! command -v hmd_hook_owned_path >/dev/null 2>&1; then
+          stale_reason="commits landed since the sweep ran"
+        else
+          changed_paths="$(git -C "$sweep_repo" diff --name-only "$r_sha" "$cur_sha" 2>/dev/null || true)"
+          non_hook_paths="$(printf '%s\n' "$changed_paths" | sed '/^$/d' | grep -Ev "^${HMD_HOOK_OWNED_PATH_RE}\$" 2>/dev/null || true)"
+          if [ -n "$non_hook_paths" ]; then
+            shown="$(printf '%s\n' "$non_hook_paths" | head -3 | paste -sd, - 2>/dev/null || true)"
+            stale_reason="commits landed since the sweep ran, including non-hook-owned paths: ${shown}"
+          else
+            hook_n="$(git -C "$sweep_repo" rev-list --count "$r_sha..$cur_sha" 2>/dev/null || true)"
+            [ -n "$hook_n" ] || hook_n="?"
+            hook_classes="$(printf '%s\n' "$changed_paths" | sed '/^$/d' \
+              | grep -Eo '^\.planning/(journal|ledger/[a-z]+)/' 2>/dev/null \
+              | sed -E 's#^\.planning/##; s#/$##' | sort -u | paste -sd, - 2>/dev/null || true)"
+            [ -n "$hook_classes" ] || hook_classes="none (empty commit)"
+            echo "NOTICE: sweep receipt HEAD is behind current HEAD by ${hook_n} commit(s), but every changed path is hook-owned (${hook_classes}) -- receipt still treated as fresh." >&2
+          fi
+        fi
+        [ -n "$stale_reason" ] && sha_stale="receipt HEAD ${r_sha} != current HEAD ${cur_sha} (${stale_reason})"
+      fi
+
       if [ -n "$r_repo" ] && [ "$r_repo" != "$sweep_repo" ]; then
         echo "GATE FAILED: sweep receipt at $receipt was recorded for a different repo ($r_repo, this checkout is $sweep_repo). Run: bash test/run-all.sh" >&2
         failed=1
-      elif [ -z "$r_sha" ] || [ "$r_sha" != "$cur_sha" ]; then
-        echo "GATE FAILED: sweep receipt is STALE — receipt HEAD ${r_sha:-<none>} != current HEAD ${cur_sha:-<none>} (commits landed since the sweep ran). Run: bash test/run-all.sh" >&2
+      elif [ -n "$sha_stale" ]; then
+        echo "GATE FAILED: sweep receipt is STALE — ${sha_stale}. Run: bash test/run-all.sh" >&2
         failed=1
       elif [ "$r_clean" != "true" ]; then
         echo "GATE FAILED: sweep receipt recorded a DIRTY tree — its green does not describe what would be pushed. Commit or stash, then run: bash test/run-all.sh" >&2
@@ -280,6 +324,22 @@ cmd_mark_clean() {
   local tmp
   tmp=$(mktemp)
   jq '.quality_gates.dirty = false | .quality_gates.tests_passing = true | .quality_gates.lint_clean = true' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  release_lock
+}
+
+cmd_mark_tests_clean() {
+  # Narrower than mark-clean on purpose: a green test/run-all.sh sweep is evidence
+  # that tests passed and the tree was clean at that moment (tests_passing, dirty)
+  # -- it is NOT evidence about lint, which bin/heimdall-stop-lint alone actually
+  # runs and owns. mark-clean's blanket lint_clean=true is exactly the no-evidence
+  # overclaim the sweep-receipt mechanism in cmd_check_quality_gates exists to
+  # prevent; reusing it here from test/run-all.sh would silently paper over a real
+  # lint_clean=false finding with an unearned green on every sweep.
+  ensure_state
+  acquire_lock
+  local tmp
+  tmp=$(mktemp)
+  jq '.quality_gates.dirty = false | .quality_gates.tests_passing = true' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
   release_lock
 }
 
@@ -549,6 +609,7 @@ case "${1:-}" in
   check-quality-gates) cmd_check_quality_gates ;;
   mark-dirty)         cmd_mark_dirty ;;
   mark-clean)         cmd_mark_clean ;;
+  mark-tests-clean)   cmd_mark_tests_clean ;;
   add-agent)          cmd_add_agent "${2:-}" "${3:-}" ;;
   add-tokens)         cmd_add_tokens "${2:-}" ;;
   set-budget)         cmd_set_budget "${2:-}" ;;

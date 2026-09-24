@@ -66,6 +66,8 @@ PW="$WORK/repo"
 mkdir -p "$PW/test"
 ( cd "$PW" && git init -q && git config user.email dev@example.com && git config user.name Dev )
 cp "$RUN_ALL" "$PW/test/run-all.sh"
+mkdir -p "$PW/bin/lib"
+cp "$ROOT/bin/lib/hook-owned-path.sh" "$PW/bin/lib/hook-owned-path.sh"
 
 for n in a b c d e; do
   cat > "$PW/test/${n}-fast.test.sh" <<'EOF'
