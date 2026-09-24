@@ -23,6 +23,13 @@ export default defineConfig({
         // respectively (see README.md), never from this file.
         bindings: {
           RELAY_SIGNING_SECRET: "test-only-relay-signing-secret-not-real",
+          // src/session.ts's KEEPALIVE_INTERVAL_MS default is 20s — far
+          // longer than a test should sit waiting. The Workers runtime
+          // gives no hook to advance its own timers (vitest's fake timers
+          // don't reach workerd's event loop), so the interval is a real
+          // binding and the suite drives it at 1s instead. Production and
+          // local dev declare no such binding and run on the 20s default.
+          RELAY_KEEPALIVE_MS: "1000",
         },
       },
     }),

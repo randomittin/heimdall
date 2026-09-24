@@ -30,8 +30,14 @@ const SENDER_TAG_BYTES = {
 };
 
 const FRAME_SENDERS = new Set(['hmd', 'device', 'relay']);
-const FRAME_TYPES = new Set(['state', 'command', 'ack', 'device_bound', 'session_ended']);
+const FRAME_TYPES = new Set(['state', 'command', 'ack', 'device_bound', 'session_ended', 'keepalive']);
 const ENCRYPTED_TYPES = new Set(['state', 'command', 'ack']);
+// Relay-originated, unencrypted, `payload`-carrying frames (relay/src/types.ts's
+// FrameType). `keepalive` joined this set when the relay started writing one
+// down an idle hmd stream -- decoding it as a control frame (rather than
+// letting it fall through to `null`) is what keeps a caller from logging a
+// "malformed stream line" every interval.
+const CONTROL_TYPES = new Set(['device_bound', 'session_ended', 'keepalive']);
 
 // Standard base64 (with padding): groups of 4 chars, optional trailing
 // `=`/`==` on the final group only -- matches relayPayload.ts's
@@ -120,7 +126,7 @@ export function decodeEnvelope(line) {
   if (!FRAME_SENDERS.has(sender)) return null;
   if (!FRAME_TYPES.has(type)) return null;
 
-  if (type === 'device_bound' || type === 'session_ended') {
+  if (CONTROL_TYPES.has(type)) {
     const { payload } = parsed;
     if (payload !== undefined && (typeof payload !== 'object' || payload === null || Array.isArray(payload))) {
       return null;

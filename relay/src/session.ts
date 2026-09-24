@@ -7,7 +7,12 @@
 // through byte-identical; only the two relay-originated control frame types
 // (`device_bound`, `session_ended`) carry a plaintext `payload`.
 
-import type { Env, DeviceBoundToPhonePayload, DeviceBoundToHmdPayload } from "./types";
+import type {
+  Env,
+  DeviceBoundToPhonePayload,
+  DeviceBoundToHmdPayload,
+  KeepalivePayload,
+} from "./types";
 import { isEnvelope } from "./types";
 import {
   jsonResponse,
@@ -43,6 +48,24 @@ interface SessionRecord {
 const DEVICE_TAG = "device";
 const DEVICE_PUBKEY_BYTES = 32;
 
+/**
+ * How long hmd's `GET /stream` may sit idle before the relay writes a
+ * `keepalive` control frame down it.
+ *
+ * Cloudflare closes a long-lived chunked response that carries no bytes:
+ * observed live on 2026-09-24, a stream that opened at 08:33:53 with a bound
+ * phone and no traffic after was closed server-side at 08:38:54 — 5m01s. A
+ * session is mostly idle by nature (hmd only sends `state` on a digest
+ * change, INV-22), so without this the steady state is a stream that dies
+ * every five minutes. 20s leaves generous headroom under any such cap while
+ * costing ~4 KiB/hour of otherwise-empty stream.
+ *
+ * This is belt, not braces: the client still reconnects with backoff if the
+ * stream is cut anyway (relay/scripts/fake-hmd.mjs, and the same contract
+ * handed to hmd in docs/HANDOFF-TO-HEIMDALL-relay.md).
+ */
+const KEEPALIVE_INTERVAL_MS = 20_000;
+
 /** Fail-closed: a malformed (non-base64) value must 400, never throw past
  * this boundary and crash the isolate — base64UrlDecode's atob call throws
  * on invalid input, and this is attacker-controlled query-string data. */
@@ -62,6 +85,18 @@ export class SessionDO {
   // more than one, since a session binds at most once (handleDeviceTokenClaim's
   // reconnect path never calls deliverToHmdStream again).
   private pendingHmdControlFrame: string | null = null;
+  // Bumped once per `GET /stream`, so a stream's own `cancel()` can tell
+  // whether it is still the live one before tearing down shared state — a
+  // reconnect installs its controller before the superseded stream's cancel
+  // runs. Same generation guard as src/transport/RelayTransport.ts's
+  // `gen !== this.generation` check on its socket callbacks.
+  private hmdStreamGeneration = 0;
+  private keepaliveTimer: ReturnType<typeof setTimeout> | null = null;
+  // The session id from the last record read or written. The keepalive timer
+  // fires outside any request and still has to stamp `session_id` on the
+  // frame it writes; caching it here keeps that path free of a storage read
+  // it cannot await synchronously.
+  private cachedSessionId: string | null = null;
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -87,11 +122,96 @@ export class SessionDO {
   }
 
   private async loadRecord(): Promise<SessionRecord | undefined> {
-    return this.ctx.storage.get<SessionRecord>("state");
+    const record = await this.ctx.storage.get<SessionRecord>("state");
+    if (record) this.cachedSessionId = record.session_id;
+    return record;
   }
 
   private async saveRecord(record: SessionRecord): Promise<void> {
+    this.cachedSessionId = record.session_id;
     await this.ctx.storage.put("state", record);
+  }
+
+  /** Milliseconds of stream idleness before the next `keepalive`. Falls back
+   * to the compiled-in default for an absent or nonsensical binding rather
+   * than trusting a value that would disable the keepalive entirely. */
+  private keepaliveIntervalMs(): number {
+    const raw = this.env.RELAY_KEEPALIVE_MS;
+    if (raw === undefined) return KEEPALIVE_INTERVAL_MS;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) return KEEPALIVE_INTERVAL_MS;
+    return parsed;
+  }
+
+  /** The single writer for hmd's `GET /stream`. Returns false when the line
+   * could not be delivered: no stream open, or a controller the runtime has
+   * already torn down. That second case is the real one — Cloudflare can
+   * close a long-lived chunked response without the stream's `cancel()` ever
+   * running, leaving a controller whose `enqueue` throws; before this, that
+   * throw escaped `webSocketMessage` and took the phone's frame with it. A
+   * failed write drops the stale controller so the next `/stream` starts
+   * clean, and deliberately does not re-arm the keepalive (nothing to write
+   * to). A successful one restarts the idle timer, so a stream carrying real
+   * frames never pays for a keepalive it does not need. */
+  private writeToHmdStream(line: string): boolean {
+    const controller = this.hmdStreamController;
+    if (!controller) return false;
+    try {
+      controller.enqueue(new TextEncoder().encode(line));
+    } catch {
+      this.hmdStreamController = null;
+      this.clearKeepalive();
+      return false;
+    }
+    this.armKeepalive();
+    return true;
+  }
+
+  /** Ends hmd's current `GET /stream` response, if any, and stops its
+   * keepalive. Called when a reconnect supersedes an older stream and on
+   * revoke — never on an ordinary drop, which leaves the session intact. */
+  private closeHmdStream(): void {
+    const controller = this.hmdStreamController;
+    this.hmdStreamController = null;
+    this.clearKeepalive();
+    if (!controller) return;
+    try {
+      controller.close();
+    } catch {
+      // Already closed or errored (client gone, or a runtime-side
+      // teardown) — the stream is over either way.
+    }
+  }
+
+  /** (Re)starts the idle timer that writes the next `keepalive`. A no-op
+   * with no stream open, which is also what ends the chain: the timer
+   * re-arms only via `writeToHmdStream`, and only on a write that landed. */
+  private armKeepalive(): void {
+    this.clearKeepalive();
+    const sessionId = this.cachedSessionId;
+    if (!this.hmdStreamController || sessionId === null) return;
+    this.keepaliveTimer = setTimeout(() => {
+      this.keepaliveTimer = null;
+      const payload: KeepalivePayload = { ts: Math.floor(Date.now() / 1000) };
+      this.writeToHmdStream(
+        JSON.stringify({
+          v: 1,
+          session_id: sessionId,
+          seq: 0,
+          sender: "relay",
+          type: "keepalive",
+          nonce: null,
+          ciphertext: null,
+          payload,
+        }) + "\n"
+      );
+    }, this.keepaliveIntervalMs());
+  }
+
+  private clearKeepalive(): void {
+    if (this.keepaliveTimer === null) return;
+    clearTimeout(this.keepaliveTimer);
+    this.keepaliveTimer = null;
   }
 
   private checkBearer(request: Request, record: SessionRecord): boolean {
@@ -134,7 +254,15 @@ export class SessionDO {
   }
 
   /** hmd's laptop leg: long-lived chunked-HTTP GET carrying newline-delimited
-   * JSON envelopes (device-originated `command` frames) up to hmd. */
+   * JSON envelopes (device-originated `command` frames) up to hmd.
+   *
+   * Reopening this is routine, not exceptional: the stream is expected to be
+   * cut periodically (see KEEPALIVE_INTERVAL_MS) and hmd reconnects with
+   * backoff. A reconnect supersedes whatever stream was open before — that
+   * one is closed here rather than left as a ReadableStream nobody will read
+   * or finish. Dropping this leg never touches the session: the phone stays
+   * bound and connected, and only `POST /revoke` (or pairing expiry before a
+   * bind) ends things. */
   private async handleStream(request: Request): Promise<Response> {
     const record = await this.loadRecord();
     if (!record) return jsonResponse(404, { error: "session not found" });
@@ -142,17 +270,27 @@ export class SessionDO {
       return jsonResponse(401, { error: "missing or invalid bearer token" });
     }
 
+    this.closeHmdStream();
+
     const owner = this;
+    const generation = ++this.hmdStreamGeneration;
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         owner.hmdStreamController = controller;
-        if (owner.pendingHmdControlFrame !== null) {
-          controller.enqueue(new TextEncoder().encode(owner.pendingHmdControlFrame));
+        const pending = owner.pendingHmdControlFrame;
+        if (pending !== null) {
           owner.pendingHmdControlFrame = null;
+          if (!owner.writeToHmdStream(pending)) owner.pendingHmdControlFrame = pending;
         }
+        owner.armKeepalive();
       },
       cancel() {
+        // Only tear down if this is still the live stream — a newer
+        // /stream may already have replaced it, and the superseded
+        // stream's cancel runs after that swap.
+        if (owner.hmdStreamGeneration !== generation) return;
         owner.hmdStreamController = null;
+        owner.clearKeepalive();
       },
     });
     return new Response(stream, {
@@ -359,9 +497,7 @@ export class SessionDO {
         ciphertext: null,
         payload,
       }) + "\n";
-    if (this.hmdStreamController) {
-      this.hmdStreamController.enqueue(new TextEncoder().encode(line));
-    } else {
+    if (!this.writeToHmdStream(line)) {
       this.pendingHmdControlFrame = line;
     }
   }
@@ -402,18 +538,11 @@ export class SessionDO {
     }
 
     // hmd's GET /stream leg (handleStream, above) is a long-lived response
-    // this Durable Object otherwise never ends on its own — only the client
-    // aborting ever closed it. A revoked session is fully over, so end that
-    // side too instead of leaving it open indefinitely with nothing left to
-    // ever write to it.
-    if (this.hmdStreamController) {
-      try {
-        this.hmdStreamController.close();
-      } catch {
-        // Already closed/errored (e.g. client already disconnected) — no-op.
-      }
-      this.hmdStreamController = null;
-    }
+    // this Durable Object otherwise never ends on its own. A revoked session
+    // is fully over — this is the ONLY path that ends it deliberately, and
+    // the only one that stops the keepalive for good. An ordinary stream
+    // drop must never come through here: hmd is expected back.
+    this.closeHmdStream();
 
     return jsonResponse(200, { ok: true });
   }
@@ -428,12 +557,14 @@ export class SessionDO {
     }
     if (!isEnvelope(envelope)) return;
 
-    if (this.hmdStreamController) {
-      this.hmdStreamController.enqueue(
-        new TextEncoder().encode(JSON.stringify(envelope) + "\n")
-      );
-      return;
-    }
+    if (this.writeToHmdStream(JSON.stringify(envelope) + "\n")) return;
+
+    // hmd's stream is down (mid-reconnect, or gone). The frame is dropped,
+    // not queued — the same fire-once semantics `POST /frames` reports as
+    // `delivered: false` when the phone is absent (relay/README.md's "no
+    // persisted frame buffering"). The phone's own `ack` timeout is what
+    // surfaces this to the operator (INV-28); the relay does not invent a
+    // retry path it has no test for.
     const record = await this.loadRecord();
     logEvent("frame_undelivered", {
       session_id: record?.session_id ?? "unknown",

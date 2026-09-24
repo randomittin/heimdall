@@ -69,6 +69,44 @@ function nextCloseCode(socket: WebSocket): Promise<number> {
   });
 }
 
+/** One NDJSON chunk off hmd's stream, parsed. Every write the Durable
+ *  Object makes is a single enqueue of exactly one line, so a chunk is a
+ *  frame — except when the runtime coalesces two, which `readDataFrame`
+ *  below handles by splitting. */
+async function readLine(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): Promise<Record<string, unknown>> {
+  const { value } = await reader.read();
+  if (!value) throw new Error("expected stream bytes");
+  return JSON.parse(new TextDecoder().decode(value).trim());
+}
+
+/** Reads past any `keepalive` control frames to the next real frame — the
+ *  keepalive cadence is wall-clock, so any test that holds a stream open
+ *  across several awaits could otherwise see one interleaved. */
+async function readDataFrame(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): Promise<Record<string, unknown>> {
+  for (;;) {
+    const { value } = await reader.read();
+    if (!value) throw new Error("expected stream bytes");
+    const lines = new TextDecoder()
+      .decode(value)
+      .split("\n")
+      .filter((line) => line.trim().length > 0);
+    for (const line of lines) {
+      const frame = JSON.parse(line) as Record<string, unknown>;
+      if (frame.type !== "keepalive") return frame;
+    }
+  }
+}
+
+function openHmdStream(sessionId: string, token: string): Promise<Response> {
+  return SELF.fetch(`${BASE}/session/${sessionId}/stream`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 function makeEnvelope(overrides: Partial<Envelope> & Pick<Envelope, "session_id">): Envelope {
   return {
     v: 1,
@@ -439,6 +477,191 @@ describe("revoke", () => {
     );
     expect(claimAfterRevoke.status).toBe(410);
   });
+});
+
+// Observed live on 2026-09-24 against https://hmd-relay.therishabh16.workers.dev:
+// hmd's GET /stream opened at 08:33:53, the phone bound, state frames flowed,
+// and at 08:38:54 — 5m01s later, with the stream idle in between — Cloudflare
+// closed the response body. The three tests below pin the two halves of the
+// fix: bytes keep flowing so an idle stream is never cut, and if it is cut
+// anyway the session (and the phone's socket) outlive it.
+describe("stream lifetime", () => {
+  const keepaliveMs = Number(
+    (env as unknown as { RELAY_KEEPALIVE_MS?: string }).RELAY_KEEPALIVE_MS ?? ""
+  );
+
+  it("is configured with a test-scale keepalive interval", () => {
+    // Guards the two timing tests below: without the vitest.config.ts
+    // binding they would silently wait on the 20s production default and
+    // fail as a timeout, which reads like a broken keepalive rather than a
+    // broken test setup.
+    expect(Number.isFinite(keepaliveMs)).toBe(true);
+    expect(keepaliveMs).toBeGreaterThan(0);
+  });
+
+  it("emits a keepalive control frame on an otherwise-idle hmd stream", async () => {
+    const init = await pairInit();
+    const streamRes = await openHmdStream(init.session_id, init.relay_session_token);
+    expect(streamRes.status).toBe(200);
+    const reader = streamRes.body?.getReader();
+    if (!reader) throw new Error("expected a readable stream body");
+
+    // Nothing else is ever written to this stream: no device claimed, no
+    // frame posted. The only line that can arrive is the keepalive.
+    const frame = await readLine(reader);
+    expect(frame.type).toBe("keepalive");
+    expect(frame.sender).toBe("relay");
+    expect(frame.session_id).toBe(init.session_id);
+    expect(frame.nonce).toBeNull();
+    expect(frame.ciphertext).toBeNull();
+    expect(typeof (frame.payload as { ts: unknown }).ts).toBe("number");
+
+    await reader.cancel();
+  }, 15_000);
+
+  it("keeps exactly one keepalive timer alive when hmd reconnects its stream", async () => {
+    const init = await pairInit();
+    const first = await openHmdStream(init.session_id, init.relay_session_token);
+    const firstReader = first.body?.getReader();
+    if (!firstReader) throw new Error("expected a readable stream body");
+    await firstReader.cancel();
+
+    const second = await openHmdStream(init.session_id, init.relay_session_token);
+    const secondReader = second.body?.getReader();
+    if (!secondReader) throw new Error("expected a readable stream body");
+
+    // Over 2.6 intervals a single live timer writes 2 keepalives. A timer
+    // left running by the first stream (the failure mode of a setInterval
+    // captured in the stream's own start() closure) would double that.
+    const deadline = Date.now() + keepaliveMs * 2.6;
+    let keepalives = 0;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const chunk = await Promise.race([
+        secondReader.read().then(({ value }) => (value ? new TextDecoder().decode(value) : null)),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), remaining)),
+      ]);
+      if (chunk === null) break;
+      keepalives += chunk.split("\n").filter((line) => line.trim().length > 0).length;
+    }
+    expect(keepalives).toBeGreaterThanOrEqual(2);
+    expect(keepalives).toBeLessThanOrEqual(3);
+
+    await secondReader.cancel();
+  }, 20_000);
+
+  it("keeps the session and the phone's websocket alive when hmd's stream drops", async () => {
+    const init = await pairInit();
+    const { socket } = await claimDevice(init.session_id, init.pairing_code);
+    await nextMessage(socket); // consume the device_bound control frame
+
+    const first = await openHmdStream(init.session_id, init.relay_session_token);
+    expect(first.status).toBe(200);
+    const firstReader = first.body?.getReader();
+    if (!firstReader) throw new Error("expected a readable stream body");
+    await readDataFrame(firstReader); // the buffered device_bound
+
+    let phoneCloseCode: number | null = null;
+    socket.addEventListener("close", (event) => {
+      phoneCloseCode = (event as unknown as { code: number }).code;
+    });
+
+    // hmd's leg goes away — the Cloudflare idle-close, or a laptop lid.
+    await firstReader.cancel();
+
+    // The session is still bound: hmd reopens its stream (same bearer, no
+    // re-pair) and traffic resumes in both directions.
+    const second = await openHmdStream(init.session_id, init.relay_session_token);
+    expect(second.status).toBe(200);
+    const secondReader = second.body?.getReader();
+    if (!secondReader) throw new Error("expected a readable stream body");
+
+    const nextFrame = nextMessage(socket);
+    const framesRes = await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({ session_id: init.session_id, ciphertext: "state-after-hmd-stream-drop" })
+    );
+    expect(framesRes.status).toBe(200);
+    expect(await framesRes.json()).toEqual({ ok: true, delivered: true });
+    expect((await nextFrame).ciphertext).toBe("state-after-hmd-stream-drop");
+
+    socket.send(
+      JSON.stringify(
+        makeEnvelope({
+          session_id: init.session_id,
+          sender: "device",
+          type: "command",
+          seq: 2,
+          ciphertext: "command-after-hmd-stream-drop",
+        })
+      )
+    );
+    const forwarded = await readDataFrame(secondReader);
+    expect(forwarded.ciphertext).toBe("command-after-hmd-stream-drop");
+
+    // No session_ended was pushed and the socket was never closed: only
+    // POST /revoke ends a bound session.
+    expect(phoneCloseCode).toBeNull();
+
+    // And the pairing code stays spent rather than the session reverting
+    // to claimable — status is still "bound", not "pending" or "ended".
+    const reclaim = await SELF.fetch(
+      wsUrl(init.session_id, `pairing_code=${init.pairing_code}&device_pubkey=${TEST_DEVICE_PUBKEY}`),
+      { headers: { Upgrade: "websocket" } }
+    );
+    expect(reclaim.status).toBe(410);
+
+    await secondReader.cancel();
+  }, 15_000);
+
+  it("still delivers a phone frame after a stale hmd stream, once hmd reconnects", async () => {
+    const init = await pairInit();
+    const { socket } = await claimDevice(init.session_id, init.pairing_code);
+    await nextMessage(socket); // consume the device_bound control frame
+
+    const first = await openHmdStream(init.session_id, init.relay_session_token);
+    const firstReader = first.body?.getReader();
+    if (!firstReader) throw new Error("expected a readable stream body");
+    await readDataFrame(firstReader); // the buffered device_bound
+    await firstReader.cancel();
+
+    // A phone frame sent while hmd is away is not delivered and not
+    // buffered (relay/README.md's "no persisted frame buffering"), and
+    // must not poison the next stream.
+    socket.send(
+      JSON.stringify(
+        makeEnvelope({
+          session_id: init.session_id,
+          sender: "device",
+          type: "command",
+          seq: 3,
+          ciphertext: "command-while-hmd-away",
+        })
+      )
+    );
+
+    const second = await openHmdStream(init.session_id, init.relay_session_token);
+    const secondReader = second.body?.getReader();
+    if (!secondReader) throw new Error("expected a readable stream body");
+
+    socket.send(
+      JSON.stringify(
+        makeEnvelope({
+          session_id: init.session_id,
+          sender: "device",
+          type: "command",
+          seq: 4,
+          ciphertext: "command-after-reconnect",
+        })
+      )
+    );
+    const forwarded = await readDataFrame(secondReader);
+    expect(forwarded.ciphertext).toBe("command-after-reconnect");
+
+    await secondReader.cancel();
+  }, 15_000);
 });
 
 describe("session id validation", () => {

@@ -8,6 +8,13 @@
 export interface Env {
   SESSION: DurableObjectNamespace;
   RELAY_SIGNING_SECRET: string;
+  /** Optional override, in milliseconds, for how long hmd's `GET /stream`
+   *  may sit idle before the relay writes a `keepalive` control frame
+   *  (src/session.ts's KEEPALIVE_INTERVAL_MS). Declared nowhere in
+   *  wrangler.toml — production and `wrangler dev` run on the code default;
+   *  only the vitest suite binds it (vitest.config.ts), so the interval is
+   *  observable inside a test's lifetime. Not a secret. */
+  RELAY_KEEPALIVE_MS?: string;
 }
 
 /** "relay" is not in the spec's sender enum — it is used only for the two
@@ -19,15 +26,16 @@ export type FrameType =
   | "command"
   | "ack"
   | "device_bound"
-  | "session_ended";
+  | "session_ended"
+  | "keepalive";
 
 /**
- * The wire envelope (spec §2.3). `nonce`/`ciphertext` are null for the two
+ * The wire envelope (spec §2.3). `nonce`/`ciphertext` are null for the three
  * unencrypted control frame types (`device_bound`, `session_ended` — INV-20,
- * INV-21). `payload` carries the plaintext body of those two control types
- * only; the relay never holds a session key (INV-18) so it can never
- * populate `payload` for `state`/`command`/`ack` — those pass through as
- * opaque `ciphertext` untouched.
+ * INV-21 — and `keepalive`). `payload` carries the plaintext body of those
+ * control types only; the relay never holds a session key (INV-18) so it can
+ * never populate `payload` for `state`/`command`/`ack` — those pass through
+ * as opaque `ciphertext` untouched.
  */
 export interface Envelope {
   v: 1;
@@ -65,11 +73,29 @@ export interface DeviceBoundToHmdPayload {
   bound_at: number; // epoch seconds
 }
 
+/** Payload of the `keepalive` control frame the relay writes into hmd's
+ *  `GET /stream` while that stream would otherwise sit idle (see
+ *  src/session.ts's KEEPALIVE_INTERVAL_MS for why). `ts` is the relay's own
+ *  clock at write time — informational only: no client is expected to trust
+ *  it, compare it against its own clock, or act on it. A `keepalive` carries
+ *  no session state and is safe for any reader to skip. */
+export interface KeepalivePayload {
+  ts: number; // epoch seconds
+}
+
 export interface ErrorResponse {
   error: string;
   retry_after_s?: number;
 }
 
+/**
+ * Validates an envelope arriving *from* a client — hmd's `POST /frames` body
+ * or a phone WebSocket message. `keepalive` is deliberately absent from the
+ * accepted `type` set below: it is relay-originated only, on the one leg
+ * (hmd's `GET /stream`) the relay itself writes, so accepting one inbound
+ * would only widen the surface with a frame that has no meaning in that
+ * direction.
+ */
 export function isEnvelope(value: unknown): value is Envelope {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;

@@ -25,6 +25,11 @@ import {
   decodeSendMessageCommand,
   buildAckPayload,
   resolvePhonePubkey,
+  nextBackoffMs,
+  runStreamWithReconnect,
+  FatalStreamError,
+  BACKOFF_BASE_MS,
+  BACKOFF_CAP_MS,
 } from '../fake-hmd.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url)); // .../relay/scripts/__tests__/
@@ -258,6 +263,154 @@ test('resolvePhonePubkey decodes a base64url device_pubkey containing bytes stan
 test('resolvePhonePubkey returns null when neither override nor payload is present', () => {
   assert.equal(resolvePhonePubkey({ payload: undefined }, undefined), null);
   assert.equal(resolvePhonePubkey({ payload: { bound_at: 123 } }, undefined), null);
+});
+
+// --- keepalive control frame ---------------------------------------------
+
+test('decodeEnvelope accepts the relay keepalive control frame', () => {
+  const line = JSON.stringify({
+    v: 1,
+    session_id: 'sess-keepalive',
+    seq: 0,
+    sender: 'relay',
+    type: 'keepalive',
+    nonce: null,
+    ciphertext: null,
+    payload: { ts: 1758700000 },
+  });
+  const decoded = decodeEnvelope(line);
+  assert.ok(decoded, 'a keepalive must decode, not be dropped as a malformed line');
+  assert.equal(decoded.type, 'keepalive');
+  assert.equal(decoded.ciphertext, null);
+  assert.equal(decoded.payload.ts, 1758700000);
+});
+
+test('decodeEnvelope accepts a keepalive with no payload at all', () => {
+  const decoded = decodeEnvelope(
+    JSON.stringify({ v: 1, session_id: 's', seq: 0, sender: 'relay', type: 'keepalive', nonce: null, ciphertext: null })
+  );
+  assert.ok(decoded);
+  assert.equal(decoded.type, 'keepalive');
+});
+
+// --- reconnect loop ------------------------------------------------------
+//
+// Cloudflare closed a live 5-minute-idle GET /stream on 2026-09-24 and this
+// tool treated it as fatal. The loop below is what makes that survivable;
+// the fakes here drive it without a relay, a socket, or a real clock.
+
+/** Records what the loop asked to sleep for, and never actually waits.
+ *  `outcomes` is consumed one per `runOnce` call, the last one repeating.
+ *  The two stop knobs are separate on purpose: `stopAfterSleeps` walks a
+ *  fixed length of the backoff ladder, while `stopAfterCalls` models a stop
+ *  (Ctrl-C) landing while a stream is being served, before any wait. */
+function makeFakes({ outcomes, stopAfterSleeps = Infinity, stopAfterCalls = Infinity }) {
+  const slept = [];
+  const reconnectFlags = [];
+  let calls = 0;
+  return {
+    slept,
+    reconnectFlags,
+    callCount: () => calls,
+    sleep: async (ms) => {
+      slept.push(ms);
+    },
+    isStopped: () => slept.length >= stopAfterSleeps || calls >= stopAfterCalls,
+    runOnce: async (isReconnect) => {
+      reconnectFlags.push(isReconnect);
+      const outcome = outcomes[calls] ?? outcomes[outcomes.length - 1];
+      calls += 1;
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    },
+  };
+}
+
+test('nextBackoffMs doubles from the base and caps at BACKOFF_CAP_MS', () => {
+  assert.equal(BACKOFF_BASE_MS, 1000);
+  assert.equal(BACKOFF_CAP_MS, 30000);
+  assert.equal(nextBackoffMs(BACKOFF_BASE_MS), 2000);
+  assert.equal(nextBackoffMs(2000), 4000);
+  assert.equal(nextBackoffMs(16000), 30000);
+  assert.equal(nextBackoffMs(30000), 30000);
+});
+
+test('nextBackoffMs floors a missing or nonsensical previous delay at the base', () => {
+  assert.equal(nextBackoffMs(undefined), BACKOFF_BASE_MS);
+  assert.equal(nextBackoffMs(null), BACKOFF_BASE_MS);
+  assert.equal(nextBackoffMs(0), BACKOFF_BASE_MS);
+  assert.equal(nextBackoffMs(-5), BACKOFF_BASE_MS);
+  assert.equal(nextBackoffMs(Number.NaN), BACKOFF_BASE_MS);
+});
+
+test('runStreamWithReconnect reopens the stream after a close instead of exiting', async () => {
+  const fakes = makeFakes({ outcomes: ['closed', 'closed', 'session-ended'] });
+  const result = await runStreamWithReconnect(fakes);
+  assert.equal(result, 'session-ended');
+  assert.equal(fakes.callCount(), 3);
+  // First attempt is an open, the two after it are reconnects.
+  assert.deepEqual(fakes.reconnectFlags, [false, true, true]);
+});
+
+test('runStreamWithReconnect escalates the delay across consecutive failures to open', async () => {
+  const fakes = makeFakes({ outcomes: ['open-failed'], stopAfterSleeps: 6 });
+  const result = await runStreamWithReconnect(fakes);
+  assert.equal(result, 'stopped');
+  assert.deepEqual(fakes.slept, [1000, 2000, 4000, 8000, 16000, 30000]);
+});
+
+test('runStreamWithReconnect caps the escalating delay at 30s no matter how long it fails', async () => {
+  const fakes = makeFakes({ outcomes: ['open-failed'], stopAfterSleeps: 11 });
+  await runStreamWithReconnect(fakes);
+  assert.equal(Math.max(...fakes.slept), BACKOFF_CAP_MS);
+  assert.deepEqual(fakes.slept.slice(-3), [30000, 30000, 30000]);
+});
+
+test('runStreamWithReconnect resets the delay after a stream that actually opened', async () => {
+  // Two failures to open escalate to 4s; then a stream opens and closes, and
+  // the ladder starts over at 1s -- the observed 5-minute cut must not creep
+  // the reconnect delay upward over a long session.
+  const fakes = makeFakes({
+    outcomes: ['open-failed', 'open-failed', 'closed', 'closed'],
+    stopAfterSleeps: 4,
+  });
+  await runStreamWithReconnect(fakes);
+  assert.deepEqual(fakes.slept, [1000, 2000, 1000, 1000]);
+});
+
+test('runStreamWithReconnect stops without sleeping once the session ends', async () => {
+  const fakes = makeFakes({ outcomes: ['session-ended'] });
+  assert.equal(await runStreamWithReconnect(fakes), 'session-ended');
+  assert.deepEqual(fakes.slept, []);
+});
+
+test('runStreamWithReconnect stops when isStopped() flips (Ctrl-C / revoke)', async () => {
+  const fakes = makeFakes({ outcomes: ['closed'], stopAfterCalls: 1 });
+  assert.equal(await runStreamWithReconnect(fakes), 'stopped');
+  assert.equal(fakes.callCount(), 1);
+  assert.deepEqual(fakes.slept, []); // no pointless wait after the stop
+});
+
+test('runStreamWithReconnect never starts when already stopped', async () => {
+  const fakes = makeFakes({ outcomes: ['closed'], stopAfterCalls: 0 });
+  assert.equal(await runStreamWithReconnect(fakes), 'stopped');
+  assert.equal(fakes.callCount(), 0);
+});
+
+test('runStreamWithReconnect propagates a FatalStreamError instead of retrying it', async () => {
+  const fakes = makeFakes({ outcomes: [new FatalStreamError('bearer rejected (HTTP 401)')] });
+  await assert.rejects(() => runStreamWithReconnect(fakes), FatalStreamError);
+  assert.equal(fakes.callCount(), 1);
+  assert.deepEqual(fakes.slept, []);
+});
+
+test('runStreamWithReconnect retries an ordinary error thrown by runOnce', async () => {
+  // undici raises a bare TypeError('terminated') when the response body is
+  // cut mid-stream -- the exact 2026-09-24 failure. It must not be fatal.
+  const fakes = makeFakes({ outcomes: [new TypeError('terminated'), 'session-ended'] });
+  assert.equal(await runStreamWithReconnect(fakes), 'session-ended');
+  assert.equal(fakes.callCount(), 2);
+  assert.deepEqual(fakes.slept, [1000]);
 });
 
 // --- end-to-end: seal a command as the phone would, open+ack as hmd does -
