@@ -263,6 +263,47 @@ while True:
 PYEOF
 }
 
+# Polls FILE (an NDJSON event stream) up to SECS seconds for a stream_drop
+# event whose "reason" equals WANT_REASON (exact match) -- companion to
+# wait_for_event, needed here because "reason" is a stream_drop-specific key
+# wait_for_event's generic detail-substring check does not cover (stream_drop
+# has no "detail" key at all). On match, prints that event object as one
+# compact JSON line on stdout (so a caller can pull line_bytes/cap_bytes/
+# total_bytes/retry_ms out of it without a second pass) and returns 0; returns
+# 1 on timeout with nothing printed.
+wait_for_stream_drop() {
+  local file="$1" want_reason="$2" secs="${3:-10}"
+  python3 - "$file" "$want_reason" "$secs" <<'PYEOF'
+import sys, json, time
+
+file_path, want_reason, secs_s = sys.argv[1:4]
+deadline = time.time() + float(secs_s)
+while True:
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("event") != "stream_drop":
+            continue
+        if (o.get("reason") or "") != want_reason:
+            continue
+        sys.stdout.write(json.dumps(o) + "\n")
+        sys.exit(0)
+    if time.time() >= deadline:
+        sys.exit(1)
+    time.sleep(0.1)
+PYEOF
+}
+
 # ── 1. syntax / static shape (claims 9-12, 14) ──────────────────────────────
 if [ -x "$RELAY_CLIENT" ]; then
   ok "test -x bin/heimdall-relay-client"
@@ -1119,6 +1160,198 @@ fi
 
 kill "$SRV_F" 2>/dev/null
 wait "$SRV_F" 2>/dev/null
+
+# ── Scenario G: relay-client-fixes.md §13 -- an oversized stream line (no
+# newline) is capped, dropped with reason=overflow + byte counts, and the
+# client keeps running (reconnects and re-binds) ───────────────────────────
+REPO_G="$(make_repo)"
+PORT_G_RELAY="$(free_port)"
+PORT_G_UI="$(free_port)"
+LOG_G="$TMPROOT/g.log"; CTL_G="$TMPROOT/g.ctl"
+mkdir -p "$LOG_G" "$CTL_G"
+
+python3 "$FAKE_RELAY" serve "$PORT_G_RELAY" --log "$LOG_G" --ctl "$CTL_G" >"$TMPROOT/g.srv.out" 2>&1 &
+SRV_G=$!
+PIDS+=("$SRV_G")
+for _ in $(seq 1 50); do
+  python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_G_RELAY))==0 else 1)" && break
+  sleep 0.1
+done
+
+CLIENT_G_OUT="$TMPROOT/g.client.out"
+: > "$CTL_G/oversized-line=4000"
+HMD_RELAY_MAX_ENVELOPE_BYTES=2000 "$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_G_RELAY" --repo "$REPO_G" --ui-port "$PORT_G_UI" \
+  >"$CLIENT_G_OUT" 2>"$TMPROOT/g.client.err" &
+CLIENT_G=$!
+PIDS+=("$CLIENT_G")
+
+if wait_for "$CLIENT_G_OUT" '"event":"device_bound"' 10; then
+  ok "scenario G: initial stream bound before the oversized line"
+else
+  bad "scenario G: relay-client never bound on the first stream"
+fi
+
+OVERFLOW_JSON_G="$(wait_for_stream_drop "$CLIENT_G_OUT" "overflow" 8)"
+if [ -n "$OVERFLOW_JSON_G" ]; then
+  ok "§13: oversized stream line produced stream_drop reason=overflow"
+else
+  bad "§13: oversized stream line never produced an overflow stream_drop"
+fi
+LINE_BYTES_G="$(printf '%s' "$OVERFLOW_JSON_G" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("line_bytes"))' 2>/dev/null)"
+CAP_BYTES_G="$(printf '%s' "$OVERFLOW_JSON_G" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cap_bytes"))' 2>/dev/null)"
+if [ "$LINE_BYTES_G" = "2001" ] && [ "$CAP_BYTES_G" = "2001" ]; then
+  ok "§13: overflow stream_drop names line_bytes=cap_bytes=2001 (HMD_RELAY_MAX_ENVELOPE_BYTES=2000 + 1)"
+else
+  bad "§13: overflow stream_drop byte counts wrong (line_bytes=$LINE_BYTES_G cap_bytes=$CAP_BYTES_G, want 2001/2001)"
+fi
+
+if wait_for_count "$CLIENT_G_OUT" 2 '"event":"device_bound"' 10; then
+  ok "§13: client kept running -- reconnected and re-bound after the overflow drop"
+else
+  bad "§13: client never reconnected/re-bound after the overflow drop"
+fi
+
+kill "$CLIENT_G" 2>/dev/null
+wait "$CLIENT_G" 2>/dev/null
+kill "$SRV_G" 2>/dev/null
+wait "$SRV_G" 2>/dev/null
+
+# ── Scenario H: relay-client-fixes.md §16 -- planned client-side stream
+# self-rotation at HMD_RELAY_STREAM_ROTATE_S, well below the relay's own
+# stream-lifetime bound, with no backoff delay on the reconnect ────────────
+REPO_H="$(make_repo)"
+PORT_H_RELAY="$(free_port)"
+PORT_H_UI="$(free_port)"
+LOG_H="$TMPROOT/h.log"; CTL_H="$TMPROOT/h.ctl"
+mkdir -p "$LOG_H" "$CTL_H"
+
+python3 "$FAKE_RELAY" serve "$PORT_H_RELAY" --log "$LOG_H" --ctl "$CTL_H" >"$TMPROOT/h.srv.out" 2>&1 &
+SRV_H=$!
+PIDS+=("$SRV_H")
+for _ in $(seq 1 50); do
+  python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_H_RELAY))==0 else 1)" && break
+  sleep 0.1
+done
+
+CLIENT_H_OUT="$TMPROOT/h.client.out"
+T0_H="$(python3 -c 'import time; print(time.time())')"
+HMD_RELAY_STREAM_ROTATE_S=3 "$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_H_RELAY" --repo "$REPO_H" --ui-port "$PORT_H_UI" \
+  >"$CLIENT_H_OUT" 2>"$TMPROOT/h.client.err" &
+CLIENT_H=$!
+PIDS+=("$CLIENT_H")
+
+if wait_for "$CLIENT_H_OUT" '"event":"device_bound"' 10; then
+  ok "scenario H: initial stream bound before rotation"
+else
+  bad "scenario H: relay-client never bound on the first stream"
+fi
+
+ROTATE_JSON_H="$(wait_for_stream_drop "$CLIENT_H_OUT" "rotate" 5)"
+T1_H="$(python3 -c 'import time; print(time.time())')"
+if [ -n "$ROTATE_JSON_H" ]; then
+  ok "§16: client self-rotated (stream_drop reason=rotate) within HMD_RELAY_STREAM_ROTATE_S=3"
+  ELAPSED_H="$(python3 -c "print($T1_H - $T0_H)")"
+  ELAPSED_H_OK="$(python3 -c "print(1 if 2.5 <= $ELAPSED_H <= 8 else 0)")"
+  if [ "$ELAPSED_H_OK" = "1" ]; then
+    ok "§16: rotation happened at roughly the configured 3s mark (~${ELAPSED_H}s)"
+  else
+    bad "§16: rotation timing off (~${ELAPSED_H}s, want roughly 2.5-8s)"
+  fi
+  RETRY_MS_H="$(printf '%s' "$ROTATE_JSON_H" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("retry_ms"))' 2>/dev/null)"
+  if [ "$RETRY_MS_H" = "0" ]; then
+    ok "§16: rotate stream_drop carries retry_ms=0 (no backoff delay)"
+  else
+    bad "§16: rotate stream_drop retry_ms was '$RETRY_MS_H', want 0"
+  fi
+else
+  bad "§16: client never self-rotated within the configured rotate interval"
+  bad "§16: cannot check rotation timing -- no rotate event observed"
+  bad "§16: cannot check retry_ms -- no rotate event observed"
+fi
+
+if wait_for_count "$CLIENT_H_OUT" 2 '"event":"device_bound"' 5; then
+  ok "§16: client resumed -- reconnected and re-bound immediately after rotation"
+else
+  bad "§16: client never reconnected/re-bound after rotation"
+fi
+
+kill "$CLIENT_H" 2>/dev/null
+wait "$CLIENT_H" 2>/dev/null
+kill "$SRV_H" 2>/dev/null
+wait "$SRV_H" 2>/dev/null
+
+# ── Scenario I: relay-client-fixes.md §15 -- a clean stream close with no
+# other local cause (idle/overflow/rotate all ruled out -- the observable
+# signature of a relay-side Durable Object generation rollover after a
+# deploy, see hmdapp docs/RELAY-OPERATIONS.md "Deploy impact on live
+# sessions") warns and reconnects with backoff actually honored ───────────
+REPO_I="$(make_repo)"
+PORT_I_RELAY="$(free_port)"
+PORT_I_UI="$(free_port)"
+LOG_I="$TMPROOT/i.log"; CTL_I="$TMPROOT/i.ctl"
+mkdir -p "$LOG_I" "$CTL_I"
+
+python3 "$FAKE_RELAY" serve "$PORT_I_RELAY" --log "$LOG_I" --ctl "$CTL_I" >"$TMPROOT/i.srv.out" 2>&1 &
+SRV_I=$!
+PIDS+=("$SRV_I")
+for _ in $(seq 1 50); do
+  python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_I_RELAY))==0 else 1)" && break
+  sleep 0.1
+done
+
+CLIENT_I_OUT="$TMPROOT/i.client.out"
+HMD_RELAY_BACKOFF_BASE_MS=500 HMD_RELAY_STREAM_ROTATE_S=120 \
+  "$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_I_RELAY" --repo "$REPO_I" --ui-port "$PORT_I_UI" \
+  >"$CLIENT_I_OUT" 2>"$TMPROOT/i.client.err" &
+CLIENT_I=$!
+PIDS+=("$CLIENT_I")
+
+if wait_for "$CLIENT_I_OUT" '"event":"device_bound"' 10; then
+  ok "scenario I: initial stream bound before the lifetime-close"
+else
+  bad "scenario I: relay-client never bound on the first stream"
+fi
+
+T0_I="$(python3 -c 'import time; print(time.time())')"
+: > "$CTL_I/lifetime-close"
+
+if wait_for_event "$CLIENT_I_OUT" "error" "relay deploy" 8; then
+  ok "§15: clean stream close emitted a WARN-shaped error event naming a possible relay deploy"
+else
+  bad "§15: clean stream close never emitted the expected warn error event"
+fi
+
+CLOSED_JSON_I="$(wait_for_stream_drop "$CLIENT_I_OUT" "closed" 2)"
+if [ -n "$CLOSED_JSON_I" ]; then
+  ok "§15: clean stream close produced stream_drop reason=closed"
+else
+  bad "§15: clean stream close never produced stream_drop reason=closed"
+fi
+
+if wait_for_count "$CLIENT_I_OUT" 2 '"event":"device_bound"' 6; then
+  ok "§15: client reconnected and re-bound after the warn"
+  T1_I="$(python3 -c 'import time; print(time.time())')"
+  ELAPSED_I="$(python3 -c "print($T1_I - $T0_I)")"
+  # lower bound: a broken/skipped backoff reconnects near-instantly instead.
+  # upper bound: the DEFAULT base (2000ms) would still clear a lower-bound-
+  # only check, so this must also stay well under 2s to prove the
+  # HMD_RELAY_BACKOFF_BASE_MS=500 override -- not just the module default --
+  # is what got honored.
+  ELAPSED_I_OK="$(python3 -c "print(1 if 0.4 <= $ELAPSED_I <= 1.5 else 0)")"
+  if [ "$ELAPSED_I_OK" = "1" ]; then
+    ok "§15: reconnect honored the HMD_RELAY_BACKOFF_BASE_MS=500 override, not the 2000ms default (~${ELAPSED_I}s)"
+  else
+    bad "§15: reconnect timing didn't match the HMD_RELAY_BACKOFF_BASE_MS=500 override (~${ELAPSED_I}s, want 0.4-1.5s)"
+  fi
+else
+  bad "§15: client never reconnected/re-bound after the warn"
+  bad "§15: cannot check backoff timing -- no reconnect observed"
+fi
+
+kill "$CLIENT_I" 2>/dev/null
+wait "$CLIENT_I" 2>/dev/null
+kill "$SRV_I" 2>/dev/null
+wait "$SRV_I" 2>/dev/null
 
 echo
 printf '%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"

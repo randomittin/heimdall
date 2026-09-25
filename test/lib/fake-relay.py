@@ -58,6 +58,20 @@ CONTROL PROTOCOL (the --ctl DIR the "serve" stream handler polls):
   end-session   -- consumed by the ACTIVE stream loop (or, if none is open
                    yet, by the next one to open): pushes a `session_ended`
                    Envelope and ends the session.
+  oversized-line=<bytes> -- consumed ONCE by the ACTIVE stream loop: pushes a
+                   single raw chunk of <bytes> 'X' characters with NO
+                   trailing newline -- a pathological line that never ends,
+                   exercising bin/heimdall-relay-client's per-line/total-
+                   per-stream read cap (STREAM_READ_CAP_BYTES, Section 13 of
+                   hmdapp's docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md).
+  lifetime-close -- (no content needed) consumed by the ACTIVE stream loop:
+                   ends the chunked response body cleanly (the terminal
+                   0-length chunk IS sent, unlike drop-stream) but with NO
+                   session_ended envelope first -- simulates the relay's own
+                   stream-lifetime bound closing a stream on its own clock,
+                   the one case bin/heimdall-relay-client cannot attribute to
+                   idle/overflow/rotate and so treats as Section 15's WARN +
+                   backoff-reconnect case.
 
 Stdlib only (Decision 1 zero-toolchain posture) -- http.server, json, base64,
 uuid, threading, argparse, importlib.
@@ -253,6 +267,31 @@ class RelayState:
             return True
         return False
 
+    def consume_oversized_line(self):
+        try:
+            names = os.listdir(self.ctl_dir)
+        except OSError:
+            return None
+        for name in names:
+            m = re.match(r"^oversized-line=(\d+)$", name)
+            if m:
+                try:
+                    os.remove(os.path.join(self.ctl_dir, name))
+                except OSError:
+                    return int(m.group(1))
+                return int(m.group(1))
+        return None
+
+    def consume_lifetime_close(self):
+        p = os.path.join(self.ctl_dir, "lifetime-close")
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                return True
+            return True
+        return False
+
     def pending_envelopes(self, seen):
         """Every ctl/NNN.json not yet in `seen`, ascending by numeric name --
         the device-authored frames still queued to be pushed down the
@@ -437,9 +476,25 @@ class Handler(BaseHTTPRequestHandler):
                     }))
                     self._chunk_end()
                     return
+                if STATE.consume_lifetime_close():
+                    # simulates the relay's own stream-lifetime bound ending
+                    # the response with NO application-level envelope
+                    # explaining why (Section 15's "clean close, no other
+                    # local cause" case) -- properly chunk-terminated, unlike
+                    # drop-stream below, so the client sees a clean EOF
+                    # rather than a raised exception.
+                    self._chunk_end()
+                    return
                 pushed = False
                 for env in STATE.pending_envelopes(seen):
                     self._chunk_send(_envelope_bytes(env))
+                    pushed = True
+                oversized_n = STATE.consume_oversized_line()
+                if oversized_n is not None:
+                    # deliberately NOT _envelope_bytes -- no trailing newline,
+                    # exercising the client's per-line/total stream byte cap
+                    # (Section 13) against a pathological line that never ends.
+                    self._chunk_send(b"X" * oversized_n)
                     pushed = True
                 if STATE.consume_drop_stream():
                     # a drop induced WHILE this stream is already open: honor

@@ -59,11 +59,22 @@ to drive its own UI; nothing else is ever written to stdout.
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
         logged, not even at this level)
-    {"event":"stream_drop","retry_ms":N[,"reason":"idle"]}
-                                                       GET stream disconnected
-                                                       (or silent past
-                                                       HMD_RELAY_STREAM_IDLE_S);
-                                                       reconnecting after N ms
+    {"event":"stream_drop","retry_ms":N[,"reason":..]}
+                                                       GET stream disconnected;
+                                                       reconnecting after N ms.
+                                                       reason "idle": silent
+                                                       past
+                                                       HMD_RELAY_STREAM_IDLE_S.
+                                                       reason "overflow": a
+                                                       line or this
+                                                       connection's running
+                                                       total exceeded
+                                                       STREAM_READ_CAP_BYTES;
+                                                       carries extra
+                                                       line_bytes/total_bytes/
+                                                       cap_bytes fields. reason
+                                                       absent: some other
+                                                       local read fault
     {"event":"session_ended","reason":..}             terminal; process exits 0
     {"event":"error","detail":..}                     non-fatal unless followed
                                                        by one of the two exit
@@ -154,6 +165,22 @@ try:
     STREAM_IDLE_S = float(os.environ.get("HMD_RELAY_STREAM_IDLE_S", "60"))
 except (TypeError, ValueError):
     STREAM_IDLE_S = 60.0
+
+# Bounds the GET /stream reader against a hostile or malformed peer
+# (docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md Section 13): both a single
+# line and the running total read on one stream connection are capped at the
+# same INV-16 envelope size, reused rather than duplicated -- a line on this
+# stream IS an envelope, and real inbound traffic on this leg (device_bound
+# once, a keepalive control frame every ~20s, occasional small command
+# frames) never approaches it, so this never trips in normal operation. +1
+# over MAX_ENVELOPE_BYTES: the sender's own cap (send_frame_envelope below)
+# measures the serialized envelope body with no trailing newline, but the
+# NDJSON wire format adds exactly one delimiter byte per line that accounting
+# never counts -- without the +1, a legitimately maximally-sized envelope
+# would read back as a false overflow. On overflow: abort the read, drop the
+# stream, reconnect through the normal retry path, emit stream_drop with
+# reason "overflow" and the offending byte counts -- see _stream_loop.
+STREAM_READ_CAP_BYTES = MAX_ENVELOPE_BYTES + 1
 
 
 def emit(obj):
@@ -514,10 +541,18 @@ class RelayClient:
             backoff_ms = BACKOFF_BASE_MS  # reset on a successful (re)connect
             conn.sock.settimeout(STREAM_IDLE_S)
             idle_drop = False
+            overflow_info = None
+            stream_total_bytes = 0
             try:
                 while not self.stop_event.is_set():
-                    line = resp.readline()
+                    line = resp.readline(STREAM_READ_CAP_BYTES)
                     if not line:
+                        break
+                    stream_total_bytes += len(line)
+                    if (len(line) >= STREAM_READ_CAP_BYTES and not line.endswith(b"\n")) \
+                            or stream_total_bytes > STREAM_READ_CAP_BYTES:
+                        overflow_info = {"line_bytes": len(line), "total_bytes": stream_total_bytes,
+                                          "cap_bytes": STREAM_READ_CAP_BYTES}
                         break
                     line = line.strip()
                     if not line:
@@ -537,7 +572,11 @@ class RelayClient:
 
             if self.stop_event.is_set():
                 return
-            if idle_drop:
+            if overflow_info is not None:
+                event = {"event": "stream_drop", "retry_ms": backoff_ms, "reason": "overflow"}
+                event.update(overflow_info)
+                emit(event)
+            elif idle_drop:
                 emit({"event": "stream_drop", "retry_ms": backoff_ms, "reason": "idle"})
             else:
                 emit({"event": "stream_drop", "retry_ms": backoff_ms})
