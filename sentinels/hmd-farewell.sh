@@ -53,16 +53,31 @@ edits=""; agents=""; clean=""
 
 ETRACKER="$PLUGIN_DIR/bin/edit-tracker"
 if [ -x "$ETRACKER" ]; then
-  _e="$("$ETRACKER" paths 2>/dev/null | grep -c . 2>/dev/null || true)"
-  case "$_e" in ''|*[!0-9]*) _e=0 ;; esac
+  # Fork-free line count (was `| grep -c .`): edit-tracker paths never emits
+  # blank lines (verified against its real output), and bash command
+  # substitution strips the trailing newline, so counting embedded newlines
+  # in the captured string and adding 1 for the truncated final line gives
+  # the same count as `grep -c .` for N>=1 lines; N=0 is the empty-string
+  # guard below. Saves 1 fork (grep) per farewell run.
+  _paths_out="$("$ETRACKER" paths 2>/dev/null || true)"
+  _e=0
+  if [ -n "$_paths_out" ]; then
+    _nl="${_paths_out//[^$'\n']/}"
+    _e=$(( ${#_nl} + 1 ))
+  fi
   [ "$_e" -gt 0 ] && edits="$_e"
 fi
 
 PTRACKER="$PLUGIN_DIR/bin/parallelism-tracker"
 if [ -x "$PTRACKER" ]; then
   _grade="$("$PTRACKER" grade 2>/dev/null || true)"
-  _a="$(printf '%s' "$_grade" | sed -nE 's/.*agents: ([0-9]+) calls.*/\1/p' | head -1)"
-  case "${_a:-}" in ''|*[!0-9]*) _a="" ;; esac
+  # Fork-free extract (was `printf | sed -nE | head -1`, a 3-process
+  # pipeline): bash regex match against the captured string in-process. The
+  # pattern lives in a plain variable, never inlined on the RHS of `=~` —
+  # bash <=3.2 (this repo's floor) mis-quotes an inline regex literal there.
+  _a=""
+  _re='agents: ([0-9]+) calls'
+  [[ $_grade =~ $_re ]] && _a="${BASH_REMATCH[1]}"
   [ -n "$_a" ] && [ "$_a" -gt 0 ] && agents="$_a"
 fi
 
@@ -71,8 +86,11 @@ fi
 # this, but it stages only edit-tracker-ledgered paths and is alarm-bounded, so
 # a dirty tree here is not a fault and the stat is simply dropped from the
 # receipt rather than reported as dirty.
-if git rev-parse --git-dir >/dev/null 2>&1; then
-  if [ -z "$(git status --porcelain 2>/dev/null)" ]; then clean="yes"; fi
+# One fork, not two: `git status --porcelain` itself exits non-zero outside a
+# work tree (stderr silenced), so its own exit code doubles as the "are we in
+# a repo" check — no separate `git rev-parse --git-dir` needed first.
+if _status_out="$(git status --porcelain 2>/dev/null)"; then
+  [ -z "$_status_out" ] && clean="yes"
 fi
 
 # ── build the receipt line from whatever REAL stats resolved ──
@@ -140,6 +158,7 @@ fi
 # roster cache (online teammates) + the local team heartbeat files. Skip entirely when
 # presence is opted-out (an invite would be a lie — no one can see the dev). Never fatal.
 invite_line=""
+# Resolved ONCE, reused by the resume block below (was a duplicate fork).
 _top="$(git rev-parse --show-toplevel 2>/dev/null || true)"; [ -n "$_top" ] || _top="$PWD"
 HMD_REPO_DIR="$_top/.heimdall"
 _optout=""
@@ -180,7 +199,8 @@ fi
 # location. `hmd --resume` auto-loads the latest checkpoint — no session ID needed.
 resume_line=""
 ckpt_line=""
-_top="$(git rev-parse --show-toplevel 2>/dev/null || true)"; [ -n "$_top" ] || _top="$PWD"
+# _top already resolved above (invite_line block) — reused, not recomputed
+# (was a duplicate `git rev-parse --show-toplevel` fork).
 if [ -f "$_top/.planning/CHECKPOINT.md" ]; then
   resume_line="${B}hmd --resume${X}"
   ckpt_line="${DIM}checkpoint → ${X}${B}.planning/CHECKPOINT.md${X}"
