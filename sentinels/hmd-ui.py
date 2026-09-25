@@ -221,19 +221,26 @@ LIVE_USERS_REFRESH_S = 2
 LIVE_USERS_REWRITE_AFTER_S = 15.0
 
 
-def _run(argv, cwd, timeout=CMD_TIMEOUT_S):
+def _run(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
     """Bounded subprocess: (returncode, stdout, stderr) or (None, '', '') on any fault.
     The first argv element is resolved against hmd's own bin/ so the target repo's
-    PATH never decides which hmd tool answers."""
+    PATH never decides which hmd tool answers. `env`, when given, overlays a copy of
+    this process's own environment (never replaces it outright) -- e.g. collect_fallback
+    tightens HEIMDALL_FALLBACK_PROBE_TIMEOUT so heimdall-fallback's own network probe
+    finishes with room to spare inside this call's own `timeout`, rather than leaning on
+    the kill below to cut off a probe that may have been about to answer anyway."""
     exe = argv[0]
     if exe != "git":
         exe = os.path.join(BIN_DIR, exe)
         if not os.access(exe, os.X_OK):
             return None, "", ""
+    child_env = os.environ.copy()
+    if env:
+        child_env.update(env)
     try:
         p = subprocess.run(
             [exe] + list(argv[1:]), cwd=cwd, capture_output=True, text=True,
-            timeout=timeout, stdin=subprocess.DEVNULL,
+            timeout=timeout, stdin=subprocess.DEVNULL, env=child_env,
         )
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -264,26 +271,28 @@ _subprocess_cache = {}
 _subprocess_cache_lock = threading.Lock()
 
 
-def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S):
+def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
     """Same contract as `_run`, memoized by the exact (argv, cwd) pair for
     SUBPROCESS_CACHE_TTL_S. The lock spans the whole miss path (not just the dict
     read/write): two concurrent /api/state requests racing a cold cache must never
     both spawn the same command -- the second blocks on the lock and then hits the
     now-warm entry instead of racing its own subprocess (perf item 2d: never spawn
-    `git` more than once per poll interval, even under concurrent load)."""
+    `git` more than once per poll interval, even under concurrent load). `timeout`/
+    `env` are forwarded to `_run` -- the cache key stays (argv, cwd) only, since every
+    caller always pairs the same argv+cwd with the same timeout/env."""
     key = (tuple(argv), cwd)
     with _subprocess_cache_lock:
         now = time.monotonic()
         hit = _subprocess_cache.get(key)
         if hit is not None and now - hit[0] < SUBPROCESS_CACHE_TTL_S:
             return hit[1]
-        result = _run(argv, cwd, timeout=timeout)
+        result = _run(argv, cwd, timeout=timeout, env=env)
         _subprocess_cache[key] = (time.monotonic(), result)
         return result
 
 
-def _run_json_cached(argv, cwd):
-    rc, out, _ = _run_cached(argv, cwd)
+def _run_json_cached(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
+    rc, out, _ = _run_cached(argv, cwd, timeout=timeout, env=env)
     if rc != 0:
         return None
     try:
@@ -417,10 +426,44 @@ def collect_hooks(root):
     return [{k: h.get(k) for k in HOOK_KEYS} for h in data if isinstance(h, dict)]
 
 
+# heimdall-fallback status is the one SOURCE_COMMANDS entry that can make a REAL
+# network syscall: run_preflight() (bin/heimdall-fallback) sends an actual loopback
+# HTTP GET via _endpoint_reachable() on every single invocation, regardless of
+# fallback state (even the default state=="off"). Every other collector in this file
+# is a file read or a fast, local-only subprocess. Under contention -- several hmd-ui
+# processes each polling every POLL_INTERVAL_S, all probing the same loopback port
+# concurrently (test/heimdall-ui-allowhost.test.sh alone launches six) -- sharing the
+# generic CMD_TIMEOUT_S here compounds badly: a slow or wedged local endpoint can
+# legitimately cost the full shared timeout on EVERY poll tick of EVERY running
+# server, indistinguishable from a hang under a loaded parallel test sweep. So this
+# one collector gets its own tighter bound instead of the shared default.
+FALLBACK_CMD_TIMEOUT_S = 2.0
+# heimdall-fallback's own probe already has a bounded timeout (_probe_timeout(),
+# default 3.0s -- already longer than FALLBACK_CMD_TIMEOUT_S above), so tighten it
+# here too, UNLESS the caller already pinned an explicit value of its own -- never
+# override an explicit choice. This way a slow-but-honest probe answer normally
+# beats FALLBACK_CMD_TIMEOUT_S's own kill, instead of every close call being decided
+# by a hard SIGKILL that throws away whatever heimdall-fallback was about to report.
+FALLBACK_PROBE_TIMEOUT_S = "1"
+
+
 def collect_fallback(root):
-    data = _run_json_cached(("heimdall-fallback", "status", "--json"), root)
+    env = None
+    if not os.environ.get("HEIMDALL_FALLBACK_PROBE_TIMEOUT"):
+        env = {"HEIMDALL_FALLBACK_PROBE_TIMEOUT": FALLBACK_PROBE_TIMEOUT_S}
+    data = _run_json_cached(
+        ("heimdall-fallback", "status", "--json"), root,
+        timeout=FALLBACK_CMD_TIMEOUT_S, env=env,
+    )
     if not isinstance(data, dict):
-        return {k: None for k in FALLBACK_ALLOWED_KEYS}
+        # Hard-timeout (or any other subprocess failure) degrade: keep the
+        # existing state/target_provider keys (null) for back-compat, and add
+        # status/reason so a caller can tell "off" apart from "we couldn't
+        # ask in time" instead of inferring it from two identical nulls.
+        result = {k: None for k in FALLBACK_ALLOWED_KEYS}
+        result["status"] = "unknown"
+        result["reason"] = "timeout"
+        return result
     # Decision 4: never forward endpoint / operator_key_* / config_path.
     return {k: data.get(k) for k in FALLBACK_ALLOWED_KEYS}
 

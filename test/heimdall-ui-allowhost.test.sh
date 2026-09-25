@@ -47,6 +47,17 @@
 #   an assertion in this file, but it was reproduced breaking that panels case under
 #   3-way concurrent load (same server, same leak) -- pinned here too so this file
 #   can never become the next one to grow a snapshot/idle assertion that trips on it.
+#   HEIMDALL_FALLBACK_ASSUME_REACHABLE is pinned for the same class of reason:
+#   collect_fallback() (sentinels/hmd-ui.py) shells out to `heimdall-fallback status
+#   --json` on every GET and every poll tick, and that command's own preflight makes
+#   a REAL network probe to its configured (default, loopback) endpoint regardless of
+#   state. Unpinned, every server here depends on whatever is or isn't listening on
+#   that real port on this real machine, and how fast it answers under however much
+#   load the sweep's sibling suites put on the same port at the same time -- exactly
+#   what turned this suite into an hours-long intermittent hang under contention
+#   before this pin plus collect_fallback()'s own bounded timeout landed
+#   (FALLBACK_CMD_TIMEOUT_S). Group J below proves the timeout side directly, with a
+#   stub heimdall-fallback that never answers at all.
 #   Every server this file
 # starts is its OWN process on its OWN port -- in-memory backoff state must never
 # leak between test groups, so each group that needs a clean failure count gets a
@@ -94,6 +105,11 @@ TMPROOT="$(mktemp -d)"
 export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
+# See "Hermetic" note above: short-circuits heimdall-fallback's own real network
+# probe with no I/O at all (bin/heimdall-fallback; established pattern, see
+# test/heimdall-fallback.test.sh) -- 0 (not 1) since nothing here configures a real
+# gateway and "unreachable" is the honest answer for this sandbox.
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 FIX="$TMPROOT/fixture-repo"
 mkdir -p "$HOME/.claude" "$FIX"
 # hmd-ui's resolve_root() canonicalises via os.path.realpath, which on macOS resolves
@@ -442,10 +458,14 @@ PIDS+=("${SSE_PIDS[@]}")
 # Give the 8 held streams time to actually clear _gate_then and acquire their
 # semaphore slot (each is a real handshake) before the 9th is sent, so the cap is
 # measured with all 8 slots genuinely occupied, not raced against connection setup.
-sleep 0.5
+sleep 1
 
 HDR9="$TMPROOT/sse-9.hdr"; BODY9="$TMPROOT/sse-9.json"
-rc9="$(curl -s -D "$HDR9" -o "$BODY9" -w '%{http_code}' "$BASE_G/api/events?$AUTH_G")"
+# --max-time 8: defensive bound only. If the settle sleep above ever loses the
+# race under heavy load, this request would be accepted as a real 200 SSE
+# stream (infinite by design) instead of the expected 503 -- without a timeout
+# that turns into an indefinite hang instead of a fast, diagnosable "bad".
+rc9="$(curl -s --max-time 8 -D "$HDR9" -o "$BODY9" -w '%{http_code}' "$BASE_G/api/events?$AUTH_G")"
 if [ "$rc9" = "503" ] && grep -qi '^retry-after: *5' "$HDR9" \
    && jq -e '.error=="too-many-streams" and .retry_after_s==5' "$BODY9" >/dev/null 2>&1; then
   ok "27. 9th concurrent /api/events past MAX_SSE_STREAMS(8) -> 503, Retry-After: 5, body {\"error\":\"too-many-streams\",\"retry_after_s\":5}"
@@ -663,6 +683,58 @@ if [ "$rc" = "200" ] && [ "$TITLE_LOOP" = "/Users/rj/secret/project" ] \
   ok "41. loopback (no --allow-host): panel title and checkpoint.branch stay full absolute paths, unredacted (N4 gated on public_host)"
 else
   bad "41. loopback should be unredacted: title=$TITLE_LOOP branch=$BRANCH_LOOP"
+fi
+
+# ═══ Group J -- collect_fallback's own bounded timeout (product-side fix) ══════
+# _run() (sentinels/hmd-ui.py) resolves every SOURCE_COMMANDS binary, including
+# heimdall-fallback, against hmd-ui's OWN bin/ -- never PATH (see _run's docstring:
+# "the target repo's PATH never decides which hmd tool answers") -- so the only way
+# to substitute a stub heimdall-fallback is a sandboxed copy of bin/+sentinels/ with
+# heimdall-fallback swapped out. bin/heimdall-ui itself must be a real file COPY, not
+# a symlink: its own launcher resolves its location via `readlink -f "$0"`, which
+# would resolve a symlink straight back to this repo's real bin/, defeating the
+# sandbox. sentinels/*.py and bin/lib/ CAN be symlinked -- __file__ (Python) and
+# module imports are never realpath()'d the way that bash launcher resolves itself.
+SANDBOX="$TMPROOT/sandbox"
+mkdir -p "$SANDBOX/bin" "$SANDBOX/sentinels"
+for f in "$REPO"/bin/*; do
+  name="$(basename "$f")"
+  case "$name" in
+    heimdall-ui|heimdall-fallback) continue ;;
+  esac
+  ln -s "$f" "$SANDBOX/bin/$name"
+done
+cp "$REPO/bin/heimdall-ui" "$SANDBOX/bin/heimdall-ui"
+chmod +x "$SANDBOX/bin/heimdall-ui"
+for f in "$REPO"/sentinels/*; do
+  ln -s "$f" "$SANDBOX/sentinels/$(basename "$f")"
+done
+cat > "$SANDBOX/bin/heimdall-fallback" <<'STUB'
+#!/usr/bin/env bash
+# Wedged heimdall-fallback double for test 42 -- `exec` replaces this shell with
+# `sleep` (same PID) so a SIGKILL from the caller's own subprocess timeout ends the
+# sleep directly, leaving no orphaned grandchild behind.
+exec sleep 30
+STUB
+chmod +x "$SANDBOX/bin/heimdall-fallback"
+
+REAL_UI="$UI"
+UI="$SANDBOX/bin/heimdall-ui"
+launch_server hungfallback || exit 1
+UI="$REAL_UI"
+BASE_HF="$BASE"; AUTH_HF="$AUTH"
+
+SECONDS=0
+BODY="$TMPROOT/state-hf.json"
+rc="$(curl -s -m 10 -o "$BODY" -w '%{http_code}' "$BASE_HF/api/state?$AUTH_HF")"
+ELAPSED="$SECONDS"
+
+if [ "$rc" = "200" ] && [ "$ELAPSED" -le 6 ] \
+   && jq -e '.fallback.state == null and .fallback.target_provider == null
+             and .fallback.status == "unknown" and .fallback.reason == "timeout"' "$BODY" >/dev/null 2>&1; then
+  ok "42. wedged heimdall-fallback (stub sleeps 30s): /api/state answers in ${ELAPSED}s with fallback={state:null,target_provider:null,status:unknown,reason:timeout} -- never blocks on it (product fix: FALLBACK_CMD_TIMEOUT_S)"
+else
+  bad "42. wedged heimdall-fallback: rc=$rc elapsed=${ELAPSED}s fallback=$(jq -c '.fallback' "$BODY" 2>/dev/null)"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
