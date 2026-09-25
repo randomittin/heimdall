@@ -47,6 +47,17 @@
 #   an assertion in this file, but it was reproduced breaking that panels case under
 #   3-way concurrent load (same server, same leak) -- pinned here too so this file
 #   can never become the next one to grow a snapshot/idle assertion that trips on it.
+#   HEIMDALL_FALLBACK_ASSUME_REACHABLE is pinned for the same class of reason:
+#   collect_fallback() (sentinels/hmd-ui.py) shells out to `heimdall-fallback status
+#   --json` on every GET and every poll tick, and that command's own preflight makes
+#   a REAL network probe to its configured (default, loopback) endpoint regardless of
+#   state. Unpinned, every server here depends on whatever is or isn't listening on
+#   that real port on this real machine, and how fast it answers under however much
+#   load the sweep's sibling suites put on the same port at the same time -- exactly
+#   what turned this suite into an hours-long intermittent hang under contention
+#   before this pin plus collect_fallback()'s own bounded timeout landed
+#   (FALLBACK_CMD_TIMEOUT_S). Group J below proves the timeout side directly, with a
+#   stub heimdall-fallback that never answers at all.
 #   Every server this file
 # starts is its OWN process on its OWN port -- in-memory backoff state must never
 # leak between test groups, so each group that needs a clean failure count gets a
