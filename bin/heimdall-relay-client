@@ -59,11 +59,37 @@ to drive its own UI; nothing else is ever written to stdout.
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
         logged, not even at this level)
-    {"event":"stream_drop","retry_ms":N[,"reason":"idle"]}
-                                                       GET stream disconnected
-                                                       (or silent past
-                                                       HMD_RELAY_STREAM_IDLE_S);
-                                                       reconnecting after N ms
+    {"event":"stream_drop","retry_ms":N[,"reason":..]}
+                                                       GET stream disconnected;
+                                                       reconnecting after N ms.
+                                                       reason "idle": silent
+                                                       past
+                                                       HMD_RELAY_STREAM_IDLE_S.
+                                                       reason "overflow": a
+                                                       line or this
+                                                       connection's running
+                                                       total exceeded
+                                                       STREAM_READ_CAP_BYTES;
+                                                       carries extra
+                                                       line_bytes/total_bytes/
+                                                       cap_bytes fields. reason
+                                                       "rotate": planned self-
+                                                       rotation at
+                                                       HMD_RELAY_STREAM_ROTATE_S
+                                                       -- retry_ms always 0, no
+                                                       backoff. reason "closed":
+                                                       clean EOF with idle,
+                                                       overflow and rotate all
+                                                       ruled out -- likely the
+                                                       relay's own stream-
+                                                       lifetime bound, possibly
+                                                       after a relay deploy; a
+                                                       WARN-level error event
+                                                       names this immediately
+                                                       before the stream_drop.
+                                                       reason absent: a genuine
+                                                       local read fault (socket
+                                                       / HTTP exception)
     {"event":"session_ended","reason":..}             terminal; process exits 0
     {"event":"error","detail":..}                     non-fatal unless followed
                                                        by one of the two exit
@@ -135,7 +161,18 @@ try:
     MAX_ENVELOPE_BYTES = int(os.environ.get("HMD_RELAY_MAX_ENVELOPE_BYTES", "1048576"))
 except (TypeError, ValueError):
     MAX_ENVELOPE_BYTES = 1048576
-BACKOFF_BASE_MS = 2000
+# HMD_RELAY_BACKOFF_BASE_MS (default 2000ms): starting reconnect backoff after
+# a dropped/failed stream, doubling on each consecutive failure up to
+# BACKOFF_CAP_MS and resetting to this base on the next successful (200)
+# reconnect. Overridable so a test can drive a fast, timestamp-verifiable
+# backoff assertion (docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md Section
+# 15) without waiting out the real default. BACKOFF_CAP_MS stays a bare
+# literal on purpose -- an existing test asserts its exact literal-assignment
+# source form.
+try:
+    BACKOFF_BASE_MS = int(os.environ.get("HMD_RELAY_BACKOFF_BASE_MS", "2000"))
+except (TypeError, ValueError):
+    BACKOFF_BASE_MS = 2000
 BACKOFF_CAP_MS = 30000
 CONNECT_TIMEOUT_S = 15
 STREAM_TIMEOUT_S = None  # unbounded connect + response-header wait for GET
@@ -154,6 +191,39 @@ try:
     STREAM_IDLE_S = float(os.environ.get("HMD_RELAY_STREAM_IDLE_S", "60"))
 except (TypeError, ValueError):
     STREAM_IDLE_S = 60.0
+
+# Bounds the GET /stream reader against a hostile or malformed peer
+# (docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md Section 13): both a single
+# line and the running total read on one stream connection are capped at the
+# same INV-16 envelope size, reused rather than duplicated -- a line on this
+# stream IS an envelope, and real inbound traffic on this leg (device_bound
+# once, a keepalive control frame every ~20s, occasional small command
+# frames) never approaches it, so this never trips in normal operation. +1
+# over MAX_ENVELOPE_BYTES: the sender's own cap (send_frame_envelope below)
+# measures the serialized envelope body with no trailing newline, but the
+# NDJSON wire format adds exactly one delimiter byte per line that accounting
+# never counts -- without the +1, a legitimately maximally-sized envelope
+# would read back as a false overflow. On overflow: abort the read, drop the
+# stream, reconnect through the normal retry path, emit stream_drop with
+# reason "overflow" and the offending byte counts -- see _stream_loop.
+STREAM_READ_CAP_BYTES = MAX_ENVELOPE_BYTES + 1
+
+# HMD_RELAY_STREAM_ROTATE_S (default 540s == 9 minutes): plan a self-initiated
+# stream close+reopen before the relay's own stream-lifetime bound (10
+# minutes, docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md Section 16) ever
+# fires -- so THIS client is usually the one ending the stream, belt-and-
+# braces against the one failure class STREAM_IDLE_S alone cannot catch: a
+# Durable Object generation rollover (any relay deploy) orphaning the old
+# generation's keepalive timer in a now-unreachable isolate, which keeps
+# writing a keepalive forever and so never goes idle. No jitter -- a fixed
+# interval is what makes HMD_RELAY_STREAM_ROTATE_S=<small N> deterministically
+# testable. On rotation: close and reopen immediately, no backoff (this is
+# planned, not a fault) -- emit stream_drop reason "rotate", retry_ms 0 -- see
+# _stream_loop.
+try:
+    STREAM_ROTATE_S = float(os.environ.get("HMD_RELAY_STREAM_ROTATE_S", "540"))
+except (TypeError, ValueError):
+    STREAM_ROTATE_S = 540.0
 
 
 def emit(obj):
@@ -512,12 +582,26 @@ class RelayClient:
                 continue
 
             backoff_ms = BACKOFF_BASE_MS  # reset on a successful (re)connect
-            conn.sock.settimeout(STREAM_IDLE_S)
-            idle_drop = False
+            drop_reason = None  # None == clean close, no other local cause
+            overflow_info = None
+            stream_total_bytes = 0
+            rotate_deadline = time.monotonic() + STREAM_ROTATE_S
             try:
                 while not self.stop_event.is_set():
-                    line = resp.readline()
+                    remaining = rotate_deadline - time.monotonic()
+                    if remaining <= 0:
+                        drop_reason = "rotate"
+                        break
+                    conn.sock.settimeout(min(STREAM_IDLE_S, remaining))
+                    line = resp.readline(STREAM_READ_CAP_BYTES)
                     if not line:
+                        break
+                    stream_total_bytes += len(line)
+                    if (len(line) >= STREAM_READ_CAP_BYTES and not line.endswith(b"\n")) \
+                            or stream_total_bytes > STREAM_READ_CAP_BYTES:
+                        drop_reason = "overflow"
+                        overflow_info = {"line_bytes": len(line), "total_bytes": stream_total_bytes,
+                                          "cap_bytes": STREAM_READ_CAP_BYTES}
                         break
                     line = line.strip()
                     if not line:
@@ -529,18 +613,34 @@ class RelayClient:
                         continue
                     self._handle_envelope(env)
             except socket.timeout:
-                idle_drop = True
+                drop_reason = "rotate" if time.monotonic() >= rotate_deadline else "idle"
             except (OSError, http.client.HTTPException) as e:
                 emit({"event": "error", "detail": "stream read failed: %s" % e})
+                drop_reason = "error"
             finally:
                 conn.close()
 
             if self.stop_event.is_set():
                 return
-            if idle_drop:
-                emit({"event": "stream_drop", "retry_ms": backoff_ms, "reason": "idle"})
-            else:
-                emit({"event": "stream_drop", "retry_ms": backoff_ms})
+
+            if drop_reason == "rotate":
+                emit({"event": "stream_drop", "retry_ms": 0, "reason": "rotate"})
+                continue  # planned self-rotation -- no backoff, reopen immediately
+
+            event = {"event": "stream_drop", "retry_ms": backoff_ms}
+            if drop_reason == "overflow":
+                event["reason"] = "overflow"
+                event.update(overflow_info)
+            elif drop_reason == "idle":
+                event["reason"] = "idle"
+            elif drop_reason is None:
+                emit({"event": "error",
+                      "detail": "stream closed by relay with no local cause (idle, "
+                                "overflow and rotate all ruled out) -- likely the "
+                                "relay's own stream-lifetime bound, possibly "
+                                "following a relay deploy; reconnecting with backoff"})
+                event["reason"] = "closed"
+            emit(event)
             if self.stop_event.wait(backoff_ms / 1000.0):
                 return
             backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
