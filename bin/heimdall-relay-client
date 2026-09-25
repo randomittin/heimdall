@@ -413,7 +413,13 @@ class RelayClient:
         try:
             plaintext = E2E.open_(self.session_key, seq, "device", env.get("nonce"), env.get("ciphertext"))
         except E2E.E2EError:
-            self.last_device_seq = seq
+            # audit #5, 2026-09-25: a frame that fails to decrypt must NEVER
+            # advance last_device_seq. The monotonic check above runs BEFORE
+            # decrypt, so an attacker-controlled seq on a forged/corrupted
+            # frame would otherwise permanently poison the replay guard and
+            # silently reject every later genuine command at or below that
+            # seq. Only a frame that actually decrypts moves the high-water
+            # mark (below, on the success path).
             emit({"event": "command", "action": None, "ok": False, "detail": "decrypt-failed"})
             self.send_hmd_frame("ack", {"ok": False, "detail": "decrypt-failed", "of_seq": seq})
             return

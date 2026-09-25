@@ -1203,6 +1203,45 @@ for line in open('$LOG_G/frames.ndjson'):
     bad "audit #3: no sender=hmd frame ever appeared to check its seq"
   fi
 
+  # ── §8 (audit #5): a forged command that fails to decrypt must never
+  # advance last_device_seq -- a real frame at the true next seq is still
+  # accepted afterward (a corrupted-in-transit frame must never become a
+  # permanent denial-of-service on every later genuine command).
+  FORGED_SEQ_G=9007199254740991
+  SEAL_BAD_JSON="$(python3 "$FAKE_RELAY" device seal --key-b64 "$SESSION_KEY_G" --seq "$FORGED_SEQ_G" --sender device \
+    --text '{"action":"send-message","params":{"text":"forged"}}')"
+  NONCE_BAD_G="$(printf '%s' "$SEAL_BAD_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nonce_b64"])')"
+  CT_BAD_GOOD_G="$(printf '%s' "$SEAL_BAD_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ciphertext_b64"])')"
+  CT_BAD_G="$(python3 -c "
+import base64, sys
+raw = bytearray(base64.b64decode(sys.argv[1]))
+raw[0] ^= 0x01
+print(base64.b64encode(bytes(raw)).decode('ascii'))
+" "$CT_BAD_GOOD_G")"
+  python3 "$FAKE_RELAY" device envelope --session-id "$SID_G" --seq "$FORGED_SEQ_G" --sender device \
+    --type command --nonce "$NONCE_BAD_G" --ciphertext "$CT_BAD_G" > "$CTL_G/002.json"
+
+  if wait_for_event "$CLIENT_G_OUT" "command" "decrypt-failed" 8; then
+    ok "audit #5: forged high-seq frame with a corrupted ciphertext failed to decrypt, as expected"
+  else
+    bad "audit #5: forged frame did not produce a command/decrypt-failed event"
+  fi
+
+  SEAL_G1_JSON="$(python3 "$FAKE_RELAY" device seal --key-b64 "$SESSION_KEY_G" --seq 1 --sender device \
+    --text '{"action":"send-message","params":{"text":"hello after forged frame"}}')"
+  NONCE_G1="$(printf '%s' "$SEAL_G1_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nonce_b64"])')"
+  CT_G1="$(printf '%s' "$SEAL_G1_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ciphertext_b64"])')"
+  python3 "$FAKE_RELAY" device envelope --session-id "$SID_G" --seq 1 --sender device \
+    --type command --nonce "$NONCE_G1" --ciphertext "$CT_G1" > "$CTL_G/003.json"
+
+  ACK_G1_JSON="$(wait_for_ack_of_seq "$LOG_G/frames.ndjson" "$SESSION_KEY_G" 1 10)"
+  ACK_G1_OK="$(printf '%s' "$ACK_G1_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null)"
+  if [ "$ACK_G1_OK" = "True" ]; then
+    ok "audit #5: last_device_seq was not advanced by the forged frame -- the real next seq=1 was still accepted"
+  else
+    bad "audit #5: seq=1 was rejected after the forged high-seq frame -- last_device_seq was corrupted (ack=$ACK_G1_JSON)"
+  fi
+
   kill "$CLIENT_G" 2>/dev/null
   wait "$CLIENT_G" 2>/dev/null
   kill "$SRV_G" 2>/dev/null
