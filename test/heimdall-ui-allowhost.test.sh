@@ -105,6 +105,11 @@ TMPROOT="$(mktemp -d)"
 export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
+# See "Hermetic" note above: short-circuits heimdall-fallback's own real network
+# probe with no I/O at all (bin/heimdall-fallback; established pattern, see
+# test/heimdall-fallback.test.sh) -- 0 (not 1) since nothing here configures a real
+# gateway and "unreachable" is the honest answer for this sandbox.
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 FIX="$TMPROOT/fixture-repo"
 mkdir -p "$HOME/.claude" "$FIX"
 # hmd-ui's resolve_root() canonicalises via os.path.realpath, which on macOS resolves
@@ -674,6 +679,57 @@ if [ "$rc" = "200" ] && [ "$TITLE_LOOP" = "/Users/rj/secret/project" ] \
   ok "41. loopback (no --allow-host): panel title and checkpoint.branch stay full absolute paths, unredacted (N4 gated on public_host)"
 else
   bad "41. loopback should be unredacted: title=$TITLE_LOOP branch=$BRANCH_LOOP"
+fi
+
+# ═══ Group J -- collect_fallback's own bounded timeout (product-side fix) ══════
+# _run() (sentinels/hmd-ui.py) resolves every SOURCE_COMMANDS binary, including
+# heimdall-fallback, against hmd-ui's OWN bin/ -- never PATH (see _run's docstring:
+# "the target repo's PATH never decides which hmd tool answers") -- so the only way
+# to substitute a stub heimdall-fallback is a sandboxed copy of bin/+sentinels/ with
+# heimdall-fallback swapped out. bin/heimdall-ui itself must be a real file COPY, not
+# a symlink: its own launcher resolves its location via `readlink -f "$0"`, which
+# would resolve a symlink straight back to this repo's real bin/, defeating the
+# sandbox. sentinels/*.py and bin/lib/ CAN be symlinked -- __file__ (Python) and
+# module imports are never realpath()'d the way that bash launcher resolves itself.
+SANDBOX="$TMPROOT/sandbox"
+mkdir -p "$SANDBOX/bin" "$SANDBOX/sentinels"
+for f in "$REPO"/bin/*; do
+  name="$(basename "$f")"
+  case "$name" in
+    heimdall-ui|heimdall-fallback) continue ;;
+  esac
+  ln -s "$f" "$SANDBOX/bin/$name"
+done
+cp "$REPO/bin/heimdall-ui" "$SANDBOX/bin/heimdall-ui"
+chmod +x "$SANDBOX/bin/heimdall-ui"
+for f in "$REPO"/sentinels/*; do
+  ln -s "$f" "$SANDBOX/sentinels/$(basename "$f")"
+done
+cat > "$SANDBOX/bin/heimdall-fallback" <<'STUB'
+#!/usr/bin/env bash
+# Wedged heimdall-fallback double for test 42 -- `exec` replaces this shell with
+# `sleep` (same PID) so a SIGKILL from the caller's own subprocess timeout ends the
+# sleep directly, leaving no orphaned grandchild behind.
+exec sleep 30
+STUB
+chmod +x "$SANDBOX/bin/heimdall-fallback"
+
+REAL_UI="$UI"
+UI="$SANDBOX/bin/heimdall-ui"
+launch_server hungfallback || exit 1
+UI="$REAL_UI"
+BASE_HF="$BASE"; AUTH_HF="$AUTH"
+
+SECONDS=0
+BODY="$TMPROOT/state-hf.json"
+rc="$(curl -s -m 10 -o "$BODY" -w '%{http_code}' "$BASE_HF/api/state?$AUTH_HF")"
+ELAPSED="$SECONDS"
+
+if [ "$rc" = "200" ] && [ "$ELAPSED" -le 6 ] \
+   && jq -e '.fallback.state == null and .fallback.target_provider == null' "$BODY" >/dev/null 2>&1; then
+  ok "42. wedged heimdall-fallback (stub sleeps 30s): /api/state answers in ${ELAPSED}s with fallback={state:null,target_provider:null} -- never blocks on it (product fix: FALLBACK_CMD_TIMEOUT_S)"
+else
+  bad "42. wedged heimdall-fallback: rc=$rc elapsed=${ELAPSED}s fallback=$(jq -c '.fallback' "$BODY" 2>/dev/null)"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
