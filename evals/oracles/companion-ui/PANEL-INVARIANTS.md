@@ -137,3 +137,39 @@ value are both normative.
 - P38. `set` exits 0 and prints the written path on success; exits 2 with a stderr
   line naming the offending FIELD (never the value) on any rejection, and no file
   is written.
+
+## Serve-side log-tail bound (additive; does not weaken P13/P17/P18/P20 at publish time)
+
+- P39. `write_panel` (the `hmd ui panel set` CLI, P37/P38) is UNCHANGED: a
+  log-tail panel whose `data.lines` exceeds `MAX_LIST_ITEMS`, whose file
+  exceeds `MAX_FILE_BYTES`, or any of whose lines exceeds `MAX_STRING_CHARS`,
+  is still REFUSED WHOLE at publish time, exactly as P17/P18/P20 state.
+  Nothing below changes what a producer may write through the blessed CLI in
+  one shot.
+- P40. `read_panels` (the server's own read path — `/api/state`, every SSE
+  frame, and the relay state frames, all three sourced from it, P30) applies
+  an ADDITIONAL, wider, log-tail-only bound BEFORE validating a file already
+  on disk — content that reached disk by some route other than `panel set`
+  (P1 says one writer per file; it does not say that writer must be this
+  CLI) is no longer required to already fit inside the publish-time caps to
+  be served at all: `HMD_UI_LOG_TAIL_LINES` (default 200), `HMD_UI_LOG_TAIL_BYTES`
+  (default 65536), `HMD_UI_LOG_LINE_MAX` (default 2000 chars/line), each read
+  fresh from the environment on every read. A line longer than the char limit
+  is cut to exactly that many characters, the last being an ellipsis; the
+  list is then trimmed from the OLD end (line 0 first), on whole-line
+  boundaries only, until both the line-count and UTF-8-byte-total budgets
+  hold. Rationale: a good-faith log that outgrows limits sized for short
+  structured job-progress lines, not prose-heavy chat transcripts, should
+  degrade to "newest slice, visibly marked", never to nothing.
+- P41. When a read-path trim actually drops at least one line, the served
+  `data` gains `truncated: true` and `dropped_lines: <n>`; an untouched log
+  (nothing dropped) carries neither key, and its `data.lines` is
+  byte-identical to what was on disk. Both keys are optional and validated
+  the same as any other `data` field (`truncated` a bool, `dropped_lines` a
+  non-negative int); an invalid value for either is still a hard rejection.
+- P42. The read-path trim runs BEFORE the secret scrub (P28/P29) and BEFORE
+  public-mode redaction (`_redact_public`): a secret-shaped string surviving
+  inside the KEPT (newest) slice still refuses the WHOLE panel, exactly as
+  before; content the trim already dropped from the OLD end is never scanned
+  or served, so it can neither leak nor be redacted. Fixed order: trim, then
+  scrub, then (if `--allow-host`/public mode) redact.
