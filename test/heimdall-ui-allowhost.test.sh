@@ -458,10 +458,14 @@ PIDS+=("${SSE_PIDS[@]}")
 # Give the 8 held streams time to actually clear _gate_then and acquire their
 # semaphore slot (each is a real handshake) before the 9th is sent, so the cap is
 # measured with all 8 slots genuinely occupied, not raced against connection setup.
-sleep 0.5
+sleep 1
 
 HDR9="$TMPROOT/sse-9.hdr"; BODY9="$TMPROOT/sse-9.json"
-rc9="$(curl -s -D "$HDR9" -o "$BODY9" -w '%{http_code}' "$BASE_G/api/events?$AUTH_G")"
+# --max-time 8: defensive bound only. If the settle sleep above ever loses the
+# race under heavy load, this request would be accepted as a real 200 SSE
+# stream (infinite by design) instead of the expected 503 -- without a timeout
+# that turns into an indefinite hang instead of a fast, diagnosable "bad".
+rc9="$(curl -s --max-time 8 -D "$HDR9" -o "$BODY9" -w '%{http_code}' "$BASE_G/api/events?$AUTH_G")"
 if [ "$rc9" = "503" ] && grep -qi '^retry-after: *5' "$HDR9" \
    && jq -e '.error=="too-many-streams" and .retry_after_s==5' "$BODY9" >/dev/null 2>&1; then
   ok "27. 9th concurrent /api/events past MAX_SSE_STREAMS(8) -> 503, Retry-After: 5, body {\"error\":\"too-many-streams\",\"retry_after_s\":5}"
