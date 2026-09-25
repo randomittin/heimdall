@@ -67,6 +67,14 @@ TMPROOT="$(mktemp -d)"
 export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
+# Short-circuits heimdall-fallback's own real network probe with no I/O at all
+# (bin/heimdall-fallback; established pattern, see test/heimdall-fallback.test.sh
+# and test/heimdall-ui-allowhost.test.sh) -- 0 (not 1) since nothing here
+# configures a real gateway and "unreachable" is the honest answer for this
+# sandbox. Without this, every /api/state poll on the server this file launches
+# shells out to the real heimdall-fallback status --json, which is a genuine
+# hang/contention risk under the 3-way concurrent sweep (allowhost+inbox+panels).
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 FIX="$TMPROOT/fixture-repo"
 mkdir -p "$HOME/.claude" "$FIX/.heimdall/receipts" "$FIX/.planning/reels"
 

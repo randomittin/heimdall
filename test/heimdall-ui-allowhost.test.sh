@@ -730,8 +730,9 @@ rc="$(curl -s -m 10 -o "$BODY" -w '%{http_code}' "$BASE_HF/api/state?$AUTH_HF")"
 ELAPSED="$SECONDS"
 
 if [ "$rc" = "200" ] && [ "$ELAPSED" -le 6 ] \
-   && jq -e '.fallback.state == null and .fallback.target_provider == null' "$BODY" >/dev/null 2>&1; then
-  ok "42. wedged heimdall-fallback (stub sleeps 30s): /api/state answers in ${ELAPSED}s with fallback={state:null,target_provider:null} -- never blocks on it (product fix: FALLBACK_CMD_TIMEOUT_S)"
+   && jq -e '.fallback.state == null and .fallback.target_provider == null
+             and .fallback.status == "unknown" and .fallback.reason == "timeout"' "$BODY" >/dev/null 2>&1; then
+  ok "42. wedged heimdall-fallback (stub sleeps 30s): /api/state answers in ${ELAPSED}s with fallback={state:null,target_provider:null,status:unknown,reason:timeout} -- never blocks on it (product fix: FALLBACK_CMD_TIMEOUT_S)"
 else
   bad "42. wedged heimdall-fallback: rc=$rc elapsed=${ELAPSED}s fallback=$(jq -c '.fallback' "$BODY" 2>/dev/null)"
 fi

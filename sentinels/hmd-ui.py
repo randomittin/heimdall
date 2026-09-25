@@ -456,7 +456,14 @@ def collect_fallback(root):
         timeout=FALLBACK_CMD_TIMEOUT_S, env=env,
     )
     if not isinstance(data, dict):
-        return {k: None for k in FALLBACK_ALLOWED_KEYS}
+        # Hard-timeout (or any other subprocess failure) degrade: keep the
+        # existing state/target_provider keys (null) for back-compat, and add
+        # status/reason so a caller can tell "off" apart from "we couldn't
+        # ask in time" instead of inferring it from two identical nulls.
+        result = {k: None for k in FALLBACK_ALLOWED_KEYS}
+        result["status"] = "unknown"
+        result["reason"] = "timeout"
+        return result
     # Decision 4: never forward endpoint / operator_key_* / config_path.
     return {k: data.get(k) for k in FALLBACK_ALLOWED_KEYS}
 
