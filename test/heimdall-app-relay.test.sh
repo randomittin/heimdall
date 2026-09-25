@@ -1271,6 +1271,44 @@ open('$CTL_G/004.json', 'w').write(json.dumps(env))
     bad "§7c: rebind produced no fresh state frame -- digest dedup suppressed the resync"
   fi
 
+  # ── §9 (audit #1): the session key is latched at the FIRST device_bound and
+  # never re-derived after -- a device_bound carrying a DIFFERENT device_pubkey
+  # must be loudly rejected, never silently adopted. Without the latch, a
+  # relay bug (or a malicious relay) could rebind an already-paired session
+  # onto an attacker-controlled device key with no visible error.
+  DEV2_KEY_JSON="$(python3 "$FAKE_RELAY" device keygen)"
+  DEV2_PUB_B64="$(printf '%s' "$DEV2_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pub_b64"])')"
+  BOUND_AT_HIJACK_G="$(python3 -c 'import time; print(int(time.time()))')"
+  python3 -c "
+import json
+env = {
+    'v': 1, 'session_id': '$SID_G', 'seq': 0, 'sender': 'relay',
+    'type': 'device_bound', 'nonce': None, 'ciphertext': None,
+    'payload': {'device_pubkey': '$DEV2_PUB_B64', 'bound_at': $BOUND_AT_HIJACK_G},
+}
+open('$CTL_G/005.json', 'w').write(json.dumps(env))
+"
+  if wait_for_event "$CLIENT_G_OUT" "error" "already latched" 8; then
+    ok "audit #1: device_bound with a different device_pubkey was rejected, not adopted"
+  else
+    bad "audit #1: a differing-key device_bound was not rejected with the expected error"
+  fi
+
+  SEAL_G2_JSON="$(python3 "$FAKE_RELAY" device seal --key-b64 "$SESSION_KEY_G" --seq 2 --sender device \
+    --text '{"action":"send-message","params":{"text":"still using the original key"}}')"
+  NONCE_G2="$(printf '%s' "$SEAL_G2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nonce_b64"])')"
+  CT_G2="$(printf '%s' "$SEAL_G2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ciphertext_b64"])')"
+  python3 "$FAKE_RELAY" device envelope --session-id "$SID_G" --seq 2 --sender device \
+    --type command --nonce "$NONCE_G2" --ciphertext "$CT_G2" > "$CTL_G/006.json"
+
+  ACK_G2_JSON="$(wait_for_ack_of_seq "$LOG_G/frames.ndjson" "$SESSION_KEY_G" 2 10)"
+  ACK_G2_OK="$(printf '%s' "$ACK_G2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null)"
+  if [ "$ACK_G2_OK" = "True" ]; then
+    ok "audit #1: original session key still works after the hijack attempt -- key was never re-derived"
+  else
+    bad "audit #1: original session key no longer works after the hijack attempt -- key was re-derived/overwritten (ack=$ACK_G2_JSON)"
+  fi
+
   kill "$CLIENT_G" 2>/dev/null
   wait "$CLIENT_G" 2>/dev/null
   kill "$SRV_G" 2>/dev/null
