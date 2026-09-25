@@ -33,9 +33,16 @@ never implements, retired 2026-09-24):
     info="hmd-relay-v1")), and is immediately ready to open `command` frames
     -- no ack is sent for `device_bound` itself (unlike a real `command`
     frame, it is a control frame, INV-20). `device_bound` may arrive more
-    than once per process lifetime (e.g. after a stream reconnect); each
-    occurrence re-derives the same key from the same inputs and is treated as
-    success, never as an error.
+    than once per process lifetime (e.g. after a stream reconnect); the
+    session key is latched on the FIRST occurrence and never re-derived
+    after (§9, audit #1). A repeat carrying the SAME device_pubkey is the
+    expected reconnect case -- treated as success, never as an error, and
+    still forces the next state tick to re-publish regardless of digest
+    (§7c) -- but a repeat carrying a DIFFERENT device_pubkey is never
+    trusted or adopted: a loud `error` event, key and pairing state left
+    untouched, since silently accepting it would let a relay bug (or a
+    malicious relay) rebind an already-paired session onto an
+    attacker-controlled device key.
     A `device_bound` whose `device_pubkey` is missing or fails to decode
     (INV-33: a relay-injected or malformed control frame must never be
     silently trusted) is a loud `error` event, ignored -- never crashes,
@@ -300,8 +307,17 @@ class RelayClient:
         self.session_key = None
 
         self.lock = threading.Lock()
-        self.hmd_seq = 0
-        self.last_device_seq = -1
+        # hmd's own first sealed frame now starts at seq=1 (not 0), and the
+        # floor for an accepted device seq is 0 (not -1): both legs of the
+        # app's crypto.ts enforce "seq must be strictly greater than 0" via
+        # open()'s `seq <= lastSeq` check (INITIAL_SEQ = 1), so a 0-valued
+        # first frame from either side was being silently rejected as a
+        # replay -- audit #3, 2026-09-25.
+        self.hmd_seq = 1
+        self.last_device_seq = 0
+        self.device_pub = None  # raw 32-byte key of the currently-bound
+                                 # device -- set once, on the first
+                                 # device_bound; see _handle_envelope.
         self.stop_event = threading.Event()
         self.state_ready = threading.Event()
         self._stopping = False
@@ -474,7 +490,13 @@ class RelayClient:
         try:
             plaintext = E2E.open_(self.session_key, seq, "device", env.get("nonce"), env.get("ciphertext"))
         except E2E.E2EError:
-            self.last_device_seq = seq
+            # audit #5, 2026-09-25: a frame that fails to decrypt must NEVER
+            # advance last_device_seq. The monotonic check above runs BEFORE
+            # decrypt, so an attacker-controlled seq on a forged/corrupted
+            # frame would otherwise permanently poison the replay guard and
+            # silently reject every later genuine command at or below that
+            # seq. Only a frame that actually decrypts moves the high-water
+            # mark (below, on the success path).
             emit({"event": "command", "action": None, "ok": False, "detail": "decrypt-failed"})
             self.send_hmd_frame("ack", {"ok": False, "detail": "decrypt-failed", "of_seq": seq})
             return
@@ -515,12 +537,48 @@ class RelayClient:
             payload = env.get("payload") or {}
             try:
                 device_pub = E2E.pub_from_b64(payload.get("device_pubkey") or "")
+            except Exception as e:
+                emit({"event": "error", "detail": "device_bound key derivation failed: %s" % e})
+                return
+            # §9, audit #1, 2026-09-25: the session key is latched at the FIRST
+            # device_bound and never re-derived after. Re-deriving unconditionally
+            # on every occurrence (the old behavior) meant a relay bug -- or a
+            # malicious relay -- could rebind an already-paired session onto a
+            # DIFFERENT device_pubkey with no visible error, silently handing the
+            # new "device" decrypt access to future commands. A repeat with the
+            # SAME device_pubkey (e.g. after a stream reconnect) is still the
+            # expected, harmless case: no re-derivation needed (ECDH is
+            # deterministic, so the result would be identical anyway), but §7c's
+            # resync still has to fire, since the phone's local state was just
+            # reset. A repeat with a DIFFERENT device_pubkey is never trusted or
+            # adopted -- loud error, key and pairing state untouched.
+            if self.session_key is not None:
+                if device_pub == self.device_pub:
+                    self.last_sent_digest = None
+                    self.bound_at = payload.get("bound_at")
+                    self.write_status()
+                    emit({"event": "device_bound", "bound_at": self.bound_at})
+                    return
+                emit({"event": "error",
+                      "detail": "device_bound device_pubkey differs from the already latched "
+                                "session key's -- ignored, key not re-derived"})
+                return
+            try:
                 self.session_key = E2E.derive_session_key(self.priv, device_pub, self.session_id)
             except Exception as e:
                 emit({"event": "error", "detail": "device_bound key derivation failed: %s" % e})
                 return
+            self.device_pub = device_pub
             self.paired = True
             self.bound_at = payload.get("bound_at")
+            # §7c, 2026-09-25: force the next tick to re-send state even if its
+            # digest hasn't changed since the last publish. A (re)bind means the
+            # phone's own local state was just reset -- INV-22's digest dedup
+            # must never suppress the resync it needs. `None` is the same
+            # never-a-real-digest sentinel __init__ uses to guarantee the very
+            # first tick always sends (line 256); digest_of() is a sha256 hex
+            # digest and can never equal it.
+            self.last_sent_digest = None
             self.write_status()
             emit({"event": "device_bound", "bound_at": self.bound_at})
             self.state_ready.set()

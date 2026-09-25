@@ -1363,6 +1363,203 @@ wait "$CLIENT_I" 2>/dev/null
 kill "$SRV_I" 2>/dev/null
 wait "$SRV_I" 2>/dev/null
 
+# ── Scenario G: session-semantics round 2 (§7/§7c/§8/§9) ───────────────────
+# hmdapp docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md, round 2 (§7-§9):
+# hmd's first sealed frame must start at seq=1, not 0 (audit #3); a device
+# rebind must re-send current state even with an unchanged digest (§7c); a
+# frame that fails to decrypt must never advance the replay guard (audit
+# #5); the session key is derived once, on the first device_bound, and
+# latched (audit #1). Gated on $E2E_PRESENT like claims 2-4: needs real
+# seal/open/derive, never the minstub.
+if [ "$E2E_PRESENT" = true ]; then
+  REPO_G="$(make_repo)"
+  PORT_G_RELAY="$(free_port)"
+  PORT_G_UI="$(free_port)"
+  LOG_G="$TMPROOT/g.log"; CTL_G="$TMPROOT/g.ctl"
+  mkdir -p "$LOG_G" "$CTL_G"
+
+  python3 "$FAKE_RELAY" serve "$PORT_G_RELAY" --log "$LOG_G" --ctl "$CTL_G" >"$TMPROOT/g.srv.out" 2>&1 &
+  SRV_G=$!
+  PIDS+=("$SRV_G")
+  for _ in $(seq 1 50); do
+    python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_G_RELAY))==0 else 1)" && break
+    sleep 0.1
+  done
+
+  DEV1_KEY_JSON="$(python3 "$FAKE_RELAY" device keygen)"
+  DEV1_PRIV_B64="$(printf '%s' "$DEV1_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["priv_b64"])')"
+  DEV1_PUB_B64="$(printf '%s' "$DEV1_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pub_b64"])')"
+  printf '%s' "$DEV1_PUB_B64" > "$CTL_G/bind-device"
+
+  CLIENT_G_OUT="$TMPROOT/g.client.out"
+  "$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_G_RELAY" --repo "$REPO_G" --ui-port "$PORT_G_UI" \
+    >"$CLIENT_G_OUT" 2>"$TMPROOT/g.client.err" &
+  CLIENT_G=$!
+  PIDS+=("$CLIENT_G")
+
+  if wait_for "$CLIENT_G_OUT" '"event":"pair_init"' 10; then
+    ok "scenario G: relay-client emitted pair_init"
+  else
+    bad "scenario G: relay-client never emitted pair_init"
+  fi
+  SID_G="$(python3 -c "
+import json
+for line in open('$CLIENT_G_OUT'):
+    o = json.loads(line)
+    if o.get('event') == 'pair_init':
+        print(o['qr']['session_id']); break
+" 2>/dev/null)"
+  HMD_PUB_G="$(python3 -c "
+import json
+for line in open('$CLIENT_G_OUT'):
+    o = json.loads(line)
+    if o.get('event') == 'pair_init':
+        print(o['qr']['hmd_pubkey']); break
+" 2>/dev/null)"
+
+  if wait_for "$CLIENT_G_OUT" '"event":"device_bound"' 10; then
+    ok "scenario G: first device_bound derived a session key"
+  else
+    bad "scenario G: relay-client never emitted the first device_bound"
+  fi
+
+  SESSION_KEY_G="$(python3 "$FAKE_RELAY" device derive --dev-priv-b64 "$DEV1_PRIV_B64" --hmd-pub-b64 "$HMD_PUB_G" --session-id "$SID_G" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["key_b64"])')"
+
+  # ── §7 (round 2, audit #3): hmd's first sealed frame carries seq 1 ───────
+  if wait_for_count "$LOG_G/frames.ndjson" 1 '"sender":"hmd"' 8; then
+    FIRST_HMD_SEQ="$(python3 -c "
+import json
+for line in open('$LOG_G/frames.ndjson'):
+    line = line.strip()
+    if not line: continue
+    o = json.loads(line)
+    if o.get('sender') == 'hmd':
+        print(o['seq']); break
+")"
+    if [ "$FIRST_HMD_SEQ" = "1" ]; then
+      ok "audit #3: hmd's first sealed frame carries seq=1 (got $FIRST_HMD_SEQ)"
+    else
+      bad "audit #3: hmd's first sealed frame carried seq=$FIRST_HMD_SEQ, want 1"
+    fi
+  else
+    bad "audit #3: no sender=hmd frame ever appeared to check its seq"
+  fi
+
+  # ── §8 (audit #5): a forged command that fails to decrypt must never
+  # advance last_device_seq -- a real frame at the true next seq is still
+  # accepted afterward (a corrupted-in-transit frame must never become a
+  # permanent denial-of-service on every later genuine command).
+  FORGED_SEQ_G=9007199254740991
+  SEAL_BAD_JSON="$(python3 "$FAKE_RELAY" device seal --key-b64 "$SESSION_KEY_G" --seq "$FORGED_SEQ_G" --sender device \
+    --text '{"action":"send-message","params":{"text":"forged"}}')"
+  NONCE_BAD_G="$(printf '%s' "$SEAL_BAD_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nonce_b64"])')"
+  CT_BAD_GOOD_G="$(printf '%s' "$SEAL_BAD_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ciphertext_b64"])')"
+  CT_BAD_G="$(python3 -c "
+import base64, sys
+raw = bytearray(base64.b64decode(sys.argv[1]))
+raw[0] ^= 0x01
+print(base64.b64encode(bytes(raw)).decode('ascii'))
+" "$CT_BAD_GOOD_G")"
+  python3 "$FAKE_RELAY" device envelope --session-id "$SID_G" --seq "$FORGED_SEQ_G" --sender device \
+    --type command --nonce "$NONCE_BAD_G" --ciphertext "$CT_BAD_G" > "$CTL_G/002.json"
+
+  if wait_for_event "$CLIENT_G_OUT" "command" "decrypt-failed" 8; then
+    ok "audit #5: forged high-seq frame with a corrupted ciphertext failed to decrypt, as expected"
+  else
+    bad "audit #5: forged frame did not produce a command/decrypt-failed event"
+  fi
+
+  SEAL_G1_JSON="$(python3 "$FAKE_RELAY" device seal --key-b64 "$SESSION_KEY_G" --seq 1 --sender device \
+    --text '{"action":"send-message","params":{"text":"hello after forged frame"}}')"
+  NONCE_G1="$(printf '%s' "$SEAL_G1_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nonce_b64"])')"
+  CT_G1="$(printf '%s' "$SEAL_G1_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ciphertext_b64"])')"
+  python3 "$FAKE_RELAY" device envelope --session-id "$SID_G" --seq 1 --sender device \
+    --type command --nonce "$NONCE_G1" --ciphertext "$CT_G1" > "$CTL_G/003.json"
+
+  ACK_G1_JSON="$(wait_for_ack_of_seq "$LOG_G/frames.ndjson" "$SESSION_KEY_G" 1 10)"
+  ACK_G1_OK="$(printf '%s' "$ACK_G1_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null)"
+  if [ "$ACK_G1_OK" = "True" ]; then
+    ok "audit #5: last_device_seq was not advanced by the forged frame -- the real next seq=1 was still accepted"
+  else
+    bad "audit #5: seq=1 was rejected after the forged high-seq frame -- last_device_seq was corrupted (ack=$ACK_G1_JSON)"
+  fi
+
+  # ── §7c: a device rebind (repeated device_bound, same device pubkey) must
+  # re-send the current sealed state frame even though its digest hasn't
+  # changed -- digest dedup (INV-22) must never suppress a post-rebind
+  # resync, since the phone's own local state was just reset by the rebind.
+  # Drain to quiescence first, same reasoning as INV-15's replay check above
+  # (line 631): the send-message just acked (seq=1, "hello after forged
+  # frame") appends to .heimdall/ui/inbox.jsonl, which organically changes
+  # collect_state()'s digest and republishes a "state" frame on the tick
+  # loop's own schedule, anywhere up to ~4s later. Snapshotting the "before"
+  # count immediately would race that unrelated fallout against the rebind's
+  # effect -- exactly the hazard wait_for_quiescent_count's docstring names.
+  wait_for_quiescent_count "$LOG_G/frames.ndjson" 3 20
+  STATE_COUNT_BEFORE_REBIND_G="$(count_matching "$LOG_G/frames.ndjson" '"sender":"hmd".*"type":"state"')"
+  BOUND_AT_REBIND_G="$(python3 -c 'import time; print(int(time.time()))')"
+  python3 -c "
+import json
+env = {
+    'v': 1, 'session_id': '$SID_G', 'seq': 0, 'sender': 'relay',
+    'type': 'device_bound', 'nonce': None, 'ciphertext': None,
+    'payload': {'device_pubkey': '$DEV1_PUB_B64', 'bound_at': $BOUND_AT_REBIND_G},
+}
+open('$CTL_G/004.json', 'w').write(json.dumps(env))
+"
+  if wait_for_count "$LOG_G/frames.ndjson" "$((STATE_COUNT_BEFORE_REBIND_G + 1))" '"sender":"hmd".*"type":"state"' 10; then
+    ok "§7c: rebind (same device pubkey) re-sent current state despite an unchanged digest"
+  else
+    bad "§7c: rebind produced no fresh state frame -- digest dedup suppressed the resync"
+  fi
+
+  # ── §9 (audit #1): the session key is latched at the FIRST device_bound and
+  # never re-derived after -- a device_bound carrying a DIFFERENT device_pubkey
+  # must be loudly rejected, never silently adopted. Without the latch, a
+  # relay bug (or a malicious relay) could rebind an already-paired session
+  # onto an attacker-controlled device key with no visible error.
+  DEV2_KEY_JSON="$(python3 "$FAKE_RELAY" device keygen)"
+  DEV2_PUB_B64="$(printf '%s' "$DEV2_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pub_b64"])')"
+  BOUND_AT_HIJACK_G="$(python3 -c 'import time; print(int(time.time()))')"
+  python3 -c "
+import json
+env = {
+    'v': 1, 'session_id': '$SID_G', 'seq': 0, 'sender': 'relay',
+    'type': 'device_bound', 'nonce': None, 'ciphertext': None,
+    'payload': {'device_pubkey': '$DEV2_PUB_B64', 'bound_at': $BOUND_AT_HIJACK_G},
+}
+open('$CTL_G/005.json', 'w').write(json.dumps(env))
+"
+  if wait_for_event "$CLIENT_G_OUT" "error" "already latched" 8; then
+    ok "audit #1: device_bound with a different device_pubkey was rejected, not adopted"
+  else
+    bad "audit #1: a differing-key device_bound was not rejected with the expected error"
+  fi
+
+  SEAL_G2_JSON="$(python3 "$FAKE_RELAY" device seal --key-b64 "$SESSION_KEY_G" --seq 2 --sender device \
+    --text '{"action":"send-message","params":{"text":"still using the original key"}}')"
+  NONCE_G2="$(printf '%s' "$SEAL_G2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nonce_b64"])')"
+  CT_G2="$(printf '%s' "$SEAL_G2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ciphertext_b64"])')"
+  python3 "$FAKE_RELAY" device envelope --session-id "$SID_G" --seq 2 --sender device \
+    --type command --nonce "$NONCE_G2" --ciphertext "$CT_G2" > "$CTL_G/006.json"
+
+  ACK_G2_JSON="$(wait_for_ack_of_seq "$LOG_G/frames.ndjson" "$SESSION_KEY_G" 2 10)"
+  ACK_G2_OK="$(printf '%s' "$ACK_G2_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null)"
+  if [ "$ACK_G2_OK" = "True" ]; then
+    ok "audit #1: original session key still works after the hijack attempt -- key was never re-derived"
+  else
+    bad "audit #1: original session key no longer works after the hijack attempt -- key was re-derived/overwritten (ack=$ACK_G2_JSON)"
+  fi
+
+  kill "$CLIENT_G" 2>/dev/null
+  wait "$CLIENT_G" 2>/dev/null
+  kill "$SRV_G" 2>/dev/null
+  wait "$SRV_G" 2>/dev/null
+else
+  skip "scenario G (session-semantics round 2, §7/§7c/§8/§9): bin/lib/hmd_relay_e2e.py absent -- needs device seal/open/derive"
+fi
+
 echo
 printf '%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ]
