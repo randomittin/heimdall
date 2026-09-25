@@ -466,6 +466,14 @@ class RelayClient:
                 return
             self.paired = True
             self.bound_at = payload.get("bound_at")
+            # §7c, 2026-09-25: force the next tick to re-send state even if its
+            # digest hasn't changed since the last publish. A (re)bind means the
+            # phone's own local state was just reset -- INV-22's digest dedup
+            # must never suppress the resync it needs. `None` is the same
+            # never-a-real-digest sentinel __init__ uses to guarantee the very
+            # first tick always sends (line 256); digest_of() is a sha256 hex
+            # digest and can never equal it.
+            self.last_sent_digest = None
             self.write_status()
             emit({"event": "device_bound", "bound_at": self.bound_at})
             self.state_ready.set()

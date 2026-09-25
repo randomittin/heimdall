@@ -1242,6 +1242,35 @@ print(base64.b64encode(bytes(raw)).decode('ascii'))
     bad "audit #5: seq=1 was rejected after the forged high-seq frame -- last_device_seq was corrupted (ack=$ACK_G1_JSON)"
   fi
 
+  # ── §7c: a device rebind (repeated device_bound, same device pubkey) must
+  # re-send the current sealed state frame even though its digest hasn't
+  # changed -- digest dedup (INV-22) must never suppress a post-rebind
+  # resync, since the phone's own local state was just reset by the rebind.
+  # Drain to quiescence first, same reasoning as INV-15's replay check above
+  # (line 631): the send-message just acked (seq=1, "hello after forged
+  # frame") appends to .heimdall/ui/inbox.jsonl, which organically changes
+  # collect_state()'s digest and republishes a "state" frame on the tick
+  # loop's own schedule, anywhere up to ~4s later. Snapshotting the "before"
+  # count immediately would race that unrelated fallout against the rebind's
+  # effect -- exactly the hazard wait_for_quiescent_count's docstring names.
+  wait_for_quiescent_count "$LOG_G/frames.ndjson" 3 20
+  STATE_COUNT_BEFORE_REBIND_G="$(count_matching "$LOG_G/frames.ndjson" '"sender":"hmd".*"type":"state"')"
+  BOUND_AT_REBIND_G="$(python3 -c 'import time; print(int(time.time()))')"
+  python3 -c "
+import json
+env = {
+    'v': 1, 'session_id': '$SID_G', 'seq': 0, 'sender': 'relay',
+    'type': 'device_bound', 'nonce': None, 'ciphertext': None,
+    'payload': {'device_pubkey': '$DEV1_PUB_B64', 'bound_at': $BOUND_AT_REBIND_G},
+}
+open('$CTL_G/004.json', 'w').write(json.dumps(env))
+"
+  if wait_for_count "$LOG_G/frames.ndjson" "$((STATE_COUNT_BEFORE_REBIND_G + 1))" '"sender":"hmd".*"type":"state"' 10; then
+    ok "§7c: rebind (same device pubkey) re-sent current state despite an unchanged digest"
+  else
+    bad "§7c: rebind produced no fresh state frame -- digest dedup suppressed the resync"
+  fi
+
   kill "$CLIENT_G" 2>/dev/null
   wait "$CLIENT_G" 2>/dev/null
   kill "$SRV_G" 2>/dev/null
