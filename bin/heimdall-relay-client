@@ -77,9 +77,19 @@ to drive its own UI; nothing else is ever written to stdout.
                                                        rotation at
                                                        HMD_RELAY_STREAM_ROTATE_S
                                                        -- retry_ms always 0, no
-                                                       backoff. reason absent:
-                                                       some other local read
-                                                       fault
+                                                       backoff. reason "closed":
+                                                       clean EOF with idle,
+                                                       overflow and rotate all
+                                                       ruled out -- likely the
+                                                       relay's own stream-
+                                                       lifetime bound, possibly
+                                                       after a relay deploy; a
+                                                       WARN-level error event
+                                                       names this immediately
+                                                       before the stream_drop.
+                                                       reason absent: a genuine
+                                                       local read fault (socket
+                                                       / HTTP exception)
     {"event":"session_ended","reason":..}             terminal; process exits 0
     {"event":"error","detail":..}                     non-fatal unless followed
                                                        by one of the two exit
@@ -151,7 +161,18 @@ try:
     MAX_ENVELOPE_BYTES = int(os.environ.get("HMD_RELAY_MAX_ENVELOPE_BYTES", "1048576"))
 except (TypeError, ValueError):
     MAX_ENVELOPE_BYTES = 1048576
-BACKOFF_BASE_MS = 2000
+# HMD_RELAY_BACKOFF_BASE_MS (default 2000ms): starting reconnect backoff after
+# a dropped/failed stream, doubling on each consecutive failure up to
+# BACKOFF_CAP_MS and resetting to this base on the next successful (200)
+# reconnect. Overridable so a test can drive a fast, timestamp-verifiable
+# backoff assertion (docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md Section
+# 15) without waiting out the real default. BACKOFF_CAP_MS stays a bare
+# literal on purpose -- an existing test asserts its exact literal-assignment
+# source form.
+try:
+    BACKOFF_BASE_MS = int(os.environ.get("HMD_RELAY_BACKOFF_BASE_MS", "2000"))
+except (TypeError, ValueError):
+    BACKOFF_BASE_MS = 2000
 BACKOFF_CAP_MS = 30000
 CONNECT_TIMEOUT_S = 15
 STREAM_TIMEOUT_S = None  # unbounded connect + response-header wait for GET
@@ -612,6 +633,13 @@ class RelayClient:
                 event.update(overflow_info)
             elif drop_reason == "idle":
                 event["reason"] = "idle"
+            elif drop_reason is None:
+                emit({"event": "error",
+                      "detail": "stream closed by relay with no local cause (idle, "
+                                "overflow and rotate all ruled out) -- likely the "
+                                "relay's own stream-lifetime bound, possibly "
+                                "following a relay deploy; reconnecting with backoff"})
+                event["reason"] = "closed"
             emit(event)
             if self.stop_event.wait(backoff_ms / 1000.0):
                 return

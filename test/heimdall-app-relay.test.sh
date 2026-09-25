@@ -1328,20 +1328,30 @@ else
   bad "§15: clean stream close never produced stream_drop reason=closed"
 fi
 
+RETRY_MS_I="$(printf '%s' "$CLOSED_JSON_I" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("retry_ms"))' 2>/dev/null)"
+if [ "$RETRY_MS_I" = "500" ]; then
+  ok "§15: closed stream_drop carries retry_ms=500 -- HMD_RELAY_BACKOFF_BASE_MS override reached the event, not the 2000ms default"
+else
+  bad "§15: closed stream_drop retry_ms was '$RETRY_MS_I', want 500 (HMD_RELAY_BACKOFF_BASE_MS override)"
+fi
+
 if wait_for_count "$CLIENT_I_OUT" 2 '"event":"device_bound"' 6; then
   ok "§15: client reconnected and re-bound after the warn"
   T1_I="$(python3 -c 'import time; print(time.time())')"
   ELAPSED_I="$(python3 -c "print($T1_I - $T0_I)")"
-  # lower bound: a broken/skipped backoff reconnects near-instantly instead.
-  # upper bound: the DEFAULT base (2000ms) would still clear a lower-bound-
-  # only check, so this must also stay well under 2s to prove the
-  # HMD_RELAY_BACKOFF_BASE_MS=500 override -- not just the module default --
-  # is what got honored.
-  ELAPSED_I_OK="$(python3 -c "print(1 if 0.4 <= $ELAPSED_I <= 1.5 else 0)")"
+  # retry_ms above is the direct, load-independent proof the override was
+  # honored. This is deliberately just a loose lower-bound sanity check that
+  # SOME real wait happened (a broken/skipped backoff reconnects near-
+  # instantly) -- not a tight upper-bound window: this suite runs scenario I
+  # after 8 earlier scenarios whose fake-relay/client processes are only
+  # reaped by the final EXIT trap, so scheduling overhead alone measured up
+  # to ~2s here under full-suite load. A tight upper bound was measuring
+  # machine load, not correctness, and that's exactly what made it flaky.
+  ELAPSED_I_OK="$(python3 -c "print(1 if $ELAPSED_I >= 0.15 else 0)")"
   if [ "$ELAPSED_I_OK" = "1" ]; then
-    ok "§15: reconnect honored the HMD_RELAY_BACKOFF_BASE_MS=500 override, not the 2000ms default (~${ELAPSED_I}s)"
+    ok "§15: reconnect wasn't instant -- a real backoff wait occurred (~${ELAPSED_I}s)"
   else
-    bad "§15: reconnect timing didn't match the HMD_RELAY_BACKOFF_BASE_MS=500 override (~${ELAPSED_I}s, want 0.4-1.5s)"
+    bad "§15: reconnect happened too fast (~${ELAPSED_I}s) -- backoff wait looks skipped"
   fi
 else
   bad "§15: client never reconnected/re-bound after the warn"
