@@ -161,8 +161,12 @@ PYEOF
 # field may be empty (best-effort — never fatal, never argv-leaks a secret).
 current_identity() {
   local h="" hd=""
-  [ -x "$IDENTITY_CLI" ] && h="$("$IDENTITY_CLI" current 2>/dev/null || true)"
-  [ -z "$h" ] && [ -x "$HAID_CLI" ] && h="$("$HAID_CLI" current 2>/dev/null || true)"
+  # NOTE: heimdall-identity's argv only accepts -h/--help, --handle, --json, whoami,
+  # --set, --seed (bin/heimdall-identity's case statement) -- it has no `current`
+  # subcommand, so "$IDENTITY_CLI current" always hit its `unknown argument` exit-2
+  # path and never produced h. Confirmed-dead fork removed (zero behavior change:
+  # h was always empty going into the HAID_CLI fallback below regardless).
+  [ -x "$HAID_CLI" ] && h="$("$HAID_CLI" current 2>/dev/null || true)"
   [ -x "$IDENTITY_CLI" ] && hd="$("$IDENTITY_CLI" --handle 2>/dev/null || true)"
   printf '%s\t%s' "$h" "$hd"
 }
@@ -353,8 +357,11 @@ log_auto() { # best-effort, secret-free
 # Used by `share` (the explicit command) and `auto` (SessionStart). Verifies the
 # repo is PROVEN private, then mints/records the secret + owner and commits it.
 # HARD-REFUSES (fail closed) on public/indeterminate — the cardinal leak guard.
-do_share() { # $1 = rotate(1|"")
-  local rotate="${1:-}"
+do_share() { # $1 = rotate(1|"")  $2 = precomputed visibility (optional; skips the
+             #      detect_visibility recompute when the caller -- cmd_auto -- already
+             #      resolved it moments earlier; every other call site omits $2 and gets
+             #      the same fresh compute as before)
+  local rotate="${1:-}" vis_in="${2:-}"
   local REPO_ROOT ORIGIN SLUG VIS
   REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -z "$REPO_ROOT" ]; then
@@ -363,7 +370,7 @@ do_share() { # $1 = rotate(1|"")
   fi
   ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
   SLUG="$(github_slug_of "$ORIGIN")"
-  VIS="$(detect_visibility)"
+  if [ -n "$vis_in" ]; then VIS="$vis_in"; else VIS="$(detect_visibility)"; fi
 
   # ── THE CARDINAL CONTROL: commit ONLY when the repo is PROVEN private. ──
   if [ "$VIS" != "private" ]; then
@@ -570,16 +577,20 @@ gh_auto() { # $1 = loud|quiet
   cp_severed && return 3
   # idempotent at SessionStart: already GitHub-formed -> nothing to do (no repeat POST).
   [ "$MODE" = quiet ] && team_has_auto_id && return 0
+  # need an AUTHENTICATED gh — the PROOF. Absent/unauth -> DEFER (also the hermetic-test path).
+  # Checked BEFORE the SLUG lookup on purpose: `command -v gh` is a shell builtin (free) and
+  # `gh auth token` is the cheapest real signal of "can this even work" -- no point paying for
+  # a git-remote fork + a python slug-parse fork when there is no token to spend on them
+  # (measured ~575ms of fork overhead on this defer path under contention; PR#team-default-slow).
+  command -v gh >/dev/null 2>&1 || return 3
+  local GH_PROOF GH_USER
+  GH_PROOF="$(gh auth token 2>/dev/null || true)"
+  [ -n "$GH_PROOF" ] || return 3
   # need a github remote slug.
   local ORIGIN SLUG
   ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
   SLUG="$(github_slug_of "$ORIGIN")"
   [ -n "$SLUG" ] || return 3
-  # need an AUTHENTICATED gh — the PROOF. Absent/unauth -> DEFER (also the hermetic-test path).
-  command -v gh >/dev/null 2>&1 || return 3
-  local GH_PROOF GH_USER
-  GH_PROOF="$(gh auth token 2>/dev/null || true)"
-  [ -n "$GH_PROOF" ] || return 3
   GH_USER="$(gh api user --jq .login 2>/dev/null || true)"
   [ -n "$GH_USER" ] || return 3
   # a CP url must resolve (flag/env/config/consent-default). None -> defer.
@@ -807,7 +818,7 @@ cmd_auto() {
       [ "$((now - mt))" -lt "$interval" ] && exit 0
     fi
     mkdir -p "$HOME/.heimdall" 2>/dev/null && : > "$stamp" 2>/dev/null || true  # claim window before work
-    do_share "" >/dev/null 2>&1 && log_auto "auto-committed team.json in $(repo_root)"
+    do_share "" "$VIS" >/dev/null 2>&1 && log_auto "auto-committed team.json in $(repo_root)"
   fi
   exit 0
 }
