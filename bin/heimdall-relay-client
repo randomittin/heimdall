@@ -115,7 +115,21 @@ itself failed to import).
 STATUS FILE (default <repo>/.heimdall/app/relay.json, atomic 0600 write, 0700
 dir, rewritten on every state change -- never holds a token or key):
     {session_id, relay, paired, bound_at, last_seq, frames_sent,
-     last_delivered, last_command_at, started_at, pid}
+     last_delivered, last_command_at, started_at, pid, event_log}
+
+EVENT LOG (HMD_RELAY_EVENT_LOG; default <repo>/.heimdall/app/relay-events.jsonl,
+atomic per-line append, 0600, 0700 dir; set to "" to disable -- no file is ever
+created in that case): a durable copy of every line this process ever writes
+to stdout (see STDOUT CONTRACT above -- unchanged, byte-for-byte), each with
+one added "ts" (ISO-8601 UTC, millisecond precision) field the stdout copy
+omits. Same secrets discipline as STATUS FILE above -- never a token, key, or
+command/state plaintext. Rotates at EVENT_LOG_MAX_BYTES (4 MiB),
+single-generation (path -> path.1, clobbering any previous .1 -- same
+mechanism as bin/lib/companion_ui_inbox.py's _rotate_if_oversized). A write
+failure (unwritable dir, disk full, ...) disables the log for the rest of
+this process's life and prints exactly one stderr notice -- never blocks or
+crashes the client, and never retried (a second failure would otherwise mean
+a second notice, defeating the point).
 """
 
 import argparse
@@ -232,10 +246,119 @@ try:
 except (TypeError, ValueError):
     STREAM_ROTATE_S = 540.0
 
+# HMD_RELAY_EVENT_LOG (docs/HANDOFF-TO-HEIMDALL-relay-send-ack.md "New ask"):
+# durable append-only NDJSON mirror of every line emit() writes to stdout, so
+# a backgrounded session (stdout usually discarded, see cmd_connect_relay's
+# --bg path in bin/heimdall-app) still leaves a record a phone-side session
+# can read after the fact. None == unset (use the default path under --repo,
+# resolved once configure_event_log() runs); "" == explicitly disabled, no
+# file ever created; anything else overrides the path outright.
+_EVENT_LOG_ENV = os.environ.get("HMD_RELAY_EVENT_LOG")
+EVENT_LOG_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB, single-generation rotation to .1
+
+_event_log_path = None       # resolved by configure_event_log(); None before
+                              # that call AND whenever logging is disabled --
+                              # both cases mean "emit() writes nothing extra"
+_event_log_notified = False  # true once the one allowed stderr failure
+                              # notice (see _append_event_log) has fired
+
+# emit() is called from two threads with no prior coordination between them
+# (main()'s stream_thread running RelayClient._stream_loop, and the main
+# thread's own run_state_loop periodic tick -- see main() below), and unlike
+# self.lock above (an INSTANCE lock guarding frame-sequencing state, unrelated
+# to this), nothing previously serialized concurrent emit() calls -- each
+# thread's stdout write was already syscall-atomic on its own (one write() per
+# line, well under PIPE_BUF), so lines never interleaved character-by-
+# character, but two threads' EVENTS could still land in either order. That
+# was harmless when stdout was the only output. Now that every event is ALSO
+# durably logged (a second, separate write() to a second fd), the two writes
+# making up one emit() call are no longer a single syscall -- without a lock,
+# thread A's stdout write and thread B's stdout write could happen in one
+# order while thread A's log write and thread B's log write happen in the
+# OTHER order, leaving stdout and the durable log genuinely disagreeing about
+# what happened first. This lock makes each emit() call's [stdout write, log
+# append] pair atomic relative to every other emit() call, so the log is
+# always a faithful mirror of stdout's own order -- whatever that order turns
+# out to be -- rather than an independently-racing second record of it.
+_emit_lock = threading.Lock()
+
+
+def configure_event_log(repo_root):
+    """Resolve the durable event-log path from HMD_RELAY_EVENT_LOG and
+    `repo_root` into module state -- emit() is a bare function called before
+    any RelayClient exists (see main(), and the pair_init/e2e-unavailable
+    error paths above it), so this can't live on an instance the way
+    status_path does. Idempotent; main() calls it exactly once, right after
+    --repo is parsed, so even the earliest emit() calls are covered."""
+    global _event_log_path
+    if _EVENT_LOG_ENV == "":
+        _event_log_path = None
+        return
+    _event_log_path = _EVENT_LOG_ENV or os.path.join(repo_root, ".heimdall", "app", "relay-events.jsonl")
+
+
+def _rotate_event_log_if_oversized(path):
+    """Single-generation rotation: path -> path.1 (clobbering any previous
+    .1) once `path` is already >= EVENT_LOG_MAX_BYTES, so the next append
+    starts a fresh file -- identical mechanism to
+    bin/lib/companion_ui_inbox.py's _rotate_if_oversized, minus its flock
+    (that file has multiple writers; this one has exactly one -- a single
+    relay-client process owns its own event log for its whole lifetime)."""
+    try:
+        if os.path.getsize(path) < EVENT_LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    os.replace(path, path + ".1")
+
+
+def _event_log_timestamp():
+    now = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + ".%03dZ" % int(now % 1 * 1000)
+
+
+def _append_event_log(obj):
+    """Best-effort durable copy of one emit() line, plus an ISO-8601 UTC "ts"
+    field the stdout copy never carries (STDOUT CONTRACT is unchanged).
+    Never raises and never blocks the caller on failure: a broken log
+    (unwritable dir, disk full, ...) disables itself for the rest of this
+    process's life and prints exactly one stderr notice, then keeps going --
+    persisting events is a debugging convenience, not a correctness gate the
+    actual relay session depends on. Broad except-and-report is deliberate,
+    matching this file's own convention at every non-critical I/O boundary
+    (e.g. run_state_loop's per-tick try/except, or _atomic_write_json's
+    try/except above)."""
+    global _event_log_path, _event_log_notified
+    if _event_log_path is None:
+        return
+    try:
+        d = os.path.dirname(_event_log_path)
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, 0o700)
+        _rotate_event_log_if_oversized(_event_log_path)
+        record = dict(obj)
+        record["ts"] = _event_log_timestamp()
+        line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        fd = os.open(_event_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.chmod(_event_log_path, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        _event_log_path = None
+        if not _event_log_notified:
+            _event_log_notified = True
+            sys.stderr.write(
+                "heimdall-relay-client: event log disabled after a write failure "
+                "(%s) -- continuing without it\n" % e)
+
 
 def emit(obj):
-    sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    with _emit_lock:
+        sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        _append_event_log(obj)
 
 
 def _atomic_write_json(path, obj):
@@ -346,6 +469,7 @@ class RelayClient:
             "last_command_at": self.last_command_at,
             "started_at": self.started_at,
             "pid": os.getpid(),
+            "event_log": _event_log_path,
         }
 
     def write_status(self):
@@ -762,6 +886,12 @@ def main(argv=None):
     parsed = _split_relay(args.relay)
     if parsed is None:
         ap.error("--relay must be an http:// or https:// URL")
+
+    # Configured before the first possible emit() below (mirrors _split_relay
+    # being computed here AND again inside RelayClient.__init__ -- a cheap
+    # pure computation done early for a pre-flight need, same pattern) so
+    # even the e2e-unavailable/UI-import error events are captured.
+    configure_event_log(os.path.realpath(os.path.expanduser(args.repo)))
 
     if UI is None:
         emit({"event": "error",

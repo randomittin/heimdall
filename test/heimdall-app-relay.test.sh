@@ -1560,6 +1560,392 @@ else
   skip "scenario G (session-semantics round 2, §7/§7c/§8/§9): bin/lib/hmd_relay_e2e.py absent -- needs device seal/open/derive"
 fi
 
+# ── Scenario J: docs/HANDOFF-TO-HEIMDALL-relay-send-ack.md "New ask" -- every
+# stdout event is durably mirrored, in order, to the default
+# <repo>/.heimdall/app/relay-events.jsonl, each log line adding only an
+# ISO-8601 UTC "ts" field the stdout copy never carries. Compared only AFTER
+# the client has been stopped (never while it is still running), so a
+# straggler periodic tick can never turn this into a race against a moving
+# target ─────────────────────────────────────────────────────────────────────
+REPO_J="$(make_repo)"
+PORT_J_RELAY="$(free_port)"
+PORT_J_UI="$(free_port)"
+LOG_J="$TMPROOT/j.log"; CTL_J="$TMPROOT/j.ctl"
+mkdir -p "$LOG_J" "$CTL_J"
+
+python3 "$FAKE_RELAY" serve "$PORT_J_RELAY" --log "$LOG_J" --ctl "$CTL_J" >"$TMPROOT/j.srv.out" 2>&1 &
+SRV_J=$!
+PIDS+=("$SRV_J")
+for _ in $(seq 1 50); do
+  python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_J_RELAY))==0 else 1)" && break
+  sleep 0.1
+done
+
+CLIENT_J_OUT="$TMPROOT/j.client.out"
+"$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_J_RELAY" --repo "$REPO_J" --ui-port "$PORT_J_UI" \
+  >"$CLIENT_J_OUT" 2>"$TMPROOT/j.client.err" &
+CLIENT_J=$!
+PIDS+=("$CLIENT_J")
+
+EVENT_LOG_J="$REPO_J/.heimdall/app/relay-events.jsonl"
+if wait_for "$CLIENT_J_OUT" '"event":"device_bound"' 10; then
+  ok "scenario J: relay-client bound (stdout)"
+else
+  bad "scenario J: relay-client never bound -- cannot test durable event log"
+fi
+wait_for "$EVENT_LOG_J" '"event":"device_bound"' 10 || true
+
+wait_for_quiescent_count "$CLIENT_J_OUT" 1 5 || true
+kill "$CLIENT_J" 2>/dev/null
+wait "$CLIENT_J" 2>/dev/null
+kill "$SRV_J" 2>/dev/null
+wait "$SRV_J" 2>/dev/null
+
+if [ -f "$EVENT_LOG_J" ]; then
+  ok "durable event log: default path <repo>/.heimdall/app/relay-events.jsonl was created"
+else
+  bad "durable event log: $EVENT_LOG_J was never created"
+fi
+
+STDOUT_LINES_J="$(wc -l < "$CLIENT_J_OUT" 2>/dev/null | tr -d ' ')"
+LOG_LINES_J="$(wc -l < "$EVENT_LOG_J" 2>/dev/null | tr -d ' ')"
+[ -z "$STDOUT_LINES_J" ] && STDOUT_LINES_J=0
+[ -z "$LOG_LINES_J" ] && LOG_LINES_J=0
+if [ "$LOG_LINES_J" -eq "$STDOUT_LINES_J" ] && [ "$LOG_LINES_J" -gt 0 ]; then
+  ok "durable event log: line count matches stdout exactly ($LOG_LINES_J lines, client fully stopped before compare)"
+else
+  bad "durable event log: line count mismatch -- stdout=$STDOUT_LINES_J log=$LOG_LINES_J"
+fi
+
+ORDER_OUT_J="$TMPROOT/j.order.out"
+python3 - "$CLIENT_J_OUT" "$EVENT_LOG_J" >"$ORDER_OUT_J" 2>"$TMPROOT/j.order.err" <<'PYEOF'
+import json, sys
+
+
+def load(path):
+    out = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+stdout_events = load(sys.argv[1])
+log_events = load(sys.argv[2])
+if len(stdout_events) != len(log_events) or not stdout_events:
+    print("RESULT order_ok False")
+    sys.exit(0)
+for so, lo in zip(stdout_events, log_events):
+    lo = dict(lo)
+    ts = lo.pop("ts", None)
+    if lo != so or not isinstance(ts, str) or not ts.endswith("Z"):
+        print("RESULT order_ok False")
+        sys.exit(0)
+print("RESULT order_ok True")
+PYEOF
+ORDER_OK_J="$(grep -o 'RESULT order_ok [A-Za-z]*' "$ORDER_OUT_J" | awk '{print $3}')"
+if [ "$ORDER_OK_J" = "True" ]; then
+  ok "durable event log: every line matches stdout in order, plus one added ISO-8601 UTC 'ts' field"
+else
+  bad "durable event log: content/order/ts mismatch against stdout (got '$ORDER_OK_J') -- $(cat "$TMPROOT/j.order.err")"
+fi
+
+SECRET_HITS_J="$(grep -Eic 'priv|secret|session_key|"token"' "$EVENT_LOG_J" 2>/dev/null || true)"
+[ -z "$SECRET_HITS_J" ] && SECRET_HITS_J=0
+if [ "$SECRET_HITS_J" -eq 0 ]; then
+  ok "durable event log: no secret-shaped field (priv/secret/session_key/token) ever written"
+else
+  bad "durable event log: found $SECRET_HITS_J secret-shaped line(s) in the event log"
+fi
+
+# ── Scenario K: durable event log rotation -- HMD_RELAY_EVENT_LOG rotates
+# path -> path.1 (single generation, clobbering any previous .1) once path
+# reaches EVENT_LOG_MAX_BYTES (4 MiB), mirroring
+# bin/lib/companion_ui_inbox.py's _rotate_if_oversized. Direct in-process
+# import (no live relay/subprocess needed -- same SourceFileLoader technique
+# as Scenario F/INV-16) so the 4 MiB fixture and rotation can be asserted
+# deterministically instead of racing real network I/O ─────────────────────
+REPO_K="$(make_repo)"
+EVENT_LOG_K="$TMPROOT/k-eventlog-dir/relay-events.jsonl"
+mkdir -p "$(dirname "$EVENT_LOG_K")"
+python3 -c '
+import sys
+path = sys.argv[1]
+line = b"old-generation-filler\n"
+with open(path, "wb") as f:
+    while f.tell() < 4 * 1024 * 1024 + 1000:
+        f.write(line)
+' "$EVENT_LOG_K"
+OLD_SIZE_K="$(wc -c < "$EVENT_LOG_K" | tr -d ' ')"
+
+ROTATE_OUT_K="$TMPROOT/k.rotate.out"
+HMD_RELAY_EVENT_LOG="$EVENT_LOG_K" python3 - "$RELAY_CLIENT_RUN" "$REPO_K" >"$ROTATE_OUT_K" 2>"$TMPROOT/k.rotate.err" <<'PYEOF'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+
+client_path, repo_dir = sys.argv[1:3]
+loader = SourceFileLoader("hmd_relay_client_rotate", client_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+print("RESULT max_bytes %d" % mod.EVENT_LOG_MAX_BYTES)
+mod.configure_event_log(repo_dir)
+print("RESULT configured_path %s" % mod._event_log_path)
+mod.emit({"event": "state_sent", "seq": 1})
+mod.emit({"event": "state_sent", "seq": 2})
+sys.exit(0)
+PYEOF
+ROTATE_RC_K=$?
+
+if [ "$ROTATE_RC_K" -eq 0 ]; then
+  ok "rotation: in-process emit() harness exited 0"
+else
+  bad "rotation: harness exited $ROTATE_RC_K -- $(cat "$TMPROOT/k.rotate.err")"
+fi
+
+MAX_BYTES_K="$(grep -o 'RESULT max_bytes [0-9]*' "$ROTATE_OUT_K" | awk '{print $3}')"
+if [ "$MAX_BYTES_K" = "4194304" ]; then
+  ok "rotation: EVENT_LOG_MAX_BYTES is 4194304 (4 MiB)"
+else
+  bad "rotation: EVENT_LOG_MAX_BYTES was '$MAX_BYTES_K', expected 4194304"
+fi
+
+CONFIGURED_PATH_K="$(sed -n 's/^RESULT configured_path //p' "$ROTATE_OUT_K")"
+if [ "$CONFIGURED_PATH_K" = "$EVENT_LOG_K" ]; then
+  ok "rotation: HMD_RELAY_EVENT_LOG override honored as the configured path"
+else
+  bad "rotation: configured path was '$CONFIGURED_PATH_K', expected '$EVENT_LOG_K'"
+fi
+
+if [ "$OLD_SIZE_K" -ge 4194304 ]; then
+  ok "rotation fixture: pre-existing log was >= 4 MiB before any append ($OLD_SIZE_K bytes)"
+else
+  bad "rotation fixture: pre-existing log was only $OLD_SIZE_K bytes, need >= 4194304 for this scenario to be meaningful"
+fi
+
+if [ -f "$EVENT_LOG_K.1" ]; then
+  ok "rotation: $EVENT_LOG_K.1 was created"
+else
+  bad "rotation: $EVENT_LOG_K.1 was never created"
+fi
+
+ROTATED_SIZE_K="$(wc -c < "$EVENT_LOG_K.1" 2>/dev/null | tr -d ' ')"
+[ -z "$ROTATED_SIZE_K" ] && ROTATED_SIZE_K=0
+if [ "$ROTATED_SIZE_K" = "$OLD_SIZE_K" ]; then
+  ok "rotation: .1 holds exactly the old generation's bytes ($ROTATED_SIZE_K bytes), untouched"
+else
+  bad "rotation: .1 size ($ROTATED_SIZE_K) does not match the old generation's size ($OLD_SIZE_K)"
+fi
+
+NEW_LINES_K="$(grep -c '"event":"state_sent"' "$EVENT_LOG_K" 2>/dev/null || true)"
+[ -z "$NEW_LINES_K" ] && NEW_LINES_K=0
+if [ "$NEW_LINES_K" -eq 2 ]; then
+  ok "rotation: fresh $EVENT_LOG_K holds only the 2 new post-rotation events (not the 4+ MiB of stale ones)"
+else
+  bad "rotation: fresh log has $NEW_LINES_K state_sent lines, want exactly 2"
+fi
+
+OLD_FILLER_IN_NEW_K="$(grep -c 'old-generation-filler' "$EVENT_LOG_K" 2>/dev/null || true)"
+[ -z "$OLD_FILLER_IN_NEW_K" ] && OLD_FILLER_IN_NEW_K=0
+if [ "$OLD_FILLER_IN_NEW_K" -eq 0 ]; then
+  ok "rotation: none of the old generation's filler lines leaked into the fresh log"
+else
+  bad "rotation: $OLD_FILLER_IN_NEW_K old filler line(s) leaked into the fresh (post-rotation) log"
+fi
+
+# ── Scenario L: durable event log -- an unwritable directory (os.makedirs
+# fails at the very first missing path component) never blocks or crashes
+# the client: it prints exactly one stderr notice and keeps emitting to
+# stdout normally for the rest of its life (never retried -- see
+# _append_event_log's docstring) ────────────────────────────────────────────
+if [ "$(id -u)" = "0" ]; then
+  skip "scenario L (unwritable event-log dir): running as root -- permission bits are not enforced"
+else
+  REPO_L="$(make_repo)"
+  chmod 0500 "$REPO_L"
+
+  UNWRITABLE_OUT_L="$TMPROOT/l.out"
+  python3 - "$RELAY_CLIENT_RUN" "$REPO_L" >"$UNWRITABLE_OUT_L" 2>"$TMPROOT/l.err" <<'PYEOF'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+
+client_path, repo_dir = sys.argv[1:3]
+loader = SourceFileLoader("hmd_relay_client_unwritable", client_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+mod.configure_event_log(repo_dir)
+print("RESULT configured_path %s" % mod._event_log_path)
+mod.emit({"event": "state_sent", "seq": 1})
+mod.emit({"event": "state_sent", "seq": 2})
+mod.emit({"event": "state_sent", "seq": 3})
+print("RESULT path_after %s" % mod._event_log_path)
+print("RESULT notified %r" % mod._event_log_notified)
+sys.exit(0)
+PYEOF
+  UNWRITABLE_RC_L=$?
+  chmod 0700 "$REPO_L"
+
+  if [ "$UNWRITABLE_RC_L" -eq 0 ]; then
+    ok "unwritable dir: emit() harness exited 0 -- never crashed or raised"
+  else
+    bad "unwritable dir: harness exited $UNWRITABLE_RC_L -- $(cat "$TMPROOT/l.err")"
+  fi
+
+  STDOUT_COUNT_L="$(grep -c '"event":"state_sent"' "$UNWRITABLE_OUT_L" 2>/dev/null || true)"
+  [ -z "$STDOUT_COUNT_L" ] && STDOUT_COUNT_L=0
+  if [ "$STDOUT_COUNT_L" -eq 3 ]; then
+    ok "unwritable dir: all 3 emit() calls still reached stdout (client keeps running)"
+  else
+    bad "unwritable dir: expected 3 state_sent lines on stdout, got $STDOUT_COUNT_L"
+  fi
+
+  STDERR_NOTICE_COUNT_L="$(grep -c 'event log disabled after a write failure' "$TMPROOT/l.err" 2>/dev/null || true)"
+  [ -z "$STDERR_NOTICE_COUNT_L" ] && STDERR_NOTICE_COUNT_L=0
+  if [ "$STDERR_NOTICE_COUNT_L" -eq 1 ]; then
+    ok "unwritable dir: exactly one stderr notice printed (not one per failed emit)"
+  else
+    bad "unwritable dir: expected exactly 1 stderr notice, got $STDERR_NOTICE_COUNT_L -- $(cat "$TMPROOT/l.err")"
+  fi
+
+  if grep -q 'RESULT path_after None' "$UNWRITABLE_OUT_L"; then
+    ok "unwritable dir: event log disabled itself (path reset to None) after the first failure"
+  else
+    bad "unwritable dir: event log path was not reset to None after failure -- $(grep path_after "$UNWRITABLE_OUT_L")"
+  fi
+
+  if grep -q 'RESULT notified True' "$UNWRITABLE_OUT_L"; then
+    ok "unwritable dir: _event_log_notified latched True"
+  else
+    bad "unwritable dir: _event_log_notified never latched -- $(grep notified "$UNWRITABLE_OUT_L")"
+  fi
+fi
+
+# ── Scenario M: durable event log -- HMD_RELAY_EVENT_LOG="" (explicitly
+# empty, not unset) disables the log outright: no file is ever created,
+# anywhere, and stdout keeps working exactly as if the feature didn't exist ─
+REPO_M="$(make_repo)"
+DISABLED_OUT_M="$TMPROOT/m.out"
+HMD_RELAY_EVENT_LOG="" python3 - "$RELAY_CLIENT_RUN" "$REPO_M" >"$DISABLED_OUT_M" 2>"$TMPROOT/m.err" <<'PYEOF'
+import importlib.util, os, sys
+from importlib.machinery import SourceFileLoader
+
+client_path, repo_dir = sys.argv[1:3]
+loader = SourceFileLoader("hmd_relay_client_disabled", client_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+mod.configure_event_log(repo_dir)
+print("RESULT configured_path %r" % (mod._event_log_path,))
+mod.emit({"event": "state_sent", "seq": 1})
+mod.emit({"event": "state_sent", "seq": 2})
+default_path = os.path.join(repo_dir, ".heimdall", "app", "relay-events.jsonl")
+print("RESULT default_path_exists %r" % os.path.exists(default_path))
+print("RESULT heimdall_dir_exists %r" % os.path.exists(os.path.join(repo_dir, ".heimdall")))
+sys.exit(0)
+PYEOF
+DISABLED_RC_M=$?
+
+if [ "$DISABLED_RC_M" -eq 0 ]; then
+  ok "disabled-via-env: emit() harness exited 0"
+else
+  bad "disabled-via-env: harness exited $DISABLED_RC_M -- $(cat "$TMPROOT/m.err")"
+fi
+
+if grep -q 'RESULT configured_path None' "$DISABLED_OUT_M"; then
+  ok 'disabled-via-env: HMD_RELAY_EVENT_LOG="" resolved _event_log_path to None'
+else
+  bad "disabled-via-env: configured_path was not None -- $(grep configured_path "$DISABLED_OUT_M")"
+fi
+
+STDOUT_COUNT_M="$(grep -c '"event":"state_sent"' "$DISABLED_OUT_M" 2>/dev/null || true)"
+[ -z "$STDOUT_COUNT_M" ] && STDOUT_COUNT_M=0
+if [ "$STDOUT_COUNT_M" -eq 2 ]; then
+  ok "disabled-via-env: both emit() calls still reached stdout normally"
+else
+  bad "disabled-via-env: expected 2 state_sent lines on stdout, got $STDOUT_COUNT_M"
+fi
+
+if grep -q 'RESULT default_path_exists False' "$DISABLED_OUT_M"; then
+  ok "disabled-via-env: the default event-log path was never created"
+else
+  bad "disabled-via-env: default event-log path exists when it should not -- $(grep default_path_exists "$DISABLED_OUT_M")"
+fi
+
+if grep -q 'RESULT heimdall_dir_exists False' "$DISABLED_OUT_M"; then
+  ok "disabled-via-env: not even the containing .heimdall dir was created"
+else
+  bad "disabled-via-env: .heimdall dir was created even though logging is disabled -- $(grep heimdall_dir_exists "$DISABLED_OUT_M")"
+fi
+
+STDERR_SIZE_M="$(wc -c < "$TMPROOT/m.err" 2>/dev/null | tr -d ' ')"
+[ -z "$STDERR_SIZE_M" ] && STDERR_SIZE_M=0
+if [ "$STDERR_SIZE_M" -eq 0 ]; then
+  ok "disabled-via-env: no stderr output at all (disabling is not a failure)"
+else
+  bad "disabled-via-env: unexpected stderr output -- $(cat "$TMPROOT/m.err")"
+fi
+
+# ── Scenario N: `hmd app status` surfaces the durable event log's path and
+# last-event time (bin/heimdall-app's cmd_status_relay; HANDOFF's "hmd app
+# status must show the log path + last event time"). Hand-synthesized
+# connect.json/relay.json -- no live processes needed, since cmd_status_relay
+# prints every field (including the new ones) before its alive-check can
+# short-circuit, confirmed by reading its body ──────────────────────────────
+REPO_N="$(make_repo)"
+mkdir -p "$REPO_N/.heimdall/app"
+
+cat > "$REPO_N/.heimdall/app/connect.json" <<JSON
+{"mode":"relay","pid_ui":$$,"pid_client":$$,"port":0,"relay":"http://127.0.0.1:1","started_at":"2026-01-01T00:00:00Z"}
+JSON
+
+EVENT_LOG_N="$REPO_N/.heimdall/app/relay-events.jsonl"
+printf '{"event":"device_bound","ts":"2026-01-01T00:00:01.000Z"}\n' > "$EVENT_LOG_N"
+
+cat > "$REPO_N/.heimdall/app/relay.json" <<JSON
+{"session_id":"sess-n","relay":"http://127.0.0.1:1","paired":true,"bound_at":1,
+ "last_seq":1,"frames_sent":1,"last_delivered":"2026-01-01T00:00:01Z","pid":$$,
+ "last_command_at":null,"started_at":1,"event_log":"$EVENT_LOG_N"}
+JSON
+
+STATUS_OUT_N="$("$APP" status --repo "$REPO_N" 2>"$TMPROOT/n.status.err")"
+
+if printf '%s\n' "$STATUS_OUT_N" | grep -qF "event log: $EVENT_LOG_N"; then
+  ok "hmd app status: prints the event log's path"
+else
+  bad "hmd app status: did not print the event log path -- $STATUS_OUT_N"
+fi
+
+if printf '%s\n' "$STATUS_OUT_N" | grep -Eq 'last event at: [0-9]{4}-[0-9]{2}-[0-9]{2}T'; then
+  ok "hmd app status: prints an ISO-8601 last-event time for the event log"
+else
+  bad "hmd app status: did not print a last-event timestamp -- $STATUS_OUT_N"
+fi
+
+# event_log:null in relay.json -> "disabled", never a blank or malformed line
+REPO_N2="$(make_repo)"
+mkdir -p "$REPO_N2/.heimdall/app"
+cat > "$REPO_N2/.heimdall/app/connect.json" <<JSON
+{"mode":"relay","pid_ui":$$,"pid_client":$$,"port":0,"relay":"http://127.0.0.1:1","started_at":"2026-01-01T00:00:00Z"}
+JSON
+cat > "$REPO_N2/.heimdall/app/relay.json" <<JSON
+{"session_id":"sess-n2","relay":"http://127.0.0.1:1","paired":false,"bound_at":null,
+ "last_seq":0,"frames_sent":0,"last_delivered":null,"pid":$$,
+ "last_command_at":null,"started_at":1,"event_log":null}
+JSON
+
+STATUS_OUT_N2="$("$APP" status --repo "$REPO_N2" 2>"$TMPROOT/n2.status.err")"
+if printf '%s\n' "$STATUS_OUT_N2" | grep -qF "event log: disabled"; then
+  ok "hmd app status: event_log:null in relay.json prints 'event log: disabled'"
+else
+  bad "hmd app status: did not print 'event log: disabled' for a null event_log -- $STATUS_OUT_N2"
+fi
+
 echo
 printf '%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ]
