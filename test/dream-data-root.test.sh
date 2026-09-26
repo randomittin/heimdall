@@ -34,6 +34,10 @@
 #        job sees new evidence) AND the repo (so git history is not regressed).
 #   (9)  MARKER — the hashed dir names the repo it belongs to, so a human can tell
 #        which checkout a key maps to without reversing a hash.
+#   (10) THE REPO ROOT ITSELF DENIED — TCC denies the REPO ROOT, not just .planning,
+#        which reaches a different guard: --repo validation must distinguish DENIED
+#        from MISSING (os.path.isdir answers False for both), or a denied root aborts
+#        the run one step after the runner correctly decided to continue.
 #
 # Hermetic: every case runs against a THROWAWAY repo and a THROWAWAY $HEIMDALL_HOME.
 # Nothing here touches the real ~/.heimdall, the real LaunchAgents dir, launchctl, the
@@ -226,6 +230,46 @@ if grep -q 'Traceback' <<<"$DENIED_OUT"; then
   bad "(6) the unreadable-repo run raised no traceback"
 else
   ok "(6) the unreadable-repo run raised no traceback"
+fi
+
+# ── (10) THE REPO ROOT ITSELF DENIED — the true TCC shape ────────────────────────
+# Case (6) denies <repo>/.planning, which the writer survives. TCC denies the REPO ROOT,
+# and that reaches a different guard: dream validates --repo with os.path.isdir, which
+# answers False for "denied" exactly as it does for "missing". That aborted the run one
+# step after the runner had correctly decided to continue. The distinction has to be
+# drawn on the errno, and this is what pins it.
+R7="$(mkrepo repo-rootdenied)"
+H7="$(newhome rootdenied)"
+printf '{"ts":"2026-08-01T00:00:00Z","metric":"parallelism","n":1}\n' > "$R7/.planning/metrics.jsonl"
+HEIMDALL_HOME="$H7" "$PY" "$PYLIB" ensure --repo "$R7" >/dev/null 2>&1 || true
+R7_REPORT="$(HEIMDALL_HOME="$H7" "$PY" "$PYLIB" planning --repo "$R7" 2>/dev/null)/dream/2026-08-07.md"
+chmod 000 "$R7" 2>/dev/null || true
+R7_OUT="$(HEIMDALL_HOME="$H7" "$PY" "$DREAM" --repo "$R7" run --date 2026-08-07 2>&1 || true)"
+R7_RC=0
+HEIMDALL_HOME="$H7" "$PY" "$DREAM" --repo "$R7" run --date 2026-08-07 >/dev/null 2>&1 || R7_RC=$?
+chmod 755 "$R7" 2>/dev/null || true
+
+if [ -s "$R7_REPORT" ]; then
+  ok "(10) a DENIED REPO ROOT still produces the report (the real TCC shape)"
+else
+  bad "(10) denied repo root produced no report: $(printf '%s' "$R7_OUT" | head -2)"
+fi
+if [ "$R7_RC" = 0 ]; then
+  ok "(10) and it exits 0 — the run genuinely succeeded"
+else
+  bad "(10) denied repo root exited $R7_RC: $(printf '%s' "$R7_OUT" | head -2)"
+fi
+
+# FALSIFIER: tolerating a DENIED repo must not tolerate a WRONG one. A plist pinned to a
+# deleted tree is a real failure and must stay one, or this guard would have been
+# deleted rather than narrowed.
+MISS_RC=0
+HEIMDALL_HOME="$H7" "$PY" "$DREAM" --repo "$TMP/no-such-repo-at-all" run \
+  --date 2026-08-07 >/dev/null 2>&1 || MISS_RC=$?
+if [ "$MISS_RC" != 0 ]; then
+  ok "(10) FALSIFIER: a genuinely MISSING repo is still rejected (exit $MISS_RC)"
+else
+  bad "(10) a missing repo was accepted — the guard was deleted, not narrowed"
 fi
 
 printf '\n-----------------------------------\n'
