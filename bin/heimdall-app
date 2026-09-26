@@ -95,7 +95,13 @@
 # <repo>/.heimdall/app/relay.json:
 #   {"session_id": "...", "relay": "...", "paired": bool, "bound_at": N|null,
 #    "last_seq": N, "frames_sent": N, "last_delivered": "...", "pid": N,
-#    "last_command_at": N|null, "started_at": N}
+#    "last_command_at": N|null, "started_at": N, "event_log": "..."|null}
+# event_log is the durable NDJSON mirror of every event the relay client ever
+# printed (HMD_RELAY_EVENT_LOG; default <repo>/.heimdall/app/relay-events.jsonl,
+# null when disabled via HMD_RELAY_EVENT_LOG=""). cmd_status_relay below
+# surfaces its path plus the mtime of that file (best-effort, no python3
+# dependency) as "last event at" so a phone-side session has something to
+# point at when asking "what did the client actually do".
 # The token (tailscale mode) is NEVER written to connect.json -- it lives
 # only in the one line `hmd ui` printed at startup and inside that process's
 # own memory. The relay mode's pairing code / hmd_pubkey are likewise never
@@ -1013,7 +1019,7 @@ cmd_status_relay() {
   started_at="$(jq -r '.started_at // empty' "$state_file" 2>/dev/null)"
 
   local relay_state_file="$REPO/.heimdall/app/relay.json"
-  local session_id="" paired="" bound_at="" frames_sent="" last_seq="" last_delivered=""
+  local session_id="" paired="" bound_at="" frames_sent="" last_seq="" last_delivered="" event_log=""
   if [ -f "$relay_state_file" ]; then
     session_id="$(jq -r '.session_id // empty' "$relay_state_file" 2>/dev/null)"
     paired="$(jq -r '.paired // empty' "$relay_state_file" 2>/dev/null)"
@@ -1021,6 +1027,7 @@ cmd_status_relay() {
     frames_sent="$(jq -r '.frames_sent // empty' "$relay_state_file" 2>/dev/null)"
     last_seq="$(jq -r '.last_seq // empty' "$relay_state_file" 2>/dev/null)"
     last_delivered="$(jq -r '.last_delivered // empty' "$relay_state_file" 2>/dev/null)"
+    event_log="$(jq -r '.event_log // empty' "$relay_state_file" 2>/dev/null)"
   fi
 
   local ui_alive="not running" client_alive="not running"
@@ -1039,6 +1046,27 @@ cmd_status_relay() {
   echo "  frames sent: ${frames_sent:-0}"
   echo "  last seq: ${last_seq:-0}"
   echo "  last delivered: ${last_delivered:-(none)}"
+  if [ -n "$event_log" ]; then
+    echo "  event log: $event_log"
+    # mtime -> ISO-8601 UTC, BSD (stat -f/date -r) then GNU (stat -c/date -d)
+    # -- same fallback order as e.g. bin/heimdall-autoupdate's own mtime read
+    # and bin/heimdall-city's epoch<-ISO conversion, composed here for the
+    # reverse (epoch->ISO) direction since no prior bin/ site needed exactly
+    # that direction before. Best-effort throughout: a missing/unreadable
+    # file (log configured but no event written yet) just falls through to
+    # the "no events written yet" default below, never an error.
+    local event_log_mtime="" event_log_when=""
+    if [ -f "$event_log" ]; then
+      event_log_mtime="$(stat -f %m "$event_log" 2>/dev/null || stat -c %Y "$event_log" 2>/dev/null || true)"
+    fi
+    if [ -n "$event_log_mtime" ]; then
+      event_log_when="$(date -u -r "$event_log_mtime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+        || date -u -d "@$event_log_mtime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+    fi
+    echo "  last event at: ${event_log_when:-(no events written yet)}"
+  else
+    echo "  event log: disabled"
+  fi
   echo "  ui pid: ${pid_ui:-?} ($ui_alive)"
   echo "  client pid: ${pid_client:-?} ($client_alive)"
   echo "  local port: ${port:-?}"

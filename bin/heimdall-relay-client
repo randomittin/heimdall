@@ -355,9 +355,10 @@ def _append_event_log(obj):
 
 
 def emit(obj):
-    sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-    _append_event_log(obj)
+    with _emit_lock:
+        sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        _append_event_log(obj)
 
 
 def _atomic_write_json(path, obj):
