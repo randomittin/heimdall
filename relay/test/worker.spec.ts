@@ -761,6 +761,204 @@ describe("device socket supersede (reconnect after a network drop)", () => {
   });
 });
 
+/**
+ * Closes the reconnect gap reported live on a Pixel 9a (2026-09-26): hmd only
+ * POSTs a `state` frame when its digest changes (INV-22), so a phone
+ * reconnecting with `?device_token=` (app relaunch, screen remount, network
+ * blip) used to get nothing until hmd's *next* digest change — measured on
+ * device at ~170s stuck on "connecting" with an empty header, because
+ * `handleFrames` answered `delivered: false` and moved on. (relay/README.md's
+ * "no persisted frame buffering" is about buffering *every* frame; this is a
+ * single, always-overwritten "last known state" slot — a narrower, different
+ * mechanism, not a reversal of that deviation.)
+ *
+ * The relay now remembers the single most recent hmd->device `state`
+ * envelope per session (`session.ts`'s `LAST_HMD_STATE_KEY`, in Durable
+ * Object storage so it survives eviction) and replays it to a device socket
+ * immediately after that socket is accepted. Replaying it is safe even when
+ * the phone already saw it: the app's `open()` (src/relay/crypto.ts) rejects
+ * any envelope whose `seq` is <= the last one it accepted from that sender
+ * *before* it ever attempts to decrypt (INV-14/INV-15), so a replay of an
+ * already-seen frame is silently ignored, never double-applied.
+ */
+describe("hmd state replay on a freshly accepted device socket", () => {
+  /** Same shape as "device socket supersede" above's `reconnectDevice` —
+   *  deliberately not shared with it: that suite is about generation
+   *  ranking, this one about replay, and test/hardening.spec.ts already
+   *  establishes the precedent of each describe block owning its own small
+   *  helpers rather than reaching into another block's closure. */
+  async function reconnectDevice(sessionId: string, deviceToken: string): Promise<WebSocket> {
+    const response = await SELF.fetch(
+      wsUrl(
+        sessionId,
+        `device_token=${encodeURIComponent(deviceToken)}&device_pubkey=${TEST_DEVICE_PUBKEY}`
+      ),
+      { headers: { Upgrade: "websocket" } }
+    );
+    expect(response.status).toBe(101);
+    const socket = response.webSocket;
+    if (!socket) throw new Error("expected a websocket in the 101 response");
+    socket.accept();
+    return socket;
+  }
+
+  async function storedLastHmdState(sessionId: string): Promise<unknown> {
+    const stub = typedEnv.SESSION.get(typedEnv.SESSION.idFromName(sessionId));
+    return runInDurableObject(stub, (_instance, state: DurableObjectState) =>
+      state.storage.get("last_hmd_state")
+    );
+  }
+
+  async function expectNoFurtherMessage(socket: WebSocket): Promise<void> {
+    let extra: unknown = "none";
+    await Promise.race([
+      nextMessage(socket).then((m) => {
+        extra = m;
+      }),
+      new Promise((resolve) => setTimeout(resolve, 50)),
+    ]);
+    expect(extra).toBe("none");
+  }
+
+  it("replays the last stored state to a reconnecting device", async () => {
+    const init = await pairInit();
+    const { socket: first } = await claimDevice(init.session_id, init.pairing_code);
+    const bound = await nextMessage(first);
+    const deviceToken = (bound.payload as { device_token: string }).device_token;
+
+    const delivered = nextMessage(first);
+    const framesRes = await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({
+        session_id: init.session_id,
+        type: "state",
+        seq: 5,
+        ciphertext: "state-before-reconnect",
+        nonce: "nonce-before-reconnect",
+      })
+    );
+    expect(await framesRes.json()).toEqual({ ok: true, delivered: true });
+    await delivered;
+
+    // Simulates a Wi-Fi drop or app relaunch: the phone reconnects with its
+    // device_token, on a session that has had no NEWER state frame since.
+    const reconnected = await reconnectDevice(init.session_id, deviceToken);
+    const replayed = await nextMessage(reconnected);
+    expect(replayed.type).toBe("state");
+    expect(replayed.ciphertext).toBe("state-before-reconnect");
+    expect(replayed.nonce).toBe("nonce-before-reconnect");
+  });
+
+  it("sends nothing extra on reconnect when nothing was ever stored", async () => {
+    const init = await pairInit();
+    const { socket: first } = await claimDevice(init.session_id, init.pairing_code);
+    const bound = await nextMessage(first);
+    const deviceToken = (bound.payload as { device_token: string }).device_token;
+
+    const reconnected = await reconnectDevice(init.session_id, deviceToken);
+    await expectNoFurtherMessage(reconnected);
+  });
+
+  it("never replays an ack frame", async () => {
+    const init = await pairInit();
+    const { socket: first } = await claimDevice(init.session_id, init.pairing_code);
+    const bound = await nextMessage(first);
+    const deviceToken = (bound.payload as { device_token: string }).device_token;
+
+    const delivered = nextMessage(first);
+    await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({
+        session_id: init.session_id,
+        type: "ack",
+        seq: 2,
+        ciphertext: "ack-not-replayable",
+      })
+    );
+    await delivered;
+
+    const reconnected = await reconnectDevice(init.session_id, deviceToken);
+    await expectNoFurtherMessage(reconnected);
+  });
+
+  it("keeps only the newest state for replay", async () => {
+    const init = await pairInit();
+    const { socket: first } = await claimDevice(init.session_id, init.pairing_code);
+    const bound = await nextMessage(first);
+    const deviceToken = (bound.payload as { device_token: string }).device_token;
+
+    const firstDelivered = nextMessage(first);
+    await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({ session_id: init.session_id, type: "state", seq: 5, ciphertext: "older" })
+    );
+    await firstDelivered;
+    const secondDelivered = nextMessage(first);
+    await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({ session_id: init.session_id, type: "state", seq: 6, ciphertext: "newer" })
+    );
+    await secondDelivered;
+
+    const reconnected = await reconnectDevice(init.session_id, deviceToken);
+    const replayed = await nextMessage(reconnected);
+    expect(replayed.ciphertext).toBe("newer");
+  });
+
+  it("clears the stored state when the session is revoked", async () => {
+    const init = await pairInit();
+    const { socket } = await claimDevice(init.session_id, init.pairing_code);
+    await nextMessage(socket); // consume the device_bound control frame
+
+    const delivered = nextMessage(socket);
+    await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({ session_id: init.session_id, type: "state", ciphertext: "before-revoke" })
+    );
+    await delivered;
+    expect(await storedLastHmdState(init.session_id)).toBeDefined();
+
+    const revokeRes = await SELF.fetch(`${BASE}/session/${init.session_id}/revoke`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${init.relay_session_token}` },
+    });
+    expect(revokeRes.status).toBe(200);
+
+    expect(await storedLastHmdState(init.session_id)).toBeUndefined();
+  });
+
+  it("skips replay on a fresh claim, even for a state frame posted before anyone had claimed", async () => {
+    // hmd's bearer token works from the moment /pair/init returns, before any
+    // device has ever claimed — but hmd cannot derive a session key (and so
+    // cannot have sealed a real `state` frame) without a device_pubkey it has
+    // not received yet. If something still reaches /frames this early, INV-3
+    // means it must never reach the device the instant it claims: replaying
+    // it the moment the claim completes would relay pre-claim data to a
+    // connection that, one instant earlier, was still unclaimed.
+    const init = await pairInit();
+    const framesRes = await postFrame(
+      init.session_id,
+      init.relay_session_token,
+      makeEnvelope({
+        session_id: init.session_id,
+        type: "state",
+        ciphertext: "posted-before-any-claim",
+      })
+    );
+    expect(await framesRes.json()).toEqual({ ok: true, delivered: false });
+
+    const { socket } = await claimDevice(init.session_id, init.pairing_code);
+    const first = await nextMessage(socket);
+    expect(first.type).toBe("device_bound");
+    await expectNoFurtherMessage(socket);
+  });
+});
+
 describe("revoke", () => {
   it("requires a bearer token", async () => {
     const init = await pairInit();

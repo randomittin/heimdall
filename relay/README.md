@@ -436,7 +436,11 @@ Deliberately **not** changed here, with reasons:
   root `npx jest --listTests` never discovers them (confirmed empirically — zero matches).
 - No persisted frame buffering: `POST /frames` with no phone connected returns `{"ok": true,
   "delivered": false}` rather than queuing — simpler, and honestly reports non-delivery instead
-  of silently dropping frames or adding an untested retry path.
+  of silently dropping frames or adding an untested retry path. One narrow exception, added
+  2026-09-26: the single most recent hmd->device `state` envelope is kept (not a queue — always
+  overwritten, never a history) and replayed to a device socket the instant it is next accepted,
+  closing the "reconnect gets nothing until the next digest change" gap. See
+  `docs/superpowers/specs/relay/INVARIANTS.md`'s "State replay on reconnect" section (INV-36).
 - No separate `POST /session/:id/end` — `/revoke` already covers session termination (device
   closed with `4001`, further claims `410`); a distinct graceful-end endpoint would be
   unrequested, untested scope.

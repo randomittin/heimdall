@@ -12,6 +12,7 @@ import type {
   DeviceBoundToPhonePayload,
   DeviceBoundToHmdPayload,
   KeepalivePayload,
+  Envelope,
 } from "./types";
 import { isDeviceFrame, isHmdFrame } from "./types";
 import {
@@ -76,6 +77,23 @@ const RECORD_KEY = "state";
  * name", which is exactly what a per-IP counter needs.
  */
 const PAIR_INIT_KEY = "pair_init_attempts";
+
+/**
+ * Persisted alongside the session record so the most recent hmd->device
+ * `state` envelope survives this Durable Object being evicted and rebuilt —
+ * the same durability need `DeviceSocketAttachment` documents for per-socket
+ * generation, and for the same reason a class field would not do.
+ */
+interface StoredHmdState {
+  envelope: Envelope;
+  /** epoch ms, this relay's own clock at write time — used only to answer
+   *  "did this predate the current bind" in loadReplayableHmdState below. */
+  stored_at: number;
+}
+
+/** Storage key for the session's most recent hmd->device `state` envelope —
+ *  see StoredHmdState and loadReplayableHmdState/storeLastHmdState below. */
+const LAST_HMD_STATE_KEY = "last_hmd_state";
 
 /**
  * Grace added to a purge deadline so a client that is merely late — a phone
@@ -293,6 +311,75 @@ export class SessionDO {
   private async saveRecord(record: SessionRecord): Promise<void> {
     this.cachedSessionId = record.session_id;
     await this.ctx.storage.put(RECORD_KEY, record);
+  }
+
+  /**
+   * Persists `envelope` as the session's most recent hmd->device `state`
+   * frame, replacing whatever was stored before — one slot, newest always
+   * wins, never a history. `envelope` is already under `MAX_ENVELOPE_BYTES`
+   * by the time this is called (handleFrames enforces that first), and the
+   * SQLite-backed Durable Object storage this project uses (wrangler.toml's
+   * `new_sqlite_classes`) comfortably holds a value that size.
+   *
+   * Called from handleFrames on every valid `state` frame that reaches this
+   * point, whether or not a device was there to receive it live: an
+   * undelivered frame is the entire reason this exists (a phone reconnecting
+   * with `?device_token=` used to get nothing until hmd's *next* digest
+   * change — measured on device at ~170s), and a delivered one is stored
+   * too, so a later reconnect is never replayed anything staler than the
+   * last live delivery.
+   */
+  private async storeLastHmdState(envelope: Envelope): Promise<void> {
+    const stored: StoredHmdState = { envelope, stored_at: Date.now() };
+    await this.ctx.storage.put(LAST_HMD_STATE_KEY, stored);
+  }
+
+  /** Clears the stored last-`state` envelope. Called wherever a session ends
+   *  (handleRevoke; handlePairingCodeClaim's expired-code and
+   *  claim-throttle-exhausted paths, which also set status to "ended") —
+   *  `alarm()`'s purge path needs no separate call, since its `deleteAll()`
+   *  already wipes every key this or any other session ever wrote. */
+  private async clearLastHmdState(): Promise<void> {
+    await this.ctx.storage.delete(LAST_HMD_STATE_KEY);
+  }
+
+  /**
+   * The stored last-`state` envelope eligible for replay to a freshly
+   * accepted device socket, or undefined if nothing is stored or nothing
+   * qualifies.
+   *
+   * Replaying it is safe even if the device already saw it: the app's
+   * `open()` (src/relay/crypto.ts) rejects any envelope whose `seq` is <= the
+   * last one it accepted from that sender *before* it ever attempts to
+   * decrypt, so a replayed frame the app has already processed is silently
+   * ignored, never double-applied (INV-14/INV-15). That is what makes an
+   * unconditional resend on every accept correct, not merely convenient.
+   *
+   * `minStoredAtMs`, when given, excludes a frame stored strictly before it.
+   * handlePairingCodeClaim is the only caller that passes it, with `now` from
+   * the instant this claim started — the instant this device becomes bound.
+   * INV-3 forbids relaying a `state`/`command` frame to an unclaimed
+   * connection; a frame that reached `/frames` while this session was still
+   * "pending" was necessarily stored before that instant, and replaying it
+   * the moment the claim completes would relay pre-claim data to the newly
+   * bound device — exactly what INV-3 forbids, even though the device has
+   * since bound by the time of replay.
+   *
+   * hmd cannot derive a session key, and therefore cannot seal a real
+   * `state` frame, before this very claim delivers `device_pubkey` to hmd's
+   * own stream (see acceptDeviceSocket's `hmdControlPayload`) — so nothing
+   * legitimate is ever actually eligible on this path. The check encodes
+   * that reasoning in code rather than relying on hmd's client behaving, and
+   * costs nothing on the reconnect path (handleDeviceTokenClaim), which
+   * omits it: a reconnect is not a new bind, so whatever is stored was
+   * written while this same device was already bound, and is always fair
+   * game to resend.
+   */
+  private async loadReplayableHmdState(minStoredAtMs?: number): Promise<Envelope | undefined> {
+    const stored = await this.ctx.storage.get<StoredHmdState>(LAST_HMD_STATE_KEY);
+    if (!stored) return undefined;
+    if (minStoredAtMs !== undefined && stored.stored_at < minStoredAtMs) return undefined;
+    return stored.envelope;
   }
 
   /**
@@ -586,6 +673,15 @@ export class SessionDO {
       return jsonResponse(400, { error: "invalid envelope" });
     }
 
+    // The session's most recent state snapshot, kept for a device that
+    // connects (or reconnects) with nobody currently there to receive it
+    // live — see storeLastHmdState. Stored regardless of what happens next:
+    // whether or not a device socket is open right now, this is the frame a
+    // device should see the moment one next connects.
+    if (envelope.type === "state") {
+      await this.storeLastHmdState(envelope);
+    }
+
     const target = this.liveDeviceSocket();
     if (!target) {
       logEvent("frame_undelivered", {
@@ -758,7 +854,17 @@ export class SessionDO {
     if (record.status === "ended") {
       return jsonResponse(410, { error: "session ended" });
     }
-    return this.acceptDeviceSocket(record.session_id, claims.exp);
+    // The fix this feature exists for: without this, a phone reconnecting
+    // here got nothing until hmd's next digest change — see
+    // loadReplayableHmdState for why replaying it unconditionally is safe.
+    const replayEnvelope = await this.loadReplayableHmdState();
+    return this.acceptDeviceSocket(
+      record.session_id,
+      claims.exp,
+      undefined,
+      undefined,
+      replayEnvelope
+    );
   }
 
   private async handlePairingCodeClaim(
@@ -774,6 +880,7 @@ export class SessionDO {
     if (now > record.pair_exp) {
       record.status = "ended";
       await this.saveRecord(record);
+      await this.clearLastHmdState();
       await this.armPurgeAlarm(now + ENDED_GRACE_MS);
       return jsonResponse(410, { error: "pairing code expired" });
     }
@@ -783,6 +890,7 @@ export class SessionDO {
     if (throttled) {
       record.status = "ended";
       await this.saveRecord(record);
+      await this.clearLastHmdState();
       await this.armPurgeAlarm(now + ENDED_GRACE_MS);
       return jsonResponse(
         429,
@@ -821,11 +929,18 @@ export class SessionDO {
     // reclamation deadline moves out to match it.
     await this.armPurgeAlarm(exp * 1000 + PURGE_GRACE_MS);
 
+    // See loadReplayableHmdState's own comment: provably never eligible here
+    // (hmd cannot have sealed a `state` frame before this exact claim hands
+    // it device_pubkey) — but the check is a real comparison against `now`,
+    // not a hardcoded skip, so it stays correct if that ever changes.
+    const replayEnvelope = await this.loadReplayableHmdState(now);
+
     return this.acceptDeviceSocket(
       record.session_id,
       exp,
       { device_token: deviceToken, exp },
-      { device_pubkey: devicePubkey, bound_at: nowS }
+      { device_pubkey: devicePubkey, bound_at: nowS },
+      replayEnvelope
     );
   }
 
@@ -833,7 +948,8 @@ export class SessionDO {
     sessionId: string,
     tokenExp: number,
     bindPayload?: DeviceBoundToPhonePayload,
-    hmdControlPayload?: DeviceBoundToHmdPayload
+    hmdControlPayload?: DeviceBoundToHmdPayload,
+    replayEnvelope?: Envelope
   ): Response {
     // Newest device socket wins, and this is where "newest" is recorded:
     // one above every generation currently attached, written onto the socket
@@ -862,6 +978,15 @@ export class SessionDO {
           payload: bindPayload,
         })
       );
+    }
+    if (replayEnvelope) {
+      // Always after device_bound, never before: a frame sealed under a
+      // session key the app derives only once it has processed device_bound
+      // cannot yet be opened by a socket that has not seen device_bound. On
+      // a reconnect (bindPayload absent) there is no such ordering
+      // constraint — the app has been bound since its original claim.
+      server.send(JSON.stringify(replayEnvelope));
+      logEvent("state_replayed", { session_id: sessionId, seq: replayEnvelope.seq });
     }
     if (hmdControlPayload) {
       this.deliverToHmdStream(sessionId, hmdControlPayload);
@@ -907,6 +1032,7 @@ export class SessionDO {
 
     record.status = "ended";
     await this.saveRecord(record);
+    await this.clearLastHmdState();
     // An ended session is dead weight, but not instantly: the grace keeps the
     // record long enough that a phone reconnecting right after the revoke gets
     // a truthful 410 rather than a 404 that reads like "wrong session id".
