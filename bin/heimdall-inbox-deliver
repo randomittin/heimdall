@@ -306,6 +306,8 @@ def paths_for(root):
         "delivered": os.path.join(d, "inbox-delivered.jsonl"),
         "lock": os.path.join(d, "inbox.jsonl.lock"),
         "state": os.path.join(d, "inbox-state.json"),
+        "waiting": os.path.join(d, "inbox-waiting"),
+        "connect": os.path.join(root, ".heimdall", "app", "connect.json"),
     }
 
 
@@ -413,6 +415,25 @@ def inline_peek(root):
     return items[0] if items else None
 
 
+def stamp_delivered(raw, delivered_at):
+    # The archive form of a popped batch: every line that is a JSON object gains
+    # delivered_at (the receipt /api/state's inbox.delivered[] is read from);
+    # any other line is kept as it was, so a pop never silently loses a byte.
+    out = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            obj["delivered_at"] = delivered_at
+            line = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        out.append(line + "\n")
+    return "".join(out)
+
+
 def inline_pop_all(root):
     p = paths_for(root)
     _ensure_dir(p["dir"])
@@ -428,8 +449,9 @@ def inline_pop_all(root):
         except OSError:
             raw = ""
         if raw.strip():
+            raw = stamp_delivered(raw, round(time.time(), 3))
             with _open_append_0600(p["delivered"]) as d:
-                d.write(raw if raw.endswith("\n") else raw + "\n")
+                d.write(raw)
         _silently(lambda: os.remove(tmp))
         return _parse_lines(raw)
 
@@ -456,26 +478,111 @@ def get_ops(root):
     return inline_append, inline_list_pending, inline_pop_all, inline_peek
 
 
-def write_state(root, waiting):
-    p = paths_for(root)
-    _ensure_dir(p["dir"])
-    tmp = "%s.tmp.%d" % (p["state"], os.getpid())
+def _write_json_0600(path, obj):
+    # Atomically replace path with obj as JSON, at mode 0600 (tmp file plus
+    # rename, so a reader never sees a half-written file).
+    _ensure_dir(os.path.dirname(path))
+    tmp = "%s.tmp.%d" % (path, os.getpid())
     try:
         # Same self-healing 0600 pattern as _open_append_0600 / _Flock above:
         # O_CREAT's mode argument is umask-limited and only applied on the
         # create branch, so the explicit chmod forces 0600 even if a prior
         # crashed run left this exact tmp path behind at a wider mode. The
-        # final path (p["state"]) inherits tmp's mode via os.replace's
-        # rename semantics, so a pre-existing 0644 state file from before
-        # this fix is fully replaced -- old mode included -- on the next
-        # write, not just newly-created ones.
+        # final path inherits tmp's mode via os.replace's rename semantics,
+        # so a pre-existing 0644 file from before this fix is fully replaced
+        # -- old mode included -- on the next write, not just newly-created
+        # ones.
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.chmod(tmp, 0o600)
         with os.fdopen(fd, "w") as f:
-            json.dump({"waiting": bool(waiting), "since": time.time()}, f)
-        os.replace(tmp, p["state"])
+            json.dump(obj, f)
+        os.replace(tmp, path)
     except Exception:
         _silently(lambda: os.remove(tmp))
+
+
+def write_state(root, waiting):
+    _write_json_0600(paths_for(root)["state"], {"waiting": bool(waiting), "since": time.time()})
+
+
+def write_waiting(root, since, until):
+    # The "a stop long-poll is live" marker. Rewritten on every poll: its mtime
+    # is the heartbeat bin/lib/companion_ui_inbox.py judges (stale after 2x the
+    # poll interval), the body only names the poller and its budget.
+    _write_json_0600(paths_for(root)["waiting"],
+                     {"pid": os.getpid(), "since": since, "until": until, "ts": time.time()})
+
+
+def clear_waiting(root):
+    # Remove the marker, but only while it is still ours: with two sessions
+    # long-polling one repo the file belongs to whichever wrote it last, and
+    # removing the other's would make a live listener look absent.
+    path = paths_for(root)["waiting"]
+    try:
+        with open(path, "r") as f:
+            owner = json.load(f).get("pid")
+    except (OSError, ValueError, AttributeError):
+        return
+    if owner == os.getpid():
+        _silently(lambda: os.remove(path))
+
+
+def _pid_alive(pid, eperm_alive=False):
+    # Signal 0 delivers nothing; it only asks the kernel whether the pid exists
+    # and may be signalled. EPERM means it exists but is someone else's:
+    # eperm_alive says whether that still counts as alive for this caller.
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return eperm_alive
+    except OSError:
+        return False
+    return True
+
+
+def attended_session():
+    # False for a session no human is typing into: headless claude -p / SDK
+    # children and hmd's own judge or role-tagged sub-sessions share this repo
+    # and these hooks, and none may hold the phone line (or consume it).
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").strip() in PROGRAMMATIC_ENTRYPOINTS:
+        return False
+    if os.environ.get("HMD_AGENT_TYPE", "").strip():
+        return False
+    return os.environ.get("HMD_JUDGMENT", "").strip().lower() in ("", "0", "false")
+
+
+def companion_connected(root):
+    # A phone can reach this session: an attended session whose connect.json
+    # (written by hmd app connect) names only live processes -- pid_ui, plus
+    # pid_client in relay mode. A pid owned by another user is not hmd's own
+    # ui/relay client (same user started it), so EPERM counts as dead here: a
+    # pid recycled by a root daemon after a crash must not read as connected.
+    # A connect.json that names no pid at all is trusted as written.
+    if not attended_session():
+        return False
+    try:
+        with open(paths_for(root)["connect"], "r", encoding="utf-8") as f:
+            rec = json.loads(f.read(65536))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict):
+        return False
+    return all(_pid_alive(rec[k]) for k in ("pid_ui", "pid_client") if k in rec)
+
+
+def hook_orphaned(ppid0):
+    # True once whatever launched this long-poll is gone: Claude Code killed the
+    # hook (Esc, timeout) but only reached the shell above us, leaving this
+    # process polling for up to half an hour with nobody left to read what it
+    # prints. It must stand down WITHOUT popping -- a message popped into a dead
+    # pipe is lost, yet would still be archived as delivered.
+    if os.getppid() != ppid0:
+        return True
+    return bool(HOOK_SHELL_PID) and not _pid_alive(HOOK_SHELL_PID, eperm_alive=True)
 
 
 def texts_of(items):
@@ -598,26 +705,39 @@ def cmd_stop(hook, root):
         print(json.dumps({"decision": "block", "reason": format_delivery(texts)}))
         return
 
-    last_msg = hook.get("last_assistant_message")
-    if not isinstance(last_msg, str) or not last_msg.strip():
-        last_msg = read_last_assistant_text(hook.get("transcript_path"))
-    if not is_question(last_msg):
-        return  # nothing queued, nothing being asked -- no output
+    connected = companion_connected(root)
+    if not connected:
+        if os.environ.get("HMD_INBOX_GATED") == "1":
+            return  # the hook wiring found no opt-in and nobody is connected: never hold the turn
+        last_msg = hook.get("last_assistant_message")
+        if not isinstance(last_msg, str) or not last_msg.strip():
+            last_msg = read_last_assistant_text(hook.get("transcript_path"))
+        if not is_question(last_msg):
+            return  # nothing queued, nothing being asked, nobody connected -- no output
 
-    wait_s = env_float("HMD_INBOX_WAIT_S", 240.0)
-    deadline = time.time() + max(0.0, wait_s)
+    wait_s = env_float("HMD_INBOX_WAIT_S", COMPANION_WAIT_S if connected else DEFAULT_WAIT_S)
+    if wait_s <= 0:
+        return
+    ppid0 = os.getppid()
+    since = time.time()
+    deadline = since + wait_s
     write_state(root, True)
     delivered_texts = []
-    while True:
-        items = pop_all_fn(root)
-        texts = texts_of(items)
-        if texts:
-            delivered_texts = texts
-            break
-        if time.time() >= deadline:
-            break
-        time.sleep(POLL_INTERVAL_S)
-    write_state(root, False)
+    try:
+        while not hook_orphaned(ppid0):
+            write_waiting(root, since, deadline)
+            texts = texts_of(pop_all_fn(root))
+            if texts:
+                delivered_texts = texts
+                break
+            if time.time() >= deadline:
+                break
+            if connected and not companion_connected(root):
+                break  # the companion that justified this wait has gone
+            time.sleep(POLL_INTERVAL_S)
+    finally:
+        clear_waiting(root)
+        write_state(root, False)
     if delivered_texts:
         print(json.dumps({"decision": "block", "reason": format_delivery(delivered_texts)}))
 
@@ -643,15 +763,15 @@ def cmd_tmux(root):
     target = resolve_tmux_target(root)
     if not target or not shutil.which("tmux"):
         return  # no target configured, or tmux unavailable -- no-op
-    _, list_pending_fn, pop_all_fn, _ = get_ops(root)
-    items = list_pending_fn(root)
-    texts = texts_of(items)
-    if not texts:
-        return
-    for text in texts:
+    _, _, pop_all_fn, _ = get_ops(root)
+    # Dequeue FIRST, then type what was dequeued: the pop is the one atomic
+    # claim on a message, so a concurrent consumer (a Stop long-poll, a prompt
+    # hook, a second tmux run) can never be handed the same one. Listing,
+    # typing and only then popping left a window in which a message was both
+    # typed into the pane AND delivered through a hook.
+    for text in texts_of(pop_all_fn(root)):
         _tmux_send(["tmux", "send-keys", "-t", target, "-l", tmux_safe(text)])
         _tmux_send(["tmux", "send-keys", "-t", target, "Enter"])
-    pop_all_fn(root)
 
 
 def cmd_prompt(hook, root):
@@ -705,5 +825,5 @@ sys.exit(0)
 PYEOF
 )
 
-printf '%s' "$INPUT" | python3 -c "$PY_SRC" "$MODE" "$REPO_EXPLICIT" "$DEFAULT_REPO"
+printf '%s' "$INPUT" | python3 -c "$PY_SRC" "$MODE" "$REPO_EXPLICIT" "$DEFAULT_REPO" "$PPID"
 exit 0
