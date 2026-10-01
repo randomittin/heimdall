@@ -224,18 +224,14 @@ def request(root, tool, summary, window_s, now=None, risk="high"):
     base = {"tool": clean_tool(tool), "summary": clean_summary(summary), "requested_at": now,
             "expires_at": now + float(window_s), "risk": risk if risk in RISKS else "high"}
     for _ in range(8):
-        rid = "p-" + secrets.token_hex(4)
-        rec = dict(base, id=rid)
-        tmp = _write_json_atomic(d, ".tmp-claim-%s" % rid, rec, now)
-        final = os.path.join(d, rid + ".json")
+        rec = dict(base, id="p-" + secrets.token_hex(4))
+        tmp = _write_tmp(d, rec, now)
         try:
-            os.link(tmp, final)
+            os.link(tmp, os.path.join(d, rec["id"] + ".json"))
         except FileExistsError:
-            _unlink(tmp)
             continue
         finally:
             _unlink(tmp)
-        os.utime(final, (now, now))
         return rec
     raise OSError("could not allocate a free approval id")
 
