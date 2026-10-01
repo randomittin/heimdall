@@ -387,6 +387,77 @@ write_transcript(d, "sess-old", [u_human("ancient", T0), a_text("history", T0 + 
 changed = CP.CompanionPublisher(root).tick(now=T0 + 10)
 check("9a. a transcript idle for days publishes nothing", changed is False and "chat" not in served(root, T0 + 10))
 
+# ── 10. hmd-question: present only while the last thing said is an hmd reply ending in `?` ──
+QPATH = lambda r: os.path.join(r, ".heimdall", "ui", "panels", "hmd-question.json")
+root, d = new_repo()
+tp = write_transcript(d, "sess-q", [
+    u_human("plan?", T0),
+    a_text("Pick one:\n\nA) alpha\nB) beta\n\nWhich do you want?", T0 + 5, "m1"),
+])
+pub = CP.CompanionPublisher(root)
+pub.tick(now=T0 + 20)
+q = served(root, T0 + 20).get("hmd-question")
+check("10a. a reply ending in `?` publishes hmd-question: markdown, title 'hmd asks', data keys exactly [text], "
+      "text is the reply",
+      q is not None and q["type"] == "markdown" and q["title"] == "hmd asks" and list(q["data"].keys()) == ["text"]
+      and q["data"]["text"] == "Pick one:\n\nA) alpha\nB) beta\n\nWhich do you want?", str(q))
+before_q = open(QPATH(root), "rb").read()
+append_transcript(tp, [a_tool(T0 + 25, "m2"), u_tool_result(T0 + 26)])
+check("10b. tool traffic after the question rewrites nothing",
+      pub.tick(now=T0 + 30) is False and open(QPATH(root), "rb").read() == before_q)
+append_transcript(tp, [stop_feedback(["B"], T0 + 40)])
+c = pub.tick(now=T0 + 50)
+check("10c. a delivered phone answer removes the question (panel file gone, no longer served)",
+      c is True and not os.path.exists(QPATH(root)) and "hmd-question" not in served(root, T0 + 50))
+
+root, d = new_repo()
+tp = write_transcript(d, "sess-q2", [u_human("go", T0), a_text("Ready to proceed?", T0 + 5, "m1")])
+pub = CP.CompanionPublisher(root)
+pub.tick(now=T0 + 20)
+had = os.path.exists(QPATH(root))
+append_transcript(tp, [u_human("yes", T0 + 30)])
+pub.tick(now=T0 + 40)
+check("10d. the next typed prompt removes hmd-question", had and not os.path.exists(QPATH(root)))
+
+for label, reply, stop, expect in (
+        ("a statement", "All done.", "end_turn", False),
+        ("emphasis around the ?", "**Which one?**", "end_turn", True),
+        ("mid-turn narration that stops for a tool", "Should I check the logs?", "tool_use", False),
+        ("a ? that is not the last character", "Why? Because.", "end_turn", False)):
+    root, d = new_repo()
+    entries = [u_human("go", T0), a_text(reply, T0 + 5, "m1", stop=stop)]
+    if stop == "tool_use":
+        entries.append(a_tool(T0 + 6, "m1"))
+    write_transcript(d, "s", entries)
+    CP.CompanionPublisher(root).tick(now=T0 + 20)
+    check("10e. %s -> hmd-question %s" % (label, "present" if expect else "absent"),
+          ("hmd-question" in served(root, T0 + 20)) == expect)
+
+root, d = new_repo()
+write_transcript(d, "s", [u_human("go", T0), a_text(
+    "background " * 100 + "\n\nA) first option\nB) second option\n\nWhich should I do?", T0 + 5, "m1")])
+CP.CompanionPublisher(root).tick(now=T0 + 20)
+q = served(root, T0 + 20).get("hmd-question")
+t = q["data"]["text"] if q else ""
+check("10f. an over-long question keeps its END: <= 500 units, ellipsis paragraph first, option list and the "
+      "question intact (the app parses its options from this text)",
+      q is not None and utf16(t) <= 500 and t.startswith("…\n\n")
+      and t.endswith("A) first option\nB) second option\n\nWhich should I do?"), repr(t[:80]))
+
+root, d = new_repo()
+write_transcript(d, "s", [u_human("go", T0), a_text("See [the docs](http://example.test/x) and <b>decide</b> now?", T0 + 5, "m1")])
+CP.CompanionPublisher(root).tick(now=T0 + 20)
+q = served(root, T0 + 20).get("hmd-question")
+check("10g. markdown links reduce to their label and HTML tags are dropped (the app's markdown has neither)",
+      q is not None and q["data"]["text"] == "See the docs and decide now?", str(q))
+
+root, d = new_repo()
+write_transcript(d, "s", [u_human("go", T0), a_text("use " + STRIPE + " ok?", T0 + 5, "m1")])
+CP.CompanionPublisher(root).tick(now=T0 + 20)
+sv = served(root, T0 + 20)
+check("10h. a secret-shaped question is dropped for that turn; the chat line is still published, redacted",
+      "hmd-question" not in sv and sv["chat"]["data"]["lines"][-1].endswith("hmd [redacted]"), str(list(sv)))
+
 failed = [r for r in results if not r[0]]
 for okv, name, detail in results:
     print(("OK   " if okv else "FAIL ") + name + ("" if okv else "  [%s]" % detail))
@@ -511,6 +582,18 @@ if start_server "$LIVE" "$TMPROOT/live"; then
     ok "L3. a new turn in the transcript reaches /api/state within the poll interval"
   else
     bad "L3. chat lines after append: $(jq -c '.panels[]|select(.id=="chat")|.data.lines' "$LIVE_STATE" 2>/dev/null)"
+  fi
+  plant_transcript "$LIVE" live-sess "hmd|Which option do you want?"
+  if state_until "$S_PORT" "$S_TOKEN" - '.panels[] | select(.id=="hmd-question") | .type=="markdown" and .title=="hmd asks" and ((.data|keys)==["text"]) and .data.text=="Which option do you want?"' 10; then
+    ok "L5. a pending question reaches /api/state as hmd-question (markdown, data keys exactly [text])"
+  else
+    bad "L5. no hmd-question in /api/state: $(jq -c '[.panels[]|.id]' "$LIVE_STATE" 2>/dev/null)"
+  fi
+  plant_transcript "$LIVE" live-sess "you|option B"
+  if state_until "$S_PORT" "$S_TOKEN" - '([.panels[].id] | index("hmd-question")) == null' 10; then
+    ok "L6. the next prompt removes hmd-question from /api/state"
+  else
+    bad "L6. hmd-question still served after the answer turn"
   fi
 else
   bad "L0. hmd ui did not come up: $(head -c 400 "$TMPROOT/live.err")"

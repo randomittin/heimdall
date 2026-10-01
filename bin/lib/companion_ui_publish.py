@@ -321,6 +321,64 @@ def format_line(role, raw_text, ts):
     return head + "[redacted]" if P.secret_shaped(line) else line
 
 
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def is_question(text):
+    """bin/heimdall's INPUT convention: a turn that needs the operator ends in a
+    literal `?` (trailing markdown emphasis/backticks ignored) -- the same rule
+    bin/heimdall-inbox-deliver uses to decide whether to long-poll."""
+    return str(text or "").strip().rstrip("*_`~ \t\r\n").endswith("?")
+
+
+def _tail_units(s, units):
+    out, used = [], 0
+    for ch in reversed(s):
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if used + w > units:
+            break
+        out.append(ch)
+        used += w
+    return "".join(reversed(out))
+
+
+def keep_tail(text, max_units):
+    """`text` cut to <= max_units UTF-16 units KEEPING THE END, on whole paragraphs
+    where it can (a leading ellipsis paragraph marks the cut). The question and the
+    option list sit at the end of a long reply; the old head-truncating publisher
+    sent the preamble and dropped the question itself."""
+    if utf16_len(text) <= max_units:
+        return text
+    paras = text.split("\n\n")
+    kept, used = [], 3          # room for the "…\n\n" marker
+    for p in reversed(paras):
+        w = utf16_len(p) + (2 if kept else 0)
+        if used + w > max_units:
+            break
+        kept.append(p)
+        used += w
+    if kept:
+        return "…\n\n" + "\n\n".join(reversed(kept))
+    tail = _tail_units(paras[-1], max_units - 1)
+    m = re.search(r"\s", tail)
+    if m and m.start() < len(tail) // 2:
+        tail = tail[m.end():]
+    return "…" + tail
+
+
+def question_markdown(raw):
+    """The `hmd-question` text: the reply with links reduced to their label and HTML
+    tags dropped (the app's markdown subset has neither), control bytes removed,
+    kept to the app's string cap from the END. None when secret-shaped -- a
+    question is dropped for that turn rather than sent redacted-but-present."""
+    t = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = _HTML_TAG_RE.sub("", _MD_LINK_RE.sub(r"\1", t))
+    t = _CONTROL_CHARS_RE.sub("", t).strip()
+    t = keep_tail(t, APP_MAX_UNITS)
+    return None if (not t or P.secret_shaped(str(raw)) or P.secret_shaped(t)) else t
+
+
 def _serialized_size(lines):
     return len(json.dumps(lines, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
@@ -397,7 +455,11 @@ class CompanionPublisher(object):
                 continue
             turns = derive_turns(entries, mtime)
             lines = [ln for ln in (format_line(t["role"], t["text"], t["ts"]) for t in turns) if ln]
-            self._derived = {"stamp": stamp, "mtime": mtime, "lines": fit_lines(lines), "turns": turns}
+            last = turns[-1] if turns else None
+            question = None
+            if last is not None and last["role"] == "hmd" and is_question(last["text"]):
+                question = question_markdown(last["text"])
+            self._derived = {"stamp": stamp, "mtime": mtime, "lines": fit_lines(lines), "question": question}
             return self._derived
         return None
 
@@ -426,10 +488,30 @@ class CompanionPublisher(object):
         self._written[CHAT_ID] = list(lines)
         return True
 
+    def _publish_question(self, derived, now):
+        text = derived["question"]
+        exists = self._exists(QUESTION_ID)
+        if text is None:
+            self._written.pop(QUESTION_ID, None)
+            if not exists:
+                return False
+            try:
+                return P.remove_panel(self.root, QUESTION_ID)
+            except OSError as e:
+                sys.stderr.write("hmd-ui: companion panel %s not removed: %s\n" % (QUESTION_ID, e.__class__.__name__))
+                return False
+        if exists and self._written.get(QUESTION_ID) == text:
+            return False
+        if not self._write(QUESTION_ID, QUESTION_TITLE, "markdown", {"text": text}, min(now, derived["mtime"])):
+            return False
+        self._written[QUESTION_ID] = text
+        return True
+
     def tick(self, now=None):
         """One publish pass. True when any panel file was written or removed."""
         now = time.time() if now is None else now
         derived = self._refresh_derived(now)
         if derived is None:
             return False
-        return self._publish_chat(derived, now)
+        changed = self._publish_chat(derived, now)
+        return self._publish_question(derived, now) or changed
