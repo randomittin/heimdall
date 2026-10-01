@@ -52,10 +52,11 @@ HOW EACH STATE IS REACHED (the newest decisive entry decides):
                   staleness stands in for it (every state, including needs_*, ages out).
 `kind: "error"` is never emitted (the handoff defines no trigger for it).
 
-Session choice: CLAUDE_SESSION_ID / SESSION_ID / CLAUDE_CODE_SESSION_ID when it names an existing
-transcript (same precedence as hmd-ui's identity.session_code), else the newest top-level
-*.jsonl, preferring one whose entrypoint is not `sdk*` (hmd's own headless judge/dream sessions
-write transcripts into the same directory and would otherwise flap the state).
+Session choice: bin/lib/hmd_session_resolve.py, the ONE rule every hmd-ui collector shares -- an
+inherited CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / SESSION_ID only when it names a transcript
+under THIS repo's own project dir, else the newest top-level *.jsonl whose entrypoint is not
+`sdk*` (hmd's own headless judge/dream sessions write transcripts into the same directory and
+would otherwise flap the state).
 
 Stdlib only. Self-contained: secret_shaped is ported (companion_ui_inbox.py:94-111), not imported.
 """
