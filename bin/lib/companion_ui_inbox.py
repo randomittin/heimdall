@@ -31,6 +31,16 @@ Delivery: `pop_all()` moves every pending line to
 empty, under the SAME lock append() takes -- a message can never be observed as
 both pending and delivered, and a message appended mid-pop is never lost.
 
+Receipts (A2): pop_all() stamps every archived message with `delivered_at` (epoch
+seconds of that pop), so the archive is also the delivery receipt log. summary() is
+the `inbox` slice /api/state serves -- {pending, consumer, oldest_age_s, delivered}
+-- where `delivered` is the last 20 archive entries as {id, delivered_at} ONLY, never
+text (the id is the uuid POST /api/send returned), and `consumer` is read from
+.heimdall/ui/inbox-waiting, the marker bin/heimdall-inbox-deliver's stop long-poll
+rewrites every poll while it waits (stale after 2x the poll interval), falling back
+to a configured tmux target, then "none". Queued -> delivered is therefore the
+message leaving `pending` and its id appearing in `delivered` with a timestamp.
+
 Capacity (N3): a token holder could otherwise POST unbounded 2000-char messages
 forever, forcing every /api/state 2s poll and every /api/send to re-parse an
 ever-growing inbox.jsonl (O(N^2), unbounded disk). append() now refuses a new
@@ -73,6 +83,7 @@ standalone with zero intra-repo import coupling.
 import argparse
 import fcntl
 import json
+import math
 import os
 import re
 import subprocess
@@ -85,6 +96,12 @@ MAX_PENDING = 200                    # N3: append() refuses a new message at/abo
 MAX_INBOX_BYTES = 2 * 1024 * 1024    # N3: inbox-delivered.jsonl rotation threshold (2 MiB)
 INBOX_REL = os.path.join(".heimdall", "ui", "inbox.jsonl")
 DELIVERED_REL = os.path.join(".heimdall", "ui", "inbox-delivered.jsonl")
+WAITING_REL = os.path.join(".heimdall", "ui", "inbox-waiting")      # the stop long-poll's heartbeat marker
+TMUX_TARGET_REL = os.path.join(".heimdall", "ui", "tmux-target")
+POLL_INTERVAL_S = 2.0                   # bin/heimdall-inbox-deliver's stop long-poll cadence
+WAITING_STALE_S = 2 * POLL_INTERVAL_S   # an inbox-waiting older than this: its long-poll is gone
+RECEIPTS_LIMIT = 20                     # inbox.delivered[] is the last this-many deliveries
+RECEIPTS_TAIL_BYTES = 256 * 1024        # the newest archive lines hold them; never read the whole file
 GIT_TIMEOUT_S = 3
 
 # ── secret scrub: bin/heimdall-activity:167-179, ported the same way
@@ -337,23 +354,43 @@ def _rotate_if_oversized(path, max_bytes):
     os.replace(path, path + ".1")
 
 
+def _stamp_delivered(raw_lines, delivered_at):
+    """The archive form of a popped batch: every line that is a JSON object gains
+    `delivered_at` (the receipt delivered_receipts() reads back); any other line
+    is kept as it was, so a pop never silently loses a byte."""
+    out = []
+    for line in raw_lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            obj["delivered_at"] = delivered_at
+            line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+        out.append(line)
+    return out
+
+
 def pop_all(root):
     """Deliver every pending message: append the current inbox.jsonl content to
-    inbox-delivered.jsonl (rotating it to inbox-delivered.jsonl.1 first if it's
-    already at MAX_INBOX_BYTES -- see _rotate_if_oversized) and truncate
-    inbox.jsonl to empty, under the SAME lock append() takes. Returns the list
-    of delivered records (oldest first); [] when nothing was pending (and
-    nothing is touched on disk, including rotation, in that case)."""
+    inbox-delivered.jsonl -- each message stamped with the `delivered_at` epoch
+    of this pop, its delivery receipt -- (rotating it to inbox-delivered.jsonl.1
+    first if it's already at MAX_INBOX_BYTES -- see _rotate_if_oversized) and
+    truncate inbox.jsonl to empty, under the SAME lock append() takes. Returns
+    the list of delivered records, receipt included (oldest first); [] when
+    nothing was pending (and nothing is touched on disk, including rotation, in
+    that case)."""
     path = _inbox_path(root)
     delivered_path = _delivered_path(root)
     with _FlockCtx(_lock_path(root)):
         records, raw_lines = _read_all(path)
         if not raw_lines:
             return []
+        delivered_at = round(time.time(), 3)
         _ensure_dir(os.path.dirname(delivered_path))
         _rotate_if_oversized(delivered_path, MAX_INBOX_BYTES)
         with _open_append_0600(delivered_path) as df:
-            df.writelines(raw_lines)
+            df.writelines(_stamp_delivered(raw_lines, delivered_at))
             df.flush()
             os.fsync(df.fileno())
         # Truncate in place, still inside the lock so nothing can land between
@@ -364,7 +401,115 @@ def pop_all(root):
         with open(path, "w", encoding="utf-8") as f:
             f.truncate(0)
         os.chmod(path, 0o600)
-    return records
+    return [dict(r, delivered_at=delivered_at) for r in records]
+
+
+# ── receipts, consumer, summary: the /api/state `inbox` slice ─────────────────
+def _is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+_RECEIPTS_CACHE = {}  # path -> ((mtime_ns, size), receipts) -- see delivered_receipts
+
+
+def _read_receipts(path, size):
+    """The last RECEIPTS_LIMIT stamped lines of the archive as {id, delivered_at},
+    oldest first, reading only its tail. A line that is not a JSON object with a
+    string `id` and a finite numeric `delivered_at` -- a pre-receipt archive line,
+    a corrupt one -- is skipped, never raised and never given an invented time."""
+    with open(path, "rb") as f:
+        if size > RECEIPTS_TAIL_BYTES:
+            f.seek(size - RECEIPTS_TAIL_BYTES)
+            f.readline()  # the seek landed mid-line: drop that partial first line
+        chunk = f.read()
+    out = []
+    for line in chunk.splitlines():
+        try:
+            obj = json.loads(line.decode("utf-8"))
+        except ValueError:  # JSONDecodeError and UnicodeDecodeError both
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("id"), str) and _is_number(obj.get("delivered_at")):
+            out.append({"id": obj["id"], "delivered_at": obj["delivered_at"]})
+    return out[-RECEIPTS_LIMIT:]
+
+
+def delivered_receipts(root):
+    """The delivery receipts /api/state serves as inbox.delivered: the last
+    RECEIPTS_LIMIT of inbox-delivered.jsonl as [{"id", "delivered_at"}], oldest
+    first -- the uuid POST /api/send returned and the epoch pop_all stamped, and
+    NEVER the message text. Cached on the archive's (mtime_ns, size), like
+    _cached_records, so the every-request poll costs one stat while nothing is
+    delivered. Returns fresh dict copies."""
+    path = _delivered_path(root)
+    try:
+        st = os.stat(path)
+    except OSError:
+        _RECEIPTS_CACHE.pop(path, None)
+        return []
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _RECEIPTS_CACHE.get(path)
+    if cached is None or cached[0] != key:
+        try:
+            cached = (key, _read_receipts(path, st.st_size))
+        except OSError:
+            return []
+        _RECEIPTS_CACHE[path] = cached
+    return [dict(r) for r in cached[1]]
+
+
+def tmux_target(root):
+    """The configured tmux target, or "" -- resolved in the same order (env, then
+    .heimdall/ui/tmux-target) bin/heimdall-inbox-deliver's tmux mode uses. In the
+    server process the env is the SERVER's, so the file is the durable switch."""
+    target = os.environ.get("HMD_TMUX_TARGET", "").strip()
+    if target:
+        return target
+    try:
+        with open(os.path.join(root, TMUX_TARGET_REL), "r", encoding="utf-8") as f:
+            return f.read(512).strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def consumer_state(root, now=None):
+    """Who would take the next phone message: "waiting" (a `stop` long-poll is live:
+    its inbox-waiting marker was refreshed within WAITING_STALE_S -- twice the poll
+    interval, so a killed hook stops counting within seconds), else "tmux" (a tmux
+    target is configured), else "none" (the next delivery needs a turn boundary). A
+    marker stamped in the future by more than that is clock noise, not a listener."""
+    now = time.time() if now is None else now
+    try:
+        age = now - os.stat(os.path.join(root, WAITING_REL)).st_mtime
+    except OSError:
+        age = None
+    if age is not None and -WAITING_STALE_S <= age <= WAITING_STALE_S:
+        return "waiting"
+    return "tmux" if tmux_target(root) else "none"
+
+
+def _oldest_age_s(records, now):
+    for r in records:
+        ts = r.get("ts")
+        if _is_number(ts):
+            return round(max(0.0, now - ts), 1)
+    return None
+
+
+def summary(root, now=None):
+    """The whole `inbox` slice of /api/state in one call:
+    {"pending": n, "consumer": "waiting"|"tmux"|"none", "oldest_age_s": float|None,
+    "delivered": [{"id", "delivered_at"}, ...]}. `pending` is read before
+    `delivered`, so a message seen as delivered really was; an unreadable source
+    degrades its own field (nothing pending / no receipts), never the slice."""
+    now = time.time() if now is None else now
+    try:
+        records = _cached_records(_inbox_path(root))
+    except OSError:
+        records = []
+    return {"pending": len(records),
+            "consumer": consumer_state(root, now),
+            "oldest_age_s": _oldest_age_s(records, now),
+            "delivered": delivered_receipts(root)}
 
 
 # ── CLI: `hmd ui inbox ls|pop|peek` (exec'd by bin/heimdall-ui) ───────────────
