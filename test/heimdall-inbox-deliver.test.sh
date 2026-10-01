@@ -32,9 +32,37 @@ inbox_of()     { printf '%s/.heimdall/ui/inbox.jsonl' "$1"; }
 delivered_of() { printf '%s/.heimdall/ui/inbox-delivered.jsonl' "$1"; }
 state_of()     { printf '%s/.heimdall/ui/inbox-state.json' "$1"; }
 lock_of()      { printf '%s/.heimdall/ui/inbox.jsonl.lock' "$1"; }
+connect_of()   { printf '%s/.heimdall/app/connect.json' "$1"; }
+waiting_of()   { printf '%s/.heimdall/ui/inbox-waiting' "$1"; }
 
 # mode_of PATH -- octal permission bits, portable across BSD (macOS) and GNU stat.
 mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
+
+# Hermetic: the A2 sections below assert interactive-session behaviour, so pin it.
+# A caller running this suite from a headless `claude -p` / SDK session would
+# otherwise have the headless guard (correctly) switch the new waits off.
+export CLAUDE_CODE_ENTRYPOINT=cli
+unset HMD_AGENT_TYPE HMD_JUDGMENT HMD_INBOX_GATED HMD_INBOX_WAIT_S HMD_TMUX_TARGET
+
+# now_s -- epoch seconds with sub-second resolution (python3 is already a hard
+# dependency of the tool under test). f_lt / f_ge -- float comparisons, exit 0
+# iff the relation holds. secs START END -- END - START, 2 decimals.
+now_s() { python3 -c 'import time; print("%.3f" % time.time())'; }
+f_lt()  { python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)' "$1" "$2"; }
+f_ge()  { python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "$1" "$2"; }
+secs()  { python3 -c 'import sys; print("%.2f" % (float(sys.argv[2]) - float(sys.argv[1])))' "$1" "$2"; }
+
+# mark_companion DIR -- a connect.json the way `hmd app connect --relay` writes
+# it, naming two LIVE pids (this script's own): a companion that is connected.
+mark_companion() {
+  mkdir -p "$1/.heimdall/app"
+  printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$$" "$$" > "$(connect_of "$1")"
+}
+# dead_pid -- a pid that provably is not running (a reaped child).
+dead_pid() { local p; ( : ) & p=$!; wait "$p" 2>/dev/null; printf '%s' "$p"; }
+# with_module DIR -- make DIR carry bin/lib/companion_ui_inbox.py, so the tool
+# under test takes the shared-library path instead of the inline fallback.
+with_module() { mkdir -p "$1/bin/lib"; cp "$REPO/bin/lib/companion_ui_inbox.py" "$1/bin/lib/companion_ui_inbox.py"; }
 
 # seed_inbox DIR TEXT [TEXT...] — writes one JSONL line per TEXT.
 seed_inbox() {
@@ -318,6 +346,303 @@ RC=$?
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
 [ "$(mode_of "$(state_of "$D")")" = "600" ] && ok "inbox-state.json is 0600 after write, even though it pre-existed at 0644" || bad "state mode is $(mode_of "$(state_of "$D")") (want 600)"
 rm -rf "$D"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A2 (docs/HANDOFF-TO-HEIMDALL-product-asks.md): idle-session delivery + receipts.
+#
+# A phone message used to sit in inbox.jsonl until the next Stop/UserPromptSubmit
+# turn boundary; the Stop long-poll only ran when the last assistant message
+# ended in '?', and only for 240s. With a companion connected
+# (.heimdall/app/connect.json) the session is reachable, so `stop` now
+# long-polls on ANY last message, for 1800s by default, and says so in a
+# short-lived marker (.heimdall/ui/inbox-waiting) the hmd-ui server turns into
+# /api/state's inbox.consumer. Every dequeue also stamps delivered_at into the
+# archive, which is what /api/state's inbox.delivered[] reads.
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo "17. A2: companion connected + last message WITHOUT a '?' + empty inbox -> long-polls and delivers a late phone message, no prompt needed:"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+SAMPLE="$(mktemp)"; SAMPLE_MODE="$(mktemp)"
+(
+  sleep 1.5
+  cp "$(waiting_of "$D")" "$SAMPLE" 2>/dev/null
+  mode_of "$(waiting_of "$D")" > "$SAMPLE_MODE" 2>/dev/null
+  sleep 1.5
+  printf '{"id":"idle1","ts":1,"text":"go ahead from phone","source":"test"}\n' >> "$(inbox_of "$D")"
+) &
+BGPID=$!
+T0="$(now_s)"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | "$BIN" stop --repo "$D")"
+RC=$?
+T1="$(now_s)"
+wait "$BGPID" 2>/dev/null || true
+echo "$OUT" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' && ok "delivers via decision:block with no prompt and no trailing '?'" || bad "no delivery: $OUT"
+echo "$OUT" | grep -q "go ahead from phone" && ok "reason carries the late-arriving text" || bad "late message missing from: $OUT"
+printf '%s' "$OUT" | grep -F -- "$MARKER" >/dev/null && ok "still wrapped in the fixed provenance marker" || bad "provenance marker missing from: $OUT"
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
+f_lt "$(secs "$T0" "$T1")" 9 && ok "delivered within the 2s poll window ($(secs "$T0" "$T1")s), not after a fixed sleep" || bad "took $(secs "$T0" "$T1")s"
+WAIT_DECLARED="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert isinstance(m["pid"], int); print(int(round(m["until"]-m["since"])))' "$SAMPLE" 2>/dev/null)"
+[ "$WAIT_DECLARED" = "1800" ] && ok "inbox-waiting (read mid-wait) names the long-poll pid and declares the 1800s companion default" || bad "marker wait is '$WAIT_DECLARED' (want 1800); marker: $(cat "$SAMPLE" 2>/dev/null)"
+[ "$(cat "$SAMPLE_MODE")" = "600" ] && ok "inbox-waiting is 0600" || bad "inbox-waiting mode is '$(cat "$SAMPLE_MODE")' (want 600)"
+[ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed once the long-poll exits" || bad "inbox-waiting left behind"
+[ "$(mode_of "$D/.heimdall/ui")" = "700" ] && ok "ui dir is 0700" || bad "ui dir mode is $(mode_of "$D/.heimdall/ui") (want 700)"
+rm -rf "$D" "$SAMPLE" "$SAMPLE_MODE"
+
+echo "18. A2: NO companion + last message without a '?' + empty inbox -> old behaviour: returns at once, no marker:"
+D="$(make_project)"
+: > "$(inbox_of "$D")"
+T0="$(now_s)"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | "$BIN" stop --repo "$D")"
+RC=$?
+T1="$(now_s)"
+[ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
+f_lt "$(secs "$T0" "$T1")" 1.5 && ok "returned in $(secs "$T0" "$T1")s (~1s: nothing to wait for without a companion)" || bad "took $(secs "$T0" "$T1")s"
+[ ! -e "$(waiting_of "$D")" ] && ok "no inbox-waiting marker left" || bad "marker left behind"
+rm -rf "$D"
+
+echo "19. A2: NO companion + question + empty inbox -> still the 240s default, declared in the marker:"
+D="$(make_project)"
+: > "$(inbox_of "$D")"
+SAMPLE="$(mktemp)"
+(
+  sleep 1.5
+  cp "$(waiting_of "$D")" "$SAMPLE" 2>/dev/null
+  sleep 1
+  printf '{"id":"q1","ts":1,"text":"yes proceed","source":"test"}\n' >> "$(inbox_of "$D")"
+) &
+BGPID=$!
+OUT="$(printf '%s' "$(stop_payload "$D" false "Should I proceed with the deploy?")" | "$BIN" stop --repo "$D")"
+wait "$BGPID" 2>/dev/null || true
+echo "$OUT" | grep -q "yes proceed" && ok "question long-poll still delivers" || bad "no delivery: $OUT"
+WAIT_DECLARED="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(int(round(m["until"]-m["since"])))' "$SAMPLE" 2>/dev/null)"
+[ "$WAIT_DECLARED" = "240" ] && ok "marker declares the unchanged 240s default when no companion is connected" || bad "marker wait is '$WAIT_DECLARED' (want 240); marker: $(cat "$SAMPLE" 2>/dev/null)"
+rm -rf "$D" "$SAMPLE"
+
+echo "20. A2: companion connected + explicit HMD_INBOX_WAIT_S=2 -> the operator's value wins over the 1800s default:"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+T0="$(now_s)"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | HMD_INBOX_WAIT_S=2 "$BIN" stop --repo "$D")"
+RC=$?
+T1="$(now_s)"
+[ -z "$OUT" ] && ok "no stdout (nothing arrived)" || bad "unexpected stdout: $OUT"
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
+f_ge "$(secs "$T0" "$T1")" 1.8 && f_lt "$(secs "$T0" "$T1")" 7 && ok "waited the operator's 2s ($(secs "$T0" "$T1")s), not 0 and not 1800" || bad "waited $(secs "$T0" "$T1")s (want ~2)"
+[ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed after a timed-out wait" || bad "marker left behind"
+rm -rf "$D"
+
+echo "21. A2: the companion disconnects mid-wait (connect.json removed) -> the long-poll releases the turn:"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+( sleep 1; rm -f "$(connect_of "$D")" ) &
+BGPID=$!
+T0="$(now_s)"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | HMD_INBOX_WAIT_S=30 "$BIN" stop --repo "$D")"
+RC=$?
+T1="$(now_s)"
+wait "$BGPID" 2>/dev/null || true
+[ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
+f_ge "$(secs "$T0" "$T1")" 1.5 && f_lt "$(secs "$T0" "$T1")" 9 && ok "held until the companion left, then released ($(secs "$T0" "$T1")s of a 30s budget)" || bad "waited $(secs "$T0" "$T1")s (want ~2-4, not 0 and not 30)"
+[ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed" || bad "marker left behind"
+rm -rf "$D"
+
+echo "22. A2: a STALE connect.json (its recorded pids are dead) is not a connected companion -> old behaviour, returns at once:"
+D="$(make_project)"
+DP="$(dead_pid)"
+mkdir -p "$D/.heimdall/app"
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$DP" "$DP" > "$(connect_of "$D")"
+: > "$(inbox_of "$D")"
+T0="$(now_s)"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | "$BIN" stop --repo "$D")"
+T1="$(now_s)"
+[ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
+f_lt "$(secs "$T0" "$T1")" 1.5 && ok "returned in $(secs "$T0" "$T1")s -- a crash-left connect.json cannot pin every turn for 30 minutes" || bad "took $(secs "$T0" "$T1")s"
+[ ! -e "$(waiting_of "$D")" ] && ok "no marker left" || bad "marker left behind"
+rm -rf "$D"
+
+echo "23. A2: loop guard unchanged -- stop_hook_active=true with a companion connected is silent, instant, and leaves the queue alone:"
+D="$(make_project)"
+mark_companion "$D"
+seed_inbox "$D" "queued msg"
+T0="$(now_s)"
+OUT="$(printf '%s' "$(stop_payload "$D" true "Done implementing the feature.")" | "$BIN" stop --repo "$D")"
+RC=$?
+T1="$(now_s)"
+[ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
+f_lt "$(secs "$T0" "$T1")" 1.5 && ok "returned in $(secs "$T0" "$T1")s -- never waits under the loop guard" || bad "took $(secs "$T0" "$T1")s"
+grep -q "queued msg" "$(inbox_of "$D")" 2>/dev/null && ok "message left queued" || bad "message was popped despite stop_hook_active"
+[ ! -e "$(waiting_of "$D")" ] && ok "no marker written" || bad "marker left behind"
+rm -rf "$D"
+
+echo "24. A2: HMD_INBOX_GATED=1 (the hook wiring found no inbox.wait opt-in) -> no wait unless a companion is connected:"
+D="$(make_project)"
+: > "$(inbox_of "$D")"
+T0="$(now_s)"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Should I proceed with the deploy?")" | HMD_INBOX_GATED=1 HMD_INBOX_WAIT_S=4 "$BIN" stop --repo "$D")"
+RC=$?
+T1="$(now_s)"
+[ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
+f_lt "$(secs "$T0" "$T1")" 1.5 && ok "question + gated + nobody connected returned in $(secs "$T0" "$T1")s, beating even an explicit HMD_INBOX_WAIT_S=4" || bad "waited $(secs "$T0" "$T1")s -- the gate did not hold"
+rm -rf "$D"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+( sleep 1; printf '{"id":"g1","ts":1,"text":"gated but connected","source":"test"}\n' >> "$(inbox_of "$D")" ) &
+BGPID=$!
+OUT="$(printf '%s' "$(stop_payload "$D" false "Done.")" | HMD_INBOX_GATED=1 "$BIN" stop --repo "$D")"
+wait "$BGPID" 2>/dev/null || true
+echo "$OUT" | grep -q "gated but connected" && ok "gated + companion connected: connect.json is the implicit opt-in, the message is delivered" || bad "no delivery: $OUT"
+rm -rf "$D"
+
+echo "25. A2: headless / sub-sessions never hold the line (claude -p children would stall for 30 minutes at every turn end):"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+for CASE in "CLAUDE_CODE_ENTRYPOINT=sdk-cli" "CLAUDE_CODE_ENTRYPOINT=sdk-ts" "CLAUDE_CODE_ENTRYPOINT=sdk-py" "HMD_AGENT_TYPE=hmd:coder" "HMD_JUDGMENT=1"; do
+  T0="$(now_s)"
+  OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | env "$CASE" HMD_INBOX_WAIT_S=4 "$BIN" stop --repo "$D")"
+  T1="$(now_s)"
+  if [ -z "$OUT" ] && f_lt "$(secs "$T0" "$T1")" 1.5 && [ ! -e "$(waiting_of "$D")" ]; then
+    ok "$CASE: returned in $(secs "$T0" "$T1")s, no wait, no marker"
+  else
+    bad "$CASE: held the turn ($(secs "$T0" "$T1")s, out='$OUT')"
+  fi
+done
+T0="$(now_s)"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | env HMD_JUDGMENT=0 HMD_INBOX_WAIT_S=2 "$BIN" stop --repo "$D")"
+T1="$(now_s)"
+f_ge "$(secs "$T0" "$T1")" 1.8 && ok "HMD_JUDGMENT=0 is not a judge: the attended wait still applies ($(secs "$T0" "$T1")s)" || bad "HMD_JUDGMENT=0 skipped the wait ($(secs "$T0" "$T1")s)"
+rm -rf "$D"
+
+echo "26. A2: every dequeue stamps delivered_at into the archive (the receipt), inline fallback AND shared library:"
+# The checker lives in a temp file written by a plain heredoc -- a heredoc nested
+# in $(...) is the construct bash 3.2's paren-matching scan chokes on (same
+# reason test 15 above goes through temp files).
+RECEIPT_CHK="$(mktemp)"
+cat > "$RECEIPT_CHK" <<'PYEOF'
+import json
+import sys
+
+path, t0, t1 = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+lines = [ln for ln in open(path).read().splitlines() if ln.strip()]
+if len(lines) != 1:
+    print("BAD want exactly one archived line, got %d" % len(lines))
+    sys.exit(0)
+rec = json.loads(lines[0])
+stamped = isinstance(rec.get("delivered_at"), (int, float)) and t0 - 1 <= rec["delivered_at"] <= t1 + 1
+kept = (rec.get("id"), rec.get("text"), rec.get("source"), rec.get("ts")) == ("seed-1", "receipt check", "test", 1)
+print("OK" if stamped and kept else "BAD %r" % rec)
+PYEOF
+receipts_case() {   # $1 label, $2 project dir (with or without bin/lib)
+  local label="$1" d="$2" t0 t1 verdict
+  seed_inbox "$d" "receipt check"
+  t0="$(now_s)"
+  printf '%s' "$(stop_payload "$d" false "working on it")" | "$BIN" stop --repo "$d" >/dev/null
+  t1="$(now_s)"
+  verdict="$(python3 "$RECEIPT_CHK" "$(delivered_of "$d")" "$t0" "$t1")"
+  [ "$verdict" = "OK" ] && ok "$label: archive line keeps id/ts/text/source and gains a delivered_at inside the delivery window" || bad "$label: $verdict"
+  [ "$(mode_of "$(delivered_of "$d")")" = "600" ] && ok "$label: inbox-delivered.jsonl is 0600" || bad "$label: delivered mode is $(mode_of "$(delivered_of "$d")") (want 600)"
+  [ "$(mode_of "$d/.heimdall/ui")" = "700" ] && ok "$label: ui dir is 0700" || bad "$label: ui dir mode is $(mode_of "$d/.heimdall/ui") (want 700)"
+}
+D="$(make_project)"
+[ ! -d "$D/bin/lib" ] && ok "inline fixture has no bin/lib" || bad "inline fixture unexpectedly ships bin/lib"
+receipts_case "inline" "$D"
+rm -rf "$D"
+D="$(make_project)"; with_module "$D"
+receipts_case "module" "$D"
+rm -rf "$D" "$RECEIPT_CHK"
+
+echo "27. A2: duplicate delivery prevented -- two concurrent long-polls + one message -> delivered exactly once:"
+dup_case() {   # $1 label, $2 project dir
+  local label="$1" d="$2" o1 o2 n1 n2 p1 p2 again
+  mark_companion "$d"
+  : > "$(inbox_of "$d")"
+  o1="$(mktemp)"; o2="$(mktemp)"
+  ( printf '%s' "$(stop_payload "$d" false "Done.")" | HMD_INBOX_WAIT_S=5 "$BIN" stop --repo "$d" > "$o1" ) &
+  p1=$!
+  ( printf '%s' "$(stop_payload "$d" false "Done.")" | HMD_INBOX_WAIT_S=5 "$BIN" stop --repo "$d" > "$o2" ) &
+  p2=$!
+  sleep 1.5
+  printf '{"id":"dup1","ts":1,"text":"only once please","source":"test"}\n' >> "$(inbox_of "$d")"
+  wait "$p1" "$p2" 2>/dev/null || true
+  n1="$(grep -c '"decision"' "$o1")"; n2="$(grep -c '"decision"' "$o2")"
+  [ $((n1 + n2)) -eq 1 ] && ok "$label: exactly one of two concurrent hooks delivered it ($n1 + $n2)" || bad "$label: deliveries = $n1 + $n2 (want exactly 1)"
+  [ "$(grep -c '"id":"dup1"' "$(delivered_of "$d")" 2>/dev/null)" = "1" ] && ok "$label: archived exactly once" || bad "$label: archive count is $(grep -c '"id":"dup1"' "$(delivered_of "$d")" 2>/dev/null) (want 1)"
+  again="$(printf '{"session_id":"s1","cwd":"%s"}' "$d" | "$BIN" prompt --repo "$d"; printf '%s' "$(stop_payload "$d" false "Done.")" | HMD_INBOX_WAIT_S=0 "$BIN" stop --repo "$d")"
+  [ -z "$again" ] && ok "$label: a later prompt/stop delivers nothing again" || bad "$label: re-delivered: $again"
+  rm -f "$o1" "$o2"
+}
+D="$(make_project)"
+dup_case "inline" "$D"
+rm -rf "$D"
+D="$(make_project)"; with_module "$D"
+dup_case "module" "$D"
+rm -rf "$D"
+
+echo "28. A2: tmux delivery dequeues BEFORE it types -- a concurrent consumer can never receive the same message too:"
+D="$(make_project)"
+seed_inbox "$D" "typed once"
+FAKEBIN="$(mktemp -d)"
+RECORD="$(mktemp)"
+CONC="$(mktemp)"
+cat > "$FAKEBIN/tmux" <<'FAKETMUX'
+#!/usr/bin/env bash
+# Records every call; on the FIRST one it plays a concurrent consumer (a
+# UserPromptSubmit hook firing on the same repo) while tmux is mid-delivery.
+printf '%s\n' "$*" >> "$TMUX_RECORD_FILE"
+if [ ! -e "$RACE_FLAG" ]; then
+  : > "$RACE_FLAG"
+  printf '{"session_id":"s2","cwd":"%s"}' "$RACE_REPO" | "$RACE_BIN" prompt --repo "$RACE_REPO" >> "$RACE_OUT"
+fi
+exit 0
+FAKETMUX
+chmod +x "$FAKEBIN/tmux"
+PATH="$FAKEBIN:$PATH" TMUX_RECORD_FILE="$RECORD" RACE_FLAG="$FAKEBIN/raced" RACE_REPO="$D" RACE_BIN="$BIN" RACE_OUT="$CONC" HMD_TMUX_TARGET="sess:0.0" "$BIN" tmux --repo "$D"
+RC=$?
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
+[ ! -s "$CONC" ] && ok "the concurrent consumer received nothing (tmux had already dequeued it)" || bad "the concurrent consumer ALSO got the message: $(cat "$CONC")"
+[ "$(grep -c -- "-l typed once" "$RECORD")" = "1" ] && ok "tmux typed it exactly once" || bad "tmux typed it $(grep -c -- "-l typed once" "$RECORD") times"
+[ "$(grep -c '"id":"seed-1"' "$(delivered_of "$D")" 2>/dev/null)" = "1" ] && ok "archived exactly once" || bad "archive count is $(grep -c '"id":"seed-1"' "$(delivered_of "$D")" 2>/dev/null) (want 1)"
+rm -rf "$D" "$FAKEBIN" "$RECORD" "$CONC"
+
+echo "29. A2: the hook shell dies mid-wait (Esc / timeout kill) -> the orphaned long-poll steps aside instead of popping a message nobody will read:"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+PL="$(mktemp)"
+stop_payload "$D" false "Shall I continue?" > "$PL"
+# A stands in for Claude Code's `bash -c <hook command>`. The trailing `; exit 0`
+# keeps it a real parent of the script (no exec optimisation), as in hooks.json.
+HMD_INBOX_WAIT_S=30 bash -c '"$0" stop --repo "$1" < "$2"; exit 0' "$BIN" "$D" "$PL" >/dev/null 2>&1 &
+A=$!
+sleep 1.5
+PIDS_BEFORE="$(pgrep -f -- "$D" | grep -vx "$$" | tr '\n' ' ')"
+kill -9 "$A" 2>/dev/null
+wait "$A" 2>/dev/null
+sleep 0.3
+printf '{"id":"orph1","ts":1,"text":"must stay queued","source":"test"}\n' >> "$(inbox_of "$D")"
+sleep 6
+grep -q "must stay queued" "$(inbox_of "$D")" 2>/dev/null && ok "the message is still queued -- the orphan never popped it" || bad "the orphaned long-poll popped the message (lost)"
+ALIVE=""
+for P in $PIDS_BEFORE; do
+  if [ "$P" != "$A" ] && kill -0 "$P" 2>/dev/null; then ALIVE="$ALIVE $P"; fi
+done
+if [ -z "$ALIVE" ]; then
+  ok "the orphaned long-poll exited on its own"
+else
+  bad "orphaned processes still running:$ALIVE"
+  for P in $ALIVE; do kill "$P" 2>/dev/null; done
+fi
+[ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed by the orphan on its way out" || bad "marker left behind"
+rm -rf "$D" "$PL"
 
 echo ""
 echo "heimdall-inbox-deliver.test.sh: $PASS passed, $FAIL failed."
