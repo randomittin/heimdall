@@ -40,9 +40,9 @@
 # Hermetic: HOME, HEIMDALL_HOME and TMPDIR are redirected to a temp dir, the
 # fixture repo is a temp dir, and every background process is reaped on EXIT.
 # TMPDIR is pinned because two of the server's slices are keyed off it, not off the
-# fixture: collect_parallelism() reads (falling back to the most-recently-touched
-# `*.state`, since this server never has a session id) $TMPDIR/heimdall-parallel, and
-# collect_edits() shells out to `edit-tracker paths`, which reads
+# fixture: collect_parallelism() reads $TMPDIR/heimdall-parallel/<session>.state (the
+# most-recently-touched one when CLAUDE_SESSION_ID/SESSION_ID are unset, as they are
+# here), and collect_edits() shells out to `edit-tracker paths`, which reads
 # $TMPDIR/heimdall-edits/<CLAUDE_CODE_SESSION_ID>.log. Unpinned, case 8c's "nothing
 # changes for 4.5s" window was broken by whatever OTHER Claude Code session or agent
 # on the machine made a tool call or an edit in that window (the diff of the two SSE
