@@ -210,6 +210,29 @@ ELAPSED=$((END - START))
 [ "$ELAPSED" -le 3 ] && ok "returned in ${ELAPSED}s (the exported 4s wait did not leak past the gate)" || bad "took ${ELAPSED}s -- the gate did not hold"
 rm -rf "$D"
 
+echo "12. typing release through the wired command: companion connected, empty inbox, the terminal is read 3s in -> the hook hands the turn back within a poll, long before its wait (HMD_INBOX_TTY survives the wrapper):"
+D="$(make_project)"
+mkdir -p "$D/.heimdall/app"
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$$" "$$" > "$D/.heimdall/app/connect.json"
+: > "$D/.heimdall/ui/inbox.jsonl"
+TTYF="$(mktemp)"
+python3 -c 'import os, sys, time; os.utime(sys.argv[1], (time.time() - 3600, os.stat(sys.argv[1]).st_mtime))' "$TTYF"
+PAYLOAD='{"session_id":"s1","transcript_path":"","cwd":"'"$D"'","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Done implementing the feature."}'
+# HMD_INBOX_WAIT_S=20 only bounds a broken run: the real default with a companion
+# is 300, and the point is that the keystroke cuts it short.
+( sleep 3; python3 -c 'import os, sys, time; os.utime(sys.argv[1], (time.time(), os.stat(sys.argv[1]).st_mtime))' "$TTYF" ) &
+BGPID=$!
+START=$(date +%s)
+OUT="$(printf '%s' "$PAYLOAD" | CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" HMD_INBOX_TTY="$TTYF" HMD_INBOX_WAIT_S=20 bash -c "$STOP_CMD" 2>&1)"
+RC=$?
+END=$(date +%s)
+ELAPSED=$((END - START))
+wait "$BGPID" 2>/dev/null || true
+[ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "exit 0, no stdout" || bad "rc=$RC out: $OUT"
+[ "$ELAPSED" -ge 2 ] && ok "held until the keystroke (${ELAPSED}s), not returned at once" || bad "returned in ${ELAPSED}s -- the companion hold never began"
+[ "$ELAPSED" -le 9 ] && ok "released ${ELAPSED}s in, a poll after the keystroke -- not the 20s bound" || bad "took ${ELAPSED}s -- the keystroke did not end the hold"
+rm -rf "$D" "$TTYF"
+
 echo ""
 echo "heimdall-inbox-wiring.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1

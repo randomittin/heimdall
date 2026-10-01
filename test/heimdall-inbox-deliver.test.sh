@@ -90,6 +90,10 @@ bounded_stop() {
 # with_module DIR -- make DIR carry bin/lib/companion_ui_inbox.py, so the tool
 # under test takes the shared-library path instead of the inline fallback.
 with_module() { mkdir -p "$1/bin/lib"; cp "$REPO/bin/lib/companion_ui_inbox.py" "$1/bin/lib/companion_ui_inbox.py"; }
+# set_atime FILE AGE_S -- stamp FILE's access time AGE_S seconds in the past, mtime
+# untouched: the stand-in for "the terminal was last read AGE_S ago". Python, not
+# touch -d, so it means the same thing on BSD and GNU.
+set_atime() { python3 -c 'import os, sys, time; st = os.stat(sys.argv[1]); os.utime(sys.argv[1], (time.time() - float(sys.argv[2]), st.st_mtime))' "$1" "$2"; }
 
 # seed_inbox DIR TEXT [TEXT...] — writes one JSONL line per TEXT.
 seed_inbox() {
@@ -678,6 +682,245 @@ else
 fi
 [ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed by the orphan on its way out" || bad "marker left behind"
 rm -rf "$D" "$PL"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hold default 300s + typing release. With a companion connected the hold was
+# 1800s, and a prompt typed at the laptop meanwhile queues behind the Stop hook
+# for up to that long. The default is now 300s, and the long-poll also ends the
+# moment the operator touches the session's terminal. The signal is that
+# terminal's access time (bin/heimdall-inbox-deliver's header says why not
+# ioreg HIDIdleTime). Tests 30-33 inject it as a plain file through HMD_INBOX_TTY
+# -- the real stat path, no keyboard needed; test 34 injects nothing and lets the
+# hook find a real pty through its own ancestors.
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo "30. typing release: companion connected (default 300s hold) + the terminal is read mid-hold -> released within one poll, nothing popped:"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+TTYF="$(mktemp)"; set_atime "$TTYF" 3600
+SAMPLE="$(mktemp)"; SIGNAL_AT="$(mktemp)"
+(
+  await_marker "$D"
+  cp "$(waiting_of "$D")" "$SAMPLE" 2>/dev/null
+  sleep 1.5
+  now_s > "$SIGNAL_AT"
+  set_atime "$TTYF" 0
+  # The message lands right behind the keystroke: whichever side of a poll they
+  # fall on, the typing check runs first, so the message is never popped into a
+  # turn the operator is typing over.
+  printf '{"id":"typ1","ts":1,"text":"arrived as they typed","source":"test"}\n' >> "$(inbox_of "$D")"
+) &
+BGPID=$!
+OUTF="$(mktemp)"
+bounded_stop "$D" "Done implementing the feature." "$OUTF" 40 HMD_INBOX_TTY="$TTYF"
+RC=$?
+T1="$(now_s)"
+OUT="$(cat "$OUTF")"
+wait "$BGPID" 2>/dev/null || true
+rm -f "$OUTF"
+[ "$RC" -eq 0 ] && ok "exit 0 (not the 124 of a hold still running at the 40s bound)" || bad "exit $RC (124 = still holding 40s in; the 300s default was never cut short)"
+[ -z "$OUT" ] && ok "no stdout: a release delivers nothing" || bad "unexpected stdout: $OUT"
+f_lt "$(secs "$(cat "$SIGNAL_AT")" "$T1")" 5 && ok "released $(secs "$(cat "$SIGNAL_AT")" "$T1")s after the terminal was read: one 2s poll, not the hold budget" || bad "took $(secs "$(cat "$SIGNAL_AT")" "$T1")s to release"
+WAIT_DECLARED="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(int(round(m["until"]-m["since"])))' "$SAMPLE" 2>/dev/null)"
+[ "$WAIT_DECLARED" = "300" ] && ok "inbox-waiting (read mid-hold) declares the 300s default" || bad "marker wait is '$WAIT_DECLARED' (want 300); marker: $(cat "$SAMPLE" 2>/dev/null)"
+grep -q "arrived as they typed" "$(inbox_of "$D")" 2>/dev/null && ok "the message that landed with the keystroke is still queued: it rides the operator's next prompt (UserPromptSubmit)" || bad "the message was popped despite the typing"
+[ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed on release" || bad "marker left behind"
+rm -rf "$D" "$TTYF" "$SAMPLE" "$SIGNAL_AT"
+
+echo "31. typing release: the terminal was read 3s BEFORE the hold would begin (a prompt just typed or just submitted) -> no hold at all:"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+TTYF="$(mktemp)"; set_atime "$TTYF" 3
+T0="$(now_s)"
+OUTF="$(mktemp)"
+bounded_stop "$D" "Done implementing the feature." "$OUTF" 20 HMD_INBOX_TTY="$TTYF"
+RC=$?
+T1="$(now_s)"
+OUT="$(cat "$OUTF")"; rm -f "$OUTF"
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (124 = held the turn behind a prompt the operator had just sent)"
+[ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
+f_lt "$(secs "$T0" "$T1")" 3 && ok "returned in $(secs "$T0" "$T1")s -- a prompt queued behind the hook would have waited out the whole hold" || bad "took $(secs "$T0" "$T1")s"
+[ ! -e "$(waiting_of "$D")" ] && ok "no inbox-waiting marker published for a hold that never began" || bad "marker left behind"
+rm -rf "$D" "$TTYF"
+
+echo "32. no usable typing signal -> the hold is exactly what it was:"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+( await_marker "$D"; sleep 1.5; printf '{"id":"ns1","ts":1,"text":"no signal, still delivered","source":"test"}\n' >> "$(inbox_of "$D")" ) &
+BGPID=$!
+OUTF="$(mktemp)"
+bounded_stop "$D" "Done implementing the feature." "$OUTF" 40 HMD_INBOX_TTY="$D/no-such-terminal"
+RC=$?
+OUT="$(cat "$OUTF")"; rm -f "$OUTF"
+wait "$BGPID" 2>/dev/null || true
+[ "$RC" -eq 0 ] && echo "$OUT" | grep -q "no signal, still delivered" && ok "terminal that cannot be stat'ed: held, then delivered the late message" || bad "rc=$RC out: $OUT"
+rm -rf "$D"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+TTYF="$(mktemp)"; set_atime "$TTYF" 3600
+T0="$(now_s)"
+OUTF="$(mktemp)"
+bounded_stop "$D" "Done implementing the feature." "$OUTF" 30 HMD_INBOX_TTY="$TTYF" HMD_INBOX_WAIT_S=4
+T1="$(now_s)"
+OUT="$(cat "$OUTF")"; rm -f "$OUTF"
+[ -z "$OUT" ] && f_ge "$(secs "$T0" "$T1")" 3.8 && ok "terminal last read an hour ago: waited the full 4s budget ($(secs "$T0" "$T1")s)" || bad "waited $(secs "$T0" "$T1")s (want >= 4), out: $OUT"
+rm -rf "$D" "$TTYF"
+# No override and no ps: nothing can say which terminal this is, so there is no
+# signal. PATH carries only the three binaries the hook itself needs.
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+BARE="$(mktemp -d)"
+ln -s "$(python3 -c 'import sys; print(sys.executable)')" "$BARE/python3"
+ln -s "$(command -v bash)" "$BARE/bash"
+ln -s "$(command -v cat)" "$BARE/cat"
+T0="$(now_s)"
+OUTF="$(mktemp)"
+bounded_stop "$D" "Done implementing the feature." "$OUTF" 30 -u HMD_INBOX_TTY PATH="$BARE" HMD_INBOX_WAIT_S=4
+T1="$(now_s)"
+OUT="$(cat "$OUTF")"; rm -f "$OUTF"
+[ -z "$OUT" ] && f_ge "$(secs "$T0" "$T1")" 3.8 && ok "no override and no ps on PATH: waited the full 4s budget ($(secs "$T0" "$T1")s) instead of failing closed" || bad "waited $(secs "$T0" "$T1")s (want >= 4), out: $OUT"
+rm -rf "$D" "$BARE"
+
+echo "33. typing release also ends the question wait (nobody connected): the answer is being typed at the terminal, not sent from the phone:"
+D="$(make_project)"
+: > "$(inbox_of "$D")"
+TTYF="$(mktemp)"; set_atime "$TTYF" 0
+T0="$(now_s)"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Should I proceed with the deploy?")" | HMD_INBOX_TTY="$TTYF" HMD_INBOX_WAIT_S=10 "$BIN" stop --repo "$D")"
+RC=$?
+T1="$(now_s)"
+[ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "exit 0, no stdout" || bad "rc=$RC out: $OUT"
+f_lt "$(secs "$T0" "$T1")" 3 && ok "returned in $(secs "$T0" "$T1")s of a 10s question wait" || bad "held $(secs "$T0" "$T1")s"
+rm -rf "$D" "$TTYF"
+
+echo "34. typing release, nothing injected: under a REAL pty the hook finds the terminal through its ancestors; a keystroke ends the hold, silence does not:"
+PTYDRV="$(mktemp)"
+cat > "$PTYDRV" <<'PYEOF'
+import contextlib
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import time
+
+bin_path, repo, payload, out_path = sys.argv[1:5]
+marker = os.path.join(repo, ".heimdall", "ui", "inbox-waiting")
+
+try:
+    pid, master = pty.fork()
+except OSError as exc:
+    print("RESULT nopty %s" % exc)
+    sys.exit(0)
+
+if pid == 0:
+    # The child is the session leader the pty is the controlling terminal of: it
+    # stands in for `claude`. Like claude it keeps reading its terminal while the
+    # Stop hook runs, and it is the hook's parent -- the hook itself has only pipes.
+    env = {k: v for k, v in os.environ.items() if k != "HMD_INBOX_TTY"}
+    with open(payload, "rb") as pin, open(out_path, "wb") as pout:
+        hook = subprocess.Popen([bin_path, "stop", "--repo", repo], stdin=pin, stdout=pout,
+                                stderr=subprocess.DEVNULL, env=env)
+        while hook.poll() is None:
+            ready, _, _ = select.select([0], [], [], 0.3)
+            if ready:
+                os.read(0, 4096)
+    os._exit(0)
+
+exited = []
+
+
+def drain():
+    # Play the terminal emulator: swallow whatever the child's tty echoes back.
+    while True:
+        ready, _, _ = select.select([master], [], [], 0)
+        if not ready:
+            return
+        try:
+            if not os.read(master, 4096):
+                return
+        except OSError:
+            return
+
+
+def alive():
+    if exited:
+        return False
+    done, _ = os.waitpid(pid, os.WNOHANG)
+    if done:
+        exited.append(True)
+    return not done
+
+
+def wait_until(pred, secs):
+    end = time.time() + secs
+    while time.time() < end:
+        drain()
+        if pred():
+            return True
+        time.sleep(0.1)
+    return pred()
+
+
+held_quiet, released = 0, -1.0
+try:
+    tty = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)], stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, timeout=5).stdout.decode().strip()
+    if tty in ("", "?", "??", "-"):
+        print("RESULT notty ps shows no controlling terminal for the pty child")
+        sys.exit(0)
+    if not wait_until(lambda: os.path.exists(marker), 20):
+        print("RESULT nohold held_quiet=0 released_after=-1")
+        sys.exit(0)
+    wait_until(lambda: not alive(), 4)       # nobody typing: it must still be holding
+    held_quiet = 1 if alive() else 0
+    t_type = time.time()
+    # One line a second. macOS shows every one at once; Linux blurs a tty's access
+    # time to 8s buckets, so a lone keystroke can land in the bucket already stored.
+    while alive() and time.time() - t_type < 25:
+        os.write(master, b"x\n")
+        wait_until(lambda: not alive(), 1.0)
+    if not alive():
+        released = time.time() - t_type
+finally:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal.SIGKILL)
+    if not exited:
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+print("RESULT run held_quiet=%d released_after=%.2f marker_left=%d" % (held_quiet, released, 1 if os.path.exists(marker) else 0))
+PYEOF
+if ! command -v ps >/dev/null 2>&1; then
+  ok "skipped: no ps here -- the signal is correctly unavailable (test 32 holds that fail-open)"
+else
+  D="$(make_project)"
+  mark_companion "$D"
+  : > "$(inbox_of "$D")"
+  PTYPL="$(mktemp)"; PTYOUT="$(mktemp)"; PTYRES="$(mktemp)"
+  stop_payload "$D" false "Done implementing the feature." > "$PTYPL"
+  python3 "$PTYDRV" "$BIN" "$D" "$PTYPL" "$PTYOUT" > "$PTYRES" 2>&1
+  RES="$(grep '^RESULT ' "$PTYRES" | head -1)"
+  case "$RES" in
+    "RESULT nopty"*|"RESULT notty"*)
+      ok "skipped: $RES" ;;
+    *)
+      HELD="$(printf '%s' "$RES" | sed -n 's/.*held_quiet=\([0-9]*\).*/\1/p')"
+      REL="$(printf '%s' "$RES" | sed -n 's/.*released_after=\([-0-9.]*\).*/\1/p')"
+      LEFT="$(printf '%s' "$RES" | sed -n 's/.*marker_left=\([0-9]*\).*/\1/p')"
+      [ "$HELD" = "1" ] && ok "4s of silence under the pty: still holding (nothing but a keystroke moves the terminal's access time)" || bad "the hold ended with nobody typing, or never began: $RES"
+      { [ -n "$REL" ] && f_ge "$REL" 0 && f_lt "$REL" 20; } && ok "a keystroke ended the hold ${REL}s after the first one -- found with no HMD_INBOX_TTY, through the hook's ancestors" || bad "never released by typing (released_after='$REL'): $RES"
+      [ ! -s "$PTYOUT" ] && ok "no stdout: nothing delivered by the release" || bad "unexpected stdout: $(cat "$PTYOUT")"
+      [ "$LEFT" = "0" ] && ok "inbox-waiting removed" || bad "marker left behind: $RES" ;;
+  esac
+  rm -rf "$D" "$PTYPL" "$PTYOUT" "$PTYRES"
+fi
+rm -f "$PTYDRV"
 
 echo ""
 echo "heimdall-inbox-deliver.test.sh: $PASS passed, $FAIL failed."
