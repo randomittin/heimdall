@@ -698,6 +698,32 @@ def collect_inbox(root):
     return {"pending": len(INBOX.list_pending(root))}
 
 
+def attention_empty():
+    """The no-evidence `attention` shape (A1): idle, nothing to point at. Mirrors
+    companion_ui_attention.empty(), which is unreachable when that module failed to load."""
+    return {"state": "idle", "id": None, "since": None, "kind": None,
+            "summary": None, "options": None, "turn": None}
+
+
+def collect_attention(root, state=None):
+    """The `attention` addendum (A1): derived from the repo's session transcript tail and the
+    slices collect_state already holds (parallelism.turns, sweep_receipt, checkpoint,
+    quality_gate) -- no extra subprocess, no second read of those sources. path_is_denied is
+    handed down so the deny-list still guards the one file this reads outside the repo."""
+    if ATTENTION is None:
+        return attention_empty()
+    state = state or {}
+    parallelism = state.get("parallelism")
+    return ATTENTION.collect(
+        root,
+        turn=parallelism.get("turns") if isinstance(parallelism, dict) else None,
+        sweep_receipt=state.get("sweep_receipt"),
+        checkpoint=state.get("checkpoint"),
+        quality_gate=state.get("quality_gate"),
+        denied=path_is_denied,
+    )
+
+
 def publish_live_users(root, roster_count, previous, now=None):
     """hmd dogfoods the panel publish path: the roster count /api/state already
     computes becomes the `hmd-live-users` number tile, written in-process through
@@ -831,6 +857,8 @@ def collect_state(root, transport=None):
         "panels": safe(collect_panels, list),
         "inbox": safe(collect_inbox, lambda: {"pending": 0}),
     }
+    # Derived AFTER the slices it reads, so it sees this pass's parallelism/receipt/checkpoint/gate.
+    state["attention"] = safe(lambda r: collect_attention(r, state), attention_empty)
     if transport is not None:
         state["transport"] = transport
         if transport.get("public_host"):
