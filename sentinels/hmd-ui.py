@@ -134,6 +134,7 @@ SOURCE_COMMANDS = (
     ("heimdall-fallback", "status", "--json"),
     ("heimdall-identity", "--json"),
     ("heimdall-haid", "current"),
+    ("heimdall-agents", "list", "--json"),   # A3: the `agents` panel (throttled; see companion_ui_publish)
 )
 GIT_COMMANDS = (
     ("git", "rev-parse", "--abbrev-ref", "HEAD"),
@@ -725,10 +726,20 @@ def publish_live_users(root, roster_count, previous, now=None):
 COMPANION = _load_module("companion_ui_publish", os.path.join(LIB_DIR, "companion_ui_publish.py"))
 
 
+AGENTS_LIST_TIMEOUT_S = 6
+
+
 def new_companion_publisher(root):
     if COMPANION is None or os.environ.get("HMD_UI_COMPANION_PANELS") == "0":
         return None
-    return COMPANION.CompanionPublisher(root, read_tail=_read_tail)
+
+    def list_agents():
+        # The publisher throttles this (>= 10s apart) and skips it while the statusline's
+        # cached count says nothing is running; _run_json_cached memoizes within a tick.
+        return _run_json_cached(("heimdall-agents", "list", "--json"), root,
+                                timeout=AGENTS_LIST_TIMEOUT_S, env={"HMD_AGENT_CWD": root})
+
+    return COMPANION.CompanionPublisher(root, read_tail=_read_tail, list_agents=list_agents)
 
 
 def publish_companion_panels(publisher):

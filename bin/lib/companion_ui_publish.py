@@ -443,8 +443,10 @@ def agent_rows(agents, now, seen):
             agent_cell(label), agent_cell(a.get("agent_type"), 64), "", status,
             time.strftime("%H:%M:%S", time.localtime(first)) if first else "",
             fmt_elapsed(end - first) if first and end else ""]))
-    for aid in [k for k in seen if k not in {t[1] for t in keep}][:max(0, len(seen) - 500)]:
-        del seen[aid]
+    if len(seen) > 500:
+        live_ids = {t[1] for t in keep}
+        for aid in [k for k in seen if k not in live_ids][:len(seen) - 500]:
+            del seen[aid]
     keep.sort(key=lambda t: (t[0], t[1]))
     return [row for _rank, _aid, row in keep[:AGENT_ROW_CAP]]
 

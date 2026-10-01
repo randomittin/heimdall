@@ -458,6 +458,115 @@ sv = served(root, T0 + 20)
 check("10h. a secret-shaped question is dropped for that turn; the chat line is still published, redacted",
       "hmd-question" not in sv and sv["chat"]["data"]["lines"][-1].endswith("hmd [redacted]"), str(list(sv)))
 
+# ── 11. agents: a projection of `heimdall-agents list --json` into the app's table ─────
+class Lister(object):
+    def __init__(self, result):
+        self.result, self.calls = result, 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.result
+
+
+def AG(aid, state, age, desc=None, typ=None, name="-"):
+    return {"id": aid, "age_secs": age, "state": state, "name": name, "agent_type": typ,
+            "description": desc, "worktree_path": None, "worktree_branch": None}
+
+
+HMS = lambda ts: time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def agents_repo():
+    r, dd = new_repo()
+    write_transcript(dd, "s", [u_human("go", T0), a_text("ok", T0 + 5, "m1")])
+    return r
+
+
+root = agents_repo()
+lister = Lister([
+    AG("w1", "working", 5, "refactor parser", "hmd:coder"),
+    AG("l1", "live", 7, None, None, "scout"),
+    AG("d1", "done", 30, "write docs", "hmd:docs-writer"),
+    AG("d2", "done", 9000, "ancient"),
+    AG("s1", "stale", 2000, "stale one"),
+    AG("m1", "mailbox", 100, "parked"),
+    AG("o1", "orphaned", 5000, "dead"),
+    AG("h1", "hung", 4000, "stuck build", "hmd:coder"),
+    AG("k1", "killed", 100, "killed one"),
+    AG("r1", "reaped", 100, "reaped"),
+])
+CP.CompanionPublisher(root, list_agents=lister).tick(now=T0 + 100)
+ap = served(root, T0 + 100).get("agents")
+check("11a. agents envelope: table, title Agents, refresh_s 30, data keys exactly [columns, rows], the app's "
+      "six columns", ap is not None and ap["type"] == "table" and ap["title"] == "Agents" and ap["refresh_s"] == 30
+      and list(ap["data"].keys()) == ["columns", "rows"]
+      and ap["data"]["columns"] == ["agent", "role", "model", "status", "started", "elapsed"], str(ap)[:200])
+want = [["scout", "", "", "running", HMS(T0 + 93), "<1m"],
+        ["refactor parser", "hmd:coder", "", "running", HMS(T0 + 95), "<1m"],
+        ["stuck build", "hmd:coder", "", "unknown", "", ""],
+        ["write docs", "hmd:docs-writer", "", "finished", "", ""],
+        ["killed one", "", "", "finished", "", ""]]
+check("11b. live/working -> running, hung -> unknown, recently done/killed -> finished; stale, orphaned, "
+      "mailbox, reaped and long-finished agents are not listed; start time claimed only for a fresh spawn",
+      ap is not None and ap["data"]["rows"] == want, repr(ap["data"]["rows"]) if ap else "")
+check("11c. every status is in the app's closed set", ap is not None and all(
+    r[3] in ("running", "pending", "finished", "unknown") for r in ap["data"]["rows"]))
+
+root = agents_repo()
+CP.CompanionPublisher(root, list_agents=Lister([])).tick(now=T0 + 100)
+ap = served(root, T0 + 100).get("agents")
+check("11d. a live session with no agents publishes the idle row (the app reads that as 'published, none "
+      "running' rather than 'no publisher')", ap is not None and ap["data"]["rows"] == [["—", "idle", "", "", "", ""]])
+
+root = agents_repo()
+cache = os.path.join(root, ".heimdall", ".agents-count-cache")
+os.makedirs(os.path.dirname(cache), exist_ok=True)
+open(cache, "w").write("0\n")
+lister = Lister([AG("w1", "working", 5, "x")])
+CP.CompanionPublisher(root, list_agents=lister).tick(now=T0 + 100)
+check("11e. the statusline's fresh cached count of 0 means no probe is spawned at all",
+      lister.calls == 0 and served(root, T0 + 100)["agents"]["data"]["rows"][0][1] == "idle")
+open(cache, "w").write("2\n")
+lister2 = Lister([AG("w1", "working", 5, "x")])
+CP.CompanionPublisher(root, list_agents=lister2).tick(now=T0 + 100)
+check("11f. a cached count > 0 (or no cache at all) probes", lister2.calls == 1)
+
+root = agents_repo()
+lister = Lister([AG("w1", "working", 5, "job")])
+pub = CP.CompanionPublisher(root, list_agents=lister)
+pub.tick(now=T0 + 100)
+pub.tick(now=T0 + 103)
+c_early = lister.calls
+pub.tick(now=T0 + 111)
+check("11g. the probe is throttled: two ticks 3s apart cost one `heimdall-agents list`, the next one >=10s later a second",
+      c_early == 1 and lister.calls == 2, "%d/%d" % (c_early, lister.calls))
+ap_path = os.path.join(root, ".heimdall", "ui", "panels", "agents.json")
+before_a = open(ap_path, "rb").read()
+check("11h. an unchanged agent list never rewrites the panel (digest stays quiet)",
+      pub.tick(now=T0 + 125) is False and open(ap_path, "rb").read() == before_a)
+lister.result = None
+check("11i. a failed probe keeps what was published (no flap to idle)",
+      pub.tick(now=T0 + 140) is False and open(ap_path, "rb").read() == before_a)
+lister.result = [AG("w1", "working", 5, "job")]
+pub.tick(now=T0 + 100 + 135)
+rows = served(root, T0 + 100 + 135)["agents"]["data"]["rows"]
+check("11j. elapsed advances at minute granularity from the observed start (2m at +135s)",
+      rows[0][5] == "2m" and rows[0][4] == HMS(T0 + 95), repr(rows))
+lister.result = [AG("w1", "done", 20, "job")]
+pub.tick(now=T0 + 100 + 150)
+rows = served(root, T0 + 100 + 150)["agents"]["data"]["rows"]
+check("11k. the same agent turning done becomes finished, elapsed = start -> finish (not the idle age)",
+      rows[0][3] == "finished" and rows[0][5] == "2m", repr(rows))
+
+root = agents_repo()
+lister = Lister([AG("w1", "working", 5, "deploy with " + STRIPE, "hmd:coder"),
+                 AG("w2", "working", 5, "two\nlines\tand\x07ctl", "hmd:coder")])
+CP.CompanionPublisher(root, list_agents=lister).tick(now=T0 + 100)
+ap = served(root, T0 + 100).get("agents")
+cells = [r[0] for r in ap["data"]["rows"]] if ap else []
+check("11l. a secret-shaped description becomes `[redacted]` (row kept, panel still served); newlines/tabs/"
+      "control bytes are flattened", cells == ["[redacted]", "two lines andctl"], repr(cells))
+
 failed = [r for r in results if not r[0]]
 for okv, name, detail in results:
     print(("OK   " if okv else "FAIL ") + name + ("" if okv else "  [%s]" % detail))
@@ -570,6 +679,11 @@ if start_server "$LIVE" "$TMPROOT/live"; then
   jq -e '.panels[] | select(.id=="chat") | .data.lines[0] | test("^[0-9]{2}:[0-9]{2} you what is the plan\\?$")' "$LIVE_STATE" >/dev/null 2>&1 \
     && ok "L1b. first line is '<HH:MM> you <prompt>' (the app's CHAT_LINE_RE)" \
     || bad "L1b. first chat line: $(jq -c '.panels[]|select(.id=="chat")|.data.lines[0]' "$LIVE_STATE" 2>/dev/null)"
+  if state_until "$S_PORT" "$S_TOKEN" - '.panels[] | select(.id=="agents") | .type=="table" and .title=="Agents" and ((.data|keys)==["columns","rows"]) and .data.rows==[["—","idle","","","",""]]' 10; then
+    ok "L7. with a live session and no agents the poller publishes the agents panel with the idle row"
+  else
+    bad "L7. agents panel: $(jq -c '[.panels[]|select(.id=="agents")]' "$LIVE_STATE" 2>/dev/null) err: $(head -c 300 "$TMPROOT/live.err")"
+  fi
   etag_of() { curl -s -D - -o /dev/null "http://127.0.0.1:$S_PORT/api/state?token=$S_TOKEN" | tr -d '\r' | awk -F': ' 'tolower($1)=="etag"{print $2}'; }
   e1="$(etag_of)"; sleep 4.5; e2="$(etag_of)"
   if [ -n "$e1" ] && [ "$e1" = "$e2" ]; then
@@ -598,6 +712,26 @@ if start_server "$LIVE" "$TMPROOT/live"; then
 else
   bad "L0. hmd ui did not come up: $(head -c 400 "$TMPROOT/live.err")"
 fi
+
+AGLIVE="$TMPROOT/agents-live-repo"
+mkdir -p "$AGLIVE/.heimdall" "$TMPROOT/agents-sub"
+( cd "$AGLIVE" && git init -q . ) >/dev/null 2>&1
+plant_transcript "$AGLIVE" ag-sess "you|spawn a coder"
+printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}' \
+  > "$TMPROOT/agents-sub/agent-aliveone.jsonl"
+printf '%s\n' '{"agentType":"hmd:coder","description":"live test agent","model":"sonnet"}' \
+  > "$TMPROOT/agents-sub/agent-aliveone.meta.json"
+export HMD_AGENT_SUBAGENTS_DIR="$TMPROOT/agents-sub" HMD_AGENT_REAPED_FILE="$TMPROOT/agents-reaped.json" HMD_AGENT_LIVE_SLUGS=""
+if start_server "$AGLIVE" "$TMPROOT/aglive"; then
+  if state_until "$S_PORT" "$S_TOKEN" - '.panels[] | select(.id=="agents") | .data.rows[0][0]=="live test agent" and .data.rows[0][1]=="hmd:coder" and .data.rows[0][3]=="running"' 15; then
+    ok "L8. a real heimdall-agents list drives the agents panel: description, role and status running"
+  else
+    bad "L8. agents panel with a planted live subagent: $(jq -c '[.panels[]|select(.id=="agents")]' "$LIVE_STATE" 2>/dev/null) err: $(head -c 300 "$TMPROOT/aglive.err"); list: $("$REPO/bin/heimdall-agents" list --json 2>&1 | head -c 300)"
+  fi
+else
+  bad "L8. hmd ui (agents) did not come up: $(head -c 400 "$TMPROOT/aglive.err")"
+fi
+unset HMD_AGENT_SUBAGENTS_DIR HMD_AGENT_REAPED_FILE HMD_AGENT_LIVE_SLUGS
 
 PUBLIC="$TMPROOT/public-repo"
 mkdir -p "$PUBLIC/.heimdall"
