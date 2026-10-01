@@ -21,10 +21,18 @@ Routes (all GET):
                       `id:` line carries, so a client can share one digest between both
                       routes. (+ Wave 4's additive `panels` array: .heimdall/ui/panels/<id>.json
                       through bin/lib/companion_ui_panels.read_panels -- validated,
-                      secret-scrubbed, capped, `stale`-flagged, TTL-reaped). When
-                      transport.public_host is set (--allow-host), `repo`/`edits.paths`
-                      go to basenames and `roster`/`ledger.team` strings are scrubbed of
-                      email-shaped substrings and absolute paths (loopback is unaffected)
+                      secret-scrubbed, capped, `stale`-flagged, TTL-reaped). The whole
+                      body is then scrubbed per the TRANSPORT carrying it
+                      (`_transport_redaction` -- never anything a request says):
+                      loopback is unredacted; with transport.public_host set
+                      (--allow-host) every absolute path token becomes its basename;
+                      over the E2E relay (bin/heimdall-relay-client builds a transport
+                      with bind "relay" in-process, the leg is sealed) a path token below
+                      the repo root keeps its repo-relative part ("src/app/x.ts") and
+                      the rest is still reduced. Email-shaped substrings become
+                      "[email]" on every redacting profile. `edits.count` is the number
+                      of UNIQUE edited paths (not edit events); `edits.paths` is
+                      repo-relative inside the repo, absolute outside it
     /api/events       text/event-stream; a `data:` frame only when the digest changes
                       (the digest covers `panels`, so a `hmd ui panel set` lands within
                       one poll)
@@ -725,17 +733,34 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _ABS_PATH_TOKEN_RE = re.compile(r"""(?<!\S)(?:/|~/)[^\s"']*""")
 
 
-def _redact_public_token(token):
-    """One matched path token -> its basename. `os.path.normpath` first so a
-    trailing slash (or an embedded '.'/'..' segment) still collapses to a real
-    last-component name instead of the empty string `basename()` would otherwise
-    give it; falls back to the original token on the rare all-slashes value (e.g.
-    a bare '/') rather than emptying it."""
+def _repo_relative(token, root):
+    """`token`'s part below `root` -- '/'-separated, never absolute, never climbing
+    out -- or None when the token IS `root`, sits outside it, or `root` is '/' (where
+    "below the root" would be everything and the whole filesystem layout would leak).
+    Purely lexical (`normpath`, no filesystem access): a value whose '..' segments
+    escape the repo normalises to something outside it, and a sibling that merely
+    shares the root's name as a string prefix ('<root>-evil/z.ts') is not below it."""
+    prefix = os.path.normpath(root).rstrip("/") + "/"
+    norm = os.path.normpath(os.path.expanduser(token))
+    return norm[len(prefix):] if len(prefix) > 1 and norm.startswith(prefix) else None
+
+
+def _redact_public_token(token, root=None):
+    """One matched path token -> what may leave this process: with a `root` (the E2E
+    relay profile only) its repo-relative part when it sits below that root, otherwise
+    its basename. `os.path.normpath` first so a trailing slash (or an embedded
+    '.'/'..' segment) still collapses to a real last-component name instead of the
+    empty string `basename()` would otherwise give it; falls back to the original
+    token on the rare all-slashes value (e.g. a bare '/') rather than emptying it."""
+    if root:
+        rel = _repo_relative(token, root)
+        if rel:
+            return rel
     bn = os.path.basename(os.path.normpath(token))
     return bn if bn else token
 
 
-def _scrub_public_string(value):
+def _scrub_public_string(value, root=None):
     """N4: a public-mode string LEAF must carry no email-shaped substring and no
     absolute-or-home path token -- either would hand the operator's identity, a
     `$HOME`-adjacent username, or a private filesystem layout to anyone Tailscale
