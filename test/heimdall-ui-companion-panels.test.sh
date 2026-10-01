@@ -407,5 +407,130 @@ if [ ! -s "$CHECKS_OUT" ]; then
   sed 's/^/       | /' "$TMPROOT/checks.err" | head -20
 fi
 
+# ── live server: the poller publishes, /api/state serves, public mode redacts ──────
+if [ ! -x "$UI" ]; then
+  bad "live: bin/heimdall-ui is not executable ($UI)"
+  printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+  exit 1
+fi
+
+# A transcript for $1 (a repo root) holding the turns passed as "role|text" args.
+plant_transcript() {
+  local root="$1" sid="$2"; shift 2
+  python3 - "$root" "$sid" "$@" <<'PYEOF'
+import json, os, re, sys, time
+root, sid, turns = os.path.realpath(sys.argv[1]), sys.argv[2], sys.argv[3:]
+d = os.path.join(os.environ["HOME"], ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", root))
+os.makedirs(d, exist_ok=True)
+t = time.time() - 120
+with open(os.path.join(d, sid + ".jsonl"), "a", encoding="utf-8") as f:
+    for i, spec in enumerate(turns):
+        role, text = spec.split("|", 1)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t + i))
+        base = {"isSidechain": False, "timestamp": ts, "entrypoint": "cli"}
+        if role == "you":
+            base.update({"type": "user", "message": {"role": "user", "content": text}, "origin": {"kind": "human"}})
+        else:
+            base.update({"type": "assistant", "message": {"id": "m%d%d" % (os.getpid(), i), "role": "assistant",
+                         "stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}})
+        f.write(json.dumps(base) + "\n")
+PYEOF
+}
+
+free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+
+wait_for() {
+  local file="$1" re="$2" secs="${3:-10}" i=0 max
+  max=$(( secs * 5 ))
+  while [ "$i" -lt "$max" ]; do
+    grep -Eq "$re" "$file" 2>/dev/null && return 0
+    sleep 0.2; i=$((i + 1))
+  done
+  return 1
+}
+
+# start_server <fixture-root> <out-prefix> [extra hmd ui args...] -> sets S_PORT S_TOKEN
+start_server() {
+  local fix="$1" prefix="$2"; shift 2
+  S_PORT="$(free_port)"
+  ( cd "$fix" && HEIMDALL_WATCH_ROOT="$fix" exec "$UI" --repo "$fix" --port "$S_PORT" --no-open "$@" ) \
+    >"$prefix.out" 2>"$prefix.err" &
+  PIDS+=("$!")
+  if ! wait_for "$prefix.out" "^http://127\.0\.0\.1:$S_PORT/\?(t|token)=[A-Za-z0-9_-]+\$" 10; then
+    return 1
+  fi
+  S_TOKEN="$(grep -E "^http://127\.0\.0\.1:$S_PORT/" "$prefix.out" | head -1 | sed 's/.*[?&]\(t\|token\)=//')"
+  return 0
+}
+
+state_until() {   # state_until <port> <token> <host-header|-> <jq-expr> <secs> -> leaves state in $LIVE_STATE
+  local port="$1" token="$2" host="$3" expr="$4" secs="${5:-10}" i=0 max
+  max=$(( secs * 5 ))
+  LIVE_STATE="$TMPROOT/live-state.$port.json"
+  while [ "$i" -lt "$max" ]; do
+    if [ "$host" = "-" ]; then
+      curl -s -o "$LIVE_STATE" "http://127.0.0.1:$port/api/state?token=$token" 2>/dev/null
+    else
+      curl -s -o "$LIVE_STATE" -H "Host: $host" "http://127.0.0.1:$port/api/state?token=$token" 2>/dev/null
+    fi
+    jq -e "$expr" "$LIVE_STATE" >/dev/null 2>&1 && return 0
+    sleep 0.2; i=$((i + 1))
+  done
+  return 1
+}
+
+LIVE="$TMPROOT/live-repo"
+mkdir -p "$LIVE/.heimdall"
+( cd "$LIVE" && git init -q . ) >/dev/null 2>&1
+plant_transcript "$LIVE" live-sess "you|what is the plan?" "hmd|Ship chat first.
+
+Then the question panel."
+if start_server "$LIVE" "$TMPROOT/live"; then
+  ok "L0. hmd ui came up with the native publishers on"
+  CHAT_EXPR='.panels[] | select(.id=="chat") | .type=="log-tail" and .title=="Chat" and ((.data|keys)==["lines"]) and (.data.lines|length)==2'
+  if state_until "$S_PORT" "$S_TOKEN" - "$CHAT_EXPR" 10; then
+    ok "L1. /api/state serves the poller-published chat panel: log-tail, data keys exactly [lines], 2 lines"
+  else
+    bad "L1. no chat panel in /api/state: $(jq -c '[.panels[]|{id,type}]' "$LIVE_STATE" 2>/dev/null) err: $(head -c 300 "$TMPROOT/live.err")"
+  fi
+  jq -e '.panels[] | select(.id=="chat") | .data.lines[0] | test("^[0-9]{2}:[0-9]{2} you what is the plan\\?$")' "$LIVE_STATE" >/dev/null 2>&1 \
+    && ok "L1b. first line is '<HH:MM> you <prompt>' (the app's CHAT_LINE_RE)" \
+    || bad "L1b. first chat line: $(jq -c '.panels[]|select(.id=="chat")|.data.lines[0]' "$LIVE_STATE" 2>/dev/null)"
+  etag_of() { curl -s -D - -o /dev/null "http://127.0.0.1:$S_PORT/api/state?token=$S_TOKEN" | tr -d '\r' | awk -F': ' 'tolower($1)=="etag"{print $2}'; }
+  e1="$(etag_of)"; sleep 4.5; e2="$(etag_of)"
+  if [ -n "$e1" ] && [ "$e1" = "$e2" ]; then
+    ok "L2. digest stable: same ETag across two poll ticks with an idle transcript (no per-tick churn)"
+  else
+    bad "L2. ETag moved while nothing changed: $e1 -> $e2"
+  fi
+  plant_transcript "$LIVE" live-sess "you|go with option B" "hmd|Doing B."
+  if state_until "$S_PORT" "$S_TOKEN" - '.panels[] | select(.id=="chat") | (.data.lines|length)==4' 10; then
+    ok "L3. a new turn in the transcript reaches /api/state within the poll interval"
+  else
+    bad "L3. chat lines after append: $(jq -c '.panels[]|select(.id=="chat")|.data.lines' "$LIVE_STATE" 2>/dev/null)"
+  fi
+else
+  bad "L0. hmd ui did not come up: $(head -c 400 "$TMPROOT/live.err")"
+fi
+
+PUBLIC="$TMPROOT/public-repo"
+mkdir -p "$PUBLIC/.heimdall"
+( cd "$PUBLIC" && git init -q . ) >/dev/null 2>&1
+plant_transcript "$PUBLIC" pub-sess "you|please read /Users/someone/private/notes.md and mail a.b@example.com" "hmd|done with /Users/someone/private/notes.md"
+HOST="funnel.example.ts.net"
+if start_server "$PUBLIC" "$TMPROOT/public" --allow-host "$HOST"; then
+  if state_until "$S_PORT" "$S_TOKEN" "$HOST" '.panels[] | select(.id=="chat") | (.data.lines|length)==2' 10; then
+    if jq -e '[.panels[]|select(.id=="chat")|.data.lines[]] | all(test("/Users/someone") | not) and (.[0] | test("notes.md") and test("\\[email\\]") and (test("a\\.b@example") | not))' "$LIVE_STATE" >/dev/null 2>&1; then
+      ok "L4. public mode (--allow-host): absolute paths and emails in chat lines are redacted by _redact_public"
+    else
+      bad "L4. public chat lines not redacted: $(jq -c '.panels[]|select(.id=="chat")|.data.lines' "$LIVE_STATE" 2>/dev/null)"
+    fi
+  else
+    bad "L4. no chat panel via the public host: $(jq -c '[.panels[]|.id]' "$LIVE_STATE" 2>/dev/null)"
+  fi
+else
+  bad "L4. public hmd ui did not come up: $(head -c 400 "$TMPROOT/public.err")"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -134,6 +134,12 @@ def slug_dirs(root):
     return out
 
 
+def source_paths(root):
+    """What the native publishers read, for `hmd ui --print-sources`: the TAIL of the
+    newest interactive session transcript of this repo, text blocks only."""
+    return [os.path.join(d, "<session>.jsonl") for d in slug_dirs(root)]
+
+
 def _default_read_tail(path, nbytes):
     try:
         with open(path, "rb") as f:
