@@ -755,5 +755,26 @@ else
   bad "L4. public hmd ui did not come up: $(head -c 400 "$TMPROOT/public.err")"
 fi
 
+OFFREPO="$TMPROOT/off-repo"
+mkdir -p "$OFFREPO/.heimdall"
+( cd "$OFFREPO" && git init -q . ) >/dev/null 2>&1
+plant_transcript "$OFFREPO" off-sess "you|hello" "hmd|hi"
+export HMD_UI_COMPANION_PANELS=0
+if start_server "$OFFREPO" "$TMPROOT/off"; then
+  if state_until "$S_PORT" "$S_TOKEN" - '[.panels[].id] | index("hmd-live-users") != null' 10; then
+    sleep 5   # two more poll ticks: long enough for a publisher that should not be running to have run
+    if state_until "$S_PORT" "$S_TOKEN" - '([.panels[].id] | map(select(. == "chat" or . == "agents" or . == "hmd-question")) | length) == 0' 3; then
+      ok "L9. HMD_UI_COMPANION_PANELS=0 switches the native publishers off (poller alive, no chat/agents/hmd-question)"
+    else
+      bad "L9. kill switch ignored: $(jq -c '[.panels[]|.id]' "$LIVE_STATE" 2>/dev/null)"
+    fi
+  else
+    bad "L9. poller never published hmd-live-users with the kill switch on"
+  fi
+else
+  bad "L9. hmd ui (kill switch) did not come up: $(head -c 400 "$TMPROOT/off.err")"
+fi
+unset HMD_UI_COMPANION_PANELS
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
