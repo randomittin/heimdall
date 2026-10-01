@@ -714,14 +714,17 @@ else
 fi
 
 AGLIVE="$TMPROOT/agents-live-repo"
-mkdir -p "$AGLIVE/.heimdall" "$TMPROOT/agents-sub"
+mkdir -p "$AGLIVE/.heimdall" "$TMPROOT/ag/claude-501/slug/tsess/tasks" "$TMPROOT/ag/projects/slug/asess/subagents"
 ( cd "$AGLIVE" && git init -q . ) >/dev/null 2>&1
 plant_transcript "$AGLIVE" ag-sess "you|spawn a coder"
+# The harness layout bin/heimdall-agents reads (test/heimdall-agents.test.sh): a task-dir `.output`
+# symlinked to the subagent transcript, whose sibling .meta.json carries agentType/description.
 printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}' \
-  > "$TMPROOT/agents-sub/agent-aliveone.jsonl"
+  > "$TMPROOT/ag/projects/slug/asess/subagents/agent-aliveone.jsonl"
 printf '%s\n' '{"agentType":"hmd:coder","description":"live test agent","model":"sonnet"}' \
-  > "$TMPROOT/agents-sub/agent-aliveone.meta.json"
-export HMD_AGENT_SUBAGENTS_DIR="$TMPROOT/agents-sub" HMD_AGENT_REAPED_FILE="$TMPROOT/agents-reaped.json" HMD_AGENT_LIVE_SLUGS=""
+  > "$TMPROOT/ag/projects/slug/asess/subagents/agent-aliveone.meta.json"
+ln -s "$TMPROOT/ag/projects/slug/asess/subagents/agent-aliveone.jsonl" "$TMPROOT/ag/claude-501/slug/tsess/tasks/aliveone.output"
+export HMD_AGENT_TASKDIR="$TMPROOT/ag/claude-501/slug/tsess/tasks" HMD_AGENT_REAPED_FILE="$TMPROOT/agents-reaped.json" HMD_AGENT_LIVE_SLUGS=""
 if start_server "$AGLIVE" "$TMPROOT/aglive"; then
   if state_until "$S_PORT" "$S_TOKEN" - '.panels[] | select(.id=="agents") | .data.rows[0][0]=="live test agent" and .data.rows[0][1]=="hmd:coder" and .data.rows[0][3]=="running"' 15; then
     ok "L8. a real heimdall-agents list drives the agents panel: description, role and status running"
@@ -731,7 +734,7 @@ if start_server "$AGLIVE" "$TMPROOT/aglive"; then
 else
   bad "L8. hmd ui (agents) did not come up: $(head -c 400 "$TMPROOT/aglive.err")"
 fi
-unset HMD_AGENT_SUBAGENTS_DIR HMD_AGENT_REAPED_FILE HMD_AGENT_LIVE_SLUGS
+unset HMD_AGENT_TASKDIR HMD_AGENT_REAPED_FILE HMD_AGENT_LIVE_SLUGS
 
 PUBLIC="$TMPROOT/public-repo"
 mkdir -p "$PUBLIC/.heimdall"
