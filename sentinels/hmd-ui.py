@@ -114,6 +114,7 @@ SOURCE_FILES = (
     ".planning/metrics.jsonl",            # last graded parallelism row (tail only)
     ".heimdall/ui/panels/",               # job panels: <id>.json via companion_ui_panels.read_panels
     ".heimdall/ui/inbox.jsonl",           # undelivered companion messages: companion_ui_inbox.list_pending
+    ".heimdall/.agents-count-cache",      # live-subagent count (one integer), read only after a turn ends
 )
 # Under $TMPDIR: parallelism-tracker's live per-session counters (key=value text).
 # READ ONLY. `parallelism-tracker grade` is deliberately NOT called: it is the
@@ -126,6 +127,12 @@ SOURCE_TMP_FILES = (
 SOURCE_HOME_FILES = (
     "ledger/repos/<repo_key>.json",
     "ledger/status.json",
+)
+# Under ${CLAUDE_CONFIG_DIR:-~/.claude}: the repo's own session transcript, for the `attention`
+# slice. READ ONLY and TAIL ONLY (bin/lib/companion_ui_attention.py): never the whole file, and
+# never anything else in that directory -- settings.json stays deny-listed and unopened.
+SOURCE_CLAUDE_FILES = (
+    "projects/<slug>/<session>.jsonl",
 )
 SOURCE_COMMANDS = (
     ("heimdall-hooks", "list", "--json"),
@@ -213,6 +220,10 @@ INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_i
 # same file, so the code shown here in identity.session_code and the code shown on the
 # statusline can never disagree.
 SESSION_CODE = _load_module("hmd_session_code", os.path.join(LIB_DIR, "hmd_session_code.py"))
+# The ONE place the `attention` derivation lives (A1, docs/HANDOFF-TO-HEIMDALL-product-asks.md):
+# the newest main-chain entries of the repo's session transcript -> {state,id,since,kind,summary,
+# options,turn}. Tail-only, stat-cached; see the module docstring.
+ATTENTION = _load_module("companion_ui_attention", os.path.join(LIB_DIR, "companion_ui_attention.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -688,6 +699,32 @@ def collect_inbox(root):
     return {"pending": len(INBOX.list_pending(root))}
 
 
+def attention_empty():
+    """The no-evidence `attention` shape (A1): idle, nothing to point at. Mirrors
+    companion_ui_attention.empty(), which is unreachable when that module failed to load."""
+    return {"state": "idle", "id": None, "since": None, "kind": None,
+            "summary": None, "options": None, "turn": None}
+
+
+def collect_attention(root, state=None):
+    """The `attention` addendum (A1): derived from the repo's session transcript tail and the
+    slices collect_state already holds (parallelism.turns, sweep_receipt, checkpoint,
+    quality_gate) -- no extra subprocess, no second read of those sources. path_is_denied is
+    handed down so the deny-list still guards the one file this reads outside the repo."""
+    if ATTENTION is None:
+        return attention_empty()
+    state = state or {}
+    parallelism = state.get("parallelism")
+    return ATTENTION.collect(
+        root,
+        turn=parallelism.get("turns") if isinstance(parallelism, dict) else None,
+        sweep_receipt=state.get("sweep_receipt"),
+        checkpoint=state.get("checkpoint"),
+        quality_gate=state.get("quality_gate"),
+        denied=path_is_denied,
+    )
+
+
 def publish_live_users(root, roster_count, previous, now=None):
     """hmd dogfoods the panel publish path: the roster count /api/state already
     computes becomes the `hmd-live-users` number tile, written in-process through
@@ -859,6 +896,8 @@ def collect_state(root, transport=None):
         "panels": safe(collect_panels, list),
         "inbox": safe(collect_inbox, lambda: {"pending": 0}),
     }
+    # Derived AFTER the slices it reads, so it sees this pass's parallelism/receipt/checkpoint/gate.
+    state["attention"] = safe(lambda r: collect_attention(r, state), attention_empty)
     if transport is not None:
         state["transport"] = transport
         if transport.get("public_host"):
@@ -1417,6 +1456,9 @@ def print_sources(root):
     if COMPANION is not None:
         for path in COMPANION.source_paths(root):
             print("file %s" % path)
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    for rel in SOURCE_CLAUDE_FILES:
+        print("file %s" % os.path.join(claude_dir, rel))
     print("file %s" % PAGE_PATH)
     for argv in SOURCE_COMMANDS:
         print("exec %s" % shlex.join([os.path.join(BIN_DIR, argv[0])] + list(argv[1:])))
