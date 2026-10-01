@@ -9,7 +9,8 @@ One additive top-level key, inside the SSE digest (sentinels/hmd-ui.py registers
                   "since":   <epoch s> | null,      # the transition's own timestamp
                   "kind":    null|"question"|"permission"|"done"|"stopped"|"error",
                   "summary": null | <= 160-char single line (secret_shaped -> null, field only),
-                  "options": null | [{"key","label"}]  (<= 8 entries, label <= 80 chars),
+                  "options": null | [{"key","label"}]  (<= 8 entries, label <= 80 chars; the question's
+                             enumerated lines, else [yes, no] for ONE closed polar question, else null),
                   "turn":    parallelism.turns | null}
 
 No evidence at all -> {"state":"idle","id":null,"since":null,"kind":null,"summary":null,
@@ -39,6 +40,9 @@ HOW EACH STATE IS REACHED (the newest decisive entry decides):
   working         a prompt / tool_result / tool_use / mid-message assistant entry.
   needs_input     a settled-or-not assistant end_turn whose text ends in `?` (the inbox's own rule,
                   bin/heimdall-inbox-deliver is_question), or a pending AskUserQuestion tool call.
+                  `options` there: the text's enumerated lines when it has them; else Yes/No ONLY when
+                  the text asks exactly one question and it is a closed polar one (_closed_polar_question);
+                  else null, so a reply that ends in several open questions gets a free-text answer.
   needs_approval  a tool call with no result for longer than that tool can still be RUNNING
                   (Bash: its own timeout + hook margin, default 180 s; fast tools 20 s; other
                   tools 120 s; Agent/Task never), skipped when the newest permission-mode is
@@ -444,6 +448,63 @@ def _question_paragraph(text):
     return (prose or paras or [""])[-1]
 
 
+# Yes/No is attached ONLY to a question that really is yes/no: exactly ONE question, and a closed polar one.
+# Anything else carries no options, so the phone shows a free-text answer instead of two buttons that cannot
+# answer it. Every pattern is linear: this runs on assistant-authored text on each state request.
+YES_NO = ({"key": "yes", "label": "Yes"}, {"key": "no", "label": "No"})   # the app's own keys (hmdapp parse.ts)
+LEAD_IN_MAX_WORDS = 8          # "Quick check — can I ...?": a SHORT lead-in may precede the auxiliary
+
+_FENCE_RE = re.compile(r"```.*?(?:```|\Z)", re.S)
+_CODE_SPAN_RE = re.compile(r"`[^`\n]*`")
+_URL_RE = re.compile(r"https?://[^\s<>()\[\]]+")
+_QUESTION_END_RE = re.compile(r"\?[\"')\]}*_~»”’]*(?=\s|\Z)")      # a "?" that ends a question, not one inside a token
+_SENTENCE_BREAK_RE = re.compile(r"\n+|(?<=[.!…])\s+")
+_LEAD_IN_RE = re.compile(r"[:;,—–]|(?<=\s)-(?=\s)")
+_LEAD_JUNK = " \t>#*_~+-\"“‘'(["
+_POLAR_START_RE = re.compile(r"(?:is|are|was|were|am|do|does|did|can|could|should|shall|will|would|may|might|"
+                             r"have|has|had)(?:n't)?\b|won't\b", re.IGNORECASE)
+_YES_NO_TAG_RE = re.compile(r"\b(?:yes|no)\s*(?:/|or)\s*(?:yes|no)\b", re.IGNORECASE)
+_OPEN_WORD_RE = re.compile(r"\b(?:which|what|how|why|when|where|who|whom|whose|or)\b", re.IGNORECASE)
+
+
+def _mask_url(m):
+    url = m.group(0)
+    return "X" + url[len(url.rstrip(".,;:!?'\"")):]
+
+
+def _polar_body(sentence):
+    """`sentence`, or what follows a SHORT lead-in inside it, when that starts with an auxiliary/modal."""
+    s = sentence.lstrip(_LEAD_JUNK)
+    if _POLAR_START_RE.match(s):
+        return s
+    for m in _LEAD_IN_RE.finditer(s):
+        if len(s[:m.start()].split()) > LEAD_IN_MAX_WORDS:
+            return None
+        rest = s[m.end():].lstrip(_LEAD_JUNK)
+        if _POLAR_START_RE.match(rest):
+            return rest
+    return None
+
+
+def _closed_polar_question(text):
+    """True when `text` asks exactly ONE question and it is a closed polar one: the closing sentence starts with
+    an auxiliary/modal (optionally after a short lead-in), is no "A or B?", no which/what/how/why/when/where/who
+    question, and an explicit "yes or no" tag does not make it an "A or B". `?` inside code, URLs or a token
+    does not count as a question. A secret-shaped text never gets an answer button: hmd-question is dropped
+    for it, so the phone could not show what Yes/No would be answering."""
+    if secret_shaped(text):
+        return False
+    t = _URL_RE.sub(_mask_url, _CODE_SPAN_RE.sub("X", _FENCE_RE.sub("\n", text)))
+    t = t.replace("’", "'").strip().rstrip("*_`~ \t\r\n")
+    if not t.endswith("?") or len(_QUESTION_END_RE.findall(t)) != 1:
+        return False
+    body = _polar_body(_SENTENCE_BREAK_RE.split(t.rstrip("?"))[-1])
+    if body is None:
+        return False
+    body = _YES_NO_TAG_RE.sub(" ", body)
+    return len(body.split()) >= 2 and not _OPEN_WORD_RE.search(body)
+
+
 def _make_options(text):
     paras = _paragraphs(text)
     for i, par in enumerate(paras):
@@ -451,7 +512,7 @@ def _make_options(text):
         if found:
             break
     else:
-        return None
+        return [dict(o) for o in YES_NO] if _closed_polar_question(text) else None
     if i == len(paras) - 1 and found[-1]["label"].endswith("?"):
         found[-1]["label"] = found[-1]["label"][:-1].strip()
     keys = [o["key"] for o in found]

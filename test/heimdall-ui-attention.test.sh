@@ -308,12 +308,17 @@ POLAR = (
     ("... after a long statement sentence",
      "The migration touched fourteen tables and three views and I verified every row count twice. Should I push?"),
     ("... after a short lead-in (em dash)", "Quick check — can I delete the stale worktrees?"),
+    ("... after a short lead-in (spaced hyphen)", "Quick check - can I delete the stale worktrees?"),
     ("... after a short lead-in (colon)", "Heads up: the gate was red earlier. Is it fine to ship anyway?"),
+    ("... after a short lead-in (commas)", "OK, so, should I push?"),
+    ("... after a lead-in of exactly 8 words", "one two three four five six seven eight — should I push?"),
     ("... in bold", "**Is the schema change safe to ship?**"),
     ("... with an explicit yes/no tag (not an 'A or B')", "Have you already rotated the key, yes or no?"),
     ("... in a negative contraction", "Doesn't the relay client already retry?"),
-    ("... with a `?` inside an inline code span", "I patched the matcher.\n\nShould I run `grep -r 'a?b' src` as well?"),
-    ("... with a `?` inside a URL", "Run: https://example.test/run?id=7\n\nDo you want me to merge it?"),
+    ("... with a `?` and a space inside an inline code span", "I rewrote the branch.\n\nShould I keep the `cond ? a : b` form?"),
+    ("... with which/or as identifiers inside code spans", "Should I rename `which` to `which_or_what`?"),
+    ("... with a what/which inside a URL", "Should I open https://example.test/run?what=1&which=2 now?"),
+    ("... ending in a URL that ends in the '?'", "Should I open https://example.test/page?"),
     ("... with a `?` inside a fenced block", "```\nwhy?\n```\n\nCan I apply the patch?"),
     ("... with a `?` glued inside a token", "Should I rename foo?bar.txt now?"),
 )
@@ -352,7 +357,7 @@ for label, text in OPEN:
 g, root, p = case([tx.entry("end", age=10, text="Pick one:\n\nA) alpha\nB) beta\n\nShould I go with A?")])
 check("U5f. enumerated options keep their parsed options even when the closing line is itself a polar question",
       g["options"] == [{"key": "A", "label": "alpha"}, {"key": "B", "label": "beta"}], g)
-g, root, p = case([tx.entry("end", age=10, text="Should I merge?\n\n1. Squash\n2. Rebase")])
+g, root, p = case([tx.entry("end", age=10, text="Here are the two ways to land it:\n\n1. Squash\n2. Rebase\n\nShould I use the first?")])
 check("U5g. a numbered list keeps its parsed options, never Yes/No",
       g["options"] == [{"key": "1", "label": "Squash"}, {"key": "2", "label": "Rebase"}], g)
 g, root, p = case([tx.entry("end", age=10, text="Pick:\n\nA) alpha\nA) again\n\nShould I go?")])
