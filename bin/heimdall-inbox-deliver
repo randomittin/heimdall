@@ -15,10 +15,11 @@
 #           the fixed INBOX_PROVENANCE_MARKER (identical in `prompt`, below)
 #           so a tool-enabled model can tell delivered text is untrusted data
 #           from the paired phone, never a same-privilege instruction. If the
-#           queue is empty but the turn just ended on a question to the user,
-#           long-polls the queue (every 2s, up to $HMD_INBOX_WAIT_S) so a
-#           same-session phone reply still reaches this turn instead of being
-#           stranded until the next Stop.
+#           queue is empty but the turn just ended on a question to the user
+#           -- or a companion is connected (IDLE-SESSION DELIVERY, below),
+#           whatever the turn ended on -- long-polls the queue (every 2s, up
+#           to $HMD_INBOX_WAIT_S) so a phone message still reaches this
+#           session instead of being stranded until the next turn boundary.
 #   tmux    Best-effort delivery into a tmux pane running Claude Code
 #           interactively, via `tmux send-keys`, for setups that don't use
 #           the Stop-hook path at all.
@@ -47,6 +48,39 @@
 # protocol: read lines, and pop atomically via `rename` (under an exclusive
 # `fcntl.flock` on inbox.jsonl.lock) followed by appending the renamed
 # content onto inbox-delivered.jsonl -- the archive of what was delivered.
+#
+# IDLE-SESSION DELIVERY (docs/HANDOFF-TO-HEIMDALL-product-asks.md, A2). A phone
+# exists for the moment the human is away, i.e. the session is idle -- but the
+# Stop long-poll used to cover only a turn that ended on a question, and only
+# for 240s; after that a phone message sat in inbox.jsonl until the laptop was
+# back. Now:
+#   COMPANION CONNECTED. <repo>/.heimdall/app/connect.json (written by `hmd app
+#     connect`) naming live processes (pid_ui, plus pid_client in relay mode)
+#     means a phone can reach this session, so `stop` long-polls after ANY last
+#     message, for HMD_INBOX_WAIT_S -- default 1800 with a companion connected,
+#     240 without. A connect.json whose pids are dead (a crash left it behind)
+#     is NOT a connected companion: a stale file must never pin every turn end
+#     for half an hour. The hook `timeout` in hooks/hooks.json is 1860 (1800
+#     plus the same 60s margin 240 -> 300 always had). stop_hook_active is
+#     still a silent loop guard.
+#   ATTENDED SESSIONS ONLY. A headless `claude -p` / SDK session
+#     (CLAUDE_CODE_ENTRYPOINT sdk-cli, sdk-ts, sdk-py, mcp, or the github
+#     action) and an hmd sub-session (HMD_JUDGMENT truthy, HMD_AGENT_TYPE set)
+#     never count as "companion connected": hmd's own automation spawns those
+#     in the same repo with the same plugin hooks, and each would otherwise
+#     stall 30 minutes at the end of its run. They keep the pre-A2 behaviour.
+#   WHO IS LISTENING. While it waits, the long-poll rewrites
+#     <repo>/.heimdall/ui/inbox-waiting (0600; JSON pid/since/until/ts) every
+#     poll and removes it on exit. `hmd ui` turns a fresh one (mtime within 2x
+#     the poll interval) into /api/state's inbox.consumer = "waiting"; a
+#     killed hook leaves a stale one that stops counting after ~4s.
+#   ORPHAN GUARD. If the shell that launched the long-poll dies (Esc or a
+#     timeout kill that reaches only the shell), the long-poll stands down
+#     without popping: a message popped into a dead pipe is lost yet archived
+#     as delivered.
+#   RECEIPTS. Every dequeue stamps delivered_at into the archived line
+#     (inbox-delivered.jsonl, 0600); /api/state's inbox.delivered[] is the last
+#     20 of those as {id, delivered_at} -- never text.
 #
 # EVERY MODE EXITS 0. A delivery-mechanism bug must never block or crash a
 # Stop/UserPromptSubmit turn. Message text is sanitized (control characters
@@ -84,9 +118,14 @@ Modes:
            followed by a fenced, capped block of the delivered text(s) --
            so Claude Code continues with it as the next instruction, clearly
            marked as untrusted data from the paired phone. If the queue is
-           empty and the assistant's last message ends with "?", long-polls
-           the queue every 2s for up to HMD_INBOX_WAIT_S seconds (default
-           240) and delivers the same way the moment a reply arrives. If
+           empty and either the assistant's last message ends with "?" or a
+           companion is connected (a .heimdall/app/connect.json naming live
+           processes; attended sessions only, never headless claude -p or an
+           hmd sub-session), long-polls the queue every 2s for up to
+           HMD_INBOX_WAIT_S seconds (default 1800 with a companion
+           connected, 240 without) and delivers the same way the moment a
+           message arrives. While it waits it keeps .heimdall/ui/inbox-waiting
+           fresh -- what `hmd ui` reports as inbox.consumer "waiting". If
            stop_hook_active is true, exits silently (loop guard) without
            touching the queue. Otherwise: no output.
 
@@ -106,20 +145,25 @@ Modes:
            --json is accepted (output is always JSON either way).
 
 Env:
-  HMD_INBOX_WAIT_S   seconds to long-poll in `stop` mode. Default 240.
+  HMD_INBOX_WAIT_S   seconds to long-poll in `stop` mode. Default 240, or 1800
+                     with a companion connected. Export 0 to never hold a turn.
+  HMD_INBOX_GATED    1 = the hook wiring found no .heimdall/ui/inbox.wait
+                     opt-in: `stop` waits only when a companion is connected,
+                     whatever HMD_INBOX_WAIT_S says.
   HMD_TMUX_TARGET    tmux target (session:window.pane) for `tmux` mode.
 
 IMPORTANT: a Stop hook wired to `stop` mode can run for up to
 HMD_INBOX_WAIT_S seconds waiting on a reply. The hook's own `timeout` in
 settings.json MUST be larger than that, or Claude Code kills this script
 before a late reply can be delivered. Ready-to-paste snippet for
-.claude/settings.json (HMD_INBOX_WAIT_S=240 -> timeout 300, a 60s margin):
+.claude/settings.json (the 1800s companion default -> timeout 1860, a 60s
+margin; with HMD_INBOX_WAIT_S=240 and no companion, timeout 300 is enough):
 
 {
   "hooks": {
     "Stop": [
       { "hooks": [ { "type": "command",
-          "command": "bin/heimdall-inbox-deliver stop", "timeout": 300 } ] }
+          "command": "bin/heimdall-inbox-deliver stop", "timeout": 1860 } ] }
     ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command",
@@ -170,11 +214,22 @@ PY_SRC=$(cat <<'PYEOF'
 import fcntl, json, os, re, shutil, subprocess, sys, time
 
 MODE, REPO_EXPLICIT, DEFAULT_REPO = sys.argv[1], sys.argv[2], sys.argv[3]
+# argv[4] is the pid of the shell that launched this script (PPID in the bash
+# wrapper below) -- the long-poll watches it, see hook_orphaned.
+HOOK_SHELL_PID = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 0
 
 MAX_MSG_CHARS = 2000
 MAX_REASON_CHARS = 4000  # joined-message cap, on top of the 2000/message cap above
+# bin/lib/companion_ui_inbox.py reads inbox-waiting as stale after twice this.
 POLL_INTERVAL_S = 2.0
+DEFAULT_WAIT_S = 240.0     # stop long-poll budget: turn ended on a question, nobody connected
+COMPANION_WAIT_S = 1800.0  # ...with a companion connected: the session is reachable, so stay reachable
 TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024  # only the last message matters
+
+# CLAUDE_CODE_ENTRYPOINT values of a session no human is typing into: Claude
+# Code rewrites an inherited "cli" to "sdk-cli" for any non-interactive (-p)
+# session, so every headless child hmd spawns carries one of these.
+PROGRAMMATIC_ENTRYPOINTS = frozenset(("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action"))
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
