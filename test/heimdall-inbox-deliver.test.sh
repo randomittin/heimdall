@@ -43,6 +43,12 @@ mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
 # otherwise have the headless guard (correctly) switch the new waits off.
 export CLAUDE_CODE_ENTRYPOINT=cli
 unset HMD_AGENT_TYPE HMD_JUDGMENT HMD_INBOX_GATED HMD_INBOX_WAIT_S HMD_TMUX_TARGET
+# The typing release (tests 30-34) watches the access time of the terminal this
+# very suite runs in -- found through the hook's ancestors, which here include
+# whatever launched the suite (an operator's shell, a claude session). A human
+# typing there mid-run would end a hold some other test is timing, so every test
+# except the typing ones runs with that signal off; those pass HMD_INBOX_TTY.
+export HMD_INBOX_TTY=off
 
 # now_s -- epoch seconds with sub-second resolution (python3 is already a hard
 # dependency of the tool under test). f_lt / f_ge -- float comparisons, exit 0
