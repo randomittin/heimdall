@@ -73,6 +73,7 @@ standalone with zero intra-repo import coupling.
 import argparse
 import fcntl
 import json
+import math
 import os
 import re
 import subprocess
@@ -85,6 +86,12 @@ MAX_PENDING = 200                    # N3: append() refuses a new message at/abo
 MAX_INBOX_BYTES = 2 * 1024 * 1024    # N3: inbox-delivered.jsonl rotation threshold (2 MiB)
 INBOX_REL = os.path.join(".heimdall", "ui", "inbox.jsonl")
 DELIVERED_REL = os.path.join(".heimdall", "ui", "inbox-delivered.jsonl")
+WAITING_REL = os.path.join(".heimdall", "ui", "inbox-waiting")      # the stop long-poll's heartbeat marker
+TMUX_TARGET_REL = os.path.join(".heimdall", "ui", "tmux-target")
+POLL_INTERVAL_S = 2.0                   # bin/heimdall-inbox-deliver's stop long-poll cadence
+WAITING_STALE_S = 2 * POLL_INTERVAL_S   # an inbox-waiting older than this: its long-poll is gone
+RECEIPTS_LIMIT = 20                     # inbox.delivered[] is the last this-many deliveries
+RECEIPTS_TAIL_BYTES = 256 * 1024        # the newest archive lines hold them; never read the whole file
 GIT_TIMEOUT_S = 3
 
 # ── secret scrub: bin/heimdall-activity:167-179, ported the same way

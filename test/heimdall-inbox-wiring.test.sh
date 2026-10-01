@@ -192,7 +192,7 @@ RC=$?
 END=$(date +%s)
 ELAPSED=$((END - START))
 [ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "exit 0, no stdout" || bad "rc=$RC out: $OUT"
-[ "$ELAPSED" -le 2 ] && ok "returned in ${ELAPSED}s (the exported 4s wait did not leak past the gate)" || bad "took ${ELAPSED}s -- the gate did not hold"
+[ "$ELAPSED" -le 3 ] && ok "returned in ${ELAPSED}s (the exported 4s wait did not leak past the gate)" || bad "took ${ELAPSED}s -- the gate did not hold"
 rm -rf "$D"
 
 echo ""

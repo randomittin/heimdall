@@ -644,7 +644,7 @@ else
   fi
 
   a2_payload "Done." > "$TMPROOT/a2-stop2.in"
-  "$DELIVER" stop --repo "$A2_FIX" < "$TMPROOT/a2-stop2.in" > "$TMPROOT/a2-stop2.out" 2>/dev/null &
+  HMD_INBOX_WAIT_S=30 "$DELIVER" stop --repo "$A2_FIX" < "$TMPROOT/a2-stop2.in" > "$TMPROOT/a2-stop2.out" 2>/dev/null &
   A2_HOOK=$!
   PIDS+=("$A2_HOOK")
   if a2_until '.inbox.consumer == "waiting"' 10; then

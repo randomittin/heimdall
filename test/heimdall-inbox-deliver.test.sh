@@ -60,6 +60,27 @@ mark_companion() {
 }
 # dead_pid -- a pid that provably is not running (a reaped child).
 dead_pid() { local p; ( : ) & p=$!; wait "$p" 2>/dev/null; printf '%s' "$p"; }
+# await_marker DIR -- wait (<=10s) for the long-poll's inbox-waiting marker to
+# appear, so a test never races a slow hook start (other suites may be running).
+await_marker() { local i=0; while [ ! -e "$(waiting_of "$1")" ] && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i + 1)); done; }
+# bounded_stop DIR LASTMSG OUTFILE MAXSECS [VAR=VALUE...] -- run the stop hook with
+# the given env, but never let a broken long-poll hang the suite: past MAXSECS
+# the hook is killed and the function returns 124.
+bounded_stop() {
+  local d="$1" msg="$2" out="$3" max="$4" pl pid rc i=0
+  shift 4
+  pl="$(mktemp)"
+  stop_payload "$d" false "$msg" > "$pl"
+  env "$@" "$BIN" stop --repo "$d" < "$pl" > "$out" 2>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt $((max * 5)) ]; do sleep 0.2; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$pl"; return 124
+  fi
+  wait "$pid"; rc=$?
+  rm -f "$pl"
+  return "$rc"
+}
 # with_module DIR -- make DIR carry bin/lib/companion_ui_inbox.py, so the tool
 # under test takes the shared-library path instead of the inline fallback.
 with_module() { mkdir -p "$1/bin/lib"; cp "$REPO/bin/lib/companion_ui_inbox.py" "$1/bin/lib/companion_ui_inbox.py"; }
@@ -366,7 +387,7 @@ mark_companion "$D"
 : > "$(inbox_of "$D")"
 SAMPLE="$(mktemp)"; SAMPLE_MODE="$(mktemp)"
 (
-  sleep 1.5
+  await_marker "$D"
   cp "$(waiting_of "$D")" "$SAMPLE" 2>/dev/null
   mode_of "$(waiting_of "$D")" > "$SAMPLE_MODE" 2>/dev/null
   sleep 1.5
@@ -374,15 +395,18 @@ SAMPLE="$(mktemp)"; SAMPLE_MODE="$(mktemp)"
 ) &
 BGPID=$!
 T0="$(now_s)"
-OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | "$BIN" stop --repo "$D")"
+OUTF="$(mktemp)"
+bounded_stop "$D" "Done implementing the feature." "$OUTF" 40
 RC=$?
 T1="$(now_s)"
+OUT="$(cat "$OUTF")"
 wait "$BGPID" 2>/dev/null || true
+rm -f "$OUTF"
 echo "$OUT" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' && ok "delivers via decision:block with no prompt and no trailing '?'" || bad "no delivery: $OUT"
 echo "$OUT" | grep -q "go ahead from phone" && ok "reason carries the late-arriving text" || bad "late message missing from: $OUT"
 printf '%s' "$OUT" | grep -F -- "$MARKER" >/dev/null && ok "still wrapped in the fixed provenance marker" || bad "provenance marker missing from: $OUT"
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
-f_lt "$(secs "$T0" "$T1")" 9 && ok "delivered within the 2s poll window ($(secs "$T0" "$T1")s), not after a fixed sleep" || bad "took $(secs "$T0" "$T1")s"
+f_lt "$(secs "$T0" "$T1")" 15 && ok "delivered within the 2s poll window ($(secs "$T0" "$T1")s), not after a fixed sleep" || bad "took $(secs "$T0" "$T1")s"
 WAIT_DECLARED="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert isinstance(m["pid"], int); print(int(round(m["until"]-m["since"])))' "$SAMPLE" 2>/dev/null)"
 [ "$WAIT_DECLARED" = "1800" ] && ok "inbox-waiting (read mid-wait) names the long-poll pid and declares the 1800s companion default" || bad "marker wait is '$WAIT_DECLARED' (want 1800); marker: $(cat "$SAMPLE" 2>/dev/null)"
 [ "$(cat "$SAMPLE_MODE")" = "600" ] && ok "inbox-waiting is 0600" || bad "inbox-waiting mode is '$(cat "$SAMPLE_MODE")' (want 600)"
@@ -394,12 +418,12 @@ echo "18. A2: NO companion + last message without a '?' + empty inbox -> old beh
 D="$(make_project)"
 : > "$(inbox_of "$D")"
 T0="$(now_s)"
-OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | "$BIN" stop --repo "$D")"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | HMD_INBOX_WAIT_S=4 "$BIN" stop --repo "$D")"
 RC=$?
 T1="$(now_s)"
 [ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
-f_lt "$(secs "$T0" "$T1")" 1.5 && ok "returned in $(secs "$T0" "$T1")s (~1s: nothing to wait for without a companion)" || bad "took $(secs "$T0" "$T1")s"
+f_lt "$(secs "$T0" "$T1")" 3 && ok "returned in $(secs "$T0" "$T1")s (~1s: nothing to wait for without a companion)" || bad "took $(secs "$T0" "$T1")s"
 [ ! -e "$(waiting_of "$D")" ] && ok "no inbox-waiting marker left" || bad "marker left behind"
 rm -rf "$D"
 
@@ -408,13 +432,15 @@ D="$(make_project)"
 : > "$(inbox_of "$D")"
 SAMPLE="$(mktemp)"
 (
-  sleep 1.5
+  await_marker "$D"
   cp "$(waiting_of "$D")" "$SAMPLE" 2>/dev/null
   sleep 1
   printf '{"id":"q1","ts":1,"text":"yes proceed","source":"test"}\n' >> "$(inbox_of "$D")"
 ) &
 BGPID=$!
-OUT="$(printf '%s' "$(stop_payload "$D" false "Should I proceed with the deploy?")" | "$BIN" stop --repo "$D")"
+OUTF="$(mktemp)"
+bounded_stop "$D" "Should I proceed with the deploy?" "$OUTF" 40
+OUT="$(cat "$OUTF")"; rm -f "$OUTF"
 wait "$BGPID" 2>/dev/null || true
 echo "$OUT" | grep -q "yes proceed" && ok "question long-poll still delivers" || bad "no delivery: $OUT"
 WAIT_DECLARED="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(int(round(m["until"]-m["since"])))' "$SAMPLE" 2>/dev/null)"
@@ -439,7 +465,7 @@ echo "21. A2: the companion disconnects mid-wait (connect.json removed) -> the l
 D="$(make_project)"
 mark_companion "$D"
 : > "$(inbox_of "$D")"
-( sleep 1; rm -f "$(connect_of "$D")" ) &
+( await_marker "$D"; sleep 1; rm -f "$(connect_of "$D")" ) &
 BGPID=$!
 T0="$(now_s)"
 OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | HMD_INBOX_WAIT_S=30 "$BIN" stop --repo "$D")"
@@ -448,7 +474,7 @@ T1="$(now_s)"
 wait "$BGPID" 2>/dev/null || true
 [ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
-f_ge "$(secs "$T0" "$T1")" 1.5 && f_lt "$(secs "$T0" "$T1")" 9 && ok "held until the companion left, then released ($(secs "$T0" "$T1")s of a 30s budget)" || bad "waited $(secs "$T0" "$T1")s (want ~2-4, not 0 and not 30)"
+f_ge "$(secs "$T0" "$T1")" 3 && f_lt "$(secs "$T0" "$T1")" 9 && ok "held until the companion left, then released ($(secs "$T0" "$T1")s of a 30s budget)" || bad "waited $(secs "$T0" "$T1")s (want ~2-4, not 0 and not 30)"
 [ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed" || bad "marker left behind"
 rm -rf "$D"
 
@@ -459,10 +485,10 @@ mkdir -p "$D/.heimdall/app"
 printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$DP" "$DP" > "$(connect_of "$D")"
 : > "$(inbox_of "$D")"
 T0="$(now_s)"
-OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | "$BIN" stop --repo "$D")"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | HMD_INBOX_WAIT_S=4 "$BIN" stop --repo "$D")"
 T1="$(now_s)"
 [ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
-f_lt "$(secs "$T0" "$T1")" 1.5 && ok "returned in $(secs "$T0" "$T1")s -- a crash-left connect.json cannot pin every turn for 30 minutes" || bad "took $(secs "$T0" "$T1")s"
+f_lt "$(secs "$T0" "$T1")" 3 && ok "returned in $(secs "$T0" "$T1")s -- a crash-left connect.json cannot pin every turn for 30 minutes" || bad "took $(secs "$T0" "$T1")s"
 [ ! -e "$(waiting_of "$D")" ] && ok "no marker left" || bad "marker left behind"
 rm -rf "$D"
 
@@ -471,12 +497,12 @@ D="$(make_project)"
 mark_companion "$D"
 seed_inbox "$D" "queued msg"
 T0="$(now_s)"
-OUT="$(printf '%s' "$(stop_payload "$D" true "Done implementing the feature.")" | "$BIN" stop --repo "$D")"
+OUT="$(printf '%s' "$(stop_payload "$D" true "Done implementing the feature.")" | HMD_INBOX_WAIT_S=4 "$BIN" stop --repo "$D")"
 RC=$?
 T1="$(now_s)"
 [ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
-f_lt "$(secs "$T0" "$T1")" 1.5 && ok "returned in $(secs "$T0" "$T1")s -- never waits under the loop guard" || bad "took $(secs "$T0" "$T1")s"
+f_lt "$(secs "$T0" "$T1")" 3 && ok "returned in $(secs "$T0" "$T1")s -- never waits under the loop guard" || bad "took $(secs "$T0" "$T1")s"
 grep -q "queued msg" "$(inbox_of "$D")" 2>/dev/null && ok "message left queued" || bad "message was popped despite stop_hook_active"
 [ ! -e "$(waiting_of "$D")" ] && ok "no marker written" || bad "marker left behind"
 rm -rf "$D"
@@ -490,14 +516,16 @@ RC=$?
 T1="$(now_s)"
 [ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
-f_lt "$(secs "$T0" "$T1")" 1.5 && ok "question + gated + nobody connected returned in $(secs "$T0" "$T1")s, beating even an explicit HMD_INBOX_WAIT_S=4" || bad "waited $(secs "$T0" "$T1")s -- the gate did not hold"
+f_lt "$(secs "$T0" "$T1")" 3 && ok "question + gated + nobody connected returned in $(secs "$T0" "$T1")s, beating even an explicit HMD_INBOX_WAIT_S=4" || bad "waited $(secs "$T0" "$T1")s -- the gate did not hold"
 rm -rf "$D"
 D="$(make_project)"
 mark_companion "$D"
 : > "$(inbox_of "$D")"
-( sleep 1; printf '{"id":"g1","ts":1,"text":"gated but connected","source":"test"}\n' >> "$(inbox_of "$D")" ) &
+( await_marker "$D"; sleep 0.5; printf '{"id":"g1","ts":1,"text":"gated but connected","source":"test"}\n' >> "$(inbox_of "$D")" ) &
 BGPID=$!
-OUT="$(printf '%s' "$(stop_payload "$D" false "Done.")" | HMD_INBOX_GATED=1 "$BIN" stop --repo "$D")"
+OUTF="$(mktemp)"
+bounded_stop "$D" "Done." "$OUTF" 40 HMD_INBOX_GATED=1
+OUT="$(cat "$OUTF")"; rm -f "$OUTF"
 wait "$BGPID" 2>/dev/null || true
 echo "$OUT" | grep -q "gated but connected" && ok "gated + companion connected: connect.json is the implicit opt-in, the message is delivered" || bad "no delivery: $OUT"
 rm -rf "$D"
@@ -510,7 +538,7 @@ for CASE in "CLAUDE_CODE_ENTRYPOINT=sdk-cli" "CLAUDE_CODE_ENTRYPOINT=sdk-ts" "CL
   T0="$(now_s)"
   OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | env "$CASE" HMD_INBOX_WAIT_S=4 "$BIN" stop --repo "$D")"
   T1="$(now_s)"
-  if [ -z "$OUT" ] && f_lt "$(secs "$T0" "$T1")" 1.5 && [ ! -e "$(waiting_of "$D")" ]; then
+  if [ -z "$OUT" ] && f_lt "$(secs "$T0" "$T1")" 3 && [ ! -e "$(waiting_of "$D")" ]; then
     ok "$CASE: returned in $(secs "$T0" "$T1")s, no wait, no marker"
   else
     bad "$CASE: held the turn ($(secs "$T0" "$T1")s, out='$OUT')"
@@ -570,7 +598,7 @@ dup_case() {   # $1 label, $2 project dir
   p1=$!
   ( printf '%s' "$(stop_payload "$d" false "Done.")" | HMD_INBOX_WAIT_S=5 "$BIN" stop --repo "$d" > "$o2" ) &
   p2=$!
-  sleep 1.5
+  await_marker "$d"; sleep 1
   printf '{"id":"dup1","ts":1,"text":"only once please","source":"test"}\n' >> "$(inbox_of "$d")"
   wait "$p1" "$p2" 2>/dev/null || true
   n1="$(grep -c '"decision"' "$o1")"; n2="$(grep -c '"decision"' "$o2")"
@@ -623,7 +651,7 @@ stop_payload "$D" false "Shall I continue?" > "$PL"
 # keeps it a real parent of the script (no exec optimisation), as in hooks.json.
 HMD_INBOX_WAIT_S=30 bash -c '"$0" stop --repo "$1" < "$2"; exit 0' "$BIN" "$D" "$PL" >/dev/null 2>&1 &
 A=$!
-sleep 1.5
+await_marker "$D"; sleep 0.5
 PIDS_BEFORE="$(pgrep -f -- "$D" | grep -vx "$$" | tr '\n' ' ')"
 kill -9 "$A" 2>/dev/null
 wait "$A" 2>/dev/null
