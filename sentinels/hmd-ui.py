@@ -32,7 +32,9 @@ Routes (all GET):
                       the rest is still reduced. Email-shaped substrings become
                       "[email]" on every redacting profile. `edits.count` is the number
                       of UNIQUE edited paths (not edit events); `edits.paths` is
-                      repo-relative inside the repo, absolute outside it
+                      repo-relative and holds ONLY paths inside the repo: the ledger of THIS
+                      repo's session (bin/lib/hmd_session_resolve.py), out-of-repo entries
+                      dropped -- never absolute, never `../x`
     /api/events       text/event-stream; a `data:` frame only when the digest changes
                       (the digest covers `panels`, so a `hmd ui panel set` lands within
                       one poll)
@@ -232,6 +234,12 @@ SESSION_CODE = _load_module("hmd_session_code", os.path.join(LIB_DIR, "hmd_sessi
 # the newest main-chain entries of the repo's session transcript -> {state,id,since,kind,summary,
 # options,turn}. Tail-only, stat-cached; see the module docstring.
 ATTENTION = _load_module("companion_ui_attention", os.path.join(LIB_DIR, "companion_ui_attention.py"))
+# The ONE place the "which Claude Code session does THIS repo's instance read" rule lives
+# (bin/lib/hmd_session_resolve.py): an inherited CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID /
+# SESSION_ID counts only when it names one of the repo's OWN transcripts, else the newest
+# interactive one. Every session-keyed collector below (edits, parallelism, session code) asks it
+# through repo_session(); attention and the chat publishers import the same module.
+SESSIONS = _load_module("hmd_session_resolve", os.path.join(LIB_DIR, "hmd_session_resolve.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -298,9 +306,10 @@ def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
     both spawn the same command -- the second blocks on the lock and then hits the
     now-warm entry instead of racing its own subprocess (perf item 2d: never spawn
     `git` more than once per poll interval, even under concurrent load). `timeout`/
-    `env` are forwarded to `_run` -- the cache key stays (argv, cwd) only, since every
-    caller always pairs the same argv+cwd with the same timeout/env."""
-    key = (tuple(argv), cwd)
+    `env` are forwarded to `_run`; the cache key carries the env overlay too (collect_edits'
+    overlay names the repo's session, which changes when a new session starts) -- `timeout`
+    stays out of it, every caller pairs the same argv+cwd with the same timeout."""
+    key = (tuple(argv), cwd, tuple(sorted((env or {}).items())))
     with _subprocess_cache_lock:
         now = time.monotonic()
         hit = _subprocess_cache.get(key)
