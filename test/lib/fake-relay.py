@@ -4,14 +4,18 @@
 test/heimdall-app-relay.test.sh to drive the REAL bin/heimdall-relay-client
 against a loopback HTTP server instead of the real Cloudflare Worker.
 
-Two independent modes, selected by argv[1]:
+Three independent modes, selected by argv[1]:
 
   fake-relay.py serve PORT --log LOGDIR --ctl CTLDIR
       Runs a ThreadingHTTPServer forever (until killed) implementing
       POST /pair/init, GET /session/:id/stream, POST /session/:id/frames,
       POST /session/:id/revoke -- see Handler below for the per-route
       contract. Every request line is appended to LOGDIR/requests.log; every
-      POST /frames body is appended verbatim to LOGDIR/frames.ndjson.
+      POST /frames body the relay ANSWERED is appended verbatim to
+      LOGDIR/frames.ndjson (a body whose response was deliberately dropped --
+      see `fail-ack-posts` below -- goes to LOGDIR/frames-dropped.ndjson
+      instead, so "what the relay accepted" and "what it received but never
+      answered" stay separately countable).
 
   fake-relay.py device <action> ...
       One-shot helper subcommands standing in for the paired PHONE, so the
@@ -22,6 +26,17 @@ Two independent modes, selected by argv[1]:
       bin/lib/hmd_relay_e2e.py BY PATH (the same convention
       bin/heimdall-relay-client itself uses) -- never re-implements the
       crypto. See device_main() below for the action list.
+
+  fake-relay.py netfault --host NAME --addrs SPEC [--stall-s N] -- CLIENT [ARGS...]
+      Runs the REAL bin/heimdall-relay-client (CLIENT, the path to it) in this
+      very process, with NAME resolving to the addresses in SPEC and any
+      address marked black-holed never completing its TCP connect -- the
+      network failure behind hmdapp's docs/HANDOFF-TO-HEIMDALL-relay-ipv6-
+      stall.md, which loopback alone cannot produce. See install_netfault()
+      below for how, and why at that layer. SPEC is a comma list in resolver
+      order, `!` marking a black-holed entry and `~N` one that answers only
+      after N seconds: `::1!,127.0.0.1` is "IPv6 first and dead, IPv4 second
+      and answering".
 
 CONTROL PROTOCOL (the --ctl DIR the "serve" stream handler polls):
   NNN.json      -- (numeric name, ascending) one Envelope (JSON object) to be
@@ -72,6 +87,16 @@ CONTROL PROTOCOL (the --ctl DIR the "serve" stream handler polls):
                    the one case bin/heimdall-relay-client cannot attribute to
                    idle/overflow/rotate and so treats as Section 15's WARN +
                    backoff-reconnect case.
+  fail-ack-posts=<N> -- consumed one POST at a time: each of the next N
+                   POST /frames whose envelope type is `ack` is read in full,
+                   appended to LOGDIR/frames-dropped.ndjson, and then the
+                   connection is closed with NO response -- the relay "got the
+                   bytes" but the client never learns it (a lost response,
+                   the case a naive ack retry turns into a duplicate). Only
+                   acks are touched: `state` frames keep flowing, so the
+                   client's own tick loop is undisturbed while a test counts
+                   ack attempts. The file is rewritten as fail-ack-posts=<N-1>
+                   after each consumption and removed at 0.
 
 Stdlib only (Decision 1 zero-toolchain posture) -- http.server, json, base64,
 uuid, threading, argparse, importlib.
@@ -81,12 +106,14 @@ import base64
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from importlib.util import module_from_spec, spec_from_file_location
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location, spec_from_loader
 from urllib.parse import urlsplit, parse_qs
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -226,10 +253,37 @@ class RelayState:
             with open(os.path.join(self.log_dir, "requests.log"), "a", encoding="utf-8") as f:
                 f.write(line)
 
-    def log_frame(self, raw_body):
+    def log_frame(self, raw_body, name="frames.ndjson"):
         with self._frames_log_lock:
-            with open(os.path.join(self.log_dir, "frames.ndjson"), "ab") as f:
+            with open(os.path.join(self.log_dir, name), "ab") as f:
                 f.write(raw_body if raw_body.endswith(b"\n") else raw_body + b"\n")
+
+    def consume_fail_ack(self):
+        """True while a `fail-ack-posts=<N>` control file still has failures to
+        hand out, consuming exactly one of them per call: the file is replaced
+        by fail-ack-posts=<N-1> (or just removed at 1), the same filename-
+        carries-the-value convention rate-limit-next=/oversized-line= use.
+        Called under a lock because several POST /frames handler threads can
+        reach it at once (the client's tick thread and its stream thread both
+        post), and two of them must never be handed the same single failure."""
+        with self.lock:
+            try:
+                names = os.listdir(self.ctl_dir)
+            except OSError:
+                return False
+            for name in names:
+                m = re.match(r"^fail-ack-posts=(\d+)$", name)
+                if not m:
+                    continue
+                remaining = int(m.group(1))
+                try:
+                    os.remove(os.path.join(self.ctl_dir, name))
+                except OSError:
+                    return False
+                if remaining > 1:
+                    open(os.path.join(self.ctl_dir, "fail-ack-posts=%d" % (remaining - 1)), "w").close()
+                return remaining > 0
+            return False
 
     # ── one-shot control-file consumption (existence-based, deleted after use) ──
     def consume_drop_stream(self):
@@ -320,6 +374,19 @@ def _envelope_bytes(env):
     return (json.dumps(env, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
+def _is_ack_envelope(raw_body):
+    """True when a POST /frames body is an envelope of type `ack`. `type` is one
+    of the envelope's plaintext routing fields (only nonce/ciphertext are
+    sealed), so the relay -- and this stand-in -- can tell an ack from a state
+    frame without any key. A body that is not a JSON object is simply not an
+    ack here; the real relay's own 400 handling is not this fixture's job."""
+    try:
+        env = json.loads(raw_body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(env, dict) and env.get("type") == "ack"
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "fake-relay/1"
@@ -402,6 +469,13 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(int(length_hdr or 0))
             if len(raw) > MAX_ENVELOPE_BYTES:
                 self._json(413, {"error": "envelope exceeds %d bytes" % MAX_ENVELOPE_BYTES})
+                return
+            if _is_ack_envelope(raw) and STATE.consume_fail_ack():
+                # received in full, never answered: see fail-ack-posts in the
+                # module docstring. Closing without a status line is what the
+                # client observes as a network drop (RemoteDisconnected).
+                STATE.log_frame(raw, name="frames-dropped.ndjson")
+                self.close_connection = True
                 return
             STATE.log_frame(raw)
             self._json(200, {"ok": True, "delivered": True})
@@ -528,6 +602,132 @@ def serve_main(argv):
     return 0
 
 
+# ── netfault mode ─────────────────────────────────────────────────────────────
+# Every address `serve` mode could ever be reached on is either 127.0.0.1
+# (answers) or something the kernel refuses INSTANTLY (nothing listening) --
+# neither reproduces the failure behind hmdapp's docs/HANDOFF-TO-HEIMDALL-
+# relay-ipv6-stall.md: a SYN that is silently dropped, so connect() just sits
+# there until its timeout. A true black hole cannot be built from userland on
+# loopback portably (a full accept queue stalls Linux but not macOS), so it is
+# emulated one layer above the kernel, at the two stdlib calls EVERY Python
+# TCP client funnels through -- socket.getaddrinfo (the resolver) and
+# socket.socket.connect (the blocking connect). Both are patched, in this
+# process only, for ONE test hostname:
+#   * getaddrinfo(HOST, ...) answers a table, in the order given, with the
+#     same 5-tuples the real resolver returns (an explicit family= argument
+#     filters it, as the real one does);
+#   * connect() to an address marked black-holed sleeps for the socket's own
+#     timeout and then raises socket.timeout -- what a dropped SYN looks like
+#     to the caller -- instead of touching the network.
+# Because the patch sits BELOW the client it needs no knowledge of HOW the
+# client connects: the same table run against the pre-fix client stalls on
+# the black-holed first address (the failing run that motivated the fix) and
+# against the fixed one does not.
+def parse_addr_spec(spec):
+    """'::1!,127.0.0.1~0.5' -> [(AF_INET6, '::1', True, 0.0), (AF_INET, '127.0.0.1', False, 0.5)]:
+    resolver order preserved, a trailing `!` marking a black-holed address and
+    `~N` one that answers only after N seconds."""
+    table = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        stalled = item.endswith("!")
+        ip, _, delay = item.rstrip("!").partition("~")
+        table.append((socket.AF_INET6 if ":" in ip else socket.AF_INET, ip, stalled, float(delay or 0)))
+    if not table:
+        raise SystemExit("fake-relay netfault: --addrs names no address")
+    return table
+
+
+class NetFault:
+    """The patch described above. `table` entries are (family, ip, black_holed)
+    or (family, ip, black_holed, delay_s) -- a delay makes connect() to that
+    address sleep first and then connect FOR REAL, so the address must be one
+    that really answers. `attempted` records the IP of every connect() issued
+    to a table address, in call order, so a test can assert which addresses a
+    client did -- and did NOT -- try."""
+
+    def __init__(self, host, table, stall_s):
+        self.host = host
+        self.table = table
+        self.stall_s = stall_s
+        self.attempted = []
+        self._ips = {entry[1] for entry in table}
+        self._stalled = {entry[1] for entry in table if entry[2]}
+        self._delays = {entry[1]: entry[3] for entry in table if len(entry) > 3 and entry[3]}
+        self._real_getaddrinfo = socket.getaddrinfo
+        self._real_connect = socket.socket.connect
+
+    def _resolve(self, port, family, type_):
+        answers = []
+        for entry in self.table:
+            fam, ip = entry[0], entry[1]
+            if family not in (0, fam) or type_ not in (0, socket.SOCK_STREAM):
+                continue
+            sockaddr = (ip, int(port), 0, 0) if fam == socket.AF_INET6 else (ip, int(port))
+            answers.append((fam, socket.SOCK_STREAM, 6, "", sockaddr))
+        if not answers:
+            raise socket.gaierror(socket.EAI_NONAME, "no %s address for %s" % (family, self.host))
+        return answers
+
+    def install(self):
+        fault = self
+
+        def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            if host != fault.host:
+                return fault._real_getaddrinfo(host, port, family, type, proto, flags)
+            return fault._resolve(port, family, type)
+
+        def connect(sock, address):
+            ip = address[0]
+            if ip in fault._ips:
+                fault.attempted.append(ip)
+            if ip in fault._stalled:
+                timeout = sock.gettimeout()
+                time.sleep(fault.stall_s if timeout is None else timeout)
+                raise socket.timeout("timed out")
+            if ip in fault._delays:
+                time.sleep(fault._delays[ip])
+            return fault._real_connect(sock, address)
+
+        socket.getaddrinfo = getaddrinfo
+        socket.socket.connect = connect
+        return self
+
+    def restore(self):
+        socket.getaddrinfo = self._real_getaddrinfo
+        socket.socket.connect = self._real_connect
+
+
+def install_netfault(host, table, stall_s=20.0):
+    """Patch THIS process (see the comment above) and return the NetFault so the
+    caller can read .attempted and call .restore()."""
+    return NetFault(host, table, stall_s).install()
+
+
+def netfault_main(argv):
+    usage = ("usage: fake-relay.py netfault --host NAME --addrs SPEC [--stall-s N] "
+             "-- CLIENT [ARGS...]\n")
+    if "--" not in argv or argv.index("--") == len(argv) - 1:
+        sys.stderr.write(usage)
+        return 2
+    cut = argv.index("--")
+    ap = argparse.ArgumentParser(prog="fake-relay.py netfault", usage=usage)
+    ap.add_argument("--host", required=True)
+    ap.add_argument("--addrs", required=True)
+    ap.add_argument("--stall-s", type=float, default=20.0)
+    args = ap.parse_args(argv[:cut])
+    client_path, client_args = argv[cut + 1], argv[cut + 2:]
+
+    install_netfault(args.host, parse_addr_spec(args.addrs), args.stall_s)
+    loader = SourceFileLoader("hmd_relay_client_netfault", client_path)
+    spec = spec_from_loader(loader.name, loader)
+    client = module_from_spec(spec)
+    loader.exec_module(client)
+    return client.main(client_args)
+
+
 # ── device mode ───────────────────────────────────────────────────────────────
 def _cmd_keygen(e2e, args):
     priv, pub = e2e.generate_keypair()
@@ -620,7 +820,10 @@ def main(argv=None):
         return device_main(argv[1:])
     if argv and argv[0] == "serve":
         return serve_main(argv[1:])
-    sys.stderr.write("usage: fake-relay.py serve PORT --log DIR --ctl DIR | fake-relay.py device <action> ...\n")
+    if argv and argv[0] == "netfault":
+        return netfault_main(argv[1:])
+    sys.stderr.write("usage: fake-relay.py serve PORT --log DIR --ctl DIR | fake-relay.py device <action> ... "
+                     "| fake-relay.py netfault --host NAME --addrs SPEC -- CLIENT [ARGS...]\n")
     return 2
 
 
