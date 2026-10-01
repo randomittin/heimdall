@@ -137,7 +137,8 @@ def slug_dirs(root):
 def source_paths(root):
     """What the native publishers read, for `hmd ui --print-sources`: the TAIL of the
     newest interactive session transcript of this repo, text blocks only."""
-    return [os.path.join(d, "<session>.jsonl") for d in slug_dirs(root)]
+    return ([os.path.join(d, "<session>.jsonl") for d in slug_dirs(root)]
+            + [os.path.join(root, ".heimdall", ".agents-count-cache")])
 
 
 def _default_read_tail(path, nbytes):
@@ -379,6 +380,75 @@ def question_markdown(raw):
     return None if (not t or P.secret_shaped(str(raw)) or P.secret_shaped(t)) else t
 
 
+# ── agents ───────────────────────────────────────────────────────────────────
+AGENT_COLUMNS = ("agent", "role", "model", "status", "started", "elapsed")   # parse.ts looks columns up by name
+IDLE_ROW = ("—", "idle", "", "", "", "")      # parse.ts drops role == 'idle'; its presence = "published, none running"
+FINISHED_TTL_S = 600            # a finished agent stays listed this long (the hmdapp publisher's FINISHED_TTL)
+FRESH_SPAWN_S = 30              # first seen this soon after its last write => its start time is known
+AGENTS_PROBE_MIN_S = 10         # `heimdall-agents list` costs ~0.3s: never more often than this
+COUNT_CACHE_MAX_AGE_S = 60      # the statusline refreshes its count every render; older => no statusline
+AGENT_ROW_CAP = 100
+AGENT_CELL_CAP = 80
+# heimdall-agents state -> the app's closed status set. Excluded: stale, orphaned, mailbox, reaped
+# (not live work -- `heimdall-agents orphans` is the operator's view of those).
+_STATE_STATUS = {"working": "running", "live": "running", "hung": "unknown",
+                 "done": "finished", "failed": "finished", "killed": "finished"}
+_STATUS_RANK = {"running": 0, "unknown": 1, "finished": 2}
+
+
+def agent_cell(value, cap=AGENT_CELL_CAP):
+    """One table cell: single line, control bytes gone, `[redacted]` when secret-shaped
+    (a row is never dropped for it), cut to `cap`."""
+    s = _CONTROL_CHARS_RE.sub("", re.sub(r"[\r\n\t]+", " ", str(value or ""))).strip()
+    return "[redacted]" if P.secret_shaped(s) else cut_utf16(s, cap)
+
+
+def fmt_elapsed(seconds):
+    """Minute granularity on purpose: a per-second figure would change the panel (and
+    so the SSE digest and every relay frame) on every probe."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return "<1m"
+    if s < 3600:
+        return "%dm" % (s // 60)
+    return "%dh%02dm" % (s // 3600, (s % 3600) // 60)
+
+
+def agent_rows(agents, now, seen):
+    """Table rows for `heimdall-agents list --json` output. `seen` ({id: {first,
+    finished_at}}) is the publisher's memory: the list carries no start time (its
+    `age_secs` is time since the agent's transcript last changed), so a start time is
+    claimed ONLY for an agent first seen while still fresh -- never guessed."""
+    keep = []
+    for a in agents:
+        if not isinstance(a, dict):
+            continue
+        status = _STATE_STATUS.get(a.get("state"))
+        age = a.get("age_secs")
+        age = age if isinstance(age, (int, float)) and not isinstance(age, bool) and age >= 0 else 0
+        aid = str(a.get("id") or "")
+        if status is None or not aid or (status == "finished" and age > FINISHED_TTL_S):
+            continue
+        rec = seen.get(aid)
+        if rec is None:
+            rec = seen[aid] = {"first": (now - age) if (status != "finished" and age <= FRESH_SPAWN_S) else None,
+                               "finished_at": None}
+        if status == "finished" and rec["finished_at"] is None:
+            rec["finished_at"] = now - age
+        first = rec["first"]
+        end = rec["finished_at"] if status == "finished" else now
+        name = a.get("name")
+        label = a.get("description") or (name if name and name != "-" else None) or aid
+        keep.append((_STATUS_RANK[status], aid, [
+            agent_cell(label), agent_cell(a.get("agent_type"), 64), "", status,
+            time.strftime("%H:%M:%S", time.localtime(first)) if first else "",
+            fmt_elapsed(end - first) if first and end else ""]))
+    for aid in [k for k in seen if k not in {t[1] for t in keep}][:max(0, len(seen) - 500)]:
+        del seen[aid]
+    keep.sort(key=lambda t: (t[0], t[1]))
+    return [row for _rank, _aid, row in keep[:AGENT_ROW_CAP]]
+
+
 def _serialized_size(lines):
     return len(json.dumps(lines, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
@@ -414,6 +484,10 @@ class CompanionPublisher(object):
         self._derived = None        # {"stamp", "mtime", "lines"} of the transcript last read
         self._headless = set()      # transcripts known to be sdk/-p sessions
         self._written = {}          # panel id -> the content last written
+        self._agent_seen = {}       # agent id -> {first, finished_at}, see agent_rows
+        self._agent_rows = None     # rows from the last successful probe
+        self._last_probe = 0.0
+        self._last_nonidle = 0.0
 
     # transcript selection
     def _candidates(self):
@@ -507,6 +581,49 @@ class CompanionPublisher(object):
         self._written[QUESTION_ID] = text
         return True
 
+    def _agents_count(self, now):
+        """The statusline's cached live-subagent count (.heimdall/.agents-count-cache, a
+        plain one-line file it refreshes on every render), or None when absent, stale
+        or garbled -- then the answer has to come from a probe."""
+        p = os.path.join(self.root, ".heimdall", ".agents-count-cache")
+        try:
+            if now - os.stat(p).st_mtime > COUNT_CACHE_MAX_AGE_S:
+                return None
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                v = f.readline().strip()
+        except OSError:
+            return None
+        return int(v) if v.isdigit() else None
+
+    def _agents_rows(self, now):
+        if self._list_agents is None:
+            return None
+        count = self._agents_count(now)
+        recent = self._last_nonidle > 0 and now - self._last_nonidle < FINISHED_TTL_S
+        if (count is None or count > 0 or recent) and now - self._last_probe >= AGENTS_PROBE_MIN_S:
+            self._last_probe = now
+            agents = self._list_agents()
+            if isinstance(agents, list):
+                rows = agent_rows(agents, now, self._agent_seen)
+                if rows:
+                    self._last_nonidle = now
+                self._agent_rows = rows or [list(IDLE_ROW)]
+            # a failed probe keeps whatever was last published: no flap to "idle"
+        elif self._agent_rows is None or (count == 0 and not recent):
+            self._agent_rows = [list(IDLE_ROW)]
+        return self._agent_rows
+
+    def _publish_agents(self, now):
+        rows = self._agents_rows(now)
+        if rows is None:
+            return False
+        if self._exists(AGENTS_ID) and self._written.get(AGENTS_ID) == rows:
+            return False
+        if not self._write(AGENTS_ID, AGENTS_TITLE, "table", {"columns": list(AGENT_COLUMNS), "rows": rows}, now):
+            return False
+        self._written[AGENTS_ID] = [list(r) for r in rows]
+        return True
+
     def tick(self, now=None):
         """One publish pass. True when any panel file was written or removed."""
         now = time.time() if now is None else now
@@ -514,4 +631,5 @@ class CompanionPublisher(object):
         if derived is None:
             return False
         changed = self._publish_chat(derived, now)
-        return self._publish_question(derived, now) or changed
+        changed = self._publish_question(derived, now) or changed
+        return self._publish_agents(now) or changed
