@@ -699,12 +699,15 @@ def collect_panels(root):
 
 
 def collect_inbox(root):
-    """The `inbox` addendum: the count of undelivered companion -> session messages,
-    always via companion_ui_inbox.list_pending -- never a raw line count of a file
-    the server hasn't parsed. A missing inbox file, or a missing module, is simply 0."""
+    """The `inbox` addendum: {pending, consumer, oldest_age_s, delivered}, always via
+    companion_ui_inbox.summary -- never a raw line count of a file the server hasn't
+    parsed. `consumer` is who takes the next phone message ("waiting": a stop long-poll
+    is live, "tmux": a tmux target is configured, "none": it needs a turn boundary);
+    `delivered` is the last 20 receipts as {id, delivered_at} -- never text. A missing
+    inbox file, or a missing module, is simply nothing pending and nobody listening."""
     if INBOX is None:
-        return {"pending": 0}
-    return {"pending": len(INBOX.list_pending(root))}
+        return {"pending": 0, "consumer": "none", "oldest_age_s": None, "delivered": []}
+    return INBOX.summary(root)
 
 
 def attention_empty():
@@ -986,6 +989,13 @@ def digest_of(state):
     if isinstance(panels, list):
         body["panels"] = [{k: v for k, v in p.items() if k != "updated_at"} if isinstance(p, dict) else p
                           for p in panels]
+    # `inbox.oldest_age_s` ticks every second a message sits queued: a clock reading,
+    # not a state change (pending 0->1 and 1->0 already move the digest), so like `ts`
+    # it stays out -- otherwise every poll tick would emit an SSE frame and a relay
+    # state frame for as long as one message is pending.
+    inbox = body.get("inbox")
+    if isinstance(inbox, dict) and "oldest_age_s" in inbox:
+        body["inbox"] = {k: v for k, v in inbox.items() if k != "oldest_age_s"}
     return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
 

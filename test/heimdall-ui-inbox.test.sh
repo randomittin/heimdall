@@ -562,6 +562,228 @@ else
   bad "19g. inbox.pending did not return to 0: $(jq -c '.inbox' "$STATE2" 2>/dev/null)"
 fi
 
+# ═══ A2. idle-session delivery: /api/state inbox.consumer / oldest_age_s / delivered[] ═══
+# docs/HANDOFF-TO-HEIMDALL-product-asks.md A2. Own fixture + own server, so the
+# queue/archive state the sections above leave behind cannot colour these
+# assertions. The deliver hook is driven for real (bin/heimdall-inbox-deliver
+# stop), the state is read for real over HTTP.
+export CLAUDE_CODE_ENTRYPOINT=cli
+unset HMD_AGENT_TYPE HMD_JUDGMENT HMD_INBOX_GATED HMD_INBOX_WAIT_S HMD_TMUX_TARGET
+DELIVER="$REPO/bin/heimdall-inbox-deliver"
+A2_FIX="$TMPROOT/fixture-a2"
+A2_UIDIR="$A2_FIX/.heimdall/ui"
+mkdir -p "$A2_FIX/.heimdall/receipts" "$A2_FIX/.planning/reels"
+( cd "$A2_FIX" && git init -q . 2>/dev/null && git -c user.email=t@t -c user.name=t add -A >/dev/null 2>&1 \
+  && git -c user.email=t@t -c user.name=t commit -qm fixture >/dev/null 2>&1 ) || true
+A2_PORT="$(free_port)"
+A2_OUT="$TMPROOT/server-a2.out"
+( cd "$A2_FIX" && HEIMDALL_WATCH_ROOT="$A2_FIX" exec "$UI" --repo "$A2_FIX" --port "$A2_PORT" --no-open ) >"$A2_OUT" 2>&1 &
+A2_PID=$!
+PIDS+=("$A2_PID")
+A2_URL_RE="^http://127\.0\.0\.1:$A2_PORT/\?(t|token)=[A-Za-z0-9_-]+\$"
+A2_STATE="$TMPROOT/a2-state.json"
+a2_until() {   # a2_until JQ_EXPR [SECS] -- poll /api/state until the jq expression holds
+  local expr="$1" secs="${2:-10}" i=0 max
+  max=$(( secs * 5 ))
+  while [ "$i" -lt "$max" ]; do
+    curl -s -o "$A2_STATE" "$A2_BASE/api/state?$A2_AUTH"
+    jq -e "$expr" "$A2_STATE" >/dev/null 2>&1 && return 0
+    sleep 0.2; i=$((i + 1))
+  done
+  return 1
+}
+a2_post() { curl -s -X POST -H "Content-Type: application/json" -d "$(jq -cn --arg t "$1" '{text:$t}')" "$A2_BASE/api/send?$A2_AUTH" | jq -r '.id'; }
+a2_mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
+a2_payload() { printf '{"session_id":"s1","transcript_path":"","cwd":"%s","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"%s"}' "$A2_FIX" "$1"; }
+a2_age_marker() { python3 -c 'import os,sys,time; t=time.time()-60; os.utime(sys.argv[1], (t, t))' "$1"; }
+
+if ! wait_for "$A2_OUT" "$A2_URL_RE" 10; then
+  bad "A2.0 the A2 server never printed its URL within 10s; output:"
+  sed 's/^/       | /' "$A2_OUT"
+else
+  A2_URL="$(grep -E "$A2_URL_RE" "$A2_OUT" | head -1)"
+  A2_Q="${A2_URL#*\?}"; A2_TP="${A2_Q%%=*}"; A2_TOKEN="${A2_Q#*=}"
+  A2_BASE="http://127.0.0.1:$A2_PORT"; A2_AUTH="$A2_TP=$A2_TOKEN"
+  ok "A2.0 second server up on $A2_BASE"
+
+  if a2_until '.inbox | (keys == ["consumer","delivered","oldest_age_s","pending"]) and .pending == 0 and .consumer == "none" and .oldest_age_s == null and .delivered == []' 5; then
+    ok "A2.1 fresh inbox slice is exactly {pending:0, consumer:\"none\", oldest_age_s:null, delivered:[]}"
+  else
+    bad "A2.1 unexpected inbox slice: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
+  fi
+
+  A2_SENT_AT="$(python3 -c 'import time; print(time.time())')"
+  A2_ID1="$(a2_post "first idle message")"
+  if a2_until '.inbox.pending == 1 and (.inbox.oldest_age_s | type == "number" and . >= 0 and . < 30) and .inbox.consumer == "none" and .inbox.delivered == []' 5; then
+    ok "A2.2 queued message: pending 1, oldest_age_s is a small number, consumer none, no receipt yet"
+  else
+    bad "A2.2 inbox after send: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
+  fi
+
+  A2_HDR="$TMPROOT/a2-hdr.txt"
+  curl -s -D "$A2_HDR" -o "$A2_STATE" "$A2_BASE/api/state?$A2_AUTH"
+  A2_ETAG="$(grep -i '^etag:' "$A2_HDR" | head -1 | sed 's/^[Ee][Tt][Aa][Gg]: *//' | tr -d '\r')"
+  A2_AGE1="$(jq -r '.inbox.oldest_age_s' "$A2_STATE")"
+  sleep 2.5
+  A2_CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: $A2_ETAG" "$A2_BASE/api/state?$A2_AUTH")"
+  curl -s -o "$A2_STATE" "$A2_BASE/api/state?$A2_AUTH"
+  A2_AGE2="$(jq -r '.inbox.oldest_age_s' "$A2_STATE")"
+  if [ "$A2_CODE" = "304" ] && python3 -c 'import sys; sys.exit(0 if float(sys.argv[2]) - float(sys.argv[1]) >= 2.0 else 1)' "$A2_AGE1" "$A2_AGE2"; then
+    ok "A2.3 oldest_age_s ticks ($A2_AGE1 -> $A2_AGE2) yet the digest/ETag does not move (304): a queued message cannot emit a frame per poll tick"
+  else
+    bad "A2.3 conditional GET = $A2_CODE (want 304), age $A2_AGE1 -> $A2_AGE2"
+  fi
+
+  mkdir -p "$A2_FIX/.heimdall/app"
+  printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$$" "$$" > "$A2_FIX/.heimdall/app/connect.json"
+  a2_payload "Done." | "$DELIVER" stop --repo "$A2_FIX" > "$TMPROOT/a2-stop1.out" 2>/dev/null
+  if a2_until ".inbox.pending == 0 and .inbox.oldest_age_s == null and (.inbox.delivered | map(select(.id == \"$A2_ID1\")) | length == 1) and ([.inbox.delivered[] | select(.id == \"$A2_ID1\") | .delivered_at] | .[0] >= $A2_SENT_AT)" 5; then
+    ok "A2.4 receipt transition: queued -> delivered, delivered_at stamped at/after the send, oldest_age_s back to null"
+  else
+    bad "A2.4 inbox after delivery: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
+  fi
+
+  a2_payload "Done." > "$TMPROOT/a2-stop2.in"
+  HMD_INBOX_WAIT_S=30 "$DELIVER" stop --repo "$A2_FIX" < "$TMPROOT/a2-stop2.in" > "$TMPROOT/a2-stop2.out" 2>/dev/null &
+  A2_HOOK=$!
+  PIDS+=("$A2_HOOK")
+  if a2_until '.inbox.consumer == "waiting"' 10; then
+    ok "A2.5a a stop long-poll on a last message WITHOUT '?' -> inbox.consumer == \"waiting\""
+  else
+    bad "A2.5a consumer never became waiting: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
+  fi
+  A2_MARKER_MODE="$(a2_mode "$A2_UIDIR/inbox-waiting")"
+  A2_ID2="$(a2_post "go ahead")"
+  wait "$A2_HOOK" 2>/dev/null
+  if grep -q '"decision"' "$TMPROOT/a2-stop2.out" && grep -q "go ahead" "$TMPROOT/a2-stop2.out"; then
+    ok "A2.5b the idle long-poll delivered the phone message into the session with no prompt"
+  else
+    bad "A2.5b hook output: $(cat "$TMPROOT/a2-stop2.out")"
+  fi
+  if a2_until ".inbox.pending == 0 and (.inbox.delivered | map(.id) | index(\"$A2_ID2\") != null) and (.inbox.delivered[0] | keys == [\"delivered_at\",\"id\"]) and all(.inbox.delivered[]; keys == [\"delivered_at\",\"id\"])" 10; then
+    ok "A2.5c after delivery: pending 0, id from the 202 is in inbox.delivered, every entry is exactly {delivered_at, id}"
+  else
+    bad "A2.5c inbox after idle delivery: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
+  fi
+  if jq -e '[.inbox | .. | strings] | all(contains("go ahead") | not) and all(contains("first idle message") | not)' "$A2_STATE" >/dev/null 2>&1; then
+    ok "A2.5d no string anywhere in the inbox slice carries message text"
+  else
+    bad "A2.5d message text leaked into the inbox slice: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
+  fi
+  if a2_until '.inbox.consumer == "none"' 10; then
+    ok "A2.5e consumer returns to \"none\" once the long-poll has exited"
+  else
+    bad "A2.5e consumer stuck: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
+  fi
+  if [ "$A2_MARKER_MODE" = "600" ] && [ "$(a2_mode "$A2_UIDIR")" = "700" ] && [ "$(a2_mode "$A2_UIDIR/inbox-delivered.jsonl")" = "600" ]; then
+    ok "A2.5f perms: ui dir 0700, inbox-waiting (read mid-wait) 0600, inbox-delivered.jsonl 0600"
+  else
+    bad "A2.5f perms: marker=$A2_MARKER_MODE dir=$(a2_mode "$A2_UIDIR") delivered=$(a2_mode "$A2_UIDIR/inbox-delivered.jsonl")"
+  fi
+
+  printf '{}' > "$A2_UIDIR/inbox-waiting"
+  if a2_until '.inbox.consumer == "waiting"' 6; then ok "A2.6a a fresh inbox-waiting marker -> consumer waiting"; else bad "A2.6a: $(jq -c '.inbox' "$A2_STATE")"; fi
+  printf 'sess:0.0\n' > "$A2_UIDIR/tmux-target"
+  if a2_until '.inbox.consumer == "waiting"' 6; then ok "A2.6b a live long-poll outranks a configured tmux target"; else bad "A2.6b: $(jq -c '.inbox' "$A2_STATE")"; fi
+  a2_age_marker "$A2_UIDIR/inbox-waiting"
+  if a2_until '.inbox.consumer == "tmux"' 6; then ok "A2.6c a STALE marker (60s old) stops counting; the configured tmux target is the consumer"; else bad "A2.6c: $(jq -c '.inbox' "$A2_STATE")"; fi
+  rm -f "$A2_UIDIR/tmux-target"
+  if a2_until '.inbox.consumer == "none"' 6; then ok "A2.6d stale marker + no tmux target -> consumer none"; else bad "A2.6d: $(jq -c '.inbox' "$A2_STATE")"; fi
+  rm -f "$A2_UIDIR/inbox-waiting"
+
+  A2_ID3="$(a2_post "popped by the CLI")"
+  ( cd "$A2_FIX" && HEIMDALL_WATCH_ROOT="$A2_FIX" exec "$UI" inbox pop --json ) > "$TMPROOT/a2-pop.json" 2>&1
+  A2_POP_AT="$(jq -r --arg id "$A2_ID3" '.[0] | select(.id == $id) | .delivered_at' "$TMPROOT/a2-pop.json" 2>/dev/null)"
+  if [ -n "$A2_POP_AT" ] && [ "$A2_POP_AT" != "null" ] && a2_until "[.inbox.delivered[] | select(.id == \"$A2_ID3\") | .delivered_at] == [$A2_POP_AT]" 5; then
+    ok "A2.7 hmd ui inbox pop stamps the same delivered_at that /api/state then serves"
+  else
+    bad "A2.7 pop output: $(cat "$TMPROOT/a2-pop.json"); inbox: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
+  fi
+
+  A2_UNIT="$TMPROOT/a2-unit.py"
+  cat > "$A2_UNIT" <<'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.join(sys.argv[1], "bin", "lib"))
+import companion_ui_inbox as M
+
+root = tempfile.mkdtemp()
+ui = os.path.join(root, ".heimdall", "ui")
+os.makedirs(ui)
+delivered = os.path.join(ui, "inbox-delivered.jsonl")
+inbox = os.path.join(ui, "inbox.jsonl")
+verdicts = []
+
+
+def check(name, cond):
+    verdicts.append("%s %s" % ("OK " if cond else "BAD", name))
+
+
+check("no archive -> []", M.delivered_receipts(root) == [])
+
+lines = ['{"id":"legacy","ts":1,"text":"old format, no receipt","source":"companion"}',
+         "this is not json",
+         "[1,2,3]",
+         '{"id":"nan","delivered_at":"yesterday","text":"x"}',
+         '{"id":"nonum","delivered_at":NaN,"text":"x"}']
+for i in range(25):
+    lines.append(json.dumps({"id": "id-%d" % i, "ts": 1, "text": "secret-text-%d" % i,
+                             "source": "companion", "delivered_at": 1000.5 + i}))
+with open(delivered, "w") as f:
+    f.write("\n".join(lines) + "\n")
+got = M.delivered_receipts(root)
+check("last 20 valid receipts, oldest first", [r["id"] for r in got] == ["id-%d" % i for i in range(5, 25)])
+check("each entry is exactly {id, delivered_at}", all(sorted(r) == ["delivered_at", "id"] for r in got))
+check("never any message text", "secret-text" not in json.dumps(got) and "old format" not in json.dumps(got))
+check("legacy / malformed / non-numeric lines skipped", all(r["id"].startswith("id-") for r in got))
+
+with open(delivered, "w") as f:
+    for i in range(6000):
+        f.write(json.dumps({"id": "junk-%d" % i, "ts": 1, "text": "x" * 60}) + "\n")
+    for i in range(3):
+        f.write(json.dumps({"id": "tail-%d" % i, "ts": 1, "text": "t", "delivered_at": 2000.0 + i}) + "\n")
+check("tail-bounded read still finds the newest receipts in a big archive",
+      os.path.getsize(delivered) > M.RECEIPTS_TAIL_BYTES and [r["id"] for r in M.delivered_receipts(root)] == ["tail-0", "tail-1", "tail-2"])
+
+with open(inbox, "w") as f:
+    f.write('{"id":"a","ts":100.0,"text":"x"}\n{"id":"b","ts":200.0,"text":"y"}\n')
+check("oldest_age_s is the oldest pending ts against now", M.summary(root, now=150.0)["oldest_age_s"] == 50.0)
+check("pending counts the queue", M.summary(root, now=150.0)["pending"] == 2)
+check("a ts in the future clamps to 0", M.summary(root, now=50.0)["oldest_age_s"] == 0.0)
+with open(inbox, "w") as f:
+    f.write('{"id":"a","text":"no ts"}\n{"id":"b","ts":200.0,"text":"y"}\n')
+check("a pending line without ts is skipped for the age", M.summary(root, now=250.0)["oldest_age_s"] == 50.0)
+with open(inbox, "w") as f:
+    f.write("")
+check("empty queue -> oldest_age_s null", M.summary(root, now=250.0)["oldest_age_s"] is None)
+
+marker = os.path.join(ui, "inbox-waiting")
+with open(marker, "w") as f:
+    f.write("{}")
+mt = os.stat(marker).st_mtime
+check("marker 1s old -> waiting", M.consumer_state(root, now=mt + 1.0) == "waiting")
+check("marker exactly 2x poll interval old -> still waiting", M.consumer_state(root, now=mt + 2 * M.POLL_INTERVAL_S) == "waiting")
+check("marker just past 2x poll interval -> stale, none", M.consumer_state(root, now=mt + 2 * M.POLL_INTERVAL_S + 0.5) == "none")
+check("marker mtime in the far future -> not trusted, none", M.consumer_state(root, now=mt - 3600.0) == "none")
+os.environ["HMD_TMUX_TARGET"] = "env:0.0"
+check("HMD_TMUX_TARGET in the server env -> tmux", M.consumer_state(root, now=mt + 100.0) == "tmux")
+check("live marker still outranks tmux", M.consumer_state(root, now=mt + 1.0) == "waiting")
+del os.environ["HMD_TMUX_TARGET"]
+print("\n".join(verdicts))
+PYEOF
+  A2_UNIT_OUT="$(python3 "$A2_UNIT" "$REPO" 2>&1)"
+  A2_UNIT_BAD="$(printf '%s\n' "$A2_UNIT_OUT" | grep -c '^BAD' || true)"
+  A2_UNIT_OK="$(printf '%s\n' "$A2_UNIT_OUT" | grep -c '^OK' || true)"
+  if [ "$A2_UNIT_BAD" = "0" ] && [ "$A2_UNIT_OK" -ge 15 ]; then
+    ok "A2.8 module-level receipts/consumer/age contract holds ($A2_UNIT_OK checks)"
+  else
+    bad "A2.8 module-level contract: $A2_UNIT_OUT"
+  fi
+fi
+
 # ═══ 20. server survived every malformed/oversize/secret/control-char/
 # capacity/rotation payload ═════════════════════════════════════════════════
 if kill -0 "$SRV_PID" 2>/dev/null; then

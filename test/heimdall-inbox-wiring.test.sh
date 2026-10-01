@@ -60,7 +60,7 @@ printf '%s' "$PROMPT_CMDS" | grep -q ' prompt --repo' && ok "UserPromptSubmit ho
 
 TIMEOUT_STOP="$(jq -r '.hooks.Stop[]?.hooks[]? | select(.command | contains("inbox-deliver-stop")) | .timeout // empty' "$HOOKS_JSON")"
 TIMEOUT_PROMPT="$(jq -r '.hooks.UserPromptSubmit[]?.hooks[]? | select(.command | contains("inbox-deliver-prompt")) | .timeout // empty' "$HOOKS_JSON")"
-[ "$TIMEOUT_STOP" = "300" ] && ok "Stop hook timeout is 300s (tool's documented HMD_INBOX_WAIT_S=240 + margin)" || bad "Stop hook timeout wrong/missing: '$TIMEOUT_STOP'"
+[ "$TIMEOUT_STOP" = "1860" ] && ok "Stop hook timeout is 1860s (the 1800s companion-connected HMD_INBOX_WAIT_S default + the same 60s margin 240 -> 300 had)" || bad "Stop hook timeout wrong/missing: '$TIMEOUT_STOP'"
 [ "$TIMEOUT_PROMPT" = "10" ] && ok "UserPromptSubmit hook timeout is 10s" || bad "UserPromptSubmit hook timeout wrong/missing: '$TIMEOUT_PROMPT'"
 
 echo "3. hooks.metadata.json registers both ids, distinct, advisory (locked:false):"
@@ -131,6 +131,68 @@ ELAPSED=$((END - START))
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0): $OUT"
 [ -z "$OUT" ] && ok "no stdout (still empty after the short wait)" || bad "unexpected stdout: $OUT"
 [ "$ELAPSED" -ge 2 ] && ok "honored the marker -- actually waited (${ELAPSED}s >= 2s)" || bad "returned in ${ELAPSED}s -- marker should have forced a wait"
+rm -rf "$D"
+
+# A2: a connected companion (.heimdall/app/connect.json naming live processes)
+# is the implicit opt-in -- the wired hook must hold the idle session for a
+# phone message even with no inbox.wait marker and no '?'. Pinned to an
+# attended session: a headless claude -p / SDK caller would otherwise (rightly)
+# switch the wait off.
+export CLAUDE_CODE_ENTRYPOINT=cli
+unset HMD_AGENT_TYPE HMD_JUDGMENT HMD_INBOX_GATED HMD_INBOX_WAIT_S
+STOP_CMD="$(jq -r '(.hooks.Stop[]?.hooks[]?) | select(.command | contains("inbox-deliver-stop")) | .command' "$HOOKS_JSON")"
+
+echo "9. A2: no inbox.wait marker + companion connected (live connect.json) + last message WITHOUT '?' -> the wired hook delivers a late phone message (idle delivery, no prompt):"
+D="$(make_project)"
+mkdir -p "$D/.heimdall/app"
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$$" "$$" > "$D/.heimdall/app/connect.json"
+: > "$D/.heimdall/ui/inbox.jsonl"
+PAYLOAD='{"session_id":"s1","transcript_path":"","cwd":"'"$D"'","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Done implementing the feature."}'
+# The message lands 3s in -- long enough that a slow hook start cannot beat it
+# and make a hook that never waits look like one that did. HMD_INBOX_WAIT_S=20
+# only bounds a broken run (the real default with a companion is 1800).
+( sleep 3; printf '{"id":"w1","ts":1,"text":"idle hello from phone","source":"test"}\n' >> "$D/.heimdall/ui/inbox.jsonl" ) &
+BGPID=$!
+START=$(date +%s)
+OUT="$(printf '%s' "$PAYLOAD" | CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" HMD_INBOX_WAIT_S=20 bash -c "$STOP_CMD" 2>&1)"
+RC=$?
+END=$(date +%s)
+ELAPSED=$((END - START))
+wait "$BGPID" 2>/dev/null || true
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0): $OUT"
+printf '%s' "$OUT" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' && ok "decision:block delivered through the wired command" || bad "no delivery: $OUT"
+printf '%s' "$OUT" | grep -q "idle hello from phone" && ok "reason carries the late-arriving text" || bad "text missing from: $OUT"
+[ "$ELAPSED" -le 9 ] && ok "delivered in ${ELAPSED}s -- the hook was holding the idle session, not returning at once" || bad "took ${ELAPSED}s"
+rm -rf "$D"
+
+echo "10. A2: a STALE connect.json (dead pids) is not a connected companion -- the wired hook returns at once:"
+D="$(make_project)"
+mkdir -p "$D/.heimdall/app"
+( : ) & DEADP=$!
+wait "$DEADP" 2>/dev/null
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$DEADP" "$DEADP" > "$D/.heimdall/app/connect.json"
+: > "$D/.heimdall/ui/inbox.jsonl"
+PAYLOAD='{"session_id":"s1","transcript_path":"","cwd":"'"$D"'","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Done implementing the feature."}'
+START=$(date +%s)
+OUT="$(printf '%s' "$PAYLOAD" | CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" HMD_INBOX_WAIT_S=6 bash -c "$STOP_CMD" 2>&1)"
+RC=$?
+END=$(date +%s)
+ELAPSED=$((END - START))
+[ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "exit 0, no stdout" || bad "rc=$RC out: $OUT"
+[ "$ELAPSED" -le 3 ] && ok "returned in ${ELAPSED}s -- a crash-left connect.json cannot pin every turn end (a wait would show >= 6s)" || bad "took ${ELAPSED}s"
+rm -rf "$D"
+
+echo "11. A2: no marker + nobody connected + question + an operator-exported HMD_INBOX_WAIT_S=4 -> the wiring's opt-in gate still wins (returns at once):"
+D="$(make_project)"
+: > "$D/.heimdall/ui/inbox.jsonl"
+PAYLOAD='{"session_id":"s1","transcript_path":"","cwd":"'"$D"'","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Should I proceed?"}'
+START=$(date +%s)
+OUT="$(printf '%s' "$PAYLOAD" | CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" HMD_INBOX_WAIT_S=4 bash -c "$STOP_CMD" 2>&1)"
+RC=$?
+END=$(date +%s)
+ELAPSED=$((END - START))
+[ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "exit 0, no stdout" || bad "rc=$RC out: $OUT"
+[ "$ELAPSED" -le 3 ] && ok "returned in ${ELAPSED}s (the exported 4s wait did not leak past the gate)" || bad "took ${ELAPSED}s -- the gate did not hold"
 rm -rf "$D"
 
 echo ""
