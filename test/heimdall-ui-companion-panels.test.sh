@@ -459,7 +459,10 @@ start_server() {
   if ! wait_for "$prefix.out" "^http://127\.0\.0\.1:$S_PORT/\?(t|token)=[A-Za-z0-9_-]+\$" 10; then
     return 1
   fi
-  S_TOKEN="$(grep -E "^http://127\.0\.0\.1:$S_PORT/" "$prefix.out" | head -1 | sed 's/.*[?&]\(t\|token\)=//')"
+  local url q
+  url="$(grep -E "^http://127\.0\.0\.1:$S_PORT/" "$prefix.out" | head -1)"
+  q="${url#*\?}"
+  S_TOKEN="${q#*=}"
   return 0
 }
 
