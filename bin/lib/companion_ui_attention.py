@@ -436,14 +436,15 @@ def _strip_markers(line):
         old = line
         # Strip blockquote marker
         line = re.sub(r'^>\s*', '', line)
-        # Strip bold/italic wrappers (** or __)
-        line = re.sub(r'^(\*\*|__)', '', line)
         # Strip heading hashes (##+ or #)
         line = re.sub(r'^#+\s*', '', line)
-        # Strip list markers: - * + •
-        line = re.sub(r'^[-*+•]\s*', '', line)
-        # Strip numbered list markers: 1. 12) etc (1-99)
-        line = re.sub(r'^\d{1,2}[.)]\s*', '', line)
+        # Strip list markers: - * + • (require space after marker)
+        line = re.sub(r'^[-*+•]\s+', '', line)
+        # Strip numbered list markers: 1. 12) etc (1-99, require space after)
+        line = re.sub(r'^\d{1,2}[.)]\s+', '', line)
+        # Strip bold/italic wrappers at start and end
+        line = re.sub(r'^(\*\*|__)', '', line)
+        line = re.sub(r'(\*\*|__)$', '', line)
         # If nothing changed, we're done
         if line == old:
             break
