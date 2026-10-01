@@ -114,6 +114,7 @@ SOURCE_FILES = (
     ".planning/metrics.jsonl",            # last graded parallelism row (tail only)
     ".heimdall/ui/panels/",               # job panels: <id>.json via companion_ui_panels.read_panels
     ".heimdall/ui/inbox.jsonl",           # undelivered companion messages: companion_ui_inbox.list_pending
+    ".heimdall/.agents-count-cache",      # live-subagent count (one integer), read only after a turn ends
 )
 # Under $TMPDIR: parallelism-tracker's live per-session counters (key=value text).
 # READ ONLY. `parallelism-tracker grade` is deliberately NOT called: it is the
@@ -126,6 +127,12 @@ SOURCE_TMP_FILES = (
 SOURCE_HOME_FILES = (
     "ledger/repos/<repo_key>.json",
     "ledger/status.json",
+)
+# Under ${CLAUDE_CONFIG_DIR:-~/.claude}: the repo's own session transcript, for the `attention`
+# slice. READ ONLY and TAIL ONLY (bin/lib/companion_ui_attention.py): never the whole file, and
+# never anything else in that directory -- settings.json stays deny-listed and unopened.
+SOURCE_CLAUDE_FILES = (
+    "projects/<slug>/<session>.jsonl",
 )
 SOURCE_COMMANDS = (
     ("heimdall-hooks", "list", "--json"),
@@ -212,6 +219,10 @@ INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_i
 # same file, so the code shown here in identity.session_code and the code shown on the
 # statusline can never disagree.
 SESSION_CODE = _load_module("hmd_session_code", os.path.join(LIB_DIR, "hmd_session_code.py"))
+# The ONE place the `attention` derivation lives (A1, docs/HANDOFF-TO-HEIMDALL-product-asks.md):
+# the newest main-chain entries of the repo's session transcript -> {state,id,since,kind,summary,
+# options,turn}. Tail-only, stat-cached; see the module docstring.
+ATTENTION = _load_module("companion_ui_attention", os.path.join(LIB_DIR, "companion_ui_attention.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -1373,6 +1384,9 @@ def print_sources(root):
         print("file %s" % os.path.join(home, rel))
     for rel in SOURCE_TMP_FILES:
         print("file %s" % os.path.join(os.environ.get("TMPDIR") or "/tmp", rel))
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    for rel in SOURCE_CLAUDE_FILES:
+        print("file %s" % os.path.join(claude_dir, rel))
     print("file %s" % PAGE_PATH)
     for argv in SOURCE_COMMANDS:
         print("exec %s" % shlex.join([os.path.join(BIN_DIR, argv[0])] + list(argv[1:])))
