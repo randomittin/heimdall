@@ -315,6 +315,8 @@ POLAR = (
     ("... in bold", "**Is the schema change safe to ship?**"),
     ("... with an explicit yes/no tag (not an 'A or B')", "Have you already rotated the key, yes or no?"),
     ("... in a negative contraction", "Doesn't the relay client already retry?"),
+    ("... in a negative contraction with a curly apostrophe", "Doesn’t the relay client already retry?"),
+    ("... in the irregular negative contraction", "Won't the gate go red again?"),
     ("... with a `?` and a space inside an inline code span", "I rewrote the branch.\n\nShould I keep the `cond ? a : b` form?"),
     ("... with which/or as identifiers inside code spans", "Should I rename `which` to `which_or_what`?"),
     ("... with a what/which inside a URL", "Should I open https://example.test/run?what=1&which=2 now?"),
@@ -331,6 +333,17 @@ g["options"].append({"key": "x", "label": "x"})
 g2, root, p = case([tx.entry("end", age=10, text="Should I proceed with the migration?")])
 check("U5d2. each result owns its Yes/No list (a consumer mutating one cannot corrupt the next)",
       g2["options"] == YES_NO, g2)
+# every auxiliary/modal of the rule opens a closed polar question
+AUX_QUESTIONS = ("Is the tree clean?", "Are the suites green?", "Was the gate green?", "Were the checkpoints committed?",
+                 "Do the docs need an update?", "Does the relay retry?", "Did the sweep pass?", "Can I merge it?",
+                 "Could the cache be stale?", "Should I push?", "Shall we ship?", "Will the gate pass?",
+                 "Would a rebase be cleaner?", "May I delete the branch?", "Might the cache be stale?",
+                 "Have you rotated the key?", "Has the sweep finished?", "Had the tree been clean?",
+                 "Am I right that the gate is green?")
+bad_aux = [t for t in AUX_QUESTIONS
+           if case([tx.entry("end", age=10, text=t)])[0]["options"] != YES_NO]
+check("U5d3. each of is/are/was/were/am/do/does/did/can/could/should/shall/will/would/may/might/have/has/had opens "
+      "a closed polar question -> Yes/No", not bad_aux, bad_aux)
 
 OPEN = (
     ("THREE open questions (the operator's real reply shape)", OPERATOR_THREE),
