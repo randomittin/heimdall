@@ -13,7 +13,19 @@
 #       -> permission -> session-end and read .attention after every step; one /api/events frame
 #       per transition and none for repeated tool-call entries; the ETag stays put while tool
 #       calls pile up; a secret-shaped summary is dropped; public mode (--allow-host) redacts a
-#       path and an email; a 50 MB transcript costs one bounded read.
+#       path and an email; a 50 MB transcript costs one bounded read. L1-L11 run with the native
+#       companion publishers (A3) OFF; L12 runs attention WITH them on -- see "Publishers" below.
+#
+# Publishers: bin/lib/companion_ui_publish.py rewrites the chat / hmd-question / agents panels
+# from the SAME transcript attention is derived from, and the digest covers panels -- so with
+# them on, one transcript append that adds text is two digest changes. Measured (a dump of every
+# SSE frame of this suite with them on): whenever a GET /api/state -- this suite's `poke`, and
+# att_is's polling -- lands before the poller's next publish pass, the append arrives as TWO
+# frames, attention first (StateCache.refresh() on a GET never publishes) and the chat /
+# hmd-question panels one poll tick later. L1-L11 count frames per ATTENTION transition, so they
+# run with HMD_UI_COMPANION_PANELS=0. L12 turns the publishers on and makes NO GET: on the
+# poller-only path (the one bin/heimdall-relay-client reads, via StateCache.latest()) the first
+# frame announcing a transition must already carry the panels it implies.
 #
 # Hermetic: HOME/HEIMDALL_HOME/TMPDIR are a temp dir, the fixture repo is a temp dir, the
 # session id env vars are unset, every background process is reaped on EXIT. No `timeout` on
@@ -57,6 +69,7 @@ export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset CLAUDE_SESSION_ID SESSION_ID CLAUDE_CODE_SESSION_ID CLAUDE_CONFIG_DIR
+export HMD_UI_COMPANION_PANELS=0   # L1-L11 only (see "Publishers" above); L12 turns it on for its own server
 FIX="$TMPROOT/fixture-repo"
 mkdir -p "$HOME/.claude" "$FIX"
 FIX_REAL="$(cd "$FIX" && pwd -P)"

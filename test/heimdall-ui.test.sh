@@ -37,9 +37,18 @@
 # not assumed: it is read off the printed URL line (`?t=` or `?token=`) and
 # reused verbatim, so both spellings are exercised with equal strictness.
 #
-# Hermetic: HOME and HEIMDALL_HOME are redirected to a temp dir, the fixture
-# repo is a temp dir, and every background process is reaped on EXIT. macOS has
-# no `timeout`; every wait is a bounded sleep-0.2 poll.
+# Hermetic: HOME, HEIMDALL_HOME and TMPDIR are redirected to a temp dir, the
+# fixture repo is a temp dir, and every background process is reaped on EXIT.
+# TMPDIR is pinned because two of the server's slices are keyed off it, not off the
+# fixture: collect_parallelism() reads (falling back to the most-recently-touched
+# `*.state`, since this server never has a session id) $TMPDIR/heimdall-parallel, and
+# collect_edits() shells out to `edit-tracker paths`, which reads
+# $TMPDIR/heimdall-edits/<CLAUDE_CODE_SESSION_ID>.log. Unpinned, case 8c's "nothing
+# changes for 4.5s" window was broken by whatever OTHER Claude Code session or agent
+# on the machine made a tool call or an edit in that window (the diff of the two SSE
+# frames was exactly edits.count/edits.paths + parallelism.calls/turns, nothing else) --
+# a digest change the server was RIGHT to emit. macOS has no `timeout`; every wait is
+# a bounded sleep-0.2 poll.
 
 set -u
 
@@ -70,6 +79,9 @@ done
 
 # ── sandbox ─────────────────────────────────────────────────────────────────
 TMPROOT="$(mktemp -d)"
+# TMPDIR before HOME -- see the Hermetic note above (parallelism-tracker + edit-tracker leak).
+# Pattern: test/heimdall-ui-panels.test.sh, test/heimdall-ui-inbox.test.sh (476b3036).
+export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 FIX="$TMPROOT/fixture-repo"
