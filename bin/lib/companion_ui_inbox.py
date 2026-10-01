@@ -337,23 +337,43 @@ def _rotate_if_oversized(path, max_bytes):
     os.replace(path, path + ".1")
 
 
+def _stamp_delivered(raw_lines, delivered_at):
+    """The archive form of a popped batch: every line that is a JSON object gains
+    `delivered_at` (the receipt delivered_receipts() reads back); any other line
+    is kept as it was, so a pop never silently loses a byte."""
+    out = []
+    for line in raw_lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            obj["delivered_at"] = delivered_at
+            line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+        out.append(line)
+    return out
+
+
 def pop_all(root):
     """Deliver every pending message: append the current inbox.jsonl content to
-    inbox-delivered.jsonl (rotating it to inbox-delivered.jsonl.1 first if it's
-    already at MAX_INBOX_BYTES -- see _rotate_if_oversized) and truncate
-    inbox.jsonl to empty, under the SAME lock append() takes. Returns the list
-    of delivered records (oldest first); [] when nothing was pending (and
-    nothing is touched on disk, including rotation, in that case)."""
+    inbox-delivered.jsonl -- each message stamped with the `delivered_at` epoch
+    of this pop, its delivery receipt -- (rotating it to inbox-delivered.jsonl.1
+    first if it's already at MAX_INBOX_BYTES -- see _rotate_if_oversized) and
+    truncate inbox.jsonl to empty, under the SAME lock append() takes. Returns
+    the list of delivered records, receipt included (oldest first); [] when
+    nothing was pending (and nothing is touched on disk, including rotation, in
+    that case)."""
     path = _inbox_path(root)
     delivered_path = _delivered_path(root)
     with _FlockCtx(_lock_path(root)):
         records, raw_lines = _read_all(path)
         if not raw_lines:
             return []
+        delivered_at = round(time.time(), 3)
         _ensure_dir(os.path.dirname(delivered_path))
         _rotate_if_oversized(delivered_path, MAX_INBOX_BYTES)
         with _open_append_0600(delivered_path) as df:
-            df.writelines(raw_lines)
+            df.writelines(_stamp_delivered(raw_lines, delivered_at))
             df.flush()
             os.fsync(df.fileno())
         # Truncate in place, still inside the lock so nothing can land between
