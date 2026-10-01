@@ -134,6 +134,7 @@ SOURCE_COMMANDS = (
     ("heimdall-fallback", "status", "--json"),
     ("heimdall-identity", "--json"),
     ("heimdall-haid", "current"),
+    ("heimdall-agents", "list", "--json"),   # A3: the `agents` panel (throttled; see companion_ui_publish)
 )
 GIT_COMMANDS = (
     ("git", "rev-parse", "--abbrev-ref", "HEAD"),
@@ -715,6 +716,44 @@ def publish_live_users(root, roster_count, previous, now=None):
     return (roster_count, now)
 
 
+# A3 (HANDOFF-TO-HEIMDALL-product-asks.md): the phone's Chat tab, question sheet and
+# Agents tab render the `chat`, `hmd-question` and `agents` panels, whose only
+# publishers used to be two scripts wired into the hmdapp repo's own settings. The
+# native publishers (bin/lib/companion_ui_publish.py) run in this poller, in the
+# same slot as publish_live_users: derived from a bounded tail of the session
+# transcript, written through the same write_panel, only when content changed.
+# HMD_UI_COMPANION_PANELS=0 switches them off.
+COMPANION = _load_module("companion_ui_publish", os.path.join(LIB_DIR, "companion_ui_publish.py"))
+
+
+AGENTS_LIST_TIMEOUT_S = 6
+
+
+def new_companion_publisher(root):
+    if COMPANION is None or os.environ.get("HMD_UI_COMPANION_PANELS") == "0":
+        return None
+
+    def list_agents():
+        # The publisher throttles this (>= 10s apart) and skips it while the statusline's
+        # cached count says nothing is running; _run_json_cached memoizes within a tick.
+        return _run_json_cached(("heimdall-agents", "list", "--json"), root,
+                                timeout=AGENTS_LIST_TIMEOUT_S, env={"HMD_AGENT_CWD": root})
+
+    return COMPANION.CompanionPublisher(root, read_tail=_read_tail, list_agents=list_agents)
+
+
+def publish_companion_panels(publisher):
+    """One publish pass of the native panels; True when any panel file changed.
+    Never raises: a publisher fault must cost a panel, never the poll loop."""
+    if publisher is None:
+        return False
+    try:
+        return bool(publisher.tick())
+    except Exception as e:
+        sys.stderr.write("hmd-ui: companion panels: %s\n" % e.__class__.__name__)
+        return False
+
+
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 # N4: a path TOKEN -- '/' or '~/' at the start of the string or right after
@@ -876,6 +915,7 @@ class StateCache:
         self._refreshed_at = None   # time.monotonic() of the last completed refresh, or None
         self._stop = threading.Event()
         self._live_users = None   # (value, written_at) of the self-published panel
+        self._companion = new_companion_publisher(root)   # A3: chat / hmd-question / agents
 
     def refresh(self, publish=False):
         state = collect_state(self.root, self.transport)
@@ -885,7 +925,8 @@ class StateCache:
             # already carries the fresh value instead of waiting one more tick.
             before = self._live_users
             self._live_users = publish_live_users(self.root, len(state.get("roster") or []), before)
-            if self._live_users is not before:
+            companion_changed = publish_companion_panels(self._companion)
+            if self._live_users is not before or companion_changed:
                 try:
                     panels = collect_panels(self.root)
                     # collect_panels() is called directly here (not through another
@@ -1373,6 +1414,9 @@ def print_sources(root):
         print("file %s" % os.path.join(home, rel))
     for rel in SOURCE_TMP_FILES:
         print("file %s" % os.path.join(os.environ.get("TMPDIR") or "/tmp", rel))
+    if COMPANION is not None:
+        for path in COMPANION.source_paths(root):
+            print("file %s" % path)
     print("file %s" % PAGE_PATH)
     for argv in SOURCE_COMMANDS:
         print("exec %s" % shlex.join([os.path.join(BIN_DIR, argv[0])] + list(argv[1:])))
