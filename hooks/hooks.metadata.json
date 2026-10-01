@@ -311,9 +311,9 @@
       "event": "Stop",
       "index": 4,
       "id": "inbox-deliver-stop",
-      "description": "Delivers companion-app inbox messages via heimdall-inbox-deliver stop. Long-poll only fires when the inbox is empty AND hmd's last message ended in a question; even then HMD_INBOX_WAIT_S is forced to 0 (near-instant return) unless <repo>/.heimdall/ui/inbox.wait exists, so opting in to the full 240s wait requires that marker file.",
+      "description": "Delivers companion-app inbox messages via heimdall-inbox-deliver stop. With the inbox empty it long-polls when a companion is connected (a live <repo>/.heimdall/app/connect.json; attended sessions only -- never headless claude -p or hmd sub-sessions) after ANY last message, up to 1800s (hook timeout 1860), or when hmd's last message ended in a question, up to 240s. HMD_INBOX_GATED=1 keeps the question wait off (near-instant return) unless <repo>/.heimdall/ui/inbox.wait exists, so opting in to the 240s question wait requires that marker file; a connected companion is the implicit opt-in for the 1800s wait. Export HMD_INBOX_WAIT_S=0 to never hold a turn.",
       "matcher": "",
-      "fingerprint": "b2c276692191b1b88db835cdfc368a353270aeab50bdde7deadaffaffb50f5de",
+      "fingerprint": "18525a6125fbcbde7cc1c65e91604dbfa1cbe6fe1a3f294df559693052cc3fd2",
       "locked": false
     },
     {
