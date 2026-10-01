@@ -742,5 +742,65 @@ else
   bad "L11b. GET /api/state over the 50 MB transcript took ${TT}s"
 fi
 
+# L12 -- attention and the native companion publishers (A3) together: both ON, and NO GET anywhere.
+# One transcript append now changes attention AND the chat / hmd-question panels. On the poller-only
+# path (what bin/heimdall-relay-client reads, via StateCache.latest()) the contract is coherence: the
+# FIRST frame announcing a transition already carries the panels it implies. Inside one poller pass
+# attention is read before the publishers run and a transcript only grows, so attention can lag the
+# panels but never lead them -- which is why this asserts content, not a frame count (a pass that
+# lags is a legal second frame). A GET /api/state in between WOULD break it: refresh() on a GET
+# never publishes, so it shows the new attention a poll tick before the panels (see "Publishers").
+FIX3="$TMPROOT/fixture-repo-3"
+mkdir -p "$FIX3"
+FIX3_REAL="$(cd "$FIX3" && pwd -P)"
+PROJ3="$HOME/.claude/projects/$(printf '%s' "$FIX3_REAL" | sed 's/[^A-Za-z0-9]/-/g')"
+mkdir -p "$PROJ3"
+TX3="$PROJ3/$SID.jsonl"
+( cd "$FIX3" && git init -q . 2>/dev/null && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m fixture >/dev/null 2>&1 ) || true
+txf() { python3 "$TXPY" "$TX3" "$@"; }
+# first_frame <jq-condition>: the first SSE frame of $EV3 satisfying it (compact JSON), else nothing.
+first_frame() { sed -n 's/^data: //p' "$EV3" | jq -c "select($1)" 2>/dev/null | head -1; }
+# announced_with_panels <label> <announce-condition> <implied-condition>: wait (bounded, polling the
+# stream file -- never /api/state) for the first frame announcing the transition, then require it to
+# satisfy what the same append implies for the panels.
+announced_with_panels() {
+  local label="$1" announce="$2" implied="$3" i=0 f=""
+  while [ "$i" -lt 40 ]; do
+    f="$(first_frame "$announce")"
+    [ -n "$f" ] && break
+    sleep 0.2; i=$((i + 1))
+  done
+  if [ -z "$f" ]; then bad "$label (no frame announced it within 8s)"; return 1; fi
+  if printf '%s' "$f" | jq -e "$implied" >/dev/null 2>&1; then ok "$label"; return 0; fi
+  bad "$label (first frame: attention=$(printf '%s' "$f" | jq -c '[.attention.state,.attention.kind]') panels=$(printf '%s' "$f" | jq -c '[.panels[].id]'))"
+  return 1
+}
+PORT3="$(free_port)"
+SRV3_OUT="$TMPROOT/server3.out"
+( cd "$FIX3" && HEIMDALL_WATCH_ROOT="$FIX3" HMD_UI_COMPANION_PANELS=1 exec "$UI" --repo "$FIX3" --port "$PORT3" --no-open ) >"$SRV3_OUT" 2>&1 &
+PIDS+=("$!")
+URL3_RE="^http://127\.0\.0\.1:$PORT3/\?(t|token)=[A-Za-z0-9_-]+\$"
+if wait_for "$SRV3_OUT" "$URL3_RE" 10; then
+  URL3="$(grep -E "$URL3_RE" "$SRV3_OUT" | head -1)"
+  EV3="$TMPROOT/events3.out"
+  curl -sN "http://127.0.0.1:$PORT3/api/events?${URL3#*\?}" >"$EV3" 2>/dev/null &
+  PIDS+=("$!")
+  wait_for "$EV3" '^data:' 10   # the connect frame is in; from here only the poller touches the cache
+  txf prompt --text "start the refactor"
+  announced_with_panels "L12a. publishers on, no GET: the first frame announcing working already carries the prompt in chat" \
+    '.attention.state == "working"' \
+    '[.panels[] | select(.id == "chat") | .data.lines[]] | any(test("you start the refactor$"))'
+  txf end --text "Shall I ship it now?"
+  announced_with_panels "L12b. ... the first needs_input frame already carries hmd-question and the question as chat's last line" \
+    '.attention.state == "needs_input"' \
+    '([.panels[] | select(.id == "hmd-question") | .data.text] == ["Shall I ship it now?"]) and (([.panels[] | select(.id == "chat") | .data.lines[-1]] | .[0] // "") | test("hmd Shall I ship it now\\?$"))'
+  txf stop --text "Done, nothing else to report."
+  announced_with_panels "L12c. ... the first idle frame already dropped hmd-question and carries the reply as chat's last line" \
+    '.attention.state == "idle" and .attention.id != null' \
+    '(([.panels[].id] | index("hmd-question")) == null) and (([.panels[] | select(.id == "chat") | .data.lines[-1]] | .[0] // "") | test("hmd Done, nothing else to report\\.$"))'
+else
+  bad "L12. the server with the publishers on never came up: $(head -c 300 "$SRV3_OUT")"
+fi
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
