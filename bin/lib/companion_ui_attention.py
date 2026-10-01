@@ -501,8 +501,7 @@ def _closed_polar_question(text):
     body = _polar_body(_SENTENCE_BREAK_RE.split(t.rstrip("?"))[-1])
     if body is None:
         return False
-    body = _YES_NO_TAG_RE.sub(" ", body)
-    return len(body.split()) >= 2 and not _OPEN_WORD_RE.search(body)
+    return not _OPEN_WORD_RE.search(_YES_NO_TAG_RE.sub(" ", body))
 
 
 def _make_options(text):

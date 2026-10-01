@@ -326,6 +326,11 @@ for label, text in POLAR:
     g, root, p = case([tx.entry("end", age=10, text=text)])
     check("U5d. %s -> options are exactly Yes/No" % label,
           g["state"] == "needs_input" and g["kind"] == "question" and g["options"] == YES_NO, [text, g])
+g["options"][0]["label"] = "tampered"
+g["options"].append({"key": "x", "label": "x"})
+g2, root, p = case([tx.entry("end", age=10, text="Should I proceed with the migration?")])
+check("U5d2. each result owns its Yes/No list (a consumer mutating one cannot corrupt the next)",
+      g2["options"] == YES_NO, g2)
 
 OPEN = (
     ("THREE open questions (the operator's real reply shape)", OPERATOR_THREE),
@@ -348,6 +353,8 @@ OPEN = (
     ("an imperative tagged 'yes or no' (not an aux-led question)", "Paths: show ../hmdapp — yes or no?"),
     ("a long run-on lead-in is not a short lead-in",
      "The migration touched fourteen tables and three views and I verified every row count twice, so should I push?"),
+    ("a lead-in of 9 words (one over the limit)", "one two three four five six seven eight nine — should I push?"),
+    ("an earlier QUOTED question plus a polar one", 'You asked "is it done?" earlier. Should I push?'),
 )
 for label, text in OPEN:
     g, root, p = case([tx.entry("end", age=10, text=text)])
