@@ -505,7 +505,39 @@ check("U12e. a 100-char label is cut to exactly 80 chars with an ellipsis",
 check("U12f. turn must be a non-negative int (bool and negatives -> null)",
       run(root, turn=True)["turn"] is None and run(root, turn=-1)["turn"] is None and run(root, turn=0)["turn"] == 0)
 
-# U13 -- which transcript
+# U13 -- strip leading markdown markers from summary
+g, root, p = case([tx.entry("end", age=5, text="- Do you want to proceed?")])
+check("U13. dash list marker stripped: '- text' -> 'text'", g["summary"] == "Do you want to proceed?", g)
+g, root, p = case([tx.entry("end", age=5, text="* What should I do next?")])
+check("U13b. asterisk list marker stripped: '* text' -> 'text'", g["summary"] == "What should I do next?", g)
+g, root, p = case([tx.entry("end", age=5, text="+ Should I merge this?")])
+check("U13c. plus list marker stripped: '+ text' -> 'text'", g["summary"] == "Should I merge this?", g)
+g, root, p = case([tx.entry("end", age=5, text="• Will this work?")])
+check("U13d. bullet marker stripped: '• text' -> 'text'", g["summary"] == "Will this work?", g)
+g, root, p = case([tx.entry("end", age=5, text="1. Do you agree?")])
+check("U13e. numbered list with period stripped: '1. text' -> 'text'", g["summary"] == "Do you agree?", g)
+g, root, p = case([tx.entry("end", age=5, text="12) Should I continue?")])
+check("U13f. numbered list with paren stripped: '12) text' -> 'text'", g["summary"] == "Should I continue?", g)
+g, root, p = case([tx.entry("end", age=5, text="> What about this?")])
+check("U13g. blockquote marker stripped: '> text' -> 'text'", g["summary"] == "What about this?", g)
+g, root, p = case([tx.entry("end", age=5, text="# Is this good?")])
+check("U13h. single hash heading marker stripped: '# text' -> 'text'", g["summary"] == "Is this good?", g)
+g, root, p = case([tx.entry("end", age=5, text="## Ready to ship?")])
+check("U13i. double hash heading marker stripped: '## text' -> 'text'", g["summary"] == "Ready to ship?", g)
+g, root, p = case([tx.entry("end", age=5, text="**Should we proceed?")])
+check("U13j. bold wrapper stripped: '**text' -> 'text'", g["summary"] == "Should we proceed?", g)
+g, root, p = case([tx.entry("end", age=5, text="__What do you think?")])
+check("U13k. italic wrapper stripped: '__text' -> 'text'", g["summary"] == "What do you think?", g)
+g, root, p = case([tx.entry("end", age=5, text="> - **Which option?**")])
+check("U13l. nested markers stripped repeatedly: '> - **text**' -> 'text'", g["summary"] == "Which option?", g)
+g, root, p = case([tx.entry("end", age=5, text="Plain text without markers?")])
+check("U13m. no markers (control case): 'plain text' -> 'plain text'", g["summary"] == "Plain text without markers?", g)
+g, root, p = case([tx.entry("end", age=5, text="   - Whitespace before marker?")])
+check("U13n. whitespace before marker is trimmed first: '   - text' -> 'text'", g["summary"] == "Whitespace before marker?", g)
+g, root, p = case([tx.entry("end", age=5, text="-> Still a question?")])
+check("U13o. dash without space after is NOT stripped (not a list marker): '-> text' -> '-> text'", g["summary"] == "-> Still a question?", g)
+
+# U15 -- which transcript
 root, pdir, p_cli = newroot()
 sid_sdk = "bbbbbbbb-0000-4000-8000-000000000002"
 p_sdk = os.path.join(pdir, sid_sdk + ".jsonl")
@@ -515,16 +547,16 @@ now = time.time()
 os.utime(p_cli, (now - 100, now - 100))
 os.utime(p_sdk, (now - 10, now - 10))
 clear()
-check("U13. a NEWER headless (sdk-*) transcript does not displace the interactive one", run(root)["state"] == "needs_input")
+check("U15. a NEWER headless (sdk-*) transcript does not displace the interactive one", run(root)["state"] == "needs_input")
 os.environ["CLAUDE_CODE_SESSION_ID"] = sid_sdk
 clear()
-check("U13b. a pinned session id (env) wins over recency", run(root)["state"] == "working")
+check("U15b. a pinned session id (env) wins over recency", run(root)["state"] == "working")
 del os.environ["CLAUDE_CODE_SESSION_ID"]
 os.remove(p_cli)
 clear()
-check("U13c. with only headless transcripts, the newest is used", run(root)["state"] == "working")
+check("U15c. with only headless transcripts, the newest is used", run(root)["state"] == "working")
 
-# U14 -- cost bounds
+# U16 -- cost bounds
 BYTES = [0]
 OPENS = [0]
 real_open = builtins.open
@@ -562,7 +594,7 @@ att.open = counting_open
 BYTES[0] = OPENS[0] = 0
 run(root)
 del att.open
-check("U14. an unchanged transcript costs zero reads (stat-keyed evidence + cached selection)", BYTES[0] == 0 and OPENS[0] == 0, [BYTES[0], OPENS[0]])
+check("U16. an unchanged transcript costs zero reads (stat-keyed evidence + cached selection)", BYTES[0] == 0 and OPENS[0] == 0, [BYTES[0], OPENS[0]])
 
 root, pdir, p = newroot()
 line = (json.dumps(tx.entry("tool_use", age=1000, tid="tbig", tool_input={"command": "x" * 350})) + "\n").encode()
@@ -578,7 +610,7 @@ t0 = time.perf_counter()
 g = run(root)
 dt = time.perf_counter() - t0
 del att.open
-check("U14b. a 50 MB transcript: correct state, %.0f ms, %d KiB read (<= 5 MiB, < 1 s)" % (dt * 1000, BYTES[0] // 1024),
+check("U16b. a 50 MB transcript: correct state, %.0f ms, %d KiB read (<= 5 MiB, < 1 s)" % (dt * 1000, BYTES[0] // 1024),
       os.path.getsize(p) > 50 * 1024 * 1024 and g["state"] == "needs_input" and g["summary"] == "Merge it?"
       and dt < 1.0 and BYTES[0] <= 5 * 1024 * 1024, [g, dt, BYTES[0]])
 
@@ -592,10 +624,10 @@ t0 = time.perf_counter()
 g = run(root)
 dt = time.perf_counter() - t0
 del att.open
-check("U14c. one 10 MiB final line: reads stay inside the 4 MiB window cap (+ head probe), result is the default shape",
+check("U16c. one 10 MiB final line: reads stay inside the 4 MiB window cap (+ head probe), result is the default shape",
       g == DEFAULT and dt < 1.0 and BYTES[0] <= 5 * 1024 * 1024, [g, dt, BYTES[0]])
 
-# U15 -- the wire shape, over everything collected above
+# U17 -- the wire shape, over everything collected above
 problems = []
 for g in SEEN:
     if sorted(g) != sorted(DEFAULT):
@@ -613,8 +645,8 @@ for g in SEEN:
         problems.append(("options", g))
     elif g["turn"] is not None and not isinstance(g["turn"], int):
         problems.append(("turn", g))
-check("U15. all %d collected results have exactly the 7 documented keys, enum values, and caps" % len(SEEN), not problems, problems[:2])
-check("U15b. the five documented states are all reachable (%s)" % ",".join(sorted({g["state"] for g in SEEN})),
+check("U17. all %d collected results have exactly the 7 documented keys, enum values, and caps" % len(SEEN), not problems, problems[:2])
+check("U17b. the five documented states are all reachable (%s)" % ",".join(sorted({g["state"] for g in SEEN})),
       {g["state"] for g in SEEN} == set(att.STATES))
 
 sys.exit(1 if FAILED[0] else 0)

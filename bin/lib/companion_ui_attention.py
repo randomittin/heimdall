@@ -431,9 +431,37 @@ def _paragraph_options(par):
     return None
 
 
+def _strip_markers(line):
+    """Strip leading markdown markers: list/heading/blockquote/bold/italic wrappers.
+    Strips repeatedly until none remain (e.g. '> - **A4**' -> 'A4').
+    Returns stripped line after whitespace trimming."""
+    line = line.strip()
+    while True:
+        old = line
+        # Strip blockquote marker
+        line = re.sub(r'^>\s*', '', line)
+        # Strip heading hashes (##+ or #)
+        line = re.sub(r'^#+\s*', '', line)
+        # Strip list markers: - * + • (require space after marker)
+        line = re.sub(r'^[-*+•]\s+', '', line)
+        # Strip numbered list markers: 1. 12) etc (1-99, require space after)
+        line = re.sub(r'^\d{1,2}[.)]\s+', '', line)
+        # Strip bold/italic wrappers at start and end
+        line = re.sub(r'^(\*\*|__)', '', line)
+        line = re.sub(r'(\*\*|__)$', '', line)
+        # If nothing changed, we're done
+        if line == old:
+            break
+        line = line.strip()
+    return line
+
+
 def _summarise(paragraph):
     line = " ".join(_CONTROL_RE.sub(" ", paragraph).split())
     if not line or secret_shaped(line):
+        return None
+    line = _strip_markers(line)
+    if not line:
         return None
     if len(line) > SUMMARY_MAX:
         line = _SENTENCE_SPLIT.split(line)[-1]
