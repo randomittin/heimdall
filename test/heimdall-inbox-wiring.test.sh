@@ -39,6 +39,13 @@ make_project() {
   printf '%s' "$d"
 }
 
+# The Stop hook ends its hold the moment the terminal it runs under is read (the
+# operator typing). Found through the hook's ancestors, that terminal is whatever
+# launched this suite -- an operator's shell, a claude session -- and a human
+# typing there mid-run would cut a wait a test is timing. Off everywhere except
+# test 12, which injects its own signal.
+export HMD_INBOX_TTY=off
+
 echo "1. bin/heimdall inbox status -- runs + exits 0 on a temp repo with empty inbox:"
 D="$(make_project)"
 : > "$D/.heimdall/ui/inbox.jsonl"
@@ -60,7 +67,15 @@ printf '%s' "$PROMPT_CMDS" | grep -q ' prompt --repo' && ok "UserPromptSubmit ho
 
 TIMEOUT_STOP="$(jq -r '.hooks.Stop[]?.hooks[]? | select(.command | contains("inbox-deliver-stop")) | .timeout // empty' "$HOOKS_JSON")"
 TIMEOUT_PROMPT="$(jq -r '.hooks.UserPromptSubmit[]?.hooks[]? | select(.command | contains("inbox-deliver-prompt")) | .timeout // empty' "$HOOKS_JSON")"
-[ "$TIMEOUT_STOP" = "1860" ] && ok "Stop hook timeout is 1860s (the 1800s companion-connected HMD_INBOX_WAIT_S default + the same 60s margin 240 -> 300 had)" || bad "Stop hook timeout wrong/missing: '$TIMEOUT_STOP'"
+[ "$TIMEOUT_STOP" = "330" ] && ok "Stop hook timeout is 330s (the 300s companion-connected HMD_INBOX_WAIT_S default + a 30s margin for the last 2s poll and process start)" || bad "Stop hook timeout wrong/missing: '$TIMEOUT_STOP'"
+# The two numbers drift apart silently -- the script's default is a constant in
+# bin/heimdall-inbox-deliver, the timeout a literal in hooks.json -- and a timeout
+# below the wait makes Claude Code kill the hook just before a late phone message
+# could be delivered. Tie them together instead of trusting two literals.
+DEFAULT_WAIT="$(sed -n 's/^COMPANION_WAIT_S = \([0-9][0-9.]*\).*/\1/p' "$REPO/bin/heimdall-inbox-deliver")"
+python3 -c 'import sys; wait, timeout = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if timeout - wait >= 20 else 1)' "${DEFAULT_WAIT:-x}" "${TIMEOUT_STOP:-0}" 2>/dev/null \
+  && ok "Stop hook timeout ($TIMEOUT_STOP) clears the script's companion wait default ($DEFAULT_WAIT) by >= 20s" \
+  || bad "Stop hook timeout '$TIMEOUT_STOP' does not clear bin/heimdall-inbox-deliver's COMPANION_WAIT_S '$DEFAULT_WAIT' by 20s -- Claude Code would kill a hold that is still delivering"
 [ "$TIMEOUT_PROMPT" = "10" ] && ok "UserPromptSubmit hook timeout is 10s" || bad "UserPromptSubmit hook timeout wrong/missing: '$TIMEOUT_PROMPT'"
 
 echo "3. hooks.metadata.json registers both ids, distinct, advisory (locked:false):"

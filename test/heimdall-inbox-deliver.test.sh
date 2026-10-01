@@ -381,7 +381,8 @@ rm -rf "$D"
 # turn boundary; the Stop long-poll only ran when the last assistant message
 # ended in '?', and only for 240s. With a companion connected
 # (.heimdall/app/connect.json) the session is reachable, so `stop` now
-# long-polls on ANY last message, for 1800s by default, and says so in a
+# long-polls on ANY last message, for 300s by default (1800 until the operator
+# cut it: a prompt typed at the laptop queues behind the hook), and says so in a
 # short-lived marker (.heimdall/ui/inbox-waiting) the hmd-ui server turns into
 # /api/state's inbox.consumer. Every dequeue also stamps delivered_at into the
 # archive, which is what /api/state's inbox.delivered[] reads.
@@ -414,7 +415,7 @@ printf '%s' "$OUT" | grep -F -- "$MARKER" >/dev/null && ok "still wrapped in the
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
 f_lt "$(secs "$T0" "$T1")" 15 && ok "delivered within the 2s poll window ($(secs "$T0" "$T1")s), not after a fixed sleep" || bad "took $(secs "$T0" "$T1")s"
 WAIT_DECLARED="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert isinstance(m["pid"], int); print(int(round(m["until"]-m["since"])))' "$SAMPLE" 2>/dev/null)"
-[ "$WAIT_DECLARED" = "1800" ] && ok "inbox-waiting (read mid-wait) names the long-poll pid and declares the 1800s companion default" || bad "marker wait is '$WAIT_DECLARED' (want 1800); marker: $(cat "$SAMPLE" 2>/dev/null)"
+[ "$WAIT_DECLARED" = "300" ] && ok "inbox-waiting (read mid-wait) names the long-poll pid and declares the 300s companion default" || bad "marker wait is '$WAIT_DECLARED' (want 300); marker: $(cat "$SAMPLE" 2>/dev/null)"
 [ "$(cat "$SAMPLE_MODE")" = "600" ] && ok "inbox-waiting is 0600" || bad "inbox-waiting mode is '$(cat "$SAMPLE_MODE")' (want 600)"
 [ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed once the long-poll exits" || bad "inbox-waiting left behind"
 [ "$(mode_of "$D/.heimdall/ui")" = "700" ] && ok "ui dir is 0700" || bad "ui dir mode is $(mode_of "$D/.heimdall/ui") (want 700)"
@@ -453,7 +454,7 @@ WAIT_DECLARED="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); pr
 [ "$WAIT_DECLARED" = "240" ] && ok "marker declares the unchanged 240s default when no companion is connected" || bad "marker wait is '$WAIT_DECLARED' (want 240); marker: $(cat "$SAMPLE" 2>/dev/null)"
 rm -rf "$D" "$SAMPLE"
 
-echo "20. A2: companion connected + explicit HMD_INBOX_WAIT_S=2 -> the operator's value wins over the 1800s default:"
+echo "20. A2: companion connected + explicit HMD_INBOX_WAIT_S=2 -> the operator's value wins over the 300s default:"
 D="$(make_project)"
 mark_companion "$D"
 : > "$(inbox_of "$D")"
@@ -463,7 +464,7 @@ RC=$?
 T1="$(now_s)"
 [ -z "$OUT" ] && ok "no stdout (nothing arrived)" || bad "unexpected stdout: $OUT"
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
-f_ge "$(secs "$T0" "$T1")" 1.8 && f_lt "$(secs "$T0" "$T1")" 7 && ok "waited the operator's 2s ($(secs "$T0" "$T1")s), not 0 and not 1800" || bad "waited $(secs "$T0" "$T1")s (want ~2)"
+f_ge "$(secs "$T0" "$T1")" 1.8 && f_lt "$(secs "$T0" "$T1")" 7 && ok "waited the operator's 2s ($(secs "$T0" "$T1")s), not 0 and not 300" || bad "waited $(secs "$T0" "$T1")s (want ~2)"
 [ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed after a timed-out wait" || bad "marker left behind"
 rm -rf "$D"
 
