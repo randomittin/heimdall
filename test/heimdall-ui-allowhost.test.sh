@@ -737,5 +737,73 @@ else
   bad "42. wedged heimdall-fallback: rc=$rc elapsed=${ELAPSED}s fallback=$(jq -c '.fallback' "$BODY" 2>/dev/null)"
 fi
 
+# ═══ Group K -- A5: the E2E relay's repo-relative profile is NOT reachable over HTTP ═══
+# test/heimdall-ui-relay-paths.test.sh proves the relay profile itself. bin/heimdall-relay-client
+# builds its OWN transport ({"bind":"relay",...}) in-process; THIS server's transport is built
+# from argv alone, so nothing a caller sends -- query, header, Host -- can select that profile,
+# and nothing can switch the public profile off. The probe is a string leaf holding an absolute
+# path BELOW the served repo (the checkpoint's open-warning text): the relay profile would keep
+# "src/app/x.ts", the public profile keeps only "x.ts". Overwrites the Group I checkpoint
+# fixture -- every assertion that read it has already run.
+cat > "$FIX/.planning/CHECKPOINT.md" <<MD
+<!-- heimdall-auto-checkpoint:begin -->
+## Auto-checkpoint — 2026-10-01T00:00:00Z
+
+- **Branch:** main
+- **HEAD:** a5a5a5a5
+- **Phase:** fixture-phase
+- **Uncommitted files:** 1
+- **Open warnings:** push gate blocked by $FIX_REAL/src/app/x.ts
+
+### What must never be lost (the resume contract)
+- **In progress:** none
+<!-- heimdall-auto-checkpoint:end -->
+MD
+
+KN=0
+# k_attempt LABEL HOST-HEADER QUERY-SUFFIX [extra curl args...] -- against the PUBLIC server.
+k_attempt() {
+  local label="$1" host="$2" qs="$3" f="$TMPROOT/state-k.json" code warn handle
+  shift 3
+  KN=$((KN + 1))
+  code="$(curl -s -o "$f" -w '%{http_code}' -H "Host: $host" "$@" "$BASE_H/api/state?$AUTH_H$qs")"
+  warn="$(jq -r '.checkpoint.push_gate_open_warning // empty' "$f" 2>/dev/null)"
+  handle="$(jq -r '.roster[0].handle // empty' "$f" 2>/dev/null)"
+  if [ "$code" = "200" ] && [ "$warn" = "push gate blocked by x.ts" ] && [ "$handle" = "[email]" ] \
+     && jq -e '.transport.bind == "loopback" and .transport.public_host == "demo.tail1234.ts.net"' "$f" >/dev/null 2>&1; then
+    ok "K$KN. $label -> public profile unchanged (basename 'x.ts', email scrubbed, transport still loopback + public_host)"
+  else
+    bad "K$KN. $label -> rc=$code warning='$warn' handle='$handle' transport=$(jq -c '.transport' "$f" 2>/dev/null) (a caller must not select the relay profile nor switch redaction off)"
+  fi
+}
+k_attempt "plain Funnel request" demo.tail1234.ts.net ""
+k_attempt "?transport=relay" demo.tail1234.ts.net "&transport=relay"
+k_attempt "?bind=relay&profile=relay&relay=1" demo.tail1234.ts.net "&bind=relay&profile=relay&relay=1"
+k_attempt "?redact=0&public=0" demo.tail1234.ts.net "&redact=0&public=0"
+k_attempt "X-Hmd-Transport / X-Heimdall-Transport / X-Transport: relay" demo.tail1234.ts.net "" \
+  -H "X-Hmd-Transport: relay" -H "X-Heimdall-Transport: relay" -H "X-Transport: relay"
+k_attempt "X-Forwarded-For: 127.0.0.1" demo.tail1234.ts.net "" -H "X-Forwarded-For: 127.0.0.1"
+k_attempt "Host: 127.0.0.1:<port> (a loopback origin presented to a public server)" "127.0.0.1:$PORT_H" ""
+
+SSE_K="$TMPROOT/sse-k.out"
+curl -s -N --max-time 2 -H "Host: demo.tail1234.ts.net" -H "X-Hmd-Transport: relay" \
+  "$BASE_H/api/events?$AUTH_H&transport=relay" -o "$SSE_K" 2>/dev/null
+SSE_K_WARN="$(grep '^data: ' "$SSE_K" 2>/dev/null | head -1 | sed 's/^data: //' | jq -r '.checkpoint.push_gate_open_warning // empty' 2>/dev/null)"
+if [ "$SSE_K_WARN" = "push gate blocked by x.ts" ]; then
+  ok "K$((KN + 1)). /api/events frame with the same opt-in attempts -> public profile unchanged ('x.ts')"
+else
+  bad "K$((KN + 1)). /api/events frame with opt-in attempts -> warning='$SSE_K_WARN', expected 'push gate blocked by x.ts'"
+fi
+
+BODY="$TMPROOT/state-k-loopback.json"
+rc="$(curl -s -o "$BODY" -w '%{http_code}' "$BASE_N/api/state?$AUTH_N")"
+if [ "$rc" = "200" ] \
+   && [ "$(jq -r '.checkpoint.push_gate_open_warning // empty' "$BODY" 2>/dev/null)" = "push gate blocked by $FIX_REAL/src/app/x.ts" ] \
+   && [ "$(jq -r '.roster[0].handle // empty' "$BODY" 2>/dev/null)" = "alice@example.com" ]; then
+  ok "K$((KN + 2)). loopback server (no --allow-host): the same fixture stays fully unredacted -- neither profile applies"
+else
+  bad "K$((KN + 2)). loopback server should be unredacted: rc=$rc warning=$(jq -r '.checkpoint.push_gate_open_warning' "$BODY" 2>/dev/null) handle=$(jq -r '.roster[0].handle' "$BODY" 2>/dev/null)"
+fi
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
