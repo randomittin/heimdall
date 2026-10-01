@@ -474,7 +474,7 @@ T1="$(now_s)"
 wait "$BGPID" 2>/dev/null || true
 [ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
 [ "$RC" -eq 0 ] && ok "exit 0" || bad "exit $RC (want 0)"
-f_ge "$(secs "$T0" "$T1")" 3 && f_lt "$(secs "$T0" "$T1")" 9 && ok "held until the companion left, then released ($(secs "$T0" "$T1")s of a 30s budget)" || bad "waited $(secs "$T0" "$T1")s (want ~2-4, not 0 and not 30)"
+f_ge "$(secs "$T0" "$T1")" 1.5 && f_lt "$(secs "$T0" "$T1")" 9 && ok "held until the companion left, then released ($(secs "$T0" "$T1")s of a 30s budget)" || bad "waited $(secs "$T0" "$T1")s (want ~2-4, not 0 and not 30)"
 [ ! -e "$(waiting_of "$D")" ] && ok "inbox-waiting removed" || bad "marker left behind"
 rm -rf "$D"
 

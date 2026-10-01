@@ -401,7 +401,7 @@ def pop_all(root):
         with open(path, "w", encoding="utf-8") as f:
             f.truncate(0)
         os.chmod(path, 0o600)
-    return records
+    return [dict(r, delivered_at=delivered_at) for r in records]
 
 
 # ── receipts, consumer, summary: the /api/state `inbox` slice ─────────────────
