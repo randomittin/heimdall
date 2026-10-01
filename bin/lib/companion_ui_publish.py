@@ -45,6 +45,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import companion_ui_panels as P  # noqa: E402
+import hmd_session_resolve as SESSION  # noqa: E402
 
 CHAT_ID, CHAT_TITLE = "chat", "Chat"
 QUESTION_ID, QUESTION_TITLE = "hmd-question", "hmd asks"
@@ -107,31 +108,19 @@ def _epoch(ts, fallback):
 
 
 # ── locating the session transcript ──────────────────────────────────────────
+# bin/lib/hmd_session_resolve.py is the ONE place that decides which session of THIS repo is read
+# (an inherited session id only when it names one of the repo's own transcripts, else the newest
+# interactive one) -- the rule the edits, parallelism, attention and session-code collectors share.
 def project_slug(path):
-    """Claude Code's project dir name: every non-alphanumeric char -> '-'
-    (bin/heimdall-agents _slug_for_cwd is the same rule)."""
-    return re.sub(r"[^A-Za-z0-9]", "-", path)
+    return SESSION.project_slug(path)
 
 
 def projects_dir():
-    """Same chain bin/heimdall-agents uses, plus CLAUDE_CONFIG_DIR."""
-    override = os.environ.get("HMD_AGENT_PROJECTS_DIR")
-    if override:
-        return override
-    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
-    if cfg:
-        return os.path.join(cfg, "projects")
-    return os.path.join(os.environ.get("HOME") or os.path.expanduser("~"), ".claude", "projects")
+    return SESSION.projects_dir()
 
 
 def slug_dirs(root):
-    base, seen, out = projects_dir(), set(), []
-    for r in (root, os.path.realpath(root)):
-        s = project_slug(r)
-        if s not in seen:
-            seen.add(s)
-            out.append(os.path.join(base, s))
-    return out
+    return list(SESSION.project_dirs(root))
 
 
 def source_paths(root):
@@ -493,23 +482,14 @@ class CompanionPublisher(object):
 
     # transcript selection
     def _candidates(self):
-        out = []
-        for d in slug_dirs(self.root):
-            try:
-                names = os.listdir(d)
-            except OSError:
-                continue
-            for n in names:
-                if not n.endswith(".jsonl"):
-                    continue
-                p = os.path.join(d, n)
-                try:
-                    st = os.stat(p)
-                except OSError:
-                    continue
-                if os.path.isfile(p):
-                    out.append((st.st_mtime_ns, st.st_size, p))
-        out.sort(reverse=True)
+        """(mtime_ns, size, path) of this repo's top-level transcripts: the session the shared
+        rule picks (hmd_session_resolve.resolve) FIRST, the rest newest-first behind it as
+        fallbacks for a pick that turns out unreadable or headless. ttl=0: re-scanned every tick,
+        a transcript created a moment ago is seen at once."""
+        out = SESSION.transcripts(self.root)
+        chosen = SESSION.resolve(self.root, ttl=0)
+        if chosen is not None:
+            out.sort(key=lambda c: c[2] != chosen.path)   # stable: the pick first, the rest keep their order
         return out
 
     def _refresh_derived(self, now):

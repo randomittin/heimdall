@@ -165,8 +165,8 @@ if [ ! -s "$PY_OUT" ]; then
   exit 1
 fi
 
-chk "R1 relay: edits.paths = repo-relative for in-repo files, basename for the out-of-repo one" \
-    '.relay.edits == ["src/app/x.ts","README.md","y.ts"]' "$PY_OUT"
+chk "R1 relay: edits.paths = repo-relative in-repo files only (the out-of-repo ledger entry is dropped, not shown as a basename)" \
+    '.relay.edits == ["src/app/x.ts","README.md"]' "$PY_OUT"
 chk "R1 relay: no edits.paths entry is absolute or climbs out ('/' or '..' prefix)" \
     '.relay.edits | all(.[]; (startswith("/") or startswith("..")) | not)' "$PY_OUT"
 chk "R1 relay: an in-repo absolute token in a string leaf -> its repo-relative part" \
