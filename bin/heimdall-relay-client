@@ -66,6 +66,23 @@ to drive its own UI; nothing else is ever written to stdout.
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
         logged, not even at this level)
+    {"event":"ack_sent","of_seq":N,"seq":S,"id":..|null,"attempt":K,"ms":N,
+     "ok":bool,"delivered":bool}
+        one line per POST ATTEMPT of the ack answering a command (so every
+        `command` line is followed by at least one): of_seq is the command's
+        device seq, seq this ack frame's own hmd-side seq (identical on every
+        attempt -- see ACK RETRY below), id the inbox record id the ack
+        carries (null when nothing was written), ms how long this attempt took,
+        ok whether the relay gave a usable answer (HTTP 200) and delivered the
+        relay's own flag for it (false too when the POST failed)
+    {"event":"connect","family":"ipv4"|"ipv6","ms":N,"dns_ms":N,"attempts":N,
+     "for":"pair"|"stream"|"frames"|"revoke"|"request"}
+        one line per NEW relay connection (every HTTP request opens its own):
+        which address family won, how long resolving plus connecting took
+        (dns_ms the resolving part of it), and how many addresses had to be
+        started to get there -- 1 is the normal case, 2+ means an earlier
+        address was too slow or failed and a later one was raced in. See
+        CONNECTING below
     {"event":"stream_drop","retry_ms":N[,"reason":..]}
                                                        GET stream disconnected;
                                                        reconnecting after N ms.
@@ -105,6 +122,42 @@ to drive its own UI; nothing else is ever written to stdout.
 Never printed, logged, or written to disk: `relay_session_token`, the derived
 session key, either private key, or any command/state plaintext.
 
+CONNECTING (HMD_RELAY_IP_FAMILY=auto|4|6, default auto; hmdapp's
+docs/HANDOFF-TO-HEIMDALL-relay-ipv6-stall.md): a connect to the relay over IPv6
+can black-hole on some networks (SYN dropped, connect() hangs ~10 s) while the
+resolver hands IPv6 back FIRST -- on the operator's Mac about one request in
+five stalled that way, which is how hmd->relay POSTs (state frames AND acks)
+missed the phone's 10 s ack window. Every connection -- /pair/init, GET
+/stream, POST /frames, /revoke -- is therefore opened by _create_connection,
+an RFC 8305 "Happy Eyeballs" connect: the addresses are ordered IPv4 first
+(families interleaved), the first is started at once, each next one
+HE_STAGGER_S (250 ms) after the previous -- or immediately when an attempt
+fails -- and the first to connect wins; the rest are abandoned. IPv4 first is
+a deliberate departure from RFC 8305's IPv6-first default: the relay is
+dual-stack Cloudflare, IPv4 to it is reliable, and never starting a flaky path
+is cheaper than racing it. TLS is untouched: http.client wraps the winning
+socket with server_hostname = the relay's NAME, so SNI and certificate
+verification never see the address. HMD_RELAY_IP_FAMILY=4 or 6 restricts the
+lookup to that family, with no fallback to the other; any other value is
+reported as an `error` event and treated as auto.
+
+ACK RETRY (HMD_RELAY_ACK_WINDOW_S, default 8): the phone gives a command 10 s
+to be acked, and an ack whose POST failed used to be lost for good. An ack POST
+that gets no usable answer (network error, timeout, non-200) is now re-POSTed --
+the SAME sealed envelope, same seq, nonce and ciphertext, never a re-seal: the
+app drops a frame whose seq it already accepted before it even decrypts, so a
+retry after a lost RESPONSE is a harmless duplicate, not a second ack. At most
+3 attempts in all, 0.25 s then 0.5 s apart, each bounded to 3 s (a state frame
+keeps the 15 s connect timeout). A RETRY starts only if it can start inside
+HMD_RELAY_ACK_WINDOW_S of the command's arrival -- the app's 10 s minus transit
+-- and is capped to what is left of it; the first attempt is always made, since
+a late ack beats none and the app accepts one. The retries run under the frame
+lock, so no later frame can overtake them (the app would drop an ack whose seq
+a newer frame has already passed). A relay that ANSWERED with delivered=false
+(no phone connected right now) gave an answer, not a failure: not retried, but
+visible in ack_sent. Backoff waits on stop_event, so a shutdown is never
+delayed by a retry.
+
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
 to import -- both mean the same thing: refuse to start a plaintext relay
@@ -133,9 +186,12 @@ a second notice, defeating the point).
 """
 
 import argparse
+import functools
 import http.client
+import itertools
 import json
 import os
+import queue
 import signal
 import socket
 import ssl
@@ -245,6 +301,36 @@ try:
     STREAM_ROTATE_S = float(os.environ.get("HMD_RELAY_STREAM_ROTATE_S", "540"))
 except (TypeError, ValueError):
     STREAM_ROTATE_S = 540.0
+
+# HMD_RELAY_IP_FAMILY (default auto): which address families _create_connection
+# may use -- auto (IPv4 first, IPv6 raced in as the fallback), or 4 / 6 (that
+# family only, no fallback). See CONNECTING in the module docstring. An
+# unrecognised value falls back to auto; main() reports it as an `error` event
+# once the event log exists (this runs at import, before it can).
+_IP_FAMILY_ENV = os.environ.get("HMD_RELAY_IP_FAMILY", "auto").strip().lower() or "auto"
+IP_FAMILY_VALID = _IP_FAMILY_ENV in ("auto", "4", "6")
+IP_FAMILY = _IP_FAMILY_ENV if IP_FAMILY_VALID else "auto"
+# RFC 8305 section 5, "Connection Attempt Delay" (250 ms recommended): how long
+# one address gets to connect before the next is started alongside it.
+HE_STAGGER_S = 0.25
+
+# Ack retry (see ACK RETRY in the module docstring). ACK_WINDOW_S is how long
+# after a command's arrival a RETRY of its ack may still START -- the phone
+# gives a command 10 s, minus transit. ACK_ATTEMPT_TIMEOUT_S bounds one ack POST
+# (connect + request + response; a state frame keeps CONNECT_TIMEOUT_S).
+# ACK_RETRY_DELAYS_S are the waits between attempts 1->2 and 2->3 -- 3 attempts
+# in all, the doc's "<=3 tries within ~8 s". ACK_MIN_ATTEMPT_S is the floor a
+# window-capped retry's timeout is never squeezed below: a retry given a few
+# milliseconds could only fail, and fail to no purpose.
+try:
+    ACK_WINDOW_S = float(os.environ.get("HMD_RELAY_ACK_WINDOW_S", "8"))
+except (TypeError, ValueError):
+    ACK_WINDOW_S = 8.0
+if not 0 <= ACK_WINDOW_S <= 3600:  # also catches nan
+    ACK_WINDOW_S = 8.0
+ACK_ATTEMPT_TIMEOUT_S = 3.0
+ACK_RETRY_DELAYS_S = (0.25, 0.5)
+ACK_MIN_ATTEMPT_S = 0.5
 
 # HMD_RELAY_EVENT_LOG (docs/HANDOFF-TO-HEIMDALL-relay-send-ack.md "New ask"):
 # durable append-only NDJSON mirror of every line emit() writes to stdout, so
@@ -386,12 +472,146 @@ def _split_relay(url):
     return parsed
 
 
-def _connect(parsed, timeout=CONNECT_TIMEOUT_S):
+_FAMILY_NAME = {socket.AF_INET: "ipv4", socket.AF_INET6: "ipv6"}
+
+
+def _ordered_addrinfo(host, port):
+    """Every address `host` resolves to, in the order to try them: IPv4 first,
+    then IPv6, families interleaved (v4, v6, v4, v6, ...) so a fallback address
+    of EITHER family is never more than one stagger away. getaddrinfo's own
+    order is deliberately not kept -- it hands IPv6 back first, which is exactly
+    the order that stalled (see CONNECTING in the module docstring).
+    HMD_RELAY_IP_FAMILY=4|6 narrows the lookup itself to one family."""
+    want = {"4": socket.AF_INET, "6": socket.AF_INET6}.get(IP_FAMILY, socket.AF_UNSPEC)
+    infos = socket.getaddrinfo(host, port, want, socket.SOCK_STREAM)
+    v4 = [i for i in infos if i[0] == socket.AF_INET]
+    v6 = [i for i in infos if i[0] == socket.AF_INET6]
+    return [i for pair in itertools.zip_longest(v4, v6) for i in pair if i is not None]
+
+
+def _create_connection(address, timeout, source_address=None, label="request"):
+    """socket.create_connection(), but RFC 8305 "Happy Eyeballs" instead of one
+    address after another -- see CONNECTING in the module docstring for why.
+
+    The first address (_ordered_addrinfo) is started at once and each next one
+    HE_STAGGER_S after the previous, or immediately when an attempt fails; every
+    attempt keeps running while later ones start, and the first to connect wins.
+    `timeout` is ONE budget for the whole race (None: none of ours -- the OS's
+    own connect limit still ends each attempt), not one per address, and
+    becomes the winner's I/O timeout. Attempts are blocking connects on daemon
+    threads, so a stalled one can never delay process exit; one that is still
+    connecting when the race is decided closes its own socket the moment it
+    finishes. On success emits a `connect` event; on failure raises ONE OSError
+    naming every address tried and why, so a caller's `except OSError` keeps
+    working exactly as it did for socket.create_connection."""
+    host, port = address
+    started = time.monotonic()
+    infos = _ordered_addrinfo(host, port)
+    resolved = time.monotonic()
+    if not infos:
+        raise OSError("no IPv4/IPv6 address found for %s:%s" % (host, port))
+    deadline = None if timeout is None else resolved + timeout
+
+    results = queue.Queue()
+    lock = threading.Lock()
+    settled = []  # non-empty once the race is decided; guarded by `lock`
+
+    def attempt(info, attempt_timeout):
+        family, socktype, proto, _canonname, sockaddr = info
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(attempt_timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+        except Exception as e:  # reported to the race below, never swallowed
+            if sock is not None:
+                sock.close()
+            outcome = (info, None, e)
+        else:
+            outcome = (info, sock, None)
+        with lock:
+            if settled and outcome[1] is not None:
+                outcome[1].close()  # decided while this one was still connecting
+                return
+            results.put(outcome)
+
+    errors = []    # (info, exception) for every attempt that failed
+    inflight = []  # infos started and not yet reported back
+    launched = 0
+    next_launch = resolved
+    winner = None
+    try:
+        while winner is None:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                break
+            if launched < len(infos) and (not inflight or now >= next_launch):
+                info = infos[launched]
+                launched += 1
+                try:
+                    threading.Thread(target=attempt, name="relay-connect", daemon=True,
+                                     args=(info, None if deadline is None else deadline - now)).start()
+                except RuntimeError as e:  # out of threads: this address failed to start
+                    errors.append((info, e))
+                else:
+                    inflight.append(info)
+                    next_launch = now + HE_STAGGER_S
+                continue
+            if not inflight:
+                break  # every address has failed
+            wait = None if launched >= len(infos) else max(next_launch - now, 0.0)
+            if deadline is not None:
+                wait = deadline - now if wait is None else min(wait, deadline - now)
+            try:
+                info, sock, err = results.get(timeout=wait)
+            except queue.Empty:
+                continue
+            inflight.remove(info)
+            if sock is not None:
+                winner = (info, sock)
+            else:
+                errors.append((info, err))
+                next_launch = time.monotonic()  # RFC 8305 s5: a failed attempt releases the next at once
+    finally:
+        with lock:
+            settled.append(True)
+            while True:
+                try:
+                    _info, late, _err = results.get_nowait()
+                except queue.Empty:
+                    break
+                if late is not None:
+                    late.close()
+
+    if winner is None:
+        errors.extend((info, "timed out waiting for the connect to complete") for info in inflight)
+        tried = "; ".join("%s %s: %s" % (_FAMILY_NAME.get(info[0], "?"), info[4][0], err)
+                          for info, err in errors)
+        raise OSError("could not connect to %s:%s -- %s" % (host, port, tried))
+    info, sock = winner
+    sock.settimeout(timeout)
+    emit({"event": "connect", "family": _FAMILY_NAME.get(info[0], "?"),
+          "ms": int(round((time.monotonic() - started) * 1000)),
+          "dns_ms": int(round((resolved - started) * 1000)),
+          "attempts": launched, "for": label})
+    return sock
+
+
+def _connect(parsed, timeout=CONNECT_TIMEOUT_S, label="request"):
     if parsed.scheme == "https":
-        ctx = ssl.create_default_context()
-        return http.client.HTTPSConnection(parsed.hostname, parsed.port or 443,
-                                            context=ctx, timeout=timeout)
-    return http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=timeout)
+        conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443,
+                                            context=ssl.create_default_context(), timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=timeout)
+    # http.client opens its socket through this per-instance attribute (CPython
+    # keeps socket.create_connection there "to allow unit tests to replace it"),
+    # and HTTPSConnection then wraps whatever socket results with
+    # server_hostname=conn.host -- the relay's NAME, never whichever address
+    # happened to win -- so SNI and certificate verification are untouched.
+    conn._create_connection = functools.partial(_create_connection, label=label)
+    return conn
 
 
 def _base_path(parsed):
@@ -480,8 +700,8 @@ class RelayClient:
             emit({"event": "error", "detail": "status write failed: %s" % e})
 
     # -- HTTP: one-shot requests --------------------------------------------
-    def _request(self, method, path, headers=None, body=None):
-        conn = _connect(self.parsed)
+    def _request(self, method, path, headers=None, body=None, timeout=CONNECT_TIMEOUT_S, label="request"):
+        conn = _connect(self.parsed, timeout=timeout, label=label)
         try:
             conn.request(method, _base_path(self.parsed) + path, body=body, headers=headers or {})
             resp = conn.getresponse()
@@ -492,7 +712,8 @@ class RelayClient:
 
     def pair_init(self):
         try:
-            status, raw = self._request("POST", "/pair/init", headers={"Content-Length": "0"}, body=b"")
+            status, raw = self._request("POST", "/pair/init", headers={"Content-Length": "0"}, body=b"",
+                                         label="pair")
         except (OSError, http.client.HTTPException) as e:
             emit({"event": "error", "detail": "pair/init unreachable: %s" % e})
             return 12
@@ -529,7 +750,7 @@ class RelayClient:
             h.update(extra)
         return h
 
-    def send_frame_envelope(self, type_, nonce, ciphertext, seq):
+    def send_frame_envelope(self, type_, nonce, ciphertext, seq, timeout=CONNECT_TIMEOUT_S):
         envelope = {
             "v": 1,
             "session_id": self.session_id,
@@ -548,7 +769,7 @@ class RelayClient:
         try:
             status, raw = self._request("POST", "/session/%s/frames" % self.session_id,
                                          headers=self._auth_headers({"Content-Type": "application/json"}),
-                                         body=body)
+                                         body=body, timeout=timeout, label="frames")
         except (OSError, http.client.HTTPException) as e:
             emit({"event": "error", "detail": "%s frame seq=%d post failed: %s" % (type_, seq, e)})
             return None, len(body)
@@ -566,18 +787,23 @@ class RelayClient:
             resp = {}
         return bool(resp.get("delivered")), len(body)
 
-    def send_hmd_frame(self, type_, plaintext_obj):
+    def send_hmd_frame(self, type_, plaintext_obj, ack_deadline=None):
         """Allocate the next shared hmd-side seq, seal, POST, update status --
         the ONE path both the state-tick loop (main thread) and the
         stream-reader thread use to send anything as sender 'hmd', so the seq
         counter (INV-14, strictly increasing per sender) is never raced
-        between the two."""
+        between the two. An `ack` frame is POSTed by _post_ack, which retries a
+        failed POST; `ack_deadline` (time.monotonic()) is the moment past which
+        none of those retries may START (default: ACK_WINDOW_S from now)."""
         plaintext = json.dumps(plaintext_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
         with self.lock:
             seq = self.hmd_seq
             self.hmd_seq += 1
             nonce, ciphertext = E2E.seal(self.session_key, seq, "hmd", plaintext)
-            delivered, nbytes = self.send_frame_envelope(type_, nonce, ciphertext, seq)
+            if type_ == "ack":
+                delivered, nbytes = self._post_ack(plaintext_obj, nonce, ciphertext, seq, ack_deadline)
+            else:
+                delivered, nbytes = self.send_frame_envelope(type_, nonce, ciphertext, seq)
             self.last_seq = seq
             if delivered is not None:
                 self.frames_sent += 1
@@ -587,25 +813,57 @@ class RelayClient:
             emit({"event": "state_sent", "seq": seq, "bytes": nbytes, "delivered": bool(delivered)})
         return seq, delivered
 
+    def _post_ack(self, ack, nonce, ciphertext, seq, deadline):
+        """POST one sealed ack frame, re-POSTing it if the POST FAILED (no usable
+        answer -- see ACK RETRY in the module docstring for every rule below),
+        and emit one `ack_sent` event per attempt. Always the SAME envelope:
+        the caller sealed it once, so every attempt carries the one seq the app
+        dedupes on. Called with self.lock held and keeps it across the retries
+        on purpose -- a state frame sent in between would carry a higher seq,
+        and the app drops any frame whose seq a newer one has already passed."""
+        if deadline is None:
+            deadline = time.monotonic() + ACK_WINDOW_S
+        attempts = len(ACK_RETRY_DELAYS_S) + 1
+        for attempt in range(1, attempts + 1):
+            began = time.monotonic()
+            # attempt 1 is always made, with the full per-attempt timeout (a
+            # late ack beats none); a retry's timeout is capped to the window
+            # that is left
+            timeout = ACK_ATTEMPT_TIMEOUT_S if attempt == 1 else \
+                min(ACK_ATTEMPT_TIMEOUT_S, max(deadline - began, ACK_MIN_ATTEMPT_S))
+            delivered, nbytes = self.send_frame_envelope("ack", nonce, ciphertext, seq, timeout=timeout)
+            emit({"event": "ack_sent", "of_seq": ack.get("of_seq"), "seq": seq, "id": ack.get("id"),
+                  "attempt": attempt, "ms": int(round((time.monotonic() - began) * 1000)),
+                  "ok": delivered is not None, "delivered": bool(delivered)})
+            if delivered is not None or attempt == attempts:
+                break
+            delay = ACK_RETRY_DELAYS_S[attempt - 1]
+            if time.monotonic() + delay >= deadline or self.stop_event.wait(delay):
+                break  # no room left in the window, or the client is stopping
+        return delivered, nbytes
+
     def revoke(self):
         if not self.session_id or not self.token:
             return
         try:
             self._request("POST", "/session/%s/revoke" % self.session_id,
-                           headers=self._auth_headers({"Content-Length": "0"}), body=b"")
+                           headers=self._auth_headers({"Content-Length": "0"}), body=b"", label="revoke")
         except (OSError, http.client.HTTPException) as e:
             # best-effort shutdown courtesy call -- surfaced, never blocks process exit
             emit({"event": "error", "detail": "revoke call failed: %s" % e})
 
     # -- stream --------------------------------------------------------------
     def _open_stream(self):
-        conn = _connect(self.parsed, timeout=STREAM_TIMEOUT_S)
+        conn = _connect(self.parsed, timeout=STREAM_TIMEOUT_S, label="stream")
         conn.request("GET", _base_path(self.parsed) + "/session/%s/stream" % self.session_id,
                       headers=self._auth_headers())
         resp = conn.getresponse()
         return conn, resp
 
     def _handle_command(self, env):
+        # The phone's ack window opened before this command reached us; retries
+        # of its ack may only START inside what is left of it (ACK_WINDOW_S).
+        ack_deadline = time.monotonic() + ACK_WINDOW_S
         seq = env.get("seq")
         if not isinstance(seq, int) or seq <= self.last_device_seq:
             emit({"event": "error", "detail": "non-increasing seq from device (got %r, last %r) -- rejected"
@@ -622,7 +880,8 @@ class RelayClient:
             # seq. Only a frame that actually decrypts moves the high-water
             # mark (below, on the success path).
             emit({"event": "command", "action": None, "ok": False, "detail": "decrypt-failed"})
-            self.send_hmd_frame("ack", {"ok": False, "detail": "decrypt-failed", "of_seq": seq})
+            self.send_hmd_frame("ack", {"ok": False, "detail": "decrypt-failed", "of_seq": seq},
+                                ack_deadline=ack_deadline)
             return
         self.last_device_seq = seq
         self.last_command_at = time.time()
@@ -652,7 +911,7 @@ class RelayClient:
         if detail is not None:
             ack_payload["detail"] = detail
         ack_payload.update(extra)
-        self.send_hmd_frame("ack", ack_payload)
+        self.send_hmd_frame("ack", ack_payload, ack_deadline=ack_deadline)
 
     def _handle_envelope(self, env):
         sender = env.get("sender")
@@ -892,6 +1151,10 @@ def main(argv=None):
     # pure computation done early for a pre-flight need, same pattern) so
     # even the e2e-unavailable/UI-import error events are captured.
     configure_event_log(os.path.realpath(os.path.expanduser(args.repo)))
+
+    if not IP_FAMILY_VALID:
+        emit({"event": "error",
+              "detail": "HMD_RELAY_IP_FAMILY=%r is not one of auto|4|6 -- using auto" % _IP_FAMILY_ENV})
 
     if UI is None:
         emit({"event": "error",
