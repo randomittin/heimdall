@@ -458,6 +458,30 @@ sv = served(root, T0 + 20)
 check("10h. a secret-shaped question is dropped for that turn; the chat line is still published, redacted",
       "hmd-question" not in sv and sv["chat"]["data"]["lines"][-1].endswith("hmd [redacted]"), str(list(sv)))
 
+# 10i/10j -- a reply that ends in SEVERAL open questions (the operator's real shape: the phone offered Yes/No for
+# it). The panel never carries options -- markdown, data keys exactly [text] -- and never gets a Yes/No written
+# into its text: the phone derives its buttons from this very text, and hmd's own answer to "which options?"
+# is attention.options (companion_ui_attention.py), never this panel.
+THREE_Q = ("Stop-hook hold: keep 30 min, shorten, or hold only when away? "
+           "Paths: show ../hmdapp — yes or no? A4: go or hold?")
+root, d = new_repo()
+write_transcript(d, "s", [u_human("go", T0), a_text(THREE_Q, T0 + 5, "m1")])
+CP.CompanionPublisher(root).tick(now=T0 + 20)
+q = served(root, T0 + 20).get("hmd-question")
+check("10i. a reply ending in several open questions publishes hmd-question verbatim and with no options "
+      "(markdown, data keys exactly [text], nothing synthesised into the text)",
+      q is not None and q["type"] == "markdown" and list(q["data"].keys()) == ["text"]
+      and q["data"]["text"] == THREE_Q, str(q))
+
+root, d = new_repo()
+write_transcript(d, "s", [u_human("go", T0), a_text(THREE_Q[:-1] + ". Reply when you can.", T0 + 5, "m1")])
+CP.CompanionPublisher(root).tick(now=T0 + 20)
+sv = served(root, T0 + 20)
+check("10j. the same questions closed by a statement (the reply no longer ends in `?`) -> no hmd-question panel, "
+      "the chat line is still published",
+      "hmd-question" not in sv and not os.path.exists(QPATH(root))
+      and sv["chat"]["data"]["lines"][-1].endswith("Reply when you can."), str(list(sv)))
+
 # ── 11. agents: a projection of `heimdall-agents list --json` into the app's table ─────
 class Lister(object):
     def __init__(self, result):

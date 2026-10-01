@@ -291,9 +291,82 @@ g, root, p = case([tx.entry("end", age=10, text="Which stack?\n\nA) native only\
 check("U5b. options in the closing paragraph lose the question's trailing '?'",
       g["options"] == [{"key": "A", "label": "native only"}, {"key": "B", "label": "native + web"}]
       and g["summary"] == "Which stack?", g)
-g, root, p = case([tx.entry("end", age=10, text="Should I proceed with the migration?")])
-check("U5c. a bare question has a summary and options null (the app keeps its own regex fallback)",
-      g["state"] == "needs_input" and g["summary"] == "Should I proceed with the migration?" and g["options"] is None, g)
+g, root, p = case([tx.entry("end", age=10, text="What should I name the new module?")])
+check("U5c. a bare OPEN question has a summary and options null (nothing enumerated, not yes/no: the phone shows a free-text answer)",
+      g["state"] == "needs_input" and g["summary"] == "What should I name the new module?" and g["options"] is None, g)
+
+# U5d -- Yes/No is attached ONLY to a question that really is yes/no: exactly ONE question, and it is a closed
+# polar one (starts with an auxiliary/modal, optionally after a short lead-in; not "A or B?"; no which/what/how/
+# why/when/where/who). Everything else carries NO options, so the phone shows a free-text answer instead of two
+# buttons that cannot answer it -- an hmd reply that ended in THREE open questions was offered Yes/No.
+YES_NO = [{"key": "yes", "label": "Yes"}, {"key": "no", "label": "No"}]
+OPERATOR_THREE = ("Stop-hook hold: keep 30 min, shorten, or hold only when away? "
+                  "Paths: show ../hmdapp — yes or no? A4: go or hold?")
+POLAR = (
+    ("a single closed polar question", "Should I proceed with the migration?"),
+    ("... after a statement paragraph", "Tests are green on both targets and the tree is clean.\n\nShall I push to origin?"),
+    ("... after a long statement sentence",
+     "The migration touched fourteen tables and three views and I verified every row count twice. Should I push?"),
+    ("... after a short lead-in (em dash)", "Quick check — can I delete the stale worktrees?"),
+    ("... after a short lead-in (colon)", "Heads up: the gate was red earlier. Is it fine to ship anyway?"),
+    ("... in bold", "**Is the schema change safe to ship?**"),
+    ("... with an explicit yes/no tag (not an 'A or B')", "Have you already rotated the key, yes or no?"),
+    ("... in a negative contraction", "Doesn't the relay client already retry?"),
+    ("... with a `?` inside an inline code span", "I patched the matcher.\n\nShould I run `grep -r 'a?b' src` as well?"),
+    ("... with a `?` inside a URL", "Run: https://example.test/run?id=7\n\nDo you want me to merge it?"),
+    ("... with a `?` inside a fenced block", "```\nwhy?\n```\n\nCan I apply the patch?"),
+    ("... with a `?` glued inside a token", "Should I rename foo?bar.txt now?"),
+)
+for label, text in POLAR:
+    g, root, p = case([tx.entry("end", age=10, text=text)])
+    check("U5d. %s -> options are exactly Yes/No" % label,
+          g["state"] == "needs_input" and g["kind"] == "question" and g["options"] == YES_NO, [text, g])
+
+OPEN = (
+    ("THREE open questions (the operator's real reply shape)", OPERATOR_THREE),
+    ("the same three questions, one per line", OPERATOR_THREE.replace("? ", "?\n")),
+    ("the same three questions, one per paragraph", OPERATOR_THREE.replace("? ", "?\n\n")),
+    ("two polar questions", "Is the tree clean? Should I push?"),
+    ("an open question before a polar one", "Which branch is this? Should I push it?"),
+    ("an 'A or B?' question", "Should I keep the old schema or migrate now?"),
+    ("a bare 'A or B?'", "Keep or drop?"),
+    ("an aux-led question that is really 'which'", "Can you tell me which file you meant?"),
+    ("a which question", "Which file should I edit?"),
+    ("a what question", "What should I name it?"),
+    ("a how question", "How do you want to handle the rollback?"),
+    ("a why question", "Why did the gate go red?"),
+    ("a when question", "When should I merge?"),
+    ("a where question", "Where should the config live?"),
+    ("a who question", "Who owns the relay client?"),
+    ("a closed question that does not start with an auxiliary", "Want me to push?"),
+    ("a one-word closed question", "Ship it?"),
+    ("an imperative tagged 'yes or no' (not an aux-led question)", "Paths: show ../hmdapp — yes or no?"),
+    ("a long run-on lead-in is not a short lead-in",
+     "The migration touched fourteen tables and three views and I verified every row count twice, so should I push?"),
+)
+for label, text in OPEN:
+    g, root, p = case([tx.entry("end", age=10, text=text)])
+    check("U5e. %s -> state needs_input, options null (free-text answer)" % label,
+          g["state"] == "needs_input" and g["kind"] == "question" and g["options"] is None, [text, g])
+
+g, root, p = case([tx.entry("end", age=10, text="Pick one:\n\nA) alpha\nB) beta\n\nShould I go with A?")])
+check("U5f. enumerated options keep their parsed options even when the closing line is itself a polar question",
+      g["options"] == [{"key": "A", "label": "alpha"}, {"key": "B", "label": "beta"}], g)
+g, root, p = case([tx.entry("end", age=10, text="Should I merge?\n\n1. Squash\n2. Rebase")])
+check("U5g. a numbered list keeps its parsed options, never Yes/No",
+      g["options"] == [{"key": "1", "label": "Squash"}, {"key": "2", "label": "Rebase"}], g)
+g, root, p = case([tx.entry("end", age=10, text="Pick:\n\nA) alpha\nA) again\n\nShould I go?")])
+check("U5h. an enumeration that cannot be represented (duplicate keys) -> options null, NOT a Yes/No stand-in",
+      g["options"] is None, g)
+
+settled_three = [tx.entry("prompt", age=300), tx.entry("end", age=200, text=OPERATOR_THREE.rstrip("?") + ". Tell me."),
+                 tx.entry("turn", age=199.9)]
+g, root, p = case(settled_three)
+check("U5i. the same three questions closed by a statement (text no longer ends in '?') -> idle/stopped, no summary, no options",
+      g["state"] == "idle" and g["kind"] == "stopped" and g["summary"] is None and g["options"] is None, g)
+g, root, p = case([tx.entry("end", age=10, text="Should I push (yes/no)")])
+check("U5j. a polar question with no closing '?' is not a question at all: not needs_input, no options",
+      g["state"] != "needs_input" and g["options"] is None, g)
 
 # U6 -- idle: stopped / done
 settled = [tx.entry("prompt", age=300), *tx.pair(age=250), tx.entry("end", age=200, text="All done."),
@@ -383,6 +456,9 @@ check("U11. a secret-shaped question -> summary null, state still needs_input/qu
 g, root, p = case([tx.entry("end", age=5, text="Pick a credential:\n\nA) %s\nB) none\n\nWhich one?" % secret)])
 check("U11b. a secret-shaped option label -> options null, the clean summary survives",
       g["options"] is None and g["summary"] == "Which one?", g)
+g, root, p = case([tx.entry("end", age=5, text="Is %s the right token to use?" % secret)])
+check("U11c. a secret-shaped polar question gets NO Yes/No either (hmd-question is dropped for it, so the phone could not even show what Yes/No answers)",
+      g["state"] == "needs_input" and g["options"] is None, g)
 
 # U12 -- caps
 long_q = ("This is a fairly long preamble sentence that keeps going and going. " * 6) \
@@ -653,8 +729,8 @@ txa end --text "Shall I ship it now?"; poke
 att_is "L5a. stop-with-question -> {needs_input, question}" needs_input '"question"'
 exactly_frames "L5b. SSE: exactly one new frame for working -> needs_input" 3
 curl -s -o "$BODY" "$STATE_URL"
-if jq -e '.attention.summary == "Shall I ship it now?" and .attention.options == null and (.attention.id != null) and (.attention.since | type) == "number"' "$BODY" >/dev/null 2>&1; then
-  ok "L5c. needs_input carries the question as its summary, options null, a fresh id and a numeric since"
+if jq -e '.attention.summary == "Shall I ship it now?" and .attention.options == [{"key":"yes","label":"Yes"},{"key":"no","label":"No"}] and (.attention.id != null) and (.attention.since | type) == "number"' "$BODY" >/dev/null 2>&1; then
+  ok "L5c. needs_input carries the question as its summary, Yes/No for a single closed polar question, a fresh id and a numeric since"
 else
   bad "L5c. needs_input payload wrong: $(jq -c .attention "$BODY")"
 fi
