@@ -766,17 +766,19 @@ def _scrub_public_string(value, root=None):
     `$HOME`-adjacent username, or a private filesystem layout to anyone Tailscale
     Funnel's --allow-host exposes this server to. Non-strings (bool/int/float/
     None) pass through untouched. A leaf transform only -- see `_redact_public`
-    for the recursive walk that reaches every leaf in the first place."""
+    for the recursive walk that reaches every leaf in the first place. `root` is
+    set only for the E2E relay profile (see `_transport_redaction`): a path token
+    below it keeps its repo-relative part instead of collapsing to a basename."""
     if not isinstance(value, str):
         return value
     if _EMAIL_RE.search(value):
         value = _EMAIL_RE.sub("[email]", value)
     if _ABS_PATH_TOKEN_RE.search(value):
-        value = _ABS_PATH_TOKEN_RE.sub(lambda m: _redact_public_token(m.group(0)), value)
+        value = _ABS_PATH_TOKEN_RE.sub(lambda m: _redact_public_token(m.group(0), root), value)
     return value
 
 
-def _redact_public(obj):
+def _redact_public(obj, root=None):
     """N4: the single recursive walk applied to the WHOLE /api/state body in
     public mode -- replacing the old 4-key allowlist (repo/edits.paths/roster/
     ledger.team), which left panels, checkpoint, sweep_receipt, identity.handle
@@ -786,16 +788,18 @@ def _redact_public(obj):
     bools, None) come back exactly as-is -- never scrubbed, never recursed into
     as if they were containers. Rebuilds dicts/lists rather than mutating them in
     place, so a structure another part of the process still holds a reference to
-    (e.g. a cached panel dict) is never mutated behind its back."""
+    (e.g. a cached panel dict) is never mutated behind its back. `root` selects the
+    E2E relay profile and is threaded unchanged to every leaf."""
     if isinstance(obj, dict):
-        return {k: _redact_public(v) for k, v in obj.items()}
+        return {k: _redact_public(v, root) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_redact_public(v) for v in obj]
-    return _scrub_public_string(obj)
+        return [_redact_public(v, root) for v in obj]
+    return _scrub_public_string(obj, root)
 
 
-def _redact_state_for_public(state):
-    """A9/N4: called only when transport.public_host is set. Walks EVERY slice of
+def _redact_state_for_public(state, root=None):
+    """A9/N4: called only when `_transport_redaction` says the state leaves this
+    machine (transport.public_host set, or the E2E relay). Walks EVERY slice of
     `state` -- repo, edits, roster, ledger, panels, checkpoint, sweep_receipt,
     identity, hooks, fallback, parallelism, quality_gate, reels, inbox, transport
     itself, and whatever the section-4 contract carries next -- so a newly added
@@ -803,7 +807,32 @@ def _redact_state_for_public(state):
     name. Loopback (no --allow-host) never calls this, so its output stays
     byte-for-byte what it was before A9/N4."""
     for key, value in list(state.items()):
-        state[key] = _redact_public(value)
+        state[key] = _redact_public(value, root)
+
+
+def _transport_redaction(transport, root):
+    """(redact, strip_root): how state must be scrubbed before it leaves this process,
+    chosen from the TRANSPORT that carries it and from nothing a request can say -- the
+    HTTP server's transport is built from argv alone (see main()) and the relay client
+    builds its own in-process (bin/heimdall-relay-client), so no query, header or Host
+    value ever reaches this decision.
+      loopback (no public_host)  -> (False, None): the owner's own machine, as ever.
+      HTTP behind --allow-host   -> (True, None):  the PUBLIC profile -- anyone who can
+                                    reach the hostname may read it, so every absolute
+                                    path token becomes its basename.
+      bind "relay"               -> (True, root):  the E2E RELAY profile -- the leg is
+                                    sealed and only the paired phone can open it, so a
+                                    path below the repo keeps its repo-relative part
+                                    ("src/app/x.ts"); the root itself, anything outside
+                                    it and ~/ tokens still reduce to basenames, and
+                                    emails are still scrubbed. Never gated on
+                                    public_host: state that leaves the machine is
+                                    redacted whether or not a friendly name was given."""
+    if not transport:
+        return False, None
+    if transport.get("bind") == "relay":
+        return True, root
+    return bool(transport.get("public_host")), None
 
 
 def collect_state(root, transport=None):
@@ -847,8 +876,9 @@ def collect_state(root, transport=None):
     }
     if transport is not None:
         state["transport"] = transport
-        if transport.get("public_host"):
-            _redact_state_for_public(state)
+        redact, strip_root = _transport_redaction(transport, root)
+        if redact:
+            _redact_state_for_public(state, strip_root)
     return state
 
 
@@ -917,8 +947,9 @@ class StateCache:
                     # collect_state()), so it bypasses collect_state()'s own A9/N4
                     # redaction gate -- re-apply it so a public-mode server can never
                     # emit one unredacted panel per live-users publish tick.
-                    if self.transport and self.transport.get("public_host"):
-                        panels = _redact_public(panels)
+                    redact, strip_root = _transport_redaction(self.transport, self.root)
+                    if redact:
+                        panels = _redact_public(panels, strip_root)
                     state["panels"] = panels
                 except Exception:
                     state["panels"] = []
