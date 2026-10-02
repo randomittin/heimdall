@@ -13,8 +13,10 @@ Routes (all GET):
     /api/state        the section-4 JSON contract, served from the SAME background-
                       polled StateCache snapshot /api/events reads (perf: a GET is a
                       dict->JSON serialize, not a fresh collect -- the cache recomputes
-                      itself at least every POLL_INTERVAL_S, or synchronously on demand
-                      if empty/stale; see StateCache.latest()). `?digest=<sha>` (or an
+                      itself the moment a watched source moves (WATCH_SOURCES, polled every
+                      WATCH_INTERVAL_S) and in any case every POLL_INTERVAL_S, or
+                      synchronously on demand if empty/stale; see StateCache.latest()).
+                      `?digest=<sha>` (or an
                       `If-None-Match: "<sha>"` header) matching the current digest gets
                       a bodyless 304 with `ETag: "<sha>"`; otherwise 200 with that same
                       ETag -- the identical digest_of() value an /api/events frame's
@@ -36,8 +38,9 @@ Routes (all GET):
                       repo's session (bin/lib/hmd_session_resolve.py), out-of-repo entries
                       dropped -- never absolute, never `../x`
     /api/events       text/event-stream; a `data:` frame only when the digest changes
-                      (the digest covers `panels`, so a `hmd ui panel set` lands within
-                      one poll)
+                      (the digest covers `panels`, so a `hmd ui panel set` lands as soon
+                      as the poller sees the panels dir move -- WATCH_INTERVAL_S plus one
+                      cheap collect -- not at the next POLL_INTERVAL_S)
 
 Auth, in this order, on EVERY route:
     0. Host header must be 127.0.0.1:<port>, localhost:<port>, or one of --allow-host's
@@ -1091,15 +1094,63 @@ def digest_of(state):
     return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
 
+# ── change detection: a stat per watched source ──────────────────────────────
+def _stamp(path):
+    """(mtime_ns, size, inode) of `path`, None when it does not exist. A stat, never a read."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+class WatchedSources:
+    """What StateCache.run polls between backstops: signature() is a tuple of stamps -- WATCH_SOURCES,
+    the repo's Claude project dirs, and its current session transcript -- that differs from the
+    previous call's exactly when one of them moved. About ten stat calls; poller thread only."""
+
+    def __init__(self, root):
+        self.root = root
+        self._paths = [os.path.join(root, *rel.split("/")) for rel in WATCH_SOURCES]
+        self._project_stamps = None
+
+    def _transcript(self):
+        """((project dir stamps), (transcript path, stamp)): the session transcript every session-keyed
+        collector reads (hmd_session_resolve.resolve -- the one rule). A transcript that appears or
+        vanishes moves a project dir's stamp; that is the one case the cached 2 s selection must be
+        re-made for, so a session that started a moment ago is picked up at once. Never raises."""
+        if SESSIONS is None:
+            return ()
+        try:
+            projects = tuple(_stamp(d) for d in SESSIONS.project_dirs(self.root))
+            ttl = 0 if projects != self._project_stamps else SESSIONS.DIR_SCAN_TTL_S
+            self._project_stamps = projects
+            session = SESSIONS.resolve(self.root, denied=path_is_denied, ttl=ttl)
+            return projects, ((session.path, _stamp(session.path)) if session else None)
+        except Exception:
+            return ()
+
+    def signature(self):
+        return tuple(_stamp(p) for p in self._paths), self._transcript()
+
+
 # ── one poller, many consumers ───────────────────────────────────────────────
 class StateCache:
-    """A single background thread re-reads the sources every POLL_INTERVAL_S and
-    publishes (state, digest). SSE clients wait on the condition for a digest change,
-    so N open tabs cost one collection per tick, not N. UIHandler._route's /api/state
-    branch shares this SAME object (state, digest, lock) via refresh() -- perf comes
-    from the lower-level subprocess/file caches making each refresh() cheap, not from
-    skipping it; a GET can also be what wakes an idle SSE stream, since refresh()
-    notifies the same condition variable wait_for_change() blocks on."""
+    """A single background thread keeps (state, digest) current and publishes it. SSE clients and
+    the relay client wait on the condition for a digest change, so N consumers cost one
+    collection per change, not N -- and a change is signalled the moment refresh() sees the
+    digest move.
+
+    The thread re-collects when a watched source moves (WatchedSources: a stat each every
+    WATCH_INTERVAL_S; the pass is "partial" -- every file re-read, the last subprocess answers
+    reused -- and starts at most every REFRESH_MIN_GAP_S), and in any case every
+    POLL_INTERVAL_S: the "full" backstop, which is what refreshes the subprocess-derived fields,
+    the time-derived ones (a panel going stale) and any source nobody watches.
+
+    UIHandler._route's /api/state branch shares this SAME object (state, digest, lock) via
+    refresh() -- perf comes from the lower-level subprocess/file caches making each refresh()
+    cheap, not from skipping it; a GET can also be what wakes an idle SSE stream, since
+    refresh() notifies the same condition variable wait_for_change() blocks on."""
 
     def __init__(self, root, transport=None):
         self.root = root
@@ -1113,7 +1164,18 @@ class StateCache:
         self._live_users = None   # (value, written_at) of the self-published panel
         self._companion = new_companion_publisher(root)   # A3: chat / hmd-question / agents
 
-    def refresh(self, publish=False):
+    def refresh(self, publish=False, partial=False):
+        """Collect, publish (state, digest), and wake wait_for_change() waiters if the digest moved.
+        `partial` is the poller's change-triggered pass: the subprocess-backed collectors serve their
+        last answer however old (see _subprocess_reuse). Every other caller -- a GET, the backstop --
+        re-spawns once the subprocess TTL ran out, exactly as before."""
+        _subprocess_reuse.any_age = partial
+        try:
+            return self._refresh(publish)
+        finally:
+            _subprocess_reuse.any_age = False
+
+    def _refresh(self, publish):
         state = collect_state(self.root, self.transport)
         if publish:
             # Poll-tick only (never on a GET): publish hmd's own live-users tile from
@@ -1163,6 +1225,13 @@ class StateCache:
                     return self._state, self._digest
             return self.refresh()
 
+    def current(self):
+        """(state, digest) as last published, whatever its age: no freshness check, never a
+        collection -- for a consumer that was just woken by wait_for_change() and must not pay
+        for (or race) a synchronous refresh. (None, None) before the first refresh finished."""
+        with self._cond:
+            return self._state, self._digest
+
     def invalidate(self):
         """Force the next latest() to recompute rather than serve a cached snapshot --
         for a write THIS process just made (POST /api/send) that latest()'s own
@@ -1180,10 +1249,40 @@ class StateCache:
             return self._state, self._digest
 
     def run(self):
-        while not self._stop.is_set():
-            with self._refresh_lock:
-                self.refresh(publish=True)
-            self._stop.wait(POLL_INTERVAL_S)
+        watch = WatchedSources(self.root)
+        kind, backstop_at = "full", 0.0
+        while kind is not None:
+            began = time.monotonic()
+            # The signature is taken BEFORE collecting: a source that moves while this pass runs
+            # differs from it afterwards and triggers the next pass, so no write is ever missed.
+            seen = watch.signature()
+            try:
+                with self._refresh_lock:
+                    self.refresh(publish=True, partial=(kind == "changed"))
+            except Exception as e:
+                # one bad pass (a collector bug, a full disk under write_panel) must not end the poller
+                sys.stderr.write("hmd-ui: refresh failed: %s\n" % e.__class__.__name__)
+            if kind == "full":
+                backstop_at = time.monotonic() + POLL_INTERVAL_S
+            kind = self._next_refresh(watch, seen, backstop_at, began + REFRESH_MIN_GAP_S)
+
+    def _next_refresh(self, watch, seen, backstop_at, not_before):
+        """Sleep until the next pass is due and say which: "full" when the backstop ran out, "changed"
+        when a watched source moved since `seen` (never before `not_before`, which bounds the CPU a
+        write storm can cost), None when stopping. Sleeps WATCH_INTERVAL_S at a time, one
+        watch.signature() between sleeps."""
+        moved = False
+        while True:
+            now = time.monotonic()
+            if now >= backstop_at:
+                return "full"
+            if moved and now >= not_before:
+                return "changed"
+            wake = min(backstop_at, not_before if moved else now + WATCH_INTERVAL_S)
+            if self._stop.wait(max(0.0, wake - now)):
+                return None
+            if not moved and watch.signature() != seen:
+                moved = True
 
     def start(self):
         t = threading.Thread(target=self.run, name="hmd-ui-poller", daemon=True)

@@ -1116,25 +1116,59 @@ class RelayClient:
                 return
             backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
 
-    # -- state tick loop (main thread) ---------------------------------------
+    # -- state loop (main thread) --------------------------------------------
+    # Send-on-change (docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md Ask 1): the loop blocks on
+    # StateCache.wait_for_change, which the cache's poller wakes the moment the digest moves, instead
+    # of sleeping --tick-s between looks -- so the frame follows the change, not a second 2 s timer.
+    STATE_DEBOUNCE_S = 0.05      # coalesce a burst: send once the digest has been still this long ...
+    STATE_DEBOUNCE_MAX_S = 0.25  # ... but never hold a burst's first change longer than this
+    STATE_WAIT_SLICE_S = 0.25    # longest single block on the cache: a stop_event.set() or a
+                                 # last_sent_digest = None re-bind (both on the stream thread) cannot wake it
+
     def _tick_once(self):
-        state, digest = self.cache.latest()
+        state, digest = self.cache.current()
         if digest == self.last_sent_digest:
             return
         self.last_sent_digest = digest
         self.send_hmd_frame("state", {"state": state})
 
+    def _await_new_state(self):
+        """Block until the cache holds a digest this client has not sent, then let a burst settle.
+        True when there is something to send: the digest stayed put for STATE_DEBOUNCE_S, or kept
+        moving until STATE_DEBOUNCE_MAX_S ran out. False when a wait slice passed with nothing new
+        (or on stop) -- the caller loops, which is how stop_event and a `last_sent_digest = None`
+        re-bind (re-read here on every call) are noticed within one slice. --tick-s (default 2) only
+        bounds the slice from above: nothing waits for it any more."""
+        if self.stop_event.is_set():
+            return False
+        _, digest = self.cache.wait_for_change(self.last_sent_digest, min(self.tick_s, self.STATE_WAIT_SLICE_S))
+        if digest is None or digest == self.last_sent_digest:
+            return False
+        began = time.monotonic()
+        while not self.stop_event.is_set():
+            hold = self.STATE_DEBOUNCE_MAX_S - (time.monotonic() - began)
+            if hold <= 0:
+                break
+            _, newer = self.cache.wait_for_change(digest, min(self.STATE_DEBOUNCE_S, hold))
+            if newer == digest:
+                break
+            digest = newer
+        return not self.stop_event.is_set()
+
     def run_state_loop(self):
         self.cache = UI.StateCache(self.root, self.transport)
         self.cache.start()
         try:
-            while not self.stop_event.wait(self.tick_s):
-                if not self.state_ready.is_set():
-                    continue
+            while not self.stop_event.is_set():
                 try:
-                    self._tick_once()
+                    if not self.state_ready.is_set():
+                        # nothing can be sealed before device_bound; setting the event wakes this at once
+                        self.state_ready.wait(min(self.tick_s, self.STATE_WAIT_SLICE_S))
+                    elif self._await_new_state():
+                        self._tick_once()
                 except Exception as e:
                     emit({"event": "error", "detail": "state tick failed: %s" % e})
+                    self.stop_event.wait(self.tick_s)  # a failing pass is retried at the old cadence, never hot
         finally:
             self.cache.stop()
 
