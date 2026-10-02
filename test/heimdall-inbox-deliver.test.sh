@@ -817,6 +817,7 @@ import time
 bin_path, repo, payload, out_path = sys.argv[1:5]
 marker = os.path.join(repo, ".heimdall", "ui", "inbox-waiting")
 
+go_r, go_w = os.pipe()
 try:
     pid, master = pty.fork()
 except OSError as exc:
@@ -827,6 +828,11 @@ if pid == 0:
     # The child is the session leader the pty is the controlling terminal of: it
     # stands in for `claude`. Like claude it keeps reading its terminal while the
     # Stop hook runs, and it is the hook's parent -- the hook itself has only pipes.
+    # It starts the hook only once the parent says go: a pty's access time begins at
+    # its creation, which reads as "just typed" and would end the hold before it
+    # began, so the parent ages it first. This read is on a pipe, never the terminal.
+    os.close(go_w)
+    os.read(go_r, 1)
     env = {k: v for k, v in os.environ.items() if k != "HMD_INBOX_TTY"}
     with open(payload, "rb") as pin, open(out_path, "wb") as pout:
         hook = subprocess.Popen([bin_path, "stop", "--repo", repo], stdin=pin, stdout=pout,
@@ -879,6 +885,13 @@ try:
     if tty in ("", "?", "??", "-"):
         print("RESULT notty ps shows no controlling terminal for the pty child")
         sys.exit(0)
+    dev = os.path.join("/dev", tty)
+    try:
+        os.utime(dev, (time.time() - 3600, os.stat(dev).st_mtime))
+    except OSError as exc:
+        print("RESULT notty cannot age the access time of %s: %s" % (dev, exc))
+        sys.exit(0)
+    os.write(go_w, b"g")
     if not wait_until(lambda: os.path.exists(marker), 20):
         print("RESULT nohold held_quiet=0 released_after=-1")
         sys.exit(0)
