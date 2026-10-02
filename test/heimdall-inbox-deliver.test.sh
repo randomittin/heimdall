@@ -688,11 +688,15 @@ rm -rf "$D" "$PL"
 # 1800s, and a prompt typed at the laptop meanwhile queues behind the Stop hook
 # for up to that long. The default is now 300s, and the long-poll also ends the
 # moment the operator touches the session's terminal. The signal is that
-# terminal's access time (bin/heimdall-inbox-deliver's header says why not
-# ioreg HIDIdleTime). Tests 30-33 inject it as a plain file through HMD_INBOX_TTY
-# -- the real stat path, no keyboard needed; test 34 injects nothing and lets the
-# hook find a real pty through its own ancestors.
+# terminal's access time, vetoed on macOS while HIDIdleTime says nobody used a
+# keyboard (bin/heimdall-inbox-deliver's header has the measurements). Tests 30-33
+# inject the terminal as a plain file through HMD_INBOX_TTY -- the real stat path,
+# no keyboard needed; test 34 injects nothing and lets the hook find a real pty
+# through its own ancestors. The keyboard side is injected too (AT_KEYBOARD): the
+# real HIDIdleTime is whatever the operator running this suite happens to be doing.
 # ─────────────────────────────────────────────────────────────────────────────
+
+AT_KEYBOARD="HMD_INBOX_PRESENCE_CMD=echo 0"   # a human used the keyboard 0s ago
 
 echo "30. typing release: companion connected (default 300s hold) + the terminal is read mid-hold -> released within one poll, nothing popped:"
 D="$(make_project)"
@@ -713,7 +717,7 @@ SAMPLE="$(mktemp)"; SIGNAL_AT="$(mktemp)"
 ) &
 BGPID=$!
 OUTF="$(mktemp)"
-bounded_stop "$D" "Done implementing the feature." "$OUTF" 40 HMD_INBOX_TTY="$TTYF"
+bounded_stop "$D" "Done implementing the feature." "$OUTF" 40 HMD_INBOX_TTY="$TTYF" "$AT_KEYBOARD"
 RC=$?
 T1="$(now_s)"
 OUT="$(cat "$OUTF")"
