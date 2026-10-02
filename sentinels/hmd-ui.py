@@ -94,7 +94,9 @@ LIB_DIR = os.path.join(BIN_DIR, "lib")
 PAGE_PATH = os.path.join(HERE, "hmd-ui.html")
 
 SCHEMA_VERSION = 1
-POLL_INTERVAL_S = 2.0
+POLL_INTERVAL_S = 2.0          # the BACKSTOP: a full re-collect at least this often, whether or not anything was seen to move
+WATCH_INTERVAL_S = 0.1         # between backstops StateCache.run stats WATCH_SOURCES this often (a stat each, no read)
+REFRESH_MIN_GAP_S = 0.25       # a change-triggered refresh never starts sooner than this after the previous one began
 KEEPALIVE_S = 15.0
 CMD_TIMEOUT_S = 8
 CHECKPOINT_HEAD_BYTES = 8192   # the auto-checkpoint header lives in the first few KB
@@ -155,6 +157,25 @@ SOURCE_COMMANDS = (
 )
 GIT_COMMANDS = (
     ("git", "rev-parse", "--abbrev-ref", "HEAD"),
+)
+# What StateCache.run STATS every WATCH_INTERVAL_S: when one of these moves the state is re-collected at
+# once instead of at the next POLL_INTERVAL_S backstop. Repo-relative, and only files that move when --
+# and only when -- a collector's INPUT moved. The statusline / roster / ledger mirrors, the agents-count
+# cache, the inbox-waiting heartbeat and the tracker's per-hook counters are rewritten on a timer or on
+# every hook whether or not their content changed, so watching them would re-collect all the time for
+# nothing: they, and every subprocess-derived field (git branch, hooks, fallback, quality gate), keep
+# arriving on the backstop exactly as before. A directory's stamp moves when an entry is created,
+# removed or renamed -- every panel write and approval request is tmp + rename / link. The repo's
+# session transcript is watched as well (WatchedSources._transcript): it is resolved per call, so it
+# cannot be listed here.
+WATCH_SOURCES = (
+    ".heimdall/ui/panels",                 # dir: `hmd ui panel set`, the chat / agents publishers
+    ".heimdall/ui/approvals",              # dir: a phone-deny request or decision
+    ".heimdall/ui/inbox.jsonl",            # appended in place
+    ".heimdall/ui/inbox-delivered.jsonl",  # delivery receipts -> inbox.delivered[]
+    ".heimdall/ui/tmux-target",            # inbox.consumer == "tmux"
+    ".planning/CHECKPOINT.md",
+    ".heimdall/receipts/last-sweep.json",
 )
 
 # ── deny-list: enforced at the read primitive ────────────────────────────────
@@ -301,11 +322,18 @@ def _run_json(argv, cwd):
 SUBPROCESS_CACHE_TTL_S = POLL_INTERVAL_S
 _subprocess_cache = {}
 _subprocess_cache_lock = threading.Lock()
+# True only on the poller thread, only inside a change-triggered StateCache.refresh(partial=True): the
+# collectors then take whatever a subprocess last answered, however old, instead of re-spawning it. The
+# files a change moved are re-read in full (that is cheap -- the mtime caches above); the seven spawns
+# are what cost 0.3-0.8 s, and they are refreshed by the next backstop refresh, so a subprocess-derived
+# field is never staler than the TTL above plus one backstop period -- the same bound as before.
+_subprocess_reuse = threading.local()
 
 
 def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
     """Same contract as `_run`, memoized by the exact (argv, cwd) pair for
-    SUBPROCESS_CACHE_TTL_S. The lock spans the whole miss path (not just the dict
+    SUBPROCESS_CACHE_TTL_S (or for as long as the entry lives, under _subprocess_reuse).
+    The lock spans the whole miss path (not just the dict
     read/write): two concurrent /api/state requests racing a cold cache must never
     both spawn the same command -- the second blocks on the lock and then hits the
     now-warm entry instead of racing its own subprocess (perf item 2d: never spawn
@@ -317,7 +345,8 @@ def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
     with _subprocess_cache_lock:
         now = time.monotonic()
         hit = _subprocess_cache.get(key)
-        if hit is not None and now - hit[0] < SUBPROCESS_CACHE_TTL_S:
+        if hit is not None and (now - hit[0] < SUBPROCESS_CACHE_TTL_S
+                                or getattr(_subprocess_reuse, "any_age", False)):
             return hit[1]
         result = _run(argv, cwd, timeout=timeout, env=env)
         _subprocess_cache[key] = (time.monotonic(), result)
