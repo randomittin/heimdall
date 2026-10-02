@@ -325,11 +325,11 @@ def _run_json(argv, cwd):
 SUBPROCESS_CACHE_TTL_S = POLL_INTERVAL_S
 _subprocess_cache = {}
 _subprocess_cache_lock = threading.Lock()
-# True only on the poller thread, only inside a change-triggered StateCache.refresh(partial=True): the
-# collectors then take whatever a subprocess last answered, however old, instead of re-spawning it. The
-# files a change moved are re-read in full (that is cheap -- the mtime caches above); the seven spawns
-# are what cost 0.3-0.8 s, and they are refreshed by the next backstop refresh, so a subprocess-derived
-# field is never staler than the TTL above plus one backstop period -- the same bound as before.
+# True only on the poller thread, only inside StateCache.refresh(partial=True): the collectors then take
+# whatever a subprocess last answered, however old, instead of re-spawning it. The files a change moved
+# are re-read in full (that is cheap -- the mtime caches above); the spawns are what cost 0.3-1.5 s, and
+# StateCache's warmer thread re-runs them every POLL_INTERVAL_S (SLOW_COLLECTORS), so a subprocess-derived
+# field is never staler than the TTL above plus one warm period -- the same bound as before.
 _subprocess_reuse = threading.local()
 
 
@@ -345,11 +345,16 @@ def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
     overlay names the repo's session, which changes when a new session starts) -- `timeout`
     stays out of it, every caller pairs the same argv+cwd with the same timeout."""
     key = (tuple(argv), cwd, tuple(sorted((env or {}).items())))
+    if getattr(_subprocess_reuse, "any_age", False):
+        # No lock: a spawn in flight on another thread (the warmer) holds it for the whole spawn,
+        # and a pass that only wants the last answer must not queue behind that.
+        hit = _subprocess_cache.get(key)
+        if hit is not None:
+            return hit[1]
     with _subprocess_cache_lock:
         now = time.monotonic()
         hit = _subprocess_cache.get(key)
-        if hit is not None and (now - hit[0] < SUBPROCESS_CACHE_TTL_S
-                                or getattr(_subprocess_reuse, "any_age", False)):
+        if hit is not None and now - hit[0] < SUBPROCESS_CACHE_TTL_S:
             return hit[1]
         result = _run(argv, cwd, timeout=timeout, env=env)
         _subprocess_cache[key] = (time.monotonic(), result)
@@ -421,9 +426,20 @@ def collect_identity(root):
 
 
 LEDGER_EMPTY = {"daemon": None, "gates": [], "verdict": None, "team": [], "team_overflow": 0}
+_ledger_memo = {}   # root -> the last answer, served to a partial pass (see _subprocess_reuse)
 
 
 def collect_ledger(root):
+    """hmd_ledger's own 5 s file cache sits behind this, and a miss there forks heimdall-identity
+    (outside _run_cached) -- so a partial pass serves the last answer instead, and the warmer
+    thread (SLOW_COLLECTORS) is what keeps it fresh."""
+    if getattr(_subprocess_reuse, "any_age", False) and root in _ledger_memo:
+        return _ledger_memo[root]
+    _ledger_memo[root] = answer = _collect_ledger(root)
+    return answer
+
+
+def _collect_ledger(root):
     if LEDGER is None:
         return dict(LEDGER_EMPTY)
     # Session id keyed by ROOT: hmd_ledger's 5s file cache is per session id, and two
@@ -877,9 +893,16 @@ def new_companion_publisher(root):
 
     def list_agents():
         # The publisher throttles this (>= 10s apart) and skips it while the statusline's
-        # cached count says nothing is running; _run_json_cached memoizes within a tick.
-        return _run_json_cached(("heimdall-agents", "list", "--json"), root,
-                                timeout=AGENTS_LIST_TIMEOUT_S, env={"HMD_AGENT_CWD": root})
+        # cached count says nothing is running; _run_json_cached memoizes within a tick. A probe
+        # the publisher chose to make wants a real answer even inside a partial pass (which would
+        # otherwise serve the first answer for ever -- nothing else re-runs this one).
+        reuse = getattr(_subprocess_reuse, "any_age", False)
+        _subprocess_reuse.any_age = False
+        try:
+            return _run_json_cached(("heimdall-agents", "list", "--json"), root,
+                                    timeout=AGENTS_LIST_TIMEOUT_S, env={"HMD_AGENT_CWD": root})
+        finally:
+            _subprocess_reuse.any_age = reuse
 
     return COMPANION.CompanionPublisher(root, read_tail=_read_tail, list_agents=list_agents)
 
