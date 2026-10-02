@@ -284,6 +284,14 @@ describe("relay wire contract (relay/contract/wire.json)", () => {
       expectMatch(await ended, wire.phone.revoked.session_ended, live);
       expect(await closed).toBe(wire.phone.revoked.close_code);
     } finally {
+      // The pool cannot pop a test's isolated storage while a socket or a response body of it is
+      // still open, which leaves the session's alarm to fire two minutes later. Release both, even
+      // when an assertion above threw.
+      try {
+        socket?.close();
+      } catch {
+        // already closed by the relay
+      }
       await reader.cancel().catch(() => undefined);
     }
   });
