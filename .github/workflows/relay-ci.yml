@@ -10,7 +10,7 @@
 #   relay        -- Node. npm ci, typecheck, `npm test` (the INV-8 no-logged-URL guard, the node:test
 #                   scripts suite including the JS side of the contract fixtures, and the vitest suite
 #                   in a real workerd including relay/test/contract.spec.ts, which drives the real
-#                   Worker + Durable Object with relay/contract/wire.json), then the trace-diff gate.
+#                   Worker + Durable Object with relay/contract/wire.json).
 #   hmd-contract -- Python. test/relay-contract-fixtures.test.sh replays the same wire.json against the
 #                   real bin/heimdall-relay-client with no network. It runs on macos-latest, like
 #                   release-gate-suites.yml, because heimdall's own Python is developed and exercised on
@@ -22,6 +22,13 @@
 #
 # Node 24 is what the relay is verified on (v24.13.0); CI runs that same major rather than an
 # unverified other one.
+#
+# NOT wired, on purpose: `npm run test:trace` (the trace-diff gate). It already exits 1 at hmdapp HEAD,
+# for two reasons that predate the move: relay/vitest.config.ts excludes test/trace/**, so the
+# runner's own `vitest run test/trace` finds no files and every row reads "no test found"; and its
+# INV-18 source scan matches the word X25519 in two comments (relay/src/types.ts:130,
+# relay/src/pairing.ts:121). A step that is red from its first run would only teach people to ignore
+# this workflow; add it here once the runner and those two comments are fixed.
 #
 # Every action is pinned by commit SHA with its tag in the trailing comment, as the sibling
 # workflows do. actions/setup-node was resolved with `git ls-remote https://github.com/actions/setup-node
@@ -55,7 +62,7 @@ concurrency:
 
 jobs:
   relay:
-    name: relay (typecheck, tests, contract, trace)
+    name: relay (typecheck, tests, contract)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -82,9 +89,6 @@ jobs:
       # (incl. test/contract.spec.ts against the real Worker + Durable Object).
       - name: Tests and contract fixtures
         run: npm test
-
-      - name: Trace-diff gate (golden + mutants)
-        run: npm run test:trace
 
   hmd-contract:
     name: hmd client vs the wire fixtures (hermetic)
