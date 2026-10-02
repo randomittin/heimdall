@@ -106,5 +106,46 @@ resolve "$H" "$P" >/dev/null
 # ── 7. the lib parses under bash -n ──────────────────────────────────────────
 bash -n "$LIB" && ok "7. lib parses" || bad "7. lib does not parse"
 
+# ── 8-11. hmd_python_cached: the cached interpreter WITHOUT running it ───────
+# The statusline renders every ~300ms and used to pay a `-c pass` launch (30-60ms, far more
+# under load) per render just to re-prove the cache. A caller that is about to RUN the
+# interpreter anyway verifies by USE instead: an empty/failed run sends it back through
+# hmd_python (cases 1-2 above), which probes and heals. So this function's contract is the
+# mirror image of hmd_python's -- it must NEVER execute the interpreter, and it must never
+# touch the cache -- and the mirror-image proof is a probe that records if it was run.
+cached() {  # HOME_DIR [HMD_PYTHON]  -> prints hmd_python_cached's stdout; exit status = its rc
+  local home="$1" pin="${2:-}"
+  ( export HEIMDALL_HOME="$home" PATH="/usr/bin:/bin"; unset HMD_PYTHON
+    [ -n "$pin" ] && export HMD_PYTHON="$pin"
+    . "$LIB" && hmd_python_cached )
+}
+
+H="$TMPROOT/h8"; mkdir -p "$H"
+RAN="$TMPROOT/h8-ran"; PROBE="$TMPROOT/probe-python3"
+printf '#!/bin/sh\n: > "%s"\nexit 69\n' "$RAN" > "$PROBE"; chmod +x "$PROBE"
+printf '%s\n' "$PROBE" > "$H/.python3-path"
+out="$(cached "$H")"; rc=$?
+if [ "$rc" = 0 ] && [ "$out" = "$PROBE" ] && [ ! -e "$RAN" ]; then
+  ok "8. returns the cached path and never executes it (not even a broken one: verify-by-use is the caller's job)"
+else
+  bad "8. cached path not served as-is, or the interpreter was executed (rc=$rc out=[$out] ran=$([ -e "$RAN" ] && echo yes || echo no))"
+fi
+[ "$(cat "$H/.python3-path")" = "$PROBE" ] && ok "9. leaves the cache untouched (healing is hmd_python's job, never a side effect here)" \
+                                            || bad "9. hmd_python_cached modified the cache: [$(cat "$H/.python3-path")]"
+
+H="$TMPROOT/h10"; mkdir -p "$H"
+out="$(cached "$H")"; rc=$?
+[ "$rc" = 1 ] && [ -z "$out" ] && ok "10a. no cache -> prints nothing, non-zero (the caller falls back to hmd_python)" \
+                                 || bad "10a. no cache but got rc=$rc out=[$out]"
+printf '%s\n' "$TMPROOT/does-not-exist-python3" > "$H/.python3-path"
+out="$(cached "$H")"; rc=$?
+[ "$rc" = 1 ] && [ -z "$out" ] && ok "10b. cache names a removed interpreter -> prints nothing, non-zero (a -x test is the one thing it does check)" \
+                                 || bad "10b. served a non-executable cached path: rc=$rc out=[$out]"
+
+H="$TMPROOT/h11"; mkdir -p "$H"; printf '%s\n' "$PROBE" > "$H/.python3-path"
+out="$(cached "$H" "$GOOD")"; rc=$?
+[ "$rc" = 0 ] && [ "$out" = "$GOOD" ] && ok "11. HMD_PYTHON override wins over the cache, verbatim, unprobed" \
+                                       || bad "11. HMD_PYTHON override not honoured (rc=$rc out=[$out])"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
