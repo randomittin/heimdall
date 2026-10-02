@@ -97,12 +97,36 @@ CONTROL PROTOCOL (the --ctl DIR the "serve" stream handler polls):
                    client's own tick loop is undisturbed while a test counts
                    ack attempts. The file is rewritten as fail-ack-posts=<N-1>
                    after each consumption and removed at 0.
+  fail-state-posts=<N> -- exactly fail-ack-posts, for POST /frames whose envelope
+                   type is `state`: the next N are read in full, appended to
+                   LOGDIR/frames-dropped.ndjson and the connection closed with
+                   no response. Acks keep flowing.
+  undelivered-ack-posts=<N> -- consumed one POST at a time: each of the next N
+                   ack POSTs is ANSWERED 200 {"ok":true,"delivered":false} --
+                   what the real relay says when no phone socket is attached
+                   right now -- and appended to LOGDIR/frames-undelivered.ndjson
+                   instead of frames.ndjson (which therefore stays "what the
+                   phone received").
+  delay-state-posts=<SECS> -- NOT consumed: while the file exists every POST
+                   /frames whose envelope type is `state` is held SECS seconds
+                   (float) after its body is read and before it is answered or
+                   logged, a slow state POST in flight. LOGDIR/state-inflight
+                   exists exactly while one is being held, so a test can wait
+                   for "a state POST is in flight right now" instead of
+                   sleeping.
+
+LOGDIR/frame-posts.log: one line per POST /frames, written when it ends --
+    recv=<epoch s> done=<epoch s> conn=<N> type=<state|ack|?> seq=<N|?> result=<ok|dropped|undelivered>
+`conn` numbers every TCP connection the server accepted (1, 2, ...), so a test
+can count how many connections the frames travelled on, and which frame types
+shared one; recv/done bracket the time the POST was in flight at the relay.
 
 Stdlib only (Decision 1 zero-toolchain posture) -- http.server, json, base64,
 uuid, threading, argparse, importlib.
 """
 import argparse
 import base64
+import contextlib
 import json
 import os
 import re
@@ -215,6 +239,36 @@ class RelayState:
         os.makedirs(ctl_dir, exist_ok=True)
         self._req_log_lock = threading.Lock()
         self._frames_log_lock = threading.Lock()
+        self._conn_lock = threading.Lock()
+        self._conn_count = 0
+
+    def next_conn_id(self):
+        """1, 2, 3, ... -- one per TCP connection the server accepts (see
+        Handler.setup), so frame-posts.log can say which connection a POST rode."""
+        with self._conn_lock:
+            self._conn_count += 1
+            return self._conn_count
+
+    def log_frame_post(self, conn_id, ftype, fseq, recv, result):
+        line = "recv=%.3f done=%.3f conn=%d type=%s seq=%s result=%s\n" % (
+            recv, time.time(), conn_id, ftype or "?", "?" if fseq is None else fseq, result)
+        with self._frames_log_lock:
+            with open(os.path.join(self.log_dir, "frame-posts.log"), "a", encoding="utf-8") as f:
+                f.write(line)
+
+    def state_post_delay(self):
+        """Seconds a `state` POST is to be held (0.0 for none): the value of a
+        `delay-state-posts=<secs>` control file. Read, never consumed -- the
+        delay applies for as long as the file exists."""
+        try:
+            names = os.listdir(self.ctl_dir)
+        except OSError:
+            return 0.0
+        for name in names:
+            m = re.match(r"^delay-state-posts=(\d+(?:\.\d+)?)$", name)
+            if m:
+                return float(m.group(1))
+        return 0.0
 
     def device_pubkey_b64(self):
         """The device pubkey to embed in this session's `device_bound` frame --
@@ -259,10 +313,14 @@ class RelayState:
                 f.write(raw_body if raw_body.endswith(b"\n") else raw_body + b"\n")
 
     def consume_fail_ack(self):
-        """True while a `fail-ack-posts=<N>` control file still has failures to
-        hand out, consuming exactly one of them per call: the file is replaced
-        by fail-ack-posts=<N-1> (or just removed at 1), the same filename-
-        carries-the-value convention rate-limit-next=/oversized-line= use.
+        return self.consume_counter("fail-ack-posts")
+
+    def consume_counter(self, prefix):
+        """True while a `<prefix>=<N>` control file (fail-ack-posts,
+        fail-state-posts, undelivered-ack-posts) still has hits to hand out,
+        consuming exactly one of them per call: the file is replaced by
+        <prefix>=<N-1> (or just removed at 1), the same filename-carries-the-
+        value convention rate-limit-next=/oversized-line= use.
         Called under a lock because several POST /frames handler threads can
         reach it at once (the client's tick thread and its stream thread both
         post), and two of them must never be handed the same single failure."""
@@ -272,7 +330,7 @@ class RelayState:
             except OSError:
                 return False
             for name in names:
-                m = re.match(r"^fail-ack-posts=(\d+)$", name)
+                m = re.match(r"^%s=(\d+)$" % re.escape(prefix), name)
                 if not m:
                     continue
                 remaining = int(m.group(1))
@@ -281,7 +339,7 @@ class RelayState:
                 except OSError:
                     return False
                 if remaining > 1:
-                    open(os.path.join(self.ctl_dir, "fail-ack-posts=%d" % (remaining - 1)), "w").close()
+                    open(os.path.join(self.ctl_dir, "%s=%d" % (prefix, remaining - 1)), "w").close()
                 return remaining > 0
             return False
 
@@ -374,25 +432,43 @@ def _envelope_bytes(env):
     return (json.dumps(env, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def _is_ack_envelope(raw_body):
-    """True when a POST /frames body is an envelope of type `ack`. `type` is one
-    of the envelope's plaintext routing fields (only nonce/ciphertext are
-    sealed), so the relay -- and this stand-in -- can tell an ack from a state
-    frame without any key. A body that is not a JSON object is simply not an
-    ack here; the real relay's own 400 handling is not this fixture's job."""
+def _envelope_type_seq(raw_body):
+    """(type, seq) of a POST /frames body, (None, None) when it is not a JSON
+    object. `type` and `seq` are plaintext routing fields of the envelope (only
+    nonce/ciphertext are sealed), so the relay -- and this stand-in -- can tell
+    an ack from a state frame without any key. A body that is not a JSON object
+    is simply neither here; the real relay's own 400 handling is not this
+    fixture's job."""
     try:
         env = json.loads(raw_body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
-        return False
-    return isinstance(env, dict) and env.get("type") == "ack"
+        return None, None
+    if not isinstance(env, dict):
+        return None, None
+    return env.get("type"), env.get("seq")
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "fake-relay/1"
 
+    def setup(self):
+        super().setup()
+        self.conn_id = STATE.next_conn_id()  # one handler instance per TCP connection
+
     def log_message(self, fmt, *args):
         return  # requests.log (STATE.log_request) is the log; stderr stays quiet
+
+    def _hold_state_post(self, seconds):
+        """Hold a state POST `seconds` with LOGDIR/state-inflight present (see
+        delay-state-posts in the module docstring)."""
+        marker = os.path.join(STATE.log_dir, "state-inflight")
+        open(marker, "w").close()
+        try:
+            time.sleep(seconds)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(marker)
 
     # -- chunked-transfer helpers ---------------------------------------------
     def _chunk_send(self, data):
@@ -470,14 +546,30 @@ class Handler(BaseHTTPRequestHandler):
             if len(raw) > MAX_ENVELOPE_BYTES:
                 self._json(413, {"error": "envelope exceeds %d bytes" % MAX_ENVELOPE_BYTES})
                 return
-            if _is_ack_envelope(raw) and STATE.consume_fail_ack():
+            received = time.time()
+            ftype, fseq = _envelope_type_seq(raw)
+            if (ftype == "ack" and STATE.consume_fail_ack()) \
+                    or (ftype == "state" and STATE.consume_counter("fail-state-posts")):
                 # received in full, never answered: see fail-ack-posts in the
                 # module docstring. Closing without a status line is what the
                 # client observes as a network drop (RemoteDisconnected).
                 STATE.log_frame(raw, name="frames-dropped.ndjson")
+                STATE.log_frame_post(self.conn_id, ftype, fseq, received, "dropped")
                 self.close_connection = True
                 return
+            if ftype == "ack" and STATE.consume_counter("undelivered-ack-posts"):
+                # answered, but no phone is attached right now: see
+                # undelivered-ack-posts in the module docstring
+                STATE.log_frame(raw, name="frames-undelivered.ndjson")
+                STATE.log_frame_post(self.conn_id, ftype, fseq, received, "undelivered")
+                self._json(200, {"ok": True, "delivered": False})
+                return
+            if ftype == "state":
+                delay = STATE.state_post_delay()
+                if delay:
+                    self._hold_state_post(delay)
             STATE.log_frame(raw)
+            STATE.log_frame_post(self.conn_id, ftype, fseq, received, "ok")
             self._json(200, {"ok": True, "delivered": True})
             return
 
