@@ -223,11 +223,26 @@ run() {
       HMD_HAID="$hd" ${envs[@]+"${envs[@]}"} "$BIN" "$@" )
 }
 
+# HANG_CAP -- wall-clock cap (seconds) on every background-loop run below: `bound` kills the
+# command at it (rc=137) and f1 asserts its elapsed time stays under it. It is a HANG DETECTOR,
+# not a latency expectation. A real hang (a loop that ignores quiesce-on-HEALTHY, the 4xx stop,
+# HMD_DOCTOR_MAX_CYCLES or HMD_DOCTOR_MAX_SECONDS) never returns on its own -- the product's
+# default backstop is 1800s -- so ANY finite cap catches it. The former 20s (15s for f1's elapsed
+# check) were sized for an idle machine: at load ~80 one healthy heal (keygen -> enroll -> beat ->
+# roster, each its own python start) outlasts them, so the detector killed HEALTHY runs (d6 rc=137,
+# d7 then found no persisted state, f1 over its limit). 60s sits clear of a loaded-but-healthy run
+# and still reports a genuine hang in about a minute instead of at the 1800s backstop.
+HANG_CAP=60
+
 # bound SECS -- runs a command with a hard kill-timeout (proves the bg loop cannot hang).
 bound() {
   local secs="$1"; shift; [ "$1" = "--" ] && shift
   "$@" & local p=$!
-  ( "$PY" -c "import time;time.sleep($secs)"; kill -9 "$p" 2>/dev/null ) & local w=$!
+  # The watchdog IS the python sleeper (not a subshell wrapping it), so `kill "$w"` below reaps
+  # it: no sleeper outlives the call (a wrapped one lingered for the full $secs after every run).
+  "$PY" -c "import os,signal,time;time.sleep($secs)
+try: os.kill($p, signal.SIGKILL)
+except ProcessLookupError: pass" & local w=$!
   wait "$p" 2>/dev/null; local rc=$?
   kill "$w" 2>/dev/null; wait "$w" 2>/dev/null || true
   return $rc
@@ -312,16 +327,26 @@ if [ "$CRYPTO" = "1" ]; then
   else
     bad "d4 the second run re-enrolled or was not healthy (count $N1->$N2)"
   fi
-  run "$HOK" "haid:okdoc" -- status 2>/dev/null | grep -q "doctor:    healthy" \
-    && ok "d5 heimdall-presence status surfaces the doctor's healthy diagnosis" \
-    || { bad "d5 status did not surface the healthy doctor diagnosis"; run "$HOK" "haid:okdoc" -- status 2>/dev/null | sed 's/^/    /' >&2; }
+  # Capture, then match with `case` -- NOT `status | grep -q`. grep -q exits on its first match,
+  # so `status` (which still has its trailing `note:` line to print) takes SIGPIPE (141) and
+  # `set -o pipefail` reports the whole pipeline FAILED although the line was there; under load
+  # grep wins that race. bin/heimdall-presence-doctor's `_pres_off` documents the same hazard.
+  # The exit code is still required to be 0: the old pipeline demanded that of `status` too.
+  D5_OUT="$(run "$HOK" "haid:okdoc" -- status 2>/dev/null)"; D5_RC=$?
+  D5_OK=0
+  case "$D5_OUT" in *"doctor:    healthy"*) [ "$D5_RC" = "0" ] && D5_OK=1 ;; esac
+  if [ "$D5_OK" = "1" ]; then
+    ok "d5 heimdall-presence status surfaces the doctor's healthy diagnosis"
+  else
+    bad "d5 status did not surface the healthy doctor diagnosis (rc=$D5_RC); output:"; printf '%s\n' "$D5_OUT" | sed 's/^/    /' >&2
+  fi
 
   # bg loop QUIESCES on HEALTHY (fresh home): terminates fast, enrolls exactly once, then stops.
   echo
   echo "   bg loop quiesces on HEALTHY (fresh home): one full heal then STOP (no hang)"
   BG_LOG="$WORK/bgok.log"; : > "$BG_LOG"; URL_BGOK="$(launch_mock "$BG_LOG" "ok")"
   HBGOK="$WORK/home_bgok"; make_home "$HBGOK" "$URL_BGOK"
-  bound 20 -- run "$HBGOK" "haid:bgokdoc" HMD_DOCTOR_MAX_CYCLES=5 HMD_DOCTOR_BACKOFF="1 1 1 1 1" -- doctor --bg >/dev/null 2>&1; BGX="$?"
+  bound "$HANG_CAP" -- run "$HBGOK" "haid:bgokdoc" HMD_DOCTOR_MAX_CYCLES=5 HMD_DOCTOR_BACKOFF="1 1 1 1 1" -- doctor --bg >/dev/null 2>&1; BGX="$?"
   BG_SEED="$(ls "$HBGOK/.heimdall/pki/"*.seed 2>/dev/null | head -1 || true)"
   BG_N="$(enroll_count "$BG_LOG")"
   if [ "$BGX" != "124" ] && [ "$BGX" = "0" ] && [ -n "$BG_SEED" ] && [ "$BG_N" = "1" ]; then
@@ -370,7 +395,7 @@ if [ "$CRYPTO" = "1" ]; then
   # the bg loop must STOP after ONE attempt on an unfixable 4xx (never a hot retry loop).
   REF2_LOG="$WORK/ref2.log"; : > "$REF2_LOG"; URL_REF2="$(launch_mock "$REF2_LOG" "badtoken")"
   HREF2="$WORK/home_ref2"; make_home "$HREF2" "$URL_REF2"
-  bound 20 -- run "$HREF2" "haid:ref2doc" HMD_DOCTOR_MAX_CYCLES=5 HMD_DOCTOR_BACKOFF="0 0 0 0 0" -- doctor --bg >/dev/null 2>&1; REF2X="$?"
+  bound "$HANG_CAP" -- run "$HREF2" "haid:ref2doc" HMD_DOCTOR_MAX_CYCLES=5 HMD_DOCTOR_BACKOFF="0 0 0 0 0" -- doctor --bg >/dev/null 2>&1; REF2X="$?"
   REF2_N="$(enroll_count "$REF2_LOG")"
   if [ "$REF2X" = "0" ] && [ "$REF2_N" = "1" ]; then
     ok "c3 the bg loop made EXACTLY ONE enroll attempt on the 4xx then STOPPED (no hot loop across 5 allowed cycles)"
@@ -387,10 +412,10 @@ if [ "$CRYPTO" = "1" ]; then
   echo "f. offline: the bg loop backs off and TERMINATES on its wallclock backstop (loud, no hang)"
   HDEAD="$WORK/home_dead"; make_home "$HDEAD" "http://127.0.0.1:1"   # nothing listening on port 1
   START="$(date +%s)"
-  bound 20 -- run "$HDEAD" "haid:deaddoc" HMD_DOCTOR_MAX_SECONDS=1 HMD_DOCTOR_BACKOFF="1 1 1" \
+  bound "$HANG_CAP" -- run "$HDEAD" "haid:deaddoc" HMD_DOCTOR_MAX_SECONDS=1 HMD_DOCTOR_BACKOFF="1 1 1" \
       -- doctor --bg >/dev/null 2>"$WORK/dead.err"; DEADX="$?"
   ELAPSED=$(( $(date +%s) - START ))
-  if [ "$DEADX" = "0" ] && [ "$ELAPSED" -ge 1 ] && [ "$ELAPSED" -lt 15 ]; then
+  if [ "$DEADX" = "0" ] && [ "$ELAPSED" -ge 1 ] && [ "$ELAPSED" -lt "$HANG_CAP" ]; then
     ok "f1 the offline bg loop BACKED OFF (~${ELAPSED}s) and TERMINATED on the backstop (did not hang)"
   else
     bad "f1 the offline bg loop did not back off + terminate cleanly (rc=$DEADX elapsed=${ELAPSED}s)"

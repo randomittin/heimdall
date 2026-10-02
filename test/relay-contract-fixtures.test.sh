@@ -6,7 +6,9 @@
 # (relay/test/contract.spec.ts) and the JS crypto (relay/scripts/__tests__/contract-fixtures.test.mjs).
 # This suite replays it against the REAL bin/heimdall-relay-client and bin/lib/hmd_relay_e2e.py,
 # hermetically: test/lib/relay_contract_replay.py opens no socket, it swaps the client's one network
-# seam for a recorder that answers from the fixture, and compares every byte the client sends.
+# seam (_connect) for in-memory keep-alive connections that record every request and answer from the
+# fixture, and compares every byte the client sends. It counts requests, not connections: the
+# client's POST /frames connections are persistent, so one carries several frames.
 #
 # Falsifiable by construction: the replay is also run against tampered copies of the fixture and
 # must go red on each, so a replay that can no longer fail is itself a failing suite.

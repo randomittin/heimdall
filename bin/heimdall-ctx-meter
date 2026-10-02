@@ -179,13 +179,34 @@ _slurp() {
   return 0
 }
 
+# The interpreter, resolved ONCE per process into a plain global. `$(hmd_python)` cannot
+# memoise (the command-substitution subshell takes its memo with it), so resolving inside
+# _json_get re-paid hmd_python's `-c pass` validation launch for every field it pulled: four
+# fields, eight launches per publish, on every statusline render. A caller that already holds
+# a working interpreter (bin/heimdall-statusline, which has just rendered with it) hands it
+# over through HMD_PYTHON, which hmd_python honours without probing. Callers that run
+# _json_get inside `$()` only benefit by calling this first, in the PARENT shell (do_publish
+# does); everyone else resolves lazily, once per call, exactly as before.
+_CTXM_PY=""; _CTXM_PY_DONE=0
+_ctxm_python() {
+  [ "$_CTXM_PY_DONE" = 1 ] && return 0
+  _CTXM_PY_DONE=1
+  if type hmd_python >/dev/null 2>&1; then _CTXM_PY="$(hmd_python 2>/dev/null || true)"; fi
+  [ -n "$_CTXM_PY" ] || _CTXM_PY="$(command -v python3 2>/dev/null || true)"
+}
+
 # Pull a field out of arbitrary JSON. python3 first (the same interpreter the watchman
 # parses the blob with, so the semantics match), jq as the fallback.
-_json_get() { # <json> <python-expr-path> <jq-path>
+#   want = session | tokens | pct | window   one field, or
+#   want = publish                           every field publish writes, from ONE parse:
+#                                            line 1 "tokens|pct|window", then the session id
+#                                            (last: the only free-form one).
+# One script serves both shapes, so there is exactly one parser of the one blob. `publish`
+# is python-only (a jq path cannot express it); callers gate on $_CTXM_PY.
+_json_get() { # <json> <python-want> <jq-path>
   local blob="$1" pypath="$2" jqpath="$3" out=""
-  local _py=""
-  if type hmd_python >/dev/null 2>&1; then _py="$(hmd_python 2>/dev/null || true)"; fi
-  [ -n "$_py" ] || _py="$(command -v python3 2>/dev/null || true)"
+  [ "$_CTXM_PY_DONE" = 1 ] || _ctxm_python
+  local _py="$_CTXM_PY"
   if [ -n "$_py" ]; then
     out="$(printf '%s' "$blob" | "$_py" -c '
 import json, sys
@@ -200,26 +221,34 @@ cw = cw if isinstance(cw, dict) else {}
 want = sys.argv[1]
 def num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
-if want == "session":
+def session():
     v = b.get("session_id")
-    if isinstance(v, str) and v:
-        print(v)
-elif want == "tokens":
+    return v if isinstance(v, str) and v else ""
+def tokens():
     v = cw.get("total_input_tokens")
     if num(v) and v >= 0:
-        print(int(v))
-    else:
-        p, w = cw.get("used_percentage"), cw.get("context_window_size")
-        if num(p) and num(w) and w > 0 and p >= 0:
-            print(int(round(float(p) * float(w) / 100.0)))
-elif want == "pct":
+        return str(int(v))
+    p, w = cw.get("used_percentage"), cw.get("context_window_size")
+    if num(p) and num(w) and w > 0 and p >= 0:
+        return str(int(round(float(p) * float(w) / 100.0)))
+    return ""
+def pct():
     v = cw.get("used_percentage")
-    if num(v):
-        print(("%.4f" % float(v)).rstrip("0").rstrip("."))
-elif want == "window":
+    return ("%.4f" % float(v)).rstrip("0").rstrip(".") if num(v) else ""
+def window():
     v = cw.get("context_window_size")
-    if num(v) and v > 0:
-        print(int(v))
+    return str(int(v)) if num(v) and v > 0 else ""
+if want == "publish":
+    line = "%s|%s|%s" % (tokens(), pct(), window())
+    sid = session()
+    print(line)
+    if sid:
+        print(sid)
+else:
+    f = {"session": session, "tokens": tokens, "pct": pct, "window": window}.get(want)
+    r = f() if f else ""
+    if r:
+        print(r)
 ' "$pypath" 2>/dev/null || true)"
     printf '%s' "$out"; return 0
   fi
@@ -237,18 +266,32 @@ do_publish() {
   _slurp
   [ -n "$STDIN_BLOB" ] || exit 0
 
-  local sid tokens pct window rec tmp
+  _ctxm_python   # in THIS shell: the $(...) calls below cannot memoise it themselves
+
+  local sid tokens pct window rec tmp fields="" psid=""
+  # ONE parse for every field (see _json_get). Empty -> no python, or a field the parser
+  # cannot take (an infinity, say): the per-field calls below then decide each field on its
+  # own exactly as they always did, so this can only ever be a shortcut, never a verdict.
+  [ -z "$_CTXM_PY" ] || fields="$(_json_get "$STDIN_BLOB" publish '')"
+  if [ -n "$fields" ]; then
+    local first="${fields%%$'\n'*}" rest=""
+    tokens="${first%%|*}"; rest="${first#*|}"; pct="${rest%%|*}"; window="${rest#*|}"
+    case "$fields" in *$'\n'*) psid="${fields#*$'\n'}" ;; esac
+  else
+    psid="$(_json_get "$STDIN_BLOB" session '.session_id // empty')"
+    tokens="$(_json_get "$STDIN_BLOB" tokens '.context_window.total_input_tokens // empty')"
+    pct="$(_json_get "$STDIN_BLOB" pct '.context_window.used_percentage // empty')"
+    window="$(_json_get "$STDIN_BLOB" window '.context_window.context_window_size // empty')"
+  fi
+
   sid="$SESSION"
-  [ -n "$sid" ] || sid="$(_json_get "$STDIN_BLOB" session '.session_id // empty')"
+  [ -n "$sid" ] || sid="$psid"
   [ -n "$sid" ] || sid="${CLAUDE_SESSION_ID:-}"
   [ -n "$sid" ] || sid="default"
   sid="$(printf '%s' "$sid" | tr -cd 'A-Za-z0-9._-' | cut -c1-96)"
   [ -n "$sid" ] || sid="default"
 
-  tokens="$(_json_get "$STDIN_BLOB" tokens '.context_window.total_input_tokens // empty')"
   _is_int "$tokens" || exit 0                      # no context signal -> write nothing
-  pct="$(_json_get "$STDIN_BLOB" pct '.context_window.used_percentage // empty')"
-  window="$(_json_get "$STDIN_BLOB" window '.context_window.context_window_size // empty')"
   _is_int "$window" || window=0
   [ -n "$pct" ] || pct=0
 

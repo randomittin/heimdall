@@ -37,16 +37,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCHMAN="$HERE/../sentinels/hmd-statusline.py"
 FACE_BIN="$HERE/heimdall-face"
 
-# ── FAST python3 — resolved ONCE, before any subprocess below ───────────────────
+# ── FAST python3 — resolved ONCE, VERIFIED BY USE, before any subprocess below ──
 # MEASURED (this machine): bare `python3` resolves through a pyenv shim
 # (~/.pyenv/shims/python3 execs `pyenv exec python3`, a version-resolution
 # dispatcher) at ~400-450ms/launch — against a DIRECT, non-shim python3 at
-# ~30-70ms. This render path launches python3 up to 4 times (the render-width
-# probe, the watchman, the Cursor host-label normalizer, the CTX-honesty
-# post-process) and hands heimdall-ctx-meter up to 3 more internal launches — at
-# ~400ms each that tax alone accounts for essentially the ENTIRE regression: the
-# watchman alone measured 2.29s real through the shim vs 0.75s cold / 0.11s warm
-# via a direct interpreter, BYTE-IDENTICAL output (diff confirmed) either way.
+# ~30-70ms. A render used to launch python3 NINE times for a Cursor payload and
+# ELEVEN for a Claude Code one: hmd_python's validation probe (1), the render-width
+# probe (1), ctx-meter's four `$(hmd_python)` + four parses (8), the Cursor
+# host-label normalizer (1), the watchman (1), the CTX-honesty post-process (1).
+# Each is 56ms idle and several times that under CPU contention — the whole of why
+# test/heimdall-statusline-perf-budget.test.sh failed at load 34-76. A render now
+# launches it TWICE: the watchman, which does the width / host-label / CTX-honesty
+# corrections itself (--host-boundary), and ONE ctx-meter parse.
 #
 # bin/lib/hmd-python.sh (the same library heimdall-ctx-meter already uses)
 # resolves the real interpreter ONCE into $PY3; every call site below uses that
@@ -54,15 +56,28 @@ FACE_BIN="$HERE/heimdall-face"
 # prepending a real bin/ directory ahead of a caller's own PATH previously
 # unshadowed test/heimdall-maintain-loop.test.sh's fake gh/git fixtures. A
 # resolved variable touches nothing outside this process.
-# DEGRADES SAFELY: hmd_python prints nothing when no working interpreter
-# exists anywhere (missing lib, no python3 at all, or a broken macOS CLT
-# stub), which is exactly the "python3 unavailable" signal every jq/legacy
-# fallback below already handled — same contract as the old
-# `command -v python3` guard, just resolved once instead of probed per call.
+#
+# VERIFIED BY USE, NOT BY PROBE. hmd_python proves its answer with a `-c pass`
+# launch on every call; here the interpreter is about to be RUN for real anyway,
+# so the cached path (hmd_python_cached — no launch) is trusted for exactly that
+# run, and an empty render is the signal to re-resolve through hmd_python, which
+# probes, deletes a stale cache and names a working interpreter (see the retry
+# below). The 2026-09-19 incident this guards (an executable licence-nag stub named
+# by the cache) still self-heals inside the one render that hits it; test/heimdall-
+# statusline-perf-budget.test.sh replays it. $PY3_PROVEN records whether $PY3 has
+# actually run (or just been probed) — only a proven interpreter is handed on.
+# DEGRADES SAFELY: no cache, no lib, no working interpreter anywhere (a broken macOS
+# CLT stub) all end at the old `command -v python3` / "python3 unavailable" floor
+# every jq/legacy fallback below already handled.
 PY3=""
+PY3_PROVEN=0
 # shellcheck source=lib/hmd-python.sh
 [ -r "$HERE/lib/hmd-python.sh" ] && . "$HERE/lib/hmd-python.sh"
-if type hmd_python >/dev/null 2>&1; then PY3="$(hmd_python 2>/dev/null || true)"; fi
+if type hmd_python_cached >/dev/null 2>&1; then PY3="$(hmd_python_cached 2>/dev/null || true)"; fi
+if [ -z "$PY3" ] && type hmd_python >/dev/null 2>&1; then
+  PY3="$(hmd_python 2>/dev/null || true)"   # cold cache: the one probe, which also writes the cache
+  [ -z "$PY3" ] || PY3_PROVEN=1
+fi
 [ -n "$PY3" ] || PY3="$(command -v python3 2>/dev/null || true)"
 
 # ── Slurp the caller's statusLine stdin blob ONCE so both the watchman and the
@@ -106,53 +121,19 @@ fi
 #   3. `tput cols` (a real terminal reachable on our own stdout — the bare
 #      manual-invocation case).
 #   4. 120, the long-standing safe default.
-resolve_render_width() {  # $1=blob -> prints digits, or nothing
-  local blob="$1"
-  [ -n "$blob" ] || return 0
-  if [ -n "$PY3" ]; then
-    printf '%s' "$blob" | "$PY3" -c '
-import json, sys
-try:
-    b = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-if not isinstance(b, dict):
-    sys.exit(0)
-w = b.get("render_width_chars")
-if isinstance(w, (int, float)) and not isinstance(w, bool) and w > 0:
-    print(int(w))
-' 2>/dev/null
-    return 0
-  fi
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$blob" | jq -r '
-      if (.render_width_chars? // empty) != "" and (.render_width_chars | type) == "number"
-      then (.render_width_chars | floor) else empty end
-    ' 2>/dev/null
-  fi
-}
-
+#
+# Step 1 is NOT resolved here any more. It used to cost a python launch (a JSON parse of
+# the blob just to read one number) before the watchman — which parses the same blob
+# anyway — even started. The watchman now reads render_width_chars itself under
+# --host-boundary (sentinels/hmd-statusline.py: resolve_cols), with identical precedence:
+# a usable number beats whatever $COLUMNS holds, with the reserve held at 0 unless the
+# caller set HMD_STATUSLINE_RESERVE; absent/null/zero/non-numeric falls through to the
+# ambient width computed below. This block only supplies that ambient width (steps 2-4).
+# (One cost of the move, accepted: a Cursor payload with NO inherited $COLUMNS now also
+# runs the `tput cols` fork below even though its field will win — one ~5ms fork against
+# the ~70ms launch it replaced; Cursor inherits $COLUMNS in practice.)
 COLS="${COLUMNS:-}"
 case "$COLS" in ''|*[!0-9]*) COLS="" ;; esac
-# Cheap, dependency-free substring probe for the Cursor-only render_width_chars key —
-# skips the python3/jq subprocess entirely on Claude Code's hot per-prompt path (that
-# key is never in a CC payload, so this case pattern never matches there), while still
-# catching every real Cursor payload so its authoritative width can override a possibly
-# stale inherited $COLUMNS (see the priority comment above). A blob that merely
-# CONTAINS the literal substring in some unrelated string value still degrades safely:
-# resolve_render_width re-parses as JSON and only trusts an actual top-level numeric
-# render_width_chars key, so a false-positive substring match costs one wasted
-# subprocess call, never a wrong width.
-case "$BLOB" in
-  *'"render_width_chars"'*)
-    RENDER_WIDTH="$(resolve_render_width "$BLOB")"
-    case "$RENDER_WIDTH" in ''|*[!0-9]*) RENDER_WIDTH="" ;; esac
-    if [ -n "$RENDER_WIDTH" ]; then
-      COLS="$RENDER_WIDTH"
-      [ -n "${HMD_STATUSLINE_RESERVE:-}" ] || export HMD_STATUSLINE_RESERVE=0
-    fi
-    ;;
-esac
 case "$COLS" in ''|*[!0-9]*) COLS="$(tput cols 2>/dev/null)" ;; esac
 case "$COLS" in ''|*[!0-9]*) COLS=120 ;; esac
 export COLUMNS="$COLS"
@@ -166,36 +147,9 @@ else
   COLOR_FLAG="--no-color"
 fi
 
-# ── PUBLISH the context reading for the per-prompt meter (bin/heimdall-ctx-meter) ──
-# Claude Code exposes context size in exactly ONE place: this statusLine stdin blob
-# (context_window.total_input_tokens). No hook receives it — UserPromptSubmit sees only
-# the prompt and the session id. So the BAR is the publisher: it hands the meter the
-# SAME blob its own CTX% gauge reads, and the UserPromptSubmit hook reads what the meter
-# stored. One parser of one field — a second estimator that could disagree with the
-# number on screen would be worse than no meter at all.
-#
-# Why it matters (docs/analysis/token-spend-forensics.md): one session ran 15 days at a
-# mean context of 501,000 tokens and cost $913.54 — 82.8% of a three-week $1,103 bill.
-# Capping at ~150K provably recovers $369.50. Drift is invisible without this.
-#
-# Same never-error contract as the rest of the bar: hard time ceiling when one is
-# available, output fully discarded, every failure path a no-op. Cursor's own schema
-# (~/.cursor/skills-cursor/statusline/SKILL.md) DOES carry
-# context_window.total_input_tokens too — documented there as an ESTIMATE derived from
-# used_percentage rather than an exact API count — so this publish call is a REAL write
-# under Cursor as well, not a no-op: it records that estimate under the Cursor
-# session's own session_id. Records are keyed per session_id, so a Cursor estimate can
-# never blend with or overwrite an exact Claude Code reading. The early-session window
-# where Cursor's used_percentage (and by extension total_input_tokens) may be null is
-# already covered by the SAME guard that protects a missing CC signal: publish already
-# treats "no context signal" as "write nothing", never a fabricated 0.
-CTX_METER="$HERE/heimdall-ctx-meter"
-if [ -n "$BLOB" ] && [ -x "$CTX_METER" ]; then
-  CTO=""
-  command -v timeout  >/dev/null 2>&1 && CTO="timeout 2"
-  [ -z "$CTO" ] && command -v gtimeout >/dev/null 2>&1 && CTO="gtimeout 2"
-  printf '%s' "$BLOB" | $CTO "$CTX_METER" publish >/dev/null 2>&1 || true
-fi
+# (The PUBLISH of the context reading to bin/heimdall-ctx-meter happens below, right after
+# the render attempt: by then $PY3 has either just run for real or been re-resolved, so
+# the meter is handed an interpreter that is KNOWN to work instead of re-proving one.)
 
 # ── LIVE harness-subagent count (cached: background refresh, cheap read) ────────
 # Claude Code Agent-tool subagents (hmd:coder &c.) are owned by the harness and
@@ -484,145 +438,94 @@ fi
 case "$HMD_LIVE_SUBAGENTS" in ''|*[!0-9]*) HMD_LIVE_SUBAGENTS="" ;; esac
 export HMD_LIVE_SUBAGENTS
 
-# ── Cursor host-label normalization ──
-# sentinels/hmd-statusline.py's own model.display_name fallback (when the field is
-# absent/null/empty) defaults to the literal string "Claude" — a holdover from when
-# Claude Code was this bar's only host. Real captured Cursor CLI traffic always
-# carried a populated model.display_name (e.g. "Auto"), so this is an edge case, not
-# the common path — but SKILL.md does not list model.display_name under "may be
-# absent", so a future/early-frame Cursor payload that omits it would silently
-# misattribute the session to Claude. `transcript_path`/`autorun` are Cursor-exclusive
-# keys (SKILL.md; never present in Claude Code's statusLine schema — confirmed against
-# test/heimdall-statusline-parity.test.sh's canned() fixture), so this probe costs
-# Claude Code's hot path nothing: the case pattern never matches there and the whole
-# block is skipped. Only rewrites $BLOB when display_name is genuinely missing — the
-# common case (already populated) prints nothing and leaves $BLOB byte-identical.
-case "$BLOB" in
-  *'"transcript_path"'*|*'"autorun"'*)
-    NORMALIZED=""
-    if [ -n "$PY3" ]; then
-      NORMALIZED="$(printf '%s' "$BLOB" | "$PY3" -c '
-import json, sys
-try:
-    b = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-if not isinstance(b, dict):
-    sys.exit(0)
-m = b.get("model")
-if not isinstance(m, dict):
-    m = {}
-if not (m.get("display_name") or "").strip():
-    m["display_name"] = "Cursor"
-    b["model"] = m
-    print(json.dumps(b))
-' 2>/dev/null)"
-    fi
-    if [ -z "$NORMALIZED" ] && command -v jq >/dev/null 2>&1; then
-      NORMALIZED="$(printf '%s' "$BLOB" | jq -c '
-        if ((.model.display_name // "") | length) == 0
-        then .model = ((.model // {}) + {display_name: "Cursor"})
-        else empty end
-      ' 2>/dev/null)"
-    fi
-    [ -n "$NORMALIZED" ] && BLOB="$NORMALIZED"
-    ;;
-esac
+# ── Host-boundary corrections: Cursor label, render_width_chars, CTX honesty ──
+# Three corrections to the host's payload used to run HERE as three separate python
+# launches wrapped around the watchman: the Cursor host-label normalizer (a blank
+# model.display_name on a Cursor-shaped payload -> "Cursor", not the watchman's "Claude"
+# default), the render_width_chars probe (above), and the CTX-honesty post-process of
+# the rendered rows (a null/absent used_percentage must never render as "CTX 0%").
+# All three are the watchman's job now, in the interpreter it launches anyway, switched
+# on by the one flag passed below. The reasoning for each (why the boundary and not the
+# gauge, why the Cursor keys are probed as raw substrings, the reserve precedence) moved
+# with the code: sentinels/hmd-statusline.py — resolve_cols, _apply_host_boundary and
+# _ctx_unavailable_row — and test/heimdall-statusline-host-boundary.test.sh pins both
+# halves (flag on: corrected; flag off: the legacy renderer other suites rely on).
+# Output through this wrapper is byte-identical to the three-launch version
+# (heimdall-statusline-cursor-payload / -parity / -density / -fullbleed).
 
 # ── PRIMARY: the full-width watchman ──
 # Capture first; emit only on success (nonempty). Any failure falls through.
+WM=""
 if [ -n "$PY3" ] && [ -f "$WATCHMAN" ]; then
   # hand the watchman the SAME color verdict the legacy fallback honors, so the
   # swarm block + HUD collapse to clean plain text in CI/pipes with no truecolor.
-  WM="$(printf '%s' "$BLOB" | "$PY3" "$WATCHMAN" "$COLOR_FLAG" 2>/dev/null)"
-  if [ -n "$WM" ]; then
-    # ── CTX HONESTY: null/absent used_percentage must never render as "CTX 0%" ──
-    # sentinels/hmd-statusline.py:1828 and sentinels/hmd_gauge.py:311 both
-    # unconditionally coerce a missing used_percentage to 0.0 before the gauge ever
-    # sees it -- there is no "unavailable" branch in render_gauge() (unlike this
-    # same renderer's OWN render_micro_gauge()/micro_text(), which already treats
-    # pct=None as "bare label, never a fabricated 0%" -- hmd_gauge.py:356-443).
-    # That function is out of this file's scope to edit, so the boundary corrects
-    # the ALREADY-RENDERED row instead: this is the ONE row on the whole HUD driven
-    # by used_percentage, so once we know from the pre-render blob that the signal
-    # was genuinely null/absent (never for a real reading, including a genuine 0),
-    # we can find that exact row by its own literal "CTX" label and replace it --
-    # never touching any other row, never re-deriving the gauge's own cell/gradient
-    # model. The replacement reuses this SAME render's own already-chosen color for
-    # the HUD's existing "unknown signal" idiom (the "– gates offline" / "◦ watching"
-    # rows) so it never invents a new visual language, and it degrades to plain,
-    # uncolored text under --no-color exactly like those sibling rows do.
-    WM="$(printf '%s' "$WM" | HMD_CTX_BLOB="$BLOB" HMD_CTX_COLOR="$COLOR_FLAG" "$PY3" -c '
-import json, os, re, sys
-
-text = sys.stdin.read()
-try:
-    blob_raw = os.environ.get("HMD_CTX_BLOB", "")
-    no_color = os.environ.get("HMD_CTX_COLOR", "") == "--no-color"
-    unavailable = False
-    b = json.loads(blob_raw) if blob_raw else {}
-    if isinstance(b, dict):
-        cw = b.get("context_window")
-        if not isinstance(cw, dict):
-            unavailable = True
-        else:
-            up = cw.get("used_percentage")
-            if not isinstance(up, (int, float)) or isinstance(up, bool):
-                unavailable = True
-    if not unavailable:
-        sys.stdout.write(text)
-        sys.exit(0)
-
-    ANSI = re.compile(r"\033\[[0-9;]*m")
-    MARGIN = re.compile(r"^▄+")
-
-    def raw_offset(line, target_idx):
-        visible = 0
-        i = 0
-        n = len(line)
-        while i < n:
-            m = ANSI.match(line, i)
-            if m:
-                i = m.end()
-                continue
-            if visible == target_idx:
-                return i
-            visible += 1
-            i += 1
-        return len(line)
-
-    style_open, style_close = "", ""
-    if not no_color:
-        style_re = re.compile(r"((?:\033\[[0-9;]*m)+)[–◦] ")
-        for probe in text.split("\n"):
-            m = style_re.search(probe)
-            if m:
-                style_open, style_close = m.group(1), "\033[0m"
-                break
-        if not style_open:
-            style_open, style_close = "\033[2m", "\033[0m"
-
-    out = []
-    replaced = False
-    for line in text.split("\n"):
-        plain = ANSI.sub("", line)
-        if not replaced:
-            mm = MARGIN.match(plain)
-            margin_len = mm.end() if mm else 0
-            remainder = plain[margin_len:].lstrip()
-            if remainder.startswith("CTX"):
-                cut = raw_offset(line, margin_len)
-                out.append(line[:cut] + " " + style_open + "– CTX unavailable" + style_close)
-                replaced = True
-                continue
-        out.append(line)
-    sys.stdout.write("\n".join(out))
-except Exception:
-    sys.stdout.write(text)
-' 2>/dev/null || printf '%s' "$WM")"
-    printf '%s\n' "$WM"
-    exit 0
+  WM="$(printf '%s' "$BLOB" | "$PY3" "$WATCHMAN" "$COLOR_FLAG" --host-boundary 2>/dev/null)"
+  # Verify by use: $PY3 may be the cached path, trusted without a probe. An empty render
+  # is the one moment worth finding out whether the interpreter is what broke — re-resolve
+  # through hmd_python (probes, deletes a stale cache, names a working one) and retry ONCE,
+  # and only when that names a DIFFERENT interpreter: if it names the same one, the
+  # watchman itself is what failed and a second identical launch would only repeat it.
+  if [ -z "$WM" ] && [ "$PY3_PROVEN" = 0 ] && type hmd_python >/dev/null 2>&1; then
+    PY3_FRESH="$(hmd_python 2>/dev/null || true)"
+    if [ -n "$PY3_FRESH" ]; then PY3_PROVEN=1; else PY3_FRESH="$(command -v python3 2>/dev/null || true)"; fi
+    if [ -n "$PY3_FRESH" ] && [ "$PY3_FRESH" != "$PY3" ]; then
+      PY3="$PY3_FRESH"
+      WM="$(printf '%s' "$BLOB" | "$PY3" "$WATCHMAN" "$COLOR_FLAG" --host-boundary 2>/dev/null)"
+    fi
   fi
+  [ -z "$WM" ] || PY3_PROVEN=1
+fi
+
+# ── PUBLISH the context reading for the per-prompt meter (bin/heimdall-ctx-meter) ──
+# Claude Code exposes context size in exactly ONE place: this statusLine stdin blob
+# (context_window.total_input_tokens). No hook receives it — UserPromptSubmit sees only
+# the prompt and the session id. So the BAR is the publisher: it hands the meter the
+# SAME blob its own CTX% gauge reads, and the UserPromptSubmit hook reads what the meter
+# stored. One parser of one field — a second estimator that could disagree with the
+# number on screen would be worse than no meter at all.
+#
+# Why it matters (docs/analysis/token-spend-forensics.md): one session ran 15 days at a
+# mean context of 501,000 tokens and cost $913.54 — 82.8% of a three-week $1,103 bill.
+# Capping at ~150K provably recovers $369.50. Drift is invisible without this.
+#
+# Same never-error contract as the rest of the bar: hard time ceiling when one is
+# available, output fully discarded, every failure path a no-op. Cursor's own schema
+# (~/.cursor/skills-cursor/statusline/SKILL.md) DOES carry
+# context_window.total_input_tokens too — documented there as an ESTIMATE derived from
+# used_percentage rather than an exact API count — so this publish call is a REAL write
+# under Cursor as well, not a no-op: it records that estimate under the Cursor
+# session's own session_id. Records are keyed per session_id, so a Cursor estimate can
+# never blend with or overwrite an exact Claude Code reading. The early-session window
+# where Cursor's used_percentage (and by extension total_input_tokens) may be null is
+# already covered by the SAME guard that protects a missing CC signal: publish already
+# treats "no context signal" as "write nothing", never a fabricated 0.
+#
+# COST: this call used to be the single most expensive stage of a render — 362ms median
+# idle (4 interpreter launches for a Cursor payload, 8 for a Claude Code one: every
+# field re-validated the interpreter through `$(hmd_python)` and then parsed). It is now
+# ONE parse, and the interpreter this render just proved is handed over through
+# HMD_PYTHON (honoured without a probe). Runs after the render and before ANY exit below
+# — the record is on disk when this process ends, which test/heimdall-statusline-
+# parity.test.sh and test/ctx-meter.test.sh both read the instant it does. An
+# interpreter that is not proven (no render succeeded, nothing probed) is NOT forced on
+# the meter: it resolves for itself, as it always did.
+CTX_METER="$HERE/heimdall-ctx-meter"
+if [ -n "$BLOB" ] && [ -x "$CTX_METER" ]; then
+  CTO=""
+  command -v timeout  >/dev/null 2>&1 && CTO="timeout 2"
+  [ -z "$CTO" ] && command -v gtimeout >/dev/null 2>&1 && CTO="gtimeout 2"
+  if [ "$PY3_PROVEN" = 1 ] && [ -n "$PY3" ]; then
+    printf '%s' "$BLOB" | HMD_PYTHON="$PY3" $CTO "$CTX_METER" publish >/dev/null 2>&1 || true
+  else
+    printf '%s' "$BLOB" | $CTO "$CTX_METER" publish >/dev/null 2>&1 || true
+  fi
+fi
+
+# The watchman produced a render (with the host-boundary corrections already applied):
+# emit it. Anything else falls through to the legacy fallbacks below.
+if [ -n "$WM" ]; then
+  printf '%s\n' "$WM"
+  exit 0
 fi
 
 # ── FALLBACK: legacy single-line instrument ──

@@ -370,10 +370,24 @@ if jq -e '.panels | all(has("id") and has("title") and has("type") and has("data
 else
   bad "1.10 an entry is missing a contract key or has a wrong type: $(jq -c '[.panels[]|{id,keys:(keys),u:(.updated_at|type),s:(.stale|type)}]' "$STATE" 2>/dev/null | head -c 600)"
 fi
-if jq -e '[.panels[] | select(.id|startswith("rt-")) | .stale] | all(. == false)' "$STATE" >/dev/null 2>&1; then
-  ok "1.11 freshly set panels are stale==false (L370-373)"
+# Assert only on the rt-* panels the SERVER itself reports as young: its snapshot `ts` minus the
+# panel's updated_at <= 25s. The rt-* panels are set one after another (each a python start plus a
+# state poll), so on a loaded machine the first of them is legitimately >30s old by now and
+# "every rt-* is stale==false" measured the machine's speed, not the L370-373 contract. 25 sits
+# under the 30s floor (L373) with 5s to spare for the gap between the snapshot stamping `ts` and
+# evaluating `stale`. The selection must be NON-EMPTY or the `all` would pass vacuously: rt-file
+# (set last, 1.9) is only seconds old at the snapshot that served it, so it qualifies unless the
+# machine stalled for 25s+ between that set and the poll that served it -- and then this FAILS
+# loudly (empty selection) rather than passing on nothing.
+FRESH_RT='.ts as $ts | [.panels[] | select(.id|startswith("rt-")) | select(($ts - .updated_at) <= 25)]'
+# The failure rendering is built in a variable on purpose: inline as "...map({id,stale,age:(\$ts ...)})"
+# inside $( ) inside bad()'s quoted argument, macOS /bin/bash 3.2 brace-expands the object and jq is
+# handed broken programs, so the message came out blank.
+FRESH_RT_DIAG="$FRESH_RT"' | map({id,stale,age:($ts - .updated_at)})'
+if jq -e "$FRESH_RT | length > 0 and all(.stale == false)" "$STATE" >/dev/null 2>&1; then
+  ok "1.11 freshly set panels (server-reported age <= 25s) are stale==false (L370-373)"
 else
-  bad "1.11 a fresh panel is already stale: $(jq -c '[.panels[]|select(.id|startswith("rt-"))|{id,stale}]' "$STATE" 2>/dev/null)"
+  bad "1.11 a fresh panel is already stale, or no rt-* panel was young enough to assert on: $(jq -c "$FRESH_RT_DIAG" "$STATE" 2>/dev/null)"
 fi
 
 # ═══ 2. `source` is refused outright (RCE surface) ═══════════════════════
@@ -571,16 +585,21 @@ if printf '{"value":1}' | panel set stale-demo --type number --title "Stale" --d
 else
   bad "7. stale-demo not served fresh: $(jq -c '[.panels[]|select(.id=="stale-demo")]' "$STATE" 2>/dev/null)"
 fi
-# backdate 20s: under max(3,30)=30 -> still fresh (refresh_s*3 is NOT the floor)
+# backdate 10s: under max(3,30)=30 -> still fresh (refresh_s*3 = 3 is NOT the floor: a missing
+# floor would already call this panel stale). The panel keeps aging after the backdate -- the
+# 4.5s sleep below, then the poll, then however long a loaded machine takes to get the snapshot
+# read -- so the backdate must leave real slack before the 30s line. At 10s it leaves ~15s; the
+# former 20s left ~5s and flaked once load pushed those waits past it. A floor lowered below
+# ~14s (the panel's age when read) is still caught.
 now="$(date +%s)"
-jq --argjson t "$((now - 20))" '.updated_at=$t' "$PANELS/stale-demo.json" > "$PANELS/stale-demo.json.tmp.$$" \
+jq --argjson t "$((now - 10))" '.updated_at=$t' "$PANELS/stale-demo.json" > "$PANELS/stale-demo.json.tmp.$$" \
   && mv -f "$PANELS/stale-demo.json.tmp.$$" "$PANELS/stale-demo.json"
 sleep 4.5
 get_state >/dev/null
 if jq -e '.panels[] | select(.id=="stale-demo") | .stale==false' "$STATE" >/dev/null 2>&1; then
-  ok "7b. backdated 20s with refresh_s=1: still fresh (threshold is max(3, 30)=30s, L373)"
+  ok "7b. backdated 10s with refresh_s=1: still fresh (threshold is max(3, 30)=30s, L373)"
 else
-  bad "7b. 20s old with refresh_s=1 marked stale -- the 30s floor is missing: $(jq -c '[.panels[]|select(.id=="stale-demo")|{stale,updated_at}]' "$STATE")"
+  bad "7b. 10s old with refresh_s=1 marked stale -- the 30s floor is missing: $(jq -c '[.panels[]|select(.id=="stale-demo")|{stale,updated_at}]' "$STATE")"
 fi
 # backdate 100s: over 30 -> stale, still served (not TTL-reaped)
 now="$(date +%s)"
