@@ -1082,7 +1082,7 @@ else
 fi
 HEIMDALL_HOME="$TMPROOT/d6home" "$HOOKS_TOOL" disable phone-deny >/dev/null 2>&1
 run_group HMD_PHONE_DENY=1 HEIMDALL_HOME="$TMPROOT/d6home"
-[ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ] && ok "D6d. flag on but the group disabled (hmd hooks disable phone-deny) -> never launched" \
+[ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ] && ok "D6d. flag on but the group disabled (heimdall-hooks disable phone-deny) -> never launched" \
   || bad "D6d. a disabled group still launched"
 HEIMDALL_HOME="$TMPROOT/d6home" "$HOOKS_TOOL" enable phone-deny >/dev/null 2>&1
 run_group HMD_PHONE_DENY=1 HEIMDALL_HOME="$TMPROOT/d6home"

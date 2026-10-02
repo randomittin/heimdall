@@ -6,7 +6,7 @@ shell command or an outside-the-repo write while hmd holds it for a few seconds;
 anything. A phone only ever REDUCES what runs, and has exactly two verbs for it: `deny` (refuse this
 call) and `stop` (refuse it AND end the turn, like pressing Esc).
 
-OFF BY DEFAULT. The hook does nothing unless HMD_PHONE_DENY=1 (exactly 1), and `hmd hooks disable
+OFF BY DEFAULT. The hook does nothing unless HMD_PHONE_DENY=1 (exactly 1), and `heimdall-hooks disable
 phone-deny` switches the whole group off (hooks/hooks.json runs this script only when the flag is set
 and the group is enabled; the script re-checks the flag itself).
 
