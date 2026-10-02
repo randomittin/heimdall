@@ -3,7 +3,9 @@
 Cloudflare relay (see hmdapp's docs/HANDOFF-TO-HEIMDALL-relay.md and
 docs/superpowers/specs/relay/INVARIANTS.md -- both read-only inputs from the
 hmdapp repo, never edited here) and accepts a `send-message` command back from
-the paired phone.
+the paired phone -- and a `decide` command, the phone's sealed DENY of a pending
+risky action (A4, deny-only round: see `_decide`; nothing else about an action can
+be decided from the phone, and "allow" is refused for every request).
 
 Spawned by `bin/heimdall-app connect --relay <url>` as a sibling process to a
 local `hmd ui`; this process owns the ONE relay session for its lifetime and is
@@ -62,10 +64,11 @@ to drive its own UI; nothing else is ever written to stdout.
                                                        may repeat across a
                                                        stream reconnect
     {"event":"state_sent","seq":N,"bytes":B,"delivered":bool}
-    {"event":"command","action":"send-message","ok":bool,"detail":..}
+    {"event":"command","action":"send-message"|"decide"|..,"ok":bool,"detail":..}
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
-        logged, not even at this level)
+        logged, not even at this level); any action other than the two
+        named is acked `not-implemented`
     {"event":"ack_sent","of_seq":N,"seq":S,"id":..|null,"attempt":K,"ms":N,
      "ok":bool,"delivered":bool}
         one line per POST ATTEMPT of the ack answering a command (so every
@@ -1147,7 +1150,7 @@ class RelayClient:
 def build_argparser():
     ap = argparse.ArgumentParser(prog="heimdall-relay-client",
                                   description="publish hmd ui state through the Cloudflare relay, "
-                                              "E2E sealed, accepting a send-message command back")
+                                              "E2E sealed, accepting send-message and decide (deny-only) commands back")
     ap.add_argument("--relay", required=True, metavar="URL",
                      help="relay base URL, e.g. https://hmd-relay.example.workers.dev")
     ap.add_argument("--repo", required=True, metavar="DIR", help="repo root to render (passed to collect_state)")
