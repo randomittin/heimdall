@@ -14,6 +14,8 @@
 #                                               "allow-not-permitted"|"bad-decision"|"decrypt-failed"}
 #
 # The properties, asserted head-on:
+#   0. a pending request reaches the phone in the sealed state frame (`approvals`, the doc's six
+#      keys, nothing else) and leaves it once decided;
 #   1. a deny from the paired device lands in the decision store and is acked ok with the id;
 #   2. a replay of that deny (fresh seq) is `already-decided`;
 #   3. an `allow` is refused (`allow-not-permitted`), writes nothing, the request stays pending;
@@ -21,7 +23,9 @@
 #   5. a frame NOT sealed under the paired session key (a forgery) is `decrypt-failed` and changes
 #      nothing -- only sealed E2E commands from the bound device count;
 #   6. a genuine frame whose seq was already used is rejected by the replay guard and changes nothing;
-#   7. after all of that abuse a genuine deny still works.
+#   7. after all of that abuse a genuine deny still works;
+#   9. the vocabulary is closed: nothing but `decide` + `deny` does anything -- an `approve`
+#      decision value, an `approve` action and a `stop` action are all refused and change nothing.
 #
 # Hermetic: HOME/HEIMDALL_HOME/TMPDIR are a temp dir, every process this suite starts is reaped on
 # EXIT, every wait is a bounded poll.
@@ -88,14 +92,15 @@ wait_for() {
 
 # Decrypts every sender=hmd envelope in FILE and prints the plaintext of the first whose of_seq is
 # WANT (one JSON line); exit 1 on timeout. of_seq lives inside the sealed payload, so an ack can
-# only be found by opening each frame.
+# only be found by opening each frame. With ONLY_OK=1 an ack that is not {ok:true} is skipped --
+# the way to tell a genuine command's ack from an earlier forgery's that carries the same of_seq.
 wait_for_ack_of_seq() {
-  local file="$1" key_b64="$2" want="$3" secs="${4:-10}"
-  python3 - "$file" "$key_b64" "$want" "$secs" "$E2E_MOD" <<'PYEOF'
+  local file="$1" key_b64="$2" want="$3" secs="${4:-10}" only_ok="${5:-0}"
+  python3 - "$file" "$key_b64" "$want" "$secs" "$E2E_MOD" "$only_ok" <<'PYEOF'
 import sys, json, time, base64
 from importlib.util import spec_from_file_location, module_from_spec
 
-file_path, key_b64, want_s, secs_s, e2e_path = sys.argv[1:6]
+file_path, key_b64, want_s, secs_s, e2e_path, only_ok = sys.argv[1:7]
 want = int(want_s)
 deadline = time.time() + float(secs_s)
 spec = spec_from_file_location("hmd_relay_e2e", e2e_path)
@@ -123,12 +128,64 @@ while True:
             obj = json.loads(plaintext.decode("utf-8"))
         except Exception:
             continue
-        if obj.get("of_seq") == want:
+        if obj.get("of_seq") == want and (only_ok != "1" or obj.get("ok") is True):
             sys.stdout.write(json.dumps(obj) + "\n")
             sys.exit(0)
     if time.time() >= deadline:
         sys.exit(1)
     time.sleep(0.1)
+PYEOF
+}
+
+# Decrypts the sealed `state` frames the client publishes and waits until the NEWEST one's
+# `approvals` slice does (MODE=has) / does not (MODE=lacks) carry request ID. Prints the matching
+# entry as one JSON line (has), or the whole slice (lacks); exit 1 on timeout. Only frames not yet
+# seen are opened, so a long log does not make every poll quadratic.
+wait_for_approvals_state() {
+  local file="$1" key_b64="$2" mode="$3" id="$4" secs="${5:-15}"
+  python3 - "$file" "$key_b64" "$mode" "$id" "$secs" "$E2E_MOD" <<'PYEOF'
+import sys, json, time, base64
+from importlib.util import spec_from_file_location, module_from_spec
+
+file_path, key_b64, mode, want_id, secs_s, e2e_path = sys.argv[1:7]
+deadline = time.time() + float(secs_s)
+spec = spec_from_file_location("hmd_relay_e2e", e2e_path)
+e2e = module_from_spec(spec)
+spec.loader.exec_module(e2e)
+key = base64.b64decode(key_b64)
+seen_lines = 0
+while True:
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    fresh, seen_lines = lines[seen_lines:], len(lines)
+    newest = None
+    for line in fresh:
+        try:
+            env = json.loads(line)
+        except ValueError:
+            continue
+        if env.get("sender") == "hmd" and env.get("type") == "state":
+            newest = env
+    if newest is not None:
+        try:
+            plain = e2e.open_(key, newest["seq"], "hmd", newest.get("nonce"), newest.get("ciphertext"))
+            slice_ = json.loads(plain.decode("utf-8"))["state"].get("approvals")
+        except Exception:
+            slice_ = None
+        if isinstance(slice_, list):
+            mine = [e for e in slice_ if isinstance(e, dict) and e.get("id") == want_id]
+            if mode == "has" and mine:
+                sys.stdout.write(json.dumps(mine[0]) + "\n")
+                sys.exit(0)
+            if mode == "lacks" and not mine:
+                sys.stdout.write(json.dumps(slice_) + "\n")
+                sys.exit(0)
+    if time.time() >= deadline:
+        sys.exit(1)
+    time.sleep(0.3)
 PYEOF
 }
 
@@ -217,10 +274,20 @@ send_cmd() {
     --type command --nonce "$nonce" --ciphertext "$ct" > "$CTL/$(printf '%03d' "$CTL_N").json"
 }
 ack_of() { wait_for_ack_of_seq "$LOG/frames.ndjson" "$KEY_B64" "$1" 10; }
+ack_of_ok() { wait_for_ack_of_seq "$LOG/frames.ndjson" "$KEY_B64" "$1" 10 1; }
 decide_json() { jq -cn --arg id "$1" --arg d "$2" '{action:"decide", params:{id:$id, decision:$d}}'; }
 
-# 1. a deny from the paired device is recorded and acked ok
+# 0. a pending request reaches the phone inside the sealed state frame -- the doc's six keys, no more
 P1="$(new_request "$REPO_T")"
+APPR="$(wait_for_approvals_state "$LOG/frames.ndjson" "$KEY_B64" has "$P1" 20)"
+if printf '%s' "$APPR" | jq -e --arg id "$P1" \
+     'keys == ["expires_at","id","requested_at","risk","summary","tool"] and .id == $id and .tool == "Bash" and .summary == "git push origin main" and .risk == "high"' >/dev/null 2>&1; then
+  ok "0. the pending request is in the sealed state frame's approvals slice with exactly the doc's six keys"
+else
+  bad "0. approvals entry missing or wrong shape in the sealed state frame: ${APPR:-<no frame>}"
+fi
+
+# 1. a deny from the paired device is recorded and acked ok
 send_cmd 1 "$(decide_json "$P1" deny)"
 ACK="$(ack_of 1)"
 if printf '%s' "$ACK" | jq -e --arg id "$P1" '.ok == true and .id == $id and .decision == "deny" and .of_seq == 1' >/dev/null 2>&1; then
@@ -232,6 +299,11 @@ if decision_file_exists "$REPO_T" "$P1" && ! is_pending "$REPO_T" "$P1"; then
   ok "1b. the decision landed in the store (0600 .decision file) and the request left pending()"
 else
   bad "1b. decision file missing, or the request is still pending"
+fi
+if SLICE="$(wait_for_approvals_state "$LOG/frames.ndjson" "$KEY_B64" lacks "$P1" 20)"; then
+  ok "1c. the next sealed state frame no longer lists the decided request (approvals: $SLICE)"
+else
+  bad "1c. the decided request is still in the sealed state frame's approvals slice"
 fi
 
 # 2. a replay of the deny with a fresh seq is already-decided
