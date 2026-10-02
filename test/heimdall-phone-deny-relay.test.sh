@@ -24,11 +24,15 @@
 #      nothing -- only sealed E2E commands from the bound device count;
 #   6. a genuine frame whose seq was already used is rejected by the replay guard and changes nothing;
 #   7. after all of that abuse a genuine deny still works;
-#   9. the vocabulary is closed: nothing but `decide` + `deny` does anything -- an `approve`
-#      decision value, an `approve` action and a `stop` action are all refused and change nothing;
+#   9. the vocabulary is closed: `decide` takes exactly two verbs, `deny` and `stop` (refuse the call;
+#      refuse it and end the turn) -- an `approve` decision value, an `approve` action, a `stop`
+#      ACTION (stop is a verb of decide, not a command of its own) and a case-varied verb are all
+#      refused and change nothing;
 #  10. the whole loop, nothing stubbed: the real bin/heimdall-phone-deny raises a request, the phone
 #      sees it in the sealed state frame, a sealed deny is acked ok and the hook blocks the action;
-#      and when the window runs out untouched a late sealed deny is acked `expired`.
+#      and when the window runs out untouched a late sealed deny is acked `expired`;
+#  11. a sealed `stop` is acked ok with decision "stop", shares the single decision slot with deny,
+#      and the real hook answers it with {continue:false} plus the denied call.
 #
 # Hermetic: HOME/HEIMDALL_HOME/TMPDIR are a temp dir, every process this suite starts is reaped on
 # EXIT, every wait is a bounded poll.
@@ -417,7 +421,7 @@ printf '%s' "$ACK" | jq -e '.ok == false and .detail == "not-implemented"' >/dev
 send_cmd 12 "$(jq -cn --arg id "$P3" '{action:"stop", params:{id:$id}}')"
 ACK="$(ack_of 12)"
 printf '%s' "$ACK" | jq -e '.ok == false and .detail == "not-implemented"' >/dev/null 2>&1 \
-  && ok "9c. action \"stop\" -> detail not-implemented (stop is deferred this round)" || bad "9c. stop action ack wrong: $ACK"
+  && ok "9c. action \"stop\" -> detail not-implemented (stop is a verb of decide, not a command of its own)" || bad "9c. stop action ack wrong: $ACK"
 send_cmd 13 "$(decide_json "$P3" Deny)"
 ACK="$(ack_of 13)"
 printf '%s' "$ACK" | jq -e '.ok == false and .detail == "bad-decision"' >/dev/null 2>&1 \
@@ -469,6 +473,45 @@ if [ ! -s "$TMPROOT/e2e.hook2.out" ] && [ -n "$LATE_ID" ] && printf '%s' "$ACK" 
   ok "10c. window ran out untouched -> the hook printed nothing, and a late sealed deny is acked detail:expired (nothing recorded)"
 else
   bad "10c. converse wrong: hook out=[$(cat "$TMPROOT/e2e.hook2.out")] late_id=[$LATE_ID] ack=[${ACK:-<none>}]"
+fi
+
+# 11. stop, the phone's second reduce-only verb: refuse the call AND end the turn
+P4="$(new_request "$REPO_T")"
+send_cmd 16 "$(decide_json "$P4" stop)"
+ACK="$(ack_of_ok 16)"
+if printf '%s' "$ACK" | jq -e --arg id "$P4" '.ok == true and .id == $id and .decision == "stop" and .of_seq == 16' >/dev/null 2>&1; then
+  ok "11. decide/stop from the paired device -> ack {ok:true, id, decision:stop}"
+else
+  bad "11. stop ack wrong: ${ACK:-<none>}"
+fi
+if decision_file_exists "$REPO_T" "$P4" && jq -e '.decision == "stop"' "$REPO_T/.heimdall/ui/approvals/$P4.decision" >/dev/null 2>&1 \
+   && ! is_pending "$REPO_T" "$P4"; then
+  ok "11b. the stop is on record in the request's single decision slot and the request left pending()"
+else
+  bad "11b. stop not recorded, or the request is still pending"
+fi
+send_cmd 17 "$(decide_json "$P4" deny)"
+ACK="$(ack_of 17)"
+printf '%s' "$ACK" | jq -e '.ok == false and .detail == "already-decided"' >/dev/null 2>&1 \
+  && ok "11c. a deny after a stop (one slot, two verbs) -> already-decided" || bad "11c. deny-after-stop ack wrong: $ACK"
+send_cmd 18 "$(decide_json "$P4" stop)"
+ACK="$(ack_of 18)"
+printf '%s' "$ACK" | jq -e '.ok == false and .detail == "already-decided"' >/dev/null 2>&1 \
+  && ok "11d. a replayed stop -> already-decided" || bad "11d. replayed stop ack wrong: $ACK"
+jq -cn --arg d "$REPO_T" '{hook_event_name:"PreToolUse",session_id:"s",cwd:$d,tool_name:"Bash",tool_input:{command:"git push origin e2e-stop"}}' > "$TMPROOT/e2e.payload3"
+env -u CLAUDE_CODE_ENTRYPOINT HMD_PHONE_DENY=1 HMD_PHONE_DENY_WINDOW_S=40 "$HOOK" --repo "$REPO_T" \
+  < "$TMPROOT/e2e.payload3" > "$TMPROOT/e2e.hook3.out" 2> "$TMPROOT/e2e.hook3.err" &
+E2E_HOOK3_PID=$!; PIDS+=("$E2E_HOOK3_PID")
+ENTRY="$(wait_for_approvals_state "$LOG/frames.ndjson" "$KEY_B64" summary "git push origin e2e-stop" 30)"
+STOP_ID="$(printf '%s' "$ENTRY" | jq -r '.id // empty')"
+send_cmd 19 "$(decide_json "${STOP_ID:-p-00000000}" stop)"
+ACK="$(ack_of_ok 19)"
+i=0; while kill -0 "$E2E_HOOK3_PID" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+if [ -n "$STOP_ID" ] && printf '%s' "$ACK" | jq -e --arg id "$STOP_ID" '.ok == true and .id == $id and .decision == "stop"' >/dev/null 2>&1 \
+   && jq -e '.continue == false and (.stopReason | length > 0) and .hookSpecificOutput.permissionDecision == "deny"' "$TMPROOT/e2e.hook3.out" >/dev/null 2>&1; then
+  ok "11e. real hook + sealed stop: the ack is ok AND the hook prints continue:false with the call denied"
+else
+  bad "11e. ack=[${ACK:-<none>}] hook out=[$(cat "$TMPROOT/e2e.hook3.out")] err=[$(cat "$TMPROOT/e2e.hook3.err")] id=[$STOP_ID]"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

@@ -844,6 +844,33 @@ else
   bad "C8c. the answered request is still listed"
 fi
 
+# C8d -- the phone STOPs inside the window: the same deny, plus the turn is ended ({"continue": false})
+R8="$(mk_repo)"; bash_payload "$R8" "git push origin main" > "$TMPROOT/p.push8s"
+phone_stop "$R8" 0.3
+run_hook "$R8" "$TMPROOT/p.push8s" "${ARMED[@]}" HMD_PHONE_DENY_WINDOW_S=15
+if [ "$HOOK_RC" = 0 ] && printf '%s' "$HOOK_OUT" | jq -e '
+      (keys == ["continue","hookSpecificOutput","stopReason"]) and
+      .continue == false and
+      (.stopReason | type == "string" and length > 10) and
+      (.hookSpecificOutput | keys == ["hookEventName","permissionDecision","permissionDecisionReason"]) and
+      .hookSpecificOutput.hookEventName == "PreToolUse" and
+      .hookSpecificOutput.permissionDecision == "deny" and
+      (.hookSpecificOutput.permissionDecisionReason | type == "string" and length > 20)' >/dev/null 2>&1; then
+  ok "C8d. a stop inside the window -> one object: continue:false + stopReason, AND the call itself denied; exit 0"
+else
+  bad "C8d. stop output wrong: rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] phone=[$(cat "$TMPROOT/phone.log" 2>/dev/null)]"
+fi
+if under "$HOOK_S" 8 && [ "$(approvals_json "$R8")" = "[]" ]; then
+  ok "C8e. the stop returned promptly (${HOOK_S}s) and the request is withdrawn"
+else
+  bad "C8e. stop path slow or leaked: ${HOOK_S}s pending=$(approvals_json "$R8")"
+fi
+if ! printf '%s' "$HOOK_OUT" | grep -q '"allow"' && [ "$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.permissionDecision')" != allow ]; then
+  ok "C8f. the vocabulary stayed closed: no allow anywhere in a stop's output"
+else
+  bad "C8f. an allow leaked into the stop output: $HOOK_OUT"
+fi
+
 # C9 -- while it waits, the request is visible to the phone, live, in the doc's shape
 R9="$(mk_repo)"; bash_payload "$R9" "git push origin main" > "$TMPROOT/p.push9"
 ( env "${ARMED[@]}" HMD_PHONE_DENY_WINDOW_S=6 "$HOOK" --repo "$R9" < "$TMPROOT/p.push9" >"$TMPROOT/c9.out" 2>"$TMPROOT/c9.err" ) &
@@ -864,23 +891,26 @@ else
 fi
 wait "$C9_PID" 2>/dev/null
 
-# C10 -- a decision file that is not a well-formed deny for THIS request is not a deny: the hook
-# never approves, never blocks on garbage
-for kind in allow garbage foreign; do
+# C10 -- a decision file that is not a well-formed deny/stop for THIS request is not a decision: the
+# hook never approves, never blocks on garbage
+for kind in allow approve garbage foreign foreign-stop casestop; do
   R10="$(mk_repo)"; bash_payload "$R10" "git push origin main" > "$TMPROOT/p.push10"
   ( env "${ARMED[@]}" HMD_PHONE_DENY_WINDOW_S=2 "$HOOK" --repo "$R10" < "$TMPROOT/p.push10" >"$TMPROOT/c10.out" 2>"$TMPROOT/c10.err" ) &
   C10_PID=$!; PIDS+=("$C10_PID")
   if wait_pending "$R10" 8; then
     RID="$(approvals_json "$R10" | jq -r '.[0].id')"
     case "$kind" in
-      allow)   printf '{"id":"%s","decision":"allow","decided_at":1}' "$RID" > "$R10/.heimdall/ui/approvals/$RID.decision" ;;
-      garbage) printf 'allow allow allow' > "$R10/.heimdall/ui/approvals/$RID.decision" ;;
-      foreign) printf '{"id":"p-00000000","decision":"deny","decided_at":1}' > "$R10/.heimdall/ui/approvals/$RID.decision" ;;
+      allow)        printf '{"id":"%s","decision":"allow","decided_at":1}' "$RID" > "$R10/.heimdall/ui/approvals/$RID.decision" ;;
+      approve)      printf '{"id":"%s","decision":"approve","decided_at":1}' "$RID" > "$R10/.heimdall/ui/approvals/$RID.decision" ;;
+      garbage)      printf 'allow allow allow' > "$R10/.heimdall/ui/approvals/$RID.decision" ;;
+      foreign)      printf '{"id":"p-00000000","decision":"deny","decided_at":1}' > "$R10/.heimdall/ui/approvals/$RID.decision" ;;
+      foreign-stop) printf '{"id":"p-00000000","decision":"stop","decided_at":1}' > "$R10/.heimdall/ui/approvals/$RID.decision" ;;
+      casestop)     printf '{"id":"%s","decision":"STOP","decided_at":1}' "$RID" > "$R10/.heimdall/ui/approvals/$RID.decision" ;;
     esac
   fi
   wait "$C10_PID" 2>/dev/null
   if [ ! -s "$TMPROOT/c10.out" ] && [ ! -s "$TMPROOT/c10.err" ]; then
-    ok "C10. a planted '$kind' decision file is no deny -> the hook prints nothing (it never approves, never trips on garbage)"
+    ok "C10. a planted '$kind' decision file is no decision -> the hook prints nothing (it never approves, never trips on garbage)"
   else
     bad "C10. a planted '$kind' decision changed the hook's output: out=[$(cat "$TMPROOT/c10.out")] err=[$(cat "$TMPROOT/c10.err")]"
   fi
