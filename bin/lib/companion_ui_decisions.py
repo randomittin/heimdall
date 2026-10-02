@@ -166,6 +166,30 @@ def _write_tmp(directory, obj, now):
     return tmp
 
 
+def _claim(directory, req_id, decision, now):
+    """Take the decision slot of `req_id` with `decision`: True when THIS call created it, False when
+    a decision is already there. The record is written in full to a temp file first and link(2)ed into
+    place -- which fails if the name exists -- so no reader ever sees half a decision and exactly one
+    claimant can win."""
+    tmp = _write_tmp(directory, {"id": req_id, "decision": decision, "decided_at": now}, now)
+    try:
+        os.link(tmp, os.path.join(directory, req_id + ".decision"))
+    except FileExistsError:
+        return False
+    finally:
+        _unlink(tmp)
+    return True
+
+
+def _already_decided(dec_path):
+    """Why a request whose slot is taken cannot take a deny: the hook's own timeout marker means the
+    window closed first (`expired`); anything else is a decision that was already made."""
+    obj = _read_json(dec_path)
+    if obj is not None and obj.get("decision") == "timeout":
+        return DecisionError("expired", "this request is no longer waiting for a decision")
+    return DecisionError("already-decided", "this request already has a decision")
+
+
 def _sweep(directory, now):
     """Drop request / decision / temp files older than GC_AFTER_S. Only ever called from the
     write path (request()); the read path (pending()) never deletes anything."""
@@ -247,9 +271,25 @@ def decision_of(root, req_id):
     return None
 
 
+def settle(root, req_id, now=None):
+    """The hook's window is over. Returns "deny" when the phone's deny is on record, else None -- and in
+    the same step makes sure no deny can be recorded from now on, by claiming the decision slot with a
+    "timeout" marker. That is the line the whole store turns on: decide() answers OK exactly when this
+    returns "deny", and `expired` exactly when it returns None, so a deny the phone is told was
+    accepted is a deny the hook acts on. Anything unexpected (no such directory, an unwritable one) is
+    None: the hook does nothing."""
+    if not _valid_id(req_id):
+        return None
+    try:
+        claimed = _claim(_approvals_dir(root), req_id, "timeout", _now(now))
+    except OSError:
+        return None
+    return None if claimed else decision_of(root, req_id)
+
+
 def close(root, req_id):
     """The hook is leaving: drop the request so it stops being listed. The decision file (if any)
-    stays, so a replay is still answered `already-decided`."""
+    stays, so a replay is still answered `already-decided` / `expired`."""
     if _valid_id(req_id):
         _unlink(os.path.join(_approvals_dir(root), req_id + ".json"))
 
@@ -261,8 +301,9 @@ def decide(root, req_id, decision, now=None):
         bad-decision          `decision` is not "allow"/"deny" (a string)
         unknown-id            `req_id` is not an id this store ever issued (or is shaped like a path)
         allow-not-permitted   "allow", for EVERY request, in this version
-        already-decided       a decision file exists (the single-use rule)
-        expired               past expires_at, or the hook stopped heartbeating
+        already-decided       a deny is already on record (the single-use rule)
+        expired               the hook already gave up (its timeout marker), or past expires_at, or the
+                              hook stopped heartbeating
     """
     now = _now(now)
     if not isinstance(decision, str) or decision not in ("allow", "deny"):
@@ -277,7 +318,7 @@ def decide(root, req_id, decision, now=None):
     if decision == "allow":
         raise DecisionError("allow-not-permitted", "the phone cannot approve an action")
     if os.path.exists(dec_path):
-        raise DecisionError("already-decided", "this request already has a decision")
+        raise _already_decided(dec_path)
     rec = _read_json(req_path)
     try:
         beat = os.stat(req_path).st_mtime
@@ -287,17 +328,8 @@ def decide(root, req_id, decision, now=None):
         raise DecisionError("unknown-id", "no such approval request")
     if now >= rec["expires_at"] or now - beat > HEARTBEAT_STALE_S:
         raise DecisionError("expired", "this request is no longer waiting for a decision")
-    try:
-        fd = os.open(dec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        raise DecisionError("already-decided", "this request already has a decision") from None
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(json.dumps({"id": req_id, "decision": "deny", "decided_at": now},
-                           sort_keys=True, separators=(",", ":")))
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(dec_path, 0o600)
-    os.utime(dec_path, (now, now))
+    if not _claim(d, req_id, "deny", now):
+        raise _already_decided(dec_path)
     return {"id": req_id, "decision": "deny"}
 
 

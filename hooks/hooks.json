@@ -106,6 +106,16 @@
             "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; LCG=\"$PLUGIN/bin/heimdall-lintconfig-guard\"; if [ -x \"$LCG\" ]; then printf '%s' \"$INPUT\" | \"$LCG\"; else exit 0; fi"
           }
         ]
+      },
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${HMD_PHONE_DENY:-}\" = \"1\" ] || exit 0; HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled phone-deny && exit 0; HOOK=\"$HMDP/bin/heimdall-phone-deny\"; [ -x \"$HOOK\" ] || exit 0; \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; exit 0",
+            "timeout": 150
+          }
+        ]
       }
     ],
     "PostToolUse": [
