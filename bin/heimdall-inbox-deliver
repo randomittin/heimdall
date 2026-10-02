@@ -201,6 +201,18 @@ Modes:
            marker as `stop`) as hookSpecificOutput.additionalContext. No
            output if the queue is empty.
 
+  tool     PreToolUse / PostToolUse hook, the MID-TURN path (hook JSON on
+           stdin). Pops any pending messages and prints them, behind the same
+           provenance marker, as {"hookSpecificOutput":{"hookEventName":
+           "<the payload's event>","additionalContext":"..."}} -- Claude Code
+           adds that next to the tool result and reads it on its next request,
+           so a message lands at the next tool boundary instead of when the
+           turn ends. Pops nothing, prints nothing, for any other event, for
+           an unattended session (headless claude -p / SDK, hmd sub-session)
+           and for a subagent's own tool call (payload carries agent_id); no
+           output on an empty queue. hooks/hooks.json guards it with a file-size
+           test so an empty inbox costs no process.
+
   status   Prints {"pending": N, "waiting": bool} and exits. Never pops.
            --json is accepted (output is always JSON either way).
 
@@ -219,6 +231,10 @@ Env:
                      counts as typing while that is under 10. Default on macOS:
                      HIDIdleTime via ioreg; elsewhere none, so the terminal read
                      alone decides. Empty or off/0/false/no/none removes the check.
+  HMD_INBOX_WATCH    how the `stop` hold waits for the inbox to change. Default:
+                     kqueue where the platform has it (macOS, BSD), else a 50ms
+                     stat poll. "poll" forces the stat poll. Either way the hold
+                     still looks every 2s as a backstop.
   HMD_TMUX_TARGET    tmux target (session:window.pane) for `tmux` mode.
 
 IMPORTANT: a Stop hook wired to `stop` mode can run for up to
@@ -272,12 +288,12 @@ fi
 
 command -v python3 >/dev/null 2>&1 || exit 0
 
-# Only stop/prompt carry a hook JSON payload on stdin. tmux/status never read
+# Only stop/prompt/tool carry a hook JSON payload on stdin. tmux/status never read
 # stdin at all, so a manual/interactive invocation of those two modes can
 # never block waiting on a terminal.
 INPUT=""
 case "$MODE" in
-  stop|prompt) INPUT="$(cat 2>/dev/null || true)" ;;
+  stop|prompt|tool) INPUT="$(cat 2>/dev/null || true)" ;;
 esac
 
 PY_SRC=$(cat <<'PYEOF'
@@ -378,7 +394,7 @@ def read_stdin_json(raw):
 def resolve_repo(hook):
     if REPO_EXPLICIT:
         return REPO_EXPLICIT
-    if MODE in ("stop", "prompt"):
+    if MODE in ("stop", "prompt", "tool"):
         cwd = hook.get("cwd")
         if isinstance(cwd, str) and cwd.strip():
             return cwd.strip()
@@ -1107,7 +1123,7 @@ def cmd_status(root):
 
 
 def main():
-    raw_stdin = sys.stdin.read() if MODE in ("stop", "prompt") else ""
+    raw_stdin = sys.stdin.read() if MODE in ("stop", "prompt", "tool") else ""
     hook = read_stdin_json(raw_stdin)
     root = resolve_repo(hook)
     if not root:
@@ -1119,6 +1135,8 @@ def main():
         cmd_tmux(root)
     elif MODE == "prompt":
         cmd_prompt(hook, root)
+    elif MODE == "tool":
+        cmd_tool(hook, root)
     elif MODE == "status":
         cmd_status(root)
     # any other/unknown mode: no-op
