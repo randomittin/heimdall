@@ -1,0 +1,333 @@
+{
+  "contract": "hmd-relay-wire",
+  "version": 1,
+  "about": [
+    "Wire-protocol fixtures for the hmd relay, shared by every party that speaks it.",
+    "Relay side: relay/test/contract.spec.ts (the real Worker + Durable Object) and relay/scripts/__tests__/contract-fixtures.test.mjs (the JS crypto and envelope codec).",
+    "hmd side: test/relay-contract-fixtures.test.sh replays this file against bin/heimdall-relay-client with no network.",
+    "$name in a string is a binding (see `bindings`). A value the relay mints (ids, codes, tokens, clocks) is matched by pattern when the relay is the producer, and takes its example when a client is fed it. A `computed` binding is derived from vectors.json by each consumer, so no key ever sits in this file.",
+    "Everything a client or the phone sends is replayed byte for byte: JSON is serialized compact with the key order stored here.",
+    "Sealed frames in `frames` are sealed under the session key HKDF(ECDH(hmdSeedHex, phnSeedHex)) with salt = bindings.session_id.example, sender tags hmd\\0 / phn\\0, nonce = tag + seq (8 bytes, big endian). hmd frames' plaintext is serialized with sorted keys (what the client does); phone frames' in the app's insertion order.",
+    "The relay routes by URL and never reads envelope.session_id, so these sealed frames carry the fixture's session id, not the live one the relay minted."
+  ],
+  "bindings": {
+    "session_id": {
+      "match": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "example": "ef5a2950-611b-4c1b-9e6c-96cbed2c0815"
+    },
+    "pairing_code": {
+      "match": "^[A-Z2-7]{26}$",
+      "example": "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    },
+    "relay_session_token": {
+      "match": "^[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "device_token": {
+      "match": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecret.FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "epoch_seconds": {
+      "match": "^[0-9]{10}$",
+      "type": "integer",
+      "example": 1790000000
+    },
+    "relay_url": {
+      "example": "https://relay.example"
+    },
+    "device_pubkey": {
+      "computed": "device_pubkey_b64url"
+    },
+    "hmd_pubkey": {
+      "computed": "hmd_pubkey_b64"
+    }
+  },
+  "pair_init": {
+    "request": {
+      "method": "POST",
+      "path": "/pair/init",
+      "headers": {
+        "Content-Length": "0"
+      },
+      "body": ""
+    },
+    "response": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": {
+        "session_id": "$session_id",
+        "pairing_code": "$pairing_code",
+        "relay_session_token": "$relay_session_token",
+        "exp": "$epoch_seconds"
+      }
+    },
+    "qr": {
+      "v": 1,
+      "relay": "$relay_url",
+      "session_id": "$session_id",
+      "pairing_code": "$pairing_code",
+      "exp": "$epoch_seconds",
+      "hmd_pubkey": "$hmd_pubkey"
+    }
+  },
+  "stream": {
+    "request": {
+      "method": "GET",
+      "path": "/session/$session_id/stream",
+      "headers": {
+        "Authorization": "Bearer $relay_session_token"
+      }
+    },
+    "response": {
+      "status": 200,
+      "content_type": "application/x-ndjson"
+    },
+    "lines": {
+      "device_bound": {
+        "v": 1,
+        "session_id": "$session_id",
+        "seq": 0,
+        "sender": "relay",
+        "type": "device_bound",
+        "nonce": null,
+        "ciphertext": null,
+        "payload": {
+          "device_pubkey": "$device_pubkey",
+          "bound_at": "$epoch_seconds"
+        }
+      },
+      "keepalive": {
+        "v": 1,
+        "session_id": "$session_id",
+        "seq": 0,
+        "sender": "relay",
+        "type": "keepalive",
+        "nonce": null,
+        "ciphertext": null,
+        "payload": {
+          "ts": "$epoch_seconds"
+        }
+      }
+    }
+  },
+  "phone": {
+    "claim": {
+      "path": "/session/$session_id/ws",
+      "query": {
+        "pairing_code": "$pairing_code",
+        "device_pubkey": "$device_pubkey"
+      },
+      "headers": {
+        "Upgrade": "websocket"
+      },
+      "status": 101
+    },
+    "device_bound": {
+      "v": 1,
+      "session_id": "$session_id",
+      "seq": 0,
+      "sender": "relay",
+      "type": "device_bound",
+      "nonce": null,
+      "ciphertext": null,
+      "payload": {
+        "device_token": "$device_token",
+        "exp": "$epoch_seconds"
+      }
+    },
+    "revoked": {
+      "session_ended": {
+        "v": 1,
+        "session_id": "$session_id",
+        "seq": 0,
+        "sender": "relay",
+        "type": "session_ended",
+        "nonce": null,
+        "ciphertext": null,
+        "payload": {
+          "reason": "revoked"
+        }
+      },
+      "close_code": 4001,
+      "late_claim_status": 410
+    }
+  },
+  "frames_post": {
+    "request": {
+      "method": "POST",
+      "path": "/session/$session_id/frames",
+      "headers": {
+        "Authorization": "Bearer $relay_session_token",
+        "Content-Type": "application/json"
+      }
+    },
+    "response_delivered": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "delivered": true
+      }
+    },
+    "response_undelivered": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "delivered": false
+      }
+    }
+  },
+  "revoke": {
+    "request": {
+      "method": "POST",
+      "path": "/session/$session_id/revoke",
+      "headers": {
+        "Authorization": "Bearer $relay_session_token",
+        "Content-Length": "0"
+      },
+      "body": ""
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  "frames": {
+    "state": {
+      "direction": "hmd->phone",
+      "plaintext": {
+        "state": {
+          "quality_gate": {
+            "clear_to_push": false,
+            "reason": "No heimdall-state.json found. Run 'heimdall-state init' first."
+          },
+          "schema_version": 1,
+          "sweep_receipt": null,
+          "ts": 1789839662.090085
+        }
+      },
+      "wire": {
+        "ciphertext": "4fferdNfZkRWSuJnMs7LtNikNiFBvlZGhB8N3N0M8jItd3XChsRy0oD6mQiRq7iqrEFyNDSTFwIUvDysWG+1ctJZGLK+5bAP1efuZ1vjly78dKC9gsY0CToirkkw8gDzsqm+Ujl0MGUnAq0AYMz4AzR8Z0Cwqn3lITd3SD9W5CwBoVlzmwvtIvK+sGT6ih2W4ZCGVvtZpKVA/r6HQLiWKUtAFrquTKt71xv8EHhuDyycv2Vng6UiBJaiP6+9WTTU5Kfd0/1FiwLG/Uk=",
+        "nonce": "aG1kAAAAAAAAAAAB",
+        "payload": null,
+        "sender": "hmd",
+        "seq": 1,
+        "session_id": "ef5a2950-611b-4c1b-9e6c-96cbed2c0815",
+        "type": "state",
+        "v": 1
+      }
+    },
+    "command_send_message": {
+      "direction": "phone->hmd",
+      "plaintext": {
+        "action": "send-message",
+        "params": {
+          "text": "ship the relay contract fixtures"
+        }
+      },
+      "wire": {
+        "v": 1,
+        "session_id": "ef5a2950-611b-4c1b-9e6c-96cbed2c0815",
+        "seq": 1,
+        "sender": "device",
+        "type": "command",
+        "nonce": "cGhuAAAAAAAAAAAB",
+        "ciphertext": "mpFbYhJeyvsGwgrxnJgIA9BYEaV2kANW9hT4Xwv4c7CwuG2HdbB/f0EDjvydcfIcYrhfKB0zfXzEZa4rxjRgiOMqtWKEXRwD1FGpwtMCnWH7XO5bUmDuImussuEfKw=="
+      }
+    },
+    "ack_send_message": {
+      "direction": "hmd->phone",
+      "plaintext": {
+        "id": "0359abb1-8230-41d7-8200-92bd4fe5eee2",
+        "of_seq": 1,
+        "ok": true
+      },
+      "wire": {
+        "ciphertext": "+JJqRGutnWTsxw/eMAZ+XUUTGL39IvHsNn8zo8TWEESxNpwS0WuVsQuIMjuKDzxz6JJVejHvUM37WiILVbWRFpcAsPM+XINI3ZzFlv14iyQaAw==",
+        "nonce": "aG1kAAAAAAAAAAAC",
+        "payload": null,
+        "sender": "hmd",
+        "seq": 2,
+        "session_id": "ef5a2950-611b-4c1b-9e6c-96cbed2c0815",
+        "type": "ack",
+        "v": 1
+      }
+    },
+    "command_decide_allow": {
+      "direction": "phone->hmd",
+      "plaintext": {
+        "action": "decide",
+        "params": {
+          "id": "p-0a1b2c3d",
+          "decision": "allow"
+        }
+      },
+      "wire": {
+        "v": 1,
+        "session_id": "ef5a2950-611b-4c1b-9e6c-96cbed2c0815",
+        "seq": 2,
+        "sender": "device",
+        "type": "command",
+        "nonce": "cGhuAAAAAAAAAAAC",
+        "ciphertext": "epDhZ3zuZzGrSh//h8vJeDcxbZYPXPy4Qh/EwFdAYenzrlzAECAH8HQiitTFfKmpm7Brg9AijjFInrOTcxBcA7rRm5fdhK7BYVTrURdcEgWtLAk="
+      }
+    },
+    "ack_decide_allow": {
+      "direction": "hmd->phone",
+      "plaintext": {
+        "detail": "allow-not-permitted",
+        "of_seq": 2,
+        "ok": false
+      },
+      "wire": {
+        "ciphertext": "w6XaYMMw1a0WRUQtFqVL6Dzhx02fWEpksdX/JJGumEGRHzhfbQecIqV4rjOGo5ZVVosyqL9zfahkbbTCUqseAGES8/+vww==",
+        "nonce": "aG1kAAAAAAAAAAAD",
+        "payload": null,
+        "sender": "hmd",
+        "seq": 3,
+        "session_id": "ef5a2950-611b-4c1b-9e6c-96cbed2c0815",
+        "type": "ack",
+        "v": 1
+      }
+    },
+    "command_decide_deny": {
+      "direction": "phone->hmd",
+      "plaintext": {
+        "action": "decide",
+        "params": {
+          "id": "p-0a1b2c3d",
+          "decision": "deny"
+        }
+      },
+      "wire": {
+        "v": 1,
+        "session_id": "ef5a2950-611b-4c1b-9e6c-96cbed2c0815",
+        "seq": 3,
+        "sender": "device",
+        "type": "command",
+        "nonce": "cGhuAAAAAAAAAAAD",
+        "ciphertext": "Igmh13DHh/w9TrDKUooTSpiKK1tjvE4LxUpUwpBnja+nmTIpQ5hjGu7VvLf06/+stGBJGIDr0oFwx/zD/yQOz8BoLNZ/86gcUFrU5FU0G/s1AA=="
+      }
+    },
+    "ack_decide_deny": {
+      "direction": "hmd->phone",
+      "plaintext": {
+        "decision": "deny",
+        "id": "p-0a1b2c3d",
+        "of_seq": 3,
+        "ok": true
+      },
+      "wire": {
+        "ciphertext": "SWsZtc1iPSnewgKhgHtAc2P6x7VkkhS9N0K8d3t+xO3rgrbWmDM/R11HPLHnpMrX5fx4Nl3GiT8LopdnmeI2f2vnD9RRSt7nuY8=",
+        "nonce": "aG1kAAAAAAAAAAAE",
+        "payload": null,
+        "sender": "hmd",
+        "seq": 4,
+        "session_id": "ef5a2950-611b-4c1b-9e6c-96cbed2c0815",
+        "type": "ack",
+        "v": 1
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+name = "hmd-relay"
+main = "src/worker.ts"
+compatibility_date = "2026-08-22"
+
+# RELAY_SIGNING_SECRET is deliberately NOT declared here as a [vars] plaintext
+# value — it is a Workers secret in every real environment:
+#   local dev:  relay/.dev.vars (gitignored) -> RELAY_SIGNING_SECRET=<value>
+#   deployed:   `wrangler secret put RELAY_SIGNING_SECRET`
+#   vitest:     injected via vitest.config.ts's miniflare bindings (test-only)
+# See README.md.
+
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionDO"]
