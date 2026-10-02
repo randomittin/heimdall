@@ -1314,6 +1314,43 @@ for CASE in "inline quiet 6" "module quiet 6" "inline churn 4" "module churn 4";
   fi
   rm -rf "$D" "$PL"
 done
+
+echo "47. TOOL mode: what bash can refuse never starts python (a stale message must not tax every tool call of every headless session and subagent, ~0.2s each):"
+REALPY="$(command -v python3)"
+SHIM="$(mktemp -d)"
+SPAWNED="$SHIM/spawned"
+printf '#!/bin/sh\necho spawned >> "%s"\nexec "%s" "$@"\n' "$SPAWNED" "$REALPY" > "$SHIM/python3"
+chmod +x "$SHIM/python3"
+D="$(make_project)"
+OUTF="$(mktemp)"
+refused() {   # refused LABEL EXTRA_JSON [VAR=VALUE...] -- no output, message left queued, python3 never ran
+  local label="$1" extra="$2"
+  shift 2
+  seed_inbox "$D" "stale message"
+  rm -f "$SPAWNED"
+  tool_run "$D" PostToolUse "$OUTF" "$extra" PATH="$SHIM:$PATH" "$@"
+  if [ ! -s "$OUTF" ] && queued "$D" "stale message" && [ ! -e "$SPAWNED" ]; then ok "$label: refused without starting python"; else bad "$label: out='$(cat "$OUTF")' python-started=$([ -e "$SPAWNED" ] && echo yes || echo no)"; fi
+}
+delivered() {   # delivered LABEL EXTRA_JSON [VAR=VALUE...] -- python IS the judge here, and it delivers
+  local label="$1" extra="$2" v
+  shift 2
+  seed_inbox "$D" "stale message"
+  rm -f "$SPAWNED"
+  tool_run "$D" PostToolUse "$OUTF" "$extra" PATH="$SHIM:$PATH" "$@"
+  v="$(python3 "$TOOLCHK" "$OUTF" PostToolUse "$MARKER" "stale message")"
+  if [ "$v" = "OK" ] && [ -e "$SPAWNED" ]; then ok "$label: left to python, which delivered it"; else bad "$label: $v python-started=$([ -e "$SPAWNED" ] && echo yes || echo no)"; fi
+}
+for CASE in "CLAUDE_CODE_ENTRYPOINT=sdk-cli" "CLAUDE_CODE_ENTRYPOINT=sdk-ts" "CLAUDE_CODE_ENTRYPOINT=sdk-py" "CLAUDE_CODE_ENTRYPOINT=mcp" "CLAUDE_CODE_ENTRYPOINT=claude-code-github-action" "HMD_AGENT_TYPE=hmd:coder" "HMD_JUDGMENT=1" "HMD_JUDGMENT=true"; do
+  refused "$CASE" "" "$CASE"
+done
+refused "a subagent's own tool call (agent_id)" ',"agent_id":"agent-7","agent_type":"Explore"'
+delivered "attended main thread (control: the shim does see python start)" ""
+# The bash refusal is a strict subset of python's: anything python would let through, bash must too.
+delivered "HMD_JUDGMENT=' 0 ' (python strips it to 0: attended)" "" "HMD_JUDGMENT= 0 "
+delivered "HMD_AGENT_TYPE='  ' (python strips it to nothing: attended)" "" "HMD_AGENT_TYPE=  "
+delivered "agent_id is the empty string (python: falsy, the main thread)" ',"agent_id":""'
+delivered "HMD_JUDGMENT=false (any case) is not a judge" "" HMD_JUDGMENT=FALSE
+rm -rf "$D" "$OUTF" "$SHIM"
 rm -f "$HOLDCPU" "$TOOLCHK" "$TOOLREC"
 
 echo ""

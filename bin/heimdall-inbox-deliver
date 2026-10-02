@@ -296,6 +296,22 @@ case "$MODE" in
   stop|prompt|tool) INPUT="$(cat 2>/dev/null || true)" ;;
 esac
 
+# tool mode answers on EVERY tool call of every session that loads the plugin (twice a
+# call: Pre and Post), and a message can sit queued for hours with nobody at the terminal.
+# What the python below would refuse anyway is refused here, before bash parses the python
+# source and python starts: ~15ms a call instead of ~200ms, for headless and hmd
+# sub-sessions and for every tool call a subagent makes while the message waits for the
+# main thread. Strictly a SUBSET of attended_session() and cmd_tool() -- a value with
+# whitespace in it, or an agent_id that is not a plain non-empty string in compact JSON,
+# is left for python to judge -- so this can only ever be too permissive, never too strict.
+if [ "$MODE" = tool ]; then
+  case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-cli|sdk-ts|sdk-py|mcp|claude-code-github-action) exit 0 ;; esac
+  case "${HMD_AGENT_TYPE:-}" in ""|*[[:space:]]*) ;; *) exit 0 ;; esac
+  case "${HMD_JUDGMENT:-}" in ""|*[[:space:]]*|0|[Ff][Aa][Ll][Ss][Ee]) ;; *) exit 0 ;; esac
+  AGENT_KEY='"agent_id":"'
+  case "$INPUT" in *"$AGENT_KEY"[!\"]*) exit 0 ;; esac
+fi
+
 PY_SRC=$(cat <<'PYEOF'
 import fcntl, json, os, re, select, shlex, shutil, subprocess, sys, time
 
