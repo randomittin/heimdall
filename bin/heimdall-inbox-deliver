@@ -6,7 +6,7 @@
 # appending to <repo>/.heimdall/ui/inbox.jsonl. Nothing about that append
 # reaches the Claude Code session on its own -- something has to notice the
 # queue and inject the text at a point Claude Code will actually read it.
-# This is that something, with three independent injection points:
+# This is that something, with four independent injection points:
 #
 #   stop    Claude Code's Stop hook. If a message is already queued, pops it
 #           and returns {"decision":"block","reason":"<marker>+<text>"} --
@@ -17,8 +17,8 @@
 #           from the paired phone, never a same-privilege instruction. If the
 #           queue is empty but the turn just ended on a question to the user
 #           -- or a companion is connected (IDLE-SESSION DELIVERY, below),
-#           whatever the turn ended on -- long-polls the queue (every 2s, up
-#           to $HMD_INBOX_WAIT_S) so a phone message still reaches this
+#           whatever the turn ended on -- long-polls the queue (woken the moment
+#           it changes; a 2s look is the backstop; up to $HMD_INBOX_WAIT_S) so a phone message still reaches this
 #           session instead of being stranded until the next turn boundary.
 #   tmux    Best-effort delivery into a tmux pane running Claude Code
 #           interactively, via `tmux send-keys`, for setups that don't use
@@ -26,6 +26,10 @@
 #   prompt  UserPromptSubmit-hook fallback: folds any pending messages into
 #           that turn's additionalContext (behind the same
 #           INBOX_PROVENANCE_MARKER as `stop`) instead of waiting for a Stop.
+#   tool    PreToolUse / PostToolUse hooks, the MID-TURN path: pops what is queued
+#           and returns it as hookSpecificOutput.additionalContext (same marker), so
+#           a message reaches the model at the next tool boundary of the running
+#           turn instead of when the turn ends. See TOOL-BOUNDARY DELIVERY, below.
 #
 # CONTRACT SOURCES VERIFIED LOCALLY (no WebFetch available to this tool; see
 # --help's note). `stop_hook_active` / `transcript_path` / a message field on
@@ -139,6 +143,47 @@
 #     (inbox-delivered.jsonl, 0600); /api/state's inbox.delivered[] is the last
 #     20 of those as {id, delivered_at} -- never text.
 #
+# TOOL-BOUNDARY DELIVERY (hmdapp docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md, ask 2).
+# Measured on the operator's Mac, queued -> delivered_at was 75s, 110s and 808s: a
+# message waited for the end of the turn. hooks/hooks.json now wires `tool` into
+# PreToolUse and PostToolUse (matcher *).
+#   CONTRACT. hookSpecificOutput.additionalContext is the documented "Add context for
+#     Claude" output of both events. Checked against the Claude Code 2.1.287 binary:
+#     PreToolUse reads it with or without a permissionDecision (this hook sends none,
+#     so the permission flow is untouched), PostToolUse reads it, and one value over
+#     10000 characters is written to disk with only a head kept -- hence MAX_BODY_CHARS.
+#   WHO MAY CONSUME. Only the main conversation of an attended session, and only for an
+#     event whose name it can echo: not a headless/SDK session or an hmd sub-session
+#     (attended_session), not a subagent's own tool call (the payload carries agent_id:
+#     the operator wrote to the main conversation), not Stop or anything else. Every
+#     refusal comes before the pop, so the message stays queued for the Stop hold or
+#     the next prompt.
+#   EXACTLY ONCE. pop_all is one atomic claim and stamps the receipt, so Stop, prompt,
+#     tmux and tool can race freely.
+#   COST. A tool hook fires twice per tool call in every session. hooks.json guards it
+#     with a file-size test on inbox.jsonl before anything else (an empty inbox spawns
+#     no python and no git), and this script refuses the cases bash can judge (headless,
+#     sub-session, subagent) before bash parses the python source: about 50ms a call
+#     instead of 200ms while a message waits. That bash filter is a strict subset of the
+#     python checks; whatever it lets through, python still judges.
+#
+# EVENT-DRIVEN HOLD. The Stop long-poll slept 2s between looks (1s mean added). It now
+# blocks on the inbox changing: kqueue (EVFILT_VNODE) on inbox.jsonl, or on its directory
+# while the file does not exist yet, where select.kqueue exists (macOS, BSD); a 50ms stat
+# poll elsewhere or with HMD_INBOX_WATCH=poll. The watch is armed before each look at the
+# queue, so nothing landing in between is slept through. POLL_INTERVAL_S stays as the
+# backstop and as the cadence of the marker heartbeat, typing release, orphan guard and
+# companion check; MIN_LAP_S keeps a busy directory from spinning the hold.
+#
+# ASYNC REWAKE (Claude Code 2.1.287; static evidence from the binary, not run live). The
+# settings schema has a hook field asyncRewake ("runs in the background and wakes the
+# model on exit code 2"); on exit 2 the handler queues a task-notification at priority
+# next whose body is the hook's stderr, else stdout. It is honoured in interactive
+# sessions and headless ones with streaming input only. Whether an IDLE session at an
+# empty prompt drains that queue was not exercised, so nothing here builds on it: the
+# 300s hold still covers an idle session, and a message left after it waits for the
+# operator.
+#
 # EVERY MODE EXITS 0. A delivery-mechanism bug must never block or crash a
 # Stop/UserPromptSubmit turn. Message text is sanitized (control characters
 # stripped, capped at 2000 chars) and is never written anywhere except the
@@ -178,7 +223,8 @@ Modes:
            empty and either the assistant's last message ends with "?" or a
            companion is connected (a .heimdall/app/connect.json naming live
            processes; attended sessions only, never headless claude -p or an
-           hmd sub-session), long-polls the queue every 2s for up to
+           hmd sub-session), long-polls the queue (woken the moment it
+           changes, a 2s look as backstop) for up to
            HMD_INBOX_WAIT_S seconds (default 300 with a companion
            connected, 240 without) and delivers the same way the moment a
            message arrives. While it waits it keeps .heimdall/ui/inbox-waiting
@@ -201,6 +247,18 @@ Modes:
            marker as `stop`) as hookSpecificOutput.additionalContext. No
            output if the queue is empty.
 
+  tool     PreToolUse / PostToolUse hook, the MID-TURN path (hook JSON on
+           stdin). Pops any pending messages and prints them, behind the same
+           provenance marker, as {"hookSpecificOutput":{"hookEventName":
+           "<the payload's event>","additionalContext":"..."}} -- Claude Code
+           adds that next to the tool result and reads it on its next request,
+           so a message lands at the next tool boundary instead of when the
+           turn ends. Pops nothing, prints nothing, for any other event, for
+           an unattended session (headless claude -p / SDK, hmd sub-session)
+           and for a subagent's own tool call (payload carries agent_id); no
+           output on an empty queue. hooks/hooks.json guards it with a file-size
+           test so an empty inbox costs no process.
+
   status   Prints {"pending": N, "waiting": bool} and exits. Never pops.
            --json is accepted (output is always JSON either way).
 
@@ -219,6 +277,10 @@ Env:
                      counts as typing while that is under 10. Default on macOS:
                      HIDIdleTime via ioreg; elsewhere none, so the terminal read
                      alone decides. Empty or off/0/false/no/none removes the check.
+  HMD_INBOX_WATCH    how the `stop` hold waits for the inbox to change. Default:
+                     kqueue where the platform has it (macOS, BSD), else a 50ms
+                     stat poll. "poll" forces the stat poll. Either way the hold
+                     still looks every 2s as a backstop.
   HMD_TMUX_TARGET    tmux target (session:window.pane) for `tmux` mode.
 
 IMPORTANT: a Stop hook wired to `stop` mode can run for up to
@@ -272,16 +334,32 @@ fi
 
 command -v python3 >/dev/null 2>&1 || exit 0
 
-# Only stop/prompt carry a hook JSON payload on stdin. tmux/status never read
+# Only stop/prompt/tool carry a hook JSON payload on stdin. tmux/status never read
 # stdin at all, so a manual/interactive invocation of those two modes can
 # never block waiting on a terminal.
 INPUT=""
 case "$MODE" in
-  stop|prompt) INPUT="$(cat 2>/dev/null || true)" ;;
+  stop|prompt|tool) INPUT="$(cat 2>/dev/null || true)" ;;
 esac
 
+# tool mode answers on EVERY tool call of every session that loads the plugin (twice a
+# call: Pre and Post), and a message can sit queued for hours with nobody at the terminal.
+# What the python below would refuse anyway is refused here, before bash parses the python
+# source and python starts: ~15ms a call instead of ~200ms, for headless and hmd
+# sub-sessions and for every tool call a subagent makes while the message waits for the
+# main thread. Strictly a SUBSET of attended_session() and cmd_tool() -- a value with
+# whitespace in it, or an agent_id that is not a plain non-empty string in compact JSON,
+# is left for python to judge -- so this can only ever be too permissive, never too strict.
+if [ "$MODE" = tool ]; then
+  case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-cli|sdk-ts|sdk-py|mcp|claude-code-github-action) exit 0 ;; esac
+  case "${HMD_AGENT_TYPE:-}" in ""|*[[:space:]]*) ;; *) exit 0 ;; esac
+  case "${HMD_JUDGMENT:-}" in ""|*[[:space:]]*|0|[Ff][Aa][Ll][Ss][Ee]) ;; *) exit 0 ;; esac
+  AGENT_KEY='"agent_id":"'
+  case "$INPUT" in *"$AGENT_KEY"[!\"]*) exit 0 ;; esac
+fi
+
 PY_SRC=$(cat <<'PYEOF'
-import fcntl, json, os, re, shlex, shutil, subprocess, sys, time
+import fcntl, json, os, re, select, shlex, shutil, subprocess, sys, time
 
 MODE, REPO_EXPLICIT, DEFAULT_REPO = sys.argv[1], sys.argv[2], sys.argv[3]
 # argv[4] is the pid of the shell that launched this script (PPID in the bash
@@ -290,8 +368,16 @@ HOOK_SHELL_PID = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit()
 
 MAX_MSG_CHARS = 2000
 MAX_REASON_CHARS = 4000  # joined-message cap, on top of the 2000/message cap above
+# The indented body of one delivery. Indenting adds four characters per line, so a few
+# thousand short lines would triple the joined text; with the marker, the count line and
+# the two fences this keeps a whole delivery under the 10000-character cap Claude Code
+# puts on one additionalContext value (longer is written to a file and cut to a preview).
+MAX_BODY_CHARS = 8000
 # bin/lib/companion_ui_inbox.py reads inbox-waiting as stale after twice this.
 POLL_INTERVAL_S = 2.0
+WATCH_POLL_S = 0.05        # the inbox watch looks this often where kqueue is not available
+MIN_LAP_S = 0.05           # one lap of the Stop hold never takes less: a busy directory cannot spin it
+TOOL_EVENTS = frozenset(("PreToolUse", "PostToolUse"))   # the two events tool mode can answer
 DEFAULT_WAIT_S = 240.0     # stop long-poll budget: turn ended on a question, nobody connected
 COMPANION_WAIT_S = 300.0   # ...with a companion connected: the session is reachable, so stay reachable (short: a prompt typed meanwhile queues behind the hook)
 TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024  # only the last message matters
@@ -370,7 +456,7 @@ def read_stdin_json(raw):
 def resolve_repo(hook):
     if REPO_EXPLICIT:
         return REPO_EXPLICIT
-    if MODE in ("stop", "prompt"):
+    if MODE in ("stop", "prompt", "tool"):
         cwd = hook.get("cwd")
         if isinstance(cwd, str) and cwd.strip():
             return cwd.strip()
@@ -803,7 +889,7 @@ def format_delivery(texts):
     # Every message line is indented 4 spaces so delivered text can never
     # itself start a line at column 0 -- the only column the marker, the
     # count line, and the two fence lines are allowed to use.
-    body = "\n".join("    " + line for line in joined.split("\n"))
+    body = truncate("\n".join("    " + line for line in joined.split("\n")), MAX_BODY_CHARS)
     count_line = "%d message%s folded:" % (n, "" if n == 1 else "s")
     return "%s\n\n%s\n%s\n%s\n%s" % (
         INBOX_PROVENANCE_MARKER, count_line, fence, body, fence)
@@ -870,6 +956,93 @@ def env_float(name, default):
         return default
 
 
+def kqueue_flags():
+    # (directory flags, file flags) for EVFILT_VNODE, or None where this platform has no
+    # kqueue. Directory: an entry added, removed or renamed (NOTE_WRITE) -- deliberately not
+    # NOTE_ATTRIB, which the chmod every pop_all makes on the directory would raise on each
+    # look and turn the wait into a spin. File: appended to, truncated, replaced or removed.
+    if not hasattr(select, "kqueue"):
+        return None
+    try:
+        return (select.KQ_NOTE_WRITE | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME,
+                select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE
+                | select.KQ_NOTE_RENAME | select.KQ_NOTE_REVOKE)
+    except AttributeError:
+        return None
+
+
+class InboxWatch(object):
+    # Blocks until inbox.jsonl may have changed. Use it as: arm(), look at the queue,
+    # wait(timeout). A change made after arm() returns ends the wait at once -- through
+    # the kernel on a kqueue platform, through a comparison of (inode, size, mtime) after
+    # that -- so a message landing between the look and the wait is never slept through.
+    # The watch is only ever a wake-up: whatever wakes it, the caller looks at the queue
+    # itself, so a spurious wake costs one look and a missed one costs one backstop lap.
+    # While the file exists the watch sits on the file; before it exists (nothing was ever
+    # queued, or a rename-style pop moved it away) it sits on the directory.
+
+    def __init__(self, inbox_path):
+        self.path = inbox_path
+        self.kq = None
+        self.fd = None
+        self.sig = None
+
+    def signature(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+    def arm(self):
+        self.close()
+        self.sig = self.signature()
+        flags = None if os.environ.get("HMD_INBOX_WATCH", "").strip().lower() == "poll" else kqueue_flags()
+        if flags is None:
+            return
+        target, fflags = (self.path, flags[1]) if self.sig is not None else (os.path.dirname(self.path), flags[0])
+        try:
+            kq = select.kqueue()
+        except OSError:
+            return
+        try:
+            fd = os.open(target, getattr(os, "O_EVTONLY", os.O_RDONLY))
+        except OSError:
+            kq.close()
+            return
+        try:
+            kq.control([select.kevent(fd, filter=select.KQ_FILTER_VNODE,
+                                      flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=fflags)], 0, 0)
+        except OSError:
+            os.close(fd)
+            kq.close()
+            return
+        self.kq, self.fd = kq, fd
+
+    def wait(self, timeout):
+        if timeout <= 0 or self.signature() != self.sig:
+            return
+        if self.kq is not None:
+            try:
+                self.kq.control(None, 1, timeout)
+                return
+            except OSError:
+                self.close()   # the kernel would not wait for us: the stat poll below still will
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            time.sleep(max(0.0, min(WATCH_POLL_S, end - time.monotonic())))
+            if self.signature() != self.sig:
+                return
+
+    def close(self):
+        if self.fd is not None:
+            _silently(lambda: os.close(self.fd))
+            self.fd = None
+        if self.kq is not None:
+            _silently(self.kq.close)
+            self.kq = None
+
+
 def cmd_stop(hook, root):
     if hook.get("stop_hook_active") is True:
         return  # silent loop guard: no output, no queue mutation at all
@@ -903,11 +1076,14 @@ def cmd_stop(hook, root):
     typing = typing_probe()  # after the deadline is fixed: finding the terminal comes out of the hold, never on top of it
     write_state(root, True)
     delivered_texts = []
+    watch = InboxWatch(paths_for(root)["inbox"])
     try:
         while not hook_orphaned(ppid0):
+            lap_start = time.monotonic()
             if typing is not None and typing():
                 break  # somebody is typing into this session: hand the turn back, nothing popped; what is queued rides their prompt
             write_waiting(root, since, deadline)
+            watch.arm()  # after our own marker write (which would wake it) and before the look at the queue (so nothing slips between)
             texts = texts_of(pop_all_fn(root))
             if texts:
                 delivered_texts = texts
@@ -916,8 +1092,15 @@ def cmd_stop(hook, root):
                 break
             if connected and not companion_connected(root):
                 break  # the companion that justified this wait has gone
-            time.sleep(POLL_INTERVAL_S)
+            # Wake the moment the inbox changes; POLL_INTERVAL_S is only the backstop, and the
+            # cadence of the marker heartbeat, the typing check, the orphan guard and the
+            # companion check above -- all as before.
+            watch.wait(min(POLL_INTERVAL_S, deadline - time.time()))
+            lap_left = MIN_LAP_S - (time.monotonic() - lap_start)
+            if lap_left > 0:
+                time.sleep(lap_left)  # a directory somebody keeps touching must not spin the hold
     finally:
+        watch.close()
         clear_waiting(root)
         write_state(root, False)
     if delivered_texts:
@@ -967,6 +1150,26 @@ def cmd_prompt(hook, root):
         "hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
 
 
+def cmd_tool(hook, root):
+    # The mid-turn path: PreToolUse / PostToolUse. Answers only for the main conversation
+    # of an attended session, and only for an event whose name it can echo back, because
+    # popping is the one irreversible step -- every refusal below happens before it, and
+    # the message stays queued for the Stop hold or the next prompt.
+    event = hook.get("hook_event_name")
+    if not isinstance(event, str) or event not in TOOL_EVENTS:
+        return
+    if not attended_session():
+        return  # a headless or sub-session of hmd's own: the operator's message is not for it
+    if hook.get("agent_id"):
+        return  # a subagent's own tool call: the message was written to the main conversation
+    _, _, pop_all_fn, _ = get_ops(root)
+    texts = texts_of(pop_all_fn(root))
+    if not texts:
+        return
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": event, "additionalContext": format_delivery(texts)}}))
+
+
 def cmd_status(root):
     _, list_pending_fn, _, _ = get_ops(root)
     items = list_pending_fn(root)
@@ -982,7 +1185,7 @@ def cmd_status(root):
 
 
 def main():
-    raw_stdin = sys.stdin.read() if MODE in ("stop", "prompt") else ""
+    raw_stdin = sys.stdin.read() if MODE in ("stop", "prompt", "tool") else ""
     hook = read_stdin_json(raw_stdin)
     root = resolve_repo(hook)
     if not root:
@@ -994,6 +1197,8 @@ def main():
         cmd_tmux(root)
     elif MODE == "prompt":
         cmd_prompt(hook, root)
+    elif MODE == "tool":
+        cmd_tool(hook, root)
     elif MODE == "status":
         cmd_status(root)
     # any other/unknown mode: no-op
