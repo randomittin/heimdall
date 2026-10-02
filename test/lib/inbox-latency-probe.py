@@ -36,6 +36,7 @@ Exit 0 when every trial was delivered, 1 otherwise. Stdlib only.
 """
 import argparse
 import concurrent.futures
+import contextlib
 import importlib.util
 import json
 import os
@@ -121,8 +122,15 @@ def payload(repo, event, **fields):
 def start_hook(cmd, env, repo, stdin_bytes):
     proc = subprocess.Popen(["bash", "-c", cmd], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, env=env, cwd=repo)
-    proc.stdin.write(stdin_bytes)
-    proc.stdin.close()
+    try:
+        proc.stdin.write(stdin_bytes)
+        proc.stdin.close()
+    except BrokenPipeError:
+        # The empty-inbox fast path is finished before it reads stdin. Claude Code's own write
+        # tolerates that too (it beats a shell's exec by milliseconds; this harness, running
+        # trials on threads, sometimes does not).
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
     proc.stdin = None   # already closed: communicate() would otherwise try to flush it again
     return proc
 
