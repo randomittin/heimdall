@@ -89,6 +89,27 @@ export interface KeepalivePayload {
   ts: number; // epoch seconds
 }
 
+/**
+ * Why the relay ended a session that hmd still held a `GET /stream` for — the
+ * `reason` in a `session_ended` frame written down that stream (INV-38).
+ * hmd's client logs it verbatim and stops, so each value names what an
+ * operator should do next:
+ * - `pairing-expired` — the ~60s pairing window lapsed with no phone bound;
+ *   run `hmd app connect` again for a fresh code.
+ * - `claim-throttled` — more than 10 claim attempts in 60s ended the session
+ *   (INV-4).
+ * - `expired` — a bound session's `device_token` lapsed and storage was
+ *   reclaimed.
+ * - `ended` — any other session already ended, reclaimed while a stream was
+ *   still attached to it.
+ * `POST /revoke` is absent on purpose: hmd is the one ending that session.
+ */
+export type SessionEndReason = "pairing-expired" | "claim-throttled" | "expired" | "ended";
+
+export interface SessionEndedPayload {
+  reason: SessionEndReason;
+}
+
 export interface ErrorResponse {
   error: string;
   retry_after_s?: number;

@@ -12,6 +12,8 @@ import type {
   DeviceBoundToPhonePayload,
   DeviceBoundToHmdPayload,
   KeepalivePayload,
+  SessionEndedPayload,
+  SessionEndReason,
   Envelope,
 } from "./types";
 import { isDeviceFrame, isHmdFrame } from "./types";
@@ -127,6 +129,15 @@ const CLOSE_MESSAGE_TOO_BIG = 1009;
  */
 function loggableSender(value: unknown): string {
   return value === "hmd" || value === "device" || value === "relay" ? value : "other";
+}
+
+/** What hmd is told when storage reclamation is what ends its stream. A
+ *  `pending` session reaching the purge is one whose pairing window lapsed
+ *  unclaimed — the 2026-10-02 field case. */
+function purgeEndReason(status: SessionStatus): SessionEndReason {
+  if (status === "pending") return "pairing-expired";
+  if (status === "bound") return "expired";
+  return "ended";
 }
 
 function loggableType(value: unknown): string {
@@ -483,6 +494,43 @@ export class SessionDO {
       // Already closed or errored (client gone, or a runtime-side
       // teardown) — the stream is over either way.
     }
+  }
+
+  /**
+   * Ends hmd's `GET /stream` because the SESSION is over, and says why first
+   * (INV-38): a plaintext `session_ended` control frame — the shape
+   * `handleRevoke` already sends the phone, and one hmd's client already reads
+   * as terminal, logging `payload.reason` — then the close.
+   *
+   * Before this, a session the relay ended closed hmd's stream with a bare
+   * EOF, and the next thing hmd met was `404` from the purged record. On
+   * 2026-10-02 that read, twice, as "the relay's own stream-lifetime bound":
+   * it was the pairing-expiry purge, 120s after `/pair/init`, of a session no
+   * phone ever bound.
+   *
+   * Not for a close that leaves the session alive — a superseding reconnect
+   * and the stream-lifetime bound go through `closeHmdStream` alone, since
+   * hmd is expected back — nor for `POST /revoke`, where hmd is the one ending
+   * it. With no stream attached there is nobody to tell: nothing is logged.
+   */
+  private endHmdStream(sessionId: string, reason: SessionEndReason): void {
+    if (this.hmdStreamController !== null) {
+      const payload: SessionEndedPayload = { reason };
+      const told = this.writeToHmdStream(
+        JSON.stringify({
+          v: 1,
+          session_id: sessionId,
+          seq: 0,
+          sender: "relay",
+          type: "session_ended",
+          nonce: null,
+          ciphertext: null,
+          payload,
+        }) + "\n"
+      );
+      logEvent("session_end_announced", { session_id: sessionId, reason, delivered: told });
+    }
+    this.closeHmdStream();
   }
 
   /** (Re)starts the idle timer that writes the next `keepalive`. A no-op
@@ -867,6 +915,25 @@ export class SessionDO {
     );
   }
 
+  /**
+   * The relay ends a session no phone ever bound: a late claim found the
+   * pairing window lapsed, or the claim throttle tripped (INV-4). Both used to
+   * flip the status and tell hmd nothing, leaving it holding a stream for a
+   * session that could never bind until the purge closed it bare. The record
+   * stays `ENDED_GRACE_MS` so a late phone meets a truthful `410`; hmd is told
+   * now, not then.
+   */
+  private async endUnboundSession(
+    record: SessionRecord,
+    reason: "pairing-expired" | "claim-throttled"
+  ): Promise<void> {
+    record.status = "ended";
+    await this.saveRecord(record);
+    await this.clearLastHmdState();
+    await this.armPurgeAlarm(Date.now() + ENDED_GRACE_MS);
+    this.endHmdStream(record.session_id, reason);
+  }
+
   private async handlePairingCodeClaim(
     record: SessionRecord,
     pairingCode: string,
@@ -878,20 +945,14 @@ export class SessionDO {
 
     const now = Date.now();
     if (now > record.pair_exp) {
-      record.status = "ended";
-      await this.saveRecord(record);
-      await this.clearLastHmdState();
-      await this.armPurgeAlarm(now + ENDED_GRACE_MS);
+      await this.endUnboundSession(record, "pairing-expired");
       return jsonResponse(410, { error: "pairing code expired" });
     }
 
     const { attempts, throttled } = recordClaimAttempt(record.claim_attempts, now);
     record.claim_attempts = attempts;
     if (throttled) {
-      record.status = "ended";
-      await this.saveRecord(record);
-      await this.clearLastHmdState();
-      await this.armPurgeAlarm(now + ENDED_GRACE_MS);
+      await this.endUnboundSession(record, "claim-throttled");
       return jsonResponse(
         429,
         { error: "too many claim attempts", retry_after_s: CLAIM_THROTTLE_RETRY_AFTER_S },
@@ -1215,7 +1276,9 @@ export class SessionDO {
       for (const socket of this.ctx.getWebSockets(DEVICE_TAG)) {
         this.closeDeviceSocket(socket, CLOSE_SESSION_ENDED, "session ended");
       }
-      this.closeHmdStream();
+      // hmd is told why before its stream goes (INV-38). Without it, a session
+      // nobody bound ended as a bare EOF followed by a 404 — see endHmdStream.
+      this.endHmdStream(record.session_id, purgeEndReason(record.status));
     }
 
     await this.ctx.storage.deleteAll();
