@@ -25,7 +25,10 @@
 #   6. a genuine frame whose seq was already used is rejected by the replay guard and changes nothing;
 #   7. after all of that abuse a genuine deny still works;
 #   9. the vocabulary is closed: nothing but `decide` + `deny` does anything -- an `approve`
-#      decision value, an `approve` action and a `stop` action are all refused and change nothing.
+#      decision value, an `approve` action and a `stop` action are all refused and change nothing;
+#  10. the whole loop, nothing stubbed: the real bin/heimdall-phone-deny raises a request, the phone
+#      sees it in the sealed state frame, a sealed deny is acked ok and the hook blocks the action;
+#      and when the window runs out untouched a late sealed deny is acked `expired`.
 #
 # Hermetic: HOME/HEIMDALL_HOME/TMPDIR are a temp dir, every process this suite starts is reaped on
 # EXIT, every wait is a bounded poll.
@@ -177,8 +180,9 @@ while True:
         except Exception:
             slice_ = None
         if isinstance(slice_, list):
-            mine = [e for e in slice_ if isinstance(e, dict) and e.get("id") == want_id]
-            if mode == "has" and mine:
+            field = "summary" if mode == "summary" else "id"
+            mine = [e for e in slice_ if isinstance(e, dict) and e.get(field) == want]
+            if mode in ("has", "summary") and mine:
                 sys.stdout.write(json.dumps(mine[0]) + "\n")
                 sys.exit(0)
             if mode == "lacks" and not mine:
@@ -422,6 +426,49 @@ if ! decision_file_exists "$REPO_T" "$P3" && is_pending "$REPO_T" "$P3"; then
   ok "9e. none of the four left a decision behind; the request is still pending"
 else
   bad "9e. a refused command changed the pending request"
+fi
+
+# 10. the whole loop with nothing stubbed: the REAL hook raises a request, the phone SEES it in the
+# sealed state frame, DENIES it with a sealed command, and the hook blocks the action. Then the
+# converse: a window that runs out untouched leaves a late sealed deny `expired` -- never an ack for
+# an action that already went through.
+HOOK="$REPO/bin/heimdall-phone-deny"
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":%s,"relay":"http://127.0.0.1:%s","started_at":"t"}' \
+  "$$" "$CLIENT_PID" "$PORT_UI" "$PORT_RELAY" > "$REPO_T/.heimdall/app/connect.json"
+jq -cn --arg d "$REPO_T" '{hook_event_name:"PreToolUse",session_id:"s",cwd:$d,tool_name:"Bash",tool_input:{command:"git push origin e2e-deny"}}' > "$TMPROOT/e2e.payload"
+env -u CLAUDE_CODE_ENTRYPOINT HMD_PHONE_DENY=1 HMD_PHONE_DENY_WINDOW_S=40 "$HOOK" --repo "$REPO_T" \
+  < "$TMPROOT/e2e.payload" > "$TMPROOT/e2e.hook.out" 2> "$TMPROOT/e2e.hook.err" &
+E2E_HOOK_PID=$!; PIDS+=("$E2E_HOOK_PID")
+ENTRY="$(wait_for_approvals_state "$LOG/frames.ndjson" "$KEY_B64" summary "git push origin e2e-deny" 30)"
+E2E_ID="$(printf '%s' "$ENTRY" | jq -r '.id // empty')"
+if [ -n "$E2E_ID" ] && printf '%s' "$ENTRY" | jq -e '.tool == "Bash" and .risk == "high"' >/dev/null 2>&1; then
+  ok "10. the phone sees the REAL hook's request in the sealed state frame (id $E2E_ID)"
+else
+  bad "10. the hook's request never reached the sealed state frame: ${ENTRY:-<none>} err=[$(cat "$TMPROOT/e2e.hook.err")] relay.json=[$(cat "$REPO_T/.heimdall/app/relay.json" 2>/dev/null)]"
+fi
+send_cmd 14 "$(decide_json "${E2E_ID:-p-00000000}" deny)"
+ACK="$(ack_of_ok 14)"
+i=0; while kill -0 "$E2E_HOOK_PID" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+if printf '%s' "$ACK" | jq -e --arg id "$E2E_ID" '.ok == true and .id == $id and .decision == "deny"' >/dev/null 2>&1 \
+   && jq -e '.hookSpecificOutput | .hookEventName == "PreToolUse" and .permissionDecision == "deny"' "$TMPROOT/e2e.hook.out" >/dev/null 2>&1; then
+  ok "10b. the sealed deny is acked ok AND the hook prints the PreToolUse deny (the action is blocked)"
+else
+  bad "10b. ack=[${ACK:-<none>}] hook out=[$(cat "$TMPROOT/e2e.hook.out")] err=[$(cat "$TMPROOT/e2e.hook.err")]"
+fi
+jq -cn --arg d "$REPO_T" '{hook_event_name:"PreToolUse",session_id:"s",cwd:$d,tool_name:"Bash",tool_input:{command:"git push origin e2e-timeout"}}' > "$TMPROOT/e2e.payload2"
+env -u CLAUDE_CODE_ENTRYPOINT HMD_PHONE_DENY=1 HMD_PHONE_DENY_WINDOW_S=2 "$HOOK" --repo "$REPO_T" \
+  < "$TMPROOT/e2e.payload2" > "$TMPROOT/e2e.hook2.out" 2> "$TMPROOT/e2e.hook2.err"
+LATE_ID=""
+for f in "$REPO_T"/.heimdall/ui/approvals/p-*.decision; do
+  if jq -e '.decision == "timeout"' "$f" >/dev/null 2>&1; then LATE_ID="$(basename "$f" .decision)"; fi
+done
+send_cmd 15 "$(decide_json "${LATE_ID:-p-00000000}" deny)"
+ACK="$(ack_of 15)"
+if [ ! -s "$TMPROOT/e2e.hook2.out" ] && [ -n "$LATE_ID" ] && printf '%s' "$ACK" | jq -e '.ok == false and .detail == "expired"' >/dev/null 2>&1 \
+   && jq -e '.decision == "timeout"' "$REPO_T/.heimdall/ui/approvals/$LATE_ID.decision" >/dev/null 2>&1; then
+  ok "10c. window ran out untouched -> the hook printed nothing, and a late sealed deny is acked detail:expired (nothing recorded)"
+else
+  bad "10c. converse wrong: hook out=[$(cat "$TMPROOT/e2e.hook2.out")] late_id=[$LATE_ID] ack=[${ACK:-<none>}]"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
