@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Cloudflare Workers + Durable Object relay for hmd's phone companion. Owned by heimdall (moved from hmdapp/relay, history preserved). See docs/2026-09-21-hmd-relay-design.md.",
+  "description": "Cloudflare Workers + Durable Object relay for hmd's phone companion. Owned by heimdall (moved from hmdapp/relay, history preserved). Design of record: docs/superpowers/specs/2026-09-21-hmd-relay-design.md in hmdapp.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

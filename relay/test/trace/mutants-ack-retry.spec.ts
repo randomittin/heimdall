@@ -1,5 +1,5 @@
 // Wave-3 mutant scenarios for INV-24 (ack pairing) and INV-25 (Retry-After).
-// relay/docs/INVARIANTS.md attributes both to "hmd client,
+// docs/superpowers/specs/relay/INVARIANTS.md attributes both to "hmd client,
 // app" rather than "relay" — the relay itself never originates an ack (it
 // only forwards whatever the hmd/device side sends, byte-identical) and
 // never emits a WS close-code 1013 anywhere in relay/src (confirmed by

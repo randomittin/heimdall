@@ -1,7 +1,7 @@
 // Shared wire types for the hmd relay Worker + Durable Object.
 //
-// Shapes mirror relay/docs/2026-09-21-hmd-relay-design.md §2.3
-// (envelope + inner payload table) and relay/docs/INVARIANTS.md.
+// Shapes mirror docs/superpowers/specs/2026-09-21-hmd-relay-design.md §2.3
+// (envelope + inner payload table) and docs/superpowers/specs/relay/INVARIANTS.md.
 // The relay never decrypts `ciphertext` — it only ever sees the opaque
 // envelope shape below (INV-18, INV-31).
 

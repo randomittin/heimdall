@@ -4,7 +4,7 @@
 // that invariant is already gated at the source level by the pre-existing
 // relay/scripts/check-no-logged-urls.mjs (wired into `npm test`).
 //
-// relay/docs/INVARIANTS.md attributes INV-9/INV-10 (and
+// docs/superpowers/specs/relay/INVARIANTS.md attributes INV-9/INV-10 (and
 // INV-29/INV-30, see mutants-revoke.spec.ts) to "relay" broadly; the four
 // are kept as distinct scenarios rather than one shared test because each
 // targets a different regression shape given the relay's actual surface —
