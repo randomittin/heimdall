@@ -84,6 +84,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from importlib.util import module_from_spec, spec_from_file_location
@@ -137,6 +138,12 @@ def entry_line(text):
 with open(transcript, "wb") as f:
     f.write(entry_line("seed turn one"))
     f.write(entry_line("seed turn two"))
+# what a live session's statusline keeps writing: "no sub-agent is running", so the agents publisher
+# makes no `heimdall-agents list` probe of its own (that probe is a spawn on the poller thread)
+counts = os.path.join(root, ".heimdall", ".agents-count-cache")
+os.makedirs(os.path.dirname(counts))
+with open(counts, "w") as f:
+    f.write("0\n")
 
 ui = load("hmd_ui", os.path.join(code, "sentinels", "hmd-ui.py"))
 relay_transport = {"bind": "relay", "public_host": "relay", "trust_proxy": False, "port": 0}
@@ -261,6 +268,39 @@ took, digest = wait_until(digest, lambda s: (s.get("identity") or {}).get("branc
 verdict(took is not None and took <= 4.5,
         "A5: an unwatched source (git branch) still lands via the backstop in %s (<= 4.5 s)"
         % ("%.2f s" % took if took is not None else "never"))
+
+# A6 -- a poller pass never waits on a spawn. With every cached subprocess answer made an hour old,
+# the poller thread runs none of the collectors' commands (a partial pass serves the last answer);
+# the warmer thread is the one that re-runs them.
+_, digest = settle(digest, 1.2)
+os.utime(counts)
+spawns = []
+inner_run = ui._run
+
+
+def recording_run(argv, cwd, *args, **kwargs):
+    spawns.append((threading.current_thread().name, argv[0]))
+    return inner_run(argv, cwd, *args, **kwargs)
+
+
+ui._run = recording_run
+for cache_key, (stamped, answer) in list(ui._subprocess_cache.items()):
+    ui._subprocess_cache[cache_key] = (stamped - 3600.0, answer)
+landed = 0
+for i in range(3):
+    time.sleep(0.4)
+    put(2000 + i)
+    took, digest = wait_until(digest, lambda s, v=2000 + i: (panel(s, "probe") or {}).get("data", {}).get("value") == v, 3.0)
+    landed += took is not None
+time.sleep(ui.POLL_INTERVAL_S + 1.5)
+ui._run = inner_run
+on_poller = sorted(set(a for t, a in spawns if t == "hmd-ui-poller"))
+on_warmer = [a for t, a in spawns if t == "hmd-ui-warm"]
+verdict(landed == 3 and not on_poller,
+        "A6a: %d/3 changes landed and the poller thread spawned %s (none expected: it reuses the last answers)"
+        % (landed, on_poller or "nothing"))
+verdict(len(on_warmer) >= 3, "A6b: the warmer thread re-ran the stale answers (%d spawns: %s)"
+        % (len(on_warmer), sorted(set(on_warmer))))
 
 cache.stop()
 print("done", flush=True)
