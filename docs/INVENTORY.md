@@ -409,7 +409,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 |---|---|
 | `heimdall-fallback` | quota-exhaustion fallback policy gate (section 7) |
 | `heimdall-quota-advisor` / `heimdall-quota-resume` | honest never-auto-switching advisor; quota-kill capture + resume |
-| `heimdall-429-mark` / `heimdall-529-scan` / `heimdall-pressure` | reactive exhaustion recorder; read-only overload scan; 529 control bit |
+| `heimdall-429-mark` / `heimdall-529-scan` / `heimdall-pressure` | reactive exhaustion recorder; read-only transcript overload scan (`hmd 529-scan [scan\|where]`, never feeds the pressure controller); 529 control bit |
 | `heimdall-modules` | module system core: install, wire, verify, remove |
 | `heimdall-omniroute-install` | pinned, patched, fail-closed OmniRoute installer |
 | `heimdall-headroom-ab` / `heimdall-ponytail-ab` | one-week Headroom A/B receipts; Ponytail lazy-ladder delta |

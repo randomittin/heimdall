@@ -436,6 +436,116 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 7k. `hmd 529-scan` → execs heimdall-529-scan, args forwarded, no fall-through.
+#     bin/heimdall-529-scan (read-only scan of this repo's session transcripts
+#     for API-overload / connection-reset records) was reachable from NO live
+#     entry point: its only mentions were comments and docstrings, the
+#     reachability gate carried it as a DEAD exemption row, and that row expired
+#     2026-09-27. install.sh puts only `hmd`/`heimdall` on PATH, so an installed
+#     operator could not run it at all, and typing `hmd 529-scan` fell through
+#     to the goal-driven task prompt (a real `claude -p` spawn). The tool
+#     requires a verb and, by its never-fails contract, exits 0 SILENTLY when
+#     given none — so a bare `hmd 529-scan` defaults to its `scan` verb instead
+#     of looking like a no-op, while an explicit verb is never rewritten.
+# ══════════════════════════════════════════════════════════════════════════════
+make_stub heimdall-529-scan
+
+reset
+run_hmd 529-scan scan --window-secs 600 --json
+
+if stub_called "heimdall-529-scan"; then
+  ok "529-scan routes to heimdall-529-scan"
+else
+  bad "529-scan routes to heimdall-529-scan"
+fi
+
+if args_contain "scan --window-secs 600 --json"; then
+  ok "529-scan forwards args verbatim (scan --window-secs 600 --json)"
+else
+  bad "529-scan forwards args verbatim (scan --window-secs 600 --json)"
+  cat "$STUB_OUT" >&2
+fi
+
+if ! claude_reached; then
+  ok "529-scan does NOT fall through to Claude"
+else
+  bad "529-scan MUST NOT reach the Claude fall-through"
+fi
+
+# Bare invocation → the `scan` verb and nothing else.
+reset
+run_hmd 529-scan
+
+if grep -qxF 'heimdall-529-scan ARGS: scan' "$STUB_OUT" 2>/dev/null; then
+  ok "bare 529-scan defaults to the scan verb (argv is exactly: scan)"
+else
+  bad "bare 529-scan defaults to the scan verb (argv is exactly: scan)"
+  cat "$STUB_OUT" >&2
+fi
+
+# An explicit verb is forwarded as given — the default must never rewrite it.
+reset
+run_hmd 529-scan where --dir /no/such/transcripts
+
+if grep -qxF 'heimdall-529-scan ARGS: where --dir /no/such/transcripts' "$STUB_OUT" 2>/dev/null; then
+  ok "529-scan with an explicit verb forwards it untouched (no scan prepended)"
+else
+  bad "529-scan with an explicit verb forwards it untouched (no scan prepended)"
+  cat "$STUB_OUT" >&2
+fi
+
+# The REAL scanner, not the stub, driven through the arm. hmd_capture is
+# run_hmd's exact environment with the output kept, so a verbatim-forwarded
+# `scan --dir … --since … --json` can be checked against what the tool reports.
+hmd_capture() {
+  PATH="$FAKE_BIN:$PATH" \
+  HEIMDALL_HOME="$FAKE_HOME" \
+  HEIMDALL_NO_INTRO=1 \
+  HEIMDALL_NO_UPDATE_CHECK=1 \
+  HMD_STUB_OUT="$STUB_OUT" \
+  HEIMDALL_TRACE_ORDER="$TRACE_FILE" \
+  bash "$FAKE_BIN/heimdall" "$@"
+}
+
+reset
+cp "$REPO/bin/heimdall-529-scan" "$FAKE_BIN/heimdall-529-scan"
+chmod +x "$FAKE_BIN/heimdall-529-scan"
+T529="$FAKE_DIR/transcripts-529"
+mkdir -p "$T529"
+printf '%s\n' '{"type":"assistant","model":"<synthetic>","isApiErrorMessage":true,"apiErrorStatus":529,"error":"server_error","sessionId":"s529","requestId":"r529","timestamp":"2020-01-01T00:00:00.000Z"}' > "$T529/session.jsonl"
+REPORT="$(hmd_capture 529-scan scan --dir "$T529" --since 2019-01-01T00:00:00Z --json 2>/dev/null)"
+SUMMARY="$(printf '%s' "$REPORT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["count"], d["events"][0]["kind"])' 2>/dev/null || true)"
+
+if [ "$SUMMARY" = "1 overloaded_error" ]; then
+  ok "the real scanner runs through the arm and reports the fixture 529 (1 overloaded_error)"
+else
+  bad "the real scanner runs through the arm and reports the fixture 529 (got: '$SUMMARY')"
+fi
+
+if ! claude_reached; then
+  ok "529-scan (real scanner) does NOT fall through to Claude"
+else
+  bad "529-scan (real scanner) MUST NOT reach the Claude fall-through"
+fi
+
+# Target missing: a plain error and a non-zero exit — never the Claude fall-through.
+reset
+rm -f "$FAKE_BIN/heimdall-529-scan"
+ERR="$(hmd_capture 529-scan scan 2>&1 >/dev/null)"; RC=$?
+
+if [ "$RC" -eq 1 ] && printf '%s' "$ERR" | grep -q 'heimdall-529-scan not found'; then
+  ok "529-scan with the target missing exits 1 with a not-found error"
+else
+  bad "529-scan with the target missing exits 1 with a not-found error (rc=$RC err='$ERR')"
+fi
+
+if ! claude_reached; then
+  ok "529-scan with the target missing does NOT fall through to Claude"
+else
+  bad "529-scan with the target missing MUST NOT reach the Claude fall-through"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 8. FALSIFIER — unknown command falls through to Claude launch path
 #    A routed name must NOT reach fall-through; an unknown one MUST.
 # ══════════════════════════════════════════════════════════════════════════════
