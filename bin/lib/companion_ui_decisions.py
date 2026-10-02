@@ -2,8 +2,9 @@
 """companion_ui_decisions.py -- the decision store for the phone's DENY-ONLY say over a pending
 risky action (A4 in docs/HANDOFF-TO-HEIMDALL-product-asks.md, first round).
 
-The one rule this module exists to keep: a phone can only ever REDUCE what runs. The only
-decision it can record is `deny`; `allow` is refused here, for every request, in this version
+The one rule this module exists to keep: a phone can only ever REDUCE what runs. It has exactly two
+verbs on a pending request, VERBS = deny (refuse this call) and stop (refuse it AND end the turn --
+the hook prints {"continue": false}); `allow` is refused here, for every request, in this version
 (DecisionError("allow-not-permitted")). Nothing in this file can make an action run that would
 not have run anyway.
 
@@ -24,12 +25,12 @@ Files:
     p-<8 hex>.decision   the one decision slot of a request, {id, decision, decided_at}. It is
                          created by link(2)-ing a finished temp file into place, so it appears
                          complete or not at all, and a second create fails: that IS the single-use
-                         guarantee. Two parties can claim it. The phone claims it with "deny"
-                         (decide()); the hook claims it with "timeout" when its window ends
+                         guarantee. Two parties can claim it. The phone claims it with "deny" or
+                         "stop" (decide()); the hook claims it with "timeout" when its window ends
                          (settle()). Whoever gets there first wins, and the loser is told so:
-                         a late deny is `expired`, never an ack for an action that already went
-                         through; a deny that got in first is the one settle() hands back. The
-                         file outlives the request file so a replay within GC_AFTER_S still
+                         a late deny/stop is `expired`, never an ack for an action that already
+                         went through; a verb that got in first is the one settle() hands back.
+                         The file outlives the request file so a replay within GC_AFTER_S still
                          answers `already-decided` / `expired`, not `unknown-id`.
 
 Ids are random (`p-` + 8 hex) and checked against a strict pattern before any path is built from
@@ -60,6 +61,7 @@ TOOL_MAX = 60
 HEARTBEAT_STALE_S = 5.0      # a request whose hook has not heartbeated this long is dead
 GC_AFTER_S = 600.0           # request/decision files older than this are swept
 RISKS = ("low", "high")
+VERBS = ("deny", "stop")     # the phone's whole vocabulary; exact, lower case
 READ_CAP_BYTES = 65536
 
 _REQUEST_FILE_RE = re.compile(r"(p-[0-9a-f]{8})\.json")
@@ -261,23 +263,24 @@ def heartbeat(root, req_id, now=None):
 
 
 def decision_of(root, req_id):
-    """"deny" when a well-formed deny decision exists for exactly this id, else None. Anything
-    else in the file -- garbage, an `allow`, another id -- is read as no decision at all."""
+    """"deny" or "stop" when a well-formed decision of that verb exists for exactly this id, else
+    None. Anything else in the file -- garbage, an `allow`, another id, a case-varied verb -- is read
+    as no decision at all."""
     if not _valid_id(req_id):
         return None
     obj = _read_json(os.path.join(_approvals_dir(root), req_id + ".decision"))
-    if obj is not None and obj.get("id") == req_id and obj.get("decision") == "deny":
-        return "deny"
+    if obj is not None and obj.get("id") == req_id and obj.get("decision") in VERBS:
+        return obj["decision"]
     return None
 
 
 def settle(root, req_id, now=None):
-    """The hook's window is over. Returns "deny" when the phone's deny is on record, else None -- and in
-    the same step makes sure no deny can be recorded from now on, by claiming the decision slot with a
-    "timeout" marker. That is the line the whole store turns on: decide() answers OK exactly when this
-    returns "deny", and `expired` exactly when it returns None, so a deny the phone is told was
-    accepted is a deny the hook acts on. Anything unexpected (no such directory, an unwritable one) is
-    None: the hook does nothing."""
+    """The hook's window is over. Returns the phone's verb ("deny" or "stop") when it is on record, else
+    None -- and in the same step makes sure no verb can be recorded from now on, by claiming the
+    decision slot with a "timeout" marker. That is the line the whole store turns on: decide() answers
+    OK exactly when this returns that verb, and `expired` exactly when it returns None, so a decision
+    the phone is told was accepted is one the hook acts on. Anything unexpected (no such directory,
+    an unwritable one) is None: the hook does nothing."""
     if not _valid_id(req_id):
         return None
     try:
@@ -298,16 +301,16 @@ def close(root, req_id):
 def decide(root, req_id, decision, now=None):
     """Record the phone's decision for `req_id` and return {id, decision}. Raises DecisionError --
     the order below is the contract, and nothing is written on any refusal:
-        bad-decision          `decision` is not "allow"/"deny" (a string)
+        bad-decision          `decision` is not exactly "deny", "stop" or "allow" (a string)
         unknown-id            `req_id` is not an id this store ever issued (or is shaped like a path)
         allow-not-permitted   "allow", for EVERY request, in this version
-        already-decided       a deny is already on record (the single-use rule)
+        already-decided       a deny or stop is already on record (the single-use rule)
         expired               the hook already gave up (its timeout marker), or past expires_at, or the
                               hook stopped heartbeating
     """
     now = _now(now)
-    if not isinstance(decision, str) or decision not in ("allow", "deny"):
-        raise DecisionError("bad-decision", "decision must be \"deny\"")
+    if not isinstance(decision, str) or decision not in VERBS + ("allow",):
+        raise DecisionError("bad-decision", "decision must be \"deny\" or \"stop\"")
     if not _valid_id(req_id):
         raise DecisionError("unknown-id", "no such approval request")
     d = _approvals_dir(root)
@@ -328,9 +331,9 @@ def decide(root, req_id, decision, now=None):
         raise DecisionError("unknown-id", "no such approval request")
     if now >= rec["expires_at"] or now - beat > HEARTBEAT_STALE_S:
         raise DecisionError("expired", "this request is no longer waiting for a decision")
-    if not _claim(d, req_id, "deny", now):
+    if not _claim(d, req_id, decision, now):
         raise _already_decided(dec_path)
-    return {"id": req_id, "decision": "deny"}
+    return {"id": req_id, "decision": decision}
 
 
 # -- exposure (sentinels/hmd-ui.py -> /api/state.approvals) ------------------------------------

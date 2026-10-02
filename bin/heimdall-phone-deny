@@ -3,7 +3,8 @@
 
 A4 of hmdapp's docs/HANDOFF-TO-HEIMDALL-product-asks.md, DENY-ONLY round. The phone can refuse a risky
 shell command or an outside-the-repo write while hmd holds it for a few seconds; it can never approve
-anything. A phone only ever REDUCES what runs.
+anything. A phone only ever REDUCES what runs, and has exactly two verbs for it: `deny` (refuse this
+call) and `stop` (refuse it AND end the turn, like pressing Esc).
 
 OFF BY DEFAULT. The hook does nothing unless HMD_PHONE_DENY=1 (exactly 1), and `hmd hooks disable
 phone-deny` switches the whole group off (hooks/hooks.json runs this script only when the flag is set
@@ -20,24 +21,29 @@ WHAT IT DOES, when armed, for one PreToolUse call (hook JSON on stdin):
     4. Risky: publish a pending request (bin/lib/companion_ui_decisions.py -> .heimdall/ui/approvals/,
        served as /api/state `approvals` and sealed to the phone) and wait, heartbeating, up to
        HMD_PHONE_DENY_WINDOW_S (default 10, at least 1, at most 120 -- the doc's ceiling) for the
-       phone's sealed `decide`/`deny` (bin/heimdall-relay-client -> decide()).
+       phone's sealed `decide` command (bin/heimdall-relay-client -> decide()).
          deny arrives in the window -> print ONE permissionDecision "deny" object and exit 0.
+         stop arrives in the window -> the same object plus {"continue": false, "stopReason": ...}:
+                                       the call is refused and the turn ends.
          anything else              -> print NOTHING, exit 0: Claude Code's normal permission flow
                                        decides exactly as it would without this hook.
     The request is withdrawn on every way out (including SIGTERM / the launching shell dying).
 
-THE VOCABULARY IS CLOSED: the hook's whole output is {nothing, one deny object}. It never prints an
-allow, never edits the tool input, never asks. A decision file that is not a well-formed deny for THIS
-request -- an allow, garbage, another request's -- is not a deny.
+THE VOCABULARY IS CLOSED: the hook's whole output is {nothing, a deny object, a deny object + stop}.
+It never prints an allow, never edits the tool input, never asks. A decision file that is not a
+well-formed deny or stop for THIS request -- an allow, an approve, garbage, a case-varied verb,
+another request's -- is not a decision.
 
 IT NEVER BLOCKS ON ITS OWN FAILURE. No reply, a timeout, malformed input, an unreadable or unwritable
 approvals dir, a missing library, any exception: exit 0 with no output (a one-line note on stderr for
 the unexpected ones). It never exits 2 (the code that blocks a tool call), and the hooks.json command
 forces exit 0 around it as well.
 
-NOT BUILT THIS ROUND: stopping a whole turn from the phone (`stop`). Claude Code has no external
-interrupt; the only lever is a hook returning {"continue": false}, which belongs to the remote-controls
-interrupt work (hmdapp docs/HANDOFF-TO-HEIMDALL-remote-controls.md, H4), not to this deny-only round.
+`stop` ENDS THE TURN ONLY AT A REQUEST THE PHONE WAS SHOWN. It is the one lever Claude Code gives a hook
+({"continue": false}), applied to the one pending call the phone is looking at -- there is no standing
+"stop the next thing" marker, so nothing lingers into a later turn. Interrupting a turn at an arbitrary
+moment is the separate remote-controls interrupt work (hmdapp docs/HANDOFF-TO-HEIMDALL-remote-controls.md,
+H4). Not verified here: what `continue:false` does when the call came from inside a sub-agent (H8 spike).
 
 Usage:  heimdall-phone-deny [--repo DIR] < hook.json        (-h / --help prints this)
 Env:    HMD_PHONE_DENY=1            arm the hook
@@ -66,6 +72,9 @@ STATE_CAP_BYTES = 65536
 PROGRAMMATIC_ENTRYPOINTS = frozenset(("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action"))
 DENY_REASON = ("Denied from the operator's paired phone (hmd phone-deny). Do not retry this action; "
                "ask the operator how they want to proceed.")
+STOP_DENY_REASON = ("Stopped from the operator's paired phone (hmd phone-deny). Do not retry this action "
+                    "or carry on with the task; wait for the operator.")
+STOP_REASON = "Stopped from the paired phone (hmd phone-deny)."
 
 
 def armed(env):
@@ -146,9 +155,16 @@ def read_hook_input(stream):
     return obj if isinstance(obj, dict) else None
 
 
-def deny_output():
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                   "permissionDecisionReason": DENY_REASON}}
+def decision_output(verdict):
+    """The hook's whole output vocabulary, besides nothing: the call is denied ("deny"), and for
+    "stop" the turn is ended too -- Claude Code's own {"continue": false, "stopReason": ...}, which
+    takes precedence over the per-call decision. There is no branch that allows anything."""
+    out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                  "permissionDecisionReason": STOP_DENY_REASON if verdict == "stop" else DENY_REASON}}
+    if verdict == "stop":
+        out["continue"] = False
+        out["stopReason"] = STOP_REASON
+    return out
 
 
 def emit(obj):
@@ -172,27 +188,29 @@ def _option(argv, name):
     return None
 
 
-def hold_for_deny(decisions, root, tool_name, summary, window_s, launcher_pid):
-    """Publish one request, wait up to window_s for the phone's deny, withdraw the request. Returns True
-    only when a deny is on record. Returns False -- and prints nothing -- when the window runs out or
-    the process that launched this hook is gone (Esc, a timeout that reached only the shell): a deny
-    printed into a dead pipe would be lost, and a request kept listed would be a lie."""
+def hold_for_decision(decisions, root, tool_name, summary, window_s, launcher_pid):
+    """Publish one request, wait up to window_s for the phone's verb, withdraw the request. Returns
+    "deny" or "stop" only when that verb is on record. Returns None -- and prints nothing -- when the
+    window runs out or the process that launched this hook is gone (Esc, a timeout that reached only
+    the shell): a decision printed into a dead pipe would be lost, and a request kept listed would be
+    a lie."""
     rec = decisions.request(root, tool_name, summary, window_s)
     try:
         deadline = time.monotonic() + window_s
         while True:
             decisions.heartbeat(root, rec["id"])
-            if decisions.decision_of(root, rec["id"]) == "deny":
-                return True
+            verdict = decisions.decision_of(root, rec["id"])
+            if verdict is not None:
+                return verdict
             if os.getppid() != launcher_pid:
-                return False
+                return None
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             time.sleep(min(POLL_S, remaining))
-        # The window is over: either the deny is already on record, or this makes sure none can land
-        # from now on -- a deny the phone is told was accepted is one this hook acts on.
-        return decisions.settle(root, rec["id"]) == "deny"
+        # The window is over: either the phone's verb is already on record, or this makes sure none
+        # can land from now on -- a decision the phone is told was accepted is one this hook acts on.
+        return decisions.settle(root, rec["id"])
     finally:
         decisions.close(root, rec["id"])
 
@@ -215,10 +233,10 @@ def run(argv, env, stdin, launcher_pid):
     risk = _load("phone_deny_risk").classify(hook.get("tool_name"), hook.get("tool_input"), root, cwd=cwd)
     if risk is None:
         return 0
-    denied = hold_for_deny(_load("companion_ui_decisions"), root, hook["tool_name"], risk["summary"],
-                           window_seconds(env), launcher_pid)
-    if denied:
-        emit(deny_output())
+    verdict = hold_for_decision(_load("companion_ui_decisions"), root, hook["tool_name"], risk["summary"],
+                                window_seconds(env), launcher_pid)
+    if verdict is not None:
+        emit(decision_output(verdict))
     return 0
 
 

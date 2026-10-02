@@ -113,7 +113,7 @@
       "event": "PreToolUse",
       "index": 7,
       "id": "phone-deny",
-      "description": "Opt-in, OFF unless HMD_PHONE_DENY=1: holds a risky shell command or outside-the-repo write for up to HMD_PHONE_DENY_WINDOW_S (default 10 s, max 120) so the paired phone can deny it over the sealed relay. The phone can only deny, never approve; no reply, no connected companion, an unattended session or any error -> does nothing and exits 0 (Claude Code's normal permission flow proceeds).",
+      "description": "Opt-in, OFF unless HMD_PHONE_DENY=1: holds a risky shell command or outside-the-repo write for up to HMD_PHONE_DENY_WINDOW_S (default 10 s, max 120) so the paired phone can deny it, or stop the turn, over the sealed relay. The phone can only reduce what runs, never approve; no reply, no connected companion, an unattended session or any error -> does nothing and exits 0 (Claude Code's normal permission flow proceeds).",
       "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
       "fingerprint": "585dd5585144a44171f115aeb3ac6bf335073b5a7d595b5178b1c099ef9f37fd",
       "locked": false

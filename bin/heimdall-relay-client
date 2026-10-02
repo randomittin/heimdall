@@ -865,16 +865,18 @@ class RelayClient:
         return conn, resp
 
     def _decide(self, params):
-        """The phone's sealed DENY of a pending risky action (A4, deny-only round; the doc's
+        """The phone's sealed DENY or STOP of a pending risky action (A4, deny-only round; the doc's
         POST /api/decide, carried as a relay command the way send-message is):
-            command  {"action":"decide","params":{"id":"p-<8 hex>","decision":"deny"}}
-            ack ok   {"ok":true,"of_seq":N,"id":"p-<8 hex>","decision":"deny"}
+            command  {"action":"decide","params":{"id":"p-<8 hex>","decision":"deny"|"stop"}}
+            ack ok   {"ok":true,"of_seq":N,"id":"p-<8 hex>","decision":"deny"|"stop"}
             ack no   {"ok":false,"of_seq":N,"detail":<code>}
-        Reached only by a frame that opened under the paired device's session key and passed the
-        replay guard, so there is no other authentication to do. The store (companion_ui_decisions)
-        owns every rule and its machine-readable refusal: bad-decision, unknown-id,
-        allow-not-permitted, already-decided, expired -- the phone can only deny, "allow" is refused
-        for every request, and nothing is written on a refusal."""
+        `deny` refuses the call; `stop` refuses it and ends the turn (bin/heimdall-phone-deny turns
+        either into its PreToolUse output). Reached only by a frame that opened under the paired
+        device's session key and passed the replay guard, so there is no other authentication to do.
+        The store (companion_ui_decisions) owns every rule and its machine-readable refusal:
+        bad-decision, unknown-id, allow-not-permitted, already-decided, expired -- the phone can only
+        reduce what runs, "allow" (and "approve", and any other word) is refused for every request,
+        and nothing is written on a refusal."""
         if DECISIONS is None:
             return False, "decisions-unavailable", {}
         fields = params if isinstance(params, dict) else {}
