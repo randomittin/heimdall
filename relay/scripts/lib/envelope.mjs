@@ -1,5 +1,5 @@
 // hmd-leg outer `Envelope` wire codec (relay/README.md "Envelope (wire shape,
-// both directions)"), independent of src/relay/protocol.ts's phone-leg inner
+// both directions)"), independent of hmdapp's phone-leg protocol module's inner
 // frame codec (`{type, seq, ciphertext}`, no v/session_id/sender/nonce --
 // those are implicit on a single WebSocket connection). hmd's leg has no
 // persistent connection (POST /frames, GET /stream are separate HTTP
@@ -60,9 +60,9 @@ export function base64Decode(value) {
 // claim query param, forwarded verbatim into hmd's stream by
 // relay/src/session.ts's deliverToHmdStream) is this alphabet, unlike
 // ciphertext/nonce above which stay standard base64. Node has had a native
-// 'base64url' Buffer encoding since v15.7 -- unlike src/relay/protocol.ts's
-// dependency-free base64Encode/base64Decode (which avoid Buffer/atob for
-// Hermes/RN portability), this is a plain-Node dev script with no such
+// 'base64url' Buffer encoding since v15.7 -- unlike the app's phone-leg
+// protocol module's dependency-free base64Encode/base64Decode (which avoid
+// Buffer/atob for Hermes/RN portability), this is a plain-Node dev script with no such
 // constraint, so it uses the built-in encoding directly rather than
 // hand-rolling one.
 const BASE64URL_SHAPE = /^[A-Za-z0-9_-]*$/;

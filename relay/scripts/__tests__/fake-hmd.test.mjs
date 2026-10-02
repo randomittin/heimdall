@@ -38,7 +38,7 @@ import {
 
 const HERE = fileURLToPath(new URL('.', import.meta.url)); // .../relay/scripts/__tests__/
 const REPO_ROOT = join(HERE, '..', '..', '..');
-const SHARED_VECTORS_PATH = join(REPO_ROOT, 'src/relay/__tests__/fixtures/vectors.json');
+const SHARED_VECTORS_PATH = join(REPO_ROOT, 'relay/contract/vectors.json');
 
 function toHex(bytes) {
   return Buffer.from(bytes).toString('hex');
@@ -50,10 +50,10 @@ function fromHex(hex) {
 
 // --- relay-crypto.mjs against the shared golden vector -----------------
 
-test('relay-crypto.mjs reproduces the shared golden vector (src/relay/__tests__/fixtures/vectors.json)', () => {
+test('relay-crypto.mjs reproduces the shared golden vector (relay/contract/vectors.json)', () => {
   assert.ok(
     existsSync(SHARED_VECTORS_PATH),
-    `expected the app's committed fixture at ${SHARED_VECTORS_PATH} (brief: "if present")`
+    `expected the canonical contract fixture at ${SHARED_VECTORS_PATH}`
   );
   const golden = JSON.parse(readFileSync(SHARED_VECTORS_PATH, 'utf8'));
 
@@ -202,15 +202,15 @@ test('parseArgs rejects a flag missing its value', () => {
   assert.throws(() => parseArgs(['--relay']), /--relay requires a value/);
 });
 
-test('resolveStatePath defaults to docs/samples/state.json under the repo root', () => {
+test('resolveStatePath defaults to relay/test/fixtures/state.json under the repo root', () => {
   const resolved = resolveStatePath(undefined);
-  assert.equal(resolved, join(REPO_ROOT, 'docs/samples/state.json'));
+  assert.equal(resolved, join(REPO_ROOT, 'relay/test/fixtures/state.json'));
   assert.ok(existsSync(resolved), `expected the real sample fixture to exist at ${resolved}`);
 });
 
 test('resolveStatePath resolves a relative --state against the repo root, not cwd', () => {
-  const resolved = resolveStatePath('docs/samples/state.json');
-  assert.equal(resolved, join(REPO_ROOT, 'docs/samples/state.json'));
+  const resolved = resolveStatePath('relay/test/fixtures/state.json');
+  assert.equal(resolved, join(REPO_ROOT, 'relay/test/fixtures/state.json'));
 });
 
 test('resolveStatePath passes an absolute --state through untouched', () => {
