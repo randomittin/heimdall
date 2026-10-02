@@ -8,8 +8,8 @@
 // Usage:
 //   node relay/scripts/fake-hmd.mjs --relay <https://...> [--state <path>] [--phone-pubkey <base64>]
 //
-// Flow (spec: docs/superpowers/specs/2026-09-21-hmd-relay-design.md §2.1-2.3;
-// invariants: docs/superpowers/specs/relay/INVARIANTS.md INV-11..25):
+// Flow (spec: relay/docs/2026-09-21-hmd-relay-design.md §2.1-2.3;
+// invariants: relay/docs/INVARIANTS.md INV-11..25):
 //   1. POST /pair/init
 //   2. generate an X25519 keypair (relay/scripts/lib/relay-crypto.mjs)
 //   3. print the QR/pairing payload as one JSON line on stdout
@@ -44,7 +44,7 @@ import { encodeHmdEnvelope, decodeEnvelope, base64Encode, base64UrlDecode } from
 
 const HERE = fileURLToPath(new URL('.', import.meta.url)); // .../relay/scripts/
 const REPO_ROOT = join(HERE, '..', '..');
-const DEFAULT_STATE_RELATIVE_PATH = 'docs/samples/state.json';
+const DEFAULT_STATE_RELATIVE_PATH = 'relay/test/fixtures/state.json';
 const STATE_SEND_INTERVAL_MS = 5000;
 
 /** Reconnect ladder for the hmd-leg `GET /stream`. Cloudflare closes a
