@@ -410,7 +410,34 @@ _gate_marker_release() {
   rm -f "$GATE_MARKER" 2>/dev/null || true
 }
 cleanup() { rm -rf "$WORK"; _gate_marker_release; }
-trap cleanup EXIT INT TERM
+
+# INT/TERM MUST END THE RUN. This used to be `trap cleanup EXIT INT TERM`, and a trap handler
+# that does not `exit` stops nothing: bash ran cleanup (rm -rf "$WORK") and RESUMED the script
+# where the signal landed. A sweep sent TERM therefore deleted its own work dir and kept going
+# -- every later suite failed to open its capture file ("No such file or directory"), was
+# classified `0s ? passed, ? failed`, the re-run-reds phase repeated that for all of them, and
+# the corpse ended "RUN RED -- 434 suite(s) not green" in 147s with a bogus sweep receipt and
+# output interleaved into the log of the replacement sweep the operator had started
+# (2026-10-02: `pkill -f test/run-all.sh`, then a fresh sweep). Now the handler stops
+# everything this sweep started and exits 128+signal; `exit` fires the EXIT trap, so cleanup
+# runs exactly once. Suites run in their OWN process group (timeout_run's setpgrp), so a
+# signal to the runner never reaches them by itself -- the parent->child links are the only
+# handle on what is still in flight. Proof: test/run-all-signal.test.sh.
+_descendants() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do
+    printf '%s\n' "$c"
+    _descendants "$c"
+  done
+}
+_abort_sweep() {
+  local p
+  for p in $(_descendants "$$"); do kill -TERM "$p" 2>/dev/null; done
+  exit "$1"
+}
+trap cleanup EXIT
+trap '_abort_sweep 130' INT
+trap '_abort_sweep 143' TERM
 
 # ── REPO INTEGRITY, BEFORE SIDE (guarantee #8 above) ────────────────────────────────────
 # Snapshot the tree now, before suite #0 has even started. The AFTER side, and the full
