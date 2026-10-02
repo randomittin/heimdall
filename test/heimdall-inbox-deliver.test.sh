@@ -1138,7 +1138,7 @@ D="$(make_project)"
 OUTF="$(mktemp)"
 seed_inbox "$D" 'esc \u001b[31mred\u001b[0m and bell \u0007 done'
 tool_run "$D" PostToolUse "$OUTF" ""
-if [ -s "$OUTF" ] && ! grep -q 'u001b\|u0007' "$OUTF" && grep -q 'red' "$OUTF"; then ok "ESC and BEL bytes stripped, the printable text survives"; else bad "control characters reached the model: $(cat "$OUTF")"; fi
+if [ -s "$OUTF" ] && ! grep -q -e u001b -e u0007 "$OUTF" && grep -q 'red' "$OUTF"; then ok "ESC and BEL bytes stripped, the printable text survives"; else bad "control characters reached the model: $(cat "$OUTF")"; fi
 LONG="$(python3 -c 'print("x" * 1900)')"
 seed_inbox "$D" "$LONG" "$LONG" "$LONG" "$LONG" "$LONG"
 tool_run "$D" PreToolUse "$OUTF" ""
@@ -1285,12 +1285,10 @@ def marker_age():
 if churn:
     threading.Thread(target=churner, daemon=True).start()
 ages = []
-usage = None
-while usage is None:
+while True:
     done, _, usage = os.wait4(proc.pid, os.WNOHANG)
     if done:
         break
-    usage = None
     age = marker_age()
     if age is not None:
         ages.append(age)

@@ -233,6 +233,168 @@ wait "$BGPID" 2>/dev/null || true
 [ "$ELAPSED" -le 9 ] && ok "released ${ELAPSED}s in, a poll after the keystroke -- not the 20s bound" || bad "took ${ELAPSED}s -- the keystroke did not end the hold"
 rm -rf "$D" "$TTYF"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool-boundary delivery (hmdapp docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md, ask 2):
+# a PreToolUse and a PostToolUse group that hand a queued phone message to a RUNNING
+# turn at its next tool boundary. They fire on EVERY tool call of EVERY session, so
+# the empty-inbox path must cost a file-size test and nothing else: no python, no git.
+# bin/heimdall-inbox-deliver's own `tool` mode is covered by its own suite (36-46).
+# ─────────────────────────────────────────────────────────────────────────────
+PRE_ID=inbox-deliver-pretool
+POST_ID=inbox-deliver-posttool
+PROBE="$REPO/test/lib/inbox-latency-probe.py"
+group_of() { jq -c --arg ev "$1" --arg id "$2" '[.hooks[$ev][]? | select(any(.hooks[]?; (.command // "") | contains($id)))] | .[0] // empty' "$HOOKS_JSON"; }
+cmd_of()   { jq -r --arg ev "$1" --arg id "$2" '[.hooks[$ev][]? | select(any(.hooks[]?; (.command // "") | contains($id)))] | .[0].hooks[0].command // empty' "$HOOKS_JSON"; }
+f_lt() { python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)' "$1" "$2"; }   # f_lt A B -- exit 0 iff A < B
+# tool_event EVENT DIR -- the payload Claude Code sends a tool hook.
+tool_event() { printf '{"session_id":"s1","transcript_path":"","cwd":"%s","hook_event_name":"%s","tool_name":"Bash","tool_input":{"command":"true"}}' "$2" "$1"; }
+
+echo "13. hooks.json carries a PreToolUse and a PostToolUse inbox-deliver group: matcher *, tool mode, kill-switch prefix, 10s timeout, file-size guard first:"
+for PAIR in "PreToolUse $PRE_ID" "PostToolUse $POST_ID"; do
+  EV="${PAIR%% *}"; ID="${PAIR##* }"
+  G="$(group_of "$EV" "$ID")"; C="$(cmd_of "$EV" "$ID")"
+  if [ -z "$G" ]; then bad "$EV: no group names $ID"; continue; fi
+  ok "$EV: a group names $ID"
+  [ "$(printf '%s' "$G" | jq -r '.matcher')" = "*" ] && ok "$EV: matcher is * (every tool boundary)" || bad "$EV: matcher is '$(printf '%s' "$G" | jq -r '.matcher')'"
+  printf '%s' "$C" | grep -q 'bin/heimdall-inbox-deliver' && ok "$EV: invokes bin/heimdall-inbox-deliver" || bad "$EV: does not invoke heimdall-inbox-deliver"
+  printf '%s' "$C" | grep -q ' tool --repo' && ok "$EV: runs tool mode" || bad "$EV: does not run tool mode"
+  printf '%s' "$C" | grep -q "hmd_hook_enabled $ID" && ok "$EV: carries the kill-switch prefix ($ID)" || bad "$EV: missing kill-switch prefix"
+  [ "$(printf '%s' "$G" | jq -r '.hooks[0].timeout')" = "10" ] && ok "$EV: timeout is 10s (a stuck hook must not stall tool calls)" || bad "$EV: timeout is '$(printf '%s' "$G" | jq -r '.hooks[0].timeout')'"
+  case "$C" in
+    '[ -s "${CLAUDE_PROJECT_DIR:-.}/.heimdall/ui/inbox.jsonl" ] || exit 0;'*) ok "$EV: the inbox-size guard is the FIRST statement, before any git or python" ;;
+    *) bad "$EV: the command does not start with the inbox-size guard: ${C%%;*}" ;;
+  esac
+done
+
+echo "14. hooks.metadata.json registers both ids once each, at the right event, advisory (locked:false), matcher *:"
+for PAIR in "PreToolUse $PRE_ID" "PostToolUse $POST_ID"; do
+  EV="${PAIR%% *}"; ID="${PAIR##* }"
+  N="$(jq -r --arg id "$ID" '[.hooks[] | select(.id == $id)] | length' "$HOOKS_META")"
+  [ "$N" = "1" ] && ok "$ID appears exactly once in metadata" || bad "$ID count: $N"
+  [ "$(jq -r --arg id "$ID" '.hooks[] | select(.id == $id) | .event' "$HOOKS_META")" = "$EV" ] && ok "$ID is registered under $EV" || bad "$ID is registered under '$(jq -r --arg id "$ID" '.hooks[] | select(.id == $id) | .event' "$HOOKS_META")'"
+  [ "$(jq -r --arg id "$ID" '.hooks[] | select(.id == $id) | .locked' "$HOOKS_META")" = "false" ] && ok "$ID is advisory (locked:false): the operator can switch it off" || bad "$ID is locked"
+  [ "$(jq -r --arg id "$ID" '.hooks[] | select(.id == $id) | .matcher' "$HOOKS_META")" = "*" ] && ok "$ID records matcher *" || bad "$ID matcher is not *"
+  jq -r --arg id "$ID" '.hooks[] | select(.id == $id) | .description' "$HOOKS_META" | grep -q 'NEW --' && bad "$ID still carries the regen placeholder description" || ok "$ID has a written description"
+done
+LIST_OUT="$("$HOOKS_TOOL" list 2>&1)"
+echo "$LIST_OUT" | grep -q "$PRE_ID" && echo "$LIST_OUT" | grep -q "$POST_ID" && ok "heimdall-hooks list shows both ids" || bad "list is missing a tool-boundary id: $LIST_OUT"
+
+echo "15. heimdall-hooks disable <id> makes each tool hook a no-op even with a message queued (it stays queued); enabled, the same command delivers:"
+TMPHOME="$(mktemp -d)"
+for PAIR in "PreToolUse $PRE_ID" "PostToolUse $POST_ID"; do
+  EV="${PAIR%% *}"; ID="${PAIR##* }"
+  CMD="$(cmd_of "$EV" "$ID")"
+  D="$(make_project)"
+  printf '{"id":"d1","ts":1,"text":"queued behind a switch","source":"test"}\n' > "$D/.heimdall/ui/inbox.jsonl"
+  printf '%s\n' "$ID" > "$TMPHOME/hooks-disabled"
+  OUT="$(tool_event "$EV" "$D" | HEIMDALL_HOME="$TMPHOME" CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" CLAUDE_CODE_ENTRYPOINT=cli bash -c "$CMD" 2>&1)"
+  RC=$?
+  [ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "$ID: disabled -> exit 0, nothing printed" || bad "$ID: disabled rc=$RC out: $OUT"
+  grep -q "queued behind a switch" "$D/.heimdall/ui/inbox.jsonl" && ok "$ID: disabled -> the message is still queued" || bad "$ID: a disabled hook popped the message"
+  : > "$TMPHOME/hooks-disabled"
+  OUT="$(tool_event "$EV" "$D" | HEIMDALL_HOME="$TMPHOME" CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" CLAUDE_CODE_ENTRYPOINT=cli bash -c "$CMD" 2>&1)"
+  printf '%s' "$OUT" | grep -q "queued behind a switch" && ok "$ID: enabled again -> the same command delivers it" || bad "$ID: enabled but nothing delivered: $OUT"
+  rm -rf "$D"
+done
+rm -rf "$TMPHOME"
+
+echo "16. empty-inbox fast path: no python3 and no git is ever spawned (inbox missing or empty), and the command costs < 5ms over a bare shell:"
+FASTP="$(mktemp)"
+cat > "$FASTP" <<'PYEOF'
+import subprocess
+import sys
+import time
+
+cmd, n = sys.argv[1], int(sys.argv[2])
+
+
+def run(c):
+    t = time.perf_counter()
+    subprocess.run(["bash", "-c", c], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, check=False)
+    return time.perf_counter() - t
+
+
+bare, guarded = [], []
+for _ in range(n):
+    bare.append(run(":"))
+    guarded.append(run(cmd))
+bare.sort()
+guarded.sort()
+mb, mg = bare[n // 2], guarded[n // 2]
+print("bare_ms=%.2f guarded_ms=%.2f over_ms=%.2f" % (mb * 1000, mg * 1000, (mg - mb) * 1000))
+PYEOF
+SHIM="$(mktemp -d)"
+SPAWNED="$SHIM/spawned"
+for T in python3 git; do
+  printf '#!/bin/sh\necho %s >> "%s"\nexit 0\n' "$T" "$SPAWNED" > "$SHIM/$T"
+  chmod +x "$SHIM/$T"
+done
+for PAIR in "PreToolUse $PRE_ID" "PostToolUse $POST_ID"; do
+  EV="${PAIR%% *}"; ID="${PAIR##* }"
+  CMD="$(cmd_of "$EV" "$ID")"
+  D="$(make_project)"
+  rm -f "$SPAWNED"
+  # CLAUDE_PLUGIN_ROOT stays unset so a git spawn (the fallback in the command) would show.
+  tool_event "$EV" "$D" | env -u CLAUDE_PLUGIN_ROOT PATH="$SHIM:$PATH" CLAUDE_PROJECT_DIR="$D" bash -c "$CMD" > /dev/null 2>&1
+  RC1=$?
+  : > "$D/.heimdall/ui/inbox.jsonl"
+  tool_event "$EV" "$D" | env -u CLAUDE_PLUGIN_ROOT PATH="$SHIM:$PATH" CLAUDE_PROJECT_DIR="$D" bash -c "$CMD" > /dev/null 2>&1
+  RC2=$?
+  if [ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ] && [ ! -e "$SPAWNED" ]; then ok "$EV: inbox missing and inbox empty -> exit 0, python3 and git never run"; else bad "$EV: rc=$RC1/$RC2, spawned: $(cat "$SPAWNED" 2>/dev/null | tr '\n' ' ')"; fi
+  RES="$(env -u CLAUDE_PLUGIN_ROOT CLAUDE_PROJECT_DIR="$D" python3 "$FASTP" "$CMD" 40)"
+  OVER="$(printf '%s' "$RES" | sed -n 's/.*over_ms=\([-0-9.]*\).*/\1/p')"
+  { [ -n "$OVER" ] && f_lt "$OVER" 5; } && ok "$EV: median over a bare 'bash -c :' is ${OVER}ms (< 5ms; $RES)" || bad "$EV: the empty path costs too much: $RES"
+  rm -rf "$D"
+done
+rm -rf "$SHIM" "$FASTP"
+
+echo "17. the wired commands deliver: a queued message becomes additionalContext on both events, the receipt is stamped, headless sessions are left alone:"
+CHK17="$(mktemp)"
+cat > "$CHK17" <<'PYEOF'
+import json
+import sys
+
+raw, event, text = sys.argv[1:4]
+try:
+    obj = json.loads(raw)
+except ValueError:
+    print("BAD not JSON: %r" % raw[:200])
+    sys.exit(0)
+hso = obj.get("hookSpecificOutput", {})
+ctx = hso.get("additionalContext", "")
+ok = (hso.get("hookEventName") == event and text in ctx
+      and ctx.startswith("[companion inbox -- message from the paired phone"))
+print("OK" if ok else "BAD %r" % raw[:300])
+PYEOF
+HOMEDIR="$(mktemp -d)"
+for PAIR in "PreToolUse $PRE_ID" "PostToolUse $POST_ID"; do
+  EV="${PAIR%% *}"; ID="${PAIR##* }"
+  CMD="$(cmd_of "$EV" "$ID")"
+  D="$(make_project)"
+  printf '{"id":"w1","ts":1,"text":"wired hello from phone","source":"test"}\n' > "$D/.heimdall/ui/inbox.jsonl"
+  OUT="$(tool_event "$EV" "$D" | HEIMDALL_HOME="$HOMEDIR" CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" CLAUDE_CODE_ENTRYPOINT=sdk-cli bash -c "$CMD" 2>&1)"
+  [ -z "$OUT" ] && grep -q "wired hello from phone" "$D/.heimdall/ui/inbox.jsonl" && ok "$EV: a headless session (CLAUDE_CODE_ENTRYPOINT=sdk-cli) neither receives nor pops it" || bad "$EV: headless session consumed it: $OUT"
+  OUT="$(tool_event "$EV" "$D" | HEIMDALL_HOME="$HOMEDIR" CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" CLAUDE_CODE_ENTRYPOINT=cli bash -c "$CMD" 2>&1)"
+  RC=$?
+  [ "$RC" -eq 0 ] && ok "$EV: exit 0" || bad "$EV: exit $RC"
+  [ "$(python3 "$CHK17" "$OUT" "$EV" "wired hello from phone")" = "OK" ] && ok "$EV: hookSpecificOutput.additionalContext carries the text behind the marker, hookEventName=$EV" || bad "$EV: $OUT"
+  grep -q '"delivered_at"' "$D/.heimdall/ui/inbox-delivered.jsonl" 2>/dev/null && ok "$EV: archived with a delivered_at receipt" || bad "$EV: no receipt in the archive"
+  [ ! -s "$D/.heimdall/ui/inbox.jsonl" ] && ok "$EV: popped" || bad "$EV: still queued"
+  rm -rf "$D"
+done
+rm -rf "$HOMEDIR" "$CHK17"
+
+echo "18. mid-turn latency through the wired commands: a message landing during a scripted turn is delivered at the next tool boundary, not at the Stop:"
+OUT="$(python3 "$PROBE" --root "$REPO" --json --scenario tool-boundary --trials 6 --turn-s 4 --gap 0.5 2>&1)"
+V="$(printf '%s' "$OUT" | python3 -c 'import json, sys; r = json.load(sys.stdin); print("%d %s %s %s" % (r["failed"], str(r["tool_boundary_wired"]).lower(), r["receipt_s"]["p50"], r["receipt_s"]["max"]))' 2>/dev/null)"
+set -- $V
+if [ -n "$V" ] && [ "$1" = "0" ] && [ "$2" = "true" ] && f_lt "$4" 1.5; then
+  ok "6 messages landing 0.3-3.0s into a 4s turn (a tool every 0.5s): all delivered, receipt p50/max = $3 / $4 s (bound 1.5s; waiting for the Stop at 4s would give 1.0-3.7s)"
+else
+  bad "failed/wired/p50/max = '${V:-none}' -- $OUT"
+fi
+
 echo ""
 echo "heimdall-inbox-wiring.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1
