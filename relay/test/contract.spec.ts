@@ -42,7 +42,7 @@ interface Wire {
   phone: {
     claim: RequestTemplate & { status: number };
     device_bound: Json;
-    revoked: { session_ended: Json; close_code: number };
+    revoked: { session_ended: Json; close_code: number; late_claim_status: number };
   };
   frames_post: {
     request: RequestTemplate;
@@ -217,6 +217,21 @@ function inbox(socket: WebSocket): () => Promise<Record<string, unknown>> {
   };
 }
 
+function claimQuery(live: Live): string {
+  return new URLSearchParams(fill(wire.phone.claim, live).query).toString();
+}
+
+/** The phone claims with the fixture's query; returns its accepted socket and its message queue. */
+async function claim(session: Session, live: Live) {
+  const claimed = fill(wire.phone.claim, live);
+  const upgrade = await wsUpgrade(session.live.session_id as string, claimQuery(live), claimed.headers);
+  expect(upgrade.status).toBe(wire.phone.claim.status);
+  const socket = upgrade.webSocket;
+  if (!socket) throw new Error("expected a websocket in the 101 response");
+  socket.accept();
+  return { socket, phone: inbox(socket) };
+}
+
 describe("relay wire contract (relay/contract/wire.json)", () => {
   it("POST /pair/init answers the fixture's shape", async () => {
     const res = await send(wire.pair_init.request, {});
@@ -235,7 +250,7 @@ describe("relay wire contract (relay/contract/wire.json)", () => {
     }
   });
 
-  it("a whole session: claim, state/ack down, commands up, revoke -- the fixture's frames, byte for byte", async () => {
+  it("passes the fixture's frames between hmd and the phone byte for byte", async () => {
     const session = await pairInit();
     const live: Live = { ...session.live, device_pubkey: COMPUTED.device_pubkey_b64url as string };
     const postFrame = (name: string) => send(wire.frames_post.request, live, wire.frames[name]?.wire);
@@ -245,54 +260,42 @@ describe("relay wire contract (relay/contract/wire.json)", () => {
     expect(early.status).toBe(wire.frames_post.response_undelivered.status);
     expectMatch(await early.json(), wire.frames_post.response_undelivered.body, live);
 
-    const { reader, lines } = await openStream(session);
-    let socket: WebSocket | undefined;
-    try {
-      // the phone claims with the fixture's query
-      const claim = fill(wire.phone.claim, live);
-      const query = new URLSearchParams(claim.query).toString();
-      const upgrade = await wsUpgrade(session.live.session_id as string, query, claim.headers);
-      expect(upgrade.status).toBe(wire.phone.claim.status);
-      socket = upgrade.webSocket ?? undefined;
-      if (!socket) throw new Error("expected a websocket in the 101 response");
-      socket.accept();
-      const phone = inbox(socket);
+    const { lines } = await openStream(session);
+    const { socket, phone } = await claim(session, live);
 
-      expectMatch(await phone(), wire.phone.device_bound, live);
-      expectMatch(await lines.nextData(), wire.stream.lines.device_bound as Json, live);
+    expectMatch(await phone(), wire.phone.device_bound, live);
+    expectMatch(await lines.nextData(), wire.stream.lines.device_bound as Json, live);
 
-      // hmd -> phone: state and the three acks arrive exactly as posted
-      for (const name of ["state", "ack_send_message", "ack_decide_allow", "ack_decide_deny"]) {
-        const res = await postFrame(name);
-        expect(res.status, name).toBe(wire.frames_post.response_delivered.status);
-        expectMatch(await res.json(), wire.frames_post.response_delivered.body, live);
-        expect(await phone(), `${name} as the phone receives it`).toEqual(wire.frames[name]?.wire);
-      }
-
-      // phone -> hmd: the three commands reach hmd's stream exactly as sent
-      for (const name of ["command_send_message", "command_decide_allow", "command_decide_deny"]) {
-        socket.send(JSON.stringify(wire.frames[name]?.wire));
-        expect(await lines.nextData(), `${name} as hmd receives it`).toEqual(wire.frames[name]?.wire);
-      }
-
-      // revoke: the phone is told why, then closed
-      const ended = phone();
-      const closed = nextCloseCode(socket);
-      const revoked = await send(wire.revoke.request, live, undefined);
-      expect(revoked.status).toBe(wire.revoke.response.status);
-      expectMatch(await revoked.json(), wire.revoke.response.body, live);
-      expectMatch(await ended, wire.phone.revoked.session_ended, live);
-      expect(await closed).toBe(wire.phone.revoked.close_code);
-    } finally {
-      // The pool cannot pop a test's isolated storage while a socket or a response body of it is
-      // still open, which leaves the session's alarm to fire two minutes later. Release both, even
-      // when an assertion above threw.
-      try {
-        socket?.close();
-      } catch {
-        // already closed by the relay
-      }
-      await reader.cancel().catch(() => undefined);
+    // hmd -> phone: state and the three acks arrive exactly as posted
+    for (const name of ["state", "ack_send_message", "ack_decide_allow", "ack_decide_deny"]) {
+      const res = await postFrame(name);
+      expect(res.status, name).toBe(wire.frames_post.response_delivered.status);
+      expectMatch(await res.json(), wire.frames_post.response_delivered.body, live);
+      expect(await phone(), `${name} as the phone receives it`).toEqual(wire.frames[name]?.wire);
     }
+
+    // phone -> hmd: the three commands reach hmd's stream exactly as sent
+    for (const name of ["command_send_message", "command_decide_allow", "command_decide_deny"]) {
+      socket.send(JSON.stringify(wire.frames[name]?.wire));
+      expect(await lines.nextData(), `${name} as hmd receives it`).toEqual(wire.frames[name]?.wire);
+    }
+  });
+
+  it("revoke tells the phone why, closes it with the fixture's code, and refuses a late claim", async () => {
+    const session = await pairInit();
+    const live: Live = { ...session.live, device_pubkey: COMPUTED.device_pubkey_b64url as string };
+    const { socket, phone } = await claim(session, live);
+    expectMatch(await phone(), wire.phone.device_bound, live);
+
+    const ended = phone();
+    const closed = nextCloseCode(socket);
+    const revoked = await send(wire.revoke.request, live, undefined);
+    expect(revoked.status).toBe(wire.revoke.response.status);
+    expectMatch(await revoked.json(), wire.revoke.response.body, live);
+    expectMatch(await ended, wire.phone.revoked.session_ended, live);
+    expect(await closed).toBe(wire.phone.revoked.close_code);
+
+    const late = await wsUpgrade(session.live.session_id as string, claimQuery(live), { Upgrade: "websocket" });
+    expect(late.status).toBe(wire.phone.revoked.late_claim_status);
   });
 });

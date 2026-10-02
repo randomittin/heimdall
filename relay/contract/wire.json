@@ -148,7 +148,8 @@
           "reason": "revoked"
         }
       },
-      "close_code": 4001
+      "close_code": 4001,
+      "late_claim_status": 410
     }
   },
   "frames_post": {
