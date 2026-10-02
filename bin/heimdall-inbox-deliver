@@ -83,42 +83,58 @@
 #   TYPING RELEASE. A prompt typed while the Stop hook is still running queues
 #     behind it, so a hold that outlives the operator's return is a prompt stuck
 #     for up to the whole wait -- the long-poll's cost, paid exactly when the human
-#     is back. Each poll therefore first asks whether the session's terminal was
-#     read within TYPING_RECENT_S (10s): somebody is typing into it, or just sent
-#     a prompt. If so the hold ends on the spot -- no marker, no pop -- and whatever
-#     is queued stays queued and rides the prompt being typed (the UserPromptSubmit
-#     hook folds it in). The 240s question wait ends the same way.
-#     Why the terminal's access time (the number `w` and `who -u` print as IDLE):
-#     a read is exactly what typing is -- the kernel stamps it when Claude Code
-#     reads a keystroke off the pty, and its redraws only move mtime. The hook has
-#     no controlling terminal of its own (stdio are pipes; the Bash tool's shell
-#     reads tty "??" under a claude on ttys000), so once per hold it walks
-#     `ps -o ppid=,tty= -p PID` up from the hook shell to the first ancestor that
-#     has one. Measured 2026-10-01, macOS (Darwin 27), Claude Code 2.1.284:
-#       tty atime     CHOSEN. os.stat per poll ~35us; the ps walk ~35ms a hop,
-#                     once per hold. Needs no permission (stat of a device node).
-#                     Moves on reads only: two live sessions' atime sat still for
-#                     13+ minutes of continuous redraws and across a turn end,
-#                     and a test pty's moved on read, never on write. Per terminal,
-#                     so typing in session A leaves session B's phone hold alone;
-#                     sees keys arriving over ssh/tmux; a mouse jiggler cannot
-#                     fake it. Linux blurs it to 8s buckets (anti keystroke-timing);
-#                     TYPING_RECENT_S covers that.
-#       HIDIdleTime   rejected. `ioreg -r -d 1 -c IOHIDSystem` (4KB; the bare -c
-#                     form is 300KB) reads it with no TCC prompt or unified-log
-#                     TCC event, but costs ~61ms wall / ~31ms CPU a poll (~1700x
-#                     the stat), is machine-global (typing in session A would end
-#                     every session's hold), is pinned at zero by jigglers,
-#                     keep-awake and screen-share tools exactly when the operator
-#                     is away, cannot see keys typed over ssh, and has no Linux
-#                     counterpart.
-#       draft file    nothing to read: ~/.claude/sessions/<pid>.json carries
-#                     status busy|idle but no draft, history.jsonl is appended on
-#                     submit, and no draft file exists.
+#     is back. Each poll therefore first asks whether somebody is typing into the
+#     session's terminal. If so the hold ends on the spot -- no marker, no pop --
+#     and whatever is queued stays queued and rides the prompt being typed (the
+#     UserPromptSubmit hook folds it in). A hold that would begin with the terminal
+#     just read (a prompt typed or sent in the last 10s) never begins, and the 240s
+#     question wait ends the same way.
+#     TYPING = the session's terminal was READ within TYPING_RECENT_S (10s), the
+#     number `w` and `who -u` print as IDLE: the kernel stamps a tty's access time
+#     when claude takes a keystroke off the pty, and claude's redraws only move
+#     mtime. The hook has no controlling terminal of its own (stdio are pipes; the
+#     Bash tool's shell reads tty "??" under a claude on ttys000), so once per hold
+#     it walks `ps -o ppid=,tty= -p PID` up from itself to the first ancestor that
+#     has one. Per terminal: typing in session A leaves session B's phone hold alone,
+#     and by construction keys arriving over ssh or tmux count.
+#     A read is not always a human. claude switches on focus reporting (DECSET 1004)
+#     and theme reports (2031), and mouse tracking when fullscreen (all three are in
+#     the 2.1.287 binary), and a terminal that implements them answers a window focus
+#     change with bytes on the pty -- with nobody at the keyboard whenever something
+#     else takes focus. So on macOS the read only counts while HIDIdleTime says a
+#     keyboard or pointer was used within the same 10s. That is a VETO, never a
+#     requirement: where HIDIdleTime cannot be read (no ioreg, no IOHIDSystem, any
+#     other platform) the read alone decides.
+#     Measured 2026-10-02, macOS (Darwin 27), Terminal.app, Claude Code 2.1.287:
+#       tty atime     the primary signal. os.stat ~4us a poll; the ps walk ~5ms a hop
+#                     (three or four of them), once per hold. Needs no permission (a
+#                     stat of a device node). A test pty's atime moves on a read and
+#                     not on a write or an unread keystroke, its mtime the other way
+#                     round; a live session's atime was five minutes old while its
+#                     mtime was 0.3s old. Linux stamps it in 8s buckets, which
+#                     TYPING_RECENT_S covers.
+#       HIDIdleTime   the macOS veto. `ioreg -r -d 1 -c IOHIDSystem` (4KB; the bare
+#                     -c form is 311KB) costs ~25ms wall / ~23ms CPU a call, thousands
+#                     of times the stat, so it is asked only once the terminal has
+#                     been read. Needs no TCC permission: it is an IORegistry property,
+#                     not an event tap, and 21 calls from a Terminal.app child all
+#                     returned the value and logged no com.apple.TCC event naming
+#                     ioreg or ListenEvent / PostEvent. As the only signal it is the
+#                     wrong one: machine-wide (typing in session A would end every
+#                     session's hold, and a released session is not listening again
+#                     until its next turn ends), reset by mouse jigglers and
+#                     remote-control tools, blind to keys that arrive over ssh, and
+#                     Linux has no counterpart.
+#       draft file    nothing to read: ~/.claude/sessions/<pid>.json carries status
+#                     busy|idle but no draft, history.jsonl is appended on submit.
 #     No signal means no release: no ps, no ancestor with a terminal, a terminal
-#     that cannot be stat'ed -- the hold runs exactly as before. HMD_INBOX_TTY
-#     pins the device (the tests point it at a file) or, as off/0/false/no/none,
-#     switches the release off.
+#     that cannot be examined -- the hold runs exactly as before. HMD_INBOX_TTY pins
+#     the device (the tests point it at a file) or, as off/0/false/no/none, switches
+#     the release off. HMD_INBOX_PRESENCE_CMD replaces the HID source with a command
+#     that prints the seconds since a keyboard or pointer was last used (the tests
+#     inject it this way; empty or off/0/false/no/none removes the veto). It runs
+#     without a shell, with the hook's own privileges, so it is operator-only: set it
+#     in the environment, never from anything a phone message can reach.
 #   RECEIPTS. Every dequeue stamps delivered_at into the archived line
 #     (inbox-delivered.jsonl, 0600); /api/state's inbox.delivered[] is the last
 #     20 of those as {id, delivered_at} -- never text.
@@ -163,11 +179,14 @@ Modes:
            companion is connected (a .heimdall/app/connect.json naming live
            processes; attended sessions only, never headless claude -p or an
            hmd sub-session), long-polls the queue every 2s for up to
-           HMD_INBOX_WAIT_S seconds (default 1800 with a companion
+           HMD_INBOX_WAIT_S seconds (default 300 with a companion
            connected, 240 without) and delivers the same way the moment a
            message arrives. While it waits it keeps .heimdall/ui/inbox-waiting
-           fresh -- what `hmd ui` reports as inbox.consumer "waiting". If
-           stop_hook_active is true, exits silently (loop guard) without
+           fresh -- what `hmd ui` reports as inbox.consumer "waiting". The
+           wait ends at once, delivering nothing, when somebody is typing into
+           the session's terminal (a prompt typed behind a running Stop hook
+           queues until it exits; the queued messages ride that prompt instead).
+           If stop_hook_active is true, exits silently (loop guard) without
            touching the queue. Otherwise: no output.
 
   tmux     Sends each pending message into a tmux pane with
@@ -186,25 +205,35 @@ Modes:
            --json is accepted (output is always JSON either way).
 
 Env:
-  HMD_INBOX_WAIT_S   seconds to long-poll in `stop` mode. Default 240, or 1800
+  HMD_INBOX_WAIT_S   seconds to long-poll in `stop` mode. Default 240, or 300
                      with a companion connected. Export 0 to never hold a turn.
   HMD_INBOX_GATED    1 = the hook wiring found no .heimdall/ui/inbox.wait
                      opt-in: `stop` waits only when a companion is connected,
                      whatever HMD_INBOX_WAIT_S says.
+  HMD_INBOX_TTY      the terminal watched for typing, as a device path. Default:
+                     found through the hook's ancestors. off/0/false/no/none
+                     switches the typing release off.
+  HMD_INBOX_PRESENCE_CMD
+                     a command (run without a shell) that prints the seconds since
+                     a keyboard or pointer was last used; a terminal read only
+                     counts as typing while that is under 10. Default on macOS:
+                     HIDIdleTime via ioreg; elsewhere none, so the terminal read
+                     alone decides. Empty or off/0/false/no/none removes the check.
   HMD_TMUX_TARGET    tmux target (session:window.pane) for `tmux` mode.
 
 IMPORTANT: a Stop hook wired to `stop` mode can run for up to
 HMD_INBOX_WAIT_S seconds waiting on a reply. The hook's own `timeout` in
 settings.json MUST be larger than that, or Claude Code kills this script
 before a late reply can be delivered. Ready-to-paste snippet for
-.claude/settings.json (the 1800s companion default -> timeout 1860, a 60s
-margin; with HMD_INBOX_WAIT_S=240 and no companion, timeout 300 is enough):
+.claude/settings.json (the 300s companion default -> timeout 330, a 30s
+margin for the last 2s poll and process start; HMD_INBOX_WAIT_S=240 with no
+companion fits the same timeout):
 
 {
   "hooks": {
     "Stop": [
       { "hooks": [ { "type": "command",
-          "command": "bin/heimdall-inbox-deliver stop", "timeout": 1860 } ] }
+          "command": "bin/heimdall-inbox-deliver stop", "timeout": 330 } ] }
     ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command",
@@ -252,7 +281,7 @@ case "$MODE" in
 esac
 
 PY_SRC=$(cat <<'PYEOF'
-import fcntl, json, os, re, shutil, subprocess, sys, time
+import fcntl, json, os, re, shlex, shutil, subprocess, sys, time
 
 MODE, REPO_EXPLICIT, DEFAULT_REPO = sys.argv[1], sys.argv[2], sys.argv[3]
 # argv[4] is the pid of the shell that launched this script (PPID in the bash

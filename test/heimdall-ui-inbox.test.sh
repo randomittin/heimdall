@@ -569,6 +569,11 @@ fi
 # stop), the state is read for real over HTTP.
 export CLAUDE_CODE_ENTRYPOINT=cli
 unset HMD_AGENT_TYPE HMD_JUDGMENT HMD_INBOX_GATED HMD_INBOX_WAIT_S HMD_TMUX_TARGET
+# The Stop hook hands the turn back the moment the terminal it runs under is read
+# (the operator typing there). A2.5a times a live hold, and this suite is launched
+# from an operator's terminal: switch that release off so a keystroke in it cannot
+# end the hold under test.
+export HMD_INBOX_TTY=off
 DELIVER="$REPO/bin/heimdall-inbox-deliver"
 A2_FIX="$TMPROOT/fixture-a2"
 A2_UIDIR="$A2_FIX/.heimdall/ui"
