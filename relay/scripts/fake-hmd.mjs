@@ -297,9 +297,9 @@ export function resolveStatePath(stateArg) {
   return isAbsolute(rel) ? rel : join(REPO_ROOT, rel);
 }
 
-/** Decodes the plaintext (post-`open`) body of a `command` frame. Mirrors
- *  src/relay/protocol.ts's `SendMessageCommand` shape and its
- *  `decodeAckPayload`'s fail-closed house style -- protocol.ts itself has no
+/** Decodes the plaintext (post-`open`) body of a `command` frame. Mirrors the
+ *  app's `SendMessageCommand` shape (hmdapp's phone-leg protocol module) and
+ *  its `decodeAckPayload`'s fail-closed house style -- that module has no
  *  decoder for this direction since the phone only ever encodes it. */
 export function decodeSendMessageCommand(bytes) {
   let parsed;
