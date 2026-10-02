@@ -119,6 +119,15 @@
       "locked": false
     },
     {
+      "event": "PreToolUse",
+      "index": 8,
+      "id": "inbox-deliver-pretool",
+      "description": "Mid-turn delivery of companion-app inbox messages before a tool runs, via heimdall-inbox-deliver tool: pops the queue and returns it as hookSpecificOutput.additionalContext behind the companion-inbox provenance marker, so a phone message reaches the running turn at its next tool boundary instead of when the turn ends. A file-size test on <repo>/.heimdall/ui/inbox.jsonl runs before anything else, so an empty inbox costs no python and no git. Never consumes for a headless claude -p / SDK session, an hmd sub-session or a subagent's own tool call; never carries a permissionDecision. Every receipt is stamped exactly as the Stop path stamps it.",
+      "matcher": "*",
+      "fingerprint": "006164cb1d93eb7556ab1eca94cd0e2f4914343f68a6232c07900a09f3764f92",
+      "locked": false
+    },
+    {
       "event": "PostToolUse",
       "index": 0,
       "id": "corpus-capture",
@@ -152,6 +161,15 @@
       "description": "Writes a journal entry when a Bash call landed a new git commit.",
       "matcher": "Bash",
       "fingerprint": "ef3ec6696a95f634e842131b2a0603de618224864080790b0d50ba31af1a5e70",
+      "locked": false
+    },
+    {
+      "event": "PostToolUse",
+      "index": 4,
+      "id": "inbox-deliver-posttool",
+      "description": "Mid-turn delivery of companion-app inbox messages after a tool ran, via heimdall-inbox-deliver tool: the same pop, marker, caps and receipts as inbox-deliver-pretool, returned as PostToolUse additionalContext next to the tool result and read on the model's next request. Fires on every tool call, so a file-size test on <repo>/.heimdall/ui/inbox.jsonl runs first and an empty inbox costs no python and no git. Never consumes for a headless claude -p / SDK session, an hmd sub-session or a subagent's own tool call.",
+      "matcher": "*",
+      "fingerprint": "1e2f12e71357c615b660c27c11226bbf460f46a49f53f8c826e504f05537f764",
       "locked": false
     },
     {
