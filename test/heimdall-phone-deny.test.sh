@@ -14,11 +14,11 @@
 #
 # The relay half (the sealed `decide` command) is test/heimdall-phone-deny-relay.test.sh.
 #
-# Design rule under test, head-on: a phone only ever REDUCES what runs. The hook's whole output
-# vocabulary is {nothing, deny}; "allow" is not in it. No reply, a timeout, a malformed record,
-# any internal error -> the hook prints nothing and exits 0 (Claude Code's normal permission flow
-# is untouched). Halting a whole turn from the phone (`stop`) is deferred this round -- the
-# handback says why -- and the relay test proves the `stop` action does nothing.
+# Design rule under test, head-on: a phone only ever REDUCES what runs. It has exactly two verbs on
+# a pending request -- `deny` (refuse this call) and `stop` (refuse it AND end the turn, the hook's
+# {"continue": false}) -- and the hook's whole output vocabulary is {nothing, deny, deny + stop};
+# "allow" is not in it. No reply, a timeout, a malformed record, any internal error -> the hook
+# prints nothing and exits 0 (Claude Code's normal permission flow is untouched).
 #
 # Hermetic: HOME / HEIMDALL_HOME / TMPDIR are a temp dir, every repo is a temp dir, every
 # background process is reaped on EXIT. No `timeout(1)` on macOS: every wait is a bounded poll.
@@ -367,6 +367,79 @@ for _ in range(80):
         inconsistent.append(seen)
 check("A18. 80 deny-vs-settle races: decide() is OK exactly when settle() sees the deny, else `expired`",
       not inconsistent, inconsistent[:3])
+
+# A19 -- `stop`, the phone's second reduce-only verb: refuse this call AND end the turn. Same single
+# decision slot as deny, same rules; only the verb differs.
+root = newroot()
+rec = D.request(root, "Bash", "git push", 10, now=T0)
+spath = os.path.join(adir(root), rec["id"] + ".decision")
+res = D.decide(root, rec["id"], "stop", now=T0 + 1)
+check("A19. decide(stop) -> {id, decision: stop} and a 0600 decision file holding the stop",
+      res == {"id": rec["id"], "decision": "stop"} and json.load(open(spath))["decision"] == "stop"
+      and mode(spath) == 0o600, res)
+check("A19b. the hook-side read sees the stop; a stopped request leaves pending()",
+      D.decision_of(root, rec["id"]) == "stop" and D.pending(root, now=T0 + 1) == [])
+check("A19c. the slot is single-use across both verbs: stop then deny, stop then stop -> already-decided",
+      decide_code(root, rec["id"], "deny", now=T0 + 2) == "already-decided"
+      and decide_code(root, rec["id"], "stop", now=T0 + 2) == "already-decided"
+      and json.load(open(spath))["decision"] == "stop")
+root = newroot()
+rec = D.request(root, "Bash", "git push", 10, now=T0)
+D.decide(root, rec["id"], "deny", now=T0 + 1)
+check("A19d. deny then stop -> already-decided, the deny stays",
+      decide_code(root, rec["id"], "stop", now=T0 + 2) == "already-decided" and D.decision_of(root, rec["id"]) == "deny")
+root = newroot()
+rec = D.request(root, "Bash", "git push", 10, now=T0)
+D.decide(root, rec["id"], "stop", now=T0 + 1)
+check("A19e. settle() with a stop on record hands the stop back", D.settle(root, rec["id"], now=T0 + 9) == "stop")
+root = newroot()
+rec = D.request(root, "Bash", "git push", 10, now=T0)
+codes = {repr(v): decide_code(root, rec["id"], v, now=T0 + 1) for v in ("Stop", "STOP", " stop", "stop ", "halt", "approve", "approved", "cancel")}
+check("A19f. the verbs are exact: Stop / STOP / padded / halt / approve / cancel -> bad-decision, nothing written",
+      set(codes.values()) == {"bad-decision"} and not os.path.exists(os.path.join(adir(root), rec["id"] + ".decision")), codes)
+check("A19g. allow stays refused for every request, stop being accepted changes nothing about it",
+      decide_code(root, rec["id"], "allow", now=T0 + 1) == "allow-not-permitted")
+root = newroot()
+rec = D.request(root, "Bash", "git push", 10, now=T0)
+dpath = os.path.join(adir(root), rec["id"] + ".decision")
+seen = {}
+for label, body in {
+    "stop for another id": json.dumps({"id": "p-00000000", "decision": "stop", "decided_at": T0}),
+    "Stop": json.dumps({"id": rec["id"], "decision": "Stop", "decided_at": T0}),
+    "approve": json.dumps({"id": rec["id"], "decision": "approve", "decided_at": T0}),
+    "stop in a list": json.dumps([{"id": rec["id"], "decision": "stop"}]),
+}.items():
+    with open(dpath, "w") as f:
+        f.write(body)
+    seen[label] = D.decision_of(root, rec["id"])
+with open(dpath, "w") as f:
+    f.write(json.dumps({"id": rec["id"], "decision": "stop", "decided_at": T0}))
+check("A19h. only a well-formed stop for exactly this id reads as a stop; foreign / case-varied / approve / listed ones read as nothing",
+      set(seen.values()) == {None} and D.decision_of(root, rec["id"]) == "stop", seen)
+
+# A20 -- the linearization point holds for stop too
+inconsistent = []
+for _ in range(60):
+    root = newroot()
+    rec = D.request(root, "Bash", "git push", 100, now=time.time())
+    gate = threading.Barrier(2)
+    seen = {}
+
+    def phone_stop():
+        gate.wait()
+        seen["decide"] = decide_code(root, rec["id"], "stop")
+
+    def hook_settle():
+        gate.wait()
+        seen["settle"] = D.settle(root, rec["id"])
+
+    threads = [threading.Thread(target=phone_stop), threading.Thread(target=hook_settle)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    if not ((seen["decide"] == "OK" and seen["settle"] == "stop") or (seen["decide"] == "expired" and seen["settle"] is None)):
+        inconsistent.append(seen)
+check("A20. 60 stop-vs-settle races: decide() is OK exactly when settle() sees the stop, else `expired`",
+      not inconsistent, inconsistent[:3])
 PYEOF
 
 # ══ B. what counts as risky ═════════════════════════════════════════════════════════════════
@@ -591,34 +664,36 @@ wait_pending() { # <repo> <secs> -> 0 once a request is listed
   return 1
 }
 
-# phone_deny <repo> <delay-s> [<summary-to-match>]: a background "phone". It waits for a pending
-# request (optionally the one whose summary is <summary-to-match>), waits <delay-s> more, then
-# denies it through the store -- exactly what the relay client's sealed `decide` handler does. What
-# the store answered is logged to $TMPROOT/phone.log, so a refusal is never silent.
-phone_deny() {
-  python3 - "$LIB" "$1" "$2" "${3:-}" <<'PYEOF' >>"$TMPROOT/phone.log" 2>&1 &
+# phone_decide <repo> <delay-s> <deny|stop> [<summary-to-match>]: a background "phone". It waits for
+# a pending request (optionally the one whose summary is <summary-to-match>), waits <delay-s> more,
+# then decides it through the store -- exactly what the relay client's sealed `decide` handler does.
+# What the store answered is logged to $TMPROOT/phone.log, so a refusal is never silent.
+phone_decide() {
+  python3 - "$LIB" "$1" "$2" "$3" "${4:-}" <<'PYEOF' >>"$TMPROOT/phone.log" 2>&1 &
 import importlib.util, sys, time
 spec = importlib.util.spec_from_file_location("dec", sys.argv[1])
 D = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(D)
-root, delay, match = sys.argv[2], float(sys.argv[3]), sys.argv[4]
+root, delay, verb, match = sys.argv[2], float(sys.argv[3]), sys.argv[4], sys.argv[5]
 deadline = time.time() + 20
 while time.time() < deadline:
     for e in D.pending(root):
         if not match or e["summary"] == match:
             time.sleep(delay)
             try:
-                D.decide(root, e["id"], "deny")
+                D.decide(root, e["id"], verb)
                 outcome = "ok"
             except D.DecisionError as err:
                 outcome = err.code
-            print("phone: %s -> %s" % (e["id"], outcome))
+            print("phone: %s %s -> %s" % (verb, e["id"], outcome))
             sys.exit(0)
     time.sleep(0.05)
 print("phone: no matching request appeared")
 PYEOF
   PIDS+=("$!")
 }
+phone_deny() { phone_decide "$1" "$2" deny "${3:-}"; }
+phone_stop() { phone_decide "$1" "$2" stop "${3:-}"; }
 
 ARMED=(HMD_PHONE_DENY=1)
 
