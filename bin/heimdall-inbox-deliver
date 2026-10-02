@@ -281,7 +281,7 @@ case "$MODE" in
 esac
 
 PY_SRC=$(cat <<'PYEOF'
-import fcntl, json, os, re, shlex, shutil, subprocess, sys, time
+import fcntl, json, os, re, select, shlex, shutil, subprocess, sys, time
 
 MODE, REPO_EXPLICIT, DEFAULT_REPO = sys.argv[1], sys.argv[2], sys.argv[3]
 # argv[4] is the pid of the shell that launched this script (PPID in the bash
@@ -290,8 +290,16 @@ HOOK_SHELL_PID = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit()
 
 MAX_MSG_CHARS = 2000
 MAX_REASON_CHARS = 4000  # joined-message cap, on top of the 2000/message cap above
+# The indented body of one delivery. Indenting adds four characters per line, so a few
+# thousand short lines would triple the joined text; with the marker, the count line and
+# the two fences this keeps a whole delivery under the 10000-character cap Claude Code
+# puts on one additionalContext value (longer is written to a file and cut to a preview).
+MAX_BODY_CHARS = 8000
 # bin/lib/companion_ui_inbox.py reads inbox-waiting as stale after twice this.
 POLL_INTERVAL_S = 2.0
+WATCH_POLL_S = 0.05        # the inbox watch looks this often where kqueue is not available
+MIN_LAP_S = 0.05           # one lap of the Stop hold never takes less: a busy directory cannot spin it
+TOOL_EVENTS = frozenset(("PreToolUse", "PostToolUse"))   # the two events tool mode can answer
 DEFAULT_WAIT_S = 240.0     # stop long-poll budget: turn ended on a question, nobody connected
 COMPANION_WAIT_S = 300.0   # ...with a companion connected: the session is reachable, so stay reachable (short: a prompt typed meanwhile queues behind the hook)
 TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024  # only the last message matters
@@ -803,7 +811,7 @@ def format_delivery(texts):
     # Every message line is indented 4 spaces so delivered text can never
     # itself start a line at column 0 -- the only column the marker, the
     # count line, and the two fence lines are allowed to use.
-    body = "\n".join("    " + line for line in joined.split("\n"))
+    body = truncate("\n".join("    " + line for line in joined.split("\n")), MAX_BODY_CHARS)
     count_line = "%d message%s folded:" % (n, "" if n == 1 else "s")
     return "%s\n\n%s\n%s\n%s\n%s" % (
         INBOX_PROVENANCE_MARKER, count_line, fence, body, fence)
@@ -870,6 +878,93 @@ def env_float(name, default):
         return default
 
 
+def kqueue_flags():
+    # (directory flags, file flags) for EVFILT_VNODE, or None where this platform has no
+    # kqueue. Directory: an entry added, removed or renamed (NOTE_WRITE) -- deliberately not
+    # NOTE_ATTRIB, which the chmod every pop_all makes on the directory would raise on each
+    # look and turn the wait into a spin. File: appended to, truncated, replaced or removed.
+    if not hasattr(select, "kqueue"):
+        return None
+    try:
+        return (select.KQ_NOTE_WRITE | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME,
+                select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE
+                | select.KQ_NOTE_RENAME | select.KQ_NOTE_REVOKE)
+    except AttributeError:
+        return None
+
+
+class InboxWatch(object):
+    # Blocks until inbox.jsonl may have changed. Use it as: arm(), look at the queue,
+    # wait(timeout). A change made after arm() returns ends the wait at once -- through
+    # the kernel on a kqueue platform, through a comparison of (inode, size, mtime) after
+    # that -- so a message landing between the look and the wait is never slept through.
+    # The watch is only ever a wake-up: whatever wakes it, the caller looks at the queue
+    # itself, so a spurious wake costs one look and a missed one costs one backstop lap.
+    # While the file exists the watch sits on the file; before it exists (nothing was ever
+    # queued, or a rename-style pop moved it away) it sits on the directory.
+
+    def __init__(self, inbox_path):
+        self.path = inbox_path
+        self.kq = None
+        self.fd = None
+        self.sig = None
+
+    def signature(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+    def arm(self):
+        self.close()
+        self.sig = self.signature()
+        flags = None if os.environ.get("HMD_INBOX_WATCH", "").strip().lower() == "poll" else kqueue_flags()
+        if flags is None:
+            return
+        target, fflags = (self.path, flags[1]) if self.sig is not None else (os.path.dirname(self.path), flags[0])
+        try:
+            kq = select.kqueue()
+        except OSError:
+            return
+        try:
+            fd = os.open(target, getattr(os, "O_EVTONLY", os.O_RDONLY))
+        except OSError:
+            kq.close()
+            return
+        try:
+            kq.control([select.kevent(fd, filter=select.KQ_FILTER_VNODE,
+                                      flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=fflags)], 0, 0)
+        except OSError:
+            os.close(fd)
+            kq.close()
+            return
+        self.kq, self.fd = kq, fd
+
+    def wait(self, timeout):
+        if timeout <= 0 or self.signature() != self.sig:
+            return
+        if self.kq is not None:
+            try:
+                self.kq.control(None, 1, timeout)
+                return
+            except OSError:
+                self.close()   # the kernel would not wait for us: the stat poll below still will
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            time.sleep(max(0.0, min(WATCH_POLL_S, end - time.monotonic())))
+            if self.signature() != self.sig:
+                return
+
+    def close(self):
+        if self.fd is not None:
+            _silently(lambda: os.close(self.fd))
+            self.fd = None
+        if self.kq is not None:
+            _silently(self.kq.close)
+            self.kq = None
+
+
 def cmd_stop(hook, root):
     if hook.get("stop_hook_active") is True:
         return  # silent loop guard: no output, no queue mutation at all
@@ -903,11 +998,14 @@ def cmd_stop(hook, root):
     typing = typing_probe()  # after the deadline is fixed: finding the terminal comes out of the hold, never on top of it
     write_state(root, True)
     delivered_texts = []
+    watch = InboxWatch(paths_for(root)["inbox"])
     try:
         while not hook_orphaned(ppid0):
+            lap_start = time.monotonic()
             if typing is not None and typing():
                 break  # somebody is typing into this session: hand the turn back, nothing popped; what is queued rides their prompt
             write_waiting(root, since, deadline)
+            watch.arm()  # after our own marker write (which would wake it) and before the look at the queue (so nothing slips between)
             texts = texts_of(pop_all_fn(root))
             if texts:
                 delivered_texts = texts
@@ -916,8 +1014,15 @@ def cmd_stop(hook, root):
                 break
             if connected and not companion_connected(root):
                 break  # the companion that justified this wait has gone
-            time.sleep(POLL_INTERVAL_S)
+            # Wake the moment the inbox changes; POLL_INTERVAL_S is only the backstop, and the
+            # cadence of the marker heartbeat, the typing check, the orphan guard and the
+            # companion check above -- all as before.
+            watch.wait(min(POLL_INTERVAL_S, deadline - time.time()))
+            lap_left = MIN_LAP_S - (time.monotonic() - lap_start)
+            if lap_left > 0:
+                time.sleep(lap_left)  # a directory somebody keeps touching must not spin the hold
     finally:
+        watch.close()
         clear_waiting(root)
         write_state(root, False)
     if delivered_texts:
@@ -965,6 +1070,26 @@ def cmd_prompt(hook, root):
     ctx = format_delivery(texts)
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
+
+
+def cmd_tool(hook, root):
+    # The mid-turn path: PreToolUse / PostToolUse. Answers only for the main conversation
+    # of an attended session, and only for an event whose name it can echo back, because
+    # popping is the one irreversible step -- every refusal below happens before it, and
+    # the message stays queued for the Stop hold or the next prompt.
+    event = hook.get("hook_event_name")
+    if not isinstance(event, str) or event not in TOOL_EVENTS:
+        return
+    if not attended_session():
+        return  # a headless or sub-session of hmd's own: the operator's message is not for it
+    if hook.get("agent_id"):
+        return  # a subagent's own tool call: the message was written to the main conversation
+    _, _, pop_all_fn, _ = get_ops(root)
+    texts = texts_of(pop_all_fn(root))
+    if not texts:
+        return
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": event, "additionalContext": format_delivery(texts)}}))
 
 
 def cmd_status(root):
