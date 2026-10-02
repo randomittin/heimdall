@@ -6,7 +6,7 @@
 # appending to <repo>/.heimdall/ui/inbox.jsonl. Nothing about that append
 # reaches the Claude Code session on its own -- something has to notice the
 # queue and inject the text at a point Claude Code will actually read it.
-# This is that something, with three independent injection points:
+# This is that something, with four independent injection points:
 #
 #   stop    Claude Code's Stop hook. If a message is already queued, pops it
 #           and returns {"decision":"block","reason":"<marker>+<text>"} --
@@ -17,8 +17,8 @@
 #           from the paired phone, never a same-privilege instruction. If the
 #           queue is empty but the turn just ended on a question to the user
 #           -- or a companion is connected (IDLE-SESSION DELIVERY, below),
-#           whatever the turn ended on -- long-polls the queue (every 2s, up
-#           to $HMD_INBOX_WAIT_S) so a phone message still reaches this
+#           whatever the turn ended on -- long-polls the queue (woken the moment
+#           it changes; a 2s look is the backstop; up to $HMD_INBOX_WAIT_S) so a phone message still reaches this
 #           session instead of being stranded until the next turn boundary.
 #   tmux    Best-effort delivery into a tmux pane running Claude Code
 #           interactively, via `tmux send-keys`, for setups that don't use
@@ -26,6 +26,10 @@
 #   prompt  UserPromptSubmit-hook fallback: folds any pending messages into
 #           that turn's additionalContext (behind the same
 #           INBOX_PROVENANCE_MARKER as `stop`) instead of waiting for a Stop.
+#   tool    PreToolUse / PostToolUse hooks, the MID-TURN path: pops what is queued
+#           and returns it as hookSpecificOutput.additionalContext (same marker), so
+#           a message reaches the model at the next tool boundary of the running
+#           turn instead of when the turn ends. See TOOL-BOUNDARY DELIVERY, below.
 #
 # CONTRACT SOURCES VERIFIED LOCALLY (no WebFetch available to this tool; see
 # --help's note). `stop_hook_active` / `transcript_path` / a message field on
@@ -139,6 +143,47 @@
 #     (inbox-delivered.jsonl, 0600); /api/state's inbox.delivered[] is the last
 #     20 of those as {id, delivered_at} -- never text.
 #
+# TOOL-BOUNDARY DELIVERY (hmdapp docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md, ask 2).
+# Measured on the operator's Mac, queued -> delivered_at was 75s, 110s and 808s: a
+# message waited for the end of the turn. hooks/hooks.json now wires `tool` into
+# PreToolUse and PostToolUse (matcher *).
+#   CONTRACT. hookSpecificOutput.additionalContext is the documented "Add context for
+#     Claude" output of both events. Checked against the Claude Code 2.1.287 binary:
+#     PreToolUse reads it with or without a permissionDecision (this hook sends none,
+#     so the permission flow is untouched), PostToolUse reads it, and one value over
+#     10000 characters is written to disk with only a head kept -- hence MAX_BODY_CHARS.
+#   WHO MAY CONSUME. Only the main conversation of an attended session, and only for an
+#     event whose name it can echo: not a headless/SDK session or an hmd sub-session
+#     (attended_session), not a subagent's own tool call (the payload carries agent_id:
+#     the operator wrote to the main conversation), not Stop or anything else. Every
+#     refusal comes before the pop, so the message stays queued for the Stop hold or
+#     the next prompt.
+#   EXACTLY ONCE. pop_all is one atomic claim and stamps the receipt, so Stop, prompt,
+#     tmux and tool can race freely.
+#   COST. A tool hook fires twice per tool call in every session. hooks.json guards it
+#     with a file-size test on inbox.jsonl before anything else (an empty inbox spawns
+#     no python and no git), and this script refuses the cases bash can judge (headless,
+#     sub-session, subagent) before bash parses the python source: about 50ms a call
+#     instead of 200ms while a message waits. That bash filter is a strict subset of the
+#     python checks; whatever it lets through, python still judges.
+#
+# EVENT-DRIVEN HOLD. The Stop long-poll slept 2s between looks (1s mean added). It now
+# blocks on the inbox changing: kqueue (EVFILT_VNODE) on inbox.jsonl, or on its directory
+# while the file does not exist yet, where select.kqueue exists (macOS, BSD); a 50ms stat
+# poll elsewhere or with HMD_INBOX_WATCH=poll. The watch is armed before each look at the
+# queue, so nothing landing in between is slept through. POLL_INTERVAL_S stays as the
+# backstop and as the cadence of the marker heartbeat, typing release, orphan guard and
+# companion check; MIN_LAP_S keeps a busy directory from spinning the hold.
+#
+# ASYNC REWAKE (Claude Code 2.1.287; static evidence from the binary, not run live). The
+# settings schema has a hook field asyncRewake ("runs in the background and wakes the
+# model on exit code 2"); on exit 2 the handler queues a task-notification at priority
+# next whose body is the hook's stderr, else stdout. It is honoured in interactive
+# sessions and headless ones with streaming input only. Whether an IDLE session at an
+# empty prompt drains that queue was not exercised, so nothing here builds on it: the
+# 300s hold still covers an idle session, and a message left after it waits for the
+# operator.
+#
 # EVERY MODE EXITS 0. A delivery-mechanism bug must never block or crash a
 # Stop/UserPromptSubmit turn. Message text is sanitized (control characters
 # stripped, capped at 2000 chars) and is never written anywhere except the
@@ -178,7 +223,8 @@ Modes:
            empty and either the assistant's last message ends with "?" or a
            companion is connected (a .heimdall/app/connect.json naming live
            processes; attended sessions only, never headless claude -p or an
-           hmd sub-session), long-polls the queue every 2s for up to
+           hmd sub-session), long-polls the queue (woken the moment it
+           changes, a 2s look as backstop) for up to
            HMD_INBOX_WAIT_S seconds (default 300 with a companion
            connected, 240 without) and delivers the same way the moment a
            message arrives. While it waits it keeps .heimdall/ui/inbox-waiting
