@@ -11,8 +11,8 @@
 // process -- this module uses node:crypto's randomBytes instead. Everything
 // else (constants, nonce layout, derivation, error shape) is a direct copy.
 //
-// Spec of record: docs/superpowers/specs/2026-09-21-hmd-relay-design.md §2.1-2.3
-// Invariants:      docs/superpowers/specs/relay/INVARIANTS.md INV-11..INV-19
+// Spec of record: relay/docs/2026-09-21-hmd-relay-design.md §2.1-2.3
+// Invariants:      relay/docs/INVARIANTS.md INV-11..INV-19
 //
 // No I/O, no module-level state -- pure crypto, same division of labour as
 // the file it mirrors.

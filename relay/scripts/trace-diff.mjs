@@ -2,7 +2,7 @@
 // Wave-3 relay-protocol-trace-diff harness runner.
 //
 // Runs the golden transcript + mutant scenarios under relay/test/trace/**
-// (independently authored against docs/superpowers/specs/relay/INVARIANTS.md
+// (independently authored against relay/docs/INVARIANTS.md
 // and relay/README.md's documented API — relay/src/** is read, never
 // modified, for this task) and prints one row per in-scope invariant:
 // INV -> PASS / FAIL / UNCOVERED. Exits 1 if any row (or the golden
