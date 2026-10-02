@@ -696,21 +696,25 @@ phone_deny() { phone_decide "$1" "$2" deny "${3:-}"; }
 phone_stop() { phone_decide "$1" "$2" stop "${3:-}"; }
 
 ARMED=(HMD_PHONE_DENY=1)
+# "No delay" means the hook did not sit out its window. With no HMD_PHONE_DENY_WINDOW_S that window
+# is 10 s, so a no-op that took under NOOP_MAX_S (8) provably did not hold -- and the bound leaves
+# room for a loaded machine (a 3 s bound flaked once while another suite was running).
+NOOP_MAX_S=8
 
 # C1 -- flag off => nothing at all
 R1="$(mk_repo)"; bash_payload "$R1" "git push origin main" > "$TMPROOT/p.push"
 run_hook "$R1" "$TMPROOT/p.push"
-if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && [ -z "$HOOK_ERR" ] && no_approvals "$R1" && under "$HOOK_S" 3; then
+if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && [ -z "$HOOK_ERR" ] && no_approvals "$R1" && under "$HOOK_S" "$NOOP_MAX_S"; then
   ok "C1. HMD_PHONE_DENY unset -> exit 0, no output, no request, no delay (${HOOK_S}s)"
 else
   bad "C1. flag-off hook did something: rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s"
 fi
 for v in 0 true yes on "" 2 " 1" "1 "; do
   run_hook "$R1" "$TMPROOT/p.push" "HMD_PHONE_DENY=$v"
-  if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && no_approvals "$R1" && under "$HOOK_S" 3; then
+  if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && no_approvals "$R1" && under "$HOOK_S" "$NOOP_MAX_S"; then
     ok "C1b. HMD_PHONE_DENY='$v' is not the opt-in (only exactly 1 arms the hook) -> no-op"
   else
-    bad "C1b. HMD_PHONE_DENY='$v' armed the hook: rc=$HOOK_RC out=[$HOOK_OUT]"
+    bad "C1b. HMD_PHONE_DENY='$v' armed the hook: rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s approvals=$(ls -A "$R1/.heimdall/ui/approvals" 2>/dev/null | tr '\n' ' ')"
   fi
 done
 
@@ -719,7 +723,7 @@ check_noop() { # <label> <repo> <payload> [VAR=val ...]
   local label="$1" repo="$2" payload="$3"
   shift 3
   run_hook "$repo" "$payload" "${ARMED[@]}" "$@"
-  if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && no_approvals "$repo" && under "$HOOK_S" 3; then
+  if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && no_approvals "$repo" && under "$HOOK_S" "$NOOP_MAX_S"; then
     ok "$label (${HOOK_S}s)"
   else
     bad "$label -- rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s approvals=$(ls -A "$repo/.heimdall/ui/approvals" 2>/dev/null | tr '\n' ' ')"
