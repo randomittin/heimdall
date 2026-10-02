@@ -2497,6 +2497,20 @@ case "${1:-}" in
     if [ -x "$_sg" ]; then exec "$_sg" "$@"; fi
     echo "error: heimdall-settings-guard not found at $_sg" >&2; exit 2
     ;;
+  hooks)
+    # Pass-through to heimdall-hooks: ids, fingerprint drift check and the
+    # per-hook kill switch for hooks/hooks.json (list|check|disable|enable|
+    # regen). Without this arm `hmd hooks --help` fell through to the
+    # task-prompt path and launched Claude with "hooks --help" as the task.
+    # Bare `hooks` and `hooks help` map to --help (argparse has no `help` sub).
+    shift
+    _hk="$(cd "$(dirname "$0")" && pwd)/heimdall-hooks"
+    if [ -x "$_hk" ]; then
+      case "${1:-}" in ""|help) exec "$_hk" --help ;; esac
+      exec "$_hk" "$@"
+    fi
+    echo "error: heimdall-hooks not found at $_hk" >&2; exit 2
+    ;;
   caveman-audit)
     # READ-BACK for the caveman compression instruction. The caveman plugin
     # wires SessionStart + UserPromptSubmit and BOTH only ever INJECT rules
@@ -3464,6 +3478,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall queue <add|pick|complete|fail|reap|get|list|status|serve>  Local work queue"
   echo "  heimdall queue drain [--forever|--drain-empty]  Drain the local work queue"
   echo "  heimdall settings-guard <check|fix>  Find ANTHROPIC_* overrides hidden in settings.json"
+  echo "  heimdall hooks <list|check|disable|enable|regen>  Hook ids, drift check, per-hook kill switch"
   echo "  heimdall volatile-repo-guard <check|explain>  Warn if this clone is on disk the OS may wipe"
   echo "  heimdall ui [--repo D] [--port N]  Live companion web UI for this session (loopback + token)"
   echo "  heimdall inbox <stop|prompt|tmux|status> [--repo D]  Deliver companion-app inbox messages into this session"
