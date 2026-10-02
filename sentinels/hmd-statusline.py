@@ -269,12 +269,40 @@ def _region_reserve():
     return CC_REGION_RESERVE
 
 
-def resolve_cols():
+def _render_width_chars(data):
+    """Cursor CLI's authoritative width, from the payload's `render_width_chars` — host-boundary
+    mode only. A positive number, else None (absent, null, bool, zero/negative, NaN, or an
+    infinity `int()` cannot take: each of those fell through to the ambient width when this
+    lived in bin/heimdall-statusline's python probe, and still does). Claude Code's schema never
+    carries the key, so its mere presence identifies the host."""
+    if not (HOST_BOUNDARY and isinstance(data, dict)):
+        return None
+    w = data.get("render_width_chars")
+    if isinstance(w, (int, float)) and not isinstance(w, bool) and w > 0:
+        try:
+            return int(w)
+        except (OverflowError, ValueError):
+            return None
+    return None
+
+
+def resolve_cols(data=None):
     """The width the whole layout is clamped to. Resolution order is LOAD-BEARING:
 
-        1. $COLUMNS - CC_REGION_RESERVE  (CC's statusLine contract, v2.1.153+ — ALWAYS FIRST)
+        0. render_width_chars            (Cursor only, --host-boundary only — see below)
+        1. $COLUMNS - CC_REGION_RESERVE  (CC's statusLine contract, v2.1.153+ — ALWAYS FIRST
+                                          for every host that does not send step 0)
         2. /dev/tty                      (plain-terminal fallback when COLUMNS is unset)
         3. 80                            (conservative floor — under-render, never wrap)
+
+    STEP 0 (moved here from bin/heimdall-statusline's own python probe, byte for byte): Cursor's
+    documented width signal is the payload field, NOT $COLUMNS — a no-shell child still inherits
+    a possibly STALE $COLUMNS from Cursor's launching terminal, while the field is computed fresh
+    on every invocation. It wins over $COLUMNS whenever it is a usable number. Cursor already
+    subtracted its own padding, so Claude Code's separate 4-cell reserve must NOT be applied on
+    top: the reserve is 0 unless the caller set HMD_STATUSLINE_RESERVE themselves (an explicit
+    override is the caller's call, exactly as before). The value then runs through the SAME
+    int/positive checks as $COLUMNS, so a field that truncates to 0 still falls through.
 
     WHY $COLUMNS MUST WIN (the RJ live-statusline bug): Claude Code runs this script for its
     statusLine with $COLUMNS set, but it CAPTURES stdout (a pipe) and gives the process no
@@ -294,14 +322,23 @@ def resolve_cols():
 
     Combined with the per-row hard clamp in main() (every emitted row is forced to EXACTLY the
     returned width), nothing the SUT emits can ever exceed CC's statusLine region."""
-    env = os.environ.get("COLUMNS")
+    rw = _render_width_chars(data)
+    if rw is not None:
+        env = str(rw)
+        # 0 unless the caller set the override (an empty value counts as unset, as it did in
+        # the shell); a set-but-garbage override still degrades to the default inside
+        # _region_reserve().
+        reserve = _region_reserve() if os.environ.get("HMD_STATUSLINE_RESERVE") else 0
+    else:
+        env = os.environ.get("COLUMNS")
+        reserve = None
     if env is not None:
         with contextlib.suppress(Exception):
             c = int(env.strip())
             if c > 0:
                 # $COLUMNS wins — the tty probe below is NOT consulted. Hold back CC's
                 # region spacing; floor at 1 so a pathologically narrow COLUMNS stays sane.
-                return max(1, c - _region_reserve())
+                return max(1, c - (_region_reserve() if reserve is None else reserve))
     c = _cols_from_tty()
     if c and c > 0:
         return c
@@ -2182,9 +2219,93 @@ def _eye(verdict, t):
 def _fallback(cols):
     _write(LAYOUT.pad_or_truncate(f"{BLUE}{BOLD}⛭ HEIMDALL{X}", cols) + "\n")
 
+# ── host boundary, part 2 + 3: the Cursor label and the CTX-honesty row ───────────────────
+# (part 1, the width, is resolve_cols above.) Same logic, same precedence, same degrade-to-
+# uncorrected-on-any-fault behaviour as the python launches bin/heimdall-statusline used to make.
+def _apply_host_boundary(data):
+    """Host-boundary mode, on a parsed payload dict. Mutates `data` (the Cursor label) and sets
+    _CTX_UNAVAILABLE (read by _write). Never raises."""
+    global _CTX_UNAVAILABLE
+    # Cursor label. sentinels' own model fallback is the literal "Claude" — right for Claude Code,
+    # wrong for a Cursor payload that omits model.display_name. transcript_path/autorun are
+    # Cursor-exclusive keys, probed as RAW SUBSTRINGS exactly as the shell did (a false positive
+    # only matters when display_name is also blank, and then the label is the same answer it
+    # always gave). A populated display_name is never touched.
+    if '"transcript_path"' in _STDIN_RAW or '"autorun"' in _STDIN_RAW:
+        try:
+            m = data.get("model")
+            if not isinstance(m, dict):
+                m = {}
+            if not (m.get("display_name") or "").strip():
+                m["display_name"] = "Cursor"
+                data["model"] = m
+        except Exception:
+            pass   # a payload this strange keeps whatever label it already had
+    # CTX honesty. render_gauge() coerces a missing used_percentage to 0.0 (no "unavailable"
+    # branch), so a null/absent reading would render "CTX 0%". The payload alone says whether the
+    # signal was genuinely absent — never for a real reading, including a genuine 0.
+    cw = data.get("context_window")
+    up = cw.get("used_percentage") if isinstance(cw, dict) else None
+    _CTX_UNAVAILABLE = (not isinstance(cw, dict)) or (not isinstance(up, (int, float))) or isinstance(up, bool)
+
+_CTX_ROW_MARGIN = re.compile(r"^▄+")
+
+def _ctx_unavailable_row(text):
+    """Replace the ONE rendered row driven by used_percentage (found by its literal `CTX` label,
+    past any ▄ margin) with `– CTX unavailable`, reusing THIS render's own "unknown signal" style
+    (the `– gates offline` / `◦ watching` idiom) so no new visual language appears; plain text
+    under --no-color. Operates on the final EMITTED bytes (post CAPS.emit), like the shell
+    post-process it replaces, and returns `text` untouched on any fault."""
+    try:
+        def raw_offset(line, target_idx):
+            visible = 0
+            i = 0
+            n = len(line)
+            while i < n:
+                m = ANSI.match(line, i)
+                if m:
+                    i = m.end()
+                    continue
+                if visible == target_idx:
+                    return i
+                visible += 1
+                i += 1
+            return len(line)
+
+        style_open, style_close = "", ""
+        if "--no-color" not in sys.argv:
+            style_re = re.compile(r"((?:\033\[[0-9;]*m)+)[–◦] ")
+            for probe in text.split("\n"):
+                m = style_re.search(probe)
+                if m:
+                    style_open, style_close = m.group(1), "\033[0m"
+                    break
+            if not style_open:
+                style_open, style_close = "\033[2m", "\033[0m"
+
+        out = []
+        replaced = False
+        for line in text.split("\n"):
+            plain = ANSI.sub("", line)
+            if not replaced:
+                mm = _CTX_ROW_MARGIN.match(plain)
+                margin_len = mm.end() if mm else 0
+                remainder = plain[margin_len:].lstrip()
+                if remainder.startswith("CTX"):
+                    cut = raw_offset(line, margin_len)
+                    out.append(line[:cut] + " " + style_open + "– CTX unavailable" + style_close)
+                    replaced = True
+                    continue
+            out.append(line)
+        return "\n".join(out)
+    except Exception:
+        return text
+
 def main():
     data = read_stdin()
-    cols = resolve_cols()
+    if data is not None and HOST_BOUNDARY:
+        _apply_host_boundary(data)
+    cols = resolve_cols(data)
     if data is None:
         _fallback(cols)
         return
