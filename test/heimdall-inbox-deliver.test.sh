@@ -1131,6 +1131,16 @@ if [ ! -s "$OUTF" ] && queued "$D" "meant for the main thread"; then ok "a subag
 tool_run "$D" PostToolUse "$OUTF" ',"agent_type":"hmd:heimdall"'
 V="$(python3 "$TOOLCHK" "$OUTF" PostToolUse "$MARKER" "meant for the main thread")"
 [ "$V" = "OK" ] && ok "the main thread of a --agent session (agent_type, no agent_id) still receives it" || bad "$V"
+# Test 47 shows bash refusing the plain cases before python starts. These are the forms bash
+# leaves alone (padded values, JSON with a space after the colon): python is still the judge.
+for CASE in "CLAUDE_CODE_ENTRYPOINT= sdk-cli" "HMD_AGENT_TYPE= hmd:coder " "HMD_JUDGMENT= yes"; do
+  seed_inbox "$D" "left to python"
+  tool_run "$D" PostToolUse "$OUTF" "" "$CASE"
+  if [ ! -s "$OUTF" ] && queued "$D" "left to python"; then ok "$CASE (padded, so bash defers): python still refuses"; else bad "$CASE: out='$(cat "$OUTF")'"; fi
+done
+seed_inbox "$D" "left to python"
+tool_run "$D" PreToolUse "$OUTF" ',"agent_id": "agent-7"'
+if [ ! -s "$OUTF" ] && queued "$D" "left to python"; then ok "agent_id in JSON with a space after the colon (bash defers): python still refuses"; else bad "spaced agent_id consumed it: out='$(cat "$OUTF")'"; fi
 rm -rf "$D" "$OUTF"
 
 echo "40. TOOL mode: control characters stripped, every cap held (10000-char value cap even when indentation multiplies a many-line text), no fence escape:"
