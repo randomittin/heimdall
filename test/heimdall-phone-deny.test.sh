@@ -994,7 +994,7 @@ run_group HMD_PHONE_DENY=1
 # ══ E. the approvals slice of /api/state ════════════════════════════════════════════════════
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 py_checks "$REPO" <<'PYEOF'
-import importlib.util, json, os, sys, tempfile, time
+import importlib.util, json, os, re, sys, tempfile, time
 
 REPO = sys.argv[1]
 
@@ -1059,6 +1059,34 @@ D.request(root3, "Bash", "git push", 30, now=time.time() - 60)
 D.request(root3, "Bash", "stale", 300, now=time.time() - 30)
 check("E7. an expired request, and one whose hook stopped heartbeating, are not listed",
       UI.collect_state(root3)["approvals"] == [], UI.collect_state(root3)["approvals"])
+
+# E9 -- A1 parity (hmdapp's remote-controls handoff, H7): while a request is pending, `attention` says
+# so, anchored on the request -- the phone's "needs you" signal and its approvals list never disagree
+root4 = os.path.realpath(tempfile.mkdtemp(prefix="e4-"))
+os.makedirs(os.path.join(root4, ".git"))
+quiet = UI.collect_state(root4)["attention"]
+rec = D.request(root4, "Bash", "git push origin main", 30)
+st = UI.collect_state(root4)
+att = st["attention"]
+turn = st["parallelism"].get("turns")
+turn = turn if isinstance(turn, int) and not isinstance(turn, bool) and turn >= 0 else None
+check("E9. a pending request -> attention needs_approval / permission, anchored on the request",
+      att["state"] == "needs_approval" and att["kind"] == "permission" and att["options"] is None
+      and re.match(r"^a-[0-9a-f]{10}$", att["id"] or "") and att["since"] == round(rec["requested_at"], 3)
+      and att["summary"] == "permission requested: Bash" and att["turn"] == turn, att)
+check("E9b. the episode id is stable across collects; the request's command never reaches attention",
+      UI.collect_state(root4)["attention"]["id"] == att["id"] and "git push" not in json.dumps(att), att)
+D.settle(root4, rec["id"])
+D.close(root4, rec["id"])
+check("E9c. once the request is gone attention is back to what the transcript says (the idle default here)",
+      UI.collect_state(root4)["attention"] == quiet, (quiet, UI.collect_state(root4)["attention"]))
+root5 = os.path.realpath(tempfile.mkdtemp(prefix="e5-"))
+os.makedirs(os.path.join(root5, ".git"))
+first = D.request(root5, "Bash", "first", 30)
+D.request(root5, "Write", "second", 30, now=time.time() + 1)
+att = UI.collect_state(root5)["attention"]
+check("E9d. with several pending, attention is anchored on the oldest",
+      att["summary"] == "permission requested: Bash" and att["since"] == round(first["requested_at"], 3), att)
 PYEOF
 
 # E8 -- over HTTP there is NO decide route: a bearer token is not a sealed E2E command

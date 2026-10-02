@@ -240,6 +240,10 @@ ATTENTION = _load_module("companion_ui_attention", os.path.join(LIB_DIR, "compan
 # interactive one. Every session-keyed collector below (edits, parallelism, session code) asks it
 # through repo_session(); attention and the chat publishers import the same module.
 SESSIONS = _load_module("hmd_session_resolve", os.path.join(LIB_DIR, "hmd_session_resolve.py"))
+# The decision store behind the phone's DENY-ONLY say over a risky action (A4). bin/heimdall-phone-deny
+# writes the pending requests, bin/heimdall-relay-client records the sealed deny; this file only READS
+# the live ones, into /api/state's `approvals` (and, through attention, `needs_approval`).
+DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "companion_ui_decisions.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -757,6 +761,16 @@ def collect_inbox(root):
     return INBOX.summary(root)
 
 
+def collect_approvals(root):
+    """The `approvals` addendum (A4, deny-only round): the live, undecided requests the phone-deny
+    hook is holding for the paired phone -- {id, tool, summary, requested_at, expires_at, risk},
+    oldest first, at most 5, summary scrubbed -- always via companion_ui_decisions.pending, never a
+    raw directory listing. No hook, no request, or a missing module is simply []."""
+    if DECISIONS is None:
+        return []
+    return DECISIONS.pending(root)
+
+
 def attention_empty():
     """The no-evidence `attention` shape (A1): idle, nothing to point at. Mirrors
     companion_ui_attention.empty(), which is unreachable when that module failed to load."""
@@ -779,6 +793,7 @@ def collect_attention(root, state=None):
         sweep_receipt=state.get("sweep_receipt"),
         checkpoint=state.get("checkpoint"),
         quality_gate=state.get("quality_gate"),
+        approvals=state.get("approvals"),
         denied=path_is_denied,
     )
 
@@ -999,6 +1014,7 @@ def collect_state(root, transport=None):
         "edits": safe(collect_edits),
         "panels": safe(collect_panels, list),
         "inbox": safe(collect_inbox, lambda: {"pending": 0}),
+        "approvals": safe(collect_approvals, list),
     }
     # Derived AFTER the slices it reads, so it sees this pass's parallelism/receipt/checkpoint/gate.
     state["attention"] = safe(lambda r: collect_attention(r, state), attention_empty)
