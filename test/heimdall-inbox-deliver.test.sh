@@ -541,7 +541,7 @@ wait "$BGPID" 2>/dev/null || true
 echo "$OUT" | grep -q "gated but connected" && ok "gated + companion connected: connect.json is the implicit opt-in, the message is delivered" || bad "no delivery: $OUT"
 rm -rf "$D"
 
-echo "25. A2: headless / sub-sessions never hold the line (claude -p children would stall for 30 minutes at every turn end):"
+echo "25. A2: headless / sub-sessions never hold the line (claude -p children would stall for 5 minutes at every turn end):"
 D="$(make_project)"
 mark_companion "$D"
 : > "$(inbox_of "$D")"

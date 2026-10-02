@@ -165,7 +165,7 @@ printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","starte
 PAYLOAD='{"session_id":"s1","transcript_path":"","cwd":"'"$D"'","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Done implementing the feature."}'
 # The message lands 3s in -- long enough that a slow hook start cannot beat it
 # and make a hook that never waits look like one that did. HMD_INBOX_WAIT_S=20
-# only bounds a broken run (the real default with a companion is 1800).
+# only bounds a broken run (the real default with a companion is 300).
 ( sleep 3; printf '{"id":"w1","ts":1,"text":"idle hello from phone","source":"test"}\n' >> "$D/.heimdall/ui/inbox.jsonl" ) &
 BGPID=$!
 START=$(date +%s)
@@ -223,7 +223,7 @@ PAYLOAD='{"session_id":"s1","transcript_path":"","cwd":"'"$D"'","hook_event_name
 ( sleep 3; python3 -c 'import os, sys, time; os.utime(sys.argv[1], (time.time(), os.stat(sys.argv[1]).st_mtime))' "$TTYF" ) &
 BGPID=$!
 START=$(date +%s)
-OUT="$(printf '%s' "$PAYLOAD" | CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" HMD_INBOX_TTY="$TTYF" HMD_INBOX_WAIT_S=20 bash -c "$STOP_CMD" 2>&1)"
+OUT="$(printf '%s' "$PAYLOAD" | CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" HMD_INBOX_TTY="$TTYF" HMD_INBOX_PRESENCE_CMD="echo 0" HMD_INBOX_WAIT_S=20 bash -c "$STOP_CMD" 2>&1)"
 RC=$?
 END=$(date +%s)
 ELAPSED=$((END - START))
