@@ -116,7 +116,7 @@ write_parker() { # NAME -- parks until signalled; p1 also records the runner's W
 #!/usr/bin/env bash
 n="$(basename "$0" .test.sh)"
 if [ "$n" = "p1" ]; then
-  { lsof -a -p $$ -d 1 -Fn 2>/dev/null | sed -n 's/^n//p'; } > "$MARK/work-probe"
+  { lsof -a -p $$ -d 2 -Fn 2>/dev/null | sed -n 's/^n//p'; } > "$MARK/work-probe"
 fi
 exec -a "$PARK_NAME" sleep "$PARK_SECS"
 FIXEOF
@@ -125,7 +125,7 @@ write_quick() { # NAME -- passes at once; records the runner's WORK dir
   cat > "$SBX/test/$1.test.sh" <<'FIXEOF'
 #!/usr/bin/env bash
 n="$(basename "$0" .test.sh)"
-{ lsof -a -p $$ -d 1 -Fn 2>/dev/null | sed -n 's/^n//p'; } > "$MARK/work-probe"
+{ lsof -a -p $$ -d 2 -Fn 2>/dev/null | sed -n 's/^n//p'; } > "$MARK/work-probe"
 echo "$n: 1 passed, 0 failed."
 FIXEOF
 }
@@ -134,7 +134,7 @@ write_red_then_park() { # NAME -- red on its first run, parks on the solo re-run
 #!/usr/bin/env bash
 n="$(basename "$0" .test.sh)"
 if [ ! -f "$MARK/$n.ran-once" ]; then
-  { lsof -a -p $$ -d 1 -Fn 2>/dev/null | sed -n 's/^n//p'; } > "$MARK/work-probe"
+  { lsof -a -p $$ -d 2 -Fn 2>/dev/null | sed -n 's/^n//p'; } > "$MARK/work-probe"
   : > "$MARK/$n.ran-once"
   echo "$n: 0 passed, 1 failed."
   exit 1

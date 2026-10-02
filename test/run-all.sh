@@ -653,7 +653,12 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
     # violation caused during the PARALLEL phase must still be attributable afterward.
     cp "$WORK/$i.t0" "$WORK/$i.t0.parallel" 2>/dev/null || true
     cp "$WORK/$i.t1" "$WORK/$i.t1.parallel" 2>/dev/null || true
-    run_one "$i" "${RUN[$i]}"
+    # Backgrounded and waited on, not run in the foreground: bash defers a trapped signal until
+    # a FOREGROUND command returns (up to the suite's whole budget -- 900s for
+    # install-stranger), whereas `wait` is interrupted at once and the suite is still a live
+    # descendant for _abort_sweep to stop.
+    run_one "$i" "${RUN[$i]}" &
+    wait $!
     newrc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
     [ "$newrc" = "0" ] && FLAKY+=("${RUN[$i]}")
     _progress_line retry "$retried" "$total_reds" "$i"
