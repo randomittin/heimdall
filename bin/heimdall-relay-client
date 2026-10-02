@@ -1303,7 +1303,7 @@ class RelayClient:
         self._rearm_gen += 1
 
     def _tick_once(self):
-        state, digest = self.cache.current()
+        state, digest = self.cache.latest()
         if digest == self.last_sent_digest:
             return
         rearm_gen = self._rearm_gen

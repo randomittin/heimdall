@@ -1257,13 +1257,6 @@ class StateCache:
                     return self._state, self._digest
             return self.refresh()
 
-    def current(self):
-        """(state, digest) as last published, whatever its age: no freshness check, never a
-        collection -- for a consumer that was just woken by wait_for_change() and must not pay
-        for (or race) a synchronous refresh. (None, None) before the first refresh finished."""
-        with self._cond:
-            return self._state, self._digest
-
     def invalidate(self):
         """Force the next latest() to recompute rather than serve a cached snapshot --
         for a write THIS process just made (POST /api/send) that latest()'s own
