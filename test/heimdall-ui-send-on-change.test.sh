@@ -555,6 +555,7 @@ mod = module_from_spec(spec)
 loader.exec_module(mod)
 args = argparse.Namespace(relay="http://127.0.0.1:9", repo=tmp, ui_port=0, public_host=None,
                           status_file=None, tick_s=2.0)
+Client = mod.RelayClient
 
 
 class ScriptedCache:
@@ -616,10 +617,10 @@ def c2():
     t0 = feed(client.cache, [(0.05, "B")])
     result = client._await_new_state()
     el = time.monotonic() - t0
-    floor = 0.05 + mod.STATE_DEBOUNCE_S - 0.01
+    floor = 0.05 + Client.STATE_DEBOUNCE_S - 0.01
     verdict(result is True and floor <= el < 0.5,
             "C2: one change -> True, but only after the %.0f ms debounce (%.0f ms; window [%.0f, 500))"
-            % (mod.STATE_DEBOUNCE_S * 1000, el * 1000, floor * 1000))
+            % (Client.STATE_DEBOUNCE_S * 1000, el * 1000, floor * 1000))
 
 
 def c3():
@@ -627,7 +628,7 @@ def c3():
     t0 = feed(client.cache, [(0.05, "B"), (0.09, "C"), (0.13, "D")])
     result = client._await_new_state()
     el = time.monotonic() - t0
-    floor = 0.13 + mod.STATE_DEBOUNCE_S - 0.01
+    floor = 0.13 + Client.STATE_DEBOUNCE_S - 0.01
     verdict(result is True and floor <= el < 0.6,
             "C3: a 3-change burst is ONE True, after the burst went quiet (%.0f ms; window [%.0f, 600))"
             % (el * 1000, floor * 1000))
@@ -639,7 +640,7 @@ def c4():
     t0 = feed(client.cache, schedule)
     result = client._await_new_state()
     el = time.monotonic() - t0
-    ceiling = mod.STATE_DEBOUNCE_MAX_S + 0.02 + 0.2
+    ceiling = Client.STATE_DEBOUNCE_MAX_S + 0.02 + 0.2
     verdict(result is True and el <= ceiling,
             "C4: churn every 30 ms for 1.5 s cannot starve the send: True after %.0f ms (<= %.0f = max hold + slack)"
             % (el * 1000, ceiling * 1000))

@@ -19,6 +19,15 @@ the same convention that module itself uses for bin/lib/*.py, see
 viewer can show which local port `hmd ui` is actually bound to); the state
 read path never opens a socket to it.
 
+SEND-ON-CHANGE: a state frame follows the change, not a timer. The cache's
+poller re-collects the moment a watched source moves (StateCache.run) and
+wakes StateCache.wait_for_change; run_state_loop blocks there, lets a burst
+settle for STATE_DEBOUNCE_S (never longer than STATE_DEBOUNCE_MAX_S since its
+first change), then sends ONE frame carrying the newest state. A frame is
+still sent only when the digest differs from the last one sent (INV-22), a
+re-bind forces one regardless (§7c), and the loop re-checks stop_event / that
+re-bind at least every STATE_WAIT_SLICE_S.
+
 SESSION-KEY BOOTSTRAP (matches hmdapp's RelayTransport / fake-hmd.mjs exactly
 -- see hmdapp's docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md Section 1;
 this section previously documented a "Wave-1 hello" handshake the real app
@@ -1199,7 +1208,9 @@ def build_argparser():
     ap.add_argument("--status-file", default=None, metavar="PATH",
                      help="default <repo>/.heimdall/app/relay.json")
     ap.add_argument("--tick-s", type=float, default=2.0, metavar="N",
-                     help="state poll/send cadence in seconds (default 2)")
+                     help="longest the state loop blocks before it re-checks for a stop or a re-bind "
+                          "(default 2, and never more than 0.25 -- STATE_WAIT_SLICE_S). A state change is "
+                          "sent as it happens (debounced 50 ms), not at the next tick")
     return ap
 
 
