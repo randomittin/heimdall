@@ -467,8 +467,8 @@ try:
     verdict(carrying(119, start) is not None, "B3a: the burst's final value (119) reaches the relay")
     verdict(1 <= got <= 4, "B3b: 20 writes in ~0.3 s were coalesced into %d frame(s) (1..4)" % got)
     verdict(seqs == sorted(set(seqs)), "B3c: frame seq strictly increasing across the burst %s" % seqs)
-    verdict(carrying(119, start) == len(frames) - 1,
-            "B3d: the LAST frame is the one carrying the final state (no stale frame after it)")
+    verdict(probe_value(len(frames) - 1) == 119,
+            "B3d: the LAST frame holds the final state (no stale frame lands after it)")
 
     # B4 -- sustained churn: the debounce is capped, so the phone is fed DURING the churn
     settle(1.5)
@@ -486,7 +486,7 @@ try:
     total = len(frames) - start
     verdict(mid >= 2, "B4a: %d frames arrived while the churn was still running (>= 2: debounce is capped)" % mid)
     verdict(total <= 14, "B4b: %.0f s of churn (%d writes) cost %d frames (<= 14)" % (churn_s, value - 200, total))
-    verdict(carrying(value - 1, start) == len(frames) - 1, "B4c: the last frame carries the last write")
+    verdict(probe_value(len(frames) - 1) == value - 1, "B4c: the last frame holds the last write")
 
     # B5 -- a re-bind (device_bound again, same pubkey) re-sends the state at once, not at the next tick
     settle(1.5)
