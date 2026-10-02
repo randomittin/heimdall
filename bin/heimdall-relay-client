@@ -73,10 +73,16 @@ to drive its own UI; nothing else is ever written to stdout.
                                                        may repeat across a
                                                        stream reconnect
     {"event":"state_sent","seq":N,"bytes":B,"delivered":bool}
-    {"event":"command","action":"send-message"|"decide"|..,"ok":bool,"detail":..}
+    {"event":"device_caps","caps":[..]}               the phone's capability set
+                                                       (from its latest sealed
+                                                       `resync`; [] after a
+                                                       device_bound), sorted, logged
+                                                       when it CHANGES. See FRAME
+                                                       COMPRESSION AND RESYNC below
+    {"event":"command","action":"send-message"|"decide"|"resync"|..,"ok":bool,"detail":..}
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
-        logged, not even at this level); any action other than the two
+        logged, not even at this level); any action other than the three
         named is acked `not-implemented`
     {"event":"ack_sent","of_seq":N,"seq":S,"id":..|null,"attempt":K,"ms":N,
      "ok":bool,"delivered":bool}
@@ -211,6 +217,21 @@ No later frame can overtake the retries (see STATE FRAMES: the app would drop
 an ack whose seq a newer frame has already passed). Every attempt is visible
 in ack_sent, a delivered=false answer too (ok true, delivered false). Backoff
 waits on stop_event, so a shutdown is never delayed by a retry.
+
+FRAME COMPRESSION AND RESYNC (the FINAL wire of hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md
+Ask 5, section 5; hmdapp's docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with
+it; codec in bin/lib/hmd_relay_e2e.py). Capabilities travel in-band, hmd first: EVERY `state`
+frame's plaintext is `{"state":{...},"caps":["resync","z-zlib"]}` (E2E.hmd_caps()). A phone that
+sees `resync` sends a sealed command `{"action":"resync","params":{"last_seq":N,"digest":"<sha256
+hex>","caps":[..]}}`; hmd acks it ok, keeps its `caps` as the phone's capability set (replaced by
+every resync, forgotten on every device_bound), and -- when `digest` is not the digest of the
+state hmd last sent -- forces a full state frame on the next tick, the same re-send device_bound
+forces. Only while the phone's set holds "z-zlib" is a state frame sealed as `{"z":"zlib","d":
+"<base64 of zlib.compress(that plain plaintext)>"}`, compressed BEFORE the seal. Plain is the
+default and the fallback: no resync yet, a frame under E2E.COMPRESS_MIN_BYTES, one the envelope
+would not shrink, `ack` frames (never compressed), a python without zlib. Only a sealed command
+that opened under the session key can set the phone's capabilities -- never the relay's
+unencrypted `device_bound`.
 
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
@@ -804,6 +825,11 @@ class RelayClient:
         self.device_pub = None  # raw 32-byte key of the currently-bound
                                  # device -- set once, on the first
                                  # device_bound; see _handle_envelope.
+        self.device_caps = frozenset()  # the phone's capability tokens: its latest
+                                         # sealed `resync`'s caps (_resync), forgotten on
+                                         # every device_bound; empty = plain frames only
+        self.last_sent_state = None     # the state object of the last state frame sealed --
+                                         # what a phone's resync digest is compared with
         self.stop_event = threading.Event()
         self.state_ready = threading.Event()
         self._stopping = False
@@ -951,7 +977,12 @@ class RelayClient:
         included -- is never overtaken by a newer frame; the converse (a state
         frame still in flight when an ack takes the next seq) is _tick_once's
         to repair."""
+        if type_ == "state":  # hmd's capability tokens ride in EVERY state frame (FRAME COMPRESSION AND RESYNC)
+            plaintext_obj = dict(plaintext_obj, caps=E2E.hmd_caps())
+            self.last_sent_state = plaintext_obj.get("state")
         plaintext = json.dumps(plaintext_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if type_ == "state":  # compress BEFORE the seal; only a state frame, only for a phone that listed "z-zlib"
+            plaintext = E2E.pack_plaintext(plaintext, self.device_caps)
         is_ack = type_ == "ack"
         with self.lock:
             if not is_ack:
@@ -1055,6 +1086,46 @@ class RelayClient:
             return False, "write-failed", {}
         return True, None, {"id": result["id"], "decision": result["decision"]}
 
+    def _adopt_device_caps(self, raw):
+        """Record the phone's capability tokens (E2E.normalize_caps: an array's strings, anything
+        else the empty set) and log a `device_caps` event when the set CHANGES. Called only with the
+        `caps` of a `resync` command that OPENED under the paired session key, or with None on a
+        device_bound (the phone's tokens are forgotten there) -- never with anything out of the
+        relay's plaintext frames (see FRAME COMPRESSION AND RESYNC). The set is replaced by one
+        reference assignment, so the state loop's read of it in send_hmd_frame needs no lock: it
+        sees the old or the new set, both valid."""
+        caps = E2E.normalize_caps(raw)
+        if caps != self.device_caps:
+            self.device_caps = caps
+            emit({"event": "device_caps", "caps": sorted(caps)})
+
+    def _resync(self, params):
+        """The phone's `resync` command, sent to an hmd that listed `resync` in its state frames'
+        caps (hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md 5.3):
+            command  {"action":"resync","params":{"last_seq":N,"digest":"<64 lowercase hex>","caps":[..]}}
+            ack ok   {"ok":true,"of_seq":N}            ack no  {"ok":false,"of_seq":N,"detail":"bad-params"}
+        Keeps `caps` as the phone's capability set (the "z-zlib" gate; each resync replaces it) and,
+        when `digest` is not the digest of the state hmd last sent, forces a full state frame on the
+        next tick -- the very re-send device_bound forces -- so it carries the next seq, compressed
+        if the new caps allow. A phone that already holds what hmd last sent needs nothing: the
+        ordinary tick delivers any newer state. A `last_seq` at or above hmd's next seq means the
+        two have desynced (the app shows RELAY_DESYNC); surfaced here as an error event, the seq
+        counter itself is never touched."""
+        fields = params if isinstance(params, dict) else {}
+        last_seq, digest = fields.get("last_seq"), fields.get("digest")
+        if not (isinstance(last_seq, int) and not isinstance(last_seq, bool) and last_seq >= 0
+                and isinstance(digest, str) and len(digest) == 64
+                and all(c in "0123456789abcdef" for c in digest)):
+            return False, "bad-params"
+        self._adopt_device_caps(fields.get("caps"))
+        if last_seq >= self.hmd_seq:
+            emit({"event": "error", "detail": "resync: phone last_seq=%d is at or above hmd's next seq %d -- "
+                                              "desynced" % (last_seq, self.hmd_seq)})
+        sent = self.last_sent_state
+        if sent is None or E2E.state_digest(sent) != digest:
+            self._rearm_state()
+        return True, None
+
     def _handle_command(self, env):
         # The phone's ack window opened before this command reached us; retries
         # of its ack may only START inside what is left of it (ACK_WINDOW_S).
@@ -1101,6 +1172,8 @@ class RelayClient:
                     ok, detail = False, "write-failed"
         elif action == "decide":
             ok, detail, extra = self._decide(params)
+        elif action == "resync":
+            ok, detail = self._resync(params)
         else:
             ok, detail = False, "not-implemented"
         emit({"event": "command", "action": action, "ok": ok, "detail": detail})
@@ -1135,6 +1208,7 @@ class RelayClient:
             if self.session_key is not None:
                 if device_pub == self.device_pub:
                     self._rearm_state()
+                    self._adopt_device_caps(None)  # forget the phone's caps on device_bound: plain until its next resync
                     self.bound_at = payload.get("bound_at")
                     self.write_status()
                     emit({"event": "device_bound", "bound_at": self.bound_at})
