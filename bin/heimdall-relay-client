@@ -1329,8 +1329,10 @@ class RelayClient:
         """Block until the cache holds a digest this client has not sent, then let a burst settle.
         True when there is something to send: the digest stayed put for STATE_DEBOUNCE_S, or kept
         moving until STATE_DEBOUNCE_MAX_S ran out. False when a wait slice passed with nothing new
-        (or on stop) -- the caller loops, which is how stop_event and a `last_sent_digest = None`
-        re-bind (re-read here on every call) are noticed within one slice. --tick-s (default 2) only
+        (or on stop) -- the caller loops, which is how stop_event and a _rearm_state() re-bind
+        (last_sent_digest = None, re-read here on every call) are noticed within one slice. A state
+        POST that got no usable answer leaves last_sent_digest as it was (_tick_once), so it reads as
+        "new" again here and is retried after _tick_once's own backoff. --tick-s (default 2) only
         bounds the slice from above: nothing waits for it any more."""
         if self.stop_event.is_set():
             return False
