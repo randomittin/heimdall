@@ -300,7 +300,7 @@
           {
             "type": "command",
             "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled inbox-deliver-stop && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-inbox-deliver\"; REPO=\"${CLAUDE_PROJECT_DIR:-.}\"; if [ -x \"$HOOK\" ]; then if [ -f \"$REPO/.heimdall/ui/inbox.wait\" ]; then \"$HOOK\" stop --repo \"$REPO\"; else HMD_INBOX_GATED=1 \"$HOOK\" stop --repo \"$REPO\"; fi; fi; exit 0",
-            "timeout": 1860
+            "timeout": 330
           }
         ]
       }

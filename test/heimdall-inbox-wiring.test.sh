@@ -39,6 +39,13 @@ make_project() {
   printf '%s' "$d"
 }
 
+# The Stop hook ends its hold the moment the terminal it runs under is read (the
+# operator typing). Found through the hook's ancestors, that terminal is whatever
+# launched this suite -- an operator's shell, a claude session -- and a human
+# typing there mid-run would cut a wait a test is timing. Off everywhere except
+# test 12, which injects its own signal.
+export HMD_INBOX_TTY=off
+
 echo "1. bin/heimdall inbox status -- runs + exits 0 on a temp repo with empty inbox:"
 D="$(make_project)"
 : > "$D/.heimdall/ui/inbox.jsonl"
@@ -60,7 +67,15 @@ printf '%s' "$PROMPT_CMDS" | grep -q ' prompt --repo' && ok "UserPromptSubmit ho
 
 TIMEOUT_STOP="$(jq -r '.hooks.Stop[]?.hooks[]? | select(.command | contains("inbox-deliver-stop")) | .timeout // empty' "$HOOKS_JSON")"
 TIMEOUT_PROMPT="$(jq -r '.hooks.UserPromptSubmit[]?.hooks[]? | select(.command | contains("inbox-deliver-prompt")) | .timeout // empty' "$HOOKS_JSON")"
-[ "$TIMEOUT_STOP" = "1860" ] && ok "Stop hook timeout is 1860s (the 1800s companion-connected HMD_INBOX_WAIT_S default + the same 60s margin 240 -> 300 had)" || bad "Stop hook timeout wrong/missing: '$TIMEOUT_STOP'"
+[ "$TIMEOUT_STOP" = "330" ] && ok "Stop hook timeout is 330s (the 300s companion-connected HMD_INBOX_WAIT_S default + a 30s margin for the last 2s poll and process start)" || bad "Stop hook timeout wrong/missing: '$TIMEOUT_STOP'"
+# The two numbers drift apart silently -- the script's default is a constant in
+# bin/heimdall-inbox-deliver, the timeout a literal in hooks.json -- and a timeout
+# below the wait makes Claude Code kill the hook just before a late phone message
+# could be delivered. Tie them together instead of trusting two literals.
+DEFAULT_WAIT="$(sed -n 's/^COMPANION_WAIT_S = \([0-9][0-9.]*\).*/\1/p' "$REPO/bin/heimdall-inbox-deliver")"
+python3 -c 'import sys; wait, timeout = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if timeout - wait >= 20 else 1)' "${DEFAULT_WAIT:-x}" "${TIMEOUT_STOP:-0}" 2>/dev/null \
+  && ok "Stop hook timeout ($TIMEOUT_STOP) clears the script's companion wait default ($DEFAULT_WAIT) by >= 20s" \
+  || bad "Stop hook timeout '$TIMEOUT_STOP' does not clear bin/heimdall-inbox-deliver's COMPANION_WAIT_S '$DEFAULT_WAIT' by 20s -- Claude Code would kill a hold that is still delivering"
 [ "$TIMEOUT_PROMPT" = "10" ] && ok "UserPromptSubmit hook timeout is 10s" || bad "UserPromptSubmit hook timeout wrong/missing: '$TIMEOUT_PROMPT'"
 
 echo "3. hooks.metadata.json registers both ids, distinct, advisory (locked:false):"
@@ -150,7 +165,7 @@ printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","starte
 PAYLOAD='{"session_id":"s1","transcript_path":"","cwd":"'"$D"'","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Done implementing the feature."}'
 # The message lands 3s in -- long enough that a slow hook start cannot beat it
 # and make a hook that never waits look like one that did. HMD_INBOX_WAIT_S=20
-# only bounds a broken run (the real default with a companion is 1800).
+# only bounds a broken run (the real default with a companion is 300).
 ( sleep 3; printf '{"id":"w1","ts":1,"text":"idle hello from phone","source":"test"}\n' >> "$D/.heimdall/ui/inbox.jsonl" ) &
 BGPID=$!
 START=$(date +%s)
@@ -194,6 +209,29 @@ ELAPSED=$((END - START))
 [ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "exit 0, no stdout" || bad "rc=$RC out: $OUT"
 [ "$ELAPSED" -le 3 ] && ok "returned in ${ELAPSED}s (the exported 4s wait did not leak past the gate)" || bad "took ${ELAPSED}s -- the gate did not hold"
 rm -rf "$D"
+
+echo "12. typing release through the wired command: companion connected, empty inbox, the terminal is read 3s in -> the hook hands the turn back within a poll, long before its wait (HMD_INBOX_TTY survives the wrapper):"
+D="$(make_project)"
+mkdir -p "$D/.heimdall/app"
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$$" "$$" > "$D/.heimdall/app/connect.json"
+: > "$D/.heimdall/ui/inbox.jsonl"
+TTYF="$(mktemp)"
+python3 -c 'import os, sys, time; os.utime(sys.argv[1], (time.time() - 3600, os.stat(sys.argv[1]).st_mtime))' "$TTYF"
+PAYLOAD='{"session_id":"s1","transcript_path":"","cwd":"'"$D"'","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Done implementing the feature."}'
+# HMD_INBOX_WAIT_S=20 only bounds a broken run: the real default with a companion
+# is 300, and the point is that the keystroke cuts it short.
+( sleep 3; python3 -c 'import os, sys, time; os.utime(sys.argv[1], (time.time(), os.stat(sys.argv[1]).st_mtime))' "$TTYF" ) &
+BGPID=$!
+START=$(date +%s)
+OUT="$(printf '%s' "$PAYLOAD" | CLAUDE_PLUGIN_ROOT="$REPO" CLAUDE_PROJECT_DIR="$D" HMD_INBOX_TTY="$TTYF" HMD_INBOX_PRESENCE_CMD="echo 0" HMD_INBOX_WAIT_S=20 bash -c "$STOP_CMD" 2>&1)"
+RC=$?
+END=$(date +%s)
+ELAPSED=$((END - START))
+wait "$BGPID" 2>/dev/null || true
+[ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "exit 0, no stdout" || bad "rc=$RC out: $OUT"
+[ "$ELAPSED" -ge 2 ] && ok "held until the keystroke (${ELAPSED}s), not returned at once" || bad "returned in ${ELAPSED}s -- the companion hold never began"
+[ "$ELAPSED" -le 9 ] && ok "released ${ELAPSED}s in, a poll after the keystroke -- not the 20s bound" || bad "took ${ELAPSED}s -- the keystroke did not end the hold"
+rm -rf "$D" "$TTYF"
 
 echo ""
 echo "heimdall-inbox-wiring.test.sh: $PASS passed, $FAIL failed."

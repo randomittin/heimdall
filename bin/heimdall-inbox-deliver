@@ -57,18 +57,20 @@
 #   COMPANION CONNECTED. <repo>/.heimdall/app/connect.json (written by `hmd app
 #     connect`) naming live processes (pid_ui, plus pid_client in relay mode)
 #     means a phone can reach this session, so `stop` long-polls after ANY last
-#     message, for HMD_INBOX_WAIT_S -- default 1800 with a companion connected,
-#     240 without. A connect.json whose pids are dead (a crash left it behind)
-#     is NOT a connected companion: a stale file must never pin every turn end
-#     for half an hour. The hook `timeout` in hooks/hooks.json is 1860 (1800
-#     plus the same 60s margin 240 -> 300 always had). stop_hook_active is
-#     still a silent loop guard.
+#     message, for HMD_INBOX_WAIT_S -- default 300 with a companion connected
+#     (it was 1800 until the operator cut it: a prompt typed at the laptop queues
+#     behind the hook, see TYPING RELEASE), 240 without. A connect.json whose pids
+#     are dead (a crash left it behind) is NOT a connected companion: a stale file
+#     must never pin every turn end for five minutes. The hook `timeout` in
+#     hooks/hooks.json is 330 (300 plus a 30s margin; the loop overshoots its
+#     deadline by one 2s poll at most). stop_hook_active is still a silent loop
+#     guard.
 #   ATTENDED SESSIONS ONLY. A headless `claude -p` / SDK session
 #     (CLAUDE_CODE_ENTRYPOINT sdk-cli, sdk-ts, sdk-py, mcp, or the github
 #     action) and an hmd sub-session (HMD_JUDGMENT truthy, HMD_AGENT_TYPE set)
 #     never count as "companion connected": hmd's own automation spawns those
 #     in the same repo with the same plugin hooks, and each would otherwise
-#     stall 30 minutes at the end of its run. They keep the pre-A2 behaviour.
+#     stall 5 minutes at the end of its run. They keep the pre-A2 behaviour.
 #   WHO IS LISTENING. While it waits, the long-poll rewrites
 #     <repo>/.heimdall/ui/inbox-waiting (0600; JSON pid/since/until/ts) every
 #     poll and removes it on exit. `hmd ui` turns a fresh one (mtime within 2x
@@ -78,6 +80,61 @@
 #     timeout kill that reaches only the shell), the long-poll stands down
 #     without popping: a message popped into a dead pipe is lost yet archived
 #     as delivered.
+#   TYPING RELEASE. A prompt typed while the Stop hook is still running queues
+#     behind it, so a hold that outlives the operator's return is a prompt stuck
+#     for up to the whole wait -- the long-poll's cost, paid exactly when the human
+#     is back. Each poll therefore first asks whether somebody is typing into the
+#     session's terminal. If so the hold ends on the spot -- no marker, no pop --
+#     and whatever is queued stays queued and rides the prompt being typed (the
+#     UserPromptSubmit hook folds it in). A hold that would begin with the terminal
+#     just read (a prompt typed or sent in the last 10s) never begins, and the 240s
+#     question wait ends the same way.
+#     TYPING = the session's terminal was READ within TYPING_RECENT_S (10s), the
+#     number `w` and `who -u` print as IDLE: the kernel stamps a tty's access time
+#     when claude takes a keystroke off the pty, and claude's redraws only move
+#     mtime. The hook has no controlling terminal of its own (stdio are pipes; the
+#     Bash tool's shell reads tty "??" under a claude on ttys000), so once per hold
+#     it walks `ps -o ppid=,tty= -p PID` up from itself to the first ancestor that
+#     has one. Per terminal: typing in session A leaves session B's phone hold alone,
+#     and by construction keys arriving over ssh or tmux count.
+#     A read is not always a human. claude switches on focus reporting (DECSET 1004)
+#     and theme reports (2031), and mouse tracking when fullscreen (all three are in
+#     the 2.1.287 binary), and a terminal that implements them answers a window focus
+#     change with bytes on the pty -- with nobody at the keyboard whenever something
+#     else takes focus. So on macOS the read only counts while HIDIdleTime says a
+#     keyboard or pointer was used within the same 10s. That is a VETO, never a
+#     requirement: where HIDIdleTime cannot be read (no ioreg, no IOHIDSystem, any
+#     other platform) the read alone decides.
+#     Measured 2026-10-02, macOS (Darwin 27), Terminal.app, Claude Code 2.1.287:
+#       tty atime     the primary signal. os.stat ~4us a poll; the ps walk ~5ms a hop
+#                     (three or four of them), once per hold. Needs no permission (a
+#                     stat of a device node). A test pty's atime moves on a read and
+#                     not on a write or an unread keystroke, its mtime the other way
+#                     round; a live session's atime was five minutes old while its
+#                     mtime was 0.3s old. Linux stamps it in 8s buckets, which
+#                     TYPING_RECENT_S covers.
+#       HIDIdleTime   the macOS veto. `ioreg -r -d 1 -c IOHIDSystem` (4KB; the bare
+#                     -c form is 311KB) costs ~25ms wall / ~23ms CPU a call, thousands
+#                     of times the stat, so it is asked only once the terminal has
+#                     been read. Needs no TCC permission: it is an IORegistry property,
+#                     not an event tap, and 21 calls from a Terminal.app child all
+#                     returned the value and logged no com.apple.TCC event naming
+#                     ioreg or ListenEvent / PostEvent. As the only signal it is the
+#                     wrong one: machine-wide (typing in session A would end every
+#                     session's hold, and a released session is not listening again
+#                     until its next turn ends), reset by mouse jigglers and
+#                     remote-control tools, blind to keys that arrive over ssh, and
+#                     Linux has no counterpart.
+#       draft file    nothing to read: ~/.claude/sessions/<pid>.json carries status
+#                     busy|idle but no draft, history.jsonl is appended on submit.
+#     No signal means no release: no ps, no ancestor with a terminal, a terminal
+#     that cannot be examined -- the hold runs exactly as before. HMD_INBOX_TTY pins
+#     the device (the tests point it at a file) or, as off/0/false/no/none, switches
+#     the release off. HMD_INBOX_PRESENCE_CMD replaces the HID source with a command
+#     that prints the seconds since a keyboard or pointer was last used (the tests
+#     inject it this way; empty or off/0/false/no/none removes the veto). It runs
+#     without a shell, with the hook's own privileges, so it is operator-only: set it
+#     in the environment, never from anything a phone message can reach.
 #   RECEIPTS. Every dequeue stamps delivered_at into the archived line
 #     (inbox-delivered.jsonl, 0600); /api/state's inbox.delivered[] is the last
 #     20 of those as {id, delivered_at} -- never text.
@@ -122,11 +179,14 @@ Modes:
            companion is connected (a .heimdall/app/connect.json naming live
            processes; attended sessions only, never headless claude -p or an
            hmd sub-session), long-polls the queue every 2s for up to
-           HMD_INBOX_WAIT_S seconds (default 1800 with a companion
+           HMD_INBOX_WAIT_S seconds (default 300 with a companion
            connected, 240 without) and delivers the same way the moment a
            message arrives. While it waits it keeps .heimdall/ui/inbox-waiting
-           fresh -- what `hmd ui` reports as inbox.consumer "waiting". If
-           stop_hook_active is true, exits silently (loop guard) without
+           fresh -- what `hmd ui` reports as inbox.consumer "waiting". The
+           wait ends at once, delivering nothing, when somebody is typing into
+           the session's terminal (a prompt typed behind a running Stop hook
+           queues until it exits; the queued messages ride that prompt instead).
+           If stop_hook_active is true, exits silently (loop guard) without
            touching the queue. Otherwise: no output.
 
   tmux     Sends each pending message into a tmux pane with
@@ -145,25 +205,35 @@ Modes:
            --json is accepted (output is always JSON either way).
 
 Env:
-  HMD_INBOX_WAIT_S   seconds to long-poll in `stop` mode. Default 240, or 1800
+  HMD_INBOX_WAIT_S   seconds to long-poll in `stop` mode. Default 240, or 300
                      with a companion connected. Export 0 to never hold a turn.
   HMD_INBOX_GATED    1 = the hook wiring found no .heimdall/ui/inbox.wait
                      opt-in: `stop` waits only when a companion is connected,
                      whatever HMD_INBOX_WAIT_S says.
+  HMD_INBOX_TTY      the terminal watched for typing, as a device path. Default:
+                     found through the hook's ancestors. off/0/false/no/none
+                     switches the typing release off.
+  HMD_INBOX_PRESENCE_CMD
+                     a command (run without a shell) that prints the seconds since
+                     a keyboard or pointer was last used; a terminal read only
+                     counts as typing while that is under 10. Default on macOS:
+                     HIDIdleTime via ioreg; elsewhere none, so the terminal read
+                     alone decides. Empty or off/0/false/no/none removes the check.
   HMD_TMUX_TARGET    tmux target (session:window.pane) for `tmux` mode.
 
 IMPORTANT: a Stop hook wired to `stop` mode can run for up to
 HMD_INBOX_WAIT_S seconds waiting on a reply. The hook's own `timeout` in
 settings.json MUST be larger than that, or Claude Code kills this script
 before a late reply can be delivered. Ready-to-paste snippet for
-.claude/settings.json (the 1800s companion default -> timeout 1860, a 60s
-margin; with HMD_INBOX_WAIT_S=240 and no companion, timeout 300 is enough):
+.claude/settings.json (the 300s companion default -> timeout 330, a 30s
+margin for the last 2s poll and process start; HMD_INBOX_WAIT_S=240 with no
+companion fits the same timeout):
 
 {
   "hooks": {
     "Stop": [
       { "hooks": [ { "type": "command",
-          "command": "bin/heimdall-inbox-deliver stop", "timeout": 1860 } ] }
+          "command": "bin/heimdall-inbox-deliver stop", "timeout": 330 } ] }
     ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command",
@@ -211,7 +281,7 @@ case "$MODE" in
 esac
 
 PY_SRC=$(cat <<'PYEOF'
-import fcntl, json, os, re, shutil, subprocess, sys, time
+import fcntl, json, os, re, shlex, shutil, subprocess, sys, time
 
 MODE, REPO_EXPLICIT, DEFAULT_REPO = sys.argv[1], sys.argv[2], sys.argv[3]
 # argv[4] is the pid of the shell that launched this script (PPID in the bash
@@ -223,8 +293,17 @@ MAX_REASON_CHARS = 4000  # joined-message cap, on top of the 2000/message cap ab
 # bin/lib/companion_ui_inbox.py reads inbox-waiting as stale after twice this.
 POLL_INTERVAL_S = 2.0
 DEFAULT_WAIT_S = 240.0     # stop long-poll budget: turn ended on a question, nobody connected
-COMPANION_WAIT_S = 1800.0  # ...with a companion connected: the session is reachable, so stay reachable
+COMPANION_WAIT_S = 300.0   # ...with a companion connected: the session is reachable, so stay reachable (short: a prompt typed meanwhile queues behind the hook)
 TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024  # only the last message matters
+
+# TYPING RELEASE (see the header). A terminal read this recently means somebody is typing
+# into it; Linux stamps a tty access time in 8s buckets, so this must stay above 8.
+TYPING_RECENT_S = 10.0
+PROBE_TIMEOUT_S = 3.0      # ps, ioreg and HMD_INBOX_PRESENCE_CMD each get this long to answer
+TTY_WALK_MAX = 8           # ps hops from this process up to the first ancestor with a terminal
+NO_TERMINAL = frozenset(("", "?", "??", "-"))   # what ps prints for a process without one
+SWITCHED_OFF = frozenset(("off", "0", "false", "no", "none"))
+HID_IDLE_RE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')   # nanoseconds, from ioreg -c IOHIDSystem
 
 # CLAUDE_CODE_ENTRYPOINT values of a session no human is typing into: Claude
 # Code rewrites an inherited "cli" to "sdk-cli" for any non-interactive (-p)
@@ -574,6 +653,106 @@ def companion_connected(root):
     return all(_pid_alive(rec[k]) for k in ("pid_ui", "pid_client") if k in rec)
 
 
+def probe_output(argv):
+    # stdout of argv, or None when it cannot be run, outlives PROBE_TIMEOUT_S or exits
+    # nonzero. ps, ioreg and HMD_INBOX_PRESENCE_CMD all come through here, and none of
+    # them may ever raise: a probe that fails is a signal that is missing, not an error.
+    if not argv:
+        return None
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=PROBE_TIMEOUT_S)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return done.stdout.decode("utf-8", "replace")
+
+
+def first_number(text):
+    # The first whitespace-separated field of text as a non-negative number, else None.
+    # NaN and negatives are not an idle time, so they count as no answer.
+    try:
+        n = float((text or "").split()[0])
+    except (IndexError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def terminal_device():
+    # The terminal this session runs in, as a /dev path, or None. The hook has no
+    # controlling terminal of its own (stdio are pipes), so walk ps up from this process
+    # to the first ancestor that has one: claude itself, on the operator terminal.
+    pid, seen = os.getpid(), set()
+    for _ in range(TTY_WALK_MAX):
+        if pid <= 1 or pid in seen:
+            return None
+        seen.add(pid)
+        fields = (probe_output(["ps", "-o", "ppid=,tty=", "-p", str(pid)]) or "").split()
+        if not fields or not fields[0].isdigit():
+            return None
+        tty = fields[1] if len(fields) > 1 else ""
+        if tty not in NO_TERMINAL:
+            return None if tty.startswith("/") or ".." in tty else os.path.join("/dev", tty)
+        pid = int(fields[0])
+    return None
+
+
+def terminal_idle_s(path):
+    # Seconds since the terminal at path was last READ, or None when it cannot be
+    # examined. A read is what typing is: the kernel stamps the access time when claude
+    # takes a keystroke off the pty, while claude redraws only move the modification time.
+    try:
+        return max(0.0, time.time() - os.stat(path).st_atime)
+    except OSError:
+        return None
+
+
+def input_idle_s():
+    # Seconds since a human last touched a keyboard or pointer of this machine, or None
+    # when that cannot be told. HMD_INBOX_PRESENCE_CMD names a command that prints the
+    # number (the tests inject it so); empty or off/0/false/no/none removes the source.
+    # Unset, it is macOS HIDIdleTime read through ioreg, and no other platform has one.
+    cmd = os.environ.get("HMD_INBOX_PRESENCE_CMD")
+    if cmd is not None:
+        if not cmd.strip() or cmd.strip().lower() in SWITCHED_OFF:
+            return None
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            return None
+        return first_number(probe_output(argv))
+    if sys.platform != "darwin":
+        return None
+    hid = HID_IDLE_RE.search(probe_output(["ioreg", "-r", "-d", "1", "-c", "IOHIDSystem"]) or "")
+    return int(hid.group(1)) / 1e9 if hid else None
+
+
+def typing_probe():
+    # None when nothing can say whether somebody is typing into this session; otherwise a
+    # zero-argument function that answers it. HMD_INBOX_TTY pins the terminal (a path: the
+    # tests point it at a plain file) or, as off/0/false/no/none, switches the release off.
+    raw = os.environ.get("HMD_INBOX_TTY", "").strip()
+    if raw.lower() in SWITCHED_OFF:
+        return None
+    path = raw or terminal_device()
+    if not path or terminal_idle_s(path) is None:
+        return None
+
+    def typing():
+        idle = terminal_idle_s(path)
+        if idle is None or idle >= TYPING_RECENT_S:
+            return False
+        # Read, but not necessarily by a human: focus and theme reports and the replies to
+        # terminal queries are reads too, and arrive with nobody at the keyboard. Where the
+        # machine can say when a keyboard or pointer was last used, a stale answer vetoes
+        # the read; where it cannot, the read stands.
+        away = input_idle_s()
+        return away is None or away < TYPING_RECENT_S
+
+    return typing
+
+
 def hook_orphaned(ppid0):
     # True once whatever launched this long-poll is gone: Claude Code killed the
     # hook (Esc, timeout) but only reached the shell above us, leaving this
@@ -721,10 +900,13 @@ def cmd_stop(hook, root):
     ppid0 = os.getppid()
     since = time.time()
     deadline = since + wait_s
+    typing = typing_probe()  # after the deadline is fixed: finding the terminal comes out of the hold, never on top of it
     write_state(root, True)
     delivered_texts = []
     try:
         while not hook_orphaned(ppid0):
+            if typing is not None and typing():
+                break  # somebody is typing into this session: hand the turn back, nothing popped; what is queued rides their prompt
             write_waiting(root, since, deadline)
             texts = texts_of(pop_all_fn(root))
             if texts:
