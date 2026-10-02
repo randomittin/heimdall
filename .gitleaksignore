@@ -29,5 +29,7 @@ f2c0b8f4349c5f99921b9d079b20751605041713:test/heimdall-telemetry.test.sh:github-
 
 # benign test vector — the golden crypto vector relay/contract/vectors.json shares with the phone app: its sessionKeyHex is the HKDF output of two PUBLIC fixed test seeds (0x11.., 0x22..), a published vector, never a credential. File:rule:line form (no commit) so it survives a rebase of the commit that added the file.
 relay/contract/vectors.json:generic-api-key:7
-# benign comment — line 2 of relay/scripts/lib/relay-crypto.mjs in imported hmdapp history (commit 0d84f0ae): prose ("session-key derivation, ChaCha20-Poly1305 ..."), where the word "key" trips generic-api-key; no credential.
+# benign comment — line 2 of relay/scripts/lib/relay-crypto.mjs in imported hmdapp history (commit 0d84f0ae): prose describing the crypto port, which the rule reads as an assignment; no credential.
 0d84f0aed1dabb765fa9343254004f7556326b8c:relay/scripts/lib/relay-crypto.mjs:generic-api-key:2
+# benign — the first wording of the comment above (commit fb7abc67) quoted that prose and so tripped the rule itself, at this very line; reworded since, this covers the frozen copy in history. File:rule:line form, no commit, so a rebase cannot orphan it.
+.gitleaksignore:generic-api-key:32
