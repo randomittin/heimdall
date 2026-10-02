@@ -61,7 +61,7 @@ heimdall-checkpoint-share	2026-11-08	KNOWN GAP — Shared Team Checkpoints (TEAM
 heimdall-md	2026-11-08	KNOWN GAP — document-to-markdown converter "for context building" (own header); tested (test/markitdown.test.sh), degrades cleanly when markitdown is absent, but nothing in the live graph calls it yet.
 heimdall-watch	2026-11-08	KNOWN GAP — H-3 sentinel watch-mode: runs sanity/security/doc-sync sentinels on human commits via heimdall-spawn. Its own header states the intended wiring explicitly ("wire it as a pre-push hook to make security blocking") and that hook was never added. Not an accidental naming collision — bin/heimdall's watch) arm execs heimdall-watch-tui on purpose (bin/heimdall:2275), and bin/heimdall:2270, bin/heimdall-drain:3 and bin/heimdall-watch-tui:4 each separately document the two are distinct tools.
 #
-heimdall-portable-brief	2026-11-26	KNOWN GAP — turns .planning/CHECKPOINT.md into a scrubbed, size-bounded brief for a fallback (possibly non-Claude) model; its own header names the natural caller as the fallback routing layer (bin/lib/issue_loop.py), not yet wired there. Deliberately NOT wired into bin/heimdall-fallback itself instead: heimdall-fallback is a state/config/safety-gate only (no transport, no brief composition), and this tool's own header insists compose and transmit stay structurally separate ("NEVER TRANSMITS ANYTHING ITSELF") so a composer bug can never exfiltrate — pairing it with a gate that has no reason to compose a brief would be a decorative caller, not genuine integration. heimdall-529-scan, shipped the same day, is now tracked in its own row below (DEAD, 2026-09-27): the transitive reachability claimed here via bin/heimdall-session-usage's docstrings (bin/heimdall-session-usage:76,84,178,196,216,486) did not survive the 2026-08-28 python-docstring-stripping fix to bin/lib/reachability.sh — those six citations are prose design-parity commentary ("mirrors", "same contract as", "see ... for the full rationale"), never an invocation, so this was itself an instance of the prose-as-edge bug that fix closes, not an honest side effect.
+heimdall-portable-brief	2026-11-26	KNOWN GAP — turns .planning/CHECKPOINT.md into a scrubbed, size-bounded brief for a fallback (possibly non-Claude) model; its own header names the natural caller as the fallback routing layer (bin/lib/issue_loop.py), not yet wired there. Deliberately NOT wired into bin/heimdall-fallback itself instead: heimdall-fallback is a state/config/safety-gate only (no transport, no brief composition), and this tool's own header insists compose and transmit stay structurally separate ("NEVER TRANSMITS ANYTHING ITSELF") so a composer bug can never exfiltrate — pairing it with a gate that has no reason to compose a brief would be a decorative caller, not genuine integration. heimdall-529-scan, shipped the same day, was tracked in its own DEAD row (recheck 2026-09-27) until 2026-10-01, when an `hmd 529-scan` dispatcher arm made it genuinely reachable and that row was removed (see the 2026-08-28 audit section below): the transitive reachability claimed here via bin/heimdall-session-usage's docstrings (bin/heimdall-session-usage:76,84,178,196,216,486) did not survive the 2026-08-28 python-docstring-stripping fix to bin/lib/reachability.sh — those six citations are prose design-parity commentary ("mirrors", "same contract as", "see ... for the full rationale"), never an invocation, so this was itself an instance of the prose-as-edge bug that fix closes, not an honest side effect.
 # ── DEAD — the 2026-08-08 transitive-liveness finding, awaiting triage ───────────
 # Each of these passed the OLD flat "something mentions it" rule and fails the transitive
 # one. In every case the only mouths naming them are themselves unreachable: their own
@@ -111,4 +111,25 @@ heimdall-spawn	2026-10-23	DEAD — Background Spawn Framework orchestrator (spec
 # or passed as an argument still does, since a real invocation can legitimately
 # live inside one of those — see bin/lib/reachability.sh's reach_extract_tokens
 # header comment for the exact rule).
-heimdall-529-scan	2026-09-27	DEAD — named only by bin/heimdall-session-usage's docstrings (bin/heimdall-session-usage:76,84,178,196,216,486), which cross-reference it for design-parity commentary ("mirrors", "same contract as", "see ... for the full rationale") — never actually invoked. The heimdall-portable-brief KNOWN GAP row above previously credited this docstring-derived mention as an "honest side effect" of real wiring; it was not — see that row's corrected text.
+# TRIAGED 2026-10-01, on this section's first recheck-by expiry (2026-09-27) — the mechanism
+# did its job: bin-reachability-gate failed both of its per-row instances (SHIPPED BUT
+# UNREACHABLE + EXEMPTION ROT) and forced a real triage instead of a blanket renewal.
+# heimdall-529-scan was checked with `heimdall-deadcode --why heimdall-529-scan` (DEAD: every
+# mention outside its own test was a comment or docstring), a full-tree grep, and its own full
+# test suite, then:
+#   WIRED — a real `529-scan)` dispatcher arm now lives in bin/heimdall, so the row here is
+#   removed (a row for a now-reachable name is itself STALE per this file's own rot rule).
+#   Not deleted: it is real, tested capability that bin/lib/pressure_control.py,
+#   bin/heimdall-agent-resume, hooks/heimdall-429-detect.sh and bin/heimdall-session-usage all
+#   cite as the reference overload classifier, and install.sh puts only hmd/heimdall on PATH,
+#   so without an arm no installed operator could run it. Not renewed: nothing names a plan to
+#   wire it — the only statement of the intent is the follow-up note in
+#   docs/analysis/2026-08-25-transcript-529-detection.md, with no branch, plan or commit
+#   behind it in the five weeks since.
+#   NOT DONE, ON PURPOSE: a feed from its output into `heimdall-pressure record`. Its own
+#   header leaves that "to a future caller", `record` is not idempotent (a re-scan would
+#   manufacture a threshold breach out of one real event), and it changes spawn concurrency —
+#   an owner's call, not a side effect of clearing a reachability gate.
+#   heimdall-face-test, the other bin this audit un-hid, is under BY DESIGN above.
+# This section is now empty as the historical record of that audit; the next finding starts
+# a new dated section below it, it does not reuse this one.

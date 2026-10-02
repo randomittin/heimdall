@@ -68,7 +68,7 @@ export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
-unset CLAUDE_SESSION_ID SESSION_ID CLAUDE_CODE_SESSION_ID CLAUDE_CONFIG_DIR
+unset CLAUDE_SESSION_ID SESSION_ID CLAUDE_CODE_SESSION_ID CLAUDE_CONFIG_DIR HMD_AGENT_PROJECTS_DIR
 export HMD_UI_COMPANION_PANELS=0   # L1-L11 only (see "Publishers" above); L12 turns it on for its own server
 FIX="$TMPROOT/fixture-repo"
 mkdir -p "$HOME/.claude" "$FIX"
@@ -218,7 +218,8 @@ _n = [0]
 
 
 def clear():
-    for d in (att._SELECT, att._HEADS, att._EVIDENCE, att._EPISODE):
+    att.SESSION.reset_caches()
+    for d in (att._EVIDENCE, att._EPISODE):
         d.clear()
 
 
@@ -291,9 +292,107 @@ g, root, p = case([tx.entry("end", age=10, text="Which stack?\n\nA) native only\
 check("U5b. options in the closing paragraph lose the question's trailing '?'",
       g["options"] == [{"key": "A", "label": "native only"}, {"key": "B", "label": "native + web"}]
       and g["summary"] == "Which stack?", g)
-g, root, p = case([tx.entry("end", age=10, text="Should I proceed with the migration?")])
-check("U5c. a bare question has a summary and options null (the app keeps its own regex fallback)",
-      g["state"] == "needs_input" and g["summary"] == "Should I proceed with the migration?" and g["options"] is None, g)
+g, root, p = case([tx.entry("end", age=10, text="What should I name the new module?")])
+check("U5c. a bare OPEN question has a summary and options null (nothing enumerated, not yes/no: the phone shows a free-text answer)",
+      g["state"] == "needs_input" and g["summary"] == "What should I name the new module?" and g["options"] is None, g)
+
+# U5d -- Yes/No is attached ONLY to a question that really is yes/no: exactly ONE question, and it is a closed
+# polar one (starts with an auxiliary/modal, optionally after a short lead-in; not "A or B?"; no which/what/how/
+# why/when/where/who). Everything else carries NO options, so the phone shows a free-text answer instead of two
+# buttons that cannot answer it -- an hmd reply that ended in THREE open questions was offered Yes/No.
+YES_NO = [{"key": "yes", "label": "Yes"}, {"key": "no", "label": "No"}]
+OPERATOR_THREE = ("Stop-hook hold: keep 30 min, shorten, or hold only when away? "
+                  "Paths: show ../hmdapp — yes or no? A4: go or hold?")
+POLAR = (
+    ("a single closed polar question", "Should I proceed with the migration?"),
+    ("... after a statement paragraph", "Tests are green on both targets and the tree is clean.\n\nShall I push to origin?"),
+    ("... after a long statement sentence",
+     "The migration touched fourteen tables and three views and I verified every row count twice. Should I push?"),
+    ("... after a short lead-in (em dash)", "Quick check — can I delete the stale worktrees?"),
+    ("... after a short lead-in (spaced hyphen)", "Quick check - can I delete the stale worktrees?"),
+    ("... after a short lead-in (colon)", "Heads up: the gate was red earlier. Is it fine to ship anyway?"),
+    ("... after a short lead-in (commas)", "OK, so, should I push?"),
+    ("... after a lead-in of exactly 8 words", "one two three four five six seven eight — should I push?"),
+    ("... in bold", "**Is the schema change safe to ship?**"),
+    ("... with an explicit yes/no tag (not an 'A or B')", "Have you already rotated the key, yes or no?"),
+    ("... in a negative contraction", "Doesn't the relay client already retry?"),
+    ("... in a negative contraction with a curly apostrophe", "Doesn’t the relay client already retry?"),
+    ("... in the irregular negative contraction", "Won't the gate go red again?"),
+    ("... with a `?` and a space inside an inline code span", "I rewrote the branch.\n\nShould I keep the `cond ? a : b` form?"),
+    ("... with which/or as identifiers inside code spans", "Should I rename `which` to `which_or_what`?"),
+    ("... with a what/which inside a URL", "Should I open https://example.test/run?what=1&which=2 now?"),
+    ("... ending in a URL that ends in the '?'", "Should I open https://example.test/page?"),
+    ("... with a `?` inside a fenced block", "```\nwhy?\n```\n\nCan I apply the patch?"),
+    ("... with a `?` glued inside a token", "Should I rename foo?bar.txt now?"),
+)
+for label, text in POLAR:
+    g, root, p = case([tx.entry("end", age=10, text=text)])
+    check("U5d. %s -> options are exactly Yes/No" % label,
+          g["state"] == "needs_input" and g["kind"] == "question" and g["options"] == YES_NO, [text, g])
+g["options"][0]["label"] = "tampered"
+g["options"].append({"key": "x", "label": "x"})
+g2, root, p = case([tx.entry("end", age=10, text="Should I proceed with the migration?")])
+check("U5d2. each result owns its Yes/No list (a consumer mutating one cannot corrupt the next)",
+      g2["options"] == YES_NO, g2)
+# every auxiliary/modal of the rule opens a closed polar question
+AUX_QUESTIONS = ("Is the tree clean?", "Are the suites green?", "Was the gate green?", "Were the checkpoints committed?",
+                 "Do the docs need an update?", "Does the relay retry?", "Did the sweep pass?", "Can I merge it?",
+                 "Could the cache be stale?", "Should I push?", "Shall we ship?", "Will the gate pass?",
+                 "Would a rebase be cleaner?", "May I delete the branch?", "Might the cache be stale?",
+                 "Have you rotated the key?", "Has the sweep finished?", "Had the tree been clean?",
+                 "Am I right that the gate is green?")
+bad_aux = [t for t in AUX_QUESTIONS
+           if case([tx.entry("end", age=10, text=t)])[0]["options"] != YES_NO]
+check("U5d3. each of is/are/was/were/am/do/does/did/can/could/should/shall/will/would/may/might/have/has/had opens "
+      "a closed polar question -> Yes/No", not bad_aux, bad_aux)
+
+OPEN = (
+    ("THREE open questions (the operator's real reply shape)", OPERATOR_THREE),
+    ("the same three questions, one per line", OPERATOR_THREE.replace("? ", "?\n")),
+    ("the same three questions, one per paragraph", OPERATOR_THREE.replace("? ", "?\n\n")),
+    ("two polar questions", "Is the tree clean? Should I push?"),
+    ("an open question before a polar one", "Which branch is this? Should I push it?"),
+    ("an 'A or B?' question", "Should I keep the old schema or migrate now?"),
+    ("a bare 'A or B?'", "Keep or drop?"),
+    ("an aux-led question that is really 'which'", "Can you tell me which file you meant?"),
+    ("a which question", "Which file should I edit?"),
+    ("a what question", "What should I name it?"),
+    ("a how question", "How do you want to handle the rollback?"),
+    ("a why question", "Why did the gate go red?"),
+    ("a when question", "When should I merge?"),
+    ("a where question", "Where should the config live?"),
+    ("a who question", "Who owns the relay client?"),
+    ("a closed question that does not start with an auxiliary", "Want me to push?"),
+    ("a one-word closed question", "Ship it?"),
+    ("an imperative tagged 'yes or no' (not an aux-led question)", "Paths: show ../hmdapp — yes or no?"),
+    ("a long run-on lead-in is not a short lead-in",
+     "The migration touched fourteen tables and three views and I verified every row count twice, so should I push?"),
+    ("a lead-in of 9 words (one over the limit)", "one two three four five six seven eight nine — should I push?"),
+    ("an earlier QUOTED question plus a polar one", 'You asked "is it done?" earlier. Should I push?'),
+)
+for label, text in OPEN:
+    g, root, p = case([tx.entry("end", age=10, text=text)])
+    check("U5e. %s -> state needs_input, options null (free-text answer)" % label,
+          g["state"] == "needs_input" and g["kind"] == "question" and g["options"] is None, [text, g])
+
+g, root, p = case([tx.entry("end", age=10, text="Pick one:\n\nA) alpha\nB) beta\n\nShould I go with A?")])
+check("U5f. enumerated options keep their parsed options even when the closing line is itself a polar question",
+      g["options"] == [{"key": "A", "label": "alpha"}, {"key": "B", "label": "beta"}], g)
+g, root, p = case([tx.entry("end", age=10, text="Here are the two ways to land it:\n\n1. Squash\n2. Rebase\n\nShould I use the first?")])
+check("U5g. a numbered list keeps its parsed options, never Yes/No",
+      g["options"] == [{"key": "1", "label": "Squash"}, {"key": "2", "label": "Rebase"}], g)
+g, root, p = case([tx.entry("end", age=10, text="Pick:\n\nA) alpha\nA) again\n\nShould I go?")])
+check("U5h. an enumeration that cannot be represented (duplicate keys) -> options null, NOT a Yes/No stand-in",
+      g["options"] is None, g)
+
+settled_three = [tx.entry("prompt", age=300), tx.entry("end", age=200, text=OPERATOR_THREE.rstrip("?") + ". Tell me."),
+                 tx.entry("turn", age=199.9)]
+g, root, p = case(settled_three)
+check("U5i. the same three questions closed by a statement (text no longer ends in '?') -> idle/stopped, no summary, no options",
+      g["state"] == "idle" and g["kind"] == "stopped" and g["summary"] is None and g["options"] is None, g)
+g, root, p = case([tx.entry("end", age=10, text="Should I push (yes/no)")])
+check("U5j. a polar question with no closing '?' is not a question at all: not needs_input, no options",
+      g["state"] != "needs_input" and g["options"] is None, g)
 
 # U6 -- idle: stopped / done
 settled = [tx.entry("prompt", age=300), *tx.pair(age=250), tx.entry("end", age=200, text="All done."),
@@ -383,6 +482,9 @@ check("U11. a secret-shaped question -> summary null, state still needs_input/qu
 g, root, p = case([tx.entry("end", age=5, text="Pick a credential:\n\nA) %s\nB) none\n\nWhich one?" % secret)])
 check("U11b. a secret-shaped option label -> options null, the clean summary survives",
       g["options"] is None and g["summary"] == "Which one?", g)
+g, root, p = case([tx.entry("end", age=5, text="Is %s the right token to use?" % secret)])
+check("U11c. a secret-shaped polar question gets NO Yes/No either (hmd-question is dropped for it, so the phone could not even show what Yes/No answers)",
+      g["state"] == "needs_input" and g["options"] is None, g)
 
 # U12 -- caps
 long_q = ("This is a fairly long preamble sentence that keeps going and going. " * 6) \
@@ -404,7 +506,39 @@ check("U12e. a 100-char label is cut to exactly 80 chars with an ellipsis",
 check("U12f. turn must be a non-negative int (bool and negatives -> null)",
       run(root, turn=True)["turn"] is None and run(root, turn=-1)["turn"] is None and run(root, turn=0)["turn"] == 0)
 
-# U13 -- which transcript
+# U13 -- strip leading markdown markers from summary
+g, root, p = case([tx.entry("end", age=5, text="- Do you want to proceed?")])
+check("U13. dash list marker stripped: '- text' -> 'text'", g["summary"] == "Do you want to proceed?", g)
+g, root, p = case([tx.entry("end", age=5, text="* What should I do next?")])
+check("U13b. asterisk list marker stripped: '* text' -> 'text'", g["summary"] == "What should I do next?", g)
+g, root, p = case([tx.entry("end", age=5, text="+ Should I merge this?")])
+check("U13c. plus list marker stripped: '+ text' -> 'text'", g["summary"] == "Should I merge this?", g)
+g, root, p = case([tx.entry("end", age=5, text="• Will this work?")])
+check("U13d. bullet marker stripped: '• text' -> 'text'", g["summary"] == "Will this work?", g)
+g, root, p = case([tx.entry("end", age=5, text="1. Do you agree?")])
+check("U13e. numbered list with period stripped: '1. text' -> 'text'", g["summary"] == "Do you agree?", g)
+g, root, p = case([tx.entry("end", age=5, text="12) Should I continue?")])
+check("U13f. numbered list with paren stripped: '12) text' -> 'text'", g["summary"] == "Should I continue?", g)
+g, root, p = case([tx.entry("end", age=5, text="> What about this?")])
+check("U13g. blockquote marker stripped: '> text' -> 'text'", g["summary"] == "What about this?", g)
+g, root, p = case([tx.entry("end", age=5, text="# Is this good?")])
+check("U13h. single hash heading marker stripped: '# text' -> 'text'", g["summary"] == "Is this good?", g)
+g, root, p = case([tx.entry("end", age=5, text="## Ready to ship?")])
+check("U13i. double hash heading marker stripped: '## text' -> 'text'", g["summary"] == "Ready to ship?", g)
+g, root, p = case([tx.entry("end", age=5, text="**Should we proceed?")])
+check("U13j. bold wrapper stripped: '**text' -> 'text'", g["summary"] == "Should we proceed?", g)
+g, root, p = case([tx.entry("end", age=5, text="__What do you think?")])
+check("U13k. italic wrapper stripped: '__text' -> 'text'", g["summary"] == "What do you think?", g)
+g, root, p = case([tx.entry("end", age=5, text="> - **Which option?**")])
+check("U13l. nested markers stripped repeatedly: '> - **text**' -> 'text'", g["summary"] == "Which option?", g)
+g, root, p = case([tx.entry("end", age=5, text="Plain text without markers?")])
+check("U13m. no markers (control case): 'plain text' -> 'plain text'", g["summary"] == "Plain text without markers?", g)
+g, root, p = case([tx.entry("end", age=5, text="   - Whitespace before marker?")])
+check("U13n. whitespace before marker is trimmed first: '   - text' -> 'text'", g["summary"] == "Whitespace before marker?", g)
+g, root, p = case([tx.entry("end", age=5, text="-> Still a question?")])
+check("U13o. dash without space after is NOT stripped (not a list marker): '-> text' -> '-> text'", g["summary"] == "-> Still a question?", g)
+
+# U15 -- which transcript
 root, pdir, p_cli = newroot()
 sid_sdk = "bbbbbbbb-0000-4000-8000-000000000002"
 p_sdk = os.path.join(pdir, sid_sdk + ".jsonl")
@@ -414,16 +548,16 @@ now = time.time()
 os.utime(p_cli, (now - 100, now - 100))
 os.utime(p_sdk, (now - 10, now - 10))
 clear()
-check("U13. a NEWER headless (sdk-*) transcript does not displace the interactive one", run(root)["state"] == "needs_input")
+check("U15. a NEWER headless (sdk-*) transcript does not displace the interactive one", run(root)["state"] == "needs_input")
 os.environ["CLAUDE_CODE_SESSION_ID"] = sid_sdk
 clear()
-check("U13b. a pinned session id (env) wins over recency", run(root)["state"] == "working")
+check("U15b. a pinned session id (env) wins over recency", run(root)["state"] == "working")
 del os.environ["CLAUDE_CODE_SESSION_ID"]
 os.remove(p_cli)
 clear()
-check("U13c. with only headless transcripts, the newest is used", run(root)["state"] == "working")
+check("U15c. with only headless transcripts, the newest is used", run(root)["state"] == "working")
 
-# U14 -- cost bounds
+# U16 -- cost bounds
 BYTES = [0]
 OPENS = [0]
 real_open = builtins.open
@@ -461,7 +595,7 @@ att.open = counting_open
 BYTES[0] = OPENS[0] = 0
 run(root)
 del att.open
-check("U14. an unchanged transcript costs zero reads (stat-keyed evidence + cached selection)", BYTES[0] == 0 and OPENS[0] == 0, [BYTES[0], OPENS[0]])
+check("U16. an unchanged transcript costs zero reads (stat-keyed evidence + cached selection)", BYTES[0] == 0 and OPENS[0] == 0, [BYTES[0], OPENS[0]])
 
 root, pdir, p = newroot()
 line = (json.dumps(tx.entry("tool_use", age=1000, tid="tbig", tool_input={"command": "x" * 350})) + "\n").encode()
@@ -477,7 +611,7 @@ t0 = time.perf_counter()
 g = run(root)
 dt = time.perf_counter() - t0
 del att.open
-check("U14b. a 50 MB transcript: correct state, %.0f ms, %d KiB read (<= 5 MiB, < 1 s)" % (dt * 1000, BYTES[0] // 1024),
+check("U16b. a 50 MB transcript: correct state, %.0f ms, %d KiB read (<= 5 MiB, < 1 s)" % (dt * 1000, BYTES[0] // 1024),
       os.path.getsize(p) > 50 * 1024 * 1024 and g["state"] == "needs_input" and g["summary"] == "Merge it?"
       and dt < 1.0 and BYTES[0] <= 5 * 1024 * 1024, [g, dt, BYTES[0]])
 
@@ -491,10 +625,10 @@ t0 = time.perf_counter()
 g = run(root)
 dt = time.perf_counter() - t0
 del att.open
-check("U14c. one 10 MiB final line: reads stay inside the 4 MiB window cap (+ head probe), result is the default shape",
+check("U16c. one 10 MiB final line: reads stay inside the 4 MiB window cap (+ head probe), result is the default shape",
       g == DEFAULT and dt < 1.0 and BYTES[0] <= 5 * 1024 * 1024, [g, dt, BYTES[0]])
 
-# U15 -- the wire shape, over everything collected above
+# U17 -- the wire shape, over everything collected above
 problems = []
 for g in SEEN:
     if sorted(g) != sorted(DEFAULT):
@@ -512,8 +646,8 @@ for g in SEEN:
         problems.append(("options", g))
     elif g["turn"] is not None and not isinstance(g["turn"], int):
         problems.append(("turn", g))
-check("U15. all %d collected results have exactly the 7 documented keys, enum values, and caps" % len(SEEN), not problems, problems[:2])
-check("U15b. the five documented states are all reachable (%s)" % ",".join(sorted({g["state"] for g in SEEN})),
+check("U17. all %d collected results have exactly the 7 documented keys, enum values, and caps" % len(SEEN), not problems, problems[:2])
+check("U17b. the five documented states are all reachable (%s)" % ",".join(sorted({g["state"] for g in SEEN})),
       {g["state"] for g in SEEN} == set(att.STATES))
 
 sys.exit(1 if FAILED[0] else 0)
@@ -653,8 +787,8 @@ txa end --text "Shall I ship it now?"; poke
 att_is "L5a. stop-with-question -> {needs_input, question}" needs_input '"question"'
 exactly_frames "L5b. SSE: exactly one new frame for working -> needs_input" 3
 curl -s -o "$BODY" "$STATE_URL"
-if jq -e '.attention.summary == "Shall I ship it now?" and .attention.options == null and (.attention.id != null) and (.attention.since | type) == "number"' "$BODY" >/dev/null 2>&1; then
-  ok "L5c. needs_input carries the question as its summary, options null, a fresh id and a numeric since"
+if jq -e '.attention.summary == "Shall I ship it now?" and .attention.options == [{"key":"yes","label":"Yes"},{"key":"no","label":"No"}] and (.attention.id != null) and (.attention.since | type) == "number"' "$BODY" >/dev/null 2>&1; then
+  ok "L5c. needs_input carries the question as its summary, Yes/No for a single closed polar question, a fresh id and a numeric since"
 else
   bad "L5c. needs_input payload wrong: $(jq -c .attention "$BODY")"
 fi

@@ -9,7 +9,8 @@ One additive top-level key, inside the SSE digest (sentinels/hmd-ui.py registers
                   "since":   <epoch s> | null,      # the transition's own timestamp
                   "kind":    null|"question"|"permission"|"done"|"stopped"|"error",
                   "summary": null | <= 160-char single line (secret_shaped -> null, field only),
-                  "options": null | [{"key","label"}]  (<= 8 entries, label <= 80 chars),
+                  "options": null | [{"key","label"}]  (<= 8 entries, label <= 80 chars; the question's
+                             enumerated lines, else [yes, no] for ONE closed polar question, else null),
                   "turn":    parallelism.turns | null}
 
 No evidence at all -> {"state":"idle","id":null,"since":null,"kind":null,"summary":null,
@@ -39,6 +40,9 @@ HOW EACH STATE IS REACHED (the newest decisive entry decides):
   working         a prompt / tool_result / tool_use / mid-message assistant entry.
   needs_input     a settled-or-not assistant end_turn whose text ends in `?` (the inbox's own rule,
                   bin/heimdall-inbox-deliver is_question), or a pending AskUserQuestion tool call.
+                  `options` there: the text's enumerated lines when it has them; else Yes/No ONLY when
+                  the text asks exactly one question and it is a closed polar one (_closed_polar_question);
+                  else null, so a reply that ends in several open questions gets a free-text answer.
   needs_approval  a tool call with no result for longer than that tool can still be RUNNING
                   (Bash: its own timeout + hook margin, default 180 s; fast tools 20 s; other
                   tools 120 s; Agent/Task never), skipped when the newest permission-mode is
@@ -52,10 +56,11 @@ HOW EACH STATE IS REACHED (the newest decisive entry decides):
                   staleness stands in for it (every state, including needs_*, ages out).
 `kind: "error"` is never emitted (the handoff defines no trigger for it).
 
-Session choice: CLAUDE_SESSION_ID / SESSION_ID / CLAUDE_CODE_SESSION_ID when it names an existing
-transcript (same precedence as hmd-ui's identity.session_code), else the newest top-level
-*.jsonl, preferring one whose entrypoint is not `sdk*` (hmd's own headless judge/dream sessions
-write transcripts into the same directory and would otherwise flap the state).
+Session choice: bin/lib/hmd_session_resolve.py, the ONE rule every hmd-ui collector shares -- an
+inherited CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / SESSION_ID only when it names a transcript
+under THIS repo's own project dir, else the newest top-level *.jsonl whose entrypoint is not
+`sdk*` (hmd's own headless judge/dream sessions write transcripts into the same directory and
+would otherwise flap the state).
 
 Stdlib only. Self-contained: secret_shaped is ported (companion_ui_inbox.py:94-111), not imported.
 """
@@ -64,8 +69,14 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import hmd_session_resolve as SESSION  # noqa: E402
 
 STATES = ("working", "needs_input", "needs_approval", "idle", "ended")
 KINDS = ("question", "permission", "done", "stopped", "error")
@@ -74,9 +85,6 @@ OPTIONS_MAX = 8
 LABEL_MAX = 80
 
 TAIL_WINDOWS = (64 * 1024, 512 * 1024, 4 * 1024 * 1024)
-HEAD_BYTES = 64 * 1024         # entrypoint probe of a candidate transcript
-PROBE_LIMIT = 12               # newest candidates probed for a non-headless entrypoint
-DIR_SCAN_TTL_S = 2.0
 
 ENDED_AFTER_S = 6 * 3600
 SETTLE_S = 30.0                # a terminal entry with no turn_duration after it counts as settled
@@ -123,8 +131,6 @@ def secret_shaped(v):
 
 
 _LOCK = threading.RLock()
-_SELECT = {}      # (project dirs, pinned session) -> (monotonic, transcript path | None)
-_HEADS = {}       # transcript path -> entrypoint (a session file's entrypoint never changes)
 _EVIDENCE = {}    # transcript path -> ((mtime_ns, size), evidence)
 _EPISODE = {}     # transcript path -> {"state", "anchor"} of the last derivation
 
@@ -135,8 +141,7 @@ def empty():
 
 
 # ── transcript discovery ──────────────────────────────────────────────────────────────────────
-_SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_TS_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(?:Z|[+-]00:?00)?$")
+_TS_RE =re.compile(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(?:Z|[+-]00:?00)?$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -149,100 +154,6 @@ def _parse_ts(value):
     except (ValueError, OverflowError):
         return None
     return whole + (float("0." + m.group(7)) if m.group(7) else 0.0)
-
-
-def _claude_dir():
-    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-
-
-def _project_dirs(root):
-    base = os.path.join(_claude_dir(), "projects")
-    dirs = []
-    for p in (root, os.path.realpath(root)):
-        d = os.path.join(base, re.sub(r"[^A-Za-z0-9]", "-", p))
-        if d not in dirs:
-            dirs.append(d)
-    return tuple(dirs)
-
-
-def _pinned_session():
-    for name in ("CLAUDE_SESSION_ID", "SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
-        v = os.environ.get(name)
-        if v and _SID_RE.match(v):
-            return v
-    return None
-
-
-def _entrypoint(path):
-    cached = _HEADS.get(path)
-    if cached is not None:
-        return cached
-    try:
-        with open(path, "rb") as f:
-            head = f.read(HEAD_BYTES)
-    except OSError:
-        return None
-    for raw in head.split(b"\n"):
-        if b'"entrypoint"' not in raw:
-            continue
-        try:
-            obj = json.loads(raw)
-        except ValueError:
-            continue
-        ep = obj.get("entrypoint") if isinstance(obj, dict) else None
-        if isinstance(ep, str):
-            if len(_HEADS) > 256:
-                _HEADS.clear()
-            _HEADS[path] = ep
-            return ep
-    return None
-
-
-def _headless(path):
-    ep = _entrypoint(path)
-    return ep is not None and ep.startswith("sdk")
-
-
-def _pick(dirs, pin, denied):
-    if pin:
-        for d in dirs:
-            p = os.path.join(d, pin + ".jsonl")
-            if os.path.isfile(p) and not (denied and denied(p)):
-                return p
-    cands = []
-    for d in dirs:
-        try:
-            it = os.scandir(d)
-        except OSError:
-            continue
-        with it:
-            for e in it:
-                if not e.name.endswith(".jsonl") or e.name.startswith("."):
-                    continue
-                try:
-                    if e.is_file():
-                        cands.append((e.stat().st_mtime_ns, e.path))
-                except OSError:
-                    continue
-    cands = [c for c in cands if not (denied and denied(c[1]))]
-    cands.sort(reverse=True)
-    for _, p in cands[:PROBE_LIMIT]:
-        if not _headless(p):
-            return p
-    return cands[0][1] if cands else None
-
-
-def _select(root, denied):
-    dirs = _project_dirs(root)
-    pin = _pinned_session()
-    key = (dirs, pin)
-    now = time.monotonic()
-    hit = _SELECT.get(key)
-    if hit is not None and now - hit[0] < DIR_SCAN_TTL_S:
-        return hit[1]
-    path = _pick(dirs, pin, denied)
-    _SELECT[key] = (now, path)
-    return path
 
 
 # ── tail scan ─────────────────────────────────────────────────────────────────────────────────
@@ -427,9 +338,37 @@ def _paragraph_options(par):
     return None
 
 
+def _strip_markers(line):
+    """Strip leading markdown markers: list/heading/blockquote/bold/italic wrappers.
+    Strips repeatedly until none remain (e.g. '> - **A4**' -> 'A4').
+    Returns stripped line after whitespace trimming."""
+    line = line.strip()
+    while True:
+        old = line
+        # Strip blockquote marker
+        line = re.sub(r'^>\s*', '', line)
+        # Strip heading hashes (##+ or #)
+        line = re.sub(r'^#+\s*', '', line)
+        # Strip list markers: - * + • (require space after marker)
+        line = re.sub(r'^[-*+•]\s+', '', line)
+        # Strip numbered list markers: 1. 12) etc (1-99, require space after)
+        line = re.sub(r'^\d{1,2}[.)]\s+', '', line)
+        # Strip bold/italic wrappers at start and end
+        line = re.sub(r'^(\*\*|__)', '', line)
+        line = re.sub(r'(\*\*|__)$', '', line)
+        # If nothing changed, we're done
+        if line == old:
+            break
+        line = line.strip()
+    return line
+
+
 def _summarise(paragraph):
     line = " ".join(_CONTROL_RE.sub(" ", paragraph).split())
     if not line or secret_shaped(line):
+        return None
+    line = _strip_markers(line)
+    if not line:
         return None
     if len(line) > SUMMARY_MAX:
         line = _SENTENCE_SPLIT.split(line)[-1]
@@ -444,6 +383,62 @@ def _question_paragraph(text):
     return (prose or paras or [""])[-1]
 
 
+# Yes/No is attached ONLY to a question that really is yes/no: exactly ONE question, and a closed polar one.
+# Anything else carries no options, so the phone shows a free-text answer instead of two buttons that cannot
+# answer it. Every pattern is linear: this runs on assistant-authored text on each state request.
+YES_NO = ({"key": "yes", "label": "Yes"}, {"key": "no", "label": "No"})   # the app's own keys (hmdapp parse.ts)
+LEAD_IN_MAX_WORDS = 8          # "Quick check — can I ...?": a SHORT lead-in may precede the auxiliary
+
+_FENCE_RE = re.compile(r"```.*?(?:```|\Z)", re.S)
+_CODE_SPAN_RE = re.compile(r"`[^`\n]*`")
+_URL_RE = re.compile(r"https?://[^\s<>()\[\]]+")
+_QUESTION_END_RE = re.compile(r"\?[\"')\]}*_~»”’]*(?=\s|\Z)")      # a "?" that ends a question, not one inside a token
+_SENTENCE_BREAK_RE = re.compile(r"\n+|(?<=[.!…])\s+")
+_LEAD_IN_RE = re.compile(r"[:;,—–]|(?<=\s)-(?=\s)")
+_LEAD_JUNK = " \t>#*_~+-\"“‘'(["
+_POLAR_START_RE = re.compile(r"(?:is|are|was|were|am|do|does|did|can|could|should|shall|will|would|may|might|"
+                             r"have|has|had)(?:n't)?\b|won't\b", re.IGNORECASE)
+_YES_NO_TAG_RE = re.compile(r"\b(?:yes|no)\s*(?:/|or)\s*(?:yes|no)\b", re.IGNORECASE)
+_OPEN_WORD_RE = re.compile(r"\b(?:which|what|how|why|when|where|who|whom|whose|or)\b", re.IGNORECASE)
+
+
+def _mask_url(m):
+    url = m.group(0)
+    return "X" + url[len(url.rstrip(".,;:!?'\"")):]
+
+
+def _polar_body(sentence):
+    """`sentence`, or what follows a SHORT lead-in inside it, when that starts with an auxiliary/modal."""
+    s = sentence.lstrip(_LEAD_JUNK)
+    if _POLAR_START_RE.match(s):
+        return s
+    for m in _LEAD_IN_RE.finditer(s):
+        if len(s[:m.start()].split()) > LEAD_IN_MAX_WORDS:
+            return None
+        rest = s[m.end():].lstrip(_LEAD_JUNK)
+        if _POLAR_START_RE.match(rest):
+            return rest
+    return None
+
+
+def _closed_polar_question(text):
+    """True when `text` asks exactly ONE question and it is a closed polar one: the closing sentence starts with
+    an auxiliary/modal (optionally after a short lead-in), is no "A or B?", no which/what/how/why/when/where/who
+    question, and an explicit "yes or no" tag does not make it an "A or B". `?` inside code, URLs or a token
+    does not count as a question. A secret-shaped text never gets an answer button: hmd-question is dropped
+    for it, so the phone could not show what Yes/No would be answering."""
+    if secret_shaped(text):
+        return False
+    t = _URL_RE.sub(_mask_url, _CODE_SPAN_RE.sub("X", _FENCE_RE.sub("\n", text)))
+    t = t.replace("’", "'").strip().rstrip("*_`~ \t\r\n")
+    if not t.endswith("?") or len(_QUESTION_END_RE.findall(t)) != 1:
+        return False
+    body = _polar_body(_SENTENCE_BREAK_RE.split(t.rstrip("?"))[-1])
+    if body is None:
+        return False
+    return not _OPEN_WORD_RE.search(_YES_NO_TAG_RE.sub(" ", body))
+
+
 def _make_options(text):
     paras = _paragraphs(text)
     for i, par in enumerate(paras):
@@ -451,7 +446,7 @@ def _make_options(text):
         if found:
             break
     else:
-        return None
+        return [dict(o) for o in YES_NO] if _closed_polar_question(text) else None
     if i == len(paras) - 1 and found[-1]["label"].endswith("?"):
         found[-1]["label"] = found[-1]["label"][:-1].strip()
     keys = [o["key"] for o in found]
@@ -580,7 +575,8 @@ def collect(root, turn=None, sweep_receipt=None, checkpoint=None, quality_gate=N
     out = empty()
     try:
         with _LOCK:
-            path = _select(root, denied)
+            session = SESSION.resolve(root, denied=denied)
+            path = session.path if session is not None else None
             if path is None:
                 return out
             st = os.stat(path)

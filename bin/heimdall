@@ -2941,6 +2941,36 @@ case "${1:-}" in
     fi
     exec "$QUOTA_ADVISOR_BIN" "$@"
     ;;
+  529-scan)
+    # Pass-through to bin/heimdall-529-scan: a READ-ONLY scan of this repo's
+    # Claude Code session transcripts for real API-overload / connection-reset
+    # records, keyed on the structural isApiErrorMessage/apiErrorStatus fields
+    # Claude Code itself writes (never a regex over prose — see that bin's own
+    # header and docs/analysis/2026-08-25-transcript-529-detection.md). It
+    # answers a human's "was that agent death an overload?"; it deliberately
+    # NEVER feeds heimdall-pressure's AIMD controller (its stated non-goal:
+    # recording is not idempotent, so that feed is a separate decision, not
+    # something a dispatcher arm should make by accident). Its only mentions
+    # elsewhere were comments and docstrings, so heimdall-deadcode reported it
+    # DEAD and its bin/lib/reachability-exemptions.tsv row expired 2026-09-27;
+    # and because install.sh puts only `hmd`/`heimdall` on PATH, an installed
+    # operator could not run it at all — typing `hmd 529-scan` fell through to
+    # the goal-driven task prompt below (a real `claude -p` spawn), the same gap
+    # `redum)`/`quota-advisor)` above exist to close. The tool requires a verb
+    # and, by its never-fails contract, exits 0 SILENTLY when given none, so a
+    # bare `hmd 529-scan` defaults to `scan` rather than looking like a no-op.
+    # Every explicit arg list forwards verbatim, so a routed run and a direct
+    # bin run are byte-identical; only the bare, no-arg call differs.
+    shift
+    SCAN_529_BIN="$PLUGIN_DIR/bin/heimdall-529-scan"
+    if [ ! -x "$SCAN_529_BIN" ]; then
+      echo "  Error: heimdall-529-scan not found at $SCAN_529_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    [ "$#" -gt 0 ] || set -- scan
+    exec "$SCAN_529_BIN" "$@"
+    ;;
   delivery-audit)
     # Pass-through to bin/heimdall-delivery-audit (delivery-claim falsifier — makes
     # "queued"/"landed"/"running now" claims checkable: dead-on-arrival reachability
