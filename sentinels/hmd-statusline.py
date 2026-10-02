@@ -68,9 +68,26 @@ WALL = _load("hmd_wall")          # import hmd_wall — the repo wall reader (re
 CAPS = TC.detect(sys.argv)
 USE_COLOR = CAPS.use_color()
 def _c(s): return s if USE_COLOR else ""
+
+# ── HOST BOUNDARY (`--host-boundary`, passed only by bin/heimdall-statusline) ──────────────
+# The wrapper used to correct the host's payload AROUND this process with three more python
+# launches — a render_width_chars probe, a Cursor host-label normalizer, a CTX-honesty
+# post-process of the rendered rows: ~210ms of a ~750ms render for corrections this process
+# already had the parsed JSON for. They run here now, in the one interpreter the render
+# launches anyway (see resolve_cols / _apply_host_boundary / _ctx_unavailable_row below),
+# with the shell code's exact precedence. OFF unless the flag is present: every suite that
+# drives this renderer directly keeps its legacy contract ($COLUMNS - reserve, "CTX 0%",
+# the "Claude" default) — the corrections are the WRAPPER's boundary, not the renderer's.
+HOST_BOUNDARY = "--host-boundary" in sys.argv
+_CTX_UNAVAILABLE = False   # set by _apply_host_boundary when used_percentage is null/absent
+_STDIN_RAW = ""            # the raw payload text, for the Cursor probe's substring gate
+
 def _write(s):
     # single choke point: every render path emits through the tier downgrade.
-    sys.stdout.write(CAPS.emit(s))
+    out = CAPS.emit(s)
+    if _CTX_UNAVAILABLE:
+        out = _ctx_unavailable_row(out)
+    sys.stdout.write(out)
 
 # palette (empty in no-color mode → f-strings render as plain text)
 CY=_c("\033[38;2;34;211;238m"); GR=_c("\033[38;2;34;197;94m"); RD=_c("\033[38;2;239;68;68m")
@@ -183,10 +200,12 @@ def _sigil_rows(seed, eye):
 def read_stdin():
     """Return (data|None). None means empty OR malformed stdin (→ the ⛭ HEIMDALL
     fallback). A valid but empty `{}` returns {} (→ the full null-safe render)."""
+    global _STDIN_RAW
     try:
         raw = sys.stdin.read()
     except Exception:
         return None
+    _STDIN_RAW = raw
     if not raw or not raw.strip():
         return None
     try:
