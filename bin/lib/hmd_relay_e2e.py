@@ -60,6 +60,29 @@ these by name):
   nonce_for_seq(seq: int, sender: str) -> bytes[12]
   seal(key, seq, sender, plaintext: bytes, aad: bytes = b"") -> (nonce_b64, ciphertext_b64)
   open_(key, seq, sender, nonce_b64, ciphertext_b64, aad: bytes = b"") -> bytes
+  hmd_caps() -> list[str]
+  normalize_caps(value) -> frozenset[str]
+  compress_envelope(plaintext: bytes) -> bytes
+  pack_plaintext(plaintext: bytes, caps, min_bytes: int = COMPRESS_MIN_BYTES) -> bytes
+  unpack_plaintext(plaintext: bytes, max_bytes: int = MAX_INFLATED_BYTES) -> bytes
+  canonical_state_json(state) -> str
+  state_digest(state) -> str
+
+FRAME COMPRESSION, CAPABILITIES, RESYNC DIGEST (the FINAL wire of hmdapp's
+docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md Ask 5; hmdapp's
+docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with it)
+Compression happens BEFORE seal -- ciphertext is incompressible -- and is a framing step on the
+plaintext, not part of the AEAD: seal()/open_() never see it. A sealed `state` plaintext is either
+    {"state": {...}, "caps": [...]}                             plain -- what every app reads
+    {"z":"zlib","d":"<standard base64 of zlib.compress(P)>"}  P = the plain plaintext above
+The envelope is produced only when the phone's most recent `resync` command listed "z-zlib"
+(pack_plaintext's `caps`), the frame is at least COMPRESS_MIN_BYTES long and the envelope is
+genuinely smaller. hmd's own tokens ride in EVERY state frame's `caps` (hmd_caps()).
+unpack_plaintext() is the inverse, with the app's hard output cap (MAX_INFLATED_BYTES) and strict
+about everything the spec calls malformed -- the reference decoder for anything on the hmd side that
+ever reads a compressed frame, and what test/hmd-relay-zlib-frames.test.sh decodes with.
+state_digest() is the resync digest (spec 5.4): sha256 of the state object's canonical JSON, an
+integral float hashed as the int it is.
 
 FAIL-CLOSED BY DESIGN
 e2e_available() is the ONE function in this module allowed to swallow an
@@ -77,8 +100,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import secrets
 import sys
+
+try:
+    import zlib
+except ImportError:  # a python3 built without zlib: frames are simply never compressed
+    zlib = None
 
 
 class E2EError(Exception):
@@ -442,6 +471,155 @@ def open_(key: bytes, seq: int, sender: str, nonce_b64: str, ciphertext_b64: str
     if not hmac.compare_digest(tag, expected_tag):
         raise E2EError("open_: authentication tag mismatch")
     return _chacha20_encrypt(key, 1, expected_nonce, ciphertext)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Frame compression, capabilities and the resync digest -- the FINAL wire of hmdapp's
+# docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md Ask 5 (see FRAME COMPRESSION in the module docstring).
+# Plaintext framing around seal()/open_(); no key material here.
+# ─────────────────────────────────────────────────────────────────────────
+
+CAP_ZLIB = "z-zlib"    # capability token: this side can emit / read the {"z":"zlib","d":...} envelope
+CAP_RESYNC = "resync"  # capability token: hmd understands the phone's `resync` command
+ENC_ZLIB = "zlib"      # the envelope's `z` value: zlib.compress output, RFC 1950 (header + Adler-32)
+# Level 1, as the spec's own reference encoder ("the measured choice"): on the real state frames
+# measured (22 KB from this repo, 103 KB from hmdapp) it gives 40.7% / 8.3% of the plaintext in
+# ~0.4 ms; level 6 trims 4 / 1.3 points more for 2-3x the time. The level never reaches the wire:
+# any level yields a stream every decoder reads.
+ZLIB_LEVEL = 1
+# Below this a frame is sent plain -- the spec's reference threshold ("should [send plain] for small
+# ones"): the saving is under a kilobyte, less than one HTTP request's headers, and the receiver
+# would still pay an inflate and a second parse for it. Every real state frame is ~10 KB or more
+# (the hooks slice alone is 8.7 KB).
+COMPRESS_MIN_BYTES = 2048
+# The most a compressed frame may inflate to: the app's own cap (spec 5.2) and ours. pack_plaintext
+# never compresses a frame longer than this, so the app never has to refuse one, and
+# unpack_plaintext never returns more. ~20x the largest real state frame measured, while a zlib bomb
+# (1000:1) would otherwise turn a 1 MiB envelope into a gigabyte.
+MAX_INFLATED_BYTES = 2 * 1024 * 1024
+MAX_CAPS = 32  # at most this many entries of an advertised capability list are read
+MAX_CAP_LEN = 32
+
+
+def hmd_caps() -> list:
+    """The capability tokens hmd lists in EVERY state frame's wrapper (`{"state": ..., "caps": [...]}`,
+    spec 5.1): `resync` always -- the relay client answers the phone's resync command -- and `z-zlib`
+    only when this python can really compress. Sorted, as in the spec's examples."""
+    return sorted([CAP_RESYNC] + ([CAP_ZLIB] if zlib is not None else []))
+
+
+def normalize_caps(value) -> frozenset:
+    """The capability set a phone advertised: the string entries of a JSON array, nothing else; a
+    token this code does not know is just never acted on. Absent, null, a bare string, an object, a
+    number -- all the EMPTY set, never an error and never a guess, so a phone that says nothing is
+    treated as the oldest one and gets plain frames."""
+    if not isinstance(value, (list, tuple)):
+        return frozenset()
+    return frozenset(c for c in value[:MAX_CAPS] if isinstance(c, str) and 0 < len(c) <= MAX_CAP_LEN)
+
+
+def compress_envelope(plaintext: bytes) -> bytes:
+    """The spec 5.2 envelope for `plaintext`, unconditionally:
+    `{"z":"zlib","d":"<standard base64 of zlib.compress(plaintext, ZLIB_LEVEL)>"}`, compact JSON.
+    pack_plaintext decides WHETHER to send it; this is the encoding itself, what the vectors pin."""
+    if zlib is None:
+        raise E2EError("compress_envelope: this python has no zlib")
+    data = base64.b64encode(zlib.compress(plaintext, ZLIB_LEVEL)).decode("ascii")
+    return json.dumps({"z": ENC_ZLIB, "d": data}, separators=(",", ":")).encode("ascii")
+
+
+def pack_plaintext(plaintext: bytes, caps, min_bytes: int = COMPRESS_MIN_BYTES) -> bytes:
+    """The bytes to seal for `plaintext` (the plain JSON of a state frame): the envelope
+    `{"z":"zlib","d":"<base64 of zlib.compress(plaintext)>"}` when `caps` -- the phone's capability
+    set, a set/list/tuple of tokens -- holds "z-zlib", `plaintext` is at least `min_bytes` and at
+    most MAX_INFLATED_BYTES long, and the envelope is strictly smaller than it -- otherwise
+    `plaintext` itself, unchanged, which is what every phone reads."""
+    if zlib is None or not isinstance(caps, (set, frozenset, list, tuple)) or CAP_ZLIB not in caps:
+        return plaintext
+    if not min_bytes <= len(plaintext) <= MAX_INFLATED_BYTES:
+        return plaintext
+    envelope = compress_envelope(plaintext)
+    return envelope if len(envelope) < len(plaintext) else plaintext
+
+
+def _is_envelope(blob: bytes) -> bool:
+    """True when `blob` is a JSON object with a top-level "z" key (a nested "z" is data)."""
+    try:
+        obj = json.loads(blob)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(obj, dict) and "z" in obj
+
+
+def unpack_plaintext(plaintext: bytes, max_bytes: int = MAX_INFLATED_BYTES) -> bytes:
+    """Inverse of pack_plaintext: the inner plaintext of an envelope, `plaintext` itself when it is
+    not one (not JSON, not an object, no top-level "z"). Fails closed with E2EError on everything
+    spec 5.2 calls malformed -- a `z` other than "zlib", a missing or non-string `d`, `d` that is not
+    standard base64 of a COMPLETE zlib stream (header and checksum included, nothing after it), an
+    empty or longer-than-`max_bytes` result, or an envelope inside the envelope (one level only).
+    The inflate is bounded by `max_bytes` + 1 as it runs, so a bomb costs at most that much memory,
+    never its full size."""
+    try:
+        obj = json.loads(plaintext)
+    except (ValueError, RecursionError):
+        return plaintext
+    if not isinstance(obj, dict) or "z" not in obj:
+        return plaintext
+    if obj["z"] != ENC_ZLIB:
+        raise E2EError(f"unpack_plaintext: unsupported frame encoding z={obj['z']!r}")
+    data = obj.get("d")
+    if not isinstance(data, str) or not data:
+        raise E2EError("unpack_plaintext: z=zlib frame without a string `d`")
+    if zlib is None:
+        raise E2EError("unpack_plaintext: this python has no zlib")
+    try:
+        compressed = base64.b64decode(data, validate=True)
+    except ValueError as exc:
+        raise E2EError(f"unpack_plaintext: `d` is not standard base64: {exc}") from exc
+    inflater = zlib.decompressobj()
+    try:
+        out = inflater.decompress(compressed, max_bytes + 1)
+    except zlib.error as exc:
+        raise E2EError(f"unpack_plaintext: `d` is not a zlib stream: {exc}") from exc
+    if len(out) > max_bytes:
+        raise E2EError(f"unpack_plaintext: inflated output exceeds the {max_bytes}-byte cap")
+    if not inflater.eof:
+        raise E2EError("unpack_plaintext: zlib stream is truncated")
+    if inflater.unused_data:
+        raise E2EError("unpack_plaintext: bytes after the end of the zlib stream")
+    if not out:
+        raise E2EError("unpack_plaintext: the compressed frame inflates to nothing")
+    if _is_envelope(out):
+        raise E2EError("unpack_plaintext: an envelope inside an envelope (one level only)")
+    return out
+
+
+def _normalize(value):
+    """JavaScript cannot tell 1.0 from 1, so an integral float is hashed as the int it is (spec 5.4)."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, list):
+        return [_normalize(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _normalize(item) for key, item in value.items()}
+    return value
+
+
+def canonical_state_json(state) -> str:
+    """json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False) with every
+    integral float written as its int (spec 5.4) -- the text the digest hashes."""
+    return json.dumps(_normalize(state), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def state_digest(state) -> str:
+    """The resync digest of a state object (spec 5.4): sha256 hex of canonical_state_json(state),
+    UTF-8 encoded. Over the state exactly as sent (the object inside the {"state": ...} wrapper,
+    `ts` included) -- deliberately NOT sentinels/hmd-ui.py's digest_of(), which drops `ts`, panel
+    `updated_at` and `inbox.oldest_age_s` so the poller stays quiet; a resync must name the exact
+    frame a phone holds. A lone surrogate in a string (a JSON file may carry one as \\ud800) is
+    encoded as its own three bytes rather than raising, so one such string cannot wedge every later
+    state send, and two different strings still hash differently."""
+    return hashlib.sha256(canonical_state_json(state).encode("utf-8", "surrogatepass")).hexdigest()
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -21,6 +21,14 @@
 # mirroring HMD_AGENTS_COUNT_TTL/_LOCK_TTL's precedent in
 # heimdall-statusline-agents-cache.test.sh, purely so polling stays sub-second.
 #
+# LOAD-TOLERANCE: wall-clock budgets here are caps, never expectations. (a) Case 5
+# asserts "a FRESH cache is not recomputed", so it renders with a long TTL (render's
+# optional 3rd arg): under machine load the render alone can take longer than the
+# default 1s, which ages the sentinel cache past its TTL before swarm_block's freshness
+# check runs and makes the product CORRECTLY recompute — a flake, not a defect.
+# (b) The waits for the background refresh (cases 2 and 4) return the moment the cache
+# file lands; the generous cap only costs time when the refresh genuinely never lands.
+#
 # FALSIFIER (verified by hand for this task): reverting swarm_block() to drop
 # the `tier_map = agent_tier_map(cwd)` line and the `_tier_tag(...)` call makes
 # cases 3, 4 and 5 go RED (no "[sonnet]"/"[opus]"/"(unapplied)" ever appears,
@@ -87,20 +95,29 @@ json.dump({'max_agents': 10, 'min_agents': 1, 'agents': agents},
 }
 
 render() {
-  # render <ws> <homed>  — the documented invocation, hermetic env.
-  ws="$1"; homed="$2"
+  # render <ws> <homed> [tier-cache-ttl-s]  — the documented invocation, hermetic env.
+  # The TTL defaults to 1s (cold/stale flows want a quick refresh). A case that asserts a
+  # cache is still FRESH must pass a long one: the render itself can outlast 1s under load.
+  ws="$1"; homed="$2"; ttl="${3:-1}"
   printf '{"workspace":{"current_dir":"%s","repo":{"name":"fixture"}},"model":{"display_name":"Auto"},"context_window":{"used_percentage":10},"session_id":"agtiers"}' "$ws" \
     | env -i PATH="$PATH" HOME="$homed" \
         HEIMDALL_IDENTITY_DIR="$ws/.heimdall" HMD_HAID=rj HMD_NOW=7 \
         HEIMDALL_CP_URL="http://127.0.0.1:1" COLUMNS=120 LANG=en_US.UTF-8 \
         HMD_STATUSLINE_TMP="$ws/tmp" \
-        HMD_AGENT_TIERS_TTL=1 HMD_AGENT_TIERS_LOCK_TTL=2 \
+        HMD_AGENT_TIERS_TTL="$ttl" HMD_AGENT_TIERS_LOCK_TTL=2 \
         HEIMDALL_STATUSLINE_MODE=truecolor python3 "$SL"
 }
 
+# Cap (seconds) on waiting for the detached refresh to land the cache file. poll_for_file
+# returns the instant the file exists, so this only costs time when it never lands. Sized
+# for heavy machine load (a load average of ~80 was observed), where the refresh child's
+# python start + agents/*.md scan is slow — not for the unloaded case, where it lands in <1s.
+CACHE_WAIT_S=30
+
 poll_for_file() {
-  local n=0
-  while [ "$n" -lt "$2" ]; do
+  # poll_for_file <path> <max-seconds>  (0.2s steps)
+  local n=0 max=$(( $2 * 5 ))
+  while [ "$n" -lt "$max" ]; do
     [ -f "$1" ] && return 0
     sleep 0.2
     n=$((n+1))
@@ -131,14 +148,14 @@ else
 fi
 
 echo "== 2) EVENTUAL: tier cache is populated by the background refresh =="
-if poll_for_file "$WS/$CACHE_REL" 15; then
+if poll_for_file "$WS/$CACHE_REL" "$CACHE_WAIT_S"; then
   if python3 -c "import json; d=json.load(open('$WS/$CACHE_REL')); assert isinstance(d.get('agents'), list)" 2>/dev/null; then
-    ok "tier cache populated with valid JSON within ~3s"
+    ok "tier cache populated with valid JSON by the background refresh"
   else
     bad "tier cache appeared but is not the expected shape"
   fi
 else
-  bad "tier cache never appeared within 3s of the cold render"
+  bad "tier cache never appeared within ${CACHE_WAIT_S}s of the cold render"
 fi
 
 echo "== 3) WARM: a fresh render shows each agent's cached declared tier =="
@@ -164,7 +181,7 @@ cat > "$WS/.planning/routing-overrides.json" <<'JSON'
 {"schema":"heimdall.routing-overrides/1","overrides":{"coder":{"model":"opus","reason":"self-improve experiment (unvalidated)","experiment":"exp-1","status":"open","applied":"2026-08-20T00:00:00Z"}}}
 JSON
 render "$WS" "$HOMED" >/dev/null 2>/dev/null
-poll_for_file "$WS/$CACHE_REL" 15 >/dev/null
+poll_for_file "$WS/$CACHE_REL" "$CACHE_WAIT_S" >/dev/null
 OUT4="$(render "$WS" "$HOMED" 2>/dev/null | strip_ansi)"
 if echo "$OUT4" | grep -q 'opus(unapplied)'; then
   ok "pending override (opus) is shown, explicitly marked unapplied"
@@ -185,7 +202,9 @@ mk_agent_template "$WS" coder sonnet sonnet
 mk_agent_template "$WS" reviewer opus opus
 mkdir -p "$WS/.heimdall"
 printf '{"schema":"heimdall.tier-agents/1","agents":[],"overrides_wired":false}' > "$WS/$CACHE_REL"
-render "$WS" "$HOMED" >/dev/null 2>/dev/null
+# TTL 30s, not render's default 1s: the sentinel must still be FRESH when swarm_block's
+# check runs, however long the render takes to get there under load.
+render "$WS" "$HOMED" 30 >/dev/null 2>/dev/null
 sleep 0.5
 AFTER="$(cat "$WS/$CACHE_REL" 2>/dev/null || echo '')"
 if echo "$AFTER" | grep -q '"agents":\[\]'; then

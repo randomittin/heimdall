@@ -19,6 +19,15 @@ the same convention that module itself uses for bin/lib/*.py, see
 viewer can show which local port `hmd ui` is actually bound to); the state
 read path never opens a socket to it.
 
+SEND-ON-CHANGE: a state frame follows the change, not a timer. The cache's
+poller re-collects the moment a watched source moves (StateCache.run) and
+wakes StateCache.wait_for_change; run_state_loop blocks there, lets a burst
+settle for STATE_DEBOUNCE_S (never longer than STATE_DEBOUNCE_MAX_S since its
+first change), then sends ONE frame carrying the newest state. A frame is
+still sent only when the digest differs from the last one sent (INV-22), a
+re-bind forces one regardless (§7c), and the loop re-checks stop_event / that
+re-bind at least every STATE_WAIT_SLICE_S.
+
 SESSION-KEY BOOTSTRAP (matches hmdapp's RelayTransport / fake-hmd.mjs exactly
 -- see hmdapp's docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md Section 1;
 this section previously documented a "Wave-1 hello" handshake the real app
@@ -64,10 +73,16 @@ to drive its own UI; nothing else is ever written to stdout.
                                                        may repeat across a
                                                        stream reconnect
     {"event":"state_sent","seq":N,"bytes":B,"delivered":bool}
-    {"event":"command","action":"send-message"|"decide"|..,"ok":bool,"detail":..}
+    {"event":"device_caps","caps":[..]}               the phone's capability set
+                                                       (from its latest sealed
+                                                       `resync`; [] after a
+                                                       device_bound), sorted, logged
+                                                       when it CHANGES. See FRAME
+                                                       COMPRESSION AND RESYNC below
+    {"event":"command","action":"send-message"|"decide"|"resync"|..,"ok":bool,"detail":..}
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
-        logged, not even at this level); any action other than the two
+        logged, not even at this level); any action other than the three
         named is acked `not-implemented`
     {"event":"ack_sent","of_seq":N,"seq":S,"id":..|null,"attempt":K,"ms":N,
      "ok":bool,"delivered":bool}
@@ -80,12 +95,19 @@ to drive its own UI; nothing else is ever written to stdout.
         relay's own flag for it (false too when the POST failed)
     {"event":"connect","family":"ipv4"|"ipv6","ms":N,"dns_ms":N,"attempts":N,
      "for":"pair"|"stream"|"frames"|"revoke"|"request"}
-        one line per NEW relay connection (every HTTP request opens its own):
-        which address family won, how long resolving plus connecting took
-        (dns_ms the resolving part of it), and how many addresses had to be
-        started to get there -- 1 is the normal case, 2+ means an earlier
-        address was too slow or failed and a later one was raced in. See
-        CONNECTING below
+        one line per NEW relay connection (/pair/init, /stream and /revoke open
+        their own every time; POST /frames only when it has no live connection
+        to reuse -- see FRAME CONNECTIONS below): which address family won, how
+        long resolving plus connecting took (dns_ms the resolving part of it),
+        and how many addresses had to be started to get there -- 1 is the
+        normal case, 2+ means an earlier address was too slow or failed and a
+        later one was raced in. See CONNECTING below
+    {"event":"post","ms":N,"reused":bool}
+        one line per POST /frames the relay ANSWERED (whatever the HTTP
+        status): ms how long the whole POST took -- the connect and TLS
+        handshake included when it had to open a connection, and the retry on a
+        replaced stale connection included -- reused whether it went out on a
+        connection that was already open. See FRAME CONNECTIONS below
     {"event":"stream_drop","retry_ms":N[,"reason":..]}
                                                        GET stream disconnected;
                                                        reconnecting after N ms.
@@ -144,22 +166,72 @@ verification never see the address. HMD_RELAY_IP_FAMILY=4 or 6 restricts the
 lookup to that family, with no fallback to the other; any other value is
 reported as an `error` event and treated as auto.
 
+FRAME CONNECTIONS (docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md Ask 3): POST
+/frames used to open a new TCP+TLS connection for every frame, and about a
+quarter of those needed a second Happy Eyeballs address -- the whole p95 of
+every state frame and every ack. Each SENDER now keeps ONE persistent HTTP/1.1
+connection of its own (state frames on one, acks on the other, neither shared
+with GET /stream), each behind its own lock, so a slow state POST can never
+hold up an ack. A connection is (re)opened, through the same Happy Eyeballs
+connect as before, only when there is none or a request on it failed, and one
+that raised is closed, never reused. TCP keepalive keeps a quiet connection's
+NAT mapping alive and turns a path that died silently into a socket error
+within about a minute, rather than into a POST that waits out its whole
+timeout. A failure on a REUSED connection is nearly always one the relay or a
+middlebox closed while it idled, so the SAME sealed envelope (same seq, nonce
+and ciphertext: the phone dedupes on seq, so a duplicate is harmless) is
+POSTed once more, at once, on a fresh connection, inside the same timeout.
+Not retried here: a timeout (it spent the whole budget; the caller's own retry
+-- the ack retry below, the next state tick -- takes over on a fresh
+connection) and a failure on a connection opened for that very POST (nothing
+about it was stale).
+
+STATE FRAMES (Ask 4): a state frame's digest (INV-22) is recorded as sent only
+once its POST got an answer from the relay. A POST that got none -- network
+error, timeout, non-200, a frame over the envelope cap refused locally --
+leaves the digest as it was, so the next tick sends the then-current state
+again under a fresh seq, after a backoff of 250 ms, 1 s, 2 s and then 5 s that
+the first answered POST resets. delivered=false (no phone connected) IS an
+answer and is not retried: a (re)bind forces the resend. The relay client
+shares ONE hmd-side seq counter between state frames and acks, and the phone
+drops a frame whose seq a newer one has already passed, so an ack must never
+be overtaken: while an ack is in flight (its retries included) no state frame
+takes a seq. The converse is accepted -- an ack takes a seq above a state
+frame that is still in flight and may land first -- but then that state frame
+is not recorded as sent either, and the next tick sends it again.
+
 ACK RETRY (HMD_RELAY_ACK_WINDOW_S, default 8): the phone gives a command 10 s
 to be acked, and an ack whose POST failed used to be lost for good. An ack POST
-that gets no usable answer (network error, timeout, non-200) is now re-POSTed --
-the SAME sealed envelope, same seq, nonce and ciphertext, never a re-seal: the
-app drops a frame whose seq it already accepted before it even decrypts, so a
-retry after a lost RESPONSE is a harmless duplicate, not a second ack. At most
-3 attempts in all, 0.25 s then 0.5 s apart, each bounded to 3 s (a state frame
-keeps the 15 s connect timeout). A RETRY starts only if it can start inside
-HMD_RELAY_ACK_WINDOW_S of the command's arrival -- the app's 10 s minus transit
--- and is capped to what is left of it; the first attempt is always made, since
-a late ack beats none and the app accepts one. The retries run under the frame
-lock, so no later frame can overtake them (the app would drop an ack whose seq
-a newer frame has already passed). A relay that ANSWERED with delivered=false
-(no phone connected right now) gave an answer, not a failure: not retried, but
-visible in ack_sent. Backoff waits on stop_event, so a shutdown is never
-delayed by a retry.
+that gets no usable answer (network error, timeout, non-200) -- or whose answer
+is delivered=false: the relay has no phone socket right now, an ack is never
+stored, and the phone may well be reconnecting inside its window -- is
+re-POSTed: the SAME sealed envelope, same seq, nonce and ciphertext, never a
+re-seal: the app drops a frame whose seq it already accepted before it even
+decrypts, so a retry after a lost RESPONSE is a harmless duplicate, not a
+second ack. At most 3 attempts in all, 0.25 s then 0.5 s apart, each bounded
+to 3 s (a state frame keeps the 15 s connect timeout). A RETRY starts only if
+it can start inside HMD_RELAY_ACK_WINDOW_S of the command's arrival -- the
+app's 10 s minus transit -- and is capped to what is left of it; the first
+attempt is always made, since a late ack beats none and the app accepts one.
+No later frame can overtake the retries (see STATE FRAMES: the app would drop
+an ack whose seq a newer frame has already passed). Every attempt is visible
+in ack_sent, a delivered=false answer too (ok true, delivered false). Backoff
+waits on stop_event, so a shutdown is never delayed by a retry.
+
+FRAME COMPRESSION AND RESYNC (the FINAL wire of hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md
+Ask 5, section 5; hmdapp's docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with
+it; codec in bin/lib/hmd_relay_e2e.py). Capabilities travel in-band, hmd first: EVERY `state`
+frame's plaintext is `{"state":{...},"caps":["resync","z-zlib"]}` (E2E.hmd_caps()). A phone that
+sees `resync` sends a sealed command `{"action":"resync","params":{"last_seq":N,"digest":"<sha256
+hex>","caps":[..]}}`; hmd acks it ok, keeps its `caps` as the phone's capability set (replaced by
+every resync, forgotten on every device_bound), and -- when `digest` is not the digest of the
+state hmd last sent -- forces a full state frame on the next tick, the same re-send device_bound
+forces. Only while the phone's set holds "z-zlib" is a state frame sealed as `{"z":"zlib","d":
+"<base64 of zlib.compress(that plain plaintext)>"}`, compressed BEFORE the seal. Plain is the
+default and the fallback: no resync yet, a frame under E2E.COMPRESS_MIN_BYTES, one the envelope
+would not shrink, `ack` frames (never compressed), a python without zlib. Only a sealed command
+that opened under the session key can set the phone's capabilities -- never the relay's
+unencrypted `device_bound`.
 
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
@@ -335,6 +407,19 @@ if not 0 <= ACK_WINDOW_S <= 3600:  # also catches nan
 ACK_ATTEMPT_TIMEOUT_S = 3.0
 ACK_RETRY_DELAYS_S = (0.25, 0.5)
 ACK_MIN_ATTEMPT_S = 0.5
+
+# State retry (see STATE FRAMES in the module docstring): a state POST that got no
+# usable answer is re-sent by the next tick, after the next of these waits -- 250 ms,
+# 1 s, 2 s, then held at 5 s -- the first answered POST resetting it to the start.
+STATE_RETRY_BACKOFF_S = (0.25, 1.0, 2.0, 5.0)
+
+# TCP keepalive on a persistent frame connection (see FRAME CONNECTIONS): the first
+# probe after KEEPALIVE_IDLE_S of silence, then one every KEEPALIVE_INTERVAL_S, the
+# connection given up after KEEPALIVE_PROBES unanswered -- a dead path surfaces as a
+# socket error in about a minute instead of as a POST waiting out its whole timeout.
+KEEPALIVE_IDLE_S = 30
+KEEPALIVE_INTERVAL_S = 10
+KEEPALIVE_PROBES = 3
 
 # HMD_RELAY_EVENT_LOG (docs/HANDOFF-TO-HEIMDALL-relay-send-ack.md "New ask"):
 # durable append-only NDJSON mirror of every line emit() writes to stdout, so
@@ -630,6 +715,74 @@ def _body_head(raw, limit=200):
     return text[:limit]
 
 
+def _keep_alive(sock):
+    """TCP keepalive on a persistent frame connection's socket (KEEPALIVE_* above).
+    Which knobs exist differs by platform -- TCP_KEEPIDLE on Linux, TCP_KEEPALIVE
+    on macOS -- so each is set only where the socket module has it. A refusal is
+    reported, never fatal: the connection works without it, just less robustly."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (("TCP_KEEPIDLE", KEEPALIVE_IDLE_S), ("TCP_KEEPALIVE", KEEPALIVE_IDLE_S),
+                            ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL_S), ("TCP_KEEPCNT", KEEPALIVE_PROBES)):
+            option = getattr(socket, name, None)
+            if option is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+    except OSError as e:
+        emit({"event": "error", "detail": "TCP keepalive not set on a frames connection: %s" % e})
+
+
+class _FramesChannel:
+    """One persistent HTTP/1.1 connection for POST /session/:id/frames, behind its
+    own lock. FRAME CONNECTIONS in the module docstring says why, and spells out
+    every rule below."""
+
+    def __init__(self, parsed):
+        self.parsed = parsed
+        self.lock = threading.Lock()
+        self.conn = None
+
+    def _drop(self):
+        conn, self.conn = self.conn, None
+        if conn is not None:
+            conn.close()
+
+    def post(self, path, headers, body, timeout):
+        """POST `body` and return (status, raw response body). `timeout` is ONE
+        budget for the connect, the request, the response and the single retry on
+        a replaced connection. Raises what http.client or the socket raised, after
+        closing the connection that raised it."""
+        with self.lock:
+            started = time.monotonic()
+            deadline = started + timeout
+            retried = False
+            while True:
+                if self.conn is None:
+                    self.conn = _connect(self.parsed, timeout=timeout, label="frames")
+                conn = self.conn
+                reused = conn.sock is not None
+                conn.timeout = max(deadline - time.monotonic(), 0.001)
+                try:
+                    if reused:
+                        conn.sock.settimeout(conn.timeout)
+                    else:
+                        conn.connect()
+                        _keep_alive(conn.sock)
+                    conn.request("POST", path, body=body, headers=headers)
+                    resp = conn.getresponse()
+                    raw = resp.read()
+                except (OSError, http.client.HTTPException) as e:
+                    self._drop()
+                    if not reused or retried or isinstance(e, socket.timeout) or time.monotonic() >= deadline:
+                        raise
+                    retried = True  # a stale reused connection: the same envelope, once more, on a fresh one
+                    continue
+                except BaseException:
+                    self._drop()  # whatever interrupted it, never leave a half-used connection to be reused
+                    raise
+                emit({"event": "post", "ms": int(round((time.monotonic() - started) * 1000)), "reused": reused})
+                return resp.status, raw
+
+
 class RelayClient:
     def __init__(self, args):
         self.args = args
@@ -653,7 +806,14 @@ class RelayClient:
         self.pub = None
         self.session_key = None
 
+        # `lock` covers seq allocation + sealing and the bookkeeping after a POST --
+        # never a POST itself. Each sender POSTs on a connection of its own, behind
+        # that connection's own lock (see FRAME CONNECTIONS), and `_acks_idle` is
+        # signalled whenever an ack leaves the air (see send_hmd_frame).
         self.lock = threading.Lock()
+        self._acks_in_flight = 0
+        self._acks_idle = threading.Condition(self.lock)
+        self._frame_channels = {"state": _FramesChannel(self.parsed), "ack": _FramesChannel(self.parsed)}
         # hmd's own first sealed frame now starts at seq=1 (not 0), and the
         # floor for an accepted device seq is 0 (not -1): both legs of the
         # app's crypto.ts enforce "seq must be strictly greater than 0" via
@@ -665,6 +825,11 @@ class RelayClient:
         self.device_pub = None  # raw 32-byte key of the currently-bound
                                  # device -- set once, on the first
                                  # device_bound; see _handle_envelope.
+        self.device_caps = frozenset()  # the phone's capability tokens: its latest
+                                         # sealed `resync`'s caps (_resync), forgotten on
+                                         # every device_bound; empty = plain frames only
+        self.last_sent_state = None     # the state object of the last state frame sealed --
+                                         # what a phone's resync digest is compared with
         self.stop_event = threading.Event()
         self.state_ready = threading.Event()
         self._stopping = False
@@ -678,6 +843,8 @@ class RelayClient:
         self.last_command_at = None
 
         self.last_sent_digest = None
+        self._rearm_gen = 0        # bumped by _rearm_state; see _tick_once
+        self._state_failures = 0   # consecutive state POSTs that got no usable answer
         self.cache = None
 
     # -- status ------------------------------------------------------------
@@ -770,10 +937,13 @@ class RelayClient:
             emit({"event": "error", "detail": "%s frame seq=%d dropped: %d bytes exceeds %d cap"
                                               % (type_, seq, len(body), MAX_ENVELOPE_BYTES)})
             return None, len(body)
+        # an ack and a state frame each have a connection (and lock) of their own
+        channel = self._frame_channels["ack" if type_ == "ack" else "state"]
         try:
-            status, raw = self._request("POST", "/session/%s/frames" % self.session_id,
-                                         headers=self._auth_headers({"Content-Type": "application/json"}),
-                                         body=body, timeout=timeout, label="frames")
+            status, raw = channel.post(_base_path(self.parsed) + "/session/%s/frames" % self.session_id,
+                                       headers=self._auth_headers({"Content-Type": "application/json",
+                                                                   "Connection": "keep-alive"}),
+                                       body=body, timeout=timeout)
         except (OSError, http.client.HTTPException) as e:
             emit({"event": "error", "detail": "%s frame seq=%d post failed: %s" % (type_, seq, e)})
             return None, len(body)
@@ -798,17 +968,43 @@ class RelayClient:
         counter (INV-14, strictly increasing per sender) is never raced
         between the two. An `ack` frame is POSTed by _post_ack, which retries a
         failed POST; `ack_deadline` (time.monotonic()) is the moment past which
-        none of those retries may START (default: ACK_WINDOW_S from now)."""
+        none of those retries may START (default: ACK_WINDOW_S from now).
+
+        Only the seq allocation and the seal run under self.lock; the POST runs
+        outside it, on the sender's own connection (FRAME CONNECTIONS), so a slow
+        state POST never delays an ack. Ordering: a state frame waits for an ack
+        in flight to finish before it takes its seq, so an ack -- retries
+        included -- is never overtaken by a newer frame; the converse (a state
+        frame still in flight when an ack takes the next seq) is _tick_once's
+        to repair."""
+        if type_ == "state":  # hmd's capability tokens ride in EVERY state frame (FRAME COMPRESSION AND RESYNC)
+            plaintext_obj = dict(plaintext_obj, caps=E2E.hmd_caps())
+            self.last_sent_state = plaintext_obj.get("state")
         plaintext = json.dumps(plaintext_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if type_ == "state":  # compress BEFORE the seal; only a state frame, only for a phone that listed "z-zlib"
+            plaintext = E2E.pack_plaintext(plaintext, self.device_caps)
+        is_ack = type_ == "ack"
         with self.lock:
+            if not is_ack:
+                while self._acks_in_flight:
+                    self._acks_idle.wait()
             seq = self.hmd_seq
             self.hmd_seq += 1
             nonce, ciphertext = E2E.seal(self.session_key, seq, "hmd", plaintext)
-            if type_ == "ack":
+            if is_ack:
+                self._acks_in_flight += 1
+        try:
+            if is_ack:
                 delivered, nbytes = self._post_ack(plaintext_obj, nonce, ciphertext, seq, ack_deadline)
             else:
                 delivered, nbytes = self.send_frame_envelope(type_, nonce, ciphertext, seq)
-            self.last_seq = seq
+        finally:
+            if is_ack:
+                with self.lock:
+                    self._acks_in_flight -= 1
+                    self._acks_idle.notify_all()
+        with self.lock:
+            self.last_seq = seq if self.last_seq is None else max(self.last_seq, seq)
             if delivered is not None:
                 self.frames_sent += 1
                 self.last_delivered = delivered
@@ -819,12 +1015,14 @@ class RelayClient:
 
     def _post_ack(self, ack, nonce, ciphertext, seq, deadline):
         """POST one sealed ack frame, re-POSTing it if the POST FAILED (no usable
-        answer -- see ACK RETRY in the module docstring for every rule below),
-        and emit one `ack_sent` event per attempt. Always the SAME envelope:
-        the caller sealed it once, so every attempt carries the one seq the app
-        dedupes on. Called with self.lock held and keeps it across the retries
-        on purpose -- a state frame sent in between would carry a higher seq,
-        and the app drops any frame whose seq a newer one has already passed."""
+        answer) or was answered delivered=false (see ACK RETRY in the module
+        docstring for every rule below), and emit one `ack_sent` event per
+        attempt. Always the SAME envelope: the caller sealed it once, so every
+        attempt carries the one seq the app dedupes on. Runs outside self.lock;
+        send_hmd_frame counts this ack as in flight until it returns, and no
+        state frame takes a seq meanwhile -- one sent in between would carry a
+        higher seq, and the app drops any frame whose seq a newer one has
+        already passed."""
         if deadline is None:
             deadline = time.monotonic() + ACK_WINDOW_S
         attempts = len(ACK_RETRY_DELAYS_S) + 1
@@ -839,8 +1037,8 @@ class RelayClient:
             emit({"event": "ack_sent", "of_seq": ack.get("of_seq"), "seq": seq, "id": ack.get("id"),
                   "attempt": attempt, "ms": int(round((time.monotonic() - began) * 1000)),
                   "ok": delivered is not None, "delivered": bool(delivered)})
-            if delivered is not None or attempt == attempts:
-                break
+            if delivered or attempt == attempts:
+                break  # delivered; or out of attempts. No usable answer (None) and delivered=false both retry
             delay = ACK_RETRY_DELAYS_S[attempt - 1]
             if time.monotonic() + delay >= deadline or self.stop_event.wait(delay):
                 break  # no room left in the window, or the client is stopping
@@ -888,6 +1086,46 @@ class RelayClient:
             return False, "write-failed", {}
         return True, None, {"id": result["id"], "decision": result["decision"]}
 
+    def _adopt_device_caps(self, raw):
+        """Record the phone's capability tokens (E2E.normalize_caps: an array's strings, anything
+        else the empty set) and log a `device_caps` event when the set CHANGES. Called only with the
+        `caps` of a `resync` command that OPENED under the paired session key, or with None on a
+        device_bound (the phone's tokens are forgotten there) -- never with anything out of the
+        relay's plaintext frames (see FRAME COMPRESSION AND RESYNC). The set is replaced by one
+        reference assignment, so the state loop's read of it in send_hmd_frame needs no lock: it
+        sees the old or the new set, both valid."""
+        caps = E2E.normalize_caps(raw)
+        if caps != self.device_caps:
+            self.device_caps = caps
+            emit({"event": "device_caps", "caps": sorted(caps)})
+
+    def _resync(self, params):
+        """The phone's `resync` command, sent to an hmd that listed `resync` in its state frames'
+        caps (hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md 5.3):
+            command  {"action":"resync","params":{"last_seq":N,"digest":"<64 lowercase hex>","caps":[..]}}
+            ack ok   {"ok":true,"of_seq":N}            ack no  {"ok":false,"of_seq":N,"detail":"bad-params"}
+        Keeps `caps` as the phone's capability set (the "z-zlib" gate; each resync replaces it) and,
+        when `digest` is not the digest of the state hmd last sent, forces a full state frame on the
+        next tick -- the very re-send device_bound forces -- so it carries the next seq, compressed
+        if the new caps allow. A phone that already holds what hmd last sent needs nothing: the
+        ordinary tick delivers any newer state. A `last_seq` at or above hmd's next seq means the
+        two have desynced (the app shows RELAY_DESYNC); surfaced here as an error event, the seq
+        counter itself is never touched."""
+        fields = params if isinstance(params, dict) else {}
+        last_seq, digest = fields.get("last_seq"), fields.get("digest")
+        if not (isinstance(last_seq, int) and not isinstance(last_seq, bool) and last_seq >= 0
+                and isinstance(digest, str) and len(digest) == 64
+                and all(c in "0123456789abcdef" for c in digest)):
+            return False, "bad-params"
+        self._adopt_device_caps(fields.get("caps"))
+        if last_seq >= self.hmd_seq:
+            emit({"event": "error", "detail": "resync: phone last_seq=%d is at or above hmd's next seq %d -- "
+                                              "desynced" % (last_seq, self.hmd_seq)})
+        sent = self.last_sent_state
+        if sent is None or E2E.state_digest(sent) != digest:
+            self._rearm_state()
+        return True, None
+
     def _handle_command(self, env):
         # The phone's ack window opened before this command reached us; retries
         # of its ack may only START inside what is left of it (ACK_WINDOW_S).
@@ -934,6 +1172,8 @@ class RelayClient:
                     ok, detail = False, "write-failed"
         elif action == "decide":
             ok, detail, extra = self._decide(params)
+        elif action == "resync":
+            ok, detail = self._resync(params)
         else:
             ok, detail = False, "not-implemented"
         emit({"event": "command", "action": action, "ok": ok, "detail": detail})
@@ -967,7 +1207,8 @@ class RelayClient:
             # adopted -- loud error, key and pairing state untouched.
             if self.session_key is not None:
                 if device_pub == self.device_pub:
-                    self.last_sent_digest = None
+                    self._rearm_state()
+                    self._adopt_device_caps(None)  # forget the phone's caps on device_bound: plain until its next resync
                     self.bound_at = payload.get("bound_at")
                     self.write_status()
                     emit({"event": "device_bound", "bound_at": self.bound_at})
@@ -991,7 +1232,7 @@ class RelayClient:
             # never-a-real-digest sentinel __init__ uses to guarantee the very
             # first tick always sends (line 256); digest_of() is a sha256 hex
             # digest and can never equal it.
-            self.last_sent_digest = None
+            self._rearm_state()
             self.write_status()
             emit({"event": "device_bound", "bound_at": self.bound_at})
             self.state_ready.set()
@@ -1116,25 +1357,87 @@ class RelayClient:
                 return
             backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
 
-    # -- state tick loop (main thread) ---------------------------------------
+    # -- state loop (main thread) --------------------------------------------
+    # Send-on-change (docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md Ask 1): the loop blocks on
+    # StateCache.wait_for_change, which the cache's poller wakes the moment the digest moves, instead
+    # of sleeping --tick-s between looks -- so the frame follows the change, not a second 2 s timer.
+    STATE_DEBOUNCE_S = 0.05      # coalesce a burst: send once the digest has been still this long ...
+    STATE_DEBOUNCE_MAX_S = 0.25  # ... but never hold a burst's first change longer than this
+    STATE_WAIT_SLICE_S = 0.25    # longest single block on the cache: a stop_event.set() or a
+                                 # _rearm_state() (both on the stream thread) cannot wake it
+
+    def _rearm_state(self):
+        """A (re)bind: the phone's local state was just reset, so the next tick must
+        send the state again whatever its digest -- the state loop re-reads
+        last_sent_digest at least every STATE_WAIT_SLICE_S (see _await_new_state).
+        The generation bump is how a state POST that is in flight right now can
+        tell, once it is answered, that it must not write its digest over this
+        (see _tick_once)."""
+        self.last_sent_digest = None
+        self._rearm_gen += 1
+
     def _tick_once(self):
         state, digest = self.cache.latest()
         if digest == self.last_sent_digest:
             return
-        self.last_sent_digest = digest
-        self.send_hmd_frame("state", {"state": state})
+        rearm_gen = self._rearm_gen
+        seq, delivered = self.send_hmd_frame("state", {"state": state})
+        if delivered is None:
+            # No usable answer: the frame never reached the phone. last_sent_digest
+            # stays as it was, so the next tick sends the (then current) state again
+            # -- after a bounded backoff, so a relay that is down is not hammered.
+            delay = STATE_RETRY_BACKOFF_S[min(self._state_failures, len(STATE_RETRY_BACKOFF_S) - 1)]
+            self._state_failures += 1
+            self.stop_event.wait(delay)
+            return
+        self._state_failures = 0
+        if self.hmd_seq - 1 > seq:
+            # An ack took a higher seq while this frame was in flight and may have
+            # landed first, and the phone drops a frame whose seq a newer one has
+            # passed: this frame may be lost, so it is not recorded as sent.
+            return
+        if rearm_gen == self._rearm_gen:  # a rebind that landed mid-POST must survive it
+            self.last_sent_digest = digest
+
+    def _await_new_state(self):
+        """Block until the cache holds a digest this client has not sent, then let a burst settle.
+        True when there is something to send: the digest stayed put for STATE_DEBOUNCE_S, or kept
+        moving until STATE_DEBOUNCE_MAX_S ran out. False when a wait slice passed with nothing new
+        (or on stop) -- the caller loops, which is how stop_event and a _rearm_state() re-bind
+        (last_sent_digest = None, re-read here on every call) are noticed within one slice. A state
+        POST that got no usable answer leaves last_sent_digest as it was (_tick_once), so it reads as
+        "new" again here and is retried after _tick_once's own backoff. --tick-s (default 2) only
+        bounds the slice from above: nothing waits for it any more."""
+        if self.stop_event.is_set():
+            return False
+        _, digest = self.cache.wait_for_change(self.last_sent_digest, min(self.tick_s, self.STATE_WAIT_SLICE_S))
+        if digest is None or digest == self.last_sent_digest:
+            return False
+        began = time.monotonic()
+        while not self.stop_event.is_set():
+            hold = self.STATE_DEBOUNCE_MAX_S - (time.monotonic() - began)
+            if hold <= 0:
+                break
+            _, newer = self.cache.wait_for_change(digest, min(self.STATE_DEBOUNCE_S, hold))
+            if newer == digest:
+                break
+            digest = newer
+        return not self.stop_event.is_set()
 
     def run_state_loop(self):
         self.cache = UI.StateCache(self.root, self.transport)
         self.cache.start()
         try:
-            while not self.stop_event.wait(self.tick_s):
-                if not self.state_ready.is_set():
-                    continue
+            while not self.stop_event.is_set():
                 try:
-                    self._tick_once()
+                    if not self.state_ready.is_set():
+                        # nothing can be sealed before device_bound; setting the event wakes this at once
+                        self.state_ready.wait(min(self.tick_s, self.STATE_WAIT_SLICE_S))
+                    elif self._await_new_state():
+                        self._tick_once()
                 except Exception as e:
                     emit({"event": "error", "detail": "state tick failed: %s" % e})
+                    self.stop_event.wait(self.tick_s)  # a failing pass is retried at the old cadence, never hot
         finally:
             self.cache.stop()
 
@@ -1165,7 +1468,9 @@ def build_argparser():
     ap.add_argument("--status-file", default=None, metavar="PATH",
                      help="default <repo>/.heimdall/app/relay.json")
     ap.add_argument("--tick-s", type=float, default=2.0, metavar="N",
-                     help="state poll/send cadence in seconds (default 2)")
+                     help="longest the state loop blocks before it re-checks for a stop or a re-bind "
+                          "(default 2, and never more than 0.25 -- STATE_WAIT_SLICE_S). A state change is "
+                          "sent as it happens (debounced 50 ms), not at the next tick")
     return ap
 
 

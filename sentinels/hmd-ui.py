@@ -13,8 +13,10 @@ Routes (all GET):
     /api/state        the section-4 JSON contract, served from the SAME background-
                       polled StateCache snapshot /api/events reads (perf: a GET is a
                       dict->JSON serialize, not a fresh collect -- the cache recomputes
-                      itself at least every POLL_INTERVAL_S, or synchronously on demand
-                      if empty/stale; see StateCache.latest()). `?digest=<sha>` (or an
+                      itself the moment a watched source moves (WATCH_SOURCES, polled every
+                      WATCH_INTERVAL_S) and in any case every POLL_INTERVAL_S, or
+                      synchronously on demand if empty/stale; see StateCache.latest()).
+                      `?digest=<sha>` (or an
                       `If-None-Match: "<sha>"` header) matching the current digest gets
                       a bodyless 304 with `ETag: "<sha>"`; otherwise 200 with that same
                       ETag -- the identical digest_of() value an /api/events frame's
@@ -36,8 +38,9 @@ Routes (all GET):
                       repo's session (bin/lib/hmd_session_resolve.py), out-of-repo entries
                       dropped -- never absolute, never `../x`
     /api/events       text/event-stream; a `data:` frame only when the digest changes
-                      (the digest covers `panels`, so a `hmd ui panel set` lands within
-                      one poll)
+                      (the digest covers `panels`, so a `hmd ui panel set` lands as soon
+                      as the poller sees the panels dir move -- WATCH_INTERVAL_S plus one
+                      cheap collect -- not at the next POLL_INTERVAL_S)
 
 Auth, in this order, on EVERY route:
     0. Host header must be 127.0.0.1:<port>, localhost:<port>, or one of --allow-host's
@@ -94,7 +97,9 @@ LIB_DIR = os.path.join(BIN_DIR, "lib")
 PAGE_PATH = os.path.join(HERE, "hmd-ui.html")
 
 SCHEMA_VERSION = 1
-POLL_INTERVAL_S = 2.0
+POLL_INTERVAL_S = 2.0          # the BACKSTOP: a pass at least this often, and the period of the slow collectors' refresh
+WATCH_INTERVAL_S = 0.1         # between passes StateCache.run stats WATCH_SOURCES this often (a stat each, no read)
+REFRESH_MIN_GAP_S = 0.25       # a poller pass never starts sooner than this after the previous one began
 KEEPALIVE_S = 15.0
 CMD_TIMEOUT_S = 8
 CHECKPOINT_HEAD_BYTES = 8192   # the auto-checkpoint header lives in the first few KB
@@ -155,6 +160,25 @@ SOURCE_COMMANDS = (
 )
 GIT_COMMANDS = (
     ("git", "rev-parse", "--abbrev-ref", "HEAD"),
+)
+# What StateCache.run STATS every WATCH_INTERVAL_S: when one of these moves the state is re-collected at
+# once instead of at the next POLL_INTERVAL_S pass. Repo-relative, and only files that move when --
+# and only when -- a collector's INPUT moved. The statusline / roster / ledger mirrors, the agents-count
+# cache, the inbox-waiting heartbeat and the tracker's per-hook counters are rewritten on a timer or on
+# every hook whether or not their content changed, so watching them would re-collect all the time for
+# nothing: they, and every subprocess-derived field (git branch, hooks, fallback, quality gate), keep
+# arriving every POLL_INTERVAL_S (the warmer, SLOW_COLLECTORS) exactly as before. A directory's stamp
+# moves when an entry is created, removed or renamed -- every panel write and approval request is
+# tmp + rename / link. The repo's session transcript is watched as well (WatchedSources._transcript):
+# it is resolved per call, so it cannot be listed here.
+WATCH_SOURCES = (
+    ".heimdall/ui/panels",                 # dir: `hmd ui panel set`, the chat / agents publishers
+    ".heimdall/ui/approvals",              # dir: a phone-deny request or decision
+    ".heimdall/ui/inbox.jsonl",            # appended in place
+    ".heimdall/ui/inbox-delivered.jsonl",  # delivery receipts -> inbox.delivered[]
+    ".heimdall/ui/tmux-target",            # inbox.consumer == "tmux"
+    ".planning/CHECKPOINT.md",
+    ".heimdall/receipts/last-sweep.json",
 )
 
 # ── deny-list: enforced at the read primitive ────────────────────────────────
@@ -301,11 +325,18 @@ def _run_json(argv, cwd):
 SUBPROCESS_CACHE_TTL_S = POLL_INTERVAL_S
 _subprocess_cache = {}
 _subprocess_cache_lock = threading.Lock()
+# True only on the poller thread, only inside StateCache.refresh(partial=True): the collectors then take
+# whatever a subprocess last answered, however old, instead of re-spawning it. The files a change moved
+# are re-read in full (that is cheap -- the mtime caches above); the spawns are what cost 0.3-1.5 s, and
+# StateCache's warmer thread re-runs them every POLL_INTERVAL_S (SLOW_COLLECTORS), so a subprocess-derived
+# field is never staler than the TTL above plus one warm period -- the same bound as before.
+_subprocess_reuse = threading.local()
 
 
 def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
     """Same contract as `_run`, memoized by the exact (argv, cwd) pair for
-    SUBPROCESS_CACHE_TTL_S. The lock spans the whole miss path (not just the dict
+    SUBPROCESS_CACHE_TTL_S (or for as long as the entry lives, under _subprocess_reuse).
+    The lock spans the whole miss path (not just the dict
     read/write): two concurrent /api/state requests racing a cold cache must never
     both spawn the same command -- the second blocks on the lock and then hits the
     now-warm entry instead of racing its own subprocess (perf item 2d: never spawn
@@ -314,6 +345,12 @@ def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
     overlay names the repo's session, which changes when a new session starts) -- `timeout`
     stays out of it, every caller pairs the same argv+cwd with the same timeout."""
     key = (tuple(argv), cwd, tuple(sorted((env or {}).items())))
+    if getattr(_subprocess_reuse, "any_age", False):
+        # No lock: a spawn in flight on another thread (the warmer) holds it for the whole spawn,
+        # and a pass that only wants the last answer must not queue behind that.
+        hit = _subprocess_cache.get(key)
+        if hit is not None:
+            return hit[1]
     with _subprocess_cache_lock:
         now = time.monotonic()
         hit = _subprocess_cache.get(key)
@@ -389,9 +426,20 @@ def collect_identity(root):
 
 
 LEDGER_EMPTY = {"daemon": None, "gates": [], "verdict": None, "team": [], "team_overflow": 0}
+_ledger_memo = {}   # root -> the last answer, served to a partial pass (see _subprocess_reuse)
 
 
 def collect_ledger(root):
+    """hmd_ledger's own 5 s file cache sits behind this, and a miss there forks heimdall-identity
+    (outside _run_cached) -- so a partial pass serves the last answer instead, and the warmer
+    thread (SLOW_COLLECTORS) is what keeps it fresh."""
+    if getattr(_subprocess_reuse, "any_age", False) and root in _ledger_memo:
+        return _ledger_memo[root]
+    _ledger_memo[root] = answer = _collect_ledger(root)
+    return answer
+
+
+def _collect_ledger(root):
     if LEDGER is None:
         return dict(LEDGER_EMPTY)
     # Session id keyed by ROOT: hmd_ledger's 5s file cache is per session id, and two
@@ -845,9 +893,16 @@ def new_companion_publisher(root):
 
     def list_agents():
         # The publisher throttles this (>= 10s apart) and skips it while the statusline's
-        # cached count says nothing is running; _run_json_cached memoizes within a tick.
-        return _run_json_cached(("heimdall-agents", "list", "--json"), root,
-                                timeout=AGENTS_LIST_TIMEOUT_S, env={"HMD_AGENT_CWD": root})
+        # cached count says nothing is running; _run_json_cached memoizes within a tick. A probe
+        # the publisher chose to make wants a real answer even inside a partial pass (which would
+        # otherwise serve the first answer for ever -- nothing else re-runs this one).
+        reuse = getattr(_subprocess_reuse, "any_age", False)
+        _subprocess_reuse.any_age = False
+        try:
+            return _run_json_cached(("heimdall-agents", "list", "--json"), root,
+                                    timeout=AGENTS_LIST_TIMEOUT_S, env={"HMD_AGENT_CWD": root})
+        finally:
+            _subprocess_reuse.any_age = reuse
 
     return COMPANION.CompanionPublisher(root, read_tail=_read_tail, list_agents=list_agents)
 
@@ -976,6 +1031,13 @@ def _transport_redaction(transport, root):
     return bool(transport.get("public_host")), None
 
 
+# The collectors whose answer costs a process spawn, or a cache miss that forks one (collect_ledger):
+# StateCache's warmer thread re-runs these every POLL_INTERVAL_S, and a partial pass reuses what they
+# last answered. Everything else collect_state calls is a file read.
+SLOW_COLLECTORS = (collect_identity, collect_ledger, collect_quality_gate, collect_hooks, collect_fallback,
+                   collect_edits)
+
+
 def collect_state(root, transport=None):
     """The section-4 contract. Each slice degrades independently: object-typed
     slices keep their keys with null values, array slices go empty, and the two
@@ -1062,15 +1124,64 @@ def digest_of(state):
     return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
 
+# ── change detection: a stat per watched source ──────────────────────────────
+def _stamp(path):
+    """(mtime_ns, size, inode) of `path`, None when it does not exist. A stat, never a read."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+class WatchedSources:
+    """What StateCache.run polls between backstops: signature() is a tuple of stamps -- WATCH_SOURCES,
+    the repo's Claude project dirs, and its current session transcript -- that differs from the
+    previous call's exactly when one of them moved. About ten stat calls; poller thread only."""
+
+    def __init__(self, root):
+        self.root = root
+        self._paths = [os.path.join(root, *rel.split("/")) for rel in WATCH_SOURCES]
+        self._project_stamps = None
+
+    def _transcript(self):
+        """((project dir stamps), (transcript path, stamp)): the session transcript every session-keyed
+        collector reads (hmd_session_resolve.resolve -- the one rule). A transcript that appears or
+        vanishes moves a project dir's stamp; that is the one case the cached 2 s selection must be
+        re-made for, so a session that started a moment ago is picked up at once. Never raises."""
+        if SESSIONS is None:
+            return ()
+        try:
+            projects = tuple(_stamp(d) for d in SESSIONS.project_dirs(self.root))
+            ttl = 0 if projects != self._project_stamps else SESSIONS.DIR_SCAN_TTL_S
+            self._project_stamps = projects
+            session = SESSIONS.resolve(self.root, denied=path_is_denied, ttl=ttl)
+            return projects, ((session.path, _stamp(session.path)) if session else None)
+        except Exception:
+            return ()
+
+    def signature(self):
+        return tuple(_stamp(p) for p in self._paths), self._transcript()
+
+
 # ── one poller, many consumers ───────────────────────────────────────────────
 class StateCache:
-    """A single background thread re-reads the sources every POLL_INTERVAL_S and
-    publishes (state, digest). SSE clients wait on the condition for a digest change,
-    so N open tabs cost one collection per tick, not N. UIHandler._route's /api/state
-    branch shares this SAME object (state, digest, lock) via refresh() -- perf comes
-    from the lower-level subprocess/file caches making each refresh() cheap, not from
-    skipping it; a GET can also be what wakes an idle SSE stream, since refresh()
-    notifies the same condition variable wait_for_change() blocks on."""
+    """A single background thread keeps (state, digest) current and publishes it. SSE clients and
+    the relay client wait on the condition for a digest change, so N consumers cost one
+    collection per change, not N -- and a change is signalled the moment refresh() sees the
+    digest move.
+
+    The poller re-collects the moment a watched source moves (WatchedSources: a stat each every
+    WATCH_INTERVAL_S; at most one pass per REFRESH_MIN_GAP_S) and in any case every POLL_INTERVAL_S
+    (time-derived fields -- a panel going stale -- and any source nobody watches). Those passes are
+    "partial": every file re-read, the last subprocess answers reused (see _subprocess_reuse). A
+    second thread, the warmer, re-runs the spawn-backed collectors (SLOW_COLLECTORS) every
+    POLL_INTERVAL_S off the poller thread, so a change is never queued behind a spawn.
+
+    UIHandler._route's /api/state branch shares this SAME object (state, digest, lock) via
+    refresh() -- perf comes from the lower-level subprocess/file caches making each refresh()
+    cheap, not from skipping it; a GET can also be what wakes an idle SSE stream, since
+    refresh() notifies the same condition variable wait_for_change() blocks on."""
 
     def __init__(self, root, transport=None):
         self.root = root
@@ -1081,10 +1192,22 @@ class StateCache:
         self._digest = None
         self._refreshed_at = None   # time.monotonic() of the last completed refresh, or None
         self._stop = threading.Event()
+        self._warmed = threading.Event()   # set by the warmer: the slow answers are fresh, a pass is due
         self._live_users = None   # (value, written_at) of the self-published panel
         self._companion = new_companion_publisher(root)   # A3: chat / hmd-question / agents
 
-    def refresh(self, publish=False):
+    def refresh(self, publish=False, partial=False):
+        """Collect, publish (state, digest), and wake wait_for_change() waiters if the digest moved.
+        `partial` is the poller's pass: the subprocess-backed collectors serve their last answer
+        however old (see _subprocess_reuse). Every other caller -- a GET, the first pass -- re-spawns
+        once the subprocess TTL ran out, exactly as before."""
+        _subprocess_reuse.any_age = partial
+        try:
+            return self._refresh(publish)
+        finally:
+            _subprocess_reuse.any_age = False
+
+    def _refresh(self, publish):
         state = collect_state(self.root, self.transport)
         if publish:
             # Poll-tick only (never on a GET): publish hmd's own live-users tile from
@@ -1151,10 +1274,57 @@ class StateCache:
             return self._state, self._digest
 
     def run(self):
-        while not self._stop.is_set():
+        """The poller thread. One synchronous full pass first (every collector answers for real),
+        then a pass whenever a watched source moves or the warmer has refreshed the slow answers,
+        and in any case every POLL_INTERVAL_S -- all of them partial, so none ever waits on a spawn."""
+        watch = WatchedSources(self.root)
+        began, seen = time.monotonic(), watch.signature()
+        self._pass(partial=False)
+        threading.Thread(target=self._warm_loop, name="hmd-ui-warm", daemon=True).start()
+        while self._next_pass(watch, seen, time.monotonic() + POLL_INTERVAL_S, began + REFRESH_MIN_GAP_S):
+            # The signature is taken BEFORE collecting: a source that moves while this pass runs
+            # differs from it afterwards and triggers the next pass, so no write is ever missed.
+            began, seen = time.monotonic(), watch.signature()
+            self._pass(partial=True)
+
+    def _pass(self, partial):
+        try:
             with self._refresh_lock:
-                self.refresh(publish=True)
-            self._stop.wait(POLL_INTERVAL_S)
+                self.refresh(publish=True, partial=partial)
+        except Exception as e:
+            # one bad pass (a collector bug, a full disk under write_panel) must not end the poller
+            sys.stderr.write("hmd-ui: refresh failed: %s\n" % e.__class__.__name__)
+
+    def _next_pass(self, watch, seen, backstop_at, not_before):
+        """Sleep until the next pass is due: True when a watched source moved since `seen` or the
+        warmer finished (never before `not_before`, which bounds the CPU a write storm can cost) or
+        `backstop_at` passed; False when stopping. Sleeps WATCH_INTERVAL_S at a time, one
+        watch.signature() between sleeps."""
+        moved = False
+        while True:
+            now = time.monotonic()
+            if now >= backstop_at or (moved and now >= not_before):
+                return True
+            wake = min(backstop_at, not_before if moved else now + WATCH_INTERVAL_S)
+            if self._stop.wait(max(0.0, wake - now)):
+                return False
+            if not moved and (self._warmed.is_set() or watch.signature() != seen):
+                self._warmed.clear()
+                moved = True
+
+    def _warm_loop(self):
+        """The old backstop's expensive half, moved off the poller thread: every POLL_INTERVAL_S
+        re-run the collectors whose answer costs a process spawn (SLOW_COLLECTORS), so the answers
+        the poller's partial passes reuse are fresh, then tell it a pass is due. What they return is
+        discarded -- only the refreshed caches matter -- so a change that lands meanwhile is never
+        queued behind 0.3-1.5 s of spawns."""
+        while not self._stop.wait(POLL_INTERVAL_S):
+            for collect in SLOW_COLLECTORS:
+                try:
+                    collect(self.root)
+                except Exception as e:
+                    sys.stderr.write("hmd-ui: %s failed: %s\n" % (collect.__name__, e.__class__.__name__))
+            self._warmed.set()
 
     def start(self):
         t = threading.Thread(target=self.run, name="hmd-ui-poller", daemon=True)

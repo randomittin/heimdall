@@ -2724,8 +2724,13 @@ PYEOF
   check_res "$Q_CHECK" q2_attempts "1,2,3" "Q: a permanently failing ack is attempted exactly 3 times"
   check_res "$Q_CHECK" q2_ok "False,False,False" "Q: ...every attempt reported ok=false"
   check_res "$Q_CHECK" q2_delivered_frames 0 "Q: ...and none was accepted by the relay"
-  check_res "$Q_CHECK" q2_dropped_frames 3 "Q: ...the relay received all three copies"
-  check_res "$Q_CHECK" q2_identical True "Q: ...and all three copies are the same envelope"
+  # Three attempts, four POSTs: attempt 1 rides the ack connection that carried command 1's
+  # delivered ack (frames now travel on a persistent connection), the relay drops it exactly as a
+  # dead idle connection would drop it, and the client cannot tell the two apart -- so it re-POSTs
+  # the same envelope once on a fresh connection before it calls that attempt failed. Attempts 2
+  # and 3 open fresh connections of their own, so a failure there is not retried inside the attempt.
+  check_res "$Q_CHECK" q2_dropped_frames 4 "Q: ...the relay received four copies (attempt 1 went out twice: once on the reused connection, once on a fresh one)"
+  check_res "$Q_CHECK" q2_identical True "Q: ...and all four copies are the same envelope"
 
   check_res "$Q_CHECK" q3_attempts 1 "Q: a healthy relay is hit once per ack (no spurious retry)"
   check_res "$Q_CHECK" q3_ok True "Q: ...ok=true"
@@ -2926,7 +2931,9 @@ show("r2", run(DEFAULT, 2, [None] * 5))
 show("r3", run({"HMD_RELAY_ACK_WINDOW_S": "1.0"}, 3, [None] * 5, cost=0.6))
 # r4: the window was already spent (9 s inside the inbox write) -> the late first attempt is still made, no retries
 show("r4", run(DEFAULT, 4, [None, True], inbox_cost=9.0))
-# r5: the relay ANSWERED (200) but no phone is connected -> not a failed POST, so no retry
+# r5: the relay ANSWERED (200) but no phone is connected right now (delivered=false) -> an ack
+# is never stored, so the phone would never see it: retried like a failed POST, same envelope,
+# inside the window (zero-lag sync Ask 4c)
 show("r5", run(DEFAULT, 5, [False, True]))
 # r6: a command that fails to decrypt is acked, retried and logged too
 r6 = run(DEFAULT, 6, [None, True], corrupt=True)
@@ -2950,6 +2957,11 @@ show("r9", r9)
 print("RESULT r9_of_seq %s" % csv(e.get("of_seq") for e in r9["events"] if e.get("event") == "ack_sent"))
 # r10: a window of 0 means "never retry" -- the one attempt is still made
 show("r10", run({"HMD_RELAY_ACK_WINDOW_S": "0"}, 10, [None, True]))
+# r11: delivered=false every time -> still bounded at 3 attempts, every answer visible in ack_sent
+show("r11", run(DEFAULT, 11, [False] * 5))
+# r12: delivered=false and the window is a 1 s one burnt by 0.6 s attempts -> the same window rule
+# as a failed POST: the 3rd attempt never starts
+show("r12", run({"HMD_RELAY_ACK_WINDOW_S": "1.0"}, 12, [False] * 5, cost=0.6))
 # HMD_RELAY_ACK_WINDOW_S that is not a sane number of seconds falls back to the 8 s default
 for tag, value in (("nan", "nan"), ("negative", "-3"), ("junk", "abc"), ("huge", "1e9"),
                    ("zero", "0"), ("fractional", "2.5")):
@@ -2985,9 +2997,21 @@ PYEOF
   check_res "$ACK_OUT_R" r4_calls 1 "R/r4: a window already spent -> the (late) first attempt is still made, with no retries"
   check_res "$ACK_OUT_R" r4_timeouts "3.00" "R/r4: ...and gets the full per-attempt timeout"
 
-  check_res "$ACK_OUT_R" r5_calls 1 "R/r5: a 200 with delivered=false is an answer, not a failed POST -- no retry"
-  check_res "$ACK_OUT_R" r5_ok True "R/r5: ...ack_sent ok=true"
-  check_res "$ACK_OUT_R" r5_delivered False "R/r5: ...delivered=false, so a phone-less relay stays diagnosable"
+  check_res "$ACK_OUT_R" r5_calls 2 "R/r5: a 200 with delivered=false (no phone attached right now) is retried inside the window"
+  check_res "$ACK_OUT_R" r5_same_envelope True "R/r5: ...the identical sealed envelope again (same nonce, ciphertext, seq)"
+  check_res "$ACK_OUT_R" r5_waits "0.25" "R/r5: ...after the same 0.25 s backoff a failed POST gets"
+  check_res "$ACK_OUT_R" r5_attempts "1,2" "R/r5: ...ack_sent logs attempts 1,2"
+  check_res "$ACK_OUT_R" r5_ok "True,True" "R/r5: ...ok=true on both (the relay answered each time)"
+  check_res "$ACK_OUT_R" r5_delivered "False,True" "R/r5: ...delivered=false then true, so a phone-less relay stays diagnosable"
+  check_res "$ACK_OUT_R" r5_frames_sent 1 "R/r5: ...and the ack still counts once in frames_sent"
+
+  check_res "$ACK_OUT_R" r11_calls 3 "R/r11: a relay that keeps answering delivered=false is attempted exactly 3 times"
+  check_res "$ACK_OUT_R" r11_ok "True,True,True" "R/r11: ...every attempt ok=true (answered)"
+  check_res "$ACK_OUT_R" r11_delivered "False,False,False" "R/r11: ...every attempt delivered=false, none hidden"
+  check_res "$ACK_OUT_R" r11_last_delivered False "R/r11: ...relay.json's last_delivered ends false"
+
+  check_res "$ACK_OUT_R" r12_calls 2 "R/r12: delivered=false obeys the same window as a failed POST -- the 3rd attempt never starts"
+  check_res "$ACK_OUT_R" r12_timeouts "3.00,0.50" "R/r12: ...and the retry's timeout is capped to what is left of the window"
 
   check_res "$ACK_OUT_R" r6_command_detail "decrypt-failed" "R/r6: the command line reports decrypt-failed"
   check_res "$ACK_OUT_R" r6_attempts "1,2" "R/r6: its ack is retried and logged like any other"
@@ -3016,6 +3040,929 @@ PYEOF
   check_res "$ACK_OUT_R" window_huge "8.0" "R: HMD_RELAY_ACK_WINDOW_S=1e9 (absurd) falls back to the 8 s default"
 else
   skip "scenario R (ack retry timing rules): bin/lib/hmd_relay_e2e.py absent -- needs real seal/open"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+# docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md (hmdapp repo, read-only), Asks 3 and
+# 4 -- the hmd -> relay leg:
+#   3. one persistent connection for POST /frames, not one per frame
+#                              -> S (the transport, against fake-relay.py's
+#                                 connection counter), U (the real client)
+#   4a. a failed state POST is re-sent, not forgotten
+#                              -> T (real client, a relay that drops the first
+#                                 state POST), W (the digest/backoff rules)
+#   4b. an ack never waits behind a slow state POST
+#                              -> U (real client, a state POST held 3 s at the
+#                                 relay while a command is acked), W (the lock
+#                                 and ordering rules, stub transport)
+#   4c. an ack answered delivered=false is retried inside the ack window
+#                              -> U (real client), R above (the timing rules)
+# Every case reads the same way against the pre-fix client, which is what makes
+# the failures there meaningful: a connection per POST, a digest recorded before
+# its POST, one lock across seal + POST + ack retries.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Scenario S: POST /frames rides ONE persistent connection per sender. Drives
+# RelayClient.send_frame_envelope -- the one function every state frame and every
+# ack POST goes through -- against fake-relay.py, which numbers every TCP
+# connection it accepts (frame-posts.log), so "one connection" is the relay's own
+# count and not the client's claim ───────────────────────────────────────────
+PORT_S_RELAY="$(free_port)"
+LOG_S="$TMPROOT/s.log"; CTL_S="$TMPROOT/s.ctl"
+mkdir -p "$LOG_S" "$CTL_S"
+python3 "$FAKE_RELAY" serve "$PORT_S_RELAY" --log "$LOG_S" --ctl "$CTL_S" >"$TMPROOT/s.srv.out" 2>&1 &
+SRV_S=$!
+PIDS+=("$SRV_S")
+for _ in $(seq 1 50); do
+  python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_S_RELAY))==0 else 1)" && break
+  sleep 0.1
+done
+
+FRAMES_OUT_S="$TMPROOT/s.frames.out"
+python3 - "$RELAY_CLIENT_RUN" "$PORT_S_RELAY" "$LOG_S" "$CTL_S" >"$FRAMES_OUT_S" 2>"$TMPROOT/s.frames.err" <<'PYEOF'
+import argparse
+import contextlib
+import io
+import json
+import os
+import socket
+import sys
+import tempfile
+import time
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+
+client_path, port, log_dir, ctl_dir = sys.argv[1:5]
+loader = SourceFileLoader("hmd_relay_client_frames_harness", client_path)
+mod = module_from_spec(spec_from_loader(loader.name, loader))
+loader.exec_module(mod)
+
+NONCE, CIPHERTEXT = "bm9uY2U", "Y2lwaGVydGV4dA"  # opaque to the relay: it never opens a frame
+
+
+def csv(values):
+    return ",".join(str(v) for v in values)
+
+
+def new_client(repo):
+    """A RelayClient paired for real with the fake relay (a fresh session each time)."""
+    args = argparse.Namespace(relay="http://127.0.0.1:%s" % port, repo=repo, ui_port=0, public_host=None,
+                              status_file=os.path.join(repo, "status.json"), tick_s=2.0)
+    client = mod.RelayClient(args)
+    client.priv, client.pub = mod.E2E.generate_keypair()
+    with contextlib.redirect_stdout(io.StringIO()):
+        if client.pair_init() != 0:
+            raise SystemExit("pair_init against the fake relay failed")
+    return client
+
+
+def post(client, type_, seq, timeout=15):
+    """One send_frame_envelope call -> (answer, events it emitted, seconds it took)."""
+    out = io.StringIO()
+    began = time.monotonic()
+    with contextlib.redirect_stdout(out):
+        answer, _nbytes = client.send_frame_envelope(type_, NONCE, CIPHERTEXT, seq, timeout=timeout)
+    events = [json.loads(l) for l in out.getvalue().splitlines() if l.strip()]
+    return answer, events, time.monotonic() - began
+
+
+def connects(events):
+    return [e for e in events if e.get("event") == "connect" and e.get("for") == "frames"]
+
+
+def posts(events):
+    return [e for e in events if e.get("event") == "post"]
+
+
+def relay_rows(seqs):
+    """The relay's own frame-posts.log lines for these seqs, oldest first."""
+    rows = []
+    with open(os.path.join(log_dir, "frame-posts.log"), encoding="utf-8") as f:
+        for line in f:
+            kv = dict(part.split("=", 1) for part in line.split())
+            if kv["seq"].isdigit() and int(kv["seq"]) in seqs:
+                rows.append(kv)
+    return rows
+
+
+def relay_bodies(name, seq):
+    path = os.path.join(log_dir, name)
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [l.rstrip("\n") for l in f if l.strip() and json.loads(l).get("seq") == seq]
+
+
+def socket_of(client, sender):
+    """The pooled socket of one sender's connection, or None when the client keeps no pool."""
+    try:
+        return client._frame_channels[sender].conn.sock
+    except (AttributeError, KeyError):
+        return None
+
+
+def keepalive_set(sock):
+    if sock is None:
+        return "no-pooled-socket"
+    return bool(sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE))
+
+
+def put_token(name):
+    open(os.path.join(ctl_dir, name), "w").close()
+
+
+def remove_token(name):
+    os.remove(os.path.join(ctl_dir, name))
+
+
+# s1: six state POSTs in a row -- one connection, opened by the first and reused by the rest
+with tempfile.TemporaryDirectory() as repo:
+    client = new_client(repo)
+    events, answers = [], []
+    for seq in range(101, 107):
+        answer, evs, _secs = post(client, "state", seq)
+        answers.append(answer)
+        events += evs
+    print("RESULT s1_answers %s" % csv(answers))
+    print("RESULT s1_connects %d" % len(connects(events)))
+    print("RESULT s1_reused %s" % csv(e.get("reused") for e in posts(events)))
+    print("RESULT s1_post_keys %s" % csv(sorted(posts(events)[0])) if posts(events) else "RESULT s1_post_keys none")
+    print("RESULT s1_ms_ints %s" % (bool(posts(events)) and all(isinstance(e.get("ms"), int) and e["ms"] >= 0
+                                                                for e in posts(events))))
+    print("RESULT s1_relay_conns %d" % len({r["conn"] for r in relay_rows(set(range(101, 107)))}))
+    print("RESULT s1_keepalive %s" % keepalive_set(socket_of(client, "state")))
+
+    # s2: an ack has a connection of its own -- the state connection is untouched by it
+    ack1, ev_ack1, _ = post(client, "ack", 201)
+    state7, ev_state7, _ = post(client, "state", 107)
+    ack2, ev_ack2, _ = post(client, "ack", 202)
+    print("RESULT s2_answers %s" % csv([ack1, state7, ack2]))
+    print("RESULT s2_connects %s" % csv([len(connects(ev_ack1)), len(connects(ev_state7)), len(connects(ev_ack2))]))
+    print("RESULT s2_reused %s" % csv(e.get("reused") for e in posts(ev_ack1 + ev_state7 + ev_ack2)))
+    ack_conns = {r["conn"] for r in relay_rows({201, 202})}
+    state_conns = {r["conn"] for r in relay_rows({107})} | {r["conn"] for r in relay_rows(set(range(101, 107)))}
+    print("RESULT s2_relay_ack_conns %d" % len(ack_conns))
+    print("RESULT s2_relay_state_conns %d" % len(state_conns))
+    print("RESULT s2_relay_disjoint %s" % (not (ack_conns & state_conns)))
+    print("RESULT s2_keepalive %s" % keepalive_set(socket_of(client, "ack")))
+
+# s3: the connection died while idle (the relay closes it as it reads the next request) -- the
+# SAME sealed envelope goes out once more, at once, on a fresh connection
+with tempfile.TemporaryDirectory() as repo:
+    client = new_client(repo)
+    post(client, "state", 301)
+    put_token("fail-state-posts=1")
+    answer, evs, _secs = post(client, "state", 302)
+    rows = relay_rows({302})
+    dropped, delivered = relay_bodies("frames-dropped.ndjson", 302), relay_bodies("frames.ndjson", 302)
+    print("RESULT s3_answer %s" % answer)
+    print("RESULT s3_relay_results %s" % csv(r["result"] for r in rows))
+    print("RESULT s3_relay_conns %d" % len({r["conn"] for r in rows}))
+    print("RESULT s3_same_envelope %s" % (len(dropped) == 1 and len(delivered) == 1 and dropped[0] == delivered[0]))
+    print("RESULT s3_connects %d" % len(connects(evs)))
+    print("RESULT s3_reused %s" % csv(e.get("reused") for e in posts(evs)))
+    print("RESULT s3_errors %d" % sum(1 for e in evs if e.get("event") == "error"))
+
+# s4: a failure on a connection opened for THAT POST is not retried here -- nothing about a
+# fresh connection is stale, and the caller (ack retry, the state loop) owns the next try
+with tempfile.TemporaryDirectory() as repo:
+    client = new_client(repo)
+    put_token("fail-state-posts=1")
+    answer, evs, _secs = post(client, "state", 401)
+    print("RESULT s4_answer %s" % answer)
+    print("RESULT s4_relay_posts %d" % len(relay_rows({401})))
+    print("RESULT s4_error_events %d" % sum(1 for e in evs if e.get("event") == "error" and "post failed" in e.get("detail", "")))
+
+# s5: a POST that times out drops its connection -- the late answer must never be read as the
+# answer to the NEXT frame -- and is not retried (it already spent the whole budget)
+with tempfile.TemporaryDirectory() as repo:
+    client = new_client(repo)
+    post(client, "state", 501)
+    put_token("delay-state-posts=2")
+    answer, _evs, secs = post(client, "state", 502, timeout=0.5)
+    remove_token("delay-state-posts=2")
+    answer2, evs2, _secs2 = post(client, "state", 503)
+    print("RESULT s5_timeout_answer %s" % answer)
+    print("RESULT s5_timeout_ms %d" % round(secs * 1000))
+    print("RESULT s5_next_answer %s" % answer2)
+    print("RESULT s5_next_reused %s" % csv(e.get("reused") for e in posts(evs2)))
+    print("RESULT s5_next_connects %d" % len(connects(evs2)))
+
+# s6: anything that interrupts a POST half way -- not only a network error -- must not leave a
+# half-used connection behind to be reused: the next POST opens a fresh one
+with tempfile.TemporaryDirectory() as repo:
+    client = new_client(repo)
+    post(client, "state", 601)
+    real_request = mod.http.client.HTTPConnection.request
+
+    def interrupted_request(self, *args, **kwargs):
+        raise RuntimeError("simulated non-network fault mid-request")
+
+    mod.http.client.HTTPConnection.request = interrupted_request
+    try:
+        try:
+            post(client, "state", 602)
+            raised = "nothing"
+        except RuntimeError as e:
+            raised = type(e).__name__
+    finally:
+        mod.http.client.HTTPConnection.request = real_request
+    pooled = getattr(client, "_frame_channels", {}).get("state")
+    pool_emptied = pooled is not None and pooled.conn is None
+    answer, evs, _secs = post(client, "state", 603)
+    print("RESULT s6_raised %s" % raised)
+    print("RESULT s6_pool_emptied %s" % pool_emptied)
+    print("RESULT s6_next_answer %s" % answer)
+    print("RESULT s6_next_reused %s" % csv(e.get("reused") for e in posts(evs)))
+    print("RESULT s6_next_connects %d" % len(connects(evs)))
+
+# s7: a reused connection that fails AFTER the POST's whole budget is spent is not retried -- the
+# retry would have nothing left to run in, and would hide the real error behind its own timeout
+with tempfile.TemporaryDirectory() as repo:
+    client = new_client(repo)
+    post(client, "state", 701)
+    real_getresponse, real_connect = mod.http.client.HTTPConnection.getresponse, mod._connect
+    opened = []
+
+    def late_reset(self, *args, **kwargs):
+        time.sleep(0.4)  # past the 0.3 s budget below
+        raise ConnectionResetError("simulated reset after the budget is gone")
+
+    def counting_connect(*args, **kwargs):
+        opened.append(1)
+        return real_connect(*args, **kwargs)
+
+    mod.http.client.HTTPConnection.getresponse = late_reset
+    mod._connect = counting_connect
+    try:
+        answer, evs, secs = post(client, "state", 702, timeout=0.3)
+    finally:
+        mod.http.client.HTTPConnection.getresponse = real_getresponse
+        mod._connect = real_connect
+    print("RESULT s7_answer %s" % answer)
+    print("RESULT s7_new_connections %d" % len(opened))
+    print("RESULT s7_error_events %d" % sum(1 for e in evs if e.get("event") == "error" and "simulated reset" in e.get("detail", "")))
+sys.exit(0)
+PYEOF
+FRAMES_RC_S=$?
+
+if [ "$FRAMES_RC_S" -eq 0 ]; then
+  ok "scenario S: frame-connection harness ran to completion"
+else
+  bad "scenario S: frame-connection harness exited $FRAMES_RC_S -- $(tail -3 "$TMPROOT/s.frames.err")"
+fi
+
+check_res "$FRAMES_OUT_S" s1_answers "True,True,True,True,True,True" "S/s1: six state POSTs, six delivered answers"
+check_res "$FRAMES_OUT_S" s1_connects 1 "S/s1: six state POSTs opened exactly ONE connection (connect events)"
+check_res "$FRAMES_OUT_S" s1_reused "False,True,True,True,True,True" "S/s1: ...the first POST opened it, the other five reused it (post events)"
+check_res "$FRAMES_OUT_S" s1_post_keys "event,ms,reused" "S/s1: a post event carries exactly event, ms and reused"
+check_res "$FRAMES_OUT_S" s1_ms_ints True "S/s1: ...ms is a non-negative integer"
+check_res "$FRAMES_OUT_S" s1_relay_conns 1 "S/s1: the relay itself counted ONE connection for the six frames"
+check_res "$FRAMES_OUT_S" s1_keepalive True "S/s1: the pooled socket has TCP keepalive on (an idle NAT mapping does not silently kill it)"
+
+check_res "$FRAMES_OUT_S" s2_answers "True,True,True" "S/s2: an ack, a state frame and an ack, all delivered"
+check_res "$FRAMES_OUT_S" s2_connects "1,0,0" "S/s2: the first ack opened a connection of its own; the next state frame and ack opened none"
+check_res "$FRAMES_OUT_S" s2_reused "False,True,True" "S/s2: ...the state frame reused the state connection, the second ack the ack connection"
+check_res "$FRAMES_OUT_S" s2_relay_ack_conns 1 "S/s2: the relay saw every ack on ONE connection"
+check_res "$FRAMES_OUT_S" s2_relay_state_conns 1 "S/s2: ...and every state frame on ONE connection"
+check_res "$FRAMES_OUT_S" s2_relay_disjoint True "S/s2: ...never the same one (a slow state POST cannot hold up an ack)"
+check_res "$FRAMES_OUT_S" s2_keepalive True "S/s2: the ack connection has TCP keepalive on too"
+
+check_res "$FRAMES_OUT_S" s3_answer True "S/s3: a reused connection that dies mid-request still ends in a delivered answer"
+check_res "$FRAMES_OUT_S" s3_relay_results "dropped,ok" "S/s3: the relay saw the POST twice: dropped, then answered"
+check_res "$FRAMES_OUT_S" s3_relay_conns 2 "S/s3: ...on two different connections"
+check_res "$FRAMES_OUT_S" s3_same_envelope True "S/s3: ...the very same sealed envelope both times (same seq, nonce, ciphertext)"
+check_res "$FRAMES_OUT_S" s3_connects 1 "S/s3: exactly one reconnect"
+check_res "$FRAMES_OUT_S" s3_reused False "S/s3: the answered exchange is reported as not reused"
+check_res "$FRAMES_OUT_S" s3_errors 0 "S/s3: a stale connection that was transparently replaced is not an error"
+
+check_res "$FRAMES_OUT_S" s4_answer None "S/s4: a failure on a brand-new connection is reported to the caller as no usable answer"
+check_res "$FRAMES_OUT_S" s4_relay_posts 1 "S/s4: ...after exactly one POST (no blind retry)"
+check_res "$FRAMES_OUT_S" s4_error_events 1 "S/s4: ...and one loud error event"
+
+check_res "$FRAMES_OUT_S" s5_timeout_answer None "S/s5: a timed-out POST is reported as no usable answer"
+check_res_between "$FRAMES_OUT_S" s5_timeout_ms 400 1500 "S/s5: ...after its own 0.5 s budget, not retried into a second wait (ms)"
+check_res "$FRAMES_OUT_S" s5_next_answer True "S/s5: the next POST is answered normally (the late answer was never read as its own)"
+check_res "$FRAMES_OUT_S" s5_next_reused False "S/s5: ...on a fresh connection: the timed-out one was dropped, not reused"
+check_res "$FRAMES_OUT_S" s5_next_connects 1 "S/s5: ...one connect event"
+
+check_res "$FRAMES_OUT_S" s6_raised RuntimeError "S/s6: a non-network fault mid-POST propagates (it is not mistaken for a stale connection)"
+check_res "$FRAMES_OUT_S" s6_pool_emptied True "S/s6: ...and the interrupted connection is dropped from the pool"
+check_res "$FRAMES_OUT_S" s6_next_answer True "S/s6: the next POST is answered normally"
+check_res "$FRAMES_OUT_S" s6_next_reused False "S/s6: ...on a fresh connection, not the half-used one"
+check_res "$FRAMES_OUT_S" s6_next_connects 1 "S/s6: ...one connect event"
+
+check_res "$FRAMES_OUT_S" s7_answer None "S/s7: a reused connection that fails once the budget is gone is reported as no usable answer"
+check_res "$FRAMES_OUT_S" s7_new_connections 0 "S/s7: ...with no retry attempted (a retry has nothing left to run in)"
+check_res "$FRAMES_OUT_S" s7_error_events 1 "S/s7: ...and the error event names the real failure, not a retry's timeout"
+if [ ! -s "$TMPROOT/s.frames.err" ]; then
+  ok "S: the harness wrote nothing to stderr"
+else
+  bad "S: the harness wrote to stderr: $(head -5 "$TMPROOT/s.frames.err")"
+fi
+
+kill "$SRV_S" 2>/dev/null
+wait "$SRV_S" 2>/dev/null
+
+# ── Scenario T: a failed state POST is re-sent. The relay receives the very first
+# state POST in full and never answers it (fail-state-posts=1). Nothing in the repo
+# changes afterwards, so the ONLY thing that can put that state on the wire again is
+# the client treating the failure as "not sent". The pre-fix client recorded the
+# digest BEFORE posting: the frame was simply gone, until the next state change ─
+if [ "$E2E_PRESENT" = true ]; then
+  REPO_T="$(make_repo)"
+  PORT_T_RELAY="$(free_port)"
+  PORT_T_UI="$(free_port)"
+  LOG_T="$TMPROOT/t.log"; CTL_T="$TMPROOT/t.ctl"
+  mkdir -p "$LOG_T" "$CTL_T"
+  : > "$CTL_T/fail-state-posts=1"
+
+  python3 "$FAKE_RELAY" serve "$PORT_T_RELAY" --log "$LOG_T" --ctl "$CTL_T" >"$TMPROOT/t.srv.out" 2>&1 &
+  SRV_T=$!
+  PIDS+=("$SRV_T")
+  for _ in $(seq 1 50); do
+    python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_T_RELAY))==0 else 1)" && break
+    sleep 0.1
+  done
+
+  CLIENT_T_OUT="$TMPROOT/t.client.out"
+  "$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_T_RELAY" --repo "$REPO_T" --ui-port "$PORT_T_UI" \
+    >"$CLIENT_T_OUT" 2>"$TMPROOT/t.client.err" &
+  CLIENT_T=$!
+  PIDS+=("$CLIENT_T")
+
+  if wait_for_count "$LOG_T/frames-dropped.ndjson" 1 '"type":"state"' 15; then
+    ok "scenario T: the relay received the first state POST and dropped it unanswered"
+  else
+    bad "scenario T: the relay never saw a state POST to drop"
+  fi
+  if wait_for_count "$LOG_T/frames.ndjson" 1 '"type":"state"' 15; then
+    ok "scenario T: the state whose POST failed was re-sent, with no state change in between"
+  else
+    bad "scenario T: the state whose POST failed was never re-sent (its digest was recorded before the POST)"
+  fi
+  [ -e "$LOG_T/frames.ndjson" ] && { wait_for_quiescent_count "$LOG_T/frames.ndjson" 4 14 || true; }
+  T_DROPPED="$(count_matching "$LOG_T/frames-dropped.ndjson" '"type":"state"')"
+  T_DELIVERED="$(count_matching "$LOG_T/frames.ndjson" '"type":"state"')"
+  if [ "$T_DROPPED" -eq 1 ] && [ "$T_DELIVERED" -eq 1 ]; then
+    ok "scenario T: exactly one dropped and one delivered state frame (a retry, not a resend loop; INV-22 intact)"
+  else
+    bad "scenario T: want 1 dropped + 1 delivered state frame, got $T_DROPPED dropped + $T_DELIVERED delivered"
+  fi
+  if wait_for_event "$CLIENT_T_OUT" "error" "post failed" 2; then
+    ok "scenario T: the failed POST was reported (error event naming it), not swallowed"
+  else
+    bad "scenario T: the failed state POST left no error event"
+  fi
+  T_GAP_MS="$(python3 - "$LOG_T/frame-posts.log" <<'PYEOF'
+import sys
+
+rows = []
+with open(sys.argv[1], encoding="utf-8") as f:
+    for line in f:
+        rows.append(dict(part.split("=", 1) for part in line.split()))
+dropped = [r for r in rows if r["type"] == "state" and r["result"] == "dropped"]
+sent = [r for r in rows if r["type"] == "state" and r["result"] == "ok"]
+if dropped and sent:
+    print(int((float(sent[0]["done"]) - float(dropped[0]["recv"])) * 1000))
+PYEOF
+)"
+  if [ -n "$T_GAP_MS" ] && [ "$T_GAP_MS" -lt 8000 ]; then
+    ok "scenario T: the re-send reached the relay ${T_GAP_MS} ms after the dropped POST (< 8000 ms: next tick plus a bounded backoff)"
+  else
+    bad "scenario T: re-send gap was '$T_GAP_MS' ms, want < 8000"
+  fi
+  if [ ! -s "$TMPROOT/t.client.err" ]; then
+    ok "scenario T: the client wrote nothing to stderr"
+  else
+    bad "scenario T: the client wrote to stderr: $(head -5 "$TMPROOT/t.client.err")"
+  fi
+
+  kill "$CLIENT_T" 2>/dev/null
+  wait "$CLIENT_T" 2>/dev/null
+  kill "$SRV_T" 2>/dev/null
+  wait "$SRV_T" 2>/dev/null
+else
+  skip "scenario T (failed state POST is re-sent): bin/lib/hmd_relay_e2e.py absent"
+fi
+
+# ── Scenario U: the REAL client, a state POST held 3 s at the relay (delay-state-
+# posts) while the phone's command arrives. The ack must land at once (it has a
+# connection and a lock of its own), the state frame it overtook must be re-sent
+# (the phone drops a frame whose seq a newer one has passed), every state POST
+# rides one connection and every ack another, and an ack answered delivered=false
+# is retried. The no-op command writes nothing to the inbox, so no state change
+# can explain a later state frame ─────────────────────────────────────────────
+prepare_device_action() {
+  # prepare_device_action OUT_FILE SESSION_ID KEY_B64 SEQ JSON -- seals JSON (a whole command
+  # object) as the paired device into a complete relay envelope at OUT_FILE WITHOUT queueing it:
+  # the relay's stream only pushes what appears in the ctl dir, so a test can `mv` the file there
+  # the instant it wants the command to arrive (sealing takes the better part of a second, which
+  # is a large slice of a 3 s window)
+  local out="$1" sid="$2" key="$3" seq="$4" json_text="$5" seal nonce ct
+  seal="$(python3 "$FAKE_RELAY" device seal --key-b64 "$key" --seq "$seq" --sender device --text "$json_text")"
+  nonce="$(printf '%s' "$seal" | python3 -c 'import json,sys; print(json.load(sys.stdin)["nonce_b64"])')"
+  ct="$(printf '%s' "$seal" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ciphertext_b64"])')"
+  python3 "$FAKE_RELAY" device envelope --session-id "$sid" --seq "$seq" --sender device \
+    --type command --nonce "$nonce" --ciphertext "$ct" > "$out"
+}
+
+if [ "$E2E_PRESENT" = true ]; then
+  REPO_U="$(make_repo)"
+  PORT_U_RELAY="$(free_port)"
+  PORT_U_UI="$(free_port)"
+  LOG_U="$TMPROOT/u.log"; CTL_U="$TMPROOT/u.ctl"
+  mkdir -p "$LOG_U" "$CTL_U"
+
+  python3 "$FAKE_RELAY" serve "$PORT_U_RELAY" --log "$LOG_U" --ctl "$CTL_U" >"$TMPROOT/u.srv.out" 2>&1 &
+  SRV_U=$!
+  PIDS+=("$SRV_U")
+  for _ in $(seq 1 50); do
+    python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT_U_RELAY))==0 else 1)" && break
+    sleep 0.1
+  done
+
+  DEVU_KEY_JSON="$(python3 "$FAKE_RELAY" device keygen)"
+  DEVU_PRIV_B64="$(printf '%s' "$DEVU_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["priv_b64"])')"
+  DEVU_PUB_B64="$(printf '%s' "$DEVU_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pub_b64"])')"
+  printf '%s' "$DEVU_PUB_B64" > "$CTL_U/bind-device"
+
+  CLIENT_U_OUT="$TMPROOT/u.client.out"
+  EVENT_LOG_U="$REPO_U/.heimdall/app/relay-events.jsonl"
+  "$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$PORT_U_RELAY" --repo "$REPO_U" --ui-port "$PORT_U_UI" \
+    >"$CLIENT_U_OUT" 2>"$TMPROOT/u.client.err" &
+  CLIENT_U=$!
+  PIDS+=("$CLIENT_U")
+
+  wait_for "$CLIENT_U_OUT" '"event":"pair_init"' 10 || true
+  SID_U="$(python3 -c "
+import json
+for line in open('$CLIENT_U_OUT'):
+    o = json.loads(line)
+    if o.get('event') == 'pair_init':
+        print(o['qr']['session_id']); break
+" 2>/dev/null)"
+  HMD_PUB_U="$(python3 -c "
+import json
+for line in open('$CLIENT_U_OUT'):
+    o = json.loads(line)
+    if o.get('event') == 'pair_init':
+        print(o['qr']['hmd_pubkey']); break
+" 2>/dev/null)"
+  if wait_for "$CLIENT_U_OUT" '"event":"device_bound"' 10 && [ -n "$SID_U" ] && [ -n "$HMD_PUB_U" ]; then
+    ok "scenario U: relay-client paired (session key derivable)"
+  else
+    bad "scenario U: relay-client never paired -- the rest of U cannot run: $(tail -3 "$TMPROOT/u.client.err" 2>/dev/null)"
+  fi
+  SESSION_KEY_U="$(python3 "$FAKE_RELAY" device derive --dev-priv-b64 "$DEVU_PRIV_B64" --hmd-pub-b64 "$HMD_PUB_U" --session-id "$SID_U" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["key_b64"])')"
+
+  # a no-op action writes nothing to the inbox, so no state change can explain a later state frame;
+  # both commands are sealed now and moved into the ctl dir only when each is wanted
+  prepare_device_action "$TMPROOT/u.cmd1.json" "$SID_U" "$SESSION_KEY_U" 1 '{"action":"noop","params":{}}'
+  prepare_device_action "$TMPROOT/u.cmd2.json" "$SID_U" "$SESSION_KEY_U" 2 '{"action":"noop","params":{}}'
+
+  # the first state frame, so both directions of the exchange start from a warm state connection
+  if wait_for_count "$LOG_U/frames.ndjson" 1 '"type":"state"' 10; then
+    ok "scenario U: first state frame delivered"
+  else
+    bad "scenario U: no first state frame"
+  fi
+
+  # a state change whose POST the relay then holds 3 s
+  : > "$CTL_U/delay-state-posts=3"
+  ( cd "$REPO_U" && HEIMDALL_WATCH_ROOT="$REPO_U" "$UI" panel set slow-state --type number \
+      --title "slow state probe" --data-json - <<<'{"value":1}' ) >/dev/null 2>&1
+  for _ in $(seq 1 120); do
+    [ -e "$LOG_U/state-inflight" ] && break
+    sleep 0.1
+  done
+  if [ -e "$LOG_U/state-inflight" ]; then
+    ok "scenario U: a state POST is in flight at the relay, held 3 s"
+  else
+    bad "scenario U: the changed state was never POSTed -- U cannot show an ack passing it"
+  fi
+
+  # the command goes in while that POST is still held
+  mv "$TMPROOT/u.cmd1.json" "$CTL_U/001.json"
+  ACK_U1_JSON="$(wait_for_ack_of_seq "$LOG_U/frames.ndjson" "$SESSION_KEY_U" 1 10)"
+  rm -f "$CTL_U/delay-state-posts=3"
+  if [ -n "$ACK_U1_JSON" ]; then
+    ok "scenario U: the ack for seq=1 reached the relay"
+  else
+    bad "scenario U: no ack for seq=1 ever reached the relay"
+  fi
+
+  # the state frame the ack overtook is re-sent (a frame with a seq above the ack's)
+  U_RESEND="$(python3 - "$LOG_U/frames.ndjson" 20 <<'PYEOF'
+import json
+import sys
+import time
+
+path, secs = sys.argv[1], float(sys.argv[2])
+deadline = time.time() + secs
+while True:
+    ack_seq, state_seqs = None, []
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            env = json.loads(line)
+        except ValueError:
+            continue
+        if env.get("type") == "ack" and ack_seq is None:
+            ack_seq = env["seq"]
+        if env.get("type") == "state":
+            state_seqs.append(env["seq"])
+    if ack_seq is not None and any(s > ack_seq for s in state_seqs):
+        print("yes")
+        sys.exit(0)
+    if time.time() >= deadline:
+        print("no")
+        sys.exit(0)
+    time.sleep(0.1)
+PYEOF
+)"
+  if [ "$U_RESEND" = "yes" ]; then
+    ok "scenario U: the state frame the ack overtook was re-sent under a seq above the ack's"
+  else
+    bad "scenario U: no state frame with a seq above the ack's ever followed -- the phone would keep the older state it dropped"
+  fi
+
+  # the delivered=false ack: the relay says no phone is attached for the next two tries
+  : > "$CTL_U/undelivered-ack-posts=2"
+  mv "$TMPROOT/u.cmd2.json" "$CTL_U/002.json"
+  wait_for_count "$EVENT_LOG_U" 3 '"event":"ack_sent".*"of_seq":2,' 15 || true
+  ACK_U2_JSON="$(wait_for_ack_of_seq "$LOG_U/frames.ndjson" "$SESSION_KEY_U" 2 5)"
+  if [ -n "$ACK_U2_JSON" ]; then
+    ok "scenario U: the ack for seq=2 reached the phone after two delivered=false answers"
+  else
+    bad "scenario U: the ack for seq=2 never reached the phone -- a delivered=false answer was not retried"
+  fi
+
+  U_CHECK="$TMPROOT/u.check.out"
+  python3 - "$EVENT_LOG_U" "$LOG_U/frame-posts.log" "$LOG_U/frames.ndjson" "$LOG_U/frames-undelivered.ndjson" \
+    >"$U_CHECK" 2>"$TMPROOT/u.check.err" <<'PYEOF'
+import calendar
+import json
+import sys
+import time
+
+events_path, posts_path, frames_path, undelivered_path = sys.argv[1:5]
+
+
+def lines_of(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [l.rstrip("\n") for l in f if l.strip()]
+    except OSError:
+        return []
+
+
+def csv(values):
+    return ",".join(str(v) for v in values)
+
+
+def ts(event):
+    t = event["ts"]
+    return calendar.timegm(time.strptime(t[:19], "%Y-%m-%dT%H:%M:%S")) + int(t[20:23]) / 1000.0
+
+
+events = []
+for line in lines_of(events_path):
+    try:
+        events.append(json.loads(line))
+    except ValueError:
+        continue  # the client is still running -- a half-written last line
+
+rows = []
+for line in lines_of(posts_path):
+    kv = dict(part.split("=", 1) for part in line.split())
+    kv["recv"], kv["done"] = float(kv["recv"]), float(kv["done"])
+    kv["seq"] = int(kv["seq"]) if kv["seq"].isdigit() else None
+    rows.append(kv)
+
+# u1: the command is acked while the state POST is still held at the relay
+cmd1 = next((e for e in events if e.get("event") == "command"), None)
+ack1 = next((e for e in events if e.get("event") == "ack_sent" and e.get("of_seq") == 1), None)
+print("RESULT u1_ack_ms %d" % (round((ts(ack1) - ts(cmd1)) * 1000) if cmd1 and ack1 else -1))
+ack_row = next((r for r in rows if ack1 and r["type"] == "ack" and r["seq"] == ack1["seq"] and r["result"] == "ok"), None)
+held = [r for r in rows if ack_row and r["type"] == "state" and r["recv"] < ack_row["done"] < r["done"]
+        and r["done"] - r["recv"] >= 2.5]
+print("RESULT u1_state_in_flight %s" % bool(held))
+overtaken = [r for r in rows if ack1 and ack_row and r["type"] == "state" and r["result"] == "ok"
+             and r["seq"] < ack1["seq"] and r["done"] > ack_row["done"]]
+print("RESULT u1_state_overtaken %s" % bool(overtaken))
+
+# u2: connections, counted by the relay and by the client's own events
+state_conns = {r["conn"] for r in rows if r["type"] == "state"}
+ack_conns = {r["conn"] for r in rows if r["type"] == "ack"}
+print("RESULT u2_state_conns %d" % len(state_conns))
+print("RESULT u2_ack_conns %d" % len(ack_conns))
+print("RESULT u2_disjoint %s" % (not (state_conns & ack_conns)))
+print("RESULT u2_frames_connects %d" % sum(1 for e in events if e.get("event") == "connect" and e.get("for") == "frames"))
+print("RESULT u2_unreused_posts %d" % sum(1 for e in events if e.get("event") == "post" and e.get("reused") is False))
+
+# u3: delivered=false is retried
+a2 = [e for e in events if e.get("event") == "ack_sent" and e.get("of_seq") == 2]
+print("RESULT u3_attempts %s" % csv(e["attempt"] for e in a2))
+print("RESULT u3_ok %s" % csv(e["ok"] for e in a2))
+print("RESULT u3_delivered %s" % csv(e["delivered"] for e in a2))
+print("RESULT u3_one_seq %s" % (bool(a2) and len({e["seq"] for e in a2}) == 1))
+seq2 = a2[0]["seq"] if a2 else None
+undelivered = [l for l in lines_of(undelivered_path) if json.loads(l).get("seq") == seq2]
+delivered = [l for l in lines_of(frames_path) if json.loads(l).get("type") == "ack" and json.loads(l).get("seq") == seq2]
+print("RESULT u3_undelivered_frames %d" % len(undelivered))
+print("RESULT u3_delivered_frames %d" % len(delivered))
+print("RESULT u3_identical %s" % (bool(delivered) and bool(undelivered) and all(l == delivered[0] for l in undelivered)))
+PYEOF
+
+  check_res_between "$U_CHECK" u1_ack_ms 0 500 "scenario U: the ack landed within 500 ms of its command while a state POST was held 3 s (ms)"
+  check_res "$U_CHECK" u1_state_in_flight True "scenario U: ...and the relay's own log shows that state POST still in flight when the ack landed"
+  check_res "$U_CHECK" u1_state_overtaken True "scenario U: ...so the ack really did pass the older state frame (the phone will drop the state as a replay)"
+  check_res "$U_CHECK" u2_state_conns 1 "scenario U: every state POST of the session rode ONE connection (the relay's count)"
+  check_res "$U_CHECK" u2_ack_conns 1 "scenario U: every ack POST rode ONE connection"
+  check_res "$U_CHECK" u2_disjoint True "scenario U: ...never the same one"
+  check_res "$U_CHECK" u2_frames_connects 2 "scenario U: exactly two connect events for frames (one per sender) across the whole session"
+  check_res "$U_CHECK" u2_unreused_posts 2 "scenario U: only those two POSTs opened a connection; every other post event is reused=true"
+  check_res "$U_CHECK" u3_attempts "1,2,3" "scenario U: two delivered=false answers then delivered -> ack_sent attempts 1,2,3"
+  check_res "$U_CHECK" u3_ok "True,True,True" "scenario U: ...every attempt got an answer (ok=true)"
+  check_res "$U_CHECK" u3_delivered "False,False,True" "scenario U: ...delivered=false,false,true"
+  check_res "$U_CHECK" u3_one_seq True "scenario U: ...all three attempts carry the same ack seq"
+  check_res "$U_CHECK" u3_undelivered_frames 2 "scenario U: the relay received the two undelivered copies"
+  check_res "$U_CHECK" u3_delivered_frames 1 "scenario U: ...and ONE delivered ack"
+  check_res "$U_CHECK" u3_identical True "scenario U: ...all byte-identical (never a re-seal)"
+  if [ ! -s "$TMPROOT/u.client.err" ]; then
+    ok "scenario U: the client wrote nothing to stderr"
+  else
+    bad "scenario U: the client wrote to stderr: $(head -5 "$TMPROOT/u.client.err")"
+  fi
+
+  kill "$CLIENT_U" 2>/dev/null
+  wait "$CLIENT_U" 2>/dev/null
+  kill "$SRV_U" 2>/dev/null
+  wait "$SRV_U" 2>/dev/null
+else
+  skip "scenario U (ack priority, persistent connections, delivered=false retry): bin/lib/hmd_relay_e2e.py absent"
+fi
+
+# ── Scenario W: the ordering and digest rules, deterministically. Drives
+# send_hmd_frame and _tick_once with a stub transport that can hold one frame
+# type's POST until released -- threads, no network, no sleeping for a race to
+# resolve. What the real-client scenarios above show end to end, one rule at a time ─
+if [ "$E2E_PRESENT" = true ]; then
+  W_OUT="$TMPROOT/w.out"
+  python3 - "$RELAY_CLIENT_RUN" >"$W_OUT" 2>"$TMPROOT/w.err" <<'PYEOF'
+import argparse
+import contextlib
+import io
+import os
+import sys
+import tempfile
+import threading
+import time
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+
+client_path = sys.argv[1]
+loader = SourceFileLoader("hmd_relay_client_order_harness", client_path)
+mod = module_from_spec(spec_from_loader(loader.name, loader))
+loader.exec_module(mod)
+results = {}
+
+
+class Stub:
+    """Stands in for RelayClient.send_frame_envelope: records every call, holds the POSTs of the
+    type named by `hold` until `release` is set, answers the rest from `outcomes` (None: the POST
+    failed, False: relay answered, no phone attached, True: delivered; default True)."""
+
+    def __init__(self, hold=None, outcomes=()):
+        self.hold = hold
+        self.release = threading.Event()
+        self.entered = {"state": threading.Event(), "ack": threading.Event()}
+        self.calls = []  # (type, seq)
+        self.outcomes = list(outcomes)
+        self.lock = threading.Lock()
+
+    def __call__(self, type_, nonce, ciphertext, seq, **kwargs):
+        with self.lock:
+            self.calls.append((type_, seq))
+        self.entered[type_].set()
+        if type_ == self.hold:
+            self.release.wait(10)
+        with self.lock:
+            outcome = self.outcomes.pop(0) if self.outcomes else True
+        return outcome, 321
+
+
+class Cache:
+    """Stands in for StateCache: whatever (state, digest) it holds now."""
+
+    def __init__(self, digest="d1"):
+        self.digest = digest
+
+    def latest(self):
+        return {"n": self.digest}, self.digest
+
+
+class Waits:
+    """Stands in for RelayClient.stop_event: records every wait, never sleeps, never stops."""
+
+    def __init__(self):
+        self.waits = []
+
+    def is_set(self):
+        return False
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return False
+
+
+def make_client(repo, stub):
+    args = argparse.Namespace(relay="http://127.0.0.1:1", repo=repo, ui_port=0, public_host=None,
+                              status_file=os.path.join(repo, "status.json"), tick_s=2.0)
+    client = mod.RelayClient(args)
+    client.session_id = "sess-order"
+    client.token = "token-order"
+    client.session_key = os.urandom(32)
+    client.send_frame_envelope = stub
+    client.cache = Cache()
+    return client
+
+
+def start(target, *args):
+    t = threading.Thread(target=target, args=args, daemon=True)
+    t.start()
+    return t
+
+
+def finished_within(thread, seconds):
+    thread.join(seconds)
+    return not thread.is_alive()
+
+
+def csv(values):
+    return ",".join(str(v) for v in values)
+
+
+def case_w1(repo):
+    """an ack POSTed while a state POST is held is not held with it"""
+    stub = Stub(hold="state")
+    client = make_client(repo, stub)
+    state = start(client.send_hmd_frame, "state", {"state": {}})
+    stub.entered["state"].wait(5)
+    began = time.monotonic()
+    ack = start(client.send_hmd_frame, "ack", {"ok": True, "of_seq": 1})
+    done = finished_within(ack, 2.0)
+    results["w1_ack_done_while_state_held"] = done
+    results["w1_ack_under_500ms"] = done and (time.monotonic() - began) < 0.5
+    stub.release.set()
+    state.join(5)
+    ack.join(5)
+    results["w1_calls"] = csv("%s=%d" % c for c in stub.calls)
+
+
+def case_w2(repo):
+    """a state frame takes no seq and sends nothing while an ack is in flight, retries included"""
+    stub = Stub(hold="ack")
+    client = make_client(repo, stub)
+    ack = start(client.send_hmd_frame, "ack", {"ok": True, "of_seq": 1})
+    stub.entered["ack"].wait(5)
+    state = start(client.send_hmd_frame, "state", {"state": {}})
+    time.sleep(0.4)
+    results["w2_state_sent_early"] = any(c[0] == "state" for c in stub.calls)
+    results["w2_next_seq_while_ack_held"] = client.hmd_seq
+    stub.release.set()
+    ack.join(5)
+    state.join(5)
+    results["w2_calls"] = csv("%s=%d" % c for c in stub.calls)
+
+
+def case_w3(repo):
+    """a state frame an ack overtook is not recorded as sent: the next tick re-sends it"""
+    stub = Stub(hold="state")
+    client = make_client(repo, stub)
+    tick = start(client._tick_once)
+    stub.entered["state"].wait(5)
+    ack = start(client.send_hmd_frame, "ack", {"ok": True, "of_seq": 1})
+    results["w3_ack_done_while_state_held"] = finished_within(ack, 2.0)
+    stub.release.set()
+    tick.join(5)
+    ack.join(5)
+    results["w3_digest_after_overtake"] = client.last_sent_digest
+    stub.hold = None
+    client._tick_once()
+    results["w3_calls"] = csv("%s=%d" % c for c in stub.calls)
+    results["w3_digest_after_resend"] = client.last_sent_digest
+
+
+def case_w4(repo):
+    """failed POSTs are re-sent on every tick, after a bounded backoff that a success resets"""
+    stub = Stub(outcomes=[None] * 5 + [True])
+    client = make_client(repo, stub)
+    client.stop_event = Waits()
+    for _ in range(6):
+        client._tick_once()
+    results["w4_calls"] = len(stub.calls)
+    results["w4_waits"] = csv("%.2f" % w for w in client.stop_event.waits)
+    results["w4_digest_after_success"] = client.last_sent_digest
+    client._tick_once()
+    results["w4_calls_after_unchanged_tick"] = len(stub.calls)
+    client.cache.digest = "d2"
+    stub.outcomes = [None, True]
+    client._tick_once()
+    client._tick_once()
+    results["w4_wait_after_reset"] = "%.2f" % client.stop_event.waits[-1] if client.stop_event.waits else "none"
+    results["w4_digest_after_second"] = client.last_sent_digest
+
+
+def case_w5(repo):
+    """delivered=false (no phone attached) is an answer, not a failure: recorded, never retried"""
+    stub = Stub(outcomes=[False])
+    client = make_client(repo, stub)
+    client.stop_event = Waits()
+    client._tick_once()
+    client._tick_once()
+    results["w5_calls"] = len(stub.calls)
+    results["w5_digest"] = client.last_sent_digest
+    results["w5_waits"] = len(client.stop_event.waits)
+
+
+def case_w6(repo):
+    """a device_bound arriving while a state POST is in flight still forces the next tick to re-send"""
+    stub = Stub(hold="state")
+    client = make_client(repo, stub)
+    priv, pub = mod.E2E.generate_keypair()
+    pub_b64 = mod.E2E.pub_b64(pub)
+    client.device_pub = mod.E2E.pub_from_b64(pub_b64)
+    tick = start(client._tick_once)
+    stub.entered["state"].wait(5)
+    client._handle_envelope({"sender": "relay", "type": "device_bound",
+                             "payload": {"device_pubkey": pub_b64, "bound_at": 1}})
+    stub.release.set()
+    tick.join(5)
+    results["w6_digest_after_rebind"] = client.last_sent_digest
+    stub.hold = None
+    client._tick_once()
+    results["w6_calls"] = csv("%s=%d" % c for c in stub.calls)
+
+
+with contextlib.redirect_stdout(io.StringIO()):
+    for case in (case_w1, case_w2, case_w3, case_w4, case_w5, case_w6):
+        with tempfile.TemporaryDirectory() as repo:
+            try:
+                case(repo)
+            except Exception as e:  # a case that crashes is a result of its own, not the end of the others
+                results[case.__name__ + "_crashed"] = "%s: %s" % (type(e).__name__, e)
+for key, value in results.items():
+    print("RESULT %s %s" % (key, value))
+sys.exit(0)
+PYEOF
+  W_RC=$?
+
+  if [ "$W_RC" -eq 0 ] && ! grep -q '^RESULT case_w[0-9]*_crashed ' "$W_OUT"; then
+    ok "scenario W: ordering/digest harness ran to completion, no case crashed"
+  else
+    bad "scenario W: ordering/digest harness exited $W_RC or a case crashed -- $(grep '_crashed ' "$W_OUT" | head -3) $(tail -3 "$TMPROOT/w.err")"
+  fi
+
+  check_res "$W_OUT" w1_ack_done_while_state_held True "W/w1: an ack sent while a state POST is held completes without waiting for it"
+  check_res "$W_OUT" w1_ack_under_500ms True "W/w1: ...in under 500 ms"
+  check_res "$W_OUT" w1_calls "state=1,ack=2" "W/w1: ...the state frame took seq 1, the ack seq 2 (seq stays strictly increasing)"
+
+  check_res "$W_OUT" w2_state_sent_early False "W/w2: a state frame sends nothing while an ack is in flight"
+  check_res "$W_OUT" w2_next_seq_while_ack_held 2 "W/w2: ...and has not even taken a seq (an ack's retries are never overtaken by a newer frame)"
+  check_res "$W_OUT" w2_calls "ack=1,state=2" "W/w2: ...it takes seq 2 only once the ack is done"
+
+  check_res "$W_OUT" w3_ack_done_while_state_held True "W/w3: the ack completed while the older state POST was held"
+  check_res "$W_OUT" w3_digest_after_overtake None "W/w3: the state frame the ack overtook is NOT recorded as sent"
+  check_res "$W_OUT" w3_calls "state=1,ack=2,state=3" "W/w3: ...the next tick re-sends it under a seq above the ack's"
+  check_res "$W_OUT" w3_digest_after_resend d1 "W/w3: ...and that re-send is recorded"
+
+  check_res "$W_OUT" w4_calls 6 "W/w4: five failed POSTs and a success -> six sends of the same digest (a failed POST is re-sent, not forgotten)"
+  check_res "$W_OUT" w4_waits "0.25,1.00,2.00,5.00,5.00" "W/w4: ...with a bounded backoff 0.25, 1, 2, 5 s then held at 5 s"
+  check_res "$W_OUT" w4_digest_after_success d1 "W/w4: the digest is recorded only once a POST got an answer"
+  check_res "$W_OUT" w4_calls_after_unchanged_tick 6 "W/w4: ...and an unchanged digest is then not sent again (INV-22)"
+  check_res "$W_OUT" w4_wait_after_reset "0.25" "W/w4: a success resets the backoff to its first step"
+  check_res "$W_OUT" w4_digest_after_second d2 "W/w4: ...and the next digest is recorded after its retry"
+
+  check_res "$W_OUT" w5_calls 1 "W/w5: delivered=false is one send, then silence -- it is not a failure and must not retry"
+  check_res "$W_OUT" w5_digest d1 "W/w5: ...its digest is recorded as sent"
+  check_res "$W_OUT" w5_waits 0 "W/w5: ...with no backoff"
+
+  check_res "$W_OUT" w6_digest_after_rebind None "W/w6: a device_bound that lands mid-POST still re-arms the next tick (the POST's success does not overwrite it)"
+  check_res "$W_OUT" w6_calls "state=1,state=2" "W/w6: ...so the state is sent again after the rebind"
+  if [ ! -s "$TMPROOT/w.err" ]; then
+    ok "W: the harness wrote nothing to stderr"
+  else
+    bad "W: the harness wrote to stderr: $(head -5 "$TMPROOT/w.err")"
+  fi
+else
+  skip "scenario W (frame ordering, digest rules): bin/lib/hmd_relay_e2e.py absent -- needs real seal"
 fi
 
 echo

@@ -1,0 +1,417 @@
+{
+  "schema_version": 1,
+  "ts": 1789839662.090085,
+  "repo": "/private/var/folders/t3/17x0hkw12n3g0qy3sjkggbsr0000gn/T/tmp.PfFZkHFZYw",
+  "identity": {
+    "handle": "rj",
+    "haid": "haid:rj.rishabhs-macbook-air-46d5",
+    "branch": null
+  },
+  "ledger": {
+    "daemon": "down",
+    "gates": [
+      {
+        "id": "falsify:changelog-bash32",
+        "state": "pass",
+        "detail": "1/1"
+      },
+      {
+        "id": "falsify:emulator-gb",
+        "state": "pass",
+        "detail": "3/3"
+      },
+      {
+        "id": "falsify:exchange-lob",
+        "state": "pass",
+        "detail": "6/6"
+      },
+      {
+        "id": "falsify:issue-collection",
+        "state": "pass",
+        "detail": "4/4"
+      },
+      {
+        "id": "falsify:ponytail-underdelivery",
+        "state": "pass",
+        "detail": "3/3"
+      },
+      {
+        "id": "falsify:rr-multitenant-isolation",
+        "state": "pass",
+        "detail": "23/23"
+      },
+      {
+        "id": "falsify:symbol-reuse",
+        "state": "pass",
+        "detail": "4/4"
+      },
+      {
+        "id": "falsify:team-checkpoint",
+        "state": "pass",
+        "detail": "5/5"
+      },
+      {
+        "id": "falsify:team-copilot",
+        "state": "pass",
+        "detail": "5/5"
+      },
+      {
+        "id": "falsify:triage-coord",
+        "state": "pass",
+        "detail": "3/3"
+      },
+      {
+        "id": "corpus",
+        "state": "pass",
+        "detail": "13/13"
+      }
+    ],
+    "verdict": {
+      "state": "pass",
+      "label": "GENERALIZES"
+    },
+    "team": [],
+    "team_overflow": 0
+  },
+  "roster": [],
+  "quality_gate": {
+    "clear_to_push": false,
+    "reason": "No heimdall-state.json found. Run 'heimdall-state init' first."
+  },
+  "sweep_receipt": null,
+  "hooks": [
+    {
+      "id": "parallel-gate",
+      "event": "UserPromptSubmit",
+      "locked": false,
+      "enabled": true,
+      "description": "Injects a delegation directive when a prompt looks multi-part (heuristic, ~1ms)."
+    },
+    {
+      "id": "ctx-meter-notice",
+      "event": "UserPromptSubmit",
+      "locked": false,
+      "enabled": true,
+      "description": "Prints the context-window meter notice from heimdall-ctx-meter."
+    },
+    {
+      "id": "secret-paste-filter",
+      "event": "UserPromptSubmit",
+      "locked": true,
+      "enabled": true,
+      "description": "REFUSES a prompt carrying a pasted credential so the value is never transmitted (heimdall-secret-filter)."
+    },
+    {
+      "id": "caveman-level-context",
+      "event": "UserPromptSubmit",
+      "locked": false,
+      "enabled": true,
+      "description": "Adds the current caveman compression level as additionalContext on every prompt."
+    },
+    {
+      "id": "bash-gate-chain",
+      "event": "PreToolUse",
+      "locked": true,
+      "enabled": true,
+      "description": "git-guard stale-lock clear, commit secret scan, pre-push quality/secret/selfscan/oracle/corpus gates (exit 2 blocks)."
+    },
+    {
+      "id": "parallelism-tracker-read",
+      "event": "PreToolUse",
+      "locked": false,
+      "enabled": true,
+      "description": "Counts Read/Grep/Glob calls for the parallelism grade."
+    },
+    {
+      "id": "agent-precheck",
+      "event": "PreToolUse",
+      "locked": true,
+      "enabled": true,
+      "description": "Named-agent notice and the brief-adoption gate that rewrites oversized spawn prompts (heimdall-precheck-agent)."
+    },
+    {
+      "id": "stub-gate",
+      "event": "PreToolUse",
+      "locked": true,
+      "enabled": true,
+      "description": "BIFROST stub gate: blocks Write/Edit content matching an unfinished-code shape (exit 2)."
+    },
+    {
+      "id": "edit-claim-prewarn",
+      "event": "PreToolUse",
+      "locked": false,
+      "enabled": true,
+      "description": "Advisory collision pre-warning when a live teammate holds a claim on the file (heimdall-precheck-edit)."
+    },
+    {
+      "id": "secret-read-guard",
+      "event": "PreToolUse",
+      "locked": true,
+      "enabled": true,
+      "description": "BLOCKS Read/Grep/Glob/Bash reads of credential-bearing files before they enter model context."
+    },
+    {
+      "id": "lintconfig-guard",
+      "event": "PreToolUse",
+      "locked": true,
+      "enabled": true,
+      "description": "Deny edits to linter/formatter/typechecker config (anti-evasion; operator override HMD_ALLOW_LINTCONFIG_EDIT=1)"
+    },
+    {
+      "id": "corpus-capture",
+      "event": "PostToolUse",
+      "locked": false,
+      "enabled": true,
+      "description": "Captures a failed oracle report into the regression corpus after a Bash call."
+    },
+    {
+      "id": "edit-tracker",
+      "event": "PostToolUse",
+      "locked": true,
+      "enabled": true,
+      "description": "Logs every edit, marks heimdall-state dirty (arms the pre-push quality gate), autocommits at 5+ changed files."
+    },
+    {
+      "id": "context-sync",
+      "event": "PostToolUse",
+      "locked": false,
+      "enabled": true,
+      "description": "Background, throttled heimdall-context-sync after a Write/Edit."
+    },
+    {
+      "id": "journal-commit",
+      "event": "PostToolUse",
+      "locked": false,
+      "enabled": true,
+      "description": "Writes a journal entry when a Bash call landed a new git commit."
+    },
+    {
+      "id": "session-bootstrap",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "Autoupdate check, statusline register, selfheal, tracker builds, state init, stack detect, team/presence beat, reap/cleanup advice, checkpoint notice."
+    },
+    {
+      "id": "resume-probe",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "Runs heimdall-resume-probe (10s alarm) when a CHECKPOINT.md exists and prints its head."
+    },
+    {
+      "id": "maintain-resume-hint",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "heimdall-maintain-loop resume-hint."
+    },
+    {
+      "id": "quota-resume-hint",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "heimdall-quota-resume resume-hint."
+    },
+    {
+      "id": "dream-notice",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "heimdall-dream-notice for the repo."
+    },
+    {
+      "id": "presence-keeper-start",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "Starts the presence keeper for this session in the background (paired with presence-keeper-stop)."
+    },
+    {
+      "id": "presence-connect-prompt",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "heimdall-presence connect-prompt."
+    },
+    {
+      "id": "ai-select",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "heimdall-ai-select session-start."
+    },
+    {
+      "id": "claude-mem-scrub",
+      "event": "SessionStart",
+      "locked": true,
+      "enabled": true,
+      "description": "Restarts a claude-mem daemon that is running with a routing/fallback-credential-contaminated env (credential egress fix C-1)."
+    },
+    {
+      "id": "caveman-rules",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "Prints the caveman compression rules into session context."
+    },
+    {
+      "id": "settings-guard",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "Advisory: warns about ANTHROPIC_* overrides persisted in a Claude Code settings.json env block (5s alarm)."
+    },
+    {
+      "id": "volatile-repo-guard",
+      "event": "SessionStart",
+      "locked": false,
+      "enabled": true,
+      "description": "Advisory: warns when the clone sits on volatile disk holding unpushed work (5s alarm)."
+    },
+    {
+      "id": "subagent-metric",
+      "event": "SubagentStop",
+      "locked": false,
+      "enabled": true,
+      "description": "Records a heimdall-metric task outcome for the finished subagent."
+    },
+    {
+      "id": "subagent-429-detect",
+      "event": "SubagentStop",
+      "locked": false,
+      "enabled": true,
+      "description": "Scans the subagent transcript for a 429/rate-limit and marks it for fallback routing."
+    },
+    {
+      "id": "stop-metric-reminder",
+      "event": "Stop",
+      "locked": false,
+      "enabled": true,
+      "description": "Metric reminder at main-agent Stop."
+    },
+    {
+      "id": "stop-claim-check",
+      "event": "Stop",
+      "locked": false,
+      "enabled": true,
+      "description": "Detects a stale present-tense process-status claim in the final message (heimdall-claim-check)."
+    },
+    {
+      "id": "stop-429-detect",
+      "event": "Stop",
+      "locked": false,
+      "enabled": true,
+      "description": "Scans the main transcript for a 429/rate-limit and marks it for fallback routing."
+    },
+    {
+      "id": "stop-lint",
+      "event": "Stop",
+      "locked": false,
+      "enabled": true,
+      "description": "Batch-lint every path edited this session at Stop; records a real lint receipt into heimdall-state"
+    },
+    {
+      "id": "presence-keeper-stop",
+      "event": "SessionEnd",
+      "locked": false,
+      "enabled": true,
+      "description": "Stops this session's presence keeper (disabling it with presence-keeper-start enabled leaks a keeper process)."
+    },
+    {
+      "id": "session-end-sweep",
+      "event": "SessionEnd",
+      "locked": false,
+      "enabled": true,
+      "description": "Foreground, each alarm-bounded (10s): checkpoint write, then autocommit — the never-lose contract; both must land before the hook returns (a checkpoint written but not committed is lost on `git worktree remove`). Background: parallelism grade, verify-edits --quick, cleanup, reel, summary-card, context-sync; then the farewell."
+    },
+    {
+      "id": "precompact-checkpoint",
+      "event": "PreCompact",
+      "locked": false,
+      "enabled": true,
+      "description": "Auto-checkpoint .planning/CHECKPOINT.md before compaction rewrites context (fail-open, stdout suppressed)"
+    }
+  ],
+  "fallback": {
+    "state": "off",
+    "target_provider": ""
+  },
+  "parallelism": {
+    "batched": 0,
+    "turns": 12,
+    "ratio": 0.0,
+    "calls": 12,
+    "agent_calls": 1,
+    "agent_batched": 0,
+    "source": "live"
+  },
+  "checkpoint": {
+    "branch": "main",
+    "head": "79c79af6",
+    "phase": "unknown",
+    "uncommitted_files": 0,
+    "push_gate_open_warning": "⚠ push gate is RED"
+  },
+  "reels": [],
+  "edits": {
+    "count": 1,
+    "paths": [
+      "/Users/rj/.claude/projects/-Users-rj-Downloads-heimdall/memory/companion-ui-scope.md"
+    ]
+  },
+  "panels": [
+    {
+      "id": "demo-kv",
+      "title": "Task",
+      "type": "kv",
+      "data": {
+        "rows": [
+          [
+            "Branch",
+            "main"
+          ],
+          [
+            "Phase",
+            "wave-4"
+          ]
+        ]
+      },
+      "refresh_s": null,
+      "updated_at": 1789839659.570848,
+      "stale": false
+    },
+    {
+      "id": "demo-orders",
+      "title": "Orders / hour",
+      "type": "timeseries",
+      "data": {
+        "x": [
+          "09:00",
+          "10:00",
+          "11:00"
+        ],
+        "y": [
+          12,
+          31,
+          25
+        ]
+      },
+      "refresh_s": null,
+      "updated_at": 1789839659.5030851,
+      "stale": false
+    },
+    {
+      "id": "hmd-live-users",
+      "title": "hmd — live users",
+      "type": "number",
+      "data": {
+        "value": 0,
+        "format": "count"
+      },
+      "refresh_s": 2,
+      "updated_at": 1789839659.594506,
+      "stale": false
+    }
+  ]
+}
