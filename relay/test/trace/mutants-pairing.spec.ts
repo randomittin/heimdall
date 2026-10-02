@@ -1,6 +1,6 @@
 // Wave-3 mutant scenarios for the pairing invariants (INV-1..5). Each test
-// performs the violating action named in docs/superpowers/specs/relay/
-// INVARIANTS.md's "Mutant (Wave-3)" column and asserts the relay REJECTS it
+// performs the violating action named in relay/docs/INVARIANTS.md's
+// "Mutant (Wave-3)" column and asserts the relay REJECTS it
 // with the documented observable — a passing test means the invariant
 // holds against the current relay/src implementation (read, never modified,
 // by this harness; see relay/README.md for the API this drives).

@@ -3,15 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Cloudflare Workers + Durable Object relay for hmd's phone companion (Wave 1 hmdapp relay track). See docs/superpowers/specs/2026-09-21-hmd-relay-design.md.",
+  "description": "Cloudflare Workers + Durable Object relay for hmd's phone companion. Owned by heimdall (moved from hmdapp/relay, history preserved). See docs/2026-09-21-hmd-relay-design.md.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/check-no-logged-urls.mjs && node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test scripts/__tests__/*.test.mjs && vitest run",
     "test:watch": "vitest",
-    "test:trace": "node scripts/trace-diff.mjs",
-    "test:interop:heimdall": "HMD_RELAY_INTEROP=1 node --test scripts/__tests__/heimdall-client-interop.test.mjs"
+    "test:trace": "node scripts/trace-diff.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
