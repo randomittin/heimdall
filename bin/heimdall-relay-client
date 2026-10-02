@@ -223,6 +223,7 @@ def _load_module(name, path):
 
 UI = _load_module("hmd_ui", os.path.join(SENTINELS_DIR, "hmd-ui.py"))
 INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_inbox.py"))
+DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "companion_ui_decisions.py"))
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
@@ -860,6 +861,28 @@ class RelayClient:
         resp = conn.getresponse()
         return conn, resp
 
+    def _decide(self, params):
+        """The phone's sealed DENY of a pending risky action (A4, deny-only round; the doc's
+        POST /api/decide, carried as a relay command the way send-message is):
+            command  {"action":"decide","params":{"id":"p-<8 hex>","decision":"deny"}}
+            ack ok   {"ok":true,"of_seq":N,"id":"p-<8 hex>","decision":"deny"}
+            ack no   {"ok":false,"of_seq":N,"detail":<code>}
+        Reached only by a frame that opened under the paired device's session key and passed the
+        replay guard, so there is no other authentication to do. The store (companion_ui_decisions)
+        owns every rule and its machine-readable refusal: bad-decision, unknown-id,
+        allow-not-permitted, already-decided, expired -- the phone can only deny, "allow" is refused
+        for every request, and nothing is written on a refusal."""
+        if DECISIONS is None:
+            return False, "decisions-unavailable", {}
+        fields = params if isinstance(params, dict) else {}
+        try:
+            result = DECISIONS.decide(self.root, fields.get("id"), fields.get("decision"))
+        except DECISIONS.DecisionError as e:
+            return False, e.code, {}
+        except OSError:
+            return False, "write-failed", {}
+        return True, None, {"id": result["id"], "decision": result["decision"]}
+
     def _handle_command(self, env):
         # The phone's ack window opened before this command reached us; retries
         # of its ack may only START inside what is left of it (ACK_WINDOW_S).
@@ -904,6 +927,8 @@ class RelayClient:
                     ok, detail = False, e.code
                 except OSError:
                     ok, detail = False, "write-failed"
+        elif action == "decide":
+            ok, detail, extra = self._decide(params)
         else:
             ok, detail = False, "not-implemented"
         emit({"event": "command", "action": action, "ok": ok, "detail": detail})
