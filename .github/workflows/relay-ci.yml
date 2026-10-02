@@ -1,0 +1,98 @@
+# relay-ci -- the relay's own gate, plus hmd's side of the shared wire contract.
+#
+# The Cloudflare Worker + Durable Object relay lives in relay/ (moved from hmdapp with its history).
+# This workflow is the check that a change to it, or to the files that speak its wire protocol,
+# still works. It has no secrets and deploys nothing: a deploy pipeline (canary, probes, rollback)
+# is a separate workflow with its own environments and is not part of this file.
+#
+# Two jobs, because the two halves of the contract run on different toolchains:
+#
+#   relay        -- Node. npm ci, typecheck, `npm test` (the INV-8 no-logged-URL guard, the node:test
+#                   scripts suite including the JS side of the contract fixtures, and the vitest suite
+#                   in a real workerd including relay/test/contract.spec.ts, which drives the real
+#                   Worker + Durable Object with relay/contract/wire.json), then the trace-diff gate.
+#   hmd-contract -- Python. test/relay-contract-fixtures.test.sh replays the same wire.json against the
+#                   real bin/heimdall-relay-client with no network. It runs on macos-latest, like
+#                   release-gate-suites.yml, because heimdall's own Python is developed and exercised on
+#                   macOS and a red for platform reasons would not be a trusted red.
+#
+# Path-filtered: only a change to relay/**, to the hmd relay client and its crypto module, to the
+# hmd-side contract replay, or to this file starts it. The contract fixtures live in relay/contract/,
+# so a fixture change reaches both jobs.
+#
+# Node 24 is what the relay is verified on (v24.13.0); CI runs that same major rather than an
+# unverified other one.
+#
+# Every action is pinned by commit SHA with its tag in the trailing comment, as the sibling
+# workflows do. actions/setup-node was resolved with `git ls-remote https://github.com/actions/setup-node
+# refs/tags/v4.4.0`, not guessed.
+name: relay-ci
+
+on:
+  pull_request:
+    paths:
+      - 'relay/**'
+      - 'bin/heimdall-relay-client'
+      - 'bin/lib/hmd_relay_e2e.py'
+      - 'test/relay-contract-fixtures.test.sh'
+      - 'test/lib/relay_contract_replay.py'
+      - '.github/workflows/relay-ci.yml'
+  push:
+    paths:
+      - 'relay/**'
+      - 'bin/heimdall-relay-client'
+      - 'bin/lib/hmd_relay_e2e.py'
+      - 'test/relay-contract-fixtures.test.sh'
+      - 'test/lib/relay_contract_replay.py'
+      - '.github/workflows/relay-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  relay:
+    name: relay (typecheck, tests, contract, trace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+
+      - name: Install (from the lockfile)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # INV-8 guard + node --test scripts/__tests__ (incl. contract-fixtures.test.mjs) + vitest
+      # (incl. test/contract.spec.ts against the real Worker + Durable Object).
+      - name: Tests and contract fixtures
+        run: npm test
+
+      - name: Trace-diff gate (golden + mutants)
+        run: npm run test:trace
+
+  hmd-contract:
+    name: hmd client vs the wire fixtures (hermetic)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Replay relay/contract/wire.json against bin/heimdall-relay-client
+        run: bash test/relay-contract-fixtures.test.sh
