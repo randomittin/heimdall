@@ -293,8 +293,17 @@ MAX_REASON_CHARS = 4000  # joined-message cap, on top of the 2000/message cap ab
 # bin/lib/companion_ui_inbox.py reads inbox-waiting as stale after twice this.
 POLL_INTERVAL_S = 2.0
 DEFAULT_WAIT_S = 240.0     # stop long-poll budget: turn ended on a question, nobody connected
-COMPANION_WAIT_S = 1800.0  # ...with a companion connected: the session is reachable, so stay reachable
+COMPANION_WAIT_S = 300.0   # ...with a companion connected: the session is reachable, so stay reachable (short: a prompt typed meanwhile queues behind the hook)
 TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024  # only the last message matters
+
+# TYPING RELEASE (see the header). A terminal read this recently means somebody is typing
+# into it; Linux stamps a tty access time in 8s buckets, so this must stay above 8.
+TYPING_RECENT_S = 10.0
+PROBE_TIMEOUT_S = 3.0      # ps, ioreg and HMD_INBOX_PRESENCE_CMD each get this long to answer
+TTY_WALK_MAX = 8           # ps hops from this process up to the first ancestor with a terminal
+NO_TERMINAL = frozenset(("", "?", "??", "-"))   # what ps prints for a process without one
+SWITCHED_OFF = frozenset(("off", "0", "false", "no", "none"))
+HID_IDLE_RE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')   # nanoseconds, from ioreg -c IOHIDSystem
 
 # CLAUDE_CODE_ENTRYPOINT values of a session no human is typing into: Claude
 # Code rewrites an inherited "cli" to "sdk-cli" for any non-interactive (-p)
@@ -644,6 +653,106 @@ def companion_connected(root):
     return all(_pid_alive(rec[k]) for k in ("pid_ui", "pid_client") if k in rec)
 
 
+def probe_output(argv):
+    # stdout of argv, or None when it cannot be run, outlives PROBE_TIMEOUT_S or exits
+    # nonzero. ps, ioreg and HMD_INBOX_PRESENCE_CMD all come through here, and none of
+    # them may ever raise: a probe that fails is a signal that is missing, not an error.
+    if not argv:
+        return None
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=PROBE_TIMEOUT_S)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return done.stdout.decode("utf-8", "replace")
+
+
+def first_number(text):
+    # The first whitespace-separated field of text as a non-negative number, else None.
+    # NaN and negatives are not an idle time, so they count as no answer.
+    try:
+        n = float((text or "").split()[0])
+    except (IndexError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def terminal_device():
+    # The terminal this session runs in, as a /dev path, or None. The hook has no
+    # controlling terminal of its own (stdio are pipes), so walk ps up from this process
+    # to the first ancestor that has one: claude itself, on the operator terminal.
+    pid, seen = os.getpid(), set()
+    for _ in range(TTY_WALK_MAX):
+        if pid <= 1 or pid in seen:
+            return None
+        seen.add(pid)
+        fields = (probe_output(["ps", "-o", "ppid=,tty=", "-p", str(pid)]) or "").split()
+        if not fields or not fields[0].isdigit():
+            return None
+        tty = fields[1] if len(fields) > 1 else ""
+        if tty not in NO_TERMINAL:
+            return None if tty.startswith("/") or ".." in tty else os.path.join("/dev", tty)
+        pid = int(fields[0])
+    return None
+
+
+def terminal_idle_s(path):
+    # Seconds since the terminal at path was last READ, or None when it cannot be
+    # examined. A read is what typing is: the kernel stamps the access time when claude
+    # takes a keystroke off the pty, while claude redraws only move the modification time.
+    try:
+        return max(0.0, time.time() - os.stat(path).st_atime)
+    except OSError:
+        return None
+
+
+def input_idle_s():
+    # Seconds since a human last touched a keyboard or pointer of this machine, or None
+    # when that cannot be told. HMD_INBOX_PRESENCE_CMD names a command that prints the
+    # number (the tests inject it so); empty or off/0/false/no/none removes the source.
+    # Unset, it is macOS HIDIdleTime read through ioreg, and no other platform has one.
+    cmd = os.environ.get("HMD_INBOX_PRESENCE_CMD")
+    if cmd is not None:
+        if not cmd.strip() or cmd.strip().lower() in SWITCHED_OFF:
+            return None
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            return None
+        return first_number(probe_output(argv))
+    if sys.platform != "darwin":
+        return None
+    hid = HID_IDLE_RE.search(probe_output(["ioreg", "-r", "-d", "1", "-c", "IOHIDSystem"]) or "")
+    return int(hid.group(1)) / 1e9 if hid else None
+
+
+def typing_probe():
+    # None when nothing can say whether somebody is typing into this session; otherwise a
+    # zero-argument function that answers it. HMD_INBOX_TTY pins the terminal (a path: the
+    # tests point it at a plain file) or, as off/0/false/no/none, switches the release off.
+    raw = os.environ.get("HMD_INBOX_TTY", "").strip()
+    if raw.lower() in SWITCHED_OFF:
+        return None
+    path = raw or terminal_device()
+    if not path or terminal_idle_s(path) is None:
+        return None
+
+    def typing():
+        idle = terminal_idle_s(path)
+        if idle is None or idle >= TYPING_RECENT_S:
+            return False
+        # Read, but not necessarily by a human: focus and theme reports and the replies to
+        # terminal queries are reads too, and arrive with nobody at the keyboard. Where the
+        # machine can say when a keyboard or pointer was last used, a stale answer vetoes
+        # the read; where it cannot, the read stands.
+        away = input_idle_s()
+        return away is None or away < TYPING_RECENT_S
+
+    return typing
+
+
 def hook_orphaned(ppid0):
     # True once whatever launched this long-poll is gone: Claude Code killed the
     # hook (Esc, timeout) but only reached the shell above us, leaving this
@@ -791,10 +900,13 @@ def cmd_stop(hook, root):
     ppid0 = os.getppid()
     since = time.time()
     deadline = since + wait_s
+    typing = typing_probe()  # after the deadline is fixed: finding the terminal comes out of the hold, never on top of it
     write_state(root, True)
     delivered_texts = []
     try:
         while not hook_orphaned(ppid0):
+            if typing is not None and typing():
+                break  # somebody is typing into this session: hand the turn back, nothing popped; what is queued rides their prompt
             write_waiting(root, since, deadline)
             texts = texts_of(pop_all_fn(root))
             if texts:
