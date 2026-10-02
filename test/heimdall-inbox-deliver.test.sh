@@ -499,7 +499,7 @@ T0="$(now_s)"
 OUT="$(printf '%s' "$(stop_payload "$D" false "Done implementing the feature.")" | HMD_INBOX_WAIT_S=4 "$BIN" stop --repo "$D")"
 T1="$(now_s)"
 [ -z "$OUT" ] && ok "no stdout" || bad "unexpected stdout: $OUT"
-f_lt "$(secs "$T0" "$T1")" 3 && ok "returned in $(secs "$T0" "$T1")s -- a crash-left connect.json cannot pin every turn for 30 minutes" || bad "took $(secs "$T0" "$T1")s"
+f_lt "$(secs "$T0" "$T1")" 3 && ok "returned in $(secs "$T0" "$T1")s -- a crash-left connect.json cannot pin every turn for 5 minutes" || bad "took $(secs "$T0" "$T1")s"
 [ ! -e "$(waiting_of "$D")" ] && ok "no marker left" || bad "marker left behind"
 rm -rf "$D"
 
@@ -739,7 +739,7 @@ mark_companion "$D"
 TTYF="$(mktemp)"; set_atime "$TTYF" 3
 T0="$(now_s)"
 OUTF="$(mktemp)"
-bounded_stop "$D" "Done implementing the feature." "$OUTF" 20 HMD_INBOX_TTY="$TTYF"
+bounded_stop "$D" "Done implementing the feature." "$OUTF" 20 HMD_INBOX_TTY="$TTYF" "$AT_KEYBOARD"
 RC=$?
 T1="$(now_s)"
 OUT="$(cat "$OUTF")"; rm -f "$OUTF"
@@ -795,7 +795,7 @@ D="$(make_project)"
 : > "$(inbox_of "$D")"
 TTYF="$(mktemp)"; set_atime "$TTYF" 0
 T0="$(now_s)"
-OUT="$(printf '%s' "$(stop_payload "$D" false "Should I proceed with the deploy?")" | HMD_INBOX_TTY="$TTYF" HMD_INBOX_WAIT_S=10 "$BIN" stop --repo "$D")"
+OUT="$(printf '%s' "$(stop_payload "$D" false "Should I proceed with the deploy?")" | env HMD_INBOX_TTY="$TTYF" "$AT_KEYBOARD" HMD_INBOX_WAIT_S=10 "$BIN" stop --repo "$D")"
 RC=$?
 T1="$(now_s)"
 [ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "exit 0, no stdout" || bad "rc=$RC out: $OUT"
@@ -893,9 +893,11 @@ try:
     if not alive():
         released = time.time() - t_type
 finally:
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pid, signal.SIGKILL)
+    # Only a child that has not been reaped yet: once waitpid has returned its pid
+    # is free for the kernel to hand to somebody else's process group.
     if not exited:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pid, signal.SIGKILL)
         with contextlib.suppress(ChildProcessError):
             os.waitpid(pid, 0)
 print("RESULT run held_quiet=%d released_after=%.2f marker_left=%d" % (held_quiet, released, 1 if os.path.exists(marker) else 0))
@@ -908,7 +910,7 @@ else
   : > "$(inbox_of "$D")"
   PTYPL="$(mktemp)"; PTYOUT="$(mktemp)"; PTYRES="$(mktemp)"
   stop_payload "$D" false "Done implementing the feature." > "$PTYPL"
-  python3 "$PTYDRV" "$BIN" "$D" "$PTYPL" "$PTYOUT" > "$PTYRES" 2>&1
+  env "$AT_KEYBOARD" python3 "$PTYDRV" "$BIN" "$D" "$PTYPL" "$PTYOUT" > "$PTYRES" 2>&1
   RES="$(grep '^RESULT ' "$PTYRES" | head -1)"
   case "$RES" in
     "RESULT nopty"*|"RESULT notty"*)
@@ -925,6 +927,35 @@ else
   rm -rf "$D" "$PTYPL" "$PTYOUT" "$PTYRES"
 fi
 rm -f "$PTYDRV"
+
+echo "35. keyboard-idle check: a terminal READ with nobody at the keyboard (a focus report) is vetoed, so the hold holds; a check that cannot answer vetoes nothing:"
+D="$(make_project)"
+mark_companion "$D"
+: > "$(inbox_of "$D")"
+TTYF="$(mktemp)"; set_atime "$TTYF" 0
+( await_marker "$D"; sleep 1.5; printf '{"id":"vt1","ts":1,"text":"delivered through a vetoed read","source":"test"}\n' >> "$(inbox_of "$D")" ) &
+BGPID=$!
+OUTF="$(mktemp)"
+bounded_stop "$D" "Done implementing the feature." "$OUTF" 40 HMD_INBOX_TTY="$TTYF" HMD_INBOX_PRESENCE_CMD="echo 600"
+RC=$?
+OUT="$(cat "$OUTF")"; rm -f "$OUTF"
+wait "$BGPID" 2>/dev/null || true
+[ "$RC" -eq 0 ] && echo "$OUT" | grep -q "delivered through a vetoed read" && ok "terminal read, keyboard idle 600s: the hold held and delivered the late message" || bad "rc=$RC out: $OUT"
+rm -rf "$D" "$TTYF"
+for PCMD in "/no/such/presence-command" "false" "echo not-a-number" "off"; do
+  D="$(make_project)"
+  mark_companion "$D"
+  : > "$(inbox_of "$D")"
+  TTYF="$(mktemp)"; set_atime "$TTYF" 0
+  T0="$(now_s)"
+  OUTF="$(mktemp)"
+  bounded_stop "$D" "Done implementing the feature." "$OUTF" 20 HMD_INBOX_TTY="$TTYF" HMD_INBOX_PRESENCE_CMD="$PCMD"
+  RC=$?
+  T1="$(now_s)"
+  OUT="$(cat "$OUTF")"; rm -f "$OUTF"
+  { [ "$RC" -eq 0 ] && [ -z "$OUT" ] && f_lt "$(secs "$T0" "$T1")" 3; } && ok "keyboard-idle check '$PCMD' cannot answer: no veto, the terminal read released the hold in $(secs "$T0" "$T1")s" || bad "'$PCMD': rc=$RC after $(secs "$T0" "$T1")s, out: $OUT"
+  rm -rf "$D" "$TTYF"
+done
 
 echo ""
 echo "heimdall-inbox-deliver.test.sh: $PASS passed, $FAIL failed."
