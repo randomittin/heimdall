@@ -349,7 +349,52 @@ trusting whenever the alarm happened to be set:
 The grace exists so a client that is merely late — a phone reconnecting seconds after its token
 lapsed, hmd re-reading a just-revoked session — meets a truthful `410`/`401` instead of a bare
 `404` that reads like "wrong session id". Purging closes any attached device socket (`4001`) and
-hmd's stream, then `deleteAll()`s; it logs `session_purged` with the `session_id` and status.
+hmd's stream — after first telling hmd why, below — then `deleteAll()`s; it logs `session_purged`
+with the `session_id` and status.
+
+An unclaimed session therefore lives ~2 minutes: nothing ends it on a timer before its pairing
+window (60 s) closes, and the purge lands 60 s after that. That second minute is invisible to the
+phone (a claim after the window is `410`), but it is what hmd's client sees as the end of a
+`connect` nobody scanned in time.
+
+### hmd is told why a session ended (INV-38)
+
+Whenever the relay ends hmd's `GET /stream` because the **session** is over, it first writes one
+plaintext control frame, then closes the stream:
+
+```json
+{"v":1,"session_id":"<uuid>","seq":0,"sender":"relay","type":"session_ended","nonce":null,"ciphertext":null,"payload":{"reason":"pairing-expired"}}
+```
+
+| `payload.reason` | When |
+|---|---|
+| `pairing-expired` | the ~60 s pairing window lapsed with no phone bound — at the purge, or when a late claim finds it so. Re-run `hmd app connect` for a fresh code |
+| `claim-throttled` | more than 10 claim attempts in 60 s ended the session (INV-4) |
+| `expired` | a bound session's `device_token` lapsed and storage was reclaimed |
+| `ended` | an already-ended session was reclaimed with a stream still attached |
+
+hmd's client already treats `session_ended` as terminal and logs `payload.reason`, so no client
+change is needed. Not announced, because the session is not over or hmd is ending it: a superseding
+`GET /stream`, the stream-lifetime bound (hmd reconnects), and `POST /revoke`. If hmd's stream is
+not attached at that instant (mid-reconnect, or orphaned by a deploy) there is nothing to write to
+and the reconnect meets `404`. Each announcement is logged as `session_end_announced` (`reason`,
+`delivered`).
+
+Before this, the same end was a bare EOF followed by `404`, which hmd's client logged as "stream
+closed by relay with no local cause … likely the relay's own stream-lifetime bound" and
+`session_ended: stream-404`. That is the 2026-10-02 field bug: two `connect`s whose QR no phone
+bound, both ended by this purge, at 120.0 s and 120.1 s after `/pair/init`.
+
+#### Verifying a deploy
+
+```
+node relay/scripts/pairing-expiry-probe.mjs --relay https://<worker>
+```
+
+Plays hmd for one throwaway session no phone claims and holds its stream ~2.5 minutes. Exit `0`:
+the relay announced a reason before the stream ended. `1`: bare EOF — a relay that predates
+INV-38. `3`: still open at `--hold-s`. Prints timings, statuses and frame types only, never a
+token, a code or a URL.
 
 **A `bound` record written before `device_token_exp` existed is never purged early** — it has no
 honest deadline, so each pass re-arms a full TTL out. A session live across the deploy that
