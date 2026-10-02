@@ -108,3 +108,32 @@ hmd_python() {
   fi
   return 1
 }
+
+# hmd_python_cached — the interpreter WITHOUT running it: $HMD_PYTHON, else the on-disk
+# cache's path while that is still executable. Prints nothing (rc 1) otherwise.
+#
+# WHY, MEASURED: hmd_python's cache branch spends a `-c pass` launch on EVERY call to
+# re-prove the cached path still runs — ~56 ms idle, several times that under load. The
+# statusline renders every ~300 ms and used to pay it once for itself and twice more per
+# ctx-meter publish (the memo above dies with each `$(hmd_python)` subshell), i.e. a launch
+# per render that proved nothing the render's own launch was not about to prove anyway.
+#
+# THE CONTRACT IS THE MIRROR OF hmd_python's. This never executes the interpreter and never
+# touches the cache. That is only sound for a caller that VERIFIES BY USE: runs the
+# interpreter for real work, and on an empty/failed run falls back to hmd_python — which
+# probes, deletes a stale cache, and names a working one (test/hmd-python.test.sh cases 1-2;
+# bin/heimdall-statusline is the reference caller, and its incident replay is in
+# test/heimdall-statusline-perf-budget.test.sh). The 2026-09-19 failure this lib's header
+# describes (an executable licence-nag stub in the cache) therefore still self-heals within
+# the one render that hits it; what is gone is the per-render probe. A caller that cannot
+# verify by use must keep calling hmd_python.
+hmd_python_cached() {
+  local cand="" cache
+  if [ -n "${HMD_PYTHON:-}" ]; then printf '%s' "$HMD_PYTHON"; return 0; fi
+  [ -n "$_HMD_PYTHON_RESOLVED" ] && { printf '%s' "$_HMD_PYTHON_RESOLVED"; return 0; }
+  cache="$(_hmd_python_cache_file)"
+  [ -r "$cache" ] || return 1
+  IFS= read -r cand < "$cache" 2>/dev/null || cand=""
+  [ -n "$cand" ] && [ -x "$cand" ] || return 1
+  printf '%s' "$cand"
+}
