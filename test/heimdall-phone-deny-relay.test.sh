@@ -382,19 +382,44 @@ else
   bad "6b. a replayed frame produced a decision"
 fi
 
-# 7. after all of that, a genuine deny still works (the seq the forgery tried was never burned)
+# 7. after all of that, a genuine deny still works (the seq the forgery tried was never burned).
+# The forgery's ack also carries of_seq 9, so only an {ok:true} ack can be this command's.
 send_cmd 9 "$(decide_json "$P2" deny)"
-ACK="$(ack_of 9)"
-if printf '%s' "$ACK" | jq -e --arg id "$P2" '.ok == true and .id == $id' >/dev/null 2>&1 && decision_file_exists "$REPO_T" "$P2"; then
+ACK="$(ack_of_ok 9)"
+if printf '%s' "$ACK" | jq -e --arg id "$P2" '.ok == true and .id == $id and .decision == "deny"' >/dev/null 2>&1 && decision_file_exists "$REPO_T" "$P2"; then
   ok "7. a genuine deny after the abuse still lands (acked ok, decision recorded)"
 else
-  bad "7. the genuine deny after the abuse failed: $ACK"
+  bad "7. the genuine deny after the abuse failed: ${ACK:-<no ok ack>}"
 fi
 
 if jq -e 'select(.event=="command" and .action=="decide")' "$CLIENT_OUT" >/dev/null 2>&1; then
   ok "8. the client logs each decide as a {event:command, action:decide} line"
 else
   bad "8. no command/decide event line in the client's stdout"
+fi
+
+# 9. the vocabulary is closed: only {action: decide, decision: deny} does anything
+P3="$(new_request "$REPO_T")"
+send_cmd 10 "$(decide_json "$P3" approve)"
+ACK="$(ack_of 10)"
+printf '%s' "$ACK" | jq -e '.ok == false and .detail == "bad-decision"' >/dev/null 2>&1 \
+  && ok "9. decision \"approve\" -> detail bad-decision (there is no approve)" || bad "9. approve decision ack wrong: $ACK"
+send_cmd 11 "$(jq -cn --arg id "$P3" '{action:"approve", params:{id:$id}}')"
+ACK="$(ack_of 11)"
+printf '%s' "$ACK" | jq -e '.ok == false and .detail == "not-implemented"' >/dev/null 2>&1 \
+  && ok "9b. action \"approve\" -> detail not-implemented" || bad "9b. approve action ack wrong: $ACK"
+send_cmd 12 "$(jq -cn --arg id "$P3" '{action:"stop", params:{id:$id}}')"
+ACK="$(ack_of 12)"
+printf '%s' "$ACK" | jq -e '.ok == false and .detail == "not-implemented"' >/dev/null 2>&1 \
+  && ok "9c. action \"stop\" -> detail not-implemented (stop is deferred this round)" || bad "9c. stop action ack wrong: $ACK"
+send_cmd 13 "$(decide_json "$P3" Deny)"
+ACK="$(ack_of 13)"
+printf '%s' "$ACK" | jq -e '.ok == false and .detail == "bad-decision"' >/dev/null 2>&1 \
+  && ok "9d. decision \"Deny\" (case-varied) -> detail bad-decision (exact vocabulary)" || bad "9d. case-varied decision ack wrong: $ACK"
+if ! decision_file_exists "$REPO_T" "$P3" && is_pending "$REPO_T" "$P3"; then
+  ok "9e. none of the four left a decision behind; the request is still pending"
+else
+  bad "9e. a refused command changed the pending request"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
