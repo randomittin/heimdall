@@ -11,7 +11,7 @@ Three parties meet in one directory, <repo>/.heimdall/ui/approvals/ (0700; every
 
     bin/heimdall-phone-deny      the PreToolUse hook: request() a decision for a risky action, then
                                  poll decision_of() inside a short bounded window, heartbeat()
-                                 while it waits, close() when it leaves
+                                 while it waits, settle() when the window ends, close() when it leaves
     bin/heimdall-relay-client    the sealed, replay-guarded command path: decide() -- only a frame
                                  that opened under the paired device's session key ever reaches it
     sentinels/hmd-ui.py          reads pending() into the `approvals` slice of /api/state
@@ -21,10 +21,16 @@ Files:
                          MTIME is the hook's heartbeat: a request nobody has heartbeated for
                          HEARTBEAT_STALE_S is a dead hook (killed, timed out) and counts as expired
                          -- a deny must never be acknowledged for an action that already ran.
-    p-<8 hex>.decision   the decision {id, decision: "deny", decided_at}, created O_EXCL: that
-                         create IS the single-use guarantee (two concurrent denies -> one wins,
-                         the other is `already-decided`). It outlives the request file so a replay
-                         within GC_AFTER_S still answers `already-decided`, not `unknown-id`.
+    p-<8 hex>.decision   the one decision slot of a request, {id, decision, decided_at}. It is
+                         created by link(2)-ing a finished temp file into place, so it appears
+                         complete or not at all, and a second create fails: that IS the single-use
+                         guarantee. Two parties can claim it. The phone claims it with "deny"
+                         (decide()); the hook claims it with "timeout" when its window ends
+                         (settle()). Whoever gets there first wins, and the loser is told so:
+                         a late deny is `expired`, never an ack for an action that already went
+                         through; a deny that got in first is the one settle() hands back. The
+                         file outlives the request file so a replay within GC_AFTER_S still
+                         answers `already-decided` / `expired`, not `unknown-id`.
 
 Ids are random (`p-` + 8 hex) and checked against a strict pattern before any path is built from
 one, so a hostile id can never walk out of the directory. A request id is never reused.
