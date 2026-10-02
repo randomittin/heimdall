@@ -15,7 +15,11 @@ Source of truth is the session transcript (~/.claude/projects/<slug>/<id>.jsonl)
 the conversation is DERIVED from a bounded tail of it (never a full read -- a live
 transcript is tens of MB), text blocks only, so a missed hook or a late-started
 server never loses the conversation, and inbox-delivered phone messages (which are
-injected as hook context, never typed as prompts) are in it too.
+injected as hook context, never typed as prompts) are in it too. The tail is not
+re-read per tick: ChatTail keeps the parsed conversation and reads only the bytes
+appended since the last tick (zero-lag stage 2 -- re-deriving the whole 1 MiB tail
+was ~115 ms of every transcript append's trip to the phone), with a result that is
+byte-identical to re-reading the tail window (see its docstring).
 
 The consumer contract is the shipped app's, not ours (hmdapp src/chat/parse.ts,
 src/contract/guards.ts, src/session/tabs/agents/parse.ts):
@@ -53,6 +57,9 @@ AGENTS_ID, AGENTS_TITLE = "agents", "Agents"
 REFRESH_S = 30                  # stale after max(30*3, 30) = 90s, same as the hmdapp publishers
 APP_MAX_UNITS = 500             # hmdapp guards.ts MAX_STRING_CHARS -- JS string length = UTF-16 units
 TAIL_BYTES_DEFAULT = 1 << 20    # env HMD_UI_CHAT_TAIL_BYTES; never a full-file read
+FP_BYTES = 256                  # ChatTail: bytes before its resume offset re-read to prove the file is the one cached
+SYNC_ATTEMPTS = 3               # ChatTail: reads retried when a write lands under them, before one plain read
+MAX_TAILS = 4                   # transcripts whose parsed tail a publisher keeps (the newest MAX_CANDIDATES rarely differ)
 MAX_CANDIDATES = 8              # newest transcripts examined per tick
 TTL_MARGIN_S = 3600             # never publish what read_panels would reap within the hour (flap loop)
 ENVELOPE_SLACK = 512            # bytes of the panel file that are not `data`
@@ -140,32 +147,18 @@ def _default_read_tail(path, nbytes):
         return None
 
 
-def parse_entries(text):
-    """JSONL text -> dict entries. A tail read starts mid-line; the partial first
-    line (like any torn or non-JSON line) simply fails to parse and is skipped."""
-    out = []
-    for ln in text.split("\n"):
-        ln = ln.strip()
-        if not ln or ln[0] != "{":
-            continue
-        try:
-            o = json.loads(ln)
-        except ValueError:
-            continue
-        if isinstance(o, dict):
-            out.append(o)
-    return out
-
-
-def is_headless(entries):
-    """True for a `claude -p` / SDK session (entrypoint sdk-cli, sdk-py, sdk-ts ...):
-    the judge/verifier sub-sessions that once replaced the whole chat panel. The
-    interactive CLI says `cli`. An entry-less window counts as interactive."""
-    for e in reversed(entries):
-        ep = e.get("entrypoint")
-        if isinstance(ep, str) and ep:
-            return ep.startswith("sdk")
-    return False
+def _parse_line(ln):
+    """One JSONL line -> its dict entry, else None. A tail read starts mid-line; the
+    partial first line (like any torn or non-JSON line) simply fails to parse and is
+    skipped."""
+    ln = ln.strip()
+    if not ln or ln[0] != "{":
+        return None
+    try:
+        o = json.loads(ln)
+    except ValueError:
+        return None
+    return o if isinstance(o, dict) else None
 
 
 # ── deriving the conversation ────────────────────────────────────────────────
@@ -256,39 +249,52 @@ def _assistant_parts(e):
     return texts, has_tool, msg.get("id"), msg.get("stop_reason")
 
 
-def derive_turns(entries, fallback_ts):
-    """Chronological conversation turns [{role, ts, text, mid}]: operator prompts,
-    delivered phone messages (both role `you`, text exactly as delivered so the app
-    can pair them with its outbox entry), and the FINAL main-chain assistant text of
-    each turn. Mid-turn narration (a message that stops for a tool) and sub-agent
-    turns are not the chat; tool calls and results are never read."""
-    turns = []
-    for e in entries:
-        ts = _epoch(e.get("timestamp"), fallback_ts)
-        if e.get("type") == "assistant":
-            if e.get("isSidechain") or e.get("isApiErrorMessage"):
-                continue
-            texts, has_tool, mid, stop = _assistant_parts(e)
-            if not texts:
-                continue
-            final = (not has_tool) and stop != "tool_use"
-            last = turns[-1] if turns else None
-            if last is not None and last["role"] == "hmd" and mid and last["mid"] == mid:
-                last["text"] += "\n" + "\n".join(texts)
-                last["final"] = last["final"] or final
-            else:
-                turns.append({"role": "hmd", "ts": ts, "text": "\n".join(texts), "mid": mid, "final": final})
-            continue
-        if e.get("isSidechain"):
-            continue
-        phone = phone_messages(e)
-        if phone:
-            turns.extend({"role": "you", "ts": ts, "text": t, "mid": None, "final": True} for t in phone)
-            continue
-        prompt = human_prompt(e)
-        if prompt is not None:
-            turns.append({"role": "you", "ts": ts, "text": prompt, "mid": None, "final": True})
-    return [t for t in turns if t["final"]]
+class _Part(object):
+    """What one transcript entry adds to the conversation: an operator prompt, a delivered
+    phone message or one assistant text block. `off` is the file offset of the entry's line
+    (what the tail window cuts by); `ts` is None when the entry has no usable timestamp (the
+    file's mtime stands in at format time). Consecutive parts of one assistant message are a
+    single turn (see _merges). `key`/`line` memoize the formatted line on the FIRST part of
+    a turn, valid for the (part count, timestamp) it was formatted for."""
+    __slots__ = ("off", "role", "mid", "text", "final", "ts", "key", "line")
+
+    def __init__(self, off, role, mid, text, final, ts):
+        self.off, self.role, self.mid, self.text, self.final, self.ts = off, role, mid, text, final, ts
+        self.key = None
+        self.line = None
+
+
+def entry_parts(e, off):
+    """The conversation parts of one transcript entry, usually none or one: operator
+    prompts, delivered phone messages (both role `you`, text exactly as delivered so the app
+    can pair them with its outbox entry) and assistant text blocks. A turn is its run of
+    parts (_merges) and is shown when any part is the FINAL main-chain text of the turn:
+    mid-turn narration (a message that stops for a tool) and sub-agent turns are not the
+    chat; tool calls and results are never read."""
+    if e.get("type") == "assistant":
+        if e.get("isSidechain") or e.get("isApiErrorMessage"):
+            return ()
+        texts, has_tool, mid, stop = _assistant_parts(e)
+        if not texts:
+            return ()
+        final = (not has_tool) and stop != "tool_use"
+        return (_Part(off, "hmd", mid, "\n".join(texts), final, _epoch(e.get("timestamp"), None)),)
+    if e.get("isSidechain"):
+        return ()
+    phone = phone_messages(e)
+    if phone:
+        ts = _epoch(e.get("timestamp"), None)
+        return tuple(_Part(off, "you", None, t, True, ts) for t in phone)
+    prompt = human_prompt(e)
+    if prompt is None:
+        return ()
+    return (_Part(off, "you", None, prompt, True, _epoch(e.get("timestamp"), None)),)
+
+
+def _merges(prev, cur):
+    """True when `cur` continues `prev`'s turn: one assistant message arrives as one transcript
+    entry per content block, all sharing the message id."""
+    return cur.role == "hmd" and prev.role == "hmd" and bool(cur.mid) and prev.mid == cur.mid
 
 
 def clean_text(raw):
@@ -457,6 +463,265 @@ def fit_lines(lines):
     return kept
 
 
+# ── the incremental chat ─────────────────────────────────────────────────────
+def _fingerprint(raw):
+    """The last FP_BYTES of `raw`, trimmed forward to start on a UTF-8 character boundary so
+    that a read beginning there decodes without a replacement character."""
+    fp = raw[-FP_BYTES:]
+    k = 0
+    while k < len(fp) and fp[k] & 0xC0 == 0x80:
+        k += 1
+    return fp[k:]
+
+
+class ChatTail(object):
+    """The chat-relevant content of ONE transcript, kept level with the file by reading only
+    what was appended since the last tick. `view()` is, byte for byte, what this publisher used
+    to derive by re-reading, re-parsing and re-formatting the last `tail_bytes` of the file on
+    every tick -- ~115 ms for 1200 turns, the largest single cost of a transcript append's trip
+    to the phone. test/heimdall-ui-chat-incremental.test.sh holds it to that against a frozen
+    copy of the old pipeline, under appends, torn lines, rotations and a sliding window.
+
+    Why it can be exact. The old read covered the window [size - tail_bytes, size) of the file,
+    which moves with every append; a line the window starts inside is a partial one that fails
+    to parse, and a line it starts exactly at is whole. So the cache keeps the parts (entry_parts)
+    of every entry together with the byte offset of its line, and drops those whose line starts
+    before the window start: the same entries the old read would parse. Turns are runs of parts
+    (_merges), so a turn the window cuts into is simply the run of its remaining parts. Offsets
+    are exact byte offsets: every read goes through the injected `read_tail(path, nbytes)` (the
+    server's deny-listed primitive), which returns decoded text, so each is checked to be a
+    lossless decode (re-encoding gives back the requested byte count) and an unaligned window
+    start is resolved by a second read (`_cold`). Anything that cannot be proven -- invalid
+    UTF-8 in the window, a write landing between the stat and the read, a transcript replaced,
+    truncated or rewritten under the cache -- rebuilds from the window, or, failing that, derives
+    from one plain read exactly as before; it never serves a guess.
+
+    A line without its newline is never consumed. When it already is a whole JSON entry it still
+    counts (the old read parsed it), re-read each tick until the newline arrives.
+
+    Formatting is lazy and memoized per turn: `view()` walks the turns newest first and
+    formats only until the 200 lines the panel can hold are found, so a tick costs the turns
+    that changed, not the window.
+
+    One instance per transcript path; the publisher's poller thread is its only caller."""
+
+    def __init__(self, read_tail, tail_bytes):
+        self._read_tail = read_tail
+        self._tail = tail_bytes
+        self._reset()
+
+    def _reset(self):
+        self._ident = None       # (st_dev, st_ino) of the file the cache was built from; None: not resumable
+        self._off = 0            # offset just past the last complete (newline-terminated) line consumed
+        self._seen = 0           # file size at the last sync: _off plus the unterminated tail's length
+        self._mtime_ns = 0
+        self._fp = b""           # up to FP_BYTES bytes just before _off, to prove the file is the one cached
+        self._wstart = 0         # start of the tail window at the last sync
+        self._parts = []         # _Part of every entry inside the window, oldest first
+        self._ep = None          # (offset, entrypoint) of the newest entry inside the window that named one
+        self._extra = ((), None)    # parts / entrypoint of the unterminated last line when it is a whole entry
+        self._q = None           # (first part, part count, markdown) of the last question formatted
+
+    # keeping level with the file
+    def sync(self, path):
+        """Bring the cache level with `path`'s bytes as they are now. False -- cache untouched --
+        when the file cannot be read (denied, gone); True once view() reflects it."""
+        try:
+            return self._sync(path)
+        except BaseException:
+            self._reset()        # never leave a half-applied update to be resumed from
+            raise
+
+    def _sync(self, path):
+        for _ in range(SYNC_ATTEMPTS):
+            try:
+                st = os.stat(path)
+            except OSError:
+                return self._once(path)      # not a file this process can stat: whatever the reader makes of it
+            done = self._resume(path, st) if self._resumable(st) else None
+            if done is None:
+                done = self._cold(path, st)
+            if done is not None:
+                return done
+        return self._once(path)              # the file kept moving under every read: one plain read, no cache
+
+    def _resumable(self, st):
+        if self._ident != (st.st_dev, st.st_ino) or st.st_mtime_ns < self._mtime_ns:
+            return False
+        if st.st_size == self._seen:
+            return st.st_mtime_ns == self._mtime_ns      # a moved mtime on an unmoved size is an edit in place
+        return self._seen < st.st_size <= self._off + self._tail
+
+    def _resume(self, path, st):
+        """Read only the bytes after the last consumed line. None: the file is not what was cached."""
+        if st.st_size == self._seen:
+            return True
+        need = st.st_size - self._off + len(self._fp)
+        text = self._read_tail(path, need)
+        if text is None:
+            return False
+        raw = text.encode("utf-8")
+        if len(raw) != need or not raw.startswith(self._fp):
+            return None          # lossy decode, a write between stat and read, or the file was replaced
+        pos, tail = self._feed(raw[len(self._fp):].decode("utf-8"), self._off)
+        if pos != self._off:
+            self._fp = _fingerprint(raw[:len(self._fp) + pos - self._off])
+        self._off, self._seen, self._mtime_ns = pos, st.st_size, st.st_mtime_ns
+        self._load_tail(tail, pos)
+        self._slide(st.st_size)
+        return True
+
+    def _cold(self, path, st):
+        """Rebuild from a read of the tail window, as the old publisher did on every tick. None: the
+        file moved while it was being read (the caller tries again)."""
+        self._reset()
+        size = st.st_size
+        text = self._read_tail(path, self._tail)
+        if text is None:
+            return False
+        if size > self._tail:
+            head, nl, rest = text.partition("\n")    # the window opens mid-line: `head` is what is left of one
+        else:
+            head, nl, rest = None, "\n", text        # the window is the whole file, from a line boundary
+        rest_raw = rest.encode("utf-8")
+        rest_pos = size - len(rest_raw)              # where `rest` starts, IF it decoded without replacements
+        # An unaligned window start decodes lossily (a replacement char per stray byte), so the byte length
+        # of `head` is unknowable; `rest` starts on a line boundary, and is proven lossless by asking for
+        # exactly its length again: a lossy `rest` would be asked for too many bytes and start earlier.
+        exact = (rest_pos == 0) if head is None else (bool(nl) and self._read_tail(path, len(rest_raw)) == rest)
+        try:
+            after = os.stat(path)
+        except OSError:
+            return None
+        if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (st.st_dev, st.st_ino, size, st.st_mtime_ns):
+            return None
+        if not exact:
+            self._load_text(text)
+            return True
+        if head is not None:
+            self._take(_parse_line(head), size - self._tail)
+        pos, tail = self._feed(rest, rest_pos)
+        self._ident = (st.st_dev, st.st_ino)
+        self._off, self._seen, self._mtime_ns = pos, size, st.st_mtime_ns
+        self._fp = _fingerprint(rest_raw[:pos - rest_pos])
+        self._load_tail(tail, pos)
+        self._slide(size)
+        return True
+
+    def _once(self, path):
+        text = self._read_tail(path, self._tail)
+        if text is None:
+            return False
+        self._load_text(text)
+        return True
+
+    def _load_text(self, text):
+        """Derive from `text` alone, as the old publisher did: the text is the whole window, so
+        nothing is cut and offsets are never compared. Not resumable (_ident stays None)."""
+        self._reset()
+        pos, tail = self._feed(text, 0)
+        self._load_tail(tail, pos)
+
+    def _feed(self, text, pos):
+        """Consume the complete lines of `text`, which starts at file offset `pos`: returns the
+        offset just past the last of them and the unterminated rest."""
+        lines = text.split("\n")
+        rest = lines.pop()
+        for ln in lines:
+            self._take(_parse_line(ln), pos)
+            pos += len(ln.encode("utf-8")) + 1
+        return pos, rest
+
+    def _take(self, e, off):
+        if e is None:
+            return
+        ep = e.get("entrypoint")
+        if isinstance(ep, str) and ep:
+            self._ep = (off, ep)
+        self._parts.extend(entry_parts(e, off))
+
+    def _load_tail(self, rest, pos):
+        e = _parse_line(rest)
+        if e is None:
+            self._extra = ((), None)
+            return
+        ep = e.get("entrypoint")
+        self._extra = (entry_parts(e, pos), (pos, ep) if isinstance(ep, str) and ep else None)
+
+    def _slide(self, size):
+        """Cut the cache to the window [size - tail_bytes, size): the entries a read of it would parse."""
+        self._wstart = start = max(0, size - self._tail)
+        k = 0
+        while k < len(self._parts) and self._parts[k].off < start:
+            k += 1
+        if k:
+            del self._parts[:k]
+        if self._ep is not None and self._ep[0] < start:
+            self._ep = None
+
+    # what the window says
+    def _window(self):
+        """(parts, newest entrypoint) inside the window, the unterminated line included."""
+        parts, ep = self._parts, self._ep
+        extra_parts, extra_ep = self._extra
+        if extra_parts and extra_parts[0].off >= self._wstart:
+            parts = parts + list(extra_parts)
+        if extra_ep is not None and extra_ep[0] >= self._wstart:
+            ep = extra_ep
+        return parts, ep
+
+    def headless(self):
+        """True for a `claude -p` / SDK session (entrypoint sdk-cli, sdk-py, sdk-ts ...): the
+        judge/verifier sub-sessions that once replaced the whole chat panel. The interactive CLI
+        says `cli`. A window with no entrypoint at all counts as interactive."""
+        ep = self._window()[1]
+        return ep is not None and ep[1].startswith("sdk")
+
+    def view(self, fallback_ts):
+        """(headless, lines, question) for the window. `lines` are the newest panel lines in the
+        publisher's format, bounded as fit_lines does; `question` is the hmd-question markdown for
+        the last shown turn, or None. `fallback_ts` (the file's mtime) times a turn whose entry
+        has no usable timestamp."""
+        parts = self._window()[0]
+        lines, last = [], None
+        i = len(parts)
+        while i > 0 and len(lines) < P.MAX_LIST_ITEMS:
+            j = i - 1
+            while j > 0 and _merges(parts[j - 1], parts[j]):
+                j -= 1
+            turn = parts[j:i]
+            i = j
+            if not any(p.final for p in turn):
+                continue
+            if last is None:
+                last = turn
+            line = self._line(turn, fallback_ts)
+            if line:
+                lines.append(line)
+        lines.reverse()
+        question = None
+        if last is not None and last[0].role == "hmd":
+            text = "\n".join(p.text for p in last)
+            if is_question(text):
+                question = self._question(last[0], len(last), text)
+        return self.headless(), fit_lines(lines), question
+
+    @staticmethod
+    def _line(turn, fallback_ts):
+        first = turn[0]
+        ts = first.ts if first.ts is not None else fallback_ts
+        key = (len(turn), ts)
+        if first.key != key:
+            first.line = format_line(first.role, "\n".join(p.text for p in turn), ts)
+            first.key = key
+        return first.line
+
+    def _question(self, first, count, text):
+        if self._q is None or self._q[0] is not first or self._q[1] != count:
+            self._q = (first, count, question_markdown(text))
+        return self._q[2]
+
+
 # ── the publisher ────────────────────────────────────────────────────────────
 class CompanionPublisher(object):
     """One per `hmd ui` process. `tick()` is called from the poller; it is cheap when
@@ -472,7 +737,8 @@ class CompanionPublisher(object):
         self._read_tail = read_tail or _default_read_tail
         self._list_agents = list_agents
         self._tail_bytes = tail_bytes or _env_int("HMD_UI_CHAT_TAIL_BYTES", TAIL_BYTES_DEFAULT)
-        self._derived = None        # {"stamp", "mtime", "lines"} of the transcript last read
+        self._derived = None        # {"stamp", "mtime", "lines", "question"} of the transcript last read
+        self._tails = {}            # transcript path -> its ChatTail, least recently used first
         self._headless = set()      # transcripts known to be sdk/-p sessions
         self._written = {}          # panel id -> the content last written
         self._agent_seen = {}       # agent id -> {first, finished_at}, see agent_rows
@@ -502,22 +768,25 @@ class CompanionPublisher(object):
             stamp = (path, size, mtime_ns)
             if self._derived is not None and self._derived["stamp"] == stamp:
                 return self._derived
-            text = self._read_tail(path, self._tail_bytes)
-            if text is None:
+            tail = self._tail_of(path)
+            if not tail.sync(path):
                 continue
-            entries = parse_entries(text)
-            if is_headless(entries):
+            if tail.headless():
                 self._headless.add(path)
+                self._tails.pop(path, None)
                 continue
-            turns = derive_turns(entries, mtime)
-            lines = [ln for ln in (format_line(t["role"], t["text"], t["ts"]) for t in turns) if ln]
-            last = turns[-1] if turns else None
-            question = None
-            if last is not None and last["role"] == "hmd" and is_question(last["text"]):
-                question = question_markdown(last["text"])
-            self._derived = {"stamp": stamp, "mtime": mtime, "lines": fit_lines(lines), "question": question}
+            _, lines, question = tail.view(mtime)
+            self._derived = {"stamp": stamp, "mtime": mtime, "lines": lines, "question": question}
             return self._derived
         return None
+
+    def _tail_of(self, path):
+        """The ChatTail of `path`, kept for the next tick (the MAX_TAILS most recently used are)."""
+        tail = self._tails.pop(path, None) or ChatTail(self._read_tail, self._tail_bytes)
+        self._tails[path] = tail
+        while len(self._tails) > MAX_TAILS:
+            del self._tails[next(iter(self._tails))]
+        return tail
 
     # writing
     def _write(self, pid, title, ptype, data, updated_at):
