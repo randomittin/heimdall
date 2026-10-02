@@ -2,7 +2,7 @@
 # test/heimdall-phone-deny.test.sh
 #
 # Oracle for A4, DENY-ONLY round (docs/HANDOFF-TO-HEIMDALL-product-asks.md item A4; the operator
-# decision: the phone can DENY or STOP a pending risky action, it can never approve one):
+# decision: the phone can DENY a pending risky action, it can never approve one):
 #
 #   bin/lib/companion_ui_decisions.py   the decision store: pending requests, single-use deny
 #                                       decisions, settle() -- the hook's window ends, and a deny
@@ -39,7 +39,7 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 
-echo "heimdall-phone-deny (A4 deny-only: the phone can deny or stop, never approve)"
+echo "heimdall-phone-deny (A4 deny-only: the phone can deny a risky action, never approve one)"
 
 for tool in python3 jq; do
   if ! command -v "$tool" >/dev/null 2>&1; then

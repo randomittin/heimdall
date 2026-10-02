@@ -138,16 +138,17 @@ PYEOF
 }
 
 # Decrypts the sealed `state` frames the client publishes and waits until the NEWEST one's
-# `approvals` slice does (MODE=has) / does not (MODE=lacks) carry request ID. Prints the matching
-# entry as one JSON line (has), or the whole slice (lacks); exit 1 on timeout. Only frames not yet
-# seen are opened, so a long log does not make every poll quadratic.
+# `approvals` slice does (MODE=has) / does not (MODE=lacks) carry request WANT, or (MODE=summary)
+# carries one whose summary is WANT. Prints the matching entry as one JSON line (has, summary), or
+# the whole slice (lacks); exit 1 on timeout. Only frames not yet seen are opened, so a long log does
+# not make every poll quadratic.
 wait_for_approvals_state() {
-  local file="$1" key_b64="$2" mode="$3" id="$4" secs="${5:-15}"
-  python3 - "$file" "$key_b64" "$mode" "$id" "$secs" "$E2E_MOD" <<'PYEOF'
+  local file="$1" key_b64="$2" mode="$3" want="$4" secs="${5:-15}"
+  python3 - "$file" "$key_b64" "$mode" "$want" "$secs" "$E2E_MOD" <<'PYEOF'
 import sys, json, time, base64
 from importlib.util import spec_from_file_location, module_from_spec
 
-file_path, key_b64, mode, want_id, secs_s, e2e_path = sys.argv[1:7]
+file_path, key_b64, mode, want, secs_s, e2e_path = sys.argv[1:7]
 deadline = time.time() + float(secs_s)
 spec = spec_from_file_location("hmd_relay_e2e", e2e_path)
 e2e = module_from_spec(spec)
@@ -247,7 +248,8 @@ printf '%s' "$DEV_PUB_B64" > "$CTL/bind-device"
 CLIENT_OUT="$TMPROOT/client.out"
 "$RELAY_CLIENT" --relay "http://127.0.0.1:$PORT_RELAY" --repo "$REPO_T" --ui-port "$PORT_UI" \
   >"$CLIENT_OUT" 2>"$TMPROOT/client.err" &
-PIDS+=("$!")
+CLIENT_PID=$!
+PIDS+=("$CLIENT_PID")
 
 if wait_for "$CLIENT_OUT" '"event":"pair_init"' 10 && wait_for "$CLIENT_OUT" '"event":"device_bound"' 10; then
   ok "setup: the real relay client paired and bound the fake device"
