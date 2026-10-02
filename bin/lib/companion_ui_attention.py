@@ -48,6 +48,9 @@ HOW EACH STATE IS REACHED (the newest decisive entry decides):
                   tools 120 s; Agent/Task never), skipped when the newest permission-mode is
                   bypassPermissions/dontAsk; a pending ExitPlanMode is immediate. This is a timing
                   heuristic standing in for the Notification(permission_prompt) hook.
+                  ALSO, and ahead of everything the transcript says: while the phone-deny hook holds a
+                  request for the phone (the `approvals` slice, A4 deny-only round) -- exact, not a
+                  heuristic, anchored on the oldest such request (see _approval_attention).
   idle            an end_turn / user interrupt / API-error that is SETTLED (a system turn_duration
                   entry followed it, or SETTLE_S passed) and has no fresh live subagents.
                   kind "done" iff sweep_receipt.head_sha and checkpoint.head agree on a >=7-char
@@ -568,9 +571,37 @@ def _episode_id(session, anchor_key, state):
     return "a-" + hashlib.sha256(("%s|%s|%s" % (session, anchor_key, state)).encode("utf-8")).hexdigest()[:10]
 
 
-def collect(root, turn=None, sweep_receipt=None, checkpoint=None, quality_gate=None, now=None, denied=None):
+def _turn_of(turn):
+    return turn if isinstance(turn, int) and not isinstance(turn, bool) and turn >= 0 else None
+
+
+def _approval_attention(approvals, turn):
+    """The `attention` dict while the phone-deny hook holds a request for the phone, else None.
+    Anchored on the OLDEST live request -- its id and requested_at -- and on nothing in the transcript,
+    so the "needs you" signal and the `approvals` list the phone renders cannot disagree, and the
+    episode id holds until the request is answered or lapses. The summary names the tool only; the
+    command itself is in approvals[].summary (already scrubbed) and is not repeated here."""
+    first = approvals[0] if isinstance(approvals, list) and approvals else None
+    if not isinstance(first, dict) or not isinstance(first.get("id"), str):
+        return None
+    since = first.get("requested_at")
+    if isinstance(since, bool) or not isinstance(since, (int, float)):
+        return None
+    out = empty()
+    out.update(state="needs_approval", id=_episode_id("approvals", first["id"], "needs_approval"),
+               since=round(float(since), 3), kind="permission",
+               summary="permission requested: " + _tool_label(first.get("tool")), turn=_turn_of(turn))
+    return out
+
+
+def collect(root, turn=None, sweep_receipt=None, checkpoint=None, quality_gate=None, now=None, denied=None,
+            approvals=None):
     """The `attention` dict for `root`. `turn` is parallelism.turns; the three slices only decide
-    idle's kind; `denied` is hmd-ui's path_is_denied. Never raises on a missing/unreadable file."""
+    idle's kind; `denied` is hmd-ui's path_is_denied; `approvals` is the live `approvals` slice (a
+    pending one decides everything). Never raises on a missing/unreadable file."""
+    live = _approval_attention(approvals, turn)
+    if live is not None:
+        return live
     now = time.time() if now is None else float(now)
     out = empty()
     try:
@@ -590,6 +621,5 @@ def collect(root, turn=None, sweep_receipt=None, checkpoint=None, quality_gate=N
     except (OSError, ValueError):
         return out
     out.update(state=state, id=_episode_id(os.path.splitext(os.path.basename(path))[0], anchor[0], state),
-               since=round(anchor[1], 3), kind=kind, summary=summary, options=options,
-               turn=turn if isinstance(turn, int) and not isinstance(turn, bool) and turn >= 0 else None)
+               since=round(anchor[1], 3), kind=kind, summary=summary, options=options, turn=_turn_of(turn))
     return out

@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""heimdall-phone-deny -- PreToolUse hook: let the paired phone DENY a risky action.
+
+A4 of hmdapp's docs/HANDOFF-TO-HEIMDALL-product-asks.md, DENY-ONLY round. The phone can refuse a risky
+shell command or an outside-the-repo write while hmd holds it for a few seconds; it can never approve
+anything. A phone only ever REDUCES what runs, and has exactly two verbs for it: `deny` (refuse this
+call) and `stop` (refuse it AND end the turn, like pressing Esc).
+
+OFF BY DEFAULT. The hook does nothing unless HMD_PHONE_DENY=1 (exactly 1), and `heimdall-hooks disable
+phone-deny` switches the whole group off (hooks/hooks.json runs this script only when the flag is set
+and the group is enabled; the script re-checks the flag itself).
+
+WHAT IT DOES, when armed, for one PreToolUse call (hook JSON on stdin):
+    1. Not an attended session (an hmd sub-session, headless claude -p)   -> nothing.
+    2. No companion that can answer: a live relay-mode `hmd app connect` (.heimdall/app/connect.json
+       naming live pids), a paired device, and a last frame the relay delivered (.heimdall/app/
+       relay.json)                                                          -> nothing.
+    3. Not a risky action (bin/lib/phone_deny_risk.py: a shell command that pushes, deletes, publishes,
+       deploys, changes something over the network, escalates privilege or changes the system; a
+       Write/Edit/MultiEdit/NotebookEdit outside the project root)          -> nothing.
+    4. Risky: publish a pending request (bin/lib/companion_ui_decisions.py -> .heimdall/ui/approvals/,
+       served as /api/state `approvals` and sealed to the phone) and wait, heartbeating, up to
+       HMD_PHONE_DENY_WINDOW_S (default 10, at least 1, at most 120 -- the doc's ceiling) for the
+       phone's sealed `decide` command (bin/heimdall-relay-client -> decide()).
+         deny arrives in the window -> print ONE permissionDecision "deny" object and exit 0.
+         stop arrives in the window -> the same object plus {"continue": false, "stopReason": ...}:
+                                       the call is refused and the turn ends.
+         anything else              -> print NOTHING, exit 0: Claude Code's normal permission flow
+                                       decides exactly as it would without this hook.
+    The request is withdrawn on every way out (including SIGTERM / the launching shell dying).
+
+THE VOCABULARY IS CLOSED: the hook's whole output is {nothing, a deny object, a deny object + stop}.
+It never prints an allow, never edits the tool input, never asks. A decision file that is not a
+well-formed deny or stop for THIS request -- an allow, an approve, garbage, a case-varied verb,
+another request's -- is not a decision.
+
+IT NEVER BLOCKS ON ITS OWN FAILURE. No reply, a timeout, malformed input, an unreadable or unwritable
+approvals dir, a missing library, any exception: exit 0 with no output (a one-line note on stderr for
+the unexpected ones). It never exits 2 (the code that blocks a tool call), and the hooks.json command
+forces exit 0 around it as well.
+
+`stop` ENDS THE TURN ONLY AT A REQUEST THE PHONE WAS SHOWN. It is the one lever Claude Code gives a hook
+({"continue": false}), applied to the one pending call the phone is looking at -- there is no standing
+"stop the next thing" marker, so nothing lingers into a later turn. Interrupting a turn at an arbitrary
+moment is the separate remote-controls interrupt work (hmdapp docs/HANDOFF-TO-HEIMDALL-remote-controls.md,
+H4). Not verified here: what `continue:false` does when the call came from inside a sub-agent (H8 spike).
+
+Usage:  heimdall-phone-deny [--repo DIR] < hook.json        (-h / --help prints this)
+Env:    HMD_PHONE_DENY=1            arm the hook
+        HMD_PHONE_DENY_WINDOW_S=N   how long a risky action is held (seconds)
+"""
+import json
+import math
+import os
+import shutil
+import signal
+import sys
+import time
+from importlib.util import module_from_spec, spec_from_file_location
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LIB_DIR = os.path.join(HERE, "lib")
+
+FLAG_ENV = "HMD_PHONE_DENY"
+WINDOW_ENV = "HMD_PHONE_DENY_WINDOW_S"
+DEFAULT_WINDOW_S = 10.0
+MIN_WINDOW_S = 1.0
+MAX_WINDOW_S = 120.0
+POLL_S = 0.2
+STDIN_CAP_BYTES = 2 * 1024 * 1024
+STATE_CAP_BYTES = 65536
+PROGRAMMATIC_ENTRYPOINTS = frozenset(("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action"))
+DENY_REASON = ("Denied from the operator's paired phone (hmd phone-deny). Do not retry this action; "
+               "ask the operator how they want to proceed.")
+STOP_DENY_REASON = ("Stopped from the operator's paired phone (hmd phone-deny). Do not retry this action "
+                    "or carry on with the task; wait for the operator.")
+STOP_REASON = "Stopped from the paired phone (hmd phone-deny)."
+
+
+def armed(env):
+    return env.get(FLAG_ENV) == "1"
+
+
+def window_seconds(env):
+    """How long a risky action is held: the env value clamped to [MIN_WINDOW_S, MAX_WINDOW_S]; anything
+    that is not a finite number is the default -- never zero, never unbounded."""
+    try:
+        value = float(env.get(WINDOW_ENV, ""))
+    except (TypeError, ValueError):
+        return DEFAULT_WINDOW_S
+    if not math.isfinite(value):
+        return DEFAULT_WINDOW_S
+    return min(max(value, MIN_WINDOW_S), MAX_WINDOW_S)
+
+
+def attended_session(env):
+    """False for a session no human is typing into: headless claude -p / SDK children and hmd's own judge
+    or role-tagged sub-sessions share this repo and its hooks, and none may hold the phone line.
+    Same rule as bin/heimdall-inbox-deliver's attended_session()."""
+    if env.get("CLAUDE_CODE_ENTRYPOINT", "").strip() in PROGRAMMATIC_ENTRYPOINTS:
+        return False
+    if env.get("HMD_AGENT_TYPE", "").strip():
+        return False
+    return env.get("HMD_JUDGMENT", "").strip().lower() in ("", "0", "false")
+
+
+def _read_json(path):
+    try:
+        with open(path, "rb") as f:
+            obj = json.loads(f.read(STATE_CAP_BYTES).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _pid_alive(pid):
+    """Signal 0 only asks whether the pid exists. A pid owned by another user is not hmd's own relay
+    client or ui (the same user started them), so EPERM counts as dead: a pid recycled by a root
+    daemon after a crash must not read as a connected companion."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def companion_reachable(root):
+    """Can a phone answer a request raised here? Only through the sealed relay path, so: a relay-mode
+    connect.json whose ui and relay-client processes are both alive, and a relay status that says a
+    device is paired and that the relay did not report "no phone connected" on its last frame."""
+    app = os.path.join(root, ".heimdall", "app")
+    connect = _read_json(os.path.join(app, "connect.json"))
+    if connect is None or connect.get("mode") != "relay":
+        return False
+    if not (_pid_alive(connect.get("pid_ui")) and _pid_alive(connect.get("pid_client"))):
+        return False
+    status = _read_json(os.path.join(app, "relay.json"))
+    return status is not None and status.get("paired") is True and status.get("last_delivered") is not False
+
+
+def read_hook_input(stream):
+    """The hook JSON object on `stream`, or None: empty, unparsable, not an object, or over the cap
+    (the rest of an oversized payload is drained so the writer is never left blocked on the pipe)."""
+    data = stream.read(STDIN_CAP_BYTES + 1)
+    if len(data) > STDIN_CAP_BYTES:
+        with open(os.devnull, "wb") as sink:
+            shutil.copyfileobj(stream, sink)
+        return None
+    try:
+        obj = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def decision_output(verdict):
+    """The hook's whole output vocabulary, besides nothing: the call is denied ("deny"), and for
+    "stop" the turn is ended too -- Claude Code's own {"continue": false, "stopReason": ...}, which
+    takes precedence over the per-call decision. There is no branch that allows anything."""
+    out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                  "permissionDecisionReason": STOP_DENY_REASON if verdict == "stop" else DENY_REASON}}
+    if verdict == "stop":
+        out["continue"] = False
+        out["stopReason"] = STOP_REASON
+    return out
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _load(name):
+    spec = spec_from_file_location(name, os.path.join(LIB_DIR, name + ".py"))
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _option(argv, name):
+    for i, arg in enumerate(argv):
+        if arg == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith(name + "="):
+            return arg[len(name) + 1:]
+    return None
+
+
+def hold_for_decision(decisions, root, tool_name, summary, window_s, launcher_pid):
+    """Publish one request, wait up to window_s for the phone's verb, withdraw the request. Returns
+    "deny" or "stop" only when that verb is on record. Returns None -- and prints nothing -- when the
+    window runs out or the process that launched this hook is gone (Esc, a timeout that reached only
+    the shell): a decision printed into a dead pipe would be lost, and a request kept listed would be
+    a lie."""
+    rec = decisions.request(root, tool_name, summary, window_s)
+    try:
+        deadline = time.monotonic() + window_s
+        while True:
+            decisions.heartbeat(root, rec["id"])
+            verdict = decisions.decision_of(root, rec["id"])
+            if verdict is not None:
+                return verdict
+            if os.getppid() != launcher_pid:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(POLL_S, remaining))
+        # The window is over: either the phone's verb is already on record, or this makes sure none
+        # can land from now on -- a decision the phone is told was accepted is one this hook acts on.
+        return decisions.settle(root, rec["id"])
+    finally:
+        decisions.close(root, rec["id"])
+
+
+def run(argv, env, stdin, launcher_pid):
+    if "-h" in argv or "--help" in argv:
+        sys.stdout.write(__doc__)
+        return 0
+    if not armed(env) or not attended_session(env):
+        return 0
+    if hasattr(stdin, "isatty") and stdin.isatty():
+        return 0
+    hook = read_hook_input(stdin)
+    if hook is None or hook.get("hook_event_name", "PreToolUse") != "PreToolUse":
+        return 0
+    cwd = hook.get("cwd") if isinstance(hook.get("cwd"), str) else None
+    root = os.path.abspath(os.path.expanduser(_option(argv, "--repo") or cwd or "."))
+    if not companion_reachable(root):
+        return 0
+    risk = _load("phone_deny_risk").classify(hook.get("tool_name"), hook.get("tool_input"), root, cwd=cwd)
+    if risk is None:
+        return 0
+    verdict = hold_for_decision(_load("companion_ui_decisions"), root, hook["tool_name"], risk["summary"],
+                                window_seconds(env), launcher_pid)
+    if verdict is not None:
+        emit(decision_output(verdict))
+    return 0
+
+
+def _stand_down(signum, _frame):
+    raise SystemExit(0)
+
+
+def main():
+    launcher_pid = os.getppid()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _stand_down)
+    try:
+        return run(sys.argv[1:], os.environ, sys.stdin.buffer, launcher_pid)
+    except Exception as e:  # fail open: the hook's own bug must never be what stops a tool call
+        sys.stderr.write("phone-deny: ignored (%s: %s)\n" % (type(e).__name__, e))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

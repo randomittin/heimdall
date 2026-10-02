@@ -3,7 +3,9 @@
 Cloudflare relay (see hmdapp's docs/HANDOFF-TO-HEIMDALL-relay.md and
 docs/superpowers/specs/relay/INVARIANTS.md -- both read-only inputs from the
 hmdapp repo, never edited here) and accepts a `send-message` command back from
-the paired phone.
+the paired phone -- and a `decide` command, the phone's sealed DENY of a pending
+risky action (A4, deny-only round: see `_decide`; nothing else about an action can
+be decided from the phone, and "allow" is refused for every request).
 
 Spawned by `bin/heimdall-app connect --relay <url>` as a sibling process to a
 local `hmd ui`; this process owns the ONE relay session for its lifetime and is
@@ -62,10 +64,11 @@ to drive its own UI; nothing else is ever written to stdout.
                                                        may repeat across a
                                                        stream reconnect
     {"event":"state_sent","seq":N,"bytes":B,"delivered":bool}
-    {"event":"command","action":"send-message","ok":bool,"detail":..}
+    {"event":"command","action":"send-message"|"decide"|..,"ok":bool,"detail":..}
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
-        logged, not even at this level)
+        logged, not even at this level); any action other than the two
+        named is acked `not-implemented`
     {"event":"ack_sent","of_seq":N,"seq":S,"id":..|null,"attempt":K,"ms":N,
      "ok":bool,"delivered":bool}
         one line per POST ATTEMPT of the ack answering a command (so every
@@ -223,6 +226,7 @@ def _load_module(name, path):
 
 UI = _load_module("hmd_ui", os.path.join(SENTINELS_DIR, "hmd-ui.py"))
 INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_inbox.py"))
+DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "companion_ui_decisions.py"))
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
@@ -860,6 +864,30 @@ class RelayClient:
         resp = conn.getresponse()
         return conn, resp
 
+    def _decide(self, params):
+        """The phone's sealed DENY or STOP of a pending risky action (A4, deny-only round; the doc's
+        POST /api/decide, carried as a relay command the way send-message is):
+            command  {"action":"decide","params":{"id":"p-<8 hex>","decision":"deny"|"stop"}}
+            ack ok   {"ok":true,"of_seq":N,"id":"p-<8 hex>","decision":"deny"|"stop"}
+            ack no   {"ok":false,"of_seq":N,"detail":<code>}
+        `deny` refuses the call; `stop` refuses it and ends the turn (bin/heimdall-phone-deny turns
+        either into its PreToolUse output). Reached only by a frame that opened under the paired
+        device's session key and passed the replay guard, so there is no other authentication to do.
+        The store (companion_ui_decisions) owns every rule and its machine-readable refusal:
+        bad-decision, unknown-id, allow-not-permitted, already-decided, expired -- the phone can only
+        reduce what runs, "allow" (and "approve", and any other word) is refused for every request,
+        and nothing is written on a refusal."""
+        if DECISIONS is None:
+            return False, "decisions-unavailable", {}
+        fields = params if isinstance(params, dict) else {}
+        try:
+            result = DECISIONS.decide(self.root, fields.get("id"), fields.get("decision"))
+        except DECISIONS.DecisionError as e:
+            return False, e.code, {}
+        except OSError:
+            return False, "write-failed", {}
+        return True, None, {"id": result["id"], "decision": result["decision"]}
+
     def _handle_command(self, env):
         # The phone's ack window opened before this command reached us; retries
         # of its ack may only START inside what is left of it (ACK_WINDOW_S).
@@ -904,6 +932,8 @@ class RelayClient:
                     ok, detail = False, e.code
                 except OSError:
                     ok, detail = False, "write-failed"
+        elif action == "decide":
+            ok, detail, extra = self._decide(params)
         else:
             ok, detail = False, "not-implemented"
         emit({"event": "command", "action": action, "ok": ok, "detail": detail})
@@ -1122,7 +1152,7 @@ class RelayClient:
 def build_argparser():
     ap = argparse.ArgumentParser(prog="heimdall-relay-client",
                                   description="publish hmd ui state through the Cloudflare relay, "
-                                              "E2E sealed, accepting a send-message command back")
+                                              "E2E sealed, accepting send-message and decide (deny-only) commands back")
     ap.add_argument("--relay", required=True, metavar="URL",
                      help="relay base URL, e.g. https://hmd-relay.example.workers.dev")
     ap.add_argument("--repo", required=True, metavar="DIR", help="repo root to render (passed to collect_state)")
