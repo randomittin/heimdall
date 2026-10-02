@@ -304,12 +304,21 @@ def main():
         check((nonce_b64, ct_b64) == (frame["wire"]["nonce"], frame["wire"]["ciphertext"]),
               "sealed frame %s: python seal() of its plaintext reproduces the fixture bytes" % name,
               "expected nonce=%s ciphertext=%s" % (nonce_b64, ct_b64))
-        check(json.loads(fx.open_(frame)) == frame["plaintext"],
-              "sealed frame %s: opens on the receiving side to its plaintext" % name)
+        try:
+            opened = json.loads(fx.open_(frame))
+        except e2e.E2EError as exc:
+            opened = "open_ refused the frame: %s" % exc
+        check(opened == frame["plaintext"],
+              "sealed frame %s: opens on the receiving side to its plaintext" % name, opened)
 
     # -- the real client, driven with the fixture ----------------------------------------------------
-    with tempfile.TemporaryDirectory() as root:
-        obs = drive(mod, fx, root)
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            obs = drive(mod, fx, root)
+    except Exception as exc:  # a tampered fixture can make the client refuse a frame outright
+        check(False, "client: the replay ran to the end", "%s: %s" % (type(exc).__name__, exc))
+        print("\n%d passed, %d failed" % (passed, failed))
+        return 1
 
     calls = obs.calls
     check(len(calls) == 6, "client: made exactly the six requests the session implies "
