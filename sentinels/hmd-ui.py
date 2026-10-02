@@ -32,7 +32,9 @@ Routes (all GET):
                       the rest is still reduced. Email-shaped substrings become
                       "[email]" on every redacting profile. `edits.count` is the number
                       of UNIQUE edited paths (not edit events); `edits.paths` is
-                      repo-relative inside the repo, absolute outside it
+                      repo-relative and holds ONLY paths inside the repo: the ledger of THIS
+                      repo's session (bin/lib/hmd_session_resolve.py), out-of-repo entries
+                      dropped -- never absolute, never `../x`
     /api/events       text/event-stream; a `data:` frame only when the digest changes
                       (the digest covers `panels`, so a `hmd ui panel set` lands within
                       one poll)
@@ -232,6 +234,12 @@ SESSION_CODE = _load_module("hmd_session_code", os.path.join(LIB_DIR, "hmd_sessi
 # the newest main-chain entries of the repo's session transcript -> {state,id,since,kind,summary,
 # options,turn}. Tail-only, stat-cached; see the module docstring.
 ATTENTION = _load_module("companion_ui_attention", os.path.join(LIB_DIR, "companion_ui_attention.py"))
+# The ONE place the "which Claude Code session does THIS repo's instance read" rule lives
+# (bin/lib/hmd_session_resolve.py): an inherited CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID /
+# SESSION_ID counts only when it names one of the repo's OWN transcripts, else the newest
+# interactive one. Every session-keyed collector below (edits, parallelism, session code) asks it
+# through repo_session(); attention and the chat publishers import the same module.
+SESSIONS = _load_module("hmd_session_resolve", os.path.join(LIB_DIR, "hmd_session_resolve.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -298,9 +306,10 @@ def _run_cached(argv, cwd, timeout=CMD_TIMEOUT_S, env=None):
     both spawn the same command -- the second blocks on the lock and then hits the
     now-warm entry instead of racing its own subprocess (perf item 2d: never spawn
     `git` more than once per poll interval, even under concurrent load). `timeout`/
-    `env` are forwarded to `_run` -- the cache key stays (argv, cwd) only, since every
-    caller always pairs the same argv+cwd with the same timeout/env."""
-    key = (tuple(argv), cwd)
+    `env` are forwarded to `_run`; the cache key carries the env overlay too (collect_edits'
+    overlay names the repo's session, which changes when a new session starts) -- `timeout`
+    stays out of it, every caller pairs the same argv+cwd with the same timeout."""
+    key = (tuple(argv), cwd, tuple(sorted((env or {}).items())))
     with _subprocess_cache_lock:
         now = time.monotonic()
         hit = _subprocess_cache.get(key)
@@ -330,19 +339,33 @@ def _first_line(text):
 
 
 # ── per-field collectors (each returns its contract slice, or None) ──────────
+def repo_session(root):
+    """The Claude Code session THIS repo's instance reads (bin/lib/hmd_session_resolve.py -- one
+    rule for every collector): an inherited session id only when it names one of the repo's own
+    transcripts, else the newest interactive one, else None. Never raises; the deny-list guards
+    the one directory this reads outside the repo."""
+    if SESSIONS is None:
+        return None
+    try:
+        return SESSIONS.resolve(root, denied=path_is_denied)
+    except Exception:
+        return None
+
+
 def collect_session_code(root):
     """identity.session_code -- the same 5-char code the companion app shows for this
     paired session (bin/lib/hmd_session_code.py, the one source both this file and
     sentinels/hmd-statusline.py read). `hmd app connect` pairs ONE `hmd ui` instance
     per repo (.planning/plans/PLAN-hmd-app-connect.md; its state file
     <repo>/.heimdall/app/connect.json is repo-keyed, not per-Claude-session), so this
-    is REPO-scoped here -- the live Claude Code session_id, when this process happens
-    to have inherited one (CLAUDE_SESSION_ID/SESSION_ID, the same env precedence
-    `_tracker_state_path()` elsewhere in this file already uses), wins when present;
-    otherwise `root` is the input. Never raises."""
+    is REPO-scoped here -- the live Claude Code session_id, when this process has inherited
+    one that names a transcript of THIS repo (repo_session().pinned: an id inherited from a
+    shell that belongs to another repo is ignored), wins when present; otherwise `root` is
+    the input. Never raises."""
     if SESSION_CODE is None:
         return None
-    sid = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("SESSION_ID")
+    session = repo_session(root)
+    sid = session.id if session is not None and session.pinned else None
     try:
         code, _source = SESSION_CODE.session_code_for(session_id=sid or None, repo=root)
     except Exception:
@@ -509,19 +532,21 @@ def _tracker_state_dir():
     return os.path.join(tmp, "heimdall-parallel")
 
 
-def _tracker_state_path():
+def _tracker_state_path(root):
     """The live counters file parallelism-tracker maintains (state_path() in
-    bin/parallelism-tracker.c). With no session id in our env, the most recently
-    touched session's file is the one the operator is looking at."""
-    sid = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("SESSION_ID")
+    bin/parallelism-tracker.c) for THIS repo's session (repo_session): `<id>.state` when it
+    exists, else the tracker's own unkeyed `default.state` (every hook run writes there -- Claude
+    Code exports only CLAUDE_CODE_SESSION_ID, which the tracker does not read -- so it is
+    machine-wide by the tracker's own design), else None. Never "the newest state file of any
+    session": that was another repo's counters."""
     d = _tracker_state_dir()
-    if sid:
-        return os.path.join(d, sid + ".state")
-    try:
-        cands = [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".state")]
-        return max(cands, key=os.path.getmtime) if cands else None
-    except (OSError, ValueError):
-        return None
+    session = repo_session(root)
+    if session is not None and session.id:
+        keyed = os.path.join(d, session.id + ".state")
+        if os.path.isfile(keyed):
+            return keyed
+    unkeyed = os.path.join(d, "default.state")
+    return unkeyed if os.path.isfile(unkeyed) else None
 
 
 def parse_tracker_state(text):
@@ -601,7 +626,7 @@ def _cached_by_mtime(path, compute):
 
 
 def collect_parallelism(root):
-    spath = _tracker_state_path()
+    spath = _tracker_state_path(root)
     live = parse_tracker_state(_read_text(spath)) if spath else None
     if live:
         return live
@@ -610,20 +635,42 @@ def collect_parallelism(root):
     return graded if graded else parallelism_empty()
 
 
+# edit-tracker picks its ledger ($TMPDIR/heimdall-edits/<id>.log) from these, first non-empty wins
+# (bin/edit-tracker.c session_id()); an EMPTY value counts as unset there.
+LEDGER_SESSION_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "SESSION_ID")
+
+
+def _repo_edit_path(p, roots):
+    """`p` (one ledger line) as a repo-relative path, or None when it is not strictly below the repo."""
+    for root in roots:
+        rel = _repo_relative(p if os.path.isabs(p) else os.path.join(root, p), root)
+        if rel:
+            return rel
+    return None
+
+
 def collect_edits(root):
-    rc, out, _ = _run_cached(("edit-tracker", "paths"), root)
+    """The UNIQUE paths edited by THIS repo's session (repo_session), repo-relative. The ledger is
+    keyed by session id, so which one is read is decided here from the repo's own transcripts --
+    never by the session id this process inherited from the shell that launched it (a foreign one
+    served another repo's edits): the inherited names are blanked for the subprocess and the
+    resolved id handed down instead; no session -> edit-tracker's unkeyed ledger. Entries outside
+    the repo root are dropped (one session can edit several repos), never shown absolute or `../x`."""
+    session = repo_session(root)
+    env = {name: "" for name in LEDGER_SESSION_ENV}
+    if session is not None and session.id:
+        env["CLAUDE_CODE_SESSION_ID"] = session.id
+    rc, out, _ = _run_cached(("edit-tracker", "paths"), root, env=env)
     if rc is None:
         return None
+    real = os.path.realpath(root)
+    roots = [root] if real == root else [root, real]
     paths = []
     for line in (out or "").splitlines():
         p = line.strip()
-        if not p:
-            continue
-        try:
-            rel = os.path.relpath(p, root)
-        except ValueError:
-            rel = p
-        paths.append(p if rel.startswith("..") else rel)
+        rel = _repo_edit_path(p, roots) if p else None
+        if rel and rel not in paths:
+            paths.append(rel)
     return {"count": len(paths), "paths": paths}
 
 

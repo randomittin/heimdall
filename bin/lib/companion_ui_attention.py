@@ -56,10 +56,11 @@ HOW EACH STATE IS REACHED (the newest decisive entry decides):
                   staleness stands in for it (every state, including needs_*, ages out).
 `kind: "error"` is never emitted (the handoff defines no trigger for it).
 
-Session choice: CLAUDE_SESSION_ID / SESSION_ID / CLAUDE_CODE_SESSION_ID when it names an existing
-transcript (same precedence as hmd-ui's identity.session_code), else the newest top-level
-*.jsonl, preferring one whose entrypoint is not `sdk*` (hmd's own headless judge/dream sessions
-write transcripts into the same directory and would otherwise flap the state).
+Session choice: bin/lib/hmd_session_resolve.py, the ONE rule every hmd-ui collector shares -- an
+inherited CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / SESSION_ID only when it names a transcript
+under THIS repo's own project dir, else the newest top-level *.jsonl whose entrypoint is not
+`sdk*` (hmd's own headless judge/dream sessions write transcripts into the same directory and
+would otherwise flap the state).
 
 Stdlib only. Self-contained: secret_shaped is ported (companion_ui_inbox.py:94-111), not imported.
 """
@@ -68,8 +69,14 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import hmd_session_resolve as SESSION  # noqa: E402
 
 STATES = ("working", "needs_input", "needs_approval", "idle", "ended")
 KINDS = ("question", "permission", "done", "stopped", "error")
@@ -78,9 +85,6 @@ OPTIONS_MAX = 8
 LABEL_MAX = 80
 
 TAIL_WINDOWS = (64 * 1024, 512 * 1024, 4 * 1024 * 1024)
-HEAD_BYTES = 64 * 1024         # entrypoint probe of a candidate transcript
-PROBE_LIMIT = 12               # newest candidates probed for a non-headless entrypoint
-DIR_SCAN_TTL_S = 2.0
 
 ENDED_AFTER_S = 6 * 3600
 SETTLE_S = 30.0                # a terminal entry with no turn_duration after it counts as settled
@@ -127,8 +131,6 @@ def secret_shaped(v):
 
 
 _LOCK = threading.RLock()
-_SELECT = {}      # (project dirs, pinned session) -> (monotonic, transcript path | None)
-_HEADS = {}       # transcript path -> entrypoint (a session file's entrypoint never changes)
 _EVIDENCE = {}    # transcript path -> ((mtime_ns, size), evidence)
 _EPISODE = {}     # transcript path -> {"state", "anchor"} of the last derivation
 
@@ -139,8 +141,7 @@ def empty():
 
 
 # ── transcript discovery ──────────────────────────────────────────────────────────────────────
-_SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_TS_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(?:Z|[+-]00:?00)?$")
+_TS_RE =re.compile(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(?:Z|[+-]00:?00)?$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -153,100 +154,6 @@ def _parse_ts(value):
     except (ValueError, OverflowError):
         return None
     return whole + (float("0." + m.group(7)) if m.group(7) else 0.0)
-
-
-def _claude_dir():
-    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
-
-
-def _project_dirs(root):
-    base = os.path.join(_claude_dir(), "projects")
-    dirs = []
-    for p in (root, os.path.realpath(root)):
-        d = os.path.join(base, re.sub(r"[^A-Za-z0-9]", "-", p))
-        if d not in dirs:
-            dirs.append(d)
-    return tuple(dirs)
-
-
-def _pinned_session():
-    for name in ("CLAUDE_SESSION_ID", "SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
-        v = os.environ.get(name)
-        if v and _SID_RE.match(v):
-            return v
-    return None
-
-
-def _entrypoint(path):
-    cached = _HEADS.get(path)
-    if cached is not None:
-        return cached
-    try:
-        with open(path, "rb") as f:
-            head = f.read(HEAD_BYTES)
-    except OSError:
-        return None
-    for raw in head.split(b"\n"):
-        if b'"entrypoint"' not in raw:
-            continue
-        try:
-            obj = json.loads(raw)
-        except ValueError:
-            continue
-        ep = obj.get("entrypoint") if isinstance(obj, dict) else None
-        if isinstance(ep, str):
-            if len(_HEADS) > 256:
-                _HEADS.clear()
-            _HEADS[path] = ep
-            return ep
-    return None
-
-
-def _headless(path):
-    ep = _entrypoint(path)
-    return ep is not None and ep.startswith("sdk")
-
-
-def _pick(dirs, pin, denied):
-    if pin:
-        for d in dirs:
-            p = os.path.join(d, pin + ".jsonl")
-            if os.path.isfile(p) and not (denied and denied(p)):
-                return p
-    cands = []
-    for d in dirs:
-        try:
-            it = os.scandir(d)
-        except OSError:
-            continue
-        with it:
-            for e in it:
-                if not e.name.endswith(".jsonl") or e.name.startswith("."):
-                    continue
-                try:
-                    if e.is_file():
-                        cands.append((e.stat().st_mtime_ns, e.path))
-                except OSError:
-                    continue
-    cands = [c for c in cands if not (denied and denied(c[1]))]
-    cands.sort(reverse=True)
-    for _, p in cands[:PROBE_LIMIT]:
-        if not _headless(p):
-            return p
-    return cands[0][1] if cands else None
-
-
-def _select(root, denied):
-    dirs = _project_dirs(root)
-    pin = _pinned_session()
-    key = (dirs, pin)
-    now = time.monotonic()
-    hit = _SELECT.get(key)
-    if hit is not None and now - hit[0] < DIR_SCAN_TTL_S:
-        return hit[1]
-    path = _pick(dirs, pin, denied)
-    _SELECT[key] = (now, path)
-    return path
 
 
 # ── tail scan ─────────────────────────────────────────────────────────────────────────────────
@@ -668,7 +575,8 @@ def collect(root, turn=None, sweep_receipt=None, checkpoint=None, quality_gate=N
     out = empty()
     try:
         with _LOCK:
-            path = _select(root, denied)
+            session = SESSION.resolve(root, denied=denied)
+            path = session.path if session is not None else None
             if path is None:
                 return out
             st = os.stat(path)

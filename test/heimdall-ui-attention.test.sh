@@ -68,7 +68,7 @@ export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
-unset CLAUDE_SESSION_ID SESSION_ID CLAUDE_CODE_SESSION_ID CLAUDE_CONFIG_DIR
+unset CLAUDE_SESSION_ID SESSION_ID CLAUDE_CODE_SESSION_ID CLAUDE_CONFIG_DIR HMD_AGENT_PROJECTS_DIR
 export HMD_UI_COMPANION_PANELS=0   # L1-L11 only (see "Publishers" above); L12 turns it on for its own server
 FIX="$TMPROOT/fixture-repo"
 mkdir -p "$HOME/.claude" "$FIX"
@@ -218,7 +218,8 @@ _n = [0]
 
 
 def clear():
-    for d in (att._SELECT, att._HEADS, att._EVIDENCE, att._EPISODE):
+    att.SESSION.reset_caches()
+    for d in (att._EVIDENCE, att._EPISODE):
         d.clear()
 
 

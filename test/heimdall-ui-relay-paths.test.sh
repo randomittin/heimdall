@@ -165,8 +165,8 @@ if [ ! -s "$PY_OUT" ]; then
   exit 1
 fi
 
-chk "R1 relay: edits.paths = repo-relative for in-repo files, basename for the out-of-repo one" \
-    '.relay.edits == ["src/app/x.ts","README.md","y.ts"]' "$PY_OUT"
+chk "R1 relay: edits.paths = repo-relative in-repo files only (the out-of-repo ledger entry is dropped, not shown as a basename)" \
+    '.relay.edits == ["src/app/x.ts","README.md"]' "$PY_OUT"
 chk "R1 relay: no edits.paths entry is absolute or climbs out ('/' or '..' prefix)" \
     '.relay.edits | all(.[]; (startswith("/") or startswith("..")) | not)' "$PY_OUT"
 chk "R1 relay: an in-repo absolute token in a string leaf -> its repo-relative part" \
@@ -188,8 +188,8 @@ chk "R1 relay: emails are still scrubbed -> '[email]'" \
 chk "R1 relay: transport.bind is echoed unchanged" \
     '.relay.transport.bind == "relay"' "$PY_OUT"
 
-chk "R2 public: edits.paths unchanged (repo-relative in-repo, basename outside)" \
-    '.public.edits == ["src/app/x.ts","README.md","y.ts"]' "$PY_OUT"
+chk "R2 public: edits.paths the same (repo-relative, in-repo only)" \
+    '.public.edits == ["src/app/x.ts","README.md"]' "$PY_OUT"
 chk "R2 public: an in-repo absolute token -> basename 'x.ts' (the repo-relative part is NOT kept for a public listener)" \
     '.public.rows.file == "x.ts"' "$PY_OUT"
 chk "R2 public: mid-sentence token -> basename" \
@@ -201,9 +201,9 @@ chk "R2 public: state.repo and a bare root token -> basename" \
 chk "R2 public: ~/, evil-sibling and dotdot tokens -> basenames; email -> [email]" \
     '.public.rows.home == "private-notes" and .public.rows.evil == "z.ts" and .public.rows.dotdot == "w.ts" and .public.rows.mail == "[email]"' "$PY_OUT"
 
-chk "R3 loopback: nothing is redacted (repo, in-repo token, email, out-of-repo edit path)" \
-    '.loopback.repo == $r and .loopback.rows.file == ($r + "/src/app/x.ts") and .loopback.rows.mail == "someone@example.com" and .loopback.edits[2] == ($o + "/lib/y.ts")' \
-    "$PY_OUT" --arg r "$FIX_REAL" --arg o "$OTHER_REAL"
+chk "R3 loopback: nothing is redacted (repo, in-repo token, email); edits are the same repo-relative in-repo list" \
+    '.loopback.repo == $r and .loopback.rows.file == ($r + "/src/app/x.ts") and .loopback.rows.mail == "someone@example.com" and .loopback.edits == ["src/app/x.ts","README.md"]' \
+    "$PY_OUT" --arg r "$FIX_REAL"
 
 chk "R4 bind=relay with public_host=null still redacts (fail closed) and uses the relay profile" \
     '.relay_nopub.rows.file == "src/app/x.ts" and .relay_nopub.rows.mail == "[email]" and (.relay_nopub.repo | contains("/") | not)' "$PY_OUT"
@@ -289,8 +289,8 @@ PYEOF
 fi
 
 if [ "$GOT_STATE" = true ]; then
-  chk "R6 e2e: the decrypted relay state frame's edits.paths are repo-relative (basename only for the out-of-repo file)" \
-      '.edits.paths == ["src/app/x.ts","README.md","y.ts"]' "$STATE_R"
+  chk "R6 e2e: the decrypted relay state frame's edits.paths are repo-relative, in-repo only (the out-of-repo entry never leaves the machine)" \
+      '.edits.paths == ["src/app/x.ts","README.md"]' "$STATE_R"
   chk "R6 e2e: panel text carries the repo-relative part and a scrubbed email" \
       '(.panels[] | select(.id=="a5-probe") | .data.rows | map({(.[0]): .[1]}) | add) as $r | $r.file == "src/app/x.ts" and $r.prose == "blocked by src/app/x.ts now" and $r.mail == "[email]"' "$STATE_R"
   chk "R6 e2e: state.repo is a bare name and transport.bind is relay" \
