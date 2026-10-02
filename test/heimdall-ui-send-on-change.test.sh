@@ -21,8 +21,9 @@
 #      converges; a source nobody watches (git branch) still arrives via the backstop.
 #   B. the real bin/heimdall-relay-client against the fake relay: change -> frame <= 500 ms, no frame
 #      while nothing changes, a burst is coalesced into a few frames carrying the final state,
-#      sustained churn cannot starve the phone, a re-bind re-sends at once, session_ended still
-#      ends the process promptly.
+#      sustained churn cannot starve the phone, a re-bind re-sends at once, a state POST that got no
+#      answer is retried (the digest is recorded after success -- main's zero-lag #4) and sent once,
+#      session_ended still ends the process promptly.
 #   C. RelayClient._await_new_state with a scripted cache: the debounce contract itself.
 #
 # Hermetic: HOME / HEIMDALL_HOME / TMPDIR / the Claude projects dir are all redirected into one temp
