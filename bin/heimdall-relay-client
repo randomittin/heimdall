@@ -19,6 +19,15 @@ the same convention that module itself uses for bin/lib/*.py, see
 viewer can show which local port `hmd ui` is actually bound to); the state
 read path never opens a socket to it.
 
+SEND-ON-CHANGE: a state frame follows the change, not a timer. The cache's
+poller re-collects the moment a watched source moves (StateCache.run) and
+wakes StateCache.wait_for_change; run_state_loop blocks there, lets a burst
+settle for STATE_DEBOUNCE_S (never longer than STATE_DEBOUNCE_MAX_S since its
+first change), then sends ONE frame carrying the newest state. A frame is
+still sent only when the digest differs from the last one sent (INV-22), a
+re-bind forces one regardless (§7c), and the loop re-checks stop_event / that
+re-bind at least every STATE_WAIT_SLICE_S.
+
 SESSION-KEY BOOTSTRAP (matches hmdapp's RelayTransport / fake-hmd.mjs exactly
 -- see hmdapp's docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md Section 1;
 this section previously documented a "Wave-1 hello" handshake the real app
@@ -1274,12 +1283,22 @@ class RelayClient:
                 return
             backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
 
-    # -- state tick loop (main thread) ---------------------------------------
+    # -- state loop (main thread) --------------------------------------------
+    # Send-on-change (docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md Ask 1): the loop blocks on
+    # StateCache.wait_for_change, which the cache's poller wakes the moment the digest moves, instead
+    # of sleeping --tick-s between looks -- so the frame follows the change, not a second 2 s timer.
+    STATE_DEBOUNCE_S = 0.05      # coalesce a burst: send once the digest has been still this long ...
+    STATE_DEBOUNCE_MAX_S = 0.25  # ... but never hold a burst's first change longer than this
+    STATE_WAIT_SLICE_S = 0.25    # longest single block on the cache: a stop_event.set() or a
+                                 # _rearm_state() (both on the stream thread) cannot wake it
+
     def _rearm_state(self):
         """A (re)bind: the phone's local state was just reset, so the next tick must
-        send the state again whatever its digest. The generation bump is how a
-        state POST that is in flight right now can tell, once it is answered, that
-        it must not write its digest over this (see _tick_once)."""
+        send the state again whatever its digest -- the state loop re-reads
+        last_sent_digest at least every STATE_WAIT_SLICE_S (see _await_new_state).
+        The generation bump is how a state POST that is in flight right now can
+        tell, once it is answered, that it must not write its digest over this
+        (see _tick_once)."""
         self.last_sent_digest = None
         self._rearm_gen += 1
 
@@ -1306,17 +1325,45 @@ class RelayClient:
         if rearm_gen == self._rearm_gen:  # a rebind that landed mid-POST must survive it
             self.last_sent_digest = digest
 
+    def _await_new_state(self):
+        """Block until the cache holds a digest this client has not sent, then let a burst settle.
+        True when there is something to send: the digest stayed put for STATE_DEBOUNCE_S, or kept
+        moving until STATE_DEBOUNCE_MAX_S ran out. False when a wait slice passed with nothing new
+        (or on stop) -- the caller loops, which is how stop_event and a _rearm_state() re-bind
+        (last_sent_digest = None, re-read here on every call) are noticed within one slice. A state
+        POST that got no usable answer leaves last_sent_digest as it was (_tick_once), so it reads as
+        "new" again here and is retried after _tick_once's own backoff. --tick-s (default 2) only
+        bounds the slice from above: nothing waits for it any more."""
+        if self.stop_event.is_set():
+            return False
+        _, digest = self.cache.wait_for_change(self.last_sent_digest, min(self.tick_s, self.STATE_WAIT_SLICE_S))
+        if digest is None or digest == self.last_sent_digest:
+            return False
+        began = time.monotonic()
+        while not self.stop_event.is_set():
+            hold = self.STATE_DEBOUNCE_MAX_S - (time.monotonic() - began)
+            if hold <= 0:
+                break
+            _, newer = self.cache.wait_for_change(digest, min(self.STATE_DEBOUNCE_S, hold))
+            if newer == digest:
+                break
+            digest = newer
+        return not self.stop_event.is_set()
+
     def run_state_loop(self):
         self.cache = UI.StateCache(self.root, self.transport)
         self.cache.start()
         try:
-            while not self.stop_event.wait(self.tick_s):
-                if not self.state_ready.is_set():
-                    continue
+            while not self.stop_event.is_set():
                 try:
-                    self._tick_once()
+                    if not self.state_ready.is_set():
+                        # nothing can be sealed before device_bound; setting the event wakes this at once
+                        self.state_ready.wait(min(self.tick_s, self.STATE_WAIT_SLICE_S))
+                    elif self._await_new_state():
+                        self._tick_once()
                 except Exception as e:
                     emit({"event": "error", "detail": "state tick failed: %s" % e})
+                    self.stop_event.wait(self.tick_s)  # a failing pass is retried at the old cadence, never hot
         finally:
             self.cache.stop()
 
@@ -1347,7 +1394,9 @@ def build_argparser():
     ap.add_argument("--status-file", default=None, metavar="PATH",
                      help="default <repo>/.heimdall/app/relay.json")
     ap.add_argument("--tick-s", type=float, default=2.0, metavar="N",
-                     help="state poll/send cadence in seconds (default 2)")
+                     help="longest the state loop blocks before it re-checks for a stop or a re-bind "
+                          "(default 2, and never more than 0.25 -- STATE_WAIT_SLICE_S). A state change is "
+                          "sent as it happens (debounced 50 ms), not at the next tick")
     return ap
 
 
