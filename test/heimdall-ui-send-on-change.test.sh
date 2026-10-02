@@ -548,7 +548,35 @@ try:
             "B5: a repeated device_bound re-sends the state within 700 ms: %s ms"
             % [("%.0f" % r) if r is not None else "never" for r in resync])
 
-    # B6 -- session_ended still stops the process promptly (the wait is sliced, not a 2 s sleep)
+    # B6 -- both halves together: a state POST that gets no usable answer is NOT recorded as sent
+    # (the digest is written after success), and the event-driven loop retries it after the bounded
+    # backoff -- not at some later 2 s tick. fail-state-posts=2: the transport's own retry on a fresh
+    # connection fails too, so the failure reaches _tick_once.
+    settle(1.5)
+    dropped_path = os.path.join(log_dir, "frames-dropped.ndjson")
+
+    def dropped_count():
+        try:
+            with open(dropped_path) as f:
+                return len(f.read().splitlines())
+        except OSError:
+            return 0
+
+    start, lost_before = len(frames), dropped_count()
+    open(os.path.join(ctl_dir, "fail-state-posts=2"), "w").close()
+    t0 = time.time_ns()
+    put(300)
+    wait_until(lambda: carrying(300, start) is not None, 8.0, 0.01)
+    hit = carrying(300, start)
+    retried_ms = (frames[hit][0] - t0) / 1e6 if hit is not None else None
+    verdict(hit is not None and dropped_count() - lost_before >= 2 and retried_ms <= 2000,
+            "B6: a state POST that got no answer (%d bodies dropped) is retried by the loop and lands in %s ms (<= 2000)"
+            % (dropped_count() - lost_before, "%.0f" % retried_ms if retried_ms is not None else "never"))
+    time.sleep(1.0)
+    verdict(sum(1 for i in range(start, len(frames)) if probe_value(i) == 300) == 1,
+            "B6b: ...and it is sent once, not re-sent after it was answered")
+
+    # B7 -- session_ended still stops the process promptly (the wait is sliced, not a 2 s sleep)
     open(os.path.join(ctl_dir, "end-session"), "w").close()
     t_end = time.monotonic()
     try:
@@ -557,7 +585,7 @@ try:
     except subprocess.TimeoutExpired:
         exited = None
     verdict(exited is not None and exited <= 2.0 and client.returncode == 0,
-            "B6: session_ended -> client exits 0 in %s (<= 2 s)" % ("%.2f s" % exited if exited is not None else "never"))
+            "B7: session_ended -> client exits 0 in %s (<= 2 s)" % ("%.2f s" % exited if exited is not None else "never"))
 finally:
     if client.poll() is None:
         client.terminate()
