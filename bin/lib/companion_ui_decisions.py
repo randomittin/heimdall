@@ -7,14 +7,13 @@ decision it can record is `deny`; `allow` is refused here, for every request, in
 (DecisionError("allow-not-permitted")). Nothing in this file can make an action run that would
 not have run anyway.
 
-Three writers meet in one directory, <repo>/.heimdall/ui/approvals/ (0700; every file 0600):
+Three parties meet in one directory, <repo>/.heimdall/ui/approvals/ (0700; every file 0600):
 
     bin/heimdall-phone-deny      the PreToolUse hook: request() a decision for a risky action, then
-                                 poll decision_of() / apply_stop() inside a short bounded window,
-                                 heartbeat() while it waits, close() when it leaves
-    bin/heimdall-relay-client    the sealed, replay-guarded command path: decide() and request_stop()
-                                 -- only a frame that opened under the paired device's session key
-                                 ever reaches them
+                                 poll decision_of() inside a short bounded window, heartbeat()
+                                 while it waits, close() when it leaves
+    bin/heimdall-relay-client    the sealed, replay-guarded command path: decide() -- only a frame
+                                 that opened under the paired device's session key ever reaches it
     sentinels/hmd-ui.py          reads pending() into the `approvals` slice of /api/state
 
 Files:
@@ -26,11 +25,9 @@ Files:
                          create IS the single-use guarantee (two concurrent denies -> one wins,
                          the other is `already-decided`). It outlives the request file so a replay
                          within GC_AFTER_S still answers `already-decided`, not `unknown-id`.
-    stop.json            the phone's `stop` request {id, requested_at, expires_at, applied_at}
-    armed                zero bytes; its mtime is the last time an ARMED hook ran (mark_armed)
 
-Ids are random (`p-` / `s-` + 8 hex) and checked against a strict pattern before any path is built
-from one, so a hostile id can never walk out of the directory. A request id is never reused.
+Ids are random (`p-` + 8 hex) and checked against a strict pattern before any path is built from
+one, so a hostile id can never walk out of the directory. A request id is never reused.
 
 Exposure (pending()) is minimal on purpose: the doc's six keys and nothing else -- never the raw
 tool input, never a pid. The summary is a single line of at most SUMMARY_MAX chars; a
@@ -55,14 +52,10 @@ MAX_LISTED = 5               # the doc: at most 5 entries in `approvals`
 SUMMARY_MAX = 200            # the doc: summary at most 200 chars
 TOOL_MAX = 60
 HEARTBEAT_STALE_S = 5.0      # a request whose hook has not heartbeated this long is dead
-GC_AFTER_S = 600.0           # request()/decision files older than this are swept
-STOP_TTL_S = 60.0            # an unapplied stop request lapses after this
-STOP_GRACE_S = 5.0           # once applied, sibling parallel tool calls still get it for this long
-ARMED_FRESH_S = 900.0        # an `armed` heartbeat older than this: no armed hook is running
+GC_AFTER_S = 600.0           # request/decision files older than this are swept
 RISKS = ("low", "high")
 READ_CAP_BYTES = 65536
 
-_ID_RE = re.compile(r"p-[0-9a-f]{8}")
 _REQUEST_FILE_RE = re.compile(r"(p-[0-9a-f]{8})\.json")
 _MANAGED_FILE_RE = re.compile(r"p-[0-9a-f]{8}\.(?:json|decision)|\.tmp-.*")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -112,8 +105,8 @@ def _ensure_dir(root):
     return d
 
 
-def _valid_id(value, prefix="p"):
-    return isinstance(value, str) and re.fullmatch(prefix + r"-[0-9a-f]{8}", value) is not None
+def _valid_id(value):
+    return isinstance(value, str) and re.fullmatch(r"p-[0-9a-f]{8}", value) is not None
 
 
 def _is_number(v):
@@ -150,8 +143,8 @@ def _unlink(path):
 
 
 def _write_tmp(directory, obj, now):
-    """A fully written 0600 temp file holding `obj` as JSON (mtime = `now`), ready to be renamed or
-    linked into place -- so a reader never sees half a record."""
+    """A fully written 0600 temp file holding `obj` as JSON (mtime = `now`), ready to be linked
+    into place -- so a reader never sees half a record."""
     tmp = os.path.join(directory, ".tmp-%d-%s" % (os.getpid(), secrets.token_hex(4)))
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -165,16 +158,6 @@ def _write_tmp(directory, obj, now):
         _unlink(tmp)
         raise
     return tmp
-
-
-def _write_json_atomic(directory, name, obj, now):
-    """Replace <directory>/<name> with `obj` (tmp + rename)."""
-    tmp = _write_tmp(directory, obj, now)
-    try:
-        os.replace(tmp, os.path.join(directory, name))
-    except BaseException:
-        _unlink(tmp)
-        raise
 
 
 def _sweep(directory, now):
@@ -347,59 +330,3 @@ def pending(root, now=None):
                     "risk": rec["risk"]})
     out.sort(key=lambda r: (r["requested_at"], r["id"]))
     return out[:MAX_LISTED]
-
-
-# -- stop ---------------------------------------------------------------------------------------
-def request_stop(root, now=None, ttl_s=None):
-    """Record the phone's request to stop the running turn at its next tool call. Latest wins."""
-    now = _now(now)
-    ttl = STOP_TTL_S if ttl_s is None else float(ttl_s)
-    d = _ensure_dir(root)
-    rec = {"id": "s-" + secrets.token_hex(4), "requested_at": now, "expires_at": now + ttl,
-           "applied_at": None}
-    _write_json_atomic(d, "stop.json", rec, now)
-    return {"id": rec["id"], "requested_at": rec["requested_at"], "expires_at": rec["expires_at"]}
-
-
-def apply_stop(root, now=None):
-    """The stop request that applies to a tool call being made right now, or None. The first call
-    stamps `applied_at`; every call inside STOP_GRACE_S of that still gets it (so parallel sibling
-    tool calls of the same assistant message are stopped together); after that the request is
-    spent and removed -- a stop never lingers into the next turn."""
-    now = _now(now)
-    path = os.path.join(_approvals_dir(root), "stop.json")
-    rec = _read_json(path)
-    if rec is None or not _valid_id(rec.get("id"), "s") or not _is_number(rec.get("expires_at")):
-        return None
-    applied = rec.get("applied_at")
-    if applied is None:
-        if now >= rec["expires_at"]:
-            _unlink(path)
-            return None
-        rec["applied_at"] = now
-        _write_json_atomic(os.path.dirname(path), "stop.json", rec, now)
-    elif not _is_number(applied) or now - applied > STOP_GRACE_S:
-        _unlink(path)
-        return None
-    return {"id": rec["id"], "requested_at": rec.get("requested_at"), "expires_at": rec["expires_at"]}
-
-
-# -- armed heartbeat ----------------------------------------------------------------------------
-def mark_armed(root, now=None):
-    """An armed hook is running right now (called once per armed invocation)."""
-    now = _now(now)
-    path = os.path.join(_ensure_dir(root), "armed")
-    os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
-    os.chmod(path, 0o600)
-    os.utime(path, (now, now))
-
-
-def armed(root, now=None, max_age_s=None):
-    """True when an armed hook has run within `max_age_s` (default ARMED_FRESH_S)."""
-    now = _now(now)
-    limit = ARMED_FRESH_S if max_age_s is None else float(max_age_s)
-    try:
-        beat = os.stat(os.path.join(_approvals_dir(root), "armed")).st_mtime
-    except OSError:
-        return False
-    return now - beat <= limit

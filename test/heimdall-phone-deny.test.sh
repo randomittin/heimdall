@@ -279,34 +279,7 @@ check("A12. a malformed / allow / foreign-id decision file is read as NO decisio
 check("A12b. decision_of on an id that is not shaped like one -> None, no exception",
       D.decision_of(root, "../../etc/passwd") is None and D.decision_of(root, None) is None)
 
-# A13 -- the stop request
-root = newroot()
-check("A13. no stop request -> apply_stop is None", D.apply_stop(root, now=T0) is None)
-stop = D.request_stop(root, now=T0)
-check("A13b. request_stop -> {id: s-<8 hex>, requested_at, expires_at = requested + STOP_TTL_S}",
-      re.match(r"^s-[0-9a-f]{8}$", stop["id"]) and stop["expires_at"] == T0 + D.STOP_TTL_S, stop)
-check("A13c. the marker is 0600", mode(os.path.join(adir(root), "stop.json")) == 0o600)
-check("A13d. first apply returns it; a sibling inside the grace window still gets it",
-      D.apply_stop(root, now=T0 + 3)["id"] == stop["id"] and D.apply_stop(root, now=T0 + 3 + D.STOP_GRACE_S - 0.1) is not None)
-check("A13e. after the grace window a stop is spent: None, and the marker is removed",
-      D.apply_stop(root, now=T0 + 3 + D.STOP_GRACE_S + 1) is None and not os.path.exists(os.path.join(adir(root), "stop.json")))
-root = newroot()
-D.request_stop(root, now=T0)
-check("A13f. a stop nobody applied expires after STOP_TTL_S", D.apply_stop(root, now=T0 + D.STOP_TTL_S + 1) is None)
-root = newroot()
-os.makedirs(adir(root))
-with open(os.path.join(adir(root), "stop.json"), "w") as f:
-    f.write("{not json")
-check("A13g. a corrupt stop marker is no stop", D.apply_stop(root, now=T0) is None)
-
-# A14 -- the armed heartbeat
-root = newroot()
-check("A14. never armed -> armed() False", D.armed(root, now=T0) is False)
-D.mark_armed(root, now=T0)
-check("A14b. mark_armed -> armed() True inside ARMED_FRESH_S, False after",
-      D.armed(root, now=T0 + D.ARMED_FRESH_S - 1) is True and D.armed(root, now=T0 + D.ARMED_FRESH_S + 1) is False)
-
-# A15 -- housekeeping and permissions
+# A13 -- housekeeping and permissions
 root = newroot()
 old = D.request(root, "Bash", "old", 10, now=T0)
 D.decide(root, old["id"], "deny", now=T0 + 1)
