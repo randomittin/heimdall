@@ -10,10 +10,14 @@ file is hmd's side: it feeds what the relay and the phone send to the client's r
 compares what the client sends back, byte for byte, with the fixture. A fixture that drifts from
 the client, or a client that drifts from the fixture, fails here.
 
-Hermetic by construction: no socket is opened. The client's one network seam, RelayClient._request
-(and _connect for the stream), is replaced by a recorder that answers from the fixture; every
-other line of the client -- pair_init, send_frame_envelope, _handle_envelope, _handle_command,
-_decide, revoke, the E2E module, the inbox and decision stores -- is the shipped code.
+Hermetic by construction: no socket is opened. The client reaches the relay through exactly one
+function, _connect(): pair/init and revoke (RelayClient._request), POST /frames (_FramesChannel, one
+persistent keep-alive connection per sender since zero-lag Ask 3) and GET /stream (_open_stream) all
+take their connection from it. _connect is replaced by a factory of in-memory keep-alive connections
+that record every request and answer from the fixture; every other line of the client -- pair_init,
+send_frame_envelope, the frame channels, _handle_envelope, _handle_command, _decide, revoke, the E2E
+module, the inbox and decision stores -- is the shipped code. The replay counts REQUESTS, never
+connections: a persistent connection carries several of them.
 
 Only the two sources of randomness the client reaches are pinned, so its output is reproducible:
 the keypair (the golden vectors.json seeds) and the two ids a command creates (the inbox record's
@@ -132,42 +136,81 @@ class Fixture:
         return self.e2e.open_(key, wire["seq"], sender, wire["nonce"], wire["ciphertext"])
 
 
-class Recorder:
-    """Stands in for RelayClient._request: records every request the client makes and answers
-    from the fixture. Requests are kept exactly as the client built them."""
-
-    def __init__(self, answers):
-        self.calls = []
-        self.answers = answers
-
-    def __call__(self, method, path, headers=None, body=None, timeout=None, label="request"):
-        text = None if body is None else (body.decode("utf-8") if isinstance(body, bytes) else body)
-        self.calls.append({"method": method, "path": path, "headers": dict(headers or {}), "body": text})
-        status, payload = self.answers(method, path)
-        return status, json.dumps(payload).encode("utf-8")
-
-
-class FakeStreamConn:
-    """Stands in for the connection RelayClient._open_stream gets from _connect: records the one
-    request it makes and never opens a socket."""
+class FakeSocket:
+    """The socket the client touches on a connection: settimeout() when it reuses the connection,
+    setsockopt() for TCP keepalive on a fresh one. It keeps what it was told and carries no bytes."""
 
     def __init__(self):
-        self.requests = []
+        self.timeout = None
+        self.options = []
+
+    def settimeout(self, value):
+        self.timeout = value
+
+    def setsockopt(self, *args):
+        self.options.append(args)
+
+
+class FakeResponse:
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+
+    def read(self):
+        return self._body
+
+
+class FakeConn:
+    """Stands in for the http.client connection _connect() hands out. Like the real one it is
+    keep-alive: it takes any number of requests until close() -- which is how the client's
+    persistent POST /frames channels use it -- and it "opens" its socket on the first request, as
+    http.client does. Every request is recorded exactly as the client built it, tagged with the
+    number of the connection it rode, and answered from the fixture."""
+
+    def __init__(self, network, number):
+        self.network = network
+        self.number = number
+        self.sock = None
+        self.timeout = None
+        self._response = None
+
+    def connect(self):
+        self.sock = FakeSocket()
+
+    def close(self):
+        self.sock = None
 
     def request(self, method, path, headers=None, body=None):
-        self.requests.append({"method": method, "path": path, "headers": dict(headers or {})})
+        if self.sock is None:
+            self.connect()
+        text = None if body is None else (body.decode("utf-8") if isinstance(body, bytes) else body)
+        self.network.requests.append({"conn": self.number, "method": method, "path": path,
+                                      "headers": dict(headers or {}), "body": text})
+        status, payload = self.network.answers(method, path)
+        self._response = FakeResponse(status, b"" if payload is None else json.dumps(payload).encode("utf-8"))
 
     def getresponse(self):
-        return self
+        return self._response
 
-    status = 200
+
+class FakeNetwork:
+    """The client's one network seam: _connect(). `requests` is every request the client made, in
+    order; the replay counts those, not `connections`, because a persistent connection carries several."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.requests = []
+        self.connections = 0
+
+    def connect(self, parsed, timeout=None, label="request"):
+        self.connections += 1
+        return FakeConn(self, self.connections)
 
 
 class Observed:
     def __init__(self):
-        self.calls = []
+        self.requests = []
         self.events = []
-        self.stream_request = None
         self.inbox_texts = []
         self.decision = None
         self.silent_after_keepalive = None
@@ -190,56 +233,56 @@ def drive(mod, fx, root):
             return 200, delivered
         if path.endswith("/revoke"):
             return 200, revoked
+        if method == "GET" and path.endswith("/stream"):
+            return 200, None
         raise AssertionError("the client made a request the fixture does not know: %s %s" % (method, path))
 
-    recorder = Recorder(answers)
+    network = FakeNetwork(answers)
     mod.emit = obs.events.append
 
     args = mod.build_argparser().parse_args(
         ["--relay", fx.value("relay_url"), "--repo", root, "--ui-port", "1"])
     client = mod.RelayClient(args)
     client.priv, client.pub = fx.hmd_priv, fx.hmd_pub
-    client._request = recorder
 
-    if client.pair_init() != 0:
-        raise AssertionError("pair_init did not return 0 against the fixture's /pair/init answer")
-
-    client._handle_envelope(fx.instantiate(wire["stream"]["lines"]["device_bound"]))
-
-    state = fx.wire["frames"]["state"]["plaintext"]["state"]
-    client.send_hmd_frame("state", {"state": state})
-
-    # Pin the two ids a command creates, so the acks are reproducible: the inbox record's uuid and
-    # the approval request's id. Both are restored before this function returns.
-    real_uuid4, real_token_hex = mod.INBOX.uuid.uuid4, mod.DECISIONS.secrets.token_hex
-    mod.INBOX.uuid.uuid4 = lambda: uuid.UUID(wire["frames"]["ack_send_message"]["plaintext"]["id"])
-    request_id = wire["frames"]["command_decide_deny"]["plaintext"]["params"]["id"]
-    mod.DECISIONS.secrets.token_hex = lambda n: request_id[len("p-"):]
+    real_connect, mod._connect = mod._connect, network.connect
     try:
-        mod.DECISIONS.request(root, "Bash", "contract fixture approval", 60)
-        for name in ("command_send_message", "command_decide_allow", "command_decide_deny"):
-            envelope = json.loads(compact(wire["frames"][name]["wire"]))
-            client._handle_envelope(envelope)
-    finally:
-        mod.INBOX.uuid.uuid4, mod.DECISIONS.secrets.token_hex = real_uuid4, real_token_hex
+        if client.pair_init() != 0:
+            raise AssertionError("pair_init did not return 0 against the fixture's /pair/init answer")
 
-    obs.inbox_texts = [row["text"] for row in mod.INBOX.list_pending(root)]
-    obs.decision = mod.DECISIONS.decision_of(root, request_id)
+        client._handle_envelope(fx.instantiate(wire["stream"]["lines"]["device_bound"]))
 
-    before = (len(recorder.calls), len(obs.events))
-    client._handle_envelope(fx.instantiate(wire["stream"]["lines"]["keepalive"]))
-    obs.silent_after_keepalive = (len(recorder.calls), len(obs.events)) == before
+        # The client adds hmd's own caps to this plaintext (zero-lag Ask 5), so the fixture's
+        # sealed bytes -- caps included -- are what the POST body is compared with.
+        state = fx.wire["frames"]["state"]["plaintext"]["state"]
+        client.send_hmd_frame("state", {"state": state})
 
-    conn = FakeStreamConn()
-    real_connect, mod._connect = mod._connect, lambda parsed, timeout=None, label="request": conn
-    try:
+        # Pin the two ids a command creates, so the acks are reproducible: the inbox record's uuid and
+        # the approval request's id. Both are restored before this function returns.
+        real_uuid4, real_token_hex = mod.INBOX.uuid.uuid4, mod.DECISIONS.secrets.token_hex
+        mod.INBOX.uuid.uuid4 = lambda: uuid.UUID(wire["frames"]["ack_send_message"]["plaintext"]["id"])
+        request_id = wire["frames"]["command_decide_deny"]["plaintext"]["params"]["id"]
+        mod.DECISIONS.secrets.token_hex = lambda n: request_id[len("p-"):]
+        try:
+            mod.DECISIONS.request(root, "Bash", "contract fixture approval", 60)
+            for name in ("command_send_message", "command_decide_allow", "command_decide_deny"):
+                envelope = json.loads(compact(wire["frames"][name]["wire"]))
+                client._handle_envelope(envelope)
+        finally:
+            mod.INBOX.uuid.uuid4, mod.DECISIONS.secrets.token_hex = real_uuid4, real_token_hex
+
+        obs.inbox_texts = [row["text"] for row in mod.INBOX.list_pending(root)]
+        obs.decision = mod.DECISIONS.decision_of(root, request_id)
+
+        before = (len(network.requests), len(obs.events))
+        client._handle_envelope(fx.instantiate(wire["stream"]["lines"]["keepalive"]))
+        obs.silent_after_keepalive = (len(network.requests), len(obs.events)) == before
+
         client._open_stream()
+        client.revoke()
     finally:
         mod._connect = real_connect
-    obs.stream_request = conn.requests[0]
-
-    client.revoke()
-    obs.calls = recorder.calls
+    obs.requests = network.requests
     return obs
 
 
@@ -320,13 +363,13 @@ def main():
         print("\n%d passed, %d failed" % (passed, failed))
         return 1
 
-    calls = obs.calls
-    check(len(calls) == 6, "client: made exactly the six requests the session implies "
-          "(pair/init, state, three acks, revoke)", [c["path"] for c in calls])
-    if len(calls) != 6:
+    requests = obs.requests
+    check(len(requests) == 7, "client: made exactly the seven requests the session implies, in order "
+          "(pair/init, state, three acks, stream, revoke)", [(r["method"], r["path"]) for r in requests])
+    if len(requests) != 7:
         print("\n%d passed, %d failed" % (passed, failed))
         return 1
-    pair_call, state_call, ack_send, ack_allow, ack_deny, revoke_call = calls
+    pair_call, state_call, ack_send, ack_allow, ack_deny, stream_call, revoke_call = requests
 
     def request_matches(call, template, label):
         want = fx.instantiate(template)
@@ -350,14 +393,21 @@ def main():
               "client: the %s frame it POSTs is byte-identical to the fixture" % name,
               "got %s" % call["body"])
 
+    # The four frames are four requests on two connections: one persistent connection per sender,
+    # so the second and third ack are reused-connection POSTs (the client's own `post` event says so).
+    posts = [e for e in obs.events if e.get("event") == "post"]
+    check(ack_send["conn"] == ack_allow["conn"] == ack_deny["conn"] != state_call["conn"]
+          and [e["reused"] for e in posts] == [False, False, True, True],
+          "client: POST /frames keeps one persistent connection per sender -- the three acks shared one, "
+          "the state frame has its own",
+          {"connections": [c["conn"] for c in (state_call, ack_send, ack_allow, ack_deny)],
+           "reused": [e["reused"] for e in posts]})
+
+    request_matches(stream_call, wire["stream"]["request"], "GET /stream (the bearer rides in a header)")
+
     revoke_template = wire["revoke"]["request"]
     request_matches(revoke_call, revoke_template, "revoke")
     check(revoke_call["body"] == fx.instantiate(revoke_template["body"]), "client: revoke sends an empty body")
-
-    stream_want = fx.instantiate(wire["stream"]["request"])
-    check(obs.stream_request == {"method": stream_want["method"], "path": stream_want["path"],
-                                 "headers": stream_want["headers"]},
-          "client: GET /stream carries the bearer in a header, on the fixture's path", obs.stream_request)
 
     # -- what the client did with each frame it was handed ---------------------------------------------
     bound = next((e for e in obs.events if e.get("event") == "device_bound"), None)
