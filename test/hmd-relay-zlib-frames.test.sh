@@ -10,7 +10,7 @@
 # send_hmd_frame).
 #
 # The wire under test: every `state` frame's plaintext is
-#   {"state": {...}, "caps": ["resync","z-zlib"]}                              plain
+#   {"state": {...}, "caps": ["push-v1","resync","z-zlib"]}                    plain
 #   {"z":"zlib","d":"<std base64 of zlib.compress(<the plain plaintext>)>"}    only for a phone whose
 #                                         most recent sealed `resync` command listed "z-zlib"
 # test/fixtures/hmdapp-zero-lag-vectors.json is the app's own vector file, vendored byte for byte
@@ -395,7 +395,7 @@ print(got[:16] + "...")
 PYEOF
 
 # ═══ 10. normalize_caps / hmd_caps ══════════════════════════════════════════
-py_case 10 "normalize_caps: the string entries of an array, else the empty set; hmd_caps lists resync + z-zlib" <<'PYEOF'
+py_case 10 "normalize_caps: the string entries of an array, else the empty set; hmd_caps lists push-v1 + resync + z-zlib" <<'PYEOF'
 assert e2e.normalize_caps(["z-zlib", "resync"]) == frozenset({"z-zlib", "resync"})
 assert e2e.normalize_caps(("z-zlib",)) == frozenset({"z-zlib"})
 assert e2e.normalize_caps(["z-zlib", 7, None, "", {"x": 1}, ["z-zlib"], "x" * 33]) == frozenset({"z-zlib"})
@@ -404,7 +404,20 @@ for junk in (None, "z-zlib", "z-zlib,resync", {"z-zlib": True}, 7, True, b"z-zli
 many = ["cap%d" % i for i in range(1000)]
 assert len(e2e.normalize_caps(many)) == e2e.MAX_CAPS, "an advertised list must be bounded"
 assert e2e.CAP_ZLIB == "z-zlib" and e2e.CAP_RESYNC == "resync" and e2e.ENC_ZLIB == "zlib"
-assert e2e.hmd_caps() == ["resync", "z-zlib"], e2e.hmd_caps()
+assert e2e.hmd_caps() == ["push-v1", "resync", "z-zlib"], e2e.hmd_caps()
+assert e2e.CAP_PUSH == "push-v1"
+os.environ["HMD_PUSH"] = "0"  # the operator's kill switch withdraws the cap
+try:
+    assert e2e.hmd_caps() == ["resync", "z-zlib"], e2e.hmd_caps()
+    assert not e2e.push_enabled()
+finally:
+    del os.environ["HMD_PUSH"]
+assert e2e.push_enabled() and e2e.hmd_caps(push=False) == ["resync", "z-zlib"], "a caller without a push store lists none"
+os.environ["HMD_PUSH"] = "1"
+try:
+    assert e2e.push_enabled() and "push-v1" in e2e.hmd_caps(), "only the exact value 0 is the switch"
+finally:
+    del os.environ["HMD_PUSH"]
 PYEOF
 
 # ═══ 11. before any resync: plain frames ════════════════════════════════════
@@ -416,7 +429,7 @@ rig.send("state", {"state": state})
 got = rig.plaintext(rig.last("state"))
 assert got == plain_frame(state), "before a resync the frame must be exactly the plain {state, caps}"
 obj = json.loads(got)
-assert "z" not in obj and obj["caps"] == ["resync", "z-zlib"] and obj["state"] == state
+assert "z" not in obj and obj["caps"] == ["push-v1", "resync", "z-zlib"] and obj["state"] == state
 # caps outside a resync command are not the handshake: a send-message that carries them changes nothing
 rig.command({"action": "send-message", "params": {"text": "no handshake here"}, "caps": ["z-zlib"]})
 rig.command({"action": "decide", "params": {"id": "p-0", "decision": "deny"}, "caps": ["z-zlib"]})
@@ -444,7 +457,7 @@ assert obj["z"] == "zlib" and list(obj) == ["z", "d"], "expected the envelope, g
 assert rig.E2E.unpack_plaintext(got) == plain_frame(state), "the envelope must inflate to the plain frame"
 assert zlib.decompress(base64.b64decode(obj["d"])) == plain_frame(state)
 inner = json.loads(zlib.decompress(base64.b64decode(obj["d"])))
-assert inner["caps"] == ["resync", "z-zlib"], "the inner plaintext still carries hmd's caps"
+assert inner["caps"] == ["push-v1", "resync", "z-zlib"], "the inner plaintext still carries hmd's caps"
 before, after = len(plain_post["ciphertext"]), len(post["ciphertext"])
 assert after < 0.6 * before, "sealed ciphertext went %d -> %d B, expected <= 60%%" % (before, after)
 print("envelope ciphertext %d -> %d B (%.1f%%)" % (before, after, 100.0 * after / before))
@@ -604,16 +617,16 @@ print(" ".join(kinds))
 PYEOF
 
 # ═══ 20. no zlib in this python ═════════════════════════════════════════════
-py_case 20 "client: a python without zlib lists only resync and sends plain whatever the phone listed" rig <<'PYEOF'
+py_case 20 "client: a python without zlib lists only resync (and push-v1) and sends plain whatever the phone listed" rig <<'PYEOF'
 rig = Rig()
 rig.E2E.zlib = None  # what `import zlib` failing leaves behind
-assert rig.E2E.hmd_caps() == ["resync"], "hmd must not list z-zlib when it cannot compress"
+assert rig.E2E.hmd_caps() == ["push-v1", "resync"], "hmd must not list z-zlib when it cannot compress"
 rig.resync(["z-zlib"])
 state = real_state()
 rig.send("state", {"state": state})
 got = rig.plaintext(rig.last("state"))
-assert json.loads(got)["caps"] == ["resync"] and "z" not in json.loads(got)
-assert got == json.dumps({"state": state, "caps": ["resync"]}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+assert json.loads(got)["caps"] == ["push-v1", "resync"] and "z" not in json.loads(got)
+assert got == json.dumps({"state": state, "caps": ["push-v1", "resync"]}, sort_keys=True, separators=(",", ":")).encode("utf-8")
 try:
     rig.E2E.compress_envelope(plain_frame(state))
 except rig.E2E.E2EError as e:
@@ -740,7 +753,7 @@ try:
     first = wait("the first state frame", lambda: (frames("state") or [None])[0])
     first_plain = read(first)
     obj = json.loads(first_plain)
-    assert "z" not in obj and obj["caps"] == ["resync", "z-zlib"] and "schema_version" in obj["state"], \
+    assert "z" not in obj and obj["caps"] == ["push-v1", "resync", "z-zlib"] and "schema_version" in obj["state"], \
         "before any resync the frame must be plain and list hmd's caps"
 
     # the phone saw `resync` in hmd's caps: it sends its resync, listing z-zlib, with a digest hmd never sent
@@ -757,7 +770,7 @@ try:
                   lambda: next((f for f in frames("state") if f["seq"] > first["seq"] and b'"z"' in read(f)[:8]), None))
     wrapper = read(packed)
     inner = json.loads(e2e.unpack_plaintext(wrapper))
-    assert inner["caps"] == ["resync", "z-zlib"] and "schema_version" in inner["state"], "decoded frame must be a full state"
+    assert inner["caps"] == ["push-v1", "resync", "z-zlib"] and "schema_version" in inner["state"], "decoded frame must be a full state"
     assert len(wrapper) < 0.6 * len(first_plain), "%d -> %d" % (len(first_plain), len(wrapper))
     sent = [e for e in events if e.get("event") == "state_sent"]
     assert sent[0]["bytes"] > sent[-1]["bytes"] and all(e["delivered"] for e in sent), sent
