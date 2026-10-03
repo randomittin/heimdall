@@ -5,7 +5,8 @@ docs/superpowers/specs/relay/INVARIANTS.md -- both read-only inputs from the
 hmdapp repo, never edited here) and accepts a `send-message` command back from
 the paired phone -- and a `decide` command, the phone's sealed DENY of a pending
 risky action (A4, deny-only round: see `_decide`; nothing else about an action can
-be decided from the phone, and "allow" is refused for every request).
+be decided from the phone, and "allow" is refused for every request) -- and, to an hmd that lists
+`push-v1`, the phone's sealed push registration (see PUSH REGISTRATION below).
 
 Spawned by `bin/heimdall-app connect --relay <url>` as a sibling process to a
 local `hmd ui`; this process owns the ONE relay session for its lifetime and is
@@ -79,11 +80,13 @@ to drive its own UI; nothing else is ever written to stdout.
                                                        device_bound), sorted, logged
                                                        when it CHANGES. See FRAME
                                                        COMPRESSION AND RESYNC below
-    {"event":"command","action":"send-message"|"decide"|"resync"|..,"ok":bool,"detail":..}
+    {"event":"command","action":"send-message"|"decide"|"resync"|"register_push"|
+     "unregister_push"|"app_state"|..,"ok":bool,"detail":..}
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
-        logged, not even at this level); any action other than the three
-        named is acked `not-implemented`
+        logged, not even at this level); any action other than the six
+        named is acked `not-implemented`. Never the token, ref or label of a
+        push registration (see PUSH REGISTRATION below)
     {"event":"ack_sent","of_seq":N,"seq":S,"id":..|null,"attempt":K,"ms":N,
      "ok":bool,"delivered":bool}
         one line per POST ATTEMPT of the ack answering a command (so every
@@ -233,6 +236,20 @@ would not shrink, `ack` frames (never compressed), a python without zlib. Only a
 that opened under the session key can set the phone's capabilities -- never the relay's
 unencrypted `device_bound`.
 
+PUSH REGISTRATION (hmdapp's docs/HANDOFF-TO-HEIMDALL-push-notifications.md PN2 and section 5 of its spec,
+docs/superpowers/specs/2026-10-03-push-notifications.md; bin/lib/companion_push_store.py owns every rule and
+keeps <repo>/.heimdall/app/push.json). Every state frame lists `push-v1` in its caps unless the operator set
+HMD_PUSH=0 or the store failed to load. A phone that sees it may send three sealed commands, each acked
+`{"ok":..,"of_seq":N[,"detail":..]}` plus the keys named here:
+    register_push    {"v":1,"provider":"expo","token":..,"platform":"ios"|"android","ref":"<16 hex>",
+                      "label":..,"events":[..]}        ack ok adds "ref" and "events" (sorted)
+    unregister_push  {"ref":"<16 hex>"}                ack ok adds "ref" and "removed":bool
+    app_state        {"state":"active"|"background"}
+A refusal's `detail` is push-disabled | bad-params | bad-version | bad-provider | bad-token | bad-platform |
+bad-ref | bad-label | bad-events | bad-state | write-failed. The Expo token is a secret: never printed, never
+logged, never in the status file, never echoed in an ack. Registrations left by an EARLIER session are
+cleared when this session latches its key (its first device_bound); a repeat device_bound leaves them alone.
+
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
 to import -- both mean the same thing: refuse to start a plaintext relay
@@ -300,6 +317,7 @@ UI = _load_module("hmd_ui", os.path.join(SENTINELS_DIR, "hmd-ui.py"))
 INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_inbox.py"))
 DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "companion_ui_decisions.py"))
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
+PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "companion_push_store.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
 # envelope this client will POST to /session/:id/frames -- one named constant,
@@ -978,7 +996,7 @@ class RelayClient:
         frame still in flight when an ack takes the next seq) is _tick_once's
         to repair."""
         if type_ == "state":  # hmd's capability tokens ride in EVERY state frame (FRAME COMPRESSION AND RESYNC)
-            plaintext_obj = dict(plaintext_obj, caps=E2E.hmd_caps())
+            plaintext_obj = dict(plaintext_obj, caps=E2E.hmd_caps(push=PUSH_STORE is not None))
             self.last_sent_state = plaintext_obj.get("state")
         plaintext = json.dumps(plaintext_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if type_ == "state":  # compress BEFORE the seal; only a state frame, only for a phone that listed "z-zlib"
@@ -1126,6 +1144,101 @@ class RelayClient:
             self._rearm_state()
         return True, None
 
+    def _push_ready(self):
+        """Push registration is on: the store loaded and the operator has not set HMD_PUSH=0."""
+        return PUSH_STORE is not None and E2E.push_enabled()
+
+    def _register_push(self, params):
+        """The phone's sealed registration of its Expo push token, sent only to an hmd that listed `push-v1`
+        (section 5.2 of hmdapp's docs/superpowers/specs/2026-10-03-push-notifications.md):
+            command  {"action":"register_push","params":{"v":1,"provider":"expo","token":"<ExpoPushToken>",
+                      "platform":"ios"|"android","ref":"<16 hex>","label":"<1..24>","events":[..]}}
+            ack ok   {"ok":true,"of_seq":N,"ref":"<16 hex>","events":[..sorted]}
+            ack no   {"ok":false,"of_seq":N,"detail":<code>}
+        An idempotent upsert. The store (companion_push_store) owns every field rule and its machine-readable
+        refusal, in the spec's order: bad-version and bad-provider are decided here, then bad-token |
+        bad-platform | bad-ref | bad-label | bad-events there; a field that is absent is the refusal its rule
+        names. Nothing is written on a refusal. The token and the label go into the store and nowhere else:
+        the ack repeats only `ref` and `events`, and no event line names a field of the registration."""
+        if not self._push_ready():
+            return False, "push-disabled", {}
+        if not isinstance(params, dict):
+            return False, "bad-params", {}
+        version = params.get("v")
+        if not (isinstance(version, int) and not isinstance(version, bool) and version == 1):
+            return False, "bad-version", {}
+        if params.get("provider") != "expo":
+            return False, "bad-provider", {}
+        for field, code in (("token", "bad-token"), ("platform", "bad-platform"), ("ref", "bad-ref"),
+                            ("label", "bad-label"), ("events", "bad-events")):
+            if params.get(field) is None:
+                return False, code, {}
+        try:
+            entry = PUSH_STORE.register(self.root, params["token"], params["platform"], ref=params["ref"],
+                                        label=params["label"], events=params["events"])
+        except PUSH_STORE.PushStoreError as e:
+            return False, e.code, {}
+        except OSError:
+            return False, "write-failed", {}
+        return True, None, {"ref": entry["ref"], "events": entry["events"]}
+
+    def _unregister_push(self, params):
+        """The phone withdrawing its registration (spec 5.3), sent before it forgets the session:
+            command  {"action":"unregister_push","params":{"ref":"<16 hex>"}}
+            ack ok   {"ok":true,"of_seq":N,"ref":"<16 hex>","removed":true|false}
+        Idempotent: a well-formed ref nothing is registered under is `removed:false`, not an error."""
+        if not self._push_ready():
+            return False, "push-disabled", {}
+        if not isinstance(params, dict):
+            return False, "bad-params", {}
+        ref = params.get("ref")
+        if ref is None:
+            return False, "bad-ref", {}
+        try:
+            removed = PUSH_STORE.unregister(self.root, ref=ref)
+        except PUSH_STORE.PushStoreError as e:
+            return False, e.code, {}
+        except OSError:
+            return False, "write-failed", {}
+        return True, None, {"ref": ref, "removed": removed}
+
+    def _app_state(self, params):
+        """The phone saying whether it is on screen (spec 5.4), on every change between the two states and once
+        after each successful resync -- what lets the notification sender stay quiet for a phone that is
+        looking at the session:
+            command  {"action":"app_state","params":{"state":"active"|"background"}}
+            ack ok   {"ok":true,"of_seq":N}
+        Kept as foreground / background with the time it arrived, so a report that stops arriving ages."""
+        if not self._push_ready():
+            return False, "push-disabled", {}
+        if not isinstance(params, dict):
+            return False, "bad-params", {}
+        state = params.get("state")
+        if state not in ("active", "background"):
+            return False, "bad-state", {}
+        try:
+            PUSH_STORE.set_app_state(self.root, state)
+        except OSError:
+            return False, "write-failed", {}
+        return True, None, {}
+
+    def _forget_push_registrations(self):
+        """This session is latching its key: whatever push.json holds was registered through an EARLIER
+        session's key (a registration needs one, and this process had none until this very frame), so it
+        belongs to a phone this session has never paired with. Its tokens go and the app state it reported is
+        forgotten. A repeat device_bound with the same key keeps the registrations, and a different key never
+        gets here -- the latch refuses it first. Bookkeeping: a failure is reported, never a reason to refuse
+        the pairing."""
+        if PUSH_STORE is None:
+            return
+        try:
+            held = PUSH_STORE.load(self.root)
+            if held["tokens"] or held["app_state"] != "unknown":
+                PUSH_STORE.remove_tokens(self.root, [entry["token"] for entry in held["tokens"]])
+                PUSH_STORE.set_app_state(self.root, "unknown")
+        except OSError as e:
+            emit({"event": "error", "detail": "push registrations from an earlier session were not cleared: %s" % e})
+
     def _handle_command(self, env):
         # The phone's ack window opened before this command reached us; retries
         # of its ack may only START inside what is left of it (ACK_WINDOW_S).
@@ -1174,6 +1287,12 @@ class RelayClient:
             ok, detail, extra = self._decide(params)
         elif action == "resync":
             ok, detail = self._resync(params)
+        elif action == "register_push":
+            ok, detail, extra = self._register_push(params)
+        elif action == "unregister_push":
+            ok, detail, extra = self._unregister_push(params)
+        elif action == "app_state":
+            ok, detail, extra = self._app_state(params)
         else:
             ok, detail = False, "not-implemented"
         emit({"event": "command", "action": action, "ok": ok, "detail": detail})
@@ -1225,6 +1344,7 @@ class RelayClient:
             self.device_pub = device_pub
             self.paired = True
             self.bound_at = payload.get("bound_at")
+            self._forget_push_registrations()
             # §7c, 2026-09-25: force the next tick to re-send state even if its
             # digest hasn't changed since the last publish. A (re)bind means the
             # phone's own local state was just reset -- INV-22's digest dedup

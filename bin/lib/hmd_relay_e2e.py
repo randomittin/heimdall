@@ -60,7 +60,8 @@ these by name):
   nonce_for_seq(seq: int, sender: str) -> bytes[12]
   seal(key, seq, sender, plaintext: bytes, aad: bytes = b"") -> (nonce_b64, ciphertext_b64)
   open_(key, seq, sender, nonce_b64, ciphertext_b64, aad: bytes = b"") -> bytes
-  hmd_caps() -> list[str]
+  hmd_caps(push: bool = True) -> list[str]
+  push_enabled() -> bool
   normalize_caps(value) -> frozenset[str]
   compress_envelope(plaintext: bytes) -> bytes
   pack_plaintext(plaintext: bytes, caps, min_bytes: int = COMPRESS_MIN_BYTES) -> bytes
@@ -77,7 +78,9 @@ plaintext, not part of the AEAD: seal()/open_() never see it. A sealed `state` p
     {"z":"zlib","d":"<standard base64 of zlib.compress(P)>"}  P = the plain plaintext above
 The envelope is produced only when the phone's most recent `resync` command listed "z-zlib"
 (pack_plaintext's `caps`), the frame is at least COMPRESS_MIN_BYTES long and the envelope is
-genuinely smaller. hmd's own tokens ride in EVERY state frame's `caps` (hmd_caps()).
+genuinely smaller. hmd's own tokens ride in EVERY state frame's `caps` (hmd_caps()): `resync`,
+`z-zlib` when this python can compress, and `push-v1` -- hmd takes the phone's push registration
+commands (hmdapp's docs/HANDOFF-TO-HEIMDALL-push-notifications.md PN2) -- unless HMD_PUSH=0.
 unpack_plaintext() is the inverse, with the app's hard output cap (MAX_INFLATED_BYTES) and strict
 about everything the spec calls malformed -- the reference decoder for anything on the hmd side that
 ever reads a compressed frame, and what test/hmd-relay-zlib-frames.test.sh decodes with.
@@ -101,6 +104,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sys
 
@@ -481,6 +485,7 @@ def open_(key: bytes, seq: int, sender: str, nonce_b64: str, ciphertext_b64: str
 
 CAP_ZLIB = "z-zlib"    # capability token: this side can emit / read the {"z":"zlib","d":...} envelope
 CAP_RESYNC = "resync"  # capability token: hmd understands the phone's `resync` command
+CAP_PUSH = "push-v1"   # capability token: hmd takes the phone's register_push / unregister_push / app_state
 ENC_ZLIB = "zlib"      # the envelope's `z` value: zlib.compress output, RFC 1950 (header + Adler-32)
 # Level 1, as the spec's own reference encoder ("the measured choice"): on the real state frames
 # measured (22 KB from this repo, 103 KB from hmdapp) it gives 40.7% / 8.3% of the plaintext in
@@ -501,11 +506,24 @@ MAX_CAPS = 32  # at most this many entries of an advertised capability list are 
 MAX_CAP_LEN = 32
 
 
-def hmd_caps() -> list:
+def push_enabled() -> bool:
+    """False only when the operator set HMD_PUSH=0 -- the one kill switch for everything push (hmdapp's
+    docs/HANDOFF-TO-HEIMDALL-push-notifications.md PN1 and PN7): hmd then neither lists `push-v1` nor takes
+    the phone's push commands. Read at every call, so the switch is never stale."""
+    return os.environ.get("HMD_PUSH") != "0"
+
+
+def hmd_caps(push: bool = True) -> list:
     """The capability tokens hmd lists in EVERY state frame's wrapper (`{"state": ..., "caps": [...]}`,
-    spec 5.1): `resync` always -- the relay client answers the phone's resync command -- and `z-zlib`
-    only when this python can really compress. Sorted, as in the spec's examples."""
-    return sorted([CAP_RESYNC] + ([CAP_ZLIB] if zlib is not None else []))
+    spec 5.1): `resync` always -- the relay client answers the phone's resync command -- `z-zlib` only when
+    this python can really compress, and `push-v1` when `push` (the caller's own "the push store loaded")
+    and push_enabled(). Sorted, as in the spec's examples."""
+    caps = [CAP_RESYNC]
+    if zlib is not None:
+        caps.append(CAP_ZLIB)
+    if push and push_enabled():
+        caps.append(CAP_PUSH)
+    return sorted(caps)
 
 
 def normalize_caps(value) -> frozenset:
