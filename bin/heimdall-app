@@ -1103,6 +1103,9 @@ cmd_status_relay() {
     pending="$(printf '%s' "$inbox_json" | jq -r '.pending // empty' 2>/dev/null)"
     echo "inbox pending: ${pending:-0}"
   fi
+  if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_cc_login.py" ]; then
+    "$PY3" "$LIB_DIR/companion_cc_login.py" status-line --repo "$REPO" 2>/dev/null
+  fi
   return 0
 }
 
