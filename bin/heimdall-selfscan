@@ -27,8 +27,9 @@
 #      because a gate that read nothing certifies nothing.
 #   2. IDENTITIES — the author AND committer email of every commit on every ref
 #      (`git log --all --format='%ae%n%ce'`) must be a subset of the allowlist
-#      {rj@runheimdall.dev, noreply@anthropic.com}. Any third identity is a hard
-#      fail: an unrecognized author/committer in history must not leave the box.
+#      {rj@runheimdall.dev, noreply@anthropic.com, rj@superpe.in}. Any other
+#      identity is a hard fail: an unrecognized author/committer in history must
+#      not leave the box.
 #
 # Why this exists: the existing bin/secret-scan guards the STAGED diff at commit
 # time and the push RANGE — but agents (and humans) commit with `--no-verify`,
@@ -105,9 +106,13 @@
 set -euo pipefail
 
 # The ONLY allowed author/committer identities in Heimdall's history. Hard-coded
-# on purpose — a configurable allowlist would be an escape hatch.
+# on purpose — a configurable allowlist would be an escape hatch. MIRRORED in
+# bin/heimdall-check-identities; proof 9 of test/heimdall-id-guard.test.sh fails
+# if the two lists differ.
+# rj@superpe.in: imported hmdapp relay history (merge eb5360e4), operator approved 2026-10-03.
 ALLOWED_IDENTITIES="rj@runheimdall.dev
-noreply@anthropic.com"
+noreply@anthropic.com
+rj@superpe.in"
 
 # --- per-sub-gate evidence -------------------------------------------------
 # Print one sub-gate's verdict THE MOMENT that gate concludes, so the record of

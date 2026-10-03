@@ -58,7 +58,7 @@
 #   first global entries: history and the bare scan went clean, the tree pass kept
 #   reporting both findings, and every pre-push went red. Proof G fences that.
 #
-# Seven proofs, all runnable, none skippable:
+# Eight proofs, all runnable, none skippable:
 #
 #   A. PARITY — bare `gitleaks detect --log-opts=--all` over heimdall's history
 #      and heimdall-selfscan's history-SECRET verdict AGREE: both clean. selfscan
@@ -93,6 +93,11 @@
 #      the tree pass exactly as it silences the history pass and a bare
 #      `gitleaks detect --no-git`, and stays as narrow as the fingerprint it is
 #      (move the line, or use another file, and the finding blocks again).
+#
+#   H. IDENTITY ALLOWLIST — rj@superpe.in (author+committer of the history imported
+#      with the hmdapp relay, merge eb5360e4, operator decision A, 2026-10-03) is
+#      admitted by the identities gate, the admission is attributable to that one
+#      entry, and lookalikes of it and strangers still block.
 #
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 
@@ -740,6 +745,109 @@ else
     ok "restoring the relative scan root honors the entry again (verdict=clean) — RED->GREEN round trip closed"
   else
     bad "restored gate returned '${g_rest:-no verdict emitted}' — the restore did not take, or the entry stopped matching"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# H. IDENTITY ALLOWLIST — the identities gate admits rj@superpe.in, exactly, and
+#    nothing that merely resembles it.
+#
+#    The history imported with the hmdapp relay (merge eb5360e4) is authored AND
+#    committed as rj@superpe.in, an address the hard-coded allowlist did not carry,
+#    so the identities gate blocked every push of this repo until operator decision
+#    A (2026-10-03) put it on the list — here and in bin/heimdall-check-identities
+#    (test/heimdall-id-guard.test.sh proof 9 holds the two lists identical).
+#
+#    Proof A reads the gate over the REAL history, which is where this broke, but a
+#    real-history verdict cannot tell "the entry admits it" from "the gate stopped
+#    checking", and it cannot show the entry stayed exact. So this proof drives the
+#    real selfscan over a MINIMAL throwaway heimdall (same construction as proof G):
+#      (i)   ADMITTED — owner + rj@superpe.in history: identities verdict=clean and
+#            allowlisted=2/2.
+#      (ii)  FALSIFIABLE — the same history under a copy of the gate with that ONE
+#            entry made unequal to the address: verdict=blocked, naming it. (i) is
+#            attributable to the entry, not to a gate that never looked.
+#      (iii) EXACT — lookalikes (a longer domain, a prefixed local part) and a
+#            stranger, each as author on one commit and committer on another:
+#            verdict=blocked, allowlisted=2/5, all three named, and rj@superpe.in
+#            is NOT among the offenders.
+#    Every row is read off the IDENTITIES gate's own verdict, never the bundled exit
+#    code, which also answers for the landmine gate.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "H. IDENTITY ALLOWLIST (rj@superpe.in admitted — exactly, and nothing like it):"
+H_CFG="$REPO/.gitleaks.toml"
+if [ ! -f "$H_CFG" ]; then
+  bad "H — .gitleaks.toml missing at repo top; the proofs below need the shipped config"
+else
+  IDM="$WORK/idmini"
+  mkdir -p "$IDM/bin"
+  cp "$SELFSCAN" "$IDM/bin/heimdall-selfscan"
+  cp "$REPO/bin/heimdall-landmine-lint" "$IDM/bin/heimdall-landmine-lint"
+  cp "$H_CFG" "$IDM/.gitleaks.toml"
+  chmod +x "$IDM/bin/heimdall-selfscan" "$IDM/bin/heimdall-landmine-lint"
+  # Benign padding: the tree gate refuses a clean verdict over < 100 KB, and the
+  # identities gate only runs once the tree gate has passed.
+  seq 1 40000 > "$IDM/pad.txt"
+  git -C "$IDM" init -q
+  git -C "$IDM" config commit.gpgsign false
+
+  # h_commit <author-email> <committer-email> — one commit, both identities pinned.
+  h_commit() {
+    printf '%s %s\n' "$1" "$2" >> "$IDM/log.txt"
+    git -C "$IDM" add -A
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL="$1" GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL="$2" \
+      git -C "$IDM" commit -q --no-verify -m "identity proof H"
+  }
+  # Run a gate script from the minimal repo's bin/; evidence goes to $1.
+  h_gate() { ( cd "$IDM" && "./bin/${2:-heimdall-selfscan}" ) >"$1" 2>&1 || true; }
+  # The N/M off the identities gate's line (empty when the gate never reported).
+  h_count() { sed -n 's/^guard: gate=identities verdict=[a-z-]* allowlisted=\([0-9]*\/[0-9]*\).*/\1/p' "$1" | tail -1; }
+
+  # (i) ADMITTED — the imported history's exact shape, next to the owner's own.
+  h_commit "rj@runheimdall.dev" "rj@runheimdall.dev"
+  h_commit "rj@superpe.in" "rj@superpe.in"
+  h_gate "$WORK/h-admit.err"
+  h_adm="$(gate_verdict "$WORK/h-admit.err" identities)"
+  if [ "$h_adm" = "clean" ] && [ "$(h_count "$WORK/h-admit.err")" = "2/2" ]; then
+    ok "history by rj@superpe.in + the owner: identities verdict=clean, allowlisted=2/2"
+  else
+    bad "identities gate returned '${h_adm:-no verdict emitted}' (allowlisted=$(h_count "$WORK/h-admit.err")) over rj@superpe.in history — the imported relay history blocks every push"
+    grep -E 'BLOCKED|✗' "$WORK/h-admit.err" | sed 's/^/      /' | head -6
+  fi
+
+  # (ii) FALSIFIABLE — a SIBLING copy of the gate (not an edit-and-restore: the gate
+  # resolves its repo top from its own directory, so the copy polices this same
+  # minimal repo) in which every spelling of the address is made a different string.
+  sed 's/rj@superpe\.in/rj@superpe.in.removed-by-falsifier/g' "$IDM/bin/heimdall-selfscan" > "$IDM/bin/heimdall-selfscan.noentry"
+  chmod +x "$IDM/bin/heimdall-selfscan.noentry"
+  if cmp -s "$IDM/bin/heimdall-selfscan" "$IDM/bin/heimdall-selfscan.noentry"; then
+    bad "falsifier: the mutation did not change the gate (no rj@superpe.in entry to remove?) — the RED below would prove nothing"
+  else
+    ok "falsifier: the mutant really differs from the gate (the rj@superpe.in entry is gone)"
+  fi
+  h_gate "$WORK/h-noentry.err" heimdall-selfscan.noentry
+  h_mut="$(gate_verdict "$WORK/h-noentry.err" identities)"
+  if [ "$h_mut" = "blocked" ] && grep -Fxq "  ✗ rj@superpe.in" "$WORK/h-noentry.err"; then
+    ok "WITHOUT the entry the same history blocks, naming rj@superpe.in — the entry earns its place"
+  else
+    bad "falsifier: the entry-less gate returned '${h_mut:-no verdict emitted}' over rj@superpe.in history — (i) is not attributable to the entry"
+  fi
+
+  # (iii) EXACT — each unlisted address once as author and once as committer, so both
+  # roles are covered. Five distinct identities in history, two of them allowlisted.
+  h_commit "rj@superpe.in.evil.test" "xrj@superpe.in"
+  h_commit "stranger@example.com" "rj@superpe.in"
+  h_gate "$WORK/h-exact.err"
+  h_exact="$(gate_verdict "$WORK/h-exact.err" identities)"
+  h_unnamed=""
+  for offender in rj@superpe.in.evil.test xrj@superpe.in stranger@example.com; do
+    grep -Fxq "  ✗ $offender" "$WORK/h-exact.err" || h_unnamed="$h_unnamed $offender"
+  done
+  if [ "$h_exact" = "blocked" ] && [ "$(h_count "$WORK/h-exact.err")" = "2/5" ] \
+     && [ -z "$h_unnamed" ] && ! grep -Fxq "  ✗ rj@superpe.in" "$WORK/h-exact.err"; then
+    ok "lookalikes and a stranger still block (allowlisted=2/5), each named; rj@superpe.in itself is not an offender"
+  else
+    bad "exact-match proof failed: verdict='${h_exact:-none}', allowlisted=$(h_count "$WORK/h-exact.err") (want 2/5), unnamed offenders:${h_unnamed:- none}, or rj@superpe.in was reported as an offender"
   fi
 fi
 
