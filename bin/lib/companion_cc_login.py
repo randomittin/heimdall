@@ -1147,20 +1147,34 @@ class LoginManager:
     def sweep_orphan(self):
         """At relay-client start: kills the process group of a `claude auth login` an earlier client left
         behind (named by the pid file), but only while that pid still runs `claude auth login`. True when a
-        group was killed. The pid file is removed either way."""
+        group was killed. The pid file is removed either way -- except when the global login lock is HELD:
+        then the login is alive (another relay client of this user is running it, the pid file is shared
+        by every client), not an orphan, and it is left completely alone."""
         path = os.path.join(self.home, PID_FILE)
+        if not os.path.exists(path):
+            return False
         try:
-            with open(path, "rb") as f:
-                record = json.loads(f.read(512).decode("utf-8"))
-        except (OSError, ValueError):
-            record = None
-        pid = record.get("pid") if isinstance(record, dict) else None
-        killed = False
-        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 and _is_login_process(pid):
-            killed = _terminate_group(pid, self.term_grace_s)
-        with contextlib.suppress(OSError):
-            os.unlink(path)
-        return killed
+            lock_fd = self._take_global_lock()
+        except LoginError:
+            return False  # busy: a live login; spawn-failed: cannot prove anything -- either way, hands off
+        try:
+            try:
+                with open(path, "rb") as f:
+                    record = json.loads(f.read(512).decode("utf-8"))
+            except (OSError, ValueError):
+                record = None
+            pid = record.get("pid") if isinstance(record, dict) else None
+            killed = False
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 and _is_login_process(pid):
+                killed = _terminate_group(pid, self.term_grace_s)
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            return killed
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(lock_fd)
 
 
 # -- the laptop's side: `hmd app remote-login on [--pin-next] | off | status` ----------------------------

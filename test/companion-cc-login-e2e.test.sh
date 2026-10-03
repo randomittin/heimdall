@@ -838,6 +838,15 @@ for junk in ("not json", "{}", '{"pid": "x"}', '{"pid": -1}', '{"pid": 0}', '{"p
         f.write(junk)
     assert w.manager().sweep_orphan() is False, junk
     assert not os.path.exists(os.path.join(w.hh, "cc-login.pid")), junk
+# a LIVE login of another relay client holds the global lock: it is not an orphan and must never be swept
+lw = World(mode="hang")
+live = lw.manager()
+live_id, _req = started(live)
+newcomer = lw.manager(term_grace_s=0.5)  # another relay client starting up on the same machine
+assert newcomer.sweep_orphan() is False
+assert alive(lw.pid("login.pid")) and os.path.exists(os.path.join(lw.hh, "cc-login.pid")), "a live login must survive another client's start"
+assert live.cancel(live_id) == {"id": live_id}
+assert lw.gone()
 PYEOF
 
 # ═══ 23-24. what the phone sees, and when ═══════════════════════════════════
