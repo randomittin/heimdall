@@ -6,7 +6,8 @@ hmdapp repo, never edited here) and accepts a `send-message` command back from
 the paired phone -- and a `decide` command, the phone's sealed DENY of a pending
 risky action (A4, deny-only round: see `_decide`; nothing else about an action can
 be decided from the phone, and "allow" is refused for every request) -- and, to an hmd that lists
-`push-v1`, the phone's sealed push registration (see PUSH REGISTRATION below).
+`push-v1`, the phone's sealed push registration (see PUSH REGISTRATION below) -- and, to an hmd that
+lists `login-v1`, the phone's sealed remote Claude Code login (see REMOTE CLAUDE CODE LOGIN below).
 
 Spawned by `bin/heimdall-app connect --relay <url>` as a sibling process to a
 local `hmd ui`; this process owns the ONE relay session for its lifetime and is
@@ -81,12 +82,15 @@ to drive its own UI; nothing else is ever written to stdout.
                                                        when it CHANGES. See FRAME
                                                        COMPRESSION AND RESYNC below
     {"event":"command","action":"send-message"|"decide"|"resync"|"register_push"|
-     "unregister_push"|"app_state"|..,"ok":bool,"detail":..}
+     "unregister_push"|"app_state"|"login_start"|"login_code"|"login_cancel"|..,
+     "ok":bool,"detail":..}
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
-        logged, not even at this level); any action other than the six
-        named is acked `not-implemented`. Never the token, ref or label of a
-        push registration (see PUSH REGISTRATION below)
+        logged, not even at this level); any action other than the nine
+        named (the three login_* only while bin/lib/companion_cc_login.py
+        imported) is acked `not-implemented`. Never the token, ref or label
+        of a push registration (see PUSH REGISTRATION below), never a login
+        command's params (see REMOTE CLAUDE CODE LOGIN below)
     {"event":"ack_sent","of_seq":N,"seq":S,"id":..|null,"attempt":K,"ms":N,
      "ok":bool,"delivered":bool}
         one line per POST ATTEMPT of the ack answering a command (so every
@@ -146,6 +150,11 @@ to drive its own UI; nothing else is ever written to stdout.
     {"event":"error","detail":..}                     non-fatal unless followed
                                                        by one of the two exit
                                                        paths below
+    {"event":"login","phase":"start"|"code"|"result","id":..|null,"ok":bool,"detail":..|null}
+        remote Claude Code login (login-v1, bin/lib/companion_cc_login.py): one line per start
+        attempt (id null, ok false and the refusal as detail when refused), per code submitted
+        (ok false + detail when refused) and per result (ok, detail one of the spec's closed
+        result.detail strings). Nothing but these fields: never the URL, the code or an account
 
 Never printed, logged, or written to disk: `relay_session_token`, the derived
 session key, either private key, or any command/state plaintext.
@@ -224,8 +233,11 @@ waits on stop_event, so a shutdown is never delayed by a retry.
 FRAME COMPRESSION AND RESYNC (the FINAL wire of hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md
 Ask 5, section 5; hmdapp's docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with
 it; codec in bin/lib/hmd_relay_e2e.py). Capabilities travel in-band, hmd first: EVERY `state`
-frame's plaintext is `{"state":{...},"caps":["resync","z-zlib"]}` (E2E.hmd_caps()). A phone that
-sees `resync` sends a sealed command `{"action":"resync","params":{"last_seq":N,"digest":"<sha256
+frame's plaintext is `{"state":{...},"caps":["login-v1","push-v1","resync","z-zlib"]}` (E2E.hmd_caps():
+`resync` always, `z-zlib` when this python can compress, and `login-v1` / `push-v1` only while their
+modules loaded -- push-v1 also only unless HMD_PUSH=0; see REMOTE CLAUDE CODE LOGIN and PUSH
+REGISTRATION below). A phone that sees `resync` sends a sealed command
+`{"action":"resync","params":{"last_seq":N,"digest":"<sha256
 hex>","caps":[..]}}`; hmd acks it ok, keeps its `caps` as the phone's capability set (replaced by
 every resync, forgotten on every device_bound), and -- when `digest` is not the digest of the
 state hmd last sent -- forces a full state frame on the next tick, the same re-send device_bound
@@ -249,6 +261,15 @@ A refusal's `detail` is push-disabled | bad-params | bad-version | bad-provider 
 bad-ref | bad-label | bad-events | bad-state | write-failed. The Expo token is a secret: never printed, never
 logged, never in the status file, never echoed in an ack. Registrations left by an EARLIER session are
 cleared when this session latches its key (its first device_bound); a repeat device_bound leaves them alone.
+
+REMOTE CLAUDE CODE LOGIN (capability `login-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-remote-cc-login.md):
+`caps` also lists `login-v1` whenever bin/lib/companion_cc_login.py imported. A phone that lists it in its
+resync gets `state.login` ({enabled, cc, request, result}, sealed with the rest of the state) and may send
+the sealed commands `login_start` {kind}, `login_code` {id, code} and `login_cancel` {id}; each ack carries
+the manager's refusal code in `detail` (see _login_command). Off by default: the operator enables it at
+the laptop with `hmd app remote-login on`. The login code exists only inside the sealed command and one
+write to a PTY; the `command` event never carries params and the `login` event never carries the URL,
+the code or an account.
 
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
@@ -318,6 +339,7 @@ INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_i
 DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "companion_ui_decisions.py"))
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
 PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "companion_push_store.py"))
+LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
 # envelope this client will POST to /session/:id/frames -- one named constant,
@@ -864,6 +886,7 @@ class RelayClient:
         self._rearm_gen = 0        # bumped by _rearm_state; see _tick_once
         self._state_failures = 0   # consecutive state POSTs that got no usable answer
         self.cache = None
+        self._login = None         # the LoginManager, created on first use (see _login_manager)
 
     # -- status ------------------------------------------------------------
     def _status_snapshot(self):
@@ -996,7 +1019,7 @@ class RelayClient:
         frame still in flight when an ack takes the next seq) is _tick_once's
         to repair."""
         if type_ == "state":  # hmd's capability tokens ride in EVERY state frame (FRAME COMPRESSION AND RESYNC)
-            plaintext_obj = dict(plaintext_obj, caps=E2E.hmd_caps(push=PUSH_STORE is not None))
+            plaintext_obj = dict(plaintext_obj, caps=E2E.hmd_caps(self._feature_caps(), push=PUSH_STORE is not None))
             self.last_sent_state = plaintext_obj.get("state")
         plaintext = json.dumps(plaintext_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if type_ == "state":  # compress BEFORE the seal; only a state frame, only for a phone that listed "z-zlib"
@@ -1114,8 +1137,11 @@ class RelayClient:
         sees the old or the new set, both valid."""
         caps = E2E.normalize_caps(raw)
         if caps != self.device_caps:
+            had_login = LOGIN is not None and LOGIN.CAP_LOGIN in self.device_caps
             self.device_caps = caps
             emit({"event": "device_caps", "caps": sorted(caps)})
+            if LOGIN is not None and LOGIN.CAP_LOGIN in caps and not had_login:
+                self._rearm_state()  # state.login rides only for a phone that lists login-v1: send it now
 
     def _resync(self, params):
         """The phone's `resync` command, sent to an hmd that listed `resync` in its state frames'
@@ -1239,6 +1265,80 @@ class RelayClient:
         except OSError as e:
             emit({"event": "error", "detail": "push registrations from an earlier session were not cleared: %s" % e})
 
+    # -- remote Claude Code login (login-v1) ----------------------------------------------------------
+    # hmdapp's docs/HANDOFF-TO-HEIMDALL-remote-cc-login.md. bin/lib/companion_cc_login.py owns the login
+    # (the PTY, the URL allowlist, the account pin); this is only its wire: three sealed commands, the
+    # state.login slice of the state frame, and the capability token.
+    def _login_manager(self):
+        """The one LoginManager of this client, created on first use: nothing is read or spawned before."""
+        if self._login is None:
+            self._login = LOGIN.LoginManager(LOGIN.heimdall_home(), dict(os.environ),
+                                             emit=lambda obj: emit(obj), on_change=self._rearm_state)
+        return self._login
+
+    def _feature_caps(self):
+        """Capability tokens of the optional features whose modules loaded (added to the codec's own)."""
+        return [E2E.CAP_LOGIN] if LOGIN is not None else []
+
+    def _login_command(self, action, params):
+        """The phone's sealed login commands (spec 4.3):
+            {"action":"login_start","params":{"kind":"claudeai"|"console"}}
+                ack ok  {"ok":true,"of_seq":N,"id":"l-<8 hex>"[,"dup":true]}
+            {"action":"login_code","params":{"id":..,"code":"<CODE#STATE>"}}
+                ack ok  {"ok":true,"of_seq":N,"id":..,"phase":"verifying"}
+            {"action":"login_cancel","params":{"id":..}}
+                ack ok  {"ok":true,"of_seq":N,"id":..}  (unknown or finished id: ok + detail "unchanged")
+            ack no      {"ok":false,"of_seq":N,"detail":<LoginError.code>}
+        The final outcome is never in an ack (the exchange takes seconds): it arrives in state.login.result.
+        The code is a secret: it goes from `params` straight to the manager -- never logged, evented, stored
+        or echoed, and no error text here ever includes it (only exception TYPE names are reported)."""
+        fields = params if isinstance(params, dict) else {}
+        has_cap = LOGIN.CAP_LOGIN in self.device_caps
+        try:
+            manager = self._login_manager()
+            if action == "login_start":
+                result = manager.start(fields.get("kind"), caps_ok=has_cap)
+            elif not has_cap:
+                return False, "caps-missing", {}
+            elif action == "login_code":
+                result = manager.submit_code(fields.get("id"), fields.get("code"))
+            else:
+                result = manager.cancel(fields.get("id"))
+        except LOGIN.LoginError as e:
+            return False, e.code, {}
+        except Exception as e:  # the type only: a message could hold what the phone sent
+            emit({"event": "error", "detail": "login command failed: %s" % type(e).__name__})
+            return False, "internal-error", {}
+        detail = result.pop("detail", None)
+        return True, detail, result
+
+    def _login_overlay(self, state):
+        """`state` plus state.login for a phone that listed login-v1 -- as a copy, because `state` is the
+        StateCache's own shared object. Applied before the seal, so last_sent_state (what a resync digest is
+        compared with) is exactly what the phone holds."""
+        if LOGIN is None or LOGIN.CAP_LOGIN not in self.device_caps:
+            return state
+        try:
+            return dict(state, login=self._login_manager().snapshot())
+        except Exception as e:
+            emit({"event": "error", "detail": "state.login skipped: %s" % type(e).__name__})
+            return state
+
+    def _login_shutdown(self):
+        """The live login (if any) ends `superseded` and its process group is killed."""
+        if self._login is not None:
+            self._login.shutdown("superseded")
+
+    def login_startup(self):
+        """At start: kill a `claude auth login` an earlier client left behind, then run the probe loop on a
+        thread of its own (it does nothing while remote login is switched off at the laptop)."""
+        if LOGIN is None:
+            return
+        manager = self._login_manager()
+        manager.sweep_orphan()
+        threading.Thread(target=manager.run_probe_loop, args=(self.stop_event,), name="login-probe",
+                         daemon=True).start()
+
     def _handle_command(self, env):
         # The phone's ack window opened before this command reached us; retries
         # of its ack may only START inside what is left of it (ACK_WINDOW_S).
@@ -1285,6 +1385,8 @@ class RelayClient:
                     ok, detail = False, "write-failed"
         elif action == "decide":
             ok, detail, extra = self._decide(params)
+        elif LOGIN is not None and action in LOGIN.ACTIONS:
+            ok, detail, extra = self._login_command(action, params)
         elif action == "resync":
             ok, detail = self._resync(params)
         elif action == "register_push":
@@ -1295,6 +1397,7 @@ class RelayClient:
             ok, detail, extra = self._app_state(params)
         else:
             ok, detail = False, "not-implemented"
+        # action/ok/detail only, never `params`: a login_code command carries the login code (a secret)
         emit({"event": "command", "action": action, "ok": ok, "detail": detail})
         ack_payload = {"ok": ok, "of_seq": seq}
         if detail is not None:
@@ -1501,7 +1604,7 @@ class RelayClient:
         if digest == self.last_sent_digest:
             return
         rearm_gen = self._rearm_gen
-        seq, delivered = self.send_hmd_frame("state", {"state": state})
+        seq, delivered = self.send_hmd_frame("state", {"state": self._login_overlay(state)})
         if delivered is None:
             # No usable answer: the frame never reached the phone. last_sent_digest
             # stays as it was, so the next tick sends the (then current) state again
@@ -1567,6 +1670,7 @@ class RelayClient:
             return
         self._stopping = True
         self.stop_event.set()
+        self._login_shutdown()  # before the (network-bound) revoke: a login process must not outlive us
         self.revoke()
         self.write_status()
         emit({"event": "session_ended", "reason": reason})
@@ -1642,7 +1746,9 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    stream_thread = threading.Thread(target=client._stream_loop, name="relay-stream", daemon=True)
+    client.login_startup()
+
+    stream_thread =threading.Thread(target=client._stream_loop, name="relay-stream", daemon=True)
     stream_thread.start()
 
     client.run_state_loop()

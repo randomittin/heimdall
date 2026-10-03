@@ -797,7 +797,7 @@ class Rig:
 # ═══ 27. caps ═══════════════════════════════════════════════════════════════
 py_case 27 "every state frame lists push-v1 in its caps -- and stops listing it with HMD_PUSH=0 or without the store" rig <<'PYEOF'
 rig = Rig()
-base = [c for c in rig.E2E.hmd_caps() if c != "push-v1"]
+base = [c for c in rig.E2E.hmd_caps(rig.client._feature_caps()) if c != "push-v1"]  # every other token the client lists (resync, z-zlib, login-v1)
 assert base and "resync" in base
 assert rig.caps() == sorted(base + ["push-v1"]), rig.caps()
 with env("HMD_PUSH", "0"):
