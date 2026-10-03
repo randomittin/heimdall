@@ -300,6 +300,7 @@ UI = _load_module("hmd_ui", os.path.join(SENTINELS_DIR, "hmd-ui.py"))
 INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_inbox.py"))
 DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "companion_ui_decisions.py"))
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
+LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
 # envelope this client will POST to /session/:id/frames -- one named constant,
@@ -846,6 +847,7 @@ class RelayClient:
         self._rearm_gen = 0        # bumped by _rearm_state; see _tick_once
         self._state_failures = 0   # consecutive state POSTs that got no usable answer
         self.cache = None
+        self._login = None         # the LoginManager, created on first use (see _login_manager)
 
     # -- status ------------------------------------------------------------
     def _status_snapshot(self):
@@ -978,7 +980,7 @@ class RelayClient:
         frame still in flight when an ack takes the next seq) is _tick_once's
         to repair."""
         if type_ == "state":  # hmd's capability tokens ride in EVERY state frame (FRAME COMPRESSION AND RESYNC)
-            plaintext_obj = dict(plaintext_obj, caps=E2E.hmd_caps())
+            plaintext_obj = dict(plaintext_obj, caps=E2E.hmd_caps(self._feature_caps()))
             self.last_sent_state = plaintext_obj.get("state")
         plaintext = json.dumps(plaintext_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if type_ == "state":  # compress BEFORE the seal; only a state frame, only for a phone that listed "z-zlib"
@@ -1096,8 +1098,11 @@ class RelayClient:
         sees the old or the new set, both valid."""
         caps = E2E.normalize_caps(raw)
         if caps != self.device_caps:
+            had_login = LOGIN is not None and LOGIN.CAP_LOGIN in self.device_caps
             self.device_caps = caps
             emit({"event": "device_caps", "caps": sorted(caps)})
+            if LOGIN is not None and LOGIN.CAP_LOGIN in caps and not had_login:
+                self._rearm_state()  # state.login rides only for a phone that lists login-v1: send it now
 
     def _resync(self, params):
         """The phone's `resync` command, sent to an hmd that listed `resync` in its state frames'

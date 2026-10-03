@@ -481,6 +481,7 @@ def open_(key: bytes, seq: int, sender: str, nonce_b64: str, ciphertext_b64: str
 
 CAP_ZLIB = "z-zlib"    # capability token: this side can emit / read the {"z":"zlib","d":...} envelope
 CAP_RESYNC = "resync"  # capability token: hmd understands the phone's `resync` command
+CAP_LOGIN = "login-v1"  # capability token: remote Claude Code login (bin/lib/companion_cc_login.py); the relay client passes it to hmd_caps when that module loaded
 ENC_ZLIB = "zlib"      # the envelope's `z` value: zlib.compress output, RFC 1950 (header + Adler-32)
 # Level 1, as the spec's own reference encoder ("the measured choice"): on the real state frames
 # measured (22 KB from this repo, 103 KB from hmdapp) it gives 40.7% / 8.3% of the plaintext in
@@ -501,11 +502,14 @@ MAX_CAPS = 32  # at most this many entries of an advertised capability list are 
 MAX_CAP_LEN = 32
 
 
-def hmd_caps() -> list:
+def hmd_caps(extra=()) -> list:
     """The capability tokens hmd lists in EVERY state frame's wrapper (`{"state": ..., "caps": [...]}`,
     spec 5.1): `resync` always -- the relay client answers the phone's resync command -- and `z-zlib`
-    only when this python can really compress. Sorted, as in the spec's examples."""
-    return sorted([CAP_RESYNC] + ([CAP_ZLIB] if zlib is not None else []))
+    only when this python can really compress. Sorted, as in the spec's examples. `extra` is the tokens of
+    optional features the CALLER has loaded (CAP_LOGIN once companion_cc_login imported): this codec cannot
+    know that. Run through normalize_caps, so junk and duplicates are dropped."""
+    tokens = normalize_caps(list(extra)) if isinstance(extra, (list, tuple, set, frozenset)) else frozenset()
+    return sorted({CAP_RESYNC} | ({CAP_ZLIB} if zlib is not None else set()) | tokens)
 
 
 def normalize_caps(value) -> frozenset:
