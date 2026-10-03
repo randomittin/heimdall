@@ -1,0 +1,254 @@
+{
+  "about": "Code vectors for normalize_code(raw) -> trimmed code | bad-code. A heimdall-authored stand-in written from hmdapp's docs/superpowers/specs/2026-10-03-remote-cc-login.md section 4.4 until the app's wave-0 docs/samples/login/code-vectors.json lands (vendor that file over this one and re-pin the checksum in test/companion-cc-login-vectors.test.sh). expect ok carries `normalized`, the value normalize_code must return (ASCII whitespace only is trimmed). Boundary lengths (8, 512, 513, 1025, 1026) are built at run time from allowlist.json by the test, so no code-shaped literal is stored here. Values are structural placeholders, never real codes.",
+  "vectors": [
+    {
+      "name": "ok-code-only-8",
+      "code": "abcdefgh",
+      "expect": "ok",
+      "normalized": "abcdefgh"
+    },
+    {
+      "name": "ok-code-and-state",
+      "code": "abcdefgh#ijklmnop",
+      "expect": "ok",
+      "normalized": "abcdefgh#ijklmnop"
+    },
+    {
+      "name": "ok-allowed-punctuation",
+      "code": "ab.cd_ef~gh-ij#kl.mn_op~qr-st",
+      "expect": "ok",
+      "normalized": "ab.cd_ef~gh-ij#kl.mn_op~qr-st"
+    },
+    {
+      "name": "ok-digits-only",
+      "code": "12345678#87654321",
+      "expect": "ok",
+      "normalized": "12345678#87654321"
+    },
+    {
+      "name": "ok-upper-case",
+      "code": "ABCDEFGH#IJKLMNOP",
+      "expect": "ok",
+      "normalized": "ABCDEFGH#IJKLMNOP"
+    },
+    {
+      "name": "ok-surrounding-spaces-trimmed",
+      "code": "  abcdefgh#ijklmnop  ",
+      "expect": "ok",
+      "normalized": "abcdefgh#ijklmnop"
+    },
+    {
+      "name": "ok-trailing-newline-trimmed",
+      "code": "abcdefgh#ijklmnop\n",
+      "expect": "ok",
+      "normalized": "abcdefgh#ijklmnop"
+    },
+    {
+      "name": "ok-trailing-crlf-trimmed",
+      "code": "abcdefgh#ijklmnop\r\n",
+      "expect": "ok",
+      "normalized": "abcdefgh#ijklmnop"
+    },
+    {
+      "name": "ok-leading-and-trailing-tabs-trimmed",
+      "code": "\tabcdefgh#ijklmnop\t",
+      "expect": "ok",
+      "normalized": "abcdefgh#ijklmnop"
+    },
+    {
+      "name": "ok-form-feed-and-vertical-tab-trimmed",
+      "code": "\fabcdefgh\u000b",
+      "expect": "ok",
+      "normalized": "abcdefgh"
+    },
+    {
+      "name": "bad-empty",
+      "code": "",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-only-whitespace",
+      "code": " \t\r\n ",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-code-part-7-chars",
+      "code": "abcdefg",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-state-part-7-chars",
+      "code": "abcdefgh#ijklmno",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-empty-state-after-hash",
+      "code": "abcdefgh#",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-empty-code-before-hash",
+      "code": "#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-hash-only",
+      "code": "#",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-two-hashes",
+      "code": "abcdefgh#ijklmnop#qrstuvwx",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-space-inside-code",
+      "code": "abcd efgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-space-inside-state",
+      "code": "abcdefgh#ijkl mnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-embedded-carriage-return",
+      "code": "abcdefgh\rijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-embedded-newline",
+      "code": "abcdefgh\nijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-embedded-crlf-between-code-and-state",
+      "code": "abcdefgh\r\n#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-embedded-tab",
+      "code": "abcd\tefgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-escape-byte",
+      "code": "abcd\u001befgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-nul-byte",
+      "code": "abcd\u0000efgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-delete-byte",
+      "code": "abcd\u007fefgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-unicode-look-alike-cyrillic-o",
+      "code": "abcdefgh#ijklmn\u043ep",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-fullwidth-letters",
+      "code": "\uff41\uff42\uff43\uff44\uff45\uff46\uff47\uff48",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-non-breaking-space-padding",
+      "code": "\u00a0abcdefgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-ideographic-space-padding",
+      "code": "abcdefgh#ijklmnop\u3000",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-zero-width-space-inside",
+      "code": "abcd\u200befgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-emoji",
+      "code": "abcdefgh\ud83d\ude00",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-standard-base64-plus",
+      "code": "abcd+fgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-standard-base64-slash",
+      "code": "abcd/fgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-standard-base64-padding",
+      "code": "abcdefg=#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-percent-encoding",
+      "code": "abcd%41fgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-quote",
+      "code": "abcd'efgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-backslash",
+      "code": "abcd\\efgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-semicolon",
+      "code": "abcd;efgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-ampersand",
+      "code": "abcd&efgh#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-shell-substitution",
+      "code": "abcd$(id)#ijklmnop",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-slash-url-fragment-shape",
+      "code": "https://x.example/abcdefgh",
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-json-null",
+      "code": null,
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-number",
+      "code": 12345678,
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-list",
+      "code": [
+        "abcdefgh"
+      ],
+      "expect": "bad-code"
+    },
+    {
+      "name": "bad-object",
+      "code": {
+        "code": "abcdefgh"
+      },
+      "expect": "bad-code"
+    }
+  ]
+}

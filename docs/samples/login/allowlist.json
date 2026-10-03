@@ -1,0 +1,38 @@
+{
+  "about": "Shared allowlist for remote Claude Code login (login-v1): the only authorize URLs hmd will publish to the phone and the only code shape it will type into `claude auth login`. A heimdall-authored stand-in written from hmdapp's docs/superpowers/specs/2026-10-03-remote-cc-login.md sections 3.2 and 4.4 until the app's wave-0 docs/samples/login/allowlist.json lands: vendor that file over this one, then re-pin the checksums in test/companion-cc-login-vectors.test.sh. Every host/path/redirect row is an endpoint constant of the installed Claude Code 2.1.288 (its pn() config object: CLAUDE_AI_AUTHORIZE_URL, CONSOLE_AUTHORIZE_URL, MANUAL_REDIRECT_URL); the legacy row is the pair older builds used.",
+  "version": 1,
+  "rows": [
+    {
+      "kind": "claudeai",
+      "host": "claude.com",
+      "path": "/cai/oauth/authorize",
+      "redirect_uri": "https://platform.claude.com/oauth/code/callback",
+      "source": "Claude Code 2.1.288"
+    },
+    {
+      "kind": "console",
+      "host": "platform.claude.com",
+      "path": "/oauth/authorize",
+      "redirect_uri": "https://platform.claude.com/oauth/code/callback",
+      "source": "Claude Code 2.1.288"
+    },
+    {
+      "kind": "claudeai",
+      "host": "claude.ai",
+      "path": "/oauth/authorize",
+      "redirect_uri": "https://console.anthropic.com/oauth/code/callback",
+      "source": "older Claude Code builds (legacy pair)"
+    }
+  ],
+  "required_query": {
+    "response_type": "code",
+    "code": "true",
+    "code_challenge_method": "S256"
+  },
+  "pkce_keys": ["code_challenge", "state"],
+  "pkce_regex": "^[A-Za-z0-9_-]{32,128}$",
+  "nonempty_keys": ["client_id"],
+  "max_url_length": 2048,
+  "code_regex": "^[A-Za-z0-9._~-]{8,512}(#[A-Za-z0-9._~-]{8,512})?$",
+  "code_max_length": 1025
+}
