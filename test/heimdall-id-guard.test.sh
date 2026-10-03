@@ -23,7 +23,14 @@
 #      INCLUDES it exits nonzero. The guard checks exactly the commits in range.
 #   5. ESCAPE HATCH — HEIMDALL_SKIP_ID_GUARD=1 turns a would-block into exit 0
 #      (documented emergency bypass) and says so on stderr.
-#   6. SYNTAX — `bash -n` on the helper AND the native pre-push hook.
+#   6. PRE-PUSH STDIN MODE — the mode the native hook feeds: a range holding the
+#      leak blocks; a deletion line is a clean no-op.
+#   7. SYNTAX — `bash -n` on the helper AND the native pre-push hook.
+#   8. IMPORTED RELAY HISTORY — rj@superpe.in, the author+committer of the history
+#      imported with the hmdapp relay (merge eb5360e4, operator decision A,
+#      2026-10-03), is allowlisted; lookalikes of it and strangers still block.
+#   9. ALLOWLIST PARITY — this helper and bin/heimdall-selfscan hard-code the SAME
+#      list (and the helper's remediation hint names every entry of it).
 #
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 
@@ -162,6 +169,90 @@ echo
 echo "7. SYNTAX (bash -n on the helper + the native pre-push hook):"
 if bash -n "$GUARD" 2>/dev/null; then ok "bash -n: heimdall-check-identities"; else bad "bash -n failed: $GUARD"; fi
 if bash -n "$HOOK"  2>/dev/null; then ok "bash -n: hooks/git/pre-push";       else bad "bash -n failed: $HOOK"; fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo
+echo "8. IMPORTED RELAY HISTORY (rj@superpe.in allowlisted; lookalikes still block):"
+# Operator decision A, 2026-10-03: the hmdapp relay history imported by merge
+# eb5360e4 is authored AND committed as rj@superpe.in. The entry is an EXACT match —
+# it must admit that one address and nothing that merely resembles it.
+RELAY="rj@superpe.in"
+C5="$(commit "$RELAY" "$RELAY" "c5 imported relay history")"
+if ( cd "$SEED" && "$GUARD" "$C4..$C5" ) >/dev/null 2>&1; then
+  ok "author+committer $RELAY -> exit 0 (the imported history's exact shape)"
+else
+  bad "author+committer $RELAY must be allowlisted but the guard blocked"
+fi
+# Each unlisted address goes in as the AUTHOR on its own commit; the commit message
+# deliberately does not repeat it, so "the output names it" cannot be satisfied by the
+# subject line alone.
+PREV="$C5"
+for NOPE in "rj@superpe.in.evil.test" "xrj@superpe.in" "stranger@example.com"; do
+  CN="$(commit "$NOPE" "$GOOD" "c6 unlisted address")"
+  OUTN="$( ( cd "$SEED" && "$GUARD" "$PREV..$CN" ) 2>&1 )" && RCN=0 || RCN=$?
+  if [ "$RCN" -ne 0 ] && grep -Fq "$NOPE" <<<"$OUTN" && grep -Fq "${CN:0:7}" <<<"$OUTN"; then
+    ok "unlisted $NOPE still blocks, named with ${CN:0:7} (exit $RCN)"
+  else
+    bad "unlisted $NOPE must block and be named with ${CN:0:7} (exit $RCN)"
+  fi
+  PREV="$CN"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo
+echo "9. ALLOWLIST PARITY (this helper and bin/heimdall-selfscan hard-code ONE list):"
+SELFSCAN="$REPO/bin/heimdall-selfscan"
+[ -f "$SELFSCAN" ] || { echo "FATAL: heimdall-selfscan not found at $SELFSCAN"; exit 2; }
+# Both gates hard-code the allowlist on purpose (a configurable one is an escape hatch),
+# so this proof is all that stops them drifting. Drift is a push that is green at one
+# layer and red at the next: the pre-push range check admits an identity the
+# full-history sweep then blocks, or the reverse.
+allowlist_of() { # allowlist_of <script> -> its ALLOWED_IDENTITIES literal, one email per line, sorted
+  sed -n '/^ALLOWED_IDENTITIES="/,/"$/{s/^ALLOWED_IDENTITIES="//;s/"$//;p;}' "$1" | sort
+}
+GUARD_LIST="$(allowlist_of "$GUARD")"
+SCAN_LIST="$(allowlist_of "$SELFSCAN")"
+# ANTI-VACUOUS: two empty or garbled extractions would compare equal. Both must be
+# non-empty and every line must be a bare email.
+SHAPE_OK=1
+for L in "$GUARD_LIST" "$SCAN_LIST"; do
+  [ -n "$L" ] || SHAPE_OK=0
+  while IFS= read -r E; do
+    grep -Eq '^[^[:space:]@"]+@[^[:space:]@"]+$' <<<"$E" || SHAPE_OK=0
+  done <<<"$L"
+done
+if [ "$SHAPE_OK" -eq 1 ]; then
+  ok "both literals extracted, every line a bare email (helper: $(printf '%s' "$GUARD_LIST" | tr '\n' ' ') | selfscan: $(printf '%s' "$SCAN_LIST" | tr '\n' ' '))"
+else
+  bad "could not extract a well-formed ALLOWED_IDENTITIES literal from one of the gates — the comparison below would be vacuous"
+fi
+if [ "$GUARD_LIST" = "$SCAN_LIST" ]; then
+  ok "the two allowlists are identical"
+else
+  bad "allowlist DRIFT between heimdall-check-identities and heimdall-selfscan:"
+  diff <(printf '%s\n' "$GUARD_LIST") <(printf '%s\n' "$SCAN_LIST") | sed 's/^/      /'
+fi
+# FALSIFIABLE: one extra address in a copy of selfscan's literal must read as drift.
+DRIFT="$WORK/selfscan.drift"
+awk '{ print } /^ALLOWED_IDENTITIES="/ { print "drift@example.com" }' "$SELFSCAN" > "$DRIFT"
+if [ "$(allowlist_of "$DRIFT")" != "$SCAN_LIST" ]; then
+  ok "falsifier: one extra address in a copy of selfscan's literal is seen as drift"
+else
+  bad "falsifier: the comparison did not notice an extra address — the identical-lists proof is vacuous"
+fi
+# The remediation hint (the git filter-repo callback in the BLOCKED output) lists the
+# allowlist by hand. A stale one would tell the operator to rewrite commits that are
+# allowlisted — so it must name every entry. $OUT2 is the BLOCKED output of proof 2.
+HINT_TUPLE="$(sed -n 's/.*email not in (\(.*\)) else email.*/\1/p' <<<"$OUT2")"
+HINT_MISSING=""
+while IFS= read -r E; do
+  grep -Fq "b\"$E\"" <<<"$HINT_TUPLE" || HINT_MISSING="$HINT_MISSING $E"
+done <<<"$GUARD_LIST"
+if [ -n "$HINT_TUPLE" ] && [ -z "$HINT_MISSING" ]; then
+  ok "the filter-repo remediation hint names every allowlisted address"
+else
+  bad "the filter-repo remediation hint is missing:${HINT_MISSING:- (no hint tuple found in the BLOCKED output)}"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo

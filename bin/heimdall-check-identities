@@ -37,15 +37,17 @@
 #   1  at least one off-allowlist author/committer identity was found
 #   2  not in a git repository / a git command failed hard
 #
-# The allowlist MIRRORS release/ship.sh's ALLOWED_IDENTITIES and
-# bin/heimdall-selfscan's ALLOWED_IDENTITIES. All three must agree; it is kept
-# short and hard-coded on purpose — a configurable allowlist would itself be an
-# escape hatch.
+# The allowlist MIRRORS bin/heimdall-selfscan's ALLOWED_IDENTITIES (release/ship.sh
+# keeps none of its own: its R9 calls this helper). The two must agree — proof 9 of
+# test/heimdall-id-guard.test.sh fails on drift. Short and hard-coded on purpose: a
+# configurable allowlist would itself be an escape hatch.
 
 set -euo pipefail
 
+# rj@superpe.in: imported hmdapp relay history (merge eb5360e4), operator approved 2026-10-03.
 ALLOWED_IDENTITIES="rj@runheimdall.dev
-noreply@anthropic.com"
+noreply@anthropic.com
+rj@superpe.in"
 
 # ── escape hatch (checked first, before any git work) ────────────────────────
 if [ "${HEIMDALL_SKIP_ID_GUARD:-}" = "1" ]; then
@@ -209,7 +211,7 @@ if [ -n "$offenders" ]; then
     echo "  git rebase --continue"
     echo "or rewrite in bulk:"
     echo "  git filter-repo --email-callback \\"
-    echo "    'return b\"rj@runheimdall.dev\" if email not in (b\"rj@runheimdall.dev\", b\"noreply@anthropic.com\") else email'"
+    echo "    'return b\"rj@runheimdall.dev\" if email not in (b\"rj@runheimdall.dev\", b\"noreply@anthropic.com\", b\"rj@superpe.in\") else email'"
     echo ""
     echo "Emergency bypass (verify manually first): HEIMDALL_SKIP_ID_GUARD=1 git push ..."
   } >&2
