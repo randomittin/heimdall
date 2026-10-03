@@ -233,8 +233,11 @@ waits on stop_event, so a shutdown is never delayed by a retry.
 FRAME COMPRESSION AND RESYNC (the FINAL wire of hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md
 Ask 5, section 5; hmdapp's docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with
 it; codec in bin/lib/hmd_relay_e2e.py). Capabilities travel in-band, hmd first: EVERY `state`
-frame's plaintext is `{"state":{...},"caps":["resync","z-zlib"]}` (E2E.hmd_caps()). A phone that
-sees `resync` sends a sealed command `{"action":"resync","params":{"last_seq":N,"digest":"<sha256
+frame's plaintext is `{"state":{...},"caps":["login-v1","push-v1","resync","z-zlib"]}` (E2E.hmd_caps():
+`resync` always, `z-zlib` when this python can compress, and `login-v1` / `push-v1` only while their
+modules loaded -- push-v1 also only unless HMD_PUSH=0; see REMOTE CLAUDE CODE LOGIN and PUSH
+REGISTRATION below). A phone that sees `resync` sends a sealed command
+`{"action":"resync","params":{"last_seq":N,"digest":"<sha256
 hex>","caps":[..]}}`; hmd acks it ok, keeps its `caps` as the phone's capability set (replaced by
 every resync, forgotten on every device_bound), and -- when `digest` is not the digest of the
 state hmd last sent -- forces a full state frame on the next tick, the same re-send device_bound
