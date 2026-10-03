@@ -49,7 +49,16 @@
 #   reads THAT instead of the bundled exit code. The landmine gate — owned by
 #   test/landmine-lint.test.sh — is reported here as a non-scoring NOTE.
 #
-# Six proofs, all runnable, none skippable:
+#   BUG 6 — TREE FINGERPRINT BLINDNESS. The tree pass scanned its scratch copy by
+#   ABSOLUTE path, so gitleaks fingerprinted every finding with the random scratch
+#   directory baked in — a string no committed .gitleaksignore `file:rule:line`
+#   entry can ever equal. A benign finding silenced for the history pass and for a
+#   human's bare `gitleaks detect --no-git` stayed a finding in the one gate that
+#   blocks a push. It surfaced 2026-10-02, when the relay import shipped the repo's
+#   first global entries: history and the bare scan went clean, the tree pass kept
+#   reporting both findings, and every pre-push went red. Proof G fences that.
+#
+# Seven proofs, all runnable, none skippable:
 #
 #   A. PARITY — bare `gitleaks detect --log-opts=--all` over heimdall's history
 #      and heimdall-selfscan's history-SECRET verdict AGREE: both clean. selfscan
@@ -77,6 +86,13 @@
 #   D. ALLOWLIST-IS-NARROW — the shipped .gitleaks.toml must NOT globally disable
 #      any rule; it may only allowlist by PATH/regex. A real secret in a
 #      non-fixture path must still fire.
+#
+#   E./F. TREE-MODE and TREE SCOPE — see their blocks below.
+#
+#   G. TREE FINGERPRINT PARITY — a `file:rule:line` .gitleaksignore entry silences
+#      the tree pass exactly as it silences the history pass and a bare
+#      `gitleaks detect --no-git`, and stays as narrow as the fingerprint it is
+#      (move the line, or use another file, and the finding blocks again).
 #
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 
@@ -519,7 +535,10 @@ else
   # (ii) FALSIFIABILITY — repoint the tree scan at the raw filesystem (pre-fix).
   SMUT="$SCOPE/bin/heimdall-selfscan"
   cp "$SMUT" "$WORK/selfscan.scoped"
-  sed 's|--source "$TREE_TMP"|--source "$HEIMDALL_TOP"|g' "$WORK/selfscan.scoped" > "$SMUT"
+  # The scan root is `--source .` (run from inside the materialised copy — see proof
+  # G); the mutant swaps that one token for the raw repo top, so only WHAT is walked
+  # changes, never how the rest of the gate behaves.
+  sed 's|gitleaks detect --source \. |gitleaks detect --source "$HEIMDALL_TOP" |g' "$WORK/selfscan.scoped" > "$SMUT"
   chmod +x "$SMUT"
   unscoped_rc=0
   ( cd "$SCOPE" && ./bin/heimdall-selfscan ) >"$WORK/f-unscoped.err" 2>&1 || unscoped_rc=$?
@@ -557,6 +576,170 @@ else
     else
       bad "tracked-file secret did NOT block (rc=$tracked_rc) — the scope is too narrow, real secrets now slip"
     fi
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# G. TREE FINGERPRINT PARITY — a `file:rule:line` .gitleaksignore entry must reach
+#    the TREE pass, exactly as it reaches the history pass and a human's bare
+#    `gitleaks detect --no-git` run from the repo top.
+#
+#    The defect this fences: the tree pass materialises the pushable set under a
+#    random scratch directory and used to scan it by that ABSOLUTE path, so
+#    gitleaks stamped each finding with a fingerprint like
+#      /var/folders/.../tmp.AbC123/relay/contract/vectors.json:generic-api-key:7
+#    — a string no committed entry can equal, because the directory name is random
+#    per run. A benign finding silenced for the history pass and for bare gitleaks
+#    therefore stayed a finding in the one gate that blocks a push. It surfaced on
+#    2026-10-02, when the relay import shipped the repo's first global entries:
+#    history and the bare scan went clean, the tree pass kept reporting both
+#    findings, and every pre-push (and the suites that drive it) went red.
+#
+#    Why proofs A-F could not see it: none of them puts a `file:rule:line` entry in
+#    play — E and F plant a secret and expect a BLOCK, the rest scan a tree with no
+#    entries to honour. So this proof manufactures the entry the way a human does:
+#    scan bare, copy the fingerprints gitleaks prints, put them in .gitleaksignore.
+#
+#    It runs against a MINIMAL throwaway heimdall (the real selfscan, the real
+#    .gitleaks.toml, the real linter, one commit, ~200 KB of padding to clear the
+#    anti-vacuous floor) rather than a clone of the real repo, on purpose. The
+#    property is fingerprint matching; a clone would also carry the real repo's own
+#    tree findings and identity history, so a red here could be blamed on something
+#    other than the property under test. It is also ~100x cheaper than scanning a
+#    23 MB tree, which is what makes six gate runs affordable.
+#
+#    A complete truth table for the entry, every row read off the TREE gate's own
+#    verdict (never the bundled exit code):
+#      (i)   BASELINE — no entry: the planted secret IS found (blocked, reason=
+#            finding). Without this, (ii) could be "clean" only because the secret
+#            was never detectable in the first place.
+#      (ii)  HONORED — entry present: the tree pass is clean over a plausible
+#            volume. This is the regression.
+#      (iii) NARROW BY LINE — same file, secret one line down: blocks. An entry is
+#            a fingerprint, not a path allowlist.
+#      (iv)  NARROW BY PATH — same secret, same line, another file: blocks.
+#      (v)   FALSIFIABLE — put back the pre-fix absolute-path scan and the SAME
+#            entry stops working. (ii) is attributable to the scan root.
+#      (vi)  ROUND TRIP — restore the fix: honored again.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "G. TREE FINGERPRINT PARITY (a file:rule:line .gitleaksignore entry must reach the tree pass):"
+if [ -z "$CFG" ]; then
+  bad "G — .gitleaks.toml missing at repo top; the proofs below need the shipped config"
+else
+  MINI="$WORK/mini"
+  FP_FILE="src/fp-leak.js"
+  FP_OTHER="src/fp-other.js"
+  mkdir -p "$MINI/bin" "$MINI/src"
+  cp "$SELFSCAN" "$MINI/bin/heimdall-selfscan"
+  cp "$REPO/bin/heimdall-landmine-lint" "$MINI/bin/heimdall-landmine-lint"
+  cp "$CFG" "$MINI/.gitleaks.toml"
+  chmod +x "$MINI/bin/heimdall-selfscan" "$MINI/bin/heimdall-landmine-lint"
+  # Benign padding: the tree gate refuses a clean verdict over < 100 KB.
+  seq 1 40000 > "$MINI/pad.txt"
+  git -C "$MINI" init -q
+  git -C "$MINI" config user.email "rj@runheimdall.dev"
+  git -C "$MINI" config user.name "RJ"
+  git -C "$MINI" config commit.gpgsign false
+  git -C "$MINI" add -A
+  git -C "$MINI" commit -q --no-verify -m "minimal heimdall for proof G"
+
+  # Run the gate under test inside the minimal repo; evidence goes to $1.
+  g_gate() { ( cd "$MINI" && ./bin/heimdall-selfscan ) >"$1" 2>&1 || true; }
+  # The reason= field off the tree gate's BLOCKED line (empty when it did not block).
+  g_reason() { sed -n 's/^guard: gate=tree-secrets verdict=blocked reason=\([a-z-]*\).*/\1/p' "$1" | tail -1; }
+  # The planted secret: untracked-but-not-ignored, so pushable by the same rule as E(iii).
+  g_plant() { printf 'const stripeKey = "%s";\n' "$sk" > "$MINI/$1"; }
+
+  g_plant "$FP_FILE"
+
+  # Derive the fingerprints exactly as a human would: a bare `--no-git` scan whose
+  # scan root is the directory holding the file, so paths are repo-relative. The
+  # probe holds ONLY that file at the same relative path (milliseconds, not a 23 MB
+  # walk); a repo-top scan reports the identical fingerprint for it.
+  PROBE="$WORK/fp-probe"
+  mkdir -p "$PROBE/src"
+  cp "$MINI/$FP_FILE" "$PROBE/$FP_FILE"
+  ( cd "$PROBE" && gitleaks detect --source . --config "$CFG" --no-git --no-banner --no-color \
+      --report-format json --report-path "$WORK/fp-probe.json" ) >/dev/null 2>&1 || true
+  FP_ENTRIES="$( [ -f "$WORK/fp-probe.json" ] && sed -n 's/^[[:space:]]*"Fingerprint": *"\([^"]*\)".*/\1/p' "$WORK/fp-probe.json" | sort -u )"
+  FP_N="$(printf '%s\n' "$FP_ENTRIES" | sed '/^$/d' | wc -l | tr -d ' ')"
+  FP_SHAPED="$(printf '%s\n' "$FP_ENTRIES" | grep -Ec "^src/fp-leak\.js:[A-Za-z0-9_-]+:1$" || true)"
+  if [ "$FP_N" -ge 1 ] && [ "$FP_SHAPED" = "$FP_N" ]; then
+    ok "premise: a bare --no-git scan fingerprints the planted line repo-relative ($FP_N entr$( [ "$FP_N" = 1 ] && echo y || echo ies), e.g. $(printf '%s\n' "$FP_ENTRIES" | sed -n 1p))"
+  else
+    bad "premise broken — bare --no-git scan gave $FP_N fingerprint(s), $FP_SHAPED repo-relative; the rows below would prove nothing"
+  fi
+
+  # (i) BASELINE — no entry: the tree pass must find the planted secret.
+  g_gate "$WORK/g-base.err"
+  g_base="$(gate_verdict "$WORK/g-base.err" tree-secrets)"
+  if [ "$g_base" = "blocked" ] && [ "$(g_reason "$WORK/g-base.err")" = "finding" ]; then
+    ok "baseline: with no entry the tree pass finds the planted secret (blocked, reason=finding)"
+  else
+    bad "baseline: tree pass returned '${g_base:-no verdict emitted}' (reason='$(g_reason "$WORK/g-base.err")') on a planted secret — a later 'clean' would be vacuous"
+  fi
+
+  # (ii) HONORED — the entries a human would commit.
+  { printf '# proof G: the planted benign finding, as bare gitleaks fingerprints it\n'
+    printf '%s\n' "$FP_ENTRIES"; } > "$MINI/.gitleaksignore"
+  g_gate "$WORK/g-honored.err"
+  g_hon="$(gate_verdict "$WORK/g-honored.err" tree-secrets)"
+  g_hon_b="$(gate_field "$WORK/g-honored.err" tree-secrets bytes)"
+  if [ "$g_hon" = "clean" ] && [ -n "$g_hon_b" ] && [ "$g_hon_b" -gt 100000 ]; then
+    ok "a file:rule:line entry silences the tree pass (verdict=clean over ${g_hon_b} bytes) — parity with the history pass and bare gitleaks"
+  else
+    bad "tree pass returned '${g_hon:-no verdict emitted}' (reason='$(g_reason "$WORK/g-honored.err")', bytes=${g_hon_b:-none}) with the entry in place — the scan root bakes the scratch dir into the fingerprint, so no committed entry can match"
+  fi
+
+  # (iii) NARROW BY LINE — the same secret one line down is a different fingerprint.
+  { printf '// moved down one line\n'; printf 'const stripeKey = "%s";\n' "$sk"; } > "$MINI/$FP_FILE"
+  g_gate "$WORK/g-shift.err"
+  g_shift="$(gate_verdict "$WORK/g-shift.err" tree-secrets)"
+  if [ "$g_shift" = "blocked" ] && [ "$(g_reason "$WORK/g-shift.err")" = "finding" ]; then
+    ok "narrow by line: the same secret one line down still blocks — an entry is a fingerprint, not a path allowlist"
+  else
+    bad "narrow by line: tree pass returned '${g_shift:-no verdict emitted}' for a moved secret — the entry silenced more than its own line"
+  fi
+
+  # (iv) NARROW BY PATH — same secret, same line number, a file the entry does not name.
+  g_plant "$FP_FILE"
+  g_plant "$FP_OTHER"
+  g_gate "$WORK/g-other.err"
+  g_other="$(gate_verdict "$WORK/g-other.err" tree-secrets)"
+  if [ "$g_other" = "blocked" ] && [ "$(g_reason "$WORK/g-other.err")" = "finding" ]; then
+    ok "narrow by path: the same secret at line 1 of another file still blocks"
+  else
+    bad "narrow by path: tree pass returned '${g_other:-no verdict emitted}' for an un-named file — the entry silenced more than its own file"
+  fi
+  rm -f "$MINI/$FP_OTHER"
+
+  # (v) FALSIFIABLE — restore the pre-fix absolute-path scan; the SAME entry must stop working.
+  cp "$MINI/bin/heimdall-selfscan" "$WORK/selfscan.fp-fixed"
+  sed 's|cd "$TREE_TMP" && gitleaks detect --source \. |gitleaks detect --source "$TREE_TMP" |g' \
+    "$WORK/selfscan.fp-fixed" > "$MINI/bin/heimdall-selfscan"
+  chmod +x "$MINI/bin/heimdall-selfscan"
+  if cmp -s "$WORK/selfscan.fp-fixed" "$MINI/bin/heimdall-selfscan"; then
+    bad "falsifier: the pre-fix mutation did not change the gate (the scan-root line moved?) — the RED below would prove nothing"
+  else
+    ok "falsifier: the pre-fix mutation really changed the gate (absolute scratch path restored)"
+  fi
+  g_gate "$WORK/g-mut.err"
+  g_mut="$(gate_verdict "$WORK/g-mut.err" tree-secrets)"
+  if [ "$g_mut" = "blocked" ] && [ "$(g_reason "$WORK/g-mut.err")" = "finding" ]; then
+    ok "WITHOUT the relative scan root the same entry no longer matches (blocked, reason=finding) — the fix earns its place"
+  else
+    bad "falsifier: pre-fix absolute-path gate returned '${g_mut:-no verdict emitted}' — (ii) is not attributable to the scan root"
+  fi
+
+  # (vi) ROUND TRIP — put the fix back; honored again.
+  cp "$WORK/selfscan.fp-fixed" "$MINI/bin/heimdall-selfscan"
+  chmod +x "$MINI/bin/heimdall-selfscan"
+  g_gate "$WORK/g-restored.err"
+  g_rest="$(gate_verdict "$WORK/g-restored.err" tree-secrets)"
+  if [ "$g_rest" = "clean" ]; then
+    ok "restoring the relative scan root honors the entry again (verdict=clean) — RED->GREEN round trip closed"
+  else
+    bad "restored gate returned '${g_rest:-no verdict emitted}' — the restore did not take, or the entry stopped matching"
   fi
 fi
 

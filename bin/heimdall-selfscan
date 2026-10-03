@@ -18,6 +18,11 @@
 #      purpose: a raw filesystem walk also reads .gitignored paths (the
 #      developer's own .heimdall/team.json, stale agent worktrees), which no push
 #      can carry, and blocking on those would train everyone to disable the gate.
+#      Scanned from inside a scratch copy of that set with a RELATIVE source, so
+#      finding paths — and the `file:rule:line` fingerprints a .gitleaksignore
+#      entry is written against — are repo-relative, as in the history pass and a
+#      bare `gitleaks detect --no-git`; an absolute scratch path would bake a random
+#      directory into every fingerprint and no entry could ever match.
 #      Includes an anti-vacuous floor: a clean verdict over ~0 bytes is refused,
 #      because a gate that read nothing certifies nothing.
 #   2. IDENTITIES — the author AND committer email of every commit on every ref
@@ -313,12 +318,27 @@ if [ "$MAT_RC" -ne 0 ]; then
   exit 1
 fi
 
+# Scan from INSIDE the copy with a RELATIVE source — never by its absolute scratch
+# path. gitleaks fingerprints a --no-git finding as `<path as walked>:<rule>:<line>`.
+# Walked by absolute path that is
+#   /var/folders/.../tmp.AbC123/relay/contract/vectors.json:generic-api-key:7
+# and the directory name is random per run, so no committed .gitleaksignore entry
+# could ever equal it: a benign finding silenced for the history pass and for a
+# human's bare `gitleaks detect --no-git` stayed a finding in the one gate that
+# blocks a push (2026-10-02, the relay import's first global entries). Walked from
+# `.` it is `relay/contract/vectors.json:generic-api-key:7` — the repo-relative form
+# a bare scan at the repo top prints and the form a `file:rule:line` entry uses.
+# What is silenced is exactly what a reviewed, line-pinned entry names, as in the
+# history pass. The scope is unchanged: the copy IS the pushable set, and the
+# committed .gitleaksignore is in it (tracked), so the entries it carries are the
+# ones in force. The `cd` is inside the command substitution, so this script's own
+# working directory is untouched. test/selfscan.test.sh proof G holds all of this.
 TREE_OUT=""
 TREE_RC=0
 if [ -f "$GL_CONFIG" ]; then
-  TREE_OUT=$(gitleaks detect --source "$TREE_TMP" --config "$GL_CONFIG" --no-git --no-banner --no-color 2>&1) && TREE_RC=0 || TREE_RC=$?
+  TREE_OUT=$(cd "$TREE_TMP" && gitleaks detect --source . --config "$GL_CONFIG" --no-git --no-banner --no-color 2>&1) && TREE_RC=0 || TREE_RC=$?
 else
-  TREE_OUT=$(gitleaks detect --source "$TREE_TMP" --no-git --no-banner --no-color 2>&1) && TREE_RC=0 || TREE_RC=$?
+  TREE_OUT=$(cd "$TREE_TMP" && gitleaks detect --source . --no-git --no-banner --no-color 2>&1) && TREE_RC=0 || TREE_RC=$?
 fi
 
 TREE_BYTES="$(selfscan_scanned_bytes "$TREE_OUT")"

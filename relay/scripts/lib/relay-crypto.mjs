@@ -1,5 +1,5 @@
 // Byte-exact plain-Node port of src/relay/crypto.ts (X25519 ECDH, HKDF-SHA256
-// session-key derivation, ChaCha20-Poly1305 seal/open with a deterministic
+// session-key derivation; ChaCha20-Poly1305 seal/open with a deterministic
 // seq-derived nonce). Same constants, same function signatures, same
 // @noble/* primitives -- verified against the same shared golden vector
 // (src/relay/__tests__/fixtures/vectors.json) in
