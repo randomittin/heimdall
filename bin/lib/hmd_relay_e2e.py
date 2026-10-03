@@ -60,7 +60,7 @@ these by name):
   nonce_for_seq(seq: int, sender: str) -> bytes[12]
   seal(key, seq, sender, plaintext: bytes, aad: bytes = b"") -> (nonce_b64, ciphertext_b64)
   open_(key, seq, sender, nonce_b64, ciphertext_b64, aad: bytes = b"") -> bytes
-  hmd_caps() -> list[str]
+  hmd_caps(extra=()) -> list[str]
   normalize_caps(value) -> frozenset[str]
   compress_envelope(plaintext: bytes) -> bytes
   pack_plaintext(plaintext: bytes, caps, min_bytes: int = COMPRESS_MIN_BYTES) -> bytes

@@ -1196,14 +1196,9 @@ def _last_result(repo, env):
             ago = ""
             with contextlib.suppress(ValueError, KeyError, TypeError, OverflowError):
                 stamp = time.strptime(row["ts"][:19], "%Y-%m-%dT%H:%M:%S")
-                ago = " %s ago" % _age(max(0, int(time.time() - calendar_timegm(stamp))))
+                ago = " %s ago" % _age(max(0, int(time.time() - calendar.timegm(stamp))))
             return ("ok" if row.get("ok") else "failed (%s)" % row.get("detail")) + ago
     return "none"
-
-
-def calendar_timegm(struct_time):
-    import calendar
-    return calendar.timegm(struct_time)
 
 
 def main(argv=None, out=None, env=None):
@@ -1243,10 +1238,12 @@ def main(argv=None, out=None, env=None):
     return 2
 
 
-def _signed_in(mgr):
+def _probe(mgr):
+    """(claude path or None, `auth status` result or None, the signed-in status JSON or None)."""
     claude = mgr.which_claude()
     result = mgr.auth_status(claude) if claude else None
-    return claude, (result["json"] if result is not None and result["rc"] == 0 else None)
+    signed_in = result["json"] if result is not None and result["rc"] == 0 else None
+    return claude, result, signed_in
 
 
 def _cli_on(mgr, home, pin_next, out):
@@ -1254,11 +1251,14 @@ def _cli_on(mgr, home, pin_next, out):
         write_config(home, True, pin=None, pin_next=True)
         out.write("remote login: on (the next successful remote login will set the pin)\n")
         return 0
-    claude, status = _signed_in(mgr)
+    claude, result, status = _probe(mgr)
     if not claude:
         out.write("remote login: not enabled -- `claude` is not on PATH, so there is no account to pin\n")
         return 1
-    if status is not None and _is_overridden(status):
+    if result is None or result["json"] is None:
+        out.write("remote login: not enabled -- `claude auth status` gave no answer\n")
+        return 1
+    if _is_overridden(result["json"]):
         out.write("remote login: not enabled -- Claude Code here uses a key or token from its environment, "
                   "which outranks a login\n")
         return 1
@@ -1274,7 +1274,7 @@ def _cli_on(mgr, home, pin_next, out):
 
 def _cli_status(mgr, home, repo, env, out):
     cfg = read_config(home)
-    claude, status = _signed_in(mgr)
+    claude, result, status = _probe(mgr)
     account = mask_account(status.get("email")) if status else None
     out.write("remote login: %s\n" % ("on" if mgr.enabled() else "off"))
     if cfg["pin"] is not None:
@@ -1286,6 +1286,8 @@ def _cli_status(mgr, home, repo, env, out):
         out.write("pin: none\n")
     if not claude:
         out.write("claude: not found on PATH\n")
+    elif result is None or result["json"] is None:
+        out.write("claude: `auth status` gave no answer\n")
     elif status is None:
         out.write("claude: signed out\n")
     else:

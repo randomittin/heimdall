@@ -481,11 +481,9 @@ w = World()
 rig = Rig(w)
 rid = rig.cmd("login_start", {"kind": "claudeai"})["id"]
 wait_for(lambda: rig.mgr.snapshot()["request"], what="the authorize URL")
-for junk in (w.code, w.full + "\r", "abc#def", w.code + "#", "#" + w.state, w.code + " " + w.state, w.full + "#" + w.state,
-             w.code + "\x1b[31m#" + w.state, "", None, 12345, ["a"], {"c": 1}):
+for junk in (w.code, "abc#def", w.code + "#", "#" + w.state, w.code + " " + w.state, w.code + "\r#" + w.state,
+             w.full + "#" + w.state, w.code + "\x1b[31m#" + w.state, "", None, 12345, ["a"], {"c": 1}):
     ack = rig.cmd("login_code", {"id": rid, "code": junk})
-    if isinstance(junk, str) and junk.rstrip(" \t\r\n") == w.full:
-        continue  # that one is fine after trimming; it is checked below
     assert ack == {"ok": False, "of_seq": ack["of_seq"], "detail": "bad-code"}, (junk, ack)
 assert rig.mgr.snapshot()["request"]["phase"] == "awaiting-code", "a refused code must not move the request on"
 assert w.logins() and len(w.logins()) == 1
@@ -641,10 +639,10 @@ for _ in range(3):
 assert len(w.logins()) == 3
 assert refused(mgr.start, "claudeai") == "rate-limited"
 assert len(w.logins()) == 3
-later = [time.time() + 601]
-fast = w.manager(now=lambda: later[0])
-assert fast.start("claudeai")["id"], "the window slides: a start after 600 s is allowed again"
-fast.shutdown("superseded")
+mgr.now = lambda: time.time() + 601
+assert mgr.start("claudeai")["id"], "the window slides: a start 601 s after the first three is allowed again"
+assert len(w.logins()) == 4
+mgr.shutdown("superseded")
 assert w.gone()
 PYEOF
 
@@ -810,7 +808,7 @@ wait_for(lambda: w.pid("child.pid"), what="the orphan to be up")
 os.makedirs(w.hh, exist_ok=True)
 with open(os.path.join(w.hh, "cc-login.pid"), "w") as f:
     json.dump({"pid": orphan.pid, "started_at": int(time.time())}, f)
-assert w.manager().sweep_orphan() is True
+assert w.manager(term_grace_s=0.5).sweep_orphan() is True  # (the test is the orphan's parent, so it lingers as a zombie)
 assert orphan.wait(timeout=10) is not None, "the orphan must be dead"
 wait_for(lambda: not group_alive(orphan.pid), what="the orphan's group")
 assert not os.path.exists(os.path.join(w.hh, "cc-login.pid"))
