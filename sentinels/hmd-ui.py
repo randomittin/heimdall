@@ -919,6 +919,46 @@ def publish_companion_panels(publisher):
         return False
 
 
+# Phone push notifications (bin/lib/companion_push.py, the SENDING half; spec: hmdapp's
+# docs/HANDOFF-TO-HEIMDALL-push-notifications.md). The monitor sees every state this cache collects,
+# plans transitions (question / approval / error / gate red / finished) in a few dict lookups and hands
+# the rest -- store, policy, HTTPS to Expo -- to its own worker thread, so the poller and the warmer
+# never wait on it. One sender per repo is the monitor's own flock, not this file's business: a second
+# process (the relay client builds a StateCache too) simply stays quiet. HMD_PUSH=0 switches it off.
+PUSH = _load_module("companion_push", os.path.join(LIB_DIR, "companion_push.py"))
+
+
+def _push_event(event):
+    """The monitor's log sink here: one compact JSON line on stderr -- never a token, title, body or ref
+    (see the module's LOGGING contract)."""
+    sys.stderr.write("hmd-ui: push %s\n" % json.dumps(event, sort_keys=True, separators=(",", ":")))
+
+
+def new_push_monitor(root):
+    if PUSH is None or not PUSH.enabled():
+        return None
+    return PUSH.PushMonitor(root, emit=_push_event)
+
+
+def observe_push(monitor, state):
+    """Hand one collected state to the push monitor. Never raises: a push fault costs a notification, never a poll."""
+    if monitor is None:
+        return
+    try:
+        monitor.observe(state)
+    except Exception as e:
+        sys.stderr.write("hmd-ui: push observe: %s\n" % e.__class__.__name__)
+
+
+def close_push(monitor):
+    if monitor is None:
+        return
+    try:
+        monitor.close()
+    except Exception as e:
+        sys.stderr.write("hmd-ui: push close: %s\n" % e.__class__.__name__)
+
+
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 # N4: a path TOKEN -- '/' or '~/' at the start of the string or right after
@@ -1195,6 +1235,7 @@ class StateCache:
         self._warmed = threading.Event()   # set by the warmer: the slow answers are fresh, a pass is due
         self._live_users = None   # (value, written_at) of the self-published panel
         self._companion = new_companion_publisher(root)   # A3: chat / hmd-question / agents
+        self._push = new_push_monitor(root)               # phone push: transitions -> Expo, on its own thread
 
     def refresh(self, publish=False, partial=False):
         """Collect, publish (state, digest), and wake wait_for_change() waiters if the digest moved.
@@ -1236,6 +1277,7 @@ class StateCache:
             if digest != self._digest:
                 self._digest = digest
                 self._cond.notify_all()
+        observe_push(self._push, state)   # after the waiters are woken: a push never delays a frame
         return state, digest
 
     def _fresh_locked(self):
@@ -1333,6 +1375,7 @@ class StateCache:
 
     def stop(self):
         self._stop.set()
+        close_push(self._push)
 
 
 # ── HTTP layer ────────────────────────────────────────────────────────────────
@@ -1754,6 +1797,9 @@ def print_sources(root):
         print("file %s" % os.path.join(os.environ.get("TMPDIR") or "/tmp", rel))
     if COMPANION is not None:
         for path in COMPANION.source_paths(root):
+            print("file %s" % path)
+    if PUSH is not None:
+        for path in PUSH.source_paths(root):
             print("file %s" % path)
     claude_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
     for rel in SOURCE_CLAUDE_FILES:
