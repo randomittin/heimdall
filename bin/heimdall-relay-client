@@ -1131,6 +1131,80 @@ class RelayClient:
             self._rearm_state()
         return True, None
 
+    # -- remote Claude Code login (login-v1) ----------------------------------------------------------
+    # hmdapp's docs/HANDOFF-TO-HEIMDALL-remote-cc-login.md. bin/lib/companion_cc_login.py owns the login
+    # (the PTY, the URL allowlist, the account pin); this is only its wire: three sealed commands, the
+    # state.login slice of the state frame, and the capability token.
+    def _login_manager(self):
+        """The one LoginManager of this client, created on first use: nothing is read or spawned before."""
+        if self._login is None:
+            self._login = LOGIN.LoginManager(LOGIN.heimdall_home(), dict(os.environ),
+                                             emit=lambda obj: emit(obj), on_change=self._rearm_state)
+        return self._login
+
+    def _feature_caps(self):
+        """Capability tokens of the optional features whose modules loaded (added to the codec's own)."""
+        return [E2E.CAP_LOGIN] if LOGIN is not None else []
+
+    def _login_command(self, action, params):
+        """The phone's sealed login commands (spec 4.3):
+            {"action":"login_start","params":{"kind":"claudeai"|"console"}}
+                ack ok  {"ok":true,"of_seq":N,"id":"l-<8 hex>"[,"dup":true]}
+            {"action":"login_code","params":{"id":..,"code":"<CODE#STATE>"}}
+                ack ok  {"ok":true,"of_seq":N,"id":..,"phase":"verifying"}
+            {"action":"login_cancel","params":{"id":..}}
+                ack ok  {"ok":true,"of_seq":N,"id":..}  (unknown or finished id: ok + detail "unchanged")
+            ack no      {"ok":false,"of_seq":N,"detail":<LoginError.code>}
+        The final outcome is never in an ack (the exchange takes seconds): it arrives in state.login.result.
+        The code is a secret: it goes from `params` straight to the manager -- never logged, evented, stored
+        or echoed, and no error text here ever includes it (only exception TYPE names are reported)."""
+        fields = params if isinstance(params, dict) else {}
+        has_cap = LOGIN.CAP_LOGIN in self.device_caps
+        try:
+            manager = self._login_manager()
+            if action == "login_start":
+                result = manager.start(fields.get("kind"), caps_ok=has_cap)
+            elif not has_cap:
+                return False, "caps-missing", {}
+            elif action == "login_code":
+                result = manager.submit_code(fields.get("id"), fields.get("code"))
+            else:
+                result = manager.cancel(fields.get("id"))
+        except LOGIN.LoginError as e:
+            return False, e.code, {}
+        except Exception as e:  # the type only: a message could hold what the phone sent
+            emit({"event": "error", "detail": "login command failed: %s" % type(e).__name__})
+            return False, "internal-error", {}
+        detail = result.pop("detail", None)
+        return True, detail, result
+
+    def _login_overlay(self, state):
+        """`state` plus state.login for a phone that listed login-v1 -- as a copy, because `state` is the
+        StateCache's own shared object. Applied before the seal, so last_sent_state (what a resync digest is
+        compared with) is exactly what the phone holds."""
+        if LOGIN is None or LOGIN.CAP_LOGIN not in self.device_caps:
+            return state
+        try:
+            return dict(state, login=self._login_manager().snapshot())
+        except Exception as e:
+            emit({"event": "error", "detail": "state.login skipped: %s" % type(e).__name__})
+            return state
+
+    def _login_shutdown(self):
+        """The live login (if any) ends `superseded` and its process group is killed."""
+        if self._login is not None:
+            self._login.shutdown("superseded")
+
+    def login_startup(self):
+        """At start: kill a `claude auth login` an earlier client left behind, then run the probe loop on a
+        thread of its own (it does nothing while remote login is switched off at the laptop)."""
+        if LOGIN is None:
+            return
+        manager = self._login_manager()
+        manager.sweep_orphan()
+        threading.Thread(target=manager.run_probe_loop, args=(self.stop_event,), name="login-probe",
+                         daemon=True).start()
+
     def _handle_command(self, env):
         # The phone's ack window opened before this command reached us; retries
         # of its ack may only START inside what is left of it (ACK_WINDOW_S).
@@ -1177,10 +1251,13 @@ class RelayClient:
                     ok, detail = False, "write-failed"
         elif action == "decide":
             ok, detail, extra = self._decide(params)
+        elif LOGIN is not None and action in LOGIN.ACTIONS:
+            ok, detail, extra = self._login_command(action, params)
         elif action == "resync":
             ok, detail = self._resync(params)
         else:
             ok, detail = False, "not-implemented"
+        # action/ok/detail only, never `params`: a login_code command carries the login code (a secret)
         emit({"event": "command", "action": action, "ok": ok, "detail": detail})
         ack_payload = {"ok": ok, "of_seq": seq}
         if detail is not None:
@@ -1386,7 +1463,7 @@ class RelayClient:
         if digest == self.last_sent_digest:
             return
         rearm_gen = self._rearm_gen
-        seq, delivered = self.send_hmd_frame("state", {"state": state})
+        seq, delivered = self.send_hmd_frame("state", {"state": self._login_overlay(state)})
         if delivered is None:
             # No usable answer: the frame never reached the phone. last_sent_digest
             # stays as it was, so the next tick sends the (then current) state again
@@ -1452,6 +1529,7 @@ class RelayClient:
             return
         self._stopping = True
         self.stop_event.set()
+        self._login_shutdown()  # before the (network-bound) revoke: a login process must not outlive us
         self.revoke()
         self.write_status()
         emit({"event": "session_ended", "reason": reason})
@@ -1527,7 +1605,9 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    stream_thread = threading.Thread(target=client._stream_loop, name="relay-stream", daemon=True)
+    client.login_startup()
+
+    stream_thread =threading.Thread(target=client._stream_loop, name="relay-stream", daemon=True)
     stream_thread.start()
 
     client.run_state_loop()
