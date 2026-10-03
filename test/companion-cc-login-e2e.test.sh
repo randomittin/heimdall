@@ -619,8 +619,10 @@ w = World(mode="hang")
 mgr = w.manager()
 first = mgr.start("claudeai")
 assert set(first) == {"id"} and re.fullmatch(r"l-[0-9a-f]{8}", first["id"]), first
+wait_for(lambda: w.logins(), what="the CLI to start")
 dup = mgr.start("claudeai")
 assert dup == {"id": first["id"], "dup": True}, dup
+time.sleep(0.5)
 assert len(w.logins()) == 1, "a duplicate start must not spawn a second CLI"
 assert refused(mgr.start, "console") == "busy"
 other_root = w.manager()  # a second relay client (another repo root) on the same machine, same HEIMDALL_HOME
@@ -631,7 +633,8 @@ res = wait_for(lambda: result_of(mgr), what="the cancel")
 assert res["detail"] == "cancelled" and res["ok"] is False, res
 assert w.gone()
 again = other_root.start("claudeai")  # the flock went with the first login
-assert again["id"] != first["id"] and len(w.logins()) == 2
+assert again["id"] != first["id"]
+wait_for(lambda: len(w.logins()) == 2, what="the second CLI")
 other_root.shutdown("superseded")
 assert w.gone()
 PYEOF
@@ -640,15 +643,16 @@ py_case 14 "rate limit: 3 starts per 600 s, the 4th is rate-limited and spawns n
 w = World(mode="hang")
 mgr = w.manager()
 for _ in range(3):
-    rid = mgr.start("claudeai")["id"]
+    rid, _req = started(mgr)
     mgr.cancel(rid)
     wait_for(lambda: request_of(mgr) is None and result_of(mgr) and result_of(mgr)["id"] == rid, what="the cancel")
 assert len(w.logins()) == 3
 assert refused(mgr.start, "claudeai") == "rate-limited"
-assert len(w.logins()) == 3
+time.sleep(0.5)
+assert len(w.logins()) == 3, "a rate-limited start must not spawn anything"
 mgr.now = lambda: time.time() + 601
 assert mgr.start("claudeai")["id"], "the window slides: a start 601 s after the first three is allowed again"
-assert len(w.logins()) == 4
+wait_for(lambda: len(w.logins()) == 4, what="the fourth CLI")
 mgr.shutdown("superseded")
 assert w.gone()
 PYEOF
