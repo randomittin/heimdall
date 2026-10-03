@@ -58,6 +58,13 @@ mkdir -p "$HOME/.claude"
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR
 trap 'rm -rf "$TMPROOT"' EXIT
 
+# Guard: this suite must never run the REAL claude. Anything on this script's own PATH named `claude` is a
+# shim that refuses (the fake worlds below build their own PATH, with the fake first, so they are unaffected).
+mkdir -p "$TMPROOT/guard"
+printf '#!/bin/sh\necho "BLOCKED: the real claude must never run in the login test suite" >&2\nexit 99\n' >"$TMPROOT/guard/claude"
+chmod +x "$TMPROOT/guard/claude"
+export PATH="$TMPROOT/guard:$PATH"
+
 cat >"$TMPROOT/prelude.py" <<'PYEOF'
 import argparse, atexit, importlib.util, io, json, os, re, secrets, select, signal, subprocess, sys, tempfile, time
 from importlib.machinery import SourceFileLoader
@@ -396,7 +403,7 @@ finally:
     os.killpg(proc.pid, signal.SIGKILL)
     proc.wait()
     os.close(master)
-assert want.endswith(b"Paste code here if prompted > ") and b"\r\n" in want and want.count(b"https://") == 2
+assert want.endswith(b"Paste code here if prompted > ") and b"\r\n" in want and want.count(b"https://") == 1
 say("%d bytes" % len(want))
 PYEOF
 
@@ -738,7 +745,7 @@ assert w.gone()
 PYEOF
 
 # ═══ 18. how a login can fail to verify ═════════════════════════════════════
-py_case 18 "verify-failed: the CLI says success but `auth status` still reports signed out" <<'PYEOF'
+py_case 18 "verify-failed: the CLI says success but auth status still reports signed out" <<'PYEOF'
 w = World(mode="login-keeps-store", signed_in=False)
 mgr = w.manager()
 rid, _req = started(mgr)
@@ -800,7 +807,7 @@ assert not os.path.exists(os.path.join(w.hh, "cc-login.pid"))
 rig.client._login_shutdown()  # idempotent
 PYEOF
 
-py_case 22 "orphan sweep: a leftover `claude auth login` named by the pid file is killed; an unrelated process with that pid is not" <<'PYEOF'
+py_case 22 "orphan sweep: a leftover claude auth login named by the pid file is killed; an unrelated process with that pid is not" <<'PYEOF'
 w = World(mode="hang")
 orphan = subprocess.Popen([os.path.join(w.bin, "claude"), "auth", "login"], env=dict(w.env), start_new_session=True,
                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

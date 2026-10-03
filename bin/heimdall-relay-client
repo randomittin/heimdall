@@ -143,6 +143,11 @@ to drive its own UI; nothing else is ever written to stdout.
     {"event":"error","detail":..}                     non-fatal unless followed
                                                        by one of the two exit
                                                        paths below
+    {"event":"login","phase":"start"|"code"|"result","id":..|null,"ok":bool,"detail":..|null}
+        remote Claude Code login (login-v1, bin/lib/companion_cc_login.py): one line per start
+        attempt (id null, ok false and the refusal as detail when refused), per code submitted
+        (ok false + detail when refused) and per result (ok, detail one of the spec's closed
+        result.detail strings). Nothing but these fields: never the URL, the code or an account
 
 Never printed, logged, or written to disk: `relay_session_token`, the derived
 session key, either private key, or any command/state plaintext.
@@ -232,6 +237,15 @@ default and the fallback: no resync yet, a frame under E2E.COMPRESS_MIN_BYTES, o
 would not shrink, `ack` frames (never compressed), a python without zlib. Only a sealed command
 that opened under the session key can set the phone's capabilities -- never the relay's
 unencrypted `device_bound`.
+
+REMOTE CLAUDE CODE LOGIN (capability `login-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-remote-cc-login.md):
+`caps` also lists `login-v1` whenever bin/lib/companion_cc_login.py imported. A phone that lists it in its
+resync gets `state.login` ({enabled, cc, request, result}, sealed with the rest of the state) and may send
+the sealed commands `login_start` {kind}, `login_code` {id, code} and `login_cancel` {id}; each ack carries
+the manager's refusal code in `detail` (see _login_command). Off by default: the operator enables it at
+the laptop with `hmd app remote-login on`. The login code exists only inside the sealed command and one
+write to a PTY; the `command` event never carries params and the `login` event never carries the URL,
+the code or an account.
 
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
