@@ -63,6 +63,18 @@
 #                              mode), the tailscale-specific checks are
 #                              skipped and a relay-reachability check runs
 #                              instead.
+#   hmd app remote-login on [--pin-next] | off | status [--repo DIR]
+#                              Remote Claude Code login from the paired phone
+#                              (capability login-v1). Off by default. `on` needs
+#                              Claude Code signed in on this laptop and pins that
+#                              account: the phone can sign the laptop in again,
+#                              never into another account. With --pin-next the
+#                              first successful remote login sets the pin
+#                              instead. `off` switches it off and clears the pin.
+#                              `status` prints the switch, the pin, the account
+#                              signed in now (masked), its config directory and
+#                              the last result. Delegates to
+#                              bin/lib/companion_cc_login.py.
 #   hmd app -h|--help          This help.
 #
 # Exit codes (connect): 64 bad --https-port, 4 tailscale not installed
@@ -1094,6 +1106,14 @@ cmd_status_relay() {
   return 0
 }
 
+cmd_remote_login() {
+  if [ -z "$PY3" ]; then
+    echo "hmd app remote-login: python3 not found (set HMD_PYTHON=/path/to/python3)" >&2
+    return 2
+  fi
+  "$PY3" "$LIB_DIR/companion_cc_login.py" "$@"
+}
+
 cmd_disconnect() {
   local REPO=""
   while [ $# -gt 0 ]; do
@@ -1479,6 +1499,7 @@ case "$CMD" in
   status) cmd_status "$@"; exit $? ;;
   disconnect) cmd_disconnect "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;
+  remote-login) cmd_remote_login "$@"; exit $? ;;
   *)
     echo "hmd app: unknown subcommand: $CMD" >&2
     usage >&2

@@ -982,7 +982,8 @@ assert w.calls() == [], "no `claude auth status` while remote login is off"
 m.write_config(w.hh, True, pin=w.owner_fp)
 wait_for(lambda: any(c.startswith("status ") for c in w.calls()), what="the first probe after enabling")
 wait_for(lambda: changes, what="on_change after the flip")
-assert mgr.snapshot()["enabled"] is True and mgr.snapshot()["cc"]["status"] == "ok"
+wait_for(lambda: mgr.snapshot()["cc"]["status"] == "ok", what="cc from the probe's answer")
+assert mgr.snapshot()["enabled"] is True
 n = len(changes)
 m.write_config(w.hh, False)
 wait_for(lambda: len(changes) > n and mgr.snapshot()["enabled"] is False, what="the off flip to be noticed")

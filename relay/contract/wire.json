@@ -8,7 +8,7 @@
     "$name in a string is a binding (see `bindings`). A value the relay mints (ids, codes, tokens, clocks) is matched by pattern when the relay is the producer, and takes its example when a client is fed it. A `computed` binding is derived from vectors.json by each consumer, so no key ever sits in this file.",
     "Everything a client or the phone sends is replayed byte for byte: JSON is serialized compact with the key order stored here.",
     "Sealed frames in `frames` are sealed under the session key HKDF(ECDH(hmdSeedHex, phnSeedHex)) with salt = bindings.session_id.example, sender tags hmd\\0 / phn\\0, nonce = tag + seq (8 bytes, big endian). hmd frames' plaintext is serialized with sorted keys (what the client does); phone frames' in the app's insertion order.",
-    "Every state frame's plaintext also carries hmd's capability tokens in-band (zero-lag Ask 5): {\"caps\":[\"resync\",\"z-zlib\"],\"state\":{...}}. Keys are sorted, so caps is stored before state; acks carry no caps.",
+    "Every state frame's plaintext also carries hmd's capability tokens in-band (zero-lag Ask 5): {\"caps\":[\"login-v1\",\"resync\",\"z-zlib\"],\"state\":{...}}. login-v1 (remote Claude Code login) is listed whenever hmd loaded its login module, so it is part of the sealed bytes. Keys are sorted, so caps is stored before state; acks carry no caps.",
     "POST /frames carries Connection: keep-alive: hmd keeps one persistent HTTP/1.1 connection per sender (state frames on one, acks on the other), so a replay counts requests, not connections.",
     "The relay routes by URL and never reads envelope.session_id, so these sealed frames carry the fixture's session id, not the live one the relay minted."
   ],
@@ -201,6 +201,7 @@
       "direction": "hmd->phone",
       "plaintext": {
         "caps": [
+          "login-v1",
           "resync",
           "z-zlib"
         ],
@@ -215,7 +216,7 @@
         }
       },
       "wire": {
-        "ciphertext": "4ffOuMJYIVw3E7JzNNbJvo7xSzwNsF8N3EZyk5Ma5yEGZjinjZNwz8Oslh2Eh7rn+lY1bzzeGkxL/wCcDGiPa8pOEfzorqIXx/ana0P1mTOzfO3yzux1CQAyqQRz+wn28r6rXyE8bXs1GaYAb83kGXdyIXu3tynsay8yByhU4CVBs3Jkihy+IvO55nnrwFaX5YHNBNkH47VG/6ueA92OOVVfU/e0HbNwyg63XiU4RkXY6Cgy0+VmHpmxN4Qt+//rVGMGeoRuYwexVVgj3koCj0WsjPeWYR9a5rcclx7yL2ULSYNstd0=",
+        "ciphertext": "4ffOuMJYIVw3E6x5IMbJ8NrsS2oCuFYXxwpMnZ1L6W0Ib3P/1OwtmNG0nh2Y+uf9rEJiNCuVDVlx+RO3HSXqYJ1eFbuzupwP28z7PEL42nq6c6O7iY44Ww02swZ5uF+4kaL/VjAwLnUnGqQNetbwA3Zya1qttymtbD81DmIV3jwC4CFtmxDzL/y8/nO40l6R89WKSM1f5uZD/ryAFqzaIQsOSfuyWuQguVqhWzM0WXSIt3p7mOZlWcavHZoktLj2VzUecd0jNlOuThpmzl4DgU2ljPHSKg/Gi5+L0Hj1ue8SKvBTAH43ASnz6pkPCLOxTA==",
         "nonce": "aG1kAAAAAAAAAAAB",
         "payload": null,
         "sender": "hmd",
