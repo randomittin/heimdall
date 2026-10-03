@@ -3965,6 +3965,364 @@ else
   skip "scenario W (frame ordering, digest rules): bin/lib/hmd_relay_e2e.py absent -- needs real seal"
 fi
 
+# ── Scenario X: push registration over sealed commands (hmdapp's docs/HANDOFF-TO-HEIMDALL-push-notifications.md PN2
+# and section 5 of its spec). The REAL client against the fake relay: every state frame lists push-v1 in its caps; the
+# phone's sealed register_push / app_state / unregister_push are acked with the spec's exact shapes and land in
+# <repo>/.heimdall/app/push.json (file 0600, directory 0700); malformed ones are refused with the spec's detail and
+# write nothing; registrations an earlier session left behind are gone at the first device_bound, while a same-device
+# repeat keeps them and a different device's frame is refused; and the Expo token is in no byte of stdout, stderr, the
+# event log, the status file or the relay's request log. The token is assembled at run time (no token-shaped literal
+# is committed). test/companion-push-store.test.sh covers the store and every refusal in-process; this is the same
+# wire through a real process. X2: HMD_PUSH=0 withdraws the cap and the commands ack push-disabled ──────────────────
+PUSH_STORE_LIB="$REPO/bin/lib/companion_push_store.py"
+
+x_json_same() {  # x_json_same ACTUAL EXPECTED -- true when the two JSON texts are the same value
+  python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)' "$1" "$2" 2>/dev/null
+}
+
+# push_state_of REPO -- what the store reads from REPO, as one JSON line; a well-formed ISO-8601 UTC timestamp is shown as ISO
+push_state_of() {
+  python3 - "$1" "$PUSH_STORE_LIB" <<'PYEOF'
+import json, re, sys
+from importlib.util import module_from_spec, spec_from_file_location
+
+repo, path = sys.argv[1:3]
+spec = spec_from_file_location("companion_push_store", path)
+store = module_from_spec(spec)
+spec.loader.exec_module(store)
+state = store.load(repo)
+iso = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+shown = lambda v: "ISO" if isinstance(v, str) and iso.fullmatch(v) else v
+state["app_state_at"] = shown(state["app_state_at"])
+for entry in state["tokens"]:
+    entry["registered_at"] = shown(entry["registered_at"])
+print(json.dumps(state, sort_keys=True))
+PYEOF
+}
+
+# state_caps_of FRAMES_FILE KEY_B64 -- the caps (JSON) of the newest state frame the relay received
+state_caps_of() {
+  python3 - "$1" "$2" "$E2E_MOD" <<'PYEOF'
+import base64, json, sys
+from importlib.util import module_from_spec, spec_from_file_location
+
+frames, key_b64, e2e_path = sys.argv[1:4]
+spec = spec_from_file_location("hmd_relay_e2e", e2e_path)
+e2e = module_from_spec(spec)
+spec.loader.exec_module(e2e)
+key = base64.b64decode(key_b64)
+caps = None
+for line in open(frames, encoding="utf-8"):
+    try:
+        env = json.loads(line)
+    except ValueError:
+        continue
+    if env.get("sender") == "hmd" and env.get("type") == "state":
+        caps = json.loads(e2e.unpack_plaintext(e2e.open_(key, env["seq"], "hmd", env["nonce"], env["ciphertext"])))["caps"]
+if caps is None:
+    sys.exit(1)
+print(json.dumps(caps))
+PYEOF
+}
+
+# command_events_of CLIENT_OUT -- [[action, ok, detail], ...] of every `command` line the client printed, or KEYS-BAD
+# when one of them carries anything beyond event/action/ok/detail
+command_events_of() {
+  python3 - "$1" <<'PYEOF'
+import json, sys
+
+rows = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    if e.get("event") != "command":
+        continue
+    if set(e) != {"event", "action", "ok", "detail"}:
+        print("KEYS-BAD")
+        sys.exit(0)
+    rows.append([e["action"], e["ok"], e["detail"]])
+print(json.dumps(rows))
+PYEOF
+}
+
+x_reg_json() {  # x_reg_json TOKEN VERSION -- a register_push command carrying TOKEN
+  printf '{"action":"register_push","params":{"v":%s,"provider":"expo","token":"%s","platform":"ios","ref":"%s","label":"api server","events":["question","approval","finished","error","gate_red"]}}' "$2" "$1" "$X_REF"
+}
+x_unreg_json() {  # x_unreg_json REF
+  printf '{"action":"unregister_push","params":{"ref":"%s"}}' "$1"
+}
+x_redact() { printf '%s' "${1//"$PUSH_TOKEN_X"/<token>}"; }
+
+# x_start_session TAG REPO [COMMAND WORDS...] -- starts a fake relay and the REAL client for REPO, the optional command
+# words (an `env ...`) placed in front of it, waits for the pairing, and leaves what the caller needs in XS_*: paths
+# XS_LOG XS_CTL XS_OUT XS_ERR, XS_SID, XS_KEY (the session key the phone derives), XS_DEV_PUB, and the pids XS_CLIENT XS_SRV
+x_start_session() {
+  local tag="$1" repo="$2" port_relay port_ui dev_json dev_priv hmd_pub
+  shift 2
+  XS_LOG="$TMPROOT/$tag.log"; XS_CTL="$TMPROOT/$tag.ctl"; XS_OUT="$TMPROOT/$tag.client.out"; XS_ERR="$TMPROOT/$tag.client.err"
+  mkdir -p "$XS_LOG" "$XS_CTL"
+  port_relay="$(free_port)"; port_ui="$(free_port)"
+  python3 "$FAKE_RELAY" serve "$port_relay" --log "$XS_LOG" --ctl "$XS_CTL" >"$TMPROOT/$tag.srv.out" 2>&1 &
+  XS_SRV=$!
+  PIDS+=("$XS_SRV")
+  for _ in $(seq 1 50); do
+    python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',$port_relay))==0 else 1)" && break
+    sleep 0.1
+  done
+  dev_json="$(python3 "$FAKE_RELAY" device keygen)"
+  dev_priv="$(printf '%s' "$dev_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["priv_b64"])')"
+  XS_DEV_PUB="$(printf '%s' "$dev_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pub_b64"])')"
+  printf '%s' "$XS_DEV_PUB" > "$XS_CTL/bind-device"
+  "$@" "$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$port_relay" --repo "$repo" --ui-port "$port_ui" >"$XS_OUT" 2>"$XS_ERR" &
+  XS_CLIENT=$!
+  PIDS+=("$XS_CLIENT")
+  wait_for "$XS_OUT" '"event":"pair_init"' 10 || true
+  XS_SID="$(python3 -c "
+import json
+for line in open('$XS_OUT'):
+    o = json.loads(line)
+    if o.get('event') == 'pair_init':
+        print(o['qr']['session_id']); break
+" 2>/dev/null)"
+  hmd_pub="$(python3 -c "
+import json
+for line in open('$XS_OUT'):
+    o = json.loads(line)
+    if o.get('event') == 'pair_init':
+        print(o['qr']['hmd_pubkey']); break
+" 2>/dev/null)"
+  wait_for "$XS_OUT" '"event":"device_bound"' 10 || true
+  XS_KEY="$(python3 "$FAKE_RELAY" device derive --dev-priv-b64 "$dev_priv" --hmd-pub-b64 "$hmd_pub" --session-id "$XS_SID" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["key_b64"])')"
+}
+
+if [ "$E2E_PRESENT" = true ]; then
+  X_REF="9f3c2a1b7d4e6f80"
+  PUSH_TOKEN_X="Exponent""PushToken[$(python3 -c 'print("xX9_-" * 5)')]"
+  PUSH_TOKEN_OLD_X="Exponent""PushToken[$(python3 -c 'print("o" * 22)')]"
+  X_ENTRY="{\"events\":[\"approval\",\"error\",\"finished\",\"gate_red\",\"question\"],\"label\":\"api server\",\"platform\":\"ios\",\"ref\":\"$X_REF\",\"registered_at\":\"ISO\",\"token\":\"$PUSH_TOKEN_X\"}"
+
+  # what an EARLIER session left behind: a registration, and the app state its phone reported
+  REPO_X="$(make_repo)"
+  python3 - "$REPO_X" "$PUSH_STORE_LIB" "$PUSH_TOKEN_OLD_X" <<'PYEOF'
+import sys
+from importlib.util import module_from_spec, spec_from_file_location
+
+repo, path, token = sys.argv[1:4]
+spec = spec_from_file_location("companion_push_store", path)
+store = module_from_spec(spec)
+spec.loader.exec_module(store)
+store.register(repo, token, "ios", ref="aaaaaaaaaaaaaaaa", label="last session", events=["error"])
+store.set_app_state(repo, "foreground")
+PYEOF
+  if [ "$(push_state_of "$REPO_X" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(len(s["tokens"]), s["app_state"])')" = "1 foreground" ]; then
+    ok "scenario X: an earlier session's registration and reported app state are on disk before this session starts"
+  else
+    bad "scenario X: the seed registration did not land -- the clearing check below would prove nothing"
+  fi
+
+  x_start_session X "$REPO_X" env -u HMD_PUSH
+  SID_X="$XS_SID"; KEY_X="$XS_KEY"; DEV_PUB_X="$XS_DEV_PUB"; LOG_X="$XS_LOG"; CTL_X="$XS_CTL"; OUT_X="$XS_OUT"
+  CLIENT_X="$XS_CLIENT"; SRV_X="$XS_SRV"
+  EVENT_LOG_X="$REPO_X/.heimdall/app/relay-events.jsonl"
+  if wait_for "$OUT_X" '"event":"device_bound"' 1 && [ -n "$SID_X" ] && [ -n "$KEY_X" ]; then
+    ok "scenario X: relay-client paired (session key derivable)"
+  else
+    bad "scenario X: relay-client never paired -- the rest of X cannot run: $(tail -3 "$XS_ERR" 2>/dev/null)"
+  fi
+
+  if x_json_same "$(push_state_of "$REPO_X")" '{"app_state":"unknown","app_state_at":null,"tokens":[]}'; then
+    ok "X: the first device_bound cleared the registration and the app state an earlier session left behind"
+  else
+    bad "X: the earlier session's registration survived the first device_bound: $(x_redact "$(push_state_of "$REPO_X")")"
+  fi
+
+  if wait_for_count "$LOG_X/frames.ndjson" 1 '"type":"state"' 10; then
+    X_CAPS="$(state_caps_of "$LOG_X/frames.ndjson" "$KEY_X")"
+    if x_json_same "$X_CAPS" '["push-v1","resync","z-zlib"]'; then
+      ok "X: the state frame the relay received lists push-v1 beside resync and z-zlib in its caps"
+    else
+      bad "X: state frame caps are not [push-v1, resync, z-zlib]: $X_CAPS"
+    fi
+  else
+    bad "X: no state frame ever reached the relay"
+  fi
+
+  # every command is sealed up front; each is moved into the relay's ctl dir only when it is wanted
+  x_prepare() { prepare_device_action "$TMPROOT/x.cmd.$1.json" "$SID_X" "$KEY_X" "$1" "$2"; }
+  x_queue() { mv "$TMPROOT/x.cmd.$1.json" "$CTL_X/$(printf '%03d' "$1").json"; }
+  x_ack() { wait_for_ack_of_seq "$LOG_X/frames.ndjson" "$KEY_X" "$1" 10; }
+  x_prepare 1 "$(x_reg_json "$PUSH_TOKEN_X" 1)"
+  x_prepare 2 '{"action":"app_state","params":{"state":"active"}}'
+  x_prepare 3 '{"action":"app_state","params":{"state":"background"}}'
+  x_prepare 4 "$(x_reg_json nope 1)"
+  x_prepare 5 "$(x_reg_json "$PUSH_TOKEN_X" 2)"
+  x_prepare 6 '{"action":"app_state","params":{"state":"inactive"}}'
+  x_prepare 7 '{"action":"register_push","params":"x"}'
+  x_prepare 8 "$(x_unreg_json XYZ)"
+  x_prepare 9 "$(x_unreg_json "$X_REF")"
+  x_prepare 10 "$(x_unreg_json "$X_REF")"
+
+  x_queue 1; X_ACK="$(x_ack 1)"
+  if x_json_same "$X_ACK" "{\"ok\":true,\"of_seq\":1,\"ref\":\"$X_REF\",\"events\":[\"approval\",\"error\",\"finished\",\"gate_red\",\"question\"]}"; then
+    ok "X: register_push is acked {ok, of_seq, ref, events (sorted)}"
+  else
+    bad "X: register_push ack is not the spec's shape: $X_ACK"
+  fi
+  X_NOW="$(push_state_of "$REPO_X")"
+  if x_json_same "$X_NOW" "{\"app_state\":\"unknown\",\"app_state_at\":null,\"tokens\":[$X_ENTRY]}"; then
+    ok "X: the registration is in push.json -- token, platform, ref, label, sorted events, an ISO registered_at"
+  else
+    bad "X: push.json after register_push is not what was registered: $(x_redact "$X_NOW")"
+  fi
+  X_PERMS="$(python3 -c 'import os,stat,sys; print(*(oct(stat.S_IMODE(os.stat(p).st_mode))[2:] for p in sys.argv[1:]))' \
+    "$REPO_X/.heimdall/app" "$REPO_X/.heimdall/app/push.json")"
+  if [ "$X_PERMS" = "700 600" ]; then
+    ok "X: .heimdall/app is 0700 and push.json 0600"
+  else
+    bad "X: permissions are '$X_PERMS', expected '700 600' (directory, file)"
+  fi
+  if grep -qF -- "$PUSH_TOKEN_X" "$REPO_X/.heimdall/app/push.json"; then
+    ok "X: the token is in push.json (so the 'in no log' check below is not vacuous)"
+  else
+    bad "X: the token is not in push.json -- the leak check below would prove nothing"
+  fi
+
+  x_queue 2; X_ACK="$(x_ack 2)"
+  X_NOW="$(push_state_of "$REPO_X")"
+  if x_json_same "$X_ACK" '{"ok":true,"of_seq":2}' \
+     && x_json_same "$X_NOW" "{\"app_state\":\"foreground\",\"app_state_at\":\"ISO\",\"tokens\":[$X_ENTRY]}"; then
+    ok "X: app_state active is acked bare and stored as foreground with a timestamp, the registration untouched"
+  else
+    bad "X: app_state active -- ack $X_ACK, store $(x_redact "$X_NOW")"
+  fi
+  x_queue 3; X_ACK="$(x_ack 3)"
+  X_AFTER_BACKGROUND="$(push_state_of "$REPO_X")"
+  if x_json_same "$X_ACK" '{"ok":true,"of_seq":3}' \
+     && x_json_same "$X_AFTER_BACKGROUND" "{\"app_state\":\"background\",\"app_state_at\":\"ISO\",\"tokens\":[$X_ENTRY]}"; then
+    ok "X: app_state background is acked bare and stored as background"
+  else
+    bad "X: app_state background -- ack $X_ACK, store $(x_redact "$X_AFTER_BACKGROUND")"
+  fi
+
+  # a same-device repeat device_bound (a stream reconnect) keeps the registration; another device's frame is refused
+  x_device_bound() {  # x_device_bound NUM PUB_B64 -- the relay's own (unencrypted) device_bound frame for that device key
+    python3 -c "
+import json, sys
+env = {'v': 1, 'session_id': sys.argv[1], 'seq': 0, 'sender': 'relay', 'type': 'device_bound',
+       'nonce': None, 'ciphertext': None, 'payload': {'device_pubkey': sys.argv[2], 'bound_at': 1758700001}}
+with open(sys.argv[3], 'w', encoding='utf-8') as f:
+    json.dump(env, f)
+" "$SID_X" "$2" "$TMPROOT/x.bound.$1.json" && mv "$TMPROOT/x.bound.$1.json" "$CTL_X/$1.json"
+  }
+  x_device_bound 020 "$DEV_PUB_X"
+  if wait_for_count "$OUT_X" 2 '"event":"device_bound"' 10 \
+     && [ "$(push_state_of "$REPO_X")" = "$X_AFTER_BACKGROUND" ]; then
+    ok "X: a repeat device_bound for the same phone leaves the registration and the app state alone"
+  else
+    bad "X: a same-device device_bound lost or changed the registration: $(x_redact "$(push_state_of "$REPO_X")")"
+  fi
+  X_OTHER_PUB="$(python3 "$FAKE_RELAY" device keygen | python3 -c 'import json,sys; print(json.load(sys.stdin)["pub_b64"])')"
+  x_device_bound 021 "$X_OTHER_PUB"
+  if wait_for_event "$OUT_X" error "differs from the already latched" 10 \
+     && [ "$(push_state_of "$REPO_X")" = "$X_AFTER_BACKGROUND" ]; then
+    ok "X: a device_bound for a DIFFERENT phone is refused by the latch and touches nothing"
+  else
+    bad "X: a different-device device_bound was not refused, or it changed the registration"
+  fi
+
+  # the malformed ones, queued together: each is refused with the spec's detail code, none writes anything
+  for n in 4 5 6 7 8; do x_queue "$n"; done
+  X_SAME=yes
+  X_BADACKS=""
+  for spec in "4 bad-token" "5 bad-version" "6 bad-state" "7 bad-params" "8 bad-ref"; do
+    read -r n code <<<"$spec"
+    X_ACK="$(x_ack "$n")"
+    x_json_same "$X_ACK" "{\"ok\":false,\"of_seq\":$n,\"detail\":\"$code\"}" || { X_SAME=no; X_BADACKS="$X_BADACKS $X_ACK"; }
+  done
+  if [ "$X_SAME" = yes ] && [ "$(push_state_of "$REPO_X")" = "$X_AFTER_BACKGROUND" ]; then
+    ok "X: a bad token, a bad version, a bad state, params that are not an object and a malformed ref are each refused with the spec's detail and write nothing"
+  else
+    bad "X: refusals were not the spec's (or a refusal wrote something):$X_BADACKS"
+  fi
+
+  x_queue 9; X_ACK="$(x_ack 9)"
+  X_NOW="$(push_state_of "$REPO_X")"
+  if x_json_same "$X_ACK" "{\"ok\":true,\"of_seq\":9,\"ref\":\"$X_REF\",\"removed\":true}" \
+     && x_json_same "$X_NOW" '{"app_state":"background","app_state_at":"ISO","tokens":[]}'; then
+    ok "X: unregister_push is acked {ok, of_seq, ref, removed:true} and the registration is gone"
+  else
+    bad "X: unregister_push -- ack $X_ACK, store $(x_redact "$X_NOW")"
+  fi
+  x_queue 10; X_ACK="$(x_ack 10)"
+  if x_json_same "$X_ACK" "{\"ok\":true,\"of_seq\":10,\"ref\":\"$X_REF\",\"removed\":false}"; then
+    ok "X: unregister_push again is idempotent: ok, removed:false"
+  else
+    bad "X: a second unregister_push was not {ok:true, removed:false}: $X_ACK"
+  fi
+
+  X_EVENTS="$(command_events_of "$OUT_X")"
+  if x_json_same "$X_EVENTS" '[["register_push",true,null],["app_state",true,null],["app_state",true,null],["register_push",false,"bad-token"],["register_push",false,"bad-version"],["app_state",false,"bad-state"],["register_push",false,"bad-params"],["unregister_push",false,"bad-ref"],["unregister_push",true,null],["unregister_push",true,null]]'; then
+    ok "X: the client's command lines name the action, the verdict and the detail -- and nothing else"
+  else
+    bad "X: command lines are not the expected action/ok/detail sequence: $X_EVENTS"
+  fi
+
+  X_LEAKS=""
+  for f in "$OUT_X" "$XS_ERR" "$EVENT_LOG_X" "$REPO_X/.heimdall/app/relay.json" "$LOG_X/requests.log" "$TMPROOT/X.srv.out"; do
+    [ -e "$f" ] || continue
+    if grep -qF -e "$PUSH_TOKEN_X" -e "api server" -e "$X_REF" "$f"; then X_LEAKS="$X_LEAKS $(basename "$f")"; fi
+  done
+  if [ -z "$X_LEAKS" ] && [ -s "$EVENT_LOG_X" ]; then
+    ok "X: the token, the label and the ref appear in no stdout, stderr, event-log, status-file or relay-request-log byte"
+  else
+    bad "X: a push secret reached:${X_LEAKS:- (nothing -- but the event log is empty, so the check proved nothing)}"
+  fi
+
+  kill "$CLIENT_X" 2>/dev/null; wait "$CLIENT_X" 2>/dev/null
+  kill "$SRV_X" 2>/dev/null; wait "$SRV_X" 2>/dev/null
+
+  # ── X2: HMD_PUSH=0, the operator's kill switch ──
+  REPO_X2="$(make_repo)"
+  x_start_session X2 "$REPO_X2" env HMD_PUSH=0
+  SID_X="$XS_SID"; KEY_X="$XS_KEY"; LOG_X="$XS_LOG"; CTL_X="$XS_CTL"; CLIENT_X2="$XS_CLIENT"; SRV_X2="$XS_SRV"
+  if wait_for "$XS_OUT" '"event":"device_bound"' 1 && [ -n "$SID_X" ] && [ -n "$KEY_X" ]; then
+    ok "scenario X2 (HMD_PUSH=0): relay-client paired (session key derivable)"
+  else
+    bad "scenario X2: relay-client never paired -- the rest of X2 cannot run: $(tail -3 "$XS_ERR" 2>/dev/null)"
+  fi
+  if wait_for_count "$LOG_X/frames.ndjson" 1 '"type":"state"' 10; then
+    X_CAPS="$(state_caps_of "$LOG_X/frames.ndjson" "$KEY_X")"
+    if x_json_same "$X_CAPS" '["resync","z-zlib"]'; then
+      ok "X2: with HMD_PUSH=0 the state frame no longer lists push-v1"
+    else
+      bad "X2: state frame caps with HMD_PUSH=0 are not [resync, z-zlib]: $X_CAPS"
+    fi
+  else
+    bad "X2: no state frame ever reached the relay"
+  fi
+  x_prepare 1 "$(x_reg_json "$PUSH_TOKEN_X" 1)"
+  x_prepare 2 '{"action":"app_state","params":{"state":"active"}}'
+  x_prepare 3 "$(x_unreg_json "$X_REF")"
+  X2_SAME=yes
+  for n in 1 2 3; do
+    x_queue "$n"
+    X_ACK="$(x_ack "$n")"
+    x_json_same "$X_ACK" "{\"ok\":false,\"of_seq\":$n,\"detail\":\"push-disabled\"}" || X2_SAME=no
+  done
+  if [ "$X2_SAME" = yes ] && [ ! -e "$REPO_X2/.heimdall/app/push.json" ]; then
+    ok "X2: register_push, app_state and unregister_push are each acked push-disabled, and nothing is written"
+  else
+    bad "X2: HMD_PUSH=0 did not answer push-disabled everywhere, or it wrote push.json"
+  fi
+  kill "$CLIENT_X2" 2>/dev/null; wait "$CLIENT_X2" 2>/dev/null
+  kill "$SRV_X2" 2>/dev/null; wait "$SRV_X2" 2>/dev/null
+else
+  skip "scenario X (push registration over sealed commands): bin/lib/hmd_relay_e2e.py absent -- needs real seal"
+fi
+
 echo
 printf '%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ]
