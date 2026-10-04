@@ -899,45 +899,57 @@ wait "$HUP_FG_PID" 2>/dev/null
 rm -rf "$D"
 
 # ── A5. the pairing URL/token is never visible in hmd_qr.py's argv (ps) ───
+# argv is what `ps` shows any local user. hmd_qr.py lives only milliseconds
+# (render a QR, exit), so sampling `ps` races it -- under load the sampler
+# routinely misses the process entirely and the check goes inconclusive.
+# Instead record argv at exec time through the HMD_PYTHON seam: a wrapper
+# logs its exact argv, then execs the real interpreter. That is the same
+# argv `ps` would display, captured deterministically, never sampled.
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-a5.out"
-( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
-A5_FG_PID=$!
-PIDS+=("$A5_FG_PID")
+A5_ARGV_LOG="$TMPROOT/a5-argv.log"
+A5_PY_WRAP="$TMPROOT/a5-python-argv-recorder"
+A5_REAL_PY="$(. "$REPO/bin/lib/hmd-python.sh"; hmd_python 2>/dev/null || true)"
+: >"$A5_ARGV_LOG"
+cat >"$A5_PY_WRAP" <<A5WRAP
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >>"$A5_ARGV_LOG"
+exec "$A5_REAL_PY" "\$@"
+A5WRAP
+chmod +x "$A5_PY_WRAP"
 
-SF="$D/.heimdall/app/connect.json"
-A5_WAITED=0
-while [ ! -f "$SF" ] && [ "$A5_WAITED" -lt 50 ]; do
-  sleep 0.05
-  A5_WAITED=$((A5_WAITED + 1))
-done
-
-A5_SAW_HMD_QR=false
-A5_LEAKED=false
-A5_POLLS=0
-while [ "$A5_POLLS" -lt 400 ]; do
-  A5_PS="$(ps -eo command= 2>/dev/null | grep hmd_qr.py | grep -v grep || true)"
-  if [ -n "$A5_PS" ]; then
-    A5_SAW_HMD_QR=true
-    if printf '%s' "$A5_PS" | grep -q 'token='; then
-      A5_LEAKED=true
-    fi
-  fi
-  A5_POLLS=$((A5_POLLS + 1))
-done
-
-if [ "$A5_SAW_HMD_QR" = true ]; then
-  if [ "$A5_LEAKED" = true ]; then
-    bad "A5. hmd_qr.py argv LEAKS the token during connect"
-  else
-    ok "A5. hmd_qr.py argv never shows token= while connect runs (observed it live, clean)"
-  fi
+if [ -z "$A5_REAL_PY" ]; then
+  bad "A5 setup: no python3 resolvable -- cannot run hmd_qr.py at all"
 else
-  bad "A5. never observed a live hmd_qr.py process to check (inconclusive -- widen the poll window)"
-fi
+  ( HMD_PYTHON="$A5_PY_WRAP" FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+  A5_FG_PID=$!
+  PIDS+=("$A5_FG_PID")
 
-kill -TERM "$A5_FG_PID" 2>/dev/null
-wait "$A5_FG_PID" 2>/dev/null
+  # connect renders the QR right after writing connect.json and before it
+  # prints its "waiting" line; that line is the deterministic "QR is done" cue.
+  A5_WAITED=0
+  while ! grep -q 'hmd app: waiting' "$OUT_FILE" 2>/dev/null && [ "$A5_WAITED" -lt 600 ]; do
+    sleep 0.05
+    A5_WAITED=$((A5_WAITED + 1))
+  done
+
+  A5_QR_ARGV="$(grep 'hmd_qr.py' "$A5_ARGV_LOG" 2>/dev/null || true)"
+  if [ -z "$A5_QR_ARGV" ]; then
+    bad "A5. connect never executed hmd_qr.py through the interpreter (argv log: $(cat "$A5_ARGV_LOG" 2>/dev/null); out: $(tail -5 "$OUT_FILE" 2>/dev/null))"
+  elif printf '%s' "$A5_QR_ARGV" | grep -q 'token='; then
+    bad "A5. hmd_qr.py argv LEAKS the token during connect: $A5_QR_ARGV"
+  else
+    ok "A5. hmd_qr.py argv never shows token= (argv recorded at exec, clean)"
+  fi
+  if grep -q 'token=' "$OUT_FILE" 2>/dev/null; then
+    ok "A5b. pairing URL still reached the operator (stdout carries the token URL)"
+  else
+    bad "A5b. connect output never showed the pairing URL: $(tail -5 "$OUT_FILE" 2>/dev/null)"
+  fi
+
+  kill -TERM "$A5_FG_PID" 2>/dev/null
+  wait "$A5_FG_PID" 2>/dev/null
+fi
 rm -rf "$D"
 
 # ── A6. ui log temp file is 0600 (mktemp + umask 077) ─────────────────────
