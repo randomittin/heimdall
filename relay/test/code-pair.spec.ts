@@ -703,6 +703,10 @@ describe("POST /pair/code (spec 6.3)", () => {
 
     it("refuses an assertion minted before the user's last revoke with 401 `identity revoked`, and honours one minted after", async () => {
       const { user, identity, window } = await ready();
+      // Assertions and `not_before` are whole seconds and the spec honours `iat >= not_before`, so
+      // a sign-in in the same second as the revoke survives it. The phone this models was lost
+      // earlier than that.
+      await sleep(1100);
       const revoke = await revokeRequest({ gh_token: fake.laptopToken(user) });
       const { not_before: notBefore } = (await revoke.json()) as { not_before: number };
 
