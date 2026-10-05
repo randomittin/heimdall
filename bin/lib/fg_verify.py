@@ -163,9 +163,7 @@ def _write(path, text, mode=0o644):
 def _stage_tests(cand, probe, stage, env, root):
     """Copy the upstream test files as they were at the merge commit into stage/tests. None, or why not."""
     paths = cand["tests"]
-    if any(os.path.isabs(p) or ".." in p.split("/") for p in paths):
-        return "unsafe test path in the candidate: %s" % ", ".join(paths)[:200]
-    listing = fg_repo.run_guarded(["git", "-c", "core.quotePath=false", "ls-tree", "-r", "-l", "-z", cand["merge"], "--"] + paths,
+    listing =fg_repo.run_guarded(["git", "-c", "core.quotePath=false", "ls-tree", "-r", "-l", "-z", cand["merge"], "--"] + paths,
                                   probe, env, fg_repo.STEP_TIMEOUT_S, root)
     if listing.rc != 0:
         return "clone: could not list the test files at the merge commit: %s" % fg_repo.tail(listing.out)
@@ -213,6 +211,8 @@ def _verify(cand, task, root, tasks_dir, issue_text, python, evidence):
         return "could not fetch the issue text: %s" % str(exc)[:200]
     owner, repo = cand["issue"].rstrip("/").split("/")[-4:-2]
     url = "%s%s/%s" % (GITHUB, owner, repo)
+    if any(os.path.isabs(p) or ".." in p.split("/") for p in cand["tests"]):
+        return "unsafe test path in the candidate: %s" % ", ".join(cand["tests"])[:200]
     targets = fg_repo.test_targets(cand["tests"])
     if not targets:
         return "no test module among the changed test files"

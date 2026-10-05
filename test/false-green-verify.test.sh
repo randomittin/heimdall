@@ -25,6 +25,7 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 required" >&2; exit 2; }
 python3 -m pytest --version >/dev/null 2>&1 || { echo "pytest required" >&2; exit 2; }
 command -v git >/dev/null 2>&1 || { echo "git required" >&2; exit 2; }
+command -v gitleaks >/dev/null 2>&1 || { echo "gitleaks required (the secret-scan section runs it)" >&2; exit 2; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fg-verify-test-XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -57,6 +58,7 @@ remotes = os.path.join(tmp, "remotes")
 work_root = os.path.join(tmp, "work")
 os.makedirs(work_root)
 fg_verify.GITHUB = "file://%s/" % remotes
+fg_verify.CLONE_RETRY_S = 0                  # the retry pause is for real networks; its mechanics are tested in [R]
 HERMETIC_ENV = (["{python} -m venv --system-site-packages .venv"], None)       # no PyPI: pytest comes from the interpreter's own site-packages
 fg_verify.env_steps = lambda tree: HERMETIC_ENV
 
@@ -241,6 +243,133 @@ with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
     rc = fg_verify.verify_all(cand_file, tasks_dir, pilot_dir, record, work_root, 2, 1, issue_text, sys.executable)
 t("with under 3 GB free the walk stops before cloning anything, exit 3, and says so", rc == 3 and "3 GB" in err.getvalue() and not os.path.exists(record), (rc, err.getvalue()))
 t("and the work root is untouched", leftovers() == [], leftovers())
+
+# ── [P] a parallel walk decides exactly what a sequential one does ──────────
+import hashlib, threading, time
+fg_repo.container_free_bytes = lambda: 50 * 10**9
+fg_verify.env_steps = lambda tree: HERMETIC_ENV
+pnames = ["p%d" % i for i in range(8)]
+p_order = sorted(["https://github.com/acme/%s/issues/5" % n for n in pnames], key=taskgen.issue_rank)
+p_by_rank = [u.split("/")[4] for u in p_order]
+p_cands = []
+for name in pnames:
+    if name in (p_by_rank[1], p_by_rank[3]):
+        shas = remote(name, [{"calc.py": FIXED, "pytest.ini": PYTEST_INI, "tests/test_calc.py": TEST}, {"README": "x"}])        # rejected: passes at base
+    else:
+        shas = remote(name, [{"calc.py": BUGGY, "pytest.ini": PYTEST_INI}, {"calc.py": FIXED, "tests/test_calc.py": TEST}])  # accepted
+    p_cands.append(candidate(name, shas[1]))
+p_file = os.path.join(tmp, "p_candidates.txt")
+open(p_file, "w").write("# pool\n" + "".join(taskgen.format_candidate(c) + "\n" for c in p_cands))
+
+def full_walk(tag, jobs, want=2, spares=1, free=None):
+    root = os.path.join(tmp, tag)
+    os.makedirs(root, exist_ok=True)
+    paths = {k: os.path.join(root, k) for k in ("tasks", "pilot", "selection.jsonl")}
+    if free:
+        fg_repo.container_free_bytes = free
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        rc = fg_verify.verify_all(p_file, paths["tasks"], paths["pilot"], paths["selection.jsonl"], work_root, want, spares, issue_text, sys.executable, jobs)
+    rows = [json.loads(l) for l in open(paths["selection.jsonl"])] if os.path.exists(paths["selection.jsonl"]) else []
+    return rc, rows, paths
+
+view = lambda rows: [(r["rank"], r["issue"], r["sha256"], r["task"], r["verdict"], fg_verify.reason_class(r["reason"]), r["role"]) for r in rows]
+rc_s, rows_s, paths_s = full_walk("seq", 1)
+t("the sequential reference walk ends normally with 5 rows (2 rejected, 2 tasks, 1 pilot)", rc_s == 0 and len(rows_s) == 5 and [r["role"] for r in rows_s if r["verdict"] == "accepted"] == ["task", "task", "pilot"], [(r["rank"], r["verdict"], r["role"]) for r in rows_s])
+
+real_verify, finished = fg_verify.verify_one, []
+def staggered(cand, work, tasks_dir, text, python):
+    rank = p_order.index(cand["issue"]) + 1
+    time.sleep(0.5 * (9 - rank))                 # the earlier the rank, the later it finishes
+    done = real_verify(cand, work, tasks_dir, text, python)
+    finished.append(rank)
+    return done
+fg_verify.verify_one = staggered
+try:
+    rc_p, rows_p, paths_p = full_walk("par", 4)
+finally:
+    fg_verify.verify_one = real_verify
+t("under jobs=4 the candidates really did finish out of rank order", finished[0] != 1 and finished != sorted(finished), finished)
+t("and the parallel record is the sequential record: same ranks, tasks, verdicts, reasons and roles", rc_p == 0 and view(rows_p) == view(rows_s), (view(rows_p), view(rows_s)))
+t("a candidate verified past the stopping point is discarded, never recorded", len(rows_p) == 5 and max(r["rank"] for r in rows_p) == rows_s[-1]["rank"] and len(finished) > 5, (len(rows_p), finished))
+t("the same task and pilot directories exist, and nothing else", sorted(os.listdir(paths_p["tasks"])) == sorted(os.listdir(paths_s["tasks"])) and os.listdir(paths_p["pilot"]) == os.listdir(paths_s["pilot"]))
+t("the work root is empty afterwards: no clone, environment or staged output survives", leftovers() == [], leftovers())
+
+# ── [L] low disk in the middle of a walk, then resume ───────────────────────
+calls = [0]
+def stingy():
+    calls[0] += 1
+    return 50 * 10**9 if calls[0] <= 2 else 1 * 10**9      # fine at the start and for candidate 1, then low
+rc_l, rows_l, paths_l = full_walk("low", 1, free=stingy)
+t("a walk that runs low on disk after the first candidate records that one and stops with exit 3", rc_l == 3 and [r["rank"] for r in rows_l] == [1], (rc_l, [r["rank"] for r in rows_l]))
+rc_l2, rows_l2, _ = full_walk("low", 1, free=lambda: 50 * 10**9)
+t("the same command, resumed with room, finishes with the sequential walk's record", rc_l2 == 0 and view(rows_l2) == view(rows_s), (rc_l2, view(rows_l2)))
+open(paths_l["selection.jsonl"], "w").write(json.dumps(dict(rows_l2[0], issue="https://github.com/acme/other/issues/1")) + "\n")
+try:
+    full_walk("low", 1)
+    t("a record that is not the first rows of the pool in rank order is an error, not a resume", False, "no exception")
+except ValueError as exc:
+    t("a record that is not the first rows of the pool in rank order is an error, not a resume", "disagree" in str(exc), str(exc))
+
+# ── [M] the manifest, the summary and the reason classes ────────────────────
+manifest = fg_verify.build_manifest(p_file, paths_s["selection.jsonl"], paths_s["tasks"])
+t("the manifest is a pure function of the pool, the record and the task directories", manifest == fg_verify.build_manifest(p_file, paths_s["selection.jsonl"], paths_s["tasks"]))
+t("it lists the tasks (not the pilot) in rank order, each with the rank hash of its issue and both commits",
+  manifest["task_count"] == 2 and [x["rank"] for x in manifest["tasks"]] == sorted(r["rank"] for r in rows_s if r["role"] == "task")
+  and all(x["sha256"] == taskgen.issue_rank(x["issue"]) and len(x["base_sha"]) == 40 and len(x["merge_sha"]) == 40 and x["category"] == "bugfix" for x in manifest["tasks"]), manifest)
+t("it pins the pool by hash and says how many were walked and why the rest were rejected",
+  manifest["candidates_sha256"] == hashlib.sha256(open(p_file, "rb").read()).hexdigest() and manifest["candidates"] == 8 and manifest["walked"] == 5
+  and manifest["rejected"] == {"tests already pass at the base commit": 2}, manifest)
+first_task = os.path.join(paths_s["tasks"], manifest["tasks"][0]["id"])
+open(os.path.join(first_task, "ground_truth.sh"), "a").write("# edited after the manifest\n")
+changed = fg_verify.build_manifest(p_file, paths_s["selection.jsonl"], paths_s["tasks"])
+t("editing any file of a task changes that task's directory hash and no other",
+  changed["tasks"][0]["dir_sha256"] != manifest["tasks"][0]["dir_sha256"] and changed["tasks"][1] == manifest["tasks"][1])
+shutil_rm(os.path.join(paths_s["tasks"], manifest["tasks"][1]["id"]))
+try:
+    fg_verify.build_manifest(p_file, paths_s["selection.jsonl"], paths_s["tasks"])
+    t("a task the record accepts but whose directory is gone is an error", False, "no exception")
+except ValueError as exc:
+    t("a task the record accepts but whose directory is gone is an error", manifest["tasks"][1]["id"] in str(exc), str(exc))
+summary = fg_verify.summarize(rows_s)
+t("the summary counts what the walk did", summary == {"walked": 5, "tasks": 2, "pilots": 1, "rejected": {"tests already pass at the base commit": 2}}, summary)
+samples = {"could not fetch the issue text: gh: HTTP 404": "issue text unavailable", "clone: step 1 (git init): exit 128: fatal": "clone or fetch failed",
+           "no installable python project at the root": "no installable python project", "environment: step 3 (uv pip): exit 1: boom": "environment build failed",
+           "the upstream tests already pass at the base commit (1 passed)": "tests already pass at the base commit",
+           "the upstream tests still fail at the merge commit (1 failed)": "tests still fail at the merge commit",
+           "the upstream tests could not run at the base commit: pytest exit 5": "tests could not run at the base commit",
+           "a committed file holds a secret-shaped literal (gitleaks: private-key)": "secret-shaped literal in a committed file", "something new": "other"}
+t("every rejection reason has a stable class, and an unknown one is 'other'", all(fg_verify.reason_class(r) == c for r, c in samples.items()), [(r, fg_verify.reason_class(r)) for r, c in samples.items() if fg_verify.reason_class(r) != c])
+
+# ── [S] a secret-shaped literal in a committed file rejects the candidate ───
+pem = "-----BEGIN " + "RSA PRIVATE KEY-----\n" + "\n".join(["MIIEowIBAAKCAQEA" + "q" * 48] * 4) + "\n-----END " + "RSA PRIVATE KEY-----\n"
+leaky = remote("leaky", [{"calc.py": BUGGY, "pytest.ini": PYTEST_INI}, {"calc.py": FIXED, "tests/test_calc.py": TEST + "KEY = '''" + pem + "'''\n"}])
+res = verify(candidate("leaky", leaky[1], number=21), os.path.join(tmp, "leaky-tasks"))
+t("an upstream test file holding a private key: rejected, naming the rule and not the secret", res["verdict"] == "rejected" and "secret-shaped literal" in res["reason"] and "private-key" in res["reason"] and "qqqq" not in res["reason"], res)
+t("and no task directory is left for the commit gate to refuse", not os.path.exists(os.path.join(tmp, "leaky-tasks", "acme__leaky-21")) and leftovers() == [])
+clean = verify(candidate("good", good[1], number=22), os.path.join(tmp, "clean-tasks"))
+t("a clean candidate records that the scan ran", clean["verdict"] == "accepted" and clean["evidence"]["secret_scan"].startswith("clean"), clean)
+status, detail = fg_verify.secret_scan(os.path.join(tmp, "clean-tasks"))
+t("secret_scan reports a clean directory as clean", status == "clean", (status, detail))
+real_which = fg_verify.shutil.which
+fg_verify.shutil.which = lambda name: None
+try:
+    status, detail = fg_verify.secret_scan(os.path.join(tmp, "clean-tasks"))
+finally:
+    fg_verify.shutil.which = real_which
+t("with no gitleaks the scan says it was skipped, and why (the task records that, never 'clean')", status == "skipped" and "not installed" in detail, (status, detail))
+
+# ── [R] input checks and the retry ──────────────────────────────────────────
+res = verify(candidate("good", good[1], tests=("../outside/test_x.py",), number=31), tasks)
+t("a candidate test path that climbs out of the tree: rejected before anything is cloned", res["verdict"] == "rejected" and res["reason"].startswith("unsafe test path") and res["evidence"] == {}, res)
+res = verify(candidate("good", good[1], tests=("tests/conftest.py", "tests/data.json"), number=32), tasks)
+t("a candidate with no test module among its changed test files: rejected", res["verdict"] == "rejected" and "no test module" in res["reason"], res)
+attempts = []
+def flaky():
+    attempts.append(1)
+    return "connection reset" if len(attempts) < 3 else None
+t("a step that fails twice and then works is retried to success", fg_verify._retried(flaky) is None and len(attempts) == 3, attempts)
+attempts.clear()
+t("a step that keeps failing is given up after CLONE_ATTEMPTS, with its last reason", fg_verify._retried(lambda: attempts.append(1) or "gone") == "gone" and len(attempts) == fg_verify.CLONE_ATTEMPTS, attempts)
 
 print("\n".join(out))
 print("END")
