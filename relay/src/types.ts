@@ -101,6 +101,16 @@ export interface DeviceBoundToPhonePayload {
 export interface DeviceBoundToHmdPayload {
   device_pubkey: string; // whatever encoding the phone sent verbatim, forwarded unchanged
   bound_at: number; // epoch seconds
+  /** How the phone got the pairing code it claimed with: a released code window, or the QR.
+   *  `code` is what tells hmd to send `key_reveal` and ask the laptop user to approve the SAS
+   *  before it seals anything (spec 5.5). Absent on a relay that predates pair-by-code, which
+   *  a client reads as `qr`. */
+  via: "code" | "qr";
+  /** `via: "code"` only. What the phone called itself when it asked for the window --
+   *  validated, but the phone's own claim and never proof of anything. */
+  device_label?: string;
+  /** `via: "code"` only. The GitHub login the phone's assertion proved. */
+  gh_login?: string;
 }
 
 /** Payload of the `keepalive` control frame the relay writes into hmd's
@@ -166,7 +176,8 @@ export function isEnvelope(value: unknown): value is Envelope {
       v.type === "command" ||
       v.type === "ack" ||
       v.type === "device_bound" ||
-      v.type === "session_ended") &&
+      v.type === "session_ended" ||
+      v.type === "key_reveal") &&
     (v.nonce === null || typeof v.nonce === "string") &&
     (v.ciphertext === null || typeof v.ciphertext === "string")
   );
@@ -198,5 +209,22 @@ export function isDeviceFrame(value: unknown): value is Envelope {
  */
 export function isHmdFrame(value: unknown): value is Envelope {
   if (!isEnvelope(value)) return false;
-  return value.sender === "hmd" && (value.type === "state" || value.type === "ack");
+  if (value.sender !== "hmd") return false;
+  if (value.type === "state" || value.type === "ack") return true;
+  return isKeyReveal(value);
+}
+
+/**
+ * `key_reveal` (INV-44): hmd's public key and the nonce its commitment was made with, sent to
+ * the phone in the clear after a bind that came through a code window (pair-by-session-code,
+ * spec 5.5). It is the only hmd->phone frame type that carries a plaintext `payload`, so it is
+ * held to exactly that: no `nonce`, no `ciphertext`, a `payload` that is an object. What is in
+ * the payload is not the relay's to read -- the phone checks it against the commitment it was
+ * given before the key was known -- and `isDeviceFrame` still refuses the type from the phone.
+ */
+function isKeyReveal(value: Envelope): boolean {
+  if (value.type !== "key_reveal") return false;
+  if (value.nonce !== null || value.ciphertext !== null) return false;
+  const payload: unknown = value.payload;
+  return typeof payload === "object" && payload !== null && !Array.isArray(payload);
 }
