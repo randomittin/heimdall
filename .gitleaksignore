@@ -33,3 +33,5 @@ relay/contract/vectors.json:generic-api-key:7
 0d84f0aed1dabb765fa9343254004f7556326b8c:relay/scripts/lib/relay-crypto.mjs:generic-api-key:2
 # benign — the first wording of the comment above (commit fb7abc67) quoted that prose and so tripped the rule itself, at this very line; reworded since, this covers the frozen copy in history. File:rule:line form, no commit, so a rebase cannot orphan it.
 .gitleaksignore:generic-api-key:32
+# benign — RFC 6455 section 1.3 published handshake example (sample nonce and its expected accept value) in the relay WebSocket client test; a public spec vector, no credential. File:rule:line form so a rebase cannot orphan it.
+test/lib/relay_ws_cases.py:generic-api-key:210

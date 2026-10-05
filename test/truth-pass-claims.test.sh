@@ -178,7 +178,7 @@ BARE_ABSOLUTES='no telemetry|no network calls|no calls home|no data collection|n
 # assert the absolute and disown it in the same breath. Self-test mutant 6 proves
 # the carve-out is line-scoped by planting a real claim in a file that also holds
 # a repudiation and asserting the gate still goes RED.
-REPUDIATIONS='do not summarize|do not paraphrase|does not make them|claims are wrong|would be wrong'
+REPUDIATIONS='do not summarize|do not paraphrase|does not make them|claims are wrong|would be wrong|does not say'
 
 # The read-surfaces a user inspects before trusting hmd. The npm README mirror is
 # the npmjs.com/package/runheimdall page (a byte-identical copy of the root README,
