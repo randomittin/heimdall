@@ -12,8 +12,9 @@
 #      locked gate and the advisory hooks NOT marked remote_toggle are `not-allowed` with hooks-disabled untouched; a
 #      hand-edited sidecar marking a locked hook remote_toggle still cannot move it
 #   3  rid: a repeated rid is answered `dup` and the handler does not run again
-#   4  fallback-mode: `off` is free; `auto` / `switch` need confirm:true; the state lands in heimdall-fallback's own
-#      answer; `coop` is neither settable nor lost on a refusal
+#   4  fallback-mode: `off` is free; every other state heimdall-fallback accepts (`auto` / `switch` / `coop`) needs
+#      confirm:true; the state lands in heimdall-fallback's own answer; `coop` moves the state word and nothing else (the
+#      laptop's allowlist rides through untouched); the modes the state offers are exactly heimdall-fallback's VALID_STATES
 #   5  save-checkpoint: writes .planning/CHECKPOINT.md and nothing else (no commit, no tracked change), a second save
 #      inside 5 s is `coalesced`, a checkpoint that fails its own completeness gate is `incomplete`
 #   6  interrupt: `not-running` (nothing written) while idle; while working it writes ONE 0600 request, a second is
@@ -28,7 +29,8 @@
 #      offered hook round-trips and every other one is refused, hooks-disabled never moving)
 #  11  mutants: the same checks run against deliberately broken copies of the module must FAIL (an allowlist that runs
 #      anything, a toggle gate that checks only `locked`, a dedupe that never remembers, a switch that needs no
-#      confirm, an interrupt that writes while idle, a hook that never consumes / ignores the TTL / is never cleared)
+#      confirm, a coop that needs no confirm, a mode list that drops coop, an interrupt that writes while idle, a hook
+#      that never consumes / ignores the TTL / is never cleared)
 #
 # Rate limits are real (burst 5 overall, 3 interrupts, 3 fallback changes, 6 toggles a minute, per server process), so
 # every group below that sends more than a few commands starts a FRESH server on the same repo -- fresh buckets.
@@ -234,8 +236,8 @@ ctl '{"action":"interrupt","params":{"rid":"r 1"}}'
 expect "1j. a rid outside [A-Za-z0-9_-] -> bad-params" 422 '.detail == "bad-params"'
 ctl '{"action":"interrupt","params":{"rid":"r23456789012345678901234567890123"}}'
 expect "1k. a rid of 33 chars -> bad-params" 422 '.detail == "bad-params"'
-ctl '{"action":"fallback-mode","params":{"mode":"coop"}}'
-expect "1l. fallback mode coop is not settable from the phone -> bad-params" 422 '.detail == "bad-params"'
+ctl '{"action":"fallback-mode","params":{"mode":"panic","confirm":true}}'
+expect "1l. a fallback mode heimdall-fallback does not know is bad-params even with confirm:true" 422 '.detail == "bad-params"'
 ctl '{"action":"fallback-mode","params":{"mode":"on"}}'
 expect "1m. fallback mode on (retired) -> bad-params" 422 '.detail == "bad-params"'
 ctl '{"action":"fallback-mode","params":{"mode":"switch","confirm":"yes"}}'
@@ -339,15 +341,90 @@ ctl '{"action":"fallback-mode","params":{"mode":"off"}}'
 expect "4g. off needs no confirm -> ok {mode:off, was:switch}" 200 '.ok == true and .result == {"mode":"off","was":"switch"}'
 "$FALLBACK" --repo "$FIX" set coop >/dev/null 2>&1
 S="$(state)"
-if printf '%s' "$S" | jq -e '.controls.fallback == {"mode":"coop","modes":["off","auto","switch"],"confirm":["auto","switch"]}' >/dev/null 2>&1; then
-  ok "4h. the state reports the laptop's coop mode and what the phone may set"
+if printf '%s' "$S" | jq -e '.controls.fallback == {"mode":"coop","modes":["off","auto","switch","coop"],"confirm":["auto","switch","coop"]}' >/dev/null 2>&1; then
+  ok "4h. the state reports the laptop's coop mode, all four modes the phone may set, and the three that need confirm"
 else
   bad "4h. controls.fallback is: $(printf '%s' "$S" | jq -c .controls.fallback)"
 fi
 ctl '{"action":"fallback-mode","params":{"mode":"off"}}'
 expect "4i. the phone can leave coop for off (reduce) -> ok, was coop" 200 '.ok == true and .result == {"mode":"off","was":"coop"}'
+
+# coop through the phone: it routes the allowlisted subagent roles off Claude, so it needs confirm like auto / switch, and it
+# moves the state word and nothing else -- the laptop's allowlist is never read, grown or shrunk from here. A fresh server:
+# the fallback bucket holds 3 and this uses all 3.
+"$FALLBACK" --repo "$FIX" coop add hmd:coder >/dev/null 2>&1
+start_ui "$FIX"
 ctl '{"action":"fallback-mode","params":{"mode":"coop"}}'
-expect "4j. ... but cannot go back to coop (a laptop-only, per-role state)" 422 '.detail == "bad-params"'
+expect "4j. coop without confirm -> 422 confirm-required" 422 '.ok == false and .detail == "confirm-required"'
+if [ "$(FB)" = "off" ]; then ok "4k. ... and the refusal moved nothing (heimdall-fallback still says off)"; else bad "4k. fallback state is $(FB)"; fi
+ctl '{"action":"fallback-mode","params":{"mode":"coop","confirm":true,"rid":"fb2"}}'
+expect "4l. coop with confirm:true -> ok {mode:coop, was:off}" 200 '.ok == true and .result == {"mode":"coop","was":"off"}'
+if [ "$(FB)" = "coop" ]; then ok "4m. heimdall-fallback itself now says coop"; else bad "4m. fallback state is $(FB)"; fi
+ctl '{"action":"fallback-mode","params":{"mode":"off"}}'
+expect "4n. off from coop needs no confirm -> ok {mode:off, was:coop}" 200 '.ok == true and .result == {"mode":"off","was":"coop"}'
+if "$FALLBACK" --repo "$FIX" coop list --json 2>/dev/null | jq -e '.coop_roles == ["hmd:coder"]' >/dev/null 2>&1; then
+  ok "4o. the laptop's coop allowlist rode through both flips untouched (still exactly hmd:coder)"
+else
+  bad "4o. the coop allowlist is now: $("$FALLBACK" --repo "$FIX" coop list --json 2>/dev/null)"
+fi
+"$FALLBACK" --repo "$FIX" coop remove hmd:coder >/dev/null 2>&1
+
+# every state heimdall-fallback's own `set` accepts -- read off ITS VALID_STATES, not off the module under test -- through the
+# phone's dispatcher in-process (rate limits reset between calls; the real heimdall-fallback runs each time): off is free,
+# every other one is refused without confirm with fallback.json byte-identical, lands with it, and the answer names the
+# previous state. The same pass checks the state key offers exactly those states and asks confirm for all but off.
+MATRIX="$(python3 - "$CTL_LIB" "$FALLBACK" <<'PYEOF'
+import importlib.machinery, importlib.util, json, os, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("c", sys.argv[1])
+C = importlib.util.module_from_spec(spec); spec.loader.exec_module(C)
+loader = importlib.machinery.SourceFileLoader("hmd_fallback", sys.argv[2])
+F = importlib.util.module_from_spec(importlib.util.spec_from_loader("hmd_fallback", loader)); loader.exec_module(F)
+root = os.path.join(os.environ["TMPDIR"], "matrix-repo"); os.makedirs(root, exist_ok=True)
+cfg_path = os.path.join(root, ".heimdall", "fallback.json")
+def raw():
+    try:
+        return open(cfg_path, "rb").read()
+    except OSError:
+        return None
+def landed():
+    return F.load_config(root)[0]["state"]
+states = list(F.VALID_STATES)
+fb = C.snapshot(root)["fallback"]
+drift = []
+if fb["modes"] != states:
+    drift.append("modes %r != VALID_STATES %r" % (fb["modes"], states))
+if fb["confirm"] != [s for s in states if s != "off"]:
+    drift.append("confirm %r is not every state but off" % (fb["confirm"],))
+bad, prev = [], "off"
+for state in states:
+    before = raw()
+    C._BUCKETS.clear()
+    ok, detail, _ = C.dispatch(root, "fallback-mode", {"mode": state})
+    if state == "off":
+        if not ok:
+            bad.append("off needed confirm: %s %s" % (ok, detail))
+    elif (ok, detail) != (False, "confirm-required") or raw() != before:
+        bad.append("%s without confirm: %s %s, file moved: %s" % (state, ok, detail, raw() != before))
+    C._BUCKETS.clear()
+    ok, detail, extra = C.dispatch(root, "fallback-mode", {"mode": state, "confirm": True})
+    want = {"mode": state} if state == prev else {"mode": state, "was": prev}
+    if not ok or extra.get("result") != want or landed() != state:
+        bad.append("%s with confirm: ok=%s detail=%s result=%s landed=%s" % (state, ok, detail, extra.get("result"), landed()))
+    prev = state
+print(json.dumps({"states": states, "drift": drift, "bad": bad}))
+PYEOF
+)"
+if printf '%s' "$MATRIX" | jq -e '.drift == [] and (.states | index("coop")) != null' >/dev/null 2>&1; then
+  ok "4p. state.controls.fallback.modes is exactly heimdall-fallback's VALID_STATES ($(printf '%s' "$MATRIX" | jq -r '.states | join(", ")')) and confirm is each of them but off"
+else
+  bad "4p. the offered modes drifted from heimdall-fallback: $MATRIX"
+fi
+if printf '%s' "$MATRIX" | jq -e '.bad == []' >/dev/null 2>&1; then
+  ok "4q. each of those states goes through the phone's dispatcher: off free, the rest refused without confirm and landed with it"
+else
+  bad "4q. state matrix: $MATRIX"
+fi
 
 # ═══ 5. save-checkpoint through the real heimdall-checkpoint ═════════════════════════════════════════════════
 HEAD0="$(git -C "$FIX" rev-parse HEAD)"
@@ -656,6 +733,12 @@ def checks(C):
     ok, detail, _ = d("fallback-mode", {"mode": "switch"})
     if (ok, detail) != (False, "confirm-required"):
         failed.append("switch ran without confirm: %r" % ((ok, detail),))
+    ok, detail, _ = d("fallback-mode", {"mode": "coop"})
+    if (ok, detail) != (False, "confirm-required"):
+        failed.append("coop ran without confirm, or was not offered at all: %r" % ((ok, detail),))
+    fb = C.snapshot(root)["fallback"]
+    if fb["modes"] != ["off", "auto", "switch", "coop"] or fb["confirm"] != ["auto", "switch", "coop"]:
+        failed.append("the state offers the wrong modes / confirm set: %r" % (fb,))
     ok, detail, _ = d("interrupt", {})
     if ok or os.path.exists(os.path.join(root, ".heimdall", "ui", "stop-request.json")):
         failed.append("interrupt wrote a request for a session that is not working")
@@ -682,6 +765,8 @@ mutants = [
     ("toggle-checks-only-locked", 'return entry.get("remote_toggle") is True and not entry.get("locked")', 'return not entry.get("locked")'),
     ("no-dedupe", "            if hit is not None:\n                ok, detail, extra = hit", "            if False:\n                ok, detail, extra = hit"),
     ("switch-needs-no-confirm", 'if mode in CONFIRM_MODES and fields["confirm"] is not True:', "if False:"),
+    ("coop-needs-no-confirm", 'CONFIRM_MODES = tuple(m for m in FALLBACK_MODES if m != "off")', 'CONFIRM_MODES = ("auto", "switch")'),
+    ("coop-not-offered", 'FALLBACK_MODES = ("off", "auto", "switch", "coop")', 'FALLBACK_MODES = ("off", "auto", "switch")'),
     ("interrupt-writes-while-idle", 'if attention.get("state") != "working":', "if False:"),
     ("stop-not-single-use", "os.replace(claim, os.path.join(root, STOP_CONSUMED_REL))\n        return record", "os.replace(claim, path)\n        return record"),
     ("ttl-ignored", "return -5.0 <= now - requested < STOP_TTL_S", "return True"),
@@ -704,7 +789,7 @@ MUTOUT="$(python3 "$MUT" "$CTL_LIB" 2>&1)"
 if printf '%s' "$MUTOUT" | grep -q '^REAL \[\]$'; then ok "11a. the checks pass against the real module"; else bad "11a. the checks fail on the real module: $(printf '%s' "$MUTOUT" | head -2)"; fi
 SURV="$(printf '%s' "$MUTOUT" | grep -c ' SURVIVED \| NO-ANCHOR' || true)"
 CAUGHT="$(printf '%s' "$MUTOUT" | grep -c ' CAUGHT ' || true)"
-if [ "$CAUGHT" = "8" ] && [ "$SURV" = "0" ]; then ok "11b. all 8 mutants (allowlist, toggle gate, dedupe, confirm, idle write, single use, TTL, prompt clear) are caught"; else bad "11b. caught $CAUGHT of 8, survived/no-anchor $SURV: $(printf '%s' "$MUTOUT" | grep MUTANT)"; fi
+if [ "$CAUGHT" = "10" ] && [ "$SURV" = "0" ]; then ok "11b. all 10 mutants (allowlist, toggle gate, dedupe, confirm, coop confirm, coop offered, idle write, single use, TTL, prompt clear) are caught"; else bad "11b. caught $CAUGHT of 10, survived/no-anchor $SURV: $(printf '%s' "$MUTOUT" | grep MUTANT)"; fi
 
 echo
 echo "$PASS passed, $FAIL failed"
