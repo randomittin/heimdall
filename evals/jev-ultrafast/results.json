@@ -1,0 +1,532 @@
+{
+  "date": "2026-10-05",
+  "reps": 3,
+  "summary": {
+    "hmd": {
+      "crawl": {
+        "pass": 6,
+        "n": 6,
+        "median_secs": 2.139,
+        "median_tokens": 135096
+      },
+      "doc-fact": {
+        "pass": 18,
+        "n": 18,
+        "median_secs": 1.126,
+        "median_tokens": 6999
+      },
+      "interaction": {
+        "pass": 0,
+        "n": 6,
+        "median_secs": 0.0,
+        "median_tokens": 0
+      },
+      "js-rendered": {
+        "pass": 0,
+        "n": 6,
+        "median_secs": 1.717,
+        "median_tokens": 13
+      },
+      "meta": {
+        "pass": 6,
+        "n": 6,
+        "median_secs": 0.821,
+        "median_tokens": 620
+      },
+      "ALL": {
+        "pass": 30,
+        "n": 42,
+        "median_secs": 0.62,
+        "median_tokens": 694
+      }
+    },
+    "jev": {
+      "state": "BLOCKED",
+      "missing": [
+        "JEV_DIR (clone of browser-use/jev-ultrafast)",
+        "TYPESAFE_API_KEY",
+        "TEXT_MODEL_API_KEY"
+      ]
+    }
+  },
+  "rows": [
+    {
+      "id": "doc-python-json",
+      "cat": "doc-fact",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.515,
+          "tokens": 9499,
+          "bytes": 38140
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.506,
+          "tokens": 9499,
+          "bytes": 38140
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.393,
+          "tokens": 9499,
+          "bytes": 38140
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "doc-wikipedia-godel",
+      "cat": "doc-fact",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 1.147,
+          "tokens": 41045,
+          "bytes": 165019
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 1.78,
+          "tokens": 41045,
+          "bytes": 165019
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 1.646,
+          "tokens": 41045,
+          "bytes": 165019
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "doc-mdn-418",
+      "cat": "doc-fact",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.504,
+          "tokens": 764,
+          "bytes": 3056
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.465,
+          "tokens": 764,
+          "bytes": 3056
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.53,
+          "tokens": 764,
+          "bytes": 3056
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "doc-sqlite-limits",
+      "cat": "doc-fact",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 3.435,
+          "tokens": 4486,
+          "bytes": 17943
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 2.866,
+          "tokens": 4486,
+          "bytes": 17943
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 3.121,
+          "tokens": 4486,
+          "bytes": 17943
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "doc-semver",
+      "cat": "doc-fact",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.401,
+          "tokens": 4832,
+          "bytes": 19589
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.551,
+          "tokens": 4832,
+          "bytes": 19589
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 1.105,
+          "tokens": 4832,
+          "bytes": 19589
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "doc-rfc8259",
+      "cat": "doc-fact",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 2.005,
+          "tokens": 9167,
+          "bytes": 36670
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 1.843,
+          "tokens": 9167,
+          "bytes": 36670
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 1.232,
+          "tokens": 9167,
+          "bytes": 36670
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "crawl-live-pytutorial",
+      "cat": "crawl",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 5.988,
+          "tokens": 270095,
+          "bytes": 1082364
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 6.671,
+          "tokens": 270095,
+          "bytes": 1082364
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 3.788,
+          "tokens": 270095,
+          "bytes": 1082364
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "crawl-fixture-deep",
+      "cat": "crawl",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.489,
+          "tokens": 98,
+          "bytes": 389
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.303,
+          "tokens": 98,
+          "bytes": 389
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.347,
+          "tokens": 98,
+          "bytes": 389
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "meta-github-jev",
+      "cat": "meta",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 1.988,
+          "tokens": 617,
+          "bytes": 2470
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 2.49,
+          "tokens": 617,
+          "bytes": 2470
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 1.075,
+          "tokens": 617,
+          "bytes": 2470
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "meta-semver",
+      "cat": "meta",
+      "hmd": [
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.534,
+          "tokens": 624,
+          "bytes": 2504
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.568,
+          "tokens": 624,
+          "bytes": 2504
+        },
+        {
+          "status": "PASS",
+          "ok": true,
+          "rc": 0,
+          "secs": 0.507,
+          "tokens": 624,
+          "bytes": 2504
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "js-fixture-inject",
+      "cat": "js-rendered",
+      "hmd": [
+        {
+          "status": "FAIL",
+          "ok": false,
+          "rc": 0,
+          "secs": 0.429,
+          "tokens": 2,
+          "bytes": 8
+        },
+        {
+          "status": "FAIL",
+          "ok": false,
+          "rc": 0,
+          "secs": 1.126,
+          "tokens": 2,
+          "bytes": 8
+        },
+        {
+          "status": "FAIL",
+          "ok": false,
+          "rc": 0,
+          "secs": 0.672,
+          "tokens": 2,
+          "bytes": 8
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "js-live-quotes",
+      "cat": "js-rendered",
+      "hmd": [
+        {
+          "status": "FAIL",
+          "ok": false,
+          "rc": 0,
+          "secs": 2.366,
+          "tokens": 24,
+          "bytes": 95
+        },
+        {
+          "status": "FAIL",
+          "ok": false,
+          "rc": 0,
+          "secs": 2.308,
+          "tokens": 24,
+          "bytes": 95
+        },
+        {
+          "status": "FAIL",
+          "ok": false,
+          "rc": 0,
+          "secs": 2.421,
+          "tokens": 24,
+          "bytes": 95
+        }
+      ],
+      "jev": {
+        "status": "NOT_APPLICABLE",
+        "reason": "jev returns final URL, not extracted page text"
+      }
+    },
+    {
+      "id": "interact-fixture-form",
+      "cat": "interaction",
+      "hmd": [
+        {
+          "status": "UNSUPPORTED",
+          "reason": "hmd web is read-only (no click/type/submit)",
+          "ok": false,
+          "secs": 0.0,
+          "tokens": 0
+        },
+        {
+          "status": "UNSUPPORTED",
+          "reason": "hmd web is read-only (no click/type/submit)",
+          "ok": false,
+          "secs": 0.0,
+          "tokens": 0
+        },
+        {
+          "status": "UNSUPPORTED",
+          "reason": "hmd web is read-only (no click/type/submit)",
+          "ok": false,
+          "secs": 0.0,
+          "tokens": 0
+        }
+      ],
+      "jev": {
+        "status": "BLOCKED",
+        "missing": [
+          "JEV_DIR (clone of browser-use/jev-ultrafast)",
+          "TYPESAFE_API_KEY",
+          "TEXT_MODEL_API_KEY"
+        ]
+      }
+    },
+    {
+      "id": "interact-fixture-reveal",
+      "cat": "interaction",
+      "hmd": [
+        {
+          "status": "UNSUPPORTED",
+          "reason": "hmd web is read-only (no click/type/submit)",
+          "ok": false,
+          "secs": 0.0,
+          "tokens": 0
+        },
+        {
+          "status": "UNSUPPORTED",
+          "reason": "hmd web is read-only (no click/type/submit)",
+          "ok": false,
+          "secs": 0.0,
+          "tokens": 0
+        },
+        {
+          "status": "UNSUPPORTED",
+          "reason": "hmd web is read-only (no click/type/submit)",
+          "ok": false,
+          "secs": 0.0,
+          "tokens": 0
+        }
+      ],
+      "jev": {
+        "status": "BLOCKED",
+        "missing": [
+          "JEV_DIR (clone of browser-use/jev-ultrafast)",
+          "TYPESAFE_API_KEY",
+          "TEXT_MODEL_API_KEY"
+        ]
+      }
+    }
+  ]
+}

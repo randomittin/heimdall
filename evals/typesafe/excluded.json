@@ -1,0 +1,56 @@
+{
+ "excluded_prompts": [
+  {
+   "id": "a53e57f5cd9aad9b",
+   "reason": "agent-authored task prompt (claude -p style)"
+  },
+  {
+   "id": "4463edcdf51610ed",
+   "reason": "agent-authored task prompt"
+  },
+  {
+   "id": "e8972afda3a8bc9e",
+   "reason": "pasted terminal output, no user intent"
+  },
+  {
+   "id": "9517db0f6a39089b",
+   "reason": "agent-authored task prompt"
+  },
+  {
+   "id": "c39fe5c0b96a0476",
+   "reason": "test probe ('Reply with exactly')"
+  },
+  {
+   "id": "fe8c3d4fab5dc532",
+   "reason": "agent-authored task prompt"
+  },
+  {
+   "id": "dbeb6f1634ae6d80",
+   "reason": "hmd-authored notice pasted back"
+  },
+  {
+   "id": "ef431a1333e473ac",
+   "reason": "agent-authored task prompt"
+  },
+  {
+   "id": "ee8f89b802a52cce",
+   "reason": "pasted hook output"
+  },
+  {
+   "id": "d0498734a0d79d55",
+   "reason": "agent-authored task prompt"
+  },
+  {
+   "id": "18b23ba28c52bde1",
+   "reason": "agent-authored task prompt"
+  },
+  {
+   "id": "e5de77447e27009b",
+   "reason": "pasted agent error log"
+  },
+  {
+   "id": "2466642d5217aea1",
+   "reason": "pasted error line"
+  }
+ ]
+}

@@ -1,0 +1,19 @@
+{
+  "reps": 3,
+  "tasks": [
+    {"id": "doc-python-json", "cat": "doc-fact", "url": "https://docs.python.org/3/library/json.html", "expect": "JavaScript Object Notation"},
+    {"id": "doc-wikipedia-godel", "cat": "doc-fact", "url": "https://en.wikipedia.org/wiki/Kurt_G%C3%B6del", "expect": "April 28, 1906"},
+    {"id": "doc-mdn-418", "cat": "doc-fact", "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/418", "expect": "(?i)teapot"},
+    {"id": "doc-sqlite-limits", "cat": "doc-fact", "url": "https://www.sqlite.org/limits.html", "expect": "1,000,000,000"},
+    {"id": "doc-semver", "cat": "doc-fact", "url": "https://semver.org/", "expect": "incompatible API changes"},
+    {"id": "doc-rfc8259", "cat": "doc-fact", "url": "https://www.rfc-editor.org/rfc/rfc8259.html", "expect": "ECMA-404"},
+    {"id": "crawl-live-pytutorial", "cat": "crawl", "url": "https://docs.python.org/3/tutorial/index.html", "crawl": {"max_depth": 1, "max_pages": 6}, "expect": "(?i)virtual environments"},
+    {"id": "crawl-fixture-deep", "cat": "crawl", "path": "/index", "crawl": {"max_depth": 2, "max_pages": 10}, "expect": "heron-7731"},
+    {"id": "meta-github-jev", "cat": "meta", "url": "https://github.com/browser-use/jev-ultrafast", "expect": "jev-ultrafast"},
+    {"id": "meta-semver", "cat": "meta", "url": "https://semver.org/", "expect": "(?i)semantic versioning"},
+    {"id": "js-fixture-inject", "cat": "js-rendered", "path": "/js", "expect": "kestrel-4402"},
+    {"id": "js-live-quotes", "cat": "js-rendered", "url": "https://quotes.toscrape.com/js/", "expect": "Albert Einstein"},
+    {"id": "interact-fixture-form", "cat": "interaction", "path": "/form", "goal": "Type the name Ada into the name field and submit the form.", "expect": "Thanks, Ada", "verify": "form_submitted"},
+    {"id": "interact-fixture-reveal", "cat": "interaction", "path": "/reveal", "goal": "Click the button that reveals the secret code.", "expect": "owl-9012", "verify": "reveal_clicked"}
+  ]
+}
