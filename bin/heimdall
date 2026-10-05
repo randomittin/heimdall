@@ -3364,6 +3364,31 @@ _heimdall_launch_cleanup() {
   exit "$rc"
 }
 
+# ── Skill pause for the life of a launch, shared by both launch paths ──
+#
+# Pauses the plugins this project does not need and records where the undo lives. Sets
+# SKILL_MGR and RESTORE_FILE, which _heimdall_launch_cleanup reads in the EXIT trap.
+#
+# ONE restore path per launch, chosen HERE and handed to BOTH halves. It used to be fetched
+# with `RESTORE_FILE=$("$SKILL_MGR" restore-file)` AFTER `activate` -- two skill-manager
+# processes, and restore-file built the path from its own `$$` -- so `activate` wrote one file,
+# the trap asked for another, `restore` found nothing and returned 0, and no launch ever put
+# back the skills it paused. The path is now a function of THIS shell's pid ($$ stays the
+# launcher's pid inside functions and subshells): the one pid that lives exactly as long as the
+# launch, which is what lets a later session tell that the file of a launcher that was killed is
+# stale and recover it. No path -> nothing is paused: an undo with nowhere to live would leave
+# the skills paused for good. Proof: test/skill-manager-restore.test.sh.
+_heimdall_skills_activate() {
+  SKILL_MGR="$PLUGIN_DIR/bin/skill-manager"
+  RESTORE_FILE=""
+  if [ -x "$SKILL_MGR" ]; then
+    RESTORE_FILE=$("$SKILL_MGR" restore-file "$$") || RESTORE_FILE=""
+    if [ -n "$RESTORE_FILE" ]; then
+      "$SKILL_MGR" activate "$WORK_DIR" "$RESTORE_FILE"
+    fi
+  fi
+}
+
 # --resume: continue the last Claude session AND load .planning/ state
 if [[ "${1:-}" == "--resume" || "${1:-}" == "-r" ]]; then
   ensure_node_path
@@ -3415,13 +3440,8 @@ except: pass
     echo "${PREAMBLE:-heimdall resumed}" > "$RESUME_PREAMBLE_FILE"
   fi
 
-  # Activate project-aware skills
-  SKILL_MGR="$PLUGIN_DIR/bin/skill-manager"
-  RESTORE_FILE=""
-  if [ -x "$SKILL_MGR" ]; then
-    "$SKILL_MGR" activate "$WORK_DIR"
-    RESTORE_FILE=$("$SKILL_MGR" restore-file)
-  fi
+  # Activate project-aware skills (sets SKILL_MGR / RESTORE_FILE for the EXIT trap below)
+  _heimdall_skills_activate
 
   cleanup_resume() { _heimdall_launch_cleanup "$RESUME_PREAMBLE_FILE"; }
   trap cleanup_resume EXIT
@@ -4789,12 +4809,7 @@ PREAMBLE_FILE=$(mktemp /tmp/heimdall-preamble-XXXXXX)
 echo "$PREAMBLE" > "$PREAMBLE_FILE"
 
 # Activate project-aware skill management (enable needed plugins, pause rest)
-SKILL_MGR="$PLUGIN_DIR/bin/skill-manager"
-RESTORE_FILE=""
-if [ -x "$SKILL_MGR" ]; then
-  "$SKILL_MGR" activate "$WORK_DIR"
-  RESTORE_FILE=$("$SKILL_MGR" restore-file)
-fi
+_heimdall_skills_activate
 
 cleanup() { _heimdall_launch_cleanup "$PREAMBLE_FILE"; }
 trap cleanup EXIT
