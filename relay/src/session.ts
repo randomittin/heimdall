@@ -1223,20 +1223,20 @@ export class SessionDO {
     replayEnvelope?: Envelope
   ): Promise<Response> {
     // hmd's half goes first because it is the one step here that can fail (a
-    // storage write, when hmd's stream is down). Failing after the socket was
+    // storage write, when hmd's leg is down). Failing after the socket was
     // accepted would leave one the phone never received — a ghost that
-    // `liveDeviceSocket` ranks newest and delivers hmd's frames into.
+    // `liveSocket` ranks newest and delivers hmd's frames into.
     if (hmdControlPayload) {
       await this.deliverToHmdStream(sessionId, hmdControlPayload);
     }
 
     // Newest device socket wins, and this is where "newest" is recorded:
     // one above every generation currently attached, written onto the socket
-    // so `liveDeviceSocket` can rank it against the others without this
+    // so `liveSocket` can rank it against the others without this
     // instance remembering anything (see DeviceSocketAttachment). Nothing
-    // already attached is closed here — see supersedeOlderDeviceSockets for
+    // already attached is closed here — see supersedeOlderSockets for
     // why that has to wait for a delivered frame.
-    const generation = this.nextDeviceGeneration();
+    const generation = this.nextGeneration(DEVICE_TAG);
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -1274,16 +1274,16 @@ export class SessionDO {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  /** Writes device_bound's hmd-facing payload (device_pubkey, bound_at) into
-   * hmd's GET /stream as a plaintext control frame — the one frame this
-   * relay ever holds back (see PENDING_HMD_CONTROL_KEY): if hmd's stream
-   * isn't open yet, this parks the encoded line in storage until
-   * handleStream flushes it, rather than dropping it because no one is
-   * currently listening (unlike a `state`/`command`/`ack` frame's fire-once
-   * `/frames` semantics, this control frame's only delivery describes a
-   * one-time event that already happened and must eventually reach hmd). In
-   * storage rather than memory because nothing keeps this object resident
-   * while hmd is away. */
+  /** Writes device_bound's hmd-facing payload (device_pubkey, bound_at) to
+   * hmd's leg — an NDJSON line or a WebSocket message, whichever is live — as a
+   * plaintext control frame: the one frame this relay ever holds back (see
+   * PENDING_HMD_CONTROL_KEY). If hmd isn't connected yet, this parks the
+   * encoded line in storage until handleStream or acceptHmdSocket flushes it,
+   * rather than dropping it because no one is currently listening (unlike a
+   * `state`/`command`/`ack` frame's fire-once `/frames` semantics, this control
+   * frame's only delivery describes a one-time event that already happened and
+   * must eventually reach hmd). In storage rather than memory because nothing
+   * keeps this object resident while hmd is away. */
   private async deliverToHmdStream(
     sessionId: string,
     payload: DeviceBoundToHmdPayload
@@ -1299,7 +1299,7 @@ export class SessionDO {
         ciphertext: null,
         payload,
       }) + "\n";
-    if (!this.writeToHmdStream(line)) {
+    if (!this.writeToHmd(line)) {
       await this.ctx.storage.put(PENDING_HMD_CONTROL_KEY, line);
     }
   }
@@ -1348,44 +1348,50 @@ export class SessionDO {
     // this Durable Object otherwise never ends on its own. A revoked session
     // is fully over — this is the ONLY path that ends it deliberately, and
     // the only one that stops the keepalive for good. An ordinary stream
-    // drop must never come through here: hmd is expected back.
+    // drop must never come through here: hmd is expected back. An hmd
+    // WebSocket is closed the same way, 4001 / "revoked", with no message
+    // first: hmd is the one ending it, as the NDJSON stream is told nothing.
     this.closeHmdStream();
+    this.closeHmdSockets(CLOSE_SESSION_ENDED, "revoked");
 
     return jsonResponse(200, { ok: true });
   }
 
   /**
+   * Every message on either WebSocket leg, routed by the socket's tag: an hmd
+   * socket's go to `handleHmdSocketMessage`, everything else is the phone's.
+   *
    * The phone leg's inbound path — and, before the 2026-09-24 audit, the
    * relay's single most dangerous line: it re-serialized anything that passed
    * a *structural* check straight into hmd's stream. Four gates now stand
    * between a phone socket and that stream, in cost order.
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (this.isHmdSocket(ws)) {
+      this.handleHmdSocketMessage(ws, message);
+      return;
+    }
     if (typeof message !== "string") return;
 
     // Per-socket state, read once: the session id for the log lines below that
     // are written before the record is read (see DeviceSocketAttachment.sid —
     // a freshly woken instance has no cached id), and the token expiry for
     // gate 4.
-    const attachment = deviceSocketAttachment(ws);
+    const attachment = socketAttachment(ws);
     const sessionId =
       typeof attachment.sid === "string" ? attachment.sid : (this.cachedSessionId ?? "unknown");
 
     // 1. INV-16, the half that was only ever enforced on `POST /frames`
     //    (finding 8). Checked before `JSON.parse` so an oversize message is
-    //    never parsed, and length-first so the encode below is itself bounded:
-    //    UTF-8 is never fewer bytes than characters, so a string longer than
-    //    the cap is over it regardless of contents.
-    if (
-      message.length > MAX_ENVELOPE_BYTES ||
-      new TextEncoder().encode(message).byteLength > MAX_ENVELOPE_BYTES
-    ) {
+    //    never parsed, and length-first (see `exceedsEnvelopeCap`) so the
+    //    encode inside it is itself bounded.
+    if (exceedsEnvelopeCap(message)) {
       logEvent("frame_rejected", {
         session_id: sessionId,
         leg: "device",
         reason: "envelope_exceeds_size_cap",
       });
-      this.closeDeviceSocket(ws, CLOSE_MESSAGE_TOO_BIG, "frame exceeds size cap");
+      this.closeSocket(ws, CLOSE_MESSAGE_TOO_BIG, "frame exceeds size cap");
       return;
     }
 
@@ -1423,7 +1429,7 @@ export class SessionDO {
         leg: "device",
         reason: "session_not_bound",
       });
-      this.closeDeviceSocket(ws, CLOSE_SESSION_ENDED, "session ended");
+      this.closeSocket(ws, CLOSE_SESSION_ENDED, "session ended");
       return;
     }
 
@@ -1437,13 +1443,13 @@ export class SessionDO {
         leg: "device",
         reason: "device_token_expired",
       });
-      this.closeDeviceSocket(ws, CLOSE_TOKEN_EXPIRED, "device token expired");
+      this.closeSocket(ws, CLOSE_TOKEN_EXPIRED, "device token expired");
       return;
     }
 
-    if (this.writeToHmdStream(JSON.stringify(envelope) + "\n")) return;
+    if (this.writeToHmd(JSON.stringify(envelope) + "\n")) return;
 
-    // hmd's stream is down (mid-reconnect, or gone). The frame is dropped,
+    // hmd's leg is down (mid-reconnect, or gone). The frame is dropped,
     // not queued — the same fire-once semantics `POST /frames` reports as
     // `delivered: false` when the phone is absent (relay/README.md's "no
     // persisted frame buffering"). The phone's own `ack` timeout is what
@@ -1455,10 +1461,55 @@ export class SessionDO {
     });
   }
 
-  /** Ends a device socket the relay has decided to stop serving. Never throws
-   * past this boundary: a socket already closing or gone is exactly the state
-   * the caller wanted, and a throw here would take its `return` with it. */
-  private closeDeviceSocket(socket: WebSocket, code: number, reason: string): void {
+  /**
+   * An hmd socket's message. hmd POSTs every frame it sends over HTTP
+   * (`POST /frames`), so the only thing it ever sends on this socket is the text
+   * `ping`, which the runtime answers itself and which never reaches this
+   * handler. What does reach it is therefore either a message that is too big
+   * (INV-16, the same cap and the same close as the phone's) or one this relay
+   * does not take on this leg — dropped and logged, never forwarded anywhere:
+   * hmd is not a source of frames for the phone over this socket.
+   */
+  private handleHmdSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+    if (typeof message !== "string") return;
+    const attachment = socketAttachment(ws);
+    const sessionId =
+      typeof attachment.sid === "string" ? attachment.sid : (this.cachedSessionId ?? "unknown");
+    if (exceedsEnvelopeCap(message)) {
+      logEvent("frame_rejected", {
+        session_id: sessionId,
+        leg: "hmd",
+        reason: "envelope_exceeds_size_cap",
+      });
+      this.closeSocket(ws, CLOSE_MESSAGE_TOO_BIG, "frame exceeds size cap");
+      return;
+    }
+    logEvent("frame_rejected", {
+      session_id: sessionId,
+      leg: "hmd",
+      reason: "ws_message_unsupported",
+    });
+  }
+
+  /** The tags `acceptWebSocket` gave `ws` — which leg it is. A socket the
+   * runtime no longer knows throws; that reads as "no tags", never as an
+   * exception out of a message or close handler. */
+  private socketTags(ws: WebSocket): string[] {
+    try {
+      return this.ctx.getTags(ws);
+    } catch {
+      return [];
+    }
+  }
+
+  private isHmdSocket(ws: WebSocket): boolean {
+    return this.socketTags(ws).includes(HMD_TAG);
+  }
+
+  /** Ends a socket the relay has decided to stop serving, on either leg. Never
+   * throws past this boundary: a socket already closing or gone is exactly the
+   * state the caller wanted, and a throw here would take its `return` with it. */
+  private closeSocket(socket: WebSocket, code: number, reason: string): void {
     try {
       socket.close(code, reason);
     } catch {
