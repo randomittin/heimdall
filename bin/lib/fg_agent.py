@@ -51,8 +51,8 @@ _FIELDS = ("in", "out", "read", "w5", "w1", "search")
 
 
 def _model_key(model):
-    key = re.sub(r"\[[^\]]*\]$", "", model or "")      # claude-opus-5-5[1m] -> claude-opus-5-5
-    return re.sub(r"-\d{8}$", "", key)                  # claude-opus-4-5-20251101 -> claude-opus-4-5
+    key = re.sub(r"\[[^\]]*\]$", "", model or "")      # drop a context-window suffix: <id>[1m] -> <id>
+    return re.sub(r"-\d{8}$", "", key)                  # drop a dated-snapshot suffix: <id>-YYYYMMDD -> <id>
 
 
 def price_for(model):
