@@ -329,10 +329,15 @@ omits. Same secrets discipline as STATUS FILE above -- never a token, key, or
 command/state plaintext. Rotates at EVENT_LOG_MAX_BYTES (4 MiB),
 single-generation (path -> path.1, clobbering any previous .1 -- same
 mechanism as bin/lib/companion_ui_inbox.py's _rotate_if_oversized). A write
-failure (unwritable dir, disk full, ...) disables the log for the rest of
-this process's life and prints exactly one stderr notice -- never blocks or
-crashes the client, and never retried (a second failure would otherwise mean
-a second notice, defeating the point).
+failure (unwritable dir, disk full, ...) drops that line and never blocks or
+crashes the client; the log is NOT switched off -- the next emit tries it
+again, so a full disk costs only the lines written while it lasted. The
+outage is reported once on stderr when it starts and once when writes work
+again (with how many failed; stderr is often a file on the same full disk, so
+the second notice is the one that gets written), never once per dropped line.
+stdout is held to the same rule: a failing write drops the line and never
+raises into the thread that emitted it -- the state loop, the stream thread
+and the connect threads all emit, and an exception out of emit() ended them.
 """
 
 import argparse
@@ -528,8 +533,6 @@ EVENT_LOG_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB, single-generation rotation to .1
 _event_log_path = None       # resolved by configure_event_log(); None before
                               # that call AND whenever logging is disabled --
                               # both cases mean "emit() writes nothing extra"
-_event_log_notified = False  # true once the one allowed stderr failure
-                              # notice (see _append_event_log) has fired
 
 # emit() is called from two threads with no prior coordination between them
 # (main()'s stream_thread running RelayClient._stream_loop, and the main
@@ -550,6 +553,44 @@ _event_log_notified = False  # true once the one allowed stderr failure
 # always a faithful mirror of stdout's own order -- whatever that order turns
 # out to be -- rather than an independently-racing second record of it.
 _emit_lock = threading.Lock()
+
+# OUTPUT SINKS THAT FAIL (disk full, quota, a vanished reader): stdout and the event log are written by emit(),
+# which runs on the state loop, the stream thread and the connect threads. `hmd app connect --relay --bg` points
+# stdout and stderr at temp files on the same volume as everything else this client writes, so when it fills,
+# an exception out of emit() ended whichever thread emitted -- the state loop included -- and the client stopped
+# sending state for good. A failing sink is therefore never allowed to raise into its caller and never switched
+# off: the line is dropped, the outage is reported once on stderr when it starts and once when writes work again
+# (stderr is usually a file on the same full disk, so the second notice is the one that gets written), and the
+# very next write tries the sink again.
+NOTICE_EVERY_S = 60.0   # a sink that flaps near a full disk still costs at most one notice per kind per this long
+_sinks_down = {}        # sink name -> writes that failed in the current outage; only touched under _emit_lock
+_notice_at = {}         # notice key -> time.monotonic() of the last notice written for it
+
+
+def _sink_notice(key, text):
+    """One stderr notice, at most once per `key` per NOTICE_EVERY_S. Never raises."""
+    now = time.monotonic()
+    last = _notice_at.get(key)
+    if last is not None and now - last < NOTICE_EVERY_S:
+        return
+    _notice_at[key] = now
+    try:
+        sys.stderr.write("heimdall-relay-client: %s\n" % text)
+    except Exception:  # stderr is a file on the same full disk, or closed: the notice is best effort
+        return
+
+
+def _sink_failed(name, err):
+    failed = _sinks_down.get(name, 0)
+    _sinks_down[name] = failed + 1
+    if not failed:
+        _sink_notice(name + ":down", "%s write failed (%s) -- continuing without it; will retry" % (name, err))
+
+
+def _sink_recovered(name):
+    failed = _sinks_down.pop(name, 0)
+    if failed:
+        _sink_notice(name + ":up", "%s writes recovered after %d failed" % (name, failed))
 
 
 def configure_event_log(repo_root):
@@ -590,14 +631,14 @@ def _append_event_log(obj):
     """Best-effort durable copy of one emit() line, plus an ISO-8601 UTC "ts"
     field the stdout copy never carries (STDOUT CONTRACT is unchanged).
     Never raises and never blocks the caller on failure: a broken log
-    (unwritable dir, disk full, ...) disables itself for the rest of this
-    process's life and prints exactly one stderr notice, then keeps going --
-    persisting events is a debugging convenience, not a correctness gate the
-    actual relay session depends on. Broad except-and-report is deliberate,
-    matching this file's own convention at every non-critical I/O boundary
-    (e.g. run_state_loop's per-tick try/except, or _atomic_write_json's
-    try/except above)."""
-    global _event_log_path, _event_log_notified
+    (unwritable dir, disk full, ...) drops this line, reports the outage once
+    (see _sink_failed) and is tried again by the next emit -- persisting
+    events is a debugging convenience, not a correctness gate the actual
+    relay session depends on, but a log that hit a full disk must come back
+    when space does, so it is never switched off. Broad except-and-report is
+    deliberate, matching this file's own convention at every non-critical
+    I/O boundary (e.g. run_state_loop's per-tick try/except, or
+    _atomic_write_json's try/except above)."""
     if _event_log_path is None:
         return
     try:
@@ -615,18 +656,20 @@ def _append_event_log(obj):
             f.flush()
             os.fsync(f.fileno())
     except Exception as e:
-        _event_log_path = None
-        if not _event_log_notified:
-            _event_log_notified = True
-            sys.stderr.write(
-                "heimdall-relay-client: event log disabled after a write failure "
-                "(%s) -- continuing without it\n" % e)
+        _sink_failed("event log", e)
+    else:
+        _sink_recovered("event log")
 
 
 def emit(obj):
     with _emit_lock:
-        sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+        except OSError as e:  # a full disk under a redirected stdout: drop the line, never raise (see _sink_failed)
+            _sink_failed("stdout", e)
+        else:
+            _sink_recovered("stdout")
         _append_event_log(obj)
 
 
@@ -960,12 +1003,18 @@ class RelayClient:
             "event_log": _event_log_path,
         }
 
+    _status_failing = False  # the last status write failed: one `error` event per outage, not one per state frame
+
     def write_status(self):
         try:
             _atomic_write_json(self.status_path, self._status_snapshot())
         except OSError as e:
-            # bookkeeping only -- surfaced, never fatal to the caller
-            emit({"event": "error", "detail": "status write failed: %s" % e})
+            # bookkeeping only -- surfaced (once per outage), never fatal to the caller; the next call retries
+            if not self._status_failing:
+                self._status_failing = True
+                emit({"event": "error", "detail": "status write failed: %s" % e})
+        else:
+            self._status_failing = False
 
     # -- HTTP: one-shot requests --------------------------------------------
     def _request(self, method, path, headers=None, body=None, timeout=CONNECT_TIMEOUT_S, label="request"):

@@ -1869,8 +1869,9 @@ fi
 # ── Scenario L: durable event log -- an unwritable directory (os.makedirs
 # fails at the very first missing path component) never blocks or crashes
 # the client: it prints exactly one stderr notice and keeps emitting to
-# stdout normally for the rest of its life (never retried -- see
-# _append_event_log's docstring) ────────────────────────────────────────────
+# stdout normally, and the log is NOT switched off -- once the directory is
+# writable again the very next emit lands in it (see _append_event_log's
+# docstring; the full-disk version is test/relay-client-enospc-recovery.test.sh) ─
 if [ "$(id -u)" = "0" ]; then
   skip "scenario L (unwritable event-log dir): running as root -- permission bits are not enforced"
 else
@@ -1879,7 +1880,7 @@ else
 
   UNWRITABLE_OUT_L="$TMPROOT/l.out"
   python3 - "$RELAY_CLIENT_RUN" "$REPO_L" >"$UNWRITABLE_OUT_L" 2>"$TMPROOT/l.err" <<'PYEOF'
-import importlib.util, sys
+import importlib.util, os, sys
 from importlib.machinery import SourceFileLoader
 
 client_path, repo_dir = sys.argv[1:3]
@@ -1894,7 +1895,11 @@ mod.emit({"event": "state_sent", "seq": 1})
 mod.emit({"event": "state_sent", "seq": 2})
 mod.emit({"event": "state_sent", "seq": 3})
 print("RESULT path_after %s" % mod._event_log_path)
-print("RESULT notified %r" % mod._event_log_notified)
+# the directory becomes writable again: the log must come back, not stay off for the rest of the process
+os.chmod(repo_dir, 0o700)
+mod.emit({"event": "state_sent", "seq": 4})
+with open(mod._event_log_path) as f:
+    print("RESULT recovered_lines %d" % sum(1 for line in f if '"seq":4' in line))
 sys.exit(0)
 PYEOF
   UNWRITABLE_RC_L=$?
@@ -1908,30 +1913,38 @@ PYEOF
 
   STDOUT_COUNT_L="$(grep -c '"event":"state_sent"' "$UNWRITABLE_OUT_L" 2>/dev/null || true)"
   [ -z "$STDOUT_COUNT_L" ] && STDOUT_COUNT_L=0
-  if [ "$STDOUT_COUNT_L" -eq 3 ]; then
-    ok "unwritable dir: all 3 emit() calls still reached stdout (client keeps running)"
+  if [ "$STDOUT_COUNT_L" -eq 4 ]; then
+    ok "unwritable dir: all 4 emit() calls (3 while unwritable, 1 after) still reached stdout (client keeps running)"
   else
-    bad "unwritable dir: expected 3 state_sent lines on stdout, got $STDOUT_COUNT_L"
+    bad "unwritable dir: expected 4 state_sent lines on stdout, got $STDOUT_COUNT_L"
   fi
 
-  STDERR_NOTICE_COUNT_L="$(grep -c 'event log disabled after a write failure' "$TMPROOT/l.err" 2>/dev/null || true)"
+  STDERR_NOTICE_COUNT_L="$(grep -c 'event log write failed' "$TMPROOT/l.err" 2>/dev/null || true)"
   [ -z "$STDERR_NOTICE_COUNT_L" ] && STDERR_NOTICE_COUNT_L=0
   if [ "$STDERR_NOTICE_COUNT_L" -eq 1 ]; then
-    ok "unwritable dir: exactly one stderr notice printed (not one per failed emit)"
+    ok "unwritable dir: exactly one failure notice printed (not one per failed emit)"
   else
-    bad "unwritable dir: expected exactly 1 stderr notice, got $STDERR_NOTICE_COUNT_L -- $(cat "$TMPROOT/l.err")"
+    bad "unwritable dir: expected exactly 1 failure notice, got $STDERR_NOTICE_COUNT_L -- $(cat "$TMPROOT/l.err")"
   fi
 
-  if grep -q 'RESULT path_after None' "$UNWRITABLE_OUT_L"; then
-    ok "unwritable dir: event log disabled itself (path reset to None) after the first failure"
+  CONFIGURED_PATH_L="$(sed -n 's/^RESULT configured_path //p' "$UNWRITABLE_OUT_L")"
+  PATH_AFTER_L="$(sed -n 's/^RESULT path_after //p' "$UNWRITABLE_OUT_L")"
+  if [ -n "$CONFIGURED_PATH_L" ] && [ "$CONFIGURED_PATH_L" != "None" ] && [ "$PATH_AFTER_L" = "$CONFIGURED_PATH_L" ]; then
+    ok "unwritable dir: the event log stays configured after the failures (retried, not switched off)"
   else
-    bad "unwritable dir: event log path was not reset to None after failure -- $(grep path_after "$UNWRITABLE_OUT_L")"
+    bad "unwritable dir: event log path changed after failure -- configured '$CONFIGURED_PATH_L', after '$PATH_AFTER_L'"
   fi
 
-  if grep -q 'RESULT notified True' "$UNWRITABLE_OUT_L"; then
-    ok "unwritable dir: _event_log_notified latched True"
+  if grep -q 'RESULT recovered_lines 1' "$UNWRITABLE_OUT_L"; then
+    ok "unwritable dir: once the dir is writable again the very next emit lands in the log"
   else
-    bad "unwritable dir: _event_log_notified never latched -- $(grep notified "$UNWRITABLE_OUT_L")"
+    bad "unwritable dir: the log never came back -- $(grep recovered_lines "$UNWRITABLE_OUT_L")"
+  fi
+
+  if grep -q 'event log writes recovered after 3 failed' "$TMPROOT/l.err"; then
+    ok "unwritable dir: one recovery notice names how many writes failed"
+  else
+    bad "unwritable dir: no 'recovered after 3 failed' notice -- $(cat "$TMPROOT/l.err")"
   fi
 fi
 
