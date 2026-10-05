@@ -225,10 +225,11 @@ class Connection:
         if not data:
             raise WsEof("the relay closed the connection")
         self.total_bytes += len(data)
+        self._buf += data
+        events = self._parse()  # a message declared over its cap is refused here, and named by its own size
         if self.max_total is not None and self.total_bytes > self.max_total:
             raise WsOverflow(0, self.total_bytes)
-        self._buf += data
-        return self._parse()
+        return events
 
     def _parse(self):
         events = []
