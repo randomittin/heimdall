@@ -185,6 +185,7 @@ REPUDIATIONS='do not summarize|do not paraphrase|does not make them|claims are w
 # gated by test/npm-readme-drift.test.sh).
 SURFACES=("$REPO/README.md" "$REPO/install.sh")
 [ -f "$REPO/packages/runheimdall/README.md" ] && SURFACES+=("$REPO/packages/runheimdall/README.md")
+[ -f "$REPO/packages/runhmd/README.md" ] && SURFACES+=("$REPO/packages/runhmd/README.md")   # the runhmd npm page
 REPO_SURFACES="${SURFACES[*]#$REPO/}"   # captured for the banner BEFORE site files land
 
 # ── the marketing site: a SIBLING repo, not a subdirectory ────────────────────

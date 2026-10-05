@@ -49,7 +49,7 @@ RAW="https://raw.githubusercontent.com/randomittin/heimdall"
 # ── Build a throwaway fake PLUGIN repo carrying only what sync-release requires ─
 make_fake_plugin() {  # $1 = dest dir
   local d="$1"
-  mkdir -p "$d/release" "$d/packages/runheimdall" "$d/.claude-plugin"
+  mkdir -p "$d/release" "$d/packages/runheimdall" "$d/packages/runhmd" "$d/.claude-plugin"
   cp "$SYNC_SRC" "$d/release/sync-release.sh"
   printf '{"redirects":[{"source":"/install","destination":"%s/%s/install.sh","permanent":true}]}\n' \
     "$RAW" "$OLD_TAG" > "$d/vercel.json"
@@ -58,6 +58,8 @@ make_fake_plugin() {  # $1 = dest dir
   printf '#!/usr/bin/env bash\ninstall() {\n  local DEFAULT_REF="%s"\n  echo "$DEFAULT_REF"\n}\n' "$OLD_TAG" > "$d/install.sh"
   printf '{"version":"0.0.1","heimdall":{"tag":"%s","installScriptUrl":"%s/%s/install.sh","sha256":"%s"}}\n' \
     "$OLD_TAG" "$RAW" "$OLD_TAG" "$OLD_SHA" > "$d/packages/runheimdall/package.json"
+  printf '{"version":"0.0.1","heimdall":{"tag":"%s","installScriptUrl":"%s/%s/install.sh","sha256":"%s","defaultCommand":"attack"}}\n' \
+    "$OLD_TAG" "$RAW" "$OLD_TAG" "$OLD_SHA" > "$d/packages/runhmd/package.json"
   printf '{"version":"0.0.1"}\n' > "$d/.claude-plugin/plugin.json"
 }
 
@@ -120,6 +122,19 @@ if [ -n "$WRAP_SHA" ] && [ "$WRAP_SHA" != "$OLD_SHA" ] \
   ok "netlify.toml comment sha256 == wrapper sha256 (reused, not recomputed)"
 else
   bad "netlify.toml sha mismatch (wrapper='$WRAP_SHA' comment='$(netlify_comment_sha "$SITE/netlify.toml")')"
+fi
+
+# Both npx wrappers carry the SAME pin: runhmd's package.json was re-pointed to the same tag,
+# url and digest as runheimdall's, and keeps the fields sync does not own.
+HMD_PKG="$PLUG/packages/runhmd/package.json"
+if [ "$(jq -r '.heimdall.sha256' "$HMD_PKG")" = "$WRAP_SHA" ] \
+   && [ "$(jq -r '.heimdall.tag' "$HMD_PKG")" = "$NEW_TAG" ] \
+   && [ "$(jq -r '.heimdall.installScriptUrl' "$HMD_PKG")" = "$RAW/$NEW_TAG/install.sh" ] \
+   && [ "$(jq -r '.version' "$HMD_PKG")" = "${NEW_TAG#v}" ] \
+   && [ "$(jq -r '.heimdall.defaultCommand' "$HMD_PKG")" = "attack" ]; then
+  ok "runhmd package.json re-pointed to the SAME tag/url/sha256 as runheimdall (and its other fields kept)"
+else
+  bad "runhmd package.json was not re-pointed in lockstep: $(jq -c '{version, heimdall}' "$HMD_PKG" 2>/dev/null)"
 fi
 
 if git -C "$SITE" log -1 --pretty=%s | grep -Fxq "chore(netlify): pin /install -> ${NEW_TAG}"; then

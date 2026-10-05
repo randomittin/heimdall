@@ -19,6 +19,9 @@
 #   E  two processes on one repo: exactly one sender, and a failover when the owner exits
 #   F  the sender against the PRODUCTION store (bin/lib/companion_push_store.py): registrations made through
 #      it, the kinds and timestamps it writes, DeviceNotRegistered pruning through its remove_tokens
+#   ERR an API-error turn end, end to end (PN3): the REAL companion_ui_attention collector over a transcript
+#      written in the shapes Claude Code writes -> a monitor over the production store -> a fake Expo:
+#      exactly one `error` push per error, none for a recovery, a user interrupt or an unflagged stop
 #
 # Hermetic: HOME / HEIMDALL_HOME / TMPDIR are a temp dir, every sender talks to a loopback fake through
 # HMD_PUSH_EXPO_URL, and HTTPS_PROXY points at a closed port so a push that tried to leave this machine
@@ -1198,6 +1201,206 @@ fake.close()
 print("done")
 PYEOF
 run_part D "$TMPROOT/part_d.py"
+
+# ── ERR. an API-error turn end, end to end (PN3) ─────────────────────────────────────────
+# `attention.kind:"error"` is derived by bin/lib/companion_ui_attention.py from Claude Code's own
+# transcript entry for a failed request (isApiErrorMessage:true). Part B proves the planner turns such
+# an attention into one error event; this part proves the two halves meet: a REAL collector run over a
+# transcript written in the shapes Claude Code writes, its output handed to a monitor over the
+# PRODUCTION store, a loopback fake Expo on the far end, and a clock the test drives.
+cat >"$TMPROOT/part_err.py" <<'PYEOF'
+import datetime
+import json
+import os
+import re
+import sys
+import time
+import uuid
+
+code, tmp = sys.argv[1], sys.argv[2]
+os.makedirs(tmp, exist_ok=True)
+sys.path.insert(0, os.path.join(code, "test", "lib"))
+import push_test_lib as T
+
+projects = os.path.join(tmp, "projects")
+os.makedirs(projects)
+os.environ["HMD_AGENT_PROJECTS_DIR"] = projects
+for name in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "SESSION_ID", "CLAUDE_CONFIG_DIR"):
+    os.environ.pop(name, None)
+
+CP = T.load("companion_push", os.path.join(code, "bin", "lib", "companion_push.py"))
+STORE = T.load("companion_push_store", os.path.join(code, "bin", "lib", "companion_push_store.py"))
+ATT = T.load("companion_ui_attention", os.path.join(code, "bin", "lib", "companion_ui_attention.py"))
+TOK, REF = T.expo_token("t"), T.session_ref()
+ID_RE = re.compile(r"a-[0-9a-f]{10}")
+RATE = "You've hit your session limit · resets 1:50am (Asia/Calcutta)"
+OVERLOADED = "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment."
+BODY = "The session stopped on an error. Open to see it."
+_n = [0]
+
+
+def stamp(age):
+    t = time.time() - age
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % int((t % 1) * 1000)
+
+
+class Run:
+    """One fixture repo with its Claude Code transcript, a PushMonitor over the production store (built the way
+    sentinels/hmd-ui.py builds it) aimed at a loopback fake Expo, and a clock the test drives. tick() is one poll of
+    the host: derive `attention` from the transcript with the real collector, hand the state to the monitor, run
+    the worker's pass."""
+
+    def __init__(self, min_run_s=0.0):
+        _n[0] += 1
+        self.root = os.path.realpath(os.path.join(tmp, "repo%d" % _n[0]))
+        os.makedirs(self.root)
+        pdir = os.path.join(projects, re.sub(r"[^A-Za-z0-9]", "-", self.root))
+        os.makedirs(pdir)
+        self.sid = str(uuid.uuid4())
+        self.path = os.path.join(pdir, self.sid + ".jsonl")
+        self.fake = T.FakeExpo()
+        STORE.register(self.root, TOK, "ios", ref=REF, label="api server")
+        self.events = []
+        self.m = CP.PushMonitor(self.root, emit=self.events.append, config={"min_run_s": min_run_s, "timeout_s": 3.0},
+                                sleep=lambda seconds: None, environ={"HMD_PUSH_EXPO_URL": self.fake.url},
+                                start_thread=False)
+        self.clock = 1000.0
+
+    def put(self, kind, text="", age=0.0, category="rate_limit", status=429):
+        """Append one entry in the shape Claude Code writes it, `age` seconds old. "error" is the synthetic assistant
+        entry of a request that failed (isApiErrorMessage:true, the category in `error`, the HTTP status); "noresp" the
+        same synthetic shape with the flag false ("No response requested.")."""
+        base = {"parentUuid": None, "isSidechain": False, "uuid": str(uuid.uuid4()), "timestamp": stamp(age),
+                "sessionId": self.sid, "entrypoint": "cli", "cwd": self.root}
+        if kind == "prompt":
+            rows = [dict(base, type="user", message={"role": "user", "content": text})]
+        elif kind == "tool":
+            tid = "toolu_" + uuid.uuid4().hex[:12]
+            call = {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": "echo hi"}}
+            result = {"type": "tool_result", "tool_use_id": tid, "content": "hi"}
+            rows = [dict(base, type="assistant", message={"role": "assistant", "stop_reason": "tool_use", "content": [call]}),
+                    dict(base, uuid=str(uuid.uuid4()), type="user", message={"role": "user", "content": [result]})]
+        elif kind == "end":
+            rows = [dict(base, type="assistant", message={"role": "assistant", "stop_reason": "end_turn",
+                                                           "content": [{"type": "text", "text": text}]})]
+        elif kind == "interrupt":
+            rows = [dict(base, type="user", message={"role": "user", "content": [
+                {"type": "text", "text": "[Request interrupted by user]"}]})]
+        elif kind == "turn":
+            rows = [dict(base, type="system", subtype="turn_duration", durationMs=1000)]
+        elif kind in ("error", "noresp"):
+            usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+            synthetic = {"id": str(uuid.uuid4()), "container": None, "model": "<synthetic>", "role": "assistant",
+                         "stop_details": None, "stop_reason": "stop_sequence", "stop_sequence": "", "type": "message",
+                         "content": [{"type": "text", "text": text or "No response requested."}], "usage": usage,
+                         "context_management": None}
+            row = dict(base, type="assistant", isApiErrorMessage=(kind == "error"), message=synthetic)
+            if kind == "error":
+                row.update(error=category, apiErrorStatus=status)
+            rows = [row]
+        else:
+            raise ValueError(kind)
+        with open(self.path, "a", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    def tick(self, dt):
+        self.clock += dt
+        att = ATT.collect(self.root)
+        self.m.observe(T.state(att), self.clock)
+        self.m.step(self.clock)
+        return att
+
+    def kinds(self):
+        return [msg["data"]["kind"] for msg in self.fake.messages()]
+
+    def close(self):
+        self.m.close()
+        self.fake.close()
+
+
+# ── ERR1. one error -> one push, however many polls follow ──
+run = Run()
+run.put("prompt", "fix the flaky test", age=300)
+run.put("tool", age=250)
+a0 = run.tick(0)
+T.eq((a0["state"], a0["kind"]), ("working", None), "ERR1a. a run in progress is working; this first tick is the monitor's silent baseline")
+run.put("error", RATE, age=5)
+run.put("turn", age=4.9)
+a1 = run.tick(1.0)
+T.check(a1["state"] == "idle" and a1["kind"] == "error" and a1["summary"] == RATE and ID_RE.fullmatch(a1["id"] or ""),
+        "ERR1b. the transcript's API-error entry is attention idle/error, its text the summary, with an episode id", a1)
+T.eq(len(run.fake.messages()), 0, "ERR1c. the error waits out the coalescing window like any non-approval event")
+run.tick(5.0)
+msgs = run.fake.messages()
+T.eq(len(msgs), 1, "ERR1d. exactly one message is POSTed for the error")
+if msgs:
+    T.eq((msgs[0]["to"], msgs[0]["title"], msgs[0]["body"], msgs[0]["data"]),
+         (TOK, "api server · agent error", BODY, {"v": 1, "ref": REF, "kind": "error", "ep": a1["id"]}),
+         "ERR1e. addressed to the registered token, the allowlisted title and body, the data keyed to that attention id")
+T.check("Calcutta" not in json.dumps(msgs) and "session limit" not in json.dumps(msgs),
+        "ERR1f. the provider's error text stays out of the notification (it rides attention.summary only)")
+for _ in range(5):
+    run.tick(30.0)
+T.eq(len(run.fake.messages()), 1, "ERR1g. the poller re-reading the same error episode sends nothing more")
+T.eq([(e["kind"], e["ok"], e["suppressed"]) for e in run.events if e.get("event") == "push"], [("error", True, None)],
+     "ERR1h. one log line: an error push, ok, not suppressed")
+
+# ── ERR2. recovery: work resuming clears the error and pushes nothing ──
+run.put("prompt", "continue", age=0.5)
+a2 = run.tick(30.0)
+T.check(a2["state"] == "working" and a2["kind"] is None and a2["summary"] is None and a2["id"] != a1["id"],
+        "ERR2a. a new prompt clears the error: working, kind and summary null, a new episode id", a2)
+run.put("tool", age=0.2)
+run.tick(30.0)
+T.eq(len(run.fake.messages()), 1, "ERR2b. the recovery sent no extra push")
+
+# ── ERR3. a second error is a new transition: one more push, keyed to its own id ──
+run.put("error", OVERLOADED, age=0.1, category="server_error", status=529)
+run.put("turn", age=0.05)
+a3 = run.tick(1.0)
+T.check(a3["kind"] == "error" and a3["id"] not in (a1["id"], a2["id"]) and a3["summary"] == OVERLOADED,
+        "ERR3a. the next failed request is a new error episode (distinct id)", a3)
+run.tick(15.0)
+T.eq(run.kinds(), ["error", "error"], "ERR3b. exactly one more error push")
+if len(run.fake.messages()) == 2:
+    T.eq(run.fake.messages()[1]["data"]["ep"], a3["id"], "ERR3c. the second push is keyed to the second episode")
+for _ in range(3):
+    run.tick(30.0)
+T.eq(len(run.fake.messages()), 2, "ERR3d. and only one")
+run.close()
+
+# ── ERR4. stops that are NOT errors never push an error ──
+STOPS = (("a user interrupt", "interrupt", ""),
+         ("an ordinary end_turn", "end", "All done."),
+         ("the unflagged synthetic 'No response requested.' entry (isApiErrorMessage false)", "noresp", ""))
+for label, kind, text in STOPS:
+    r = Run()
+    r.put("prompt", "work", age=60)
+    r.put("tool", age=30)
+    r.tick(0)
+    r.put(kind, text, age=4.0)
+    r.put("turn", age=3.9)
+    att = r.tick(1.0)
+    r.tick(10.0)
+    r.tick(30.0)
+    T.check(att["state"] == "idle" and att["kind"] == "stopped", "ERR4a. %s is attention idle/stopped, not error" % label, att)
+    T.check("error" not in r.kinds(), "ERR4b. %s: no error push (sent: %s)" % (label, r.kinds()), r.kinds())
+    r.close()
+
+# ── ERR5. an error left over from before the monitor started is a baseline, not a push ──
+r = Run()
+r.put("prompt", "old work", age=400)
+r.put("error", RATE, age=300)
+r.put("turn", age=299.9)
+b = r.tick(0)
+r.tick(10.0)
+r.tick(30.0)
+T.check(b["kind"] == "error" and r.kinds() == [], "ERR5. an API error already in the transcript when the monitor starts is silent", [b["kind"], r.kinds()])
+r.close()
+print("done")
+PYEOF
+run_part ERR "$TMPROOT/part_err.py"
 
 # ── E. two processes on one repo: exactly one sender, and a failover ─────────────────────
 cat >"$TMPROOT/push_child.py" <<'PYEOF'

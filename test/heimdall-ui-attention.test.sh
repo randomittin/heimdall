@@ -9,6 +9,10 @@
 #   U*  the collector in isolation (python, injected `now`): every state reachable from a
 #       synthetic transcript, the exact wire shape, id/since anchoring, secret scrub, session
 #       choice, and the cost bound (a 50 MB transcript, a 10 MiB final line, an unchanged file).
+#       U14 is PN3 (docs/HANDOFF-TO-HEIMDALL-push-notifications.md): an API-error turn end -- Claude
+#       Code's synthetic isApiErrorMessage:true entry -- is kind "error" with its scrubbed text, one id
+#       per error, cleared when work resumes; a user interrupt, a retry notice, a sub-agent's error and
+#       the unflagged synthetic "No response requested." are NOT errors.
 #   L*  the real server (bin/heimdall-ui): replay user-prompt -> stop-with-question -> stop-plain
 #       -> permission -> session-end and read .attention after every step; one /api/events frame
 #       per transition and none for repeated tool-call entries; the ETag stays put while tool
@@ -112,7 +116,8 @@ def iso(t):
 
 
 def entry(kind, age=0.0, text="", name="Bash", tid=None, tool_input=None, mode="default",
-          entrypoint="cli", sidechain=False, session=SID, pad=0):
+          entrypoint="cli", sidechain=False, session=SID, pad=0, category="rate_limit", status=429,
+          flagged=True, stop="stop_sequence"):
     t = time.time() - age
     if kind == "mode":
         return {"type": "permission-mode", "permissionMode": mode, "sessionId": session}
@@ -135,6 +140,26 @@ def entry(kind, age=0.0, text="", name="Bash", tid=None, tool_input=None, mode="
     elif kind == "interrupt":
         base.update(type="user", message={"role": "user", "content": [
             {"type": "text", "text": "[Request interrupted by user]"}]})
+    elif kind in ("error", "noresp"):
+        # Claude Code's SYNTHETIC assistant entry (model "<synthetic>", stop_reason "stop_sequence", zero usage), as read
+        # off real transcripts (2.1.241 - 2.1.288). A request that FAILED after Claude Code's own retries carries
+        # isApiErrorMessage:true, the failure's category in `error` and its HTTP status in apiErrorStatus (absent when
+        # there is none); `flagged` overrides the flag. "noresp" is the same synthetic shape with the flag false --
+        # "No response requested.", an ordinary stop.
+        usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+        base.update(type="assistant", isApiErrorMessage=flagged if kind == "error" else False, message={
+            "id": str(uuid.uuid4()), "container": None, "model": "<synthetic>", "role": "assistant",
+            "stop_details": None, "stop_reason": stop, "stop_sequence": "", "type": "message",
+            "content": [{"type": "text", "text": text if kind == "error" else "No response requested."}],
+            "usage": usage, "context_management": None})
+        if kind == "error":
+            base["error"] = category
+            if status is not None:
+                base["apiErrorStatus"] = status
+    elif kind == "retry":
+        # the notice Claude Code writes while it is still RETRYING a failed request (source request_retry)
+        base.update(type="system", subtype="api_error", level="error", retryAttempt=3, maxRetries=10,
+                    retryInMs=2000, source="request_retry", error="{'message': '529 Overloaded', 'status': 529}")
     else:
         raise ValueError(kind)
     return base
@@ -169,6 +194,9 @@ if __name__ == "__main__":
     elif a.kind == "stop":
         # end_turn + its turn_duration in ONE write: a Stop whose hooks have already finished
         append(a.file, entry("end", age=a.age + 0.01, text=a.text), entry("turn", age=a.age))
+    elif a.kind == "errstop":
+        # a failed request + its turn_duration in ONE write, the order Claude Code writes them
+        append(a.file, entry("error", age=a.age + 0.01, text=a.text), entry("turn", age=a.age))
     else:
         append(a.file, entry(a.kind, age=a.age, text=a.text, name=a.name, tool_input=ti,
                              mode=a.mode, pad=a.pad))
@@ -538,6 +566,106 @@ check("U13n. whitespace before marker is trimmed first: '   - text' -> 'text'", 
 g, root, p = case([tx.entry("end", age=5, text="-> Still a question?")])
 check("U13o. dash without space after is NOT stripped (not a list marker): '-> text' -> '-> text'", g["summary"] == "-> Still a question?", g)
 
+# U14 -- an API-error turn end is kind "error" (PN3, docs/HANDOFF-TO-HEIMDALL-push-notifications.md). The record shapes are
+# the ones Claude Code writes (tx.entry "error"): a synthetic assistant entry carrying isApiErrorMessage:true and the
+# failure's category in `error`. The same synthetic shape with the flag false ("No response requested.") is an ordinary stop.
+RATE = "You've hit your session limit · resets 1:50am (Asia/Calcutta)"
+OVERLOADED = ("API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. "
+              "If it persists, check your inference gateway (127.0.0.1:8787).")
+err = tx.entry("error", age=200, text=RATE)
+g, root, p = case([tx.entry("prompt", age=300), *tx.pair(age=250), err, tx.entry("turn", age=199.9)])
+check("U14. a settled API-error entry -> idle/error; summary = its text; options null; since = the entry's own timestamp; id a-<10 hex>",
+      g["state"] == "idle" and g["kind"] == "error" and g["summary"] == RATE and g["options"] is None
+      and abs(g["since"] - ts_of(err)) < 0.002 and ID_RE.match(g["id"] or ""), g)
+REAL_ERRORS = (   # (category, status, text): one of each failure family seen in real transcripts
+    ("rate_limit", 429, RATE),
+    ("rate_limit", 429, "API Error: Request rejected (429) · This request would exceed your account's rate limit. Please try again later."),
+    ("server_error", 529, OVERLOADED),
+    ("server_error", None, "API Error: The response stopped arriving. The response above may be incomplete."),
+    ("authentication_failed", None, "Login expired · Please run /login"),
+    ("authentication_failed", 401, "Failed to authenticate. API Error: 401 credits exhausted"),
+    ("invalid_request", None, "Prompt is too long"),
+    ("oauth_org_not_allowed", 403, "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"),
+    ("unknown", 400, "API Error: 400 Ambiguous model 'claude-opus-4-7'. Use provider/model prefix (ex: cc/claude-opus-4-7 or cw/claude-opus-4-7)."),
+)
+families = []
+for category, status, text in REAL_ERRORS:
+    g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text=text, category=category, status=status),
+                       tx.entry("turn", age=199.9)])
+    families.append((g["state"], g["kind"]))
+check("U14a. every failure family Claude Code records (rate/session limit, 5xx/529, auth, prompt too long, org policy, 400) is idle/error",
+      families == [("idle", "error")] * len(REAL_ERRORS), families)
+g, root, p = case([tx.entry("prompt", age=300), *tx.pair(age=250), tx.entry("noresp", age=200), tx.entry("turn", age=199.9)])
+check("U14b. falsifiable pair: the same synthetic entry with isApiErrorMessage:false ('No response requested.') is an ordinary stop -> idle/stopped, no summary",
+      g["state"] == "idle" and g["kind"] == "stopped" and g["summary"] is None, g)
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text=RATE, flagged="yes"), tx.entry("turn", age=199.9)])
+check("U14c. the flag must be the boolean true: a truthy non-boolean flag is no error -> idle/stopped", g["kind"] == "stopped", g)
+g, root, p = case([tx.entry("prompt", age=20), tx.entry("error", age=1, text=RATE)])
+check("U14d. an API-error entry with no turn_duration yet stays working (the same settle rule as any turn end)",
+      g["state"] == "working" and g["kind"] is None and g["summary"] is None, g)
+g = run(root, now=time.time() + 60)
+check("U14e. ... and settles to idle/error once SETTLE_S has passed", g["state"] == "idle" and g["kind"] == "error", g)
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text="API Error: 529 Overloaded. Retry the request?"),
+                   tx.entry("turn", age=199.9)])
+check("U14f. an error text that ends in '?' is no question: idle/error, options null, never needs_input",
+      g["state"] == "idle" and g["kind"] == "error" and g["options"] is None, g)
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text=RATE), tx.entry("turn", age=199.9)])
+g = run(root, sweep_receipt={"head_sha": "abcdef0123456789abcdef0123456789abcdef01"}, checkpoint={"head": "abcdef01"},
+        quality_gate={"clear_to_push": True})
+check("U14g. an error turn is never 'done', even with receipt, checkpoint and gate all agreeing", g["state"] == "idle" and g["kind"] == "error", g)
+secret14 = "ghp_" + "A1b2" * 9
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text="API Error: 401 rejected the token %s" % secret14),
+                   tx.entry("turn", age=199.9)])
+check("U14h. a secret-shaped error text -> summary null (the field only), kind still error, the secret nowhere in the result",
+      g["kind"] == "error" and g["summary"] is None and secret14 not in json.dumps(g), g)
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text=OVERLOADED, category="server_error", status=529),
+                   tx.entry("turn", age=199.9)])
+check("U14i. a text over 160 chars keeps the leading WHOLE sentences that fit (the gateway address in the tail is dropped)",
+      g["kind"] == "error" and g["summary"] == "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.", g)
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text="x" * 400), tx.entry("turn", age=199.9)])
+check("U14j. one overlong sentence is cut to exactly 160 chars, head first, with a trailing ellipsis",
+      g["kind"] == "error" and len(g["summary"]) == 160 and g["summary"].startswith("xxxx") and g["summary"].endswith("…"), g)
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text="Rate limit\nreached\n\n   try later\x07"),
+                   tx.entry("turn", age=199.9)])
+check("U14k. a multi-line text with control characters is flattened to one line", g["summary"] == "Rate limit reached try later", g)
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text=""), tx.entry("turn", age=199.9)])
+check("U14l. an error entry with no text is still idle/error, summary null", g["kind"] == "error" and g["summary"] is None, g)
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text=RATE, stop=None), tx.entry("turn", age=199.9)])
+check("U14m. the flag decides, not stop_reason: an API-error entry whose stop_reason is null is still idle/error",
+      g["state"] == "idle" and g["kind"] == "error", g)
+
+# U14 -- one id per error, cleared when work resumes, and what is NOT an error
+root, pdir, p = newroot()
+tx.append(p, tx.entry("prompt", age=300), tx.entry("error", age=250, text=RATE), tx.entry("turn", age=249.9))
+first_err = run(root)
+tx.append(p, tx.entry("prompt", age=200), tx.entry("error", age=100, text=RATE), tx.entry("turn", age=99.9))
+second_err = run(root)
+check("U14n. two errors in one session carry distinct attention ids (each anchored on its own entry)",
+      first_err["kind"] == second_err["kind"] == "error" and first_err["id"] != second_err["id"], [first_err["id"], second_err["id"]])
+clear()
+check("U14o. the id is deterministic: a cold re-derivation of the same transcript gives the same id", run(root)["id"] == second_err["id"])
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=200, text=RATE), tx.entry("turn", age=199.9)])
+err_id = g["id"]
+tx.append(p, tx.entry("prompt", age=5, text="continue"))
+g = run(root)
+check("U14p. work resuming (a new prompt) clears the error: working, kind and summary null, a different id",
+      g["state"] == "working" and g["kind"] is None and g["summary"] is None and g["id"] != err_id, g)
+tx.append(p, *tx.pair(age=1))
+g = run(root)
+check("U14q. ... tool calls keep it cleared", g["state"] == "working" and g["kind"] is None, g)
+tx.append(p, tx.entry("end", age=0.5, text="Resumed and finished."), tx.entry("turn", age=0.4))
+g = run(root)
+check("U14r. ... and a later ordinary stop is idle/stopped: the error does not stick", g["state"] == "idle" and g["kind"] == "stopped", g)
+g, root, p = case([tx.entry("prompt", age=300), tx.entry("error", age=250, text=RATE), tx.entry("turn", age=249.9),
+                   tx.entry("prompt", age=200), tx.entry("interrupt", age=100), tx.entry("turn", age=99.9)])
+check("U14s. a user interrupt is not an error, not even right after one: idle/stopped", g["state"] == "idle" and g["kind"] == "stopped", g)
+g, root, p = case([*settled, tx.entry("error", text=RATE, sidechain=True)])
+check("U14t. a sub-agent's (sidechain) API error is not the session's: still idle/stopped", g["state"] == "idle" and g["kind"] == "stopped", g)
+g, root, p = case([tx.entry("prompt", age=60), tx.entry("retry", age=50), tx.entry("retry", age=20)])
+check("U14u. retry notices (system/api_error: Claude Code is still retrying) are no error: working", g["state"] == "working" and g["kind"] is None, g)
+g, root, p = case([*settled, tx.entry("retry", age=5)])
+check("U14v. ... and one after a settled stop does not turn it into an error", g["state"] == "idle" and g["kind"] == "stopped", g)
+
 # U15 -- which transcript
 root, pdir, p_cli = newroot()
 sid_sdk = "bbbbbbbb-0000-4000-8000-000000000002"
@@ -810,6 +938,21 @@ fi
 python3 -c "import os,sys,time; t=time.time()-8*3600; os.utime(sys.argv[1],(t,t))" "$TX"; poke
 att_is "L8a. session-end (no write for 8h) -> {ended, null}" ended null
 exactly_frames "L8b. SSE: exactly one new frame for needs_approval -> ended" 6
+
+# L8c -- an API-error turn end (PN3): {idle, error} with the scrubbed text; the next prompt clears it
+ERR_TEXT="API Error: 529 Overloaded. This is a server-side issue, usually temporary - try again in a moment."
+txa errstop --text "$ERR_TEXT"; poke
+att_is "L8c. API-error turn end -> {idle, error}" idle '"error"'
+exactly_frames "L8d. SSE: exactly one new frame for ended -> idle/error" 7
+curl -s -o "$BODY" "$STATE_URL"
+if jq -e --arg t "$ERR_TEXT" '.attention.summary == $t and .attention.options == null and (.attention.id != null) and (.attention.since | type) == "number"' "$BODY" >/dev/null 2>&1; then
+  ok "L8e. the error carries its text as the summary, no options, a fresh id and a numeric since"
+else
+  bad "L8e. error payload wrong: $(jq -c .attention "$BODY")"
+fi
+txa prompt --text "continue"; poke
+att_is "L8f. the next prompt clears the error -> {working, null}" working null
+exactly_frames "L8g. SSE: exactly one new frame for idle/error -> working" 8
 
 # L9 -- a secret-shaped question: the field goes, the state stays
 SECRET="ghp_$(python3 -c 'print("A1b2" * 9)')"

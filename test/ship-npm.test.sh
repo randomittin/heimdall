@@ -15,7 +15,12 @@
 #      exit 0, which is the bug that let ship.sh print "✓ Shipped & verified" having
 #      published nothing;
 #   5. a package.json/manifest version mismatch is REFUSED rather than published;
-#   6. the happy path publishes and then READS THE VERSION BACK off the registry.
+#   6. the happy path publishes and then READS THE VERSION BACK off the registry;
+#   7-9. loud failure, TTY-attached publish, lagging-readback tolerance, §3 positioning notice;
+#   10-16. TWO wrappers (runheimdall + runhmd): the dry run lists both with name/version/pinned
+#      sha/files/command, both are published, a stale second package is refused before the first
+#      ships, preflight proves rights on both, and a default hmd command this tree does not
+#      dispatch is surfaced.
 #
 # R6 (checks must be able to fail): every case asserts a behaviour a regression would flip.
 # Case 3 and case 4 are the corrupt-and-confirm proofs — they stub npm to fail and assert a
@@ -77,9 +82,9 @@ case "$sub" in
     spec="${args[1]:-}"
     case "$spec" in
       *@*)  # pkg@version — is that EXACT version live?
-        ver="${spec##*@}"
+        ver="${spec##*@}"; name="${spec%@*}"
         [ "$mode" = "already-published" ] && { echo "$ver"; exit 0; }
-        [ -f "$state/published-$ver" ] && { echo "$ver"; exit 0; }
+        [ -f "$state/published-$name-$ver" ] && { echo "$ver"; exit 0; }
         echo "npm ERR! code E404 (simulated: $spec is not in the registry)" >&2; exit 1 ;;
       *)    # bare pkg — does the package exist at all?
         [ "${NPM_STUB_PKG_EXISTS:-1}" = "1" ] || { echo "npm ERR! code E404 (simulated)" >&2; exit 1; }
@@ -87,6 +92,7 @@ case "$sub" in
     esac ;;
   owner)
     [ "$mode" = "not-owner" ] && { echo "someone-else <nope@example.com>"; exit 0; }
+    [ "${NPM_STUB_NOT_OWNER_OF:-}" = "${args[2]:-}" ] && { echo "someone-else <nope@example.com>"; exit 0; }
     echo "$user <$user@example.com>"; exit 0 ;;
   publish)
     [ "$mode" = "publish-fail" ] && {
@@ -94,10 +100,12 @@ case "$sub" in
       echo "npm ERR! 403 Forbidden - PUT https://registry.npmjs.org/runheimdall (simulated)" >&2
       exit 1; }
     ver="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ./package.json | head -1)"
+    name="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ./package.json | head -1)"
     # publish-ok-lag: publish succeeds but the write is NOT made visible to `npm view` — the
     # read replica lags. Every other ok mode records the marker so readback sees it immediately.
-    [ "$mode" = "publish-ok-lag" ] || { mkdir -p "$state"; : > "$state/published-$ver"; }
-    echo "+ runheimdall@$ver"; exit 0 ;;
+    # The marker is per PACKAGE and version: two wrappers ship at one version.
+    [ "$mode" = "publish-ok-lag" ] || { mkdir -p "$state"; : > "$state/published-$name-$ver"; }
+    echo "+ $name@$ver"; exit 0 ;;
   *) exit 0 ;;
 esac
 STUB
@@ -398,6 +406,205 @@ if grep -q 'npm positioning is PENDING' "$C9U"; then
   ok "npm_positioning_notice STILL warns when §3 is genuinely undecided (pre-launch description)"
 else
   bad "npm_positioning_notice went silent on a genuinely undecided §3 — the warning was lost, not fixed"; sed 's/^/    /' "$C9U" >&2
+fi
+
+# ══ TWO wrappers: runheimdall + runhmd — one release, two npm names, one shared pin ══════
+# Cases 10-16 prove ship.sh treats packages/runhmd as a first-class publish target: the dry run
+# lists BOTH, preflight proves rights on BOTH, a stale second package is refused before the first
+# is published, and a wrapper whose default hmd command this tree does not dispatch is surfaced.
+HMD_PKG_DIR="$REPO/packages/runhmd"
+CUR_VER="$(jq -r '.version' "$REPO/.claude-plugin/plugin.json")"
+
+# ── Case 10: --dry-run lists BOTH wrappers — name, version, pinned sha, files, command ──
+n_pkg_lines="$(grep -c 'package         :' "$DRY" || true)"
+if [ "$n_pkg_lines" -eq 2 ] && grep -q 'package         : runheimdall$' "$DRY" && grep -q 'package         : runhmd$' "$DRY"; then
+  ok "--dry-run prints exactly TWO 'package         :' lines — runheimdall and runhmd"
+else
+  bad "--dry-run package lines: want runheimdall + runhmd (2), got $n_pkg_lines"; sed 's/^/    /' "$DRY" >&2
+fi
+for rel in runheimdall runhmd; do
+  d="$REPO/packages/$rel"
+  want_sha="$(jq -r '.heimdall.sha256' "$d/package.json")"
+  want_ver="$(jq -r '.version' "$d/package.json")"
+  if grep -Fq "pinned sha256   : $want_sha" "$DRY" \
+     && grep -Fq "package.json ver: $want_ver" "$DRY" \
+     && grep -Fq "cd $d && npm publish --access public --auth-type=web" "$DRY"; then
+    ok "--dry-run shows $rel: version $want_ver, its pinned sha256, its exact publish command"
+  else
+    bad "--dry-run is missing $rel's version / pinned sha256 / publish command"; sed 's/^/    /' "$DRY" >&2
+  fi
+done
+hmd_files_shown=1
+while IFS= read -r f; do
+  grep -Fq -- "- $f" "$DRY" || { hmd_files_shown=0; echo "    missing from dry-run output: $f" >&2; }
+done < <(jq -r '.files[]? // empty' "$HMD_PKG_DIR/package.json")
+if [ "$hmd_files_shown" -eq 1 ]; then
+  ok "--dry-run prints runhmd's files allowlist contents"
+else
+  bad "--dry-run omitted runhmd's files allowlist entries"
+fi
+if [ "$(grep -c "publish version : ${NEXT}" "$DRY" || true)" -eq 2 ]; then
+  ok "--dry-run prints the resolved publish version ($NEXT) once per wrapper"
+else
+  bad "--dry-run did not print the publish version for each wrapper"; sed 's/^/    /' "$DRY" >&2
+fi
+
+# ── Case 11: the publish stage publishes BOTH, runheimdall first ────────────────
+C11="$WORK/c11.out"
+(
+  cd "$REPO"
+  export NPM_STUB_STATE="$WORK/c11state" NPM_STUB_MODE="publish-ok"
+  PATH="$BIN_STUB:$PATH"
+  # shellcheck disable=SC1090
+  SHIP_SOURCE_ONLY=1 . "$SHIP"
+  REPO_ROOT="$REPO"
+  publish_npm_all "$(read_version)"
+) >"$C11" 2>&1
+c11_rc=$?
+if [ "$c11_rc" -eq 0 ] && [ -f "$WORK/c11state/published-runheimdall-$CUR_VER" ] && [ -f "$WORK/c11state/published-runhmd-$CUR_VER" ]; then
+  ok "publish_npm_all publishes runheimdall@$CUR_VER AND runhmd@$CUR_VER (exit 0)"
+else
+  bad "publish_npm_all did not publish both wrappers (rc=$c11_rc)"; sed 's/^/    /' "$C11" >&2
+fi
+ln_old="$(grep -n "published runheimdall@$CUR_VER to npm" "$C11" | head -1 | cut -d: -f1)"
+ln_new="$(grep -n "published runhmd@$CUR_VER to npm" "$C11" | head -1 | cut -d: -f1)"
+if [ -n "$ln_old" ] && [ -n "$ln_new" ] && [ "$ln_old" -lt "$ln_new" ]; then
+  ok "both publishes are reported, runheimdall before runhmd"
+else
+  bad "publish reports missing or out of order (runheimdall@L$ln_old runhmd@L$ln_new)"; sed 's/^/    /' "$C11" >&2
+fi
+
+# ── Case 12: idempotent per package — one already live, the other still published ──
+C12="$WORK/c12.out"
+mkdir -p "$WORK/c12state"; : > "$WORK/c12state/published-runheimdall-$CUR_VER"
+(
+  cd "$REPO"
+  export NPM_STUB_STATE="$WORK/c12state" NPM_STUB_MODE="publish-ok"
+  PATH="$BIN_STUB:$PATH"
+  # shellcheck disable=SC1090
+  SHIP_SOURCE_ONLY=1 . "$SHIP"
+  REPO_ROOT="$REPO"
+  publish_npm_all "$(read_version)"
+) >"$C12" 2>&1
+c12_rc=$?
+if [ "$c12_rc" -eq 0 ] && grep -q "runheimdall@$CUR_VER is ALREADY published" "$C12" \
+   && grep -q "published runhmd@$CUR_VER to npm" "$C12" && [ -f "$WORK/c12state/published-runhmd-$CUR_VER" ]; then
+  ok "an already-live runheimdall is skipped LOUDLY while runhmd is still published"
+else
+  bad "the per-package idempotent skip did not work (rc=$c12_rc)"; sed 's/^/    /' "$C12" >&2
+fi
+
+# ── Case 13: a stale SECOND wrapper is refused BEFORE the first is published ────────
+# Finding runhmd stale only after runheimdall is on an immutable registry is the half-shipped
+# state the all-packages check exists to prevent.
+FIXROOT="$WORK/fixroot"; mkdir -p "$FIXROOT/packages/runheimdall" "$FIXROOT/packages/runhmd"
+printf '{"name":"runheimdall","version":"2.2.6","files":["bin/runheimdall.js"]}\n' > "$FIXROOT/packages/runheimdall/package.json"
+printf '{"name":"runhmd","version":"0.0.1","files":["bin/runhmd.js"]}\n' > "$FIXROOT/packages/runhmd/package.json"
+C13="$WORK/c13.out"
+(
+  cd "$REPO"
+  export NPM_STUB_STATE="$WORK/c13state" NPM_STUB_MODE="publish-ok"
+  PATH="$BIN_STUB:$PATH"
+  # shellcheck disable=SC1090
+  SHIP_SOURCE_ONLY=1 . "$SHIP"
+  REPO_ROOT="$FIXROOT"
+  publish_npm_all "2.2.6"
+) >"$C13" 2>&1
+c13_rc=$?
+if [ "$c13_rc" -ne 0 ] && grep -q 'packages/runhmd/package.json is at 0.0.1' "$C13" \
+   && grep -q 'Refusing to publish a mismatched version' "$C13"; then
+  ok "a stale runhmd package.json is REFUSED, and named (rc=$c13_rc)"
+else
+  bad "a stale second wrapper was not refused (rc=$c13_rc)"; sed 's/^/    /' "$C13" >&2
+fi
+if ! ls "$WORK/c13state"/published-* >/dev/null 2>&1; then
+  ok "…and NOTHING was published — not even the up-to-date runheimdall"
+else
+  bad "runheimdall was published although runhmd was stale"; ls "$WORK/c13state" >&2
+fi
+
+# ── Case 14: preflight hard-fails when the second wrapper's package.json is missing ──
+FIXROOT2="$WORK/fixroot2"; mkdir -p "$FIXROOT2/packages/runheimdall"
+printf '{"name":"runheimdall","version":"2.2.6"}\n' > "$FIXROOT2/packages/runheimdall/package.json"
+C14="$WORK/c14.out"
+(
+  cd "$REPO"
+  export NPM_STUB_STATE="$WORK/c14state" NPM_STUB_MODE="publish-ok"
+  PATH="$BIN_STUB:$PATH"
+  # shellcheck disable=SC1090
+  SHIP_SOURCE_ONLY=1 . "$SHIP"
+  REPO_ROOT="$FIXROOT2"
+  preflight_npm_prereqs
+) >"$C14" 2>&1
+c14_rc=$?
+if [ "$c14_rc" -ne 0 ] && grep -q 'packages/runhmd/package.json not found' "$C14"; then
+  ok "preflight HARD-FAILS naming the missing packages/runhmd/package.json (rc=$c14_rc)"
+else
+  bad "preflight did not catch the missing second wrapper (rc=$c14_rc)"; sed 's/^/    /' "$C14" >&2
+fi
+
+# ── Case 15: publish RIGHTS are proven on the SECOND wrapper too ──────────────────
+C15="$WORK/c15.out"
+(
+  cd "$REPO"
+  export NPM_STUB_STATE="$WORK/c15state" NPM_STUB_MODE="publish-ok" NPM_STUB_NOT_OWNER_OF="runhmd"
+  PATH="$BIN_STUB:$PATH"
+  # shellcheck disable=SC1090
+  SHIP_SOURCE_ONLY=1 . "$SHIP"
+  REPO_ROOT="$REPO"
+  preflight_npm_prereqs
+) >"$C15" 2>&1
+c15_rc=$?
+if [ "$c15_rc" -ne 0 ] && grep -q "has publish rights on 'runheimdall'" "$C15" && grep -q "NOT an owner of 'runhmd'" "$C15"; then
+  ok "preflight proves rights on runheimdall, then HARD-FAILS on runhmd (not an owner)"
+else
+  bad "preflight did not check ownership of both wrappers (rc=$c15_rc)"; sed 's/^/    /' "$C15" >&2
+fi
+
+# ── Case 16: a wrapper whose default hmd command this tree does not dispatch is SURFACED ──
+# runhmd routes a bare path to `hmd attack`. A release whose bin/heimdall has no `attack`
+# subcommand treats that as a free-text task prompt and starts an agent session — and an npm
+# version is immutable. Loud when absent, silent when dispatched (also in a combined label), and
+# silent for a wrapper that declares no default command. SHIP_HMD_BIN points the check at a fixture.
+HMD_NO="$WORK/heimdall-no-attack"; printf 'case "${1:-}" in\n  demo)\n    :\n    ;;\n  help)\n    :\n    ;;\nesac\n' > "$HMD_NO"
+HMD_YES="$WORK/heimdall-with-attack"; printf 'case "${1:-}" in\n  demo)\n    :\n    ;;\n  prove|attack)\n    :\n    ;;\nesac\n' > "$HMD_YES"
+notice_for() {  # <hmd bin fixture> <package dir, repo-relative>
+  (
+    cd "$REPO"
+    PATH="$BIN_STUB:$PATH"
+    # shellcheck disable=SC1090
+    SHIP_SOURCE_ONLY=1 . "$SHIP"
+    REPO_ROOT="$REPO"
+    SHIP_HMD_BIN="$1" npm_default_command_notice "$2"
+  ) 2>&1
+}
+# Captured, then matched with a `case` — not `notice_for … | grep -q`: under pipefail grep -q's
+# early exit SIGPIPEs the writer and reports a false negative on a real match.
+NOTICE_NO="$(notice_for "$HMD_NO" packages/runhmd)"
+case "$NOTICE_NO" in
+  *"dispatches no 'attack' subcommand"*) ok "runhmd with a tree that has no 'attack' subcommand: the notice is LOUD" ;;
+  *) bad "no notice for a runhmd whose default command is not dispatched"; printf '%s\n' "$NOTICE_NO" | sed 's/^/    /' >&2 ;;
+esac
+if [ -z "$(notice_for "$HMD_YES" packages/runhmd)" ]; then
+  ok "…and SILENT once bin/heimdall dispatches it (here via a combined 'prove|attack)' label)"
+else
+  bad "the notice cried wolf although attack is dispatched"
+fi
+if [ -z "$(notice_for "$HMD_NO" packages/runheimdall)" ]; then
+  ok "…and SILENT for runheimdall, which declares no default command"
+else
+  bad "the notice fired for a wrapper with no default command"
+fi
+C16="$WORK/c16.out"
+(
+  cd "$REPO"
+  export NPM_STUB_STATE="$WORK/c16state" NPM_STUB_MODE="publish-ok"
+  PATH="$BIN_STUB:$PATH" SHIP_HMD_BIN="$HMD_NO" "$SHIP" --dry-run
+) >"$C16" 2>&1
+if grep -q "dispatches no 'attack' subcommand" "$C16"; then
+  ok "--dry-run surfaces the missing default command (the operator sees it before a publish)"
+else
+  bad "--dry-run did not surface the missing default command"; sed 's/^/    /' "$C16" >&2
 fi
 
 echo ""
