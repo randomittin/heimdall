@@ -203,9 +203,11 @@ export function isDeviceFrame(value: unknown): value is Envelope {
  *
  * `state` and `ack` are the set — `send_hmd_frame` in
  * `bin/heimdall-relay-client` is the single call site on that side and passes
- * only those two. Symmetric to `isDeviceFrame`: holding hmd's bearer token
- * must not let a caller mint a control frame the relay itself owns, nor
- * impersonate the device on the leg that feeds the phone.
+ * only those two — plus a plaintext `key_reveal` (see `isKeyReveal`), which
+ * hmd sends once, after a bind that came through a code window. Symmetric to
+ * `isDeviceFrame`: holding hmd's bearer token must not let a caller mint a
+ * control frame the relay itself owns, nor impersonate the device on the leg
+ * that feeds the phone.
  */
 export function isHmdFrame(value: unknown): value is Envelope {
   if (!isEnvelope(value)) return false;
