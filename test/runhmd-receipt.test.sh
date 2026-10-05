@@ -158,6 +158,9 @@ must_reject "tool.name other than hmd"            '.tool.name="other"'          
 must_reject "tool.version empty"                  '.tool.version=""'                                    '/tool/version'
 must_reject "verdict_sha256 not 64 hex"           '.verdict_sha256="deadbeef"'                          '/verdict_sha256'
 must_reject "key_id not 16 lowercase hex"         '.key_id="4F5478232BC96072"'                          '/key_id'
+must_reject "key_id with a trailing newline (Python's \$ alone would let it through)" '.key_id="4f5478232bc96072\n"' '/key_id'
+must_reject "id with a trailing newline"          '.id="a1b2c3d4e5f6\n"'                                '/id'
+must_reject "verdict_sha256 with a trailing newline" ".verdict_sha256=\"$HEX64\\n\""                    '/verdict_sha256'
 must_reject "signature that is not 64 bytes of base64" '.signature="AAAA"'                              '/signature'
 must_reject "signature with url-safe base64"      ".signature=\"$(printf '_%.0s' $(seq 1 86))==\""      '/signature'
 must_reject "finding without a digest"            'del(.findings[0].digest)'                            'digest'
@@ -185,6 +188,12 @@ must_reject "a gate marked falsified without a perfect score" '.gates[0].falsify
 
 printf 'not json{' >"$TMP/garbage.json"
 validate "$TMP/garbage.json"; [ "$VRC" -eq 1 ] && ok "rejects: input that is not JSON (exit 1)" || bad "rejects: input that is not JSON (rc=$VRC)"
+for odd in '{"schema":[]}' '{"schema":{"a":1}}' '[]' 'null' '{"schema":null}'; do
+  printf '%s' "$odd" >"$TMP/odd.json"
+  validate "$TMP/odd.json"
+  if [ "$VRC" -eq 1 ] && printf '%s' "$VERR" | grep -q "one of"; then ok "rejects with exit 1 and a message, not a traceback: $odd"
+  else bad "rejects cleanly: $odd (rc=$VRC: $(printf '%s' "$VERR" | tail -1))"; fi
+done
 
 # single source: the verdict vocabulary lives in ONE file and the receipt schema points at it
 check "the receipt schema borrows verdict/attacks/agent/gate/finding vocabulary by \$ref to the verdict schema file, not by copy" \
@@ -542,7 +551,10 @@ case("keygen: the public key file never contains the seed", open(key_path).read(
 case("keygen: refuses to overwrite an existing key", kind_of(lambda: rr.generate_key_files(key_dir)) == "key_exists")
 loaded = rr.load_signer(key_path)
 case("load_signer: reads the key file and reports the same key_id as keygen", loaded.key_id == key_id)
-case("load_trust: the public key file yields exactly that key", rr.load_trust([pub_path]) == {key_id: rr.load_trust([pub_path])[key_id]} and key_id in rr.load_trust([pub_path]))
+pub_lines = [l.strip() for l in open(pub_path).read().splitlines() if l.strip() and not l.startswith("#")]
+case("load_trust: the public key file holds one base64 line and yields exactly that key under its key_id",
+     len(pub_lines) == 1 and rr.load_trust([pub_path]) == {key_id: pub_lines[0]}
+     and key_id == hashlib.sha256(base64.b64decode(pub_lines[0])).hexdigest()[:16])
 signed_by_file = rr.issue_receipt(signer=loaded, id="b1b2c3d4e5f6", verdict="PROVEN", subject={"kind": "path", "head_sha": None, "tree_sha256": HEX("c")},
                                   attacks=PROVEN_OVER["attacks"], findings=[], agent={"name": "none", "model": None}, cost_usd=0, duration_s=0.5,
                                   verdict_sha256=HEX("d"), gates=PROVEN_OVER["gates"], created_at="2026-10-05T12:00:00Z")
@@ -560,10 +572,14 @@ os.environ["RUNHMD_RECEIPT_KEY_FILE"] = key_path
 case("RUNHMD_RECEIPT_KEY_FILE selects the signing key", rr.load_signer().key_id == key_id)
 del os.environ["RUNHMD_RECEIPT_KEY_FILE"]
 case("with no env and no default key file there is no signing key (never a silent mint)", kind_of(lambda: rr.load_signer()) == "no_signing_key")
-default_dir = os.path.join(WORK, "home", "signing"); os.makedirs(default_dir)
-rr.generate_key_files(default_dir)
-case("the default signing key lives at $HEIMDALL_HOME/signing/runhmd-receipt.key", rr.load_signer().key_id == rr.load_trust()[next(iter(rr.load_trust()))] and True or True)
-case("the default trust set is the public key beside it ($HEIMDALL_HOME/signing/runhmd-receipt.pub)", list(rr.load_trust()) == [rr.load_signer().key_id])
+default_dir = os.path.join(WORK, "home", "signing")
+d_key, d_pub, d_id = rr.generate_key_files(default_dir)
+case("the default signing key lives at $HEIMDALL_HOME/signing/runhmd-receipt.key",
+     d_key == os.path.join(default_dir, "runhmd-receipt.key") and rr.load_signer().key_id == d_id)
+repo_anchor_file = os.path.join(REPO, "release", "runhmd-receipt.pub")
+repo_anchor = set(rr.load_trust([repo_anchor_file])) if os.path.exists(repo_anchor_file) else set()
+case("the default trust set is the public key beside it ($HEIMDALL_HOME/signing/runhmd-receipt.pub) plus the in-repo release/runhmd-receipt.pub when that exists",
+     d_pub == os.path.join(default_dir, "runhmd-receipt.pub") and set(rr.load_trust()) == {d_id} | repo_anchor)
 
 two = os.path.join(WORK, "two.pub")
 open(two, "w").write("# receipt keys: current + previous (rotation)\n\n%s\n%s\n" % (pub, other_pub))
@@ -577,7 +593,9 @@ case("load_trust: a malformed line is a hard error, never skipped", kind_of(lamb
 short_pub = os.path.join(WORK, "short.pub"); open(short_pub, "w").write(base64.b64encode(b"x" * 31).decode() + "\n")
 case("load_trust: a key that is not 32 bytes is refused", kind_of(lambda: rr.load_trust([short_pub])) == "bad_trust")
 case("load_trust: a missing file is refused", kind_of(lambda: rr.load_trust([os.path.join(WORK, "nope.pub")])) == "bad_trust")
-case("load_trust: no explicit file, no env, no default key yields an empty set", (lambda: (os.environ.__setitem__("HEIMDALL_HOME", os.path.join(WORK, "empty-home")), rr.load_trust() == {})[1])())
+os.environ["HEIMDALL_HOME"] = os.path.join(WORK, "empty-home")
+case("load_trust: no explicit file, no env and no default key yields nothing beyond the in-repo anchor (an empty set is a config error at verify time)",
+     set(rr.load_trust()) == repo_anchor)
 
 # ── digests, privacy, tool version, store ────────────────────────────────────
 finding = {"id": "f-0001", "title": "t é", "severity": "high", "category": "auth",

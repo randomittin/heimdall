@@ -151,6 +151,17 @@ def _is_type(value, name):
     raise SchemaError("unsupported type name '%s'" % name)
 
 
+def _ecma(pattern):
+    """Python's `$` also matches just before a trailing newline; ECMA 262's (the dialect JSON
+    Schema patterns are written in) does not. An unescaped final `$` therefore becomes \\Z:
+    without it an id, a digest or a URL ending in a newline passed the pattern that forbids it."""
+    if pattern.endswith("$"):
+        backslashes = len(pattern) - 1 - len(pattern[:-1].rstrip("\\"))
+        if backslashes % 2 == 0:
+            return pattern[:-1] + r"\Z"
+    return pattern
+
+
 def _json_eq(a, b):
     """JSON equality: true != 1, 1 == 1.0."""
     if isinstance(a, bool) or isinstance(b, bool):
