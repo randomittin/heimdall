@@ -9,9 +9,9 @@
 # audit 2026-10-04, finding 12). `hmd hooks` was the same bug for one real command
 # and was fixed by adding its arm (dc5ef731); this suite pins the whole class.
 # `attack` (RP1) and `prove` (RP2) were the same bug for two more real commands and were
-# fixed the same way, one arm each -- so neither is an unknown word any more: the probes
-# below use words that are unknown on their own account, and sections 2, 6 and 8 assert
-# that `attack` and `prove` are KNOWN.
+# fixed the same way, one arm each; `receipt` (RP3) arrived with its arm. None of the three
+# is an unknown word, so the probes below use words that are unknown on their own account,
+# and sections 2, 6 and 8 assert that `attack`, `prove` and `receipt` are KNOWN.
 #
 # THE RULE UNDER TEST. After every dispatch arm and every flag block has had its
 # chance, whatever argv is left is classified by SHAPE alone:
@@ -101,6 +101,7 @@ make_stub heimdall-hooks
 make_stub heimdall-weekly-log
 make_stub heimdall-attack
 make_stub heimdall-prove
+make_stub heimdall-receipt
 
 # The launcher activates project skills before a launch and restores them in its EXIT
 # trap. A real install always has bin/skill-manager, so the sandbox carries a stub (section
@@ -216,10 +217,11 @@ run "$HMD" verison;     expect_rejected "hmd verison exits 2";         expect_su
 run "$HMD" --versoin;   expect_rejected "hmd --versoin exits 2";       expect_suggests "hmd --versoin -> --version" --version
 run "$HMD" Status;      expect_rejected "hmd Status exits 2";          expect_suggests "hmd Status -> status (case only)" status
 run "$HMD" updat;       expect_rejected "hmd updat exits 2";           expect_suggests "hmd updat -> update (a bare flag-ladder command)" update
-# attack and prove are dispatched commands now, so a typo of either is told what it meant: the
-# suggestion list is the dispatch text, and these two arms are in it.
+# attack, prove and receipt are dispatched commands now, so a typo of any is told what it meant:
+# the suggestion list is the dispatch text, and these arms are in it.
 run "$HMD" attak;       expect_rejected "hmd attak exits 2";           expect_suggests "hmd attak -> attack (a real subcommand, so a suggestion target)" attack
 run "$HMD" provee;      expect_rejected "hmd provee exits 2";          expect_suggests "hmd provee -> prove (a real subcommand, so a suggestion target)" prove
+run "$HMD" recipt;      expect_rejected "hmd recipt exits 2";          expect_suggests "hmd recipt -> receipt (a real subcommand, so a suggestion target)" receipt
 # `attack` and `prove` used to be in this list. Neither was ever "close to nothing": `hmd attack`
 # simply exited 3 on its consent gate, so the no-suggestion check passed on a run that never reached
 # the guard. The rejection is asserted here too, so a word that stops being unknown fails loudly
@@ -352,10 +354,10 @@ if [ "$RC" -eq 0 ] && grep -qF 'heimdall-weekly-log ARGS:' "$STUB_LOG" && ! laun
 else
   bad "hmd weekly-log routing broke -- exit=$RC stub=[$(snip "$STUB_LOG")] stderr=[$(snip "$ERR")]"
 fi
-# attack and prove: the bare word is exactly the shape the guard classifies as "a command attempt",
-# and both used to be rejected (or launched an agent) here. Each has a dispatch arm now, so the
-# lone word reaches its helper and the guard never sees it.
-for c in attack prove; do
+# attack, prove and receipt: the bare word is exactly the shape the guard classifies as "a command
+# attempt"; attack and prove used to be rejected (or launch an agent) here. Each has a dispatch arm
+# now, so the lone word reaches its helper and the guard never sees it.
+for c in attack prove receipt; do
   run "$FAKE/bin/heimdall" "$c"
   if [ "$RC" -eq 0 ] && grep -qF "heimdall-$c ARGS:" "$STUB_LOG" && ! err_has "unknown command" && ! launched; then
     ok "hmd $c (the bare word) routes to heimdall-$c: a known command, never rejected as unknown"
@@ -421,10 +423,11 @@ NCOUNT="$(printf '%s\n' "$NAMES" | grep -c .)"
 [ "$NCOUNT" -ge 60 ] \
   && ok "the extractor finds the dispatch ($NCOUNT names, floor 60)" \
   || bad "the extractor found only $NCOUNT names (want >= 60): it is not reading the dispatch"
-# NAMES is read out of the dispatch text; this list only says what it must contain. attack and
-# prove are ordinary case arms, named here because this suite once asserted them UNKNOWN.
+# NAMES is read out of the dispatch text; this list only says what it must contain. attack,
+# prove and receipt are ordinary case arms, named here because this suite once asserted attack
+# and prove UNKNOWN.
 for n in hooks version --version -V help demo team presence beat roster wrap unwrap 529-scan caveman-audit \
-         attack prove update --update --help -h --auto --resume --skills --team --uninstall; do
+         attack prove receipt update --update --help -h --auto --resume --skills --team --uninstall; do
   printf '%s\n' "$NAMES" | grep -qx -- "$n" \
     && ok "extractor includes '$n'" \
     || bad "extractor misses '$n'"

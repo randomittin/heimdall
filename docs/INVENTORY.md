@@ -20,11 +20,11 @@ README.md, first sentence: **"Heimdall makes your coding agent's work pass a tes
 | Plugin manifest name / display name | `jq -r '.name, .displayName' .claude-plugin/plugin.json` → `hmd`, `Heimdall` |
 | Marketplace entry | `jq -r '.plugins[0].name' .claude-plugin/marketplace.json` → `hmd` |
 | Canonical domain | `grep canonical IDENTITY.md` → `runheimdall.dev` |
-| Executables in `bin/` | `find bin -maxdepth 1 -type f -perm +111 \| wc -l` → 218 (220 files; `ls bin \| wc -l` → 222 incl. `lib/`, `protocol/`; a checkout that has run Python also holds an untracked `__pycache__/`) |
-| Python libraries in `bin/lib/` | `ls bin/lib/*.py \| wc -l` → 133 (of which `ls bin/lib/cp_*.py \| wc -l` → 47 control-plane) |
+| Executables in `bin/` | `find bin -maxdepth 1 -type f -perm +111 \| wc -l` → 219 (221 files; `ls bin \| wc -l` → 223 incl. `lib/`, `protocol/`; a checkout that has run Python also holds an untracked `__pycache__/`) |
+| Python libraries in `bin/lib/` | `ls bin/lib/*.py \| wc -l` → 136 (of which `ls bin/lib/cp_*.py \| wc -l` → 47 control-plane) |
 | Hooks in the registry | `bin/heimdall-hooks list --json \| jq length` → 36 |
 | Agents / commands / skills | `ls agents/*.md \| wc -l` → 16 · `ls commands/*.md \| wc -l` → 19 · `ls skills/*/SKILL.md \| wc -l` → 5 |
-| Test suites | `ls test/*.test.sh \| wc -l` → 467 |
+| Test suites | `ls test/*.test.sh \| wc -l` → 468 |
 | Oracles registered | `jq -r '.oracles \| keys[]' evals/oracles/registry.json \| wc -l` → 10 |
 | Corpus cases | `jq '.cases \| length' evals/corpus/INDEX.json` → 13 |
 
@@ -95,7 +95,7 @@ Also in `evals/oracles/`: `BLIND-VERIFICATION.md`, `REPORT-CONTRACT.md`, `change
 jq '{finished_at,head_sha,suites_total,suites_passed,suites_failed,assertions_passed,assertions_failed,duration_s,tree_clean}' .heimdall/receipts/last-sweep.json
 ```
 
-Last receipt at writing: **412/412 suites, 10,127 assertions passed, 0 failed**, 1037 s, `tree_clean: true`, at `b43c4f4b`. Suites added since bring the on-disk count to 467. CLAUDE.md rule: the full sweep runs **once**, immediately before the landing commit; `bin/heimdall-conformance` fails `gate-runs-once` / `gates-at-end` on the transcript otherwise. Commit `b43c4f4b` made the receipt immune to hmd's own post-commit publishing dirtying the tree (`test/sweep-receipt-gate.test.sh`).
+Last receipt at writing: **412/412 suites, 10,127 assertions passed, 0 failed**, 1037 s, `tree_clean: true`, at `b43c4f4b`. Suites added since bring the on-disk count to 468. CLAUDE.md rule: the full sweep runs **once**, immediately before the landing commit; `bin/heimdall-conformance` fails `gate-runs-once` / `gates-at-end` on the transcript otherwise. Commit `b43c4f4b` made the receipt immune to hmd's own post-commit publishing dirtying the tree (`test/sweep-receipt-gate.test.sh`).
 
 ### 2.7 The judgment invariant
 
@@ -296,13 +296,13 @@ Default posture is **network-on**: presence beats to the public control plane fr
 | Sentinels (spec H-3) | `sentinels/bloat.sh`, `doc-sync.sh`, `sanity.sh`, `security.sh`, `spec-drift.sh` | harness sentinels run per wave / pre-push |
 | Summary card | `bin/summary-card` | end-of-run card |
 
-`hmd --help` (`bin/heimdall --help`) subcommands: run a task · interactive · `--resume` · `--auto` · `--no-goal` · `--skip-checkpoint` · `--no-autocommit`/`--autocommit` · `--skills` · `--update` · `--setup` · `--team N` · `--reinstall` · `--uninstall` · `team` · `invite` · `join` · `connect` · `presence` · `tier` · `status` · `weekly-log` · `sla` · `report-issue` · `authenticity-check` · `queue …` · `queue drain` · `settings-guard` · `volatile-repo-guard`. The `bin/heimdall` router also dispatches many more verbs (`attack`, `prove`, `init`, `wrap`, `route`, `modules`, `fallback`, `ui`, `inbox`, `app`, `demo`, `sigil`, `funnel`, `hooks`, `caveman`, `verdict`, …) that `--help` does not list — see section 14.
+`hmd --help` (`bin/heimdall --help`) subcommands: run a task · interactive · `--resume` · `--auto` · `--no-goal` · `--skip-checkpoint` · `--no-autocommit`/`--autocommit` · `--skills` · `--update` · `--setup` · `--team N` · `--reinstall` · `--uninstall` · `team` · `invite` · `join` · `connect` · `presence` · `tier` · `status` · `weekly-log` · `sla` · `report-issue` · `authenticity-check` · `queue …` · `queue drain` · `settings-guard` · `volatile-repo-guard`. The `bin/heimdall` router also dispatches many more verbs (`attack`, `prove`, `receipt`, `init`, `wrap`, `route`, `modules`, `fallback`, `ui`, `inbox`, `app`, `demo`, `sigil`, `funnel`, `hooks`, `caveman`, `verdict`, …) that `--help` does not list — see section 14.
 
 ---
 
 ## 10. `bin/` inventory by group
 
-Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $f)" "$(sed -n '2,8p' "$f" | grep -m1 -E '^#[^!]' | cut -c1-150)"; done`. One line each; 218 executables.
+Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $f)" "$(sed -n '2,8p' "$f" | grep -m1 -E '^#[^!]' | cut -c1-150)"; done`. One line each; 219 executables.
 
 ### Entry points and dispatch
 | Executable | Purpose |
@@ -470,14 +470,14 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `benchmark` / `heimdall-bench` | honest-receipts benchmark harness; reproduce the public table locally |
 
 ### `bin/lib/` (shared)
-Shell: `hmd-gate-endpoint.sh` (judgment invariant), `hmd-adjudication-set.sh`, `hmd-route-claude`, `hmd-headroom-chain.sh`, `hmd-python.sh` (shim-avoiding interpreter resolver, cached, runs `-c pass` to validate), `hook-enabled.sh`, `heimdall-stub-patterns.sh`, `heimdall-verify.sh`, `heimdall-emit.sh`, `hmd-claude-mem-scrub.sh`, `hmd-claude-retry.sh`, `module_preflight.sh`, `session-liveness.sh`, `reachability.sh`, `real-home.sh`, `tcc-paths.sh`, `crontab-safe.sh`, `brief-core.sh`, `planning.sh`, `protocol.sh`, `dispatch.sh`, `select.sh`, `resume-contract.sh`, `rule-inventory.sh`, `cp-consent.sh`, `dream-data.sh`. Python: 47 `cp_*.py` control-plane modules (auth, allowlist, audit, enroll, presence, funnel, dashboard, jobrunner, jobstore, scheduler, worker, state/state_firestore, ratelimit, anomaly, approval, notify, iap, god, credforward, team_creds, team_queue, repoteam, publicsurface, registry_hygiene, cost_model, costjob, daily_budget, corpus/_aggregate/_synth, issue_*/ingest, maintainer_runner, selfcheck, diag, boot, config, nonce, session, handlers, server); `funnel.py`, `pmr_corpus.py`, `telemetry.py`, `run_telemetry.py`, `holdout.py`, `report.py`; `checker.py`, `redum.py`, `dedup.py`, `collision.py`, `symbolgraph*.py`, `treesitter_ast.py`, `astgrep_match.py`, `reuse_analyzer.py`; `verified_memory.py`, `vm_*.py`, `memory_codec.py`; `chat_*.py`; `issue_*.py`, `maintain_loop.py`, `work_queue.py`, `triage_handoff.py`, `land_consolidate.py`; `watch_data.py`, `watch_tui.py`, `watch_entry.py`; `paste_secret_filter.py`, `claude_cred.py`, `minisign_verify.py`, `attestation.py`; `designmatch_targets/`, `behavioral_diff.py`, `regen_log.py`, `design_path.py`; `runhmd_attack.py`, `runhmd_prove.py` (the `hmd attack` / `hmd prove` engines), `runhmd_schema.py` (the validator both import), `runhmd_card.py` (the 40-column verdict card); `skill_restore.py` (`bin/skill-manager`'s launch-scoped pause and restore of project skills); `web_fetch.py`, `md_convert.py`, `dream_data.py`, `persona_store.py`, `frontdoor.py`, `comprehension.py`, `branch_context.py`, `checkpoint_share.py`, `quota_stop.py`, `pressure_control.py`, `hmd_api_backend.py`, `hmd_plan_verify.py`, `repo_audit.py`, `repo_roster.py`, `connectors/`. Data: `tier-table.json`, `liveness-subsystems.conf`, `reachability-exemptions.tsv`.
+Shell: `hmd-gate-endpoint.sh` (judgment invariant), `hmd-adjudication-set.sh`, `hmd-route-claude`, `hmd-headroom-chain.sh`, `hmd-python.sh` (shim-avoiding interpreter resolver, cached, runs `-c pass` to validate), `hook-enabled.sh`, `heimdall-stub-patterns.sh`, `heimdall-verify.sh`, `heimdall-emit.sh`, `hmd-claude-mem-scrub.sh`, `hmd-claude-retry.sh`, `module_preflight.sh`, `session-liveness.sh`, `reachability.sh`, `real-home.sh`, `tcc-paths.sh`, `crontab-safe.sh`, `brief-core.sh`, `planning.sh`, `protocol.sh`, `dispatch.sh`, `select.sh`, `resume-contract.sh`, `rule-inventory.sh`, `cp-consent.sh`, `dream-data.sh`. Python: 47 `cp_*.py` control-plane modules (auth, allowlist, audit, enroll, presence, funnel, dashboard, jobrunner, jobstore, scheduler, worker, state/state_firestore, ratelimit, anomaly, approval, notify, iap, god, credforward, team_creds, team_queue, repoteam, publicsurface, registry_hygiene, cost_model, costjob, daily_budget, corpus/_aggregate/_synth, issue_*/ingest, maintainer_runner, selfcheck, diag, boot, config, nonce, session, handlers, server); `funnel.py`, `pmr_corpus.py`, `telemetry.py`, `run_telemetry.py`, `holdout.py`, `report.py`; `checker.py`, `redum.py`, `dedup.py`, `collision.py`, `symbolgraph*.py`, `treesitter_ast.py`, `astgrep_match.py`, `reuse_analyzer.py`; `verified_memory.py`, `vm_*.py`, `memory_codec.py`; `chat_*.py`; `issue_*.py`, `maintain_loop.py`, `work_queue.py`, `triage_handoff.py`, `land_consolidate.py`; `watch_data.py`, `watch_tui.py`, `watch_entry.py`; `paste_secret_filter.py`, `claude_cred.py`, `minisign_verify.py`, `attestation.py`; `designmatch_targets/`, `behavioral_diff.py`, `regen_log.py`, `design_path.py`; `runhmd_attack.py`, `runhmd_prove.py` (the `hmd attack` / `hmd prove` engines), `runhmd_schema.py` (the validator both import), `runhmd_card.py` (the 40-column verdict card), `runhmd_receipt.py` (issues and verifies the signed `runhmd.receipt/1`), `runhmd_receipt_cli.py` + `runhmd_receipt_site.py` (the `hmd receipt` CLI and its `/r/<id>` pages); `skill_restore.py` (`bin/skill-manager`'s launch-scoped pause and restore of project skills); `web_fetch.py`, `md_convert.py`, `dream_data.py`, `persona_store.py`, `frontdoor.py`, `comprehension.py`, `branch_context.py`, `checkpoint_share.py`, `quota_stop.py`, `pressure_control.py`, `hmd_api_backend.py`, `hmd_plan_verify.py`, `repo_audit.py`, `repo_roster.py`, `connectors/`. Data: `tier-table.json`, `liveness-subsystems.conf`, `reachability-exemptions.tsv`.
 
 ---
 
 ## 11. Tests and evals
 
 ```bash
-ls test/*.test.sh | wc -l                               # 467 suites
+ls test/*.test.sh | wc -l                               # 468 suites
 bash test/<one>.test.sh                                 # the normal loop — run constantly
 bash test/run-all.sh                                    # the full sweep — ONCE, before the landing commit
 jq .assertions_passed .heimdall/receipts/last-sweep.json
