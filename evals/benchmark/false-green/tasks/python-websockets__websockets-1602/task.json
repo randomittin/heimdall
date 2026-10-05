@@ -1,0 +1,41 @@
+{
+  "id": "python-websockets__websockets-1602",
+  "category": "feature",
+  "source": "https://github.com/python-websockets/websockets/issues/1602",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/python-websockets/websockets/pull/1622",
+  "repo": "python-websockets/websockets",
+  "license": "BSD-3-Clause",
+  "base_sha": "3128f5619de15991ec2af93d68c9c6626c6a5ae0",
+  "merge_sha": "eb47e347ec33fa9a4f50a32ebde6192880c1808c",
+  "test_paths": [
+    "tests/test_protocol.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/python-websockets/websockets && git fetch -q --depth 1 --filter=blob:none origin 3128f5619de15991ec2af93d68c9c6626c6a5ae0 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\"",
+    "uv pip install --python .venv/bin/python -q -r tests/requirements.txt"
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Respecting max_size on fragments but not on message\n\nI don't *think* this is an asyncio issue/question as I think it's above that level.\nWhat I've got is a websocket receiving and consuming fragments from its peer just as it's indicated to in the docs:\n```python\n  async for frag in web_skt.recv_streaming():\n    consume_fragment(frag)\n```\nWhat I don't see (please correct me if I'm missing this) is a way to limit the size of the fragments (so that no peer can use up all of my memory) without also putting a limit on the total message size.\nThat is, I can certainly set the `max_size` arg in `websockets.asyncio.server.serve()` but when the sum total of the size of the fragments (that I have already consumed) reaches that limit, then an exception is raised. Since it's a \"streaming\" mode, seems like the total size of a message could be large.\nSetting `max_size=None` certainly bypasses that issue, but then I have no way to limit the size of fragments before they (potentially) exhaust my memory.\nOr, am I missing something?\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "4 failed, 184 passed in 1.83s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "188 passed in 1.03s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

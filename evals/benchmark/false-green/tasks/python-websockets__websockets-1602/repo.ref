@@ -1,0 +1,6 @@
+repository: https://github.com/python-websockets/websockets
+issue: https://github.com/python-websockets/websockets/issues/1602
+pull_request: https://github.com/python-websockets/websockets/pull/1622
+base_sha: 3128f5619de15991ec2af93d68c9c6626c6a5ae0
+merge_sha: eb47e347ec33fa9a4f50a32ebde6192880c1808c
+license: BSD-3-Clause
