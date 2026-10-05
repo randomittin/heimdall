@@ -75,7 +75,7 @@ DEFAULT_MAX_BYTES, MAX_MAX_BYTES = 131072, 262144
 DEFAULT_SLICE_BYTES = 1048576 * 3 // 8        # the relay client passes 3/8 of ITS envelope cap
 BASE_JSON_BYTES = 256                         # the result's own keys, plus the slice wrapper, with room to spare
 RATE_LIMIT, RATE_WINDOW_S = 20, 60
-DEADLINE_S = 4.0                              # for the whole request; the phone waits 10 s for the ack
+DEADLINE_S = 6.0                              # for the whole request; the phone waits 10 s for the ack
 GIT_OUTPUT_CAP = 8 * 1024 * 1024
 UNTRACKED_MAX_BYTES = 2 * 1024 * 1024
 BINARY_SNIFF = 8000                           # git's own rule: a NUL in the first 8000 bytes is a binary file
@@ -208,9 +208,24 @@ def _tokens(out):
     return fields
 
 
-def _numstat(out):
-    """`git diff --numstat -z` -> [(path, old_path|None, add, del, binary)] in git's order. A binary file's `-` counts are 0."""
-    fields, entries, i = _tokens(out), [], 0
+def _changes(out):
+    """`git diff --raw --numstat -z` -> [(path, old_path|None, add, del, binary, status letter)] in git's order.
+    The raw records come first (`:modes shas STATUS`, then the name -- two names for a rename or copy), the numstat
+    records after them (`add TAB del TAB name`, a rename's name field empty and the two names after it). A binary
+    file's `-` counts are 0. One git run answers both, because a big diff is slow and the phone is waiting."""
+    fields, status, i = _tokens(out), {}, 0
+    while i < len(fields) and fields[i].startswith(":"):
+        letter = fields[i].split(" ")[-1][:1]
+        i += 1
+        if letter in ("R", "C"):
+            if i + 1 >= len(fields):
+                break
+            status[fields[i + 1]] = (letter, fields[i])
+            i += 2
+        elif i < len(fields):
+            status[fields[i]] = (letter, None)
+            i += 1
+    entries = []
     while i < len(fields):
         parts = fields[i].split("\t", 2)
         i += 1
@@ -224,26 +239,10 @@ def _numstat(out):
             old, path = fields[i], fields[i + 1]
             i += 2
         binary = added == "-" and removed == "-"
-        entries.append((path, old, 0 if binary or not added.isdigit() else int(added),
-                        0 if binary or not removed.isdigit() else int(removed), binary))
+        letter, renamed_from = status.get(path, ("M", None))
+        entries.append((path, old or renamed_from, 0 if binary or not added.isdigit() else int(added),
+                        0 if binary or not removed.isdigit() else int(removed), binary, letter))
     return entries
-
-
-def _name_status(out):
-    """`git diff --name-status -z` -> {path: (status letter, old_path|None)}, keyed by the name the file has now."""
-    fields, status, i = _tokens(out), {}, 0
-    while i < len(fields):
-        letter = fields[i][:1]
-        i += 1
-        if letter in ("R", "C"):
-            if i + 1 >= len(fields):
-                break
-            status[fields[i + 1]] = (letter, fields[i])
-            i += 2
-        elif i < len(fields):
-            status[fields[i]] = (letter, None)
-            i += 1
-    return status
 
 
 _ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
@@ -396,12 +395,11 @@ class ViewManager:
         rel = "/".join(segments) if segments else None
         if segments:
             self._check_path(segments, rel)
-        out, _ = self._git(self._diff_args(["--numstat", "-z"], req, rel), deadline)
-        entries = [e for e in _numstat(out) if _visible(e[0], e[1])]
+        out, _ = self._git(self._diff_args(["--raw", "--numstat", "-z"], req, rel), deadline)
+        entries = [e for e in _changes(out) if _visible(e[0], e[1])]
         if not entries:
             return self._unchanged(req, rel, segments, deadline)
-        out, _ = self._git(self._diff_args(["--name-status", "-z"], req, rel), deadline)
-        files, shown, truncated, used = self._files(entries, _name_status(out))
+        files, shown, truncated, used = self._files(entries)
         patch, capped = self._git(self._diff_args(["-U%d" % req["ctx"]], req, rel), deadline)
         hunks, raw, cut = self._collect(_hunks(patch.decode("utf-8", "replace")), shown, req["max_bytes"], used)
         return self._result_of(req, files, hunks, raw, truncated or capped or cut)
@@ -486,8 +484,10 @@ class ViewManager:
             os.close(fd)
 
     def _diff_args(self, shape, req, rel):
+        # The working tree against the index holds no renames (git pairs only what the index or HEAD names), and finding
+        # them costs a second pass over every changed file: so only the staged and head scopes look.
         args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-prefix", "--relative",
-                "--find-renames"] + shape
+                "--no-renames" if req["scope"] == "worktree" else "--find-renames"] + shape
         if req["scope"] == "staged":
             args.append("--cached")
         elif req["scope"] == "head":
@@ -541,15 +541,14 @@ class ViewManager:
         return b"".join(chunks), capped
 
     # -- the result ---------------------------------------------------------------------------------------------
-    def _files(self, entries, status):
+    def _files(self, entries):
         """The `files` list, in git's order, within the slice budget -> (files, paths shown, truncated, bytes used)."""
         files, shown, used, truncated = [], set(), BASE_JSON_BYTES, False
-        for path, old, added, removed, binary in entries:
-            letter, renamed_from = status.get(path, ("M", None))
+        for path, old, added, removed, binary, letter in entries:
             entry = {"path": path, "status": letter if letter in _STATUSES else "M", "add": added, "del": removed,
                      "binary": binary}
-            if entry["status"] in ("R", "C") and (old or renamed_from):
-                entry["old_path"] = old or renamed_from
+            if entry["status"] in ("R", "C") and old:
+                entry["old_path"] = old
             size = _jsize(entry) + 1
             if len(files) >= MAX_FILES or used + size > self._budget:
                 truncated = True
