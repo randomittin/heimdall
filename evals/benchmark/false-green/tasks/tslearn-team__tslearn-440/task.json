@@ -1,0 +1,41 @@
+{
+  "id": "tslearn-team__tslearn-440",
+  "category": "bugfix",
+  "source": "https://github.com/tslearn-team/tslearn/issues/440",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/tslearn-team/tslearn/pull/584",
+  "repo": "tslearn-team/tslearn",
+  "license": "BSD-2-Clause",
+  "base_sha": "92b76eb39cd92f29311809d7a7bda650b79ca3a0",
+  "merge_sha": "597071727bb46ffb91287f1de4ad4715293e44a8",
+  "test_paths": [
+    "tslearn/tests/test_clustering.py",
+    "tslearn/tests/test_svm.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/tslearn-team/tslearn && git fetch -q --depth 1 --filter=blob:none origin 92b76eb39cd92f29311809d7a7bda650b79ca3a0 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: TimeSeriesSVR input causes nan errors\n\n**Describe the bug**\r\nSome inputs fail when fitting and give the nan error when no nans exist in the data. I provide a minimal example here which gives the same error as my larger dataset but may/may not be the same root cause. Note that my larger dataset is trimmed to avoid the 405 datapoint limit reported elsewhere.\r\n\r\n**To Reproduce**\r\nThe following minimal example gives the error (see below)\r\n\r\nfrom tslearn.svm import TimeSeriesSVR\r\nfrom tslearn.utils import to_time_series_dataset\r\nimport numpy as np\r\nX = to_time_series_dataset([ np.ones(3),  np.ones(3)*2, np.ones(3)])\r\ny = [0, 3, 0.1]\r\nclf = TimeSeriesSVR(C=1., kernel=\"gak\")\r\nclf.fit(X, y)\r\n\r\n**Expected behavior**\r\nNot to fail but to actually fit, or give a better error message.\r\n\r\n**Environment (please complete the following information):**\r\n - Windows 11\r\n - tslearn version [0.5.3.2]\r\n - numpy [1.23.1]\r\n - python [3.10.5]\r\n \r\n\r\n**Additional context**\r\nHere is the error code:\r\n\r\n5 y = [0, 3, 0.1]\r\n6 clf = TimeSeriesSVR(C=1., kernel=\"gak\")\r\n----> 7 clf.fit(X, y)\r\nFile ~\\PyVenvs\\test2\\lib\\site-packages\\tslearn\\svm\\svm.py:552, in TimeSeriesSVR.fit(self, X, y, sample_weight)\r\n    544 sklearn_X, y = self._preprocess_sklearn(X, y, fit_time=True)\r\n    546 self.svm_estimator_ = SVR(\r\n    547     C=self.C, kernel=self.estimator_kernel_, degree=self.degree,\r\n    548     gamma=self.gamma_, coef0=self.coef0, shrinking=self.shrinking,\r\n    549     tol=self.tol, cache_size=self.cache_size,\r\n    550     verbose=self.verbose, max_iter=self.max_iter\r\n    551 )\r\n--> 552 self.svm_estimator_.fit(sklearn_X, y, sample_weight=sample_weight)\r\n    553 return self\r\n\r\nFile ~\\PyVenvs\\test2\\lib\\site-packages\\sklearn\\svm\\_base.py:192, in BaseLibSVM.fit(self, X, y, sample_weight)\r\n    190     check_consistent_length(X, y)\r\n    191 else:\r\n--> 192     X, y = self._validate_data(\r\n    193         X,\r\n    194         y,\r\n    195         dtype=np.float64,\r\n    196         order=\"C\",\r\n    197         accept_sparse=\"csr\",\r\n    198         accept_large_sparse=False,\r\n    199     )\r\n    201 y = self._validate_targets(y)\r\n    203 sample_weight = np.asarray(\r\n    204     [] if sample_weight is None else sample_weight, dtype=np.float64\r\n    205 )\r\n\r\nFile ~\\PyVenvs\\test2\\lib\\site-packages\\sklearn\\base.py:554, in BaseEstimator._validate_data(self, X, y, reset, validate_separately, **check_params)\r\n    552         y = check_array(y, input_name=\"y\", **check_y_params)\r\n    553     else:\r\n--> 554         X, y = check_X_y(X, y, **check_params)\r\n    555     out = X, y\r\n    557 if not no_val_X and check_params.get(\"ensure_2d\", True):\r\n\r\nFile ~\\PyVenvs\\test2\\lib\\site-packages\\sklearn\\utils\\validation.py:1104, in check_X_y(X, y, accept_sparse, accept_large_sparse, dtype, order, copy, force_all_finite, ensure_2d, allow_nd, multi_output, ensure_min_samples, ensure_min_features, y_numeric, estimator)\r\n   1099         estimator_name = _check_estimator_name(estimator)\r\n   1100     raise ValueError(\r\n   1101         f\"{estimator_name} requires y to be passed, but the target y is None\"\r\n   1102     )\r\n-> 1104 X = check_array(\r\n   1105     X,\r\n   1106     accept_sparse=accept_sparse,\r\n   1107     accept_large_sparse=accept_large_sparse,\r\n   1108     dtype=dtype,\r\n   1109     order=order,\r\n   1110     copy=copy,\r\n   1111     force_all_finite=force_all_finite,\r\n   1112     ensure_2d=ensure_2d,\r\n   1113     allow_nd=allow_nd,\r\n   1114     ensure_min_samples=ensure_min_samples,\r\n   1115     ensure_min_features=ensure_min_features,\r\n   1116     estimator=estimator,\r\n   1117     input_name=\"X\",\r\n   1118 )\r\n   1120 y = _check_y(y, multi_output=multi_output, y_numeric=y_numeric, estimator=estimator)\r\n   1122 check_consistent_length(X, y)\r\n\r\nFile ~\\PyVenvs\\test2\\lib\\site-packages\\sklearn\\utils\\validation.py:919, in check_array(array, accept_sparse, accept_large_sparse, dtype, order, copy, force_all_finite, ensure_2d, allow_nd, ensure_min_samples, ensure_min_features, estimator, input_name)\r\n    913         raise ValueError(\r\n    914             \"Found array with dim %d. %s expected <= 2.\"\r\n    915             % (array.ndim, estimator_name)\r\n    916         )\r\n    918     if force_all_finite:\r\n--> 919         _assert_all_finite(\r\n    920             array,\r\n    921             input_name=input_name,\r\n    922             estimator_name=estimator_name,\r\n    923             allow_nan=force_all_finite == \"allow-nan\",\r\n    924         )\r\n    926 if ensure_min_samples > 0:\r\n    927     n_samples = _num_samples(array)\r\n\r\nFile ~\\PyVenvs\\test2\\lib\\site-packages\\sklearn\\utils\\validation.py:161, in _assert_all_finite(X, allow_nan, msg_dtype, estimator_name, input_name)\r\n    144 if estimator_name and input_name == \"X\" and has_nan_error:\r\n    145     # Improve the error message on how to handle missing values in\r\n    146     # scikit-learn.\r\n    147     msg_err += (\r\n    148         f\"\\n{estimator_name} does not accept missing values\"\r\n    149         \" encoded as NaN natively. For supervised learning, you might want\"\r\n   (...)\r\n    159         \"#estimators-that-handle-nan-values\"\r\n    160     )\r\n--> 161 raise ValueError(msg_err)\r\n\r\nValueError: Input X contains NaN.\r\nSVR does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "2 failed, 5 passed, 16 warnings in 22.06s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "7 passed, 9 warnings in 18.41s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

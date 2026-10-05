@@ -1,0 +1,43 @@
+{
+  "id": "amaranth-lang__amaranth-1223",
+  "category": "feature",
+  "source": "https://github.com/amaranth-lang/amaranth/issues/1223",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/amaranth-lang/amaranth/pull/1234",
+  "repo": "amaranth-lang/amaranth",
+  "license": "BSD-2-Clause",
+  "base_sha": "c7f719ab9369660632e923028cb9c5450a4a37a8",
+  "merge_sha": "fa2adbef84ca173d3c19fba37cfd7a3a042635f5",
+  "test_paths": [
+    "tests/test_hdl_ast.py",
+    "tests/test_hdl_dsl.py",
+    "tests/test_hdl_ir.py",
+    "tests/test_sim.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/amaranth-lang/amaranth && git fetch -q --depth 1 --filter=blob:none origin c7f719ab9369660632e923028cb9c5450a4a37a8 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Signals with private names\n\nIn some cases it is desirable to create a signal with a name that doesn't show up in the waveform viewer, such as when a signal is created to hold the results of intermediate computations, or to change shape, and it would just add noise. I propose adding a notion of a \"private signal name\".\r\n\r\nI suggest changing naming rules so that `Signal(name=\"\")` creates a signal with a private name. Such a signal is translated to a private wire in RTLIL (with a `$\\d+` name), doesn't get displayed in the waveform viewer, and so on.\r\n\r\n---\r\n\r\nThe FSM ongoing signals (not the state signal) should be changed to have private names in the 0.5 milestone.\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "4 failed, 480 passed in 2.69s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "484 passed in 1.93s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

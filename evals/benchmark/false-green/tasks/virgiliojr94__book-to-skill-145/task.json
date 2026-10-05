@@ -1,0 +1,40 @@
+{
+  "id": "virgiliojr94__book-to-skill-145",
+  "category": "feature",
+  "source": "https://github.com/virgiliojr94/book-to-skill/issues/145",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/virgiliojr94/book-to-skill/pull/151",
+  "repo": "virgiliojr94/book-to-skill",
+  "license": "MIT",
+  "base_sha": "07cd21f0fec1be7cb438066f93c1183a3f8fafad",
+  "merge_sha": "98f09592d54f3c784ee1180bd61b0bea82a3491a",
+  "test_paths": [
+    "tests/test_isolated_install_hint.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/virgiliojr94/book-to-skill && git fetch -q --depth 1 --filter=blob:none origin 07cd21f0fec1be7cb438066f93c1183a3f8fafad && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: --check reports docling missing when pipx installed it, without saying how to use it\n\n## Summary\n\n`--check` reports `\u2717 python: docling` on a machine where Docling is installed via pipx. The message is **technically correct and practically useless**: it tells the user something is missing without telling them it is right there, in an environment this interpreter cannot see.\n\n## The correction this issue needed\n\nAn earlier version of this issue proposed using `shutil.which(\"docling\")` so the check would stop reporting it as absent. That is the wrong remedy, and it would make things worse.\n\n`book_to_skill/parsers/pdf.py` imports Docling **as a library**:\n\n```python\nfrom docling.document_converter import DocumentConverter\nfrom docling.datamodel.pipeline_options import PdfPipelineOptions\n```\n\nThere is no CLI invocation anywhere. So a binary on `PATH` does **not** make Docling usable from the running interpreter \u2014 treating `which()` as proof of installation would flip a true \"missing\" into a false \"present\", and the failure would move from a cheap preflight message to a crash in the middle of extraction.\n\n## What the user actually needs\n\nThe thing that worked, after a round trip through failed installs:\n\n```\n/home/user/.local/share/pipx/venvs/docling/bin/python scripts/extract.py <pdf> --mode technical\n```\n\nSo the fix is the **message**, not the classification. Keep the `\u2717`, keep the fallback, and add the diagnosis when \u2014 and only when \u2014 a same-named executable exists on `PATH`:\n\n```\n\u2717 python: docling \u2014 not importable from this interpreter.\n  A `docling` command exists at /home/user/.local/bin/docling, which usually means an\n  isolated install (pipx). Either run the extractor with that environment's Python:\n      ~/.local/share/pipx/venvs/docling/bin/python scripts/extract.py \u2026\n  or install it into this one:  pip install docling\n```\n\n`shutil.which()` is already used in this file for system tools, so the detection is one call. Resolving the venv path can be best-effort and omitted when unknown.\n\nSecond thing worth fixing while in there: `--install-missing yes` then tries to install Docling anyway and dies with `/usr/bin/python3: No module named pip` \u2014 a second confusing message for someone whose only mistake was installing Docling the way its own docs recommend.\n\n## Also worth documenting (not this bug)\n\nDocling 2.119.0 defaults to `compile_torch_models = True`, which needs the Python development headers; without them the layout stage dies on `fatal error: Python.h: No such file or directory`. `DOCLING_INFERENCE_COMPILE_TORCH_MODELS=false` avoids it with no loss of the layout model. FAQ material.\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "5 failed in 0.09s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "5 passed in 0.27s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

@@ -1,0 +1,6 @@
+repository: https://github.com/requests-cache/requests-cache
+issue: https://github.com/requests-cache/requests-cache/issues/1090
+pull_request: https://github.com/requests-cache/requests-cache/pull/1091
+base_sha: 1c97b7d94df0c0bce3027e44ef30c5ded7c5485d
+merge_sha: df6e34a79048584d187dc40eb8d2533a96c9382d
+license: BSD-2-Clause

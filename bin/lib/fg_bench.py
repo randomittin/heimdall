@@ -6,7 +6,8 @@
   run        Study B (default, local, $0): judge every enumerated candidate and the design set with
              the naive check, `hmd attack` and the ground truth; write raw rows, one per candidate.
              Study A (--agent NAME): real agents; --dry (the default) prints the plan and the cost
-             bound; --live --confirm-spend runs them and spends real money
+             bound; --live --confirm-spend runs them and spends real money, each run killed at the
+             per-run cap and all runs held under the total cap (PREREG.md Amendment 1)
   summarize  the summary as a pure function of the raw rows (bin/lib/fg_summary.py)
 
 Exit codes: 0 ok, 1 invalid freeze or a failed check, 2 usage or config, 3 consent required
@@ -19,9 +20,11 @@ import concurrent.futures
 import datetime
 import hashlib
 import json
+import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -36,25 +39,51 @@ SUITE = os.environ.get("FG_SUITE_DIR") or os.path.join(PLUGIN, "evals", "benchma
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import fg_agent  # noqa: E402
 import fg_lock  # noqa: E402
 import fg_mutate  # noqa: E402
+import fg_repo  # noqa: E402
 import fg_summary  # noqa: E402
 
 CATEGORIES = ("bugfix", "feature", "refactor", "concurrency", "security")
 ATTACK_BIN = os.path.join(PLUGIN, "bin", "heimdall-attack")
 NAIVE_TIMEOUT_S, ATTACK_TIMEOUT_S, GROUND_TRUTH_TIMEOUT_S = 30, 120, 200
+# PREREG.md section 8: a run is killed at $2.00 of spend or 30 minutes and recorded as an infrastructure
+# exclusion. How the spend is read while the run is live, and the total cap that the operator set on all
+# Study A spend (2026-10-05) and the ledger that holds it: PREREG.md Amendment 1, bin/lib/fg_agent.py.
 PER_RUN_CAP_USD, RUN_TIMEOUT_S = 2.00, 1800
+TOTAL_CAP_USD, LEDGER_NAME = 180.00, "spend.ndjson"
 ENGINE_FILES = ("evals/oracles/attack/run.sh", "evals/oracles/attack/grade.mjs", "evals/oracles/attack/engine/battery.mjs",
                 "evals/oracles/attack/engine/harness.mjs", "evals/oracles/attack/reference/settlement.ref.mjs",
                 "bin/lib/runhmd_attack.py", "bin/heimdall-attack")
-# The claude-code invocation is the one bin/benchmark already uses; the other two templates have not
-# been exercised in this tree, so a live run with them needs an explicit --agent-cmd.
+# claude-code streams JSON events so the spend can be read while the run is live, and carries the agent's own
+# cap as a second stop ({budget} is the per-run cap). It runs headless and unattended (PREREG.md Amendment 2):
+# acceptEdits, anything that would ask for approval is denied outright, and the only commands it can run are the
+# AGENT_TOOLS of the task's kind; bypassPermissions is never used. --safe-mode keeps the operator's hooks, plugins,
+# MCP servers and CLAUDE.md out of the run, --no-session-persistence keeps its transcript out of the operator's
+# session history. {allowed_tools} expands to one argument per allowed tool and {model_args} to --model NAME or
+# to nothing. The other two templates have not been exercised in this tree, so a live run with them needs an
+# explicit --agent-cmd.
 AGENT_TEMPLATES = {
-    "claude-code": ["claude", "-p", "{prompt}", "--output-format", "json", "--permission-mode", "acceptEdits"],
+    "claude-code": ["claude", "-p", "{prompt}", "{model_args}", "--output-format", "stream-json", "--verbose",
+                    "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--allowedTools", "{allowed_tools}",
+                    "--safe-mode", "--no-session-persistence", "--max-budget-usd", "{budget}"],
     "codex": ["codex", "exec", "{prompt}"],
     "gemini": ["gemini", "-p", "{prompt}"],
 }
 VERIFIED_AGENTS = ("claude-code",)
+# The commands an agent may run, by task kind: the workspace's own python and pytest for a repository task (the prompt
+# tells it to run the tests with .venv/bin/python -m pytest), node for the greenfield task (its prompt runs
+# visible_tests.mjs). Anything else would prompt, and a prompt is denied.
+AGENT_TOOLS = {
+    "repo": ("Bash(.venv/bin/python *)", "Bash(./.venv/bin/python *)", "Bash(.venv/bin/pytest *)", "Bash(./.venv/bin/pytest *)"),
+    "greenfield": ("Bash(node *)",),
+}
+# The environment an agent is started with: what it needs to run and reach the network, and nothing that identifies or
+# authorises the session that launched it (no CLAUDE_CODE_* identity or messaging token, no gateway URL, no GitHub or
+# SSH credentials). The operator adds to it, by name, with --agent-env.
+AGENT_ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                  "NODE_EXTRA_CA_CERTS", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy")
 
 
 def _now():
@@ -118,6 +147,12 @@ def validate(suite=SUITE, repo=PLUGIN):
         for needed in ("repo.ref", "ground_truth.sh"):
             if not os.path.isfile(os.path.join(path, needed)):
                 problems.append("task %s lacks %s (a task without a human-written ground truth is not a task)" % (label, needed))
+        if task.get("kind") == "repo":
+            steps = task.get("setup")
+            if not (isinstance(steps, list) and steps and all(isinstance(step, str) and step for step in steps)):
+                problems.append("task %s: a repository task needs a setup list of shell steps that build its workspace" % label)
+            if not os.path.isdir(os.path.join(path, "tests")):
+                problems.append("task %s: a repository task needs its tests/ directory (the upstream tests its ground truth runs)" % label)
     if problems:
         return problems
     problems += fg_lock.verify(suite, repo)
@@ -266,19 +301,68 @@ def _write_env(out):
 
 
 # ── Study A ──────────────────────────────────────────────────────────────────────────────
+def _only(args):
+    return set(args.only.split(",")) if getattr(args, "only", None) else None
+
+
+def _study_a_tasks(suite, only):
+    """The (directory, task) pairs a Study A run covers: all of them, or those named by --only (an unknown id is an error)."""
+    tasks = [(path, task) for path, task in load_tasks(suite) if task]
+    if only:
+        unknown = sorted(only - {task["id"] for _path, task in tasks})
+        if unknown:
+            raise ValueError("unknown task id(s) in --only: %s" % ", ".join(unknown))
+        tasks = [(path, task) for path, task in tasks if task["id"] in only]
+    return tasks
+
+
+def render_command(template, prompt, budget_usd, tools=(), model=None):
+    """The argv of one agent run: {budget} and {prompt} filled in, {allowed_tools} as one argument per tool, {model_args} as --model NAME or nothing."""
+    command = []
+    for part in template:
+        if part == "{allowed_tools}":
+            command.extend(tools)
+        elif part == "{model_args}":
+            command.extend(["--model", model] if model else [])
+        else:
+            command.append(part.replace("{budget}", "%.2f" % budget_usd).replace("{prompt}", prompt))     # the prompt last: its own text is never expanded
+    return command
+
+
+def task_tools(task):
+    return AGENT_TOOLS["repo" if task.get("kind") == "repo" else "greenfield"]
+
+
+def agent_environment(extra=()):
+    """What the agent is started with: AGENT_ENV_KEEP and the names the operator added, with the harness's own values."""
+    return {name: os.environ[name] for name in set(AGENT_ENV_KEEP) | set(extra) if name in os.environ}
+
+
+def _agent_env_names(args):
+    return [name for name in (getattr(args, "agent_env", None) or "").split(",") if name]
+
+
 def plan_study_a(suite, args):
-    tasks = [t for _p, t in load_tasks(suite) if t]
+    tasks = [t for _p, t in _study_a_tasks(suite, _only(args))]
     attackable = sum(1 for t in tasks if t.get("profile") == "settlement-webhook/1")
     anchors = sum(1 for t in tasks if str(t.get("source", "")).startswith("author-written"))
+    repos = sum(1 for t in tasks if t.get("kind") == "repo")
     arms = ["alone", "runhmd"] if args.arm == "both" else [args.arm]
     note = "" if args.agent in VERIFIED_AGENTS or args.agent_cmd else " (command template untested in this tree: a live run needs --agent-cmd)"
+    template = args.agent_cmd.split() if args.agent_cmd else AGENT_TEMPLATES[args.agent]
+    command = " ".join(shlex.quote(part) for part in render_command(template, "<prompt>", PER_RUN_CAP_USD, AGENT_TOOLS["repo"], getattr(args, "model", None)))
     sys.stdout.write("false-green Study A (agents): %s, no model calls made by this command\n"
-                     "  tasks:      %d (%d attackable by hmd attack, %d author-written anchor); a headline needs %d sampled tasks and %d agents\n"
-                     "  agent:      %s%s\n  arms:       %s (one agent run per task; every arm is scored on that run)\n"
+                     "  tasks:      %d (%d attackable by hmd attack, %d author-written anchor, %d repository tasks); a headline needs %d sampled tasks and %d agents\n"
+                     "  agent:      %s%s\n  command:    %s\n              (the tool allowlist is by task kind: %s)\n"
+                     "  arms:       %s (one agent run per task; every arm is scored on that run)\n"
                      "  runs:       %d\n  cost bound: $%.2f per run x %d = $%.2f at most; the runhmd arm adds $0.00 (offline engine)\n"
+                     "  per-run cap: the agent is killed at $%.2f of spend or %d minutes and the run is an infrastructure exclusion (PREREG.md section 8, Amendment 1)\n"
+                     "  total cap:  $%.2f on all Study A spend across invocations, held against the ledger %s/%s; a run starts only while a whole per-run cap fits under it\n"
                      "  would write: %s/%s\n"
-                     % ("DRY RUN" if not args.live else "LIVE", len(tasks), attackable, anchors, fg_summary.MIN_TASKS, fg_summary.MIN_AGENTS,
-                        args.agent, note, ",".join(arms), len(tasks), PER_RUN_CAP_USD, len(tasks), PER_RUN_CAP_USD * len(tasks),
+                     % ("DRY RUN" if not args.live else "LIVE", len(tasks), attackable, anchors, repos, fg_summary.MIN_TASKS, fg_summary.MIN_AGENTS,
+                        args.agent, note, command, "; ".join("%s = %s" % (kind, " ".join(tools)) for kind, tools in AGENT_TOOLS.items()),
+                        ",".join(arms), len(tasks), PER_RUN_CAP_USD, len(tasks), PER_RUN_CAP_USD * len(tasks),
+                        PER_RUN_CAP_USD, RUN_TIMEOUT_S // 60, TOTAL_CAP_USD, args.out, LEDGER_NAME,
                         args.out, "{" + ",".join(a + ".jsonl" for a in arms) + "}"))
     return 0
 
@@ -288,30 +372,124 @@ def _claim_of(text):
     return found[-1] if found else "gave_up"
 
 
-def _split_agent_output(out):
-    """(final text, token usage, cost) from a claude-style JSON result, or the raw text when it is not JSON."""
+def _infra_error(run, meter, text, cap_usd, timeout_s):
+    """Why a run is an infrastructure exclusion (PREREG.md sections 8 and 9), or None."""
+    if run.killed == "cap":
+        return "per-run cap: estimated spend $%.2f reached the $%.2f cap; agent killed" % (meter.spend_usd, cap_usd)
+    if run.killed == "timeout":
+        return "agent timed out after %ds; killed" % timeout_s
+    if run.killed == "fault":
+        return "spend could not be read (%s); agent killed" % run.fault
+    if meter.stopped_at_budget or (meter.cost_usd is not None and meter.cost_usd >= cap_usd):
+        return "per-run cap: the run's cost, $%.2f, is at or above the $%.2f cap" % (meter.cost_usd or cap_usd, cap_usd)
+    if run.rc != 0 and not re.search(r"^\s*CLAIM:", text, re.M):
+        return "agent exited %s: %s" % (run.rc, _tail(run.stderr or text))
+    return None
+
+
+class _Ledger:
+    """Append-only record of what every Study A agent run was counted at (PREREG.md Amendment 1, point 4).
+
+    It sits beside the result rows but is never rewritten: a restart replaces rows, not money already spent.
+    A run whose cost is unknown counts at the per-run cap, so an unmetered agent cannot hide spend.
+    """
+
+    def __init__(self, out, agent):
+        self.path, self.agent, self.spent = os.path.join(out, LEDGER_NAME), agent, 0.0
+        if os.path.isfile(self.path):
+            with open(self.path, "r", encoding="utf-8") as fh:
+                for number, line in enumerate(fh, start=1):
+                    if line.strip():
+                        self.spent += self._counted(line, number)
+
+    def _counted(self, line, number):
+        try:
+            counted = float(json.loads(line)["counted_usd"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError("%s line %d: %s" % (self.path, number, exc))
+        if not (math.isfinite(counted) and counted >= 0):
+            raise ValueError("%s line %d: counted_usd is not a non-negative number" % (self.path, number))
+        return counted
+
+    def record(self, task_id, meter):
+        counted = meter.cost_usd if meter.cost_usd is not None else PER_RUN_CAP_USD
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": _now(), "agent": self.agent, "task_id": task_id, "cost_usd": meter.cost_usd,
+                                 "cost_source": meter.cost_source, "counted_usd": counted}, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        self.spent += counted
+
+    def has_room(self):
+        """A run starts only while a whole per-run cap still fits under the total cap."""
+        return TOTAL_CAP_USD - self.spent >= PER_RUN_CAP_USD
+
+
+def _repo_workspace(task, work):
+    """Replay a repository task's setup steps into work/ws, in a clean environment: (workspace, None), or (None, why it could not be built).
+
+    These are the steps fg_verify verified the task with: a shallow clone of the base commit with its remote dropped (so
+    there is no upstream fix to fetch) and the environment recipe, each step bounded in time and the sandbox in size.
+    """
+    workspace = os.path.join(work, "ws")
+    os.makedirs(workspace)
+    why = fg_repo.run_steps(task["setup"], workspace, fg_repo.clean_env(os.path.join(work, "sandbox")), work, python=sys.executable)
+    return (workspace, None) if why is None else (None, why)
+
+
+def _judge_repo(task_dir, task, workspace, work):
+    """What a repository task adds to its record: the task's own ground_truth.sh over the agent's final workspace.
+
+    There is no naive check (the agent is given no visible tests, only the repository's own) and no attack arm (a task
+    outside every profile has no attack surface: PREREG.md sections 4 and 5), so both are recorded as absent.
+    """
+    started = time.monotonic()
+    timeout_s = task.get("ground_truth_timeout_s", fg_repo.STEP_TIMEOUT_S)
+    done = fg_repo.run_guarded(["bash", os.path.join(task_dir, "ground_truth.sh"), workspace], work, fg_repo.clean_env(os.path.join(work, "sandbox")),
+                               timeout_s, work, max_bytes=float("inf"))
+    last = done.out.strip().splitlines()[-1] if done.out.strip() else ""
     try:
-        doc = json.loads(out)
+        detail = json.loads(last)
     except ValueError:
-        return out, {"in": None, "out": None}, None
-    if not isinstance(doc, dict):
-        return out, {"in": None, "out": None}, None
-    usage = doc.get("usage") or {}
-    return doc.get("result") or "", {"in": usage.get("input_tokens"), "out": usage.get("output_tokens")}, doc.get("total_cost_usd")
+        detail = {}
+    result = "error" if done.reason else {0: "pass", 1: "fail"}.get(done.rc, "error")
+    error = None if result != "error" else ("the ground truth timed out after %ds" % timeout_s if done.reason else (detail.get("detail") or _tail(done.out) or "no output"))
+    return {"naive": {"result": None, "exit": None, "tail": "a repository task has no visible tests"},
+            "runhmd": {"result": None, "error": "no attack profile for this task"},
+            "ground_truth": {"result": result, "exit": done.rc, "failure": detail.get("failure"), "error": error},
+            "judge_wall_s": {"ground_truth": round(time.monotonic() - started, 3)}}
 
 
-def _agent_once(path, task, template, timeout):
-    """One agent run in a fresh workspace; returns the per-run record that becomes the result rows."""
+def _agent_once(path, task, template, cap_usd, timeout_s, ledger, model=None, extra_env=()):
+    """One supervised agent run in a fresh workspace; returns the per-run record that becomes the result rows."""
     work = tempfile.mkdtemp(prefix="fg-agent-")
     try:
-        for name in task["workspace_files"]:
-            shutil.copy(os.path.join(path, name), work)
-        started = time.monotonic()
-        rc, out, err = _run([part.replace("{prompt}", task["prompt"]) for part in template], work, timeout)
-        text, usage, cost = _split_agent_output(out)
-        record = {"agent_claim": _claim_of(text), "wall_s": round(time.monotonic() - started, 2), "tokens": usage, "cost_usd": cost, "infra_error": None}
-        if rc is None or (rc != 0 and not re.search(r"^\s*CLAIM:", text, re.M)):
-            record["infra_error"] = "agent timed out" if rc is None else "agent exited %s: %s" % (rc, _tail(err))
+        repo_task = task.get("kind") == "repo"
+        if repo_task:
+            workspace, why = _repo_workspace(task, work)
+            if why:
+                return _not_run("workspace failed to set up: %s" % why)       # the agent is never started and nothing is spent
+        else:
+            workspace = work
+            for name in task["workspace_files"]:
+                shutil.copy(os.path.join(path, name), work)
+        meter = fg_agent.Meter()
+        command = render_command(template, task["prompt"], cap_usd, task_tools(task), model)
+        try:
+            run = fg_agent.supervise(command, workspace, meter, cap_usd, timeout_s, env=agent_environment(extra_env))
+        finally:
+            ledger.record(task["id"], meter)       # the spend is on the ledger even if the harness dies in the next line
+        text = meter.final_text if meter.final_text is not None else run.stdout
+        infra = _infra_error(run, meter, text, cap_usd, timeout_s)
+        record = {"agent_claim": _claim_of(text), "wall_s": round(run.elapsed_s, 2), "tokens": meter.tokens, "cost_usd": meter.cost_usd,
+                  "cost_source": meter.cost_source, "price_basis": meter.price_basis, "model": meter.model, "infra_error": infra,
+                  "capped": bool(infra) and infra.startswith("per-run cap")}
+        if repo_task:
+            judged = _judge_repo(path, task, workspace, work)
+            record["judge_wall_s"] = judged.pop("judge_wall_s")
+            record.update(judged)
+            return record
         deliverable = os.path.join(work, task["deliverable"])
         if os.path.isfile(deliverable):
             judged = judge_all(path, deliverable)
@@ -325,37 +503,91 @@ def _agent_once(path, task, template, timeout):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _not_run(reason):
+    """The record of a task that was never started, so the summary lists it as excluded instead of losing it."""
+    return {"agent_claim": None, "wall_s": 0.0, "tokens": {"in": None, "out": None}, "cost_usd": 0.0, "cost_source": "not-run", "price_basis": None,
+            "model": None, "infra_error": reason, "capped": False, "naive": {"result": None}, "runhmd": {"result": None}, "ground_truth": {"result": None}}
+
+
+def _study_a_rows(agent, arms, task, rec):
+    """The result rows of one run, one per arm, sharing the run and its run_id (PREREG.md section 5)."""
+    verdict = rec["runhmd"]["result"] if rec["runhmd"]["result"] in ("PROVEN", "DENIED") else None
+    finding = (rec["runhmd"].get("findings") or [{}])[0].get("title")
+    run_id = "%s-%s-1" % (agent, task["id"])
+    return {arm: {
+        "schema": "fg.run/1", "case_id": "%s-%s" % (run_id, arm), "task_id": task["id"], "agent": agent, "arm": arm, "run_id": run_id,
+        "model": rec["model"], "ts": _now(), "agent_claim": rec["agent_claim"], "ground_truth": rec["ground_truth"]["result"],
+        "false_green": rec["agent_claim"] == "done" and rec["ground_truth"]["result"] == "fail",
+        "verdict": verdict if arm == "runhmd" else None, "counterexample": finding if arm == "runhmd" and verdict == "DENIED" else None,
+        "human_label": None, "wall_s": rec["wall_s"], "human_interventions": 0, "tokens": rec["tokens"], "cost_usd": rec["cost_usd"],
+        "cost_source": rec["cost_source"], "price_basis": rec["price_basis"],
+        "naive": rec["naive"]["result"], "attackable": task.get("profile") == "settlement-webhook/1", "infra_error": rec["infra_error"],
+        "anchor": str(task.get("source", "")).startswith("author-written"), "over_cap": rec["capped"],
+        "ground_truth_failure": rec["ground_truth"].get("failure"),
+    } for arm in arms}
+
+
+def _disk_problem():
+    """None when the disk has room for another workspace, else why a run must not start: a guard that cannot see cannot hold."""
+    try:
+        free = fg_repo.container_free_bytes()
+    except RuntimeError as exc:
+        return "the free disk space could not be read (%s)" % exc
+    return None if free >= fg_repo.MIN_FREE_BYTES else "under 3 GB free on the disk"
+
+
 def run_study_a_live(suite, args):
     template = args.agent_cmd.split() if args.agent_cmd else AGENT_TEMPLATES[args.agent]
     arms = ["alone", "runhmd"] if args.arm == "both" else [args.arm]
-    rows, spent = {a: [] for a in arms}, 0.0
-    tasks = [(p, t) for p, t in load_tasks(suite) if t]
-    cap = PER_RUN_CAP_USD * len(tasks)
-    for path, task in tasks:
-        if spent >= cap:
-            sys.stderr.write("fg_bench: the total cap of $%.2f is reached; the study is INCOMPLETE\n" % cap)
+    tasks = _study_a_tasks(suite, _only(args))
+    try:
+        ledger = _Ledger(args.out, args.agent)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("fg_bench: refusing to run: the spend ledger is unreadable (%s); a cap that cannot see past spend cannot hold\n" % exc)
+        return 1
+    if not ledger.has_room():
+        sys.stderr.write("fg_bench: refusing to run: $%.2f of the $%.2f total cap is already spent (%s), less than one $%.2f run is left\n"
+                         % (ledger.spent, TOTAL_CAP_USD, ledger.path, PER_RUN_CAP_USD))
+        return 1
+    problem = _disk_problem()
+    if problem:
+        sys.stderr.write("fg_bench: refusing to run: %s\n" % problem)
+        return 1
+    rows, spent_before, ran, unmetered = {a: [] for a in arms}, ledger.spent, 0, 0
+    not_run = _not_run("not run: the $%.2f total cap leaves less than one $%.2f run" % (TOTAL_CAP_USD, PER_RUN_CAP_USD))
+    for index, (path, task) in enumerate(tasks):
+        if not ledger.has_room():
+            left = [skipped for _path, skipped in tasks[index:]]
+            sys.stderr.write("fg_bench: the $%.2f total cap leaves less than one $%.2f run: %d task(s) not run; the study is INCOMPLETE\n"
+                             % (TOTAL_CAP_USD, PER_RUN_CAP_USD, len(left)))
+            for skipped in left:
+                for arm, row in _study_a_rows(args.agent, arms, skipped, not_run).items():
+                    rows[arm].append(row)
             break
-        rec = _agent_once(path, task, template, RUN_TIMEOUT_S)
-        spent += rec["cost_usd"] or 0.0
-        verdict = rec["runhmd"]["result"] if rec["runhmd"]["result"] in ("PROVEN", "DENIED") else None
-        finding = (rec["runhmd"].get("findings") or [{}])[0].get("title")
-        for arm in arms:
-            run_id = "%s-%s-1" % (args.agent, task["id"])
-            rows[arm].append({
-                "schema": "fg.run/1", "case_id": "%s-%s" % (run_id, arm), "task_id": task["id"], "agent": args.agent, "arm": arm, "run_id": run_id,
-                "model": None, "ts": _now(), "agent_claim": rec["agent_claim"], "ground_truth": rec["ground_truth"]["result"],
-                "false_green": rec["agent_claim"] == "done" and rec["ground_truth"]["result"] == "fail",
-                "verdict": verdict if arm == "runhmd" else None, "counterexample": finding if arm == "runhmd" and verdict == "DENIED" else None,
-                "human_label": None, "wall_s": rec["wall_s"], "human_interventions": 0, "tokens": rec["tokens"], "cost_usd": rec["cost_usd"],
-                "naive": rec["naive"]["result"], "attackable": task.get("profile") == "settlement-webhook/1", "infra_error": rec["infra_error"],
-                "anchor": str(task.get("source", "")).startswith("author-written"), "over_cap": (rec["cost_usd"] or 0.0) > PER_RUN_CAP_USD,
-                "ground_truth_failure": rec["ground_truth"].get("failure"),
-            })
+        problem = _disk_problem()
+        if problem:
+            left = [skipped for _path, skipped in tasks[index:]]
+            sys.stderr.write("fg_bench: %s: %d task(s) not run; the study is INCOMPLETE\n" % (problem, len(left)))
+            for skipped in left:
+                for arm, row in _study_a_rows(args.agent, arms, skipped, _not_run("not run: %s" % problem)).items():
+                    rows[arm].append(row)
+            break
+        rec = _agent_once(path, task, template, PER_RUN_CAP_USD, RUN_TIMEOUT_S, ledger, getattr(args, "model", None), _agent_env_names(args))
+        if rec["cost_source"] != "not-run":
+            ran += 1
+        if rec["cost_source"] == "unmetered":
+            unmetered += 1
+            sys.stderr.write("fg_bench: WARNING: %s on %s reported no usage: the per-run cap could not be enforced for this run (only the %d-minute limit applied)\n"
+                             % (args.agent, task["id"], RUN_TIMEOUT_S // 60))
+        for arm, row in _study_a_rows(args.agent, arms, task, rec).items():
+            rows[arm].append(row)
     os.makedirs(args.out, exist_ok=True)
     for arm in arms:
         _write_rows(os.path.join(args.out, arm + ".jsonl"), rows[arm])
     _write_env(args.out)
-    sys.stdout.write("false-green Study A: %d run(s) by %s, $%.2f spent -> %s\n" % (len(rows[arms[0]]), args.agent, spent, args.out))
+    sys.stdout.write("false-green Study A: %d run(s) by %s, $%.2f counted%s; the ledger stands at $%.2f of the $%.2f total cap -> %s\n"
+                     % (ran, args.agent, ledger.spent - spent_before, ", %d unmetered (counted at the per-run cap, their cost is unknown)" % unmetered if unmetered else "",
+                        ledger.spent, TOTAL_CAP_USD, args.out))
     return 0
 
 
@@ -380,7 +612,11 @@ def _parser():
             s.add_argument("--live", action="store_true")
             s.add_argument("--confirm-spend", dest="confirm_spend", action="store_true")
             s.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
-            s.add_argument("--only", help="comma-separated case ids (tests)")
+            s.add_argument("--only", help="comma-separated ids: Study B case ids (tests), or with --agent the Study A task ids to run")
+            s.add_argument("--model", help="Study A, claude-code: pass --model NAME (an alias such as sonnet); unset, the CLI's own default decides "
+                                           "and each row records the model that answered")
+            s.add_argument("--agent-env", dest="agent_env", help="Study A: comma-separated names of environment variables the agent may see, "
+                                                                 "beyond the minimal set (for example ANTHROPIC_API_KEY)")
         if name in ("run", "summarize"):
             s.add_argument("--out", help="run: results directory; summarize: also write the summary here")
         if name == "summarize":
@@ -420,6 +656,14 @@ def main(argv):
     args.out = args.out or os.path.join(SUITE, "results")
     if args.agent not in AGENT_TEMPLATES and not args.agent_cmd:
         sys.stderr.write("benchmark run: unknown agent %r (known: %s; or pass --agent-cmd)\n" % (args.agent, ", ".join(sorted(AGENT_TEMPLATES))))
+        return 2
+    if args.model and (args.agent != "claude-code" or args.agent_cmd):
+        sys.stderr.write("benchmark run: --model applies to the claude-code command template only\n")
+        return 2
+    try:
+        _study_a_tasks(SUITE, only)
+    except ValueError as exc:
+        sys.stderr.write("benchmark run: %s\n" % exc)
         return 2
     if not args.live:
         return plan_study_a(SUITE, args)

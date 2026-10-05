@@ -1,0 +1,40 @@
+{
+  "id": "Python-Markdown__markdown-1329",
+  "category": "bugfix",
+  "source": "https://github.com/Python-Markdown/markdown/issues/1329",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/Python-Markdown/markdown/pull/1380",
+  "repo": "Python-Markdown/markdown",
+  "license": "BSD-3-Clause",
+  "base_sha": "25b64df6a9066b8eef7e68101567de938e38ea0e",
+  "merge_sha": "5a2fee340845ee5a70f6570c35b53fd4a37ade1c",
+  "test_paths": [
+    "tests/test_syntax/extensions/test_admonition.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/Python-Markdown/markdown && git fetch -q --depth 1 --filter=blob:none origin 25b64df6a9066b8eef7e68101567de938e38ea0e && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".[testing]\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: admonition extension returns **invalid** html code without blank line.\n\n```python\r\nIn [8]: import markdown\r\nIn [9]: some_text = \"\"\"\r\n   ...: !!! danger \"Danger\"\r\n   ...:     don't try this at home.\r\n   ...:\r\n   ...: \"\"\"\r\nIn [10]: markdown.markdown(some_text, tab_length=2, extensions=['admonition'])\r\nOut[10]: '<div class=\"admonition danger\">\\n<p class=\"admonition-title\">Danger<p>don\\'t try this at home.</p>\\n</p>\\n</div>'\r\n```\r\n\r\n\r\n1. A paragraph inside a paragraph is **invalid** html and *etree* parser complains!\r\n2. the simple solution of turning the title *paragraph* into a *div* will work, but it wraps the inner paragraph, resulting in a CSS mess.\r\n\r\nRecommended working solution:\r\n\r\n```diff\r\n     CLASSNAME_TITLE = 'admonition-title'\r\n+    CLASSNAME_BODY = 'admonition-body'\r\n     RE = re.compile(r'(?:^|\\n)!!! ?([\\w\\-]+(?: +[\\w\\-]+)*)(?: +\"(.*?)\")? *(?:\\n|$)')\r\n\r\n@@ -130,9 +134,11 @@ class AdmonitionProcessor(BlockProcessor):\r\n             div = etree.SubElement(parent, 'div')\r\n             div.set('class', '{} {}'.format(self.CLASSNAME, klass))\r\n             if title:\r\n-                p = etree.SubElement(div, 'p')\r\n+                p = etree.SubElement(div, 'div')\r\n                 p.text = title\r\n                 p.set('class', self.CLASSNAME_TITLE)\r\n+                p = etree.SubElement(div, 'div')\r\n+                p.set('class', self.CLASSNAME_BODY)\r\n\r\n```\r\n\r\n> **Note:**   the `parse_content()` method of your admonition extension is an unreadable code-mess ;-)\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "1 failed, 6 passed in 0.07s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "7 passed in 0.04s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

@@ -1,0 +1,6 @@
+repository: https://github.com/dbcli/pgcli
+issue: https://github.com/dbcli/pgcli/issues/1405
+pull_request: https://github.com/dbcli/pgcli/pull/1612
+base_sha: fab13f08afa85550208f4dd6c2b0b7eaa2adc861
+merge_sha: 4beae4740ab1a159422b649e8aa3d47c95678ce8
+license: BSD-3-Clause

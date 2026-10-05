@@ -1,0 +1,41 @@
+{
+  "id": "google__langextract-106",
+  "category": "feature",
+  "source": "https://github.com/google/langextract/issues/106",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/google/langextract/pull/119",
+  "repo": "google/langextract",
+  "license": "Apache-2.0",
+  "base_sha": "898962031946e04cc02c6fbc48ece621476e1e8c",
+  "merge_sha": "1a24cd0056013191e6ac70a3ecc144b45e848695",
+  "test_paths": [
+    "tests/extract_precedence_test.py",
+    "tests/init_test.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/google/langextract && git fetch -q --depth 1 --filter=blob:none origin 898962031946e04cc02c6fbc48ece621476e1e8c && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".[test]\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Add `config` and `model` parameters to `extract()`\n\n# Add `config` and `model` parameters to `extract()`\n\nHey @mariano, creating an issue about the feature you proposed - I think it's a great idea and was something I had in mind, so please feel free to send a PR if you're interested!\n\nFollowing up from #99, the idea is to let `extract()` accept either a `ModelConfig` or a pre-instantiated model directly for explicit provider selection and model reuse.\n\nThe API would look like:\n```python\n# Pass a config\nconfig = factory.ModelConfig(\n    model_id=\"gemini-2.5-flash\",\n    provider=\"GeminiLanguageModel\",\n    provider_kwargs={\"api_key\": \"...\", \"temperature\": 0.7}\n)\nresult = extract(text_or_documents=content, config=config, ...)\n\n# Or pass a model directly  \nmodel = factory.create_model(config)\nresult = extract(text_or_documents=content, model=model, ...)\n```\n\nPrecedence would be: `model` > `config` > `model_id+kwargs` > `language_model_type` (deprecated).\n\nWe'd need tests for precedence, factory feature preservation, and backward compat. This would complement the factory infrastructure from #97 in a nice way.\n\nCould also be interesting to support loading configs from JSON/YAML files down the road - would make it easy to manage different model configurations.\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "4 failed, 3 passed in 4.32s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "7 passed, 2 warnings in 1.06s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

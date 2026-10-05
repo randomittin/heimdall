@@ -1,0 +1,6 @@
+repository: https://github.com/google/langextract
+issue: https://github.com/google/langextract/issues/106
+pull_request: https://github.com/google/langextract/pull/119
+base_sha: 898962031946e04cc02c6fbc48ece621476e1e8c
+merge_sha: 1a24cd0056013191e6ac70a3ecc144b45e848695
+license: Apache-2.0

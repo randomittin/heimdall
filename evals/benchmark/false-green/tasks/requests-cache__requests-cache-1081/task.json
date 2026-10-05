@@ -1,0 +1,40 @@
+{
+  "id": "requests-cache__requests-cache-1081",
+  "category": "bugfix",
+  "source": "https://github.com/requests-cache/requests-cache/issues/1081",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/requests-cache/requests-cache/pull/1134",
+  "repo": "requests-cache/requests-cache",
+  "license": "BSD-2-Clause",
+  "base_sha": "3e1e5b4f99dd92ce6b628ceb46a71723138c2011",
+  "merge_sha": "bb373d287c6bcc3e28328fd3eb8042dc74087bee",
+  "test_paths": [
+    "tests/unit/policy/test_actions.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/requests-cache/requests-cache && git fetch -q --depth 1 --filter=blob:none origin 3e1e5b4f99dd92ce6b628ceb46a71723138c2011 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\" --group dev"
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Add support for `Vary: Cookie`\n\n<!--\nNote: See the troubleshooting page for help with some common issues:\nhttps://requests-cache.readthedocs.io/en/stable/user_guide/troubleshooting.html\n-->\n### The problem\nDoing a post call to a URL with a colon (such as https://en.wikipedia.org/wiki/Template:Welcome) doesn't ever use the cache result. I can see the cached response in Sqlite but it doesn't seem to be picked up\n\n### Expected behavior\nThe second duplicate call returns a response from the cache\n\n### Steps to reproduce the behavior\nThe following fails to use the cached result:\n\n```\nsession = requests_cache.CachedSession(\n    'test_cache',\n    allowable_methods=('GET', 'POST'),\n)\ndata = \"{}\"\nresp1 = session.post(\"https://en.wikipedia.org/wiki/Template:Welcome\",data=data)\nprint('First:', resp1.from_cache)\nprint(resp1.status_code)\n\nresp2 = session.post(\"https://en.wikipedia.org/wiki/Template:Welcome\",data=data)\nprint('Second:', resp2.from_cache)\nprint(resp2.status_code)\n```\n\nSwitching the URL to something like \"https://httpbin.org/post\" does work\n\n### Workarounds\n_Is there an existing workaround for this issue?_\n\n### Environment\n- requests-cache version: 1.2.1\n- Python version: 3.12\n- Platform: Ubuntu 24.04\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "        96 passed"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "       100 passed"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

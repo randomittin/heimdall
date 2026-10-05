@@ -1,0 +1,40 @@
+{
+  "id": "google__langextract-177",
+  "category": "bugfix",
+  "source": "https://github.com/google/langextract/issues/177",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/google/langextract/pull/189",
+  "repo": "google/langextract",
+  "license": "Apache-2.0",
+  "base_sha": "9119a2bf8e3f3a3bdf42348342a3b6fac15843a9",
+  "merge_sha": "9fda9d69d168b01ceb6d7a7696aeca273058e993",
+  "test_paths": [
+    "tests/data_lib_test.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/google/langextract && git fetch -q --depth 1 --filter=blob:none origin 9119a2bf8e3f3a3bdf42348342a3b6fac15843a9 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".[test]\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: BUG: having a URL in your text may cause LangExtract to pull that text from the URL.\n\nlx.extract can take strings, Documents, or URLs\n\nThere is an issue where i have a URL somewhere in my string (not uncommon) then when lx.extract goes to chunk the string it can result in the chunk leading with the URL.\n\nIf that happens, LangExtract will try to pull that URL.\n\nThis is not good for a few of reason: polluting your extraction, unintended telemetry, and it can crash the extraction.\n\nMy current work around is to clean the data, i.e. replace http with ht_tp (or whatever).\n\n`cleaned_input_text = input_text.replace(\"http\",\"ht_tp\")`\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "1 failed, 6 passed in 13.38s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "7 passed in 1.65s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

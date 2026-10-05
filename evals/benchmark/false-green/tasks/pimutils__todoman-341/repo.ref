@@ -1,0 +1,6 @@
+repository: https://github.com/pimutils/todoman
+issue: https://github.com/pimutils/todoman/issues/341
+pull_request: https://github.com/pimutils/todoman/pull/610
+base_sha: 2d15d49fa486f36dc22b6b851ef0df10885049d0
+merge_sha: 6a429eb7aafc8c31184a4dbf6dc6978695efa9ef
+license: ISC

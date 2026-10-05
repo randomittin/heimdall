@@ -1,0 +1,40 @@
+{
+  "id": "virgiliojr94__book-to-skill-148",
+  "category": "bugfix",
+  "source": "https://github.com/virgiliojr94/book-to-skill/issues/148",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/virgiliojr94/book-to-skill/pull/150",
+  "repo": "virgiliojr94/book-to-skill",
+  "license": "MIT",
+  "base_sha": "b7e3a81ad604f49051eb97e11fd51ff32c6738f2",
+  "merge_sha": "07cd21f0fec1be7cb438066f93c1183a3f8fafad",
+  "test_paths": [
+    "tests/test_chapter_method_reported.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/virgiliojr94/book-to-skill && git fetch -q --depth 1 --filter=blob:none origin b7e3a81ad604f49051eb97e11fd51ff32c6738f2 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Chapter detection never reports which method it used, so a wrong count is silent\n\n## Summary\n\n`detect_structure()` picks between two ways of counting chapters and prints nothing about the choice:\n\n```python\nchapters_detected = (\n    numeric_count if numeric_count > 0 else _structural_chapter_count(text)\n)\n```\n\nThe number lands in `metadata.json` and in the run output with no indication of which method produced it, at which heading depth, or what the other method saw. When the count is wrong, nothing in the output says so.\n\n## Why this is the shape of a defect and not a nice-to-have\n\nEvery parser in this codebase already reports its decisions:\n\n```\nTrying python-docx... OK\nTrying stdlib DOCX parser... OK\n  [warn] extract_with_pdftotext failed: \u2026\n  [security] removed 3 invisible Unicode code point(s) from book.pdf\n```\n\nSame class of decision \u2014 method A or method B, with a fallback \u2014 and five loud paths sit next to one silent one. This is an inconsistency inside the project's own convention, not a new feature request.\n\nThe cost is concrete. In a real conversion of a 26-page paper with 8 numbered sections (#143), the run reported 4 chapters. The user only discovered it by reading the headings themselves; nothing in the output invited suspicion. And `chapters_detected` is not cosmetic \u2014 Step 3 plans from it and the generated skill's file layout follows it, so a wrong count silently becomes the structure of the artifact.\n\nOf the frictions from that session, this is the only one with no floor under it: a false scanner alert stops the run visibly, a missing-dependency message is annoying but the fallback still produces output, and a wrong chapter count produces a confident, complete-looking, wrong skill.\n\n## Suggested change\n\nOne line, in the convention already used elsewhere:\n\n```\nChapters: 8 (structural, depth 2)\nChapters: 12 (numeric)\nChapters: 1 (structural, depth 1) \u2014 only one heading level found\n```\n\nWorth considering alongside it:\n\n- record the method in `metadata.json` next to `chapters_detected`, so a batch run can be audited afterwards rather than watched live;\n- when the structural fallback returns 0 or 1 on a document of non-trivial length, say so explicitly \u2014 that combination is nearly always a detection failure rather than a one-chapter book.\n\n## Not in scope\n\nThe heuristic itself is #143. This issue is only about the run being able to tell you which answer you got and how it was reached.\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "4 failed in 0.07s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "4 passed in 0.05s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

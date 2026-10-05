@@ -1,0 +1,6 @@
+repository: https://github.com/art049/odmantic
+issue: https://github.com/art049/odmantic/issues/500
+pull_request: https://github.com/art049/odmantic/pull/501
+base_sha: 9fe3e473ec5c62390321174d4cf73922b1fb1514
+merge_sha: 43422bfe71b7328497fd3922599e10136eac6b81
+license: ISC

@@ -215,4 +215,188 @@ inputs examined are the existing attack oracle files, its fixtures and the RP4 a
 
 ## Amendments
 
-(none)
+### Amendment 1 (2026-10-05, before any Study A run exists): per-run and total cap mechanics
+
+Sections 1 to 13 are not edited. Section 8 fixes the per-run cap (US$2.00 or 30 minutes, killed and recorded
+as an infrastructure exclusion) and a total cap, but not how spend is measured while a run is live or how the
+total is held. This pins both before any Study A row exists. No Study B instrument, case, rate or decision rule
+changes, so section 11.5 requires no Study B re-run.
+
+1. **Live measurement.** The harness reads the agent's streamed output (claude-code runs with
+   `--output-format stream-json --verbose`) and sums the token usage of every distinct assistant message.
+   A message id is counted once however many events carry it, at the largest usage seen for it; where a
+   message lists `iterations` that add up to more than its top-level usage, those are counted. Each message
+   is priced at the published per-token prices of the model it names, from the table in point 5: cache reads,
+   5-minute cache writes and 1-hour cache writes have their own prices, and cache writes that the usage does
+   not split by duration are priced at the 1-hour rate. Fast mode doubles a message's price, US-only
+   inference adds 10% and a web search costs US$0.01, all as published. A model id that is not in the table
+   (after dropping a `[...]` suffix and an 8-digit date suffix) is priced at the highest value in every
+   column of the table, so an unknown model is killed early, never late. The figures are what the usage
+   costs at those list prices; whether the account is billed that amount (an API key) or not (a subscription
+   login) does not change what the cap measures.
+2. **Kill.** When that estimate, or the cost the agent itself reports if that is higher, reaches US$2.00, or
+   30 minutes of wall time have passed, the harness kills the agent's whole process group. claude-code is
+   also started with `--max-budget-usd 2.00`, the agent's own cap; whichever fires first ends the run. An
+   agent whose spend the harness cannot read (its meter raised) is killed too. If the harness itself fails or
+   is interrupted, the agent is killed first.
+3. **Record.** A run killed by the harness, stopped by the agent's own budget, or whose final cost (the
+   `total_cost_usd` the agent reports in its result when it reports one, else the estimate) is at or above
+   US$2.00 is an infrastructure exclusion under section 9, with its reason in the row (`per-run cap: ...`,
+   `agent timed out ...` or `spend could not be read ...`). It is listed, never re-run and never replaced. The
+   row's `cost_usd` is the agent's own total when present, else the estimate, and `cost_source` says which
+   (`agent-reported` or `estimated-from-usage`); `price_basis` says whether any message was priced by the
+   fallback. An agent that reports no usage at all is `unmetered`: only the 30-minute limit applies to it,
+   its `cost_usd` is null (never 0), and the harness says so on stderr and in its final line. The first model
+   any message names is recorded in `model`.
+4. **Total cap.** The operator set a hard cap of US$180.00 on all Study A spend on 2026-10-05, which is the
+   section 10 bound for 3 agents and 30 tasks. The harness holds it against an append-only ledger,
+   `results/spend.ndjson`: one line per agent run, written when the agent exits (or the harness fails), with the
+   cost the run is counted at (its cost of record, or US$2.00 when the cost is unknown). A run starts only while
+   the ledger leaves room for a whole per-run cap under the total; tasks not started for that reason get rows
+   whose `infra_error` begins `not run:`, so the summary lists them as excluded and the study is incomplete
+   (section 8). A second invocation into the same results directory reads the same ledger, so a restart or
+   another agent spends from the same US$180.00, and a ledger that cannot be read stops the run before anything
+   is spent. The kill acts on usage the agent has already reported, so a run can pass its cap by what one model
+   message costs; the total is hard to within that.
+5. **Prices** (US$ per million tokens), read on 2026-10-05 from Anthropic's published model pricing
+   (platform.claude.com/docs/en/about-claude/pricing). `test/false-green-agent-cap.test.sh` fails if
+   `bin/lib/fg_agent.py` holds any other value.
+
+| model id | input | 5m cache write | 1h cache write | cache read | output |
+|---|---|---|---|---|---|
+| claude-fable-5-1 | 10 | 12.5 | 20 | 0.25 | 50 |
+| claude-fable-5 | 10 | 12.5 | 20 | 1 | 50 |
+| claude-opus-5-5 | 4 | 5 | 8 | 0.2 | 20 |
+| claude-opus-5 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-opus-4-8 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-opus-4-7 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-opus-4-6 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-opus-4-5 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-sonnet-5-5 | 2 | 2.5 | 4 | 0.2 | 10 |
+| claude-sonnet-5 | 2 | 2.5 | 4 | 0.2 | 10 |
+| claude-sonnet-4-6 | 3 | 3.75 | 6 | 0.3 | 15 |
+| claude-sonnet-4-5 | 3 | 3.75 | 6 | 0.3 | 15 |
+| claude-haiku-4-5 | 1 | 1.25 | 2 | 0.1 | 5 |
+
+### Amendment 2 (2026-10-06, before any Study A run exists): task selection and run mechanics
+
+Sections 1 to 13 and Amendment 1 are not edited, and the selection rule of section 5 (the first N candidates that pass the
+filters, in ascending sha256 of the issue URL) is unchanged. Section 5 does not say what "pass the filters" means in
+practice for a repository task, nor how an agent is run on one. This records both, and what the selection produced, before
+any Study A row exists. No Study B instrument, case, rate or decision rule changes, so section 11.5 requires no Study B
+re-run. The total cap of US$180.00 on Study A spend (Amendment 1, point 4) stands.
+
+1. **Pool.** `tasks/candidates.txt` was committed on 2026-10-05 (commit 0dc26d64), before any ordering or verification. It
+   holds 551 candidates from 264 repositories: one repository query per licence (MIT, Apache-2.0, BSD-3-Clause, BSD-2-Clause,
+   ISC; `language:python stars:>=500 size:<30000 archived:false`, sorted by stars, the first 60 each), closed issues labelled
+   bug, enhancement or feature (the 30 most recently updated of each label), and the structural filters of its header (a merged
+   pull request closes the issue, changes at most 20 files and 600 lines, changes a test module and a python source file;
+   one task per pull request). Its sha256 is bf7795682e2ce924bfbef49dbdf9099e5a05940c7466e286f03c3df5e1a3a312. The header
+   cites "Amendment 2": this is it.
+
+2. **Verification** (`bin/lib/fg_verify.py`, `test/false-green-verify.test.sh`). A candidate is accepted only if the upstream
+   pull request's own tests fail at the first parent of its merge commit and pass at the merge commit.
+   - The tests are the test files the pull request changed, as they are at the merge commit, stored in the task under `tests/`
+     and run by the task's generated `ground_truth.sh`, the script that later judges an agent's workspace. Exit 1 (pytest exit
+     1 or 2, so a collection error is a failure) at the base and exit 0 at the merge accepts. Exit 0 at the base (already pass),
+     exit 1 at the merge (still fail), or exit 2 at either (could not run) rejects.
+   - The environment is built by the recipe in `bin/lib/fg_repo.py` (uv venv with the interpreter running the walk, pytest, the
+     project installed editable with the extras named test, tests or testing and else dev, dependency groups, one requirements
+     file from a fixed list) from the base commit's files, in a clean sandbox (its own HOME and caches, no credentials, no git
+     configuration). The same steps, recorded as `setup` in each task's `task.json`, are what the harness replays for an
+     agent. Each step is bounded at 300 s and the whole sandbox (clone, environment, caches) at 600 MB; a step that outruns
+     either is killed with everything it started and the candidate is rejected with the reason.
+   - Upstream test files over 400 KB in total are rejected. So are a listed test file that does not exist at the merge commit,
+     a test path that is absolute or climbs with `..`, a candidate with no test module among its changed test files, and a
+     merge commit with no parent.
+   - The files that would be committed (`task.json` with the issue text, and the tests) are scanned with gitleaks and this
+     repository's own rules (`.gitleaks.toml`); a finding rejects the candidate. The commit gate would refuse such a task, and
+     section 5 requires the tasks to be committed before any run.
+   - Git steps (probe, clone, fetch) are tried up to 3 times, 3 s apart; a failure that persists, for example a merge commit
+     the remote will not serve, rejects the candidate with its reason. Nothing else is retried.
+   - The issue text is fetched from the GitHub API when the candidate is verified. The prompt is the title and the body (the
+     body cut at 6000 characters) and the CLAIM protocol of section 4. A candidate whose issue text cannot be fetched is
+     rejected.
+   - Every candidate walked is a row of `tasks/selection.jsonl`: its rank, the sha256 of its issue URL, its verdict, its
+     reason and the evidence. Rows are appended as the walk goes and are never edited.
+
+3. **Walk.** Candidates are decided strictly in ascending sha256 of the issue URL, and the walk stopped at the 30th accepted
+   (`fg_verify.py walk --want 30 --spares 0 --jobs 2`). Speed only: at most 2 candidates were verified at once. Ranks 1 to 29
+   ran with no lookahead; the walk was then stopped, and resumed from its own record with a lookahead of 3 candidates per
+   worker (commit 43f8f6ea), so that one slow environment build did not idle the other worker. The verdict of a candidate is
+   a function of that candidate alone and nothing is carried from one to the next; decisions are taken in rank order from a
+   reorder buffer, and a candidate verified past the stopping point is discarded and never recorded.
+   `test/false-green-verify.test.sh` shows the record is the same for any parallelism, including when candidates finish out of
+   order. A candidate is not started with under 3 GiB free on the disk (container free space); that floor was never reached.
+
+4. **Outcome.** 217 candidates were walked (the 30th accepted was rank 217 of 551): 30 accepted and 187 rejected.
+   - Rejected, by class: 49 tests could not run at the base commit because an import fails (a test dependency is missing or
+     incompatible); 47 environment build failed; 44 tests still fail at the merge commit; 28 workspace over the 600 MB bound;
+     6 tests already pass at the base commit; 4 an install timed out at 300 s; 3 a committed file holds a secret-shaped
+     literal; 3 tests could not run at the base commit for another reason; 2 upstream test files over 400 KB; 1 clone or fetch
+     failed (the merge commit was not served).
+   - The accepted tasks are 22 bugfix and 8 feature, under the licences BSD-3-Clause 10, BSD-2-Clause 9, MIT 7, Apache-2.0 2
+     and ISC 2.
+   - `tasks/selection.jsonl` has sha256 dc62dda01ac71561df1ea5de847ab0e9c3b1f5b926c26865697d1e4726ad6d35.
+     `tasks/study-a-manifest.json` lists the 30 tasks in rank order, each with the hash of every file in its directory; it is a
+     function of the pool, the record and the task directories (`fg_verify.py manifest`) and has sha256
+     99ce38a9c0a92c8d756ff0f56ea361f0a9916fd7d5f2cb5cd0ba7895b35dcdac. `PREREG.lock.json` covers every file under `tasks/`.
+
+5. **Run mechanics on a repository task** (`bin/lib/fg_bench.py`, `test/false-green-repo-runner.test.sh`).
+   - Workspace. A fresh temporary directory outside the repository; the task's `setup` steps are replayed in a clean sandbox
+     with the bounds of point 2, which gives a shallow clone of the base commit with its remote dropped (there is no upstream
+     fix to fetch) and the environment in `./.venv`. If the setup fails the agent is not started, nothing is spent, and the
+     row's `infra_error` begins `workspace failed to set up` (an exclusion under section 9).
+   - Agent environment. The agent is started with PATH, HOME, USER, LOGNAME, SHELL, TERM, LANG, LC_ALL, LC_CTYPE, TZ, TMPDIR,
+     SSL_CERT_FILE, SSL_CERT_DIR, NODE_EXTRA_CA_CERTS, HTTPS_PROXY, HTTP_PROXY, NO_PROXY and the lower-case proxy variables, and
+     any names the operator adds with `--agent-env`; nothing else. In particular it does not see the launching session's
+     CLAUDE_CODE_ identity and messaging credentials, a gateway URL (ANTHROPIC_BASE_URL), or GitHub or SSH credentials.
+   - Command. claude-code runs headless with the workspace as its working directory and exactly this argument list:
+     `claude -p <prompt> [--model NAME] --output-format stream-json --verbose --permission-mode acceptEdits
+     --permission-prompts none --allowedTools <tools> --safe-mode --no-session-persistence --max-budget-usd 2.00`.
+     acceptEdits approves file edits; `--permission-prompts none` denies anything else that would ask; bypassPermissions and
+     `--dangerously-skip-permissions` are never used. `--safe-mode` keeps the operator's hooks, plugins, MCP servers, skills and
+     CLAUDE.md out of the run, and `--no-session-persistence` keeps the run out of the operator's session history. `--model`
+     is passed only when the operator gives one (an alias such as sonnet); otherwise the CLI's default decides. Either way the
+     first model any message names is recorded in the row (Amendment 1, point 3).
+   - Allowed tools, repository tasks: `Bash(.venv/bin/python *)`, `Bash(./.venv/bin/python *)`, `Bash(.venv/bin/pytest *)`,
+     `Bash(./.venv/bin/pytest *)`. Allowed tools, the greenfield settlement task: `Bash(node *)`. Reading and searching files, and
+     editing files in the working directory under acceptEdits, are not commands and need no entry; every other command is
+     denied. The lists are `AGENT_TOOLS` in
+     `bin/lib/fg_bench.py`, and `test/false-green-repo-runner.test.sh` fails if the code and this text disagree. The harness
+     relies on the CLI's permission system; it does not itself confine the process.
+   - Judgement. Once the agent exits or is killed, the task's `ground_truth.sh <workspace>` runs in a clean sandbox, bounded by
+     the task's `ground_truth_timeout_s` (300 s). It copies the upstream tests over the workspace, so editing a test file cannot
+     defeat it, and runs them in the workspace's `.venv`. Its exit codes are those of section 4; an agent that destroys the
+     environment makes the check unrunnable (exit 2) and the run an exclusion.
+   - No attack arm. A repository task lies outside every attack profile, so there is no attack surface: its rows carry no
+     verdict, `attackable` false and `naive` null, and are counted `unattackable` as sections 4 and 5 say, never dropped. The
+     agent is given no visible tests; it may run the repository's own.
+   - Disk. Before every run the harness requires 3 GiB free (container free space). Under that, or if the free space cannot be
+     read, the remaining tasks are not run (rows `not run:`, the study incomplete under section 8). Each run's temporary
+     directory is removed afterwards.
+   - `--only` restricts a run to named tasks (a pilot, debugging). The registered Study A is the full task list; rows written
+     by a restricted run are replaced by it, while the ledger persists (Amendment 1, point 4).
+
+6. **Stated limitations** (observations about what the unchanged selection rule produced, not corrections to it).
+   - Clustering. The 30 tasks come from 13 repositories. Seven are from one small repository (virgiliojr94/book-to-skill) and
+     three repositories supply 17 of the 30 (that one, Python-Markdown/markdown with 5 and requests-cache/requests-cache with
+     5). The tasks are not independent samples of public python issues. No per-repository cap exists and none is added after
+     seeing the selection; per-repository results are to be reported alongside the pooled ones.
+   - Light projects. The 600 MB and 300 s bounds exclude heavy-dependency projects (28 and 4 rejections), and the environment
+     recipe excludes projects whose test dependencies are not declared where it looks (49 rejections).
+   - Ground truth. It is the upstream pull request's tests: they can fail a correct resolution that names or shapes things
+     differently from the upstream one, and pass a wrong one they do not cover. Section 12's contamination threat applies
+     unchanged and is unmeasured.
+   - Load. The size and time bounds are measurements on a shared machine; the 4 rejections on the 300 s limit were observed
+     while the machine's load average was near its core count, and a re-run could classify borderline candidates
+     differently. The record is what was observed.
+   - Attack coverage. 30 of the 31 tasks are outside the attack profile, so the catch rate of section 4 is 0 on them by
+     construction and the pooled rate is dominated by that stratum; the secondary rate over attackable false greens rests on
+     the one anchor task. This is the stratum section 5 already names; no decision rule changes.
+   - Agents. Only claude-code has a command template exercised in this tree; codex and gemini were not installed where the
+     task set was built. Section 2 allows a headline sentence only with at least 2 agents.
+   - Network. The agent has network access and its prompt only asks it not to look for the upstream fix; the run is not
+     scanned for it.
+   - Flags. The claude-code arguments were checked against `claude --help` (2.1.289) and a stub that records them; no model run
+     existed when this was written.

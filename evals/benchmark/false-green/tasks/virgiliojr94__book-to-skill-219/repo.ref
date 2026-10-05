@@ -1,0 +1,6 @@
+repository: https://github.com/virgiliojr94/book-to-skill
+issue: https://github.com/virgiliojr94/book-to-skill/issues/219
+pull_request: https://github.com/virgiliojr94/book-to-skill/pull/220
+base_sha: a45a2c9472a5a25deac3ea5eb5b825ed957d54f0
+merge_sha: 0d538c8506f63a1d93b7d7ba86dd3058341f070c
+license: MIT

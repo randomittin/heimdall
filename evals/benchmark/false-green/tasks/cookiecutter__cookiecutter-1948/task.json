@@ -1,0 +1,48 @@
+{
+  "id": "cookiecutter__cookiecutter-1948",
+  "category": "feature",
+  "source": "https://github.com/cookiecutter/cookiecutter/issues/1948",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/cookiecutter/cookiecutter/pull/1950",
+  "repo": "cookiecutter/cookiecutter",
+  "license": "BSD-3-Clause",
+  "base_sha": "539f341d514e237149e7e6b4248c5b765c70922e",
+  "merge_sha": "0fa6a86b00d5a71e862bc9bcde8c6caa90ddfa88",
+  "test_paths": [
+    "tests/test-pyhooks/cookiecutter.json",
+    "tests/test-pyhooks/hooks/pre_prompt.py",
+    "tests/test-pyshellhooks/cookiecutter.json",
+    "tests/test-pyshellhooks/hooks/pre_prompt.sh",
+    "tests/test_cli.py",
+    "tests/test_generate_hooks.py",
+    "tests/test_pre_prompt_hooks.py",
+    "tests/test_utils.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/cookiecutter/cookiecutter && git fetch -q --depth 1 --filter=blob:none origin 539f341d514e237149e7e6b4248c5b765c70922e && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\"",
+    "uv pip install --python .venv/bin/python -q -r test_requirements.txt"
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Implement a pre_prompt hook that will run before prompts\n\n* Cookiecutter version: 2.3.1\r\n\r\n### Description:\r\n\r\nCreate a new hook, `pre_prompt`, that will be called before `cookiecutter` asks the user any question. This hook can be used to:\r\n\r\n- Pre-process the context\r\n- Run sanity checks\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "=================== 6 failed, 66 passed, 1 skipped in 3.40s ===================="
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "======================== 72 passed, 1 skipped in 2.99s ========================="
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

@@ -1,0 +1,6 @@
+repository: https://github.com/Python-Markdown/markdown
+issue: https://github.com/Python-Markdown/markdown/issues/1358
+pull_request: https://github.com/Python-Markdown/markdown/pull/1359
+base_sha: 93054dd9f7e6e2f555537873a3ec76d99e82326a
+merge_sha: d60c16f712e5caf806e3c0ed40eac385a9d2e18a
+license: BSD-3-Clause

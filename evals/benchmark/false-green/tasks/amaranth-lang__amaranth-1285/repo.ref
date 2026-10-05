@@ -1,0 +1,6 @@
+repository: https://github.com/amaranth-lang/amaranth
+issue: https://github.com/amaranth-lang/amaranth/issues/1285
+pull_request: https://github.com/amaranth-lang/amaranth/pull/1313
+base_sha: 0be2dda6561a05c4769a4fb1f50f129c3ad65958
+merge_sha: c59447c2580c29e4376cc98fe034bc280c3d63b9
+license: BSD-2-Clause

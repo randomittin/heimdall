@@ -1,0 +1,6 @@
+repository: https://github.com/tslearn-team/tslearn
+issue: https://github.com/tslearn-team/tslearn/issues/440
+pull_request: https://github.com/tslearn-team/tslearn/pull/584
+base_sha: 92b76eb39cd92f29311809d7a7bda650b79ca3a0
+merge_sha: 597071727bb46ffb91287f1de4ad4715293e44a8
+license: BSD-2-Clause

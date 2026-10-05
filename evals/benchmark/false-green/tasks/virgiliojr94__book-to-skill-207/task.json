@@ -1,0 +1,40 @@
+{
+  "id": "virgiliojr94__book-to-skill-207",
+  "category": "bugfix",
+  "source": "https://github.com/virgiliojr94/book-to-skill/issues/207",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/virgiliojr94/book-to-skill/pull/208",
+  "repo": "virgiliojr94/book-to-skill",
+  "license": "MIT",
+  "base_sha": "7e0795351f5f005191d4fc4e9e54273d0f78c501",
+  "merge_sha": "ecf99ee36a7bd0644b2a962efdb7d2f8ffc57476",
+  "test_paths": [
+    "tests/test_dependency_install_semantics.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/virgiliojr94/book-to-skill && git fetch -q --depth 1 --filter=blob:none origin 7e0795351f5f005191d4fc4e9e54273d0f78c501 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: [bug] Dependency preflight installs redundant fallback parsers\n\n## What happened\n\nThe runtime dependency preflight treats alternative parser chains as though every\nparser were required:\n\n- PDF extraction offers to install `pdfminer.six` when `pdftotext` is absent but\n  `pypdf` is already importable.\n- HTML extraction offers to install `beautifulsoup4` when the preferred\n  `trafilatura` parser is already importable.\n- When no parser in an alternative chain is present, the preflight installs every\n  alternative even though extraction only needs one.\n\nThis disagrees with `DEPENDENCY_GROUPS`, where PDF and HTML declare\n`any_of_modules=True`, and can trigger unnecessary prompts and network installs.\n\n## What you expected\n\nFor an any-of parser chain, any available parser should satisfy the preflight. If\nnone is available and installation is enabled, the preflight should install only\nthe first (preferred) parser. Formats whose dependencies are cumulative, such as\nEPUB's `ebooklib` plus `beautifulsoup4`, should keep installing every missing\npackage.\n\n## Source document\n\n- Format: PDF and HTML\n- Pages / size: n/a \u2014 the bug occurs before document parsing\n- Language: n/a\n- Does `python3 scripts/extract.py --check` show the relevant extractor installed? yes; the runtime preflight does not honor the same any-of semantics\n\n## Repro\n\nThe failure is deterministic by stubbing dependency availability:\n\n1. Make `python_module_available(\"pypdf\")` return true and\n   `python_module_available(\"pdfminer\")` return false, with `pdftotext` absent.\n2. Run `prepare_dependencies(\".pdf\", \"text\", \"yes\")`.\n3. Observe an attempted `pdfminer.six` installation despite an available PDF\n   parser.\n\nThe equivalent HTML case occurs with `trafilatura` available and `bs4` absent.\n\n## Environment\n\n- OS: platform-independent; reproduced on Windows 11 and verified under WSL/Linux\n- Python version: 3.12 reproduction; full Linux suite also passes on Python 3.14\n- book-to-skill version / commit: `a6cad12`\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "3 failed, 1 passed in 0.10s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "4 passed in 0.04s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "id": "requests-cache__requests-cache-1090",
+  "category": "bugfix",
+  "source": "https://github.com/requests-cache/requests-cache/issues/1090",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/requests-cache/requests-cache/pull/1091",
+  "repo": "requests-cache/requests-cache",
+  "license": "BSD-2-Clause",
+  "base_sha": "1c97b7d94df0c0bce3027e44ef30c5ded7c5485d",
+  "merge_sha": "df6e34a79048584d187dc40eb8d2533a96c9382d",
+  "test_paths": [
+    "tests/unit/policy/test_expiration.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/requests-cache/requests-cache && git fetch -q --depth 1 --filter=blob:none origin 1c97b7d94df0c0bce3027e44ef30c5ded7c5485d && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\" --group dev"
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: 'Expires: -1' raises ValueError\n\n### The problem\nSome endpoints (`GET https://management.azure.com\n/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/example?api-version=2024-11-01`) returns `Expires: -1`.\n\nThis results in ValueError being raised:\n```\nTraceback (most recent call last):\n  [snipped my code]\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/tracing/decorator.py\", line 119, in wrapper_use_tracer \n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/mgmt/resource/resources/v2024_11_01/operations/_operations.py\", line 10806, in get\n    pipeline_response: PipelineResponse = self._client._pipeline.run(  # pylint: disable=protected-access\n                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/_base.py\", line 242, in run\n    return first_node.send(pipeline_request)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/_base.py\", line 98, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^    \n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/_base.py\", line 98, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/_base.py\", line 98, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^    \n  [Previous line repeated 2 more times]\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/mgmt/core/policies/_base.py\", line 95, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/policies/_redirect.py\", line 205, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^    \n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/policies/_retry.py\", line 544, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/policies/_authentication.py\", line 159, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^    \n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/_base.py\", line 98, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/_base.py\", line 98, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/_base.py\", line 98, in send\n    response = self.next.send(request)\n               ^^^^^^^^^^^^^^^^^^^^^^^    \n  [Previous line repeated 2 more times]\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/_base.py\", line 130, in send\n    self._sender.send(request.http_request, **request.context.options),\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/azure/core/pipeline/transport/_requests_basic.py\", line 363, in send\n    response = self.session.request(  # type: ignore\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/requests_cache/session.py\", line 183, in request\n    return super().request(method, url, *args, headers=headers, **kwargs)  # type: ignore\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/requests/sessions.py\", line 589, in request\n    resp = self.send(prep, **send_kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/requests_cache/session.py\", line 230, in send\n    response = self._send_and_cache(request, actions, cached_response, **kwargs) \n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/requests_cache/session.py\", line 258, in _send_and_cache\n    self.cache.save_response(response, actions.cache_key, actions.expires)\n                                                          ^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/requests_cache/policy/actions.py\", line 149, in expires\n    return get_expiration_datetime(self.expire_after)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alex/src/radnac/.venv/lib/python3.11/site-packages/requests_cache/policy/expiration.py\", line 39, in get_expiration_datetime \n    raise ValueError(f'Invalid HTTP date: {expire_after}')\nValueError: Invalid HTTP date: -1\n```\n\nThe HTTP headers returned by Azure here were:\n```\nCache-Control: no-cache\nPragma: no-cache\nContent-Length: 441\nContent-Type: application/json; charset=utf-8\nExpires: -1\nx-ms-ratelimit-remaining-subscription-reads: 249\nx-ms-ratelimit-remaining-subscription-global-reads: 3749\nx-ms-request-id: 110d9135-48b3-4c37-80df-4b7f286353d4\nx-ms-correlation-request-id: 110d9135-48b3-4c37-80df-4b7f286353d4\nx-ms-routing-request-id: UKSOUTH:20250518T065142Z:110d9135-48b3-4c37-80df-4b7f286353d4\nStrict-Transport-Security: max-age=31536000; includeSubDomains\nX-Content-Type-Options: nosniff\nX-Cache: CONFIG_NOCACHE\nX-MSEdge-Ref: Ref A: 05A8543688334C55A5FB3E83F84C756E Ref B: AMS231022012011 Ref C: 2025-05-18T06:51:42Z\nDate: Sun, 18 May 2025 06:51:42 GMT\n```\n\n### Expected behavior\nInvalid dates MUST be treated as 'already expired' ([RFC 2616, section 14.21](https://datatracker.ietf.org/doc/html/rfc2616#section-14\n[the issue text is cut here]\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "        24 passed"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "        25 passed"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

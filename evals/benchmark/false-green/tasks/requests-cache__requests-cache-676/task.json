@@ -1,0 +1,40 @@
+{
+  "id": "requests-cache__requests-cache-676",
+  "category": "feature",
+  "source": "https://github.com/requests-cache/requests-cache/issues/676",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/requests-cache/requests-cache/pull/1087",
+  "repo": "requests-cache/requests-cache",
+  "license": "BSD-2-Clause",
+  "base_sha": "af7db37c70e5fab20b9fce5bf0a709d636c7934d",
+  "merge_sha": "1c97b7d94df0c0bce3027e44ef30c5ded7c5485d",
+  "test_paths": [
+    "tests/unit/test_normalize.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/requests-cache/requests-cache && git fetch -q --depth 1 --filter=blob:none origin af7db37c70e5fab20b9fce5bf0a709d636c7934d && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\" --group dev"
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Add option to ignore nested parameters in a JSON request body\n\nIs it possible to ignore a nested parameter? For example the data of my requests looks like this:\r\n```json\r\n{\r\n  \"data\": {\r\n    \"key\": \"value\",\r\n    \"timestamp\": \"2022-08-04\"\r\n  }\r\n}\r\n```\r\n\r\nIn this example, I would like to ignore `timestamp` but not `key` when creating the cache key. Yes, I could overwrite the `cache_key` function, but feels like this should be part of the library? Maybe like this: `data.timestamp`\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "         2 failed"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "         2 passed"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}
