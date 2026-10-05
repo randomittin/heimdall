@@ -52,6 +52,10 @@
 # protocol: read lines, and pop atomically via `rename` (under an exclusive
 # `fcntl.flock` on inbox.jsonl.lock) followed by appending the renamed
 # content onto inbox-delivered.jsonl -- the archive of what was delivered.
+# An EMPTY inbox is never renamed (nothing to pop, same as the module's
+# pop_all): a writer that took no flock -- a plain >> from a script -- may
+# have created the file and not yet written, and must keep writing into the
+# live inbox, not into an inode the pop just removed.
 #
 # IDLE-SESSION DELIVERY (docs/HANDOFF-TO-HEIMDALL-product-asks.md, A2). A phone
 # exists for the moment the human is away, i.e. the session is idle -- but the
@@ -603,6 +607,16 @@ def inline_pop_all(root):
     p = paths_for(root)
     _ensure_dir(p["dir"])
     with _Flock(p["lock"]):
+        # An empty inbox has nothing to pop, so it stays exactly where it is (what
+        # companion_ui_inbox.pop_all does). Renaming it away strands a writer that has created
+        # or opened the file and not yet written: a plain append takes no flock, the event-driven
+        # hold wakes on the create, pops the empty file, and the line then lands in an inode that
+        # was renamed and removed. See test/heimdall-inbox-lockless-writer.test.sh.
+        try:
+            if os.stat(p["inbox"]).st_size == 0:
+                return []
+        except OSError:
+            return []  # no inbox file: nothing queued to pop
         tmp = "%s.popped.%d.%d" % (p["inbox"], os.getpid(), int(time.time() * 1000))
         try:
             os.rename(p["inbox"], tmp)
