@@ -231,7 +231,7 @@ def _verdict(report, ref, started, evidence_prefix, tree):
         })
     return {
         "schema": "runhmd.verdict/1",
-        "id": hashlib.sha256(("%s|%s|%s" % (metrics["suite"], metrics["profile"], _tree_digest(ref))).encode()).hexdigest()[:12],
+        "id": hashlib.sha256(("%s|%s|%s" % (metrics["suite"], metrics["profile"], tree)).encode()).hexdigest()[:12],
         "verdict": "PROVEN" if report["status"] == "pass" else "DENIED",
         "target": {"kind": "path", "ref": ref, "head_sha": _git_head(ref)},
         "attacks": metrics["attacks"],
@@ -249,10 +249,43 @@ def _write_json(path, obj):
         fh.write(json.dumps(obj, indent=2) + "\n")
 
 
-def _attack_one(ref, out_layout):
+def _receipt_setup(args):
+    """(context, None) for --receipt, (None, None) without it, or (None, (error doc, exit code)) when
+    a receipt cannot be issued. Reads the signing key and checks the URL base, so a missing key or a
+    bad base fails here, before any target is attacked. Imported lazily: the receipt module pulls in
+    the crypto stack, and the default attack path stays light and offline."""
+    if not args.receipt:
+        return None, None
+    import runhmd_receipt as rr
+    try:
+        signer = rr.load_signer()
+        rr.receipt_url("000")          # validates RUNHMD_RECEIPT_BASE_URL before anything runs
+    except rr.ReceiptError as exc:
+        return None, ({"error": exc.kind, "detail": exc.detail}, EXIT_USAGE if exc.kind in rr.CONFIG_KINDS else EXIT_INFRA)
+    return {"rr": rr, "signer": signer, "store": rr.store_dir(), "public": args.public, "publish": not args.no_upload, "paths": []}, None
+
+
+def _issue_receipt(doc, tree, receipt):
+    """Issue and store the receipt for verdict `doc` (the target is attested by its content hash `tree`),
+    and set doc["receipt_url"] unless the receipt is to stay local. Returns an error document or None.
+    The URL is only set once the receipt is on disk: never a URL that points at nothing."""
+    rr = receipt["rr"]
+    try:
+        raw = rr.receipt_for_verdict(doc, tree_sha256=tree, signer=receipt["signer"], visibility="public" if receipt["public"] else "private")
+        path = rr.write_receipt(receipt["store"], doc["id"], raw)
+        url = rr.receipt_url(doc["id"]) if receipt["publish"] else None
+    except rr.ReceiptError as exc:
+        return {"error": "receipt_failed", "detail": "%s: %s" % (exc.kind, exc.detail)}
+    doc["receipt_url"] = url
+    receipt["paths"].append(path)
+    return None
+
+
+def _attack_one(ref, out_layout, receipt=None):
     """Attack one target. Returns (verdict doc, None, exit code) or (None, error doc, exit code).
 
     out_layout: None, or (verdict_path, evidence_dir, evidence_ref_prefix) for --out.
+    receipt: None, or the context _receipt_setup built: the verdict then gets a signed receipt.
     """
     if not os.path.exists(ref):
         return None, {"error": "target_not_found", "detail": "no such file or directory: %s" % ref, "target": ref}, EXIT_USAGE
@@ -268,7 +301,12 @@ def _attack_one(ref, out_layout):
             return None, {"error": kind, "detail": detail, "target": ref}, EXIT_USAGE if kind in _USAGE_KINDS else EXIT_INFRA
         if report.get("status") not in ("pass", "fail"):
             return None, {"error": "infra", "detail": "the attack gate reported an unknown status %r" % report.get("status"), "target": ref}, EXIT_INFRA
-        doc = _verdict(report, ref, started, out_layout[2] if out_layout else None)
+        tree = _tree_digest(ref)
+        doc = _verdict(report, ref, started, out_layout[2] if out_layout else None, tree)
+        if receipt:
+            failure = _issue_receipt(doc, tree, receipt)
+            if failure:
+                return None, dict(failure, target=ref), EXIT_INFRA
         problems = runhmd_schema.validate(doc)
         if problems:
             return None, {"error": "infra", "detail": "internal error: the verdict violates runhmd.verdict/1: " + "; ".join(problems[:3]),
@@ -307,11 +345,11 @@ def _show_card(doc, as_json):
     (sys.stderr if as_json else sys.stdout).write(runhmd_card.render_card(doc))
 
 
-def _run_single(args, ref):
+def _run_single(args, ref, receipt):
     layout = None
     if args.out:
         layout = (os.path.join(args.out, "verdict.json"), os.path.join(args.out, "attacks"), "attacks/")
-    doc, err, code = _attack_one(ref, layout)
+    doc, err, code = _attack_one(ref, layout, receipt)
     if err:
         _emit(err, args.json, "hmd attack: %s: %s" % (err["error"], err["detail"]))
         return code
@@ -321,16 +359,18 @@ def _run_single(args, ref):
             _show_card(doc, True)
     else:
         _show_card(doc, False)
+    for path in (receipt or {}).get("paths", []):
+        sys.stderr.write("receipt: %s\n" % path)
     return code
 
 
-def _run_batch(args, refs):
+def _run_batch(args, refs, receipt):
     worst, lines = EXIT_PROVEN, []
     rank = {EXIT_PROVEN: 0, EXIT_DENIED: 1, EXIT_USAGE: 2, EXIT_INFRA: 3}
     for index, ref in enumerate(refs, start=1):
         slug = _slug(index, ref)
         layout = (os.path.join(args.out, slug + ".json"), os.path.join(args.out, slug + ".attacks"), slug + ".attacks/")
-        doc, err, code = _attack_one(ref, layout)
+        doc, err, code = _attack_one(ref, layout, receipt)
         if err:
             _write_json(os.path.join(args.out, slug + ".json"), err)
             lines.append("ERROR    %s: %s" % (ref, err["error"]))
@@ -342,6 +382,8 @@ def _run_batch(args, refs):
             worst = code
     if not args.json:
         sys.stdout.write("\n".join(lines) + "\n")
+    if receipt and receipt["paths"]:
+        sys.stderr.write("receipts: %d written to %s\n" % (len(receipt["paths"]), receipt["store"]))
     return worst
 
 
@@ -381,8 +423,17 @@ def main(argv):
                              "Check it out and attack the path.\n" % ref)
             return EXIT_USAGE
 
-    # Everything above is a usage check and touches nothing. From here a target is looked at and its
-    # code is run, so consent comes first.
+    if args.public and not args.receipt:
+        sys.stderr.write("hmd attack: --public marks a receipt public, so it needs --receipt (see hmd attack --help)\n")
+        return EXIT_USAGE
+    receipt, receipt_error = _receipt_setup(args)
+    if receipt_error:
+        error, code = receipt_error
+        _emit(error, args.json, "hmd attack: %s: %s" % (error["error"], error["detail"]))
+        return code
+
+    # Everything above is a usage check and touches nothing (--receipt only READS the signing key).
+    # From here a target is looked at and its code is run, so consent comes first.
     if not _consent(args, targets or ["(each target listed in %s)" % args.batch]):
         return EXIT_CONSENT
     refs = _read_batch(args.batch) if args.batch is not None else targets
@@ -390,7 +441,7 @@ def main(argv):
     if over:
         _emit(over, args.json, "hmd attack: budget cap hit: estimated $%.2f exceeds --max-usd %.2f" % (over["spent_usd"], over["cap_usd"]))
         return EXIT_BUDGET
-    return _run_batch(args, refs) if args.batch is not None else _run_single(args, refs[0])
+    return _run_batch(args, refs, receipt) if args.batch is not None else _run_single(args, refs[0], receipt)
 
 
 if __name__ == "__main__":
