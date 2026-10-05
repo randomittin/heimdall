@@ -70,9 +70,13 @@ import {
 } from "./code-pair-helpers";
 
 // Many tests here drive a whole pairing -- sign-in, a window, a release, a bind -- or fill a
-// throttle (10 and 20 requests), each request a few Durable Object hops in a real workerd:
-// seconds, not milliseconds, so the 5 s default would fail them for being thorough.
-vi.setConfig({ testTimeout: 60_000 });
+// throttle (10 and 20 requests), each request a few Durable Object hops in a real workerd: the
+// heaviest take up to ~5.5 s on a loaded machine, and one waits out the relay's own 5 s GitHub
+// timeout, so the 5 s default would fail them for being thorough. 20 s is that with headroom for
+// a slower CI runner. It is not a cure for a stall: the 110 s+ stalls this file once had were
+// the INV-39 sweep below walking every Durable Object the earlier tests had left behind, and a
+// bigger number would only have hidden them.
+vi.setConfig({ testTimeout: 20_000 });
 
 const fake = new FakeGitHub();
 beforeEach(() => fake.install());
@@ -1239,6 +1243,11 @@ describe("INV-39: the relay holds no GitHub token, assertion or signature, and l
     const phone = newPhone();
     const secrets: string[] = [];
     let pairingCode = "";
+    // Only the objects this pairing creates are swept below. Sweeping the whole namespace would
+    // also wake every object the file's earlier tests left behind (storage is not reset between
+    // tests): thousands by here, minutes of wall time, and none of them can hold secrets that
+    // exist nowhere before this test starts.
+    const existing = new Set((await listDurableObjectIds(typedEnv.SESSION)).map((id) => id.toString()));
 
     const log = await withRelayLog(async () => {
       const phoneToken = fake.phoneToken(user);
@@ -1269,11 +1278,16 @@ describe("INV-39: the relay holds no GitHub token, assertion or signature, and l
     expect(logged).not.toContain(String(user.id));
     expect(logged).not.toContain(pairingCode);
 
+    let swept = 0;
     for (const id of await listDurableObjectIds(typedEnv.SESSION)) {
+      if (existing.has(id.toString())) continue;
       const dump = await dumpStorage(typedEnv.SESSION.get(id));
       for (const secret of secrets) expect(dump).not.toContain(secret);
       expect(dump).not.toContain(String(user.id));
+      swept++;
     }
+    // the session, the owner's index and the per-IP buckets at least: a sweep of nothing proves nothing
+    expect(swept).toBeGreaterThanOrEqual(3);
   });
 });
 
@@ -1429,6 +1443,22 @@ describe("INV-41: a window's identifying fields live no longer than the window",
 
     expect(await storedIndex(user.id)).toEqual({ codes: {}, miss_streak: [], attempts: [], not_before: notBefore });
     expect(await runInDurableObject(indexStub(user.id), (_i, state) => state.storage.getAlarm())).not.toBeNull();
+  });
+
+  it("drop a revoke once every assertion it killed has expired: the alarm reclaims the object instead of re-arming in the past", async () => {
+    const user = newUser();
+    await revokeRequest({ gh_token: fake.laptopToken(user) });
+    // the revoke is now a month and a minute old
+    await runInDurableObject(indexStub(user.id), async (_instance, state) => {
+      const index = (await state.storage.get<{ not_before: number }>("code_index")) as { not_before: number };
+      index.not_before = nowS() - GH_ASSERTION_TTL_S - 60;
+      await state.storage.put("code_index", index);
+    });
+
+    expect(await runDurableObjectAlarm(indexStub(user.id))).toBe(true);
+    expect(await storedIndex(user.id)).toBeUndefined();
+    // a deadline already past would set an alarm that is due at once and fires again: for ever
+    expect(await runInDurableObject(indexStub(user.id), (_i, state) => state.storage.getAlarm())).toBeNull();
   });
 });
 
