@@ -764,7 +764,9 @@ def register_action(name, *, cls, handler, required=(), optional=(), fields=_no_
     """Put `name` on the allowlist: the one way an action gets in (module import time; trusted code only). `handler(root,
     fields, ctx)` returns (ok, detail, extra). `cls` is read | safe-write | risky-write | expand. An expand action names its
     laptop `switch` (launch | merge) and, when the phone picks the repo, `repo_field` -- the param holding an allowlist id
-    (otherwise the gate checks the session's own repo); the handler then finds the allowlist's own entry in ctx.repo. A name
+    (otherwise the gate checks the session's own repo); the handler then finds the allowlist's own entry in ctx.repo -- its
+    path was re-checked at the gate, so a handler that acts later (a worktree add, a merge) re-checks it with
+    companion_remote_switches.usable(ctx.repo) first, and never touches any path the phone sent. A name
     in RESERVED_EXPAND must be that class and switch; a name in KILL_SWITCH_EXEMPT must be safe-write. `rate` is a (burst,
     per_second) pair or a sequence of them (see EXPAND_RATES); `usable(root)` says whether the action is offered now."""
     global ALLOWED_ACTIONS

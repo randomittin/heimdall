@@ -761,7 +761,7 @@ real = load(sys.argv[1], "real")
 print("REAL", json.dumps(checks(real)))
 src = open(sys.argv[1]).read()
 mutants = [
-    ("allowlist-runs-anything", "if not isinstance(action, str) or action not in _ACTIONS:", "if not isinstance(action, str):"),
+    ("allowlist-runs-anything", "    if spec is None and gate is None:", "    if not isinstance(action, str):"),
     ("toggle-checks-only-locked", 'return entry.get("remote_toggle") is True and not entry.get("locked")', 'return not entry.get("locked")'),
     ("no-dedupe", "            if hit is not None:\n                ok, detail, extra = hit", "            if False:\n                ok, detail, extra = hit"),
     ("switch-needs-no-confirm", 'if mode in CONFIRM_MODES and fields["confirm"] is not True:', "if False:"),
