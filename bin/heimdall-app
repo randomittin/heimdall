@@ -679,6 +679,7 @@ _relay_event() {
       ;;
     approve_request)
       local sas label login auto tmo ans
+      [ "$client_gone" = true ] && return 0  # the client exited: nobody is left to answer
       sas="$(printf '%s' "$line" | jq -r '.sas // empty' 2>/dev/null | tr -cd '0-9')"
       label="$(_clean_text "$(printf '%s' "$line" | jq -r '.device_label // empty' 2>/dev/null)")"
       login="$(_clean_text "$(printf '%s' "$line" | jq -r '.gh_login // empty' 2>/dev/null)")"
@@ -1012,7 +1013,7 @@ cmd_connect() {
 # its own stdout, and tears it down. $1: REPO (already resolved). $2: PORT.
 # $3: BG (true/false). $4: RELAY_URL.
 cmd_connect_relay() {
-  local REPO="$1" PORT="$2" BG="$3" RELAY_URL="$4"
+  local REPO="$1" PORT="$2" BG="$3" RELAY_URL="$4" NO_CODE="${5:-false}" NO_CONFIRM="${6:-false}"
 
   if [ ! -x "$UI_BIN" ]; then
     echo "hmd app connect: heimdall-ui not found at $UI_BIN" >&2
@@ -1025,6 +1026,31 @@ cmd_connect_relay() {
   if ! command -v mktemp >/dev/null 2>&1; then
     echo "hmd app connect: required tool missing: mktemp" >&2
     return 2
+  fi
+
+  # Pair by code (see the usage block): decided now, before anything is started, so a --bg that could not
+  # confirm at a terminal fails before it leaves a process behind. The token lives in gh_tok only until it has
+  # been written to the client's pipe; it is never passed as an argument or exported.
+  local code_requested=false code="" gh_tok=""
+  if [ "$NO_CODE" != true ]; then
+    if code="$(_session_code_for_repo "$REPO")"; then
+      if _gh_token_into gh_tok; then
+        code_requested=true
+      else
+        echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
+      fi
+    else
+      code=""
+      echo "hmd app: code pairing off — could not derive this session's code. Scan the QR."
+    fi
+  fi
+  if [ "$code_requested" = true ] && [ "$BG" = true ] && [ "$NO_CONFIRM" != true ]; then
+    gh_tok=""
+    echo "hmd app connect: code pairing confirms at this terminal — drop --bg, add --no-confirm, or use the QR" >&2
+    return 64
+  fi
+  if [ "$code_requested" = true ] && [ "$NO_CONFIRM" = true ]; then
+    echo "hmd app: --no-confirm trusts the relay to deliver the right keys."
   fi
 
   mkdir -p "$REPO/.heimdall/app" 2>/dev/null || true
@@ -1087,8 +1113,41 @@ cmd_connect_relay() {
   local relay_host
   relay_host="$(printf '%s' "$RELAY_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*$##; s#:.*$##')"
 
-  "$RELAY_CLIENT_BIN" --relay "$RELAY_URL" --repo "$REPO" --ui-port "$actual_port" --public-host "$relay_host" >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
-  CLIENT_PID=$!
+  local client_args=(--relay "$RELAY_URL" --repo "$REPO" --ui-port "$actual_port" --public-host "$relay_host")
+  if [ "$code_requested" = true ]; then
+    # The token reaches the client on its stdin and nowhere else: a pipe made here whose directory entry is
+    # removed as soon as both ends are open, so it is anonymous before a byte is written. This shell keeps the
+    # only write end (fd 3) for the operator's approve/reject lines; the client gets the read end as stdin and
+    # neither of ours.
+    local old_umask2 ctl_rc
+    old_umask2="$(umask)"
+    umask 077
+    CTL_DIR="$(mktemp -d)"
+    ctl_rc=$?
+    umask "$old_umask2"
+    if [ "$ctl_rc" -eq 0 ] && [ -n "$CTL_DIR" ] && mkfifo "$CTL_DIR/in" 2>/dev/null; then
+      exec 3<>"$CTL_DIR/in"
+      exec 4<"$CTL_DIR/in"
+      rm -rf "$CTL_DIR"
+      CTL_DIR=""
+    else
+      code_requested=false
+      gh_tok=""
+      echo "hmd app: code pairing off — cannot make a private pipe for the relay client. Scan the QR."
+    fi
+  fi
+  if [ "$code_requested" = true ]; then
+    client_args+=(--code "$code")
+    [ "$NO_CONFIRM" = true ] && client_args+=(--no-confirm)
+    "$RELAY_CLIENT_BIN" "${client_args[@]}" <&4 3>&- 4>&- >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
+    CLIENT_PID=$!
+    exec 4<&-
+    printf '%s\n' "$gh_tok" >&3
+    gh_tok=""
+  else
+    "$RELAY_CLIENT_BIN" "${client_args[@]}" >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
+    CLIENT_PID=$!
+  fi
 
   jq -n \
     --argjson pid_ui "$UI_PID" \
@@ -1100,73 +1159,36 @@ cmd_connect_relay() {
     >"$STATE_FILE" 2>/dev/null
   [ -s "$STATE_FILE" ] && STATE_WRITTEN=true
 
+  # What _relay_event reads and sets while it renders the client's events (see its comment).
   local pair_init_seen=false warned_expired=false pairing_exp=0 seen_lines=0 client_rc=0
+  local code_resolved=false code_active=false code_shown=false client_gone=false
+  local bg_code_deadline=$(( $(date +%s) + 30 ))
 
   while :; do
     if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
       wait "$CLIENT_PID" 2>/dev/null
       client_rc=$?
+      client_gone=true
+      _relay_drain  # whatever it printed between the last look and its exit
       break
     fi
 
-    local line ev
-    while IFS= read -r line; do
-      seen_lines=$((seen_lines + 1))
-      [ -n "$line" ] || continue
-      ev="$(printf '%s' "$line" | jq -r '.event // empty' 2>/dev/null)"
-      case "$ev" in
-        pair_init)
-          pair_init_seen=true
-          local qr_json code exp remain now
-          qr_json="$(printf '%s' "$line" | jq -c '.qr // empty' 2>/dev/null)"
-          exp="$(printf '%s' "$line" | jq -r '.exp // empty' 2>/dev/null)"
-          code="$(printf '%s' "$qr_json" | jq -r '.pairing_code // empty' 2>/dev/null)"
-          [ -n "$exp" ] && pairing_exp="$exp"
-          echo ""
-          echo "hmd app: scan to pair a device --"
-          echo ""
-          if [ -n "$PY3" ] && [ -r "$QR_PY" ]; then
-            # A5: the QR payload (session id, pairing code, pubkey) goes on
-            # stdin, never argv -- same rationale as the Funnel URL above.
-            printf '%s' "$qr_json" | "$PY3" "$QR_PY" --ascii || true
-            echo ""
-          fi
-          if [ -n "$code" ]; then
-            echo "  PAIRING CODE: $code"
-            echo ""
-          fi
-          now="$(date +%s)"
-          remain=60
-          [ -n "$exp" ] && remain=$((exp - now))
-          echo "WARNING: anyone who scans this code within ${remain}s binds a device to"
-          echo "this session -- E2E-encrypted; the relay sees only ciphertext."
-          echo ""
-          ;;
-        device_bound)
-          echo "hmd app: phone paired"
-          ;;
-        stream_drop)
-          echo "hmd app: relay stream dropped -- the client will attempt to reconnect" >&2
-          ;;
-        error)
-          local msg
-          msg="$(printf '%s' "$line" | jq -r '.message // .error // empty' 2>/dev/null)"
-          echo "hmd app connect: relay client error: ${msg:-$line}" >&2
-          ;;
-        *) : ;;
-      esac
-    done < <(tail -n +"$((seen_lines + 1))" "$CLIENT_OUT" 2>/dev/null)
+    _relay_drain
 
-    if [ "$pair_init_seen" = true ] && [ "$BG" = true ]; then
+    # --bg returns once pairing has started -- and, when a code was asked for, once the relay has answered
+    # for it (or 30 s have passed), so the SESSION CODE is on screen before this leaves.
+    if [ "$pair_init_seen" = true ] && [ "$BG" = true ] \
+        && { [ "$code_requested" != true ] || [ "$code_resolved" = true ] || [ "$(date +%s)" -ge "$bg_code_deadline" ]; }; then
       echo "hmd app: running in background (ui pid $UI_PID, relay client pid $CLIENT_PID). Tear down with: hmd app disconnect"
       trap - INT TERM HUP EXIT
       disown "$UI_PID" 2>/dev/null || true
       disown "$CLIENT_PID" 2>/dev/null || true
       rm -f "$UI_OUT" "$CLIENT_OUT" "$CLIENT_ERR" 2>/dev/null || true
+      exec 3>&-  # the client sees its stdin end: with --no-confirm nothing was ever going to be said on it
       return 0
     fi
 
-    if [ "$pair_init_seen" = true ] && [ "$warned_expired" = false ] && [ "$pairing_exp" -gt 0 ]; then
+    if [ "$pair_init_seen" = true ] && [ "$warned_expired" = false ] && [ "$code_active" != true ] && [ "$pairing_exp" -gt 0 ]; then
       local now2
       now2="$(date +%s)"
       if [ "$now2" -gt $((pairing_exp + 5)) ]; then
@@ -1185,6 +1207,63 @@ cmd_connect_relay() {
 
   echo "hmd app: relay session ended (client exit $client_rc)"
   return "$client_rc"
+}
+
+# cmd_identity: `hmd app identity revoke` -- see the usage block. The relay client does the one HTTP call
+# (--identity-revoke); this reads the laptop's GitHub token, pipes it in and says what came back.
+cmd_identity() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    revoke) cmd_identity_revoke "$@" ;;
+    *) echo "hmd app identity: unknown subcommand: ${sub:-(none)} (try: revoke)" >&2; return 2 ;;
+  esac
+}
+
+cmd_identity_revoke() {
+  local RELAY_URL="" RELAY_SET=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --relay)
+        RELAY_URL="${2:-}"
+        RELAY_SET=true
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      *) echo "hmd app identity revoke: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+  if [ "$RELAY_SET" = true ] && [ -z "$RELAY_URL" ]; then
+    echo "hmd app identity revoke: --relay needs a URL" >&2
+    return 2
+  fi
+  RELAY_URL="${RELAY_URL:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
+  if [ ! -x "$RELAY_CLIENT_BIN" ]; then
+    echo "hmd app identity revoke: heimdall-relay-client not found at $RELAY_CLIENT_BIN" >&2
+    return 2
+  fi
+  local tok="" out rc ev login reason
+  if ! _gh_token_into tok; then
+    echo "hmd app identity revoke: laptop not signed in to GitHub (gh auth login) -- nothing to revoke with" >&2
+    return 3
+  fi
+  # the token goes to the client on a pipe: printf is a builtin, so it is in no process's argv
+  out="$(printf '%s\n' "$tok" | "$RELAY_CLIENT_BIN" --identity-revoke --relay "$RELAY_URL" 2>/dev/null)"
+  rc=$?
+  tok=""
+  ev="$(printf '%s\n' "$out" | grep -E '"event":"identity_revoke' | tail -n 1)"
+  if [ "$(printf '%s' "$ev" | jq -r '.event // empty' 2>/dev/null)" = "identity_revoked" ]; then
+    login="$(_clean_text "$(printf '%s' "$ev" | jq -r '.gh_login // empty' 2>/dev/null)")"
+    echo "revoked every hmd app sign-in for @$login"
+    return 0
+  fi
+  reason="$(_clean_text "$(printf '%s' "$ev" | jq -r '.reason // empty' 2>/dev/null)")"
+  case "$reason" in
+    no-gh) echo "hmd app identity revoke: GitHub did not accept this laptop's token (gh auth login) -- nothing was revoked" >&2 ;;
+    disabled) echo "hmd app identity revoke: this relay has code pairing disabled -- there is nothing to revoke" >&2 ;;
+    *) echo "hmd app identity revoke: failed (${reason:-the relay client exited $rc})" >&2 ;;
+  esac
+  [ "$rc" -ne 0 ] && return "$rc"
+  return 12
 }
 
 cmd_status() {
