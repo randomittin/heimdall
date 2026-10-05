@@ -846,6 +846,27 @@ def collect_attention(root, state=None):
     )
 
 
+# stderr diagnostics from the loop threads (the poller, the warmer, the panel publishers, the push observer). Two rules,
+# both learned from a full disk. A diagnostic never raises: stderr is a file on the same volume as everything else, so
+# its write fails exactly when something else already did, and an exception out of an `except` handler ended the
+# poller / warmer thread for good -- the cache then never refreshed again and the relay client sat there alive,
+# sending nothing, space or no space. And a failure that repeats every pass is logged at a bounded rate.
+WARN_EVERY_S = 30.0
+_warned_at = {}   # key -> time.monotonic() of the last line written for it
+
+
+def _warn(key, text):
+    now = time.monotonic()
+    last = _warned_at.get(key)
+    if last is not None and now - last < WARN_EVERY_S:
+        return
+    _warned_at[key] = now
+    try:
+        sys.stderr.write(text)
+    except Exception:  # OSError on a full disk, ValueError on a closed stream: the line is best effort
+        return
+
+
 def publish_live_users(root, roster_count, previous, now=None):
     """hmd dogfoods the panel publish path: the roster count /api/state already
     computes becomes the `hmd-live-users` number tile, written in-process through
@@ -869,7 +890,7 @@ def publish_live_users(root, roster_count, previous, now=None):
             "updated_at": now,
         })
     except (OSError, ValueError) as e:
-        sys.stderr.write("hmd-ui: could not publish %s: %s\n" % (LIVE_USERS_PANEL_ID, e.__class__.__name__))
+        _warn("live-users", "hmd-ui: could not publish %s: %s\n" % (LIVE_USERS_PANEL_ID, e.__class__.__name__))
         return previous
     return (roster_count, now)
 
@@ -915,7 +936,7 @@ def publish_companion_panels(publisher):
     try:
         return bool(publisher.tick())
     except Exception as e:
-        sys.stderr.write("hmd-ui: companion panels: %s\n" % e.__class__.__name__)
+        _warn("companion-panels", "hmd-ui: companion panels: %s\n" % e.__class__.__name__)
         return False
 
 
@@ -947,7 +968,7 @@ def observe_push(monitor, state):
     try:
         monitor.observe(state)
     except Exception as e:
-        sys.stderr.write("hmd-ui: push observe: %s\n" % e.__class__.__name__)
+        _warn("push-observe", "hmd-ui: push observe: %s\n" % e.__class__.__name__)
 
 
 def close_push(monitor):
@@ -956,7 +977,7 @@ def close_push(monitor):
     try:
         monitor.close()
     except Exception as e:
-        sys.stderr.write("hmd-ui: push close: %s\n" % e.__class__.__name__)
+        _warn("push-close", "hmd-ui: push close: %s\n" % e.__class__.__name__)
 
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -1334,8 +1355,9 @@ class StateCache:
             with self._refresh_lock:
                 self.refresh(publish=True, partial=partial)
         except Exception as e:
-            # one bad pass (a collector bug, a full disk under write_panel) must not end the poller
-            sys.stderr.write("hmd-ui: refresh failed: %s\n" % e.__class__.__name__)
+            # one bad pass (a collector bug, a full disk under write_panel) must not end the poller -- and neither
+            # may the report of it (_warn never raises)
+            _warn("refresh", "hmd-ui: refresh failed: %s\n" % e.__class__.__name__)
 
     def _next_pass(self, watch, seen, backstop_at, not_before):
         """Sleep until the next pass is due: True when a watched source moved since `seen` or the
@@ -1365,7 +1387,7 @@ class StateCache:
                 try:
                     collect(self.root)
                 except Exception as e:
-                    sys.stderr.write("hmd-ui: %s failed: %s\n" % (collect.__name__, e.__class__.__name__))
+                    _warn("warm:" + collect.__name__, "hmd-ui: %s failed: %s\n" % (collect.__name__, e.__class__.__name__))
             self._warmed.set()
 
     def start(self):
