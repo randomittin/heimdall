@@ -186,7 +186,7 @@ else
   bad "golden did not pass cleanly (rc=$GRC)"; cat "$TMP/golden.report.json" 2>/dev/null | head -c 600
 fi
 check "report.json carries the 8 fixed spec-H-1 fields" \
-  jq -e 'keys==["fix_hint","first_divergence","gate_id","haid","metrics","status","ts","wave"]' "$TMP/golden.report.json"
+  jq -e 'keys==["first_divergence","fix_hint","gate_id","haid","metrics","status","ts","wave"]' "$TMP/golden.report.json"
 
 # every mutant: DENIED at its pinned first case, breaking EXACTLY its pinned attack set
 while IFS=$'\t' read -r mname mfile mfirst; do

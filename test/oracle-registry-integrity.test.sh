@@ -133,13 +133,17 @@ else
   bad "dropping README row '$drop_id' went UNDETECTED — table check is vacuous"
 fi
 
-# 3b. Inflate a README gate_type -> the gate_type diff must fire.
-sed "s/^| \`${drop_id}\` | [a-z-]* |/| \`${drop_id}\` | differential |/" "$README" >"$TMP/readme-inflated.md"
+# 3b. Inflate a README gate_type -> the gate_type diff must fire. The inflated type must
+#     DIFFER from the entry's real one (an entry that already is `differential` would make
+#     "inflate to differential" a no-op and the check could never go red).
+cur_type="$(awk -F'\t' -v id="$drop_id" '$1 == id { print $2 }' "$TMP/reg.tsv")"
+infl_type="differential"; [ "$cur_type" = "differential" ] && infl_type="example"
+sed "s/^| \`${drop_id}\` | [a-z-]* |/| \`${drop_id}\` | ${infl_type} |/" "$README" >"$TMP/readme-inflated.md"
 readme_pairs "$TMP/readme-inflated.md" >"$TMP/doc-inflated.tsv"
 if diff -q "$TMP/reg.tsv" "$TMP/doc-inflated.tsv" >/dev/null 2>&1; then
-  bad "inflating '$drop_id' gate_type to 'differential' went UNDETECTED — type check is vacuous"
+  bad "inflating '$drop_id' gate_type to '$infl_type' went UNDETECTED — type check is vacuous"
 else
-  ok "inflating '$drop_id' gate_type to 'differential' is DETECTED"
+  ok "inflating '$drop_id' gate_type to '$infl_type' is DETECTED"
 fi
 
 # 3c. Inject a phantom gate_command -> the phantom check must fire.
