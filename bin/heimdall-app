@@ -1180,10 +1180,10 @@ cmd_controls() {
     echo "hmd app controls: python3 not found (set HMD_PYTHON=/path/to/python3)" >&2
     return 2
   fi
-  local sub="${1:-status}"
-  if [ $# -gt 0 ]; then shift; fi
-  case "$sub" in
-    on|off|status) ;;
+  local sub="status"
+  case "${1:-}" in
+    on|off|status) sub="$1"; shift ;;
+    ""|--*) ;;
     *) echo "usage: hmd app controls on|off|status [--repo DIR]" >&2; return 2 ;;
   esac
   "$PY3" "$LIB_DIR/companion_ui_controls.py" "$sub" "$@"
