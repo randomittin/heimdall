@@ -1,0 +1,404 @@
+{
+  "contract": "hmd-relay-code-pair",
+  "version": 1,
+  "about": [
+    "Wire contract for pair-by-session-code on the hmd relay. Design of record: hmdapp docs/superpowers/specs/2026-10-05-pair-by-session-code.md -- it wins over this file on any disagreement; this file is the relay's exact reading of it. Three parties align to it: the relay (relay/test/code-pair.spec.ts drives the real Worker + Durable Objects with it), the hmd client (bin/heimdall-relay-client, bin/heimdall-app) and the phone app (hmdapp). The pre-existing wire (pair_init, stream, frames, phone claim, revoke) is wire.json and is unchanged, except that hmd's device_bound payload gains `via` (frames.device_bound_to_hmd_code / _qr below) -- wire.json carries the `via: qr` form.",
+    "$name in a string is a binding (see `bindings`): a value the relay mints is matched by pattern when the relay is the producer, and takes its example when a client is fed it. Every `body` is the exact JSON the relay accepts or answers: objects have exactly these keys, no more and no fewer. Error bodies are {error:<string>, retry_after_s?:<integer>}; every 429 also carries a Retry-After header equal to retry_after_s.",
+    "Encodings. Every binary value on this wire (install_pubkey, hmd_commit, sig, key_reveal.hmd_pubkey, key_reveal.nonce) is base64url, unpadded, alphabet A-Za-z0-9_- only -- never `=`, `+` or `/`. A 32-byte value is 43 characters, a 64-byte value 86. `code` is exactly 5 characters of constants.code_alphabet, uppercase (the app normalises before it sends; the relay does not). `ts` is epoch seconds as a JSON integer.",
+    "Config gate. GITHUB_CLIENT_ID (a wrangler [vars] entry), GITHUB_CLIENT_SECRET and RELAY_IDENTITY_SECRET (wrangler secrets) must all be set. If any is unset or empty, every route in this file answers 503 `code pairing disabled` before it touches a Durable Object or GitHub, and the QR flow is unaffected -- that is also what a self-hosted relay without a GitHub App answers.",
+    "GitHub. The laptop's token (`gh auth token`) is used for exactly one call, GET /user. The phone's token (device flow against the project's GitHub App) is used for exactly two: POST /applications/{client_id}/token (proves it was issued to OUR App and names the user), then DELETE /applications/{client_id}/token (single use by construction). No token is stored or logged; every GitHub call has a 5 s timeout and answers 502 `github unavailable` when it cannot give a verdict.",
+    "Every route below lists its `check_order`: the first check that fails answers, so a later one never runs. Throttles are sliding windows (src/pairing.ts recordAttempt): the attempt that crosses the bound is the one refused, and a refused attempt still counts toward the window.",
+    "Code windows. hmd registers a window for its session with POST /session/:id/code after /pair/init. One live window per (GitHub id, code): a second session of the same user registering the same code while the first is still claimable gets 409 (hmd falls back to the QR for that run). A window lives exactly as long as its session's pairing window (`exp`, ~60 s); hmd renews by running /pair/init again -- a fresh X25519 keypair, a fresh nonce_h -- and registering the SAME code against the new session, which replaces the index entry. A window is released at most once (INV-40); a released window cannot be registered again (410). It is cleared at bind, revoke, end and purge (INV-41).",
+    "Release is invisible to everyone but the owner. /pair/code answers 404 with one body, no extra headers, for an unknown code, another user's code, an expired window, a session that is no longer pending and a window already released -- the relay looks the code up only inside the verified caller's own namespace, so there is no existence oracle (INV-42). 10 consecutive 404s for one GitHub id within 600 s lock that id out for the rest of the 600 s.",
+    "key_reveal. After a bind whose device_bound carries via=code, hmd POSTs ONE plaintext key_reveal envelope to /session/:id/frames (its bearer, as for any hmd frame). The relay forwards it to the phone socket verbatim, stores it as the frame replayed first on any later phone socket (after device_bound, before any replayed state) until the session ends, and refuses a second one (INV-44). The relay checks only that it is a plaintext envelope (nonce and ciphertext null, payload an object) and that the session is bound; it does not inspect hmd_pubkey or nonce. The phone checks SHA256(\"hmd-pair-commit-v1\\0\" || hmd_pubkey || nonce) against the hmd_commit /pair/code gave it, and an older phone that does not know the frame type skips it.",
+    "Hosted origin and GitHub App (operator answer D3, 2026-10-05): https://hmd-relay.therishabh16.workers.dev and client id Iv23liawqpKieqqpgIPj (a public id, committed on purpose). The canary Worker uses the same App; its secrets are set separately with `wrangler secret put --env canary`."
+  ],
+  "constants": {
+    "code_alphabet": "ABCDEFGHJKLMNPQRSTUVWXYZ23456789",
+    "code_length": 5,
+    "assertion_ttl_s": 2592000,
+    "pop_skew_s": 60,
+    "pair_window_s": 60,
+    "max_body_bytes": 4096,
+    "github_timeout_ms": 5000,
+    "device_label": {
+      "min_chars": 1,
+      "max_chars": 32,
+      "rejects": "C0 controls (U+0000-U+001F), DEL, C1 controls (U+0080-U+009F), U+2028, U+2029, the bidirectional controls (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) and lone surrogates; length is counted in code points"
+    },
+    "throttles": {
+      "identity_per_ip": { "bucket": "identity-throttle:<CF-Connecting-IP>", "max": 10, "window_s": 60, "shared_by": ["POST /identity/github", "POST /identity/github/revoke"] },
+      "pair_code_per_ip": { "bucket": "pair-code-throttle:<CF-Connecting-IP>", "max": 20, "window_s": 60 },
+      "pair_code_per_github_id": { "max": 10, "window_s": 60 },
+      "pair_code_lockout": { "consecutive_404s": 10, "within_s": 600, "retry_after_s": 600 },
+      "register_per_session": { "max": 6, "window_s": 60 }
+    }
+  },
+  "bindings": {
+    "session_id": {
+      "match": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "example": "ef5a2950-611b-4c1b-9e6c-96cbed2c0815"
+    },
+    "pairing_code": {
+      "match": "^[A-Z2-7]{26}$",
+      "example": "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    },
+    "relay_session_token": {
+      "match": "^[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "epoch_seconds": {
+      "match": "^[0-9]{10}$",
+      "type": "integer",
+      "example": 1790000000
+    },
+    "session_code": {
+      "match": "^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}$",
+      "example": "4SELK"
+    },
+    "b64url_32": {
+      "match": "^[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "b64url_64": {
+      "match": "^[A-Za-z0-9_-]{86}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREnotASecretFIXTUREnotASecretFIXTUREnotASecretx"
+    },
+    "gh_assertion": {
+      "match": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecret.FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "gh_token_phone": {
+      "example": "ghu_FIXTUREnotARealToken"
+    },
+    "gh_token_laptop": {
+      "example": "gho_FIXTUREnotARealToken"
+    },
+    "gh_id": {
+      "match": "^[1-9][0-9]{0,15}$",
+      "type": "integer",
+      "example": 1234567
+    },
+    "gh_login": {
+      "match": "^[A-Za-z0-9][A-Za-z0-9_.\\[\\]-]{0,63}$",
+      "example": "octocat"
+    },
+    "device_label": {
+      "example": "Pixel 9a"
+    },
+    "lockout_retry_after_s": {
+      "match": "^(59[0-9]|600)$",
+      "type": "integer",
+      "example": 600
+    }
+  },
+  "identity_github": {
+    "spec": "section 6.1",
+    "who": "the phone, once per 30 days, right after the GitHub device flow; unauthenticated",
+    "request": {
+      "method": "POST",
+      "path": "/identity/github",
+      "headers": { "Content-Type": "application/json" },
+      "body": { "gh_token": "$gh_token_phone", "install_pubkey": "$b64url_32" }
+    },
+    "check_order": [
+      "any of GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET / RELAY_IDENTITY_SECRET unset -> disabled",
+      "per-IP throttle identity-throttle:<ip> -> throttled",
+      "body over max_body_bytes -> shared.body_too_large; not a JSON object -> shared.invalid_json",
+      "install_pubkey does not decode to 32 bytes -> bad_install_pubkey",
+      "gh_token absent, not a string or empty -> missing_gh_token",
+      "gh_token not 1..255 visible ASCII characters (cannot be a GitHub token, never sent upstream) -> github_rejected",
+      "POST /applications/{client_id}/token: 404/422, or the answer names another App -> github_rejected; timeout, 5xx, any other status, or the relay's own client credentials refused -> github_unavailable",
+      "DELETE /applications/{client_id}/token did not confirm (204, or 404/422 for a token already gone) -> github_unavailable (INV-39: no assertion for a token that may still be live)",
+      "ok: the assertion is HMAC-SHA256(RELAY_IDENTITY_SECRET) over its claims, bound to install_pubkey, valid assertion_ttl_s"
+    ],
+    "assertion_claims": {
+      "v": 1,
+      "role": "device",
+      "gh_id": "$gh_id",
+      "gh_login": "$gh_login",
+      "install_pubkey": "$b64url_32",
+      "iat": "$epoch_seconds",
+      "exp": "$epoch_seconds"
+    },
+    "responses": {
+      "ok": {
+        "status": 200,
+        "body": { "gh_assertion": "$gh_assertion", "gh_id": "$gh_id", "gh_login": "$gh_login", "exp": "$epoch_seconds" }
+      },
+      "bad_install_pubkey": { "status": 400, "body": { "error": "install_pubkey must decode to 32 bytes" } },
+      "missing_gh_token": { "status": 400, "body": { "error": "gh_token required" } },
+      "github_rejected": { "status": 401, "body": { "error": "github token rejected" } },
+      "throttled": {
+        "status": 429,
+        "headers": { "Retry-After": "60" },
+        "body": { "error": "too many identity requests", "retry_after_s": 60 }
+      },
+      "github_unavailable": { "status": 502, "body": { "error": "github unavailable" } },
+      "disabled": { "status": 503, "body": { "error": "code pairing disabled" } }
+    }
+  },
+  "session_code": {
+    "spec": "section 6.2",
+    "who": "hmd (the laptop), after /pair/init, and again after every renewal; the session's bearer",
+    "request": {
+      "method": "POST",
+      "path": "/session/$session_id/code",
+      "headers": { "Authorization": "Bearer $relay_session_token", "Content-Type": "application/json" },
+      "body": { "code": "$session_code", "gh_token": "$gh_token_laptop", "hmd_commit": "$b64url_32" }
+    },
+    "check_order": [
+      "session id not a UUID -> 400 `invalid session id` (the router, as for every /session/:id route)",
+      "any of the three config values unset -> disabled (the router, before the session is touched)",
+      "no such session -> session_not_found",
+      "bearer is not the session's relay_session_token -> unauthorized",
+      "session not pending, or its pairing window already lapsed -> not_claimable",
+      "per-session throttle (register_per_session) -> throttled",
+      "body over max_body_bytes -> shared.body_too_large; not a JSON object -> shared.invalid_json",
+      "code not 5 characters of the alphabet -> invalid_code",
+      "hmd_commit does not decode to 32 bytes -> invalid_hmd_commit",
+      "gh_token absent, not a string or empty -> missing_gh_token",
+      "gh_token not 1..255 visible ASCII characters -> github_rejected",
+      "GET /user: 401 -> github_rejected; timeout, 5xx, any other status -> github_unavailable",
+      "this session's window was already released -> not_claimable (INV-40: it cannot be reopened)",
+      "another live session of the same GitHub user holds the code -> code_in_use",
+      "ok: window written on the session, entry upserted in the owner's index; `exp` is the session's pairing exp"
+    ],
+    "responses": {
+      "ok": { "status": 200, "body": { "code": "$session_code", "gh_login": "$gh_login", "exp": "$epoch_seconds" } },
+      "invalid_code": { "status": 400, "body": { "error": "invalid code" } },
+      "invalid_hmd_commit": { "status": 400, "body": { "error": "invalid hmd_commit" } },
+      "missing_gh_token": { "status": 400, "body": { "error": "gh_token required" } },
+      "unauthorized": { "status": 401, "body": { "error": "unauthorized" } },
+      "github_rejected": { "status": 401, "body": { "error": "github token rejected" } },
+      "session_not_found": { "status": 404, "body": { "error": "session not found" } },
+      "code_in_use": { "status": 409, "body": { "error": "code in use by another open window" } },
+      "not_claimable": { "status": 410, "body": { "error": "session no longer claimable" } },
+      "throttled": {
+        "status": 429,
+        "headers": { "Retry-After": "60" },
+        "body": { "error": "too many code registrations", "retry_after_s": 60 }
+      },
+      "github_unavailable": { "status": 502, "body": { "error": "github unavailable" } },
+      "disabled": { "status": 503, "body": { "error": "code pairing disabled" } }
+    }
+  },
+  "pair_code": {
+    "spec": "section 6.3",
+    "who": "the phone, with the 5 characters the user typed; unauthenticated, but proves a GitHub identity and holds an install key",
+    "request": {
+      "method": "POST",
+      "path": "/pair/code",
+      "headers": { "Content-Type": "application/json" },
+      "body": {
+        "code": "$session_code",
+        "gh_assertion": "$gh_assertion",
+        "ts": "$epoch_seconds",
+        "sig": "$b64url_64",
+        "device_label": "$device_label"
+      }
+    },
+    "check_order": [
+      "any of the three config values unset -> disabled",
+      "per-IP throttle pair-code-throttle:<ip> -> throttled",
+      "body over max_body_bytes -> shared.body_too_large; not a JSON object -> shared.invalid_json",
+      "code not 5 characters of the alphabet -> invalid_code",
+      "device_label not 1..32 printable characters (constants.device_label.rejects) -> invalid_device_label",
+      "gh_assertion absent, malformed, not signed by RELAY_IDENTITY_SECRET, or past its exp -> identity_expired (the app clears its sign-in and asks again, which is the right reaction to all four)",
+      "ts not an integer within pop_skew_s of the relay's clock -> stale_timestamp",
+      "sig is not a valid Ed25519 signature by the assertion's install_pubkey over the pop message -> bad_signature (INV-43)",
+      "assertion iat before the GitHub id's not_before -> identity_revoked",
+      "this GitHub id locked out (10 consecutive 404s within 600 s) -> locked_out; its throttle (10 per 60 s) crossed -> throttled",
+      "lookup in that GitHub id's own index, then release by the window's session: only while pending, before pair_exp, owner equal, not yet released -> ok; any miss -> no_window"
+    ],
+    "responses": {
+      "ok": {
+        "status": 200,
+        "body": { "session_id": "$session_id", "pairing_code": "$pairing_code", "hmd_commit": "$b64url_32", "exp": "$epoch_seconds" }
+      },
+      "invalid_code": { "status": 400, "body": { "error": "invalid code" } },
+      "invalid_device_label": { "status": 400, "body": { "error": "invalid device_label" } },
+      "identity_expired": { "status": 401, "body": { "error": "identity expired" } },
+      "identity_revoked": { "status": 401, "body": { "error": "identity revoked" } },
+      "bad_signature": { "status": 401, "body": { "error": "bad signature" } },
+      "stale_timestamp": { "status": 401, "body": { "error": "stale timestamp" } },
+      "no_window": {
+        "status": 404,
+        "body": { "error": "no open pairing window for that code on your GitHub account" }
+      },
+      "throttled": {
+        "status": 429,
+        "headers": { "Retry-After": "60" },
+        "body": { "error": "too many attempts", "retry_after_s": 60 }
+      },
+      "locked_out": {
+        "status": 429,
+        "body": { "error": "too many attempts", "retry_after_s": "$lockout_retry_after_s" }
+      },
+      "disabled": { "status": 503, "body": { "error": "code pairing disabled" } }
+    },
+    "after_ok": "the phone opens the existing claim socket GET /session/$session_id/ws?pairing_code=..&device_pubkey=.. exactly as after a QR scan (wire.json `phone.claim`); INV-4 and the finding-6 device_token binding apply unchanged."
+  },
+  "identity_revoke": {
+    "spec": "section 6.4",
+    "who": "the laptop, `hmd app identity revoke` after a lost phone; unauthenticated",
+    "request": {
+      "method": "POST",
+      "path": "/identity/github/revoke",
+      "headers": { "Content-Type": "application/json" },
+      "body": { "gh_token": "$gh_token_laptop" }
+    },
+    "check_order": [
+      "any of the three config values unset -> disabled",
+      "per-IP throttle identity-throttle:<ip> (the bucket /identity/github uses) -> throttled",
+      "body over max_body_bytes -> shared.body_too_large; not a JSON object -> shared.invalid_json",
+      "gh_token absent, not a string or empty -> missing_gh_token",
+      "gh_token not 1..255 visible ASCII characters -> github_rejected",
+      "GET /user: 401 -> github_rejected; timeout, 5xx, any other status -> github_unavailable",
+      "ok: not_before for that GitHub id becomes now, in epoch seconds; an assertion minted before it is dead (`identity_revoked`), one minted at or after it is honoured"
+    ],
+    "responses": {
+      "ok": { "status": 200, "body": { "gh_login": "$gh_login", "not_before": "$epoch_seconds" } },
+      "missing_gh_token": { "status": 400, "body": { "error": "gh_token required" } },
+      "github_rejected": { "status": 401, "body": { "error": "github token rejected" } },
+      "throttled": {
+        "status": 429,
+        "headers": { "Retry-After": "60" },
+        "body": { "error": "too many identity requests", "retry_after_s": 60 }
+      },
+      "github_unavailable": { "status": 502, "body": { "error": "github unavailable" } },
+      "disabled": { "status": 503, "body": { "error": "code pairing disabled" } }
+    }
+  },
+  "shared": {
+    "about": "Answered by all four routes, after the throttle and before any field is read.",
+    "responses": {
+      "invalid_json": { "status": 400, "body": { "error": "invalid json" } },
+      "body_too_large": { "status": 413, "body": { "error": "request too large" } }
+    }
+  },
+  "frames": {
+    "device_bound_to_hmd_code": {
+      "direction": "relay->hmd",
+      "carrier": "GET /session/$session_id/stream: one NDJSON line, or one WebSocket message without the newline (wire.json `stream` / `stream_ws`)",
+      "when": "the phone bound with the pairing_code /pair/code released, so the window was released. hmd must now send key_reveal and ask the laptop user to approve the SAS before it seals anything.",
+      "envelope": {
+        "v": 1,
+        "session_id": "$session_id",
+        "seq": 0,
+        "sender": "relay",
+        "type": "device_bound",
+        "nonce": null,
+        "ciphertext": null,
+        "payload": {
+          "device_pubkey": "$b64url_32",
+          "bound_at": "$epoch_seconds",
+          "via": "code",
+          "device_label": "$device_label",
+          "gh_login": "$gh_login"
+        }
+      },
+      "notes": [
+        "device_label is what the phone claimed (validated, but not proven); gh_login is what the phone's assertion proved. Print neither without stripping C0/C1/ESC.",
+        "device_pubkey is relayed verbatim, as for a QR bind."
+      ]
+    },
+    "device_bound_to_hmd_qr": {
+      "direction": "relay->hmd",
+      "when": "every other bind: a QR scan, whether or not a code window was registered. No device_label, no gh_login.",
+      "envelope": {
+        "v": 1,
+        "session_id": "$session_id",
+        "seq": 0,
+        "sender": "relay",
+        "type": "device_bound",
+        "nonce": null,
+        "ciphertext": null,
+        "payload": { "device_pubkey": "$b64url_32", "bound_at": "$epoch_seconds", "via": "qr" }
+      }
+    },
+    "key_reveal": {
+      "direction": "hmd->phone",
+      "post": {
+        "method": "POST",
+        "path": "/session/$session_id/frames",
+        "headers": { "Authorization": "Bearer $relay_session_token", "Content-Type": "application/json" }
+      },
+      "envelope": {
+        "v": 1,
+        "session_id": "$session_id",
+        "seq": 0,
+        "sender": "hmd",
+        "type": "key_reveal",
+        "nonce": null,
+        "ciphertext": null,
+        "payload": { "hmd_pubkey": "$b64url_32", "nonce": "$b64url_32" }
+      },
+      "notes": [
+        "hmd_pubkey is the raw 32-byte X25519 public key of the session's pair_init keypair and nonce is the nonce_h its hmd_commit was computed with; both base64url, unpadded.",
+        "seq is 0: the frame is not sealed and takes no part in hmd's sealed seq counter."
+      ],
+      "responses": {
+        "delivered": { "status": 200, "body": { "ok": true, "delivered": true } },
+        "undelivered": { "status": 200, "body": { "ok": true, "delivered": false } },
+        "duplicate": { "status": 409, "body": { "error": "duplicate key_reveal" } },
+        "not_bound": { "status": 409, "body": { "error": "session not bound" } },
+        "not_plaintext": { "status": 400, "body": { "error": "invalid envelope" } }
+      }
+    },
+    "key_reveal_to_phone": {
+      "direction": "relay->phone",
+      "carrier": "the phone's claim socket, one text message: the envelope hmd posted, byte for byte",
+      "also": "replayed first, right after device_bound and before any replayed state, on every later phone socket of the session (a device_token reconnect), until the session ends."
+    }
+  },
+  "pop": {
+    "algorithm": "Ed25519 (RFC 8032), pure: no prehash, no context",
+    "message": "\"hmd-pair-code-v1\\n\" + code + \"\\n\" + ts, UTF-8; ts is the request's integer, in decimal, no sign, no padding",
+    "signer": "the install key whose public half is the assertion's install_pubkey (it never leaves the phone's secure store)",
+    "sig": "b64url_64 of the 64-byte signature",
+    "skew_s": 60
+  },
+  "vectors": {
+    "about": "Known-answer vectors, computed with python hashlib and (for Ed25519) node:crypto and @noble/curves, which agree byte for byte -- none from the relay's own code. A raw 32-byte input is SHA-256 of its label, so no key material sits in this file. The commit and SAS vectors are the same as hmdapp docs/samples/pair-code-vectors.json; every party asserts them.",
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "labels": {
+      "hmd_pub": "vector/hmd_pubkey",
+      "device_pub": "vector/device_pubkey",
+      "device_pub_mitm": "vector/device_pubkey-mitm",
+      "nonce_h": "vector/nonce_h",
+      "install_seed": "vector/install_seed"
+    },
+    "raw_sha256_hex": {
+      "hmd_pub": "75c332d5a93371d676a450163cb7afac5b108bab218e91a6457124442135612a",
+      "device_pub": "3458abd54e3ca71456928ac2a1d8b88a3952503469bdb764ea7c2dbf6199c21c",
+      "device_pub_mitm": "1fd5e8a7c97423a6e9b3551bfaffe917315d6505fdd3cb24cb859b4ecc8fb5b6",
+      "nonce_h": "dd515555118935eb4c7b3578051babbcbb3810450d2334048dc060dc635c2a45"
+    },
+    "commit": {
+      "formula": "base64url(SHA256(\"hmd-pair-commit-v1\" || 0x00 || hmd_pub || nonce_h))",
+      "expected_b64url": "fK9skJUq6kpGOhbFB86vr2qzCW-P6zu7-tKBZPyDt9Q"
+    },
+    "sas": {
+      "formula": "uint32_be(SHA256(\"hmd-pair-sas-v1\" || 0x00 || session_id_utf8 || 0x00 || hmd_pub || device_pub)[0:4]) mod 1000000, zero-padded to 6 digits",
+      "expected": "817531",
+      "expected_with_device_pub_mitm": "006173"
+    },
+    "pop": {
+      "install_seed": "SHA256 of labels.install_seed is the Ed25519 seed",
+      "install_pub_b64url": "0aNrJilXSyb_LDD5FRU5pcZ04_QLp2pkp6m4y8NLi4s",
+      "code": "4SELK",
+      "ts": 1790000010,
+      "message_utf8": "hmd-pair-code-v1\n4SELK\n1790000010",
+      "sig_b64url": "UG9gGWcvV08ubV42rhEMEZFHv5qlDOTxqBTr84ENZglGy-4xkBl4IRRvITW5zkRP_y5lNoTozQdNn3-MPdZaCQ"
+    }
+  },
+  "invariants": {
+    "INV-39": "The relay never persists a GitHub token. The laptop's is used for exactly one GitHub call (GET /user) per request; the phone's for exactly two (check, then delete at GitHub after the check succeeded), and no assertion is minted for a token whose deletion did not confirm. No token, assertion, signature, pairing_code or GitHub id is logged.",
+    "INV-40": "A code window is released at most once, only to an assertion whose gh_id equals the window's owner_gh_id, only while its session is pending and before pair_exp.",
+    "INV-41": "owner_gh_id, code, gh_login and device_label are cleared from the session's record at bind, revoke, end and purge; an index entry is deleted at release, at clear, or replaced at renewal, and expires with its window. A GitHub id's index keeps nothing but its revoke not_before once its windows and counters have lapsed, and that only for the life of the assertions it kills.",
+    "INV-42": "/pair/code answers 404 identically (status, body, headers) for an unknown, a foreign, an expired, a non-pending and an already-released code.",
+    "INV-43": "An assertion is honoured only with a valid Ed25519 signature by its install_pubkey over the request's code and a timestamp within 60 s.",
+    "INV-44": "key_reveal is the only hmd->phone frame type that carries a plaintext payload; hmd may post at most one per session, only once the session is bound, and a phone cannot originate one."
+  }
+}
