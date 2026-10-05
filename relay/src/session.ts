@@ -40,6 +40,7 @@ import {
   verifyDeviceToken,
   timingSafeEqual,
   base64UrlDecode,
+  decodeFixedBase64Url,
   PAIRING_CODE_TTL_S,
   CLAIM_THROTTLE_RETRY_AFTER_S,
   DEVICE_TOKEN_TTL_S,
@@ -47,9 +48,52 @@ import {
   PAIR_INIT_WINDOW_MS,
   PAIR_INIT_RETRY_AFTER_S,
 } from "./pairing";
+import {
+  admitAttempt,
+  clearEntry,
+  emptyIndex,
+  isRevoked,
+  lastDeadline,
+  pruneIndex,
+  recordHit,
+  recordMiss,
+  registerEntry,
+  revokeBefore,
+  type CodeIndexState,
+} from "./code-index";
+import {
+  githubFailureResponse,
+  indexStub,
+  isPlausibleGithubToken,
+  isValidDeviceLabel,
+  isValidSessionCode,
+  readJsonObject,
+  throttledResponse,
+} from "./code-pair";
+import { verifyLaptopToken } from "./github";
 import { logEvent } from "./logging";
 
 type SessionStatus = "pending" | "bound" | "ended";
+
+/**
+ * A code window (pair-by-session-code): the laptop's registration that lets a phone signed
+ * in as `owner_gh_id` pair this session by typing `code`. Lives on the session record from
+ * `POST /code` until the phone binds, hmd revokes, the session ends or the record is purged
+ * (INV-41) -- the fields that identify a person (`owner_gh_id`, `gh_login`, `device_label`)
+ * are gone with it.
+ */
+interface CodeWindow {
+  code: string;
+  owner_gh_id: number;
+  /** hmd's commitment to its X25519 key, opaque here: handed to the phone with the release. */
+  hmd_commit: string;
+  /** Set once, by the release, and never unset (INV-40). */
+  released: boolean;
+  /** Set at release: what the phone called itself. */
+  device_label?: string;
+  /** Set at release: the login the phone's assertion proved. */
+  gh_login?: string;
+}
 
 interface SessionRecord {
   session_id: string;
@@ -66,6 +110,10 @@ interface SessionRecord {
    * re-scheduled a full TTL out.
    */
   device_token_exp?: number;
+  /** The open code window, if hmd registered one and the session is still pending. */
+  code_window?: CodeWindow;
+  /** Epoch ms of recent `POST /code` attempts: the per-session registration throttle. */
+  code_register_attempts?: number[];
 }
 
 const DEVICE_TAG = "device";
@@ -88,6 +136,29 @@ const RECORD_KEY = "state";
  * name", which is exactly what a per-IP counter needs.
  */
 const PAIR_INIT_KEY = "pair_init_attempts";
+
+/**
+ * The same idea for the pair-by-session-code buckets, `identity-throttle:<ip>` and
+ * `pair-code-throttle:<ip>`: one instance per source IP, one key, a limit the Worker passes
+ * in (`/bucket`) because the instance's name already says which bucket it is.
+ */
+const BUCKET_KEY = "bucket_attempts";
+
+/** Storage key of a `code-index:<gh_id>` instance's state (src/code-index.ts). An instance
+ *  holding it is an index, not a session and not a bucket; `alarm` tells them apart by it. */
+const CODE_INDEX_KEY = "code_index";
+
+/** Storage key of the session's one `key_reveal` envelope (INV-44): the frame a phone that
+ *  reconnects is replayed first. */
+const KEY_REVEAL_KEY = "key_reveal";
+
+/** `POST /session/:id/code`: 6 a minute per session (spec 6.2). */
+const CODE_REGISTER_MAX_PER_WINDOW = 6;
+const CODE_REGISTER_WINDOW_MS = 60_000;
+const CODE_REGISTER_RETRY_AFTER_S = 60;
+
+/** What `/pair/code` answers for every way there is nothing to release (INV-42): one body. */
+const NO_WINDOW_ERROR = "no open pairing window for that code on your GitHub account";
 
 /**
  * Persisted alongside the session record so the most recent hmd->device
@@ -180,7 +251,8 @@ function loggableType(value: unknown): string {
     value === "ack" ||
     value === "device_bound" ||
     value === "session_ended" ||
-    value === "keepalive"
+    value === "keepalive" ||
+    value === "key_reveal"
     ? value
     : "other";
 }
@@ -405,6 +477,23 @@ export class SessionDO {
         return this.handleRevoke(request);
       case "/throttle":
         return this.handlePairInitThrottle();
+      // Pair-by-session-code. `/code` is the one public path (worker.ts's whitelist); the
+      // rest are the Worker's and the other instances' internal calls, unreachable from
+      // outside for the same reason `/init` is.
+      case "/code":
+        return this.handleCodeRegister(request);
+      case "/code-release":
+        return this.handleCodeRelease(request);
+      case "/bucket":
+        return this.handleBucket(request);
+      case "/index-register":
+        return this.handleIndexRegister(request);
+      case "/index-clear":
+        return this.handleIndexClear(request);
+      case "/index-resolve":
+        return this.handleIndexResolve(request);
+      case "/index-revoke":
+        return this.handleIndexRevoke();
       default:
         return jsonResponse(404, { error: "not found" });
     }
@@ -931,6 +1020,9 @@ export class SessionDO {
       return jsonResponse(400, { error: "invalid envelope" });
     }
 
+    // `key_reveal` is the one plaintext hmd->phone frame and has rules of its own.
+    if (envelope.type === "key_reveal") return this.handleKeyReveal(record, envelope);
+
     // The session's most recent state snapshot, kept for a device that
     // connects (or reconnects) with nobody currently there to receive it
     // live — see storeLastHmdState. Stored regardless of what happens next:
@@ -951,6 +1043,40 @@ export class SessionDO {
     target.send(JSON.stringify(envelope));
     // Only now — with a frame actually on its way to a known-live socket —
     // is it safe to end the older ones. See supersedeOlderSockets.
+    this.supersedeOlderSockets(DEVICE_TAG, socketGeneration(target));
+    return jsonResponse(200, { ok: true, delivered: true });
+  }
+
+  /**
+   * hmd's `key_reveal` (INV-44): its public key and commitment nonce, in the clear, to the phone
+   * that bound through a code window. Allowed once the session is bound -- hmd only sends it
+   * after the `device_bound` that says the bind came via a code, and a frame posted into a
+   * session nobody has bound would be replayed at the claim to a phone it was never meant for
+   * -- and at most once: a second is refused, so the key a phone was told cannot be swapped
+   * after the fact by anyone holding hmd's bearer.
+   *
+   * Stored as the frame a reconnecting phone is replayed first (`acceptDeviceSocket`), and
+   * delivered live if a phone socket is open, like any hmd frame. `isHmdFrame` has already
+   * held it to a plaintext envelope; the payload is not read here.
+   */
+  private async handleKeyReveal(record: SessionRecord, envelope: Envelope): Promise<Response> {
+    if (record.status !== "bound") return jsonResponse(409, { error: "session not bound" });
+    if ((await this.ctx.storage.get(KEY_REVEAL_KEY)) !== undefined) {
+      logEvent("frame_rejected", {
+        session_id: record.session_id,
+        leg: "hmd",
+        reason: "duplicate_key_reveal",
+      });
+      return jsonResponse(409, { error: "duplicate key_reveal" });
+    }
+    await this.ctx.storage.put(KEY_REVEAL_KEY, envelope);
+
+    const target = this.liveSocket(DEVICE_TAG);
+    if (!target) {
+      logEvent("frame_undelivered", { session_id: record.session_id, reason: "no_device_connected" });
+      return jsonResponse(200, { ok: true, delivered: false });
+    }
+    target.send(JSON.stringify(envelope));
     this.supersedeOlderSockets(DEVICE_TAG, socketGeneration(target));
     return jsonResponse(200, { ok: true, delivered: true });
   }
