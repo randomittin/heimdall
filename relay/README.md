@@ -22,6 +22,11 @@ Durable Object per `session_id` (the single serialization point for that session
   or `?device_token=<token>` to reconnect after binding.
 - **pairing**: `POST /pair/init` (unauthenticated) creates a session and returns a session id, a
   single-use ~60s pairing code, and the hmd-side bearer token.
+- **health**: `GET /health` (unauthenticated; `HEAD` too) answers `200 {"ok":true,"version":"<build>"}`
+  from the Worker alone — it never reaches a Durable Object — and is what the deploy pipeline's
+  canary check polls. `version` is `BUILD_ID`, the commit sha the pipeline injects with `wrangler
+  deploy --var BUILD_ID:<sha>`, or `package.json`'s version when none was injected (local dev, a
+  hand-run deploy). The body carries nothing about sessions, secrets or the host.
 
 The relay stores and forwards **ciphertext only** for `state` / `command` / `ack` frames — it
 never sees plaintext. `device_bound`, `session_ended` and `keepalive` are the three

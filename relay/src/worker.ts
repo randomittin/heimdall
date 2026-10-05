@@ -4,9 +4,12 @@
 // Object, which is the sole owner of the session's state (spec §1). Any
 // other `/session/<uuid>/*` subpath — including the Durable Object's own
 // internal `/init` handler — is rejected here and never reaches the
-// Durable Object; see PUBLIC_SESSION_SUBPATHS below.
+// Durable Object; see PUBLIC_SESSION_SUBPATHS below. `GET /health` is the one
+// other unauthenticated route: the Worker answers it itself, first, and it
+// never reaches a Durable Object (src/health.ts).
 
 import type { Env } from "./types";
+import { handleHealth } from "./health";
 import { jsonResponse } from "./http";
 import { PAIR_INIT_RETRY_AFTER_S } from "./pairing";
 
@@ -32,6 +35,12 @@ const SESSION_PATH_RE = /^\/session\/([^/]+)\/([^/]+)$/;
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    // Liveness probe: answered ahead of everything below, every other branch of
+    // which builds a Durable Object stub.
+    if (url.pathname === "/health" && (request.method === "GET" || request.method === "HEAD")) {
+      return handleHealth(request, env);
+    }
 
     if (request.method === "POST" && url.pathname === "/pair/init") {
       return handlePairInit(request, env);
