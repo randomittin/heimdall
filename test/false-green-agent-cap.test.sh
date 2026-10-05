@@ -265,14 +265,15 @@ bench() {  # bench <name> <agent-cmd...>: one fake agent, both arms, rows in $TM
   bash "$BENCH" run --suite false-green --agent "fake-$name" --agent-cmd "$*" --live --confirm-spend --out "$TMP/$name" >"$TMP/$name.out" 2>"$TMP/$name.err"
 }
 PYBIN="$(command -v python3)"
+printf '#!/bin/sh\necho "CLAIM: done"\n' >"$TMP/plain.sh"; chmod +x "$TMP/plain.sh"
 bench capped   "$PYBIN $TMP/fake_stream.py events=20 cost=0.90 interval=0.4 {prompt}"
 bench ok       "$PYBIN $TMP/fake_stream.py events=2 cost=0.10 reported=0.2 deliver=$GOLDEN {prompt}"
 bench over     "$PYBIN $TMP/fake_stream.py events=1 cost=0.50 reported=2.40 deliver=$GOLDEN {prompt}"
-bench plain    "$PYBIN -c print('CLAIM:\ done') {prompt}"
+bench plain    "$TMP/plain.sh {prompt}"
 
 jqok "a run that hits the cap is an infrastructure exclusion that says so"     "$TMP/capped/runhmd.jsonl" '.infra_error | startswith("per-run cap")'
 jqok "a capped run is over_cap and its cost is the estimate that tripped it"   "$TMP/capped/runhmd.jsonl" '.over_cap == true and .cost_usd >= 2.0 and .cost_usd < 4.0 and .cost_source == "estimated-from-usage"'
-jqok "a capped run is never a false green, whatever it claimed"                "$TMP/capped/runhmd.jsonl" '.false_green == false'
+jqok "a killed run never printed a claim, so its row is not a false green"     "$TMP/capped/runhmd.jsonl" '.agent_claim == "gave_up" and .false_green == false'
 jqok "both arms of the capped run carry the exclusion"                         <(cat "$TMP/capped/alone.jsonl" "$TMP/capped/runhmd.jsonl") '.infra_error | startswith("per-run cap")'
 bash "$BENCH" summarize --json --suite false-green --in "$TMP/capped" >"$TMP/capped.json" 2>/dev/null
 jqok "the summary lists the capped run as excluded, with the reason"           "$TMP/capped.json" '(.study_a.excluded|length) == 1 and (.study_a.excluded[0].reason | startswith("infrastructure: per-run cap"))'
@@ -311,7 +312,7 @@ jqok "the claude-code row has the agent's claim, cost and model"               "
 
 # the 30-minute limit, wired through the live path (the constant patched down to one second)
 python3 - "$REPO" "$TMP" >"$TMP/t.out" 2>"$TMP/t.out.err" <<'PY'
-import argparse, json, os, sys
+import argparse, contextlib, io, json, os, sys
 repo, tmp = sys.argv[1], sys.argv[2]
 sys.path.insert(0, os.path.join(repo, "bin", "lib"))
 import fg_bench
@@ -323,7 +324,8 @@ def t(desc, cond, detail=""):
 fg_bench.RUN_TIMEOUT_S = 1
 args = argparse.Namespace(agent="fake-timeout", agent_cmd="%s %s events=1 silent_for=60 {prompt}" % (sys.executable, os.path.join(tmp, "fake_stream.py")),
                           arm="runhmd", out=os.path.join(tmp, "timeout"))
-fg_bench.run_study_a_live(fg_bench.SUITE, args)
+with contextlib.redirect_stdout(io.StringIO()):
+    fg_bench.run_study_a_live(fg_bench.SUITE, args)
 row = json.loads(open(os.path.join(tmp, "timeout", "runhmd.jsonl")).read().splitlines()[0])
 t("a run past the wall-clock limit is an infrastructure exclusion that says so", str(row["infra_error"]).startswith("agent timed out"), row["infra_error"])
 t("and has no claim, so it cannot be a false green", row["agent_claim"] == "gave_up" and row["false_green"] is False, row)
