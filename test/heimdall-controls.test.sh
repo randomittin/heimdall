@@ -78,6 +78,7 @@ export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 export HEIMDALL_FALLBACK_PROBE_TIMEOUT=1
 export HMD_UI_COMPANION_PANELS=0
+export HMD_UI_CONTROL_DEADLINE_S=8   # the operator knob, at its ceiling: a loaded CI box must not turn a slow CLI into a flaky timeout
 export REPO_ROOT="$REPO"
 unset CLAUDE_SESSION_ID SESSION_ID CLAUDE_CODE_SESSION_ID CLAUDE_CONFIG_DIR HMD_AGENT_PROJECTS_DIR HMD_UI_CONTROLS \
       CLAUDE_CODE_ENTRYPOINT HMD_AGENT_TYPE HMD_JUDGMENT HMD_HOOKS_METADATA HMD_TMUX_TARGET HMD_CKPT_FAULT
@@ -436,20 +437,25 @@ TIMES="$(python3 - "$FIX" "$CMD" <<'PYEOF'
 import os, subprocess, sys, time
 fix, cmd = sys.argv[1:3]
 env = dict(os.environ, CLAUDE_PROJECT_DIR=fix, CLAUDE_PLUGIN_ROOT=os.environ["REPO_ROOT"])
-t = []
-for _ in range(200):
-    a = time.perf_counter()
-    subprocess.run(["sh", "-c", cmd], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    t.append((time.perf_counter() - a) * 1000)
-t.sort()
-print("%.1f %.1f" % (t[len(t) // 2], t[int(len(t) * 0.99)]))
+def run(argv):
+    t = []
+    for _ in range(200):
+        a = time.perf_counter()
+        subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        t.append((time.perf_counter() - a) * 1000)
+    t.sort()
+    return t[len(t) // 2], t[int(len(t) * 0.99)]
+b50, b99 = run(["sh", "-c", "exit 0"])      # what merely starting a shell costs on THIS machine, right now
+c50, c99 = run(["sh", "-c", cmd])           # the wired command with nothing pending
+print("%.1f %.1f %.1f %.1f" % (c50, c99, b50, b99))
 PYEOF
 )"
-P50="${TIMES% *}"; P99="${TIMES#* }"
-if python3 -c "import sys; sys.exit(0 if float('$P50') < 15 and float('$P99') < 60 else 1)"; then
-  ok "6l. the wired PreToolUse command with nothing pending: p50 ${P50} ms, p99 ${P99} ms over 200 runs (bound 15 / 60)"
+set -- $TIMES
+P50="$1"; P99="$2"; B50="$3"; B99="$4"
+if python3 -c "import sys; sys.exit(0 if float('$P50') - float('$B50') < 10 and float('$P99') - float('$B99') < 60 else 1)"; then
+  ok "6l. the wired PreToolUse command with nothing pending costs a shell start and a file test: p50 ${P50} ms vs ${B50} ms for a bare shell, p99 ${P99} vs ${B99} (200 runs each; bound +10 / +60 ms)"
 else
-  bad "6l. the wired fast path is too slow: p50 ${P50} ms, p99 ${P99} ms"
+  bad "6l. the wired fast path costs more than a shell start: p50 ${P50} vs ${B50} ms, p99 ${P99} vs ${B99} ms"
 fi
 
 # ═══ 7. rate limits (fresh servers, fresh buckets) ═══════════════════════════════════════════════════════════
@@ -471,13 +477,12 @@ RA="$(curl -s -D - -o /dev/null -X POST -H 'Content-Type: application/json' -d '
 if [ -n "$RA" ] && [ "$RA" -gt 0 ] 2>/dev/null; then ok "7b. the 429 carries Retry-After: $RA"; else bad "7b. no Retry-After header on the 429"; fi
 FIX_G="$(new_repo globalrate)"
 start_ui "$FIX_G"
-limited=0; n=0
-for h in parallel-gate ctx-meter-notice caveman-rules dream-notice stop-metric-reminder subagent-metric resume-probe; do
-  ctl "{\"action\":\"hook-toggle\",\"params\":{\"id\":\"$h\",\"enabled\":false}}"
-  n=$((n + 1)); [ "$CODE" = "429" ] && limited=$((limited + 1))
+limited=0; passed=0; n=0
+for _ in 1 2 3 4 5 6 7; do   # refusals cost no process, so the burst really is a burst
+  ctl '{"action":"hook-toggle","params":{"id":"stub-gate","enabled":false}}'
+  n=$((n + 1)); if [ "$CODE" = "429" ]; then limited=$((limited + 1)); elif [ "$CODE" = "403" ]; then passed=$((passed + 1)); fi
 done
-if [ "$limited" -ge 1 ] && [ "$limited" -le 2 ]; then ok "7c. seven hook toggles in a burst: the overall budget (burst 5) refuses the overflow ($limited of $n)"; else bad "7c. expected 1-2 refusals out of $n, got $limited"; fi
-rm -f "$DIS"
+if [ "$passed" -eq 5 ] && [ "$limited" -eq 2 ]; then ok "7c. seven commands in a burst: the overall budget (burst 5) lets 5 reach the handler and refuses the other 2 with 429"; else bad "7c. expected 5 through and 2 refused out of $n, got $passed through and $limited refused"; fi
 
 # ═══ 8. kill switch ═════════════════════════════════════════════════════════════════════════════════════════
 FIX_K="$(new_repo killswitch)"

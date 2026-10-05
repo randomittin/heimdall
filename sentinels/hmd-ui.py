@@ -180,6 +180,7 @@ WATCH_SOURCES = (
     ".heimdall/ui/tmux-target",            # inbox.consumer == "tmux"
     ".heimdall/ui/controls-audit.jsonl",   # a control ran -> controls.last (appended in place)
     ".heimdall/app/controls-disabled",     # the kill switch -> controls.enabled
+    ".heimdall/fallback.json",             # controls.fallback.mode (only its one `state` word is ever read)
     ".planning/CHECKPOINT.md",
     ".heimdall/receipts/last-sweep.json",
 )
