@@ -220,7 +220,7 @@ if section C; then
 echo "[C] canonical bytes, Ed25519 signature, trust anchors, tamper evidence"
 
 cat >"$TMP/crypto-check.py" <<'PY'
-import base64, copy, hashlib, json, os, stat, sys, tempfile, time
+import base64, calendar, copy, hashlib, json, os, stat, sys, time
 
 PYLIB, REPO, WORK = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, PYLIB)
@@ -290,8 +290,6 @@ c = rr.canonical
 case("canonical: sorted keys, no whitespace", c({"b": 1, "a": [True, None, "x"]}) == b'{"a":[true,null,"x"],"b":1}')
 case("canonical: an integral float is written as an integer (1.0 -> 1, -0.0 -> 0, 134.0 -> 134)", c({"x": 1.0, "y": -0.0, "z": 134.0}) == b'{"x":1,"y":0,"z":134}')
 case("canonical: other numbers are the shortest round-trip decimal", c({"x": 0.41, "y": 1.25, "z": 12.35}) == b'{"x":0.41,"y":1.25,"z":12.35}')
-case("canonical: NaN and infinity are refused", all(kind_of_exc is ValueError for kind_of_exc in [
-    next((type(e) for e in [_e] if True), None) for _e in [ (lambda f: (lambda: (f(), None))) and None ] ]) if False else True)
 for label, bad in (("NaN", float("nan")), ("infinity", float("inf")), ("a number that needs an exponent (1e-05)", 1e-05), ("an integral number past 1e16", 1e16)):
     try:
         c({"x": bad}); refused = False
@@ -324,7 +322,8 @@ case("Ed25519 is deterministic: issuing the same receipt twice gives identical b
 t0 = time.time()
 now_doc = json.loads(issue(created_at=None))
 case("created_at defaults to the current UTC time, to the second",
-     len(now_doc["created_at"]) == 20 and now_doc["created_at"].endswith("Z") and abs(time.mktime(time.strptime(now_doc["created_at"], "%Y-%m-%dT%H:%M:%SZ")) - time.timezone - t0) < 10)
+     len(now_doc["created_at"]) == 20 and now_doc["created_at"].endswith("Z")
+     and abs(calendar.timegm(time.strptime(now_doc["created_at"], "%Y-%m-%dT%H:%M:%SZ")) - t0) < 10, now_doc["created_at"])
 case("a receipt without its final LF still verifies (the LF is not content)", outcome(raw[:-1], trust) == "ok")
 case("a second LF is refused", outcome(raw + b"\n", trust) != "ok")
 proven = issue(**PROVEN_OVER)
@@ -479,8 +478,7 @@ for label, sample in (("DENIED", raw), ("PROVEN", proven)):
         got = outcome(sample + b" ", trust)
         if got == "ok" or got.startswith("CRASH"):
             escaped["insert a space"].append((n, got))
-    total = sum(1 for _ in range(n)) * 4 - 1
-    case("%s receipt, %d bytes: editing ANY single byte (flip a bit, flip case, delete it, insert a space before it) fails verification (%d variants)" % (label, n, total),
+    case("%s receipt, %d bytes: editing ANY single byte (flip a bit, flip case, delete it, insert a space before it) fails verification (%d variants)" % (label, n, 4 * n),
          not any(escaped.values()), {k: v[:3] for k, v in escaped.items() if v})
 
 # ── hostile input never crashes the verifier ─────────────────────────────────
@@ -492,12 +490,16 @@ for label, blob in hostile.items():
     case("hostile input (%s) is refused with a clean ReceiptError, no crash" % label, got in ("not_json", "schema"), got)
 dup = raw.replace(b'"id":"a1b2c3d4e5f6"', b'"id":"zzzzzzzzzzzz","id":"a1b2c3d4e5f6"')
 case("a duplicate object member is refused (the bytes are not the canonical form)", dup != raw and outcome(dup, trust) == "not_canonical")
-pretty = json.dumps(json.loads(raw), indent=2).encode()
-case("a pretty-printed copy of a genuine receipt is refused as not canonical", outcome(pretty, trust) == "not_canonical")
-unsorted = json.dumps(json.loads(raw), separators=(",", ":")).encode()
-case("a compact but key-order-changed copy is refused as not canonical", unsorted != raw.rstrip(b"\n") and outcome(unsorted, trust) == "not_canonical")
-ascii_escaped = json.dumps(json.loads(raw), sort_keys=True, separators=(",", ":")).encode()
-case("an ensure_ascii re-serialisation (non-ASCII as \\uXXXX escapes) is refused as not canonical", ascii_escaped != raw.rstrip(b"\n") and outcome(ascii_escaped, trust) == "not_canonical")
+parsed = json.loads(raw)
+pretty = json.dumps(parsed, indent=2, sort_keys=True, ensure_ascii=False).encode()
+case("a pretty-printed copy of a genuine receipt (same members, same order, only whitespace added) is refused as not canonical",
+     outcome(pretty, trust) == "not_canonical")
+reordered = json.dumps(dict(reversed(list(parsed.items()))), separators=(",", ":"), ensure_ascii=False).encode()
+case("a compact copy with the members in another order is refused as not canonical",
+     reordered != raw.rstrip(b"\n") and outcome(reordered, trust) == "not_canonical")
+ascii_escaped = json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode()
+case("an ensure_ascii re-serialisation (non-ASCII as \\uXXXX escapes) is refused as not canonical",
+     ascii_escaped != raw.rstrip(b"\n") and outcome(ascii_escaped, trust) == "not_canonical")
 
 # ── who may have signed it ───────────────────────────────────────────────────
 mine = json.loads(raw)
@@ -523,9 +525,10 @@ case("control: signing exactly 'runhmd.receipt/1' LF + canonical(body) verifies 
 case("domain separation: a signature over the bare canonical body (no prefix) is refused", outcome(with_sig(signer.sign(rr.canonical(body))), trust) == "bad_signature")
 case("domain separation: a signature under another prefix ('runhmd.receipt/2' LF) is refused", outcome(with_sig(signer.sign(b"runhmd.receipt/2\n" + rr.canonical(body))), trust) == "bad_signature")
 sig = mine["signature"]
-variant = sig[:85] + ("B" if sig[85] == "A" else "A") + "=="
-case("control: that variant decodes to the same 64 bytes as the genuine signature (so only a canonical-base64 check can tell them apart)",
-     sig[85] in "AQgw" and base64.b64decode(variant)[:63] == base64.b64decode(sig)[:63])
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+variant = sig[:85] + ALPHABET[ALPHABET.index(sig[85]) + 1] + "=="
+case("control: a variant that differs only in the unused trailing bits decodes to the SAME 64 bytes (so only a canonical-base64 check can tell it apart)",
+     sig[85] in "AQgw" and variant != sig and base64.b64decode(variant) == base64.b64decode(sig))
 case("a non-canonical base64 spelling of the genuine signature is refused", outcome(with_sig(variant), trust) == "bad_signature")
 
 # ── keys: where the secret comes from, and what is refused ───────────────────
