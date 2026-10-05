@@ -2,10 +2,12 @@
 # test/heimdall-cli-routing.test.sh — CLI routing contract for bin/heimdall
 #
 # WHAT THIS GATES. The top-level dispatcher (bin/heimdall) must route named
-# subcommands to their real bins and forward all args verbatim, while unknown
-# commands fall through to the Claude task-prompt path. The three routing gaps
-# fixed: `hmd team`, `hmd invite`, `hmd presence` (including `off`, `on`,
-# `on --global`, `on --no-files`, `status`, `roster`, etc.).
+# subcommands to their real bins and forward all args verbatim, while a task
+# prompt (two or more words, or one quoted sentence) falls through to the Claude
+# launch path. A LONE unknown word is a mistyped command, not a prompt: it exits 2
+# (section 8a here; the full rule is pinned by test/heimdall-unknown-command.test.sh).
+# The three routing gaps fixed: `hmd team`, `hmd invite`, `hmd presence`
+# (including `off`, `on`, `on --global`, `on --no-files`, `status`, `roster`, etc.).
 #
 # HOW THE HARNESS WORKS.
 #   Routed cases  — we COPY bin/heimdall into a temp fake plugin dir so
@@ -546,24 +548,52 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. FALSIFIER — unknown command falls through to Claude launch path
-#    A routed name must NOT reach fall-through; an unknown one MUST.
+# 8. FALSIFIER — a task prompt falls through to Claude launch path
+#    A routed name must NOT reach fall-through; a multi-word prompt MUST. (A lone
+#    unknown word is not a prompt at all — 8a.)
 # ══════════════════════════════════════════════════════════════════════════════
 reset
-run_hmd "build-something-xyz-unknown-task-abcdef"
+run_hmd "build something xyz unknown task abcdef"
 
 if claude_reached; then
-  ok "unknown command falls through to Claude launch path"
+  ok "a task prompt falls through to Claude launch path"
 else
-  bad "unknown command must reach the Claude launch path (launch:task trace missing)"
+  bad "a task prompt must reach the Claude launch path (launch:task trace missing)"
   cat "$TRACE_FILE" >&2
 fi
 
 if ! stub_called "heimdall-team" && ! stub_called "heimdall-invite" && ! stub_called "heimdall-presence" && ! stub_called "heimdall-connect" && ! stub_called "heimdall-report" && ! stub_called "designmatch"; then
-  ok "unknown command does NOT route to team/invite/presence/connect/report/designmatch stubs (falsifier)"
+  ok "a task prompt does NOT route to team/invite/presence/connect/report/designmatch stubs (falsifier)"
 else
-  bad "unknown command must NOT be intercepted by any routing stub"
+  bad "a task prompt must NOT be intercepted by any routing stub"
   cat "$STUB_OUT" >&2
+fi
+
+# 8a. The other side of the same falsifier: ONE unknown word with no whitespace is a
+#     command attempt, not a prompt. It must exit 2 and must NOT reach the launch
+#     path — the old fall-through started an autonomous agent on a typo (`hmd attack`).
+#     Same environment as run_hmd, but the exit code is kept.
+reset
+PATH="$FAKE_BIN:$PATH" \
+HEIMDALL_HOME="$FAKE_HOME" \
+HEIMDALL_NO_INTRO=1 \
+HEIMDALL_NO_UPDATE_CHECK=1 \
+HMD_STUB_OUT="$STUB_OUT" \
+HEIMDALL_TRACE_ORDER="$TRACE_FILE" \
+bash "$FAKE_BIN/heimdall" "build-something-xyz-unknown-task-abcdef" >/dev/null 2>&1
+LONE_RC=$?
+
+if [ "$LONE_RC" -eq 2 ]; then
+  ok "a lone unknown word exits 2"
+else
+  bad "a lone unknown word must exit 2 (got $LONE_RC)"
+fi
+
+if ! claude_reached; then
+  ok "a lone unknown word does NOT reach the Claude launch path"
+else
+  bad "a lone unknown word MUST NOT reach the Claude launch path (launch:task trace present)"
+  cat "$TRACE_FILE" >&2
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -587,7 +617,7 @@ fi
 # A. resolver absent — this is the state every other case in this file runs in.
 reset
 rm -f "$FAKE_BIN/heimdall-model-resolve"
-run_hmd "some-unknown-task-resolver-absent"
+run_hmd "some unknown task resolver absent"
 
 if claude_reached; then
   ok "launch survives a MISSING heimdall-model-resolve (no 127 abort)"
@@ -611,7 +641,7 @@ fi
 reset
 make_stub heimdall-model-resolve
 NO_OVERRIDE_DIR="$(mktemp -d /tmp/test-heimdall-no-override-XXXXXX)"
-( cd "$NO_OVERRIDE_DIR" && run_hmd "some-unknown-task-resolver-present" )
+( cd "$NO_OVERRIDE_DIR" && run_hmd "some unknown task resolver present" )
 rm -rf "$NO_OVERRIDE_DIR"
 
 if claude_reached; then

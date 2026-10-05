@@ -227,12 +227,12 @@ echo "5. launcher flags are consumed BEFORE the word is classified"
 # ══════════════════════════════════════════════════════════════════════════════
 run "$FAKE/bin/heimdall" --auto "fix the bug in x"
 expect_launched "hmd --auto \"fix the bug in x\" launches" "fix the bug in x"
-claude_has '[--permission-mode] [auto]' && ok "...and --auto reached claude as --permission-mode auto" \
+launch_has '[--permission-mode] [auto]' && ok "...and --auto reached claude as --permission-mode auto" \
   || bad "...but --auto was not applied -- log=[$(snip "$CLAUDE_LOG")]"
 
 run "$FAKE/bin/heimdall" --no-goal "fix the bug in x"
 expect_launched "hmd --no-goal \"fix the bug in x\" launches" "fix the bug in x"
-claude_has '/goal' && bad "--no-goal still wrapped the task in /goal" || ok "...without the /goal wrapper"
+launch_has '/goal' && bad "--no-goal still wrapped the task in /goal" || ok "...without the /goal wrapper"
 
 run "$FAKE/bin/heimdall" --auto typo
 expect_rejected "hmd --auto typo exits 2: the flag is consumed, the lone word that is left is unknown"
@@ -340,7 +340,7 @@ expect_rejected "(rename) the old name is itself unknown now"
 # (c) The extractor sees every kind of dispatch entry: case arms (single and
 #     aliased), the odd names, and the flag-ladder commands that are not arms.
 NAMES="$( ( cd "$WORK" && env -i PATH="$PATH" HOME="$HOME_DIR" HEIMDALL_HOME="$HOME_DIR/.heimdall" \
-            HEIMDALL_LIB_ONLY=1 bash -c 'set --; source "$1" || exit 90; _hmd_dispatch_names "$1"' _ "$HEIMDALL" ) 2>/dev/null )"
+            HEIMDALL_LIB_ONLY=1 bash -c 'f="$1"; set --; source "$f" || exit 90; _hmd_dispatch_names "$f"' _ "$HEIMDALL" ) 2>/dev/null )"
 NCOUNT="$(printf '%s\n' "$NAMES" | grep -c .)"
 [ "$NCOUNT" -ge 60 ] \
   && ok "the extractor finds the dispatch ($NCOUNT names, floor 60)" \
