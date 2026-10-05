@@ -642,6 +642,13 @@ T.eq((len(c.fake.requests), os.path.exists(c.path("push-test")), os.path.exists(
      "that starts later does not find it")
 c.close()
 
+# ── B3e. without --wait a missing sender is reported at the 10 s pickup deadline, not after the whole 60 s ──
+c = Case()
+rc, out, err, took = c.cli()
+T.check(rc == 4 and 9.0 <= took < 30.0,
+        "B3e. no --wait and no sender: exit 4 after the 10 s pickup deadline, not the 60 s wait (%.1f s)" % took, (rc, out))
+c.close()
+
 # ── B4. one device, a live sender: exit 0, one message of kind test, a per-token line, no token anywhere ──
 c = Case()
 T.check(c.start_sender("a"), "B4a. the sender process is up")
