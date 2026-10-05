@@ -1,6 +1,6 @@
 # Maintainer Mode Guide
 
-Maintainer mode turns Heimdall into an autonomous repo maintainer that triages issues, fixes bugs, and manages releases.
+Maintainer mode turns Heimdall into an autonomous repo maintainer that triages issues, fixes bugs, and prepares releases for the operator to run.
 
 **Read this file when `/hmd:maintain` or `/hmd:maintain-check` runs**, or when the user
 asks Heimdall to watch a repo. It is not consulted by ordinary development tasks.
@@ -28,7 +28,7 @@ Each `/hmd:maintain-check` invocation runs one cycle:
    | Any x Low | Escalate to user with full context |
 
 4. **Fix** — spawn agents for each routed issue (coder, test-runner, lint-quality, reviewer)
-5. **Release** — when 3+ items in queue or oldest is >24h: batch into patch release with semver bump, changelog, and GitHub release
+5. **Release prep** — when 3+ items in queue or oldest is >24h: prepare a patch release (semver bump, changelog, release PR, the exact release command) and STOP — the operator runs it; see *Batched Patch Releases*
 6. **Communicate** — report the summary to the user. Posting it to Slack requires the
    `slack:*` skills to be installed; there is no Slack client in this repo and nothing reads
    `maintainer.slack_channel`.
@@ -73,7 +73,7 @@ Or for persistent monitoring that survives session restarts:
 /schedule maintain-check --cron "*/30 * * * *" --command "/hmd:maintain-check"
 ```
 
-Each `/hmd:maintain-check` invocation runs one full cycle: scan → triage → fix → release.
+Each `/hmd:maintain-check` invocation runs one full cycle: scan → triage → fix → prepare release (the operator runs it).
 
 After activation, the user starts continuous monitoring with:
 - `/loop 30m /hmd:maintain-check` — checks every 30 minutes in-session
@@ -125,9 +125,9 @@ Issue detected
 | Critical × Any | Alert + hotfix agent + human approval |
 | High × High | Auto-fix + PR + request review |
 | High × Medium | Investigate + fix + PR |
-| Medium × High | Auto-fix, batch into patch release |
+| Medium × High | Auto-fix, add to release queue for batch |
 | Medium × Medium | Investigate, add to release queue |
-| Low × High | Auto-fix, batch into patch release |
+| Low × High | Auto-fix, add to release queue for batch |
 | Low × Medium | Add to release queue |
 
 ## Auto-Fix Protocol
@@ -148,14 +148,17 @@ Issue detected
 
 ## Batched Patch Releases
 
-Group related small fixes into patch releases:
+Group related small fixes into a patch release. The agent prepares the release and stops; the operator,
+who holds the credentials, runs it. Never run `release/ship.sh` or any tag, push or publish step yourself.
 
 1. Collect fixes from `maintainer.release_queue`
 2. Ensure all tests pass together
-3. Bump version (patch for fixes, minor for features)
+3. Bump version (patch for fixes, minor for features) on a `release/v<version>` branch
 4. Generate changelog from commit messages
-5. Create release tag + GitHub release
-6. Clear the release queue
+5. Open the release PR (version bump + changelog) with the exact release command for this repo's release
+   procedure in its description (heimdall itself: `release/publish-checklist.md`), then STOP: reviewing the
+   PR and running the release are the operator's
+6. Clear the release queue only once the operator confirms the release is out
 
 ## Self-Improvement (run between fix batches)
 
