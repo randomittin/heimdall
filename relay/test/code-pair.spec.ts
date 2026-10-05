@@ -16,7 +16,7 @@
 // check through the other layer would let a mutant that deletes it survive.
 
 import { SELF, listDurableObjectIds, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/worker";
 import {
   GH_ASSERTION_TTL_S,
@@ -68,6 +68,11 @@ import {
   typedEnv,
   type Identity,
 } from "./code-pair-helpers";
+
+// Many tests here drive a whole pairing -- sign-in, a window, a release, a bind -- or fill a
+// throttle (10 and 20 requests), each request a few Durable Object hops in a real workerd:
+// seconds, not milliseconds, so the 5 s default would fail them for being thorough.
+vi.setConfig({ testTimeout: 60_000 });
 
 const fake = new FakeGitHub();
 beforeEach(() => fake.install());
