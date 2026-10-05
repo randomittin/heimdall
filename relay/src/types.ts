@@ -28,6 +28,22 @@ export interface Env {
    *  RELAY_KEEPALIVE_MS above — vitest-only, absent in wrangler.toml, not a
    *  secret. */
   RELAY_STREAM_MAX_LIFETIME_MS?: string;
+  /** Pair-by-session-code (src/code-pair.ts). The public client id of the project's GitHub
+   *  App: a `[vars]` entry in wrangler.toml, not a secret. Optional in the type because
+   *  all three of this and the two below must be set for code pairing to run; any one
+   *  unset or empty and every code-pairing route answers 503 `code pairing disabled`. */
+  GITHUB_CLIENT_ID?: string;
+  /** The GitHub App's client secret, a Workers secret (`wrangler secret put`). Used only
+   *  as the Basic-auth half of the check-token and delete-token calls (src/github.ts). */
+  GITHUB_CLIENT_SECRET?: string;
+  /** HMAC key of the gh_assertion (src/pairing.ts's mintGhAssertion), a Workers secret,
+   *  distinct from RELAY_SIGNING_SECRET so the two token kinds can never stand in for each
+   *  other. */
+  RELAY_IDENTITY_SECRET?: string;
+  /** Optional origin every GitHub call is sent to, default `https://api.github.com`.
+   *  Declared nowhere in wrangler.toml: only the vitest suite binds it, to point the relay
+   *  at its fake GitHub. Not a secret. */
+  GITHUB_API_BASE?: string;
 }
 
 /** "relay" is not in the spec's sender enum — it is used only for the two
@@ -40,7 +56,8 @@ export type FrameType =
   | "ack"
   | "device_bound"
   | "session_ended"
-  | "keepalive";
+  | "keepalive"
+  | "key_reveal";
 
 /**
  * The wire envelope (spec §2.3). `nonce`/`ciphertext` are null for the three
