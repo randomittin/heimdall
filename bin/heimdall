@@ -2286,6 +2286,25 @@ case "${1:-}" in
     fi
     exec "$ATTACK_BIN" "$@"
     ;;
+  prove)
+    # `hmd prove` (RP2) -- "do all gates pass, and has each gate been shown to fail first?": prove the
+    # oracle gates of a repository (evals/oracles/<id>/ with fixtures/mutants) and its regression corpus,
+    # as a runhmd.prove/1 JSON document (docs/schemas/runhmd.verdict.v1.json, the schema `hmd attack`'s
+    # runhmd.verdict/1 lives in). Pass-through to bin/heimdall-prove; every arg is forwarded verbatim.
+    # The verdict is derived from real bin/falsify + bin/corpus runs, not by the CLI: PROVEN only when
+    # every gate passes AND is falsified AND no regression case failed.
+    # Exit: 0 PROVEN, 1 DENIED, 2 usage/config, 3 consent required (non-TTY without --yes), 5
+    # infrastructure -- same table as `hmd attack`, which is why a missing bin exits 5 here, not 1:
+    # 1 means DENIED. Without this arm `hmd prove` fell through to the Claude task-prompt path.
+    shift
+    PROVE_BIN="$PLUGIN_DIR/bin/heimdall-prove"
+    if [ ! -x "$PROVE_BIN" ]; then
+      echo "  Error: heimdall-prove not found at $PROVE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 5
+    fi
+    exec "$PROVE_BIN" "$@"
+    ;;
   sla)
     # Pass-through to heimdall-sla: the ⚠-class observation SLA auditor. The standing
     # rule is that a security_note / sensitive / ⚠ observation gets a verdict within
