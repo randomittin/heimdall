@@ -1,0 +1,7 @@
+{
+  "id": "attack",
+  "name": "hmd attack — adversarial differential gate on a settlement webhook",
+  "trigger": "manual",
+  "severity": "hard",
+  "golden_input": "fixtures/golden/target.mjs"
+}

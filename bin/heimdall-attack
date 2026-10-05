@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""heimdall-attack -- `hmd attack`: can I break this? PROVEN or DENIED, with a counterexample.
+
+Thin launcher: the logic lives in bin/lib/runhmd_attack.py so tests and `hmd prove` can import
+it. The verdict is computed by the `attack` oracle gate (evals/oracles/attack/run.sh), never here.
+See `hmd attack --help` for flags and exit codes (0 PROVEN, 1 DENIED, 2 usage, 3 consent,
+4 budget cap, 5 infrastructure).
+"""
+import os
+import signal
+import sys
+
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `hmd attack --card | head -3` ends quietly
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+
+from runhmd_attack import main  # noqa: E402
+
+sys.exit(main(sys.argv[1:]))

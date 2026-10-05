@@ -1,0 +1,127 @@
+{
+  "domain": "attack",
+  "fixture_kind": "mutants",
+  "purpose": "Each mutant is the SAME settlement webhook as fixtures/golden/target.mjs with EXACTLY ONE defect, in the shape AI-written code actually ships it. `bin/falsify attack` runs the attack gate (run.sh) against the golden (expect PROVEN) and then every mutant (expect DENIED). A mutant the battery fails to break would be a defect `hmd attack` cannot see — a false PROVEN — and BLOCKS the build. `kills` pins the exact set of attacks each mutant must break: a mutant that breaks more means the defect is not single, one that breaks fewer means an attack has gone blind.",
+  "golden": "../golden/target.mjs",
+  "candidate_contract": "An ES module exporting default createWebhook({ store }) -> { handleEvent(event), getBalance(account, caller), getSettlement(eventId, caller) }; see INVARIANTS.md (rules R1-R4) and COVERAGE.md.",
+  "mutants": [
+    {
+      "name": "missed-duplicate",
+      "file": "missed-duplicate.mjs",
+      "attack_class": "duplicate",
+      "defect": "The idempotency claim is gone: every delivery of an event credits the account again, so a provider retry pays twice.",
+      "must_turn_red_gate": "attack",
+      "first_fail_case": "duplicate.sequential-retry",
+      "kills": [
+        "duplicate.sequential-retry",
+        "duplicate.retry-at-0ms",
+        "duplicate.retry-at-1ms",
+        "duplicate.retry-at-10ms",
+        "duplicate.retry-at-25ms",
+        "duplicate.retry-at-49ms",
+        "duplicate.burst-of-3"
+      ],
+      "blind_to": ["every IDOR read", "every rounding amount", "two different events for one account"]
+    },
+    {
+      "name": "racy-duplicate",
+      "file": "racy-duplicate.mjs",
+      "attack_class": "duplicate",
+      "defect": "Check-then-act instead of an atomic claim: the event is marked processed only AFTER the account is credited, so a retry arriving within 50ms of the first delivery passes the check and credits a second time. A retry after the first attempt finished is rejected correctly.",
+      "must_turn_red_gate": "attack",
+      "first_fail_case": "duplicate.retry-at-0ms",
+      "kills": [
+        "duplicate.retry-at-0ms",
+        "duplicate.retry-at-1ms",
+        "duplicate.retry-at-10ms",
+        "duplicate.retry-at-25ms",
+        "duplicate.retry-at-49ms",
+        "duplicate.burst-of-3"
+      ],
+      "blind_to": ["a sequential redelivery (duplicate.sequential-retry) — the case a naive test uses", "every IDOR read", "every rounding amount"]
+    },
+    {
+      "name": "dedupes-by-account",
+      "file": "dedupes-by-account.mjs",
+      "attack_class": "duplicate",
+      "defect": "The idempotency claim is keyed by the account instead of the event id: redelivery is absorbed, but a second DIFFERENT event for the same account is dropped as a duplicate and never credited.",
+      "must_turn_red_gate": "attack",
+      "first_fail_case": "duplicate.distinct-events-same-account",
+      "kills": ["duplicate.distinct-events-same-account"],
+      "blind_to": ["every redelivery of one event", "every IDOR read", "every rounding amount"]
+    },
+    {
+      "name": "missed-idor",
+      "file": "missed-idor.mjs",
+      "attack_class": "idor",
+      "defect": "The ownership check is gone from both reads: another account, or an anonymous caller, reads someone else's balance and settlement records.",
+      "must_turn_red_gate": "attack",
+      "first_fail_case": "idor.balance-other-account",
+      "kills": [
+        "idor.balance-other-account",
+        "idor.settlement-other-account",
+        "idor.balance-anonymous",
+        "idor.settlement-anonymous",
+        "idor.balance-prefix-lookalike",
+        "idor.settlement-prefix-lookalike"
+      ],
+      "blind_to": ["every delivery race", "every rounding amount", "the owner reading their own data"]
+    },
+    {
+      "name": "prefix-ownership",
+      "file": "prefix-ownership.mjs",
+      "attack_class": "idor",
+      "defect": "Ownership is decided by startsWith instead of identity: acct_A1 is treated as the owner of acct_A, while an unrelated account and the anonymous caller are still refused.",
+      "must_turn_red_gate": "attack",
+      "first_fail_case": "idor.balance-prefix-lookalike",
+      "kills": ["idor.balance-prefix-lookalike", "idor.settlement-prefix-lookalike"],
+      "blind_to": ["another unrelated account", "an anonymous caller", "every delivery race", "every rounding amount"]
+    },
+    {
+      "name": "denies-owner",
+      "file": "denies-owner.mjs",
+      "attack_class": "idor",
+      "defect": "The reads refuse everybody, the owner included — an IDOR 'fixed' by breaking the feature. Nothing leaks, so every refusal attack survives; the owner controls and every delivery read-back catch it.",
+      "must_turn_red_gate": "attack",
+      "first_fail_case": "duplicate.sequential-retry",
+      "kills": [
+        "duplicate.sequential-retry",
+        "duplicate.retry-at-0ms",
+        "duplicate.retry-at-1ms",
+        "duplicate.retry-at-10ms",
+        "duplicate.retry-at-25ms",
+        "duplicate.retry-at-49ms",
+        "duplicate.burst-of-3",
+        "duplicate.distinct-events-same-account",
+        "owner.reads-own-balance",
+        "owner.reads-own-settlement",
+        "rounding.fee-on-18",
+        "rounding.fee-on-34",
+        "rounding.fee-on-500",
+        "rounding.fee-on-1500",
+        "rounding.fee-on-2500",
+        "rounding.fee-on-9999",
+        "rounding.fee-on-100500"
+      ],
+      "blind_to": ["every refusal attack: it leaks nothing"]
+    },
+    {
+      "name": "off-by-one-rounding",
+      "file": "off-by-one-rounding.mjs",
+      "attack_class": "rounding",
+      "defect": "The fee is truncated (Math.floor of the exact fee) instead of rounded half-up: wherever the exact fee has a fractional part of .5 or more the fee is one cent too small and the account is credited one cent too much.",
+      "must_turn_red_gate": "attack",
+      "first_fail_case": "rounding.fee-on-18",
+      "kills": [
+        "rounding.fee-on-18",
+        "rounding.fee-on-34",
+        "rounding.fee-on-500",
+        "rounding.fee-on-1500",
+        "rounding.fee-on-2500",
+        "rounding.fee-on-9999",
+        "rounding.fee-on-100500"
+      ],
+      "blind_to": ["every delivery race", "every IDOR read", "amounts whose exact fee is below .5 of a cent"]
+    }
+  ]
+}

@@ -60,7 +60,7 @@ Scores of record: `evals/flagship/STATUS.md` ("Falsifiability scores" table). Th
 
 ### 2.3 Oracles — external graders
 
-`evals/oracles/registry.json` catalogues 9 oracles; `evals/oracles/README.md` is the schema. Gate-type ranking: `differential > trace-diff > verdict > property > example`. Every `reference.independent` must be `true` — the reference never shares code or authorship with the implementation.
+`evals/oracles/registry.json` catalogues 10 oracles (the newest, `attack`, is the gate behind `hmd attack`: a 23-attack differential battery, 7 single-defect mutants, a reference written independently of the engine); `evals/oracles/README.md` is the schema. Gate-type ranking: `differential > trace-diff > verdict > property > example`. Every `reference.independent` must be `true` — the reference never shares code or authorship with the implementation.
 
 ```bash
 jq -r '.oracles | to_entries[] | "\(.key)\t\(.value.gate_type)"' evals/oracles/registry.json
@@ -329,6 +329,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-gate-run` | headless gate entrypoint for plain git hooks; persists `verdict.json` |
 | `heimdall-gate` | contract-consuming adapter (Token-Frugal Protocol v2) |
 | `heimdall-verdict` | print the repo's last gate result |
+| `heimdall-attack` | `hmd attack` (RP1): attack a target, answer PROVEN or DENIED with a counterexample as a `runhmd.verdict/1` document (`docs/schemas/runhmd.verdict.v1.json`, validated by `bin/lib/runhmd_schema.py`); the verdict comes from the falsifiable `attack` oracle gate, not the CLI. Non-TTY without `--yes` exits 3 |
 | `heimdall-stamp` | the branded hard-gate-block denial stamp |
 | `heimdall-selfscan` | shared push-integrity gate: gitleaks history + tree, identity allowlist |
 | `secret-scan` | gitleaks over staged changes |

@@ -2267,6 +2267,25 @@ case "${1:-}" in
     fi
     exec "$VERDICT_BIN" "$@"
     ;;
+  attack)
+    # `hmd attack` (RP1) -- "can I break this?": attack a target and answer PROVEN or DENIED with
+    # a counterexample, as a runhmd.verdict/1 JSON document (docs/schemas/runhmd.verdict.v1.json).
+    # Pass-through to bin/heimdall-attack; every arg is forwarded verbatim, so a routed run and a
+    # direct bin run are byte-identical. The verdict is computed by the `attack` oracle gate
+    # (evals/oracles/attack/run.sh, proven falsifiable by `bin/falsify attack`), not by the CLI.
+    # Exit: 0 PROVEN, 1 DENIED, 2 usage/config, 3 consent required (non-TTY without --yes),
+    # 4 budget cap, 5 infrastructure -- which is why a missing bin exits 5 here, not 1: 1 means
+    # DENIED. Without this arm `hmd attack` fell through to the Claude task-prompt path below and
+    # started an agent session; `npx runhmd <path>` (packages/runhmd) runs exactly `hmd attack <path>`.
+    shift
+    ATTACK_BIN="$PLUGIN_DIR/bin/heimdall-attack"
+    if [ ! -x "$ATTACK_BIN" ]; then
+      echo "  Error: heimdall-attack not found at $ATTACK_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 5
+    fi
+    exec "$ATTACK_BIN" "$@"
+    ;;
   sla)
     # Pass-through to heimdall-sla: the ⚠-class observation SLA auditor. The standing
     # rule is that a security_note / sensitive / ⚠ observation gets a verdict within
