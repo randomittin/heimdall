@@ -1,7 +1,7 @@
 {
   "schema": "fg.prereg-lock/1",
   "files": {
-    "PREREG.md": "d783ba220b6cb0cc7be9b08580dc5e57b9928aa58eae8b876f287d97f66a455c",
+    "PREREG.md": "3cb6d12e9dc70cc8389c8ee1995edec42fb41f5093c6d179f1585fd82e372610",
     "cases.json": "78767e9136800a516cd29ae0144fe1acd9ab25872eb6b27ea27ba9e2c0f3d628",
     "tasks/settlement-webhook/SPEC.md": "a0b93cd4cd04a574ff548e58d2e7ae37d9a4f18bd23d3c119d44086faa2746db",
     "tasks/settlement-webhook/base/golden.mjs": "9c9e60477a693a0448c66e631d9bc3e3dcbf39a7cefdf0dfa434b7bfc0ed8d9c",

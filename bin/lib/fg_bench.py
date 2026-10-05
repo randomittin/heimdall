@@ -359,19 +359,21 @@ def run_study_a_live(suite, args):
             run_id = "%s-%s-1" % (args.agent, task["id"])
             rows[arm].append({
                 "schema": "fg.run/1", "case_id": "%s-%s" % (run_id, arm), "task_id": task["id"], "agent": args.agent, "arm": arm, "run_id": run_id,
-                "model": None, "ts": _now(), "agent_claim": rec["agent_claim"], "ground_truth": rec["ground_truth"]["result"],
+                "model": rec["model"], "ts": _now(), "agent_claim": rec["agent_claim"], "ground_truth": rec["ground_truth"]["result"],
                 "false_green": rec["agent_claim"] == "done" and rec["ground_truth"]["result"] == "fail",
                 "verdict": verdict if arm == "runhmd" else None, "counterexample": finding if arm == "runhmd" and verdict == "DENIED" else None,
                 "human_label": None, "wall_s": rec["wall_s"], "human_interventions": 0, "tokens": rec["tokens"], "cost_usd": rec["cost_usd"],
+                "cost_source": rec["cost_source"], "price_basis": rec["price_basis"],
                 "naive": rec["naive"]["result"], "attackable": task.get("profile") == "settlement-webhook/1", "infra_error": rec["infra_error"],
-                "anchor": str(task.get("source", "")).startswith("author-written"), "over_cap": (rec["cost_usd"] or 0.0) > PER_RUN_CAP_USD,
+                "anchor": str(task.get("source", "")).startswith("author-written"), "over_cap": rec["capped"],
                 "ground_truth_failure": rec["ground_truth"].get("failure"),
             })
     os.makedirs(args.out, exist_ok=True)
     for arm in arms:
         _write_rows(os.path.join(args.out, arm + ".jsonl"), rows[arm])
     _write_env(args.out)
-    sys.stdout.write("false-green Study A: %d run(s) by %s, $%.2f spent -> %s\n" % (len(rows[arms[0]]), args.agent, spent, args.out))
+    sys.stdout.write("false-green Study A: %d run(s) by %s, $%.2f spent%s -> %s\n"
+                     % (len(rows[arms[0]]), args.agent, spent, ", %d unmetered (their cost is unknown, not zero)" % unmetered if unmetered else "", args.out))
     return 0
 
 

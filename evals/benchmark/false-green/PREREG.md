@@ -215,4 +215,55 @@ inputs examined are the existing attack oracle files, its fixtures and the RP4 a
 
 ## Amendments
 
-(none)
+### Amendment 1 (2026-10-05, before any Study A run exists): per-run cap mechanics
+
+Sections 1 to 13 are not edited. Section 8 fixes the per-run cap (US$2.00 or 30 minutes, killed and recorded
+as an infrastructure exclusion) but not how spend is measured while a run is live. This pins that before any
+Study A row exists. No Study B instrument, case, rate or decision rule changes, so section 11.5 requires no
+Study B re-run.
+
+1. **Live measurement.** The harness reads the agent's streamed output (claude-code runs with
+   `--output-format stream-json --verbose`) and sums the token usage of every distinct assistant message.
+   A message id is counted once however many events carry it, at the largest usage seen for it; where a
+   message lists `iterations` that add up to more than its top-level usage, those are counted. Each message
+   is priced at the published per-token prices of the model it names, from the table in point 4: cache reads,
+   5-minute cache writes and 1-hour cache writes have their own prices, and cache writes that the usage does
+   not split by duration are priced at the 1-hour rate. Fast mode doubles a message's price, US-only
+   inference adds 10% and a web search costs US$0.01, all as published. A model id that is not in the table
+   (after dropping a `[...]` suffix and an 8-digit date suffix) is priced at the highest value in every
+   column of the table, so an unknown model is killed early, never late. The figures are what the usage
+   costs at those list prices; whether the account is billed that amount (an API key) or not (a subscription
+   login) does not change what the cap measures.
+2. **Kill.** When that estimate, or the cost the agent itself reports if that is higher, reaches US$2.00, or
+   30 minutes of wall time have passed, the harness kills the agent's whole process group. claude-code is
+   also started with `--max-budget-usd 2.00`, the agent's own cap; whichever fires first ends the run. An
+   agent whose spend the harness cannot read (its meter raised) is killed too. If the harness itself fails or
+   is interrupted, the agent is killed first.
+3. **Record.** A run killed by the harness, stopped by the agent's own budget, or whose final cost (the
+   `total_cost_usd` the agent reports in its result when it reports one, else the estimate) is at or above
+   US$2.00 is an infrastructure exclusion under section 9, with its reason in the row (`per-run cap: ...`,
+   `agent timed out ...` or `spend could not be read ...`). It is listed, never re-run and never replaced. The
+   row's `cost_usd` is the agent's own total when present, else the estimate, and `cost_source` says which
+   (`agent-reported` or `estimated-from-usage`); `price_basis` says whether any message was priced by the
+   fallback. An agent that reports no usage at all is `unmetered`: only the 30-minute limit applies to it,
+   its `cost_usd` is null (never 0), and the harness says so on stderr and in its final line. The first model
+   any message names is recorded in `model`.
+4. **Prices** (US$ per million tokens), read on 2026-10-05 from Anthropic's published model pricing
+   (platform.claude.com/docs/en/about-claude/pricing). `test/false-green-agent-cap.test.sh` fails if
+   `bin/lib/fg_agent.py` holds any other value.
+
+| model id | input | 5m cache write | 1h cache write | cache read | output |
+|---|---|---|---|---|---|
+| claude-fable-5-1 | 10 | 12.5 | 20 | 0.25 | 50 |
+| claude-fable-5 | 10 | 12.5 | 20 | 1 | 50 |
+| claude-opus-5-5 | 4 | 5 | 8 | 0.2 | 20 |
+| claude-opus-5 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-opus-4-8 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-opus-4-7 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-opus-4-6 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-opus-4-5 | 5 | 6.25 | 10 | 0.5 | 25 |
+| claude-sonnet-5-5 | 2 | 2.5 | 4 | 0.2 | 10 |
+| claude-sonnet-5 | 2 | 2.5 | 4 | 0.2 | 10 |
+| claude-sonnet-4-6 | 3 | 3.75 | 6 | 0.3 | 15 |
+| claude-sonnet-4-5 | 3 | 3.75 | 6 | 0.3 | 15 |
+| claude-haiku-4-5 | 1 | 1.25 | 2 | 0.1 | 5 |
