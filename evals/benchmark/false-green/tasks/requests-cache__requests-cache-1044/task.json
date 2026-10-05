@@ -1,0 +1,40 @@
+{
+  "id": "requests-cache__requests-cache-1044",
+  "category": "bugfix",
+  "source": "https://github.com/requests-cache/requests-cache/issues/1044",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/requests-cache/requests-cache/pull/1080",
+  "repo": "requests-cache/requests-cache",
+  "license": "BSD-2-Clause",
+  "base_sha": "c7ab1375f0df12fedc53b7ce7888a204e180cfc6",
+  "merge_sha": "5ebb4b9a0c0c232691200820b6d9562669db5c17",
+  "test_paths": [
+    "tests/unit/test_cache_keys.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/requests-cache/requests-cache && git fetch -q --depth 1 --filter=blob:none origin c7ab1375f0df12fedc53b7ce7888a204e180cfc6 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\" --group dev"
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Support file-like objects for `data` argument in PUT and POST requests\n\n### The problem\r\nI'm trying to PUT a json file using CachedSession while reading in the file using open(). Curiously, the same call using vanilla requests works fine.\r\n\r\n### Expected behavior\r\nFile should upload successfully. \r\n\r\n### Steps to reproduce the behavior\r\n```python\r\nfrom requests_cache import CachedSession\r\nfrom functools import partial\r\n\r\ncached_sesh = CachedSession(backend=\"memory\")\r\nput = partial(cached_sesh.put, verify=False)\r\n\r\nwith open(\"a.json\", \"rb\") as f:\r\n    response = put(\r\n        url\r\n        headers={\r\n           ...\r\n        },\r\n        data=f,\r\n    )\r\n   # Results in an error\r\n```\r\n<details>\r\n<summary>Stacktrace</summary>\r\n<br>\r\n\r\nFile \"/home/b/.Environments/general/lib/python3.11/site-packages/requests_cache/session.py\", line 141, in put\r\n    return self.request('PUT', url, data=data, **kwargs)\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/home/b/.Environments/general/lib/python3.11/site-packages/requests_cache/session.py\", line 183, in request\r\n    return super().request(method, url, *args, headers=headers, **kwargs)  # type: ignore\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/home/b/.Environments/general/lib/python3.11/site-packages/requests/sessions.py\", line 589, in request\r\n    resp = self.send(prep, **send_kwargs)\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/home/b/.Environments/general/lib/python3.11/site-packages/requests_cache/session.py\", line 212, in send\r\n    self.cache.create_key(request, **kwargs), request, self.settings\r\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/home/b/.Environments/general/lib/python3.11/site-packages/requests_cache/backends/base.py\", line 127, in create_key\r\n    return key_fn(\r\n           ^^^^^^^\r\n  File \"/home/b/.Environments/general/lib/python3.11/site-packages/requests_cache/cache_keys.py\", line 71, in create_key\r\n    request = normalize_request(request, ignored_parameters)\r\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/home/b/.Environments/general/lib/python3.11/site-packages/requests_cache/cache_keys.py\", line 129, in normalize_request\r\n    norm_request.body = normalize_body(norm_request, ignored_parameters)\r\n                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/home/b/.Environments/general/lib/python3.11/site-packages/requests_cache/cache_keys.py\", line 168, in normalize_body\r\n    filtered_body = normalize_json_body(request.body, ignored_parameters)\r\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/home/b/.Environments/general/lib/python3.11/site-packages/requests_cache/cache_keys.py\", line 179, in normalize_json_body\r\n    if len(original_body) <= 2 or len(original_body) > MAX_NORM_BODY_SIZE:\r\n       ^^^^^^^^^^^^^^^^^^\r\n\r\n</details>\r\n\r\n\r\n### Workarounds\r\nUsing the vanilla requests for the PUT call works fine.\r\n\r\n### Environment\r\n- requests-cache version: `1.2.1` \r\n- Python version: `3.11`\r\n- Platform: `debian, arm64`\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "        32 passed"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "        34 passed"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "id": "Python-Markdown__markdown-1305",
+  "category": "bugfix",
+  "source": "https://github.com/Python-Markdown/markdown/issues/1305",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/Python-Markdown/markdown/pull/1348",
+  "repo": "Python-Markdown/markdown",
+  "license": "BSD-3-Clause",
+  "base_sha": "965c06c398a394b1da06651bb4ed62be7609a946",
+  "merge_sha": "dba80252f122da11b1d520a2aaee1ba8f553e3bc",
+  "test_paths": [
+    "tests/test_syntax/extensions/test_smarty.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/Python-Markdown/markdown && git fetch -q --depth 1 --filter=blob:none origin 965c06c398a394b1da06651bb4ed62be7609a946 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".[testing]\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: SmartyPants: Apostrophes at the start of leading contractions\n\nAs mentioned in the original project [here](https://daringfireball.net/projects/smartypants/#:~:text=or%20email%20client.-,ALGORITHMIC%20SHORTCOMINGS), \"SmartyPants will turn the apostrophe into an opening single-quote, when in fact it should be a closing one.\"\r\n\r\nThis is specifically presenting an issue for me when `smarty` collides with `abbr`. For instance, this code:\r\n\r\n```\r\nEach section of the editor controls an access group's ability to view, and actions within, the listed pages.\r\nSelect the checkboxes to allow the appropriate actions.\r\n\r\n*[access group]: Access groups allow admin users to<br>assign custom permissions to all<br>users assigned to that group.\r\n```\r\n\r\nis rendering like this:\r\n\r\n![image](https://user-images.githubusercontent.com/97999520/202307054-76b288f7-ed2e-4712-8f58-4d0d0b03b9d4.png)\r\n\r\nbecause when `access group` gets rendered by `abbr`, the `'` is no longer recognized as being mid-word and instead renders as a leading single quote for the possessive `s`.\r\n\r\nI've implemented a stopgap via javascript, but there are a lot of different contraction situations and it would be great to have a real fix.\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "1 failed, 9 passed in 0.10s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "10 passed in 0.07s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}
