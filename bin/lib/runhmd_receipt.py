@@ -188,8 +188,13 @@ class Signer:
         return "<Signer key_id=%s>" % self.key_id
 
 
+def signing_dir():
+    """$HEIMDALL_HOME/signing: where `hmd receipt keygen` writes by default (SIGNING.md's directory)."""
+    return os.path.join(_home(), "signing")
+
+
 def default_key_path():
-    return os.environ.get("RUNHMD_RECEIPT_KEY_FILE") or os.path.join(_home(), "signing", KEY_FILE)
+    return os.environ.get("RUNHMD_RECEIPT_KEY_FILE") or os.path.join(signing_dir(), KEY_FILE)
 
 
 def load_signer(path=None):

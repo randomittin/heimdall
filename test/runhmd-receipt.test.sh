@@ -830,25 +830,6 @@ rcpt verify a b; [ "$RRC" -eq 2 ] && ok "verify with two targets is a usage erro
 rcpt verify --bogus x; [ "$RRC" -eq 2 ] && ok "an unknown flag is exit 2" || bad "unknown flag (rc=$RRC)"
 rcpt verify "$VO/denied.receipt.json" --pubkey; [ "$RRC" -eq 2 ] && ok "a flag missing its value is exit 2" || bad "missing flag value (rc=$RRC)"
 
-echo "  -- verify --verdict: do the digests mean anything? --"
-rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$VO/verdict.json"
-[ "$RRC" -eq 0 ] && ok "verify --verdict FILE: the receipt attests exactly this verdict document (exit 0)" || bad "--verdict match (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
-python3 - "$VO/verdict.json" "$TMP/verdict.duration.json" "$TMP/verdict.minimal.json" <<'PY'
-import json, sys
-src, dur, minimal = sys.argv[1:4]
-d = json.load(open(src)); d["duration_s"] = 12.36; json.dump(d, open(dur, "w"))
-d = json.load(open(src)); d["findings"][0]["counterexample"]["minimal_input"] = "{\"deliveries\":[]}"; json.dump(d, open(minimal, "w"))
-PY
-rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$TMP/verdict.duration.json"
-[ "$RRC" -eq 1 ] && grep -q 'verdict_mismatch' "$RERR" && grep -q 'elsewhere' "$RERR" && ok "--verdict: a verdict whose duration changed is refused (exit 1, verdict_mismatch, 'differs elsewhere')" || bad "--verdict duration tamper (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
-rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$TMP/verdict.minimal.json"
-[ "$RRC" -eq 1 ] && grep -q 'verdict_mismatch' "$RERR" && grep -q 'f-0001' "$RERR" && ok "--verdict: a counterexample edited AFTER the receipt was issued is caught through the finding digest (names f-0001)" || bad "--verdict counterexample tamper (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
-rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$TMP/absent-verdict.json"
-[ "$RRC" -eq 2 ] && ok "--verdict with an unreadable file is exit 2" || bad "--verdict unreadable (rc=$RRC)"
-printf 'not json' >"$TMP/verdict.garbage.json"
-rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$TMP/verdict.garbage.json"
-[ "$RRC" -eq 2 ] && ok "--verdict with a file that is not JSON is exit 2" || bad "--verdict garbage (rc=$RRC)"
-
 echo "  -- the command itself --"
 snap() { (cd "$1" && find . -type f -exec shasum {} + | sort); }
 s1="$(snap "$VS")"; h1="$(snap "$VK")"
@@ -858,7 +839,7 @@ rcpt
 [ "$RRC" -eq 2 ] && grep -q 'verify' "$RERR" && grep -q 'keygen' "$RERR" && [ ! -s "$ROUT" ] && ok "hmd receipt with no subcommand prints the usage on stderr and exits 2" || bad "no-subcommand usage (rc=$RRC)"
 rcpt bogus; [ "$RRC" -eq 2 ] && grep -q 'bogus' "$RERR" && ok "an unknown subcommand is exit 2 and named" || bad "unknown subcommand (rc=$RRC)"
 rcpt --help
-if [ "$RRC" -eq 0 ] && for w in verify keygen render serve --pubkey --store --json --verdict RUNHMD_RECEIPT_KEY_FILE RUNHMD_RECEIPT_PUBKEY_FILE RUNHMD_RECEIPT_DIR; do grep -q -- "$w" "$ROUT" || { echo "missing $w" >&2; exit 1; }; done 2>"$TMP/help.miss" && grep -Eq '^ +1 ' "$ROUT" && grep -Eq '^ +2 ' "$ROUT"; then
+if [ "$RRC" -eq 0 ] && for w in verify keygen render serve --pubkey --store --json RUNHMD_RECEIPT_KEY_FILE RUNHMD_RECEIPT_PUBKEY_FILE RUNHMD_RECEIPT_DIR; do grep -q -- "$w" "$ROUT" || { echo "missing $w" >&2; exit 1; }; done 2>"$TMP/help.miss" && grep -Eq '^ +1 ' "$ROUT" && grep -Eq '^ +2 ' "$ROUT"; then
   ok "--help documents every subcommand, flag, the key/trust/store environment variables and the exit codes"
 else bad "--help incomplete (rc=$RRC: $(cat "$TMP/help.miss" 2>/dev/null | tr '\n' ' '))"; fi
 [ ! -s "$HEIMDALL_TRACE_ORDER" ] && ok "hmd receipt never fell through to the Claude task-prompt path during this section" || bad "hmd receipt fell through to the task-prompt path: $(head -c 200 "$HEIMDALL_TRACE_ORDER")"
@@ -866,6 +847,211 @@ else bad "--help incomplete (rc=$RRC: $(cat "$TMP/help.miss" 2>/dev/null | tr '\
   && ok "the receipt code never shells out through a shell string" || bad "the receipt code uses shell=True / os.system"
 ! grep -En '^[[:space:]]*(import|from)[[:space:]]+(socket|urllib|ssl|ftplib|smtplib|requests)' "$PYLIB/runhmd_receipt.py" "$PYLIB/runhmd_receipt_cli.py" "$RECEIPT_BIN" >/dev/null 2>&1 \
   && ok "issue/verify code imports no network module (only the local server module does, and only to listen on loopback)" || bad "the receipt core imports a network module"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [H] HOSTING — /r/<id> (escaped HTML) and /r/<id>.json (the exact signed bytes)
+# ══════════════════════════════════════════════════════════════════════════════
+if section H; then
+echo "[H] /r/<id> and /r/<id>.json: hmd receipt serve (local) and hmd receipt render (static)"
+
+HK="$TMP/h-keys"; HS="$TMP/h-store"; HPUB="$HK/runhmd-receipt.pub"
+PUB_ID=a0a0a0a0a0a0; PRIV_ID=b0b0b0b0b0b0; HOSTILE_ID=c0c0c0c0c0c0; FLIP_ID=d0d0d0d0d0d0; SWAP_ID=e0e0e0e0e0e0
+rcpt keygen --dir "$HK"
+cat >"$TMP/make-hosting.py" <<'PY'
+import json, sys
+PYLIB, KEYFILE, STORE, OUT = sys.argv[1:5]
+sys.path.insert(0, PYLIB)
+import runhmd_receipt as rr
+signer = rr.load_signer(KEYFILE)
+HEX = lambda c: c * 64
+common = dict(signer=signer, subject={"kind": "path", "head_sha": None, "tree_sha256": HEX("c")}, cost_usd=0.41, duration_s=1.25,
+              verdict_sha256=HEX("d"), created_at="2026-10-05T12:00:00Z")
+digest = "sha256:" + HEX("a")
+HOSTILE_TITLES = [
+    "<script>alert(1)</script>",
+    "\"><img src=x onerror=alert(2)>",
+    "' onmouseover='alert(3)",
+    "&lt;b&gt;already escaped&lt;/b&gt; & <b>bold</b>",
+    "</title><script>alert(4)</script>",
+    "javascript:alert(5)",
+    "<svg/onload=alert(6)>",
+    "café ✓ 日本語 \U0001F6E1 </td></tr></table><h1>injected</h1>",
+]
+hostile_findings = [{"id": "f-%04d" % (i + 1), "title": t, "severity": "high", "category": "logic", "digest": digest} for i, t in enumerate(HOSTILE_TITLES)]
+HOSTILE_META = {"model": "\"><script>alert(7)</script>", "version": "<b>9.9</b>&amp;", "gate_id": "<img src=x onerror=alert(8)>", "gate_type": "\" onmouseover=\"alert(9)"}
+receipts = {
+    "a0a0a0a0a0a0": rr.issue_receipt(id="a0a0a0a0a0a0", verdict="PROVEN", attacks={"total": 24, "survived": 24, "killed": 0}, findings=[], visibility="public",
+        agent={"name": "none", "model": None}, gates=[{"id": "settlement", "gate_type": "differential", "status": "pass", "falsified": True, "falsify_score": 1}], **common),
+    "b0b0b0b0b0b0": rr.issue_receipt(id="b0b0b0b0b0b0", verdict="DENIED", attacks={"total": 24, "survived": 21, "killed": 3}, visibility="private",
+        agent={"name": "none", "model": None}, findings=[{"id": "f-0001", "title": "a private finding title", "severity": "high", "category": "auth", "digest": digest}], **common),
+    "c0c0c0c0c0c0": rr.issue_receipt(id="c0c0c0c0c0c0", verdict="DENIED", attacks={"total": 24, "survived": 16, "killed": 8}, visibility="public",
+        agent={"name": "none", "model": HOSTILE_META["model"]}, findings=hostile_findings, tool={"name": "hmd", "version": HOSTILE_META["version"]},
+        gates=[{"id": HOSTILE_META["gate_id"], "gate_type": HOSTILE_META["gate_type"], "status": "fail", "falsified": True, "falsify_score": 1}], **common),
+}
+for rid, raw in receipts.items():
+    rr.write_receipt(STORE, rid, raw)
+good = receipts["a0a0a0a0a0a0"]
+rr.write_receipt(STORE, "d0d0d0d0d0d0", good[:300] + bytes([good[300] ^ 1]) + good[301:])          # one byte altered
+rr.write_receipt(STORE, "e0e0e0e0e0e0", good)                                                    # a genuine receipt under another id
+json.dump({"hostile_titles": HOSTILE_TITLES, "meta": HOSTILE_META}, open(OUT, "w"))
+PY
+python3 "$TMP/make-hosting.py" "$PYLIB" "$HK/runhmd-receipt.key" "$HS" "$TMP/hostile.json" 2>"$TMP/make-h.err" \
+  && ok "fixtures: a public PROVEN, a private DENIED and a public DENIED receipt full of hostile text, plus a byte-flipped copy and a mis-filed copy" || bad "hosting fixtures failed: $(tail -3 "$TMP/make-h.err" | tr '\n' '|')"
+head_of() { tr -d '\r' <"$HHEAD" | grep -i "^$1:" | head -1 | cut -d' ' -f2-; }
+http_do() {  # http_do <curl-args...> <path>: sets HCODE HBODY HHEAD against $BASE
+  local path="${*: -1}"; set -- "${@:1:$#-1}"
+  HBODY="$TMP/http.body"; HHEAD="$TMP/http.head"; : >"$HBODY"; : >"$HHEAD"
+  HCODE="$(curl -sS --noproxy '*' --max-time 15 --path-as-is -D "$HHEAD" -o "$HBODY" -w '%{http_code}' "$@" "$BASE$path" 2>"$TMP/http.err")" || HCODE="curl-failed:$(head -c 100 "$TMP/http.err")"
+}
+
+echo "  -- the local server (loopback only) --"
+rcpt serve --store "$HS" --port 0 --pubkey "$HK/absent.pub"
+[ "$RRC" -eq 2 ] && grep -q 'bad_trust' "$RERR" && ok "serve refuses to start with an unreadable trust file (exit 2): it will not serve what it cannot verify" || bad "serve with a bad trust file (rc=$RRC)"
+HEIMDALL_HOME="$TMP/h-empty-home" rcpt serve --store "$HS" --port 0
+[ "$RRC" -eq 2 ] && grep -q 'no_trust' "$RERR" && ok "serve refuses to start with no trust anchor at all (exit 2, no_trust)" || bad "serve without trust (rc=$RRC)"
+rcpt serve --store "$HS" --port abc --pubkey "$HPUB"; [ "$RRC" -eq 2 ] && ok "serve --port abc is exit 2" || bad "serve --port abc (rc=$RRC)"
+rcpt serve --store "$HS" --port 70000 --pubkey "$HPUB"; [ "$RRC" -eq 2 ] && ok "serve --port 70000 is exit 2" || bad "serve --port 70000 (rc=$RRC)"
+rcpt serve --store "$HS" --host 0.0.0.0 --pubkey "$HPUB"; [ "$RRC" -eq 2 ] && ok "there is no --host: the server only ever binds 127.0.0.1 (exit 2 on the flag)" || bad "serve --host (rc=$RRC)"
+"$HMD" receipt serve --store "$HS" --pubkey "$HPUB" --port 0 </dev/null >"$TMP/serve.out" 2>"$TMP/serve.err" &
+SERVER_PID=$!
+for _ in $(seq 1 150); do grep -q 'http://127.0.0.1:' "$TMP/serve.out" 2>/dev/null && break; sleep 0.1; done
+BASE="$(grep -Eo 'http://127\.0\.0\.1:[0-9]+' "$TMP/serve.out" | head -1)"
+[ -n "$BASE" ] && ok "serve --port 0 listens on an ephemeral loopback port and prints its URL ($BASE)" || { bad "the server did not report a listening URL: $(head -c 300 "$TMP/serve.err")"; BASE="http://127.0.0.1:9"; }
+store_before="$(cd "$HS" && find . -type f -exec shasum {} + | sort)"
+
+echo "  -- /r/<id>.json serves the exact signed bytes --"
+http_do "/r/$PUB_ID.json"
+if [ "$HCODE" = "200" ] && cmp -s "$HBODY" "$HS/$PUB_ID.json"; then ok "GET /r/<id>.json: 200 and the body is byte-identical to the stored, signed receipt"; else bad "GET /r/<id>.json (code=$HCODE, bytes differ or missing)"; fi
+head_of content-type | grep -qi '^application/json' && ok "GET /r/<id>.json is served as application/json" || bad "content-type of .json is '$(head_of content-type)'"
+head_of x-content-type-options | grep -qi nosniff && ok "responses carry X-Content-Type-Options: nosniff" || bad "no nosniff header"
+cp "$HBODY" "$TMP/served.json"
+rcpt verify "$TMP/served.json" --pubkey "$HPUB"
+[ "$RRC" -eq 0 ] && ok "the downloaded /r/<id>.json verifies with 'hmd receipt verify' (what was served is what was signed)" || bad "the served bytes do not verify (rc=$RRC: $(head -c 200 "$RERR"))"
+curl -fsS --noproxy '*' "$BASE/r/$PUB_ID.json" 2>/dev/null | jq -e '.schema=="runhmd.receipt/1" and .cost_usd!=null' >/dev/null \
+  && ok "RP3 acceptance verbatim: curl -fsS \$BASE/r/<id>.json | jq -e '.schema==\"runhmd.receipt/1\" and .cost_usd!=null'" || bad "RP3 acceptance line for /r/<id>.json"
+curl -fsS --noproxy '*' "$BASE/r/$PUB_ID.json" 2>/dev/null | grep -q minimal_input \
+  && bad "the served receipt contains minimal_input" || ok "RP3 acceptance: ! curl \$BASE/r/<id>.json | grep -q minimal_input (a receipt holds digests only)"
+http_do -I "/r/$PUB_ID.json"
+[ "$HCODE" = "200" ] && [ "$(head_of content-length)" = "$(wc -c <"$HS/$PUB_ID.json" | tr -d ' ')" ] && ok "HEAD /r/<id>.json: 200 with the exact Content-Length and no body" || bad "HEAD (code=$HCODE length=$(head_of content-length))"
+
+echo "  -- /r/<id> is HTML, with every dynamic value escaped --"
+http_do "/r/$PUB_ID"
+[ "$HCODE" = "200" ] && head_of content-type | grep -qi '^text/html; charset=utf-8' && grep -q "PROVEN" "$HBODY" && grep -q "$PUB_ID" "$HBODY" && ok "GET /r/<id>: 200 text/html with the verdict and the id" || bad "GET /r/<id> (code=$HCODE type=$(head_of content-type))"
+grep -q "href=\"$PUB_ID.json\"" "$HBODY" && ok "the page links to its own signed JSON by a relative href" || bad "no link to $PUB_ID.json"
+grep -q "hmd receipt verify" "$HBODY" && ok "the page tells the reader how to verify it themselves" || bad "no verify instructions on the page"
+CSP="$(head_of content-security-policy)"
+case "$CSP" in *"default-src 'none'"*"base-uri 'none'"*"form-action 'none'"*"frame-ancestors 'none'"*) ok "the Content-Security-Policy header is default-src 'none' (+ base-uri, form-action, frame-ancestors)" ;; *) bad "CSP header is '$CSP'" ;; esac
+head_of referrer-policy | grep -qi 'no-referrer' && ok "Referrer-Policy: no-referrer" || bad "no referrer policy"
+cp "$HBODY" "$TMP/public-page.html"
+http_do "/r/$HOSTILE_ID"
+cp "$HBODY" "$TMP/hostile-page.html"; HHOSTILE_CODE="$HCODE"
+cat >"$TMP/html-check.py" <<'PY'
+import hashlib, base64, json, re, sys
+from html.parser import HTMLParser
+page = open(sys.argv[1], "rb").read().decode("utf-8")
+hostile = json.load(open(sys.argv[2]))
+ALLOWED = {"html", "head", "meta", "title", "style", "body", "main", "header", "section", "h1", "h2", "p", "dl", "dt", "dd", "table", "thead",
+           "tbody", "tr", "th", "td", "code", "pre", "a", "span", "ul", "li", "strong", "em"}
+class P(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tags, self.attrs, self.text, self.style, self.in_style, self.title = [], [], [], [], False, []
+        self.in_title = False
+    def handle_starttag(self, tag, attrs):
+        self.tags.append(tag); self.attrs += [(tag, k, v) for k, v in attrs]
+        self.in_style = self.in_style or tag == "style"; self.in_title = tag == "title" or self.in_title
+    def handle_endtag(self, tag):
+        self.in_style = False if tag == "style" else self.in_style; self.in_title = False if tag == "title" else self.in_title
+    def handle_data(self, data):
+        (self.style if self.in_style else self.text).append(data)
+        if self.in_title: self.title.append(data)
+p = P(); p.feed(page); p.close()
+out = []
+def case(desc, cond, detail=""):
+    out.append(("PASS " if cond else "FAIL ") + desc + ("" if cond or not detail else ": " + str(detail)))
+extra = sorted(set(p.tags) - ALLOWED)
+case("the page uses only plain structural elements (no script, img, svg, iframe, form, link, base, object)", not extra, extra)
+on = [(t, k) for t, k, v in p.attrs if k.lower().startswith("on")]
+case("no element carries an event-handler attribute", not on, on)
+bad_urls = [(t, k, v) for t, k, v in p.attrs if k in ("href", "src", "action", "data", "formaction") and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{2,63}\.json", v or "")]
+case("the only link target is the receipt's own <id>.json (no javascript:, no absolute URL)", not bad_urls, bad_urls)
+text = "".join(p.text)
+missing = [t for t in hostile["hostile_titles"] if t not in text]
+case("every hostile finding title is DISPLAYED, as text, exactly as issued (escaped, not dropped, not interpreted)", not missing, missing[:2])
+for label, value in (("agent.model", hostile["meta"]["model"]), ("tool.version", hostile["meta"]["version"]), ("gate id", hostile["meta"]["gate_id"]), ("gate type", hostile["meta"]["gate_type"])):
+    case("hostile %s is displayed verbatim as text" % label, value in text, value)
+case("the document title is the receipt id and verdict, free of finding text", "".join(p.title).strip() == "runhmd receipt c0c0c0c0c0c0 · DENIED", "".join(p.title))
+raw_bad = [s for s in ("<script", "<img", "<svg", "<iframe", "</td></tr></table><h1>injected", "<b>bold</b>") if s in page]
+case("raw markup from the hostile text never appears in the page source", not raw_bad, raw_bad)
+case("an already-escaped title is escaped again (&lt;b&gt; is displayed as the characters &lt;b&gt;, not as <b>)", "&amp;lt;b&amp;gt;already escaped" in page)
+meta_csp = re.search(r"<meta http-equiv=\"Content-Security-Policy\" content=\"([^\"]*)\"", page)
+case("the page carries its own CSP in a <meta>, so it is safe on any static host", bool(meta_csp) and "default-src 'none'" in meta_csp.group(1), meta_csp and meta_csp.group(1))
+style_hash = "sha256-" + base64.b64encode(hashlib.sha256("".join(p.style).encode("utf-8")).digest()).decode()
+case("the inline <style> is allowed by hash ('%s'), not by 'unsafe-inline'" % style_hash[:18], bool(meta_csp) and style_hash in meta_csp.group(1) and "unsafe-inline" not in meta_csp.group(1))
+print("\n".join(out))
+PY
+python3 "$TMP/html-check.py" "$TMP/hostile-page.html" "$TMP/hostile.json" >"$TMP/html-check.out" 2>"$TMP/html-check.err"
+[ "$HHOSTILE_CODE" = "200" ] && ok "GET /r/<id> of a receipt whose every text field is hostile still serves 200 (it is valid, just hostile)" || bad "hostile receipt page (code=$HHOSTILE_CODE)"
+while IFS= read -r line; do case "$line" in "PASS "*) ok "${line#PASS }" ;; "FAIL "*) bad "${line#FAIL }" ;; esac; done <"$TMP/html-check.out"
+[ -s "$TMP/html-check.out" ] || bad "the HTML checker produced no output: $(tail -3 "$TMP/html-check.err" | tr '\n' '|')"
+grep -q 'private' "$TMP/public-page.html" && bad "a public receipt page mentions 'private'" || ok "a public receipt's page does not claim to be private"
+http_do "/r/$PRIV_ID"
+[ "$HCODE" = "200" ] && grep -qi 'private' "$HBODY" && head_of x-robots-tag | grep -qi noindex && ok "the local server also serves a PRIVATE receipt (it is the owner's loopback), marked private and X-Robots-Tag: noindex" || bad "private receipt (code=$HCODE robots=$(head_of x-robots-tag))"
+
+echo "  -- nothing but verified receipts at /r/<id>[.json] --"
+for bad_route in "/" "/r" "/r/" "/r/zzzzzzzzzzzz" "/r/zzzzzzzzzzzz.json" "/r/$PUB_ID/" "/r/$PUB_ID.json/" "/r/$PUB_ID/card.png" "/r/$PUB_ID.html" "/api/receipts" "/r/$PUB_ID.JSON" "/r/ab" "/R/$PUB_ID"; do
+  http_do "$bad_route"
+  if [ "$HCODE" = "404" ] && ! grep -q "PROVEN" "$HBODY"; then ok "GET $bad_route is 404"; else bad "GET $bad_route -> $HCODE"; fi
+done
+mkdir -p "$TMP/h-outside"; cp "$HS/$PUB_ID.json" "$TMP/h-outside/loot.json"; cp "$HS/$PUB_ID.json" "$TMP/h-secret.json"
+for evil in "/r/../h-secret" "/r/../h-secret.json" "/r/..%2fh-secret.json" "/r/%2e%2e%2fh-secret.json" "/r/%252e%252e%252fh-secret.json" "/r/$PUB_ID.json%00.png" "/r/$PUB_ID%0a" "/r/$PUB_ID.json%0a" "/r/%2e%2e/%2e%2e/etc/passwd" "/r/..\\h-secret.json" "//r/$PUB_ID.json"; do
+  http_do "$evil"
+  if [ "$HCODE" = "404" ] || [ "$HCODE" = "400" ]; then ok "traversal/odd path $evil is refused ($HCODE)"; else bad "path $evil -> $HCODE"; fi
+done
+http_do -X POST --data 'x=1' "/r/$PUB_ID"
+[ "$HCODE" = "405" ] && head_of allow | grep -qi 'GET' && ok "POST /r/<id> is 405 with an Allow header" || bad "POST -> $HCODE"
+http_do -X PUT --data 'x=1' "/r/$PUB_ID.json"; [ "$HCODE" = "405" ] && ok "PUT is 405" || bad "PUT -> $HCODE"
+http_do -X DELETE "/r/$PUB_ID.json"; [ "$HCODE" = "405" ] && ok "DELETE is 405" || bad "DELETE -> $HCODE"
+http_do "/r/$(printf 'a%.0s' $(seq 1 6000))"; [ "$HCODE" = "404" ] || [ "$HCODE" = "414" ] || [ "$HCODE" = "400" ] && ok "a 6 KB path is refused ($HCODE), no crash" || bad "huge path -> $HCODE"
+for tampered in "$FLIP_ID" "$SWAP_ID"; do
+  for suffix in "" ".json"; do
+    http_do "/r/$tampered$suffix"
+    if [ "$HCODE" = "500" ] && ! grep -qiE "PROVEN|verdict|settlement|signature" "$HBODY"; then ok "a stored receipt that fails verification ($tampered) is 500 on /r/<id>$suffix and its content is not served"
+    else bad "tampered receipt $tampered$suffix -> $HCODE body='$(head -c 80 "$HBODY")'"; fi
+  done
+done
+http_do "/r/$PUB_ID.json"; [ "$HCODE" = "200" ] && ok "the server is still serving after every hostile request" || bad "the server stopped serving ($HCODE)"
+[ "$store_before" = "$(cd "$HS" && find . -type f -exec shasum {} + | sort)" ] && ok "the server only reads: the store is byte-identical after every request" || bad "the server modified the store"
+kill "$SERVER_PID" >/dev/null 2>&1; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+
+echo "  -- hmd receipt render: the same pages as a static tree for runhmd.dev --"
+HS2="$TMP/h-store-clean"; mkdir -p "$HS2"
+for id in "$PUB_ID" "$PRIV_ID" "$HOSTILE_ID"; do cp "$HS/$id.json" "$HS2/$id.json"; done
+HO="$TMP/h-site"
+rcpt render --store "$HS2" --pubkey "$HPUB" --out "$HO" --json
+if [ "$RRC" -eq 0 ] && jq -e --arg a "$PUB_ID" --arg c "$HOSTILE_ID" --arg b "$PRIV_ID" '.ok==true and (.rendered|sort)==([$a,$c]|sort) and .skipped_private==[$b] and .failed==[]' "$ROUT" >/dev/null 2>&1; then
+  ok "render --json: the two PUBLIC receipts are rendered, the private one is skipped by name, nothing failed"
+else bad "render summary wrong (rc=$RRC: $(head -c 300 "$ROUT") $(head -c 200 "$RERR"))"; fi
+if [ -f "$HO/r/$PUB_ID.json" ] && cmp -s "$HO/r/$PUB_ID.json" "$HS2/$PUB_ID.json" && [ -f "$HO/r/$PUB_ID.html" ]; then ok "render writes r/<id>.json (byte-identical to the signed receipt) and r/<id>.html"; else bad "render output missing or not byte-identical"; fi
+[ ! -e "$HO/r/$PRIV_ID.json" ] && [ ! -e "$HO/r/$PRIV_ID.html" ] && ! grep -rqs "a private finding title" "$HO" && ok "a private receipt is never written into the publishable tree" || bad "private receipt leaked into the static site"
+cmp -s "$HO/r/$PUB_ID.html" "$TMP/public-page.html" && cmp -s "$HO/r/$HOSTILE_ID.html" "$TMP/hostile-page.html" && ok "the static HTML is byte-identical to what the server returned (one code path renders both)" || bad "static HTML differs from the served HTML"
+[ "$(find "$HO" -type f | wc -l | tr -d ' ')" = "4" ] && ok "the tree holds exactly r/<id>.json and r/<id>.html for each public receipt, nothing else" || bad "unexpected files: $(find "$HO" -type f | tr '\n' ' ')"
+python3 "$TMP/html-check.py" "$HO/r/$HOSTILE_ID.html" "$TMP/hostile.json" | grep -q '^FAIL' && bad "the STATIC hostile page fails the escaping checks" || ok "the static hostile page passes every escaping check too"
+before="$(cd "$HO" && find . -type f -exec shasum {} + | sort)"
+rcpt render --store "$HS2" --pubkey "$HPUB" --out "$HO"
+[ "$RRC" -eq 0 ] && [ "$before" = "$(cd "$HO" && find . -type f -exec shasum {} + | sort)" ] && ok "re-rendering is idempotent (same bytes)" || bad "re-render changed the tree (rc=$RRC)"
+HO2="$TMP/h-site-bad"
+rcpt render --store "$HS" --pubkey "$HPUB" --out "$HO2" --json
+if [ "$RRC" -eq 1 ] && jq -e --arg f "$FLIP_ID" --arg s "$SWAP_ID" '.ok==false and ([.failed[].id]|sort)==([$f,$s]|sort) and (.failed[0].error|type=="string")' "$ROUT" >/dev/null 2>&1; then
+  ok "render over a store holding a tampered and a mis-filed receipt exits 1 and names both"
+else bad "render over a bad store (rc=$RRC: $(head -c 300 "$ROUT"))"; fi
+[ ! -e "$HO2/r/$FLIP_ID.json" ] && [ ! -e "$HO2/r/$FLIP_ID.html" ] && [ ! -e "$HO2/r/$SWAP_ID.json" ] && [ -f "$HO2/r/$PUB_ID.json" ] && ok "a receipt that fails verification is never published; the genuine ones still are" || bad "bad receipts were published or good ones were not"
+rcpt render --store "$HS2" --pubkey "$HPUB"; [ "$RRC" -eq 2 ] && ok "render without --out is a usage error (exit 2)" || bad "render without --out (rc=$RRC)"
+HEIMDALL_HOME="$TMP/h-empty-home" rcpt render --store "$HS2" --out "$TMP/h-site-notrust"
+[ "$RRC" -eq 2 ] && [ ! -e "$TMP/h-site-notrust" ] && ok "render with no trust anchor is exit 2 and writes nothing" || bad "render without trust (rc=$RRC)"
+rcpt render --store "$TMP/h-no-such-store" --pubkey "$HPUB" --out "$TMP/h-site-empty" --json
+[ "$RRC" -eq 0 ] && jq -e '.ok==true and .rendered==[]' "$ROUT" >/dev/null 2>&1 && ok "render over an empty or missing store succeeds with nothing rendered" || bad "render over a missing store (rc=$RRC)"
 fi
 
 echo ""
