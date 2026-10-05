@@ -164,11 +164,20 @@ def issue(repo, n, prs):
     return {"url": "https://github.com/acme/%s/issues/%d" % (repo, n), "title": "t", "closedByPullRequestsReferences": {"nodes": prs}}
 
 if "search/repositories" in a:
-    # the same two repositories answer every licence query: a repository found under several stays once
-    print(json.dumps({"items": [{"full_name": "acme/alpha"}, {"full_name": "acme/beta"}]}))
+    # the same repositories answer every licence query: a repository found under several stays once
+    items = [{"full_name": "acme/alpha"}, {"full_name": "acme/beta"}] + ([{"full_name": "acme/boom"}] if os.environ.get("STUB_GH_BOOM") else [])
+    print(json.dumps({"items": items}))
     sys.exit(0)
 if "graphql" in a:
+    # the real gh turns -F values that look like numbers, booleans or null into non-strings: owner and name must go as -f
+    for i, x in enumerate(a):
+        if x == "-F" and i + 1 < len(a) and a[i + 1].split("=", 1)[0] in ("owner", "name"):
+            sys.stderr.write("gh: Variable $%s of type String! was provided invalid value\n" % a[i + 1].split("=", 1)[0])
+            sys.exit(1)
     name = [x for x in a if x.startswith("name=")][0].split("=", 1)[1]
+    if name == "boom":
+        sys.stderr.write("gh: Could not resolve to a Repository with the name 'acme/boom'.\n")
+        sys.exit(1)
     empty = {"nodes": []}
     if name == "alpha":
         shared = pr(11)
@@ -222,6 +231,15 @@ t("the header records the counts and why issues were dropped", "pool: 2 reposito
 t("the header records when and with what it ran", "harvested: 20" in joined and "gh version 0.0.0-test" in joined)
 t("harvest --max-repos limits the pool (a trial run)", quiet(fg_taskgen.harvest, os.path.join(tmp, "trial.txt"), max_repos=1) == 0 and
   [c["issue"] for c in fg_taskgen.parse_candidates(open(os.path.join(tmp, "trial.txt")).read())] == ["https://github.com/acme/alpha/issues/1", "https://github.com/acme/alpha/issues/4"])
+
+# one repository that cannot be queried is recorded and skipped, not fatal and not silent
+os.environ["STUB_GH_BOOM"] = "1"
+boom = os.path.join(tmp, "boom.txt")
+t("a repository that cannot be queried does not stop the harvest", quiet(fg_taskgen.harvest, boom) == 0)
+boom_text = open(boom, encoding="utf-8").read()
+t("and the candidates are unchanged", [c["issue"] for c in fg_taskgen.parse_candidates(boom_text)] == [c["issue"] for c in cands])
+t("and the header names it and the reason", "could not be queried: 1 (acme/boom: " in boom_text and "Could not resolve to a Repository" in boom_text, boom_text[-700:])
+del os.environ["STUB_GH_BOOM"]
 
 os.environ["STUB_GH_FAIL"] = "1"
 try:
