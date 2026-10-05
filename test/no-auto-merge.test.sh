@@ -137,9 +137,12 @@ PRIM_TABLE = (
      r"\b(?:allow_auto_merge|enable_auto_merge|auto_merge|autoMerge|automerge|auto[- ]merg\w*|squash[- ]and[- ]merge|merge[- ]queue|merge[- ]when[- ]ready)\b",
      ("auto_merge", "automerge", "auto-merge", "auto merge", "squash", "merge queue", "merge-queue",
       "merge when", "merge-when"), "auto-merge, squash-and-merge, merge queue"),
+    # `x["merge"]` is a dict subscript, not an argv. A list literal's `[` is never glued to the end of an
+    # expression (a word character, `)` or `]`), so the verb-first alternative carries a lookbehind for that; and in
+    # the `["git", ...]` alternative "merge" must be a list element (after a comma), or `["git", "ls-tree", d["merge"]]` trips it.
     ("git-merge", "merge", "all",
-     r"\bgit\s+<G>merge(?=\s|$|<Q>)|\[\s*<Q>git<Q>\s*,[^\]\n]*<Q>merge<Q>|\[\s*<Q>merge<Q>\s*[,\]]",
-     ("merge",), "git merge (shell or argv form); merge-base/-tree/-file are not merges"),
+     r"\bgit\s+<G>merge(?=\s|$|<Q>)|\[\s*<Q>git<Q>\s*,(?:[^\]\n]*,)?\s*<Q>merge<Q>|(?<![\w)\]])\[\s*<Q>merge<Q>\s*[,\]]",
+     ("merge",), 'git merge (shell or argv form); merge-base/-tree/-file and a dict subscript like x["merge"] are not merges'),
     ("git-push", "push", "all",
      r"\bgit\s+<G>push\b|\[\s*<Q>git<Q>\s*,[^\]\n]*<Q>push<Q>|\[\s*<Q>push<Q>\s*[,\]]",
      ("push",), "git push (shell or argv form): publishes a ref, or main"),
@@ -211,6 +214,8 @@ POSITIVE = (
     ("auto-merge", "gh repo edit --enable-auto-merge"), ("auto-merge", "allow_auto_merge: true"),
     ("git-merge", "git merge --no-ff feature"), ("git-merge", 'git -C "$INTEG" merge --no-ff --no-commit "$SHA"'),
     ("git-merge", 'subprocess.run(["git", "merge", branch])'),
+    ("git-merge", 'subprocess.run(["git", "-C", repo, "merge", "--no-ff", branch])'),
+    ("git-merge", '_git(repo, ["merge", "--no-ff", ref])'), ("git-merge", "run_git(['merge'])"),
     ("git-push", "git push origin main"), ("git-push", "git push --force-with-lease origin HEAD"),
     ("git-push", 'git -C "$repo" push -q "$remote" "refs/heads/x:refs/heads/x"'),
     ("git-push", '_git(repo, ["push", "--force", "origin", ref])'),
@@ -251,6 +256,11 @@ NEGATIVE = (
     "Deploy command: [if known]", "If error NO LONGER appears in logs -> the fix was deployed and worked:",
     "Reap merged agent worktrees at the top of each sweep", 'run `alembic merge heads -m "merge"` to create a merge migration',
     "deploy history", "the release queue is empty", "Auto-update checks GitHub Releases for new signed versions.",
+    # a dict subscript is not an argv list: plain, chained, on a call result, single-quoted, and inside another git command's argv
+    'ident, label, path, merge = item["id"], item["label"], item["path"], item["merge"]',
+    'if switch == "merge" and entry["merge"] is not True:', 'return ",".join([c["issue"], c["pr"], c["merge"]])',
+    'evidence["merge"]["rc"] == 1', 'cfg["repo"]["merge"] or load()["merge"]', "label = row['merge'] or 'no'",
+    'run(["git", "-c", "core.quotePath=false", "ls-tree", "-r", "-z", cand["merge"], "--"] + paths)',
 )
 # Negation corpus: the primitive matches, and the clause logic must classify it NEGATION / must NOT.
 NEGATED = (
@@ -1305,6 +1315,13 @@ if [ "${1:-}" = "--self-test" ]; then
   expect_red "a GraphQL auto-merge mutation planted in relay/ (and the bot invariant fires)" "$RELAY_SRC" \
     'const q = "mutation { enablePullRequestAutoMerge(input: {pullRequestId: 1}) { clientMutationId } }";' "BOT|graphql-merge|$RELAY_SRC"
   expect_red "git push origin main planted in a sentinels script" sentinels/hmd-gate-event.sh 'git push origin main' 'UNCLASSIFIED|git-push|sentinels/hmd-gate-event.sh'
+  # a git merge in argv form is still a merge: excluding dict subscripts (`x["merge"]`) must not hide any of these shapes
+  expect_red "a git merge argv list planted in a Python lib" bin/lib/fg_verify.py \
+    'subprocess.run(["git", "merge", branch])' 'UNCLASSIFIED|git-merge|bin/lib/fg_verify.py'
+  expect_red "a git merge argv with the repo and options before the verb" bin/lib/fg_verify.py \
+    'subprocess.run(["git", "-C", repo, "merge", "--no-ff", branch])' 'UNCLASSIFIED|git-merge|bin/lib/fg_verify.py'
+  expect_red "a verb-first merge argv handed to a git helper" bin/lib/fg_verify.py \
+    '_git(repo, ["merge", "--no-ff", branch])' 'UNCLASSIFIED|git-merge|bin/lib/fg_verify.py'
   expect_red "a merge instruction planted in an agent definition" agents/coder.md 'When the tests are green, merge the PR yourself.' 'UNCLASSIFIED|p-merge|agents/coder.md'
   expect_red "a release instruction planted in an agent definition" agents/lint-quality.md 'When lint is clean, publish a release.' 'UNCLASSIFIED|p-release|agents/lint-quality.md'
   expect_red "a merge instruction planted in the maintainer guide (a bot surface)" skills/heimdall/references/maintainer-guide.md \
@@ -1329,6 +1346,11 @@ if [ "${1:-}" = "--self-test" ]; then
   expect_green "a merge verb inside a whole-line comment of a code file" bin/heimdall-verdict '# gh pr merge --auto 1   (documented as what NOT to run)'
   expect_green "an explicit negation in an instruction file" agents/coder.md 'You must never merge the PR yourself.'
   expect_green "git merge-base, which is not a merge" bin/heimdall-verdict 'git merge-base --is-ancestor main HEAD'
+  # a dict subscript is not an argv list (17 false UNCLASSIFIED hits in fg_verify.py, fg_taskgen.py and companion_remote_switches.py)
+  expect_green "a dict subscript x[\"merge\"] in a Python lib" bin/lib/fg_verify.py 'merged = cand["merge"] is not None'
+  expect_green "a chained subscript and a subscript on a call result" bin/lib/fg_verify.py 'merged = cfg["repo"]["merge"] or load()["merge"]'
+  expect_green "a dict subscript inside another git command's argv list" bin/lib/fg_verify.py \
+    'subprocess.run(["git", "ls-tree", "-r", "-z", cand["merge"], "--"])'
 
   echo "no-auto-merge --self-test: $PASSN passed, $FAILN failed."
   [ "$FAILN" -eq 0 ]
