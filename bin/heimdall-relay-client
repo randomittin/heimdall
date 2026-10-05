@@ -325,17 +325,20 @@ session key and passed the replay guard above. The `command` event stays action 
 READ-ONLY VIEWS (capability `view-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-cursor-parity.md CP5, the phone half in its
 src/views): `caps` also lists `view-v1` whenever bin/lib/companion_view.py imported. The phone's Files list seals
     {"action":"view","params":{"rid":"v-9","kind":"diff","scope":"worktree","path":"src/a.ts"|null,"ctx":3,"max_bytes":131072}}
+    {"action":"view","params":{"rid":"v-10","kind":"transcript","agent_id":"<roster id>"|null|absent,"tail":200}}
+    {"action":"view","params":{"rid":"v-12","kind":"pr"}}
 and hmd acks {"ok":true,"of_seq":N,"id":"v-9"} or {"ok":false,"of_seq":N,"detail":<code>[,"retry_after_s":N]} -- code one of
-caps-missing, controls-off, rate-limited, bad-params, not-implemented, not-allowed, not-found, too-large, timeout. The answer
-is state.views = {"v":1,"enabled":bool,"kinds":["diff"],"result":null|{id,kind,at,truncated,bytes,files,hunks}}, sealed with
+caps-missing, controls-off, rate-limited, bad-params, not-implemented (kind reel only), not-allowed, not-found, too-large,
+timeout. The answer is state.views = {"v":1,"enabled":bool,"kinds":["diff","transcript","pr"],"result":null|{id,kind,at,...
+the kind's own fields, listed in bin/lib/companion_view.py}}, sealed with
 the rest of the state and ONLY in the frames of a phone whose latest sealed resync listed `view-v1` (so only to the one paired
 device: the command itself opened under the latched session key); the newest result replaces the last, it is held in memory
 only, and it is dropped when the phone stops listing the cap or the device binds again. bin/lib/companion_view.py owns every
 rule (the path policy, the symlink refusal, the per-line secret mask, the size cuts, the 20/min limit, the kill switch
 HMD_UI_CONTROLS=0 / .heimdall/app/controls-disabled); this client owns the wire, and applies the relay's redaction profile
 (sentinels/hmd-ui.py _transport_redaction) to the result exactly as it is applied to the rest of the state. A request is
-answered whole on the stream thread (git is bounded to a few seconds), so there is never more than one in flight. The
-`command` event names the action only: never the path, never a line of the diff.
+answered whole on the stream thread (git is bounded to a few seconds, gh to 8), so there is never more than one in flight. The
+`command` event names the action only: never the path, never a line of a diff, a turn of a transcript or a pull request.
 
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
@@ -2019,8 +2022,14 @@ class RelayClient:
             redact, strip_root = UI._transport_redaction(self.transport, self.root)
             self._views = VIEW.ViewManager(self.root,
                                            redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None,
-                                           max_slice_bytes=MAX_ENVELOPE_BYTES * 3 // 8, on_change=self._rearm_state)
+                                           max_slice_bytes=MAX_ENVELOPE_BYTES * 3 // 8, on_change=self._rearm_state,
+                                           state=self._latest_state)
         return self._views
+
+    def _latest_state(self):
+        """The newest state the cache holds -- what the phone's last frame was built from -- or None before the cache exists.
+        A pull request's `gate` is read from it (quality_gate, sweep_receipt); a view never runs those collectors itself."""
+        return self.cache.latest()[0] if self.cache is not None else None
 
     def _view_command(self, params):
         """The phone's sealed `view` command (the contract is in companion_view.py): -> (ok, detail, extra) for the ack.
