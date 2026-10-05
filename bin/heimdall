@@ -3339,6 +3339,31 @@ if [[ "${1:-}" == "--setup" ]]; then
   exit 0
 fi
 
+# ── EXIT-trap cleanup, shared by both launch paths (the default launch and --resume) ──
+#
+# THE LAUNCHER'S EXIT STATUS IS CLAUDE'S, AND NOTHING THIS TRAP DOES MAY CHANGE IT.
+# A trap action runs under the script's own `set -e`, so a non-zero RETURN from it makes
+# errexit fire INSIDE the trap, and that status replaces the one being exited with. Each
+# trap used to end on
+#     [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ] && "$SKILL_MGR" restore "$RESTORE_FILE"
+# With no skill-manager (RESTORE_FILE empty) that list is false, so the function returned
+# 1 and EVERY run exited 1 — a successful `hmd "task"` and a claude that exited 3 alike —
+# and a `restore` that failed put its own status in the same place.
+#
+# So: capture the status at entry, keep every best-effort step status-neutral (`if … fi`
+# and `|| true`, never a trailing `a && b` whose false first test becomes the return
+# value), and `exit` with the captured status. One body serves both traps so the
+# invariant lives in one place. Proof: test/heimdall-unknown-command.test.sh section 9.
+#   $1  the temp preamble file this launch wrote
+_heimdall_launch_cleanup() {
+  local rc=$?
+  rm -f "$1" 2>/dev/null || true
+  if [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ]; then
+    "$SKILL_MGR" restore "$RESTORE_FILE" 2>/dev/null || true
+  fi
+  exit "$rc"
+}
+
 # --resume: continue the last Claude session AND load .planning/ state
 if [[ "${1:-}" == "--resume" || "${1:-}" == "-r" ]]; then
   ensure_node_path
@@ -3398,10 +3423,7 @@ except: pass
     RESTORE_FILE=$("$SKILL_MGR" restore-file)
   fi
 
-  cleanup_resume() {
-    rm -f "$RESUME_PREAMBLE_FILE"
-    [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ] && "$SKILL_MGR" restore "$RESTORE_FILE" 2>/dev/null
-  }
+  cleanup_resume() { _heimdall_launch_cleanup "$RESUME_PREAMBLE_FILE"; }
   trap cleanup_resume EXIT
 
   # SWITCH-only session-wide fallback routing (see apply_switch_fallback_env's
@@ -4774,10 +4796,7 @@ if [ -x "$SKILL_MGR" ]; then
   RESTORE_FILE=$("$SKILL_MGR" restore-file)
 fi
 
-cleanup() {
-  rm -f "$PREAMBLE_FILE"
-  [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ] && "$SKILL_MGR" restore "$RESTORE_FILE" 2>/dev/null
-}
+cleanup() { _heimdall_launch_cleanup "$PREAMBLE_FILE"; }
 trap cleanup EXIT
 
 # ── Launch boot animation (change #2, v2.0.3): the watchman wakes ──
