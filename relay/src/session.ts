@@ -291,8 +291,11 @@ function exceedsEnvelopeCap(message: string): boolean {
 }
 
 /**
- * How long hmd's `GET /stream` may sit idle before the relay writes a
- * `keepalive` control frame down it.
+ * How long hmd's NDJSON `GET /stream` may sit idle before the relay writes a
+ * `keepalive` control frame down it. NDJSON only: the WebSocket transport is
+ * never sent a keepalive — a timer would keep the object resident, which is the
+ * one thing that transport exists to avoid (hmd sends the text `ping` and the
+ * runtime answers `pong` without waking the object).
  *
  * Cloudflare closes a long-lived chunked response that carries no bytes:
  * observed live on 2026-09-24, a stream that opened at 08:33:53 with a bound
@@ -309,8 +312,10 @@ function exceedsEnvelopeCap(message: string): boolean {
 const KEEPALIVE_INTERVAL_MS = 20_000;
 
 /**
- * The upper bound on how long a single `GET /stream` response may live,
- * however healthy it looks.
+ * The upper bound on how long a single NDJSON `GET /stream` response may live,
+ * however healthy it looks. NDJSON only: a hibernatable WebSocket is
+ * re-delivered to the new generation after a deploy, so the orphaned stream
+ * below cannot happen to one, and a lifetime timer would pin the object.
  *
  * Observed live on 2026-09-25, and the failure `KEEPALIVE_INTERVAL_MS` above
  * made possible. A deploy rolls this Durable Object to a new generation.
@@ -349,6 +354,11 @@ function isValidDevicePubkey(value: string | null): value is string {
 }
 
 export class SessionDO {
+  // The four fields below are hmd's NDJSON transport and nothing else. An hmd
+  // WebSocket keeps no state on the instance at all: which socket is newest and
+  // which session it belongs to are re-derived from `ctx.getWebSockets(HMD_TAG)`
+  // and each socket's attachment on every use (see DeviceSocketAttachment), and
+  // no timer is ever armed for one.
   private hmdStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
   // Bumped once per `GET /stream`, so a stream's own `cancel()` can tell
   // whether it is still the live one before tearing down shared state — a
@@ -370,7 +380,15 @@ export class SessionDO {
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly env: Env
-  ) {}
+  ) {
+    // hmd's liveness probe on its WebSocket leg: it sends the text `ping`, and
+    // the runtime answers `pong` itself, without waking a hibernated object — so
+    // NAT and proxy state stay warm, and a missing pong tells hmd the socket is
+    // dead, at no Durable Object duration. It applies to every socket this
+    // object holds, the phone's included, which never sends it. Set on every
+    // construction because a woken instance is a new one.
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -533,16 +551,57 @@ export class SessionDO {
     return parsed;
   }
 
-  /** The single writer for hmd's `GET /stream`. Returns false when the line
-   * could not be delivered: no stream open, or a controller the runtime has
-   * already torn down. That second case is the real one — Cloudflare can
-   * close a long-lived chunked response without the stream's `cancel()` ever
-   * running, leaving a controller whose `enqueue` throws; before this, that
-   * throw escaped `webSocketMessage` and took the phone's frame with it. A
-   * failed write drops the stale controller so the next `/stream` starts
-   * clean, and deliberately does not re-arm the keepalive (nothing to write
-   * to). A successful one restarts the idle timer, so a stream carrying real
-   * frames never pays for a keepalive it does not need. */
+  /**
+   * "To hmd, by whatever transport is live": the one writer every caller that
+   * means "send hmd this" uses — the phone's command in `webSocketMessage`, the
+   * `device_bound` in `deliverToHmdStream`, the `session_ended` in
+   * `endHmdStream`. `line` is an NDJSON line, trailing "\n" included, because
+   * that is how every frame is built and how the held `device_bound` is stored;
+   * an hmd WebSocket is sent it as one message without that newline.
+   *
+   * Newest wins across both transports, and a transport swap is synchronous (see
+   * handleStream and acceptHmdSocket), so at most one is ever live: the newest
+   * OPEN hmd socket if there is one, else the NDJSON controller. Returns false
+   * when nothing could be written to, and the caller says what that means (a
+   * dropped phone frame is logged, a `device_bound` is held for the next
+   * connection).
+   *
+   * Never arms a timer: a write to a WebSocket leaves nothing pending, which is
+   * what lets the object hibernate with hmd connected. Only the NDJSON
+   * primitive below restarts its keepalive.
+   */
+  private writeToHmd(line: string): boolean {
+    const socket = this.liveSocket(HMD_TAG);
+    if (socket === undefined) return this.writeToHmdStream(line);
+    return this.sendToHmdSocket(socket, line);
+  }
+
+  /** One NDJSON line to one hmd socket, as the message it carries. A socket the
+   * runtime has already torn down throws on `send`; like `writeToHmdStream`,
+   * that is a non-delivery for the caller to act on, not an exception to take
+   * the caller's frame down with it. */
+  private sendToHmdSocket(socket: WebSocket, line: string): boolean {
+    try {
+      socket.send(lineToMessage(line));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The NDJSON-only primitive: one line to hmd's chunked `GET /stream`.
+   * Returns false when the line could not be delivered: no stream open, or a
+   * controller the runtime has already torn down. That second case is the real
+   * one — Cloudflare can close a long-lived chunked response without the
+   * stream's `cancel()` ever running, leaving a controller whose `enqueue`
+   * throws; before this, that throw escaped `webSocketMessage` and took the
+   * phone's frame with it. A failed write drops the stale controller so the
+   * next `/stream` starts clean, and deliberately does not re-arm the keepalive
+   * (nothing to write to). A successful one restarts the idle timer, so a
+   * stream carrying real frames never pays for a keepalive it does not need.
+   * Callers that mean "to hmd" use `writeToHmd`; this is for the paths that
+   * serve one specific stream — `handleStream`'s flush of the held frame, and
+   * the keepalive timer itself. */
   private writeToHmdStream(line: string): boolean {
     const controller = this.hmdStreamController;
     if (!controller) return false;
@@ -558,7 +617,7 @@ export class SessionDO {
     return true;
   }
 
-  /** Ends hmd's current `GET /stream` response, if any, and stops its
+  /** Ends hmd's current NDJSON `GET /stream` response, if any, and stops its
    * keepalive. Called when a reconnect supersedes an older stream and on
    * revoke — never on an ordinary drop, which leaves the session intact. */
   private closeHmdStream(): void {
@@ -575,11 +634,22 @@ export class SessionDO {
     }
   }
 
+  /** Closes every hmd WebSocket — `closeHmdStream`'s counterpart for the other
+   * transport. Re-derived from `getWebSockets`, never from a field: after a
+   * hibernation this instance has never seen the sockets it is closing. */
+  private closeHmdSockets(code: number, reason: string): void {
+    for (const socket of this.ctx.getWebSockets(HMD_TAG)) {
+      this.closeSocket(socket, code, reason);
+    }
+  }
+
   /**
-   * Ends hmd's `GET /stream` because the SESSION is over, and says why first
-   * (INV-38): a plaintext `session_ended` control frame — the shape
-   * `handleRevoke` already sends the phone, and one hmd's client already reads
-   * as terminal, logging `payload.reason` — then the close.
+   * Ends hmd's leg — an NDJSON stream or a WebSocket, whichever is attached —
+   * because the SESSION is over, and says why first (INV-38): a plaintext
+   * `session_ended` control frame — the shape `handleRevoke` already sends the
+   * phone, and one hmd's client already reads as terminal, logging
+   * `payload.reason` — then the close. A WebSocket gets the frame as a message,
+   * then close code 4001 / `"session ended"`.
    *
    * Before this, a session the relay ended closed hmd's stream with a bare
    * EOF, and the next thing hmd met was `404` from the purged record. On
@@ -590,12 +660,12 @@ export class SessionDO {
    * Not for a close that leaves the session alive — a superseding reconnect
    * and the stream-lifetime bound go through `closeHmdStream` alone, since
    * hmd is expected back — nor for `POST /revoke`, where hmd is the one ending
-   * it. With no stream attached there is nobody to tell: nothing is logged.
+   * it. With nothing attached there is nobody to tell: nothing is logged.
    */
   private endHmdStream(sessionId: string, reason: SessionEndReason): void {
-    if (this.hmdStreamController !== null) {
+    if (this.hmdStreamController !== null || this.liveSocket(HMD_TAG) !== undefined) {
       const payload: SessionEndedPayload = { reason };
-      const told = this.writeToHmdStream(
+      const told = this.writeToHmd(
         JSON.stringify({
           v: 1,
           session_id: sessionId,
@@ -610,6 +680,7 @@ export class SessionDO {
       logEvent("session_end_announced", { session_id: sessionId, reason, delivered: told });
     }
     this.closeHmdStream();
+    this.closeHmdSockets(CLOSE_SESSION_ENDED, "session ended");
   }
 
   /** (Re)starts the idle timer that writes the next `keepalive`. A no-op
