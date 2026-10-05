@@ -123,6 +123,21 @@ def heuristic_arm(rows):
     return out
 
 
+def candidate_polar_arm(rows):
+    """IN-SAMPLE what-if, NOT shipped code: the same detector with 'Want me to / Ready to / Done' openers added to
+    _POLAR_START_RE. Tuned after reading this dataset's misses, so it is an optimistic upper bound (overfit)."""
+    import re
+    import companion_ui_attention as cua
+    orig = cua._POLAR_START_RE
+    cua._POLAR_START_RE = re.compile(orig.pattern + r"|want\s+me\s+to\b|ready\s+to\b|done\b|"
+                                     r"(?:run|build|scan|start|make|keep|leave)\b", re.IGNORECASE)
+    try:
+        sub = [r for r in rows if r["kind"] == "question"]
+        return [int(cua._closed_polar_question(r["text"])) for r in sub], [r["label"] for r in sub]
+    finally:
+        cua._POLAR_START_RE = orig
+
+
 # ── typesafe arm ──────────────────────────────────────────────────────────────────────────────
 def typesafe_call(kind, text, key, base, model, timeout=30):
     body = json.dumps({"state": text, "model": model, "questions": {"q": QUESTIONS[kind]}}).encode()
@@ -244,7 +259,13 @@ def main():
     print("dataset: %d prompts (%d multi-part), %d questions (%d closed-polar)" % (
         sum(r["kind"] == "prompt" for r in rows), sum(r["kind"] == "prompt" and r["label"] for r in rows),
         sum(r["kind"] == "question" for r in rows), sum(r["kind"] == "question" and r["label"] for r in rows)))
-    result = {"heuristic": report_heuristic(heuristic_arm(rows))}
+    load1 = os.getloadavg()[0]
+    print("host load avg (1m): %.1f  (latency numbers are inflated when this is >> cpu count)" % load1)
+    result = {"host_load_1m": load1, "heuristic": report_heuristic(heuristic_arm(rows))}
+    cp, cy = candidate_polar_arm(rows)
+    cm = prf(cy, cp)
+    result["candidate_polar_in_sample"] = cm
+    print("[what-if/question, in-sample, overfit] %s" % fmt(cm))
     key = os.environ.get(KEY_ENV, "")
     if not (a.typesafe and key and a.accept_egress):
         why = [w for w, bad in (("%s not set (operator must supply)" % KEY_ENV, not key),
