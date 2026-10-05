@@ -67,6 +67,14 @@ their own team (sees only themselves) until they deliberately share or join.
   thereafter carry NO secret (membership is server-side).
 - **Don't hand-craft a secret.** Use `new` (mints 43-char base64url, 256-bit
   entropy). Never type a short or low-entropy secret.
+- **The commit is switchable.** In a repo `hmd` can prove is private, `new` / `share` /
+  `rotate` / `auto` also commit `team.json` (a local commit, never pushed) so a clone
+  auto-joins. `HMD_TEAM_NO_COMMIT=1` — or, persistently and machine-wide,
+  `touch ~/.heimdall/no-team-commit` — keeps `team.json` written and current on disk but
+  never stages or commits it (also honored by the wip checkpoints' blanket `git add -A`).
+  Offer it to a dev who wants the secret out of git history, and grow such a team with
+  `/hmd:invite`, since a clone no longer carries the file. A `team.json` that is already
+  tracked stays tracked until `git rm --cached .heimdall/team.json`. Details: `DATA.md`.
 
 ## Examples
 
