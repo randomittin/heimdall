@@ -19,6 +19,7 @@ import concurrent.futures
 import datetime
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -45,8 +46,10 @@ CATEGORIES = ("bugfix", "feature", "refactor", "concurrency", "security")
 ATTACK_BIN = os.path.join(PLUGIN, "bin", "heimdall-attack")
 NAIVE_TIMEOUT_S, ATTACK_TIMEOUT_S, GROUND_TRUTH_TIMEOUT_S = 30, 120, 200
 # PREREG.md section 8: a run is killed at $2.00 of spend or 30 minutes and recorded as an infrastructure
-# exclusion. How the spend is read while the run is live: PREREG.md Amendment 1, bin/lib/fg_agent.py.
+# exclusion. How the spend is read while the run is live, and the total cap that the operator set on all
+# Study A spend (2026-10-05) and the ledger that holds it: PREREG.md Amendment 1, bin/lib/fg_agent.py.
 PER_RUN_CAP_USD, RUN_TIMEOUT_S = 2.00, 1800
+TOTAL_CAP_USD, LEDGER_NAME = 180.00, "spend.ndjson"
 ENGINE_FILES = ("evals/oracles/attack/run.sh", "evals/oracles/attack/grade.mjs", "evals/oracles/attack/engine/battery.mjs",
                 "evals/oracles/attack/engine/harness.mjs", "evals/oracles/attack/reference/settlement.ref.mjs",
                 "bin/lib/runhmd_attack.py", "bin/heimdall-attack")
@@ -283,10 +286,12 @@ def plan_study_a(suite, args):
                      "  agent:      %s%s\n  arms:       %s (one agent run per task; every arm is scored on that run)\n"
                      "  runs:       %d\n  cost bound: $%.2f per run x %d = $%.2f at most; the runhmd arm adds $0.00 (offline engine)\n"
                      "  per-run cap: the agent is killed at $%.2f of spend or %d minutes and the run is an infrastructure exclusion (PREREG.md section 8, Amendment 1)\n"
+                     "  total cap:  $%.2f on all Study A spend across invocations, held against the ledger %s/%s; a run starts only while a whole per-run cap fits under it\n"
                      "  would write: %s/%s\n"
                      % ("DRY RUN" if not args.live else "LIVE", len(tasks), attackable, anchors, fg_summary.MIN_TASKS, fg_summary.MIN_AGENTS,
                         args.agent, note, ",".join(arms), len(tasks), PER_RUN_CAP_USD, len(tasks), PER_RUN_CAP_USD * len(tasks),
-                        PER_RUN_CAP_USD, RUN_TIMEOUT_S // 60, args.out, "{" + ",".join(a + ".jsonl" for a in arms) + "}"))
+                        PER_RUN_CAP_USD, RUN_TIMEOUT_S // 60, TOTAL_CAP_USD, args.out, LEDGER_NAME,
+                        args.out, "{" + ",".join(a + ".jsonl" for a in arms) + "}"))
     return 0
 
 
@@ -310,7 +315,46 @@ def _infra_error(run, meter, text, cap_usd, timeout_s):
     return None
 
 
-def _agent_once(path, task, template, cap_usd, timeout_s):
+class _Ledger:
+    """Append-only record of what every Study A agent run was counted at (PREREG.md Amendment 1, point 5).
+
+    It sits beside the result rows but is never rewritten: a restart replaces rows, not money already spent.
+    A run whose cost is unknown counts at the per-run cap, so an unmetered agent cannot hide spend.
+    """
+
+    def __init__(self, out, agent):
+        self.path, self.agent, self.spent = os.path.join(out, LEDGER_NAME), agent, 0.0
+        if os.path.isfile(self.path):
+            with open(self.path, "r", encoding="utf-8") as fh:
+                for number, line in enumerate(fh, start=1):
+                    if line.strip():
+                        self.spent += self._counted(line, number)
+
+    def _counted(self, line, number):
+        try:
+            counted = float(json.loads(line)["counted_usd"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError("%s line %d: %s" % (self.path, number, exc))
+        if not (math.isfinite(counted) and counted >= 0):
+            raise ValueError("%s line %d: counted_usd is not a non-negative number" % (self.path, number))
+        return counted
+
+    def record(self, task_id, meter):
+        counted = meter.cost_usd if meter.cost_usd is not None else PER_RUN_CAP_USD
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": _now(), "agent": self.agent, "task_id": task_id, "cost_usd": meter.cost_usd,
+                                 "cost_source": meter.cost_source, "counted_usd": counted}, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        self.spent += counted
+
+    def has_room(self):
+        """A run starts only while a whole per-run cap still fits under the total cap."""
+        return TOTAL_CAP_USD - self.spent >= PER_RUN_CAP_USD
+
+
+def _agent_once(path, task, template, cap_usd, timeout_s, ledger):
     """One supervised agent run in a fresh workspace; returns the per-run record that becomes the result rows."""
     work = tempfile.mkdtemp(prefix="fg-agent-")
     try:
@@ -318,7 +362,10 @@ def _agent_once(path, task, template, cap_usd, timeout_s):
             shutil.copy(os.path.join(path, name), work)
         meter = fg_agent.Meter()
         command = [part.replace("{prompt}", task["prompt"]).replace("{budget}", "%.2f" % cap_usd) for part in template]
-        run = fg_agent.supervise(command, work, meter, cap_usd, timeout_s)
+        try:
+            run = fg_agent.supervise(command, work, meter, cap_usd, timeout_s)
+        finally:
+            ledger.record(task["id"], meter)       # the spend is on the ledger even if the harness dies in the next line
         text = meter.final_text if meter.final_text is not None else run.stdout
         infra = _infra_error(run, meter, text, cap_usd, timeout_s)
         record = {"agent_claim": _claim_of(text), "wall_s": round(run.elapsed_s, 2), "tokens": meter.tokens, "cost_usd": meter.cost_usd,
@@ -337,43 +384,68 @@ def _agent_once(path, task, template, cap_usd, timeout_s):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _not_run(reason):
+    """The record of a task that was never started, so the summary lists it as excluded instead of losing it."""
+    return {"agent_claim": None, "wall_s": 0.0, "tokens": {"in": None, "out": None}, "cost_usd": 0.0, "cost_source": "not-run", "price_basis": None,
+            "model": None, "infra_error": reason, "capped": False, "naive": {"result": None}, "runhmd": {"result": None}, "ground_truth": {"result": None}}
+
+
+def _study_a_rows(agent, arms, task, rec):
+    """The result rows of one run, one per arm, sharing the run and its run_id (PREREG.md section 5)."""
+    verdict = rec["runhmd"]["result"] if rec["runhmd"]["result"] in ("PROVEN", "DENIED") else None
+    finding = (rec["runhmd"].get("findings") or [{}])[0].get("title")
+    run_id = "%s-%s-1" % (agent, task["id"])
+    return {arm: {
+        "schema": "fg.run/1", "case_id": "%s-%s" % (run_id, arm), "task_id": task["id"], "agent": agent, "arm": arm, "run_id": run_id,
+        "model": rec["model"], "ts": _now(), "agent_claim": rec["agent_claim"], "ground_truth": rec["ground_truth"]["result"],
+        "false_green": rec["agent_claim"] == "done" and rec["ground_truth"]["result"] == "fail",
+        "verdict": verdict if arm == "runhmd" else None, "counterexample": finding if arm == "runhmd" and verdict == "DENIED" else None,
+        "human_label": None, "wall_s": rec["wall_s"], "human_interventions": 0, "tokens": rec["tokens"], "cost_usd": rec["cost_usd"],
+        "cost_source": rec["cost_source"], "price_basis": rec["price_basis"],
+        "naive": rec["naive"]["result"], "attackable": task.get("profile") == "settlement-webhook/1", "infra_error": rec["infra_error"],
+        "anchor": str(task.get("source", "")).startswith("author-written"), "over_cap": rec["capped"],
+        "ground_truth_failure": rec["ground_truth"].get("failure"),
+    } for arm in arms}
+
+
 def run_study_a_live(suite, args):
     template = args.agent_cmd.split() if args.agent_cmd else AGENT_TEMPLATES[args.agent]
     arms = ["alone", "runhmd"] if args.arm == "both" else [args.arm]
-    rows, spent, unmetered = {a: [] for a in arms}, 0.0, 0
     tasks = [(p, t) for p, t in load_tasks(suite) if t]
-    cap = PER_RUN_CAP_USD * len(tasks)
-    for path, task in tasks:
-        if spent >= cap:
-            sys.stderr.write("fg_bench: the total cap of $%.2f is reached; the study is INCOMPLETE\n" % cap)
+    try:
+        ledger = _Ledger(args.out, args.agent)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("fg_bench: refusing to run: the spend ledger is unreadable (%s); a cap that cannot see past spend cannot hold\n" % exc)
+        return 1
+    if not ledger.has_room():
+        sys.stderr.write("fg_bench: refusing to run: $%.2f of the $%.2f total cap is already spent (%s), less than one $%.2f run is left\n"
+                         % (ledger.spent, TOTAL_CAP_USD, ledger.path, PER_RUN_CAP_USD))
+        return 1
+    rows, spent_before, ran, unmetered = {a: [] for a in arms}, ledger.spent, 0, 0
+    for index, (path, task) in enumerate(tasks):
+        if not ledger.has_room():
+            left = [skipped for _path, skipped in tasks[index:]]
+            sys.stderr.write("fg_bench: the $%.2f total cap leaves less than one $%.2f run: %d task(s) not run; the study is INCOMPLETE\n"
+                             % (TOTAL_CAP_USD, PER_RUN_CAP_USD, len(left)))
+            for skipped in left:
+                for arm, row in _study_a_rows(args.agent, arms, skipped, _not_run("not run: the $%.2f total cap leaves less than one $%.2f run" % (TOTAL_CAP_USD, PER_RUN_CAP_USD))).items():
+                    rows[arm].append(row)
             break
-        rec = _agent_once(path, task, template, PER_RUN_CAP_USD, RUN_TIMEOUT_S)
-        spent += rec["cost_usd"] or 0.0
+        rec = _agent_once(path, task, template, PER_RUN_CAP_USD, RUN_TIMEOUT_S, ledger)
+        ran += 1
         if rec["cost_source"] == "unmetered":
             unmetered += 1
             sys.stderr.write("fg_bench: WARNING: %s on %s reported no usage: the per-run cap could not be enforced for this run (only the %d-minute limit applied)\n"
                              % (args.agent, task["id"], RUN_TIMEOUT_S // 60))
-        verdict = rec["runhmd"]["result"] if rec["runhmd"]["result"] in ("PROVEN", "DENIED") else None
-        finding = (rec["runhmd"].get("findings") or [{}])[0].get("title")
-        for arm in arms:
-            run_id = "%s-%s-1" % (args.agent, task["id"])
-            rows[arm].append({
-                "schema": "fg.run/1", "case_id": "%s-%s" % (run_id, arm), "task_id": task["id"], "agent": args.agent, "arm": arm, "run_id": run_id,
-                "model": rec["model"], "ts": _now(), "agent_claim": rec["agent_claim"], "ground_truth": rec["ground_truth"]["result"],
-                "false_green": rec["agent_claim"] == "done" and rec["ground_truth"]["result"] == "fail",
-                "verdict": verdict if arm == "runhmd" else None, "counterexample": finding if arm == "runhmd" and verdict == "DENIED" else None,
-                "human_label": None, "wall_s": rec["wall_s"], "human_interventions": 0, "tokens": rec["tokens"], "cost_usd": rec["cost_usd"],
-                "cost_source": rec["cost_source"], "price_basis": rec["price_basis"],
-                "naive": rec["naive"]["result"], "attackable": task.get("profile") == "settlement-webhook/1", "infra_error": rec["infra_error"],
-                "anchor": str(task.get("source", "")).startswith("author-written"), "over_cap": rec["capped"],
-                "ground_truth_failure": rec["ground_truth"].get("failure"),
-            })
+        for arm, row in _study_a_rows(args.agent, arms, task, rec).items():
+            rows[arm].append(row)
     os.makedirs(args.out, exist_ok=True)
     for arm in arms:
         _write_rows(os.path.join(args.out, arm + ".jsonl"), rows[arm])
     _write_env(args.out)
-    sys.stdout.write("false-green Study A: %d run(s) by %s, $%.2f spent%s -> %s\n"
-                     % (len(rows[arms[0]]), args.agent, spent, ", %d unmetered (their cost is unknown, not zero)" % unmetered if unmetered else "", args.out))
+    sys.stdout.write("false-green Study A: %d run(s) by %s, $%.2f counted%s; the ledger stands at $%.2f of the $%.2f total cap -> %s\n"
+                     % (ran, args.agent, ledger.spent - spent_before, ", %d unmetered (counted at the per-run cap, their cost is unknown)" % unmetered if unmetered else "",
+                        ledger.spent, TOTAL_CAP_USD, args.out))
     return 0
 
 

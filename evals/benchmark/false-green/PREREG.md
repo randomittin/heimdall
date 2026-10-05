@@ -215,12 +215,12 @@ inputs examined are the existing attack oracle files, its fixtures and the RP4 a
 
 ## Amendments
 
-### Amendment 1 (2026-10-05, before any Study A run exists): per-run cap mechanics
+### Amendment 1 (2026-10-05, before any Study A run exists): per-run and total cap mechanics
 
 Sections 1 to 13 are not edited. Section 8 fixes the per-run cap (US$2.00 or 30 minutes, killed and recorded
-as an infrastructure exclusion) but not how spend is measured while a run is live. This pins that before any
-Study A row exists. No Study B instrument, case, rate or decision rule changes, so section 11.5 requires no
-Study B re-run.
+as an infrastructure exclusion) and a total cap, but not how spend is measured while a run is live or how the
+total is held. This pins both before any Study A row exists. No Study B instrument, case, rate or decision rule
+changes, so section 11.5 requires no Study B re-run.
 
 1. **Live measurement.** The harness reads the agent's streamed output (claude-code runs with
    `--output-format stream-json --verbose`) and sums the token usage of every distinct assistant message.
