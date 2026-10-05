@@ -199,7 +199,7 @@ async function serve(request: Request, env: Env, id: string, kind: Kind): Promis
 function parseRating(raw: Uint8Array): { label: Label; source: string } | string {
   let body: unknown;
   try {
-    body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+    body = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw));
   } catch {
     return "body must be a JSON object";
   }
