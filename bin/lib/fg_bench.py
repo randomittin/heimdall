@@ -6,7 +6,8 @@
   run        Study B (default, local, $0): judge every enumerated candidate and the design set with
              the naive check, `hmd attack` and the ground truth; write raw rows, one per candidate.
              Study A (--agent NAME): real agents; --dry (the default) prints the plan and the cost
-             bound; --live --confirm-spend runs them and spends real money
+             bound; --live --confirm-spend runs them and spends real money, each run killed at the
+             per-run cap and all runs held under the total cap (PREREG.md Amendment 1)
   summarize  the summary as a pure function of the raw rows (bin/lib/fg_summary.py)
 
 Exit codes: 0 ok, 1 invalid freeze or a failed check, 2 usage or config, 3 consent required

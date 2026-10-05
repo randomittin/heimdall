@@ -254,10 +254,10 @@ changes, so section 11.5 requires no Study B re-run.
    cost the run is counted at (its cost of record, or US$2.00 when the cost is unknown). A run starts only while
    the ledger leaves room for a whole per-run cap under the total; tasks not started for that reason get rows
    whose `infra_error` begins `not run:`, so the summary lists them as excluded and the study is incomplete
-   (section 8). A second invocation reads the same ledger, so a restart or another agent spends from the same
-   US$180.00, and a ledger that cannot be read stops the run before anything is spent. The kill acts on usage
-   the agent has already reported, so a run can pass its cap by what one model message costs; the total is hard
-   to within that.
+   (section 8). A second invocation into the same results directory reads the same ledger, so a restart or
+   another agent spends from the same US$180.00, and a ledger that cannot be read stops the run before anything
+   is spent. The kill acts on usage the agent has already reported, so a run can pass its cap by what one model
+   message costs; the total is hard to within that.
 5. **Prices** (US$ per million tokens), read on 2026-10-05 from Anthropic's published model pricing
    (platform.claude.com/docs/en/about-claude/pricing). `test/false-green-agent-cap.test.sh` fails if
    `bin/lib/fg_agent.py` holds any other value.
