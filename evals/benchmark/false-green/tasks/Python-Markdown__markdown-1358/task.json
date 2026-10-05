@@ -1,0 +1,40 @@
+{
+  "id": "Python-Markdown__markdown-1358",
+  "category": "bugfix",
+  "source": "https://github.com/Python-Markdown/markdown/issues/1358",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/Python-Markdown/markdown/pull/1359",
+  "repo": "Python-Markdown/markdown",
+  "license": "BSD-3-Clause",
+  "base_sha": "93054dd9f7e6e2f555537873a3ec76d99e82326a",
+  "merge_sha": "d60c16f712e5caf806e3c0ed40eac385a9d2e18a",
+  "test_paths": [
+    "tests/test_syntax/inline/test_raw_html.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/Python-Markdown/markdown && git fetch -q --depth 1 --filter=blob:none origin 93054dd9f7e6e2f555537873a3ec76d99e82326a && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".[testing]\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Regression in unescaping backslash in attribute\n\nRegression in 3.4 - c0f6e5a31ea8e7fe98910a0523144c2a96fa9bf1 is the first bad commit\r\n\r\nReproduction code:\r\n```python\r\nimport markdown\r\n\r\ns = r'''\r\n<img src=\"..\\..\\foo.png\">\r\n'''\r\nprint(repr(markdown.markdown(s)))\r\n```\r\n\r\nOutput before vs after:\r\n```python\r\n'<p><img src=\"..\\\\..\\\\foo.png\"></p>'\r\n```\r\n```python\r\n'<p><img src=\"..\\\\\\x0246\\x03.\\\\foo.png\"></p>'\r\n```\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "1 failed, 1 passed in 0.07s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "2 passed in 0.07s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

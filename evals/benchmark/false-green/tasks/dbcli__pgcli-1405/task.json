@@ -1,0 +1,40 @@
+{
+  "id": "dbcli__pgcli-1405",
+  "category": "bugfix",
+  "source": "https://github.com/dbcli/pgcli/issues/1405",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/dbcli/pgcli/pull/1612",
+  "repo": "dbcli/pgcli",
+  "license": "BSD-3-Clause",
+  "base_sha": "fab13f08afa85550208f4dd6c2b0b7eaa2adc861",
+  "merge_sha": "4beae4740ab1a159422b649e8aa3d47c95678ce8",
+  "test_paths": [
+    "tests/test_pgcompleter.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/dbcli/pgcli && git fetch -q --depth 1 --filter=blob:none origin fab13f08afa85550208f4dd6c2b0b7eaa2adc861 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".[dev]\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: TypeError: cannot use a string pattern on a bytes-like object\n\n## Description\r\n<!--- Describe your problem as fully as you can. -->\r\nWhen launching pgcli, I get the following error:\r\n```\r\nException in thread completion_refresh:\r\nTraceback (most recent call last):\r\n  File \"/usr/lib/python3.11/threading.py\", line 1038, in _bootstrap_inner\r\n    self.run()\r\n  File \"/usr/lib/python3.11/threading.py\", line 975, in run-mode  [F5] Explain: OFF      Refreshing completions...                                                                            \r\n    self._target(*self._args, **self._kwargs)\r\n  File \"/usr/lib/python3/dist-packages/pgcli/completion_refresher.py\", line 68, in _bg_refresh\r\n    refresher(completer, executor)\r\n  File \"/usr/lib/python3/dist-packages/pgcli/completion_refresher.py\", line 109, in refresh_schemata\r\n    completer.set_search_path(executor.search_path())\r\n  File \"/usr/lib/python3/dist-packages/pgcli/pgcompleter.py\", line 306, in set_search_path\r\n    self.search_path = self.escaped_names(search_path)\r\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/usr/lib/python3/dist-packages/pgcli/pgcompleter.py\", line 150, in escaped_names\r\n    return [self.escape_name(name) for name in names]\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/usr/lib/python3/dist-packages/pgcli/pgcompleter.py\", line 150, in <listcomp>\r\n    return [self.escape_name(name) for name in names]\r\n            ^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/usr/lib/python3/dist-packages/pgcli/pgcompleter.py\", line 131, in escape_name\r\n    (not self.name_pattern.match(name))\r\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\nTypeError: cannot use a string pattern on a bytes-like object\r\n```\r\nThis error occurs when connecting to a PostgreSQL 9.3.4, but not a PostgreSQL 9.3.20 server.\r\n\r\n## Your environment\r\n<!-- This gives us some more context to work with. -->\r\nOS: Ubuntu 23.04 x86_64\r\npgcli Version: 3.5.0\r\npip freeze:\r\n```\r\nasn1crypto==1.5.1\r\nattrs==22.2.0\r\nBabel==2.10.3\r\nblinker==1.5\r\nBrlapi==0.8.4\r\ncertifi==2022.9.24\r\nchardet==5.1.0\r\ncli-helpers==2.3.0\r\nclick==8.1.3\r\ncloud-init==23.1.2\r\ncolorama==0.4.6\r\ncommand-not-found==0.3\r\nconfigobj==5.0.8\r\ncryptography==38.0.4\r\ncupshelpers==1.0\r\ndbus-python==1.3.2\r\ndefer==1.0.6\r\ndistro==1.8.0\r\ndistro-info==1.5\r\nhtml5lib==1.1\r\nhttplib2==0.20.4\r\nidna==3.3\r\nimportlib-metadata==4.12.0\r\njaraco.classes==3.2.1\r\njeepney==0.8.0\r\nJinja2==3.1.2\r\njsonpatch==1.32\r\njsonpointer==2.0\r\njsonschema==4.6.0\r\nkeyring==23.9.3\r\nlanguage-selector==0.1\r\nlaunchpadlib==1.11.0\r\nlazr.restfulclient==0.14.5\r\nlazr.uri==1.0.6\r\nlouis==3.24.0\r\nMako==1.2.4.dev0\r\nmarkdown-it-py==2.1.0\r\nMarkupSafe==2.1.2\r\nmdurl==0.1.2\r\nmechanize==0.4.8\r\nmore-itertools==8.10.0\r\nnetifaces==0.11.0\r\noauthlib==3.2.2\r\nolefile==0.46\r\npendulum==2.1.2\r\npexpect==4.8.0\r\npgcli==3.5.0\r\npgspecial==2.0.1\r\nPillow==9.4.0\r\nprompt-toolkit==3.0.36\r\npsycopg==3.1.7\r\npsycopg-pool==3.1.5\r\npsycopg2==2.9.5\r\nptyprocess==0.7.0\r\npycairo==1.20.1\r\npycups==2.0.1\r\nPygments==2.14.0\r\nPyGObject==3.44.1\r\nPyJWT==2.6.0\r\npyparsing==3.0.9\r\npyrsistent==0.18.1\r\npyserial==3.5\r\npython-apt==2.5.3+ubuntu1\r\npython-dateutil==2.8.2\r\npython-debian==0.1.49+ubuntu2\r\npytz==2022.7.1\r\npytzdata==2020.1\r\npyxdg==0.28\r\nPyYAML==6.0\r\nreportlab==3.6.12\r\nrequests==2.28.1\r\nrich==13.3.1\r\nSecretStorage==3.3.3\r\nsetproctitle==1.3.1\r\nsix==1.16.0\r\nsqlparse==0.4.2\r\nsystemd-python==235\r\ntabulate==0.8.9\r\nterminaltables==3.1.10\r\ntyping_extensions==4.4.0\r\nubuntu-advantage-tools==8001\r\nubuntu-drivers-common==0.0.0\r\nufw==0.36.1\r\nunattended-upgrades==0.1\r\nurllib3==1.26.12\r\nwadllib==1.3.6\r\nwcwidth==0.2.5\r\nwebencodings==0.5.1\r\nxdg==5\r\nxkit==0.0.0\r\nzipp==1.0.0\r\n```\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "4 failed, 14 passed in 0.16s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "18 passed in 0.03s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}
