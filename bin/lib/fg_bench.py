@@ -36,6 +36,7 @@ SUITE = os.environ.get("FG_SUITE_DIR") or os.path.join(PLUGIN, "evals", "benchma
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import fg_agent  # noqa: E402
 import fg_lock  # noqa: E402
 import fg_mutate  # noqa: E402
 import fg_summary  # noqa: E402
@@ -43,14 +44,19 @@ import fg_summary  # noqa: E402
 CATEGORIES = ("bugfix", "feature", "refactor", "concurrency", "security")
 ATTACK_BIN = os.path.join(PLUGIN, "bin", "heimdall-attack")
 NAIVE_TIMEOUT_S, ATTACK_TIMEOUT_S, GROUND_TRUTH_TIMEOUT_S = 30, 120, 200
+# PREREG.md section 8: a run is killed at $2.00 of spend or 30 minutes and recorded as an infrastructure
+# exclusion. How the spend is read while the run is live: PREREG.md Amendment 1, bin/lib/fg_agent.py.
 PER_RUN_CAP_USD, RUN_TIMEOUT_S = 2.00, 1800
 ENGINE_FILES = ("evals/oracles/attack/run.sh", "evals/oracles/attack/grade.mjs", "evals/oracles/attack/engine/battery.mjs",
                 "evals/oracles/attack/engine/harness.mjs", "evals/oracles/attack/reference/settlement.ref.mjs",
                 "bin/lib/runhmd_attack.py", "bin/heimdall-attack")
-# The claude-code invocation is the one bin/benchmark already uses; the other two templates have not
-# been exercised in this tree, so a live run with them needs an explicit --agent-cmd.
+# claude-code streams JSON events so the spend can be read while the run is live, and carries the agent's own
+# cap as a second stop ({budget} is the per-run cap). Its permission mode and tool set have not been exercised
+# against a real task yet. The other two templates have not been exercised in this tree either, so a live run
+# with them needs an explicit --agent-cmd.
 AGENT_TEMPLATES = {
-    "claude-code": ["claude", "-p", "{prompt}", "--output-format", "json", "--permission-mode", "acceptEdits"],
+    "claude-code": ["claude", "-p", "{prompt}", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits",
+                    "--max-budget-usd", "{budget}"],
     "codex": ["codex", "exec", "{prompt}"],
     "gemini": ["gemini", "-p", "{prompt}"],
 }
@@ -276,10 +282,11 @@ def plan_study_a(suite, args):
                      "  tasks:      %d (%d attackable by hmd attack, %d author-written anchor); a headline needs %d sampled tasks and %d agents\n"
                      "  agent:      %s%s\n  arms:       %s (one agent run per task; every arm is scored on that run)\n"
                      "  runs:       %d\n  cost bound: $%.2f per run x %d = $%.2f at most; the runhmd arm adds $0.00 (offline engine)\n"
+                     "  per-run cap: the agent is killed at $%.2f of spend or %d minutes and the run is an infrastructure exclusion (PREREG.md section 8, Amendment 1)\n"
                      "  would write: %s/%s\n"
                      % ("DRY RUN" if not args.live else "LIVE", len(tasks), attackable, anchors, fg_summary.MIN_TASKS, fg_summary.MIN_AGENTS,
                         args.agent, note, ",".join(arms), len(tasks), PER_RUN_CAP_USD, len(tasks), PER_RUN_CAP_USD * len(tasks),
-                        args.out, "{" + ",".join(a + ".jsonl" for a in arms) + "}"))
+                        PER_RUN_CAP_USD, RUN_TIMEOUT_S // 60, args.out, "{" + ",".join(a + ".jsonl" for a in arms) + "}"))
     return 0
 
 
@@ -288,30 +295,35 @@ def _claim_of(text):
     return found[-1] if found else "gave_up"
 
 
-def _split_agent_output(out):
-    """(final text, token usage, cost) from a claude-style JSON result, or the raw text when it is not JSON."""
-    try:
-        doc = json.loads(out)
-    except ValueError:
-        return out, {"in": None, "out": None}, None
-    if not isinstance(doc, dict):
-        return out, {"in": None, "out": None}, None
-    usage = doc.get("usage") or {}
-    return doc.get("result") or "", {"in": usage.get("input_tokens"), "out": usage.get("output_tokens")}, doc.get("total_cost_usd")
+def _infra_error(run, meter, text, cap_usd, timeout_s):
+    """Why a run is an infrastructure exclusion (PREREG.md sections 8 and 9), or None."""
+    if run.killed == "cap":
+        return "per-run cap: estimated spend $%.2f reached the $%.2f cap; agent killed" % (meter.spend_usd, cap_usd)
+    if run.killed == "timeout":
+        return "agent timed out after %ds; killed" % timeout_s
+    if run.killed == "fault":
+        return "spend could not be read (%s); agent killed" % run.fault
+    if meter.stopped_at_budget or (meter.cost_usd is not None and meter.cost_usd >= cap_usd):
+        return "per-run cap: the run's cost, $%.2f, is at or above the $%.2f cap" % (meter.cost_usd or cap_usd, cap_usd)
+    if run.rc != 0 and not re.search(r"^\s*CLAIM:", text, re.M):
+        return "agent exited %s: %s" % (run.rc, _tail(run.stderr or text))
+    return None
 
 
-def _agent_once(path, task, template, timeout):
-    """One agent run in a fresh workspace; returns the per-run record that becomes the result rows."""
+def _agent_once(path, task, template, cap_usd, timeout_s):
+    """One supervised agent run in a fresh workspace; returns the per-run record that becomes the result rows."""
     work = tempfile.mkdtemp(prefix="fg-agent-")
     try:
         for name in task["workspace_files"]:
             shutil.copy(os.path.join(path, name), work)
-        started = time.monotonic()
-        rc, out, err = _run([part.replace("{prompt}", task["prompt"]) for part in template], work, timeout)
-        text, usage, cost = _split_agent_output(out)
-        record = {"agent_claim": _claim_of(text), "wall_s": round(time.monotonic() - started, 2), "tokens": usage, "cost_usd": cost, "infra_error": None}
-        if rc is None or (rc != 0 and not re.search(r"^\s*CLAIM:", text, re.M)):
-            record["infra_error"] = "agent timed out" if rc is None else "agent exited %s: %s" % (rc, _tail(err))
+        meter = fg_agent.Meter()
+        command = [part.replace("{prompt}", task["prompt"]).replace("{budget}", "%.2f" % cap_usd) for part in template]
+        run = fg_agent.supervise(command, work, meter, cap_usd, timeout_s)
+        text = meter.final_text if meter.final_text is not None else run.stdout
+        infra = _infra_error(run, meter, text, cap_usd, timeout_s)
+        record = {"agent_claim": _claim_of(text), "wall_s": round(run.elapsed_s, 2), "tokens": meter.tokens, "cost_usd": meter.cost_usd,
+                  "cost_source": meter.cost_source, "price_basis": meter.price_basis, "model": meter.model, "infra_error": infra,
+                  "capped": bool(infra) and infra.startswith("per-run cap")}
         deliverable = os.path.join(work, task["deliverable"])
         if os.path.isfile(deliverable):
             judged = judge_all(path, deliverable)
@@ -328,15 +340,19 @@ def _agent_once(path, task, template, timeout):
 def run_study_a_live(suite, args):
     template = args.agent_cmd.split() if args.agent_cmd else AGENT_TEMPLATES[args.agent]
     arms = ["alone", "runhmd"] if args.arm == "both" else [args.arm]
-    rows, spent = {a: [] for a in arms}, 0.0
+    rows, spent, unmetered = {a: [] for a in arms}, 0.0, 0
     tasks = [(p, t) for p, t in load_tasks(suite) if t]
     cap = PER_RUN_CAP_USD * len(tasks)
     for path, task in tasks:
         if spent >= cap:
             sys.stderr.write("fg_bench: the total cap of $%.2f is reached; the study is INCOMPLETE\n" % cap)
             break
-        rec = _agent_once(path, task, template, RUN_TIMEOUT_S)
+        rec = _agent_once(path, task, template, PER_RUN_CAP_USD, RUN_TIMEOUT_S)
         spent += rec["cost_usd"] or 0.0
+        if rec["cost_source"] == "unmetered":
+            unmetered += 1
+            sys.stderr.write("fg_bench: WARNING: %s on %s reported no usage: the per-run cap could not be enforced for this run (only the %d-minute limit applied)\n"
+                             % (args.agent, task["id"], RUN_TIMEOUT_S // 60))
         verdict = rec["runhmd"]["result"] if rec["runhmd"]["result"] in ("PROVEN", "DENIED") else None
         finding = (rec["runhmd"].get("findings") or [{}])[0].get("title")
         for arm in arms:

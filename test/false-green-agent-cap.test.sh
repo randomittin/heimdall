@@ -251,6 +251,35 @@ meter = fg_agent.Meter()
 run = fg_agent.supervise([os.path.join(tmp, "no-such-agent")], tmp, meter, 2.00, 30)
 t("a command that does not exist returns rc 127 with the reason", run.rc == 127 and run.stderr, (run.rc, run.stderr))
 
+# K7 a supervisor that fails must not leave the agent running (and spending): the group is killed first
+pid_file = os.path.join(tmp, "k7.pid")
+
+class Blind(fg_agent.Meter):
+    @property
+    def spend_usd(self):
+        while not os.path.exists(pid_file):
+            time.sleep(0.02)
+        raise RuntimeError("the meter cannot read spend")
+
+raised = None
+try:
+    fg_agent.supervise(fake + ["events=20", "cost=0.10", "interval=0.5", "grandchild=" + pid_file], tmp, Blind(), 2.00, 60)
+except RuntimeError as exc:
+    raised = exc
+t("a failure in the supervisor propagates", raised is not None, raised)
+t("and the agent's process group is killed before it does (the grandchild is dead)", os.path.exists(pid_file) and gone(pid_file))
+
+# K8 a meter that raises while it is being fed kills the run: spend that cannot be read is not left running
+pid_file = os.path.join(tmp, "k8.pid")
+
+class Faulty(fg_agent.Meter):
+    def feed(self, line):
+        raise ValueError("cannot parse")
+
+run = fg_agent.supervise(fake + ["events=20", "cost=0.10", "interval=0.5", "grandchild=" + pid_file], tmp, Faulty(), 2.00, 60)
+t("a meter that raises on feed kills the run and says so", run.killed == "fault" and "cannot parse" in (run.fault or ""), (run.killed, run.fault))
+t("and the fault run's grandchild is dead", gone(pid_file))
+
 print("\n".join(out))
 print("END")
 PY
