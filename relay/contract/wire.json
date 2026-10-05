@@ -106,7 +106,8 @@
         "ciphertext": null,
         "payload": {
           "device_pubkey": "$device_pubkey",
-          "bound_at": "$epoch_seconds"
+          "bound_at": "$epoch_seconds",
+          "via": "qr"
         }
       },
       "keepalive": {
@@ -154,7 +155,8 @@
         "ciphertext": null,
         "payload": {
           "device_pubkey": "$device_pubkey",
-          "bound_at": "$epoch_seconds"
+          "bound_at": "$epoch_seconds",
+          "via": "qr"
         }
       },
       "client_ping": "ping",

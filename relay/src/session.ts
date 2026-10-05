@@ -1519,7 +1519,314 @@ export class SessionDO {
     this.closeHmdStream();
     this.closeHmdSockets(CLOSE_SESSION_ENDED, "revoked");
 
+    // Last, and best effort: the revoke is already done and answered for, and an index entry
+    // that lingers is dead on arrival (it expires with its window and a release finds nothing).
+    if (window) await this.clearIndexEntry(window, record.session_id);
+
     return jsonResponse(200, { ok: true });
+  }
+
+  // ------------------------------------------------------------------------------------------
+  // Pair by session code (spec 5.3-5.4, 6.2). One class, three roles: this block is the
+  // session's own half (`/code`, `/code-release`), the index role of a `code-index:<gh_id>`
+  // instance (`/index-*`) and the per-IP bucket (`/bucket`) -- the same single-class,
+  // no-migration choice the `/pair/init` throttle bucket made.
+  // ------------------------------------------------------------------------------------------
+
+  /**
+   * hmd registers a code window for this session: `POST /code`, the session's bearer. The order
+   * of the checks is the contract's (relay/contract/code-pair.json, `session_code.check_order`).
+   *
+   * Nothing from before an `await` on GitHub or another instance is trusted after it: the
+   * record is read again, as the last read before the write, because a phone can bind the
+   * session while the laptop's token is being checked, and writing back a stale `pending`
+   * would un-bind it.
+   */
+  private async handleCodeRegister(request: Request): Promise<Response> {
+    const record = await this.loadRecord();
+    if (!record) return jsonResponse(404, { error: "session not found" });
+    if (!this.checkBearer(request, record)) return jsonResponse(401, { error: "unauthorized" });
+
+    const now = Date.now();
+    if (record.status !== "pending" || now > record.pair_exp) {
+      return jsonResponse(410, { error: "session no longer claimable" });
+    }
+
+    const { attempts, throttled } = recordAttempt(
+      record.code_register_attempts ?? [],
+      now,
+      CODE_REGISTER_WINDOW_MS,
+      CODE_REGISTER_MAX_PER_WINDOW
+    );
+    record.code_register_attempts = attempts;
+    await this.saveRecord(record);
+    if (throttled) return throttledResponse("too many code registrations", CODE_REGISTER_RETRY_AFTER_S);
+
+    const read = await readJsonObject(request);
+    if (!read.ok) return read.response;
+    const { code, gh_token: ghToken, hmd_commit: hmdCommit } = read.body;
+    if (!isValidSessionCode(code)) return jsonResponse(400, { error: "invalid code" });
+    if (decodeFixedBase64Url(hmdCommit, 32) === null) return jsonResponse(400, { error: "invalid hmd_commit" });
+    if (typeof ghToken !== "string" || ghToken.length === 0) {
+      return jsonResponse(400, { error: "gh_token required" });
+    }
+    if (!isPlausibleGithubToken(ghToken)) return githubFailureResponse("rejected");
+
+    const verdict = await verifyLaptopToken(this.env, ghToken);
+    if (!verdict.ok) return githubFailureResponse(verdict.reason);
+    const owner = verdict.user;
+
+    // The write: read again, check again, then no await until it is saved.
+    const current = await this.loadRecord();
+    if (!current || current.status !== "pending" || Date.now() > current.pair_exp) {
+      return jsonResponse(410, { error: "session no longer claimable" });
+    }
+    // INV-40: a window that has been released stays released. Registering over it would hand
+    // the same session to a second phone.
+    if (current.code_window?.released) return jsonResponse(410, { error: "session no longer claimable" });
+    const previous = current.code_window;
+    current.code_window = { code, owner_gh_id: owner.id, hmd_commit: hmdCommit as string, released: false };
+    await this.saveRecord(current);
+
+    const registered = await indexStub(this.env, owner.id).fetch("http://do-internal/index-register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code, session_id: current.session_id, exp: current.pair_exp }),
+    });
+    if (registered.status !== 200) {
+      await this.restoreWindow(code, owner.id, previous);
+      return jsonResponse(409, { error: "code in use by another open window" });
+    }
+    // This session had a different window before (another code, or another GitHub id): its
+    // entry is no longer this session's to keep.
+    if (previous && (previous.code !== code || previous.owner_gh_id !== owner.id)) {
+      await this.clearIndexEntry(previous, current.session_id);
+    }
+
+    logEvent("code_window_registered", { session_id: current.session_id });
+    return jsonResponse(200, { code, gh_login: owner.login, exp: Math.floor(current.pair_exp / 1000) });
+  }
+
+  /** A registration the index refused: put back the window the session had, if it still has
+   *  the one that was just written. Re-read first, for the usual reason. */
+  private async restoreWindow(code: string, ownerGhId: number, previous: CodeWindow | undefined): Promise<void> {
+    const current = await this.loadRecord();
+    const written = current?.code_window;
+    if (!current || !written || written.code !== code || written.owner_gh_id !== ownerGhId) return;
+    if (previous) current.code_window = previous;
+    else delete current.code_window;
+    await this.saveRecord(current);
+  }
+
+  /**
+   * Internal, called only by an index instance's `/index-resolve`: release this session's
+   * window to `gh_id` (INV-40). Released iff the session is still `pending`, its pairing window
+   * has not lapsed, the window is the one asked for (`code`), it belongs to `gh_id`, and it has
+   * not been released before -- the last two being the ones that make a window usable by one
+   * person, once. The index in front has already looked the code up in `gh_id`'s own namespace;
+   * that is a hint, and every check here is made anyway, because this is where a stale or
+   * racing hint stops.
+   *
+   * One answer for every refusal: the index maps it to the one `404` (INV-42). The read, the
+   * decision and the write are one storage round with no other `await` between them, so two
+   * releases racing for one window cannot both win.
+   */
+  private async handleCodeRelease(request: Request): Promise<Response> {
+    const miss = (): Response => jsonResponse(404, { error: "no open pairing window" });
+    let input: unknown;
+    try {
+      input = await request.json();
+    } catch {
+      return miss();
+    }
+    if (typeof input !== "object" || input === null || Array.isArray(input)) return miss();
+    const { gh_id: ghId, gh_login: ghLogin, code, device_label: deviceLabel } = input as Record<string, unknown>;
+    if (typeof ghId !== "number" || !Number.isSafeInteger(ghId)) return miss();
+    if (typeof ghLogin !== "string" || typeof code !== "string") return miss();
+    if (!isValidDeviceLabel(deviceLabel)) return miss();
+
+    const record = await this.loadRecord();
+    const window = record?.code_window;
+    if (!record || !window) return miss();
+    if (record.status !== "pending" || Date.now() > record.pair_exp) return miss();
+    if (window.code !== code || window.owner_gh_id !== ghId || window.released) return miss();
+
+    window.released = true;
+    window.device_label = deviceLabel;
+    window.gh_login = ghLogin;
+    await this.saveRecord(record);
+    logEvent("code_window_released", { session_id: record.session_id });
+    return jsonResponse(200, {
+      session_id: record.session_id,
+      pairing_code: record.pairing_code,
+      hmd_commit: window.hmd_commit,
+      exp: Math.floor(record.pair_exp / 1000),
+    });
+  }
+
+  /** Removes a window's entry from its owner's index. Best effort and never fatal: it is
+   *  called on the way out of a bind, a revoke or an end that has already happened, and an
+   *  entry left behind is harmless (it expires with its window, and a release behind it finds
+   *  nothing). */
+  private async clearIndexEntry(window: CodeWindow, sessionId: string): Promise<void> {
+    try {
+      await indexStub(this.env, window.owner_gh_id).fetch("http://do-internal/index-clear", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code: window.code, session_id: sessionId }),
+      });
+    } catch {
+      logEvent("code_index_clear_failed", { session_id: sessionId });
+    }
+  }
+
+  /** One per-IP bucket's attempt (`identity-throttle:<ip>`, `pair-code-throttle:<ip>`): the
+   *  Worker supplies the limit, the instance's name is the bucket. Reclaims itself one window
+   *  after the IP's last request, like the `/pair/init` bucket. */
+  private async handleBucket(request: Request): Promise<Response> {
+    let params: Record<string, unknown>;
+    try {
+      params = (await request.json()) as Record<string, unknown>;
+    } catch {
+      return jsonResponse(400, { error: "invalid json" });
+    }
+    const { max, window_ms: windowMs } = params;
+    if (typeof max !== "number" || typeof windowMs !== "number" || !(max > 0) || !(windowMs > 0)) {
+      return jsonResponse(400, { error: "invalid bucket" });
+    }
+    const now = Date.now();
+    const previous = (await this.ctx.storage.get<number[]>(BUCKET_KEY)) ?? [];
+    const { attempts, throttled } = recordAttempt(previous, now, windowMs, max);
+    await this.ctx.storage.put(BUCKET_KEY, attempts);
+    await this.armPurgeAlarm(now + windowMs + PURGE_GRACE_MS);
+    return jsonResponse(200, { throttled });
+  }
+
+  // -- the index role: a `code-index:<gh_id>` instance (state and rules: src/code-index.ts) --
+
+  private async loadIndex(nowMs: number): Promise<CodeIndexState> {
+    const state = (await this.ctx.storage.get<CodeIndexState>(CODE_INDEX_KEY)) ?? emptyIndex();
+    pruneIndex(state, nowMs);
+    return state;
+  }
+
+  /** Writes the index and sets the alarm that reclaims it once nothing in it matters. An index
+   *  with nothing left in it is not written at all: an empty object with no alarm would be
+   *  storage nobody ever reclaims. */
+  private async saveIndex(state: CodeIndexState): Promise<void> {
+    const deadline = lastDeadline(state);
+    if (deadline === null) {
+      await this.ctx.storage.deleteAll();
+      return;
+    }
+    await this.ctx.storage.put(CODE_INDEX_KEY, state);
+    await this.armPurgeAlarm(deadline + PURGE_GRACE_MS);
+  }
+
+  /** Internal: a session opens `code` in this GitHub id's index. 409 if another session of the
+   *  same id holds it and has not lapsed. */
+  private async handleIndexRegister(request: Request): Promise<Response> {
+    const input = await this.internalBody(request);
+    const { code, session_id: sessionId, exp } = input ?? {};
+    if (!isValidSessionCode(code) || typeof sessionId !== "string" || typeof exp !== "number") {
+      return jsonResponse(400, { error: "invalid index entry" });
+    }
+    const now = Date.now();
+    const state = await this.loadIndex(now);
+    if (!registerEntry(state, code, sessionId, exp, now)) {
+      return jsonResponse(409, { error: "code in use by another open window" });
+    }
+    await this.saveIndex(state);
+    return jsonResponse(200, { ok: true });
+  }
+
+  /** Internal: a session that has ended, been bound or been revoked takes its entry out. */
+  private async handleIndexClear(request: Request): Promise<Response> {
+    const input = await this.internalBody(request);
+    const { code, session_id: sessionId } = input ?? {};
+    if (typeof code !== "string" || typeof sessionId !== "string") {
+      return jsonResponse(400, { error: "invalid index entry" });
+    }
+    const state = await this.loadIndex(Date.now());
+    clearEntry(state, code, sessionId);
+    await this.saveIndex(state);
+    return jsonResponse(200, { ok: true });
+  }
+
+  /** Internal: `/identity/github/revoke` -- every assertion minted before now is dead. */
+  private async handleIndexRevoke(): Promise<Response> {
+    const now = Date.now();
+    const state = await this.loadIndex(now);
+    const notBefore = revokeBefore(state, now);
+    await this.saveIndex(state);
+    return jsonResponse(200, { not_before: notBefore });
+  }
+
+  /**
+   * Internal: `/pair/code`, after the Worker has verified the assertion and the proof of
+   * possession and so knows `gh_id` is the caller's. In this GitHub id's own index only:
+   * revoked sign-in, lockout, throttle -- in that order -- then the lookup, then the session's
+   * release. Every way there is nothing to release is the same `404` (INV-42).
+   *
+   * The attempt is on file before the slow part, and the index is read again after it: the
+   * session is another instance and the answer takes a round trip, during which a registration
+   * or a second attempt may have changed this one's state. Applying the outcome to the state
+   * read before the call would write that change away.
+   */
+  private async handleIndexResolve(request: Request): Promise<Response> {
+    const input = await this.internalBody(request);
+    const { code, gh_id: ghId, gh_login: ghLogin, iat, device_label: deviceLabel } = input ?? {};
+    const noWindow = (): Response => jsonResponse(404, { error: NO_WINDOW_ERROR });
+    if (
+      !isValidSessionCode(code) ||
+      typeof ghId !== "number" ||
+      typeof ghLogin !== "string" ||
+      typeof iat !== "number" ||
+      !isValidDeviceLabel(deviceLabel)
+    ) {
+      return noWindow();
+    }
+
+    const now = Date.now();
+    const state = await this.loadIndex(now);
+    if (isRevoked(state, iat)) return jsonResponse(401, { error: "identity revoked" });
+    const admission = admitAttempt(state, now);
+    await this.saveIndex(state);
+    if (!admission.admitted) return throttledResponse("too many attempts", admission.retryAfterS);
+
+    const entry = state.codes[code];
+    let released: Record<string, unknown> | null = null;
+    if (entry) {
+      const answer = await this.env.SESSION.get(this.env.SESSION.idFromName(entry.session_id)).fetch(
+        "http://do-internal/code-release",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ gh_id: ghId, gh_login: ghLogin, code, device_label: deviceLabel }),
+        }
+      );
+      if (answer.status === 200) released = (await answer.json()) as Record<string, unknown>;
+    }
+
+    const after = await this.loadIndex(Date.now());
+    if (entry) clearEntry(after, code, entry.session_id);
+    if (released) recordHit(after);
+    else recordMiss(after, Date.now());
+    await this.saveIndex(after);
+    return released ? jsonResponse(200, released) : noWindow();
+  }
+
+  /** An internal call's JSON body as an object, or null: these callers are this relay's own
+   *  Worker and instances, but a body that is not what they send is refused like any other. */
+  private async internalBody(request: Request): Promise<Record<string, unknown> | null> {
+    try {
+      const parsed: unknown = await request.json();
+      return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1727,6 +2034,20 @@ export class SessionDO {
       // hmd is told why before its stream goes (INV-38). Without it, a session
       // nobody bound ended as a bare EOF followed by a 404 — see endHmdStream.
       this.endHmdStream(record.session_id, purgeEndReason(record.status));
+    } else {
+      // A `code-index:<gh_id>` instance: not a session, but not a throttle bucket either, and
+      // it must not be wiped while it still holds an open window, a lockout or a revoke. What
+      // has lapsed goes; the rest stays, with the alarm set for when it too is of no use.
+      const index = await this.ctx.storage.get<CodeIndexState>(CODE_INDEX_KEY);
+      if (index) {
+        pruneIndex(index, now);
+        const deadline = lastDeadline(index);
+        if (deadline !== null) {
+          await this.ctx.storage.put(CODE_INDEX_KEY, index);
+          await this.armPurgeAlarm(deadline + PURGE_GRACE_MS);
+          return;
+        }
+      }
     }
 
     await this.ctx.storage.deleteAll();
