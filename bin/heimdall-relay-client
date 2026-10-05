@@ -2238,16 +2238,25 @@ class RelayClient:
 
             backoff_ms = BACKOFF_BASE_MS  # reset on a successful (re)connect
             emit({"event": "stream_open", "transport": "ws" if ws is not None else "ndjson"})
+            with self._stream_lock:
+                self._stream_conn = conn
+            self._reading_epoch = epoch
             try:
                 if ws is not None:
                     drop_reason, drop_info = self._read_ws(ws)
                 else:
                     drop_reason, drop_info = self._read_ndjson(conn, resp)
             finally:
+                with self._stream_lock:
+                    self._stream_conn = None
                 conn.close()
 
             if self.stop_event.is_set():
                 return
+
+            if epoch != self._stream_epoch:  # a code-window renewal cut this stream: planned, so no backoff, no noise
+                backoff_ms = BACKOFF_BASE_MS
+                continue
 
             if drop_reason == "rotate":
                 emit({"event": "stream_drop", "retry_ms": 0, "reason": "rotate"})
@@ -2368,6 +2377,7 @@ class RelayClient:
             return
         self._stopping = True
         self.stop_event.set()
+        self._gh_secret = None  # a stopped client offers no code window, so it keeps no token
         self._login_shutdown()  # before the (network-bound) revoke: a login process must not outlive us
         self.revoke()
         self.write_status()
@@ -2380,8 +2390,8 @@ def build_argparser():
                                               "E2E sealed, accepting send-message and decide (deny-only) commands back")
     ap.add_argument("--relay", required=True, metavar="URL",
                      help="relay base URL, e.g. https://hmd-relay.example.workers.dev")
-    ap.add_argument("--repo", required=True, metavar="DIR", help="repo root to render (passed to collect_state)")
-    ap.add_argument("--ui-port", required=True, type=int, metavar="N",
+    ap.add_argument("--repo", default=None, metavar="DIR", help="repo root to render (passed to collect_state)")
+    ap.add_argument("--ui-port", default=None, type=int, metavar="N",
                      help="port a local `hmd ui` is bound to (informational -- carried in the "
                           "transport dict, never dialed by this process)")
     ap.add_argument("--public-host", default=None, metavar="NAME",
@@ -2393,7 +2403,50 @@ def build_argparser():
                      help="longest the state loop blocks before it re-checks for a stop or a re-bind "
                           "(default 2, and never more than 0.25 -- STATE_WAIT_SLICE_S). A state change is "
                           "sent as it happens (debounced 50 ms), not at the next tick")
+    ap.add_argument("--code", default=None, metavar="CODE", type=_code_arg,
+                     help="also offer this 5-character session code: the phone pairs by typing it. The laptop's "
+                          "GitHub token is read from the first line of stdin (a pipe), the operator's answers "
+                          "(approve / reject) from the lines after it")
+    ap.add_argument("--no-confirm", action="store_true",
+                     help="with --code: approve a phone that claimed by code without asking the laptop. The relay "
+                          "is then trusted to deliver the right keys")
+    ap.add_argument("--identity-revoke", action="store_true",
+                     help="instead of a session: read the laptop's GitHub token from stdin, ask the relay to "
+                          "revoke every phone sign-in for that GitHub user, print one event, exit")
     return ap
+
+
+def identity_revoke(args):
+    """`--identity-revoke`: POST /identity/github/revoke with the token read from stdin (a pipe), print ONE
+    event -- identity_revoked {gh_login, not_before} or identity_revoke_failed {reason} -- and exit: 0 revoked,
+    3 no usable token, 12 the relay refused or was unreachable. The token is in that request body only."""
+    client = RelayClient(argparse.Namespace(relay=args.relay, repo=".", status_file=None, tick_s=2.0,
+                                            public_host=None, ui_port=0))
+    client._stdin = _StdinLines(0)
+    token = client._read_token()
+    if token is None:
+        emit({"event": "identity_revoke_failed", "reason": "no-gh"})
+        return 3
+    body = json.dumps({"gh_token": token}, separators=(",", ":")).encode("utf-8")
+    try:
+        status, raw = client._request("POST", "/identity/github/revoke",
+                                      headers={"Content-Type": "application/json"}, body=body, label="identity")
+    except (OSError, http.client.HTTPException) as e:
+        emit({"event": "error", "detail": "identity revoke unreachable: %s" % e})
+        emit({"event": "identity_revoke_failed", "reason": "unreachable"})
+        return 12
+    answer = None
+    if status == 200:
+        try:
+            answer = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            answer = None
+    if isinstance(answer, dict) and valid_login(answer.get("gh_login")):
+        emit({"event": "identity_revoked", "gh_login": answer["gh_login"], "not_before": answer.get("not_before")})
+        return 0
+    reason = _refusal_reason(status, raw) if status != 200 else "http-200"
+    emit({"event": "identity_revoke_failed", "reason": reason})
+    return 3 if reason == "no-gh" else 12
 
 
 def main(argv=None):
@@ -2402,6 +2455,13 @@ def main(argv=None):
     parsed = _split_relay(args.relay)
     if parsed is None:
         ap.error("--relay must be an http:// or https:// URL")
+    if args.identity_revoke:
+        return identity_revoke(args)
+    missing = [flag for flag, value in (("--repo", args.repo), ("--ui-port", args.ui_port)) if value is None]
+    if missing:
+        ap.error("the following arguments are required: %s" % ", ".join(missing))
+    if args.no_confirm and not args.code:
+        ap.error("--no-confirm needs --code")
 
     # Configured before the first possible emit() below (mirrors _split_relay
     # being computed here AND again inside RelayClient.__init__ -- a cheap
@@ -2450,6 +2510,9 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
+
+    if args.code:
+        client.code_start()  # after the signal handlers: Ctrl-C while the window registers still revokes
 
     client.login_startup()
 

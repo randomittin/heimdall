@@ -40,6 +40,18 @@ def _compact(obj):
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
+class _QuietServer(ThreadingHTTPServer):
+    """A client that closes a connection mid-request (the code-window renewal cuts hmd's stream on purpose) is
+    not a fault of this fake: the default handler would print a traceback for it into the suite's output."""
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Session:
     def __init__(self, sid, token, pairing_code, exp):
         self.id = sid
