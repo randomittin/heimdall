@@ -1,0 +1,22 @@
+{
+  "name": "runhmd-receipts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker + Durable Objects: the hosted runhmd receipt service (RP3). Verifies runhmd.receipt/1 Ed25519 signatures against a pinned public key, stores receipts immutably, serves /r/<id>, /r/<id>.json and /r/<id>/card.png, and takes finding ratings. Contract of record: docs/RECEIPTS.md and docs/schemas/runhmd.receipt.v1.json.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "sync-schemas": "node scripts/sync-schemas.mjs",
+    "test": "node scripts/sync-schemas.mjs --check && vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260921.1",
+    "typescript": "~6.0.3",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.136.1"
+  }
+}

@@ -1,0 +1,8 @@
+node_modules/
+# trailing-slash above only matches a directory; a worktree's node_modules
+# symlink is a symlink, not a dir, so it needs the plain (no-slash) form too.
+node_modules
+.wrangler/
+.dev.vars
+dist/
+*.tsbuildinfo
