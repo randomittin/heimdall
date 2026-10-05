@@ -123,8 +123,8 @@ class Phone:
                 return None
             time.sleep(0.1)
 
-    def ack(self, seq, timeout=20):
-        frame = self.wait(lambda f: f["type"] == "ack" and f["body"].get("of_seq") == seq, timeout=timeout)
+    def ack(self, seq, since=0, timeout=20):
+        frame = self.wait(lambda f: f["type"] == "ack" and f["body"].get("of_seq") == seq, since=since, timeout=timeout)
         return None if frame is None else frame["body"]
 
     def state(self, pred=lambda state: True, since=0, timeout=20):

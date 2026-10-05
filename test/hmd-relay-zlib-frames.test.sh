@@ -437,7 +437,7 @@ rig.send("state", {"state": state})
 got = rig.plaintext(rig.last("state"))
 assert got == plain_frame(state), "before a resync the frame must be exactly the plain {state, caps}"
 obj = json.loads(got)
-assert "z" not in obj and obj["caps"] == ["login-v1", "push-v1", "resync", "z-zlib"] and obj["state"] == state
+assert "z" not in obj and obj["caps"] == ["login-v1", "push-v1", "resync", "view-v1", "z-zlib"] and obj["state"] == state
 # caps outside a resync command are not the handshake: a send-message that carries them changes nothing
 rig.command({"action": "send-message", "params": {"text": "no handshake here"}, "caps": ["z-zlib"]})
 rig.command({"action": "decide", "params": {"id": "p-0", "decision": "deny"}, "caps": ["z-zlib"]})

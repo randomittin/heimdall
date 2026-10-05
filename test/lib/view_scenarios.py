@@ -542,7 +542,7 @@ def g_latch(st):
           "latch: and nothing it asked for is ever answered")
     before = p.mark()
     seq = p.command({"action": "view", "params": {"rid": "v-replay", "kind": "diff", "path": None}}, seq=1)
-    ack = p.ack(seq)
+    ack = p.ack(seq, since=before)
     check(ack is not None and ack.get("ok") is False and ack.get("detail") == "non-increasing-seq",
           "latch: a genuine command under a seq already used is refused by the replay guard", ack)
     check(p.state(lambda s: ((s.get("views") or {}).get("result") or {}).get("id") == "v-replay", since=before, timeout=2) is None,
