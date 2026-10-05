@@ -156,9 +156,9 @@ run "$HMD" definitely-not-a-cmd
 expect_rejected "hmd definitely-not-a-cmd exits 2 'unknown command', no launch"
 run "$HEIMDALL" definitely-not-a-cmd
 expect_rejected "heimdall definitely-not-a-cmd behaves identically"
-err_has "'definitely-not-a-cmd'" \
-  && ok "the message names the offending word" \
-  || bad "the message does not quote the word -- stderr=[$(snip "$ERR")]"
+err_has "unknown command: definitely-not-a-cmd" \
+  && ok "the message names the offending word ('unknown command: <word>')" \
+  || bad "the message is not 'unknown command: <word>' -- stderr=[$(snip "$ERR")]"
 for w in attack prove typo; do
   run "$HMD" "$w"
   expect_rejected "hmd $w (the three words the audit launched agents with) exits 2"

@@ -927,12 +927,12 @@ UNK_STUB="$(cat "$ROUTE_OUT")"
 UNK_TRACE="$(cat "$TRACE")"
 
 grep -q 'launch:task' <<<"$UNK_TRACE" \
-  && ok "8c UNKNOWN token still falls through to the task prompt (hmd fix the login bug)" \
-  || bad "8c the unknown-token fall-through broke" "trace=[$UNK_TRACE]"
+  && ok "8c an unknown multi-word prompt still falls through to the task prompt (hmd fix the login bug)" \
+  || bad "8c the unknown-prompt fall-through broke" "trace=[$UNK_TRACE]"
 
 grep -q 'heimdall-wrap' <<<"$UNK_STUB" \
-  && bad "8d an unknown token was hijacked by the wrap launcher" "stub=[$UNK_STUB]" \
-  || ok "8d UNKNOWN tokens are NOT routed to wrap"
+  && bad "8d an unknown prompt was hijacked by the wrap launcher" "stub=[$UNK_STUB]" \
+  || ok "8d unknown prompts are NOT routed to wrap"
 
 [ "$EMPTY_STUB" != "$UNK_STUB" ] && [ "$EMPTY_TRACE" != "$UNK_TRACE" ] \
   && ok "8e empty and unknown produce DIFFERENT observable behaviour" \
