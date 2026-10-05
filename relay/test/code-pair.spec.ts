@@ -937,6 +937,7 @@ describe("POST /identity/github/revoke (spec 6.4)", () => {
     const window = await openWindow(fake, user);
     const bystanderWindow = await openWindow(fake, bystander.user);
 
+    await sleep(1100); // the sign-in above must be an earlier second than the revoke: see "identity revoked" above
     const token = fake.laptopToken(user);
     const res = await revokeRequest({ gh_token: token });
     const body = await expectRow(res, "identity_revoke.ok", { gh_login: user.login });
