@@ -678,7 +678,7 @@ mkdir -p "$OVERRIDE_DIR/.planning"
 cat > "$OVERRIDE_DIR/.planning/settings.json" <<'EOJSON'
 {"model_routing": {"default_code": "opus"}}
 EOJSON
-( cd "$OVERRIDE_DIR" && run_hmd "some-unknown-task-resolver-present-with-override" )
+( cd "$OVERRIDE_DIR" && run_hmd "some unknown task resolver present with override" )
 rm -rf "$OVERRIDE_DIR"
 
 if claude_reached; then
@@ -723,7 +723,7 @@ for helper in $LAUNCH_HELPERS; do
   # ABSENT
   reset
   rm -f "$FAKE_BIN/$helper"
-  run_hmd "unknown-task-absent-$helper"
+  run_hmd "unknown task absent $helper"
   if claude_reached; then
     ok "launch survives ABSENT $helper"
   else
@@ -735,7 +735,7 @@ for helper in $LAUNCH_HELPERS; do
   reset
   printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE_BIN/$helper"
   chmod 000 "$FAKE_BIN/$helper"
-  run_hmd "unknown-task-noexec-$helper"
+  run_hmd "unknown task noexec $helper"
   if claude_reached; then
     ok "launch survives NON-EXECUTABLE $helper (lost +x bit)"
   else

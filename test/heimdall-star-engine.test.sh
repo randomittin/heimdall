@@ -332,15 +332,16 @@ if grep -q "heimdall-funnel" "$STUB_OUT" && grep -qF -- "emit init --context cli
 else
   bad "(E3) funnel routing failed: $(cat "$STUB_OUT")"
 fi
-# FALSIFIER: an unknown command must NOT route to any of the three stubs.
-rstub; run_fake "build-something-unknown-xyz-abcdef"
+# FALSIFIER: a task prompt (several words — a lone unknown word exits 2 instead, see
+# test/heimdall-unknown-command.test.sh) must NOT route to any of the three stubs.
+rstub; run_fake "build something unknown xyz abcdef"
 if grep -q "launch:task" "$TRACE" \
    && ! grep -q "heimdall-badge" "$STUB_OUT" \
    && ! grep -q "heimdall-clip" "$STUB_OUT" \
    && ! grep -q "heimdall-funnel" "$STUB_OUT"; then
-  ok "(E4) unknown command falls through to Claude, routes to no star stub (falsifier)"
+  ok "(E4) a task prompt falls through to Claude, routes to no star stub (falsifier)"
 else
-  bad "(E4) unknown command mis-routed: trace=$(cat "$TRACE") stubs=$(cat "$STUB_OUT")"
+  bad "(E4) a task prompt mis-routed: trace=$(cat "$TRACE") stubs=$(cat "$STUB_OUT")"
 fi
 rm -rf "$FAKE" "$STUB_OUT" "$TRACE"
 

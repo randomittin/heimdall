@@ -34,10 +34,12 @@
 #     is destroyed by (or destroys) the tool's next self-update. It must not live
 #     in the tool's own directory.
 #   · EMPTY vs UNKNOWN COLLAPSE. Bare `hmd` must wrap-and-launch the default tool;
-#     an UNKNOWN token must still fall through to the Claude task prompt (that is
-#     why `hmd fix the login bug` works — test/heimdall-cli-routing.test.sh §8).
-#     These are two DIFFERENT behaviours and each is asserted separately here; a
-#     change that collapses them into one goes RED on the other.
+#     an unknown MULTI-WORD invocation must still fall through to the Claude task
+#     prompt (that is why `hmd fix the login bug` works — test/heimdall-cli-routing.test.sh
+#     §8). (A lone unknown word is neither: it exits 2, see
+#     test/heimdall-unknown-command.test.sh.) These are two DIFFERENT behaviours and
+#     each is asserted separately here; a change that collapses them into one goes RED
+#     on the other.
 #
 # SAFETY. Every case runs inside a throwaway `mktemp -d` with HOME, HEIMDALL_HOME
 # and the git repo all redirected into it. Nothing here can reach the real
@@ -897,12 +899,14 @@ done
 # 8. EMPTY vs UNKNOWN — two DIFFERENT behaviours, each asserted on its own.
 #
 #    Empty  → wrap-and-launch the default tool (the §7 behaviour).
-#    Unknown→ the Claude task prompt, unchanged. This is why `hmd fix the login
-#             bug` works, and test/heimdall-cli-routing.test.sh §8 pins it at 51/0.
+#    Unknown→ the Claude task prompt, unchanged, for a multi-word invocation. This is
+#             why `hmd fix the login bug` works, and test/heimdall-cli-routing.test.sh
+#             §8 pins it. (A LONE unknown word exits 2 instead of launching:
+#             test/heimdall-unknown-command.test.sh.)
 #    A change that collapses either into the other goes RED here.
 # ══════════════════════════════════════════════════════════════════════════════
 echo
-echo "8. empty args vs unknown subcommand (distinct)"
+echo "8. empty args vs unknown multi-word prompt (distinct)"
 
 # The routed heimdall-wrap stub records the call; the trace file records whether
 # the Claude launch path was reached. The two are read independently.
