@@ -146,9 +146,9 @@ def run(push, root, wait_s, out, env):
         if result is None or result["state"] != "done":
             push.withdraw_test_request(root, request_id)
     if result is None:
-        out.write("push-test: no push sender picked the request up within %g s. The sender is the `hmd ui` process "
-                  "that `hmd app connect` started for this repo (`hmd app status`); one started before this command "
-                  "existed has to be restarted, and HMD_PUSH=0 in its environment turns it off.\n"
+        out.write("push-test: no push sender picked the request up within %g s. The sender is the `hmd ui` or relay "
+                  "client process that `hmd app connect` started for this repo (`hmd app status`); one started before "
+                  "this command existed has to be restarted, and HMD_PUSH=0 in its environment turns it off.\n"
                   % min(PICKUP_S, wait_s))
         return EXIT_NO_SENDER
     if result["state"] != "done":
