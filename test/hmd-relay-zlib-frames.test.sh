@@ -122,7 +122,7 @@ def real_state():
 
 def plain_frame(state):
     """The bytes send_hmd_frame serialises a state frame to before any packing: the state plus hmd'"'"'s caps."""
-    return json.dumps({"state": state, "caps": e2e.hmd_caps(extra=[e2e.CAP_LOGIN])}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps({"state": state, "caps": e2e.hmd_caps(extra=[e2e.CAP_LOGIN, e2e.CAP_CONTROLS])}, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def real_state_plaintext():

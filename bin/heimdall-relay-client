@@ -1366,9 +1366,9 @@ class RelayClient:
         except Exception as e:
             emit({"event": "error", "detail": "control command failed: %s" % type(e).__name__})
             return False, "internal-error", {}
-        if self.cache is not None:
-            self.cache.invalidate()  # a control changes what the next state frame must say
-        return result
+        if result[0] and self.cache is not None:
+            self.cache.invalidate()  # a control that ran changes what the next state frame must say (a refusal only
+        return result                #  moves the audit log, which the cache already watches)
 
     def _login_command(self, action, params):
         """The phone's sealed login commands (spec 4.3):

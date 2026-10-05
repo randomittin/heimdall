@@ -1055,7 +1055,7 @@ rig.mod.LOGIN = None  # the feature module failed to import
 rig.client._rearm_state()
 rig.client._tick_once()
 frame = json.loads(rig.E2E.unpack_plaintext(rig.plaintext([p for p in rig.posts if p["type"] == "state"][-1])))
-assert frame["caps"] == ["push-v1", "resync", "z-zlib"], "no module, no cap (and the push store's own cap is untouched)"
+assert frame["caps"] == ["controls-v1", "push-v1", "resync", "z-zlib"], "no module, no cap (and the push store's own cap is untouched)"
 rig.resync(["login-v1"])
 assert rig.cmd("login_start", {"kind": "claudeai"})["detail"] == "not-implemented"
 assert rig.cmd("login_code", {"id": "l-00000000", "code": "x"})["detail"] == "not-implemented"
