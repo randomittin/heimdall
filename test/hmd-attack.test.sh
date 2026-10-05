@@ -27,8 +27,6 @@ FALSIFY="$REPO/bin/falsify"
 SCHEMA_PY="$REPO/bin/lib/runhmd_schema.py"
 SCHEMA_JSON="$REPO/docs/schemas/runhmd.verdict.v1.json"
 ORACLE="$REPO/evals/oracles/attack"
-BUGGY="$REPO/fixtures/attack/buggy-webhook"
-CLEAN="$REPO/fixtures/attack/clean-sample"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
@@ -581,8 +579,15 @@ git_before="$(git -C "$REPO" status --porcelain)"
 ( cd "$REPO" && HOME="$HOME_BEFORE/h" HEIMDALL_HOME="$HOME_BEFORE/heimdall" TMPDIR="$HOME_BEFORE/tmp" "$HMD" attack fixtures/attack/buggy-webhook --json --yes >/dev/null 2>&1 )
 [ -z "$(ls -A "$HOME_BEFORE/h")" ] && [ -z "$(ls -A "$HOME_BEFORE/tmp")" ] && [ "$git_before" = "$(git -C "$REPO" status --porcelain)" ] \
   && ok "no files in HOME, none left in TMPDIR, repo tree untouched" || bad "attack wrote outside its ephemeral dir: home=[$(ls -A "$HOME_BEFORE/h")] tmp=[$(ls -A "$HOME_BEFORE/tmp")]"
-stray="$(cd "$HOME_BEFORE/heimdall" && find . -type f | sort | tr '\n' ' ')"
-[ "$stray" = "./.run-count " ] && ok "HEIMDALL_HOME holds only the dispatcher's own .run-count bump (pre-existing behaviour of every hmd command)" || bad "unexpected files in HEIMDALL_HOME: $stray"
+# What the dispatcher preamble itself leaves in HEIMDALL_HOME (run-count bump, setup marker) is
+# pre-existing behaviour of EVERY hmd command (RP7's zero-footprint mode owns it); measure it with
+# a command that does nothing else, and require attack to add nothing on top.
+BASE_HOME="$TMP/basehome"; mkdir -p "$BASE_HOME"
+( cd "$REPO" && HEIMDALL_HOME="$BASE_HOME" "$HMD" version >/dev/null 2>&1 )
+footprint() { (cd "$1" && find . -type f | sort | tr '\n' ' '); }
+[ "$(footprint "$HOME_BEFORE/heimdall")" = "$(footprint "$BASE_HOME")" ] \
+  && ok "attack adds nothing to HEIMDALL_HOME beyond the dispatcher preamble's own footprint ($(footprint "$BASE_HOME"))" \
+  || bad "attack wrote extra files into HEIMDALL_HOME: [$(footprint "$HOME_BEFORE/heimdall")] vs preamble-only [$(footprint "$BASE_HOME")]"
 
 echo "  -- the verdict comes from the gate (mutation proof) --"
 mkdir -p "$TMP/mut"

@@ -380,11 +380,12 @@ dispatch_words() {
   } | sort -u
 }
 
-# Dispatched by hmd's roadmap but not yet by this tree's bin/heimdall (RP1 `hmd attack`, RP2
-# `hmd prove`). runhmd must already know them: `attack` IS the default command. Once a word
-# lands in bin/heimdall it stops needing this allowance — and the allowance for a word that IS
-# dispatched is itself reported, so the list cannot quietly outlive its reason.
-PLANNED="attack prove"
+# Dispatched by hmd's roadmap but not yet by this tree's bin/heimdall (RP2 `hmd prove`;
+# RP1 `hmd attack` has landed: bin/heimdall dispatches it). runhmd must already know them:
+# `attack` IS the default command. Once a word lands in bin/heimdall it stops needing this
+# allowance — and the allowance for a word that IS dispatched is itself reported, so the list
+# cannot quietly outlive its reason.
+PLANNED="prove"
 
 DISPATCHED="$(dispatch_words)"
 LISTED="$(grep -v '^[[:space:]]*#' "$HMD_PKG/subcommands.txt" | grep -v '^[[:space:]]*$' | sed 's/[[:space:]]*$//' | sort)"
