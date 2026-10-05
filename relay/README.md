@@ -22,6 +22,11 @@ Durable Object per `session_id` (the single serialization point for that session
   or `?device_token=<token>` to reconnect after binding.
 - **pairing**: `POST /pair/init` (unauthenticated) creates a session and returns a session id, a
   single-use ~60s pairing code, and the hmd-side bearer token.
+- **health**: `GET /health` (unauthenticated; `HEAD` too) answers `200 {"ok":true,"version":"<build>"}`
+  from the Worker alone — it never reaches a Durable Object — and is what the deploy pipeline's
+  canary check polls. `version` is `BUILD_ID`, the commit sha the pipeline injects with `wrangler
+  deploy --var BUILD_ID:<sha>`, or `package.json`'s version when none was injected (local dev, a
+  hand-run deploy). The body carries nothing about sessions, secrets or the host.
 
 The relay stores and forwards **ciphertext only** for `state` / `command` / `ack` frames — it
 never sees plaintext. `device_bound`, `session_ended` and `keepalive` are the three
@@ -31,11 +36,32 @@ seal them if it wanted to.
 
 ## Deploy
 
+A merge to `main` that touches `relay/**` deploys itself. `.github/workflows/relay-deploy.yml` runs
+relay-ci, ships the commit to the `hmd-relay-canary` Worker (`[env.canary]` in `wrangler.toml`: its
+own Durable Object namespace and its own signing secret) and polls that Worker's `GET /health` until
+it reports the commit's sha as `version`. Only then does it deploy the same commit to `hmd-relay` and
+run the same check. If either check fails, that Worker is put back with `wrangler rollback` and the
+pipeline stops, so a bad canary never reaches production. `workflow_dispatch` runs it by hand; from a
+branch other than `main` it stops after the canary.
+
+What the check proves is that the Worker answers and that the new build is the one serving. It does
+not pair a phone or round-trip a frame, so a canary missing its `RELAY_SIGNING_SECRET` still passes.
+
+One-time setup, in the repo's Settings, Environments: `relay-canary` and `relay-production` each need
+the secret `CLOUDFLARE_API_TOKEN` and the variable `CLOUDFLARE_ACCOUNT_ID`, and each Worker needs its
+own signing secret (below). The check polls `https://hmd-relay-canary.therishabh16.workers.dev` and
+`https://hmd-relay.therishabh16.workers.dev`; an environment variable `RELAY_URL` overrides the base
+URL. `bash scripts/health-check.sh <base-url> [expected-version]` is that same check, runnable by hand
+against any relay.
+
+By hand:
+
 ```
 cd relay
 npx wrangler login
-npx wrangler secret put RELAY_SIGNING_SECRET
-npx wrangler deploy
+npx wrangler secret put RELAY_SIGNING_SECRET                # production
+npx wrangler secret put RELAY_SIGNING_SECRET --env canary   # canary
+npx wrangler deploy                                         # production; --env canary for the canary
 ```
 
 `RELAY_SIGNING_SECRET` HMAC-signs the **`device_token` only** — session id, role, expiry and the

@@ -8,6 +8,13 @@
 export interface Env {
   SESSION: DurableObjectNamespace;
   RELAY_SIGNING_SECRET: string;
+  /** Optional build identifier `GET /health` reports as `version`
+   *  (src/health.ts). The deploy pipeline injects the commit sha with
+   *  `wrangler deploy --var BUILD_ID:<sha>` so its canary check can tell the
+   *  NEW build from a stale one. Declared nowhere in wrangler.toml — absent
+   *  (local dev, vitest, a hand-run `wrangler deploy`) or empty, `/health`
+   *  reports package.json's version. Not a secret. */
+  BUILD_ID?: string;
   /** Optional override, in milliseconds, for how long hmd's `GET /stream`
    *  may sit idle before the relay writes a `keepalive` control frame
    *  (src/session.ts's KEEPALIVE_INTERVAL_MS). Declared nowhere in

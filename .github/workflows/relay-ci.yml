@@ -2,8 +2,9 @@
 #
 # The Cloudflare Worker + Durable Object relay lives in relay/ (moved from hmdapp with its history).
 # This workflow is the check that a change to it, or to the files that speak its wire protocol,
-# still works. It has no secrets and deploys nothing: a deploy pipeline (canary, probes, rollback)
-# is a separate workflow with its own environments and is not part of this file.
+# still works. It has no secrets and deploys nothing: the deploy pipeline (canary, health check,
+# rollback) is a separate workflow with its own environments, relay-deploy.yml, which runs this
+# whole file as its first job (the workflow_call trigger below) and deploys only if it is green.
 #
 # Two jobs, because the two halves of the contract run on different toolchains:
 #
@@ -52,12 +53,17 @@ on:
       - 'test/relay-contract-fixtures.test.sh'
       - 'test/lib/relay_contract_replay.py'
       - '.github/workflows/relay-ci.yml'
+  workflow_call:
 
 permissions:
   contents: read
 
+# The group carries github.workflow because relay-deploy.yml calls this file as its gate, and in a
+# called workflow github.workflow is the CALLER's name. A push to main therefore runs this file twice
+# -- on its own push trigger, and as the deploy gate -- under two different groups, and neither can
+# cancel the other. Were they one group, a cancelled gate would silently skip the deploy.
 concurrency:
-  group: relay-ci-${{ github.ref }}
+  group: relay-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
