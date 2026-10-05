@@ -226,7 +226,7 @@ changes, so section 11.5 requires no Study B re-run.
    `--output-format stream-json --verbose`) and sums the token usage of every distinct assistant message.
    A message id is counted once however many events carry it, at the largest usage seen for it; where a
    message lists `iterations` that add up to more than its top-level usage, those are counted. Each message
-   is priced at the published per-token prices of the model it names, from the table in point 4: cache reads,
+   is priced at the published per-token prices of the model it names, from the table in point 5: cache reads,
    5-minute cache writes and 1-hour cache writes have their own prices, and cache writes that the usage does
    not split by duration are priced at the 1-hour rate. Fast mode doubles a message's price, US-only
    inference adds 10% and a web search costs US$0.01, all as published. A model id that is not in the table
@@ -248,7 +248,17 @@ changes, so section 11.5 requires no Study B re-run.
    fallback. An agent that reports no usage at all is `unmetered`: only the 30-minute limit applies to it,
    its `cost_usd` is null (never 0), and the harness says so on stderr and in its final line. The first model
    any message names is recorded in `model`.
-4. **Prices** (US$ per million tokens), read on 2026-10-05 from Anthropic's published model pricing
+4. **Total cap.** The operator set a hard cap of US$180.00 on all Study A spend on 2026-10-05, which is the
+   section 10 bound for 3 agents and 30 tasks. The harness holds it against an append-only ledger,
+   `results/spend.ndjson`: one line per agent run, written when the agent exits (or the harness fails), with the
+   cost the run is counted at (its cost of record, or US$2.00 when the cost is unknown). A run starts only while
+   the ledger leaves room for a whole per-run cap under the total; tasks not started for that reason get rows
+   whose `infra_error` begins `not run:`, so the summary lists them as excluded and the study is incomplete
+   (section 8). A second invocation reads the same ledger, so a restart or another agent spends from the same
+   US$180.00, and a ledger that cannot be read stops the run before anything is spent. The kill acts on usage
+   the agent has already reported, so a run can pass its cap by what one model message costs; the total is hard
+   to within that.
+5. **Prices** (US$ per million tokens), read on 2026-10-05 from Anthropic's published model pricing
    (platform.claude.com/docs/en/about-claude/pricing). `test/false-green-agent-cap.test.sh` fails if
    `bin/lib/fg_agent.py` holds any other value.
 
