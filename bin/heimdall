@@ -1611,7 +1611,8 @@ print_banner() {
 # of reserved words — demo, uninstall, version, help — are routed as real
 # subcommands (the space form: `hmd demo`) BEFORE the task-prompt fallthrough.
 # Everything else falls through to task-prompt behavior (`hmd "build X"`), which
-# is the everyday two-letter invocation the short name exists for.
+# is the everyday two-letter invocation the short name exists for -- except ONE bare
+# word, which is a mistyped command and exits 2 (see "Unknown-command guard" below).
 
 ENTRY_NAME="$(basename "$0")"   # hmd or heimdall — for self-referential help
 
@@ -3040,12 +3041,14 @@ case "${1:-}" in
   '')
     # §7 EMPTY ARGS → wrap-and-launch the default tool.
     #
-    # DISTINCT FROM THE UNKNOWN-TOKEN PATH, deliberately. An unknown token still
-    # falls through to the Claude task prompt below — that fall-through is what
-    # makes `hmd fix the login bug` work, and test/heimdall-cli-routing.test.sh §8
-    # pins it. Only the EMPTY invocation means "set this repo up and start", so
-    # only the empty invocation routes here. test/wrap-lifecycle.test.sh §8 asserts
-    # both behaviours separately; collapsing either into the other goes RED.
+    # DISTINCT FROM THE UNKNOWN-TOKEN PATH, deliberately. An unknown MULTI-WORD
+    # invocation still falls through to the Claude task prompt below — that
+    # fall-through is what makes `hmd fix the login bug` work, and
+    # test/heimdall-cli-routing.test.sh §8 pins it. (A lone unknown word is
+    # rejected, exit 2, by the guard just before ensure_node_path.) Only the EMPTY
+    # invocation means "set this repo up and start", so only the empty invocation
+    # routes here. test/wrap-lifecycle.test.sh §8 asserts both behaviours
+    # separately; collapsing either into the other goes RED.
     #
     # THE GUARD: heimdall-wrap launches `claude` by exec'ing THIS script back (it
     # owns model-tier resolution, the permission flags and the preamble). Without
@@ -3450,6 +3453,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo ""
   echo "Usage:"
   echo "  heimdall \"build X\"       Run a task end-to-end in the current directory"
+  echo "  heimdall -- <word>       Run a ONE-word task (a lone word alone is read as a command)"
   echo "  heimdall                  Interactive Claude session with heimdall powers"
   echo "  heimdall --resume         Resume last session (conversation + .planning state)"
   echo "  heimdall --auto           Use auto-mode (safer alternative to skip-permissions)"
@@ -4385,6 +4389,114 @@ PYEOF
   fi
 }
 
+# ── Unknown-command guard: a lone mistyped word must not start an agent ──
+#
+# THE BUG: the dispatch above has no catch-all arm, so a word it did not recognise
+# fell through to the task-prompt launch below -- an autonomous Claude session
+# (--dangerously-skip-permissions) started on a typo. `hmd attack`, `hmd prove` and
+# `hmd typo` each did exactly that (an `hmd attack </dev/null` hung 120 s). `hmd hooks`
+# was the same bug for one real command (dc5ef731); this closes the class.
+#
+# THE RULE, applied at the call site below -- AFTER every case arm and every flag
+# block has had its chance, so a known command has already exec'd or exited and the
+# decision needs no list of what is known:
+#   no arguments                          -> interactive session
+#   two or more arguments                 -> task prompt        (hmd fix the login bug)
+#   one argument containing whitespace    -> task prompt        (hmd "fix the bug in x")
+#   `--` first, then anything             -> task prompt, verbatim (hmd -- refactor)
+#   one empty argument                    -> left alone: not a word
+#   one non-empty argument, no whitespace -> a command attempt: exit 2
+# A mistyped command followed by more words (`hmd hook list`) is indistinguishable
+# from a prompt and still launches; only the lone word is rejected.
+#
+# The only list here -- the "did you mean" candidates -- is read out of this file's own
+# dispatch text each time, never copied: a command added or removed above is suggested
+# (or not) with nothing else to update. It is best-effort: a failed read costs the
+# suggestion, never the rejection.
+
+# _hmd_dispatch_names [FILE] -- every command word FILE (default: this script) dispatches,
+# one per line: the arms of each top-level `case "${1:-}" in` block, plus the
+# `if [[ "${1:-}" == "..." ]]` flag blocks after it (--update, update, --help, ...).
+# The '' and * arms are not names.
+_hmd_dispatch_names() {
+  awk -v q="'" '
+    /^case "\$\{1:-\}" in[[:space:]]*$/ { arms = 1; next }
+    /^esac([[:space:]]|$)/              { arms = 0; next }
+    arms && /^  [^[:space:]#][^()]*\)/ {
+      label = $0
+      sub(/\).*/, "", label)
+      sub(/^  /, "", label)
+      n = split(label, alt, "|")
+      for (i = 1; i <= n; i++) {
+        gsub(/[[:space:]]/, "", alt[i])
+        if (alt[i] != "" && alt[i] != q q && alt[i] != "*") print alt[i]
+      }
+    }
+    /^if \[\[ "\$\{1:-\}" == / {
+      rest = $0
+      while (match(rest, /== "[^"]+"/)) {
+        print substr(rest, RSTART + 4, RLENGTH - 5)
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+    }
+  ' "${1:-$SELF}"
+}
+
+# _hmd_closest_command WORD -- the dispatched command nearest to WORD by edit distance
+# (case-insensitive), or nothing when none is close enough to be a fair guess: within a
+# third of WORD's length, 1..3 edits. A wrong "did you mean" is worse than none. Never
+# WORD itself (a known flag that is merely misplaced is not a typo of itself).
+_hmd_closest_command() {
+  _hmd_dispatch_names | HMD_TYPED="$1" awk '
+    function lev(a, b,    la, lb, i, j, c, prev, cur) {
+      la = length(a); lb = length(b)
+      for (j = 0; j <= lb; j++) prev[j] = j
+      for (i = 1; i <= la; i++) {
+        cur[0] = i
+        for (j = 1; j <= lb; j++) {
+          c = (substr(a, i, 1) == substr(b, j, 1)) ? 0 : 1
+          cur[j] = prev[j] + 1
+          if (cur[j - 1] + 1 < cur[j]) cur[j] = cur[j - 1] + 1
+          if (prev[j - 1] + c < cur[j]) cur[j] = prev[j - 1] + c
+        }
+        for (j = 0; j <= lb; j++) prev[j] = cur[j]
+      }
+      return prev[lb]
+    }
+    BEGIN {
+      typed = ENVIRON["HMD_TYPED"]
+      lowered = tolower(typed)
+      tlen = length(typed)
+      limit = int(tlen / 3)
+      if (limit < 1) limit = 1
+      if (limit > 3) limit = 3
+      best = limit + 1
+    }
+    $0 != typed {
+      # An edit distance is never below the length gap, so a candidate whose length is
+      # already out of reach is skipped BEFORE the quadratic table is built: without
+      # this a pasted 30000-character word ran for minutes.
+      gap = length($0) - tlen
+      if (gap < 0) gap = -gap
+      if (gap >= best) next
+      d = lev(lowered, tolower($0))
+      if (d < best) { best = d; pick = $0 }
+    }
+    END { if (pick != "") print pick }
+  '
+}
+
+# hmd_reject_unknown_command WORD -- say WORD is not a command (and what it may have
+# been meant to be), then exit 2. Everything goes to stderr; never returns.
+hmd_reject_unknown_command() {
+  local word="$1" near=""
+  near="$(_hmd_closest_command "$word" 2>/dev/null || true)"
+  echo "error: unknown command: $word" >&2
+  [ -z "$near" ] || echo "did you mean '$near'?" >&2
+  echo "run '$ENTRY_NAME --help' for the commands, or '$ENTRY_NAME -- $word' to run it as a task prompt" >&2
+  exit 2
+}
+
 # ── Main: ensure deps, then launch Claude ──
 
 # LIBRARY-ONLY MODE, part 2 of 2 (part 1 skips the dispatch, far above — this half
@@ -4397,6 +4509,16 @@ PYEOF
 # unaffected. `return` works when sourced; the `|| exit 0` covers a direct run.
 if [ "$HMD_LIB_ONLY" = 1 ]; then
   return 0 2>/dev/null || exit 0
+fi
+
+# THE UNKNOWN-COMMAND GUARD (rule + rationale: "Unknown-command guard" above). It sits
+# here -- after the library-only return, before any setup -- so a rejected word never
+# triggers first-run setup, the banner, the update check or a git init, and so library
+# mode never classifies its caller's positional parameters.
+if [ "${1:-}" = "--" ]; then
+  shift                      # explicit prompt marker: whatever follows is the task, even one word
+elif [ "$#" -eq 1 ] && [ -n "$1" ]; then
+  case "$1" in *[[:space:]]*) : ;; *) hmd_reject_unknown_command "$1" ;; esac
 fi
 
 ensure_node_path
