@@ -28,6 +28,34 @@ real history is in git:
 ### Deprecated
 - **`/hmd:level`** is kept as a deprecated alias for one release. It still works and prints a one-line "'/hmd:level' is now '/hmd:autonomy'" notice. It will be removed a couple of releases later.
 
+## [2.4.4] - 2026-10-06 <!-- HEIMDALL:PIN:FROZEN -->
+
+The companion-app release. hmd can now publish a live, end-to-end-encrypted view of a running session to the phone app through a hosted relay, take a short list of safe remote actions from it, and issue signed receipts for what its gates did.
+
+### Added
+- **Pair by session code** — `hmd app connect` defaults to the hosted relay and pairs by the 5-character session code the statusline shows. A bind by code reveals hmd's key in a plaintext `key_reveal`, seals nothing until the laptop approves the SAS check, and revokes and renews the window on reject, timeout or closed input. A revealed key is burned after an unapproved bind, `--code` needs https or loopback, and an identity can be revoked.
+- **controls-v1** — the phone can drive an allowlisted set of controls: `hmd app controls on|off|status`, `POST /api/control`, an interrupt (stop) hook, remote toggles from the hooks registry, and fallback mode over every `heimdall-fallback` state (confirmation required for all but `off`).
+- **view-v1** — the phone can ask for a sealed diff of one repo-relative path (worktree, staged or head; an untracked file shown whole). Path policy refuses `..`, absolute paths, deny-listed files and any symlink; secrets are masked per line; output is size-capped and rate-limited (20 requests per 60 s, `HMD_VIEW_RATE_LIMIT` to change it).
+- **push-v1** — the phone registers its Expo push token (`register_push`, `unregister_push`, `app_state`; stored 0600 in `.heimdall/app/push.json`, at most 5, newest wins) and hmd's push sender notifies it on five triggers (question, approval, error, gate red, finished) with per-device policy, foreground suppression and rate caps. `HMD_PUSH=0` turns it off.
+- **login-v1** — log Claude Code in from the phone: a PTY-driven `claude auth login`, the printed URL checked against an allowlist before it is published, the code typed from a sealed command and never logged, and the resulting account compared with the laptop's pin. Laptop switch: `hmd app remote-login on|off|status`.
+- **Relay** — a Cloudflare Worker + Durable Object relay: E2E sealing (X25519, HKDF-SHA256, ChaCha20-Poly1305), zlib-compressed state frames, persisted client events, last-state replay to a newly accepted device socket, a `GET /health` probe answered by the Worker alone, and hmd's leg over a hibernatable WebSocket (stdlib RFC 6455 client in `bin/lib/hmd_relay_ws.py`). Deploys run the relay-ci gate, then a canary Worker that must report the deployed sha on `/health`, then production, and roll back if a check never passes.
+- **`hmd attack`, `hmd prove`, `hmd receipt`** — `hmd attack <path>` runs the attack oracle battery behind a consent gate (non-TTY needs `--yes`) and prints a `runhmd.verdict/1` as JSON or a card; `hmd prove` answers "do all of this repo's gates pass, and was each shown to fail first?" (PROVEN or DENIED, never a pass on unreadable output); `hmd receipt verify|keygen|render|serve` handles Ed25519-signed `runhmd.receipt/1` receipts, and `attack --receipt` issues one. `npx runhmd <path>` runs `hmd attack <path>`, and `release/ship.sh` now publishes both npm wrappers.
+- **`HMD_TEAM_NO_COMMIT=1`** (or the marker file `~/.heimdall/no-team-commit`) — `hmd team` keeps `.heimdall/team.json` current on disk but never stages or commits it, so a wip checkpoint's `git add -A` cannot sweep it into history.
+- **`hmd ui`, `hmd app`, `hmd inbox`** — a local, token-gated companion web UI; `hmd app connect|status|disconnect|doctor` with Tailscale Funnel publishing; and an inbox that delivers phone messages into the session at tool boundaries and at the Stop hook (held up to 300 s while a companion is connected, released the moment the operator types).
+- **Hooks registry** — every hook has an id and a fingerprint (`heimdall-hooks check` fails on drift), advisory hooks get a per-hook kill switch, and the gates that hold a line are locked and cannot be disabled. New guards: edits to linter, formatter and typechecker config are denied; a live tool-loop detector; `hmd settings-guard` for `ANTHROPIC_*` overrides persisted in Claude Code settings.
+
+### Fixed
+- **ENOSPC recovery** — the relay client no longer goes silent after the disk fills. Its diagnostics wrote to the full disk and raised out of the loops that report errors, ending the poller thread for good. A failing log sink now never raises and is never switched off: the outage is reported once when it starts and once on recovery, and sending resumes when space returns.
+- `hmd <typo>` exits 2 with a did-you-mean suggestion instead of launching an autonomous agent on a lone unknown word.
+- Relay hardening from the protocol audit: the session key is latched at the first device bind, the device sequence never advances on a decrypt failure, and stream reads are bounded per line and per stream.
+
+### Security
+- Audit pass over `hmd ui`, `hmd app` and the inbox: public-mode redaction of every string leaf, connection caps and a header timeout, per-IP auth backoff, the Funnel token kept off argv and logs, validated DNS names, no `eval` in the install path, and 0700/0600 permissions on inbox files.
+- gitleaks now flags Stripe-shaped tokens regardless of entropy.
+
+### Performance
+- State is sent on change instead of on a poll, and `/api/state` is served from the SSE snapshot cache (1.5-3 s per poll down to tens of milliseconds). The chat publisher reads only the appended transcript bytes, and a statusline render launches python 2 times instead of 9-11.
+
 ## [1.1.0] - 2026-04-19
 
 superx can now run **10 agents in parallel** instead of 3 — background agents bypass Claude Code's per-turn limit, so a 10-task wave all runs simultaneously.
