@@ -246,7 +246,7 @@ def load_trust(paths=None):
     that is not a canonical base64 32-byte key is a hard error, never skipped."""
     if paths is None:
         explicit = os.environ.get("RUNHMD_RECEIPT_PUBKEY_FILE")
-        paths = [explicit] if explicit else [p for p in (ANCHOR_FILE, os.path.join(_home(), "signing", PUB_FILE)) if os.path.isfile(p)]
+        paths = [explicit] if explicit else [p for p in (ANCHOR_FILE, os.path.join(signing_dir(), PUB_FILE)) if os.path.isfile(p)]
     trust = {}
     for path in paths:
         try:

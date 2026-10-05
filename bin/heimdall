@@ -2286,6 +2286,23 @@ case "${1:-}" in
     fi
     exec "$ATTACK_BIN" "$@"
     ;;
+  receipt)
+    # `hmd receipt` (RP3) -- the signed, shareable record of one verdict (runhmd.receipt/1,
+    # docs/schemas/runhmd.receipt.v1.json): `verify <file|id>` (any changed field or byte fails),
+    # `keygen`, `render` (static /r/<id> + /r/<id>.json tree for runhmd.dev), `serve` (the same,
+    # locally, loopback only). Pass-through to bin/heimdall-receipt; every arg is forwarded
+    # verbatim. Exit: 0 ok, 1 the receipt is INVALID, 2 usage/config, 5 infrastructure -- which is
+    # why a missing bin exits 5 here, not 1: 1 means a receipt failed verification. Without this
+    # arm `hmd receipt verify x` fell through to the Claude task-prompt path below.
+    shift
+    RECEIPT_BIN="$PLUGIN_DIR/bin/heimdall-receipt"
+    if [ ! -x "$RECEIPT_BIN" ]; then
+      echo "  Error: heimdall-receipt not found at $RECEIPT_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 5
+    fi
+    exec "$RECEIPT_BIN" "$@"
+    ;;
   sla)
     # Pass-through to heimdall-sla: the ⚠-class observation SLA auditor. The standing
     # rule is that a security_note / sensitive / ⚠ observation gets a verdict within
