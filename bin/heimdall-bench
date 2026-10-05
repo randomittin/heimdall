@@ -39,6 +39,10 @@ BENCH_DIR="$PLUGIN_DIR/evals/benchmark"
 RESULTS_JSONL="$BENCH_DIR/results.jsonl"
 RESULTS_MD="$BENCH_DIR/results.md"
 
+# The false-green suite (RP4) subcommands go straight to the harness, which owns their flags:
+#   heimdall bench validate|run|summarize --suite false-green
+case "${1:-}" in validate|run|summarize) exec "$HARNESS" "$@" ;; esac
+
 # ── Colors (truecolor with plain fallback, matching the other bins) ──
 if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" || "${TERM:-}" == *256color* ]]; then
   P='\033[38;2;224;86;160m'; C='\033[38;2;0;212;255m'; V='\033[38;2;155;89;182m'
