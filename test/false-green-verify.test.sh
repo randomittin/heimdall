@@ -294,6 +294,25 @@ t("a candidate verified past the stopping point is discarded, never recorded", l
 t("the same task and pilot directories exist, and nothing else", sorted(os.listdir(paths_p["tasks"])) == sorted(os.listdir(paths_s["tasks"])) and os.listdir(paths_p["pilot"]) == os.listdir(paths_s["pilot"]))
 t("the work root is empty afterwards: no clone, environment or staged output survives", leftovers() == [], leftovers())
 
+# ── [H] a slow candidate at the head of the line does not idle the other workers ──
+started_ranks, started_when_head_finished = [], []
+def slow_head(cand, work, tasks_dir, text, python):
+    rank = p_order.index(cand["issue"]) + 1
+    started_ranks.append(rank)
+    if rank == 1:
+        time.sleep(4)
+    done = real_verify(cand, work, tasks_dir, text, python)
+    if rank == 1:
+        started_when_head_finished.append(len(started_ranks))
+    return done
+fg_verify.verify_one = slow_head
+try:
+    rc_h, rows_h, _ = full_walk("head", 2)
+finally:
+    fg_verify.verify_one = real_verify
+t("while the first candidate is still running, the free worker has moved on to later ranks (3 or more started)", started_when_head_finished and started_when_head_finished[0] >= 3, started_when_head_finished)
+t("and the record is still decided in rank order, the sequential record", rc_h == 0 and view(rows_h) == view(rows_s), (rc_h, view(rows_h)))
+
 # ── [L] low disk in the middle of a walk, then resume ───────────────────────
 calls = [0]
 def stingy():
