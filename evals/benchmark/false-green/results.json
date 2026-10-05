@@ -1,0 +1,221 @@
+{
+  "catch_rate": null,
+  "denial_precision": null,
+  "false_green_rate_by_agent": {},
+  "headline": "No headline number exists: Study A (real agents) has no data.",
+  "judge_calibration": {
+    "by_operator": {
+      "AOR": {
+        "denied_of_those": 0,
+        "judged": 4,
+        "naive_green_defective": 0,
+        "truth_fail": 4
+      },
+      "AWD": {
+        "denied_of_those": 0,
+        "judged": 5,
+        "naive_green_defective": 0,
+        "truth_fail": 2
+      },
+      "COND": {
+        "denied_of_those": 0,
+        "judged": 5,
+        "naive_green_defective": 0,
+        "truth_fail": 5
+      },
+      "CRP": {
+        "denied_of_those": 5,
+        "judged": 13,
+        "naive_green_defective": 6,
+        "truth_fail": 12
+      },
+      "IDR": {
+        "denied_of_those": 0,
+        "judged": 15,
+        "naive_green_defective": 0,
+        "truth_fail": 14
+      },
+      "NEG": {
+        "denied_of_those": 0,
+        "judged": 1,
+        "naive_green_defective": 0,
+        "truth_fail": 1
+      },
+      "ROR": {
+        "denied_of_those": 0,
+        "judged": 2,
+        "naive_green_defective": 0,
+        "truth_fail": 2
+      },
+      "RVR": {
+        "denied_of_those": 0,
+        "judged": 2,
+        "naive_green_defective": 0,
+        "truth_fail": 2
+      },
+      "SDL": {
+        "denied_of_those": 0,
+        "judged": 11,
+        "naive_green_defective": 0,
+        "truth_fail": 11
+      }
+    },
+    "calibration": {
+      "attack_on_design_set": {
+        "base": "PROVEN",
+        "buggy-webhook": "DENIED",
+        "clean-sample": "PROVEN",
+        "dedupes-by-account": "DENIED",
+        "denies-owner": "DENIED",
+        "missed-duplicate": "DENIED",
+        "missed-idor": "DENIED",
+        "off-by-one-rounding": "DENIED",
+        "prefix-ownership": "DENIED",
+        "racy-duplicate": "DENIED"
+      },
+      "calibrated": true,
+      "entries": 10,
+      "problems": []
+    },
+    "candidates_judged": 58,
+    "excluded": [],
+    "false_denials": [],
+    "flags": {
+      "catch_lt_50pct": false,
+      "false_denial_gt_10pct": false
+    },
+    "headline": "Judge calibration, NOT an agent false-green rate: 58 mechanical single-site mutants of one webhook judged (0 excluded). The naive visible tests passed 11 of them; 6 of those were truly defective. Only 6 defective candidates passed the naive check, under 10: no catch percentage is stated.",
+    "misses": [
+      {
+        "case_id": "m-0012",
+        "from": "500",
+        "ground_truth": "balance of acct_A read by its owner",
+        "line": 14,
+        "operator": "CRP",
+        "to": "501"
+      }
+    ],
+    "paired": {
+      "both_caught": 47,
+      "mcnemar_exact_p": 0.0625,
+      "neither_caught": 1,
+      "only_attack_caught": 5,
+      "only_naive_caught": 0
+    },
+    "primary": {
+      "catch_rate": {
+        "ci95": [
+          0.436491,
+          0.969947
+        ],
+        "k": 5,
+        "n": 6,
+        "rate": 0.833333
+      },
+      "denial_precision": {
+        "ci95": [
+          0.565509,
+          1.0
+        ],
+        "k": 5,
+        "n": 5,
+        "rate": 1.0
+      },
+      "false_denial_rate": {
+        "ci95": [
+          0.0,
+          0.434491
+        ],
+        "k": 0,
+        "n": 5,
+        "rate": 0.0
+      },
+      "naive_false_green_rate": {
+        "ci95": [
+          0.280088,
+          0.78729
+        ],
+        "k": 6,
+        "n": 11,
+        "rate": 0.545455
+      },
+      "naive_green": 11,
+      "naive_green_defective": {
+        "ci95": [
+          0.280088,
+          0.78729
+        ],
+        "k": 6,
+        "n": 11,
+        "rate": 0.545455
+      }
+    },
+    "secondary": {
+      "attack_catch_rate": {
+        "ci95": [
+          0.900569,
+          0.996662
+        ],
+        "k": 52,
+        "n": 53,
+        "rate": 0.981132
+      },
+      "attack_denial_precision": {
+        "ci95": [
+          0.931205,
+          1.0
+        ],
+        "k": 52,
+        "n": 52,
+        "rate": 1.0
+      },
+      "attack_false_denial_rate": {
+        "ci95": [
+          0.0,
+          0.434491
+        ],
+        "k": 0,
+        "n": 5,
+        "rate": 0.0
+      },
+      "naive_catch_rate": {
+        "ci95": [
+          0.774232,
+          0.94707
+        ],
+        "k": 47,
+        "n": 53,
+        "rate": 0.886792
+      },
+      "truth_fail": 53,
+      "truth_pass": 5
+    },
+    "status": "measured",
+    "underpowered": {
+      "catch_rate": true,
+      "false_denial_rate": true
+    }
+  },
+  "kill_flags": {
+    "catch_lt_50pct": null,
+    "false_green_lt_10pct": null
+  },
+  "schema": "fg.summary/1",
+  "study_a": {
+    "agents": 0,
+    "by_agent": {},
+    "catch": null,
+    "denial_precision": {
+      "n_rated": 0,
+      "rate": null,
+      "reported": false
+    },
+    "excluded": [],
+    "headline_eligible": false,
+    "pooled": null,
+    "runs": 0,
+    "sampled_tasks": 0,
+    "status": "no-data"
+  },
+  "suite": "false-green"
+}

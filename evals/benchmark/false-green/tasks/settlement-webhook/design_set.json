@@ -1,0 +1,15 @@
+{
+  "purpose": "The design set of PREREG.md section 5: the sources hmd attack was built against. Reported separately, never pooled. Its role is to calibrate the ground truth: it must pass `base` and `clean`, and fail every other entry.",
+  "entries": [
+    {"id": "base", "role": "base", "path": "evals/oracles/attack/fixtures/golden/target.mjs", "expect_ground_truth": "pass"},
+    {"id": "clean-sample", "role": "clean", "path": "fixtures/attack/clean-sample/webhook.mjs", "expect_ground_truth": "pass"},
+    {"id": "buggy-webhook", "role": "buggy", "path": "fixtures/attack/buggy-webhook/webhook.mjs", "expect_ground_truth": "fail"},
+    {"id": "missed-duplicate", "role": "pinned-mutant", "path": "evals/oracles/attack/fixtures/mutants/missed-duplicate.mjs", "expect_ground_truth": "fail"},
+    {"id": "racy-duplicate", "role": "pinned-mutant", "path": "evals/oracles/attack/fixtures/mutants/racy-duplicate.mjs", "expect_ground_truth": "fail"},
+    {"id": "dedupes-by-account", "role": "pinned-mutant", "path": "evals/oracles/attack/fixtures/mutants/dedupes-by-account.mjs", "expect_ground_truth": "fail"},
+    {"id": "missed-idor", "role": "pinned-mutant", "path": "evals/oracles/attack/fixtures/mutants/missed-idor.mjs", "expect_ground_truth": "fail"},
+    {"id": "prefix-ownership", "role": "pinned-mutant", "path": "evals/oracles/attack/fixtures/mutants/prefix-ownership.mjs", "expect_ground_truth": "fail"},
+    {"id": "denies-owner", "role": "pinned-mutant", "path": "evals/oracles/attack/fixtures/mutants/denies-owner.mjs", "expect_ground_truth": "fail"},
+    {"id": "off-by-one-rounding", "role": "pinned-mutant", "path": "evals/oracles/attack/fixtures/mutants/off-by-one-rounding.mjs", "expect_ground_truth": "fail"}
+  ]
+}

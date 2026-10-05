@@ -1,0 +1,28 @@
+{
+  "schema": "fg.prereg-lock/1",
+  "files": {
+    "PREREG.md": "d783ba220b6cb0cc7be9b08580dc5e57b9928aa58eae8b876f287d97f66a455c",
+    "cases.json": "78767e9136800a516cd29ae0144fe1acd9ab25872eb6b27ea27ba9e2c0f3d628",
+    "tasks/settlement-webhook/SPEC.md": "a0b93cd4cd04a574ff548e58d2e7ae37d9a4f18bd23d3c119d44086faa2746db",
+    "tasks/settlement-webhook/base/golden.mjs": "9c9e60477a693a0448c66e631d9bc3e3dcbf39a7cefdf0dfa434b7bfc0ed8d9c",
+    "tasks/settlement-webhook/design_set.json": "16d953866bc61aa23acfab79697423c7efee2a1fe88ac308b2415f9bfd0b2abe",
+    "tasks/settlement-webhook/ground_truth.mjs": "6ddc58ad324da55d7382986bfdc0ebf6089987fa815f9f335a63fb0e28e00dad",
+    "tasks/settlement-webhook/ground_truth.sh": "2fbae22f84b10fdec1caa7ee90d5267f0fe762c1771318058e309f7ae3fe434c",
+    "tasks/settlement-webhook/repo.ref": "bad6814867102d08bbb0972c90aeddff60be4ef8d165c424b482676d09403329",
+    "tasks/settlement-webhook/runhmd.attack.json": "b45e5ce10e4c2e495115bfe954145e33c59a7e3f8c1e7c61e930401b0879c07f",
+    "tasks/settlement-webhook/task.json": "8d8d1057688ad84c342df359e3252693f4742b56509334ebfc57652d63716a30",
+    "tasks/settlement-webhook/visible_tests.mjs": "f9ecd9116c1c9f48cc610c4cbe51c5150eaf6972e6d1b41697f086e53f0e4240"
+  },
+  "design_set": {
+    "evals/oracles/attack/fixtures/golden/target.mjs": "9c9e60477a693a0448c66e631d9bc3e3dcbf39a7cefdf0dfa434b7bfc0ed8d9c",
+    "evals/oracles/attack/fixtures/mutants/dedupes-by-account.mjs": "021f25c630141770a3976861d5b74db50dfaf8d34d672406774d7dcbbc496c1e",
+    "evals/oracles/attack/fixtures/mutants/denies-owner.mjs": "be3b7f771643146167a3a0240f5f93d8e425a7c18d8978a909d74f64bd212233",
+    "evals/oracles/attack/fixtures/mutants/missed-duplicate.mjs": "79067d3edc0d39b330cbeb4c6c319136ad472b44f45fa0e40847ba7d0273b5ad",
+    "evals/oracles/attack/fixtures/mutants/missed-idor.mjs": "55c6e4e0bf5fe72983dfcb3399385b472664712aa99a9851e562262f11f2058b",
+    "evals/oracles/attack/fixtures/mutants/off-by-one-rounding.mjs": "2fa7207a9071b906bfa7ea95195d5535ca3375eab2d5afc2bed9cc560f055a3a",
+    "evals/oracles/attack/fixtures/mutants/prefix-ownership.mjs": "05e2e7e94b9f81457d26cfc9067597a9bb8a5ab9ffe0a5d9d0984bf8120d4c75",
+    "evals/oracles/attack/fixtures/mutants/racy-duplicate.mjs": "da04eaca4f62a6b40508a78980e262c47dca3267af7532271f070190bb5a913f",
+    "fixtures/attack/buggy-webhook/webhook.mjs": "229c9f4fa2a732c09404032896beb3677045f055c1396714ea54f40b8bd2d12b",
+    "fixtures/attack/clean-sample/webhook.mjs": "6f9557263cea810ab20f57850f638232be6c094c4b053f0fff103d2874ee2fe6"
+  }
+}
