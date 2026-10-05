@@ -1,0 +1,92 @@
+# receipts-worker-ci -- the hosted receipt service's own gate, plus the Python half of its contract.
+#
+# The Worker lives in receipts-worker/ (RP3). It has no secrets, no deploy and no network: every key
+# the suite uses is generated in memory per run. Deploying is the operator's, by hand
+# (receipts-worker/README.md), so there is deliberately no deploy workflow here.
+#
+# Two jobs, because the two halves of the contract run on different toolchains:
+#
+#   worker   -- Node 24 (the version this was verified on). npm ci, typecheck, `npm test`: the schema-copy
+#               check, then vitest in a real workerd, including test/vectors.spec.ts, which replays
+#               receipts-worker/contract/vectors.json against the Worker's JavaScript.
+#   contract -- Python. test/receipts-worker-contract.test.sh replays the same vectors against
+#               bin/lib/runhmd_receipt.py, regenerates them, checks the schema copies and runs the real
+#               `hmd receipt verify` on the same bytes. macos-latest, like relay-ci's hmd job, because
+#               heimdall's Python is exercised on macOS; it needs `cryptography` for Ed25519.
+#
+# Path-filtered to the Worker, its contract fixtures, the Python they are pinned to, the schemas it
+# copies, and this file. Actions are pinned by commit SHA, the same pins relay-ci.yml uses.
+name: receipts-worker-ci
+
+on:
+  pull_request:
+    paths:
+      - 'receipts-worker/**'
+      - 'bin/lib/runhmd_receipt.py'
+      - 'bin/lib/runhmd_schema.py'
+      - 'bin/lib/cp_auth.py'
+      - 'docs/schemas/runhmd.*.json'
+      - 'test/receipts-worker-contract.test.sh'
+      - '.github/workflows/receipts-worker-ci.yml'
+  push:
+    paths:
+      - 'receipts-worker/**'
+      - 'bin/lib/runhmd_receipt.py'
+      - 'bin/lib/runhmd_schema.py'
+      - 'bin/lib/cp_auth.py'
+      - 'docs/schemas/runhmd.*.json'
+      - 'test/receipts-worker-contract.test.sh'
+      - '.github/workflows/receipts-worker-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: receipts-worker-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  worker:
+    name: worker (typecheck, tests, vectors)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: receipts-worker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: receipts-worker/package-lock.json
+
+      - name: Install (from the lockfile)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests (schema copies, then vitest in workerd)
+        run: npm test
+
+  contract:
+    name: Python half of the cross-language contract
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # A venv, not the system Python: the runner's Homebrew Python refuses a global pip install (PEP 668).
+      - name: Ed25519 backend
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet cryptography
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Replay receipts-worker/contract/vectors.json against bin/lib/runhmd_receipt.py
+        run: bash test/receipts-worker-contract.test.sh

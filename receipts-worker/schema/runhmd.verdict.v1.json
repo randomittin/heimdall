@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runhmd.dev/schemas/runhmd.verdict.v1.json",
+  "title": "runhmd.verdict/1",
+  "description": "The runhmd verdict document: what `hmd attack --json` prints, and the vocabulary (verdict, finding, gate) that `hmd prove` and the receipt service share. THIS FILE IS THE SINGLE SOURCE: bin/lib/runhmd_schema.py reads it at run time (no copy of these rules lives in code) and refuses any keyword it cannot enforce. The root schema is runhmd.verdict/1; `x-documents` maps every document id this file defines to its schema, and `$defs.proveDoc` is the runhmd.prove/1 envelope `hmd prove` emits. JSON Schema cannot express arithmetic or cross-field rules, so `x-invariants` lists the extra rules the validator enforces; each id is implemented in bin/lib/runhmd_schema.py.",
+  "x-documents": {
+    "runhmd.verdict/1": "#",
+    "runhmd.prove/1": "#/$defs/proveDoc"
+  },
+  "x-invariants": [
+    {"id": "V1", "applies_to": "runhmd.verdict/1", "rule": "attacks.total == attacks.survived + attacks.killed"},
+    {"id": "V2", "applies_to": "runhmd.verdict/1", "rule": "finding ids are unique"},
+    {"id": "V3", "applies_to": "runhmd.verdict/1", "rule": "PROVEN requires attacks.killed == 0, no findings, at least one attack or one gate (a verdict over nothing is a false green), every gate pass+falsified, and no failed regression test"},
+    {"id": "V4", "applies_to": "runhmd.verdict/1", "rule": "DENIED requires at least one finding (a denial must carry its counterexample)"},
+    {"id": "G1", "applies_to": "gate", "rule": "falsified == true requires falsify_score == 1.0"},
+    {"id": "P1", "applies_to": "runhmd.prove/1", "rule": "total == number of gates and passed == number of gates with status pass"},
+    {"id": "P2", "applies_to": "runhmd.prove/1", "rule": "the verdict is derived, never asserted: PROVEN iff there is at least one gate, every gate passes AND is falsified, and no regression test failed; a gate that passes but was never shown to fail makes the verdict DENIED"}
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "verdict", "target", "attacks", "findings", "cost_usd", "duration_s", "agent", "receipt_url"],
+  "properties": {
+    "schema": {"const": "runhmd.verdict/1"},
+    "id": {"$ref": "#/$defs/id"},
+    "verdict": {"$ref": "#/$defs/verdict"},
+    "target": {"$ref": "#/$defs/target"},
+    "attacks": {"$ref": "#/$defs/attacks"},
+    "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "gates": {"type": "array", "items": {"$ref": "#/$defs/gate"}},
+    "regression_tests": {"$ref": "#/$defs/regressionTests"},
+    "cost_usd": {"type": "number", "minimum": 0},
+    "duration_s": {"type": "number", "minimum": 0},
+    "agent": {"$ref": "#/$defs/agent"},
+    "receipt_url": {"type": ["string", "null"], "pattern": "^https://[^\\s]+$"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$"},
+    "verdict": {"enum": ["PROVEN", "DENIED"]},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref", "head_sha"],
+      "properties": {
+        "kind": {"enum": ["path", "pr", "diff"]},
+        "ref": {"type": "string", "minLength": 1},
+        "head_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{7,64}$"}
+      }
+    },
+    "attacks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "survived", "killed"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "survived": {"type": "integer", "minimum": 0},
+        "killed": {"type": "integer", "minimum": 0}
+      }
+    },
+    "counterexample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "repro_cmd", "minimal_input"],
+      "properties": {
+        "summary": {"type": "string", "minLength": 1},
+        "repro_cmd": {"type": "string", "minLength": 1},
+        "minimal_input": {"type": "string"}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "severity", "category", "counterexample", "evidence_ref"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^f-[0-9]{4,}$"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 200},
+        "severity": {"enum": ["high", "medium", "low", "info"]},
+        "category": {"enum": ["concurrency", "auth", "logic", "regression", "input"]},
+        "counterexample": {"$ref": "#/$defs/counterexample"},
+        "evidence_ref": {"type": ["string", "null"], "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/-]+$"}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "gate_type", "status", "falsified", "falsify_score"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "gate_type": {"type": "string", "minLength": 1},
+        "status": {"enum": ["pass", "fail"]},
+        "falsified": {"type": "boolean"},
+        "falsify_score": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "regressionTests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "failed"],
+      "properties": {
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0}
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "model"],
+      "properties": {
+        "name": {"enum": ["claude-code", "codex", "gemini", "cursor", "none"]},
+        "model": {"type": ["string", "null"]}
+      }
+    },
+    "proveDoc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "verdict", "gates", "passed", "total", "regression_tests"],
+      "properties": {
+        "schema": {"const": "runhmd.prove/1"},
+        "verdict": {"$ref": "#/$defs/verdict"},
+        "gates": {"type": "array", "items": {"$ref": "#/$defs/gate"}},
+        "passed": {"type": "integer", "minimum": 0},
+        "total": {"type": "integer", "minimum": 0},
+        "regression_tests": {"$ref": "#/$defs/regressionTests"}
+      }
+    }
+  }
+}

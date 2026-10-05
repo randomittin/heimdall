@@ -1,0 +1,39 @@
+name = "runhmd-receipts"
+main = "src/worker.ts"
+compatibility_date = "2026-08-22"
+
+# NOTHING here is a secret, and no key of any kind is committed. What the operator provisions at
+# deploy time (README.md, "Deploy"):
+#   RECEIPT_PUBKEYS     `npx wrangler secret put RECEIPT_PUBKEYS`: the receipt PUBLIC key(s), the
+#                       content of release/runhmd-receipt.pub (one base64 32-byte key per line, `#`
+#                       comments allowed, several lines while rotating). A public value, stored as a
+#                       secret only so it cannot drift from what `wrangler secret list` shows. The
+#                       service verifies every upload and every read against exactly this set.
+#   API_TOKEN_SHA256S   `npx wrangler secret put API_TOKEN_SHA256S`: SHA-256 hex digests (whitespace
+#                       or comma separated) of the bearer tokens allowed to upload, rate and read
+#                       private receipts. The tokens themselves are never stored here.
+# Missing either one and the write routes answer 503 `uploads disabled` instead of running open.
+# local dev: receipts-worker/.dev.vars (gitignored). vitest: both are generated per test run in
+# vitest.config.ts and injected as miniflare bindings; they exist nowhere on disk.
+#
+# Wiring the zone is the operator's, not this file's: runhmd.dev has no DNS yet, and a route to a
+# zone the account does not own fails the deploy. Once it does, add
+#   routes = [{ pattern = "runhmd.dev/*", zone_name = "runhmd.dev" }]
+
+[vars]
+# Public base URL the pages, the OG tags and upload answers link to (never taken from the request).
+PUBLIC_BASE_URL = "https://runhmd.dev"
+# Where the "Request cloud access for this team" link points. RP12 owns what answers there.
+CTA_URL = "https://runhmd.dev/request-cloud-access"
+
+[[durable_objects.bindings]]
+name = "RECEIPT"
+class_name = "ReceiptDO"
+
+[[durable_objects.bindings]]
+name = "THROTTLE"
+class_name = "ThrottleDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ReceiptDO", "ThrottleDO"]
