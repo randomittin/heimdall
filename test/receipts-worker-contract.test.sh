@@ -15,6 +15,8 @@
 #   [S] SCHEMAS    receipts-worker/schema/* are byte-identical to docs/schemas/* (the single source)
 #   [W] WORKER     the package's shape: bindings, migrations, no key or token material, nothing the
 #                  Workers runtime cannot run
+#   [T] CLI        the real `hmd receipt verify` (bin/heimdall-receipt) gives the matching verdict on
+#                  the same bytes: what the Worker accepts verifies, what it refuses does not
 #
 # Hermetic: no network, no deploy, no key outside memory and a throwaway dir.
 set -uo pipefail
@@ -147,6 +149,27 @@ check "the Worker has no runtime dependency (everything is the platform's)" \
   jq -e '(.dependencies // {}) == {}' "$W/package.json"
 check "bin/lib/runhmd_receipt.py and the Worker agree on the size limit" \
   bash -c 'py=$(sed -n "s/^MAX_RECEIPT_BYTES = \(.*\)$/\1/p" "$1/bin/lib/runhmd_receipt.py" | head -1); js=$(sed -n "s/^export const MAX_RECEIPT_BYTES = \(.*\);$/\1/p" "$2/src/receipt.ts"); [ "$py" = "1024 * 1024" ] && [ "$js" = "1024 * 1024" ]' _ "$REPO" "$W"
+
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[T] the real CLI agrees: hmd receipt verify on the bytes the Worker would serve"
+python3 - "$TMP" "$VECTORS" <<'PY'
+import base64, json, sys
+tmp, path = sys.argv[1], sys.argv[2]
+doc = json.load(open(path, encoding="utf-8"))
+open(tmp + "/anchor.pub", "w").write("# vector anchor\n" + doc["anchors"][0] + "\n")
+for case in doc["receipts"]:
+    open("%s/v-%s.json" % (tmp, case["name"]), "wb").write(base64.b64decode(case["raw_b64"]))
+PY
+cli() { HEIMDALL_HOME="$TMP/home" "$REPO/bin/heimdall-receipt" verify "$TMP/v-$1.json" --pubkey "$TMP/anchor.pub" --json </dev/null 2>&1; }
+OUTV="$(cli denied-canonical-lf)"; RCV=$?
+[ "$RCV" -eq 0 ] && ok "a vector receipt the Worker accepts verifies with the CLI (exit 0)" || bad "CLI rejects an accepted receipt (rc=$RCV: $(printf '%s' "$OUTV" | head -c 160))"
+for pair in "tampered-cost:bad_signature" "tampered-id:bad_signature" "signature-first-char:bad_signature" "stranger-signer:unknown_key" \
+            "crlf-ending:not_canonical" "pretty-printed:not_canonical" "unsigned:schema" "extra-member:schema" "not-json:not_json"; do
+  name="${pair%%:*}"; kind="${pair##*:}"
+  OUTV="$(cli "$name")"; RCV=$?
+  if [ "$RCV" -eq 1 ] && printf '%s' "$OUTV" | grep -q "$kind"; then ok "the CLI refuses $name with exit 1 ($kind), as the Worker answers 4xx"
+  else bad "CLI on $name (rc=$RCV, want 1 + $kind): $(printf '%s' "$OUTV" | head -c 160)"; fi
+done
 
 echo
 printf 'receipts-worker-contract: %d passed, %d failed\n' "$PASS" "$FAIL"
