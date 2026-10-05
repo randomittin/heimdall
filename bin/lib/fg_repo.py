@@ -17,6 +17,7 @@ import contextlib
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -63,6 +64,31 @@ def dir_bytes(root):
             with contextlib.suppress(OSError):
                 total += os.lstat(os.path.join(here, name)).st_blocks * 512
     return total
+
+
+MIN_FREE_BYTES = 3 * 2**30
+_CONTAINER_FREE = re.compile(r"Container Free Space:[^(]*\((\d+) Bytes\)")
+
+
+def parse_container_free(text):
+    """Free bytes of the APFS container, read from `diskutil info` text. An unreadable report is an error, never 'plenty'."""
+    found = _CONTAINER_FREE.search(text)
+    if not found:
+        raise RuntimeError("the disk report has no 'Container Free Space' line")
+    return int(found.group(1))
+
+
+def container_free_bytes(path="/"):
+    """Bytes free on the disk that holds `path`. macOS reads the APFS container (what every volume in it shares); elsewhere statvfs."""
+    if sys.platform != "darwin":
+        return shutil.disk_usage(path).free
+    try:
+        done = subprocess.run(["diskutil", "info", path], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("cannot read the free disk space: %s" % exc)
+    if done.returncode != 0:
+        raise RuntimeError("cannot read the free disk space: diskutil exit %d: %s" % (done.returncode, done.stderr.strip()[:200]))
+    return parse_container_free(done.stdout)
 
 
 def run_guarded(cmd, cwd, env, timeout_s, watch, max_bytes=MAX_BYTES):
