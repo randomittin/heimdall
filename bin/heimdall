@@ -6,7 +6,6 @@
 #
 # Usage:
 #   heimdall "build a dashboard with auth"     Run a task end-to-end
-#   heimdall -- refactor                        Run a one-word task (a lone word is a command)
 #   heimdall                                    Interactive mode
 #   heimdall --update                           Pull latest version
 #   heimdall --setup                            Re-run plugin setup
@@ -4466,13 +4465,21 @@ _hmd_closest_command() {
     }
     BEGIN {
       typed = ENVIRON["HMD_TYPED"]
-      limit = int(length(typed) / 3)
+      lowered = tolower(typed)
+      tlen = length(typed)
+      limit = int(tlen / 3)
       if (limit < 1) limit = 1
       if (limit > 3) limit = 3
       best = limit + 1
     }
     $0 != typed {
-      d = lev(tolower(typed), tolower($0))
+      # An edit distance is never below the length gap, so a candidate whose length is
+      # already out of reach is skipped BEFORE the quadratic table is built: without
+      # this a pasted 30000-character word ran for minutes.
+      gap = length($0) - tlen
+      if (gap < 0) gap = -gap
+      if (gap >= best) next
+      d = lev(lowered, tolower($0))
       if (d < best) { best = d; pick = $0 }
     }
     END { if (pick != "") print pick }

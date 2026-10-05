@@ -109,7 +109,7 @@ run() {
       HEIMDALL_NO_INTRO=1 HEIMDALL_NO_UPDATE_CHECK=1 HEIMDALL_NO_REUSE_METRIC=1 \
       HEIMDALL_DEFAULT_CP_URL="$HEIMDALL_DEFAULT_CP_URL" \
       CLAUDE_LOG="$CLAUDE_LOG" HMD_STUB_LOG="$STUB_LOG" \
-      perl -e 'alarm 90; exec @ARGV' "$@" </dev/null >"$OUT" 2>"$ERR" )
+      perl -e 'alarm shift; exec @ARGV' "${RUN_ALARM:-90}" "$@" </dev/null >"$OUT" 2>"$ERR" )
   RC=$?
 }
 
@@ -192,6 +192,18 @@ for w in definitely-not-a-cmd attack prove; do
     ok "hmd $w gets NO suggestion (nothing is close enough to guess)"
   fi
 done
+
+# A pathological lone token must be rejected promptly. The nearest-command search is
+# quadratic in the token's length unless candidates whose LENGTH is out of reach are
+# skipped before any edit distance is computed (measured before that prefilter existed: a
+# 30000-character word ran past a 120 s alarm, so a pasted blob would have hung the CLI).
+LONG="$(head -c 30000 /dev/zero | LC_ALL=C tr '\000' 'a')"
+T0=$SECONDS
+RUN_ALARM=30 run "$HMD" "$LONG"
+T1=$((SECONDS - T0))
+expect_rejected "a 30000-character lone word is rejected"
+if [ "$T1" -lt 20 ]; then ok "...promptly (${T1}s, bound 20s)"; else bad "...but only after ${T1}s (bound 20s)"; fi
+if err_has "did you mean"; then bad "...and a 30000-character word was offered a suggestion"; else ok "...with no suggestion"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo "3. anything that reads as a task prompt still launches (stub claude records argv)"
