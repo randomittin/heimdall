@@ -123,7 +123,7 @@ def _gh(args, attempts=3):
         done = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=180)
         if done.returncode == 0:
             return json.loads(done.stdout)
-        time.sleep(10 * (attempt + 1))
+        time.sleep(RETRY_S * (attempt + 1))
     raise RuntimeError("gh %s failed: %s" % (" ".join(args[:2]), done.stderr.strip()[:300]))
 
 
@@ -134,7 +134,7 @@ def _repo_pool():
                    "-f", "per_page=%d" % REPOS_PER_LICENSE])
         for item in doc["items"]:
             pool.setdefault(item["full_name"], spdx)
-        time.sleep(3)
+        time.sleep(PACE_S)
     return pool
 
 
@@ -142,7 +142,8 @@ def _repo_candidates(repo, spdx, tally):
     owner, name = repo.split("/")
     doc = _gh(["api", "graphql", "-f", "query=" + ISSUE_QUERY, "-F", "owner=" + owner, "-F", "name=" + name])["data"]
     if doc["rateLimit"]["remaining"] < 100:
-        time.sleep(max(0, (datetime.datetime.fromisoformat(doc["rateLimit"]["resetAt"].replace("Z", "+00:00")) - datetime.datetime.now(datetime.timezone.utc)).total_seconds()) + 5)
+        reset = datetime.datetime.fromisoformat(doc["rateLimit"]["resetAt"].replace("Z", "+00:00"))
+        time.sleep(max(0, (reset - datetime.datetime.now(datetime.timezone.utc)).total_seconds()) + RESET_SLACK_S)
     found = []
     for i, (_label, kind) in enumerate(LABELS):
         for issue in doc["repository"]["l%d" % i]["nodes"]:

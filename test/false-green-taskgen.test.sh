@@ -187,19 +187,23 @@ sys.exit(3)
 PY
 chmod +x "$TMP/stubbin/gh"
 python3 - "$REPO" "$TMP" >"$TMP/h.out" 2>"$TMP/h.out.err" <<'PY'
-import os, sys
+import contextlib, io, os, sys
 repo, tmp = sys.argv[1], sys.argv[2]
 sys.path.insert(0, os.path.join(repo, "bin", "lib"))
 os.environ["PATH"] = os.path.join(tmp, "stubbin") + os.pathsep + os.environ["PATH"]
 import fg_taskgen
 fg_taskgen.PACE_S = fg_taskgen.RETRY_S = fg_taskgen.RESET_SLACK_S = 0
 
+def quiet(fn, *args, **kwargs):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return fn(*args, **kwargs)
+
 out = []
 def t(desc, cond, detail=""):
     out.append("%s\t%s\t%s" % ("PASS" if cond else "FAIL", desc, "" if cond else detail))
 
 path = os.path.join(tmp, "candidates.txt")
-rc = fg_taskgen.harvest(path)
+rc = quiet(fg_taskgen.harvest, path)
 text = open(path, encoding="utf-8").read()
 cands = fg_taskgen.parse_candidates(text)
 t("harvest exits 0 and writes the file", rc == 0 and os.path.getsize(path) > 0, rc)
@@ -216,12 +220,12 @@ t("the header records one repository query per licence", all(("license:%s " % k)
 t("the header records the label queries and the structural filters", '"bug" / "enhancement" / "feature"' in joined and "at most 20 files and 600 lines" in joined)
 t("the header records the counts and why issues were dropped", "pool: 2 repositories, 6 issues examined, 3 candidates." in joined and "no merged pull request closes it: 1" in joined and "the pull request changes no test module: 1" in joined, joined[-500:])
 t("the header records when and with what it ran", "harvested: 20" in joined and "gh version 0.0.0-test" in joined)
-t("harvest --max-repos limits the pool (a trial run)", fg_taskgen.harvest(os.path.join(tmp, "trial.txt"), max_repos=1) == 0 and
+t("harvest --max-repos limits the pool (a trial run)", quiet(fg_taskgen.harvest, os.path.join(tmp, "trial.txt"), max_repos=1) == 0 and
   [c["issue"] for c in fg_taskgen.parse_candidates(open(os.path.join(tmp, "trial.txt")).read())] == ["https://github.com/acme/alpha/issues/1", "https://github.com/acme/alpha/issues/4"])
 
 os.environ["STUB_GH_FAIL"] = "1"
 try:
-    fg_taskgen.harvest(os.path.join(tmp, "never.txt"))
+    quiet(fg_taskgen.harvest, os.path.join(tmp, "never.txt"))
     t("a failing gh is an error, not an empty pool", False, "no exception")
 except RuntimeError as exc:
     t("a failing gh is an error, not an empty pool", "forced failure" in str(exc), str(exc))
