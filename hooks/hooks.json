@@ -41,6 +41,15 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f \"${CLAUDE_PROJECT_DIR:-.}/.heimdall/ui/stop-request.json\" ] || exit 0; HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled phone-control-prompt && exit 0; HOOK=\"$HMDP/bin/heimdall-phone-control\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" prompt --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -126,6 +135,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f \"${CLAUDE_PROJECT_DIR:-.}/.heimdall/ui/stop-request.json\" ] || exit 0; HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled phone-control-pretool && exit 0; HOOK=\"$HMDP/bin/heimdall-phone-control\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" stop --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -171,6 +190,16 @@
           {
             "type": "command",
             "command": "[ -s \"${CLAUDE_PROJECT_DIR:-.}/.heimdall/ui/inbox.jsonl\" ] || exit 0; HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled inbox-deliver-posttool && exit 0; HOOK=\"$HMDP/bin/heimdall-inbox-deliver\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" tool --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f \"${CLAUDE_PROJECT_DIR:-.}/.heimdall/ui/stop-request.json\" ] || exit 0; HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled phone-control-posttool && exit 0; HOOK=\"$HMDP/bin/heimdall-phone-control\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" stop --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0",
             "timeout": 10
           }
         ]

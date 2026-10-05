@@ -8,7 +8,8 @@ verdict, or a roster parse. Every field it serves traces to one of the sources i
 SOURCE_FILES / SOURCE_COMMANDS below, and `--print-sources` prints that list so a
 tester can assert the deny-list against it.
 
-Routes (all GET):
+Routes (GET, plus the two writes POST /api/send -- a message to the session -- and POST /api/control -- the phone's
+remote controls, bin/lib/companion_ui_controls.py; both behind the same token / Host gate):
     /                 the single static page (sentinels/hmd-ui.html)
     /api/state        the section-4 JSON contract, served from the SAME background-
                       polled StateCache snapshot /api/events reads (perf: a GET is a
@@ -177,6 +178,9 @@ WATCH_SOURCES = (
     ".heimdall/ui/inbox.jsonl",            # appended in place
     ".heimdall/ui/inbox-delivered.jsonl",  # delivery receipts -> inbox.delivered[]
     ".heimdall/ui/tmux-target",            # inbox.consumer == "tmux"
+    ".heimdall/ui/controls-audit.jsonl",   # a control ran -> controls.last (appended in place)
+    ".heimdall/app/controls-disabled",     # the kill switch -> controls.enabled
+    ".heimdall/fallback.json",             # controls.fallback.mode (only its one `state` word is ever read)
     ".planning/CHECKPOINT.md",
     ".heimdall/receipts/last-sweep.json",
 )
@@ -268,6 +272,11 @@ SESSIONS = _load_module("hmd_session_resolve", os.path.join(LIB_DIR, "hmd_sessio
 # writes the pending requests, bin/heimdall-relay-client records the sealed deny; this file only READS
 # the live ones, into /api/state's `approvals` (and, through attention, `needs_approval`).
 DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "companion_ui_decisions.py"))
+# The ONE place the phone's remote controls live (interrupt, save-checkpoint, hook-toggle, fallback-mode): the
+# allowlist, the exact params, the rate limits, the kill switch and the audit log. bin/heimdall-relay-client
+# dispatches its sealed commands through it and POST /api/control below dispatches the same way; this file only
+# serves its `controls` slice of /api/state.
+CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -846,6 +855,18 @@ def collect_attention(root, state=None):
     )
 
 
+def collect_controls(root, state=None):
+    """The `controls` addendum (the phone's remote controls): which actions are usable now, which hooks the phone
+    may toggle and their states, the fallback mode, whether the kill switch is off, and the last control run (no
+    params) -- always via companion_ui_controls.snapshot, fed the hooks and fallback slices collect_state already
+    holds so one pass never disagrees with itself. None when the module cannot load: the key is then absent, which is
+    how an hmd without controls reads to the phone -- never a crash."""
+    if CONTROLS is None:
+        return None
+    state = state or {}
+    return CONTROLS.snapshot(root, hooks=state.get("hooks"))
+
+
 # stderr diagnostics from the loop threads (the poller, the warmer, the panel publishers, the push observer). Two rules,
 # both learned from a full disk. A diagnostic never raises: stderr is a file on the same volume as everything else, so
 # its write fails exactly when something else already did, and an exception out of an `except` handler ended the
@@ -1141,6 +1162,9 @@ def collect_state(root, transport=None):
     }
     # Derived AFTER the slices it reads, so it sees this pass's parallelism/receipt/checkpoint/gate.
     state["attention"] = safe(lambda r: collect_attention(r, state), attention_empty)
+    controls = safe(lambda r: collect_controls(r, state))
+    if controls is not None:
+        state["controls"] = controls
     if transport is not None:
         state["transport"] = transport
         redact, strip_root = _transport_redaction(transport, root)
@@ -1618,8 +1642,66 @@ class UIHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/api/send":
             self._handle_send()
+        elif path == "/api/control":
+            self._handle_control()
         else:
             self._send(405, "method not allowed")
+
+    # The HTTP status for a refused control (a successful one is 200, whatever `detail` it adds). Anything the module
+    # refuses that is not named here is the laptop failing to do what was asked -- a 500.
+    CONTROL_STATUS = {
+        "not-implemented": 404,
+        "not-allowed": 403, "controls-off": 403,
+        "bad-params": 422, "confirm-required": 422,
+        "not-running": 409, "unknown-id": 409, "already-decided": 409, "expired": 409, "already-requested": 409,
+        "rate-limited": 429,
+    }
+
+    def _handle_control(self):
+        """POST /api/control: the direct-mode twin of the relay's sealed control commands -- the body
+        {"action": "...", "params": {...}} goes through companion_ui_controls.dispatch exactly as a relay command
+        does, so the two transports cannot drift. Auth already passed (_gate_then). Same content-type, size and JSON
+        rules as /api/send. Answer {"ok": bool, "detail"?, "id"?, "result"?, "dup"?}; 200 when ok, else
+        CONTROL_STATUS (429 carries Retry-After). The body is never logged and never echoed."""
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            self._send_json(415, {"error": "unsupported-media-type"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._send_json(400, {"error": "invalid-content-length"})
+            return
+        if length < 0:
+            self._send_json(400, {"error": "invalid-content-length"})
+            return
+        if length > MAX_SEND_BODY_BYTES:
+            self._send_json(413, {"error": "payload-too-large"})
+            return
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            obj = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"error": "invalid-json"})
+            return
+        if not isinstance(obj, dict) or not isinstance(obj.get("action"), str):
+            self._send_json(400, {"error": "action field (string) is required"})
+            return
+        if CONTROLS is None:
+            self._send_json(500, {"error": "controls module unavailable"})
+            return
+        ok, detail, extra = CONTROLS.dispatch(self.server.cache.root, obj["action"], obj.get("params"),
+                                              device_id="direct", seq=None, transport="direct")
+        self.server.cache.invalidate()  # a control changes /api/state in THIS process (see StateCache.invalidate)
+        body = {"ok": ok}
+        if detail is not None:
+            body["detail"] = detail
+        body.update(extra)
+        if ok:
+            self._send_json(200, body)
+            return
+        headers = {"Retry-After": str(extra["retry_after_s"])} if detail == "rate-limited" and "retry_after_s" in extra else None
+        self._send_json(self.CONTROL_STATUS.get(detail, 500), body, extra_headers=headers)
 
     def _handle_send(self):
         """POST /api/send: companion -> session message, appended to

@@ -7,8 +7,9 @@ the paired phone -- and a `decide` command, the phone's sealed DENY of a pending
 risky action (A4, deny-only round: see `_decide`; nothing else about an action can
 be decided from the phone, and "allow" is refused for every request) -- and, to an hmd that lists
 `push-v1`, the phone's sealed push registration (see PUSH REGISTRATION below) -- and, to an hmd that
-lists `login-v1`, the phone's sealed remote Claude Code login (see REMOTE CLAUDE CODE LOGIN below) -- and, to
-an hmd that lists `view-v1`, the phone's sealed read-only `view` request: a file's diff (see READ-ONLY VIEWS below).
+lists `login-v1`, the phone's sealed remote Claude Code login (see REMOTE CLAUDE CODE LOGIN below) -- and, to an hmd that
+lists `controls-v1`, the phone's sealed remote controls (see REMOTE CONTROLS below) -- and, to an hmd that lists
+`view-v1`, the phone's sealed read-only `view` request: a file's diff (see READ-ONLY VIEWS below).
 
 Spawned by `bin/heimdall-app connect --relay <url>` as a sibling process to a
 local `hmd ui`; this process owns the ONE relay session for its lifetime and is
@@ -89,8 +90,8 @@ to drive its own UI; nothing else is ever written to stdout.
         handling (a `keepalive` control frame is always silent -- never
         logged, not even at this level); any action other than the ten
         named (the three login_* only while bin/lib/companion_cc_login.py
-        imported, view only while bin/lib/companion_view.py is) is acked
-        `not-implemented`. Never the token, ref or label
+        imported, view only while bin/lib/companion_view.py is) and the four control actions (REMOTE CONTROLS below)
+        is acked `not-implemented`. Never the token, ref or label
         of a push registration (see PUSH REGISTRATION below), never a login
         command's params (see REMOTE CLAUDE CODE LOGIN below), never a view's
         path (see READ-ONLY VIEWS below). A stale-seq
@@ -273,9 +274,9 @@ ordinary ack frame: hmd's own next seq and nonce, sealed, delivered under the AC
 FRAME COMPRESSION AND RESYNC (the FINAL wire of hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md
 Ask 5, section 5; hmdapp's docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with
 it; codec in bin/lib/hmd_relay_e2e.py). Capabilities travel in-band, hmd first: EVERY `state`
-frame's plaintext is `{"state":{...},"caps":["login-v1","push-v1","resync","view-v1","z-zlib"]}` (E2E.hmd_caps():
-`resync` always, `z-zlib` when this python can compress, and `login-v1` / `view-v1` / `push-v1` only while their
-modules loaded -- push-v1 also only unless HMD_PUSH=0; see REMOTE CLAUDE CODE LOGIN and PUSH
+frame's plaintext is `{"state":{...},"caps":["controls-v1","login-v1","push-v1","resync","view-v1","z-zlib"]}` (E2E.hmd_caps():
+`resync` always, `z-zlib` when this python can compress, and `controls-v1` / `login-v1` / `view-v1` / `push-v1` only while
+their modules loaded -- push-v1 also only unless HMD_PUSH=0; see REMOTE CONTROLS, REMOTE CLAUDE CODE LOGIN, READ-ONLY VIEWS and PUSH
 REGISTRATION below). A phone that sees `resync` sends a sealed command
 `{"action":"resync","params":{"last_seq":N,"digest":"<sha256
 hex>","caps":[..]}}`; hmd acks it ok, keeps its `caps` as the phone's capability set (replaced by
@@ -310,6 +311,16 @@ the manager's refusal code in `detail` (see _login_command). Off by default: the
 the laptop with `hmd app remote-login on`. The login code exists only inside the sealed command and one
 write to a PTY; the `command` event never carries params and the `login` event never carries the URL,
 the code or an account.
+
+REMOTE CONTROLS (capability `controls-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-remote-controls.md H1-H6):
+`caps` lists `controls-v1` whenever bin/lib/companion_ui_controls.py imported, and the state carries its additive
+`controls` key. Any command this client does not handle itself goes to that module's dispatch(): `interrupt`,
+`save-checkpoint`, `hook-toggle` {id, enabled}, `fallback-mode` {mode, confirm?} -- each acked
+`{"ok":..,"of_seq":N[,"detail":..][,"id":..][,"result":{..}][,"dup":true][,"retry_after_s":N]}` -- and an unknown
+action is acked `not-implemented` there, audited like the rest. The module owns the allowlist, the exact params, the
+`rid` de-duplication, the rate limits, the kill switch (`hmd app controls off`) and <repo>/.heimdall/ui/controls-audit.jsonl;
+this client only latches who is asking: a command reaches it solely as a frame that opened under the paired device's
+session key and passed the replay guard above. The `command` event stays action / ok / detail.
 
 READ-ONLY VIEWS (capability `view-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-cursor-parity.md CP5, the phone half in its
 src/views): `caps` also lists `view-v1` whenever bin/lib/companion_view.py imported. The phone's Files list seals
@@ -406,6 +417,7 @@ DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "compan
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
 PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "companion_push_store.py"))
 LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
+CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
 VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
 WS =_load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
@@ -1921,7 +1933,22 @@ class RelayClient:
 
     def _feature_caps(self):
         """Capability tokens of the optional features whose modules loaded (added to the codec's own)."""
-        return ([E2E.CAP_LOGIN] if LOGIN is not None else []) + ([VIEW.CAP_VIEW] if VIEW is not None else [])
+        return (([E2E.CAP_LOGIN] if LOGIN is not None else [])
+                + ([E2E.CAP_CONTROLS] if CONTROLS is not None else [])
+                + ([VIEW.CAP_VIEW] if VIEW is not None else []))
+
+    def _control(self, action, params, seq):
+        """The phone's sealed control commands (REMOTE CONTROLS above): bin/lib/companion_ui_controls.py owns every
+        rule and its refusal. Never raises -- a fault is an `internal-error` ack and an event naming only its type."""
+        try:
+            result = CONTROLS.dispatch(self.root, action, params, device_id=CONTROLS.device_id_of(self.device_pub),
+                                       seq=seq, transport="relay")
+        except Exception as e:
+            emit({"event": "error", "detail": "control command failed: %s" % type(e).__name__})
+            return False, "internal-error", {}
+        if result[0] and self.cache is not None:
+            self.cache.invalidate()  # a control that ran changes what the next state frame must say (a refusal only
+        return result                #  moves the audit log, which the cache already watches)
 
     def _login_command(self, action, params):
         """The phone's sealed login commands (spec 4.3):
@@ -2100,6 +2127,8 @@ class RelayClient:
             ok, detail, extra = self._unregister_push(params)
         elif action == "app_state":
             ok, detail, extra = self._app_state(params)
+        elif CONTROLS is not None:
+            ok, detail, extra = self._control(action, params, seq)
         else:
             ok, detail = False, "not-implemented"
         # action/ok/detail only, never `params`: a login_code command carries the login code (a secret)
