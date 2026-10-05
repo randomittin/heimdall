@@ -95,11 +95,27 @@ _read_count() { # <file>
 
 _dirty_count() { git status --porcelain 2>/dev/null | wc -l | tr -d ' '; }
 
+# The team off switch — the SAME predicate as team_no_commit in bin/heimdall-team (HMD_TEAM_NO_COMMIT,
+# or the machine-wide marker ~/.heimdall/no-team-commit; fail-safe parse: ANY value other than
+# empty/0/false/no/off is ON). Repeated here, not sourced, so this standalone checkpoint tool keeps
+# no dependency on the team CLI; test/heimdall-team-no-commit.test.sh pins the two together.
+_team_no_commit() {
+  case "${HMD_TEAM_NO_COMMIT:-}" in
+    ""|0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff]) ;;
+    *) return 0 ;;
+  esac
+  [ -n "${HOME:-}" ] && [ -f "$HOME/.heimdall/no-team-commit" ]
+}
+
 _do_commit() { # <subject>
   local guard
   guard="$(dirname "$0")/heimdall-git-guard"
   [ -x "$guard" ] && "$guard" >/dev/null 2>&1
   git add -A >/dev/null 2>&1 || return 1
+  # `add -A` takes a tracked-and-modified (or un-ignored) .heimdall/team.json — the team's bearer
+  # secret. With the off switch on it never rides a checkpoint: back it out of the index. The file
+  # itself is untouched, so the edit stays on disk as a pending change.
+  _team_no_commit && git reset -q -- ':(top).heimdall/team.json' >/dev/null 2>&1
   git commit -m "$1" -m "heimdall-wip: mechanical mid-task checkpoint" \
     -m "Co-Authored-By: hmd <hmd@runheimdall.dev>" --no-verify >/dev/null 2>&1
 }

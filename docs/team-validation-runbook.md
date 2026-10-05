@@ -65,6 +65,7 @@ python3 -c "import hashlib, secrets, json; print('ok')"
 | `HEIMDALL_TEAM_DIR` | Override per-repo team dir (tests; omit normally) | `<repo>/.heimdall` |
 | `HEIMDALL_CP_URL` | Override CP URL | baked-in default |
 | `HEIMDALL_NO_TEAM_AUTOSHARE` | Set to `1` to opt out of auto-share | unset |
+| `HMD_TEAM_NO_COMMIT` | Set to `1` to keep `team.json` on disk but never stage/commit it (persistent: `touch ~/.heimdall/no-team-commit`) | unset |
 | `HMD_PRESENCE_SEED` | Dev signing seed override (testing only) | auto-bootstrapped |
 | `HEIMDALL_TEAM_AUTO_THROTTLE` | Override the ~24 h auto-share throttle (seconds) | `86400` |
 
@@ -459,6 +460,19 @@ heimdall-team new 2>&1; echo "exit=$?"
 heimdall-team auto
 [ ! -f .heimdall/team.shared.json ] && echo "PASS: auto never shared on public repo" || echo "FAIL: LEAK"
 [ -f .heimdall/team.json ] && echo "PASS: solo team still minted" || echo "note: no solo team (normal if active marker absent)"
+```
+
+**5.7 — `HMD_TEAM_NO_COMMIT=1`: team.json stays on disk, is never staged or committed**
+
+```bash
+# In a PRIVATE repo with heimdall active and team.json not yet tracked.
+BEFORE=$(git rev-list --count HEAD)
+HMD_TEAM_NO_COMMIT=1 heimdall-team auto
+[ "$(git rev-list --count HEAD)" = "$BEFORE" ] && echo "PASS: no commit" || echo "FAIL: committed"
+[ -z "$(git diff --cached --name-only)" ] && echo "PASS: nothing staged" || echo "FAIL: staged"
+[ -f .heimdall/team.json ] && echo "PASS: team.json kept on disk" || echo "FAIL: not written"
+git check-ignore -q .heimdall/team.json && echo "PASS: excluded from blanket adds" || echo "FAIL: not excluded"
+# persistent equivalent: touch ~/.heimdall/no-team-commit   (rm it to restore)
 ```
 
 ---
