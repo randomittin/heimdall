@@ -149,9 +149,9 @@ class Sandbox:
 
 
 class Proc:
-    def __init__(self, argv, env, cwd=None):
+    def __init__(self, argv, env, cwd=None, stdin=subprocess.PIPE):
         self.argv = argv
-        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        self.p = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   env=env, cwd=cwd, bufsize=0)
         self._out = bytearray()
         self._err = bytearray()
