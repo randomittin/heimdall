@@ -39,6 +39,21 @@ git push origin vX.Y.Z
 - [ ] `raw.githubusercontent.com/randomittin/heimdall/vX.Y.Z/install.sh` now resolves
       and its sha256 equals the digest `sync-release.sh` printed.
 
+## 2b. Attach the release manifest (the site's version-sync source)
+
+`sync-release.sh` also wrote `.heimdall/release/release-manifest.json` (`tag`, `install_sha256`,
+`install_url`, `minisig_url`): generated, ignored build output, not a tracked file. `release/ship.sh`
+attaches it to the GitHub Release next to `install.sh.minisig`; the site's CI reads it
+(`heimdall-site/gates/version-sync.sh` is the site-side check). By hand:
+
+```
+gh release upload vX.Y.Z .heimdall/release/release-manifest.json --clobber   # RJ-EXECUTED
+curl -fsSL https://github.com/randomittin/heimdall/releases/latest/download/release-manifest.json | jq -e '.tag and .install_sha256'
+```
+
+- [ ] `release-manifest.json` is attached to the vX.Y.Z Release, and its `.tag` and `.install_sha256`
+      match the digest `sync-release.sh` printed.
+
 ## 3. Publish the npx wrappers (TWO packages, one pin)
 
 `release/ship.sh --dry-run` prints both (name, version, pinned tag + sha256, files, command)

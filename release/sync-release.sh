@@ -256,6 +256,34 @@ assert_eq "_redirects /install -> tag target"       "$INSTALL_URL" "$REDIR_URL"
 
 echo "sync-release.sh: all artifacts resolve to ${INSTALL_URL} (sha256 ${NEW_SHA})"
 
+# ── 9. release-manifest.json — the RELEASE ASSET the site's CI reads ─────────
+# {"tag","install_sha256","install_url","minisig_url"} for THIS tag, written from the same
+# $TAG / $INSTALL_URL / $NEW_SHA every artifact above was written from, so the manifest cannot
+# disagree with the wrapper, the redirect or the README about which install.sh this release is.
+# It is generated BUILD OUTPUT, not a tracked source file: it lands in the ignored dot-directory
+# .heimdall/release/ (RELEASE_MANIFEST_OUT overrides), where the version sweeps, which prune
+# dot-directories, never read it as a hand-typed pin. release/ship.sh uploads it as a release
+# asset next to install.sh.minisig; publishing the release stays the human step
+# (release/publish-checklist.md), so this script only writes a file. The site's version-sync
+# gate then reads: curl -fsSL https://github.com/${REPO_PATH}/releases/latest/download/release-manifest.json
+MANIFEST_OUT="${RELEASE_MANIFEST_OUT:-$ROOT/.heimdall/release/release-manifest.json}"
+MINISIG_URL="https://github.com/${REPO_PATH}/releases/download/${TAG}/install.sh.minisig"
+T="$(mktemp)"
+jq -n --arg tag "$TAG" --arg sha "$NEW_SHA" --arg url "$INSTALL_URL" --arg sig "$MINISIG_URL" \
+   '{tag: $tag, install_sha256: $sha, install_url: $url, minisig_url: $sig}' > "$T"
+if [ "$DRY" -eq 1 ]; then
+  echo "  ~ ${MANIFEST_OUT} (would write)"
+  rm -f "$T"
+else
+  mkdir -p "$(dirname "$MANIFEST_OUT")"
+  mv "$T" "$MANIFEST_OUT"
+  echo "  ✓ ${MANIFEST_OUT}"
+  assert_eq "release manifest tag == release tag"                       "$TAG"         "$(jq -r '.tag' "$MANIFEST_OUT")"
+  assert_eq "release manifest install_sha256 == tag install.sh sha256"  "$NEW_SHA"     "$(jq -r '.install_sha256' "$MANIFEST_OUT")"
+  assert_eq "release manifest install_url == redirect target"           "$INSTALL_URL" "$(jq -r '.install_url' "$MANIFEST_OUT")"
+  assert_eq "release manifest minisig_url == the signature asset URL"   "$MINISIG_URL" "$(jq -r '.minisig_url' "$MANIFEST_OUT")"
+fi
+
 # ── 8. Netlify vanity redirect (runheimdall.dev/install) — SEPARATE site repo ──
 # runheimdall.dev is served by Netlify from randomittin/heimdall-site, NOT this
 # plugin repo. Its /install 302 lives in heimdall-site/netlify.toml and pins a

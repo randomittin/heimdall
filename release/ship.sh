@@ -312,6 +312,34 @@ sign_release_artifact() {  # $1 = tag (vX.Y.Z). Best-effort: WARN + return 0 whe
   rm -rf "$sigdir"
 }
 
+# publish_release_manifest <tag> — attach release-manifest.json to the Release, next to
+# install.sh.minisig. release/sync-release.sh writes it (tag, install_sha256, install_url,
+# minisig_url) into .heimdall/release/ as ignored build output; the site's CI reads it from
+# https://github.com/randomittin/heimdall/releases/latest/download/release-manifest.json.
+# Same posture as signing: a manifest that is ABSENT only warns with the exact commands (a repo
+# that never ran sync-release has nothing to attach), but one that IS present and cannot be
+# attached, or that names a different tag, is a loud failure — the site gate would otherwise
+# render a stale version, which is the drift this asset exists to remove.
+publish_release_manifest() {  # $1 = tag (vX.Y.Z)
+  local tag="$1"
+  local manifest="${SHIP_MANIFEST:-${REPO_ROOT:-$PWD}/.heimdall/release/release-manifest.json}"
+  if [ ! -f "$manifest" ]; then
+    warn "release manifest: $manifest not found — $tag has NO release-manifest.json asset; the site's version-sync gate reads it."
+    warn "  generate + attach:  release/sync-release.sh $tag && gh release upload $tag $manifest --clobber"
+    return 0
+  fi
+  [ "$(jq -r '.tag // empty' "$manifest" 2>/dev/null)" = "$tag" ] \
+    || die "release manifest $manifest is not for $tag — re-run release/sync-release.sh $tag, then: gh release upload $tag $manifest --clobber"
+  local out rc
+  if ! out="$(gh release upload "$tag" "$manifest" --clobber 2>&1)"; then
+    rc=$?; printf '%s\n' "$out" >&2
+    die "gh release upload failed (exit $rc) — $tag is published WITHOUT release-manifest.json. Attach it with: gh release upload $tag $manifest --clobber"
+  fi
+  gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq 'release-manifest.json' \
+    || die "post-upload readback failed: Release $tag carries no release-manifest.json asset"
+  ok "attached release-manifest.json to Release $tag"
+}
+
 # bump_default_ref — pin install.sh's `local DEFAULT_REF="vX.Y.Z"` to $1 (a vX.Y.Z tag) and
 # `git add` it. Idempotent; a no-op (returns 0) if the file or the line is absent so a repo
 # layout change never hard-blocks a release. This is what keeps fresh installs off a stale ref.
@@ -872,6 +900,7 @@ if [ "$RELEASE_ONLY" -eq 1 ]; then
   build_release_notes "$TAG" "$RO_NOTES"
   publish_release "$TAG" "$RO_NOTES"
   sign_release_artifact "$TAG"
+  publish_release_manifest "$TAG"
   printf '\n%s%s✓ Released %s%s — https://github.com/randomittin/heimdall/releases/tag/%s\n' \
     "$G" "$B" "$TAG" "$R" "$TAG"
   exit 0
@@ -1057,6 +1086,7 @@ if [ -n "$TAG" ]; then
   # applying it. Key-absent is a documented WARN (RJ holds the key offline); a failure to
   # attach a sig we DID produce is a hard failure — see sign_release_artifact.
   sign_release_artifact "$TAG"
+  publish_release_manifest "$TAG"
 
   printf '\n%s%s✓ Released %s%s — https://github.com/randomittin/heimdall/releases/tag/%s\n' \
     "$G" "$B" "$TAG" "$R" "$TAG"
