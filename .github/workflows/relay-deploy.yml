@@ -1,0 +1,166 @@
+# relay-deploy -- ship relay/ to Cloudflare: gate on relay-ci, then a canary Worker, then production.
+#
+# Three jobs, each able to stop the next:
+#
+#   ci          The whole of relay-ci.yml, reused through its workflow_call trigger: typecheck, the
+#               relay's tests, and the hmd client's side of the wire contract. Nothing below runs
+#               unless it is green, so a deploy can never ship a tree relay-ci would have rejected.
+#   canary      Deploys this commit to the SEPARATE hmd-relay-canary Worker (relay/wrangler.toml
+#               [env.canary]: its own Durable Object namespace, its own RELAY_SIGNING_SECRET), then
+#               polls its GET /health until it reports THIS commit's sha as its version, so a stale
+#               build that still answers 200 does not pass. If the canary never does, it is rolled
+#               back with `wrangler rollback` and the pipeline stops there: production is untouched.
+#   production  Deploys the same commit to hmd-relay, runs the same check against it, and rolls
+#               back the same way on failure.
+#
+# What the check proves, and what it does not: that the Worker answers and that the new build is the
+# one serving. It does not pair a phone, hold a stream or round-trip a frame. The probes that would
+# (hmdapp docs/superpowers/specs/2026-10-02-relay-ownership-migration.md, section 2.3) are not built
+# yet, so a canary missing its RELAY_SIGNING_SECRET still passes here. Nor does this pipeline treat
+# a Durable Object migration specially, and `wrangler rollback` cannot cross one.
+#
+# Triggers: a push to main that touches relay/**, and workflow_dispatch. Never a pull request, so
+# the environment secrets below are unreachable from a fork's or a branch's code. A dispatch can be
+# started from any branch, so the production job is also pinned to refs/heads/main: from another
+# branch the pipeline stops after the canary.
+#
+# OPERATOR SETUP (once; repo Settings -> Environments). Secrets and variables are environment-scoped,
+# so each job sees only its own environment's values:
+#   relay-canary      secret CLOUDFLARE_API_TOKEN, variable CLOUDFLARE_ACCOUNT_ID
+#   relay-production  secret CLOUDFLARE_API_TOKEN, variable CLOUDFLARE_ACCOUNT_ID
+# and on each Worker: `npx wrangler secret put RELAY_SIGNING_SECRET` (add `--env canary` for the
+# canary). The health check polls the workers.dev hosts the relay serves from today; an environment
+# variable RELAY_URL (a base URL, no trailing /health) overrides that, e.g. for a custom domain.
+#
+# Supply chain: every action is pinned by commit SHA (the ones relay-ci.yml vets), and wrangler is the
+# version relay/package-lock.json pins, run with `npx --no-install`: no third-party deploy action ever
+# holds the token. The token is set only on the steps that deploy or roll back, never on `npm ci`,
+# whose dependency install scripts run arbitrary code. No dependency cache is restored in these jobs
+# and the checkout does not persist its own token. Nothing interpolates a ${{ }} expression into a
+# shell script: values reach it through env.
+#
+# Concurrency: one deploy at a time, and a running one is never cancelled (a cancelled `wrangler
+# deploy` or rollback can leave a Worker half-updated); a push that lands meanwhile waits its turn.
+#
+# test/relay-deploy-workflow.test.sh holds every property above to this file, and PROVE-REDs each.
+name: relay-deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'relay/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-deploy
+  cancel-in-progress: false
+
+env:
+  WRANGLER_SEND_METRICS: 'false'
+
+jobs:
+  ci:
+    name: relay-ci (gate)
+    uses: ./.github/workflows/relay-ci.yml
+
+  canary:
+    name: canary (deploy, health check, roll back on failure)
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: relay-canary
+    defaults:
+      run:
+        shell: bash
+        working-directory: relay
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Install (from the lockfile)
+        run: npm ci
+
+      # BUILD_ID is what GET /health reports as `version` (relay/src/health.ts); the check below
+      # holds the canary to this commit's sha.
+      - name: Deploy the canary Worker
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --no-install wrangler deploy --env canary --var "BUILD_ID:${GITHUB_SHA}"
+
+      - name: Canary health check (the new build must answer)
+        env:
+          RELAY_URL: ${{ vars.RELAY_URL || 'https://hmd-relay-canary.therishabh16.workers.dev' }}
+        run: bash scripts/health-check.sh "$RELAY_URL" "$GITHUB_SHA"
+
+      # Only after a deploy that succeeded: a failed deploy changed nothing, and rolling back then
+      # would revert the previous good version.
+      - name: Roll the canary back
+        if: failure() && steps.deploy.outcome == 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          RELAY_URL: ${{ vars.RELAY_URL || 'https://hmd-relay-canary.therishabh16.workers.dev' }}
+        run: |
+          npx --no-install wrangler rollback --env canary --yes --message "auto-rollback ${GITHUB_SHA}"
+          bash scripts/health-check.sh "$RELAY_URL"
+
+  production:
+    name: production (deploy, health check, roll back on failure)
+    needs: [ci, canary]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: relay-production
+    defaults:
+      run:
+        shell: bash
+        working-directory: relay
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Install (from the lockfile)
+        run: npm ci
+
+      - name: Deploy to production
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --no-install wrangler deploy --var "BUILD_ID:${GITHUB_SHA}"
+
+      - name: Production health check (the new build must answer)
+        env:
+          RELAY_URL: ${{ vars.RELAY_URL || 'https://hmd-relay.therishabh16.workers.dev' }}
+        run: bash scripts/health-check.sh "$RELAY_URL" "$GITHUB_SHA"
+
+      - name: Roll production back
+        if: failure() && steps.deploy.outcome == 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          RELAY_URL: ${{ vars.RELAY_URL || 'https://hmd-relay.therishabh16.workers.dev' }}
+        run: |
+          npx --no-install wrangler rollback --yes --message "auto-rollback ${GITHUB_SHA}"
+          bash scripts/health-check.sh "$RELAY_URL"

@@ -16,3 +16,19 @@ class_name = "SessionDO"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SessionDO"]
+
+# The canary Worker that .github/workflows/relay-deploy.yml ships to and probes before promoting the
+# same commit to production. A SEPARATE Worker rather than a gradual rollout of this one: its own
+# Durable Object namespace, so a bad build cannot touch a live session, and its own signing secret
+# (`npx wrangler secret put RELAY_SIGNING_SECRET --env canary`). `wrangler deploy --env canary`.
+#
+# Wrangler does not inherit `durable_objects` into an environment, so the binding is restated here;
+# leave it out and the canary deploys with no Durable Object at all while /health still passes.
+# `migrations` IS inherited, which is what keeps the canary on exactly production's migration
+# history, so it is deliberately not restated. test/relay-deploy-workflow.test.sh fails on drift.
+[env.canary]
+name = "hmd-relay-canary"
+
+[[env.canary.durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionDO"
