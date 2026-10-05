@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""heimdall-prove -- `hmd prove`: do all gates pass, and has each gate been shown to fail first?
+
+Thin launcher: the logic lives in bin/lib/runhmd_prove.py so tests can import it. The verdict is
+derived from real bin/falsify and bin/corpus runs, never here. See `hmd prove --help` for flags and
+exit codes (0 PROVEN, 1 DENIED, 2 usage, 3 consent, 5 infrastructure; 130/143 interrupted).
+"""
+import os
+import signal
+import sys
+
+sys.dont_write_bytecode = True  # prove writes nothing into the repository it proves, nor into the install it runs from
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `hmd prove | head -3` ends quietly
+
+
+def _terminate(signum, _frame):
+    # unwinds through the runner's cleanup: the running gate's process group is killed, the temp dir removed
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _terminate)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+
+from runhmd_prove import main  # noqa: E402
+
+sys.exit(main(sys.argv[1:]))

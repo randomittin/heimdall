@@ -2286,6 +2286,25 @@ case "${1:-}" in
     fi
     exec "$ATTACK_BIN" "$@"
     ;;
+  prove)
+    # `hmd prove` (RP2) -- "do all gates pass, and has each gate been shown to fail first?": prove the
+    # oracle gates of a repository (evals/oracles/<id>/ with fixtures/mutants) and its regression corpus,
+    # as a runhmd.prove/1 JSON document (docs/schemas/runhmd.verdict.v1.json, the schema `hmd attack`'s
+    # runhmd.verdict/1 lives in). Pass-through to bin/heimdall-prove; every arg is forwarded verbatim.
+    # The verdict is derived from real bin/falsify + bin/corpus runs, not by the CLI: PROVEN only when
+    # every gate passes AND is falsified AND no regression case failed.
+    # Exit: 0 PROVEN, 1 DENIED, 2 usage/config, 3 consent required (non-TTY without --yes), 5
+    # infrastructure -- same table as `hmd attack`, which is why a missing bin exits 5 here, not 1:
+    # 1 means DENIED. Without this arm `hmd prove` fell through to the Claude task-prompt path.
+    shift
+    PROVE_BIN="$PLUGIN_DIR/bin/heimdall-prove"
+    if [ ! -x "$PROVE_BIN" ]; then
+      echo "  Error: heimdall-prove not found at $PROVE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 5
+    fi
+    exec "$PROVE_BIN" "$@"
+    ;;
   sla)
     # Pass-through to heimdall-sla: the ⚠-class observation SLA auditor. The standing
     # rule is that a security_note / sensitive / ⚠ observation gets a verdict within
@@ -3339,6 +3358,56 @@ if [[ "${1:-}" == "--setup" ]]; then
   exit 0
 fi
 
+# ── EXIT-trap cleanup, shared by both launch paths (the default launch and --resume) ──
+#
+# THE LAUNCHER'S EXIT STATUS IS CLAUDE'S, AND NOTHING THIS TRAP DOES MAY CHANGE IT.
+# A trap action runs under the script's own `set -e`, so a non-zero RETURN from it makes
+# errexit fire INSIDE the trap, and that status replaces the one being exited with. Each
+# trap used to end on
+#     [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ] && "$SKILL_MGR" restore "$RESTORE_FILE"
+# With no skill-manager (RESTORE_FILE empty) that list is false, so the function returned
+# 1 and EVERY run exited 1 — a successful `hmd "task"` and a claude that exited 3 alike —
+# and a `restore` that failed put its own status in the same place.
+#
+# So: capture the status at entry, keep every best-effort step status-neutral (`if … fi`
+# and `|| true`, never a trailing `a && b` whose false first test becomes the return
+# value), and `exit` with the captured status. One body serves both traps so the
+# invariant lives in one place. Proof: test/heimdall-unknown-command.test.sh section 9.
+#   $1  the temp preamble file this launch wrote
+_heimdall_launch_cleanup() {
+  local rc=$?
+  rm -f "$1" 2>/dev/null || true
+  if [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ]; then
+    "$SKILL_MGR" restore "$RESTORE_FILE" 2>/dev/null || true
+  fi
+  exit "$rc"
+}
+
+# ── Skill pause for the life of a launch, shared by both launch paths ──
+#
+# Pauses the plugins this project does not need and records where the undo lives. Sets
+# SKILL_MGR and RESTORE_FILE, which _heimdall_launch_cleanup reads in the EXIT trap.
+#
+# ONE restore path per launch, chosen HERE and handed to BOTH halves. It used to be fetched
+# with `RESTORE_FILE=$("$SKILL_MGR" restore-file)` AFTER `activate` -- two skill-manager
+# processes, and restore-file built the path from its own `$$` -- so `activate` wrote one file,
+# the trap asked for another, `restore` found nothing and returned 0, and no launch ever put
+# back the skills it paused. The path is now a function of THIS shell's pid ($$ stays the
+# launcher's pid inside functions and subshells): the one pid that lives exactly as long as the
+# launch, which is what lets a later session tell that the file of a launcher that was killed is
+# stale and recover it. No path -> nothing is paused: an undo with nowhere to live would leave
+# the skills paused for good. Proof: test/skill-manager-restore.test.sh.
+_heimdall_skills_activate() {
+  SKILL_MGR="$PLUGIN_DIR/bin/skill-manager"
+  RESTORE_FILE=""
+  if [ -x "$SKILL_MGR" ]; then
+    RESTORE_FILE=$("$SKILL_MGR" restore-file "$$") || RESTORE_FILE=""
+    if [ -n "$RESTORE_FILE" ]; then
+      "$SKILL_MGR" activate "$WORK_DIR" "$RESTORE_FILE"
+    fi
+  fi
+}
+
 # --resume: continue the last Claude session AND load .planning/ state
 if [[ "${1:-}" == "--resume" || "${1:-}" == "-r" ]]; then
   ensure_node_path
@@ -3390,18 +3459,10 @@ except: pass
     echo "${PREAMBLE:-heimdall resumed}" > "$RESUME_PREAMBLE_FILE"
   fi
 
-  # Activate project-aware skills
-  SKILL_MGR="$PLUGIN_DIR/bin/skill-manager"
-  RESTORE_FILE=""
-  if [ -x "$SKILL_MGR" ]; then
-    "$SKILL_MGR" activate "$WORK_DIR"
-    RESTORE_FILE=$("$SKILL_MGR" restore-file)
-  fi
+  # Activate project-aware skills (sets SKILL_MGR / RESTORE_FILE for the EXIT trap below)
+  _heimdall_skills_activate
 
-  cleanup_resume() {
-    rm -f "$RESUME_PREAMBLE_FILE"
-    [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ] && "$SKILL_MGR" restore "$RESTORE_FILE" 2>/dev/null
-  }
+  cleanup_resume() { _heimdall_launch_cleanup "$RESUME_PREAMBLE_FILE"; }
   trap cleanup_resume EXIT
 
   # SWITCH-only session-wide fallback routing (see apply_switch_fallback_env's
@@ -4767,17 +4828,9 @@ PREAMBLE_FILE=$(mktemp /tmp/heimdall-preamble-XXXXXX)
 echo "$PREAMBLE" > "$PREAMBLE_FILE"
 
 # Activate project-aware skill management (enable needed plugins, pause rest)
-SKILL_MGR="$PLUGIN_DIR/bin/skill-manager"
-RESTORE_FILE=""
-if [ -x "$SKILL_MGR" ]; then
-  "$SKILL_MGR" activate "$WORK_DIR"
-  RESTORE_FILE=$("$SKILL_MGR" restore-file)
-fi
+_heimdall_skills_activate
 
-cleanup() {
-  rm -f "$PREAMBLE_FILE"
-  [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ] && "$SKILL_MGR" restore "$RESTORE_FILE" 2>/dev/null
-}
+cleanup() { _heimdall_launch_cleanup "$PREAMBLE_FILE"; }
 trap cleanup EXIT
 
 # ── Launch boot animation (change #2, v2.0.3): the watchman wakes ──

@@ -2,6 +2,14 @@
 # skill-manager — project-aware plugin lifecycle for heimdall
 # Enables plugins needed for current project, disables the rest.
 # State stored in ~/.claude/settings.json under enabledPlugins.
+#
+# RESTORE FILES. `activate` records what it paused in a restore file and `restore` undoes exactly
+# that. The two are separate processes, so they must agree on the file's path WITHOUT sharing a
+# pid: the path is a pure function of an OWNER (the launcher's pid), printed by `restore-file`,
+# and the caller hands it to both halves. It used to be built from this script's own `$$`, so
+# every call named a different file, `restore` found nothing and the skills were never restored.
+# The state logic lives in bin/lib/skill_restore.py (restore format, recovery of the files of
+# launchers that died, locking).
 set -eo pipefail
 
 SELF="$0"
@@ -13,7 +21,16 @@ PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 CONFIG="$PLUGIN_DIR/heimdall-skills.json"
 [ -f "$CONFIG" ] || [ ! -f "$PLUGIN_DIR/superx-skills.json" ] || CONFIG="$PLUGIN_DIR/superx-skills.json"
 SETTINGS="$HOME/.claude/settings.json"
-RESTORE_FILE="/tmp/heimdall-skill-restore-$$.json"
+STATE_PY="$PLUGIN_DIR/bin/lib/skill_restore.py"
+# One <owner-pid>.json per launch, in a private per-user dir: the recovery of a dead launcher's
+# file applies its contents to settings.json, so it must not live where another local user can
+# plant one (/tmp), and it must outlast a reboot after a crash.
+RESTORE_DIR="${HEIMDALL_HOME:-$HOME/.heimdall}/skill-restore"
+
+# restore_path OWNER-PID — the restore file of that owner. Pure: every call, in any process, agrees.
+restore_path() {
+  printf '%s/%s.json\n' "$RESTORE_DIR" "$1"
+}
 
 G='\033[38;2;78;204;163m'
 D='\033[38;2;100;100;120m'
@@ -21,114 +38,42 @@ C='\033[38;2;0;212;255m'
 P='\033[38;2;224;86;160m'
 R='\033[0m'
 
+# cmd_activate [dir] [restore-file] — pause what the project does not need; the undo goes to
+# restore-file (default: the one owned by the calling process).
 cmd_activate() {
-  local project_dir="${1:-.}"
+  local project_dir="${1:-.}" restore_file="${2:-}"
+  [ -n "$restore_file" ] || restore_file="$(restore_path "$PPID")"
 
   [ -f "$CONFIG" ] || return 0
   [ -f "$SETTINGS" ] || return 0
+  [ -f "$STATE_PY" ] || return 0
   command -v python3 &>/dev/null || return 0
 
-  python3 <<PYEOF
-import json, glob, os, sys, copy
-
-config_path = "$CONFIG"
-settings_path = "$SETTINGS"
-project_dir = "$project_dir"
-restore_path = "$RESTORE_FILE"
-
-with open(config_path) as f:
-    config = json.load(f)
-
-with open(settings_path) as f:
-    settings = json.load(f)
-
-enabled_plugins = settings.get("enabledPlugins", {})
-prev_state = copy.deepcopy(enabled_plugins)
-
-# Build set of needed plugins
-needed = set(config.get("permanent", []))
-
-for rule_name, rule in config.get("detection", {}).items():
-    patterns = rule.get("files", [])
-    matched = False
-    for pattern in patterns:
-        # Check top-level and one level deep (fast scan)
-        if glob.glob(os.path.join(project_dir, pattern)):
-            matched = True
-            break
-        if glob.glob(os.path.join(project_dir, "*", pattern)):
-            matched = True
-            break
-        # Check src/ specifically (common convention)
-        if glob.glob(os.path.join(project_dir, "src", "**", pattern), recursive=True):
-            matched = True
-            break
-    if matched:
-        for p in rule.get("plugins", []):
-            needed.add(p)
-
-# Apply: enable needed, disable rest
-changed_on = []
-changed_off = []
-
-for plugin_id, is_enabled in list(enabled_plugins.items()):
-    if plugin_id in needed:
-        if not is_enabled:
-            enabled_plugins[plugin_id] = True
-            changed_on.append(plugin_id)
-    else:
-        if is_enabled:
-            enabled_plugins[plugin_id] = False
-            changed_off.append(plugin_id)
-
-# Save previous state for restore
-with open(restore_path, "w") as f:
-    json.dump(prev_state, f)
-
-# Write settings
-settings["enabledPlugins"] = enabled_plugins
-with open(settings_path, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-
-# Report
-active = sum(1 for v in enabled_plugins.values() if v)
-paused = sum(1 for v in enabled_plugins.values() if not v)
-
-if changed_on or changed_off:
-    print(f"CHANGED|{active}|{paused}|{','.join(changed_on)}|{','.join(changed_off)}")
-else:
-    print(f"OK|{active}|{paused}||")
-PYEOF
+  python3 "$STATE_PY" activate "$CONFIG" "$SETTINGS" "$project_dir" "$restore_file" "$RESTORE_DIR"
 }
 
+# cmd_restore [restore-file] — undo that activation (default: the file owned by the calling process).
 cmd_restore() {
-  local restore_file="${1:-$RESTORE_FILE}"
+  local restore_file="${1:-}"
+  [ -n "$restore_file" ] || restore_file="$(restore_path "$PPID")"
 
   [ -f "$restore_file" ] || return 0
   [ -f "$SETTINGS" ] || return 0
+  [ -f "$STATE_PY" ] || return 0
   command -v python3 &>/dev/null || return 0
 
-  python3 <<PYEOF
-import json
+  python3 "$STATE_PY" restore "$SETTINGS" "$restore_file" "$RESTORE_DIR"
+}
 
-restore_path = "$restore_file"
-settings_path = "$SETTINGS"
-
-with open(restore_path) as f:
-    prev_state = json.load(f)
-
-with open(settings_path) as f:
-    settings = json.load(f)
-
-settings["enabledPlugins"] = prev_state
-
-with open(settings_path, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-PYEOF
-
-  rm -f "$restore_file"
+# cmd_restore_file [owner-pid] — print the restore file for an owner (default: the calling process).
+cmd_restore_file() {
+  local owner="${1:-$PPID}"
+  case "$owner" in
+    ''|*[!0-9]*|0*)
+      echo "skill-manager: restore-file: the owner must be a positive pid, got '$owner'" >&2
+      return 2 ;;
+  esac
+  restore_path "$owner"
 }
 
 cmd_status() {
@@ -204,11 +149,13 @@ cmd_print_summary() {
 
 case "${1:-}" in
   activate)
-    result=$(cmd_activate "${2:-.}")
-    cmd_print_summary "$result"
+    result=$(cmd_activate "${2:-.}" "${3:-}")
+    # Nothing to activate (no settings, no config, no python, no place for the undo): say nothing,
+    # rather than a "Skills:  active,  paused" line with the numbers missing.
+    [ -z "$result" ] || cmd_print_summary "$result"
     ;;
   activate-quiet)
-    cmd_activate "${2:-.}" > /dev/null
+    cmd_activate "${2:-.}" "${3:-}" > /dev/null
     ;;
   restore)
     cmd_restore "${2:-}"
@@ -217,13 +164,15 @@ case "${1:-}" in
     cmd_status "${2:-.}"
     ;;
   restore-file)
-    echo "$RESTORE_FILE"
+    cmd_restore_file "${2:-}"
     ;;
   *)
-    echo "Usage: skill-manager {activate|restore|status} [project-dir]"
+    echo "Usage: skill-manager {activate|restore|restore-file|status} [args]"
     echo ""
-    echo "  activate [dir]   Enable project-needed plugins, disable rest"
-    echo "  restore          Re-enable all plugins (previous state)"
-    echo "  status [dir]     Show which plugins would be active"
+    echo "  activate [dir] [restore-file]  Enable project-needed plugins, disable rest;"
+    echo "                                 the undo is recorded in restore-file"
+    echo "  restore [restore-file]         Undo that activation (only what it changed)"
+    echo "  restore-file [owner-pid]       Print the restore file of an owner (default: the caller)"
+    echo "  status [dir]                   Show which plugins would be active"
     ;;
 esac

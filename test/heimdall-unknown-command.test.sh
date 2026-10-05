@@ -23,10 +23,16 @@
 # and section 8 proves that with a mutated copy of the script (a hand-copied list
 # would fail it).
 #
+# ALSO PINNED (section 9) -- found while landing the guard, and not about unknown words:
+# the launcher's EXIT trap used to replace the exit status of every run in an install with
+# no skill-manager, so a successful `hmd "task"` exited 1 and a claude that exited 3 was
+# reported as 1.
+#
 # HARNESS. Every launch runs with a stub `claude` first on PATH that RECORDS its
-# argv and exits 0 -- the real claude is never launched, so a regression is
-# DETECTED (the stub's log) instead of starting a session. HOME, HEIMDALL_HOME and the
-# working directory are throwaway dirs, stdin is /dev/null, every run is bounded.
+# argv and exits 0 (STUB_CLAUDE_RC makes its launch exit N, for section 9) -- the real
+# claude is never launched, so a regression is DETECTED (the stub's log) instead of
+# starting a session. HOME, HEIMDALL_HOME and the working directory are throwaway dirs,
+# stdin is /dev/null, every run is bounded.
 #
 # EXIT: 0 = all assertions pass; 1 = any FAIL.
 
@@ -66,10 +72,13 @@ touch "$HOME_DIR/.heimdall/setup-done"
 
 # The stub `claude`: one `ARGV: [a] [b] ...` line per invocation. The launcher's OWN
 # launch is the invocation that carries `--agent heimdall`; helper probes it makes
-# (--version and friends) are recorded too but never match that marker.
+# (--version and friends) are recorded too but never match that marker. Only that launch
+# honours STUB_CLAUDE_RC (default 0): a probe that failed would send the launcher down a
+# repair path instead of the exit path section 9 is about.
 cat > "$STUBS/claude" <<'EOF'
 #!/bin/sh
 { printf 'ARGV:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "${CLAUDE_LOG:-/dev/null}"
+case " $* " in *" --agent heimdall "*) exit "${STUB_CLAUDE_RC:-0}" ;; esac
 exit 0
 EOF
 chmod +x "$STUBS/claude"
@@ -88,15 +97,20 @@ make_stub heimdall-hooks
 make_stub heimdall-weekly-log
 
 # The launcher activates project skills before a launch and restores them in its EXIT
-# trap. A real install always has bin/skill-manager; without one the trap's last test
-# returns 1 and replaces an otherwise-0 exit status (a launcher quirk this suite is not
-# about). Stubbing it keeps the sandbox a faithful install, so "launched => exit 0" holds.
-cat > "$FAKE/bin/skill-manager" <<'EOF'
+# trap. A real install always has bin/skill-manager, so the sandbox carries a stub (section
+# 9 removes it to prove the exit status never depends on it). Every call is logged, and
+# `restore` exits STUB_RESTORE_RC (default 0) so section 9 can make the restore fail.
+install_skill_manager() {
+  cat > "$FAKE/bin/skill-manager" <<'EOF'
 #!/bin/sh
+printf 'skill-manager ARGS: %s\n' "$*" >> "${HMD_STUB_LOG:-/dev/null}"
 [ "$1" = "restore-file" ] && echo "${TMPDIR:-/tmp}/skill-restore-stub"
+[ "$1" = "restore" ] && exit "${STUB_RESTORE_RC:-0}"
 exit 0
 EOF
-chmod +x "$FAKE/bin/skill-manager"
+  chmod +x "$FAKE/bin/skill-manager"
+}
+install_skill_manager
 
 # run ENTRY [ARGS...] -- run the launcher in the sandbox. Sets RC; stdout/stderr land
 # in $OUT/$ERR; $CLAUDE_LOG holds every claude invocation. Bounded by a perl alarm so
@@ -109,6 +123,7 @@ run() {
       HEIMDALL_NO_INTRO=1 HEIMDALL_NO_UPDATE_CHECK=1 HEIMDALL_NO_REUSE_METRIC=1 \
       HEIMDALL_DEFAULT_CP_URL="$HEIMDALL_DEFAULT_CP_URL" \
       CLAUDE_LOG="$CLAUDE_LOG" HMD_STUB_LOG="$STUB_LOG" \
+      STUB_CLAUDE_RC="${STUB_CLAUDE_RC:-0}" STUB_RESTORE_RC="${STUB_RESTORE_RC:-0}" \
       perl -e 'alarm shift; exec @ARGV' "${RUN_ALARM:-90}" "$@" </dev/null >"$OUT" 2>"$ERR" )
   RC=$?
 }
@@ -152,6 +167,14 @@ expect_interactive() {
   ! launch_has '[-p]' || why="$why launched with a -p task prompt;"
   ! err_has "unknown command" || why="$why stderr says unknown command;"
   if [ -z "$why" ]; then ok "$label"; else bad "$label --$why log=[$(snip "$CLAUDE_LOG")] stderr=[$(snip "$ERR")]"; fi
+}
+
+# expect_status LABEL WANT -- the last run launched claude and the launcher exited WANT.
+expect_status() {
+  local label="$1" want="$2" why=""
+  launched || why="$why claude never launched;"
+  [ "$RC" -eq "$want" ] || why="$why exit=$RC (want $want);"
+  if [ -z "$why" ]; then ok "$label"; else bad "$label --$why stderr=[$(snip "$ERR")]"; fi
 }
 
 # expect_suggests LABEL WORD -- the last run's stderr offers WORD as the nearest command.
@@ -383,7 +406,62 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-echo "9. syntax"
+echo "9. the launcher exits with claude's own status -- its EXIT trap never replaces it"
+# ══════════════════════════════════════════════════════════════════════════════
+# The launch paths register an EXIT trap that deletes the temp preamble and restores the
+# skills the launch paused. A trap action runs under the script's own `set -e`, so a
+# non-zero RETURN from it makes errexit fire inside the trap and its status replaces the
+# one being exited with. It used to end on
+#   [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ] && "$SKILL_MGR" restore "$RESTORE_FILE"
+# so with no skill-manager that list was false, the trap returned 1, and EVERY run exited 1
+# -- a successful `hmd "task"` and a claude that exited 3 alike -- while a skill-manager
+# whose `restore` failed put its own status in the same place.
+# The three launch shapes leave differently (the task path through `exit "$TASK_RC"`, the
+# interactive one by running off the end, --resume through `exit $?`) and --resume has a
+# trap of its own, so every shape runs with and without a skill-manager.
+for SM in with without; do
+  if [ "$SM" = with ]; then install_skill_manager; else rm -f "$FAKE/bin/skill-manager"; fi
+  for WANT in 0 3; do
+    STUB_CLAUDE_RC=$WANT run "$FAKE/bin/heimdall" "fix the bug in x"
+    expect_status "task prompt, claude exits $WANT, $SM skill-manager: launcher exits $WANT" "$WANT"
+    STUB_CLAUDE_RC=$WANT run "$FAKE/bin/heimdall"
+    expect_status "interactive, claude exits $WANT, $SM skill-manager: launcher exits $WANT" "$WANT"
+    STUB_CLAUDE_RC=$WANT run "$FAKE/bin/heimdall" --resume
+    expect_status "--resume, claude exits $WANT, $SM skill-manager: launcher exits $WANT" "$WANT"
+  done
+done
+
+# A skill-manager whose restore FAILS is best-effort housekeeping: it must not pick the
+# exit status either.
+install_skill_manager
+for WANT in 0 3; do
+  STUB_CLAUDE_RC=$WANT STUB_RESTORE_RC=5 run "$FAKE/bin/heimdall" "fix the bug in x"
+  expect_status "task prompt, claude exits $WANT, skill-manager restore FAILS (5): launcher exits $WANT" "$WANT"
+  STUB_CLAUDE_RC=$WANT STUB_RESTORE_RC=5 run "$FAKE/bin/heimdall" --resume
+  expect_status "--resume, claude exits $WANT, skill-manager restore FAILS (5): launcher exits $WANT" "$WANT"
+done
+
+# ...and keeping the status may not cost the trap its work: it still deletes the temp
+# preamble and still asks the skill-manager to restore the paused skills.
+run "$FAKE/bin/heimdall" "fix the bug in x"
+PRE_FILE="$(sed -n 's/.*\[--append-system-prompt-file\] \[\([^]]*\)\].*/\1/p' "$CLAUDE_LOG" | sed -n '1p')"
+case "$PRE_FILE" in
+  /tmp/heimdall-preamble-*)
+    if [ ! -e "$PRE_FILE" ]; then
+      ok "the trap still deletes the temp preamble file"
+    else
+      bad "the temp preamble file survived the run: $PRE_FILE"; rm -f "$PRE_FILE"
+    fi ;;
+  *) bad "no temp preamble path in the launch argv -- log=[$(snip "$CLAUDE_LOG")]" ;;
+esac
+if grep -qE '^skill-manager ARGS: restore /' "$STUB_LOG"; then
+  ok "the trap still asks the skill-manager to restore the paused skills"
+else
+  bad "the skill-manager was never asked to restore -- stub=[$(snip "$STUB_LOG")]"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+echo "10. syntax"
 # ══════════════════════════════════════════════════════════════════════════════
 if bash -n "$HEIMDALL" 2>/dev/null; then ok "bin/heimdall passes bash -n"; else bad "bin/heimdall has a syntax error"; fi
 
