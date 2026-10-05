@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runhmd.dev/schemas/runhmd.receipt.v1.json",
+  "title": "runhmd.receipt/1",
+  "description": "The runhmd receipt: a signed, shareable record that one verification happened and what it concluded. `hmd attack --receipt` issues it (bin/lib/runhmd_receipt.py), `hmd receipt verify` checks it, `/r/<id>` and `/r/<id>.json` publish it. THIS FILE IS THE SINGLE SOURCE: bin/lib/runhmd_schema.py reads it at run time (no copy of these rules lives in code) and refuses any keyword it cannot enforce. The verdict vocabulary (verdict, attacks, agent, gate, regression_tests, and the id/title/severity/category of a finding) is referenced from runhmd.verdict.v1.json, never copied. WHAT A RECEIPT HOLDS: what was attacked as a content hash (subject.tree_sha256, never file contents and never a path), the verdict, each finding as a digest (sha256 of the finding's canonical JSON from the verdict document, never its counterexample text), the tool version and a UTC timestamp. It carries no secret and no counterexample text, so its exact signed bytes can be published at any visibility. SIGNATURE: Ed25519 over the bytes 'runhmd.receipt/1' LF followed by the canonical form of the receipt with its `signature` member removed. CANONICAL FORM: UTF-8 JSON with no insignificant whitespace, object members sorted by the UTF-16 code units of the key, strings with the minimal RFC 8259 escapes, integral numbers written without a fraction or exponent, other numbers as the shortest decimal that round-trips (cost_usd has at most 4 and duration_s at most 2 decimal places, so no exponent form ever occurs). A receipt FILE is the canonical form of the WHOLE document (signature included) followed by one LF; a verifier rejects any other byte sequence for the same document, so the bytes served at /r/<id>.json are the bytes that were signed. `key_id` is the first 16 hex digits of the SHA-256 of the raw 32-byte public key and is covered by the signature; a verifier takes the public key from a pinned trust set (--pubkey, RUNHMD_RECEIPT_PUBKEY_FILE, release/runhmd-receipt.pub), NEVER from the receipt. `signature` is the standard padded base64 of the 64 signature bytes. `verdict_sha256` is the sha256 of the canonical JSON of the attested verdict document with its receipt_url member (if any) set to null: a receipt cannot hash the URL that points at it. JSON Schema cannot express cross-field rules, so `x-invariants` lists the extra rules the validator enforces; each id is implemented in bin/lib/runhmd_schema.py.",
+  "x-documents": {
+    "runhmd.receipt/1": "#"
+  },
+  "x-invariants": [
+    {"id": "RC1", "applies_to": "runhmd.receipt/1", "rule": "created_at is a real UTC calendar timestamp (no 30 February, no hour 25)"},
+    {"id": "RC2", "applies_to": "runhmd.receipt/1", "rule": "the attested verdict is consistent: the runhmd.verdict/1 rules V1-V4 and G1 hold over the receipt's own verdict, attacks, findings, gates and regression_tests"},
+    {"id": "RC3", "applies_to": "runhmd.receipt/1", "rule": "cost_usd is a finite number with at most 4 decimal places and duration_s at most 2, so every implementation writes the same canonical bytes for them"}
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "created_at", "visibility", "verdict", "subject", "attacks", "findings", "agent", "cost_usd", "duration_s", "tool", "verdict_sha256", "key_id", "signature"],
+  "properties": {
+    "schema": {"const": "runhmd.receipt/1"},
+    "id": {"$ref": "runhmd.verdict.v1.json#/$defs/id"},
+    "created_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+    "visibility": {"enum": ["private", "public"]},
+    "verdict": {"$ref": "runhmd.verdict.v1.json#/$defs/verdict"},
+    "subject": {"$ref": "#/$defs/subject"},
+    "attacks": {"$ref": "runhmd.verdict.v1.json#/$defs/attacks"},
+    "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "gates": {"type": "array", "items": {"$ref": "runhmd.verdict.v1.json#/$defs/gate"}},
+    "regression_tests": {"$ref": "runhmd.verdict.v1.json#/$defs/regressionTests"},
+    "agent": {"$ref": "runhmd.verdict.v1.json#/$defs/agent"},
+    "cost_usd": {"type": "number", "minimum": 0},
+    "duration_s": {"type": "number", "minimum": 0},
+    "tool": {"$ref": "#/$defs/tool"},
+    "verdict_sha256": {"$ref": "#/$defs/sha256"},
+    "key_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+    "signature": {"type": "string", "pattern": "^[A-Za-z0-9+/]{86}==$"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "head_sha", "tree_sha256"],
+      "properties": {
+        "kind": {"$ref": "runhmd.verdict.v1.json#/$defs/target/properties/kind"},
+        "head_sha": {"$ref": "runhmd.verdict.v1.json#/$defs/target/properties/head_sha"},
+        "tree_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "severity", "category", "digest"],
+      "properties": {
+        "id": {"$ref": "runhmd.verdict.v1.json#/$defs/finding/properties/id"},
+        "title": {"$ref": "runhmd.verdict.v1.json#/$defs/finding/properties/title"},
+        "severity": {"$ref": "runhmd.verdict.v1.json#/$defs/finding/properties/severity"},
+        "category": {"$ref": "runhmd.verdict.v1.json#/$defs/finding/properties/category"},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"const": "hmd"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 64}
+      }
+    }
+  }
+}

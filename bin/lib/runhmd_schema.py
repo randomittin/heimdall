@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""runhmd_schema -- validate runhmd documents against docs/schemas/runhmd.verdict.v1.json.
+"""runhmd_schema -- validate runhmd documents against docs/schemas/runhmd.*.v1.json.
 
-The schema FILE is the single source of the runhmd.verdict/1 contract (and of the
-runhmd.prove/1 envelope `hmd prove` emits). This module holds no copy of those rules:
-it loads the file and enforces it. Two layers:
+The schema FILES are the single source of the runhmd contracts: runhmd.verdict/1 (and the
+runhmd.prove/1 envelope `hmd prove` emits) in runhmd.verdict.v1.json, runhmd.receipt/1 in
+runhmd.receipt.v1.json. This module holds no copy of those rules: it loads the file and
+enforces it. A document is checked against the file whose `x-documents` declares its
+`schema` id. Two layers:
 
-  1. structure  -- a small, stdlib-only subset of JSON Schema (2020-12): $ref (local
-                   only, never fetched), type, const, enum, required, properties,
+  1. structure  -- a small, stdlib-only subset of JSON Schema (2020-12): $ref (local, or a
+                   sibling runhmd.*.json file in the schema's own directory so the receipt
+                   schema shares the verdict vocabulary instead of copying it -- never a
+                   URL, never fetched), type, const, enum, required, properties,
                    additionalProperties, items, minItems, maxItems, minLength, maxLength,
                    pattern, minimum, maximum. Any other validating keyword in the schema
                    file makes the whole schema UNUSABLE (exit 2): a rule this module
@@ -22,19 +26,23 @@ Usage:
 Exit: 0 valid (prints `ok <schema id>` on stdout); 1 invalid (one error per line on
 stderr); 2 usage / IO / unusable schema.
 
-Python API (what `hmd attack` and `hmd prove` import):
+Python API (what `hmd attack`, `hmd prove` and `hmd receipt` import):
   load_schema(path=None) -> dict
   validate(doc, schema=None) -> list[str]        empty list == valid
 """
 from __future__ import annotations
 
+import datetime
 import json
+import math
 import os
 import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SCHEMA = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "schemas", "runhmd.verdict.v1.json"))
+SCHEMA_DIR = os.path.dirname(DEFAULT_SCHEMA)
+_SIBLING_FILE = re.compile(r"runhmd\.[A-Za-z0-9_.-]+\.json")
 
 # Keywords this module enforces. Anything else that is not an annotation is refused.
 _VALIDATING = {
@@ -49,10 +57,39 @@ class SchemaError(Exception):
 
 
 def load_schema(path=None):
-    with open(path or DEFAULT_SCHEMA, "r", encoding="utf-8") as fh:
+    path = path or DEFAULT_SCHEMA
+    with open(path, "r", encoding="utf-8") as fh:
         schema = json.load(fh)
+    if not isinstance(schema, dict):
+        raise SchemaError("a schema file must hold a JSON object")
     _audit(schema, "#")
+    # Where this file lives: a sibling $ref inside it is looked up next to it, so a copied
+    # schema directory (a test fixture, a vendored copy) is self-contained.
+    schema["x-source-dir"] = os.path.dirname(os.path.abspath(path))
     return schema
+
+
+_LOADED = {}
+
+
+def _load_sibling(path):
+    """load_schema, memoised per (path, mtime, size): a receipt with many findings resolves the
+    same sibling $ref once per finding, and re-reading the file each time would be pure waste."""
+    stat = os.stat(path)
+    key = (path, stat.st_mtime_ns, stat.st_size)
+    if key not in _LOADED:
+        _LOADED[key] = load_schema(path)
+    return _LOADED[key]
+
+
+def _declared_documents():
+    """{document id: the schema declaring it} for every runhmd.*.json in the schema directory."""
+    found = {}
+    for name in sorted(n for n in os.listdir(SCHEMA_DIR) if _SIBLING_FILE.fullmatch(n)):
+        schema = _load_sibling(os.path.join(SCHEMA_DIR, name))
+        for doc_id in schema.get("x-documents", {}):
+            found.setdefault(doc_id, schema)
+    return found
 
 
 def _audit(node, where):
