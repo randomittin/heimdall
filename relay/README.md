@@ -451,6 +451,13 @@ re-checked behind it. The new internal handlers (`code-release`, `index-*`, `buc
 | **INV-43** | An assertion is honoured only with a valid Ed25519 signature by its `install_pubkey` over the request's code and a timestamp within 60 s. | `handlePairCode`, `verifyInstallSignature`; "proof of possession (INV-43)" |
 | **INV-44** | `key_reveal` is the only hmd->phone frame type that carries a plaintext payload; hmd may post at most one per session, only once the session is bound, and a phone cannot originate one. | `isHmdFrame`/`isKeyReveal`, `handleKeyReveal`; "key_reveal (INV-44)" |
 
+One caveat to INV-41, disclosed rather than hidden: the `device_bound` the relay writes to hmd names
+the phone's `device_label` and `gh_login`, and if hmd's stream is not open at the bind the relay
+holds that frame (`pending_hmd_control_frame`, as it always has) until hmd connects. Delivery
+deletes it, so the labels leave storage when hmd takes the frame -- seconds, in practice -- but an
+hmd that never comes back leaves them until the session is purged. The session record itself is
+clean from the bind.
+
 Refinements the spec leaves open, decided here and in the contract: a bad assertion of any kind
 (forged, malformed, past `exp`) is `identity expired`; a check-token `401`/`403` is the relay's
 own credentials being refused, so `502` and a `github_error` line, never a verdict on the user's

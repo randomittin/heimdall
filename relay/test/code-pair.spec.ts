@@ -939,11 +939,13 @@ describe("POST /identity/github/revoke (spec 6.4)", () => {
 
     await sleep(1100); // the sign-in above must be an earlier second than the revoke: see "identity revoked" above
     const token = fake.laptopToken(user);
+    const callsBefore = fake.calls.length; // the sign-ins and windows above called GitHub too
     const res = await revokeRequest({ gh_token: token });
     const body = await expectRow(res, "identity_revoke.ok", { gh_login: user.login });
     expect(Math.abs((body.not_before as number) - nowS())).toBeLessThanOrEqual(5);
-    expect(fake.calls.map((c) => `${c.method} ${c.path}`)).toEqual(["GET /user"]);
-    expect(fake.calls[0]?.authorization).toBe(`Bearer ${token}`);
+    const revokeCalls = fake.calls.slice(callsBefore);
+    expect(revokeCalls.map((c) => `${c.method} ${c.path}`)).toEqual(["GET /user"]);
+    expect(revokeCalls[0]?.authorization).toBe(`Bearer ${token}`);
 
     await expectRow(await pairCode(stale, window.code), "pair_code.identity_revoked");
     expect((await pairCode(bystander, bystanderWindow.code)).status).toBe(200);
@@ -1352,8 +1354,13 @@ describe("INV-41: a window's identifying fields live no longer than the window",
     const released = (await (await pairCode(identity, window.code, { device_label: "Pixel 9a" })).json()) as { pairing_code: string };
     expect((await storedRecord(window.init.session_id))?.code_window).toBeDefined();
 
+    // hmd is listening, so the device_bound that names the label is delivered at once and not held:
+    // a frame held for an hmd that is away carries the label until hmd takes it (README, INV-41).
+    const hmd = await HmdLines.open(window.init);
     const phone = await claimSocket(window.init.session_id, released.pairing_code);
     await phone.next();
+    expect(await hmd.next()).toMatchObject({ type: "device_bound" });
+    await hmd.close();
 
     const record = await storedRecord(window.init.session_id);
     expect(record?.status).toBe("bound");
