@@ -98,6 +98,22 @@ interface StoredHmdState {
 const LAST_HMD_STATE_KEY = "last_hmd_state";
 
 /**
+ * Storage key for the one control frame the relay may have to hold for hmd: the
+ * `device_bound` that carries the phone's public key, which a claim can
+ * produce before hmd's `GET /stream` is open. Never more than one — a session
+ * binds at most once, and handleDeviceTokenClaim's reconnect path never calls
+ * deliverToHmdStream. Stored as the encoded NDJSON line, byte for byte what
+ * handleStream later writes.
+ *
+ * This was a field on the instance. Nothing keeps the object resident while
+ * hmd is away (only an open `GET /stream` does), so an eviction between the
+ * claim and hmd connecting dropped the frame, and hmd — which derives its
+ * session key from that frame alone — never completed the pairing.
+ * test/hibernation.spec.ts reproduces it.
+ */
+const PENDING_HMD_CONTROL_KEY = "pending_hmd_control_frame";
+
+/**
  * Grace added to a purge deadline so a client that is merely late — a phone
  * reconnecting seconds after its token lapsed, hmd re-reading a just-revoked
  * session — meets a truthful `410`/`401` rather than a bare `404` from a
@@ -180,6 +196,15 @@ interface DeviceSocketAttachment {
    * honest expiry to apply to it.
    */
   token_exp?: number;
+  /**
+   * The session this socket belongs to, so a freshly woken instance can name
+   * the session in a log line written before it has read the record:
+   * `cachedSessionId` is a field on `this`, and `this` is rebuilt on every
+   * wake. Absent on a socket accepted before this field existed — such a line
+   * falls back to the cached id, and to `"unknown"` when the instance has not
+   * read the record yet either.
+   */
+  sid?: string;
 }
 
 /**
@@ -266,11 +291,6 @@ function isValidDevicePubkey(value: string | null): value is string {
 
 export class SessionDO {
   private hmdStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
-  // The one control frame that may need buffering (spec: device_bound to
-  // hmd's stream can arrive before hmd's GET /stream is even open) — never
-  // more than one, since a session binds at most once (handleDeviceTokenClaim's
-  // reconnect path never calls deliverToHmdStream again).
-  private pendingHmdControlFrame: string | null = null;
   // Bumped once per `GET /stream`, so a stream's own `cancel()` can tell
   // whether it is still the live one before tearing down shared state — a
   // reconnect installs its controller before the superseded stream's cancel
@@ -648,6 +668,10 @@ export class SessionDO {
       return jsonResponse(401, { error: "missing or invalid bearer token" });
     }
 
+    // Read ahead of the swap below, so nothing is awaited between closing the
+    // old stream and installing the new one.
+    const pending = await this.ctx.storage.get<string>(PENDING_HMD_CONTROL_KEY);
+
     this.closeHmdStream();
 
     const owner = this;
@@ -655,11 +679,6 @@ export class SessionDO {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         owner.hmdStreamController = controller;
-        const pending = owner.pendingHmdControlFrame;
-        if (pending !== null) {
-          owner.pendingHmdControlFrame = null;
-          if (!owner.writeToHmdStream(pending)) owner.pendingHmdControlFrame = pending;
-        }
         owner.armKeepalive();
         owner.armStreamLifetime(generation);
       },
@@ -673,6 +692,12 @@ export class SessionDO {
         owner.clearStreamLifetime();
       },
     });
+    // The `device_bound` held while hmd's stream was down goes out first, and
+    // leaves storage only once it has actually been written: a write that
+    // failed keeps it for the next stream.
+    if (pending !== undefined && this.writeToHmdStream(pending)) {
+      await this.ctx.storage.delete(PENDING_HMD_CONTROL_KEY);
+    }
     return new Response(stream, {
       status: 200,
       headers: { "content-type": "application/x-ndjson", ...SECURITY_HEADERS },
@@ -1005,13 +1030,21 @@ export class SessionDO {
     );
   }
 
-  private acceptDeviceSocket(
+  private async acceptDeviceSocket(
     sessionId: string,
     tokenExp: number,
     bindPayload?: DeviceBoundToPhonePayload,
     hmdControlPayload?: DeviceBoundToHmdPayload,
     replayEnvelope?: Envelope
-  ): Response {
+  ): Promise<Response> {
+    // hmd's half goes first because it is the one step here that can fail (a
+    // storage write, when hmd's stream is down). Failing after the socket was
+    // accepted would leave one the phone never received — a ghost that
+    // `liveDeviceSocket` ranks newest and delivers hmd's frames into.
+    if (hmdControlPayload) {
+      await this.deliverToHmdStream(sessionId, hmdControlPayload);
+    }
+
     // Newest device socket wins, and this is where "newest" is recorded:
     // one above every generation currently attached, written onto the socket
     // so `liveDeviceSocket` can rank it against the others without this
@@ -1024,7 +1057,11 @@ export class SessionDO {
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [DEVICE_TAG]);
-    const attachment: DeviceSocketAttachment = { gen: generation, token_exp: tokenExp };
+    const attachment: DeviceSocketAttachment = {
+      gen: generation,
+      token_exp: tokenExp,
+      sid: sessionId,
+    };
     server.serializeAttachment(attachment);
     if (bindPayload) {
       server.send(
@@ -1049,21 +1086,23 @@ export class SessionDO {
       server.send(JSON.stringify(replayEnvelope));
       logEvent("state_replayed", { session_id: sessionId, seq: replayEnvelope.seq });
     }
-    if (hmdControlPayload) {
-      this.deliverToHmdStream(sessionId, hmdControlPayload);
-    }
     return new Response(null, { status: 101, webSocket: client });
   }
 
   /** Writes device_bound's hmd-facing payload (device_pubkey, bound_at) into
    * hmd's GET /stream as a plaintext control frame — the one frame this
-   * relay ever buffers (see pendingHmdControlFrame's own comment): if hmd's
-   * stream isn't open yet, this parks the encoded line until handleStream's
-   * `start()` flushes it, rather than dropping it because no one is
+   * relay ever holds back (see PENDING_HMD_CONTROL_KEY): if hmd's stream
+   * isn't open yet, this parks the encoded line in storage until
+   * handleStream flushes it, rather than dropping it because no one is
    * currently listening (unlike a `state`/`command`/`ack` frame's fire-once
    * `/frames` semantics, this control frame's only delivery describes a
-   * one-time event that already happened and must eventually reach hmd). */
-  private deliverToHmdStream(sessionId: string, payload: DeviceBoundToHmdPayload): void {
+   * one-time event that already happened and must eventually reach hmd). In
+   * storage rather than memory because nothing keeps this object resident
+   * while hmd is away. */
+  private async deliverToHmdStream(
+    sessionId: string,
+    payload: DeviceBoundToHmdPayload
+  ): Promise<void> {
     const line =
       JSON.stringify({
         v: 1,
@@ -1076,7 +1115,7 @@ export class SessionDO {
         payload,
       }) + "\n";
     if (!this.writeToHmdStream(line)) {
-      this.pendingHmdControlFrame = line;
+      await this.ctx.storage.put(PENDING_HMD_CONTROL_KEY, line);
     }
   }
 
@@ -1139,6 +1178,14 @@ export class SessionDO {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== "string") return;
 
+    // Per-socket state, read once: the session id for the log lines below that
+    // are written before the record is read (see DeviceSocketAttachment.sid —
+    // a freshly woken instance has no cached id), and the token expiry for
+    // gate 4.
+    const attachment = deviceSocketAttachment(ws);
+    const sessionId =
+      typeof attachment.sid === "string" ? attachment.sid : (this.cachedSessionId ?? "unknown");
+
     // 1. INV-16, the half that was only ever enforced on `POST /frames`
     //    (finding 8). Checked before `JSON.parse` so an oversize message is
     //    never parsed, and length-first so the encode below is itself bounded:
@@ -1149,7 +1196,7 @@ export class SessionDO {
       new TextEncoder().encode(message).byteLength > MAX_ENVELOPE_BYTES
     ) {
       logEvent("frame_rejected", {
-        session_id: this.cachedSessionId ?? "unknown",
+        session_id: sessionId,
         leg: "device",
         reason: "envelope_exceeds_size_cap",
       });
@@ -1171,7 +1218,7 @@ export class SessionDO {
     if (!isDeviceFrame(envelope)) {
       const rejected = envelope as Record<string, unknown>;
       logEvent("frame_rejected", {
-        session_id: this.cachedSessionId ?? "unknown",
+        session_id: sessionId,
         leg: "device",
         reason: "sender_or_type_not_device_originated",
         frame_sender: loggableSender(rejected.sender),
@@ -1187,7 +1234,7 @@ export class SessionDO {
     const record = await this.loadRecord();
     if (!record || record.status !== "bound") {
       logEvent("frame_rejected", {
-        session_id: record?.session_id ?? "unknown",
+        session_id: record?.session_id ?? sessionId,
         leg: "device",
         reason: "session_not_bound",
       });
@@ -1198,7 +1245,7 @@ export class SessionDO {
     // 4. And the token's own expiry, which nothing re-checked once a socket
     //    was open: a phone that never drops would have kept a 30-day
     //    credential working indefinitely.
-    const tokenExp = deviceSocketAttachment(ws).token_exp;
+    const tokenExp = attachment.token_exp;
     if (typeof tokenExp === "number" && Date.now() / 1000 > tokenExp) {
       logEvent("frame_rejected", {
         session_id: record.session_id,

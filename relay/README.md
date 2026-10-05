@@ -297,7 +297,9 @@ carries no `jti`, so revoking one device means ending the session.
   `docs/HANDBACK-FROM-HEIMDALL-relay-client-fixes.md` item 6). This lets hmd derive the session
   key without the phone ever sending its pubkey through an encrypted frame. Buffered (at most
   this one control frame, per session) if hmd's stream isn't open yet, and flushed as the first
-  line the moment it connects.
+  line the moment it connects. The buffer is Durable Object **storage**, not memory: nothing keeps
+  the object resident while hmd is away, and a frame held only on the instance was lost when the
+  object was evicted before hmd reconnected (hmd then never derived the session key).
 - **A bind supersedes the previous device socket.** Every accepted upgrade (claim *or*
   `device_token` reconnect) first closes whatever device socket the session already had, with
   close code **`4002` / `"superseded"`** — deliberately distinct from `/revoke`'s `4001`, since
@@ -544,6 +546,15 @@ Deliberately **not** changed here, with reasons:
   through `writeToHmdStream`, which treats a throwing `enqueue` as "this stream is gone",
   drops the stale controller and reports non-delivery — rather than letting the throw escape
   and take the caller's frame with it.
+- **What hibernates, and what does not (Durable Object duration).** The phone leg is a
+  Hibernation-API socket (`ctx.acceptWebSocket`, `webSocketMessage`/`Close`/`Error`, per-socket
+  state on `serializeAttachment`), and a bound session with no hmd stream open can be evicted
+  right after any request. hmd's `GET /stream` cannot hibernate: an open response holds the
+  object resident, and with it the `setTimeout` keepalive and lifetime timers, so a Durable Object
+  is billed wall-clock (128 MB) for as long as hmd's stream is open — about 10.8k GB-s per day
+  for one session with hmd always on. Measurements, the follow-ups that would remove it, and how
+  to measure duration before/after: `docs/analysis/2026-10-05-relay-hibernation.md`. The
+  eviction-based proof is `test/hibernation.spec.ts`.
 - **The keepalive is a `setTimeout` chain, not a Durable Object alarm.** An alarm is the durable
   choice and survives eviction, but this DO has no other alarm use and a 20s alarm rescheduled
   forever would pin the object awake for the life of a session, billed, purely to write filler.
