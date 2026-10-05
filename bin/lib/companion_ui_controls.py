@@ -16,7 +16,7 @@ WIRE. Command plaintext is `{"action": A, "params": {...}}` for A in ALLOWED_ACT
     save-checkpoint   {}                          ack ok  {"result":{"written_at":<epoch>}}; detail coalesced | incomplete
     hook-toggle       {"id": str, "enabled": bool} ack ok  {"result":{"id","enabled"}}; detail unchanged | not-allowed |
                                                   unknown-id | write-failed
-    fallback-mode     {"mode": "off"|"auto"|"switch", "confirm"?: true}
+    fallback-mode     {"mode": "off"|"auto"|"switch"|"coop", "confirm"?: true}
                                                   ack ok  {"result":{"mode","was"}}; detail unchanged | confirm-required |
                                                   write-failed | unavailable
 
@@ -29,18 +29,23 @@ never free text), `dup`, `retry_after_s`.
 
 STATE. snapshot() is the additive `controls` key of /api/state (so of every relay state frame):
     {"v":1,"actions":[..usable now..],"hooks_toggleable":[ids],"hooks":[{"id","enabled"}..],
-     "fallback":{"mode":..,"modes":["off","auto","switch"],"confirm":["auto","switch"]},"enabled":bool,
+     "fallback":{"mode":..,"modes":["off","auto","switch","coop"],"confirm":["auto","switch","coop"]},"enabled":bool,
      "last":{"action","ok","at"}|null}
 `hooks_toggleable` / `hooks` are the hooks whose sidecar entry says `remote_toggle: true` and `locked: false`;
-`last` is the newest line of the audit log, params left out.
+`last` is the newest line of the audit log, params left out. `fallback.modes` is every state bin/heimdall-fallback's `set`
+accepts (test/heimdall-controls.test.sh reads its VALID_STATES and fails on any drift); `fallback.confirm` is each of them
+but `off`.
 
 SECURITY MODEL.
   * One allowlist, fail closed: an action not in ALLOWED_ACTIONS is `not-implemented` and audited. A hook is toggleable
     only when hooks/hooks.metadata.json says `remote_toggle: true` AND `locked: false` -- a hand-set flag, false for every
     new hook; a locked gate can never be switched off from here even if someone hand-edits the sidecar.
   * Reduce-direction first: `interrupt` ends work, `hook-toggle` only reaches advisory hooks, `fallback-mode` `off` is the
-    safe state. The two states that ROUTE (`auto`, `switch` -- both reach the main agent, owner directive 2026-09-11) are
-    refused unless the command carries `confirm: true`. `coop` is not settable from the phone at all.
+    safe state and needs no confirm. Every other state bin/heimdall-fallback accepts can route work off Claude -- `auto`
+    and `switch` both reach the main agent (owner directive 2026-09-11), `coop` routes only the subagent roles on the
+    laptop's allowlist and never the main agent -- so each is refused unless the command carries `confirm: true`. `coop`
+    moves the state word and nothing else: its allowlist (`heimdall-fallback coop add|remove`) is edited at the laptop
+    alone, the phone never reads, grows or shrinks it, and an empty allowlist means coop routes nothing.
   * No shell, argv lists only, every id matched against a fixed pattern before any path or argv is built. A phone-supplied
     string is never written to disk, logged or echoed: the audit line carries only whitelisted, pattern-checked fields
     (never `rid`, never text), and a field that is secret-shaped is dropped.
@@ -109,9 +114,8 @@ STOP_CONSUMED_REL = os.path.join(".heimdall", "ui", "stop-request.consumed")
 CHECKPOINT_LOCK_REL = os.path.join(".heimdall", "ui", "controls-checkpoint.lock")
 CHECKPOINT_FILE_REL = os.path.join(".planning", "CHECKPOINT.md")
 
-FALLBACK_MODES = ("off", "auto", "switch")     # all the phone may set; `coop` is a laptop-only, per-role state
-FALLBACK_STATES = ("off", "auto", "switch", "coop")   # what heimdall-fallback can report
-CONFIRM_MODES = ("auto", "switch")             # the states that route the main agent: explicit confirm only
+FALLBACK_MODES = ("off", "auto", "switch", "coop")   # every state bin/heimdall-fallback's `set` accepts (its VALID_STATES; test-pinned)
+CONFIRM_MODES = tuple(m for m in FALLBACK_MODES if m != "off")   # `off` routes nothing; every other state needs confirm:true
 
 RID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 HOOK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -650,7 +654,7 @@ def fallback_mode(root):
     taken from the file (it is on hmd-ui's never-forward list for everything else it holds)."""
     data = _read_json(os.path.join(root, ".heimdall", "fallback.json"))
     state = data.get("state") if isinstance(data, dict) else None
-    return state if state in FALLBACK_STATES else "off"
+    return state if state in FALLBACK_MODES else "off"
 
 
 def _do_fallback_mode(root, fields, ctx):
