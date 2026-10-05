@@ -52,6 +52,7 @@ Stronger gates catch more classes of bug with fewer false passes. When a task's 
 
 | id | gate_type | domain | reference kind |
 |----|-----------|--------|----------------|
+| `attack` | differential | adversarial verification of a settlement webhook (`hmd attack`) | separate-agent (independent settlement reference model, derived from `INVARIANTS.md` alone) |
 | `emulator-gb` | trace-diff | Game Boy / LR35902 emulation | external-dataset (Blargg ROMs + gameboy-doctor traces) |
 | `exchange-lob` | differential | limit-order-book matching engine | separate-agent (independent O(n²) matcher) |
 | `issue-collection` | differential | anonymized issue-collection k-anon aggregate | separate-agent (independent reference aggregator) |

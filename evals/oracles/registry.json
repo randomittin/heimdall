@@ -8,6 +8,45 @@
     "example"
   ],
   "oracles": {
+    "attack": {
+      "gate_type": "differential",
+      "description": "Adversarial verification oracle behind `hmd attack` (RP1), profile settlement-webhook/1. Replays a 23-attack battery against a candidate settlement webhook (a module exporting `createWebhook({ store })`) on a deterministic virtual clock — redelivery and retry races inside the 50ms window, a burst of three, IDOR reads by another account / an anonymous caller / a prefix-lookalike id, owner-read controls, and fee-rounding boundaries — and diffs every observable outcome (delivery statuses, balances, settlement records, read refusals) against an INDEPENDENT reference model authored from INVARIANTS.md by someone other than the engine and fixture author. A target no attack can break is PROVEN (report.json status pass); one a single attack breaks is DENIED (status fail) with a minimal counterexample. gate_type is `differential`: the truth source is an independently-authored reference recomputed over the same scenarios. Gate strength is proven by the falsifiability sweep — `bin/falsify` requires the golden GREEN and all 7 single-defect mutants RED (score 1.0), each breaking exactly the attacks pinned in fixtures/mutants/manifest.json: missed-duplicate, racy-duplicate (the 'webhook+retry within 50ms' race a sequential test never sees), dedupes-by-account, missed-idor, prefix-ownership, denies-owner, off-by-one-rounding.",
+      "domain_signals": [
+        "hmd attack",
+        "attack-suite",
+        "settlement webhook",
+        "webhook retry",
+        "duplicate settlement",
+        "idempotent webhook",
+        "fee rounding"
+      ],
+      "assets": [
+        {
+          "name": "reference-model",
+          "kind": "separate-agent",
+          "purpose": "Independently authored, spec-only reference of the settlement rules R1-R4 (idempotent application, half-up integer-cent fee, credit + record, exact-identity ownership). Derived solely from INVARIANTS.md by a separate agent session that never read the engine or any target, imports nothing, and shares no code path with the implementations under test. Cross-checked against Python decimal ROUND_HALF_UP for every gross in 1..200000 by test/hmd-attack.test.sh.",
+          "dir": "evals/oracles/attack/reference"
+        },
+        {
+          "name": "attack-battery",
+          "kind": "in-repo-dataset",
+          "purpose": "The 23 deterministic attack scenarios and the virtual-time harness that replays them (engine/battery.mjs, engine/harness.mjs). Same scenarios => same verdict on every machine: store latency is virtual, so a race window of 50ms is exact and the run takes milliseconds.",
+          "dir": "evals/oracles/attack/engine"
+        },
+        {
+          "name": "single-defect-mutant-corpus",
+          "kind": "in-repo-dataset",
+          "purpose": "7 committed mutants, each the golden webhook with EXACTLY ONE defect, pinned via manifest.json to the exact set of attacks it must break. The falsifiability sweep requires all 7 KILLED plus the golden GREEN — the meta-proof that each attack class (duplicate, IDOR, rounding) can actually go red. Weakening the battery (dropping the concurrent-retry attacks) is how test/hmd-attack.test.sh proves the battery is load-bearing: racy-duplicate then SURVIVES and the falsify score drops below 1.0.",
+          "dir": "evals/oracles/attack/fixtures/mutants"
+        }
+      ],
+      "gate_command": "evals/oracles/attack/run.sh",
+      "reference": {
+        "independent": true,
+        "kind": "separate-agent",
+        "dir": "evals/oracles/attack/reference"
+      }
+    },
     "ponytail-underdelivery": {
       "gate_type": "example",
       "description": "Under-delivery guard oracle (Heimdall x ponytail write-time lazy-ladder). Grades a candidate feature module (ES module exporting `default function roman(n)`) against a FIXED {n -> expected} acceptance table of 16 enumerated cases, chosen to cover the two requirements a too-aggressive minimalist is tempted to cut: subtractive notation (IV, IX, XL, XC, CD, CM) and the full required 1..3999 range (thousands via M). It exists to prove the write-time lazy ladder adopted in agents/coder.md cannot cause an agent to ship a half-built feature -- a deliberately under-delivered 'lazy' shortcut FAILS the gate, because minimalism may cut gold-plating but never scope. gate_type is `example`, NOT `differential`: the truth source is a fixed input->expected-output table, not an independently-authored reference implementation recomputed over the same inputs. Gate strength comes instead from the falsifiability sweep -- `bin/falsify` requires the golden candidate GREEN and all 3 under-delivery mutants RED (score 1.0), one per ladder-risk mode (hard part skipped, required criterion silently dropped, terse-but-broken).",
