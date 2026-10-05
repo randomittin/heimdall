@@ -1,0 +1,40 @@
+{
+  "id": "requests-cache__requests-cache-1140",
+  "category": "bugfix",
+  "source": "https://github.com/requests-cache/requests-cache/issues/1140",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/requests-cache/requests-cache/pull/1141",
+  "repo": "requests-cache/requests-cache",
+  "license": "BSD-2-Clause",
+  "base_sha": "900b2346a23268c2c1833d63b480fa59beb8a23a",
+  "merge_sha": "d5086ff474063538ef555b27ac033b77cda709c0",
+  "test_paths": [
+    "tests/unit/policy/test_actions.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/requests-cache/requests-cache && git fetch -q --depth 1 --filter=blob:none origin 900b2346a23268c2c1833d63b480fa59beb8a23a && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\" --group dev"
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: `skip_write` flag is incorrectly overwritten during 304 revalidation, bypassing `read_only` mode\n\n### The problem\n\nWhen a session is in `read_only` mode (or caching is disabled via headers), the `skip_write` flag is correctly set to `True` during the initial request evaluation. However, if a cached response is stale but revalidates successfully (returns a `304 Not Modified`) and contains modified headers, the `update_revalidated_response` method in `requests_cache/policy/actions.py` unconditionally overwrites the `skip_write` flag.\n\nSpecifically, this line:\n\n```python\nself.skip_write = self.expires == cached_response.expires and not headers_changed\n```\n\nevaluates to `False` because `headers_changed` is `True`. This ignores the fact that `skip_write` was already `True`, causing the cache backend to be updated with the new headers and violating the `read_only` restriction.\n\n### Expected behavior\n\nThe cache backend should not be updated if `read_only=True` or if `skip_write` was previously set to `True` for other reasons (e.g., server returned `no-store`), even if the 304 response includes new headers. The `skip_write` flag should remain `True`.\n\n### Steps to reproduce the behavior\n\nHere is a complete code example using `requests-mock` to simulate the 304 revalidation with a new header while in `read_only` mode:\n\n```python\nimport requests_mock\nfrom requests_cache import CachedSession\n\ndef reproduce_bug():\n    # Initialize an in-memory CachedSession with cache_control=True\n    session = CachedSession(backend='memory', cache_control=True)\n\n    with requests_mock.Mocker() as m:\n        # --- STEP 1: Populate the cache ---\n        m.get('http://example.com/api', \n              text='response data', \n              headers={'ETag': '\"123\"', 'Cache-Control': 'max-age=0'})\n        \n        session.get('http://example.com/api')\n        \n        # --- STEP 2: Enable read-only mode ---\n        session.settings.read_only = True\n        \n        # --- STEP 3: Setup the 304 Revalidation response ---\n        # The mock server returns 304 Not Modified, but with a NEW header\n        m.get('http://example.com/api', \n              status_code=304, \n              headers={\n                  'ETag': '\"123\"', \n                  'Cache-Control': 'max-age=0', \n                  'X-Custom-Header': 'I bypassed read-only!' \n              })\n        \n        # Trigger 304 revalidation\n        resp2 = session.get('http://example.com/api')\n        \n        # --- STEP 4: Inspect the cache ---\n        cache_key = session.cache.create_key(resp2.request)\n        cached_item = session.cache.get_response(cache_key)\n        \n        if 'X-Custom-Header' in cached_item.headers:\n            print(\"\u274c BUG REPRODUCED: The new header was saved to the cache!\")\n            print(f\"Cached Headers: {dict(cached_item.headers)}\")\n\nif __name__ == '__main__':\n    reproduce_bug()\n```\n\n### Workarounds\n\nA fix can be applied directly to `requests_cache/policy/actions.py` by ensuring the existing state of `skip_write` is preserved.\n\nChange this:\n\n```python\nself.skip_write = self.expires == cached_response.expires and not headers_changed\n```\n\nTo this:\n\n```python\nself.skip_write = self.skip_write or (self.expires == cached_response.expires and not headers_changed)\n```\n\n### Environment\n\n* requests-cache version: `main` (and likely all recent versions)\n* Python version: *3.13*\n* Platform: *Windows 11*\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "       110 passed"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "       111 passed"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}
