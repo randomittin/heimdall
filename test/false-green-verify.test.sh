@@ -362,7 +362,10 @@ samples = {"could not fetch the issue text: gh: HTTP 404": "issue text unavailab
            "the upstream tests could not run at the base commit: size: ": "workspace over the 600 MB bound",
            "environment: step 2 (uv pip install): timed out after 300s": "step timed out",
            "the upstream tests could not run at the merge commit: timed out after 300s": "step timed out",
-           "the upstream tests could not run at the base commit: timeout: ": "step timed out"}
+           "the upstream tests could not run at the base commit: timeout: ": "step timed out",
+           "the upstream tests could not run at the base commit: pytest exit 4: E   ModuleNotFoundError: No module named 'requests'": IMPORT_FAILS,
+           "the upstream tests could not run at the base commit: pytest exit 4: E   ImportError: cannot import name 'X' from 'y'": IMPORT_FAILS,
+           "the upstream tests could not run at the merge commit: pytest exit 4: E   ModuleNotFoundError: No module named 'requests'": "tests could not run at the merge commit"}
 t("every rejection reason has a stable class, and an unknown one is 'other'", all(fg_verify.reason_class(r) == c for r, c in samples.items()), [(r, fg_verify.reason_class(r)) for r, c in samples.items() if fg_verify.reason_class(r) != c])
 
 # ── [S] a secret-shaped literal in a committed file rejects the candidate ───
