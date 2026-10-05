@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""test/lib/view_scenarios.py -- the cases of test/companion-view.test.sh (the `view-v1` file diff, end to end).
+"""test/lib/view_scenarios.py -- the cases of test/companion-view.test.sh (the `view-v1` diff, transcript and pr, end to end).
 
 Every case drives the REAL bin/heimdall-relay-client (or a mutated copy of it -- see --client) as its own process against
 test/lib/fake-relay.py, through a sealed command and the sealed state frame that answers it, with test/lib/view_phone.py
 playing the paired phone. Nothing here imports the client or bin/lib/companion_view.py. What git says is computed
-independently, by running git again on the same working tree.
+independently, by running git again on the same working tree; a transcript is a session file this writes into the client's
+HOME, and the pull request is a fake `gh` first on the client's PATH that records exactly how it was called.
 
-    view_scenarios.py main   --client PATH [--groups a,b,..]   one stack, groups wire diff paths secrets params size latch kill
+    view_scenarios.py main   --client PATH [--groups a,b,..]   one stack, groups wire diff paths secrets params size transcript pr latch kill
     view_scenarios.py subdir --client PATH                     --repo is a subdirectory of the git toplevel; the 20/min limit
     view_scenarios.py killenv --client PATH                    HMD_UI_CONTROLS=0 in the client's environment
+    view_scenarios.py nogh   --client PATH                     a PATH on which `gh` does not exist
 
 Secret-shaped inputs are assembled at runtime: no such literal sits in the repo. Output: "  ok   ..." / "  FAIL ..." lines
 and a closing "P passed, F failed"; exit 1 when F > 0. Processes this starts are reaped on exit; it signals nothing else.
@@ -16,6 +18,7 @@ and a closing "P passed, F failed"; exit 1 when F > 0. Processes this starts are
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -29,6 +32,7 @@ import view_phone as VP  # noqa: E402
 
 FAKE_RELAY = os.path.join(HERE, "fake-relay.py")
 BUDGET = 1048576 * 3 // 8  # the slice budget the client derives from its 1 MiB envelope cap
+KINDS = ["diff", "transcript", "pr"]  # what state.views.kinds lists
 PASS = FAIL = 0
 
 
@@ -46,6 +50,10 @@ def check(cond, text, got=None):
 
 def token_shaped():
     return "".join(("gh", "p_", "Q" * 36))  # a GitHub-token-shaped string, assembled at runtime
+
+
+def gh_token_shaped():
+    return "".join(("gh", "o_", "R" * 36))  # another one: what the client's environment hands the fake gh
 
 
 def refused(ack, code):
@@ -125,6 +133,7 @@ class Stack:
         self.phone = None
         self.listed = False
         self.counter = 0
+        self.gh = None
 
     def start(self):
         os.makedirs(self.log)
@@ -175,6 +184,13 @@ class Stack:
         params.update(extra)
         return self.phone.view(params)
 
+    def ask(self, kind, **params):
+        """A transcript or pr request shaped like the app's (hmdapp src/views/protocol.ts) -> (ack, result)."""
+        self.ready()
+        body = {"rid": self.rid(), "kind": kind}
+        body.update(params)
+        return self.phone.view(body)
+
     def burst(self, params_list):
         """Seal every request first, then read the acks: the client answers them in order."""
         self.ready()
@@ -199,6 +215,14 @@ class Stack:
         """The names of the places `needle` is in: every artifact above and the decrypted frames. [] when it is nowhere."""
         text = self.artifacts()
         text["frames"] = self.phone.all_text()
+        return [name for name, body in text.items() if needle in body]
+
+    def found_in_views(self, needle):
+        """Like found_in, but of the decrypted frames only their `views` slices count. hmd-ui's own chat panel reads the same session
+        files (and follows links) for ITS slice; what these cases pin is that the view channel itself never carries `needle`."""
+        text = self.artifacts()
+        self.phone.pull()
+        text["views"] = "\n".join(json.dumps(f["body"]["state"].get("views")) for f in self.phone.frames if f["type"] == "state")
         return [name for name, body in text.items() if needle in body]
 
 
@@ -233,8 +257,8 @@ def g_wire(st):
     ack, _ = p.resync(VP.FULL_CAPS)
     st.listed = True
     frame = p.state(lambda s: "views" in s, since=before)
-    check(frame is not None and frame["body"]["state"]["views"] == {"v": 1, "enabled": True, "kinds": ["diff"], "result": None},
-          "wire: after its resync lists view-v1 the next frame carries views {v:1, enabled:true, kinds:[diff], result:null}",
+    check(frame is not None and frame["body"]["state"]["views"] == {"v": 1, "enabled": True, "kinds": KINDS, "result": None},
+          "wire: after its resync lists view-v1 the next frame carries views {v:1, enabled:true, kinds:[diff, transcript, pr], result:null}",
           frame and frame["body"]["state"].get("views"))
     st.repo.write("wire.txt", "one\n")
     st.repo.commit("wire baseline")
@@ -458,9 +482,17 @@ def g_params(st):
     seqs = [st.phone.command({"action": "view", "params": params}) for params in ([1], None, "diff")]
     acks = [st.phone.ack(s) for s in seqs]
     check(all(refused(a, "bad-params") for a in acks), "params: params that are not an object are bad-params", acks)
-    others = [{"rid": st.rid(), "kind": "transcript", "tail": 200}, {"rid": st.rid(), "kind": "reel", "name": "x.txt"}, {"rid": st.rid(), "kind": "pr"}]
-    acks = st.burst(others)
-    check(all(refused(a, "not-implemented") for a in acks), "params: transcript, reel and pr -- the contract's other kinds -- are refused not-implemented", acks)
+    acks = st.burst([{"rid": st.rid(), "kind": "reel", "name": "x.txt"}])
+    check(all(refused(a, "not-implemented") for a in acks), "params: reel -- the contract's one kind not answered here -- is refused not-implemented", acks)
+    wrong = {"tail 0": {"tail": 0}, "tail 501": {"tail": 501}, "tail -1": {"tail": -1}, "tail str": {"tail": "5"}, "tail bool": {"tail": True},
+             "tail float": {"tail": 2.5}, "tail null": {"tail": None}, "extra path": {"path": "a"}, "extra scope": {"scope": "head"},
+             "agent int": {"agent_id": 5}, "agent list": {"agent_id": ["a"]}, "agent empty": {"agent_id": ""}}
+    acks = st.burst([dict(kind="transcript", rid=st.rid(), **kw) for kw in wrong.values()]
+                    + [{"rid": st.rid(), "kind": "pr", "path": "a"}, {"rid": st.rid(), "kind": "pr", "number": 3}, {"rid": "v 1", "kind": "pr"}])
+    check(all(refused(a, "bad-params") for a in acks), "params: a transcript's tail outside 1..500 or not a whole number, an unknown key, a bad agent_id, and any key on a pr request, are bad-params",
+          [(k, a) for k, a in zip(list(wrong) + ["pr path", "pr number", "pr rid"], acks) if not refused(a, "bad-params")])
+    acks = st.burst([{"rid": st.rid(), "kind": "transcript", "agent_id": None, "tail": 1}])
+    check(acks[0] is not None and acks[0].get("ok") is True or refused(acks[0], "not-found"), "params: agent_id null means the session's own transcript (an ok, or not-found when the repo has no session yet)", acks)
     acks = st.burst([{"rid": st.rid(), "kind": "diff"}])
     check(acks[0] is not None and acks[0].get("ok") is True, "params: only rid and kind are required (the rest default)", acks)
 
@@ -574,10 +606,12 @@ def g_kill(st):
     open(flag, "w").close()
     ack, _ = st.view("kill.txt")
     check(refused(ack, "controls-off"), "kill: with .heimdall/app/controls-disabled in place a request is refused controls-off", ack)
+    others = [st.ask(kind)[0] for kind in ("transcript", "pr")]
+    check(all(refused(a, "controls-off") for a in others), "kill: and so is a transcript request and a pr request", others)
     before = st.phone.mark()
     st.phone.resync(VP.FULL_CAPS)
     frame = st.phone.state(lambda s: "views" in s, since=before)
-    check(frame is not None and frame["body"]["state"]["views"] == {"v": 1, "enabled": False, "kinds": ["diff"], "result": None},
+    check(frame is not None and frame["body"]["state"]["views"] == {"v": 1, "enabled": False, "kinds": KINDS, "result": None},
           "kill: and the slice says enabled:false and holds no result, though one was held", frame and frame["body"]["state"].get("views"))
     os.remove(flag)
     ack, res = st.view("kill.txt")
@@ -619,30 +653,386 @@ def g_subdir(st):
           "subdir: the 21st request inside a minute is refused rate-limited with retry_after_s (20 answered)", (sent + oks, limited))
 
 
-MAIN_GROUPS = ("wire", "diff", "paths", "secrets", "params", "size", "latch", "kill")
-RUN = {"wire": g_wire, "diff": g_diff, "paths": g_paths, "secrets": g_secrets, "params": g_params, "size": g_size, "latch": g_latch,
-       "kill": g_kill, "killenv": g_killenv, "subdir": g_subdir}
+# -- transcript and pr ------------------------------------------------------------------------------------------------------
+GH_FIELDS = "number,title,state,isDraft,mergeable,headRefOid,statusCheckRollup,reviews,url"
+PR_HEAD = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+OTHER_HEAD = "0123456789abcdef0123456789abcdef01234567"
+FAKE_GH = """#!/bin/bash
+d="$(cd "$(dirname "$0")" && pwd)"
+{ for a in "$@"; do printf '%s\\n' "$a"; done; echo "--"; } >> "$d/argv.log"
+env | grep -E '^(GH_TOKEN|GITHUB_TOKEN|GH_REPO|GH_PROMPT_DISABLED)=' >> "$d/env.log"
+case "$(cat "$d/mode" 2>/dev/null)" in
+  fail) cat "$d/out.json"; echo "gh: authentication failed" >&2; exit 4 ;;
+  garbage) echo "this is not json" ;;
+  huge) head -c 4400000 /dev/zero | tr '\\0' 'x' ;;
+  sleep) n=0; while [ ! -e "$d/stop" ] && [ "$n" -lt 150 ]; do sleep 0.2; n=$((n+1)); done ;;
+  *) cat "$d/out.json" ;;
+esac
+"""
+_CLOCK = [time.time()]
+
+
+class FakeGh:
+    """A `gh` first on the client's PATH: it records its argv and the few variables it was given, and answers as its `mode` file says."""
+
+    def __init__(self, directory):
+        self.dir = directory
+        os.makedirs(directory)
+        with open(os.path.join(directory, "gh"), "w") as f:
+            f.write(FAKE_GH)
+        os.chmod(os.path.join(directory, "gh"), 0o755)
+
+    def set(self, mode="ok", doc=None):
+        for name in ("argv.log", "env.log"):
+            if os.path.exists(os.path.join(self.dir, name)):
+                os.remove(os.path.join(self.dir, name))
+        with open(os.path.join(self.dir, "mode"), "w") as f:
+            f.write(mode)
+        if doc is not None:
+            with open(os.path.join(self.dir, "out.json"), "w") as f:
+                json.dump(doc, f)
+
+    def read(self, name):
+        try:
+            with open(os.path.join(self.dir, name)) as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def calls(self):
+        return [chunk.split("\n")[:-1] for chunk in self.read("argv.log").split("--\n") if chunk]
+
+    def release(self):
+        """Let a gh still waiting in `sleep` mode end (it also ends by itself after 30 s)."""
+        open(os.path.join(self.dir, "stop"), "w").close()
+
+
+def path_without(program, tmp):
+    """PATH with `program` unfindable: each directory that holds it is replaced by one of links to everything else in it."""
+    shadow = os.path.join(tmp, "nogh-bin")
+    os.makedirs(shadow)
+    rest = []
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if d and os.path.exists(os.path.join(d, program)):
+            for name in os.listdir(d):
+                link = os.path.join(shadow, name)
+                if name != program and not os.path.lexists(link):
+                    os.symlink(os.path.join(d, name), link)
+        elif d:
+            rest.append(d)
+    return os.pathsep.join([shadow] + rest)
+
+
+def projects_dir(st):
+    """Where the client looks for this repo's sessions: <HOME>/.claude/projects/<the repo's real path, non-alphanumerics as '-'>."""
+    return os.path.join(st.env_extra["HOME"], ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(st.repo_arg)))
+
+
+def write_lines(path, entries, stamp):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(entry if isinstance(entry, str) else json.dumps(entry, ensure_ascii=False))
+            f.write("\n")
+    os.utime(path, (stamp, stamp))
+
+
+def write_session(st, sid, entries, mtime=None):
+    """A session transcript of the repo. Without `mtime` it is newer than every one written before: the one the client picks."""
+    if mtime is None:
+        _CLOCK[0] += 10
+        mtime = _CLOCK[0]
+    path = os.path.join(projects_dir(st), sid + ".jsonl")
+    write_lines(path, entries, mtime)
+    return path
+
+
+def u_entry(text, **kw):
+    return dict({"type": "user", "message": {"role": "user", "content": text}}, **kw)
+
+
+def a_entry(*blocks, **kw):
+    return dict({"type": "assistant", "message": {"role": "assistant", "content": list(blocks)}}, **kw)
+
+
+def t_text(text):
+    return {"type": "text", "text": text}
+
+
+def t_use(tid, name, **inp):
+    return {"type": "tool_use", "id": tid, "name": name, "input": inp}
+
+
+def t_result(tid, content, error=False):
+    return {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": content, "is_error": error}]}}
+
+
+def turns_of(res):
+    return [(t["role"], t["s"]) for t in res["turns"]] if res else None
+
+
+def g_transcript(st):
+    tok = token_shaped()
+    ack, _ = st.ask("transcript")
+    check(refused(ack, "not-found"), "transcript: a repo with no session transcript is refused not-found", ack)
+    write_session(st, "s1-main", [
+        u_entry("Fix the flaky test please"),
+        a_entry(t_text("Looking at it now.\n\nI will   run the suite.")),
+        a_entry({"type": "thinking", "thinking": "HIDDEN-THOUGHT"}, t_use("t1", "Bash", command="npm test")),
+        t_result("t1", "Exit code 2\nFAIL src/a.test.ts\nmore detail", error=True),
+        a_entry(t_use("t2", "Read", file_path="/x/proj/.env")),
+        t_result("t2", "ENVMARKER_ONE=1\nsecond"),
+        a_entry(t_use("t3", "Bash", command="cat .env.local && echo hi")),
+        t_result("t3", "ENVMARKER_TWO=2"),
+        a_entry(t_use("t4", "Grep", pattern="x")),
+        t_result("t4", [{"type": "text", "text": "src/a.ts:3: match\nsrc/b.ts"}]),
+        a_entry(t_text("The key is %s use it" % tok)),
+        a_entry(t_text("w" * 230 + " " + tok)),
+        a_entry(t_text("mail someone@example.com about /etc/hosts")),
+        u_entry("Caveat: injected by the harness", isMeta=True),
+        u_entry("<local-command-stdout>noise</local-command-stdout>"),
+        a_entry(t_text("SIDECHAIN-CHATTER"), isSidechain=True),
+        "{this line is not json",
+        a_entry(t_text("L" * 400)),
+        a_entry(t_text("done"), t_use("t9", "Bash", command="sleep 100")),
+    ])
+    want = [("user", "Fix the flaky test please"), ("assistant", "Looking at it now. I will run the suite."),
+            ("tool", "Bash · exit 2 · FAIL src/a.test.ts"), ("tool", "Read · ok"), ("tool", "Bash · ok"),
+            ("tool", "Grep · ok · src/a.ts:3: match"), ("assistant", "[redacted]"), ("assistant", "[redacted]"),
+            ("assistant", "mail [email] about hosts"), ("assistant", "L" * 239 + "…"), ("assistant", "done")]
+    ack, res = st.ask("transcript")
+    check(res is not None and res["kind"] == "transcript" and res["agent"] is None and res["truncated"] is False and isinstance(res["at"], float)
+          and ack.get("id") == res["id"], "transcript: the session's own transcript answers {kind:transcript, agent:null, truncated:false, at, turns[]}",
+          res and {k: res[k] for k in ("kind", "agent", "truncated")})
+    check(turns_of(res) == want,
+          "transcript: the turns are the prompts, the assistant's text (one line each, cut at 240) and one line per tool call (name, ok|error|exit N, first output line) -- "
+          "never thinking, sidechain chatter, injected caveats, local-command noise, an unreadable line or an unanswered call", turns_of(res))
+    check(turns_of(res) is not None and ("tool", "Read · ok") in turns_of(res) and ("tool", "Bash · ok") in turns_of(res),
+          "transcript: a tool call that named .env or .env.local shows no output line at all, not even its first")
+    ack, three = st.ask("transcript", tail=3)
+    check(turns_of(three) == want[-3:] and three["truncated"] is True,
+          "transcript: tail N keeps the newest N turns and says truncated:true", turns_of(three))
+    ack, mid = st.ask("transcript", tail=len(want))
+    check(mid is not None and turns_of(mid) == want and mid["truncated"] is False, "transcript: tail equal to the turn count is not truncated")
+    cut = "gh" + "p_"
+    leaked = [n for n in (tok, cut, "HIDDEN-THOUGHT", "SIDECHAIN-CHATTER", "ENVMARKER_ONE", "ENVMARKER_TWO", "someone@example.com") if st.found_in_views(n)]
+    check(not leaked, "transcript: no secret (not even the first characters of one the cut would have shown), no thinking, no .env output and no email is in any frame or file", leaked)
+    write_session(st, "s2-big", [u_entry("%04d %s" % (i, "字" * 300)) for i in range(500)])
+    ack, big = st.ask("transcript", tail=500)
+    size = len(json.dumps(big, separators=(",", ":"))) if big else None
+    check(big is not None and big["truncated"] is True and 0 < len(big["turns"]) < 500 and size <= BUDGET and big["turns"][-1]["s"].startswith("0499 ")
+          and big["turns"][0]["s"][:4] != "0000" and all(len(t["s"]) == 240 for t in big["turns"]),
+          "transcript: a result is held to the slice budget by dropping the OLDEST turns (the newest is always kept), each turn at most 240 characters",
+          big and (len(big["turns"]), size))
+    pad = json.dumps({"type": "progress", "pad": "x" * 60000})
+    write_session(st, "s3-window", [u_entry("OLDEST-MARKER")] + [pad] * 90 + [u_entry("recent one"), a_entry(t_text("recent two"))])
+    ack, win = st.ask("transcript")
+    check(turns_of(win) == [("user", "recent one"), ("assistant", "recent two")] and win["truncated"] is True and not st.found_in_views("OLDEST-MARKER"),
+          "transcript: only the last 4 MiB of a transcript is read: what lies before it is not shown, and the result says truncated:true", turns_of(win))
+    outside = tempfile.mkdtemp(prefix="view-tx-outside-")
+    elsewhere = os.path.join(outside, "elsewhere.jsonl")
+    _CLOCK[0] += 10
+    write_lines(elsewhere, [u_entry("OUTSIDE-TRANSCRIPT-MARKER")], _CLOCK[0])
+    link = os.path.join(projects_dir(st), "zz-link.jsonl")
+    os.symlink(elsewhere, link)
+    ack, _ = st.ask("transcript")
+    check(refused(ack, "not-found") and not st.found_in_views("OUTSIDE-TRANSCRIPT-MARKER"),
+          "transcript: a session file that is a symlink is never followed (the session is refused not-found, nothing outside is read)", ack)
+    os.remove(link)
+    ack, back = st.ask("transcript")
+    check(back is not None and turns_of(back) == [("user", "recent one"), ("assistant", "recent two")], "transcript: with the link gone the newest real session answers again")
+    write_session(st, "s4-agents", [u_entry("main session says hi")])
+    sub = os.path.join(projects_dir(st), "s4-agents", "subagents")
+    write_lines(os.path.join(sub, "agent-a1b2c3.jsonl"), [u_entry("agent prompt", isSidechain=True), a_entry(t_text("agent reply"), isSidechain=True)], time.time())
+    with open(os.path.join(sub, "agent-a1b2c3.meta.json"), "w") as f:
+        json.dump({"agentType": "coder", "description": "x"}, f)
+    old_sub = os.path.join(projects_dir(st), "s0-old", "subagents")
+    write_session(st, "s0-old", [u_entry("an older session")], mtime=1000000000)
+    write_lines(os.path.join(old_sub, "agent-old999.jsonl"), [a_entry(t_text("from the older session"), isSidechain=True)], time.time())
+    os.symlink(elsewhere, os.path.join(sub, "agent-link1.jsonl"))
+    ack, agent = st.ask("transcript", agent_id="a1b2c3")
+    check(agent is not None and agent["agent"] == {"id": "a1b2c3", "role": "coder", "state": ""}
+          and turns_of(agent) == [("user", "agent prompt"), ("assistant", "agent reply")],
+          "transcript: agent_id answers that subagent's own transcript (its sidechain entries are its conversation), agent {id, role from its metadata, state ''}", agent and (agent["agent"], turns_of(agent)))
+    ack, older = st.ask("transcript", agent_id="old999")
+    check(older is not None and turns_of(older) == [("assistant", "from the older session")] and older["agent"]["role"] == "",
+          "transcript: a subagent owned by an older session of the same repo is found too (role '' without a metadata file)", older and turns_of(older))
+    ack, own = st.ask("transcript", agent_id=None)
+    check(own is not None and own["agent"] is None and turns_of(own) == [("user", "main session says hi")], "transcript: agent_id null is the session's own transcript")
+    acks = st.burst([{"rid": st.rid(), "kind": "transcript", "agent_id": "nope123"}, {"rid": st.rid(), "kind": "transcript", "agent_id": "link1"}])
+    check(all(refused(a, "not-found") for a in acks) and not st.found_in_views("OUTSIDE-TRANSCRIPT-MARKER"),
+          "transcript: an unknown agent id, and an agent file that is a symlink, are not-found", acks)
+    bad = ["../x", "a/b", "a.b", "a b", "a\n", "x" * 129, "..", "agent-a1b2c3.jsonl/../../x"]
+    acks = st.burst([{"rid": st.rid(), "kind": "transcript", "agent_id": b} for b in bad])
+    check(all(refused(a, "bad-params") for a in acks), "transcript: an agent_id that is not a plain [A-Za-z0-9_-] key (a path, a dot, a space, a newline, too long) is bad-params",
+          [(b, a) for b, a in zip(bad, acks) if not refused(a, "bad-params")])
+    shutil.rmtree(outside, ignore_errors=True)
+
+
+def pr_doc(**over):
+    doc = {"number": 12, "title": "Add the thing", "state": "OPEN", "isDraft": False, "mergeable": "MERGEABLE", "headRefOid": PR_HEAD,
+           "url": "https://github.com/octo/widgets/pull/12",
+           "statusCheckRollup": [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                                 {"__typename": "CheckRun", "name": "lint", "status": "IN_PROGRESS", "conclusion": ""},
+                                 {"__typename": "CheckRun", "name": "deploy", "status": "COMPLETED", "conclusion": "TIMED_OUT"},
+                                 {"__typename": "StatusContext", "context": "ci/legacy", "state": "PENDING"}],
+           "reviews": [{"author": {"login": "alice"}, "state": "COMMENTED"}, {"author": {"login": "alice"}, "state": "CHANGES_REQUESTED"},
+                       {"author": {"login": "bob"}, "state": "APPROVED"}, {"author": {"login": "alice"}, "state": "APPROVED"},
+                       {"author": {"login": "bob"}, "state": "COMMENTED"}, {"author": {"login": "carol"}, "state": "PENDING"},
+                       {"author": {"login": "dave"}, "state": "COMMENTED"}]}
+    doc.update(over)
+    return doc
+
+
+def g_pr(st):
+    r, p, gh = st.repo, st.phone, st.gh
+    tok, secret = gh_token_shaped(), token_shaped()
+    st.ready()
+    gh.set(doc=pr_doc())
+    ack, res = st.ask("pr")
+    want = {"id": ack and ack.get("id"), "kind": "pr", "number": 12, "title": "Add the thing", "state": "open", "draft": False, "mergeable": "MERGEABLE",
+            "head": PR_HEAD, "url": "https://github.com/octo/widgets/pull/12",
+            "checks": [{"name": "ci", "status": "success"}, {"name": "lint", "status": "in_progress"}, {"name": "deploy", "status": "timed_out"},
+                       {"name": "ci/legacy", "status": "pending"}],
+            "reviewers": [{"login": "bob", "state": "approved"}, {"login": "alice", "state": "approved"}, {"login": "dave", "state": "commented"}]}
+    got = {k: v for k, v in res.items() if k not in ("at", "gate")} if res else None
+    check(got == want and isinstance(res["at"], float) and "gate" in res,
+          "pr: gh's document comes out field for field: state lower-cased, a check run's conclusion (its status while it has none) or a commit status's state, "
+          "each reviewer's newest state (a later comment never overrides an approval, a pending draft is left out)", got)
+    calls = gh.calls()
+    check(calls == [["pr", "view", "--json", GH_FIELDS]], "pr: gh was run once, read-only, with exactly `pr view --json <the fields>` and nothing else on its command line", calls)
+    env = gh.read("env.log")
+    check(("GH_TOKEN=" + tok) in env and "GH_REPO" not in env and "GH_PROMPT_DISABLED=1" in env and tok not in gh.read("argv.log"),
+          "pr: a GH_TOKEN in hmd's environment reaches gh through ITS environment, never its argv; GH_REPO does not reach it; prompts are off", env)
+    check(not st.found_in(tok), "pr: the token is in no frame and no file the client wrote", st.found_in(tok))
+    for state, draft, mergeable, expect in (("MERGED", True, "WHATEVER", ("merged", True, "UNKNOWN")), ("CLOSED", False, "CONFLICTING", ("closed", False, "CONFLICTING"))):
+        gh.set(doc=pr_doc(state=state, isDraft=draft, mergeable=mergeable))
+        ack, other = st.ask("pr")
+        check(other is not None and (other["state"], other["draft"], other["mergeable"]) == expect, "pr: state %s / mergeable %s read as %s" % (state, mergeable, expect), other and (other["state"], other["draft"], other["mergeable"]))
+    for label, link in (("another host", "https://evil.example/octo/widgets/pull/12"), ("another pull request", "https://github.com/octo/widgets/pull/13"),
+                        ("a query", "https://github.com/octo/widgets/pull/12?x=1")):
+        gh.set(doc=pr_doc(url=link))
+        ack, linked = st.ask("pr")
+        check(linked is not None and linked["url"] is None, "pr: a url that is %s is not passed on (the phone opens only github.com/<owner>/<repo>/pull/<this number>)" % label, linked and linked["url"])
+    gh.set(doc=pr_doc(title="Rotate %s now" % secret, statusCheckRollup=[{"__typename": "StatusContext", "context": "deploy " + secret, "state": "SUCCESS"}]))
+    ack, masked = st.ask("pr")
+    check(masked is not None and masked["title"] == "[redacted]" and masked["checks"] == [{"name": "[redacted]", "status": "success"}] and not st.found_in(secret),
+          "pr: a secret-shaped title or check name is \"[redacted]\" whole, and appears nowhere", masked and (masked["title"], masked["checks"]))
+    gh.set(doc=pr_doc(title="ask someone@example.com " + "T" * 400))
+    ack, long_title = st.ask("pr")
+    check(long_title is not None and long_title["title"].startswith("ask [email] ") and long_title["title"].endswith("…") and len(long_title["title"]) <= 300
+          and not st.found_in("someone@example.com"), "pr: the relay's redaction applies (the email goes) and a long title is cut inside the phone's 300-character limit",
+          long_title and (long_title["title"][:20], len(long_title["title"])))
+    gh.set(doc=pr_doc(title="   "))
+    ack, untitled = st.ask("pr")
+    check(untitled is not None and untitled["title"] == "(no title)", "pr: a title with nothing in it is shown as (no title): the phone drops a result whose title is empty", untitled and untitled["title"])
+    shapes = {"empty object": {}, "a list": [1], "head not 40 hex": pr_doc(headRefOid="abc"), "head upper-case": pr_doc(headRefOid=PR_HEAD.upper()), "number 0": pr_doc(number=0),
+              "number str": pr_doc(number="12"), "number bool": pr_doc(number=True), "state draft": pr_doc(state="DRAFT"), "isDraft str": pr_doc(isDraft="no"),
+              "title int": pr_doc(title=5)}
+    bad = []
+    for label, doc in shapes.items():
+        gh.set(doc=doc)
+        ack, _ = st.ask("pr")
+        if not refused(ack, "not-found"):
+            bad.append((label, ack))
+    check(not bad, "pr: output that is not a pull request the contract can carry is not-found, never a half-filled result", bad)
+    gh.set(mode="fail", doc=pr_doc())
+    ack, _ = st.ask("pr")
+    check(refused(ack, "not-found") and not st.found_in("authentication failed"), "pr: gh failing (not logged in, no pull request for the branch) is not-found even if it printed a document, and its error text goes nowhere", ack)
+    gh.set(mode="garbage")
+    ack, _ = st.ask("pr")
+    check(refused(ack, "not-found"), "pr: output that is not JSON is not-found", ack)
+    gh.set(mode="huge")
+    ack, _ = st.ask("pr")
+    check(refused(ack, "too-large"), "pr: gh output over 4 MiB is too-large", ack)
+    gh.set(mode="sleep")
+    began = time.time()
+    ack, _ = st.ask("pr")
+    took = time.time() - began
+    check(refused(ack, "timeout") and 7 <= took <= 14, "pr: a gh that does not answer is killed at the 8 s bound and the request is refused timeout", (ack, round(took, 1)))
+    gh.release()
+    gh.set(doc=pr_doc())
+    ack, again = st.ask("pr")
+    check(again is not None, "pr: after all of it a plain request still works")
+    # the gate: hmd's own join of the pull request to quality_gate.clear_to_push and the sweep receipt
+    receipt_path = os.path.join(r.path, ".heimdall", "receipts", "last-sweep.json")
+
+    def gate_with(receipt):
+        mark = p.mark()
+        if receipt is None:
+            if os.path.exists(receipt_path):
+                os.remove(receipt_path)
+            fits = lambda s: s.get("sweep_receipt") is None
+        else:
+            os.makedirs(os.path.dirname(receipt_path), exist_ok=True)
+            with open(receipt_path, "w") as f:
+                json.dump(receipt, f)
+            fits = lambda s: all((s.get("sweep_receipt") or {}).get(k) == receipt[k] for k in ("head_sha", "tree_clean", "suites_passed", "suites_failed"))
+        frame = p.state(fits, since=mark, timeout=45)
+        ack, res = st.ask("pr")
+        if frame is None or res is None:
+            return None, None
+        gate = frame["body"]["state"].get("quality_gate")
+        clear = gate.get("clear_to_push") if isinstance(gate, dict) else None
+        return res["gate"], clear
+
+    def receipt(head=PR_HEAD, clean=True, passed=4, failed=0):
+        return {"finished_at": "2026-10-05T00:00:00Z", "head_sha": head, "tree_clean": clean, "suites_total": passed + failed, "suites_passed": passed,
+                "suites_failed": failed, "duration_s": 10}
+
+    for label, rc, head, green in (("a clean all-green sweep of this head", receipt(), PR_HEAD, True), ("a green sweep of another head", receipt(head=OTHER_HEAD), OTHER_HEAD, False),
+                                   ("a sweep of this head over a dirty tree", receipt(clean=False), PR_HEAD, False), ("a sweep of this head with a failed suite", receipt(passed=3, failed=1), PR_HEAD, False),
+                                   ("no sweep receipt", None, None, False)):
+        gate, clear = gate_with(rc)
+        if isinstance(clear, bool):
+            expected = {"clear_to_push": clear, "receipt_head": head, "receipt_green": green}
+        else:
+            expected = None
+        check(gate == expected and (gate is None or isinstance(gate["clear_to_push"], bool)),
+              "pr: gate with %s is %s (clear_to_push is the sealed state's own quality_gate; the receipt must be clean and all-green for THIS head)" % (label, expected), gate)
+    shutil.rmtree(os.path.dirname(receipt_path), ignore_errors=True)
+
+
+def g_prmissing(st):
+    ack, _ = st.ask("pr")
+    check(refused(ack, "not-found"), "prmissing: with no gh on the PATH a pr request is refused not-found", ack)
+    ack, _ = st.ask("transcript")
+    check(refused(ack, "not-found"), "prmissing: and a transcript request with no session is refused not-found, the same code", ack)
+
+
+MAIN_GROUPS = ("wire", "diff", "paths", "secrets", "params", "size", "transcript", "pr", "latch", "kill")
+RUN = {"wire": g_wire, "diff": g_diff, "paths": g_paths, "secrets": g_secrets, "params": g_params, "size": g_size, "transcript": g_transcript,
+       "pr": g_pr, "latch": g_latch, "kill": g_kill, "killenv": g_killenv, "subdir": g_subdir, "prmissing": g_prmissing}
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("stack", choices=("main", "subdir", "killenv"))
+    ap.add_argument("stack", choices=("main", "subdir", "killenv", "nogh"))
     ap.add_argument("--client", required=True)
     ap.add_argument("--groups", default=",".join(MAIN_GROUPS))
     args = ap.parse_args()
     tmp = tempfile.mkdtemp(prefix="view-scenarios-")
-    st = None
+    st = gh = None
     try:
         env = {"HOME": os.path.join(tmp, "home"), "HEIMDALL_HOME": os.path.join(tmp, "home", ".heimdall"), "TMPDIR": tmp}
         os.makedirs(os.path.join(env["HOME"], ".claude"))
         os.environ.update(env, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")  # hermetic: no user git config
-        for name in ("CLAUDE_SESSION_ID", "SESSION_ID", "CLAUDE_CODE_SESSION_ID", "HMD_UI_CONTROLS", "HMD_VIEW_RATE_LIMIT"):
+        for name in ("CLAUDE_SESSION_ID", "SESSION_ID", "CLAUDE_CODE_SESSION_ID", "HMD_UI_CONTROLS", "HMD_VIEW_RATE_LIMIT", "CLAUDE_CONFIG_DIR",
+                     "HMD_AGENT_PROJECTS_DIR", "GH_TOKEN", "GITHUB_TOKEN", "GH_REPO"):
             os.environ.pop(name, None)
         if args.stack == "main":
             env["HMD_VIEW_RATE_LIMIT"] = "1000"
+            gh = FakeGh(os.path.join(tmp, "fakebin"))
+            env.update(PATH=gh.dir + os.pathsep + os.environ.get("PATH", ""), GH_TOKEN=gh_token_shaped(), GH_REPO="other-owner/other-repo")
             repo = new_repo(tmp)
             st = Stack(tmp, args.client, repo, env=env)
+            st.gh = gh
             groups = [g for g in args.groups.split(",") if g]
+        elif args.stack == "nogh":
+            env["PATH"] = path_without("gh", tmp)
+            repo = new_repo(tmp)
+            st = Stack(tmp, args.client, repo, env=env)
+            groups = ["prmissing"]
         elif args.stack == "killenv":
             env["HMD_UI_CONTROLS"] = "0"
             repo = new_repo(tmp)
@@ -664,6 +1054,8 @@ def main():
             for name in groups:
                 RUN[name](st)
     finally:
+        if gh is not None:
+            gh.release()
         if st is not None:
             st.stop()
         shutil.rmtree(tmp, ignore_errors=True)
