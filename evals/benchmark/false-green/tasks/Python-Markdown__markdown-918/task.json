@@ -1,0 +1,40 @@
+{
+  "id": "Python-Markdown__markdown-918",
+  "category": "bugfix",
+  "source": "https://github.com/Python-Markdown/markdown/issues/918",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/Python-Markdown/markdown/pull/1007",
+  "repo": "Python-Markdown/markdown",
+  "license": "BSD-3-Clause",
+  "base_sha": "611cf6d98297f8cb79c06d2c785c885b88a12cf0",
+  "merge_sha": "370e17b3923d7d8f4709652bc24b695271a0210d",
+  "test_paths": [
+    "tests/test_syntax/extensions/test_def_list.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/Python-Markdown/markdown && git fetch -q --depth 1 --filter=blob:none origin 611cf6d98297f8cb79c06d2c785c885b88a12cf0 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: definition lists containing multi-paragraph ordered lists rendered as code\n\nGiven Markdown with a definition list that contains an ordered list and the ordered list has multi-paragraph elements, each ordered list element is rendered as a separate ordered list and the paragraphs are rendered as code blocks.\r\n\r\nThis appears specific to definition lists (using `def_list`). It does not appear that other types of lists make a similar formatting decision for multi-paragraph sub-lists.\r\n\r\nThe markdown input:\r\n\r\n```markdown\r\nterm\r\n\r\n:   this is a definition for term. it has \r\n    multiple lines in the first paragraph.\r\n\r\n    1.  first thing\r\n    \r\n        first thing details in a second paragraph.\r\n        \r\n    1.  second thing\r\n\r\n        second thing details in a second paragraph.\r\n\r\n    1.  third thing\r\n\r\n        third thing details in a second paragraph.\r\n```\r\n\r\nExpected:\r\n\r\n```\r\n<dl>\r\n<dt>term</dt>\r\n<dd>\r\n<p>this is a definition for term. it has\r\nmultiple lines in the first paragraph.</p>\r\n\r\n<ol>\r\n<li>first thing\r\n<p>first thing details in a second paragraph.</p>\r\n</li>\r\n\r\n<li>second thing\r\n<p>second thing details in a second paragraph.</p>\r\n</li>\r\n\r\n<li>third thing\r\n<p>third thing details in a second paragraph.</p>\r\n</li>\r\n</ol>\r\n\r\n</dd>\r\n</dl>\r\n```\r\n\r\nActual:\r\n\r\n```\r\n<dl>\r\n<dt>term</dt>\r\n<dd>\r\n<p>this is a definition for term. it has\r\nmultiple lines in the first paragraph.</p>\r\n<ol>\r\n<li>first thing</li>\r\n</ol>\r\n<pre><code>first thing details in a second paragraph.\r\n</code></pre>\r\n<ol>\r\n<li>second thing</li>\r\n</ol>\r\n<pre><code>second thing details in a second paragraph.\r\n</code></pre>\r\n<ol>\r\n<li>third thing</li>\r\n</ol>\r\n<pre><code>third thing details in a second paragraph.\r\n</code></pre>\r\n</dd>\r\n</dl>\r\n```\r\n\r\nTested with:\r\n\r\n```bash\r\n/usr/local/bin/markdown_py -x def_list definitions.md\r\n/usr/local/bin/markdown_py --version\r\n# => markdown_py 3.2.1\r\n```\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "4 failed, 2 passed, 1 warning in 0.10s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "6 passed, 1 warning in 0.06s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

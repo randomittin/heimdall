@@ -1,0 +1,40 @@
+{
+  "id": "virgiliojr94__book-to-skill-143",
+  "category": "bugfix",
+  "source": "https://github.com/virgiliojr94/book-to-skill/issues/143",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/virgiliojr94/book-to-skill/pull/149",
+  "repo": "virgiliojr94/book-to-skill",
+  "license": "MIT",
+  "base_sha": "c4c5e948caaa912c9e2024b925a7cdee9237b0c0",
+  "merge_sha": "b7e3a81ad604f49051eb97e11fd51ff32c6738f2",
+  "test_paths": [
+    "tests/test_numbered_headings.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/virgiliojr94/book-to-skill && git fetch -q --depth 1 --filter=blob:none origin c4c5e948caaa912c9e2024b925a7cdee9237b0c0 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Arabic-numbered headings are dropped by the digit-led guard, collapsing numbered documents to 1 chapter\n\n## Summary\n\n`_structural_chapter_count()` rejects any ATX title starting with a digit \u2014 a guard meant to keep `## 5 Setup` from counting as a chapter. That guard drops **every arabic-numbered heading**, which is how academic papers, technical reports and standards documents are structured, and which is exactly what `--mode technical` with Docling produces.\n\n## Reproduction \u2014 four forms, all lost\n\nThree same-level sections per document; the detector should see 3:\n\n```\n\"## 1. Intro\"    -> 1   rejected\n\"## 1 Intro\"     -> 1   rejected\n\"## 1) Intro\"    -> 1   rejected\n\"## 1.2 Intro\"   -> 1   rejected\n\"## I. Intro\"    -> 3   ok   (roman survives)\n\"## Intro\"       -> 3   ok   (control)\n```\n\n(The 1 is the lone `#` document title surviving through the thin-document fallback.)\n\nA first version of this issue described the defect as \"numbering with a dot\" and proposed accepting `\\d+\\.`. That is wrong: it fixes one of the four broken forms and leaves the other three exactly as they are.\n\n## The knot\n\n`## 5 Setup` \u2014 which the guard exists to reject \u2014 and `## 1 Intro` \u2014 which it should accept \u2014 are **syntactically identical**. No adjustment of the leading-token regex separates them, so any patch that admits the second admits the first.\n\nWhat separates them is not the separator, it is the **sequence**. Structural numbering appears as a run: 1, 2, 3 at the same heading depth, starting at 1. A tutorial step numbered `## 5 Setup` normally appears without the siblings that would make it a sequence, or without starting at 1.\n\n## Suggested direction\n\nDecide per document, not per line:\n\n1. Collect the digit-led titles at each depth, in document order.\n2. If a depth holds three or more of them whose leading numbers form an ascending run starting at 1, treat that depth as structural numbering and count those titles as chapters, using the leading number as the chapter number.\n3. Otherwise keep rejecting them, exactly as today.\n\nThat admits all four forms above without a separator whitelist, and leaves an isolated `## 5 Setup` rejected.\n\n## Tests this needs\n\n- Each of the four numbering forms, three sections each, counted as 3.\n- `## 5 Setup` / `## 6 Teardown` with no sibling run: still rejected (this is the existing `test_bare_digit_titles_still_rejected`, which must stay green).\n- A document mixing a numbered run with an unnumbered heading, to pin which depth wins.\n- Roman and unnumbered headings unchanged.\n\n## Where it came from\n\nConverting *Prompt Design and Engineering* (Xavier Amatriain, 26 pages) through Codex with `--mode technical`. The document has 8 numbered sections; the run reported 4, and the agent had to rebuild the structure by reading headings itself. `chapters_detected` feeds Step 3's plan and the generated skill's file layout, so the wrong number does not just look wrong \u2014 it becomes the structure.\n\n## Environment\n\nbook-to-skill v1.4.0, reproduced on current `master`. Source: PDF via Docling 2.119.0.\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "7 failed, 7 passed in 0.09s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "14 passed in 0.07s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

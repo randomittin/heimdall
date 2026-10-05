@@ -1,0 +1,6 @@
+repository: https://github.com/caronc/apprise
+issue: https://github.com/caronc/apprise/issues/1639
+pull_request: https://github.com/caronc/apprise/pull/1640
+base_sha: 7502e81e27bfea4d847ead31cda0d97bafcb1883
+merge_sha: 6c9b054b3ba2ee248305a2346931740d3cc79170
+license: BSD-2-Clause

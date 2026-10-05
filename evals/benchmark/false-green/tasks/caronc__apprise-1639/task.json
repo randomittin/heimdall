@@ -1,0 +1,41 @@
+{
+  "id": "caronc__apprise-1639",
+  "category": "bugfix",
+  "source": "https://github.com/caronc/apprise/issues/1639",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/caronc/apprise/pull/1640",
+  "repo": "caronc/apprise",
+  "license": "BSD-2-Clause",
+  "base_sha": "7502e81e27bfea4d847ead31cda0d97bafcb1883",
+  "merge_sha": "6c9b054b3ba2ee248305a2346931740d3cc79170",
+  "test_paths": [
+    "tests/test_plugin_email.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/caronc/apprise && git fetch -q --depth 1 --filter=blob:none origin 7502e81e27bfea4d847ead31cda0d97bafcb1883 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".[dev]\"",
+    "uv pip install --python .venv/bin/python -q -r dev-requirements.txt"
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Apprise mailtos SMTPS accepts self-signed SMTP certificates by default\n\n## Notification Service(s) Impacted\nEmail / SMTP \n\n## What happened\nApprise's email notification plugin accepts a self-signed and hostname-mismatched SMTP TLS certificate even though certificate verification is enabled by default.\n\nFor HTTPS-based notification services, Apprise passes `verify=self.verify_certificate` to the underlying HTTP client. The email SMTP path also exposes the same `verify_certificate=True` URL-level setting, but it is not converted into a validating TLS context for SMTP.\n\nIn the current source, the SSL SMTP path calls `smtplib.SMTP_SSL(...)` without a `context` argument, and the STARTTLS path calls `socket.starttls()` without a `context` argument. In Python's `smtplib`, both cases fall back to `ssl._create_stdlib_context()`, which does not enforce normal CA validation and hostname verification.\n\nExpected behavior: when `verify_certificate=True` (the default), SMTPS and STARTTLS SMTP connections should reject self-signed, untrusted, expired, or hostname-mismatched certificates before credentials or message data are sent.\n\nActual behavior: a local SMTPS server presenting a self-signed certificate for `wrong.example.test` is accepted when connecting to `127.0.0.1`, and Apprise proceeds to send SMTP commands including `MAIL FROM`, `RCPT TO`, `DATA`, and `QUIT`.\n\n## Impact\nAn attacker who can intercept or redirect SMTP traffic can present an untrusted certificate and receive the SMTP session. This can expose SMTP credentials and notification contents, and can allow notification modification or suppression.\n\n## Steps to reproduce\n1. Install or run Apprise from the latest source.\n2. Start a local SMTPS server that presents a self-signed certificate whose CN/SAN does not match the target hostname, for example a certificate for `wrong.example.test` while the client connects to `127.0.0.1`.\n3. Add an Apprise email notification URL using SMTPS:\n   ```text\n   mailtos://127.0.0.1:24652?from=sender@example.com&to=recipient@example.com&mode=ssl\n   ```\n4. Send a notification through Apprise.\n5. Observe that the SMTP session continues past TLS setup and reaches `MAIL FROM`, `RCPT TO`, and `DATA`.\n\nA secure SMTP client with certificate verification enabled should fail the TLS handshake before sending SMTP credentials or message data.\n\n## Logs \n```text\nnotify_result=True\nsmtp_transcript_marker=ehlo [127.0.1.1]|mail FROM:<sender@example.com>|rcpt TO:<recipient@example.com>|data|quit\nAPPRISE_SELF_SIGNED_SMTP_ACCEPTED\n```\nAbove the reproduction output means that Apprise successfully connected to the test SMTPS server and treated the TLS connection as valid, even though the server presented a self-signed certificate with a hostname mismatch.\n\nThis is important because, if certificate verification were working correctly, the connection should fail during the TLS handshake due to the self-signed and hostname-mismatched certificate, before any MAIL FROM command is sent.\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "2 failed, 24 passed, 12 skipped, 1 warning in 5.59s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "26 passed, 12 skipped, 1 warning in 4.80s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}
