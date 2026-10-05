@@ -888,12 +888,19 @@ def serve_main(argv):
     ap.add_argument("port", type=int)
     ap.add_argument("--log", required=True, metavar="DIR")
     ap.add_argument("--ctl", required=True, metavar="DIR")
+    ap.add_argument("--ws", action="store_true",
+                    help="answer `Upgrade: websocket` on GET /stream with 101 (a relay that has the WebSocket leg)")
+    ap.add_argument("--tls", nargs=2, metavar=("CERT", "KEY"), help="serve HTTPS/WSS with this certificate")
     args = ap.parse_args(argv)
 
     global STATE
-    STATE = RelayState(args.log, args.ctl)
+    STATE = RelayState(args.log, args.ctl, ws_enabled=args.ws)
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     httpd.daemon_threads = True
+    if args.tls:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(args.tls[0], args.tls[1])
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     try:
         httpd.serve_forever(poll_interval=0.1)
     except KeyboardInterrupt:
