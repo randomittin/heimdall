@@ -1,0 +1,40 @@
+{
+  "id": "amaranth-lang__amaranth-1285",
+  "category": "bugfix",
+  "source": "https://github.com/amaranth-lang/amaranth/issues/1285",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/amaranth-lang/amaranth/pull/1313",
+  "repo": "amaranth-lang/amaranth",
+  "license": "BSD-2-Clause",
+  "base_sha": "0be2dda6561a05c4769a4fb1f50f129c3ad65958",
+  "merge_sha": "c59447c2580c29e4376cc98fe034bc280c3d63b9",
+  "test_paths": [
+    "tests/test_lib_data.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/amaranth-lang/amaranth && git fetch -q --depth 1 --filter=blob:none origin 0be2dda6561a05c4769a4fb1f50f129c3ad65958 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: `Signal.like` is not fully functional with `ShapeCastable`-based signals\n\nThe `name_suffix` functionality is broken. The `init`, `reset_less`, `attrs`, and `decoder` properties of the original signal are not preserved.\r\n\r\n```\r\n>>> from amaranth.lib import data\r\n>>> from amaranth.hdl import *\r\n>>> l = data.StructLayout({\"a\": 8, \"b\": 4})\r\n>>> s = Signal(l, init={\"a\": 1, \"b\": 2}, reset_less=True, attrs={\"x\": 123})\r\n>>> s2 = Signal.like(s, name_suffix=\"a\")\r\n[...]\r\nAttributeError: View with layout StructLayout({'a': 8, 'b': 4}) does not have a field 'name'; did you mean one of: 'a', 'b'?\r\n>>> s2 = Signal.like(s)\r\n>>> s.as_value().init\r\n513\r\n>>> s2.as_value().init\r\n0\r\n>>> s.as_value().reset_less\r\nTrue\r\n>>> s2.as_value().reset_less\r\nFalse\r\n>>> s.as_value().attrs\r\nOrderedDict([('x', 123)])\r\n>>> s2.as_value().attrs\r\nOrderedDict()\r\n```\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "1 failed, 112 passed in 0.28s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "113 passed in 0.21s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

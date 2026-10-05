@@ -52,6 +52,7 @@ from fg_taskgen import issue_rank, ordered, parse_candidates  # noqa: E402
 GITHUB = "https://github.com/"
 MAX_TEST_BYTES = 400 * 1024
 CLONE_ATTEMPTS, CLONE_RETRY_S = 3, 3          # a dropped connection is not a verdict on a candidate
+LOOKAHEAD = 3                                 # candidates in flight or waiting per worker
 GROUND_TRUTH_TIMEOUT_S = fg_repo.STEP_TIMEOUT_S
 GITLEAKS_CONFIG = os.path.join(PLUGIN, ".gitleaks.toml")
 LEAKS_EXIT = 7                                # gitleaks --exit-code: distinct from its own errors (1)
@@ -303,6 +304,13 @@ def verify_one(cand, work_root, tasks_dir, issue_text, python):
     return result
 
 
+def _started(cand, work_root, stage, issue_text, python):
+    """verify_one, unless the disk is low when this candidate's turn comes: then None, and nothing is cloned."""
+    if fg_repo.container_free_bytes() < fg_repo.MIN_FREE_BYTES:
+        return None
+    return verify_one(cand, work_root, stage, issue_text, python)
+
+
 def read_record(path):
     rows = []
     if os.path.isfile(path):
@@ -327,9 +335,10 @@ def _append(path, row):
 def verify_all(cand_file, tasks_dir, pilot_dir, record, work_root, want, spares, issue_text, python, jobs=1):
     """Walk the candidates in ascending sha256(issue URL) order until `want` are accepted as tasks and `spares` more as pilots.
 
-    Candidates are verified up to `jobs` at a time but decided strictly in rank order, so the record is the
-    same whatever `jobs` is; one verified past the stopping point is discarded, never recorded. Rows already
-    in `record` are not walked again. Returns 0 (quota met), 1 (candidates exhausted), 3 (stopped on low disk).
+    Candidates are verified `jobs` at a time, with a few ranks of lookahead so that one slow candidate does not
+    idle the other workers, but decided strictly in rank order: the record is the same whatever `jobs` is, and a
+    candidate verified past the stopping point is discarded, never recorded. Rows already in `record` are not
+    walked again. Returns 0 (quota met), 1 (candidates exhausted), 3 (stopped on low disk, resumable).
     """
     if fg_repo.container_free_bytes() < fg_repo.MIN_FREE_BYTES:
         sys.stderr.write("fg_verify: under 3 GB free on the disk: stopping before anything is cloned\n")
@@ -342,22 +351,23 @@ def verify_all(cand_file, tasks_dir, pilot_dir, record, work_root, want, spares,
     taken = {role: sum(1 for r in rows if r.get("role") == role) for role in ("task", "pilot")}
     quota = {"task": want, "pilot": spares}
     met = lambda: all(taken[role] >= quota[role] for role in quota)
-    pending, cursor, low_disk = collections.deque(), len(rows), False
+    pending, cursor, low_disk, window = collections.deque(), len(rows), False, max(1, jobs) * LOOKAHEAD
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         try:
             while not met():
-                while cursor < len(cands) and len(pending) < max(1, jobs) and not low_disk:
-                    if fg_repo.container_free_bytes() < fg_repo.MIN_FREE_BYTES:
-                        sys.stderr.write("fg_verify: under 3 GB free on the disk: no further candidate is started; resume with the same command\n")
-                        low_disk = True
-                        break
+                while cursor < len(cands) and len(pending) < window:
                     stage = os.path.join(work_root, "out-%d" % (cursor + 1))
-                    pending.append((cursor + 1, cands[cursor], stage, pool.submit(verify_one, cands[cursor], work_root, stage, issue_text, python)))
+                    pending.append((cursor + 1, cands[cursor], stage, pool.submit(_started, cands[cursor], work_root, stage, issue_text, python)))
                     cursor += 1
                 if not pending:
                     break
                 rank, cand, stage, future = pending.popleft()
                 result = future.result()
+                if result is None:                 # the disk was low when this candidate's turn came: everything after it is left undecided too
+                    sys.stderr.write("fg_verify: under 3 GB free on the disk: no further candidate is started; resume with the same command\n")
+                    low_disk = True
+                    shutil.rmtree(stage, ignore_errors=True)
+                    break
                 role = None
                 if result["verdict"] == "accepted":
                     role = "task" if taken["task"] < quota["task"] else "pilot"
