@@ -100,6 +100,12 @@ mutant decide-ack-flipped \
   "w['frames']['ack_decide_allow']['plaintext']['ok'] = True"
 mutant refusal-last-skew \
   "w['frames']['ack_non_increasing_seq']['plaintext']['last'] = 2"
+mutant ws-version-skew \
+  "w['stream_ws']['request']['headers']['Sec-WebSocket-Version'] = '8'"
+mutant ws-ping-octets \
+  "w['stream_ws']['frames']['client_ping']['hex'] = '818437fa213d47934f5b'"
+mutant ws-wrong-accept \
+  "w['stream_ws']['response']['headers']['Sec-WebSocket-Accept'] = 'AAAAAAAAAAAAAAAAAAAAAAAAAAA='"
 
 echo ""
 echo "$PASS passed, $FAIL failed"
