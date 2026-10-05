@@ -6,6 +6,13 @@
 // The relay never decrypts anything (INV-18) — `ciphertext`/`nonce` pass
 // through byte-identical; only the two relay-originated control frame types
 // (`device_bound`, `session_ended`) carry a plaintext `payload`.
+//
+// hmd's leg has two transports on the one `/stream` route, negotiated by the
+// request alone: the original chunked NDJSON response (no `Upgrade` header),
+// and a hibernatable WebSocket (`Upgrade: websocket`). Only the WebSocket lets
+// the object hibernate while hmd is connected: an open NDJSON response, and the
+// keepalive and lifetime timers that serve it, keep the object resident — and
+// billed — for as long as it lasts. See docs/analysis/2026-10-05-relay-hibernation.md.
 
 import type {
   Env,
@@ -62,6 +69,8 @@ interface SessionRecord {
 }
 
 const DEVICE_TAG = "device";
+/** Tag on hmd's WebSocket leg: `GET /stream` with `Upgrade: websocket`. */
+const HMD_TAG = "hmd";
 const DEVICE_PUBKEY_BYTES = 32;
 
 /** Storage key for a session's record. */
@@ -103,11 +112,13 @@ const LAST_HMD_STATE_KEY = "last_hmd_state";
  * produce before hmd's `GET /stream` is open. Never more than one — a session
  * binds at most once, and handleDeviceTokenClaim's reconnect path never calls
  * deliverToHmdStream. Stored as the encoded NDJSON line, byte for byte what
- * handleStream later writes.
+ * handleStream later writes to an NDJSON stream — its trailing "\n" included,
+ * so a value written by an older build still works. A WebSocket is sent the
+ * same line without that newline (`lineToMessage`).
  *
  * This was a field on the instance. Nothing keeps the object resident while
- * hmd is away (only an open `GET /stream` does), so an eviction between the
- * claim and hmd connecting dropped the frame, and hmd — which derives its
+ * hmd is away (only an open NDJSON `GET /stream` does), so an eviction between
+ * the claim and hmd connecting dropped the frame, and hmd — which derives its
  * session key from that frame alone — never completed the pairing.
  * test/hibernation.spec.ts reproduces it.
  */
@@ -134,8 +145,15 @@ const ENDED_GRACE_MS = 5 * 60_000;
  */
 const CLOSE_SESSION_ENDED = 4001;
 const CLOSE_TOKEN_EXPIRED = 4003;
-/** RFC 6455's "message too big" — INV-16 on the phone leg. */
+/** RFC 6455's "message too big" — INV-16, on both WebSocket legs. */
 const CLOSE_MESSAGE_TOO_BIG = 1009;
+/**
+ * A newer socket on the same leg took over (`4002` / `"superseded"`), on both
+ * WebSocket legs. Distinct from `CLOSE_SESSION_ENDED` on purpose: the session
+ * is alive, and a client that conflated the two would stop reconnecting after
+ * a routine network change.
+ */
+const CLOSE_SUPERSEDED = 4002;
 
 /**
  * A rejected frame's `sender`/`type` are attacker-controlled and unbounded, so
@@ -208,14 +226,24 @@ interface DeviceSocketAttachment {
 }
 
 /**
- * The generation of one device socket, or 0 for a socket accepted before this
- * attachment existed — a deploy rolling over live sessions leaves those
- * connected, and any socket accepted afterwards outranks them.
- *
- * Never throws: a malformed or absent attachment must degrade to "oldest
- * possible", never cost a frame.
+ * An hmd socket's attachment: the `gen` and `sid` of `DeviceSocketAttachment`,
+ * for the same reasons (which socket is newest, and which session a freshly
+ * woken instance is serving), and nothing else. There is no `token_exp`: hmd's
+ * credential is the session's own bearer, presented once at the upgrade and
+ * good for as long as the session lives — and ending the session closes this
+ * socket.
  */
-function deviceSocketAttachment(socket: WebSocket): Partial<DeviceSocketAttachment> {
+type HmdSocketAttachment = Required<Pick<DeviceSocketAttachment, "gen" | "sid">>;
+
+/**
+ * The attachment of one accepted socket, on either leg (`token_exp` only ever
+ * appears on a device socket).
+ *
+ * Never throws: a malformed or absent attachment degrades to "nothing known",
+ * which `socketGeneration` reads as the oldest possible socket — never a
+ * lost frame.
+ */
+function socketAttachment(socket: WebSocket): Partial<DeviceSocketAttachment> {
   let attachment: unknown;
   try {
     attachment = socket.deserializeAttachment();
@@ -226,9 +254,40 @@ function deviceSocketAttachment(socket: WebSocket): Partial<DeviceSocketAttachme
   return attachment as Partial<DeviceSocketAttachment>;
 }
 
-function deviceSocketGeneration(socket: WebSocket): number {
-  const gen = deviceSocketAttachment(socket).gen;
+/**
+ * The generation of one socket, or 0 for a socket accepted before this
+ * attachment existed — a deploy rolling over live sessions leaves those
+ * connected, and any socket accepted afterwards outranks them.
+ */
+function socketGeneration(socket: WebSocket): number {
+  const gen = socketAttachment(socket).gen;
   return typeof gen === "number" && Number.isFinite(gen) ? gen : 0;
+}
+
+/**
+ * One NDJSON line is an envelope's JSON plus the single "\n" that ends it; one
+ * WebSocket message is the envelope alone. This is the one place a line becomes
+ * a message — the held `device_bound` is stored as a line (see
+ * PENDING_HMD_CONTROL_KEY), and every writer builds lines. `JSON.stringify`
+ * never emits a raw newline, so exactly one trailing "\n", when there is one,
+ * is the terminator and nothing else.
+ */
+function lineToMessage(line: string): string {
+  return line.endsWith("\n") ? line.slice(0, -1) : line;
+}
+
+/**
+ * INV-16 for a message already in memory: whether it is over
+ * `MAX_ENVELOPE_BYTES`. Length-first, so the encode is itself bounded — UTF-8
+ * is never fewer bytes than characters, so a string longer than the cap is over
+ * it regardless of contents. Checked before any `JSON.parse`, on both WebSocket
+ * legs, so an oversize message is never parsed.
+ */
+function exceedsEnvelopeCap(message: string): boolean {
+  return (
+    message.length > MAX_ENVELOPE_BYTES ||
+    new TextEncoder().encode(message).byteLength > MAX_ENVELOPE_BYTES
+  );
 }
 
 /**
