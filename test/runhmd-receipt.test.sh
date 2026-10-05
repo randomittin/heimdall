@@ -308,6 +308,7 @@ for label, bad in (("NaN", float("nan")), ("infinity", float("inf")), ("a number
     except ValueError:
         refused = True
     case("canonical: %s is refused" % label, refused)
+case("canonical: the largest interoperable integer (2**53 - 1) is written as is", c({"x": 2 ** 53 - 1}) == b'{"x":9007199254740991}')
 case("canonical: non-ASCII is literal UTF-8 and control characters use \\u00xx",
      c({"t": "é \x1f"}) == '{"t":"é \\u001f"}'.encode("utf-8"))
 case("canonical: quote, backslash and newline use the short escapes", c({"t": '"\\\n'}) == b'{"t":"\\"\\\\\\n"}')
