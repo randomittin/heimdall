@@ -316,7 +316,7 @@ def _infra_error(run, meter, text, cap_usd, timeout_s):
 
 
 class _Ledger:
-    """Append-only record of what every Study A agent run was counted at (PREREG.md Amendment 1, point 5).
+    """Append-only record of what every Study A agent run was counted at (PREREG.md Amendment 1, point 4).
 
     It sits beside the result rows but is never rewritten: a restart replaces rows, not money already spent.
     A run whose cost is unknown counts at the per-run cap, so an unmetered agent cannot hide spend.
@@ -422,13 +422,14 @@ def run_study_a_live(suite, args):
                          % (ledger.spent, TOTAL_CAP_USD, ledger.path, PER_RUN_CAP_USD))
         return 1
     rows, spent_before, ran, unmetered = {a: [] for a in arms}, ledger.spent, 0, 0
+    not_run = _not_run("not run: the $%.2f total cap leaves less than one $%.2f run" % (TOTAL_CAP_USD, PER_RUN_CAP_USD))
     for index, (path, task) in enumerate(tasks):
         if not ledger.has_room():
             left = [skipped for _path, skipped in tasks[index:]]
             sys.stderr.write("fg_bench: the $%.2f total cap leaves less than one $%.2f run: %d task(s) not run; the study is INCOMPLETE\n"
                              % (TOTAL_CAP_USD, PER_RUN_CAP_USD, len(left)))
             for skipped in left:
-                for arm, row in _study_a_rows(args.agent, arms, skipped, _not_run("not run: the $%.2f total cap leaves less than one $%.2f run" % (TOTAL_CAP_USD, PER_RUN_CAP_USD))).items():
+                for arm, row in _study_a_rows(args.agent, arms, skipped, not_run).items():
                     rows[arm].append(row)
             break
         rec = _agent_once(path, task, template, PER_RUN_CAP_USD, RUN_TIMEOUT_S, ledger)
