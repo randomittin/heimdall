@@ -336,13 +336,17 @@ a second notice, defeating the point).
 """
 
 import argparse
+import base64
 import collections
 import functools
+import hashlib
 import http.client
 import itertools
 import json
 import os
 import queue
+import re
+import select
 import signal
 import socket
 import ssl
@@ -655,6 +659,135 @@ def _split_relay(url):
     return parsed
 
 
+# -- pair by session code (see PAIR BY SESSION CODE in the module docstring) -----------------------------
+# The code is hmd's 5-character session code, the alphabet bin/lib/hmd_session_code.py emits. The two domain
+# strings are the wire contract shared with the phone app (hmdapp's docs/samples/pair-code-vectors.json holds
+# the known answers both sides assert).
+CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+CODE_LENGTH = 5
+COMMIT_DOMAIN = b"hmd-pair-commit-v1\x00"
+SAS_DOMAIN = b"hmd-pair-sas-v1\x00"
+_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
+_TOKEN_RE = re.compile(r"[\x21-\x7e]{1,255}")
+STDIN_LINE_MAX = 4096
+TOKEN_READ_TIMEOUT_S = 5.0
+
+
+def _env_seconds(name, default):
+    """A positive number of seconds from the environment, `default` when unset, malformed or out of range --
+    the same forgiving read every HMD_RELAY_* knob above gets, for the four code-window timings a test must
+    shorten."""
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if 0 < value <= 86400 else default
+
+
+# How long one code stays offered in total, how long after a window lapses before the next is registered
+# (the relay's clock and ours may differ by a moment), the least time between two renewals (a skewed clock
+# must never turn renewal into a hot loop), and how long the laptop has to approve a bind.
+CODE_WINDOW_TOTAL_S = _env_seconds("HMD_RELAY_CODE_WINDOW_S", 600.0)
+CODE_RENEW_MARGIN_S = _env_seconds("HMD_RELAY_CODE_RENEW_MARGIN_S", 1.5)
+CODE_RENEW_MIN_S = _env_seconds("HMD_RELAY_CODE_RENEW_MIN_S", 5.0)
+APPROVAL_TIMEOUT_S = _env_seconds("HMD_RELAY_APPROVAL_TIMEOUT_S", 60.0)
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def commit_for(hmd_pub, nonce):
+    """hmd's commitment to its X25519 key: SHA256(domain || key || nonce), registered with the relay before any
+    phone key exists and opened by the later key_reveal."""
+    return hashlib.sha256(COMMIT_DOMAIN + hmd_pub + nonce).digest()
+
+
+def sas_for(session_id, hmd_pub, device_pub):
+    """The six-digit short authentication string both screens show: uint32_be of the first four digest bytes
+    mod 10^6, zero-padded. It binds the session and both keys, each fixed before the other was revealed."""
+    digest = hashlib.sha256(SAS_DOMAIN + session_id.encode("utf-8") + b"\x00" + hmd_pub + device_pub).digest()
+    return "%06d" % (int.from_bytes(digest[:4], "big") % 1000000)
+
+
+def valid_code(code):
+    return isinstance(code, str) and len(code) == CODE_LENGTH and all(ch in CODE_ALPHABET for ch in code)
+
+
+def valid_login(login):
+    return isinstance(login, str) and _LOGIN_RE.fullmatch(login) is not None
+
+
+def clean_text(value, limit):
+    """`value` without C0 controls (ESC among them), DEL and C1 controls, as code points, cut to `limit`
+    characters: what a phone-claimed label or a relay-supplied name is reduced to before it is shown anywhere."""
+    return "".join(ch for ch in str(value) if not (ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F))[:limit]
+
+
+def _code_arg(value):
+    if not valid_code(value):
+        raise argparse.ArgumentTypeError("--code must be %d characters of %s" % (CODE_LENGTH, CODE_ALPHABET))
+    return value
+
+
+def _refusal_reason(status, raw):
+    """The one-word reason a relay answer other than 200 maps to: what code_unavailable says."""
+    try:
+        detail = json.loads(raw.decode("utf-8")).get("error")
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        detail = None
+    if status == 503:
+        return "disabled"
+    if status == 409:
+        return "conflict"
+    if status == 401 and detail == "github token rejected":
+        return "no-gh"
+    return "http-%d" % status
+
+
+class _StdinLines:
+    """Newline-delimited lines off a raw file descriptor, with a deadline. The first line of stdin is the
+    laptop's GitHub token and the lines after it are the operator's answers, and a buffered text stream
+    cannot be polled with select once it has read ahead -- so this owns the descriptor's bytes itself."""
+
+    def __init__(self, fd):
+        self.fd = fd
+        self.buf = b""
+        self.eof = False
+
+    def readline(self, timeout):
+        """The next line (no newline, decoded), None when `timeout` seconds pass first. Raises EOFError once
+        the stream ended with nothing left, ValueError for a line over STDIN_LINE_MAX bytes."""
+        deadline = time.monotonic() + timeout
+        while True:
+            newline = self.buf.find(b"\n")
+            if newline >= 0:
+                line, self.buf = self.buf[:newline], self.buf[newline + 1:]
+                return line.decode("utf-8", "replace").rstrip("\r")
+            if len(self.buf) > STDIN_LINE_MAX:
+                raise ValueError("line over %d bytes" % STDIN_LINE_MAX)
+            if self.eof:
+                if not self.buf:
+                    raise EOFError
+                line, self.buf = self.buf, b""
+                return line.decode("utf-8", "replace").rstrip("\r")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                ready = select.select([self.fd], [], [], remaining)[0]
+                chunk = os.read(self.fd, 4096) if ready else None
+            except (OSError, ValueError):
+                self.eof = True  # a closed or unusable descriptor is an ended stream
+                continue
+            if chunk is None:
+                return None
+            if not chunk:
+                self.eof = True
+                continue
+            self.buf += chunk
+
+
 _FAMILY_NAME = {socket.AF_INET: "ipv4", socket.AF_INET6: "ipv6"}
 
 
@@ -944,6 +1077,27 @@ class RelayClient:
         self.cache = None
         self._login = None         # the LoginManager, created on first use (see _login_manager)
 
+        # Pair by session code (PAIR BY SESSION CODE in the module docstring). Everything below stays idle --
+        # state "off", nothing read from stdin -- unless --code was given.
+        self._code = getattr(args, "code", None)
+        self._no_confirm = bool(getattr(args, "no_confirm", False))
+        self._stdin = None             # _StdinLines over fd 0: the token line, then the operator's answers
+        self._control_open = True      # False once stdin ended: nobody is left to answer an approval
+        self._gh_secret = None         # the laptop's GitHub token. Memory only, dropped when the window ends
+        self._code_state = "off"       # off | open | approving | bound | closed, guarded by _code_lock
+        self._code_lock = threading.Lock()
+        self._code_deadline = 0.0      # time.monotonic() after which no window is renewed
+        self._code_lapse_at = 0.0      # time.monotonic() when the current session's window lapses unclaimed
+        self._last_renew_at = 0.0
+        self._code_renewals = 0
+        self._commit_nonce = None      # nonce_h of the current session, revealed once a code bind is approved
+        self._pending = None           # the bind waiting for the laptop's answer
+        self._renew_now = threading.Event()
+        self._stream_epoch = 0         # bumped when a renewal replaces the session the stream reads
+        self._reading_epoch = 0        # the epoch the stream thread is reading frames of
+        self._stream_conn = None
+        self._stream_lock = threading.Lock()
+
     # -- status ------------------------------------------------------------
     def _status_snapshot(self):
         return {
@@ -978,28 +1132,31 @@ class RelayClient:
         finally:
             conn.close()
 
-    def pair_init(self):
+    def _post_pair_init(self):
+        """POST /pair/init: (the answer, 0), or (None, 12) after an `error` event says why it failed."""
         try:
             status, raw = self._request("POST", "/pair/init", headers={"Content-Length": "0"}, body=b"",
                                          label="pair")
         except (OSError, http.client.HTTPException) as e:
             emit({"event": "error", "detail": "pair/init unreachable: %s" % e})
-            return 12
+            return None, 12
         if status != 200:
             emit({"event": "error", "detail": "pair/init HTTP %d: %s" % (status, _body_head(raw))})
-            return 12
+            return None, 12
         try:
             data = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
             emit({"event": "error", "detail": "pair/init returned invalid JSON: %s" % e})
-            return 12
+            return None, 12
         for key in ("session_id", "pairing_code", "relay_session_token", "exp"):
             if key not in data:
                 emit({"event": "error", "detail": "pair/init response missing %r" % key})
-                return 12
-        self.session_id = data["session_id"]
-        self.token = data["relay_session_token"]
-        self.exp = data["exp"]
+                return None, 12
+        return data, 0
+
+    def _emit_pair_init(self, data, renewal=0):
+        """The `pair_init` event for the session this client now holds (the QR payload, Decision 7.2 shape).
+        A code-window renewal carries its number so a reader can tell it is not a new person's QR."""
         qr = {
             "v": 1,
             "relay": self.relay_url,
@@ -1008,8 +1165,20 @@ class RelayClient:
             "exp": self.exp,
             "hmd_pubkey": E2E.pub_b64(self.pub),
         }
-        emit({"event": "pair_init", "qr": qr, "exp": self.exp})
+        event = {"event": "pair_init", "qr": qr, "exp": self.exp}
+        if renewal:
+            event["renewal"] = renewal
+        emit(event)
         self.write_status()
+
+    def pair_init(self):
+        data, rc = self._post_pair_init()
+        if rc != 0:
+            return rc
+        self.session_id = data["session_id"]
+        self.token = data["relay_session_token"]
+        self.exp = data["exp"]
+        self._emit_pair_init(data)
         return 0
 
     def _auth_headers(self, extra=None):

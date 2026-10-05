@@ -205,6 +205,8 @@ class Proc:
         return found
 
     def send(self, data):
+        if self.p.stdin is None:
+            return False
         try:
             self.p.stdin.write(data if isinstance(data, bytes) else data.encode("utf-8"))
             self.p.stdin.flush()
@@ -213,6 +215,8 @@ class Proc:
         return True
 
     def close_stdin(self):
+        if self.p.stdin is None:
+            return
         try:
             self.p.stdin.close()
         except (BrokenPipeError, OSError):
