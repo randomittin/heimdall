@@ -387,9 +387,9 @@ def g_paths(st):
     ack, res = st.view("fifo")
     check(ack is not None and (ack.get("ok") is True or refused(ack, "not-allowed")) and (res is None or res["hunks"] == []),
           "paths: a named pipe is answered without hanging and shows nothing", ack)
-    check(not st.absent_everywhere(marker) and not st.absent_everywhere("FOO=changed"),
+    check(not st.found_in(marker) and not st.found_in("FOO=changed"),
           "paths: neither the outside file's content nor .env's is in any frame or any file the client wrote",
-          st.absent_everywhere(marker) + st.absent_everywhere("FOO=changed"))
+          st.found_in(marker) + st.found_in("FOO=changed"))
     ack, again = st.view("id_utils.py")
     check(ack and ack.get("ok") is True, "paths: after all of it a plain request still works")
     r.reset("ulink", "fifo", "link-in", "link-out", "linkdir")
@@ -401,7 +401,7 @@ def g_secrets(st):
     st.ready()
     tok, pwd, key_begin, key_end = token_shaped(), "p" * 24, "-----BEGIN " + "RSA PRIVATE KEY-----", "-----END " + "RSA PRIVATE KEY-----"
     body = ("MIIEvQIBADANBgkq", "hkiG9w0BAQEFAASC")
-    email, root = "someone@example.com", r.path
+    email, root = "someone@example.com", os.path.realpath(r.path)
     r.write("k.txt", "start\n")
     r.write("src/a.ts", "x\n")
     r.write("sec.py", "def f(api_key=\"%s\"):\n%s\ndef g():\n%s" % ("x" * 30, "".join("    n%d = %d\n" % (i, i) for i in range(15)),
@@ -415,10 +415,11 @@ def g_secrets(st):
     check(res is not None and plus[:6] == ["[redacted]"] * 6,
           "secrets: a token-shaped line, an assigned-credential line and a whole PEM private key (BEGIN, body, END) are masked line by line", plus[:8])
     check(res is not None and plus[6] == "plain neighbour", "secrets: the line next to them is untouched", plus)
-    check(res is not None and "[email]" in plus[7] and email not in plus[7] and root not in json.dumps(res) and "hosts" in plus[7] and "/etc/hosts" not in plus[7],
-          "secrets: the relay's redaction profile applies to the result (the email, the repo's absolute path and /etc/hosts are scrubbed)", plus[7:8])
+    check(res is not None and "[email]" in plus[7] and email not in plus[7] and root not in json.dumps(res)
+          and plus[7].endswith("or see hosts and src/a.ts"),
+          "secrets: the relay's redaction profile applies to the result (the email goes, /etc/hosts shrinks to its name, the repo's own path to repo-relative)", plus[7:8])
     check(res is not None and len(plus[8]) == 2001 and plus[8].endswith("…"), "secrets: a line past 2000 characters is cut with an ellipsis", len(plus[8]) if len(plus) > 8 else None)
-    leaked = [n for n in (tok, pwd, body[0], body[1]) if st.absent_everywhere(n)]
+    leaked = [n for n in (tok, pwd, body[0], body[1]) if st.found_in(n)]
     check(not leaked, "secrets: no secret-shaped string and no key body is in any frame or any file the client wrote", leaked)
     r.write("sec.py", "def f(api_key=\"%s\"):\n%s\ndef g():\n%s" % ("x" * 30, "".join("    n%d = %d\n" % (i, i + (100 if i == 9 else 0)) for i in range(15)),
                                                                    "".join("    m%d = %d\n" % (i, i + (100 if i == 9 else 0)) for i in range(15))))
@@ -428,11 +429,11 @@ def g_secrets(st):
           "secrets: git's function context in a hunk header is dropped when secret-shaped and kept when not", heads)
     name = "password=%s.txt" % pwd
     r.write(name, "b\n")
-    ack, one = st.view(name)
+    named = st.burst([{"rid": st.rid(), "kind": "diff", "path": name}])[0]
     ack, whole = st.view(None)
-    check(refused(ack if False else st.burst([{"rid": st.rid(), "kind": "diff", "path": name}])[0], "not-allowed") and whole is not None
-          and all(f["path"] != name for f in whole["files"]) and not st.absent_everywhere(pwd),
-          "secrets: a secret-shaped file name is not-allowed and left out of the whole tree")
+    check(refused(named, "not-allowed") and whole is not None and all(f["path"] != name for f in whole["files"]),
+          "secrets: a secret-shaped file name is not-allowed and left out of the whole tree", named)
+    check(not st.found_in(pwd), "secrets: that name and the value in it are in no frame and no file the client wrote", st.found_in(pwd))
     r.reset()
 
 
@@ -632,6 +633,7 @@ def main():
     try:
         env = {"HOME": os.path.join(tmp, "home"), "HEIMDALL_HOME": os.path.join(tmp, "home", ".heimdall"), "TMPDIR": tmp}
         os.makedirs(os.path.join(env["HOME"], ".claude"))
+        os.environ.update(env, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")  # hermetic: no user git config
         for name in ("CLAUDE_SESSION_ID", "SESSION_ID", "CLAUDE_CODE_SESSION_ID", "HMD_UI_CONTROLS", "HMD_VIEW_RATE_LIMIT"):
             os.environ.pop(name, None)
         if args.stack == "main":
