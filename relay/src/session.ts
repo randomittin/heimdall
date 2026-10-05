@@ -1242,12 +1242,16 @@ export class SessionDO {
     // here got nothing until hmd's next digest change — see
     // loadReplayableHmdState for why replaying it unconditionally is safe.
     const replayEnvelope = await this.loadReplayableHmdState();
+    // A phone that bound through a code window and dropped before it read hmd's key_reveal
+    // must still be handed it (spec 5.5); anything else has none stored.
+    const keyReveal = await this.ctx.storage.get<Envelope>(KEY_REVEAL_KEY);
     return this.acceptDeviceSocket(
       record.session_id,
       claims.exp,
       undefined,
       undefined,
-      replayEnvelope
+      replayEnvelope,
+      keyReveal
     );
   }
 
@@ -1263,11 +1267,14 @@ export class SessionDO {
     record: SessionRecord,
     reason: "pairing-expired" | "claim-throttled"
   ): Promise<void> {
+    const window = record.code_window;
+    delete record.code_window;
     record.status = "ended";
     await this.saveRecord(record);
     await this.clearLastHmdState();
     await this.armPurgeAlarm(Date.now() + ENDED_GRACE_MS);
     this.endHmdStream(record.session_id, reason);
+    if (window) await this.clearIndexEntry(window, record.session_id);
   }
 
   private async handlePairingCodeClaim(
@@ -1319,6 +1326,23 @@ export class SessionDO {
       exp,
       device_pubkey: devicePubkey,
     });
+    // How this phone came by the pairing code, read before the window is cleared: from a
+    // released code window, or from the QR. hmd is told, because `code` is what makes it send
+    // key_reveal and put the SAS to the laptop user (spec 5.5).
+    const window = record.code_window;
+    const hmdControl: DeviceBoundToHmdPayload =
+      window?.released === true
+        ? {
+            device_pubkey: devicePubkey,
+            bound_at: nowS,
+            via: "code",
+            device_label: window.device_label,
+            gh_login: window.gh_login,
+          }
+        : { device_pubkey: devicePubkey, bound_at: nowS, via: "qr" };
+    // INV-41: the window's identifying fields end here, with the pairing window they served.
+    delete record.code_window;
+
     record.status = "bound";
     record.device_token_exp = exp;
     await this.saveRecord(record);
@@ -1332,13 +1356,18 @@ export class SessionDO {
     // not a hardcoded skip, so it stays correct if that ever changes.
     const replayEnvelope = await this.loadReplayableHmdState(now);
 
-    return this.acceptDeviceSocket(
+    const accepted = await this.acceptDeviceSocket(
       record.session_id,
       exp,
       { device_token: deviceToken, exp },
-      { device_pubkey: devicePubkey, bound_at: nowS },
+      hmdControl,
       replayEnvelope
     );
+    // A window that was registered but never released (a QR scan got here first) is still in
+    // its owner's index; a released one left it at the release. After the claim, so the
+    // claim never waits on, or fails with, the index.
+    if (window && !window.released) await this.clearIndexEntry(window, record.session_id);
+    return accepted;
   }
 
   private async acceptDeviceSocket(
@@ -1346,7 +1375,8 @@ export class SessionDO {
     tokenExp: number,
     bindPayload?: DeviceBoundToPhonePayload,
     hmdControlPayload?: DeviceBoundToHmdPayload,
-    replayEnvelope?: Envelope
+    replayEnvelope?: Envelope,
+    keyReveal?: Envelope
   ): Promise<Response> {
     // hmd's half goes first because it is the one step here that can fail (a
     // storage write, when hmd's leg is down). Failing after the socket was
@@ -1387,6 +1417,12 @@ export class SessionDO {
           payload: bindPayload,
         })
       );
+    }
+    if (keyReveal) {
+      // First of everything replayed: a state frame is sealed under the key this frame lets
+      // the phone derive, so it cannot be opened until this has been read.
+      server.send(JSON.stringify(keyReveal));
+      logEvent("key_reveal_replayed", { session_id: sessionId });
     }
     if (replayEnvelope) {
       // Always after device_bound, never before: a frame sealed under a
@@ -1441,9 +1477,12 @@ export class SessionDO {
       return jsonResponse(401, { error: "missing or invalid bearer token" });
     }
 
+    const window = record.code_window;
+    delete record.code_window;
     record.status = "ended";
     await this.saveRecord(record);
     await this.clearLastHmdState();
+    await this.ctx.storage.delete(KEY_REVEAL_KEY);
     // An ended session is dead weight, but not instantly: the grace keeps the
     // record long enough that a phone reconnecting right after the revoke gets
     // a truthful 410 rather than a 404 that reads like "wrong session id".
