@@ -285,29 +285,13 @@ def A(file, prims, fragment, cls, reason, guards=(), names=(), triggers=()):
 ALLOW = [
     # ── instruction text that tells an agent to ship, release or deploy ──────────────────────────────────────
     # HUMAN-REQUESTED is for a row that only fires when the user asks for that action. KNOWN-GAP is for text that
-    # releases or deploys with no human-confirmation step in the text itself: found by this gate on 2026-10-05
-    # and left visible on every run (see main_report) because rewording shipped agent behaviour is an operator
-    # decision, not something a test file should do quietly.
+    # releases or deploys with no human-confirmation step in the text itself, and it is EMPTY on purpose: the nine
+    # rows this gate found on 2026-10-05 (maintainer guide, incident responder, the maintain-cycle summary in
+    # agents/heimdall.md) were reworded on 2026-10-06 so the agent prepares the release or fix and stops for the
+    # operator to run it, and the gate now enforces that wording. The class stays so that a future gap is a
+    # decision someone owns (main_report prints it on every run), never a silent one.
     A("agents/heimdall.md", "git-tag-create", "Execute + verify + git tag + changelog + push", "HUMAN-REQUESTED",
       "routing-table row: Ship mode is entered only when the user's own prompt says ship, deploy or release"),
-    A("agents/heimdall.md", "p-release", "fix → release → communicate", "KNOWN-GAP",
-      "describes the maintainer cycle, whose release step the maintainer guide leaves to the agent with no human confirmation"),
-    A("agents/incident-responder.md", "p-deploy", "or redeploy last-known-good", "KNOWN-GAP",
-      "tells the incident agent to redeploy a known-good build; nothing in the text asks a human to confirm that deploy first"),
-    A("agents/incident-responder.md", "p-deploy", "Deploy fix, verify metrics return to baseline", "KNOWN-GAP",
-      "tells the incident agent to deploy its own fix; nothing in the text asks a human to confirm that deploy first"),
-    A("skills/heimdall/references/maintainer-guide.md", "p-release", "and manages releases", "KNOWN-GAP",
-      "describes maintainer mode as managing releases autonomously; the guide has no human-confirmation step before a release"),
-    A("skills/heimdall/references/maintainer-guide.md", "p-release", "batch into patch release with semver bump", "KNOWN-GAP",
-      "step 5 of the maintainer cycle releases once 3+ fixes are queued, with no human step before the tag and GitHub release"),
-    A("skills/heimdall/references/maintainer-guide.md", "p-release", "triage → fix → release", "KNOWN-GAP",
-      "cycle summary that ends in a release step the guide does not gate on a human"),
-    A("skills/heimdall/references/maintainer-guide.md", "p-release", "Medium × High | Auto-fix, batch into patch release", "KNOWN-GAP",
-      "routing-table row that auto-fixes and batches into a release with no human-confirmation step"),
-    A("skills/heimdall/references/maintainer-guide.md", "p-release", "Low × High | Auto-fix, batch into patch release", "KNOWN-GAP",
-      "routing-table row that auto-fixes and batches into a release with no human-confirmation step"),
-    A("skills/heimdall/references/maintainer-guide.md", "p-release", "Create release tag + GitHub release", "KNOWN-GAP",
-      "step 5 of the release procedure creates the tag and the GitHub release with no human step; release/publish-checklist.md says a human does both"),
     # ── DOC / DATA / HINT: text that mentions a push, merge or deploy without being able to run one ────────
     A("agents/architect.md", "p-merge", "merge them into one task", "DOC",
       "planning advice to fold two same-file tasks into one task; no code is merged"),
@@ -1163,7 +1147,8 @@ def main_report(A_, res, fail_only_keys=False):
         print("")
         print("  KNOWN GAPS, accepted and visible every run: instruction text that tells an agent to release or deploy")
         print("  with no human-confirmation step in the text (a merge verb can never be listed here). Each is an operator")
-        print("  decision: reword it to 'prepare it, then ask a human to run release/ship.sh', or keep accepting it.")
+        print("  decision: reword it so the agent prepares the change and stops for the operator to run the command, or keep")
+        print("  accepting it. (Name a human-run script only inside a 'never run' clause: the unattended check rejects any other mention.)")
         print("  A new one fails this gate:")
         for f, frag in gaps:
             print("    %s  %r" % (f, frag))
@@ -1322,8 +1307,15 @@ if [ "${1:-}" = "--self-test" ]; then
   expect_red "git push origin main planted in a sentinels script" sentinels/hmd-gate-event.sh 'git push origin main' 'UNCLASSIFIED|git-push|sentinels/hmd-gate-event.sh'
   expect_red "a merge instruction planted in an agent definition" agents/coder.md 'When the tests are green, merge the PR yourself.' 'UNCLASSIFIED|p-merge|agents/coder.md'
   expect_red "a release instruction planted in an agent definition" agents/lint-quality.md 'When lint is clean, publish a release.' 'UNCLASSIFIED|p-release|agents/lint-quality.md'
-  expect_red "a NEW merge instruction beside accepted KNOWN-GAP lines is not laundered" skills/heimdall/references/maintainer-guide.md \
+  expect_red "a merge instruction planted in the maintainer guide (a bot surface)" skills/heimdall/references/maintainer-guide.md \
     'Then merge the PR yourself.' 'UNCLASSIFIED|p-merge|skills/heimdall/references/maintainer-guide.md'
+  # the nine lines once accepted as KNOWN-GAP are enforced now: the old autonomous release or deploy wording, planted back, is RED
+  expect_red "the old autonomous release step planted back in the maintainer guide" skills/heimdall/references/maintainer-guide.md \
+    '5. Create release tag + GitHub release' 'UNCLASSIFIED|p-release|skills/heimdall/references/maintainer-guide.md'
+  expect_red "the old autonomous deploy step planted back in the incident responder" agents/incident-responder.md \
+    '- Deploy fix, verify metrics return to baseline' 'UNCLASSIFIED|p-deploy|agents/incident-responder.md'
+  expect_red "the old maintain-cycle release step planted back in the heimdall agent" agents/heimdall.md \
+    'Each cycle runs: scan -> triage -> fix -> release -> communicate.' 'UNCLASSIFIED|p-release|agents/heimdall.md'
 
   # a stale allowlist entry: delete the line an entry covers
   cp -p "$COPY/agents/heimdall.md" "$BAK" && grep -v 'better than a bad auto-merge' "$BAK" > "$COPY/agents/heimdall.md"

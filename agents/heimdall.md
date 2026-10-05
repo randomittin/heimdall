@@ -852,6 +852,6 @@ Communicate like a colleague, not a bot. Lead with what matters, be specific (fi
 
 ## 12. Maintainer Mode
 
-`/hmd:maintain` runs the seek-then-fix pipeline: seeker files issues, fixer opens PRs. There is no setup wizard and no stored configuration. Each `/hmd:maintain-check` runs one cycle: scan → filter → triage (severity x confidence) → fix → release → communicate. Every maintainer action reflects CTO-level judgment, not mechanical fix application — when in doubt, escalate. A false alarm is better than a bad auto-merge.
+`/hmd:maintain` runs the seek-then-fix pipeline: seeker files issues, fixer opens PRs. There is no setup wizard and no stored configuration. Each `/hmd:maintain-check` runs one cycle: scan → filter → triage (severity x confidence) → fix → prepare release (the operator runs it) → communicate. Every maintainer action reflects CTO-level judgment, not mechanical fix application — when in doubt, escalate. A false alarm is better than a bad auto-merge.
 
 → Setup, issue sources, the severity x confidence routing matrix, the auto-fix protocol, batched patch releases, continuous monitoring (`/loop`, `/schedule`), and the every-Nth-cycle self-improvement experiment are in `skills/heimdall/references/maintainer-guide.md`. **Read it when `/hmd:maintain` or `/hmd:maintain-check` runs**, or when the user asks Heimdall to watch a repo.
