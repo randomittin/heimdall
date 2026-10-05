@@ -90,6 +90,7 @@ import json
 import math
 import os
 import re
+import secrets
 import threading
 import time
 import urllib.error
@@ -122,6 +123,11 @@ TICKETS_CAP = 100                 # receipt ids remembered
 EVENT_QUEUE_CAP = 32              # events waiting for the worker; the oldest is dropped when full
 LOCK_REL = os.path.join(".heimdall", "app", "push-sender.lock")
 STORE_REL = os.path.join(".heimdall", "app", "push.json")
+TEST_REQUEST_REL = os.path.join(".heimdall", "app", "push-test")          # `hmd app push-test` -> the sender
+TEST_RESULT_REL = os.path.join(".heimdall", "app", "push-test.result")    # the sender -> `hmd app push-test`
+TEST_REQUEST_TTL_S = 60.0         # a request written longer ago than this is never served
+TEST_REQUEST_SKEW_S = 30.0        # ... nor one dated further ahead of this clock than this
+TEST_FILE_CAP = 4096              # a request or a result is a few hundred bytes; a bigger file is not ours
 
 DEFAULTS = {
     "coalesce_s": 5.0,            # spec 7.5: a non-approval candidate waits this long for a better one
@@ -156,6 +162,9 @@ _REF_RE = re.compile(r"[0-9a-f]{16}")
 _TOKEN_RE = re.compile(r"(?:ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]{8,64}\]")
 _CODE_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
 _ISO_UTC_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_REQUEST_ID_RE = re.compile(r"[0-9a-f]{16}")
+_DEVICE_RE = re.compile(r"[0-9a-f]{8}")
+_TEST_SUPPRESSED = ("rate-limited",)      # the only reason a test is answered "not sent" besides an Expo / back-off detail
 
 
 def enabled(environ=None):
@@ -685,11 +694,115 @@ def _devices_from(raw):
         if not (isinstance(token, str) and _TOKEN_RE.fullmatch(token)) or _fingerprint(token) in devices:
             continue
         wanted = [k for k in _list(item.get("events")) if k in _PUSH_KINDS]
+        platform = item.get("platform")
         devices[_fingerprint(token)] = {"token": token, "ref": item.get("ref"), "label": item.get("label"),
+                                        "platform": platform if platform in ("ios", "android") else None,
                                         "events": frozenset(wanted) if wanted else _PUSH_KINDS}
     state = raw.get("app_state")
     return {"devices": devices, "app_state": state if state in ("foreground", "background", "unknown") else "unknown",
             "app_state_at": _iso_epoch(raw.get("app_state_at"))}
+
+
+# ── operator test: `hmd app push-test` asks the sender for one `test` message per device ──────────
+# The module docstring says why it is a request and not a send. These are the two files and the five functions
+# both sides use; PushMonitor._serve_test is the sender's half.
+def _read_small_json(path):
+    """The JSON object in `path`, or None: a missing, oversized, unparsable or non-object file is simply no record."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(TEST_FILE_CAP + 1)
+    except OSError:
+        return None
+    if len(raw) > TEST_FILE_CAP:
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _write_private_json(path, obj):
+    """Replace `path` with `obj`, atomically and privately: a fully written, fsynced 0600 temp file renamed into
+    place, so a reader sees the old file or the new one and never half of either. Raises OSError."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = "%s.tmp-%d-%s" % (path, os.getpid(), secrets.token_hex(4))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(obj, sort_keys=True, separators=(",", ":")))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def registered_devices(root, store=None):
+    """[{"device": <8 hex of sha256(token)>, "platform": "ios" | "android" | None}] for every registered token the
+    sender would send to, in registry order -- what `hmd app push-test` counts and lists. Never a token. `store`
+    reads the registry (default bin/lib/companion_push_store.py, whose load() never raises: no registry is no
+    devices); raises RuntimeError when that module cannot be loaded."""
+    store = store if store is not None else _load_sibling("companion_push_store")
+    if store is None:
+        raise RuntimeError("bin/lib/companion_push_store.py could not be loaded")
+    data = _devices_from(store.load(root))
+    return [{"device": fp, "platform": rec["platform"]} for fp, rec in (data["devices"] if data else {}).items()]
+
+
+def request_test(root, now=None):
+    """Ask the sender of this repo for a test notification: write the request it watches, return its id (16 hex).
+    Raises OSError when the request cannot be written."""
+    request_id = secrets.token_hex(8)
+    _write_private_json(os.path.join(root, TEST_REQUEST_REL),
+                        {"v": 1, "id": request_id, "at": int(time.time() if now is None else now)})
+    return request_id
+
+
+def withdraw_test_request(root, request_id):
+    """Remove the request when it is still `request_id`'s -- nobody picked it up, so a sender that starts later
+    must not find it. Another request's file is left alone."""
+    path = os.path.join(root, TEST_REQUEST_REL)
+    held = _read_small_json(path)
+    if held is not None and held.get("id") == request_id:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def read_test_request(root, now):
+    """The request a sender should serve, {"id", "at"}, or None: well-formed, written no more than
+    TEST_REQUEST_TTL_S before `now` (or TEST_REQUEST_SKEW_S after it), and not yet answered -- a result for its id,
+    "sending" included, means some sender has it."""
+    held = _dict(_read_small_json(os.path.join(root, TEST_REQUEST_REL)))
+    request_id, at = held.get("id"), _num(held.get("at"))
+    if not (isinstance(request_id, str) and _REQUEST_ID_RE.fullmatch(request_id)) or at is None:
+        return None
+    if not -TEST_REQUEST_SKEW_S <= now - at <= TEST_REQUEST_TTL_S:
+        return None
+    if read_test_result(root, request_id) is not None:
+        return None
+    return {"id": request_id, "at": at}
+
+
+def read_test_result(root, request_id):
+    """The sender's answer to `request_id` -- {"state": "sending" | "done", "results": [{"device", "ok", "detail",
+    "suppressed"}]} -- or None when there is none yet. Every field is re-validated on the way in: a result file is
+    only ever read, never trusted."""
+    held = _read_small_json(os.path.join(root, TEST_RESULT_REL))
+    if held is None or held.get("id") != request_id or held.get("state") not in ("sending", "done"):
+        return None
+    results = []
+    for item in _list(held.get("results")):
+        item = _dict(item)
+        device, ok, detail, suppressed = item.get("device"), item.get("ok"), item.get("detail"), item.get("suppressed")
+        if not (isinstance(device, str) and _DEVICE_RE.fullmatch(device) and isinstance(ok, bool)):
+            continue
+        results.append({"device": device, "ok": ok,
+                        "detail": detail if isinstance(detail, str) and _CODE_RE.fullmatch(detail) else None,
+                        "suppressed": suppressed if suppressed in _TEST_SUPPRESSED else None})
+    return {"state": held["state"], "results": results}
 
 
 class PushMonitor:
@@ -721,6 +834,9 @@ class PushMonitor:
         self._stop = threading.Event()
         self._thread = None
         self._pending = collections.deque(maxlen=EVENT_QUEUE_CAP)   # (detected_at, event); the oldest falls off when full
+        self._tests = collections.deque(maxlen=EVENT_QUEUE_CAP)     # request ids of `hmd app push-test`, waiting for the worker
+        self._test_stamp = None         # (mtime, size, inode) of the request file as last looked at
+        self._test_last = None          # id of the last request queued: a touched file is not served twice
         self._last_ts = None
         self._devices = {}              # fingerprint -> runtime record (window, last_sent, hourly counters)
         self._ready = []                # approvals to send in this step: (fingerprint, event)
@@ -738,6 +854,7 @@ class PushMonitor:
             return
         try:
             now = self._clock() if now is None else now
+            self._watch_test_request()
             ts = state.get("ts") if isinstance(state, dict) else None
             with self._cv:
                 if _num(ts) is not None:
@@ -748,12 +865,38 @@ class PushMonitor:
                 if not events:
                     return
                 self._pending.extend((now, event) for event in events)
-                if self._start_thread and (self._thread is None or not self._thread.is_alive()):
-                    self._thread = threading.Thread(target=self._run, name="hmd-push", daemon=True)
-                    self._thread.start()
-                self._cv.notify()
+                self._wake_locked()
         except Exception as exc:
             self._error_once("observe", exc)
+
+    def _watch_test_request(self):
+        """One stat() of the operator's request file per observed state. A request that is new -- a different stamp,
+        then a fresh, well-formed, unanswered id -- is queued for the worker, which decides the rest."""
+        try:
+            st = os.stat(os.path.join(self.root, TEST_REQUEST_REL))
+        except OSError:
+            return
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        with self._cv:
+            if stamp == self._test_stamp:
+                return
+            self._test_stamp = stamp
+        request = read_test_request(self.root, self._clock())
+        if request is None:
+            return
+        with self._cv:
+            if request["id"] == self._test_last:
+                return
+            self._test_last = request["id"]
+            self._tests.append(request["id"])
+            self._wake_locked()
+
+    def _wake_locked(self):
+        """Make sure the worker thread is running and tell it there is work. The caller holds self._cv."""
+        if self._start_thread and (self._thread is None or not self._thread.is_alive()):
+            self._thread = threading.Thread(target=self._run, name="hmd-push", daemon=True)
+            self._thread.start()
+        self._cv.notify()
 
     def close(self):
         """Stop the worker and give up the sender role. Safe to call twice."""
