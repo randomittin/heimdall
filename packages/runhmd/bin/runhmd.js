@@ -25,6 +25,15 @@
  * fetching over the network. The sha256 assertion runs identically against the local bytes —
  * point it at a file + a matching RUNHMD_SHA256 to prove the run path, or a mismatching one to
  * prove the abort.
+ *
+ * Zero footprint: `attack` and `demo --offline` are the trial path - a stranger runs them once to see
+ * what runhmd does - so they leave nothing behind. They run with HOME (and every override that would
+ * walk past it: HEIMDALL_HOME, CLAUDE_CONFIG_DIR, HEIMDALL_LAUNCH_AGENTS_DIR, HEIMDALL_TEAM_DIR)
+ * redirected into one temp dir that is removed when the command ends; the pinned installer, if it has
+ * to run, installs there and runs from an empty work dir, with the LaunchAgent schedule off and Python
+ * bytecode writing off. A temp dir inside, or an --out aimed at, ~/.zshrc and its siblings,
+ * ~/Library/LaunchAgents or ~/.claude is refused with exit 2 before anything runs. Every other
+ * subcommand keeps the installer's normal footprint (see README). test/zero-footprint.test.sh proves it.
  */
 
 const fs = require('fs');
@@ -43,6 +52,9 @@ const TAG = process.env.RUNHMD_TAG || meta.tag;
 const URL = process.env.RUNHMD_INSTALL_URL || meta.installScriptUrl;
 const EXPECTED_SHA = (process.env.RUNHMD_SHA256 || meta.sha256 || '').toLowerCase();
 const LOCAL_OVERRIDE = process.env.RUNHMD_INSTALL_SCRIPT;
+// The real home, read before zero-footprint mode redirects HOME; ZF is that mode's state (null = off).
+const REAL_HOME = os.homedir();
+let ZF = null;
 
 function die(msg) {
   process.stderr.write('runhmd: ' + msg + '\n');
@@ -53,6 +65,13 @@ function die(msg) {
 // can tell it apart from the verification and refusal output, which must match runheimdall's.
 function note(msg) {
   process.stderr.write('runhmd: note: ' + msg + '\n');
+}
+
+// Exit 2 (usage/config) is the refusal code across the runhmd tools. die() stays exactly as
+// runheimdall.js has it - the parity test compares it - so zero-footprint refusals use their own.
+function refuse(msg) {
+  process.stderr.write('runhmd: ' + msg + '\n');
+  process.exit(2);
 }
 
 function sha256(buf) {
@@ -147,7 +166,7 @@ function runScript(buf) {
   fs.writeFileSync(scriptPath, buf, { mode: 0o700 });
   let result;
   try {
-    result = spawnSync('bash', [scriptPath], { stdio: 'inherit', env: process.env });
+    result = spawnSync('bash', [scriptPath], { stdio: 'inherit', env: process.env, cwd: ZF ? ZF.work : undefined });
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { /* best effort cleanup */ }
   }
@@ -195,6 +214,103 @@ function route(args, subcommands, dflt) {
   return [dflt].concat(args);
 }
 
+// ── zero-footprint mode ──────────────────────────────────────────────────────
+
+// What a trial run must never touch in the real home: the shell profiles the installer appends its
+// PATH line to, LaunchAgents (a HOME redirect does not isolate launchd), and Claude Code's settings.
+const PROTECTED_FILES = ['.zshrc', '.zprofile', '.zshenv', '.bashrc', '.bash_profile', '.profile'];
+const PROTECTED_TREES = [path.join('Library', 'LaunchAgents'), '.claude'];
+// Overrides the installer and hmd honour INSTEAD of $HOME: left in the environment they walk straight
+// past the redirect (a Claude Code user very likely has CLAUDE_CONFIG_DIR set).
+const HOME_OVERRIDES = ['HEIMDALL_HOME', 'HEIMDALL_TEAM_DIR', 'HEIMDALL_LAUNCH_AGENTS_DIR', 'CLAUDE_CONFIG_DIR'];
+
+function wantsZeroFootprint(hmdArgs) {
+  return hmdArgs[0] === 'attack' || (hmdArgs[0] === 'demo' && hmdArgs.indexOf('--offline') !== -1);
+}
+
+// realpath of the deepest ancestor that exists, plus the part that does not exist yet.
+function resolveLoose(p) {
+  let head = path.resolve(p);
+  const rest = [];
+  while (true) {
+    try {
+      return path.join.apply(path, [fs.realpathSync(head)].concat(rest));
+    } catch (e) {
+      const parent = path.dirname(head);
+      if (parent === head) {
+        return path.resolve(p);
+      }
+      rest.unshift(path.basename(head));
+      head = parent;
+    }
+  }
+}
+
+// Which protected location (as the user would write it) p is, or lies inside; null if none.
+function protectedReason(p) {
+  const target = resolveLoose(p);
+  for (let i = 0; i < PROTECTED_FILES.length; i++) {
+    if (target === resolveLoose(path.join(REAL_HOME, PROTECTED_FILES[i]))) {
+      return '~/' + PROTECTED_FILES[i];
+    }
+  }
+  for (let i = 0; i < PROTECTED_TREES.length; i++) {
+    const tree = resolveLoose(path.join(REAL_HOME, PROTECTED_TREES[i]));
+    if (target === tree || target.indexOf(tree + path.sep) === 0) {
+      return '~/' + PROTECTED_TREES[i];
+    }
+  }
+  return null;
+}
+
+// The directories handed to --out: `--out DIR` and `--out=DIR`.
+function outTargets(args) {
+  const found = [];
+  args.forEach(function (a, i) {
+    if (a === '--out' && i + 1 < args.length) {
+      found.push(args[i + 1]);
+    } else if (a.indexOf('--out=') === 0) {
+      found.push(a.slice('--out='.length));
+    }
+  });
+  return found;
+}
+
+// Refuse (exit 2) anything that would write a protected path, then move the whole run into a temp dir
+// that is removed when this process exits - on every path out, die() and refuse() included.
+function enterZeroFootprint(hmdArgs) {
+  const tmpInside = protectedReason(os.tmpdir());
+  if (tmpInside) {
+    refuse('zero-footprint: the temporary directory (' + os.tmpdir() + ') is inside ' + tmpInside + ' - refusing to create anything there. Point TMPDIR somewhere else.');
+  }
+  outTargets(hmdArgs).forEach(function (out) {
+    const why = protectedReason(out);
+    if (why) {
+      refuse('zero-footprint: --out ' + out + ' would write into ' + why + ' - refusing. Pick another directory.');
+    }
+  });
+
+  let root;
+  try {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'runhmd-zf-'));
+  } catch (e) {
+    die('cannot create a temporary directory under ' + os.tmpdir() + ': ' + e.message);
+  }
+  ['home', 'work', 'tmp'].forEach(function (d) { fs.mkdirSync(path.join(root, d)); });
+  process.on('exit', function () {
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch (e) { /* the OS reaps its temp dir */ }
+  });
+
+  HOME_OVERRIDES.forEach(function (name) { delete process.env[name]; });
+  process.env.HOME = path.join(root, 'home');
+  process.env.TMPDIR = path.join(root, 'tmp');
+  process.env.HEIMDALL_NO_DREAM_SCHEDULE = '1';
+  process.env.PYTHONDONTWRITEBYTECODE = '1';
+  // The node that is running this wrapper stays first: a shim that finds its versions through $HOME cannot.
+  process.env.PATH = path.dirname(process.execPath) + path.delimiter + (process.env.PATH || '');
+  return { root: root, home: path.join(root, 'home'), work: path.join(root, 'work') };
+}
+
 // ── hmd discovery ────────────────────────────────────────────────────────────
 
 function isExecutableFile(p) {
@@ -209,15 +325,12 @@ function isExecutableFile(p) {
 // PATH first, then where the installer links it (~/.local/bin/hmd) and where it lives
 // (~/.heimdall/bin/heimdall) — a fresh install is usable in this very process even though the
 // PATH line it appended to the shell profile only reaches NEW shells.
-function findHmd() {
-  const home = os.homedir();
-  const candidates = (process.env.PATH || '').split(path.delimiter)
-    .filter(Boolean)
-    .map(function (dir) { return path.join(dir, 'hmd'); })
-    .concat([
-      path.join(home, '.local', 'bin', 'hmd'),
-      path.join(home, '.heimdall', 'bin', 'heimdall')
-    ]);
+function findHmd(homes, searchPath) {
+  const dirs = searchPath === false ? [] : (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const candidates = dirs.map(function (dir) { return path.join(dir, 'hmd'); });
+  (homes || [os.homedir()]).forEach(function (home) {
+    candidates.push(path.join(home, '.local', 'bin', 'hmd'), path.join(home, '.heimdall', 'bin', 'heimdall'));
+  });
   for (let i = 0; i < candidates.length; i++) {
     if (isExecutableFile(candidates[i])) {
       return candidates[i];
@@ -257,7 +370,7 @@ function installedVersion(hmd) {
 // first when there is none. An hmd older than the pin is never run: a release that predates a
 // subcommand treats it as a free-text task prompt and starts an agent session instead.
 async function ensureHmd(pinned) {
-  let hmd = findHmd();
+  let hmd = findHmd(ZF ? [REAL_HOME] : undefined);   // zero-footprint: HOME is already the temp dir, so look in the real one
   let have = hmd ? installedVersion(hmd) : null;
   if (hmd && have && compareVersions(have, pinned) >= 0) {
     return hmd;
@@ -270,16 +383,21 @@ async function ensureHmd(pinned) {
   } else {
     note('installed hmd ' + formatVersion(have) + ' is older than the ' + TAG + " this runhmd is pinned to — running the pinned installer first.");
   }
-  note('same installer and footprint as `npx runheimdall`: ~/.heimdall, ~/.local/bin, a PATH line in your shell profile, Claude Code settings, and on macOS a nightly LaunchAgent (HEIMDALL_NO_DREAM_SCHEDULE=1 skips it). `hmd uninstall` reverses it.');
+  if (ZF) {
+    note('zero-footprint: installing into a throwaway directory (' + ZF.root + ', removed when this command ends) - nothing is written to your home directory, shell profile, LaunchAgents or Claude Code settings.');
+  } else {
+    note('same installer and footprint as `npx runheimdall`: ~/.heimdall, ~/.local/bin, a PATH line in your shell profile, Claude Code settings, and on macOS a nightly LaunchAgent (HEIMDALL_NO_DREAM_SCHEDULE=1 skips it). `hmd uninstall` reverses it.');
+  }
 
   const status = runScript(await verifiedScript());
   if (status !== 0) {
     die('installer exited with status ' + status + ' — not running hmd.');
   }
 
-  hmd = findHmd();
+  // zero-footprint: the installer ran with HOME = the temp dir, so what it installed is there and only there
+  hmd = ZF ? findHmd([ZF.home], false) : findHmd();
   if (!hmd) {
-    die('the installer finished but no hmd was found (looked on PATH, in ~/.local/bin and in ~/.heimdall/bin).');
+    die('the installer finished but no hmd was found (looked ' + (ZF ? 'in ' + ZF.home + '/.local/bin and ' + ZF.home + '/.heimdall/bin' : 'on PATH, in ~/.local/bin and in ~/.heimdall/bin') + ').');
   }
   have = installedVersion(hmd);
   if (!have || compareVersions(have, pinned) < 0) {
@@ -339,6 +457,9 @@ async function main() {
     die('the pinned release "' + TAG + '" is not a vX.Y.Z version');
   }
 
+  if (wantsZeroFootprint(hmdArgs)) {
+    ZF = enterZeroFootprint(hmdArgs);
+  }
   const hmd = await ensureHmd(pinned);
   const result = spawnSync(hmd, hmdArgs, { stdio: 'inherit', env: process.env });
   if (result.error) {
