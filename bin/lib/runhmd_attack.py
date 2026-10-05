@@ -72,7 +72,10 @@ options:
   --no-upload       with --receipt, do not publish it: receipt_url stays null (it is still stored locally)
   --out DIR         write verdict.json and attacks/f-NNNN.json evidence into DIR
   --batch FILE      attack every target listed in FILE (one per line, # comments); needs --out
-  --diff SPEC       attack a diff: NOT SUPPORTED in this build (arrives with the gitdiff adapter)
+  --diff SPEC       attack a change instead of a checkout: a patch file, BASE..HEAD, BASE...HEAD or - (a patch on
+                    stdin; needs --yes). It is applied to the git repository at <path> (default .) in a throwaway
+                    copy, through the gitdiff adapter (docs/ADAPTERS.md); the attack surface is the one <path>
+                    declares in that copy. A patch applies on the repo's HEAD; a range names its own base.
   -h, --help        this text
 
 receipts: with --receipt the receipt is stored as <id>.json under $RUNHMD_RECEIPT_DIR (default
@@ -217,9 +220,9 @@ def _run_gate(target, work):
     return report, None
 
 
-def _verdict(report, ref, started, evidence_prefix, tree):
+def _verdict(report, ref, started, evidence_prefix, tree, subject=None):
     metrics = report["metrics"]
-    repro = "hmd attack %s --json --yes" % shlex.quote(ref)
+    repro = subject["repro"] if subject else "hmd attack %s --json --yes" % shlex.quote(ref)
     findings = []
     for index, found in enumerate(metrics["findings"], start=1):
         fid = "f-%04d" % index
@@ -233,12 +236,13 @@ def _verdict(report, ref, started, evidence_prefix, tree):
         "schema": "runhmd.verdict/1",
         "id": hashlib.sha256(("%s|%s|%s" % (metrics["suite"], metrics["profile"], tree)).encode()).hexdigest()[:12],
         "verdict": "PROVEN" if report["status"] == "pass" else "DENIED",
-        "target": {"kind": "path", "ref": ref, "head_sha": _git_head(ref)},
+        "target": ({"kind": subject["kind"], "ref": subject["ref"], "head_sha": subject["head_sha"]} if subject
+                   else {"kind": "path", "ref": ref, "head_sha": _git_head(ref)}),
         "attacks": metrics["attacks"],
         "findings": findings,
         "cost_usd": 0.0,
         "duration_s": round(time.monotonic() - started, 2),
-        "agent": {"name": "none", "model": None},
+        "agent": {"name": subject["agent"] if subject else "none", "model": None},
         "receipt_url": None,
     }
 
@@ -281,36 +285,39 @@ def _issue_receipt(doc, tree, receipt):
     return None
 
 
-def _attack_one(ref, out_layout, receipt=None):
+def _attack_one(ref, out_layout, receipt=None, subject=None):
     """Attack one target. Returns (verdict doc, None, exit code) or (None, error doc, exit code).
 
     out_layout: None, or (verdict_path, evidence_dir, evidence_ref_prefix) for --out.
     receipt: None, or the context _receipt_setup built: the verdict then gets a signed receipt.
+    subject: None, or the diff under attack (_run_diff builds it): `ref` is then a private checkout of
+    base + diff, and the verdict and every error name the diff rather than that temp path.
     """
+    shown = subject["ref"] if subject else ref
     if not os.path.exists(ref):
-        return None, {"error": "target_not_found", "detail": "no such file or directory: %s" % ref, "target": ref}, EXIT_USAGE
+        return None, {"error": "target_not_found", "detail": "no such file or directory: %s" % shown, "target": shown}, EXIT_USAGE
     started = time.monotonic()
     work = tempfile.mkdtemp(prefix="runhmd-attack-")
     try:
         report, err = _run_gate(ref, work)
         if err:
-            return None, dict(err, target=ref), EXIT_INFRA
+            return None, dict(err, target=shown), EXIT_INFRA
         if report.get("status") == "error":
             kind = (report.get("metrics") or {}).get("error_kind", "infra")
             detail = (report.get("first_divergence") or {}).get("actual") or report.get("fix_hint") or kind
-            return None, {"error": kind, "detail": detail, "target": ref}, EXIT_USAGE if kind in _USAGE_KINDS else EXIT_INFRA
+            return None, {"error": kind, "detail": detail, "target": shown}, EXIT_USAGE if kind in _USAGE_KINDS else EXIT_INFRA
         if report.get("status") not in ("pass", "fail"):
-            return None, {"error": "infra", "detail": "the attack gate reported an unknown status %r" % report.get("status"), "target": ref}, EXIT_INFRA
+            return None, {"error": "infra", "detail": "the attack gate reported an unknown status %r" % report.get("status"), "target": shown}, EXIT_INFRA
         tree = _tree_digest(ref)
-        doc = _verdict(report, ref, started, out_layout[2] if out_layout else None, tree)
+        doc = _verdict(report, ref, started, out_layout[2] if out_layout else None, tree, subject)
         if receipt:
             failure = _issue_receipt(doc, tree, receipt)
             if failure:
-                return None, dict(failure, target=ref), EXIT_INFRA
+                return None, dict(failure, target=shown), EXIT_INFRA
         problems = runhmd_schema.validate(doc)
         if problems:
             return None, {"error": "infra", "detail": "internal error: the verdict violates runhmd.verdict/1: " + "; ".join(problems[:3]),
-                          "target": ref}, EXIT_INFRA
+                          "target": shown}, EXIT_INFRA
         if out_layout:
             verdict_path, evidence_dir, _ = out_layout
             for found, mine in zip(report["metrics"]["findings"], doc["findings"]):
@@ -345,11 +352,11 @@ def _show_card(doc, as_json):
     (sys.stderr if as_json else sys.stdout).write(runhmd_card.render_card(doc))
 
 
-def _run_single(args, ref, receipt):
+def _run_single(args, ref, receipt, subject=None):
     layout = None
     if args.out:
         layout = (os.path.join(args.out, "verdict.json"), os.path.join(args.out, "attacks"), "attacks/")
-    doc, err, code = _attack_one(ref, layout, receipt)
+    doc, err, code = _attack_one(ref, layout, receipt, subject)
     if err:
         _emit(err, args.json, "hmd attack: %s: %s" % (err["error"], err["detail"]))
         return code
@@ -362,6 +369,51 @@ def _run_single(args, ref, receipt):
     for path in (receipt or {}).get("paths", []):
         sys.stderr.write("receipt: %s\n" % path)
     return code
+
+
+_ADAPTER_USAGE_KINDS = {"bad_task", "bad_diff", "empty_diff", "unknown_base", "unknown_head", "too_large"}
+
+
+def _adapters():
+    """The adapters package sits at the repo root beside bin/ (docs/ADAPTERS.md); only --diff needs it."""
+    if PLUGIN_DIR not in sys.path:
+        sys.path.insert(0, PLUGIN_DIR)
+    from adapters import AdapterError, _common, gitdiff
+    return AdapterError, _common, gitdiff
+
+
+def _run_diff(args, repo_arg, spec, receipt):
+    """Attack a change: the gitdiff adapter claims `spec` (a patch file, a range or stdin) against the git
+    repository at `repo_arg`, the claimed diff is applied to its base in a private copy, and that copy is
+    attacked. The caller's repository is only ever read."""
+    AdapterError, common, gitdiff = _adapters()
+
+    def read_stdin():
+        raw = sys.stdin.buffer.read()
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise AdapterError("bad_diff", "the patch on stdin is not valid UTF-8 text")
+
+    work = tempfile.mkdtemp(prefix="runhmd-diff-")
+    try:
+        try:
+            task = gitdiff.task_for_spec(repo_arg, spec, read_stdin=read_stdin)
+            claim = gitdiff.claim(gitdiff.start(task))
+            checkout = os.path.join(work, "tree")
+            common.materialize(task["repo"], task["base_sha"], claim["diff"], checkout)
+            inside = os.path.relpath(os.path.realpath(task["repo"]), os.path.realpath(common.toplevel(task["repo"])))
+        except AdapterError as exc:
+            _emit({"error": exc.kind, "detail": exc.detail, "target": spec}, args.json, "hmd attack: --diff %s: %s: %s" % (spec, exc.kind, exc.detail))
+            return EXIT_USAGE if exc.kind in _ADAPTER_USAGE_KINDS else EXIT_INFRA
+        except OSError as exc:
+            _emit({"error": "infra", "detail": "cannot prepare the change: %s" % exc, "target": spec}, args.json, "hmd attack: --diff %s: cannot prepare the change: %s" % (spec, exc))
+            return EXIT_INFRA
+        subject = {"kind": "diff", "ref": spec, "head_sha": claim["head_sha"], "agent": gitdiff.AGENT,
+                   "repro": "hmd attack %s --diff %s --json --yes" % (shlex.quote(repo_arg), shlex.quote(spec))}
+        return _run_single(args, os.path.normpath(os.path.join(checkout, inside)), receipt, subject)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _run_batch(args, refs, receipt):
@@ -394,9 +446,15 @@ def main(argv):
     args = _parser().parse_args(argv)
 
     if args.diff is not None:
-        sys.stderr.write("hmd attack: --diff is not supported in this build: attacking a diff needs the gitdiff adapter (RP9). "
-                         "Apply the change to a checkout and attack that path.\n")
-        return EXIT_USAGE
+        if args.batch is not None:
+            sys.stderr.write("hmd attack: --diff attacks one change; it cannot be combined with --batch\n")
+            return EXIT_USAGE
+        if len(args.targets) > 1:
+            sys.stderr.write("hmd attack: --diff takes at most one repository path\n")
+            return EXIT_USAGE
+        if args.diff == "-" and not args.yes:
+            sys.stderr.write("hmd attack: --diff - reads the patch from stdin, so it cannot also ask for consent there: pass --yes\n")
+            return EXIT_USAGE
     cap = None
     if args.max_usd is not None:
         try:
@@ -434,13 +492,16 @@ def main(argv):
 
     # Everything above is a usage check and touches nothing (--receipt only READS the signing key).
     # From here a target is looked at and its code is run, so consent comes first.
-    if not _consent(args, targets or ["(each target listed in %s)" % args.batch]):
+    shown_targets = ["%s, changed by --diff %s" % (targets[0], args.diff)] if args.diff is not None else targets or ["(each target listed in %s)" % args.batch]
+    if not _consent(args, shown_targets):
         return EXIT_CONSENT
     refs = _read_batch(args.batch) if args.batch is not None else targets
     over = enforce_budget(estimate_cost_usd(refs), cap)
     if over:
         _emit(over, args.json, "hmd attack: budget cap hit: estimated $%.2f exceeds --max-usd %.2f" % (over["spent_usd"], over["cap_usd"]))
         return EXIT_BUDGET
+    if args.diff is not None:
+        return _run_diff(args, refs[0], args.diff, receipt)
     return _run_batch(args, refs, receipt) if args.batch is not None else _run_single(args, refs[0], receipt)
 
 

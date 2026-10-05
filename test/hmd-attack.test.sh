@@ -466,7 +466,7 @@ attack fixtures/attack/clean-sample --max-usd abc --yes;  [ "$ARC" -eq 2 ] && ok
 attack fixtures/attack/clean-sample --max-usd -1 --yes;   [ "$ARC" -eq 2 ] && ok "--max-usd -1 exits 2" || bad "--max-usd -1 rc=$ARC"
 attack --batch "$TMP/none.txt" --yes;     [ "$ARC" -eq 2 ] && ok "--batch without --out exits 2" || bad "--batch without --out rc=$ARC"
 attack fixtures/attack/clean-sample --diff x.patch --yes
-[ "$ARC" -eq 2 ] && grep -qi 'adapter' "$AERR" && ok "--diff is refused with exit 2 and says it arrives with the adapters (RP9), not silently ignored" || bad "--diff handling wrong (rc=$ARC)"
+[ "$ARC" -eq 2 ] && grep -q 'x.patch' "$AERR" && ok "--diff with a patch file that does not exist is refused with exit 2 and names it (the working path is proven in test/adapter-gitdiff.test.sh)" || bad "--diff handling wrong (rc=$ARC)"
 attack https://github.com/org/repo/pull/123 --yes
 [ "$ARC" -eq 2 ] && grep -qi 'not supported' "$AERR" && ok "a PR URL is refused with exit 2 (needs network + adapters), nothing fetched" || bad "PR url handling wrong (rc=$ARC)"
 attack fixtures/attack/clean-sample --max-usd 0.50 --no-network --json --yes
