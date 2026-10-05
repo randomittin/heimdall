@@ -20,6 +20,7 @@
 #   B  `hmd app push-test` end to end against sender PROCESSES and a loopback fake Expo: per-token results, the exit
 #      codes (0 sent, 2 usage, 3 no device, 4 no sender, 5 push off, 6 all failed), the lock, restarts
 #   C  the same CLI against the real bin/heimdall-ui: its StateCache poller is what notices the request
+#   D  the CLI module's waiting rules and the wording of every outcome, against a stand-in for the sender
 #
 # Hermetic: HOME / HEIMDALL_HOME / TMPDIR are a temp dir, every sender talks to a loopback fake through
 # HMD_PUSH_EXPO_URL (the CLI is given it too, so a CLI that tried to send would hit the fake, never Expo), and
@@ -387,6 +388,21 @@ T.eq((sent_kinds(rig), [(e["kind"], e["ok"]) for e in events if e.get("event") =
 thread_monitor.close()
 rig.close()
 
+# while the send is in flight the answer already reads "sending": a slow sender is told apart from no sender
+rig = Rig(devices=TWO[:1])
+rig.fake.script = [{"hang": 2.0}]
+slow_monitor = CP.PushMonitor(rig.root, emit=lambda event: None, config={"min_run_s": 0, "timeout_s": 10.0},
+                              environ={"HMD_PUSH_EXPO_URL": rig.fake.url}, start_thread=True)
+rid = CP.request_test(rig.root)
+slow_monitor.observe(IDLE)
+T.check(wait_for(lambda: (answer(rig, rid) or ("",))[0] == "sending", 10),
+        "A8c. while Expo is slow to answer, the answer reads 'sending' (no results yet)", answer(rig, rid))
+T.check(wait_for(lambda: (answer(rig, rid) or ("",))[0] == "done", 30)
+        and answer(rig, rid) == ("done", [(fp(TOK1), True, None, None)]),
+        "A8d. and then 'done' with the device's outcome", answer(rig, rid))
+slow_monitor.close()
+rig.close()
+
 # ── A9. what the CLI uses: the registered devices, the request, its withdrawal, the paths ──
 rig = Rig()
 listed = CP.registered_devices(rig.root)
@@ -409,6 +425,26 @@ paths = CP.source_paths("/r")
 T.check("/r/.heimdall/app/push-test" in paths and "/r/.heimdall/app/push-test.result" in paths
         and "/r/.heimdall/app/push.json" in paths and "/r/.heimdall/app/push-sender.lock" in paths,
         "A9h. source_paths names everything the sender touches, the request and the result included", paths)
+
+
+def put_result(root, rid, state, results):
+    directory = os.path.join(root, ".heimdall", "app")
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, "push-test.result"), "w", encoding="utf-8") as f:
+        json.dump({"v": 1, "id": rid, "state": state, "results": results}, f)
+
+
+# a result file is only read, never trusted: junk entries are dropped, junk fields read as absent
+put_result(rig.root, "7" * 16, "done",
+           [{"device": "5e0c9a77", "ok": True, "detail": "x y z", "suppressed": "elsewhere"},
+            {"device": "NOT-HEX!", "ok": True, "detail": None, "suppressed": None},
+            {"device": "5e0c9a78", "ok": "yes", "detail": None, "suppressed": None}, "junk", 7, None])
+T.eq(CP.read_test_result(rig.root, "7" * 16),
+     {"state": "done", "results": [{"device": "5e0c9a77", "ok": True, "detail": None, "suppressed": None}]},
+     "A9i. a result's junk entries are dropped and its junk detail / suppressed read as absent")
+T.eq(CP.read_test_result(rig.root, "8" * 16), None, "A9j. a result for another request id is no answer")
+put_result(rig.root, "7" * 16, "finished", [])
+T.eq(CP.read_test_result(rig.root, "7" * 16), None, "A9k. a result in a state other than sending / done is no answer")
 rig.close()
 print("done")
 PYEOF
@@ -723,6 +759,20 @@ h = subprocess.run([BIN, "--help"], capture_output=True, text=True, timeout=60)
 T.check(h.returncode == 0 and "hmd app push-test" in h.stdout and "Exit codes (push-test)" in h.stdout,
         "B14b. `hmd app --help` documents push-test and its exit codes", h.stdout[-600:])
 c.close()
+
+# ── B15. an Expo outage is reported as its code; the sender's back-off is explained ──
+c = Case()
+c.fake.script = [{"status": 500, "body": {}}] * 4
+c.start_sender("a", {"config": {"retry_delays": [0.05, 0.05, 0.05]}})
+rc, out, err, _ = c.cli()
+T.eq(rc, 6, "B15a. Expo answering 500: every device failed, exit 6")
+T.check(line_for(out, fp(TOK1), "ios", "error: http-500"), "B15b. the line carries Expo's failure as a code", out)
+rc, out, err, _ = c.cli()
+T.eq(rc, 6, "B15c. the next test, inside the sender's back-off, is held back: exit 6")
+T.check(line_for(out, fp(TOK1), "ios", "error: backoff") and "holding back" in out,
+        "B15d. and its line says the sender is holding back", out)
+T.eq(len(c.fake.sends()), 4, "B15e. with nothing more POSTed")
+c.close()
 print("done")
 PYEOF
 run_part B "$TMPROOT/part_b.py"
@@ -832,6 +882,152 @@ fake.close()
 print("done")
 PYEOF
 run_part C "$TMPROOT/part_c.py"
+
+# ── D. the CLI module's waiting rules and wording, with a stand-in for the sender ─────────
+cat >"$TMPROOT/part_d.py" <<'PYEOF'
+import hashlib
+import io
+import json
+import os
+import re
+import sys
+import threading
+import time
+
+code, tmp = sys.argv[1], sys.argv[2]
+os.makedirs(tmp, exist_ok=True)
+sys.path.insert(0, os.path.join(code, "test", "lib"))
+import push_test_lib as T
+
+CP = T.load("companion_push", os.path.join(code, "bin", "lib", "companion_push.py"))
+STORE = T.load("companion_push_store", os.path.join(code, "bin", "lib", "companion_push_store.py"))
+CLI = T.load("companion_push_cli", os.path.join(code, "bin", "lib", "companion_push_cli.py"))
+TOKENS = [T.expo_token(c) for c in "abcd"]
+_n = [0]
+
+
+def fp(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+
+
+def repo(tokens=()):
+    _n[0] += 1
+    root = os.path.join(tmp, "repo%d" % _n[0])
+    os.makedirs(root)
+    for token, platform in zip(tokens, ("ios", "android", "ios", "android")):
+        STORE.register(root, token, platform)
+    return root
+
+
+def write_result(root, rid, state, results):
+    directory = os.path.join(root, ".heimdall", "app")
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, "push-test.result"), "w", encoding="utf-8") as f:
+        json.dump({"v": 1, "id": rid, "state": state, "results": results}, f)
+
+
+def stand_in(root, answers):
+    """Plays the sender for ONE request: waits for the request file, then writes `answers` -- [(state, results)] -- in order."""
+    def run():
+        path = os.path.join(root, ".heimdall", "app", "push-test")
+        end = time.monotonic() + 15
+        while time.monotonic() < end:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    held = json.load(f)
+            except (OSError, ValueError):
+                time.sleep(0.02)
+                continue
+            for state, results in answers:
+                write_result(root, held["id"], state, results)
+            return
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def cli_main(root, *args, env=None):
+    out = io.StringIO()
+    rc = CLI.main(["push-test", "--repo", root] + list(args), out=out, env={} if env is None else env)
+    return rc, out.getvalue()
+
+
+# ── D1. await_answer: the pickup deadline, the finish deadline, an answer that is already there ──
+CLI.PICKUP_S = 0.5
+root = repo()
+began = time.monotonic()
+got = CLI.await_answer(CP, root, "a" * 16, 5.0)
+took = time.monotonic() - began
+T.check(got is None and 0.4 <= took < 2.0, "D1a. nothing answers: it gives up at the pickup deadline, not after the whole wait (%.1f s)" % took)
+write_result(root, "b" * 16, "sending", [])
+began = time.monotonic()
+got = CLI.await_answer(CP, root, "b" * 16, 1.5)
+took = time.monotonic() - began
+T.check(got is not None and got["state"] == "sending" and 1.3 <= took < 3.0,
+        "D1b. a sender that took the request but is slow is waited for up to --wait, past the pickup deadline (%.1f s)" % took)
+write_result(root, "c" * 16, "done", [{"device": "5e0c9a77", "ok": True, "detail": None, "suppressed": None}])
+began = time.monotonic()
+got = CLI.await_answer(CP, root, "c" * 16, 5.0)
+T.check(got is not None and got["state"] == "done" and time.monotonic() - began < 0.5,
+        "D1c. an answer that is done is returned at once")
+
+# ── D2. --wait is a number of seconds in 1..120 ──
+good = [CLI.wait_seconds(t) for t in ("1", "120", "2.5")]
+bad = []
+for text in ("nan", "inf", "0.9", "120.1", "x", "", "-1"):
+    try:
+        CLI.wait_seconds(text)
+        bad.append(text)
+    except Exception:
+        continue
+T.check(good == [1.0, 120.0, 2.5] and bad == [], "D2. wait_seconds takes 1..120 and refuses everything else", (good, bad))
+
+# ── D3. a sender that took the request and never finished: exit 4, the request withdrawn ──
+root = repo(TOKENS[:1])
+stand_in(root, [("sending", [])])
+rc, out = cli_main(root, "--wait", "2")
+T.check(rc == 4 and "took the request but had not finished" in out, "D3a. a sender that never finishes: exit 4 and it says so", (rc, out))
+T.check(not os.path.exists(os.path.join(root, ".heimdall", "app", "push-test")), "D3b. and the request was withdrawn")
+
+# ── D4. the wording of every outcome, one line per device ──
+root = repo(TOKENS)
+unknown = "deadbeef"
+stand_in(root, [("done", [
+    {"device": fp(TOKENS[0]), "ok": True, "detail": None, "suppressed": None},
+    {"device": fp(TOKENS[1]), "ok": False, "detail": "paused", "suppressed": None},
+    {"device": fp(TOKENS[2]), "ok": False, "detail": "MessageTooBig", "suppressed": None},
+    {"device": fp(TOKENS[3]), "ok": False, "detail": None, "suppressed": "rate-limited"},
+    {"device": unknown, "ok": False, "detail": None, "suppressed": None}])])
+rc, out = cli_main(root, "--wait", "5")
+lines = {m.group(1): m.group(3) for m in re.finditer(r"^  ([0-9a-f]{8})  (\S+)\s+(.*)$", out, re.M)}
+T.eq(rc, 0, "D4a. one device accepted: exit 0")
+T.eq(lines, {fp(TOKENS[0]): "accepted",
+             fp(TOKENS[1]): "error: paused (the sender is paused after Expo refused its credentials)",
+             fp(TOKENS[2]): "error: MessageTooBig",
+             fp(TOKENS[3]): "not sent (rate-limited: 20 notifications per device per hour)",
+             unknown: "error: unknown"}, "D4b. each outcome in its own words: accepted, a hinted code, a bare code, rate-limited, unknown")
+T.check(re.search(r"^  %s  android  error: paused" % fp(TOKENS[1]), out, re.M) and re.search(r"^  %s  \?  " % unknown, out, re.M),
+        "D4c. the platform column comes from the registry; a device it does not know reads ?", out)
+T.check("1 of 5 accepted" in out, "D4d. the summary counts them", out)
+T.check(not any(t in out for t in TOKENS), "D4e. and no token is printed")
+
+# ── D5. nothing accepted: exit 6; an empty answer: exit 3; the switch: exit 5; usage: exit 2 ──
+root = repo(TOKENS[:1])
+stand_in(root, [("done", [{"device": fp(TOKENS[0]), "ok": False, "detail": "network", "suppressed": None}])])
+rc, out = cli_main(root, "--wait", "5")
+T.check(rc == 6 and "0 of 1 accepted" in out and "error: network (Expo could not be reached)" in out,
+        "D5a. nothing accepted: exit 6", (rc, out))
+root = repo(TOKENS[:1])
+stand_in(root, [("done", [])])
+rc, out = cli_main(root, "--wait", "5")
+T.check(rc == 3 and "no device registered" in out, "D5b. the sender found no device left: exit 3", (rc, out))
+rc, out = cli_main(repo(TOKENS[:1]), env={"HMD_PUSH": "0"})
+T.check(rc == 5 and "HMD_PUSH=0" in out, "D5c. HMD_PUSH=0: exit 5", (rc, out))
+T.check(CLI.main([], out=io.StringIO()) == 2 and CLI.main(["bogus"], out=io.StringIO()) == 2,
+        "D5d. no subcommand, or another one: exit 2")
+print("done")
+PYEOF
+run_part D "$TMPROOT/part_d.py"
 
 echo
 echo "$PASS passed, $FAIL failed"
