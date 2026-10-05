@@ -79,10 +79,14 @@ class Repo:
 
     def numstat(self, *args):
         """git's own `--numstat -z` for the same tree: [(path, add|None, del|None)], None for a binary file's `-`."""
-        out = self.git("diff", "--numstat", "-z", *args)
-        rows = []
-        for field in out.split("\0")[:-1]:
-            added, removed, path = field.split("\t", 2)
+        fields = self.git("diff", "--numstat", "-z", *args).split("\0")[:-1]
+        rows, i = [], 0
+        while i < len(fields):
+            added, removed, path = fields[i].split("\t", 2)
+            i += 1
+            if path == "":  # a rename: the next two fields are the old name and the new one
+                path = fields[i + 1]
+                i += 2
             rows.append((path, None if added == "-" else int(added), None if removed == "-" else int(removed)))
         return rows
 
