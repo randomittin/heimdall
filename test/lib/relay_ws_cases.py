@@ -77,7 +77,11 @@ def server_frame(opcode, payload=b"", fin=True, rsv=0, masked=False):
 
 
 def read_client_frame(data):
-    """(fin, opcode, payload, masked, consumed) of the first frame in `data`, the way a server reads one."""
+    """(fin, opcode, payload, masked, consumed) of the first frame in `data`, the way a server reads one;
+    all None when `data` holds no frame (nothing was sent), so a case reports that as a failure instead of
+    crashing on it."""
+    if len(data) < 2:
+        return None, None, None, None, 0
     first, second = data[0], data[1]
     n, i = second & 0x7F, 2
     if n == 126:
@@ -324,8 +328,8 @@ def main():
     payload_256, payload_64k = b"a" * 256, b"b" * 65536
     _, conn = connection(mod, server_frame(1, payload_256) + server_frame(1, payload_64k),
                          max_message=70000, max_total=200000)
-    check(receive_all(conn) == [("text", payload_256.decode()), ("text", payload_64k.decode())],
-          "decode: the 16-bit and the 64-bit length forms are read")
+    check(receive_all(conn, rounds=2) == [("text", payload_256.decode()), ("text", payload_64k.decode())],
+          "decode: the 16-bit and the 64-bit length forms are read (the second frame spans two reads)")
 
     euro = "café €".encode("utf-8")
     _, conn = connection(mod, server_frame(1, euro[:4], fin=False) + server_frame(0, euro[4:]))
@@ -333,22 +337,26 @@ def main():
           "decode: a multibyte character split across two fragments is decoded whole")
 
     # -- frames a client must refuse -------------------------------------------------------------------
+    # each is refused FOR ITS OWN REASON: the error names it, so a check that is gone cannot hide behind the
+    # garbage it lets through failing some other check further on
     forbidden = {
-        "a masked frame from the server": server_frame(1, b"x", masked=True),
-        "a reserved bit set": server_frame(1, b"x", rsv=0x40),
-        "a reserved opcode": server_frame(3, b"x"),
-        "a control frame over 125 bytes": bytes([0x89, 126]) + struct.pack("!H", 126) + b"x" * 126,
-        "a fragmented control frame": server_frame(9, b"x", fin=False),
-        "a continuation with nothing to continue": server_frame(0, b"x"),
-        "a new data frame in the middle of a fragmented message": server_frame(1, b"a", fin=False) + server_frame(1, b"b"),
-        "a text message that is not UTF-8": server_frame(1, b"\xff\xfe"),
-        "a 64-bit length with the top bit set": bytes([0x82, 127]) + struct.pack("!Q", 1 << 63),
-        "a close frame with a one-byte payload": server_frame(8, b"x"),
+        "a masked frame from the server": ("masked", server_frame(1, b"x", masked=True)),
+        "a reserved bit set": ("reserved bit", server_frame(1, b"x", rsv=0x40)),
+        "a reserved opcode": ("reserved opcode", server_frame(3, b"x")),
+        "a control frame over 125 bytes": ("control frame", bytes([0x89, 126]) + struct.pack("!H", 126) + b"x" * 126),
+        "a fragmented control frame": ("control frame", server_frame(9, b"x", fin=False)),
+        "a continuation with nothing to continue": ("continuation", server_frame(0, b"x")),
+        "a new data frame in the middle of a fragmented message":
+            ("middle of a fragmented", server_frame(1, b"a", fin=False) + server_frame(1, b"b")),
+        "a text message that is not UTF-8": ("UTF-8", server_frame(1, b"\xff\xfe")),
+        "a 64-bit length with the top bit set": ("top bit", bytes([0x82, 127]) + struct.pack("!Q", 1 << 63)),
+        "a close frame with a one-byte payload": ("one-byte", server_frame(8, b"x")),
     }
-    for what, wire in forbidden.items():
+    for what, (named, wire) in forbidden.items():
         _, conn = connection(mod, wire)
         err = raises(Exception, lambda conn=conn: conn.receive(1.0))
-        check(isinstance(err, mod.WsProtocolError), "decode: refused -- %s" % what, repr(err))
+        check(isinstance(err, mod.WsProtocolError) and named in str(err),
+              "decode: refused -- %s" % what, repr(err))
 
     # -- the bounds -------------------------------------------------------------------------------------
     sock, conn = connection(mod, bytes([0x81, 126]) + struct.pack("!H", 1001), max_message=1000)
@@ -461,4 +469,10 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    except Exception as exc:  # a module broken badly enough to crash a case is a red run, said as one
+        check(False, "the cases ran to the end", "%s: %s" % (type(exc).__name__, exc))
+        print("\n%d passed, %d failed" % (PASSED, FAILED))
+        code = 1
+    sys.exit(code)

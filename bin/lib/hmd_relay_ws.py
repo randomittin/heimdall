@@ -41,6 +41,7 @@ prove it can fail.
 """
 
 import base64
+import contextlib
 import functools
 import hashlib
 import http.client
