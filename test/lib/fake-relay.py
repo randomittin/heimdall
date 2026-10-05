@@ -6,7 +6,7 @@ against a loopback HTTP server instead of the real Cloudflare Worker.
 
 Three independent modes, selected by argv[1]:
 
-  fake-relay.py serve PORT --log LOGDIR --ctl CTLDIR
+  fake-relay.py serve PORT --log LOGDIR --ctl CTLDIR [--ws] [--tls CERT KEY]
       Runs a ThreadingHTTPServer forever (until killed) implementing
       POST /pair/init, GET /session/:id/stream, POST /session/:id/frames,
       POST /session/:id/revoke -- see Handler below for the per-route
@@ -16,6 +16,21 @@ Three independent modes, selected by argv[1]:
       see `fail-ack-posts` below -- goes to LOGDIR/frames-dropped.ndjson
       instead, so "what the relay accepted" and "what it received but never
       answered" stay separately countable).
+
+      WITHOUT --ws this is the relay as it was before hmd's leg learned
+      WebSockets: a GET /stream that asks for `Upgrade: websocket` is answered
+      200 chunked NDJSON, the Upgrade header ignored -- which is exactly what
+      the deployed Worker does until it is redeployed, so every scenario that
+      starts this without --ws is also a proof that the current client still
+      works against an old relay. WITH --ws the same request is answered 101
+      and the stream is a WebSocket (RFC 6455, written below on its own: this
+      fake is the oracle for bin/lib/hmd_relay_ws.py and must not share its
+      codec): one text message per envelope, the text `ping` answered `pong`
+      (unless LOGDIR's sibling ctl file `mute-pong` exists), no keepalive.
+      Every ctl file below means the same on both transports, translated:
+      an NDJSON line is a WebSocket text message, a clean EOF is a close frame.
+      --tls serves HTTPS/WSS with the given certificate, so the real client's
+      TLS path (SNI, certificate check, SSLSocket reads) is exercised.
 
   fake-relay.py device <action> ...
       One-shot helper subcommands standing in for the paired PHONE, so the
@@ -44,6 +59,15 @@ CONTROL PROTOCOL (the --ctl DIR the "serve" stream handler polls):
                    stream connection -- built by `device envelope` below and
                    written to CTLDIR by the bash test, standing in for a
                    frame the paired phone "sent".
+  NNN.raw       -- the same queue (the number orders both kinds together), but
+                   the file's text is pushed AS IT IS -- not parsed, not
+                   re-serialized -- as one NDJSON line or one WebSocket text
+                   message: what a relay that sends garbage looks like.
+  bad-accept    -- (no content needed) consumed ONCE by the next WebSocket
+                   upgrade: answered 101 with a wrong Sec-WebSocket-Accept.
+  mute-pong     -- (no content needed) NOT consumed: while it exists a
+                   WebSocket `ping` is not answered -- a relay whose object is
+                   dead, or a path that dropped the reply.
   bind-device   -- (written ONCE, before the server is asked to start a
                    stream -- NOT polled mid-stream) the paired phone's X25519
                    public key, base64, embedded in every device_bound frame's
@@ -115,6 +139,12 @@ CONTROL PROTOCOL (the --ctl DIR the "serve" stream handler polls):
                    for "a state POST is in flight right now" instead of
                    sleeping.
 
+LOGDIR/stream-transport.log: one line per GET /stream the relay accepted, `<ws|ndjson> asked=<yes|no>` --
+    which transport the connection became, and whether the request carried `Upgrade: websocket`.
+LOGDIR/ws-client.log: what the client said on a WebSocket, one line each -- `text <payload>`, `close <code>`
+    (its close frame), `eof` (its TCP connection ended with no close frame), `violation <why>` (a frame
+    RFC 6455 forbids a client, e.g. an unmasked one).
+
 LOGDIR/frame-posts.log: one line per POST /frames, written when it ends --
     recv=<epoch s> done=<epoch s> conn=<N> type=<state|ack|?> seq=<N|?> result=<ok|dropped|undelivered>
 `conn` numbers every TCP connection the server accepted (1, 2, ...), so a test
@@ -127,10 +157,14 @@ uuid, threading, argparse, importlib.
 import argparse
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import re
+import select
 import socket
+import ssl
+import struct
 import sys
 import threading
 import time
@@ -148,7 +182,11 @@ E2E_PATH = os.path.join(REPO_ROOT, "bin", "lib", "hmd_relay_e2e.py")
 # bin/heimdall-relay-client's own MAX_ENVELOPE_BYTES comment for the
 # 2026-09-24 128 KiB -> 1 MiB raise this fixture stands in for.
 MAX_ENVELOPE_BYTES = 1048576
-NUM_JSON_RE = re.compile(r"^\d+\.json$")
+NUM_JSON_RE = re.compile(r"^\d+\.(json|raw)$")
+# RFC 6455 section 1.3: what a server hashes the client's key with to answer it
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# a syntactically valid Sec-WebSocket-Accept that answers no key (the `bad-accept` ctl file)
+WS_WRONG_ACCEPT = "AAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 # A fixed, valid (non-low-order), obviously-fake X25519 public key -- used as
 # the device_bound payload's device_pubkey whenever a scenario never writes
@@ -230,9 +268,10 @@ class Session:
 
 
 class RelayState:
-    def __init__(self, log_dir, ctl_dir):
+    def __init__(self, log_dir, ctl_dir, ws_enabled=False):
         self.log_dir = log_dir
         self.ctl_dir = ctl_dir
+        self.ws_enabled = ws_enabled
         self.sessions = {}
         self.lock = threading.Lock()
         os.makedirs(log_dir, exist_ok=True)
