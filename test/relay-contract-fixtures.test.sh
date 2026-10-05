@@ -98,6 +98,8 @@ mutant qr-wrong-key \
   "w['bindings']['hmd_pubkey'] = {'computed': 'device_pubkey_b64url'}"
 mutant decide-ack-flipped \
   "w['frames']['ack_decide_allow']['plaintext']['ok'] = True"
+mutant refusal-last-skew \
+  "w['frames']['ack_non_increasing_seq']['plaintext']['last'] = 2"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

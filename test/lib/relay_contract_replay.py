@@ -218,8 +218,8 @@ class Observed:
 
 def drive(mod, fx, root):
     """Plays one whole session through the real client, in the order the wire fixtures number it:
-    pair/init, the relay's device_bound, a state frame, the phone's three commands, a relay
-    keepalive, the stream open, revoke. Returns everything the client did."""
+    pair/init, the relay's device_bound, a state frame, the phone's three commands, the first of
+    them replayed, a relay keepalive, the stream open, revoke. Returns everything the client did."""
     wire = fx.wire
     obs = Observed()
     pair_response = fx.instantiate(wire["pair_init"]["response"]["body"])
@@ -268,6 +268,9 @@ def drive(mod, fx, root):
             for name in ("command_send_message", "command_decide_allow", "command_decide_deny"):
                 envelope = json.loads(compact(wire["frames"][name]["wire"]))
                 client._handle_envelope(envelope)
+            # The phone's first command (seq 1) arrives again once seq 3 has been taken. It is a frame that
+            # opens, so the replay guard's rejection is answered with a sealed refusal, never acted on.
+            client._handle_envelope(json.loads(compact(wire["frames"]["command_send_message"]["wire"])))
         finally:
             mod.INBOX.uuid.uuid4, mod.DECISIONS.secrets.token_hex = real_uuid4, real_token_hex
 
@@ -364,12 +367,13 @@ def main():
         return 1
 
     requests = obs.requests
-    check(len(requests) == 7, "client: made exactly the seven requests the session implies, in order "
-          "(pair/init, state, three acks, stream, revoke)", [(r["method"], r["path"]) for r in requests])
-    if len(requests) != 7:
+    check(len(requests) == 8, "client: made exactly the eight requests the session implies, in order "
+          "(pair/init, state, three acks, the refusal of the replay, stream, revoke)",
+          [(r["method"], r["path"]) for r in requests])
+    if len(requests) != 8:
         print("\n%d passed, %d failed" % (passed, failed))
         return 1
-    pair_call, state_call, ack_send, ack_allow, ack_deny, stream_call, revoke_call = requests
+    pair_call, state_call, ack_send, ack_allow, ack_deny, ack_refusal, stream_call, revoke_call = requests
 
     def request_matches(call, template, label):
         want = fx.instantiate(template)
@@ -387,20 +391,21 @@ def main():
 
     frames_template = wire["frames_post"]["request"]
     for call, name in ((state_call, "state"), (ack_send, "ack_send_message"),
-                       (ack_allow, "ack_decide_allow"), (ack_deny, "ack_decide_deny")):
+                       (ack_allow, "ack_decide_allow"), (ack_deny, "ack_decide_deny"),
+                       (ack_refusal, "ack_non_increasing_seq")):
         request_matches(call, frames_template, "POST /frames (%s)" % name)
         check(call["body"] == compact(wire["frames"][name]["wire"]),
               "client: the %s frame it POSTs is byte-identical to the fixture" % name,
               "got %s" % call["body"])
 
-    # The four frames are four requests on two connections: one persistent connection per sender,
-    # so the second and third ack are reused-connection POSTs (the client's own `post` event says so).
+    # The five frames are five requests on two connections: one persistent connection per sender,
+    # so every ack after the first is a reused-connection POST (the client's own `post` event says so).
     posts = [e for e in obs.events if e.get("event") == "post"]
-    check(ack_send["conn"] == ack_allow["conn"] == ack_deny["conn"] != state_call["conn"]
-          and [e["reused"] for e in posts] == [False, False, True, True],
-          "client: POST /frames keeps one persistent connection per sender -- the three acks shared one, "
+    check(ack_send["conn"] == ack_allow["conn"] == ack_deny["conn"] == ack_refusal["conn"] != state_call["conn"]
+          and [e["reused"] for e in posts] == [False, False, True, True, True],
+          "client: POST /frames keeps one persistent connection per sender -- the four acks shared one, "
           "the state frame has its own",
-          {"connections": [c["conn"] for c in (state_call, ack_send, ack_allow, ack_deny)],
+          {"connections": [c["conn"] for c in (state_call, ack_send, ack_allow, ack_deny, ack_refusal)],
            "reused": [e["reused"] for e in posts]})
 
     request_matches(stream_call, wire["stream"]["request"], "GET /stream (the bearer rides in a header)")
@@ -417,12 +422,13 @@ def main():
 
     commands = [e for e in obs.events if e.get("event") == "command"]
     wanted = []
-    for name in ("ack_send_message", "ack_decide_allow", "ack_decide_deny"):
+    for name in ("ack_send_message", "ack_decide_allow", "ack_decide_deny", "ack_non_increasing_seq"):
         ack = wire["frames"][name]["plaintext"]
         wanted.append({"ok": ack["ok"], "detail": ack.get("detail")})
     check([{"ok": c["ok"], "detail": c["detail"]} for c in commands] == wanted
-          and [c["action"] for c in commands] == ["send-message", "decide", "decide"],
-          "client: send-message, decide(allow) and decide(deny) each end as their fixture ack says", commands)
+          and [c["action"] for c in commands] == ["send-message", "decide", "decide", None],
+          "client: send-message, decide(allow) and decide(deny) each end as their fixture ack says, and the "
+          "replay of the first is refused as the fixture says (no action: its plaintext is never read)", commands)
     check(obs.inbox_texts == [wire["frames"]["command_send_message"]["plaintext"]["params"]["text"]],
           "client: the send-message text reached the inbox", obs.inbox_texts)
     check(obs.decision == wire["frames"]["command_decide_deny"]["plaintext"]["params"]["decision"],

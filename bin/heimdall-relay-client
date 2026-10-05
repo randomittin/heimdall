@@ -90,7 +90,9 @@ to drive its own UI; nothing else is ever written to stdout.
         named (the three login_* only while bin/lib/companion_cc_login.py
         imported) is acked `not-implemented`. Never the token, ref or label
         of a push registration (see PUSH REGISTRATION below), never a login
-        command's params (see REMOTE CLAUDE CODE LOGIN below)
+        command's params (see REMOTE CLAUDE CODE LOGIN below). A stale-seq
+        frame that is refused gets one too: action null, ok false, detail
+        `non-increasing-seq` (see STALE-SEQ REFUSAL below)
     {"event":"ack_sent","of_seq":N,"seq":S,"id":..|null,"attempt":K,"ms":N,
      "ok":bool,"delivered":bool}
         one line per POST ATTEMPT of the ack answering a command (so every
@@ -230,6 +232,20 @@ an ack whose seq a newer frame has already passed). Every attempt is visible
 in ack_sent, a delivered=false answer too (ok true, delivered false). Backoff
 waits on stop_event, so a shutdown is never delayed by a retry.
 
+STALE-SEQ REFUSAL (the replay guard, INV-14/15: a device seq must be strictly above the last one hmd accepted,
+last_device_seq): a command frame that is not is never acted on -- and one that OPENS under the session key is no longer
+dropped in silence either. It is answered with a sealed refusal ack
+    {"ok":false,"of_seq":S,"detail":"non-increasing-seq","last":L}     S the stale frame's own seq, L last_device_seq
+so the phone can tell a refused command from a lost one and seal it again above L. Those four keys and nothing more: `last`
+is the one thing about hmd's state a refusal names, and `of_seq` only echoes what the phone sent. Only a frame that OPENS is
+answered. One that does not (a forgery, a corrupted frame, the wrong key, no usable seq) stays silent and records nothing:
+it can neither draw a reply (an oracle for guessing seqs) nor use up the refusal its genuine twin is owed -- the rule that
+already keeps it from advancing last_device_seq (hmdapp's docs/HANDOFF-TO-HEIMDALL-relay-client-fixes.md section 8). No
+amplification loop: ONE refusal per distinct stale seq (a frame replayed, or sent again, is answered once; the last
+STALE_REFUSAL_MEMORY seqs are remembered) and at most STALE_REFUSAL_BURST refusals in any STALE_REFUSAL_WINDOW_S, whatever
+the flood. A frame past either bound is dropped as it always was -- the `error` event still names it. The refusal is an
+ordinary ack frame: hmd's own next seq and nonce, sealed, delivered under the ACK RETRY rules above.
+
 FRAME COMPRESSION AND RESYNC (the FINAL wire of hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md
 Ask 5, section 5; hmdapp's docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with
 it; codec in bin/lib/hmd_relay_e2e.py). Capabilities travel in-band, hmd first: EVERY `state`
@@ -299,6 +315,7 @@ a second notice, defeating the point).
 """
 
 import argparse
+import collections
 import functools
 import http.client
 import itertools
@@ -447,6 +464,13 @@ if not 0 <= ACK_WINDOW_S <= 3600:  # also catches nan
 ACK_ATTEMPT_TIMEOUT_S = 3.0
 ACK_RETRY_DELAYS_S = (0.25, 0.5)
 ACK_MIN_ATTEMPT_S = 0.5
+
+# Stale-seq refusal (see STALE-SEQ REFUSAL in the module docstring): at most STALE_REFUSAL_BURST refusals in any
+# STALE_REFUSAL_WINDOW_S, and the last STALE_REFUSAL_MEMORY stale seqs remembered as already refused (one refusal each).
+# Bare literals on purpose: test/heimdall-app-relay.test.sh reads the first two from this source to check the bound.
+STALE_REFUSAL_BURST = 8
+STALE_REFUSAL_WINDOW_S = 1.0
+STALE_REFUSAL_MEMORY = 256
 
 # State retry (see STATE FRAMES in the module docstring): a state POST that got no
 # usable answer is re-sent by the next tick, after the next of these waits -- 250 ms,
@@ -862,6 +886,8 @@ class RelayClient:
         # replay -- audit #3, 2026-09-25.
         self.hmd_seq = 1
         self.last_device_seq = 0
+        self._refused_seqs = {}  # stale device seqs already refused once, oldest first (_refuse_stale_seq)
+        self._refusal_times = collections.deque()  # time.monotonic() of the refusals sent within STALE_REFUSAL_WINDOW_S
         self.device_pub = None  # raw 32-byte key of the currently-bound
                                  # device -- set once, on the first
                                  # device_bound; see _handle_envelope.
@@ -1339,6 +1365,33 @@ class RelayClient:
         threading.Thread(target=manager.run_probe_loop, args=(self.stop_event,), name="login-probe",
                          daemon=True).start()
 
+    def _refuse_stale_seq(self, env, seq, ack_deadline):
+        """Answer a command frame the replay guard just rejected (see STALE-SEQ REFUSAL in the module docstring):
+            ack  {"ok":false,"of_seq":<its seq>,"detail":"non-increasing-seq","last":<last_device_seq>}
+        Only when the frame OPENS under the session key, so nothing unauthenticated draws a reply or is recorded; at
+        most once per distinct seq; at most STALE_REFUSAL_BURST per STALE_REFUSAL_WINDOW_S. The cheap checks come first,
+        so once its bound is spent a flood costs a lookup per frame, not an AEAD open. Nothing here ever touches
+        last_device_seq, and the stale frame's plaintext is never read: it was opened to prove who sealed it, no more.
+        Runs on the stream thread, like the rest of _handle_command, so its two bookkeeping structures need no lock."""
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq in self._refused_seqs:
+            return
+        now = time.monotonic()
+        while self._refusal_times and now - self._refusal_times[0] >= STALE_REFUSAL_WINDOW_S:
+            self._refusal_times.popleft()
+        if len(self._refusal_times) >= STALE_REFUSAL_BURST:
+            return
+        try:
+            E2E.open_(self.session_key, seq, "device", env.get("nonce"), env.get("ciphertext"))
+        except E2E.E2EError:
+            return  # does not open: no reply, nothing recorded -- the `error` event the caller emitted is all it gets
+        self._refusal_times.append(now)
+        self._refused_seqs[seq] = None
+        if len(self._refused_seqs) > STALE_REFUSAL_MEMORY:
+            del self._refused_seqs[next(iter(self._refused_seqs))]
+        emit({"event": "command", "action": None, "ok": False, "detail": "non-increasing-seq"})
+        self.send_hmd_frame("ack", {"ok": False, "of_seq": seq, "detail": "non-increasing-seq",
+                                    "last": self.last_device_seq}, ack_deadline=ack_deadline)
+
     def _handle_command(self, env):
         # The phone's ack window opened before this command reached us; retries
         # of its ack may only START inside what is left of it (ACK_WINDOW_S).
@@ -1347,6 +1400,7 @@ class RelayClient:
         if not isinstance(seq, int) or seq <= self.last_device_seq:
             emit({"event": "error", "detail": "non-increasing seq from device (got %r, last %r) -- rejected"
                                               % (seq, self.last_device_seq)})
+            self._refuse_stale_seq(env, seq, ack_deadline)
             return
         try:
             plaintext = E2E.open_(self.session_key, seq, "device", env.get("nonce"), env.get("ciphertext"))
