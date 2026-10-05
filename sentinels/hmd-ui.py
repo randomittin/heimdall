@@ -863,7 +863,7 @@ def collect_controls(root, state=None):
     if CONTROLS is None:
         return None
     state = state or {}
-    return CONTROLS.snapshot(root, hooks=state.get("hooks"), fallback=state.get("fallback"))
+    return CONTROLS.snapshot(root, hooks=state.get("hooks"))
 
 
 def publish_live_users(root, roster_count, previous, now=None):

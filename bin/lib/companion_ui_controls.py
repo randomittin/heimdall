@@ -91,6 +91,8 @@ BIN_DIR = os.path.normpath(os.path.join(HERE, ".."))
 PLUGIN_DIR = os.path.normpath(os.path.join(HERE, "..", ".."))
 
 CONTROL_DEADLINE_S = 5.0          # a synchronous handler's whole budget; past it the command is `timeout`
+DEADLINE_ENV = "HMD_UI_CONTROL_DEADLINE_S"   # operator knob for a slow disk / a big repo: clamped to [1, 8] (the relay's ack
+                                             # window is 8 s and the phone waits 10), CONTROL_DEADLINE_S when unset or junk
 MAX_COMMAND_BYTES = 1024          # the whole command plaintext
 MAX_RESULT_BYTES = 1024           # an ack's `result`, serialized
 RID_MEMORY = 64                   # rid -> ack pairs kept per repo
@@ -640,19 +642,15 @@ def _do_hook_toggle(root, fields, ctx):
     return True, None, {"result": result}
 
 
-def _fallback_state(root, deadline):
-    """heimdall-fallback's own answer for this repo's state (off|auto|switch|coop), or None. Its loopback probe is
-    bounded to 1 s unless the operator pinned a value, as sentinels/hmd-ui.py's collect_fallback does."""
-    env = dict(os.environ)
-    env.setdefault("HEIMDALL_FALLBACK_PROBE_TIMEOUT", "1")
-    rc, out = _run_argv([_bin("heimdall-fallback"), "--repo", root, "status", "--json"], deadline, env=env)
-    if rc != 0:
-        return None
-    try:
-        state = json.loads(out).get("state")
-    except (ValueError, AttributeError):
-        return None
-    return state if state in FALLBACK_STATES else None
+def fallback_mode(root):
+    """The repo's fallback state (off|auto|switch|coop) as bin/heimdall-fallback's load_config reads it from
+    <repo>/.heimdall/fallback.json: a missing, unreadable or unknown value (the retired `on` included) is `off`, the
+    fail-closed default. A file read, not `heimdall-fallback status` -- that runs the whole preflight, a loopback probe
+    and two database reads, which is no way to answer a phone inside a 5 s bound. Only this one closed-set word is ever
+    taken from the file (it is on hmd-ui's never-forward list for everything else it holds)."""
+    data = _read_json(os.path.join(root, ".heimdall", "fallback.json"))
+    state = data.get("state") if isinstance(data, dict) else None
+    return state if state in FALLBACK_STATES else "off"
 
 
 def _do_fallback_mode(root, fields, ctx):
@@ -661,9 +659,7 @@ def _do_fallback_mode(root, fields, ctx):
         return False, "confirm-required", {}
     if not _usable_tool("heimdall-fallback"):
         return False, "unavailable", {}
-    was = _fallback_state(root, ctx.deadline)
-    if was is None:
-        return False, "unavailable", {}
+    was = fallback_mode(root)
     if was == mode:
         return True, "unchanged", {"result": {"mode": mode}}
     rc, out = _run_argv([_bin("heimdall-fallback"), "--repo", root, "set", mode], ctx.deadline)
@@ -688,6 +684,14 @@ ACTION_ORDER = ("interrupt", "save-checkpoint", "hook-toggle", "fallback-mode")
 
 
 # -- dispatch ---------------------------------------------------------------------------------------------------
+def _deadline_s():
+    try:
+        value = float(os.environ.get(DEADLINE_ENV, ""))
+    except ValueError:
+        return CONTROL_DEADLINE_S
+    return min(8.0, max(1.0, value)) if math.isfinite(value) else CONTROL_DEADLINE_S
+
+
 def _bounded(extra):
     """`extra` as the ack may carry it: only id / result / dup / retry_after_s, a result inside MAX_RESULT_BYTES."""
     out = {}
@@ -719,7 +723,7 @@ def _run_command(root, action, params, device_id, started):
                 ok, detail, extra = hit
                 return ok, detail, dict(extra, dup=True), audit_params, True
         _charge(root, action)
-        ctx = _Ctx(device_id, started + CONTROL_DEADLINE_S)
+        ctx = _Ctx(device_id, started + _deadline_s())
         try:
             ok, detail, extra = _ACTIONS[action]["handler"](root, fields, ctx)
         except _Timeout:
@@ -770,19 +774,17 @@ def _usable(action):
     return False
 
 
-def snapshot(root, hooks=None, fallback=None):
-    """The additive `controls` key. `hooks` is the state's own hooks slice and `fallback` its fallback slice (the
-    states the phone already sees, so one pass never disagrees with itself); both may be None."""
+def snapshot(root, hooks=None):
+    """The additive `controls` key. `hooks` is the state's own hooks slice (the enabled flags the phone already sees, so
+    one pass never disagrees with itself); it may be None."""
     states = {h["id"]: bool(h.get("enabled")) for h in (hooks or []) if isinstance(h, dict) and isinstance(h.get("id"), str)}
     ids = toggleable_hooks()
-    mode = fallback.get("state") if isinstance(fallback, dict) else None
     return {
         "v": 1,
         "actions": [a for a in ACTION_ORDER if a in ALLOWED_ACTIONS and _usable(a)],
         "hooks_toggleable": ids,
         "hooks": [{"id": i, "enabled": states[i]} for i in ids if i in states],
-        "fallback": {"mode": mode if mode in FALLBACK_STATES else None, "modes": list(FALLBACK_MODES),
-                     "confirm": list(CONFIRM_MODES)},
+        "fallback": {"mode": fallback_mode(root), "modes": list(FALLBACK_MODES), "confirm": list(CONFIRM_MODES)},
         "enabled": controls_enabled(root),
         "last": last_control(root),
     }
