@@ -155,15 +155,23 @@ def case_default_transport():
         s.events("events-1", PAIR_INIT)
         app = s.app("--no-code", recorder=True)
         app.close_stdin()
-        app.wait_for(lambda: s.read("argv"), 30)
-        T.check("PAIRING CODE: ABCDEFGHIJKLMNOPQRSTUVWXYZ" in app.text() and "scan to pair a device" in app.text(),
-                "--no-code: the QR flow prints exactly as it always did (QR, pairing code, header unchanged)", app.tail())
+        app.wait_text("PAIRING CODE: ABCDEFGHIJKLMNOPQRSTUVWXYZ", 30)
+        T.check("scan to pair a device" in app.text() and "WARNING: anyone who scans this code within" in app.text()
+                and "SESSION CODE" not in app.text(),
+                "--no-code: the QR flow prints exactly as it always did (header, QR, pairing code, warning)", app.tail())
+    with AppScenario() as s:
+        s.events("events-1", PAIR_INIT)
+        app = s.app(recorder=True)  # stdin is a pipe: nobody to confirm a phone with
+        app.close_stdin()
+        app.wait_text("PAIRING CODE:", 30)
+        T.check("code pairing off — no terminal to confirm a phone at" in app.text() and "[--code]" not in s.read("argv"),
+                "no terminal on stdin (and no --no-confirm): the code is not offered, one line says so, the QR is shown", app.tail())
 
 
 def case_token_path_and_code():
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT)
-        app = s.app(recorder=True)
+        app = s.app(recorder=True, tty=True)
         app.wait_for(lambda: s.read("stdin.sha256"), 30)
         argv, env = s.read("argv"), s.read("env")
         code = ""
@@ -180,8 +188,8 @@ def case_token_path_and_code():
         T.check(len(code) == 5 and code == helper == shown,
                 "the code handed to the client is the one `hmd ui` shows in /api/state (identity.session_code)",
                 "client %r helper %r ui %r" % (code, helper, shown))
-        T.check(s.read("stdin.sha256").strip() == hashlib.sha256((H.TOKEN + "\n").encode()).hexdigest(),
-                "the client's first stdin line is exactly the token gh printed")
+        T.check(s.read("stdin.sha256").strip() == hashlib.sha256(H.TOKEN.encode()).hexdigest(),
+                "the client's first stdin line is exactly the token gh printed (its hash, never the token, was recorded)")
         T.check(H.TOKEN not in argv and H.TOKEN not in env, "the token is in neither the client's argv nor its environment")
         T.check(s.gh_calls() == ["auth token"], "gh is asked exactly `auth token`, once", str(s.gh_calls()))
         app.stop()
@@ -212,14 +220,12 @@ def case_off_paths():
                 "--no-code: gh is never asked and nothing is printed about it", app.tail())
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT, {"event": "code_unavailable", "reason": "conflict"})
-        app = s.app(recorder=True)
-        app.close_stdin()
+        app = s.app(recorder=True, tty=True)
         T.check(app.wait_text("is held by another open window of yours. Scan the QR.", 30) and "PAIRING CODE:" in app.text(),
                 "a code clash prints one line and the QR is still shown", app.tail())
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT, {"event": "code_unavailable", "reason": "disabled"})
-        app = s.app(recorder=True)
-        app.close_stdin()
+        app = s.app(recorder=True, tty=True)
         T.check(app.wait_text("this relay has code pairing disabled. Scan the QR.", 30), "a relay without code pairing prints one line", app.tail())
 
 
@@ -273,7 +279,7 @@ def case_prompt():
         with AppScenario() as s:
             s.events("events-1", PAIR_INIT, WINDOW, REQUEST)
             s.events("events-2", then)
-            app = s.app(recorder=True)
+            app = s.app(recorder=True, tty=True)
             shown = app.wait_text("Approve [y/N]:", 40)
             if answer is None:
                 app.close_stdin()
