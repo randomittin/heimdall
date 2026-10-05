@@ -8,6 +8,23 @@ compatibility_date = "2026-08-22"
 #   deployed:   `wrangler secret put RELAY_SIGNING_SECRET`
 #   vitest:     injected via vitest.config.ts's miniflare bindings (test-only)
 # See README.md.
+#
+# Pair-by-session-code (README.md, "Pair by session code") needs three more values, and a Worker
+# missing ANY of them answers 503 `code pairing disabled` on its four code-pairing routes while
+# the QR flow carries on untouched:
+#   GITHUB_CLIENT_ID       [vars] below: the PUBLIC client id of the project's GitHub App. A public
+#                          identifier (it is in the app and in the device-flow URL), committed on
+#                          purpose; not a secret.
+#   GITHUB_CLIENT_SECRET   `npx wrangler secret put GITHUB_CLIENT_SECRET` (and `--env canary`): the
+#                          App's client secret, the Basic-auth half of the check-token call.
+#   RELAY_IDENTITY_SECRET  `npx wrangler secret put RELAY_IDENTITY_SECRET` (and `--env canary`):
+#                          the HMAC key of the gh_assertion; any high-entropy random string,
+#                          distinct from RELAY_SIGNING_SECRET.
+# local dev: relay/.dev.vars (gitignored) carries the two secrets. vitest: injected via
+# vitest.config.ts's miniflare bindings (test-only placeholders, and a fake GitHub).
+
+[vars]
+GITHUB_CLIENT_ID = "Iv23liawqpKieqqpgIPj"
 
 [[durable_objects.bindings]]
 name = "SESSION"
@@ -32,3 +49,8 @@ name = "hmd-relay-canary"
 [[env.canary.durable_objects.bindings]]
 name = "SESSION"
 class_name = "SessionDO"
+
+# `vars` is not inherited into an environment either, so the canary restates the public client id:
+# the same GitHub App as production. Its two secrets are its own (`wrangler secret put ... --env canary`).
+[env.canary.vars]
+GITHUB_CLIENT_ID = "Iv23liawqpKieqqpgIPj"

@@ -393,6 +393,78 @@ Response `200 {"ok": true}`. Closes the bound device's WebSocket with close code
 turns any further `pairing_code` claim into `410`. Arms the purge alarm below at a 5-minute
 grace.
 
+## Pair by session code
+
+A phone can pair by typing only the 5-character session code hmd already shows (statusline,
+`/api/state`), instead of scanning the QR. The code is **not a secret**: the relay releases a
+pending pairing for code `X` only to a phone whose relay-verified GitHub numeric id equals the id
+of the laptop that opened the window, so the code just selects among the user's own open windows.
+The QR is untouched and stays the fallback in every failure path. Design of record: hmdapp
+`docs/superpowers/specs/2026-10-05-pair-by-session-code.md` (it wins over this section). The wire is
+`contract/code-pair.json` (every status row of the four endpoints, the check order of each, the
+`key_reveal` frame, hmd's `device_bound` payload, the Ed25519 proof-of-possession message, and
+known-answer vectors for the commitment, the SAS and the PoP); `test/code-pair.spec.ts` drives the
+real Worker and Durable Objects with it and fails if a row of it is never asserted.
+
+| Route | Who | What |
+|---|---|---|
+| `POST /identity/github` | phone, once per 30 days | The device-flow token is checked against **our** GitHub App (`POST /applications/{client_id}/token`), deleted at GitHub (`DELETE` the same), and replaced by a `gh_assertion` bound to the phone's Ed25519 install key. 10/min per IP. |
+| `POST /session/:id/code` | hmd, the session's bearer | Registers a window: the code, the laptop's `gh auth token` (one `GET /user`, forwarded once, never stored) and hmd's commitment to its X25519 key. 6/min per session. `409` if another live session of the same GitHub user holds the code. |
+| `POST /pair/code` | phone | Assertion + Ed25519 signature over `hmd-pair-code-v1\n<code>\n<ts>` -> `{session_id, pairing_code, hmd_commit, exp}`; the phone then claims over the existing socket. 20/min per IP, 10/min per GitHub id, 10 consecutive 404s lock the id out for 600 s. |
+| `POST /identity/github/revoke` | laptop | `not_before = now` for that GitHub id: every assertion minted before it is dead. Shares the sign-in route's per-IP bucket. |
+
+hmd's `device_bound` now carries `via: "code" | "qr"` (and, for `code`, the phone's `device_label`
+and the `gh_login` its assertion proved). On `code`, hmd POSTs one plaintext `key_reveal`
+(`{hmd_pubkey, nonce}`) through `POST /frames`; the relay forwards it, replays it first to a phone
+that reconnects, and refuses a second. The phone checks it against the commitment it was given
+before the key was known; both screens show a 6-digit SAS and the laptop user approves it.
+`via` is **the relay's word**: a client that wants the SAS to defend against a malicious relay
+should key its approval on having registered a window, not on `via`.
+
+**Config.** `GITHUB_CLIENT_ID` is a `[vars]` entry in `wrangler.toml` (the project's public GitHub
+App client id, `Iv23liawqpKieqqpgIPj`; the canary restates it); `GITHUB_CLIENT_SECRET` and
+`RELAY_IDENTITY_SECRET` are Workers secrets, set per Worker (`npx wrangler secret put <NAME>`, and
+`--env canary`). Any one unset or empty and all four routes answer `503 code pairing disabled` before
+they touch a Durable Object or GitHub; the QR flow does not look. The hosted relay origin is
+`https://hmd-relay.therishabh16.workers.dev`. Every GitHub call goes through one function
+(`src/github.ts`): 5 s timeout, `User-Agent: hmd-relay`, no redirect followed, and
+`GITHUB_API_BASE` (unset outside the test suite) as the only seam. Rotating `RELAY_IDENTITY_SECRET`
+invalidates every assertion, like `RELAY_SIGNING_SECRET` does device tokens: every phone signs in
+again.
+
+**Where it lives.** A GitHub id's open windows are one `code-index:<gh_id>` instance of the same
+`SessionDO` class every throttle bucket already uses (no new class, no migration): its
+`{codes, not_before, miss_streak, attempts}` is `src/code-index.ts`, and a code is only ever looked
+up inside the verified caller's own index. The window itself (`code_window`) is on the session
+record, and the release is the session's decision, not the index's: the index entry is a hint that is
+re-checked behind it. The new internal handlers (`code-release`, `index-*`, `bucket`) are not in
+`PUBLIC_SESSION_SUBPATHS`; only `code` is.
+
+### INV-39..INV-44
+
+| | Invariant | Held by |
+|---|---|---|
+| **INV-39** | The relay never persists a GitHub token. The laptop's is used for exactly one GitHub call (`GET /user`) per request; the phone's for exactly two (check, then delete at GitHub after the check succeeded), and no assertion is minted for a token whose deletion did not confirm. No token, assertion, signature, `pairing_code` or GitHub id is logged. | `src/github.ts`; `code-pair.spec.ts` "INV-39" (every Durable Object's storage and every log line scanned after a whole pairing) |
+| **INV-40** | A code window is released at most once, only to an assertion whose `gh_id` equals the window's `owner_gh_id`, only while its session is `pending` and before `pair_exp`. | `SessionDO.handleCodeRelease`; "INV-40, at the session" (the session's own checks, reached directly, so the index in front cannot hide a missing one) and the race test |
+| **INV-41** | `owner_gh_id`, `code`, `gh_login` and `device_label` are cleared from the session's record at bind, revoke, end and purge; an index entry is deleted at release or clear, replaced at renewal, and expires with its window. A GitHub id's index keeps nothing but its revoke `not_before` once its windows and counters have lapsed, and that only for the 30 days of the assertions it kills. | `handlePairingCodeClaim`, `handleRevoke`, `endUnboundSession`, `alarm`; "INV-41" |
+| **INV-42** | `/pair/code` answers `404` identically (status, body, headers) for an unknown, a foreign, an expired, a non-pending and an already-released code. | the namespacing, and `handleIndexResolve`'s one `noWindow()`; "no window" compares whole responses |
+| **INV-43** | An assertion is honoured only with a valid Ed25519 signature by its `install_pubkey` over the request's code and a timestamp within 60 s. | `handlePairCode`, `verifyInstallSignature`; "proof of possession (INV-43)" |
+| **INV-44** | `key_reveal` is the only hmd->phone frame type that carries a plaintext payload; hmd may post at most one per session, only once the session is bound, and a phone cannot originate one. | `isHmdFrame`/`isKeyReveal`, `handleKeyReveal`; "key_reveal (INV-44)" |
+
+One caveat to INV-41, disclosed rather than hidden: the `device_bound` the relay writes to hmd names
+the phone's `device_label` and `gh_login`, and if hmd's stream is not open at the bind the relay
+holds that frame (`pending_hmd_control_frame`, as it always has) until hmd connects. Delivery
+deletes it, so the labels leave storage when hmd takes the frame -- seconds, in practice -- but an
+hmd that never comes back leaves them until the session is purged. The session record itself is
+clean from the bind.
+
+Refinements the spec leaves open, decided here and in the contract: a bad assertion of any kind
+(forged, malformed, past `exp`) is `identity expired`; a check-token `401`/`403` is the relay's
+own credentials being refused, so `502` and a `github_error` line, never a verdict on the user's
+token; `not_before` honours an assertion minted at or after it (`iat >= not_before`); the lockout
+counts consecutive misses within 600 s and is judged by the newest of them; request bodies on these
+routes are capped at 4 KiB and read as a stream.
+
 ## Storage reclamation (purge schedule)
 
 `SessionDO` used to write its record and delete it on no path at all — not on revoke, not on
@@ -406,6 +478,8 @@ trusting whenever the alarm happened to be set:
 | `bound` | the `device_token`'s `exp` + 60s grace — 30 days, the last moment it could reconnect |
 | `ended` (revoked, expired, or claim-throttled) | 5 minutes after it ended |
 | `/pair/init` throttle bucket | one window + grace after the IP's last request |
+| `identity-throttle:<ip>` / `pair-code-throttle:<ip>` bucket | the same: one window + grace |
+| `code-index:<gh_id>` index | when its last window, counter and lockout have lapsed; a revoke's `not_before` keeps it 30 days |
 
 The grace exists so a client that is merely late — a phone reconnecting seconds after its token
 lapsed, hmd re-reading a just-revoked session — meets a truthful `410`/`401` instead of a bare
@@ -477,9 +551,10 @@ shipped this keeps running.
 ```
 
 `type` is a closed set: `state` | `command` | `ack` | `device_bound` | `session_ended` |
-`keepalive`. `nonce` / `ciphertext` are forwarded byte-identical in both directions — the relay
-does not decode, validate, or transform them — and are `null` on the three plaintext control
-types. `payload` is a relay-side addition (never present on `state` / `command` / `ack`) that
+`keepalive` | `key_reveal` (hmd->phone, plaintext, once per session — "Pair by session code").
+`nonce` / `ciphertext` are forwarded byte-identical in both directions — the relay
+does not decode, validate, or transform them — and are `null` on the plaintext control
+types (`key_reveal` included). `payload` is a relay-side addition (never present on `state` / `command` / `ack`) that
 carries plaintext relay-originated data — a `device_bound` sent to the *phone* carries
 `{device_token, exp}`; a `device_bound` written into *hmd's* `GET /stream` carries
 `{device_pubkey, bound_at}` instead (see the `ws` endpoint above) — the two are the same frame

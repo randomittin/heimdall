@@ -204,3 +204,128 @@ export function timingSafeEqual(a: string, b: string): boolean {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
+
+/**
+ * Strict unpadded base64url of exactly `byteLength` bytes, or `null`. The relay's own
+ * `base64UrlDecode` throws on bad input and happily takes padding and either alphabet;
+ * everything pair-by-code accepts off the wire (install_pubkey, hmd_commit, sig) goes
+ * through this instead, so there is one spelling of each value and a malformed one is a
+ * `null` the caller maps to its own 4xx, never an exception out of a handler.
+ */
+export function decodeFixedBase64Url(value: unknown, byteLength: number): Uint8Array | null {
+  if (typeof value !== "string") return null;
+  if (value.length !== Math.ceil((byteLength * 4) / 3)) return null;
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  try {
+    const bytes = base64UrlDecode(value);
+    return bytes.length === byteLength ? bytes : null;
+  } catch {
+    return null;
+  }
+}
+
+/** gh_assertion validity: 30 days, the same horizon as a device_token. Revocation is
+ *  `not_before` at the index (src/code-index.ts), not this expiry, which only bounds how
+ *  long a NEVER-revoked sign-in survives on a phone that is never signed out. */
+export const GH_ASSERTION_TTL_S = 60 * 60 * 24 * 30;
+
+/** Longest GitHub login the relay will carry. GitHub's own bound is 39 characters; the
+ *  slack is for `[bot]`-style and enterprise-managed suffixes. */
+export const MAX_GH_LOGIN_LENGTH = 64;
+
+export interface GhAssertionClaims {
+  v: 1;
+  /** Same word as a device_token's role, kept on purpose: the two are kept apart by their
+   *  secrets (RELAY_IDENTITY_SECRET vs RELAY_SIGNING_SECRET) and their claim sets, not by
+   *  a differently-spelled role. */
+  role: "device";
+  gh_id: number;
+  gh_login: string;
+  /** Unpadded base64url Ed25519 public key (32 bytes) of the phone's install key: every
+   *  use of the assertion must be signed by it (INV-43). */
+  install_pubkey: string;
+  iat: number; // epoch seconds
+  exp: number; // epoch seconds
+}
+
+/** gh_assertion = base64url(claims JSON) "." base64url(HMAC-SHA256(secret, that payload)) —
+ *  `mintDeviceToken`'s construction, keyed with RELAY_IDENTITY_SECRET. */
+export async function mintGhAssertion(
+  secret: string,
+  claims: GhAssertionClaims
+): Promise<string> {
+  const payload = base64UrlEncode(new TextEncoder().encode(JSON.stringify(claims)));
+  const signature = await hmacSha256(secret, payload);
+  return `${payload}.${signature}`;
+}
+
+/**
+ * The verified claims of a gh_assertion, or `null` on any failure — bad shape, a signature
+ * from another secret, an expired `exp`, or claims that are not a well-formed assertion.
+ * Fails closed the way `verifyDeviceToken` does (finding 13): the signature is checked
+ * constant-time before the payload is trusted, and every claim is type-checked after it,
+ * because a correct signature proves who minted the body, not that the body means anything.
+ */
+export async function verifyGhAssertion(
+  secret: string,
+  token: string,
+  nowMs: number
+): Promise<GhAssertionClaims | null> {
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [payload, signature] = parts as [string, string];
+  const expectedSignature = await hmacSha256(secret, payload);
+  if (!timingSafeEqual(signature, expectedSignature)) return null;
+
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(new TextDecoder().decode(base64UrlDecode(payload)));
+  } catch {
+    return null;
+  }
+  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return null;
+  const claims = decoded as Record<string, unknown>;
+
+  if (claims.v !== 1 || claims.role !== "device") return null;
+  const { gh_id, gh_login, install_pubkey, iat, exp } = claims;
+  if (typeof gh_id !== "number" || !Number.isSafeInteger(gh_id) || gh_id <= 0) return null;
+  if (typeof gh_login !== "string" || gh_login.length === 0 || gh_login.length > MAX_GH_LOGIN_LENGTH) {
+    return null;
+  }
+  if (decodeFixedBase64Url(install_pubkey, 32) === null) return null;
+  if (typeof iat !== "number" || !Number.isFinite(iat)) return null;
+  if (typeof exp !== "number" || !Number.isFinite(exp)) return null;
+  if (nowMs / 1000 > exp) return null;
+
+  return {
+    v: 1,
+    role: "device",
+    gh_id,
+    gh_login,
+    install_pubkey: install_pubkey as string,
+    iat,
+    exp,
+  };
+}
+
+/**
+ * Whether `signature` is `installPubkey`'s Ed25519 signature over `message` (RFC 8032,
+ * pure). WebCrypto, so nothing is bundled; both inputs are strict fixed-length base64url
+ * and any failure — a malformed key or signature, a point the runtime refuses — is `false`,
+ * never a throw: this runs on attacker-chosen bytes.
+ */
+export async function verifyInstallSignature(
+  installPubkey: string,
+  message: Uint8Array,
+  signature: string
+): Promise<boolean> {
+  const publicKey = decodeFixedBase64Url(installPubkey, 32);
+  const signatureBytes = decodeFixedBase64Url(signature, 64);
+  if (publicKey === null || signatureBytes === null) return false;
+  try {
+    const key = await crypto.subtle.importKey("raw", publicKey, { name: "Ed25519" }, false, ["verify"]);
+    return await crypto.subtle.verify({ name: "Ed25519" }, key, signatureBytes, message);
+  } catch {
+    return false;
+  }
+}
