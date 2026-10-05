@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import wireJson from "../contract/wire.json";
 import vectors from "../contract/vectors.json";
 import { base64UrlEncode } from "../src/pairing";
+import { HmdSocket } from "./hmd-socket";
 import { BASE, nextCloseCode, wsUpgrade } from "./trace/helpers";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -39,6 +40,12 @@ interface Wire {
   bindings: Record<string, Binding>;
   pair_init: { request: RequestTemplate; response: { status: number; content_type: string; body: Json } };
   stream: { request: RequestTemplate; response: { status: number; content_type: string }; lines: Record<string, Json> };
+  stream_ws: {
+    request: RequestTemplate;
+    response: { status: number; headers: Record<string, string> };
+    messages: { device_bound: Json; client_ping: string; relay_pong: string };
+    close_codes: { session_ended: number; superseded: number; message_too_big: number };
+  };
   phone: {
     claim: RequestTemplate & { status: number };
     device_bound: Json;
@@ -203,6 +210,18 @@ async function openStream(session: Session) {
   return { reader, lines: new Lines(reader) };
 }
 
+/** hmd's WebSocket transport: the fixture's `stream_ws.request`, answered 101 (the pool can assert
+ *  nothing more of the handshake: `Sec-WebSocket-Accept` is added by the platform, not the Worker),
+ *  and the accepted client end of the socket. */
+async function openStreamWs(session: Session): Promise<HmdSocket> {
+  const res = await send(wire.stream_ws.request, session.live);
+  expect(res.status).toBe(wire.stream_ws.response.status);
+  const socket = res.webSocket;
+  if (!socket) throw new Error("expected a websocket in the 101 response");
+  socket.accept();
+  return new HmdSocket(socket);
+}
+
 /** Every message the phone socket receives, in order, from the moment it is accepted. */
 function inbox(socket: WebSocket): () => Promise<Record<string, unknown>> {
   const queue: Record<string, unknown>[] = [];
@@ -279,6 +298,47 @@ describe("relay wire contract (relay/contract/wire.json)", () => {
       socket.send(JSON.stringify(wire.frames[name]?.wire));
       expect(await lines.nextData(), `${name} as hmd receives it`).toEqual(wire.frames[name]?.wire);
     }
+  });
+
+  it("hmd's WebSocket transport carries the fixture's messages, one envelope each, and answers its ping", async () => {
+    const session = await pairInit();
+    const live: Live = { ...session.live, device_pubkey: COMPUTED.device_pubkey_b64url as string };
+    const hmd = await openStreamWs(session);
+    const { socket, phone } = await claim(session, live);
+
+    expectMatch(await phone(), wire.phone.device_bound, live);
+    const bound = await hmd.next();
+    expect(bound, "device_bound reaches hmd's socket").not.toBeNull();
+    expectMatch(JSON.parse(bound as string), wire.stream_ws.messages.device_bound, live);
+
+    // phone -> hmd: the three commands arrive on the socket exactly as sent, the NDJSON line
+    // without its newline
+    for (const name of ["command_send_message", "command_decide_allow", "command_decide_deny"]) {
+      const sent = JSON.stringify(wire.frames[name]?.wire);
+      socket.send(sent);
+      expect(await hmd.next(), `${name} as hmd receives it`).toBe(sent);
+    }
+
+    // hmd's keepalive of its own: the runtime answers it, the object never wakes for it
+    hmd.send(wire.stream_ws.messages.client_ping);
+    expect(await hmd.next()).toBe(wire.stream_ws.messages.relay_pong);
+  });
+
+  it("hmd's WebSocket transport closes with the fixture's codes", async () => {
+    const session = await pairInit();
+    const live: Live = { ...session.live, device_pubkey: COMPUTED.device_pubkey_b64url as string };
+
+    const superseded = await openStreamWs(session);
+    const tooBig = await openStreamWs(session);
+    expect((await superseded.closed())?.code).toBe(wire.stream_ws.close_codes.superseded);
+
+    tooBig.send("x".repeat(1_100_000));
+    expect((await tooBig.closed())?.code).toBe(wire.stream_ws.close_codes.message_too_big);
+
+    const ended = await openStreamWs(session);
+    const revoked = await send(wire.revoke.request, live, undefined);
+    expect(revoked.status).toBe(wire.revoke.response.status);
+    expect((await ended.closed())?.code).toBe(wire.stream_ws.close_codes.session_ended);
   });
 
   it("revoke tells the phone why, closes it with the fixture's code, and refuses a late claim", async () => {

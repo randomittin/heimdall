@@ -42,6 +42,9 @@ on:
       - 'relay/**'
       - 'bin/heimdall-relay-client'
       - 'bin/lib/hmd_relay_e2e.py'
+      - 'bin/lib/hmd_relay_ws.py'
+      - 'test/hmd-relay-ws.test.sh'
+      - 'test/lib/relay_ws_cases.py'
       - 'test/relay-contract-fixtures.test.sh'
       - 'test/lib/relay_contract_replay.py'
       - '.github/workflows/relay-ci.yml'
@@ -50,6 +53,9 @@ on:
       - 'relay/**'
       - 'bin/heimdall-relay-client'
       - 'bin/lib/hmd_relay_e2e.py'
+      - 'bin/lib/hmd_relay_ws.py'
+      - 'test/hmd-relay-ws.test.sh'
+      - 'test/lib/relay_ws_cases.py'
       - 'test/relay-contract-fixtures.test.sh'
       - 'test/lib/relay_contract_replay.py'
       - '.github/workflows/relay-ci.yml'
@@ -106,3 +112,6 @@ jobs:
 
       - name: Replay relay/contract/wire.json against bin/heimdall-relay-client
         run: bash test/relay-contract-fixtures.test.sh
+
+      - name: RFC 6455 client codec (bin/lib/hmd_relay_ws.py)
+        run: bash test/hmd-relay-ws.test.sh
