@@ -1,0 +1,40 @@
+{
+  "id": "Kludex__uvicorn-941",
+  "category": "feature",
+  "source": "https://github.com/Kludex/uvicorn/issues/941",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/Kludex/uvicorn/pull/2919",
+  "repo": "Kludex/uvicorn",
+  "license": "BSD-3-Clause",
+  "base_sha": "b224045f5900b7f766743bcb16ba9fc3adea2606",
+  "merge_sha": "b499bc45101d920e691e384025d728507215d4d1",
+  "test_paths": [
+    "tests/test_main.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/Kludex/uvicorn && git fetch -q --depth 1 --filter=blob:none origin b224045f5900b7f766743bcb16ba9fc3adea2606 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\" --group dev"
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Eager Asynchronous Construction of App Interferes with Running Event Loop\n\nBecause [`Server#run`](https://github.com/encode/uvicorn/blob/320fd6d975d47257aecde808d602c9a57fb74cba/uvicorn/server.py#L46) calls [`Config#load`](https://github.com/encode/uvicorn/blob/320fd6d975d47257aecde808d602c9a57fb74cba/uvicorn/server.py#L56) within [`loop.run_until_complete(self.serve(...))`](https://github.com/encode/uvicorn/blob/320fd6d975d47257aecde808d602c9a57fb74cba/uvicorn/server.py#L49), a config load that involves asynchronously constructing an app fails because the event loop is already running. Note that this config load will fail only if the app name is provided instead of the app itself. This is because in the latter case, the app had already been asynchronously constructed in its own `run_until_complete` prior to the `run_until_complete` launched by `Server`.\r\n\r\n### To reproduce\r\n\r\n1) `pip install -e git+https://github.com/encode/uvicorn#egg=uvicorn`\r\n2) Create `main.py`:\r\n\r\n```\r\nimport asyncio\r\n\r\nasync def new_app():\r\n    async def app(scope, receive, send):\r\n        await send({\r\n            'type': 'http.response.start',\r\n            'status': 200,\r\n            'headers': [\r\n                [b'content-type', b'text/plain'],\r\n            ],\r\n        })\r\n        await send({\r\n            'type': 'http.response.body',\r\n            'body': b'Hello, world!',\r\n        })\r\n\r\n    return app\r\n\r\napp = asyncio.get_event_loop().run_until_complete(new_app())\r\n```\r\n3) Run `uvicorn main:app`.\r\n\r\n### Expected behavior\r\n```\r\nINFO: Started server process [xxx]\r\nINFO: Waiting for application startup.\r\nINFO: Application startup complete.\r\nINFO: Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)\r\n```\r\nAnd that a server request would return Hello, world!\r\n\r\n### Actual behavior\r\n\r\n```\r\nTraceback (most recent call last):\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/bin/uvicorn\", line 33, in <module>\r\n    sys.exit(load_entry_point('uvicorn', 'console_scripts', 'uvicorn')())\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/lib/python3.8/site-packages/click/core.py\", line 829, in __call__\r\n    return self.main(*args, **kwargs)\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/lib/python3.8/site-packages/click/core.py\", line 782, in main\r\n    rv = self.invoke(ctx)\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/lib/python3.8/site-packages/click/core.py\", line 1066, in invoke\r\n    return ctx.invoke(self.callback, **ctx.params)\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/lib/python3.8/site-packages/click/core.py\", line 610, in invoke\r\n    return callback(*args, **kwargs)\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/src/uvicorn/uvicorn/main.py\", line 362, in main\r\n    run(**kwargs)\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/src/uvicorn/uvicorn/main.py\", line 386, in run\r\n    server.run()\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/src/uvicorn/uvicorn/server.py\", line 49, in run\r\n    loop.run_until_complete(self.serve(sockets=sockets))\r\n  File \"uvloop/loop.pyx\", line 1456, in uvloop.loop.Loop.run_until_complete\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/src/uvicorn/uvicorn/server.py\", line 56, in serve\r\n    config.load()\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/src/uvicorn/uvicorn/config.py\", line 308, in load\r\n    self.loaded_app = import_from_string(self.app)\r\n  File \"/home/mishac/dev/python/personal/async_init/venv/src/uvicorn/uvicorn/importer.py\", line 20, in import_from_string\r\n    module = importlib.import_module(module_str)\r\n  File \"/usr/lib/python3.8/importlib/__init__.py\", line 127, in import_module\r\n    return _bootstrap._gcd_import(name[level:], package, level)\r\n  File \"<frozen importlib._bootstrap>\", line 1014, in _gcd_import\r\n  File \"<frozen importlib._bootstrap>\", line 991, in _find_and_load\r\n  File \"<frozen importlib._bootstrap>\", line 975, in _find_and_load_unlocked\r\n  File \"<frozen importlib._bootstrap>\", line 671, in _load_unlocked\r\n  File \"<frozen importlib._bootstrap_external>\", line 783, in exec_module\r\n  File \"<frozen importlib._bootstrap>\", line 219, in _call_with_frames_removed\r\n  File \"./main.py\", line 19, in <module>\r\n    app = asyncio.get_event_loop().run_until_complete(new_app())\r\n  File \"uvloop/loop.pyx\", line 1450, in uvloop.loop.Loop.run_until_complete\r\n  File \"uvloop/loop.pyx\", line 1443, in uvloop.loop.Loop.run_until_complete\r\n  File \"uvloop/loop.pyx\", line 1351, in uvloop.loop.Loop.run_forever\r\n  File \"uvloop/loop.pyx\", line 480, in uvloop.loop.Loop._run\r\nRuntimeError: this event loop is already running.\r\n```\r\nEvent loop started running before app could be asynchronously constructed.\r\n\r\n### Environment\r\nUbuntu 20.04\r\nCPython 3.8.5\r\nUvicorn 0.13.3\r\n\r\n### Additional context\r\nReplacing step 1 with `pip install -e git+https://github.com/MarioIshac/uvicorn@feat-async-construction#egg=uvicorn` will achieve the expected behavior.\r\n\r\nThe particular benefit I get from having the app asynchronously & eagerly constructed instead of lazily constructed within `async def app(...)` is that I can take advantage of gunicorn preloading. I can also have the server fail-fast instead of on-first-request in the case that the asynchronous construction fails (for example, database connection pool could not be created).\n\n<!-- POLAR PLEDGE BADGE START -->\n> [!IMPORTANT]\n> - We're using [Polar.sh](https://polar.sh/encode) so you can upvote and help fund this issue.\n> - We receive the funding once the issue is completed & confirmed by you.\n> - Thank you in advance for helping prioritize & fund our backlog.\n\n<a href=\"https://polar.sh/encode/uvicorn/issues/941\">\n<picture>\n  <source media=\"(prefers-color-scheme: dark)\" srcset=\"https://polar.sh/api/github/encode/uvicorn/issues/941/pledge.svg?darkmode=1\">\n  <img alt=\"Fund with Polar\" src=\"https://polar.sh/api/github/encode/uvicorn/issues/941/pledge.svg\">\n</picture>\n</a>\n<!-- POLAR PLEDGE BADGE END -->\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "2 failed, 10 passed in 4.67s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "12 passed in 5.75s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

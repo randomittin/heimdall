@@ -1,0 +1,6 @@
+repository: https://github.com/Kludex/uvicorn
+issue: https://github.com/Kludex/uvicorn/issues/941
+pull_request: https://github.com/Kludex/uvicorn/pull/2919
+base_sha: b224045f5900b7f766743bcb16ba9fc3adea2606
+merge_sha: b499bc45101d920e691e384025d728507215d4d1
+license: BSD-3-Clause
