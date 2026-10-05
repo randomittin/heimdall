@@ -443,10 +443,11 @@ class RelayState:
             return True
         return False
 
-    def pending_envelopes(self, seen):
-        """Every ctl/NNN.json not yet in `seen`, ascending by numeric name --
-        the device-authored frames still queued to be pushed down the
-        currently-open stream."""
+    def pending_items(self, seen):
+        """Every ctl/NNN.json and ctl/NNN.raw not yet in `seen`, ascending by
+        numeric name -- what is still queued to be pushed down the
+        currently-open stream, as ("json", Envelope) or ("raw", text): the
+        device-authored frames, and whatever garbage a test wants sent."""
         try:
             names = sorted((n for n in os.listdir(self.ctl_dir) if NUM_JSON_RE.match(n)),
                            key=lambda n: int(n.split(".")[0]))
@@ -459,12 +460,38 @@ class RelayState:
             path = os.path.join(self.ctl_dir, n)
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    env = json.load(f)
+                    if n.endswith(".raw"):
+                        item = ("raw", f.read())
+                    else:
+                        item = ("json", json.load(f))
             except (OSError, ValueError):
                 continue  # not fully written yet -- retry next poll, never mark seen
             seen.add(n)
-            out.append(env)
+            out.append(item)
         return out
+
+    def flag_present(self, name):
+        """True while the ctl file `name` exists -- a flag that is read, never consumed."""
+        return os.path.exists(os.path.join(self.ctl_dir, name))
+
+    def consume_flag(self, name):
+        """True exactly once per creation of the ctl file `name`: it is removed as it is read."""
+        path = os.path.join(self.ctl_dir, name)
+        if not os.path.exists(path):
+            return False
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        return True
+
+    def log_stream_transport(self, transport, asked):
+        with self._frames_log_lock:
+            with open(os.path.join(self.log_dir, "stream-transport.log"), "a", encoding="utf-8") as f:
+                f.write("%s asked=%s\n" % (transport, "yes" if asked else "no"))
+
+    def log_ws_client(self, line):
+        with self._frames_log_lock:
+            with open(os.path.join(self.log_dir, "ws-client.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
 
 
 def _envelope_bytes(env):
@@ -485,6 +512,80 @@ def _envelope_type_seq(raw_body):
     if not isinstance(env, dict):
         return None, None
     return env.get("type"), env.get("seq")
+
+
+class _WsServer:
+    """The server end of an RFC 6455 connection, for this fake only: unmasked frames out, masked frames in.
+    Written here and nowhere else on purpose -- the fake is what bin/lib/hmd_relay_ws.py is tested AGAINST, so
+    it must not borrow that module's codec. Client frames are expected whole (FIN set, no fragmentation: the
+    client never fragments); anything else RFC 6455 forbids a client is reported as a violation, not repaired."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = bytearray()
+
+    def send(self, opcode, payload=b""):
+        n = len(payload)
+        if n < 126:
+            head = bytes([0x80 | opcode, n])
+        elif n < 65536:
+            head = bytes([0x80 | opcode, 126]) + struct.pack("!H", n)
+        else:
+            head = bytes([0x80 | opcode, 127]) + struct.pack("!Q", n)
+        self.sock.sendall(head + payload)
+
+    def send_text(self, text):
+        self.send(0x1, text.encode("utf-8"))
+
+    def send_close(self, code, reason=""):
+        self.send(0x8, struct.pack("!H", code) + reason.encode("utf-8"))
+
+    def poll(self, timeout):
+        """What the client sent within `timeout` seconds: ("text", str), ("close", code), ("eof",) or
+        ("violation", why), in order. A ping is answered here and is not an event."""
+        readable = bool(isinstance(self.sock, ssl.SSLSocket) and self.sock.pending())
+        if not readable:
+            readable = bool(select.select([self.sock], [], [], timeout)[0])
+        if readable:
+            try:
+                data = self.sock.recv(65536)
+            except (ConnectionResetError, ssl.SSLError):
+                return [("eof",)]
+            if not data:
+                return [("eof",)]
+            self.buf += data
+        return self._frames()
+
+    def _frames(self):
+        events = []
+        while len(self.buf) >= 2:
+            first, second = self.buf[0], self.buf[1]
+            opcode, length, head = first & 0x0F, second & 0x7F, 2
+            if length == 126:
+                if len(self.buf) < 4:
+                    break
+                length, head = struct.unpack("!H", bytes(self.buf[2:4]))[0], 4
+            elif length == 127:
+                if len(self.buf) < 10:
+                    break
+                length, head = struct.unpack("!Q", bytes(self.buf[2:10]))[0], 10
+            if not second & 0x80:
+                return events + [("violation", "unmasked client frame")]
+            if not first & 0x80:
+                return events + [("violation", "fragmented client frame")]
+            if len(self.buf) < head + 4 + length:
+                break
+            mask = bytes(self.buf[head:head + 4])
+            payload = bytes(c ^ mask[i % 4] for i, c in enumerate(self.buf[head + 4:head + 4 + length]))
+            del self.buf[:head + 4 + length]
+            if opcode == 0x1:
+                events.append(("text", payload.decode("utf-8", "replace")))
+            elif opcode == 0x8:
+                events.append(("close", struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else None))
+                break
+            elif opcode == 0x9:
+                self.send(0xA, payload)
+        return events
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -658,27 +759,25 @@ class Handler(BaseHTTPRequestHandler):
         if sess is None:
             return
 
+        asked = (self.headers.get("Upgrade") or "").lower() == "websocket"
+        if asked and STATE.ws_enabled:
+            self._serve_ws_stream(sess)
+            return
+        STATE.log_stream_transport("ndjson", asked)
+
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Transfer-Encoding", "chunked")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         try:
-            self._chunk_send(_envelope_bytes({
-                "v": 1, "session_id": sess.id, "seq": 0, "sender": "relay",
-                "type": "device_bound", "nonce": None, "ciphertext": None,
-                "payload": {"device_pubkey": STATE.device_pubkey_b64(), "bound_at": int(time.time())},
-            }))
+            self._chunk_send(_envelope_bytes(_device_bound(sess)))
             seen = set()
             while True:
                 with sess.lock:
                     ended = sess.ended
                 if ended or STATE.consume_end_session():
-                    self._chunk_send(_envelope_bytes({
-                        "v": 1, "session_id": sess.id, "seq": 0, "sender": "relay",
-                        "type": "session_ended", "nonce": None, "ciphertext": None,
-                        "payload": {"reason": "revoked"},
-                    }))
+                    self._chunk_send(_envelope_bytes(_session_ended(sess)))
                     self._chunk_end()
                     return
                 if STATE.consume_lifetime_close():
@@ -691,8 +790,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._chunk_end()
                     return
                 pushed = False
-                for env in STATE.pending_envelopes(seen):
-                    self._chunk_send(_envelope_bytes(env))
+                for kind, item in STATE.pending_items(seen):
+                    self._chunk_send(_envelope_bytes(item) if kind == "json" else item.encode("utf-8") + b"\n")
                     pushed = True
                 oversized_n = STATE.consume_oversized_line()
                 if oversized_n is not None:
@@ -710,6 +809,75 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(0.05)
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
+
+    def _serve_ws_stream(self, sess):
+        """GET /stream answered as a WebSocket (--ws): the same ctl protocol as the NDJSON loop above, one text
+        message where that writes one line, a close frame where it ends the response."""
+        key = self.headers.get("Sec-WebSocket-Key") or ""
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+        if STATE.consume_flag("bad-accept"):
+            accept = WS_WRONG_ACCEPT
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.close_connection = True
+        STATE.log_stream_transport("ws", True)
+        ws = _WsServer(self.connection)
+        try:
+            ws.send_text(_compact(_device_bound(sess)))
+            seen = set()
+            while True:
+                with sess.lock:
+                    ended = sess.ended
+                if ended or STATE.consume_end_session():
+                    ws.send_text(_compact(_session_ended(sess)))
+                    ws.send_close(4001, "session ended")
+                    return
+                if STATE.consume_lifetime_close():
+                    ws.send_close(1001, "going away")  # the relay ending the connection with no envelope first
+                    return
+                for kind, item in STATE.pending_items(seen):
+                    ws.send_text(_compact(item) if kind == "json" else item)
+                oversized_n = STATE.consume_oversized_line()
+                if oversized_n is not None:
+                    ws.send_text("X" * oversized_n)  # one message longer than the client's cap
+                if STATE.consume_drop_stream():
+                    return  # an abrupt close of the live connection: no close frame
+                for event in ws.poll(0.05):
+                    if event[0] == "text":
+                        STATE.log_ws_client("text %s" % event[1])
+                        if event[1] == "ping" and not STATE.flag_present("mute-pong"):
+                            ws.send_text("pong")
+                    elif event[0] == "close":
+                        STATE.log_ws_client("close %s" % event[1])
+                        ws.send_close(event[1] if event[1] is not None else 1000)
+                        return
+                    elif event[0] == "eof":
+                        STATE.log_ws_client("eof")
+                        return
+                    else:
+                        STATE.log_ws_client("violation %s" % event[1])
+                        ws.send_close(1002, "protocol error")
+                        return
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+
+def _compact(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def _device_bound(sess):
+    return {"v": 1, "session_id": sess.id, "seq": 0, "sender": "relay", "type": "device_bound",
+            "nonce": None, "ciphertext": None,
+            "payload": {"device_pubkey": STATE.device_pubkey_b64(), "bound_at": int(time.time())}}
+
+
+def _session_ended(sess):
+    return {"v": 1, "session_id": sess.id, "seq": 0, "sender": "relay", "type": "session_ended",
+            "nonce": None, "ciphertext": None, "payload": {"reason": "revoked"}}
 
 
 STATE = None  # set by serve_main
