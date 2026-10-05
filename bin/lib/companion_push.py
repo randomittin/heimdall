@@ -1223,5 +1223,6 @@ class PushMonitor:
 
 
 def source_paths(root):
-    """What the sender touches under the repo, for `hmd ui --print-sources`."""
-    return [os.path.join(root, STORE_REL), os.path.join(root, LOCK_REL)]
+    """What the sender touches under the repo, for `hmd ui --print-sources`: the registry, the lock, and the
+    operator's push-test request and its result."""
+    return [os.path.join(root, rel) for rel in (STORE_REL, LOCK_REL, TEST_REQUEST_REL, TEST_RESULT_REL)]
