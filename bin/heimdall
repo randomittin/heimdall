@@ -6,6 +6,7 @@
 #
 # Usage:
 #   heimdall "build a dashboard with auth"     Run a task end-to-end
+#   heimdall -- refactor                        Run a one-word task (a lone word is a command)
 #   heimdall                                    Interactive mode
 #   heimdall --update                           Pull latest version
 #   heimdall --setup                            Re-run plugin setup
@@ -3041,12 +3042,14 @@ case "${1:-}" in
   '')
     # §7 EMPTY ARGS → wrap-and-launch the default tool.
     #
-    # DISTINCT FROM THE UNKNOWN-TOKEN PATH, deliberately. An unknown token still
-    # falls through to the Claude task prompt below — that fall-through is what
-    # makes `hmd fix the login bug` work, and test/heimdall-cli-routing.test.sh §8
-    # pins it. Only the EMPTY invocation means "set this repo up and start", so
-    # only the empty invocation routes here. test/wrap-lifecycle.test.sh §8 asserts
-    # both behaviours separately; collapsing either into the other goes RED.
+    # DISTINCT FROM THE UNKNOWN-TOKEN PATH, deliberately. An unknown MULTI-WORD
+    # invocation still falls through to the Claude task prompt below — that
+    # fall-through is what makes `hmd fix the login bug` work, and
+    # test/heimdall-cli-routing.test.sh §8 pins it. (A lone unknown word is
+    # rejected, exit 2, by the guard just before ensure_node_path.) Only the EMPTY
+    # invocation means "set this repo up and start", so only the empty invocation
+    # routes here. test/wrap-lifecycle.test.sh §8 asserts both behaviours
+    # separately; collapsing either into the other goes RED.
     #
     # THE GUARD: heimdall-wrap launches `claude` by exec'ing THIS script back (it
     # owns model-tier resolution, the permission flags and the preamble). Without
