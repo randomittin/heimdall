@@ -274,6 +274,8 @@ HEX = lambda c: c * 64
 priv, pub = cp_auth.generate_keypair()
 signer = rr.Signer(priv)
 trust = {signer.key_id: pub}
+other_priv, other_pub = cp_auth.generate_keypair()
+attacker = rr.Signer(other_priv)
 FINDINGS = [
     {"id": "f-0001", "title": "duplicate settlement (webhook+retry within 50ms)", "severity": "high", "category": "concurrency", "digest": "sha256:" + HEX("a")},
     {"id": "f-0002", "title": "missing auth check on /refunds — é ✓", "severity": "medium", "category": "auth", "digest": "sha256:" + HEX("b")},
@@ -299,7 +301,8 @@ c = rr.canonical
 case("canonical: sorted keys, no whitespace", c({"b": 1, "a": [True, None, "x"]}) == b'{"a":[true,null,"x"],"b":1}')
 case("canonical: an integral float is written as an integer (1.0 -> 1, -0.0 -> 0, 134.0 -> 134)", c({"x": 1.0, "y": -0.0, "z": 134.0}) == b'{"x":1,"y":0,"z":134}')
 case("canonical: other numbers are the shortest round-trip decimal", c({"x": 0.41, "y": 1.25, "z": 12.35}) == b'{"x":0.41,"y":1.25,"z":12.35}')
-for label, bad in (("NaN", float("nan")), ("infinity", float("inf")), ("a number that needs an exponent (1e-05)", 1e-05), ("an integral number past 1e16", 1e16)):
+for label, bad in (("NaN", float("nan")), ("infinity", float("inf")), ("a number that needs an exponent (1e-05)", 1e-05),
+                   ("an integral float past 2**53", 1e16), ("an integer past 2**53 (a JavaScript verifier would misread it)", 2 ** 53)):
     try:
         c({"x": bad}); refused = False
     except ValueError:
@@ -339,6 +342,10 @@ proven = issue(**PROVEN_OVER)
 case("round trip: a PROVEN receipt verifies", outcome(proven, trust) == "ok")
 case("issue refuses a receipt that would violate its own contract (PROVEN with findings)", kind_of(lambda: issue(verdict="PROVEN")) == "invalid")
 case("issue refuses an unknown visibility", kind_of(lambda: issue(visibility="secret")) == "invalid")
+liar = rr.Signer(priv)
+liar.sign = attacker.sign       # signs with ANOTHER key while the receipt will name this signer's key_id
+case("issue refuses to hand out a receipt it cannot verify itself (a signer whose signatures do not match its key)",
+     kind_of(lambda: issue(signer=liar)) == "invalid")
 case("issue does not alias or mutate its inputs", FINDINGS[0]["title"] == "duplicate settlement (webhook+retry within 50ms)" and "signature" not in GATES[0])
 
 # ── every field, one at a time ───────────────────────────────────────────────
@@ -513,8 +520,6 @@ case("an ensure_ascii re-serialisation (non-ASCII as \\uXXXX escapes) is refused
 # ── who may have signed it ───────────────────────────────────────────────────
 mine = json.loads(raw)
 case("an empty trust set is a CONFIG error, never a pass and never 'invalid'", kind_of(lambda: rr.verify_bytes(raw, {})) == "no_trust")
-other_priv, other_pub = cp_auth.generate_keypair()
-attacker = rr.Signer(other_priv)
 forged_doc = copy.deepcopy(mine); forged_doc["verdict"] = "PROVEN"; forged_doc.update(findings=[], attacks={"total": 24, "survived": 24, "killed": 0})
 forged_doc["gates"] = PROVEN_OVER["gates"]; forged_doc["key_id"] = attacker.key_id
 forged_doc.pop("signature")
@@ -671,6 +676,187 @@ while IFS= read -r line; do
   esac
 done <"$TMP/crypto.out"
 [ "$crc" -eq 0 ] || bad "the crypto driver crashed (exit $crc): $(tail -3 "$TMP/crypto.err" | tr '\n' '|')"
+fi
+
+# rcpt <args...>: run `hmd receipt` from the repo root with stdin from /dev/null; sets ROUT RERR RRC
+rcpt() {
+  ROUT="$TMP/rcpt.out"; RERR="$TMP/rcpt.err"
+  (cd "$REPO" && "$HMD" receipt "$@" </dev/null >"$ROUT" 2>"$RERR"); RRC=$?
+}
+modeof() { python3 -c 'import os,stat,sys; print("%o" % stat.S_IMODE(os.stat(sys.argv[1]).st_mode))' "$1"; }
+# flip <file> <needle> <replacement>: replace the first occurrence of a text in a file
+flip() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+path, needle, repl = sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode()
+data = open(path, "rb").read()
+assert needle in data, "needle %r not in %s" % (needle, path)
+open(path, "wb").write(data.replace(needle, repl, 1))
+PY
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [V] VERIFY — hmd receipt verify / keygen
+# ══════════════════════════════════════════════════════════════════════════════
+if section V; then
+echo "[V] hmd receipt verify / keygen"
+VH="$TMP/v-home"; mkdir -p "$VH"; touch "$VH/setup-done"
+VK="$TMP/v-keys"; VS="$TMP/v-store"; VO="$TMP/v-out"; mkdir -p "$VO"
+D_ID=d1d1d1d1d1d1; P_ID=b2b2b2b2b2b2; V_ID=a1b2c3d4e5f6
+
+echo "  -- keygen: the documented key source --"
+rcpt keygen --dir "$VK"
+if [ "$RRC" -eq 0 ] && [ "$(modeof "$VK/runhmd-receipt.key")" = "600" ] && [ "$(modeof "$VK/runhmd-receipt.pub")" = "644" ] && [ "$(modeof "$VK")" = "700" ]; then
+  ok "keygen --dir DIR writes the secret key (0600) and the public key (0644) into a 0700 directory"
+else bad "keygen --dir DIR (rc=$RRC: $(head -3 "$RERR" | tr '\n' '|'))"; fi
+SEED="$(tr -d '\n' <"$VK/runhmd-receipt.key")"
+KID="$(grep -Eo '[0-9a-f]{16}' "$ROUT" | head -1)"
+if [ -n "$SEED" ] && ! grep -qF -- "$SEED" "$ROUT" "$RERR" && [ -n "$KID" ] && grep -qF "$VK/runhmd-receipt.pub" "$ROUT"; then
+  ok "keygen prints the key id and where the public key is, and never prints the seed"
+else bad "keygen output wrong (kid='$KID')"; fi
+before="$(shasum "$VK/runhmd-receipt.key" | awk '{print $1}')"
+rcpt keygen --dir "$VK"
+[ "$RRC" -eq 2 ] && grep -q 'key_exists' "$RERR" && [ "$before" = "$(shasum "$VK/runhmd-receipt.key" | awk '{print $1}')" ] \
+  && ok "keygen refuses to overwrite an existing key (exit 2) and leaves it byte-identical" || bad "keygen overwrote or mis-reported (rc=$RRC)"
+HEIMDALL_HOME="$VH" rcpt keygen
+[ "$RRC" -eq 0 ] && [ -f "$VH/signing/runhmd-receipt.key" ] && [ -f "$VH/signing/runhmd-receipt.pub" ] \
+  && ok "keygen with no --dir writes into \$HEIMDALL_HOME/signing (the default key source)" || bad "default keygen location wrong (rc=$RRC)"
+rcpt keygen --dir "$TMP/v-keys-other"
+OTHER_PUB="$TMP/v-keys-other/runhmd-receipt.pub"
+
+echo "  -- issuing fixtures with the library (the CLI under test only verifies) --"
+cat >"$TMP/make-receipts.py" <<'PY'
+import json, sys
+PYLIB, KEYFILE, STORE, OUT = sys.argv[1:5]
+sys.path.insert(0, PYLIB)
+import runhmd_receipt as rr
+signer = rr.load_signer(KEYFILE)
+HEX = lambda c: c * 64
+common = dict(signer=signer, subject={"kind": "path", "head_sha": None, "tree_sha256": HEX("c")}, agent={"name": "none", "model": None},
+              cost_usd=0, duration_s=1.25, created_at="2026-10-05T12:00:00Z")
+finding = {"id": "f-0001", "title": "duplicate settlement (webhook+retry within 50ms)", "severity": "high", "category": "concurrency",
+           "counterexample": {"summary": "event evt_1 credited twice", "repro_cmd": "hmd attack x --json --yes", "minimal_input": "{\"deliveries\":[{\"at_ms\":0},{\"at_ms\":10}]}"},
+           "evidence_ref": None}
+VERDICT = {"schema": "runhmd.verdict/1", "id": "a1b2c3d4e5f6", "verdict": "DENIED", "target": {"kind": "path", "ref": "x", "head_sha": None},
+           "attacks": {"total": 23, "survived": 17, "killed": 6}, "findings": [finding], "cost_usd": 0.0, "duration_s": 12.35,
+           "agent": {"name": "none", "model": None}, "receipt_url": None}
+json.dump(VERDICT, open(OUT + "/verdict.json", "w"), indent=2)
+receipts = {
+    "d1d1d1d1d1d1": rr.issue_receipt(id="d1d1d1d1d1d1", verdict="DENIED", attacks={"total": 24, "survived": 21, "killed": 3}, verdict_sha256=HEX("d"),
+        findings=[{k: finding[k] for k in ("id", "title", "severity", "category")} | {"digest": rr.finding_digest(finding)}], **common),
+    "b2b2b2b2b2b2": rr.issue_receipt(id="b2b2b2b2b2b2", verdict="PROVEN", attacks={"total": 24, "survived": 24, "killed": 0}, findings=[], verdict_sha256=HEX("d"), **common),
+    "a1b2c3d4e5f6": rr.receipt_for_verdict(VERDICT, tree_sha256=HEX("e"), signer=signer, created_at="2026-10-05T12:00:00Z"),
+}
+for rid, raw in receipts.items():
+    rr.write_receipt(STORE, rid, raw)
+PY
+python3 "$TMP/make-receipts.py" "$PYLIB" "$VK/runhmd-receipt.key" "$VS" "$VO" 2>"$TMP/make.err" && ok "fixtures: DENIED, PROVEN and verdict-attesting receipts signed with the generated key" || bad "fixture setup failed: $(tail -3 "$TMP/make.err" | tr '\n' '|')"
+cp "$VS/$D_ID.json" "$VO/denied.receipt.json"
+
+echo "  -- verify: a genuine receipt --"
+rcpt verify "$VO/denied.receipt.json" --pubkey "$VK/runhmd-receipt.pub"
+[ "$RRC" -eq 0 ] && grep -q "^ok $D_ID DENIED" "$ROUT" && grep -q "$KID" "$ROUT" \
+  && ok "verify FILE --pubkey PUB: exit 0, 'ok <id> <verdict>' naming the signing key" || bad "verify FILE (rc=$RRC: $(cat "$ROUT" "$RERR" | head -3 | tr '\n' '|'))"
+rcpt verify "$VO/denied.receipt.json" --pubkey "$VK/runhmd-receipt.pub" --json
+jq -e --arg id "$D_ID" --arg kid "$KID" '.ok==true and .id==$id and .verdict=="DENIED" and .key_id==$kid and .visibility=="private" and .created_at=="2026-10-05T12:00:00Z"' "$ROUT" >/dev/null 2>&1 \
+  && ok "verify --json: the canonical output, one JSON object on stdout" || bad "verify --json shape wrong: $(head -c 200 "$ROUT")"
+rcpt verify "$D_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS"
+[ "$RRC" -eq 0 ] && ok "verify <id> --store DIR: finds the receipt by id" || bad "verify by id with --store (rc=$RRC)"
+( cd "$REPO" && RUNHMD_RECEIPT_DIR="$VS" RUNHMD_RECEIPT_PUBKEY_FILE="$VK/runhmd-receipt.pub" "$HMD" receipt verify "$P_ID" </dev/null >/dev/null 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "verify <id>: RUNHMD_RECEIPT_DIR selects the store and RUNHMD_RECEIPT_PUBKEY_FILE the trust anchor" || bad "verify by id via env (rc=$rc)"
+mkdir -p "$VH/runhmd/receipts"
+python3 "$TMP/make-receipts.py" "$PYLIB" "$VH/signing/runhmd-receipt.key" "$VH/runhmd/receipts" "$TMP/v-out-home" 2>/dev/null || mkdir -p "$TMP/v-out-home"
+python3 "$TMP/make-receipts.py" "$PYLIB" "$VH/signing/runhmd-receipt.key" "$VH/runhmd/receipts" "$TMP/v-out-home" 2>"$TMP/make.err"
+HEIMDALL_HOME="$VH" rcpt verify "$P_ID"
+[ "$RRC" -eq 0 ] && ok "the default flow needs no flags: keygen, issue, then 'hmd receipt verify <id>' (default store, default trust = the local public key)" || bad "default flow (rc=$RRC: $(cat "$RERR" | head -2 | tr '\n' '|'))"
+
+echo "  -- verify: tampering is caught (exit 1, with the reason) --"
+cp "$VS/$D_ID.json" "$TMP/tamper-store-copy.json"
+before="$(shasum "$VS/$D_ID.json" | awk '{print $1}')"
+flip "$VS/$D_ID.json" 'duplicate settlement' 'duplicate settlemenT'
+rcpt verify "$D_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS"
+[ "$RRC" -eq 1 ] && grep -q 'bad_signature' "$RERR" && [ "$before" != "$(shasum "$VS/$D_ID.json" | awk '{print $1}')" ] \
+  && ok "RP3 acceptance: edit one byte of a STORED receipt and 'hmd receipt verify <id>' exits non-zero (1, bad_signature)" || bad "stored-receipt tamper not caught (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
+cp "$TMP/tamper-store-copy.json" "$VS/$D_ID.json"
+rcpt verify "$D_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS"; [ "$RRC" -eq 0 ] && ok "control: restoring the byte makes it verify again" || bad "control restore failed (rc=$RRC)"
+rcpt verify "$VO/denied.receipt.json" --pubkey "$VK/runhmd-receipt.pub" --json >/dev/null
+cp "$VO/denied.receipt.json" "$TMP/t-private-public.json"; flip "$TMP/t-private-public.json" '"visibility":"private"' '"visibility":"public"'
+rcpt verify "$TMP/t-private-public.json" --pubkey "$VK/runhmd-receipt.pub"
+[ "$RRC" -eq 1 ] && grep -q 'bad_signature' "$RERR" && ok "turning a private receipt public (a schema-valid edit) breaks the signature" || bad "private->public edit not caught (rc=$RRC)"
+cp "$VO/denied.receipt.json" "$TMP/t-verdict.json"; flip "$TMP/t-verdict.json" '"verdict":"DENIED"' '"verdict":"PROVEN"'
+rcpt verify "$TMP/t-verdict.json" --pubkey "$VK/runhmd-receipt.pub"
+[ "$RRC" -eq 1 ] && ok "rewriting DENIED as PROVEN is refused (exit 1)" || bad "DENIED->PROVEN edit not caught (rc=$RRC)"
+head -c 200 "$VO/denied.receipt.json" >"$TMP/t-trunc.json"
+rcpt verify "$TMP/t-trunc.json" --pubkey "$VK/runhmd-receipt.pub"; [ "$RRC" -eq 1 ] && grep -q 'not_json' "$RERR" && ok "a truncated receipt is refused (exit 1, not_json)" || bad "truncated receipt (rc=$RRC)"
+: >"$TMP/t-empty.json"
+rcpt verify "$TMP/t-empty.json" --pubkey "$VK/runhmd-receipt.pub"; [ "$RRC" -eq 1 ] && ok "an empty file is refused (exit 1)" || bad "empty file (rc=$RRC)"
+python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2, sort_keys=True, ensure_ascii=False))' "$VO/denied.receipt.json" >"$TMP/t-pretty.json"
+rcpt verify "$TMP/t-pretty.json" --pubkey "$VK/runhmd-receipt.pub"
+[ "$RRC" -eq 1 ] && grep -q 'not_canonical' "$RERR" && ok "a pretty-printed copy is refused (exit 1, not_canonical): only the signed bytes are the receipt" || bad "pretty-printed copy (rc=$RRC)"
+rcpt verify "$VO/denied.receipt.json" --pubkey "$OTHER_PUB"
+[ "$RRC" -eq 1 ] && grep -q 'unknown_key' "$RERR" && ok "a receipt signed by a key outside the pinned set is refused (exit 1, unknown_key)" || bad "unknown key (rc=$RRC)"
+rcpt verify "$VO/denied.receipt.json" --pubkey "$OTHER_PUB" --json
+jq -e '.ok==false and .error=="unknown_key" and (.detail|type=="string")' "$ROUT" >/dev/null 2>&1 && ok "verify --json on failure: {ok:false,error,detail} on stdout, exit 1" || bad "verify --json failure shape: $(head -c 200 "$ROUT")"
+cp "$VS/$P_ID.json" "$VS/$D_ID.swapped.json"; cp "$VS/$P_ID.json" "$TMP/swap.json"
+mkdir -p "$TMP/v-swap"; cp "$VS/$P_ID.json" "$TMP/v-swap/$D_ID.json"
+rcpt verify "$D_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$TMP/v-swap"
+[ "$RRC" -eq 1 ] && grep -q 'id_mismatch' "$RERR" && ok "a genuine receipt filed under another receipt's id is refused (exit 1, id_mismatch)" || bad "id swap (rc=$RRC)"
+rm -f "$VS/$D_ID.swapped.json"
+
+echo "  -- verify: configuration problems are exit 2, never a pass and never 'invalid' --"
+HEIMDALL_HOME="$TMP/v-empty-home" rcpt verify "$VO/denied.receipt.json"
+[ "$RRC" -eq 2 ] && grep -q 'no_trust' "$RERR" && ok "no trust anchor anywhere: exit 2 (no_trust), naming --pubkey, not a silent pass" || bad "no trust anchor (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
+rcpt verify "$TMP/nope.json" --pubkey "$VK/runhmd-receipt.pub"; [ "$RRC" -eq 2 ] && grep -q 'not_found' "$RERR" && ok "a missing file is exit 2 (not_found)" || bad "missing file (rc=$RRC)"
+rcpt verify zzzzzzzzzzzz --pubkey "$VK/runhmd-receipt.pub" --store "$VS"; [ "$RRC" -eq 2 ] && grep -q 'not_found' "$RERR" && ok "an unknown id is exit 2 (not_found)" || bad "unknown id (rc=$RRC)"
+mkdir -p "$TMP/decoy"; cp "$VS/$P_ID.json" "$TMP/decoy/$P_ID.json"
+for hostile in "../decoy/$P_ID" "a/b" ".." "$TMP/decoy/$P_ID"; do
+  rcpt verify "$hostile" --pubkey "$VK/runhmd-receipt.pub" --store "$VS/inner-never-created"
+  [ "$RRC" -eq 2 ] && ok "an id like '$hostile' is never resolved against the filesystem: exit 2" || bad "hostile id '$hostile' (rc=$RRC)"
+done
+rcpt verify "$VO/denied.receipt.json" --pubkey "$TMP/absent.pub"; [ "$RRC" -eq 2 ] && grep -q 'bad_trust' "$RERR" && ok "an unreadable --pubkey file is exit 2 (bad_trust)" || bad "absent pubkey file (rc=$RRC)"
+printf 'AAAA\n' >"$TMP/short.pub"
+rcpt verify "$VO/denied.receipt.json" --pubkey "$TMP/short.pub"; [ "$RRC" -eq 2 ] && grep -q 'bad_trust' "$RERR" && ok "a malformed --pubkey file is exit 2, not skipped" || bad "malformed pubkey (rc=$RRC)"
+rcpt verify; [ "$RRC" -eq 2 ] && ok "verify with no target is a usage error (exit 2)" || bad "verify with no target (rc=$RRC)"
+rcpt verify a b; [ "$RRC" -eq 2 ] && ok "verify with two targets is a usage error (exit 2)" || bad "verify with two targets (rc=$RRC)"
+rcpt verify --bogus x; [ "$RRC" -eq 2 ] && ok "an unknown flag is exit 2" || bad "unknown flag (rc=$RRC)"
+rcpt verify "$VO/denied.receipt.json" --pubkey; [ "$RRC" -eq 2 ] && ok "a flag missing its value is exit 2" || bad "missing flag value (rc=$RRC)"
+
+echo "  -- verify --verdict: do the digests mean anything? --"
+rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$VO/verdict.json"
+[ "$RRC" -eq 0 ] && ok "verify --verdict FILE: the receipt attests exactly this verdict document (exit 0)" || bad "--verdict match (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
+python3 - "$VO/verdict.json" "$TMP/verdict.duration.json" "$TMP/verdict.minimal.json" <<'PY'
+import json, sys
+src, dur, minimal = sys.argv[1:4]
+d = json.load(open(src)); d["duration_s"] = 12.36; json.dump(d, open(dur, "w"))
+d = json.load(open(src)); d["findings"][0]["counterexample"]["minimal_input"] = "{\"deliveries\":[]}"; json.dump(d, open(minimal, "w"))
+PY
+rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$TMP/verdict.duration.json"
+[ "$RRC" -eq 1 ] && grep -q 'verdict_mismatch' "$RERR" && grep -q 'elsewhere' "$RERR" && ok "--verdict: a verdict whose duration changed is refused (exit 1, verdict_mismatch, 'differs elsewhere')" || bad "--verdict duration tamper (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
+rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$TMP/verdict.minimal.json"
+[ "$RRC" -eq 1 ] && grep -q 'verdict_mismatch' "$RERR" && grep -q 'f-0001' "$RERR" && ok "--verdict: a counterexample edited AFTER the receipt was issued is caught through the finding digest (names f-0001)" || bad "--verdict counterexample tamper (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
+rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$TMP/absent-verdict.json"
+[ "$RRC" -eq 2 ] && ok "--verdict with an unreadable file is exit 2" || bad "--verdict unreadable (rc=$RRC)"
+printf 'not json' >"$TMP/verdict.garbage.json"
+rcpt verify "$V_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --verdict "$TMP/verdict.garbage.json"
+[ "$RRC" -eq 2 ] && ok "--verdict with a file that is not JSON is exit 2" || bad "--verdict garbage (rc=$RRC)"
+
+echo "  -- the command itself --"
+snap() { (cd "$1" && find . -type f -exec shasum {} + | sort); }
+s1="$(snap "$VS")"; h1="$(snap "$VK")"
+rcpt verify "$P_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --json >/dev/null
+[ "$s1" = "$(snap "$VS")" ] && [ "$h1" = "$(snap "$VK")" ] && ok "verify writes nothing (store and key directory byte-identical afterwards)" || bad "verify modified files"
+rcpt
+[ "$RRC" -eq 2 ] && grep -q 'verify' "$RERR" && grep -q 'keygen' "$RERR" && [ ! -s "$ROUT" ] && ok "hmd receipt with no subcommand prints the usage on stderr and exits 2" || bad "no-subcommand usage (rc=$RRC)"
+rcpt bogus; [ "$RRC" -eq 2 ] && grep -q 'bogus' "$RERR" && ok "an unknown subcommand is exit 2 and named" || bad "unknown subcommand (rc=$RRC)"
+rcpt --help
+if [ "$RRC" -eq 0 ] && for w in verify keygen render serve --pubkey --store --json --verdict RUNHMD_RECEIPT_KEY_FILE RUNHMD_RECEIPT_PUBKEY_FILE RUNHMD_RECEIPT_DIR; do grep -q -- "$w" "$ROUT" || { echo "missing $w" >&2; exit 1; }; done 2>"$TMP/help.miss" && grep -Eq '^ +1 ' "$ROUT" && grep -Eq '^ +2 ' "$ROUT"; then
+  ok "--help documents every subcommand, flag, the key/trust/store environment variables and the exit codes"
+else bad "--help incomplete (rc=$RRC: $(cat "$TMP/help.miss" 2>/dev/null | tr '\n' ' '))"; fi
+[ ! -s "$HEIMDALL_TRACE_ORDER" ] && ok "hmd receipt never fell through to the Claude task-prompt path during this section" || bad "hmd receipt fell through to the task-prompt path: $(head -c 200 "$HEIMDALL_TRACE_ORDER")"
+! grep -En 'shell[[:space:]]*=[[:space:]]*True|os\.system' "$PYLIB/runhmd_receipt.py" "$PYLIB/runhmd_receipt_cli.py" "$RECEIPT_BIN" >/dev/null 2>&1 \
+  && ok "the receipt code never shells out through a shell string" || bad "the receipt code uses shell=True / os.system"
+! grep -En '^[[:space:]]*(import|from)[[:space:]]+(socket|urllib|ssl|ftplib|smtplib|requests)' "$PYLIB/runhmd_receipt.py" "$PYLIB/runhmd_receipt_cli.py" "$RECEIPT_BIN" >/dev/null 2>&1 \
+  && ok "issue/verify code imports no network module (only the local server module does, and only to listen on loopback)" || bad "the receipt core imports a network module"
 fi
 
 echo ""
