@@ -645,6 +645,14 @@ case("write_receipt stores <id>.json byte for byte, readable only by the owner",
 case("read_receipt returns the stored bytes", rr.read_receipt(store, "a1b2c3d4e5f6") == raw)
 case("write_receipt replaces atomically and leaves no temp files", rr.write_receipt(store, "a1b2c3d4e5f6", proven) and os.listdir(store) == ["a1b2c3d4e5f6.json"])
 case("read_receipt of an unknown id is not_found", kind_of(lambda: rr.read_receipt(store, "zzzzzzzzzzzz")) == "not_found")
+doc_v, raw_v = rr.load_verified(store, "a1b2c3d4e5f6", trust)
+case("load_verified returns the verified document together with the exact stored bytes", doc_v["verdict"] == "PROVEN" and raw_v == proven)
+rr.write_receipt(store, "b1b2c3d4e5f6", proven)
+case("load_verified refuses a valid receipt filed under another receipt's id (it would be served at the wrong URL)",
+     kind_of(lambda: rr.load_verified(store, "b1b2c3d4e5f6", trust)) == "id_mismatch")
+rr.write_receipt(store, "c1b2c3d4e5f6", proven[:100] + bytes([proven[100] ^ 1]) + proven[101:])
+case("load_verified refuses a stored receipt whose bytes were altered",
+     kind_of(lambda: rr.load_verified(store, "c1b2c3d4e5f6", trust)) in ("not_json", "schema", "not_canonical", "bad_signature"))
 for hostile_id in ("../a1b2c3d4e5f6", "a/b", "..", ".", "", "a" * 65, "a b", "a\x00b", "/etc/passwd", "ab"):
     got = (kind_of(lambda: rr.read_receipt(store, hostile_id)), kind_of(lambda: rr.write_receipt(store, hostile_id, raw)))
     case("an id like %r never reaches the filesystem (bad_id on read and write)" % hostile_id, got == ("bad_id", "bad_id"), got)

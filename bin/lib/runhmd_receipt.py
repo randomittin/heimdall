@@ -479,6 +479,17 @@ def read_receipt(store, receipt_id):
         raise ReceiptError("store_failed", "cannot read %s: %s" % (path, exc)) from exc
 
 
+def load_verified(store, receipt_id, trust):
+    """(document, exact stored bytes) of stored receipt `receipt_id`, verified. The receipt's own id
+    must be the id it is filed under: otherwise one valid receipt copied to another receipt's file
+    name would be served, and look genuine, at the wrong URL."""
+    raw = read_receipt(store, receipt_id)
+    doc = verify_bytes(raw, trust)
+    if doc["id"] != receipt_id:
+        raise ReceiptError("id_mismatch", "filed as %s but it is receipt %s" % (receipt_id, doc["id"]))
+    return doc, raw
+
+
 def receipt_url(receipt_id, base=None):
     """https://<base>/r/<id>; <base> is `base`, else $RUNHMD_RECEIPT_BASE_URL, else https://runhmd.dev.
     A base that is not an https URL without query or fragment is refused."""
