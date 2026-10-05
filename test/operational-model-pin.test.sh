@@ -92,10 +92,27 @@ SWEPT_PATHSPECS=(bin hooks agents commands skills modules sentinels deploy .clau
 #                               nothing. Scoped to the dict's own line shape
 #                               (`"claude-...": dict(input=`) only — a pin
 #                               anywhere else in the file is still caught.
+#   bin/lib/fg_agent.py         the PRICES dict (US$/MTok rate table of the RP4
+#                               false-green Study A runner's spend meter). Same
+#                               class of exemption as cost-forensics above: the
+#                               meter reads the full id a finished message NAMES
+#                               and must key a rate on it, so the key can only be
+#                               a concrete id (one tier's generations differ in
+#                               price; a bare alias prices nothing). Data, never
+#                               a spawn: nothing in the table is passed to a CLI.
+#                               The table is frozen verbatim in the locked
+#                               PREREG.md Amendment 1, and
+#                               test/false-green-agent-cap.test.sh fails if the
+#                               two differ. Scoped to the dict's own line shape
+#                               (`"claude-...": (<five rates>),`) only — a pin
+#                               anywhere else in the file, comments included, is
+#                               still caught, as is a same-shaped line that
+#                               carries anything but five numbers.
 ALLOW_ROWS='bin/heimdall-bench|--model <id>|PIN_PROBE=claude-opus-4-8|heimdall-bench --live --model claude-
 bin/heimdall-model-resolve|HEIMDALL_MODEL_OPUS|PIN_PROBE=claude-opus-4-8|^#
 bin/lib/tier-table.json|no_pinned_ids|  "probe_pin": "claude-opus-4-8",|"no_pinned_ids"
-bin/heimdall-cost-forensics|PRICING = {|PIN_PROBE=claude-opus-4-8|^    "claude-[a-z0-9-]+": dict\(input='
+bin/heimdall-cost-forensics|PRICING = {|PIN_PROBE=claude-opus-4-8|^    "claude-[a-z0-9-]+": dict\(input=
+bin/lib/fg_agent.py|PRICES = {|    "claude-opus-4-8": ("--model", "claude-opus-4-8"),|^    "claude-[a-z0-9-]+": \([0-9.]+(, [0-9.]+){4}\),$'
 
 # The agent templates whose routing tables an orchestrator reads before it spawns.
 ROUTING_TEMPLATES="agents/heimdall.md agents/architect.md agents/planner.md"
