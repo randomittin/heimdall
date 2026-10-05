@@ -149,7 +149,7 @@ validate --schema "$TMP/schema-unsupported.json" "$DENIED_DOC"
 [ "$VRC" -eq 2 ] && printf '%s' "$VERR" | grep -q patternProperties \
   && ok "a schema keyword the validator cannot enforce fails closed (exit 2), never a silent pass" \
   || bad "unsupported schema keyword must fail closed (rc=$VRC: $VERR)"
-jq 'del(.properties.verdict.enum) | .properties.verdict.enum=["PROVEN","DENIED","MAYBE"]' "$SCHEMA_JSON" >"$TMP/schema-loose.json"
+jq '."$defs".verdict.enum=["PROVEN","DENIED","MAYBE"]' "$SCHEMA_JSON" >"$TMP/schema-loose.json"
 jq '.verdict="MAYBE"' "$DENIED_DOC" >"$TMP/maybe.json"
 validate --schema "$TMP/schema-loose.json" "$TMP/maybe.json"
 [ "$VRC" -eq 0 ] && ok "the schema FILE drives validation: loosening the enum there changes the verdict (it is the single source)" \
