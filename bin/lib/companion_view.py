@@ -42,7 +42,7 @@ Size: the diff is cut at a hunk boundary (`truncated: true`) once it passes `max
 still fits beside a state of that size; a phone that listed z-zlib gets the same frame compressed). When the very
 first hunk alone is over a budget its leading lines are kept rather than nothing.
 
-Rate: 20 requests in any 60 s. Work: every git call is an argv list in a scrubbed environment (no GIT_DIR, no
+Rate: 20 requests in any 60 s (HMD_VIEW_RATE_LIMIT, a positive whole number, replaces the 20). Work: every git call is an argv list in a scrubbed environment (no GIT_DIR, no
 pager, no external diff, no textconv, no fsmonitor, literal pathspecs), bounded by one DEADLINE_S for the request
 and GIT_OUTPUT_CAP bytes of output. A result lives in memory only and is never logged.
 
@@ -112,6 +112,12 @@ def controls_off(root):
     <repo>/.heimdall/app/controls-disabled. Read at every call, so the switch is never stale."""
     return (os.environ.get("HMD_UI_CONTROLS") == "0"
             or os.path.exists(os.path.join(root, ".heimdall", "app", "controls-disabled")))
+
+
+def rate_limit():
+    """Requests per RATE_WINDOW_S: RATE_LIMIT, or HMD_VIEW_RATE_LIMIT when that is a positive whole number."""
+    value = os.environ.get("HMD_VIEW_RATE_LIMIT", "")
+    return int(value) if value.isdigit() and int(value) > 0 else RATE_LIMIT
 
 
 def denied(segments):
@@ -339,6 +345,7 @@ class ViewManager:
         self._redact = redact
         self._budget = max_slice_bytes
         self._on_change = on_change
+        self._rate = rate_limit()
         self._stamps = collections.deque()  # time.monotonic() of the requests inside the last RATE_WINDOW_S
         self._result = None
 
@@ -377,7 +384,7 @@ class ViewManager:
         now = time.monotonic()
         while self._stamps and now - self._stamps[0] >= RATE_WINDOW_S:
             self._stamps.popleft()
-        if len(self._stamps) >= RATE_LIMIT:
+        if len(self._stamps) >= self._rate:
             return max(1, int(math.ceil(RATE_WINDOW_S - (now - self._stamps[0]))))
         self._stamps.append(now)
         return 0
@@ -427,10 +434,13 @@ class ViewManager:
             entry = {"path": rel, "status": "?", "add": 0, "del": 0, "binary": True}
             return self._result_of(req, [entry], [], 0, False)
         lines = data.decode("utf-8", "replace").split("\n")
-        ended = lines.pop() == ""  # the piece after the last newline: empty when the file ends with one
+        ended = lines[-1] == ""  # the piece after the last newline is empty when the file ends with one
+        if ended:
+            lines.pop()
         body = [("+", s) for s in lines] + ([] if ended or not lines else [("\\", " No newline at end of file")])
         entry = {"path": rel, "status": "?", "add": len(lines), "del": 0, "binary": False}
-        added = [(rel, "@@ -0,0 +1,%d @@" % len(lines), body, True)] if lines else []
+        header = "@@ -0,0 +1%s @@" % ("" if len(lines) == 1 else ",%d" % len(lines))  # git's own form
+        added = [(rel, header, body, True)] if lines else []
         hunks, raw, cut = self._collect(iter(added), {rel}, req["max_bytes"], BASE_JSON_BYTES + _jsize(entry) + 1)
         return self._result_of(req, [entry], hunks, raw, cut)
 
