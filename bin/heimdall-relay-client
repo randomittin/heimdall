@@ -89,7 +89,8 @@ to drive its own UI; nothing else is ever written to stdout.
         handling (a `keepalive` control frame is always silent -- never
         logged, not even at this level); any action other than the nine
         named (the three login_* only while bin/lib/companion_cc_login.py
-        imported) is acked `not-implemented`. Never the token, ref or label
+        imported) and the four control actions (REMOTE CONTROLS below) is
+        acked `not-implemented`. Never the token, ref or label
         of a push registration (see PUSH REGISTRATION below), never a login
         command's params (see REMOTE CLAUDE CODE LOGIN below). A stale-seq
         frame that is refused gets one too: action null, ok false, detail
