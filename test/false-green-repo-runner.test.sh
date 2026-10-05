@@ -248,7 +248,8 @@ def tools_after(argv):
 
 done, argv = stub_run("cc-repo", TASK, extra=("--model", "sonnet"))
 t("the real claude-code command runs on a repository task and its row is written", done.returncode == 0 and first(os.path.join(tmp, "cc-repo"), "runhmd").get("agent_claim") == "gave_up", (done.returncode, done.stderr[-300:]))
-t("it runs headless: -p and the issue prompt, which carries the CLAIM protocol", argv[:1] == ["-p"] and "CLAIM: done" in argv[1] and "Add is broken" in argv[1], argv[:2])
+prompt = "\n".join(argv[1:next((i for i in range(1, len(argv)) if argv[i].startswith("--")), len(argv))])      # the stub prints one argument per line, the prompt has several lines
+t("it runs headless: -p and the issue prompt, which carries the CLAIM protocol", argv[:1] == ["-p"] and "CLAIM: done" in prompt and "Add is broken" in prompt, argv[:3])
 t("permission mode acceptEdits, and anything that would prompt is denied outright", after(argv, "--permission-mode") == "acceptEdits" and after(argv, "--permission-prompts") == "none", argv)
 t("the allowlist is exactly python and pytest of the workspace's own .venv", tools_after(argv) == REPO_TOOLS, tools_after(argv))
 t("the operator's hooks, plugins and MCP servers are off, and no session is saved", "--safe-mode" in argv and "--no-session-persistence" in argv, argv)

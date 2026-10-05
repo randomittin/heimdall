@@ -295,7 +295,7 @@ echo "[B] bench: through bin/benchmark and the Study A live path"
 GOLDEN="$SUITE/tasks/settlement-webhook/base/golden.mjs"
 bench() {  # bench <name> <agent-cmd...>: one fake agent, both arms, rows in $TMP/<name>
   local name="$1"; shift
-  bash "$BENCH" run --suite false-green --agent "fake-$name" --agent-cmd "$*" --live --confirm-spend --out "$TMP/$name" >"$TMP/$name.out" 2>"$TMP/$name.err"
+  bash "$BENCH" run --suite false-green --agent "fake-$name" --agent-cmd "$*" --live --confirm-spend --only settlement-webhook --out "$TMP/$name" >"$TMP/$name.out" 2>"$TMP/$name.err"
 }
 PYBIN="$(command -v python3)"
 printf '#!/bin/sh\necho "CLAIM: done"\n' >"$TMP/plain.sh"; chmod +x "$TMP/plain.sh"
@@ -337,7 +337,7 @@ cp "$GOLDEN" webhook.mjs
 cat "$TMP/claude.stream"
 EOF
 chmod +x "$TMP/stubbin/claude"
-PATH="$TMP/stubbin:$PATH" bash "$BENCH" run --suite false-green --agent claude-code --live --confirm-spend --out "$TMP/cc" >"$TMP/cc.out" 2>"$TMP/cc.err"
+PATH="$TMP/stubbin:$PATH" bash "$BENCH" run --suite false-green --agent claude-code --live --confirm-spend --only settlement-webhook --out "$TMP/cc" >"$TMP/cc.out" 2>"$TMP/cc.err"
 check "the claude-code command streams JSON events"                            bash -c "grep -qx 'stream-json' '$TMP/claude.argv' && grep -qx -- '--verbose' '$TMP/claude.argv'"
 check "the claude-code command carries the agent's own cap, --max-budget-usd 2.00" bash -c "[ \"\$(awk '/^--max-budget-usd\$/{getline; print}' '$TMP/claude.argv')\" = 2.00 ]"
 check "the claude-code command still passes the prompt with -p"                bash -c "grep -qx -- '-p' '$TMP/claude.argv' && grep -q 'CLAIM: done' '$TMP/claude.argv'"
@@ -356,7 +356,7 @@ def t(desc, cond, detail=""):
 
 fg_bench.RUN_TIMEOUT_S = 1
 args = argparse.Namespace(agent="fake-timeout", agent_cmd="%s %s events=1 silent_for=60 {prompt}" % (sys.executable, os.path.join(tmp, "fake_stream.py")),
-                          arm="runhmd", out=os.path.join(tmp, "timeout"))
+                          arm="runhmd", out=os.path.join(tmp, "timeout"), only="settlement-webhook")
 with contextlib.redirect_stdout(io.StringIO()):
     fg_bench.run_study_a_live(fg_bench.SUITE, args)
 row = json.loads(open(os.path.join(tmp, "timeout", "runhmd.jsonl")).read().splitlines()[0])
@@ -380,7 +380,7 @@ out = []
 def t(desc, cond, detail=""):
     out.append("%s\t%s\t%s" % ("PASS" if cond else "FAIL", desc, "" if cond else detail))
 
-anchor_path, anchor = fg_bench.load_tasks(fg_bench.SUITE)[0]
+anchor_path, anchor = [(p, t) for p, t in fg_bench.load_tasks(fg_bench.SUITE) if t and t["id"] == "settlement-webhook"][0]
 fg_bench.load_tasks = lambda suite: [(anchor_path, dict(anchor, id="t%d" % i)) for i in range(1, 5)]
 fg_bench.TOTAL_CAP_USD = 5.0          # two $1.80 runs leave $1.40, less than one $2.00 run
 fake = "%s %s" % (sys.executable, os.path.join(tmp, "fake_stream.py"))
