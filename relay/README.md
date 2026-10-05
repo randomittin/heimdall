@@ -13,11 +13,13 @@ The relay is hmd's presence control plane: outbound-only from the laptop (Decisi
 end-to-end-encrypted pipe between one laptop (`hmd`) and one or more paired phones, keyed by a
 Durable Object per `session_id` (the single serialization point for that session's state).
 
-- **hmd leg** (laptop, authenticated): `GET /session/:id/stream` — a long-lived chunked-HTTP
-  response, one NDJSON-encoded envelope per line, for frames the phone sent, plus a
-  `keepalive` control frame every 20s of idleness (see "Stream lifetime" below). `POST
-  /session/:id/frames` — send one envelope to the phone. Both require
-  `Authorization: Bearer <relay_session_token>`.
+- **hmd leg** (laptop, authenticated): `GET /session/:id/stream` — for frames the phone sent, in
+  one of two transports chosen by the request alone: a hibernatable **WebSocket** when it carries
+  `Upgrade: websocket` (one envelope per text message; the Durable Object can sleep while hmd is
+  connected — see "The hmd leg as a WebSocket" below), otherwise the original long-lived
+  chunked-HTTP response, one NDJSON-encoded envelope per line, plus a `keepalive` control frame
+  every 20s of idleness (see "Stream lifetime" below). `POST /session/:id/frames` — send one
+  envelope to the phone. Both require `Authorization: Bearer <relay_session_token>`.
 - **phone leg** (WebSocket): `wss://.../session/:id/ws?pairing_code=<code>` for the first claim,
   or `?device_token=<token>` to reconnect after binding.
 - **pairing**: `POST /pair/init` (unauthenticated) creates a session and returns a session id, a
@@ -151,7 +153,38 @@ Response `200`:
 - `400` — malformed `:id` (not a UUID) — rejected before reaching the Durable Object.
 - `404` — well-formed `:id` that was never initialized via `/pair/init`.
 
-#### Stream lifetime
+#### The hmd leg as a WebSocket (hibernatable)
+
+`GET /session/:id/stream` with `Upgrade: websocket` — the same route, the same bearer, the same
+`401`/`404` (ordinary JSON, never an upgrade) — is answered `101`, and the Durable Object accepts
+the socket through the Hibernation API (`ctx.acceptWebSocket(server, ["hmd"])`). A request without
+the header gets the NDJSON response above, unchanged: that is what every client that predates this
+gets, and what an older relay answers an `Upgrade` request with (it ignores the header), so client
+and relay can be deployed in either order. The wire is pinned in `contract/wire.json` (`stream_ws`).
+
+- **One envelope per text message** — the bytes of an NDJSON line without its newline. The first
+  message is the held `device_bound` if the phone claimed before hmd connected; then the phone's
+  `command` frames. `session_ended` (INV-38) arrives as a message before the close. Never a
+  `keepalive`.
+- **No timer, nothing in memory.** No keepalive, no lifetime bound, no response body: nothing keeps
+  the object resident, so it is evicted between events, and a frame arriving later (a phone
+  command, hmd's `POST /frames`) wakes it and is still delivered. Which socket is newest and which
+  session it belongs to are on the socket (`getWebSockets("hmd")`, `{ gen, sid }` on its
+  attachment), never on the instance. Hibernatable sockets are re-delivered to the new generation
+  after a deploy, so the 2026-09-25 orphaned-stream failure cannot happen on this transport.
+- **Liveness is hmd's job.** hmd sends the text message `ping` and the runtime answers `pong`
+  (`setWebSocketAutoResponse`) without waking the object. Any other message from hmd is ignored and
+  logged `frame_rejected` (`leg: "hmd"`, `ws_message_unsupported`); one over `MAX_ENVELOPE_BYTES`
+  closes the socket with `1009`.
+- **Newest wins, across both transports.** A new hmd leg — WebSocket or NDJSON — ends the previous
+  one: a socket with close code `4002` (`superseded`), a stream by closing it.
+- **Ends.** `POST /revoke` closes the socket `4001` (`revoked`); a relay-ended session (pairing
+  expiry, claim throttle, purge) sends the `session_ended` message, then closes `4001`.
+- **Logs** (never a URL or token): `hmd_stream_open` `{transport: "ws" | "ndjson"}` on every open
+  — what to count in `wrangler tail` to watch a rollout — and `hmd_socket_closed` /
+  `hmd_socket_error`.
+
+#### Stream lifetime (the NDJSON transport)
 
 **Cloudflare closes a long-lived chunked response that carries no bytes.** Observed live on
 2026-09-24 against the deployed relay: a stream opened at 08:33:53 with a phone bound and state
@@ -549,12 +582,14 @@ Deliberately **not** changed here, with reasons:
 - **What hibernates, and what does not (Durable Object duration).** The phone leg is a
   Hibernation-API socket (`ctx.acceptWebSocket`, `webSocketMessage`/`Close`/`Error`, per-socket
   state on `serializeAttachment`), and a bound session with no hmd stream open can be evicted
-  right after any request. hmd's `GET /stream` cannot hibernate: an open response holds the
+  right after any request. hmd's NDJSON `GET /stream` cannot hibernate: an open response holds the
   object resident, and with it the `setTimeout` keepalive and lifetime timers, so a Durable Object
-  is billed wall-clock (128 MB) for as long as hmd's stream is open — about 10.8k GB-s per day
-  for one session with hmd always on. Measurements, the follow-ups that would remove it, and how
-  to measure duration before/after: `docs/analysis/2026-10-05-relay-hibernation.md`. The
-  eviction-based proof is `test/hibernation.spec.ts`.
+  is billed wall-clock (128 MB) for as long as that stream is open — about 10.8k GB-s per day
+  for one session with hmd always on. hmd's WebSocket leg (above) is a Hibernation-API socket with
+  no timer, so with it connected the object sleeps between events. Measurements, the estimate for
+  the WebSocket leg, and how to measure duration before/after:
+  `docs/analysis/2026-10-05-relay-hibernation.md`. The eviction-based proofs are
+  `test/hibernation.spec.ts` and `test/hmd-ws.spec.ts`.
 - **The keepalive is a `setTimeout` chain, not a Durable Object alarm.** An alarm is the durable
   choice and survives eviction, but this DO has no other alarm use and a 20s alarm rescheduled
   forever would pin the object awake for the life of a session, billed, purely to write filler.

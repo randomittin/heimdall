@@ -216,3 +216,33 @@ Acceptance:
 > state that did not survive eviction: the `device_bound` held for hmd (now in storage) and the session id in early log lines (now on the socket attachment). It does not change Durable Object duration: that is hmd's open `GET /stream`,
 > and two always-on streams account for the 2026-10-04 free-cap trip (13,289 GB-s modelled vs the observed 18:17Z). Removing it needs the hmd leg on a hibernatable WebSocket or a Worker-held stream
 > (`docs/analysis/2026-10-05-relay-hibernation.md`, section 6). The ack volume (~5,200/day) is a phone-side `register_push` loop (99.1% of commands), not relay load. Duration probe: section 7 of the same note.
+
+## 9. Follow-up A shipped: the hmd leg over a hibernatable WebSocket
+
+Option A was built, not B: it removes the pin at its root (no response body, no timer in the object), where B moves it to a Worker that
+would hold a long streamed response and its keepalives for hours (not validated on the platform) and still needs the router change this
+note deferred; A is also the end state section 6 names, and the client change it needs lives in this repo.
+
+- **Wire** (`relay/contract/wire.json` `stream_ws`): the same route, `GET /session/:id/stream`, with `Upgrade: websocket`. No Upgrade header is
+  exactly the old NDJSON stream. One envelope per text message, no keepalive, hmd's `ping` answered `pong` by the runtime, close codes 4001
+  (ended) / 4002 (superseded, newest leg wins across both transports) / 1009 (too big).
+- **Compatibility, both deploy orders.** Old client against the new relay: it sends no Upgrade, gets NDJSON. New client against the old relay:
+  it asks, the relay ignores the header and answers 200 NDJSON, the client reads that (`stream_open transport=ndjson`).
+  `HMD_RELAY_STREAM_TRANSPORT=ndjson` pins the old transport. The E2E layer is untouched: the relay still sees only the envelope.
+- **Semantics kept over the new transport** (`bin/heimdall-relay-client`): rotation (`HMD_RELAY_STREAM_ROTATE_S`, now with a close frame first), the
+  idle drop (`HMD_RELAY_STREAM_IDLE_S`, counted only while blocked in the read; a ping goes out after a third of it), backoff, the per-message and
+  per-connection byte caps, 401/404/410/429, and everything downstream of the read (replay guard, refusal acks, ack retry and priority, the two
+  persistent POST connections), because a message goes through the same `_handle_envelope` a line did.
+- **Estimate per always-on session, by this note's method.** Stream-open seconds billed: 0. What is left is wakes: the client's planned rotation
+  (every 540 s, 160 a day) costs one upgrade request and one close handler, ~40 ms at the section 6 assumption, so 160 x 40 ms = 6.4 s =
+  **~0.8 GB-s/day**; pings are answered without a wake. Add section 6's activity wakes (~5 GB-s/day per session at ~20 ms each). Typical:
+  **~6 GB-s/day per session against 5,800 to 10,800 today (about 1,000x less)**. Hard bound, every wake billed a full 10 s window:
+  160 x 10 s x 0.125 = 200 GB-s/day for rotation plus ~740 for activity, **~940 GB-s/day, still 6x to 11x below today**. The rotation
+  interval is the dominant idle term and is a knob (a longer `HMD_RELAY_STREAM_ROTATE_S` removes most of it); the default stays 540 s so the
+  byte caps keep their per-connection meaning. This is an estimate, not a measurement: confirm with section 7's probe after the deploy
+  (`hmd_stream_open` with `transport: "ws"` in `wrangler tail` shows who has moved; acceptance is under ~500 GB-s/day per session).
+- **Proof in the tree**: `relay/test/hibernation.spec.ts` (an idle object with hmd's socket attached is evicted at once, and the next phone command
+  or hmd POST is still delivered; the held `device_bound` survives an eviction; newest-wins survives an eviction), `relay/test/hmd-ws.spec.ts`,
+  `relay/test/contract.spec.ts`, `test/hmd-relay-ws.test.sh` (the RFC 6455 client against frames built from the RFC's own examples, and
+  ten deliberately broken copies), `test/relay-contract-fixtures.test.sh`, and scenario Z of `test/heimdall-app-relay.test.sh` (the fake relay
+  speaks WebSocket and TLS; scenarios A to Y now run a client that asks for the upgrade against a relay that ignores it).
