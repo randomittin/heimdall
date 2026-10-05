@@ -898,22 +898,35 @@ fi
 wait "$HUP_FG_PID" 2>/dev/null
 rm -rf "$D"
 
-# ── A5. the pairing URL/token is never visible in hmd_qr.py's argv (ps) ───
-# argv is what `ps` shows any local user. hmd_qr.py lives only milliseconds
-# (render a QR, exit), so sampling `ps` races it -- under load the sampler
-# routinely misses the process entirely and the check goes inconclusive.
-# Instead record argv at exec time through the HMD_PYTHON seam: a wrapper
-# logs its exact argv, then execs the real interpreter. That is the same
-# argv `ps` would display, captured deterministically, never sampled.
+# ── A5. the pairing URL/token rides hmd_qr.py's stdin, never its argv (ps) ──
+# argv is what `ps` shows any local user; stdin is not. hmd_qr.py lives only
+# milliseconds (render a QR, exit), so sampling `ps` for it races it -- under
+# load the sampler misses the process entirely and the check goes
+# "inconclusive" -- and a machine-wide `ps | grep` can also match some OTHER
+# session's hmd_qr.py. Instead observe the launch itself, deterministically,
+# through the HMD_PYTHON seam (hmd_qr.py has no path override of its own; the
+# interpreter is what the app resolves through the environment): a wrapper
+# interpreter appends the exact argv of every launch to a log and, for the
+# hmd_qr.py launch only, saves its stdin to a file, then execs the real
+# interpreter so the QR still renders. Both are written BEFORE the real
+# process runs, so there is nothing to sample and nothing to miss.
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-a5.out"
 A5_ARGV_LOG="$TMPROOT/a5-argv.log"
+A5_STDIN_LOG="$TMPROOT/a5-qr-stdin.log"
 A5_PY_WRAP="$TMPROOT/a5-python-argv-recorder"
 A5_REAL_PY="$(. "$REPO/bin/lib/hmd-python.sh"; hmd_python 2>/dev/null || true)"
 : >"$A5_ARGV_LOG"
+: >"$A5_STDIN_LOG"
 cat >"$A5_PY_WRAP" <<A5WRAP
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >>"$A5_ARGV_LOG"
+case "\$*" in
+  *hmd_qr.py*)
+    cat >"$A5_STDIN_LOG"
+    exec "$A5_REAL_PY" "\$@" <"$A5_STDIN_LOG"
+    ;;
+esac
 exec "$A5_REAL_PY" "\$@"
 A5WRAP
 chmod +x "$A5_PY_WRAP"
@@ -945,6 +958,21 @@ else
     ok "A5b. pairing URL still reached the operator (stdout carries the token URL)"
   else
     bad "A5b. connect output never showed the pairing URL: $(tail -5 "$OUT_FILE" 2>/dev/null)"
+  fi
+
+  # The positive half of "stdin, not argv": the bytes the QR renderer was
+  # handed on stdin are exactly the URL connect showed the operator. Both
+  # sides must be non-empty, so two empty strings can never compare equal.
+  A5_PRINTED_URL="$(grep -Eo 'https://[^[:space:]]+\?token=[A-Za-z0-9_-]+' "$OUT_FILE" 2>/dev/null | head -1)"
+  A5_STDIN_URL="$(cat "$A5_STDIN_LOG" 2>/dev/null || true)"
+  if [ -z "$A5_PRINTED_URL" ]; then
+    bad "A5c. no pairing URL in connect's output to compare the QR payload against: $(tail -5 "$OUT_FILE" 2>/dev/null)"
+  elif [ -z "$A5_STDIN_URL" ]; then
+    bad "A5c. hmd_qr.py stdin was empty -- the pairing URL never reached the QR renderer on stdin (argv: $A5_QR_ARGV)"
+  elif [ "$A5_STDIN_URL" = "$A5_PRINTED_URL" ]; then
+    ok "A5c. hmd_qr.py received the printed pairing URL on stdin (QR payload == the URL shown to the operator)"
+  else
+    bad "A5c. hmd_qr.py stdin differs from the URL connect printed (stdin: $A5_STDIN_URL; printed: $A5_PRINTED_URL)"
   fi
 
   kill -TERM "$A5_FG_PID" 2>/dev/null
