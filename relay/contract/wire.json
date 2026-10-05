@@ -8,7 +8,7 @@
     "$name in a string is a binding (see `bindings`). A value the relay mints (ids, codes, tokens, clocks) is matched by pattern when the relay is the producer, and takes its example when a client is fed it. A `computed` binding is derived from vectors.json by each consumer, so no key ever sits in this file.",
     "Everything a client or the phone sends is replayed byte for byte: JSON is serialized compact with the key order stored here.",
     "Sealed frames in `frames` are sealed under the session key HKDF(ECDH(hmdSeedHex, phnSeedHex)) with salt = bindings.session_id.example, sender tags hmd\\0 / phn\\0, nonce = tag + seq (8 bytes, big endian). hmd frames' plaintext is serialized with sorted keys (what the client does); phone frames' in the app's insertion order.",
-    "Every state frame's plaintext also carries hmd's capability tokens in-band (zero-lag Ask 5): {\"caps\":[\"login-v1\",\"push-v1\",\"resync\",\"z-zlib\"],\"state\":{...}}. Keys are sorted, so caps is stored before state; acks carry no caps. login-v1 (remote Claude Code login) is listed whenever hmd loaded its login module, so it is part of the sealed bytes. push-v1 says hmd takes the phone's register_push / unregister_push / app_state commands (push notifications, PN2); hmd leaves it out when the operator sets HMD_PUSH=0, so this fixture is hmd with push on.",
+    "Every state frame's plaintext also carries hmd's capability tokens in-band (zero-lag Ask 5): {\"caps\":[\"login-v1\",\"push-v1\",\"resync\",\"view-v1\",\"z-zlib\"],\"state\":{...}}. Keys are sorted, so caps is stored before state; acks carry no caps. login-v1 (remote Claude Code login) is listed whenever hmd loaded its login module, so it is part of the sealed bytes. push-v1 says hmd takes the phone's register_push / unregister_push / app_state commands (push notifications, PN2); hmd leaves it out when the operator sets HMD_PUSH=0, so this fixture is hmd with push on. view-v1 (the phone's read-only file diff, bin/lib/companion_view.py) is listed whenever hmd loaded that module, so it too is part of the sealed bytes.",
     "POST /frames carries Connection: keep-alive: hmd keeps one persistent HTTP/1.1 connection per sender (state frames on one, acks on the other), so a replay counts requests, not connections.",
     "ack_non_increasing_seq is hmd's answer when command_send_message (seq 1) arrives again after hmd took seq 3: the replay guard refuses a device seq that is not above the last one it accepted and, because the frame opens under the session key, refuses it with this sealed ack -- ok false, detail non-increasing-seq, last the last device seq accepted (3), of_seq the replayed seq (1), no other key -- so the phone can seal the command again above last. It is hmd's fifth frame (seq 5). The replay re-sends command_send_message's wire byte for byte, so the fixture holds no second phone frame; a frame that does not open is never answered.",
     "The relay routes by URL and never reads envelope.session_id, so these sealed frames carry the fixture's session id, not the live one the relay minted.",
@@ -267,6 +267,7 @@
           "login-v1",
           "push-v1",
           "resync",
+          "view-v1",
           "z-zlib"
         ],
         "state": {
@@ -280,7 +281,7 @@
         }
       },
       "wire": {
-        "ciphertext": "4ffOuMJYIVw3E6x5IMbJ8NrsS2oCukYX1klZjpNFsTIXcGPzlZMtmNjthQWUuv/bohFkISaIHAIU5VCyDWa8cstEJrmzvKZZjuipKl31mTKDZqCXnNdpQUptpgh76QC2/b+6XyY2LTN8VIZPKcr0Hn44YEWu9Hq/Yj4+RCZG4ydMpmlwkB2wa8+l/H7szlqM+5GCSsgGsrJE46vTC+yRKAAMXPGoTP1vxFHoCzM+Xn/H7BQh3+dhVcyxYNJw+//sUCRZO+wkP1znBR5hzl5cwxnwmOCfbxvOlJiK2XD+taRZKB2nwB9amSlsFJcIViQCCqY32QHbP/+yBBg=",
+        "ciphertext": "4ffOuMJYIVw3E6x5IMbJ8NrsS2oCukYX1klZjpNFsTIXcGPzlZMtmNSpmh7QruykohFteD2QEEIMw17hC3Oxb9ofQ6XwubYa2Pr/MG73mTS5MPWzzsF2TAklnx14xRXvrKX9BDM4L2IjWupSbMPiGH1+OwuMtimjZiM2Di1Z4GQftGdxm1f0OPK+sjik01GBuNWxU8oL5q5A/qOXA+6UcVRYW+y/H+Avj1jjCSY0RGneo2kqlrdhX8u6L4keobjtVChTJZFsaxOgHxlwiRRtxBD/0aubaBvOy9rejGTv+OFNIAKgwRZSkiUnXxQD5TbNq4jFBK1b+WrwD1XaH8D23x7Unuez",
         "nonce": "aG1kAAAAAAAAAAAB",
         "payload": null,
         "sender": "hmd",
