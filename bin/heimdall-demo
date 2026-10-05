@@ -31,6 +31,8 @@
 #   heimdall-demo ./demo --force        Overwrite an existing scaffold
 #   heimdall-demo --intro               Force-replay the first-run narrated arc
 #   heimdall-demo --no-intro            Skip the narrated arc this run
+#   heimdall-demo --offline [--json]    DENIED -> fix -> PROVEN on the real attack engine;
+#                                       no network, no model, nothing outside a temp dir
 #
 # Dry mode is the default and never executes work — it only writes files and
 # prints the paste-ready next step. --run additionally launches heimdall.
@@ -71,6 +73,22 @@ RUNLIB="$BIN_DIR/lib/run_telemetry.py"
 # Resolve a python3 once for the per-run telemetry lib (piece c). Absent python or
 # an absent lib ⇒ telemetry is a silent no-op (§8: telemetry never gates the demo).
 PY3="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+
+# `--offline` is a different demo, not a mode of the scaffold below: the self-contained
+# DENIED -> fix -> PROVEN arc (bin/lib/runhmd_demo.py), told by the real attack engine on a
+# bundled fixture pair - no network, no model, nothing written outside one temp dir. It never
+# scaffolds, never narrates and never touches $HEIMDALL_HOME/first-run, so it is decided HERE,
+# before any of that machinery is reached. Every arg is forwarded: the runner owns its own
+# --help and its own usage errors (exit 2, including for a flag that belongs to the scaffold demo).
+for arg in "$@"; do
+  if [ "$arg" = "--offline" ]; then
+    if [ -z "$PY3" ] || [ ! -f "$BIN_DIR/lib/runhmd_demo.py" ]; then
+      echo "  Error: hmd demo --offline needs python3 and $BIN_DIR/lib/runhmd_demo.py" >&2
+      exit 5
+    fi
+    exec env PYTHONDONTWRITEBYTECODE=1 "$PY3" "$BIN_DIR/lib/runhmd_demo.py" "$@"
+  fi
+done
 
 # tlm — the ONE call site onto the per-run instrumentation lib. Every demo beat
 # routes its event through here. It is fire-and-forget by construction: a missing
@@ -120,11 +138,17 @@ $(printf "${P}${B}")heimdall-demo$(printf "${R}") — scaffold a real full-stack
 
 $(printf "${B}")USAGE$(printf "${R}")
   heimdall-demo [dir] [--dry|--run] [--force]
+  heimdall-demo --offline [--json]
 
 $(printf "${B}")ARGUMENTS$(printf "${R}")
   dir            Target project directory (default: ./heimdall-demo-app)
 
 $(printf "${B}")FLAGS$(printf "${R}")
+  --offline      A different demo: an agent writes a bug, \`hmd attack\` DENIES it, the agent
+                 fixes it, \`hmd attack\` PROVES it - told by the real attack engine on a bundled
+                 fixture pair. No network, no model, nothing written outside a temp dir. It takes
+                 no directory and no other flag except --json (the same arc as a JSON document).
+                 \`heimdall-demo --offline --help\` has the details.
   --dry          Scaffold + print the paste-ready command. Never executes. (default)
   --run          Scaffold AND launch heimdall on the task (requires \`heimdall\` on PATH).
                  On completion, prints the H-5 summary card + records a reel and
