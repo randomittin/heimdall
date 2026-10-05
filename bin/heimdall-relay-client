@@ -1536,6 +1536,8 @@ class RelayClient:
             ok, detail, extra = self._decide(params)
         elif LOGIN is not None and action in LOGIN.ACTIONS:
             ok, detail, extra = self._login_command(action, params)
+        elif VIEW is not None and action == "view":
+            ok, detail, extra = self._view_command(params)
         elif action == "resync":
             ok, detail = self._resync(params)
         elif action == "register_push":
@@ -1855,7 +1857,7 @@ class RelayClient:
         if digest == self.last_sent_digest:
             return
         rearm_gen = self._rearm_gen
-        seq, delivered = self.send_hmd_frame("state", {"state": self._login_overlay(state)})
+        seq, delivered = self.send_hmd_frame("state", {"state": self._views_overlay(self._login_overlay(state))})
         if delivered is None:
             # No usable answer: the frame never reached the phone. last_sent_digest
             # stays as it was, so the next tick sends the (then current) state again
