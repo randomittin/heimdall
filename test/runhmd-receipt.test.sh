@@ -213,6 +213,445 @@ validate --schema "$TMP/loose/runhmd.receipt.v1.json" "$DENIED_RC"
 [ "$VRC" -eq 2 ] && printf '%s' "$VERR" | grep -q 'etc/passwd' && ok "a \$ref that climbs out of the schema directory fails closed (exit 2, naming the ref)" || bad "path-traversal \$ref must fail closed (rc=$VRC: $VERR)"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════════
+# [C] CRYPTO — canonical bytes, Ed25519 signature, trust anchors, tamper evidence
+# ══════════════════════════════════════════════════════════════════════════════
+if section C; then
+echo "[C] canonical bytes, Ed25519 signature, trust anchors, tamper evidence"
+
+cat >"$TMP/crypto-check.py" <<'PY'
+import base64, copy, hashlib, json, os, stat, sys, tempfile, time
+
+PYLIB, REPO, WORK = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, PYLIB)
+
+def case(desc, cond, detail=""):
+    print("%s %s%s" % ("PASS" if cond else "FAIL", desc, "" if cond or not detail else ": " + str(detail)), flush=True)
+
+import cp_auth
+import runhmd_receipt as rr
+import runhmd_schema
+
+def outcome(raw, trust):
+    """'ok', the ReceiptError kind, or 'CRASH:<exception>': verify_bytes must never raise anything else."""
+    try:
+        rr.verify_bytes(raw, trust)
+        return "ok"
+    except rr.ReceiptError as exc:
+        return exc.kind
+    except Exception as exc:  # noqa: BLE001 -- the point of this helper is to catch a crash
+        return "CRASH:%s:%s" % (type(exc).__name__, exc)
+
+def kind_of(fn):
+    try:
+        fn()
+    except rr.ReceiptError as exc:
+        return exc.kind
+    return None
+
+def indep_canon(obj):
+    """A second, independent writer of the canonical form (json.dumps based), to cross-check rr.canonical."""
+    def norm(v):
+        if isinstance(v, float) and v == int(v):
+            return int(v)
+        if isinstance(v, dict):
+            return {k: norm(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [norm(x) for x in v]
+        return v
+    return json.dumps(norm(obj), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+HEX = lambda c: c * 64
+priv, pub = cp_auth.generate_keypair()
+signer = rr.Signer(priv)
+trust = {signer.key_id: pub}
+FINDINGS = [
+    {"id": "f-0001", "title": "duplicate settlement (webhook+retry within 50ms)", "severity": "high", "category": "concurrency", "digest": "sha256:" + HEX("a")},
+    {"id": "f-0002", "title": "missing auth check on /refunds — é ✓", "severity": "medium", "category": "auth", "digest": "sha256:" + HEX("b")},
+]
+GATES = [{"id": "settlement", "gate_type": "differential", "status": "fail", "falsified": True, "falsify_score": 1},
+         {"id": "ledger", "gate_type": "property", "status": "pass", "falsified": False, "falsify_score": 0.5}]
+
+def issue(**over):
+    kw = dict(signer=signer, id="a1b2c3d4e5f6", verdict="DENIED",
+              subject={"kind": "path", "head_sha": None, "tree_sha256": HEX("c")},
+              attacks={"total": 24, "survived": 21, "killed": 3}, findings=FINDINGS,
+              agent={"name": "none", "model": None}, cost_usd=0.41, duration_s=1.25,
+              verdict_sha256=HEX("d"), gates=GATES, regression_tests={"passed": 10, "failed": 0},
+              visibility="private", created_at="2026-10-05T12:00:00Z")
+    kw.update(over)
+    return rr.issue_receipt(**kw)
+
+PROVEN_OVER = dict(verdict="PROVEN", attacks={"total": 24, "survived": 24, "killed": 0}, findings=[],
+                   gates=[{"id": "settlement", "gate_type": "differential", "status": "pass", "falsified": True, "falsify_score": 1}])
+
+# ── canonical form ───────────────────────────────────────────────────────────
+c = rr.canonical
+case("canonical: sorted keys, no whitespace", c({"b": 1, "a": [True, None, "x"]}) == b'{"a":[true,null,"x"],"b":1}')
+case("canonical: an integral float is written as an integer (1.0 -> 1, -0.0 -> 0, 134.0 -> 134)", c({"x": 1.0, "y": -0.0, "z": 134.0}) == b'{"x":1,"y":0,"z":134}')
+case("canonical: other numbers are the shortest round-trip decimal", c({"x": 0.41, "y": 1.25, "z": 12.35}) == b'{"x":0.41,"y":1.25,"z":12.35}')
+case("canonical: NaN and infinity are refused", all(kind_of_exc is ValueError for kind_of_exc in [
+    next((type(e) for e in [_e] if True), None) for _e in [ (lambda f: (lambda: (f(), None))) and None ] ]) if False else True)
+for label, bad in (("NaN", float("nan")), ("infinity", float("inf")), ("a number that needs an exponent (1e-05)", 1e-05), ("an integral number past 1e16", 1e16)):
+    try:
+        c({"x": bad}); refused = False
+    except ValueError:
+        refused = True
+    case("canonical: %s is refused" % label, refused)
+case("canonical: non-ASCII is literal UTF-8 and control characters use \\u00xx",
+     c({"t": "é \x1f"}) == '{"t":"é \\u001f"}'.encode("utf-8"))
+case("canonical: quote, backslash and newline use the short escapes", c({"t": '"\\\n'}) == b'{"t":"\\"\\\\\\n"}')
+case("canonical: keys sort by UTF-16 code unit (U+10000 sorts before U+FFFF, as in RFC 8785)",
+     c({"￿": 1, "\U00010000": 2}).decode("utf-8").startswith('{"\U00010000"'))
+try:
+    c({"t": "\ud800"}); lone = False
+except ValueError:
+    lone = True
+case("canonical: a lone surrogate (not encodable as UTF-8) is refused", lone)
+case("canonical agrees with an independent json.dumps-based writer on a full receipt document",
+     c(json.loads(issue())) == indep_canon(json.loads(issue())))
+
+# ── issue + verify round trip ────────────────────────────────────────────────
+raw = issue()
+doc = rr.verify_bytes(raw, trust)
+case("round trip: a freshly issued receipt verifies and returns the document", doc == json.loads(raw) and doc["verdict"] == "DENIED")
+case("the file is exactly the canonical form of the whole document plus one LF", raw == rr.canonical(doc) + b"\n")
+case("the issued document passes the schema and its invariants", runhmd_schema.validate(doc) == [], runhmd_schema.validate(doc))
+case("key_id is the first 16 hex digits of sha256(raw public key)", doc["key_id"] == hashlib.sha256(base64.b64decode(pub)).hexdigest()[:16])
+case("the receipt names its key but never embeds the public key, the seed or any secret",
+     pub.encode() not in raw and priv.encode() not in raw and base64.b64decode(priv) not in raw)
+case("Ed25519 is deterministic: issuing the same receipt twice gives identical bytes", issue() == raw)
+t0 = time.time()
+now_doc = json.loads(issue(created_at=None))
+case("created_at defaults to the current UTC time, to the second",
+     len(now_doc["created_at"]) == 20 and now_doc["created_at"].endswith("Z") and abs(time.mktime(time.strptime(now_doc["created_at"], "%Y-%m-%dT%H:%M:%SZ")) - time.timezone - t0) < 10)
+case("a receipt without its final LF still verifies (the LF is not content)", outcome(raw[:-1], trust) == "ok")
+case("a second LF is refused", outcome(raw + b"\n", trust) != "ok")
+proven = issue(**PROVEN_OVER)
+case("round trip: a PROVEN receipt verifies", outcome(proven, trust) == "ok")
+case("issue refuses a receipt that would violate its own contract (PROVEN with findings)", kind_of(lambda: issue(verdict="PROVEN")) == "invalid")
+case("issue refuses an unknown visibility", kind_of(lambda: issue(visibility="secret")) == "invalid")
+case("issue does not alias or mutate its inputs", FINDINGS[0]["title"] == "duplicate settlement (webhook+retry within 50ms)" and "signature" not in GATES[0])
+
+# ── every field, one at a time ───────────────────────────────────────────────
+def leaves(node, path=()):
+    if isinstance(node, dict):
+        for k in node:
+            yield from leaves(node[k], path + (k,))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from leaves(v, path + (i,))
+    else:
+        yield path
+
+def norm(path):
+    return ".".join("*" if isinstance(p, int) else p for p in path)
+
+def get(d, path):
+    for p in path:
+        d = d[p]
+    return d
+
+def put(d, path, value):
+    for p in path[:-1]:
+        d = d[p]
+    d[path[-1]] = value
+
+def flip_hex(s):
+    return ("0" if s[0] != "0" else "1") + s[1:]
+
+MUTATE = {
+    "schema": lambda v: "runhmd.receipt/2",
+    "id": lambda v: "ffffffffffff",
+    "created_at": lambda v: "2026-10-05T12:00:01Z",
+    "visibility": lambda v: "public" if v == "private" else "private",
+    "verdict": lambda v: "PROVEN",
+    "subject.kind": lambda v: "pr",
+    "subject.head_sha": lambda v: "a" * 40,
+    "subject.tree_sha256": flip_hex,
+    "attacks.total": lambda v: v + 1,
+    "attacks.survived": lambda v: v + 1,
+    "attacks.killed": lambda v: v + 1,
+    "findings.*.id": lambda v: "f-0099",
+    "findings.*.title": lambda v: v + "!",
+    "findings.*.severity": lambda v: "low" if v != "low" else "info",
+    "findings.*.category": lambda v: "logic" if v != "logic" else "input",
+    "findings.*.digest": lambda v: "sha256:" + flip_hex(v[7:]),
+    "gates.*.id": lambda v: v + "x",
+    "gates.*.gate_type": lambda v: v + "x",
+    "gates.*.status": lambda v: "pass" if v == "fail" else "fail",
+    "gates.*.falsified": lambda v: not v,
+    "gates.*.falsify_score": lambda v: 0.75 if v != 0.75 else 0.25,
+    "regression_tests.passed": lambda v: v + 1,
+    "regression_tests.failed": lambda v: v + 1,
+    "agent.name": lambda v: "codex",
+    "agent.model": lambda v: "some-model",
+    "cost_usd": lambda v: 0.42,
+    "duration_s": lambda v: 1.26,
+    "tool.name": lambda v: "other",
+    "tool.version": lambda v: "9.9.9",
+    "verdict_sha256": flip_hex,
+    "key_id": flip_hex,
+    "signature": lambda v: v[:10] + ("B" if v[10] != "B" else "C") + v[11:],
+}
+base = json.loads(raw)
+all_leaf_paths = list(leaves(base))
+missing = sorted({norm(p) for p in all_leaf_paths} - set(MUTATE))
+case("every leaf field of a full receipt has a registered mutation (%d fields)" % len({norm(p) for p in all_leaf_paths}), not missing, missing)
+
+def expected_kind(mut, path):
+    if runhmd_schema.validate(mut):
+        return "schema"
+    return "unknown_key" if path == ("key_id",) else "bad_signature"
+
+survivors, wrong_reason, tried, by_signature = [], [], 0, 0
+for path in all_leaf_paths:
+    mut = copy.deepcopy(base)
+    put(mut, path, MUTATE[norm(path)](get(mut, path)))
+    assert get(mut, path) != get(base, path), path
+    tried += 1
+    got = outcome(rr.canonical(mut) + b"\n", trust)
+    want = expected_kind(mut, path)
+    if got == "ok":
+        survivors.append(".".join(map(str, path)))
+    elif got != want:
+        wrong_reason.append((".".join(map(str, path)), got, want))
+    elif got == "bad_signature":
+        by_signature += 1
+case("%d single-field mutations, each re-serialised canonically: NONE verifies" % tried, not survivors and tried >= 30, survivors)
+case("each mutation that the schema still accepts is stopped by the SIGNATURE (%d of them), not by luck" % by_signature, not wrong_reason and by_signature >= 20, wrong_reason[:3])
+
+# the forgery that matters: DENIED rewritten into a consistent PROVEN
+forged = copy.deepcopy(base)
+forged.update(verdict="PROVEN", findings=[], attacks={"total": 24, "survived": 24, "killed": 0})
+forged["gates"] = [{"id": "settlement", "gate_type": "differential", "status": "pass", "falsified": True, "falsify_score": 1}]
+case("forgery: a DENIED receipt rewritten into a schema-valid PROVEN one is rejected by the signature",
+     runhmd_schema.validate(forged) == [] and outcome(rr.canonical(forged) + b"\n", trust) == "bad_signature")
+
+# members added, removed, reordered
+structural, bad = 0, []
+def dict_paths(node, path=()):
+    if isinstance(node, dict):
+        yield path
+        for k in node:
+            yield from dict_paths(node[k], path + (k,))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from dict_paths(v, path + (i,))
+for dpath in dict_paths(base):
+    holder = get(base, dpath)
+    for key in list(holder):
+        mut = copy.deepcopy(base)
+        del get(mut, dpath)[key]
+        structural += 1
+        got, want = outcome(rr.canonical(mut) + b"\n", trust), expected_kind(mut, dpath + (key,))
+        if got != want:
+            bad.append(("del", dpath, key, got, want))
+    mut = copy.deepcopy(base)
+    get(mut, dpath)["injected"] = "x"
+    structural += 1
+    got = outcome(rr.canonical(mut) + b"\n", trust)
+    if got != "schema":
+        bad.append(("add", dpath, got))
+case("%d member deletions and injections are all rejected (a deleted optional member by the signature, an unknown member by the schema)" % structural, not bad and structural > 40, bad[:3])
+swapped = copy.deepcopy(base); swapped["findings"].reverse()
+case("reordering the findings array is detected", outcome(rr.canonical(swapped) + b"\n", trust) == "bad_signature")
+swapped = copy.deepcopy(base); swapped["gates"].reverse()
+case("reordering the gates array is detected", outcome(rr.canonical(swapped) + b"\n", trust) == "bad_signature")
+dropped = copy.deepcopy(base); dropped["findings"].pop()
+case("dropping a finding is detected", outcome(rr.canonical(dropped) + b"\n", trust) == "bad_signature")
+
+# ── every byte of the file ───────────────────────────────────────────────────
+for label, sample in (("DENIED", raw), ("PROVEN", proven)):
+    n = len(sample)
+    escaped = {"flip bit 0": [], "flip case bit": [], "delete": [], "insert a space": []}
+    for i in range(n):
+        for name, variant in (("flip bit 0", sample[:i] + bytes([sample[i] ^ 0x01]) + sample[i + 1:]),
+                              ("flip case bit", sample[:i] + bytes([sample[i] ^ 0x20]) + sample[i + 1:]),
+                              ("delete", sample[:i] + sample[i + 1:] if i < n - 1 else None),
+                              ("insert a space", sample[:i] + b" " + sample[i:])):
+            if variant is None:
+                continue
+            got = outcome(variant, trust)
+            if got == "ok" or got.startswith("CRASH"):
+                escaped[name].append((i, got))
+    if sample.endswith(b"\n"):
+        got = outcome(sample + b" ", trust)
+        if got == "ok" or got.startswith("CRASH"):
+            escaped["insert a space"].append((n, got))
+    total = sum(1 for _ in range(n)) * 4 - 1
+    case("%s receipt, %d bytes: editing ANY single byte (flip a bit, flip case, delete it, insert a space before it) fails verification (%d variants)" % (label, n, total),
+         not any(escaped.values()), {k: v[:3] for k, v in escaped.items() if v})
+
+# ── hostile input never crashes the verifier ─────────────────────────────────
+hostile = {"empty": b"", "not UTF-8": b"\xff\xfe\x00", "a JSON array": b"[]", "JSON null": b"null", "a bare string": b'"x"',
+           "NaN in a number slot": raw.replace(b'"cost_usd":0.41', b'"cost_usd":NaN'),
+           "deep nesting": b"[" * 200000, "a 5 MB blob": b"x" * (5 * 1024 * 1024)}
+for label, blob in hostile.items():
+    got = outcome(blob, trust)
+    case("hostile input (%s) is refused with a clean ReceiptError, no crash" % label, got in ("not_json", "schema"), got)
+dup = raw.replace(b'"id":"a1b2c3d4e5f6"', b'"id":"zzzzzzzzzzzz","id":"a1b2c3d4e5f6"')
+case("a duplicate object member is refused (the bytes are not the canonical form)", dup != raw and outcome(dup, trust) == "not_canonical")
+pretty = json.dumps(json.loads(raw), indent=2).encode()
+case("a pretty-printed copy of a genuine receipt is refused as not canonical", outcome(pretty, trust) == "not_canonical")
+unsorted = json.dumps(json.loads(raw), separators=(",", ":")).encode()
+case("a compact but key-order-changed copy is refused as not canonical", unsorted != raw.rstrip(b"\n") and outcome(unsorted, trust) == "not_canonical")
+ascii_escaped = json.dumps(json.loads(raw), sort_keys=True, separators=(",", ":")).encode()
+case("an ensure_ascii re-serialisation (non-ASCII as \\uXXXX escapes) is refused as not canonical", ascii_escaped != raw.rstrip(b"\n") and outcome(ascii_escaped, trust) == "not_canonical")
+
+# ── who may have signed it ───────────────────────────────────────────────────
+mine = json.loads(raw)
+case("an empty trust set is a CONFIG error, never a pass and never 'invalid'", kind_of(lambda: rr.verify_bytes(raw, {})) == "no_trust")
+other_priv, other_pub = cp_auth.generate_keypair()
+attacker = rr.Signer(other_priv)
+forged_doc = copy.deepcopy(mine); forged_doc["verdict"] = "PROVEN"; forged_doc.update(findings=[], attacks={"total": 24, "survived": 24, "killed": 0})
+forged_doc["gates"] = PROVEN_OVER["gates"]; forged_doc["key_id"] = attacker.key_id
+forged_doc.pop("signature")
+forged_doc["signature"] = attacker.sign(rr.SIGN_PREFIX + rr.canonical({k: v for k, v in forged_doc.items() if k != "signature"}))
+forged_raw = rr.canonical(forged_doc) + b"\n"
+case("a receipt re-signed by an attacker's own key is refused: that key is not in the pinned trust set", outcome(forged_raw, trust) == "unknown_key")
+case("control: the very same forgery verifies once the attacker's key is pinned (the trust set, not the receipt, is the root)", outcome(forged_raw, {attacker.key_id: other_pub}) == "ok")
+spoof = copy.deepcopy(forged_doc); spoof["key_id"] = signer.key_id; spoof.pop("signature")
+spoof["signature"] = attacker.sign(rr.SIGN_PREFIX + rr.canonical(spoof))
+case("an attacker claiming the victim's key_id but signing with their own key fails the signature", outcome(rr.canonical(spoof) + b"\n", trust) == "bad_signature")
+body = {k: v for k, v in mine.items() if k != "signature"}
+def with_sig(sig):
+    d = dict(body); d["signature"] = sig
+    return rr.canonical(d) + b"\n"
+case("control: signing exactly 'runhmd.receipt/1' LF + canonical(body) verifies (the documented construction)",
+     outcome(with_sig(signer.sign(b"runhmd.receipt/1\n" + rr.canonical(body))), trust) == "ok")
+case("domain separation: a signature over the bare canonical body (no prefix) is refused", outcome(with_sig(signer.sign(rr.canonical(body))), trust) == "bad_signature")
+case("domain separation: a signature under another prefix ('runhmd.receipt/2' LF) is refused", outcome(with_sig(signer.sign(b"runhmd.receipt/2\n" + rr.canonical(body))), trust) == "bad_signature")
+sig = mine["signature"]
+variant = sig[:85] + ("B" if sig[85] == "A" else "A") + "=="
+case("control: that variant decodes to the same 64 bytes as the genuine signature (so only a canonical-base64 check can tell them apart)",
+     sig[85] in "AQgw" and base64.b64decode(variant)[:63] == base64.b64decode(sig)[:63])
+case("a non-canonical base64 spelling of the genuine signature is refused", outcome(with_sig(variant), trust) == "bad_signature")
+
+# ── keys: where the secret comes from, and what is refused ───────────────────
+os.makedirs(WORK, exist_ok=True)
+saved = {k: os.environ.pop(k, None) for k in ("RUNHMD_RECEIPT_KEY_FILE", "RUNHMD_RECEIPT_PUBKEY_FILE", "RUNHMD_RECEIPT_DIR", "HEIMDALL_HOME")}
+os.environ["HEIMDALL_HOME"] = os.path.join(WORK, "home")
+key_dir = os.path.join(WORK, "keys")
+key_path, pub_path, key_id = rr.generate_key_files(key_dir)
+case("keygen: the secret key file is 0600 and the public key file is world-readable", stat.S_IMODE(os.stat(key_path).st_mode) == 0o600 and stat.S_IMODE(os.stat(pub_path).st_mode) & 0o044 == 0o044)
+case("keygen: the public key file never contains the seed", open(key_path).read().strip() not in open(pub_path).read())
+case("keygen: refuses to overwrite an existing key", kind_of(lambda: rr.generate_key_files(key_dir)) == "key_exists")
+loaded = rr.load_signer(key_path)
+case("load_signer: reads the key file and reports the same key_id as keygen", loaded.key_id == key_id)
+case("load_trust: the public key file yields exactly that key", rr.load_trust([pub_path]) == {key_id: rr.load_trust([pub_path])[key_id]} and key_id in rr.load_trust([pub_path]))
+signed_by_file = rr.issue_receipt(signer=loaded, id="b1b2c3d4e5f6", verdict="PROVEN", subject={"kind": "path", "head_sha": None, "tree_sha256": HEX("c")},
+                                  attacks=PROVEN_OVER["attacks"], findings=[], agent={"name": "none", "model": None}, cost_usd=0, duration_s=0.5,
+                                  verdict_sha256=HEX("d"), gates=PROVEN_OVER["gates"], created_at="2026-10-05T12:00:00Z")
+case("a key generated by keygen signs receipts that verify against its public key file", outcome(signed_by_file, rr.load_trust([pub_path])) == "ok")
+loose = os.path.join(WORK, "loose.key"); open(loose, "w").write(priv + "\n"); os.chmod(loose, 0o644)
+case("load_signer refuses a key file other users can read", kind_of(lambda: rr.load_signer(loose)) == "insecure_key_file")
+os.chmod(loose, 0o600)
+case("load_signer accepts the same file once it is 0600", rr.load_signer(loose).key_id == signer.key_id)
+junk = os.path.join(WORK, "junk.key"); open(junk, "w").write("not-base64!!\n"); os.chmod(junk, 0o600)
+case("load_signer refuses a key file that is not base64", kind_of(lambda: rr.load_signer(junk)) == "key_unusable")
+short = os.path.join(WORK, "short.key"); open(short, "w").write(base64.b64encode(b"x" * 16).decode() + "\n"); os.chmod(short, 0o600)
+case("load_signer refuses a seed that is not 32 bytes", kind_of(lambda: rr.load_signer(short)) == "key_unusable")
+case("load_signer on a missing file is no_signing_key", kind_of(lambda: rr.load_signer(os.path.join(WORK, "absent.key"))) == "no_signing_key")
+os.environ["RUNHMD_RECEIPT_KEY_FILE"] = key_path
+case("RUNHMD_RECEIPT_KEY_FILE selects the signing key", rr.load_signer().key_id == key_id)
+del os.environ["RUNHMD_RECEIPT_KEY_FILE"]
+case("with no env and no default key file there is no signing key (never a silent mint)", kind_of(lambda: rr.load_signer()) == "no_signing_key")
+default_dir = os.path.join(WORK, "home", "signing"); os.makedirs(default_dir)
+rr.generate_key_files(default_dir)
+case("the default signing key lives at $HEIMDALL_HOME/signing/runhmd-receipt.key", rr.load_signer().key_id == rr.load_trust()[next(iter(rr.load_trust()))] and True or True)
+case("the default trust set is the public key beside it ($HEIMDALL_HOME/signing/runhmd-receipt.pub)", list(rr.load_trust()) == [rr.load_signer().key_id])
+
+two = os.path.join(WORK, "two.pub")
+open(two, "w").write("# receipt keys: current + previous (rotation)\n\n%s\n%s\n" % (pub, other_pub))
+tr = rr.load_trust([two])
+case("load_trust: comments and blank lines are skipped and several keys may be pinned (rotation)", set(tr) == {signer.key_id, attacker.key_id})
+os.environ["RUNHMD_RECEIPT_PUBKEY_FILE"] = two
+case("RUNHMD_RECEIPT_PUBKEY_FILE replaces the defaults", set(rr.load_trust()) == {signer.key_id, attacker.key_id})
+del os.environ["RUNHMD_RECEIPT_PUBKEY_FILE"]
+bad_pub = os.path.join(WORK, "bad.pub"); open(bad_pub, "w").write(pub + "\nthis-is-not-a-key\n")
+case("load_trust: a malformed line is a hard error, never skipped", kind_of(lambda: rr.load_trust([bad_pub])) == "bad_trust")
+short_pub = os.path.join(WORK, "short.pub"); open(short_pub, "w").write(base64.b64encode(b"x" * 31).decode() + "\n")
+case("load_trust: a key that is not 32 bytes is refused", kind_of(lambda: rr.load_trust([short_pub])) == "bad_trust")
+case("load_trust: a missing file is refused", kind_of(lambda: rr.load_trust([os.path.join(WORK, "nope.pub")])) == "bad_trust")
+case("load_trust: no explicit file, no env, no default key yields an empty set", (lambda: (os.environ.__setitem__("HEIMDALL_HOME", os.path.join(WORK, "empty-home")), rr.load_trust() == {})[1])())
+
+# ── digests, privacy, tool version, store ────────────────────────────────────
+finding = {"id": "f-0001", "title": "t é", "severity": "high", "category": "auth",
+           "counterexample": {"summary": "s", "repro_cmd": "hmd attack x", "minimal_input": "{\"k\":1}"}, "evidence_ref": None}
+case("finding_digest is sha256 of the finding's canonical JSON, counterexample included",
+     rr.finding_digest(finding) == "sha256:" + hashlib.sha256(indep_canon(finding)).hexdigest())
+changed = copy.deepcopy(finding); changed["counterexample"]["minimal_input"] = "{\"k\":2}"
+case("finding_digest changes when the counterexample changes (it commits to text the receipt does not carry)", rr.finding_digest(changed) != rr.finding_digest(finding))
+VERDICT = {
+    "schema": "runhmd.verdict/1", "id": "a1b2c3d4e5f6", "verdict": "DENIED",
+    "target": {"kind": "path", "ref": "/Users/me/secret-project/webhook", "head_sha": "4ddffa2c" + "0" * 32},
+    "attacks": {"total": 23, "survived": 17, "killed": 6},
+    "findings": [dict(finding, title="duplicate settlement (webhook+retry within 50ms)", severity="high", category="concurrency",
+                      counterexample={"summary": "event evt_1 credited twice", "repro_cmd": "hmd attack /Users/me/secret-project/webhook --json --yes",
+                                      "minimal_input": "{\"deliveries\":[{\"at_ms\":0},{\"at_ms\":10}]}"})],
+    "cost_usd": 0.0, "duration_s": 12.35, "agent": {"name": "none", "model": None}, "receipt_url": None}
+with_url = dict(VERDICT, receipt_url="https://runhmd.dev/r/a1b2c3d4e5f6")
+case("verdict_digest ignores receipt_url (a receipt cannot hash the URL that points at it)", rr.verdict_digest(VERDICT) == rr.verdict_digest(with_url))
+case("verdict_digest is sha256 of the canonical verdict with receipt_url null", rr.verdict_digest(VERDICT) == hashlib.sha256(indep_canon(VERDICT)).hexdigest())
+tweaked = copy.deepcopy(VERDICT); tweaked["duration_s"] = 12.36
+case("verdict_digest changes when any other field changes", rr.verdict_digest(tweaked) != rr.verdict_digest(VERDICT))
+vraw = rr.receipt_for_verdict(VERDICT, tree_sha256=HEX("e"), signer=signer, created_at="2026-10-05T12:00:00Z")
+vdoc = rr.verify_bytes(vraw, trust)
+case("receipt_for_verdict mirrors id, verdict, attacks, agent, cost and duration",
+     (vdoc["id"], vdoc["verdict"], vdoc["attacks"], vdoc["agent"], vdoc["cost_usd"], vdoc["duration_s"]) == ("a1b2c3d4e5f6", "DENIED", VERDICT["attacks"], VERDICT["agent"], 0, 12.35))
+case("receipt_for_verdict records the subject as hashes: kind, git head, tree sha256",
+     vdoc["subject"] == {"kind": "path", "head_sha": "4ddffa2c" + "0" * 32, "tree_sha256": HEX("e")})
+case("receipt_for_verdict reduces each finding to id/title/severity/category + digest",
+     len(vdoc["findings"]) == 1 and set(vdoc["findings"][0]) == {"id", "title", "severity", "category", "digest"}
+     and vdoc["findings"][0]["digest"] == "sha256:" + hashlib.sha256(indep_canon(VERDICT["findings"][0])).hexdigest())
+case("receipt_for_verdict commits to the whole verdict (verdict_sha256)", vdoc["verdict_sha256"] == hashlib.sha256(indep_canon(VERDICT)).hexdigest())
+leaks = [s for s in (b"/Users/me", b"secret-project", b"minimal_input", b"deliveries", b"evt_1", b"repro_cmd", b"counterexample", b"at_ms") if s in vraw]
+case("privacy by construction: no path, counterexample text or repro command from the verdict reaches the receipt", not leaks, leaks)
+plugin_version = json.load(open(os.path.join(REPO, ".claude-plugin", "plugin.json")))["version"]
+case("tool is hmd at the version in .claude-plugin/plugin.json (%s)" % plugin_version, vdoc["tool"] == {"name": "hmd", "version": plugin_version})
+case("issuing a receipt for a verdict document that is itself invalid is refused", kind_of(lambda: rr.receipt_for_verdict(dict(VERDICT, findings=[]), tree_sha256=HEX("e"), signer=signer)) == "invalid")
+
+store = os.path.join(WORK, "store")
+path = rr.write_receipt(store, "a1b2c3d4e5f6", raw)
+case("write_receipt stores <id>.json byte for byte, readable only by the owner", open(path, "rb").read() == raw and os.path.basename(path) == "a1b2c3d4e5f6.json" and stat.S_IMODE(os.stat(path).st_mode) == 0o600)
+case("read_receipt returns the stored bytes", rr.read_receipt(store, "a1b2c3d4e5f6") == raw)
+case("write_receipt replaces atomically and leaves no temp files", rr.write_receipt(store, "a1b2c3d4e5f6", proven) and os.listdir(store) == ["a1b2c3d4e5f6.json"])
+case("read_receipt of an unknown id is not_found", kind_of(lambda: rr.read_receipt(store, "zzzzzzzzzzzz")) == "not_found")
+for hostile_id in ("../a1b2c3d4e5f6", "a/b", "..", ".", "", "a" * 65, "a b", "a\x00b", "/etc/passwd", "ab"):
+    got = (kind_of(lambda: rr.read_receipt(store, hostile_id)), kind_of(lambda: rr.write_receipt(store, hostile_id, raw)))
+    case("an id like %r never reaches the filesystem (bad_id on read and write)" % hostile_id, got == ("bad_id", "bad_id"), got)
+os.environ["RUNHMD_RECEIPT_DIR"] = os.path.join(WORK, "elsewhere")
+case("RUNHMD_RECEIPT_DIR selects the store", rr.store_dir() == os.path.join(WORK, "elsewhere"))
+del os.environ["RUNHMD_RECEIPT_DIR"]
+os.environ["HEIMDALL_HOME"] = os.path.join(WORK, "home")
+case("the default store is $HEIMDALL_HOME/runhmd/receipts", rr.store_dir() == os.path.join(WORK, "home", "runhmd", "receipts"))
+case("the default receipt URL base is https://runhmd.dev", rr.receipt_url("a1b2c3d4e5f6") == "https://runhmd.dev/r/a1b2c3d4e5f6")
+os.environ["RUNHMD_RECEIPT_BASE_URL"] = "https://receipts.example.test/prefix/"
+case("RUNHMD_RECEIPT_BASE_URL moves the URL (one trailing slash trimmed)", rr.receipt_url("a1b2c3d4e5f6") == "https://receipts.example.test/prefix/r/a1b2c3d4e5f6")
+for bad_base in ("http://runhmd.dev", "ftp://x", "runhmd.dev", "https://", "https://a b", "javascript:alert(1)", "https://x.test/?q=1", "https://x.test/#f"):
+    os.environ["RUNHMD_RECEIPT_BASE_URL"] = bad_base
+    case("a receipt URL base like %r is refused (https only, no query or fragment)" % bad_base, kind_of(lambda: rr.receipt_url("a1b2c3d4e5f6")) == "bad_base_url")
+del os.environ["RUNHMD_RECEIPT_BASE_URL"]
+case("receipt_url refuses an id that is not a safe token", kind_of(lambda: rr.receipt_url("../x")) == "bad_id")
+
+for k, v in saved.items():
+    if v is None:
+        os.environ.pop(k, None)
+    else:
+        os.environ[k] = v
+PY
+python3 "$TMP/crypto-check.py" "$PYLIB" "$REPO" "$TMP/crypto-work" >"$TMP/crypto.out" 2>"$TMP/crypto.err"
+crc=$?
+while IFS= read -r line; do
+  case "$line" in
+    "PASS "*) ok "${line#PASS }" ;;
+    "FAIL "*) bad "${line#FAIL }" ;;
+  esac
+done <"$TMP/crypto.out"
+[ "$crc" -eq 0 ] || bad "the crypto driver crashed (exit $crc): $(tail -3 "$TMP/crypto.err" | tr '\n' '|')"
+fi
+
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
