@@ -150,6 +150,17 @@ prev_release_tag() {
     | grep -Fxv "$exclude" | head -1
 }
 
+# has_content <text> — true iff <text> holds at least one non-whitespace character.
+# PURE BASH, on purpose: never `printf '%s' "$text" | grep -q '[^[:space:]]'`. grep -q exits at
+# its first match without draining stdin, so a multi-line body bigger than the pipe buffer
+# (64 KiB) leaves printf mid-write — EPIPE ("printf: write error: Broken pipe") — and this
+# script's `set -o pipefail` turns that into a failed pipeline: a body full of real content then
+# reads as EMPTY. That is how the first release whose notes range outgrew 64 KiB (890 commits,
+# 74 KB of notes, most of them auto-generated journal:/wip: commits) was refused with "came out
+# EMPTY" while the generator had produced every line. A regex test has no pipe, so it has no
+# size threshold and no SIGPIPE.
+has_content() { [[ "$1" =~ [^[:space:]] ]]; }
+
 # build_release_notes <tag> <outfile> — write the Release body for <tag> to <outfile>.
 # Source of truth, in order:
 #   1. CHANGELOG.md — if it carries a section for THIS exact version, that hand-curated
@@ -168,7 +179,7 @@ build_release_notes() {
       grab { print }
     ' "$REPO_ROOT/CHANGELOG.md" 2>/dev/null || true)"
     # Strip to nothing if the section held only blank lines.
-    printf '%s' "$notes_body" | grep -q '[^[:space:]]' || notes_body=""
+    has_content "$notes_body" || notes_body=""
   fi
 
   # (2) Otherwise derive from conventional commits since the previous tag.
@@ -188,7 +199,7 @@ build_release_notes() {
   fi
 
   # (3) Last resort: a plain commit list. Still real content, never boilerplate.
-  if ! printf '%s' "$notes_body" | grep -q '[^[:space:]]'; then
+  if ! has_content "$notes_body"; then
     prev="$(prev_release_tag "$tag")"
     if [ -n "$prev" ]; then
       notes_body="$(git log --no-merges --pretty=format:'- %s' "${prev}..HEAD" 2>/dev/null || true)"
@@ -197,7 +208,7 @@ build_release_notes() {
     fi
   fi
 
-  printf '%s' "$notes_body" | grep -q '[^[:space:]]' \
+  has_content "$notes_body" \
     || die "release notes for $tag came out EMPTY — refusing to publish a boilerplate Release"
 
   prev="$(prev_release_tag "$tag")"
