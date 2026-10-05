@@ -68,6 +68,7 @@ metric-audit
 status
 cursor-statusline
 weekly-log
+weekly-review
 report
 report-issue
 designmatch

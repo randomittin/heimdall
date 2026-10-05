@@ -5,11 +5,11 @@
   </picture>
 </p>
 
-# Heimdall 🛡️
+# runhmd 🛡️
 
-**Heimdall makes your coding agent's work pass a test it didn't write — and proves that test can fail — before the push lands.**
+**runhmd makes your coding agent's work pass a test it didn't write — and proves that test can fail — before the push lands.**
 
-A Claude Code plugin. One prompt in, a gated, receipted change out. The gate is a plain git pre-push hook, so it holds in any repo and also gates [Cursor CLI](#also-gates-cursor-cli). Your agent's own tests are a claim; the oracle Heimdall wires is external, and it is first shown to go red on a planted defect before its green is trusted.
+`hmd` is the one CLI; Heimdall is the engine underneath ([NAMING.md](NAMING.md)). A Claude Code plugin: one prompt in, a gated, receipted change out. The gate is a plain git pre-push hook, so it holds in any repo and also gates [Cursor CLI](docs/ARCHITECTURE.md#also-gates-cursor-cli). Your agent's own tests are a claim; the oracle it wires is external, and is first shown to go red on a planted defect before its green is trusted.
 
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-e056a0?style=flat-square)](https://code.claude.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-9b59b6?style=flat-square)](LICENSE)
@@ -27,15 +27,67 @@ curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.4.3/install
 ```
 <!-- HEIMDALL:PIN:END -->
 
-**Run first:**
+**Then attack a planted bug** (the installer clones this repo to `~/.heimdall`; `hmd attack` asks for consent before it runs anything):
 
 ```bash
-hmd demo
+hmd attack ~/.heimdall/fixtures/attack/buggy-webhook
 ```
 
-Dry by default — scaffolds a fully-specified full-stack task into `./heimdall-demo-app` and prints the paste-ready next step; it executes nothing until you add `--run`. On a terminal, the first-ever run also plays the narrated build in which a planted credential is caught by the real `bin/secret-scan` gate — deny → fix → pass — the same arc every gated change goes through.
+Real output from this tree (`hmd attack fixtures/attack/buggy-webhook --card --yes`):
 
-**Check the proof yourself, no trust required (~1 min, network-free after the clone):**
+```text
+╭──────────────────────────────────────╮
+│ 🛡 runhmd attack                     │
+│                                      │
+│ VERDICT: DENIED                      │
+│                                      │
+│ 23 attacks · 17 survived · 6 killed  │
+│                                      │
+│ ✗ duplicate settlement (webhook+retry│
+│   within 50ms)                       │
+│                                      │
+│ Cost: $0.00 · Time: 0.5s             │
+╰──────────────────────────────────────╯
+```
+
+## What `hmd attack` does
+
+`hmd attack <path>` asks "can I break this?" and answers **PROVEN** or **DENIED**, with a counterexample.
+
+- **Target:** a directory that declares its attack surface in `runhmd.attack.json`, or a single `.mjs` module. A directory that declares nothing exits 2: a verdict over nothing would be a false green. `--diff` and PR URLs are not supported in this build.
+- **Engine:** deterministic and offline: no model, no network, $0.00. The target runs in an ephemeral temp dir, in a scrubbed environment.
+- **Output:** the card above; `--json` prints the canonical `runhmd.verdict/1` document; `--out DIR` writes the evidence.
+- **Exit codes:** 0 PROVEN · 1 DENIED · 2 usage/config · 3 consent required (non-TTY without `--yes`) · 4 budget cap · 5 infrastructure.
+- **Receipts:** `--receipt` issues a signed `runhmd.receipt/1`, stored locally and checked with `hmd receipt verify`. The hosted `runhmd.dev` service is not built yet ([docs/RECEIPTS.md](docs/RECEIPTS.md)).
+
+`hmd demo` is dry by default: it scaffolds a full-stack task into `./heimdall-demo-app` and prints the next step; it executes nothing until you add `--run`.
+
+## Install
+
+Three paths, each labelled with what it does to your machine. The one-liner above is **path 1** and carries the highest risk: a script fetched over the network, run with your privileges, with the sha256 check as the only thing between you and those bytes. Path 2 is `npx runheimdall` (the same script, same digest, same privileges) and path 3 is a Docker sandbox built from your own clone. Full text: [docs/INSTALL.md](docs/INSTALL.md).
+
+Pinned to the `v2.4.3` tag **and** checked against the sha256 of that tag's `install.sh`. <!-- HEIMDALL:PIN:TAG --> A signature is stronger than a digest copied from this page; every release signs `install.sh` with minisign ([`SIGNING.md`](SIGNING.md)):
+
+<!-- HEIMDALL:PIN:TAG:BEGIN -->
+```bash
+curl -fsSL -O https://github.com/randomittin/heimdall/releases/download/v2.4.3/install.sh.minisig
+minisign -Vp release/heimdall-signing.pub -m heimdall-install.sh -x install.sh.minisig
+```
+<!-- HEIMDALL:PIN:END -->
+
+**What the installer writes outside the repo** (measured from a real run against a throwaway `$HOME`; no sudo, idempotent, `hmd uninstall` reverses all of it):
+
+- `~/.heimdall/`, `~/.local/bin/hmd` and `~/.local/bin/heimdall`: a full clone of this repo, and symlinks into it.
+- `~/.claude/settings.json`: a `statusLine` and `subagentStatusLine`, and the plugin under `enabledPlugins` / `extraKnownMarketplaces` (honors `$CLAUDE_CONFIG_DIR`; never clobbers a `statusLine` you set).
+- `~/.zshrc` / `~/.bashrc` / `~/.profile`: one appended `export PATH=…` line, only when `~/.local/bin` is not already on `PATH`.
+- macOS only: a nightly 03:00 LaunchAgent, `~/Library/LaunchAgents/com.heimdall.dream.plist` (opt out with `HEIMDALL_NO_DREAM_SCHEDULE=1`).
+- `~/.heimdall/team.json`: an auto-minted solo team secret, a bearer capability: treat it like a credential.
+
+**A default module is a local proxy that can read your prompts.** Headroom is `default_included: true`, but nothing installs it for you: until you run `hmd modules add headroom`, `hmd modules status headroom` reports `NOT ATTEMPTED`, and that command is a remote code install with no digest verified. Disclosure in full: [docs/INSTALL.md](docs/INSTALL.md) and [SECURITY.md](SECURITY.md#the-headroom-proxy--a-local-process-that-reads-your-prompts).
+
+## Check the proof yourself
+
+No trust required (~1 min, network-free after the clone):
 
 ```bash
 git clone https://github.com/randomittin/heimdall && cd heimdall
@@ -53,139 +105,11 @@ SCORE: 3/3 = 1.0000 (golden passing)
 ASSERT PASS: score 1.0000 >= target 1.0 (golden passed, no mutant survived)
 ```
 
-`bin/corpus run` replays the 13 real shipped-failure cases through the same gates and appends a per-version catch-rate row to [`evals/corpus/CORPUS-STATUS.md`](evals/corpus/CORPUS-STATUS.md) — it writes to the tree, so it is not in the read-only block above. Its current score and the ❌ rows that are kept in view: [`evals/flagship/STATUS.md`](evals/flagship/STATUS.md).
+The ❌ rows are kept in view: [`evals/flagship/STATUS.md`](evals/flagship/STATUS.md). The suite counts and how to reproduce them: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#numbers-and-how-to-reproduce-them).
 
-| Number | Reproduce it |
-|---|---|
-| **427** test suites | `ls test/*.test.sh \| wc -l` |
-| **10,127** assertions passed, **412/412** suites, 0 failed — last full sweep, at commit `b43c4f4b` (suites added since account for 427 on disk) | `bash test/run-all.sh` (~17 min) writes `.heimdall/receipts/last-sweep.json`; then `jq .assertions_passed .heimdall/receipts/last-sweep.json` |
-| **13/13** corpus cases caught (100%) | `bin/corpus run` (mutates `CORPUS-STATUS.md`); scoreboard row in [`evals/flagship/STATUS.md`](evals/flagship/STATUS.md) |
-| **1.0** falsifiability on both flagship oracles (6/6, 3/3) | the two `bin/falsify … --assert-score 1.0` commands above |
+## Your code stays yours
 
-Then: `hmd invite` puts a teammate on your team wall in one paste · cloud bot that opens gated PRs on your repo: [`rr`](#get-a-bot-pr-on-your-repo) · a default module is a local proxy that reads your prompts — disclosed in full under [Install](#install).
-
----
-
-## Install
-
-Three paths. Each is labelled with what it actually does to your machine — pick the risk you are willing to take, not the shortest command.
-
-| # | Path | What it runs | Honest risk |
-|---|---|---|---|
-| **1** | **One-liner** (below) | Downloads `install.sh`, checks its sha256, then **runs it as you** | **Highest.** A script fetched over the network, executing with your user's privileges — it can do anything you can do. The digest check is the only thing between you and whatever those bytes are. Verify it, or take path 3. |
-| **2** | **npm** — `npx runheimdall` | The same `install.sh`, fetched over https and sha256-checked against a digest baked in at publish time ([`bin/runheimdall.js`](packages/runheimdall/bin/runheimdall.js)), then handed to `bash` | **Same as path 1.** The wrapper is thin and the script still runs as you. You gain not having to hand-copy a digest. You gain no isolation. |
-| **3** | **Docker sandbox** — [`Dockerfile.install`](Dockerfile.install) | The same `install.sh`, **copied from your own clone** — nothing fetched, no digest to trust — run **inside a container** | **Lowest, with real caveats.** Every `$HOME` change lands in a layer you delete. It does **not** isolate a repo you mount, and it is not a macOS sandbox. [Caveats below.](#path-3--the-docker-sandbox) |
-
-**Whichever you pick, this is what the installer writes outside the repo.** Measured from a real run against a throwaway `$HOME`, not asserted:
-
-| Written | What it is |
-|---|---|
-| `~/.heimdall/` | A full git clone of this repo — the installed checkout `hmd` runs from |
-| `~/.local/bin/hmd`, `~/.local/bin/heimdall` | Symlinks into `~/.heimdall/bin/heimdall` |
-| `~/.claude/settings.json` | Adds `statusLine` + `subagentStatusLine`, and registers the plugin under `enabledPlugins` / `extraKnownMarketplaces`. Honors `$CLAUDE_CONFIG_DIR`, and never clobbers a `statusLine` you set yourself |
-| `~/.zshrc` / `~/.bashrc` / `~/.profile` | One appended `export PATH=…` line for `~/.local/bin` — only when it is not already on `PATH` |
-| `~/Library/LaunchAgents/com.heimdall.dream.plist` | **macOS only** — a nightly 03:00 LaunchAgent (`com.heimdall.dream`) that runs the overnight sweep with no session open and survives logout and reboot. Opt out with `HEIMDALL_NO_DREAM_SCHEDULE=1` |
-| `~/.heimdall/team.json` | An auto-minted solo **team secret**, written by the post-install health check on every run (`heimdall-doctor-install`, deliberately pinned to `$HOME`) whether or not you supplied a team invite. A bearer capability — treat it like a credential |
-
-One thing that table leaves out because it does not fit "outside the repo": pasting a team invite (`HEIMDALL_TEAM_SECRET='<secret>' curl -fsSL … | bash`) writes a SECOND, real team.json inside whatever repo your shell was in when you ran the installer — `<repo>/.heimdall/team.json`, resolved from that shell's git toplevel at install time, never `~/.heimdall` (`ensure_team_secret`, `install.sh:520-537`). Measured the same way as the table above: a throwaway git-toplevel cwd distinct from `$HOME` got the file; the throwaway `$HOME` did not.
-
-No sudo. Idempotent — re-run to upgrade. `hmd uninstall` reverses all of it.
-
-**Network posture is default-ON.** Team presence and the cloud features reach the control plane as soon as you use them: a signed heartbeat carrying your handle, verdict, and current filename — scoped to your team, never your code or file contents. That is a feature, and it is on until you switch it off. `hmd presence sever` gives zero egress. Field-by-field contract: [DATA.md](DATA.md). The precisely scoped claims are under [Your code stays yours](#your-code-stays-yours).
-
-**hmd's default module set includes a proxy that can read your prompts. `hmd wrap claude` routes generation traffic through it; not every `hmd wrap <tool>` does — see below.** [Headroom](#headroom--the-one-shipped-module-and-its-honest-limits) is `default_included: true` in [`modules/headroom/manifest.json`](modules/headroom/manifest.json): a **local** context-compression proxy which, once traffic is pointed at it, sits between your coding tool and the model provider, reads the prompts and context on their way out, and rewrites them to be smaller. `hmd modules add headroom` installs the package, then measures each wire the manifest declares and reports what it found: the wrap chain measures `ROUTED`, meaning `bin/heimdall-wrap` offers the proxy hop to every tool it launches — not that every tool's traffic actually flows through it. Only `claude` reads the `ANTHROPIC_BASE_URL` this repo sets, so `hmd wrap claude` is the one launch that truly carries GENERATION traffic through the proxy; `hmd wrap codex`/`hmd wrap gemini` set the same variable on a CLI that never reads it, so their generation traffic is NOT routed despite the wire measuring `ROUTED`, and `hmd wrap cursor`/`hmd wrap aider` are unconfirmed either way. Bare `hmd` does not route. The storage-codec wire still measures `RECORDED, not routed`. JUDGMENT never traverses it — every verdict-producing call is scrubbed back to the real provider, which `test/gate-judgment-uncompressed.test.sh` goes red on. It runs as a process you own and can inspect, and it introduces no Heimdall-operated destination — that traffic goes to the same provider it went to before. Five things to know before you install:
-
-- **Nothing installs it for you.** `install.sh` has no module code path at all, and the background updater refuses to acquire a consent-required class unattended — it names the module and hands you the command. Until you run `hmd modules add headroom`, `hmd modules status headroom` reports `NOT ATTEMPTED`.
-- **That command is a remote code install, and no digest is verified.** It runs `uv tool install --python 3.13 "headroom-ai[all]==<pin>"` against PyPI. hmd hashes nothing on that path and does not claim to: the lifecycle step is named `install + provenance`, not `digest-verify`, and the receipt records `verified: false` alongside the pin it did not check. It also pulls an ML stack — Rust wheels, an ONNX runtime, HuggingFace tokenizers — so this is the one place hmd stops being near-stdlib.
-- **The consent question is waived; the disclosure is not.** `consent_waived` sits on that one module's manifest. [`modules/_classes/traffic-proxy.json`](modules/_classes/traffic-proxy.json) still reads `consent_required: true`, so every other traffic-proxy module hmd ships still asks. The consent text still prints, both declared class contracts still run their invariants, and the receipt records `granted_via: manifest-waiver`. This is a deliberate maintainer decision: disclosed, not asked.
-- **Installing it is not wiring it, and hmd measures the difference out loud.** The manifest declares two wires and hmd applies neither. `[6/7] wire` prints each one as `RECORDED, not routed` next to the measurement that produced it — `bin/heimdall-wrap` holds no reference to the module, and the memory-codec seam reports `backend=plain` — and `hmd modules status headroom` reads back that same record. A declared wire whose kind the code has no handler for is refused at validate rather than quietly recorded, so a module cannot install while claiming a capability hmd does not deliver ([`test/wire-kind-dispatch.test.sh`](test/wire-kind-dispatch.test.sh)).
-- **Gates read raw, and signed traffic steps around it.** Route generation through a proxy — this one, or your employer's — and judgment still may not follow it. Verdict-producing commands run through `hmd_gate_exec`, and control-plane, enrollment and presence traffic through `hmd_signed_exec` ([`bin/lib/hmd-gate-endpoint.sh`](bin/lib/hmd-gate-endpoint.sh)); both drop `ANTHROPIC_BASE_URL`, the proxy pairs and the whole `HEADROOM_*` namespace before pinning the endpoint to the real provider. [`test/gate-judgment-uncompressed.test.sh`](test/gate-judgment-uncompressed.test.sh) goes red the moment a gate request reaches the proxy.
-
-`hmd modules remove headroom` returns the tree byte-identically. Threat model, the full reachability table and every way to decline it: [SECURITY.md](SECURITY.md#the-headroom-proxy--a-local-process-that-reads-your-prompts). Mechanics and honest limits: [Modules](#modules).
-
-### Path 1 — the one-liner
-
-<!-- HEIMDALL:PIN:TAG,SHA256:BEGIN -->
-```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.4.3/install.sh -o heimdall-install.sh \
-  && echo "a03c15bfdddd096f3152204c047dbf6888b34194592b0707ee82a892da147a67  heimdall-install.sh" | shasum -a 256 -c - \
-  && bash heimdall-install.sh
-```
-<!-- HEIMDALL:PIN:END -->
-
-Pinned to the `v2.4.3` tag **and** checked against the sha256 of that tag's `install.sh`. <!-- HEIMDALL:PIN:TAG --> The `&&`
-chain is load-bearing: if the bytes do not match the digest, `shasum -c` prints `FAILED` and
-**nothing runs** — so a tag moved under you, a CDN cache poisoning, or a truncated download stops
-the install instead of executing. On a Linux box without `shasum`, `sha256sum -c -` takes the same
-digest. Re-derive it yourself any time:
-
-<!-- HEIMDALL:PIN:TAG,SHA256:BEGIN -->
-```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.4.3/install.sh | shasum -a 256
-# a03c15bfdddd096f3152204c047dbf6888b34194592b0707ee82a892da147a67
-```
-<!-- HEIMDALL:PIN:END -->
-
-No sudo. Idempotent — re-run to upgrade. Reversible:
-
-```bash
-hmd uninstall    # removes everything; nothing else was touched
-```
-
-**Prefer to inspect first?** Same download, same check — just read it before you run it:
-
-<!-- HEIMDALL:PIN:TAG,SHA256:BEGIN -->
-```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.4.3/install.sh -o heimdall-install.sh
-echo "a03c15bfdddd096f3152204c047dbf6888b34194592b0707ee82a892da147a67  heimdall-install.sh" | shasum -a 256 -c -
-less heimdall-install.sh  # function-wrapped, no eval, no base64 — what you read is what runs
-bash heimdall-install.sh
-```
-<!-- HEIMDALL:PIN:END -->
-
-**Signature (stronger than the digest).** A digest you copy from this README only proves the bytes
-match what this README says; a signature proves they came from the maintainer's key. Every release
-signs `install.sh` with minisign and publishes `install.sh.minisig` as a release asset:
-
-<!-- HEIMDALL:PIN:TAG:BEGIN -->
-```bash
-curl -fsSL -O https://github.com/randomittin/heimdall/releases/download/v2.4.3/install.sh.minisig
-minisign -Vp release/heimdall-signing.pub -m heimdall-install.sh -x install.sh.minisig
-```
-<!-- HEIMDALL:PIN:END -->
-
-The public key ships in this repo at `release/heimdall-signing.pub`, so that command assumes a
-clone. [`SIGNING.md`](SIGNING.md) has the full model — including the bundled pure-python verifier
-for machines with no `minisign` binary, and the fail-closed behavior of the auto-updater.
-
-**Prerequisites:** Claude Code 1.0+ · Git · `jq` (`brew install jq`) — `install.sh` itself completes without `jq` (every call site there guards with `command -v jq`), but most `hmd` subcommands hard-require it afterward, so install it up front
-
-hmd is itself a Claude Code plugin, so Claude Code is what installs and runs it. If Cursor CLI's `agent` (`cursor-agent`) is also on `PATH`, `hmd init` gates that host too — see [Also gates Cursor CLI](#also-gates-cursor-cli).
-
-### Path 2 — npm
-
-[`npx runheimdall`](https://www.npmjs.com/package/runheimdall) — same pinned tag, same sha256 check, zero clone required. It fetches the pinned `install.sh`, verifies it against the digest baked in at publish time, and aborts before executing anything if the bytes disagree. Convenience, not containment: what finally runs is the same script, with the same privileges as path 1.
-
-### Path 3 — the Docker sandbox
-
-For a first look that does not touch your machine. Build from a clone, so the `install.sh` you read is byte-for-byte the one that runs — nothing is fetched, so there is no digest for you to trust:
-
-```bash
-git clone https://github.com/randomittin/heimdall && cd heimdall
-less install.sh                                     # what you read is what runs
-docker build -f Dockerfile.install -t heimdall-sandbox .
-docker run --rm -it heimdall-sandbox                # hmd is already on PATH
-```
-
-`--rm` discards every `$HOME` mutation in the table above the moment the container exits. The image also drops the auto-minted `team.json` during the build, so containers never share one team secret.
-
-**What the container does not isolate** — a sandbox you misunderstand is worse than no sandbox:
-
-- **A mounted repo is not isolated.** `-v "$PWD:/work"` is a hole you punched on purpose: anything `hmd` writes under `/work` lands on your real disk. Mount `:ro` if you only want `hmd` to read your code.
-- **It is not a macOS sandbox.** The image is Linux, so launchd and the keychain do not exist inside it and the nightly LaunchAgent step is skipped as `unsupported`. That is the container being a different OS — not a boundary defending your account. `launchctl` and the keychain are **account-scoped**: a fake `$HOME` relocates only the plist *file*, while `launchctl load` still registers the job in your real per-user session. A sandboxed test in this repo learned that the hard way, by rewriting the developer's live LaunchAgent. The switch is `HEIMDALL_NO_DREAM_SCHEDULE=1` — never `$HOME`.
-- **The network is open.** The build clones from GitHub, and presence is on by default. `docker run --network none` gives the container zero egress; `hmd presence sever` does the same at the application level.
-
-### Your code stays yours
+**Network posture is default-ON.** Team presence and the cloud features reach the control plane as soon as you use them: a signed heartbeat carrying your handle, verdict, and current filename — scoped to your team, never your code or file contents. That is a feature, and it is on until you switch it off. `hmd presence sever` gives zero egress. Field-by-field contract: [DATA.md](DATA.md). The precisely scoped claims are below.
 
 Gates run 100% locally. Your code never leaves your machine.
 
@@ -199,270 +123,20 @@ Auto-update checks GitHub Releases for new signed versions. HEIMDALL_NO_AUTOUPDA
 
 Full data contract and every field collected: [DATA.md](DATA.md).
 
----
-
-## First run
-
-```bash
-hmd demo --run
-```
-
-Scaffolds a real full-stack task, builds it, ends with a summary card and a follow-up prompt. Safe to run sight-unseen — `hmd demo` (without `--run`) prints the plan and does nothing.
-
----
-
-## Why Heimdall
-
-- **Catches the silent failures** — ordering races, whole-sequence invariants, missing subsystems that pass a naive green suite.
-- **Falsifiable gates** — every gate is proven able to go red before it is trusted green. The corpus of real failure cases replays on every change; a regression that once shipped can never ship twice.
-- **Proof of correctness, not just generation** — the delta Heimdall sells is the receipt that proves the proof can fail. [Generalizes: 0.50 median reuse across 8 cold repos.](https://runheimdall.dev/proof)
-- **Full audit trail** — `hmd report` produces a machine-readable telemetry report of every gate, mutation score, and corpus catch-rate from the last run.
-
----
-
 ## Get a bot PR on your repo
 
-`rr` is the same gate, run in the cloud: a bot that fixes your GitHub issues and opens a PR whose fix has already passed a check the agent never wrote. You review, you merge. The bot opens it on a `heimdall/*` branch **as a scoped GitHub App** — never as you, never on `main`, and it never self-merges. A human always gates the merge.
-
-Once you've installed the Heimdall Maintainer GitHub App on your repo and run `claude setup-token`, it's two commands:
-
-```bash
-rr connect                                    # registers your App install + captures your Claude cred
-rr "fix the flaky test in payments and open a PR"
-```
-
-**What happens:** `rr` signs your task with your own Ed25519 key and enqueues it. A gated worker clones your repo with **your team's** Claude subscription and **your** GitHub App installation, runs the issue-resolution loop until the fix passes the gates, and opens a `heimdall/*` PR on your repo. You review it. You merge it.
-
-**Nothing to paste — no token, no URL.** The public control plane is baked in and enrollment is automatic: your first signed call registers this device on first use. Just `rr connect` and go. (Running your own deployment, or need to re-gate enrollment behind a bootstrap token? That's an operator concern — see [`OPERATORS.md`](OPERATORS.md).)
-
-### Why it's safe to point at your repo
-
-- **Tenant isolation is a falsifiable oracle, not a promise.** Every cross-tenant attack — IDOR by repo slug, cred read across teams, queue drain, installation-id swap, signed-request replay — has a named invariant and a red-line mutant test. Drop any gate and [`test/heimdall-cp-authz-gate.test.sh`](test/heimdall-cp-authz-gate.test.sh) goes red; the keystone suite passes **only** when every mutant is caught. Full invariant + attack matrix: [`docs/specs/2026-07-03-rr-isolation-invariants.md`](docs/specs/2026-07-03-rr-isolation-invariants.md).
-- **BYOC — no shared keys.** You pay your own Claude tokens; your credential lands in **your own** per-team Secret Manager secret and is injected env-only into your job — never logged, never echoed, never readable by another tenant.
-- **Least-privilege bot.** The App holds exactly Contents + Issues + Pull requests — **no** Administration, **no** Actions/Workflows, **no** merge capability. It can open a PR; it cannot touch branch protection or push to `main`.
-- **Honest bring-up.** This loop was hardened over a live multi-tenant bring-up that shook out a run of production-only failures — Google's GFE rejecting GET-with-a-body, cold-start identity drift, jobs starving under scale-to-zero — each now documented as fixed in [`deploy/cloud-run/README.md`](deploy/cloud-run/README.md) and the runbook.
-
-Under the hood the bot runs the local engine installed above: every plan wires an external, falsifiable oracle so the implementation can never grade its own homework, and the merge stays blocked until that oracle is green — after it has been proven able to go red.
-
----
-
-## What's inside
-
-| Capability | Command | Status |
-|---|---|---|
-| Verification gates (secret-scan, falsify) | Automatic on commit/push (git hooks) · `bin/falsify <domain>` to run one directly | Shipped |
-| Demo task runner | `hmd demo` / `hmd demo --run` | Shipped |
-| Issue-resolution loop | `hmd` (auto-retries failures against corpus) | Shipped |
-| Telemetry report | `hmd report` | Shipped |
-| Design match (visual diff vs spec) | `hmd designmatch` | Shipped |
-| Redum / conformance checker | `hmd redum` · `hmd check` | Shipped |
-| Reuse engine (cold-repo analysis) | `bin/lib/reuse_analyzer.py` | Shipped |
-| Debloat scanner | `heimdall-debloat --report-only` | Shipped |
-| Parallel workers | `hmd --team N "task"` (N tmux panes, independent — no shared state) | Shipped (no coordination layer) |
-| Benchmark suite | `heimdall-bench` | Shipped |
-| Optional capability modules | `hmd modules` | Shipped |
-| Cursor CLI host (gate + statusline HUD) | `hmd init` (auto-detects) · [details](#also-gates-cursor-cli) | Shipped |
-| AI backend preference (Claude Code ⇄ Cursor CLI) | `heimdall-ai-select` · `/hmd:switch-ai` | Shipped |
-
----
-
-## Modules
-
-Optional capability modules. **The base install ships the module system and zero module payloads** — [`modules/`](modules/) holds manifests and class contracts, never vendored code. The registry *is this repo*, so every pin is a reviewed commit rather than a network lookup, and there is no code path that resolves "latest". **Nothing self-installs.**
-
-```bash
-hmd modules                    # list — honest when nothing is installed
-hmd modules add <name>         # the full ordered pipeline
-hmd modules remove <name>      # total removal
-hmd modules update [<name>]    # move to the manifest's human-set pin
-hmd modules status <name>      # one module in detail
-hmd modules verify [<name>]    # re-run class invariants (the CI entry point)
-hmd modules preflight <name>   # can this install happen? read-only, asks nothing
-hmd modules repair <name>      # retry an install, recording which stage failed
-hmd modules defer <name>       # not now — hmd is ready, the module follows later
-hmd modules pending            # what is deferred or awaiting a retry
-hmd modules optout <name>      # decline; no install path may re-install it
-hmd modules optin <name>       # undo an optout
-```
-
-Every verb accepts `--json`; `add` accepts `--yes`. `--registry` and `--state` relocate the registry and install state, which is how the suite runs hermetically.
-
-### Four permission classes
-
-A module declares its class — or several — in its manifest, and a missing or unknown class is **refused, not defaulted**: the class decides consent and which invariants are enforced, so picking one silently would be picking a security posture on the operator's behalf. When a module declares several, **the union of their invariants runs, never the first match.**
-
-| Class | Consent | Invariants enforced |
-|---|---|---|
-| `traffic-proxy` | **required** | gates read raw · non-interactive passthrough · signed and control-plane traffic never routed through it |
-| `tool-adapter` | **required** | wrap/unwrap byte-identical · hooksPath and AGENTS.md fences preserved |
-| `storage-codec` | not required | round-trip fidelity · plain fallback when absent · never touches judgment inputs |
-| `rule-pack` | not required | rules ship falsifiers · attribution preserved |
-
-The two classes that mutate something you own — the wire, and your own config files — ask. The two that are transparent by contract do not, and their invariants are what make that transparency true rather than asserted: a codec that loses a byte, or a pack that flattens attribution, is rolled back rather than merely disclosed.
-
-### The lifecycle order is the contract
-
-```
-[1/7] validate → [2/7] class contract → [3/7] preflight → [4/7] consent
-    → [5/7] install + provenance → [6/7] wire → [7/7] class invariants (module active)
-```
-
-Steps 1–4 are read-only, so anything rejected at validate, class, preflight or consent mutates nothing at all. **Preflight sits before consent on purpose** — nobody should be asked to agree to an install that cannot happen. Step 5 is the first mutation, and from there every failure unwinds through **the same removal path `remove` uses**, so a module that fails its own class test leaves a byte-identical tree. Wiring precedes invariants deliberately: the contracts assert behaviour *with the module active*, so a check run against an unwired module would prove nothing.
-
-**Step 5 is called `provenance`, not `digest-verify`, and the naming is load-bearing.** A digest is verified on exactly one path: a `local` module, whose artifact ships in this repo and is hashed here against its pin. An `upstream` module is fetched from a package index and hmd hashes **nothing** — it records the pin and asks the installer whether the payload arrived. The receipt reads `verified: false` in every upstream state, and nothing re-checks that pin later: `hmd modules verify` re-runs the class invariants and reads no digest at all. Printing `digest-verify` over that would assert a check that never ran.
-
-### Consent leaves a receipt
-
-An install that required consent records how it was granted — `granted_via` is one of `interactive`, `--yes`, or `manifest-waiver` — alongside the exact `consent_text` shown and its `consent_text_sha256`. Consent required with a non-TTY stdin is **refused, not prompted and not defaulted to yes**; `--yes` is the operator saying so on purpose.
-
-A module in the default set reaches machines the author will never meet, so `default_included: true` is refused at **validate** time if any class it claims requires consent and the manifest ships no `consent_text`. A disclosure that only materialises at a prompt somebody may never be shown is not a disclosure.
-
-### Opting out
-
-Two surfaces read opt-out signals, and **they do not overlap** — each verb honours the signals of the surface it belongs to:
-
-| Signal | Read by | Effect |
-|---|---|---|
-| `HEIMDALL_NO_MODULES=1` | `bin/heimdall-autoupdate` | no module is acquired automatically, at all |
-| `~/.heimdall/modules-optout` | `bin/heimdall-autoupdate` | one module name per line; `#` starts a comment |
-| `hmd modules optout <name>` | `bin/heimdall-modules` | persisted; `repair`, `defer` and `pending` all refuse to act |
-| `HMD_MODULE_OPTOUT=a,b` | `bin/heimdall-modules` | the same, for one invocation |
-
-**`install.sh` acquires no modules at all** — the installer has no module code path, so there is no installer flag to suppress and none is offered. Automatic acquisition lives in the background updater, which is why `HEIMDALL_NO_MODULES=1` bites there. The consequence, stated plainly: every one of these signals governs acquisition that happens **on your behalf**. `HEIMDALL_NO_MODULES=1` suppresses automatic acquisition and does **not** block an explicit `hmd modules add <name>` — an operator typing the command themselves is not what an opt-out for unattended installs is trying to stop.
-
-### Headroom — the one shipped module, and its honest limits
-
-[`modules/headroom/manifest.json`](modules/headroom/manifest.json) pins [Headroom](https://github.com/headroomlabs-ai/headroom) (Apache-2.0), a local context-compression proxy. **Depend, don't clone** — none of its source is vendored here. The manifest is the single source of truth for the pin and its artifact digest; this page deliberately does not restate the version, because a second hand-maintained copy of a pin is how pins drift.
-
-It is `default_included`, and its consent *question* is waived on the module itself. `modules/_classes/traffic-proxy.json` still reads `consent_required: true`, so every other traffic-proxy module hmd ever ships still asks; the waiver's blast radius is this one module. Waived is the question, never the disclosure — the consent text still prints, both declared classes still run their invariants with the module active, and `hmd modules remove headroom` still returns the tree byte-identically.
-
-Being in the default set is a **distribution** fact, not a claim that it helps, and not an unattended install:
-
-- **The background updater will not install it for you.** Acquisition reads the *class* contract, and `traffic-proxy` requires consent — so `heimdall-autoupdate` names the module, states the class, and hands you `hmd modules add headroom` rather than acquiring it. Until you run that command, `heimdall-autoupdate status` reports it `absent` with the reason and `hmd modules status headroom` reports `NOT ATTEMPTED`.
-- **It is the one place hmd stops being near-stdlib.** The fetch is `uv tool install --python 3.13 "headroom-ai[all]==<pin>"`, which pulls an ML stack — Rust wheels, an ONNX runtime, HuggingFace tokenizers. Install size and time are materially larger than hmd's own.
-- **A failed Headroom install does not fail `hmd install`.** hmd works; the module reports ABSENT with the blocker and the remedy named, and rolls back through the removal path. It is never silently assumed present.
-- **The storage-codec half does not engage via the documented install.** `uv tool install` lands the package in an isolated per-tool venv that hmd's `python3` cannot import, so the memory codec stays on its `plain` backend on every machine that installs it the sanctioned way. The manifest records that as a measurement rather than letting a green `add` imply otherwise. Treat compression on the storage seam as a contract the seam honours *if* a backend ever arrives — not as a description of any running machine.
-- **The proxy half is declared, not applied — hmd points no traffic at it.** `bin/heimdall-wrap` contains no reference to the module, so installing Headroom leaves your generation traffic going exactly where it went before. The `wrap-chain` wire records the chain hmd *would* offer; wiring it up is yours to do, deliberately, by pointing your tool at the proxy. hmd measures that wire at every `add` and prints `RECORDED, not routed` while it stays unapplied, and a wire kind with no handler behind it is refused outright rather than recorded — an install may not imply a capability the code cannot deliver ([`test/wire-kind-dispatch.test.sh`](test/wire-kind-dispatch.test.sh)).
-- **Gates read raw.** Generation traffic may traverse a proxy once you route it through one; judgment traffic may not follow. Every verdict-producing execution runs through `hmd_gate_exec`, which unsets `ANTHROPIC_BASE_URL`, the HTTP/HTTPS/ALL/NO_PROXY pairs and Headroom's own `HEADROOM_*` namespace before pinning the endpoint to the real provider. A judge reading compressed context emits confident false greens, which is the failure this whole project exists to prevent.
-
-Full manifest schema, class-contract details and the lifecycle rationale: [`modules/README.md`](modules/README.md).
-
----
-
-## Viral statusline — watchman, team wall, gate animation
-
-Heimdall's status bar is a full-width, four-row watchman HUD. It renders entirely shell-side (zero model, zero context cost) — `bin/heimdall-statusline` is one CLI-agnostic renderer shared by both hosts it wires into. Under Claude Code, `hooks/statusline.sh` reads the `statusLine` JSON Claude Code hands it on stdin. Under Cursor CLI it reads the same shape from Cursor's own `statusLine` plug-in point, swapping only the width signal — Cursor hands `render_width_chars` in that JSON instead of Claude Code's `$COLUMNS`, and the renderer already reads that field itself. Three surfaces, by how far they spread:
-
-**Your sigil — the identity hook.** Every Heimdall identity (`HAID`) gets a unique, deterministic pixel watchman: same identity, same sigil, forever. It anchors the left of the line, prints big on the install card, and shares as a postable block:
-
-```bash
-python3 sentinels/hmd-sigil.py --seed $HMD_HAID --size large   # share/banner render
-bash hooks/hmd-banner.sh --share                               # postable "my watchman" card
-```
-
-The seed is your **HAID by default** — automatic, stable, no PII in the art. Works solo on day one, before any teammate shows up.
-
-**The team watch wall — the headline, and the moat.** When teammates also run `hmd` in the same repo, the bottom row becomes a live wall of their watchmen and what each agent is doing — gate state colored in, a teammate's cell flashing red the instant their gate denies. Nobody else can render this; it needs Heimdall's coordination substrate. The wall is empty until your team joins, so the feature recruits your team for you.
-
-Two presence channels, two defaults. The **control-plane presence** (the signed heartbeat described under *Network posture* above) is **on by default**: `hmd presence off` silences this repo (`<repo>/.heimdall/presence.json` → `{"enabled": false}`), `hmd presence off --global` is the machine-wide kill switch (`~/.heimdall/presence-off`), and `hmd presence sever` is the zero-egress opt-out. The **file-based wall heartbeat** is separate and off until you ask for it: `sentinels/hmd-gate-event.sh` writes `<repo>/.heimdall/team/<haid>.json` (TTL ~30s; a stale file means the agent left) only when `<repo>/.heimdall/team/CONSENT` exists, and the statusline reads those files only when the server roster is empty. Names in that dir never leave the repo. The watchman watches your gates, not your team. At squad scale the wall caps at the **~6 most-recently-active** teammates plus a `+N more` tail so a wide terminal never wraps.
-
-**The deny flash — the clip.** When a gate blocks, `hmd-gate-anim.sh` redraws the big watchman inline: a scanning pulse settling to a green sparkle on pass, or three red beats and `✗ BIFRÖST CLOSED` on deny. TTY-only — in CI or a pipe it collapses to one clean final frame so logs stay readable.
-
-```bash
-bash sentinels/hmd-gate-anim.sh deny "oracle/falsify" $HMD_HAID
-```
-
-**Wiring** (`settings.json`):
-
-```json
-{
-  "statusLine":         {"type":"command","command":"bash ${CLAUDE_PLUGIN_ROOT}/hooks/statusline.sh"},
-  "subagentStatusLine": {"type":"command","command":"bash ${CLAUDE_PLUGIN_ROOT}/sentinels/hmd-subagent-statusline.sh"}
-}
-```
-
-`install.sh` wires this for you — it registers both entries into your `~/.claude/settings.json` (honoring `$CLAUDE_CONFIG_DIR`) using the **absolute installed path**, idempotently and without clobbering a `statusLine` you set yourself. The `${CLAUDE_PLUGIN_ROOT}` form above is the plugin-hook spelling; a user-level statusLine resolves no such variable, so the installer fills in the resolved absolute path — which is why the HUD now reaches every dev, not just whoever hand-wired it in dev setup.
-
-Cursor CLI gets the identical renderer through its own plug-in point, registered automatically by `hmd init` — mechanics and the honest limits of that second host are in [Also gates Cursor CLI](#also-gates-cursor-cli) below.
-
-`hooks/statusline.sh` drives the full-width watchman and falls back to the legacy single line if `python3` is missing — it never errors, never blocks. Already a ccstatusline (9.2k★) user? Keep your line and drop the watchman in as a Custom Command widget:
-
-```bash
-python3 sentinels/hmd-statusline.py --widget   # just the watchman + verdict segment
-```
-
-The sigil ships solo-first (viral-cheap, no team required); the watch wall is the team-gated headline that lights up once presence is wired into your gate hooks.
-
----
-
-## Also gates Cursor CLI
-
-hmd is itself a Claude Code plugin, but the gate it wires into git is not plugin-specific. Once a repo has been through `hmd init`, code written by Cursor CLI's `agent` (`cursor-agent`) is checked by the exact same `pre-commit`/`pre-push` → `bin/heimdall-gate-run` path as code written by Claude Code — same stub-scan, same falsify oracle, same `BIFRÖST` deny on the same terms. Cursor also reads `AGENTS.md` at session start the way Claude Code reads `CLAUDE.md`, so the fenced `hmd init` block that tells an agent "this repo is gated" reaches it too.
-
-`hmd init` also auto-registers the watchman HUD into Cursor's own `~/.cursor/cli-config.json` `statusLine` the moment it detects `cursor-agent` on `PATH` (`bin/heimdall-statusline-register-cursor`, verbs `status` / `register` / `unregister`, also reachable as `hmd cursor-statusline`). It is idempotent, never clobbers a `statusLine` you set yourself, and never runs at all against a machine that has never touched Cursor. Opt out with `HEIMDALL_NO_CURSOR_STATUSLINE_REGISTER=1` or `~/.heimdall/no-cursor-statusline-register` (the shared `HEIMDALL_NO_STATUSLINE_REGISTER=1` / `~/.heimdall/no-statusline-register` markers suppress both hosts).
-
-hmd's own sub-agent spawns can delegate work to more than one detected CLI backend. `heimdall-ai-select list --auth` shows what is on `PATH`, and `/hmd:switch-ai` (or `heimdall-ai-select select <letter|id>`) changes which one hmd *prefers*, persisted to `.planning/settings.json` under `ai_backend` with its provenance (`user` vs `auto-default`). That preference is not a live hot-swap: hmd is Claude Code code running inside a Claude Code process, and nothing restarts that process into a different CLI mid-session — switching takes effect for delegated spawns now and for the next session's default, never for the session you're already in.
-
-### What you don't get under Cursor
-
-The gate itself has the same teeth under Cursor as under Claude Code — nothing here weakens what gets blocked. What differs is *when* and *how* it fires:
-
-- **Caught at commit, not at write.** Claude Code's live `PreToolUse` hook blocks a stub the instant it is written. Cursor CLI has no equivalent pre-write hook, so the same stub is instead caught at `git commit` by `bin/heimdall-gate-run`'s backstop — later, but the same gate, and the commit still does not land.
-- **No SessionStart automation.** The auto-update check, `cc-selfheal`, the resume probe, the dream notice, the presence keeper, and `heimdall-ai-select session-start` all fire from Claude Code's SessionStart hook. Cursor has no such hook for hmd to fire from, so `hmd init` is a one-time, by-hand setup rather than something that re-arms itself every session.
-- **No SessionEnd automation.** Checkpoint writes, `verify-edits`, and auto-commit likewise never fire under Cursor — there is no session-end hook to fire them from.
-- **No subagent orchestration.** hmd's `Agent`/`SendMessage` spawning is Claude Agent SDK-specific; it does not run inside a `cursor-agent` process.
-- **Cursor's own `.cursor/hooks.json` is untouched.** Cursor has a separate, unrelated hook mechanism (`sessionStart` / `preToolUse` / `beforeShellExecution`, allow/ask with an exit-code-2 deny); hmd does not populate it and has no plan to.
-
----
+`rr` is the same gate, run in the cloud: a bot that fixes your GitHub issues and opens a PR whose fix has already passed a check the agent never wrote. The bot opens it on a `heimdall/*` branch **as a scoped GitHub App** — never as you, never on `main`, and it never self-merges. A human always gates the merge: `test/no-auto-merge.test.sh` fails if any shipped code path merges, pushes or deploys without a classified human trigger. It also prints, on every run, the places where shipped agent instructions (the maintainer guide, the incident responder) tell an agent to release or deploy with no confirmation step: known gaps that wait for an operator decision, not accepted silently. Setup, the isolation oracle and the bring-up notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#get-a-bot-pr-on-your-repo).
 
 ## Running on your own work
 
-```bash
-cd /path/to/your/project
-heimdall --auto "build a real-time dashboard with auth and charts"
-```
+`heimdall --auto "<task>"` runs Claude Code's auto permission mode (a background safety classifier). With no flag, `heimdall` launches Claude Code with `--dangerously-skip-permissions` (full autonomy): pass `--auto` first for the safer opt-in. More: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#running-on-your-own-work).
 
-`--auto` runs Claude Code's auto permission mode (`--permission-mode auto`): a background safety classifier that blocks prompt injection and risky escalation. It is **not** the default. With no flag, `heimdall` launches Claude Code with `--dangerously-skip-permissions` (full autonomy) — `bin/heimdall` sets `PERMISSION_FLAG="--dangerously-skip-permissions"` and only a leading `--auto` overrides it. Pass `--auto` as the first argument for the safer opt-in; run the bare default only where you would accept a fully autonomous agent.
+## Docs
 
----
+[Install and its disclosure](docs/INSTALL.md) · [Architecture and capabilities](docs/ARCHITECTURE.md) · [Naming](NAMING.md) · [Parked](PARKED.md) · [Receipts](docs/RECEIPTS.md) · [Data contract](DATA.md) · [Security](SECURITY.md) · [Signing](SIGNING.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
-## Failures visible on purpose
-
-Live flagship status: [`evals/flagship/STATUS.md`](evals/flagship/STATUS.md) — the ❌ rows are kept in view. The corpus dip log and golden provenance are at [`evals/corpus/CORPUS-STATUS.md`](evals/corpus/CORPUS-STATUS.md) and [`evals/oracles/emulator-gb/fixtures/golden/VERIFICATION.md`](evals/oracles/emulator-gb/fixtures/golden/VERIFICATION.md).
-
-A verification system that can't show you its own failures can't be trusted with yours.
-
----
-
-## Contributing
-
-- **Stack packs** ([`skills/stacks/`](skills/stacks/)) — teach Heimdall a framework's conventions and build commands.
-- **Oracle packs** ([`evals/oracles/`](evals/oracles/)) — add a falsifiable external gate for a new domain.
-
-See [CHANGELOG.md](CHANGELOG.md) for release history.
-
----
+Teach it a framework with a [stack pack](skills/stacks/), or add a falsifiable external gate for a new domain with an [oracle pack](evals/oracles/). A verification system that can't show you its own failures can't be trusted with yours.
 
 ## License
 
 [MIT](LICENSE)
-
-## Self-maintenance (auto-update + self-heal)
-
-hmd keeps itself and its host current, in the background, on session start — both are
-throttled (~24h), detached (never block the session), idempotent, and opt-out:
-
-- **Plugin auto-update** (`bin/heimdall-autoupdate`): checks the installed version vs the
-  latest GitHub release; if newer, re-runs the latest installer in the background (takes
-  effect next launch; never hot-swaps the running session). Off: `HEIMDALL_NO_AUTOUPDATE=1`
-  or `~/.heimdall/no-autoupdate`.
-- **Claude Code self-heal** (`bin/heimdall-cc-selfheal`): on a NATIVE Claude Code install,
-  auto-repairs the "✘ Auto-update failed" class — a stale npm-global `@anthropic-ai/claude-code`
-  conflicting with the native updater. It removes ONLY that conflicting package, ensures
-  `autoUpdates:true`, and re-runs `claude update`. Never touches an npm/brew-managed install,
-  never uninstalls anything else, never touches credentials. Off: `HEIMDALL_NO_SELFHEAL=1`
-  or `~/.heimdall/no-selfheal`. Inspect: `heimdall-cc-selfheal status`.
-- **Default module reconciliation** (same updater): compares the installed [modules](#modules)
-  against the default set. A module whose class requires consent is **never** acquired here —
-  it is named, with the `hmd modules add` command to run. Off: `HEIMDALL_NO_MODULES=1` or
-  `~/.heimdall/modules-optout`. Inspect: `heimdall-autoupdate status`.

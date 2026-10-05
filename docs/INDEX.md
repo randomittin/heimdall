@@ -15,6 +15,10 @@ The single map of Heimdall's knowledge tree. Every committed Markdown doc earns 
 | [../README.md](../README.md) | Project front door — what Heimdall is and how to install/use it. | Load-bearing |
 | [INVENTORY.md](INVENTORY.md) | Inventory of the current version — every shipped part, what it does, how it is proven; every count derived from a shown command. | Current (2026-09-19) |
 | [../IDENTITY.md](../IDENTITY.md) | Canonical identity — single source of truth for naming/positioning. | Load-bearing |
+| [../NAMING.md](../NAMING.md) | Canonical name list (runhmd product, `hmd` CLI, Heimdall engine) with every codename mapped to a subcommand or internal; checked against the code by `test/naming.test.sh`. | Load-bearing |
+| [../PARKED.md](../PARKED.md) | What is deliberately not being built now (plan section 16) and the feature-freeze rule that feeds it. | Current |
+| [INSTALL.md](INSTALL.md) | Install disclosure — the three paths, what the installer writes, what leaves the machine, the Headroom proxy, self-maintenance. Moved out of the README. | Load-bearing |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Architecture and capabilities moved out of the README — gates, `rr`, modules, statusline, the Cursor host, the reproducible numbers. | Load-bearing |
 | [superpowers/specs/2026-07-06-teams-growth-strategy.md](superpowers/specs/2026-07-06-teams-growth-strategy.md) | Heimdall Teams growth strategy (Slack-playbook → Cursor-for-teams revenue). | Current (draft) |
 | [../DECISION-GATE.md](../DECISION-GATE.md) | Pre-launch decision gate — written before launch, frozen. | Reference |
 | [../PARITY.md](../PARITY.md) | superx → heimdall feature-surface parity matrix. | Reference |
