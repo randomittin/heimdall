@@ -53,11 +53,25 @@ HOW EACH STATE IS REACHED (the newest decisive entry decides):
                   heuristic, anchored on the oldest such request (see _approval_attention).
   idle            an end_turn / user interrupt / API-error that is SETTLED (a system turn_duration
                   entry followed it, or SETTLE_S passed) and has no fresh live subagents.
-                  kind "done" iff sweep_receipt.head_sha and checkpoint.head agree on a >=7-char
-                  prefix AND quality_gate.clear_to_push is true; else "stopped".
+                  kind "error" iff that entry is an API-error turn end (ERROR, below), whatever the
+                  gate says; else "done" iff sweep_receipt.head_sha and checkpoint.head agree on a
+                  >=7-char prefix AND quality_gate.clear_to_push is true; else "stopped".
   ended           no transcript write for ENDED_AFTER_S. SessionEnd leaves no mark on disk, so
                   staleness stands in for it (every state, including needs_*, ages out).
-`kind: "error"` is never emitted (the handoff defines no trigger for it).
+
+ERROR (PN3, docs/HANDOFF-TO-HEIMDALL-push-notifications.md). The one trigger is an API-error turn end: Claude
+Code's synthetic assistant entry for a request that FAILED after its own retries -- a session / rate limit, a
+5xx or 529, an expired login, "Prompt is too long", an org policy, a 400. Its shape, read off real transcripts
+(Claude Code 2.1.241 - 2.1.288): `isApiErrorMessage: true`, model "<synthetic>", stop_reason "stop_sequence", the
+failure's category in `error` (rate_limit, server_error, authentication_failed, invalid_request, ...), its HTTP
+status in `apiErrorStatus` when there is one. The boolean flag alone decides; the category, the status and the
+text are not consulted. Same settle rule as any turn end, then state idle, kind "error", `summary` the entry's
+text flattened to one line (the leading whole sentences that fit 160 chars, else a hard cut with an ellipsis;
+secret_shaped -> null, the field only), `options` null. The id is anchored on that entry like every episode, so
+each failed request has its own id (the push sender's e:<id> key rides on it), and the next prompt, tool call or
+any other resumed work moves the state to `working`: cleared. NOT errors: a user interrupt, a `system`/`api_error`
+retry notice (Claude Code is still retrying), a failed tool call (a red test run is routine), a sub-agent's
+(sidechain) error, and the same synthetic entry with the flag false ("No response requested.").
 
 Session choice: bin/lib/hmd_session_resolve.py, the ONE rule every hmd-ui collector shares -- an
 inherited CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / SESSION_ID only when it names a transcript
@@ -181,7 +195,9 @@ def _classify(e):
         if uses:
             return "tool_use", uses
         stop = msg.get("stop_reason")
-        if isinstance(stop, str) and stop and stop not in ("tool_use", "pause_turn"):
+        # An API-error entry ends its turn whatever its stop_reason says: the flag is the one field the whole
+        # error trigger rests on, so a stop_reason that ever drifts must not leave the run "working" for 6 hours.
+        if e.get("isApiErrorMessage") is True or (isinstance(stop, str) and stop and stop not in ("tool_use", "pause_turn")):
             return "text_end", _text_of(content)
         return "progress", None
     if t == "user":
@@ -204,7 +220,7 @@ def _classify(e):
 def _record(e, kind):
     uid = e.get("uuid")
     return {"kind": kind, "uuid": uid if isinstance(uid, str) and uid else None,
-            "ts": _parse_ts(e.get("timestamp")), "error": bool(e.get("isApiErrorMessage"))}
+            "ts": _parse_ts(e.get("timestamp")), "error": e.get("isApiErrorMessage") is True}
 
 
 def _scan(lines):
@@ -386,6 +402,25 @@ def _question_paragraph(text):
     return (prose or paras or [""])[-1]
 
 
+def _error_summary(text):
+    """One line for an API-error turn end: the error's own text, whitespace and control characters flattened.
+    Over SUMMARY_MAX it keeps the leading WHOLE sentences that fit (the head says what failed; the tail is advice and
+    a gateway address), else a hard cut with a trailing ellipsis. secret_shaped -> None: the field goes, never the
+    state. The push notification never carries this text -- its body is a constant -- it rides attention.summary only."""
+    line = " ".join(_CONTROL_RE.sub(" ", text).split())
+    if not line or secret_shaped(line):
+        return None
+    if len(line) <= SUMMARY_MAX:
+        return line
+    head = ""
+    for sentence in _SENTENCE_SPLIT.split(line):
+        joined = head + " " + sentence if head else sentence
+        if len(joined) > SUMMARY_MAX:
+            break
+        head = joined
+    return head or line[:SUMMARY_MAX - 1].rstrip() + "…"
+
+
 # Yes/No is attached ONLY to a question that really is yes/no: exactly ONE question, and a closed polar one.
 # Anything else carries no options, so the phone shows a free-text answer instead of two buttons that cannot
 # answer it. Every pattern is linear: this runs on assistant-authored text on each state request.
@@ -559,11 +594,14 @@ def _derive(path, ev, st, now, root, gate_evidence):
         return state, _anchor(call, st.st_mtime), kind, summary, None
     ts = nw["ts"] if nw["ts"] is not None else st.st_mtime
     text = nw.get("text") or ""
+    failed = nw["kind"] == "text_end" and nw["error"]
     if nw["kind"] == "text_end" and not nw["error"] and is_question(text):
         return ("needs_input", _anchor(nw, st.st_mtime), "question",
                 _summarise(_question_paragraph(text)), _make_options(text))
     if not (ev["turn_end"] or now - ts >= SETTLE_S) or _agents_live(root, now):
         return "working", _working_anchor(path, ev, st.st_mtime), None, None, None
+    if failed:
+        return "idle", _anchor(nw, st.st_mtime), "error", _error_summary(text), None
     return "idle", _anchor(nw, st.st_mtime), ("done" if _is_done(*gate_evidence) else "stopped"), None, None
 
 
