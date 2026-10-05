@@ -194,7 +194,7 @@ def _check(value, schema, root, path, errors):
             errors.append("%s: string is shorter than %d" % (where, schema["minLength"]))
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             errors.append("%s: string is longer than %d" % (where, schema["maxLength"]))
-        if "pattern" in schema and not re.search(schema["pattern"], value):
+        if "pattern" in schema and not re.search(_ecma(schema["pattern"]), value):
             errors.append("%s: %r does not match pattern %s" % (where, value, schema["pattern"]))
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if "minimum" in schema and value < schema["minimum"]:
@@ -319,6 +319,8 @@ def validate(doc, schema=None):
     the verdict file first (so verdict and prove validation never touch any other file), then
     its siblings in docs/schemas/."""
     doc_id = doc.get("schema") if isinstance(doc, dict) else None
+    if not isinstance(doc_id, str):
+        doc_id = None   # a list or object as the id must be rejected, not crash the lookup below
     explicit = schema is not None
     if not explicit:
         schema = load_schema()
