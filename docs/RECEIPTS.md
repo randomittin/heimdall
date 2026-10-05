@@ -78,8 +78,28 @@ server is narrow on purpose:
   HTML it returns.
 
 `runhmd.dev` has no DNS yet (operator-only), so receipt URLs do not resolve until the operator
-points it at a host serving that tree. NOT built: `POST /api/receipts`, `GET /r/<id>/card.png`,
-`POST /r/<id>/f/<fid>/rate`, the "request cloud access" CTA. They need storage, auth and a deploy.
+points it at a host serving that tree, or at the hosted service below.
+
+## The hosted service (`receipts-worker/`)
+
+Built, not deployed. A Cloudflare Worker with two Durable Object classes does what `render` and
+`serve` cannot, with the same verify rules (`receipts-worker/src/receipt.ts` ports `verify_bytes`;
+`receipts-worker/contract/vectors.json` pins both languages to the same canonical bytes and the same
+outcome for 133 + 65 vectors, replayed by `test/receipts-worker-contract.test.sh` here and by
+`npm test` there):
+
+- `POST /api/receipts` (bearer token): only a receipt that verifies against the pinned public key(s)
+  is stored, first write wins per id, 1 MiB cap, 30 writes/min/IP. Unsigned, mis-signed and
+  non-canonical files are refused (4xx with the `hmd receipt verify` error kind).
+- `GET /r/<id>`, `/r/<id>.json` (the exact signed bytes), `/r/<id>/card.png` (1200x630): public
+  receipts only; a private one is a 404 identical to an unknown id unless the request carries a token.
+  Re-verified on every read.
+- `POST /r/<id>/f/<finding_id>/rate` (bearer token) `{"label":"real"|"false"}`: stored beside the
+  receipt, not in it. The page shows the "Request cloud access for this team" link only while some
+  finding is rated real; what that link reaches is RP12's.
+
+Operator-only, still open: the Cloudflare deploy, the `runhmd.dev` zone, API tokens, and custody of
+the signing key whose public half the service pins. Steps: `receipts-worker/README.md`.
 
 ## `hmd attack --receipt`
 
