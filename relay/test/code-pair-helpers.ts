@@ -58,6 +58,7 @@ interface Route {
   responses: Record<string, Row>;
 }
 interface Contract {
+  constants: { max_body_bytes: number };
   bindings: Record<string, Binding>;
   identity_github: Route;
   session_code: Route;

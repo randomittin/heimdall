@@ -751,7 +751,9 @@ describe("POST /pair/code (spec 6.3)", () => {
       const good = popSig(identity.phone, window.code, ts);
       const forOtherCode = popSig(identity.phone, randomCode(), ts);
       const forOtherTs = popSig(identity.phone, window.code, ts - 1);
-      const flipped = base64UrlEncode(Uint8Array.from(atob(good.replace(/-/g, "+").replace(/_/g, "/") + "=="), (c) => c.charCodeAt(0)).map((b, i) => (i === 0 ? b ^ 1 : b)));
+      const damaged = base64UrlDecode(good);
+      damaged[0] = (damaged[0] ?? 0) ^ 1;
+      const flipped = base64UrlEncode(damaged);
       for (const sig of [forOtherCode, forOtherTs, flipped, good.slice(0, -1), `${good}==`, "", 7, undefined]) {
         await expectRow(await pairCode(identity, window.code, { ts, sig }), "pair_code.bad_signature");
       }
@@ -1020,10 +1022,19 @@ describe("rows all four routes share: unreadable and oversized bodies", () => {
       }
     );
 
-    it(`${name} answers 413 for a body over ${contract.shared ? 4096 : 0} bytes, unread`, async () => {
-      const big = JSON.stringify({ gh_token: "gho_x", padding: "x".repeat(5000) });
+    it(`${name} answers 413 for a body over the contract's ${contract.constants.max_body_bytes} bytes, unread`, async () => {
+      const big = JSON.stringify({ gh_token: "gho_x", padding: "x".repeat(contract.constants.max_body_bytes) });
       await expectRow(await send(big), "shared.body_too_large");
       expect(fake.calls).toHaveLength(0);
+    });
+
+    it(`${name} still reads a body of exactly the contract's ${contract.constants.max_body_bytes} bytes`, async () => {
+      const filler = contract.constants.max_body_bytes - JSON.stringify({ gh_token: "gho_x", padding: "" }).length;
+      const exact = JSON.stringify({ gh_token: "gho_x", padding: "x".repeat(filler) });
+      expect(new TextEncoder().encode(exact).byteLength).toBe(contract.constants.max_body_bytes);
+      const res = await send(exact);
+      expect(res.status).not.toBe(413);
+      expect(res.status).not.toBe(503);
     });
   }
 });
@@ -1118,7 +1129,7 @@ describe("frames (spec 6.5)", () => {
       await postHmdFrame(window.init, first);
       expect(await phone.next()).toEqual(first);
 
-      const other = (await import("./code-pair-helpers")).newCommitment();
+      const other = newCommitment();
       await expectRow(await postHmdFrame(window.init, keyRevealEnvelope(window.init, other)), "frames.key_reveal.duplicate");
       expect(await phone.next(400)).toBeNull();
       await hmd.close();
@@ -1225,7 +1236,7 @@ describe("INV-39: the relay holds no GitHub token, assertion or signature, and l
 
       const init = await pairInit();
       const laptopToken = fake.laptopToken(user);
-      const commitment = (await import("./code-pair-helpers")).newCommitment();
+      const commitment = newCommitment();
       const code = randomCode();
       await registerWindow(init, { code, gh_token: laptopToken, hmd_commit: commitment.commit });
 
@@ -1311,16 +1322,15 @@ describe("INV-40, at the session: the checks the index in front of it cannot sta
     expect((await directRelease(init.session_id, { gh_id: 1, code: randomCode() })).status).toBe(404);
   });
 
-  it("refuses a release that carries no usable fields", async () => {
-    const { window } = await fresh();
-    const res = await sessionStubFetch(window.init.session_id, "not json");
-    expect(res.status).toBe(404);
+  it("refuses a release that carries no usable fields, without spending the window", async () => {
+    const { user, window } = await fresh();
+    for (const body of ["not json", "[]", "null", JSON.stringify({ gh_id: "1", code: window.code }), JSON.stringify({ code: window.code })]) {
+      const res = await sessionStub(window.init.session_id).fetch("http://do-internal/code-release", { method: "POST", body });
+      expect(res.status, body).toBe(404);
+    }
+    expect((await directRelease(window.init.session_id, { gh_id: user.id, code: window.code })).status).toBe(200);
   });
 });
-
-function sessionStubFetch(sessionId: string, body: string): Promise<Response> {
-  return typedEnv.SESSION.get(typedEnv.SESSION.idFromName(sessionId)).fetch("http://do-internal/code-release", { method: "POST", body });
-}
 
 // ============================================================================================
 // INV-41: retention
