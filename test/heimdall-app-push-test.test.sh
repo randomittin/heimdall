@@ -494,7 +494,11 @@ idle = S(att("idle", A(1)))
 asking = S(att("needs_input", A(2), "question", "Delete the old branch?", YESNO))
 monitor.observe(idle)
 open(flag("ready", name), "w").close()
-while not os.path.exists(flag("stop", name)):
+# runs until told to stop -- or until nobody is left to tell it: the suite's temp dir is gone, its parent died, or ten
+# minutes passed -- so a part that crashed can never leave this process behind
+give_up = time.monotonic() + 600
+while (not os.path.exists(flag("stop", name)) and os.path.isdir(ctl) and os.getppid() != 1
+       and time.monotonic() < give_up):
     if os.path.exists(flag("question", name)):
         os.unlink(flag("question", name))
         monitor.observe(asking)
@@ -860,8 +864,11 @@ with open(out_path, "w") as out_f, open(err_path, "w") as err_f:
 
 
 def stop_ui():
+    """Stop the hmd ui this part started (its own process group, nothing else). Safe to call twice."""
+    if ui.poll() is not None:
+        return
     with contextlib.suppress(OSError):
-        os.killpg(ui.pid, signal.SIGTERM)             # the process group this part started, nothing else
+        os.killpg(ui.pid, signal.SIGTERM)
     try:
         ui.wait(timeout=20)
     except subprocess.TimeoutExpired:
@@ -870,33 +877,34 @@ def stop_ui():
         ui.wait()
 
 
-url = None
-if wait_for(lambda: re.search(r"^http://127\.0\.0\.1:\d+/\?token=\S+$", read(out_path), re.M) is not None, 60):
-    url = re.search(r"^(http://127\.0\.0\.1:\d+)/\?token=(\S+)$", read(out_path), re.M).groups()
-T.check(url is not None, "C1. the real hmd ui is up", read(err_path)[-300:])
-if url is not None:
-    # wait for its first collection pass: a GET /api/state returns only once there is a state
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    opener.open("%s/api/state?token=%s" % url, timeout=90).read()
-    rc, out, err = cli("--wait", "40")
-    T.eq(rc, 0, "C2. the real hmd ui's poller notices the request and serves it: exit 0")
-    T.eq([(m["to"], m["data"]["kind"]) for m in fake.messages()], [(TOK, "test")],
-         "C3. exactly one message reached Expo: the registered token, kind test")
-    ui_err = read(err_path)
-    pushed = [json.loads(m.group(1)) for m in re.finditer(r"^hmd-ui: push (\{.*\})$", ui_err, re.M)]
-    T.eq([(e["kind"], e["ok"], e["suppressed"]) for e in pushed], [("test", True, None)],
-         "C4. hmd ui logged one test push line, ok")
-    T.check(TOK not in out + err + ui_err + read(out_path), "C5. no token in the CLI's output or in hmd ui's output")
-    T.check(os.path.exists(os.path.join(root, ".heimdall", "app", "push-sender.lock")),
-            "C6. hmd ui took the sender lock to serve it")
-    rc2, out2, err2 = cli("--wait", "40")
-    T.eq((rc2, len(fake.messages())), (0, 2), "C7. the same process, now the standing lock owner, serves the next request too")
+try:
+    url = None
+    if wait_for(lambda: re.search(r"^http://127\.0\.0\.1:\d+/\?token=\S+$", read(out_path), re.M) is not None, 60):
+        url = re.search(r"^(http://127\.0\.0\.1:\d+)/\?token=(\S+)$", read(out_path), re.M).groups()
+    T.check(url is not None, "C1. the real hmd ui is up", read(err_path)[-300:])
+    if url is not None:
+        # wait for its first collection pass: a GET /api/state returns only once there is a state
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener.open("%s/api/state?token=%s" % url, timeout=90).read()
+        rc, out, err = cli("--wait", "40")
+        T.eq(rc, 0, "C2. the real hmd ui's poller notices the request and serves it: exit 0")
+        T.eq([(m["to"], m["data"]["kind"]) for m in fake.messages()], [(TOK, "test")],
+             "C3. exactly one message reached Expo: the registered token, kind test")
+        ui_err = read(err_path)
+        pushed = [json.loads(m.group(1)) for m in re.finditer(r"^hmd-ui: push (\{.*\})$", ui_err, re.M)]
+        T.eq([(e["kind"], e["ok"], e["suppressed"]) for e in pushed], [("test", True, None)],
+             "C4. hmd ui logged one test push line, ok")
+        T.check(TOK not in out + err + ui_err + read(out_path), "C5. no token in the CLI's output or in hmd ui's output")
+        T.check(os.path.exists(os.path.join(root, ".heimdall", "app", "push-sender.lock")),
+                "C6. hmd ui took the sender lock to serve it")
+        rc2, out2, err2 = cli("--wait", "40")
+        T.eq((rc2, len(fake.messages())), (0, 2), "C7. the same process, now the standing lock owner, serves the next request too")
+        stop_ui()
+        rc3, out3, err3 = cli("--wait", "2")
+        T.eq((rc3, len(fake.messages())), (4, 2), "C8. with hmd ui gone nothing answers: exit 4, nothing more sent")
+finally:
     stop_ui()
-    rc3, out3, err3 = cli("--wait", "2")
-    T.eq((rc3, len(fake.messages())), (4, 2), "C8. with hmd ui gone nothing answers: exit 4, nothing more sent")
-else:
-    stop_ui()
-fake.close()
+    fake.close()
 print("done")
 PYEOF
 run_part C "$TMPROOT/part_c.py"
