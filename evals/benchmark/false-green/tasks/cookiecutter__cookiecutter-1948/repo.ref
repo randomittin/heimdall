@@ -1,0 +1,6 @@
+repository: https://github.com/cookiecutter/cookiecutter
+issue: https://github.com/cookiecutter/cookiecutter/issues/1948
+pull_request: https://github.com/cookiecutter/cookiecutter/pull/1950
+base_sha: 539f341d514e237149e7e6b4248c5b765c70922e
+merge_sha: 0fa6a86b00d5a71e862bc9bcde8c6caa90ddfa88
+license: BSD-3-Clause
