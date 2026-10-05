@@ -337,7 +337,13 @@ samples = {"could not fetch the issue text: gh: HTTP 404": "issue text unavailab
            "the upstream tests already pass at the base commit (1 passed)": "tests already pass at the base commit",
            "the upstream tests still fail at the merge commit (1 failed)": "tests still fail at the merge commit",
            "the upstream tests could not run at the base commit: pytest exit 5": "tests could not run at the base commit",
-           "a committed file holds a secret-shaped literal (gitleaks: private-key)": "secret-shaped literal in a committed file", "something new": "other"}
+           "a committed file holds a secret-shaped literal (gitleaks: private-key)": "secret-shaped literal in a committed file", "something new": "other",
+           "environment: step 3 (uv pip install -e .): the workspace grew past 600 MB": "workspace over the 600 MB bound",
+           "the upstream tests could not run at the base commit: the workspace grew past 600 MB": "workspace over the 600 MB bound",
+           "the upstream tests could not run at the base commit: size: ": "workspace over the 600 MB bound",
+           "environment: step 2 (uv pip install): timed out after 300s": "step timed out",
+           "the upstream tests could not run at the merge commit: timed out after 300s": "step timed out",
+           "the upstream tests could not run at the base commit: timeout: ": "step timed out"}
 t("every rejection reason has a stable class, and an unknown one is 'other'", all(fg_verify.reason_class(r) == c for r, c in samples.items()), [(r, fg_verify.reason_class(r)) for r, c in samples.items() if fg_verify.reason_class(r) != c])
 
 # ── [S] a secret-shaped literal in a committed file rejects the candidate ───
@@ -363,6 +369,16 @@ res = verify(candidate("good", good[1], tests=("../outside/test_x.py",), number=
 t("a candidate test path that climbs out of the tree: rejected before anything is cloned", res["verdict"] == "rejected" and res["reason"].startswith("unsafe test path") and res["evidence"] == {}, res)
 res = verify(candidate("good", good[1], tests=("tests/conftest.py", "tests/data.json"), number=32), tasks)
 t("a candidate with no test module among its changed test files: rejected", res["verdict"] == "rejected" and "no test module" in res["reason"], res)
+real_guard = fg_repo.run_guarded
+try:
+    fg_repo.run_guarded = lambda *a, **k: fg_repo.Result(-9, "", "size")
+    killed_size = fg_verify._ground_truth(".", ".", {}, ".")
+    fg_repo.run_guarded = lambda *a, **k: fg_repo.Result(-9, "", "timeout")
+    killed_time = fg_verify._ground_truth(".", ".", {}, ".")
+finally:
+    fg_repo.run_guarded = real_guard
+t("a ground-truth run killed for size says the workspace grew past the bound, and has no exit code", killed_size["rc"] is None and "grew past 600 MB" in killed_size["tail"], killed_size)
+t("a ground-truth run killed for time says how long it was given, and has no exit code", killed_time["rc"] is None and "timed out after %ds" % fg_verify.GROUND_TRUTH_TIMEOUT_S in killed_time["tail"], killed_time)
 attempts = []
 def flaky():
     attempts.append(1)

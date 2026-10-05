@@ -67,6 +67,10 @@ REASON_CLASSES = (
     ("exceed 400 KB", "upstream test files over 400 KB"),
     ("no test module", "no test module among the changed files"),
     ("no installable python project", "no installable python project"),
+    ("grew past 600 MB", "workspace over the 600 MB bound"),
+    ("size: ", "workspace over the 600 MB bound"),            # the first rows of the walk were written before the message said it in words
+    ("timed out after", "step timed out"),
+    ("timeout: ", "step timed out"),
     ("environment:", "environment build failed"),
     ("already pass at the base commit", "tests already pass at the base commit"),
     ("could not run at the base commit", "tests could not run at the base commit"),
@@ -193,7 +197,8 @@ def _ground_truth(stage, ws, env, root):
     """Run the task's own ground_truth.sh over the workspace: {"rc": 0 pass | 1 fail | other could not run, "tail": pytest's last line}."""
     done = fg_repo.run_guarded(["bash", os.path.join(stage, "ground_truth.sh"), ws], root, env, GROUND_TRUTH_TIMEOUT_S, root)
     if done.reason:
-        return {"rc": None, "tail": "%s: %s" % (done.reason, fg_repo.tail(done.out))[:300]}
+        why = "the workspace grew past %d MB" % (fg_repo.MAX_BYTES // 2**20) if done.reason == "size" else "timed out after %ds" % GROUND_TRUTH_TIMEOUT_S
+        return {"rc": None, "tail": (why + (" | " + fg_repo.tail(done.out) if done.out.strip() else ""))[:300]}
     last = done.out.strip().splitlines()[-1] if done.out.strip() else ""
     try:
         detail = json.loads(last)
