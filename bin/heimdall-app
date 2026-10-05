@@ -75,6 +75,44 @@
 #                              signed in now (masked), its config directory and
 #                              the last result. Delegates to
 #                              bin/lib/companion_cc_login.py.
+#   hmd app push-test [--repo DIR] [--wait SECONDS]
+#                              Check that a phone registered for push receives
+#                              a notification: one `test` notification per
+#                              registered device, put on the phone by the SAME
+#                              push sender (and the same text rules) as every
+#                              real notification, then one line per device --
+#                              an 8-hex fingerprint of its Expo token (never
+#                              the token), its platform, and accepted /
+#                              DeviceNotRegistered (the registration is then
+#                              removed) / error: <code> / not sent
+#                              (rate-limited). accepted means Expo queued it for
+#                              APNs/FCM; the phone shows it within seconds.
+#                              This command never sends: the sender is the one
+#                              process per repo that holds
+#                              .heimdall/app/push-sender.lock (the `hmd ui` or
+#                              relay client `hmd app connect` started), and a
+#                              second process taking that lock would make it
+#                              drop what it detects meanwhile. So this posts a
+#                              request (.heimdall/app/push-test) and that
+#                              process answers it
+#                              (.heimdall/app/push-test.result); no sender
+#                              running = no answer. The test skips the
+#                              kind filter, foreground suppression and the 5 s
+#                              coalescing window (so the 10 s spacing too); it
+#                              still obeys the 20-per-hour cap, the provider
+#                              back-off, the lock, HMD_PUSH=0 and the
+#                              loopback-only HMD_PUSH_EXPO_URL rule.
+#                              --wait is how long the answer may take (1-120
+#                              seconds, default 60); a sender that has not
+#                              picked the request up within 10 seconds is not
+#                              running. Delegates to bin/lib/companion_push_cli.py.
+#                              Exit codes (push-test): 0 at least one device
+#                              accepted, 1 a local fault (the request could not
+#                              be written), 2 usage, 3 no device registered for
+#                              push, 4 no sender picked the request up (or it did
+#                              not finish in time), 5 push is switched off
+#                              (HMD_PUSH=0), 6 every device failed or was held
+#                              back.
 #   hmd app -h|--help          This help.
 #
 # Exit codes (connect): 64 bad --https-port, 4 tailscale not installed
@@ -1117,6 +1155,41 @@ cmd_remote_login() {
   "$PY3" "$LIB_DIR/companion_cc_login.py" "$@"
 }
 
+# cmd_push_test: `hmd app push-test` -- see the usage block above. Resolves the repo like status/disconnect do, then
+# hands everything else to bin/lib/companion_push_cli.py, whose exit code is this command's (0 sent, 3 no device,
+# 4 no sender answered, 5 push off, 6 every device failed). The flags are checked here, the --wait range there.
+cmd_push_test() {
+  local REPO="" WAIT="" WAIT_SET=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)
+        REPO="${2:-}"
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      --wait)
+        WAIT="${2:-}"
+        WAIT_SET=true
+        if [ $# -ge 2 ]; then shift 2; else shift 1; fi
+        ;;
+      *) echo "hmd app push-test: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+  REPO="$(resolve_repo_value "$REPO")"
+  if [ -z "$PY3" ]; then
+    echo "hmd app push-test: python3 not found (set HMD_PYTHON=/path/to/python3)" >&2
+    return 2
+  fi
+  if [ ! -d "$REPO" ]; then
+    echo "hmd app push-test: not a directory: $REPO" >&2
+    return 2
+  fi
+  if [ "$WAIT_SET" = true ]; then
+    "$PY3" "$LIB_DIR/companion_push_cli.py" push-test --repo "$REPO" --wait "$WAIT"
+  else
+    "$PY3" "$LIB_DIR/companion_push_cli.py" push-test --repo "$REPO"
+  fi
+}
+
 cmd_disconnect() {
   local REPO=""
   while [ $# -gt 0 ]; do
@@ -1503,6 +1576,7 @@ case "$CMD" in
   disconnect) cmd_disconnect "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;
   remote-login) cmd_remote_login "$@"; exit $? ;;
+  push-test) cmd_push_test "$@"; exit $? ;;
   *)
     echo "hmd app: unknown subcommand: $CMD" >&2
     usage >&2
