@@ -89,13 +89,14 @@
 #                              APNs/FCM; the phone shows it within seconds.
 #                              This command never sends: the sender is the one
 #                              process per repo that holds
-#                              .heimdall/app/push-sender.lock (the `hmd ui` that
-#                              `hmd app connect` started), and a second process
-#                              taking that lock would make it drop what it
-#                              detects meanwhile. So this posts a request
-#                              (.heimdall/app/push-test) and that process
-#                              answers it (.heimdall/app/push-test.result); no
-#                              sender running = no answer. The test skips the
+#                              .heimdall/app/push-sender.lock (the `hmd ui` or
+#                              relay client `hmd app connect` started), and a
+#                              second process taking that lock would make it
+#                              drop what it detects meanwhile. So this posts a
+#                              request (.heimdall/app/push-test) and that
+#                              process answers it
+#                              (.heimdall/app/push-test.result); no sender
+#                              running = no answer. The test skips the
 #                              kind filter, foreground suppression and the 5 s
 #                              coalescing window (so the 10 s spacing too); it
 #                              still obeys the 20-per-hour cap, the provider
@@ -106,9 +107,10 @@
 #                              picked the request up within 10 seconds is not
 #                              running. Delegates to bin/lib/companion_push_cli.py.
 #                              Exit codes (push-test): 0 at least one device
-#                              accepted, 2 usage, 3 no device registered for push,
-#                              4 no sender picked the request up (or it did not
-#                              finish in time), 5 push is switched off
+#                              accepted, 1 a local fault (the request could not
+#                              be written), 2 usage, 3 no device registered for
+#                              push, 4 no sender picked the request up (or it did
+#                              not finish in time), 5 push is switched off
 #                              (HMD_PUSH=0), 6 every device failed or was held
 #                              back.
 #   hmd app -h|--help          This help.

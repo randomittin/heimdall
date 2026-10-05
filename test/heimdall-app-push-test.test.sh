@@ -329,6 +329,17 @@ rig.m.step(1002.0)
 T.eq(len(rig.fake.messages()), 1, "A7c. the same request noticed again is not served twice")
 rig.close()
 
+# a request file that is touched again (the same id) before it was served is still served ONCE
+rig = Rig(devices=TWO[:1])
+rid = CP.request_test(rig.root)
+rig.m.observe(IDLE, 1000.0)                                  # noticed and queued
+later = time.time() + 5
+os.utime(rig.path("push-test"), (later, later))              # the file moves, the request does not
+rig.m.observe(IDLE, 1001.0)
+rig.m.step(1001.0)
+T.eq(sent_kinds(rig), ["test"], "A7c2. a request file touched again (same id) before it is served is served once")
+rig.close()
+
 # a request that was answered is not served again, not even by a monitor that never saw it (a restarted sender)
 rig = Rig(devices=TWO[:1])
 rid = ask(rig, 1000.0)
@@ -1023,6 +1034,9 @@ rc, out = cli_main(root, "--wait", "5")
 T.check(rc == 3 and "no device registered" in out, "D5b. the sender found no device left: exit 3", (rc, out))
 rc, out = cli_main(repo(TOKENS[:1]), env={"HMD_PUSH": "0"})
 T.check(rc == 5 and "HMD_PUSH=0" in out, "D5c. HMD_PUSH=0: exit 5", (rc, out))
+rc, out = cli_main(repo())
+T.check(rc == 3 and "no device registered" in out and not os.path.exists(os.path.join(tmp, "repo%d" % _n[0], ".heimdall", "app", "push-test")),
+        "D5c2. nothing registered: exit 3, and no request is posted", (rc, out))
 T.check(CLI.main([], out=io.StringIO()) == 2 and CLI.main(["bogus"], out=io.StringIO()) == 2,
         "D5d. no subcommand, or another one: exit 2")
 print("done")

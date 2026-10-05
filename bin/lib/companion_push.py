@@ -1080,7 +1080,8 @@ class PushMonitor:
                 continue
             dev["sent_other"].append(now)
             out.append((fp, event, self._message(dev, event, now)))
-        for fp, ok, detail in self._send(out, now) if out else []:
+        outcomes = self._send(out, now) if out else []
+        for fp, ok, detail in outcomes:
             answers[fp] = {"device": fp, "ok": ok, "detail": detail, "suppressed": None}
         self._test_result(request_id, "done", [answers[fp] for fp in devices])
 
