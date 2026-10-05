@@ -1879,6 +1879,7 @@ case "$CMD" in
     exit 0
     ;;
   connect) cmd_connect "$@"; exit $? ;;
+  identity) cmd_identity "$@"; exit $? ;;
   status) cmd_status "$@"; exit $? ;;
   disconnect) cmd_disconnect "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;

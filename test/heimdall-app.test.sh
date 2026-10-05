@@ -290,7 +290,7 @@ OUT="$("$HMD" app 2>&1)"; RC=$?
 
 # ── 6. bad --https-port (checked before touching tailscale at all) ──────
 D="$(make_repo)"
-OUT="$(FAKE_TS_MODE=online-with-DNSName "$APP" connect --repo "$D" --https-port 9999 2>&1)"
+OUT="$(FAKE_TS_MODE=online-with-DNSName "$APP" connect --tailscale --repo "$D" --https-port 9999 2>&1)"
 RC=$?
 [ "$RC" -eq 64 ] && ok "connect --https-port 9999 exits 64" || bad "exit $RC (want 64): $OUT"
 printf '%s' "$OUT" | grep -qi "port" && ok "bad-https-port message mentions 'port'" || bad "message: $OUT"
@@ -299,7 +299,7 @@ rm -rf "$D"
 
 # ── 7-8. install prompt (D1: never silent) ──────────────────────────────
 D="$(make_repo)"
-OUT="$(FAKE_TS_MODE=not-installed "$APP" connect --repo "$D" --no-install 2>&1)"
+OUT="$(FAKE_TS_MODE=not-installed "$APP" connect --tailscale --repo "$D" --no-install 2>&1)"
 RC=$?
 [ "$RC" -eq 4 ] && ok "connect --no-install (not installed) exits 4" || bad "exit $RC (want 4): $OUT"
 printf '%s' "$OUT" | grep -qi "not installed" && ok "--no-install failure mentions 'not installed'" || bad "$OUT"
@@ -308,7 +308,7 @@ printf '%s' "$OUT" | grep -qi "hmd would run" && ok "--no-install failure names 
 rm -rf "$D"
 
 D="$(make_repo)"
-OUT="$(FAKE_TS_MODE=not-installed "$APP" connect --repo "$D" </dev/null 2>&1)"
+OUT="$(FAKE_TS_MODE=not-installed "$APP" connect --tailscale --repo "$D" </dev/null 2>&1)"
 RC=$?
 [ "$RC" -eq 4 ] && ok "connect w/o --no-install + closed stdin declines cleanly, exit 4 (no hang)" || bad "exit $RC: $OUT"
 printf '%s' "$OUT" | grep -qi "hmd would run" && ok "closed-stdin decline still shows the manual install command (D1)" || bad "$OUT"
@@ -316,7 +316,7 @@ rm -rf "$D"
 
 # ── 9-10. not online ─────────────────────────────────────────────────────
 D="$(make_repo)"
-OUT="$(FAKE_TS_MODE=daemon-down "$APP" connect --repo "$D" 2>&1)"
+OUT="$(FAKE_TS_MODE=daemon-down "$APP" connect --tailscale --repo "$D" 2>&1)"
 RC=$?
 [ "$RC" -eq 5 ] && ok "connect w/ tailscaled down exits 5" || bad "exit $RC (want 5): $OUT"
 printf '%s' "$OUT" | grep -qi "tailscale up" && ok "daemon-down prints the login hint" || bad "$OUT"
@@ -324,7 +324,7 @@ printf '%s' "$OUT" | grep -qi "tailscale up" && ok "daemon-down prints the login
 rm -rf "$D"
 
 D="$(make_repo)"
-OUT="$(FAKE_TS_MODE=offline "$APP" connect --repo "$D" 2>&1)"
+OUT="$(FAKE_TS_MODE=offline "$APP" connect --tailscale --repo "$D" 2>&1)"
 RC=$?
 [ "$RC" -eq 5 ] && ok "connect w/ tailscale logged out exits 5" || bad "exit $RC: $OUT"
 printf '%s' "$OUT" | grep -qi "tailscale up" && ok "logged-out login hint present" || bad "$OUT"
@@ -334,7 +334,7 @@ rm -rf "$D"
 # ── 11-25. modern funnel, online: the full success path ─────────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-online.out"
-FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
+FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && ok "connect --bg (modern funnel, online) exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
 
@@ -419,7 +419,7 @@ rm -rf "$D"
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-policy.out"
 ERR_FILE="$TMPROOT/connect-policy.err"
-FAKE_TS_MODE=policy-hint-on-funnel-start "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
+FAKE_TS_MODE=policy-hint-on-funnel-start "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
 [ "$RC" -eq 3 ] && ok "connect under a tailnet policy block exits 3" || bad "exit $RC"
 if grep -qF 'funnel: HTTPS is not enabled for your tailnet. To enable HTTPS certificates and Funnel, visit the admin console: https://login.tailscale.com/admin/dns' "$ERR_FILE"; then
@@ -444,7 +444,7 @@ rm -rf "$D"
 # ── 31-35. status redacts the token ──────────────────────────────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-for-status.out"
-FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
+FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
 if [ "$RC" -ne 0 ]; then
   bad "setup: connect --bg for the status test failed (exit $RC): $(cat "$OUT_FILE")"
@@ -468,7 +468,7 @@ rm -rf "$D"
 # ── 36-40. disconnect kills the ui and is idempotent ─────────────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-for-disconnect.out"
-FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
+FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
 if [ "$RC" -ne 0 ]; then
   bad "setup: connect --bg for the disconnect test failed: $(cat "$OUT_FILE")"
@@ -611,7 +611,7 @@ D="$(make_repo)"
 LOG="$TMPROOT/ts-legacy.log"
 : > "$LOG"
 OUT_FILE="$TMPROOT/connect-legacy.out"
-FAKE_TS_MODE=legacy-funnel FAKE_TS_LOG="$LOG" "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
+FAKE_TS_MODE=legacy-funnel FAKE_TS_LOG="$LOG" "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && ok "connect --bg (legacy funnel CLI) exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
 if grep -Eq 'https://my-machine\.tail1a2b3\.ts\.net/\?token=[A-Za-z0-9_-]+' "$OUT_FILE"; then
@@ -628,7 +628,7 @@ rm -rf "$D"
 # ── 68-72. foreground wait + signal-based teardown ───────────────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-fg.out"
-( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+( FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
 FG_PID=$!
 PIDS+=("$FG_PID")
 
@@ -723,7 +723,7 @@ if [ "$A4B_PORT_BUSY_EXTERNALLY" -eq 1 ]; then
 else
   D="$(make_repo)"
   OUT_FILE="$TMPROOT/connect-a4b-default.out"
-  FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg >"$OUT_FILE" 2>&1
+  FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --bg >"$OUT_FILE" 2>&1
   RC=$?
   if [ "$RC" -eq 0 ]; then
     SF="$D/.heimdall/app/connect.json"
@@ -752,7 +752,7 @@ PYEOF
     HOLD_WAITED=$((HOLD_WAITED + 1))
   done
   exec 3<&- 2>/dev/null || true
-  OUT="$(FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --bg 2>&1)"; RC=$?
+  OUT="$(FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --bg 2>&1)"; RC=$?
   [ "$RC" -eq 6 ] && ok "A4b. connect w/ the fixed default port (8710) busy exits 6" || bad "exit $RC (want 6): $OUT"
   kill "$HOLD_PID" 2>/dev/null
   wait "$HOLD_PID" 2>/dev/null
@@ -774,7 +774,7 @@ rm -rf "$D"
 D0="$(make_repo)"
 LOG0="$TMPROOT/ts-a4d-baseline.log"
 : > "$LOG0"
-FAKE_TS_MODE=modern-funnel FAKE_TS_LOG="$LOG0" "$APP" connect --repo "$D0" --bg --port 0 >/dev/null 2>&1
+FAKE_TS_MODE=modern-funnel FAKE_TS_LOG="$LOG0" "$APP" connect --tailscale --repo "$D0" --bg --port 0 >/dev/null 2>&1
 BASELINE_COUNT="$(grep -c '^funnel' "$LOG0")"
 FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D0" >/dev/null 2>&1
 rm -rf "$D0"
@@ -783,7 +783,7 @@ D="$(make_repo)"
 LOG="$TMPROOT/ts-a4d.log"
 : > "$LOG"
 OUT_FILE="$TMPROOT/connect-a4d.out"
-FAKE_TS_MODE=funnel-still-up FAKE_TS_LOG="$LOG" "$APP" connect --repo "$D" --bg --port 0 >"$OUT_FILE" 2>&1
+FAKE_TS_MODE=funnel-still-up FAKE_TS_LOG="$LOG" "$APP" connect --tailscale --repo "$D" --bg --port 0 >"$OUT_FILE" 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && ok "A4d. connect w/ a pre-existing funnel still exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
 grep -qi 'tearing it down' "$OUT_FILE" && ok "A4d. connect announces tearing down the pre-existing funnel" || bad "$(cat "$OUT_FILE")"
@@ -836,7 +836,7 @@ rm -f "$HUP_PROBE_READY" "$HUP_PROBE_FIRED"
 
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-hup.out"
-( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+( FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
 HUP_FG_PID=$!
 PIDS+=("$HUP_FG_PID")
 
@@ -934,7 +934,7 @@ chmod +x "$A5_PY_WRAP"
 if [ -z "$A5_REAL_PY" ]; then
   bad "A5 setup: no python3 resolvable -- cannot run hmd_qr.py at all"
 else
-  ( HMD_PYTHON="$A5_PY_WRAP" FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+  ( HMD_PYTHON="$A5_PY_WRAP" FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
   A5_FG_PID=$!
   PIDS+=("$A5_FG_PID")
 
@@ -983,7 +983,7 @@ rm -rf "$D"
 # ── A6. ui log temp file is 0600 (mktemp + umask 077) ─────────────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-a6-mode.out"
-( FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+( FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
 A6_FG_PID=$!
 PIDS+=("$A6_FG_PID")
 
@@ -1036,7 +1036,7 @@ chmod +x "$FAKE_UI_DIES"
 D="$(make_repo)"
 ERR_FILE="$TMPROOT/connect-a6-race.err"
 OUT_FILE="$TMPROOT/connect-a6-race.out"
-HEIMDALL_UI_BIN="$FAKE_UI_DIES" FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>"$ERR_FILE"
+HEIMDALL_UI_BIN="$FAKE_UI_DIES" FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
 [ "$RC" -eq 6 ] && ok "A6. connect w/ a ui that dies before printing a URL exits 6" || bad "exit $RC (want 6): $(cat "$ERR_FILE")"
 if grep -q 'SECRETVALUE12345' "$ERR_FILE"; then
@@ -1049,14 +1049,14 @@ rm -rf "$D"
 
 # ── A12. DNSName is validated before use as --allow-host ─────────────────
 D="$(make_repo)"
-OUT="$(FAKE_TS_DNSNAME='evil.example.com' FAKE_TS_MODE=online-with-DNSName "$APP" connect --repo "$D" --bg --port 0 2>&1)"; RC=$?
+OUT="$(FAKE_TS_DNSNAME='evil.example.com' FAKE_TS_MODE=online-with-DNSName "$APP" connect --tailscale --repo "$D" --bg --port 0 2>&1)"; RC=$?
 [ "$RC" -eq 5 ] && ok "A12. connect w/ a non-ts.net DNSName exits 5" || bad "exit $RC (want 5): $OUT"
 printf '%s' "$OUT" | grep -qF 'evil.example.com' && ok "A12. bad-DNSName error quotes the offending value" || bad "$OUT"
 [ ! -f "$D/.heimdall/app/connect.json" ] && ok "A12. no state file written on bad-DNSName failure" || bad "state file leaked"
 rm -rf "$D"
 
 D="$(make_repo)"
-OUT="$(FAKE_TS_DNSNAME='bad host.ts.net' FAKE_TS_MODE=online-with-DNSName "$APP" connect --repo "$D" --bg --port 0 2>&1)"; RC=$?
+OUT="$(FAKE_TS_DNSNAME='bad host.ts.net' FAKE_TS_MODE=online-with-DNSName "$APP" connect --tailscale --repo "$D" --bg --port 0 2>&1)"; RC=$?
 [ "$RC" -eq 5 ] && ok "A12. connect w/ a DNSName containing a space exits 5" || bad "exit $RC (want 5): $OUT"
 rm -rf "$D"
 
@@ -1157,7 +1157,7 @@ rm -rf "$D"
 # signal's own code) when its own stop can't be verified down ────────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-n1g.out"
-( FAKE_TS_MODE=funnel-still-up "$APP" connect --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
+( FAKE_TS_MODE=funnel-still-up "$APP" connect --tailscale --repo "$D" --port 0 >"$OUT_FILE" 2>&1 ) &
 N1G_PID=$!
 PIDS+=("$N1G_PID")
 
@@ -1261,7 +1261,7 @@ rm -rf "$D"
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-macsys.out"
 ERR_FILE="$TMPROOT/connect-macsys.err"
-HMD_TAILSCALE_APP_PLIST="$MACSYS_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
+HMD_TAILSCALE_APP_PLIST="$MACSYS_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
 [ "$RC" -eq 9 ] && ok "connect on a macsys build exits 9" || bad "exit $RC (want 9): $(cat "$ERR_FILE")"
 grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)' "$ERR_FILE" && ok "connect (macsys) prints the exact brew-install fix line" || bad "$(cat "$ERR_FILE")"
@@ -1287,7 +1287,7 @@ OUT_FILE="$TMPROOT/connect-hang.out"
 ERR_FILE="$TMPROOT/connect-hang.err"
 LOG="$TMPROOT/connect-hang.log"
 C10_START=$(date +%s)
-HMD_FUNNEL_START_TIMEOUT_S=3 FAKE_TS_MODE=funnel-start-hangs FAKE_TS_LOG="$LOG" "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
+HMD_FUNNEL_START_TIMEOUT_S=3 FAKE_TS_MODE=funnel-start-hangs FAKE_TS_LOG="$LOG" "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
 C10_ELAPSED=$(( $(date +%s) - C10_START ))
 [ "$RC" -eq 10 ] && ok "connect w/ a hung funnel-start exits 10 instead of hanging" || bad "exit $RC (want 10): $(cat "$ERR_FILE")"
@@ -1313,7 +1313,7 @@ rm -rf "$D"
 if [ -n "$HOST_NORM" ]; then
   D="$(make_repo)"
   OUT_FILE="$TMPROOT/connect-dns-suffix.out"
-  FAKE_TS_DNSNAME="${HOST_NORM}-1.tail1234.ts.net." FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
+  FAKE_TS_DNSNAME="${HOST_NORM}-1.tail1234.ts.net." FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
   RC=$?
   [ "$RC" -eq 0 ] && ok "connect --bg (DNSName w/ -N suffix) still exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
   EXPECT_CONNECT_LINE="DNSName carries a -N suffix: an older node named ${HOST_NORM} is probably still registered (offline) in the tailnet admin console — remove it at https://login.tailscale.com/admin/machines and re-run 'tailscale up' to reclaim ${HOST_NORM}.tail1234.ts.net"
@@ -1324,7 +1324,7 @@ if [ -n "$HOST_NORM" ]; then
 
   D="$(make_repo)"
   OUT_FILE2="$TMPROOT/connect-dns-nosuffix.out"
-  FAKE_TS_MODE=modern-funnel "$APP" connect --repo "$D" --port 0 --bg >"$OUT_FILE2" 2>&1
+  FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE2" 2>&1
   RC=$?
   if grep -qF -- '-N suffix' "$OUT_FILE2"; then
     bad "connect banner unexpectedly prints the -N suffix hint for a plain DNSName: $(cat "$OUT_FILE2")"
