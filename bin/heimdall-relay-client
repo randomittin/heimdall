@@ -364,6 +364,7 @@ import collections
 import functools
 import hashlib
 import http.client
+import ipaddress
 import itertools
 import json
 import os
@@ -719,6 +720,21 @@ def _split_relay(url):
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
     return parsed
+
+
+def token_transport_ok(parsed):
+    """May the laptop's GitHub token go in a request body to this relay (--code, --identity-revoke)? Over TLS
+    anywhere; over plain http only to this machine (localhost or a loopback address) -- to any other host it
+    would cross the network in the clear."""
+    if parsed.scheme == "https":
+        return True
+    host = (parsed.hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 # -- pair by session code (see PAIR BY SESSION CODE in the module docstring) -----------------------------
@@ -1154,6 +1170,8 @@ class RelayClient:
         self._last_renew_at = 0.0
         self._code_renewals = 0
         self._commit_nonce = None      # nonce_h of the current session, revealed once a code bind is approved
+        self._key_revealed = False     # a key_reveal was posted for the current key: the relay knows it, so it is burned.
+                                       # Set under _code_lock before the post, cleared only where a fresh key is installed
         self._pending = None           # the bind waiting for the laptop's answer
         self._renew_now = threading.Event()
         self._stream_epoch = 0         # bumped when a renewal replaces the session the stream reads
@@ -1443,13 +1461,20 @@ class RelayClient:
         self._code_lapse_at = time.monotonic() + max(exp - time.time(), 0.0) + CODE_RENEW_MARGIN_S
 
     def _code_end(self, event, reason):
-        """The window is over for good (no session of this client has a live one): drop the token, say why once."""
+        """The window is over for good (no session of this client has a live one): drop the token, say why once.
+        A window that ends on a key the relay has seen leaves no QR worth showing -- no bind on it could be told
+        from the relay's own (see _key_revealed) -- so the session ends with it; the next pair_init has a fresh key."""
         with self._code_lock:
-            if self._code_state in ("bound", "closed"):
-                return
+            if self._code_state in ("bound", "closed", "approving"):
+                return  # an approval in flight is answered first: its answer renews the window or ends it
             self._code_state = "closed"
+            burned = self._key_revealed
         self._gh_secret = None
         emit({"event": event, "reason": reason})
+        if burned:
+            self.write_status()
+            emit({"event": "session_ended", "reason": "key-revealed"})
+            self.stop_event.set()
 
     def _code_bound(self):
         """A bind that needed no approval (the QR's) ended the window: the token has nothing left to do."""
@@ -1551,6 +1576,7 @@ class RelayClient:
                 old = (self.session_id, self.token)
                 self.session_id, self.token, self.exp = new_id, new_token, data["exp"]
                 self.priv, self.pub, self._commit_nonce = priv, pub, nonce
+                self._key_revealed = False  # a fresh key that no one has seen: binds are accepted on it again
                 self._code_renewals += 1
                 renewal = self._code_renewals
                 self._last_renew_at = time.monotonic()
@@ -1640,6 +1666,7 @@ class RelayClient:
             if self._code_state != "open":
                 return
             self._code_state = "approving"
+            self._key_revealed = True  # before the post: whatever becomes of it, the relay may have read this key
             pending = {"device_pub": device_pub, "bound_at": payload.get("bound_at"), "key": key,
                        "sid": self.session_id, "token": self.token, "timer": None}
             self._pending = pending
@@ -2131,6 +2158,16 @@ class RelayClient:
                           "detail": "device_bound device_pubkey differs from the bind already awaiting "
                                     "approval -- ignored"})
                 return
+            # A key whose key_reveal the relay carried is burned: the relay can now answer for any "device" -- a
+            # bind of via "qr" with a key of its own, or a second claim by code with a key ground to show the same
+            # SAS -- so no bind is accepted on that session again, in any code state. Only a renewed window, with a
+            # fresh key, binds again (_renew_window); the approved bind itself never reaches this line.
+            if self._key_revealed:
+                emit({"event": "error",
+                      "detail": "device_bound refused: this session's key was already revealed to the relay by a "
+                                "code bind that was not approved, so a bind on it cannot be told from the "
+                                "relay's own -- ignored"})
+                return
             if self._code_state == "open" and payload.get("via") == "code":
                 self._begin_approval(payload, device_pub)
                 return
@@ -2514,13 +2551,15 @@ def build_argparser():
     ap.add_argument("--code", default=None, metavar="CODE", type=_code_arg,
                      help="also offer this 5-character session code: the phone pairs by typing it. The laptop's "
                           "GitHub token is read from the first line of stdin (a pipe), the operator's answers "
-                          "(approve / reject) from the lines after it")
+                          "(approve / reject) from the lines after it. The token travels in a request body, so "
+                          "the relay must be https:// or on this machine (localhost / a loopback address)")
     ap.add_argument("--no-confirm", action="store_true",
                      help="with --code: approve a phone that claimed by code without asking the laptop. The relay "
                           "is then trusted to deliver the right keys")
     ap.add_argument("--identity-revoke", action="store_true",
                      help="instead of a session: read the laptop's GitHub token from stdin, ask the relay to "
-                          "revoke every phone sign-in for that GitHub user, print one event, exit")
+                          "revoke every phone sign-in for that GitHub user, print one event, exit (the same "
+                          "https-or-loopback relay rule as --code applies)")
     return ap
 
 
@@ -2563,6 +2602,10 @@ def main(argv=None):
     parsed = _split_relay(args.relay)
     if parsed is None:
         ap.error("--relay must be an http:// or https:// URL")
+    if (args.code or args.identity_revoke) and not token_transport_ok(parsed):
+        ap.error("%s sends the GitHub token in a request body: the relay must be an https:// URL, or on this machine "
+                 "(localhost or a loopback address), not %s://%s -- `hmd app connect --no-code` pairs by QR over any relay"
+                 % ("--code" if args.code else "--identity-revoke", parsed.scheme, parsed.hostname))
     if args.identity_revoke:
         return identity_revoke(args)
     missing = [flag for flag, value in (("--repo", args.repo), ("--ui-port", args.ui_port)) if value is None]

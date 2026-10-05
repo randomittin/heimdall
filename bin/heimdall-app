@@ -689,7 +689,10 @@ _relay_event() {
       case "$tmo" in ''|*[!0-9]*) tmo=60 ;; esac
       [ "$tmo" -ge 1 ] || tmo=60
       echo ""
-      echo "hmd app: phone '${label:-unnamed device}' (GitHub @${login:-unknown}) wants to pair."
+      echo "hmd app: a phone wants to pair."
+      echo "  relay-claimed device name: '${label:-unnamed device}'"
+      echo "  relay-claimed GitHub user: @${login:-unknown}"
+      echo "  (the relay says so -- only the number below shows which phone this is)"
       echo "  The phone shows:  ${sas:0:3} ${sas:3:3}"
       if [ "$auto" = true ]; then
         echo "  --no-confirm: approved without asking."

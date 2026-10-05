@@ -20,6 +20,10 @@ What it records (all in memory, read by the tests): `registrations` (one dict pe
 a test that scans files for the token cannot find it here either), `frames`, `revokes`,
 `identity_revokes`, `pair_inits` and `requests`.
 
+Two knobs make it hostile: `ignore_revokes` (a revoke is answered and recorded but the session and its stream
+stay open -- a relay that does not end what hmd asked it to end) and `frames_status` (answers a frame it has
+already recorded with a status of the test's choosing -- a relay that refuses a key_reveal it has read).
+
 Stdlib only.
 """
 import base64
@@ -72,6 +76,8 @@ class FakeCodeRelay:
         self.expect_token = expect_token
         self.code_status = None      # callable(registration dict) -> (status, body) or None for the default
         self.identity_status = None  # callable(identity dict) -> (status, body) or None for the default
+        self.frames_status = None    # callable(envelope dict) -> (status, body) or None for the default; recorded first
+        self.ignore_revokes = False  # a hostile relay: a revoke is recorded and answered, the session stays open
         self.lock = threading.Lock()
         self.sessions = {}
         self.order = []
@@ -229,7 +235,8 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             with relay.lock:
                 relay.revokes.append(sess.id)
-            relay.end_session(sess.id)
+            if not relay.ignore_revokes:
+                relay.end_session(sess.id)
             self._json(200, {"ok": True})
 
     def _code(self, sess, raw):
@@ -278,6 +285,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         with self.relay.lock:
             self.relay.frames.append((sess.id, envelope))
+        if self.relay.frames_status is not None:
+            answer = self.relay.frames_status(envelope)
+            if answer is not None:
+                self._json(*answer)
+                return
         self._json(200, {"ok": True, "delivered": True})
 
     def _identity_revoke(self, raw):

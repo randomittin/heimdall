@@ -155,7 +155,9 @@ def case_default_transport():
         s.events("events-1", PAIR_INIT)
         app = s.app("--no-code", recorder=True)
         app.close_stdin()
-        app.wait_text("PAIRING CODE: ABCDEFGHIJKLMNOPQRSTUVWXYZ", 30)
+        # the last line of the block asserted below, not its first: the lines after PAIRING CODE follow it by a
+        # `date` fork, and a poll that lands in between used to find the warning "missing"
+        app.wait_text("the relay sees only ciphertext.", 30)
         T.check("scan to pair a device" in app.text() and "WARNING: anyone who scans this code within" in app.text()
                 and "SESSION CODE" not in app.text(),
                 "--no-code: the QR flow prints exactly as it always did (header, QR, pairing code, warning)", app.tail())
@@ -292,8 +294,9 @@ def case_prompt():
                     "prompt answered %r -> the client is told %s and the screen says %r" % (answer, word, want),
                     "control %r %s" % (s.read("control"), app.tail()))
             if answer == "y\n":
-                T.check("The phone shows:  817 531" in out and "phone 'Evil[2J]0;pwnPhone' (GitHub @octocat)" in out,
-                        "the prompt shows the SAS as 817 531 and the phone's label and login (escape bytes gone, the rest is plain text)",
+                T.check("The phone shows:  817 531" in out and "relay-claimed device name: 'Evil[2J]0;pwnPhone'" in out
+                        and "relay-claimed GitHub user: @octocat" in out,
+                        "the prompt shows the SAS as 817 531 and the phone's label and login, each marked relay-claimed (escape bytes gone, the rest is plain text)",
                         out[-500:])
                 T.check(has_none_of(app.out(), b"\x1b", b"\x07", b"\x00", "\u0085".encode(), "\u009b".encode()),
                         "no escape, bell, NUL or C1 control of the phone's label or login reaches the terminal")
@@ -353,8 +356,9 @@ def case_end_to_end():
         reveals = s.relay.frames_of(sid, "key_reveal")
         hmd_pub = H.b64_any(reveals[0]["payload"]["hmd_pubkey"]) if reveals else b""
         sas = H.sas_ref(sid, hmd_pub, s.phone.pub)
-        T.check(shown and ("The phone shows:  %s %s" % (sas[:3], sas[3:])) in app.text() and "phone 'Pixel 9a' (GitHub @octocat)" in app.text(),
-                "end to end: the prompt shows the SAS the phone computes from the revealed key", app.tail())
+        T.check(shown and ("The phone shows:  %s %s" % (sas[:3], sas[3:])) in app.text()
+                and "relay-claimed device name: 'Pixel 9a'" in app.text() and "relay-claimed GitHub user: @octocat" in app.text(),
+                "end to end: the prompt shows the SAS the phone computes from the revealed key, its name and login marked relay-claimed", app.tail())
         T.check(s.relay.frames_of(sid, "state") == [], "end to end: nothing is sealed while the prompt waits")
         app.send("y\n")
         app.wait_text("phone paired", 20)
