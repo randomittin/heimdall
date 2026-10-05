@@ -513,14 +513,12 @@ def g_size(st):
     squeezed = st.phone.state(lambda s: ((s.get("views") or {}).get("result") or {}).get("id") == (wide or {}).get("id"), since=before)
     check(squeezed is not None and plain is not None and squeezed["z"] is True and squeezed["envelope_bytes"] < plain["envelope_bytes"],
           "size: for a phone that listed z-zlib the same frame goes out zlib-compressed and smaller", squeezed and squeezed["envelope_bytes"])
-    for i in range(2100):
+    for i in range(2100):  # staged, not modified: the index against HEAD is the cheap diff, and git's speed is not what is tested
         r.write("many/f%04d.txt" % i, "v%d\n" % i)
-    r.commit("many baseline")
-    for i in range(2100):
-        r.write("many/f%04d.txt" % i, "w%d\n" % i)
-    ack, many = st.view(None)
+    r.git("add", "-A")
+    ack, many = st.view(None, scope="staged")
     check(many is not None and len(many["files"]) == 2000 and many["truncated"] is True,
-          "size: a diff of 2100 files lists 2000 (the phone's cap) and says it is truncated", many and len(many["files"]))
+          "size: a staged diff of 2100 files lists 2000 (the phone's cap) and says it is truncated", ack if many is None else len(many["files"]))
     r.reset("wide.txt")
 
 
