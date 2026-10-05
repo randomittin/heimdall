@@ -10,7 +10,12 @@
 #   bin/heimdall-ui            the loopback companion web UI this publishes
 #
 # Usage:
-#   hmd app connect [--repo DIR] [--port N] [--https-port 443|8443|10000]
+#   hmd app connect [--repo DIR] [--port N] [--relay URL] [--bg] [--no-code] [--no-confirm]
+#                              With no transport flag: publish through the hosted Cloudflare relay (the
+#                              DEFAULT, https://hmd-relay.therishabh16.workers.dev; HMD_RELAY_URL overrides
+#                              it and --relay URL overrides both) -- see the relay block below.
+#                              --tailscale, --https-port and --no-install select Tailscale Funnel instead.
+#   hmd app connect --tailscale [--repo DIR] [--port N] [--https-port 443|8443|10000]
 #                    [--no-install] [--bg]
 #                              Ensure tailscale is installed and online, start
 #                              `hmd ui` on loopback (fixed port 8710 unless
@@ -25,10 +30,10 @@
 #                              the state file. --bg returns immediately instead
 #                              of waiting, leaving both running (tear down
 #                              later with `hmd app disconnect`).
-#   hmd app connect [--repo DIR] [--port N] --relay URL [--bg]
+#   hmd app connect [--repo DIR] [--port N] [--relay URL] [--bg]
 #                              Publish through a Cloudflare relay instead of
 #                              Tailscale Funnel -- mutually exclusive with
-#                              --https-port (exit 2 if both are given). Skips
+#                              --https-port and --tailscale (exit 2 with either). Skips
 #                              every tailscale step entirely: no install/login
 #                              checks, no Funnel. Starts `hmd ui` loopback-only
 #                              (no --allow-host/--trust-proxy -- the relay
@@ -42,6 +47,30 @@
 #                              down the ui and state files. --bg returns once
 #                              pairing has started, leaving both running (tear
 #                              down later with `hmd app disconnect`).
+#                              PAIR BY CODE (on whenever `gh auth token` yields a
+#                              token, off with --no-code): the 5-character session
+#                              code `hmd ui` shows is registered with the relay
+#                              under this laptop's GitHub identity and printed as
+#                              SESSION CODE -- typing it in the app pairs a phone
+#                              signed in to GitHub as the same user, no QR. The
+#                              token goes to the relay client on a pipe, once, and
+#                              is on no argv, environment variable or file. A phone
+#                              that claims the code shows a 6-digit number; the
+#                              same number is shown here and you approve it
+#                              (y/N, 60 s) -- nothing is sent to the phone until
+#                              you do. --no-confirm approves for you (the relay is
+#                              then trusted to deliver the right keys); --bg needs
+#                              it, there being no terminal to ask at (exit 64
+#                              without it). The code is offered for 10 minutes. No
+#                              gh, signed out, a code clash or a relay that cannot
+#                              do it prints one line and leaves the QR as it was.
+#   hmd app identity revoke [--relay URL]
+#                              Revoke every phone sign-in made with this laptop's
+#                              GitHub identity (`gh auth token` is sent to the
+#                              relay once, on a pipe): each phone must sign in
+#                              again. Revoking the hmd GitHub App at github.com
+#                              does NOT do this by itself -- a sign-in already
+#                              minted stays valid until it expires or you run this.
 #   hmd app status [--repo DIR]
 #                              Tailscale install/online/DNSName, funnel state,
 #                              the state file's contents, the public URL with
