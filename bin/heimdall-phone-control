@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""heimdall-phone-control -- the hook half of the paired phone's `interrupt` control.
+
+Claude Code has no external interrupt. The one lever a hook has is {"continue": false, "stopReason": ..}, honoured
+the next time a hook event fires, so "stop the current turn" from the phone is "stop at the next tool boundary".
+bin/lib/companion_ui_controls.py (the `interrupt` action, only while the session is `working`) writes
+<repo>/.heimdall/ui/stop-request.json; this script is what turns it into the stop, and nothing else:
+
+    heimdall-phone-control stop   --repo DIR   PreToolUse + PostToolUse: a request younger than 120 s is renamed to
+                                               stop-request.consumed (single use: the rename is the claim, so two hooks
+                                               firing together stop once) and ONE object is printed:
+                                               {"continue": false, "stopReason": "Stopped from the phone at HH:MM.
+                                               Send a message to continue."}. An older request is deleted unused.
+    heimdall-phone-control prompt --repo DIR   UserPromptSubmit: a pending request is deleted, so a stale flag can never
+                                               stop the NEXT turn.
+
+hooks/hooks.json runs it behind a file test (`[ -f <repo>/.heimdall/ui/stop-request.json ] || exit 0`), so a tool call
+with nothing pending costs one shell builtin and no process. It acts only for an ATTENDED session -- never for a headless
+claude -p / SDK child or an hmd sub-session that shares this repo and its hooks -- the rule bin/heimdall-phone-deny and
+bin/heimdall-inbox-deliver use, so a judge running beside the operator's session cannot swallow the stop meant for it.
+
+NEVER BLOCKS ON ITS OWN FAILURE: malformed input, an unreadable directory, a missing library, any exception -> no output,
+exit 0 (a one-line note on stderr for an unexpected one). It never exits 2, never prints anything but the one object above,
+and is not in the phone's own hook allowlist (`remote_toggle` false): the phone cannot switch off its own stop path.
+
+Not verified: what {"continue": false} does when the tool call came from inside a sub-agent (hmdapp handoff H8 spike), and
+whether attention then reads idle or working -- see bin/heimdall-phone-deny, which says the same.
+
+Usage:  heimdall-phone-control stop|prompt [--repo DIR]        (-h / --help prints this)
+"""
+import json
+import os
+import sys
+import time
+from importlib.util import module_from_spec, spec_from_file_location
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LIB_DIR = os.path.join(HERE, "lib")
+PROGRAMMATIC_ENTRYPOINTS = frozenset(("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action"))
+
+
+def attended_session(env):
+    """False for a session no human is typing into: headless claude -p / SDK children and hmd's own judge or role-tagged
+    sub-sessions share this repo and its hooks. Same rule as bin/heimdall-phone-deny and bin/heimdall-inbox-deliver."""
+    if env.get("CLAUDE_CODE_ENTRYPOINT", "").strip() in PROGRAMMATIC_ENTRYPOINTS:
+        return False
+    if env.get("HMD_AGENT_TYPE", "").strip():
+        return False
+    return env.get("HMD_JUDGMENT", "").strip().lower() in ("", "0", "false")
+
+
+def load_controls():
+    spec = spec_from_file_location("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
+    mod = module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def stop_output(now):
+    """The hook's whole vocabulary: this one object, printed only for a request that was fresh and is now consumed."""
+    return {"continue": False,
+            "stopReason": "Stopped from the phone at %s. Send a message to continue." % time.strftime("%H:%M", time.localtime(now))}
+
+
+def run(mode, root, env, now=None):
+    """The object to print for `mode` against repo `root`, or None for nothing. Raises only on a broken library."""
+    if mode not in ("stop", "prompt") or not attended_session(env):
+        return None
+    now = time.time() if now is None else now
+    controls = load_controls()
+    if mode == "prompt":
+        controls.clear_stop_request(root)
+        return None
+    if controls.consume_stop_request(root, now) is None:
+        return None
+    return stop_output(now)
+
+
+def main(argv):
+    if any(a in ("-h", "--help") for a in argv):
+        sys.stdout.write(__doc__)
+        return 0
+    mode = argv[0] if argv else ""
+    repo = "."
+    rest = argv[1:]
+    for i, arg in enumerate(rest):
+        if arg == "--repo" and i + 1 < len(rest):
+            repo = rest[i + 1]
+    try:
+        out = run(mode, os.path.realpath(os.path.expanduser(repo)), os.environ)
+    except Exception as e:  # fail open: a broken hook must never be the reason a tool call or a prompt is lost
+        sys.stderr.write("heimdall-phone-control: %s: %s\n" % (mode, type(e).__name__))
+        return 0
+    if out is not None:
+        sys.stdout.write(json.dumps(out) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
