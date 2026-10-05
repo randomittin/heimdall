@@ -1,0 +1,40 @@
+{
+  "id": "python-websockets__websockets-631",
+  "category": "feature",
+  "source": "https://github.com/python-websockets/websockets/issues/631",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/python-websockets/websockets/pull/1495",
+  "repo": "python-websockets/websockets",
+  "license": "BSD-3-Clause",
+  "base_sha": "1f89db78ca6363a7e4d9830b6b280e311e3934f3",
+  "merge_sha": "7650f95b3b38aa775118d64c747a3837573e32e7",
+  "test_paths": [
+    "tests/asyncio/test_client.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/python-websockets/websockets && git fetch -q --depth 1 --filter=blob:none origin 1f89db78ca6363a7e4d9830b6b280e311e3934f3 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: Don't follow redirects when path, sock, host or port are overridden\n\n(from https://github.com/aaugustin/websockets/pull/544#issuecomment-505837262)\r\n\r\nSince #528 websockets follows redirects.\r\n\r\nI believe that this feature is incompatible with connection overrides (either with host + port or with sock). If you need to control exactly where you're connecting, I assume you aren't expecting to be redirected somewhere else.\r\n\r\nThis deserves documentation at a minimum, perhaps a warning or even an exception.\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "9 failed, 35 passed in 1.36s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "44 passed in 0.62s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "id": "virgiliojr94__book-to-skill-95",
+  "category": "bugfix",
+  "source": "https://github.com/virgiliojr94/book-to-skill/issues/95",
+  "kind": "repo",
+  "profile": null,
+  "pr": "https://github.com/virgiliojr94/book-to-skill/pull/97",
+  "repo": "virgiliojr94/book-to-skill",
+  "license": "MIT",
+  "base_sha": "e15399f5fa121afa15e9f3f326494b2f946ccf81",
+  "merge_sha": "b5f3c45c76d2caa888ffca78bc2859c8229959de",
+  "test_paths": [
+    "tests/test_book_to_skill.py"
+  ],
+  "ground_truth_timeout_s": 300,
+  "setup": [
+    "git init -q . && git remote add origin https://github.com/virgiliojr94/book-to-skill && git fetch -q --depth 1 --filter=blob:none origin e15399f5fa121afa15e9f3f326494b2f946ccf81 && git checkout -q --detach FETCH_HEAD && git remote remove origin",
+    "uv venv -q --python {python} .venv",
+    "uv pip install --python .venv/bin/python -q pytest",
+    "uv pip install --python .venv/bin/python -q -e \".\""
+  ],
+  "prompt": "You are working in a Git repository checked out in the current directory. Its Python environment is already set up in ./.venv: run the project's tests with `.venv/bin/python -m pytest`.\n\nResolve this GitHub issue by changing the repository's code. Do not look for, and do not rely on, any upstream fix.\n\nIssue: [bug] documented `book-to-skill --help` is rejected as an unknown flag\n\n## What happened\n\nThe README tells users to run `book-to-skill --help`, but that flag isn't recognized. Since #89 added\nunknown-flag warnings, it now reports itself as a mistake:\n\n```\n$ book-to-skill --help\nWARNING: Unknown flag '--help' \u2014 ignoring it.\nERROR: No input document, folder, or glob pattern specified.\n$ echo $?\n1\n```\n\nThat is the complete output \u2014 no usage text is printed. `-h` and `--version` behave identically.\n\nThe usage block does exist, but it's gated on `len(sys.argv) < 2` (`book_to_skill/utils.py:618`), so it\nonly prints on the **zero-argument** run, which is a different invocation:\n\n```\n$ book-to-skill\nUsage: extract.py <path-to-document-folder-or-glob>... [--mode technical|text] [--install-missing ask|yes|no]\n       extract.py --check    # report which extractors are installed\nSupported formats: .adoc, .asciidoc, .azw, .azw3, .docx, .epub, ...\n$ echo $?\n1\n```\n\nPassing `--help` makes `argv` length 2, so that branch is unreachable \u2014 the documented flag produces\nstrictly *less* help than passing nothing at all.\n\nREADME.md line 352 says:\n\n> **As a standalone CLI** (just the text extractor) \u2192 `pip install book-to-skill`, then\n> `book-to-skill --help`.\n\nSo the first command a new pip user is told to run prints a warning and an error. Everything else\nworks fine \u2014 this is purely the help entry point.\n\nThree separate things, all small:\n\n1. **`--help` / `-h` aren't handled.** The usage text already exists (`book_to_skill/utils.py:619`)\n   and prints on no-args \u2014 it just isn't reachable by the documented flag, because the `len(sys.argv)\n   < 2` gate one line above excludes any invocation that passes one.\n2. **The usage text names the wrong program.** It says `Usage: extract.py ...`, but a pip-installed\n   user's command is `book-to-skill`. The `extract.py` path doesn't exist for them.\n3. **`--version` isn't handled** either, though the version is already declared in `pyproject.toml`.\n   Minor, and easy to fold in if you want it.\n\n## What you expected\n\n`book-to-skill --help` prints the usage text and exits 0, with `book-to-skill` as the program name.\n\n## Source document\n\nn/a \u2014 this isn't an extraction bug; it reproduces with no input document.\n\n- Format: n/a\n- Pages / size: n/a\n- Language: n/a\n- Does `--check` show the relevant extractor installed? n/a (`--check` itself works correctly, exit 0)\n\n## Repro\n\n```bash\npip install book-to-skill\nbook-to-skill --help\n```\n\n## Environment\n\n- OS: macOS 26.5.2 (Darwin 25.5.0), arm64\n- Python version: 3.13.14 (clean venv)\n- book-to-skill version / commit: 1.3.0 @ `b74286d`\n\n## Note\n\nExit codes are correct, in case it's worth ruling out: error paths return 1 and `--check` returns 0.\nThe only defect is that the documented help flag isn't wired to the usage text that already exists.\n\nHappy to send a PR if you'd like \u2014 though `--version` and the program-name string are UX calls that\nare probably yours to make.\n\nWhen you are finished, print exactly one final line: `CLAIM: done` if the issue is fully resolved and you verified it, `CLAIM: failed` if you could not resolve it, or `CLAIM: gave_up` if you stopped without finishing.",
+  "verified": {
+    "base": {
+      "rc": 1,
+      "tail": "3 failed, 168 passed in 0.44s"
+    },
+    "merge": {
+      "rc": 0,
+      "tail": "171 passed in 0.24s"
+    },
+    "toolchain": {
+      "python": "3.11.14",
+      "uv": "uv 0.11.7 (9d177269e 2026-04-15 aarch64-apple-darwin)",
+      "git": "git version 2.53.0",
+      "gitleaks": "8.30.1"
+    },
+    "secret_scan": "clean: 8.30.1"
+  }
+}
