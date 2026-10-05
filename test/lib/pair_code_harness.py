@@ -149,10 +149,18 @@ class Sandbox:
 
 
 class Proc:
-    def __init__(self, argv, env, cwd=None, stdin=subprocess.PIPE):
+    def __init__(self, argv, env, cwd=None, stdin=subprocess.PIPE, tty=False):
+        """`tty=True` gives the child a pseudo-terminal for stdin (`send` types on it, `close_stdin` hangs it
+        up): the one way to answer a prompt that is only ever asked at a terminal."""
         self.argv = argv
+        self._master = None
+        if tty:
+            self._master, slave = os.openpty()
+            stdin = slave
         self.p = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   env=env, cwd=cwd, bufsize=0)
+        if tty:
+            os.close(slave)
         self._out = bytearray()
         self._err = bytearray()
         self._lock = threading.Lock()
@@ -205,16 +213,27 @@ class Proc:
         return found
 
     def send(self, data):
-        if self.p.stdin is None:
-            return False
+        raw = data if isinstance(data, bytes) else data.encode("utf-8")
         try:
-            self.p.stdin.write(data if isinstance(data, bytes) else data.encode("utf-8"))
-            self.p.stdin.flush()
+            if self._master is not None:
+                os.write(self._master, raw)
+            elif self.p.stdin is not None:
+                self.p.stdin.write(raw)
+                self.p.stdin.flush()
+            else:
+                return False
         except (BrokenPipeError, OSError):
             return False
         return True
 
     def close_stdin(self):
+        if self._master is not None:
+            master, self._master = self._master, None
+            try:
+                os.close(master)
+            except OSError:
+                return
+            return
         if self.p.stdin is None:
             return
         try:

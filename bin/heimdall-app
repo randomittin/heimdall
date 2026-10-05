@@ -695,6 +695,11 @@ _relay_event() {
         echo "  --no-confirm: approved without asking."
         return 0
       fi
+      if [ ! -t 0 ]; then  # connect only offers a code at a terminal; this keeps a prompt from ever waiting on a pipe
+        echo "  No terminal to confirm at -- the pairing is rejected."
+        _ctl_send reject
+        return 0
+      fi
       printf '  Same number on both screens? Approve [y/N]: '
       ans=""
       read -r -t "$tmo" ans || ans=""
@@ -1048,6 +1053,13 @@ cmd_connect_relay() {
     gh_tok=""
     echo "hmd app connect: code pairing confirms at this terminal — drop --bg, add --no-confirm, or use the QR" >&2
     return 64
+  fi
+  if [ "$code_requested" = true ] && [ "$NO_CONFIRM" != true ] && [ ! -t 0 ]; then
+    # A phone that claims the code is approved by a person looking at two screens; with no terminal there is
+    # nobody to ask, so the code is not offered at all (a code that rejects every phone would only mislead).
+    code_requested=false
+    gh_tok=""
+    echo "hmd app: code pairing off — no terminal to confirm a phone at (run this at a terminal, or add --no-confirm). Scan the QR."
   fi
   if [ "$code_requested" = true ] && [ "$NO_CONFIRM" = true ]; then
     echo "hmd app: --no-confirm trusts the relay to deliver the right keys."
