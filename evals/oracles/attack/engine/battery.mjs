@@ -76,7 +76,8 @@ function duplicateCases() {
       title: 'two different events for one account delivered together',
       scenario: deliveries(STORE_LATENCY_MS, [
         { at_ms: 0, event: SETTLED },
-        { at_ms: 0, event: ev('evt_1002', OWNER, 2500) },
+        // 1000 gross is an exact 29-cent fee: no rounding in play, so only a duplicate defect can break this case
+        { at_ms: 0, event: ev('evt_1002', OWNER, 1000) },
       ]),
     },
   ];
