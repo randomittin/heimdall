@@ -52,9 +52,30 @@ configuration (`no_trust`, `not_found`, `bad_trust`, `bad_id`). An id is looked 
 `hmd receipt render --out DIR` writes `DIR/r/<id>.json` (the exact signed bytes) and
 `DIR/r/<id>.html` for every PUBLIC receipt that verifies; a private one is never written and a
 failing one is reported (exit 1) and never written. Publish `DIR` on any static host that maps
-`/r/<id>` to `r/<id>.html` (Netlify, Cloudflare Pages). `hmd receipt serve [--port N]` serves the
-same responses on 127.0.0.1 only, for testing. The HTML escapes every dynamic value, has no script,
-no external resource and no form, and carries its own CSP.
+`/r/<id>` to `r/<id>.html` (Netlify, Cloudflare Pages). The HTML escapes every dynamic value, has no
+script, no external resource and no form, and carries its own CSP.
+
+`hmd receipt serve [--store DIR] [--port N]` answers the same two URLs on 127.0.0.1, to test what
+`render` would publish. Any web page open in the operator's browser can aim at a local port, so this
+server is narrow on purpose:
+
+- **Public receipts only.** A private receipt is a 404, byte for byte the answer for an id that does
+  not exist, so the server cannot be used to find out which private receipts exist. No flag serves
+  one: a private receipt belongs to a service that knows who is asking (the hosted service, not
+  built here), and an unauthenticated port is not that. `hmd receipt verify <id>` checks one locally.
+- **Host header.** A request is served only when it carries exactly one `Host` header and that is
+  `127.0.0.1:<port>` or `localhost:<port>` (the port the server actually bound; exact,
+  case-insensitive). Anything else, a missing Host included, is a 403 before any receipt is read.
+  This is the DNS-rebinding defence: a page on `evil.example` whose name is re-pointed at
+  127.0.0.1 reaches the server but still sends `Host: evil.example`. It is the check
+  `sentinels/hmd-ui.py` makes; there is no `--allow-host`, because a public name belongs to the
+  `render` tree on a static host, not to this server.
+- **Bind.** 127.0.0.1 only; no flag changes it.
+- **Headers.** Every answer the server builds, errors included, carries `Content-Security-Policy`
+  (`default-src 'none'`, the one inline style allowed by hash, no framing), `X-Content-Type-Options:
+  nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control: no-store`. The HTTP layer's own
+  refusals (a malformed request, an unknown method) are plain text, so the receipt page is the only
+  HTML it returns.
 
 `runhmd.dev` has no DNS yet (operator-only), so receipt URLs do not resolve until the operator
 points it at a host serving that tree. NOT built: `POST /api/receipts`, `GET /r/<id>/card.png`,

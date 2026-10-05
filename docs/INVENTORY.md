@@ -330,7 +330,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-gate` | contract-consuming adapter (Token-Frugal Protocol v2) |
 | `heimdall-verdict` | print the repo's last gate result |
 | `heimdall-attack` | `hmd attack` (RP1): attack a target, answer PROVEN or DENIED with a counterexample as a `runhmd.verdict/1` document (`docs/schemas/runhmd.verdict.v1.json`, validated by `bin/lib/runhmd_schema.py`); the verdict comes from the falsifiable `attack` oracle gate, not the CLI. Non-TTY without `--yes` exits 3 |
-| `heimdall-receipt` | `hmd receipt` (RP3): `verify <file\|id>` a signed `runhmd.receipt/1` (any changed field or byte fails), `keygen`, `render` (static `/r/<id>` + `/r/<id>.json` tree), `serve` (the same, loopback). Contract `docs/schemas/runhmd.receipt.v1.json`, notes `docs/RECEIPTS.md`; `hmd attack --receipt` issues them |
+| `heimdall-receipt` | `hmd receipt` (RP3): `verify <file\|id>` a signed `runhmd.receipt/1` (any changed field or byte fails), `keygen`, `render` (static `/r/<id>` + `/r/<id>.json` tree), `serve` (the same for public receipts: loopback only, Host-checked). Contract `docs/schemas/runhmd.receipt.v1.json`, notes `docs/RECEIPTS.md`; `hmd attack --receipt` issues them |
 | `heimdall-stamp` | the branded hard-gate-block denial stamp |
 | `heimdall-selfscan` | shared push-integrity gate: gitleaks history + tree, identity allowlist |
 | `secret-scan` | gitleaks over staged changes |
