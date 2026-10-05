@@ -386,6 +386,39 @@ T.eq((answer(rig, rid), len(rig.fake.requests), os.path.exists(rig.path("push-se
      (("done", []), 0, False), "A7h. no device registered: answered as an empty list; no request, no lock file")
 rig.close()
 
+
+class BrokenStore:
+    """A registry that cannot be read."""
+
+    def load(self, root):
+        raise RuntimeError("registry unreadable")
+
+    def remove_tokens(self, root, tokens):
+        return 0
+
+
+# a registry that cannot be read: nothing is sent, the request is not answered (the CLI then says no sender), one error event
+rig = Rig(devices=TWO[:1])
+broken = CP.PushMonitor(rig.root, store=BrokenStore(), emit=rig.events.append, config={"min_run_s": 0, "timeout_s": 3.0},
+                        sleep=lambda seconds: None, environ={"HMD_PUSH_EXPO_URL": rig.fake.url}, start_thread=False)
+rid = CP.request_test(rig.root)
+broken.observe(IDLE, 1000.0)
+broken.step(1000.0)
+T.eq((len(rig.fake.requests), answer(rig, rid), [e["detail"] for e in rig.events if e.get("event") == "error"]),
+     (0, None, ["push: store-load failed (RuntimeError)"]),
+     "A7i. a registry that cannot be read: nothing sent, no answer, exactly one error event")
+broken.close()
+rig.close()
+
+# an answer that cannot be written costs the CLI its answer, never the send
+rig = Rig(devices=TWO[:1])
+os.makedirs(rig.path("push-test.result"))                    # a directory where the answer would go
+rid = ask(rig, 1000.0)
+errors = [e["detail"] for e in rig.events if e.get("event") == "error"]
+T.check(sent_kinds(rig) == ["test"] and len(errors) == 1 and errors[0].startswith("push: test-result failed"),
+        "A7j. the answer cannot be written: the test was still sent, and one error event says why", (sent_kinds(rig), errors))
+rig.close()
+
 # ── A8. the worker thread serves a request by itself (no step() from the caller) ──
 rig = Rig(devices=TWO[:1])
 events = []
@@ -911,6 +944,7 @@ run_part C "$TMPROOT/part_c.py"
 
 # ── D. the CLI module's waiting rules and wording, with a stand-in for the sender ─────────
 cat >"$TMPROOT/part_d.py" <<'PYEOF'
+import contextlib
 import hashlib
 import io
 import json
@@ -1054,6 +1088,37 @@ T.check(rc == 3 and "no device registered" in out and not os.path.exists(os.path
         "D5c2. nothing registered: exit 3, and no request is posted", (rc, out))
 T.check(CLI.main([], out=io.StringIO()) == 2 and CLI.main(["bogus"], out=io.StringIO()) == 2,
         "D5d. no subcommand, or another one: exit 2")
+
+# ── D6. a request that cannot be posted: exit 1 and a reason, no traceback ──
+if os.geteuid() != 0:
+    root = repo(TOKENS[:1])
+    app_dir = os.path.join(root, ".heimdall", "app")
+    os.chmod(app_dir, 0o500)
+    seen = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(seen):
+            rc, out = cli_main(root, "--wait", "2")
+    finally:
+        os.chmod(app_dir, 0o700)
+    T.check(rc == 1 and "Permission denied" in seen.getvalue() and out == "",
+            "D6. the app directory is read-only: exit 1 with the reason on stderr", (rc, out, seen.getvalue()))
+
+# ── D7. Ctrl-C while waiting: exit 130, the request withdrawn ──
+root = repo(TOKENS[:1])
+real_await = CLI.await_answer
+
+
+def interrupted(push, repo_root, request_id, wait_s):
+    raise KeyboardInterrupt()
+
+
+CLI.await_answer = interrupted
+try:
+    rc, out = cli_main(root, "--wait", "5")
+finally:
+    CLI.await_answer = real_await
+T.check(rc == 130 and "interrupted" in out and not os.path.exists(os.path.join(root, ".heimdall", "app", "push-test")),
+        "D7. Ctrl-C while waiting: exit 130, and the request is withdrawn", (rc, out))
 print("done")
 PYEOF
 run_part D "$TMPROOT/part_d.py"
