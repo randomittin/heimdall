@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# heimdall-weekly-review -- `hmd weekly-review --week N`: the plan section 17 weekly review
+# template, with its Numbers block filled from what this machine can measure.
+#
+# Prints the template as markdown on stdout: "## Week N review", the Numbers block (eight lines),
+# then "What users said (verbatim quotes)", "What surprised me", "Decisions" and "Next week's one
+# priority". A number that cannot be measured prints "unmeasured". Two lines have no source anywhere
+# (Overnight users, Developer conversations held): they stay BLANK for the human, never filled with
+# a guess.
+#
+# USAGE
+#   heimdall-weekly-review --week N [--json] [--repo DIR] [--receipts DIR] [--bench-results DIR]
+#
+#   --week N              the week number: a positive integer without leading zeros (required)
+#   --json                print {"week":N,"window_days":7,"numbers":{...}} instead; the two numbers
+#                         with no source are null
+#   --repo DIR            the git repository whose commits are counted (default: the current directory)
+#   --receipts DIR        forwarded to heimdall-metrics: the receipt store
+#   --bench-results DIR   forwarded to heimdall-metrics: the benchmark rows
+#   -h, --help            this text
+#
+# THE NUMBERS
+#   The window is the trailing 7 days; one line under the title says so.
+#   Active developers, Confirmed real bugs caught, Denial precision, $ per proven PR
+#       come from `heimdall-metrics --json`, run from this script's own directory and never found
+#       through $PATH. Its sources and rules, and why most of them read "unmeasured" today, are in
+#       `hmd metrics --help`. Active developers is a trailing-7-days number; the other three are
+#       cumulative over local data.
+#   Tasks verified
+#       the valid runhmd receipts in the local store created in the window (the same store and the
+#       same validity rule as hmd metrics); "unmeasured" when the store holds no valid receipt.
+#   Commits shipped
+#       `git rev-list --count --since="7 days ago" HEAD` in the repo; "unmeasured" (with a warning on
+#       stderr) when git cannot count: not a repository, or no commits.
+#   Overnight users, Developer conversations held
+#       no source: blank in the markdown, null in --json.
+#
+# EXIT CODES: 0 ok, 2 usage error (a bad N included), 5 infrastructure (jq or python3 is missing,
+# or hmd metrics failed).
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+METRICS="$BIN_DIR/heimdall-metrics"
+WINDOW_DAYS=7
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$SELF"; }
+die_usage() { echo "hmd weekly-review: $1 (see hmd weekly-review --help)" >&2; exit 2; }
+die_infra() { echo "hmd weekly-review: $1 (infrastructure error)" >&2; exit 5; }
+need_value() { [ -n "$2" ] || die_usage "$1 needs a non-empty value"; }
+
+WEEK=""; JSON=""; REPO="."
+FORWARD=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --week)            [ $# -ge 2 ] || die_usage "--week needs a number"; WEEK="$2"; shift 2 ;;
+    --week=*)          WEEK="${1#*=}"; shift ;;
+    --json)            JSON=1; shift ;;
+    --repo)            [ $# -ge 2 ] || die_usage "--repo needs a directory"; need_value --repo "$2"; REPO="$2"; shift 2 ;;
+    --repo=*)          need_value --repo "${1#*=}"; REPO="${1#*=}"; shift ;;
+    --receipts)        [ $# -ge 2 ] || die_usage "--receipts needs a directory"; need_value --receipts "$2"; FORWARD+=(--receipts "$2"); shift 2 ;;
+    --receipts=*)      need_value --receipts "${1#*=}"; FORWARD+=(--receipts "${1#*=}"); shift ;;
+    --bench-results)   [ $# -ge 2 ] || die_usage "--bench-results needs a directory"; need_value --bench-results "$2"; FORWARD+=(--bench-results "$2"); shift 2 ;;
+    --bench-results=*) need_value --bench-results "${1#*=}"; FORWARD+=(--bench-results "${1#*=}"); shift ;;
+    -h|--help)         usage; exit 0 ;;
+    -*)                die_usage "unknown option '$1'" ;;
+    *)                 die_usage "unexpected argument '$1'" ;;
+  esac
+done
+
+[ -n "$WEEK" ] || die_usage "--week N is required (N is a positive integer)"
+case "$WEEK" in
+  *[!0-9]*|0*) die_usage "--week must be a positive integer without leading zeros, got '$WEEK'" ;;
+esac
+[ "${#WEEK}" -le 9 ] || die_usage "--week must have at most 9 digits, got '$WEEK'"
+
+command -v jq >/dev/null 2>&1 || die_infra "jq is required"
+command -v python3 >/dev/null 2>&1 || die_infra "python3 is required, hmd metrics runs on it"
+[ -x "$METRICS" ] || die_infra "$METRICS is missing or not executable"
+
+METRICS_JSON="$("$METRICS" --json --evidence ${FORWARD[@]+"${FORWARD[@]}"})"
+RC=$?
+if [ "$RC" -ne 0 ]; then
+  echo "hmd weekly-review: hmd metrics failed (exit $RC)" >&2
+  [ "$RC" -eq 2 ] && exit 2
+  exit 5
+fi
+printf '%s' "$METRICS_JSON" | jq -e 'has("active_developers") and (.evidence.receipts.valid | type == "number")' >/dev/null 2>&1 \
+  || die_infra "hmd metrics did not print its --json output"
+
+COMMITS=null
+if command -v git >/dev/null 2>&1; then
+  COUNT="$(git -C "$REPO" rev-list --count --since="$WINDOW_DAYS days ago" HEAD 2>/dev/null)"
+  case "$COUNT" in
+    ''|*[!0-9]*) echo "hmd weekly-review: warning: cannot count commits in $REPO (not a git repository, or it has no commits): Commits shipped is unmeasured" >&2 ;;
+    *)           COMMITS="$COUNT" ;;
+  esac
+else
+  echo "hmd weekly-review: warning: git is not installed: Commits shipped is unmeasured" >&2
+fi
+
+NUMBERS="$(printf '%s' "$METRICS_JSON" | jq -c --argjson commits "$COMMITS" '{
+  active_developers: .active_developers,
+  tasks_verified: (if .evidence.receipts.valid > 0 then .evidence.receipts.in_window else null end),
+  confirmed_real_bugs_caught: .real_bugs_caught,
+  denial_precision: .denial_precision,
+  usd_per_proven_pr: .usd_per_proven_pr,
+  overnight_users: null,
+  developer_conversations_held: null,
+  commits_shipped: $commits
+}')" || die_infra "cannot read the numbers from the hmd metrics output"
+
+if [ -n "$JSON" ]; then
+  printf '%s' "$NUMBERS" | jq -c --argjson week "$WEEK" --argjson days "$WINDOW_DAYS" '{week: $week, window_days: $days, numbers: .}'
+  exit 0
+fi
+
+printf '%s' "$NUMBERS" | jq -r --arg week "$WEEK" --arg days "$WINDOW_DAYS" --arg until "$(date -u +%Y-%m-%d)" '
+  def v: if . == null then "unmeasured" else tostring end;
+  "## Week \($week) review",
+  "",
+  "Window: trailing \($days) days to \($until) (UTC) for active developers, tasks verified and commits shipped; the other numbers are cumulative over local data (hmd metrics).",
+  "",
+  "### Numbers",
+  "- Active developers: \(.active_developers | v)",
+  "- Tasks verified: \(.tasks_verified | v)",
+  "- Confirmed real bugs caught: \(.confirmed_real_bugs_caught | v)",
+  "- Denial precision: \(.denial_precision | v)",
+  "- $ per proven PR: \(.usd_per_proven_pr | v)",
+  "- Overnight users:",
+  "- Developer conversations held:",
+  "- Commits shipped: \(.commits_shipped | v)",
+  "",
+  "### What users said (verbatim quotes)",
+  "-",
+  "",
+  "### What surprised me",
+  "-",
+  "",
+  "### Decisions",
+  "-",
+  "",
+  "### Next week'"'"'s one priority",
+  "-"'

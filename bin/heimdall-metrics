@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# heimdall-metrics -- `hmd metrics`: the eight launch numbers (plan section 1), from LOCAL data only.
+#
+# A number is null (a count is 0) when its source is absent or cannot support it. It is never
+# estimated, never a flattering default, and never computed from a figure that is itself an
+# estimate. Every non-null value is computed from an on-disk source named below, and --evidence
+# prints the counts it was computed from. The scope is this machine: fleet-wide numbers need the
+# control plane and are not available here.
+#
+# USAGE
+#   heimdall-metrics [--json] [--evidence] [--receipts DIR] [--bench-results DIR]
+#
+#   --json                one JSON object with exactly these keys, in this order, and nothing else:
+#                           false_green_rate, catch_rate, denial_precision, real_bugs_caught,
+#                           usd_per_proven_pr, usd_per_real_bug, active_developers,
+#                           partner_teams_active_weekly
+#                         With nothing measured it is this one line:
+#                           {"false_green_rate":null,"catch_rate":null,"denial_precision":null,"real_bugs_caught":0,"usd_per_proven_pr":null,"usd_per_real_bug":null,"active_developers":0,"partner_teams_active_weekly":0}
+#                         Without --json: the same data as text, "unmeasured" for null.
+#   --evidence            with --json, add an "evidence" object after the eight keys: the receipt and
+#                         benchmark counts every number was computed from
+#   --receipts DIR        the receipt store: this flag, else $HMD_METRICS_RECEIPTS_DIR, else
+#                         $RUNHMD_RECEIPT_DIR, else $HEIMDALL_HOME/runhmd/receipts (where
+#                         `hmd attack --receipt` writes; HEIMDALL_HOME defaults to ~/.heimdall)
+#   --bench-results DIR   the benchmark rows (*.jsonl): this flag, else $HMD_METRICS_BENCH_RESULTS_DIR,
+#                         else $FG_SUITE_DIR/results, else evals/benchmark/false-green/results
+#   -h, --help            this text
+#
+# SOURCES AND RULES
+#   false_green_rate, catch_rate, denial_precision
+#       The RP4 false-green benchmark: the rows in the benchmark results dir, summarised by
+#       bin/lib/fg_summary.py, the code behind `bin/benchmark summarize --suite false-green --json`
+#       (its output is reused, never recomputed). Only Study A can fill them: real agents, fg.run/1
+#       rows, arms alone and runhmd. Study B (judge calibration on mechanical mutants, fg.case/1
+#       rows) is never an agent false-green rate and is never reported here
+#       (evals/benchmark/false-green/PREREG.md section 1). The two rates are reported only when the
+#       summarizer calls Study A headline-eligible (at least 30 sampled tasks and 2 agents, PREREG
+#       section 2); denial_precision only when it reports one (at least 100 human-rated findings).
+#       false_green_rate is the pooled rate: false greens over "done" claims.
+#   real_bugs_caught
+#       Study A rows of the runhmd arm, verdict DENIED, that a human labelled "true_positive".
+#       That is the only label store on this tree: a receipt carries no label (docs/RECEIPTS.md:
+#       labels belong to the RP5 service, which is not built).
+#   usd_per_proven_pr, usd_per_real_bug
+#       Local runhmd receipts (docs/schemas/runhmd.receipt.v1.json): the files that satisfy that
+#       schema and are filed under their own id. Signatures are not re-checked here (hmd receipt
+#       verify does that). A receipt's cost_usd is a MEASURED basis only when a model was invoked
+#       (agent.model is a string) and a non-zero cost was recorded. The offline engine writes
+#       cost_usd 0.0 and agent.model null whatever it did (bin/lib/runhmd_attack.py: _verdict, and
+#       estimate_cost_usd returns 0.0): zero by construction, never metered, so never a cost basis.
+#       RP6 (real token accounting) is not built, so on this tree both numbers stay null.
+#       With a basis: usd_per_proven_pr = measured spend / PROVEN receipts among the measured ones;
+#       usd_per_real_bug = measured spend / real_bugs_caught (plan section 1: total cost over
+#       confirmed true-positive denials; both are local totals). An empty denominator is null,
+#       never 0/0.
+#   active_developers
+#       1 when this machine's store holds at least 3 receipts created in the trailing 7 days (plan
+#       section 1: an active developer ran at least 3 verifications in a week), else 0. A machine
+#       is one developer, and a verification that wrote no receipt is invisible here: a floor.
+#   partner_teams_active_weekly
+#       0: there is no local source for design-partner teams (the control plane would have one).
+#
+# EXIT CODES: 0 ok (every unmeasured case included), 2 usage error, 5 infrastructure (python3 or
+# the hmd libraries are missing, or the receipt schema is unusable).
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$SELF"; }
+die_usage() { echo "hmd metrics: $1 (see hmd metrics --help)" >&2; exit 2; }
+need_value() { [ -n "$2" ] || die_usage "$1 needs a non-empty directory"; }
+
+JSON=""; EVIDENCE=""
+RECEIPTS="${HMD_METRICS_RECEIPTS_DIR:-}"
+BENCH="${HMD_METRICS_BENCH_RESULTS_DIR:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)            JSON=1; shift ;;
+    --evidence)        EVIDENCE=1; shift ;;
+    --receipts)        [ $# -ge 2 ] || die_usage "--receipts needs a directory"; need_value --receipts "$2"; RECEIPTS="$2"; shift 2 ;;
+    --receipts=*)      need_value --receipts "${1#*=}"; RECEIPTS="${1#*=}"; shift ;;
+    --bench-results)   [ $# -ge 2 ] || die_usage "--bench-results needs a directory"; need_value --bench-results "$2"; BENCH="$2"; shift 2 ;;
+    --bench-results=*) need_value --bench-results "${1#*=}"; BENCH="${1#*=}"; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    -*)                die_usage "unknown option '$1'" ;;
+    *)                 die_usage "unexpected argument '$1'" ;;
+  esac
+done
+
+PY="$(command -v python3 || true)"
+if [ -z "$PY" ]; then
+  echo "hmd metrics: python3 is required (infrastructure error)" >&2
+  exit 5
+fi
+
+exec "$PY" - "$LIB_DIR" "$JSON" "$EVIDENCE" "$RECEIPTS" "$BENCH" <<'PYEOF'
+import datetime
+import json
+import math
+import os
+import signal
+import sys
+
+lib_dir, as_json, with_evidence, receipts_arg, bench_arg = sys.argv[1:6]
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `hmd metrics | head -3` ends quietly
+sys.path.insert(0, lib_dir)
+
+EXIT_INFRA = 5
+WINDOW_DAYS = 7
+ACTIVE_MIN_RECEIPTS = 3          # plan section 1: an active developer ran at least 3 verifications in a week
+RECEIPT_SCHEMA = "runhmd.receipt/1"
+
+
+def warn(message):
+    sys.stderr.write("hmd metrics: warning: %s\n" % message)
+
+
+def infra(message):
+    sys.stderr.write("hmd metrics: %s\n" % message)
+    sys.exit(EXIT_INFRA)
+
+
+try:
+    import fg_summary
+    import runhmd_receipt
+    import runhmd_schema
+except ImportError as exc:
+    infra("cannot load the hmd libraries from %s (%s): reinstall hmd" % (lib_dir, exc))
+
+
+# ── receipts ─────────────────────────────────────────────────────────────────────────────────
+def _no_constant(name):
+    raise ValueError("%s is not allowed in a receipt" % name)
+
+
+def load_receipt(path, name):
+    """The receipt in `path`, or None unless it is a runhmd.receipt/1 that satisfies its schema and is
+    filed under its own id (a copy under another name would otherwise be counted twice)."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(runhmd_receipt.MAX_RECEIPT_BYTES + 1)
+        if len(raw) > runhmd_receipt.MAX_RECEIPT_BYTES:
+            return None
+        doc = json.loads(raw.decode("utf-8"), parse_constant=_no_constant)
+        if not isinstance(doc, dict) or doc.get("schema") != RECEIPT_SCHEMA or runhmd_schema.validate(doc):
+            return None
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    return doc if name == doc["id"] + ".json" else None
+
+
+def read_receipts(store):
+    """(valid receipts, number of .json files skipped, store present). An absent store is unmeasured."""
+    if not os.path.isdir(store):
+        return [], 0, False
+    try:
+        names = sorted(n for n in os.listdir(store) if n.endswith(".json") and not n.startswith("."))
+    except OSError as exc:
+        warn("cannot read the receipt store %s: %s" % (store, exc))
+        return [], 0, False
+    loaded = [load_receipt(os.path.join(store, n), n) for n in names]
+    valid = [doc for doc in loaded if doc is not None]
+    skipped = len(loaded) - len(valid)
+    if skipped:
+        warn("skipped %d file(s) in %s that are not valid runhmd.receipt/1 documents filed under their own id" % (skipped, store))
+    return valid, skipped, True
+
+
+def created(doc):
+    return datetime.datetime.strptime(doc["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+
+
+# ── the false-green benchmark ────────────────────────────────────────────────────────────────
+def default_results_dir():
+    """Same rule as bin/lib/fg_bench.py: $FG_SUITE_DIR, else this install's suite, then /results."""
+    plugin = os.path.dirname(os.path.dirname(os.path.realpath(lib_dir)))
+    return os.path.join(os.environ.get("FG_SUITE_DIR") or os.path.join(plugin, "evals", "benchmark", "false-green"), "results")
+
+
+def is_confirmed_bug(row):
+    """A finding a human confirmed: the runhmd arm's DENIED verdict, labelled true_positive (the label
+    fg_summary.py counts for denial_precision)."""
+    return (row.get("schema") == "fg.run/1" and row.get("arm") == "runhmd"
+            and row.get("verdict") == "DENIED" and row.get("human_label") == "true_positive")
+
+
+def read_benchmark(results_dir):
+    """What the benchmark rows in `results_dir` measure. Study A fills the rates; Study B never does.
+    Absent or unreadable rows measure nothing (a warning says so when they exist but cannot be read)."""
+    found = {"dir": results_dir, "present": os.path.isdir(results_dir), "study_a_status": None, "headline_eligible": None,
+             "n_rated": None, "true_positives": 0, "false_green_rate": None, "catch_rate": None, "denial_precision": None}
+    if not found["present"]:
+        return found
+    try:
+        rows = fg_summary.load_rows(results_dir)
+        summary = fg_summary.summarize(rows)
+        study = summary["study_a"]
+        eligible = study["headline_eligible"]
+        found.update(
+            study_a_status=study["status"], headline_eligible=eligible, n_rated=study["denial_precision"]["n_rated"],
+            true_positives=sum(1 for row in rows if is_confirmed_bug(row)),
+            false_green_rate=study["pooled"]["false_green_rate"]["rate"] if eligible else None,
+            catch_rate=summary["catch_rate"] if eligible else None,
+            denial_precision=summary["denial_precision"])
+    except Exception as exc:  # untrusted rows feed the summarizer and any of them can break it; nothing is then measured
+        warn("cannot summarise the benchmark rows in %s (%s: %s): the benchmark numbers are unmeasured" % (results_dir, type(exc).__name__, exc))
+    return found
+
+
+# ── the numbers ──────────────────────────────────────────────────────────────────────────────
+def ratio(numerator, denominator):
+    """numerator / denominator to the receipt's own 4 decimal places, or None for an empty denominator (never 0/0)."""
+    return round(numerator / denominator, 4) if denominator else None
+
+
+def render_text(metrics, evidence):
+    rec, bench = evidence["receipts"], evidence["benchmark"]
+    lines = ["hmd metrics -- local data only (fleet-wide numbers need the control plane)", ""]
+    lines += ["  %-28s %s" % (key, "unmeasured" if value is None else value) for key, value in metrics.items()]
+    lines += ["", "sources"]
+    lines.append("  receipts   %s: %s" % (rec["dir"], "absent" if not rec["present"] else
+                "%d valid (%d in the last %d days), %d skipped, %d with a measured cost basis" % (
+                    rec["valid"], rec["in_window"], evidence["window_days"], rec["skipped"], rec["measured"])))
+    lines.append("  benchmark  %s: %s" % (bench["dir"], "absent" if not bench["present"] else
+                "Study A %s, %d confirmed true positives, %s findings rated" % (
+                    bench["study_a_status"] or "unreadable", bench["true_positives"], "?" if bench["n_rated"] is None else bench["n_rated"])))
+    sys.stdout.write("\n".join(lines) + "\n")
+
+
+def main():
+    store = receipts_arg or runhmd_receipt.store_dir()
+    receipts, skipped, present = read_receipts(store)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    since = now - datetime.timedelta(days=WINDOW_DAYS)
+    measured = [r for r in receipts if r["agent"]["model"] and r["cost_usd"] > 0]
+    usd_total = math.fsum(r["cost_usd"] for r in measured)
+    proven = sum(1 for r in measured if r["verdict"] == "PROVEN")
+    in_window = sum(1 for r in receipts if since <= created(r) <= now)
+    bench = read_benchmark(bench_arg or default_results_dir())
+    metrics = {
+        "false_green_rate": bench["false_green_rate"],
+        "catch_rate": bench["catch_rate"],
+        "denial_precision": bench["denial_precision"],
+        "real_bugs_caught": bench["true_positives"],
+        "usd_per_proven_pr": ratio(usd_total, proven) if measured else None,
+        "usd_per_real_bug": ratio(usd_total, bench["true_positives"]) if measured else None,
+        "active_developers": 1 if in_window >= ACTIVE_MIN_RECEIPTS else 0,
+        "partner_teams_active_weekly": 0,
+    }
+    evidence = {
+        "window_days": WINDOW_DAYS,
+        "receipts": {"dir": store, "present": present, "valid": len(receipts), "skipped": skipped, "in_window": in_window,
+                     "measured": len(measured), "usd_total_measured": round(usd_total, 4), "proven_measured": proven},
+        "benchmark": {key: bench[key] for key in ("dir", "present", "study_a_status", "headline_eligible", "n_rated", "true_positives")},
+    }
+    if as_json:
+        sys.stdout.write(json.dumps(dict(metrics, evidence=evidence) if with_evidence else metrics, separators=(",", ":")) + "\n")
+    else:
+        render_text(metrics, evidence)
+
+
+try:
+    main()
+except runhmd_schema.SchemaError as exc:
+    infra("the receipt schema is unusable (%s): reinstall hmd" % exc)
+PYEOF
