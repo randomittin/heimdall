@@ -16,6 +16,8 @@
 #                                           — bin/heimdall-render-version
 #   3. packages/runheimdall/package.json    — .version, .heimdall.tag, .heimdall.installScriptUrl
 #                                           — release/sync-release.sh
+#   3b. packages/runhmd/package.json        — the same three fields (the second npx wrapper)
+#                                           — release/sync-release.sh
 #   4. vercel.json /install redirect target — release/sync-release.sh
 #   5. _redirects  /install redirect target — release/sync-release.sh
 #   6. install.sh  DEFAULT_REF              — release/ship.sh bump_default_ref
@@ -200,6 +202,12 @@ NORM
   set_version "$TMP/packages/runheimdall/package.json" 2.0.5
   assert_red "runheimdall package.json .version=2.0.5" "runheimdall package.json drift"
 
+  # Mutant 2b — the SECOND wrapper drifts on its own. `npx runhmd` pins through its OWN
+  # package.json; if only runheimdall's is re-pointed, runhmd installs a stale hmd silently.
+  fresh_copy
+  set_version "$TMP/packages/runhmd/package.json" 2.0.5
+  assert_red "runhmd package.json .version=2.0.5" "runhmd package.json drift"
+
   # Mutants 3+4 — the SITE block, both directions. A site surface that is never proven
   # able to go red is exactly how the site drifted to v2.0.16 unnoticed. proof.html (not
   # index.html) carries the planted tag so ONLY the meta assertion is in play.
@@ -227,6 +235,15 @@ NORM
   sed "s#$TRUE_DIGEST#$BENT_DIGEST#g" "$TMP/README.md" > "$TMP/README.md.mut" \
     && mv "$TMP/README.md.mut" "$TMP/README.md"
   assert_red "README install digest bent by one character" "does NOT match the bytes it claims to describe"
+
+  # Mutant 6b — the digest in packages/runhmd/package.json ALONE is bent. Proves the new wrapper
+  # is covered by the by-shape digest discovery (surface 8) without a hardcoded file list: an
+  # `npx runhmd` that verifies a digest which is not install.sh's would refuse to install.
+  fresh_copy
+  MUT_SITE="$NO_SITE"
+  sed "s#$TRUE_DIGEST#$BENT_DIGEST#g" "$TMP/packages/runhmd/package.json" > "$TMP/packages/runhmd/package.json.mut" \
+    && mv "$TMP/packages/runhmd/package.json.mut" "$TMP/packages/runhmd/package.json"
+  assert_red "runhmd package.json digest bent by one character" "does NOT match the bytes it claims to describe"
 
   # Mutant 7 — two WELL-FORMED surfaces pinning different digests for the same ref. This is
   # the shipped defect's exact shape (README.md vs heimdall-site/netlify.toml), and it is
@@ -568,6 +585,33 @@ if [ -f "$PKG" ]; then
   fi
 else
   bad "packages/runheimdall/package.json missing"
+fi
+
+# ── 3b. packages/runhmd/package.json — the second npx wrapper ────────────────
+# `npx runhmd` verifies the SAME pinned install.sh through its OWN package.json, so it can drift
+# independently of runheimdall's — and a stale tag here makes `npx runhmd` install a stale hmd.
+# Its digest needs no assertion of its own: surface 8 discovers it by shape (a 64-hex token beside
+# an install URL), so it is held to the same ref-shape / cross-surface / digest-vs-bytes checks.
+PKG_HMD="$REPO/packages/runhmd/package.json"
+if [ -f "$PKG_HMD" ]; then
+  HMD_PKG_VER="$(read_version_field "$PKG_HMD")"
+  [ "$HMD_PKG_VER" = "$VER" ] \
+    && ok "runhmd package.json .version == plugin.json ($HMD_PKG_VER)" \
+    || bad "runhmd package.json drift: .version='$HMD_PKG_VER' != plugin.json='$VER'"
+
+  if command -v jq >/dev/null 2>&1; then
+    HMD_PKG_TAG="$(jq -r '.heimdall.tag // empty' "$PKG_HMD" 2>/dev/null)"
+    HMD_PKG_URL="$(jq -r '.heimdall.installScriptUrl // empty' "$PKG_HMD" 2>/dev/null)"
+    [ "$HMD_PKG_TAG" = "$TAG" ] \
+      && ok "runhmd .heimdall.tag == $TAG" \
+      || bad "runhmd .heimdall.tag drift: '$HMD_PKG_TAG' != '$TAG'"
+    case "$HMD_PKG_URL" in
+      */"$TAG"/install.sh) ok "runhmd .heimdall.installScriptUrl pinned to $TAG" ;;
+      *) bad "runhmd .heimdall.installScriptUrl drift: '$HMD_PKG_URL' is not pinned to $TAG" ;;
+    esac
+  fi
+else
+  bad "packages/runhmd/package.json missing"
 fi
 
 # ── 4/5. Vanity redirect targets (vercel.json + _redirects) ──────────────────

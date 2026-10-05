@@ -239,6 +239,7 @@ fi
 SURFACES=()
 [ -f "$REPO/README.md" ] && SURFACES+=("$REPO/README.md")
 [ -f "$REPO/packages/runheimdall/README.md" ] && SURFACES+=("$REPO/packages/runheimdall/README.md")
+[ -f "$REPO/packages/runhmd/README.md" ] && SURFACES+=("$REPO/packages/runhmd/README.md")
 if [ -d "$REPO/site" ]; then
   while IFS= read -r sf; do
     [ -n "$sf" ] && SURFACES+=("$sf")

@@ -8,8 +8,10 @@
 # byte-identical install.sh bytes (and a byte-identical README):
 #
 #   1. Redirect:  vercel.json + _redirects  -> raw .../<TAG>/install.sh  (302)
-#   2. npx wrap:  packages/runheimdall/package.json  ->  version, pinned URL,
-#                 tag, and the sha256 of THIS tag's install.sh
+#   2. npx wrap:  packages/runheimdall/package.json AND packages/runhmd/package.json
+#                 ->  version, pinned URL, tag, and the sha256 of THIS tag's
+#                 install.sh (one pin, two npm names — test/runhmd-parity.test.sh
+#                 gates that the two never disagree)
 #   3. Docs/ref:  README.md raw-URL tags + install.sh DEFAULT_REF
 #   4. npm docs:  packages/runheimdall/README.md  <-  root README.md
 #                 (byte-identical copy, taken AFTER step 3's URL templating,
@@ -45,6 +47,7 @@ REDIRECTS="$ROOT/_redirects"
 README="$ROOT/README.md"
 INSTALL="$ROOT/install.sh"
 PKG="$ROOT/packages/runheimdall/package.json"
+PKG_HMD="$ROOT/packages/runhmd/package.json"
 PKG_README="$ROOT/packages/runheimdall/README.md"
 MANIFEST="$ROOT/.claude-plugin/plugin.json"
 
@@ -104,7 +107,7 @@ if ! have jq; then
 fi
 
 # ── Preconditions ────────────────────────────────────────────────────────────
-for f in "$VERCEL" "$REDIRECTS" "$README" "$INSTALL" "$PKG" "$MANIFEST"; do
+for f in "$VERCEL" "$REDIRECTS" "$README" "$INSTALL" "$PKG" "$PKG_HMD" "$MANIFEST"; do
   [ -f "$f" ] || { echo "sync-release.sh: missing artifact: $f" >&2; exit 1; }
 done
 
@@ -184,15 +187,19 @@ T="$(mktemp)"
 cp "$README" "$T"
 write_file "$PKG_README" "$T"
 
-# 6. npx wrapper package.json: version, tag, url, sha256
-T="$(mktemp)"
-jq --arg v "$VERSION" --arg tag "$TAG" --arg url "$INSTALL_URL" --arg sha "$NEW_SHA" \
-   '.version = $v
-    | .heimdall.tag = $tag
-    | .heimdall.installScriptUrl = $url
-    | .heimdall.sha256 = $sha' \
-   "$PKG" > "$T"
-write_file "$PKG" "$T"
+# 6. npx wrapper package.json — BOTH wrappers, runheimdall and runhmd: version, tag, url, sha256.
+# One pin, two npm names: each is written from the SAME $TAG / $INSTALL_URL / $NEW_SHA, so they
+# cannot disagree about which install.sh they verify.
+for WRAPPER_PKG in "$PKG" "$PKG_HMD"; do
+  T="$(mktemp)"
+  jq --arg v "$VERSION" --arg tag "$TAG" --arg url "$INSTALL_URL" --arg sha "$NEW_SHA" \
+     '.version = $v
+      | .heimdall.tag = $tag
+      | .heimdall.installScriptUrl = $url
+      | .heimdall.sha256 = $sha' \
+     "$WRAPPER_PKG" > "$T"
+  write_file "$WRAPPER_PKG" "$T"
+done
 
 # 7. plugin manifest .version — bump to the release version so the manifest stays
 # consistent with the tag. The launcher's heimdall_version() resolves the tag
@@ -227,17 +234,23 @@ assert_eq() {
 if [ "$DRY" -eq 1 ]; then
   WRAP_SHA="$NEW_SHA"
   WRAP_URL="$INSTALL_URL"
+  HMD_SHA="$NEW_SHA"
+  HMD_URL="$INSTALL_URL"
   VERCEL_URL="$INSTALL_URL"
   REDIR_URL="$INSTALL_URL"
 else
   WRAP_SHA="$(jq -r '.heimdall.sha256' "$PKG")"
   WRAP_URL="$(jq -r '.heimdall.installScriptUrl' "$PKG")"
+  HMD_SHA="$(jq -r '.heimdall.sha256' "$PKG_HMD")"
+  HMD_URL="$(jq -r '.heimdall.installScriptUrl' "$PKG_HMD")"
   VERCEL_URL="$(jq -r '.redirects[] | select(.source=="/install") | .destination' "$VERCEL")"
   REDIR_URL="$(awk '$1=="/install"{print $2}' "$REDIRECTS")"
 fi
 
 assert_eq "wrapper sha256 == tag install.sh sha256" "$NEW_SHA" "$WRAP_SHA"
 assert_eq "wrapper url == redirect target"          "$INSTALL_URL" "$WRAP_URL"
+assert_eq "runhmd wrapper sha256 == tag install.sh sha256" "$NEW_SHA" "$HMD_SHA"
+assert_eq "runhmd wrapper url == redirect target"          "$INSTALL_URL" "$HMD_URL"
 assert_eq "vercel.json /install -> tag target"      "$INSTALL_URL" "$VERCEL_URL"
 assert_eq "_redirects /install -> tag target"       "$INSTALL_URL" "$REDIR_URL"
 
