@@ -7,7 +7,8 @@ the paired phone -- and a `decide` command, the phone's sealed DENY of a pending
 risky action (A4, deny-only round: see `_decide`; nothing else about an action can
 be decided from the phone, and "allow" is refused for every request) -- and, to an hmd that lists
 `push-v1`, the phone's sealed push registration (see PUSH REGISTRATION below) -- and, to an hmd that
-lists `login-v1`, the phone's sealed remote Claude Code login (see REMOTE CLAUDE CODE LOGIN below).
+lists `login-v1`, the phone's sealed remote Claude Code login (see REMOTE CLAUDE CODE LOGIN below) -- and, to
+an hmd that lists `view-v1`, the phone's sealed read-only `view` request: a file's diff (see READ-ONLY VIEWS below).
 
 Spawned by `bin/heimdall-app connect --relay <url>` as a sibling process to a
 local `hmd ui`; this process owns the ONE relay session for its lifetime and is
@@ -82,15 +83,17 @@ to drive its own UI; nothing else is ever written to stdout.
                                                        when it CHANGES. See FRAME
                                                        COMPRESSION AND RESYNC below
     {"event":"command","action":"send-message"|"decide"|"resync"|"register_push"|
-     "unregister_push"|"app_state"|"login_start"|"login_code"|"login_cancel"|..,
+     "unregister_push"|"app_state"|"login_start"|"login_code"|"login_cancel"|"view"|..,
      "ok":bool,"detail":..}
         one line per inbound command frame that reaches decrypted-payload
         handling (a `keepalive` control frame is always silent -- never
-        logged, not even at this level); any action other than the nine
+        logged, not even at this level); any action other than the ten
         named (the three login_* only while bin/lib/companion_cc_login.py
-        imported) is acked `not-implemented`. Never the token, ref or label
+        imported, view only while bin/lib/companion_view.py is) is acked
+        `not-implemented`. Never the token, ref or label
         of a push registration (see PUSH REGISTRATION below), never a login
-        command's params (see REMOTE CLAUDE CODE LOGIN below). A stale-seq
+        command's params (see REMOTE CLAUDE CODE LOGIN below), never a view's
+        path (see READ-ONLY VIEWS below). A stale-seq
         frame that is refused gets one too: action null, ok false, detail
         `non-increasing-seq` (see STALE-SEQ REFUSAL below)
     {"event":"ack_sent","of_seq":N,"seq":S,"id":..|null,"attempt":K,"ms":N,
@@ -270,8 +273,8 @@ ordinary ack frame: hmd's own next seq and nonce, sealed, delivered under the AC
 FRAME COMPRESSION AND RESYNC (the FINAL wire of hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md
 Ask 5, section 5; hmdapp's docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with
 it; codec in bin/lib/hmd_relay_e2e.py). Capabilities travel in-band, hmd first: EVERY `state`
-frame's plaintext is `{"state":{...},"caps":["login-v1","push-v1","resync","z-zlib"]}` (E2E.hmd_caps():
-`resync` always, `z-zlib` when this python can compress, and `login-v1` / `push-v1` only while their
+frame's plaintext is `{"state":{...},"caps":["login-v1","push-v1","resync","view-v1","z-zlib"]}` (E2E.hmd_caps():
+`resync` always, `z-zlib` when this python can compress, and `login-v1` / `view-v1` / `push-v1` only while their
 modules loaded -- push-v1 also only unless HMD_PUSH=0; see REMOTE CLAUDE CODE LOGIN and PUSH
 REGISTRATION below). A phone that sees `resync` sends a sealed command
 `{"action":"resync","params":{"last_seq":N,"digest":"<sha256
@@ -307,6 +310,21 @@ the manager's refusal code in `detail` (see _login_command). Off by default: the
 the laptop with `hmd app remote-login on`. The login code exists only inside the sealed command and one
 write to a PTY; the `command` event never carries params and the `login` event never carries the URL,
 the code or an account.
+
+READ-ONLY VIEWS (capability `view-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-cursor-parity.md CP5, the phone half in its
+src/views): `caps` also lists `view-v1` whenever bin/lib/companion_view.py imported. The phone's Files list seals
+    {"action":"view","params":{"rid":"v-9","kind":"diff","scope":"worktree","path":"src/a.ts"|null,"ctx":3,"max_bytes":131072}}
+and hmd acks {"ok":true,"of_seq":N,"id":"v-9"} or {"ok":false,"of_seq":N,"detail":<code>[,"retry_after_s":N]} -- code one of
+caps-missing, controls-off, rate-limited, bad-params, not-implemented, not-allowed, not-found, too-large, timeout. The answer
+is state.views = {"v":1,"enabled":bool,"kinds":["diff"],"result":null|{id,kind,at,truncated,bytes,files,hunks}}, sealed with
+the rest of the state and ONLY in the frames of a phone whose latest sealed resync listed `view-v1` (so only to the one paired
+device: the command itself opened under the latched session key); the newest result replaces the last, it is held in memory
+only, and it is dropped when the phone stops listing the cap or the device binds again. bin/lib/companion_view.py owns every
+rule (the path policy, the symlink refusal, the per-line secret mask, the size cuts, the 20/min limit, the kill switch
+HMD_UI_CONTROLS=0 / .heimdall/app/controls-disabled); this client owns the wire, and applies the relay's redaction profile
+(sentinels/hmd-ui.py _transport_redaction) to the result exactly as it is applied to the rest of the state. A request is
+answered whole on the stream thread (git is bounded to a few seconds), so there is never more than one in flight. The
+`command` event names the action only: never the path, never a line of the diff.
 
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
@@ -387,7 +405,8 @@ DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "compan
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
 PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "companion_push_store.py"))
 LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
-WS = _load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
+VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
+WS =_load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
 # envelope this client will POST to /session/:id/frames -- one named constant,
@@ -1119,6 +1138,7 @@ class RelayClient:
         self._state_failures = 0   # consecutive state POSTs that got no usable answer
         self.cache = None
         self._login = None         # the LoginManager, created on first use (see _login_manager)
+        self._views = None         # the ViewManager, created on first use (see _view_manager)
 
         # Pair by session code (PAIR BY SESSION CODE in the module docstring). Everything below stays idle --
         # state "off", nothing read from stdin -- unless --code was given.
@@ -1729,10 +1749,15 @@ class RelayClient:
         caps = E2E.normalize_caps(raw)
         if caps != self.device_caps:
             had_login = LOGIN is not None and LOGIN.CAP_LOGIN in self.device_caps
+            had_view = VIEW is not None and VIEW.CAP_VIEW in self.device_caps
             self.device_caps = caps
             emit({"event": "device_caps", "caps": sorted(caps)})
             if LOGIN is not None and LOGIN.CAP_LOGIN in caps and not had_login:
                 self._rearm_state()  # state.login rides only for a phone that lists login-v1: send it now
+            if VIEW is not None and (VIEW.CAP_VIEW in caps) != had_view:
+                if had_view and self._views is not None:
+                    self._views.forget()  # the phone stopped listing view-v1: what it asked for is not kept
+                self._rearm_state()  # state.views rides only for a phone that lists view-v1: send (or drop) it now
 
     def _resync(self, params):
         """The phone's `resync` command, sent to an hmd that listed `resync` in its state frames'
@@ -1869,7 +1894,7 @@ class RelayClient:
 
     def _feature_caps(self):
         """Capability tokens of the optional features whose modules loaded (added to the codec's own)."""
-        return [E2E.CAP_LOGIN] if LOGIN is not None else []
+        return ([E2E.CAP_LOGIN] if LOGIN is not None else []) + ([VIEW.CAP_VIEW] if VIEW is not None else [])
 
     def _login_command(self, action, params):
         """The phone's sealed login commands (spec 4.3):
@@ -1929,6 +1954,38 @@ class RelayClient:
         manager.sweep_orphan()
         threading.Thread(target=manager.run_probe_loop, args=(self.stop_event,), name="login-probe",
                          daemon=True).start()
+
+    # -- read-only views (view-v1) --------------------------------------------------------------------------------
+    # See READ-ONLY VIEWS in the module docstring. bin/lib/companion_view.py owns every rule; this is only its wire:
+    # the sealed `view` command, the state.views slice, and the redaction profile it is run through.
+    def _view_manager(self):
+        """The one ViewManager of this client, created on first use. The relay's redaction profile is established here and
+        a failure to establish it propagates: a view is never served unredacted."""
+        if self._views is None:
+            redact, strip_root = UI._transport_redaction(self.transport, self.root)
+            self._views = VIEW.ViewManager(self.root,
+                                           redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None,
+                                           max_slice_bytes=MAX_ENVELOPE_BYTES * 3 // 8, on_change=self._rearm_state)
+        return self._views
+
+    def _view_command(self, params):
+        """The phone's sealed `view` command (the contract is in companion_view.py): -> (ok, detail, extra) for the ack.
+        The path is in `params` and nowhere else: not in the `command` event, not in an error event."""
+        try:
+            return self._view_manager().handle(params, VIEW.CAP_VIEW in self.device_caps)
+        except Exception as e:  # the type only: a message could hold what the phone sent
+            emit({"event": "error", "detail": "view command failed: %s" % type(e).__name__})
+            return False, "internal-error", {}
+
+    def _views_overlay(self, state):
+        """`state` plus state.views for a phone that listed view-v1 -- as a copy, like _login_overlay, and for the same reason."""
+        if VIEW is None or VIEW.CAP_VIEW not in self.device_caps:
+            return state
+        try:
+            return dict(state, views=self._view_manager().snapshot())
+        except Exception as e:
+            emit({"event": "error", "detail": "state.views skipped: %s" % type(e).__name__})
+            return state
 
     def _refuse_stale_seq(self, env, seq, ack_deadline):
         """Answer a command frame the replay guard just rejected (see STALE-SEQ REFUSAL in the module docstring):
@@ -2006,6 +2063,8 @@ class RelayClient:
             ok, detail, extra = self._decide(params)
         elif LOGIN is not None and action in LOGIN.ACTIONS:
             ok, detail, extra = self._login_command(action, params)
+        elif VIEW is not None and action == "view":
+            ok, detail, extra = self._view_command(params)
         elif action == "resync":
             ok, detail = self._resync(params)
         elif action == "register_push":
@@ -2360,7 +2419,7 @@ class RelayClient:
         if digest == self.last_sent_digest:
             return
         rearm_gen = self._rearm_gen
-        seq, delivered = self.send_hmd_frame("state", {"state": self._login_overlay(state)})
+        seq, delivered = self.send_hmd_frame("state", {"state": self._views_overlay(self._login_overlay(state))})
         if delivered is None:
             # No usable answer: the frame never reached the phone. last_sent_digest
             # stays as it was, so the next tick sends the (then current) state again
