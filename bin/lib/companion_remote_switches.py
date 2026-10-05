@@ -5,10 +5,12 @@ them is bin/lib/companion_ui_controls.py; this module is what it asks, and the c
 
     $HEIMDALL_HOME/remote-launch.json   {"enabled": bool, "since": "<iso>"}   the launch switch   (off unless a person flipped it)
     $HEIMDALL_HOME/remote-merge.json    {"enabled": bool, "since": "<iso>"}   the merge switch    (a separate decision)
-    $HEIMDALL_HOME/.heimdall/app/launch-allowlist.json  (0600)
+    $HEIMDALL_HOME/app/launch-allowlist.json  (0600, in a 0700 directory)
         [{"id": "r-3fa9", "label": "heimdall", "path": "<abs, never sent to the phone>", "merge": false}]
         id = "r-" + the first 4 hex of sha256 of the REALPATH; the path is realpath'd when it is added and re-checked on
         every use (a symlink swapped in since => the entry is not usable); only a repo added with --merge can receive pr-merge.
+        Laptop-wide like the two switches, so it sits directly under $HEIMDALL_HOME (~/.heimdall/app/ by default), never under
+        a second .heimdall inside it (that name belongs to a repo's own <repo>/.heimdall/).
 
     hmd app remote-launch on|off|status [--repo DIR]     (bin/heimdall-app delegates here: python3 <this file> remote-launch ...)
     hmd app remote-merge  on|off|status [--repo DIR]
@@ -47,8 +49,8 @@ SWITCHES = {"launch": "remote-launch.json", "merge": "remote-merge.json"}
 CLI_SWITCH = {"remote-launch": "launch", "remote-merge": "merge"}
 SWITCH_WORDS = {"launch": "remote launch", "merge": "remote merge"}
 SWITCH_MAX_BYTES = 4096
-ALLOWLIST_REL = os.path.join(".heimdall", "app", "launch-allowlist.json")
-ALLOWLIST_LOCK_REL = os.path.join(".heimdall", "app", "launch-allowlist.lock")
+ALLOWLIST_REL = os.path.join("app", "launch-allowlist.json")
+ALLOWLIST_LOCK_REL = os.path.join("app", "launch-allowlist.lock")
 ALLOWLIST_MAX_BYTES = 65536
 ALLOWLIST_MAX_ENTRIES = 32
 LABEL_MAX = 32

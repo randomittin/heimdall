@@ -104,6 +104,28 @@
 #                              signed in now (masked), its config directory and
 #                              the last result. Delegates to
 #                              bin/lib/companion_cc_login.py.
+#   hmd app remote-launch on|off|status [--repo DIR]
+#   hmd app remote-merge  on|off|status [--repo DIR]
+#   hmd app launch-allow <repo-path> [--merge] | --remove <id> | --list
+#                              The laptop-side safeguards for the phone's `expand`
+#                              actions (start a Claude Code session in a repo, merge
+#                              a pull request). Each switch is off until a person
+#                              turns it on, and an action only reaches a repo on the
+#                              launch allowlist (only one added with --merge can be
+#                              merged). `on` and `launch-allow <repo-path>` refuse
+#                              unless stdin is a terminal -- an agent's shell, a
+#                              script and the phone have none -- and `on` also
+#                              refuses under HMD_UI_CONTROLS=0 or where the repo's
+#                              controls-disabled file exists. `off`, `status`,
+#                              `--list` and `--remove` only reduce or read, so they
+#                              need no terminal. State, all 0600:
+#                              $HEIMDALL_HOME/remote-launch.json,
+#                              $HEIMDALL_HOME/remote-merge.json and
+#                              $HEIMDALL_HOME/app/launch-allowlist.json (the phone is
+#                              shown an id and a label, never a path). `hmd app
+#                              status` prints one `remote:` line with both switches
+#                              and the allowlist size. Delegates to
+#                              bin/lib/companion_remote_switches.py.
 #   hmd app controls on|off|status [--repo DIR]
 #                              The paired phone's remote controls (capability
 #                              controls-v1: interrupt, save-checkpoint, hook-toggle,
@@ -1388,6 +1410,9 @@ cmd_status() {
   if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_ui_controls.py" ]; then
     "$PY3" "$LIB_DIR/companion_ui_controls.py" status-line --repo "$REPO" 2>/dev/null
   fi
+  if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_remote_switches.py" ]; then
+    "$PY3" "$LIB_DIR/companion_remote_switches.py" status-line --repo "$REPO" 2>/dev/null
+  fi
 
   [ "$orphaned" = true ] && return 1
   return 0
@@ -1484,6 +1509,9 @@ cmd_status_relay() {
   if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_ui_controls.py" ]; then
     "$PY3" "$LIB_DIR/companion_ui_controls.py" status-line --repo "$REPO" 2>/dev/null
   fi
+  if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_remote_switches.py" ]; then
+    "$PY3" "$LIB_DIR/companion_remote_switches.py" status-line --repo "$REPO" 2>/dev/null
+  fi
   return 0
 }
 
@@ -1493,6 +1521,20 @@ cmd_remote_login() {
     return 2
   fi
   "$PY3" "$LIB_DIR/companion_cc_login.py" "$@"
+}
+
+# cmd_remote_switches: `hmd app remote-launch|remote-merge|launch-allow ...` -- see the usage block above. $1 is the subcommand
+# as typed; everything else is bin/lib/companion_remote_switches.py's, its refusals and its exit code included. stdin is left
+# exactly as the caller had it: that script's terminal check ("only a person at a terminal may widen what the phone can do")
+# is the whole point, so nothing here may redirect or replace it.
+cmd_remote_switches() {
+  local sub="$1"
+  shift
+  if [ -z "$PY3" ]; then
+    echo "hmd app $sub: python3 not found (set HMD_PYTHON=/path/to/python3)" >&2
+    return 2
+  fi
+  "$PY3" "$LIB_DIR/companion_remote_switches.py" "$sub" "$@"
 }
 
 # cmd_controls: `hmd app controls on|off|status [--repo DIR]` -- the kill switch for the phone's remote controls (see the
@@ -1933,6 +1975,7 @@ case "$CMD" in
   disconnect) cmd_disconnect "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;
   remote-login) cmd_remote_login "$@"; exit $? ;;
+  remote-launch|remote-merge|launch-allow) cmd_remote_switches "$CMD" "$@"; exit $? ;;
   controls) cmd_controls "$@"; exit $? ;;
   push-test) cmd_push_test "$@"; exit $? ;;
   *)
