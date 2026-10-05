@@ -66,11 +66,18 @@ options:
   --yes, -y         consent without a prompt (required when stdin is not a terminal)
   --max-usd N       refuse to run when the estimated cost exceeds N dollars (exit 4)
   --no-network      guarantee no network use (the built-in engine never uses the network)
-  --no-upload       do not upload a receipt (this build never uploads one)
+  --receipt         issue a signed receipt (runhmd.receipt/1) for each verdict and set receipt_url to its
+                    address; needs a signing key (hmd receipt keygen, RUNHMD_RECEIPT_KEY_FILE)
+  --public          mark the receipt public: the only kind `hmd receipt render` publishes (needs --receipt)
+  --no-upload       with --receipt, do not publish it: receipt_url stays null (it is still stored locally)
   --out DIR         write verdict.json and attacks/f-NNNN.json evidence into DIR
   --batch FILE      attack every target listed in FILE (one per line, # comments); needs --out
   --diff SPEC       attack a diff: NOT SUPPORTED in this build (arrives with the gitdiff adapter)
   -h, --help        this text
+
+receipts: with --receipt the receipt is stored as <id>.json under $RUNHMD_RECEIPT_DIR (default
+$HEIMDALL_HOME/runhmd/receipts) and receipt_url is https://runhmd.dev/r/<id> (RUNHMD_RECEIPT_BASE_URL
+moves it). The URL resolves once the receipt is published (hmd receipt render); see hmd receipt --help.
 
 exit codes:
   0  PROVEN: no attack broke the target
@@ -109,6 +116,8 @@ def _parser():
     p.add_argument("--max-usd", dest="max_usd")
     p.add_argument("--no-network", action="store_true")
     p.add_argument("--no-upload", action="store_true")
+    p.add_argument("--receipt", action="store_true")
+    p.add_argument("--public", action="store_true")
     p.add_argument("--out")
     p.add_argument("--batch")
     p.add_argument("--diff")
@@ -208,7 +217,7 @@ def _run_gate(target, work):
     return report, None
 
 
-def _verdict(report, ref, started, evidence_prefix):
+def _verdict(report, ref, started, evidence_prefix, tree):
     metrics = report["metrics"]
     repro = "hmd attack %s --json --yes" % shlex.quote(ref)
     findings = []

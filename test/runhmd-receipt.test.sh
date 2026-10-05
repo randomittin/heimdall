@@ -1054,6 +1054,187 @@ rcpt render --store "$TMP/h-no-such-store" --pubkey "$HPUB" --out "$TMP/h-site-e
 [ "$RRC" -eq 0 ] && jq -e '.ok==true and .rendered==[]' "$ROUT" >/dev/null 2>&1 && ok "render over an empty or missing store succeeds with nothing rendered" || bad "render over a missing store (rc=$RRC)"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════════
+# [A] ATTACK — `hmd attack --receipt` issues a receipt and populates receipt_url
+# ══════════════════════════════════════════════════════════════════════════════
+if section A; then
+echo "[A] hmd attack --receipt"
+
+AK="$TMP/a-keys"; AS="$TMP/a-store"
+# attack <args...>: from the repo root, stdin from /dev/null; sets AOUT AERR ARC (the env is the caller's)
+attack() { AOUT="$TMP/attack.out"; AERR="$TMP/attack.err"; (cd "$REPO" && "$HMD" attack "$@" </dev/null >"$AOUT" 2>"$AERR"); ARC=$?; }
+rcpt keygen --dir "$AK" >/dev/null
+export RUNHMD_RECEIPT_KEY_FILE="$AK/runhmd-receipt.key" RUNHMD_RECEIPT_PUBKEY_FILE="$AK/runhmd-receipt.pub" RUNHMD_RECEIPT_DIR="$AS"
+BUGGY=fixtures/attack/buggy-webhook; CLEAN=fixtures/attack/clean-sample
+
+echo "  -- opt-in: without --receipt nothing changes --"
+attack $BUGGY --json --yes
+[ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .receipt_url==null' "$AOUT" >/dev/null 2>&1 && [ ! -e "$AS" ] && ! grep -qi receipt "$AERR" \
+  && ok "no --receipt: receipt_url stays null, no store is created, a configured key is not touched (a signing key in the environment is not consent to write)" || bad "default attack changed (rc=$ARC, store exists: $([ -e "$AS" ] && echo yes || echo no))"
+
+echo "  -- --receipt on a DENIED target --"
+attack $BUGGY --json --yes --receipt; cp "$AOUT" "$TMP/a.denied.json"; DRC=$ARC; cp "$AERR" "$TMP/a.denied.err"
+AID="$(jq -r .id "$TMP/a.denied.json")"
+[ "$DRC" -eq 1 ] && ok "the exit code is still the verdict's (DENIED = 1) when a receipt is issued" || bad "exit code with --receipt is $DRC, want 1"
+python3 "$SCHEMA_PY" validate "$TMP/a.denied.json" >/dev/null 2>"$TMP/a.err" && ok "the verdict with a populated receipt_url still validates against runhmd.verdict/1" || bad "verdict with receipt_url invalid: $(head -2 "$TMP/a.err" | tr '\n' '|')"
+[ "$(jq -r .receipt_url "$TMP/a.denied.json")" = "https://runhmd.dev/r/$AID" ] && ok "receipt_url is https://runhmd.dev/r/<verdict id>" || bad "receipt_url is '$(jq -r .receipt_url "$TMP/a.denied.json")'"
+[ -f "$AS/$AID.json" ] && grep -q "receipt: $AS/$AID.json" "$TMP/a.denied.err" && ok "the receipt is stored as <store>/<id>.json and its path is reported on stderr (stdout stays pure JSON)" || bad "receipt file or stderr note missing"
+check "stdout is still exactly one JSON value" jq -e -s 'length==1' "$TMP/a.denied.json"
+rcpt verify "$AID"
+[ "$RRC" -eq 0 ] && grep -q "^ok $AID DENIED" "$ROUT" && ok "hmd receipt verify <id> accepts the receipt the attack just issued" || bad "verify of the issued receipt (rc=$RRC: $(head -c 200 "$RERR"))"
+cat >"$TMP/a-check.py" <<'PY'
+import hashlib, json, os, sys
+verdict_path, receipt_path, target, plugin_json = sys.argv[1:5]
+verdict = json.load(open(verdict_path)); raw = open(receipt_path, "rb").read(); r = json.loads(raw)
+out = []
+def case(desc, cond, detail=""):
+    out.append(("PASS " if cond else "FAIL ") + desc + ("" if cond or not detail else ": " + str(detail)))
+def canon(o):
+    def norm(v):
+        if isinstance(v, float) and v == int(v): return int(v)
+        if isinstance(v, dict): return {k: norm(x) for k, x in v.items()}
+        if isinstance(v, list): return [norm(x) for x in v]
+        return v
+    return json.dumps(norm(o), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+def tree_digest(path):
+    d = hashlib.sha256()
+    if os.path.isfile(path):
+        d.update(b"file\0" + open(path, "rb").read()); return d.hexdigest()
+    for root, dirs, files in os.walk(path, followlinks=False):
+        dirs[:] = sorted(x for x in dirs if x not in (".git", "node_modules"))
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            if os.path.islink(full): continue
+            d.update(os.path.relpath(full, path).encode("utf-8", "replace") + b"\0"); d.update(open(full, "rb").read()); d.update(b"\0")
+    return d.hexdigest()
+case("receipt id, verdict, attacks and agent are the verdict's", (r["id"], r["verdict"], r["attacks"], r["agent"]) == (verdict["id"], verdict["verdict"], verdict["attacks"], verdict["agent"]))
+case("receipt cost and duration are the verdict's", (r["cost_usd"], r["duration_s"]) == (verdict["cost_usd"], verdict["duration_s"]), (r["cost_usd"], r["duration_s"]))
+case("subject = path + the git head + the INDEPENDENTLY computed sha256 of the attacked tree",
+     r["subject"] == {"kind": "path", "head_sha": verdict["target"]["head_sha"], "tree_sha256": tree_digest(target)}, r["subject"])
+case("each finding is id/title/severity/category plus sha256 of the verdict's own finding (computed independently)",
+     [(f["id"], f["title"], f["severity"], f["category"], f["digest"]) for f in r["findings"]]
+     == [(f["id"], f["title"], f["severity"], f["category"], "sha256:" + hashlib.sha256(canon(f)).hexdigest()) for f in verdict["findings"]])
+committed = dict(verdict, receipt_url=None)
+case("verdict_sha256 = sha256 of the canonical verdict with receipt_url null (independently computed)", r["verdict_sha256"] == hashlib.sha256(canon(committed)).hexdigest())
+leaks = [s for s in (b"minimal_input", b"deliveries", b"repro_cmd", b"counterexample", b"hmd attack", target.encode(), b"fixtures/attack") if s in raw]
+case("no counterexample text, repro command or path reached the receipt", not leaks, leaks)
+case("tool is hmd at the manifest version", r["tool"] == {"name": "hmd", "version": json.load(open(plugin_json))["version"]})
+case("a receipt issued with no further flag is private", r["visibility"] == "private")
+print("\n".join(out))
+PY
+python3 "$TMP/a-check.py" "$TMP/a.denied.json" "$AS/$AID.json" "$REPO/$BUGGY" "$REPO/.claude-plugin/plugin.json" >"$TMP/a-check.out" 2>"$TMP/a-check.err"
+while IFS= read -r line; do case "$line" in "PASS "*) ok "${line#PASS }" ;; "FAIL "*) bad "${line#FAIL }" ;; esac; done <"$TMP/a-check.out"
+[ -s "$TMP/a-check.out" ] || bad "the attack/receipt cross-check produced nothing: $(tail -3 "$TMP/a-check.err" | tr '\n' '|')"
+
+echo "  -- RP3 acceptance: tamper with the stored receipt --"
+cp "$AS/$AID.json" "$TMP/a-original.json"
+size="$(wc -c <"$AS/$AID.json" | tr -d ' ')"
+for off in 3 $((size/3)) $((size/2)) $((size-80)) $((size-2)); do
+  cp "$TMP/a-original.json" "$AS/$AID.json"
+  python3 -c 'import sys; p,i=sys.argv[1],int(sys.argv[2]); b=bytearray(open(p,"rb").read()); b[i]^=1; open(p,"wb").write(b)' "$AS/$AID.json" "$off"
+  rcpt verify "$AID"
+  [ "$RRC" -eq 1 ] && ok "edit one byte (offset $off) of the stored receipt: 'hmd receipt verify $AID' exits 1" || bad "tampered stored receipt at offset $off not rejected (rc=$RRC)"
+done
+cp "$TMP/a-original.json" "$AS/$AID.json"
+rcpt verify "$AID"; [ "$RRC" -eq 0 ] && ok "control: the restored receipt verifies again" || bad "restored receipt (rc=$RRC)"
+
+echo "  -- PROVEN, card, flags --"
+attack $CLEAN --json --yes --receipt; cp "$AOUT" "$TMP/a.proven.json"; PRC=$ARC
+PID="$(jq -r .id "$TMP/a.proven.json")"
+[ "$PRC" -eq 0 ] && jq -e --arg u "https://runhmd.dev/r/$PID" '.verdict=="PROVEN" and .receipt_url==$u' "$TMP/a.proven.json" >/dev/null 2>&1 && ok "PROVEN: exit 0 and receipt_url populated" || bad "PROVEN with receipt (rc=$PRC)"
+rcpt verify "$PID" --json
+jq -e '.ok==true and .verdict=="PROVEN"' "$ROUT" >/dev/null 2>&1 && jq -e '.findings==[]' "$AS/$PID.json" >/dev/null 2>&1 && ok "the PROVEN receipt verifies and carries no findings" || bad "PROVEN receipt (rc=$RRC)"
+attack $CLEAN --yes --receipt
+grep -q "VERDICT: PROVEN" "$AOUT" && grep -q "Evidence → runhmd.dev/r/$PID" "$AOUT" && grep -q "receipt: $AS/$PID.json" "$AERR" \
+  && ok "the card shows 'Evidence → runhmd.dev/r/<id>' only now that a receipt exists, and the file path is on stderr" || bad "card with receipt (rc=$ARC: $(cat "$AOUT" | tail -4 | tr '\n' '|'))"
+attack $CLEAN --yes
+! grep -q "Evidence" "$AOUT" && ok "without --receipt the card has no Evidence line (nothing is invented)" || bad "an Evidence line appeared without a receipt"
+attack $CLEAN --json --yes --receipt --no-upload
+jq -e '.receipt_url==null' "$AOUT" >/dev/null 2>&1 && [ -f "$AS/$PID.json" ] && ok "--receipt --no-upload: the receipt is issued locally and receipt_url stays null (RP1: null when --no-upload)" || bad "--no-upload (rc=$ARC)"
+attack $CLEAN --json --yes --receipt --public
+jq -e '.visibility=="public"' "$AS/$PID.json" >/dev/null 2>&1 && ok "--receipt --public issues a public receipt (the only kind 'hmd receipt render' publishes)" || bad "--public receipt"
+attack $CLEAN --json --yes --receipt
+jq -e '.visibility=="private"' "$AS/$PID.json" >/dev/null 2>&1 && [ "$(ls "$AS" | grep -c "^$PID")" = "1" ] && ok "re-attacking the same tree replaces its receipt (one file per id) and goes back to private" || bad "re-attack did not replace the receipt"
+attack $CLEAN --json --yes --receipt --public --out "$TMP/a-out"
+[ "$(jq -r .receipt_url "$TMP/a-out/verdict.json")" = "https://runhmd.dev/r/$PID" ] && python3 "$SCHEMA_PY" validate "$TMP/a-out/verdict.json" >/dev/null 2>&1 \
+  && ok "--out DIR: the verdict.json written to disk carries receipt_url too" || bad "--out verdict.json lacks the receipt_url"
+RUNHMD_RECEIPT_BASE_URL="https://receipts.example.test/team/" attack $CLEAN --json --yes --receipt
+[ "$(jq -r .receipt_url "$AOUT")" = "https://receipts.example.test/team/r/$PID" ] && ok "RUNHMD_RECEIPT_BASE_URL moves the URL" || bad "base URL override (url=$(jq -r .receipt_url "$AOUT"))"
+printf '%s\n%s\n' "$BUGGY" "$CLEAN" >"$TMP/a-targets.txt"; rm -rf "$AS"
+attack --batch "$TMP/a-targets.txt" --out "$TMP/a-batch" --json --yes --receipt
+[ "$ARC" -eq 1 ] && [ "$(jq -r 'select(.receipt_url!=null)|.id' "$AOUT" | wc -l | tr -d ' ')" = "2" ] && [ "$(ls "$AS" | wc -l | tr -d ' ')" = "2" ] \
+  && ok "--batch --receipt: each target gets its receipt and receipt_url (2 receipts in the store)" || bad "batch receipts (rc=$ARC, store: $(ls "$AS" 2>/dev/null | tr '\n' ' '))"
+for f in "$AS"/*.json; do rcpt verify "$f"; [ "$RRC" -eq 0 ] || { bad "batch receipt $f does not verify"; break; }; done
+
+echo "  -- refusals happen before any work, and never half-succeed --"
+HEIMDALL_HOME="$TMP/a-empty-home" RUNHMD_RECEIPT_KEY_FILE="" attack $BUGGY --json --receipt
+[ "$ARC" -eq 2 ] && jq -e '.error=="no_signing_key" and (has("verdict")|not)' "$AOUT" >/dev/null 2>&1 \
+  && ok "--receipt with no signing key: exit 2 (no_signing_key) even without --yes, no verdict, nothing run (a receipt is never silently skipped)" || bad "no signing key (rc=$ARC: $(head -c 200 "$AOUT"))"
+cp "$AK/runhmd-receipt.key" "$TMP/a-loose.key"; chmod 644 "$TMP/a-loose.key"
+RUNHMD_RECEIPT_KEY_FILE="$TMP/a-loose.key" attack $BUGGY --json --yes --receipt
+[ "$ARC" -eq 2 ] && jq -e '.error=="insecure_key_file"' "$AOUT" >/dev/null 2>&1 && ok "a signing key other users can read is refused (exit 2)" || bad "loose key (rc=$ARC)"
+attack $BUGGY --yes --public
+[ "$ARC" -eq 2 ] && grep -q -- '--receipt' "$AERR" && [ ! -s "$AOUT" ] && ok "--public without --receipt is a usage error (exit 2) that names --receipt" || bad "--public alone (rc=$ARC)"
+for base in "http://runhmd.dev" "https://" "ftp://x.test" "https://x.test/?q=1"; do
+  RUNHMD_RECEIPT_BASE_URL="$base" attack $CLEAN --json --yes --receipt
+  [ "$ARC" -eq 2 ] && jq -e '.error=="bad_base_url"' "$AOUT" >/dev/null 2>&1 && ok "RUNHMD_RECEIPT_BASE_URL=$base is refused before the attack runs (exit 2)" || bad "bad base $base (rc=$ARC)"
+done
+touch "$TMP/a-afile"
+RUNHMD_RECEIPT_DIR="$TMP/a-afile/store" attack $BUGGY --json --yes --receipt
+[ "$ARC" -eq 5 ] && jq -e '.error=="receipt_failed" and (has("verdict")|not)' "$AOUT" >/dev/null 2>&1 \
+  && ok "a store that cannot be written is exit 5 (receipt_failed) and NO verdict is printed: no URL that points at nothing" || bad "unwritable store (rc=$ARC: $(head -c 200 "$AOUT"))"
+attack $CLEAN --yes --receipt --max-usd 0.50 --no-network
+[ "$ARC" -eq 0 ] && ok "--receipt composes with --max-usd and --no-network" || bad "--receipt with other flags (rc=$ARC)"
+
+echo "  -- isolation: the receipt store is the only place --receipt writes --"
+mkdir -p "$TMP/a-iso/h" "$TMP/a-iso/heimdall" "$TMP/a-iso/tmp"; rm -rf "$TMP/a-iso/store"
+git_before="$(git -C "$REPO" status --porcelain)"
+( cd "$REPO" && HOME="$TMP/a-iso/h" HEIMDALL_HOME="$TMP/a-iso/heimdall" TMPDIR="$TMP/a-iso/tmp" RUNHMD_RECEIPT_DIR="$TMP/a-iso/store" "$HMD" attack $BUGGY --json --yes --receipt >/dev/null 2>&1 )
+[ -z "$(ls -A "$TMP/a-iso/h")" ] && [ -z "$(ls -A "$TMP/a-iso/tmp")" ] && [ "$git_before" = "$(git -C "$REPO" status --porcelain)" ] && [ "$(ls "$TMP/a-iso/store" | wc -l | tr -d ' ')" = "1" ] \
+  && ok "HOME untouched, TMPDIR left empty, the repo tree untouched; exactly one new file, the receipt" || bad "--receipt wrote outside the store: home=[$(ls -A "$TMP/a-iso/h")] tmp=[$(ls -A "$TMP/a-iso/tmp")]"
+unset RUNHMD_RECEIPT_KEY_FILE RUNHMD_RECEIPT_PUBKEY_FILE RUNHMD_RECEIPT_DIR
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [D] DOCS — dispatch, inventory, and the documented `hmd prove` call site
+# ══════════════════════════════════════════════════════════════════════════════
+if section D; then
+echo "[D] dispatch, inventory, docs, the hmd prove call site"
+grep -Eq '^  receipt\)' "$REPO/bin/heimdall" && ok "bin/heimdall has a receipt) dispatch arm" || bad "bin/heimdall has no receipt) arm"
+[ -x "$RECEIPT_BIN" ] && ok "bin/heimdall-receipt is executable" || bad "bin/heimdall-receipt is not executable"
+bash -n "$REPO/bin/heimdall" && ok "bin/heimdall still passes bash -n" || bad "bin/heimdall has a syntax error"
+grep -qx 'receipt' "$REPO/packages/runhmd/subcommands.txt" && ok "packages/runhmd/subcommands.txt lists receipt (npx runhmd receipt ... reaches hmd, not 'attack receipt')" || bad "subcommands.txt does not list receipt"
+grep -q '`heimdall-receipt`' "$REPO/docs/INVENTORY.md" && ok "docs/INVENTORY.md lists heimdall-receipt" || bad "INVENTORY.md does not list heimdall-receipt"
+DOC="$REPO/docs/RECEIPTS.md"
+[ -f "$DOC" ] && ok "docs/RECEIPTS.md exists" || bad "docs/RECEIPTS.md is missing"
+for need in RUNHMD_RECEIPT_KEY_FILE RUNHMD_RECEIPT_PUBKEY_FILE "release/runhmd-receipt.pub" "release/heimdall-signing.pub" "hmd receipt keygen" "hmd receipt render" "Wiring hmd prove" "issue_receipt" "verdict_digest" "runhmd.prove/1" "RC2" "POST /api/receipts" "runhmd.dev"; do
+  grep -qF -- "$need" "$DOC" 2>/dev/null && ok "docs/RECEIPTS.md covers: $need" || bad "docs/RECEIPTS.md does not mention: $need"
+done
+grep -q "hmd prove" "$PYLIB/runhmd_receipt.py" && grep -q "def issue_receipt" "$PYLIB/runhmd_receipt.py" && ok "the module docstring names hmd prove's call site and issue_receipt exists" || bad "prove call site not documented in runhmd_receipt.py"
+python3 - "$PYLIB" <<'PY' >"$TMP/prove-site.out" 2>&1
+import inspect, sys
+sys.path.insert(0, sys.argv[1])
+import runhmd_receipt as rr
+params = inspect.signature(rr.issue_receipt).parameters
+need = {"signer", "id", "verdict", "subject", "attacks", "findings", "agent", "cost_usd", "duration_s", "verdict_sha256", "gates", "regression_tests"}
+assert need <= set(params), sorted(need - set(params))
+assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values()), "issue_receipt must be keyword-only"
+print("prove-site-ok")
+PY
+grep -q prove-site-ok "$TMP/prove-site.out" && ok "issue_receipt takes keyword-only gates/regression_tests: the fields a runhmd.prove/1 document supplies" || bad "issue_receipt signature: $(tail -2 "$TMP/prove-site.out" | tr '\n' '|')"
+python3 - "$PYLIB" <<'PY' >"$TMP/lazy.out" 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import runhmd_attack
+loaded = [m for m in ("cp_auth", "runhmd_receipt", "runhmd_receipt_site", "http.server", "socket") if m in sys.modules]
+assert not loaded, loaded
+print("lazy-ok")
+PY
+grep -q lazy-ok "$TMP/lazy.out" && ok "importing the attack CLI loads no crypto, receipt, server or socket module (the default path stays light and offline)" || bad "attack imports too much: $(tail -2 "$TMP/lazy.out" | tr '\n' '|')"
+"$HMD" attack --help 2>/dev/null | grep -q -- '--receipt' && "$HMD" attack --help 2>/dev/null | grep -q -- '--public' && ok "hmd attack --help documents --receipt and --public" || bad "attack --help does not document --receipt/--public"
+[ ! -s "$HEIMDALL_TRACE_ORDER" ] && ok "nothing in this suite fell through to the Claude task-prompt path" || bad "fell through to the task-prompt path: $(head -c 200 "$HEIMDALL_TRACE_ORDER")"
+fi
+
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
