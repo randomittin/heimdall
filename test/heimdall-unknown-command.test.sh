@@ -87,6 +87,17 @@ make_stub heimdall-team
 make_stub heimdall-hooks
 make_stub heimdall-weekly-log
 
+# The launcher activates project skills before a launch and restores them in its EXIT
+# trap. A real install always has bin/skill-manager; without one the trap's last test
+# returns 1 and replaces an otherwise-0 exit status (a launcher quirk this suite is not
+# about). Stubbing it keeps the sandbox a faithful install, so "launched => exit 0" holds.
+cat > "$FAKE/bin/skill-manager" <<'EOF'
+#!/bin/sh
+[ "$1" = "restore-file" ] && echo "${TMPDIR:-/tmp}/skill-restore-stub"
+exit 0
+EOF
+chmod +x "$FAKE/bin/skill-manager"
+
 # run ENTRY [ARGS...] -- run the launcher in the sandbox. Sets RC; stdout/stderr land
 # in $OUT/$ERR; $CLAUDE_LOG holds every claude invocation. Bounded by a perl alarm so
 # a regression that launches something long-lived cannot hang the suite.
@@ -109,7 +120,7 @@ launched()     { [ -n "$(launch_line)" ]; }
 launch_has()   { local l; l="$(launch_line)"; case "$l" in *"$1"*) return 0 ;; esac; return 1; }
 claude_has()   { grep -qF -- "$1" "$CLAUDE_LOG" 2>/dev/null; }
 err_has()      { grep -qF -- "$1" "$ERR" 2>/dev/null; }
-snip()         { head -c 240 "$1" 2>/dev/null | tr '\n' ' '; }
+snip()         { head -c 240 "$1" 2>/dev/null | LC_ALL=C tr '\n' ' '; }
 
 # expect_rejected LABEL -- the last run exited 2 with "unknown command" on stderr,
 # nothing on stdout, and never launched claude.
@@ -351,9 +362,13 @@ for n in hooks version --version -V help demo team presence beat roster wrap unw
     && ok "extractor includes '$n'" \
     || bad "extractor misses '$n'"
 done
-printf '%s\n' "$NAMES" | grep -qxE "''|\*|" \
-  && bad "extractor emitted an empty, '' or * entry" \
-  || ok "extractor emits no empty, '' or * entry"
+if printf '%s\n' "$NAMES" | grep -qxF "''" \
+   || printf '%s\n' "$NAMES" | grep -qxF '*' \
+   || printf '%s\n' "$NAMES" | grep -q '^$'; then
+  bad "extractor emitted an empty, '' or * entry"
+else
+  ok "extractor emits no empty, '' or * entry"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo "9. syntax"
