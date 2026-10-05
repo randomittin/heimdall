@@ -166,15 +166,16 @@ function countWebSocketMessages(sessionId: string): Promise<{ calls: () => numbe
  *  supersede `close()` that failed would leave behind -- older than the live
  *  socket, and still open. */
 async function acceptStaleHmdSocket(init: PairInitBody): Promise<HmdSocket> {
-  let client!: WebSocket;
-  await runInDurableObject(sessionStub(init.session_id), (_instance, state: DurableObjectState) => {
+  // The client end is accepted inside the object's own context too: a WebSocket
+  // made there cannot be accepted from the test's ("Cannot perform I/O on behalf
+  // of a different Durable Object").
+  return runInDurableObject(sessionStub(init.session_id), (_instance, state: DurableObjectState) => {
     const pair = new WebSocketPair();
     state.acceptWebSocket(pair[1], ["hmd"]);
     pair[1].serializeAttachment({ gen: 0, sid: init.session_id });
-    client = pair[0];
+    pair[0].accept();
+    return new HmdSocket(pair[0]);
   });
-  client.accept();
-  return new HmdSocket(client);
 }
 
 describe("hmd's WebSocket leg: negotiation and auth", () => {

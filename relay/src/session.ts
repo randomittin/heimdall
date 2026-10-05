@@ -1557,7 +1557,7 @@ export class SessionDO {
 
       logEvent("session_purged", { session_id: record.session_id, status: record.status });
       for (const socket of this.ctx.getWebSockets(DEVICE_TAG)) {
-        this.closeDeviceSocket(socket, CLOSE_SESSION_ENDED, "session ended");
+        this.closeSocket(socket, CLOSE_SESSION_ENDED, "session ended");
       }
       // hmd is told why before its stream goes (INV-38). Without it, a session
       // nobody bound ended as a bare EOF followed by a 404 — see endHmdStream.
@@ -1568,21 +1568,23 @@ export class SessionDO {
   }
 
   async webSocketClose(
-    _ws: WebSocket,
+    ws: WebSocket,
     code: number,
     _reason: string,
     wasClean: boolean
   ): Promise<void> {
     const record = await this.loadRecord();
-    logEvent("device_socket_closed", {
+    logEvent(this.isHmdSocket(ws) ? "hmd_socket_closed" : "device_socket_closed", {
       session_id: record?.session_id ?? "unknown",
       code,
       wasClean,
     });
   }
 
-  async webSocketError(_ws: WebSocket, _error: unknown): Promise<void> {
+  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     const record = await this.loadRecord();
-    logEvent("device_socket_error", { session_id: record?.session_id ?? "unknown" });
+    logEvent(this.isHmdSocket(ws) ? "hmd_socket_error" : "device_socket_error", {
+      session_id: record?.session_id ?? "unknown",
+    });
   }
 }
