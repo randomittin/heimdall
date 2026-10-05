@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""runhmd_schema -- validate runhmd documents against docs/schemas/runhmd.verdict.v1.json.
+"""runhmd_schema -- validate runhmd documents against docs/schemas/runhmd.*.v1.json.
 
-The schema FILE is the single source of the runhmd.verdict/1 contract (and of the
-runhmd.prove/1 envelope `hmd prove` emits). This module holds no copy of those rules:
-it loads the file and enforces it. Two layers:
+The schema FILES are the single source of the runhmd contracts: runhmd.verdict/1 (and the
+runhmd.prove/1 envelope `hmd prove` emits) in runhmd.verdict.v1.json, runhmd.receipt/1 in
+runhmd.receipt.v1.json. This module holds no copy of those rules: it loads the file and
+enforces it. A document is checked against the file whose `x-documents` declares its
+`schema` id. Two layers:
 
-  1. structure  -- a small, stdlib-only subset of JSON Schema (2020-12): $ref (local
-                   only, never fetched), type, const, enum, required, properties,
+  1. structure  -- a small, stdlib-only subset of JSON Schema (2020-12): $ref (local, or a
+                   sibling runhmd.*.json file in the schema's own directory so the receipt
+                   schema shares the verdict vocabulary instead of copying it -- never a
+                   URL, never fetched), type, const, enum, required, properties,
                    additionalProperties, items, minItems, maxItems, minLength, maxLength,
                    pattern, minimum, maximum. Any other validating keyword in the schema
                    file makes the whole schema UNUSABLE (exit 2): a rule this module
@@ -22,19 +26,23 @@ Usage:
 Exit: 0 valid (prints `ok <schema id>` on stdout); 1 invalid (one error per line on
 stderr); 2 usage / IO / unusable schema.
 
-Python API (what `hmd attack` and `hmd prove` import):
+Python API (what `hmd attack`, `hmd prove` and `hmd receipt` import):
   load_schema(path=None) -> dict
   validate(doc, schema=None) -> list[str]        empty list == valid
 """
 from __future__ import annotations
 
+import datetime
 import json
+import math
 import os
 import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SCHEMA = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "schemas", "runhmd.verdict.v1.json"))
+SCHEMA_DIR = os.path.dirname(DEFAULT_SCHEMA)
+_SIBLING_FILE = re.compile(r"runhmd\.[A-Za-z0-9_.-]+\.json")
 
 # Keywords this module enforces. Anything else that is not an annotation is refused.
 _VALIDATING = {
@@ -49,10 +57,39 @@ class SchemaError(Exception):
 
 
 def load_schema(path=None):
-    with open(path or DEFAULT_SCHEMA, "r", encoding="utf-8") as fh:
+    path = path or DEFAULT_SCHEMA
+    with open(path, "r", encoding="utf-8") as fh:
         schema = json.load(fh)
+    if not isinstance(schema, dict):
+        raise SchemaError("a schema file must hold a JSON object")
     _audit(schema, "#")
+    # Where this file lives: a sibling $ref inside it is looked up next to it, so a copied
+    # schema directory (a test fixture, a vendored copy) is self-contained.
+    schema["x-source-dir"] = os.path.dirname(os.path.abspath(path))
     return schema
+
+
+_LOADED = {}
+
+
+def _load_sibling(path):
+    """load_schema, memoised per (path, mtime, size): a receipt with many findings resolves the
+    same sibling $ref once per finding, and re-reading the file each time would be pure waste."""
+    stat = os.stat(path)
+    key = (path, stat.st_mtime_ns, stat.st_size)
+    if key not in _LOADED:
+        _LOADED[key] = load_schema(path)
+    return _LOADED[key]
+
+
+def _declared_documents():
+    """{document id: the schema declaring it} for every runhmd.*.json in the schema directory."""
+    found = {}
+    for name in sorted(n for n in os.listdir(SCHEMA_DIR) if _SIBLING_FILE.fullmatch(n)):
+        schema = _load_sibling(os.path.join(SCHEMA_DIR, name))
+        for doc_id in schema.get("x-documents", {}):
+            found.setdefault(doc_id, schema)
+    return found
 
 
 def _audit(node, where):
@@ -74,17 +111,26 @@ def _audit(node, where):
 
 
 def _resolve(ref, root):
-    if not ref.startswith("#"):
-        raise SchemaError("only local $ref values are supported (never fetched): %s" % ref)
+    """The (node, root) a $ref points at. `root` is the schema document the node lives in: it is
+    what any local $ref INSIDE that node is relative to, so a sibling file's nodes resolve
+    against that sibling, not against the document that referenced it."""
+    name, _, pointer = ref.partition("#")
+    if name:
+        if not _SIBLING_FILE.fullmatch(name):
+            raise SchemaError("only local and sibling runhmd.*.json $ref values are supported (never fetched): %s" % ref)
+        try:
+            root = _load_sibling(os.path.join(root.get("x-source-dir") or SCHEMA_DIR, name))
+        except (OSError, ValueError) as exc:
+            raise SchemaError("cannot load the schema file %s referenced by %s: %s" % (name, ref, exc)) from exc
     node = root
-    for part in ref[1:].split("/"):
+    for part in pointer.split("/"):
         if part == "":
             continue
         part = part.replace("~1", "/").replace("~0", "~")
         if not isinstance(node, dict) or part not in node:
             raise SchemaError("unresolvable $ref: %s" % ref)
         node = node[part]
-    return node
+    return node, root
 
 
 def _is_type(value, name):
@@ -105,6 +151,17 @@ def _is_type(value, name):
     raise SchemaError("unsupported type name '%s'" % name)
 
 
+def _ecma(pattern):
+    """Python's `$` also matches just before a trailing newline; ECMA 262's (the dialect JSON
+    Schema patterns are written in) does not. An unescaped final `$` therefore becomes \\Z:
+    without it an id, a digest or a URL ending in a newline passed the pattern that forbids it."""
+    if pattern.endswith("$"):
+        backslashes = len(pattern) - 1 - len(pattern[:-1].rstrip("\\"))
+        if backslashes % 2 == 0:
+            return pattern[:-1] + r"\Z"
+    return pattern
+
+
 def _json_eq(a, b):
     """JSON equality: true != 1, 1 == 1.0."""
     if isinstance(a, bool) or isinstance(b, bool):
@@ -120,7 +177,8 @@ def _json_eq(a, b):
 
 def _check(value, schema, root, path, errors):
     if "$ref" in schema:
-        _check(value, _resolve(schema["$ref"], root), root, path, errors)
+        target, target_root = _resolve(schema["$ref"], root)
+        _check(value, target, target_root, path, errors)
     where = path or "/"
     if "type" in schema:
         names = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
@@ -136,7 +194,7 @@ def _check(value, schema, root, path, errors):
             errors.append("%s: string is shorter than %d" % (where, schema["minLength"]))
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             errors.append("%s: string is longer than %d" % (where, schema["maxLength"]))
-        if "pattern" in schema and not re.search(schema["pattern"], value):
+        if "pattern" in schema and not re.search(_ecma(schema["pattern"]), value):
             errors.append("%s: %r does not match pattern %s" % (where, value, schema["pattern"]))
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if "minimum" in schema and value < schema["minimum"]:
@@ -233,18 +291,48 @@ def _prove_invariants(doc):
     return errors
 
 
-_INVARIANTS = {"runhmd.verdict/1": _verdict_invariants, "runhmd.prove/1": _prove_invariants}
+def _receipt_invariants(doc):
+    errors = []
+    # RC1
+    try:
+        datetime.datetime.strptime(doc["created_at"], "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        errors.append("created_at %r is not a real UTC timestamp" % doc["created_at"])
+    # RC3
+    for field, places in (("cost_usd", 4), ("duration_s", 2)):
+        value = doc[field]
+        if not math.isfinite(value) or round(value, places) != value:
+            errors.append("%s %r is not a finite number with at most %d decimal places" % (field, value, places))
+    # RC2: a receipt attests a verdict, so the verdict's own consistency rules apply to its fields
+    errors.extend(_verdict_invariants(doc))
+    return errors
+
+
+_INVARIANTS = {"runhmd.verdict/1": _verdict_invariants, "runhmd.prove/1": _prove_invariants,
+               "runhmd.receipt/1": _receipt_invariants}
 
 
 def validate(doc, schema=None):
-    """Return the list of problems with `doc` (empty list == valid)."""
-    schema = schema if schema is not None else load_schema()
-    documents = schema.get("x-documents", {"runhmd.verdict/1": "#"})
+    """Return the list of problems with `doc` (empty list == valid).
+
+    With no `schema`, the document is checked against the file that declares its `schema` id:
+    the verdict file first (so verdict and prove validation never touch any other file), then
+    its siblings in docs/schemas/."""
     doc_id = doc.get("schema") if isinstance(doc, dict) else None
+    if not isinstance(doc_id, str):
+        doc_id = None   # a list or object as the id must be rejected, not crash the lookup below
+    explicit = schema is not None
+    if not explicit:
+        schema = load_schema()
+        if doc_id not in schema.get("x-documents", {}):
+            schema = _declared_documents().get(doc_id, schema)
+    documents = schema.get("x-documents", {"runhmd.verdict/1": "#"})
     if doc_id not in documents:
-        return ["/: document must be an object whose 'schema' is one of %s (got %r)" % (sorted(documents), doc_id)]
+        known = documents if explicit else _declared_documents()
+        return ["/: document must be an object whose 'schema' is one of %s (got %r)" % (sorted(known), doc_id)]
     errors = []
-    _check(doc, _resolve(documents[doc_id], schema), schema, "", errors)
+    node, node_root = _resolve(documents[doc_id], schema)
+    _check(doc, node, node_root, "", errors)
     if errors:
         return errors
     return _INVARIANTS[doc_id](doc)
@@ -292,7 +380,7 @@ def _main(argv):
         sys.stderr.write("/: not valid JSON: %s\n" % exc)
         return 1
     try:
-        errors = validate(doc, schema)
+        errors = validate(doc, schema if schema_path else None)
     except SchemaError as exc:
         sys.stderr.write("runhmd_schema: unusable schema: %s\n" % exc)
         return 2

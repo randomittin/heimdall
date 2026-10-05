@@ -27,6 +27,7 @@ The single map of Heimdall's knowledge tree. Every committed Markdown doc earns 
 | [specs/README.md](specs/README.md) | **Sub-index** — chat-originated design specs (chatops, viral-launch plan, S-6 generalization, ship plan, website v2) + the Layer 0/Layer 1 resolution table. | Load-bearing |
 | [../PROTOCOL.md](../PROTOCOL.md) | Heimdall token-frugal protocol (v2.0.0). | Load-bearing |
 | [rr-control-plane-client.md](rr-control-plane-client.md) | `rr --mode control-plane` — the signed enqueue client. | Current |
+| [RECEIPTS.md](RECEIPTS.md) | runhmd receipts (RP3) — the signed `/r/<id>` record of a verdict: what it holds, the key and trust source, verify/render/serve, the `hmd prove` call site. | Current |
 | [superpowers/specs/2026-04-06-superx-design.md](superpowers/specs/2026-04-06-superx-design.md) | superx superskill-manager design — referenced by the heimdall skill + agent. | Load-bearing |
 | [superpowers/specs/heimdall-fixture-secret-convention.md](superpowers/specs/heimdall-fixture-secret-convention.md) | Test-fixture secret convention — cited by 6 integration tests. | Load-bearing |
 | [../STACK_PACK_TEMPLATE.md](../STACK_PACK_TEMPLATE.md) | Template for authoring stack skill packs. | Load-bearing |
