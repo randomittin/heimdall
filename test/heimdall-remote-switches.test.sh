@@ -33,9 +33,16 @@
 #      skipped / ignores the switch, a launch-stop that needs the switch, a kill switch that exempts everything, an expand
 #      run unaudited, no second record, a reserved name that is ungated, an unchecked class tag, a dropped hourly ceiling,
 #      a CLI that needs no terminal, a switch file that is not trust-checked)
+#   7  the `hmd app` arms, through the REAL bin/heimdall-app: remote-launch / remote-merge / launch-allow delegate to the
+#      module and keep its terminal rule (stdin is the caller's own, not one the wrapper replaced); the allowlist is
+#      $HEIMDALL_HOME/app/launch-allowlist.json (0600, directory 0700, no second .heimdall under HEIMDALL_HOME); a bad
+#      invocation is the module's usage error and exit 2; --help documents the three; `hmd app status` prints the one-line
+#      `remote:` summary in the tailscale report AND the relay report, and it follows the switches and the allowlist;
+#      without python3 the arms say so and exit 2
 #
 # Hermetic: HOME / HEIMDALL_HOME / TMPDIR are a temp dir, fixture repos are temp dirs, every server is reaped on EXIT,
-# every wait is a bounded poll. Secret-shaped strings are assembled at RUNTIME. No live relay client is ever signalled.
+# every wait is a bounded poll. Secret-shaped strings are assembled at RUNTIME. No live relay client is ever signalled
+# (section 7's stand-in for one is a bash loop that merely carries the name in its argv, killed when the section ends).
 
 set -u
 
@@ -525,7 +532,7 @@ def cli_checks(libdir):
     env = {"HEIMDALL_HOME": home}
     os.environ.pop("HMD_UI_CONTROLS", None)
     lp, mp = os.path.join(home, "remote-launch.json"), os.path.join(home, "remote-merge.json")
-    al = os.path.join(home, ".heimdall", "app", "launch-allowlist.json")
+    al = os.path.join(home, "app", "launch-allowlist.json")
     repo = git_repo(base, "proj")
 
     for sub, f in (("remote-launch", lp), ("remote-merge", mp)):
@@ -790,6 +797,136 @@ if [ "$NMUT" = "16" ] && [ "$CAUGHT" = "16" ] && [ "$SURV" = "0" ]; then
   ok "6. all 16 mutants (prompt in the audit, a switch an action can flip, allowlist by label, symlink swap not re-checked, merge flag ignored, gate skipped, switch not consulted, launch-stop needing the switch, a kill switch that exempts everything, an expand run unaudited, no second record, a reserved name ungated, an unchecked class, a dropped hourly ceiling, a CLI needing no terminal, an untrusted switch file) are caught"
 else
   bad "6. caught $CAUGHT of 16 (saw $NMUT), survived/no-anchor $SURV: $(printf '%s' "$MUTOUT" | grep -v ' CAUGHT ' | head -8)"
+fi
+
+# ═══ 7. the `hmd app` arms: bin/heimdall-app hands remote-launch / remote-merge / launch-allow to the module, and `status` prints its summary line ═══
+APP="$REPO/bin/heimdall-app"
+FAKE_TS="$TMPROOT/fake-tailscale"
+printf '#!/bin/sh\nexit 1\n' > "$FAKE_TS"
+chmod +x "$FAKE_TS"
+# hmd_app ARGS... -- the real script, stdin NOT a terminal, stderr folded in; tailscale, its plist and the inbox are stand-ins that
+# answer "no", so `status` never reaches for the real ones
+hmd_app() {
+  HMD_TAILSCALE_BIN="$FAKE_TS" HMD_TAILSCALE_APP_PLIST="$TMPROOT/no-such.plist" HEIMDALL_INBOX_DELIVER_BIN="$TMPROOT/no-such-inbox" \
+    "$APP" "$@" </dev/null 2>&1
+}
+ARMS_REPO="$(new_repo arms-proj)"
+ARMS_RELAY="$(new_repo arms-relay)"
+ARMS_ID="$(python3 -c 'import hashlib, sys; print("r-" + hashlib.sha256(sys.argv[1].encode()).hexdigest()[:4])' "$ARMS_REPO")"
+ALLOWLIST="$HEIMDALL_HOME/app/launch-allowlist.json"
+rm -rf "$HEIMDALL_HOME/remote-launch.json" "$HEIMDALL_HOME/remote-merge.json" "$HEIMDALL_HOME/app"
+
+OUT="$(hmd_app remote-launch on)"; RC=$?
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'interactive terminal' && [ ! -e "$HEIMDALL_HOME/remote-launch.json" ]; then
+  ok "7a. hmd app remote-launch on without a terminal is refused through the arm and writes nothing"
+else
+  bad "7a. rc=$RC out=$OUT file=$(ls "$HEIMDALL_HOME" 2>&1 | tr '\n' ' ')"
+fi
+OUT="$(hmd_app launch-allow "$ARMS_REPO")"; RC=$?
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'interactive terminal' && [ ! -e "$ALLOWLIST" ]; then
+  ok "7b. hmd app launch-allow <repo> without a terminal is refused through the arm and writes nothing"
+else
+  bad "7b. rc=$RC out=$OUT"
+fi
+tty_run "$APP" remote-launch on --repo "$ARMS_REPO"; RC=$?
+if [ "$RC" = 0 ] && printf '%s' "$TTY_OUT" | grep -q 'remote launch: on' && jq -e '.enabled == true' "$HEIMDALL_HOME/remote-launch.json" >/dev/null 2>&1 \
+   && [ "$(mode_of "$HEIMDALL_HOME/remote-launch.json")" = "600" ]; then
+  ok "7c. at a terminal, hmd app remote-launch on --repo DIR writes the switch (0600): the arm leaves the caller's own stdin in place"
+else
+  bad "7c. rc=$RC out=$TTY_OUT"
+fi
+tty_run "$APP" launch-allow "$ARMS_REPO" --merge; RC=$?
+if [ "$RC" = 0 ] && jq -e --arg id "$ARMS_ID" --arg p "$ARMS_REPO" '. == [{"id": $id, "label": "arms-proj", "path": $p, "merge": true}]' "$ALLOWLIST" >/dev/null 2>&1; then
+  ok "7d. at a terminal, hmd app launch-allow <repo> --merge adds {id, label, path, merge:true} (id = r- + sha256(realpath)[:4])"
+else
+  bad "7d. rc=$RC out=$TTY_OUT file=$(cat "$ALLOWLIST" 2>/dev/null)"
+fi
+if [ "$(mode_of "$ALLOWLIST")" = "600" ] && [ "$(mode_of "$HEIMDALL_HOME/app")" = "700" ] && [ ! -e "$HEIMDALL_HOME/.heimdall/app/launch-allowlist.json" ]; then
+  ok "7e. the allowlist is \$HEIMDALL_HOME/app/launch-allowlist.json (0600, its directory 0700), not under a second .heimdall"
+else
+  bad "7e. file mode $(mode_of "$ALLOWLIST" 2>&1), dir mode $(mode_of "$HEIMDALL_HOME/app" 2>&1), doubled path present: $([ -e "$HEIMDALL_HOME/.heimdall/app/launch-allowlist.json" ] && echo yes || echo no)"
+fi
+OUT="$(hmd_app launch-allow --list)"; RC=$?
+if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "$ARMS_ID" && printf '%s' "$OUT" | grep -q 'merge:yes'; then
+  ok "7f. hmd app launch-allow --list needs no terminal and shows the entry"
+else
+  bad "7f. rc=$RC out=$OUT"
+fi
+OUT="$(hmd_app remote-launch status)"; RC=$?
+if [ "$RC" = 0 ] && printf '%s\n' "$OUT" | grep -q '^remote launch: on (since ' && printf '%s\n' "$OUT" | grep -qx 'allowlist: 1 repo(s), 1 with merge'; then
+  ok "7g. hmd app remote-launch status (no terminal) says on and the allowlist size"
+else
+  bad "7g. rc=$RC out=$OUT"
+fi
+OUT="$(hmd_app remote-merge status)"; RC=$?
+if [ "$RC" = 0 ] && printf '%s\n' "$OUT" | grep -qx 'remote merge: off'; then
+  ok "7h. hmd app remote-merge status is its own switch: off"
+else
+  bad "7h. rc=$RC out=$OUT"
+fi
+ARMS_LINE='remote: launch on, merge off, allowlist 1 repo(s)'
+OUT="$(hmd_app status --repo "$ARMS_REPO")"; RC=$?
+if [ "$RC" = 0 ] && printf '%s\n' "$OUT" | grep -qxF "$ARMS_LINE"; then
+  ok "7i. hmd app status (tailscale report) prints the one-line remote summary"
+else
+  bad "7i. rc=$RC out=$OUT"
+fi
+mkdir -p "$ARMS_RELAY/.heimdall/app"
+bash -c 'while :; do sleep 0.2; done' heimdall-relay-client &
+ARMS_CLIENT=$!
+PIDS+=("$ARMS_CLIENT")
+jq -n --argjson pid "$ARMS_CLIENT" '{mode: "relay", pid_ui: null, pid_client: $pid, port: 1, relay: "https://relay.example.com", started_at: "2026-10-06T00:00:00Z"}' > "$ARMS_RELAY/.heimdall/app/connect.json"
+OUT="$(hmd_app status --repo "$ARMS_RELAY")"; RC=$?
+kill "$ARMS_CLIENT" 2>/dev/null
+{ wait "$ARMS_CLIENT"; } 2>/dev/null
+if [ "$RC" = 0 ] && printf '%s\n' "$OUT" | grep -qx 'mode: relay' && printf '%s\n' "$OUT" | grep -qxF "$ARMS_LINE"; then
+  ok "7j. hmd app status (relay report) prints the same one-line remote summary"
+else
+  bad "7j. rc=$RC out=$OUT"
+fi
+OUT="$(hmd_app remote-launch off)"; RC=$?
+if [ "$RC" = 0 ] && jq -e '.enabled == false' "$HEIMDALL_HOME/remote-launch.json" >/dev/null 2>&1 \
+   && hmd_app status --repo "$ARMS_REPO" | grep -qxF 'remote: launch off, merge off, allowlist 1 repo(s)'; then
+  ok "7k. hmd app remote-launch off needs no terminal, and the status line follows the switch"
+else
+  bad "7k. rc=$RC out=$OUT"
+fi
+OUT="$(hmd_app launch-allow --remove "$ARMS_ID")"; RC=$?
+if [ "$RC" = 0 ] && jq -e '. == []' "$ALLOWLIST" >/dev/null 2>&1 \
+   && hmd_app status --repo "$ARMS_REPO" | grep -qxF 'remote: launch off, merge off, allowlist 0 repo(s)'; then
+  ok "7l. hmd app launch-allow --remove <id> needs no terminal, and the status line's allowlist size follows"
+else
+  bad "7l. rc=$RC out=$OUT file=$(cat "$ALLOWLIST" 2>/dev/null)"
+fi
+OUT="$(hmd_app remote-launch frobnicate)"; RC=$?
+OUT2="$(hmd_app launch-allow)"; RC2=$?
+if [ "$RC" = 2 ] && [ "$RC2" = 2 ] && printf '%s' "$OUT" | grep -q '^usage: hmd app remote-launch' && printf '%s' "$OUT2" | grep -q 'launch-allow <repo-path>'; then
+  ok "7m. a malformed invocation is the module's usage error with exit status 2, unchanged by the arm"
+else
+  bad "7m. rc=$RC/$RC2 out=$OUT // $OUT2"
+fi
+HELP="$("$APP" --help 2>&1)"
+if printf '%s' "$HELP" | grep -q 'hmd app remote-launch on|off|status' && printf '%s' "$HELP" | grep -q 'hmd app remote-merge  on|off|status' \
+   && printf '%s' "$HELP" | grep -q 'hmd app launch-allow <repo-path>' && printf '%s' "$HELP" | grep -q 'app/launch-allowlist.json'; then
+  ok "7n. hmd app --help documents the three arms and where the allowlist lives"
+else
+  bad "7n. help: $(printf '%s' "$HELP" | grep -n 'remote-\|launch-allow' | head -5)"
+fi
+NOPY="$TMPROOT/nopy"
+mkdir -p "$NOPY/lib"
+cp "$APP" "$NOPY/heimdall-app"
+cp "$LIBDIR/hmd_tailscale.sh" "$NOPY/lib/hmd_tailscale.sh"
+printf 'hmd_python() { return 1; }\n' > "$NOPY/lib/hmd-python.sh"
+OUT="$("$NOPY/heimdall-app" remote-merge status 2>&1 </dev/null)"; RC=$?
+if [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'hmd app remote-merge: python3 not found'; then
+  ok "7o. with no python3 the arm says so and exits 2 (a copy of the script whose interpreter lookup finds none)"
+else
+  bad "7o. rc=$RC out=$OUT"
+fi
+if [ ! -e "$HEIMDALL_HOME/.heimdall" ]; then
+  ok "7p. nothing in this suite created a second .heimdall under HEIMDALL_HOME"
+else
+  bad "7p. $HEIMDALL_HOME/.heimdall exists: $(find "$HEIMDALL_HOME/.heimdall" | head -5 | tr '\n' ' ')"
 fi
 
 echo
