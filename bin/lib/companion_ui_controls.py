@@ -50,12 +50,34 @@ SECURITY MODEL.
     string is never written to disk, logged or echoed: the audit line carries only whitelisted, pattern-checked fields
     (never `rid`, never text), and a field that is secret-shaped is dropped.
   * Kill switch: env HMD_UI_CONTROLS=0, or the file <repo>/.heimdall/app/controls-disabled (`hmd app controls off`):
-    every action returns `controls-off`. Neither can be flipped by any action in this module.
+    every action returns `controls-off` -- except `launch-stop` (KILL_SWITCH_EXEMPT), which only ends work the phone
+    started, so the phone can always say stop. Neither can be flipped by any action in this module.
   * Rate limits (token buckets, per repo, in memory): all controls 10/min burst 5; interrupt 3/min; hook-toggle 6/min;
     fallback-mode 3/min; save-checkpoint is not refused but COALESCED (a second save within 5 s of a good one is ok).
   * Every command -- ok, refused, unknown -- appends one line to <repo>/.heimdall/ui/controls-audit.jsonl (0600, dir 0700,
     O_APPEND + fsync, rotated at 1 MiB to `.1`). A write failure disables the log for the rest of the process with ONE
     stderr notice and never blocks a command.
+
+CLASSES AND THE EXPAND GATE (hmdapp docs/HANDOFF-TO-HEIMDALL-cursor-parity.md CP1 + CP2). Every action is registered
+(register_action, import time, trusted code only -- the ONE way a name joins ALLOWED_ACTIONS) with a class tag: `read`
+(shows something), `safe-write` (adds data, or only reduces what is running: interrupt, save-checkpoint, launch-stop),
+`risky-write` (changes how this laptop behaves: hook-toggle, fallback-mode) or `expand` (gives the phone authority it
+did not have: launch-session, pr-merge). An `expand` command is refused `not-allowed` unless, in this order: the
+laptop's switch for it is on (`hmd app remote-launch on` / `remote-merge on`, flipped at a terminal by a person --
+bin/lib/companion_remote_switches.py; nothing in THIS file can write either switch), its params are well formed, and
+the repo it names -- by allowlist id, never by label or path; the session's own repo for a merge -- is on the allowlist
+(`hmd app launch-allow`), still resolves to the path it was added with and, for the merge switch, was added with
+--merge. `launch-session` and `pr-merge` are RESERVED expand names (RESERVED_EXPAND): their class and switch cannot be
+re-declared, and they are gated even before a handler is registered for them (answered `not-implemented` once the
+switch is on). Every expand attempt, refused ones included, and every launch-stop is recorded TWICE: one
+controls-audit.jsonl line and one `remote-action` line in relay-events.jsonl (same ts; `ref` is the action id). The
+audit params are filtered here whatever a handler's own rule returns: repo, branch, model, mode, number, method, id,
+enabled, confirm only, each pattern-checked -- never a prompt, a rid or a path. An expand command that cannot be
+audited is refused `internal-error`, not run unaudited. EXPAND_RATES carries the per-session limits the registrations
+use (launch 1 a minute; merge 1 per 30 s and 5 an hour).
+STATE (additive, beside `controls`): remote_actions {v, launch_enabled, merge_enabled, recent:[{at, action, device,
+repo_label, ok, detail}] -- the last 20, newest first, read back from the audit log} and launch {v, enabled[, repos:
+[{id, label}]]} -- ids and labels only, never a path.
 
 INTERRUPT -- what was investigated and what ships. Claude Code has no external interrupt API; the options on this machine:
   1. A hook returning {"continue": false, "stopReason": ..} is the only documented lever (the phone-deny hook already
@@ -105,6 +127,18 @@ STOP_TTL_S = 120.0                # a stop request older than this is never hono
 CHECKPOINT_COALESCE_S = 5.0       # a save within this of a good one is `coalesced`
 AUDIT_MAX_BYTES = 1024 * 1024
 KILL_SWITCH_ENV = "HMD_UI_CONTROLS"
+EVENT_LOG_ENV = "HMD_RELAY_EVENT_LOG"          # the relay client's own event log override ("" = off)
+EVENT_LOG_MAX_BYTES = 4 * 1024 * 1024         # its rotation size: a second writer must not outgrow it
+RECENT_REMOTE = 20                            # rows in state.remote_actions.recent
+RECENT_SCAN_BYTES = 256 * 1024                # how much of an audit generation is read back for them
+
+CLASS_READ, CLASS_SAFE_WRITE, CLASS_RISKY_WRITE, CLASS_EXPAND = "read", "safe-write", "risky-write", "expand"
+CLASSES = (CLASS_READ, CLASS_SAFE_WRITE, CLASS_RISKY_WRITE, CLASS_EXPAND)
+EXPAND_SWITCHES = ("launch", "merge")         # the two laptop switches (companion_remote_switches.SWITCHES)
+RESERVED_EXPAND = {"launch-session": "launch", "pr-merge": "merge"}   # fixed by CP2: class expand, this switch, always
+KILL_SWITCH_EXEMPT = frozenset(("launch-stop",))   # reduce-direction: ends only what the phone started
+EXPAND_RATES = {"launch-session": ((1, 1 / 60.0),),
+                "pr-merge": ((1, 1 / 30.0), (5, 5 / 3600.0))}   # (burst, per second): launch 1/min; merge 1/30 s and 5/h
 HOOKS_METADATA_ENV = "HMD_HOOKS_METADATA"   # the same override bin/lib/hook-enabled.sh honours
 
 AUDIT_REL = os.path.join(".heimdall", "ui", "controls-audit.jsonl")
@@ -121,6 +155,11 @@ RID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 HOOK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ACTION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
 STOP_ID_RE = re.compile(r"s-[0-9a-f]{8}")
+REPO_ID_RE = re.compile(r"r-[0-9a-f]{4}")         # an allowlist id (companion_remote_switches.repo_id)
+NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,39}")      # a registered action name: kebab-case
+DETAIL_RE = re.compile(r"[a-z0-9-]{1,40}")
+DEVICE_RE = re.compile(r"[0-9a-f]{8}|direct|unknown")
+_BRANCH_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]{0,99}")
 
 # -- secret scrub: bin/lib/companion_ui_inbox.py, itself bin/heimdall-activity's, ported -----------------------------
 _SECRET_RES = (
@@ -204,6 +243,17 @@ def _sibling(name):
 
 def _bin(name):
     return os.path.join(BIN_DIR, name)
+
+
+def _switches():
+    """bin/lib/companion_remote_switches.py -- the laptop's expand switches and the repo allowlist -- or None when it
+    cannot load: every expand command is then refused, and the state says both switches are off."""
+    return _sibling("companion_remote_switches")
+
+
+def _switch_on(name):
+    sw = _switches()
+    return sw is not None and sw.switch_enabled(name)
 
 
 def _usable_tool(name):
@@ -478,6 +528,25 @@ def _audit_fallback(fields):
     return {"mode": fields["mode"], "confirm": fields["confirm"]}
 
 
+# The ONLY params an audit line may carry, and the shape each must have. Applied to every action's own audit rule, so a
+# handler (or a later ask) that returns more -- a prompt, a path, a rid -- cannot widen what the log holds.
+_AUDIT_FIELDS = {
+    "id": lambda v: isinstance(v, str) and HOOK_ID_RE.fullmatch(v) is not None,
+    "enabled": lambda v: isinstance(v, bool),
+    "confirm": lambda v: isinstance(v, bool),
+    "mode": lambda v: v in FALLBACK_MODES or v in ("plan", "default"),
+    "repo": lambda v: isinstance(v, str) and REPO_ID_RE.fullmatch(v) is not None,
+    "branch": lambda v: isinstance(v, str) and _BRANCH_RE.fullmatch(v) is not None and ".." not in v and "//" not in v,
+    "model": lambda v: v in ("sonnet", "opus", "haiku"),
+    "method": lambda v: v in ("squash", "merge", "rebase"),
+    "number": lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 < v < 10 ** 9,
+}
+
+
+def _clean_audit(params):
+    return {k: v for k, v in params.items() if k in _AUDIT_FIELDS and _AUDIT_FIELDS[k](v) and not secret_shaped(v)}
+
+
 def _validate(action, params):
     """(rid, fields) for a well-formed command, else _Refusal("bad-params"). Exact key set, exact types, <= 1 KiB."""
     spec = _ACTIONS[action]
@@ -509,8 +578,10 @@ class _Bucket:
         self.at = time.monotonic()
 
     def _refill(self, now):
-        self.tokens = min(self.capacity, self.tokens + (now - self.at) * self.per_s)
-        self.at = now
+        # `now` can be a hair BEFORE `at`: _charge reads the clock, then builds a bucket that stamps a later one. A one-token
+        # bucket (an expand action's) would then start a sliver short of a whole token and refuse its very first command.
+        self.tokens = min(self.capacity, self.tokens + max(0.0, now - self.at) * self.per_s)
+        self.at = max(self.at, now)
 
     def wait(self, now):
         """Seconds until a token is available (0.0 when one is now)."""
@@ -533,9 +604,8 @@ def _charge(root, action):
     taken when any bucket is empty, so a refused command never spends budget."""
     now = time.monotonic()
     names = [("*",) + _GLOBAL_RATE]
-    rate = _ACTIONS[action]["rate"]
-    if rate is not None:
-        names.append((action,) + rate)
+    for i, (cap, per) in enumerate(_ACTIONS[action]["rate"]):
+        names.append(("%s#%d" % (action, i), cap, per))
     with _LOCK:
         buckets = [_BUCKETS.setdefault((root, n), _Bucket(cap, per)) for n, cap, per in names]
         wait = max(b.wait(now) for b in buckets)
@@ -547,9 +617,10 @@ def _charge(root, action):
 
 # -- handlers: (root, fields, ctx) -> (ok, detail, extra) --------------------------------------------------------
 class _Ctx:
-    def __init__(self, device_id, deadline):
+    def __init__(self, device_id, deadline, repo=None):
         self.device_id = device_id
         self.deadline = deadline
+        self.repo = repo   # an expand handler's allowlist entry {id, label, path, merge}: hmd's own path, never the phone's
 
 
 def _attention(root):
@@ -672,19 +743,65 @@ def _do_fallback_mode(root, fields, ctx):
     return True, None, {"result": {"mode": mode, "was": was}}
 
 
-#            required keys        optional      field rules        audit rule         handler              rate (burst, /s)
-_ACTIONS = {
-    "interrupt": {"required": (), "optional": (), "fields": _no_fields, "audit": lambda f: {},
-                  "handler": _do_interrupt, "rate": (3, 3 / 60.0)},
-    "save-checkpoint": {"required": (), "optional": (), "fields": _no_fields, "audit": lambda f: {},
-                        "handler": _do_save_checkpoint, "rate": None},
-    "hook-toggle": {"required": ("id", "enabled"), "optional": (), "fields": _hook_toggle_fields,
-                    "audit": _audit_hook_toggle, "handler": _do_hook_toggle, "rate": (6, 6 / 60.0)},
-    "fallback-mode": {"required": ("mode",), "optional": ("confirm",), "fields": _fallback_fields,
-                      "audit": _audit_fallback, "handler": _do_fallback_mode, "rate": (3, 3 / 60.0)},
-}
-ALLOWED_ACTIONS = frozenset(_ACTIONS)
-ACTION_ORDER = ("interrupt", "save-checkpoint", "hook-toggle", "fallback-mode")
+_ACTIONS = {}
+ALLOWED_ACTIONS = frozenset()
+ACTION_ORDER = []
+
+
+def _rate_pairs(rate):
+    """`rate` -- None, one (burst, per_second) pair, or a sequence of pairs -- as a tuple of validated pairs."""
+    if rate is None:
+        return ()
+    pairs = (rate,) if isinstance(rate[0], (int, float)) else tuple(rate)
+    for pair in pairs:
+        if len(pair) != 2 or not all(isinstance(x, (int, float)) and x > 0 for x in pair):
+            raise ValueError("a rate is (burst, per_second), both positive")
+    return tuple((float(cap), float(per)) for cap, per in pairs)
+
+
+def register_action(name, *, cls, handler, required=(), optional=(), fields=_no_fields, audit=None, rate=None, switch=None,
+                    repo_field=None, usable=None):
+    """Put `name` on the allowlist: the one way an action gets in (module import time; trusted code only). `handler(root,
+    fields, ctx)` returns (ok, detail, extra). `cls` is read | safe-write | risky-write | expand. An expand action names its
+    laptop `switch` (launch | merge) and, when the phone picks the repo, `repo_field` -- the param holding an allowlist id
+    (otherwise the gate checks the session's own repo); the handler then finds the allowlist's own entry in ctx.repo -- its
+    path was re-checked at the gate, so a handler that acts later (a worktree add, a merge) re-checks it with
+    companion_remote_switches.usable(ctx.repo) first, and never touches any path the phone sent. A name
+    in RESERVED_EXPAND must be that class and switch; a name in KILL_SWITCH_EXEMPT must be safe-write. `rate` is a (burst,
+    per_second) pair or a sequence of them (see EXPAND_RATES); `usable(root)` says whether the action is offered now."""
+    global ALLOWED_ACTIONS
+    if not (isinstance(name, str) and NAME_RE.fullmatch(name)) or name in _ACTIONS:
+        raise ValueError("an action name is kebab-case and registered once")
+    if cls not in CLASSES:
+        raise ValueError("unknown class")
+    if not callable(handler):
+        raise ValueError("a handler is callable")
+    if (cls == CLASS_EXPAND) != (switch is not None) or (switch is not None and switch not in EXPAND_SWITCHES):
+        raise ValueError("an expand action names exactly one expand switch; no other class names one")
+    if repo_field is not None and cls != CLASS_EXPAND:
+        raise ValueError("repo_field belongs to expand actions")
+    if name in RESERVED_EXPAND and (cls != CLASS_EXPAND or switch != RESERVED_EXPAND[name]):
+        raise ValueError("a reserved name keeps its class and switch")
+    if name in KILL_SWITCH_EXEMPT and cls != CLASS_SAFE_WRITE:
+        raise ValueError("only a safe-write action can be exempt from the kill switch")
+    _ACTIONS[name] = {"cls": cls, "switch": switch, "repo_field": repo_field, "required": tuple(required),
+                      "optional": tuple(optional), "fields": fields, "audit": audit or (lambda f: {}), "handler": handler,
+                      "rate": _rate_pairs(rate), "usable": usable,
+                      "timeline": cls == CLASS_EXPAND or name in KILL_SWITCH_EXEMPT}
+    ACTION_ORDER.append(name)
+    ALLOWED_ACTIONS = frozenset(_ACTIONS)
+
+
+register_action("interrupt", cls=CLASS_SAFE_WRITE, handler=_do_interrupt, rate=(3, 3 / 60.0),
+                usable=lambda root: _usable_tool("heimdall-phone-control"))
+register_action("save-checkpoint", cls=CLASS_SAFE_WRITE, handler=_do_save_checkpoint,
+                usable=lambda root: _usable_tool("heimdall-checkpoint"))
+register_action("hook-toggle", cls=CLASS_RISKY_WRITE, handler=_do_hook_toggle, required=("id", "enabled"),
+                fields=_hook_toggle_fields, audit=_audit_hook_toggle, rate=(6, 6 / 60.0),
+                usable=lambda root: _usable_tool("heimdall-hooks") and bool(toggleable_hooks()))
+register_action("fallback-mode", cls=CLASS_RISKY_WRITE, handler=_do_fallback_mode, required=("mode",), optional=("confirm",),
+                fields=_fallback_fields, audit=_audit_fallback, rate=(3, 3 / 60.0),
+                usable=lambda root: _usable_tool("heimdall-fallback"))
 
 
 # -- dispatch ---------------------------------------------------------------------------------------------------
@@ -708,30 +825,84 @@ def _bounded(extra):
     return out
 
 
+def _authorize(root, spec, fields):
+    """(entry, repo, detail) for an expand command: the allowlist entry it may act on (its path re-checked now), the allowlist
+    id it named (None when what it named is not shaped like one) and `not-allowed` unless the laptop's switch is on and the
+    repo is on the allowlist BY ID -- never by label or path --, still resolves to the path it was added with and, for the
+    merge switch, was added with --merge. `fields` is None when the params were malformed: only the switch is checked."""
+    sw = _switches()
+    if sw is None or not sw.switch_enabled(spec["switch"]):
+        return None, None, "not-allowed"
+    if fields is None:
+        return None, None, None
+    if spec["repo_field"] is not None:
+        wanted = fields.get(spec["repo_field"])
+        repo = wanted if isinstance(wanted, str) and REPO_ID_RE.fullmatch(wanted) else None
+        entry = sw.authorize(spec["switch"], repo=wanted) if isinstance(wanted, str) else None
+    else:
+        repo = sw.repo_id(os.path.realpath(root))
+        entry = sw.authorize(spec["switch"], root=root)
+    return entry, repo, (None if entry is not None else "not-allowed")
+
+
+def _audit_ready(root):
+    """True when this command's audit line can be written: an expand command is never run unrecorded."""
+    if root in _AUDIT_OFF:
+        return False
+    try:
+        _ensure_dir(os.path.join(root, ".heimdall", "ui"))
+        os.close(os.open(os.path.join(root, AUDIT_REL), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+    except OSError:
+        return False
+    return True
+
+
+def _timeline_names():
+    """The actions that also go to relay-events.jsonl: every expand action (reserved names included) and launch-stop."""
+    return set(RESERVED_EXPAND) | set(KILL_SWITCH_EXEMPT) | {n for n, s in _ACTIONS.items() if s["timeline"]}
+
+
 def _run_command(root, action, params, device_id, started):
-    """(ok, detail, extra, audit_params, dup) -- every refusal path included."""
-    if not isinstance(action, str) or action not in _ACTIONS:
-        return False, "not-implemented", {}, {}, False
-    if not controls_enabled(root):
-        return False, "controls-off", {}, {}, False
+    """(ok, detail, extra, audit_params, dup, repo) -- every refusal path included. `repo` is the allowlist id an expand
+    command named (the session's own repo's, for a merge), else None."""
+    spec = _ACTIONS.get(action) if isinstance(action, str) else None
+    gate = RESERVED_EXPAND.get(action) if isinstance(action, str) else None
+    if spec is None and gate is None:
+        return False, "not-implemented", {}, {}, False, None
+    if action not in KILL_SWITCH_EXEMPT and not controls_enabled(root):
+        return False, "controls-off", {}, {}, False, None
+    if spec is None:   # a reserved expand name nothing has registered a handler for: gated all the same
+        detail = "not-allowed" if not _switch_on(gate) else "not-implemented"
+        return False, detail, {}, {}, False, None
     try:
         rid, fields = _validate(action, params)
+        refusal = None
     except _Refusal as r:
-        return False, r.detail, _bounded(r.extra), {}, False
-    audit_params = _ACTIONS[action]["audit"](fields)
+        rid, fields, refusal = None, None, r
+    audit_params = _clean_audit(spec["audit"](fields)) if fields is not None else {}
+    repo = None
     try:
+        entry = None
+        if spec["cls"] == CLASS_EXPAND:
+            entry, repo, detail = _authorize(root, spec, fields)
+            if detail is not None:
+                return False, detail, {}, audit_params, False, repo
+        if refusal is not None:
+            raise refusal
         if rid is not None:
             with _LOCK:
                 hit = _RIDS.get(root, {}).get(rid)
             if hit is not None:
                 ok, detail, extra = hit
-                return ok, detail, dict(extra, dup=True), audit_params, True
+                return ok, detail, dict(extra, dup=True), audit_params, True, repo
+        if spec["cls"] == CLASS_EXPAND and not _audit_ready(root):
+            return False, "internal-error", {}, audit_params, False, repo
         _charge(root, action)
-        ctx = _Ctx(device_id, started + _deadline_s())
+        ctx = _Ctx(device_id, started + _deadline_s(), entry)
         try:
-            ok, detail, extra = _ACTIONS[action]["handler"](root, fields, ctx)
+            ok, detail, extra = spec["handler"](root, fields, ctx)
         except _Timeout:
-            return False, "timeout", {}, audit_params, False
+            return False, "timeout", {}, audit_params, False, repo
         extra = _bounded(extra)
         if rid is not None:
             with _LOCK:
@@ -739,9 +910,53 @@ def _run_command(root, action, params, device_id, started):
                 store[rid] = (ok, detail, extra)
                 while len(store) > RID_MEMORY:
                     store.popitem(last=False)
-        return ok, detail, extra, audit_params, False
+        return ok, detail, extra, audit_params, False, repo
     except _Refusal as r:
-        return False, r.detail, _bounded(r.extra), audit_params, False
+        return False, r.detail, _bounded(r.extra), audit_params, False, repo
+
+
+_TIMELINE_WARNED = set()
+
+
+def _timeline_path(root):
+    """The relay client's own event log: HMD_RELAY_EVENT_LOG ("" = off, no file), else <repo>/.heimdall/app/relay-events.jsonl."""
+    override = os.environ.get(EVENT_LOG_ENV)
+    if override == "":
+        return None
+    return override or os.path.join(root, ".heimdall", "app", "relay-events.jsonl")
+
+
+def _timeline(root, line, repo):
+    """The second record of an expand attempt (and of a launch-stop): one `remote-action` line in relay-events.jsonl, the log
+    the relay client already keeps, so it is the single timeline. Same ts as the audit line; `ref` is the audit line's `id`.
+    Never a param, a path or free text. Best effort: a failure costs the line and ONE stderr notice, never the command."""
+    path = _timeline_path(root)
+    if path is None:
+        return
+    ref, detail = line.get("id"), line.get("detail")
+    record = {"ts": line["ts"], "event": "remote-action", "action": line["action"], "device": line["device"], "repo": repo,
+              "ok": line["ok"], "detail": detail if isinstance(detail, str) and DETAIL_RE.fullmatch(detail) else None,
+              "ref": ref if isinstance(ref, str) and HOOK_ID_RE.fullmatch(ref) else None}
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        try:
+            oversized = os.stat(path).st_size >= EVENT_LOG_MAX_BYTES
+        except OSError:
+            oversized = False
+        if oversized:
+            os.replace(path, path + ".1")
+        data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        if path not in _TIMELINE_WARNED:
+            _TIMELINE_WARNED.add(path)
+            sys.stderr.write("companion_ui_controls: relay event log not written (%s)\n" % type(e).__name__)
 
 
 def dispatch(root, action, params, *, device_id="direct", seq=None, transport="direct"):
@@ -749,10 +964,10 @@ def dispatch(root, action, params, *, device_id="direct", seq=None, transport="d
     started = time.monotonic()
     wall = time.time()
     try:
-        ok, detail, extra, audit_params, dup = _run_command(root, action, params, device_id, started)
+        ok, detail, extra, audit_params, dup, repo = _run_command(root, action, params, device_id, started)
     except Exception as e:  # the type only: a message could hold what the phone sent
         sys.stderr.write("companion_ui_controls: internal error: %s\n" % type(e).__name__)
-        ok, detail, extra, audit_params, dup = False, "internal-error", {}, {}, False
+        ok, detail, extra, audit_params, dup, repo = False, "internal-error", {}, {}, False, None
     name = action if isinstance(action, str) and ACTION_NAME_RE.fullmatch(action) and not secret_shaped(action) else None
     line = {"ts": _iso(wall), "device": device_id, "seq": seq if isinstance(seq, int) and not isinstance(seq, bool) else None,
             "action": name, "params": audit_params, "ok": ok, "detail": detail,
@@ -762,20 +977,19 @@ def dispatch(root, action, params, *, device_id="direct", seq=None, transport="d
     if dup:
         line["dup"] = True
     _audit(root, line)
+    if name is not None and name in _timeline_names():
+        _timeline(root, line, repo)
     return ok, detail, extra
 
 
 # -- the `controls` key of /api/state ---------------------------------------------------------------------------
-def _usable(action):
-    if action == "interrupt":
-        return _usable_tool("heimdall-phone-control")
-    if action == "save-checkpoint":
-        return _usable_tool("heimdall-checkpoint")
-    if action == "hook-toggle":
-        return _usable_tool("heimdall-hooks") and bool(toggleable_hooks())
-    if action == "fallback-mode":
-        return _usable_tool("heimdall-fallback")
-    return False
+def _usable(root, action):
+    spec = _ACTIONS[action]
+    if spec["cls"] == CLASS_EXPAND:
+        sw = _switches()
+        if sw is None or not sw.available(spec["switch"], root=root):
+            return False
+    return True if spec["usable"] is None else bool(spec["usable"](root))
 
 
 def snapshot(root, hooks=None):
@@ -785,13 +999,82 @@ def snapshot(root, hooks=None):
     ids = toggleable_hooks()
     return {
         "v": 1,
-        "actions": [a for a in ACTION_ORDER if a in ALLOWED_ACTIONS and _usable(a)],
+        "actions": [a for a in ACTION_ORDER if _usable(root, a)],
         "hooks_toggleable": ids,
         "hooks": [{"id": i, "enabled": states[i]} for i in ids if i in states],
         "fallback": {"mode": fallback_mode(root), "modes": list(FALLBACK_MODES), "confirm": list(CONFIRM_MODES)},
         "enabled": controls_enabled(root),
         "last": last_control(root),
     }
+
+
+_RECENT_CACHE = {}
+
+
+def _ts_epoch(ts):
+    try:
+        return calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) + float("0" + ts[19:-1])
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
+def _remote_rows(path, names):
+    """The remote-action rows (oldest first) in the tail of one audit generation, stat-cached."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    stamp = (st.st_mtime_ns, st.st_size, st.st_ino, tuple(sorted(names)))
+    hit = _RECENT_CACHE.get(path)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, st.st_size - RECENT_SCAN_BYTES))
+            chunk = f.read(RECENT_SCAN_BYTES)
+    except OSError:
+        return []
+    rows = []
+    for raw in chunk.splitlines():
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+            at, action, ok = _ts_epoch(obj["ts"]), obj["action"], obj["ok"]
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+            continue
+        if at is None or not isinstance(action, str) or action not in names or not isinstance(ok, bool):
+            continue
+        params = obj.get("params")
+        repo = params.get("repo") if isinstance(params, dict) else None
+        device, detail = obj.get("device"), obj.get("detail")
+        rows.append({"at": round(at, 3), "action": action,
+                     "device": device if isinstance(device, str) and DEVICE_RE.fullmatch(device) else "unknown",
+                     "repo": repo if isinstance(repo, str) and REPO_ID_RE.fullmatch(repo) else None, "ok": ok,
+                     "detail": detail if isinstance(detail, str) and DETAIL_RE.fullmatch(detail) else None})
+    _RECENT_CACHE[path] = (stamp, rows)
+    return rows
+
+
+def remote_actions(root):
+    """The additive `remote_actions` key of /api/state: both laptop switches as they are now and the last RECENT_REMOTE expand
+    attempts (and launch-stops), newest first, read back from the audit log so the two cannot disagree. A row carries the
+    repo's LABEL from the allowlist (None when it is not on it) -- never a path, a param or any text."""
+    sw = _switches()
+    names = _timeline_names()
+    base = os.path.join(root, AUDIT_REL)
+    rows = _remote_rows(base + ".1", names) + _remote_rows(base, names)
+    recent = [{"at": r["at"], "action": r["action"], "device": r["device"],
+               "repo_label": sw.label_of(r["repo"]) if sw is not None and r["repo"] is not None else None,
+               "ok": r["ok"], "detail": r["detail"]} for r in reversed(rows[-RECENT_REMOTE:])]
+    return {"v": 1, "launch_enabled": _switch_on("launch"), "merge_enabled": _switch_on("merge"), "recent": recent}
+
+
+def launch_state(root):
+    """The additive `launch` key: {"v":1,"enabled":false} while the launch switch is off, else the repos the phone may name --
+    allowlist id and label only; an entry whose path no longer resolves as it was added is left out, and no path is ever sent."""
+    sw = _switches()
+    if sw is None or not sw.switch_enabled("launch"):
+        return {"v": 1, "enabled": False}
+    return {"v": 1, "enabled": True, "repos": sw.public_repos()}
 
 
 # -- `hmd app controls on|off|status` (bin/heimdall-app delegates here) ------------------------------------------

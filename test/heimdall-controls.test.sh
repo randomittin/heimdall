@@ -761,7 +761,7 @@ real = load(sys.argv[1], "real")
 print("REAL", json.dumps(checks(real)))
 src = open(sys.argv[1]).read()
 mutants = [
-    ("allowlist-runs-anything", "if not isinstance(action, str) or action not in _ACTIONS:", "if not isinstance(action, str):"),
+    ("allowlist-runs-anything", "    if spec is None and gate is None:", "    if not isinstance(action, str):"),
     ("toggle-checks-only-locked", 'return entry.get("remote_toggle") is True and not entry.get("locked")', 'return not entry.get("locked")'),
     ("no-dedupe", "            if hit is not None:\n                ok, detail, extra = hit", "            if False:\n                ok, detail, extra = hit"),
     ("switch-needs-no-confirm", 'if mode in CONFIRM_MODES and fields["confirm"] is not True:', "if False:"),
@@ -790,6 +790,110 @@ if printf '%s' "$MUTOUT" | grep -q '^REAL \[\]$'; then ok "11a. the checks pass 
 SURV="$(printf '%s' "$MUTOUT" | grep -c ' SURVIVED \| NO-ANCHOR' || true)"
 CAUGHT="$(printf '%s' "$MUTOUT" | grep -c ' CAUGHT ' || true)"
 if [ "$CAUGHT" = "10" ] && [ "$SURV" = "0" ]; then ok "11b. all 10 mutants (allowlist, toggle gate, dedupe, confirm, coop confirm, coop offered, idle write, single use, TTL, prompt clear) are caught"; else bad "11b. caught $CAUGHT of 10, survived/no-anchor $SURV: $(printf '%s' "$MUTOUT" | grep MUTANT)"; fi
+
+# ═══ 12. class tags and the kill-switch exemption (the CP1 carve-outs of hmdapp's cursor-parity handoff) ══════════
+# Every action carries one of read / safe-write / risky-write / expand; `expand` is gated by the laptop's switches (the full
+# battery is test/heimdall-remote-switches.test.sh); the kill switch turns every action into controls-off EXCEPT launch-stop,
+# which only ends what the phone started. Nothing has registered launch-stop yet, so the in-process half registers one the way
+# its ask will, and the real server half proves the reserved names are gated before any handler exists.
+CLS="$TMPROOT/classes.py"
+cat > "$CLS" <<'PYEOF'
+import importlib.util, json, os, sys, tempfile, uuid
+
+def load(libdir):
+    spec = importlib.util.spec_from_file_location("c_" + uuid.uuid4().hex, os.path.join(libdir, "companion_ui_controls.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+def checks(libdir):
+    failed = []
+    def expect(label, cond, got=""):
+        if not cond:
+            failed.append("%s [%s]" % (label, str(got)[:160]))
+    os.environ.pop("HMD_UI_CONTROLS", None)
+    C = load(libdir)
+    root = tempfile.mkdtemp(prefix="cls-")
+    stopped = []
+    def h_stop(r, fields, ctx):
+        stopped.append(fields["id"])
+        return True, None, {"id": fields["id"]}
+    C.register_action("launch-stop", cls="safe-write", required=("id",), fields=lambda b: {"id": b["id"]},
+                      audit=lambda f: {"id": f["id"]}, handler=h_stop)
+    C.register_action("x-view", cls="read", handler=lambda r, f, c: (True, None, {}))
+    pins = {"interrupt": "safe-write", "save-checkpoint": "safe-write", "hook-toggle": "risky-write", "fallback-mode": "risky-write"}
+    expect("the four shipped actions carry the pinned class tags", all(C._ACTIONS[k]["cls"] == v for k, v in pins.items()))
+    expect("every allowed action has a class from the closed set", all(C._ACTIONS[a]["cls"] in C.CLASSES for a in C.ALLOWED_ACTIONS))
+    expect("the classes are exactly read / safe-write / risky-write / expand", C.CLASSES == ("read", "safe-write", "risky-write", "expand"))
+    C2 = load(libdir)
+    try:
+        C2.register_action("launch-stop", cls="risky-write", handler=lambda r, f, c: (True, None, {}))
+        refused = False
+    except ValueError:
+        refused = True
+    expect("launch-stop cannot be registered as anything but safe-write", refused)
+    def d(action, params):
+        C._BUCKETS.clear()
+        return C.dispatch(root, action, params)
+    for how in ("env", "file"):
+        if how == "env":
+            os.environ["HMD_UI_CONTROLS"] = "0"
+        else:
+            os.environ.pop("HMD_UI_CONTROLS", None)
+            C.set_enabled(root, False)
+        expect("(%s) launch-stop runs under the kill switch" % how, d("launch-stop", {"id": "l-77"})[0] is True)
+        expect("(%s) every other action -- a read one included -- is controls-off" % how,
+               all(d(a, {})[:2] == (False, "controls-off") for a in ("x-view", "save-checkpoint", "interrupt", "launch-session", "pr-merge")))
+        expect("(%s) the exemption is by NAME: a look-alike is still not-implemented" % how, d("launch-stoop", {"id": "l-77"})[:2] == (False, "not-implemented"))
+    os.environ.pop("HMD_UI_CONTROLS", None)
+    C.set_enabled(root, True)
+    expect("with the kill switch off again launch-stop and a read action both run", d("launch-stop", {"id": "l-78"})[0] is True and d("x-view", {})[0] is True)
+    return failed
+
+real = checks(sys.argv[1])
+print("REAL", json.dumps(real))
+ctl_src = open(os.path.join(sys.argv[1], "companion_ui_controls.py")).read()
+sw_src = open(os.path.join(sys.argv[1], "companion_remote_switches.py")).read()
+mutants = [
+    ("launch-stop-needs-the-switch", 'KILL_SWITCH_EXEMPT = frozenset(("launch-stop",))', "KILL_SWITCH_EXEMPT = frozenset()"),
+    ("kill-switch-exempts-everything", "    if action not in KILL_SWITCH_EXEMPT and not controls_enabled(root):", "    if False:"),
+    ("exempt-class-unchecked", "    if name in KILL_SWITCH_EXEMPT and cls != CLASS_SAFE_WRITE:", "    if False:"),
+    ("reserved-names-unnamed", 'RESERVED_EXPAND = {"launch-session": "launch", "pr-merge": "merge"}', "RESERVED_EXPAND = {}"),
+]
+for name, old, new in mutants:
+    if old not in ctl_src:
+        print("MUTANT", name, "NO-ANCHOR")
+        continue
+    d = tempfile.mkdtemp(prefix="clsmut-")
+    open(os.path.join(d, "companion_ui_controls.py"), "w").write(ctl_src.replace(old, new, 1))
+    open(os.path.join(d, "companion_remote_switches.py"), "w").write(sw_src)
+    try:
+        failed = checks(d)
+    except Exception as e:
+        failed = ["crashed: %s" % type(e).__name__]
+    print("MUTANT", name, "CAUGHT" if failed else "SURVIVED", json.dumps(failed)[:140])
+PYEOF
+CLSOUT="$(python3 "$CLS" "$REPO/bin/lib" 2>/dev/null)"
+if printf '%s' "$CLSOUT" | grep -q '^REAL \[\]$'; then ok "12a class tags (closed set, the four pinned) and the launch-stop kill-switch exemption hold on the real module"; else bad "12a class tags / exemption: $(printf '%s' "$CLSOUT" | head -3 | cut -c1-500)"; fi
+CAUGHT="$(printf '%s' "$CLSOUT" | grep -c ' CAUGHT ' || true)"
+SURV="$(printf '%s' "$CLSOUT" | grep -c ' SURVIVED \| NO-ANCHOR' || true)"
+if [ "$CAUGHT" = "3" ] && [ "$SURV" = "1" ] && printf '%s' "$CLSOUT" | grep -q 'MUTANT reserved-names-unnamed SURVIVED'; then
+  bad "12b the reserved-names mutant survived: the in-process half does not check a reserved name's gate"
+elif [ "$CAUGHT" = "4" ] && [ "$SURV" = "0" ]; then
+  ok "12b all 4 mutants (launch-stop needing the switch, a kill switch that exempts everything, an exempt class unchecked, reserved names unnamed) are caught"
+else
+  bad "12b caught $CAUGHT of 4, survived/no-anchor $SURV: $(printf '%s' "$CLSOUT" | grep MUTANT)"
+fi
+FIX_X="$(new_repo expandgate)"
+HMD_UI_CONTROLS=0 start_ui "$FIX_X"
+ctl '{"action":"launch-session","params":{"repo":"r-0000","branch":"x"}}'
+expect "12c the kill switch beats the expand gate: launch-session -> 403 controls-off" 403 '.ok == false and .detail == "controls-off"'
+ctl '{"action":"launch-stop","params":{"id":"l-1"}}'
+expect "12d launch-stop is exempt from the kill switch, but nothing registered a handler yet -> 404 not-implemented, never controls-off" 404 '.ok == false and .detail == "not-implemented"'
+start_ui "$FIX_X"
+ctl '{"action":"pr-merge","params":{"number":1,"method":"squash"}}'
+expect "12e the reserved expand name pr-merge is gated before any handler exists: 403 not-allowed while the switch is off" 403 '.ok == false and .detail == "not-allowed"'
+stop_ui
 
 echo
 echo "$PASS passed, $FAIL failed"

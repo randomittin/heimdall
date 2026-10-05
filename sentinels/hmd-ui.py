@@ -867,6 +867,19 @@ def collect_controls(root, state=None):
     return CONTROLS.snapshot(root, hooks=state.get("hooks"))
 
 
+def collect_remote_actions(root):
+    """The `remote_actions` addendum (CP2): the laptop's two expand switches and the last expand attempts, read back from the
+    controls audit log -- via companion_ui_controls.remote_actions. None when the module cannot load: the key is then
+    absent, which is how an hmd without it reads to the phone -- never a crash."""
+    return None if CONTROLS is None else CONTROLS.remote_actions(root)
+
+
+def collect_launch(root):
+    """The `launch` addendum (CP2): {v, enabled} and, while the launch switch is on, the allowlisted repos by id + label --
+    never a path. Via companion_ui_controls.launch_state; None when the module cannot load."""
+    return None if CONTROLS is None else CONTROLS.launch_state(root)
+
+
 # stderr diagnostics from the loop threads (the poller, the warmer, the panel publishers, the push observer). Two rules,
 # both learned from a full disk. A diagnostic never raises: stderr is a file on the same volume as everything else, so
 # its write fails exactly when something else already did, and an exception out of an `except` handler ended the
@@ -1165,6 +1178,12 @@ def collect_state(root, transport=None):
     controls = safe(lambda r: collect_controls(r, state))
     if controls is not None:
         state["controls"] = controls
+    remote_actions = safe(collect_remote_actions)
+    if remote_actions is not None:
+        state["remote_actions"] = remote_actions
+    launch = safe(collect_launch)
+    if launch is not None:
+        state["launch"] = launch
     if transport is not None:
         state["transport"] = transport
         redact, strip_root = _transport_redaction(transport, root)
