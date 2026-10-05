@@ -1,0 +1,5 @@
+{
+  "schema": "runhmd.attack-target/1",
+  "profile": "settlement-webhook/1",
+  "module": "webhook.mjs"
+}
