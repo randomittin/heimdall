@@ -19,9 +19,20 @@
 #   7  after all of that abuse a genuine send-message still returns {ok:true, id}
 #   8  the audit log has one line per command with device = 8 hex of the bound key (never "direct"), via relay, no params
 #      outside the whitelist
+#   9  none of those commands was refused `rate-limited`: the suite spends the overall budget on a schedule (below)
 #
 # Hermetic: HOME/HEIMDALL_HOME/TMPDIR are a temp dir, every process this suite starts is reaped on EXIT, every wait is a
 # bounded poll. No live relay client is ever signalled: the one this suite starts is its own.
+#
+# The one thing it cannot make hermetic is the clock. The dispatcher's overall budget (bin/lib/companion_ui_controls.py
+# _GLOBAL_RATE: a burst of 5, then one more command every 6 s) is a token bucket in the relay client's own memory, and 9 of
+# this suite's 14 frames are charged to it (an unknown action, a rid repeat, a forgery, a replayed seq and send-message are
+# all refused before the budget). Nothing is shared with any other suite or run -- the bucket dies with the client -- but
+# the suite used to stay inside it only while python3 start-up and its own polls were slow enough to space the commands
+# out: on a quicker box (python3 not behind a pyenv shim, ~20 ms a start instead of ~170) the 6th charged command came back
+# `rate-limited` and so did every one after it (3b, 4, 5 red). So a charged command goes through send_charged, which holds
+# the 6th and every later one until the bucket is certain to hold a token again; the burst and the refill are read from the
+# module itself, so a retuned limit retunes the schedule.
 
 set -u
 
@@ -63,6 +74,24 @@ cleanup() {
   rm -rf "$TMPROOT"
 }
 trap cleanup EXIT
+
+# The overall control budget the schedule below is built from, "<burst>:<whole seconds per token>", read from the module itself.
+BUDGET="$(python3 - "$REPO/bin/lib/companion_ui_controls.py" <<'PYEOF' 2>/dev/null
+import math, sys
+from importlib.util import spec_from_file_location, module_from_spec
+spec = spec_from_file_location("companion_ui_controls", sys.argv[1])
+mod = module_from_spec(spec); spec.loader.exec_module(mod)
+burst, per_s = mod._GLOBAL_RATE
+print("%d:%d" % (burst, math.ceil(1.0 / per_s - 1e-9)))
+PYEOF
+)"
+BUDGET_BURST="${BUDGET%%:*}"
+BUDGET_EVERY_S="${BUDGET##*:}"
+case "$BUDGET" in
+  ''|:*|*:|*[!0-9:]*|*:*:*)
+    printf 'FATAL: cannot read the overall control budget (_GLOBAL_RATE) from bin/lib/companion_ui_controls.py\n' >&2
+    printf '\n0 passed, 1 failed\n'; exit 1 ;;
+esac
 
 wait_for() {
   local file="$1" re="$2" secs="${3:-10}" i=0 max
@@ -189,6 +218,32 @@ send_cmd() {
 }
 ack_of() { wait_for_ack_of_seq "$LOG/frames.ndjson" "$KEY_B64" "$1" 10; }
 cmd_json() { jq -cn --arg a "$1" --argjson p "$2" '{action:$a, params:$p}'; }
+
+# send_charged SEQ TEXT [KEY] -> send_cmd for a command that reaches a handler, so is charged to the overall budget (see the
+# header). The first BUDGET_BURST go out at once; the Nth after that waits for BUDGET_T0 + (N - burst) * seconds-per-token on
+# time.monotonic() -- the clock the bucket itself runs on, one value for every process. BUDGET_T0 is taken when the first
+# charged command's ack was read, so it is never earlier than the charge that emptied the first token: the bucket holds at
+# least what this assumes, whatever the box's speed. A frame refused before the budget (unknown action, rid repeat,
+# forgery, replay, send-message) is a plain send_cmd.
+CHARGED=0
+BUDGET_T0=""
+mono_now() { python3 -c 'import time; print(repr(time.monotonic()))'; }
+send_charged() {
+  CHARGED=$((CHARGED + 1))
+  if [ "$CHARGED" -gt "$BUDGET_BURST" ]; then
+    if [ -z "$BUDGET_T0" ]; then printf 'FATAL: charged command #%s sent before BUDGET_T0 was taken\n' "$CHARGED" >&2; printf '\n0 passed, 1 failed\n'; exit 1; fi
+    python3 - "$BUDGET_T0" "$(( BUDGET_EVERY_S * (CHARGED - BUDGET_BURST) ))" <<'PYEOF'
+import sys, time
+until = float(sys.argv[1]) + float(sys.argv[2])
+while True:
+    left = until - time.monotonic()
+    if left <= 0:
+        break
+    time.sleep(min(0.25, left))
+PYEOF
+  fi
+  send_cmd "$@"
+}
 HEADS_BEFORE="$(git -C "$REPO_T" rev-parse HEAD)"
 
 # 0. the cap and the controls key ride every sealed state frame
@@ -202,8 +257,9 @@ fi
 if ! printf '%s' "$ST" | jq -c '.state.controls' | grep -Eq '/(Users|home|private|tmp|var)/|@'; then ok "0b. no absolute path or e-mail anywhere in the relayed controls key"; else bad "0b. a path or e-mail leaked into state.controls"; fi
 
 # 1. save-checkpoint
-send_cmd 1 "$(cmd_json save-checkpoint '{"rid":"c1"}')"
+send_charged 1 "$(cmd_json save-checkpoint '{"rid":"c1"}')"
 ACK="$(ack_of 1)"
+BUDGET_T0="$(mono_now)"   # the first charge happened before this ack was read: every later charge is scheduled from here
 if printf '%s' "$ACK" | jq -e '.ok == true and .of_seq == 1 and (.result.written_at | type == "number")' >/dev/null 2>&1 && [ -s "$REPO_T/.planning/CHECKPOINT.md" ] \
    && [ "$(git -C "$REPO_T" rev-parse HEAD)" = "$HEADS_BEFORE" ]; then
   ok "1. save-checkpoint -> {ok:true, of_seq:1, result:{written_at}}; the file is written, nothing is committed"
@@ -212,14 +268,14 @@ else
 fi
 
 # 2. hook-toggle, a locked id, an unknown action
-send_cmd 2 "$(cmd_json hook-toggle '{"id":"parallel-gate","enabled":false,"rid":"h1"}')"
+send_charged 2 "$(cmd_json hook-toggle '{"id":"parallel-gate","enabled":false,"rid":"h1"}')"
 ACK="$(ack_of 2)"
 if printf '%s' "$ACK" | jq -e '.ok == true and .of_seq == 2 and .result == {"id":"parallel-gate","enabled":false}' >/dev/null 2>&1 && [ "$(cat "$HEIMDALL_HOME/hooks-disabled" 2>/dev/null)" = "parallel-gate" ]; then
   ok "2a. hook-toggle (parallel-gate, off) -> {ok:true, result:{id, enabled:false}} and hooks-disabled holds exactly it"
 else
   bad "2a. hook-toggle ack: $ACK / $(cat "$HEIMDALL_HOME/hooks-disabled" 2>/dev/null)"
 fi
-send_cmd 3 "$(cmd_json hook-toggle '{"id":"stub-gate","enabled":false}')"
+send_charged 3 "$(cmd_json hook-toggle '{"id":"stub-gate","enabled":false}')"
 ACK="$(ack_of 3)"
 if printf '%s' "$ACK" | jq -e '.ok == false and .of_seq == 3 and .detail == "not-allowed"' >/dev/null 2>&1 && [ "$(cat "$HEIMDALL_HOME/hooks-disabled" 2>/dev/null)" = "parallel-gate" ]; then
   ok "2b. a locked id -> {ok:false, detail:not-allowed} and hooks-disabled is unchanged"
@@ -229,23 +285,23 @@ fi
 send_cmd 4 "$(cmd_json rm-rf '{}')"
 ACK="$(ack_of 4)"
 if printf '%s' "$ACK" | jq -e '.ok == false and .of_seq == 4 and .detail == "not-implemented"' >/dev/null 2>&1; then ok "2c. an unknown action -> {ok:false, detail:not-implemented}"; else bad "2c. unknown-action ack: $ACK"; fi
-send_cmd 5 "$(cmd_json hook-toggle '{"id":"parallel-gate","enabled":true,"rid":"h2"}')"
+send_charged 5 "$(cmd_json hook-toggle '{"id":"parallel-gate","enabled":true,"rid":"h2"}')"
 ack_of 5 >/dev/null
 
 # 3. fallback-mode
-send_cmd 6 "$(cmd_json fallback-mode '{"mode":"switch"}')"
+send_charged 6 "$(cmd_json fallback-mode '{"mode":"switch"}')"
 ACK="$(ack_of 6)"
 if printf '%s' "$ACK" | jq -e '.ok == false and .detail == "confirm-required"' >/dev/null 2>&1 && [ ! -e "$REPO_T/.heimdall/fallback.json" ]; then
   ok "3a. fallback-mode switch without confirm -> confirm-required and nothing written"
 else
   bad "3a. switch-without-confirm ack: $ACK"
 fi
-send_cmd 7 "$(cmd_json fallback-mode '{"mode":"off"}')"
+send_charged 7 "$(cmd_json fallback-mode '{"mode":"off"}')"
 ACK="$(ack_of 7)"
 if printf '%s' "$ACK" | jq -e '.ok == true and .detail == "unchanged" and .result == {"mode":"off"}' >/dev/null 2>&1; then ok "3b. fallback-mode off while off -> ok, unchanged"; else bad "3b. off ack: $ACK"; fi
 
 # 4. interrupt while idle
-send_cmd 8 "$(cmd_json interrupt '{"rid":"i1"}')"
+send_charged 8 "$(cmd_json interrupt '{"rid":"i1"}')"
 ACK="$(ack_of 8)"
 if printf '%s' "$ACK" | jq -e '.ok == false and .detail == "not-running"' >/dev/null 2>&1 && [ ! -e "$REPO_T/.heimdall/ui/stop-request.json" ]; then
   ok "4. interrupt with no running turn -> {ok:false, detail:not-running}, no stop request written"
@@ -254,12 +310,12 @@ else
 fi
 
 # 5. rid
-send_cmd 9 "$(cmd_json hook-toggle '{"id":"ctx-meter-notice","enabled":false,"rid":"d1"}')"
+send_charged 9 "$(cmd_json hook-toggle '{"id":"ctx-meter-notice","enabled":false,"rid":"d1"}')"
 ack_of 9 >/dev/null
 send_cmd 10 "$(cmd_json hook-toggle '{"id":"ctx-meter-notice","enabled":false,"rid":"d1"}')"
 ACK="$(ack_of 10)"
 if printf '%s' "$ACK" | jq -e '.ok == true and .dup == true and .result.id == "ctx-meter-notice"' >/dev/null 2>&1; then ok "5. the same rid again -> the stored ack with dup:true"; else bad "5. dup ack: $ACK"; fi
-send_cmd 11 "$(cmd_json hook-toggle '{"id":"ctx-meter-notice","enabled":true,"rid":"d2"}')"
+send_charged 11 "$(cmd_json hook-toggle '{"id":"ctx-meter-notice","enabled":true,"rid":"d2"}')"
 ack_of 11 >/dev/null
 
 # 6. a forgery and a replayed seq change nothing
@@ -290,6 +346,14 @@ if [ -f "$AUD" ] && jq -e -s 'length >= 10 and all(.[]; (.device | test("^[0-9a-
   ok "8. the audit log holds a line per command: device = 8 hex of the bound key, via relay, the seq, whitelisted params only"
 else
   bad "8. audit log: $(head -c 400 "$AUD" 2>/dev/null)"
+fi
+
+# 9. the schedule held: not one command was refused for rate (a charged frame sent with a plain send_cmd, or a retuned
+#    budget the schedule did not follow, shows up here by name instead of as a cascade of unrelated acks)
+if [ -f "$AUD" ] && jq -e -s 'all(.[]; .detail != "rate-limited")' "$AUD" >/dev/null 2>&1; then
+  ok "9. no command was refused rate-limited: the overall budget was spent on the schedule, not on the speed of the box"
+else
+  bad "9. rate-limited commands in the audit log: $(jq -c 'select(.detail == "rate-limited") | {seq, action}' "$AUD" 2>/dev/null | head -c 400)"
 fi
 
 echo
