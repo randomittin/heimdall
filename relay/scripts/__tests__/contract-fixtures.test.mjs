@@ -104,3 +104,40 @@ test('the phone-leg device_bound and revoke frames decode as control frames too'
     assert.equal(decoded.sender, 'relay');
   }
 });
+
+test('hmd WebSocket leg: device_bound is the NDJSON line\'s envelope and decodes as a relay control frame', () => {
+  const message = wire.stream_ws.messages.device_bound;
+  assert.deepEqual(message, wire.stream.lines.device_bound, 'a WebSocket message is an NDJSON line without its newline');
+  const decoded = decodeEnvelope(JSON.stringify(instantiate(message)));
+  assert.ok(decoded, 'stream_ws device_bound must decode');
+  assert.equal(decoded.sender, 'relay');
+  assert.equal(decoded.type, 'device_bound');
+  assert.equal(decoded.ciphertext, null);
+  assert.equal(decoded.payload.device_pubkey, computed.device_pubkey_b64url);
+});
+
+test('hmd WebSocket leg: ping and pong are plain text, never an envelope', () => {
+  for (const text of [wire.stream_ws.messages.client_ping, wire.stream_ws.messages.relay_pong]) {
+    assert.equal(typeof text, 'string');
+    assert.equal(decodeEnvelope(text), null, `${text} must not decode as an envelope`);
+  }
+});
+
+/** The payload of one unfragmented RFC 6455 text frame, unmasked when the mask bit is set. */
+function textFramePayload(hex) {
+  const bytes = fromHex(hex);
+  assert.equal(bytes[0], 0x81, 'FIN set, text opcode');
+  const length = bytes[1] & 0x7f;
+  assert.ok(length < 126, 'a short payload');
+  const mask = (bytes[1] & 0x80) === 0 ? null : bytes.subarray(2, 6);
+  const payload = bytes.subarray(mask === null ? 2 : 6);
+  assert.equal(payload.length, length, 'the frame is exactly its header and payload');
+  return Buffer.from(payload.map((byte, i) => (mask === null ? byte : byte ^ mask[i % 4]))).toString('utf8');
+}
+
+test('hmd WebSocket leg: the pinned ping and pong octets are RFC 6455 text frames of the fixture\'s messages', () => {
+  const { frames, messages } = wire.stream_ws;
+  assert.equal(textFramePayload(frames.client_ping.hex), messages.client_ping);
+  assert.equal(frames.client_ping.hex.slice(4, 12), frames.client_ping.mask, 'the pinned mask is the one in the frame');
+  assert.equal(textFramePayload(frames.relay_pong.hex), messages.relay_pong);
+});
