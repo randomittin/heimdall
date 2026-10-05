@@ -923,10 +923,11 @@ class PushMonitor:
             with self._cv:
                 if self._stop.is_set():
                     return
-                if not (self._pending or self._tickets or any(d["window"] for d in self._devices.values())):
+                if not (self._pending or self._tests or self._tickets
+                        or any(d["window"] for d in self._devices.values())):
                     self._thread = None
                     return
-                if not self._pending:
+                if not (self._pending or self._tests):
                     self._cv.wait(self._next_wait(self._clock()))
 
     def _next_wait(self, now):
@@ -943,15 +944,20 @@ class PushMonitor:
         return max(0.05, min(due))
 
     def step(self, now=None):
-        """One worker pass: take queued events through the policy, send what is due, fetch receipts that are due."""
+        """One worker pass: take queued events through the policy, send what is due, serve operator test requests,
+        fetch receipts that are due."""
         with self._step_lock:
             now = self._clock() if now is None else now
             with self._cv:
                 batch = list(self._pending)
                 self._pending.clear()
+                tests = list(self._tests)
+                self._tests.clear()
             if batch:
                 self._accept(batch, now)
             self._flush(now)
+            for request_id in tests:
+                self._serve_test(request_id, now)
             self._poll_receipts(now)
 
     # -- policy --------------------------------------------------------------------------------------
@@ -964,9 +970,7 @@ class PushMonitor:
             del self._devices[fp]
         for detected_at, event in batch:
             for fp, record in data["devices"].items():
-                dev = self._devices.setdefault(fp, {"window": None, "last_sent": None,
-                                                    "sent_other": collections.deque(), "sent_approval": collections.deque()})
-                dev["rec"] = record
+                dev = self._runtime(fp, record)
                 if event["kind"] not in record["events"]:
                     self._log(event["kind"], fp, False, None, "disabled-kind", 0)
                 elif foreground:
@@ -977,6 +981,14 @@ class PushMonitor:
                     dev["window"] = {"opened": detected_at, "cands": [event]}
                 else:
                     dev["window"]["cands"].append(event)
+
+    def _runtime(self, fp, record):
+        """The in-memory state of one device (coalescing window, last send, hourly counters), created on first
+        sight, with its latest registry record."""
+        dev = self._devices.setdefault(fp, {"window": None, "last_sent": None,
+                                            "sent_other": collections.deque(), "sent_approval": collections.deque()})
+        dev["rec"] = record
+        return dev
 
     def _foreground(self, data, now):
         """Spec 7.3: the app said foreground, recently, and (when the host can tell) the phone is attached. A report
@@ -1041,21 +1053,65 @@ class PushMonitor:
         record = dev["rec"]
         return build_message(record["token"], event, record["label"], record["ref"], now)
 
+    def _serve_test(self, request_id, now):
+        """`hmd app push-test`: ONE `test` message to every registered device, answered through push-test.result.
+
+        Only the owner of the sender lock serves it -- a monitor that does not own it stays quiet and the owner answers
+        -- so a test goes through the one process that sends the real notifications, with its back-off and its
+        counters. It skips the kind filter, foreground suppression and the coalescing window (so the 10 s spacing);
+        it still obeys the hourly cap, the back-off / pause, the lock and the kill switch (see the module docstring)."""
+        data = self._load()
+        if data is None:
+            return                                       # the registry could not be read: _load reported it
+        devices = data["devices"]
+        if not devices:
+            self._test_result(request_id, "done", [])    # nothing to send to, so there is no sender to be: any monitor may say so
+            return
+        if not self._own_lock():
+            return
+        self._test_result(request_id, "sending", [])
+        event = {"kind": "test", "key": "t:" + request_id, "ep": None, "fields": {}}
+        answers, out = {}, []
+        for fp, record in devices.items():
+            dev = self._runtime(fp, record)
+            if self._capped(dev["sent_other"], now):
+                self._log("test", fp, False, None, "rate-limited", 0)
+                answers[fp] = {"device": fp, "ok": False, "detail": None, "suppressed": "rate-limited"}
+                continue
+            dev["sent_other"].append(now)
+            out.append((fp, event, self._message(dev, event, now)))
+        for fp, ok, detail in self._send(out, now) if out else []:
+            answers[fp] = {"device": fp, "ok": ok, "detail": detail, "suppressed": None}
+        self._test_result(request_id, "done", [answers[fp] for fp in devices])
+
+    def _test_result(self, request_id, state, results):
+        """Write the answer the CLI is waiting for. A write that fails costs the CLI its answer, never the send."""
+        try:
+            _write_private_json(os.path.join(self.root, TEST_RESULT_REL),
+                                {"v": 1, "id": request_id, "state": state, "results": results})
+        except OSError as exc:
+            self._error_once("test-result", exc)
+
     # -- sending -------------------------------------------------------------------------------------
     def _send(self, out, now):
+        """POST `out` -- [(fingerprint, event, message)] -- in batches of MAX_BATCH, log every message and act on what
+        Expo says about each. Returns [(fingerprint, ok, detail)] for every message, in order."""
         sender = self._get_sender()
+        outcomes = []
         for start in range(0, len(out), MAX_BATCH):
             chunk = out[start:start + MAX_BATCH]
             if now < self._paused_until or now < self._backoff_until:
                 why = "paused" if now < self._paused_until else "backoff"
                 for fp, event, _ in chunk:
                     self._log(event["kind"], fp, False, why, None, 0)
+                    outcomes.append((fp, False, why))
                 continue
             began = time.monotonic()
             results, gave_up = sender.send([message for _, _, message in chunk])
             took = int((time.monotonic() - began) * 1000)
             for (fp, event, message), res in zip(chunk, results):
                 self._log(event["kind"], fp, res["ok"], res["detail"], None, took)
+                outcomes.append((fp, res["ok"], res["detail"]))
                 if res["ok"] and res["id"]:
                     self._tickets.append((res["id"], message["to"], now))
                 elif res["detail"] == "DeviceNotRegistered":
@@ -1064,6 +1120,7 @@ class PushMonitor:
                     self._paused_until = now + self._cfg["pause_s"]
             if gave_up:
                 self._backoff_until = now + self._cfg["backoff_s"]
+        return outcomes
 
     def _poll_receipts(self, now):
         """Spec 7.8: once, >= receipt_after_s after the oldest ticket; only DeviceNotRegistered changes anything."""
