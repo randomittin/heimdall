@@ -207,6 +207,36 @@ class FakeNetwork:
         return FakeConn(self, self.connections)
 
 
+class HandshakeAnswer:
+    """What check_upgrade reads off the relay's answer to the upgrade request: a status and headers."""
+
+    def __init__(self, status, headers):
+        self.status = status
+        self._headers = {name.lower(): value for name, value in headers.items()}
+
+    def getheader(self, name, default=None):
+        return self._headers.get(name.lower(), default)
+
+
+class OneShotSocket:
+    """A socket that has received `data` and nothing more; it keeps what it was told and what was sent."""
+
+    def __init__(self, data):
+        self.data = data
+        self.timeout = None
+        self.sent = b""
+
+    def settimeout(self, value):
+        self.timeout = value
+
+    def recv(self, n):
+        chunk, self.data = self.data[:n], self.data[n:]
+        return chunk
+
+    def sendall(self, data):
+        self.sent += data
+
+
 class Observed:
     def __init__(self):
         self.requests = []
@@ -281,7 +311,16 @@ def drive(mod, fx, root):
         client._handle_envelope(fx.instantiate(wire["stream"]["lines"]["keepalive"]))
         obs.silent_after_keepalive = (len(network.requests), len(obs.events)) == before
 
+        # hmd's leg is one route with two transports: a request with no Upgrade header (what every client before
+        # the WebSocket sends, and what HMD_RELAY_STREAM_TRANSPORT=ndjson still sends) and one that asks for it.
+        real_transport, real_new_key = mod.STREAM_TRANSPORT, mod.WS.new_key
+        mod.STREAM_TRANSPORT = "ndjson"
         client._open_stream()
+        mod.STREAM_TRANSPORT, mod.WS.new_key = "auto", lambda: fx.value("ws_key")
+        try:
+            client._open_stream()
+        finally:
+            mod.STREAM_TRANSPORT, mod.WS.new_key = real_transport, real_new_key
         client.revoke()
     finally:
         mod._connect = real_connect
@@ -309,6 +348,7 @@ def main():
     mod = load_client()
     check(mod.E2E is not None and mod.E2E.e2e_available(), "client: hmd_relay_e2e loads and passes its RFC self-tests")
     check(mod.INBOX is not None and mod.DECISIONS is not None, "client: inbox and decision stores load")
+    check(mod.WS is not None, "client: the WebSocket codec (hmd_relay_ws) loads")
     if failed:
         print("\n%d passed, %d failed" % (passed, failed))
         return 1
@@ -367,13 +407,14 @@ def main():
         return 1
 
     requests = obs.requests
-    check(len(requests) == 8, "client: made exactly the eight requests the session implies, in order "
-          "(pair/init, state, three acks, the refusal of the replay, stream, revoke)",
+    check(len(requests) == 9, "client: made exactly the nine requests the session implies, in order "
+          "(pair/init, state, three acks, the refusal of the replay, stream, stream asking for a WebSocket, revoke)",
           [(r["method"], r["path"]) for r in requests])
-    if len(requests) != 8:
+    if len(requests) != 9:
         print("\n%d passed, %d failed" % (passed, failed))
         return 1
-    pair_call, state_call, ack_send, ack_allow, ack_deny, ack_refusal, stream_call, revoke_call = requests
+    (pair_call, state_call, ack_send, ack_allow, ack_deny, ack_refusal, stream_call, stream_ws_call,
+     revoke_call) = requests
 
     def request_matches(call, template, label):
         want = fx.instantiate(template)
@@ -409,6 +450,35 @@ def main():
            "reused": [e["reused"] for e in posts]})
 
     request_matches(stream_call, wire["stream"]["request"], "GET /stream (the bearer rides in a header)")
+
+    # -- hmd's leg as a WebSocket: the request, the handshake, and the octets on the wire ----------------
+    request_matches(stream_ws_call, wire["stream_ws"]["request"],
+                    "GET /stream asking for a WebSocket (the same bearer beside the upgrade headers, key pinned)")
+    ws, ws_fixture = mod.WS, wire["stream_ws"]
+    answer = HandshakeAnswer(ws_fixture["response"]["status"], fx.instantiate(ws_fixture["response"]["headers"]))
+    try:
+        ws.check_upgrade(answer, fx.value("ws_key"))
+        handshake = "valid"
+    except ws.WsError as exc:
+        handshake = "refused: %s" % exc
+    check(handshake == "valid",
+          "client: the fixture's 101 (Sec-WebSocket-Accept included) answers the key the client sent", handshake)
+    ping = ws_fixture["frames"]["client_ping"]
+    check(ws.encode_frame(ws.OP_TEXT, ws_fixture["messages"]["client_ping"].encode("utf-8"),
+                          mask_key=bytes.fromhex(ping["mask"])).hex() == ping["hex"],
+          "client: its ping is the fixture's octets, byte for byte")
+    pong = ws_fixture["frames"]["relay_pong"]
+    check(ws.Connection(OneShotSocket(bytes.fromhex(pong["hex"])), max_message=1000, max_total=1000).receive(1.0)
+          == [("text", ws_fixture["messages"]["relay_pong"])],
+          "client: the relay's pong octets read back as the text message the fixture names")
+    bound_message = fx.instantiate(ws_fixture["messages"]["device_bound"])
+    check(bound_message == fx.instantiate(wire["stream"]["lines"]["device_bound"]),
+          "fixture: a WebSocket message is the NDJSON line's envelope, the same bytes without the newline")
+    bound_text = compact(bound_message)
+    bound_frame = bytes([0x81, 0x7E]) + len(bound_text).to_bytes(2, "big") + bound_text.encode("utf-8")
+    check(ws.Connection(OneShotSocket(bound_frame), max_message=100000, max_total=100000).receive(1.0)
+          == [("text", bound_text)],
+          "client: the device_bound message the relay sends is read off the wire whole")
 
     revoke_template = wire["revoke"]["request"]
     request_matches(revoke_call, revoke_template, "revoke")

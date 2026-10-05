@@ -117,6 +117,9 @@ to drive its own UI; nothing else is ever written to stdout.
         handshake included when it had to open a connection, and the retry on a
         replaced stale connection included -- reused whether it went out on a
         connection that was already open. See FRAME CONNECTIONS below
+    {"event":"stream_open","transport":"ws"|"ndjson"}
+        one line per hmd-leg connection that opened (HTTP 101 or 200): which transport it is. See STREAM
+        TRANSPORT below
     {"event":"stream_drop","retry_ms":N[,"reason":..]}
                                                        GET stream disconnected;
                                                        reconnecting after N ms.
@@ -179,6 +182,24 @@ socket with server_hostname = the relay's NAME, so SNI and certificate
 verification never see the address. HMD_RELAY_IP_FAMILY=4 or 6 restricts the
 lookup to that family, with no fallback to the other; any other value is
 reported as an `error` event and treated as auto.
+
+STREAM TRANSPORT (HMD_RELAY_STREAM_TRANSPORT=auto|ndjson, default auto; bin/lib/hmd_relay_ws.py; relay/contract/wire.json
+`stream_ws`; docs/analysis/2026-10-05-relay-hibernation.md): hmd's leg, GET /session/:id/stream, used to be one chunked
+NDJSON response, and an open response keeps the relay's Durable Object resident and billed (about 10,800 GB-s a day for one
+always-on session). The same route is now also a hibernatable WebSocket, so an idle session lets the object sleep. The
+transport is negotiated by the request alone: `auto` sends `Upgrade: websocket` beside the bearer and reads whatever comes
+back -- 101 is the WebSocket, 200 is the NDJSON an older relay answers (it ignores the header), so client and relay can be
+deployed in either order -- while `ndjson` never asks, which is what every client before this one does. A refused upgrade (a
+101 whose Sec-WebSocket-Accept is wrong) is an `error` event and a backoff, never a silent fallback. Over a WebSocket each
+message is one envelope, the bytes of an NDJSON line without its newline, handled by exactly the code a line is
+(_handle_envelope), so everything downstream of the read -- the replay guard, refusal acks, ack retry, ack priority, the two
+persistent POST connections -- is the same. What the transport changes is liveness: the relay writes no keepalive on a
+WebSocket (a timer would pin the object), so hmd pings. After STREAM_IDLE_S / 3 of silence it sends the text `ping`, which the
+runtime answers `pong` without waking the object; anything arriving is proof of life, and STREAM_IDLE_S of silence (counted
+only while blocked in the read, so a slow command handler is never mistaken for a quiet relay) is the same `idle` drop.
+Rotation, backoff, the per-message and per-connection byte caps (`overflow`) and the 401/404/410/429 handling are the NDJSON
+leg's, unchanged; a rotation ends the socket with a close frame (1000) first. A relay that closes the socket gives
+`stream_drop` reason "closed" with its close code (4001 session ended, 4002 superseded by a newer hmd leg, ...).
 
 FRAME CONNECTIONS (docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md Ask 3): POST
 /frames used to open a new TCP+TLS connection for every frame, and about a
@@ -357,6 +378,7 @@ DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "compan
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
 PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "companion_push_store.py"))
 LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
+WS = _load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
 # envelope this client will POST to /session/:id/frames -- one named constant,
@@ -434,6 +456,14 @@ try:
     STREAM_ROTATE_S = float(os.environ.get("HMD_RELAY_STREAM_ROTATE_S", "540"))
 except (TypeError, ValueError):
     STREAM_ROTATE_S = 540.0
+
+# HMD_RELAY_STREAM_TRANSPORT (default auto): how hmd's leg is carried -- see STREAM TRANSPORT in the module
+# docstring. `auto` asks the relay for a WebSocket on the same GET /stream and reads whatever it answers; `ndjson`
+# never asks. An unrecognised value falls back to auto; main() reports it as an `error` event once the event log
+# exists (this runs at import, before it can).
+_STREAM_TRANSPORT_ENV = os.environ.get("HMD_RELAY_STREAM_TRANSPORT", "auto").strip().lower() or "auto"
+STREAM_TRANSPORT_VALID = _STREAM_TRANSPORT_ENV in ("auto", "ndjson")
+STREAM_TRANSPORT = _STREAM_TRANSPORT_ENV if STREAM_TRANSPORT_VALID else "auto"
 
 # HMD_RELAY_IP_FAMILY (default auto): which address families _create_connection
 # may use -- auto (IPv4 first, IPv6 raced in as the fallback), or 4 / 6 (that
@@ -1123,11 +1153,19 @@ class RelayClient:
 
     # -- stream --------------------------------------------------------------
     def _open_stream(self):
+        """Open hmd's leg; returns (conn, resp, ws_key). With HMD_RELAY_STREAM_TRANSPORT=auto the request also asks
+        for a WebSocket upgrade, ws_key is the Sec-WebSocket-Key it carries (None when none was asked for), and
+        `resp` is whatever the relay answers: 101 is the WebSocket, 200 the NDJSON an older relay answers instead --
+        see `_stream_loop`."""
         conn = _connect(self.parsed, timeout=STREAM_TIMEOUT_S, label="stream")
-        conn.request("GET", _base_path(self.parsed) + "/session/%s/stream" % self.session_id,
-                      headers=self._auth_headers())
-        resp = conn.getresponse()
-        return conn, resp
+        headers = self._auth_headers()
+        ws_key = None
+        if WS is not None and STREAM_TRANSPORT == "auto":
+            ws_key = WS.new_key()
+            headers.update(WS.upgrade_headers(ws_key))
+            conn.response_class = WS.UpgradeResponse  # never reads past the head of a 101: see its docstring
+        conn.request("GET", _base_path(self.parsed) + "/session/%s/stream" % self.session_id, headers=headers)
+        return conn, conn.getresponse(), ws_key
 
     def _decide(self, params):
         """The phone's sealed DENY or STOP of a pending risky action (A4, deny-only round; the doc's
@@ -1460,6 +1498,9 @@ class RelayClient:
         self.send_hmd_frame("ack", ack_payload, ack_deadline=ack_deadline)
 
     def _handle_envelope(self, env):
+        if not isinstance(env, dict):  # valid JSON that is not an envelope: a loud error, never a dead stream thread
+            emit({"event": "error", "detail": "unexpected frame (not a JSON object) -- ignored"})
+            return
         sender = env.get("sender")
         type_ = env.get("type")
         if sender == "relay" and type_ == "device_bound":
@@ -1530,11 +1571,118 @@ class RelayClient:
             return
         emit({"event": "error", "detail": "unexpected frame sender=%r type=%r -- ignored" % (sender, type_)})
 
+    def _read_ndjson(self, conn, resp):
+        """Read hmd's leg as chunked NDJSON, one envelope per line, until it ends. Returns (drop_reason, info):
+        why it ended (None: a clean close with no local cause) and, for "overflow", the byte counts the
+        stream_drop event carries. The caller owns closing `conn`."""
+        drop_reason = None  # None == clean close, no other local cause
+        overflow_info = None
+        stream_total_bytes = 0
+        rotate_deadline = time.monotonic() + STREAM_ROTATE_S
+        try:
+            while not self.stop_event.is_set():
+                remaining = rotate_deadline - time.monotonic()
+                if remaining <= 0:
+                    drop_reason = "rotate"
+                    break
+                conn.sock.settimeout(min(STREAM_IDLE_S, remaining))
+                line = resp.readline(STREAM_READ_CAP_BYTES)
+                if not line:
+                    break
+                stream_total_bytes += len(line)
+                if (len(line) >= STREAM_READ_CAP_BYTES and not line.endswith(b"\n")) \
+                        or stream_total_bytes > STREAM_READ_CAP_BYTES:
+                    drop_reason = "overflow"
+                    overflow_info = {"line_bytes": len(line), "total_bytes": stream_total_bytes,
+                                      "cap_bytes": STREAM_READ_CAP_BYTES}
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    env = json.loads(line.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    emit({"event": "error", "detail": "malformed frame from stream (not JSON)"})
+                    continue
+                self._handle_envelope(env)
+        except socket.timeout:
+            drop_reason = "rotate" if time.monotonic() >= rotate_deadline else "idle"
+        except (OSError, http.client.HTTPException) as e:
+            emit({"event": "error", "detail": "stream read failed: %s" % e})
+            drop_reason = "error"
+        return drop_reason, overflow_info
+
+    def _read_ws(self, ws):
+        """Read hmd's leg as a WebSocket until it ends (STREAM TRANSPORT in the module docstring). Returns
+        (drop_reason, info) like _read_ndjson, plus one reason of its own, "closed": the relay's close frame, or its
+        connection ending, with the close code in info (None when there was no close frame). The caller owns
+        closing the connection.
+
+        Idleness is counted in time spent BLOCKED in the read, never in wall clock: a slow command handler (an ack
+        POST with retries takes seconds) must not read as a relay gone quiet, and the pong a ping draws is only
+        asked for once this loop is back to send the ping."""
+        rotate_deadline = time.monotonic() + STREAM_ROTATE_S
+        ping_every = max(STREAM_IDLE_S / 3.0, 0.05)
+        quiet = quiet_since_ping = 0.0  # seconds blocked in the read since the last byte / the last ping
+        try:
+            while not self.stop_event.is_set():
+                remaining = rotate_deadline - time.monotonic()
+                if remaining <= 0:
+                    try:
+                        ws.send_close(1000, "rotate")  # a courtesy to the relay: the connection is closed next either way
+                    except OSError as e:
+                        emit({"event": "error", "detail": "close frame before rotating not sent: %s" % e})
+                    return "rotate", None
+                wait = max(min(remaining, STREAM_IDLE_S - quiet, ping_every - quiet_since_ping), 0.001)
+                began = time.monotonic()
+                try:
+                    events = ws.receive(wait)
+                except socket.timeout:
+                    blocked = time.monotonic() - began
+                    quiet += blocked
+                    quiet_since_ping += blocked
+                    if quiet >= STREAM_IDLE_S:
+                        return "idle", None
+                    if quiet_since_ping >= ping_every:
+                        ws.send_text("ping")  # the relay writes no keepalive on a WebSocket: hmd asks for proof of life
+                        quiet_since_ping = 0.0
+                    continue
+                quiet = quiet_since_ping = 0.0
+                for event in events:
+                    kind = event[0]
+                    if kind == "close":
+                        return "closed", {"close_code": event[1]}
+                    if kind == "text":
+                        if event[1] == "pong":
+                            continue  # the runtime's answer to our ping: it was proof of life, there is nothing to handle
+                        try:
+                            env = json.loads(event[1])
+                        except ValueError:
+                            emit({"event": "error", "detail": "malformed frame from stream (not JSON)"})
+                            continue
+                        self._handle_envelope(env)
+                    elif kind == "binary":
+                        emit({"event": "error", "detail": "unexpected binary message from stream -- ignored"})
+                    if self.stop_event.is_set():
+                        break
+        except WS.WsOverflow as e:
+            return "overflow", {"line_bytes": e.message_bytes, "total_bytes": e.total_bytes,
+                                "cap_bytes": STREAM_READ_CAP_BYTES}
+        except WS.WsEof:
+            return "closed", {"close_code": None}
+        except WS.WsProtocolError as e:
+            emit({"event": "error", "detail": "stream protocol error: %s" % e})
+            return "error", None
+        except (OSError, http.client.HTTPException) as e:
+            emit({"event": "error", "detail": "stream read failed: %s" % e})
+            return "error", None
+        return None, None
+
     def _stream_loop(self):
         backoff_ms = BACKOFF_BASE_MS
         while not self.stop_event.is_set():
             try:
-                conn, resp = self._open_stream()
+                conn, resp, ws_key = self._open_stream()
             except (OSError, http.client.HTTPException) as e:
                 emit({"event": "error", "detail": "stream connect failed: %s" % e})
                 emit({"event": "stream_drop", "retry_ms": backoff_ms})
@@ -1561,7 +1709,21 @@ class RelayClient:
                     return
                 continue
 
-            if resp.status != 200:
+            ws = None
+            if resp.status == 101 and ws_key is not None:
+                try:
+                    WS.check_upgrade(resp, ws_key)
+                except WS.WsHandshakeError as e:
+                    emit({"event": "error", "detail": "stream upgrade refused: %s" % e})
+                    emit({"event": "stream_drop", "retry_ms": backoff_ms})
+                    conn.close()
+                    if self.stop_event.wait(backoff_ms / 1000.0):
+                        return
+                    backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
+                    continue
+                ws = WS.Connection(conn.sock, max_message=STREAM_READ_CAP_BYTES - 1,
+                                   max_total=STREAM_READ_CAP_BYTES)
+            elif resp.status != 200:
                 emit({"event": "error", "detail": "stream open HTTP %d" % resp.status})
                 emit({"event": "stream_drop", "retry_ms": backoff_ms})
                 conn.close()
@@ -1571,41 +1733,12 @@ class RelayClient:
                 continue
 
             backoff_ms = BACKOFF_BASE_MS  # reset on a successful (re)connect
-            drop_reason = None  # None == clean close, no other local cause
-            overflow_info = None
-            stream_total_bytes = 0
-            rotate_deadline = time.monotonic() + STREAM_ROTATE_S
+            emit({"event": "stream_open", "transport": "ws" if ws is not None else "ndjson"})
             try:
-                while not self.stop_event.is_set():
-                    remaining = rotate_deadline - time.monotonic()
-                    if remaining <= 0:
-                        drop_reason = "rotate"
-                        break
-                    conn.sock.settimeout(min(STREAM_IDLE_S, remaining))
-                    line = resp.readline(STREAM_READ_CAP_BYTES)
-                    if not line:
-                        break
-                    stream_total_bytes += len(line)
-                    if (len(line) >= STREAM_READ_CAP_BYTES and not line.endswith(b"\n")) \
-                            or stream_total_bytes > STREAM_READ_CAP_BYTES:
-                        drop_reason = "overflow"
-                        overflow_info = {"line_bytes": len(line), "total_bytes": stream_total_bytes,
-                                          "cap_bytes": STREAM_READ_CAP_BYTES}
-                        break
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        env = json.loads(line.decode("utf-8"))
-                    except (ValueError, UnicodeDecodeError):
-                        emit({"event": "error", "detail": "malformed frame from stream (not JSON)"})
-                        continue
-                    self._handle_envelope(env)
-            except socket.timeout:
-                drop_reason = "rotate" if time.monotonic() >= rotate_deadline else "idle"
-            except (OSError, http.client.HTTPException) as e:
-                emit({"event": "error", "detail": "stream read failed: %s" % e})
-                drop_reason = "error"
+                if ws is not None:
+                    drop_reason, drop_info = self._read_ws(ws)
+                else:
+                    drop_reason, drop_info = self._read_ndjson(conn, resp)
             finally:
                 conn.close()
 
@@ -1619,9 +1752,16 @@ class RelayClient:
             event = {"event": "stream_drop", "retry_ms": backoff_ms}
             if drop_reason == "overflow":
                 event["reason"] = "overflow"
-                event.update(overflow_info)
+                event.update(drop_info)
             elif drop_reason == "idle":
                 event["reason"] = "idle"
+            elif drop_reason == "closed":  # a WebSocket the relay (or the path) ended
+                code = drop_info["close_code"]
+                emit({"event": "error",
+                      "detail": "stream closed by relay (%s) -- reconnecting with backoff"
+                                % ("WebSocket close code %d" % code if code is not None else "no close frame")})
+                event["reason"] = "closed"
+                event["close_code"] = code
             elif drop_reason is None:
                 emit({"event": "error",
                       "detail": "stream closed by relay with no local cause (idle, "
@@ -1768,6 +1908,13 @@ def main(argv=None):
     if not IP_FAMILY_VALID:
         emit({"event": "error",
               "detail": "HMD_RELAY_IP_FAMILY=%r is not one of auto|4|6 -- using auto" % _IP_FAMILY_ENV})
+    if not STREAM_TRANSPORT_VALID:
+        emit({"event": "error",
+              "detail": "HMD_RELAY_STREAM_TRANSPORT=%r is not one of auto|ndjson -- using auto" % _STREAM_TRANSPORT_ENV})
+    if WS is None and STREAM_TRANSPORT == "auto":
+        emit({"event": "error",
+              "detail": "bin/lib/hmd_relay_ws.py failed to import -- hmd's leg stays on NDJSON, which keeps the "
+                        "relay's Durable Object awake for as long as it is open"})
 
     if UI is None:
         emit({"event": "error",

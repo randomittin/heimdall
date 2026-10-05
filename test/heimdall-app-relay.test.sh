@@ -4164,8 +4164,9 @@ x_start_session() {
   shift 2
   XS_LOG="$TMPROOT/$tag.log"; XS_CTL="$TMPROOT/$tag.ctl"; XS_OUT="$TMPROOT/$tag.client.out"; XS_ERR="$TMPROOT/$tag.client.err"
   mkdir -p "$XS_LOG" "$XS_CTL"
+  for flag in ${XS_CTL_FLAGS:-}; do : > "$XS_CTL/$flag"; done  # ctl files that must exist before the client's first connect
   port_relay="$(free_port)"; port_ui="$(free_port)"
-  python3 "$FAKE_RELAY" serve "$port_relay" --log "$XS_LOG" --ctl "$XS_CTL" >"$TMPROOT/$tag.srv.out" 2>&1 &
+  python3 "$FAKE_RELAY" serve "$port_relay" --log "$XS_LOG" --ctl "$XS_CTL" ${XS_RELAY_ARGS:-} >"$TMPROOT/$tag.srv.out" 2>&1 &
   XS_SRV=$!
   PIDS+=("$XS_SRV")
   for _ in $(seq 1 50); do
@@ -4176,7 +4177,7 @@ x_start_session() {
   dev_priv="$(printf '%s' "$dev_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["priv_b64"])')"
   XS_DEV_PUB="$(printf '%s' "$dev_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pub_b64"])')"
   printf '%s' "$XS_DEV_PUB" > "$XS_CTL/bind-device"
-  "$@" "$RELAY_CLIENT_RUN" --relay "http://127.0.0.1:$port_relay" --repo "$repo" --ui-port "$port_ui" >"$XS_OUT" 2>"$XS_ERR" &
+  "$@" "$RELAY_CLIENT_RUN" --relay "${XS_SCHEME:-http}://127.0.0.1:$port_relay" --repo "$repo" --ui-port "$port_ui" >"$XS_OUT" 2>"$XS_ERR" &
   XS_CLIENT=$!
   PIDS+=("$XS_CLIENT")
   wait_for "$XS_OUT" '"event":"pair_init"' 10 || true
@@ -4590,6 +4591,273 @@ print("OK" if len(seen) == len(set(seen)) else "BAD duplicate of_seq")
   kill "$SRV_Y" 2>/dev/null; wait "$SRV_Y" 2>/dev/null
 else
   skip "scenario Y (stale-seq refusal): bin/lib/hmd_relay_e2e.py absent -- needs real seal"
+fi
+
+# ── Scenario Z: hmd's leg as a hibernatable WebSocket (relay/contract/wire.json `stream_ws`, bin/lib/hmd_relay_ws.py) ────
+# hmd's GET /stream used to be one chunked NDJSON response, and an open response keeps the relay's Durable Object awake and
+# billed. The same route is now also a WebSocket the object can sleep through, negotiated by the request alone (`Upgrade:
+# websocket`). Every scenario above runs against a relay WITHOUT --ws -- the relay as deployed before this change, which
+# ignores the Upgrade header and answers 200 NDJSON -- with a client that now asks for the upgrade by default, so all of
+# them are also proof that the current client works against an old relay. Here the fake relay speaks WebSocket (--ws) and
+# the stream semantics hmd relies on are checked over it: Z1 negotiation, bootstrap, a command and its ack, the stale-seq
+# refusal, a forged frame, the persistent POST connections; Z2 ping/pong liveness and the idle drop; Z3 rotation; Z4 the byte
+# cap; Z5 a relay that closes; Z6 a relay that ends the session; Z7 a refused upgrade and a 429; Z8 a relay that sends garbage;
+# Z9 the fallbacks and the knob; Z10 wss (TLS) ──────────────────────────────────────────────────────────────────────
+ws_start() {
+  # ws_start TAG [COMMAND WORDS...] -- a fake relay (--ws, unless W_RELAY_ARGS says otherwise) and the REAL client on a fresh
+  # repo, paired; leaves what a scenario needs in W_*
+  local tag="$1" relay_args="--ws"
+  shift
+  [ "${W_RELAY_ARGS+set}" = set ] && relay_args="$W_RELAY_ARGS"
+  W_REPO="$(make_repo)"
+  W_NUM=0
+  XS_RELAY_ARGS="$relay_args" x_start_session "$tag" "$W_REPO" "$@"
+  W_SID="$XS_SID"; W_KEY="$XS_KEY"; W_LOG="$XS_LOG"; W_CTL="$XS_CTL"; W_OUT="$XS_OUT"; W_ERR="$XS_ERR"
+  W_CLIENT="$XS_CLIENT"; W_SRV="$XS_SRV"
+}
+ws_stop() {
+  kill "$W_CLIENT" 2>/dev/null; wait "$W_CLIENT" 2>/dev/null
+  kill "$W_SRV" 2>/dev/null; wait "$W_SRV" 2>/dev/null
+}
+ws_command() {  # ws_command SEQ JSON [KEY_B64] -- seals one phone command and queues it as the next ctl file
+  W_NUM=$((W_NUM + 1))
+  prepare_device_action "$TMPROOT/ws.cmd.$W_NUM.json" "$W_SID" "${3:-$W_KEY}" "$1" "$2"
+  mv "$TMPROOT/ws.cmd.$W_NUM.json" "$W_CTL/$(printf '%03d' "$W_NUM").json"
+}
+ws_ack() { wait_for_ack_of_seq "$W_LOG/frames.ndjson" "$W_KEY" "$1" "${2:-10}"; }  # the opened ack of device seq $1
+ws_field() { python3 -c 'import json,sys; v=json.load(sys.stdin).get(sys.argv[1]); print("" if v is None else v)' "$1"; }  # one field of a JSON line
+
+if [ "$E2E_PRESENT" = true ]; then
+  # Z1: negotiation, bootstrap, a command and its ack, the refusal, a forged frame, the POST connections
+  ws_start Z1
+  if wait_for "$W_OUT" '"event":"stream_open","transport":"ws"' 10 && [ "$(head -1 "$W_LOG/stream-transport.log" 2>/dev/null)" = "ws asked=yes" ]; then
+    ok "Z1: the client asks for an upgrade on GET /stream, the relay answers 101, and the client reports the WebSocket"
+  else
+    bad "Z1: no ws stream_open (transport log: $(cat "$W_LOG/stream-transport.log" 2>/dev/null | tr '\n' ','); stderr: $(tail -2 "$W_ERR" 2>/dev/null))"
+  fi
+  if [ -n "$W_SID" ] && [ -n "$W_KEY" ] && grep -q '"event":"device_bound"' "$W_OUT" && ! grep -q 'token_query=y' "$W_LOG/requests.log" \
+     && grep -Eq '^GET /session/.*/stream.*auth=y' "$W_LOG/requests.log"; then
+    ok "Z1: the session key is bootstrapped from the device_bound message; the upgrade carried the bearer in a header, never ?token="
+  else
+    bad "Z1: no device_bound over the WebSocket, or the bearer was not a header"
+  fi
+  ws_command 1 '{"action":"send-message","params":{"text":"z1 over a websocket"}}'
+  Z1_ACK="$(ws_ack 1)"
+  if [ "$(printf '%s' "$Z1_ACK" | ws_field ok)" = "True" ] && [ -n "$(printf '%s' "$Z1_ACK" | ws_field id)" ] \
+     && grep -q '"z1 over a websocket"' "$W_REPO/.heimdall/ui/inbox.jsonl" 2>/dev/null; then
+    ok "Z1: a send-message command arrives as a WebSocket text message, lands in the inbox, and is acked {ok:true, id}"
+  else
+    bad "Z1: the command over the WebSocket was not acked ok / not in the inbox (ack '${Z1_ACK:-none}')"
+  fi
+  ws_command 1 '{"action":"send-message","params":{"text":"z1 over a websocket"}}'   # the very same frame again: the replay guard
+  Z1_REFUSAL="$(wait_for_refusal_ack "$W_LOG/frames.ndjson" "$W_KEY" 1 8)"
+  if [ "$Z1_REFUSAL" = '{"detail":"non-increasing-seq","last":1,"of_seq":1,"ok":false}' ] \
+     && [ "$(grep -c '"z1 over a websocket"' "$W_REPO/.heimdall/ui/inbox.jsonl")" = "1" ]; then
+    ok "Z1: a replayed seq is answered with the sealed refusal ack over this transport too, and acted on once"
+  else
+    bad "Z1: no exact refusal ack for the replay (got '${Z1_REFUSAL:-none}')"
+  fi
+  Z_WRONG_KEY="$(python3 -c 'import base64; print(base64.b64encode(bytes(range(32))).decode())')"
+  ws_command 2 '{"action":"send-message","params":{"text":"z1 forged"}}' "$Z_WRONG_KEY"
+  Z1_FORGED="$(ws_ack 2)"
+  if [ "$(printf '%s' "$Z1_FORGED" | ws_field detail)" = "decrypt-failed" ] && ! grep -q '"z1 forged"' "$W_REPO/.heimdall/ui/inbox.jsonl" 2>/dev/null; then
+    ok "Z1: a frame sealed under another key is acked decrypt-failed and never acted on"
+  else
+    bad "Z1: the forged frame was not refused as decrypt-failed (ack '${Z1_FORGED:-none}')"
+  fi
+  Z1_CONNS="$(python3 - "$W_LOG/frame-posts.log" <<'PYEOF'
+import re, sys
+conns = {"ack": set(), "state": set()}
+for line in open(sys.argv[1], encoding="utf-8"):
+    m = re.search(r"conn=(\d+) type=(\w+)", line)
+    if m and m.group(2) in conns:
+        conns[m.group(2)].add(m.group(1))
+print("ok" if len(conns["ack"]) == 1 and len(conns["state"]) == 1 and conns["ack"] != conns["state"] else "bad %r" % conns)
+PYEOF
+)"
+  if [ "$Z1_CONNS" = "ok" ] && ! grep -q '^violation' "$W_LOG/ws-client.log" 2>/dev/null; then
+    ok "Z1: acks still share ONE persistent POST connection and state frames another, none of them the stream's; no frame the RFC forbids a client"
+  else
+    bad "Z1: POST connections changed with the transport ($Z1_CONNS), or the client broke RFC 6455 ($(grep '^violation' "$W_LOG/ws-client.log" 2>/dev/null | head -1))"
+  fi
+  ws_stop
+
+  # Z2: the relay writes no keepalive on a WebSocket, so hmd pings; the runtime's pong is proof of life, silence is the idle drop
+  ws_start Z2 env HMD_RELAY_STREAM_IDLE_S=2 HMD_RELAY_BACKOFF_BASE_MS=500
+  if wait_for_count "$W_LOG/ws-client.log" 3 '^text ping$' 8; then
+    ok "Z2: an idle client pings (3 pings inside 8 s with HMD_RELAY_STREAM_IDLE_S=2: one every idle/3)"
+  else
+    bad "Z2: the idle client never pinged ($(cat "$W_LOG/ws-client.log" 2>/dev/null | head -3))"
+  fi
+  sleep 4
+  if [ "$(count_matching "$W_OUT" '"event":"stream_drop"')" = "0" ]; then
+    ok "Z2: answered pings keep the stream up through twice its idle window with the relay otherwise silent"
+  else
+    bad "Z2: the stream dropped although every ping was answered ($(grep '"event":"stream_drop"' "$W_OUT" | head -1))"
+  fi
+  Z2_PINGS="$(count_matching "$W_LOG/ws-client.log" '^text ping$')"
+  : > "$W_CTL/mute-pong"
+  if [ -n "$(wait_for_stream_drop "$W_OUT" idle 8)" ]; then
+    ok "Z2: pings that draw no pong end in stream_drop reason=idle within HMD_RELAY_STREAM_IDLE_S"
+  else
+    bad "Z2: a relay that stopped answering never produced an idle stream_drop"
+  fi
+  if [ "$(count_matching "$W_LOG/ws-client.log" '^text ping$')" -ge "$((Z2_PINGS + 2))" ] \
+     && wait_for_count "$W_LOG/stream-transport.log" 2 '^ws asked=yes$' 8; then
+    ok "Z2: it kept pinging until the idle drop, then reconnected over the WebSocket"
+  else
+    bad "Z2: no pings while the pongs were muted, or no reconnect after the idle drop"
+  fi
+  ws_stop
+
+  # Z3: rotation over a WebSocket: a close frame, no backoff, the same session on the new socket
+  ws_start Z3 env HMD_RELAY_STREAM_ROTATE_S=3
+  Z3_DROP="$(wait_for_stream_drop "$W_OUT" rotate 8)"
+  if [ -n "$Z3_DROP" ] && [ "$(printf '%s' "$Z3_DROP" | ws_field retry_ms)" = "0" ]; then
+    ok "Z3: the client rotates its WebSocket at HMD_RELAY_STREAM_ROTATE_S (stream_drop reason=rotate, retry_ms=0)"
+  else
+    bad "Z3: no rotate stream_drop with retry_ms=0 ('${Z3_DROP:-none}')"
+  fi
+  if wait_for "$W_LOG/ws-client.log" '^close 1000$' 3 && wait_for_count "$W_LOG/stream-transport.log" 2 '^ws asked=yes$' 6 \
+     && wait_for_count "$W_OUT" 2 '"event":"device_bound"' 6; then
+    ok "Z3: the rotation ended the socket with a close frame (1000), and the new one re-bound at once"
+  else
+    bad "Z3: no close frame before the rotation, or no re-bind on the new socket"
+  fi
+  ws_stop
+
+  # Z4: the byte cap: a message declared over it is refused from its header, then the client reconnects
+  ws_start Z4 env HMD_RELAY_MAX_ENVELOPE_BYTES=2000
+  : > "$W_CTL/oversized-line=4000"
+  Z4_DROP="$(wait_for_stream_drop "$W_OUT" overflow 8)"
+  if [ "$(printf '%s' "$Z4_DROP" | ws_field line_bytes)" = "4000" ] && [ "$(printf '%s' "$Z4_DROP" | ws_field cap_bytes)" = "2001" ]; then
+    ok "Z4: a 4000-byte message over a 2000-byte envelope cap is stream_drop reason=overflow (line_bytes=4000, cap_bytes=2001)"
+  else
+    bad "Z4: no overflow drop naming the message ('${Z4_DROP:-none}')"
+  fi
+  if wait_for_count "$W_OUT" 2 '"event":"device_bound"' 10; then
+    ok "Z4: the client kept running: it reconnected and re-bound after the overflow"
+  else
+    bad "Z4: no reconnect after the overflow drop"
+  fi
+  ws_stop
+
+  # Z5: a relay that closes the socket: stream_drop reason=closed names the close code, the backoff is honoured
+  ws_start Z5 env HMD_RELAY_BACKOFF_BASE_MS=500
+  : > "$W_CTL/lifetime-close"
+  Z5_DROP="$(wait_for_stream_drop "$W_OUT" closed 8)"
+  if [ "$(printf '%s' "$Z5_DROP" | ws_field close_code)" = "1001" ] && [ "$(printf '%s' "$Z5_DROP" | ws_field retry_ms)" = "500" ] \
+     && wait_for_event "$W_OUT" error "WebSocket close code 1001" 3; then
+    ok "Z5: a close frame from the relay is stream_drop reason=closed with close_code=1001 and the 500 ms backoff, named in an error event"
+  else
+    bad "Z5: the relay's close was not reported as closed/1001/500 ('${Z5_DROP:-none}')"
+  fi
+  if wait_for_count "$W_OUT" 2 '"event":"device_bound"' 8; then
+    ok "Z5: it reconnected and re-bound after the relay's close"
+  else
+    bad "Z5: no reconnect after the relay's close"
+  fi
+  ws_stop
+
+  # Z6: a relay that ends the session: the session_ended message, then the close; the client exits 0 and posts nothing more
+  ws_start Z6
+  Z6_BEFORE="$(wc -l < "$W_LOG/frames.ndjson" 2>/dev/null | tr -d ' ')"
+  : > "$W_CTL/end-session"
+  if wait_pid_exit "$W_CLIENT" 10; then
+    wait "$W_CLIENT" 2>/dev/null; Z6_RC=$?
+  else
+    Z6_RC=hung
+  fi
+  sleep 0.5
+  if [ "$Z6_RC" = "0" ] && grep -q '"event":"session_ended"' "$W_OUT" && [ "$(wc -l < "$W_LOG/frames.ndjson" 2>/dev/null | tr -d ' ')" = "${Z6_BEFORE:-0}" ]; then
+    ok "Z6: session_ended over the WebSocket ends the client with exit 0 and no frame posted afterwards"
+  else
+    bad "Z6: the client did not end cleanly on session_ended over the WebSocket (rc $Z6_RC)"
+  fi
+  ws_stop
+
+  # Z7: what the upgrade request can be answered before it is one: a wrong Sec-WebSocket-Accept, a 429
+  XS_CTL_FLAGS="bad-accept" ws_start Z7a env HMD_RELAY_BACKOFF_BASE_MS=500
+  if wait_for_event "$W_OUT" error "upgrade refused" 8 && grep -q '"event":"stream_drop","retry_ms":500' "$W_OUT" \
+     && wait_for "$W_OUT" '"event":"stream_open","transport":"ws"' 8 && [ "$(count_matching "$W_OUT" '"event":"stream_open"')" = "1" ]; then
+    ok "Z7: a 101 with the wrong Sec-WebSocket-Accept is an error and a backoff -- never opened, never a silent fallback -- and the retry succeeds"
+  else
+    bad "Z7: the wrong Sec-WebSocket-Accept was not refused and retried ($(grep -E 'upgrade refused|stream_open' "$W_OUT" | head -3))"
+  fi
+  ws_stop
+  XS_CTL_FLAGS="rate-limit-next=1" ws_start Z7b
+  if wait_for "$W_OUT" '"event":"stream_open","transport":"ws"' 10 && grep -q '"event":"device_bound"' "$W_OUT"; then
+    ok "Z7: a 429 with Retry-After on the upgrade request is waited out, and the stream then opens as a WebSocket"
+  else
+    bad "Z7: the client did not recover from a 429 on the upgrade request"
+  fi
+  ws_stop
+
+  # Z8: a relay that sends garbage: text that is not JSON, JSON that is not an object, an object that is not an envelope --
+  # each a loud error, none a dead stream, and a real command after them is still acted on over the same socket
+  ws_start Z8
+  printf '%s' 'this is not json' > "$W_CTL/001.raw"
+  printf '%s' '[]' > "$W_CTL/002.raw"
+  printf '%s' '{"v":1}' > "$W_CTL/003.raw"
+  W_NUM=3
+  ws_command 1 '{"action":"send-message","params":{"text":"z8 after the garbage"}}'
+  Z8_ACK="$(ws_ack 1)"
+  if wait_for_event "$W_OUT" error "malformed frame" 3 && wait_for_event "$W_OUT" error "not a JSON object" 3 \
+     && wait_for_event "$W_OUT" error "unexpected frame" 3 && [ "$(printf '%s' "$Z8_ACK" | ws_field ok)" = "True" ] \
+     && [ "$(count_matching "$W_OUT" '"event":"stream_drop"')" = "0" ]; then
+    ok "Z8: three kinds of garbage are three error events; the stream stays up and the command after them is acked"
+  else
+    bad "Z8: garbage over the WebSocket was not survived (ack '${Z8_ACK:-none}', drops $(count_matching "$W_OUT" '"event":"stream_drop"'))"
+  fi
+  ws_stop
+
+  # Z9: the fallbacks and the knob. (a) a relay without the WebSocket leg answers the Upgrade request with NDJSON: the client
+  # reads that and works; (b) HMD_RELAY_STREAM_TRANSPORT=ndjson never asks; (c) a value the knob does not know is auto, loudly
+  W_RELAY_ARGS="" ws_start Z9a
+  ws_command 1 '{"action":"send-message","params":{"text":"z9a over ndjson"}}'
+  Z9A_ACK="$(ws_ack 1)"
+  if [ "$(head -1 "$W_LOG/stream-transport.log" 2>/dev/null)" = "ndjson asked=yes" ] && grep -q '"event":"stream_open","transport":"ndjson"' "$W_OUT" \
+     && [ "$(printf '%s' "$Z9A_ACK" | ws_field ok)" = "True" ]; then
+    ok "Z9: a relay that ignores the Upgrade header streams NDJSON; the client reads it as before, reports transport=ndjson, and works"
+  else
+    bad "Z9: the fallback against a relay without the WebSocket leg failed ($(cat "$W_LOG/stream-transport.log" 2>/dev/null | head -1), ack '${Z9A_ACK:-none}')"
+  fi
+  ws_stop
+  ws_start Z9b env HMD_RELAY_STREAM_TRANSPORT=ndjson
+  if [ "$(head -1 "$W_LOG/stream-transport.log" 2>/dev/null)" = "ndjson asked=no" ] && grep -q '"event":"stream_open","transport":"ndjson"' "$W_OUT"; then
+    ok "Z9: HMD_RELAY_STREAM_TRANSPORT=ndjson never asks for the upgrade, even of a relay that would grant it"
+  else
+    bad "Z9: HMD_RELAY_STREAM_TRANSPORT=ndjson still asked ($(cat "$W_LOG/stream-transport.log" 2>/dev/null | head -1))"
+  fi
+  ws_stop
+  ws_start Z9c env HMD_RELAY_STREAM_TRANSPORT=carrier-pigeon
+  if wait_for_event "$W_OUT" error "is not one of auto|ndjson" 5 && wait_for "$W_OUT" '"event":"stream_open","transport":"ws"' 8; then
+    ok "Z9: an unknown HMD_RELAY_STREAM_TRANSPORT is reported and treated as auto"
+  else
+    bad "Z9: an unknown HMD_RELAY_STREAM_TRANSPORT was not reported / not treated as auto"
+  fi
+  ws_stop
+
+  # Z10: wss. The real client over TLS to a fake relay with a throwaway certificate (trusted through SSL_CERT_FILE): the
+  # upgrade, the SSLSocket reads, a command and its ack
+  if command -v openssl >/dev/null 2>&1 \
+     && openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMPROOT/z.key" -out "$TMPROOT/z.crt" -days 2 \
+          -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" >/dev/null 2>&1; then
+    W_RELAY_ARGS="--ws --tls $TMPROOT/z.crt $TMPROOT/z.key" XS_SCHEME=https ws_start Z10 env SSL_CERT_FILE="$TMPROOT/z.crt"
+    ws_command 1 '{"action":"send-message","params":{"text":"z10 over wss"}}'
+    Z10_ACK="$(ws_ack 1)"
+    if grep -q '"event":"stream_open","transport":"ws"' "$W_OUT" && [ "$(head -1 "$W_LOG/stream-transport.log" 2>/dev/null)" = "ws asked=yes" ] \
+       && [ "$(printf '%s' "$Z10_ACK" | ws_field ok)" = "True" ]; then
+      ok "Z10: over TLS the upgrade is answered 101 and a command round-trips as a WebSocket message (wss)"
+    else
+      bad "Z10: no WebSocket over TLS (ack '${Z10_ACK:-none}', stderr: $(tail -2 "$W_ERR" 2>/dev/null), events: $(grep -E 'error|stream_open' "$W_OUT" | head -2))"
+    fi
+    ws_stop
+  else
+    skip "Z10: openssl cannot make a throwaway certificate here -- the wss path is not exercised"
+  fi
+else
+  skip "scenario Z (hmd's leg over a WebSocket): bin/lib/hmd_relay_e2e.py absent -- needs real seal"
 fi
 
 echo

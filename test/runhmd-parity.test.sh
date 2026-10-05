@@ -380,12 +380,12 @@ dispatch_words() {
   } | sort -u
 }
 
-# Dispatched by hmd's roadmap but not yet by this tree's bin/heimdall (RP2 `hmd prove`;
-# RP1 `hmd attack` has landed: bin/heimdall dispatches it). runhmd must already know them:
-# `attack` IS the default command. Once a word lands in bin/heimdall it stops needing this
-# allowance — and the allowance for a word that IS dispatched is itself reported, so the list
-# cannot quietly outlive its reason.
-PLANNED="prove"
+# Words on hmd's roadmap that this tree's bin/heimdall does not dispatch yet. runhmd must
+# already know them: `attack` IS the default command. None right now -- RP1 `hmd attack` and
+# RP2 `hmd prove` are both dispatched by bin/heimdall -- and the list stays for the next roadmap
+# word. Once a word lands in bin/heimdall it stops needing this allowance — and the allowance
+# for a word that IS dispatched is itself reported, so the list cannot quietly outlive its reason.
+PLANNED=""
 
 DISPATCHED="$(dispatch_words)"
 LISTED="$(grep -v '^[[:space:]]*#' "$HMD_PKG/subcommands.txt" | grep -v '^[[:space:]]*$' | sed 's/[[:space:]]*$//' | sort)"
@@ -426,7 +426,7 @@ for w in $LISTED; do
   PHANTOM="$PHANTOM $w"
 done
 if [ -z "$PHANTOM" ]; then
-  ok "every listed subcommand is dispatched by bin/heimdall or is a planned one ($PLANNED)"
+  ok "every listed subcommand is dispatched by bin/heimdall or is a planned one (planned: ${PLANNED:-none})"
 else
   bad "SUBCOMMAND DRIFT: subcommands.txt lists [${PHANTOM# }] which bin/heimdall does not dispatch and which are not planned — 'runhmd <word>' would reach an hmd that treats it as a task prompt"
 fi

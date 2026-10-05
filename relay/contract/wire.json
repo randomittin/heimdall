@@ -11,7 +11,9 @@
     "Every state frame's plaintext also carries hmd's capability tokens in-band (zero-lag Ask 5): {\"caps\":[\"login-v1\",\"push-v1\",\"resync\",\"z-zlib\"],\"state\":{...}}. Keys are sorted, so caps is stored before state; acks carry no caps. login-v1 (remote Claude Code login) is listed whenever hmd loaded its login module, so it is part of the sealed bytes. push-v1 says hmd takes the phone's register_push / unregister_push / app_state commands (push notifications, PN2); hmd leaves it out when the operator sets HMD_PUSH=0, so this fixture is hmd with push on.",
     "POST /frames carries Connection: keep-alive: hmd keeps one persistent HTTP/1.1 connection per sender (state frames on one, acks on the other), so a replay counts requests, not connections.",
     "ack_non_increasing_seq is hmd's answer when command_send_message (seq 1) arrives again after hmd took seq 3: the replay guard refuses a device seq that is not above the last one it accepted and, because the frame opens under the session key, refuses it with this sealed ack -- ok false, detail non-increasing-seq, last the last device seq accepted (3), of_seq the replayed seq (1), no other key -- so the phone can seal the command again above last. It is hmd's fifth frame (seq 5). The replay re-sends command_send_message's wire byte for byte, so the fixture holds no second phone frame; a frame that does not open is never answered.",
-    "The relay routes by URL and never reads envelope.session_id, so these sealed frames carry the fixture's session id, not the live one the relay minted."
+    "The relay routes by URL and never reads envelope.session_id, so these sealed frames carry the fixture's session id, not the live one the relay minted.",
+    "hmd's leg has two transports on ONE route, negotiated by the request alone. `stream` is the original chunked NDJSON response, what any client that sends no Upgrade header gets, and what an older relay answers an Upgrade request with (it ignores the header: status 200, content-type application/x-ndjson). `stream_ws` is the same route with `Upgrade: websocket`: a hibernatable WebSocket, so an idle session lets the Durable Object sleep. Every message on it is one envelope, the bytes of an NDJSON line without its newline; the relay never writes a keepalive there (hmd sends the text message `ping`, the runtime answers `pong` without waking the object).",
+    "stream_ws.request.headers are exactly what bin/heimdall-relay-client sends, Sec-WebSocket-Key pinned to RFC 6455 section 1.3's sample so the replay is deterministic; the relay suite sends them too but can only assert the status, because the Sec-WebSocket-Accept header is added by the platform, not by the Worker. stream_ws.frames are the exact octets of the two messages that are not envelopes, in RFC 6455 framing: hmd's masked `ping` (mask pinned) and the relay's unmasked `pong`."
   ],
   "bindings": {
     "session_id": {
@@ -37,6 +39,14 @@
     },
     "relay_url": {
       "example": "https://relay.example"
+    },
+    "ws_key": {
+      "match": "^[A-Za-z0-9+/]{22}==$",
+      "example": "dGhlIHNhbXBsZSBub25jZQ=="
+    },
+    "ws_accept": {
+      "match": "^[A-Za-z0-9+/]{27}=$",
+      "example": "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
     },
     "device_pubkey": {
       "computed": "device_pubkey_b64url"
@@ -111,6 +121,58 @@
           "ts": "$epoch_seconds"
         }
       }
+    }
+  },
+  "stream_ws": {
+    "request": {
+      "method": "GET",
+      "path": "/session/$session_id/stream",
+      "headers": {
+        "Authorization": "Bearer $relay_session_token",
+        "Upgrade": "websocket",
+        "Connection": "Upgrade",
+        "Sec-WebSocket-Key": "$ws_key",
+        "Sec-WebSocket-Version": "13"
+      }
+    },
+    "response": {
+      "status": 101,
+      "headers": {
+        "Upgrade": "websocket",
+        "Connection": "Upgrade",
+        "Sec-WebSocket-Accept": "$ws_accept"
+      }
+    },
+    "messages": {
+      "device_bound": {
+        "v": 1,
+        "session_id": "$session_id",
+        "seq": 0,
+        "sender": "relay",
+        "type": "device_bound",
+        "nonce": null,
+        "ciphertext": null,
+        "payload": {
+          "device_pubkey": "$device_pubkey",
+          "bound_at": "$epoch_seconds"
+        }
+      },
+      "client_ping": "ping",
+      "relay_pong": "pong"
+    },
+    "frames": {
+      "client_ping": {
+        "mask": "37fa213d",
+        "hex": "818437fa213d47934f5a"
+      },
+      "relay_pong": {
+        "hex": "8104706f6e67"
+      }
+    },
+    "close_codes": {
+      "session_ended": 4001,
+      "superseded": 4002,
+      "message_too_big": 1009
     }
   },
   "phone": {

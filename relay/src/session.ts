@@ -6,6 +6,13 @@
 // The relay never decrypts anything (INV-18) — `ciphertext`/`nonce` pass
 // through byte-identical; only the two relay-originated control frame types
 // (`device_bound`, `session_ended`) carry a plaintext `payload`.
+//
+// hmd's leg has two transports on the one `/stream` route, negotiated by the
+// request alone: the original chunked NDJSON response (no `Upgrade` header),
+// and a hibernatable WebSocket (`Upgrade: websocket`). Only the WebSocket lets
+// the object hibernate while hmd is connected: an open NDJSON response, and the
+// keepalive and lifetime timers that serve it, keep the object resident — and
+// billed — for as long as it lasts. See docs/analysis/2026-10-05-relay-hibernation.md.
 
 import type {
   Env,
@@ -62,6 +69,8 @@ interface SessionRecord {
 }
 
 const DEVICE_TAG = "device";
+/** Tag on hmd's WebSocket leg: `GET /stream` with `Upgrade: websocket`. */
+const HMD_TAG = "hmd";
 const DEVICE_PUBKEY_BYTES = 32;
 
 /** Storage key for a session's record. */
@@ -103,11 +112,13 @@ const LAST_HMD_STATE_KEY = "last_hmd_state";
  * produce before hmd's `GET /stream` is open. Never more than one — a session
  * binds at most once, and handleDeviceTokenClaim's reconnect path never calls
  * deliverToHmdStream. Stored as the encoded NDJSON line, byte for byte what
- * handleStream later writes.
+ * handleStream later writes to an NDJSON stream — its trailing "\n" included,
+ * so a value written by an older build still works. A WebSocket is sent the
+ * same line without that newline (`lineToMessage`).
  *
  * This was a field on the instance. Nothing keeps the object resident while
- * hmd is away (only an open `GET /stream` does), so an eviction between the
- * claim and hmd connecting dropped the frame, and hmd — which derives its
+ * hmd is away (only an open NDJSON `GET /stream` does), so an eviction between
+ * the claim and hmd connecting dropped the frame, and hmd — which derives its
  * session key from that frame alone — never completed the pairing.
  * test/hibernation.spec.ts reproduces it.
  */
@@ -134,8 +145,15 @@ const ENDED_GRACE_MS = 5 * 60_000;
  */
 const CLOSE_SESSION_ENDED = 4001;
 const CLOSE_TOKEN_EXPIRED = 4003;
-/** RFC 6455's "message too big" — INV-16 on the phone leg. */
+/** RFC 6455's "message too big" — INV-16, on both WebSocket legs. */
 const CLOSE_MESSAGE_TOO_BIG = 1009;
+/**
+ * A newer socket on the same leg took over (`4002` / `"superseded"`), on both
+ * WebSocket legs. Distinct from `CLOSE_SESSION_ENDED` on purpose: the session
+ * is alive, and a client that conflated the two would stop reconnecting after
+ * a routine network change.
+ */
+const CLOSE_SUPERSEDED = 4002;
 
 /**
  * A rejected frame's `sender`/`type` are attacker-controlled and unbounded, so
@@ -208,14 +226,24 @@ interface DeviceSocketAttachment {
 }
 
 /**
- * The generation of one device socket, or 0 for a socket accepted before this
- * attachment existed — a deploy rolling over live sessions leaves those
- * connected, and any socket accepted afterwards outranks them.
- *
- * Never throws: a malformed or absent attachment must degrade to "oldest
- * possible", never cost a frame.
+ * An hmd socket's attachment: the `gen` and `sid` of `DeviceSocketAttachment`,
+ * for the same reasons (which socket is newest, and which session a freshly
+ * woken instance is serving), and nothing else. There is no `token_exp`: hmd's
+ * credential is the session's own bearer, presented once at the upgrade and
+ * good for as long as the session lives — and ending the session closes this
+ * socket.
  */
-function deviceSocketAttachment(socket: WebSocket): Partial<DeviceSocketAttachment> {
+type HmdSocketAttachment = Required<Pick<DeviceSocketAttachment, "gen" | "sid">>;
+
+/**
+ * The attachment of one accepted socket, on either leg (`token_exp` only ever
+ * appears on a device socket).
+ *
+ * Never throws: a malformed or absent attachment degrades to "nothing known",
+ * which `socketGeneration` reads as the oldest possible socket — never a
+ * lost frame.
+ */
+function socketAttachment(socket: WebSocket): Partial<DeviceSocketAttachment> {
   let attachment: unknown;
   try {
     attachment = socket.deserializeAttachment();
@@ -226,14 +254,48 @@ function deviceSocketAttachment(socket: WebSocket): Partial<DeviceSocketAttachme
   return attachment as Partial<DeviceSocketAttachment>;
 }
 
-function deviceSocketGeneration(socket: WebSocket): number {
-  const gen = deviceSocketAttachment(socket).gen;
+/**
+ * The generation of one socket, or 0 for a socket accepted before this
+ * attachment existed — a deploy rolling over live sessions leaves those
+ * connected, and any socket accepted afterwards outranks them.
+ */
+function socketGeneration(socket: WebSocket): number {
+  const gen = socketAttachment(socket).gen;
   return typeof gen === "number" && Number.isFinite(gen) ? gen : 0;
 }
 
 /**
- * How long hmd's `GET /stream` may sit idle before the relay writes a
- * `keepalive` control frame down it.
+ * One NDJSON line is an envelope's JSON plus the single "\n" that ends it; one
+ * WebSocket message is the envelope alone. This is the one place a line becomes
+ * a message — the held `device_bound` is stored as a line (see
+ * PENDING_HMD_CONTROL_KEY), and every writer builds lines. `JSON.stringify`
+ * never emits a raw newline, so exactly one trailing "\n", when there is one,
+ * is the terminator and nothing else.
+ */
+function lineToMessage(line: string): string {
+  return line.endsWith("\n") ? line.slice(0, -1) : line;
+}
+
+/**
+ * INV-16 for a message already in memory: whether it is over
+ * `MAX_ENVELOPE_BYTES`. Length-first, so the encode is itself bounded — UTF-8
+ * is never fewer bytes than characters, so a string longer than the cap is over
+ * it regardless of contents. Checked before any `JSON.parse`, on both WebSocket
+ * legs, so an oversize message is never parsed.
+ */
+function exceedsEnvelopeCap(message: string): boolean {
+  return (
+    message.length > MAX_ENVELOPE_BYTES ||
+    new TextEncoder().encode(message).byteLength > MAX_ENVELOPE_BYTES
+  );
+}
+
+/**
+ * How long hmd's NDJSON `GET /stream` may sit idle before the relay writes a
+ * `keepalive` control frame down it. NDJSON only: the WebSocket transport is
+ * never sent a keepalive — a timer would keep the object resident, which is the
+ * one thing that transport exists to avoid (hmd sends the text `ping` and the
+ * runtime answers `pong` without waking the object).
  *
  * Cloudflare closes a long-lived chunked response that carries no bytes:
  * observed live on 2026-09-24, a stream that opened at 08:33:53 with a bound
@@ -250,8 +312,10 @@ function deviceSocketGeneration(socket: WebSocket): number {
 const KEEPALIVE_INTERVAL_MS = 20_000;
 
 /**
- * The upper bound on how long a single `GET /stream` response may live,
- * however healthy it looks.
+ * The upper bound on how long a single NDJSON `GET /stream` response may live,
+ * however healthy it looks. NDJSON only: a hibernatable WebSocket is
+ * re-delivered to the new generation after a deploy, so the orphaned stream
+ * below cannot happen to one, and a lifetime timer would pin the object.
  *
  * Observed live on 2026-09-25, and the failure `KEEPALIVE_INTERVAL_MS` above
  * made possible. A deploy rolls this Durable Object to a new generation.
@@ -290,6 +354,11 @@ function isValidDevicePubkey(value: string | null): value is string {
 }
 
 export class SessionDO {
+  // The four fields below are hmd's NDJSON transport and nothing else. An hmd
+  // WebSocket keeps no state on the instance at all: which socket is newest and
+  // which session it belongs to are re-derived from `ctx.getWebSockets(HMD_TAG)`
+  // and each socket's attachment on every use (see DeviceSocketAttachment), and
+  // no timer is ever armed for one.
   private hmdStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
   // Bumped once per `GET /stream`, so a stream's own `cancel()` can tell
   // whether it is still the live one before tearing down shared state — a
@@ -311,7 +380,15 @@ export class SessionDO {
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly env: Env
-  ) {}
+  ) {
+    // hmd's liveness probe on its WebSocket leg: it sends the text `ping`, and
+    // the runtime answers `pong` itself, without waking a hibernated object — so
+    // NAT and proxy state stay warm, and a missing pong tells hmd the socket is
+    // dead, at no Durable Object duration. It applies to every socket this
+    // object holds, the phone's included, which never sends it. Set on every
+    // construction because a woken instance is a new one.
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -474,16 +551,57 @@ export class SessionDO {
     return parsed;
   }
 
-  /** The single writer for hmd's `GET /stream`. Returns false when the line
-   * could not be delivered: no stream open, or a controller the runtime has
-   * already torn down. That second case is the real one — Cloudflare can
-   * close a long-lived chunked response without the stream's `cancel()` ever
-   * running, leaving a controller whose `enqueue` throws; before this, that
-   * throw escaped `webSocketMessage` and took the phone's frame with it. A
-   * failed write drops the stale controller so the next `/stream` starts
-   * clean, and deliberately does not re-arm the keepalive (nothing to write
-   * to). A successful one restarts the idle timer, so a stream carrying real
-   * frames never pays for a keepalive it does not need. */
+  /**
+   * "To hmd, by whatever transport is live": the one writer every caller that
+   * means "send hmd this" uses — the phone's command in `webSocketMessage`, the
+   * `device_bound` in `deliverToHmdStream`, the `session_ended` in
+   * `endHmdStream`. `line` is an NDJSON line, trailing "\n" included, because
+   * that is how every frame is built and how the held `device_bound` is stored;
+   * an hmd WebSocket is sent it as one message without that newline.
+   *
+   * Newest wins across both transports, and a transport swap is synchronous (see
+   * handleStream and acceptHmdSocket), so at most one is ever live: the newest
+   * OPEN hmd socket if there is one, else the NDJSON controller. Returns false
+   * when nothing could be written to, and the caller says what that means (a
+   * dropped phone frame is logged, a `device_bound` is held for the next
+   * connection).
+   *
+   * Never arms a timer: a write to a WebSocket leaves nothing pending, which is
+   * what lets the object hibernate with hmd connected. Only the NDJSON
+   * primitive below restarts its keepalive.
+   */
+  private writeToHmd(line: string): boolean {
+    const socket = this.liveSocket(HMD_TAG);
+    if (socket === undefined) return this.writeToHmdStream(line);
+    return this.sendToHmdSocket(socket, line);
+  }
+
+  /** One NDJSON line to one hmd socket, as the message it carries. A socket the
+   * runtime has already torn down throws on `send`; like `writeToHmdStream`,
+   * that is a non-delivery for the caller to act on, not an exception to take
+   * the caller's frame down with it. */
+  private sendToHmdSocket(socket: WebSocket, line: string): boolean {
+    try {
+      socket.send(lineToMessage(line));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The NDJSON-only primitive: one line to hmd's chunked `GET /stream`.
+   * Returns false when the line could not be delivered: no stream open, or a
+   * controller the runtime has already torn down. That second case is the real
+   * one — Cloudflare can close a long-lived chunked response without the
+   * stream's `cancel()` ever running, leaving a controller whose `enqueue`
+   * throws; before this, that throw escaped `webSocketMessage` and took the
+   * phone's frame with it. A failed write drops the stale controller so the
+   * next `/stream` starts clean, and deliberately does not re-arm the keepalive
+   * (nothing to write to). A successful one restarts the idle timer, so a
+   * stream carrying real frames never pays for a keepalive it does not need.
+   * Callers that mean "to hmd" use `writeToHmd`; this is for the paths that
+   * serve one specific stream — `handleStream`'s flush of the held frame, and
+   * the keepalive timer itself. */
   private writeToHmdStream(line: string): boolean {
     const controller = this.hmdStreamController;
     if (!controller) return false;
@@ -499,7 +617,7 @@ export class SessionDO {
     return true;
   }
 
-  /** Ends hmd's current `GET /stream` response, if any, and stops its
+  /** Ends hmd's current NDJSON `GET /stream` response, if any, and stops its
    * keepalive. Called when a reconnect supersedes an older stream and on
    * revoke — never on an ordinary drop, which leaves the session intact. */
   private closeHmdStream(): void {
@@ -516,11 +634,22 @@ export class SessionDO {
     }
   }
 
+  /** Closes every hmd WebSocket — `closeHmdStream`'s counterpart for the other
+   * transport. Re-derived from `getWebSockets`, never from a field: after a
+   * hibernation this instance has never seen the sockets it is closing. */
+  private closeHmdSockets(code: number, reason: string): void {
+    for (const socket of this.ctx.getWebSockets(HMD_TAG)) {
+      this.closeSocket(socket, code, reason);
+    }
+  }
+
   /**
-   * Ends hmd's `GET /stream` because the SESSION is over, and says why first
-   * (INV-38): a plaintext `session_ended` control frame — the shape
-   * `handleRevoke` already sends the phone, and one hmd's client already reads
-   * as terminal, logging `payload.reason` — then the close.
+   * Ends hmd's leg — an NDJSON stream or a WebSocket, whichever is attached —
+   * because the SESSION is over, and says why first (INV-38): a plaintext
+   * `session_ended` control frame — the shape `handleRevoke` already sends the
+   * phone, and one hmd's client already reads as terminal, logging
+   * `payload.reason` — then the close. A WebSocket gets the frame as a message,
+   * then close code 4001 / `"session ended"`.
    *
    * Before this, a session the relay ended closed hmd's stream with a bare
    * EOF, and the next thing hmd met was `404` from the purged record. On
@@ -531,12 +660,12 @@ export class SessionDO {
    * Not for a close that leaves the session alive — a superseding reconnect
    * and the stream-lifetime bound go through `closeHmdStream` alone, since
    * hmd is expected back — nor for `POST /revoke`, where hmd is the one ending
-   * it. With no stream attached there is nobody to tell: nothing is logged.
+   * it. With nothing attached there is nobody to tell: nothing is logged.
    */
   private endHmdStream(sessionId: string, reason: SessionEndReason): void {
-    if (this.hmdStreamController !== null) {
+    if (this.hmdStreamController !== null || this.liveSocket(HMD_TAG) !== undefined) {
       const payload: SessionEndedPayload = { reason };
-      const told = this.writeToHmdStream(
+      const told = this.writeToHmd(
         JSON.stringify({
           v: 1,
           session_id: sessionId,
@@ -551,6 +680,7 @@ export class SessionDO {
       logEvent("session_end_announced", { session_id: sessionId, reason, delivered: told });
     }
     this.closeHmdStream();
+    this.closeHmdSockets(CLOSE_SESSION_ENDED, "session ended");
   }
 
   /** (Re)starts the idle timer that writes the next `keepalive`. A no-op
@@ -651,16 +781,23 @@ export class SessionDO {
     });
   }
 
-  /** hmd's laptop leg: long-lived chunked-HTTP GET carrying newline-delimited
-   * JSON envelopes (device-originated `command` frames) up to hmd.
+  /** hmd's laptop leg: `GET /stream`, carrying device-originated `command`
+   * frames (and the relay's own control frames) up to hmd, in one of two
+   * transports chosen by the request alone. WITHOUT an `Upgrade` header it is
+   * the original long-lived chunked response of newline-delimited JSON
+   * envelopes, which is also what every client that predates the WebSocket
+   * gets. WITH `Upgrade: websocket` it is a hibernatable WebSocket
+   * (`acceptHmdSocket`). Auth is the same bearer check on both, and happens
+   * first — a refusal is an ordinary JSON response, never an upgrade.
    *
-   * Reopening this is routine, not exceptional: the stream is expected to be
-   * cut periodically (see KEEPALIVE_INTERVAL_MS) and hmd reconnects with
-   * backoff. A reconnect supersedes whatever stream was open before — that
-   * one is closed here rather than left as a ReadableStream nobody will read
-   * or finish. Dropping this leg never touches the session: the phone stays
-   * bound and connected, and only `POST /revoke` (or pairing expiry before a
-   * bind) ends things. */
+   * Reopening this is routine, not exceptional: the NDJSON stream is expected
+   * to be cut periodically (see KEEPALIVE_INTERVAL_MS) and hmd reconnects with
+   * backoff. A reconnect supersedes whatever hmd leg was open before, on either
+   * transport — an NDJSON stream is closed here rather than left as a
+   * ReadableStream nobody will read or finish, an hmd WebSocket is closed with
+   * 4002 — so there is never more than one live. Dropping this leg never
+   * touches the session: the phone stays bound and connected, and only `POST
+   * /revoke` (or pairing expiry before a bind) ends things. */
   private async handleStream(request: Request): Promise<Response> {
     const record = await this.loadRecord();
     if (!record) return jsonResponse(404, { error: "session not found" });
@@ -672,7 +809,11 @@ export class SessionDO {
     // old stream and installing the new one.
     const pending = await this.ctx.storage.get<string>(PENDING_HMD_CONTROL_KEY);
 
+    if (isWebSocketUpgrade(request)) return this.acceptHmdSocket(record.session_id, pending);
+
     this.closeHmdStream();
+    // Newest wins across transports: an hmd WebSocket still attached is ended too.
+    this.closeHmdSockets(CLOSE_SUPERSEDED, "superseded");
 
     const owner = this;
     const generation = ++this.hmdStreamGeneration;
@@ -698,10 +839,54 @@ export class SessionDO {
     if (pending !== undefined && this.writeToHmdStream(pending)) {
       await this.ctx.storage.delete(PENDING_HMD_CONTROL_KEY);
     }
+    logEvent("hmd_stream_open", { session_id: record.session_id, transport: "ndjson" });
     return new Response(stream, {
       status: 200,
       headers: { "content-type": "application/x-ndjson", ...SECURITY_HEADERS },
     });
+  }
+
+  /**
+   * hmd's leg as a hibernatable WebSocket (`GET /stream` with `Upgrade:
+   * websocket`; the bearer was checked by `handleStream`). Every message the
+   * relay sends hmd on it is one envelope as a text message — byte-identical to
+   * the NDJSON line without its newline — and the wire is pinned in
+   * relay/contract/wire.json's `stream_ws`.
+   *
+   * What makes it worth having is what it does NOT do. No response body is held
+   * open, no `setTimeout` or `setInterval` is armed — no keepalive, no
+   * lifetime — and nothing about the socket is cached on the instance, so the
+   * object hibernates between events and the duration meter stops. Everything
+   * this needs to find the socket again after a wake is on the socket itself
+   * (its tag, and `{ gen, sid }` on its attachment).
+   *
+   * `pending` is the held `device_bound`, read by the caller before any socket
+   * is swapped. It is the first message hmd gets, and leaves storage only once
+   * it was actually sent: a send that failed keeps it for the next connection.
+   */
+  private async acceptHmdSocket(sessionId: string, pending: string | undefined): Promise<Response> {
+    // Newest wins across transports: an NDJSON stream still open is ended.
+    this.closeHmdStream();
+
+    const generation = this.nextGeneration(HMD_TAG);
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    this.ctx.acceptWebSocket(server, [HMD_TAG]);
+    const attachment: HmdSocketAttachment = { gen: generation, sid: sessionId };
+    server.serializeAttachment(attachment);
+    // The older hmd sockets are ended right here, the rule an NDJSON open has
+    // always applied to the stream it replaces. (The phone leg waits for a
+    // delivered frame instead — see supersedeOlderSockets — because the app can
+    // open a duplicate upgrade and discard it; hmd opens its leg once, on
+    // purpose, from one reconnect loop.)
+    this.supersedeOlderSockets(HMD_TAG, generation);
+
+    if (pending !== undefined && this.sendToHmdSocket(server, pending)) {
+      await this.ctx.storage.delete(PENDING_HMD_CONTROL_KEY);
+    }
+    logEvent("hmd_stream_open", { session_id: sessionId, transport: "ws" });
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   /** hmd's laptop leg: POST of one envelope (`state` or `ack`) to forward to
@@ -755,7 +940,7 @@ export class SessionDO {
       await this.storeLastHmdState(envelope);
     }
 
-    const target = this.liveDeviceSocket();
+    const target = this.liveSocket(DEVICE_TAG);
     if (!target) {
       logEvent("frame_undelivered", {
         session_id: record.session_id,
@@ -765,37 +950,40 @@ export class SessionDO {
     }
     target.send(JSON.stringify(envelope));
     // Only now — with a frame actually on its way to a known-live socket —
-    // is it safe to end the older ones. See supersedeOlderDeviceSockets.
-    this.supersedeOlderDeviceSockets(target);
+    // is it safe to end the older ones. See supersedeOlderSockets.
+    this.supersedeOlderSockets(DEVICE_TAG, socketGeneration(target));
     return jsonResponse(200, { ok: true, delivered: true });
   }
 
-  /** Every device socket still attached to this session, highest generation
-   *  first. Re-derived from `getWebSockets` on every call — see
-   *  `DeviceSocketAttachment` for why none of this may be cached on the
-   *  instance. */
-  private deviceSocketsNewestFirst(): { socket: WebSocket; gen: number }[] {
+  /** Every socket still attached to this session under `tag` (the phone's or
+   *  hmd's), highest generation first. Re-derived from `getWebSockets` on every
+   *  call — see `DeviceSocketAttachment` for why none of this may be cached on
+   *  the instance. */
+  private socketsNewestFirst(tag: string): { socket: WebSocket; gen: number }[] {
     return this.ctx
-      .getWebSockets(DEVICE_TAG)
-      .map((socket) => ({ socket, gen: deviceSocketGeneration(socket) }))
+      .getWebSockets(tag)
+      .map((socket) => ({ socket, gen: socketGeneration(socket) }))
       .sort((a, b) => b.gen - a.gen);
   }
 
   /** The generation to stamp on the socket being accepted right now: one
-   *  above every socket currently attached. A socket that has left the set
-   *  can never rejoin it, so "highest still attached, plus one" is all the
-   *  monotonicity the comparisons below need — and it costs no storage write
-   *  on the connect path. */
-  private nextDeviceGeneration(): number {
+   *  above every socket currently attached under `tag`. A socket that has left
+   *  the set can never rejoin it, so "highest still attached, plus one" is all
+   *  the monotonicity the comparisons below need — and it costs no storage
+   *  write on the connect path. */
+  private nextGeneration(tag: string): number {
     let highest = 0;
-    for (const { gen } of this.deviceSocketsNewestFirst()) {
+    for (const { gen } of this.socketsNewestFirst(tag)) {
       if (gen > highest) highest = gen;
     }
     return highest + 1;
   }
 
   /**
-   * The device socket to deliver to: the newest one that is open.
+   * The socket to deliver to under `tag`: the newest one that is open. The
+   * account below is the phone leg's, where it was learned the hard way; hmd's
+   * WebSocket leg uses the same ranking for the same reasons, and the same
+   * helpers.
    *
    * Two live failures are pinned here, and the second is why generations
    * exist at all.
@@ -826,40 +1014,37 @@ export class SessionDO {
    * phone connected last — and it says it just as well after a hibernation
    * wake, since it lives on the socket rather than on this instance.
    */
-  private liveDeviceSocket(): WebSocket | undefined {
-    return this.deviceSocketsNewestFirst().find(
+  private liveSocket(tag: string): WebSocket | undefined {
+    return this.socketsNewestFirst(tag).find(
       (entry) => entry.socket.readyState === WebSocket.OPEN
     )?.socket;
   }
 
   /**
-   * Ends every device socket older than the one now known to be live — the
-   * phone leg's counterpart to `closeHmdStream` (which `handleStream` has
-   * always called for exactly this reason on hmd's leg): one session, one
-   * live device socket, newest wins.
+   * Ends every socket under `tag` older than generation `liveGen` — the
+   * socket-leg counterpart to `closeHmdStream` (which `handleStream` has
+   * always called for exactly this reason on hmd's NDJSON leg): one session,
+   * one live socket per leg, newest wins. A socket that is already closing or
+   * gone is skipped by `closeSocket` — either way it is not the live socket any
+   * more, which is all this needs to guarantee.
    *
-   * Deliberately driven by delivery rather than by `acceptDeviceSocket`. An
-   * accept only proves a socket was *offered*; a delivered frame proves which
-   * socket is being used. Closing on the accept is what let a discarded
-   * duplicate upgrade take the app's real socket down with it (see
-   * `liveDeviceSocket`), and nothing needs it earlier: delivery already
-   * refuses to target anything but the newest open socket, so a lingering
-   * older one is untidy, never wrong.
+   * On the phone leg this is deliberately driven by delivery rather than by
+   * `acceptDeviceSocket`. An accept only proves a socket was *offered*; a
+   * delivered frame proves which socket is being used. Closing on the accept is
+   * what let a discarded duplicate upgrade take the app's real socket down with
+   * it (see `liveSocket`), and nothing needs it earlier: delivery already
+   * refuses to target anything but the newest open socket, so a lingering older
+   * one is untidy, never wrong. hmd's leg calls it at its accept instead
+   * (`acceptHmdSocket`).
    *
    * Close code 4002 is deliberately distinct from `handleRevoke`'s 4001 —
    * this session is emphatically NOT over, and a client that conflated the
    * two would stop reconnecting after a routine network change.
    */
-  private supersedeOlderDeviceSockets(live: WebSocket): void {
-    const liveGen = deviceSocketGeneration(live);
-    for (const { socket, gen } of this.deviceSocketsNewestFirst()) {
+  private supersedeOlderSockets(tag: string, liveGen: number): void {
+    for (const { socket, gen } of this.socketsNewestFirst(tag)) {
       if (gen >= liveGen) continue;
-      try {
-        socket.close(4002, "superseded");
-      } catch {
-        // Already closing or gone — either way it is not the live socket
-        // any more, which is all this needs to guarantee.
-      }
+      this.closeSocket(socket, CLOSE_SUPERSEDED, "superseded");
     }
   }
 
@@ -1038,20 +1223,20 @@ export class SessionDO {
     replayEnvelope?: Envelope
   ): Promise<Response> {
     // hmd's half goes first because it is the one step here that can fail (a
-    // storage write, when hmd's stream is down). Failing after the socket was
+    // storage write, when hmd's leg is down). Failing after the socket was
     // accepted would leave one the phone never received — a ghost that
-    // `liveDeviceSocket` ranks newest and delivers hmd's frames into.
+    // `liveSocket` ranks newest and delivers hmd's frames into.
     if (hmdControlPayload) {
       await this.deliverToHmdStream(sessionId, hmdControlPayload);
     }
 
     // Newest device socket wins, and this is where "newest" is recorded:
     // one above every generation currently attached, written onto the socket
-    // so `liveDeviceSocket` can rank it against the others without this
+    // so `liveSocket` can rank it against the others without this
     // instance remembering anything (see DeviceSocketAttachment). Nothing
-    // already attached is closed here — see supersedeOlderDeviceSockets for
+    // already attached is closed here — see supersedeOlderSockets for
     // why that has to wait for a delivered frame.
-    const generation = this.nextDeviceGeneration();
+    const generation = this.nextGeneration(DEVICE_TAG);
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -1089,16 +1274,16 @@ export class SessionDO {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  /** Writes device_bound's hmd-facing payload (device_pubkey, bound_at) into
-   * hmd's GET /stream as a plaintext control frame — the one frame this
-   * relay ever holds back (see PENDING_HMD_CONTROL_KEY): if hmd's stream
-   * isn't open yet, this parks the encoded line in storage until
-   * handleStream flushes it, rather than dropping it because no one is
-   * currently listening (unlike a `state`/`command`/`ack` frame's fire-once
-   * `/frames` semantics, this control frame's only delivery describes a
-   * one-time event that already happened and must eventually reach hmd). In
-   * storage rather than memory because nothing keeps this object resident
-   * while hmd is away. */
+  /** Writes device_bound's hmd-facing payload (device_pubkey, bound_at) to
+   * hmd's leg — an NDJSON line or a WebSocket message, whichever is live — as a
+   * plaintext control frame: the one frame this relay ever holds back (see
+   * PENDING_HMD_CONTROL_KEY). If hmd isn't connected yet, this parks the
+   * encoded line in storage until handleStream or acceptHmdSocket flushes it,
+   * rather than dropping it because no one is currently listening (unlike a
+   * `state`/`command`/`ack` frame's fire-once `/frames` semantics, this control
+   * frame's only delivery describes a one-time event that already happened and
+   * must eventually reach hmd). In storage rather than memory because nothing
+   * keeps this object resident while hmd is away. */
   private async deliverToHmdStream(
     sessionId: string,
     payload: DeviceBoundToHmdPayload
@@ -1114,7 +1299,7 @@ export class SessionDO {
         ciphertext: null,
         payload,
       }) + "\n";
-    if (!this.writeToHmdStream(line)) {
+    if (!this.writeToHmd(line)) {
       await this.ctx.storage.put(PENDING_HMD_CONTROL_KEY, line);
     }
   }
@@ -1163,44 +1348,50 @@ export class SessionDO {
     // this Durable Object otherwise never ends on its own. A revoked session
     // is fully over — this is the ONLY path that ends it deliberately, and
     // the only one that stops the keepalive for good. An ordinary stream
-    // drop must never come through here: hmd is expected back.
+    // drop must never come through here: hmd is expected back. An hmd
+    // WebSocket is closed the same way, 4001 / "revoked", with no message
+    // first: hmd is the one ending it, as the NDJSON stream is told nothing.
     this.closeHmdStream();
+    this.closeHmdSockets(CLOSE_SESSION_ENDED, "revoked");
 
     return jsonResponse(200, { ok: true });
   }
 
   /**
+   * Every message on either WebSocket leg, routed by the socket's tag: an hmd
+   * socket's go to `handleHmdSocketMessage`, everything else is the phone's.
+   *
    * The phone leg's inbound path — and, before the 2026-09-24 audit, the
    * relay's single most dangerous line: it re-serialized anything that passed
    * a *structural* check straight into hmd's stream. Four gates now stand
    * between a phone socket and that stream, in cost order.
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (this.isHmdSocket(ws)) {
+      this.handleHmdSocketMessage(ws, message);
+      return;
+    }
     if (typeof message !== "string") return;
 
     // Per-socket state, read once: the session id for the log lines below that
     // are written before the record is read (see DeviceSocketAttachment.sid —
     // a freshly woken instance has no cached id), and the token expiry for
     // gate 4.
-    const attachment = deviceSocketAttachment(ws);
+    const attachment = socketAttachment(ws);
     const sessionId =
       typeof attachment.sid === "string" ? attachment.sid : (this.cachedSessionId ?? "unknown");
 
     // 1. INV-16, the half that was only ever enforced on `POST /frames`
     //    (finding 8). Checked before `JSON.parse` so an oversize message is
-    //    never parsed, and length-first so the encode below is itself bounded:
-    //    UTF-8 is never fewer bytes than characters, so a string longer than
-    //    the cap is over it regardless of contents.
-    if (
-      message.length > MAX_ENVELOPE_BYTES ||
-      new TextEncoder().encode(message).byteLength > MAX_ENVELOPE_BYTES
-    ) {
+    //    never parsed, and length-first (see `exceedsEnvelopeCap`) so the
+    //    encode inside it is itself bounded.
+    if (exceedsEnvelopeCap(message)) {
       logEvent("frame_rejected", {
         session_id: sessionId,
         leg: "device",
         reason: "envelope_exceeds_size_cap",
       });
-      this.closeDeviceSocket(ws, CLOSE_MESSAGE_TOO_BIG, "frame exceeds size cap");
+      this.closeSocket(ws, CLOSE_MESSAGE_TOO_BIG, "frame exceeds size cap");
       return;
     }
 
@@ -1238,7 +1429,7 @@ export class SessionDO {
         leg: "device",
         reason: "session_not_bound",
       });
-      this.closeDeviceSocket(ws, CLOSE_SESSION_ENDED, "session ended");
+      this.closeSocket(ws, CLOSE_SESSION_ENDED, "session ended");
       return;
     }
 
@@ -1252,13 +1443,13 @@ export class SessionDO {
         leg: "device",
         reason: "device_token_expired",
       });
-      this.closeDeviceSocket(ws, CLOSE_TOKEN_EXPIRED, "device token expired");
+      this.closeSocket(ws, CLOSE_TOKEN_EXPIRED, "device token expired");
       return;
     }
 
-    if (this.writeToHmdStream(JSON.stringify(envelope) + "\n")) return;
+    if (this.writeToHmd(JSON.stringify(envelope) + "\n")) return;
 
-    // hmd's stream is down (mid-reconnect, or gone). The frame is dropped,
+    // hmd's leg is down (mid-reconnect, or gone). The frame is dropped,
     // not queued — the same fire-once semantics `POST /frames` reports as
     // `delivered: false` when the phone is absent (relay/README.md's "no
     // persisted frame buffering"). The phone's own `ack` timeout is what
@@ -1270,10 +1461,55 @@ export class SessionDO {
     });
   }
 
-  /** Ends a device socket the relay has decided to stop serving. Never throws
-   * past this boundary: a socket already closing or gone is exactly the state
-   * the caller wanted, and a throw here would take its `return` with it. */
-  private closeDeviceSocket(socket: WebSocket, code: number, reason: string): void {
+  /**
+   * An hmd socket's message. hmd POSTs every frame it sends over HTTP
+   * (`POST /frames`), so the only thing it ever sends on this socket is the text
+   * `ping`, which the runtime answers itself and which never reaches this
+   * handler. What does reach it is therefore either a message that is too big
+   * (INV-16, the same cap and the same close as the phone's) or one this relay
+   * does not take on this leg — dropped and logged, never forwarded anywhere:
+   * hmd is not a source of frames for the phone over this socket.
+   */
+  private handleHmdSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+    if (typeof message !== "string") return;
+    const attachment = socketAttachment(ws);
+    const sessionId =
+      typeof attachment.sid === "string" ? attachment.sid : (this.cachedSessionId ?? "unknown");
+    if (exceedsEnvelopeCap(message)) {
+      logEvent("frame_rejected", {
+        session_id: sessionId,
+        leg: "hmd",
+        reason: "envelope_exceeds_size_cap",
+      });
+      this.closeSocket(ws, CLOSE_MESSAGE_TOO_BIG, "frame exceeds size cap");
+      return;
+    }
+    logEvent("frame_rejected", {
+      session_id: sessionId,
+      leg: "hmd",
+      reason: "ws_message_unsupported",
+    });
+  }
+
+  /** The tags `acceptWebSocket` gave `ws` — which leg it is. A socket the
+   * runtime no longer knows throws; that reads as "no tags", never as an
+   * exception out of a message or close handler. */
+  private socketTags(ws: WebSocket): string[] {
+    try {
+      return this.ctx.getTags(ws);
+    } catch {
+      return [];
+    }
+  }
+
+  private isHmdSocket(ws: WebSocket): boolean {
+    return this.socketTags(ws).includes(HMD_TAG);
+  }
+
+  /** Ends a socket the relay has decided to stop serving, on either leg. Never
+   * throws past this boundary: a socket already closing or gone is exactly the
+   * state the caller wanted, and a throw here would take its `return` with it. */
+  private closeSocket(socket: WebSocket, code: number, reason: string): void {
     try {
       socket.close(code, reason);
     } catch {
@@ -1321,7 +1557,7 @@ export class SessionDO {
 
       logEvent("session_purged", { session_id: record.session_id, status: record.status });
       for (const socket of this.ctx.getWebSockets(DEVICE_TAG)) {
-        this.closeDeviceSocket(socket, CLOSE_SESSION_ENDED, "session ended");
+        this.closeSocket(socket, CLOSE_SESSION_ENDED, "session ended");
       }
       // hmd is told why before its stream goes (INV-38). Without it, a session
       // nobody bound ended as a bare EOF followed by a 404 — see endHmdStream.
@@ -1332,21 +1568,23 @@ export class SessionDO {
   }
 
   async webSocketClose(
-    _ws: WebSocket,
+    ws: WebSocket,
     code: number,
     _reason: string,
     wasClean: boolean
   ): Promise<void> {
     const record = await this.loadRecord();
-    logEvent("device_socket_closed", {
+    logEvent(this.isHmdSocket(ws) ? "hmd_socket_closed" : "device_socket_closed", {
       session_id: record?.session_id ?? "unknown",
       code,
       wasClean,
     });
   }
 
-  async webSocketError(_ws: WebSocket, _error: unknown): Promise<void> {
+  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     const record = await this.loadRecord();
-    logEvent("device_socket_error", { session_id: record?.session_id ?? "unknown" });
+    logEvent(this.isHmdSocket(ws) ? "hmd_socket_error" : "device_socket_error", {
+      session_id: record?.session_id ?? "unknown",
+    });
   }
 }
