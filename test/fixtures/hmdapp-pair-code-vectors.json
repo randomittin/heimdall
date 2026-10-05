@@ -1,0 +1,17 @@
+{
+  "description": "Known-answer vectors for pair-by-session-code (docs/superpowers/specs/2026-10-05-pair-by-session-code.md section 9). Raw 32-byte inputs are SHA-256 of the labels below; expected values were computed with python hashlib, independent of the app. The hmd side must assert the same file.",
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "labels": {
+    "hmd_pubkey": "vector/hmd_pubkey",
+    "device_pubkey": "vector/device_pubkey",
+    "device_pubkey_mitm": "vector/device_pubkey-mitm",
+    "nonce_h": "vector/nonce_h"
+  },
+  "commit_domain": "hmd-pair-commit-v1 followed by one NUL byte",
+  "sas_domain": "hmd-pair-sas-v1 followed by one NUL byte",
+  "expected": {
+    "hmd_commit_b64url": "fK9skJUq6kpGOhbFB86vr2qzCW-P6zu7-tKBZPyDt9Q",
+    "sas": "817531",
+    "sas_mitm": "006173"
+  }
+}

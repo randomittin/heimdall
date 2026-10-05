@@ -341,13 +341,17 @@ and the connect threads all emit, and an exception out of emit() ended them.
 """
 
 import argparse
+import base64
 import collections
 import functools
+import hashlib
 import http.client
 import itertools
 import json
 import os
 import queue
+import re
+import select
 import signal
 import socket
 import ssl
@@ -698,6 +702,135 @@ def _split_relay(url):
     return parsed
 
 
+# -- pair by session code (see PAIR BY SESSION CODE in the module docstring) -----------------------------
+# The code is hmd's 5-character session code, the alphabet bin/lib/hmd_session_code.py emits. The two domain
+# strings are the wire contract shared with the phone app (hmdapp's docs/samples/pair-code-vectors.json holds
+# the known answers both sides assert).
+CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+CODE_LENGTH = 5
+COMMIT_DOMAIN = b"hmd-pair-commit-v1\x00"
+SAS_DOMAIN = b"hmd-pair-sas-v1\x00"
+_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
+_TOKEN_RE = re.compile(r"[\x21-\x7e]{1,255}")
+STDIN_LINE_MAX = 4096
+TOKEN_READ_TIMEOUT_S = 5.0
+
+
+def _env_seconds(name, default):
+    """A positive number of seconds from the environment, `default` when unset, malformed or out of range --
+    the same forgiving read every HMD_RELAY_* knob above gets, for the four code-window timings a test must
+    shorten."""
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if 0 < value <= 86400 else default
+
+
+# How long one code stays offered in total, how long after a window lapses before the next is registered
+# (the relay's clock and ours may differ by a moment), the least time between two renewals (a skewed clock
+# must never turn renewal into a hot loop), and how long the laptop has to approve a bind.
+CODE_WINDOW_TOTAL_S = _env_seconds("HMD_RELAY_CODE_WINDOW_S", 600.0)
+CODE_RENEW_MARGIN_S = _env_seconds("HMD_RELAY_CODE_RENEW_MARGIN_S", 1.5)
+CODE_RENEW_MIN_S = _env_seconds("HMD_RELAY_CODE_RENEW_MIN_S", 5.0)
+APPROVAL_TIMEOUT_S = _env_seconds("HMD_RELAY_APPROVAL_TIMEOUT_S", 60.0)
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def commit_for(hmd_pub, nonce):
+    """hmd's commitment to its X25519 key: SHA256(domain || key || nonce), registered with the relay before any
+    phone key exists and opened by the later key_reveal."""
+    return hashlib.sha256(COMMIT_DOMAIN + hmd_pub + nonce).digest()
+
+
+def sas_for(session_id, hmd_pub, device_pub):
+    """The six-digit short authentication string both screens show: uint32_be of the first four digest bytes
+    mod 10^6, zero-padded. It binds the session and both keys, each fixed before the other was revealed."""
+    digest = hashlib.sha256(SAS_DOMAIN + session_id.encode("utf-8") + b"\x00" + hmd_pub + device_pub).digest()
+    return "%06d" % (int.from_bytes(digest[:4], "big") % 1000000)
+
+
+def valid_code(code):
+    return isinstance(code, str) and len(code) == CODE_LENGTH and all(ch in CODE_ALPHABET for ch in code)
+
+
+def valid_login(login):
+    return isinstance(login, str) and _LOGIN_RE.fullmatch(login) is not None
+
+
+def clean_text(value, limit):
+    """`value` without C0 controls (ESC among them), DEL and C1 controls, as code points, cut to `limit`
+    characters: what a phone-claimed label or a relay-supplied name is reduced to before it is shown anywhere."""
+    return "".join(ch for ch in str(value) if not (ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F))[:limit]
+
+
+def _code_arg(value):
+    if not valid_code(value):
+        raise argparse.ArgumentTypeError("--code must be %d characters of %s" % (CODE_LENGTH, CODE_ALPHABET))
+    return value
+
+
+def _refusal_reason(status, raw):
+    """The one-word reason a relay answer other than 200 maps to: what code_unavailable says."""
+    try:
+        detail = json.loads(raw.decode("utf-8")).get("error")
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        detail = None
+    if status == 503:
+        return "disabled"
+    if status == 409:
+        return "conflict"
+    if status == 401 and detail == "github token rejected":
+        return "no-gh"
+    return "http-%d" % status
+
+
+class _StdinLines:
+    """Newline-delimited lines off a raw file descriptor, with a deadline. The first line of stdin is the
+    laptop's GitHub token and the lines after it are the operator's answers, and a buffered text stream
+    cannot be polled with select once it has read ahead -- so this owns the descriptor's bytes itself."""
+
+    def __init__(self, fd):
+        self.fd = fd
+        self.buf = b""
+        self.eof = False
+
+    def readline(self, timeout):
+        """The next line (no newline, decoded), None when `timeout` seconds pass first. Raises EOFError once
+        the stream ended with nothing left, ValueError for a line over STDIN_LINE_MAX bytes."""
+        deadline = time.monotonic() + timeout
+        while True:
+            newline = self.buf.find(b"\n")
+            if newline >= 0:
+                line, self.buf = self.buf[:newline], self.buf[newline + 1:]
+                return line.decode("utf-8", "replace").rstrip("\r")
+            if len(self.buf) > STDIN_LINE_MAX:
+                raise ValueError("line over %d bytes" % STDIN_LINE_MAX)
+            if self.eof:
+                if not self.buf:
+                    raise EOFError
+                line, self.buf = self.buf, b""
+                return line.decode("utf-8", "replace").rstrip("\r")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                ready = select.select([self.fd], [], [], remaining)[0]
+                chunk = os.read(self.fd, 4096) if ready else None
+            except (OSError, ValueError):
+                self.eof = True  # a closed or unusable descriptor is an ended stream
+                continue
+            if chunk is None:
+                return None
+            if not chunk:
+                self.eof = True
+                continue
+            self.buf += chunk
+
+
 _FAMILY_NAME = {socket.AF_INET: "ipv4", socket.AF_INET6: "ipv6"}
 
 
@@ -987,6 +1120,27 @@ class RelayClient:
         self.cache = None
         self._login = None         # the LoginManager, created on first use (see _login_manager)
 
+        # Pair by session code (PAIR BY SESSION CODE in the module docstring). Everything below stays idle --
+        # state "off", nothing read from stdin -- unless --code was given.
+        self._code = getattr(args, "code", None)
+        self._no_confirm = bool(getattr(args, "no_confirm", False))
+        self._stdin = None             # _StdinLines over fd 0: the token line, then the operator's answers
+        self._control_open = True      # False once stdin ended: nobody is left to answer an approval
+        self._gh_secret = None         # the laptop's GitHub token. Memory only, dropped when the window ends
+        self._code_state = "off"       # off | open | approving | bound | closed, guarded by _code_lock
+        self._code_lock = threading.Lock()
+        self._code_deadline = 0.0      # time.monotonic() after which no window is renewed
+        self._code_lapse_at = 0.0      # time.monotonic() when the current session's window lapses unclaimed
+        self._last_renew_at = 0.0
+        self._code_renewals = 0
+        self._commit_nonce = None      # nonce_h of the current session, revealed once a code bind is approved
+        self._pending = None           # the bind waiting for the laptop's answer
+        self._renew_now = threading.Event()
+        self._stream_epoch = 0         # bumped when a renewal replaces the session the stream reads
+        self._reading_epoch = 0        # the epoch the stream thread is reading frames of
+        self._stream_conn = None
+        self._stream_lock = threading.Lock()
+
     # -- status ------------------------------------------------------------
     def _status_snapshot(self):
         return {
@@ -1027,28 +1181,31 @@ class RelayClient:
         finally:
             conn.close()
 
-    def pair_init(self):
+    def _post_pair_init(self):
+        """POST /pair/init: (the answer, 0), or (None, 12) after an `error` event says why it failed."""
         try:
             status, raw = self._request("POST", "/pair/init", headers={"Content-Length": "0"}, body=b"",
                                          label="pair")
         except (OSError, http.client.HTTPException) as e:
             emit({"event": "error", "detail": "pair/init unreachable: %s" % e})
-            return 12
+            return None, 12
         if status != 200:
             emit({"event": "error", "detail": "pair/init HTTP %d: %s" % (status, _body_head(raw))})
-            return 12
+            return None, 12
         try:
             data = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
             emit({"event": "error", "detail": "pair/init returned invalid JSON: %s" % e})
-            return 12
+            return None, 12
         for key in ("session_id", "pairing_code", "relay_session_token", "exp"):
             if key not in data:
                 emit({"event": "error", "detail": "pair/init response missing %r" % key})
-                return 12
-        self.session_id = data["session_id"]
-        self.token = data["relay_session_token"]
-        self.exp = data["exp"]
+                return None, 12
+        return data, 0
+
+    def _emit_pair_init(self, data, renewal=0):
+        """The `pair_init` event for the session this client now holds (the QR payload, Decision 7.2 shape).
+        A code-window renewal carries its number so a reader can tell it is not a new person's QR."""
         qr = {
             "v": 1,
             "relay": self.relay_url,
@@ -1057,8 +1214,20 @@ class RelayClient:
             "exp": self.exp,
             "hmd_pubkey": E2E.pub_b64(self.pub),
         }
-        emit({"event": "pair_init", "qr": qr, "exp": self.exp})
+        event = {"event": "pair_init", "qr": qr, "exp": self.exp}
+        if renewal:
+            event["renewal"] = renewal
+        emit(event)
         self.write_status()
+
+    def pair_init(self):
+        data, rc = self._post_pair_init()
+        if rc != 0:
+            return rc
+        self.session_id = data["session_id"]
+        self.token = data["relay_session_token"]
+        self.exp = data["exp"]
+        self._emit_pair_init(data)
         return 0
 
     def _auth_headers(self, extra=None):
@@ -1191,14 +1360,323 @@ class RelayClient:
         return delivered, nbytes
 
     def revoke(self):
-        if not self.session_id or not self.token:
+        self._revoke_session(self.session_id, self.token)
+
+    def _revoke_session(self, session_id, token):
+        """POST /session/:id/revoke for ANY session this client minted -- the current one at shutdown, a
+        superseded or rejected code window's mid-run."""
+        if not session_id or not token:
             return
         try:
-            self._request("POST", "/session/%s/revoke" % self.session_id,
-                           headers=self._auth_headers({"Content-Length": "0"}), body=b"", label="revoke")
+            self._request("POST", "/session/%s/revoke" % session_id,
+                           headers={"Authorization": "Bearer %s" % token, "Content-Length": "0"}, body=b"",
+                           label="revoke")
         except (OSError, http.client.HTTPException) as e:
             # best-effort shutdown courtesy call -- surfaced, never blocks process exit
             emit({"event": "error", "detail": "revoke call failed: %s" % e})
+
+    # -- pair by session code ----------------------------------------------------------------------
+    # PAIR BY SESSION CODE in the module docstring is the design; what follows is its client half.
+    def _read_token(self):
+        """The laptop's GitHub token: the first line of stdin, which must be a pipe. A terminal is never read
+        (a pasted token would echo), and one that is late, missing or malformed is simply none."""
+        if os.isatty(0):
+            sys.stderr.write("heimdall-relay-client: --code reads the GitHub token from a pipe on stdin, "
+                             "not from a terminal\n")
+            return None
+        try:
+            line = self._stdin.readline(TOKEN_READ_TIMEOUT_S)
+        except (EOFError, ValueError, OSError):
+            return None
+        token = (line or "").strip()
+        return token if _TOKEN_RE.fullmatch(token) else None
+
+    def _register_code(self, session_id, bearer, commit):
+        """POST /session/:id/code for a session of this client: (gh_login, exp, None) once the relay verified the
+        token and opened the window, else (None, None, reason). The token travels in this request body and
+        nowhere else -- no event, status field or error text here carries it, nor the relay's own words."""
+        body = json.dumps({"code": self._code, "gh_token": self._gh_secret, "hmd_commit": b64url(commit)},
+                          sort_keys=True, separators=(",", ":")).encode("utf-8")
+        try:
+            status, raw = self._request("POST", "/session/%s/code" % session_id,
+                                        headers={"Authorization": "Bearer %s" % bearer,
+                                                 "Content-Type": "application/json"},
+                                        body=body, label="code")
+        except (OSError, http.client.HTTPException) as e:
+            emit({"event": "error", "detail": "code registration unreachable: %s" % e})
+            return None, None, "unreachable"
+        if status != 200:
+            return None, None, _refusal_reason(status, raw)
+        try:
+            answer = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            answer = None
+        if not isinstance(answer, dict):
+            return None, None, "http-200"
+        login, exp = answer.get("gh_login"), answer.get("exp")
+        if answer.get("code") != self._code or not valid_login(login) or isinstance(exp, bool) \
+                or not isinstance(exp, int):
+            return None, None, "http-200"  # a 200 that is not what the relay documents is no window
+        return login, exp, None
+
+    def _schedule_lapse(self, exp):
+        self._code_lapse_at = time.monotonic() + max(exp - time.time(), 0.0) + CODE_RENEW_MARGIN_S
+
+    def _code_end(self, event, reason):
+        """The window is over for good (no session of this client has a live one): drop the token, say why once."""
+        with self._code_lock:
+            if self._code_state in ("bound", "closed"):
+                return
+            self._code_state = "closed"
+        self._gh_secret = None
+        emit({"event": event, "reason": reason})
+
+    def _code_bound(self):
+        """A bind that needed no approval (the QR's) ended the window: the token has nothing left to do."""
+        with self._code_lock:
+            if self._code_state in ("off", "closed"):
+                return
+            self._code_state = "bound"
+        self._gh_secret = None
+
+    def code_start(self):
+        """Offer the session code, right after the first pair_init: read the token, commit to this session's
+        key, register the window. Whatever goes wrong ends code mode with ONE code_unavailable event and leaves
+        the QR session exactly as it was."""
+        self._stdin = _StdinLines(0)
+        token = self._read_token()
+        if token is None:
+            self._code_end("code_unavailable", "no-gh")
+            return
+        self._gh_secret = token
+        self._commit_nonce = os.urandom(32)
+        login, exp, reason = self._register_code(self.session_id, self.token,
+                                                 commit_for(self.pub, self._commit_nonce))
+        if reason is not None:
+            self._code_end("code_unavailable", reason)
+            return
+        now = time.monotonic()
+        with self._code_lock:
+            self._code_state = "open"
+            self._code_deadline = now + CODE_WINDOW_TOTAL_S
+            self._last_renew_at = now
+            self._schedule_lapse(exp)
+        emit({"event": "code_window", "code": self._code, "gh_login": login, "exp": exp})
+        threading.Thread(target=self._control_loop, name="code-control", daemon=True).start()
+        threading.Thread(target=self._code_loop, name="code-window", daemon=True).start()
+
+    def _control_loop(self):
+        """The operator's answers: one word per line on stdin after the token. `approve` and `reject` mean
+        something only while a bind is waiting -- one that arrives earlier answers nothing and is not kept."""
+        while not self.stop_event.is_set():
+            try:
+                line = self._stdin.readline(0.5)
+            except (EOFError, ValueError, OSError):
+                self._control_open = False
+                self._resolve_approval(False, "eof")
+                return
+            word = (line or "").strip().lower()
+            if word == "approve":
+                self._resolve_approval(True, "operator")
+            elif word == "reject":
+                self._resolve_approval(False, "operator")
+
+    def _code_loop(self):
+        """Offers the code for CODE_WINDOW_TOTAL_S: each time the current session's window lapses unclaimed, or
+        a bind is rejected, the window is renewed. A bound or ended window ends this thread."""
+        while not self.stop_event.is_set():
+            with self._code_lock:
+                state, lapse_at = self._code_state, self._code_lapse_at
+            if state not in ("open", "approving"):
+                return
+            if state == "approving":
+                self.stop_event.wait(0.2)  # the laptop's answer decides what happens next
+                continue
+            triggered = self._renew_now.wait(min(max(lapse_at - time.monotonic(), 0.0), 0.5))
+            if self.stop_event.is_set():
+                return
+            if not triggered and time.monotonic() < lapse_at:
+                continue
+            earliest = self._last_renew_at + CODE_RENEW_MIN_S
+            if time.monotonic() < earliest and self.stop_event.wait(earliest - time.monotonic()):
+                return
+            self._renew_window()
+
+    def _renew_window(self):
+        """A new session, a FRESH X25519 key and a fresh nonce for the same code. Built beside the current one
+        and swapped in only if no bind landed meanwhile -- a bind on the session being replaced wins."""
+        self._renew_now.clear()
+        if time.monotonic() >= self._code_deadline:
+            self._code_end("code_window_closed", "expired")
+            return
+        data, rc = self._post_pair_init()
+        if rc != 0:
+            self._code_end("code_unavailable", "unreachable")
+            return
+        new_id, new_token = data["session_id"], data["relay_session_token"]
+        priv, pub = E2E.generate_keypair()
+        nonce = os.urandom(32)
+        login, exp, reason = self._register_code(new_id, new_token, commit_for(pub, nonce))
+        if reason == "conflict":
+            # our own lapsed window may still hold the code on the relay's clock: free it, once more
+            self._revoke_session(self.session_id, self.token)
+            login, exp, reason = self._register_code(new_id, new_token, commit_for(pub, nonce))
+        if reason is not None:
+            self._revoke_session(new_id, new_token)
+            self._code_end("code_unavailable", reason)
+            return
+        with self._code_lock:
+            installed = self._code_state == "open"
+            if installed:
+                old = (self.session_id, self.token)
+                self.session_id, self.token, self.exp = new_id, new_token, data["exp"]
+                self.priv, self.pub, self._commit_nonce = priv, pub, nonce
+                self._code_renewals += 1
+                renewal = self._code_renewals
+                self._last_renew_at = time.monotonic()
+                self._schedule_lapse(exp)
+                self._stream_epoch += 1
+        if not installed:
+            self._revoke_session(new_id, new_token)
+            return
+        self._interrupt_stream()
+        self._emit_pair_init(data, renewal)
+        emit({"event": "code_window", "code": self._code, "gh_login": login, "exp": exp, "renewal": renewal})
+        self._renew_now.clear()  # whatever the old session's end set belongs to a session this client has left
+        self._revoke_session(*old)
+
+    def _interrupt_stream(self):
+        """Cut the connection the stream thread is blocked reading, so it reopens at once on the session this
+        client holds now. A connection that is already down needs no cutting -- the thread reopens on its own."""
+        with self._stream_lock:
+            conn = self._stream_conn
+        sock = getattr(conn, "sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                return
+
+    def _await_window_swap(self, epoch, timeout=30.0):
+        """Wait for a renewal to replace the session the stream was reading: True once it has."""
+        deadline = time.monotonic() + timeout
+        while epoch == self._stream_epoch and time.monotonic() < deadline:
+            if self.stop_event.wait(0.2):
+                return False
+        return epoch != self._stream_epoch
+
+    def _renew_after_session_end(self):
+        """The relay ended the current session. While a window is still being offered and unbound that is a
+        reason to renew it, not to end the client -- True when it was taken as one."""
+        with self._code_lock:
+            state, pending = self._code_state, self._pending
+            if state not in ("open", "approving") or time.monotonic() >= self._code_deadline:
+                return False
+            if state == "approving":
+                self._pending = None
+                self._code_state = "open"
+        if state == "approving":
+            if pending["timer"] is not None:
+                pending["timer"].cancel()
+            emit({"event": "code_rejected", "reason": "session-ended"})
+        self._renew_now.set()
+        return True
+
+    def _post_key_reveal(self):
+        """The one plaintext hmd->phone frame: hmd's public key and the nonce its commitment was made with.
+        The relay passes it on without reading it; the phone checks it against the commitment it was given."""
+        envelope = {"v": 1, "session_id": self.session_id, "seq": 0, "sender": "hmd", "type": "key_reveal",
+                    "nonce": None, "ciphertext": None,
+                    "payload": {"hmd_pubkey": E2E.pub_b64(self.pub), "nonce": E2E.pub_b64(self._commit_nonce)}}
+        body = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        for attempt in range(3):
+            try:
+                status, raw = self._frame_channels["state"].post(
+                    _base_path(self.parsed) + "/session/%s/frames" % self.session_id,
+                    headers=self._auth_headers({"Content-Type": "application/json", "Connection": "keep-alive"}),
+                    body=body, timeout=CONNECT_TIMEOUT_S)
+            except (OSError, http.client.HTTPException) as e:
+                emit({"event": "error", "detail": "key_reveal post failed: %s" % e})
+                status = None
+            else:
+                if status == 200:
+                    return True
+                emit({"event": "error", "detail": "key_reveal post HTTP %d: %s" % (status, _body_head(raw))})
+                if status < 500:
+                    return False  # the relay refused it: asking again changes nothing
+            if attempt < 2 and self.stop_event.wait(0.3):
+                return False
+        return False
+
+    def _begin_approval(self, payload, device_pub):
+        """A phone claimed the window by code. hmd reveals its key, shows the SAS, and seals NOTHING until the
+        laptop answers (or --no-confirm answers for it)."""
+        try:
+            key = E2E.derive_session_key(self.priv, device_pub, self.session_id)
+        except Exception as e:
+            emit({"event": "error", "detail": "device_bound key derivation failed: %s" % e})
+            return
+        with self._code_lock:
+            if self._code_state != "open":
+                return
+            self._code_state = "approving"
+            pending = {"device_pub": device_pub, "bound_at": payload.get("bound_at"), "key": key,
+                       "sid": self.session_id, "token": self.token, "timer": None}
+            self._pending = pending
+        if not self._post_key_reveal():
+            self._resolve_approval(False, "reveal-failed", pending)
+            return
+        login = payload.get("gh_login")
+        timeout_s = int(APPROVAL_TIMEOUT_S) if APPROVAL_TIMEOUT_S == int(APPROVAL_TIMEOUT_S) else APPROVAL_TIMEOUT_S
+        event = {"event": "approve_request", "sas": sas_for(pending["sid"], self.pub, device_pub),
+                 "device_label": clean_text(payload.get("device_label") or "", 32) or "unnamed device",
+                 "gh_login": login if valid_login(login) else "unknown", "timeout_s": timeout_s}
+        if self._no_confirm:
+            event["auto"] = True
+        emit(event)
+        if self._no_confirm:
+            self._resolve_approval(True, "auto", pending)
+        elif not self._control_open:
+            self._resolve_approval(False, "eof", pending)
+        else:
+            timer = threading.Timer(APPROVAL_TIMEOUT_S, self._resolve_approval, args=(False, "timeout", pending))
+            timer.daemon = True
+            with self._code_lock:
+                if self._pending is pending:
+                    pending["timer"] = timer
+                    timer.start()
+
+    def _resolve_approval(self, approved, by, expect=None):
+        """The laptop's answer (or its silence): approve pairs the session exactly as a QR bind does; anything
+        else revokes it and renews the window. With nothing waiting, or with `expect` no longer the waiting
+        bind, this does nothing -- a late timer or a stray word cannot answer a question not asked of it."""
+        with self._code_lock:
+            pending = self._pending
+            if pending is None or (expect is not None and expect is not pending):
+                return
+            self._pending = None
+            self._code_state = "bound" if approved else "open"
+        if pending["timer"] is not None:
+            pending["timer"].cancel()
+        if approved:
+            self._gh_secret = None
+            self._finish_bind(pending)
+            return
+        emit({"event": "code_rejected", "reason": by})
+        self._revoke_session(pending["sid"], pending["token"])
+        self._renew_now.set()
+
+    def _finish_bind(self, pending):
+        """What the first device_bound does for a QR bind, once the laptop approved the code bind."""
+        self.device_pub = pending["device_pub"]
+        self.paired = True
+        self.bound_at = pending["bound_at"]
+        self.session_key = pending["key"]  # last: the stream thread reads a set key as "paired"
+        self._forget_push_registrations()
+        self._rearm_state()
+        self.write_status()
+        emit({"event": "device_bound", "bound_at": self.bound_at})
+        self.state_ready.set()
 
     # -- stream --------------------------------------------------------------
     def _open_stream(self):
@@ -1550,6 +2028,8 @@ class RelayClient:
         if not isinstance(env, dict):  # valid JSON that is not an envelope: a loud error, never a dead stream thread
             emit({"event": "error", "detail": "unexpected frame (not a JSON object) -- ignored"})
             return
+        if self._reading_epoch != self._stream_epoch:
+            return  # a frame of a session this client has already left: a code-window renewal replaced it
         sender = env.get("sender")
         type_ = env.get("type")
         if sender == "relay" and type_ == "device_bound":
@@ -1583,6 +2063,18 @@ class RelayClient:
                       "detail": "device_bound device_pubkey differs from the already latched "
                                 "session key's -- ignored, key not re-derived"})
                 return
+            # Pair by session code: a bind by CODE reaches pairing only through the laptop's approval, and a
+            # second bind while one is waiting asks nothing again (a different key is refused, like a latched one).
+            if self._code_state == "approving":
+                pending = self._pending
+                if pending is not None and device_pub != pending["device_pub"]:
+                    emit({"event": "error",
+                          "detail": "device_bound device_pubkey differs from the bind already awaiting "
+                                    "approval -- ignored"})
+                return
+            if self._code_state == "open" and payload.get("via") == "code":
+                self._begin_approval(payload, device_pub)
+                return
             try:
                 self.session_key = E2E.derive_session_key(self.priv, device_pub, self.session_id)
             except Exception as e:
@@ -1591,6 +2083,7 @@ class RelayClient:
             self.device_pub = device_pub
             self.paired = True
             self.bound_at = payload.get("bound_at")
+            self._code_bound()
             self._forget_push_registrations()
             # §7c, 2026-09-25: force the next tick to re-send state even if its
             # digest hasn't changed since the last publish. A (re)bind means the
@@ -1605,6 +2098,8 @@ class RelayClient:
             self.state_ready.set()
             return
         if sender == "relay" and type_ == "session_ended":
+            if self._renew_after_session_end():
+                return  # a code window still being offered: the session is replaced, the client lives on
             payload = env.get("payload") or {}
             self.write_status()
             emit({"event": "session_ended", "reason": payload.get("reason", "unknown")})
@@ -1730,6 +2225,7 @@ class RelayClient:
     def _stream_loop(self):
         backoff_ms = BACKOFF_BASE_MS
         while not self.stop_event.is_set():
+            epoch = self._stream_epoch  # the session this pass reads: a code-window renewal moves it on
             try:
                 conn, resp, ws_key = self._open_stream()
             except (OSError, http.client.HTTPException) as e:
@@ -1740,7 +2236,15 @@ class RelayClient:
                 backoff_ms = min(backoff_ms * 2, BACKOFF_CAP_MS)
                 continue
 
+            if epoch != self._stream_epoch:  # replaced while connecting: this connection is the old session's
+                conn.close()
+                continue
+
             if resp.status in (401, 404, 410):
+                if self._renew_after_session_end():  # the window's session is gone: wait for its replacement
+                    conn.close()
+                    if self._await_window_swap(epoch):
+                        continue
                 self.write_status()
                 emit({"event": "session_ended", "reason": "stream-%d" % resp.status})
                 self.stop_event.set()
@@ -1783,16 +2287,25 @@ class RelayClient:
 
             backoff_ms = BACKOFF_BASE_MS  # reset on a successful (re)connect
             emit({"event": "stream_open", "transport": "ws" if ws is not None else "ndjson"})
+            with self._stream_lock:
+                self._stream_conn = conn
+            self._reading_epoch = epoch
             try:
                 if ws is not None:
                     drop_reason, drop_info = self._read_ws(ws)
                 else:
                     drop_reason, drop_info = self._read_ndjson(conn, resp)
             finally:
+                with self._stream_lock:
+                    self._stream_conn = None
                 conn.close()
 
             if self.stop_event.is_set():
                 return
+
+            if epoch != self._stream_epoch:  # a code-window renewal cut this stream: planned, so no backoff, no noise
+                backoff_ms = BACKOFF_BASE_MS
+                continue
 
             if drop_reason == "rotate":
                 emit({"event": "stream_drop", "retry_ms": 0, "reason": "rotate"})
@@ -1913,6 +2426,7 @@ class RelayClient:
             return
         self._stopping = True
         self.stop_event.set()
+        self._gh_secret = None  # a stopped client offers no code window, so it keeps no token
         self._login_shutdown()  # before the (network-bound) revoke: a login process must not outlive us
         self.revoke()
         self.write_status()
@@ -1925,8 +2439,8 @@ def build_argparser():
                                               "E2E sealed, accepting send-message and decide (deny-only) commands back")
     ap.add_argument("--relay", required=True, metavar="URL",
                      help="relay base URL, e.g. https://hmd-relay.example.workers.dev")
-    ap.add_argument("--repo", required=True, metavar="DIR", help="repo root to render (passed to collect_state)")
-    ap.add_argument("--ui-port", required=True, type=int, metavar="N",
+    ap.add_argument("--repo", default=None, metavar="DIR", help="repo root to render (passed to collect_state)")
+    ap.add_argument("--ui-port", default=None, type=int, metavar="N",
                      help="port a local `hmd ui` is bound to (informational -- carried in the "
                           "transport dict, never dialed by this process)")
     ap.add_argument("--public-host", default=None, metavar="NAME",
@@ -1938,7 +2452,50 @@ def build_argparser():
                      help="longest the state loop blocks before it re-checks for a stop or a re-bind "
                           "(default 2, and never more than 0.25 -- STATE_WAIT_SLICE_S). A state change is "
                           "sent as it happens (debounced 50 ms), not at the next tick")
+    ap.add_argument("--code", default=None, metavar="CODE", type=_code_arg,
+                     help="also offer this 5-character session code: the phone pairs by typing it. The laptop's "
+                          "GitHub token is read from the first line of stdin (a pipe), the operator's answers "
+                          "(approve / reject) from the lines after it")
+    ap.add_argument("--no-confirm", action="store_true",
+                     help="with --code: approve a phone that claimed by code without asking the laptop. The relay "
+                          "is then trusted to deliver the right keys")
+    ap.add_argument("--identity-revoke", action="store_true",
+                     help="instead of a session: read the laptop's GitHub token from stdin, ask the relay to "
+                          "revoke every phone sign-in for that GitHub user, print one event, exit")
     return ap
+
+
+def identity_revoke(args):
+    """`--identity-revoke`: POST /identity/github/revoke with the token read from stdin (a pipe), print ONE
+    event -- identity_revoked {gh_login, not_before} or identity_revoke_failed {reason} -- and exit: 0 revoked,
+    3 no usable token, 12 the relay refused or was unreachable. The token is in that request body only."""
+    client = RelayClient(argparse.Namespace(relay=args.relay, repo=".", status_file=None, tick_s=2.0,
+                                            public_host=None, ui_port=0))
+    client._stdin = _StdinLines(0)
+    token = client._read_token()
+    if token is None:
+        emit({"event": "identity_revoke_failed", "reason": "no-gh"})
+        return 3
+    body = json.dumps({"gh_token": token}, separators=(",", ":")).encode("utf-8")
+    try:
+        status, raw = client._request("POST", "/identity/github/revoke",
+                                      headers={"Content-Type": "application/json"}, body=body, label="identity")
+    except (OSError, http.client.HTTPException) as e:
+        emit({"event": "error", "detail": "identity revoke unreachable: %s" % e})
+        emit({"event": "identity_revoke_failed", "reason": "unreachable"})
+        return 12
+    answer = None
+    if status == 200:
+        try:
+            answer = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            answer = None
+    if isinstance(answer, dict) and valid_login(answer.get("gh_login")):
+        emit({"event": "identity_revoked", "gh_login": answer["gh_login"], "not_before": answer.get("not_before")})
+        return 0
+    reason = _refusal_reason(status, raw) if status != 200 else "http-200"
+    emit({"event": "identity_revoke_failed", "reason": reason})
+    return 3 if reason == "no-gh" else 12
 
 
 def main(argv=None):
@@ -1947,6 +2504,13 @@ def main(argv=None):
     parsed = _split_relay(args.relay)
     if parsed is None:
         ap.error("--relay must be an http:// or https:// URL")
+    if args.identity_revoke:
+        return identity_revoke(args)
+    missing = [flag for flag, value in (("--repo", args.repo), ("--ui-port", args.ui_port)) if value is None]
+    if missing:
+        ap.error("the following arguments are required: %s" % ", ".join(missing))
+    if args.no_confirm and not args.code:
+        ap.error("--no-confirm needs --code")
 
     # Configured before the first possible emit() below (mirrors _split_relay
     # being computed here AND again inside RelayClient.__init__ -- a cheap
@@ -1995,6 +2559,9 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
+
+    if args.code:
+        client.code_start()  # after the signal handlers: Ctrl-C while the window registers still revokes
 
     client.login_startup()
 

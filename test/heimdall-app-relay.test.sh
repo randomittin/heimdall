@@ -1023,7 +1023,7 @@ CONNECT_D_ERR="$TMPROOT/d.connect.err"
 # exercised whether or not the real crypto module has landed on this branch
 # yet. bin/heimdall-app itself is never copied or edited.
 HEIMDALL_RELAY_CLIENT_BIN="$STUB_CLIENT" "$HEIMDALL" app connect \
-  --repo "$REPO_D" --port "$PORT_D_UI" --relay "http://127.0.0.1:$PORT_D_RELAY" \
+  --repo "$REPO_D" --port "$PORT_D_UI" --no-code --relay "http://127.0.0.1:$PORT_D_RELAY" \
   >"$CONNECT_D_OUT" 2>"$CONNECT_D_ERR"
 CONNECT_D_RC=$?
 
