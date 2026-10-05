@@ -285,7 +285,9 @@ describe("hmd's WebSocket leg: what the relay sends hmd", () => {
       type: "device_bound",
       nonce: null,
       ciphertext: null,
-      payload: { device_pubkey: TEST_DEVICE_PUBKEY, bound_at: expect.any(Number) },
+      // `via` is how the bind came about (pair-by-session-code, spec 6.5); a QR scan says `qr` and
+      // carries nothing about a person -- relay/test/code-pair.spec.ts holds the code form.
+      payload: { device_pubkey: TEST_DEVICE_PUBKEY, bound_at: expect.any(Number), via: "qr" },
     });
   });
 
