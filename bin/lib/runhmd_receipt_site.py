@@ -91,10 +91,13 @@ def render_page(doc):
         ("Cost", "$%s &middot; %ss" % (_num(doc["cost_usd"], 4), _num(doc["duration_s"], 2))),
         ("Tool", "<span class=\"t\">%s %s</span>" % (_e(tool["name"]), _e(tool["version"]))),
     ]
-    sections = ["<section><h2>Findings</h2>%s<p>A finding is shown as a digest: the receipt commits to its counterexample without carrying it.</p></section>" % (
-        _table(["Finding", "Severity", "Category", "Title", "Digest"],
-               [["<code>%s</code>" % _e(f["id"]), _e(f["severity"]), _e(f["category"]), "<span class=\"t\">%s</span>" % _e(f["title"]),
-                 "<code>%s</code>" % _e(f["digest"])] for f in doc["findings"]) if doc["findings"] else "<p>No findings.</p>")]
+    if doc["findings"]:
+        found = _table(["Finding", "Severity", "Category", "Title", "Digest"],
+                       [["<code>%s</code>" % _e(f["id"]), _e(f["severity"]), _e(f["category"]), "<span class=\"t\">%s</span>" % _e(f["title"]),
+                         "<code>%s</code>" % _e(f["digest"])] for f in doc["findings"]])
+    else:
+        found = "<p>No findings.</p>"
+    sections = ["<section><h2>Findings</h2>%s<p>A finding is shown as a digest: the receipt commits to its counterexample without carrying it.</p></section>" % found]
     if doc.get("gates"):
         sections.append("<section><h2>Gates</h2>%s</section>" % _table(
             ["Gate", "Type", "Status", "Falsified", "Score"],
