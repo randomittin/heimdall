@@ -9,7 +9,7 @@
       "matcher": "",
       "fingerprint": "f80665a729244616f95ecd0a2f68dc1a26a1864be48a60911ba1c87611e8e30f",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "UserPromptSubmit",
@@ -19,7 +19,7 @@
       "matcher": "",
       "fingerprint": "b4ec5067ce255dd6706497e87e9ccc30b0c433c06d4795b556f3b8fdbdb640e5",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "UserPromptSubmit",
@@ -39,7 +39,7 @@
       "matcher": "",
       "fingerprint": "d573a9aed96110192381b8a50ef55662d9fdf9f1e786cc247a82ed8f0ee5d370",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "UserPromptSubmit",
@@ -54,8 +54,8 @@
     {
       "event": "UserPromptSubmit",
       "index": 5,
-      "id": "lib",
-      "description": "NEW -- describe what this hook does",
+      "id": "phone-control-prompt",
+      "description": "Drops a pending phone `interrupt` request (<repo>/.heimdall/ui/stop-request.json) at UserPromptSubmit via heimdall-phone-control prompt, so a stale stop flag can never end the NEXT turn. A file test runs first, so nothing pending costs no process. Attended sessions only. Not remote_toggle: the phone cannot switch off its own stop path.",
       "matcher": "",
       "fingerprint": "6c10c005f06563f818e7c1fa1bc423d2c0a265e595c3df1d43ce43499b754f56",
       "locked": false,
@@ -79,7 +79,7 @@
       "matcher": "Read|Grep|Glob",
       "fingerprint": "3334862e18768af3c358c7de8b132c453c5c48bf8f74d676ac6fc3ab8b83a962",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "PreToolUse",
@@ -154,8 +154,8 @@
     {
       "event": "PreToolUse",
       "index": 9,
-      "id": "lib",
-      "description": "NEW -- describe what this hook does",
+      "id": "phone-control-pretool",
+      "description": "Honours the phone's `interrupt` before a tool runs, via heimdall-phone-control stop: a stop request younger than 120 s is consumed once (renamed to stop-request.consumed) and answered with {continue:false, stopReason}. A file test on <repo>/.heimdall/ui/stop-request.json runs first, so a tool call with nothing pending costs one shell builtin. Attended sessions only; never blocks on its own failure. Not remote_toggle: the phone cannot switch off its own stop path.",
       "matcher": "*",
       "fingerprint": "33726e9338420fd925f6942bca341d4e25452914b1976d969b787b8522c9762b",
       "locked": false,
@@ -169,7 +169,7 @@
       "matcher": "Bash",
       "fingerprint": "72e1d9cdb35228d6a1a1076a3b601c119689a56032387a4aa50c3e468ca9e769",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "PostToolUse",
@@ -214,8 +214,8 @@
     {
       "event": "PostToolUse",
       "index": 5,
-      "id": "lib",
-      "description": "NEW -- describe what this hook does",
+      "id": "phone-control-posttool",
+      "description": "Honours the phone's `interrupt` after a tool ran, via heimdall-phone-control stop: the same single-use, 120 s request as phone-control-pretool, so a stop lands the moment a long tool call returns instead of one model reply later. File-test fast path; attended sessions only; never blocks on its own failure. Not remote_toggle.",
       "matcher": "*",
       "fingerprint": "acc38cbac8e2f69282499732584cecb2ac21d460e78213b440e0ab9b16448460",
       "locked": false,
@@ -239,7 +239,7 @@
       "matcher": "",
       "fingerprint": "43b61c54637592aefbbc49d10faadf73974816ef5b4011c2044671ebe4089160",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "SessionStart",
@@ -249,7 +249,7 @@
       "matcher": "",
       "fingerprint": "255dc069d5993a1f505f99ae99410e8989a3ef024f67924c5aa34ec48cf10884",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "SessionStart",
@@ -259,7 +259,7 @@
       "matcher": "",
       "fingerprint": "92bb68d091d58f77c8b198142ef2d67e6cc2437ced0db63c78cb4e23aca86bb0",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "SessionStart",
@@ -269,7 +269,7 @@
       "matcher": "",
       "fingerprint": "e99050636e047e42bf9ed6cde01fdb15ba42b9d7a0da215964416b2e67ba7aa4",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "SessionStart",
@@ -289,7 +289,7 @@
       "matcher": "",
       "fingerprint": "467e89bcab759e9834fdad3e5e17bac128ddb4c742608feae3c7822b166771b2",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "SessionStart",
@@ -319,7 +319,7 @@
       "matcher": "",
       "fingerprint": "167e83fc43c2004d52548b72d74c002483e4f13d335f12e67371fd5681a1a212",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "SessionStart",
@@ -349,7 +349,7 @@
       "matcher": "",
       "fingerprint": "e631cbb84435f3b2b30f2968040cdd0d93a05759ba2d8fc41e7bc9b7e12b9df6",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "SubagentStop",
@@ -369,7 +369,7 @@
       "matcher": "",
       "fingerprint": "900027c81a27da24c394012aebbc844e519ccffe74ddaa4a74ad2ba1cdeda030",
       "locked": false,
-      "remote_toggle": false
+      "remote_toggle": true
     },
     {
       "event": "Stop",
