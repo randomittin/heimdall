@@ -1448,7 +1448,7 @@ rm -f "$TERM_MARKER" "$RELAY_LOG"
 # observe both pair_init and device_bound before we tear it down ourselves.
 ( HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=pair-bind \
     FAKE_RELAY_TERM_MARKER="$TERM_MARKER" FAKE_RELAY_LOG="$RELAY_LOG" \
-    "$APP" connect --repo "$D" --port 0 --relay "$RELAY_URL" >"$OUT_FILE" 2>&1 ) &
+    "$APP" connect --repo "$D" --port 0 --no-code --relay "$RELAY_URL" >"$OUT_FILE" 2>&1 ) &
 FG_PID=$!
 PIDS+=("$FG_PID")
 
@@ -1527,7 +1527,7 @@ rm -rf "$D"
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-relay-e2e.out"
 ( HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=exit-e2e \
-    "$APP" connect --repo "$D" --port 0 --relay "https://relay.example.com" >"$OUT_FILE" 2>&1 ) &
+    "$APP" connect --repo "$D" --port 0 --no-code --relay "https://relay.example.com" >"$OUT_FILE" 2>&1 ) &
 FG_PID=$!
 PIDS+=("$FG_PID")
 
@@ -1561,7 +1561,7 @@ rm -rf "$D"
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-relay-unreachable.out"
 ( HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=exit-unreachable \
-    "$APP" connect --repo "$D" --port 0 --relay "https://relay.example.com" >"$OUT_FILE" 2>&1 ) &
+    "$APP" connect --repo "$D" --port 0 --no-code --relay "https://relay.example.com" >"$OUT_FILE" 2>&1 ) &
 FG_PID=$!
 PIDS+=("$FG_PID")
 
@@ -1596,7 +1596,7 @@ rm -rf "$D"
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-relay-ignoreterm.out"
 HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=ignore-term \
-  "$APP" connect --repo "$D" --port 0 --relay "https://relay.example.com" --bg >"$OUT_FILE" 2>&1
+  "$APP" connect --repo "$D" --port 0 --no-code --relay "https://relay.example.com" --bg >"$OUT_FILE" 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && ok "relay connect --bg (ignore-term client) exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
 
