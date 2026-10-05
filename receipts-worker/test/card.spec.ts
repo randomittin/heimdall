@@ -75,7 +75,7 @@ describe("renderCard", () => {
 
   it("draws findings, and never overruns the canvas for long or unusual titles", async () => {
     const many = Array.from({ length: 7 }, (_, i) => ({
-      id: `f-000${i + 1}`, title: `${"very long title é✓\U0001F6E1 ".repeat(20)}`.slice(0, 200), severity: ["high", "medium", "low", "info"][i % 4], category: "logic", digest: `sha256:${"a".repeat(64)}`,
+      id: `f-000${i + 1}`, title: "very long title é✓\u{1F6E1} ".repeat(20).slice(0, 200), severity: ["high", "medium", "low", "info"][i % 4], category: "logic", digest: `sha256:${"a".repeat(64)}`,
     }));
     const { pixels } = await pixelsOf(receiptBody({ findings: many, attacks: { total: 24, survived: 21, killed: 3 } }));
     expect(countIn(pixels, COLOURS.TEXT, 64, 330, CARD_WIDTH - 64, 500)).toBeGreaterThan(300);
@@ -92,7 +92,7 @@ describe("bitmap font", () => {
   it("folds lower case up, strips accents, and draws '?' for what it lacks", () => {
     expect(glyph("a")).toEqual(glyph("A"));
     expect(glyph("é")).toEqual(glyph("E"));
-    expect(glyph("\U0001F6E1")).toEqual(glyph("?"));
+    expect(glyph("\u{1F6E1}")).toEqual(glyph("?"));
     expect(glyph("日")).toEqual(glyph("?"));
     expect(glyph("A")).not.toEqual(glyph("B"));
   });

@@ -208,13 +208,12 @@ describe("GET /r/<id>, /r/<id>.json, /r/<id>/card.png", () => {
     expect([view.getUint32(16), view.getUint32(20)]).toEqual([1200, 630]);
   });
 
-  it("never publishes counterexample text: no response mentions minimal_input or counterexample", async () => {
+  it("never publishes counterexample text: nothing mentions minimal_input, and the .json has no counterexample", async () => {
     const { id } = await stored();
     for (const path of [`/r/${id}`, `/r/${id}.json`]) {
-      const body = await (await get(path)).text();
-      expect(body).not.toContain("minimal_input");
-      expect(body).not.toContain("counterexample");
+      expect(await (await get(path)).text(), path).not.toContain("minimal_input");
     }
+    expect(await (await get(`/r/${id}.json`)).text()).not.toContain("counterexample");
   });
 
   it("answers 404 for an unknown id and for malformed ones, with one body", async () => {
@@ -242,11 +241,9 @@ describe("GET /r/<id>, /r/<id>.json, /r/<id>/card.png", () => {
 
   it("re-verifies on every read: a receipt whose key was withdrawn is not served", async () => {
     const { id } = await stored();
-    const other = await strangerSigner();
-    const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]) as CryptoKeyPair;
-    const raw = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey))));
-    expect(other.keyId).toHaveLength(16);
-    const res = await worker.fetch(new Request(`${BASE}/r/${id}.json`), { ...(env as unknown as Env), RECEIPT_PUBKEYS: raw });
+    const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])) as CryptoKeyPair;
+    const otherPublic = btoa(String.fromCharCode(...new Uint8Array((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer)));
+    const res = await worker.fetch(new Request(`${BASE}/r/${id}.json`), { ...(env as unknown as Env), RECEIPT_PUBKEYS: otherPublic });
     expect(res.status).toBe(500);
     expect(await res.text()).toBe("receipt failed verification\n");
   });

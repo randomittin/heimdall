@@ -11,8 +11,8 @@ const hex = (bytes: Uint8Array): string => Array.from(bytes, (b) => b.toString(1
 const b64 = (bytes: Uint8Array): string => btoa(String.fromCharCode(...bytes));
 
 const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])) as CryptoKeyPair;
-const publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
-const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
+const publicRaw = new Uint8Array((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer);
+const pkcs8 = new Uint8Array((await crypto.subtle.exportKey("pkcs8", pair.privateKey)) as ArrayBuffer);
 const seed = pkcs8.slice(pkcs8.length - 32);
 const apiToken = hex(crypto.getRandomValues(new Uint8Array(32)));
 const tokenDigest = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(apiToken))));

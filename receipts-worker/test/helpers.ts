@@ -33,7 +33,7 @@ export async function trustedSigner(): Promise<Signer> {
 /** A signer nobody trusts. */
 export async function strangerSigner(): Promise<Signer> {
   const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])) as CryptoKeyPair;
-  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const raw = new Uint8Array((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer);
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", raw));
   return { key: pair.privateKey, keyId: Array.from(digest.slice(0, 8), (b) => b.toString(16).padStart(2, "0")).join("") };
 }
