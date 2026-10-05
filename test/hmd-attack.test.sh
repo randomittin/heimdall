@@ -42,6 +42,14 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/hmd-attack-test-XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 export HEIMDALL_HOME="$TMP/home"; mkdir -p "$HEIMDALL_HOME"
 export HEIMDALL_NO_INTRO=1 HEIMDALL_NO_UPDATE_CHECK=1
+# Safety rails: if `hmd attack` is ever unrouted, the dispatcher falls through to the Claude
+# task-prompt path. With a stub claude, a setup-done marker and HEIMDALL_TRACE_ORDER that path
+# only appends "launch:task" to a file and exits — it can never start a model session, run
+# first-run setup or touch the network from this suite. [C] asserts the trace stays empty.
+touch "$HEIMDALL_HOME/setup-done"
+mkdir -p "$TMP/stubbin"; printf '#!/bin/sh\nexit 0\n' >"$TMP/stubbin/claude"; chmod +x "$TMP/stubbin/claude"
+export PATH="$TMP/stubbin:$PATH"
+export HEIMDALL_TRACE_ORDER="$TMP/trace.order"; : >"$HEIMDALL_TRACE_ORDER"
 
 command -v jq      >/dev/null 2>&1 || { echo "jq required" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 required" >&2; exit 2; }
@@ -350,6 +358,266 @@ gate "$TMP/t/ok" "$TMP/r.ok2.json"
 mkdir -p "$TMP/clean-tmp"
 TMPDIR="$TMP/clean-tmp" "$ORACLE/run.sh" --input "$TMP/t/ok" --report "$TMP/r.ok3.json" >/dev/null 2>&1
 [ -z "$(ls -A "$TMP/clean-tmp")" ] && ok "the gate leaves nothing behind in TMPDIR (ephemeral temp dir removed)" || bad "the gate left files in TMPDIR: $(ls -A "$TMP/clean-tmp")"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [C] CLI — `hmd attack`
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[C] hmd attack CLI"
+
+# attack <args...>: run from the repo root with stdin from /dev/null; sets AOUT AERR ARC
+attack() {
+  AOUT="$TMP/attack.out"; AERR="$TMP/attack.err"
+  (cd "$REPO" && "$HMD" attack "$@" </dev/null >"$AOUT" 2>"$AERR"); ARC=$?
+}
+
+echo "  -- the RP1 acceptance lines, verbatim --"
+( set +o pipefail; cd "$REPO" && "$HMD" attack fixtures/attack/buggy-webhook --json --yes 2>/dev/null | jq -e '.verdict=="DENIED" and (.findings|length)>=1' >/dev/null ) \
+  && ok "ACCEPT 1: hmd attack fixtures/attack/buggy-webhook --json --yes | jq -e '.verdict==\"DENIED\" and (.findings|length)>=1'" \
+  || bad "ACCEPT 1: buggy-webhook is not DENIED with >=1 finding"
+( set +o pipefail; cd "$REPO" && "$HMD" attack fixtures/attack/clean-sample --json --yes 2>/dev/null | jq -e '.verdict=="PROVEN"' >/dev/null ) \
+  && ok "ACCEPT 2: hmd attack fixtures/attack/clean-sample --json --yes | jq -e '.verdict==\"PROVEN\"'" \
+  || bad "ACCEPT 2: clean-sample is not PROVEN"
+( cd "$REPO" && "$HMD" attack . </dev/null >/dev/null 2>&1; test $? -eq 3 ) \
+  && ok "ACCEPT 3: hmd attack . </dev/null exits 3 (no TTY, no --yes: refuses to run)" \
+  || bad "ACCEPT 3: hmd attack . </dev/null did not exit 3"
+
+echo "  -- verdicts, exit codes, contract --"
+attack fixtures/attack/buggy-webhook --json --yes; cp "$AOUT" "$TMP/v.denied.json"; DRC=$ARC
+attack fixtures/attack/clean-sample --json --yes;  cp "$AOUT" "$TMP/v.proven.json"; PRC=$ARC
+[ "$DRC" -eq 1 ] && ok "DENIED exits 1" || bad "DENIED exit code is $DRC, want 1"
+[ "$PRC" -eq 0 ] && ok "PROVEN exits 0" || bad "PROVEN exit code is $PRC, want 0"
+for v in denied proven; do
+  python3 "$SCHEMA_PY" validate "$TMP/v.$v.json" >/dev/null 2>"$TMP/v.err" \
+    && ok "the $v verdict validates against docs/schemas/runhmd.verdict.v1.json" || bad "the $v verdict violates the schema: $(head -2 "$TMP/v.err" | tr '\n' '|')"
+done
+check "the verdict document is the only thing on stdout (one JSON value)" jq -e -s 'length==1' "$TMP/v.denied.json"
+check "DENIED document: path target as given, 40-hex head_sha, 23 attacks / 6 killed, no model, no receipt" \
+  jq -e '.schema=="runhmd.verdict/1" and .target.kind=="path" and .target.ref=="fixtures/attack/buggy-webhook"
+         and (.target.head_sha|test("^[0-9a-f]{40}$")) and .attacks=={total:23,survived:17,killed:6}
+         and .cost_usd==0 and .agent=={name:"none",model:null} and .receipt_url==null' "$TMP/v.denied.json"
+check "DENIED finding: the 50ms duplicate-settlement race, high/concurrency, f-0001, minimal two-delivery input" \
+  jq -e '(.findings|length)==1 and .findings[0].id=="f-0001" and .findings[0].title=="duplicate settlement (webhook+retry within 50ms)"
+         and .findings[0].severity=="high" and .findings[0].category=="concurrency" and .findings[0].evidence_ref==null
+         and (.findings[0].counterexample.minimal_input|fromjson|.deliveries|length)==2
+         and (.findings[0].counterexample.summary|contains("delivery statuses"))' "$TMP/v.denied.json"
+check "PROVEN document: no findings, nothing killed, every attack survived" \
+  jq -e '.verdict=="PROVEN" and .findings==[] and .attacks.killed==0 and .attacks.total==23 and .attacks.survived==23' "$TMP/v.proven.json"
+[ "$(jq -r .id "$TMP/v.denied.json")" != "$(jq -r .id "$TMP/v.proven.json")" ] && ok "different targets get different ids" || bad "buggy and clean share an id"
+attack fixtures/attack/buggy-webhook --json --yes
+[ "$(jq -r .id "$AOUT")" = "$(jq -r .id "$TMP/v.denied.json")" ] \
+  && [ "$(jq -S 'del(.duration_s)' "$AOUT")" = "$(jq -S 'del(.duration_s)' "$TMP/v.denied.json")" ] \
+  && ok "the same target gives the same id and the same document (deterministic; only duration_s varies)" || bad "two runs on one target differ"
+repro="$(jq -r '.findings[0].counterexample.repro_cmd' "$TMP/v.denied.json")"
+case "$repro" in "hmd attack fixtures/attack/buggy-webhook "*) ok "repro_cmd names the command and the target: $repro" ;; *) bad "repro_cmd is not a runnable hmd attack command: $repro" ;; esac
+attack ${repro#hmd attack }
+[ "$(jq -r '.findings[0].title' "$AOUT")" = "duplicate settlement (webhook+retry within 50ms)" ] && ok "running repro_cmd reproduces the same finding" || bad "repro_cmd does not reproduce the finding"
+
+echo "  -- consent (non-TTY without --yes exits 3, before any work) --"
+attack fixtures/attack/clean-sample
+[ "$ARC" -eq 3 ] && [ ! -s "$AOUT" ] && grep -q -- '--yes' "$AERR" && ok "no --yes and no TTY: exit 3, nothing on stdout, stderr says to pass --yes" || bad "non-TTY consent refusal wrong (rc=$ARC)"
+( cd "$REPO" && printf 'y\n' | "$HMD" attack fixtures/attack/clean-sample >"$TMP/piped.out" 2>/dev/null; test $? -eq 3 && [ ! -s "$TMP/piped.out" ] ) \
+  && ok "a 'y' piped into a non-TTY is NOT consent (exit 3)" || bad "piped input was accepted as consent"
+attack fixtures/attack/clean-sample --json
+[ "$ARC" -eq 3 ] && jq -e '.error=="consent_required"' "$AOUT" >/dev/null 2>&1 && ok "--json without consent: exit 3 and an error document on stdout" || bad "--json consent refusal wrong (rc=$ARC)"
+attack /nonexistent/path/xyz
+[ "$ARC" -eq 3 ] && ok "consent is asked for before the target is even looked at (exit 3, not 2)" || bad "consent should precede target resolution (rc=$ARC)"
+
+cat >"$TMP/pty-consent.py" <<'PY'
+import os, pty, select, sys, time
+
+def run(answer, hmd, repo, args):
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(repo)
+        os.execv(hmd, [hmd, "attack"] + args)
+    out, sent, deadline = b"", False, time.time() + 90
+    while time.time() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.5)
+        if ready:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            if not sent and b"[y/N]" in out:
+                os.write(fd, answer)
+                sent = True
+    _, status = os.waitpid(pid, 0)
+    return os.WEXITSTATUS(status), out.decode("utf-8", "replace"), sent
+
+hmd, repo = sys.argv[1], sys.argv[2]
+rc_y, out_y, sent_y = run(b"y\n", hmd, repo, ["fixtures/attack/clean-sample"])
+rc_n, out_n, sent_n = run(b"n\n", hmd, repo, ["fixtures/attack/clean-sample"])
+print("YES rc=%d prompted=%s proven=%s executes=%s" % (rc_y, sent_y, "PROVEN" in out_y, "EXECUTE" in out_y.upper()))
+print("NO rc=%d prompted=%s ran=%s" % (rc_n, sent_n, "VERDICT" in out_n))
+PY
+pty_out="$(python3 "$TMP/pty-consent.py" "$HMD" "$REPO" 2>/dev/null)"
+printf '%s\n' "$pty_out" | grep -q '^YES rc=0 prompted=True proven=True executes=True' && ok "on a TTY the prompt says it will EXECUTE the target; answering y runs the attack (PROVEN, exit 0)" || bad "TTY consent 'y' flow wrong: $(printf '%s' "$pty_out" | tr '\n' '|')"
+printf '%s\n' "$pty_out" | grep -q '^NO rc=3 prompted=True ran=False' && ok "on a TTY, answering n declines: exit 3 and nothing ran" || bad "TTY consent 'n' flow wrong: $(printf '%s' "$pty_out" | tr '\n' '|')"
+
+echo "  -- no attack surface / bad input is never a PROVEN --"
+attack . --json --yes
+[ "$ARC" -eq 2 ] && jq -e '.error=="no_attack_surface" and (has("verdict")|not)' "$AOUT" >/dev/null 2>&1 \
+  && ok "attacking a tree that declares no attack surface exits 2 (no_attack_surface), never a vacuous PROVEN" || bad "no-surface target wrong (rc=$ARC): $(head -c 200 "$AOUT")"
+attack /nonexistent/path/xyz --yes --json
+[ "$ARC" -eq 2 ] && jq -e '.error=="target_not_found"' "$AOUT" >/dev/null 2>&1 && ok "a missing target exits 2 (target_not_found)" || bad "missing target wrong (rc=$ARC)"
+attack --bogus --yes;                     [ "$ARC" -eq 2 ] && ok "an unknown flag exits 2" || bad "unknown flag rc=$ARC"
+attack fixtures/attack/clean-sample --max-usd abc --yes;  [ "$ARC" -eq 2 ] && ok "--max-usd abc exits 2" || bad "--max-usd abc rc=$ARC"
+attack fixtures/attack/clean-sample --max-usd -1 --yes;   [ "$ARC" -eq 2 ] && ok "--max-usd -1 exits 2" || bad "--max-usd -1 rc=$ARC"
+attack --batch "$TMP/none.txt" --yes;     [ "$ARC" -eq 2 ] && ok "--batch without --out exits 2" || bad "--batch without --out rc=$ARC"
+attack fixtures/attack/clean-sample --diff x.patch --yes
+[ "$ARC" -eq 2 ] && grep -qi 'adapter' "$AERR" && ok "--diff is refused with exit 2 and says it arrives with the adapters (RP9), not silently ignored" || bad "--diff handling wrong (rc=$ARC)"
+attack https://github.com/org/repo/pull/123 --yes
+[ "$ARC" -eq 2 ] && grep -qi 'not supported' "$AERR" && ok "a PR URL is refused with exit 2 (needs network + adapters), nothing fetched" || bad "PR url handling wrong (rc=$ARC)"
+attack fixtures/attack/clean-sample --max-usd 0.50 --no-network --json --yes
+[ "$ARC" -eq 0 ] && jq -e '.verdict=="PROVEN" and .cost_usd==0' "$AOUT" >/dev/null 2>&1 && ok "--max-usd 0.50 --no-network: runs, costs \$0 (deterministic engine: no model, no network)" || bad "--max-usd/--no-network run wrong (rc=$ARC)"
+attack --help
+[ "$ARC" -eq 0 ] && for w in --json --card --yes --max-usd --batch --out --no-network --diff; do grep -q -- "$w" "$AOUT" || { bad "--help does not document $w"; break; }; done
+[ "$ARC" -eq 0 ] && grep -Eq '^ +3 .*consent' "$AOUT" && grep -Eq '^ +4 .*budget' "$AOUT" && ok "--help documents every flag and the exit codes (0..5)" || bad "--help incomplete (rc=$ARC)"
+
+PYLIB="$REPO/bin/lib"
+python3 - "$PYLIB" <<'PY' >"$TMP/budget.out" 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import runhmd_attack as ra
+over = ra.enforce_budget(0.5, 0.01)
+assert over == {"error": "budget_cap", "spent_usd": 0.5, "cap_usd": 0.01}, over
+assert ra.enforce_budget(0.0, 0.0) is None
+assert ra.enforce_budget(0.01, 0.01) is None
+assert ra.enforce_budget(3.0, None) is None
+assert ra.EXIT_BUDGET == 4 and ra.EXIT_CONSENT == 3 and ra.EXIT_USAGE == 2 and ra.EXIT_INFRA == 5
+print("budget-ok")
+PY
+grep -q budget-ok "$TMP/budget.out" && ok "budget cap: a cost over --max-usd is exit 4 {error:budget_cap,spent_usd,cap_usd}; at-or-under passes" || bad "enforce_budget wrong: $(cat "$TMP/budget.out")"
+! grep -En '^[[:space:]]*(import|from)[[:space:]]+(socket|urllib|http|ssl|ftplib|smtplib|requests)' "$PYLIB/runhmd_attack.py" "$PYLIB/runhmd_card.py" "$ATTACK_BIN" >/dev/null 2>&1 \
+  && ok "the CLI imports no network module (nothing beyond the local gate subprocess)" || bad "the CLI imports a network module"
+! grep -En 'shell[[:space:]]*=[[:space:]]*True|os\.system' "$PYLIB/runhmd_attack.py" "$ATTACK_BIN" >/dev/null 2>&1 \
+  && ok "the CLI never shells out through a shell string" || bad "the CLI uses shell=True / os.system"
+
+echo "  -- the verdict card (plan 5.3, 40 columns) --"
+attack fixtures/attack/buggy-webhook --card --yes
+check "--card output starts with the runhmd attack box (head -3 | grep 'runhmd attack')" bash -c 'head -3 "$1" | grep -q "runhmd attack"' _ "$AOUT"
+python3 - "$AOUT" <<'PY' >"$TMP/card.out" 2>&1
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+width = lambda s: sum(2 if ch == "\U0001F6E1" else 1 for ch in s)
+bad = [(i, width(l)) for i, l in enumerate(lines) if width(l) != 40]
+print("cols-ok" if lines and not bad else "bad-cols %r" % bad)
+print("denied" if any("VERDICT: DENIED" in l for l in lines) else "no-verdict")
+print("finding" if any(l.startswith("│ ✗ duplicate settlement (webhook+retry") for l in lines) else "no-finding")
+print("counts" if any("23 attacks · 17 survived · 6 killed" in l for l in lines) else "no-counts")
+print("nourl" if not any("Evidence" in l for l in lines) else "fabricated-evidence-line")
+PY
+[ "$(tr '\n' ' ' <"$TMP/card.out")" = "cols-ok denied finding counts nourl " ] && ok "the real DENIED card: every row is 40 columns, VERDICT: DENIED, the wrapped finding, the real counts, and no invented receipt line" || bad "card content wrong: $(tr '\n' '|' <"$TMP/card.out")"
+
+cat >"$TMP/plan-card.txt" <<'CARD'
+╭──────────────────────────────────────╮
+│ 🛡 runhmd attack                     │
+│                                      │
+│ VERDICT: DENIED                      │
+│                                      │
+│ 24 attacks · 21 survived · 3 killed  │
+│                                      │
+│ ✗ duplicate settlement (webhook+retry│
+│   within 50ms)                       │
+│ ✗ missing auth check on /refunds     │
+│ ✗ regression in currency rounding    │
+│                                      │
+│ Cost: $0.41 · Time: 2m 14s           │
+│ Evidence → runhmd.dev/r/abc123       │
+╰──────────────────────────────────────╯
+CARD
+python3 - "$PYLIB" >"$TMP/plan-card.got" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import runhmd_card
+finding = lambda i, title, sev, cat: {"id": "f-000%d" % i, "title": title, "severity": sev, "category": cat,
+    "counterexample": {"summary": "s", "repro_cmd": "hmd attack x", "minimal_input": ""}, "evidence_ref": None}
+doc = {"schema": "runhmd.verdict/1", "id": "abc123", "verdict": "DENIED",
+       "target": {"kind": "path", "ref": ".", "head_sha": None},
+       "attacks": {"total": 24, "survived": 21, "killed": 3},
+       "findings": [finding(1, "duplicate settlement (webhook+retry within 50ms)", "high", "concurrency"),
+                    finding(2, "missing auth check on /refunds", "high", "auth"),
+                    finding(3, "regression in currency rounding", "medium", "regression")],
+       "cost_usd": 0.41, "duration_s": 134, "agent": {"name": "claude-code", "model": "m"},
+       "receipt_url": "https://runhmd.dev/r/abc123"}
+sys.stdout.write(runhmd_card.render_card(doc))
+PY
+cmp -s "$TMP/plan-card.txt" "$TMP/plan-card.got" && ok "the card is byte-for-byte the box in plan 5.3 (wrapping, glyphs, cost/time, evidence line)" || { bad "card differs from plan 5.3"; diff "$TMP/plan-card.txt" "$TMP/plan-card.got" | head -10; }
+attack fixtures/attack/clean-sample --yes
+grep -q "VERDICT: PROVEN" "$AOUT" && ! grep -q '✗' "$AOUT" && ok "the default human output (no --json) is the card: PROVEN with no findings" || bad "default human output is not the PROVEN card"
+attack fixtures/attack/buggy-webhook --json --card --yes
+jq -e '.verdict=="DENIED"' "$AOUT" >/dev/null 2>&1 && grep -q "VERDICT: DENIED" "$AERR" && ok "--json --card: stdout stays pure JSON, the card goes to stderr" || bad "--json --card mixes the streams"
+
+echo "  -- evidence on disk (--out) and batch --"
+OUTD="$TMP/out1"
+attack fixtures/attack/buggy-webhook --json --yes --out "$OUTD"
+if [ "$ARC" -eq 1 ] && python3 "$SCHEMA_PY" validate "$OUTD/verdict.json" >/dev/null 2>&1 \
+   && [ "$(jq -r '.findings[0].evidence_ref' "$OUTD/verdict.json")" = "attacks/f-0001.json" ] \
+   && jq -e '.finding_id=="f-0001" and (.evidence|length)==6 and (.evidence[0].scenario.deliveries|length)==2' "$OUTD/attacks/f-0001.json" >/dev/null 2>&1; then
+  ok "--out DIR: verdict.json is schema-valid and evidence_ref points at a real attacks/f-0001.json holding all 6 killed attacks"
+else bad "--out evidence layout wrong (rc=$ARC)"; ls -R "$OUTD" 2>&1 | head; fi
+[ "$(jq -r '.findings[0].evidence_ref' "$TMP/v.denied.json")" = "null" ] && ok "without --out evidence_ref is null (never a dangling path into a deleted temp dir)" || bad "evidence_ref set without --out"
+
+printf '# targets\n\nfixtures/attack/buggy-webhook\nfixtures/attack/clean-sample\n' >"$TMP/targets.txt"
+BATCH="$TMP/batch"
+attack --batch "$TMP/targets.txt" --out "$BATCH" --json --yes
+nfiles="$(ls "$BATCH"/*.json 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$ARC" -eq 1 ] && [ "$nfiles" -eq 2 ] && [ "$(wc -l <"$AOUT" | tr -d ' ')" -eq 2 ] \
+   && [ "$(jq -r .verdict "$AOUT" | paste -sd, -)" = "DENIED,PROVEN" ] \
+   && for f in "$BATCH"/*.json; do python3 "$SCHEMA_PY" validate "$f" >/dev/null 2>&1 || exit 1; done; then
+  ok "--batch FILE --out DIR: one schema-valid verdict file per target ($nfiles), JSONL on stdout, exit 1 because one was DENIED"
+else bad "batch wrong (rc=$ARC files=$nfiles)"; ls -R "$BATCH" 2>&1 | head; fi
+printf 'fixtures/attack/clean-sample\n.\n' >"$TMP/targets2.txt"
+attack --batch "$TMP/targets2.txt" --out "$TMP/batch2" --json --yes
+[ "$ARC" -eq 2 ] && [ "$(ls "$TMP"/batch2/*.json | wc -l | tr -d ' ')" -eq 2 ] && ls "$TMP"/batch2/*.json | head -1 >/dev/null \
+  && ok "a batch target that cannot be attacked gets an error file and exit 2; the other targets are still attacked" || bad "batch error handling wrong (rc=$ARC)"
+
+echo "  -- isolation: nothing written outside the temp dir --"
+HOME_BEFORE="$TMP/clihome"; mkdir -p "$HOME_BEFORE/h" "$HOME_BEFORE/heimdall" "$HOME_BEFORE/tmp"
+git_before="$(git -C "$REPO" status --porcelain)"
+( cd "$REPO" && HOME="$HOME_BEFORE/h" HEIMDALL_HOME="$HOME_BEFORE/heimdall" TMPDIR="$HOME_BEFORE/tmp" "$HMD" attack fixtures/attack/buggy-webhook --json --yes >/dev/null 2>&1 )
+[ -z "$(ls -A "$HOME_BEFORE/h")" ] && [ -z "$(ls -A "$HOME_BEFORE/tmp")" ] && [ "$git_before" = "$(git -C "$REPO" status --porcelain)" ] \
+  && ok "no files in HOME, none left in TMPDIR, repo tree untouched" || bad "attack wrote outside its ephemeral dir: home=[$(ls -A "$HOME_BEFORE/h")] tmp=[$(ls -A "$HOME_BEFORE/tmp")]"
+stray="$(cd "$HOME_BEFORE/heimdall" && find . -type f | sort | tr '\n' ' ')"
+[ "$stray" = "./.run-count " ] && ok "HEIMDALL_HOME holds only the dispatcher's own .run-count bump (pre-existing behaviour of every hmd command)" || bad "unexpected files in HEIMDALL_HOME: $stray"
+
+echo "  -- the verdict comes from the gate (mutation proof) --"
+mkdir -p "$TMP/mut"
+python3 - "$REPO/fixtures/attack" "$TMP/mut" <<'PY'
+import os, shutil, sys
+src, dst = sys.argv[1], sys.argv[2]
+claim = "      const claimed = await store.putIfAbsent(`event:${event.id}`, true);\n      if (!claimed) return { status: 'duplicate' };\n"
+check = "      const alreadyProcessed = await store.get(`event:${event.id}`);\n      if (alreadyProcessed) return { status: 'duplicate' };\n"
+incr = "      await store.incr(`balance:${event.account}`, net);\n"
+mark = "      await store.set(`event:${event.id}`, true);\n"
+for name in ("clean-sample", "buggy-webhook"):
+    shutil.copytree(os.path.join(src, name), os.path.join(dst, name))
+# break the clean sample: atomic claim -> check-then-act
+p = os.path.join(dst, "clean-sample", "webhook.mjs"); s = open(p).read()
+assert claim in s and incr in s
+open(p, "w").write(s.replace(claim, check).replace(incr, incr + mark))
+# fix the buggy one: check-then-act -> atomic claim
+p = os.path.join(dst, "buggy-webhook", "webhook.mjs"); s = open(p).read()
+assert check in s and mark in s
+open(p, "w").write(s.replace(check, claim).replace(mark, ""))
+PY
+attack "$TMP/mut/clean-sample" --json --yes
+[ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .findings[0].title=="duplicate settlement (webhook+retry within 50ms)"' "$AOUT" >/dev/null 2>&1 \
+  && ok "MUTATION: introduce the race into clean-sample -> PROVEN flips to DENIED with the duplicate-settlement finding" || bad "mutating clean-sample did not flip it to DENIED (rc=$ARC)"
+attack "$TMP/mut/buggy-webhook" --json --yes
+[ "$ARC" -eq 0 ] && jq -e '.verdict=="PROVEN"' "$AOUT" >/dev/null 2>&1 \
+  && ok "MUTATION: fix the race in buggy-webhook (atomic claim) -> DENIED flips to PROVEN" || bad "fixing buggy-webhook did not flip it to PROVEN (rc=$ARC)"
+( cd "$REPO" && HEIMDALL_ORACLES_DIR="$WEAK" "$HMD" attack fixtures/attack/buggy-webhook --json --yes 2>/dev/null | jq -e '.verdict=="PROVEN"' >/dev/null )
+[ $? -eq 0 ] && ok "MUTATION: weaken the gate (drop the concurrent-retry attacks) and the same buggy-webhook is PROVEN — the verdict is computed by the gate, not by the fixture's name" || bad "the CLI verdict does not follow the gate"
+
+echo "  -- dispatch --"
+[ ! -s "$HEIMDALL_TRACE_ORDER" ] && ok "hmd attack never fell through to the Claude task-prompt path during this suite" || bad "hmd attack fell through to the task-prompt path: $(head -c 200 "$HEIMDALL_TRACE_ORDER")"
+grep -Eq '^  attack\)' "$REPO/bin/heimdall" && ok "bin/heimdall has an attack) dispatch arm" || bad "bin/heimdall has no attack) arm"
+[ -x "$ATTACK_BIN" ] && ok "bin/heimdall-attack is executable" || bad "bin/heimdall-attack is not executable"
+bash -n "$REPO/bin/heimdall" && ok "bin/heimdall still passes bash -n" || bad "bin/heimdall has a syntax error"
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
