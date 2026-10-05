@@ -14,6 +14,10 @@
 #               summary lists it; a run that finishes over the cap is excluded too; the row's cost is the
 #               agent's own total when it reports one; an agent that reports no usage is recorded as
 #               unmetered, never as free; the claude-code command streams JSON and carries --max-budget-usd.
+#   [T] TOTAL   the US$180 total cap is held against an append-only ledger (results/spend.ndjson): no run starts
+#               unless the ledger leaves a whole per-run cap, tasks left unstarted are listed as not run, a
+#               second invocation sees the first's spend, an unmetered run counts at the per-run cap, an
+#               unreadable ledger stops everything, and spend is ledgered even if the harness dies mid-run.
 #
 # Hermetic: HOME and TMPDIR point into a throwaway dir; no network and no model call (the agents are fakes
 # and a stub `claude` on PATH prints canned events).
@@ -362,6 +366,90 @@ print("\n".join(out))
 print("END")
 PY
 report "$TMP/t.out"
+
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[T] total cap: held against an append-only ledger, across runs and invocations"
+# ══════════════════════════════════════════════════════════════════════════════
+python3 - "$REPO" "$TMP" >"$TMP/c.out" 2>"$TMP/c.out.err" <<'PY'
+import argparse, contextlib, hashlib, io, json, os, sys
+repo, tmp = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(repo, "bin", "lib"))
+import fg_agent, fg_bench, fg_summary
+
+out = []
+def t(desc, cond, detail=""):
+    out.append("%s\t%s\t%s" % ("PASS" if cond else "FAIL", desc, "" if cond else detail))
+
+anchor_path, anchor = fg_bench.load_tasks(fg_bench.SUITE)[0]
+fg_bench.load_tasks = lambda suite: [(anchor_path, dict(anchor, id="t%d" % i)) for i in range(1, 5)]
+fg_bench.TOTAL_CAP_USD = 5.0          # two $1.80 runs leave $1.40, less than one $2.00 run
+fake = "%s %s" % (sys.executable, os.path.join(tmp, "fake_stream.py"))
+
+def invoke(name, cmd):
+    args = argparse.Namespace(agent="fake-cap", agent_cmd=cmd, arm="runhmd", out=os.path.join(tmp, name))
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        rc = fg_bench.run_study_a_live(fg_bench.SUITE, args)
+    return rc, err.getvalue(), args.out
+
+def lines(path):
+    return [json.loads(l) for l in open(path).read().splitlines() if l.strip()]
+
+# T1 the cap fills mid-batch: two runs, the rest are listed as not run
+rc, err, d = invoke("cap1", fake + " events=1 cost=1.80 reported=1.80 {prompt}")
+rows = {r["task_id"]: r for r in lines(os.path.join(d, "runhmd.jsonl"))}
+ledger = lines(os.path.join(d, "spend.ndjson"))
+t("a cap that fills mid-batch ends the invocation normally", rc == 0, rc)
+t("the first two tasks ran and the last two did not", sorted(rows) == ["t1", "t2", "t3", "t4"] and rows["t1"]["infra_error"] is None and rows["t2"]["infra_error"] is None
+  and all(str(rows[k]["infra_error"]).startswith("not run") for k in ("t3", "t4")), {k: v["infra_error"] for k, v in rows.items()})
+t("the ledger has one line per run that ran, at what it cost", [e["counted_usd"] for e in ledger] == [1.8, 1.8] and [e["task_id"] for e in ledger] == ["t1", "t2"], ledger)
+t("the harness says the study is incomplete", "INCOMPLETE" in err, err)
+summary = fg_summary.summarize(fg_summary.load_rows(d))["study_a"]
+t("the summary lists the tasks that were not run as excluded, with the reason",
+  sorted(e["task_id"] for e in summary["excluded"]) == ["t3", "t4"] and all(e["reason"].startswith("infrastructure: not run") for e in summary["excluded"]), summary["excluded"])
+t("and counts only the runs that ran", summary["pooled"]["runs"] == 2, summary["pooled"])
+
+# T2 a second invocation into the same directory sees what the first spent and runs nothing, touching nothing
+before = hashlib.sha256(open(os.path.join(d, "runhmd.jsonl"), "rb").read()).hexdigest(), open(os.path.join(d, "spend.ndjson")).read()
+rc, err, _ = invoke("cap1", fake + " events=1 cost=1.80 reported=1.80 {prompt}")
+after = hashlib.sha256(open(os.path.join(d, "runhmd.jsonl"), "rb").read()).hexdigest(), open(os.path.join(d, "spend.ndjson")).read()
+t("a second invocation after the cap is full refuses (exit 1) and says why", rc == 1 and "total cap" in err, (rc, err))
+t("and leaves the rows and the ledger exactly as they were", before == after)
+
+# T3 an agent whose cost is unknown is counted at the per-run cap, so it cannot hide spend from the total
+rc, err, d = invoke("cap3", os.path.join(tmp, "plain.sh") + " {prompt}")
+ledger = lines(os.path.join(d, "spend.ndjson"))
+t("unmetered runs are ledgered at the per-run cap, their cost null", [(e["cost_usd"], e["counted_usd"]) for e in ledger] == [(None, 2.0), (None, 2.0)], ledger)
+
+# T4 a ledger that cannot be read stops the run before anything is spent
+os.makedirs(os.path.join(tmp, "cap4"))
+with open(os.path.join(tmp, "cap4", "spend.ndjson"), "w") as fh:
+    fh.write("this is not json\n")
+rc, err, d = invoke("cap4", fake + " events=1 cost=0.10 reported=0.1 {prompt}")
+t("an unreadable ledger refuses to run (exit 1) and says so", rc == 1 and "ledger" in err, (rc, err))
+t("and no run happened", not os.path.exists(os.path.join(d, "runhmd.jsonl")))
+
+# T5 spend is ledgered even when the harness fails during the run
+real_supervise = fg_agent.supervise
+def failing(cmd, cwd, meter, cap_usd, timeout_s, env=None, poll_s=0.1):
+    meter.feed(json.dumps({"type": "assistant", "message": {"id": "m", "model": "claude-opus-5-5", "content": [],
+               "usage": {"output_tokens": 50000, "input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}))
+    raise RuntimeError("the harness failed mid-run")
+fg_agent.supervise = failing
+raised = None
+try:
+    invoke("cap5", fake + " {prompt}")
+except RuntimeError as exc:
+    raised = exc
+fg_agent.supervise = real_supervise
+ledger = lines(os.path.join(tmp, "cap5", "spend.ndjson"))
+t("a failure during a run propagates", raised is not None)
+t("and the spend the meter had seen is already in the ledger ($1.00)", [e["counted_usd"] for e in ledger] == [1.0], ledger)
+
+print("\n".join(out))
+print("END")
+PY
+report "$TMP/c.out"
 
 echo
 echo "false-green-agent-cap: $PASS passed, $FAIL failed"
