@@ -27,6 +27,29 @@ HMD_PUSH_COALESCE_S (default 5) and sends its highest-priority candidate -> at m
 10 s, 20 non-approval + 20 approval per rolling hour. Suppressed events still count as handled: nothing is
 ever replayed.
 
+OPERATOR TEST (`hmd app push-test`; spec 6 `test`, key t:<request id>). The CLI cannot be the sender: the sender
+role is one process per repo, held for life by whichever process sent first, and a process that does not own the
+lock drops every event it detects -- a CLI that took the lock to send a test would make the real sender lose an
+approval or a question detected meanwhile, and one that sent without it would break the one-sender rule. So the
+CLI posts a REQUEST, <repo>/.heimdall/app/push-test ({"v":1,"id":<16 hex>,"at":<epoch s>}, 0600, atomic), and every
+monitor looks at that one file with a single stat() per state it observes -- no thread, no poll of its own. The
+monitor that owns the sender lock serves it, through the same message builder, scrub, transport, back-off and
+DeviceNotRegistered pruning as any event, and answers in <repo>/.heimdall/app/push-test.result:
+    {"v":1,"id":..,"state":"sending"|"done","results":[{"device":<8 hex>,"ok":bool,"detail":null|<code>,
+                                                           "suppressed":null|"rate-limited"}]}
+"sending" is written the moment it takes the request (so the CLI can tell a sender that is slow from none), "done"
+carries one entry per registered device and never a token. A request is served only while it is fresh (written <=
+60 s ago, not more than 30 s ahead) and unanswered (no result for its id): a leftover file is inert and a
+restarted sender never serves one twice. A request that finds no device registered is answered "done" with no
+results by any monitor, lock or not (nothing is sent, so there is no sender to be).
+What `test` BYPASSES: the kind filter (a phone cannot subscribe to it), foreground suppression, and the coalescing
+window with the 10 s spacing that belongs to it -- it is sent at once and is never merged away by a higher-priority
+candidate; a real notification waiting in its window is neither delayed nor dropped by it. What still APPLIES: the
+20-per-hour cap (a test counts as one non-approval message; the one past the cap is answered "rate-limited"), the
+provider back-off and the InvalidCredentials pause (answered "backoff" / "paused"), the sender lock, HMD_PUSH=0,
+the loopback-only HMD_PUSH_EXPO_URL rule, the allowlisted text (the constant body, the registered label) and
+DeviceNotRegistered pruning.
+
 TEXT (spec 8). A notification carries ONLY allowlisted fields through fixed templates. The one free-text
 field is the question summary (and up to 3 option labels): it goes through
 companion_ui_attention.secret_shaped (a hit replaces the whole body with a constant) and then `scrub`, a

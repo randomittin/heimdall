@@ -985,7 +985,9 @@ T.eq((CP.config_from_env({"HMD_PUSH_MIN_RUN_S": "-5"})["min_run_s"], CP.config_f
       CP.config_from_env({"HMD_PUSH_MIN_RUN_S": "nan"})["min_run_s"], CP.config_from_env({})["min_run_s"]),
      (0, 3600, 60.0, 60.0), "C9f. HMD_PUSH_MIN_RUN_S is clamped to 0..3600 and nan reads as the default")
 paths = CP.source_paths("/r")
-T.check(paths == ["/r/.heimdall/app/push.json", "/r/.heimdall/app/push-sender.lock"], "C9g. source_paths names the store and the lock", paths)
+T.check(paths == ["/r/.heimdall/app/push.json", "/r/.heimdall/app/push-sender.lock", "/r/.heimdall/app/push-test",
+                  "/r/.heimdall/app/push-test.result"],
+        "C9g. source_paths names the store, the lock and the push-test request and result", paths)
 
 # ── C10. no devices -> no network, no lock; one sender per repo inside a process ──
 rig = Rig(tokens=[])
