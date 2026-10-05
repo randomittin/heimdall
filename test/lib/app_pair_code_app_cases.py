@@ -292,8 +292,9 @@ def case_prompt():
                     "prompt answered %r -> the client is told %s and the screen says %r" % (answer, word, want),
                     "control %r %s" % (s.read("control"), app.tail()))
             if answer == "y\n":
-                T.check("The phone shows:  817 531" in out and "phone 'Evil[2JPhone' (GitHub @octocat)" in out,
-                        "the prompt shows the SAS as 817 531 and the phone's label and login")
+                T.check("The phone shows:  817 531" in out and "phone 'Evil[2J]0;pwnPhone' (GitHub @octocat)" in out,
+                        "the prompt shows the SAS as 817 531 and the phone's label and login (escape bytes gone, the rest is plain text)",
+                        out[-500:])
                 T.check(has_none_of(app.out(), b"\x1b", b"\x07", b"\x00", "\u0085".encode(), "\u009b".encode()),
                         "no escape, bell, NUL or C1 control of the phone's label or login reaches the terminal")
                 T.check("SESSION CODE: 4SELK" in out and "type 4SELK." in out and "as @octocat can use it. Valid for 10 min." in out,
@@ -308,8 +309,7 @@ def case_prompt():
     with AppScenario() as s:
         renewal = dict(PAIR_INIT, renewal=1)
         s.events("events-1", PAIR_INIT, WINDOW, renewal, dict(WINDOW, renewal=1), {"event": "code_window_closed", "reason": "expired"})
-        app = s.app(recorder=True)
-        app.close_stdin()
+        app = s.app(recorder=True, tty=True)
         app.wait_text("code window closed", 40)
         T.check(app.text().count("PAIRING CODE:") == 1 and app.text().count("SESSION CODE:") == 1
                 and "code window closed — rerun to pair" in app.text() + app.err().decode("utf-8", "replace"),
@@ -345,7 +345,7 @@ def case_identity_revoke():
 # -- one whole pairing -------------------------------------------------------------------------------
 def case_end_to_end():
     with AppScenario(relay=True) as s:
-        app = s.app("--relay", s.relay.url)
+        app = s.app("--relay", s.relay.url, tty=True)
         T.check(app.wait_text("SESSION CODE:", 40), "end to end: the app prints the SESSION CODE after the relay verified the token", app.tail())
         sid = s.relay.latest().id
         s.relay.inject_device_bound(sid, s.phone.pub_b64url, via="code", device_label="Pixel 9a")
@@ -366,7 +366,7 @@ def case_end_to_end():
         T.check("phone paired" in app.text() and opened is not None and "state" in opened,
                 "end to end: y pairs the session and the first sealed state frame opens under the phone's key", app.tail())
     with AppScenario(relay=True) as s:
-        app = s.app("--relay", s.relay.url)
+        app = s.app("--relay", s.relay.url, tty=True)
         app.wait_text("SESSION CODE:", 40)
         sid = s.relay.latest().id
         s.relay.inject_device_bound(sid, s.phone.pub_b64url, via="code")
@@ -381,7 +381,7 @@ def case_end_to_end():
                 "end to end: n revokes the session, seals nothing, and the window renews with the same code", app.tail())
     with AppScenario(relay=True) as s:
         s.relay.code_status = lambda _reg: (409, {"error": "code in use by another open window"})
-        app = s.app("--relay", s.relay.url)
+        app = s.app("--relay", s.relay.url, tty=True)
         T.check(app.wait_text("is held by another open window of yours. Scan the QR.", 40) and "PAIRING CODE:" in app.text(),
                 "end to end: the relay's 409 prints one line and the QR is still shown", app.tail())
 
