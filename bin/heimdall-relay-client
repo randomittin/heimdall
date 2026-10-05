@@ -396,7 +396,8 @@ DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "compan
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
 PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "companion_push_store.py"))
 LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
-WS = _load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
+VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
+WS =_load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
 # envelope this client will POST to /session/:id/frames -- one named constant,
@@ -961,6 +962,7 @@ class RelayClient:
         self._state_failures = 0   # consecutive state POSTs that got no usable answer
         self.cache = None
         self._login = None         # the LoginManager, created on first use (see _login_manager)
+        self._views = None         # the ViewManager, created on first use (see _view_manager)
 
     # -- status ------------------------------------------------------------
     def _status_snapshot(self):
@@ -1220,10 +1222,15 @@ class RelayClient:
         caps = E2E.normalize_caps(raw)
         if caps != self.device_caps:
             had_login = LOGIN is not None and LOGIN.CAP_LOGIN in self.device_caps
+            had_view = VIEW is not None and VIEW.CAP_VIEW in self.device_caps
             self.device_caps = caps
             emit({"event": "device_caps", "caps": sorted(caps)})
             if LOGIN is not None and LOGIN.CAP_LOGIN in caps and not had_login:
                 self._rearm_state()  # state.login rides only for a phone that lists login-v1: send it now
+            if VIEW is not None and (VIEW.CAP_VIEW in caps) != had_view:
+                if had_view and self._views is not None:
+                    self._views.forget()  # the phone stopped listing view-v1: what it asked for is not kept
+                self._rearm_state()  # state.views rides only for a phone that lists view-v1: send (or drop) it now
 
     def _resync(self, params):
         """The phone's `resync` command, sent to an hmd that listed `resync` in its state frames'
@@ -1360,7 +1367,7 @@ class RelayClient:
 
     def _feature_caps(self):
         """Capability tokens of the optional features whose modules loaded (added to the codec's own)."""
-        return [E2E.CAP_LOGIN] if LOGIN is not None else []
+        return ([E2E.CAP_LOGIN] if LOGIN is not None else []) + ([VIEW.CAP_VIEW] if VIEW is not None else [])
 
     def _login_command(self, action, params):
         """The phone's sealed login commands (spec 4.3):
@@ -1420,6 +1427,38 @@ class RelayClient:
         manager.sweep_orphan()
         threading.Thread(target=manager.run_probe_loop, args=(self.stop_event,), name="login-probe",
                          daemon=True).start()
+
+    # -- read-only views (view-v1) --------------------------------------------------------------------------------
+    # See READ-ONLY VIEWS in the module docstring. bin/lib/companion_view.py owns every rule; this is only its wire:
+    # the sealed `view` command, the state.views slice, and the redaction profile it is run through.
+    def _view_manager(self):
+        """The one ViewManager of this client, created on first use. The relay's redaction profile is established here and
+        a failure to establish it propagates: a view is never served unredacted."""
+        if self._views is None:
+            redact, strip_root = UI._transport_redaction(self.transport, self.root)
+            self._views = VIEW.ViewManager(self.root,
+                                           redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None,
+                                           max_slice_bytes=MAX_ENVELOPE_BYTES * 3 // 8, on_change=self._rearm_state)
+        return self._views
+
+    def _view_command(self, params):
+        """The phone's sealed `view` command (the contract is in companion_view.py): -> (ok, detail, extra) for the ack.
+        The path is in `params` and nowhere else: not in the `command` event, not in an error event."""
+        try:
+            return self._view_manager().handle(params, VIEW.CAP_VIEW in self.device_caps)
+        except Exception as e:  # the type only: a message could hold what the phone sent
+            emit({"event": "error", "detail": "view command failed: %s" % type(e).__name__})
+            return False, "internal-error", {}
+
+    def _views_overlay(self, state):
+        """`state` plus state.views for a phone that listed view-v1 -- as a copy, like _login_overlay, and for the same reason."""
+        if VIEW is None or VIEW.CAP_VIEW not in self.device_caps:
+            return state
+        try:
+            return dict(state, views=self._view_manager().snapshot())
+        except Exception as e:
+            emit({"event": "error", "detail": "state.views skipped: %s" % type(e).__name__})
+            return state
 
     def _refuse_stale_seq(self, env, seq, ack_deadline):
         """Answer a command frame the replay guard just rejected (see STALE-SEQ REFUSAL in the module docstring):
