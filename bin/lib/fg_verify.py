@@ -59,6 +59,7 @@ LEAKS_EXIT = 7                                # gitleaks --exit-code: distinct f
 SHA = re.compile(r"[0-9a-f]{40}")
 
 # rejection reason -> a short stable label, for counting (first match wins)
+IMPORT_FAILS = "tests could not run at the base commit: an import fails (a test dependency is missing or incompatible)"
 REASON_CLASSES = (
     ("could not fetch the issue text", "issue text unavailable"),
     ("clone:", "clone or fetch failed"),
@@ -74,6 +75,8 @@ REASON_CLASSES = (
     ("timeout: ", "step timed out"),
     ("environment:", "environment build failed"),
     ("already pass at the base commit", "tests already pass at the base commit"),
+    (("could not run at the base commit", "ModuleNotFoundError"), IMPORT_FAILS),
+    (("could not run at the base commit", "ImportError"), IMPORT_FAILS),
     ("could not run at the base commit", "tests could not run at the base commit"),
     ("still fail at the merge commit", "tests still fail at the merge commit"),
     ("could not run at the merge commit", "tests could not run at the merge commit"),
@@ -82,8 +85,8 @@ REASON_CLASSES = (
 
 
 def reason_class(reason):
-    for marker, label in REASON_CLASSES:
-        if marker in reason:
+    for markers, label in REASON_CLASSES:
+        if all(marker in reason for marker in ((markers,) if isinstance(markers, str) else markers)):
             return label
     return "other"
 

@@ -351,6 +351,7 @@ except ValueError as exc:
     t("a task the record accepts but whose directory is gone is an error", manifest["tasks"][1]["id"] in str(exc), str(exc))
 summary = fg_verify.summarize(rows_s)
 t("the summary counts what the walk did", summary == {"walked": 5, "tasks": 2, "pilots": 1, "rejected": {"tests already pass at the base commit": 2}}, summary)
+IMPORT_FAILS = "tests could not run at the base commit: an import fails (a test dependency is missing or incompatible)"
 samples = {"could not fetch the issue text: gh: HTTP 404": "issue text unavailable", "clone: step 1 (git init): exit 128: fatal": "clone or fetch failed",
            "no installable python project at the root": "no installable python project", "environment: step 3 (uv pip): exit 1: boom": "environment build failed",
            "the upstream tests already pass at the base commit (1 passed)": "tests already pass at the base commit",

@@ -5,13 +5,14 @@
   "candidates": 551,
   "walked": 217,
   "rejected": {
-    "tests could not run at the base commit": 52,
+    "tests could not run at the base commit: an import fails (a test dependency is missing or incompatible)": 49,
     "environment build failed": 47,
     "tests still fail at the merge commit": 44,
     "workspace over the 600 MB bound": 28,
     "tests already pass at the base commit": 6,
     "step timed out": 4,
     "secret-shaped literal in a committed file": 3,
+    "tests could not run at the base commit": 3,
     "upstream test files over 400 KB": 2,
     "clone or fetch failed": 1
   },
