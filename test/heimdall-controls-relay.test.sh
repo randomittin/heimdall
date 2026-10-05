@@ -292,6 +292,38 @@ else
   bad "8. audit log: $(head -c 400 "$AUD" 2>/dev/null)"
 fi
 
+# 9. the expand gate over the sealed transport (CP2): launch-session / pr-merge are reserved expand actions -- refused
+#    not-allowed while the laptop's switches are off, recorded twice (controls-audit.jsonl AND relay-events.jsonl), never with
+#    the prompt or a path, and the sealed state frame carries remote_actions + launch without a path
+MARK="RELAY-PROMPT-MARKER-$$"
+PAYLOAD_L="$(jq -cn --arg m "$MARK" '{rid:"L-1",repo:"r-0000",branch:"feat/x",prompt:($m + " /etc/hosts")}')"
+send_cmd 14 "$(cmd_json launch-session "$PAYLOAD_L")"
+ACK="$(ack_of 14)"
+if printf '%s' "$ACK" | jq -e '.ok == false and .of_seq == 14 and .detail == "not-allowed"' >/dev/null 2>&1; then ok "9a launch-session with the switch off -> {ok:false, detail:not-allowed}"; else bad "9a launch-session ack: $ACK"; fi
+send_cmd 15 "$(cmd_json pr-merge '{"rid":"M-1","number":12,"method":"squash"}')"
+ACK="$(ack_of 15)"
+if printf '%s' "$ACK" | jq -e '.ok == false and .of_seq == 15 and .detail == "not-allowed"' >/dev/null 2>&1; then ok "9b pr-merge with the switch off -> {ok:false, detail:not-allowed}"; else bad "9b pr-merge ack: $ACK"; fi
+EVT="$REPO_T/.heimdall/app/relay-events.jsonl"
+if jq -e -s '[.[] | select(.event == "remote-action")] | length == 2 and all(.[]; (.device | test("^[0-9a-f]{8}$")) and .ok == false and .detail == "not-allowed" and .repo == null and .ref == null and (.action == "launch-session" or .action == "pr-merge"))' "$EVT" >/dev/null 2>&1 \
+   && jq -e -s '[.[] | select(.action == "launch-session" or .action == "pr-merge")] | length == 2 and all(.[]; .params == {} and .detail == "not-allowed" and .via == "relay" and (.seq | type == "number") and (has("rid") | not))' "$AUD" >/dev/null 2>&1; then
+  ok "9c each refusal is ONE remote-action line in relay-events.jsonl (device = 8 hex of the bound key) and ONE line in controls-audit.jsonl (no params)"
+else
+  bad "9c logs: $(grep remote-action "$EVT" 2>/dev/null | head -c 500)"
+fi
+if ! grep -rq "$MARK" "$REPO_T/.heimdall" "$HEIMDALL_HOME" 2>/dev/null; then ok "9d the prompt text is in no log and no file under .heimdall"; else bad "9d the prompt text leaked to disk"; fi
+i=0; ST9=""
+while [ "$i" -lt 30 ]; do
+  ST9="$(newest_state "$LOG/frames.ndjson" "$KEY_B64" 2)"
+  printf '%s' "$ST9" | jq -e '(.state.remote_actions.recent | length) >= 2' >/dev/null 2>&1 && break
+  sleep 0.5; i=$((i + 1))
+done
+if printf '%s' "$ST9" | jq -e '.state.remote_actions.v == 1 and .state.remote_actions.launch_enabled == false and .state.remote_actions.merge_enabled == false and (.state.remote_actions.recent | length) >= 2 and (.state.remote_actions.recent[0] | keys == ["action","at","detail","device","ok","repo_label"]) and .state.launch == {"v":1,"enabled":false}' >/dev/null 2>&1; then
+  ok "9e the sealed state frame carries remote_actions (both switches off, the refusals as recent rows) and launch {v:1, enabled:false}"
+else
+  bad "9e state frame: $(printf '%s' "$ST9" | jq -c '{remote_actions: .state.remote_actions, launch: .state.launch}' 2>/dev/null | cut -c1-400)"
+fi
+if ! printf '%s' "$ST9" | jq -c '[.state.remote_actions, .state.launch]' | grep -Eq '/(Users|home|private|tmp|var)/|@'; then ok "9f no absolute path or e-mail in the relayed remote_actions / launch"; else bad "9f a path or e-mail leaked into remote_actions / launch"; fi
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

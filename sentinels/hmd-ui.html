@@ -52,6 +52,7 @@
   .tag.locked { border-color: var(--run); color: var(--run); }
   .tag.off { border-color: var(--deny); color: var(--deny); }
   .tag.on { border-color: var(--pass); color: var(--pass); }
+  tr.refused td { color: var(--deny); }
   ul.plain { margin: 0; padding: 0; list-style: none; }
   ul.plain li { padding: 2px 0; }
   /* ── job panels (Wave 4): dataviz reference palette -- categorical slots in fixed
@@ -105,6 +106,7 @@
   <section id="p-hooks" style="grid-column: 1 / -1"><h2>Hooks <span class="src">hooks</span></h2><div id="hooks" class="nodata">no data</div></section>
   <section id="p-checkpoint"><h2>Checkpoint <span class="src">checkpoint</span></h2><div id="checkpoint" class="nodata">no data</div></section>
   <section id="p-fallback"><h2>Fallback / routing <span class="src">fallback</span></h2><div id="fallback" class="nodata">no data</div></section>
+  <section id="p-remote"><h2>Remote actions <span class="src">remote_actions</span></h2><div id="remote" class="nodata">no data</div></section>
   <section id="p-reels"><h2>Reels <span class="src">reels</span></h2><div id="reels" class="nodata">no data</div></section>
   <section id="p-jobpanels" style="grid-column: 1 / -1"><h2>Job panels <span class="src">panels &middot; .heimdall/ui/panels/&lt;id&gt;.json</span></h2><div id="jobpanels" class="nodata">no panels &mdash; publish one with <code>hmd ui panel set &lt;id&gt; --type &lt;t&gt; --title &lt;s&gt; --data-json &lt;file|-&gt;</code></div></section>
 </main>
@@ -259,6 +261,19 @@
     return '<ul class="plain mono">' + r.slice(0, 8).map(function (x) {
       return "<li>" + esc(x.name) + ' <span class="muted">' + new Date(x.mtime * 1000).toLocaleString() + "</span></li>";
     }).join("") + "</ul>";
+  }
+
+  function renderRemoteActions(ra) {
+    if (!ra) { return null; }
+    var sw = function (name, on) { return '<span class="tag ' + (on ? "on" : "off") + '">' + name + " " + (on ? "on" : "off") + "</span>"; };
+    var head = "<div>" + sw("remote launch", ra.launch_enabled) + " " + sw("remote merge", ra.merge_enabled) + "</div>";
+    var rows = ra.recent || [];
+    if (!rows.length) { return head + '<div class="muted" style="margin-top:6px">no remote actions yet</div>'; }
+    return head + "<table><tr><th>when</th><th>action</th><th>device</th><th>repo</th><th>result</th></tr>" + rows.map(function (r) {
+      return '<tr class="' + (r.ok ? "" : "refused") + '"><td class="mono">' + esc(new Date(r.at * 1000).toLocaleTimeString()) +
+             '</td><td class="mono">' + esc(r.action) + '</td><td class="mono">' + esc(r.device) + '</td><td class="mono">' +
+             esc(r.repo_label || "-") + "</td><td>" + (r.ok ? "ok" : "refused: " + esc(r.detail || "?")) + "</td></tr>";
+    }).join("") + "</table>";
   }
 
   // ── job panels (Wave 4, Decision 6) ──────────────────────────────────────
@@ -557,7 +572,8 @@
     { id: "hooks",      pick: function (s) { return s.hooks; },                            draw: function (s) { return renderHooks(s.hooks); } },
     { id: "checkpoint", pick: function (s) { return s.checkpoint; },                       draw: function (s) { return renderCheckpoint(s.checkpoint); } },
     { id: "fallback",   pick: function (s) { return s.fallback; },                         draw: function (s) { return renderFallback(s.fallback); } },
-    { id: "reels",      pick: function (s) { return s.reels; },                            draw: function (s) { return renderReels(s.reels); } }
+    { id: "reels",      pick: function (s) { return s.reels; },                            draw: function (s) { return renderReels(s.reels); } },
+    { id: "remote",     pick: function (s) { return s.remote_actions; },                   draw: function (s) { return renderRemoteActions(s.remote_actions); } }
   ];
 
   function flash(panelId) {
