@@ -8,7 +8,8 @@ verdict, or a roster parse. Every field it serves traces to one of the sources i
 SOURCE_FILES / SOURCE_COMMANDS below, and `--print-sources` prints that list so a
 tester can assert the deny-list against it.
 
-Routes (all GET):
+Routes (GET, plus the two writes POST /api/send -- a message to the session -- and POST /api/control -- the phone's
+remote controls, bin/lib/companion_ui_controls.py; both behind the same token / Host gate):
     /                 the single static page (sentinels/hmd-ui.html)
     /api/state        the section-4 JSON contract, served from the SAME background-
                       polled StateCache snapshot /api/events reads (perf: a GET is a

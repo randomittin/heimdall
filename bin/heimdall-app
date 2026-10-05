@@ -75,6 +75,18 @@
 #                              signed in now (masked), its config directory and
 #                              the last result. Delegates to
 #                              bin/lib/companion_cc_login.py.
+#   hmd app controls on|off|status [--repo DIR]
+#                              The paired phone's remote controls (capability
+#                              controls-v1: interrupt, save-checkpoint, hook-toggle,
+#                              fallback-mode). On by default. `off` is the kill
+#                              switch (creates .heimdall/app/controls-disabled):
+#                              every control is then refused `controls-off`;
+#                              `on` removes it. HMD_UI_CONTROLS=0 in a process's
+#                              environment switches it off the same way and is not
+#                              undone by `on`. `status` (and `hmd app status`)
+#                              prints the switch, the last control and how many
+#                              are audited in .heimdall/ui/controls-audit.jsonl.
+#                              Delegates to bin/lib/companion_ui_controls.py.
 #   hmd app push-test [--repo DIR] [--wait SECONDS]
 #                              Check that a phone registered for push receives
 #                              a notification: one `test` notification per
@@ -1051,6 +1063,9 @@ cmd_status() {
     pending="$(printf '%s' "$inbox_json" | jq -r '.pending // empty' 2>/dev/null)"
     echo "inbox pending: ${pending:-0}"
   fi
+  if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_ui_controls.py" ]; then
+    "$PY3" "$LIB_DIR/companion_ui_controls.py" status-line --repo "$REPO" 2>/dev/null
+  fi
 
   [ "$orphaned" = true ] && return 1
   return 0
@@ -1144,6 +1159,9 @@ cmd_status_relay() {
   if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_cc_login.py" ]; then
     "$PY3" "$LIB_DIR/companion_cc_login.py" status-line --repo "$REPO" 2>/dev/null
   fi
+  if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_ui_controls.py" ]; then
+    "$PY3" "$LIB_DIR/companion_ui_controls.py" status-line --repo "$REPO" 2>/dev/null
+  fi
   return 0
 }
 
@@ -1153,6 +1171,22 @@ cmd_remote_login() {
     return 2
   fi
   "$PY3" "$LIB_DIR/companion_cc_login.py" "$@"
+}
+
+# cmd_controls: `hmd app controls on|off|status [--repo DIR]` -- the kill switch for the phone's remote controls (see the
+# usage block above). Everything is bin/lib/companion_ui_controls.py's; its exit code is this command's.
+cmd_controls() {
+  if [ -z "$PY3" ]; then
+    echo "hmd app controls: python3 not found (set HMD_PYTHON=/path/to/python3)" >&2
+    return 2
+  fi
+  local sub="${1:-status}"
+  if [ $# -gt 0 ]; then shift; fi
+  case "$sub" in
+    on|off|status) ;;
+    *) echo "usage: hmd app controls on|off|status [--repo DIR]" >&2; return 2 ;;
+  esac
+  "$PY3" "$LIB_DIR/companion_ui_controls.py" "$sub" "$@"
 }
 
 # cmd_push_test: `hmd app push-test` -- see the usage block above. Resolves the repo like status/disconnect do, then
@@ -1576,6 +1610,7 @@ case "$CMD" in
   disconnect) cmd_disconnect "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;
   remote-login) cmd_remote_login "$@"; exit $? ;;
+  controls) cmd_controls "$@"; exit $? ;;
   push-test) cmd_push_test "$@"; exit $? ;;
   *)
     echo "hmd app: unknown subcommand: $CMD" >&2
