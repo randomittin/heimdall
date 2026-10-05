@@ -24,6 +24,7 @@ import {
   isValidSessionCode,
   popMessage,
 } from "../src/code-pair";
+import { emptyIndex, lastDeadline, pruneIndex, type CodeIndexState } from "../src/code-index";
 
 const SECRET = "unit-test-identity-secret";
 const NOW_S = 1_790_000_000;
@@ -331,5 +332,47 @@ describe("field validators", () => {
     expect(isPlausibleGithubToken("trailing-newline\n")).toBe(false);
     expect(isPlausibleGithubToken("tab\tinside")).toBe(false);
     expect(isPlausibleGithubToken("café")).toBe(false);
+  });
+});
+
+// A `code-index:<gh_id>` Durable Object's storage alarm is set to `lastDeadline(state)` plus a
+// grace, and its alarm() re-arms it from the state pruned at that moment. That only ever ends if
+// a state pruned at `now` has no deadline at or before `now`: a deadline that has already passed
+// re-arms an alarm that is due at once, and it fires again, forever.
+describe("code index retention: a pruned state never has a deadline that has passed", () => {
+  const NOW = 1_790_000_000_000; // a whole second, so `not_before + TTL` can land exactly on it
+  const NOW_SECOND = NOW / 1000;
+  const lockout = (newestMissAt: number): number[] => Array.from({ length: 10 }, (_, i) => newestMissAt - i);
+
+  it.each<[string, CodeIndexState]>([
+    ["a window that has lapsed", { ...emptyIndex(), codes: { ABCDE: { session_id: "s", exp: NOW - 1 } } }],
+    ["a window lapsing right now", { ...emptyIndex(), codes: { ABCDE: { session_id: "s", exp: NOW } } }],
+    ["attempts a minute old or more", { ...emptyIndex(), attempts: [NOW - 61_000, NOW - 60_000] }],
+    ["a short miss streak past the lockout", { ...emptyIndex(), miss_streak: [NOW - 600_000] }],
+    ["a full lockout that has run out", { ...emptyIndex(), miss_streak: lockout(NOW - 600_000) }],
+    ["a revoke whose last assertion expires right now", { ...emptyIndex(), not_before: NOW_SECOND - GH_ASSERTION_TTL_S }],
+    ["a revoke every assertion of which expired long ago", { ...emptyIndex(), not_before: NOW_SECOND - GH_ASSERTION_TTL_S - 5000 }],
+  ])("leaves nothing behind that is already due: %s", (_label, state) => {
+    pruneIndex(state, NOW);
+    expect(lastDeadline(state)).toBeNull();
+  });
+
+  it("keeps a revoke for as long as an assertion it kills could still be alive, and says when it stops mattering", () => {
+    const state: CodeIndexState = { ...emptyIndex(), not_before: NOW_SECOND - GH_ASSERTION_TTL_S + 1 };
+    pruneIndex(state, NOW);
+    expect(state.not_before).toBe(NOW_SECOND - GH_ASSERTION_TTL_S + 1);
+    expect(lastDeadline(state)).toBe(NOW + 1000);
+  });
+
+  it("keeps what is still live, with a deadline in the future", () => {
+    const state: CodeIndexState = {
+      ...emptyIndex(),
+      codes: { ABCDE: { session_id: "s", exp: NOW + 5000 } },
+      attempts: [NOW - 59_999],
+      miss_streak: [NOW - 599_999],
+    };
+    pruneIndex(state, NOW);
+    expect(Object.keys(state.codes)).toEqual(["ABCDE"]);
+    expect(lastDeadline(state)).toBe(NOW + 5000);
   });
 });

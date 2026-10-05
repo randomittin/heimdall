@@ -59,6 +59,13 @@ export function pruneIndex(state: CodeIndexState, nowMs: number): void {
   } else if (nowMs - (state.miss_streak[state.miss_streak.length - 1] as number) >= MISS_LOCKOUT_MS) {
     state.miss_streak = [];
   }
+  // A revoke matters only until every assertion it kills has expired by itself: one minted before
+  // `not_before` lapses by `not_before + GH_ASSERTION_TTL_S`. After that the marker protects
+  // nothing and goes. Kept, `lastDeadline` would go on answering a moment that has passed, and the
+  // storage alarm re-armed from it would be due at once and fire again, for ever.
+  if (state.not_before !== undefined && nowMs >= (state.not_before + GH_ASSERTION_TTL_S) * 1000) {
+    delete state.not_before;
+  }
 }
 
 /** Opens `code` for `sessionId`. Refused only when ANOTHER session of this GitHub id holds it
