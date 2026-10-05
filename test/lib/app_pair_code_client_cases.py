@@ -14,8 +14,15 @@ What is proven here, each against the shipped client and a loopback relay:
     (a stray early `approve` approves nothing); reject, timeout and a closed control input all revoke and
     the window renews; --no-confirm approves by itself;
   * a QR bind in a code-registered session pairs as before; renewal registers the same code with a fresh
-    commitment and fresh keys until the window total ends, and the stream follows each new session.
+    commitment and fresh keys until the window total ends, and the stream follows each new session;
+  * a key that was revealed is burned: the relay knows it, so whatever the approval's outcome no bind on that
+    session is accepted again (a QR bind made up from the revealed key, a second claim by code, in any code
+    state), the window renewed afterwards pairs normally under a fresh key, and a window that ends on a burned
+    key ends the session;
+  * --code and --identity-revoke put the GitHub token in a request body, so they are refused unless the relay
+    is https or on this machine.
 """
+import argparse
 import hashlib
 import json
 import os
@@ -333,10 +340,226 @@ def case_qr_only_unchanged():
                 "without --code: no registration, no code event, a QR bind pairs at once as it always did", c.tail())
 
 
+# -- a revealed key is a burned key -----------------------------------------------------------------
+# The key_reveal crosses the relay in plaintext, so from the moment it is posted the relay knows hmd's public key
+# for that session -- and a bind it makes up from there (a "QR" bind with a key of its own, or a second claim by
+# code with a key ground to show the same SAS) cannot be told from a phone's. The cases below play a HOSTILE
+# relay: it keeps a session open after being asked to revoke it, and attacks the window whose key it has seen.
+BURN_ENV = {"HMD_RELAY_CODE_RENEW_MIN_S": "30", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2"}  # the burned window outlives the attack
+
+
+def refusals(proc):
+    return [e for e in proc.events() if e.get("event") == "error" and "device_bound refused" in e.get("detail", "")]
+
+
+def await_binds_answered(proc, refused, timeout=8.0):
+    """Until the client has refused `refused` binds -- or paired, which fails the case at once, not at the timeout."""
+    proc.wait_for(lambda: len(refusals(proc)) >= refused or proc.count_events("device_bound"), timeout)
+
+
+def status_paired(sandbox):
+    with open(os.path.join(sandbox.repo, ".heimdall", "app", "relay.json"), encoding="utf-8") as f:
+        return json.load(f)["paired"]
+
+
+def burn(s, c, how):
+    """A phone claims the window by code, hmd reveals its key, and the approval ends without a pairing.
+    Returns (the session id, the code_rejected event)."""
+    c.wait_event("code_window")
+    sid = s.bind()
+    if how in ("reject", "eof"):
+        c.wait_event("approve_request", timeout=10)
+        if how == "reject":
+            c.send("reject\n")
+        else:
+            c.close_stdin()
+    return sid, c.wait_event("code_rejected", timeout=10)
+
+
+def case_burned_key_binds_nothing():
+    for how, ended in (("reject", "operator"), ("timeout", "timeout"), ("eof", "eof"), ("reveal-failed", "reveal-failed")):
+        with Scenario() as s:
+            s.relay.ignore_revokes = True
+            if how == "reveal-failed":  # the relay refuses the key_reveal -- having read it
+                s.relay.frames_status = lambda env: (400, {"error": "refused"}) if env.get("type") == "key_reveal" else None
+            c = s.client(env=dict(BURN_ENV, HMD_RELAY_APPROVAL_TIMEOUT_S=1.5) if how == "timeout" else BURN_ENV)
+            sid, rejected = burn(s, c, how)
+            s.relay.inject_device_bound(sid, H.Phone(E2E).pub_b64url, via="qr")  # a bind made up from the revealed key
+            await_binds_answered(c, 1)
+            qr_refused = len(refusals(c)) == 1
+            s.bind(sid=sid, via="code", phone=H.Phone(E2E))  # a second claim by code
+            await_binds_answered(c, 2)
+            time.sleep(0.5)
+            T.check(bool(rejected) and rejected["reason"] == ended and len(s.relay.frames_of(sid, "key_reveal")) == 1,
+                    "burned key (%s): the approval ended without a pairing, the key revealed once" % how, c.tail())
+            T.check(qr_refused and c.count_events("device_bound") == 0 and sealed_frames(s.relay, sid) == []
+                    and status_paired(s.sb) is False,
+                    "burned key (%s): a QR bind made up from the revealed key is refused -- unpaired, nothing sealed" % how, c.tail())
+            T.check(len(refusals(c)) == 2 and c.count_events("approve_request") == (0 if how == "reveal-failed" else 1)
+                    and len(s.relay.frames_of(sid, "key_reveal")) == 1,
+                    "burned key (%s): a second claim by code is refused too -- no second prompt, no second key_reveal" % how,
+                    c.tail())
+
+
+class captured_events:
+    """The client's own event channel, captured into a list instead of printed -- for cases that drive a RelayClient
+    in this process, with no relay and no sockets."""
+
+    def __enter__(self):
+        self.events, self._real = [], CLIENT.emit
+        CLIENT.emit = self.events.append
+        return self.events
+
+    def __exit__(self, *_exc):
+        CLIENT.emit = self._real
+
+
+def offline_client(sandbox):
+    """A RelayClient as `--code` mode leaves it right after code_start, pointed at a port nothing listens on."""
+    client = CLIENT.RelayClient(argparse.Namespace(relay="http://127.0.0.1:1", repo=sandbox.repo, tick_s=2.0,
+                                                   status_file=os.path.join(sandbox.root, "relay.json"),
+                                                   public_host=None, ui_port=1))
+    client.priv, client.pub = E2E.generate_keypair()
+    client._commit_nonce = os.urandom(32)
+    client.session_id = "offline-session"
+    return client
+
+
+def device_bound(client, via):
+    """What the relay tells hmd's stream about a phone claiming the session (`via` None: a relay that predates the field)."""
+    payload = {"device_pubkey": H.Phone(E2E).pub_b64url, "bound_at": 1}
+    if via is not None:
+        payload["via"] = via
+    return {"v": 1, "session_id": client.session_id, "seq": 0, "sender": "relay", "type": "device_bound",
+            "nonce": None, "ciphertext": None, "payload": payload}
+
+
+def case_burn_guard_holds_in_every_code_state():
+    sandbox = H.Sandbox()
+    try:
+        with captured_events() as events:
+            bound = []
+            for state in ("off", "open", "closed", "bound"):
+                for via in ("qr", "code", None):
+                    client = offline_client(sandbox)
+                    client._code_state, client._key_revealed = state, True
+                    client._handle_envelope(device_bound(client, via))
+                    if client.session_key is not None or client.paired or client.device_pub is not None:
+                        bound.append((state, via))
+            T.check(bound == [], "a burned key binds nothing whatever the code state (off/open/closed/bound) or the via", str(bound))
+            T.check(sum(1 for e in events if e.get("event") == "error" and "device_bound refused" in e.get("detail", "")) == 12,
+                    "...and each of those twelve binds is refused loudly, none dropped silently", str(events)[:300])
+            control = offline_client(sandbox)
+            control._handle_envelope(device_bound(control, "qr"))
+            T.check(control.session_key is not None and control.paired,
+                    "control: the same QR bind on a key that was never revealed pairs (the cases above prove something)")
+    finally:
+        sandbox.close()
+
+
+def case_code_end_on_a_burned_key():
+    sandbox = H.Sandbox()
+    try:
+        for label, revealed, state, ends in (("a window whose key was revealed", True, "open", True),
+                                             ("a window whose key was never revealed", False, "open", False),
+                                             ("an approval still in flight on a revealed key", True, "approving", False)):
+            with captured_events() as events:
+                client = offline_client(sandbox)
+                client._code_state, client._key_revealed = state, revealed
+                client._code_end("code_window_closed", "expired")
+            names = [(e.get("event"), e.get("reason")) for e in events]
+            want = [] if state == "approving" else [("code_window_closed", "expired")] + ([("session_ended", "key-revealed")] if ends else [])
+            T.check(names == want and client.stop_event.is_set() is ends
+                    and client._code_state == ("approving" if state == "approving" else "closed"),
+                    "code end on %s: %s" % (label, "the session ends with the window" if ends else
+                                            "the in-flight approval decides first, nothing is closed" if state == "approving"
+                                            else "the QR session goes on"), str(names))
+    finally:
+        sandbox.close()
+
+
+def case_window_renewed_after_a_burn_pairs():
+    env = {"HMD_RELAY_CODE_RENEW_MIN_S": "0.5", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2"}
+    with Scenario() as s:
+        c = s.client(env=env)
+        c.wait_event("code_window")
+        sid1, _req = await_request(s, c)
+        c.send("reject\n")
+        renewed = c.wait_event("code_window", where=lambda e: e.get("renewal") == 1, timeout=15)
+        sid2, seen = s.relay.latest().id, len(c.events())
+        s.bind(sid=sid2)
+        req = c.wait_event("approve_request", start=seen, timeout=10)
+        reveals = s.relay.frames_of(sid2, "key_reveal")
+        hmd_pub2 = H.b64_any(reveals[0]["payload"]["hmd_pubkey"]) if reveals else b""
+        fresh_key = len(pair_inits(c)) > 1 and hmd_pub2 == hmd_pub_of(c, 1) != hmd_pub_of(c, 0)
+        T.check(bool(renewed) and bool(req) and sid2 != sid1 and fresh_key and req["sas"] == H.sas_ref(sid2, hmd_pub2, s.phone.pub),
+                "a window renewed after a burned key is claimable again: a fresh key, and a new prompt on it", c.tail())
+        c.send("approve\n")
+        bound = c.wait_event("device_bound")
+        c.wait_for(lambda: s.relay.frames_of(sid2, "state"), 15)
+        states = s.relay.frames_of(sid2, "state")
+        opened = s.phone.open_hmd_frame(hmd_pub2, sid2, states[0]) if states else None
+        T.check(bool(bound) and opened is not None and "state" in opened,
+                "...and the pairing it approves seals state under the fresh key", c.tail())
+
+
+def case_burned_key_ends_the_session_when_the_window_does():
+    env = {"HMD_RELAY_CODE_WINDOW_S": "3", "HMD_RELAY_CODE_RENEW_MIN_S": "0.5", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2"}
+    with Scenario() as s:
+        s.relay.ignore_revokes = True
+        c = s.client(env=env)
+        c.wait_event("code_window")
+        sid, _req = await_request(s, c)
+        time.sleep(3.2)  # the window's whole 3 s runs out while the laptop is still looking at the prompt
+        c.send("reject\n")
+        closed = c.wait_event("code_window_closed", timeout=10)
+        s.relay.inject_device_bound(sid, H.Phone(E2E).pub_b64url, via="qr")  # the burned session is still open on the relay's side
+        c.wait_for(lambda: c.count_events("session_ended") or c.count_events("device_bound"), 10)
+        ended = [e for e in c.events() if e.get("event") == "session_ended"]
+        rc = c.wait_exit(10) if ended else None
+        T.check(bool(closed) and closed["reason"] == "expired" and len(ended) == 1 and ended[0]["reason"] == "key-revealed"
+                and rc == 0 and c.count_events("device_bound") == 0,
+                "the window ending on a burned key ends the session: no QR is left to bind on that key, the client exits 0", c.tail())
+
+
+# -- the token only travels over TLS or to this machine ----------------------------------------------------
+def case_code_needs_tls_or_loopback():
+    ok_urls = ["https://hmd-relay.therishabh16.workers.dev", "https://relay.example/base", "HTTPS://Relay.Example",
+               "http://127.0.0.1:8787", "http://127.1.2.3", "http://localhost", "http://LOCALHOST:9", "http://[::1]:9"]
+    bad_urls = ["http://relay.example", "http://192.0.2.1", "http://[2001:db8::1]", "http://0.0.0.0:9",
+                "http://127.0.0.1.relay.example", "http://localhost.relay.example", "http://relay.example:443"]
+    T.check(all(CLIENT.token_transport_ok(CLIENT._split_relay(u)) for u in ok_urls)
+            and not any(CLIENT.token_transport_ok(CLIENT._split_relay(u)) for u in bad_urls),
+            "token_transport_ok: https anywhere, plain http only to localhost or a loopback address",
+            str([u for u in ok_urls if not CLIENT.token_transport_ok(CLIENT._split_relay(u))]
+                + [u for u in bad_urls if CLIENT.token_transport_ok(CLIENT._split_relay(u))]))
+    for flag, extra in (("--code", ["--code", H.CODE]), ("--identity-revoke", ["--identity-revoke"])):
+        with Scenario() as s:
+            proc = H.Proc([H.CLIENT_PATH, "--relay", "http://relay.example.test", "--repo", s.sb.repo, "--ui-port", "1"] + extra,
+                          s.sb.env())
+            s.procs.append(proc)
+            proc.send(H.TOKEN + "\n")
+            rc = proc.wait_exit(10)
+            T.check(rc == 2 and ("%s sends the GitHub token in a request body" % flag).encode() in proc.err()
+                    and b"https://" in proc.err() and proc.out() == b""
+                    and H.TOKEN.encode() not in proc.out() + proc.err(),
+                    "%s over plain http to a host that is not this machine: a usage error (exit 2) before anything is sent" % flag,
+                    proc.tail())
+    with Scenario() as s:  # the gate lets a TLS relay through: what fails is pair/init, on a port nothing listens on
+        proc = H.Proc([H.CLIENT_PATH, "--relay", "https://127.0.0.1:1", "--repo", s.sb.repo, "--ui-port", "1",
+                       "--code", H.CODE], s.sb.env())
+        s.procs.append(proc)
+        proc.send(H.TOKEN + "\n")
+        rc = proc.wait_exit(20)
+        T.check(rc == 12, "--code over https passes the gate: the client goes on to pair/init (unreachable here, exit 12)", proc.tail())
+
+
 def main():
     for case in (case_vectors_and_helpers, case_registration_and_hygiene, case_no_token, case_refusals,
                  case_approve_flow, case_reject_timeout_eof, case_no_confirm_and_qr_bind, case_renewal,
-                 case_qr_only_unchanged):
+                 case_qr_only_unchanged, case_code_needs_tls_or_loopback, case_burn_guard_holds_in_every_code_state,
+                 case_code_end_on_a_burned_key, case_burned_key_binds_nothing, case_window_renewed_after_a_burn_pairs,
+                 case_burned_key_ends_the_session_when_the_window_does):
         try:
             case()
         except Exception as exc:  # a case that dies is a failure, not a crash of the whole run
