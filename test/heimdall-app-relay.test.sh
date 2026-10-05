@@ -304,6 +304,104 @@ while True:
 PYEOF
 }
 
+# A stale-seq refusal (scenario Y, and INV-15 in scenario A) is an ordinary sealed ack, so like every ack its fields live
+# INSIDE the sealed payload (see wait_for_ack_of_seq above): the only way to find one is to open each sender=hmd ack
+# envelope in FILE with the session key -- here with the same bin/lib/hmd_relay_e2e.py the client uses, never by grepping
+# ciphertext.
+
+# sealed_acks FILE KEY_B64 -- every ack the relay received from hmd, oldest first, one JSON line each:
+# {"ack": <the opened plaintext>, "seq": <the ack frame's own hmd-side seq>}
+sealed_acks() {
+  python3 - "$1" "$2" "$E2E_MOD" <<'PYEOF'
+import base64, json, sys
+from importlib.util import module_from_spec, spec_from_file_location
+
+file_path, key_b64, e2e_path = sys.argv[1:4]
+spec = spec_from_file_location("hmd_relay_e2e", e2e_path)
+e2e = module_from_spec(spec)
+spec.loader.exec_module(e2e)
+key = base64.b64decode(key_b64)
+try:
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    try:
+        env = json.loads(line)
+    except ValueError:
+        continue
+    if env.get("sender") != "hmd" or env.get("type") != "ack":
+        continue
+    try:
+        ack = json.loads(e2e.open_(key, env["seq"], "hmd", env.get("nonce"), env.get("ciphertext")).decode("utf-8"))
+    except Exception:
+        continue
+    print(json.dumps({"ack": ack, "seq": env["seq"]}, sort_keys=True))
+PYEOF
+}
+
+# refusal_acks FILE KEY_B64 [OF_SEQ] -- the sealed_acks that are stale-seq refusals (detail non-increasing-seq), as the
+# opened plaintext only, one JSON line each; with OF_SEQ only those answering that device seq
+refusal_acks() {
+  sealed_acks "$1" "$2" | python3 -c '
+import json, sys
+want = int(sys.argv[1]) if len(sys.argv) > 1 else None
+for line in sys.stdin:
+    ack = json.loads(line)["ack"]
+    if ack.get("detail") == "non-increasing-seq" and (want is None or ack.get("of_seq") == want):
+        print(json.dumps(ack, sort_keys=True, separators=(",", ":")))
+' ${3:+"$3"}
+}
+
+# wait_for_refusal_ack FILE KEY_B64 OF_SEQ [SECS] -- polls (0.2 s steps) until the relay holds a refusal answering OF_SEQ;
+# on match prints the first one as one JSON line and returns 0; returns 1 on timeout with nothing printed
+wait_for_refusal_ack() {
+  local file="$1" key="$2" want="$3" secs="${4:-10}" i=0 max found
+  max=$(( secs * 5 ))
+  while [ "$i" -lt "$max" ]; do
+    found="$(refusal_acks "$file" "$key" "$want" | head -1)"
+    if [ -n "$found" ]; then printf '%s\n' "$found"; return 0; fi
+    sleep 0.2; i=$((i + 1))
+  done
+  return 1
+}
+
+# refusal_rate FILE KEY_B64 POSTS_LOG WINDOW_S -- "<refusals the relay received> <the most of them inside any one WINDOW_S
+# window>". The times are the relay's own `recv` stamps in frame-posts.log; an ack's hmd seq joins them to the opened refusals
+refusal_rate() {
+  python3 - "$1" "$2" "$3" "$4" "$E2E_MOD" <<'PYEOF'
+import base64, json, re, sys
+from importlib.util import module_from_spec, spec_from_file_location
+
+frames, key_b64, posts_log, window_s, e2e_path = sys.argv[1:6]
+spec = spec_from_file_location("hmd_relay_e2e", e2e_path)
+e2e = module_from_spec(spec)
+spec.loader.exec_module(e2e)
+key = base64.b64decode(key_b64)
+refusal_seqs = set()
+with open(frames, "r", encoding="utf-8") as f:
+    for line in f.read().splitlines():
+        try:
+            env = json.loads(line)
+            if env.get("sender") != "hmd" or env.get("type") != "ack":
+                continue
+            ack = json.loads(e2e.open_(key, env["seq"], "hmd", env.get("nonce"), env.get("ciphertext")).decode("utf-8"))
+        except Exception:
+            continue
+        if ack.get("detail") == "non-increasing-seq":
+            refusal_seqs.add(env["seq"])
+times = []
+with open(posts_log, "r", encoding="utf-8") as f:
+    for line in f:
+        m = re.search(r"recv=([0-9.]+) .* type=ack seq=([0-9]+) result=ok", line)
+        if m and int(m.group(2)) in refusal_seqs:
+            times.append(float(m.group(1)))
+window = float(window_s)
+print(len(times), max((sum(1 for u in times if t <= u < t + window) for t in times), default=0))
+PYEOF
+}
+
 # ── 1. syntax / static shape (claims 9-12, 14) ──────────────────────────────
 if [ -x "$RELAY_CLIENT" ]; then
   ok "test -x bin/heimdall-relay-client"
@@ -662,7 +760,8 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   fi
 
   # claim 3b (INV-15): replay of seq=1 (already seen) is rejected -- no
-  # second inbox record, no new ack.
+  # second inbox record, and its only answer on the wire is ONE sealed
+  # refusal ack (a frame that opens is answered, see scenario Y).
   #
   # INV-15 is about the REPLAY's own effect, not the client's independent
   # state-tick loop -- but that loop (bin/heimdall-relay-client's tick_s and
@@ -670,16 +769,11 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   # schedule, that the FIRST (legitimate) send-message above just changed
   # on-disk state (collect_inbox()'s pending count, sentinels/hmd-ui.py:638,
   # 0 -> 1) and republishes a "state" frame once that lands -- anywhere up to
-  # ~4s after the write. Sampling FRAMES_BEFORE_REPLAY immediately, before
-  # that fallout has necessarily landed, raced it against the replay's own
-  # ~1-7s check-plus-sleep window below: under load the legitimate frame
-  # could land inside that window and get blamed on the replay (observed:
-  # "4 -> 5" with the replay itself still correctly rejected per case 23/24).
-  # Draining the frame stream to quiescence here -- rather than a fixed
-  # sleep -- makes the before/after comparison isolate the replay's effect
-  # regardless of how long that unrelated fallout takes to arrive.
-  wait_for_quiescent_count "$LOG_A/frames.ndjson" 3 20
-  FRAMES_BEFORE_REPLAY="$(wc -l < "$LOG_A/frames.ndjson" | tr -d ' ')"
+  # ~4s after the write. A count of every posted frame blamed that on the
+  # replay (observed: "4 -> 5" with the replay itself still correctly
+  # rejected per case 23/24) and had to be drained to quiescence first; the
+  # replay's effect is counted in ACKS instead, which no state frame is.
+  ACKS_BEFORE_REPLAY="$(sealed_acks "$LOG_A/frames.ndjson" "$SESSION_KEY_A" | wc -l | tr -d ' ')"
   INBOX_COUNT_BEFORE="$(grep '"hello from claim4"' "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
   python3 "$FAKE_RELAY" device envelope --session-id "$SID_A" --seq 1 --sender device \
     --type command --nonce "$NONCE1" --ciphertext "$CT1" > "$CTL_A/003.json"
@@ -688,18 +782,25 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   else
     bad "INV-15: replayed device seq=1 was not rejected with an error event"
   fi
+  # the replay is a frame that opens, so it is answered (see scenario Y): one sealed refusal naming the last device seq
+  A_REFUSAL="$(wait_for_refusal_ack "$LOG_A/frames.ndjson" "$SESSION_KEY_A" 1 6)"
+  if [ "$A_REFUSAL" = '{"detail":"non-increasing-seq","last":1,"of_seq":1,"ok":false}' ]; then
+    ok "INV-15: the replay is answered with a sealed refusal naming hmd's last device seq ($A_REFUSAL)"
+  else
+    bad "INV-15: the replay drew no sealed refusal {detail:non-increasing-seq,last:1,of_seq:1,ok:false} (got '${A_REFUSAL:-nothing}')"
+  fi
   sleep 1
   INBOX_COUNT_AFTER="$(grep '"hello from claim4"' "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
-  FRAMES_AFTER_REPLAY="$(wc -l < "$LOG_A/frames.ndjson" | tr -d ' ')"
+  ACKS_AFTER_REPLAY="$(sealed_acks "$LOG_A/frames.ndjson" "$SESSION_KEY_A" | wc -l | tr -d ' ')"
   if [ "$INBOX_COUNT_AFTER" -eq "$INBOX_COUNT_BEFORE" ]; then
     ok "INV-15: replay produced no second inbox record ($INBOX_COUNT_BEFORE == $INBOX_COUNT_AFTER)"
   else
     bad "INV-15: replay produced a second inbox record ($INBOX_COUNT_BEFORE -> $INBOX_COUNT_AFTER)"
   fi
-  if [ "$FRAMES_AFTER_REPLAY" -eq "$FRAMES_BEFORE_REPLAY" ]; then
-    ok "INV-15: replay produced no new posted frame ($FRAMES_BEFORE_REPLAY == $FRAMES_AFTER_REPLAY)"
+  if [ "$ACKS_AFTER_REPLAY" -eq "$((ACKS_BEFORE_REPLAY + 1))" ]; then
+    ok "INV-15: replay produced exactly one new ack -- the refusal ($ACKS_BEFORE_REPLAY -> $ACKS_AFTER_REPLAY)"
   else
-    bad "INV-15: replay unexpectedly produced a new posted frame ($FRAMES_BEFORE_REPLAY -> $FRAMES_AFTER_REPLAY)"
+    bad "INV-15: replay produced $((ACKS_AFTER_REPLAY - ACKS_BEFORE_REPLAY)) new acks, want exactly the one refusal ($ACKS_BEFORE_REPLAY -> $ACKS_AFTER_REPLAY)"
   fi
 
   # claim 4b (INV-23): too-long text -> ack {ok:false, detail:"too-long"}, no inbox record.
@@ -4321,6 +4422,174 @@ with open(sys.argv[3], 'w', encoding='utf-8') as f:
   kill "$SRV_X2" 2>/dev/null; wait "$SRV_X2" 2>/dev/null
 else
   skip "scenario X (push registration over sealed commands): bin/lib/hmd_relay_e2e.py absent -- needs real seal"
+fi
+
+# ── Scenario Y: a command frame refused for a non-increasing seq is ANSWERED, not dropped (hmdapp's
+# docs/analysis/2026-10-04-heimdall-golive-readiness.md: the phone could not tell a refused command from a lost one). The replay
+# guard (INV-14/15) never acts on a frame whose seq is not above the last device seq hmd accepted. A frame of that kind that
+# OPENS under the session key is answered with a sealed refusal {ok:false, of_seq:<its seq>, detail:non-increasing-seq,
+# last:<last device seq accepted>} so the phone can seal the command again above `last`; one that does not open stays silent
+# and uses up nothing (audit #5); each distinct stale seq is refused once, and no more than STALE_REFUSAL_BURST refusals go
+# out in any STALE_REFUSAL_WINDOW_S. The REAL client against the fake relay: Y1 the refusal and its shape, Y2 the phone's
+# re-seal at last+1, Y3 a frame that does not open, Y4 a flood ─────────────────────────────────────────────────────────
+y_inbox_texts() {  # y_inbox_texts REPO -- the text of every inbox record, one per line, oldest first
+  python3 - "$1/.heimdall/ui/inbox.jsonl" <<'PYEOF'
+import json, os, sys
+
+path = sys.argv[1]
+if os.path.exists(path):
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                print(json.loads(line)["text"])
+PYEOF
+}
+
+# y_prepare_flood DIR SESSION_ID KEY_B64 FIRST_SEQ COUNT FIRST_NUM -- seals COUNT send-message commands, at FIRST_SEQ and every seq
+# after it, as the paired device: one complete relay envelope per file in DIR, named FIRST_NUM, FIRST_NUM+1, ... (.json). Queues nothing.
+y_prepare_flood() {
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$E2E_MOD" <<'PYEOF'
+import base64, json, os, sys
+from importlib.util import module_from_spec, spec_from_file_location
+
+out_dir, sid, key_b64, first_seq, count, first_num, e2e_path = sys.argv[1:8]
+spec = spec_from_file_location("hmd_relay_e2e", e2e_path)
+e2e = module_from_spec(spec)
+spec.loader.exec_module(e2e)
+key = base64.b64decode(key_b64)
+os.makedirs(out_dir, exist_ok=True)
+for i in range(int(count)):
+    seq = int(first_seq) + i
+    body = json.dumps({"action": "send-message", "params": {"text": "y flood %d" % seq}})
+    nonce, ciphertext = e2e.seal(key, seq, "device", body.encode("utf-8"))
+    env = {"v": 1, "session_id": sid, "seq": seq, "sender": "device", "type": "command",
+           "nonce": nonce, "ciphertext": ciphertext, "payload": None}
+    with open(os.path.join(out_dir, "%03d.json" % (int(first_num) + i)), "w", encoding="utf-8") as f:
+        json.dump(env, f, sort_keys=True, separators=(",", ":"))
+PYEOF
+}
+
+if [ "$E2E_PRESENT" = true ]; then
+  REPO_Y="$(make_repo)"
+  x_start_session Y "$REPO_Y"
+  SID_Y="$XS_SID"; KEY_Y="$XS_KEY"; LOG_Y="$XS_LOG"; CTL_Y="$XS_CTL"; OUT_Y="$XS_OUT"; ERR_Y="$XS_ERR"
+  CLIENT_Y="$XS_CLIENT"; SRV_Y="$XS_SRV"
+  FRAMES_Y="$LOG_Y/frames.ndjson"
+  Y_NUM=0
+  y_queue() { Y_NUM=$((Y_NUM + 1)); mv "$1" "$CTL_Y/$(printf '%03d' "$Y_NUM").json"; }  # the relay pushes ctl files in numeric order
+  y_replay() { cp "$1" "$TMPROOT/y.replay.json" && y_queue "$TMPROOT/y.replay.json"; }   # the very same bytes once more
+  y_prepare() { prepare_device_action "$TMPROOT/y.cmd.$1.json" "$SID_Y" "${4:-$KEY_Y}" "$2" "$3"; }  # y_prepare NAME SEQ JSON [KEY_B64]
+  if wait_for "$OUT_Y" '"event":"device_bound"' 1 && [ -n "$SID_Y" ] && [ -n "$KEY_Y" ]; then
+    ok "scenario Y: relay-client paired (session key derivable)"
+  else
+    bad "scenario Y: relay-client never paired -- the rest of Y cannot run: $(tail -3 "$ERR_Y" 2>/dev/null)"
+  fi
+
+  # every frame is sealed up front and queued only when it is wanted
+  Y_WRONG_KEY="$(python3 -c 'import base64; print(base64.b64encode(bytes(range(32))).decode())')"
+  y_prepare first 5 '{"action":"send-message","params":{"text":"y first"}}'
+  y_prepare lower 4 '{"action":"send-message","params":{"text":"y lower"}}'
+  y_prepare forged 3 '{"action":"send-message","params":{"text":"y forged"}}' "$Y_WRONG_KEY"
+  y_prepare jump 100 '{"action":"y-noop","params":{}}'
+  y_prepare sentinel 101 '{"action":"y-noop","params":{}}'
+  # the stale seq-4 frame with one ciphertext bit flipped: it does not open
+  python3 - "$TMPROOT/y.cmd.lower.json" "$TMPROOT/y.cmd.tampered.json" <<'PYEOF'
+import base64, json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    env = json.load(f)
+raw = bytearray(base64.b64decode(env["ciphertext"]))
+raw[0] ^= 0x01
+env["ciphertext"] = base64.b64encode(bytes(raw)).decode("ascii")
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(env, f, sort_keys=True, separators=(",", ":"))
+PYEOF
+
+  # the phone's seq 5 is accepted: hmd's last device seq is 5
+  y_replay "$TMPROOT/y.cmd.first.json"
+  Y_ACK_FIRST="$(wait_for_ack_of_seq "$FRAMES_Y" "$KEY_Y" 5 10)"
+  if printf '%s' "$Y_ACK_FIRST" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") is True else 1)' 2>/dev/null; then
+    ok "scenario Y: the phone's seq 5 is accepted (acked ok), so hmd's last device seq is 5"
+  else
+    bad "scenario Y: the phone's seq 5 was not accepted: '${Y_ACK_FIRST:-no ack}'"
+  fi
+
+  # silent ones first (a corrupted seq-4 frame, a seq-3 frame sealed under another key), then the seq-5 frame replayed three
+  # times, then a genuine frame at the lower seq 4
+  y_queue "$TMPROOT/y.cmd.tampered.json"
+  y_queue "$TMPROOT/y.cmd.forged.json"
+  y_replay "$TMPROOT/y.cmd.first.json"; y_replay "$TMPROOT/y.cmd.first.json"; y_replay "$TMPROOT/y.cmd.first.json"
+  y_queue "$TMPROOT/y.cmd.lower.json"
+
+  Y_REFUSAL_5="$(wait_for_refusal_ack "$FRAMES_Y" "$KEY_Y" 5 10)"
+  Y_REFUSAL_4="$(wait_for_refusal_ack "$FRAMES_Y" "$KEY_Y" 4 10)"
+  if [ "$Y_REFUSAL_5" = '{"detail":"non-increasing-seq","last":5,"of_seq":5,"ok":false}' ] \
+     && [ "$Y_REFUSAL_4" = '{"detail":"non-increasing-seq","last":5,"of_seq":4,"ok":false}' ]; then
+    ok "Y1: a replayed frame (seq 5) and a lower one (seq 4) are each answered with a sealed {detail:non-increasing-seq, last:5, of_seq, ok:false} and nothing more"
+  else
+    bad "Y1: no exact sealed refusal for the replay (got '${Y_REFUSAL_5:-none}') and the lower seq (got '${Y_REFUSAL_4:-none}')"
+  fi
+
+  # Y2: the phone re-seals the refused command above the `last` the refusal names
+  Y_LAST_NAMED="$(printf '%s' "$Y_REFUSAL_4" | python3 -c 'import json,sys; print(json.load(sys.stdin)["last"])' 2>/dev/null)"
+  Y_LAST="${Y_LAST_NAMED:-5}"  # with no refusal to read it from the scenario still runs on; Y2 fails below
+  y_prepare reseal "$((Y_LAST + 1))" '{"action":"send-message","params":{"text":"y lower"}}'
+  y_queue "$TMPROOT/y.cmd.reseal.json"
+  Y_ACK_RESEAL="$(wait_for_ack_of_seq "$FRAMES_Y" "$KEY_Y" "$((Y_LAST + 1))" 10)"
+  if [ -n "$Y_LAST_NAMED" ] \
+     && printf '%s' "$Y_ACK_RESEAL" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") is True else 1)' 2>/dev/null \
+     && [ "$(y_inbox_texts "$REPO_Y")" = "$(printf 'y first\ny lower')" ]; then
+    ok "Y2: the phone's re-seal at last+1 (seq $((Y_LAST + 1))) is accepted -- acked ok and in the inbox once; no stale frame ever reached it"
+  else
+    bad "Y2: no refusal named a last seq to re-seal above (named '${Y_LAST_NAMED:-none}'), or the re-seal at seq $((Y_LAST + 1)) was not accepted, or a stale frame was acted on (ack '${Y_ACK_RESEAL:-none}', inbox: $(y_inbox_texts "$REPO_Y" | tr '\n' '|'))"
+  fi
+
+  # Y3: that ack is the barrier -- hmd handles frames in order -- so every earlier frame has been dealt with. The answers it
+  # gave, by the seq they answer: the accepted 5, ONE refusal of the three replays of 5, the refusal of the genuine 4 (the
+  # corrupted 4 before it neither drew one nor used up its allowance), the accepted 6; nothing for the forged 3.
+  Y_OF_SEQS="$(sealed_acks "$FRAMES_Y" "$KEY_Y" | python3 -c 'import json,sys; print(" ".join(str(json.loads(l)["ack"]["of_seq"]) for l in sys.stdin))')"
+  if [ "$Y_OF_SEQS" = "5 5 4 $((Y_LAST + 1))" ]; then
+    ok "Y3: frames that do not open (a corrupted seq 4, a seq 3 sealed under another key) draw no ack and use up no refusal ($Y_OF_SEQS)"
+  else
+    bad "Y3: the acks answered seqs '$Y_OF_SEQS', want '5 5 4 $((Y_LAST + 1))'"
+  fi
+
+  # Y4: a flood of 40 stale frames, each a distinct seq that opens. last_device_seq goes to 100 first; the last frame (seq 101,
+  # accepted) is the barrier. Bound: at most STALE_REFUSAL_BURST refusals in any STALE_REFUSAL_WINDOW_S (checked over 0.9 of it,
+  # since the relay's receive stamps and the client's clock differ by a few ms); none of the 40 is acted on.
+  Y_BURST="$(sed -n 's/^STALE_REFUSAL_BURST = \([0-9][0-9]*\).*/\1/p' "$RELAY_CLIENT" | head -1)"
+  Y_WINDOW_S="$(sed -n 's/^STALE_REFUSAL_WINDOW_S = \([0-9][0-9.]*\).*/\1/p' "$RELAY_CLIENT" | head -1)"
+  y_queue "$TMPROOT/y.cmd.jump.json"
+  wait_for_ack_of_seq "$FRAMES_Y" "$KEY_Y" 100 10 >/dev/null
+  y_prepare_flood "$TMPROOT/y.flood" "$SID_Y" "$KEY_Y" 10 40 500
+  mv "$TMPROOT"/y.flood/*.json "$CTL_Y/"
+  mv "$TMPROOT/y.cmd.sentinel.json" "$CTL_Y/900.json"
+  wait_for_ack_of_seq "$FRAMES_Y" "$KEY_Y" 101 20 >/dev/null
+  Y_CHECK_WINDOW="$(python3 -c 'import sys; print(float(sys.argv[1]) * 0.9)' "${Y_WINDOW_S:-1.0}")"
+  read -r Y_COUNT Y_PEAK <<<"$(refusal_rate "$FRAMES_Y" "$KEY_Y" "$LOG_Y/frame-posts.log" "$Y_CHECK_WINDOW")"
+  # the flood's refusals are every one after the first two (seqs 5 and 4): each names last 100, a flood seq, and nothing more
+  Y_FLOOD_SHAPE="$(refusal_acks "$FRAMES_Y" "$KEY_Y" | tail -n +3 | python3 -c '
+import json, sys
+seen = []
+for line in sys.stdin:
+    ack = json.loads(line)
+    if set(ack) != {"detail", "last", "of_seq", "ok"} or ack["last"] != 100 or ack["ok"] is not False \
+            or not 10 <= ack["of_seq"] <= 49:
+        print("BAD " + line.strip()); sys.exit(0)
+    seen.append(ack["of_seq"])
+print("OK" if len(seen) == len(set(seen)) else "BAD duplicate of_seq")
+')"
+  if [ -n "$Y_BURST" ] && [ -n "$Y_WINDOW_S" ] && [ "$((Y_COUNT - 2))" -ge 1 ] && [ "$Y_PEAK" -le "$Y_BURST" ] \
+     && [ "$Y_FLOOD_SHAPE" = "OK" ] && [ "$(y_inbox_texts "$REPO_Y")" = "$(printf 'y first\ny lower')" ]; then
+    ok "Y4: a flood of 40 stale frames drew $((Y_COUNT - 2)) refusals, at most $Y_PEAK in any ${Y_CHECK_WINDOW}s (bound $Y_BURST per ${Y_WINDOW_S}s); none was acted on"
+  else
+    bad "Y4: flood not bounded as STALE_REFUSAL_BURST='${Y_BURST:-undefined}' per STALE_REFUSAL_WINDOW_S='${Y_WINDOW_S:-undefined}' (refusals $((Y_COUNT - 2)), peak in window ${Y_PEAK:-?}, shape ${Y_FLOOD_SHAPE:-?}, inbox: $(y_inbox_texts "$REPO_Y" | tr '\n' '|'))"
+  fi
+
+  kill "$CLIENT_Y" 2>/dev/null; wait "$CLIENT_Y" 2>/dev/null
+  kill "$SRV_Y" 2>/dev/null; wait "$SRV_Y" 2>/dev/null
+else
+  skip "scenario Y (stale-seq refusal): bin/lib/hmd_relay_e2e.py absent -- needs real seal"
 fi
 
 echo
