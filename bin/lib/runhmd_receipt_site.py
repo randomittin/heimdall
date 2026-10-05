@@ -15,14 +15,27 @@ can publish, and `hmd receipt serve` runs the same thing locally for testing. A 
 that accepts uploads (`POST /api/receipts`), renders the 1200x630 card and takes finding ratings is
 NOT here: it needs storage, auth and a deploy, all operator decisions (docs/RECEIPTS.md).
 
-WHAT IS SERVED. Only a stored receipt that verifies RIGHT NOW against the pinned keys, and only
-under the id it is filed as. /r/<id>.json is the stored bytes untouched. /r/<id> is rendered from
-the verified document with every dynamic value passed through html.escape; the template has no
-script, no external resource and no form, and carries its own Content-Security-Policy
-(default-src 'none', the one inline <style> allowed by hash) so it stays safe on any host. A
-receipt that fails verification is a 500 with a fixed body: its content is never echoed. The
-publishable tree only ever contains `public` receipts; the local server (loopback only) also
-serves `private` ones, marked noindex.
+WHAT IS SERVED. Only a PUBLIC stored receipt that verifies RIGHT NOW against the pinned keys, and
+only under the id it is filed as: the local server and the publishable tree serve exactly the same
+set. A private receipt is a plain 404, byte for byte the answer for an id that does not exist, so
+nothing here confirms that one exists, and no switch serves one: a private receipt belongs to a
+service that knows who is asking, and an unauthenticated loopback port is not that. /r/<id>.json
+is the stored bytes untouched. /r/<id> is rendered from the verified document with every dynamic
+value passed through html.escape; the template has no script, no external resource and no form,
+and carries its own Content-Security-Policy (default-src 'none', the one inline <style> allowed by
+hash) so it stays safe on any host. A receipt that fails verification is a 500 with a fixed body:
+its content is never echoed.
+
+WHO MAY ASK. The server listens on 127.0.0.1 and nowhere else, and answers a request only when it
+carries exactly one Host header and that header is this server's own origin: 127.0.0.1:<port> or
+localhost:<port>, the port it actually bound, compared exactly and case-insensitively (the check
+sentinels/hmd-ui.py makes, minus its --allow-host extension: this server is for testing, and a
+public name belongs to the static tree). That is the DNS-rebinding defence: a page on evil.example
+whose name is re-pointed at 127.0.0.1 makes the browser reach this server, but the browser still
+sends `Host: evil.example`, and gets a 403 before any receipt is read. Every answer built here,
+errors included, carries X-Content-Type-Options: nosniff, Referrer-Policy: no-referrer and the CSP;
+the HTTP layer's own refusals (a malformed request, an unknown method) are plain text, so the
+receipt page is the only HTML this server returns.
 """
 from __future__ import annotations
 
@@ -110,14 +123,13 @@ def render_page(doc):
         "<section><h2>Signature</h2><p>Ed25519 &middot; key <code>%s</code> &middot; checked against the pinned runhmd receipt keys when this page was produced.</p>"
         "<p>Check it yourself:</p><pre>hmd receipt verify %s</pre>"
         "<p><a href=\"%s.json\">%s.json</a> is the exact signed receipt.</p></section>" % (_e(doc["key_id"]), _e(doc["id"]), _e(doc["id"]), _e(doc["id"])))
-    robots = "<meta name=\"robots\" content=\"noindex\">\n" if doc["visibility"] != "public" else ""
     return (
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-        "<meta http-equiv=\"Content-Security-Policy\" content=\"%s\">\n<meta name=\"referrer\" content=\"no-referrer\">\n%s"
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"%s\">\n<meta name=\"referrer\" content=\"no-referrer\">\n"
         "<title>runhmd receipt %s &middot; %s</title>\n<style>%s</style>\n</head>\n<body>\n<main>\n"
         "<header><p>runhmd receipt</p><h1 class=\"%s\">%s</h1></header>\n<dl>\n%s\n</dl>\n%s\n</main>\n</body>\n</html>\n" % (
-            PAGE_CSP, robots, _e(doc["id"]), _e(verdict), CSS, "proven" if verdict == "PROVEN" else "denied", _e(verdict),
+            PAGE_CSP, _e(doc["id"]), _e(verdict), CSS, "proven" if verdict == "PROVEN" else "denied", _e(verdict),
             "\n".join("<dt>%s</dt><dd>%s</dd>" % (label, value) for label, value in facts), "\n".join(sections)))
 
 
@@ -125,12 +137,9 @@ def page_bytes(doc):
     return render_page(doc).encode("utf-8")
 
 
-def _headers(content_type, private=False):
-    headers = [("Content-Type", content_type), ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"),
-               ("Content-Security-Policy", HEADER_CSP), ("Cache-Control", "no-store")]
-    if private:
-        headers.append(("X-Robots-Tag", "noindex"))
-    return headers
+def _headers(content_type):
+    return [("Content-Type", content_type), ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"),
+            ("Content-Security-Policy", HEADER_CSP), ("Cache-Control", "no-store")]
 
 
 def _plain(status, text, extra=()):
@@ -140,7 +149,8 @@ def _plain(status, text, extra=()):
 def respond(store, trust, method, target):
     """(status, [(header, value)], body bytes) for one request. Only GET and HEAD, only the exact
     paths /r/<id> and /r/<id>.json (the target is never percent-decoded, so nothing but a safe
-    token can name a file), only a receipt that verifies now and is filed under its own id."""
+    token can name a file), only a PUBLIC receipt that verifies now and is filed under its own id:
+    a private one is a 404, the same answer as an id that does not exist."""
     if method not in ("GET", "HEAD"):
         return _plain(405, "method not allowed", [("Allow", "GET, HEAD")])
     match = _ROUTE.fullmatch(target.split("?", 1)[0].split("#", 1)[0])
@@ -157,10 +167,12 @@ def respond(store, trust, method, target):
             return _plain(404, "not found")
         sys.stderr.write("hmd receipt serve: refusing %s: %s\n" % (ident, exc))
         return _plain(500, "receipt failed verification")
-    private = doc["visibility"] != "public"
+    if doc["visibility"] != "public":
+        sys.stderr.write("hmd receipt serve: not serving %s: it is %s, and only public receipts are served\n" % (ident, doc["visibility"]))
+        return _plain(404, "not found")
     if as_json:
-        return 200, _headers("application/json", private), raw
-    return 200, _headers("text/html; charset=utf-8", private), page_bytes(doc)
+        return 200, _headers("application/json"), raw
+    return 200, _headers("text/html; charset=utf-8"), page_bytes(doc)
 
 
 def _write_atomic(path, data):
@@ -209,16 +221,40 @@ def build_site(store, trust, out_dir):
     return summary
 
 
+class _Server(http.server.ThreadingHTTPServer):
+    """Listens on the loopback address and nothing else. `allowed_hosts` are the only Host header values
+    that name it: 127.0.0.1 and localhost, each with the port the OS actually gave it (--port 0 asks
+    for any free one)."""
+
+    def __init__(self, port, handler):
+        super().__init__(("127.0.0.1", port), handler)
+        bound = self.server_address[1]
+        self.allowed_hosts = frozenset(("127.0.0.1:%d" % bound, "localhost:%d" % bound))
+
+
 def _handler(store, trust):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "hmd-receipts"
         sys_version = ""
+        # The HTTP layer's own refusals (an unknown method, an oversized request line) are plain text:
+        # the receipt page is the only HTML this server returns, and it is the page that carries the lock-down.
+        error_content_type = "text/plain; charset=utf-8"
+        error_message_format = "%(code)d %(message)s\n"
 
         def _serve(self, method):
-            # The request target exactly as the client wrote it: some Python versions collapse a
-            # leading // in self.path, and only the exact /r/<id>[.json] forms may be served.
-            words = self.requestline.split(" ")
-            status, headers, body = respond(store, trust, method, words[1] if len(words) >= 3 else self.path)
+            # Exactly one Host header, and it names this server. Judged before the method, the route
+            # or the store, so a foreign Host is told nothing, not even a 404; and never "the first
+            # of two", which another component may read as the last.
+            hosts = self.headers.get_all("Host") or []
+            if len(hosts) != 1 or hosts[0].strip().lower() not in self.server.allowed_hosts:
+                sys.stderr.write("hmd receipt serve: refused Host %s: only %s name this server\n" % (
+                    repr(", ".join(hosts))[:100], " and ".join(sorted(self.server.allowed_hosts))))
+                status, headers, body = _plain(403, "forbidden: Host header is not this server's loopback origin")
+            else:
+                # The request target exactly as the client wrote it: some Python versions collapse a
+                # leading // in self.path, and only the exact /r/<id>[.json] forms may be served.
+                words = self.requestline.split(" ")
+                status, headers, body = respond(store, trust, method, words[1] if len(words) >= 3 else self.path)
             self.send_response(status)
             for name, value in headers:
                 self.send_header(name, value)
@@ -253,10 +289,11 @@ def _handler(store, trust):
 
 def serve(store, trust, port):
     """Serve respond() on 127.0.0.1:`port` (0 = any free port) until interrupted. Loopback only: there
-    is deliberately no way to bind another address. Raises OSError when the port cannot be bound."""
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _handler(store, trust))
+    is deliberately no way to bind another address or to answer another Host. Raises OSError when the
+    port cannot be bound."""
+    server = _Server(port, _handler(store, trust))
     host, bound = server.server_address[:2]
-    sys.stdout.write("listening on http://%s:%d (receipts: %s, %d trusted key(s))\n" % (host, bound, store, len(trust)))
+    sys.stdout.write("listening on http://%s:%d (public receipts only; store: %s, %d trusted key(s))\n" % (host, bound, store, len(trust)))
     sys.stdout.flush()
     try:
         server.serve_forever()

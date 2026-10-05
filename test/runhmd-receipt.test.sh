@@ -16,6 +16,10 @@
 #   [V] VERIFY   `hmd receipt verify <file|id>`, `hmd receipt keygen`: exit codes and messages.
 #   [H] HOSTING  `/r/<id>` (HTML, escaped) and `/r/<id>.json` (the exact signed bytes), served by
 #                `hmd receipt serve` locally and written by `hmd receipt render` for a static host.
+#                The local server is hardened against a web page in the operator's own browser: it
+#                answers only a Host header that is its own loopback origin (DNS rebinding), serves
+#                public receipts only, listens on 127.0.0.1 only, and locks every response down
+#                (CSP default-src 'none', nosniff, no-referrer).
 #   [A] ATTACK   `hmd attack --receipt` issues a receipt and populates receipt_url.
 #   [D] DOCS     dispatch, inventory, and the documented `hmd prove` call site.
 #
@@ -996,8 +1000,6 @@ python3 "$TMP/html-check.py" "$TMP/hostile-page.html" "$TMP/hostile.json" >"$TMP
 while IFS= read -r line; do case "$line" in "PASS "*) ok "${line#PASS }" ;; "FAIL "*) bad "${line#FAIL }" ;; esac; done <"$TMP/html-check.out"
 [ -s "$TMP/html-check.out" ] || bad "the HTML checker produced no output: $(tail -3 "$TMP/html-check.err" | tr '\n' '|')"
 grep -q 'private' "$TMP/public-page.html" && bad "a public receipt page mentions 'private'" || ok "a public receipt's page does not claim to be private"
-http_do "/r/$PRIV_ID"
-[ "$HCODE" = "200" ] && grep -qi 'private' "$HBODY" && head_of x-robots-tag | grep -qi noindex && ok "the local server also serves a PRIVATE receipt (it is the owner's loopback), marked private and X-Robots-Tag: noindex" || bad "private receipt (code=$HCODE robots=$(head_of x-robots-tag))"
 
 echo "  -- nothing but verified receipts at /r/<id>[.json] --"
 for bad_route in "/" "/r" "/r/" "/r/zzzzzzzzzzzz" "/r/zzzzzzzzzzzz.json" "/r/$PUB_ID/" "/r/$PUB_ID.json/" "/r/$PUB_ID/card.png" "/r/$PUB_ID.html" "/api/receipts" "/r/$PUB_ID.JSON" "/r/ab" "/R/$PUB_ID"; do
@@ -1021,6 +1023,151 @@ for tampered in "$FLIP_ID" "$SWAP_ID"; do
     else bad "tampered receipt $tampered$suffix -> $HCODE body='$(head -c 80 "$HBODY")'"; fi
   done
 done
+echo "  -- the Host header: a request is answered only if it names this server's own loopback origin (DNS rebinding) --"
+PORT="${BASE##*:}"
+REFUSAL_FAILS=""
+refused_everywhere() {  # refused_everywhere <Host value>: 403 on every request shape, and no receipt content in any body
+  local shape method path
+  REFUSAL_FAILS=""
+  for shape in "GET:/r/$PUB_ID.json" "GET:/r/$PUB_ID" "GET:/r/$FLIP_ID" "GET:/r/zzzzzzzzzzzz" "GET:/" "HEAD:/r/$PUB_ID.json" "POST:/r/$PUB_ID" "DELETE:/r/$PUB_ID.json"; do
+    method="${shape%%:*}"; path="${shape#*:}"
+    case "$method" in
+      GET)  http_do -H "Host: $1" "$path" ;;
+      HEAD) http_do -I -H "Host: $1" "$path" ;;
+      *)    http_do -X "$method" --data 'x=1' -H "Host: $1" "$path" ;;
+    esac
+    { [ "$HCODE" = "403" ] && ! grep -qE 'PROVEN|runhmd\.receipt/1|settlement|signature' "$HBODY"; } || REFUSAL_FAILS="$REFUSAL_FAILS $method $path -> $HCODE;"
+  done
+  [ -z "$REFUSAL_FAILS" ]
+}
+for foreign in "evil.example" "rebind.attacker.example:$PORT" "127.0.0.1" "localhost" "127.0.0.1:$((PORT + 1))" "localhost:$((PORT + 1))" \
+               "127.0.0.1.evil.example:$PORT" "localhost.evil.example:$PORT" "evillocalhost:$PORT" "evil127.0.0.1:$PORT" \
+               "127.0.0.1:$PORT@evil.example" "0.0.0.0:$PORT" "[::1]:$PORT"; do
+  if refused_everywhere "$foreign"; then ok "Host: $foreign is refused (403) on every request shape, before any receipt is read"
+  else bad "Host: $foreign was answered:$REFUSAL_FAILS"; fi
+done
+for spelled in "localhost:$PORT" "LOCALHOST:$PORT" "127.0.0.1:$PORT"; do
+  http_do -H "Host: $spelled" "/r/$PUB_ID.json"
+  if [ "$HCODE" = "200" ] && cmp -s "$HBODY" "$HS/$PUB_ID.json"; then ok "Host: $spelled is this server's own origin: 200 and the exact signed bytes"
+  else bad "Host: $spelled -> $HCODE (the operator's own browser must still be served)"; fi
+done
+cat >"$TMP/raw-host.py" <<'PY'
+import socket, sys
+port, pub = int(sys.argv[1]), sys.argv[2]
+path, good = "/r/%s.json" % pub, "127.0.0.1:%d" % port
+
+def exchange(request):
+    """(header block, body) for the literal request bytes: the server answers HTTP/1.0 and closes the connection."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+        conn.sendall(request.encode("ascii"))
+        data = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    return head.decode("latin-1"), body
+
+def ask(request):
+    head, body = exchange(request)
+    return int(head.split(" ", 2)[1]), body
+
+def plain_refusal(desc, request, want):
+    """The HTTP layer's own refusals (here: a method nobody handles) are plain text: the only HTML this
+    server returns is the receipt page, and that is the page that carries the lock-down."""
+    head, body = exchange(request)
+    status = int(head.split(" ", 2)[1])
+    plain = "content-type: text/plain" in head.lower() and b"<" not in body
+    print("%s %s%s" % ("PASS" if status == want and plain else "FAIL", desc, "" if status == want and plain else " (status %s, head %r)" % (status, head[:120])))
+
+def case(desc, status, body, want):
+    served = b"runhmd.receipt/1" in body
+    good_answer = status == want and served == (want == 200)
+    print("%s %s%s" % ("PASS" if good_answer else "FAIL", desc, "" if good_answer else " (status %s, receipt in body: %s)" % (status, served)))
+
+case("control: one well-formed Host header is served", *ask("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (path, good)), 200)
+case("a request with no Host header at all is refused (403) and serves nothing", *ask("GET %s HTTP/1.0\r\n\r\n" % path), 403)
+case("an empty Host header is refused (403)", *ask("GET %s HTTP/1.1\r\nHost:\r\nConnection: close\r\n\r\n" % path), 403)
+case("two Host headers, the valid one first, are refused (403): the allowlist must judge the Host that is used", *ask("GET %s HTTP/1.1\r\nHost: %s\r\nHost: evil.example\r\nConnection: close\r\n\r\n" % (path, good)), 403)
+case("two Host headers, the valid one last, are refused (403)", *ask("GET %s HTTP/1.1\r\nHost: evil.example\r\nHost: %s\r\nConnection: close\r\n\r\n" % (path, good)), 403)
+plain_refusal("an unknown method (501) is answered in plain text, not by the stdlib's HTML error page", "FOO %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (path, good), 501)
+PY
+python3 "$TMP/raw-host.py" "$PORT" "$PUB_ID" >"$TMP/raw-host.out" 2>"$TMP/raw-host.err"
+while IFS= read -r line; do case "$line" in "PASS "*) ok "${line#PASS }" ;; "FAIL "*) bad "${line#FAIL }" ;; esac; done <"$TMP/raw-host.out"
+[ "$(grep -c . "$TMP/raw-host.out")" = "6" ] || bad "the raw-socket Host checks did not all run: $(tail -3 "$TMP/raw-host.err" | tr '\n' '|')"
+
+echo "  -- a private receipt is never served, as a page or as JSON, whatever the request presents --"
+http_do "/r/zzzzzzzzzzzz";      cp "$HBODY" "$TMP/absent.body"
+http_do "/r/zzzzzzzzzzzz.json"; cp "$HBODY" "$TMP/absent-json.body"
+for form in "/r/$PRIV_ID" "/r/$PRIV_ID.json" "/r/$PRIV_ID?token=x" "/r/$PRIV_ID.json?visibility=public"; do
+  http_do -H "X-Heimdall-UI-Token: x" "$form"
+  want_body="$TMP/absent.body"; case "$form" in *.json*) want_body="$TMP/absent-json.body" ;; esac
+  if [ "$HCODE" = "404" ] && cmp -s "$HBODY" "$want_body" && ! grep -qiE 'private finding title|DENIED|runhmd\.receipt/1' "$HBODY"; then
+    ok "GET $form is 404, byte for byte the answer for an id that does not exist: no receipt, no sign that it exists"
+  else bad "GET $form -> $HCODE: $(head -c 80 "$HBODY")"; fi
+done
+http_do -I "/r/$PRIV_ID.json"; [ "$HCODE" = "404" ] && ok "HEAD /r/<private id>.json is 404 too" || bad "HEAD of a private receipt -> $HCODE"
+
+echo "  -- headers: every response is locked down, the HTML page above all --"
+locked_down() {  # the last response (HHEAD) carries the whole lock-down set
+  [ "$(head_of x-content-type-options)" = "nosniff" ] && [ "$(head_of referrer-policy)" = "no-referrer" ] \
+    && head_of content-security-policy | grep -q "^default-src 'none'; " && [ "$(head_of cache-control)" = "no-store" ]
+}
+http_do "/r/$PUB_ID"
+cp "$HBODY" "$TMP/hdr-page.html"; cp "$HHEAD" "$TMP/hdr-page.head"
+cat >"$TMP/hdr-check.py" <<'PY'
+import base64, hashlib, re, sys
+page = open(sys.argv[1], "rb").read().decode("utf-8")
+head = {}
+for line in open(sys.argv[2], "rb").read().decode("latin-1").splitlines()[1:]:
+    if ":" in line:
+        name, value = line.split(":", 1)
+        head[name.strip().lower()] = value.strip()
+out = []
+def case(desc, cond, detail=""):
+    out.append(("PASS " if cond else "FAIL ") + desc + ("" if cond or not detail else ": " + str(detail)))
+style = re.search(r"<style>(.*?)</style>", page, re.S).group(1)
+want_hash = "sha256-" + base64.b64encode(hashlib.sha256(style.encode("utf-8")).digest()).decode("ascii")
+csp = {}
+for part in head.get("content-security-policy", "").split(";"):
+    words = part.split()
+    if words:
+        csp[words[0]] = words[1:]
+case("the page is text/html; charset=utf-8", head.get("content-type") == "text/html; charset=utf-8", head.get("content-type"))
+case("the page carries X-Content-Type-Options: nosniff", head.get("x-content-type-options") == "nosniff", head.get("x-content-type-options"))
+case("the page carries Referrer-Policy: no-referrer", head.get("referrer-policy") == "no-referrer", head.get("referrer-policy"))
+case("the page carries Cache-Control: no-store", head.get("cache-control") == "no-store", head.get("cache-control"))
+case("CSP default-src is 'none'", csp.get("default-src") == ["'none'"], csp.get("default-src"))
+case("CSP lets the one inline <style> in by its hash (%s...), which is the hash of the style element that was served" % want_hash[:14],
+     csp.get("style-src") == ["'%s'" % want_hash], csp.get("style-src"))
+case("CSP forbids <base>, form targets and framing", csp.get("base-uri") == ["'none'"] and csp.get("form-action") == ["'none'"] and csp.get("frame-ancestors") == ["'none'"], csp)
+loose = [w for words in csp.values() for w in words if w in ("'unsafe-inline'", "'unsafe-eval'", "*", "data:", "http:", "https:", "'self'")]
+case("CSP allows nothing loose (no unsafe-inline, unsafe-eval, wildcard, data:, http(s): or 'self')", not loose, loose)
+case("CSP gives scripts no source of their own (they fall under default-src 'none')", "script-src" not in csp, csp.get("script-src"))
+print("\n".join(out))
+PY
+python3 "$TMP/hdr-check.py" "$TMP/hdr-page.html" "$TMP/hdr-page.head" >"$TMP/hdr-check.out" 2>"$TMP/hdr-check.err"
+while IFS= read -r line; do case "$line" in "PASS "*) ok "${line#PASS }" ;; "FAIL "*) bad "${line#FAIL }" ;; esac; done <"$TMP/hdr-check.out"
+[ "$(grep -c . "$TMP/hdr-check.out")" = "9" ] || bad "the header checks did not all run: $(tail -3 "$TMP/hdr-check.err" | tr '\n' '|')"
+for probe in "200:GET:/r/$PUB_ID.json" "404:GET:/r/zzzzzzzzzzzz" "404:GET:/r/$PRIV_ID" "405:POST:/r/$PUB_ID" "500:GET:/r/$FLIP_ID"; do
+  want="${probe%%:*}"; rest="${probe#*:}"; method="${rest%%:*}"; path="${rest#*:}"
+  if [ "$method" = GET ]; then http_do "$path"; else http_do -X "$method" --data 'x=1' "$path"; fi
+  if [ "$HCODE" = "$want" ] && locked_down; then ok "the $want response to $method $path carries nosniff, no-referrer, CSP default-src 'none' and no-store"
+  else bad "$method $path -> $HCODE (want $want), headers: $(tr -d '\r' <"$HHEAD" | tr '\n' '|' | head -c 300)"; fi
+done
+http_do -H "Host: evil.example" "/r/$PUB_ID.json"
+if [ "$HCODE" = "403" ] && locked_down; then ok "the 403 for a foreign Host carries the same lock-down headers"
+else bad "403 for a foreign Host -> $HCODE, headers: $(tr -d '\r' <"$HHEAD" | tr '\n' '|' | head -c 300)"; fi
+
+echo "  -- bind: the listening socket is 127.0.0.1 only --"
+if command -v lsof >/dev/null 2>&1; then
+  LISTENING="$(lsof -nP -a -p "$SERVER_PID" -iTCP -sTCP:LISTEN 2>/dev/null)"
+  if printf '%s\n' "$LISTENING" | grep -q "127\.0\.0\.1:$PORT (LISTEN)" && ! printf '%s\n' "$LISTENING" | grep -Eq "(\*|0\.0\.0\.0|\[::\]|\[::1\]):$PORT"; then
+    ok "the serving process listens on 127.0.0.1:$PORT and on no other address"
+  else bad "listening sockets of the serving process: $(printf '%s' "$LISTENING" | tr '\n' '|' | head -c 300)"; fi
+else printf '  SKIP lsof is not installed: the listening address cannot be inspected here\n'; fi
+
 http_do "/r/$PUB_ID.json"; [ "$HCODE" = "200" ] && ok "the server is still serving after every hostile request" || bad "the server stopped serving ($HCODE)"
 [ "$store_before" = "$(cd "$HS" && find . -type f -exec shasum {} + | sort)" ] && ok "the server only reads: the store is byte-identical after every request" || bad "the server modified the store"
 kill "$SERVER_PID" >/dev/null 2>&1; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""

@@ -42,8 +42,11 @@ HELP = """hmd receipt -- the signed, shareable record of one verdict (runhmd.rec
   render   write the PUBLIC receipts of the store as a static tree for runhmd.dev: r/<id>.json (the
            exact signed bytes) and r/<id>.html (escaped). Private receipts are never written and a
            receipt that fails verification is reported and never written.
-  serve    serve /r/<id> and /r/<id>.json from the store on 127.0.0.1 only (default port 8720),
-           for local testing of what render publishes. Refuses to start without a trust anchor.
+  serve    serve /r/<id> and /r/<id>.json of the PUBLIC receipts in the store on 127.0.0.1 only
+           (default port 8720), for local testing of what render publishes. A private receipt is a
+           404, the same answer as an id that does not exist, and no flag serves one. A request is
+           answered only if its Host header is 127.0.0.1:<port> or localhost:<port> (the
+           DNS-rebinding defence); any other Host is a 403. Refuses to start without a trust anchor.
 
 options:
   --pubkey FILE   a file of pinned public keys, one base64 Ed25519 key per line (repeatable);
