@@ -210,7 +210,7 @@ validate --schema "$TMP/loose/runhmd.receipt.v1.json" "$DENIED_RC"
 [ "$VRC" -eq 2 ] && printf '%s' "$VERR" | grep -q 'never fetched' && ok "a \$ref to a URL fails closed (exit 2), never fetched" || bad "URL \$ref must fail closed (rc=$VRC: $VERR)"
 jq '.properties.verdict={"$ref":"../../etc/passwd#/x"}' "$RECEIPT_SCHEMA" >"$TMP/loose/runhmd.receipt.v1.json"
 validate --schema "$TMP/loose/runhmd.receipt.v1.json" "$DENIED_RC"
-[ "$VRC" -eq 2 ] && ok "a \$ref that climbs out of the schema directory fails closed (exit 2)" || bad "path-traversal \$ref must fail closed (rc=$VRC: $VERR)"
+[ "$VRC" -eq 2 ] && printf '%s' "$VERR" | grep -q 'etc/passwd' && ok "a \$ref that climbs out of the schema directory fails closed (exit 2, naming the ref)" || bad "path-traversal \$ref must fail closed (rc=$VRC: $VERR)"
 fi
 
 echo ""

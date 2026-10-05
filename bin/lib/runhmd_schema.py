@@ -111,17 +111,26 @@ def _audit(node, where):
 
 
 def _resolve(ref, root):
-    if not ref.startswith("#"):
-        raise SchemaError("only local $ref values are supported (never fetched): %s" % ref)
+    """The (node, root) a $ref points at. `root` is the schema document the node lives in: it is
+    what any local $ref INSIDE that node is relative to, so a sibling file's nodes resolve
+    against that sibling, not against the document that referenced it."""
+    name, _, pointer = ref.partition("#")
+    if name:
+        if not _SIBLING_FILE.fullmatch(name):
+            raise SchemaError("only local and sibling runhmd.*.json $ref values are supported (never fetched): %s" % ref)
+        try:
+            root = _load_sibling(os.path.join(root.get("x-source-dir") or SCHEMA_DIR, name))
+        except (OSError, ValueError) as exc:
+            raise SchemaError("cannot load the schema file %s referenced by %s: %s" % (name, ref, exc)) from exc
     node = root
-    for part in ref[1:].split("/"):
+    for part in pointer.split("/"):
         if part == "":
             continue
         part = part.replace("~1", "/").replace("~0", "~")
         if not isinstance(node, dict) or part not in node:
             raise SchemaError("unresolvable $ref: %s" % ref)
         node = node[part]
-    return node
+    return node, root
 
 
 def _is_type(value, name):
@@ -157,7 +166,8 @@ def _json_eq(a, b):
 
 def _check(value, schema, root, path, errors):
     if "$ref" in schema:
-        _check(value, _resolve(schema["$ref"], root), root, path, errors)
+        target, target_root = _resolve(schema["$ref"], root)
+        _check(value, target, target_root, path, errors)
     where = path or "/"
     if "type" in schema:
         names = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
@@ -270,18 +280,46 @@ def _prove_invariants(doc):
     return errors
 
 
-_INVARIANTS = {"runhmd.verdict/1": _verdict_invariants, "runhmd.prove/1": _prove_invariants}
+def _receipt_invariants(doc):
+    errors = []
+    # RC1
+    try:
+        datetime.datetime.strptime(doc["created_at"], "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        errors.append("created_at %r is not a real UTC timestamp" % doc["created_at"])
+    # RC3
+    for field, places in (("cost_usd", 4), ("duration_s", 2)):
+        value = doc[field]
+        if not math.isfinite(value) or round(value, places) != value:
+            errors.append("%s %r is not a finite number with at most %d decimal places" % (field, value, places))
+    # RC2: a receipt attests a verdict, so the verdict's own consistency rules apply to its fields
+    errors.extend(_verdict_invariants(doc))
+    return errors
+
+
+_INVARIANTS = {"runhmd.verdict/1": _verdict_invariants, "runhmd.prove/1": _prove_invariants,
+               "runhmd.receipt/1": _receipt_invariants}
 
 
 def validate(doc, schema=None):
-    """Return the list of problems with `doc` (empty list == valid)."""
-    schema = schema if schema is not None else load_schema()
-    documents = schema.get("x-documents", {"runhmd.verdict/1": "#"})
+    """Return the list of problems with `doc` (empty list == valid).
+
+    With no `schema`, the document is checked against the file that declares its `schema` id:
+    the verdict file first (so verdict and prove validation never touch any other file), then
+    its siblings in docs/schemas/."""
     doc_id = doc.get("schema") if isinstance(doc, dict) else None
+    explicit = schema is not None
+    if not explicit:
+        schema = load_schema()
+        if doc_id not in schema.get("x-documents", {}):
+            schema = _declared_documents().get(doc_id, schema)
+    documents = schema.get("x-documents", {"runhmd.verdict/1": "#"})
     if doc_id not in documents:
-        return ["/: document must be an object whose 'schema' is one of %s (got %r)" % (sorted(documents), doc_id)]
+        known = documents if explicit else _declared_documents()
+        return ["/: document must be an object whose 'schema' is one of %s (got %r)" % (sorted(known), doc_id)]
     errors = []
-    _check(doc, _resolve(documents[doc_id], schema), schema, "", errors)
+    node, node_root = _resolve(documents[doc_id], schema)
+    _check(doc, node, node_root, "", errors)
     if errors:
         return errors
     return _INVARIANTS[doc_id](doc)
@@ -329,7 +367,7 @@ def _main(argv):
         sys.stderr.write("/: not valid JSON: %s\n" % exc)
         return 1
     try:
-        errors = validate(doc, schema)
+        errors = validate(doc, schema if schema_path else None)
     except SchemaError as exc:
         sys.stderr.write("runhmd_schema: unusable schema: %s\n" % exc)
         return 2
