@@ -38,6 +38,19 @@ export default defineConfig({
           // other test holds open (~2.6s, the keepalive-reconnect test) and
           // short enough to observe twice inside one test's budget.
           RELAY_STREAM_MAX_LIFETIME_MS: "8000",
+          // Pair-by-session-code config (src/code-pair.ts's codePairingConfig): all three
+          // must be set or every code-pairing route answers 503. Test-only placeholders on
+          // the same terms as RELAY_SIGNING_SECRET above -- obviously fake, never a real
+          // credential. The client id here is NOT the project's real (public) one in
+          // wrangler.toml: test/code-pair.spec.ts's fake GitHub checks the id the relay puts
+          // in the URL and the Basic auth it sends against whatever this binding says.
+          GITHUB_CLIENT_ID: "Iv-test-client-id-not-real",
+          GITHUB_CLIENT_SECRET: "test-only-github-client-secret-not-real",
+          RELAY_IDENTITY_SECRET: "test-only-relay-identity-secret-not-real",
+          // The seam src/github.ts reads: every GitHub call goes to this origin. The suite
+          // answers it itself (test/code-pair-helpers.ts's FakeGitHub), so no test ever
+          // reaches the real api.github.com. Production and local dev bind nothing.
+          GITHUB_API_BASE: "https://github-api.test",
         },
       },
     }),

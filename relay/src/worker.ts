@@ -1,14 +1,27 @@
 // Top-level Worker entry point: routes `/pair/init` (unauthenticated per
 // spec §2 — nobody has a credential yet) and forwards a session's PUBLIC
-// surface (`stream`, `frames`, `ws`, `revoke`) to that session's Durable
+// surface (`stream`, `frames`, `ws`, `revoke`, `code`) to that session's Durable
 // Object, which is the sole owner of the session's state (spec §1). Any
 // other `/session/<uuid>/*` subpath — including the Durable Object's own
 // internal `/init` handler — is rejected here and never reaches the
 // Durable Object; see PUBLIC_SESSION_SUBPATHS below. `GET /health` is the one
 // other unauthenticated route: the Worker answers it itself, first, and it
 // never reaches a Durable Object (src/health.ts).
+//
+// Pair-by-session-code adds three routes the Worker answers itself —
+// `POST /identity/github`, `POST /identity/github/revoke`, `POST /pair/code`
+// (src/code-pair.ts) — and the session subpath `code`, where hmd registers a
+// window. All four answer 503 `code pairing disabled` unless the GitHub App's
+// config is set; the QR flow never depends on it.
 
 import type { Env } from "./types";
+import {
+  codePairConfig,
+  disabledResponse,
+  handleIdentityGithub,
+  handleIdentityRevoke,
+  handlePairCode,
+} from "./code-pair";
 import { handleHealth } from "./health";
 import { jsonResponse } from "./http";
 import { PAIR_INIT_RETRY_AFTER_S } from "./pairing";
@@ -28,7 +41,12 @@ const SESSION_ID_RE =
 // unauthenticated caller who merely knew/guessed a session_id re-mint its
 // pairing_code and invalidate the real one (see
 // test/trace/mutants-pairing.spec.ts's regression test for this).
-const PUBLIC_SESSION_SUBPATHS = new Set(["stream", "frames", "ws", "revoke"]);
+//
+// `code` is hmd registering a code window (pair-by-session-code, spec 6.2); it is
+// authenticated by the session's own bearer inside the Durable Object, like `frames` and
+// `revoke`. The index and release handlers it feeds (`code-release`, `index-*`, `bucket`)
+// are internal in exactly the way `init` is, and stay out of this set for the same reason.
+const PUBLIC_SESSION_SUBPATHS = new Set(["stream", "frames", "ws", "revoke", "code"]);
 
 const SESSION_PATH_RE = /^\/session\/([^/]+)\/([^/]+)$/;
 
@@ -45,6 +63,15 @@ export default {
     if (request.method === "POST" && url.pathname === "/pair/init") {
       return handlePairInit(request, env);
     }
+    if (request.method === "POST" && url.pathname === "/identity/github") {
+      return handleIdentityGithub(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/identity/github/revoke") {
+      return handleIdentityRevoke(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/pair/code") {
+      return handlePairCode(request, env);
+    }
 
     const match = SESSION_PATH_RE.exec(url.pathname);
     if (match) {
@@ -56,6 +83,8 @@ export default {
       if (!PUBLIC_SESSION_SUBPATHS.has(subPath)) {
         return jsonResponse(404, { error: "not found" });
       }
+      // Before the session is touched: with code pairing off, `code` is not a route here.
+      if (subPath === "code" && codePairConfig(env) === null) return disabledResponse();
       const id = env.SESSION.idFromName(sessionId);
       const stub = env.SESSION.get(id);
       const forwardUrl = new URL(request.url);

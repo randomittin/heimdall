@@ -28,6 +28,22 @@ export interface Env {
    *  RELAY_KEEPALIVE_MS above — vitest-only, absent in wrangler.toml, not a
    *  secret. */
   RELAY_STREAM_MAX_LIFETIME_MS?: string;
+  /** Pair-by-session-code (src/code-pair.ts). The public client id of the project's GitHub
+   *  App: a `[vars]` entry in wrangler.toml, not a secret. Optional in the type because
+   *  all three of this and the two below must be set for code pairing to run; any one
+   *  unset or empty and every code-pairing route answers 503 `code pairing disabled`. */
+  GITHUB_CLIENT_ID?: string;
+  /** The GitHub App's client secret, a Workers secret (`wrangler secret put`). Used only
+   *  as the Basic-auth half of the check-token and delete-token calls (src/github.ts). */
+  GITHUB_CLIENT_SECRET?: string;
+  /** HMAC key of the gh_assertion (src/pairing.ts's mintGhAssertion), a Workers secret,
+   *  distinct from RELAY_SIGNING_SECRET so the two token kinds can never stand in for each
+   *  other. */
+  RELAY_IDENTITY_SECRET?: string;
+  /** Optional origin every GitHub call is sent to, default `https://api.github.com`.
+   *  Declared nowhere in wrangler.toml: only the vitest suite binds it, to point the relay
+   *  at its fake GitHub. Not a secret. */
+  GITHUB_API_BASE?: string;
 }
 
 /** "relay" is not in the spec's sender enum — it is used only for the two
@@ -40,7 +56,8 @@ export type FrameType =
   | "ack"
   | "device_bound"
   | "session_ended"
-  | "keepalive";
+  | "keepalive"
+  | "key_reveal";
 
 /**
  * The wire envelope (spec §2.3). `nonce`/`ciphertext` are null for the three
@@ -84,6 +101,16 @@ export interface DeviceBoundToPhonePayload {
 export interface DeviceBoundToHmdPayload {
   device_pubkey: string; // whatever encoding the phone sent verbatim, forwarded unchanged
   bound_at: number; // epoch seconds
+  /** How the phone got the pairing code it claimed with: a released code window, or the QR.
+   *  `code` is what tells hmd to send `key_reveal` and ask the laptop user to approve the SAS
+   *  before it seals anything (spec 5.5). Absent on a relay that predates pair-by-code, which
+   *  a client reads as `qr`. */
+  via: "code" | "qr";
+  /** `via: "code"` only. What the phone called itself when it asked for the window --
+   *  validated, but the phone's own claim and never proof of anything. */
+  device_label?: string;
+  /** `via: "code"` only. The GitHub login the phone's assertion proved. */
+  gh_login?: string;
 }
 
 /** Payload of the `keepalive` control frame the relay writes into hmd's
@@ -149,7 +176,8 @@ export function isEnvelope(value: unknown): value is Envelope {
       v.type === "command" ||
       v.type === "ack" ||
       v.type === "device_bound" ||
-      v.type === "session_ended") &&
+      v.type === "session_ended" ||
+      v.type === "key_reveal") &&
     (v.nonce === null || typeof v.nonce === "string") &&
     (v.ciphertext === null || typeof v.ciphertext === "string")
   );
@@ -175,11 +203,30 @@ export function isDeviceFrame(value: unknown): value is Envelope {
  *
  * `state` and `ack` are the set — `send_hmd_frame` in
  * `bin/heimdall-relay-client` is the single call site on that side and passes
- * only those two. Symmetric to `isDeviceFrame`: holding hmd's bearer token
- * must not let a caller mint a control frame the relay itself owns, nor
- * impersonate the device on the leg that feeds the phone.
+ * only those two — plus a plaintext `key_reveal` (see `isKeyReveal`), which
+ * hmd sends once, after a bind that came through a code window. Symmetric to
+ * `isDeviceFrame`: holding hmd's bearer token must not let a caller mint a
+ * control frame the relay itself owns, nor impersonate the device on the leg
+ * that feeds the phone.
  */
 export function isHmdFrame(value: unknown): value is Envelope {
   if (!isEnvelope(value)) return false;
-  return value.sender === "hmd" && (value.type === "state" || value.type === "ack");
+  if (value.sender !== "hmd") return false;
+  if (value.type === "state" || value.type === "ack") return true;
+  return isKeyReveal(value);
+}
+
+/**
+ * `key_reveal` (INV-44): hmd's public key and the nonce its commitment was made with, sent to
+ * the phone in the clear after a bind that came through a code window (pair-by-session-code,
+ * spec 5.5). It is the only hmd->phone frame type that carries a plaintext `payload`, so it is
+ * held to exactly that: no `nonce`, no `ciphertext`, a `payload` that is an object. What is in
+ * the payload is not the relay's to read -- the phone checks it against the commitment it was
+ * given before the key was known -- and `isDeviceFrame` still refuses the type from the phone.
+ */
+function isKeyReveal(value: Envelope): boolean {
+  if (value.type !== "key_reveal") return false;
+  if (value.nonce !== null || value.ciphertext !== null) return false;
+  const payload: unknown = value.payload;
+  return typeof payload === "object" && payload !== null && !Array.isArray(payload);
 }

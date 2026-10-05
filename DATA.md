@@ -96,6 +96,33 @@ State lives locally and is read without a server round-trip:
 **OFF is enforced client-side as a stat-only no-op** — a cron/hook cannot leak a beat
 around the toggle.
 
+### Does `hmd` commit `team.json`? — and the off switch
+
+The team secret file is a **repository-mutation** surface as well as a network one. In a
+repo `hmd` can *prove* is private (authenticated `gh`), `hmd team` — and the SessionStart
+`hmd team auto` step — force-adds `<repo>/.heimdall/team.json` and makes one **local** commit
+(never a push), so a teammate's clone auto-joins. A public or unprovable repo is never
+committed to: the file is gitignored instead (`bin/heimdall-team`: `commit_team`).
+
+To keep the secret out of git history entirely, switch the commit off:
+
+| Switch | Effect |
+|---|---|
+| `HMD_TEAM_NO_COMMIT=1` | this process / shell |
+| `touch ~/.heimdall/no-team-commit` | persistent, machine-wide (`rm` it to restore) |
+
+With either on, `team.json` is **still written and kept current on disk** (`new`, `join`,
+`rotate`, `auto` — presence works exactly as before) but is **never staged or committed**:
+not by `hmd team new|share|rotate|auto|<bare>`, and not by the blanket `git add -A` inside
+`bin/heimdall-wip-commit`'s mid-task checkpoints (it backs `team.json` out of the index; the
+edit stays on disk as a pending change). Any value other than empty / `0` / `false` / `no` /
+`off` turns the switch on — fail-safe, so a typo can never commit a secret. An untracked
+`team.json` is added to your clone's local `.git/info/exclude` (never the shared
+`.gitignore`) so a blanket `git add` cannot sweep it in either. One limit: a `team.json`
+that is **already tracked** stays tracked — `git rm --cached .heimdall/team.json` stops that.
+Without the commit a clone no longer carries the file, so grow the team with `hmd invite`.
+Proof: `test/heimdall-team-no-commit.test.sh`.
+
 ### Presence never sends
 
 Source code · file contents · full file paths (only the current *filename* is ever
