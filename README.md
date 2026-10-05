@@ -125,7 +125,7 @@ Full data contract and every field collected: [DATA.md](DATA.md).
 
 ## Get a bot PR on your repo
 
-`rr` is the same gate, run in the cloud: a bot that fixes your GitHub issues and opens a PR whose fix has already passed a check the agent never wrote. The bot opens it on a `heimdall/*` branch **as a scoped GitHub App** — never as you, never on `main`, and it never self-merges. A human always gates the merge: `test/no-auto-merge.test.sh` fails if any shipped code path merges or deploys without an explicit human action. Setup, the isolation oracle and the bring-up notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#get-a-bot-pr-on-your-repo).
+`rr` is the same gate, run in the cloud: a bot that fixes your GitHub issues and opens a PR whose fix has already passed a check the agent never wrote. The bot opens it on a `heimdall/*` branch **as a scoped GitHub App** — never as you, never on `main`, and it never self-merges. A human always gates the merge: `test/no-auto-merge.test.sh` fails if any shipped code path merges, pushes or deploys without a classified human trigger. It also prints, on every run, the places where shipped agent instructions (the maintainer guide, the incident responder) tell an agent to release or deploy with no confirmation step: known gaps that wait for an operator decision, not accepted silently. Setup, the isolation oracle and the bring-up notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#get-a-bot-pr-on-your-repo).
 
 ## Running on your own work
 
