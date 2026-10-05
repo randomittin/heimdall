@@ -43,6 +43,13 @@ RESULTS_JSONL="$BENCH_DIR/results.jsonl"
 RESULTS_MD="$BENCH_DIR/results.md"
 HEIMDALL_BIN="$BIN_DIR/heimdall"
 
+# ── false-green suite (RP4): validate | run | summarize --suite false-green ──
+# Its own harness (bin/lib/fg_bench.py) owns these subcommands and their flags; the raw-vs-heimdall
+# suite below is untouched. Preregistration: evals/benchmark/false-green/PREREG.md.
+case "${1:-}" in
+  validate|run|summarize) exec python3 "$BIN_DIR/lib/fg_bench.py" "$@" ;;
+esac
+
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
 
 # ── Args ──
