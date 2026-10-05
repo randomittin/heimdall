@@ -781,16 +781,23 @@ export class SessionDO {
     });
   }
 
-  /** hmd's laptop leg: long-lived chunked-HTTP GET carrying newline-delimited
-   * JSON envelopes (device-originated `command` frames) up to hmd.
+  /** hmd's laptop leg: `GET /stream`, carrying device-originated `command`
+   * frames (and the relay's own control frames) up to hmd, in one of two
+   * transports chosen by the request alone. WITHOUT an `Upgrade` header it is
+   * the original long-lived chunked response of newline-delimited JSON
+   * envelopes, which is also what every client that predates the WebSocket
+   * gets. WITH `Upgrade: websocket` it is a hibernatable WebSocket
+   * (`acceptHmdSocket`). Auth is the same bearer check on both, and happens
+   * first — a refusal is an ordinary JSON response, never an upgrade.
    *
-   * Reopening this is routine, not exceptional: the stream is expected to be
-   * cut periodically (see KEEPALIVE_INTERVAL_MS) and hmd reconnects with
-   * backoff. A reconnect supersedes whatever stream was open before — that
-   * one is closed here rather than left as a ReadableStream nobody will read
-   * or finish. Dropping this leg never touches the session: the phone stays
-   * bound and connected, and only `POST /revoke` (or pairing expiry before a
-   * bind) ends things. */
+   * Reopening this is routine, not exceptional: the NDJSON stream is expected
+   * to be cut periodically (see KEEPALIVE_INTERVAL_MS) and hmd reconnects with
+   * backoff. A reconnect supersedes whatever hmd leg was open before, on either
+   * transport — an NDJSON stream is closed here rather than left as a
+   * ReadableStream nobody will read or finish, an hmd WebSocket is closed with
+   * 4002 — so there is never more than one live. Dropping this leg never
+   * touches the session: the phone stays bound and connected, and only `POST
+   * /revoke` (or pairing expiry before a bind) ends things. */
   private async handleStream(request: Request): Promise<Response> {
     const record = await this.loadRecord();
     if (!record) return jsonResponse(404, { error: "session not found" });
@@ -802,7 +809,11 @@ export class SessionDO {
     // old stream and installing the new one.
     const pending = await this.ctx.storage.get<string>(PENDING_HMD_CONTROL_KEY);
 
+    if (isWebSocketUpgrade(request)) return this.acceptHmdSocket(record.session_id, pending);
+
     this.closeHmdStream();
+    // Newest wins across transports: an hmd WebSocket still attached is ended too.
+    this.closeHmdSockets(CLOSE_SUPERSEDED, "superseded");
 
     const owner = this;
     const generation = ++this.hmdStreamGeneration;
@@ -828,10 +839,54 @@ export class SessionDO {
     if (pending !== undefined && this.writeToHmdStream(pending)) {
       await this.ctx.storage.delete(PENDING_HMD_CONTROL_KEY);
     }
+    logEvent("hmd_stream_open", { session_id: record.session_id, transport: "ndjson" });
     return new Response(stream, {
       status: 200,
       headers: { "content-type": "application/x-ndjson", ...SECURITY_HEADERS },
     });
+  }
+
+  /**
+   * hmd's leg as a hibernatable WebSocket (`GET /stream` with `Upgrade:
+   * websocket`; the bearer was checked by `handleStream`). Every message the
+   * relay sends hmd on it is one envelope as a text message — byte-identical to
+   * the NDJSON line without its newline — and the wire is pinned in
+   * relay/contract/wire.json's `stream_ws`.
+   *
+   * What makes it worth having is what it does NOT do. No response body is held
+   * open, no `setTimeout` or `setInterval` is armed — no keepalive, no
+   * lifetime — and nothing about the socket is cached on the instance, so the
+   * object hibernates between events and the duration meter stops. Everything
+   * this needs to find the socket again after a wake is on the socket itself
+   * (its tag, and `{ gen, sid }` on its attachment).
+   *
+   * `pending` is the held `device_bound`, read by the caller before any socket
+   * is swapped. It is the first message hmd gets, and leaves storage only once
+   * it was actually sent: a send that failed keeps it for the next connection.
+   */
+  private async acceptHmdSocket(sessionId: string, pending: string | undefined): Promise<Response> {
+    // Newest wins across transports: an NDJSON stream still open is ended.
+    this.closeHmdStream();
+
+    const generation = this.nextGeneration(HMD_TAG);
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    this.ctx.acceptWebSocket(server, [HMD_TAG]);
+    const attachment: HmdSocketAttachment = { gen: generation, sid: sessionId };
+    server.serializeAttachment(attachment);
+    // The older hmd sockets are ended right here, the rule an NDJSON open has
+    // always applied to the stream it replaces. (The phone leg waits for a
+    // delivered frame instead — see supersedeOlderSockets — because the app can
+    // open a duplicate upgrade and discard it; hmd opens its leg once, on
+    // purpose, from one reconnect loop.)
+    this.supersedeOlderSockets(HMD_TAG, generation);
+
+    if (pending !== undefined && this.sendToHmdSocket(server, pending)) {
+      await this.ctx.storage.delete(PENDING_HMD_CONTROL_KEY);
+    }
+    logEvent("hmd_stream_open", { session_id: sessionId, transport: "ws" });
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   /** hmd's laptop leg: POST of one envelope (`state` or `ack`) to forward to
@@ -885,7 +940,7 @@ export class SessionDO {
       await this.storeLastHmdState(envelope);
     }
 
-    const target = this.liveDeviceSocket();
+    const target = this.liveSocket(DEVICE_TAG);
     if (!target) {
       logEvent("frame_undelivered", {
         session_id: record.session_id,
@@ -895,37 +950,40 @@ export class SessionDO {
     }
     target.send(JSON.stringify(envelope));
     // Only now — with a frame actually on its way to a known-live socket —
-    // is it safe to end the older ones. See supersedeOlderDeviceSockets.
-    this.supersedeOlderDeviceSockets(target);
+    // is it safe to end the older ones. See supersedeOlderSockets.
+    this.supersedeOlderSockets(DEVICE_TAG, socketGeneration(target));
     return jsonResponse(200, { ok: true, delivered: true });
   }
 
-  /** Every device socket still attached to this session, highest generation
-   *  first. Re-derived from `getWebSockets` on every call — see
-   *  `DeviceSocketAttachment` for why none of this may be cached on the
-   *  instance. */
-  private deviceSocketsNewestFirst(): { socket: WebSocket; gen: number }[] {
+  /** Every socket still attached to this session under `tag` (the phone's or
+   *  hmd's), highest generation first. Re-derived from `getWebSockets` on every
+   *  call — see `DeviceSocketAttachment` for why none of this may be cached on
+   *  the instance. */
+  private socketsNewestFirst(tag: string): { socket: WebSocket; gen: number }[] {
     return this.ctx
-      .getWebSockets(DEVICE_TAG)
-      .map((socket) => ({ socket, gen: deviceSocketGeneration(socket) }))
+      .getWebSockets(tag)
+      .map((socket) => ({ socket, gen: socketGeneration(socket) }))
       .sort((a, b) => b.gen - a.gen);
   }
 
   /** The generation to stamp on the socket being accepted right now: one
-   *  above every socket currently attached. A socket that has left the set
-   *  can never rejoin it, so "highest still attached, plus one" is all the
-   *  monotonicity the comparisons below need — and it costs no storage write
-   *  on the connect path. */
-  private nextDeviceGeneration(): number {
+   *  above every socket currently attached under `tag`. A socket that has left
+   *  the set can never rejoin it, so "highest still attached, plus one" is all
+   *  the monotonicity the comparisons below need — and it costs no storage
+   *  write on the connect path. */
+  private nextGeneration(tag: string): number {
     let highest = 0;
-    for (const { gen } of this.deviceSocketsNewestFirst()) {
+    for (const { gen } of this.socketsNewestFirst(tag)) {
       if (gen > highest) highest = gen;
     }
     return highest + 1;
   }
 
   /**
-   * The device socket to deliver to: the newest one that is open.
+   * The socket to deliver to under `tag`: the newest one that is open. The
+   * account below is the phone leg's, where it was learned the hard way; hmd's
+   * WebSocket leg uses the same ranking for the same reasons, and the same
+   * helpers.
    *
    * Two live failures are pinned here, and the second is why generations
    * exist at all.
@@ -956,40 +1014,37 @@ export class SessionDO {
    * phone connected last — and it says it just as well after a hibernation
    * wake, since it lives on the socket rather than on this instance.
    */
-  private liveDeviceSocket(): WebSocket | undefined {
-    return this.deviceSocketsNewestFirst().find(
+  private liveSocket(tag: string): WebSocket | undefined {
+    return this.socketsNewestFirst(tag).find(
       (entry) => entry.socket.readyState === WebSocket.OPEN
     )?.socket;
   }
 
   /**
-   * Ends every device socket older than the one now known to be live — the
-   * phone leg's counterpart to `closeHmdStream` (which `handleStream` has
-   * always called for exactly this reason on hmd's leg): one session, one
-   * live device socket, newest wins.
+   * Ends every socket under `tag` older than generation `liveGen` — the
+   * socket-leg counterpart to `closeHmdStream` (which `handleStream` has
+   * always called for exactly this reason on hmd's NDJSON leg): one session,
+   * one live socket per leg, newest wins. A socket that is already closing or
+   * gone is skipped by `closeSocket` — either way it is not the live socket any
+   * more, which is all this needs to guarantee.
    *
-   * Deliberately driven by delivery rather than by `acceptDeviceSocket`. An
-   * accept only proves a socket was *offered*; a delivered frame proves which
-   * socket is being used. Closing on the accept is what let a discarded
-   * duplicate upgrade take the app's real socket down with it (see
-   * `liveDeviceSocket`), and nothing needs it earlier: delivery already
-   * refuses to target anything but the newest open socket, so a lingering
-   * older one is untidy, never wrong.
+   * On the phone leg this is deliberately driven by delivery rather than by
+   * `acceptDeviceSocket`. An accept only proves a socket was *offered*; a
+   * delivered frame proves which socket is being used. Closing on the accept is
+   * what let a discarded duplicate upgrade take the app's real socket down with
+   * it (see `liveSocket`), and nothing needs it earlier: delivery already
+   * refuses to target anything but the newest open socket, so a lingering older
+   * one is untidy, never wrong. hmd's leg calls it at its accept instead
+   * (`acceptHmdSocket`).
    *
    * Close code 4002 is deliberately distinct from `handleRevoke`'s 4001 —
    * this session is emphatically NOT over, and a client that conflated the
    * two would stop reconnecting after a routine network change.
    */
-  private supersedeOlderDeviceSockets(live: WebSocket): void {
-    const liveGen = deviceSocketGeneration(live);
-    for (const { socket, gen } of this.deviceSocketsNewestFirst()) {
+  private supersedeOlderSockets(tag: string, liveGen: number): void {
+    for (const { socket, gen } of this.socketsNewestFirst(tag)) {
       if (gen >= liveGen) continue;
-      try {
-        socket.close(4002, "superseded");
-      } catch {
-        // Already closing or gone — either way it is not the live socket
-        // any more, which is all this needs to guarantee.
-      }
+      this.closeSocket(socket, CLOSE_SUPERSEDED, "superseded");
     }
   }
 
