@@ -25,8 +25,9 @@
 #   4. TAG + GitHub RELEASE (only AFTER R9 passes — release only verified-clean history):
 #      git tag vX.Y.Z, push the tag, publish a Release whose notes are DERIVED from this
 #      repo's conventional commits (bin/generate-changelog), attach the minisign signature.
-#   5. NPM PUBLISH — publish the npx wrapper (packages/runheimdall) to the registry, so
-#      `npx runheimdall` resolves to the version this ship just cut. Publishing used to live
+#   5. NPM PUBLISH — publish the npx wrappers (packages/runheimdall AND packages/runhmd: one
+#      release, two npm names, one shared install.sh pin) to the registry, so `npx runheimdall`
+#      and `npx runhmd` resolve to the version this ship just cut. Publishing used to live
 #      OUTSIDE this script as a human step, and the human forgot: npm sat at 2.0.5 while the
 #      plugin shipped 2.2.6. Same disease as the orphaned Releases, same cure.
 #
@@ -53,10 +54,13 @@ set -euo pipefail
 
 # ── Config (edit if the repo's facts change) ─────────────────────────────────
 BRANCH="main"
-# The npx wrapper published to npm. Its package.json version is NOT a second source of truth:
-# release/sync-release.sh re-points it FROM the plugin manifest on every release sync, and
-# publish_npm refuses to publish if the two ever disagree.
-NPM_PKG_DIR="packages/runheimdall"
+# The npx wrappers published to npm: ONE release, TWO package names, one shared install.sh pin —
+# packages/runheimdall (installs hmd) and packages/runhmd (the same verified install, then
+# `hmd attack <path>`). Neither package.json version is a second source of truth:
+# release/sync-release.sh re-points BOTH FROM the plugin manifest on every release sync, and
+# publish_npm refuses to publish if either ever disagrees. runheimdall is first, so it is the
+# default package for every helper below that is called without a package argument.
+NPM_PKG_DIRS="packages/runheimdall packages/runhmd"
 # The author/committer identity allowlist is NOT duplicated here — R9 (b) below
 # delegates to bin/heimdall-check-identities, the single source of truth shared
 # with the native pre-push hook, so the release gate and pre-push gate can never
@@ -339,10 +343,10 @@ render_version_surfaces() {
 }
 
 # sync_release_artifacts — re-point the TAG-derived artifacts at $1 via release/sync-release.sh:
-# the npx wrapper (packages/runheimdall/package.json version/tag/url/sha256), and the vanity
-# 302 targets (vercel.json, _redirects). That script also ASSERTS the wrapper's baked sha256
-# equals the digest of the install.sh this tag will serve, so `npx runheimdall` and
-# runheimdall.dev/install provably resolve to byte-identical bytes.
+# the npx wrappers (packages/runheimdall AND packages/runhmd: package.json version/tag/url/sha256),
+# and the vanity 302 targets (vercel.json, _redirects). That script also ASSERTS each wrapper's baked
+# sha256 equals the digest of the install.sh this tag will serve, so `npx runheimdall`, `npx runhmd`
+# and runheimdall.dev/install provably resolve to byte-identical bytes.
 #
 # This call is why the wrapper stopped drifting: sync-release.sh existed but NOTHING invoked
 # it, so the wrapper sat at v2.0.5 while the plugin shipped 2.2.6 — `npx runheimdall`
@@ -355,6 +359,7 @@ sync_release_artifacts() {
   bash "$sync" "$tag" || die "sync_release_artifacts: release/sync-release.sh $tag failed — artifacts would drift from the tag"
   git add "${REPO_ROOT:-$PWD}/packages/runheimdall/package.json" \
           "${REPO_ROOT:-$PWD}/packages/runheimdall/README.md" \
+          "${REPO_ROOT:-$PWD}/packages/runhmd/package.json" \
           "${REPO_ROOT:-$PWD}/vercel.json" \
           "${REPO_ROOT:-$PWD}/_redirects" \
           "${REPO_ROOT:-$PWD}/install.sh" \
@@ -375,11 +380,22 @@ sync_release_artifacts() {
 #   * be idempotent so a re-run converges               (already-published -> loud skip)
 #   * give the operator a recovery flag for drift that already exists   (--npm-only)
 
-npm_pkg_dir() { printf '%s' "${SHIP_NPM_DIR:-${REPO_ROOT:-$PWD}/$NPM_PKG_DIR}"; }
+# The published packages, one repo-relative dir per line. SHIP_NPM_DIR (the test seam) collapses
+# the set to ONE fixture dir, so the single-package unit cases keep working unchanged.
+npm_pkg_rels() {
+  if [ -n "${SHIP_NPM_DIR:-}" ]; then
+    printf '%s\n' "${NPM_PKG_DIRS%% *}"
+  else
+    printf '%s\n' $NPM_PKG_DIRS
+  fi
+}
 
-npm_pkg_field() {  # $1=field — read a top-level string field out of the wrapper's package.json
+# npm_pkg_dir [rel] — absolute dir of one wrapper (default: the first, runheimdall)
+npm_pkg_dir() { printf '%s' "${SHIP_NPM_DIR:-${REPO_ROOT:-$PWD}/${1:-${NPM_PKG_DIRS%% *}}}"; }
+
+npm_pkg_field() {  # $1=field [$2=rel] — read a top-level string field out of that wrapper's package.json
   local field="$1" file v
-  file="$(npm_pkg_dir)/package.json"
+  file="$(npm_pkg_dir "${2:-}")/package.json"
   [ -f "$file" ] || die "npm: $file not found — cannot resolve .$field"
   v="$(jq -r --arg f "$field" '.[$f] // empty' "$file" 2>/dev/null)" \
     || die "npm: could not parse $file (invalid JSON?)"
@@ -404,37 +420,42 @@ npm_version_published() {
 # print "✓ Shipped & verified" having published nothing. npm's stderr is REPRINTED, never
 # swallowed by 2>/dev/null, so the operator sees what the registry actually said.
 preflight_npm_prereqs() {
-  local dir pkg who out rc
+  local rel dir pkg who out rc
   command -v npm >/dev/null 2>&1 \
-    || die "npm not found — the npx wrapper cannot be published. Install Node/npm, or re-run with --no-npm to ship without publishing to npm."
+    || die "npm not found — the npx wrappers cannot be published. Install Node/npm, or re-run with --no-npm to ship without publishing to npm."
   command -v jq >/dev/null 2>&1 \
-    || die "jq not found — cannot read $NPM_PKG_DIR/package.json. Install it (brew install jq), or re-run with --no-npm."
-  dir="$(npm_pkg_dir)"
-  [ -f "$dir/package.json" ] || die "npm: $dir/package.json not found — there is nothing to publish."
-  pkg="$(npm_pkg_field name)"
+    || die "jq not found — cannot read the wrappers' package.json files ($NPM_PKG_DIRS). Install it (brew install jq), or re-run with --no-npm."
+  for rel in $(npm_pkg_rels); do
+    dir="$(npm_pkg_dir "$rel")"
+    [ -f "$dir/package.json" ] || die "npm: $dir/package.json not found — there is nothing to publish."
+  done
 
   # if-condition capture (set -e safe — see publish_release for why bare `out=$(...)` aborts).
   if ! who="$(npm whoami 2>&1)"; then
     rc=$?; printf '%s\n' "$who" >&2
-    die "npm is not authenticated (npm whoami exit $rc) — '$pkg' cannot be published. Run 'npm login', or re-run with --no-npm to ship without publishing to npm."
+    die "npm is not authenticated (npm whoami exit $rc) — the wrappers cannot be published. Run 'npm login', or re-run with --no-npm to ship without publishing to npm."
   fi
   ok "npm prereqs: authenticated as $who"
 
-  # Publish RIGHTS on the package. Only checkable when the package already exists — a package
+  # Publish RIGHTS on EACH package. Only checkable when the package already exists — a package
   # that is not on the registry yet is a first publish, which any authenticated user may do.
-  if npm view --prefer-online "$pkg" version >/dev/null 2>&1; then
-    if ! out="$(npm owner ls "$pkg" 2>&1)"; then
-      rc=$?; printf '%s\n' "$out" >&2
-      die "npm: could not read the owners of '$pkg' (npm owner ls exit $rc) — publish rights cannot be proven. See npm's output above."
+  for rel in $(npm_pkg_rels); do
+    pkg="$(npm_pkg_field name "$rel")"
+    if npm view --prefer-online "$pkg" version >/dev/null 2>&1; then
+      if ! out="$(npm owner ls "$pkg" 2>&1)"; then
+        rc=$?; printf '%s\n' "$out" >&2
+        die "npm: could not read the owners of '$pkg' (npm owner ls exit $rc) — publish rights cannot be proven. See npm's output above."
+      fi
+      if ! printf '%s\n' "$out" | grep -Fq "$who"; then
+        printf '%s\n' "$out" >&2
+        die "npm: '$who' is NOT an owner of '$pkg' — the publish would be REJECTED *after* the version bump commit was already made. Owners are listed above. Get publish rights, or re-run with --no-npm."
+      fi
+      ok "npm prereqs: '$who' has publish rights on '$pkg'"
+    else
+      warn "npm: '$pkg' is not on the registry yet — this would be its FIRST publish"
     fi
-    if ! printf '%s\n' "$out" | grep -Fq "$who"; then
-      printf '%s\n' "$out" >&2
-      die "npm: '$who' is NOT an owner of '$pkg' — the publish would be REJECTED *after* the version bump commit was already made. Owners are listed above. Get publish rights, or re-run with --no-npm."
-    fi
-    ok "npm prereqs: '$who' has publish rights on '$pkg'"
-  else
-    warn "npm: '$pkg' is not on the registry yet — this would be its FIRST publish"
-  fi
+    npm_default_command_notice "$rel"
+  done
 }
 
 # npm_positioning_notice — SURFACE an UNDECIDED §3 positioning, stay SILENT once it is decided.
@@ -447,36 +468,80 @@ preflight_npm_prereqs() {
 # never drift out of sync with a separate marker file. Decided → silent (no more crying wolf on
 # every ship); undecided → still loud. Decision history: .planning/A3-PENDING-POSITIONING.md.
 NPM_POSITIONING_TAGLINE="Nothing ships unproven."
-npm_positioning_notice() {
-  local dir desc
-  dir="$(npm_pkg_dir)"
+npm_positioning_notice() {  # [$1=rel]
+  local rel="${1:-${NPM_PKG_DIRS%% *}}" dir desc
+  dir="$(npm_pkg_dir "$rel")"
   desc="$(jq -r '.description // empty' "$dir/package.json" 2>/dev/null || true)"
   case "$desc" in
     *"$NPM_POSITIONING_TAGLINE"*) return 0 ;;   # §3 decided — publish the right words, say nothing
   esac
   warn "npm positioning is PENDING RJ's canonical §3 decision:"
-  warn "  .description / .keywords in $NPM_PKG_DIR/package.json are still pre-launch text."
+  warn "  .description / .keywords in $rel/package.json are still pre-launch text."
   warn "  npm versions are IMMUTABLE — publishing now means publishing AGAIN to fix the words."
   warn "  Decide first (candidates A/B/C): .planning/A3-PENDING-POSITIONING.md"
 }
 
-# publish_npm <version> — publish the npx wrapper at <version> to the registry.
+# npm_default_command_notice [rel] — SURFACE a wrapper whose default hmd command this tree does not
+# dispatch; stay SILENT otherwise (same contract as npm_positioning_notice). runhmd routes a bare
+# path to `hmd attack <path>`: a release whose bin/heimdall has no `attack` subcommand treats that
+# as a free-text task prompt and starts an agent session — and an npm version is immutable. A
+# WARN, not a die: shipping the rest of a release before `hmd attack` lands is the operator's
+# call, but it has to be a SEEN call. SHIP_HMD_BIN points the check at a fixture (test seam).
+npm_default_command_notice() {
+  local rel="${1:-${NPM_PKG_DIRS%% *}}" dflt name hmd_bin
+  dflt="$(jq -r '.heimdall.defaultCommand // empty' "$(npm_pkg_dir "$rel")/package.json" 2>/dev/null || true)"
+  [ -n "$dflt" ] || return 0
+  hmd_bin="${SHIP_HMD_BIN:-${REPO_ROOT:-$PWD}/bin/heimdall}"
+  if [ -f "$hmd_bin" ] && grep -Eq "^  ([a-z0-9-]+\|)*${dflt}(\|[a-z0-9-]+)*\)[[:space:]]*(#.*)?\$" "$hmd_bin"; then
+    return 0
+  fi
+  name="$(npm_pkg_field name "$rel")"
+  warn "$name routes a bare path to \`hmd $dflt\`, but bin/heimdall in this tree dispatches no '$dflt' subcommand:"
+  warn "  a release without it treats \`hmd $dflt <path>\` as a free-text task prompt and starts an agent session — and an npm version is IMMUTABLE."
+  warn "  Land \`hmd $dflt\` before publishing $name (--no-npm skips BOTH wrappers)."
+}
+
+# assert_npm_versions <version> — EVERY wrapper must already carry <version>. Checked for ALL of
+# them before ANY is published: discovering the second one stale after the first is on an immutable
+# registry is exactly the half-shipped state this exists to prevent.
+assert_npm_versions() {
+  local version="$1" rel have
+  for rel in $(npm_pkg_rels); do
+    have="$(npm_pkg_field version "$rel")"
+    [ "$have" = "$version" ] \
+      || die "npm: $rel/package.json is at $have but this ship is publishing $version — release/sync-release.sh did not re-point the wrapper. Refusing to publish a mismatched version."
+  done
+}
+
+# publish_npm_all <version> — publish every wrapper at <version>, runheimdall first.
+publish_npm_all() {
+  local version="$1" rel pkg
+  assert_npm_versions "$version"
+  for rel in $(npm_pkg_rels); do
+    pkg="$(npm_pkg_field name "$rel")"
+    step "npm publish (${pkg}@${version})"
+    publish_npm "$version" "$rel"
+    printf '\n%s%s✓ Published %s@%s%s — https://www.npmjs.com/package/%s\n' "$G" "$B" "$pkg" "$version" "$R" "$pkg"
+  done
+}
+
+# publish_npm <version> [rel] — publish ONE npx wrapper at <version> to the registry.
 # IDEMPOTENT by design, exactly like publish_release: a re-run after a partial ship must
 # converge, not error out ambiguously. We ask the registry FIRST rather than letting a
 # duplicate publish fail, because npm's own duplicate error (E403 "cannot publish over
 # previously published version") is indistinguishable at a glance from a real permissions
 # failure — so we say plainly which case this is.
 publish_npm() {
-  local version="$1" dir pkg pkg_version rc tries
-  dir="$(npm_pkg_dir)"
-  pkg="$(npm_pkg_field name)"
+  local version="$1" rel="${2:-${NPM_PKG_DIRS%% *}}" dir pkg pkg_version rc tries
+  dir="$(npm_pkg_dir "$rel")"
+  pkg="$(npm_pkg_field name "$rel")"
 
   # The manifest is the SOLE source of version truth; the wrapper's package.json is a rendered
   # surface that release/sync-release.sh re-points from it. If they disagree, the sync did not
   # run and publishing would put a mislabelled tarball on an immutable registry.
-  pkg_version="$(npm_pkg_field version)"
+  pkg_version="$(npm_pkg_field version "$rel")"
   [ "$pkg_version" = "$version" ] \
-    || die "npm: $NPM_PKG_DIR/package.json is at $pkg_version but this ship is publishing $version — release/sync-release.sh did not re-point the wrapper. Refusing to publish a mismatched version."
+    || die "npm: $rel/package.json is at $pkg_version but this ship is publishing $version — release/sync-release.sh did not re-point the wrapper. Refusing to publish a mismatched version."
 
   if npm_version_published "$pkg" "$version"; then
     warn "npm: ${pkg}@${version} is ALREADY published — skipping the publish (idempotent re-run)"
@@ -484,7 +549,7 @@ publish_npm() {
     return 0
   fi
 
-  npm_positioning_notice
+  npm_positioning_notice "$rel"
 
   # PUBLISH ON THE REAL TTY — deliberately NOT wrapped in $(...) capture (nor piped/tee'd).
   # WHY: RJ's npm 2FA is a passkey/WebAuthn (Apple Keychain). It produces NO typed TOTP code,
@@ -506,7 +571,7 @@ publish_npm() {
   if [ "$rc" -ne 0 ]; then
     die "npm publish failed (exit $rc) for ${pkg}@${version} — see npm's output above. The version bump is already committed and the Release is published; recover with:  release/ship.sh --npm-only"
   fi
-  ok "published ${pkg}@${version} to npm — 'npx runheimdall' now resolves to $version"
+  ok "published ${pkg}@${version} to npm — 'npx ${pkg}' now resolves to $version"
 
   # Post-publish readback — CONFIRM the write is visible on a read replica. This is NOT the
   # gate that catches a failed publish: a real publish failure already died above (npm publish
@@ -724,41 +789,58 @@ if [ "$DRY_RUN" -eq 1 ]; then
     elif ! command -v jq >/dev/null 2>&1; then
       warn "jq not found — a real run would HARD-FAIL in preflight (or use --no-npm)"
     else
-      DRY_NPM_DIR="$(npm_pkg_dir)"
-      DRY_NPM_PKG="$(npm_pkg_field name)"
-      DRY_NPM_PKGVER="$(npm_pkg_field version)"
-      printf '  package         : %s\n' "$DRY_NPM_PKG"
-      printf '  package dir     : %s\n' "$DRY_NPM_DIR"
-      printf '  publish version : %s\n' "$DRY_VERSION"
-      printf '  package.json ver: %s' "$DRY_NPM_PKGVER"
-      if [ "$DRY_NPM_PKGVER" = "$DRY_VERSION" ]; then
-        printf '  (matches)\n'
-      else
-        printf '  (release/sync-release.sh re-points this to %s during the bump)\n' "$DRY_VERSION"
-      fi
-      printf '  npm authed      : %s\n' "$(npm whoami 2>/dev/null || echo 'NO — a real run would HARD-FAIL in preflight')"
-      printf '  registry now at : %s\n' "$(npm view --prefer-online "$DRY_NPM_PKG" version 2>/dev/null || echo '<unreachable or unpublished>')"
-      if npm_version_published "$DRY_NPM_PKG" "$DRY_VERSION"; then
-        printf '  already on npm  : YES — a real run would SKIP the publish (idempotent)\n'
-      else
-        printf '  already on npm  : no — a real run would PUBLISH it\n'
-      fi
-
-      printf '  files allowlist :\n'
-      jq -r '.files[]? // empty' "$DRY_NPM_DIR/package.json" | while IFS= read -r f; do
-        if [ -e "$DRY_NPM_DIR/$f" ]; then
-          printf '    - %s (present)\n' "$f"
+      DRY_NPM_WHO="$(npm whoami 2>/dev/null || echo 'NO — a real run would HARD-FAIL in preflight')"
+      # One block per wrapper: name, version, the pinned install.sh tag + sha256, the files that
+      # would land in the tarball. A dry run that listed only one would let the other ship unseen.
+      for DRY_REL in $(npm_pkg_rels); do
+        DRY_NPM_DIR="$(npm_pkg_dir "$DRY_REL")"
+        DRY_NPM_PKG="$(npm_pkg_field name "$DRY_REL")"
+        DRY_NPM_PKGVER="$(npm_pkg_field version "$DRY_REL")"
+        DRY_PIN_TAG="$(jq -r '.heimdall.tag // empty' "$DRY_NPM_DIR/package.json" 2>/dev/null || true)"
+        printf '  package         : %s\n' "$DRY_NPM_PKG"
+        printf '  package dir     : %s\n' "$DRY_NPM_DIR"
+        printf '  publish version : %s\n' "$DRY_VERSION"
+        printf '  package.json ver: %s' "$DRY_NPM_PKGVER"
+        if [ "$DRY_NPM_PKGVER" = "$DRY_VERSION" ]; then
+          printf '  (matches)\n'
         else
-          printf '    - %s (MISSING — the tarball would not carry it)\n' "$f"
+          printf '  (release/sync-release.sh re-points this to %s during the bump)\n' "$DRY_VERSION"
         fi
+        printf '  pinned tag      : %s' "${DRY_PIN_TAG:-<none>}"
+        if [ "$DRY_PIN_TAG" = "$DRY_TAG" ]; then
+          printf '  (matches)\n'
+        else
+          printf '  (release/sync-release.sh re-points the pin to %s during the bump)\n' "$DRY_TAG"
+        fi
+        printf '  pinned sha256   : %s\n' "$(jq -r '.heimdall.sha256 // "<none>"' "$DRY_NPM_DIR/package.json" 2>/dev/null || echo '<unreadable>')"
+        printf '  npm authed      : %s\n' "$DRY_NPM_WHO"
+        printf '  registry now at : %s\n' "$(npm view --prefer-online "$DRY_NPM_PKG" version 2>/dev/null || echo '<unreachable or unpublished>')"
+        if npm_version_published "$DRY_NPM_PKG" "$DRY_VERSION"; then
+          printf '  already on npm  : YES — a real run would SKIP the publish (idempotent)\n'
+        else
+          printf '  already on npm  : no — a real run would PUBLISH it\n'
+        fi
+
+        printf '  files allowlist :\n'
+        jq -r '.files[]? // empty' "$DRY_NPM_DIR/package.json" | while IFS= read -r f; do
+          if [ -e "$DRY_NPM_DIR/$f" ]; then
+            printf '    - %s (present)\n' "$f"
+          else
+            printf '    - %s (MISSING — the tarball would not carry it)\n' "$f"
+          fi
+        done
+
+        npm_positioning_notice "$DRY_REL"
+        npm_default_command_notice "$DRY_REL"
+        printf '\n'
       done
 
-      step "Exact npm command that would run"
-      # Runs attached to the terminal (no $(...) capture) so npm's browser/web 2FA works for a
+      step "Exact npm commands that would run"
+      # Run attached to the terminal (no $(...) capture) so npm's browser/web 2FA works for a
       # passkey/WebAuthn account; --auth-type=web pins that flow. See publish_npm for the full why.
-      printf '  cd %s && npm publish --access public --auth-type=web\n' "$DRY_NPM_DIR"
-
-      npm_positioning_notice
+      for DRY_REL in $(npm_pkg_rels); do
+        printf '  cd %s && npm publish --access public --auth-type=web\n' "$(npm_pkg_dir "$DRY_REL")"
+      done
     fi
   fi
 
@@ -805,9 +887,8 @@ if [ "$NPM_ONLY" -eq 1 ]; then
   step "npm-only — publishing the version already in the manifest to npm"
   preflight_npm_prereqs
   NPM_ONLY_VERSION="$(read_version)"
-  publish_npm "$NPM_ONLY_VERSION"
-  printf '\n%s%s✓ npm reconciled to %s%s — https://www.npmjs.com/package/%s\n' \
-    "$G" "$B" "$NPM_ONLY_VERSION" "$R" "$(npm_pkg_field name)"
+  publish_npm_all "$NPM_ONLY_VERSION"
+  printf '\n%s%s✓ npm reconciled to %s%s\n' "$G" "$B" "$NPM_ONLY_VERSION" "$R"
   exit 0
 fi
 
@@ -991,9 +1072,6 @@ if [ -n "$TAG" ]; then
   # in preflight before anything was mutated, so reaching this point and failing to publish is
   # a hard, non-zero failure with a named recovery path — never a warn-and-exit-0.
   if [ "$DO_NPM" -eq 1 ]; then
-    step "npm publish ($(npm_pkg_field name)@$NEW_VERSION)"
-    publish_npm "$NEW_VERSION"
-    printf '\n%s%s✓ Published %s@%s%s — https://www.npmjs.com/package/%s\n' \
-      "$G" "$B" "$(npm_pkg_field name)" "$NEW_VERSION" "$R" "$(npm_pkg_field name)"
+    publish_npm_all "$NEW_VERSION"
   fi
 fi

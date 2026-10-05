@@ -1,0 +1,83 @@
+# The hmd subcommands `runhmd` passes straight through. Anything else - a path, a PR URL, a
+# flag - is a target for the default command: `runhmd <path>` runs `hmd attack <path>`.
+#
+# One word per line; blank lines and #-comments are ignored. Keep it in step with the top-level
+# dispatch in bin/heimdall: test/runhmd-parity.test.sh fails when a dispatched subcommand is
+# missing here (it would silently become `hmd attack <word>`), and when a listed word is neither
+# dispatched nor planned.
+
+# the default command, and its sibling - planned, not dispatched by every hmd release yet
+attack
+prove
+
+# dispatched by bin/heimdall, in dispatch order
+version
+help
+demo
+rr
+sigil
+sigil-png
+guard
+uninstall
+team
+invite
+join
+connect
+presence
+context
+chat
+link
+beat
+roster
+dashboard
+god
+telemetry
+init
+verdict
+sla
+badge
+metrics
+clip
+funnel
+watch
+rules
+route
+modules
+tier
+caveman
+volatile-repo-guard
+ui
+inbox
+app
+settings-guard
+hooks
+caveman-audit
+cost-forensics
+branch-context
+collision
+task
+land
+issue
+memory
+vm-bench
+caveman-eval
+web
+plan-verify
+metric-audit
+status
+cursor-statusline
+weekly-log
+report
+report-issue
+designmatch
+check
+redum
+authenticity-check
+queue
+quota-advisor
+529-scan
+delivery-audit
+unconnected
+wrap
+unwrap
+update

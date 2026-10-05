@@ -143,7 +143,8 @@ STRUCTURAL_ROWS='VERSION|bin/heimdall-render-version|"$ROOT/VERSION"|VERSION == 
 vercel.json|release/sync-release.sh|"$ROOT/vercel.json"|vercel.json /install redirect targets|"destination"[[:space:]]*:
 _redirects|release/sync-release.sh|"$ROOT/_redirects"|_redirects /install targets|^/install[[:space:]]
 install.sh|release/sync-release.sh|"$ROOT/install.sh"|install.sh DEFAULT_REF ==|local DEFAULT_REF=
-packages/runheimdall/package.json|release/sync-release.sh|"$ROOT/packages/runheimdall/package.json"|runheimdall package.json .version|"(version|tag|installScriptUrl|sha256)"[[:space:]]*:'
+packages/runheimdall/package.json|release/sync-release.sh|"$ROOT/packages/runheimdall/package.json"|runheimdall package.json .version|"(version|tag|installScriptUrl|sha256)"[[:space:]]*:
+packages/runhmd/package.json|release/sync-release.sh|"$ROOT/packages/runhmd/package.json"|runhmd package.json .version|"(version|tag|installScriptUrl|sha256)"[[:space:]]*:'
 
 # find_files <mode> <root> — see the header. published prunes dot-dirs AND scaffolding;
 # candidates prunes dot-dirs only, so the sweep can REPORT what its own exclusion removed

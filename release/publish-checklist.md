@@ -39,15 +39,24 @@ git push origin vX.Y.Z
 - [ ] `raw.githubusercontent.com/randomittin/heimdall/vX.Y.Z/install.sh` now resolves
       and its sha256 equals the digest `sync-release.sh` printed.
 
-## 3. Publish the npx wrapper
+## 3. Publish the npx wrappers (TWO packages, one pin)
+
+`release/ship.sh --dry-run` prints both (name, version, pinned tag + sha256, files, command)
+before anything is published. `runhmd` is a new npm name: its first publish claims it.
 
 ```
 cd packages/runheimdall
 jq -e . package.json                     # version == X.Y.Z, sha256 is 64-hex, url has the tag
 npm publish --access public              # RJ-EXECUTED — do not run from an agent
+cd ../runhmd
+jq -e . package.json                     # the SAME version, tag, url and sha256 as runheimdall
+npm publish --access public              # RJ-EXECUTED — do not run from an agent
 ```
 
 - [ ] `runheimdall@X.Y.Z` is live on npm, pinned to vX.Y.Z.
+- [ ] `runhmd@X.Y.Z` is live on npm, pinned to the same vX.Y.Z and the same install.sh digest.
+- [ ] The release you are publishing dispatches `hmd attack` (`ship.sh --dry-run` warns when it
+      does not): `npx runhmd <path>` routes a bare path to it.
 
 ## 4. Point the vanity redirect at the new tag
 
@@ -79,6 +88,6 @@ npm view runheimdall@X.Y.Z dist.tarball   # or inspect package.json heimdall.sha
 
 ## What stays queued as RJ-EXECUTED (never an agent)
 
-- `npm publish` of `runheimdall` (step 3)
+- `npm publish` of `runheimdall` and `runhmd` (step 3)
 - DNS / hosting deploy of the 302 redirect (step 4)
 - `git tag` creation + `git push origin vX.Y.Z` (step 2)
