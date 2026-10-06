@@ -21,6 +21,20 @@
 # adopted the feature is worthless exactly when it matters. Every list/status
 # assertion below therefore runs against a scratch --state this file creates.
 #
+# THIS SUITE OWNS ITS CONTROL PLANE, TOO. H1b, H3, H5 and H6's green arm drive the
+# REAL manifest through `add`, and its traffic-proxy `no-signed-traffic-routing`
+# invariant curls $HEIMDALL_DEFAULT_CP_URL/readyz and FAILS CLOSED on anything but
+# 200. Left at its baked-in default that is the LIVE production control plane, so
+# a dozen assertions here were statements about the internet: green only while it
+# answered, and red (add failed, no invariant record, the dropped-class arm never
+# completed, the restored manifest still failed) the moment it did not — or when
+# the ambient env pinned the default at a dead port, which test/lib/net-default-
+# guard.sh does on purpose for the presence corpus. The suite now serves /readyz
+# itself from a loopback stand-in (test/lib/hermetic-cp.sh, shared with
+# omniroute-module and module-consent-waiver). The manifest and the engine are
+# untouched, and H3b proves the add still FAILS CLOSED when that control plane is
+# unreachable, so supplying a reachable one is not a weakening.
+#
 # THE ABSENCE ASSERTIONS ARE KEPT, NOT DELETED — they are a real property. Install
 # can fail (no uv, no network, wrong Python) and an operator can decline outright,
 # so every invariant the manifest ships has to be green with the library absent; a
@@ -36,6 +50,8 @@
 # same bytes, so the proof is the same proof.
 #
 # Guarantees proved:
+#   CP  the control plane the add path probes is a loopback stand-in this file
+#       owns, and it is a real probe target (200 on /readyz, 404 everywhere else).
 #   H0  the manifest is valid JSON, covers the schema, and the temp copy the
 #       mutation arms use is byte-identical to the shipped file.
 #   H1  `hmd modules` lists headroom as AVAILABLE, and against a state root where
@@ -46,6 +62,9 @@
 #   H3  the add path runs BOTH classes' invariants with the module wired, and the
 #       recorded evidence proves the judgment falsifier really ran at 25/0 —
 #       twice, once for each class that consumes it.
+#   H3b FALSIFIER FOR THE STAND-IN — the SAME add with ONLY the control plane
+#       unreachable is REFUSED, names the invariant it could not verify, and
+#       leaves no receipt: an unreachable check fails closed, it never passes.
 #   H4  the storage-codec invariants are wired to the codec seam and the
 #       traffic-proxy ones to the gate falsifier, demonstrated WITHOUT installing
 #       Headroom.
@@ -98,6 +117,13 @@ trap 'rm -rf "$TMP"' EXIT
 # OWN behaviour is proven — on both sides, with explicit per-command values — in
 # test/module-preflight-wiring.test.sh, which is where that assertion belongs.
 export HMD_PREFLIGHT_DISK_FLOOR_MB=1
+
+# THE SAME RULE, APPLIED TO THE NETWORK — see "THIS SUITE OWNS ITS CONTROL PLANE"
+# in the header. Started before any add runs, and verified (CP section) before any
+# add result is read as a statement about the manifest.
+. "$SELF_DIR/lib/hermetic-cp.sh"
+hermetic_cp_start "$TMP" || exit 2
+hermetic_cp_selfcheck
 
 sha_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
@@ -273,6 +299,25 @@ else
   bad "no invariant record from the real add"
 fi
 "$MODS" --state "$ST" remove headroom >/dev/null 2>&1
+
+echo
+echo "H3b — FALSIFIER FOR THE STAND-IN: the SAME add with the control plane unreachable is REFUSED"
+# H3 is green against a control plane this file supplies. This is what keeps that from
+# reading as a weakening: ONE difference from H3 — the control plane the traffic-proxy
+# no-signed-traffic-routing invariant probes is a loopback port nothing listens on —
+# and the add must be REFUSED and unwound. An unreachable check fails closed; it never
+# passes (also proved on its own in test/cp-signed-no-rewriting-proxy.test.sh 4.6).
+NST="$TMP/state/cp-down"
+NOUT="$(env HEIMDALL_DEFAULT_CP_URL="$(hermetic_cp_dead_url)" "$MODS" --state "$NST" add headroom --yes 2>&1)"; NRC=$?
+[ "$NRC" -ne 0 ] \
+  && ok "RED ARM: the SAME add is REFUSED when the control plane is unreachable (exit $NRC)" \
+  || bad "add succeeded with an unreachable control plane — an unverifiable invariant PASSED"
+grep -q 'FAILED INVARIANT: no-signed-traffic-routing' <<<"$NOUT" \
+  && ok "the refusal names the invariant that could not be verified" \
+  || bad "the refusal did not name no-signed-traffic-routing: $(printf '%s\n' "$NOUT" | tail -8)"
+[ ! -f "$NST/headroom/receipt.json" ] \
+  && ok "nothing was left installed after the fail-closed refusal" \
+  || bad "a refused add left a receipt"
 
 echo
 echo "H4 — the invariants are wired to the repo's real falsifiers"
