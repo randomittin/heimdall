@@ -11,7 +11,8 @@
 # python3 is a pyenv shim every `python3` call paid a bash+pyenv version-resolution tax of 0.3-0.8 s under
 # load, and this suite makes thousands of them (every JSON field extraction, every sealed command, every poll
 # iteration of the refusal/ack waits, every fake relay and client start). That tax, not the protocol's own
-# timers, was most of the wall clock.
+# timers, was most of the wall clock. test/run-all.sh now pins it for every suite it runs; the same pin
+# (test/lib/py-pin.sh) is a no-op under run-all.sh and still engages when a suite is run standalone.
 
 set -u
 
@@ -23,6 +24,7 @@ UI="$REPO/bin/heimdall-ui"
 FAKE_RELAY="$REPO/test/lib/fake-relay.py"
 E2E_MOD="$REPO/bin/lib/hmd_relay_e2e.py"
 INBOX_LIB="$REPO/bin/lib/companion_ui_inbox.py"
+PY_PIN_LIB="$REPO/test/lib/py-pin.sh"
 
 PASS=0
 FAIL=0
@@ -34,7 +36,7 @@ skip() { N=$((N + 1)); SKIP=$((SKIP + 1)); printf '  SKIP %d. %s\n' "$N" "$1"; }
 
 echo "$RELAY_SUITE_TITLE"
 
-for f in "$RELAY_CLIENT" "$APP" "$HEIMDALL" "$UI" "$FAKE_RELAY" "$INBOX_LIB"; do
+for f in "$RELAY_CLIENT" "$APP" "$HEIMDALL" "$UI" "$FAKE_RELAY" "$INBOX_LIB" "$PY_PIN_LIB"; do
   if [ ! -e "$f" ]; then
     printf 'FATAL: required file missing: %s\n' "$f" >&2
     printf '\n0 passed, 1 failed\n'
@@ -60,18 +62,13 @@ export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 mkdir -p "$HOME/.claude"
 
 # ── python3 pin ──────────────────────────────────────────────────────────
-# Resolve the interpreter ONCE and put a one-line exec wrapper first on PATH. A wrapper, not a symlink: a
-# symlink would hide a venv's pyvenv.cfg (the interpreter finds it next to the path it was started by), and
-# a PATH entry for the interpreter's own bin dir would also expose every other tool installed beside it. The
-# wrapper execs the SAME interpreter python3 already resolved to, so nothing the suite imports changes; it
-# is only installed when python3 resolves through something else (a pyenv shim, the macOS xcrun stub).
-_REAL_PY="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null)"
-if [ -n "$_REAL_PY" ] && [ -x "$_REAL_PY" ] && [ "$_REAL_PY" != "$(command -v python3)" ]; then
-  mkdir -p "$TMPROOT/pybin"
-  printf '#!/bin/sh\nexec "%s" "$@"\n' "$_REAL_PY" > "$TMPROOT/pybin/python3"
-  chmod +x "$TMPROOT/pybin/python3"
-  export PATH="$TMPROOT/pybin:$PATH"
-fi
+# test/run-all.sh has already pinned the real interpreter for the suites it runs, in which case this call
+# changes nothing (no second resolve, no second wrapper). Run standalone, it does the same pin itself: one
+# resolve, a wrapper under $TMPROOT (removed by cleanup below) first on PATH. The how and the why live in
+# test/lib/py-pin.sh; HMD_TEST_NO_PY_PIN=1 opts out of both.
+# shellcheck source=py-pin.sh
+. "$PY_PIN_LIB"
+hmd_test_pin_python3 "$TMPROOT/pybin"
 
 
 PIDS=()

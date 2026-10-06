@@ -41,6 +41,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from importlib.util import module_from_spec, spec_from_file_location
 
@@ -118,10 +119,11 @@ def _read_trusted_json(path, cap):
 
 
 def _write_json_atomic(path, obj):
-    """Temp file, fsync, rename: 0600, never a half-written switch. A symlink at `path` is replaced, never followed."""
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    tmp = "%s.tmp-%d" % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Temp file, fsync, rename: 0600, never a half-written switch. A symlink at `path` is replaced, never followed.
+    The temp file is unique per call (mkstemp), so two threads setting one switch never share one."""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(obj, sort_keys=True, separators=(",", ":")))

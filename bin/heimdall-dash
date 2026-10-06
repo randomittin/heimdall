@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# heimdall-dash -- `hmd dash`, the laptop side of custom dashboards
+# (hmdapp docs/HANDOFF-TO-HEIMDALL-custom-dashboards.md DD4-DD6).
+#
+# Usage:
+#   hmd dash pending | ls | show | confirm | decline
+#   hmd dash connector add | ls | rm
+#   hmd dash run                      the producer loop (see below)
+#   hmd dash -h | --help              the module's own usage
+#
+# Every argument is forwarded verbatim to bin/lib/dashboard_producers.py, which owns the contract.
+# `confirm` and `connector add` refuse unless stdin is a terminal, so stdin is left exactly as the
+# caller had it: this script never reads or redirects it, and it ends in `exec`, so the module IS the
+# process.
+#
+# The repo is --repo, else $CLAUDE_PROJECT_DIR, else the git toplevel, else the cwd (the order `hmd app`
+# uses), so the tile the relay client stored is the tile this lists. The producer loop itself
+# (`hmd dash run`) is started by the relay client while `hmd app remote-dashboards` is on; run it by
+# hand only when no client is running.
+#
+# Interpreter: resolved through bin/lib/hmd-python.sh's hmd_python (cached, shim-avoiding), never a bare
+# `python3` -- same convention as heimdall-ui. It is resolved HERE, in this script's own process, and
+# not in the bin/heimdall dispatcher: an inline `. "$PLUGIN_DIR/bin/lib/hmd-python.sh"` in an arm that
+# follows the uninstall arm is the shape heimdall-landmine-lint class 5 (ORDER-DESTROY) flags.
+#
+# Exit: 1 producers module missing, 2 no python; otherwise the module's own (3 = another process owns
+# this repo's producer loop).
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+PRODUCERS="$LIB_DIR/dashboard_producers.py"
+
+if [ ! -r "$PRODUCERS" ]; then
+  echo "  Error: dashboard_producers.py not found at $PRODUCERS" >&2
+  echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+  exit 1
+fi
+
+PY3=""
+if [ -r "$LIB_DIR/hmd-python.sh" ]; then
+  # shellcheck source=lib/hmd-python.sh
+  . "$LIB_DIR/hmd-python.sh"
+  PY3="$(hmd_python 2>/dev/null || true)"
+fi
+if [ -z "$PY3" ]; then
+  echo "hmd dash needs a working python3 (none resolved by bin/lib/hmd-python.sh)." >&2
+  echo "Install python3, or set HMD_PYTHON=/path/to/python3, then re-run: hmd dash $*" >&2
+  exit 2
+fi
+
+has_repo=0
+for arg in "$@"; do
+  case "$arg" in --repo) has_repo=1 ;; esac
+done
+if [ "$has_repo" = 0 ]; then
+  top="${CLAUDE_PROJECT_DIR:-}"
+  [ -n "$top" ] || top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$top" ] || top="$(pwd)"
+  set -- --repo "$top" "$@"
+fi
+
+exec "$PY3" "$PRODUCERS" "$@"

@@ -58,6 +58,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -301,10 +302,11 @@ def write_config(home, enabled, pin=None, pin_next=False):
         raise ValueError("pin must be a 64-hex fingerprint")
     os.makedirs(home, mode=0o700, exist_ok=True)
     path = os.path.join(home, CONFIG_FILE)
-    tmp = "%s.tmp-%d" % (path, os.getpid())
     body = json.dumps({"enabled": bool(enabled), "pin": pin, "pin_next": bool(pin_next),
                        "updated_at": int(time.time())}, sort_keys=True, separators=(",", ":"))
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # A temp file of its own per call (mkstemp: unique, O_EXCL, 0600): the verifying session's thread and a command
+    # thread can both write this file, and one temp name per process let one rename pull it out from under the other.
+    fd, tmp = tempfile.mkstemp(dir=home, prefix=CONFIG_FILE + ".tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(body)
@@ -527,11 +529,16 @@ class LoginSession:
 
     def _write_pid_file(self):
         path = os.path.join(self.mgr.home, PID_FILE)
-        tmp = "%s.tmp-%d" % (path, os.getpid())
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"pid": self.proc.pid, "started_at": int(self.created)}, f)
-        os.replace(tmp, path)
+        # a temp file of its own per call (mkstemp: unique, O_EXCL, 0600), removed on any failure
+        fd, tmp = tempfile.mkstemp(dir=self.mgr.home, prefix=PID_FILE + ".tmp-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"pid": self.proc.pid, "started_at": int(self.created)}, f)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     def public(self):
         """state.login.request while this login is live: None until a validated URL exists."""
