@@ -46,6 +46,7 @@ done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/runhmd-wrapper-test.XXXXXX")"
 [ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
+# shellcheck disable=SC2329  # runs from the EXIT trap on the next line; shellcheck does not follow trap handlers
 cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
 trap cleanup EXIT
 mkdir -p "$WORK/tmp"
@@ -66,7 +67,7 @@ HMD_TEMPLATE="$WORK/hmd-template";      rf_make_hmd_template "$HMD_TEMPLATE"
 INSTALLER="$WORK/install-fixture.sh";   rf_make_installer "$INSTALLER"
 INSTALLER_SHA="$(rf_sha256 "$INSTALLER")"
 WRONG_SHA="$(rf_bend_digest "$INSTALLER_SHA")"
-NEAR_SHA="${INSTALLER_SHA%?}$(printf '%s' "${INSTALLER_SHA#${INSTALLER_SHA%?}}" | tr '0123456789abcdef' '1234567890badcfe')"
+NEAR_SHA="${INSTALLER_SHA%?}$(printf '%s' "${INSTALLER_SHA#"${INSTALLER_SHA%?}"}" | tr '0123456789abcdef' '1234567890badcfe')"
 UPPER_SHA="$(printf '%s' "$INSTALLER_SHA" | tr 'abcdef' 'ABCDEF')"
 
 PKG_VER="$(jq -r '.version // empty' "$PKG_DIR/package.json" 2>/dev/null || true)"

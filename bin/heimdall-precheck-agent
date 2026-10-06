@@ -201,6 +201,7 @@ if command -v jq >/dev/null 2>&1 && command -v date >/dev/null 2>&1 && command -
     # `declare -f` + `bash -c` -- one alarm bounds the whole sequence, not
     # each filesystem call individually, at zero added latency in the
     # success path (perl execs straight into it; no polling loop).
+    # shellcheck disable=SC2329  # never called in THIS shell: declare -f ships it into the guarded bash -c child below
     cap_body() {
       local dir="$1" ttl="$2" max="$3" now f ts age count id
       mkdir -p "$dir" 2>/dev/null || { echo "OPEN:mkdir"; return 1; }
