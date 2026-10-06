@@ -110,6 +110,9 @@ grep -q 'ASK.CAP_ASK' "$RC" && grep -q '_asks_overlay(self._dashboards_overlay' 
   && grep -q 'caps=self.device_caps' "$RC" && ok "relay client: cap listed, slice applied per phone, state re-sent when a result lands, phone caps passed to dispatch" \
   || bad "relay client wiring missing"
 grep -q '"asks"' "$RC" && ok 'the "asks" key is wired in bin/heimdall-relay-client' || bad 'no "asks" key wiring in the relay client'
+grep -q '^ASK = CONTROLS._sibling("companion_quick_ask")' "$RC" && ! grep -q '_load_module("companion_quick_ask"' "$RC" \
+  && ok "relay client: the asks module is the dispatcher's own instance (results live in its memory; a second copy would hold none)" \
+  || bad "relay client loads its own copy of companion_quick_ask: the phone would never see a result (see test/quick-ask-e2e.test.sh)"
 if grep -q '"asks"' "$REPO/sentinels/hmd-ui.py"; then bad 'hmd-ui carries an "asks" key: answers must never be in the base state'; else ok 'hmd-ui (the base state and its SSE digest) carries no asks key: answers live only in the phone'"'"'s own frames'; fi
 grep -q 'remote-asks' "$REPO/bin/heimdall-app" && grep -q 'companion_quick_ask.py" status-line' "$REPO/bin/heimdall-app" \
   && ok "heimdall-app: remote-asks routed, status line printed" || bad "heimdall-app wiring missing"

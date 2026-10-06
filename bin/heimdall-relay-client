@@ -444,7 +444,10 @@ LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_l
 CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
 VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
 DASH = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_dashboards.py"))
-ASK = _load_module("companion_quick_ask", os.path.join(LIB_DIR, "companion_quick_ask.py"))
+# ONE instance with the dispatcher: a quick-ask worker keeps its answers in this module's memory, so the copy that applies the state.asks
+# slice and hears "a result changed" must be the very copy the controls module registered `quick-ask` from -- a second _load_module copy
+# would hold no results and never be called back.
+ASK = CONTROLS._sibling("companion_quick_ask") if CONTROLS is not None else None
 WS =_load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed

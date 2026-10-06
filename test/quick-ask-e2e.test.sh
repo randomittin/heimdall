@@ -78,6 +78,9 @@ mutant "the client never applies the asks slice" \
   'self._dashboards_overlay(self._views_overlay(self._login_overlay(state)))' "3a\."
 mutant "dispatch without the phone's caps" 'seq=seq, transport="relay", caps=self.device_caps)' 'seq=seq, transport="relay")' "4a\."
 mutant "a result never sends the state again" 'ASK.set_on_change(self.root, self._rearm_state)' 'pass' "4b\."
+mutant "the client loads its own copy of the module (the results live in the other one)" \
+  'ASK = CONTROLS._sibling("companion_quick_ask") if CONTROLS is not None else None' \
+  'ASK = _load_module("companion_quick_ask", os.path.join(LIB_DIR, "companion_quick_ask.py"))' "4b\."
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

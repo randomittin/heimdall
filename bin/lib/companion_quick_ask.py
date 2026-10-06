@@ -17,7 +17,9 @@ STATE. snapshot() is the additive `asks` key, sent ONLY to a phone whose latest 
 detail: null|no-tile|too-vague|timeout}`, matched by `rid`. `at` is when the row last changed. done = an answer, detail null; failed = no
 answer, a detail (no-tile: nothing live covers it, or the tile has no change figure; too-vague: the chooser's answer was not one of the
 closed choices, or the tiles cannot be compared; timeout: no answer in time). Results are held in memory only -- never in a file, a log or
-the audit -- and vanish when the switch goes off. No `asks` key at all for a phone that did not list the cap.
+the audit -- and vanish when the switch goes off. No `asks` key at all for a phone that did not list the cap. Because they live in this
+module's memory there must be ONE instance per process: the relay client takes it from CONTROLS._sibling (the copy the dispatcher
+registered the action from), never from a second load by path (test/quick-ask-e2e.test.sh holds the proof).
 
 READ-ONLY BY CONSTRUCTION, NO INVENTED NUMBERS. A model is asked ONE thing: which of the live `number` tiles (and which of value | change |
 compare) the question is about. It is given the question as quoted JSON data plus, for each such tile, only its id, title, intent and

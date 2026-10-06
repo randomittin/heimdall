@@ -386,12 +386,14 @@ def run(st):
           and "q-0000a001" not in audit and '"quick-ask"' in audit,
           "8b. the question text is in no sealed frame, audit line, relay event or client output; the audit has the actions (ids and tokens only)",
           [w for w, blob in (("frames", text), ("audit", audit), ("events", events), ("client", diag)) if NEEDLE in blob])
-    check(os.path.exists(events_path) is False or '"quick-ask"' not in events, "8c. a read action is not on the relay-event timeline")
+    timeline = [json.loads(line) for line in events.splitlines() if line.strip().startswith("{")]
+    check(not [e for e in timeline if e.get("event") == "remote-action" and e.get("action") == "quick-ask"],
+          "8c. a read action never gets a remote-action line on the relay-event timeline (that is for expand actions)")
 
     # 9. a phone that never listed ask-v1 sees none of it and cannot ask
     ack, before = p.resync(NO_ASK_CAPS)
     p.state(since=before, timeout=30)
-    ack, _ = send_ask(p, "orders?", "q-0000d001")
+    ack, _ = send_ask(p, "orders?", "q-0000d001", caps=None)
     time.sleep(2.5)
     p.pull()
     after = [fr for fr in p.frames[before:] if fr["type"] == "state"]
