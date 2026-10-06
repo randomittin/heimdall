@@ -146,10 +146,13 @@ clean_state() {
   rm -f "$STATE_DIR"/* "$STATE_DIR"/.lock 2>/dev/null || true
 }
 state_count() { ls "$STATE_DIR"/*.json 2>/dev/null | wc -l | tr -d ' '; }
+# stale_left -- how many of the seeded fake-owner restore files (pids 20000000NN) are still in the state dir.
+stale_left() { find "$STATE_DIR" -maxdepth 1 -name '20000000*' | wc -l | tr -d ' '; }
 
 # new_live_pid -- sets LIVE to a process that stays alive for the test. dead_pid -- sets DEAD to
 # a pid that has already exited (a launcher that crashed).
 new_live_pid() {
+  # shellcheck disable=SC2217  # sleep never reads stdin; </dev/null just keeps the long-lived child off the test's own stdin
   sleep 600 </dev/null >/dev/null 2>&1 &
   LIVE=$!
   disown "$LIVE" 2>/dev/null || true             # no "Terminated" job notice when cleanup kills it
@@ -436,10 +439,10 @@ I=1
 while [ "$I" -le 70 ]; do printf '{"t": 1.0, "changes": {}}' > "$STATE_DIR/$((2000000000 + I)).json"; I=$((I + 1)); done
 new_live_pid; KL=$LIVE; RFL="$(sm restore-file "$KL")"
 sm activate "$PLAIN" "$RFL" >/dev/null 2>&1
-LEFT="$(ls "$STATE_DIR" | grep -c '^20000000')"
+LEFT="$(stale_left)"
 [ "$LEFT" = "6" ] && ok "one activation sweeps at most 64 stale files (70 -> 6 left)" || bad "$LEFT stale files left after one activation (want 6)"
 sm activate "$PLAIN" "$RFL" >/dev/null 2>&1
-LEFT="$(ls "$STATE_DIR" | grep -c '^20000000' || true)"
+LEFT="$(stale_left)"
 [ "$LEFT" = "0" ] && ok "...and the next activation finishes the job" || bad "$LEFT stale files left after the second activation"
 sm restore "$RFL" >/dev/null 2>&1
 same_as_s0 && ok "...with the skill set intact throughout" || bad "bounded-sweep case: after restore [$(plugins)]"
