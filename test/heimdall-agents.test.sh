@@ -374,9 +374,9 @@ CZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK
 LZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" list)"
 grep -q "no tracked subagents" <<<"$LZERO" && ok "absent task dir → honest empty list" || bad "absent task dir list wrong"
 SZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" sweep 2>&1)"; SZ_RC=$?
-[ "$SZ_RC" = "0" ] && ok "sweep exits 0 on absent task dir" || bad "sweep exit $SZ_RC on absent task dir"
+[ "$SZ_RC" = "0" ] && ok "sweep exits 0 on absent task dir" || bad "sweep exit $SZ_RC on absent task dir: $SZERO"
 OZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" orphans 2>&1)"; OZ_RC=$?
-[ "$OZ_RC" = "0" ] && ok "orphans exits 0 on absent task dir" || bad "orphans exit $OZ_RC on absent task dir"
+[ "$OZ_RC" = "0" ] && ok "orphans exits 0 on absent task dir" || bad "orphans exit $OZ_RC on absent task dir: $OZERO"
 
 # Transcript deleted out from under us: metadata gone, must degrade not crash.
 BROKEN="$WORK/broken"; mkdir -p "$BROKEN"

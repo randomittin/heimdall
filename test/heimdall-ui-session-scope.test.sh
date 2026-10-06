@@ -57,7 +57,7 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 
 echo "heimdall-ui-session-scope (each hmd ui / relay client reads only the sessions of its own --repo)"
 
-for f in "$UI" "$UI_PY" "$SC_PY" "$RELAY_CLIENT" "$FAKE_RELAY" "$E2E_MOD"; do
+for f in "$UI" "$UI_PY" "$RES_PY" "$SC_PY" "$RELAY_CLIENT" "$FAKE_RELAY" "$E2E_MOD"; do
   if [ ! -e "$f" ]; then
     printf 'FATAL: required file missing: %s\n\n0 passed, 1 failed\n' "$f"
     exit 1
@@ -148,7 +148,8 @@ mkrepo() {
 }
 # slugdir REAL_REPO -> its Claude project dir, created
 slugdir() {
-  local d="$HOME/.claude/projects/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+  local d
+  d="$HOME/.claude/projects/$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
   mkdir -p "$d"
   printf '%s' "$d"
 }

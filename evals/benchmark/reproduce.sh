@@ -26,7 +26,7 @@ MODE=compare; OUT=""; JOBS=4
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) MODE=dry; shift ;;
-    --write)   MODE=write; shift ;;
+    --write)   MODE="write"; shift ;;
     --out)     OUT="${2:?--out needs a directory}"; shift 2 ;;
     --jobs)    JOBS="${2:?--jobs needs a number}"; shift 2 ;;
     -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
