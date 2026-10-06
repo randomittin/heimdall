@@ -4,6 +4,7 @@
 # ack, log every ack) and the persistent-connection / state-resend rules that followed. Split out of
 # test/heimdall-app-relay.test.sh (see its header); the shared prelude is test/lib/app-relay-common.sh.
 
+# shellcheck disable=SC2034  # RELAY_SUITE_TITLE is read by test/lib/app-relay-common.sh (sourced next), never in this file
 RELAY_SUITE_TITLE="heimdall-app-relay (bin/heimdall-relay-client + hmd app connect --relay oracle) -- part 2/3: connect, ack/state retry"
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/app-relay-common.sh"
 

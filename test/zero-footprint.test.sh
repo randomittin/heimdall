@@ -43,6 +43,7 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 skip() { printf '  \033[33mSKIP\033[0m %s\n' "$1"; SKIP=$((SKIP+1)); }
 
 [ -r "$FIXTURES" ] || { echo "FATAL: shared fixtures missing: $FIXTURES" >&2; exit 2; }
+# shellcheck source=lib/runhmd-fixtures.sh
 . "$FIXTURES"
 for t in node jq python3 shasum git perl; do
   command -v "$t" >/dev/null 2>&1 || { echo "FATAL: $t is required" >&2; exit 2; }

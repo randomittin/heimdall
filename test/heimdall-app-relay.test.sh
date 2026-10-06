@@ -43,6 +43,7 @@
 #   heimdall-app-relay-push-ws.test.sh      scenarios W-Z (ordering/digest, push registration, stale-seq refusal, WebSocket leg)
 # The shared prelude (sandbox, waits, the e2e stand-in, python3 pin) is test/lib/app-relay-common.sh.
 
+# shellcheck disable=SC2034  # RELAY_SUITE_TITLE is read by test/lib/app-relay-common.sh (sourced next), never in this file
 RELAY_SUITE_TITLE="heimdall-app-relay (bin/heimdall-relay-client + hmd app connect --relay oracle) -- part 1/3: core protocol"
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/app-relay-common.sh"
 
@@ -621,13 +622,13 @@ else
 fi
 
 # leftover UI/relay-client pids from the connect attempt, if any survived
-for sf in "$REPO_D"/.heimdall/app/connect.json; do
-  [ -f "$sf" ] || continue
+sf="$REPO_D/.heimdall/app/connect.json"
+if [ -f "$sf" ]; then
   leak_pid="$(python3 -c "import json,sys; print(json.load(open('$sf')).get('pid_ui','') or '')" 2>/dev/null)"
   [ -n "$leak_pid" ] && kill -9 "$leak_pid" 2>/dev/null
   leak_client="$(python3 -c "import json,sys; print(json.load(open('$sf')).get('pid_client','') or '')" 2>/dev/null)"
   [ -n "$leak_client" ] && kill -9 "$leak_client" 2>/dev/null
-done
+fi
 
 kill "$SRV_D" 2>/dev/null
 wait "$SRV_D" 2>/dev/null

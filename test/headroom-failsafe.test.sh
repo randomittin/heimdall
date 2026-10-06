@@ -203,6 +203,7 @@ echo
 echo "1 — dead port -> the start path runs ONCE and the proxy is detached into its own process group"
 nextport; OUT="$TMP/out1"; ERR="$TMP/err1"
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c1 "$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nbase=%s\ndown=%s\nwarned=%s\n' "$rc" "$HMD_HEADROOM_BASE_URL" "${HMD_HEADROOM_DOWN:-}" "${HMD_HEADROOM_WARNED:-}" > "$OUT"
@@ -227,6 +228,7 @@ echo "2 — start path fails -> decline, ONE stderr warning, bounded wait, never
 nextport; OUT="$TMP/out2"; ERR="$TMP/err2"
 T0=$(now)
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c2 "$P"; export FAKE_HEADROOM_MODE=die
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nbase=%s\ndown=%s\nwarned=%s\nurl=%s\nwhy=%s\n' "$rc" "$HMD_HEADROOM_BASE_URL" "${HMD_HEADROOM_DOWN:-}" "${HMD_HEADROOM_WARNED:-}" "${ANTHROPIC_BASE_URL:-unset}" "$HMD_HEADROOM_WHY" > "$OUT"
@@ -249,6 +251,7 @@ echo
 echo "3 — an inherited ANTHROPIC_BASE_URL that is OUR dead proxy is dropped, in one line"
 nextport; OUT="$TMP/out3"; ERR="$TMP/err3"
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c3 "$P"; export FAKE_HEADROOM_MODE=die
   export ANTHROPIC_BASE_URL="http://127.0.0.1:$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
@@ -266,6 +269,7 @@ echo
 echo "4 — an operator's OWN ANTHROPIC_BASE_URL is never dropped"
 nextport; OUT="$TMP/out4"; ERR="$TMP/err4"
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c4 "$P"; export FAKE_HEADROOM_MODE=die
   export ANTHROPIC_BASE_URL="https://example.invalid"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
@@ -281,6 +285,7 @@ nextport; OUT="$TMP/out5"; ERR="$TMP/err5"
 blackhole "$P"
 T0=$(now)
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c5 "$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\ndown=%s\nwhy=%s\n' "$rc" "${HMD_HEADROOM_DOWN:-}" "$HMD_HEADROOM_WHY" > "$OUT"
@@ -298,6 +303,7 @@ echo "6 — a healthy proxy is reused untouched (no start, no warning)"
 nextport; OUT="$TMP/out6"; ERR="$TMP/err6"
 serve "$P" --lossless
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c6 "$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nbase=%s\nwhy=%s\n' "$rc" "$HMD_HEADROOM_BASE_URL" "$HMD_HEADROOM_WHY" > "$OUT"
@@ -311,6 +317,7 @@ echo "7 — hmd_headroom_port_state: dead / silent / answering, each inside its 
 nextport; PD=$P; nextport; PS=$P; nextport; PA=$P
 blackhole "$PS"; serve "$PA" --lossless
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"
   t0=$(now); d="$(hmd_headroom_port_state "$PD")"; td=$(secs "$t0" "$(now)")
   t0=$(now); s="$(hmd_headroom_port_state "$PS")"; ts=$(secs "$t0" "$(now)")
@@ -331,6 +338,7 @@ echo "8 — a stranger that answers HTTP is refused, and no proxy is started ove
 nextport; OUT="$TMP/out8"; ERR="$TMP/err8"
 FAKE_SERVICE=not-headroom serve "$P"
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c8 "$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nwhy=%s\n' "$rc" "$HMD_HEADROOM_WHY" > "$OUT"
@@ -349,6 +357,7 @@ UIDN="$(id -u)"
 # 9a: plist present, agent not loaded -> bootstrap (which starts it), no direct spawn
 nextport; OUT="$TMP/out9a"; ERR="$TMP/err9a"
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c9a "$P"; export HMD_HEADROOM_SUPERVISOR_LABEL="$LABEL9"
   mkdir -p "$HEIMDALL_LAUNCH_AGENTS_DIR"; : > "$HEIMDALL_LAUNCH_AGENTS_DIR/$LABEL9.plist"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
@@ -363,6 +372,7 @@ grep -q '^supervised=yes$' "$OUT" && ok "9e hmd_headroom_supervised follows the 
 # 9f: already loaded -> kickstart only, never a second bootstrap
 nextport; OUT="$TMP/out9f"; ERR="$TMP/err9f"
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c9f "$P"; export HMD_HEADROOM_SUPERVISOR_LABEL="$LABEL9"
   mkdir -p "$HEIMDALL_LAUNCH_AGENTS_DIR"; : > "$HEIMDALL_LAUNCH_AGENTS_DIR/$LABEL9.plist"; : > "$LC_LOADED"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
@@ -373,6 +383,7 @@ grep -q "^kickstart gui/$UIDN/$LABEL9\$" "$TMP/lc-c9f.calls" && ! grep -q '^boot
 # 9g: launchctl refuses -> fall back to the direct spawn, still fail-safe
 nextport; OUT="$TMP/out9g"; ERR="$TMP/err9g"
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c9g "$P"; export HMD_HEADROOM_SUPERVISOR_LABEL="$LABEL9" FAKE_LAUNCHCTL_MODE=fail
   mkdir -p "$HEIMDALL_LAUNCH_AGENTS_DIR"; : > "$HEIMDALL_LAUNCH_AGENTS_DIR/$LABEL9.plist"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
@@ -392,6 +403,7 @@ exit 0
 EOSH
 chmod +x "$TMP/pathshim/launchctl"; : > "$TMP/real-launchctl.calls"
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c10 "$P"; export HMD_HEADROOM_SUPERVISOR_LABEL="$LABEL9"
   unset LAUNCHCTL                      # the plain `launchctl` on PATH — i.e. the REAL one on a real machine
   export PATH="$TMP/pathshim:$PATH"
@@ -411,6 +423,7 @@ nextport; PD=$P; nextport; PL=$P
 serve "$PL" --lossless
 OUT="$TMP/out11"
 (
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
   . "$CHAIN"; setup_env c11 "$PD"
   export ANTHROPIC_BASE_URL="http://127.0.0.1:$PD"
   hmd_headroom_drop_if_dead 2>"$TMP/err11a"; printf 'dead_url=%s\n' "${ANTHROPIC_BASE_URL:-unset}" > "$OUT"
@@ -430,6 +443,7 @@ echo "12 — three launch classes, chain level: plain goes direct WITH a warning
 for cls in plain judge required; do
   nextport; OUT="$TMP/out12$cls"; ERR="$TMP/err12$cls"
   (
+    # shellcheck source=../bin/lib/hmd-headroom-chain.sh
     . "$CHAIN"; setup_env "c12$cls" "$P"; export FAKE_HEADROOM_MODE=die
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$P"
     case "$cls" in judge) export HMD_JUDGMENT=1 ;; required) export HMD_HEADROOM_REQUIRED=1 ;; esac
@@ -450,9 +464,11 @@ for cls in judge required; do
 done
 # The guard only bites when the proxy is WANTED and DOWN. Healthy -> routed; not wanted -> direct is fine.
 nextport; serve "$P" --lossless; OUT="$TMP/out12h"
+# shellcheck source=../bin/lib/hmd-headroom-chain.sh
 ( . "$CHAIN"; setup_env c12h "$P"; export HMD_JUDGMENT=1; hmd_headroom_chain "$TMP" 2>/dev/null; echo "rc=$?" > "$OUT" )
 grep -q '^rc=0$' "$OUT" && ok "12d a judge launch with a HEALTHY proxy routes normally (the guard is not an over-block)" || bad "12d judge + healthy proxy misrouted" "$(cat "$OUT")"
 nextport; OUT="$TMP/out12o"
+# shellcheck source=../bin/lib/hmd-headroom-chain.sh
 ( . "$CHAIN"; setup_env c12o "$P"; export HMD_JUDGMENT=1 HMD_HEADROOM_DISABLE=1; hmd_headroom_chain "$TMP" 2>"$TMP/err12o"; echo "rc=$?" > "$OUT" )
 grep -q '^rc=1$' "$OUT" && [ ! -s "$TMP/err12o" ] && ok "12e judge + operator opted OUT of headroom: rc 1, silent — no proxy was wanted, so nothing 'failed'" || bad "12e opted-out judge launch was blocked or noisy" "$(cat "$OUT" "$TMP/err12o")"
 

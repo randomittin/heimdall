@@ -80,7 +80,7 @@ R=$(mkrepo auto-priv true); printf '{}' > "$R/.heimdall/identity.json"
 run "$R" true bash "$TEAM" auto >/dev/null 2>&1; sleep 0.3
 [ -n "$(team_tracked "$R")" ] && ok "auto/private+active: auto-committed team.json (TRACKED)" || bad "auto/private: did not commit"
 # no remote push happened (origin has no objects pushed — bare check: no upstream)
-git -C "$R" log @{u}.. >/dev/null 2>&1 && bad "auto: pushed (must not)" || ok "auto: did NOT push (commit only)"
+git -C "$R" log "@{u}.." >/dev/null 2>&1 && bad "auto: pushed (must not)" || ok "auto: did NOT push (commit only)"
 
 # 7) `auto` idempotent: 2nd run with shared present -> no 2nd commit
 C1=$(git -C "$R" rev-list --count HEAD 2>/dev/null || echo 0)

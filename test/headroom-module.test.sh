@@ -456,7 +456,7 @@ restore
 
 echo
 echo "H11 — DEPEND, DON'T CLONE"
-EXTRA="$(ls -A "$REG/headroom" | grep -v '^manifest.json$' | head -5)"
+EXTRA="$(find "$REG/headroom/" -mindepth 1 -maxdepth 1 ! -name manifest.json | sed 's|.*/||' | head -5)"
 [ -z "$EXTRA" ] \
   && ok "modules/headroom holds manifest.json and nothing else" \
   || bad "vendored payload in modules/headroom: $EXTRA"

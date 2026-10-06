@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # test/lib/app-relay-common.sh -- shared prelude of the heimdall-app-relay* suites.
 #
 # SOURCED, never executed (run-all.sh globs test/*.test.sh only, so this file is not a suite). It carries
@@ -407,6 +408,7 @@ PYEOF
 # session key), stay gated on $E2E_PRESENT and are skipped, loudly, whenever
 # this stub is in play.
 if [ "$E2E_PRESENT" = true ]; then
+  # shellcheck disable=SC2034  # RELAY_CLIENT_RUN is read by the suites that source this prelude, never inside it
   RELAY_CLIENT_RUN="$RELAY_CLIENT"
 else
   MINSTUB_LIB="$TMPROOT/stub-min-e2e"
@@ -452,6 +454,7 @@ MINSTUB_EOF
   cp -R "$REPO/bin" "$MINSTUB_ROOT/bin"
   cp -R "$REPO/sentinels" "$MINSTUB_ROOT/sentinels"
   cp "$MINSTUB_LIB/hmd_relay_e2e.py" "$MINSTUB_ROOT/bin/lib/hmd_relay_e2e.py"
+  # shellcheck disable=SC2034  # RELAY_CLIENT_RUN is read by the suites that source this prelude, never inside it
   RELAY_CLIENT_RUN="$MINSTUB_ROOT/bin/heimdall-relay-client"
 fi
 

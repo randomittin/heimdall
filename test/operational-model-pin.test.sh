@@ -131,8 +131,8 @@ echo "--------------------------------------------------------------------"
 # excused <relpath> <line text> — 0 when the allowlist entry for this exact path
 # covers this exact line. File membership alone is deliberately NOT enough.
 excused() {
-  local rel="$1" text="$2" rrel ranchor rprobe rere
-  while IFS='|' read -r rrel ranchor rprobe rere; do
+  local rel="$1" text="$2" rrel rere
+  while IFS='|' read -r rrel _ _ rere; do
     [ -n "$rrel" ] || continue
     [ "$rrel" = "$rel" ] || continue
     printf '%s\n' "$text" | grep -Eq -e "$rere" && return 0

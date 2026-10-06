@@ -70,7 +70,7 @@ chmod +x "$BIN_STUB/gh"
 # otherwise from bin/generate-changelog; either way they must be real content, not boilerplate.
 NOTES_OUT="$WORK/notes.md"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   # shellcheck disable=SC1090
   SHIP_SOURCE_ONLY=1 . "$SHIP"
   REPO_ROOT="$REPO"
@@ -115,7 +115,7 @@ fi
 # ── Case 3: publish_release is idempotent — existing release -> UPDATE ───────
 C3="$WORK/c3.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export GH_STUB_STATE="$WORK/c3state" GH_STUB_MODE="edit-ok"
   mkdir -p "$GH_STUB_STATE"; : > "$GH_STUB_STATE/created"   # pretend it already exists
   PATH="$BIN_STUB:$PATH"
@@ -135,7 +135,7 @@ fi
 # ── Case 4: a gh failure makes the publish path exit NON-ZERO ────────────────
 C4="$WORK/c4.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export GH_STUB_STATE="$WORK/c4state" GH_STUB_MODE="create-fail"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -186,7 +186,7 @@ BIG="$WORK/bigrange"
 NOTES5="$WORK/notes5.md"
 mk_range_repo "$BIG" 1200 || bad "could not build the 1200-commit throwaway repo"
 (
-  cd "$BIG"
+  cd "$BIG" || exit 1
   # shellcheck disable=SC1090
   SHIP_SOURCE_ONLY=1 . "$SHIP"
   REPO_ROOT="$BIG"
@@ -212,9 +212,10 @@ EMPTYR="$WORK/emptyrange"
 NOTES6="$WORK/notes6.md"
 mk_range_repo "$EMPTYR" 0 || bad "could not build the empty-range throwaway repo"
 (
-  cd "$EMPTYR"
+  cd "$EMPTYR" || exit 1
   # shellcheck disable=SC1090
   SHIP_SOURCE_ONLY=1 . "$SHIP"
+  # shellcheck disable=SC2034  # REPO_ROOT is read by build_release_notes, which `. "$SHIP"` defines; shellcheck cannot follow the source
   REPO_ROOT="$EMPTYR"
   build_release_notes "v9.9.9" "$NOTES6"
 ) >"$WORK/c6.out" 2>"$WORK/c6.err"
