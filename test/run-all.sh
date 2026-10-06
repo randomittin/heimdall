@@ -73,7 +73,7 @@ REPO="$(cd "$SELF_DIR/.." && pwd)"
 # is the one guarantee run-all.sh exists to enforce (guarantee #8, REPO INTEGRITY),
 # so a missing/broken copy must stop the sweep loudly here rather than silently
 # treat every hook-owned commit as a violation (or worse, every path as exempt).
-# shellcheck source=lib/hook-owned-path.sh
+# shellcheck source=../bin/lib/hook-owned-path.sh disable=SC1091  # the default run never opens sourced files; source= is for -x -P SCRIPTDIR
 if ! . "$REPO/bin/lib/hook-owned-path.sh" 2>/dev/null; then
   echo "run-all.sh: missing/unreadable $REPO/bin/lib/hook-owned-path.sh -- cannot safely evaluate REPO INTEGRITY or the sweep receipt's tree_clean. Aborting." >&2
   exit 2
@@ -412,11 +412,13 @@ _gate_marker_claim
 # it was still grading — reintroducing exactly the race the marker exists to close, in the
 # one situation hardest to notice. The marker is only removed by the process whose pid it
 # names, so a nested run leaves its parent's claim standing.
+# shellcheck disable=SC2329  # runs from cleanup(), which the EXIT trap below invokes; shellcheck does not follow trap handlers
 _gate_marker_release() {
   [ -f "$GATE_MARKER" ] || return 0
   [ "$(sed -n '1p' "$GATE_MARKER" 2>/dev/null)" = "$$" ] || return 0
   rm -f "$GATE_MARKER" 2>/dev/null || true
 }
+# shellcheck disable=SC2329  # invoked by the EXIT trap below; shellcheck does not follow trap handlers
 cleanup() { rm -rf "$WORK"; _gate_marker_release; }
 
 # INT/TERM MUST END THE RUN. This used to be `trap cleanup EXIT INT TERM`, and a trap handler
@@ -431,6 +433,7 @@ cleanup() { rm -rf "$WORK"; _gate_marker_release; }
 # runs exactly once. Suites run in their OWN process group (timeout_run's setpgrp), so a
 # signal to the runner never reaches them by itself -- the parent->child links are the only
 # handle on what is still in flight. Proof: test/run-all-signal.test.sh.
+# shellcheck disable=SC2329  # runs from _abort_sweep, which the INT/TERM traps below invoke
 _descendants() {
   local c
   for c in $(pgrep -P "$1" 2>/dev/null); do
@@ -438,6 +441,7 @@ _descendants() {
     _descendants "$c"
   done
 }
+# shellcheck disable=SC2329  # invoked by the INT/TERM traps below; shellcheck does not follow trap handlers
 _abort_sweep() {
   local p
   for p in $(_descendants "$$"); do kill -TERM "$p" 2>/dev/null; done
@@ -458,7 +462,7 @@ trap '_abort_sweep 143' TERM
 # file next to it (the throwaway fixture repos of the test/run-all-*.test.sh suites) runs unpinned and says
 # so. Printed straight after the banner so the run header always states which interpreter the suites get.
 # Proof: test/run-all-python-pin.test.sh.
-# shellcheck source=lib/py-pin.sh
+# shellcheck source=lib/py-pin.sh disable=SC1091  # the default run never opens sourced files; source= is for -x -P SCRIPTDIR
 if [ -r "$SELF_DIR/lib/py-pin.sh" ] && . "$SELF_DIR/lib/py-pin.sh"; then
   hmd_test_pin_python3 "$WORK/pybin"
 else

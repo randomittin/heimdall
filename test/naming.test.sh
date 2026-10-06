@@ -41,6 +41,7 @@ check() {
     n=$((n+1))
     name="$(printf '%s' "$row" | awk -F'|' '{gsub(/^ +| +$/,"",$2); print $2}')"
     reach="$(printf '%s' "$row" | awk -F'|' '{print $4}')"
+    # shellcheck disable=SC2016  # the backticks are literal regex characters for grep, not a command substitution
     for tok in $(printf '%s' "$reach" | grep -oE '`[^`]+`' | tr -d '`' | tr ' ' '_'); do
       case "$tok" in
         hmd_*)
