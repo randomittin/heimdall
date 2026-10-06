@@ -179,114 +179,163 @@ state_of() { "$AGENTS" list --json | jq -r --arg id "$1" '.[]|select(.id==$id)|.
 name_of()  { "$AGENTS" list --json | jq -r --arg id "$1" '.[]|select(.id==$id)|.name'; }
 
 # ── (1) classification ────────────────────────────────────────────────────────
-[ "$(state_of "$A_LIVE")"  = "live"    ] && ok "fresh regular subagent → live"      || bad "expected live, got '$(state_of "$A_LIVE")'"
-[ "$(state_of "$A_STALE")" = "stale"   ] && ok "old + end_turn + no notif → stale"  || bad "expected stale, got '$(state_of "$A_STALE")'"
-[ "$(state_of "$A_FAIL")"  = "failed"  ] && ok "terminal marker beats freshness"    || bad "expected failed, got '$(state_of "$A_FAIL")'"
-[ "$(state_of "$A_MBOX")"  = "mailbox" ] && ok "in_process_teammate + alive session → mailbox" || bad "expected mailbox, got '$(state_of "$A_MBOX")'"
-[ "$(state_of "$A_HUNG")"  = "hung"    ] && ok "awaiting one tool ≥ HUNG_SECS → hung" || bad "expected hung, got '$(state_of "$A_HUNG")'"
-[ "$(name_of  "$A_MBOX")"  = "ve-server" ] && ok "mailbox agent reports its name"   || bad "expected name ve-server, got '$(name_of "$A_MBOX")'"
+if [ "$(state_of "$A_LIVE")"  = "live"    ]; then ok "fresh regular subagent → live"; else bad "expected live, got '$(state_of "$A_LIVE")'"; fi
+if [ "$(state_of "$A_STALE")" = "stale"   ]; then ok "old + end_turn + no notif → stale"; else bad "expected stale, got '$(state_of "$A_STALE")'"; fi
+if [ "$(state_of "$A_FAIL")"  = "failed"  ]; then ok "terminal marker beats freshness"; else bad "expected failed, got '$(state_of "$A_FAIL")'"; fi
+if [ "$(state_of "$A_MBOX")"  = "mailbox" ]; then ok "in_process_teammate + alive session → mailbox"; else bad "expected mailbox, got '$(state_of "$A_MBOX")'"; fi
+if [ "$(state_of "$A_HUNG")"  = "hung"    ]; then ok "awaiting one tool ≥ HUNG_SECS → hung"; else bad "expected hung, got '$(state_of "$A_HUNG")'"; fi
+if [ "$(name_of  "$A_MBOX")"  = "ve-server" ]; then ok "mailbox agent reports its name"; else bad "expected name ve-server, got '$(name_of "$A_MBOX")'"; fi
 
 # ── (2) THE GUARD: old mtime but awaiting a tool result ⇒ working, never reaped ─
-[ "$(state_of "$A_WORK")" = "working" ] && ok "GUARD: stale-aged but mid tool_use → working" \
-  || bad "GUARD BROKEN: expected working, got '$(state_of "$A_WORK")'"
+if [ "$(state_of "$A_WORK")" = "working" ]; then
+  ok "GUARD: stale-aged but mid tool_use → working"
+else
+  bad "GUARD BROKEN: expected working, got '$(state_of "$A_WORK")'"
+fi
 
 # ── (3) background Bash tasks are NOT subagents ───────────────────────────────
-[ -z "$(state_of "$B_BASH")" ] && ok "background Bash task excluded from agent list" \
-  || bad "bash task '$B_BASH' wrongly tracked as agent (got '$(state_of "$B_BASH")')"
+if [ -z "$(state_of "$B_BASH")" ]; then
+  ok "background Bash task excluded from agent list"
+else
+  bad "bash task '$B_BASH' wrongly tracked as agent (got '$(state_of "$B_BASH")')"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # DEFECT 1 — A COMPLETION MUST NEVER BE CALLED `orphaned`.
 # Regression guard for: two agents that finished, emitted task-notifications and
 # had their work merged were both reported `orphaned` by `list`.
 # ═════════════════════════════════════════════════════════════════════════════
-[ "$(state_of "$A_DONE")" = "done" ] && ok "DEFECT-1: notified completion → done" \
-  || bad "DEFECT-1: expected done for completed agent, got '$(state_of "$A_DONE")'"
-[ "$(state_of "$A_DONE2")" = "done" ] && ok "DEFECT-1: second completion → done" \
-  || bad "DEFECT-1: expected done, got '$(state_of "$A_DONE2")'"
-[ "$(state_of "$A_DONE")" != "orphaned" ] && ok "DEFECT-1: completion is NOT orphaned" \
-  || bad "DEFECT-1 REGRESSION: completed agent reported orphaned"
-[ "$(state_of "$A_KILL")" = "killed" ] && ok "DEFECT-1: notified kill → killed" \
-  || bad "DEFECT-1: expected killed, got '$(state_of "$A_KILL")'"
+if [ "$(state_of "$A_DONE")" = "done" ]; then
+  ok "DEFECT-1: notified completion → done"
+else
+  bad "DEFECT-1: expected done for completed agent, got '$(state_of "$A_DONE")'"
+fi
+if [ "$(state_of "$A_DONE2")" = "done" ]; then
+  ok "DEFECT-1: second completion → done"
+else
+  bad "DEFECT-1: expected done, got '$(state_of "$A_DONE2")'"
+fi
+if [ "$(state_of "$A_DONE")" != "orphaned" ]; then
+  ok "DEFECT-1: completion is NOT orphaned"
+else
+  bad "DEFECT-1 REGRESSION: completed agent reported orphaned"
+fi
+if [ "$(state_of "$A_KILL")" = "killed" ]; then
+  ok "DEFECT-1: notified kill → killed"
+else
+  bad "DEFECT-1: expected killed, got '$(state_of "$A_KILL")'"
+fi
 
 # The decisive case: session PROVABLY dead, but the agent completed first. A
 # completion outranks a dead session — the work happened and was returned.
 DEADW="$(HMD_AGENT_REAPED_FILE="$WORK/reaped-dead.json" HMD_AGENT_LIVE_SLUGS="" "$AGENTS" list --json)"
-[ "$(printf '%s' "$DEADW" | jq -r --arg i "$A_DONE" '.[]|select(.id==$i)|.state')" = "done" ] \
-  && ok "DEFECT-1: completion outranks dead session (still done, not orphaned)" \
-  || bad "DEFECT-1 REGRESSION: completed agent in dead session became '$(printf '%s' "$DEADW" | jq -r --arg i "$A_DONE" '.[]|select(.id==$i)|.state')'"
+if [ "$(printf '%s' "$DEADW" | jq -r --arg i "$A_DONE" '.[]|select(.id==$i)|.state')" = "done" ]; then
+  ok "DEFECT-1: completion outranks dead session (still done, not orphaned)"
+else
+  bad "DEFECT-1 REGRESSION: completed agent in dead session became '$(printf '%s' "$DEADW" | jq -r --arg i "$A_DONE" '.[]|select(.id==$i)|.state')'"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # DEFECT 2 — THE PARKED MAILBOX TEAMMATE MUST BE VISIBLE.
 # Regression guard for: `termprobe` (live, parked, no `.output` entry) was absent
 # from `list` and `list --json` entirely. This is the tool's entire purpose.
 # ═════════════════════════════════════════════════════════════════════════════
-[ -n "$(state_of "$A_PARKED")" ] && ok "DEFECT-2: teammate with NO .output is enumerated" \
-  || bad "DEFECT-2 REGRESSION: parked teammate '$A_PARKED' invisible to list --json"
-[ "$(state_of "$A_PARKED")" = "mailbox" ] && ok "DEFECT-2: no-.output teammate → mailbox" \
-  || bad "DEFECT-2: expected mailbox, got '$(state_of "$A_PARKED")'"
-[ "$(name_of "$A_PARKED")" = "termprobe" ] && ok "DEFECT-2: parked teammate reports its name" \
-  || bad "DEFECT-2: expected name termprobe, got '$(name_of "$A_PARKED")'"
+if [ -n "$(state_of "$A_PARKED")" ]; then
+  ok "DEFECT-2: teammate with NO .output is enumerated"
+else
+  bad "DEFECT-2 REGRESSION: parked teammate '$A_PARKED' invisible to list --json"
+fi
+if [ "$(state_of "$A_PARKED")" = "mailbox" ]; then
+  ok "DEFECT-2: no-.output teammate → mailbox"
+else
+  bad "DEFECT-2: expected mailbox, got '$(state_of "$A_PARKED")'"
+fi
+if [ "$(name_of "$A_PARKED")" = "termprobe" ]; then
+  ok "DEFECT-2: parked teammate reports its name"
+else
+  bad "DEFECT-2: expected name termprobe, got '$(name_of "$A_PARKED")'"
+fi
 # Capture first, then grep. Piping `list` straight into `grep -q` makes the
 # producer take a SIGPIPE when grep exits early, and `set -o pipefail` reports
 # that 141 as the assertion's result — a false RED that has nothing to do with
 # the output's content.
 LIST_TXT="$("$AGENTS" list)"
-grep -q "termprobe" <<<"$LIST_TXT" && ok "DEFECT-2: plain-text list shows termprobe" \
-  || bad "DEFECT-2 REGRESSION: plain-text list omits termprobe"
+if grep -q "termprobe" <<<"$LIST_TXT"; then
+  ok "DEFECT-2: plain-text list shows termprobe"
+else
+  bad "DEFECT-2 REGRESSION: plain-text list omits termprobe"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # DEFECT 3 — THE `orphans` SUBCOMMAND MUST EXIST AND SURFACE THE PARKED CLASS.
 # Regression guard for: `heimdall-agents orphans` → "error: unknown subcommand".
 # ═════════════════════════════════════════════════════════════════════════════
 ORPH_OUT="$("$AGENTS" orphans 2>&1)"; ORPH_RC=$?
-[ "$ORPH_RC" = "0" ] && ok "DEFECT-3: orphans exits 0" \
-  || bad "DEFECT-3 REGRESSION: orphans exit $ORPH_RC (output: $(printf '%s' "$ORPH_OUT" | head -1))"
-grep -qi "unknown subcommand" <<<"$ORPH_OUT" \
-  && bad "DEFECT-3 REGRESSION: orphans is not a known subcommand" \
-  || ok "DEFECT-3: orphans is a recognised subcommand"
-grep -q "termprobe" <<<"$ORPH_OUT" && ok "DEFECT-3: orphans surfaces termprobe" \
-  || bad "DEFECT-3: orphans omitted termprobe"
+if [ "$ORPH_RC" = "0" ]; then
+  ok "DEFECT-3: orphans exits 0"
+else
+  bad "DEFECT-3 REGRESSION: orphans exit $ORPH_RC (output: $(printf '%s' "$ORPH_OUT" | head -1))"
+fi
+if grep -qi "unknown subcommand" <<<"$ORPH_OUT"; then
+  bad "DEFECT-3 REGRESSION: orphans is not a known subcommand"
+else
+  ok "DEFECT-3: orphans is a recognised subcommand"
+fi
+if grep -q "termprobe" <<<"$ORPH_OUT"; then
+  ok "DEFECT-3: orphans surfaces termprobe"
+else
+  bad "DEFECT-3: orphans omitted termprobe"
+fi
 ORPH_J="$("$AGENTS" orphans --json 2>/dev/null)"
-[ "$(printf '%s' "$ORPH_J" | jq -r 'type')" = "array" ] && ok "DEFECT-3: orphans --json is an array" \
-  || bad "DEFECT-3: orphans --json not an array"
-[ "$(printf '%s' "$ORPH_J" | jq -r --arg i "$A_PARKED" '[.[]|select(.id==$i)]|length')" = "1" ] \
-  && ok "DEFECT-3: orphans --json includes the parked teammate" \
-  || bad "DEFECT-3: orphans --json missing parked teammate"
+if [ "$(printf '%s' "$ORPH_J" | jq -r 'type')" = "array" ]; then
+  ok "DEFECT-3: orphans --json is an array"
+else
+  bad "DEFECT-3: orphans --json not an array"
+fi
+if [ "$(printf '%s' "$ORPH_J" | jq -r --arg i "$A_PARKED" '[.[]|select(.id==$i)]|length')" = "1" ]; then
+  ok "DEFECT-3: orphans --json includes the parked teammate"
+else
+  bad "DEFECT-3: orphans --json missing parked teammate"
+fi
 # A completion is NOT an orphan — the defect-1 and defect-3 fixes must agree.
-[ "$(printf '%s' "$ORPH_J" | jq -r --arg i "$A_DONE" '[.[]|select(.id==$i)]|length')" = "0" ] \
-  && ok "DEFECT-3: orphans excludes completed agents" \
-  || bad "DEFECT-3: orphans wrongly lists a completed agent"
+if [ "$(printf '%s' "$ORPH_J" | jq -r --arg i "$A_DONE" '[.[]|select(.id==$i)]|length')" = "0" ]; then
+  ok "DEFECT-3: orphans excludes completed agents"
+else
+  bad "DEFECT-3: orphans wrongly lists a completed agent"
+fi
 # Never surface a genuinely live/working agent as an orphan.
-[ "$(printf '%s' "$ORPH_J" | jq -r --arg i "$A_WORK" '[.[]|select(.id==$i)]|length')" = "0" ] \
-  && ok "GUARD: orphans excludes the working agent" \
-  || bad "GUARD BROKEN: orphans lists a working agent"
+if [ "$(printf '%s' "$ORPH_J" | jq -r --arg i "$A_WORK" '[.[]|select(.id==$i)]|length')" = "0" ]; then
+  ok "GUARD: orphans excludes the working agent"
+else
+  bad "GUARD BROKEN: orphans lists a working agent"
+fi
 
 # ── (4) count is LIVE-only (live + working) ──────────────────────────────────
 C="$("$AGENTS" count)"
-[ "$C" = "2" ] && ok "count==2 (live + working only)" || bad "count expected 2, got '$C'"
+if [ "$C" = "2" ]; then ok "count==2 (live + working only)"; else bad "count expected 2, got '$C'"; fi
 
 # ── (5) reap records the terminal/parked ones, NEVER the live or working ─────
 "$AGENTS" reap >/dev/null
-[ "$(jq -r --arg i "$A_STALE" '.[$i].reason // ""' "$REAPED")" = "stale" ]   && ok "stale recorded reason=stale"     || bad "stale not recorded"
-[ "$(jq -r --arg i "$A_FAIL"  '.[$i].reason // ""' "$REAPED")" = "failed" ]  && ok "failed recorded reason=failed"   || bad "failed not recorded"
-[ "$(jq -r --arg i "$A_HUNG"  '.[$i].reason // ""' "$REAPED")" = "hung" ]    && ok "hung recorded reason=hung"       || bad "hung not recorded"
-[ "$(jq -r --arg i "$A_MBOX"  '.[$i].reason // ""' "$REAPED")" = "mailbox-parked" ] && ok "mailbox recorded reason=mailbox-parked" || bad "mailbox not recorded"
-[ "$(jq -r --arg i "$A_DONE"  '.[$i].reason // ""' "$REAPED")" = "done" ]    && ok "completed recorded reason=done"  || bad "completed not recorded as done"
-[ "$(jq -r --arg i "$A_LIVE"  '.[$i] // "absent"' "$REAPED")" = "absent" ]   && ok "GUARD: live agent NEVER reaped"  || bad "GUARD BROKEN: live agent was reaped"
-[ "$(jq -r --arg i "$A_WORK"  '.[$i] // "absent"' "$REAPED")" = "absent" ]   && ok "GUARD: working agent NEVER reaped" || bad "GUARD BROKEN: working agent was reaped"
+if [ "$(jq -r --arg i "$A_STALE" '.[$i].reason // ""' "$REAPED")" = "stale" ]; then ok "stale recorded reason=stale"; else bad "stale not recorded"; fi
+if [ "$(jq -r --arg i "$A_FAIL"  '.[$i].reason // ""' "$REAPED")" = "failed" ]; then ok "failed recorded reason=failed"; else bad "failed not recorded"; fi
+if [ "$(jq -r --arg i "$A_HUNG"  '.[$i].reason // ""' "$REAPED")" = "hung" ]; then ok "hung recorded reason=hung"; else bad "hung not recorded"; fi
+if [ "$(jq -r --arg i "$A_MBOX"  '.[$i].reason // ""' "$REAPED")" = "mailbox-parked" ]; then ok "mailbox recorded reason=mailbox-parked"; else bad "mailbox not recorded"; fi
+if [ "$(jq -r --arg i "$A_DONE"  '.[$i].reason // ""' "$REAPED")" = "done" ]; then ok "completed recorded reason=done"; else bad "completed not recorded as done"; fi
+if [ "$(jq -r --arg i "$A_LIVE"  '.[$i] // "absent"' "$REAPED")" = "absent" ]; then ok "GUARD: live agent NEVER reaped"; else bad "GUARD BROKEN: live agent was reaped"; fi
+if [ "$(jq -r --arg i "$A_WORK"  '.[$i] // "absent"' "$REAPED")" = "absent" ]; then ok "GUARD: working agent NEVER reaped"; else bad "GUARD BROKEN: working agent was reaped"; fi
 
 # ── (6) post-reap: count unchanged; reaped ones show state=reaped ────────────
 C2="$("$AGENTS" count)"
-[ "$C2" = "2" ] && ok "post-reap count STILL 2 (live+working untouched)" || bad "post-reap count expected 2, got '$C2'"
-[ "$(state_of "$A_STALE")" = "reaped" ] && ok "stale now shows reaped"   || bad "stale not reaped (got '$(state_of "$A_STALE")')"
-[ "$(state_of "$A_MBOX")"  = "reaped" ] && ok "mailbox now shows reaped" || bad "mailbox not reaped (got '$(state_of "$A_MBOX")')"
-[ "$(state_of "$A_WORK")"  = "working" ] && ok "working agent still working" || bad "working agent changed state"
+if [ "$C2" = "2" ]; then ok "post-reap count STILL 2 (live+working untouched)"; else bad "post-reap count expected 2, got '$C2'"; fi
+if [ "$(state_of "$A_STALE")" = "reaped" ]; then ok "stale now shows reaped"; else bad "stale not reaped (got '$(state_of "$A_STALE")')"; fi
+if [ "$(state_of "$A_MBOX")"  = "reaped" ]; then ok "mailbox now shows reaped"; else bad "mailbox not reaped (got '$(state_of "$A_MBOX")')"; fi
+if [ "$(state_of "$A_WORK")"  = "working" ]; then ok "working agent still working"; else bad "working agent changed state"; fi
 
 # ── (7) idempotency ──────────────────────────────────────────────────────────
 J2="$("$AGENTS" reap --json)"
-[ "$J2" = "[]" ] && ok "second reap is idempotent no-op" || bad "second reap not idempotent (got '$J2')"
+if [ "$J2" = "[]" ]; then ok "second reap is idempotent no-op"; else bad "second reap not idempotent (got '$J2')"; fi
 RN="$(jq 'keys|length' "$REAPED" 2>/dev/null)"
-[ "$RN" = "8" ] && ok "registry exactly 8 after re-reap (no drift)" || bad "registry drifted to $RN keys, expected 8"
+if [ "$RN" = "8" ]; then ok "registry exactly 8 after re-reap (no drift)"; else bad "registry drifted to $RN keys, expected 8"; fi
 
 # ── (8) sweep: reports parked mailbox + names EVERY real remedy, honestly ────
 # Both edges are asserted. Understating (restart-only) is the stale claim this
@@ -294,63 +343,93 @@ RN="$(jq 'keys|length' "$REAPED" 2>/dev/null)"
 # opposite lie. A test that merely string-matched whatever the tool emits would
 # catch neither, so every assertion below names the property, not the phrasing.
 SW="$("$AGENTS" sweep 2>&1)"
-grep -q "ve-server" <<<"$SW"      && ok "sweep names the parked agent"        || bad "sweep omitted parked agent name"
-grep -q "TaskStop" <<<"$SW"       && ok "sweep names TaskStop as the programmatic remedy" || bad "sweep failed to name TaskStop"
-grep -qi "restart" <<<"$SW"       && ok "sweep still offers session restart as fallback"  || bad "sweep dropped the restart fallback"
-grep -qiE 'only a restart|restart only|restart-only' <<<"$SW" \
-  && bad "sweep STILL claims restart is the only remedy" || ok "sweep no longer claims restart-only"
-grep -qi 'not yet verified' <<<"$SW" \
-  && ok "sweep flags TaskStop as documented-not-proven" || bad "sweep overstates TaskStop as proven"
-grep -qiE 'killed the|terminated the' <<<"$SW" && bad "sweep FALSELY claims a kill" || ok "sweep never claims a kill it did not perform"
+if grep -q "ve-server" <<<"$SW"; then ok "sweep names the parked agent"; else bad "sweep omitted parked agent name"; fi
+if grep -q "TaskStop" <<<"$SW"; then ok "sweep names TaskStop as the programmatic remedy"; else bad "sweep failed to name TaskStop"; fi
+if grep -qi "restart" <<<"$SW"; then ok "sweep still offers session restart as fallback"; else bad "sweep dropped the restart fallback"; fi
+if grep -qiE 'only a restart|restart only|restart-only' <<<"$SW"; then
+  bad "sweep STILL claims restart is the only remedy"
+else
+  ok "sweep no longer claims restart-only"
+fi
+if grep -qi 'not yet verified' <<<"$SW"; then
+  ok "sweep flags TaskStop as documented-not-proven"
+else
+  bad "sweep overstates TaskStop as proven"
+fi
+if grep -qiE 'killed the|terminated the' <<<"$SW"; then bad "sweep FALSELY claims a kill"; else ok "sweep never claims a kill it did not perform"; fi
 SWJ="$("$AGENTS" sweep --json 2>/dev/null)"
 # CONTRACT: clearable_by is a LIST of mechanism ids, so a consumer branches on
 # membership instead of parsing a sentence. The old scalar "session restart only"
 # must be gone AND the list must actually name the mechanism that replaced it.
-[ "$(printf '%s' "$SWJ" | jq -r '.clearable_by | type')" = "array" ] \
-  && ok "sweep --json clearable_by is a machine-readable list" \
-  || bad "clearable_by not a list (got type '$(printf '%s' "$SWJ" | jq -r '.clearable_by|type')')"
-printf '%s' "$SWJ" | jq -e '.clearable_by | index("TaskStop")' >/dev/null 2>&1 \
-  && ok "sweep --json clearable_by names TaskStop" || bad "clearable_by omits TaskStop"
+if [ "$(printf '%s' "$SWJ" | jq -r '.clearable_by | type')" = "array" ]; then
+  ok "sweep --json clearable_by is a machine-readable list"
+else
+  bad "clearable_by not a list (got type '$(printf '%s' "$SWJ" | jq -r '.clearable_by|type')')"
+fi
+if printf '%s' "$SWJ" | jq -e '.clearable_by | index("TaskStop")' >/dev/null 2>&1; then
+  ok "sweep --json clearable_by names TaskStop"
+else
+  bad "clearable_by omits TaskStop"
+fi
 # `type=="array" and` is load-bearing: jq's `length` on the old scalar returns the
 # STRING length (20), which would sail past a bare `>= 2` and green-light exactly
 # the claim this asserts is gone.
-printf '%s' "$SWJ" | jq -e '.clearable_by | type == "array" and length >= 2' >/dev/null 2>&1 \
-  && ok "sweep --json offers more than one mechanism (not restart-only)" \
-  || bad "clearable_by lists fewer than 2 mechanisms — the restart-only claim survives"
-printf '%s' "$SWJ" | jq -e '.clearable_by | index("session-restart")' >/dev/null 2>&1 \
-  && ok "sweep --json keeps session-restart as fallback" || bad "clearable_by dropped session-restart"
+if printf '%s' "$SWJ" | jq -e '.clearable_by | type == "array" and length >= 2' >/dev/null 2>&1; then
+  ok "sweep --json offers more than one mechanism (not restart-only)"
+else
+  bad "clearable_by lists fewer than 2 mechanisms — the restart-only claim survives"
+fi
+if printf '%s' "$SWJ" | jq -e '.clearable_by | index("session-restart")' >/dev/null 2>&1; then
+  ok "sweep --json keeps session-restart as fallback"
+else
+  bad "clearable_by dropped session-restart"
+fi
 # Honesty tripwire: TaskStop is documented, NOT verified end to end. It must be
 # absent from the verified subset until a run proves it — so the upgrade is a
 # deliberate act that turns this assertion red, never a silent wording drift.
-printf '%s' "$SWJ" | jq -e '.clearable_by_verified | index("TaskStop") | not' >/dev/null 2>&1 \
-  && ok "sweep --json does NOT claim TaskStop is verified" || bad "clearable_by_verified overstates TaskStop as proven"
-printf '%s' "$SWJ" | jq -e '.clearable_by_verified | index("session-restart")' >/dev/null 2>&1 \
-  && ok "sweep --json marks session-restart as the verified mechanism" || bad "clearable_by_verified omits session-restart"
-[ "$(printf '%s' "$SWJ" | jq -r '.parked_mailbox|length')" -ge 1 ] && ok "sweep --json lists parked mailbox agents" || bad "sweep --json parked list empty"
+if printf '%s' "$SWJ" | jq -e '.clearable_by_verified | index("TaskStop") | not' >/dev/null 2>&1; then
+  ok "sweep --json does NOT claim TaskStop is verified"
+else
+  bad "clearable_by_verified overstates TaskStop as proven"
+fi
+if printf '%s' "$SWJ" | jq -e '.clearable_by_verified | index("session-restart")' >/dev/null 2>&1; then
+  ok "sweep --json marks session-restart as the verified mechanism"
+else
+  bad "clearable_by_verified omits session-restart"
+fi
+if [ "$(printf '%s' "$SWJ" | jq -r '.parked_mailbox|length')" -ge 1 ]; then ok "sweep --json lists parked mailbox agents"; else bad "sweep --json parked list empty"; fi
 
 # ── (9) sweep is idempotent and safe to re-run ──────────────────────────────
 RN_BEFORE="$(jq 'keys|length' "$REAPED")"
 "$AGENTS" sweep >/dev/null 2>&1
 "$AGENTS" sweep >/dev/null 2>&1
 RN_AFTER="$(jq 'keys|length' "$REAPED")"
-[ "$RN_BEFORE" = "$RN_AFTER" ] && ok "sweep idempotent across repeat runs" || bad "sweep drifted registry $RN_BEFORE → $RN_AFTER"
+if [ "$RN_BEFORE" = "$RN_AFTER" ]; then ok "sweep idempotent across repeat runs"; else bad "sweep drifted registry $RN_BEFORE → $RN_AFTER"; fi
 C3="$("$AGENTS" count)"
-[ "$C3" = "2" ] && ok "count stable after repeated sweeps" || bad "count drifted to '$C3'"
+if [ "$C3" = "2" ]; then ok "count stable after repeated sweeps"; else bad "count drifted to '$C3'"; fi
 
 # ── (10) explicit opt-out ───────────────────────────────────────────────────
 OUT="$(HMD_AGENT_NO_SWEEP=1 "$AGENTS" sweep 2>&1)"
-grep -q "disabled" <<<"$OUT" && ok "HMD_AGENT_NO_SWEEP=1 disables sweep" || bad "opt-out not honoured"
+if grep -q "disabled" <<<"$OUT"; then ok "HMD_AGENT_NO_SWEEP=1 disables sweep"; else bad "opt-out not honoured"; fi
 
 # ── (11) World B: owning session process is GONE ⇒ provably dead ⇒ orphaned ──
 REAPED_B="$WORK/reaped-b.json"
 ORPH="$(HMD_AGENT_REAPED_FILE="$REAPED_B" HMD_AGENT_LIVE_SLUGS="" "$AGENTS" list --json)"
-[ "$(printf '%s' "$ORPH" | jq -r --arg i "$A_STALE" '.[]|select(.id==$i)|.state')" = "orphaned" ] \
-  && ok "dead session ⇒ un-notified stale agent → orphaned" || bad "expected orphaned for stale in dead session"
-[ "$(printf '%s' "$ORPH" | jq -r --arg i "$A_MBOX" '.[]|select(.id==$i)|.state')" = "orphaned" ] \
-  && ok "dead session ⇒ parked teammate → orphaned (provably gone)" || bad "expected orphaned for mailbox in dead session"
-[ "$(printf '%s' "$ORPH" | jq -r --arg i "$A_WORK" '.[]|select(.id==$i)|.state')" = "working" ] \
-  && ok "GUARD: working agent stays working even in dead-session world" \
-  || bad "GUARD BROKEN: working agent reclassified in dead-session world"
+if [ "$(printf '%s' "$ORPH" | jq -r --arg i "$A_STALE" '.[]|select(.id==$i)|.state')" = "orphaned" ]; then
+  ok "dead session ⇒ un-notified stale agent → orphaned"
+else
+  bad "expected orphaned for stale in dead session"
+fi
+if [ "$(printf '%s' "$ORPH" | jq -r --arg i "$A_MBOX" '.[]|select(.id==$i)|.state')" = "orphaned" ]; then
+  ok "dead session ⇒ parked teammate → orphaned (provably gone)"
+else
+  bad "expected orphaned for mailbox in dead session"
+fi
+if [ "$(printf '%s' "$ORPH" | jq -r --arg i "$A_WORK" '.[]|select(.id==$i)|.state')" = "working" ]; then
+  ok "GUARD: working agent stays working even in dead-session world"
+else
+  bad "GUARD BROKEN: working agent reclassified in dead-session world"
+fi
 
 # ── (11b) LIVENESS EVIDENCE: a freshly-written session transcript proves the
 # session is alive. Measured root cause of defect 1: `pgrep -x claude` + lsof cwd
@@ -364,25 +443,27 @@ set_mtime "$LIVEPROBE/$SLUG/$ASESS/subagents/agent-$A_STALE.jsonl" $(( NOW - 500
 : > "$LIVEPROBE/$SLUG/$ASESS.jsonl"; set_mtime "$LIVEPROBE/$SLUG/$ASESS.jsonl" $(( NOW - 5 ))
 LP="$(HMD_AGENT_PROJECTS_DIR="$LIVEPROBE" HMD_AGENT_REAPED_FILE="$WORK/reaped-lp.json" \
       env -u HMD_AGENT_LIVE_SLUGS "$AGENTS" list --json 2>/dev/null)"
-[ "$(printf '%s' "$LP" | jq -r --arg i "$A_STALE" '.[]|select(.id==$i)|.state')" = "stale" ] \
-  && ok "fresh session transcript ⇒ session alive ⇒ stale, not orphaned" \
-  || bad "fresh-transcript liveness ignored: got '$(printf '%s' "$LP" | jq -r --arg i "$A_STALE" '.[]|select(.id==$i)|.state')'"
+if [ "$(printf '%s' "$LP" | jq -r --arg i "$A_STALE" '.[]|select(.id==$i)|.state')" = "stale" ]; then
+  ok "fresh session transcript ⇒ session alive ⇒ stale, not orphaned"
+else
+  bad "fresh-transcript liveness ignored: got '$(printf '%s' "$LP" | jq -r --arg i "$A_STALE" '.[]|select(.id==$i)|.state')'"
+fi
 
 # ── (12) degraded honesty: unreadable / missing inputs must not crash or lie ──
 CZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" count)"
-[ "$CZERO" = "0" ] && ok "absent task dir → count 0 (fail-closed)" || bad "absent task dir count expected 0, got '$CZERO'"
+if [ "$CZERO" = "0" ]; then ok "absent task dir → count 0 (fail-closed)"; else bad "absent task dir count expected 0, got '$CZERO'"; fi
 LZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" list)"
-grep -q "no tracked subagents" <<<"$LZERO" && ok "absent task dir → honest empty list" || bad "absent task dir list wrong"
+if grep -q "no tracked subagents" <<<"$LZERO"; then ok "absent task dir → honest empty list"; else bad "absent task dir list wrong"; fi
 SZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" sweep 2>&1)"; SZ_RC=$?
-[ "$SZ_RC" = "0" ] && ok "sweep exits 0 on absent task dir" || bad "sweep exit $SZ_RC on absent task dir: $SZERO"
+if [ "$SZ_RC" = "0" ]; then ok "sweep exits 0 on absent task dir"; else bad "sweep exit $SZ_RC on absent task dir: $SZERO"; fi
 OZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" orphans 2>&1)"; OZ_RC=$?
-[ "$OZ_RC" = "0" ] && ok "orphans exits 0 on absent task dir" || bad "orphans exit $OZ_RC on absent task dir: $OZERO"
+if [ "$OZ_RC" = "0" ]; then ok "orphans exits 0 on absent task dir"; else bad "orphans exit $OZ_RC on absent task dir: $OZERO"; fi
 
 # Transcript deleted out from under us: metadata gone, must degrade not crash.
 BROKEN="$WORK/broken"; mkdir -p "$BROKEN"
 ln -sf "$WORK/no-such-transcript.jsonl" "$BROKEN/a7777777777777777.output"
 BOUT="$(HMD_AGENT_TASKDIR="$BROKEN" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" list --json 2>/dev/null)"
-[ "$(printf '%s' "$BOUT" | jq -r 'type')" = "array" ] && ok "dangling transcript → valid JSON, no crash" || bad "dangling transcript produced invalid output"
+if [ "$(printf '%s' "$BOUT" | jq -r 'type')" = "array" ]; then ok "dangling transcript → valid JSON, no crash"; else bad "dangling transcript produced invalid output"; fi
 BC="$(HMD_AGENT_TASKDIR="$BROKEN" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" count 2>/dev/null)"
 case "$BC" in ''|*[!0-9]*) bad "dangling transcript count not numeric: '$BC'" ;; *) ok "dangling transcript → numeric count ($BC)" ;; esac
 
@@ -397,7 +478,7 @@ cp "$SUBDIR/agent-$A_DONE.jsonl" "$CORRUPTP/$SLUG/$ASESS/subagents/" 2>/dev/null
 cp "$SUBDIR/agent-$A_DONE.meta.json" "$CORRUPTP/$SLUG/$ASESS/subagents/" 2>/dev/null
 printf '{"type":"queue-operation","content":"<task-notification>\n<task-id>trunc\n' > "$CORRUPTP/$SLUG/$ASESS.jsonl"
 CPOUT="$(HMD_AGENT_PROJECTS_DIR="$CORRUPTP" HMD_AGENT_REAPED_FILE="$WORK/reaped-cp.json" "$AGENTS" list --json 2>/dev/null)"
-[ "$(printf '%s' "$CPOUT" | jq -r 'type')" = "array" ] && ok "truncated parent transcript → valid JSON, no crash" || bad "truncated parent transcript broke list"
+if [ "$(printf '%s' "$CPOUT" | jq -r 'type')" = "array" ]; then ok "truncated parent transcript → valid JSON, no crash"; else bad "truncated parent transcript broke list"; fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # (13) live_slugs ON-DISK CACHE — a fresh cache is read without re-probing; a
@@ -461,10 +542,16 @@ rm -f "$LS_CACHE"
 N0="$(ls_pgrep_calls)"
 C1="$(ls_count)"
 N1="$(ls_pgrep_calls)"
-[ "$N1" -gt "$N0" ] && ok "missing cache -> live_slugs probes (pgrep invoked)" \
-  || bad "missing cache should have probed pgrep ($N0 -> $N1 calls)"
-[ -f "$LS_CACHE" ] && ok "probe result written through to the on-disk cache" \
-  || bad "cache file not created after a real probe"
+if [ "$N1" -gt "$N0" ]; then
+  ok "missing cache -> live_slugs probes (pgrep invoked)"
+else
+  bad "missing cache should have probed pgrep ($N0 -> $N1 calls)"
+fi
+if [ -f "$LS_CACHE" ]; then
+  ok "probe result written through to the on-disk cache"
+else
+  bad "cache file not created after a real probe"
+fi
 case "$C1" in ''|*[!0-9]*) bad "count not numeric after cold probe: '$C1'" ;; *) ok "count numeric after cold probe ($C1)" ;; esac
 
 # (13b) cache just written -> pin its mtime to the fictional test clock (the
@@ -475,10 +562,16 @@ set_mtime "$LS_CACHE" "$NOW"
 N0="$(ls_pgrep_calls)"
 C2="$(ls_count)"
 N1="$(ls_pgrep_calls)"
-[ "$N1" = "$N0" ] && ok "fresh cache served without re-probing pgrep" \
-  || bad "fresh cache still re-probed pgrep ($N0 -> $N1 calls)"
-[ "$C1" = "$C2" ] && ok "cached count matches the freshly-probed count" \
-  || bad "count changed between fresh-cache reads ($C1 vs $C2)"
+if [ "$N1" = "$N0" ]; then
+  ok "fresh cache served without re-probing pgrep"
+else
+  bad "fresh cache still re-probed pgrep ($N0 -> $N1 calls)"
+fi
+if [ "$C1" = "$C2" ]; then
+  ok "cached count matches the freshly-probed count"
+else
+  bad "count changed between fresh-cache reads ($C1 vs $C2)"
+fi
 
 # (13c) HMD_AGENT_LIVE_SLUGS_TTL is actually honoured, not just the hardcoded
 # default: age the cache PAST a short override TTL while still well inside the
@@ -487,17 +580,22 @@ set_mtime "$LS_CACHE" $(( NOW - 10 ))
 N0="$(ls_pgrep_calls)"
 ls_count 5 >/dev/null
 N1="$(ls_pgrep_calls)"
-[ "$N1" -gt "$N0" ] \
-  && ok "HMD_AGENT_LIVE_SLUGS_TTL shortens freshness (age 10s, ttl 5s -> re-probe)" \
-  || bad "TTL override not honoured ($N0 -> $N1 calls)"
+if [ "$N1" -gt "$N0" ]; then
+  ok "HMD_AGENT_LIVE_SLUGS_TTL shortens freshness (age 10s, ttl 5s -> re-probe)"
+else
+  bad "TTL override not honoured ($N0 -> $N1 calls)"
+fi
 
 # (13d) cache aged past even the default TTL -> re-probes.
 set_mtime "$LS_CACHE" $(( NOW - 9999 ))
 N0="$(ls_pgrep_calls)"
 C3="$(ls_count)"
 N1="$(ls_pgrep_calls)"
-[ "$N1" -gt "$N0" ] && ok "stale cache (past default TTL) triggers a fresh probe" \
-  || bad "stale cache did not re-probe ($N0 -> $N1 calls)"
+if [ "$N1" -gt "$N0" ]; then
+  ok "stale cache (past default TTL) triggers a fresh probe"
+else
+  bad "stale cache did not re-probe ($N0 -> $N1 calls)"
+fi
 case "$C3" in ''|*[!0-9]*) bad "count not numeric after stale re-probe: '$C3'" ;; *) ok "count numeric after stale re-probe ($C3)" ;; esac
 
 # (13e) HMD_AGENT_LIVE_SLUGS override still bypasses the cache ENTIRELY — never
@@ -508,10 +606,16 @@ OV="$(HMD_AGENT_TASKDIR="$LS_TASKDIR" HMD_AGENT_PROJECTS_DIR="$LS_PROJ" \
       HMD_AGENT_REAPED_FILE="$LS_DIR/reaped-ov.json" HMD_AGENT_CWD="$LS_CWD" \
       HMD_AGENT_LIVE_SLUGS="" PATH="$LS_FAKEBIN:$PATH" "$AGENTS" count)"
 N1="$(ls_pgrep_calls)"
-[ "$N1" = "$N0" ] && ok "HMD_AGENT_LIVE_SLUGS override bypasses the disk cache entirely (no probe)" \
-  || bad "override still triggered a probe ($N0 -> $N1 calls)"
-[ ! -f "$LS_CACHE" ] && ok "override never writes the cache file" \
-  || bad "override unexpectedly created a cache file"
+if [ "$N1" = "$N0" ]; then
+  ok "HMD_AGENT_LIVE_SLUGS override bypasses the disk cache entirely (no probe)"
+else
+  bad "override still triggered a probe ($N0 -> $N1 calls)"
+fi
+if [ ! -f "$LS_CACHE" ]; then
+  ok "override never writes the cache file"
+else
+  bad "override unexpectedly created a cache file"
+fi
 case "$OV" in ''|*[!0-9]*) bad "count not numeric under override: '$OV'" ;; *) ok "count numeric under override ($OV)" ;; esac
 
 echo
