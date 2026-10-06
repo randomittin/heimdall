@@ -76,9 +76,11 @@
 from __future__ import annotations
 
 import abc
+import contextlib
 import json
 import os
 import sys
+import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -284,16 +286,24 @@ class LocalBackend(StateBackend):
         return out
 
     def put_record(self, rel, record):
-        """Atomic keyed write: mktemp + json.dump(indent=2, sort_keys) + os.replace.
-        Byte-identical to cp_approval._write_record. False on OSError."""
+        """Atomic keyed write: mkstemp + json.dump(indent=2, sort_keys) + os.replace.
+        Byte-identical to cp_approval._write_record. False on OSError. The temp file is unique per call, so two
+        threads writing one key never share one (the loser's rename used to fail ENOENT: a lost write, and a torn
+        record when both had written into the same file)."""
         try:
             abspath = self.path(rel)
-            os.makedirs(os.path.dirname(abspath), exist_ok=True)
-            tmp = abspath + ".tmp.%d" % os.getpid()
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(record, fh, sort_keys=True, indent=2)
-                fh.flush()
-            os.replace(tmp, abspath)
+            d = os.path.dirname(abspath)
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(abspath) + ".tmp.")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(record, fh, sort_keys=True, indent=2)
+                    fh.flush()
+                os.replace(tmp, abspath)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
             return True
         except OSError:
             return False

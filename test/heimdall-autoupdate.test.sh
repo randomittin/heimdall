@@ -38,6 +38,19 @@ BIN="$REPO/bin/heimdall-autoupdate"
 
 [ -x "$BIN" ] || { echo "FATAL: $BIN missing/not executable" >&2; exit 2; }
 
+# THE REAL MODULE-RECONCILE PATH RUNS HERE TOO. `update` acquires the default-included
+# module (headroom — its own consent waiver lets the updater take it unprompted) through
+# `heimdall-modules add`, whose traffic-proxy `no-signed-traffic-routing` invariant curls
+# $HEIMDALL_DEFAULT_CP_URL/readyz. Unpinned that is the LIVE production control plane:
+# measured at 12 GET /readyz per run against a recording server, from a suite whose header
+# says it NEVER hits the network. Nothing below depends on the answer — every verdict is
+# read back from autoupdate.log and is identical with the control plane reachable or not
+# (the suite passes with outbound network denied) — so the default is pinned at a dead
+# loopback port (test/lib/net-default-guard.sh) instead of phoning production. Unset first
+# so an ambient pin, live or dead, cannot leak in.
+unset HEIMDALL_DEFAULT_CP_URL
+. "$REPO/test/lib/net-default-guard.sh"
+
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS+1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
