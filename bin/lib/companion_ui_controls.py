@@ -571,13 +571,15 @@ def _validate(action, params):
     if size > MAX_COMMAND_BYTES:
         raise _Refusal("bad-params")
     rid = params.get("rid")
-    if "rid" in params and not (isinstance(rid, str) and RID_RE.fullmatch(rid)):
+    rid_re = spec["policy"].get("rid_re")
+    if ("rid" in params or rid_re is not None) and not (isinstance(rid, str) and (rid_re or RID_RE).fullmatch(rid)):
         raise _Refusal("bad-params")
     body = {k: v for k, v in params.items() if k != "rid"}
     keys = set(body)
     if not set(spec["required"]) <= keys or not keys <= set(spec["required"]) | set(spec["optional"]):
         raise _Refusal("bad-params")
-    return rid, spec["fields"](body)
+    fields = spec["fields"](body)
+    return rid, (dict(fields, rid=rid) if rid_re is not None else fields)
 
 
 # -- rate limits ------------------------------------------------------------------------------------------------
@@ -616,12 +618,12 @@ def _charge(root, action):
     """Take one token from every bucket this command draws on, or raise rate-limited with the longest wait. Nothing is
     taken when any bucket is empty, so a refused command never spends budget."""
     now = time.monotonic()
-    names = [("*",) + _GLOBAL_RATE]
+    names = [("*",) + _GLOBAL_RATE] if _ACTIONS[action]["policy"].get("global_rate", True) else []
     for i, (cap, per) in enumerate(_ACTIONS[action]["rate"]):
         names.append(("%s#%d" % (action, i), cap, per))
     with _LOCK:
         buckets = [_BUCKETS.setdefault((root, n), _Bucket(cap, per)) for n, cap, per in names]
-        wait = max(b.wait(now) for b in buckets)
+        wait = max([b.wait(now) for b in buckets] or [0.0])
         if wait > 0:
             raise _Refusal("rate-limited", {"retry_after_s": max(1, int(math.ceil(wait)))})
         for b in buckets:
@@ -773,7 +775,7 @@ def _rate_pairs(rate):
 
 
 def register_action(name, *, cls, handler, required=(), optional=(), fields=_no_fields, audit=None, rate=None, switch=None,
-                    repo_field=None, usable=None):
+                    repo_field=None, usable=None, policy=None):
     """Put `name` on the allowlist: the one way an action gets in (module import time; trusted code only). `handler(root,
     fields, ctx)` returns (ok, detail, extra). `cls` is read | safe-write | risky-write | expand. An expand action names its
     laptop `switch` (launch | merge) and, when the phone picks the repo, `repo_field` -- the param holding an allowlist id
@@ -797,9 +799,12 @@ def register_action(name, *, cls, handler, required=(), optional=(), fields=_no_
         raise ValueError("a reserved name keeps its class and switch")
     if name in KILL_SWITCH_EXEMPT and cls != CLASS_SAFE_WRITE:
         raise ValueError("only a safe-write action can be exempt from the kill switch")
+    policy = dict(policy or {})
+    if not set(policy) <= POLICY_KEYS or (policy.get("open_switch") and cls != CLASS_EXPAND):
+        raise ValueError("unknown policy key, or open_switch on an action that is not expand")
     _ACTIONS[name] = {"cls": cls, "switch": switch, "repo_field": repo_field, "required": tuple(required),
                       "optional": tuple(optional), "fields": fields, "audit": audit or (lambda f: {}), "handler": handler,
-                      "rate": _rate_pairs(rate), "usable": usable,
+                      "rate": _rate_pairs(rate), "usable": usable, "policy": policy,
                       "timeline": cls == CLASS_EXPAND or name in KILL_SWITCH_EXEMPT}
     ACTION_ORDER.append(name)
     ALLOWED_ACTIONS = frozenset(_ACTIONS)
@@ -815,6 +820,27 @@ register_action("hook-toggle", cls=CLASS_RISKY_WRITE, handler=_do_hook_toggle, r
 register_action("fallback-mode", cls=CLASS_RISKY_WRITE, handler=_do_fallback_mode, required=("mode",), optional=("confirm",),
                 fields=_fallback_fields, audit=_audit_fallback, rate=(3, 3 / 60.0),
                 usable=lambda root: _usable_tool("heimdall-fallback"))
+
+
+# -- actions a sibling module owns ------------------------------------------------------------------------------
+# A module named here registers its own action(s) through register_actions(kit) when this one imports (trusted code only,
+# like every register_action call); one that cannot load, or raises, simply leaves its action off the allowlist.
+ACTION_MODULES = ("companion_dashboards",)
+
+
+def _load_action_modules():
+    kit = types.SimpleNamespace(register_action=register_action, CLASS_EXPAND=CLASS_EXPAND, Refusal=_Refusal, audit=_audit,
+                                iso=_iso, controls_enabled=controls_enabled)
+    for name in ACTION_MODULES:
+        hook = getattr(_sibling(name), "register_actions", None)
+        if callable(hook):
+            try:
+                hook(kit)
+            except Exception as e:
+                sys.stderr.write("companion_ui_controls: %s did not register its actions (%s)\n" % (name, type(e).__name__))
+
+
+_load_action_modules()
 
 
 # -- dispatch ---------------------------------------------------------------------------------------------------
@@ -845,7 +871,10 @@ def _authorize(root, spec, fields):
     merge switch, was added with --merge. `fields` is None when the params were malformed: only the switch is checked."""
     sw = _switches()
     if sw is None or not sw.switch_enabled(spec["switch"]):
-        return None, None, "not-allowed"
+        return None, None, spec["policy"].get("off_detail", "not-allowed")
+    if spec["policy"].get("open_switch"):    # acts on the session's own repo only: the switch is the whole gate
+        real = os.path.realpath(root)
+        return {"id": sw.repo_id(real), "label": None, "path": real, "merge": False}, sw.repo_id(real), None
     if fields is None:
         return None, None, None
     if spec["repo_field"] is not None:
