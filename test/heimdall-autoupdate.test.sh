@@ -49,6 +49,8 @@ BIN="$REPO/bin/heimdall-autoupdate"
 # loopback port (test/lib/net-default-guard.sh) instead of phoning production. Unset first
 # so an ambient pin, live or dead, cannot leak in.
 unset HEIMDALL_DEFAULT_CP_URL
+# shellcheck source=lib/net-default-guard.sh
+# shellcheck disable=SC1091  # sourced lib is not a shellcheck input without -x
 . "$REPO/test/lib/net-default-guard.sh"
 
 PASS=0
@@ -151,9 +153,11 @@ rm -rf "$H"
 H="$(mk_home)"
 HEIMDALL_HOME="$H" HEIMDALL_LATEST_OVERRIDE="$NEWER" HEIMDALL_AUTOUPDATE_DRYRUN=1 \
   "$BIN" check >/dev/null 2>&1
-grep -q 'would-apply' "$H/autoupdate.log" 2>/dev/null \
-  && ok "C1 latest>installed → would-apply" \
-  || bad "C1 expected would-apply (log='$(last_log "$H")')"
+if grep -q 'would-apply' "$H/autoupdate.log" 2>/dev/null; then
+  ok "C1 latest>installed → would-apply"
+else
+  bad "C1 expected would-apply (log='$(last_log "$H")')"
+fi
 rm -rf "$H"
 
 H="$(mk_home)"
@@ -192,9 +196,11 @@ rm -rf "$H"
 
 H="$(mk_home)"
 OUT="$(HEIMDALL_HOME="$H" HEIMDALL_LATEST_OVERRIDE="$SAME" "$BIN" status 2>/dev/null)"
-grep -q 'pending:   no' <<<"$OUT" \
-  && ok "D2 status pending:no when latest==installed" \
-  || bad "D2 expected pending:no: $OUT"
+if grep -q 'pending:   no' <<<"$OUT"; then
+  ok "D2 status pending:no when latest==installed"
+else
+  bad "D2 expected pending:no: $OUT"
+fi
 rm -rf "$H"
 
 # ── E. SAFETY ─────────────────────────────────────────────────────────────────────
@@ -222,9 +228,11 @@ rm -rf "$H"
 H="$(mk_home)"
 HEIMDALL_HOME="$H" "$BIN" frobnicate >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] \
-  && ok "E2 unknown subcommand exits non-zero (rc=$rc)" \
-  || bad "E2 unknown subcommand should be non-zero (rc=$rc)"
+if [ "$rc" -ne 0 ]; then
+  ok "E2 unknown subcommand exits non-zero (rc=$rc)"
+else
+  bad "E2 unknown subcommand should be non-zero (rc=$rc)"
+fi
 rm -rf "$H"
 
 # ── F. UPDATE-CHECK CACHE: the background check WRITES the signal the statusline reads ─

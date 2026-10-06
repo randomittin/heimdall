@@ -19,6 +19,7 @@
 #                  the same bytes: what the Worker accepts verifies, what it refuses does not
 #
 # Hermetic: no network, no deploy, no key outside memory and a throwaway dir.
+# shellcheck disable=SC2016  # the `bash -c '...'` bodies below are single-quoted on purpose: $1/$2 expand in the child shell
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,7 +79,7 @@ PY
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo "[V] vectors replayed against bin/lib/runhmd_receipt.py"
-[ -f "$VECTORS" ] && ok "receipts-worker/contract/vectors.json exists" || bad "receipts-worker/contract/vectors.json exists"
+if [ -f "$VECTORS" ]; then ok "receipts-worker/contract/vectors.json exists"; else bad "receipts-worker/contract/vectors.json exists"; fi
 check "the vectors file is JSON with anchors, canonical[] and receipts[]" \
   jq -e '(.anchors|length)>=1 and (.canonical|length)>=100 and (.receipts|length)>=60' "$VECTORS"
 check "the recorded outcomes span ok, not_json, schema, not_canonical, unknown_key and bad_signature" \
@@ -86,8 +87,8 @@ check "the recorded outcomes span ok, not_json, schema, not_canonical, unknown_k
 check "some canonical cases are refusals (null) and some are written" \
   jq -e '([.canonical[]|select(.hex==null)]|length)>=8 and ([.canonical[]|select(.hex!=null)]|length)>=100' "$VECTORS"
 OUT="$(python3 "$TMP/replay.py" "$PYLIB" "$VECTORS" 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "Python gives every recorded canonical byte string and verify outcome ($(printf '%s' "$OUT" | tail -1))" \
-  || bad "Python disagrees with the recorded vectors: $(printf '%s' "$OUT" | head -5 | tr '\n' '|')"
+if [ "$RC" -eq 0 ]; then ok "Python gives every recorded canonical byte string and verify outcome ($(printf '%s' "$OUT" | tail -1))"
+else bad "Python disagrees with the recorded vectors: $(printf '%s' "$OUT" | head -5 | tr '\n' '|')"; fi
 
 mutant() {  # mutant <description> <jq filter>: the replay must go red on the tampered copy
   local desc="$1" filter="$2" f="$TMP/mutant.$RANDOM.json"
@@ -162,7 +163,7 @@ for case in doc["receipts"]:
 PY
 cli() { HEIMDALL_HOME="$TMP/home" "$REPO/bin/heimdall-receipt" verify "$TMP/v-$1.json" --pubkey "$TMP/anchor.pub" --json </dev/null 2>&1; }
 OUTV="$(cli denied-canonical-lf)"; RCV=$?
-[ "$RCV" -eq 0 ] && ok "a vector receipt the Worker accepts verifies with the CLI (exit 0)" || bad "CLI rejects an accepted receipt (rc=$RCV: $(printf '%s' "$OUTV" | head -c 160))"
+if [ "$RCV" -eq 0 ]; then ok "a vector receipt the Worker accepts verifies with the CLI (exit 0)"; else bad "CLI rejects an accepted receipt (rc=$RCV: $(printf '%s' "$OUTV" | head -c 160))"; fi
 for pair in "tampered-cost:bad_signature" "tampered-id:bad_signature" "signature-first-char:bad_signature" "stranger-signer:unknown_key" \
             "crlf-ending:not_canonical" "pretty-printed:not_canonical" "unsigned:schema" "extra-member:schema" "not-json:not_json"; do
   name="${pair%%:*}"; kind="${pair##*:}"

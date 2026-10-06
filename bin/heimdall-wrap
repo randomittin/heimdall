@@ -50,6 +50,7 @@ HEIMDALL_HOME_DIR="${HEIMDALL_HOME:-$HOME/.heimdall}"
 # which itself routes nothing unless the module is added, un-opted-out and its proxy is
 # live. Absent file -> the chain simply never engages, which is a supported state.
 # shellcheck source=lib/hmd-headroom-chain.sh
+# shellcheck disable=SC1091  # sourced lib is not a shellcheck input without -x
 [ -r "$BIN_DIR/lib/hmd-headroom-chain.sh" ] && . "$BIN_DIR/lib/hmd-headroom-chain.sh"
 
 C='\033[38;2;0;212;255m'; G='\033[38;2;78;204;163m'; W='\033[38;2;255;200;80m'
@@ -59,6 +60,7 @@ D='\033[2m'; B='\033[1m'; R='\033[0m'
 TOOLS="claude cursor codex gemini aider"
 
 QUIET=0
+# shellcheck disable=SC2059  # printf wrapper: every caller passes a literal format string as "$1"
 say()  { [ "$QUIET" -eq 1 ] || printf "$@"; }
 die()  { printf "  ${W}heimdall wrap:${R} %s\n" "$1" >&2; exit "${2:-1}"; }
 
@@ -512,6 +514,7 @@ install_path_block() {
   ensure_trailing_newline "$rc"
   {
     printf '%s\n' "$RC_BEGIN"
+    # shellcheck disable=SC2016  # literal $PATH on purpose: written into the rc file, expanded when the rc is sourced
     printf 'export PATH="%s:$PATH"\n' "$SHIM_DIR"
     printf '%s\n' "$RC_END"
   } >> "$rc" 2>/dev/null || return 1
@@ -659,7 +662,7 @@ do_status() {
     if [ -f "$sd/manifest" ]; then
       any=1
       printf "  %-8s ${G}wrapped${R}" "$t"
-      [ -e "$SHIM_DIR/$t" ] && printf " ${D}+ shim${R}"
+      [ -e "$SHIM_DIR/$t" ] && printf " %b+ shim%b" "$D" "$R"
       printf "\n"
     fi
   done
@@ -668,12 +671,12 @@ do_status() {
 }
 
 usage() {
-  printf "\n  ${B}hmd wrap${R} — put a coding tool behind the Heimdall gate\n\n"
-  printf "    ${C}hmd wrap${R} [tool]            wrap this repo and launch the tool\n"
-  printf "    ${C}hmd wrap${R} <tool> --always   also make \`<tool>\` itself a wrapped session\n"
-  printf "    ${C}hmd wrap${R} <tool> --default  remember <tool> as the default\n"
-  printf "    ${C}hmd unwrap${R} <tool>          reverse every change\n"
-  printf "    ${C}hmd wrap${R} status            what is wrapped here\n\n"
+  printf "\n  %bhmd wrap%b — put a coding tool behind the Heimdall gate\n\n" "$B" "$R"
+  printf "    %bhmd wrap%b [tool]            wrap this repo and launch the tool\n" "$C" "$R"
+  printf "    %bhmd wrap%b <tool> --always   also make \`<tool>\` itself a wrapped session\n" "$C" "$R"
+  printf "    %bhmd wrap%b <tool> --default  remember <tool> as the default\n" "$C" "$R"
+  printf "    %bhmd unwrap%b <tool>          reverse every change\n" "$C" "$R"
+  printf "    %bhmd wrap%b status            what is wrapped here\n\n" "$C" "$R"
   printf "  tools: ${D}%s${R}\n\n" "$TOOLS"
 }
 

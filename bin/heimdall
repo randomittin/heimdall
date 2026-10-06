@@ -287,17 +287,17 @@ except Exception:
   local Y O R D
   Y='\033[38;2;255;200;80m'; O='\033[1m'; R='\033[0m'; D='\033[2m'
   {
-    printf "\n  ${Y}${O}⚠ SWITCH — this ENTIRE session is now routed to a third-party model${R}\n"
+    printf "\n  %b%b⚠ SWITCH — this ENTIRE session is now routed to a third-party model%b\n" "$Y" "$O" "$R"
     printf "    endpoint: %s\n" "$fb_url"
     printf "    model:    %s\n" "${ANTHROPIC_MODEL:-(none pinned -- OmniRoute receives bare claude-* ids)}"
-    printf "    ${D}Prompt-cache is lost on this path (OmniRoute drops cache_control; Anthropic's${R}\n"
+    printf "    %bPrompt-cache is lost on this path (OmniRoute drops cache_control; Anthropic's%b\n" "$D" "$R"
     printf "    ${D}own cache is measured at ~91-95%% of the value on the table), and this${R}\n"
-    printf "    ${D}session's context goes to that provider, not Anthropic -- a measured live run${R}\n"
-    printf "    ${D}carried ~41,000 tokens of local context in a single request.${R}\n"
-    printf "    ${D}Judge subagents (hmd:reviewer / hmd:verifier / hmd:security-auditor) will be${R}\n"
-    printf "    ${D}DENIED for the rest of this session -- bin/heimdall-precheck-agent's own${R}\n"
-    printf "    ${D}adjudication fence working as designed, not a bug.${R}\n"
-    printf "    ${D}Undo: heimdall-fallback set off${R}\n\n"
+    printf "    %bsession's context goes to that provider, not Anthropic -- a measured live run%b\n" "$D" "$R"
+    printf "    %bcarried ~41,000 tokens of local context in a single request.%b\n" "$D" "$R"
+    printf "    %bJudge subagents (hmd:reviewer / hmd:verifier / hmd:security-auditor) will be%b\n" "$D" "$R"
+    printf "    %bDENIED for the rest of this session -- bin/heimdall-precheck-agent's own%b\n" "$D" "$R"
+    printf "    %badjudication fence working as designed, not a bug.%b\n" "$D" "$R"
+    printf "    %bUndo: heimdall-fallback set off%b\n\n" "$D" "$R"
   } >&2
 }
 
@@ -486,8 +486,8 @@ f1_persona_check() {
         # user who doesn't already know which to pick can decide. This is ONLY a
         # communication-style preference — it does not limit what Heimdall can do,
         # and it can be changed later.
-        printf "\n  ${P}One-time question${R} — how should Heimdall explain its work to you?\n"
-        printf "    ${D}This only changes the wording of explanations, not what Heimdall can do.${R}\n"
+        printf "\n  %bOne-time question%b — how should Heimdall explain its work to you?\n" "$P" "$R"
+        printf "    %bThis only changes the wording of explanations, not what Heimdall can do.%b\n" "$D" "$R"
         # Arrow-key selection (↑/↓ + Enter; j/k aliases; Ctrl-C cancels and
         # restores the terminal). hmd_select renders the highlighted choice and
         # returns the picked index in HMD_SELECT_INDEX. It reads keys ONLY on a
@@ -559,12 +559,12 @@ f1_onboard_if_cold() {
       local G C D B R
       G='\033[38;2;78;204;163m'; C='\033[38;2;0;212;255m'
       D='\033[2m'; B='\033[1m'; R='\033[0m'
-      printf "\n  ${B}New here?${R} Heimdall is an autonomous build agent — you describe a task,\n"
+      printf "\n  %bNew here?%b Heimdall is an autonomous build agent — you describe a task,\n" "$B" "$R"
       printf "  it plans, writes the code, runs the tests, and commits the result for you.\n\n"
-      printf "  ${B}Best first step${R} — watch it build something real, end to end:\n"
-      printf "    ${C}hmd demo --run${R}  ${D}— scaffolds a Todo API + frontend + tests and builds it${R}\n\n"
-      printf "  ${D}Or just tell it what you want:${R}  ${C}hmd \"build a CLI that renames files\"${R}\n"
-      printf "  ${G}▸${R} ${D}Heimdall writes every file in THIS directory. Nothing ships unproven.${R}\n\n"
+      printf "  %bBest first step%b — watch it build something real, end to end:\n" "$B" "$R"
+      printf "    %bhmd demo --run%b  %b— scaffolds a Todo API + frontend + tests and builds it%b\n\n" "$C" "$R" "$D" "$R"
+      printf "  %bOr just tell it what you want:%b  %bhmd \"build a CLI that renames files\"%b\n" "$D" "$R" "$C" "$R"
+      printf "  %b▸%b %bHeimdall writes every file in THIS directory. Nothing ships unproven.%b\n\n" "$G" "$R" "$D" "$R"
     fi
   fi
 }
@@ -725,6 +725,7 @@ _heimdall_remove_path_export() {
   local D R rc tmp marker mktpl
   D='\033[2m'; R='\033[0m'
   # The EXACT marker comment install.sh writes (kept in sync with install.sh).
+  # shellcheck disable=SC2016  # literal backticks: this is the exact marker comment install.sh writes
   marker='# Added by Heimdall installer — put `hmd`/`heimdall` on PATH'
   # mktemp template built at runtime (the fill run is assembled, not a literal).
   mktpl="${TMPDIR:-/tmp}/heimdall-rc.$(printf 'X%.0s' 1 2 3 4 5 6)"
@@ -1198,11 +1199,11 @@ ensure_auth() {
   # server/VM with no browser, then continue so setup + marker complete regardless.
   local W C D R
   W='\033[38;2;255;200;80m'; C='\033[38;2;0;212;255m'; D='\033[2m'; R='\033[0m'
-  printf "\n  ${W}⚠ Not signed in to Claude Code yet — setup is otherwise complete.${R}\n"
+  printf "\n  %b⚠ Not signed in to Claude Code yet — setup is otherwise complete.%b\n" "$W" "$R"
   printf "  To start running tasks, sign in ONCE, then re-run your command:\n"
-  printf "    ${C}claude${R}              ${D}opens login (a server/VM with no browser prints a code-relay link to open elsewhere)${R}\n"
-  printf "    ${C}claude setup-token${R}  ${D}headless / no browser — generates a token to paste${R}\n"
-  printf "  ${D}(Or export ANTHROPIC_API_KEY to skip interactive login entirely.)${R}\n\n"
+  printf "    %bclaude%b              %bopens login (a server/VM with no browser prints a code-relay link to open elsewhere)%b\n" "$C" "$R" "$D" "$R"
+  printf "    %bclaude setup-token%b  %bheadless / no browser — generates a token to paste%b\n" "$C" "$R" "$D" "$R"
+  printf "  %b(Or export ANTHROPIC_API_KEY to skip interactive login entirely.)%b\n\n" "$D" "$R"
 
   _tele_install_step auth failed "$_auth_t0" auth-deferred "sign-in deferred to user; bootstrap continued"
   return 0
@@ -1219,6 +1220,7 @@ ensure_node_path() {
   local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
   if [ -d "$nvm_dir/versions/node" ]; then
     local latest
+    # shellcheck disable=SC2012  # nvm version dirs are plain vX.Y.Z names, safe to list with ls
     latest=$(ls "$nvm_dir/versions/node" 2>/dev/null | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
     if [ -n "$latest" ] && [ -x "$nvm_dir/versions/node/v${latest}/bin/node" ]; then
       export PATH="$nvm_dir/versions/node/v${latest}/bin:$PATH"
@@ -1591,16 +1593,16 @@ print_banner() {
   local _ver; _ver="$(banner_version)"
   [ -n "$_ver" ] && printf "  ${D}%s${R}\n" "$_ver"
   sleep 0.1
-  printf "  ${V}╭─────────────────────────────────────╮${R}\n"; sleep 0.05
-  printf "  ${V}│${R}  ${C}▸${R} autonomous orchestration          ${V}│${R}\n"; sleep 0.05
-  printf "  ${V}│${R}  ${C}▸${R} wave-based parallel execution     ${V}│${R}\n"; sleep 0.05
-  printf "  ${V}│${R}  ${C}▸${R} smart skill management            ${V}│${R}\n"; sleep 0.05
-  printf "  ${V}│${R}  ${C}▸${R} caveman      ${G}terser output${R}      ${V}│${R}\n"; sleep 0.05
-  printf "  ${V}╰─────────────────────────────────────╯${R}\n"
-  local short_cwd; short_cwd=$(echo "$WORK_DIR" | sed "s|$HOME|~|")
+  printf "  %b╭─────────────────────────────────────╮%b\n" "$V" "$R"; sleep 0.05
+  printf "  %b│%b  %b▸%b autonomous orchestration          %b│%b\n" "$V" "$R" "$C" "$R" "$V" "$R"; sleep 0.05
+  printf "  %b│%b  %b▸%b wave-based parallel execution     %b│%b\n" "$V" "$R" "$C" "$R" "$V" "$R"; sleep 0.05
+  printf "  %b│%b  %b▸%b smart skill management            %b│%b\n" "$V" "$R" "$C" "$R" "$V" "$R"; sleep 0.05
+  printf "  %b│%b  %b▸%b caveman      %bterser output%b      %b│%b\n" "$V" "$R" "$C" "$R" "$G" "$R" "$V" "$R"; sleep 0.05
+  printf "  %b╰─────────────────────────────────────╯%b\n" "$V" "$R"
+  local short_cwd; short_cwd=${WORK_DIR/"$HOME"/\~}
   printf "  ${D}cwd:${R} ${C}%s${R}" "$short_cwd"
   if [ -f "$WORK_DIR/.heimdall-no-autocommit" ] || [ -f "$WORK_DIR/.superx-no-autocommit" ]; then
-    printf "  ${D}[auto-commit: off]${R}"
+    printf "  %b[auto-commit: off]%b" "$D" "$R"
   fi
   printf "\n\n"
 }
@@ -1925,9 +1927,9 @@ case "${1:-}" in
             echo "set -euo pipefail"
             echo "REFS=\"\$(cat)\""
             echo "here=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\""
-            echo "if [ -x \"\$here/pre-push.local\" ]; then printf '%s\\n' \"\$REFS\" | \"\$here/pre-push.local\" \"\$@\"; fi"
+            printf '%s\n' "if [ -x \"\$here/pre-push.local\" ]; then printf '%s\\n' \"\$REFS\" | \"\$here/pre-push.local\" \"\$@\"; fi"
             echo "top=\"\$(git rev-parse --show-toplevel)\""
-            echo "printf '%s\\n' \"\$REFS\" | exec \"\$top/hooks/git/pre-push\" \"\$@\""
+            printf '%s\n' "printf '%s\\n' \"\$REFS\" | exec \"\$top/hooks/git/pre-push\" \"\$@\""
           } > "$custom_dir/pre-push"
           chmod +x "$custom_dir/pre-push"
           dst_hook="$custom_dir/pre-push"
@@ -1949,17 +1951,17 @@ case "${1:-}" in
       fi
     fi
 
-    printf "\n  ${B}Heimdall push guard installed${R}\n\n"
+    printf "\n  %bHeimdall push guard installed%b\n\n" "$B" "$R"
     printf "  ${G}✓${R} hook        %s\n" "$dst_hook"
     printf "  ${G}✓${R} identity    %s ${D}(push-range author+committer allowlist)${R}\n" "$repo_root/bin/heimdall-check-identities"
     printf "  ${G}✓${R} delegates   %s ${D}(full-history secret + identity + landmine)${R}\n" "$repo_root/bin/heimdall-selfscan"
     printf "  ${G}✓${R} core.hooksPath = %s ${D}(relative → survives a repo move)${R}\n" "$rel_hooks_dir"
     printf "\n"
-    printf "  ${D}Runs on EVERY push (human or agent): a push-range identity allowlist${R}\n"
-    printf "  ${D}(root-cause fix for the v2.2.0 R9 trip) + a full-history gitleaks secret${R}\n"
-    printf "  ${D}scan + identity allowlist + landmine lint. A blocked push prints the reason;${R}\n"
-    printf "  ${D}a clean push prints: guard: gitleaks=0 · identities=N/N allowlisted${R}\n"
-    printf "  ${D}Emergency identity bypass (verify first): HEIMDALL_SKIP_ID_GUARD=1 git push${R}\n\n"
+    printf "  %bRuns on EVERY push (human or agent): a push-range identity allowlist%b\n" "$D" "$R"
+    printf "  %b(root-cause fix for the v2.2.0 R9 trip) + a full-history gitleaks secret%b\n" "$D" "$R"
+    printf "  %bscan + identity allowlist + landmine lint. A blocked push prints the reason;%b\n" "$D" "$R"
+    printf "  %ba clean push prints: guard: gitleaks=0 · identities=N/N allowlisted%b\n" "$D" "$R"
+    printf "  %bEmergency identity bypass (verify first): HEIMDALL_SKIP_ID_GUARD=1 git push%b\n\n" "$D" "$R"
     exit 0
     ;;
   uninstall)
@@ -1976,7 +1978,7 @@ case "${1:-}" in
     #                        read from a stdin that will never arrive (that hangs).
     apply_heimdall_theme 2>/dev/null || true
     D='\033[2m'; G='\033[32m'; R='\033[0m'; B='\033[1m'
-    printf "\n  ${B}Uninstalling Heimdall${R}\n\n"
+    printf "\n  %bUninstalling Heimdall%b\n\n" "$B" "$R"
 
     _uyes=0; for _a in "$@"; do { [ "$_a" = "--yes" ] || [ "$_a" = "-y" ]; } && _uyes=1; done
     if [ "$_uyes" -ne 1 ]; then
@@ -1987,14 +1989,14 @@ case "${1:-}" in
         if command -v hmd_confirm >/dev/null 2>&1; then
           hmd_confirm "  Remove heimdall from ~/.heimdall and PATH?" && _confirm=y
         else
-          read -p "  Remove heimdall from ~/.heimdall and PATH? [y/N] " _confirm
+          read -r -p "  Remove heimdall from ~/.heimdall and PATH? [y/N] " _confirm
         fi
         if [[ "${_confirm:-n}" != [yY]* ]]; then
-          printf "\n  ${D}Cancelled — nothing removed.${R}\n\n"
+          printf "\n  %bCancelled — nothing removed.%b\n\n" "$D" "$R"
           exit 0
         fi
       else
-        printf "  ${D}Non-interactive: pass --yes to confirm uninstall (refusing to prompt).${R}\n" >&2
+        printf "  %bNon-interactive: pass --yes to confirm uninstall (refusing to prompt).%b\n" "$D" "$R" >&2
         exit 2
       fi
     fi
@@ -2012,7 +2014,7 @@ case "${1:-}" in
       while IFS= read -r _fl; do
         printf "  %s\n" "$_fl"
       done < <("$PLUGIN_DIR/bin/heimdall-face" --frame sad "$_face_flag" 2>/dev/null)
-      printf "  ${D}the watchman sleeps. it was good to keep watch with you.${R}\n\n"
+      printf "  %bthe watchman sleeps. it was good to keep watch with you.%b\n\n" "$D" "$R"
     fi
 
     # Reverse install.sh's appended PATH export FIRST (the v2.0.2 gap: uninstall
@@ -2039,12 +2041,12 @@ case "${1:-}" in
 
     printf "\n"
     if [ "${REMOVED_ANY:-0}" -eq 1 ]; then
-      printf "  ${G}✓${R} Heimdall removed. Nothing else was touched.\n"
-      printf "  ${D}Open a new terminal for the PATH change to take effect.${R}\n"
+      printf "  %b✓%b Heimdall removed. Nothing else was touched.\n" "$G" "$R"
+      printf "  %bOpen a new terminal for the PATH change to take effect.%b\n" "$D" "$R"
     else
-      printf "  ${D}Nothing to remove — Heimdall was not installed here.${R}\n"
+      printf "  %bNothing to remove — Heimdall was not installed here.%b\n" "$D" "$R"
     fi
-    printf "  ${D}Reinstall anytime: curl -fsSL https://runheimdall.dev/install | bash${R}\n\n"
+    printf "  %bReinstall anytime: curl -fsSL https://runheimdall.dev/install | bash%b\n\n" "$D" "$R"
     exit 0
     ;;
   team)
@@ -3187,14 +3189,14 @@ if [[ "${1:-}" == "--update" || "${1:-}" == "update" ]]; then
   B='\033[1m' R='\033[0m'
 
   printf "\n"
-  printf "  ${P}${B}"
+  printf "  %b%b" "$P" "$B"
   type_text "░▒▓█" 0.03
   printf " "
   type_text "U P D A T I N G" 0.04
   printf " "
   type_text "█▓▒░" 0.03
-  printf "${R}\n"
-  printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n\n"
+  printf "%b\n" "$R"
+  printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n\n" "$V" "$R"
 
   # DEV-CHECKOUT GUARD: a contributor's editable clone (local commits or uncommitted
   # edits) must never be clobbered by an auto-update. If this is a dev checkout, print the
@@ -3206,13 +3208,13 @@ if [[ "${1:-}" == "--update" || "${1:-}" == "update" ]]; then
     case "$ahead_count" in ''|*[!0-9]*) ahead_count=0 ;; esac
     if [ "$dirty_tree" -eq 1 ] || [ "$ahead_count" -gt 0 ]; then
       printf "  ${W}This looks like a development checkout${R} ${D}(%s)${R}\n" "$PLUGIN_DIR"
-      [ "$dirty_tree" -eq 1 ]    && printf "    ${D}• uncommitted local changes present${R}\n"
+      [ "$dirty_tree" -eq 1 ]    && printf "    %b• uncommitted local changes present%b\n" "$D" "$R"
       [ "$ahead_count" -gt 0 ]   && printf "    ${D}• %s local commit(s) ahead of origin/main${R}\n" "$ahead_count"
-      printf "\n  ${B}Auto-update is disabled here${R} to avoid discarding your work.\n"
+      printf "\n  %bAuto-update is disabled here%b to avoid discarding your work.\n" "$B" "$R"
       printf "  Update manually:\n\n"
       printf "    ${C}cd %s && git pull --ff-only${R}\n" "$PLUGIN_DIR"
-      printf "  ${D}or, for a clean reinstall of the released build:${R}\n"
-      printf "    ${C}hmd --reinstall${R}\n\n"
+      printf "  %bor, for a clean reinstall of the released build:%b\n" "$D" "$R"
+      printf "    %bhmd --reinstall%b\n\n" "$C" "$R"
       # THE NIGHTLY /dream PERMISSION STILL GETS ASKED HERE — this branch exits without
       # ever reaching bin/heimdall-autoupdate, where the ask normally lives, and a dev
       # checkout is precisely the shape that needs it: a clone living in ~/Downloads is
@@ -3235,14 +3237,14 @@ if [[ "${1:-}" == "--update" || "${1:-}" == "update" ]]; then
   # verification entirely. The updater pins the resolved version so the EXACT release installs.
   AUTOUP="$PLUGIN_DIR/bin/heimdall-autoupdate"
   if [ -x "$AUTOUP" ]; then
-    printf "  ${D}[1/1]${R} ${B}Verify & apply signed release${R}\n\n"
+    printf "  %b[1/1]%b %bVerify & apply signed release%b\n\n" "$D" "$R" "$B" "$R"
     "$AUTOUP" update
     exit $?
   fi
 
   # Fallback: the updater binary is missing (a broken/partial install). Re-run the canonical
   # installer, which itself fails closed on a bad fetch. Never silently no-op.
-  printf "  ${W}Signed updater not found — reinstalling from the canonical installer…${R}\n"
+  printf "  %bSigned updater not found — reinstalling from the canonical installer…%b\n" "$W" "$R"
   exec bash -c 'cd "$HOME" && curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/main/install.sh | bash'
 fi
 
@@ -3267,7 +3269,7 @@ if [[ "${1:-}" == "--reinstall" || "${1:-}" == "--fix" ]]; then
       if command -v hmd_confirm >/dev/null 2>&1; then
         hmd_confirm "  Proceed with reinstall (wipes ~/.heimdall)?" && confirm=y
       else
-        read -p "  Proceed? [y/N] " confirm
+        read -r -p "  Proceed? [y/N] " confirm
       fi
       if [[ "${confirm:-n}" != [yY]* ]]; then
         echo "  Cancelled."
@@ -3310,19 +3312,19 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   P='\033[38;2;224;86;160m' D='\033[38;2;100;100;120m'
   B='\033[1m' R='\033[0m'
   printf "\n"
-  printf "  ${P}${B}"
+  printf "  %b%b" "$P" "$B"
   type_text "░▒▓█" 0.04
   printf " "
   type_text "G O O D B Y E" 0.06
   printf " "
   type_text "█▓▒░" 0.04
-  printf "${R}\n\n"
+  printf "%b\n\n" "$R"
 
-  printf "  ${D}╭─────────────────────────────────────╮${R}\n"
+  printf "  %b╭─────────────────────────────────────╮%b\n" "$D" "$R"
   sleep 0.05
-  printf "  ${D}│${R}  ${P}(╥_╥)${R}  we had a good run...        ${D}│${R}\n"
+  printf "  %b│%b  %b(╥_╥)%b  we had a good run...        %b│%b\n" "$D" "$R" "$P" "$R" "$D" "$R"
   sleep 0.05
-  printf "  ${D}╰─────────────────────────────────────╯${R}\n\n"
+  printf "  %b╰─────────────────────────────────────╯%b\n\n" "$D" "$R"
 
   # Interactive confirm only on a TTY without --yes; --yes/non-TTY skips it.
   if [ "$ASSUME_YES" -ne 1 ]; then
@@ -3332,10 +3334,10 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     if command -v hmd_confirm >/dev/null 2>&1; then
       hmd_confirm "  Remove heimdall from ~/.heimdall and PATH?" && confirm=y
     else
-      read -p "  Remove heimdall from ~/.heimdall and PATH? [y/N] " confirm
+      read -r -p "  Remove heimdall from ~/.heimdall and PATH? [y/N] " confirm
     fi
     if [[ "${confirm:-n}" != [yY]* ]]; then
-      printf "\n  ${P}${B}(ᵔᴥᵔ)${R}  ${D}phew! welcome back.${R}\n\n"
+      printf "\n  %b%b(ᵔᴥᵔ)%b  %bphew! welcome back.%b\n\n" "$P" "$B" "$R" "$D" "$R"
       exit 0
     fi
   fi
@@ -3353,7 +3355,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     if [ -f "$rc" ] && grep -qE 'superx.*autonomous|\.superx/bin' "$rc"; then
       sed -i '' '/superx.*autonomous/d;/\.superx\/bin/d' "$rc" 2>/dev/null || \
       sed -i '/superx.*autonomous/d;/\.superx\/bin/d' "$rc" 2>/dev/null || true
-      printf "  ${D}×${R} legacy superx PATH entry removed from $(basename "$rc")\n"
+      printf "  %b×%b legacy superx PATH entry removed from %s\n" "$D" "$R" "$(basename "$rc")"
     fi
   done
   # Reverse the two registrations that live OUTSIDE the install tree, via the same
@@ -3376,26 +3378,26 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     if command -v hmd_confirm >/dev/null 2>&1; then
       hmd_confirm "  Also uninstall companion plugins (caveman)?" && plugins=y
     else
-      read -p "  Also uninstall companion plugins (caveman)? [y/N] " plugins
+      read -r -p "  Also uninstall companion plugins (caveman)? [y/N] " plugins
     fi
     if [[ "${plugins:-n}" == [yY]* ]]; then
-      claude plugins uninstall caveman 2>/dev/null && printf "  ${D}×${R} caveman removed\n" || true
-      claude plugins uninstall superpowers 2>/dev/null && printf "  ${D}×${R} superpowers removed\n" || true
-      claude plugins marketplace remove heimdall-marketplace 2>/dev/null && printf "  ${D}×${R} marketplace removed\n" || true
+      claude plugins uninstall caveman 2>/dev/null && printf "  %b×%b caveman removed\n" "$D" "$R" || true
+      claude plugins uninstall superpowers 2>/dev/null && printf "  %b×%b superpowers removed\n" "$D" "$R" || true
+      claude plugins marketplace remove heimdall-marketplace 2>/dev/null && printf "  %b×%b marketplace removed\n" "$D" "$R" || true
     fi
   fi
 
   printf "\n"
-  printf "  ${D}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
+  printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$D" "$R"
   sleep 0.1
-  printf "  ${D}heimdall uninstalled.${R}\n"
-  printf "  ${D}Open a new terminal for PATH changes.${R}\n"
+  printf "  %bheimdall uninstalled.%b\n" "$D" "$R"
+  printf "  %bOpen a new terminal for PATH changes.%b\n" "$D" "$R"
   sleep 0.1
   printf "\n"
-  printf "  ${D}Want us back? Just run:${R}\n"
-  printf "  ${P}curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/main/install.sh | bash${R}\n"
+  printf "  %bWant us back? Just run:%b\n" "$D" "$R"
+  printf "  %bcurl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/main/install.sh | bash%b\n" "$P" "$R"
   printf "\n"
-  printf "  ${D}(╥_╥)  bye bye...${R}\n\n"
+  printf "  %b(╥_╥)  bye bye...%b\n\n" "$D" "$R"
   exit 0
 fi
 
@@ -3513,6 +3515,7 @@ except: pass
   # Activate project-aware skills (sets SKILL_MGR / RESTORE_FILE for the EXIT trap below)
   _heimdall_skills_activate
 
+  # shellcheck disable=SC2329  # runs via the EXIT trap on the next line; shellcheck drops that reference because this branch ends in exit
   cleanup_resume() { _heimdall_launch_cleanup "$RESUME_PREAMBLE_FILE"; }
   trap cleanup_resume EXIT
 
@@ -3911,9 +3914,11 @@ _update_refresh_cache() {
   local now; now="$(date +%s 2>/dev/null || echo 0)"
   # Write atomically (temp + mv) so a concurrent reader never sees half a file.
   local tmp="${cache}.tmp.$$"
-  printf '{"checked_epoch":%s,"installed":"%s","latest":"%s"}\n' \
-    "$now" "$installed" "$latest" > "$tmp" 2>/dev/null \
-    && mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  if ! { printf '{"checked_epoch":%s,"installed":"%s","latest":"%s"}\n' \
+      "$now" "$installed" "$latest" > "$tmp" 2>/dev/null \
+      && mv -f "$tmp" "$cache" 2>/dev/null; }; then
+    rm -f "$tmp" 2>/dev/null
+  fi
   _tele_install_step update-check succeeded "$_t0"
 }
 
@@ -4643,6 +4648,7 @@ hmd_reject_unknown_command() {
 # `claude` call. A no-op for normal runs (the var is unset), so the launcher is
 # unaffected. `return` works when sourced; the `|| exit 0` covers a direct run.
 if [ "$HMD_LIB_ONLY" = 1 ]; then
+  # shellcheck disable=SC2317  # exit 0 is the fallback when `return` fails: run directly, not sourced
   return 0 2>/dev/null || exit 0
 fi
 
@@ -4918,7 +4924,7 @@ narrate_launch_wakeup() {
   { [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; } && face_flag="--color"
 
   local D C R; D='\033[2m'; C='\033[38;2;0;212;255m'; R='\033[0m'
-  printf "\n  ${D}the watchman wakes…${R}  ${D}(press any key to skip)${R}\n\n"
+  printf "\n  %bthe watchman wakes…%b  %b(press any key to skip)%b\n\n" "$D" "$R" "$D" "$R"
 
   # Reuse the demo's exact frame SEQUENCE; faster per-frame holds for the launch
   # variant. Sum of holds = 0.30+0.18+0.28+0.30+0.22 = 1.28s (≤ ~1.5s cap).
@@ -4928,6 +4934,7 @@ narrate_launch_wakeup() {
   local wake_holds="0.30 0.18 0.28 0.30 0.22"
   local first=1 i=1 emo hold
   for emo in $wake_frames; do
+    # shellcheck disable=SC2086  # intentional word-splitting: one printf argument per hold in the fixed list
     hold="$(printf '%s\n' $wake_holds | sed -n "${i}p")"
     # Repaint each 3-line frame in place after the first (cursor up 3 rows).
     [ "$first" -eq 1 ] || printf '\033[3A'
@@ -4946,7 +4953,7 @@ narrate_launch_wakeup() {
     fi
     i=$((i+1))
   done
-  printf "  ${C}▸${R} awake. ${D}watching your build.${R}\n\n"
+  printf "  %b▸%b awake. %bwatching your build.%b\n\n" "$C" "$R" "$D" "$R"
 }
 
 # FIRST-RUN ORDERING CHECKPOINT: every setup phase (auth → companion → skills)
@@ -5077,7 +5084,7 @@ PYEOF
       printf "\n  ${Y}${O}⚠ Low reuse (%s%%)${R} — likely reinventing existing code: ${Y}%s${R}.\n" \
         "$pct_int" "$dup_list" >&2
       printf "    Inspect before proceeding. Record: %s\n" "$rec" >&2
-      printf "    Re-run with ${O}--force${R} (or HEIMDALL_FORCE=1) to proceed past this advisory.\n\n" >&2
+      printf "    Re-run with %b--force%b (or HEIMDALL_FORCE=1) to proceed past this advisory.\n\n" "$O" "$R" >&2
       return 7
       ;;
     *)
@@ -5119,6 +5126,7 @@ ${USER_TASK}"
   # output, and emits the locked RAW record. It returns claude's REAL exit status;
   # metering is fail-open and never alters it. NO transcript file is read.
   set +e
+  # shellcheck disable=SC2086  # PERMISSION_FLAG/MODEL_FLAG stay unquoted on purpose: empty -> no argument, "--model X" -> two
   capture_and_emit_usage "$RUN_MODEL" \
     --agent heimdall \
     $PERMISSION_FLAG \
@@ -5152,6 +5160,7 @@ else
   apply_switch_fallback_env
 
   # Interactive mode: preamble injected via system prompt file, Claude stays interactive
+  # shellcheck disable=SC2086  # PERMISSION_FLAG/MODEL_FLAG stay unquoted on purpose: empty -> no argument, "--model X" -> two
   claude \
     --agent heimdall \
     $PERMISSION_FLAG \
