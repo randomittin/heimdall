@@ -171,7 +171,7 @@ echo "runhmd-parity harness  repo=$REPO"
 echo "--------------------------------------------------------------------"
 
 for f in "$OLD_JS" "$HMD_JS" "$OLD_PKG/package.json" "$HMD_PKG/package.json" "$HMD_PKG/subcommands.txt" "$DISPATCH"; do
-  [ -f "$f" ] || { bad "missing: ${f#$REPO/}"; }
+  [ -f "$f" ] || { bad "missing: ${f#"$REPO"/}"; }
 done
 if [ "$FAIL" -gt 0 ]; then
   echo ""; echo "runhmd-parity.test.sh: $PASS passed, $FAIL failed."; exit 1
@@ -220,7 +220,7 @@ compare_block() {  # <name> <start-ERE>
   a="$(extract_block "$OLD_JS" "$re" | normalize)"
   b="$(extract_block "$HMD_JS" "$re" | normalize)"
   if [ -z "$a" ] || [ -z "$b" ]; then
-    bad "PIN LOGIC DRIFT: '$name' could not be found in ${OLD_JS#$REPO/} and/or ${HMD_JS#$REPO/} (empty extraction — the gate would be vacuous)"
+    bad "PIN LOGIC DRIFT: '$name' could not be found in ${OLD_JS#"$REPO"/} and/or ${HMD_JS#"$REPO"/} (empty extraction — the gate would be vacuous)"
   elif [ "$a" = "$b" ]; then
     ok "$name is identical in both wrappers"
   else
@@ -268,7 +268,7 @@ HMD_TEMPLATE="$WORK/hmd-template";    rf_make_hmd_template "$HMD_TEMPLATE"
 INSTALLER="$WORK/install-fixture.sh"; rf_make_installer "$INSTALLER"
 SHA="$(rf_sha256 "$INSTALLER")"
 BENT="$(rf_bend_digest "$SHA")"
-NEAR="${SHA%?}$(printf '%s' "${SHA#${SHA%?}}" | tr '0123456789abcdef' '1234567890badcfe')"
+NEAR="${SHA%?}$(printf '%s' "${SHA#"${SHA%?}"}" | tr '0123456789abcdef' '1234567890badcfe')"
 UPPER="$(printf '%s' "$SHA" | tr 'abcdef' 'ABCDEF')"
 TRUNC="$WORK/install-truncated.sh";   head -c 40 "$INSTALLER" > "$TRUNC"
 
