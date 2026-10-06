@@ -14,6 +14,11 @@ bad(){ FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 bash -n "$TEAM" || { echo "FATAL syntax"; exit 2; }
 
 ROOT_TMP="$(mktemp -d)"; trap 'rm -rf "$ROOT_TMP"' EXIT
+# HERMETIC against the operator's team off switch (HMD_TEAM_NO_COMMIT / $HOME/.heimdall/no-team-commit): `run`
+# below gives each repo its own HOME, which covers the marker but not an exported HMD_TEAM_NO_COMMIT, and with
+# that set the bare/private cases never commit and go red for a reason that is not the code.
+# shellcheck source=lib/hermetic-team-env.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hermetic-team-env.sh"; hermetic_team_env "$ROOT_TMP" || exit 2
 # fake gh that reports the repo's privacy from an env the caller sets ($FAKE_PRIVATE=true|false);
 # absent FAKE_PRIVATE simulates an error (unverifiable).
 mkgh(){ local d="$1"; mkdir -p "$d/fb"; cat > "$d/fb/gh" <<EOF

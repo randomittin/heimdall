@@ -55,6 +55,11 @@ bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 WORK="$(mktemp -d -t "heimdall-autojoin.$(printf 'X%.0s' 1 2 3 4 5 6)")"
 trap 'rm -rf "$WORK"' EXIT
 
+# HERMETIC against the operator's team off switch (HMD_TEAM_NO_COMMIT / $HOME/.heimdall/no-team-commit):
+# on a box that has it on, `share` never commits and (a) + (g) go red for a reason that is not the code.
+# shellcheck source=lib/hermetic-team-env.sh
+. "$HERE/lib/hermetic-team-env.sh"; hermetic_team_env "$WORK" || exit 2
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 # The canonical client/server team_id derive (MUST match the server byte-for-byte).
 server_team_id() { # $1 = secret

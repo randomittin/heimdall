@@ -70,6 +70,11 @@ mkdir -p "$HEIMDALL_HOME"
 cleanup() { rm -rf "$EXT"; }
 trap cleanup EXIT
 
+# HERMETIC against the operator's team off switch (HMD_TEAM_NO_COMMIT / $HOME/.heimdall/no-team-commit):
+# on a box that has it on, `share` never commits, so S1/S2/B go red for a reason that is not the code.
+# shellcheck source=lib/hermetic-team-env.sh
+. "$SELF_DIR/lib/hermetic-team-env.sh"; hermetic_team_env "$EXT" || exit 2
+
 PROJECT="acme/private-widget"
 TEAMMATE_HAID="haid:teammate.laptop"
 # OBVIOUSLY-FAKE team secret (>=32 chars, low entropy) — never a real credential.
