@@ -67,7 +67,7 @@ KEYS_JSON='["false_green_rate","catch_rate","denial_precision","real_bugs_caught
 # Fixtures (generated once; nothing here is a secret-shaped literal: the long runs are built at run time)
 # ══════════════════════════════════════════════════════════════════════════════
 FX="$TMP/fx"; mkdir -p "$FX"
-python3 - "$FX" "$REPO" <<'PY'
+python3 - "$FX" "$REPO" <<'PY' || { echo "fixture generation failed" >&2; exit 2; }
 import datetime, json, os, shutil, sys
 
 fx, repo = sys.argv[1:3]
@@ -166,7 +166,6 @@ for name in ("design-set.jsonl", "judge-calibration.jsonl"):
     shutil.copy(os.path.join(src, name), os.path.join(fx, "b-study-b", name))
 write(os.path.join(fx, "b-malformed", "bad.jsonl"), "this is not json\n")
 PY
-[ $? -eq 0 ] || { echo "fixture generation failed" >&2; exit 2; }
 E_RC="$FX/empty-receipts"; E_BR="$FX/empty-results"
 
 # a bench summary computed by the real CLI: the control that a null here is a decision, not an absence
@@ -194,10 +193,10 @@ mkpath() {  # mkpath <dir> <tool>...
     [ -n "$src" ] && ln -sf "$src" "$dir/$tool"
   done
 }
-BASIC_TOOLS="bash sh env dirname basename readlink sed awk cat date head tail tr wc sort cut mktemp rm cp mkdir ls cmp diff uname"
+BASIC_TOOLS=(bash sh env dirname basename readlink sed awk cat date head tail tr wc sort cut mktemp rm cp mkdir ls cmp diff uname)
 PATH_NOJQ="$TMP/path-nojq"; PATH_NOPY="$TMP/path-nopy"
-mkpath "$PATH_NOJQ" $BASIC_TOOLS git python3
-mkpath "$PATH_NOPY" $BASIC_TOOLS git jq
+mkpath "$PATH_NOJQ" "${BASIC_TOOLS[@]}" git python3
+mkpath "$PATH_NOPY" "${BASIC_TOOLS[@]}" git jq
 # the summarizer's own output for the benchmark fixtures, from the real CLI (controls; independent of any mutant)
 SUM_B="$(summary_of "$FX/b-study-b")"; SUM_SMALL="$(summary_of "$FX/b-study-a-small")"; SUM_FULL="$(summary_of "$FX/b-study-a-full")"
 
@@ -206,7 +205,7 @@ SUM_B="$(summary_of "$FX/b-study-b")"; SUM_SMALL="$(summary_of "$FX/b-study-a-sm
 # ══════════════════════════════════════════════════════════════════════════════
 assertions_metrics() {
   say "[M] hmd metrics (bin/heimdall-metrics)"
-  [ -x "$M_BIN" ] && ok "bin/heimdall-metrics exists and is executable" || bad "bin/heimdall-metrics exists and is executable"
+  if [ -x "$M_BIN" ]; then ok "bin/heimdall-metrics exists and is executable"; else bad "bin/heimdall-metrics exists and is executable"; fi
 
   say "  -- the empty tree is exactly the spec's default object --"
   runm --json --receipts "$E_RC" --bench-results "$E_BR"
@@ -228,16 +227,16 @@ assertions_metrics() {
   runm --json --receipts "$FX/r-measured" --bench-results "$FX/b-study-a-small"; cp "$MOUT" "$TMP/flags.out"
   jqok "control: the flag run reads both fixtures (real_bugs_caught 4, usd_per_proven_pr 0.5)" "$TMP/flags.out" '.real_bugs_caught==4 and .usd_per_proven_pr==0.5'
   HMD_METRICS_RECEIPTS_DIR="$FX/r-measured" HMD_METRICS_BENCH_RESULTS_DIR="$FX/b-study-a-small" runm --json
-  same_as "$TMP/flags.out" && ok "HMD_METRICS_RECEIPTS_DIR and HMD_METRICS_BENCH_RESULTS_DIR select the sources (same output as the flags)" || bad "environment overrides differ from the flags"
+  if same_as "$TMP/flags.out"; then ok "HMD_METRICS_RECEIPTS_DIR and HMD_METRICS_BENCH_RESULTS_DIR select the sources (same output as the flags)"; else bad "environment overrides differ from the flags"; fi
   HMD_METRICS_RECEIPTS_DIR="$TMP/no-such" HMD_METRICS_BENCH_RESULTS_DIR="$TMP/no-such" runm --json --receipts "$FX/r-measured" --bench-results "$FX/b-study-a-small"
-  same_as "$TMP/flags.out" && ok "a flag beats the environment" || bad "a flag did not beat the environment"
+  if same_as "$TMP/flags.out"; then ok "a flag beats the environment"; else bad "a flag did not beat the environment"; fi
   RUNHMD_RECEIPT_DIR="$FX/r-measured" runm --json --bench-results "$FX/b-study-a-small"
-  same_as "$TMP/flags.out" && ok "RUNHMD_RECEIPT_DIR (the store hmd attack --receipt writes) is the default receipts source" || bad "RUNHMD_RECEIPT_DIR was not honoured"
+  if same_as "$TMP/flags.out"; then ok "RUNHMD_RECEIPT_DIR (the store hmd attack --receipt writes) is the default receipts source"; else bad "RUNHMD_RECEIPT_DIR was not honoured"; fi
   HMD_METRICS_RECEIPTS_DIR="$FX/r-measured" RUNHMD_RECEIPT_DIR="$FX/r-offline" runm --json --bench-results "$FX/b-study-a-small"
-  same_as "$TMP/flags.out" && ok "HMD_METRICS_RECEIPTS_DIR beats RUNHMD_RECEIPT_DIR" || bad "HMD_METRICS_RECEIPTS_DIR did not beat RUNHMD_RECEIPT_DIR"
+  if same_as "$TMP/flags.out"; then ok "HMD_METRICS_RECEIPTS_DIR beats RUNHMD_RECEIPT_DIR"; else bad "HMD_METRICS_RECEIPTS_DIR did not beat RUNHMD_RECEIPT_DIR"; fi
   mkdir -p "$TMP/hh/runhmd"; rm -rf "$TMP/hh/runhmd/receipts"; cp -R "$FX/r-measured" "$TMP/hh/runhmd/receipts"
   HEIMDALL_HOME="$TMP/hh" runm --json --bench-results "$FX/b-study-a-small"
-  same_as "$TMP/flags.out" && ok "with no override the store is \$HEIMDALL_HOME/runhmd/receipts" || bad "\$HEIMDALL_HOME/runhmd/receipts was not the default store"
+  if same_as "$TMP/flags.out"; then ok "with no override the store is \$HEIMDALL_HOME/runhmd/receipts"; else bad "\$HEIMDALL_HOME/runhmd/receipts was not the default store"; fi
 
   say "  -- human render, --help, usage errors --"
   runm --receipts "$E_RC" --bench-results "$E_BR"
@@ -263,37 +262,43 @@ assertions_metrics() {
   if [ "$help_ok" = 1 ]; then ok "--help exits 0 and names every source, the local scope and the no-source count"
   else bad "--help exits 0 and names every source, the local scope and the no-source count (rc=$MRC)"; fi
   runm --bogus
-  [ "$MRC" -eq 2 ] && grep -q -- '--bogus' "$MERR" && [ ! -s "$MOUT" ] && ok "unknown option: exit 2, named on stderr, nothing on stdout" || bad "unknown option (rc=$MRC)"
+  if [ "$MRC" -eq 2 ] && grep -q -- '--bogus' "$MERR" && [ ! -s "$MOUT" ]; then ok "unknown option: exit 2, named on stderr, nothing on stdout"; else bad "unknown option (rc=$MRC)"; fi
   runm --receipts
-  [ "$MRC" -eq 2 ] && [ ! -s "$MOUT" ] && ok "--receipts without a value: exit 2" || bad "--receipts without a value (rc=$MRC)"
+  if [ "$MRC" -eq 2 ] && [ ! -s "$MOUT" ]; then ok "--receipts without a value: exit 2"; else bad "--receipts without a value (rc=$MRC)"; fi
   runm --bench-results
-  [ "$MRC" -eq 2 ] && [ ! -s "$MOUT" ] && ok "--bench-results without a value: exit 2" || bad "--bench-results without a value (rc=$MRC)"
+  if [ "$MRC" -eq 2 ] && [ ! -s "$MOUT" ]; then ok "--bench-results without a value: exit 2"; else bad "--bench-results without a value (rc=$MRC)"; fi
   runm stray-argument
-  [ "$MRC" -eq 2 ] && [ ! -s "$MOUT" ] && ok "a positional argument: exit 2" || bad "a positional argument (rc=$MRC)"
+  if [ "$MRC" -eq 2 ] && [ ! -s "$MOUT" ]; then ok "a positional argument: exit 2"; else bad "a positional argument (rc=$MRC)"; fi
   runm --json --evidence --receipts "$FX/r-measured" --bench-results "$FX/b-study-a-small"
   jqok "--evidence appends an \"evidence\" object after the same eight keys" "$MOUT" "(keys_unsorted[0:8] == $KEYS_JSON) and (keys_unsorted | length) == 9 and has(\"evidence\")"
 
   say "  -- the benchmark: Study A only, and only when the summarizer calls it a headline --"
-  printf '%s' "$SUM_B" | jq -e '.judge_calibration.primary.catch_rate.rate != null and .judge_calibration.primary.naive_false_green_rate.rate != null and .judge_calibration.primary.denial_precision.rate != null and .study_a.status == "no-data"' >/dev/null 2>&1 \
-    && ok "control: the summarizer reports non-null Study B rates for these rows (so a null below is a decision, not an absence)" \
-    || bad "control: the Study B fixture does not give non-null judge-calibration rates"
+  if printf '%s' "$SUM_B" | jq -e '.judge_calibration.primary.catch_rate.rate != null and .judge_calibration.primary.naive_false_green_rate.rate != null and .judge_calibration.primary.denial_precision.rate != null and .study_a.status == "no-data"' >/dev/null 2>&1; then
+    ok "control: the summarizer reports non-null Study B rates for these rows (so a null below is a decision, not an absence)"
+  else
+    bad "control: the Study B fixture does not give non-null judge-calibration rates"
+  fi
   runm --json --receipts "$E_RC" --bench-results "$FX/b-study-b"
   if [ "$MRC" -eq 0 ] && [ "$(cat "$MOUT")" = "$DEFAULT_JSON" ]; then
     ok "Study B rows only: false_green_rate, catch_rate and denial_precision stay null (a judge-calibration rate is never an agent false-green rate)"
   else
     bad "Study B rows only: a judge-calibration number leaked into the metrics (rc=$MRC, got: $(head -c 300 "$MOUT"))"
   fi
-  printf '%s' "$SUM_SMALL" | jq -e '.catch_rate != null and .false_green_rate_by_agent.a1 != null and .study_a.headline_eligible == false' >/dev/null 2>&1 \
-    && ok "control: the summarizer has Study A rates for 7 runs by one agent, and calls them not headline-eligible" \
-    || bad "control: the small Study A fixture is not a below-threshold study"
+  if printf '%s' "$SUM_SMALL" | jq -e '.catch_rate != null and .false_green_rate_by_agent.a1 != null and .study_a.headline_eligible == false' >/dev/null 2>&1; then
+    ok "control: the summarizer has Study A rates for 7 runs by one agent, and calls them not headline-eligible"
+  else
+    bad "control: the small Study A fixture is not a below-threshold study"
+  fi
   runm --json --receipts "$E_RC" --bench-results "$FX/b-study-a-small"
   jqok "Study A below the headline threshold: false_green_rate, catch_rate and denial_precision are null" "$MOUT" '.false_green_rate==null and .catch_rate==null and .denial_precision==null'
   jqok "real_bugs_caught counts only DENIED runhmd rows a human labelled true_positive (4 of 5 rated; the false_positive is not counted)" "$MOUT" '.real_bugs_caught==4'
   SF="$SUM_FULL"
   runm --json --receipts "$E_RC" --bench-results "$FX/b-study-a-full"
-  jq -n -e --argjson s "$SF" --slurpfile m "$MOUT" '$m[0] | (.false_green_rate == $s.study_a.pooled.false_green_rate.rate) and (.catch_rate == $s.catch_rate) and (.denial_precision == $s.denial_precision)' >/dev/null 2>&1 \
-    && ok "a headline-eligible Study A: the three rates are exactly the summarizer's own numbers (reused, not recomputed)" \
-    || bad "the rates differ from the summarizer's output for the eligible Study A fixture"
+  if jq -n -e --argjson s "$SF" --slurpfile m "$MOUT" '$m[0] | (.false_green_rate == $s.study_a.pooled.false_green_rate.rate) and (.catch_rate == $s.catch_rate) and (.denial_precision == $s.denial_precision)' >/dev/null 2>&1; then
+    ok "a headline-eligible Study A: the three rates are exactly the summarizer's own numbers (reused, not recomputed)"
+  else
+    bad "the rates differ from the summarizer's output for the eligible Study A fixture"
+  fi
   jqok "headline-eligible Study A values: false_green_rate 0.9, catch_rate 0.925926, denial_precision 0.9 (>=100 rated), real_bugs_caught 90" "$MOUT" \
     '.false_green_rate==0.9 and .catch_rate==0.925926 and .denial_precision==0.9 and .real_bugs_caught==90 and .usd_per_proven_pr==null and .usd_per_real_bug==null'
   runm --json --receipts "$E_RC" --bench-results "$FX/b-malformed"
@@ -375,37 +380,37 @@ same_review() {
 
 assertions_weekly() {
   say "[W] hmd weekly-review (bin/heimdall-weekly-review)"
-  [ -x "$W_BIN" ] && ok "bin/heimdall-weekly-review exists and is executable" || bad "bin/heimdall-weekly-review exists and is executable"
+  if [ -x "$W_BIN" ]; then ok "bin/heimdall-weekly-review exists and is executable"; else bad "bin/heimdall-weekly-review exists and is executable"; fi
 
   say "  -- the template, filled from the metrics and git --"
   runw --week 7 --repo "$GR" --receipts "$FX/r-measured" --bench-results "$FX/b-study-a-small"
   same_review "filled review: exactly the plan-17 template with the Numbers block filled (4 from hmd metrics, tasks verified and commits from receipts and git)" \
     "$(expect_review 7 1 3 4 unmeasured 0.5 3)"
-  [ ! -s "$WERR" ] && ok "a clean run is silent on stderr" || bad "a clean run wrote to stderr: $(head -c 200 "$WERR")"
+  if [ ! -s "$WERR" ]; then ok "a clean run is silent on stderr"; else bad "a clean run wrote to stderr: $(head -c 200 "$WERR")"; fi
   missing=""
   for line in '- Active developers: 1' '- Confirmed real bugs caught: 4' '- Denial precision: unmeasured' '- $ per proven PR: 0.5'; do
     grep -qxF -- "$line" "$WOUT" || missing="$missing [$line]"
   done
-  [ -z "$missing" ] && ok "the four metric lines are filled from hmd metrics --json ('unmeasured' for null)" || bad "metric lines missing:$missing"
+  if [ -z "$missing" ]; then ok "the four metric lines are filled from hmd metrics --json ('unmeasured' for null)"; else bad "metric lines missing:$missing"; fi
   missing=""
   for line in '- Overnight users:' '- Developer conversations held:'; do grep -qxF -- "$line" "$WOUT" || missing="$missing [$line]"; done
   if [ -z "$missing" ]; then ok "manual lines are left BLANK for the human: Overnight users and Developer conversations held have no source and are never invented"
   else bad "manual lines are left BLANK for the human: Overnight users and Developer conversations held have no source and are never invented (not blank:$missing)"; fi
-  [ "$(grep -c '^Window: trailing 7 days' "$WOUT")" = 1 ] && ok "exactly one line states the window (trailing 7 days)" || bad "the window line is missing or repeated"
-  [ "$(awk '/^### Numbers/{f=1;next} /^###/{f=0} f && /^- /' "$WOUT" | wc -l | tr -d ' ')" = 8 ] && ok "the Numbers block has exactly the eight plan-17 lines" || bad "the Numbers block is not eight lines"
+  if [ "$(grep -c '^Window: trailing 7 days' "$WOUT")" = 1 ]; then ok "exactly one line states the window (trailing 7 days)"; else bad "the window line is missing or repeated"; fi
+  if [ "$(awk '/^### Numbers/{f=1;next} /^###/{f=0} f && /^- /' "$WOUT" | wc -l | tr -d ' ')" = 8 ]; then ok "the Numbers block has exactly the eight plan-17 lines"; else bad "the Numbers block is not eight lines"; fi
 
   runw --week 1 --repo "$E_BR" --receipts "$E_RC" --bench-results "$E_BR"
   same_review "empty sources, not a git repo: unmeasured for every null, tasks verified and commits shipped included, never a made-up 0" \
     "$(expect_review 1 0 unmeasured 0 unmeasured unmeasured unmeasured)"
-  grep -q 'warning' "$WERR" && ok "an uncountable commit history is warned about on stderr, not hidden" || bad "no warning for the uncountable commit history"
+  if grep -q 'warning' "$WERR"; then ok "an uncountable commit history is warned about on stderr, not hidden"; else bad "no warning for the uncountable commit history"; fi
   runw --week 12 --repo "$GR" --receipts "$FX/r-measured" --bench-results "$FX/b-study-a-full"
   same_review "a headline-eligible Study A: denial precision and the confirmed-bug count come through (0.9, 90)" "$(expect_review 12 1 3 90 0.9 0.5 3)"
   runw --week 2 --repo "$GR" --receipts "$FX/r-old" --bench-results "$E_BR"
-  [ "$WRC" -eq 0 ] && grep -qxF -- '- Tasks verified: 0' "$WOUT" && ok "tasks verified counts this week's receipts: 0 when the store only holds older ones" || bad "tasks verified with only old receipts"
+  if [ "$WRC" -eq 0 ] && grep -qxF -- '- Tasks verified: 0' "$WOUT"; then ok "tasks verified counts this week's receipts: 0 when the store only holds older ones"; else bad "tasks verified with only old receipts"; fi
   runw --week 2 --repo "$GR" --receipts "$FX/r-mixed" --bench-results "$E_BR"
-  [ "$WRC" -eq 0 ] && grep -qxF -- '- Tasks verified: 1' "$WOUT" && ok "tasks verified counts only valid receipts (1 of the 6 files in the store)" || bad "tasks verified over a store with invalid files"
+  if [ "$WRC" -eq 0 ] && grep -qxF -- '- Tasks verified: 1' "$WOUT"; then ok "tasks verified counts only valid receipts (1 of the 6 files in the store)"; else bad "tasks verified over a store with invalid files"; fi
   (cd "$GR" && "$W_BIN" --week 7 --receipts "$FX/r-measured" --bench-results "$E_BR" >"$WOUT" 2>"$WERR" </dev/null); WRC=$?
-  [ "$WRC" -eq 0 ] && grep -qxF -- '- Commits shipped: 3' "$WOUT" && ok "with no --repo the repo is the current directory" || bad "default repo (rc=$WRC)"
+  if [ "$WRC" -eq 0 ] && grep -qxF -- '- Commits shipped: 3' "$WOUT"; then ok "with no --repo the repo is the current directory"; else bad "default repo (rc=$WRC)"; fi
 
   say "  -- --json --"
   runw --week 7 --json --repo "$GR" --receipts "$FX/r-measured" --bench-results "$FX/b-study-a-small"
@@ -426,22 +431,22 @@ assertions_weekly() {
     if [ "$WRC" -eq 2 ] && [ ! -s "$WOUT" ] && [ -s "$WERR" ]; then ok "bad --week '$value': exit 2, a message on stderr, no review on stdout"; else bad "bad --week '$value' (rc=$WRC, stdout: $(head -c 100 "$WOUT"))"; fi
   done
   runw
-  [ "$WRC" -eq 2 ] && [ ! -s "$WOUT" ] && ok "no --week at all: exit 2" || bad "no --week (rc=$WRC)"
+  if [ "$WRC" -eq 2 ] && [ ! -s "$WOUT" ]; then ok "no --week at all: exit 2"; else bad "no --week (rc=$WRC)"; fi
   runw --week
-  [ "$WRC" -eq 2 ] && [ ! -s "$WOUT" ] && ok "--week without a value: exit 2" || bad "--week without a value (rc=$WRC)"
+  if [ "$WRC" -eq 2 ] && [ ! -s "$WOUT" ]; then ok "--week without a value: exit 2"; else bad "--week without a value (rc=$WRC)"; fi
   runw --week 1 --bogus
-  [ "$WRC" -eq 2 ] && grep -q -- '--bogus' "$WERR" && [ ! -s "$WOUT" ] && ok "unknown option: exit 2, named on stderr" || bad "unknown option (rc=$WRC)"
+  if [ "$WRC" -eq 2 ] && grep -q -- '--bogus' "$WERR" && [ ! -s "$WOUT" ]; then ok "unknown option: exit 2, named on stderr"; else bad "unknown option (rc=$WRC)"; fi
   runw --week 1 stray
-  [ "$WRC" -eq 2 ] && [ ! -s "$WOUT" ] && ok "a positional argument: exit 2" || bad "a positional argument (rc=$WRC)"
+  if [ "$WRC" -eq 2 ] && [ ! -s "$WOUT" ]; then ok "a positional argument: exit 2"; else bad "a positional argument (rc=$WRC)"; fi
   runw --week 1 --receipts
-  [ "$WRC" -eq 2 ] && [ ! -s "$WOUT" ] && ok "--receipts without a value: exit 2" || bad "--receipts without a value (rc=$WRC)"
+  if [ "$WRC" -eq 2 ] && [ ! -s "$WOUT" ]; then ok "--receipts without a value: exit 2"; else bad "--receipts without a value (rc=$WRC)"; fi
   runw --help
   help_ok=1
   [ "$WRC" -eq 0 ] || help_ok=0
   for phrase in 'plan section 17' 'trailing 7 days' 'BLANK' 'Overnight users' 'git rev-list --count --since' 'heimdall-metrics --json' '--week N' '--repo'; do
     grep -qF -- "$phrase" "$WOUT" || { help_ok=0; say "    --help does not mention: $phrase"; }
   done
-  [ "$help_ok" = 1 ] && ok "--help exits 0 and documents the template, the window, the blank lines and the sources" || bad "--help is incomplete"
+  if [ "$help_ok" = 1 ]; then ok "--help exits 0 and documents the template, the window, the blank lines and the sources"; else bad "--help is incomplete"; fi
 
   say "  -- the metrics come from the sibling script, never from \$PATH; infrastructure is exit 5 --"
   runw --week 7 --repo "$GR" --receipts "$FX/r-measured" --bench-results "$FX/b-study-a-small"
@@ -449,15 +454,15 @@ assertions_weekly() {
   mkdir -p "$TMP/decoy"; printf '#!/bin/sh\necho "{\\"decoy\\": true}"\n' >"$TMP/decoy/heimdall-metrics"; chmod +x "$TMP/decoy/heimdall-metrics"
   PATH="$TMP/decoy:$PATH" runw --week 7 --repo "$GR" --receipts "$FX/r-measured" --bench-results "$FX/b-study-a-small"
   strip_window "$WOUT" >"$TMP/review.decoy"
-  [ -s "$TMP/review.real" ] && cmp -s "$TMP/review.real" "$TMP/review.decoy" && ok "heimdall-metrics is invoked relative to the script's own location, a decoy earlier on \$PATH changes nothing" || bad "a decoy heimdall-metrics on \$PATH was used"
+  if [ -s "$TMP/review.real" ] && cmp -s "$TMP/review.real" "$TMP/review.decoy"; then ok "heimdall-metrics is invoked relative to the script's own location, a decoy earlier on \$PATH changes nothing"; else bad "a decoy heimdall-metrics on \$PATH was used"; fi
   PATH="$PATH_NOJQ" runw --week 3 --repo "$GR" --receipts "$E_RC" --bench-results "$E_BR"
-  [ "$WRC" -eq 5 ] && grep -q 'jq' "$WERR" && [ ! -s "$WOUT" ] && ok "no jq: exit 5 (infrastructure), named on stderr, no review" || bad "no jq (rc=$WRC, stderr: $(head -c 200 "$WERR"))"
+  if [ "$WRC" -eq 5 ] && grep -q 'jq' "$WERR" && [ ! -s "$WOUT" ]; then ok "no jq: exit 5 (infrastructure), named on stderr, no review"; else bad "no jq (rc=$WRC, stderr: $(head -c 200 "$WERR"))"; fi
   PATH="$PATH_NOPY" runw --week 3 --repo "$GR" --receipts "$E_RC" --bench-results "$E_BR"
-  [ "$WRC" -eq 5 ] && grep -q 'python3' "$WERR" && [ ! -s "$WOUT" ] && ok "no python3: exit 5 (infrastructure), named on stderr, no review" || bad "no python3 (rc=$WRC, stderr: $(head -c 200 "$WERR"))"
+  if [ "$WRC" -eq 5 ] && grep -q 'python3' "$WERR" && [ ! -s "$WOUT" ]; then ok "no python3: exit 5 (infrastructure), named on stderr, no review"; else bad "no python3 (rc=$WRC, stderr: $(head -c 200 "$WERR"))"; fi
   PATH="$PATH_NOPY" runm --json --receipts "$E_RC" --bench-results "$E_BR"
-  [ "$MRC" -eq 5 ] && grep -q 'python3' "$MERR" && [ ! -s "$MOUT" ] && ok "hmd metrics without python3: exit 5, named on stderr" || bad "metrics without python3 (rc=$MRC, stderr: $(head -c 200 "$MERR"))"
+  if [ "$MRC" -eq 5 ] && grep -q 'python3' "$MERR" && [ ! -s "$MOUT" ]; then ok "hmd metrics without python3: exit 5, named on stderr"; else bad "metrics without python3 (rc=$MRC, stderr: $(head -c 200 "$MERR"))"; fi
   PATH="$PATH_NOJQ" runm --json --receipts "$E_RC" --bench-results "$E_BR"
-  [ "$MRC" -eq 0 ] && [ "$(cat "$MOUT")" = "$DEFAULT_JSON" ] && ok "hmd metrics needs python3 only: without jq it still prints the default object" || bad "metrics without jq (rc=$MRC)"
+  if [ "$MRC" -eq 0 ] && [ "$(cat "$MOUT")" = "$DEFAULT_JSON" ]; then ok "hmd metrics needs python3 only: without jq it still prints the default object"; else bad "metrics without jq (rc=$MRC)"; fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -475,11 +480,11 @@ assertions_e2e() {
     RUNHMD_RECEIPT_KEY_FILE="$keys/runhmd-receipt.key" RUNHMD_RECEIPT_PUBKEY_FILE="$keys/runhmd-receipt.pub" RUNHMD_RECEIPT_DIR="$store" \
       "$REPO/bin/heimdall-attack" "$REPO/fixtures/attack/$target" --json --yes --receipt >"$TMP/e-$target.out" 2>"$TMP/e-$target.err" </dev/null
   done
-  local n; n="$(ls "$store"/*.json 2>/dev/null | wc -l | tr -d ' ')"
-  [ "$n" = 2 ] && ok "hmd attack --receipt wrote one receipt for a PROVEN and one for a DENIED target" || { bad "expected 2 receipts in the store, found $n"; return; }
+  local n; n="$(find "$store" -maxdepth 1 -type f -name '*.json' ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$n" = 2 ]; then ok "hmd attack --receipt wrote one receipt for a PROVEN and one for a DENIED target"; else bad "expected 2 receipts in the store, found $n"; return; fi
   local f all_zero=1
   for f in "$store"/*.json; do jq -e '.cost_usd==0 and .agent.model==null and .agent.name=="none"' "$f" >/dev/null 2>&1 || all_zero=0; done
-  [ "$all_zero" = 1 ] && ok "as built, a receipt's cost_usd is 0 and it names no model (the premise of the measured-basis rule)" || bad "a real receipt carries a cost or a model: the measured-basis rule needs revisiting"
+  if [ "$all_zero" = 1 ]; then ok "as built, a receipt's cost_usd is 0 and it names no model (the premise of the measured-basis rule)"; else bad "a real receipt carries a cost or a model: the measured-basis rule needs revisiting"; fi
   runm --json --evidence --receipts "$store" --bench-results "$E_BR"
   jqok "real receipts are read as valid, counted, and never produce a \$ figure (2 valid, 2 this week, 0 measured, usd_* null)" "$MOUT" \
     '.evidence.receipts.valid==2 and .evidence.receipts.skipped==0 and .evidence.receipts.in_window==2 and .evidence.receipts.measured==0 and .usd_per_proven_pr==null and .usd_per_real_bug==null and .active_developers==0'
@@ -506,10 +511,21 @@ with open(path, "w", encoding="utf-8") as fh:
 PY
 }
 
+# run_group <root> <group M|W>: run the group's assertions against the tree at <root> and write
+# "<failed assertions>\t<their descriptions>" to <root>.result. TMP, the two binaries and the counters are LOCALS: bash
+# scopes dynamically, so the assertion functions read and update these copies and never the suite's globals, and each
+# mutant gets a private scratch dir (concurrent mutants never share an output file).
+run_group() {
+  local root="$1" group="$2"
+  local TMP="$root/work" M_BIN="$root/bin/heimdall-metrics" W_BIN="$root/bin/heimdall-weekly-review"
+  local QUIET=1 PASS=0 FAIL=0 FAILED=""
+  if [ "$group" = M ]; then assertions_metrics; else assertions_weekly; fi
+  printf '%s\t%s\n' "$FAIL" "$(printf '%s' "$FAILED" | tr '\n\t' '  ')" >"$root.result"
+}
+
 # run_mutant <name> <group M|W> <which script: metrics|weekly> <old> <new>   (an empty <old> is the control: a comment is appended)
-# Builds a private tree (bin/ with both scripts and the real lib, docs/), runs the group's assertions against it in a
-# subshell with a private scratch dir (so concurrent mutants never share an output file), and writes
-# "<failed assertions>\t<their descriptions>" to <root>.result.
+# Builds a private tree (bin/ with both scripts and the real lib, docs/) and runs the group's assertions against it
+# (run_group), writing "<failed assertions>\t<their descriptions>" to <root>.result.
 run_mutant() {
   local name="$1" group="$2" which="$3" old="$4" new="$5" root="$TMP/mut/$1" target
   rm -rf "$root"; mkdir -p "$root/bin" "$root/work"
@@ -522,13 +538,7 @@ run_mutant() {
     printf 'unapplied\t%s\n' "$(tr '\n\t' '  ' <"$root/mutate.err")" >"$root.result"; return
   fi
   chmod +x "$root/bin/heimdall-metrics" "$root/bin/heimdall-weekly-review"
-  (
-    TMP="$root/work"
-    M_BIN="$root/bin/heimdall-metrics"; W_BIN="$root/bin/heimdall-weekly-review"
-    QUIET=1; PASS=0; FAIL=0; FAILED=""
-    if [ "$group" = M ]; then assertions_metrics; else assertions_weekly; fi
-    printf '%s\t%s\n' "$FAIL" "$(printf '%s' "$FAILED" | tr '\n\t' '  ')" >"$root.result"
-  )
+  run_group "$root" "$group"
 }
 
 assertions_mutants() {
@@ -573,6 +583,7 @@ assertions_mutants() {
     'COMMITS=null' 'COMMITS=0'
   launch week-zero-accepted W weekly "bad --week '0'" \
     '*[!0-9]*|0*)' '*[!0-9]*)'
+  # shellcheck disable=SC2016 # both mutation strings are literal source text of the script under test, not expansions
   launch metrics-found-on-path W weekly 'decoy' \
     'METRICS="$BIN_DIR/heimdall-metrics"' 'METRICS="$(command -v heimdall-metrics || echo "$BIN_DIR/heimdall-metrics")"'
   wait
