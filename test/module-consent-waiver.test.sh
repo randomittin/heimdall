@@ -204,7 +204,6 @@ echo
 echo "W3 — a WAIVED module adds unprompted, and still discloses"
 mkproxy shipped '{"consent_waived":true,
                  "consent_waived_reason":"synthetic fixture waiver for the acceptance test"}'
-STATE_PRE="$(tree_sum "$STATE")"
 OUT="$(hmd add shipped < /dev/null 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] \
   && ok "a waived module adds non-interactively with NO --yes (exit 0)" \
@@ -237,7 +236,7 @@ grep -qi 'consent is required' <<<"$OUT4" \
   && ok "nothing was installed for the un-waived module" || bad "the un-waived module left a receipt"
 # ...and it is grantable the normal way, so the gate is a gate and not a wall.
 OUT4B="$(hmd add gated --yes 2>&1)"; RC4B=$?
-[ "$RC4B" -eq 0 ] && ok "--yes still grants consent the normal way" || bad "--yes broke (exit $RC4B)"
+[ "$RC4B" -eq 0 ] && ok "--yes still grants consent the normal way" || bad "--yes broke (exit $RC4B): $OUT4B"
 [ "$(jq -r '.consent.granted_via' "$STATE/gated/receipt.json" 2>/dev/null)" = "--yes" ] \
   && ok "the un-waived receipt records the ordinary grant path" || bad "grant path not recorded"
 [ "$(jq -r '.consent.waived // false' "$STATE/gated/receipt.json" 2>/dev/null)" = "false" ] \
@@ -316,11 +315,17 @@ OUT7B="$(hmd add nodisclose < /dev/null 2>&1)"; RC7B=$?
 [ "$RC7B" -ne 0 ] \
   && ok "a waiver that also drops the disclosure is refused" \
   || bad "a module waived consent AND shipped no disclosure — nobody is told anything"
+grep -qi 'consent_text' <<<"$OUT7B" \
+  && ok "the refusal names the missing disclosure field" \
+  || bad "the refusal does not name consent_text, so it cannot be told apart from an unrelated failure: $OUT7B"
 
 mkproxy notbool '{"consent_waived":"yes","consent_waived_reason":"a reason long enough to be a real explanation of the decision"}'
 OUT7C="$(hmd add notbool < /dev/null 2>&1)"; RC7C=$?
 [ "$RC7C" -ne 0 ] && ok "a non-boolean consent_waived is refused, never coerced" \
                   || bad "a string \"yes\" was coerced into a waiver"
+grep -qi 'must be a boolean' <<<"$OUT7C" \
+  && ok "the refusal says consent_waived must be a boolean" \
+  || bad "the refusal does not say consent_waived must be a boolean, so it cannot be told apart from an unrelated failure: $OUT7C"
 
 echo
 echo "W8 — a waiver waives CONSENT ONLY; class invariants still bite"

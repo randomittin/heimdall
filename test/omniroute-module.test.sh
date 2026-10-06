@@ -388,7 +388,7 @@ else
   hmd4() { "$MODS" --registry "$MREG" --state "$O4STATE" "$@"; }
 
   OUT4="$(hmd4 optout omniroute 2>&1)"; RC4=$?
-  [ "$RC4" -eq 0 ] && ok "optout omniroute exits 0" || bad "optout exited $RC4"
+  [ "$RC4" -eq 0 ] && ok "optout omniroute exits 0" || bad "optout exited $RC4: $OUT4"
   [ -f "$O4STATE/.modstate/omniroute/optout.json" ] \
     && ok "the opt-out is recorded as a file — hmd's own definition of a state fact" \
     || bad "no optout.json was written"
@@ -424,7 +424,7 @@ else
 
   # optin — reversible, and cleanly so.
   OUT4B="$(hmd4 optin omniroute 2>&1)"; RC4B=$?
-  [ "$RC4B" -eq 0 ] && ok "optin omniroute exits 0" || bad "optin exited $RC4B"
+  [ "$RC4B" -eq 0 ] && ok "optin omniroute exits 0" || bad "optin exited $RC4B: $OUT4B"
   [ ! -f "$O4STATE/.modstate/omniroute/optout.json" ] \
     && ok "optin clears the opt-out record" || bad "the opt-out record survived optin"
   [ "$(hmd4 --json status omniroute 2>/dev/null | jq -r '.state')" != "opted-out" ] \
@@ -795,7 +795,7 @@ else
   # the assertion above discriminates on INSTALL_DIR's actual shape rather than
   # refusing unconditionally regardless of what INSTALL_DIR points at.
   FIXTURE_ABSENT="$TMP/fixture-absent-$$"
-  OUT9F2="$(run_installer "$FULL_PRECOND_PATH" INSTALL_DIR="$FIXTURE_ABSENT")"; RC9F2=$?
+  OUT9F2="$(run_installer "$FULL_PRECOND_PATH" INSTALL_DIR="$FIXTURE_ABSENT")"
   grep -qi 'already exists and is not a git checkout' <<<"$OUT9F2" \
     && bad "RED-ARM CHECK FAILED: an absent INSTALL_DIR still tripped the 'not a git checkout' refusal — the check above is not discriminating" \
     || ok "RED ARM: an absent INSTALL_DIR does not trip the same refusal (it fails later instead, on the stubbed pin mismatch)"
@@ -812,11 +812,17 @@ else
       || bad "…but its refusal never mentions node — cannot confirm THIS is why it refused (may be refusing for an unrelated, unmet assumption)"
   fi
 
-  OUT9B="$(run_installer "$GIT_WRONGSHA_PATH" OMNIROUTE_PIN_SHA="$PIN_SHA")"; RC9B=$?
+  # FULL_PRECOND_PATH, not O8's GIT_WRONGSHA_PATH: that PATH has no dirname, so the real installer
+  # died at its own line 84 before it ever compared a SHA, and this probe passed for the wrong
+  # reason. FULL_PRECOND_PATH's stub git answers a SHA that is not the pin: the wrong post-clone SHA.
+  OUT9B="$(run_installer "$FULL_PRECOND_PATH" OMNIROUTE_PIN_SHA="$PIN_SHA")"; RC9B=$?
   if [ "$RC9B" -eq 0 ]; then
     bad "the real installer exited 0 with a git stub returning a WRONG post-clone SHA — it should refuse"
   else
     ok "the real installer exits nonzero when the post-clone SHA is wrong (exit $RC9B)"
+    grep -qi 'post-checkout HEAD' <<<"$OUT9B" \
+      && ok "…and its refusal names the post-checkout HEAD mismatch" \
+      || bad "…but its refusal never names the post-checkout HEAD mismatch — cannot confirm THIS is why it refused: $OUT9B"
   fi
 fi
 

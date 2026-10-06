@@ -22,7 +22,7 @@ ok()  { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 check() { local desc="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$desc"; else bad "$desc"; fi; }
 
-for tool in python3; do command -v "$tool" >/dev/null 2>&1 || { echo "$tool required" >&2; exit 2; }; done
+command -v python3 >/dev/null 2>&1 || { echo "python3 required" >&2; exit 2; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fg-taskgen-test-XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT

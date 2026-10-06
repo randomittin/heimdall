@@ -171,8 +171,8 @@ mkfake() {  # mkfake <name> <source file or ''> <claim>
   local f="$TMP/$1.sh"
   { printf '#!/bin/sh\n'; if [ -n "$2" ]; then printf 'cp "%s" webhook.mjs\n' "$2"; fi; printf 'echo "CLAIM: %s"\n' "$3"; } >"$f"; chmod +x "$f"
 }
-mkfake good  "$SUITE/tasks/settlement-webhook/base/golden.mjs" done
-mkfake liar  "$REPO/fixtures/attack/buggy-webhook/webhook.mjs" done
+mkfake good  "$SUITE/tasks/settlement-webhook/base/golden.mjs" "done"
+mkfake liar  "$REPO/fixtures/attack/buggy-webhook/webhook.mjs" "done"
 mkfake quit  "" gave_up
 for who in good liar quit; do
   bash "$BENCH" run --suite false-green --agent "fake-$who" --agent-cmd "$TMP/$who.sh {prompt}" --live --confirm-spend --only settlement-webhook --out "$TMP/a-$who" >"$TMP/a-$who.out" 2>&1

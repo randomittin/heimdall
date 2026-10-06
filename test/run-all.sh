@@ -195,7 +195,8 @@ live_reason() {
 # The effective budget is max(default, override) so `--timeout 600` still raises everything
 # and an override never drops below its measured need.
 suite_timeout() {
-  local base="$(basename "$1")" override=0
+  local base override=0
+  base="$(basename "$1")"
   case "$base" in
     # gitleaks history pass (~40s alone) PLUS a full tree-mode pass; both are I/O-bound
     # scans over the whole repo and contend hard when run alongside 5 other suites.

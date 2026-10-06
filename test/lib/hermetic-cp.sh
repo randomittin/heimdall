@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # hermetic-cp.sh — a loopback stand-in for the control plane that module `add` probes.
 #
 # WHY THIS EXISTS. Both real traffic-proxy manifests (modules/headroom and
@@ -47,7 +48,7 @@
 HERMETIC_CP_PORT=""
 
 hermetic_cp_start() { # <existing scratch dir>
-  local dir="${1:-}" py i
+  local dir="${1:-}" py
   [ -d "$dir" ] || { echo "error: hermetic_cp_start needs an existing scratch dir" >&2; return 2; }
   py="$(command -v python3 || true)"
   [ -n "$py" ] || { echo "error: python3 is required for the local stand-in control plane" >&2; return 2; }
@@ -88,7 +89,7 @@ PYEOF
   # notice into the suite output (pristine output is part of the pass criteria).
   disown "$!" 2>/dev/null || true
   HERMETIC_CP_PORT=""
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     [ -s "$dir/stub-cp.port" ] && { HERMETIC_CP_PORT="$(cat "$dir/stub-cp.port")"; break; }
     sleep 0.1
   done

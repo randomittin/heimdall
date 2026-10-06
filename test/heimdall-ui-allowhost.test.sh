@@ -242,7 +242,7 @@ else bad "10. Host: localhost:<port> -> $rc, expected 200"; fi
 
 # ═══ Group B -- no flags: default behaviour byte-for-byte unchanged (SRV_NOHOST) ═
 launch_server nohost || exit 1
-PORT_N="$PORT"; BASE_N="$BASE"; AUTH_N="$AUTH"; OUT_N="$OUT"
+BASE_N="$BASE"; AUTH_N="$AUTH"; OUT_N="$OUT"
 
 rc="$(code_of -H "Host: demo.tail1234.ts.net" "$BASE_N/api/state?$AUTH_N")"
 if [ "$rc" = "403" ]; then ok "11. no --allow-host: the SAME hostname another server allowed is refused -> 403 (per-launch, not global)"
@@ -264,7 +264,7 @@ fi
 
 # ═══ Group C -- transport shape+banner with flags; trust-proxy XFF attribution ══
 launch_server trustproxy --allow-host demo.tail1234.ts.net --trust-proxy || exit 1
-PORT_T="$PORT"; BASE_T="$BASE"; AUTH_T="$AUTH"; OUT_T="$OUT"
+BASE_T="$BASE"; AUTH_T="$AUTH"; OUT_T="$OUT"
 
 BODY="$TMPROOT/state-t.json"
 rc="$(curl -s -o "$BODY" -w '%{http_code}' -H "Host: demo.tail1234.ts.net" "$BASE_T/api/state?$AUTH_T")"
@@ -316,7 +316,7 @@ else bad "18. request without XFF (real peer) -> $rc, expected 200 (only the XFF
 
 # ═══ Group D -- core backoff contract (SRV_LOCKOUT1, no flags) ══════════════
 launch_server lockout1 || exit 1
-PORT_L1="$PORT"; BASE_L1="$BASE"; AUTH_L1="$AUTH"
+BASE_L1="$BASE"; AUTH_L1="$AUTH"
 
 rc="$(code_of "$BASE_L1/api/state?token=$BADTOK")"
 if [ "$rc" = "401" ]; then ok "19a. bad-token attempt 1 -> 401"
@@ -379,7 +379,7 @@ else bad "22. /api/events with a good token -> $rc, expected 200 (A7)"; fi
 
 # ═══ Group E -- XFF ignored entirely without --trust-proxy (SRV_LOCKOUT_NOTRUST) ═
 launch_server lockout-notrust || exit 1
-PORT_L2="$PORT"; BASE_L2="$BASE"; AUTH_L2="$AUTH"
+BASE_L2="$BASE"; AUTH_L2="$AUTH"
 
 rc="$(code_of -H "X-Forwarded-For: 10.9.8.7" "$BASE_L2/api/state?token=$BADTOK")"
 if [ "$rc" = "401" ]; then ok "23a. bad-token+XFF (no --trust-proxy) attempt 1 -> 401"
@@ -409,7 +409,7 @@ else bad "24. without --trust-proxy, good token should bypass the peer's lockout
 
 # ═══ Group F -- a successful auth resets the counter (SRV_RESET, no flags) ══
 launch_server reset || exit 1
-PORT_R="$PORT"; BASE_R="$BASE"; AUTH_R="$AUTH"
+BASE_R="$BASE"; AUTH_R="$AUTH"
 
 rc="$(code_of "$BASE_R/api/state?token=$BADTOK")"
 if [ "$rc" = "401" ]; then ok "25a. pre-reset bad-token attempt 1 -> 401"
