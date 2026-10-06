@@ -271,7 +271,17 @@ launch_tool() {
   # and why judgment is unaffected (hmd_gate_exec scrubs ANTHROPIC_BASE_URL).
   # Best-effort by contract: every failure path leaves the tool launching
   # unproxied, exactly as it did before this wire existed.
-  if type hmd_headroom_chain >/dev/null 2>&1 && hmd_headroom_chain "$PLUGIN_DIR"; then
+  local chain_rc=1
+  if type hmd_headroom_chain >/dev/null 2>&1; then
+    hmd_headroom_chain "$PLUGIN_DIR" && chain_rc=0 || chain_rc=$?
+  fi
+  # rc 3: the proxy is REQUIRED for this launch (a judge, or fallback routing) and is down. The
+  # chain already said so on stderr; the one thing left to do is NOT launch direct.
+  if [ "$chain_rc" -eq 3 ]; then
+    _trace_order "wrap:headroom:required-but-down:${HMD_HEADROOM_WHY:-}"
+    exit 3
+  fi
+  if [ "$chain_rc" -eq 0 ]; then
     export ANTHROPIC_BASE_URL="$HMD_HEADROOM_BASE_URL"
     _trace_order "wrap:headroom:routed:$HMD_HEADROOM_BASE_URL"
     # DISCLOSURE, not decoration. A proxy the user cannot see is the thing this
@@ -299,7 +309,9 @@ launch_tool() {
     esac
   else
     _trace_order "wrap:headroom:unrouted:${HMD_HEADROOM_WHY:-chain unavailable}"
-    [ -n "${HMD_HEADROOM_WHY:-}" ] && \
+    # The chain already put ONE stderr line on the screen when the proxy was wanted but down
+    # (HMD_HEADROOM_WARNED); repeating it here would say the same thing twice.
+    [ -n "${HMD_HEADROOM_WHY:-}" ] && [ "${HMD_HEADROOM_WARNED:-0}" != 1 ] && \
       say "  ${D}· headroom not routing — %s${R}\n" "$HMD_HEADROOM_WHY"
   fi
 
@@ -405,6 +417,12 @@ HMD_PLUGIN_DIR="$PLUGIN_DIR"
 # 1. RE-ENTRY REFUSAL. Already inside a wrapped session -> straight to the real
 #    binary. This is what makes a fork loop impossible rather than merely unlikely.
 if [ -n "\${HEIMDALL_WRAP_SHIM_ACTIVE:-}" ]; then
+  # No chain here, but a DEAD proxy URL inherited from the wrapped parent must not ride into the
+  # real tool: one cheap, start-nothing liveness check, then straight through.
+  if [ -r "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh" ]; then
+    . "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh"
+    type hmd_headroom_drop_if_dead >/dev/null 2>&1 && hmd_headroom_drop_if_dead
+  fi
   exec "\$HMD_REAL" "\$@"
 fi
 
@@ -422,8 +440,12 @@ fi
 #    a chain that declines to route all fall through untouched.
 if [ -r "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh" ]; then
   . "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh"
-  if type hmd_headroom_chain >/dev/null 2>&1 && hmd_headroom_chain "\$HMD_PLUGIN_DIR"; then
-    export ANTHROPIC_BASE_URL="\$HMD_HEADROOM_BASE_URL"
+  if type hmd_headroom_chain >/dev/null 2>&1; then
+    _hmd_chain_rc=0
+    hmd_headroom_chain "\$HMD_PLUGIN_DIR" || _hmd_chain_rc=\$?
+    # rc 3: a judge or fallback launch whose proxy is down — fail loudly, never exec direct.
+    [ "\$_hmd_chain_rc" -eq 3 ] && exit 3
+    [ "\$_hmd_chain_rc" -eq 0 ] && export ANTHROPIC_BASE_URL="\$HMD_HEADROOM_BASE_URL"
   fi
 fi
 

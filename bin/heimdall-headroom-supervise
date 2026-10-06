@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# heimdall-headroom-supervise — OPT-IN launchd supervision for the local Headroom proxy.
+#
+#   install      write ~/Library/LaunchAgents/dev.runheimdall.headroom.plist (KeepAlive,
+#                ThrottleInterval 5) and bootstrap it when the port is free
+#   uninstall    bootout the agent and remove the plist and its launchd logs
+#   status       installed / loaded / pid / last exit code / what is on the port   [--json]
+#
+# Reached as `hmd modules supervise headroom <install|uninstall|status>`, and uninstalled by
+# `hmd modules remove headroom`.
+#
+# WHY THIS EXISTS (2026-10-06). The proxy on 127.0.0.1:8787 is one unsupervised process that
+# `hmd wrap` happened to start. It exited on a signal at 11:58:50 and nothing restarted it until
+# the next launch, 16m27s later; every session had ANTHROPIC_BASE_URL pinned to it and every
+# request died with ECONNREFUSED. A running session cannot re-point itself, so the only real
+# mitigation is making the dead window short: KeepAlive restarts it on ANY exit within the
+# ThrottleInterval, and the chain (bin/lib/hmd-headroom-chain.sh) asks launchd to start it
+# instead of racing it.
+#
+# OPT-IN, like every module side effect: `hmd modules add headroom` still installs only the
+# payload. Nothing here runs until the operator asks, and the plist's existence is the single
+# fact the chain reads to know supervision was chosen.
+#
+# THE PLIST CARRIES `--lossless` IN ProgramArguments, not only in the environment. The chain
+# reuses a live proxy only if it can PROVE it is lossless, and the one reading that works on every
+# platform is the process's argv (hmd_headroom_proc_lossless). A supervised proxy whose argv lacked
+# the flag would be refused as unverifiable and the session would run unproxied while it was up.
+#
+# NEVER LOADED OVER A LIVE PROXY. If something already answers on the port (typically the
+# unsupervised proxy this replaces) the plist is written but NOT bootstrapped: a second proxy
+# cannot bind, and headroom runs its whole model preload before it finds that out, so a bootstrap
+# here would become a heavy crash loop every ThrottleInterval for as long as the old one lives.
+# Nothing is killed. Supervision takes over by itself the next time the port is found dead (the
+# chain bootstraps the installed plist instead of spawning), or at next login (RunAtLoad).
+#
+# FAIL-SAFE AGAINST THE SANDBOX INCIDENT (bin/lib/real-home.sh). launchctl acts on gui/<uid> no
+# matter what $HOME says, so a harness with HOME=$(mktemp -d) can reach the developer's REAL
+# launchd. Every launchctl verb here is gated on LAUNCHCTL being a shim or $HOME being the real
+# passwd home; otherwise exit 4 and nothing is written.
+#
+# `uninstall` stops the proxy (bootout is how a KeepAlive job is stopped). It is the operator's
+# explicit act; sessions still pinned to the port go direct on their next launch.
+#
+# Test seams (same family as bin/heimdall-dream-schedule):
+#   HEIMDALL_LAUNCH_AGENTS_DIR   plist dir        (default $HOME/Library/LaunchAgents)
+#   LAUNCHCTL                    launchctl binary (default launchctl)
+#   HMD_HEADROOM_SUPERVISOR_LABEL  label           (default dev.runheimdall.headroom)
+#   HMD_HEADROOM_BIN / HEADROOM_PORT / HEIMDALL_HOME as for the chain itself.
+#
+# Exit: 0 ok | 2 precondition unmet | 4 refused — synthetic HOME would reach the real launchd.
+
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+BIN_DIR="$PLUGIN_DIR/bin"
+
+# shellcheck source=lib/hmd-headroom-chain.sh
+. "$BIN_DIR/lib/hmd-headroom-chain.sh"
+
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$SELF"; }
+die()   { echo "heimdall-headroom-supervise: $*" >&2; exit 2; }
+
+JSON=0; QUIET=0; ACTION=""
+for arg in "$@"; do
+  case "$arg" in
+    --json)         JSON=1 ;;
+    --quiet|-q)     QUIET=1 ;;
+    -h|--help)      usage; exit 0 ;;
+    install|uninstall|status) ACTION="$arg" ;;
+    *)              die "unknown argument: $arg (install | uninstall | status [--json] [--quiet])" ;;
+  esac
+done
+[ -n "$ACTION" ] || { usage >&2; exit 2; }
+
+LABEL="$(hmd_headroom_supervisor_label)"
+PLIST="$(hmd_headroom_supervisor_plist)"
+LC="${LAUNCHCTL:-launchctl}"
+DOMAIN="gui/$(id -u)"
+LOGDIR="${HEIMDALL_HOME:-$HOME/.heimdall}/headroom"
+OUT_LOG="$LOGDIR/launchd.out.log"
+ERR_LOG="$LOGDIR/launchd.err.log"
+
+say() { [ "$QUIET" -eq 1 ] || [ "$JSON" -eq 1 ] || printf '%s\n' "$*"; }
+
+xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"
+  printf '%s' "$s"
+}
+
+require_reachable_launchd() {
+  _hmd_headroom_launchd_reachable && return 0
+  echo "not touching launchd for $LABEL (synthetic HOME — refusing to reach the real launchd domain)" >&2
+  echo "  \$HOME is not this user's passwd home, so launchctl would act on the REAL per-user" >&2
+  echo "  launchd that \$HOME does not isolate. Nothing was written." >&2
+  exit 4
+}
+
+is_loaded() { "$LC" print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
+
+# stage_plist <headroom-bin> <port> <destfile> — the plist, validated BEFORE it can replace anything.
+stage_plist() {
+  local bin="$1" port="$2" dest="$3" lossless_arg="" e_bin e_wd e_path e_out e_err e_ll e_to e_km
+  hmd_headroom_lossless_wanted && lossless_arg="    <string>--lossless</string>"
+  e_bin="$(xml_escape "$bin")"
+  e_wd="$(xml_escape "$HOME")"
+  e_path="$(xml_escape "$(dirname "$bin"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")"
+  e_out="$(xml_escape "$OUT_LOG")"; e_err="$(xml_escape "$ERR_LOG")"
+  e_ll="$(xml_escape "${HEADROOM_LOSSLESS:-1}")"
+  e_to="$(xml_escape "${HEADROOM_COMPRESSION_TIMEOUT_SECONDS:-30}")"
+  e_km="$(xml_escape "${HEADROOM_KOMPRESS_MAX_TOKENS:-10000}")"
+  cat > "$dest" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$e_bin</string>
+    <string>proxy</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>$port</string>
+$lossless_arg
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HEADROOM_LOSSLESS</key>
+    <string>$e_ll</string>
+    <key>HEADROOM_COMPRESSION_TIMEOUT_SECONDS</key>
+    <string>$e_to</string>
+    <key>HEADROOM_KOMPRESS_MAX_TOKENS</key>
+    <string>$e_km</string>
+    <key>PATH</key>
+    <string>$e_path</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ExitTimeOut</key>
+  <integer>20</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>WorkingDirectory</key>
+  <string>$e_wd</string>
+  <key>StandardOutPath</key>
+  <string>$e_out</string>
+  <key>StandardErrorPath</key>
+  <string>$e_err</string>
+</dict>
+</plist>
+PLIST
+  # An invalid plist must never reach launchd — or replace a good one. plutil is the platform's
+  # own validator and ships with every macOS.
+  if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$dest" >/dev/null 2>&1; then
+    rm -f "$dest"
+    die "generated plist failed plutil -lint — nothing installed"
+  fi
+}
+
+emit() { # emit <action> <loaded> <port_state> — one summary, human or JSON
+  if [ "$JSON" -eq 1 ]; then
+    jq -n --arg action "$1" --argjson loaded "$2" --arg label "$LABEL" --arg plist "$PLIST" \
+          --arg port "$PORT" --arg state "$3" \
+      '{installed:true, action:$action, loaded:$loaded, label:$label, plist:$plist, port:($port|tonumber), port_state:$state}'
+  fi
+}
+
+cmd_install() {
+  [ "$(uname -s)" = Darwin ] || die "unsupported platform: launchd supervision is macOS-only (found $(uname -s)); unsupervised hosts keep the chain's own start-on-launch"
+  require_reachable_launchd
+  hmd_headroom_installed "$PLUGIN_DIR" || die "the headroom module is not added — run: hmd modules add headroom"
+  if hmd_headroom_opted_out "$PLUGIN_DIR"; then
+    die "headroom is opted out — run: hmd modules optin headroom"
+  fi
+  local bin changed=1 loaded=false state action
+  bin="$(hmd_headroom_bin)" || die "the headroom CLI is not installed — run: hmd modules add headroom"
+  PORT="$(hmd_headroom_port)"
+
+  mkdir -p "$(dirname "$PLIST")" || die "cannot create $(dirname "$PLIST")"
+  mkdir -p "$LOGDIR" && chmod 0700 "$LOGDIR" || die "cannot create $LOGDIR"
+  STAGED="$PLIST.new.$$"
+  trap 'rm -f "${STAGED:-}"' EXIT
+  stage_plist "$bin" "$PORT" "$STAGED"
+  chmod 0644 "$STAGED"
+  [ -f "$PLIST" ] && cmp -s "$STAGED" "$PLIST" && changed=0
+  mv -f "$STAGED" "$PLIST"
+
+  is_loaded && loaded=true
+  state="$(hmd_headroom_port_state "$PORT")"
+  if [ "$loaded" = true ] && [ "$changed" -eq 0 ]; then
+    action="unchanged"                       # already supervised with this exact config: do not restart it
+  elif [ "$loaded" = true ]; then
+    "$LC" bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+    "$LC" bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1 || die "launchctl bootstrap failed for $PLIST"
+    action="reloaded"                        # the config changed, so the proxy restarts once, deliberately
+  elif [ "$state" = dead ]; then
+    "$LC" bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1 || die "launchctl bootstrap failed for $PLIST"
+    action="loaded"
+  else
+    action="deferred"                        # a live listener holds the port: never start a doomed second proxy
+  fi
+  is_loaded && loaded=true || loaded=false
+
+  say "installed $LABEL — $action"
+  say "  plist:    $PLIST"
+  say "  proxy:    $bin proxy --host 127.0.0.1 --port $PORT$(hmd_headroom_lossless_wanted && printf ' --lossless')"
+  say "  restart:  KeepAlive, at most one spawn per 5s (ThrottleInterval)"
+  say "  logs:     $OUT_LOG / $ERR_LOG"
+  if [ "$action" = deferred ]; then
+    say "  NOT LOADED: port $PORT is held by a live listener ($state). It was left running — a second proxy"
+    say "              cannot bind. Supervision takes over by itself the next time the port is found"
+    say "              dead (the next \`hmd wrap\` bootstraps this plist), or at next login."
+  fi
+  say "  stop it:  launchctl bootout $DOMAIN/$LABEL   (a plain kill is undone within seconds)"
+  say "  remove:   hmd modules supervise headroom uninstall"
+  emit "$action" "$loaded" "$state"
+}
+
+cmd_uninstall() {
+  local was_loaded=false
+  if [ ! -f "$PLIST" ]; then
+    # Nothing was ever installed. No launchctl verb, no touch of anything: this is what keeps
+    # `hmd modules remove headroom` a pure no-op for every operator who never opted in.
+    if [ "$JSON" -eq 1 ]; then
+      jq -n --arg label "$LABEL" --arg plist "$PLIST" '{installed:false, loaded:false, label:$label, plist:$plist}'
+    else
+      say "not installed ($LABEL) — nothing to remove"
+    fi
+    return 0
+  fi
+  require_reachable_launchd
+  if is_loaded; then was_loaded=true; "$LC" bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true; fi
+  rm -f "$PLIST" "$OUT_LOG" "$ERR_LOG"
+  if [ "$JSON" -eq 1 ]; then
+    jq -n --arg label "$LABEL" --arg plist "$PLIST" --argjson was "$was_loaded" \
+      '{installed:false, loaded:false, was_loaded:$was, label:$label, plist:$plist}'
+  else
+    say "uninstalled $LABEL (agent booted out, plist and launchd logs removed)"
+    [ "$was_loaded" = true ] && say "  the supervised proxy stopped with it; the next \`hmd wrap\` starts an unsupervised one"
+  fi
+}
+
+cmd_status() {
+  local installed=false loaded=false pid="" lastexit="" state dump
+  PORT="$(hmd_headroom_port)"
+  [ -f "$PLIST" ] && installed=true
+  if [ "$installed" = true ] && _hmd_headroom_launchd_reachable && is_loaded; then
+    loaded=true
+    dump="$("$LC" print "$DOMAIN/$LABEL" 2>/dev/null || true)"
+    pid="$(printf '%s\n' "$dump" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -1)"
+    lastexit="$(printf '%s\n' "$dump" | sed -n 's/^[[:space:]]*last exit code = \(.*[^[:space:]]\)[[:space:]]*$/\1/p' | head -1)"
+  fi
+  state="$(hmd_headroom_port_state "$PORT")"
+  if [ "$JSON" -eq 1 ]; then
+    jq -n --argjson installed "$installed" --argjson loaded "$loaded" --arg label "$LABEL" --arg plist "$PLIST" \
+          --arg port "$PORT" --arg state "$state" --arg pid "$pid" --arg lastexit "$lastexit" \
+      '{installed:$installed, loaded:$loaded, label:$label, plist:$plist, port:($port|tonumber), port_state:$state,
+        pid:(if $pid == "" then null else ($pid|tonumber) end), last_exit:(if $lastexit == "" then null else $lastexit end)}'
+    return 0
+  fi
+  say "supervision: $([ "$installed" = true ] && echo "installed ($PLIST)" || echo 'not installed — opt in with: hmd modules supervise headroom install')"
+  [ "$installed" = true ] && say "  agent:   $([ "$loaded" = true ] && echo "loaded${pid:+, pid $pid}${lastexit:+, last exit $lastexit}" || echo 'not loaded')"
+  say "  port $PORT: $state"
+  # A bind conflict is a silent crash loop (launchd respawns every 5s) — so surface the log tail
+  # rather than leaving it for someone to find.
+  if [ "$loaded" = true ] && [ -s "$ERR_LOG" ] && [ -n "$lastexit" ] && [ "$lastexit" != "0" ] && [ "$lastexit" != "(never exited)" ]; then
+    say "  launchd.err.log (last 3 lines):"
+    tail -n 3 "$ERR_LOG" | sed 's/^/    /'
+  fi
+}
+
+case "$ACTION" in
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  status)    cmd_status ;;
+esac
