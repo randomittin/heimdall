@@ -456,6 +456,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `heimdall-demo` | first-five-minutes demo |
 | `heimdall-ui` | `hmd ui` companion web UI |
 | `heimdall-app` | `hmd app connect/status/disconnect/doctor` — Tailscale Funnel publish for the companion app |
+| `heimdall-dash` | `hmd dash`: laptop side of custom dashboards (confirm or decline producer proposals, manage connectors, run the producer loop) |
 | `heimdall-weekly-log` / `generate-changelog` / `heimdall-render-version` | weekly changelog draft; changelog from conventional commits; render every version surface from plugin.json |
 
 ### Skills, stacks, design
