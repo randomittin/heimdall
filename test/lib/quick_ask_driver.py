@@ -210,7 +210,14 @@ def keysets():
         assert c.dispatch(e.root, "quick-ask", params, caps=CAPS)[:2] == (False, "bad-params"), params
     assert c.dispatch(e.root, "quick-ask", "nope", caps=CAPS)[:2] == (False, "bad-params")
     assert e.rows() == [] and model_calls() == [], "a refused ask costs nothing"
-    assert e.send("\u20ac" * 166)[:2] == (True, "queued"), "166 euro signs = 498 bytes is inside both caps"
+    def refused(text):                   # the handler's own cap: the dispatcher's 1 KiB check counts every non-ASCII character as 6 bytes
+        try:
+            ask.parse_params({"project": "p", "text": text})
+        except ValueError:
+            return True
+        return False
+    assert e.send("\u20ac" * 140)[:2] == (True, "queued"), "140 euro signs: inside the character, byte and 1 KiB caps"
+    assert not refused("\u20ac" * 166) and refused("\u20ac" * 167), "166 euro signs are 498 bytes, 167 are 501: only the byte cap tells them apart"
 
 
 @check
