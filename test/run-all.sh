@@ -210,6 +210,10 @@ suite_timeout() {
     # under a 180s default, a timeout means something genuinely hung.
     # measured 56s solo / 102s under --jobs 6 — the closest suite to the old 120s cliff.
     heimdall-context-capsule.test.sh) override=300 ;;
+    # quick-ask: every mutant of test/quick-ask.test.sh re-runs the whole in-process driver (a model-child spawn per check), and the e2e
+    # re-runs the real relay client through the fake relay once per wiring mutant -- each is minutes of honest work, not a hang.
+    quick-ask.test.sh)               override=900 ;;
+    quick-ask-e2e.test.sh)           override=600 ;;
     # measured 428s SOLO (57 passed, 0 failed) on an M-series mac, 2026-08-04 — BEFORE
     # claude-mem's install step was retired 2026-09-04 (see CLAUDE.md); the real total is
     # now lower than this by roughly the ~21s/install claude-mem line below, which no
