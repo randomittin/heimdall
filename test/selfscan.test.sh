@@ -652,11 +652,13 @@ else
     ok "mutation is real AT RUNTIME (tree scan widened ${f_scoped_b} -> ${f_unscoped_b} bytes)"
   else
     bad "tree scan volume did not widen (scoped=${f_scoped_b:-none}, unscoped=${f_unscoped_b:-none}) — the RED below would prove nothing"
+    grep -E '^guard|BLOCKED' "$WORK/f-unscoped.err" | sed 's/^/      /' | head -8
   fi
   if [ "$unscoped_rc" -ne 0 ] && grep -q "WORKING TREE" "$WORK/f-unscoped.err"; then
     ok "WITHOUT the scoping the same ignored files DO block (rc=$unscoped_rc) — the scoping earns its place"
   else
     bad "unscoped gate did not block on the ignored pollution (rc=$unscoped_rc) — (i) is vacuous; the planted secrets may not be detectable at all"
+    tail -8 "$WORK/f-unscoped.err" | sed 's/^/      /'
   fi
 
   # (iii) TRACKED IS IN — restore the scoped gate, keep the pollution, and make an
