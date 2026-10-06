@@ -34,9 +34,16 @@ k/M/B/T, 4m 12s, 1.2 GB, 63%) or a short string of letters, digits and `.,%+- `.
 
 STORE. <repo>/.heimdall/app/digest.json (dir 0700, file 0600, atomic replace, one exclusive flock over digest.json.lock around every
 read-modify-write, so the relay client, `hmd ui` and the sender can not lose each other's update):
-    {"v":1,"config":null|{"at","tz_min","tiles","include_values","on","set_at"},"last_day":null|"YYYY-MM-DD","last_at":null|epoch,
+    {"v":1,"config":null|{"at","tz_min","tiles","include_values","on","set_at","project"},"last_day":null|"YYYY-MM-DD","last_at":null|epoch,
      "counts":{"finished","verdicts","alerts"},"seen":[<=64 event keys]}
 Counting is idempotent across processes: an event key already in `seen` is not counted again. Never in it: a token, a title, a value.
+`project` is the repo's name as the phone sent it: it is hashed (companion_push's collapseId, `<project hash>.digest`) and never in a message.
+
+PUSH KIND. `digest` is a REGISTERED kind (register_push_kinds below, named in companion_push.KIND_MODULES), not one of the closed
+six: companion_push.KINDS is unchanged, its store accepts `digest` and hmd lists `push-digest-v1` only while this module loads. A device
+that named no events never gets one (a registered kind is opt-in). The `tile_alert` events that move the alerts counter are the ones
+dashboard_alerts hands companion_push.enqueue_event: the sender's worker reads them from the push spool and counts them here (record)
+whether or not it is the process that serves them.
 
 Stdlib only. Loadable by path, like every companion_* module; no side effects at import.
 """
@@ -62,6 +69,7 @@ LOCK_TIMEOUT_S = 1.0
 LOCK_POLL_S = 0.005
 RETRY_S = 60.0                  # a process whose attempt came to nothing looks again no sooner than this
 MAX_TILES = 3
+PROJECT_MAX = 255               # the longest `project` the dashboards wire admits (companion_dashboards.MAX_PROJECT_CHARS)
 MAX_LINES = 4
 BODY_MAX = 160                  # UTF-16 units: the handoff's limit for a digest body (every other kind: companion_push.BODY_MAX)
 TITLE_UNITS = 24                # a tile title as shown, ellipsis included
@@ -417,6 +425,17 @@ def compose_body(fields, tools):
         if line:
             lines.append(line)
     return tools.clip("\n".join(lines), BODY_MAX) if lines else None
+
+
+def register_push_kinds(kit):
+    """companion_push's registration hook (KIND_MODULES): the kind `digest` and its constants (H2 table: title "<label> · morning
+    report", channel hmd-updates, no category, level active, ttl 21600, collapseId "<project hash>.digest"; cap push-digest-v1, which
+    hmd lists in its state frames while the kind is registered). Priority 0: a digest never displaces another kind in a coalescing
+    window. It keeps 4 lines and BODY_MAX units, where the registry's default is one line of its own BODY_MAX. `kit` is the sender's
+    own scrub, clip and secret check, handed to compose_body unchanged."""
+    kit.register_kind(KIND, phrase="morning report", channel="hmd-updates", level="active", ttl=21600, cap=CAP_DIGEST, priority=0,
+                      body=lambda fields: compose_body(fields, kit), suffix="digest", body_max=BODY_MAX, lines=MAX_LINES,
+                      scope=lambda fields: "project:%s" % fields["project"] if fields.get("project") else None)
 
 
 # -- the sender's side -------------------------------------------------------------------------------------------------

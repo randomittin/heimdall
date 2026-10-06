@@ -71,7 +71,7 @@ READ_CAP_BYTES = 65536         # five entries are ~1 KiB; a file bigger than thi
 LOCK_TIMEOUT_S = 3.0           # the relay client's stream thread must never wedge behind a stuck writer
 LOCK_POLL_S = 0.005
 PLATFORMS = ("ios", "android")
-EVENT_KINDS = ("approval", "digest", "error", "finished", "gate_red", "question")  # spec 5.2's five kinds, and `digest` (watch handoff H2/H4: a phone asks for it only when hmd lists push-digest-v1)
+EVENT_KINDS = ("approval", "error", "finished", "gate_red", "question")  # spec 5.2: the five kinds a phone may ask for
 LABEL_MAX_UNITS = 24           # UTF-16 code units, after trim (spec 5.2)
 
 # Spec 5.2: the Expo token shape. fullmatch, so a trailing newline can never ride along.
