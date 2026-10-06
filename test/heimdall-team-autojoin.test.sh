@@ -57,7 +57,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 # HERMETIC against the operator's team off switch (HMD_TEAM_NO_COMMIT / $HOME/.heimdall/no-team-commit):
 # on a box that has it on, `share` never commits and (a) + (g) go red for a reason that is not the code.
-# shellcheck source=lib/hermetic-team-env.sh
+# shellcheck source=/dev/null  # sibling helper test/lib/hermetic-team-env.sh; not followed (no -x)
 . "$HERE/lib/hermetic-team-env.sh"; hermetic_team_env "$WORK" || exit 2
 
 # ── helpers ──────────────────────────────────────────────────────────────────

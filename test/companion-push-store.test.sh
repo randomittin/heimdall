@@ -78,6 +78,7 @@ trap 'rm -rf "$TMPROOT"' EXIT
 
 # Every python case gets this prelude (the store loaded BY PATH, the convention bin/heimdall-relay-client
 # itself uses) followed by its own body on stdin.
+# shellcheck disable=SC2016  # Python source, not shell: any $ in it must reach python literally
 PRELUDE='
 import ast, errno, inspect, json, os, re, stat, subprocess, sys, tempfile, threading, time
 from importlib.util import module_from_spec, spec_from_file_location
@@ -694,6 +695,7 @@ PYEOF
 # The REAL RelayClient, paired in-process with a fake phone through the real device_bound path. Only the
 # POST is replaced: every frame the client would send is recorded as the phone would receive it, and
 # ack() opens the newest one with the key the phone derived.
+# shellcheck disable=SC2016  # Python source, not shell: any $ in it must reach python literally
 RIG='
 import argparse, contextlib, importlib.util, io
 from importlib.machinery import SourceFileLoader

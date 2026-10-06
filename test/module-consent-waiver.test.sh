@@ -109,6 +109,7 @@ export HMD_PREFLIGHT_DISK_FLOOR_MB=1
 # THE SAME RULE, APPLIED TO THE NETWORK — see "THIS SUITE OWNS ITS CONTROL PLANE"
 # in the header. Started before any add runs, and verified (CP section) before any
 # add result is read as a statement about consent.
+# shellcheck source=/dev/null  # sibling helper test/lib/hermetic-cp.sh; not followed (no -x)
 . "$SELF_DIR/lib/hermetic-cp.sh"
 hermetic_cp_start "$TMP" || exit 2
 hermetic_cp_selfcheck
@@ -168,36 +169,54 @@ mkproxy() { # <name> [extra JSON merged over the manifest]
 echo
 echo "W1 — Headroom declares the waiver explicitly, and keeps the disclosure"
 HMF="$REAL_REG/headroom/manifest.json"
-[ -f "$HMF" ] && ok "headroom manifest exists" || bad "headroom manifest missing"
-[ "$(jq -r '.consent_waived // "absent"' "$HMF")" = "true" ] \
-  && ok "consent_waived is true — the waiver is declared, not implied" \
-  || bad "headroom carries no consent_waived (got: $(jq -r '.consent_waived // "absent"' "$HMF"))"
-jq -e '.consent_waived | type == "boolean"' "$HMF" >/dev/null 2>&1 \
-  && ok "consent_waived is a boolean" || bad "consent_waived is not a boolean"
+if [ -f "$HMF" ]; then ok "headroom manifest exists"; else bad "headroom manifest missing"; fi
+if [ "$(jq -r '.consent_waived // "absent"' "$HMF")" = "true" ]; then
+  ok "consent_waived is true — the waiver is declared, not implied"
+else
+  bad "headroom carries no consent_waived (got: $(jq -r '.consent_waived // "absent"' "$HMF"))"
+fi
+if jq -e '.consent_waived | type == "boolean"' "$HMF" >/dev/null 2>&1; then
+  ok "consent_waived is a boolean"
+else
+  bad "consent_waived is not a boolean"
+fi
 WR="$(jq -r '.consent_waived_reason // ""' "$HMF")"
-[ -n "$WR" ] && ok "consent_waived_reason is present — the waiver says WHY" \
-             || bad "no consent_waived_reason: an unexplained waiver reads as a bug"
-[ "${#WR}" -ge 60 ] \
-  && ok "the reason is a real explanation, not a shrug (${#WR} chars)" \
-  || bad "consent_waived_reason is too short to be a reason (${#WR} chars)"
-[ -n "$(jq -r '.consent_text // ""' "$HMF")" ] \
-  && ok "consent_text SURVIVES the waiver — disclosure is not deleted" \
-  || bad "the waiver deleted the disclosure text"
-jq -e . "$HMF" >/dev/null 2>&1 && ok "headroom manifest is still valid JSON" || bad "manifest is not valid JSON"
+if [ -n "$WR" ]; then
+  ok "consent_waived_reason is present — the waiver says WHY"
+else
+  bad "no consent_waived_reason: an unexplained waiver reads as a bug"
+fi
+if [ "${#WR}" -ge 60 ]; then
+  ok "the reason is a real explanation, not a shrug (${#WR} chars)"
+else
+  bad "consent_waived_reason is too short to be a reason (${#WR} chars)"
+fi
+if [ -n "$(jq -r '.consent_text // ""' "$HMF")" ]; then
+  ok "consent_text SURVIVES the waiver — disclosure is not deleted"
+else
+  bad "the waiver deleted the disclosure text"
+fi
+if jq -e . "$HMF" >/dev/null 2>&1; then ok "headroom manifest is still valid JSON"; else bad "manifest is not valid JSON"; fi
 
 echo
 echo "W2 — the CLASS contract is untouched (the blast-radius guard)"
 TPC="$REAL_CLASSES/traffic-proxy.json"
-[ "$(jq -r '.consent_required' "$TPC")" = "true" ] \
-  && ok "traffic-proxy STILL requires consent — the waiver did not flip the class" \
-  || bad "traffic-proxy consent_required is no longer true — the waiver widened to the whole class"
-jq -e 'has("consent_waived") | not' "$TPC" >/dev/null 2>&1 \
-  && ok "the class contract carries no consent_waived of its own" \
-  || bad "a waiver was placed on the CLASS — that exempts every traffic-proxy module ever shipped"
+if [ "$(jq -r '.consent_required' "$TPC")" = "true" ]; then
+  ok "traffic-proxy STILL requires consent — the waiver did not flip the class"
+else
+  bad "traffic-proxy consent_required is no longer true — the waiver widened to the whole class"
+fi
+if jq -e 'has("consent_waived") | not' "$TPC" >/dev/null 2>&1; then
+  ok "the class contract carries no consent_waived of its own"
+else
+  bad "a waiver was placed on the CLASS — that exempts every traffic-proxy module ever shipped"
+fi
 for cls in storage-codec rule-pack tool-adapter; do
-  jq -e 'has("consent_waived") | not' "$REAL_CLASSES/$cls.json" >/dev/null 2>&1 \
-    && ok "$cls contract carries no class-level waiver" \
-    || bad "$cls contract carries a class-level waiver"
+  if jq -e 'has("consent_waived") | not' "$REAL_CLASSES/$cls.json" >/dev/null 2>&1; then
+    ok "$cls contract carries no class-level waiver"
+  else
+    bad "$cls contract carries a class-level waiver"
+  fi
 done
 
 echo
@@ -205,127 +224,205 @@ echo "W3 — a WAIVED module adds unprompted, and still discloses"
 mkproxy shipped '{"consent_waived":true,
                  "consent_waived_reason":"synthetic fixture waiver for the acceptance test"}'
 OUT="$(hmd add shipped < /dev/null 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] \
-  && ok "a waived module adds non-interactively with NO --yes (exit 0)" \
-  || bad "waived add still failed (exit $RC)"
-grep -qF 'Synthetic disclosure for shipped.' <<<"$OUT" \
-  && ok "the disclosure text is PRINTED — told, not asked" \
-  || bad "the disclosure was never shown"
-grep -qi 'Install it? \[y/N\]' <<<"$OUT" \
-  && bad "it still prompted" || ok "no [y/N] prompt was issued"
-grep -qi 'waived' <<<"$OUT" \
-  && ok "the output says out loud that consent was waived" \
-  || bad "the waiver happened silently — a reader cannot tell they were not asked"
-grep -qF 'synthetic fixture waiver for the acceptance test' <<<"$OUT" \
-  && ok "the REASON is printed at add time" || bad "the reason was not shown"
+if [ "$RC" -eq 0 ]; then
+  ok "a waived module adds non-interactively with NO --yes (exit 0)"
+else
+  bad "waived add still failed (exit $RC)"
+fi
+if grep -qF 'Synthetic disclosure for shipped.' <<<"$OUT"; then
+  ok "the disclosure text is PRINTED — told, not asked"
+else
+  bad "the disclosure was never shown"
+fi
+if grep -qi 'Install it? \[y/N\]' <<<"$OUT"; then
+  bad "it still prompted"
+else
+  ok "no [y/N] prompt was issued"
+fi
+if grep -qi 'waived' <<<"$OUT"; then
+  ok "the output says out loud that consent was waived"
+else
+  bad "the waiver happened silently — a reader cannot tell they were not asked"
+fi
+if grep -qF 'synthetic fixture waiver for the acceptance test' <<<"$OUT"; then
+  ok "the REASON is printed at add time"
+else
+  bad "the reason was not shown"
+fi
 # The pipeline still ran in order, consent included as a real step.
-grep -q '\[4/7\] consent' <<<"$OUT" \
-  && ok "step 4 still RUNS — the waiver answers it, it does not delete it" \
-  || bad "the consent step vanished from the pipeline"
+if grep -q '\[4/7\] consent' <<<"$OUT"; then
+  ok "step 4 still RUNS — the waiver answers it, it does not delete it"
+else
+  bad "the consent step vanished from the pipeline"
+fi
 
 echo
 echo "W4 — an UN-WAIVED module of the same real class is STILL GATED"
 mkproxy gated
 OUT4="$(hmd add gated < /dev/null 2>&1)"; RC4=$?
-[ "$RC4" -ne 0 ] \
-  && ok "an un-waived traffic-proxy module is REFUSED without consent (exit $RC4)" \
-  || bad "an un-waived traffic-proxy module installed with nobody asked — the waiver leaked to the class"
-grep -qi 'consent is required' <<<"$OUT4" \
-  && ok "it says consent is required" || bad "no consent-required message"
-[ ! -f "$STATE/gated/receipt.json" ] \
-  && ok "nothing was installed for the un-waived module" || bad "the un-waived module left a receipt"
+if [ "$RC4" -ne 0 ]; then
+  ok "an un-waived traffic-proxy module is REFUSED without consent (exit $RC4)"
+else
+  bad "an un-waived traffic-proxy module installed with nobody asked — the waiver leaked to the class"
+fi
+if grep -qi 'consent is required' <<<"$OUT4"; then
+  ok "it says consent is required"
+else
+  bad "no consent-required message"
+fi
+if [ ! -f "$STATE/gated/receipt.json" ]; then
+  ok "nothing was installed for the un-waived module"
+else
+  bad "the un-waived module left a receipt"
+fi
 # ...and it is grantable the normal way, so the gate is a gate and not a wall.
 OUT4B="$(hmd add gated --yes 2>&1)"; RC4B=$?
-[ "$RC4B" -eq 0 ] && ok "--yes still grants consent the normal way" || bad "--yes broke (exit $RC4B): $OUT4B"
-[ "$(jq -r '.consent.granted_via' "$STATE/gated/receipt.json" 2>/dev/null)" = "--yes" ] \
-  && ok "the un-waived receipt records the ordinary grant path" || bad "grant path not recorded"
-[ "$(jq -r '.consent.waived // false' "$STATE/gated/receipt.json" 2>/dev/null)" = "false" ] \
-  && ok "the un-waived receipt is NOT marked waived" || bad "an ordinary grant was recorded as a waiver"
+if [ "$RC4B" -eq 0 ]; then ok "--yes still grants consent the normal way"; else bad "--yes broke (exit $RC4B): $OUT4B"; fi
+if [ "$(jq -r '.consent.granted_via' "$STATE/gated/receipt.json" 2>/dev/null)" = "--yes" ]; then
+  ok "the un-waived receipt records the ordinary grant path"
+else
+  bad "grant path not recorded"
+fi
+if [ "$(jq -r '.consent.waived // false' "$STATE/gated/receipt.json" 2>/dev/null)" = "false" ]; then
+  ok "the un-waived receipt is NOT marked waived"
+else
+  bad "an ordinary grant was recorded as a waiver"
+fi
 hmd remove gated >/dev/null 2>&1
 
 echo
 echo "W5 — the receipt records the waiver, the reason, and the disclosed text"
 R="$STATE/shipped/receipt.json"
-[ "$(jq -r '.consent.required' "$R" 2>/dev/null)" = "true" ] \
-  && ok "the receipt still says consent WAS required by the class" \
-  || bad "the receipt pretends consent was never required"
-[ "$(jq -r '.consent.waived' "$R" 2>/dev/null)" = "true" ] \
-  && ok "the receipt records that it was waived" || bad "the receipt hides the waiver"
-[ "$(jq -r '.consent.granted_via' "$R" 2>/dev/null)" = "manifest-waiver" ] \
-  && ok "granted_via names the waiver, distinctly from --yes and interactive" \
-  || bad "granted_via does not distinguish a waiver from a human saying yes"
-[ -n "$(jq -r '.consent.waived_reason // ""' "$R" 2>/dev/null)" ] \
-  && ok "the receipt carries the reason" || bad "the receipt drops the reason"
-[ -n "$(jq -r '.consent.consent_text_sha256 // ""' "$R" 2>/dev/null)" ] \
-  && ok "the receipt pins the hash of the text that was DISCLOSED" \
-  || bad "no hash of the disclosed text"
+if [ "$(jq -r '.consent.required' "$R" 2>/dev/null)" = "true" ]; then
+  ok "the receipt still says consent WAS required by the class"
+else
+  bad "the receipt pretends consent was never required"
+fi
+if [ "$(jq -r '.consent.waived' "$R" 2>/dev/null)" = "true" ]; then
+  ok "the receipt records that it was waived"
+else
+  bad "the receipt hides the waiver"
+fi
+if [ "$(jq -r '.consent.granted_via' "$R" 2>/dev/null)" = "manifest-waiver" ]; then
+  ok "granted_via names the waiver, distinctly from --yes and interactive"
+else
+  bad "granted_via does not distinguish a waiver from a human saying yes"
+fi
+if [ -n "$(jq -r '.consent.waived_reason // ""' "$R" 2>/dev/null)" ]; then
+  ok "the receipt carries the reason"
+else
+  bad "the receipt drops the reason"
+fi
+if [ -n "$(jq -r '.consent.consent_text_sha256 // ""' "$R" 2>/dev/null)" ]; then
+  ok "the receipt pins the hash of the text that was DISCLOSED"
+else
+  bad "no hash of the disclosed text"
+fi
 # The hash must be the hash of the real text, not a placeholder.
 EXPECT_SHA="$(printf '%s' "$(jq -r '.consent_text' "$REG/shipped/manifest.json")" | shasum -a 256 | awk '{print $1}')"
-[ "$(jq -r '.consent.consent_text_sha256' "$R")" = "$EXPECT_SHA" ] \
-  && ok "the pinned hash matches the manifest's disclosure text exactly" \
-  || bad "the pinned hash is not the hash of the shown text"
+if [ "$(jq -r '.consent.consent_text_sha256' "$R")" = "$EXPECT_SHA" ]; then
+  ok "the pinned hash matches the manifest's disclosure text exactly"
+else
+  bad "the pinned hash is not the hash of the shown text"
+fi
 # The --json add receipt is the machine-readable surface the requirement names.
 hmd remove shipped >/dev/null 2>&1
 # `--json add` prints the human progress lines first and the receipt after, and
 # jq pretty-prints it, so the JSON is the block from the first bare `{` onward —
 # NOT the last line, which is just a closing brace.
 J="$(hmd --json add shipped < /dev/null 2>/dev/null | awk '/^\{$/{f=1} f')"
-printf '%s' "$J" | jq -e . >/dev/null 2>&1 \
-  && ok "--json add emits valid JSON" || bad "--json add emitted invalid JSON"
-[ "$(printf '%s' "$J" | jq -r '.receipt.consent.waived')" = "true" ] \
-  && ok "the --json receipt exposes the waiver" || bad "--json receipt hides the waiver"
-[ -n "$(printf '%s' "$J" | jq -r '.receipt.consent.waived_reason // ""')" ] \
-  && ok "the --json receipt exposes the reason" || bad "--json receipt drops the reason"
+if printf '%s' "$J" | jq -e . >/dev/null 2>&1; then
+  ok "--json add emits valid JSON"
+else
+  bad "--json add emitted invalid JSON"
+fi
+if [ "$(printf '%s' "$J" | jq -r '.receipt.consent.waived')" = "true" ]; then
+  ok "the --json receipt exposes the waiver"
+else
+  bad "--json receipt hides the waiver"
+fi
+if [ -n "$(printf '%s' "$J" | jq -r '.receipt.consent.waived_reason // ""')" ]; then
+  ok "the --json receipt exposes the reason"
+else
+  bad "--json receipt drops the reason"
+fi
 
 echo
 echo "W6 — status renders the waiver, installed and not-installed"
 S="$(hmd status shipped 2>&1)"
-grep -qi 'waived' <<<"$S" \
-  && ok "status on an INSTALLED waived module shows the waiver" \
-  || bad "status hides the waiver on an installed module"
-grep -qF 'synthetic fixture waiver for the acceptance test' <<<"$S" \
-  && ok "status shows the REASON" || bad "status shows no reason"
+if grep -qi 'waived' <<<"$S"; then
+  ok "status on an INSTALLED waived module shows the waiver"
+else
+  bad "status hides the waiver on an installed module"
+fi
+if grep -qF 'synthetic fixture waiver for the acceptance test' <<<"$S"; then
+  ok "status shows the REASON"
+else
+  bad "status shows no reason"
+fi
 SJ="$(hmd --json status shipped 2>/dev/null)"
-[ "$(printf '%s' "$SJ" | jq -r '.receipt.consent.waived')" = "true" ] \
-  && ok "--json status exposes the waiver" || bad "--json status hides the waiver"
+if [ "$(printf '%s' "$SJ" | jq -r '.receipt.consent.waived')" = "true" ]; then
+  ok "--json status exposes the waiver"
+else
+  bad "--json status hides the waiver"
+fi
 hmd remove shipped >/dev/null 2>&1
 # NOT-INSTALLED is the state a reader is actually in when they go looking, so the
 # waiver has to be visible there too or it is only ever visible after the fact.
 S2="$(hmd status shipped 2>&1)"
-grep -qi 'waived' <<<"$S2" \
-  && ok "status on a NOT-INSTALLED waived module still discloses the waiver" \
-  || bad "the waiver is invisible until after it has already been applied"
+if grep -qi 'waived' <<<"$S2"; then
+  ok "status on a NOT-INSTALLED waived module still discloses the waiver"
+else
+  bad "the waiver is invisible until after it has already been applied"
+fi
 SJ2="$(hmd --json status shipped 2>/dev/null)"
-[ "$(printf '%s' "$SJ2" | jq -r '.consent_waiver.waived // false')" = "true" ] \
-  && ok "--json status exposes the waiver before install" \
-  || bad "--json status hides the pre-install waiver"
+if [ "$(printf '%s' "$SJ2" | jq -r '.consent_waiver.waived // false')" = "true" ]; then
+  ok "--json status exposes the waiver before install"
+else
+  bad "--json status hides the pre-install waiver"
+fi
 
 echo
 echo "W7 — an UNEXPLAINED or UNDISCLOSED waiver is REFUSED at validate"
 mkproxy mute '{"consent_waived":true}'
 OUT7="$(hmd add mute < /dev/null 2>&1)"; RC7=$?
-[ "$RC7" -ne 0 ] && ok "a waiver with no reason is refused" \
-                 || bad "a silent waiver was accepted — that is the indefensible one"
-grep -qi 'consent_waived_reason' <<<"$OUT7" \
-  && ok "the refusal names the missing field" || bad "the refusal does not say what is missing"
-[ ! -f "$STATE/mute/receipt.json" ] && ok "the refused waiver installed nothing" || bad "left a receipt"
+if [ "$RC7" -ne 0 ]; then
+  ok "a waiver with no reason is refused"
+else
+  bad "a silent waiver was accepted — that is the indefensible one"
+fi
+if grep -qi 'consent_waived_reason' <<<"$OUT7"; then
+  ok "the refusal names the missing field"
+else
+  bad "the refusal does not say what is missing"
+fi
+if [ ! -f "$STATE/mute/receipt.json" ]; then ok "the refused waiver installed nothing"; else bad "left a receipt"; fi
 
 mkproxy nodisclose '{"consent_waived":true,"consent_waived_reason":"a reason long enough to be a real explanation of the decision","consent_text":null}'
 OUT7B="$(hmd add nodisclose < /dev/null 2>&1)"; RC7B=$?
-[ "$RC7B" -ne 0 ] \
-  && ok "a waiver that also drops the disclosure is refused" \
-  || bad "a module waived consent AND shipped no disclosure — nobody is told anything"
-grep -qi 'consent_text' <<<"$OUT7B" \
-  && ok "the refusal names the missing disclosure field" \
-  || bad "the refusal does not name consent_text, so it cannot be told apart from an unrelated failure: $OUT7B"
+if [ "$RC7B" -ne 0 ]; then
+  ok "a waiver that also drops the disclosure is refused"
+else
+  bad "a module waived consent AND shipped no disclosure — nobody is told anything"
+fi
+if grep -qi 'consent_text' <<<"$OUT7B"; then
+  ok "the refusal names the missing disclosure field"
+else
+  bad "the refusal does not name consent_text, so it cannot be told apart from an unrelated failure: $OUT7B"
+fi
 
 mkproxy notbool '{"consent_waived":"yes","consent_waived_reason":"a reason long enough to be a real explanation of the decision"}'
 OUT7C="$(hmd add notbool < /dev/null 2>&1)"; RC7C=$?
-[ "$RC7C" -ne 0 ] && ok "a non-boolean consent_waived is refused, never coerced" \
-                  || bad "a string \"yes\" was coerced into a waiver"
-grep -qi 'must be a boolean' <<<"$OUT7C" \
-  && ok "the refusal says consent_waived must be a boolean" \
-  || bad "the refusal does not say consent_waived must be a boolean, so it cannot be told apart from an unrelated failure: $OUT7C"
+if [ "$RC7C" -ne 0 ]; then
+  ok "a non-boolean consent_waived is refused, never coerced"
+else
+  bad "a string \"yes\" was coerced into a waiver"
+fi
+if grep -qi 'must be a boolean' <<<"$OUT7C"; then
+  ok "the refusal says consent_waived must be a boolean"
+else
+  bad "the refusal does not say consent_waived must be a boolean, so it cannot be told apart from an unrelated failure: $OUT7C"
+fi
 
 echo
 echo "W8 — a waiver waives CONSENT ONLY; class invariants still bite"
@@ -340,13 +437,21 @@ mkproxy shippedbad '{"consent_waived":true,
                     "invariants":{"non-interactive-passthrough":{"command":"printf INVARIANT-DELIBERATELY-BROKEN","expect":"PASSTHROUGH-OK"}}}'
 PRE8="$(tree_sum "$STATE")"
 OUT8="$(hmd add shippedbad < /dev/null 2>&1)"; RC8=$?
-[ "$RC8" -ne 0 ] \
-  && ok "a WAIVED module that fails a class invariant is still REFUSED" \
-  || bad "the waiver skipped the invariants — consent and invariants got conflated"
-grep -q 'FAILED INVARIANT' <<<"$OUT8" \
-  && ok "the refusal names the failed invariant" || bad "no invariant failure reported"
-[ "$(tree_sum "$STATE")" = "$PRE8" ] \
-  && ok "the failed waived module rolled back byte-identically" || bad "left residue"
+if [ "$RC8" -ne 0 ]; then
+  ok "a WAIVED module that fails a class invariant is still REFUSED"
+else
+  bad "the waiver skipped the invariants — consent and invariants got conflated"
+fi
+if grep -q 'FAILED INVARIANT' <<<"$OUT8"; then
+  ok "the refusal names the failed invariant"
+else
+  bad "no invariant failure reported"
+fi
+if [ "$(tree_sum "$STATE")" = "$PRE8" ]; then
+  ok "the failed waived module rolled back byte-identically"
+else
+  bad "left residue"
+fi
 # A module cannot weaken the class-owned falsifier even by naming it. Proven by
 # handing a WAIVED module a green-looking gates-read-raw command and watching the
 # real suite command run instead of the manifest's.
@@ -355,12 +460,16 @@ mkproxy shippedliar '{"consent_waived":true,
                       "invariants":{"gates-read-raw":{"command":"printf 25 passed, 0 failed","expect":"25 passed, 0 failed"}}}'
 hmd add shippedliar < /dev/null >/dev/null 2>&1
 GRR="$(jq -r '.[] | select(.id == "gates-read-raw") | .command' "$STATE/shippedliar/invariants.json" 2>/dev/null)"
-grep -q 'test/gate-judgment-uncompressed.test.sh' <<<"$GRR" \
-  && ok "a waived module CANNOT redefine the class-owned judgment falsifier" \
-  || bad "the manifest overrode a class-owned suite check (ran: $GRR)"
-[ "$(jq -r '.[] | select(.id == "gates-read-raw") | .source' "$STATE/shippedliar/invariants.json" 2>/dev/null)" = "class-contract" ] \
-  && ok "the receipt attributes that check to the CLASS, not the manifest" \
-  || bad "gates-read-raw was attributed to the manifest"
+if grep -q 'test/gate-judgment-uncompressed.test.sh' <<<"$GRR"; then
+  ok "a waived module CANNOT redefine the class-owned judgment falsifier"
+else
+  bad "the manifest overrode a class-owned suite check (ran: $GRR)"
+fi
+if [ "$(jq -r '.[] | select(.id == "gates-read-raw") | .source' "$STATE/shippedliar/invariants.json" 2>/dev/null)" = "class-contract" ]; then
+  ok "the receipt attributes that check to the CLASS, not the manifest"
+else
+  bad "gates-read-raw was attributed to the manifest"
+fi
 hmd remove shippedliar >/dev/null 2>&1
 
 echo
@@ -368,48 +477,80 @@ echo "W9 — the REAL headroom add runs past consent unprompted"
 RSTATE="$TMP/realstate/modules"
 REAL_PRE="$(tree_sum "$RSTATE")"
 OUT9="$("$MODS" --registry "$REAL_REG" --state "$RSTATE" add headroom < /dev/null 2>&1)"; RC9=$?
-[ "$RC9" -eq 0 ] && ok "hmd modules add headroom SUCCEEDS non-interactively (exit 0)" \
-                 || bad "real headroom add failed (exit $RC9)"
-grep -q '\[4/7\] consent' <<<"$OUT9" \
-  && ok "it reaches step 4" || bad "never reached the consent step"
-grep -qi 'Install it? \[y/N\]' <<<"$OUT9" \
-  && bad "the real add still prompted" || ok "the real add did NOT prompt"
-grep -qF 'Headroom is a local context-compression proxy.' <<<"$OUT9" \
-  && ok "the real disclosure is printed in full" || bad "the real disclosure was not shown"
-grep -q '\[7/7\] class invariants' <<<"$OUT9" \
-  && ok "it reaches step 7 — the waiver did not short-circuit the pipeline" \
-  || bad "never reached the invariants"
+if [ "$RC9" -eq 0 ]; then
+  ok "hmd modules add headroom SUCCEEDS non-interactively (exit 0)"
+else
+  bad "real headroom add failed (exit $RC9)"
+fi
+if grep -q '\[4/7\] consent' <<<"$OUT9"; then
+  ok "it reaches step 4"
+else
+  bad "never reached the consent step"
+fi
+if grep -qi 'Install it? \[y/N\]' <<<"$OUT9"; then
+  bad "the real add still prompted"
+else
+  ok "the real add did NOT prompt"
+fi
+if grep -qF 'Headroom is a local context-compression proxy.' <<<"$OUT9"; then
+  ok "the real disclosure is printed in full"
+else
+  bad "the real disclosure was not shown"
+fi
+if grep -q '\[7/7\] class invariants' <<<"$OUT9"; then
+  ok "it reaches step 7 — the waiver did not short-circuit the pipeline"
+else
+  bad "never reached the invariants"
+fi
 # Both classes' invariants must actually have executed, waiver or no waiver.
 INV="$RSTATE/headroom/invariants.json"
-[ -f "$INV" ] && ok "invariant evidence was recorded" || bad "no invariants.json"
+if [ -f "$INV" ]; then ok "invariant evidence was recorded"; else bad "no invariants.json"; fi
 N_TP="$(jq -r '[.[] | select(.class == "traffic-proxy")] | length' "$INV" 2>/dev/null || echo 0)"
 N_SC="$(jq -r '[.[] | select(.class == "storage-codec")] | length' "$INV" 2>/dev/null || echo 0)"
 case "$N_TP" in ''|*[!0-9]*) N_TP=0 ;; esac
 case "$N_SC" in ''|*[!0-9]*) N_SC=0 ;; esac
-[ "$N_TP" -ge 3 ] \
-  && ok "the traffic-proxy contract's invariants ran" || bad "traffic-proxy invariants did not run"
-[ "$N_SC" -ge 1 ] \
-  && ok "the storage-codec contract's invariants ran (dual class preserved)" \
-  || bad "storage-codec invariants did not run"
-jq -e 'all(.[]; .passed)' "$INV" >/dev/null 2>&1 \
-  && ok "every invariant PASSED with the module active" || bad "an invariant failed"
-jq -e 'any(.[]; .id == "gates-read-raw" and .source == "class-contract")' "$INV" >/dev/null 2>&1 \
-  && ok "the class-owned judgment falsifier ran from the CLASS contract" \
-  || bad "gates-read-raw did not run from the class contract"
-[ "$(jq -r '.consent.waived' "$RSTATE/headroom/receipt.json" 2>/dev/null)" = "true" ] \
-  && ok "the real receipt records the waiver" || bad "the real receipt hides the waiver"
+if [ "$N_TP" -ge 3 ]; then
+  ok "the traffic-proxy contract's invariants ran"
+else
+  bad "traffic-proxy invariants did not run"
+fi
+if [ "$N_SC" -ge 1 ]; then
+  ok "the storage-codec contract's invariants ran (dual class preserved)"
+else
+  bad "storage-codec invariants did not run"
+fi
+if jq -e 'all(.[]; .passed)' "$INV" >/dev/null 2>&1; then
+  ok "every invariant PASSED with the module active"
+else
+  bad "an invariant failed"
+fi
+if jq -e 'any(.[]; .id == "gates-read-raw" and .source == "class-contract")' "$INV" >/dev/null 2>&1; then
+  ok "the class-owned judgment falsifier ran from the CLASS contract"
+else
+  bad "gates-read-raw did not run from the class contract"
+fi
+if [ "$(jq -r '.consent.waived' "$RSTATE/headroom/receipt.json" 2>/dev/null)" = "true" ]; then
+  ok "the real receipt records the waiver"
+else
+  bad "the real receipt hides the waiver"
+fi
 RS="$("$MODS" --registry "$REAL_REG" --state "$RSTATE" status headroom 2>&1)"
-grep -qi 'waived' <<<"$RS" \
-  && ok "hmd modules status headroom shows the waiver" || bad "real status hides the waiver"
+if grep -qi 'waived' <<<"$RS"; then
+  ok "hmd modules status headroom shows the waiver"
+else
+  bad "real status hides the waiver"
+fi
 
 echo
 echo "W10 — remove headroom is still byte-identical reversibility"
 "$MODS" --registry "$REAL_REG" --state "$RSTATE" remove headroom >/dev/null 2>&1
-[ "$(tree_sum "$RSTATE")" = "$REAL_PRE" ] \
-  && ok "add -> remove leaves the tree byte-identical (waiver did not cost reversibility)" \
-  || bad "removal left residue"
+if [ "$(tree_sum "$RSTATE")" = "$REAL_PRE" ]; then
+  ok "add -> remove leaves the tree byte-identical (waiver did not cost reversibility)"
+else
+  bad "removal left residue"
+fi
 REG_SUM_NOW="$(tree_sum "$REAL_REG")"
-[ -n "$REG_SUM_NOW" ] && ok "the registry is readable after the round trip" || bad "registry unreadable"
+if [ -n "$REG_SUM_NOW" ]; then ok "the registry is readable after the round trip"; else bad "registry unreadable"; fi
 
 echo
 echo "W10b — a waiver waives CONSENT ONLY, on the REAL manifest: an unreachable control plane still REFUSES"
@@ -424,18 +565,26 @@ DSTATE="$TMP/downstate/modules"
 DPRE="$(tree_sum "$DSTATE")"
 OUT10B="$(env HEIMDALL_DEFAULT_CP_URL="$(hermetic_cp_dead_url)" \
             "$MODS" --registry "$REAL_REG" --state "$DSTATE" add headroom < /dev/null 2>&1)"; RC10B=$?
-[ "$RC10B" -ne 0 ] \
-  && ok "the REAL waived add is REFUSED when the control plane is unreachable (exit $RC10B)" \
-  || bad "the real waived add succeeded with an unreachable control plane — an unverifiable invariant PASSED"
-grep -q '\[4/7\] consent' <<<"$OUT10B" && ! grep -qi 'Install it? \[y/N\]' <<<"$OUT10B" \
-  && ok "it got past consent unprompted — the waiver did its job and nothing more" \
-  || bad "the refusal did not come after a waived, unprompted consent step"
-grep -q 'FAILED INVARIANT: no-signed-traffic-routing' <<<"$OUT10B" \
-  && ok "the refusal names the invariant that could not be verified — the waiver did not skip it" \
-  || bad "the refusal did not name no-signed-traffic-routing: $(printf '%s\n' "$OUT10B" | tail -8)"
-[ "$(tree_sum "$DSTATE")" = "$DPRE" ] \
-  && ok "the refused waived add rolled back byte-identically" \
-  || bad "the refused waived add left residue"
+if [ "$RC10B" -ne 0 ]; then
+  ok "the REAL waived add is REFUSED when the control plane is unreachable (exit $RC10B)"
+else
+  bad "the real waived add succeeded with an unreachable control plane — an unverifiable invariant PASSED"
+fi
+if grep -q '\[4/7\] consent' <<<"$OUT10B" && ! grep -qi 'Install it? \[y/N\]' <<<"$OUT10B"; then
+  ok "it got past consent unprompted — the waiver did its job and nothing more"
+else
+  bad "the refusal did not come after a waived, unprompted consent step"
+fi
+if grep -q 'FAILED INVARIANT: no-signed-traffic-routing' <<<"$OUT10B"; then
+  ok "the refusal names the invariant that could not be verified — the waiver did not skip it"
+else
+  bad "the refusal did not name no-signed-traffic-routing: $(printf '%s\n' "$OUT10B" | tail -8)"
+fi
+if [ "$(tree_sum "$DSTATE")" = "$DPRE" ]; then
+  ok "the refused waived add rolled back byte-identically"
+else
+  bad "the refused waived add left residue"
+fi
 
 echo
 echo "W11 — FALSIFIER: strip the waiver and the SAME add gates again"
@@ -446,14 +595,21 @@ mkdir -p "$FALSIFY_REG/headroom"
 cp -R "$REAL_CLASSES" "$FALSIFY_REG/_classes"
 jq 'del(.consent_waived, .consent_waived_reason)' "$HMF" > "$FALSIFY_REG/headroom/manifest.json"
 OUT11="$("$MODS" --registry "$FALSIFY_REG" --state "$TMP/fstate/modules" add headroom < /dev/null 2>&1)"; RC11=$?
-[ "$RC11" -ne 0 ] \
-  && ok "with the waiver REMOVED, the identical add is GATED again (exit $RC11)" \
-  || bad "the add succeeded without the waiver — the waiver is not the thing letting it through"
-grep -qi 'consent is required' <<<"$OUT11" \
-  && ok "the un-waived headroom refusal names consent as the reason" \
-  || bad "refused for some other reason — the RED/GREEN pair does not isolate consent"
-[ ! -f "$TMP/fstate/modules/headroom/receipt.json" ] \
-  && ok "the gated add installed nothing" || bad "the gated add left a receipt"
+if [ "$RC11" -ne 0 ]; then
+  ok "with the waiver REMOVED, the identical add is GATED again (exit $RC11)"
+else
+  bad "the add succeeded without the waiver — the waiver is not the thing letting it through"
+fi
+if grep -qi 'consent is required' <<<"$OUT11"; then
+  ok "the un-waived headroom refusal names consent as the reason"
+else
+  bad "refused for some other reason — the RED/GREEN pair does not isolate consent"
+fi
+if [ ! -f "$TMP/fstate/modules/headroom/receipt.json" ]; then
+  ok "the gated add installed nothing"
+else
+  bad "the gated add left a receipt"
+fi
 
 echo
 echo "--------------------------------------------------------------------"
