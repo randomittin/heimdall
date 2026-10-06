@@ -1001,6 +1001,7 @@ class PushMonitor:
         try:
             now = self._clock() if now is None else now
             self._watch_test_request()
+            self._watch_spool(now)
             ts = state.get("ts") if isinstance(state, dict) else None
             with self._cv:
                 if _num(ts) is not None:
@@ -1037,6 +1038,32 @@ class PushMonitor:
             self._tests.append(request["id"])
             self._wake_locked()
 
+    def _watch_spool(self, now):
+        """One stat() of the spool directory per observed state; when it changed, the fresh events in it are queued for the worker
+        (a file this monitor already queued is not queued twice). Whether to SERVE them is the worker's call: only the owner of the
+        sender lock does, and it removes the file once it has taken the event."""
+        if not _EXT:
+            return
+        try:
+            st = os.stat(_spool_dir(self.root))
+        except OSError:
+            return
+        stamp = (st.st_mtime_ns, st.st_ino)
+        with self._cv:
+            if stamp == self._spool_stamp:
+                return
+            self._spool_stamp = stamp
+        fresh = [(path, event) for path, event in read_spool(self.root, now) if os.path.basename(path) not in self._spool_seen]
+        if not fresh:
+            return
+        with self._cv:
+            for path, event in fresh:
+                self._spool_seen[os.path.basename(path)] = now
+                while len(self._spool_seen) > SEEN_CAP:
+                    self._spool_seen.popitem(last=False)
+                self._spooled.append((path, event))
+            self._wake_locked()
+
     def _wake_locked(self):
         """Make sure the worker thread is running and tell it there is work. The caller holds self._cv."""
         if self._start_thread and (self._thread is None or not self._thread.is_alive()):
@@ -1069,11 +1096,11 @@ class PushMonitor:
             with self._cv:
                 if self._stop.is_set():
                     return
-                if not (self._pending or self._tests or self._tickets
+                if not (self._pending or self._tests or self._spooled or self._tickets
                         or any(d["window"] for d in self._devices.values())):
                     self._thread = None
                     return
-                if not (self._pending or self._tests):
+                if not (self._pending or self._tests or self._spooled):
                     self._cv.wait(self._next_wait(self._clock()))
 
     def _next_wait(self, now):
@@ -1099,8 +1126,12 @@ class PushMonitor:
                 self._pending.clear()
                 tests = list(self._tests)
                 self._tests.clear()
+                spooled = list(self._spooled)
+                self._spooled.clear()
             if batch:
                 self._accept(batch, now)
+            if spooled:
+                self._accept_spooled(spooled, now)
             self._flush(now)
             for request_id in tests:
                 self._serve_test(request_id, now)
@@ -1127,6 +1158,18 @@ class PushMonitor:
                     dev["window"] = {"opened": detected_at, "cands": [event]}
                 else:
                     dev["window"]["cands"].append(event)
+
+    def _accept_spooled(self, spooled, now):
+        """Events another process handed over (enqueue_event). Served only by the owner of the sender lock and only when a device is
+        registered; the owner removes each file as it takes the event, so it is served once and never replayed. A monitor that does
+        not own the lock leaves the files for the owner, and an event nobody serves ages out at its kind's ttl (read_spool)."""
+        data = self._load()
+        if data is None or not data["devices"] or not self._own_lock():
+            return
+        for path, _ in spooled:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        self._accept([(now, event) for _, event in spooled], now)
 
     def _runtime(self, fp, record):
         """The in-memory state of one device (coalescing window, last send, hourly counters), created on first
@@ -1373,3 +1416,19 @@ def source_paths(root):
     """What the sender touches under the repo, for `hmd ui --print-sources`: the registry, the lock, and the
     operator's push-test request and its result."""
     return [os.path.join(root, rel) for rel in (STORE_REL, LOCK_REL, TEST_REQUEST_REL, TEST_RESULT_REL)]
+
+
+def _load_kind_modules():
+    """Run register_push_kinds(kit) of every module in KIND_MODULES (trusted code, like companion_ui_controls.ACTION_MODULES). A module
+    that cannot load, or raises, leaves its kinds unregistered -- and so unadvertised and refused as `bad-events`."""
+    kit = types.SimpleNamespace(register_kind=register_kind, scrub=scrub, clip=clip, BODY_MAX=BODY_MAX)
+    for name in KIND_MODULES:
+        hook = getattr(_load_sibling(name), "register_push_kinds", None)
+        if callable(hook):
+            try:
+                hook(kit)
+            except Exception as exc:
+                sys.stderr.write("companion_push: %s did not register its push kinds (%s)\n" % (name, exc.__class__.__name__))
+
+
+_load_kind_modules()
