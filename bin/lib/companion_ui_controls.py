@@ -99,6 +99,7 @@ it) so every caller can load this one file by path.
 import argparse
 import calendar
 import collections
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -109,6 +110,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -471,13 +473,18 @@ def _pending_stop(root, now):
 def _write_stop(root, record):
     _ensure_dir(os.path.join(root, ".heimdall", "ui"))
     path = _stop_path(root)
-    tmp = "%s.tmp.%d" % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # A temp file of its own per call (mkstemp: unique, O_EXCL, 0600): two stop requests handled on two threads of one
+    # process (a double click, the laptop and a phone) must not share one temp name, or one rename pulls the file out
+    # from under the other.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=os.path.basename(path) + ".tmp.")
     try:
-        os.write(fd, json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
+        with os.fdopen(fd, "wb") as f:
+            f.write(json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def consume_stop_request(root, now=None):
