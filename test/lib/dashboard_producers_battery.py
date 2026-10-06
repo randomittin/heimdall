@@ -330,14 +330,6 @@ def statement_check():
     ok("wrapper-limit", mod.check_statement("SELECT 1").wrapped(5).endswith("LIMIT 5") and "(SELECT 1)" in mod.check_statement("SELECT 1").wrapped(5))
 
 
-def _unsafe_message(sql):
-    try:
-        mod.check_statement(sql)
-    except mod.Unsafe as e:
-        return e
-    return ""
-
-
 # -- B. the engine layer and the type wall -----------------------------------------------------------------------
 @section
 def read_only_structure():
@@ -684,6 +676,10 @@ def generate_next_flow():
 
 
 # -- G. laptop confirmation --------------------------------------------------------------------------------------
+def wrong_for(tile_id, fp):
+    return "%06d" % ((int(mod.confirm_code(tile_id, fp)) + 1) % 1000000)
+
+
 @section
 def confirmation():
     ok("confirm-code-vector", mod.confirm_code("t-0000abcd", "f" * 64) == "%06d" % (int.from_bytes(hashlib.sha256(
@@ -764,10 +760,6 @@ def confirmation():
     ok("cli:unknown-command-is-usage-error", rc == 2 and "usage" in err)
 
 
-def wrong_for(tile_id, fp):
-    return "%06d" % ((int(mod.confirm_code(tile_id, fp)) + 1) % 1000000)
-
-
 # -- H. the scheduler --------------------------------------------------------------------------------------------
 class Edge:
     def __init__(self, high):
@@ -839,12 +831,18 @@ def run_due_against_the_store():
     tile = store.get_tile(R, rec["tile_id"])
     ok("run_due:publishes-a-valid-panel-through-the-store", done and mine and mine[0]["phase"] == "live" and tile["panel"]["data"]["y"] == [3, 5, 8] and tile["phase"] == "live", why)
     done, rec2, _ = confirmed(GOOD, TS)
-    tile_id, fp = pending_tile(GOOD, TS)
-    store.confirm_tile(R, tile_id, fp)    # pinned behind the producer half's back: no receipt
+    R2 = os.path.join(T, "repo2")
+    os.makedirs(R2)
+    fp2 = mod.fingerprint(GOOD)
+    tile2 = store.new_tile("t-00000777", D1, "orders", "phone", None, TS)
+    tile2.update(proposal={"shape": TS, "producer": GOOD}, fingerprint=fp2, phase="needs-confirm", pending_at=now)
+    store.put_tile(R2, tile2)
+    store.set_last_request(R2, now)
+    store.confirm_tile(R2, "t-00000777", fp2)    # pinned behind the producer half's back: no receipt exists
     recording = Recording()
-    mod.run_due(R, mod.Scheduler(idle_pause_s=12 * 3600), store=store, now=now, drivers=lambda e, env: recording)
-    ok("unconfirmed-never-runs", all(tile_id not in str(s) for s in recording.selects) and store.get_tile(R, tile_id)["panel"] is None)
-    ok("unconfirmed-tile-never-queries-at-all", len(recording.selects) <= 2)
+    outcomes = mod.run_due(R2, mod.Scheduler(idle_pause_s=12 * 3600), store=store, now=now, drivers=lambda e, env: recording)
+    ok("unconfirmed-never-runs", recording.selects == [] and store.get_tile(R2, "t-00000777")["panel"] is None)
+    ok("unconfirmed-reported-needs-confirm", [o["reason"] for o in outcomes] == ["needs-confirm"])
     store.set_last_request(R, now - 13 * 3600)
     recording = Recording()
     outcomes = mod.run_due(R, mod.Scheduler(idle_pause_s=12 * 3600), store=store, now=now, drivers=lambda e, env: recording)
