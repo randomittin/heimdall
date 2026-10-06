@@ -1098,7 +1098,8 @@ def _remote_rows(path, names):
             at, action, ok = _ts_epoch(obj["ts"]), obj["action"], obj["ok"]
         except (ValueError, KeyError, TypeError, UnicodeDecodeError):
             continue
-        if at is None or not isinstance(action, str) or action not in names or not isinstance(ok, bool):
+        if at is None or not isinstance(action, str) or action not in names or not isinstance(ok, bool) \
+                or not _timeline_row_ok(action, obj.get("op")):
             continue
         params = obj.get("params")
         repo = params.get("repo") if isinstance(params, dict) else None
