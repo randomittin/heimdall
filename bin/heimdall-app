@@ -1990,7 +1990,7 @@ case "$CMD" in
   disconnect) cmd_disconnect "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;
   remote-login) cmd_remote_login "$@"; exit $? ;;
-  remote-launch|remote-merge|launch-allow|remote-dashboards) cmd_remote_switches "$CMD" "$@"; exit $? ;;
+  remote-launch|remote-merge|launch-allow|remote-dashboards|remote-alerts) cmd_remote_switches "$CMD" "$@"; exit $? ;;
   controls) cmd_controls "$@"; exit $? ;;
   push-test) cmd_push_test "$@"; exit $? ;;
   *)

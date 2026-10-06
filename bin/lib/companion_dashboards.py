@@ -117,6 +117,7 @@ STATUS_DETAILS = {"live": (None,), "error": ("producer-failed", "timeout"), "pau
 GENERATION_DETAILS = ("no-connector", "ambiguous", "unsafe-query", "generation-failed", "timeout")
 DETAILS = frozenset(GENERATION_DETAILS + ("producer-failed", "rejected-panel", "declined", "expired", "idle", "backoff", "budget"))
 PHASES = frozenset(("generating", "needs-confirm", "live", "error", "paused"))
+ALERT_AUDIT_DETAILS = frozenset(("alerts-off", "push-off", "not-a-number-tile", "too-many-alerts", "unknown-tile", "wrong-project", "rate-limited"))
 LIMITS = {"tiles": MAX_TILES, "refresh_min_s": REFRESH_MIN_S, "refresh_max_s": REFRESH_MAX_S,
           "refresh_default_s": REFRESH_DEFAULT_S, "panel_bytes": PANEL_BYTES}
 
@@ -217,18 +218,30 @@ def _valid_shape(v):
     return isinstance(series, int) and not isinstance(series, bool) and 1 <= series <= p.MAX_SERIES
 
 
+def _alerts():
+    """bin/lib/dashboard_alerts.py (H1: the ops set-alert / clear-alert and the alert evaluation), or None when it cannot load."""
+    return _sibling("dashboard_alerts")
+
+
+def _all_ops():
+    mod = _alerts()
+    return dict(_OPS, **mod.OPS) if mod is not None else dict(_OPS)
+
+
 def parse_params(body):
     """The clean params of one op from `body` (the params without `rid`), or ValueError: the exact key set of its op, each
     value of its exact type."""
+    ops = _all_ops()
     op = body.get("op") if isinstance(body, dict) else None
-    if not isinstance(op, str) or op not in _OPS:
+    if not isinstance(op, str) or op not in ops:
         raise ValueError("op")
-    required, optional = _OPS[op]
+    required, optional = ops[op]
     keys = set(body) - {"op"}
     if not set(required) <= keys or not keys <= set(required) | set(optional):
         raise ValueError("keys")
     checks = {"project": _valid_project, "text": _valid_text, "refresh_s": _valid_refresh, "shape": _valid_shape,
               "origin": lambda v: v == "import", "author": lambda v: isinstance(v, str) and AUTHOR_RE.fullmatch(v) is not None}
+    checks.update(_alerts().CHECKS if _alerts() is not None else {})
     out = {"op": op}
     for key in keys:
         value = body[key]
@@ -435,7 +448,14 @@ def audit_event(root, op, tile_id, ok, detail, device="local", via="local"):
         return
     now = time.time()
     ctl.audit(root, {"ts": ctl.iso(now), "device": device, "seq": None, "action": ACTION, "op": op, "tile_id": tile_id, "params": {},
-                     "ok": bool(ok), "detail": detail if detail in DETAILS else None, "ms": 0, "via": via})
+                     "ok": bool(ok), "detail": detail if detail in DETAILS or detail in ALERT_AUDIT_DETAILS else None, "ms": 0, "via": via})
+
+
+def _alert_kit():
+    """What dashboard_alerts needs of this module, as one namespace (so it never loads a second copy of the store)."""
+    return types.SimpleNamespace(store_dir=store_dir, read_json=_read_json, write_json=_write_json, mkdir=_mkdir, touch=_touch,
+                                 find=_find, read_tile=_read_tile, project_names=project_names, enabled=enabled, audit=audit_event,
+                                 take=_take, last_request_at=lambda root: _load_meta(root)["last_request_at"])
 
 
 # -- request handling (the registered action) --------------------------------------------------------------------
@@ -624,6 +644,8 @@ def _do_remove(root, meta, f, rid, now):
             os.unlink(_tile_path(root, tile["dashboard_id"], tile["tile_id"]))
         _TILE_REFRESH.pop((root, tile["tile_id"]), None)
     meta["queue"] = [j for j in meta["queue"] if j.get("tile_id") not in gone]
+    if _alerts() is not None:
+        _alerts().forget(_alert_kit(), root, gone)
     _request(meta, rid, "remove", f.get("tile_id"), "done", None, now)
     return True, "queued", ({"id": f["tile_id"]} if "tile_id" in f else {})
 
@@ -643,7 +665,10 @@ def handle(root, fields, ctx=None):
             meta["last_request_at"] = now                 # presence: a phone that talks to hmd is a phone that is watching
             _expire(root, meta, now)
             _reap_in_flight(root, meta, now)
-            result = _HANDLERS[fields["op"]](root, meta, fields, fields["rid"], now)
+            if fields["op"] in _HANDLERS:
+                result = _HANDLERS[fields["op"]](root, meta, fields, fields["rid"], now)
+            else:                                          # set-alert / clear-alert (H1)
+                result = _alerts().handle(_alert_kit(), root, fields, ctx, now)
             _save_meta(root, meta)
             return result
     except OSError:
@@ -651,7 +676,8 @@ def handle(root, fields, ctx=None):
 
 
 def audit_rule(fields):
-    return {"op": fields["op"], "tile_id": fields.get("tile_id")}
+    mod = _alerts()
+    return {"op": mod.AUDIT_OP.get(fields["op"], fields["op"]) if mod is not None else fields["op"], "tile_id": fields.get("tile_id")}
 
 
 def register_actions(kit):
@@ -670,7 +696,7 @@ def register_actions(kit):
         except ValueError:
             raise kit.Refusal("bad-params")
 
-    every = sorted({k for required, optional in _OPS.values() for k in required + optional})
+    every = sorted({k for required, optional in _all_ops().values() for k in required + optional})
     kit.register_action(ACTION, cls=kit.CLASS_EXPAND, switch=SWITCH, handler=handle, required=("op",), optional=tuple(every),
                         fields=fields, audit=audit_rule, rate=((6, 20 / 60.0),), usable=lambda root: True,
                         policy={"cap": CAP_DASH, "rid_re": RID_RE, "replay_detail": "dup", "global_rate": False,
@@ -765,6 +791,12 @@ def confirmed_producers(root):
             for t in _all_tiles(root) if _runnable(t)]
 
 
+def alerted_tiles(root, now=None):
+    """Tile ids with a live alert: dashboard_producers exempts them from the 12 h no-phone pause (floor interval 300 s)."""
+    mod = _alerts()
+    return mod.alerted_tiles(_alert_kit(), root, now) if mod is not None else set()
+
+
 def phone_present(root, idle_s=IDLE_S, now=None):
     now = time.time() if now is None else now
     if idle_s <= 0:
@@ -823,6 +855,11 @@ def publish_panel(root, tile_id, candidate, now=None, panel_bytes=PANEL_BYTES):
         tile.update(panel=stored, panel_rev=tile["panel_rev"] + 1, last_ok_at=int(now), phase="live", detail=None)
         _write_tile(root, tile)
         _touch(root)
+        if _alerts() is not None:                               # H1: a successful run is the one thing an alert is evaluated on
+            try:
+                _alerts().evaluate(_alert_kit(), root, tile_id, stored, now)
+            except Exception as e:                              # an alert fault costs the alert, never the panel
+                sys.stderr.write("companion_dashboards: tile %s: alert evaluation failed (%s)\n" % (tile_id, type(e).__name__))
         return True, None
 
 
@@ -899,7 +936,7 @@ def _row(tile, now, phone):
     return row
 
 
-def snapshot(root, now=None, phone=True, redact=None):
+def snapshot(root, now=None, phone=True, redact=None, alerts=None):
     """The `dashboards` key: the phone's slice (phone=True) or the desktop view for the base state (phone=False) -- the same tiles and
     the same panels, from the same store; the ONLY difference is that the desktop view carries no confirmation code (`confirm` is
     {expires_at}), because the six digits are shown on the phone alone, and it adds `pending`, the count waiting for a person.
@@ -910,7 +947,13 @@ def snapshot(root, now=None, phone=True, redact=None):
     if not out["enabled"]:
         return out
     meta = _load_meta(root)
-    out["tiles"] = [_row(t, now, phone) for t in _all_tiles(root)]
+    tiles = _all_tiles(root)
+    out["tiles"] = [_row(t, now, phone) for t in tiles]
+    if (not phone if alerts is None else alerts) and _alerts() is not None:     # tiles[].alert: a phone that listed dash-alert-v1, and the laptop view
+        held = _alerts().rows(_alert_kit(), root, now, tiles)
+        for row in out["tiles"]:
+            if row["tile_id"] in held:
+                row["alert"] = held[row["tile_id"]]
     out["requests"] = [{"rid": r.get("rid"), "op": r.get("op"), "tile_id": r.get("tile_id"), "phase": r.get("phase"),
                         "detail": r.get("detail"), "at": r.get("at")} for r in meta["requests"] if RID_RE.fullmatch(str(r.get("rid")))]
     if not phone:
@@ -934,7 +977,8 @@ def overlay(state, root, device_caps, redact=None):
         return state
     out = {k: v for k, v in state.items() if k != "dashboards"}
     if listed:
-        out["dashboards"] = snapshot(root, phone=True, redact=redact)
+        out["dashboards"] = snapshot(root, phone=True, redact=redact,
+                                     alerts=_alerts() is not None and _alerts().CAP_ALERTS in device_caps)
     return out
 
 
