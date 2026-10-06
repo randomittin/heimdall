@@ -614,55 +614,78 @@ else
 fi
 
 # ── 0. the tool is executable and is valid Python ────────────────────────────
-[ -x "$CLI" ] && ok "0a. $CLI is executable" || bad "0a. not executable: $CLI"
+if [ -x "$CLI" ]; then
+  ok "0a. $CLI is executable"
+else
+  bad "0a. not executable: $CLI"
+fi
 ast_out="$(python3 -c "import ast; ast.parse(open('$CLI').read())" 2>&1)"; ast_rc=$?
-[ "$ast_rc" -eq 0 ] && ok "0b. AST parse clean (valid Python syntax)" || bad "0b. AST parse failed: $ast_out"
+if [ "$ast_rc" -eq 0 ]; then
+  ok "0b. AST parse clean (valid Python syntax)"
+else
+  bad "0b. AST parse failed: $ast_out"
+fi
 
 # ── 1. fresh/absent config reads off ─────────────────────────────────────────
 R="$(fresh_repo)"
 out="$(fb --repo "$R" status)"; rc=$?
-echo "$out" | grep -Eq 'state:[[:space:]]+off' && [ "$rc" -eq 0 ] \
-  && ok "1a. fresh repo, no config file -> status shows state=off" \
-  || bad "1a. got rc=$rc out='$out'"
+if echo "$out" | grep -Eq 'state:[[:space:]]+off' && [ "$rc" -eq 0 ]; then
+  ok "1a. fresh repo, no config file -> status shows state=off"
+else
+  bad "1a. got rc=$rc out='$out'"
+fi
 out="$(fb --repo "$R" check)"; rc=$?
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
-  && ok "1b. fresh repo -> check REFUSEs (off is never a route verdict)" \
-  || bad "1b. rc=$rc out='$out'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE"; then
+  ok "1b. fresh repo -> check REFUSEs (off is never a route verdict)"
+else
+  bad "1b. rc=$rc out='$out'"
+fi
 
 # ── 2. corrupt config reads off, never on ────────────────────────────────────
 R="$(fresh_repo)"
 write_cfg "$R" 'not json { garbage'
 out="$(fb --repo "$R" status)"
-echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "corrupt" \
-  && ok "2a. malformed JSON -> state=off, corruption surfaced (not silent)" \
-  || bad "2a. got: $out"
+if echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "corrupt"; then
+  ok "2a. malformed JSON -> state=off, corruption surfaced (not silent)"
+else
+  bad "2a. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '[1, 2, 3]'
 out="$(fb --repo "$R" status)"
-echo "$out" | grep -Eq 'state:[[:space:]]+off' \
-  && ok "2b. valid JSON but not an object -> state=off" \
-  || bad "2b. got: $out"
+if echo "$out" | grep -Eq 'state:[[:space:]]+off'; then
+  ok "2b. valid JSON but not an object -> state=off"
+else
+  bad "2b. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "mitm_enabled": true, "operator_key_env": "X", "target_provider": "y", "endpoint": "http://127.0.0.1:20128"}'
 out="$(fb --repo "$R" status)"
-echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "forbidden" \
-  && ok "2c. well-formed JSON but carries a forbidden MITM key -> forced back to off, never on" \
-  || bad "2c. got: $out"
+if echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "forbidden"; then
+  ok "2c. well-formed JSON but carries a forbidden MITM key -> forced back to off, never on"
+else
+  bad "2c. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "please-route-me-now"}'
 out="$(fb --repo "$R" status)"
-echo "$out" | grep -Eq 'state:[[:space:]]+off' \
-  && ok "2d. unrecognized state string -> reads off" \
-  || bad "2d. got: $out"
+if echo "$out" | grep -Eq 'state:[[:space:]]+off'; then
+  ok "2d. unrecognized state string -> reads off"
+else
+  bad "2d. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "mitm_enabled": true}'
 fb --repo "$R" check >/dev/null 2>&1; rc=$?
-[ "$rc" -ne 0 ] && ok "2e. corrupt+MITM-tainted config -> check never exits 0 (never ROUTE)" \
-  || bad "2e. check exited 0 (ROUTE) on a corrupt config! rc=$rc"
+if [ "$rc" -ne 0 ]; then
+  ok "2e. corrupt+MITM-tainted config -> check never exits 0 (never ROUTE)"
+else
+  bad "2e. check exited 0 (ROUTE) on a corrupt config! rc=$rc"
+fi
 
 # ── 3. falsifier (a): fixture DB CONTAINS a claude row -> REFUSE, Tier-1 reason ─
 R="$(fresh_repo)"
@@ -679,26 +702,32 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -qi "Tier-1" \
-  && echo "$out" | grep -q "FAIL.*tier1_credential_absent" && echo "$out" | grep -q "claude" \
-  && ok "3. falsifier (a): DB has a 'claude' provider_connections row -> REFUSE, Tier-1 reason names it" \
-  || bad "3. rc=$rc out='$out'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -qi "Tier-1" \
+  && echo "$out" | grep -q "FAIL.*tier1_credential_absent" && echo "$out" | grep -q "claude"; then
+  ok "3. falsifier (a): DB has a 'claude' provider_connections row -> REFUSE, Tier-1 reason names it"
+else
+  bad "3. rc=$rc out='$out'"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 4. auto + failing preflight -> WAIT, not ROUTE; same failure under switch -> REFUSE ─
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
 out="$(fb --repo "$R" check)"; rc=$?
-[ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
-  && ok "4a. state=auto, nothing configured -> WAIT (not ROUTE)" \
-  || bad "4a. rc=$rc out='$out'"
+if [ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE"; then
+  ok "4a. state=auto, nothing configured -> WAIT (not ROUTE)"
+else
+  bad "4a. rc=$rc out='$out'"
+fi
 
 R2="$(fresh_repo)"
 write_cfg "$R2" '{"state": "switch"}'
 out2="$(fb --repo "$R2" check)"; rc2=$?
-[ "$rc2" -eq 1 ] && echo "$out2" | grep -q "VERDICT: REFUSE" \
-  && ok "4b. identical failing preflight but state=switch -> REFUSE, not WAIT (state changes the verdict, not the checks)" \
-  || bad "4b. rc=$rc2 out='$out2'"
+if [ "$rc2" -eq 1 ] && echo "$out2" | grep -q "VERDICT: REFUSE"; then
+  ok "4b. identical failing preflight but state=switch -> REFUSE, not WAIT (state changes the verdict, not the checks)"
+else
+  bad "4b. rc=$rc2 out='$out2'"
+fi
 
 # ── 5. no subcommand's output ever contains the secret VALUE ────────────────
 R="$(fresh_repo)"
@@ -724,8 +753,11 @@ unset HMD_FB_SECRET_ENV
 # ── 6. where prints the exact expected config path ───────────────────────────
 R="$(fresh_repo)"
 out="$(fb --repo "$R" where)"
-[ "$out" = "$(cfg_path "$R")" ] && ok "6. where prints the exact expected config path" \
-  || bad "6. got '$out', want '$(cfg_path "$R")'"
+if [ "$out" = "$(cfg_path "$R")" ]; then
+  ok "6. where prints the exact expected config path"
+else
+  bad "6. got '$out', want '$(cfg_path "$R")'"
+fi
 
 # ── 7. set rejects the removed 'on' value outright -- never persists it, and
 # a pre-existing on-disk state is left untouched by the rejected attempt
@@ -735,21 +767,28 @@ fb --repo "$R" set auto >/dev/null
 before="$(cat "$(cfg_path "$R")")"
 out="$(fb --repo "$R" set on 2>&1)"; rc=$?
 after="$(cat "$(cfg_path "$R")")"
-[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "invalid choice: 'on'" \
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "invalid choice: 'on'" \
   && printf '%s' "$out" | grep -qF "'off', 'auto', 'switch'" \
-  && [ "$before" = "$after" ] \
-  && ok "7. set on is rejected outright (never-fail-caller, names all three surviving states) and never touches the existing on-disk state" \
-  || bad "7. rc=$rc out='$out' before='$before' after='$after'"
+  && [ "$before" = "$after" ]; then
+  ok "7. set on is rejected outright (never-fail-caller, names all three surviving states) and never touches the existing on-disk state"
+else
+  bad "7. rc=$rc out='$out' before='$before' after='$after'"
+fi
 
 # ── 8. set rejects an invalid value; never breaks the caller unless --strict ─
 R="$(fresh_repo)"
 out="$(fb --repo "$R" set nonsense 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qi "invalid" \
-  && ok "8a. set <bad-value>, no --strict -> exit 0, reason reported (never-fail-caller)" \
-  || bad "8a. rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qi "invalid"; then
+  ok "8a. set <bad-value>, no --strict -> exit 0, reason reported (never-fail-caller)"
+else
+  bad "8a. rc=$rc out='$out'"
+fi
 fb --repo "$R" --strict set nonsense >/dev/null 2>&1; rc=$?
-[ "$rc" -ne 0 ] && ok "8b. same call WITH --strict -> nonzero (opt-in strictness)" \
-  || bad "8b. rc=$rc, want nonzero"
+if [ "$rc" -ne 0 ]; then
+  ok "8b. same call WITH --strict -> nonzero (opt-in strictness)"
+else
+  bad "8b. rc=$rc, want nonzero"
+fi
 
 # ── 9. endpoint locality: a non-loopback endpoint fails with its own reason ──
 R="$(fresh_repo)"
@@ -764,9 +803,11 @@ write_cfg "$R" '{
 }'
 out="$(fb --repo "$R" check)"
 unset ANTHROPIC_MODEL
-echo "$out" | grep -q "FAIL.*endpoint_local" && echo "$out" | grep -qi "loopback" \
-  && ok "9. non-loopback endpoint -> distinct 'not a loopback address' reason" \
-  || bad "9. got: $out"
+if echo "$out" | grep -q "FAIL.*endpoint_local" && echo "$out" | grep -qi "loopback"; then
+  ok "9. non-loopback endpoint -> distinct 'not a loopback address' reason"
+else
+  bad "9. got: $out"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 10. operator-configured tos_flagged_providers entry blocks a provider,
@@ -790,9 +831,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-echo "$out" | grep -q "FAIL.*target_provider_allowed" && echo "$out" | grep -q "groq" \
-  && ok "10. operator-configured tos_flagged_providers entry (groq) -> refused and named in the reason (built-in deny list is empty by default since 2026-08-26; the override mechanism still works)" \
-  || bad "10. got: $out"
+if echo "$out" | grep -q "FAIL.*target_provider_allowed" && echo "$out" | grep -q "groq"; then
+  ok "10. operator-configured tos_flagged_providers entry (groq) -> refused and named in the reason (built-in deny list is empty by default since 2026-08-26; the override mechanism still works)"
+else
+  bad "10. got: $out"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 11. operator_key_env naming a Claude/Anthropic var is itself refused ────
@@ -810,9 +853,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-echo "$out" | grep -q "FAIL.*operator_key" && echo "$out" | grep -qi "Claude/Anthropic" \
-  && ok "11. operator_key_env='ANTHROPIC_API_KEY' -> refused, Claude Code OAuth reuse named as the reason" \
-  || bad "11. got: $out"
+if echo "$out" | grep -q "FAIL.*operator_key" && echo "$out" | grep -qi "Claude/Anthropic"; then
+  ok "11. operator_key_env='ANTHROPIC_API_KEY' -> refused, Claude Code OAuth reuse named as the reason"
+else
+  bad "11. got: $out"
+fi
 unset ANTHROPIC_API_KEY
 
 # ── 12. fully-passing config -> ROUTE (the tool CAN say yes, not just always no) ─
@@ -830,9 +875,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
-  && ok "12. every check green, including all four Tier-1 checks -> ROUTE (exit 0)" \
-  || bad "12. rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE"; then
+  ok "12. every check green, including all four Tier-1 checks -> ROUTE (exit 0)"
+else
+  bad "12. rc=$rc out='$out'"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 13. many simultaneous failures still produce distinct, separate reasons ──
@@ -845,9 +892,11 @@ write_cfg "$R" '{
 out="$(fb --repo "$R" check)"
 n_fail_lines=$(printf '%s\n' "$out" | grep -c '\[FAIL\]')
 distinct_reasons=$(printf '%s\n' "$out" | grep '\[FAIL\]' | sed -E 's/^[^-]*-- //' | sort -u | wc -l | tr -d ' ')
-[ "$n_fail_lines" -ge 4 ] && [ "$distinct_reasons" -ge 4 ] \
-  && ok "13. an all-defaults config fails >=4 checks with >=4 DISTINCT reason strings (no generic 'preflight failed')" \
-  || bad "13. n_fail_lines=$n_fail_lines distinct_reasons=$distinct_reasons out='$out'"
+if [ "$n_fail_lines" -ge 4 ] && [ "$distinct_reasons" -ge 4 ]; then
+  ok "13. an all-defaults config fails >=4 checks with >=4 DISTINCT reason strings (no generic 'preflight failed')"
+else
+  bad "13. n_fail_lines=$n_fail_lines distinct_reasons=$distinct_reasons out='$out'"
+fi
 
 # ── 14. falsifier (b): clean DB (no Tier-1 row) -> tier1_credential_absent PASSES ─
 R="$(fresh_repo)"
@@ -857,9 +906,11 @@ write_cfg "$R" '{
   "cliproxyapi_dir": "/nonexistent-heimdall-fallback-test/cli-proxy-api"
 }'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK.*tier1_credential_absent" && ! echo "$out" | grep -q "FAIL.*tier1_credential_absent" \
-  && ok "14. falsifier (b): DB has no Tier-1 row -> tier1_credential_absent passes in isolation" \
-  || bad "14. got: $out"
+if echo "$out" | grep -q "OK.*tier1_credential_absent" && ! echo "$out" | grep -q "FAIL.*tier1_credential_absent"; then
+  ok "14. falsifier (b): DB has no Tier-1 row -> tier1_credential_absent passes in isolation"
+else
+  bad "14. got: $out"
+fi
 
 # ── 15. falsifier (c): an absent or malformed OmniRoute DB FAILS, never a silent pass ─
 R="$(fresh_repo)"
@@ -868,9 +919,11 @@ write_cfg "$R" '{
   "omniroute_db_path": "/nonexistent-heimdall-fallback-test/definitely-not-here.sqlite"
 }'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*tier1_credential_absent" && echo "$out" | grep -qi "not found" \
-  && ok "15a. falsifier (c): absent DB -> tier1_credential_absent FAILS ('not found'), never a silent pass" \
-  || bad "15a. got: $out"
+if echo "$out" | grep -q "FAIL.*tier1_credential_absent" && echo "$out" | grep -qi "not found"; then
+  ok "15a. falsifier (c): absent DB -> tier1_credential_absent FAILS ('not found'), never a silent pass"
+else
+  bad "15a. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{
@@ -878,9 +931,11 @@ write_cfg "$R" '{
   "omniroute_db_path": "'"$MALFORMED_DB"'"
 }'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*tier1_credential_absent" && echo "$out" | grep -qi "unreadable or malformed" \
-  && ok "15b. falsifier (c): malformed (non-SQLite) DB file -> tier1_credential_absent FAILS, never a silent pass" \
-  || bad "15b. got: $out"
+if echo "$out" | grep -q "FAIL.*tier1_credential_absent" && echo "$out" | grep -qi "unreadable or malformed"; then
+  ok "15b. falsifier (c): malformed (non-SQLite) DB file -> tier1_credential_absent FAILS, never a silent pass"
+else
+  bad "15b. got: $out"
+fi
 
 # ── 16. falsifier (d): blockedProviders is never evidence, and its presence warns ─
 R="$(fresh_repo)"
@@ -890,37 +945,47 @@ write_cfg "$R" '{
   "blockedProviders": ["claude"]
 }'
 out="$(fb --repo "$R" check 2>&1)"
-echo "$out" | grep -q "FAIL.*tier1_credential_absent" \
-  && echo "$out" | grep -qi "blockedProviders" \
-  && ok "16. falsifier (d): blockedProviders=[claude] does NOT satisfy tier1_credential_absent, and its presence is warned about" \
-  || bad "16. got: $out"
+if echo "$out" | grep -q "FAIL.*tier1_credential_absent" \
+  && echo "$out" | grep -qi "blockedProviders"; then
+  ok "16. falsifier (d): blockedProviders=[claude] does NOT satisfy tier1_credential_absent, and its presence is warned about"
+else
+  bad "16. got: $out"
+fi
 
 # ── 17. anthropic_model_pinned: unset, bare, and prefixed ANTHROPIC_MODEL ───
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$CLEAN_DB"'"}'
 unset ANTHROPIC_MODEL
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "not set" \
-  && ok "17a. ANTHROPIC_MODEL unset -> anthropic_model_pinned FAILS ('not set')" \
-  || bad "17a. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "not set"; then
+  ok "17a. ANTHROPIC_MODEL unset -> anthropic_model_pinned FAILS ('not set')"
+else
+  bad "17a. got: $out"
+fi
 
 export ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "no explicit provider/ prefix" \
-  && ok "17b. bare claude-* id (no prefix) -> anthropic_model_pinned FAILS" \
-  || bad "17b. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "no explicit provider/ prefix"; then
+  ok "17b. bare claude-* id (no prefix) -> anthropic_model_pinned FAILS"
+else
+  bad "17b. got: $out"
+fi
 
 export ANTHROPIC_MODEL="gpt-4o"
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" \
-  && ok "17c. any unprefixed id (not just claude-*) -> anthropic_model_pinned FAILS" \
-  || bad "17c. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned"; then
+  ok "17c. any unprefixed id (not just claude-*) -> anthropic_model_pinned FAILS"
+else
+  bad "17c. got: $out"
+fi
 
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK.*anthropic_model_pinned" \
-  && ok "17d. explicit provider/ prefix -> anthropic_model_pinned PASSES" \
-  || bad "17d. got: $out"
+if echo "$out" | grep -q "OK.*anthropic_model_pinned"; then
+  ok "17d. explicit provider/ prefix -> anthropic_model_pinned PASSES"
+else
+  bad "17d. got: $out"
+fi
 unset ANTHROPIC_MODEL
 
 # ── 18. prefer_claude_code_flag_off: the Tier-1 WIDENING knob must default off ─
@@ -928,21 +993,27 @@ R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$CLEAN_DB"'"}'
 unset OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK.*prefer_claude_code_flag_off" \
-  && ok "18a. unset (default) -> prefer_claude_code_flag_off PASSES" \
-  || bad "18a. got: $out"
+if echo "$out" | grep -q "OK.*prefer_claude_code_flag_off"; then
+  ok "18a. unset (default) -> prefer_claude_code_flag_off PASSES"
+else
+  bad "18a. got: $out"
+fi
 
 export OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS=1
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*prefer_claude_code_flag_off" && echo "$out" | grep -qi "WIDENING" \
-  && ok "18b. set to '1' -> prefer_claude_code_flag_off FAILS, named as a WIDENING knob" \
-  || bad "18b. got: $out"
+if echo "$out" | grep -q "FAIL.*prefer_claude_code_flag_off" && echo "$out" | grep -qi "WIDENING"; then
+  ok "18b. set to '1' -> prefer_claude_code_flag_off FAILS, named as a WIDENING knob"
+else
+  bad "18b. got: $out"
+fi
 
 export OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS=false
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK.*prefer_claude_code_flag_off" \
-  && ok "18c. explicit 'false' -> prefer_claude_code_flag_off still PASSES" \
-  || bad "18c. got: $out"
+if echo "$out" | grep -q "OK.*prefer_claude_code_flag_off"; then
+  ok "18c. explicit 'false' -> prefer_claude_code_flag_off still PASSES"
+else
+  bad "18c. got: $out"
+fi
 unset OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS
 
 # ── 19. no_delegated_sidecar: installed dir, DB-mode row, and the clean case ─
@@ -954,9 +1025,11 @@ write_cfg "$R" '{
   "cliproxyapi_dir": "'"$SIDECAR_DIR"'"
 }'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "CLIProxyAPI directory exists" \
-  && ok "19a. CLIProxyAPI directory installed -> no_delegated_sidecar FAILS" \
-  || bad "19a. got: $out"
+if echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "CLIProxyAPI directory exists"; then
+  ok "19a. CLIProxyAPI directory installed -> no_delegated_sidecar FAILS"
+else
+  bad "19a. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{
@@ -965,9 +1038,11 @@ write_cfg "$R" '{
   "cliproxyapi_dir": "/nonexistent-heimdall-fallback-test/cli-proxy-api"
 }'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "delegated sidecar" \
-  && ok "19b. no sidecar dir, but DB has a cliproxyapi-mode connection row -> no_delegated_sidecar FAILS" \
-  || bad "19b. got: $out"
+if echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "delegated sidecar"; then
+  ok "19b. no sidecar dir, but DB has a cliproxyapi-mode connection row -> no_delegated_sidecar FAILS"
+else
+  bad "19b. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{
@@ -976,9 +1051,11 @@ write_cfg "$R" '{
   "cliproxyapi_dir": "/nonexistent-heimdall-fallback-test/cli-proxy-api"
 }'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK.*no_delegated_sidecar" \
-  && ok "19c. no sidecar dir, clean DB -> no_delegated_sidecar PASSES" \
-  || bad "19c. got: $out"
+if echo "$out" | grep -q "OK.*no_delegated_sidecar"; then
+  ok "19c. no sidecar dir, clean DB -> no_delegated_sidecar PASSES"
+else
+  bad "19c. got: $out"
+fi
 
 # ── 20. NEW: a persisted state=on (removed; owner directive: only
 # off/auto/switch survive) migrates to off on load -- status surfaces the
@@ -1006,19 +1083,23 @@ write_cfg "$R" '{
   "target_provider": "self-hosted-mixtral"
 }'
 out_status="$(fb --repo "$R" status)"
-echo "$out_status" | grep -Eq 'state:[[:space:]]+off' \
+if echo "$out_status" | grep -Eq 'state:[[:space:]]+off' \
   && echo "$out_status" | grep -qi "no longer exists" \
-  && echo "$out_status" | grep -qF "migrated to 'off'" \
-  && ok "20a. persisted state=on migrates to off on load, status surfaces the corrected migration NOTE" \
-  || bad "20a. got: $out_status"
+  && echo "$out_status" | grep -qF "migrated to 'off'"; then
+  ok "20a. persisted state=on migrates to off on load, status surfaces the corrected migration NOTE"
+else
+  bad "20a. got: $out_status"
+fi
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
-  && echo "$out" | grep -qF "state -- fallback state is 'off'" \
-  && ok "20b. that same migrated (now off) config REFUSEs even though every OTHER check would pass -- off is a hard disable (its state check fails on state=='off' alone), so on's prior tier-blind ROUTE is genuinely gone: fail-toward-less-egress made concrete, on purpose" \
-  || bad "20b. rc=$rc out='$out'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
+  && echo "$out" | grep -qF "state -- fallback state is 'off'"; then
+  ok "20b. that same migrated (now off) config REFUSEs even though every OTHER check would pass -- off is a hard disable (its state check fails on state=='off' alone), so on's prior tier-blind ROUTE is genuinely gone: fail-toward-less-egress made concrete, on purpose"
+else
+  bad "20b. rc=$rc out='$out'"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 21. NEW: arm --state on is rejected outright too -- arm's OWN --state
@@ -1031,11 +1112,13 @@ write_cfg "$R" '{"state": "switch", "target_provider": "aihorde"}'
 before="$(cat "$(cfg_path "$R")")"
 out="$(fb --repo "$R" arm --state on 2>&1)"; rc=$?
 after="$(cat "$(cfg_path "$R")")"
-[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "argument --state: invalid choice: 'on'" \
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "argument --state: invalid choice: 'on'" \
   && printf '%s' "$out" | grep -qF "'auto', 'switch'" \
-  && [ "$before" = "$after" ] \
-  && ok "21. arm --state on is rejected outright too, naming only arm's own 2 valid choices (auto/switch -- arm never offered off even before this change), and leaves the existing on-disk config untouched" \
-  || bad "21. rc=$rc out='$out' before='$before' after='$after'"
+  && [ "$before" = "$after" ]; then
+  ok "21. arm --state on is rejected outright too, naming only arm's own 2 valid choices (auto/switch -- arm never offered off even before this change), and leaves the existing on-disk config untouched"
+else
+  bad "21. rc=$rc out='$out' before='$before' after='$after'"
+fi
 
 # ── 22. NEW: state=switch routes on a passing preflight alone -- there is no
 # tier axis left to be blind to (--tier itself is gone; see tests 25/28), so
@@ -1054,9 +1137,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
-  && ok "22. falsifier (c): state=switch + passing preflight -> ROUTE" \
-  || bad "22. rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE"; then
+  ok "22. falsifier (c): state=switch + passing preflight -> ROUTE"
+else
+  bad "22. rc=$rc out='$out'"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 23. NEW: state=switch NEVER bypasses safety -- failing Tier-1 -> REFUSE ──
@@ -1074,33 +1159,41 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "FAIL.*tier1_credential_absent" \
-  && ok "23. falsifier (d): state=switch + failing Tier-1 check -> still REFUSE (no state bypasses safety)" \
-  || bad "23. rc=$rc out='$out'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "FAIL.*tier1_credential_absent"; then
+  ok "23. falsifier (d): state=switch + failing Tier-1 check -> still REFUSE (no state bypasses safety)"
+else
+  bad "23. rc=$rc out='$out'"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 24. NEW: falsifier (e): a corrupt or near-miss state string still reads off ─
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "Switch"}'
 out="$(fb --repo "$R" status)"
-echo "$out" | grep -Eq 'state:[[:space:]]+off' \
-  && ok "24a. falsifier (e): wrong-case 'Switch' -> reads off, never switch" \
-  || bad "24a. got: $out"
+if echo "$out" | grep -Eq 'state:[[:space:]]+off'; then
+  ok "24a. falsifier (e): wrong-case 'Switch' -> reads off, never switch"
+else
+  bad "24a. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "switching"}'
 out="$(fb --repo "$R" status)"
-echo "$out" | grep -Eq 'state:[[:space:]]+off' \
-  && ok "24b. falsifier (e): near-miss 'switching' -> reads off, never switch" \
-  || bad "24b. got: $out"
+if echo "$out" | grep -Eq 'state:[[:space:]]+off'; then
+  ok "24b. falsifier (e): near-miss 'switching' -> reads off, never switch"
+else
+  bad "24b. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "switch", "mitm_enabled": true}'
 out="$(fb --repo "$R" status)"
 fb --repo "$R" check >/dev/null 2>&1; rc=$?
-echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "forbidden" && [ "$rc" -ne 0 ] \
-  && ok "24c. falsifier (e): state=switch + forbidden MITM key -> forced to off, check never ROUTEs" \
-  || bad "24c. got: $out (check rc=$rc)"
+if echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "forbidden" && [ "$rc" -ne 0 ]; then
+  ok "24c. falsifier (e): state=switch + forbidden MITM key -> forced to off, check never ROUTEs"
+else
+  bad "24c. got: $out (check rc=$rc)"
+fi
 
 # ── 25. NEW: --tier is not just deprecated, it is GONE -- check --tier <any>
 # is rejected as an UNRECOGNIZED argument (deleted from check's argparse
@@ -1110,43 +1203,53 @@ echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "forbid
 # repo-wide grep for real callers), so its call shape is untouched. ────────
 R="$(fresh_repo)"
 out="$(fb --repo "$R" check --tier haiku 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "unrecognized arguments: --tier" \
-  && ok "25. check --tier <anything> is rejected as an unrecognized argument -- the flag no longer exists on check at all" \
-  || bad "25. rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "unrecognized arguments: --tier"; then
+  ok "25. check --tier <anything> is rejected as an unrecognized argument -- the flag no longer exists on check at all"
+else
+  bad "25. rc=$rc out='$out'"
+fi
 
 # ── 26. NEW: set switch persists across invocations ─────────────────────────
 R="$(fresh_repo)"
 fb --repo "$R" set switch >/dev/null
 out="$(fb --repo "$R" status)"
-echo "$out" | grep -Eq 'state:[[:space:]]+switch' \
-  && ok "26. set switch persists to disk and is read back by a fresh invocation" \
-  || bad "26. got: $out"
+if echo "$out" | grep -Eq 'state:[[:space:]]+switch'; then
+  ok "26. set switch persists to disk and is read back by a fresh invocation"
+else
+  bad "26. got: $out"
+fi
 
 # ── 27. NEW: switch is UNMISTAKABLE in both status renderings and in check ───
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "switch"}'
 out_text="$(fb --repo "$R" status)"
 out_json="$(fb --repo "$R" status --json)"
-echo "$out_text" | grep -q "SWITCH" \
-  && printf '%s' "$out_json" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('full_switch') is True else 1)" \
-  && ok "27a. status text loudly flags switch (contains 'SWITCH'); status --json carries full_switch:true" \
-  || bad "27a. text='$out_text' json='$out_json'"
+if echo "$out_text" | grep -q "SWITCH" \
+  && printf '%s' "$out_json" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('full_switch') is True else 1)"; then
+  ok "27a. status text loudly flags switch (contains 'SWITCH'); status --json carries full_switch:true"
+else
+  bad "27a. text='$out_text' json='$out_json'"
+fi
 
 R2="$(fresh_repo)"
 write_cfg "$R2" '{"state": "auto"}'
 out_text2="$(fb --repo "$R2" status)"
 out_json2="$(fb --repo "$R2" status --json)"
-! echo "$out_text2" | grep -q "SWITCH" \
-  && printf '%s' "$out_json2" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('full_switch') is False else 1)" \
-  && ok "27b. state=auto -> no SWITCH banner in text, full_switch:false in json (no false alarm)" \
-  || bad "27b. text='$out_text2' json='$out_json2'"
+if ! echo "$out_text2" | grep -q "SWITCH" \
+  && printf '%s' "$out_json2" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('full_switch') is False else 1)"; then
+  ok "27b. state=auto -> no SWITCH banner in text, full_switch:false in json (no false alarm)"
+else
+  bad "27b. text='$out_text2' json='$out_json2'"
+fi
 
 R3="$(fresh_repo)"
 write_cfg "$R3" '{"state": "switch"}'
 out_check="$(fb --repo "$R3" check 2>&1)"
-echo "$out_check" | grep -q "SWITCH" \
-  && ok "27c. check's own VERDICT line also loudly flags switch" \
-  || bad "27c. got: $out_check"
+if echo "$out_check" | grep -q "SWITCH"; then
+  ok "27c. check's own VERDICT line also loudly flags switch"
+else
+  bad "27c. got: $out_check"
+fi
 
 # ── 28. NEW: even given a value, the (removed) --tier flag still never
 # breaks the caller unless --strict -- same never-fail-caller contract as
@@ -1154,12 +1257,17 @@ echo "$out_check" | grep -q "SWITCH" \
 # (test 25) rather than an invalid-choice-within-a-declared-flag path. ─────
 R="$(fresh_repo)"
 out="$(fb --repo "$R" check --tier nonsense-tier 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] \
-  && ok "28a. check --tier <anything>, no --strict -> exit 0 (never-fail-caller, even though the flag is unrecognized)" \
-  || bad "28a. rc=$rc out='$out'"
+if [ "$rc" -eq 0 ]; then
+  ok "28a. check --tier <anything>, no --strict -> exit 0 (never-fail-caller, even though the flag is unrecognized)"
+else
+  bad "28a. rc=$rc out='$out'"
+fi
 fb --repo "$R" --strict check --tier nonsense-tier >/dev/null 2>&1; rc=$?
-[ "$rc" -ne 0 ] && ok "28b. same call WITH --strict -> nonzero (opt-in strictness)" \
-  || bad "28b. rc=$rc, want nonzero"
+if [ "$rc" -ne 0 ]; then
+  ok "28b. same call WITH --strict -> nonzero (opt-in strictness)"
+else
+  bad "28b. rc=$rc, want nonzero"
+fi
 
 # ── 29. NEW: no-auth pinned provider needs NO operator key -> reaches ROUTE ──
 R="$(fresh_repo)"
@@ -1174,9 +1282,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "OK.*operator_key" && echo "$out" | grep -qi "keyless" \
-  && ok "29. no-auth target_provider ('opencode') with NO key configured -> ROUTE, operator_key passes and says why" \
-  || bad "29. rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "OK.*operator_key" && echo "$out" | grep -qi "keyless"; then
+  ok "29. no-auth target_provider ('opencode') with NO key configured -> ROUTE, operator_key passes and says why"
+else
+  bad "29. rc=$rc out='$out'"
+fi
 
 # ── 30. NEW: a key-REQUIRING provider with no key configured still REFUSEs ──
 R="$(fresh_repo)"
@@ -1191,9 +1301,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "FAIL.*operator_key" \
-  && ok "30. key-requiring target_provider with NO key configured -> REFUSE (operator_key fails, unaffected by no-auth logic)" \
-  || bad "30. rc=$rc out='$out'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "FAIL.*operator_key"; then
+  ok "30. key-requiring target_provider with NO key configured -> REFUSE (operator_key fails, unaffected by no-auth logic)"
+else
+  bad "30. rc=$rc out='$out'"
+fi
 
 # ── 31. no-auth does NOT weaken target_provider_allowed's separate ToS gate.
 # UPDATED 2026-08-26: the built-in deny list is now empty by design, so
@@ -1213,10 +1325,12 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "OK.*operator_key" \
-  && echo "$out" | grep -q "FAIL.*target_provider_allowed" \
-  && ok "31. no-auth provider that is operator-deny-listed ('duckduckgo-web' in tos_flagged_providers) -> operator_key passes keyless, but target_provider_allowed still REFUSEs independently" \
-  || bad "31. rc=$rc out='$out'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "OK.*operator_key" \
+  && echo "$out" | grep -q "FAIL.*target_provider_allowed"; then
+  ok "31. no-auth provider that is operator-deny-listed ('duckduckgo-web' in tos_flagged_providers) -> operator_key passes keyless, but target_provider_allowed still REFUSEs independently"
+else
+  bad "31. rc=$rc out='$out'"
+fi
 
 # ── 32. NEW: operator can DECLARE an additional no-auth provider via config ──
 R="$(fresh_repo)"
@@ -1232,9 +1346,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "OK.*operator_key" \
-  && ok "32a. operator-declared noauth_providers addition -> operator_key passes keyless for a provider not in the built-in list" \
-  || bad "32a. rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "OK.*operator_key"; then
+  ok "32a. operator-declared noauth_providers addition -> operator_key passes keyless for a provider not in the built-in list"
+else
+  bad "32a. rc=$rc out='$out'"
+fi
 
 R2="$(fresh_repo)"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
@@ -1248,9 +1364,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out2="$(fb --repo "$R2" check)"; rc2=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc2" -eq 1 ] && echo "$out2" | grep -q "FAIL.*operator_key" \
-  && ok "32b. WITHOUT the config declaration, the same undeclared provider still requires a key (no guessing)" \
-  || bad "32b. rc=$rc2 out='$out2'"
+if [ "$rc2" -eq 1 ] && echo "$out2" | grep -q "FAIL.*operator_key"; then
+  ok "32b. WITHOUT the config declaration, the same undeclared provider still requires a key (no guessing)"
+else
+  bad "32b. rc=$rc2 out='$out2'"
+fi
 
 # ── 33. NEW: no-auth provider still refuses a Claude/Anthropic-named key_env ─
 R="$(fresh_repo)"
@@ -1268,9 +1386,11 @@ out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 unset ANTHROPIC_API_KEY
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "FAIL.*operator_key" && echo "$out" | grep -qi "Claude/Anthropic" \
-  && ok "33. no-auth target_provider does NOT waive the Claude/Anthropic operator_key_env ban" \
-  || bad "33. rc=$rc out='$out'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "FAIL.*operator_key" && echo "$out" | grep -qi "Claude/Anthropic"; then
+  ok "33. no-auth target_provider does NOT waive the Claude/Anthropic operator_key_env ban"
+else
+  bad "33. rc=$rc out='$out'"
+fi
 
 # ── 34. NEW (schema fix): correct table is upstream_proxy_config, not
 # provider_connections -- a live OmniRoute 3.8.51 (d82b682) install confirmed
@@ -1294,22 +1414,38 @@ unset ANTHROPIC_API_KEY
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$SIDECAR_MODE_DB"'"}'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "cliproxyapi"   && ok "34a. falsifier: upstream_proxy_config row with mode='cliproxyapi' (CORRECT table) -> no_delegated_sidecar FAILS"   || bad "34a. got: $out"
+if echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "cliproxyapi"; then
+  ok "34a. falsifier: upstream_proxy_config row with mode='cliproxyapi' (CORRECT table) -> no_delegated_sidecar FAILS"
+else
+  bad "34a. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$CLEAN_DB"'"}'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK  .*no_delegated_sidecar"   && ok "34b. falsifier: upstream_proxy_config table present but EMPTY -> no_delegated_sidecar PASSES"   || bad "34b. got: $out"
+if echo "$out" | grep -q "OK  .*no_delegated_sidecar"; then
+  ok "34b. falsifier: upstream_proxy_config table present but EMPTY -> no_delegated_sidecar PASSES"
+else
+  bad "34b. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$NO_PROXY_CONFIG_TABLE_DB"'"}'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK  .*no_delegated_sidecar" && echo "$out" | grep -qi "schema predates"   && ok "34c. falsifier: DB missing upstream_proxy_config table entirely, but provider_connections IS present/queryable -> PASSES (schema predates the delegated-sidecar migration; this is the exact DB shape issue-loop-claude-fix-fallback's own case (c) fixture depends on)"   || bad "34c. got: $out"
+if echo "$out" | grep -q "OK  .*no_delegated_sidecar" && echo "$out" | grep -qi "schema predates"; then
+  ok "34c. falsifier: DB missing upstream_proxy_config table entirely, but provider_connections IS present/queryable -> PASSES (schema predates the delegated-sidecar migration; this is the exact DB shape issue-loop-claude-fix-fallback's own case (c) fixture depends on)"
+else
+  bad "34c. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$MALFORMED_DB"'"}'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "could not be queried for upstream_proxy_config"   && ok "34d. falsifier: a genuinely unreadable/malformed DB (provider_connections ALSO fails) -> no_delegated_sidecar still FAILS closed (never a silent pass)"   || bad "34d. got: $out"
+if echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "could not be queried for upstream_proxy_config"; then
+  ok "34d. falsifier: a genuinely unreadable/malformed DB (provider_connections ALSO fails) -> no_delegated_sidecar still FAILS closed (never a silent pass)"
+else
+  bad "34d. got: $out"
+fi
 
 # ── 35. NEW: mode='dario' is ALSO a delegated sidecar -- header point 1d
 # already named Dario explicitly, but the OLD code's SIDECAR_CONNECTION_MODE
@@ -1321,7 +1457,11 @@ add_proxy_config_row "$DARIO_DB" some-provider dario
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$DARIO_DB"'"}'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "dario"   && ok "35. falsifier: upstream_proxy_config row with mode='dario' -> no_delegated_sidecar FAILS (names Dario)"   || bad "35. got: $out"
+if echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "dario"; then
+  ok "35. falsifier: upstream_proxy_config row with mode='dario' -> no_delegated_sidecar FAILS (names Dario)"
+else
+  bad "35. got: $out"
+fi
 
 # ── 36. NEW: mode='fallback' delegates its retry leg to EITHER cliproxyapi
 # or dario (migration 138's own wording) -- both backends still FAIL. ──────
@@ -1331,7 +1471,11 @@ add_proxy_config_row "$FALLBACK_CPA_DB" some-provider fallback cliproxyapi
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$FALLBACK_CPA_DB"'"}'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*no_delegated_sidecar"   && ok "36a. falsifier: mode='fallback', fallback_backend='cliproxyapi' -> no_delegated_sidecar FAILS"   || bad "36a. got: $out"
+if echo "$out" | grep -q "FAIL.*no_delegated_sidecar"; then
+  ok "36a. falsifier: mode='fallback', fallback_backend='cliproxyapi' -> no_delegated_sidecar FAILS"
+else
+  bad "36a. got: $out"
+fi
 
 FALLBACK_DARIO_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-fallback-dario.XXXXXX")"
 make_omniroute_db "$FALLBACK_DARIO_DB"
@@ -1339,7 +1483,11 @@ add_proxy_config_row "$FALLBACK_DARIO_DB" some-provider fallback dario
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$FALLBACK_DARIO_DB"'"}'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "dario"   && ok "36b. falsifier: mode='fallback', fallback_backend='dario' -> no_delegated_sidecar FAILS, names dario"   || bad "36b. got: $out"
+if echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "dario"; then
+  ok "36b. falsifier: mode='fallback', fallback_backend='dario' -> no_delegated_sidecar FAILS, names dario"
+else
+  bad "36b. got: $out"
+fi
 
 # ── 37. NEW: an explicit mode='native' row is NOT a delegated sidecar ──────
 NATIVE_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-native.XXXXXX")"
@@ -1348,7 +1496,11 @@ add_proxy_config_row "$NATIVE_DB" some-provider native
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$NATIVE_DB"'"}'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK  .*no_delegated_sidecar"   && ok "37. an explicit mode='native' row is NOT a delegated sidecar -> PASSES"   || bad "37. got: $out"
+if echo "$out" | grep -q "OK  .*no_delegated_sidecar"; then
+  ok "37. an explicit mode='native' row is NOT a delegated sidecar -> PASSES"
+else
+  bad "37. got: $out"
+fi
 
 # ── 38. NEW: state=auto + heimdall-session-usage reporting CROSSED, with a
 # fully-passing preflight -> ROUTE. Under the 2026-08-26 correction, "crossed"
@@ -1375,9 +1527,11 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 unset HMD_FB_TEST_KEY
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -qi "CROSSED" \
-  && ok "38. auto + session-usage CROSSED + passing preflight -> still ROUTE, and check reports the crossed signal" \
-  || bad "38. rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -qi "CROSSED"; then
+  ok "38. auto + session-usage CROSSED + passing preflight -> still ROUTE, and check reports the crossed signal"
+else
+  bad "38. rc=$rc out='$out'"
+fi
 
 # ── 39. NEW: heimdall-session-usage reporting "unknown" must never be treated
 # as "under" -- proven by an explicit allow-list check (verdict == "crossed"),
@@ -1390,13 +1544,17 @@ HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unkn
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out_unknown="$(fb --repo "$R" check)"
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-echo "$out_unknown" | grep -qi "CROSSED" \
-  && bad "39a. an 'unknown' session-usage reading must NEVER trigger the crossed-only line: out='$out_unknown'" \
-  || ok "39a. 'unknown' session-usage reading does not trigger the crossed-only line"
+if echo "$out_unknown" | grep -qi "CROSSED"; then
+  bad "39a. an 'unknown' session-usage reading must NEVER trigger the crossed-only line: out='$out_unknown'"
+else
+  ok "39a. 'unknown' session-usage reading does not trigger the crossed-only line"
+fi
 
-echo "$out_unknown" | grep -qi "could not be determined" \
-  && ok "39b. 'unknown' gets its own honest wording (not silently folded into 'under')" \
-  || bad "39b. out='$out_unknown'"
+if echo "$out_unknown" | grep -qi "could not be determined"; then
+  ok "39b. 'unknown' gets its own honest wording (not silently folded into 'under')"
+else
+  bad "39b. out='$out_unknown'"
+fi
 
 R2="$(fresh_repo)"
 write_cfg "$R2" '{"state": "auto"}'
@@ -1404,9 +1562,11 @@ HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unde
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out_under="$(fb --repo "$R2" check)"
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-echo "$out_under" | grep -qi "could not be determined" \
-  && bad "39c. a genuine 'under' reading must not use unknown's 'could not be determined' wording: out='$out_under'" \
-  || ok "39c. 'under' and 'unknown' produce genuinely distinct wording, not a shared fallback string"
+if echo "$out_under" | grep -qi "could not be determined"; then
+  bad "39c. a genuine 'under' reading must not use unknown's 'could not be determined' wording: out='$out_under'"
+else
+  ok "39c. 'under' and 'unknown' produce genuinely distinct wording, not a shared fallback string"
+fi
 
 # ── 40. NEW: a missing/broken heimdall-session-usage is best-effort ONLY --
 # must never crash `check`, and must never change any of the OTHER checks'
@@ -1420,17 +1580,21 @@ write_cfg "$R" '{
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="/nonexistent-heimdall-fallback-test/no-such-heimdall-session-usage"
 out_missing="$(fb --repo "$R" check)"; rc_missing=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-[ "$rc_missing" -eq 2 ] && echo "$out_missing" | grep -q "VERDICT: WAIT" \
-  && ok "40a. a missing heimdall-session-usage binary does not crash check -- same WAIT verdict as always" \
-  || bad "40a. rc=$rc_missing out='$out_missing'"
+if [ "$rc_missing" -eq 2 ] && echo "$out_missing" | grep -q "VERDICT: WAIT"; then
+  ok "40a. a missing heimdall-session-usage binary does not crash check -- same WAIT verdict as always"
+else
+  bad "40a. rc=$rc_missing out='$out_missing'"
+fi
 
 HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage 'not valid json {{{')"
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out_garbage="$(fb --repo "$R" check)"; rc_garbage=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-[ "$rc_garbage" -eq 2 ] && echo "$out_garbage" | grep -q "VERDICT: WAIT" \
-  && ok "40b. malformed (non-JSON) heimdall-session-usage output does not crash check -- same WAIT verdict" \
-  || bad "40b. rc=$rc_garbage out='$out_garbage'"
+if [ "$rc_garbage" -eq 2 ] && echo "$out_garbage" | grep -q "VERDICT: WAIT"; then
+  ok "40b. malformed (non-JSON) heimdall-session-usage output does not crash check -- same WAIT verdict"
+else
+  bad "40b. rc=$rc_garbage out='$out_garbage'"
+fi
 
 # The preflight FAIL lines themselves must be byte-identical regardless of
 # whether the session-usage consultation succeeded, failed, or was missing --
@@ -1438,9 +1602,11 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 # checks list.
 baseline_fail_lines="$(printf '%s\n' "$out_missing" | grep '\[FAIL\]' | sort)"
 garbage_fail_lines="$(printf '%s\n' "$out_garbage" | grep '\[FAIL\]' | sort)"
-[ "$baseline_fail_lines" = "$garbage_fail_lines" ] && [ -n "$baseline_fail_lines" ] \
-  && ok "40c. every OTHER check's FAIL line is byte-identical whether heimdall-session-usage is missing or returns garbage" \
-  || bad "40c. baseline='$baseline_fail_lines' garbage='$garbage_fail_lines'"
+if [ "$baseline_fail_lines" = "$garbage_fail_lines" ] && [ -n "$baseline_fail_lines" ]; then
+  ok "40c. every OTHER check's FAIL line is byte-identical whether heimdall-session-usage is missing or returns garbage"
+else
+  bad "40c. baseline='$baseline_fail_lines' garbage='$garbage_fail_lines'"
+fi
 
 # ── 41. NEW (2026-08-26 correction): state=auto + a FULLY PASSING preflight
 # + heimdall-session-usage reporting "under" -> WAIT (exit 2), NOT ROUTE.
@@ -1467,9 +1633,11 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 unset HMD_FB_TEST_KEY
-[ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
-  && ok "41. auto + passing preflight + session-usage UNDER -> WAIT, NOT route (capacity remains)" \
-  || bad "41. got rc=$rc out='$out'"
+if [ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE"; then
+  ok "41. auto + passing preflight + session-usage UNDER -> WAIT, NOT route (capacity remains)"
+else
+  bad "41. got rc=$rc out='$out'"
+fi
 
 # ── 42. NEW (2026-08-26 correction): state=auto + a FAILING preflight +
 # heimdall-session-usage reporting CROSSED -> still WAIT, never ROUTE. Proves
@@ -1481,9 +1649,11 @@ HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"cros
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-[ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
-  && ok "42. auto + failing preflight + session-usage CROSSED -> still WAIT, crossing 90% authorizes nothing alone" \
-  || bad "42. got rc=$rc out='$out'"
+if [ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE"; then
+  ok "42. auto + failing preflight + session-usage CROSSED -> still WAIT, crossing 90% authorizes nothing alone"
+else
+  bad "42. got rc=$rc out='$out'"
+fi
 
 # ── 43. NEW (2026-08-26 correction): state=auto + a FULLY PASSING preflight
 # + heimdall-session-usage reporting "unknown" -> WAIT (exit 2), NOT ROUTE.
@@ -1512,9 +1682,11 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 unset HMD_FB_TEST_KEY
-[ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
-  && ok "43. auto + passing preflight + session-usage UNKNOWN -> WAIT, NOT route (fails closed on unmeasurable capacity)" \
-  || bad "43. got rc=$rc out='$out'"
+if [ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE"; then
+  ok "43. auto + passing preflight + session-usage UNKNOWN -> WAIT, NOT route (fails closed on unmeasurable capacity)"
+else
+  bad "43. got rc=$rc out='$out'"
+fi
 
 # ── 43b/43c/43d (NEW 2026-08-29, heimdall-session-usage PHASE 3): the
 # session-usage payload can now carry a "window" field (five_hour / seven_day
@@ -1540,17 +1712,21 @@ HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"cros
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: seven_day)" \
-  && ok "43b. session-usage crossed+window=seven_day -> [INFO] names the window" \
-  || bad "43b. got rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: seven_day)"; then
+  ok "43b. session-usage crossed+window=seven_day -> [INFO] names the window"
+else
+  bad "43b. got rc=$rc out='$out'"
+fi
 
 HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && ! echo "$out" | grep -q "(window:" && ! echo "$out" | grep -q " None" \
-  && ok "43c. legacy crossed payload with no 'window' key -> unchanged [INFO], no crash, no stray None" \
-  || bad "43c. got rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && ! echo "$out" | grep -q "(window:" && ! echo "$out" | grep -q " None"; then
+  ok "43c. legacy crossed payload with no 'window' key -> unchanged [INFO], no crash, no stray None"
+else
+  bad "43c. got rc=$rc out='$out'"
+fi
 
 HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","window":"five_hour"}')"
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
@@ -1559,9 +1735,11 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 unset HMD_FB_TEST_KEY
-[ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "(window:" \
-  && ok "43d. adversarial non-crossed payload still carrying a 'window' key -> never surfaces (window: never fires when it should not)" \
-  || bad "43d. got rc=$rc out='$out'"
+if [ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "(window:"; then
+  ok "43d. adversarial non-crossed payload still carrying a 'window' key -> never surfaces (window: never fires when it should not)"
+else
+  bad "43d. got rc=$rc out='$out'"
+fi
 
 # ── 44. NEW (2026-08-26 deny-list-emptied correction): a real provider name
 # formerly on the built-in ToS deny list now PASSES target_provider_allowed
@@ -1576,9 +1754,11 @@ write_cfg "$R" '{
   "target_provider": "mistral"
 }'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK.*target_provider_allowed" && ! echo "$out" | grep -q "FAIL.*target_provider_allowed" \
-  && ok "44a. falsifier: a real provider ('mistral') formerly on the built-in deny list now PASSES target_provider_allowed by default" \
-  || bad "44a. got: $out"
+if echo "$out" | grep -q "OK.*target_provider_allowed" && ! echo "$out" | grep -q "FAIL.*target_provider_allowed"; then
+  ok "44a. falsifier: a real provider ('mistral') formerly on the built-in deny list now PASSES target_provider_allowed by default"
+else
+  bad "44a. got: $out"
+fi
 
 R2="$(fresh_repo)"
 write_cfg "$R2" '{
@@ -1588,9 +1768,11 @@ write_cfg "$R2" '{
   "tos_flagged_providers": ["mistral"]
 }'
 out2="$(fb --repo "$R2" check)"
-echo "$out2" | grep -q "FAIL.*target_provider_allowed" && echo "$out2" | grep -q "mistral" \
-  && ok "44b. same provider ('mistral'), operator explicitly adds it to tos_flagged_providers -> target_provider_allowed FAILS, named (the override mechanism survives an empty built-in default)" \
-  || bad "44b. got: $out2"
+if echo "$out2" | grep -q "FAIL.*target_provider_allowed" && echo "$out2" | grep -q "mistral"; then
+  ok "44b. same provider ('mistral'), operator explicitly adds it to tos_flagged_providers -> target_provider_allowed FAILS, named (the override mechanism survives an empty built-in default)"
+else
+  bad "44b. got: $out2"
+fi
 
 # ── 45. NEW: target_provider_allowed's completeness check is untouched by the
 # deny-list change -- an EMPTY target_provider still FAILS, always (this is a
@@ -1603,9 +1785,11 @@ write_cfg "$R" '{
   "target_provider": ""
 }'
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*target_provider_allowed" && echo "$out" | grep -qi "no target_provider configured" \
-  && ok "45. empty target_provider still FAILS target_provider_allowed (completeness check, unaffected by the deny-list default)" \
-  || bad "45. got: $out"
+if echo "$out" | grep -q "FAIL.*target_provider_allowed" && echo "$out" | grep -qi "no target_provider configured"; then
+  ok "45. empty target_provider still FAILS target_provider_allowed (completeness check, unaffected by the deny-list default)"
+else
+  bad "45. got: $out"
+fi
 
 # ── 46. NEW (the one that matters): with the built-in deny list EMPTY, a
 # config whose target_provider is a provider that USED TO be built-in-denied
@@ -1628,11 +1812,13 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
   && echo "$out" | grep -q "OK.*target_provider_allowed" \
-  && echo "$out" | grep -q "FAIL.*tier1_credential_absent" && echo "$out" | grep -qi "claude" \
-  && ok "46. falsifier: deny list empty (target_provider_allowed now PASSES for 'mistral'), but OmniRoute DB has a live 'claude' Tier-1 row -> still REFUSE overall, tier1_credential_absent FAILS independently" \
-  || bad "46. rc=$rc out='$out'"
+  && echo "$out" | grep -q "FAIL.*tier1_credential_absent" && echo "$out" | grep -qi "claude"; then
+  ok "46. falsifier: deny list empty (target_provider_allowed now PASSES for 'mistral'), but OmniRoute DB has a live 'claude' Tier-1 row -> still REFUSE overall, tier1_credential_absent FAILS independently"
+else
+  bad "46. rc=$rc out='$out'"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 47. NEW: state=switch + failing Tier-1 check is still REFUSE, even for a
@@ -1656,11 +1842,13 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
   && echo "$out" | grep -q "OK.*target_provider_allowed" \
-  && echo "$out" | grep -q "FAIL.*tier1_credential_absent" \
-  && ok "47. falsifier: state=switch + target_provider ('cohere') now allowed by the empty deny list + failing Tier-1 check -> still REFUSE (no state, and no deny-list change, ever bypasses Tier-1 safety)" \
-  || bad "47. rc=$rc out='$out'"
+  && echo "$out" | grep -q "FAIL.*tier1_credential_absent"; then
+  ok "47. falsifier: state=switch + target_provider ('cohere') now allowed by the empty deny list + failing Tier-1 check -> still REFUSE (no state, and no deny-list change, ever bypasses Tier-1 safety)"
+else
+  bad "47. rc=$rc out='$out'"
+fi
 unset HMD_FB_TEST_KEY
 
 
@@ -1683,11 +1871,13 @@ out="$(fb --repo "$R" arm --state switch)"; rc=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 cfg_out="$(cat "$(cfg_path "$R")")"
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
   && echo "$cfg_out" | grep -q '"target_provider": "aihorde"' \
-  && echo "$cfg_out" | grep -q '"operator_key_env": ""' \
-  && ok "48. arm with nothing pre-configured self-provisions no-auth 'aihorde' with an EMPTY operator_key_env and reaches VERDICT: ROUTE end-to-end" \
-  || bad "48. rc=$rc out='$out' cfg='$cfg_out'"
+  && echo "$cfg_out" | grep -q '"operator_key_env": ""'; then
+  ok "48. arm with nothing pre-configured self-provisions no-auth 'aihorde' with an EMPTY operator_key_env and reaches VERDICT: ROUTE end-to-end"
+else
+  bad "48. rc=$rc out='$out' cfg='$cfg_out'"
+fi
 
 # ── 49. NEW: that same arm run's stdout carries the mandatory operator
 # guidance for the ONE step arm genuinely cannot perform -- the export line
@@ -1704,11 +1894,13 @@ export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 out="$(fb --repo "$R" arm --state switch)"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-echo "$out" | grep -q "export ANTHROPIC_MODEL=aihorde/" \
+if echo "$out" | grep -q "export ANTHROPIC_MODEL=aihorde/" \
   && echo "$out" | grep -qi "cannot" \
-  && echo "$out" | grep -qi "gateway:.*reachable" \
-  && ok "49. arm's own output names the unavoidable 'export ANTHROPIC_MODEL=' step, explains why arm itself cannot do it, and reports real gateway reachability" \
-  || bad "49. out='$out'"
+  && echo "$out" | grep -qi "gateway:.*reachable"; then
+  ok "49. arm's own output names the unavoidable 'export ANTHROPIC_MODEL=' step, explains why arm itself cannot do it, and reports real gateway reachability"
+else
+  bad "49. out='$out'"
+fi
 
 # ── 50. NEW: arm --provider naming a KEYED provider with no usable key
 # anywhere (no operator_key_env configured, nothing to reuse) REFUSES --
@@ -1721,10 +1913,12 @@ write_cfg "$R" '{"state": "off"}'
 before="$(cat "$(cfg_path "$R")")"
 out="$(fb --repo "$R" arm --provider mistral --state switch)"; rc=$?
 after="$(cat "$(cfg_path "$R")")"
-[ "$rc" -eq 1 ] && echo "$out" | grep -q "REFUSED" && echo "$out" | grep -qi "never invents a credential" \
-  && echo "$out" | grep -q "VERDICT: REFUSE" && [ "$before" = "$after" ] \
-  && ok "50. arm --provider mistral (keyed, no usable key anywhere) REFUSES, config left byte-for-byte unchanged, trailing check still reports the true REFUSE verdict" \
-  || bad "50. rc=$rc out='$out' before='$before' after='$after'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -q "REFUSED" && echo "$out" | grep -qi "never invents a credential" \
+  && echo "$out" | grep -q "VERDICT: REFUSE" && [ "$before" = "$after" ]; then
+  ok "50. arm --provider mistral (keyed, no usable key anywhere) REFUSES, config left byte-for-byte unchanged, trailing check still reports the true REFUSE verdict"
+else
+  bad "50. rc=$rc out='$out' before='$before' after='$after'"
+fi
 
 # ── 51a/51b. NEW: arm --provider claude / claude-web REFUSE outright, naming
 # the Tier-1 boundary -- arm enforces this itself (target_provider is never
@@ -1733,17 +1927,21 @@ after="$(cat "$(cfg_path "$R")")"
 # DB, not by inspecting this config field -- see header point 12). ─────────
 R="$(fresh_repo)"
 out="$(fb --repo "$R" arm --provider claude)"; rc=$?
-[ "$rc" -eq 1 ] && echo "$out" | grep -qi "Tier-1" && echo "$out" | grep -q "REFUSED" \
-  && ! grep -q '"target_provider": "claude"' "$(cfg_path "$R")" 2>/dev/null \
-  && ok "51a. arm --provider claude REFUSES with Tier-1 language, never written to disk" \
-  || bad "51a. rc=$rc out='$out'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -qi "Tier-1" && echo "$out" | grep -q "REFUSED" \
+  && ! grep -q '"target_provider": "claude"' "$(cfg_path "$R")" 2>/dev/null; then
+  ok "51a. arm --provider claude REFUSES with Tier-1 language, never written to disk"
+else
+  bad "51a. rc=$rc out='$out'"
+fi
 
 R="$(fresh_repo)"
 out="$(fb --repo "$R" arm --provider claude-web)"; rc=$?
-[ "$rc" -eq 1 ] && echo "$out" | grep -qi "Tier-1" && echo "$out" | grep -q "REFUSED" \
-  && ! grep -q '"target_provider": "claude-web"' "$(cfg_path "$R")" 2>/dev/null \
-  && ok "51b. arm --provider claude-web REFUSES with Tier-1 language, never written to disk" \
-  || bad "51b. rc=$rc out='$out'"
+if [ "$rc" -eq 1 ] && echo "$out" | grep -qi "Tier-1" && echo "$out" | grep -q "REFUSED" \
+  && ! grep -q '"target_provider": "claude-web"' "$(cfg_path "$R")" 2>/dev/null; then
+  ok "51b. arm --provider claude-web REFUSES with Tier-1 language, never written to disk"
+else
+  bad "51b. rc=$rc out='$out'"
+fi
 
 # ── 52. NEW (the defensive case): a config that ALREADY has target_provider
 # "claude" on disk (e.g. a hand-edited or pre-existing bad config) -- arm run
@@ -1760,11 +1958,13 @@ write_cfg "$R" '{
 }'
 out="$(fb --repo "$R" arm --state switch)"
 cfg_out="$(cat "$(cfg_path "$R")")"
-echo "$cfg_out" | grep -q '"target_provider": "aihorde"' \
+if echo "$cfg_out" | grep -q '"target_provider": "aihorde"' \
   && ! echo "$cfg_out" | grep -q '"target_provider": "claude"' \
-  && ! echo "$cfg_out" | grep -q '"target_provider": "claude-web"' \
-  && ok "52. arm never reuses/preserves a pre-existing claude target_provider -- overwrites it away to a safe no-auth pick" \
-  || bad "52. out='$out' cfg='$cfg_out'"
+  && ! echo "$cfg_out" | grep -q '"target_provider": "claude-web"'; then
+  ok "52. arm never reuses/preserves a pre-existing claude target_provider -- overwrites it away to a safe no-auth pick"
+else
+  bad "52. out='$out' cfg='$cfg_out'"
+fi
 
 # ── 53. NEW: repo-path disclosure (the second bug this work fixes) -- every
 # subcommand that reads or writes THIS repo's config must say which repo's
@@ -1776,13 +1976,15 @@ out_status1="$(fb --repo "$R1" status)"
 out_status2="$(fb --repo "$R2" status)"
 out_set1="$(fb --repo "$R1" set switch)"
 out_check1="$(fb --repo "$R1" check)"
-echo "$out_status1" | grep -qF "$(cfg_path "$R1")" \
+if echo "$out_status1" | grep -qF "$(cfg_path "$R1")" \
   && echo "$out_status2" | grep -qF "$(cfg_path "$R2")" \
   && ! echo "$out_status1" | grep -qF "$(cfg_path "$R2")" \
   && echo "$out_set1" | grep -qF "$(cfg_path "$R1")" \
-  && echo "$out_check1" | grep -qF "$(cfg_path "$R1")" \
-  && ok "53. status/set/check each print the exact resolved config path, correctly distinct per repo" \
-  || bad "53. status1='$out_status1' status2='$out_status2' set1='$out_set1' check1='$out_check1'"
+  && echo "$out_check1" | grep -qF "$(cfg_path "$R1")"; then
+  ok "53. status/set/check each print the exact resolved config path, correctly distinct per repo"
+else
+  bad "53. status1='$out_status1' status2='$out_status2' set1='$out_set1' check1='$out_check1'"
+fi
 
 # ── 54. NEW: a partial, old-schema config (missing noauth_providers,
 # omniroute_db_path, cliproxyapi_dir -- exactly this repo's own real
@@ -1796,18 +1998,22 @@ echo "$out_status1" | grep -qF "$(cfg_path "$R1")" \
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "target_provider": "opencode"}'
 out_check="$(fb --repo "$R" check 2>&1)"; rc_check=$?
-[ "$rc_check" -ne 3 ] && ! echo "$out_check" | grep -qi "traceback" \
-  && echo "$out_check" | grep -q "VERDICT:" \
-  && ok "54a. a partial/old-schema config (missing noauth_providers/omniroute_db_path/cliproxyapi_dir) does not crash check" \
-  || bad "54a. rc=$rc_check out='$out_check'"
+if [ "$rc_check" -ne 3 ] && ! echo "$out_check" | grep -qi "traceback" \
+  && echo "$out_check" | grep -q "VERDICT:"; then
+  ok "54a. a partial/old-schema config (missing noauth_providers/omniroute_db_path/cliproxyapi_dir) does not crash check"
+else
+  bad "54a. rc=$rc_check out='$out_check'"
+fi
 
 out_arm="$(fb --repo "$R" arm --state switch)"; rc_arm=$?
 cfg_out="$(cat "$(cfg_path "$R")")"
-[ "$rc_arm" -eq 1 ] && echo "$out_arm" | grep -q "target_provider:.*opencode" \
+if [ "$rc_arm" -eq 1 ] && echo "$out_arm" | grep -q "target_provider:.*opencode" \
   && echo "$out_arm" | grep -q "VERDICT: REFUSE" \
-  && echo "$cfg_out" | grep -q '"target_provider": "opencode"' \
-  && ok "54b. arm reuses the already-valid, non-default 'opencode' target_provider from a partial/old-schema config rather than re-picking the deterministic default ('aihorde') -- its own trailing check REFUSEs (this partial config has no working omniroute_db_path), proving arm actually ran rather than silently no-op'ing" \
-  || bad "54b. rc=$rc_arm out='$out_arm' cfg='$cfg_out'"
+  && echo "$cfg_out" | grep -q '"target_provider": "opencode"'; then
+  ok "54b. arm reuses the already-valid, non-default 'opencode' target_provider from a partial/old-schema config rather than re-picking the deterministic default ('aihorde') -- its own trailing check REFUSEs (this partial config has no working omniroute_db_path), proving arm actually ran rather than silently no-op'ing"
+else
+  bad "54b. rc=$rc_arm out='$out_arm' cfg='$cfg_out'"
+fi
 
 # ── 55. NEW: arm never touches OmniRoute's own DB -- it is a config-file
 # writer only (header point 12's own "never adds a provider_connections row"
@@ -1823,9 +2029,11 @@ db_before="$(md5 -q "$CLEAN_DB" 2>/dev/null || md5sum "$CLEAN_DB" | awk '{print 
 fb --repo "$R" arm --state switch >/dev/null
 db_after="$(md5 -q "$CLEAN_DB" 2>/dev/null || md5sum "$CLEAN_DB" | awk '{print $1}')"
 cfg_out="$(cat "$(cfg_path "$R")")"
-[ "$db_before" = "$db_after" ] && echo "$cfg_out" | grep -q '"target_provider": "aihorde"' \
-  && ok "55. arm never modifies OmniRoute's own DB -- fixture byte-for-byte unchanged after arm actually ran and wrote its self-picked target_provider" \
-  || bad "55. db_before=$db_before db_after=$db_after cfg='$cfg_out'"
+if [ "$db_before" = "$db_after" ] && echo "$cfg_out" | grep -q '"target_provider": "aihorde"'; then
+  ok "55. arm never modifies OmniRoute's own DB -- fixture byte-for-byte unchanged after arm actually ran and wrote its self-picked target_provider"
+else
+  bad "55. db_before=$db_before db_after=$db_after cfg='$cfg_out'"
+fi
 
 # ── 56. NEW: arm's self-pick is USABILITY-RANKED, never plain alphabetical.
 # Regression guard for a real defect: the first implementation sorted no-auth
@@ -1859,9 +2067,11 @@ esac
 R="$(fresh_repo)"
 write_cfg "$R" '{}'
 fb --repo "$R" arm --provider auggie --state switch >/dev/null
-grep -q '"target_provider": "auggie"' "$(cfg_path "$R")" \
-  && ok "57. an explicit --provider auggie is honoured verbatim -- usability ranking governs arm's own pick, never an operator's stated choice" \
-  || bad "57. explicit --provider auggie was not honoured: cfg='$(cat "$(cfg_path "$R")")'"
+if grep -q '"target_provider": "auggie"' "$(cfg_path "$R")"; then
+  ok "57. an explicit --provider auggie is honoured verbatim -- usability ranking governs arm's own pick, never an operator's stated choice"
+else
+  bad "57. explicit --provider auggie was not honoured: cfg='$(cat "$(cfg_path "$R")")'"
+fi
 
 # ── 59. base-url: a ROUTE verdict prints the exact configured endpoint on
 # stdout and exits 0. Reuses test 12's fully-passing recipe verbatim so a
@@ -1880,9 +2090,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 run_capture fb --repo "$R" base-url
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "http://127.0.0.1:20128" ] \
-  && ok "59. base-url on a ROUTE verdict prints exactly the configured endpoint, exit 0" \
-  || bad "59. rc=$CAP_RC out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "http://127.0.0.1:20128" ]; then
+  ok "59. base-url on a ROUTE verdict prints exactly the configured endpoint, exit 0"
+else
+  bad "59. rc=$CAP_RC out='$CAP_OUT' err='$CAP_ERR'"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 60. base-url: a REFUSE verdict (exit 1) leaves stdout BYTE-EMPTY. THE
@@ -1897,9 +2109,11 @@ unset HMD_FB_TEST_KEY
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "switch"}'
 run_capture fb --repo "$R" base-url
-[ "$CAP_RC" -eq 1 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
-  && ok "60. base-url on a REFUSE verdict: exit 1 AND stdout is byte-empty (reason goes to stderr only)" \
-  || bad "60. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -eq 1 ] && [ "$CAP_OUT_BYTES" -eq 0 ]; then
+  ok "60. base-url on a REFUSE verdict: exit 1 AND stdout is byte-empty (reason goes to stderr only)"
+else
+  bad "60. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+fi
 
 # ── 61. base-url: a WAIT verdict (exit 2) also leaves stdout byte-empty --
 # same contract as REFUSE; `hmd route` must never treat a stalled decision as
@@ -1908,18 +2122,22 @@ run_capture fb --repo "$R" base-url
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
 run_capture fb --repo "$R" base-url
-[ "$CAP_RC" -eq 2 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
-  && ok "61. base-url on a WAIT verdict: exit 2 AND stdout is byte-empty" \
-  || bad "61. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -eq 2 ] && [ "$CAP_OUT_BYTES" -eq 0 ]; then
+  ok "61. base-url on a WAIT verdict: exit 2 AND stdout is byte-empty"
+else
+  bad "61. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+fi
 
 # ── 62. base-url: with no config file at all (default state=off), stdout is
 # byte-empty and exit is non-zero. fresh_repo() alone, no write_cfg call --
 # .heimdall/fallback.json genuinely does not exist on disk. ────────────────
 R="$(fresh_repo)"
 run_capture fb --repo "$R" base-url
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
-  && ok "62. base-url with no config file at all: exit non-zero, stdout byte-empty" \
-  || bad "62. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ]; then
+  ok "62. base-url with no config file at all: exit non-zero, stdout byte-empty"
+else
+  bad "62. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+fi
 
 # ── 63. base-url: endpoint configured to a NON-loopback URL refuses, stdout
 # byte-empty. WHICH LAYER CATCHES THIS: run_preflight's own `endpoint_local`
@@ -1946,9 +2164,11 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 run_capture fb --repo "$R" base-url
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "endpoint_local" \
-  && ok "63. base-url with a non-loopback endpoint: refuses (caught by run_preflight's endpoint_local before cmd_base_url's own body runs), stdout byte-empty" \
-  || bad "63. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "endpoint_local"; then
+  ok "63. base-url with a non-loopback endpoint: refuses (caught by run_preflight's endpoint_local before cmd_base_url's own body runs), stdout byte-empty"
+else
+  bad "63. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+fi
 unset HMD_FB_TEST_KEY
 
 # ── 64. anti-drift guard: base-url and check must NEVER disagree on exit
@@ -1972,26 +2192,32 @@ fb --repo "$R" check >/dev/null 2>&1; rc_check=$?
 fb --repo "$R" base-url >/dev/null 2>&1; rc_burl=$?
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-[ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 0 ] \
-  && ok "64a. ROUTE config: check and base-url agree (both exit $rc_check)" \
-  || bad "64a. check=$rc_check base-url=$rc_burl (want both 0)"
+if [ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 0 ]; then
+  ok "64a. ROUTE config: check and base-url agree (both exit $rc_check)"
+else
+  bad "64a. check=$rc_check base-url=$rc_burl (want both 0)"
+fi
 unset HMD_FB_TEST_KEY
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "switch"}'
 fb --repo "$R" check >/dev/null 2>&1; rc_check=$?
 fb --repo "$R" base-url >/dev/null 2>&1; rc_burl=$?
-[ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 1 ] \
-  && ok "64b. REFUSE config: check and base-url agree (both exit $rc_check)" \
-  || bad "64b. check=$rc_check base-url=$rc_burl (want both 1)"
+if [ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 1 ]; then
+  ok "64b. REFUSE config: check and base-url agree (both exit $rc_check)"
+else
+  bad "64b. check=$rc_check base-url=$rc_burl (want both 1)"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
 fb --repo "$R" check >/dev/null 2>&1; rc_check=$?
 fb --repo "$R" base-url >/dev/null 2>&1; rc_burl=$?
-[ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 2 ] \
-  && ok "64c. WAIT config: check and base-url agree (both exit $rc_check)" \
-  || bad "64c. check=$rc_check base-url=$rc_burl (want both 2)"
+if [ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 2 ]; then
+  ok "64c. WAIT config: check and base-url agree (both exit $rc_check)"
+else
+  bad "64c. check=$rc_check base-url=$rc_burl (want both 2)"
+fi
 
 # ── 65. token-file: a 0600 file -> stdout is its absolute path, exit 0. ────
 R="$(fresh_repo)"
@@ -2000,9 +2226,11 @@ printf 'not-a-real-token-value' > "$tokf"
 chmod 600 "$tokf"
 write_cfg "$R" '{"gateway_token_file": "'"$tokf"'"}'
 run_capture fb --repo "$R" token-file
-[ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "$tokf" ] \
-  && ok "65. token-file with a 0600 file prints its absolute path, exit 0" \
-  || bad "65. rc=$CAP_RC out='$CAP_OUT' want='$tokf' err='$CAP_ERR'"
+if [ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "$tokf" ]; then
+  ok "65. token-file with a 0600 file prints its absolute path, exit 0"
+else
+  bad "65. rc=$CAP_RC out='$CAP_OUT' want='$tokf' err='$CAP_ERR'"
+fi
 
 # ── 66. token-file: the file's CONTENTS never appear on stdout or stderr --
 # cmd_token_file only ever os.stat()s the file for its mode; it must never
@@ -2032,9 +2260,11 @@ printf 'not-a-real-token-value' > "$tokf"
 chmod 644 "$tokf"
 write_cfg "$R" '{"gateway_token_file": "'"$tokf"'"}'
 run_capture fb --repo "$R" token-file
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "0644" \
-  && ok "67. token-file refuses a 0644 file: exit non-zero, stdout byte-empty, stderr names the mode" \
-  || bad "67. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "0644"; then
+  ok "67. token-file refuses a 0644 file: exit non-zero, stdout byte-empty, stderr names the mode"
+else
+  bad "67. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+fi
 
 # ── 68. token-file: mode 0640 (group-readable only, no world bits) ALSO
 # refuses -- proves the check is `mode & 0o077` (any group OR world bit), not
@@ -2049,34 +2279,42 @@ printf 'not-a-real-token-value' > "$tokf"
 chmod 640 "$tokf"
 write_cfg "$R" '{"gateway_token_file": "'"$tokf"'"}'
 run_capture fb --repo "$R" token-file
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "0640" \
-  && ok "68. token-file refuses a 0640 (group-readable) file too -- the check is mode & 0o077, not world-bits-only" \
-  || bad "68. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "0640"; then
+  ok "68. token-file refuses a 0640 (group-readable) file too -- the check is mode & 0o077, not world-bits-only"
+else
+  bad "68. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+fi
 
 # ── 69. token-file: gateway_token_file unset/empty -> refuses, stdout
 # byte-empty. Two cases: key absent entirely, and key present but "". ──────
 R="$(fresh_repo)"
 write_cfg "$R" '{}'
 run_capture fb --repo "$R" token-file
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
-  && ok "69a. token-file with gateway_token_file entirely absent from config -> refuses, stdout byte-empty" \
-  || bad "69a. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ]; then
+  ok "69a. token-file with gateway_token_file entirely absent from config -> refuses, stdout byte-empty"
+else
+  bad "69a. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"gateway_token_file": ""}'
 run_capture fb --repo "$R" token-file
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
-  && ok "69b. token-file with gateway_token_file explicitly empty -> refuses, stdout byte-empty" \
-  || bad "69b. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ]; then
+  ok "69b. token-file with gateway_token_file explicitly empty -> refuses, stdout byte-empty"
+else
+  bad "69b. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+fi
 
 # ── 70. token-file: configured path does not exist on disk -> refuses,
 # stdout byte-empty. ────────────────────────────────────────────────────────
 R="$(fresh_repo)"
 write_cfg "$R" '{"gateway_token_file": "/nonexistent-heimdall-fallback-test/token/does/not/exist"}'
 run_capture fb --repo "$R" token-file
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "does not exist" \
-  && ok "70. token-file with a configured path that does not exist -> refuses, stdout byte-empty" \
-  || bad "70. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "does not exist"; then
+  ok "70. token-file with a configured path that does not exist -> refuses, stdout byte-empty"
+else
+  bad "70. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+fi
 
 # ── 71. token-file: a ~-prefixed path is expanded. Creates a real 0600 file
 # under $HOME (a fresh, uniquely-named directory, cleaned up immediately
@@ -2092,9 +2330,11 @@ R="$(fresh_repo)"
 write_cfg "$R" '{"gateway_token_file": "'"$rel"'"}'
 run_capture fb --repo "$R" token-file
 want="$(cd "$home_dir" && pwd)/token"
-[ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "$want" ] \
-  && ok "71. token-file expands a ~-prefixed gateway_token_file path" \
-  || bad "71. rc=$CAP_RC out='$CAP_OUT' want='$want' err='$CAP_ERR'"
+if [ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "$want" ]; then
+  ok "71. token-file expands a ~-prefixed gateway_token_file path"
+else
+  bad "71. rc=$CAP_RC out='$CAP_OUT' want='$want' err='$CAP_ERR'"
+fi
 rm -rf "$home_dir"
 
 # ── 72. anthropic_model_pinned: the NEW default-off baseline. With
@@ -2106,17 +2346,21 @@ R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
 unset ANTHROPIC_MODEL
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "ANTHROPIC_MODEL is not set" && echo "$out" | grep -qi "no fallback_model is configured" \
-  && ok "72a. ANTHROPIC_MODEL unset, fallback_model absent from config -> anthropic_model_pinned FAILS, names both halves" \
-  || bad "72a. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "ANTHROPIC_MODEL is not set" && echo "$out" | grep -qi "no fallback_model is configured"; then
+  ok "72a. ANTHROPIC_MODEL unset, fallback_model absent from config -> anthropic_model_pinned FAILS, names both halves"
+else
+  bad "72a. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "fallback_model": ""}'
 unset ANTHROPIC_MODEL
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "ANTHROPIC_MODEL is not set" && echo "$out" | grep -qi "no fallback_model is configured" \
-  && ok "72b. ANTHROPIC_MODEL unset, fallback_model explicitly '' -> anthropic_model_pinned FAILS, names both halves" \
-  || bad "72b. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "ANTHROPIC_MODEL is not set" && echo "$out" | grep -qi "no fallback_model is configured"; then
+  ok "72b. ANTHROPIC_MODEL unset, fallback_model explicitly '' -> anthropic_model_pinned FAILS, names both halves"
+else
+  bad "72b. got: $out"
+fi
 
 # ── 73. anthropic_model_pinned: ANTHROPIC_MODEL unset AND fallback_model set
 # to a safe, prefixed id -> PASSES. This is the whole point of the feature:
@@ -2126,9 +2370,11 @@ R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "fallback_model": "oc/big-pickle"}'
 unset ANTHROPIC_MODEL
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "OK.*anthropic_model_pinned" \
-  && ok "73. ANTHROPIC_MODEL unset, fallback_model='oc/big-pickle' (safe, prefixed) -> anthropic_model_pinned PASSES" \
-  || bad "73. got: $out"
+if echo "$out" | grep -q "OK.*anthropic_model_pinned"; then
+  ok "73. ANTHROPIC_MODEL unset, fallback_model='oc/big-pickle' (safe, prefixed) -> anthropic_model_pinned PASSES"
+else
+  bad "73. got: $out"
+fi
 
 # ── 74. anthropic_model_pinned: ANTHROPIC_MODEL unset AND fallback_model set
 # to an UNPREFIXED id -> FAILS. An unprefixed fallback_model is exactly the
@@ -2138,9 +2384,11 @@ R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "fallback_model": "big-pickle"}'
 unset ANTHROPIC_MODEL
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "no explicit provider/ prefix" \
-  && ok "74. ANTHROPIC_MODEL unset, fallback_model='big-pickle' (unprefixed) -> anthropic_model_pinned FAILS" \
-  || bad "74. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "no explicit provider/ prefix"; then
+  ok "74. ANTHROPIC_MODEL unset, fallback_model='big-pickle' (unprefixed) -> anthropic_model_pinned FAILS"
+else
+  bad "74. got: $out"
+fi
 
 # ── 75. anthropic_model_pinned: fallback_model='claude/sonnet' -> FAILS,
 # reason names Tier-1. Mutation-verified: with `if provider_segment in
@@ -2150,9 +2398,11 @@ R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "fallback_model": "claude/sonnet"}'
 unset ANTHROPIC_MODEL
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1" \
-  && ok "75. fallback_model='claude/sonnet' -> anthropic_model_pinned FAILS, names Tier-1" \
-  || bad "75. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1"; then
+  ok "75. fallback_model='claude/sonnet' -> anthropic_model_pinned FAILS, names Tier-1"
+else
+  bad "75. got: $out"
+fi
 
 # ── 76. anthropic_model_pinned: fallback_model='claude-web/anything' -> FAILS,
 # same Tier-1 boundary as test 75, covering the SECOND entry in
@@ -2162,9 +2412,11 @@ R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "fallback_model": "claude-web/anything"}'
 unset ANTHROPIC_MODEL
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1" \
-  && ok "76. fallback_model='claude-web/anything' -> anthropic_model_pinned FAILS, names Tier-1" \
-  || bad "76. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1"; then
+  ok "76. fallback_model='claude-web/anything' -> anthropic_model_pinned FAILS, names Tier-1"
+else
+  bad "76. got: $out"
+fi
 
 # ── 77. PRECEDENCE (load-bearing): an operator-set ANTHROPIC_MODEL outranks
 # fallback_model. With ANTHROPIC_MODEL set to an UNSAFE value and
@@ -2179,18 +2431,22 @@ write_cfg "$R" '{"state": "auto", "fallback_model": "oc/big-pickle"}'
 export ANTHROPIC_MODEL="big-pickle"
 out="$(fb --repo "$R" check)"
 unset ANTHROPIC_MODEL
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -q "ANTHROPIC_MODEL='big-pickle'" \
-  && ok "77a. ANTHROPIC_MODEL='big-pickle' (unsafe, unprefixed) + fallback_model='oc/big-pickle' (safe) -> still FAILS on ANTHROPIC_MODEL, never substitutes fallback_model" \
-  || bad "77a. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -q "ANTHROPIC_MODEL='big-pickle'"; then
+  ok "77a. ANTHROPIC_MODEL='big-pickle' (unsafe, unprefixed) + fallback_model='oc/big-pickle' (safe) -> still FAILS on ANTHROPIC_MODEL, never substitutes fallback_model"
+else
+  bad "77a. got: $out"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "fallback_model": "oc/big-pickle"}'
 export ANTHROPIC_MODEL="claude/x"
 out="$(fb --repo "$R" check)"
 unset ANTHROPIC_MODEL
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1" && echo "$out" | grep -q "ANTHROPIC_MODEL='claude/x'" \
-  && ok "77b. ANTHROPIC_MODEL='claude/x' (unsafe, explicit Tier-1) + fallback_model='oc/big-pickle' (safe) -> still FAILS on ANTHROPIC_MODEL, never substitutes fallback_model" \
-  || bad "77b. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1" && echo "$out" | grep -q "ANTHROPIC_MODEL='claude/x'"; then
+  ok "77b. ANTHROPIC_MODEL='claude/x' (unsafe, explicit Tier-1) + fallback_model='oc/big-pickle' (safe) -> still FAILS on ANTHROPIC_MODEL, never substitutes fallback_model"
+else
+  bad "77b. got: $out"
+fi
 
 # ── 78. anthropic_model_pinned: ANTHROPIC_MODEL=anthropic/claude-3-5-sonnet-
 # 20241022 -> PASSES. Provider segment is 'anthropic' (a paid API key), not
@@ -2205,9 +2461,11 @@ write_cfg "$R" '{"state": "auto"}'
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 out="$(fb --repo "$R" check)"
 unset ANTHROPIC_MODEL
-echo "$out" | grep -q "OK.*anthropic_model_pinned" \
-  && ok "78. ANTHROPIC_MODEL='anthropic/claude-3-5-sonnet-20241022' -> anthropic_model_pinned PASSES (provider segment, not a substring match)" \
-  || bad "78. got: $out"
+if echo "$out" | grep -q "OK.*anthropic_model_pinned"; then
+  ok "78. ANTHROPIC_MODEL='anthropic/claude-3-5-sonnet-20241022' -> anthropic_model_pinned PASSES (provider segment, not a substring match)"
+else
+  bad "78. got: $out"
+fi
 
 # ── 79. anthropic_model_pinned: case-insensitivity. fallback_model=
 # 'CLAUDE/sonnet' -> FAILS exactly like the lowercase form (test 75) -- the
@@ -2216,9 +2474,11 @@ R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "fallback_model": "CLAUDE/sonnet"}'
 unset ANTHROPIC_MODEL
 out="$(fb --repo "$R" check)"
-echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1" \
-  && ok "79. fallback_model='CLAUDE/sonnet' (mixed case) -> anthropic_model_pinned FAILS, case is not a bypass" \
-  || bad "79. got: $out"
+if echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1"; then
+  ok "79. fallback_model='CLAUDE/sonnet' (mixed case) -> anthropic_model_pinned FAILS, case is not a bypass"
+else
+  bad "79. got: $out"
+fi
 
 # ── 80. model: a safe configured fallback_model prints EXACTLY that id on
 # stdout, exit 0. Same stdout contract as base-url (tests 59-64) and for the
@@ -2227,9 +2487,11 @@ echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "
 R="$(fresh_repo)"
 write_cfg "$R" '{"fallback_model": "oc/big-pickle"}'
 run_capture fb --repo "$R" model
-[ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "oc/big-pickle" ] \
-  && ok "80. model with a safe configured fallback_model prints exactly that id, exit 0" \
-  || bad "80. rc=$CAP_RC out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "oc/big-pickle" ]; then
+  ok "80. model with a safe configured fallback_model prints exactly that id, exit 0"
+else
+  bad "80. rc=$CAP_RC out='$CAP_OUT' err='$CAP_ERR'"
+fi
 
 # ── 81. model: fallback_model absent/empty -> refuses, stdout BYTE-EMPTY.
 # Two cases, mirroring the token-file absent/empty pair (tests 69a/69b).
@@ -2239,16 +2501,20 @@ run_capture fb --repo "$R" model
 R="$(fresh_repo)"
 write_cfg "$R" '{}'
 run_capture fb --repo "$R" model
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
-  && ok "81a. model with fallback_model entirely absent from config -> refuses, stdout byte-empty" \
-  || bad "81a. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ]; then
+  ok "81a. model with fallback_model entirely absent from config -> refuses, stdout byte-empty"
+else
+  bad "81a. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+fi
 
 R="$(fresh_repo)"
 write_cfg "$R" '{"fallback_model": ""}'
 run_capture fb --repo "$R" model
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
-  && ok "81b. model with fallback_model explicitly empty -> refuses, stdout byte-empty" \
-  || bad "81b. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ]; then
+  ok "81b. model with fallback_model explicitly empty -> refuses, stdout byte-empty"
+else
+  bad "81b. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+fi
 
 # ── 82. model: fallback_model='claude/sonnet' -> refuses, stdout byte-empty,
 # stderr names Tier-1. `hmd route` must never export a Tier-1 id just
@@ -2256,17 +2522,21 @@ run_capture fb --repo "$R" model
 R="$(fresh_repo)"
 write_cfg "$R" '{"fallback_model": "claude/sonnet"}'
 run_capture fb --repo "$R" model
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -qi "Tier-1" \
-  && ok "82. model with fallback_model='claude/sonnet' -> refuses, stdout byte-empty, stderr names Tier-1" \
-  || bad "82. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -qi "Tier-1"; then
+  ok "82. model with fallback_model='claude/sonnet' -> refuses, stdout byte-empty, stderr names Tier-1"
+else
+  bad "82. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+fi
 
 # ── 83. model: fallback_model unprefixed -> refuses, stdout byte-empty. ────
 R="$(fresh_repo)"
 write_cfg "$R" '{"fallback_model": "big-pickle"}'
 run_capture fb --repo "$R" model
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
-  && ok "83. model with fallback_model='big-pickle' (unprefixed) -> refuses, stdout byte-empty" \
-  || bad "83. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ]; then
+  ok "83. model with fallback_model='big-pickle' (unprefixed) -> refuses, stdout byte-empty"
+else
+  bad "83. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+fi
 
 # ── 84. model NEVER reads ANTHROPIC_MODEL: it reports what hmd WOULD PIN,
 # not what is already set. With ANTHROPIC_MODEL set to a fully valid,
@@ -2278,9 +2548,11 @@ write_cfg "$R" '{"fallback_model": ""}'
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 run_capture fb --repo "$R" model
 unset ANTHROPIC_MODEL
-[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
-  && ok "84. model with ANTHROPIC_MODEL set (valid) but fallback_model empty -> still refuses, stdout byte-empty (model never reads ANTHROPIC_MODEL)" \
-  || bad "84. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+if [ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ]; then
+  ok "84. model with ANTHROPIC_MODEL set (valid) but fallback_model empty -> still refuses, stdout byte-empty (model never reads ANTHROPIC_MODEL)"
+else
+  bad "84. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+fi
 
 
 # ── 85. LIVENESS PROBE IS HTTP, NOT TCP. ──────────────────────────────────
@@ -2340,19 +2612,25 @@ print("wedged=%s" % reachable("http://127.0.0.1:%d" % ls.getsockname()[1]))
 print("dead=%s" % reachable("http://127.0.0.1:1"))
 PYPROBE
 )"
-printf '%s' "$PROBE_OUT" | grep -q '^live200=True$' \
+if printf '%s' "$PROBE_OUT" | grep -q '^live200=True$' \
   && printf '%s' "$PROBE_OUT" | grep -q '^live401=True$' \
-  && printf '%s' "$PROBE_OUT" | grep -q '^live307=True$' \
-  && ok "85a. liveness probe: a server answering 200/401/307 is reachable (non-2xx still proves liveness)" \
-  || bad "85a. probe output: $PROBE_OUT"
+  && printf '%s' "$PROBE_OUT" | grep -q '^live307=True$'; then
+  ok "85a. liveness probe: a server answering 200/401/307 is reachable (non-2xx still proves liveness)"
+else
+  bad "85a. probe output: $PROBE_OUT"
+fi
 
-printf '%s' "$PROBE_OUT" | grep -q '^wedged=False$' \
-  && ok "85b. liveness probe: a server that accepts TCP but never answers HTTP is NOT reachable (old TCP-only probe returned True here)" \
-  || bad "85b. probe output: $PROBE_OUT"
+if printf '%s' "$PROBE_OUT" | grep -q '^wedged=False$'; then
+  ok "85b. liveness probe: a server that accepts TCP but never answers HTTP is NOT reachable (old TCP-only probe returned True here)"
+else
+  bad "85b. probe output: $PROBE_OUT"
+fi
 
-printf '%s' "$PROBE_OUT" | grep -q '^dead=False$' \
-  && ok "85c. liveness probe: nothing bound -> not reachable" \
-  || bad "85c. probe output: $PROBE_OUT"
+if printf '%s' "$PROBE_OUT" | grep -q '^dead=False$'; then
+  ok "85c. liveness probe: nothing bound -> not reachable"
+else
+  bad "85c. probe output: $PROBE_OUT"
+fi
 
 # ── 86. The probe is BOUNDED. A wedged server must not hang the gate. ─────
 # PARALLEL-FLAKY (root-caused 2026-09-10): this measures REAL wall-clock time around a
@@ -2381,11 +2659,13 @@ print("rc=%s elapsed=%.2f" % (r, time.time() - t))
 PYBOUND
 )"
 BOUND_SECS="$(printf '%s' "$BOUND_OUT" | sed -n 's/.*elapsed=\([0-9.]*\).*/\1/p')"
-printf '%s' "$BOUND_OUT" | grep -q '^rc=False' \
+if printf '%s' "$BOUND_OUT" | grep -q '^rc=False' \
   && [ -n "$BOUND_SECS" ] \
-  && awk -v s="$BOUND_SECS" 'BEGIN{exit !(s < 30)}' \
-  && ok "86. liveness probe honours HEIMDALL_FALLBACK_PROBE_TIMEOUT: wedged server refused in ${BOUND_SECS}s, not hung" \
-  || bad "86. bound output: $BOUND_OUT"
+  && awk -v s="$BOUND_SECS" 'BEGIN{exit !(s < 30)}'; then
+  ok "86. liveness probe honours HEIMDALL_FALLBACK_PROBE_TIMEOUT: wedged server refused in ${BOUND_SECS}s, not hung"
+else
+  bad "86. bound output: $BOUND_OUT"
+fi
 
 
 # ── 87. The liveness probe is IMMUNE to ambient proxy variables. ──────────
@@ -2420,13 +2700,17 @@ print("live=%s" % ns["_endpoint_reachable"]("http://127.0.0.1:%d" % srv.server_a
 print("dead=%s" % ns["_endpoint_reachable"]("http://127.0.0.1:1"))
 PYPROXY
 )"
-printf '%s' "$PROXY_OUT" | grep -q '^live=True$' \
-  && ok "87a. liveness probe ignores ambient proxy vars: a live loopback server stays reachable with http_proxy/HTTPS_PROXY/ALL_PROXY set to a dead proxy" \
-  || bad "87a. proxy output: $PROXY_OUT"
+if printf '%s' "$PROXY_OUT" | grep -q '^live=True$'; then
+  ok "87a. liveness probe ignores ambient proxy vars: a live loopback server stays reachable with http_proxy/HTTPS_PROXY/ALL_PROXY set to a dead proxy"
+else
+  bad "87a. proxy output: $PROXY_OUT"
+fi
 
-printf '%s' "$PROXY_OUT" | grep -q '^dead=False$' \
-  && ok "87b. proxy immunity does not blanket-pass: nothing bound is still unreachable with the same vars set" \
-  || bad "87b. proxy output: $PROXY_OUT"
+if printf '%s' "$PROXY_OUT" | grep -q '^dead=False$'; then
+  ok "87b. proxy immunity does not blanket-pass: nothing bound is still unreachable with the same vars set"
+else
+  bad "87b. proxy output: $PROXY_OUT"
+fi
 
 # ── 88. PHASE 5 (2026-09-05): an extra/unknown window ALONE crosses --
 # five_hour/seven_day both genuinely under, but a THIRD window (e.g. a
@@ -2456,9 +2740,11 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 unset HMD_FB_TEST_KEY
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: extra:session)" \
-  && ok "88. PHASE 5: an extra/unknown window ALONE crossing (five_hour/seven_day both under) still reaches ROUTE end-to-end, and [INFO] names it -- the literal defect this wave closes" \
-  || bad "88. got rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: extra:session)"; then
+  ok "88. PHASE 5: an extra/unknown window ALONE crossing (five_hour/seven_day both under) still reaches ROUTE end-to-end, and [INFO] names it -- the literal defect this wave closes"
+else
+  bad "88. got rc=$rc out='$out'"
+fi
 
 # ── 89. PHASE 5: the HONEST 'under' wording. Before this wave, a genuine
 # 'under' verdict rendered as a flat, unqualified "under the pre-exhaustion
@@ -2476,14 +2762,16 @@ HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unde
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-[ "$rc" -eq 2 ] \
+if [ "$rc" -eq 2 ] \
   && echo "$out" | grep -q "VERDICT: WAIT" \
   && echo "$out" | grep -q "five_hour" \
   && echo "$out" | grep -q "seven_day" \
   && ! echo "$out" | grep -qi "could not be determined" \
-  && ! echo "$out" | grep -q "(window:" \
-  && ok "89. PHASE 5: an honest 'under' names the windows_seen (five_hour, seven_day) instead of an unqualified 'under the pre-exhaustion threshold'" \
-  || bad "89. got rc=$rc out='$out'"
+  && ! echo "$out" | grep -q "(window:"; then
+  ok "89. PHASE 5: an honest 'under' names the windows_seen (five_hour, seven_day) instead of an unqualified 'under the pre-exhaustion threshold'"
+else
+  bad "89. got rc=$rc out='$out'"
+fi
 
 # ── 90. PHASE 5 acceptance pin (the literal production incident): 'under'
 # with NO windows_seen at all -- heimdall-session-usage saw no rate-limit
@@ -2499,13 +2787,15 @@ HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unde
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-[ "$rc" -eq 2 ] \
+if [ "$rc" -eq 2 ] \
   && echo "$out" | grep -q "VERDICT: WAIT" \
   && echo "$out" | grep -qi "BLIND" \
   && ! echo "$out" | grep -qi "could not be determined" \
-  && ! echo "$out" | grep -q "(window:" \
-  && ok "90. PHASE 5 acceptance pin: 'under' with no windows_seen at all reads BLIND, never a confident bare 'under the pre-exhaustion threshold' -- the exact production incident (session-limit 429 while this line read 'under')" \
-  || bad "90. got rc=$rc out='$out'"
+  && ! echo "$out" | grep -q "(window:"; then
+  ok "90. PHASE 5 acceptance pin: 'under' with no windows_seen at all reads BLIND, never a confident bare 'under the pre-exhaustion threshold' -- the exact production incident (session-limit 429 while this line read 'under')"
+else
+  bad "90. got rc=$rc out='$out'"
+fi
 
 # ── 91. PHASE 5: the window validator accepts the ADDITIVE combo form (a
 # base window already crossed + an extra window also crossed), the same
@@ -2530,9 +2820,11 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 unset HMD_FB_TEST_KEY
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: five_hour+extra:session)" \
-  && ok "91. PHASE 5: additive window combo 'five_hour+extra:session' surfaces in full -- upgrade is additive to the old fixed allow-list, not a narrowing" \
-  || bad "91. got rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: five_hour+extra:session)"; then
+  ok "91. PHASE 5: additive window combo 'five_hour+extra:session' surfaces in full -- upgrade is additive to the old fixed allow-list, not a narrowing"
+else
+  bad "91. got rc=$rc out='$out'"
+fi
 
 # ── 92. PHASE 5: the window validator still FAILS CLOSED on an adversarial
 # window string -- an external, unsanitized rate_limits dict key reaching
@@ -2561,9 +2853,11 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 unset HMD_FB_TEST_KEY
-[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && ! echo "$out" | grep -q "(window:" \
-  && ok "92. PHASE 5: an adversarial path-traversal-shaped window token fails closed to no window shown at all (never trusted onto the printed line)" \
-  || bad "92. got rc=$rc out='$out'"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && ! echo "$out" | grep -q "(window:"; then
+  ok "92. PHASE 5: an adversarial path-traversal-shaped window token fails closed to no window shown at all (never trusted onto the printed line)"
+else
+  bad "92. got rc=$rc out='$out'"
+fi
 
 # ── 93. PHASE 5: windows_seen itself fails closed on malformed input (not a
 # list) -- degrades to the same BLIND wording as a genuinely absent
@@ -2575,9 +2869,11 @@ HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unde
 export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
-[ "$rc" -eq 2 ] && echo "$out" | grep -qi "BLIND" && ! echo "$out" | grep -qi "could not be determined" \
-  && ok "93. PHASE 5: a malformed (non-list) windows_seen degrades to the same honest BLIND wording, never a crash" \
-  || bad "93. got rc=$rc out='$out'"
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "BLIND" && ! echo "$out" | grep -qi "could not be determined"; then
+  ok "93. PHASE 5: a malformed (non-list) windows_seen degrades to the same honest BLIND wording, never a crash"
+else
+  bad "93. got rc=$rc out='$out'"
+fi
 
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"

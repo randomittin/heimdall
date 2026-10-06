@@ -84,8 +84,8 @@ if [ ! -x "$UI" ]; then
   exit 0
 fi
 if ! grep -q '"panel"' "$UI" 2>/dev/null || [ ! -f "$REPO/bin/lib/companion_ui_panels.py" ]; then
-  printf '  SKIP the `panel` subcommand is not wired yet\n'
-  printf '       (need: a `panel` guard clause in %s AND %s -- PLAN L450-455)\n' "$UI" "$REPO/bin/lib/companion_ui_panels.py"
+  printf "  SKIP the \`panel\` subcommand is not wired yet\n"
+  printf "       (need: a \`panel\` guard clause in %s AND %s -- PLAN L450-455)\n" "$UI" "$REPO/bin/lib/companion_ui_panels.py"
   printf '       the author has not landed Wave 4 (companion-ui-panels); nothing to grade\n'
   printf '\n0 passed, 0 failed, 1 skipped (Wave 4 job panels: author not landed)\n'
   exit 0
@@ -240,7 +240,7 @@ gone_within() {
 
 # Names of every regular file currently in the panels dir (sorted), for
 # "nothing was written" assertions.
-panel_files() { ( cd "$PANELS" 2>/dev/null && ls -1 2>/dev/null | sort ) || true; }
+panel_files() { ( cd "$PANELS" 2>/dev/null && shopt -s nullglob && for f in *; do printf '%s\n' "$f"; done | sort ) || true; }
 
 contains_sentinel() {
   local file="$1" s
@@ -312,6 +312,7 @@ fi
 # PLAN L299-342: the closed set and each type's data shape; L713: reflected in
 # /api/state within one poll cycle; L516-517: entry keys.
 declare -a T_NAMES=(kv table number timeseries bars markdown log-tail)
+# shellcheck disable=SC2016  # literal JSON fixtures: the markdown backticks in the markdown case must reach the CLI unexpanded
 declare -a T_DATA=(
   '{"rows":[["Branch","main"],["HEAD","abc1234"],["Phase","fixture"]]}'
   '{"columns":["gate","state"],"rows":[["tests","pass"],["lint","running"]]}'
@@ -379,10 +380,12 @@ fi
 # (set last, 1.9) is only seconds old at the snapshot that served it, so it qualifies unless the
 # machine stalled for 25s+ between that set and the poll that served it -- and then this FAILS
 # loudly (empty selection) rather than passing on nothing.
+# shellcheck disable=SC2016  # jq program: $ts is a jq variable, not a shell expansion
 FRESH_RT='.ts as $ts | [.panels[] | select(.id|startswith("rt-")) | select(($ts - .updated_at) <= 25)]'
 # The failure rendering is built in a variable on purpose: inline as "...map({id,stale,age:(\$ts ...)})"
 # inside $( ) inside bad()'s quoted argument, macOS /bin/bash 3.2 brace-expands the object and jq is
 # handed broken programs, so the message came out blank.
+# shellcheck disable=SC2016  # jq program: $ts is a jq variable, not a shell expansion
 FRESH_RT_DIAG="$FRESH_RT"' | map({id,stale,age:($ts - .updated_at)})'
 if jq -e "$FRESH_RT | length > 0 and all(.stale == false)" "$STATE" >/dev/null 2>&1; then
   ok "1.11 freshly set panels (server-reported age <= 25s) are stale==false (L370-373)"
