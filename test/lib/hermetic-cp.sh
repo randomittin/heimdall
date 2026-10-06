@@ -102,12 +102,12 @@ PYEOF
 hermetic_cp_selfcheck() {
   echo
   echo "CP — the stand-in control plane the add path probes (hermetic: loopback only)"
-  [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEIMDALL_DEFAULT_CP_URL/readyz" 2>/dev/null)" = "200" ] \
-    && ok "the stand-in answers 200 on /readyz — the probe the invariants make can succeed offline" \
-    || bad "the stand-in did not answer 200 on /readyz — every add below would fail closed for the wrong reason"
-  [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEIMDALL_DEFAULT_CP_URL/not-readyz" 2>/dev/null)" = "404" ] \
-    && ok "…and is not a wall of 200s: any other path answers 404, so the probe is reading /readyz specifically" \
-    || bad "the stand-in answers 200 on a path that is not /readyz — it cannot distinguish a real probe"
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEIMDALL_DEFAULT_CP_URL/readyz" 2>/dev/null)" = "200" ]; then
+    ok "the stand-in answers 200 on /readyz — the probe the invariants make can succeed offline"
+  else bad "the stand-in did not answer 200 on /readyz — every add below would fail closed for the wrong reason"; fi
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEIMDALL_DEFAULT_CP_URL/not-readyz" 2>/dev/null)" = "404" ]; then
+    ok "…and is not a wall of 200s: any other path answers 404, so the probe is reading /readyz specifically"
+  else bad "the stand-in answers 200 on a path that is not /readyz — it cannot distinguish a real probe"; fi
 }
 
 # A loopback URL whose port nothing listens on, for a FAIL-CLOSED arm: run the

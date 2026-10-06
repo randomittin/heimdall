@@ -49,6 +49,8 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 g() { local d="$1"; shift; git -C "$d" -c user.name=fixture -c user.email=fixture@example.com -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"; }
 commit_all() { g "$1" add -A >/dev/null && g "$1" commit -q -m "$2"; }
 sha() { g "$1" rev-parse "$2"; }
+# the first $2 names (not paths) left in dir $1, for a failure message
+leftovers() { find "$1" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | head -n "$2" | tr '\n' ' '; }
 
 # ── fixture repo W: commit 1 = a clean settlement webhook, commit 2 = the buggy one ──────────────
 W="$TMP/w"; mkdir -p "$W"; git -C "$W" init -q
@@ -60,7 +62,7 @@ commit_all "$W" "buggy"
 C2="$(sha "$W" HEAD)"
 g "$W" diff --binary --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ "$C1" "$C2" >"$TMP/c1-c2.patch"
 g "$W" diff --binary --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ "$C2" "$C1" >"$TMP/c2-c1.patch"
-[ -s "$TMP/c1-c2.patch" ] && ok "fixture: the clean->buggy patch is non-empty" || bad "fixture patch empty"
+if [ -s "$TMP/c1-c2.patch" ]; then ok "fixture: the clean->buggy patch is non-empty"; else bad "fixture patch empty"; fi
 
 # drive '<task json>' -> DOUT: start, events, claim in one go (or the AdapterError as {error,detail})
 cat >"$TMP/drive.py" <<'PY'
@@ -87,33 +89,40 @@ task() {  # task <repo> <base> <options-json>
 echo "[A] gitdiff: patch / patch_file / head"
 
 drive "$(task "$W" "$C1" "$(jq -cn --rawfile p "$TMP/c1-c2.patch" '{gitdiff:{patch:$p}}')")"
-[ "$DRC" -eq 0 ] && jq -e --rawfile p "$TMP/c1-c2.patch" '.claim.claim=="done" and .claim.diff==$p and .claim.head_sha==null' <<<"$DOUT" >/dev/null \
-  && ok "patch source: done, the diff is the patch verbatim, head_sha is null (no commit holds a bare patch)" || bad "patch source wrong (rc=$DRC): $(head -c 300 <<<"$DOUT") $(head -c 200 "$TMP/drive.err")"
-jq -e '(.events|length)>=3 and .events[0].kind=="status" and .events[0].data.state=="started" and .events[-1].kind=="status" and .events[-1].data.state=="done"' <<<"$DOUT" >/dev/null \
-  && ok "events: started first, terminal done last, at least one event between" || bad "event framing wrong: $(jq -c '[.events[]|[.kind,.data.state]]' <<<"$DOUT")"
-jq -e '[.events[]|select(.kind=="test")]|length==0' <<<"$DOUT" >/dev/null \
-  && ok "no test events: gitdiff cannot observe the change being tested, so it never invents one" || bad "gitdiff emitted a test event"
-jq -e '.run_id|test("^gitdiff-[0-9a-f]{12}$")' <<<"$DOUT" >/dev/null && ok "run id is gitdiff-<12 hex>" || bad "run id shape: $(jq -r .run_id <<<"$DOUT")"
+if [ "$DRC" -eq 0 ] && jq -e --rawfile p "$TMP/c1-c2.patch" '.claim.claim=="done" and .claim.diff==$p and .claim.head_sha==null' <<<"$DOUT" >/dev/null; then
+  ok "patch source: done, the diff is the patch verbatim, head_sha is null (no commit holds a bare patch)"
+else bad "patch source wrong (rc=$DRC): $(head -c 300 <<<"$DOUT") $(head -c 200 "$TMP/drive.err")"; fi
+if jq -e '(.events|length)>=3 and .events[0].kind=="status" and .events[0].data.state=="started" and .events[-1].kind=="status" and .events[-1].data.state=="done"' <<<"$DOUT" >/dev/null; then
+  ok "events: started first, terminal done last, at least one event between"
+else bad "event framing wrong: $(jq -c '[.events[]|[.kind,.data.state]]' <<<"$DOUT")"; fi
+if jq -e '[.events[]|select(.kind=="test")]|length==0' <<<"$DOUT" >/dev/null; then
+  ok "no test events: gitdiff cannot observe the change being tested, so it never invents one"
+else bad "gitdiff emitted a test event"; fi
+if jq -e '.run_id|test("^gitdiff-[0-9a-f]{12}$")' <<<"$DOUT" >/dev/null; then ok "run id is gitdiff-<12 hex>"; else bad "run id shape: $(jq -r .run_id <<<"$DOUT")"; fi
 
 drive "$(task "$W" "$C1" "$(jq -cn --arg f "$TMP/c1-c2.patch" '{gitdiff:{patch_file:$f}}')")"
-[ "$DRC" -eq 0 ] && jq -e --rawfile p "$TMP/c1-c2.patch" '.claim.claim=="done" and .claim.diff==$p and .claim.head_sha==null' <<<"$DOUT" >/dev/null \
-  && ok "patch_file source: same claim as the inline patch" || bad "patch_file source wrong: $(head -c 300 <<<"$DOUT")"
+if [ "$DRC" -eq 0 ] && jq -e --rawfile p "$TMP/c1-c2.patch" '.claim.claim=="done" and .claim.diff==$p and .claim.head_sha==null' <<<"$DOUT" >/dev/null; then
+  ok "patch_file source: same claim as the inline patch"
+else bad "patch_file source wrong: $(head -c 300 <<<"$DOUT")"; fi
 
 drive "$(task "$W" "$C1" "$(jq -cn --arg h "$C2" '{gitdiff:{head:$h}}')")"
-[ "$DRC" -eq 0 ] && jq -e --arg h "$C2" '.claim.claim=="done" and .claim.head_sha==$h and (.claim.diff|startswith("diff --git "))' <<<"$DOUT" >/dev/null \
-  && ok "head source: done, head_sha is the resolved head commit, the diff is git's own" || bad "head source wrong: $(head -c 300 <<<"$DOUT")"
+if [ "$DRC" -eq 0 ] && jq -e --arg h "$C2" '.claim.claim=="done" and .claim.head_sha==$h and (.claim.diff|startswith("diff --git "))' <<<"$DOUT" >/dev/null; then
+  ok "head source: done, head_sha is the resolved head commit, the diff is git's own"
+else bad "head source wrong: $(head -c 300 <<<"$DOUT")"; fi
 
 drive "$(task "$W" "$C1" "$(jq -cn --arg h "$C2" '{gitdiff:{head:"HEAD"}}')")"
-[ "$DRC" -eq 0 ] && jq -e --arg h "$C2" '.claim.head_sha==$h' <<<"$DOUT" >/dev/null \
-  && ok "head given as a ref (HEAD) is resolved to its full sha" || bad "ref head not resolved: $(head -c 300 <<<"$DOUT")"
+if [ "$DRC" -eq 0 ] && jq -e --arg h "$C2" '.claim.head_sha==$h' <<<"$DOUT" >/dev/null; then
+  ok "head given as a ref (HEAD) is resolved to its full sha"
+else bad "ref head not resolved: $(head -c 300 <<<"$DOUT")"; fi
 
 drive "$(task "$W" "$C1" "$(jq -cn --arg f "$TMP/c1-c2.patch" '{other:{x:1}, gitdiff:{patch_file:$f}}')")"
-[ "$DRC" -eq 0 ] && jq -e '.claim.claim=="done"' <<<"$DOUT" >/dev/null \
-  && ok "options for another adapter are ignored (a task is portable across adapters)" || bad "foreign options rejected: $(head -c 200 <<<"$DOUT")"
+if [ "$DRC" -eq 0 ] && jq -e '.claim.claim=="done"' <<<"$DOUT" >/dev/null; then
+  ok "options for another adapter are ignored (a task is portable across adapters)"
+else bad "foreign options rejected: $(head -c 200 <<<"$DOUT")"; fi
 
 # the repo is left alone and no temp dir is left behind
-[ -z "$(g "$W" status --porcelain)" ] && [ "$(sha "$W" HEAD)" = "$C2" ] && ok "the caller's repo is untouched (clean status, same HEAD)" || bad "repo modified"
-[ -z "$(ls -A "$TMPDIR")" ] && ok "no adapter temp dir is left behind" || bad "temp dirs leaked: $(ls "$TMPDIR" | head -3 | tr '\n' ' ')"
+if [ -z "$(g "$W" status --porcelain)" ] && [ "$(sha "$W" HEAD)" = "$C2" ]; then ok "the caller's repo is untouched (clean status, same HEAD)"; else bad "repo modified"; fi
+if [ -z "$(ls -A "$TMPDIR")" ]; then ok "no adapter temp dir is left behind"; else bad "temp dirs leaked: $(leftovers "$TMPDIR" 3)"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [B] refusals: typed errors, nothing escapes
@@ -138,8 +147,8 @@ refuse "a patch_file that does not exist"    '{"gitdiff":{"patch_file":"/nonexis
 refuse "a head that is not in the repo"      '{"gitdiff":{"head":"no-such-ref"}}'                                                            unknown_head
 refuse "a head identical to the base (no change)" "$(jq -cn --arg h "$C1" '{gitdiff:{head:$h}}')"                                           empty_diff
 HMD_ADAPTER_MAX_DIFF_BYTES=50 refuse "a diff over the size cap" "$(jq -cn --rawfile p "$TMP/c1-c2.patch" '{gitdiff:{patch:$p}}')"          too_large
-[ -z "$(find "$TMP" -name 'escape*.txt' -o -name 'z.txt' | head -1)" ] && ok "no refused patch wrote a file anywhere under the sandbox" || bad "a refused patch wrote a file: $(find "$TMP" -name 'escape*.txt' -o -name 'z.txt' | head -2)"
-[ -z "$(ls -A "$TMPDIR")" ] && ok "refusals leave no adapter temp dir behind" || bad "temp dirs leaked after refusals: $(ls "$TMPDIR" | head -3 | tr '\n' ' ')"
+if [ -z "$(find "$TMP" -name 'escape*.txt' -o -name 'z.txt' | head -1)" ]; then ok "no refused patch wrote a file anywhere under the sandbox"; else bad "a refused patch wrote a file: $(find "$TMP" -name 'escape*.txt' -o -name 'z.txt' | head -2)"; fi
+if [ -z "$(ls -A "$TMPDIR")" ]; then ok "refusals leave no adapter temp dir behind"; else bad "temp dirs leaked after refusals: $(leftovers "$TMPDIR" 3)"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [C] the base tree is the committed bytes, not an archive view of them
@@ -148,15 +157,16 @@ echo "[C] gitdiff: export-ignore does not hide files from the patch"
 
 X="$TMP/x"; mkdir -p "$X/tests" "$X/src"; git -C "$X" init -q
 printf 'tests export-ignore\n*.md export-subst\n' >"$X/.gitattributes"
-printf 'one\n' >"$X/tests/t.txt"; printf 'version $Format:%%h$\n' >"$X/src/v.md"
+printf 'one\n' >"$X/tests/t.txt"; printf "version \$Format:%%h\$\n" >"$X/src/v.md"
 commit_all "$X" "base"
 XB="$(sha "$X" HEAD)"
-printf 'one\ntwo\n' >"$X/tests/t.txt"; printf 'version $Format:%%h$\nmore\n' >"$X/src/v.md"
+printf 'one\ntwo\n' >"$X/tests/t.txt"; printf "version \$Format:%%h\$\nmore\n" >"$X/src/v.md"
 commit_all "$X" "edit"
 XH="$(sha "$X" HEAD)"
 drive "$(jq -cn --arg repo "$X" --arg base "$XB" --arg h "$XH" '{id:"x-1", prompt:"", repo:$repo, base_sha:$base, options:{gitdiff:{head:$h}}}')"
-[ "$DRC" -eq 0 ] && jq -e '.claim.claim=="done" and (.claim.diff|contains("tests/t.txt")) and (.claim.diff|contains("src/v.md"))' <<<"$DOUT" >/dev/null \
-  && ok "a patch touching export-ignore'd and export-subst'd files applies to the exported base" || bad "export-ignore regression: $(head -c 300 <<<"$DOUT")"
+if [ "$DRC" -eq 0 ] && jq -e '.claim.claim=="done" and (.claim.diff|contains("tests/t.txt")) and (.claim.diff|contains("src/v.md"))' <<<"$DOUT" >/dev/null; then
+  ok "a patch touching export-ignore'd and export-subst'd files applies to the exported base"
+else bad "export-ignore regression: $(head -c 300 <<<"$DOUT")"; fi
 
 # git apply inside a repository silently skips every path outside its own subdirectory: with the temp
 # dir INSIDE a repo, a patch that cannot apply must still be refused, not waved through
@@ -164,7 +174,7 @@ mkdir -p "$W/inner-tmp"
 OLDTMP="$TMPDIR"; export TMPDIR="$W/inner-tmp"
 refuse "a non-applying patch while TMPDIR sits inside a git repository (apply must see a plain directory)" "$(jq -cn --rawfile p "$TMP/c2-c1.patch" '{gitdiff:{patch:$p}}')" bad_diff
 drive "$(task "$W" "$C1" "$(jq -cn --rawfile p "$TMP/c1-c2.patch" '{gitdiff:{patch:$p}}')")"
-[ "$DRC" -eq 0 ] && jq -e '.claim.claim=="done"' <<<"$DOUT" >/dev/null && ok "an applying patch is still accepted with TMPDIR inside a repository" || bad "TMPDIR-in-repo broke a good patch: $(head -c 200 <<<"$DOUT")"
+if [ "$DRC" -eq 0 ] && jq -e '.claim.claim=="done"' <<<"$DOUT" >/dev/null; then ok "an applying patch is still accepted with TMPDIR inside a repository"; else bad "TMPDIR-in-repo broke a good patch: $(head -c 200 <<<"$DOUT")"; fi
 export TMPDIR="$OLDTMP"; rm -rf "$W/inner-tmp"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -186,27 +196,32 @@ PY
 spec() { SOUT="$(python3 "$TMP/spec.py" "$1" "$2" 2>"$TMP/spec.err")"; }
 
 spec "$W" "$TMP/c1-c2.patch"
-jq -e --arg base "$C2" --arg f "$TMP/c1-c2.patch" '.base_sha==$base and .options.gitdiff.patch_file==$f and .repo=="'"$W"'"' <<<"$SOUT" >/dev/null \
-  && ok "a patch file is applied on top of the repo's HEAD" || bad "patch-file spec wrong: $SOUT"
+if jq -e --arg base "$C2" --arg f "$TMP/c1-c2.patch" '.base_sha==$base and .options.gitdiff.patch_file==$f and .repo=="'"$W"'"' <<<"$SOUT" >/dev/null; then
+  ok "a patch file is applied on top of the repo's HEAD"
+else bad "patch-file spec wrong: $SOUT"; fi
 spec "$W" "$C1..$C2"
-jq -e --arg b "$C1" --arg h "$C2" '.base_sha==$b and .options.gitdiff.head==$h' <<<"$SOUT" >/dev/null \
-  && ok "A..B: base is A, head is B, both full shas" || bad "range spec wrong: $SOUT"
+if jq -e --arg b "$C1" --arg h "$C2" '.base_sha==$b and .options.gitdiff.head==$h' <<<"$SOUT" >/dev/null; then
+  ok "A..B: base is A, head is B, both full shas"
+else bad "range spec wrong: $SOUT"; fi
 spec "$W" "HEAD~1..HEAD"
-jq -e --arg b "$C1" --arg h "$C2" '.base_sha==$b and .options.gitdiff.head==$h' <<<"$SOUT" >/dev/null \
-  && ok "A..B with refs (HEAD~1..HEAD) resolves to full shas" || bad "ref range spec wrong: $SOUT"
+if jq -e --arg b "$C1" --arg h "$C2" '.base_sha==$b and .options.gitdiff.head==$h' <<<"$SOUT" >/dev/null; then
+  ok "A..B with refs (HEAD~1..HEAD) resolves to full shas"
+else bad "ref range spec wrong: $SOUT"; fi
 g "$W" branch -q side "$C1"
 spec "$W" "side...HEAD"
-jq -e --arg b "$C1" --arg h "$C2" '.base_sha==$b and .options.gitdiff.head==$h' <<<"$SOUT" >/dev/null \
-  && ok "A...B: base is merge-base(A,B)" || bad "triple-dot spec wrong: $SOUT"
+if jq -e --arg b "$C1" --arg h "$C2" '.base_sha==$b and .options.gitdiff.head==$h' <<<"$SOUT" >/dev/null; then
+  ok "A...B: base is merge-base(A,B)"
+else bad "triple-dot spec wrong: $SOUT"; fi
 spec "$W" "-"
-jq -e --arg base "$C2" '.base_sha==$base and .options.gitdiff.patch=="STDIN-PATCH\n"' <<<"$SOUT" >/dev/null \
-  && ok "'-' reads the patch through the caller's reader, never the process stdin itself" || bad "stdin spec wrong: $SOUT"
+if jq -e --arg base "$C2" '.base_sha==$base and .options.gitdiff.patch=="STDIN-PATCH\n"' <<<"$SOUT" >/dev/null; then
+  ok "'-' reads the patch through the caller's reader, never the process stdin itself"
+else bad "stdin spec wrong: $SOUT"; fi
 spec "$W" "$TMP/no-such.patch"
-jq -e '.error=="bad_task"' <<<"$SOUT" >/dev/null && ok "a spec that is neither a file nor a range is bad_task" || bad "bad spec accepted: $SOUT"
+if jq -e '.error=="bad_task"' <<<"$SOUT" >/dev/null; then ok "a spec that is neither a file nor a range is bad_task"; else bad "bad spec accepted: $SOUT"; fi
 spec "$W" "nope..HEAD"
-jq -e '.error=="bad_task"' <<<"$SOUT" >/dev/null && ok "a range with an unresolvable side is bad_task" || bad "bad range accepted: $SOUT"
+if jq -e '.error=="bad_task"' <<<"$SOUT" >/dev/null; then ok "a range with an unresolvable side is bad_task"; else bad "bad range accepted: $SOUT"; fi
 spec "$TMP" "HEAD~1..HEAD"
-jq -e '.error=="bad_task"' <<<"$SOUT" >/dev/null && ok "a directory that is not a git repository is bad_task" || bad "non-repo accepted: $SOUT"
+if jq -e '.error=="bad_task"' <<<"$SOUT" >/dev/null; then ok "a directory that is not a git repository is bad_task"; else bad "non-repo accepted: $SOUT"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [E] hmd attack --diff, end to end
@@ -216,26 +231,32 @@ echo "[E] hmd attack --diff"
 attack() { AOUT="$TMP/attack.out"; AERR="$TMP/attack.err"; "$HMD" attack "$@" >"$AOUT" 2>"$AERR" </dev/null; ARC=$?; }
 
 attack "$W" --diff "$C1..$C2" --json --yes
-[ "$ARC" -eq 1 ] && jq -e --arg h "$C2" '.verdict=="DENIED" and .target.kind=="diff" and .target.ref=="'"$C1..$C2"'" and .target.head_sha==$h and (.findings|length)>=1 and .agent.name=="none"' "$AOUT" >/dev/null 2>&1 \
-  && ok "clean->buggy range: DENIED (exit 1), target.kind=diff, ref is the spec, head_sha is the head commit" || bad "range attack wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"
-jq -e '.findings[0].counterexample.repro_cmd|startswith("hmd attack ") and contains("--diff")' "$AOUT" >/dev/null 2>&1 \
-  && ok "the finding's repro_cmd reproduces the DIFF attack (it carries --diff), not a path attack" || bad "repro_cmd wrong: $(jq -r '.findings[0].counterexample.repro_cmd' "$AOUT" 2>/dev/null)"
+if [ "$ARC" -eq 1 ] && jq -e --arg h "$C2" '.verdict=="DENIED" and .target.kind=="diff" and .target.ref=="'"$C1..$C2"'" and .target.head_sha==$h and (.findings|length)>=1 and .agent.name=="none"' "$AOUT" >/dev/null 2>&1; then
+  ok "clean->buggy range: DENIED (exit 1), target.kind=diff, ref is the spec, head_sha is the head commit"
+else bad "range attack wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"; fi
+if jq -e '.findings[0].counterexample.repro_cmd|startswith("hmd attack ") and contains("--diff")' "$AOUT" >/dev/null 2>&1; then
+  ok "the finding's repro_cmd reproduces the DIFF attack (it carries --diff), not a path attack"
+else bad "repro_cmd wrong: $(jq -r '.findings[0].counterexample.repro_cmd' "$AOUT" 2>/dev/null)"; fi
 attack "$W" --diff "$C2..$C1" --json --yes
-[ "$ARC" -eq 0 ] && jq -e '.verdict=="PROVEN" and .target.kind=="diff"' "$AOUT" >/dev/null 2>&1 \
-  && ok "buggy->clean range: PROVEN (exit 0): the attack grades the change, not the path" || bad "reverse range wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"
+if [ "$ARC" -eq 0 ] && jq -e '.verdict=="PROVEN" and .target.kind=="diff"' "$AOUT" >/dev/null 2>&1; then
+  ok "buggy->clean range: PROVEN (exit 0): the attack grades the change, not the path"
+else bad "reverse range wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"; fi
 
 # the candidate is HEAD + patch: the working copy at HEAD (buggy) with the clean patch applied is PROVEN
 attack "$W" --diff "$TMP/c2-c1.patch" --json --yes
-[ "$ARC" -eq 0 ] && jq -e '.verdict=="PROVEN" and .target.kind=="diff" and .target.head_sha==null' "$AOUT" >/dev/null 2>&1 \
-  && ok "patch file on HEAD: PROVEN, head_sha null (a bare patch has no commit)" || bad "patch-file attack wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"
+if [ "$ARC" -eq 0 ] && jq -e '.verdict=="PROVEN" and .target.kind=="diff" and .target.head_sha==null' "$AOUT" >/dev/null 2>&1; then
+  ok "patch file on HEAD: PROVEN, head_sha null (a bare patch has no commit)"
+else bad "patch-file attack wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"; fi
 git -C "$W" checkout -q "$C1"
 attack "$W" --diff "$TMP/c1-c2.patch" --json --yes
-[ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .target.kind=="diff"' "$AOUT" >/dev/null 2>&1 \
-  && ok "patch file on a clean HEAD introduces the bug: DENIED (exit 1)" || bad "patch-file DENIED wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"
+if [ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .target.kind=="diff"' "$AOUT" >/dev/null 2>&1; then
+  ok "patch file on a clean HEAD introduces the bug: DENIED (exit 1)"
+else bad "patch-file DENIED wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"; fi
 "$HMD" attack "$W" --diff - --json --yes <"$TMP/c1-c2.patch" >"$TMP/attack.out" 2>"$TMP/attack.err"; ARC=$?
-[ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .target.ref=="-"' "$TMP/attack.out" >/dev/null 2>&1 \
-  && ok "--diff - reads the patch from stdin (with --yes): DENIED" || bad "stdin attack wrong (rc=$ARC): $(head -c 300 "$TMP/attack.out") $(head -c 200 "$TMP/attack.err")"
-[ "$(git -C "$W" rev-parse HEAD)" = "$C1" ] && [ -z "$(g "$W" status --porcelain)" ] && ok "attacking a diff leaves the caller's repo untouched" || bad "repo modified by --diff"
+if [ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .target.ref=="-"' "$TMP/attack.out" >/dev/null 2>&1; then
+  ok "--diff - reads the patch from stdin (with --yes): DENIED"
+else bad "stdin attack wrong (rc=$ARC): $(head -c 300 "$TMP/attack.out") $(head -c 200 "$TMP/attack.err")"; fi
+if [ "$(git -C "$W" rev-parse HEAD)" = "$C1" ] && [ -z "$(g "$W" status --porcelain)" ]; then ok "attacking a diff leaves the caller's repo untouched"; else bad "repo modified by --diff"; fi
 git -C "$W" checkout -q "$C2"
 
 # the target may be a subdirectory of the repository
@@ -243,23 +264,25 @@ S="$TMP/s"; mkdir -p "$S/svc"; git -C "$S" init -q
 cp "$REPO/fixtures/attack/clean-sample/"* "$S/svc/"; commit_all "$S" "clean"; S1="$(sha "$S" HEAD)"
 cp "$REPO/fixtures/attack/buggy-webhook/webhook.mjs" "$S/svc/webhook.mjs"; commit_all "$S" "buggy"; S2="$(sha "$S" HEAD)"
 attack "$S/svc" --diff "$S1..$S2" --json --yes
-[ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .target.kind=="diff"' "$AOUT" >/dev/null 2>&1 \
-  && ok "a subdirectory target: the change is applied to the whole repo, the attack surface is found in svc/" || bad "subdirectory attack wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"
+if [ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .target.kind=="diff"' "$AOUT" >/dev/null 2>&1; then
+  ok "a subdirectory target: the change is applied to the whole repo, the attack surface is found in svc/"
+else bad "subdirectory attack wrong (rc=$ARC): $(head -c 300 "$AOUT") $(head -c 200 "$AERR")"; fi
 
 # refusals
 attack "$W" --diff "$TMP/no-such.patch" --yes
-[ "$ARC" -eq 2 ] && grep -q 'no-such.patch' "$AERR" && ok "--diff with a missing patch file: exit 2 and the error names the file" || bad "missing patch handling wrong (rc=$ARC): $(head -c 200 "$AERR")"
+if [ "$ARC" -eq 2 ] && grep -q 'no-such.patch' "$AERR"; then ok "--diff with a missing patch file: exit 2 and the error names the file"; else bad "missing patch handling wrong (rc=$ARC): $(head -c 200 "$AERR")"; fi
 attack "$W" --diff "$C1..$C2" --batch "$TMP/x.txt" --out "$TMP/o" --yes
-[ "$ARC" -eq 2 ] && ok "--diff with --batch: exit 2" || bad "--diff + --batch rc=$ARC"
+if [ "$ARC" -eq 2 ]; then ok "--diff with --batch: exit 2"; else bad "--diff + --batch rc=$ARC"; fi
 attack "$TMP" --diff "HEAD~1..HEAD" --yes
-[ "$ARC" -eq 2 ] && ok "--diff on a directory that is not a git repository: exit 2" || bad "non-repo --diff rc=$ARC"
+if [ "$ARC" -eq 2 ]; then ok "--diff on a directory that is not a git repository: exit 2"; else bad "non-repo --diff rc=$ARC"; fi
 attack "$W" --diff "$C1..$C2" --json
-[ "$ARC" -eq 3 ] && jq -e '.error=="consent_required"' "$AOUT" >/dev/null 2>&1 && ok "--diff without --yes on a non-terminal: exit 3 (consent_required), nothing ran" || bad "consent not required for --diff (rc=$ARC)"
+if [ "$ARC" -eq 3 ] && jq -e '.error=="consent_required"' "$AOUT" >/dev/null 2>&1; then ok "--diff without --yes on a non-terminal: exit 3 (consent_required), nothing ran"; else bad "consent not required for --diff (rc=$ARC)"; fi
 attack "$W" --diff "$C1..$C2" --out "$TMP/out-diff" --json --yes
-[ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED"' "$TMP/out-diff/verdict.json" >/dev/null 2>&1 && [ -s "$TMP/out-diff/attacks/f-0001.json" ] \
-  && ok "--out works with --diff (verdict.json + attacks/f-NNNN.json)" || bad "--out with --diff wrong (rc=$ARC)"
-[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 \( -name 'runhmd-diff-*' -o -name 'runhmd-adapter-*' \))" ] && ok "no candidate checkout or adapter temp dir survives the run" || bad "temp dirs leaked: $(ls "$TMPDIR" | head -4 | tr '\n' ' ')"
-[ ! -s "$HEIMDALL_TRACE_ORDER" ] && ok "nothing fell through to the Claude task-prompt path" || bad "hmd attack --diff fell through to the launcher: $(cat "$HEIMDALL_TRACE_ORDER")"
+if [ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED"' "$TMP/out-diff/verdict.json" >/dev/null 2>&1 && [ -s "$TMP/out-diff/attacks/f-0001.json" ]; then
+  ok "--out works with --diff (verdict.json + attacks/f-NNNN.json)"
+else bad "--out with --diff wrong (rc=$ARC)"; fi
+if [ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 \( -name 'runhmd-diff-*' -o -name 'runhmd-adapter-*' \))" ]; then ok "no candidate checkout or adapter temp dir survives the run"; else bad "temp dirs leaked: $(leftovers "$TMPDIR" 4)"; fi
+if [ ! -s "$HEIMDALL_TRACE_ORDER" ]; then ok "nothing fell through to the Claude task-prompt path"; else bad "hmd attack --diff fell through to the launcher: $(cat "$HEIMDALL_TRACE_ORDER")"; fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

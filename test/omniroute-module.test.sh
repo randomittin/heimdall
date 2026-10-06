@@ -142,6 +142,7 @@ export HMD_PREFLIGHT_DISK_FLOOR_MB=1
 # the same invariant) and documents why the manifests and the engine are NOT what
 # to change; the fail-closed arm in O3 below proves OmniRoute's own copy of the
 # probe still refuses when that control plane is unreachable.
+# shellcheck source=lib/hermetic-cp.sh disable=SC1091
 . "$SELF_DIR/lib/hermetic-cp.sh"
 hermetic_cp_start "$TMP" || exit 2
 hermetic_cp_selfcheck
@@ -220,39 +221,43 @@ echo "O1 — opt-in headline: default_included:false, consent_waived:false"
 if [ "$HAVE_MANIFEST" -eq 0 ]; then
   skip "O1 needs modules/omniroute/manifest.json — not present yet"
 else
-  jq -e . "$MANIFEST" >/dev/null 2>&1 \
-    && ok "manifest is valid JSON" || bad "manifest is not valid JSON"
-  [ "$(jq -r '.name' "$MANIFEST")" = "omniroute" ] \
-    && ok "name matches the module directory" || bad "name/directory mismatch"
-  jq -e '.default_included | type == "boolean"' "$MANIFEST" >/dev/null 2>&1 \
-    && ok "default_included is a boolean" || bad "default_included is not a boolean"
-  [ "$(jq -r '.default_included' "$MANIFEST")" = "false" ] \
-    && ok "default_included is false — OmniRoute ships to NOBODY by default" \
-    || bad "default_included is not false (got: $(jq -r '.default_included' "$MANIFEST"))"
-  jq -e '.consent_waived | type == "boolean"' "$MANIFEST" >/dev/null 2>&1 \
-    && ok "consent_waived is a boolean" || bad "consent_waived is not a boolean"
-  [ "$(jq -r '.consent_waived' "$MANIFEST")" = "false" ] \
-    && ok "consent_waived is false — nobody is auto-consented into OmniRoute" \
-    || bad "consent_waived is not false (got: $(jq -r '.consent_waived' "$MANIFEST"))"
-  jq -e '.permission_class | (type=="string" and .=="traffic-proxy") or (type=="array" and index("traffic-proxy")!=null)' \
-    "$MANIFEST" >/dev/null 2>&1 \
-    && ok "declares the traffic-proxy class — the strictest class in the system" \
-    || bad "does not declare traffic-proxy"
+  if jq -e . "$MANIFEST" >/dev/null 2>&1; then
+    ok "manifest is valid JSON"
+  else bad "manifest is not valid JSON"; fi
+  if [ "$(jq -r '.name' "$MANIFEST")" = "omniroute" ]; then
+    ok "name matches the module directory"
+  else bad "name/directory mismatch"; fi
+  if jq -e '.default_included | type == "boolean"' "$MANIFEST" >/dev/null 2>&1; then
+    ok "default_included is a boolean"
+  else bad "default_included is not a boolean"; fi
+  if [ "$(jq -r '.default_included' "$MANIFEST")" = "false" ]; then
+    ok "default_included is false — OmniRoute ships to NOBODY by default"
+  else bad "default_included is not false (got: $(jq -r '.default_included' "$MANIFEST"))"; fi
+  if jq -e '.consent_waived | type == "boolean"' "$MANIFEST" >/dev/null 2>&1; then
+    ok "consent_waived is a boolean"
+  else bad "consent_waived is not a boolean"; fi
+  if [ "$(jq -r '.consent_waived' "$MANIFEST")" = "false" ]; then
+    ok "consent_waived is false — nobody is auto-consented into OmniRoute"
+  else bad "consent_waived is not false (got: $(jq -r '.consent_waived' "$MANIFEST"))"; fi
+  if jq -e '.permission_class | (type=="string" and .=="traffic-proxy") or (type=="array" and index("traffic-proxy")!=null)' \
+    "$MANIFEST" >/dev/null 2>&1; then
+    ok "declares the traffic-proxy class — the strictest class in the system"
+  else bad "does not declare traffic-proxy"; fi
 
   # FALSIFIER: on a COPY, flip both fields to true and show the same assertion
   # style now reads true — proving O1 reads the field rather than a constant.
   restore_manifest
   mutate_manifest '.default_included = true | .consent_waived = true'
-  [ "$(jq -r '.default_included' "$MREG/omniroute/manifest.json")" = "true" ] \
-    && ok "RED ARM: the mutated copy now reads default_included:true — the check discriminates" \
-    || bad "the mutation did not take — the copy still reads false"
-  [ "$(jq -r '.consent_waived' "$MREG/omniroute/manifest.json")" = "true" ] \
-    && ok "RED ARM: the mutated copy now reads consent_waived:true — the check discriminates" \
-    || bad "the mutation did not take on consent_waived"
+  if [ "$(jq -r '.default_included' "$MREG/omniroute/manifest.json")" = "true" ]; then
+    ok "RED ARM: the mutated copy now reads default_included:true — the check discriminates"
+  else bad "the mutation did not take — the copy still reads false"; fi
+  if [ "$(jq -r '.consent_waived' "$MREG/omniroute/manifest.json")" = "true" ]; then
+    ok "RED ARM: the mutated copy now reads consent_waived:true — the check discriminates"
+  else bad "the mutation did not take on consent_waived"; fi
   restore_manifest
-  [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
-    && ok "GREEN ARM: restored — the working copy is byte-identical to the shipped manifest again" \
-    || bad "restore did not return the copy to the shipped bytes"
+  if [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ]; then
+    ok "GREEN ARM: restored — the working copy is byte-identical to the shipped manifest again"
+  else bad "restore did not return the copy to the shipped bytes"; fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -281,9 +286,9 @@ run_reconcile() { # <home> <registry> <state>
       "$AUTOUPD" check >/dev/null 2>&1
 }
 run_reconcile "$SHOME" "$SREG" "$TMP/state-o2"
-grep -q 'proxymod_synth' "$SHOME/autoupdate.log" 2>/dev/null \
-  && bad "a default_included:false traffic-proxy module was named by reconcile at all" \
-  || ok "default_included:false keeps a module OUT of the reconcile loop entirely — not even deferred"
+if grep -q 'proxymod_synth' "$SHOME/autoupdate.log" 2>/dev/null; then
+  bad "a default_included:false traffic-proxy module was named by reconcile at all"
+else ok "default_included:false keeps a module OUT of the reconcile loop entirely — not even deferred"; fi
 
 # FALSIFIER: flip default_included to true on the SAME synthetic module and show
 # it now appears (deferred, pending consent — traffic-proxy always requires it
@@ -293,9 +298,9 @@ mkdir -p "$SREG2/_classes"; cp -R "$SREG/proxymod_synth" "$SREG2/"; cp "$REAL_CL
 jq '.default_included = true' "$SREG/proxymod_synth/manifest.json" > "$SREG2/proxymod_synth/manifest.json"
 SHOME2="$TMP/home-o2-flip"; mkdir -p "$SHOME2"
 run_reconcile "$SHOME2" "$SREG2" "$TMP/state-o2-flip"
-grep -q 'reconcile: proxymod_synth defer-consent' "$SHOME2/autoupdate.log" 2>/dev/null \
-  && ok "RED ARM: flipping default_included to true makes the SAME module appear (deferred, pending consent)" \
-  || bad "flipping default_included to true did not change the outcome — O2 may be passing vacuously: $(cat "$SHOME2/autoupdate.log" 2>/dev/null)"
+if grep -q 'reconcile: proxymod_synth defer-consent' "$SHOME2/autoupdate.log" 2>/dev/null; then
+  ok "RED ARM: flipping default_included to true makes the SAME module appear (deferred, pending consent)"
+else bad "flipping default_included to true did not change the outcome — O2 may be passing vacuously: $(cat "$SHOME2/autoupdate.log" 2>/dev/null)"; fi
 
 echo
 echo "O2b — REAL (gated): the shipped OmniRoute manifest is excluded from the default set"
@@ -304,9 +309,9 @@ if [ "$HAVE_MANIFEST" -eq 0 ]; then
 else
   RHOME="$TMP/home-o2b"; mkdir -p "$RHOME"
   run_reconcile "$RHOME" "$REAL_REG" "$TMP/state-o2b"
-  grep -q 'omniroute' "$RHOME/autoupdate.log" 2>/dev/null \
-    && bad "the real reconcile loop named omniroute at all: $(cat "$RHOME/autoupdate.log" 2>/dev/null)" \
-    || ok "the REAL registry's OmniRoute manifest never enters the reconcile loop — default_included:false holds for real"
+  if grep -q 'omniroute' "$RHOME/autoupdate.log" 2>/dev/null; then
+    bad "the real reconcile loop named omniroute at all: $(cat "$RHOME/autoupdate.log" 2>/dev/null)"
+  else ok "the REAL registry's OmniRoute manifest never enters the reconcile loop — default_included:false holds for real"; fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -319,25 +324,27 @@ else
 
   OSTATE="$TMP/state/o3-omni"
   OUT_O="$(hmd_mreg "$OSTATE" add omniroute < /dev/null 2>&1)"; RC_O=$?
-  [ "$RC_O" -ne 0 ] \
-    && ok "an un-waived OmniRoute is REFUSED without consent (exit $RC_O)" \
-    || bad "OmniRoute installed with nobody asked — the opt-in property is broken"
-  grep -qi 'consent is required' <<<"$OUT_O" \
-    && ok "the refusal names consent as the reason" || bad "no consent-required message from the OmniRoute refusal"
-  [ ! -f "$OSTATE/omniroute/receipt.json" ] \
-    && ok "nothing was installed for OmniRoute" || bad "OmniRoute left a receipt despite the refusal"
+  if [ "$RC_O" -ne 0 ]; then
+    ok "an un-waived OmniRoute is REFUSED without consent (exit $RC_O)"
+  else bad "OmniRoute installed with nobody asked — the opt-in property is broken"; fi
+  if grep -qi 'consent is required' <<<"$OUT_O"; then
+    ok "the refusal names consent as the reason"
+  else bad "no consent-required message from the OmniRoute refusal"; fi
+  if [ ! -f "$OSTATE/omniroute/receipt.json" ]; then
+    ok "nothing was installed for OmniRoute"
+  else bad "OmniRoute left a receipt despite the refusal"; fi
 
   HSTATE="$TMP/state/o3-headroom"
   OUT_H="$(hmd_mreg "$HSTATE" add headroom < /dev/null 2>&1)"; RC_H=$?
-  [ "$RC_H" -eq 0 ] \
-    && ok "the SAME invocation shape SUCCEEDS unprompted for headroom (its own manifest waives consent)" \
-    || bad "headroom failed under the identical harness (exit $RC_H) — the contrast fixture itself is broken"
-  grep -qi 'Install it? \[y/N\]' <<<"$OUT_H" \
-    && bad "headroom still prompted — its waiver stopped working" \
-    || ok "headroom is not prompted — proving this harness CAN let a module through, so O3's OmniRoute refusal is not a wall that blocks everything"
-  [ -f "$HSTATE/headroom/receipt.json" ] \
-    && ok "headroom's receipt exists — the contrast is real, not two refusals dressed up differently" \
-    || bad "headroom left no receipt — the contrast fixture did not actually install anything"
+  if [ "$RC_H" -eq 0 ]; then
+    ok "the SAME invocation shape SUCCEEDS unprompted for headroom (its own manifest waives consent)"
+  else bad "headroom failed under the identical harness (exit $RC_H) — the contrast fixture itself is broken"; fi
+  if grep -qi 'Install it? \[y/N\]' <<<"$OUT_H"; then
+    bad "headroom still prompted — its waiver stopped working"
+  else ok "headroom is not prompted — proving this harness CAN let a module through, so O3's OmniRoute refusal is not a wall that blocks everything"; fi
+  if [ -f "$HSTATE/headroom/receipt.json" ]; then
+    ok "headroom's receipt exists — the contrast is real, not two refusals dressed up differently"
+  else bad "headroom left no receipt — the contrast fixture did not actually install anything"; fi
   "$MODS" --registry "$MREG" --state "$HSTATE" remove headroom >/dev/null 2>&1
 
   # FALSIFIER: a copy of OmniRoute's OWN manifest with consent explicitly waived
@@ -347,11 +354,12 @@ else
   mutate_manifest '.consent_waived = true | .consent_waived_reason = "synthetic falsifier: proving the O3 refusal is really about consent_waived, not an unrelated block"'
   FSTATE="$TMP/state/o3-falsify"
   OUT_F="$(hmd_mreg "$FSTATE" add omniroute < /dev/null 2>&1)"; RC_F=$?
-  [ "$RC_F" -eq 0 ] \
-    && ok "RED ARM: waiving consent on a COPY makes the identical add succeed unprompted" \
-    || bad "even with consent waived on the copy, add still failed (exit $RC_F) — O3's refusal is not isolated to consent: $(printf '%s\n' "$OUT_F" | tail -15)"
-  grep -qi 'Install it? \[y/N\]' <<<"$OUT_F" \
-    && bad "the waived copy still prompted" || ok "the waived copy is not prompted"
+  if [ "$RC_F" -eq 0 ]; then
+    ok "RED ARM: waiving consent on a COPY makes the identical add succeed unprompted"
+  else bad "even with consent waived on the copy, add still failed (exit $RC_F) — O3's refusal is not isolated to consent: $(printf '%s\n' "$OUT_F" | tail -15)"; fi
+  if grep -qi 'Install it? \[y/N\]' <<<"$OUT_F"; then
+    bad "the waived copy still prompted"
+  else ok "the waived copy is not prompted"; fi
   "$MODS" --registry "$MREG" --state "$FSTATE" remove omniroute >/dev/null 2>&1
 
   # FAIL-CLOSED ARM: the same waived copy, the same registry, ONE difference --
@@ -363,19 +371,19 @@ else
   NSTATE="$TMP/state/o3-cp-down"
   OUT_N="$(env HEIMDALL_DEFAULT_CP_URL="$(hermetic_cp_dead_url)" \
              "$MODS" --registry "$MREG" --state "$NSTATE" add omniroute < /dev/null 2>&1)"; RC_N=$?
-  [ "$RC_N" -ne 0 ] \
-    && ok "RED ARM: the SAME waived add is REFUSED when the control plane is unreachable (exit $RC_N) — an unreachable check fails closed" \
-    || bad "the waived add succeeded with an unreachable control plane — an unverifiable invariant PASSED"
-  grep -q 'FAILED INVARIANT: no-signed-traffic-routing' <<<"$OUT_N" \
-    && ok "the refusal names the invariant that could not be verified" \
-    || bad "the refusal did not name no-signed-traffic-routing: $(printf '%s\n' "$OUT_N" | tail -8)"
-  [ ! -f "$NSTATE/omniroute/receipt.json" ] \
-    && ok "nothing was left installed after the fail-closed refusal" \
-    || bad "a refused add left a receipt"
+  if [ "$RC_N" -ne 0 ]; then
+    ok "RED ARM: the SAME waived add is REFUSED when the control plane is unreachable (exit $RC_N) — an unreachable check fails closed"
+  else bad "the waived add succeeded with an unreachable control plane — an unverifiable invariant PASSED"; fi
+  if grep -q 'FAILED INVARIANT: no-signed-traffic-routing' <<<"$OUT_N"; then
+    ok "the refusal names the invariant that could not be verified"
+  else bad "the refusal did not name no-signed-traffic-routing: $(printf '%s\n' "$OUT_N" | tail -8)"; fi
+  if [ ! -f "$NSTATE/omniroute/receipt.json" ]; then
+    ok "nothing was left installed after the fail-closed refusal"
+  else bad "a refused add left a receipt"; fi
   restore_manifest
-  [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
-    && ok "GREEN ARM: restored — the copy is byte-identical to the shipped manifest again" \
-    || bad "restore did not return the copy to the shipped bytes"
+  if [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ]; then
+    ok "GREEN ARM: restored — the copy is byte-identical to the shipped manifest again"
+  else bad "restore did not return the copy to the shipped bytes"; fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -388,28 +396,31 @@ else
   hmd4() { "$MODS" --registry "$MREG" --state "$O4STATE" "$@"; }
 
   OUT4="$(hmd4 optout omniroute 2>&1)"; RC4=$?
-  [ "$RC4" -eq 0 ] && ok "optout omniroute exits 0" || bad "optout exited $RC4: $OUT4"
-  [ -f "$O4STATE/.modstate/omniroute/optout.json" ] \
-    && ok "the opt-out is recorded as a file — hmd's own definition of a state fact" \
-    || bad "no optout.json was written"
+  if [ "$RC4" -eq 0 ]; then ok "optout omniroute exits 0"; else bad "optout exited $RC4: $OUT4"; fi
+  if [ -f "$O4STATE/.modstate/omniroute/optout.json" ]; then
+    ok "the opt-out is recorded as a file — hmd's own definition of a state fact"
+  else bad "no optout.json was written"; fi
 
   ST4="$(hmd4 status omniroute 2>&1)"
-  grep -qi 'OPTED OUT' <<<"$ST4" \
-    && ok "status renders the opt-out in words" || bad "status does not mention the opt-out: $ST4"
-  [ "$(hmd4 --json status omniroute 2>/dev/null | jq -r '.state')" = "opted-out" ] \
-    && ok "json status reports state:opted-out" || bad "json status does not report opted-out"
+  if grep -qi 'OPTED OUT' <<<"$ST4"; then
+    ok "status renders the opt-out in words"
+  else bad "status does not mention the opt-out: $ST4"; fi
+  if [ "$(hmd4 --json status omniroute 2>/dev/null | jq -r '.state')" = "opted-out" ]; then
+    ok "json status reports state:opted-out"
+  else bad "json status does not report opted-out"; fi
 
   # repair — the real code path this suite read before writing this assertion:
   # cmd_repair checks is_opted_out FIRST and returns a no-op, never re-attempting
   # an install someone declined.
   REPOUT="$(hmd4 repair omniroute 2>&1)"; REPRC=$?
-  [ "$REPRC" -eq 0 ] && ok "repair on an opted-out module exits 0 (a no-op, not an error)" \
-                     || bad "repair on an opted-out module exited $REPRC"
-  grep -qi 'opted out' <<<"$REPOUT" \
-    && ok "repair SAYS it is honouring the opt-out rather than silently doing nothing" \
-    || bad "repair gave no indication it was honouring the opt-out: $REPOUT"
-  [ ! -f "$O4STATE/omniroute/receipt.json" ] \
-    && ok "repair left OmniRoute uninstalled" || bad "repair installed OmniRoute despite the opt-out"
+  if [ "$REPRC" -eq 0 ]; then ok "repair on an opted-out module exits 0 (a no-op, not an error)"
+  else bad "repair on an opted-out module exited $REPRC"; fi
+  if grep -qi 'opted out' <<<"$REPOUT"; then
+    ok "repair SAYS it is honouring the opt-out rather than silently doing nothing"
+  else bad "repair gave no indication it was honouring the opt-out: $REPOUT"; fi
+  if [ ! -f "$O4STATE/omniroute/receipt.json" ]; then
+    ok "repair left OmniRoute uninstalled"
+  else bad "repair installed OmniRoute despite the opt-out"; fi
 
   # reconcile — belt and suspenders: the default set already excludes OmniRoute
   # (O2b), and the opt-out record independently keeps it out too.
@@ -418,17 +429,19 @@ else
       HEIMDALL_LATEST_OVERRIDE="9.9.9" HEIMDALL_INSTALLED_OVERRIDE="9.9.9" \
       HEIMDALL_AUTOUPDATE_DRYRUN=1 HEIMDALL_MODULE_RECONCILE_DRYRUN=1 \
       "$AUTOUPD" check >/dev/null 2>&1
-  grep -qE 'reconcile: omniroute would-acquire' "$RCHOME/autoupdate.log" 2>/dev/null \
-    && bad "reconcile tried to acquire the opted-out omniroute module" \
-    || ok "reconcile does not try to re-install the opted-out omniroute module"
+  if grep -qE 'reconcile: omniroute would-acquire' "$RCHOME/autoupdate.log" 2>/dev/null; then
+    bad "reconcile tried to acquire the opted-out omniroute module"
+  else ok "reconcile does not try to re-install the opted-out omniroute module"; fi
 
   # optin — reversible, and cleanly so.
   OUT4B="$(hmd4 optin omniroute 2>&1)"; RC4B=$?
-  [ "$RC4B" -eq 0 ] && ok "optin omniroute exits 0" || bad "optin exited $RC4B: $OUT4B"
-  [ ! -f "$O4STATE/.modstate/omniroute/optout.json" ] \
-    && ok "optin clears the opt-out record" || bad "the opt-out record survived optin"
-  [ "$(hmd4 --json status omniroute 2>/dev/null | jq -r '.state')" != "opted-out" ] \
-    && ok "status no longer reports opted-out after optin" || bad "status still reports opted-out after optin"
+  if [ "$RC4B" -eq 0 ]; then ok "optin omniroute exits 0"; else bad "optin exited $RC4B: $OUT4B"; fi
+  if [ ! -f "$O4STATE/.modstate/omniroute/optout.json" ]; then
+    ok "optin clears the opt-out record"
+  else bad "the opt-out record survived optin"; fi
+  if [ "$(hmd4 --json status omniroute 2>/dev/null | jq -r '.state')" != "opted-out" ]; then
+    ok "status no longer reports opted-out after optin"
+  else bad "status still reports opted-out after optin"; fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -439,23 +452,23 @@ if [ "$HAVE_MANIFEST" -eq 0 ]; then
 else
   O5STATE="$TMP/state/o5"
   OUT5="$("$MODS" --registry "$MREG" --state "$O5STATE" add omniroute < /dev/null 2>&1)"; RC5=$?
-  grep -q '\[1/7\] validate' <<<"$OUT5" && ok "reaches [1/7] validate" || bad "never reached validate"
-  grep -q '\[2/7\] class contract' <<<"$OUT5" && ok "reaches [2/7] class contract" || bad "never reached class contract"
-  grep -q '\[3/7\] preflight' <<<"$OUT5" && ok "reaches [3/7] preflight" || bad "never reached preflight"
-  grep -q '\[4/7\] consent' <<<"$OUT5" && ok "reaches [4/7] consent — validate + class contract + preflight all passed" \
-                                        || bad "never reached consent — something before it refused"
-  grep -q '\[5/7\]' <<<"$OUT5" \
-    && bad "reached [5/7] install — this run had no consent, so a fetch would have run without permission" \
-    || ok "never reaches [5/7] install — HERMETIC: no fetch command ever runs on this path"
-  grep -qi 'manifest failed validation' <<<"$OUT5" \
-    && bad "validate_manifest rejected the shipped manifest: $OUT5" \
-    || ok "validate_manifest accepts the shipped manifest"
-  grep -qi 'does not cover every invariant' <<<"$OUT5" \
-    && bad "check_invariant_coverage rejected the shipped manifest: $OUT5" \
-    || ok "check_invariant_coverage accepts the shipped manifest"
-  [ "$RC5" -ne 0 ] \
-    && ok "the run still exits nonzero overall (refused at consent, as O3 already established)" \
-    || bad "add exited 0 with no consent granted — something let it through"
+  if grep -q '\[1/7\] validate' <<<"$OUT5"; then ok "reaches [1/7] validate"; else bad "never reached validate"; fi
+  if grep -q '\[2/7\] class contract' <<<"$OUT5"; then ok "reaches [2/7] class contract"; else bad "never reached class contract"; fi
+  if grep -q '\[3/7\] preflight' <<<"$OUT5"; then ok "reaches [3/7] preflight"; else bad "never reached preflight"; fi
+  if grep -q '\[4/7\] consent' <<<"$OUT5"; then ok "reaches [4/7] consent — validate + class contract + preflight all passed"
+  else bad "never reached consent — something before it refused"; fi
+  if grep -q '\[5/7\]' <<<"$OUT5"; then
+    bad "reached [5/7] install — this run had no consent, so a fetch would have run without permission"
+  else ok "never reaches [5/7] install — HERMETIC: no fetch command ever runs on this path"; fi
+  if grep -qi 'manifest failed validation' <<<"$OUT5"; then
+    bad "validate_manifest rejected the shipped manifest: $OUT5"
+  else ok "validate_manifest accepts the shipped manifest"; fi
+  if grep -qi 'does not cover every invariant' <<<"$OUT5"; then
+    bad "check_invariant_coverage rejected the shipped manifest: $OUT5"
+  else ok "check_invariant_coverage accepts the shipped manifest"; fi
+  if [ "$RC5" -ne 0 ]; then
+    ok "the run still exits nonzero overall (refused at consent, as O3 already established)"
+  else bad "add exited 0 with no consent granted — something let it through"; fi
 
   echo
   echo "  O5 falsifiers — a broken pin and an uncovered invariant are each refused by name"
@@ -465,10 +478,11 @@ else
   mutate_manifest '.pinned_version.artifact_sha256 = "not-a-real-digest"'
   OUT5A="$(add_o5 badpin)"; RC5A=$?
   if jq -e '.installs_via.kind == "local"' "$MREG/omniroute/manifest.json" >/dev/null 2>&1; then
-    [ "$RC5A" -ne 0 ] && ok "a non-hex artifact digest is refused (local install)" \
-                      || bad "a bad local pin digest was accepted"
-    grep -q 'artifact_sha256' <<<"$OUT5A" \
-      && ok "the refusal names artifact_sha256" || bad "the refusal did not name the field"
+    if [ "$RC5A" -ne 0 ]; then ok "a non-hex artifact digest is refused (local install)"
+    else bad "a bad local pin digest was accepted"; fi
+    if grep -q 'artifact_sha256' <<<"$OUT5A"; then
+      ok "the refusal names artifact_sha256"
+    else bad "the refusal did not name the field"; fi
   else
     ok "installs_via.kind is upstream — artifact_sha256 does not gate this manifest (documented divergence from headroom's local-kind pin)"
   fi
@@ -476,32 +490,37 @@ else
 
   mutate_manifest 'del(.pinned_version)'
   OUT5B="$(add_o5 nopin)"; RC5B=$?
-  [ "$RC5B" -ne 0 ] && ok "a missing pinned_version is refused" || bad "a manifest with no pin was accepted"
-  grep -q 'pinned_version' <<<"$OUT5B" \
-    && ok "the refusal names pinned_version" || bad "the refusal did not name pinned_version"
+  if [ "$RC5B" -ne 0 ]; then ok "a missing pinned_version is refused"; else bad "a manifest with no pin was accepted"; fi
+  if grep -q 'pinned_version' <<<"$OUT5B"; then
+    ok "the refusal names pinned_version"
+  else bad "the refusal did not name pinned_version"; fi
   restore_manifest
 
   # An uncovered manifest-kind invariant the traffic-proxy class demands.
   MANIFEST_KIND_IDS="$(jq -r '.requires_invariants[] | select(.check.kind=="manifest") | .id' "$REAL_CLASSES/traffic-proxy.json")"
   FIRST_ID="$(printf '%s\n' "$MANIFEST_KIND_IDS" | head -1)"
   if [ -n "$FIRST_ID" ] && jq -e --arg id "$FIRST_ID" '.invariants | has($id)' "$MANIFEST" >/dev/null 2>&1; then
+    # shellcheck disable=SC2016 # $id is a jq variable bound by --arg, not a shell expansion
     mutate_manifest --arg id "$FIRST_ID" 'del(.invariants[$id])'
     OUT5C="$(add_o5 hole)"; RC5C=$?
-    [ "$RC5C" -ne 0 ] && ok "an uncovered class invariant ($FIRST_ID) is refused" \
-                      || bad "an uncovered class invariant ($FIRST_ID) was accepted"
-    grep -qF "$FIRST_ID" <<<"$OUT5C" \
-      && ok "the refusal names the uncovered invariant" || bad "the refusal did not name $FIRST_ID"
-    grep -q 'traffic-proxy' <<<"$OUT5C" \
-      && ok "the refusal names the class that demanded it" || bad "the refusal did not name traffic-proxy"
-    [ ! -e "$TMP/state/o5-hole/omniroute" ] \
-      && ok "the refused manifest installed nothing" || bad "a refused manifest left residue"
+    if [ "$RC5C" -ne 0 ]; then ok "an uncovered class invariant ($FIRST_ID) is refused"
+    else bad "an uncovered class invariant ($FIRST_ID) was accepted"; fi
+    if grep -qF "$FIRST_ID" <<<"$OUT5C"; then
+      ok "the refusal names the uncovered invariant"
+    else bad "the refusal did not name $FIRST_ID"; fi
+    if grep -q 'traffic-proxy' <<<"$OUT5C"; then
+      ok "the refusal names the class that demanded it"
+    else bad "the refusal did not name traffic-proxy"; fi
+    if [ ! -e "$TMP/state/o5-hole/omniroute" ]; then
+      ok "the refused manifest installed nothing"
+    else bad "a refused manifest left residue"; fi
     restore_manifest
   else
     bad "could not find a manifest-kind traffic-proxy invariant covered by the shipped manifest to falsify against"
   fi
-  [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
-    && ok "GREEN ARM: restored — the working copy is byte-identical to the shipped manifest again" \
-    || bad "restore did not return the copy to the shipped bytes"
+  if [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ]; then
+    ok "GREEN ARM: restored — the working copy is byte-identical to the shipped manifest again"
+  else bad "restore did not return the copy to the shipped bytes"; fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -510,12 +529,12 @@ echo "O6 — pin integrity: commit $PIN_SHA, version $PIN_VERSION"
 if [ "$HAVE_MANIFEST" -eq 0 ]; then
   skip "O6 needs modules/omniroute/manifest.json — not present yet"
 else
-  grep -q "$PIN_SHA" "$MANIFEST" \
-    && ok "the manifest records the exact pinned commit $PIN_SHA" \
-    || bad "the manifest does not mention the pinned commit $PIN_SHA anywhere"
-  [ "$(jq -r '.pinned_version.version' "$MANIFEST")" = "$PIN_VERSION" ] \
-    && ok "pinned_version.version is exactly $PIN_VERSION" \
-    || bad "pinned_version.version is not $PIN_VERSION (got: $(jq -r '.pinned_version.version' "$MANIFEST"))"
+  if grep -q "$PIN_SHA" "$MANIFEST"; then
+    ok "the manifest records the exact pinned commit $PIN_SHA"
+  else bad "the manifest does not mention the pinned commit $PIN_SHA anywhere"; fi
+  if [ "$(jq -r '.pinned_version.version' "$MANIFEST")" = "$PIN_VERSION" ]; then
+    ok "pinned_version.version is exactly $PIN_VERSION"
+  else bad "pinned_version.version is not $PIN_VERSION (got: $(jq -r '.pinned_version.version' "$MANIFEST"))"; fi
 
   # FALSIFIER: a copy with the SHA swapped for a different (still well-formed)
   # 40-hex string no longer matches — proving this check reads the real bytes.
@@ -527,20 +546,20 @@ else
   # second occurrence on that line intact — which is exactly how this fixture
   # previously failed to drift at all.
   sed "s/$PIN_SHA/0000000000000000000000000000000000000000/g" "$MANIFEST" > "$DRIFT"
-  [ "$(sha_file "$MANIFEST")" != "$(sha_file "$DRIFT")" ] \
-    && ok "the drift fixture is genuinely different bytes from the shipped manifest — the sed substitution took" \
-    || bad "the drift fixture is byte-identical to the shipped manifest — the sed substitution did not take at all"
-  grep -q "$PIN_SHA" "$DRIFT" \
-    && bad "the drift fixture still contains the real pin — the sed substitution did not take" \
-    || ok "RED ARM: a manifest with the pin swapped for a different SHA no longer matches — a drifted manifest would FAIL this gate"
+  if [ "$(sha_file "$MANIFEST")" != "$(sha_file "$DRIFT")" ]; then
+    ok "the drift fixture is genuinely different bytes from the shipped manifest — the sed substitution took"
+  else bad "the drift fixture is byte-identical to the shipped manifest — the sed substitution did not take at all"; fi
+  if grep -q "$PIN_SHA" "$DRIFT"; then
+    bad "the drift fixture still contains the real pin — the sed substitution did not take"
+  else ok "RED ARM: a manifest with the pin swapped for a different SHA no longer matches — a drifted manifest would FAIL this gate"; fi
 
   if [ "$HAVE_README" -eq 1 ]; then
-    grep -q "$PIN_SHA" "$PATCH_README" \
-      && ok "patches/omniroute/README.md documents the same pinned commit" \
-      || bad "the README does not mention $PIN_SHA — manifest and patch rationale have drifted"
-    grep -q "$PIN_VERSION" "$PATCH_README" \
-      && ok "patches/omniroute/README.md documents the same pinned version" \
-      || bad "the README does not mention $PIN_VERSION"
+    if grep -q "$PIN_SHA" "$PATCH_README"; then
+      ok "patches/omniroute/README.md documents the same pinned commit"
+    else bad "the README does not mention $PIN_SHA — manifest and patch rationale have drifted"; fi
+    if grep -q "$PIN_VERSION" "$PATCH_README"; then
+      ok "patches/omniroute/README.md documents the same pinned version"
+    else bad "the README does not mention $PIN_VERSION"; fi
   else
     skip "README cross-check needs patches/omniroute/README.md — not present yet"
   fi
@@ -552,17 +571,18 @@ echo "O7 — the installer exists, is executable, is syntax-clean, and carries t
 if [ "$HAVE_INSTALLER" -eq 0 ]; then
   skip "O7 needs bin/heimdall-omniroute-install — not present yet"
 else
-  [ -x "$INSTALLER" ] && ok "bin/heimdall-omniroute-install is executable" \
-                       || bad "bin/heimdall-omniroute-install exists but is not executable"
-  bash -n "$INSTALLER" 2>/tmp/o7-syntax.$$ \
-    && ok "bash -n is clean" || { bad "bash -n reported a syntax error"; cat /tmp/o7-syntax.$$ >&2; }
+  if [ -x "$INSTALLER" ]; then ok "bin/heimdall-omniroute-install is executable"
+  else bad "bin/heimdall-omniroute-install exists but is not executable"; fi
+  if bash -n "$INSTALLER" 2>/tmp/o7-syntax.$$; then
+    ok "bash -n is clean"
+  else bad "bash -n reported a syntax error"; cat /tmp/o7-syntax.$$ >&2; fi
   rm -f /tmp/o7-syntax.$$
-  grep -q "$PIN_SHA" "$INSTALLER" \
-    && ok "the installer's own source carries the pinned commit $PIN_SHA" \
-    || bad "the installer never mentions the pinned commit — it cannot be verifying against it"
-  grep -qE '(^|[^0-9])24([^0-9]|$)' "$INSTALLER" \
-    && ok "the installer mentions a version constraint touching 24 (the required node major)" \
-    || bad "the installer never mentions node 24 anywhere in its source"
+  if grep -q "$PIN_SHA" "$INSTALLER"; then
+    ok "the installer's own source carries the pinned commit $PIN_SHA"
+  else bad "the installer never mentions the pinned commit — it cannot be verifying against it"; fi
+  if grep -qE '(^|[^0-9])24([^0-9]|$)' "$INSTALLER"; then
+    ok "the installer mentions a version constraint touching 24 (the required node major)"
+  else bad "the installer never mentions node 24 anywhere in its source"; fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -639,10 +659,10 @@ done
 write_stub_git "$NODE_OLD_PATH" "2222222222222222222222222222222222222222"
 
 OUT8A="$(PATH="$NODE_OLD_PATH" perl -e 'alarm 20; exec @ARGV' bash "$REF" 2>&1)"; RC8A=$?
-[ "$RC8A" -ne 0 ] && ok "an old node major (v18) is REFUSED by the reference installer" \
-                  || bad "the reference installer accepted node v18"
-grep -qi 'node v24' <<<"$OUT8A" && ok "the refusal names the node v24 requirement" \
-                                || bad "the refusal did not name node v24"
+if [ "$RC8A" -ne 0 ]; then ok "an old node major (v18) is REFUSED by the reference installer"
+else bad "the reference installer accepted node v18"; fi
+if grep -qi 'node v24' <<<"$OUT8A"; then ok "the refusal names the node v24 requirement"
+else bad "the refusal did not name node v24"; fi
 
 # A real (new-enough) node stub: the same script proceeds past the node check.
 NODE_NEW_PATH="$TMP/path-node-new"; mkdir -p "$NODE_NEW_PATH"
@@ -667,10 +687,10 @@ OUT8B="$(PATH="$GIT_WRONGSHA_PATH" \
   OMNIROUTE_CLONE_DIR="$TMP/clone-wrongsha" OMNIROUTE_UPSTREAM="https://example.invalid/omniroute" \
   OMNIROUTE_PIN_SHA="$PIN_SHA" OMNIROUTE_PROVIDERS_FILE="$TMP/no-such-providers.json" \
   perl -e 'alarm 20; exec @ARGV' bash "$REF" 2>&1)"; RC8B=$?
-[ "$RC8B" -ne 0 ] && ok "a post-clone SHA that does not match the pin is REFUSED" \
-                  || bad "the reference installer accepted a mismatched post-clone SHA"
-grep -q "$PIN_SHA" <<<"$OUT8B" && ok "the refusal names the pin it expected" \
-                                || bad "the refusal did not name the expected pin"
+if [ "$RC8B" -ne 0 ]; then ok "a post-clone SHA that does not match the pin is REFUSED"
+else bad "the reference installer accepted a mismatched post-clone SHA"; fi
+if grep -q "$PIN_SHA" <<<"$OUT8B"; then ok "the refusal names the pin it expected"
+else bad "the refusal did not name the expected pin"; fi
 
 # git stub returning the CORRECT sha: proceeds past the SHA check. This is the
 # ONLY fixture PATH in this whole section whose "clone" outcome matters for a
@@ -689,10 +709,10 @@ OUT8C="$(PATH="$GIT_RIGHTSHA_PATH" \
   OMNIROUTE_CLONE_DIR="$TMP/clone-tier1" OMNIROUTE_UPSTREAM="https://example.invalid/omniroute" \
   OMNIROUTE_PIN_SHA="$PIN_SHA" OMNIROUTE_PROVIDERS_FILE="$PROVIDERS_TIER1" \
   perl -e 'alarm 20; exec @ARGV' bash "$REF" 2>&1)"; RC8C=$?
-[ "$RC8C" -ne 0 ] && ok "a Tier-1 provider row present is REFUSED even with node and pin both correct" \
-                  || bad "the reference installer proceeded with a Tier-1 provider row present"
-grep -qi 'tier-1' <<<"$OUT8C" && ok "the refusal names the Tier-1 provider reason" \
-                              || bad "the refusal did not name Tier-1"
+if [ "$RC8C" -ne 0 ]; then ok "a Tier-1 provider row present is REFUSED even with node and pin both correct"
+else bad "the reference installer proceeded with a Tier-1 provider row present"; fi
+if grep -qi 'tier-1' <<<"$OUT8C"; then ok "the refusal names the Tier-1 provider reason"
+else bad "the refusal did not name Tier-1"; fi
 
 # GREEN — all three preconditions genuinely satisfied: the reference installer
 # proceeds. This is the falsifier for O8's three refusals: it proves the same
@@ -703,9 +723,9 @@ OUT8D="$(PATH="$GIT_RIGHTSHA_PATH" \
   OMNIROUTE_CLONE_DIR="$TMP/clone-green" OMNIROUTE_UPSTREAM="https://example.invalid/omniroute" \
   OMNIROUTE_PIN_SHA="$PIN_SHA" OMNIROUTE_PROVIDERS_FILE="$PROVIDERS_TIER2" \
   perl -e 'alarm 20; exec @ARGV' bash "$REF" 2>&1)"; RC8D=$?
-[ "$RC8D" -eq 0 ] && grep -q '^installed$' <<<"$OUT8D" \
-  && ok "GREEN ARM: node v24, correct SHA, no Tier-1 row → the reference installer proceeds — the three refusals are real gates, not a wall" \
-  || bad "the reference installer did not proceed with every precondition satisfied (exit $RC8D): $OUT8D"
+if [ "$RC8D" -eq 0 ] && grep -q '^installed$' <<<"$OUT8D"; then
+  ok "GREEN ARM: node v24, correct SHA, no Tier-1 row → the reference installer proceeds — the three refusals are real gates, not a wall"
+else bad "the reference installer did not proceed with every precondition satisfied (exit $RC8D): $OUT8D"; fi
 
 # MUTANT — the node guard's echo+exit disabled. Proves the harness itself is
 # discriminating: a script that stops checking node still gets caught by the
@@ -729,9 +749,9 @@ if grep -q 'node check disabled by mutant' "$MUTREF"; then
     OMNIROUTE_CLONE_DIR="$TMP/clone-mutant" OMNIROUTE_UPSTREAM="https://example.invalid/omniroute" \
     OMNIROUTE_PIN_SHA="$PIN_SHA" OMNIROUTE_PROVIDERS_FILE="$TMP/no-such-providers.json" \
     perl -e 'alarm 20; exec @ARGV' bash "$MUTREF" 2>&1)"
-  grep -qi 'node v24' <<<"$OUT8E" \
-    && bad "the mutant with the node guard disabled still refused on node — the mutation did not take" \
-    || ok "MUTANT: disabling the node guard stops the node-specific refusal from firing — O8's node assertion can go RED"
+  if grep -qi 'node v24' <<<"$OUT8E"; then
+    bad "the mutant with the node guard disabled still refused on node — the mutation did not take"
+  else ok "MUTANT: disabling the node guard stops the node-specific refusal from firing — O8's node assertion can go RED"; fi
 else
   bad "could not build the node-guard-disabled mutant — the sed rewrite did not match the reference script"
 fi
@@ -781,12 +801,12 @@ else
   write_stub_git "$FULL_PRECOND_PATH" "0000000000000000000000000000000000000000"
 
   OUT9F1="$(run_installer "$FULL_PRECOND_PATH" INSTALL_DIR="$FIXTURE_NONGIT")"; RC9F1=$?
-  [ "$RC9F1" -ne 0 ] \
-    && ok "the real installer refuses when INSTALL_DIR already exists and is not a git checkout (exit $RC9F1)" \
-    || bad "the real installer proceeded against an existing non-git INSTALL_DIR — it should refuse (this is the live-gateway protection)"
-  grep -qi 'already exists and is not a git checkout' <<<"$OUT9F1" \
-    && ok "the refusal names the reason: not a git checkout" \
-    || bad "the refusal did not name 'not a git checkout': $OUT9F1"
+  if [ "$RC9F1" -ne 0 ]; then
+    ok "the real installer refuses when INSTALL_DIR already exists and is not a git checkout (exit $RC9F1)"
+  else bad "the real installer proceeded against an existing non-git INSTALL_DIR — it should refuse (this is the live-gateway protection)"; fi
+  if grep -qi 'already exists and is not a git checkout' <<<"$OUT9F1"; then
+    ok "the refusal names the reason: not a git checkout"
+  else bad "the refusal did not name 'not a git checkout': $OUT9F1"; fi
 
   # RED ARM / falsifier: an ABSENT INSTALL_DIR must NOT trip this specific
   # refusal — it proceeds into clone_and_pin's clone step (the same safe,
@@ -796,9 +816,9 @@ else
   # refusing unconditionally regardless of what INSTALL_DIR points at.
   FIXTURE_ABSENT="$TMP/fixture-absent-$$"
   OUT9F2="$(run_installer "$FULL_PRECOND_PATH" INSTALL_DIR="$FIXTURE_ABSENT")"
-  grep -qi 'already exists and is not a git checkout' <<<"$OUT9F2" \
-    && bad "RED-ARM CHECK FAILED: an absent INSTALL_DIR still tripped the 'not a git checkout' refusal — the check above is not discriminating" \
-    || ok "RED ARM: an absent INSTALL_DIR does not trip the same refusal (it fails later instead, on the stubbed pin mismatch)"
+  if grep -qi 'already exists and is not a git checkout' <<<"$OUT9F2"; then
+    bad "RED-ARM CHECK FAILED: an absent INSTALL_DIR still tripped the 'not a git checkout' refusal — the check above is not discriminating"
+  else ok "RED ARM: an absent INSTALL_DIR does not trip the same refusal (it fails later instead, on the stubbed pin mismatch)"; fi
 
   # PATH here intentionally carries only the stub node plus symlinked coreutils
   # from O8's fixture — reused so this section makes no new assumption beyond O8's.
@@ -807,9 +827,9 @@ else
     bad "the real installer exited 0 with node v18 on PATH — it should refuse (see O8's reference contract)"
   else
     ok "the real installer exits nonzero with an old node on PATH (exit $RC9A)"
-    grep -qi 'node' <<<"$OUT9A" \
-      && ok "…and its refusal mentions node" \
-      || bad "…but its refusal never mentions node — cannot confirm THIS is why it refused (may be refusing for an unrelated, unmet assumption)"
+    if grep -qi 'node' <<<"$OUT9A"; then
+      ok "…and its refusal mentions node"
+    else bad "…but its refusal never mentions node — cannot confirm THIS is why it refused (may be refusing for an unrelated, unmet assumption)"; fi
   fi
 
   # FULL_PRECOND_PATH, not O8's GIT_WRONGSHA_PATH: that PATH has no dirname, so the real installer
@@ -820,9 +840,9 @@ else
     bad "the real installer exited 0 with a git stub returning a WRONG post-clone SHA — it should refuse"
   else
     ok "the real installer exits nonzero when the post-clone SHA is wrong (exit $RC9B)"
-    grep -qi 'post-checkout HEAD' <<<"$OUT9B" \
-      && ok "…and its refusal names the post-checkout HEAD mismatch" \
-      || bad "…but its refusal never names the post-checkout HEAD mismatch — cannot confirm THIS is why it refused: $OUT9B"
+    if grep -qi 'post-checkout HEAD' <<<"$OUT9B"; then
+      ok "…and its refusal names the post-checkout HEAD mismatch"
+    else bad "…but its refusal never names the post-checkout HEAD mismatch — cannot confirm THIS is why it refused: $OUT9B"; fi
   fi
 fi
 
@@ -851,18 +871,18 @@ chmod +x "$LEAKY"
 # binary) is what actually applies them, and unlike the old alarm_run function,
 # perl is a real binary too, so this composes correctly.
 LEAK_OUT="$(env "${SECRET_ENV[@]}" perl -e 'alarm 10; exec @ARGV' bash "$LEAKY" 2>&1)"
-grep -qF "$SECRET_MARKER" <<<"$LEAK_OUT" \
-  && ok "RED ARM: the marker-leak detector correctly catches a script that echoes a secret env var" \
-  || bad "the detector missed an intentional secret leak — the check is not discriminating"
+if grep -qF "$SECRET_MARKER" <<<"$LEAK_OUT"; then
+  ok "RED ARM: the marker-leak detector correctly catches a script that echoes a secret env var"
+else bad "the detector missed an intentional secret leak — the check is not discriminating"; fi
 
 # GREEN ARM — the O8 reference installer never touches those vars and never leaks.
 CLEAN_OUT="$(env "${SECRET_ENV[@]}" PATH="$GIT_RIGHTSHA_PATH" \
   OMNIROUTE_CLONE_DIR="$TMP/clone-secrets" OMNIROUTE_UPSTREAM="https://example.invalid/omniroute" \
   OMNIROUTE_PIN_SHA="$PIN_SHA" OMNIROUTE_PROVIDERS_FILE="$TMP/no-such-providers.json" \
   perl -e 'alarm 20; exec @ARGV' bash "$REF" 2>&1)"
-grep -qF "$SECRET_MARKER" <<<"$CLEAN_OUT" \
-  && bad "the reference installer leaked the secret marker" \
-  || ok "GREEN ARM: the reference installer's stdout+stderr are byte-free of the marker"
+if grep -qF "$SECRET_MARKER" <<<"$CLEAN_OUT"; then
+  bad "the reference installer leaked the secret marker"
+else ok "GREEN ARM: the reference installer's stdout+stderr are byte-free of the marker"; fi
 
 if [ "$HAVE_INSTALLER" -eq 0 ]; then
   skip "the real-installer secrets probe needs bin/heimdall-omniroute-install — not present yet"
@@ -870,9 +890,9 @@ else
   mkdir -p "$TMP/home-o10"
   REAL_SEC_OUT="$(env "${SECRET_ENV[@]}" PATH="$NODE_OLD_PATH" HOME="$TMP/home-o10" TMPDIR="$TMP" \
     perl -e 'alarm 30; exec @ARGV' bash "$INSTALLER" < /dev/null 2>&1)"
-  grep -qF "$SECRET_MARKER" <<<"$REAL_SEC_OUT" \
-    && bad "the REAL installer printed the planted secret marker to stdout/stderr" \
-    || ok "the real installer's captured stdout+stderr on its refusal path are byte-free of the marker"
+  if grep -qF "$SECRET_MARKER" <<<"$REAL_SEC_OUT"; then
+    bad "the REAL installer printed the planted secret marker to stdout/stderr"
+  else ok "the real installer's captured stdout+stderr on its refusal path are byte-free of the marker"; fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -218,7 +218,9 @@ build_release_notes() {
     if [ -n "$prev" ]; then
       printf '**Full changelog**: https://github.com/randomittin/heimdall/compare/%s...%s\n' "$prev" "$tag"
     fi
+    # shellcheck disable=SC2016 # literal Markdown code fence: the backticks go into the notes file, not a command substitution
     printf '\nInstall/upgrade:\n\n```bash\ncurl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/%s/install.sh | bash\n```\n' "$tag"
+    # shellcheck disable=SC2016 # literal Markdown backticks around file names, not a command substitution
     printf '\n`install.sh.minisig` is the detached minisign signature of this release'\''s `install.sh`; `bin/heimdall-autoupdate` verifies it against `release/heimdall-signing.pub` before applying.\n'
   } > "$out" || die "could not write release notes to $out"
 }
@@ -425,6 +427,7 @@ npm_pkg_rels() {
   if [ -n "${SHIP_NPM_DIR:-}" ]; then
     printf '%s\n' "${NPM_PKG_DIRS%% *}"
   else
+    # shellcheck disable=SC2086 # NPM_PKG_DIRS is a space-separated list: word splitting is the point
     printf '%s\n' $NPM_PKG_DIRS
   fi
 }
@@ -640,6 +643,7 @@ publish_npm() {
 # (read_version, sign_release_artifact, publish_npm, …) WITHOUT running the release flow.
 # Executed normally the variable is unset and we fall through to the real pipeline below.
 if [ "${SHIP_SOURCE_ONLY:-0}" = "1" ]; then
+  # shellcheck disable=SC2317 # return only works when sourced; exit 0 is the fallback when executed directly
   return 0 2>/dev/null || exit 0
 fi
 
