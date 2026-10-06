@@ -107,7 +107,7 @@
   <section id="p-checkpoint"><h2>Checkpoint <span class="src">checkpoint</span></h2><div id="checkpoint" class="nodata">no data</div></section>
   <section id="p-fallback"><h2>Fallback / routing <span class="src">fallback</span></h2><div id="fallback" class="nodata">no data</div></section>
   <section id="p-remote"><h2>Remote actions <span class="src">remote_actions</span></h2><div id="remote" class="nodata">no data</div></section>
-  <section id="p-dashboards"><h2>Dashboards <span class="src">dashboards</span></h2><div id="dashboards" class="nodata">no data</div></section>
+  <section id="p-dashboards" style="grid-column: 1 / -1"><h2>Dashboards <span class="src">dashboards &middot; read-only &middot; built on the phone</span></h2><div id="dashboards" class="nodata">no data</div><div id="dashpanels"></div></section>
   <section id="p-reels"><h2>Reels <span class="src">reels</span></h2><div id="reels" class="nodata">no data</div></section>
   <section id="p-jobpanels" style="grid-column: 1 / -1"><h2>Job panels <span class="src">panels &middot; .heimdall/ui/panels/&lt;id&gt;.json</span></h2><div id="jobpanels" class="nodata">no panels &mdash; publish one with <code>hmd ui panel set &lt;id&gt; --type &lt;t&gt; --title &lt;s&gt; --data-json &lt;file|-&gt;</code></div></section>
 </main>
@@ -279,7 +279,8 @@
 
   function renderDashboards(d) {
     if (!d) { return null; }
-    var head = '<div><span class="tag ' + (d.enabled ? "on" : "off") + '">remote dashboards ' + (d.enabled ? "on" : "off") + "</span></div>";
+    var head = '<div><span class="tag ' + (d.enabled ? "on" : "off") + '">remote dashboards ' + (d.enabled ? "on" : "off") + "</span>" +
+               (d.pending ? ' <span class="tag off">' + esc(d.pending) + " waiting for you: hmd dash pending</span>" : "") + "</div>";
     var tiles = d.tiles || [];
     if (!tiles.length) { return head + '<div class="muted" style="margin-top:6px">' + (d.enabled ? "no tiles yet" : "off") + "</div>"; }
     return head + "<table><tr><th>tile</th><th>intent</th><th>phase</th><th>last ok</th></tr>" + tiles.map(function (t) {
@@ -575,6 +576,23 @@
     });
   }
 
+  // ── dashboards (read-only) ────────────────────────────────────────────────
+  // The phone builds these; this page only DRAWS them, from the same tile store the phone's slice is cut from. Every tile that has a
+  // panel goes through drawJobPanel -- the closed type set, DOM nodes and textContent, nothing in the data is ever HTML. Nothing below
+  // creates a button, an input, a form or a request: a tile cannot be created, edited, refreshed or removed from this page.
+  function renderDashPanels(d, nowS) {
+    var host = el("dashpanels");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    var tiles = (d && d.enabled && Array.isArray(d.tiles) ? d.tiles : []).filter(function (t) { return t && t.panel; });
+    host.className = tiles.length ? "panel-grid" : "";
+    tiles.forEach(function (t) {
+      var art = drawJobPanel(t.panel, nowS);
+      art.appendChild(mk("div", "muted", shortLabel(t.intent, 80) + " · " + t.phase + (t.detail ? " (" + t.detail + ")" : "") +
+                                          (t.producer_label ? " · " + t.producer_label : "")));
+      host.appendChild(art);
+    });
+  }
+
   // ── diff-and-patch: only panels whose slice changed are re-rendered ──────
   var panels = [
     { id: "verdict",    pick: function (s) { return s.ledger && s.ledger.verdict; },       draw: function (s) { return renderVerdict(s.ledger); } },
@@ -615,6 +633,9 @@
       renderJobPanels(state.panels, nowS);
       if (prev) { changed.push("panels"); flash("jobpanels"); }
     }
+    var dashNow = JSON.stringify(state.dashboards || null);
+    var dashBefore = prev ? JSON.stringify(prev.dashboards || null) : undefined;
+    if (dashNow !== dashBefore) { renderDashPanels(state.dashboards, nowS); }
     var when = new Date(nowS * 1000).toLocaleTimeString();
     el("stamp").textContent = (prev ? "frame " : "first frame ") + when + " · schema v" + esc(state.schema_version);
     if (prev && changed.length) { el("diff").textContent = "changed: " + changed.join(", "); }
