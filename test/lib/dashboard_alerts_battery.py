@@ -3,6 +3,7 @@
 the push kind `tile_alert`). Real modules, hermetic: HEIMDALL_HOME and the repo are a temp dir, the Expo endpoint is test/lib/push_test_lib.py's
 loopback FakeExpo, the clock is injected (publish_panel(now=...)). Prints `ok <text>` / `bad <text>` lines; exit 0 even when something is bad
 (the bash runner tallies). Usage: dashboard_alerts_battery.py [--lib DIR]  (DIR = a copy of bin/lib; the mutant runs point it at a patched one)."""
+import hashlib
 import json
 import os
 import re
@@ -212,6 +213,7 @@ T.check(limited[-1] == (False, "rate-limited") and limited[0] == (True, "queued"
 DASH._BUCKETS.clear()
 
 # -- the push: allowlisted text only, no number unless with_value, the limits ----------------------------------------
+os.unlink(os.path.join(DASH.store_dir(ROOT), "alerts.json"))        # the 10-alert section filled the project: start the next sections empty
 reset_devices()
 register_phone(["tile_alert"], "d")
 fake = T.FakeExpo()
@@ -248,12 +250,13 @@ valued = make_tile()
 ask("set-alert", valued, cmp="lt", value=4242, hold_s=0, with_value=True)
 run(valued, 5000, T0 + 600, fmt="count")
 run(valued, 3333, T0 + 660, fmt="count")
+held_spool = [open(os.path.join(ROOT, PUSH.SPOOL_REL, n)).read() for n in spooled()]
 mon.observe({"ts": 3}, T0 + 700)
 mon.step(T0 + 700)
 mon.step(T0 + 710)
 sent = fake.messages() if callable(fake.messages) else fake.messages
 T.check(len(sent) == 2 and sent[-1].get("body") == "3,333, limit 4,242" and len(sent[-1]["body"]) <= 40,
-        "with_value: '<value>, limit <limit>', formatted, <= 40 characters", (len(sent), sent[-1:], events[-3:], spooled()))
+        "with_value: '<value>, limit <limit>', formatted, <= 40 characters", (len(sent), sent[-1:], events[-3:], held_spool))
 
 # -- a phone that did not ask for the kind gets nothing ---------------------------------------------------------
 mon.close()                                              # release the sender lock: a second monitor must be able to own it
