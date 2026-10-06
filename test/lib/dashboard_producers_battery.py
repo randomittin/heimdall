@@ -945,6 +945,12 @@ def real_store_contract():
     recording = Recording()
     mod.run_due(R3, mod.Scheduler(idle_pause_s=43200), store=real, drivers=lambda e, env: recording)
     ok("real-store:import-refine-never-runs-without-a-fresh-confirmation", recording.selects == [] and not mod.may_run(R3, prod_rec(t, GOOD, TS))[0])
+    again = real.get_tile(R3, t)
+    ok("real-store:the-forced-reconfirmation-is-the-case-under-test", again["origin"] == "import" and again["phase"] == "needs-confirm"
+       and again["confirmed_fp"] == again["fingerprint"] == fp, str((again["phase"], again["confirmed_fp"] == fp)))
+    with as_tty():
+        done, msg = mod.confirm_tile(R3, t, real.confirm_code(t, fp), store=real)
+    ok("real-store:an-import-confirmed-again-goes-live-though-its-fingerprint-was-pinned-before", done and real.get_tile(R3, t)["phase"] == "live", msg)
 
 
 @section

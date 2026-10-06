@@ -1047,7 +1047,7 @@ def confirm_tile(root, tile_id, typed_code, store=None, now=None):
             _write_pending(root, rec)
             _audit_refused(store, root, tile_id)
             return False, "refused -- wrong code"
-        if tile.get("confirmed_fp") != fp:
+        if tile.get("phase") == "needs-confirm" or tile.get("confirmed_fp") != fp:   # an import is in needs-confirm even with its fingerprint already pinned
             pinned, why = store.confirm_tile(root, tile_id, fp)
             if not pinned:
                 return False, "refused -- the store did not pin it (%s)" % _safe(why, 40)

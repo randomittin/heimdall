@@ -549,6 +549,48 @@ def confirmed_producers_exact():
 
 
 @check
+def failed_tiles_retry_under_backoff():
+    e = Env()
+    for detail in ("producer-failed", "timeout"):
+        tid = e.live()
+        assert d.set_tile_status(e.root, tid, "error", detail) is True
+        assert tid in [p["tile_id"] for p in d.confirmed_producers(e.root)], "an error/%s tile must stay listed: the scheduler retries it under backoff" % detail
+        assert d.set_tile_status(e.root, tid, "error", detail) is True, "a second failure of the same tile is still recorded"
+    rejected = e.live()
+    d.publish_panel(e.root, rejected, {"title": "t", "type": "no-such-type", "data": {}})
+    assert d.get_tile(e.root, rejected)["detail"] == "rejected-panel" and rejected in [p["tile_id"] for p in d.confirmed_producers(e.root)]
+    declined, expired = e.pending(), e.pending(now=1000)
+    d.decline_tile(e.root, declined)
+    d.expire_pending(e.root, now=1000 + d.PENDING_TTL_S + 1)
+    listed = {p["tile_id"] for p in d.confirmed_producers(e.root)}
+    assert declined not in listed and expired not in listed, "a declined or expired tile never runs"
+
+
+@check
+def import_with_the_confirmed_fingerprint_still_needs_confirm():
+    e = Env()
+    assert e.send(e.p("create", origin="import", author="cd" * 16))[:2] == (True, "queued")
+    job = d.claim_generation(e.root)
+    tid = job["tile_id"]
+    assert d.register_proposal(e.root, tid, job["rid"], prop()) == (True, None)
+    assert d.confirm_tile(e.root, tid, d.get_tile(e.root, tid)["fingerprint"]) == (True, None)
+    assert tid in [p["tile_id"] for p in d.confirmed_producers(e.root)]
+    assert e.send(e.p("refine", tile_id=tid))[:2] == (True, "queued")
+    job = d.claim_generation(e.root)
+    assert d.register_proposal(e.root, tid, job["rid"], prop()) == (True, None), "the generator answered with the SAME producer"
+    tile = d.get_tile(e.root, tid)
+    assert tile["confirmed_fp"] == tile["fingerprint"], "the fixture must be the case under test: the fingerprint already confirmed"
+    assert tile["origin"] == "import" and tile["phase"] == "needs-confirm" and tile["pending_at"] is not None, \
+        "an import is always confirmed again, whatever its fingerprint (%s)" % tile["phase"]
+    assert tid not in [p["tile_id"] for p in d.confirmed_producers(e.root)]
+    plain = e.live()
+    assert e.send(e.p("refine", tile_id=plain))[:2] == (True, "queued")
+    job = d.claim_generation(e.root)
+    assert d.register_proposal(e.root, plain, job["rid"], prop()) == (True, None)
+    assert d.get_tile(e.root, plain)["phase"] == "live", "a phone tile whose producer did not change still needs nothing"
+
+
+@check
 def expiry_and_decline():
     e = Env()
     tid = e.pending(now=1000)

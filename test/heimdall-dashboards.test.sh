@@ -113,6 +113,10 @@ mutant "refuse a create for an unseen tile" companion_dashboards.py \
         return False, "too-many-tiles", {}' create-accepts-unseen-tile-ids
 mutant "run a producer with fingerprint != confirmed_fp" companion_dashboards.py \
   'tile["fingerprint"] == tile["confirmed_fp"] and isinstance(tile.get("proposal"), dict)' 'isinstance(tile.get("proposal"), dict)' confirmed-producers-exact
+mutant "an error/timeout tile never retries" companion_dashboards.py \
+  'tile["detail"] in ("producer-failed", "timeout", "rejected-panel")' 'tile["detail"] in ("producer-failed", "rejected-panel")' failed-tiles-retry-under-backoff
+mutant "an import with the confirmed fingerprint goes live unconfirmed" companion_dashboards.py \
+  'if tile["confirmed_fp"] == fp and tile["origin"] != "import":' 'if tile["confirmed_fp"] == fp:' import-with-the-confirmed-fingerprint-still-needs-confirm
 mutant "let a rejected panel replace the good one" companion_dashboards.py \
   'tile.update(phase="error", detail="rejected-panel")' 'tile.update(phase="error", detail="rejected-panel", panel=dict(candidate) if isinstance(candidate, dict) else None)' publish-goes-through-the-validator
 mutant "put the producer plan into the state" companion_dashboards.py \

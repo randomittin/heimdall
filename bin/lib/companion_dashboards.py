@@ -727,7 +727,7 @@ def register_proposal(root, tile_id, rid, proposal, now=None):
             return False, "generation-failed"
         fp = fingerprint_of(clean["producer"])
         tile.update(proposal=clean, fingerprint=fp, shape=clean["shape"], detail=None)
-        if tile["confirmed_fp"] == fp:                           # a refine that left the producer as it was needs nothing
+        if tile["confirmed_fp"] == fp and tile["origin"] != "import":   # a refine that left the producer as it was needs nothing -- an import is always confirmed again (DD6.4)
             tile.update(phase="live", pending_at=None)
         else:
             tile.update(phase="needs-confirm", pending_at=now)
@@ -748,9 +748,12 @@ def fail_generation(root, tile_id, rid, detail, now=None):
 
 
 def _runnable(tile):
+    """May this tile run now? Its fingerprint is the confirmed one AND it is live, or failed in a way the scheduler retries under its
+    backoff (a run that failed, timed out or produced a panel the validator refused). Declined, expired, paused and generation
+    failures are not retried here."""
     return (tile["fingerprint"] is not None and tile["fingerprint"] == tile["confirmed_fp"] and isinstance(tile.get("proposal"), dict)
             and (tile["phase"] in ("live", "generating")
-                 or (tile["phase"] == "error" and tile["detail"] in ("producer-failed", "rejected-panel"))))
+                 or (tile["phase"] == "error" and tile["detail"] in ("producer-failed", "timeout", "rejected-panel"))))
 
 
 def confirmed_producers(root):
