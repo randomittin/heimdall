@@ -123,7 +123,7 @@ Durability is never optional — the entry lands on disk even when
 The commit is scoped (`git add` of the journal file only, not `-A`) and
 best-effort (a warning on stderr, never a hard failure — a journal tool must
 never be the reason a coding task fails), carrying the same
-`Co-Authored-By: hmd <hmd@runheimdall.dev>` trailer every hmd commit does.
+`Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>` trailer every hmd commit does.
 
 **Advisory (needs judgement, can't be mechanized):** deciding *what* is
 worth a journal entry, and writing the subject/body/evidence well. Prompt-

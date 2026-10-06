@@ -24,11 +24,17 @@
 #      the PreToolUse(Edit) hook invokes it (JSON piped on stdin), triggers a
 #      checkpoint at the threshold AND preserves its own original exit-code contract.
 #   H. STATUS                  — reports counter/threshold/dirty count correctly.
+#   I. ATTRIBUTION             — every commit the tool emits (checkpoint, note-at-threshold,
+#      squash) carries exactly one CURRENT `runhmd` trailer and never the retired
+#      `hmd@runheimdall.dev` address (CLAUDE.md "Commit attribution"). Graded in a repo with
+#      git hooks switched off, so the tool's OWN output is what is tested — not the
+#      prepare-commit-msg normalization `hmd init` installs, which would mask a stale emitter.
 #
 # Falsifiability (quoted in the implementing commit, not re-asserted here): the
 # threshold comparison in cmd_note was mutated from `-ge` to `-gt` during development,
 # which turned section B red (commit created one call late) with the exact expected
-# reason, then reverted back to green.
+# reason, then reverted back to green. Section I was run against the pre-fix tool first
+# and went red on all three assertions for each of the three commit kinds.
 #
 # Usage: bash test/heimdall-wip-commit.test.sh   (exit 0 = all hold)
 set -uo pipefail
@@ -150,6 +156,62 @@ dirty_one_file "$P" "h2.txt"
 ST="$(cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=9 "$WIP" status 2>/dev/null)"
 printf '%s' "$ST" | grep -q "count=1" && printf '%s' "$ST" | grep -q "threshold=9" && printf '%s' "$ST" | grep -q "dirty=2" \
   && ok "status line correct: $ST" || bad "status line wrong: $ST"
+rm -rf "$P"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "I. ATTRIBUTION — every commit the tool emits carries exactly one CURRENT runhmd trailer, never the retired address:"
+# Both literals are pinned HERE, not read back out of bin/heimdall-wip-commit: a stale copy of the
+# old string in the tool (or a drift in either place) must fail, not quietly agree with itself.
+# CLAUDE.md "Commit attribution": `hmd@runheimdall.dev` was retired 2026-08-20 for the `runhmd`
+# GitHub account. `hmd init`'s prepare-commit-msg hook rewrites the old form, but only in a repo
+# that hook is wired into — a fresh worktree before `hmd init`, or any other checkout, keeps
+# whatever THIS tool wrote. So the tool must emit the current form itself, and this section
+# grades its own output in a repo with hooks switched off.
+PINNED_TRAILER='Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>'
+RETIRED_ADDR='hmd@runheimdall.dev'
+
+make_hookless_project() {
+  local d
+  d="$(make_project)"
+  git -C "$d" config core.hooksPath "$d/.git/no-hooks"
+  printf '%s' "$d"
+}
+
+assert_attribution() { # <repo> <label> — grades HEAD's full message
+  local msg
+  msg="$(git -C "$1" log -1 --format=%B)"
+  [ "$(printf '%s\n' "$msg" | grep -Fxc "$PINNED_TRAILER")" -eq 1 ] \
+    && ok "$2: exactly one runhmd trailer line" || bad "$2: runhmd trailer line count != 1: $msg"
+  printf '%s' "$msg" | grep -qF "$RETIRED_ADDR" \
+    && bad "$2: carries the retired $RETIRED_ADDR address: $msg" || ok "$2: no retired $RETIRED_ADDR address"
+  [ "$(printf '%s\n' "$msg" | git -C "$1" interpret-trailers --only-trailers)" = "$PINNED_TRAILER" ] \
+    && ok "$2: git parses it as the sole trailer (the form GitHub links to the runhmd account)" \
+    || bad "$2: git does not parse the runhmd line as the sole trailer: $msg"
+}
+
+P="$(make_hookless_project)"
+dirty_one_file "$P" "i1.txt"
+( cd "$P" && "$WIP" checkpoint ) >/dev/null 2>&1
+assert_attribution "$P" "checkpoint commit"
+rm -rf "$P"
+
+P="$(make_hookless_project)"
+dirty_one_file "$P" "i2.txt"
+( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=1 "$WIP" note ) >/dev/null 2>&1
+assert_attribution "$P" "note-at-threshold commit"
+rm -rf "$P"
+
+P="$(make_hookless_project)"
+BASE_SHA="$(git -C "$P" rev-parse HEAD)"
+for n in 1 2 3; do
+  dirty_one_file "$P" "i3-$n.txt"; ( cd "$P" && "$WIP" checkpoint ) >/dev/null 2>&1
+done
+( cd "$P" && "$WIP" squash --base "$BASE_SHA" ) >/dev/null 2>&1
+case "$(git -C "$P" log -1 --format=%s)" in
+  "wip: squashed 3 checkpoint commit(s)"*) ok "squash commit is HEAD (3 wip commits collapsed)" ;;
+  *) bad "HEAD is not the squash commit: $(git -C "$P" log -1 --format=%s)" ;;
+esac
+assert_attribution "$P" "squash commit"
 rm -rf "$P"
 
 echo ""
