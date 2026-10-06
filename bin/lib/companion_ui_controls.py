@@ -136,13 +136,16 @@ RECENT_SCAN_BYTES = 256 * 1024                # how much of an audit generation 
 CLASS_READ, CLASS_SAFE_WRITE, CLASS_RISKY_WRITE, CLASS_EXPAND = "read", "safe-write", "risky-write", "expand"
 CLASSES = (CLASS_READ, CLASS_SAFE_WRITE, CLASS_RISKY_WRITE, CLASS_EXPAND)
 EXPAND_SWITCHES = ("launch", "merge", "dashboards")   # the laptop switches (companion_remote_switches.SWITCHES)
+GATE_SWITCHES = ("asks",)    # the laptop switches that gate a NON-expand action (policy gate_switch); their writer is the same one
 # What register_action's `policy` may carry: the per-action rules a sibling module's action needs of this dispatcher and nothing
 # else does. cap: the phone must have listed it (caps-missing). rid_re: a rid is REQUIRED and must be exactly this shape (it is
 # then also handed to the handler as fields["rid"]). replay_detail: the detail a replayed rid's ok ack carries instead of the first
 # one's. global_rate: False = exempt from the all-controls bucket (the action's own `rate` still applies). off_detail: the refusal
 # when its switch is off (default not-allowed). open_switch: the switch is the whole gate, there is no repo allowlist (the action
-# only ever acts on the session's own repo). timeline_ops: only these `op`s are also recorded in relay-events.jsonl.
-POLICY_KEYS = frozenset(("cap", "rid_re", "replay_detail", "global_rate", "off_detail", "open_switch", "timeline_ops"))
+# only ever acts on the session's own repo). timeline_ops: only these `op`s are also recorded in relay-events.jsonl. gate_switch: a
+# GATE_SWITCHES laptop switch that must be on for an action that is not expand (a read action behind its own consent); off = its
+# off_detail, answered before the params are read, the rid memory or any bucket is touched.
+POLICY_KEYS = frozenset(("cap", "rid_re", "replay_detail", "global_rate", "off_detail", "open_switch", "timeline_ops", "gate_switch"))
 RESERVED_EXPAND = {"launch-session": "launch", "pr-merge": "merge"}   # fixed by CP2: class expand, this switch, always
 KILL_SWITCH_EXEMPT = frozenset(("launch-stop",))   # reduce-direction: ends only what the phone started
 EXPAND_RATES = {"launch-session": ((1, 1 / 60.0),),
@@ -802,6 +805,8 @@ def register_action(name, *, cls, handler, required=(), optional=(), fields=_no_
     policy = dict(policy or {})
     if not set(policy) <= POLICY_KEYS or (policy.get("open_switch") and cls != CLASS_EXPAND):
         raise ValueError("unknown policy key, or open_switch on an action that is not expand")
+    if policy.get("gate_switch") is not None and (policy["gate_switch"] not in GATE_SWITCHES or cls == CLASS_EXPAND):
+        raise ValueError("gate_switch names a GATE_SWITCHES switch and belongs to an action that is not expand")
     _ACTIONS[name] = {"cls": cls, "switch": switch, "repo_field": repo_field, "required": tuple(required),
                       "optional": tuple(optional), "fields": fields, "audit": audit or (lambda f: {}), "handler": handler,
                       "rate": _rate_pairs(rate), "usable": usable, "policy": policy,
@@ -825,11 +830,11 @@ register_action("fallback-mode", cls=CLASS_RISKY_WRITE, handler=_do_fallback_mod
 # -- actions a sibling module owns ------------------------------------------------------------------------------
 # A module named here registers its own action(s) through register_actions(kit) when this one imports (trusted code only,
 # like every register_action call); one that cannot load, or raises, simply leaves its action off the allowlist.
-ACTION_MODULES = ("companion_dashboards",)
+ACTION_MODULES = ("companion_dashboards", "companion_quick_ask")
 
 
 def _load_action_modules():
-    kit = types.SimpleNamespace(register_action=register_action, CLASS_EXPAND=CLASS_EXPAND, Refusal=_Refusal, audit=_audit,
+    kit = types.SimpleNamespace(register_action=register_action, CLASS_EXPAND=CLASS_EXPAND, CLASS_READ=CLASS_READ, Refusal=_Refusal, audit=_audit,
                                 iso=_iso, controls_enabled=controls_enabled)
     for name in ACTION_MODULES:
         hook = getattr(_sibling(name), "register_actions", None)
@@ -926,6 +931,9 @@ def _run_command(root, action, params, device_id, started, caps=None):
     if spec is None:   # a reserved expand name nothing has registered a handler for: gated all the same
         detail = "not-allowed" if not _switch_on(gate) else "not-implemented"
         return False, detail, {}, {}, False, None
+    gated = spec["policy"].get("gate_switch")
+    if gated is not None and not _switch_on(gated):   # a laptop switch in front of a non-expand action: refused before anything is read
+        return False, spec["policy"].get("off_detail", "not-allowed"), {}, {}, False, None
     try:
         rid, fields = _validate(action, params)
         refusal = None

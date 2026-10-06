@@ -351,6 +351,14 @@ frames of a phone whose latest sealed resync listed `dash-v1`; the base state ca
 no confirmation code) so a change anywhere in the store moves the digest, and that view is replaced or dropped per phone here.
 The command event names the action only, as for every other command.
 
+QUICK ASKS (capability `ask-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-watch.md H3): `caps` also lists `ask-v1` whenever
+bin/lib/companion_quick_ask.py imported. The phone seals {"action":"quick-ask","params":{"rid":..,"project":..,"text":..}} (class `read`,
+behind `hmd app remote-asks on`, off by default), acked {"ok":true,"detail":"queued"|"dup"} or {"ok":false,"detail":<code>}. The answer
+(two lines at most, composed in code from the current panel values of the repo's dashboard tiles) is state.asks =
+{"v":1,"enabled":bool,"results":[{rid,phase,answer,tiles,at,detail}..last 8]}, sealed ONLY in the frames of a phone whose latest sealed
+resync listed `ask-v1`, held in memory only, and it sends the state again the moment a result changes. The command event names the
+action only: never the question, never an answer.
+
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
 to import -- both mean the same thing: refuse to start a plaintext relay
@@ -434,6 +442,7 @@ LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_l
 CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
 VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
 DASH = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_dashboards.py"))
+ASK = _load_module("companion_quick_ask", os.path.join(LIB_DIR, "companion_quick_ask.py"))
 WS =_load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
@@ -1801,10 +1810,13 @@ class RelayClient:
         reference assignment, so the state loop's read of it in send_hmd_frame needs no lock: it
         sees the old or the new set, both valid."""
         caps = E2E.normalize_caps(raw)
+        if ASK is not None:
+            ASK.set_on_change(self.root, self._rearm_state)  # a quick-ask answer lands later, on a worker: it sends the state again
         if caps != self.device_caps:
             had_login = LOGIN is not None and LOGIN.CAP_LOGIN in self.device_caps
             had_view = VIEW is not None and VIEW.CAP_VIEW in self.device_caps
             had_dash = DASH is not None and DASH.CAP_DASH in self.device_caps
+            had_ask = ASK is not None and ASK.CAP_ASK in self.device_caps
             self.device_caps = caps
             emit({"event": "device_caps", "caps": sorted(caps)})
             if LOGIN is not None and LOGIN.CAP_LOGIN in caps and not had_login:
@@ -1815,6 +1827,8 @@ class RelayClient:
                 self._rearm_state()  # state.views rides only for a phone that lists view-v1: send (or drop) it now
             if DASH is not None and (DASH.CAP_DASH in caps) != had_dash:
                 self._rearm_state()  # state.dashboards rides only for a phone that lists dash-v1: send (or drop) it now
+            if ASK is not None and (ASK.CAP_ASK in caps) != had_ask:
+                self._rearm_state()  # state.asks rides only for a phone that lists ask-v1: send (or drop) it now
 
     def _resync(self, params):
         """The phone's `resync` command, sent to an hmd that listed `resync` in its state frames'
@@ -1954,7 +1968,8 @@ class RelayClient:
         return (([E2E.CAP_LOGIN] if LOGIN is not None else [])
                 + ([E2E.CAP_CONTROLS] if CONTROLS is not None else [])
                 + ([VIEW.CAP_VIEW] if VIEW is not None else [])
-                + ([DASH.CAP_DASH] if DASH is not None else []))
+                + ([DASH.CAP_DASH] if DASH is not None else [])
+                + ([ASK.CAP_ASK] if ASK is not None else []))
 
     def _control(self, action, params, seq):
         """The phone's sealed control commands (REMOTE CONTROLS above): bin/lib/companion_ui_controls.py owns every
@@ -2082,6 +2097,22 @@ class RelayClient:
         except Exception as e:
             emit({"event": "error", "detail": "state.dashboards skipped: %s" % type(e).__name__})
             return {k: v for k, v in state.items() if k != "dashboards"}
+
+    # -- quick asks (ask-v1) --------------------------------------------------------------------------------------
+    # See QUICK ASKS in the module docstring. bin/lib/companion_quick_ask.py owns every rule; the sealed `quick-ask` command goes through
+    # CONTROLS.dispatch like any registered action (_control, with the phone's caps), so this is only the state.asks slice.
+    def _asks_overlay(self, state):
+        """`state` as this phone must see it, as a copy: state.asks for a phone that listed ask-v1 (through the relay's redaction
+        profile, like the rest of the state), no such key for one that did not; a fault costs the slice, never the frame."""
+        if ASK is None:
+            return state
+        try:
+            redact, strip_root = UI._transport_redaction(self.transport, self.root)
+            return ASK.overlay(state, self.root, self.device_caps,
+                               redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None)
+        except Exception as e:
+            emit({"event": "error", "detail": "state.asks skipped: %s" % type(e).__name__})
+            return {k: v for k, v in state.items() if k != "asks"}
 
     def _refuse_stale_seq(self, env, seq, ack_deadline):
         """Answer a command frame the replay guard just rejected (see STALE-SEQ REFUSAL in the module docstring):
@@ -2527,7 +2558,7 @@ class RelayClient:
         if digest == self.last_sent_digest:
             return
         rearm_gen = self._rearm_gen
-        seq, delivered = self.send_hmd_frame("state", {"state": self._dashboards_overlay(self._views_overlay(self._login_overlay(state)))})
+        seq, delivered = self.send_hmd_frame("state", {"state": self._asks_overlay(self._dashboards_overlay(self._views_overlay(self._login_overlay(state))))})
         if delivered is None:
             # No usable answer: the frame never reached the phone. last_sent_digest
             # stays as it was, so the next tick sends the (then current) state again

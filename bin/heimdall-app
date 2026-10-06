@@ -135,6 +135,14 @@
 #                              $HEIMDALL_HOME/remote-dashboards.json. `hmd app status` prints one `remote dashboards:`
 #                              line (switch, tiles, pending confirmations). Delegates to
 #                              bin/lib/companion_remote_switches.py; the slice and the store are bin/lib/companion_dashboards.py.
+#   hmd app remote-asks on|off|status [--repo DIR]
+#                              Quick asks from the paired phone and its watch (capability ask-v1): a short question about the
+#                              dashboard numbers, answered in two lines from the tiles' current values, read-only -- no producer
+#                              runs, nothing is queried, the coding agent is never reached. Off by default; it also needs remote
+#                              dashboards on. `on` refuses unless stdin is a terminal and under HMD_UI_CONTROLS=0; `off` and
+#                              `status` need no terminal. State, 0600: $HEIMDALL_HOME/remote-asks.json. `hmd app status` prints one
+#                              `remote asks:` line. Delegates to bin/lib/companion_remote_switches.py; the rest is
+#                              bin/lib/companion_quick_ask.py.
 #   hmd app controls on|off|status [--repo DIR]
 #                              The paired phone's remote controls (capability
 #                              controls-v1: interrupt, save-checkpoint, hook-toggle,
@@ -1425,6 +1433,9 @@ cmd_status() {
   if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_dashboards.py" ]; then
     "$PY3" "$LIB_DIR/companion_dashboards.py" status-line --repo "$REPO" 2>/dev/null
   fi
+  if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_quick_ask.py" ]; then
+    "$PY3" "$LIB_DIR/companion_quick_ask.py" status-line --repo "$REPO" 2>/dev/null
+  fi
 
   [ "$orphaned" = true ] && return 1
   return 0
@@ -1526,6 +1537,9 @@ cmd_status_relay() {
   fi
   if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_dashboards.py" ]; then
     "$PY3" "$LIB_DIR/companion_dashboards.py" status-line --repo "$REPO" 2>/dev/null
+  fi
+  if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_quick_ask.py" ]; then
+    "$PY3" "$LIB_DIR/companion_quick_ask.py" status-line --repo "$REPO" 2>/dev/null
   fi
   return 0
 }
@@ -1990,7 +2004,7 @@ case "$CMD" in
   disconnect) cmd_disconnect "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;
   remote-login) cmd_remote_login "$@"; exit $? ;;
-  remote-launch|remote-merge|launch-allow|remote-dashboards) cmd_remote_switches "$CMD" "$@"; exit $? ;;
+  remote-launch|remote-merge|launch-allow|remote-dashboards|remote-asks) cmd_remote_switches "$CMD" "$@"; exit $? ;;
   controls) cmd_controls "$@"; exit $? ;;
   push-test) cmd_push_test "$@"; exit $? ;;
   *)

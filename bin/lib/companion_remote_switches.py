@@ -14,6 +14,7 @@ them is bin/lib/companion_ui_controls.py; this module is what it asks, and the c
 
     hmd app remote-launch on|off|status [--repo DIR]     (bin/heimdall-app delegates here: python3 <this file> remote-launch ...)
     hmd app remote-merge  on|off|status [--repo DIR]
+    hmd app remote-asks   on|off|status [--repo DIR]     (the phone's read-only quick-ask, bin/lib/companion_quick_ask.py)
     hmd app launch-allow <repo-path> [--merge] | --remove <id> | --list
     status-line [--repo DIR]                            one line for `hmd app status`: both switches and the allowlist size
 
@@ -45,9 +46,9 @@ from importlib.util import module_from_spec, spec_from_file_location
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 
-SWITCHES = {"launch": "remote-launch.json", "merge": "remote-merge.json", "dashboards": "remote-dashboards.json"}
-CLI_SWITCH = {"remote-launch": "launch", "remote-merge": "merge", "remote-dashboards": "dashboards"}
-SWITCH_WORDS = {"launch": "remote launch", "merge": "remote merge", "dashboards": "remote dashboards"}
+SWITCHES = {"launch": "remote-launch.json", "merge": "remote-merge.json", "dashboards": "remote-dashboards.json", "asks": "remote-asks.json"}
+CLI_SWITCH = {"remote-launch": "launch", "remote-merge": "merge", "remote-dashboards": "dashboards", "remote-asks": "asks"}
+SWITCH_WORDS = {"launch": "remote launch", "merge": "remote merge", "dashboards": "remote dashboards", "asks": "remote asks"}
 OPEN_SWITCHES = frozenset(("dashboards",))   # a switch that is the whole gate: its action acts on the session's own repo, no allowlist
 SWITCH_MAX_BYTES = 4096
 ALLOWLIST_REL = os.path.join("app", "launch-allowlist.json")
@@ -347,6 +348,7 @@ def remove_repo(wanted, home=None):
 USAGE = ("usage: hmd app remote-launch on|off|status [--repo DIR]\n"
          "       hmd app remote-merge  on|off|status [--repo DIR]\n"
          "       hmd app remote-dashboards on|off|status [--repo DIR]\n"
+         "       hmd app remote-asks on|off|status [--repo DIR]\n"
          "       hmd app launch-allow <repo-path> [--merge] | --remove <id> | --list\n")
 
 
@@ -414,6 +416,12 @@ def _cmd_switch(switch, cmd, rest):
         _say("remote dashboards: on -- the paired phone can describe a panel in words and hmd on this laptop builds a read-only "
              "data producer for it; nothing runs until you confirm it here (hmd dash pending). Turn it off with: hmd app "
              "remote-dashboards off")
+        return 0
+    elif switch == "asks":
+        _say("remote asks: on -- the paired phone (and its watch) can ask a short question about the dashboard numbers of this repo "
+             "and hmd answers from the tiles' current values, read-only: no producer runs, nothing is queried, the coding agent is never "
+             "reached. To choose the tile a model sees the question and each live number tile's title and intent (never its value). "
+             "It needs remote dashboards on too. Turn it off with: hmd app remote-asks off")
         return 0
     else:
         _say("remote merge: on -- the paired phone can merge a pull request for a repo allowlisted with --merge, only while "
