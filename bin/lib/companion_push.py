@@ -446,6 +446,26 @@ def registered_kinds():
     return {kind: spec["cap"] for kind, spec in _EXT.items()}
 
 
+def _load_store():
+    """The registration store by path, bound to this module's registry so it keeps (and does not drop as damaged) a registered kind."""
+    store = _load_sibling("companion_push_store")
+    if store is not None and hasattr(store, "bind_extension_kinds"):
+        store.bind_extension_kinds(registered_kinds)
+    return store
+
+
+def devices_wanting(root, kind):
+    """How many registered devices asked for `kind` (a registered extension kind): 0 when none did, push is off or the store is gone."""
+    if not enabled() or kind not in _EXT:
+        return 0
+    store = _load_store()
+    try:
+        data = _devices_from(store.load(root)) if store is not None else None
+    except Exception:
+        return 0
+    return sum(1 for record in (data["devices"].values() if data else ()) if kind in record["events"])
+
+
 def _spool_dir(root):
     return os.path.join(root, SPOOL_REL)
 
@@ -890,7 +910,7 @@ def registered_devices(root, store=None):
     sender would send to, in registry order -- what `hmd app push-test` counts and lists. Never a token. `store`
     reads the registry (default bin/lib/companion_push_store.py, whose load() never raises: no registry is no
     devices); raises RuntimeError when that module cannot be loaded."""
-    store = store if store is not None else _load_sibling("companion_push_store")
+    store = store if store is not None else _load_store()
     if store is None:
         raise RuntimeError("bin/lib/companion_push_store.py could not be loaded")
     data = _devices_from(store.load(root))
@@ -1353,7 +1373,7 @@ class PushMonitor:
     # -- the store, the lock, the log ----------------------------------------------------------------
     def _store(self):
         if self.store is None:
-            self.store = _load_sibling("companion_push_store")
+            self.store = _load_store()
         return self.store
 
     def _load(self):
