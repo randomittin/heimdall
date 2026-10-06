@@ -99,6 +99,27 @@
 #      admitted by the identities gate, the admission is attributable to that one
 #      entry, and lookalikes of it and strangers still block.
 #
+# COST — why E(ii-iv) and F run over minimal repos, not clones of the real one.
+#   Measured 2026-10-06 over the real repo (4346 commits, 2059 tracked files, 35 MB
+#   tree), CPU-seconds so the figure survives a loaded box: one gitleaks HISTORY
+#   pass ~43, one TREE pass (materialise + scan) ~36, one landmine-lint pass ~23
+#   (fork-bound: 117 s wall at load 38). Every selfscan run pays history first and
+#   only reaches tree/identities/lint if that was clean.
+#   The old layout cloned the real repo for E AND F and ran the full gate ten times
+#   over real-repo-sized input: 10 history + 7 tree + 4 lint passes ~ 770 CPU-s, a
+#   number that grows with every commit. It TIMEOUT'd (killed at the 600 s override,
+#   in section F, still passing) in `run-all.sh --jobs 3 --timeout 400` and again in
+#   its solo retry.
+#   Now only proofs that are claims about the REAL repo touch it: A (bare gitleaks +
+#   the gate over the repo) and E(i) (the gate over a pristine clone) = 3 history +
+#   2 tree + 2 lint ~ 250 CPU-s, and those three chains (A's bare scan, A's gate run,
+#   E(i)'s clone + gate run) are independent read-only walks, so they run OVERLAPPED as
+#   background jobs: wall time is the longest chain, not the sum. Proofs about the
+#   GATE'S BEHAVIOUR on a planted file —
+#   E(ii-iv), F, and already G and H — run the real gate over mk_mini repos, whose
+#   cost does not depend on history size. No assertion was dropped or weakened; each
+#   still runs the real gate script (the on-disk copy, uncommitted edits included).
+#
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 
 set -uo pipefail
@@ -149,15 +170,49 @@ command -v gitleaks >/dev/null 2>&1 || { echo "FATAL: gitleaks not installed —
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# ── proof E(i)'s clone + gate run starts NOW and overlaps section A ──────────────
+# E(i) is one full gate run over a pristine clone of the real repo: ~100 CPU-s, and
+# minutes of wall clock on a loaded box (213 s measured at load 38). It shares no
+# state with A — its own clone, read-only against the repo — so it runs as a
+# background job and section E collects it. A's own two scans overlap the same way.
+# Wall time under contention scales with CPU SHARE, which a few extra runnable
+# chains barely change, so overlapping independent chains is a near-linear win even
+# on a saturated machine. The clone must be FULL, never shallow, and uncommitted
+# tracked changes are applied on top: the reasons are in E's header.
+E_STATUS="$WORK/e-clone.status"
+(
+  CLONE="$WORK/treeclone"
+  if ! git clone -q "$REPO" "$CLONE" 2>/dev/null; then
+    echo clone-failed > "$E_STATUS"
+    exit 0
+  fi
+  WT_DIFF="$WORK/worktree.patch"
+  ( cd "$REPO" && git diff HEAD --binary ) > "$WT_DIFF" 2>/dev/null || : > "$WT_DIFF"
+  if [ -s "$WT_DIFF" ] && ! ( cd "$CLONE" && git apply "$WT_DIFF" ) 2>/dev/null; then
+    echo apply-failed > "$E_STATUS"
+  else
+    echo ok > "$E_STATUS"
+  fi
+  chmod +x "$CLONE/bin/heimdall-selfscan"
+  e_rc=0
+  ( cd "$CLONE" && ./bin/heimdall-selfscan ) >"$WORK/e-clean.err" 2>&1 || e_rc=$?
+  echo "$e_rc" > "$WORK/e-clean.rc"
+) &
+E_PID=$!
+
 # ─────────────────────────────────────────────────────────────────────────────
 # A. PARITY — bare gitleaks history scan == selfscan, both clean.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "A. PARITY (bare gitleaks history == selfscan's SECRET verdict):"
-bare_rc=0
-( cd "$REPO" && gitleaks detect --source . --log-opts="--all" --no-banner ) >/dev/null 2>&1 || bare_rc=$?
+# The bare scan and the gate are independent read-only walks of the same history, so
+# they overlap (see the prelaunch note above); the verdicts are read after both end.
+( cd "$REPO" && gitleaks detect --source . --log-opts="--all" --no-banner ) >/dev/null 2>&1 &
+bare_pid=$!
 A_ERR="$WORK/a-selfscan.err"
 self_rc=0
 ( cd "$REPO" && "$SELFSCAN" ) >"$A_ERR" 2>&1 || self_rc=$?
+bare_rc=0
+wait "$bare_pid" || bare_rc=$?
 if [ "$bare_rc" -eq 0 ]; then
   ok "bare gitleaks over heimdall history is clean (rc=0)"
 else
@@ -303,6 +358,30 @@ if [ -n "$CFG" ]; then
   fi
 fi
 
+# mk_mini <dir> — a MINIMAL heimdall for the proofs whose property is the GATE'S
+# BEHAVIOUR rather than the real repo's contents (see COST in the header): the real
+# gate as it stands on disk (uncommitted edits included), the real linter, the real
+# .gitleaks.toml and .gitignore, a tracked README.md, ONE commit, and ~200 KB of
+# benign padding so a clean tree verdict clears the tree gate's 100 KB anti-vacuous
+# floor. The same construction proofs G and H use.
+mk_mini() {
+  local d="$1"
+  mkdir -p "$d/bin"
+  cp "$SELFSCAN" "$d/bin/heimdall-selfscan"
+  cp "$REPO/bin/heimdall-landmine-lint" "$d/bin/heimdall-landmine-lint"
+  cp "$CFG" "$d/.gitleaks.toml"
+  cp "$REPO/.gitignore" "$d/.gitignore"
+  chmod +x "$d/bin/heimdall-selfscan" "$d/bin/heimdall-landmine-lint"
+  printf '# minimal heimdall\n' > "$d/README.md"
+  seq 1 40000 > "$d/pad.txt"
+  git -C "$d" init -q
+  git -C "$d" config user.email "rj@runheimdall.dev"
+  git -C "$d" config user.name "RJ"
+  git -C "$d" config commit.gpgsign false
+  git -C "$d" add -A
+  git -C "$d" commit -q --no-verify -m "minimal heimdall"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # E. TREE-MODE — the gate must also scan the files as they are ON DISK.
 #
@@ -316,14 +395,24 @@ fi
 #    exactly that reason. A credential in a working-tree file could therefore
 #    sail past a pre-push gate that reported clean.
 #
-#    Four coupled proofs, run against a throwaway clone so the real repo is never
-#    touched. The clone must be FULL, never shallow: `--depth 1` re-materializes
-#    the entire tree as one fresh commit whose SHA matches none of the
-#    .gitleaksignore fingerprints (they are commit-scoped), so every benign
-#    historical fixture resurfaces and the history pass blocks for the wrong
-#    reason — proof E would then "fail" without the tree pass ever being at fault.
-#    Uncommitted tracked changes are applied on top, so the gate under test is the
-#    one about to be pushed rather than the last-committed one.
+#    Four coupled proofs, split by what each one is a claim ABOUT (see COST in the
+#    header: one gate run over the real repo is ~100 CPU-seconds before its linter):
+#      (i)   is a claim about the REAL tree, so it alone runs over a throwaway
+#            clone of the real repo (the real repo itself is never touched). The
+#            clone must be FULL, never shallow: `--depth 1` re-materializes the
+#            entire tree as one fresh commit whose SHA matches none of the
+#            .gitleaksignore fingerprints (they are commit-scoped), so every benign
+#            historical fixture resurfaces and the history pass blocks for the
+#            wrong reason — proof E would then "fail" without the tree pass ever
+#            being at fault. Uncommitted tracked changes are applied on top, so the
+#            gate under test is the one about to be pushed rather than the
+#            last-committed one.
+#      (ii)-(iv) are claims about the GATE'S BEHAVIOUR on a planted working-tree
+#            file — a blind history walk, a block, a removable step. None depends
+#            on how large the repo around the file is, so they run over a MINIMAL
+#            throwaway heimdall (mk_mini) as proofs G and H do. They used to clone
+#            the real repo three more times and walk its full history and tree on
+#            every run, to learn the same thing.
 #      (i)   TRUE NEGATIVE + ANTI-VACUOUS — a pristine clone scans clean, AND the
 #            gate reports a plausible scanned volume. "0 findings" is meaningless
 #            without "over this much"; a clean verdict over ~0 bytes is refused.
@@ -334,25 +423,21 @@ fi
 #            through (RED); restore it and the block returns (GREEN).
 # ─────────────────────────────────────────────────────────────────────────────
 echo "E. TREE-MODE (on-disk secret blocks; history-only cannot see it):"
-CLONE="$WORK/treeclone"
-if ! git clone -q "$REPO" "$CLONE" 2>/dev/null; then
-  bad "E — could not clone $REPO into a throwaway; the tree-mode proofs did NOT run"
+# The clone, the working-tree diff and the gate run for (i) were started before
+# section A (see the prelaunch note at the top) and overlapped it; collect them here.
+wait "$E_PID" 2>/dev/null
+E_CLONE_STATUS="$(cat "$E_STATUS" 2>/dev/null || true)"
+if [ -z "$E_CLONE_STATUS" ] || [ "$E_CLONE_STATUS" = "clone-failed" ]; then
+  bad "E — could not clone $REPO into a throwaway; proof E(i) did NOT run"
 else
-  # Carry over uncommitted tracked edits so the gate under test is the one about
-  # to be pushed, not the last-committed one. Empty diff -> nothing to apply.
-  WT_DIFF="$WORK/worktree.patch"
-  ( cd "$REPO" && git diff HEAD --binary ) > "$WT_DIFF" 2>/dev/null || : > "$WT_DIFF"
-  if [ -s "$WT_DIFF" ]; then
-    ( cd "$CLONE" && git apply "$WT_DIFF" ) 2>/dev/null \
-      || bad "E — could not apply the working-tree diff to the clone; proofs below test the COMMITTED gate, not the pending one"
+  if [ "$E_CLONE_STATUS" = "apply-failed" ]; then
+    bad "E — could not apply the working-tree diff to the clone; proof E(i) tests the COMMITTED gate, not the pending one"
   fi
-  chmod +x "$CLONE/bin/heimdall-selfscan"
 
   # (i) TRUE NEGATIVE + ANTI-VACUOUS — asserted on the TREE gate's own verdict,
   # not on the bundled exit code, so a block in an unrelated sub-gate can neither
   # fail this proof nor erase the measurement it depends on.
-  clean_rc=0
-  ( cd "$CLONE" && ./bin/heimdall-selfscan ) >"$WORK/e-clean.err" 2>&1 || clean_rc=$?
+  clean_rc="$(cat "$WORK/e-clean.rc" 2>/dev/null || echo unknown)"
   e_tree="$(gate_verdict "$WORK/e-clean.err" tree-secrets)"
   if [ "$e_tree" = "clean" ]; then
     ok "pristine clone: tree pass returns verdict=clean — no false positive"
@@ -371,16 +456,26 @@ else
   else
     bad "tree pass reported no/implausible scanned volume (${TREE_B:-none}) — a clean verdict here proves nothing"
   fi
+fi
+
+if [ -z "$CFG" ]; then
+  bad "E — .gitleaks.toml missing at repo top; proofs E(ii)-(iv) need the shipped config"
+else
+  EMINI="$WORK/emini"
+  mk_mini "$EMINI"
 
   # Plant a real-shaped credential in a WORKING-TREE file. Never committed: that
   # is precisely the surface the history walk cannot reach. Reuses the runtime-
   # assembled Stripe token from proof C, so this file still carries no literal.
-  mkdir -p "$CLONE/src"
-  printf 'const stripeKey = "%s";\n' "$sk" > "$CLONE/src/tree-leak.js"
+  mkdir -p "$EMINI/src"
+  printf 'const stripeKey = "%s";\n' "$sk" > "$EMINI/src/tree-leak.js"
 
-  # (ii) BLINDNESS — history-only must NOT see it.
+  # (ii) BLINDNESS — history-only must NOT see it. A property of history mode
+  # itself, so a one-commit repo shows it as well as 4346 commits would; the
+  # positive control is proof C (the same secret COMMITTED is flagged by this same
+  # scan under this same config).
   hist_only_rc=0
-  ( cd "$CLONE" && gitleaks detect --source . --config .gitleaks.toml --log-opts="--all" --no-banner --no-color ) >/dev/null 2>&1 || hist_only_rc=$?
+  ( cd "$EMINI" && gitleaks detect --source . --config .gitleaks.toml --log-opts="--all" --no-banner --no-color ) >/dev/null 2>&1 || hist_only_rc=$?
   if [ "$hist_only_rc" -eq 0 ]; then
     ok "history-only scan is BLIND to the working-tree secret (rc=0) — blind spot reproduced"
   else
@@ -389,7 +484,7 @@ else
 
   # (iii) TRUE POSITIVE — the full gate must block, and say why.
   planted_rc=0
-  ( cd "$CLONE" && ./bin/heimdall-selfscan ) >"$WORK/e-planted.err" 2>&1 || planted_rc=$?
+  ( cd "$EMINI" && ./bin/heimdall-selfscan ) >"$WORK/e-planted.err" 2>&1 || planted_rc=$?
   if [ "$planted_rc" -ne 0 ] && grep -q "WORKING TREE" "$WORK/e-planted.err"; then
     ok "gate BLOCKS the working-tree secret (rc=$planted_rc) and names the working tree"
   else
@@ -397,14 +492,14 @@ else
   fi
 
   # (iv) FALSIFIABILITY — remove the tree pass; the same secret must sail through.
-  MUT="$CLONE/bin/heimdall-selfscan"
+  MUT="$EMINI/bin/heimdall-selfscan"
   cp "$MUT" "$WORK/selfscan.orig"
   sed '/# --- scan the WORKING TREE for secrets/,/# --- identity allowlist over the FULL history/{
          /# --- identity allowlist over the FULL history/!d
        }' "$WORK/selfscan.orig" > "$MUT"
   chmod +x "$MUT"
   mut_rc=0
-  ( cd "$CLONE" && ./bin/heimdall-selfscan ) >"$WORK/e-mut.err" 2>&1 || mut_rc=$?
+  ( cd "$EMINI" && ./bin/heimdall-selfscan ) >"$WORK/e-mut.err" 2>&1 || mut_rc=$?
 
   # The mutation must be REAL — otherwise the RED below is meaningless theatre.
   #
@@ -418,7 +513,7 @@ else
   # from commentary, so it proves nothing about what RAN.
   #
   # The A/B below is over observed behaviour instead: the same planted secret,
-  # the same clone, the original vs the mutant. The original's tree gate REPORTS
+  # the same repo, the original vs the mutant. The original's tree gate REPORTS
   # (blocked, having found the secret); the mutant's tree gate never reports at
   # all, because it no longer exists. No comment can emit a runtime verdict.
   orig_tree="$(gate_verdict "$WORK/e-planted.err" tree-secrets)"
@@ -441,7 +536,7 @@ else
   cp "$WORK/selfscan.orig" "$MUT"
   chmod +x "$MUT"
   restored_rc=0
-  ( cd "$CLONE" && ./bin/heimdall-selfscan ) >"$WORK/e-restored.err" 2>&1 || restored_rc=$?
+  ( cd "$EMINI" && ./bin/heimdall-selfscan ) >"$WORK/e-restored.err" 2>&1 || restored_rc=$?
   # Must block for the RIGHT reason. A nonzero exit alone would also be produced by
   # a history/identity/landmine failure, which would make this a vacuous green.
   if [ "$restored_rc" -ne 0 ] && grep -q "WORKING TREE" "$WORK/e-restored.err"; then
@@ -470,6 +565,13 @@ fi
 #    failed". So this proof MANUFACTURES the pollution rather than hoping to
 #    encounter it.
 #
+#    It runs over a MINIMAL throwaway heimdall (mk_mini), not a clone of the real
+#    repo: the property is which paths the tree pass walks, which is decided by
+#    git's own pushable-set rule applied to the repo's .gitignore — and mk_mini
+#    carries the REAL .gitignore, with the premise below asserting the three
+#    planted paths are ignored under it. A clone added nothing but a full-history
+#    walk and a 35 MB tree walk per gate run (see COST in the header).
+#
 #    Three coupled assertions, a complete truth table over the pushable set:
 #      (i)   IGNORED IS OUT — secrets in .gitignored paths must NOT block.
 #      (ii)  FALSIFIABILITY — repoint the scan at the raw filesystem (the pre-fix
@@ -484,27 +586,18 @@ fi
 #    which plants exactly that and requires a block — so all three classes hold.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "F. TREE SCOPE (pushable set only — ignored paths must not block a push):"
-SCOPE="$WORK/scopeclone"
-if ! git clone -q "$REPO" "$SCOPE" 2>/dev/null; then
-  bad "F — could not clone $REPO into a throwaway; the scope proofs did NOT run"
+if [ -z "$CFG" ]; then
+  bad "F — .gitleaks.toml missing at repo top; the scope proofs did NOT run"
 else
-  # Same rationale as E: test the gate that is about to be pushed, not the last
-  # committed one. A full (never shallow) clone keeps .gitleaksignore fingerprints
-  # valid, so the history pass cannot block for an unrelated reason.
-  WT_DIFF_F="$WORK/worktree-f.patch"
-  ( cd "$REPO" && git diff HEAD --binary ) > "$WT_DIFF_F" 2>/dev/null || : > "$WT_DIFF_F"
-  if [ -s "$WT_DIFF_F" ]; then
-    ( cd "$SCOPE" && git apply "$WT_DIFF_F" ) 2>/dev/null \
-      || bad "F — could not apply the working-tree diff to the clone; proofs below test the COMMITTED gate, not the pending one"
-  fi
-  chmod +x "$SCOPE/bin/heimdall-selfscan"
+  SCOPE="$WORK/scopemini"
+  mk_mini "$SCOPE"
 
   # Manufacture the exact pollution that made the gate unshippable: a real-shaped
   # credential in three .gitignored locations, mirroring the three real classes
   # (agent worktree copy / local team credential / ignored analysis doc).
   # $sk is the runtime-assembled Stripe token from proof C — never a real
   # credential. The developer's actual .heimdall/team.json is never read, copied,
-  # or referenced by this suite; only a throwaway clone is written to.
+  # or referenced by this suite; only a throwaway is written to.
   POLLUTED=".claude/worktrees/stale-agent/fixture.js .heimdall/team.json docs/analysis/scratch-triage.md"
   for p in $POLLUTED; do
     mkdir -p "$SCOPE/$(dirname "$p")"
@@ -517,7 +610,7 @@ else
   for p in $POLLUTED; do
     if ! ( cd "$SCOPE" && git check-ignore -q "$p" ); then
       ignored_all=0
-      bad "F — $p is NOT gitignored in the clone; this proof's premise no longer holds"
+      bad "F — $p is NOT gitignored in the throwaway; this proof's premise no longer holds"
     fi
   done
   if [ "$ignored_all" -eq 1 ]; then
@@ -550,20 +643,22 @@ else
   ( cd "$SCOPE" && ./bin/heimdall-selfscan ) >"$WORK/f-unscoped.err" 2>&1 || unscoped_rc=$?
   # Mutation proven by the VOLUME the tree gate reports it read, not by grepping
   # the source. Repointing --source from the materialised pushable set to the raw
-  # repo top strictly widens the walk (it picks up .git, the ignored pollution,
-  # every untracked scratch file), so the mutant MUST report more bytes than the
-  # scoped run did. That is the scoping change observable in the executing path.
+  # repo top strictly widens the walk (it picks up the ignored pollution and every
+  # untracked scratch file), so the mutant MUST report more bytes than the scoped
+  # run did. That is the scoping change observable in the executing path.
   f_scoped_b="$(gate_field "$WORK/f-ignored.err" tree-secrets bytes)"
   f_unscoped_b="$(gate_field "$WORK/f-unscoped.err" tree-secrets bytes)"
   if [ -n "$f_scoped_b" ] && [ -n "$f_unscoped_b" ] && [ "$f_unscoped_b" -gt "$f_scoped_b" ]; then
     ok "mutation is real AT RUNTIME (tree scan widened ${f_scoped_b} -> ${f_unscoped_b} bytes)"
   else
     bad "tree scan volume did not widen (scoped=${f_scoped_b:-none}, unscoped=${f_unscoped_b:-none}) — the RED below would prove nothing"
+    grep -E '^guard|BLOCKED' "$WORK/f-unscoped.err" | sed 's/^/      /' | head -8
   fi
   if [ "$unscoped_rc" -ne 0 ] && grep -q "WORKING TREE" "$WORK/f-unscoped.err"; then
     ok "WITHOUT the scoping the same ignored files DO block (rc=$unscoped_rc) — the scoping earns its place"
   else
     bad "unscoped gate did not block on the ignored pollution (rc=$unscoped_rc) — (i) is vacuous; the planted secrets may not be detectable at all"
+    tail -8 "$WORK/f-unscoped.err" | sed 's/^/      /'
   fi
 
   # (iii) TRACKED IS IN — restore the scoped gate, keep the pollution, and make an
@@ -572,7 +667,7 @@ else
   chmod +x "$SMUT"
   TRACKED_VICTIM="README.md"
   if [ ! -f "$SCOPE/$TRACKED_VICTIM" ]; then
-    bad "F — $TRACKED_VICTIM missing from the clone; cannot prove tracked files stay in scope"
+    bad "F — $TRACKED_VICTIM missing from the throwaway; cannot prove tracked files stay in scope"
   else
     printf 'const stripeKey = "%s";\n' "$sk" >> "$SCOPE/$TRACKED_VICTIM"
     tracked_rc=0
