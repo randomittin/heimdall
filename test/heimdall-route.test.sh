@@ -87,6 +87,7 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-route.XXXXXX")"
 LIVE_PIDS=""
+# shellcheck disable=SC2329  # runs from the EXIT trap below; shellcheck does not follow trap handlers
 cleanup() {
   local p
   for p in $LIVE_PIDS; do kill "$p" >/dev/null 2>&1 || true; done
@@ -117,10 +118,18 @@ print(" ".join(str(p) for p in ports))
 
 echo
 echo "1 — the binary exists, parses, and is reachable from the router"
-[ -f "$ROUTE" ] && [ -x "$ROUTE" ] && ok "bin/heimdall-route exists and is executable" \
-  || { bad "bin/heimdall-route missing or not executable"; echo "FATAL"; exit 1; }
-bash -n "$ROUTE" && ok "bin/heimdall-route parses (bash -n)" \
-  || bad "bin/heimdall-route has a syntax error"
+if [ -f "$ROUTE" ] && [ -x "$ROUTE" ]; then
+  ok "bin/heimdall-route exists and is executable"
+else
+  bad "bin/heimdall-route missing or not executable"
+  echo "FATAL"
+  exit 1
+fi
+if bash -n "$ROUTE"; then
+  ok "bin/heimdall-route parses (bash -n)"
+else
+  bad "bin/heimdall-route has a syntax error"
+fi
 if "$REPO/bin/hmd" route --help 2>/dev/null | grep -q "hmd route"; then
   ok "\`hmd route\` reaches it through the router"
 else
@@ -226,9 +235,11 @@ PID1="$(start_proxy "$PORT1" --lossless)" && LIVE_PIDS="$LIVE_PIDS $PID1"
 if [ -n "${PID1:-}" ]; then
   URL1="$(cd "$FALLBACK_FREE_REPO" && HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
           HEIMDALL_HOME="$TMP/home1" HEADROOM_PORT="$PORT1" "$ROUTE" --url 2>/dev/null)"
-  [ "$URL1" = "http://127.0.0.1:$PORT1" ] \
-    && ok "--url prints $URL1" \
-    || bad "--url printed '$URL1', expected http://127.0.0.1:$PORT1"
+  if [ "$URL1" = "http://127.0.0.1:$PORT1" ]; then
+    ok "--url prints $URL1"
+  else
+    bad "--url printed '$URL1', expected http://127.0.0.1:$PORT1"
+  fi
 else
   bad "guarantee 2 skipped — the fixture proxy never became ready on $PORT1"
 fi
@@ -245,9 +256,11 @@ if [ -n "${PID2:-}" ]; then
   else
     bad "--url returned rc=$RC2 stdout='$OUT2' — a refused proxy must not yield a URL"
   fi
-  grep -q "lossless" "$TMP/err2" \
-    && ok "the reason reaches stderr, where a shell integration can show it" \
-    || bad "no reason on stderr: $(cat "$TMP/err2")"
+  if grep -q "lossless" "$TMP/err2"; then
+    ok "the reason reaches stderr, where a shell integration can show it"
+  else
+    bad "no reason on stderr: $(cat "$TMP/err2")"
+  fi
 else
   bad "guarantee 3 skipped — the fixture proxy never became ready on $PORT2"
 fi
@@ -261,16 +274,26 @@ if [ -n "${PID1:-}" ]; then
     HEIMDALL_HOME="$TMP/home4" HEADROOM_PORT="$PORT1" \
     "$ROUTE" faketool --some-flag value >"$TMP/out4" 2>"$TMP/err4" )
   RC4=$?
-  [ "$RC4" = "0" ] && ok "the tool ran (exit 0)" || bad "the tool did not run cleanly (rc=$RC4): $(cat "$TMP/err4")"
-  grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV4" 2>/dev/null \
-    && ok "the child env carries ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1" \
-    || bad "child env has no ANTHROPIC_BASE_URL for the live proxy: $(grep '^ANTHROPIC_BASE_URL=' "$ENV4" 2>/dev/null || echo '<absent>')"
-  grep -q -- "--some-flag value" "$TMP/out4" \
-    && ok "the tool's own arguments are forwarded verbatim" \
-    || bad "arguments were not forwarded: $(cat "$TMP/out4")"
-  grep -q "routed via" "$TMP/err4" \
-    && ok "routing is disclosed on stderr, never silent" \
-    || bad "the launch did not disclose that it is proxied: $(cat "$TMP/err4")"
+  if [ "$RC4" = "0" ]; then
+    ok "the tool ran (exit 0)"
+  else
+    bad "the tool did not run cleanly (rc=$RC4): $(cat "$TMP/err4")"
+  fi
+  if grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV4" 2>/dev/null; then
+    ok "the child env carries ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1"
+  else
+    bad "child env has no ANTHROPIC_BASE_URL for the live proxy: $(grep '^ANTHROPIC_BASE_URL=' "$ENV4" 2>/dev/null || echo '<absent>')"
+  fi
+  if grep -q -- "--some-flag value" "$TMP/out4"; then
+    ok "the tool's own arguments are forwarded verbatim"
+  else
+    bad "arguments were not forwarded: $(cat "$TMP/out4")"
+  fi
+  if grep -q "routed via" "$TMP/err4"; then
+    ok "routing is disclosed on stderr, never silent"
+  else
+    bad "the launch did not disclose that it is proxied: $(cat "$TMP/err4")"
+  fi
 else
   bad "guarantee 4 skipped — no live fixture proxy"
 fi
@@ -284,8 +307,11 @@ EMPTY_STATE="$TMP/empty-modstate"; mkdir -p "$EMPTY_STATE"
   HEIMDALL_HOME="$TMP/home5" HEADROOM_PORT="$PORT_FAILOPEN" \
   "$ROUTE" faketool >"$TMP/out5" 2>"$TMP/err5" )
 RC5=$?
-[ "$RC5" = "0" ] && ok "the tool launched anyway (exit 0)" \
-  || bad "an unavailable proxy blocked the launch (rc=$RC5) — fail-open is the contract"
+if [ "$RC5" = "0" ]; then
+  ok "the tool launched anyway (exit 0)"
+else
+  bad "an unavailable proxy blocked the launch (rc=$RC5) — fail-open is the contract"
+fi
 if grep -q '^ANTHROPIC_BASE_URL=' "$ENV5" 2>/dev/null; then
   bad "ANTHROPIC_BASE_URL was set with no usable proxy: $(grep '^ANTHROPIC_BASE_URL=' "$ENV5")"
 else
@@ -306,9 +332,11 @@ if [ -s "$ENV4" ]; then
   for v in HTTPS_PROXY ALL_PROXY HTTP_PROXY https_proxy all_proxy http_proxy; do
     grep -q "^$v=" "$ENV4" && LEAKED="$LEAKED $v"
   done
-  [ -z "$LEAKED" ] \
-    && ok "no HTTPS_PROXY/ALL_PROXY/HTTP_PROXY on the child — only ANTHROPIC_BASE_URL is set" \
-    || bad "the child inherited generic proxy vars ($LEAKED) — that routes signed traffic too"
+  if [ -z "$LEAKED" ]; then
+    ok "no HTTPS_PROXY/ALL_PROXY/HTTP_PROXY on the child — only ANTHROPIC_BASE_URL is set"
+  else
+    bad "the child inherited generic proxy vars ($LEAKED) — that routes signed traffic too"
+  fi
 else
   bad "guarantee 6 skipped — no child env recorded in guarantee 4"
 fi
@@ -316,8 +344,11 @@ fi
 echo
 echo "7 — an unknown tool exits 127 with a named reason and launches nothing"
 OUT7="$( "$ROUTE" definitely-not-a-real-tool-xyz 2>&1 )"; RC7=$?
-[ "$RC7" = "127" ] && ok "exit 127 for a tool that is not on PATH" \
-  || bad "expected exit 127, got $RC7"
+if [ "$RC7" = "127" ]; then
+  ok "exit 127 for a tool that is not on PATH"
+else
+  bad "expected exit 127, got $RC7"
+fi
 case "$OUT7" in
   *"not installed"*) ok "the failure names the missing tool" ;;
   *) bad "unhelpful failure text: '$OUT7'" ;;
@@ -344,9 +375,11 @@ if [ -n "${PID1:-}" ]; then
       HEIMDALL_HOME="$TMP/home8" HEADROOM_PORT="$PORT1" \
       "$ROUTE" faketool >/dev/null 2>&1 )
   SUM_AFTER="$(treesum "$SANDBOX")"
-  [ "$SUM_BEFORE" = "$SUM_AFTER" ] \
-    && ok "the repo is byte-identical after a routed launch ($SUM_BEFORE)" \
-    || bad "the routed launch mutated the repo ($SUM_BEFORE -> $SUM_AFTER) — route must never wrap"
+  if [ "$SUM_BEFORE" = "$SUM_AFTER" ]; then
+    ok "the repo is byte-identical after a routed launch ($SUM_BEFORE)"
+  else
+    bad "the routed launch mutated the repo ($SUM_BEFORE -> $SUM_AFTER) — route must never wrap"
+  fi
 else
   bad "guarantee 8 skipped — no live fixture proxy"
 fi
@@ -478,11 +511,16 @@ if [ -n "${PID1:-}" ]; then
       HEIMDALL_HOME="$TMP/home10" HEADROOM_PORT="$PORT1" \
       "$ROUTE" faketool >"$TMP/out10" 2>"$TMP/err10" )
   RC10=$?
-  [ "$RC10" = "0" ] && ok "no fallback.json: the child still launches (exit 0)" \
-    || bad "no fallback.json: launch failed (rc=$RC10): $(cat "$TMP/err10")"
-  grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV10" 2>/dev/null \
-    && ok "no fallback.json: headroom path taken unchanged (pre-6de9093 behavior)" \
-    || bad "no fallback.json: headroom path was not taken: $(grep '^ANTHROPIC_BASE_URL=' "$ENV10" 2>/dev/null || echo '<absent>')"
+  if [ "$RC10" = "0" ]; then
+    ok "no fallback.json: the child still launches (exit 0)"
+  else
+    bad "no fallback.json: launch failed (rc=$RC10): $(cat "$TMP/err10")"
+  fi
+  if grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV10" 2>/dev/null; then
+    ok "no fallback.json: headroom path taken unchanged (pre-6de9093 behavior)"
+  else
+    bad "no fallback.json: headroom path was not taken: $(grep '^ANTHROPIC_BASE_URL=' "$ENV10" 2>/dev/null || echo '<absent>')"
+  fi
 else
   bad "guarantee 10 skipped — no live fixture proxy"
 fi
@@ -501,11 +539,16 @@ if [ -n "${PID1:-}" ]; then
     HEIMDALL_HOME="$TMP/home11" HEADROOM_PORT="$PORT1" \
     "$ROUTE" faketool >"$TMP/out11" 2>"$TMP/err11"
   RC11=$?
-  [ "$RC11" = "0" ] && ok "heimdall-fallback absent from PATH: the tool still launches (exit 0)" \
-    || bad "heimdall-fallback absent from PATH: launch failed (rc=$RC11): $(cat "$TMP/err11")"
-  grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV11" 2>/dev/null \
-    && ok "heimdall-fallback absent from PATH: headroom path is still taken" \
-    || bad "heimdall-fallback absent from PATH: headroom path was not taken: $(grep '^ANTHROPIC_BASE_URL=' "$ENV11" 2>/dev/null || echo '<absent>')"
+  if [ "$RC11" = "0" ]; then
+    ok "heimdall-fallback absent from PATH: the tool still launches (exit 0)"
+  else
+    bad "heimdall-fallback absent from PATH: launch failed (rc=$RC11): $(cat "$TMP/err11")"
+  fi
+  if grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV11" 2>/dev/null; then
+    ok "heimdall-fallback absent from PATH: headroom path is still taken"
+  else
+    bad "heimdall-fallback absent from PATH: headroom path was not taken: $(grep '^ANTHROPIC_BASE_URL=' "$ENV11" 2>/dev/null || echo '<absent>')"
+  fi
 else
   bad "guarantee 11 skipped — no live fixture proxy"
 fi
@@ -525,11 +568,16 @@ if [ -n "${PID1:-}" ]; then
     HEIMDALL_HOME="$TMP/home13" HEADROOM_PORT="$PORT1" \
     "$ROUTE" faketool >"$TMP/out13" 2>"$TMP/err13"
   RC13=$?
-  [ "$RC13" = "0" ] && ok "fallback beats a live headroom proxy: the tool still ran (exit 0)" \
-    || bad "fallback+live-headroom launch failed (rc=$RC13): $(cat "$TMP/err13")"
-  grep -q "^ANTHROPIC_BASE_URL=$FB_URL$" "$ENV13" 2>/dev/null \
-    && ok "the child got the FALLBACK url ($FB_URL), not headroom's" \
-    || bad "expected ANTHROPIC_BASE_URL=$FB_URL, got: $(grep '^ANTHROPIC_BASE_URL=' "$ENV13" 2>/dev/null || echo '<absent>')"
+  if [ "$RC13" = "0" ]; then
+    ok "fallback beats a live headroom proxy: the tool still ran (exit 0)"
+  else
+    bad "fallback+live-headroom launch failed (rc=$RC13): $(cat "$TMP/err13")"
+  fi
+  if grep -q "^ANTHROPIC_BASE_URL=$FB_URL$" "$ENV13" 2>/dev/null; then
+    ok "the child got the FALLBACK url ($FB_URL), not headroom's"
+  else
+    bad "expected ANTHROPIC_BASE_URL=$FB_URL, got: $(grep '^ANTHROPIC_BASE_URL=' "$ENV13" 2>/dev/null || echo '<absent>')"
+  fi
   if grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV13" 2>/dev/null; then
     bad "the child got headroom's URL even though the fallback gate said ROUTE"
   else
@@ -542,12 +590,16 @@ fi
 echo
 echo "14 — PRECEDENCE: the stderr disclosure names the fallback destination and says compression is OFF"
 if [ -n "${PID1:-}" ]; then
-  grep -q "$FB_URL" "$TMP/err13" 2>/dev/null \
-    && ok "stderr names the fallback destination ($FB_URL)" \
-    || bad "stderr never named the fallback destination: $(cat "$TMP/err13" 2>/dev/null)"
-  grep -qi "compression is off" "$TMP/err13" 2>/dev/null \
-    && ok "stderr says headroom compression is OFF for this session" \
-    || bad "stderr did not disclose compression is off: $(cat "$TMP/err13" 2>/dev/null)"
+  if grep -q "$FB_URL" "$TMP/err13" 2>/dev/null; then
+    ok "stderr names the fallback destination ($FB_URL)"
+  else
+    bad "stderr never named the fallback destination: $(cat "$TMP/err13" 2>/dev/null)"
+  fi
+  if grep -qi "compression is off" "$TMP/err13" 2>/dev/null; then
+    ok "stderr says headroom compression is OFF for this session"
+  else
+    bad "stderr did not disclose compression is off: $(cat "$TMP/err13" 2>/dev/null)"
+  fi
 else
   bad "guarantee 14 skipped — no live fixture proxy"
 fi
@@ -562,11 +614,16 @@ if [ -n "${PID1:-}" ]; then
     HEIMDALL_HOME="$TMP/home15" HEADROOM_PORT="$PORT1" \
     "$ROUTE" faketool >"$TMP/out15" 2>"$TMP/err15"
   RC15=$?
-  [ "$RC15" = "0" ] && ok "fallback+token launch succeeded (exit 0)" \
-    || bad "fallback+token launch failed (rc=$RC15): $(cat "$TMP/err15")"
-  grep -q "^ANTHROPIC_AUTH_TOKEN=$TOKEN_SENTINEL$" "$ENV15" 2>/dev/null \
-    && ok "the child's ANTHROPIC_AUTH_TOKEN equals the token file's contents" \
-    || bad "child ANTHROPIC_AUTH_TOKEN missing or wrong: $(grep '^ANTHROPIC_AUTH_TOKEN=' "$ENV15" 2>/dev/null || echo '<absent>')"
+  if [ "$RC15" = "0" ]; then
+    ok "fallback+token launch succeeded (exit 0)"
+  else
+    bad "fallback+token launch failed (rc=$RC15): $(cat "$TMP/err15")"
+  fi
+  if grep -q "^ANTHROPIC_AUTH_TOKEN=$TOKEN_SENTINEL$" "$ENV15" 2>/dev/null; then
+    ok "the child's ANTHROPIC_AUTH_TOKEN equals the token file's contents"
+  else
+    bad "child ANTHROPIC_AUTH_TOKEN missing or wrong: $(grep '^ANTHROPIC_AUTH_TOKEN=' "$ENV15" 2>/dev/null || echo '<absent>')"
+  fi
 else
   bad "guarantee 15 skipped — no live fixture proxy"
 fi
@@ -602,8 +659,11 @@ FBSTUB_URL="" FBSTUB_URL_RC=1 FBSTUB_TOKEN_FILE="$TOKFILE" FBSTUB_TOKEN_FILE_RC=
   HEIMDALL_HOME="$TMP/home17" HEADROOM_PORT="$PORT_UNUSED" \
   "$ROUTE" faketool >"$TMP/out17" 2>"$TMP/err17"
 RC17=$?
-[ "$RC17" = "0" ] && ok "non-fallback launch with a matching token still runs (exit 0)" \
-  || bad "non-fallback launch failed (rc=$RC17): $(cat "$TMP/err17")"
+if [ "$RC17" = "0" ]; then
+  ok "non-fallback launch with a matching token still runs (exit 0)"
+else
+  bad "non-fallback launch failed (rc=$RC17): $(cat "$TMP/err17")"
+fi
 if grep -q "^ANTHROPIC_AUTH_TOKEN=" "$ENV17" 2>/dev/null; then
   bad "the matching gateway token rode along to a non-fallback launch: $(grep '^ANTHROPIC_AUTH_TOKEN=' "$ENV17")"
 else
@@ -622,11 +682,16 @@ FBSTUB_URL="" FBSTUB_URL_RC=1 FBSTUB_TOKEN_FILE="$TOKFILE" FBSTUB_TOKEN_FILE_RC=
   HEIMDALL_HOME="$TMP/home18" HEADROOM_PORT="$PORT_UNUSED" \
   "$ROUTE" faketool >"$TMP/out18" 2>"$TMP/err18"
 RC18=$?
-[ "$RC18" = "0" ] && ok "non-fallback launch with an operator's own token still runs (exit 0)" \
-  || bad "non-fallback launch failed (rc=$RC18): $(cat "$TMP/err18")"
-grep -q "^ANTHROPIC_AUTH_TOKEN=$REAL_TOKEN$" "$ENV18" 2>/dev/null \
-  && ok "the operator's own (non-matching) token passed through untouched" \
-  || bad "the operator's own token was altered or dropped: $(grep '^ANTHROPIC_AUTH_TOKEN=' "$ENV18" 2>/dev/null || echo '<absent>')"
+if [ "$RC18" = "0" ]; then
+  ok "non-fallback launch with an operator's own token still runs (exit 0)"
+else
+  bad "non-fallback launch failed (rc=$RC18): $(cat "$TMP/err18")"
+fi
+if grep -q "^ANTHROPIC_AUTH_TOKEN=$REAL_TOKEN$" "$ENV18" 2>/dev/null; then
+  ok "the operator's own (non-matching) token passed through untouched"
+else
+  bad "the operator's own token was altered or dropped: $(grep '^ANTHROPIC_AUTH_TOKEN=' "$ENV18" 2>/dev/null || echo '<absent>')"
+fi
 
 echo
 echo "19 — --url prints the fallback URL, not headroom's, when the gate says ROUTE"
@@ -635,9 +700,11 @@ if [ -n "${PID1:-}" ]; then
            HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
            HEIMDALL_HOME="$TMP/home19" HEADROOM_PORT="$PORT1" "$ROUTE" --url 2>"$TMP/err19")"
   RC19=$?
-  [ "$RC19" = "0" ] && [ "$OUT19" = "$FB_URL" ] \
-    && ok "--url printed the fallback URL ($OUT19) and exited 0" \
-    || bad "--url printed '$OUT19' (rc=$RC19), expected $FB_URL with rc=0"
+  if [ "$RC19" = "0" ] && [ "$OUT19" = "$FB_URL" ]; then
+    ok "--url printed the fallback URL ($OUT19) and exited 0"
+  else
+    bad "--url printed '$OUT19' (rc=$RC19), expected $FB_URL with rc=0"
+  fi
 else
   bad "guarantee 19 skipped — no live fixture proxy"
 fi
@@ -667,11 +734,16 @@ if [ -n "${PID1:-}" ]; then
       HEIMDALL_HOME="$TMP/home21a" HEADROOM_PORT="$PORT1" \
       "$ROUTE" faketool >"$TMP/out21a" 2>"$TMP/err21a" )
   RC21A=$?
-  [ "$RC21A" = "0" ] && ok "fallback+unset-model launch succeeded (exit 0)" \
-    || bad "fallback+unset-model launch failed (rc=$RC21A): $(cat "$TMP/err21a")"
-  grep -q '^ANTHROPIC_MODEL=oc/test-model$' "$ENV21A" 2>/dev/null \
-    && ok "an unset ANTHROPIC_MODEL is pinned from heimdall-fallback model" \
-    || bad "ANTHROPIC_MODEL was not pinned: $(grep '^ANTHROPIC_MODEL=' "$ENV21A" 2>/dev/null || echo '<absent>')"
+  if [ "$RC21A" = "0" ]; then
+    ok "fallback+unset-model launch succeeded (exit 0)"
+  else
+    bad "fallback+unset-model launch failed (rc=$RC21A): $(cat "$TMP/err21a")"
+  fi
+  if grep -q '^ANTHROPIC_MODEL=oc/test-model$' "$ENV21A" 2>/dev/null; then
+    ok "an unset ANTHROPIC_MODEL is pinned from heimdall-fallback model"
+  else
+    bad "ANTHROPIC_MODEL was not pinned: $(grep '^ANTHROPIC_MODEL=' "$ENV21A" 2>/dev/null || echo '<absent>')"
+  fi
 
   ENV21B="$TMP/env21b"
   PRESET_MODEL="claude-operator-pinned-model"
@@ -682,11 +754,16 @@ if [ -n "${PID1:-}" ]; then
     HEIMDALL_HOME="$TMP/home21b" HEADROOM_PORT="$PORT1" \
     "$ROUTE" faketool >"$TMP/out21b" 2>"$TMP/err21b"
   RC21B=$?
-  [ "$RC21B" = "0" ] && ok "fallback+preset-model launch succeeded (exit 0)" \
-    || bad "fallback+preset-model launch failed (rc=$RC21B): $(cat "$TMP/err21b")"
-  grep -q "^ANTHROPIC_MODEL=$PRESET_MODEL$" "$ENV21B" 2>/dev/null \
-    && ok "an operator-set ANTHROPIC_MODEL was NOT overridden by heimdall-fallback model" \
-    || bad "the operator's ANTHROPIC_MODEL was overridden: $(grep '^ANTHROPIC_MODEL=' "$ENV21B" 2>/dev/null || echo '<absent>')"
+  if [ "$RC21B" = "0" ]; then
+    ok "fallback+preset-model launch succeeded (exit 0)"
+  else
+    bad "fallback+preset-model launch failed (rc=$RC21B): $(cat "$TMP/err21b")"
+  fi
+  if grep -q "^ANTHROPIC_MODEL=$PRESET_MODEL$" "$ENV21B" 2>/dev/null; then
+    ok "an operator-set ANTHROPIC_MODEL was NOT overridden by heimdall-fallback model"
+  else
+    bad "the operator's ANTHROPIC_MODEL was overridden: $(grep '^ANTHROPIC_MODEL=' "$ENV21B" 2>/dev/null || echo '<absent>')"
+  fi
 else
   bad "guarantee 21 skipped — no live fixture proxy"
 fi

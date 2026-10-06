@@ -49,10 +49,16 @@ TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
 # ── static checks (the handoff's acceptance greps, and the token's path in the sources) ──────────────
-grep -q 'hmd-pair-sas-v1' "$CLIENT" && ok "the relay client carries the SAS domain string hmd-pair-sas-v1" \
-  || bad "hmd-pair-sas-v1 missing from bin/heimdall-relay-client"
-grep -q 'hmd-pair-commit-v1' "$CLIENT" && ok "the relay client carries the commitment domain string hmd-pair-commit-v1" \
-  || bad "hmd-pair-commit-v1 missing from bin/heimdall-relay-client"
+if grep -q 'hmd-pair-sas-v1' "$CLIENT"; then
+  ok "the relay client carries the SAS domain string hmd-pair-sas-v1"
+else
+  bad "hmd-pair-sas-v1 missing from bin/heimdall-relay-client"
+fi
+if grep -q 'hmd-pair-commit-v1' "$CLIENT"; then
+  ok "the relay client carries the commitment domain string hmd-pair-commit-v1"
+else
+  bad "hmd-pair-commit-v1 missing from bin/heimdall-relay-client"
+fi
 if grep -nE 'gh_token.*(log|emit|print)' "$CLIENT" >"$TMPROOT/leak.out"; then
   bad "a relay-client line names the token near log/emit/print: $(head -3 "$TMPROOT/leak.out")"
 else
@@ -63,8 +69,11 @@ if grep -nE '(export|declare -x|env) +[A-Za-z_]*(GH|GITHUB)_?TOKEN|GH_TOKEN=|GIT
 else
   ok "bin/heimdall-app never puts a GitHub token in an environment variable"
 fi
-grep -q 'hmd-relay.therishabh16.workers.dev' "$APP" && ok "bin/heimdall-app defaults to the hosted relay origin" \
-  || bad "the hosted relay origin is not in bin/heimdall-app"
+if grep -q 'hmd-relay.therishabh16.workers.dev' "$APP"; then
+  ok "bin/heimdall-app defaults to the hosted relay origin"
+else
+  bad "the hosted relay origin is not in bin/heimdall-app"
+fi
 
 # ── the two case files ────────────────────────────────────────────────────────────────────────────────
 run_cases() {

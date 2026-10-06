@@ -99,7 +99,12 @@ pin_lines() { grep -c '^python3 pin: ' "$T/$1.log"; }
 # ── A. pinned ────────────────────────────────────────────────────────────
 echo "-- A. python3 behind a shim: pinned for the suites run-all.sh runs"
 run_fixture pinned "$T/shimbin"
-green pinned && ok "A1 the fixture sweep is green" || { bad "A1 the fixture sweep is green"; sed -n '1,14p' "$T/pinned.log"; }
+if green pinned; then
+  ok "A1 the fixture sweep is green"
+else
+  bad "A1 the fixture sweep is green"
+  sed -n '1,14p' "$T/pinned.log"
+fi
 want="python3 pin: pinned -> $REALPY (python3 resolved via $T/shimbin/python3)"
 if [ "$(pin_lines pinned)" = 1 ] && grep -Fxq -- "$want" "$T/pinned.log"; then
   ok "A2 the header carries exactly one pin line naming the interpreter and the shim it replaced"
@@ -118,29 +123,53 @@ else bad "A5 shim ran $(lines "$T/pinned.count") times, want 1"; fi
 if [ "$(lines "$T/pinned.exe")" = 5 ] && [ "$(sort -u "$T/pinned.exe")" = "$REALPY" ]; then ok "A6 every call ran the real interpreter"
 else bad "A6 sys.executable lines: $(tr '\n' '~' < "$T/pinned.exe")"; fi
 if [ "$(cat "$T/pinned.stdin" 2>/dev/null)" = 'a b' ] && [ "$(cat "$T/pinned.stdin.rc" 2>/dev/null)" = 7 ] \
-   && [ "$(cat "$T/pinned.args" 2>/dev/null)" = 'x y|it'"'"'s|$HOME' ]; then ok "A7 stdin, exit status and argv pass through the wrapper untouched"
+   && [ "$(cat "$T/pinned.args" 2>/dev/null)" = "x y|it's|\$HOME" ]; then ok "A7 stdin, exit status and argv pass through the wrapper untouched"
 else bad "A7 passthrough: stdin='$(cat "$T/pinned.stdin" 2>/dev/null)' rc='$(cat "$T/pinned.stdin.rc" 2>/dev/null)' args='$(cat "$T/pinned.args" 2>/dev/null)'"; fi
 if [ -z "$(ls -A "$T/tmp")" ]; then ok "A8 the wrapper dir is gone when the run ends (nothing left in TMPDIR)"
-else bad "A8 left in TMPDIR: $(ls -A "$T/tmp" | tr '\n' ' ')"; fi
+else bad "A8 left in TMPDIR: $(find "$T/tmp" -mindepth 1 -maxdepth 1 -exec basename {} \; | tr '\n' ' ')"; fi
 
 # ── B. opt-out ───────────────────────────────────────────────────────────
 echo "-- B. HMD_TEST_NO_PY_PIN=1 opts out"
 run_fixture optout "$T/shimbin" HMD_TEST_NO_PY_PIN=1
-green optout && ok "B1 the opted-out sweep is green" || bad "B1 the opted-out sweep is green"
-grep -Fxq 'python3 pin: off (HMD_TEST_NO_PY_PIN=1)' "$T/optout.log" && [ "$(pin_lines optout)" = 1 ] \
-  && ok "B2 the header says the pin is off, and why" || bad "B2 header: $(grep '^python3 pin: ' "$T/optout.log" | tr '\n' '~')"
-[ "$(cmdv optout)" = "$T/shimbin/python3" ] && ok "B3 the suite still sees the shim" || bad "B3 suite python3 = '$(cmdv optout)'"
-[ "$(lines "$T/optout.count")" = 7 ] && ok "B4 all 7 calls went through the shim, nothing was resolved up front" \
-  || bad "B4 shim ran $(lines "$T/optout.count") times, want 7"
+if green optout; then
+  ok "B1 the opted-out sweep is green"
+else
+  bad "B1 the opted-out sweep is green"
+fi
+if grep -Fxq 'python3 pin: off (HMD_TEST_NO_PY_PIN=1)' "$T/optout.log" && [ "$(pin_lines optout)" = 1 ]; then
+  ok "B2 the header says the pin is off, and why"
+else
+  bad "B2 header: $(grep '^python3 pin: ' "$T/optout.log" | tr '\n' '~')"
+fi
+if [ "$(cmdv optout)" = "$T/shimbin/python3" ]; then
+  ok "B3 the suite still sees the shim"
+else
+  bad "B3 suite python3 = '$(cmdv optout)'"
+fi
+if [ "$(lines "$T/optout.count")" = 7 ]; then
+  ok "B4 all 7 calls went through the shim, nothing was resolved up front"
+else
+  bad "B4 shim ran $(lines "$T/optout.count") times, want 7"
+fi
 
 # ── C. already direct ────────────────────────────────────────────────────
 echo "-- C. python3 already is the interpreter"
 run_fixture direct "$T/directbin"
-green direct && ok "C1 the sweep is green" || bad "C1 the sweep is green"
-grep -q '^python3 pin: not needed' "$T/direct.log" && [ "$(pin_lines direct)" = 1 ] \
-  && ok "C2 the header says no pin was needed" || bad "C2 header: $(grep '^python3 pin: ' "$T/direct.log" | tr '\n' '~')"
-[ "$(cmdv direct)" = "$T/directbin/python3" ] && ok "C3 no wrapper was installed: the suite sees the original python3" \
-  || bad "C3 suite python3 = '$(cmdv direct)'"
+if green direct; then
+  ok "C1 the sweep is green"
+else
+  bad "C1 the sweep is green"
+fi
+if grep -q '^python3 pin: not needed' "$T/direct.log" && [ "$(pin_lines direct)" = 1 ]; then
+  ok "C2 the header says no pin was needed"
+else
+  bad "C2 header: $(grep '^python3 pin: ' "$T/direct.log" | tr '\n' '~')"
+fi
+if [ "$(cmdv direct)" = "$T/directbin/python3" ]; then
+  ok "C3 no wrapper was installed: the suite sees the original python3"
+else
+  bad "C3 suite python3 = '$(cmdv direct)'"
+fi
 
 # ── D. an interpreter path that needs quoting ────────────────────────────
 echo "-- D. an interpreter path with spaces, quotes and a dollar sign"
@@ -151,7 +180,10 @@ cat > "$WEIRD/py" <<'W_EOF'
 if [ "$1" = -c ]; then printf '%s\n' "$FAKE_SELF"; else printf 'FAKE-PY'; for a in "$@"; do printf '[%s]' "$a"; done; echo; fi
 W_EOF
 chmod +x "$WEIRD/py"
-printf '#!/bin/sh\nexec "$FAKE_SELF" "$@"\n' > "$T/fakeshim/python3"
+cat > "$T/fakeshim/python3" <<'FS_EOF'
+#!/bin/sh
+exec "$FAKE_SELF" "$@"
+FS_EOF
 chmod +x "$T/fakeshim/python3"
 cat > "$T/d.sh" <<'D_EOF'
 . "$1"
@@ -159,7 +191,11 @@ hmd_test_pin_python3 "$2"
 python3 'a b' "it's"
 D_EOF
 got="$(env "${UNSET[@]}" FAKE_SELF="$WEIRD/py" PATH="$T/fakeshim:$PATH" bash "$T/d.sh" "$PIN_LIB" "$T/wd" 2>&1)"
-[ "$got" = "FAKE-PY[a b][it's]" ] && ok "D1 the wrapper execs the awkward path with its arguments intact" || bad "D1 got: $got"
+if [ "$got" = "FAKE-PY[a b][it's]" ]; then
+  ok "D1 the wrapper execs the awkward path with its arguments intact"
+else
+  bad "D1 got: $got"
+fi
 
 # ── E. app-relay-common.sh ───────────────────────────────────────────────
 echo "-- E. test/lib/app-relay-common.sh"
@@ -204,9 +240,11 @@ printf 'NOTE %s\n' "$HMD_PY_PIN_NOTE"
 F_EOF
 : > "$T/f.count"
 env "${UNSET[@]}" PATH="$T/shimbin:$PATH" SHIM_COUNT="$T/f.count" FIXTURE_REAL_PY="$REALPY" bash "$T/f.sh" "$PIN_LIB" "$T/f1" "$T/f2" > "$T/f.out" 2>&1
-grep -qx SAME "$T/f.out" && grep -q '^NOTE inherited' "$T/f.out" && [ "$(lines "$T/f.count")" = 1 ] \
-  && ok "F1 the second call leaves PATH alone, creates nothing and resolves nothing" \
-  || bad "F1 idempotence: $(tr '\n' '~' < "$T/f.out"), shim ran $(lines "$T/f.count") times"
+if grep -qx SAME "$T/f.out" && grep -q '^NOTE inherited' "$T/f.out" && [ "$(lines "$T/f.count")" = 1 ]; then
+  ok "F1 the second call leaves PATH alone, creates nothing and resolves nothing"
+else
+  bad "F1 idempotence: $(tr '\n' '~' < "$T/f.out"), shim ran $(lines "$T/f.count") times"
+fi
 
 echo
 printf '%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"

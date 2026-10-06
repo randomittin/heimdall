@@ -121,6 +121,7 @@ export HMD_PREFLIGHT_DISK_FLOOR_MB=1
 # THE SAME RULE, APPLIED TO THE NETWORK — see "THIS SUITE OWNS ITS CONTROL PLANE"
 # in the header. Started before any add runs, and verified (CP section) before any
 # add result is read as a statement about the manifest.
+# shellcheck source=lib/hermetic-cp.sh disable=SC1091  # the default run never opens sourced files; source= is for -x -P SCRIPTDIR
 . "$SELF_DIR/lib/hermetic-cp.sh"
 hermetic_cp_start "$TMP" || exit 2
 hermetic_cp_selfcheck
@@ -157,26 +158,49 @@ hmd_present() { "$MODS" --state "$PRESENT_STATE" "$@"; }
 
 echo
 echo "H0 — the manifest is valid and the mutation copy is byte-identical"
-jq -e . "$MANIFEST" >/dev/null 2>&1 \
-  && ok "manifest is valid JSON" || bad "manifest is not valid JSON"
-[ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/headroom/manifest.json")" ] \
-  && ok "the mutation copy is byte-identical to the shipped manifest" \
-  || bad "mutation copy diverged from the shipped manifest"
+if jq -e . "$MANIFEST" >/dev/null 2>&1; then
+  ok "manifest is valid JSON"
+else
+  bad "manifest is not valid JSON"
+fi
+if [ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/headroom/manifest.json")" ]; then
+  ok "the mutation copy is byte-identical to the shipped manifest"
+else
+  bad "mutation copy diverged from the shipped manifest"
+fi
 for f in name description upstream license pinned_version permission_class \
          installs_via wires invariants tier consent_text; do
-  jq -e --arg f "$f" 'has($f)' "$MANIFEST" >/dev/null 2>&1 \
-    && ok "manifest carries \`$f\`" || bad "manifest is missing \`$f\`"
+  if jq -e --arg f "$f" 'has($f)' "$MANIFEST" >/dev/null 2>&1; then
+    ok "manifest carries \`$f\`"
+  else
+    bad "manifest is missing \`$f\`"
+  fi
 done
-[ "$(jq -r '.name' "$MANIFEST")" = "headroom" ] \
-  && ok "name matches the module directory" || bad "name/directory mismatch"
-[ "$(jq -r '.license' "$MANIFEST")" = "Apache-2.0" ] \
-  && ok "license is Apache-2.0" || bad "unexpected license"
-jq -e '.pinned_version.artifact_sha256 | test("^[0-9a-f]{64}$")' "$MANIFEST" >/dev/null 2>&1 \
-  && ok "the pin carries a 64-hex artifact digest" || bad "pin digest is not 64 lowercase hex"
-[ "$(jq -r '.installs_via.kind' "$MANIFEST")" = "upstream" ] \
-  && ok "installs_via is upstream — depend, don't clone" || bad "installs_via is not upstream"
-jq -e '.installs_via.fetch | test("uv tool install")' "$MANIFEST" >/dev/null 2>&1 \
-  && ok "the fetch command is the recorded uv install line" || bad "fetch command is not the uv line"
+if [ "$(jq -r '.name' "$MANIFEST")" = "headroom" ]; then
+  ok "name matches the module directory"
+else
+  bad "name/directory mismatch"
+fi
+if [ "$(jq -r '.license' "$MANIFEST")" = "Apache-2.0" ]; then
+  ok "license is Apache-2.0"
+else
+  bad "unexpected license"
+fi
+if jq -e '.pinned_version.artifact_sha256 | test("^[0-9a-f]{64}$")' "$MANIFEST" >/dev/null 2>&1; then
+  ok "the pin carries a 64-hex artifact digest"
+else
+  bad "pin digest is not 64 lowercase hex"
+fi
+if [ "$(jq -r '.installs_via.kind' "$MANIFEST")" = "upstream" ]; then
+  ok "installs_via is upstream — depend, don't clone"
+else
+  bad "installs_via is not upstream"
+fi
+if jq -e '.installs_via.fetch | test("uv tool install")' "$MANIFEST" >/dev/null 2>&1; then
+  ok "the fetch command is the recorded uv install line"
+else
+  bad "fetch command is not the uv line"
+fi
 
 echo
 echo "H1 — listed as AVAILABLE, and honest that it is NOT installed"
@@ -184,23 +208,43 @@ echo "H1 — listed as AVAILABLE, and honest that it is NOT installed"
 # "nothing is installed" is a fact the suite established rather than one it
 # inherited from whoever ran hmd on this machine last.
 LIST="$(hmd_absent list 2>&1)"
-grep -q 'headroom' <<<"$LIST" \
-  && ok "\`hmd modules\` lists headroom" || bad "headroom is not listed"
-grep -qE 'headroom +available' <<<"$LIST" \
-  && ok "it is listed at tier available" || bad "headroom is not listed as available"
-grep -q 'Installed: none' <<<"$LIST" \
-  && ok "nothing is installed — the base install ships zero payloads" \
-  || bad "something is reported installed"
+if grep -q 'headroom' <<<"$LIST"; then
+  ok "\`hmd modules\` lists headroom"
+else
+  bad "headroom is not listed"
+fi
+if grep -qE 'headroom +available' <<<"$LIST"; then
+  ok "it is listed at tier available"
+else
+  bad "headroom is not listed as available"
+fi
+if grep -q 'Installed: none' <<<"$LIST"; then
+  ok "nothing is installed — the base install ships zero payloads"
+else
+  bad "something is reported installed"
+fi
 JLIST="$(hmd_absent --json list 2>/dev/null)"
-[ "$(printf '%s' "$JLIST" | jq -r '.installed_count')" = "0" ] \
-  && ok "json list agrees: installed_count is 0" || bad "json list reports an install"
-[ "$(printf '%s' "$JLIST" | jq -r '.available[] | select(.name=="headroom") | .tier')" = "available" ] \
-  && ok "json list reports headroom at tier available" || bad "json tier is wrong"
+if [ "$(printf '%s' "$JLIST" | jq -r '.installed_count')" = "0" ]; then
+  ok "json list agrees: installed_count is 0"
+else
+  bad "json list reports an install"
+fi
+if [ "$(printf '%s' "$JLIST" | jq -r '.available[] | select(.name=="headroom") | .tier')" = "available" ]; then
+  ok "json list reports headroom at tier available"
+else
+  bad "json tier is wrong"
+fi
 STATUS="$(hmd_absent status headroom 2>&1)"
-grep -q 'not installed' <<<"$STATUS" \
-  && ok "\`status headroom\` is honest that it is absent" || bad "status is not honest about absence"
-[ "$(hmd_absent --json status headroom 2>/dev/null | jq -r '.installed')" = "false" ] \
-  && ok "json status reports installed:false" || bad "json status is not honest"
+if grep -q 'not installed' <<<"$STATUS"; then
+  ok "\`status headroom\` is honest that it is absent"
+else
+  bad "status is not honest about absence"
+fi
+if [ "$(hmd_absent --json status headroom 2>/dev/null | jq -r '.installed')" = "false" ]; then
+  ok "json status reports installed:false"
+else
+  bad "json status is not honest"
+fi
 # NOT a state-root fact — an IMPORT-PATH one, and it is why the absent path stays
 # the live case even on a machine that has adopted the module. The sanctioned
 # install is `uv tool install`, which puts headroom-ai in an isolated uv tool venv
@@ -209,12 +253,16 @@ grep -q 'not installed' <<<"$STATUS" \
 # REASON as well as the verdict is what stops a seam that has silently stopped
 # looking from reading as a seam that looked and found nothing.
 CODEC="$(python3 "$REPO/bin/lib/memory_codec.py" status 2>&1)"
-grep -q 'available: no' <<<"$CODEC" \
-  && ok "the codec seam is on the plain backend — the uv-tool install never reaches hmd's import path" \
-  || bad "the codec seam claims a backend hmd cannot import"
-grep -q 'not importable' <<<"$CODEC" \
-  && ok "…and it NAMES the reason: headroom is not importable from hmd's interpreter" \
-  || bad "the seam reports plain without saying headroom is unimportable"
+if grep -q 'available: no' <<<"$CODEC"; then
+  ok "the codec seam is on the plain backend — the uv-tool install never reaches hmd's import path"
+else
+  bad "the codec seam claims a backend hmd cannot import"
+fi
+if grep -q 'not importable' <<<"$CODEC"; then
+  ok "…and it NAMES the reason: headroom is not importable from hmd's interpreter"
+else
+  bad "the seam reports plain without saying headroom is unimportable"
+fi
 
 echo
 echo "H1b — and honest about PRESENCE, against a root this file really installs into"
@@ -226,75 +274,137 @@ echo "H1b — and honest about PRESENCE, against a root this file really install
 # assertions rather than being the case nobody checked.
 PIN="$(jq -r '.pinned_version.version' "$MANIFEST")"
 PADD="$(hmd_present add headroom --yes 2>&1)"; PRC=$?
-[ "$PRC" -eq 0 ] && ok "the module installs into a state root the suite owns (exit 0)" \
-  || { bad "add into the scratch present root failed (exit $PRC)"; printf '%s\n' "$PADD" | tail -15; }
+if [ "$PRC" -eq 0 ]; then
+  ok "the module installs into a state root the suite owns (exit 0)"
+else
+  bad "add into the scratch present root failed (exit $PRC)"
+  printf '%s\n' "$PADD" | tail -15
+fi
 PLIST="$(hmd_present list 2>&1 | tr -s ' ')"
-grep -q 'Installed: none' <<<"$PLIST" \
-  && bad "list still reports 'Installed: none' with the module installed" \
-  || ok "list stops claiming an empty install set once the module is there"
-grep -qF "headroom $PIN" <<<"$PLIST" \
-  && ok "list names headroom at the manifest pin ($PIN)" || bad "list does not report the installed pin"
+if grep -q 'Installed: none' <<<"$PLIST"; then
+  bad "list still reports 'Installed: none' with the module installed"
+else
+  ok "list stops claiming an empty install set once the module is there"
+fi
+if grep -qF "headroom $PIN" <<<"$PLIST"; then
+  ok "list names headroom at the manifest pin ($PIN)"
+else
+  bad "list does not report the installed pin"
+fi
 PJLIST="$(hmd_present --json list 2>/dev/null)"
-[ "$(printf '%s' "$PJLIST" | jq -r '.installed_count')" = "1" ] \
-  && ok "json list agrees: installed_count is 1" || bad "json list did not count the install"
-[ "$(printf '%s' "$PJLIST" | jq -r '[.installed[] | select(.name=="headroom")] | length')" = "1" ] \
-  && ok "json list names headroom under installed" || bad "json list lost the installed module"
+if [ "$(printf '%s' "$PJLIST" | jq -r '.installed_count')" = "1" ]; then
+  ok "json list agrees: installed_count is 1"
+else
+  bad "json list did not count the install"
+fi
+if [ "$(printf '%s' "$PJLIST" | jq -r '[.installed[] | select(.name=="headroom")] | length')" = "1" ]; then
+  ok "json list names headroom under installed"
+else
+  bad "json list lost the installed module"
+fi
 PSTATUS="$(hmd_present status headroom 2>&1 | tr -s ' ')"
-grep -q 'not installed' <<<"$PSTATUS" \
-  && bad "status still claims absence with the module installed" \
-  || ok "\`status headroom\` is honest about PRESENCE — it stops claiming absence"
-grep -qF "pin: $PIN" <<<"$PSTATUS" \
-  && ok "status reports the pin it installed" || bad "status does not report the installed pin"
-[ "$(hmd_present --json status headroom 2>/dev/null | jq -r '.installed')" = "true" ] \
-  && ok "json status reports installed:true" || bad "json status hides the install"
+if grep -q 'not installed' <<<"$PSTATUS"; then
+  bad "status still claims absence with the module installed"
+else
+  ok "\`status headroom\` is honest about PRESENCE — it stops claiming absence"
+fi
+if grep -qF "pin: $PIN" <<<"$PSTATUS"; then
+  ok "status reports the pin it installed"
+else
+  bad "status does not report the installed pin"
+fi
+if [ "$(hmd_present --json status headroom 2>/dev/null | jq -r '.installed')" = "true" ]; then
+  ok "json status reports installed:true"
+else
+  bad "json status hides the install"
+fi
 hmd_present remove headroom >/dev/null 2>&1
-[ "$(hmd_present --json status headroom 2>/dev/null | jq -r '.installed')" = "false" ] \
-  && ok "…and back to installed:false after remove — the readout TRACKS state, it is not a constant" \
-  || bad "status still reports installed after remove"
+if [ "$(hmd_present --json status headroom 2>/dev/null | jq -r '.installed')" = "false" ]; then
+  ok "…and back to installed:false after remove — the readout TRACKS state, it is not a constant"
+else
+  bad "status still reports installed after remove"
+fi
 
 echo
 echo "H2 — permission_class is DUAL and both contracts exist"
-[ "$(jq -r '.permission_class | type' "$MANIFEST")" = "array" ] \
-  && ok "permission_class is a list, not a single class" || bad "permission_class is not a list"
+if [ "$(jq -r '.permission_class | type' "$MANIFEST")" = "array" ]; then
+  ok "permission_class is a list, not a single class"
+else
+  bad "permission_class is not a list"
+fi
 for c in traffic-proxy storage-codec; do
-  jq -e --arg c "$c" '.permission_class | index($c) != null' "$MANIFEST" >/dev/null 2>&1 \
-    && ok "declares the $c class" || bad "does not declare $c"
-  [ -f "$REG/_classes/$c.json" ] \
-    && ok "the $c contract exists in the registry" || bad "no contract for $c"
+  if jq -e --arg c "$c" '.permission_class | index($c) != null' "$MANIFEST" >/dev/null 2>&1; then
+    ok "declares the $c class"
+  else
+    bad "does not declare $c"
+  fi
+  if [ -f "$REG/_classes/$c.json" ]; then
+    ok "the $c contract exists in the registry"
+  else
+    bad "no contract for $c"
+  fi
 done
 
 echo
 echo "H3 — the add path runs BOTH classes' invariants, module WIRED"
 ST="$TMP/state/real"
 OUT="$("$MODS" --state "$ST" add headroom --yes 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "add succeeds against the real dual-class contract" \
-                || { bad "add failed (exit $RC)"; printf '%s\n' "$OUT" | tail -20; }
+if [ "$RC" -eq 0 ]; then
+  ok "add succeeds against the real dual-class contract"
+else
+  bad "add failed (exit $RC)"
+  printf '%s\n' "$OUT" | tail -20
+fi
 INV="$ST/headroom/invariants.json"
 if [ -f "$INV" ]; then
-  [ "$(jq -r 'length' "$INV")" = "6" ] \
-    && ok "all six invariants across both classes ran" \
-    || bad "expected 6 invariants, got $(jq -r 'length' "$INV")"
-  [ "$(jq -r '[.[] | select(.passed)] | length' "$INV")" = "6" ] \
-    && ok "all six passed with the codec library NOT importable" || bad "not all six passed"
-  [ "$(jq -r '[.[] | select(.class=="traffic-proxy")] | length' "$INV")" = "3" ] \
-    && ok "three of them are attributed to traffic-proxy" || bad "traffic-proxy count wrong"
-  [ "$(jq -r '[.[] | select(.class=="storage-codec")] | length' "$INV")" = "3" ] \
-    && ok "three of them are attributed to storage-codec" || bad "storage-codec count wrong"
+  if [ "$(jq -r 'length' "$INV")" = "6" ]; then
+    ok "all six invariants across both classes ran"
+  else
+    bad "expected 6 invariants, got $(jq -r 'length' "$INV")"
+  fi
+  if [ "$(jq -r '[.[] | select(.passed)] | length' "$INV")" = "6" ]; then
+    ok "all six passed with the codec library NOT importable"
+  else
+    bad "not all six passed"
+  fi
+  if [ "$(jq -r '[.[] | select(.class=="traffic-proxy")] | length' "$INV")" = "3" ]; then
+    ok "three of them are attributed to traffic-proxy"
+  else
+    bad "traffic-proxy count wrong"
+  fi
+  if [ "$(jq -r '[.[] | select(.class=="storage-codec")] | length' "$INV")" = "3" ]; then
+    ok "three of them are attributed to storage-codec"
+  else
+    bad "storage-codec count wrong"
+  fi
   # The evidence, not the claim: the falsifier's own 25/0 line must appear in the
   # recorded output of BOTH class-owned suite checks.
-  jq -r '.[] | select(.id=="gates-read-raw") | .output_tail' "$INV" | grep -q '25 passed, 0 failed' \
-    && ok "gates-read-raw really ran the judgment falsifier at 25/0" \
-    || bad "gates-read-raw output has no 25/0 line"
-  jq -r '.[] | select(.id=="never-touches-judgment-inputs") | .output_tail' "$INV" \
-    | grep -q '25 passed, 0 failed' \
-    && ok "never-touches-judgment-inputs ran the same falsifier at 25/0" \
-    || bad "never-touches-judgment-inputs output has no 25/0 line"
-  [ -f "$ST/headroom/wired.json" ] \
-    && ok "the module was WIRED before the invariants ran" || bad "module was not wired"
-  [ "$(jq -r '.permission_classes | length' "$ST/headroom/receipt.json")" = "2" ] \
-    && ok "the receipt records BOTH classes" || bad "receipt lost a class"
-  [ "$(jq -r '.default_included' "$ST/headroom/receipt.json")" = "true" ] \
-    && ok "the receipt records default_included" || bad "receipt lost default_included"
+  if jq -r '.[] | select(.id=="gates-read-raw") | .output_tail' "$INV" | grep -q '25 passed, 0 failed'; then
+    ok "gates-read-raw really ran the judgment falsifier at 25/0"
+  else
+    bad "gates-read-raw output has no 25/0 line"
+  fi
+  if jq -r '.[] | select(.id=="never-touches-judgment-inputs") | .output_tail' "$INV" \
+    | grep -q '25 passed, 0 failed'; then
+    ok "never-touches-judgment-inputs ran the same falsifier at 25/0"
+  else
+    bad "never-touches-judgment-inputs output has no 25/0 line"
+  fi
+  if [ -f "$ST/headroom/wired.json" ]; then
+    ok "the module was WIRED before the invariants ran"
+  else
+    bad "module was not wired"
+  fi
+  if [ "$(jq -r '.permission_classes | length' "$ST/headroom/receipt.json")" = "2" ]; then
+    ok "the receipt records BOTH classes"
+  else
+    bad "receipt lost a class"
+  fi
+  if [ "$(jq -r '.default_included' "$ST/headroom/receipt.json")" = "true" ]; then
+    ok "the receipt records default_included"
+  else
+    bad "receipt lost default_included"
+  fi
 else
   bad "no invariant record from the real add"
 fi
@@ -309,37 +419,55 @@ echo "H3b — FALSIFIER FOR THE STAND-IN: the SAME add with the control plane un
 # passes (also proved on its own in test/cp-signed-no-rewriting-proxy.test.sh 4.6).
 NST="$TMP/state/cp-down"
 NOUT="$(env HEIMDALL_DEFAULT_CP_URL="$(hermetic_cp_dead_url)" "$MODS" --state "$NST" add headroom --yes 2>&1)"; NRC=$?
-[ "$NRC" -ne 0 ] \
-  && ok "RED ARM: the SAME add is REFUSED when the control plane is unreachable (exit $NRC)" \
-  || bad "add succeeded with an unreachable control plane — an unverifiable invariant PASSED"
-grep -q 'FAILED INVARIANT: no-signed-traffic-routing' <<<"$NOUT" \
-  && ok "the refusal names the invariant that could not be verified" \
-  || bad "the refusal did not name no-signed-traffic-routing: $(printf '%s\n' "$NOUT" | tail -8)"
-[ ! -f "$NST/headroom/receipt.json" ] \
-  && ok "nothing was left installed after the fail-closed refusal" \
-  || bad "a refused add left a receipt"
+if [ "$NRC" -ne 0 ]; then
+  ok "RED ARM: the SAME add is REFUSED when the control plane is unreachable (exit $NRC)"
+else
+  bad "add succeeded with an unreachable control plane — an unverifiable invariant PASSED"
+fi
+if grep -q 'FAILED INVARIANT: no-signed-traffic-routing' <<<"$NOUT"; then
+  ok "the refusal names the invariant that could not be verified"
+else
+  bad "the refusal did not name no-signed-traffic-routing: $(printf '%s\n' "$NOUT" | tail -8)"
+fi
+if [ ! -f "$NST/headroom/receipt.json" ]; then
+  ok "nothing was left installed after the fail-closed refusal"
+else
+  bad "a refused add left a receipt"
+fi
 
 echo
 echo "H4 — the invariants are wired to the repo's real falsifiers"
 CTP="$REG/_classes/traffic-proxy.json"
 CSC="$REG/_classes/storage-codec.json"
-jq -e '[.requires_invariants[] | select(.check.kind=="suite") | .check.command]
-       | any(test("gate-judgment-uncompressed"))' "$CTP" >/dev/null 2>&1 \
-  && ok "traffic-proxy consumes test/gate-judgment-uncompressed.test.sh" \
-  || bad "traffic-proxy is not wired to the gate falsifier"
-jq -e '[.requires_invariants[] | select(.check.kind=="suite") | .check.command]
-       | any(test("gate-judgment-uncompressed"))' "$CSC" >/dev/null 2>&1 \
-  && ok "storage-codec consumes the same falsifier" \
-  || bad "storage-codec is not wired to the gate falsifier"
-jq -e '.invariants["round-trip-fidelity"].command | test("memory_codec")' "$MANIFEST" >/dev/null 2>&1 \
-  && ok "round-trip-fidelity drives bin/lib/memory_codec.py" || bad "round-trip is not wired to the codec"
-jq -e '.invariants["plain-fallback-when-absent"].command | test("memory_codec")' "$MANIFEST" >/dev/null 2>&1 \
-  && ok "plain-fallback-when-absent drives the same seam" || bad "fallback check is not wired to the codec"
+if jq -e '[.requires_invariants[] | select(.check.kind=="suite") | .check.command]
+       | any(test("gate-judgment-uncompressed"))' "$CTP" >/dev/null 2>&1; then
+  ok "traffic-proxy consumes test/gate-judgment-uncompressed.test.sh"
+else
+  bad "traffic-proxy is not wired to the gate falsifier"
+fi
+if jq -e '[.requires_invariants[] | select(.check.kind=="suite") | .check.command]
+       | any(test("gate-judgment-uncompressed"))' "$CSC" >/dev/null 2>&1; then
+  ok "storage-codec consumes the same falsifier"
+else
+  bad "storage-codec is not wired to the gate falsifier"
+fi
+if jq -e '.invariants["round-trip-fidelity"].command | test("memory_codec")' "$MANIFEST" >/dev/null 2>&1; then
+  ok "round-trip-fidelity drives bin/lib/memory_codec.py"
+else
+  bad "round-trip is not wired to the codec"
+fi
+if jq -e '.invariants["plain-fallback-when-absent"].command | test("memory_codec")' "$MANIFEST" >/dev/null 2>&1; then
+  ok "plain-fallback-when-absent drives the same seam"
+else
+  bad "fallback check is not wired to the codec"
+fi
 # test/memory-codec.test.sh is the suite that guards that seam; it must exist and
 # still be the 59/0 gate the storage-codec attachment point relies on.
-[ -f "$REPO/test/memory-codec.test.sh" ] \
-  && ok "test/memory-codec.test.sh — the codec seam's own gate — exists" \
-  || bad "the codec seam has no gate suite"
+if [ -f "$REPO/test/memory-codec.test.sh" ]; then
+  ok "test/memory-codec.test.sh — the codec seam's own gate — exists"
+else
+  bad "the codec seam has no gate suite"
+fi
 
 echo
 echo "H5 — FALSIFIER: dropping storage-codec makes a real check DISAPPEAR"
@@ -352,39 +480,65 @@ OUT="$(add_mut dropped)"; RC=$?
 if [ "$RC" -eq 0 ]; then
   ok "RED ARM: dropping a class still 'succeeds' — no error is raised"
   DINV="$TMP/state/dropped/headroom/invariants.json"
-  [ "$(jq -r 'length' "$DINV")" = "3" ] \
-    && ok "…but only 3 invariants ran instead of 6" || bad "unexpected invariant count when a class was dropped"
-  jq -e '[.[] | select(.id=="round-trip-fidelity")] | length == 0' "$DINV" >/dev/null 2>&1 \
-    && ok "round-trip-fidelity STOPPED RUNNING — the dropped class cost a real check" \
-    || bad "round-trip-fidelity still ran with storage-codec dropped"
-  jq -e '[.[] | select(.class=="storage-codec")] | length == 0' "$DINV" >/dev/null 2>&1 \
-    && ok "no storage-codec invariant ran at all" || bad "a storage-codec invariant ran anyway"
+  if [ "$(jq -r 'length' "$DINV")" = "3" ]; then
+    ok "…but only 3 invariants ran instead of 6"
+  else
+    bad "unexpected invariant count when a class was dropped"
+  fi
+  if jq -e '[.[] | select(.id=="round-trip-fidelity")] | length == 0' "$DINV" >/dev/null 2>&1; then
+    ok "round-trip-fidelity STOPPED RUNNING — the dropped class cost a real check"
+  else
+    bad "round-trip-fidelity still ran with storage-codec dropped"
+  fi
+  if jq -e '[.[] | select(.class=="storage-codec")] | length == 0' "$DINV" >/dev/null 2>&1; then
+    ok "no storage-codec invariant ran at all"
+  else
+    bad "a storage-codec invariant ran anyway"
+  fi
   "$MODS" --registry "$MREG" --state "$TMP/state/dropped" remove headroom >/dev/null 2>&1
 else
   bad "the dropped-class arm did not complete (exit $RC)"
 fi
 restore
-[ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/headroom/manifest.json")" ] \
-  && ok "GREEN ARM: restored — the copy is byte-identical to the shipped manifest again" \
-  || bad "restore did not return the copy to the shipped bytes"
+if [ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/headroom/manifest.json")" ]; then
+  ok "GREEN ARM: restored — the copy is byte-identical to the shipped manifest again"
+else
+  bad "restore did not return the copy to the shipped bytes"
+fi
 
 echo
 echo "H6 — FALSIFIER: an uncovered invariant is REFUSED and named"
 restore
 mutate 'del(.invariants["round-trip-fidelity"])'
 OUT="$(add_mut hole)"; RC=$?
-[ "$RC" -ne 0 ] && ok "RED ARM: a manifest with an uncovered invariant is refused" \
-               || bad "an uncovered invariant was accepted"
-grep -q 'round-trip-fidelity' <<<"$OUT" \
-  && ok "the refusal names the uncovered invariant" || bad "the refusal did not name the hole"
-grep -q 'storage-codec' <<<"$OUT" \
-  && ok "the refusal names the class that demanded it" || bad "the refusal did not name the class"
-[ ! -e "$TMP/state/hole/headroom" ] \
-  && ok "the refused manifest installed nothing" || bad "a refused manifest left residue"
+if [ "$RC" -ne 0 ]; then
+  ok "RED ARM: a manifest with an uncovered invariant is refused"
+else
+  bad "an uncovered invariant was accepted"
+fi
+if grep -q 'round-trip-fidelity' <<<"$OUT"; then
+  ok "the refusal names the uncovered invariant"
+else
+  bad "the refusal did not name the hole"
+fi
+if grep -q 'storage-codec' <<<"$OUT"; then
+  ok "the refusal names the class that demanded it"
+else
+  bad "the refusal did not name the class"
+fi
+if [ ! -e "$TMP/state/hole/headroom" ]; then
+  ok "the refused manifest installed nothing"
+else
+  bad "a refused manifest left residue"
+fi
 restore
 OUT="$(add_mut restored)"; RC=$?
-[ "$RC" -eq 0 ] && ok "GREEN ARM: restoring the command makes the add pass again" \
-               || { bad "restored manifest still fails (exit $RC)"; printf '%s\n' "$OUT" | tail -15; }
+if [ "$RC" -eq 0 ]; then
+  ok "GREEN ARM: restoring the command makes the add pass again"
+else
+  bad "restored manifest still fails (exit $RC)"
+  printf '%s\n' "$OUT" | tail -15
+fi
 "$MODS" --registry "$MREG" --state "$TMP/state/restored" remove headroom >/dev/null 2>&1
 
 echo
@@ -392,74 +546,128 @@ echo "H7 — a bad or missing pin is REFUSED"
 restore
 mutate '.pinned_version.artifact_sha256 = "not-a-real-digest"'
 OUT="$(add_mut badpin)"; RC=$?
-[ "$RC" -ne 0 ] && ok "a non-hex pin digest is refused" || bad "a bad pin was accepted"
-grep -q 'artifact_sha256' <<<"$OUT" \
-  && ok "the refusal names artifact_sha256" || bad "the refusal did not name the field"
+if [ "$RC" -ne 0 ]; then
+  ok "a non-hex pin digest is refused"
+else
+  bad "a bad pin was accepted"
+fi
+if grep -q 'artifact_sha256' <<<"$OUT"; then
+  ok "the refusal names artifact_sha256"
+else
+  bad "the refusal did not name the field"
+fi
 restore
 mutate 'del(.pinned_version)'
 OUT="$(add_mut nopin)"; RC=$?
-[ "$RC" -ne 0 ] && ok "a missing pin is refused — there is no latest" || bad "a missing pin was accepted"
-grep -q 'pinned_version' <<<"$OUT" \
-  && ok "the refusal names pinned_version" || bad "the refusal did not name pinned_version"
+if [ "$RC" -ne 0 ]; then
+  ok "a missing pin is refused — there is no latest"
+else
+  bad "a missing pin was accepted"
+fi
+if grep -q 'pinned_version' <<<"$OUT"; then
+  ok "the refusal names pinned_version"
+else
+  bad "the refusal did not name pinned_version"
+fi
 
 echo
 echo "H8 — a consent-required class with no consent_text is REFUSED"
 restore
 mutate 'del(.consent_text)'
 OUT="$(add_mut noconsent)"; RC=$?
-[ "$RC" -ne 0 ] && ok "a consent-required class with no disclosure text is refused" \
-               || bad "a blank consent prompt was accepted"
-grep -q 'consent_text' <<<"$OUT" \
-  && ok "the refusal names consent_text" || bad "the refusal did not name consent_text"
-[ ! -e "$TMP/state/noconsent/headroom" ] \
-  && ok "the consent refusal installed nothing" || bad "a consent refusal left residue"
+if [ "$RC" -ne 0 ]; then
+  ok "a consent-required class with no disclosure text is refused"
+else
+  bad "a blank consent prompt was accepted"
+fi
+if grep -q 'consent_text' <<<"$OUT"; then
+  ok "the refusal names consent_text"
+else
+  bad "the refusal did not name consent_text"
+fi
+if [ ! -e "$TMP/state/noconsent/headroom" ]; then
+  ok "the consent refusal installed nothing"
+else
+  bad "a consent refusal left residue"
+fi
 
 echo
 echo "H9 — tier is available, and suggested is unreachable without the A/B receipt"
 restore
-[ "$(jq -r '.tier' "$MANIFEST")" = "available" ] \
-  && ok "the shipped tier is available" || bad "the shipped tier is not available"
-jq -e 'has("tier_evidence") | not' "$MANIFEST" >/dev/null 2>&1 \
-  && ok "no tier_evidence is claimed — the A/B has not run" || bad "tier_evidence claimed without an A/B"
+if [ "$(jq -r '.tier' "$MANIFEST")" = "available" ]; then
+  ok "the shipped tier is available"
+else
+  bad "the shipped tier is not available"
+fi
+if jq -e 'has("tier_evidence") | not' "$MANIFEST" >/dev/null 2>&1; then
+  ok "no tier_evidence is claimed — the A/B has not run"
+else
+  bad "tier_evidence claimed without an A/B"
+fi
 mutate '.tier = "suggested"'
 OUT="$(add_mut suggested)"; RC=$?
-[ "$RC" -ne 0 ] && ok "flipping tier to suggested WITHOUT a receipt is refused" \
-               || bad "suggested was reachable without evidence"
-grep -q 'tier_evidence' <<<"$OUT" \
-  && ok "the refusal demands tier_evidence.receipt" || bad "the refusal did not demand a receipt"
-grep -qi 'advertisement' <<<"$OUT" \
-  && ok "the refusal says why: a recommendation without evidence is an advertisement" \
-  || bad "the refusal gave no rationale"
+if [ "$RC" -ne 0 ]; then
+  ok "flipping tier to suggested WITHOUT a receipt is refused"
+else
+  bad "suggested was reachable without evidence"
+fi
+if grep -q 'tier_evidence' <<<"$OUT"; then
+  ok "the refusal demands tier_evidence.receipt"
+else
+  bad "the refusal did not demand a receipt"
+fi
+if grep -qi 'advertisement' <<<"$OUT"; then
+  ok "the refusal says why: a recommendation without evidence is an advertisement"
+else
+  bad "the refusal gave no rationale"
+fi
 restore
 
 echo
 echo "H10 — default_included is a distribution fact, kept apart from tier"
-[ "$(jq -r '.default_included' "$MANIFEST")" = "true" ] \
-  && ok "headroom is marked default_included" || bad "default_included is not set"
-[ "$(jq -r '.default_included | type' "$MANIFEST")" = "boolean" ] \
-  && ok "default_included is a boolean" || bad "default_included is not a boolean"
+if [ "$(jq -r '.default_included' "$MANIFEST")" = "true" ]; then
+  ok "headroom is marked default_included"
+else
+  bad "default_included is not set"
+fi
+if [ "$(jq -r '.default_included | type' "$MANIFEST")" = "boolean" ]; then
+  ok "default_included is a boolean"
+else
+  bad "default_included is not a boolean"
+fi
 mutate '.default_included = "yes"'
 OUT="$(add_mut baddefault)"; RC=$?
-[ "$RC" -ne 0 ] && ok "a non-boolean default_included is refused" || bad "a non-boolean was accepted"
+if [ "$RC" -ne 0 ]; then
+  ok "a non-boolean default_included is refused"
+else
+  bad "a non-boolean was accepted"
+fi
 restore
 # Default inclusion must NOT be able to launder itself into an evidence claim.
-jq -e '.tier == "available" and .default_included == true' "$MANIFEST" >/dev/null 2>&1 \
-  && ok "default-included AND unproven are stated together, not conflated" \
-  || bad "distribution and evidence are conflated"
+if jq -e '.tier == "available" and .default_included == true' "$MANIFEST" >/dev/null 2>&1; then
+  ok "default-included AND unproven are stated together, not conflated"
+else
+  bad "distribution and evidence are conflated"
+fi
 # A default-included module reaches every machine, so its disclosure must exist
 # before it ships — enforced at validate, not at a prompt nobody may see.
 mutate 'del(.consent_text)'
 OUT="$(add_mut defaultnodisclosure)"; RC=$?
-[ "$RC" -ne 0 ] && ok "a default-included module with no disclosure text is refused" \
-               || bad "a default-included module shipped with no disclosure"
+if [ "$RC" -ne 0 ]; then
+  ok "a default-included module with no disclosure text is refused"
+else
+  bad "a default-included module shipped with no disclosure"
+fi
 restore
 
 echo
 echo "H11 — DEPEND, DON'T CLONE"
 EXTRA="$(find "$REG/headroom/" -mindepth 1 -maxdepth 1 ! -name manifest.json | sed 's|.*/||' | head -5)"
-[ -z "$EXTRA" ] \
-  && ok "modules/headroom holds manifest.json and nothing else" \
-  || bad "vendored payload in modules/headroom: $EXTRA"
+if [ -z "$EXTRA" ]; then
+  ok "modules/headroom holds manifest.json and nothing else"
+else
+  bad "vendored payload in modules/headroom: $EXTRA"
+fi
 # No Headroom source anywhere in the tree. What makes a directory a VENDORING is
 # what is INSIDE it, so that is what is judged — never its path.
 #
@@ -507,17 +715,22 @@ scan_vendored() {
 }
 
 VEND="$(scan_vendored "$REPO" | head -3)"
-[ -z "$VEND" ] && ok "no Headroom package tree is vendored anywhere in the repo" \
-               || bad "possible vendored Headroom source: $VEND"
+if [ -z "$VEND" ]; then
+  ok "no Headroom package tree is vendored anywhere in the repo"
+else
+  bad "possible vendored Headroom source: $VEND"
+fi
 # No published Headroom artifact may be sitting in the tree either. The one
 # license-compliant exception path (a single vendored component carrying Apache
 # headers plus a NOTICE) is deliberately NOT taken here, so the sdist and the
 # wheels must both be absent.
 VENDFILE="$(find "$REPO" \( -name 'headroom_ai-*' -o -name 'headroom-*.tar.gz' \) \
             -not -path '*/.git/*' 2>/dev/null | head -3)"
-[ -z "$VENDFILE" ] \
-  && ok "no Headroom sdist or wheel is vendored in the tree" \
-  || bad "vendored Headroom artifact: $VENDFILE"
+if [ -z "$VENDFILE" ]; then
+  ok "no Headroom sdist or wheel is vendored in the tree"
+else
+  bad "vendored Headroom artifact: $VENDFILE"
+fi
 
 echo
 echo "H11b — FALSIFIER: the content rule still fires on a vendoring hidden in an hmd shape"
@@ -529,29 +742,38 @@ VFX="$TMP/vendorscan"
 mkdir -p "$VFX/clean/modules/headroom" "$VFX/clean/.heimdall/modules/headroom"
 printf '{}\n' > "$VFX/clean/modules/headroom/manifest.json"
 for r in receipt wired invariants; do printf '{}\n' > "$VFX/clean/.heimdall/modules/headroom/$r.json"; done
-[ -z "$(scan_vendored "$VFX/clean")" ] \
-  && ok "GREEN: hmd's own registry entry AND install record are both cleared" \
-  || bad "the scan flags hmd's own bookkeeping: $(scan_vendored "$VFX/clean")"
+if [ -z "$(scan_vendored "$VFX/clean")" ]; then
+  ok "GREEN: hmd's own registry entry AND install record are both cleared"
+else
+  bad "the scan flags hmd's own bookkeeping: $(scan_vendored "$VFX/clean")"
+fi
 # (b) source smuggled INTO the install record. This is the whole question: the
 #     directory the fix stopped flagging is precisely where a violation would now
 #     try to hide, so a path-based exclusion would be blind here and this must fire.
 cp -R "$VFX/clean" "$VFX/smuggled"
 printf 'def compress(text):\n    return text\n' > "$VFX/smuggled/.heimdall/modules/headroom/__init__.py"
-printf '%s' "$(scan_vendored "$VFX/smuggled")" | grep -q '\.heimdall/modules/headroom' \
-  && ok "RED: one .py inside the install record is reported — the exclusion is an inventory, not a path" \
-  || bad "a vendoring hidden in the install-state directory was MISSED"
+if printf '%s' "$(scan_vendored "$VFX/smuggled")" | grep -q '\.heimdall/modules/headroom'; then
+  ok "RED: one .py inside the install record is reported — the exclusion is an inventory, not a path"
+else
+  bad "a vendoring hidden in the install-state directory was MISSED"
+fi
 # (c) an ordinary vendoring anywhere else is still caught…
 mkdir -p "$VFX/plain/vendor/headroom"
 printf 'def compress(text):\n    return text\n' > "$VFX/plain/vendor/headroom/__init__.py"
 printf '[project]\nname = "headroom"\n' > "$VFX/plain/vendor/headroom/pyproject.toml"
-printf '%s' "$(scan_vendored "$VFX/plain")" | grep -q 'vendor/headroom' \
-  && ok "RED: a plain vendored source tree is reported" || bad "an outright vendoring was missed"
+if printf '%s' "$(scan_vendored "$VFX/plain")" | grep -q 'vendor/headroom'; then
+  ok "RED: a plain vendored source tree is reported"
+else
+  bad "an outright vendoring was missed"
+fi
 # (d) …and it cannot launder itself by wearing an hmd-shaped filename, because the
 #     rule clears a directory only when EVERY file in it is one of hmd's records.
 cp "$VFX/clean/modules/headroom/manifest.json" "$VFX/plain/vendor/headroom/manifest.json"
-printf '%s' "$(scan_vendored "$VFX/plain")" | grep -q 'vendor/headroom' \
-  && ok "RED: adding a manifest.json beside the source does not clear it" \
-  || bad "a vendoring laundered itself with an hmd-shaped filename"
+if printf '%s' "$(scan_vendored "$VFX/plain")" | grep -q 'vendor/headroom'; then
+  ok "RED: adding a manifest.json beside the source does not clear it"
+else
+  bad "a vendoring laundered itself with an hmd-shaped filename"
+fi
 
 echo
 echo "H12 — CP / enroll / signed traffic is scrubbed of LOCAL REWRITERS"
@@ -568,9 +790,11 @@ UNSCRUBBED=""
 for f in $SIGNED_FILES; do
   grep -q 'hmd_signed_exec' "$REPO/$f" 2>/dev/null || UNSCRUBBED="$UNSCRUBBED $f"
 done
-[ -z "$UNSCRUBBED" ] \
-  && ok "every signed / enrollment surface routes its client through hmd_signed_exec" \
-  || bad "a signed-traffic surface does not scrub local rewriters:$UNSCRUBBED"
+if [ -z "$UNSCRUBBED" ]; then
+  ok "every signed / enrollment surface routes its client through hmd_signed_exec"
+else
+  bad "a signed-traffic surface does not scrub local rewriters:$UNSCRUBBED"
+fi
 
 # …and the scrub must never become a BLANKET bypass. A corporate HTTPS proxy CONNECT-tunnels
 # TLS, so it cannot rewrite signed bytes, and in a locked-down estate it is the only egress —
@@ -580,16 +804,22 @@ BLANKET=""
 for f in $SIGNED_FILES; do
   grep -q -- '--noproxy' "$REPO/$f" 2>/dev/null && BLANKET="$BLANKET $f"
 done
-[ -z "$BLANKET" ] \
-  && ok "no signed surface blanket-bypasses proxies — a corporate CONNECT proxy still works" \
-  || bad "a signed surface forces a blanket proxy bypass:$BLANKET"
+if [ -z "$BLANKET" ]; then
+  ok "no signed surface blanket-bypasses proxies — a corporate CONNECT proxy still works"
+else
+  bad "a signed surface forces a blanket proxy bypass:$BLANKET"
+fi
 # And the gate scrub still covers Headroom's own namespace.
-grep -q 'HEADROOM_BASE_URL' "$REPO/bin/lib/hmd-gate-endpoint.sh" \
-  && ok "the gate scrub covers Headroom's own routing namespace" \
-  || bad "the gate scrub does not know about HEADROOM_* vars"
-grep -q 'HMD_PROVIDER_BASE_URL="https://api.anthropic.com"' "$REPO/bin/lib/hmd-gate-endpoint.sh" \
-  && ok "judgment is still pinned to the real provider by a hardcoded constant" \
-  || bad "the judgment pin is no longer a hardcoded constant"
+if grep -q 'HEADROOM_BASE_URL' "$REPO/bin/lib/hmd-gate-endpoint.sh"; then
+  ok "the gate scrub covers Headroom's own routing namespace"
+else
+  bad "the gate scrub does not know about HEADROOM_* vars"
+fi
+if grep -q 'HMD_PROVIDER_BASE_URL="https://api.anthropic.com"' "$REPO/bin/lib/hmd-gate-endpoint.sh"; then
+  ok "judgment is still pinned to the real provider by a hardcoded constant"
+else
+  bad "the judgment pin is no longer a hardcoded constant"
+fi
 
 echo
 echo "--------------------------------------------------------------------"

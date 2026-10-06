@@ -527,6 +527,7 @@ c50, c99 = run(["sh", "-c", cmd])           # the wired command with nothing pen
 print("%.1f %.1f %.1f %.1f" % (c50, c99, b50, b99))
 PYEOF
 )"
+# shellcheck disable=SC2086  # TIMES is four space-separated numbers; the word splitting is the point
 set -- $TIMES
 P50="$1"; P99="$2"; B50="$3"; B99="$4"
 if python3 -c "import sys; sys.exit(0 if float('$P50') - float('$B50') < 10 and float('$P99') - float('$B99') < 60 else 1)"; then
