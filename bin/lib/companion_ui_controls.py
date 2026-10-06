@@ -904,13 +904,23 @@ def _timeline_names():
     return set(RESERVED_EXPAND) | set(KILL_SWITCH_EXEMPT) | {n for n, s in _ACTIONS.items() if s["timeline"]}
 
 
-def _run_command(root, action, params, device_id, started):
+def _timeline_row_ok(name, op):
+    """An action whose policy lists `timeline_ops` is on the timeline (and in remote_actions.recent) for those ops only."""
+    spec = _ACTIONS.get(name)
+    ops = spec["policy"].get("timeline_ops") if spec is not None else None
+    return ops is None or op in ops
+
+
+def _run_command(root, action, params, device_id, started, caps=None):
     """(ok, detail, extra, audit_params, dup, repo) -- every refusal path included. `repo` is the allowlist id an expand
     command named (the session's own repo's, for a merge), else None."""
     spec = _ACTIONS.get(action) if isinstance(action, str) else None
     gate = RESERVED_EXPAND.get(action) if isinstance(action, str) else None
     if spec is None and gate is None:
         return False, "not-implemented", {}, {}, False, None
+    cap = spec["policy"].get("cap") if spec is not None else None
+    if cap is not None and (caps is None or cap not in caps):   # an action behind a capability: the phone must have listed it
+        return False, "caps-missing", {}, {}, False, None
     if action not in KILL_SWITCH_EXEMPT and not controls_enabled(root):
         return False, "controls-off", {}, {}, False, None
     if spec is None:   # a reserved expand name nothing has registered a handler for: gated all the same
@@ -936,7 +946,8 @@ def _run_command(root, action, params, device_id, started):
                 hit = _RIDS.get(root, {}).get(rid)
             if hit is not None:
                 ok, detail, extra = hit
-                return ok, detail, dict(extra, dup=True), audit_params, True, repo
+                replay = spec["policy"].get("replay_detail")
+                return ok, (replay if ok and replay else detail), dict(extra, dup=True), audit_params, True, repo
         if spec["cls"] == CLASS_EXPAND and not _audit_ready(root):
             return False, "internal-error", {}, audit_params, False, repo
         _charge(root, action)
@@ -1001,12 +1012,13 @@ def _timeline(root, line, repo):
             sys.stderr.write("companion_ui_controls: relay event log not written (%s)\n" % type(e).__name__)
 
 
-def dispatch(root, action, params, *, device_id="direct", seq=None, transport="direct"):
-    """Run one phone command. Returns (ok, detail, extra); never raises. Every command is audited, refused or not."""
+def dispatch(root, action, params, *, device_id="direct", seq=None, transport="direct", caps=None):
+    """Run one phone command. Returns (ok, detail, extra); never raises. Every command is audited, refused or not. `caps` is the
+    capability set the phone listed (None = unknown, as on the direct route): an action behind a capability is `caps-missing`."""
     started = time.monotonic()
     wall = time.time()
     try:
-        ok, detail, extra, audit_params, dup, repo = _run_command(root, action, params, device_id, started)
+        ok, detail, extra, audit_params, dup, repo = _run_command(root, action, params, device_id, started, caps)
     except Exception as e:  # the type only: a message could hold what the phone sent
         sys.stderr.write("companion_ui_controls: internal error: %s\n" % type(e).__name__)
         ok, detail, extra, audit_params, dup, repo = False, "internal-error", {}, {}, False, None
@@ -1018,8 +1030,11 @@ def dispatch(root, action, params, *, device_id="direct", seq=None, transport="d
         line["id"] = extra["id"]
     if dup:
         line["dup"] = True
+    for key in ("op", "tile_id"):    # an action that names its op or tile in its audit rule has them beside `action`, not inside params
+        if key in audit_params:
+            line[key] = audit_params.pop(key)
     _audit(root, line)
-    if name is not None and name in _timeline_names():
+    if name is not None and name in _timeline_names() and _timeline_row_ok(name, line.get("op")):
         _timeline(root, line, repo)
     return ok, detail, extra
 
