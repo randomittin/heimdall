@@ -126,6 +126,15 @@
 #                              status` prints one `remote:` line with both switches
 #                              and the allowlist size. Delegates to
 #                              bin/lib/companion_remote_switches.py.
+#   hmd app remote-dashboards on|off|status [--repo DIR]
+#                              Custom dashboards from the paired phone (capability dash-v1): the phone describes a
+#                              panel in words and hmd on this laptop builds a read-only data panel for it over your own
+#                              connectors -- nothing runs until you confirm it here. Off by default. `on` refuses unless
+#                              stdin is a terminal (an agent's shell, a script and the phone have none) and under
+#                              HMD_UI_CONTROLS=0; `off` and `status` need no terminal. State, 0600:
+#                              $HEIMDALL_HOME/remote-dashboards.json. `hmd app status` prints one `remote dashboards:`
+#                              line (switch, tiles, pending confirmations). Delegates to
+#                              bin/lib/companion_remote_switches.py; the slice and the store are bin/lib/companion_dashboards.py.
 #   hmd app controls on|off|status [--repo DIR]
 #                              The paired phone's remote controls (capability
 #                              controls-v1: interrupt, save-checkpoint, hook-toggle,
@@ -1413,6 +1422,9 @@ cmd_status() {
   if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_remote_switches.py" ]; then
     "$PY3" "$LIB_DIR/companion_remote_switches.py" status-line --repo "$REPO" 2>/dev/null
   fi
+  if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_dashboards.py" ]; then
+    "$PY3" "$LIB_DIR/companion_dashboards.py" status-line --repo "$REPO" 2>/dev/null
+  fi
 
   [ "$orphaned" = true ] && return 1
   return 0
@@ -1511,6 +1523,9 @@ cmd_status_relay() {
   fi
   if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_remote_switches.py" ]; then
     "$PY3" "$LIB_DIR/companion_remote_switches.py" status-line --repo "$REPO" 2>/dev/null
+  fi
+  if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_dashboards.py" ]; then
+    "$PY3" "$LIB_DIR/companion_dashboards.py" status-line --repo "$REPO" 2>/dev/null
   fi
   return 0
 }
@@ -1975,7 +1990,7 @@ case "$CMD" in
   disconnect) cmd_disconnect "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;
   remote-login) cmd_remote_login "$@"; exit $? ;;
-  remote-launch|remote-merge|launch-allow) cmd_remote_switches "$CMD" "$@"; exit $? ;;
+  remote-launch|remote-merge|launch-allow|remote-dashboards) cmd_remote_switches "$CMD" "$@"; exit $? ;;
   controls) cmd_controls "$@"; exit $? ;;
   push-test) cmd_push_test "$@"; exit $? ;;
   *)

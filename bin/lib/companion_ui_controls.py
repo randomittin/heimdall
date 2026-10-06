@@ -111,6 +111,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from importlib.util import module_from_spec, spec_from_file_location
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -134,7 +135,14 @@ RECENT_SCAN_BYTES = 256 * 1024                # how much of an audit generation 
 
 CLASS_READ, CLASS_SAFE_WRITE, CLASS_RISKY_WRITE, CLASS_EXPAND = "read", "safe-write", "risky-write", "expand"
 CLASSES = (CLASS_READ, CLASS_SAFE_WRITE, CLASS_RISKY_WRITE, CLASS_EXPAND)
-EXPAND_SWITCHES = ("launch", "merge")         # the two laptop switches (companion_remote_switches.SWITCHES)
+EXPAND_SWITCHES = ("launch", "merge", "dashboards")   # the laptop switches (companion_remote_switches.SWITCHES)
+# What register_action's `policy` may carry: the per-action rules a sibling module's action needs of this dispatcher and nothing
+# else does. cap: the phone must have listed it (caps-missing). rid_re: a rid is REQUIRED and must be exactly this shape (it is
+# then also handed to the handler as fields["rid"]). replay_detail: the detail a replayed rid's ok ack carries instead of the first
+# one's. global_rate: False = exempt from the all-controls bucket (the action's own `rate` still applies). off_detail: the refusal
+# when its switch is off (default not-allowed). open_switch: the switch is the whole gate, there is no repo allowlist (the action
+# only ever acts on the session's own repo). timeline_ops: only these `op`s are also recorded in relay-events.jsonl.
+POLICY_KEYS = frozenset(("cap", "rid_re", "replay_detail", "global_rate", "off_detail", "open_switch", "timeline_ops"))
 RESERVED_EXPAND = {"launch-session": "launch", "pr-merge": "merge"}   # fixed by CP2: class expand, this switch, always
 KILL_SWITCH_EXEMPT = frozenset(("launch-stop",))   # reduce-direction: ends only what the phone started
 EXPAND_RATES = {"launch-session": ((1, 1 / 60.0),),
@@ -156,6 +164,9 @@ HOOK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ACTION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
 STOP_ID_RE = re.compile(r"s-[0-9a-f]{8}")
 REPO_ID_RE = re.compile(r"r-[0-9a-f]{4}")         # an allowlist id (companion_remote_switches.repo_id)
+TILE_ID_RE = re.compile(r"t-[0-9a-f]{8}")         # a dashboard tile id (bin/lib/companion_dashboards.py)
+AUDIT_OPS = frozenset(("create", "refine", "set-refresh", "refresh", "remove", "confirm", "decline", "expire", "run-failed",
+                       "idle-pause"))             # the dashboards ops an audit line may name, requests and what the laptop did
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,39}")      # a registered action name: kebab-case
 DETAIL_RE = re.compile(r"[a-z0-9-]{1,40}")
 DEVICE_RE = re.compile(r"[0-9a-f]{8}|direct|unknown")
@@ -540,6 +551,8 @@ _AUDIT_FIELDS = {
     "model": lambda v: v in ("sonnet", "opus", "haiku"),
     "method": lambda v: v in ("squash", "merge", "rebase"),
     "number": lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 < v < 10 ** 9,
+    "op": lambda v: v in AUDIT_OPS,
+    "tile_id": lambda v: isinstance(v, str) and TILE_ID_RE.fullmatch(v) is not None,
 }
 
 
@@ -558,13 +571,15 @@ def _validate(action, params):
     if size > MAX_COMMAND_BYTES:
         raise _Refusal("bad-params")
     rid = params.get("rid")
-    if "rid" in params and not (isinstance(rid, str) and RID_RE.fullmatch(rid)):
+    rid_re = spec["policy"].get("rid_re")
+    if ("rid" in params or rid_re is not None) and not (isinstance(rid, str) and (rid_re or RID_RE).fullmatch(rid)):
         raise _Refusal("bad-params")
     body = {k: v for k, v in params.items() if k != "rid"}
     keys = set(body)
     if not set(spec["required"]) <= keys or not keys <= set(spec["required"]) | set(spec["optional"]):
         raise _Refusal("bad-params")
-    return rid, spec["fields"](body)
+    fields = spec["fields"](body)
+    return rid, (dict(fields, rid=rid) if rid_re is not None else fields)
 
 
 # -- rate limits ------------------------------------------------------------------------------------------------
@@ -603,12 +618,12 @@ def _charge(root, action):
     """Take one token from every bucket this command draws on, or raise rate-limited with the longest wait. Nothing is
     taken when any bucket is empty, so a refused command never spends budget."""
     now = time.monotonic()
-    names = [("*",) + _GLOBAL_RATE]
+    names = [("*",) + _GLOBAL_RATE] if _ACTIONS[action]["policy"].get("global_rate", True) else []
     for i, (cap, per) in enumerate(_ACTIONS[action]["rate"]):
         names.append(("%s#%d" % (action, i), cap, per))
     with _LOCK:
         buckets = [_BUCKETS.setdefault((root, n), _Bucket(cap, per)) for n, cap, per in names]
-        wait = max(b.wait(now) for b in buckets)
+        wait = max([b.wait(now) for b in buckets] or [0.0])
         if wait > 0:
             raise _Refusal("rate-limited", {"retry_after_s": max(1, int(math.ceil(wait)))})
         for b in buckets:
@@ -760,7 +775,7 @@ def _rate_pairs(rate):
 
 
 def register_action(name, *, cls, handler, required=(), optional=(), fields=_no_fields, audit=None, rate=None, switch=None,
-                    repo_field=None, usable=None):
+                    repo_field=None, usable=None, policy=None):
     """Put `name` on the allowlist: the one way an action gets in (module import time; trusted code only). `handler(root,
     fields, ctx)` returns (ok, detail, extra). `cls` is read | safe-write | risky-write | expand. An expand action names its
     laptop `switch` (launch | merge) and, when the phone picks the repo, `repo_field` -- the param holding an allowlist id
@@ -784,9 +799,12 @@ def register_action(name, *, cls, handler, required=(), optional=(), fields=_no_
         raise ValueError("a reserved name keeps its class and switch")
     if name in KILL_SWITCH_EXEMPT and cls != CLASS_SAFE_WRITE:
         raise ValueError("only a safe-write action can be exempt from the kill switch")
+    policy = dict(policy or {})
+    if not set(policy) <= POLICY_KEYS or (policy.get("open_switch") and cls != CLASS_EXPAND):
+        raise ValueError("unknown policy key, or open_switch on an action that is not expand")
     _ACTIONS[name] = {"cls": cls, "switch": switch, "repo_field": repo_field, "required": tuple(required),
                       "optional": tuple(optional), "fields": fields, "audit": audit or (lambda f: {}), "handler": handler,
-                      "rate": _rate_pairs(rate), "usable": usable,
+                      "rate": _rate_pairs(rate), "usable": usable, "policy": policy,
                       "timeline": cls == CLASS_EXPAND or name in KILL_SWITCH_EXEMPT}
     ACTION_ORDER.append(name)
     ALLOWED_ACTIONS = frozenset(_ACTIONS)
@@ -802,6 +820,27 @@ register_action("hook-toggle", cls=CLASS_RISKY_WRITE, handler=_do_hook_toggle, r
 register_action("fallback-mode", cls=CLASS_RISKY_WRITE, handler=_do_fallback_mode, required=("mode",), optional=("confirm",),
                 fields=_fallback_fields, audit=_audit_fallback, rate=(3, 3 / 60.0),
                 usable=lambda root: _usable_tool("heimdall-fallback"))
+
+
+# -- actions a sibling module owns ------------------------------------------------------------------------------
+# A module named here registers its own action(s) through register_actions(kit) when this one imports (trusted code only,
+# like every register_action call); one that cannot load, or raises, simply leaves its action off the allowlist.
+ACTION_MODULES = ("companion_dashboards",)
+
+
+def _load_action_modules():
+    kit = types.SimpleNamespace(register_action=register_action, CLASS_EXPAND=CLASS_EXPAND, Refusal=_Refusal, audit=_audit,
+                                iso=_iso, controls_enabled=controls_enabled)
+    for name in ACTION_MODULES:
+        hook = getattr(_sibling(name), "register_actions", None)
+        if callable(hook):
+            try:
+                hook(kit)
+            except Exception as e:
+                sys.stderr.write("companion_ui_controls: %s did not register its actions (%s)\n" % (name, type(e).__name__))
+
+
+_load_action_modules()
 
 
 # -- dispatch ---------------------------------------------------------------------------------------------------
@@ -832,7 +871,10 @@ def _authorize(root, spec, fields):
     merge switch, was added with --merge. `fields` is None when the params were malformed: only the switch is checked."""
     sw = _switches()
     if sw is None or not sw.switch_enabled(spec["switch"]):
-        return None, None, "not-allowed"
+        return None, None, spec["policy"].get("off_detail", "not-allowed")
+    if spec["policy"].get("open_switch"):    # acts on the session's own repo only: the switch is the whole gate
+        real = os.path.realpath(root)
+        return {"id": sw.repo_id(real), "label": None, "path": real, "merge": False}, sw.repo_id(real), None
     if fields is None:
         return None, None, None
     if spec["repo_field"] is not None:
@@ -862,13 +904,23 @@ def _timeline_names():
     return set(RESERVED_EXPAND) | set(KILL_SWITCH_EXEMPT) | {n for n, s in _ACTIONS.items() if s["timeline"]}
 
 
-def _run_command(root, action, params, device_id, started):
+def _timeline_row_ok(name, op):
+    """An action whose policy lists `timeline_ops` is on the timeline (and in remote_actions.recent) for those ops only."""
+    spec = _ACTIONS.get(name)
+    ops = spec["policy"].get("timeline_ops") if spec is not None else None
+    return ops is None or op in ops
+
+
+def _run_command(root, action, params, device_id, started, caps=None):
     """(ok, detail, extra, audit_params, dup, repo) -- every refusal path included. `repo` is the allowlist id an expand
     command named (the session's own repo's, for a merge), else None."""
     spec = _ACTIONS.get(action) if isinstance(action, str) else None
     gate = RESERVED_EXPAND.get(action) if isinstance(action, str) else None
     if spec is None and gate is None:
         return False, "not-implemented", {}, {}, False, None
+    cap = spec["policy"].get("cap") if spec is not None else None
+    if cap is not None and (caps is None or cap not in caps):   # an action behind a capability: the phone must have listed it
+        return False, "caps-missing", {}, {}, False, None
     if action not in KILL_SWITCH_EXEMPT and not controls_enabled(root):
         return False, "controls-off", {}, {}, False, None
     if spec is None:   # a reserved expand name nothing has registered a handler for: gated all the same
@@ -894,7 +946,8 @@ def _run_command(root, action, params, device_id, started):
                 hit = _RIDS.get(root, {}).get(rid)
             if hit is not None:
                 ok, detail, extra = hit
-                return ok, detail, dict(extra, dup=True), audit_params, True, repo
+                replay = spec["policy"].get("replay_detail")
+                return ok, (replay if ok and replay else detail), dict(extra, dup=True), audit_params, True, repo
         if spec["cls"] == CLASS_EXPAND and not _audit_ready(root):
             return False, "internal-error", {}, audit_params, False, repo
         _charge(root, action)
@@ -959,12 +1012,13 @@ def _timeline(root, line, repo):
             sys.stderr.write("companion_ui_controls: relay event log not written (%s)\n" % type(e).__name__)
 
 
-def dispatch(root, action, params, *, device_id="direct", seq=None, transport="direct"):
-    """Run one phone command. Returns (ok, detail, extra); never raises. Every command is audited, refused or not."""
+def dispatch(root, action, params, *, device_id="direct", seq=None, transport="direct", caps=None):
+    """Run one phone command. Returns (ok, detail, extra); never raises. Every command is audited, refused or not. `caps` is the
+    capability set the phone listed (None = unknown, as on the direct route): an action behind a capability is `caps-missing`."""
     started = time.monotonic()
     wall = time.time()
     try:
-        ok, detail, extra, audit_params, dup, repo = _run_command(root, action, params, device_id, started)
+        ok, detail, extra, audit_params, dup, repo = _run_command(root, action, params, device_id, started, caps)
     except Exception as e:  # the type only: a message could hold what the phone sent
         sys.stderr.write("companion_ui_controls: internal error: %s\n" % type(e).__name__)
         ok, detail, extra, audit_params, dup, repo = False, "internal-error", {}, {}, False, None
@@ -976,8 +1030,11 @@ def dispatch(root, action, params, *, device_id="direct", seq=None, transport="d
         line["id"] = extra["id"]
     if dup:
         line["dup"] = True
+    for key in ("op", "tile_id"):    # an action that names its op or tile in its audit rule has them beside `action`, not inside params
+        if key in audit_params:
+            line[key] = audit_params.pop(key)
     _audit(root, line)
-    if name is not None and name in _timeline_names():
+    if name is not None and name in _timeline_names() and _timeline_row_ok(name, line.get("op")):
         _timeline(root, line, repo)
     return ok, detail, extra
 
@@ -1041,7 +1098,8 @@ def _remote_rows(path, names):
             at, action, ok = _ts_epoch(obj["ts"]), obj["action"], obj["ok"]
         except (ValueError, KeyError, TypeError, UnicodeDecodeError):
             continue
-        if at is None or not isinstance(action, str) or action not in names or not isinstance(ok, bool):
+        if at is None or not isinstance(action, str) or action not in names or not isinstance(ok, bool) \
+                or not _timeline_row_ok(action, obj.get("op")):
             continue
         params = obj.get("params")
         repo = params.get("repo") if isinstance(params, dict) else None

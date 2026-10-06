@@ -129,6 +129,7 @@ SOURCE_FILES = (
     ".planning/reels/",                   # directory listing: name + mtime only
     ".planning/metrics.jsonl",            # last graded parallelism row (tail only)
     ".heimdall/ui/panels/",               # job panels: <id>.json via companion_ui_panels.read_panels
+    ".heimdall/ui/dashboards/",           # custom-dashboard tiles + meta.json: companion_dashboards.snapshot (laptop view)
     ".heimdall/ui/inbox.jsonl",           # undelivered companion messages: companion_ui_inbox.list_pending
     ".heimdall/.agents-count-cache",      # live-subagent count (one integer), read only after a turn ends
 )
@@ -178,6 +179,7 @@ WATCH_SOURCES = (
     ".heimdall/ui/inbox.jsonl",            # appended in place
     ".heimdall/ui/inbox-delivered.jsonl",  # delivery receipts -> inbox.delivered[]
     ".heimdall/ui/tmux-target",            # inbox.consumer == "tmux"
+    ".heimdall/ui/dashboards/rev",         # the tile store bumps it on every write -> state.dashboards
     ".heimdall/ui/controls-audit.jsonl",   # a control ran -> controls.last (appended in place)
     ".heimdall/app/controls-disabled",     # the kill switch -> controls.enabled
     ".heimdall/fallback.json",             # controls.fallback.mode (only its one `state` word is ever read)
@@ -277,6 +279,9 @@ DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "compan
 # dispatches its sealed commands through it and POST /api/control below dispatches the same way; this file only
 # serves its `controls` slice of /api/state.
 CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
+# The custom-dashboards tile store (the phone's dash-v1): this file serves the LAPTOP view of its slice as the additive
+# `dashboards` key of /api/state (no panel data, no confirmation code), so a change in the store moves the digest.
+DASHBOARDS = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_dashboards.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -880,6 +885,13 @@ def collect_launch(root):
     return None if CONTROLS is None else CONTROLS.launch_state(root)
 
 
+def collect_dashboards(root):
+    """The `dashboards` addendum: the LAPTOP view of the custom-dashboards slice (companion_dashboards.snapshot, phone=False) --
+    tiles, phases, last ok and how many wait for a confirmation; no panel data, no code, no statement. None when the module
+    cannot load: the key is then absent, which is how an hmd without dashboards reads."""
+    return None if DASHBOARDS is None else DASHBOARDS.snapshot(root, phone=False)
+
+
 # stderr diagnostics from the loop threads (the poller, the warmer, the panel publishers, the push observer). Two rules,
 # both learned from a full disk. A diagnostic never raises: stderr is a file on the same volume as everything else, so
 # its write fails exactly when something else already did, and an exception out of an `except` handler ended the
@@ -1184,6 +1196,9 @@ def collect_state(root, transport=None):
     launch = safe(collect_launch)
     if launch is not None:
         state["launch"] = launch
+    dashboards = safe(collect_dashboards)
+    if dashboards is not None:
+        state["dashboards"] = dashboards
     if transport is not None:
         state["transport"] = transport
         redact, strip_root = _transport_redaction(transport, root)

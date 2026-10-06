@@ -45,9 +45,10 @@ from importlib.util import module_from_spec, spec_from_file_location
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 
-SWITCHES = {"launch": "remote-launch.json", "merge": "remote-merge.json"}
-CLI_SWITCH = {"remote-launch": "launch", "remote-merge": "merge"}
-SWITCH_WORDS = {"launch": "remote launch", "merge": "remote merge"}
+SWITCHES = {"launch": "remote-launch.json", "merge": "remote-merge.json", "dashboards": "remote-dashboards.json"}
+CLI_SWITCH = {"remote-launch": "launch", "remote-merge": "merge", "remote-dashboards": "dashboards"}
+SWITCH_WORDS = {"launch": "remote launch", "merge": "remote merge", "dashboards": "remote dashboards"}
+OPEN_SWITCHES = frozenset(("dashboards",))   # a switch that is the whole gate: its action acts on the session's own repo, no allowlist
 SWITCH_MAX_BYTES = 4096
 ALLOWLIST_REL = os.path.join("app", "launch-allowlist.json")
 ALLOWLIST_LOCK_REL = os.path.join("app", "launch-allowlist.lock")
@@ -263,6 +264,8 @@ def available(switch, root=None, home=None):
     repo is usable, or (merge) `root` is allowlisted with --merge."""
     if not switch_enabled(switch, home):
         return False
+    if switch in OPEN_SWITCHES:
+        return True
     if switch == "merge":
         return authorize("merge", root=root, home=home) is not None
     return bool(public_repos(home))
@@ -343,6 +346,7 @@ def remove_repo(wanted, home=None):
 # -- the command line -------------------------------------------------------------------------------------------------------
 USAGE = ("usage: hmd app remote-launch on|off|status [--repo DIR]\n"
          "       hmd app remote-merge  on|off|status [--repo DIR]\n"
+         "       hmd app remote-dashboards on|off|status [--repo DIR]\n"
          "       hmd app launch-allow <repo-path> [--merge] | --remove <id> | --list\n")
 
 
@@ -406,6 +410,11 @@ def _cmd_switch(switch, cmd, rest):
     if switch == "launch":
         _say("remote launch: on -- the paired phone can start new Claude Code sessions in the repos on the allowlist "
              "(hmd app launch-allow --list). Turn it off with: hmd app remote-launch off")
+    elif switch == "dashboards":
+        _say("remote dashboards: on -- the paired phone can describe a panel in words and hmd on this laptop builds a read-only "
+             "data producer for it; nothing runs until you confirm it here (hmd dash pending). Turn it off with: hmd app "
+             "remote-dashboards off")
+        return 0
     else:
         _say("remote merge: on -- the paired phone can merge a pull request for a repo allowlisted with --merge, only while "
              "hmd's gates and the sweep receipt for that exact head are green. Turn it off with: hmd app remote-merge off")

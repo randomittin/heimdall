@@ -1,0 +1,153 @@
+{
+  "enabled": true,
+  "limits": {
+    "panel_bytes": 32768,
+    "refresh_default_s": 300,
+    "refresh_max_s": 86400,
+    "refresh_min_s": 60,
+    "tiles": 16
+  },
+  "requests": [
+    {
+      "at": 1790273049,
+      "detail": null,
+      "op": "create",
+      "phase": "done",
+      "rid": "q-00ff11ee",
+      "tile_id": "t-9c0d1e2f"
+    },
+    {
+      "at": 1790273052,
+      "detail": null,
+      "op": "create",
+      "phase": "working",
+      "rid": "q-1100ff22",
+      "tile_id": "t-11aa22bb"
+    }
+  ],
+  "tiles": [
+    {
+      "confirm": null,
+      "dashboard_id": "d-0a0a0a0a",
+      "detail": null,
+      "intent": "order volume so far today",
+      "last_ok_at": null,
+      "origin": "phone",
+      "panel": null,
+      "phase": "generating",
+      "producer_label": null,
+      "refresh_s": 300,
+      "rev": 1,
+      "screen_id": "s-0b0b0b0b",
+      "tile_id": "t-11aa22bb"
+    },
+    {
+      "confirm": {
+        "code": "351236",
+        "expires_at": 1790359400
+      },
+      "dashboard_id": "d-0a0a0a0a",
+      "detail": null,
+      "intent": "seeded tile",
+      "last_ok_at": null,
+      "origin": "phone",
+      "panel": null,
+      "phase": "needs-confirm",
+      "producer_label": "shop-db (read-only)",
+      "refresh_s": 300,
+      "rev": 1,
+      "screen_id": "s-0b0b0b0b",
+      "tile_id": "t-33cc44dd"
+    },
+    {
+      "confirm": null,
+      "dashboard_id": "d-0a0a0a0a",
+      "detail": "producer-failed",
+      "intent": "seeded tile",
+      "last_ok_at": 1790273040,
+      "origin": "phone",
+      "panel": {
+        "data": {
+          "labels": [
+            "Week 1",
+            "Week 2"
+          ],
+          "values": [
+            2,
+            3
+          ]
+        },
+        "id": "t-55ee66ff",
+        "refresh_s": 300,
+        "stale": false,
+        "title": "Refund rate",
+        "type": "bars",
+        "updated_at": 1790273040
+      },
+      "phase": "error",
+      "producer_label": "shop-db (read-only)",
+      "refresh_s": 300,
+      "rev": 1,
+      "screen_id": "s-0b0b0b0b",
+      "tile_id": "t-55ee66ff"
+    },
+    {
+      "confirm": null,
+      "dashboard_id": "d-0a0a0a0a",
+      "detail": "idle",
+      "intent": "seeded tile",
+      "last_ok_at": 1790273020,
+      "origin": "phone",
+      "panel": {
+        "data": {
+          "text": "**12** open"
+        },
+        "id": "t-77001122",
+        "refresh_s": 300,
+        "stale": false,
+        "title": "Support backlog",
+        "type": "markdown",
+        "updated_at": 1790273020
+      },
+      "phase": "paused",
+      "producer_label": "shop-db (read-only)",
+      "refresh_s": 300,
+      "rev": 1,
+      "screen_id": "s-0b0b0b0b",
+      "tile_id": "t-77001122"
+    },
+    {
+      "confirm": null,
+      "dashboard_id": "d-0a0a0a0a",
+      "detail": null,
+      "intent": "seeded tile",
+      "last_ok_at": 1790273051,
+      "origin": "phone",
+      "panel": {
+        "data": {
+          "x": [
+            "Mon",
+            "Tue"
+          ],
+          "y": [
+            12,
+            15
+          ]
+        },
+        "id": "t-9c0d1e2f",
+        "refresh_s": 300,
+        "stale": false,
+        "title": "New customers",
+        "type": "timeseries",
+        "updated_at": 1790273051
+      },
+      "phase": "live",
+      "producer_label": "shop-db (read-only)",
+      "refresh_s": 300,
+      "rev": 1,
+      "screen_id": "s-0b0b0b0b",
+      "tile_id": "t-9c0d1e2f"
+    }
+  ],
+  "v": 1
+}
