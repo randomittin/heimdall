@@ -188,6 +188,12 @@ fi
 # Named per-site assertions — the durable receipt for each site this task's
 # investigation classified, so a future edit that changes any of these sites' safety
 # is caught by name, not just by an aggregate count.
+#
+# Pins are file:LINE. A `got: [<not found>]` failure means the site MOVED (an edit above
+# it shifted the line) — it does NOT mean the site regressed. Run scan_one_file on that
+# file, confirm the same path= expression still carries the same status, then re-pin.
+# A status that CHANGED (GUARDED/NOT-AFF -> AFFECTED) is the real regression this lint
+# exists to catch.
 assert_site() {
   local want="$1" relpath="$2" line="$3"
   local got
@@ -213,7 +219,7 @@ assert_site GUARDED bin/heimdall 55
 # NOT-AFF — the containing file never enables errexit (confirmed: only `set -uo
 # pipefail` / `set -u`), so §0's hazard never applies here regardless of shape; two of
 # these three sites are ALSO pre-guarded by an early `[ -f ] || return 1`/`return 0`.
-assert_site NOT-AFF bin/heimdall-modules 1866
+assert_site NOT-AFF bin/heimdall-modules 1898
 assert_site NOT-AFF bin/heimdall-autoupdate 837
 assert_site NOT-AFF bin/heimdall-autoupdate 884
 assert_site NOT-AFF bin/lib/hmd-route-claude 52
