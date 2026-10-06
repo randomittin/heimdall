@@ -702,8 +702,9 @@ hmd_headroom_report() {
     printf 'NOT ROUTED — the headroom CLI is not installed'; return 0
   fi
   port="$(hmd_headroom_port)"
-  local health refusal
-  if health="$(hmd_headroom_health "$port")"; then
+  local health refusal state
+  state="$(hmd_headroom_port_state "$port")"
+  if [ "$state" = answering ] && health="$(hmd_headroom_health "$port")"; then
     live="$(printf '%s' "$health" | jq -r '.checks.upstream.url // empty' 2>/dev/null)"
     if ! refusal="$(hmd_headroom_reuse_ok "$port" "$health")"; then
       # A refusal the operator cannot see is indistinguishable from a silent proxy: they
@@ -711,8 +712,20 @@ hmd_headroom_report() {
       printf 'NOT ROUTED — %s' "$refusal"
       return 0
     fi
-    printf 'ROUTED — generation traffic goes to http://127.0.0.1:%s, which forwards to %s. Judgment does NOT: hmd_gate_exec scrubs it.' "$port" "$live"
+    printf 'ROUTED — generation traffic goes to http://127.0.0.1:%s, which forwards to %s. Judgment does NOT: hmd_gate_exec scrubs it.%s' "$port" "$live" "$(_hmd_headroom_supervised_note)"
+  elif [ "$state" = silent ]; then
+    printf 'NOT ROUTED — something is listening on %s but is not answering (hung or saturated); launches run direct until it does%s' "$port" "$(_hmd_headroom_held_by "$port")"
+  elif [ "$state" = answering ]; then
+    printf 'NOT ROUTED — port %s is answering but is not a Headroom proxy pointed at %s%s' "$port" "$HMD_HEADROOM_UPSTREAM" "$(_hmd_headroom_held_by "$port")"
   else
-    printf 'NOT ROUTED — no Headroom proxy is listening on %s (it starts on the next `hmd wrap`)' "$port"
+    printf 'NOT ROUTED — no Headroom proxy is listening on %s (it starts on the next `hmd wrap`)%s' "$port" "$(_hmd_headroom_supervised_note)"
   fi
+}
+
+# Said whenever the proxy is supervised: a plain kill is UNDONE within seconds, which is the
+# point, and also exactly what surprises an operator who kills the proxy to free its port.
+_hmd_headroom_supervised_note() {
+  hmd_headroom_supervised || return 0
+  printf ' Supervised by launchd (%s): it is restarted if it exits, so a plain kill is undone within seconds — stop it with `launchctl bootout gui/%s/%s`.' \
+    "$(hmd_headroom_supervisor_label)" "$(id -u)" "$(hmd_headroom_supervisor_label)"
 }

@@ -2,6 +2,11 @@
 # heimdall-modules — the module system core: install, wire, verify and TOTALLY
 # remove optional capability modules.
 #
+#   hmd modules supervise headroom <install|uninstall|status>
+#       OPT-IN launchd supervision of the local Headroom proxy (bin/heimdall-headroom-supervise).
+#       `remove headroom` uninstalls it too. Machine-global, so it acts only on the canonical
+#       state root, never on a scratch --state.
+#
 # WHAT THIS IS. hmd's base install ships the SYSTEM and ZERO module payloads.
 # A module is an optional capability described by a manifest in the registry.
 # The registry IS this repo (modules/<name>/manifest.json), so every pin is a
@@ -140,6 +145,7 @@ warn() { echo "$*" >&2; }
 # ── Arguments ────────────────────────────────────────────────────────────────
 CMD=""
 TARGET=""
+ACTION=""
 AS_JSON=0
 ASSUME_YES=0
 QUIET=0
@@ -158,6 +164,7 @@ while [ $# -gt 0 ]; do
     *)
       if [ -z "$CMD" ]; then CMD="$1"
       elif [ -z "$TARGET" ]; then TARGET="$1"
+      elif [ "$CMD" = supervise ] && [ -z "$ACTION" ]; then ACTION="$1"
       else die "unexpected argument: $1"
       fi
       shift ;;
@@ -166,7 +173,7 @@ done
 
 CMD="${CMD:-list}"
 case "$CMD" in
-  list|add|remove|update|status|rewire|verify|preflight|repair|defer|pending|optout|optin) : ;;
+  list|add|remove|update|status|rewire|verify|preflight|repair|defer|pending|optout|optin|supervise) : ;;
   *) echo "error: unknown command: $CMD" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -1466,6 +1473,24 @@ cmd_add() {
   fi
 }
 
+# ── supervise: opt-in launchd supervision of a module's long-lived process ──────────────
+# Only headroom has one (its local proxy). A machine-global side effect, so — like the upstream
+# fetch — it acts only when this state root IS the machine's bookkeeping.
+SUPERVISOR="$PLUGIN_DIR/bin/heimdall-headroom-supervise"
+cmd_supervise() {
+  local name="$1" action="$2" flags=()
+  [ -n "$name" ] || die "supervise needs a module name: hmd modules supervise headroom <install|uninstall|status>"
+  [ "$name" = headroom ] || die "\"$name\" has no supervised process — only headroom does"
+  case "$action" in install|uninstall|status) : ;; *) die "supervise needs an action: install | uninstall | status" ;; esac
+  if [ "$action" != status ] && ! state_is_canonical; then
+    die "refusing to touch launchd for a scratch state root ($STATE): supervision is machine-global. Use the canonical state, or set HMD_MODULE_STATE_IS_CANONICAL=1 if this checkout owns it"
+  fi
+  [ -x "$SUPERVISOR" ] || die "missing $SUPERVISOR"
+  [ "$AS_JSON" -eq 1 ] && flags+=(--json)
+  [ "$QUIET" -eq 1 ] && flags+=(--quiet)
+  "$SUPERVISOR" "$action" ${flags[@]+"${flags[@]}"}
+}
+
 cmd_remove() {
   local name="$1"
   [ -n "$name" ] || die "remove needs a module name"
@@ -1477,6 +1502,13 @@ cmd_remove() {
       printf '\n  "%s" is not installed. Nothing to remove.\n\n' "$name"
     fi
     return 0
+  fi
+  # A module's supervised process is part of what it installed, so it goes with the module — but
+  # only when this state root IS the machine's bookkeeping (the rule the upstream fetch obeys): a
+  # scratch --state must never reach the real launchd. Best-effort: a supervisor that cannot be
+  # removed must not wedge removing the module, and says so on stderr.
+  if [ "$name" = headroom ] && state_is_canonical && [ -x "$SUPERVISOR" ]; then
+    "$SUPERVISOR" uninstall --quiet || warn "warning: could not remove the headroom launchd supervisor (exit $?) — run: hmd modules supervise headroom uninstall"
   fi
   remove_module "$name" || exit 1
   if [ "$AS_JSON" -eq 1 ]; then
@@ -2250,4 +2282,5 @@ case "$CMD" in
   pending)   cmd_pending ;;
   optout)    cmd_optout "$TARGET" ;;
   optin)     cmd_optin "$TARGET" ;;
+  supervise) cmd_supervise "$TARGET" "$ACTION" ;;
 esac
