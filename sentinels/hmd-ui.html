@@ -107,6 +107,7 @@
   <section id="p-checkpoint"><h2>Checkpoint <span class="src">checkpoint</span></h2><div id="checkpoint" class="nodata">no data</div></section>
   <section id="p-fallback"><h2>Fallback / routing <span class="src">fallback</span></h2><div id="fallback" class="nodata">no data</div></section>
   <section id="p-remote"><h2>Remote actions <span class="src">remote_actions</span></h2><div id="remote" class="nodata">no data</div></section>
+  <section id="p-dashboards"><h2>Dashboards <span class="src">dashboards</span></h2><div id="dashboards" class="nodata">no data</div></section>
   <section id="p-reels"><h2>Reels <span class="src">reels</span></h2><div id="reels" class="nodata">no data</div></section>
   <section id="p-jobpanels" style="grid-column: 1 / -1"><h2>Job panels <span class="src">panels &middot; .heimdall/ui/panels/&lt;id&gt;.json</span></h2><div id="jobpanels" class="nodata">no panels &mdash; publish one with <code>hmd ui panel set &lt;id&gt; --type &lt;t&gt; --title &lt;s&gt; --data-json &lt;file|-&gt;</code></div></section>
 </main>
@@ -273,6 +274,19 @@
       return '<tr class="' + (r.ok ? "" : "refused") + '"><td class="mono">' + esc(new Date(r.at * 1000).toLocaleTimeString()) +
              '</td><td class="mono">' + esc(r.action) + '</td><td class="mono">' + esc(r.device) + '</td><td class="mono">' +
              esc(r.repo_label || "-") + "</td><td>" + (r.ok ? "ok" : "refused: " + esc(r.detail || "?")) + "</td></tr>";
+    }).join("") + "</table>";
+  }
+
+  function renderDashboards(d) {
+    if (!d) { return null; }
+    var head = '<div><span class="tag ' + (d.enabled ? "on" : "off") + '">remote dashboards ' + (d.enabled ? "on" : "off") + "</span></div>";
+    var tiles = d.tiles || [];
+    if (!tiles.length) { return head + '<div class="muted" style="margin-top:6px">' + (d.enabled ? "no tiles yet" : "off") + "</div>"; }
+    return head + "<table><tr><th>tile</th><th>intent</th><th>phase</th><th>last ok</th></tr>" + tiles.map(function (t) {
+      var wait = t.phase === "needs-confirm";
+      return '<tr><td class="mono">' + esc(t.tile_id) + "</td><td>" + esc(t.intent) + '</td><td class="mono' + (wait ? " deny" : "") + '">' +
+             esc(wait ? "needs-confirm: run hmd dash pending" : t.phase + (t.detail ? " (" + t.detail + ")" : "")) + '</td><td class="mono">' +
+             esc(t.last_ok_at ? new Date(t.last_ok_at * 1000).toLocaleTimeString() : "never") + "</td></tr>";
     }).join("") + "</table>";
   }
 
@@ -573,7 +587,8 @@
     { id: "checkpoint", pick: function (s) { return s.checkpoint; },                       draw: function (s) { return renderCheckpoint(s.checkpoint); } },
     { id: "fallback",   pick: function (s) { return s.fallback; },                         draw: function (s) { return renderFallback(s.fallback); } },
     { id: "reels",      pick: function (s) { return s.reels; },                            draw: function (s) { return renderReels(s.reels); } },
-    { id: "remote",     pick: function (s) { return s.remote_actions; },                   draw: function (s) { return renderRemoteActions(s.remote_actions); } }
+    { id: "remote",     pick: function (s) { return s.remote_actions; },                   draw: function (s) { return renderRemoteActions(s.remote_actions); } },
+    { id: "dashboards",  pick: function (s) { return s.dashboards; },                       draw: function (s) { return renderDashboards(s.dashboards); } }
   ];
 
   function flash(panelId) {

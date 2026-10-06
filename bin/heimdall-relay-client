@@ -340,6 +340,17 @@ HMD_UI_CONTROLS=0 / .heimdall/app/controls-disabled); this client owns the wire,
 answered whole on the stream thread (git is bounded to a few seconds, gh to 8), so there is never more than one in flight. The
 `command` event names the action only: never the path, never a line of a diff, a turn of a transcript or a pull request.
 
+CUSTOM DASHBOARDS (capability `dash-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-custom-dashboards.md DD1-DD3, DD7): `caps` also lists
+`dash-v1` whenever bin/lib/companion_dashboards.py imported. The phone seals
+    {"action":"dashboard-request","params":{"rid":"q-<8 hex>","op":"create"|"refine"|"set-refresh"|"refresh"|"remove",..}}
+which bin/lib/companion_ui_controls.py dispatches like any registered action (an `expand` action behind `hmd app
+remote-dashboards on`, off by default; the phone's caps travel with it, so a phone that never listed dash-v1 is `caps-missing`),
+acked {"ok":true,"detail":"queued"|"dup","id":<tile id>} or {"ok":false,"detail":<code>}. The answer is state.dashboards
+({v, enabled, limits, tiles, requests}, never a statement or a producer plan), sealed with the rest of the state and ONLY in the
+frames of a phone whose latest sealed resync listed `dash-v1`; the base state carries a laptop view of the same key (no panel data,
+no confirmation code) so a change anywhere in the store moves the digest, and that view is replaced or dropped per phone here.
+The command event names the action only, as for every other command.
+
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
 to import -- both mean the same thing: refuse to start a plaintext relay
@@ -422,6 +433,7 @@ PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "compani
 LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
 CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
 VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
+DASH = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_dashboards.py"))
 WS =_load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
@@ -1792,6 +1804,7 @@ class RelayClient:
         if caps != self.device_caps:
             had_login = LOGIN is not None and LOGIN.CAP_LOGIN in self.device_caps
             had_view = VIEW is not None and VIEW.CAP_VIEW in self.device_caps
+            had_dash = DASH is not None and DASH.CAP_DASH in self.device_caps
             self.device_caps = caps
             emit({"event": "device_caps", "caps": sorted(caps)})
             if LOGIN is not None and LOGIN.CAP_LOGIN in caps and not had_login:
@@ -1800,6 +1813,8 @@ class RelayClient:
                 if had_view and self._views is not None:
                     self._views.forget()  # the phone stopped listing view-v1: what it asked for is not kept
                 self._rearm_state()  # state.views rides only for a phone that lists view-v1: send (or drop) it now
+            if DASH is not None and (DASH.CAP_DASH in caps) != had_dash:
+                self._rearm_state()  # state.dashboards rides only for a phone that lists dash-v1: send (or drop) it now
 
     def _resync(self, params):
         """The phone's `resync` command, sent to an hmd that listed `resync` in its state frames'
@@ -1938,14 +1953,15 @@ class RelayClient:
         """Capability tokens of the optional features whose modules loaded (added to the codec's own)."""
         return (([E2E.CAP_LOGIN] if LOGIN is not None else [])
                 + ([E2E.CAP_CONTROLS] if CONTROLS is not None else [])
-                + ([VIEW.CAP_VIEW] if VIEW is not None else []))
+                + ([VIEW.CAP_VIEW] if VIEW is not None else [])
+                + ([DASH.CAP_DASH] if DASH is not None else []))
 
     def _control(self, action, params, seq):
         """The phone's sealed control commands (REMOTE CONTROLS above): bin/lib/companion_ui_controls.py owns every
         rule and its refusal. Never raises -- a fault is an `internal-error` ack and an event naming only its type."""
         try:
             result = CONTROLS.dispatch(self.root, action, params, device_id=CONTROLS.device_id_of(self.device_pub),
-                                       seq=seq, transport="relay")
+                                       seq=seq, transport="relay", caps=self.device_caps)
         except Exception as e:
             emit({"event": "error", "detail": "control command failed: %s" % type(e).__name__})
             return False, "internal-error", {}
@@ -2049,6 +2065,23 @@ class RelayClient:
         except Exception as e:
             emit({"event": "error", "detail": "state.views skipped: %s" % type(e).__name__})
             return state
+
+    # -- custom dashboards (dash-v1) ------------------------------------------------------------------------------
+    # See CUSTOM DASHBOARDS in the module docstring. bin/lib/companion_dashboards.py owns every rule; the sealed `dashboard-request`
+    # command goes through CONTROLS.dispatch like any registered action (_control, with the phone's caps), so this is only the
+    # state.dashboards slice: the phone's own for a phone that listed dash-v1, no key at all for one that did not.
+    def _dashboards_overlay(self, state):
+        """`state` as this phone must see it, as a copy (like _login_overlay): the slice goes through the relay's redaction profile,
+        exactly as the rest of the state does, and a fault costs the slice, never the frame."""
+        if DASH is None:
+            return state
+        try:
+            redact, strip_root = UI._transport_redaction(self.transport, self.root)
+            return DASH.overlay(state, self.root, self.device_caps,
+                                redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None)
+        except Exception as e:
+            emit({"event": "error", "detail": "state.dashboards skipped: %s" % type(e).__name__})
+            return {k: v for k, v in state.items() if k != "dashboards"}
 
     def _refuse_stale_seq(self, env, seq, ack_deadline):
         """Answer a command frame the replay guard just rejected (see STALE-SEQ REFUSAL in the module docstring):
@@ -2494,7 +2527,7 @@ class RelayClient:
         if digest == self.last_sent_digest:
             return
         rearm_gen = self._rearm_gen
-        seq, delivered = self.send_hmd_frame("state", {"state": self._views_overlay(self._login_overlay(state))})
+        seq, delivered = self.send_hmd_frame("state", {"state": self._dashboards_overlay(self._views_overlay(self._login_overlay(state)))})
         if delivered is None:
             # No usable answer: the frame never reached the phone. last_sent_digest
             # stays as it was, so the next tick sends the (then current) state again
