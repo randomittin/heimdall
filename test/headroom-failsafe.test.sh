@@ -337,6 +337,8 @@ FAKE_SERVICE=not-headroom serve "$P"
 )
 grep -q '^rc=1$' "$OUT" && grep -q 'not a Headroom proxy' "$OUT" && ok "8a refused, reason says it is not a Headroom proxy" || bad "8a stranger not refused" "$(cat "$OUT")"
 [ "$(lines "$TMP/start-c8.log")" = 0 ] && ok "8b nothing started over the stranger" || bad "8b started a proxy over a stranger" "$(cat "$TMP/start-c8.log")"
+STRANGER_PID="$(tail -1 "$PIDS")"
+grep -q "held by pid $STRANGER_PID" "$OUT" && ok "8c the refusal NAMES the port holder (pid $STRANGER_PID) — an owner mismatch is reported, not guessed" || bad "8c refusal does not name the port holder" "$(cat "$OUT") (expected pid $STRANGER_PID)"
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -421,6 +423,99 @@ grep -q '^dead_url=unset$' "$OUT" && [ "$(lines "$TMP/err11a")" = 1 ] && ok "11a
 grep -q "^live_url=http://127.0.0.1:$PL\$" "$OUT" && [ ! -s "$TMP/err11b" ] && ok "11b live proxy URL left alone, silent" || bad "11b live URL disturbed" "$(cat "$OUT" "$TMP/err11b")"
 grep -q '^own_url=https://example.invalid$' "$OUT" && [ ! -s "$TMP/err11c" ] && ok "11c operator URL left alone, silent" || bad "11c operator URL disturbed" "$(cat "$OUT" "$TMP/err11c")"
 [ "$(lines "$TMP/start-c11.log")" = 0 ] && ok "11d it never starts anything" || bad "11d the cheap check started a proxy"
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+echo
+echo "12 — three launch classes, chain level: plain goes direct WITH a warning; judge and fallback FAIL LOUDLY (rc 3)"
+for cls in plain judge required; do
+  nextport; OUT="$TMP/out12$cls"; ERR="$TMP/err12$cls"
+  (
+    . "$CHAIN"; setup_env "c12$cls" "$P"; export FAKE_HEADROOM_MODE=die
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$P"
+    case "$cls" in judge) export HMD_JUDGMENT=1 ;; required) export HMD_HEADROOM_REQUIRED=1 ;; esac
+    hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
+    printf 'rc=%s\nurl=%s\n' "$rc" "${ANTHROPIC_BASE_URL:-unset}" > "$OUT"
+  )
+done
+grep -q '^rc=1$' "$TMP/out12plain" && grep -q '^url=unset$' "$TMP/out12plain" && grep -q "running direct" "$TMP/err12plain" \
+  && ok "12a plain session: rc 1, stale URL dropped, 'running direct' warning — the ONLY class allowed to go direct" \
+  || bad "12a plain session misbehaved" "$(cat "$TMP/out12plain" "$TMP/err12plain")"
+for cls in judge required; do
+  if grep -q '^rc=3$' "$TMP/out12$cls" && grep -q "REFUSING to run direct" "$TMP/err12$cls" && ! grep -q "running direct" "$TMP/err12$cls" && [ "$(lines "$TMP/err12$cls")" = 1 ]; then
+    ok "12b $cls launch: rc 3 and ONE loud stderr line 'REFUSING to run direct' — never a silent direct connection"
+  else
+    bad "12b $cls launch did not fail loudly" "$(cat "$TMP/out12$cls" "$TMP/err12$cls")"
+  fi
+  grep -q "^url=http://127.0.0.1:" "$TMP/out12$cls" && ok "12c $cls launch: the environment is left exactly as found (nothing silently rewritten)" || bad "12c $cls launch rewrote the environment" "$(cat "$TMP/out12$cls")"
+done
+# The guard only bites when the proxy is WANTED and DOWN. Healthy -> routed; not wanted -> direct is fine.
+nextport; serve "$P" --lossless; OUT="$TMP/out12h"
+( . "$CHAIN"; setup_env c12h "$P"; export HMD_JUDGMENT=1; hmd_headroom_chain "$TMP" 2>/dev/null; echo "rc=$?" > "$OUT" )
+grep -q '^rc=0$' "$OUT" && ok "12d a judge launch with a HEALTHY proxy routes normally (the guard is not an over-block)" || bad "12d judge + healthy proxy misrouted" "$(cat "$OUT")"
+nextport; OUT="$TMP/out12o"
+( . "$CHAIN"; setup_env c12o "$P"; export HMD_JUDGMENT=1 HMD_HEADROOM_DISABLE=1; hmd_headroom_chain "$TMP" 2>"$TMP/err12o"; echo "rc=$?" > "$OUT" )
+grep -q '^rc=1$' "$OUT" && [ ! -s "$TMP/err12o" ] && ok "12e judge + operator opted OUT of headroom: rc 1, silent — no proxy was wanted, so nothing 'failed'" || bad "12e opted-out judge launch was blocked or noisy" "$(cat "$OUT" "$TMP/err12o")"
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+echo
+echo "13 — launcher level (bin/heimdall-route): the same three classes, plus the OmniRoute fallback gateway"
+mkdir -p "$TMP/route-bin"
+cat > "$TMP/route-bin/heimdall-fallback" <<'EOSH'
+#!/usr/bin/env bash
+case "$*" in *base-url*) [ -n "${STUB_FALLBACK_URL:-}" ] && echo "$STUB_FALLBACK_URL" ;; esac
+exit 0
+EOSH
+cat > "$TMP/route-bin/claude" <<'EOSH'
+#!/usr/bin/env bash
+echo "RAN url=${ANTHROPIC_BASE_URL:-unset}" >> "${ROUTE_TOOL_LOG:?}"
+exit 0
+EOSH
+chmod +x "$TMP/route-bin/heimdall-fallback" "$TMP/route-bin/claude"
+
+run_route() { # run_route <tag> <port> [VAR=val ...]  ->  $RROUTE_RC, $TMP/r-<tag>.{err,log}
+  local tag="$1" port="$2"; shift 2
+  : > "$TMP/r-$tag.log"
+  ( cd "$TMP" && env -u ANTHROPIC_BASE_URL -u HMD_JUDGMENT -u HMD_HEADROOM_REQUIRED -u STUB_FALLBACK_URL \
+      HOME="$TMP/home-r$tag" HEIMDALL_HOME="$TMP/home-r$tag/.heimdall" PATH="$TMP/route-bin:$PATH" \
+      HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" HEADROOM_PORT="$port" HMD_HEADROOM_READY_POLLS=4 \
+      FAKE_START_LOG="$TMP/start-r$tag.log" ROUTE_TOOL_LOG="$TMP/r-$tag.log" \
+      LAUNCHCTL="$LC_SHIM" HEIMDALL_LAUNCH_AGENTS_DIR="$TMP/la-r$tag" \
+      LC_CALLS="$TMP/lc-r$tag.calls" LC_SPAWN_LOG="$TMP/lcs-r$tag.log" LC_LOADED="$TMP/lc-r$tag.loaded" \
+      "$@" "$ROOT/bin/heimdall-route" claude --version ) >"$TMP/r-$tag.out" 2>"$TMP/r-$tag.err"
+  RROUTE_RC=$?
+}
+
+nextport; run_route plain "$P" FAKE_HEADROOM_MODE=die
+{ [ "$RROUTE_RC" = 0 ] && grep -q '^RAN url=unset$' "$TMP/r-plain.log" && grep -q "headroom not routing" "$TMP/r-plain.err"; } \
+  && ok "13a plain session, proxy down: tool runs DIRECT (ABURL unset) with a warning on stderr" \
+  || bad "13a plain-session fallback broke" "rc=$RROUTE_RC log=$(cat "$TMP/r-plain.log") err=$(cat "$TMP/r-plain.err")"
+
+nextport; run_route judge "$P" FAKE_HEADROOM_MODE=die HMD_JUDGMENT=1
+{ [ "$RROUTE_RC" = 3 ] && [ ! -s "$TMP/r-judge.log" ] && grep -q "REFUSING to run direct" "$TMP/r-judge.err"; } \
+  && ok "13b judge (HMD_JUDGMENT=1), proxy down: exit 3, loud stderr, the tool NEVER ran" \
+  || bad "13b judge launch did not fail loudly" "rc=$RROUTE_RC log=$(cat "$TMP/r-judge.log") err=$(cat "$TMP/r-judge.err")"
+
+nextport; run_route req "$P" FAKE_HEADROOM_MODE=die HMD_HEADROOM_REQUIRED=1
+{ [ "$RROUTE_RC" = 3 ] && [ ! -s "$TMP/r-req.log" ]; } \
+  && ok "13c HMD_HEADROOM_REQUIRED=1, proxy down: exit 3, the tool NEVER ran" \
+  || bad "13c required launch did not fail" "rc=$RROUTE_RC log=$(cat "$TMP/r-req.log") err=$(cat "$TMP/r-req.err")"
+
+nextport; DEADGW=$P; nextport
+run_route gwdead "$P" STUB_FALLBACK_URL="http://127.0.0.1:$DEADGW"
+{ [ "$RROUTE_RC" = 3 ] && [ ! -s "$TMP/r-gwdead.log" ] && grep -q "REFUSING to launch" "$TMP/r-gwdead.err" && grep -q "never falls back to a direct connection" "$TMP/r-gwdead.err"; } \
+  && ok "13d OmniRoute fallback gateway DOWN: exit 3, 'REFUSING to launch', the tool NEVER ran (no direct fallback)" \
+  || bad "13d dead fallback gateway was launched into or fell back direct" "rc=$RROUTE_RC log=$(cat "$TMP/r-gwdead.log") err=$(cat "$TMP/r-gwdead.err")"
+
+nextport; GW=$P; serve "$GW" --lossless; nextport
+run_route gwlive "$P" STUB_FALLBACK_URL="http://127.0.0.1:$GW"
+{ [ "$RROUTE_RC" = 0 ] && grep -q "^RAN url=http://127.0.0.1:$GW\$" "$TMP/r-gwlive.log"; } \
+  && ok "13e fallback gateway ANSWERING: the launch proceeds routed to it (the guard is not an over-block)" \
+  || bad "13e a live fallback gateway was refused" "rc=$RROUTE_RC log=$(cat "$TMP/r-gwlive.log") err=$(cat "$TMP/r-gwlive.err")"
+
+nextport; serve "$P" --lossless; run_route live "$P"
+{ [ "$RROUTE_RC" = 0 ] && grep -q "^RAN url=http://127.0.0.1:$P\$" "$TMP/r-live.log"; } \
+  && ok "13f plain session, healthy proxy: still routed through it" \
+  || bad "13f healthy-proxy routing regressed" "rc=$RROUTE_RC log=$(cat "$TMP/r-live.log") err=$(cat "$TMP/r-live.err")"
 
 echo
 echo "headroom-failsafe: $PASS passed, $FAIL failed"
