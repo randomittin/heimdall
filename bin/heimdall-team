@@ -1117,12 +1117,14 @@ case "$SUB" in
     usage; exit 0 ;;
 
   ""|dispatch)
+    cmd_dispatch "$@"
     # shellcheck disable=SC2317  # cmd_dispatch exits on every path today; the arm keeps its own exit so a future `return` still ends the script with that status
-    cmd_dispatch "$@"; exit $? ;;
+    exit $? ;;
 
   show|status)
+    cmd_status "$@"
     # shellcheck disable=SC2317  # cmd_status exits on every path today; the arm keeps its own exit so a future `return` still ends the script with that status
-    cmd_status "$@"; exit $? ;;
+    exit $? ;;
 
   auto)
     cmd_auto ;;

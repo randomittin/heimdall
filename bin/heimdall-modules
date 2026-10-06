@@ -2019,6 +2019,11 @@ repair_fixable() {
   return 0
 }
 
+# Plain-text, status-only verify for cmd_repair's "already healthy?" probe: it forces
+# AS_JSON=0 so no JSON is rendered, and is ONLY ever called inside a ( ) subshell so
+# that override (and any die/exit in cmd_verify) can never leak into cmd_repair.
+verify_plain() { AS_JSON=0; cmd_verify "$@"; }
+
 # The repair/verify entry point. Idempotent by construction: healthy is a no-op,
 # broken is rebuilt through the SAME ordered pipeline a first install faces.
 cmd_repair() {
@@ -2052,7 +2057,7 @@ cmd_repair() {
   #    update` call repair on every run: a working module costs one invariant
   #    pass, prints nothing, and re-downloads nothing.
   if is_installed "$name"; then
-    if ( AS_JSON=0; cmd_verify "$name" ) >/dev/null 2>&1; then
+    if ( verify_plain "$name" ) >/dev/null 2>&1; then
       clear_modstate "$name" "$(failure_file "$name")"
       clear_modstate "$name" "$(deferred_file "$name")"
       if [ "$AS_JSON" -eq 1 ]; then
