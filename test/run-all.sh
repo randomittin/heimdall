@@ -211,7 +211,8 @@ suite_timeout() {
     # measured 56s solo / 102s under --jobs 6 — the closest suite to the old 120s cliff.
     heimdall-context-capsule.test.sh) override=300 ;;
     # quick-ask: every mutant of test/quick-ask.test.sh re-runs the whole in-process driver (a model-child spawn per check), and the e2e
-    # re-runs the real relay client through the fake relay once per wiring mutant -- each is minutes of honest work, not a hang.
+    # re-runs the real relay client through the fake relay once per wiring mutant -- minutes of honest work, not a hang. Measured
+    # 2026-10-06 beside other suites: quick-ask.test.sh 331s (60 passed, 0 failed), quick-ask-e2e.test.sh about 140s.
     quick-ask.test.sh)               override=900 ;;
     quick-ask-e2e.test.sh)           override=600 ;;
     # measured 428s SOLO (57 passed, 0 failed) on an M-series mac, 2026-08-04 — BEFORE

@@ -223,11 +223,16 @@ def slice_of(frame):
 
 
 def republish():
-    """Put both panels back as laid down (and both tiles live): the client's producer loop is on while the dashboards switch is, and what it
-    does to a tile is not what this scenario tests -- an ask reads whatever the store holds at that moment."""
+    """Lay both panels down again, both tiles live and no longer confirmed: the client's producer loop is on while the dashboards switch is,
+    and a tile it may not run is a tile nothing refreshes (or flips to error) behind this scenario's back. An ask reads whatever the store
+    holds at that moment, which is all this scenario needs of a tile."""
     store = load_store()
     for tid, spec in TILES.items():
-        assert store.publish_panel(REPO_DIR, tid, {"title": spec["intent"], "type": "number", "data": spec["data"]}, now=time.time()) == (True, None), tid
+        with store._locked(REPO_DIR):
+            tile = store.get_tile(REPO_DIR, tid)
+            tile.update(phase="live", detail=None, confirmed_fp=None,
+                        panel={"id": tid, "title": spec["intent"], "type": "number", "data": spec["data"], "refresh_s": 3600, "updated_at": int(time.time())})
+            store._write_tile(REPO_DIR, tile)
 
 
 def send_ask(p, text, rid, caps=ASK_CAPS, **overrides):
@@ -398,8 +403,10 @@ def run(st):
           "8c. a read action never gets a remote-action line on the relay-event timeline (that is for expand actions)")
 
     # 9. a phone that never listed ask-v1 sees none of it and cannot ask
-    ack, before = p.resync(NO_ASK_CAPS)
-    p.state(since=before, timeout=30)
+    seq = p.command({"action": "resync", "params": {"last_seq": 0, "digest": "0" * 64, "caps": NO_ASK_CAPS}})
+    acked = p.wait(lambda fr: fr["type"] == "ack" and fr["body"].get("of_seq") == seq, timeout=20)
+    fresh = p.wait(lambda fr: fr["type"] == "state", since=p.frames.index(acked) + 1, timeout=30) if acked else None
+    before = p.frames.index(fresh) if fresh else len(p.frames)     # a frame already in flight when the caps changed may still carry asks: not counted
     ack, _ = send_ask(p, "orders?", "q-0000d001", caps=None)
     time.sleep(2.5)
     p.pull()
