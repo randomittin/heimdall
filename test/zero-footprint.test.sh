@@ -44,6 +44,7 @@ skip() { printf '  \033[33mSKIP\033[0m %s\n' "$1"; SKIP=$((SKIP+1)); }
 
 [ -r "$FIXTURES" ] || { echo "FATAL: shared fixtures missing: $FIXTURES" >&2; exit 2; }
 # shellcheck source=lib/runhmd-fixtures.sh
+# shellcheck disable=SC1091  # sourced lib is not a shellcheck input without -x
 . "$FIXTURES"
 for t in node jq python3 shasum git perl; do
   command -v "$t" >/dev/null 2>&1 || { echo "FATAL: $t is required" >&2; exit 2; }
@@ -53,6 +54,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/zero-footprint-test.XXXXXX")"
 [ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 WORK="$(cd "$WORK" && pwd -P)"
 LISTENER_PID=""
+# shellcheck disable=SC2329  # runs via the EXIT trap right below; shellcheck does not follow that reference here
 cleanup() {
   if [ -n "$LISTENER_PID" ]; then kill "$LISTENER_PID" 2>/dev/null; fi
   rm -rf "$WORK" 2>/dev/null || true
@@ -149,7 +151,7 @@ footprint_report() {
   find "$H" -newer "$MARKER" | sed 's/^/home newer than marker: /'
   diff <(snapshot "$PROJ") "$WORK/snap-proj" | sed 's/^/repo changed: /'
   find "$PROJ" -newer "$MARKER" | sed 's/^/repo newer than marker: /'
-  ls -A "$TMPD" | sed 's/^/temp dir left behind: /'
+  find "$TMPD" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | sed 's/^/temp dir left behind: /'
 }
 assert_clean() {  # <label>
   local rep; rep="$(footprint_report)"
@@ -635,7 +637,7 @@ if ! command -v npm >/dev/null 2>&1 || ! command -v npx >/dev/null 2>&1; then
 else
   PACK="$WORK/pack"; mkdir -p "$PACK" "$WORK/npm-cache" "$WORK/npx-tmp" "$WORK/npm-home"
   ( cd "$PKG_DIR" && HOME="$WORK/npm-home" npm_config_cache="$WORK/npm-cache" npm pack --pack-destination "$PACK" --ignore-scripts --silent ) >/dev/null 2>&1
-  TGZ="$(ls "$PACK"/runhmd-*.tgz 2>/dev/null | head -1)"
+  TGZ="$(find "$PACK" -maxdepth 1 -name 'runhmd-*.tgz' 2>/dev/null | sort | head -1)"
   if [ -z "$TGZ" ]; then
     bad "npm pack produced no tarball"
   else

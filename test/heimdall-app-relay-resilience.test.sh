@@ -6,6 +6,8 @@
 
 # shellcheck disable=SC2034  # RELAY_SUITE_TITLE is read by test/lib/app-relay-common.sh (sourced next), never in this file
 RELAY_SUITE_TITLE="heimdall-app-relay (bin/heimdall-relay-client + hmd app connect --relay oracle) -- part 2/3: connect, ack/state retry"
+# shellcheck source=lib/app-relay-common.sh
+# shellcheck disable=SC1091  # sourced lib is not a shellcheck input without -x
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/app-relay-common.sh"
 
 # ═════════════════════════════════════════════════════════════════════════════

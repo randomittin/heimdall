@@ -46,22 +46,27 @@ conf() { COUT="$TMP/conf.out"; CERR="$TMP/conf.err"; python3 -m adapters.conform
 echo "[A] golden: every adapter under adapters/ conforms"
 
 conf --list
-[ "$CRC" -eq 0 ] && ADAPTERS="$(cat "$COUT")" || ADAPTERS=""
-[ -n "$ADAPTERS" ] && grep -qx gitdiff "$COUT" && ok "--list names the adapters present, gitdiff among them" || bad "--list wrong (rc=$CRC): $(head -c 200 "$COUT") $(head -c 200 "$CERR")"
-! grep -Eqx '_?common|conformance' "$COUT" && ok "--list does not mistake the helper modules for adapters" || bad "--list names a helper module"
+ADAPTERS=""
+if [ "$CRC" -eq 0 ]; then ADAPTERS="$(cat "$COUT")"; fi
+if [ -n "$ADAPTERS" ] && grep -qx gitdiff "$COUT"; then ok "--list names the adapters present, gitdiff among them"
+else bad "--list wrong (rc=$CRC): $(head -c 200 "$COUT") $(head -c 200 "$CERR")"; fi
+if ! grep -Eqx '_?common|conformance' "$COUT"; then ok "--list does not mistake the helper modules for adapters"
+else bad "--list names a helper module"; fi
 
 for name in $ADAPTERS; do
   conf --adapter "$name"
-  [ "$CRC" -eq 0 ] && grep -q '^RESULT: [0-9]* passed, 0 failed' "$COUT" && ok "adapter '$name': python3 -m adapters.conformance --adapter $name exits 0" \
-    || bad "adapter '$name' does not conform (rc=$CRC): $(grep -E '^(FAIL|RESULT)' "$COUT" | head -5 | tr '\n' '|') $(head -c 200 "$CERR")"
+  if [ "$CRC" -eq 0 ] && grep -q '^RESULT: [0-9]* passed, 0 failed' "$COUT"; then ok "adapter '$name': python3 -m adapters.conformance --adapter $name exits 0"
+  else bad "adapter '$name' does not conform (rc=$CRC): $(grep -E '^(FAIL|RESULT)' "$COUT" | head -5 | tr '\n' '|') $(head -c 200 "$CERR")"; fi
 done
 
 conf --adapter gitdiff --json
-jq -e '.schema=="runhmd.adapter-conformance/1" and .adapter=="gitdiff" and .contract=="runhmd.adapter/1" and .ok==true and .failed==0 and (.checks|length)>=20
-       and ([.checks[]|select(.status=="pass")]|length)==.passed and all(.checks[]; has("id") and has("title") and has("status") and has("detail"))' "$COUT" >/dev/null 2>&1 \
-  && ok "--json: runhmd.adapter-conformance/1 with every check (id, title, status, detail) and consistent counts" || bad "--json shape wrong (rc=$CRC): $(head -c 300 "$COUT")"
-jq -e '[.checks[]|select(.status=="skip")]|length==0' "$COUT" >/dev/null 2>&1 \
-  && ok "a conforming adapter skips nothing: every rule actually ran" || bad "golden run skipped checks: $(jq -c '[.checks[]|select(.status=="skip")|.id]' "$COUT" 2>/dev/null)"
+if jq -e '.schema=="runhmd.adapter-conformance/1" and .adapter=="gitdiff" and .contract=="runhmd.adapter/1" and .ok==true and .failed==0 and (.checks|length)>=20
+       and ([.checks[]|select(.status=="pass")]|length)==.passed and all(.checks[]; has("id") and has("title") and has("status") and has("detail"))' "$COUT" >/dev/null 2>&1; then
+  ok "--json: runhmd.adapter-conformance/1 with every check (id, title, status, detail) and consistent counts"
+else bad "--json shape wrong (rc=$CRC): $(head -c 300 "$COUT")"; fi
+if jq -e '[.checks[]|select(.status=="skip")]|length==0' "$COUT" >/dev/null 2>&1; then
+  ok "a conforming adapter skips nothing: every rule actually ran"
+else bad "golden run skipped checks: $(jq -c '[.checks[]|select(.status=="skip")|.id]' "$COUT" 2>/dev/null)"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [B] mutants: each broken adapter is rejected for the rule it breaks
@@ -100,17 +105,18 @@ while read -r mutant want; do
   if [ "$CRC" -eq 1 ] && [ "$got" = "$want" ]; then ok "mutant $mutant is rejected: exit 1, failing rules exactly {$want}"
   else bad "mutant $mutant: want exit 1 and failing rules {$want}, got rc=$CRC rules {$got} $(head -c 200 "$CERR")"; fi
 done <<<"$MUTANTS"
-[ "$NMUT" -ge 21 ] && ok "$NMUT mutants ran, covering every rule the suite enforces" || bad "only $NMUT mutants ran"
+if [ "$NMUT" -ge 21 ]; then ok "$NMUT mutants ran, covering every rule the suite enforces"; else bad "only $NMUT mutants ran"; fi
 
 # every rule the suite enforces has at least one mutant aimed at it
 conf --rules
 RULES="$(cut -f1 "$COUT")"
-[ "$CRC" -eq 0 ] && [ "$(printf '%s\n' "$RULES" | grep -c .)" -ge 20 ] && ok "--rules lists the contract's rules ($(printf '%s\n' "$RULES" | grep -c .) of them)" || bad "--rules wrong (rc=$CRC): $(head -c 200 "$COUT")"
+if [ "$CRC" -eq 0 ] && [ "$(printf '%s\n' "$RULES" | grep -c .)" -ge 20 ]; then ok "--rules lists the contract's rules ($(printf '%s\n' "$RULES" | grep -c .) of them)"
+else bad "--rules wrong (rc=$CRC): $(head -c 200 "$COUT")"; fi
 missing=""
 for rule in $RULES; do
-  printf '%s\n' "$MUTANTS" | tr ' ,' '\n\n' | grep -qx "$rule" || missing="$missing $rule"
+  printf '%s\n' "$MUTANTS" | tr ' ,' '\n' | grep -qx "$rule" || missing="$missing $rule"
 done
-[ -z "$missing" ] && ok "every rule id has a mutant that must trip it" || bad "rules with no mutant:$missing"
+if [ -z "$missing" ]; then ok "every rule id has a mutant that must trip it"; else bad "rules with no mutant:$missing"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [C] independence
@@ -119,39 +125,42 @@ echo "[C] independence: the suite core imports no adapter"
 
 CORE="$REPO/adapters/conformance/__main__.py $REPO/adapters/conformance/rules.py $REPO/adapters/conformance/fixture.py"
 # shellcheck disable=SC2086
-! grep -En '^[[:space:]]*(from|import)[[:space:]]+adapters\.(_common|gitdiff|claude|codex|gemini)\b|from[[:space:]]+adapters[[:space:]]+import[[:space:]]+(_common|gitdiff|claude|codex|gemini)\b' $CORE >/dev/null 2>&1 \
-  && ok "no static import of an adapter or of adapters._common in the suite core" || bad "the suite core imports an adapter: $(grep -En 'adapters\.(_common|gitdiff)' $CORE | head -3)"
+if ! grep -En '^[[:space:]]*(from|import)[[:space:]]+adapters\.(_common|gitdiff|claude|codex|gemini)\b|from[[:space:]]+adapters[[:space:]]+import[[:space:]]+(_common|gitdiff|claude|codex|gemini)\b' $CORE >/dev/null 2>&1; then
+  ok "no static import of an adapter or of adapters._common in the suite core"
+else bad "the suite core imports an adapter: $(grep -En 'adapters\.(_common|gitdiff)' $CORE | head -3)"; fi
 # shellcheck disable=SC2086
-! grep -En 'adapters\._common|adapters/_common' $CORE >/dev/null 2>&1 \
-  && ok "the suite core never reaches adapters._common (it keeps its own git helpers)" || bad "the suite core reaches adapters._common"
+if ! grep -En 'adapters\._common|adapters/_common' $CORE >/dev/null 2>&1; then
+  ok "the suite core never reaches adapters._common (it keeps its own git helpers)"
+else bad "the suite core reaches adapters._common"; fi
 check_drivers=""
 for driver_file in "$REPO"/adapters/conformance/drivers/*.py; do
   driver_name="$(basename "$driver_file" .py)"
   case "$driver_name" in __*) ;; *) check_drivers="$check_drivers$driver_name " ;; esac
 done
-[ -n "$check_drivers" ] && ok "adapter-specific glue lives only in adapters/conformance/drivers/ (${check_drivers% })" || bad "no drivers directory"
-! grep -En '^[[:space:]]*(from|import)[[:space:]]+adapters\.(_common|gitdiff)|from[[:space:]]+adapters[[:space:]]+import' "$REPO"/adapters/conformance/drivers/*.py >/dev/null 2>&1 \
-  && ok "drivers import no adapter either: they translate a scenario into a task, nothing more" || bad "a driver imports an adapter"
+if [ -n "$check_drivers" ]; then ok "adapter-specific glue lives only in adapters/conformance/drivers/ (${check_drivers% })"; else bad "no drivers directory"; fi
+if ! grep -En '^[[:space:]]*(from|import)[[:space:]]+adapters\.(_common|gitdiff)|from[[:space:]]+adapters[[:space:]]+import' "$REPO"/adapters/conformance/drivers/*.py >/dev/null 2>&1; then
+  ok "drivers import no adapter either: they translate a scenario into a task, nothing more"
+else bad "a driver imports an adapter"; fi
 # a conforming run must not depend on the adapter's own fixtures: the suite builds its repo itself
-grep -q '"init"' "$REPO/adapters/conformance/fixture.py" 2>/dev/null && ok "the suite builds its own fixture repository" || bad "fixture.py does not build a repo"
+if grep -q '"init"' "$REPO/adapters/conformance/fixture.py" 2>/dev/null; then ok "the suite builds its own fixture repository"; else bad "fixture.py does not build a repo"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [D] docs <-> suite
 # ══════════════════════════════════════════════════════════════════════════════
 echo "[D] docs/ADAPTERS.md documents exactly the rules the suite enforces"
 
-[ -f "$DOC" ] && ok "docs/ADAPTERS.md exists" || bad "docs/ADAPTERS.md missing"
+if [ -f "$DOC" ]; then ok "docs/ADAPTERS.md exists"; else bad "docs/ADAPTERS.md missing"; fi
 undoc=""
 for rule in $RULES; do
   grep -Eq "^\| *$rule *\|" "$DOC" 2>/dev/null || undoc="$undoc $rule"
 done
-[ -z "$undoc" ] && ok "every enforced rule id has a row in the ADAPTERS.md rules table" || bad "rules enforced but not documented:$undoc"
+if [ -z "$undoc" ]; then ok "every enforced rule id has a row in the ADAPTERS.md rules table"; else bad "rules enforced but not documented:$undoc"; fi
 extra="$(grep -Eo '^\| *[MTEK][0-9]+ *\|' "$DOC" 2>/dev/null | tr -d '| ' | sort -u | while read -r id; do printf '%s\n' "$RULES" | grep -qx "$id" || printf '%s ' "$id"; done)"
-[ -z "$extra" ] && ok "no documented rule id is missing from the suite" || bad "documented but not enforced: $extra"
+if [ -z "$extra" ]; then ok "no documented rule id is missing from the suite"; else bad "documented but not enforced: $extra"; fi
 for form in 'start(task' 'events(run_id' 'claim(run_id' 'done|failed|gave_up' 'tool|message|test|status' 'python3 -m adapters.conformance --adapter'; do
   grep -qF -- "$form" "$DOC" 2>/dev/null || { bad "ADAPTERS.md does not state the contract form: $form"; continue; }
 done
-grep -qF 'start(task' "$DOC" && grep -qF 'tool|message|test|status' "$DOC" && ok "ADAPTERS.md states the RP9 contract signatures and enums verbatim" || bad "contract signatures missing"
+if grep -qF 'start(task' "$DOC" && grep -qF 'tool|message|test|status' "$DOC"; then ok "ADAPTERS.md states the RP9 contract signatures and enums verbatim"; else bad "contract signatures missing"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [E] CLI behaviour
@@ -159,18 +168,20 @@ grep -qF 'start(task' "$DOC" && grep -qF 'tool|message|test|status' "$DOC" && ok
 echo "[E] CLI exit codes"
 
 conf --adapter no_such_adapter
-[ "$CRC" -eq 2 ] && grep -qi 'no_such_adapter' "$CERR" && ok "an unknown adapter is exit 2 (usage), never a pass" || bad "unknown adapter rc=$CRC"
+if [ "$CRC" -eq 2 ] && grep -qi 'no_such_adapter' "$CERR"; then ok "an unknown adapter is exit 2 (usage), never a pass"; else bad "unknown adapter rc=$CRC"; fi
 conf --adapter-file "$TMP/missing.py" --driver gitdiff
-[ "$CRC" -eq 2 ] && ok "an unreadable --adapter-file is exit 2" || bad "missing adapter file rc=$CRC"
+if [ "$CRC" -eq 2 ]; then ok "an unreadable --adapter-file is exit 2"; else bad "missing adapter file rc=$CRC"; fi
 cp "$REPO/adapters/gitdiff.py" "$TMP/needs_driver.py"
 conf --adapter-file "$TMP/needs_driver.py" --driver no_such_driver
-[ "$CRC" -eq 2 ] && grep -q 'drivers' "$CERR" && ok "an adapter with no driver is exit 2 and the error points at adapters/conformance/drivers/" || bad "missing driver rc=$CRC: $(head -c 200 "$CERR")"
+if [ "$CRC" -eq 2 ] && grep -q 'drivers' "$CERR"; then ok "an adapter with no driver is exit 2 and the error points at adapters/conformance/drivers/"
+else bad "missing driver rc=$CRC: $(head -c 200 "$CERR")"; fi
 conf
-[ "$CRC" -eq 2 ] && ok "no --adapter is exit 2" || bad "no adapter rc=$CRC"
+if [ "$CRC" -eq 2 ]; then ok "no --adapter is exit 2"; else bad "no adapter rc=$CRC"; fi
 printf 'CONTRACT = "runhmd.adapter/1"\nAGENT = "none"\nraise RuntimeError("boom at import")\n' >"$TMP/explodes.py"
 conf --adapter-file "$TMP/explodes.py" --driver gitdiff --json
-[ "$CRC" -eq 1 ] && jq -e '[.checks[]|select(.status=="fail")|.id]==["M1"]' "$COUT" >/dev/null 2>&1 \
-  && ok "an adapter that raises on import is nonconformant (M1, exit 1), not a crash and not a usage error" || bad "import failure wrong (rc=$CRC): $(head -c 200 "$COUT") $(head -c 200 "$CERR")"
+if [ "$CRC" -eq 1 ] && jq -e '[.checks[]|select(.status=="fail")|.id]==["M1"]' "$COUT" >/dev/null 2>&1; then
+  ok "an adapter that raises on import is nonconformant (M1, exit 1), not a crash and not a usage error"
+else bad "import failure wrong (rc=$CRC): $(head -c 200 "$COUT") $(head -c 200 "$CERR")"; fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
