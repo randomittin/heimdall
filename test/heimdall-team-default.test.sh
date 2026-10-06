@@ -17,7 +17,7 @@ ROOT_TMP="$(mktemp -d)"; trap 'rm -rf "$ROOT_TMP"' EXIT
 # HERMETIC against the operator's team off switch (HMD_TEAM_NO_COMMIT / $HOME/.heimdall/no-team-commit): `run`
 # below gives each repo its own HOME, which covers the marker but not an exported HMD_TEAM_NO_COMMIT, and with
 # that set the bare/private cases never commit and go red for a reason that is not the code.
-# shellcheck source=lib/hermetic-team-env.sh
+# shellcheck source=lib/hermetic-team-env.sh disable=SC1091
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hermetic-team-env.sh"; hermetic_team_env "$ROOT_TMP" || exit 2
 # fake gh that reports the repo's privacy from an env the caller sets ($FAKE_PRIVATE=true|false);
 # absent FAKE_PRIVATE simulates an error (unverifiable).
@@ -46,15 +46,15 @@ secret_in_tree(){ git -C "$1" grep -lI team_secret -- "$(git -C "$1" ls-files)" 
 # 1) bare `hmd team` in a PRIVATE repo -> mint + COMMIT team.json (TRACKED)
 R=$(mkrepo priv1 true); printf '{}' > "$R/.heimdall/identity.json"   # heimdall-active
 run "$R" true bash "$TEAM" >/dev/null 2>&1
-[ -n "$(team_tracked "$R")" ] && ok "bare/private: team.json committed (TRACKED)" || bad "bare/private: team.json not tracked"
-git -C "$R" log --oneline 2>/dev/null | grep -qi 'team' && ok "bare/private: committed the team" || bad "bare/private: not committed"
+if [ -n "$(team_tracked "$R")" ]; then ok "bare/private: team.json committed (TRACKED)"; else bad "bare/private: team.json not tracked"; fi
+if git -C "$R" log --oneline 2>/dev/null | grep -qi 'team'; then ok "bare/private: committed the team"; else bad "bare/private: not committed"; fi
 
 # 2) bare `hmd team` in a PUBLIC repo -> mint personal team.json, NEVER track/commit (CARDINAL)
 R=$(mkrepo pub1 false)
 run "$R" false bash "$TEAM" >/dev/null 2>&1
-[ -z "$(team_tracked "$R")" ] && ok "bare/PUBLIC: team.json NOT tracked (leak guard)" || bad "bare/PUBLIC: LEAK — team.json committed!"
-[ -z "$(secret_in_tree "$R")" ] && ok "bare/PUBLIC: secret NOT in git tree" || bad "bare/PUBLIC: secret committed!"
-[ -f "$R/.heimdall/team.json" ] && ok "bare/PUBLIC: personal team minted (presence works)" || bad "bare/PUBLIC: no personal team"
+if [ -z "$(team_tracked "$R")" ]; then ok "bare/PUBLIC: team.json NOT tracked (leak guard)"; else bad "bare/PUBLIC: LEAK — team.json committed!"; fi
+if [ -z "$(secret_in_tree "$R")" ]; then ok "bare/PUBLIC: secret NOT in git tree"; else bad "bare/PUBLIC: secret committed!"; fi
+if [ -f "$R/.heimdall/team.json" ]; then ok "bare/PUBLIC: personal team minted (presence works)"; else bad "bare/PUBLIC: no personal team"; fi
 
 # 3) bare with team.shared.json already present -> show only, no NEW commit
 R=$(mkrepo priv2 true); printf '{}' > "$R/.heimdall/identity.json"
@@ -62,37 +62,37 @@ run "$R" true bash "$TEAM" >/dev/null 2>&1   # first: mint+share
 C1=$(git -C "$R" rev-list --count HEAD 2>/dev/null || echo 0)
 run "$R" true bash "$TEAM" >/dev/null 2>&1   # second: should just show
 C2=$(git -C "$R" rev-list --count HEAD 2>/dev/null || echo 0)
-[ "$C1" = "$C2" ] && ok "bare/already-shared: no second commit (idempotent)" || bad "bare: re-committed ($C1->$C2)"
+if [ "$C1" = "$C2" ]; then ok "bare/already-shared: no second commit (idempotent)"; else bad "bare: re-committed ($C1->$C2)"; fi
 
 # 4) `auto` zero-command -> ALWAYS mints a solo team (presence works, no command)
 R=$(mkrepo auto1 true)   # no heimdall-active marker yet
 run "$R" true bash "$TEAM" auto >/dev/null 2>&1; sleep 0.2
-[ -f "$R/.heimdall/team.json" ] && ok "auto: solo team minted (zero-config presence)" || bad "auto: no solo mint"
+if [ -f "$R/.heimdall/team.json" ]; then ok "auto: solo team minted (zero-config presence)"; else bad "auto: no solo mint"; fi
 
 # 5) `auto` in PUBLIC repo -> solo mint only, NEVER tracks/commits (CARDINAL)
 R=$(mkrepo auto-pub false); printf '{}' > "$R/.heimdall/identity.json"
 run "$R" false bash "$TEAM" auto >/dev/null 2>&1; sleep 0.2
-[ -z "$(team_tracked "$R")" ] && ok "auto/PUBLIC: NEVER auto-tracks team.json (leak guard)" || bad "auto/PUBLIC: LEAK"
-[ -z "$(secret_in_tree "$R")" ] && ok "auto/PUBLIC: secret not in tree" || bad "auto/PUBLIC: secret committed"
+if [ -z "$(team_tracked "$R")" ]; then ok "auto/PUBLIC: NEVER auto-tracks team.json (leak guard)"; else bad "auto/PUBLIC: LEAK"; fi
+if [ -z "$(secret_in_tree "$R")" ]; then ok "auto/PUBLIC: secret not in tree"; else bad "auto/PUBLIC: secret committed"; fi
 
 # 6) `auto` in PRIVATE + heimdall-active + not-tracked -> auto-commits team.json (no push)
 R=$(mkrepo auto-priv true); printf '{}' > "$R/.heimdall/identity.json"
 run "$R" true bash "$TEAM" auto >/dev/null 2>&1; sleep 0.3
-[ -n "$(team_tracked "$R")" ] && ok "auto/private+active: auto-committed team.json (TRACKED)" || bad "auto/private: did not commit"
+if [ -n "$(team_tracked "$R")" ]; then ok "auto/private+active: auto-committed team.json (TRACKED)"; else bad "auto/private: did not commit"; fi
 # no remote push happened (origin has no objects pushed — bare check: no upstream)
-git -C "$R" log "@{u}.." >/dev/null 2>&1 && bad "auto: pushed (must not)" || ok "auto: did NOT push (commit only)"
+if git -C "$R" log "@{u}.." >/dev/null 2>&1; then bad "auto: pushed (must not)"; else ok "auto: did NOT push (commit only)"; fi
 
 # 7) `auto` idempotent: 2nd run with shared present -> no 2nd commit
 C1=$(git -C "$R" rev-list --count HEAD 2>/dev/null || echo 0)
 rm -f "$R/.heimdall/.team-auto-stamp" "$HOME/.heimdall/.team-auto-stamp" 2>/dev/null
 run "$R" true bash "$TEAM" auto >/dev/null 2>&1; sleep 0.2
 C2=$(git -C "$R" rev-list --count HEAD 2>/dev/null || echo 0)
-[ "$C1" = "$C2" ] && ok "auto: idempotent (shared exists -> no 2nd commit)" || bad "auto: re-committed"
+if [ "$C1" = "$C2" ]; then ok "auto: idempotent (shared exists -> no 2nd commit)"; else bad "auto: re-committed"; fi
 
 # 8) opt-out -> clean no-op (no solo mint, no commit)
 R=$(mkrepo optout true); printf '{}' > "$R/.heimdall/identity.json"
 run "$R" true env HEIMDALL_NO_TEAM_AUTOSHARE=1 bash "$TEAM" auto >/dev/null 2>&1; sleep 0.2
-[ -z "$(team_tracked "$R")" ] && ok "auto/opt-out: no commit (not tracked)" || bad "auto/opt-out: committed anyway"
+if [ -z "$(team_tracked "$R")" ]; then ok "auto/opt-out: no commit (not tracked)"; else bad "auto/opt-out: committed anyway"; fi
 
 # 9) non-blocking: auto returns fast. Sampled 3x (a FRESH repo each time -- auto's own
 # idempotency guards would make repeat runs on the SAME repo artificially fast and hide
@@ -125,7 +125,7 @@ AUTO_MED="$(printf '%s\n' "${_auto_ms[@]}" | sort -n | sed -n '2p')"
 # returns at the empty-GH_PROOF check every time in this hermetic harness -- so a
 # regression that reintroduces a network hop, which this codebase's own timeouts
 # put at 5-10s per call (curl -m 5 / urlopen timeout=10), still trips it).
-[ "$AUTO_MED" -lt 6000 ] && ok "auto non-blocking (median ${AUTO_MED}ms of ${_auto_ms[*]})" || bad "auto slow (median ${AUTO_MED}ms of ${_auto_ms[*]})"
+if [ "$AUTO_MED" -lt 6000 ]; then ok "auto non-blocking (median ${AUTO_MED}ms of ${_auto_ms[*]})"; else bad "auto slow (median ${AUTO_MED}ms of ${_auto_ms[*]})"; fi
 
 # 10) MIGRATION (the rally fix): a PRIVATE repo with a GITIGNORED + UNCOMMITTED auto-solo
 #     team.json (minted while visibility was indeterminate — no committed path ran) is the
@@ -155,7 +155,7 @@ else
   bad "migrate: bare 'hmd team' did not promote (tracked='$M_POST' secret_preserved=$([ "$M_SECRET_POST" = "$M_SECRET_PRE" ]&&echo y||echo n))"
 fi
 # The promoted secret is present in the git TREE (a clone would carry it) — private repo only.
-[ -n "$(git -C "$R" grep -lF "$M_SECRET_POST" 2>/dev/null)" ] && ok "migrate: promoted secret is in the git tree (a clone == join)" || bad "migrate: promoted secret not in tree"
+if [ -n "$(git -C "$R" grep -lF "$M_SECRET_POST" 2>/dev/null)" ]; then ok "migrate: promoted secret is in the git tree (a clone == join)"; else bad "migrate: promoted secret not in tree"; fi
 
 echo "──────────────────────────────────────"
 echo "heimdall-team-default: $PASS passed, $FAIL failed"

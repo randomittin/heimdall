@@ -35,6 +35,10 @@
 #  10  launchd is unreachable from a synthetic HOME unless launchctl is shimmed
 #  11  hmd_headroom_drop_if_dead (the shim re-entry arm's cheap check)
 
+# Every case below runs in its OWN ( ) subshell on purpose, so the env it exports
+# (FAKE_HEADROOM_MODE, ANTHROPIC_BASE_URL, ...) never leaks into the next case; the
+# parent then reads those names back from files, never from its own scope.
+# shellcheck disable=SC2030,SC2031
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -196,23 +200,23 @@ blackhole() { # blackhole <port> — accepts into the backlog, never answers
 
 echo
 echo "0 — the chain parses"
-bash -n "$CHAIN" && ok "bin/lib/hmd-headroom-chain.sh parses (bash -n)" || bad "syntax error in the chain lib"
+if bash -n "$CHAIN"; then ok "bin/lib/hmd-headroom-chain.sh parses (bash -n)"; else bad "syntax error in the chain lib"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
 echo "1 — dead port -> the start path runs ONCE and the proxy is detached into its own process group"
 nextport; OUT="$TMP/out1"; ERR="$TMP/err1"
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c1 "$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nbase=%s\ndown=%s\nwarned=%s\n' "$rc" "$HMD_HEADROOM_BASE_URL" "${HMD_HEADROOM_DOWN:-}" "${HMD_HEADROOM_WARNED:-}" > "$OUT"
 )
-grep -q '^rc=0$' "$OUT" && ok "1a chain returns 0 when it can bring the proxy up" || bad "1a chain did not route after a start" "$(cat "$OUT" "$ERR" 2>/dev/null)"
-grep -q "^base=http://127.0.0.1:$P\$" "$OUT" && ok "1b base URL points at the proxy it started" || bad "1b wrong base URL" "$(cat "$OUT")"
-[ "$(lines "$TMP/start-c1.log")" = 1 ] && ok "1c the start path ran exactly once" || bad "1c start count != 1" "$(cat "$TMP/start-c1.log")"
-[ ! -s "$ERR" ] && ok "1d no warning on a successful start" || bad "1d unexpected stderr on success" "$(cat "$ERR")"
-[ ! -s "$TMP/lc-c1.calls" ] && ok "1e launchctl untouched when supervision was never opted into" || bad "1e launchctl was called without opt-in" "$(cat "$TMP/lc-c1.calls")"
+if grep -q '^rc=0$' "$OUT"; then ok "1a chain returns 0 when it can bring the proxy up"; else bad "1a chain did not route after a start" "$(cat "$OUT" "$ERR" 2>/dev/null)"; fi
+if grep -q "^base=http://127.0.0.1:$P\$" "$OUT"; then ok "1b base URL points at the proxy it started"; else bad "1b wrong base URL" "$(cat "$OUT")"; fi
+if [ "$(lines "$TMP/start-c1.log")" = 1 ]; then ok "1c the start path ran exactly once"; else bad "1c start count != 1" "$(cat "$TMP/start-c1.log")"; fi
+if [ ! -s "$ERR" ]; then ok "1d no warning on a successful start"; else bad "1d unexpected stderr on success" "$(cat "$ERR")"; fi
+if [ ! -s "$TMP/lc-c1.calls" ]; then ok "1e launchctl untouched when supervision was never opted into"; else bad "1e launchctl was called without opt-in" "$(cat "$TMP/lc-c1.calls")"; fi
 PG="$(sed -n 's/.*pgid=\([0-9]*\).*/\1/p' "$TMP/start-c1.log" | head -1)"
 MYPG="$(ps -o pgid= -p $$ | tr -d ' ')"
 PIDREC="$(cat "$TMP/home-c1/.heimdall/headroom/proxy.pid" 2>/dev/null)"
@@ -228,36 +232,36 @@ echo "2 — start path fails -> decline, ONE stderr warning, bounded wait, never
 nextport; OUT="$TMP/out2"; ERR="$TMP/err2"
 T0=$(now)
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c2 "$P"; export FAKE_HEADROOM_MODE=die
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nbase=%s\ndown=%s\nwarned=%s\nurl=%s\nwhy=%s\n' "$rc" "$HMD_HEADROOM_BASE_URL" "${HMD_HEADROOM_DOWN:-}" "${HMD_HEADROOM_WARNED:-}" "${ANTHROPIC_BASE_URL:-unset}" "$HMD_HEADROOM_WHY" > "$OUT"
 )
 EL=$(secs "$T0" "$(now)")
-grep -q '^rc=1$' "$OUT" && ok "2a chain declines when the proxy never comes up" || bad "2a chain did not decline" "$(cat "$OUT")"
-grep -q '^base=$' "$OUT" && ok "2b no base URL is offered" || bad "2b a base URL was offered for a dead proxy" "$(cat "$OUT")"
-grep -q '^url=unset$' "$OUT" && ok "2c ANTHROPIC_BASE_URL stays unset (direct)" || bad "2c ANTHROPIC_BASE_URL was set" "$(cat "$OUT")"
-[ "$(lines "$TMP/start-c2.log")" = 1 ] && ok "2d the restart was attempted exactly once" || bad "2d restart attempts != 1" "$(cat "$TMP/start-c2.log")"
-grep -q '^down=1$' "$OUT" && grep -q '^warned=1$' "$OUT" && ok "2e HMD_HEADROOM_DOWN / HMD_HEADROOM_WARNED are set" || bad "2e down/warned flags not set" "$(cat "$OUT")"
+if grep -q '^rc=1$' "$OUT"; then ok "2a chain declines when the proxy never comes up"; else bad "2a chain did not decline" "$(cat "$OUT")"; fi
+if grep -q '^base=$' "$OUT"; then ok "2b no base URL is offered"; else bad "2b a base URL was offered for a dead proxy" "$(cat "$OUT")"; fi
+if grep -q '^url=unset$' "$OUT"; then ok "2c ANTHROPIC_BASE_URL stays unset (direct)"; else bad "2c ANTHROPIC_BASE_URL was set" "$(cat "$OUT")"; fi
+if [ "$(lines "$TMP/start-c2.log")" = 1 ]; then ok "2d the restart was attempted exactly once"; else bad "2d restart attempts != 1" "$(cat "$TMP/start-c2.log")"; fi
+if grep -q '^down=1$' "$OUT" && grep -q '^warned=1$' "$OUT"; then ok "2e HMD_HEADROOM_DOWN / HMD_HEADROOM_WARNED are set"; else bad "2e down/warned flags not set" "$(cat "$OUT")"; fi
 if [ "$(lines "$ERR")" = 1 ] && grep -q "headroom not routing" "$ERR" && grep -q "running direct" "$ERR"; then
   ok "2f exactly ONE stderr line: 'headroom not routing ... running direct'"
 else
   bad "2f expected a single 'headroom not routing ... running direct' stderr line" "$(cat "$ERR")"
 fi
-lt "$EL" 6 && ok "2g the wait is bounded (${EL}s with 8 readiness polls)" || bad "2g wait not bounded: ${EL}s"
+if lt "$EL" 6; then ok "2g the wait is bounded (${EL}s with 8 readiness polls)"; else bad "2g wait not bounded: ${EL}s"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
 echo "3 — an inherited ANTHROPIC_BASE_URL that is OUR dead proxy is dropped, in one line"
 nextport; OUT="$TMP/out3"; ERR="$TMP/err3"
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c3 "$P"; export FAKE_HEADROOM_MODE=die
   export ANTHROPIC_BASE_URL="http://127.0.0.1:$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nurl=%s\n' "$rc" "${ANTHROPIC_BASE_URL:-unset}" > "$OUT"
 )
-grep -q '^url=unset$' "$OUT" && ok "3a the stale URL is unset: the tool launches DIRECT" || bad "3a a dead ANTHROPIC_BASE_URL survived the decline" "$(cat "$OUT")"
+if grep -q '^url=unset$' "$OUT"; then ok "3a the stale URL is unset: the tool launches DIRECT"; else bad "3a a dead ANTHROPIC_BASE_URL survived the decline" "$(cat "$OUT")"; fi
 if [ "$(lines "$ERR")" = 1 ] && grep -q "dropped the inherited ANTHROPIC_BASE_URL" "$ERR"; then
   ok "3b one stderr line says the inherited URL was dropped"
 else
@@ -269,14 +273,14 @@ echo
 echo "4 — an operator's OWN ANTHROPIC_BASE_URL is never dropped"
 nextport; OUT="$TMP/out4"; ERR="$TMP/err4"
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c4 "$P"; export FAKE_HEADROOM_MODE=die
   export ANTHROPIC_BASE_URL="https://example.invalid"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nurl=%s\n' "$rc" "${ANTHROPIC_BASE_URL:-unset}" > "$OUT"
 )
-grep -q '^url=https://example.invalid$' "$OUT" && ok "4a the operator's URL is untouched" || bad "4a the operator's ANTHROPIC_BASE_URL was clobbered" "$(cat "$OUT")"
-! grep -q "dropped" "$ERR" && ok "4b nothing claims a drop that did not happen" || bad "4b warning claims a drop" "$(cat "$ERR")"
+if grep -q '^url=https://example.invalid$' "$OUT"; then ok "4a the operator's URL is untouched"; else bad "4a the operator's ANTHROPIC_BASE_URL was clobbered" "$(cat "$OUT")"; fi
+if ! grep -q "dropped" "$ERR"; then ok "4b nothing claims a drop that did not happen"; else bad "4b warning claims a drop" "$(cat "$ERR")"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -285,17 +289,17 @@ nextport; OUT="$TMP/out5"; ERR="$TMP/err5"
 blackhole "$P"
 T0=$(now)
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c5 "$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\ndown=%s\nwhy=%s\n' "$rc" "${HMD_HEADROOM_DOWN:-}" "$HMD_HEADROOM_WHY" > "$OUT"
 )
 EL=$(secs "$T0" "$(now)")
-grep -q '^rc=1$' "$OUT" && ok "5a chain declines" || bad "5a chain did not decline" "$(cat "$OUT")"
-lt "$EL" 2.5 && ok "5b the launch is never held by a hung listener (${EL}s < 2.5s)" || bad "5b a hung listener blocked the launch for ${EL}s"
-grep -q '^why=.*did not answer' "$OUT" && ok "5c the reason names the hung listener" || bad "5c reason does not say the listener is not answering" "$(cat "$OUT")"
-[ "$(lines "$TMP/start-c5.log")" = 0 ] && ok "5d no second proxy was started on top of it" || bad "5d a proxy was started over a live listener" "$(cat "$TMP/start-c5.log")"
-[ "$(lines "$ERR")" = 1 ] && grep -q "headroom not routing" "$ERR" && ok "5e one stderr warning" || bad "5e expected one stderr warning" "$(cat "$ERR")"
+if grep -q '^rc=1$' "$OUT"; then ok "5a chain declines"; else bad "5a chain did not decline" "$(cat "$OUT")"; fi
+if lt "$EL" 2.5; then ok "5b the launch is never held by a hung listener (${EL}s < 2.5s)"; else bad "5b a hung listener blocked the launch for ${EL}s"; fi
+if grep -q '^why=.*did not answer' "$OUT"; then ok "5c the reason names the hung listener"; else bad "5c reason does not say the listener is not answering" "$(cat "$OUT")"; fi
+if [ "$(lines "$TMP/start-c5.log")" = 0 ]; then ok "5d no second proxy was started on top of it"; else bad "5d a proxy was started over a live listener" "$(cat "$TMP/start-c5.log")"; fi
+if [ "$(lines "$ERR")" = 1 ] && grep -q "headroom not routing" "$ERR"; then ok "5e one stderr warning"; else bad "5e expected one stderr warning" "$(cat "$ERR")"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -303,13 +307,13 @@ echo "6 — a healthy proxy is reused untouched (no start, no warning)"
 nextport; OUT="$TMP/out6"; ERR="$TMP/err6"
 serve "$P" --lossless
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c6 "$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nbase=%s\nwhy=%s\n' "$rc" "$HMD_HEADROOM_BASE_URL" "$HMD_HEADROOM_WHY" > "$OUT"
 )
-grep -q '^rc=0$' "$OUT" && grep -q "^base=http://127.0.0.1:$P\$" "$OUT" && ok "6a a live proxy is routed into" || bad "6a live proxy not reused" "$(cat "$OUT" "$ERR")"
-[ "$(lines "$TMP/start-c6.log")" = 0 ] && [ ! -s "$ERR" ] && ok "6b nothing started, nothing warned" || bad "6b reuse started something or warned" "$(cat "$TMP/start-c6.log" "$ERR" 2>/dev/null)"
+if grep -q '^rc=0$' "$OUT" && grep -q "^base=http://127.0.0.1:$P\$" "$OUT"; then ok "6a a live proxy is routed into"; else bad "6a live proxy not reused" "$(cat "$OUT" "$ERR")"; fi
+if [ "$(lines "$TMP/start-c6.log")" = 0 ] && [ ! -s "$ERR" ]; then ok "6b nothing started, nothing warned"; else bad "6b reuse started something or warned" "$(cat "$TMP/start-c6.log" "$ERR" 2>/dev/null)"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -317,7 +321,7 @@ echo "7 — hmd_headroom_port_state: dead / silent / answering, each inside its 
 nextport; PD=$P; nextport; PS=$P; nextport; PA=$P
 blackhole "$PS"; serve "$PA" --lossless
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"
   t0=$(now); d="$(hmd_headroom_port_state "$PD")"; td=$(secs "$t0" "$(now)")
   t0=$(now); s="$(hmd_headroom_port_state "$PS")"; ts=$(secs "$t0" "$(now)")
@@ -328,9 +332,9 @@ read -r line < "$TMP/out7"
 d="$(printf '%s' "$line" | sed -n 's/.*d=\([a-z]*\) .*/\1/p')"; td="$(printf '%s' "$line" | sed -n 's/.*td=\([0-9.]*\) .*/\1/p')"
 s="$(printf '%s' "$line" | sed -n 's/.* s=\([a-z]*\) .*/\1/p')"; ts="$(printf '%s' "$line" | sed -n 's/.*ts=\([0-9.]*\) .*/\1/p')"
 a="$(printf '%s' "$line" | sed -n 's/.* a=\([a-z]*\)$/\1/p')"
-[ "$d" = dead ] && lt "${td:-9}" 0.8 && ok "7a refused connection -> dead, instantly (${td}s)" || bad "7a dead port misread" "$line"
-[ "$s" = silent ] && lt "${ts:-9}" 1.6 && ok "7b accepts-but-silent -> silent, within the 1s budget (${ts}s)" || bad "7b hung listener misread or slow" "$line"
-[ "$a" = answering ] && ok "7c a live listener -> answering" || bad "7c live proxy misread" "$line"
+if [ "$d" = dead ] && lt "${td:-9}" 0.8; then ok "7a refused connection -> dead, instantly (${td}s)"; else bad "7a dead port misread" "$line"; fi
+if [ "$s" = silent ] && lt "${ts:-9}" 1.6; then ok "7b accepts-but-silent -> silent, within the 1s budget (${ts}s)"; else bad "7b hung listener misread or slow" "$line"; fi
+if [ "$a" = answering ]; then ok "7c a live listener -> answering"; else bad "7c live proxy misread" "$line"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -338,15 +342,15 @@ echo "8 — a stranger that answers HTTP is refused, and no proxy is started ove
 nextport; OUT="$TMP/out8"; ERR="$TMP/err8"
 FAKE_SERVICE=not-headroom serve "$P"
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c8 "$P"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nwhy=%s\n' "$rc" "$HMD_HEADROOM_WHY" > "$OUT"
 )
-grep -q '^rc=1$' "$OUT" && grep -q 'not a Headroom proxy' "$OUT" && ok "8a refused, reason says it is not a Headroom proxy" || bad "8a stranger not refused" "$(cat "$OUT")"
-[ "$(lines "$TMP/start-c8.log")" = 0 ] && ok "8b nothing started over the stranger" || bad "8b started a proxy over a stranger" "$(cat "$TMP/start-c8.log")"
+if grep -q '^rc=1$' "$OUT" && grep -q 'not a Headroom proxy' "$OUT"; then ok "8a refused, reason says it is not a Headroom proxy"; else bad "8a stranger not refused" "$(cat "$OUT")"; fi
+if [ "$(lines "$TMP/start-c8.log")" = 0 ]; then ok "8b nothing started over the stranger"; else bad "8b started a proxy over a stranger" "$(cat "$TMP/start-c8.log")"; fi
 STRANGER_PID="$(tail -1 "$PIDS")"
-grep -q "held by pid $STRANGER_PID" "$OUT" && ok "8c the refusal NAMES the port holder (pid $STRANGER_PID) — an owner mismatch is reported, not guessed" || bad "8c refusal does not name the port holder" "$(cat "$OUT") (expected pid $STRANGER_PID)"
+if grep -q "held by pid $STRANGER_PID" "$OUT"; then ok "8c the refusal NAMES the port holder (pid $STRANGER_PID) — an owner mismatch is reported, not guessed"; else bad "8c refusal does not name the port holder" "$(cat "$OUT") (expected pid $STRANGER_PID)"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -357,39 +361,39 @@ UIDN="$(id -u)"
 # 9a: plist present, agent not loaded -> bootstrap (which starts it), no direct spawn
 nextport; OUT="$TMP/out9a"; ERR="$TMP/err9a"
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c9a "$P"; export HMD_HEADROOM_SUPERVISOR_LABEL="$LABEL9"
   mkdir -p "$HEIMDALL_LAUNCH_AGENTS_DIR"; : > "$HEIMDALL_LAUNCH_AGENTS_DIR/$LABEL9.plist"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\nwhy=%s\nsupervised=%s\n' "$rc" "$HMD_HEADROOM_WHY" "$(hmd_headroom_supervised && echo yes || echo no)" > "$OUT"
 )
-grep -q '^rc=0$' "$OUT" && ok "9a chain routes once launchd has started the proxy" || bad "9a supervised start failed" "$(cat "$OUT" "$ERR" "$TMP/lc-c9a.calls" 2>/dev/null)"
-grep -q "^bootstrap gui/$UIDN $TMP/la-c9a/$LABEL9.plist\$" "$TMP/lc-c9a.calls" && ok "9b not loaded -> launchctl bootstrap gui/<uid> <plist>" || bad "9b no bootstrap recorded" "$(cat "$TMP/lc-c9a.calls")"
-[ "$(lines "$TMP/start-c9a.log")" = 0 ] && [ "$(lines "$TMP/lcspawn-c9a.log")" = 1 ] && ok "9c exactly one proxy, started by launchd — the chain did NOT also spawn one" || bad "9c double start or no start" "chain-spawns=$(lines "$TMP/start-c9a.log") launchd-spawns=$(lines "$TMP/lcspawn-c9a.log")"
-grep -q '^why=.*launchd' "$OUT" && ok "9d the reason says launchd started it" || bad "9d reason does not mention launchd" "$(cat "$OUT")"
-grep -q '^supervised=yes$' "$OUT" && ok "9e hmd_headroom_supervised follows the plist (the opt-in marker)" || bad "9e supervised not detected" "$(cat "$OUT")"
+if grep -q '^rc=0$' "$OUT"; then ok "9a chain routes once launchd has started the proxy"; else bad "9a supervised start failed" "$(cat "$OUT" "$ERR" "$TMP/lc-c9a.calls" 2>/dev/null)"; fi
+if grep -q "^bootstrap gui/$UIDN $TMP/la-c9a/$LABEL9.plist\$" "$TMP/lc-c9a.calls"; then ok "9b not loaded -> launchctl bootstrap gui/<uid> <plist>"; else bad "9b no bootstrap recorded" "$(cat "$TMP/lc-c9a.calls")"; fi
+if [ "$(lines "$TMP/start-c9a.log")" = 0 ] && [ "$(lines "$TMP/lcspawn-c9a.log")" = 1 ]; then ok "9c exactly one proxy, started by launchd — the chain did NOT also spawn one"; else bad "9c double start or no start" "chain-spawns=$(lines "$TMP/start-c9a.log") launchd-spawns=$(lines "$TMP/lcspawn-c9a.log")"; fi
+if grep -q '^why=.*launchd' "$OUT"; then ok "9d the reason says launchd started it"; else bad "9d reason does not mention launchd" "$(cat "$OUT")"; fi
+if grep -q '^supervised=yes$' "$OUT"; then ok "9e hmd_headroom_supervised follows the plist (the opt-in marker)"; else bad "9e supervised not detected" "$(cat "$OUT")"; fi
 
 # 9f: already loaded -> kickstart only, never a second bootstrap
 nextport; OUT="$TMP/out9f"; ERR="$TMP/err9f"
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c9f "$P"; export HMD_HEADROOM_SUPERVISOR_LABEL="$LABEL9"
   mkdir -p "$HEIMDALL_LAUNCH_AGENTS_DIR"; : > "$HEIMDALL_LAUNCH_AGENTS_DIR/$LABEL9.plist"; : > "$LC_LOADED"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\n' "$rc" > "$OUT"
 )
-grep -q "^kickstart gui/$UIDN/$LABEL9\$" "$TMP/lc-c9f.calls" && ! grep -q '^bootstrap' "$TMP/lc-c9f.calls" && ok "9f loaded -> launchctl kickstart gui/<uid>/<label>, no re-bootstrap" || bad "9f wrong verb for a loaded agent" "$(cat "$TMP/lc-c9f.calls")"
+if grep -q "^kickstart gui/$UIDN/$LABEL9\$" "$TMP/lc-c9f.calls" && ! grep -q '^bootstrap' "$TMP/lc-c9f.calls"; then ok "9f loaded -> launchctl kickstart gui/<uid>/<label>, no re-bootstrap"; else bad "9f wrong verb for a loaded agent" "$(cat "$TMP/lc-c9f.calls")"; fi
 
 # 9g: launchctl refuses -> fall back to the direct spawn, still fail-safe
 nextport; OUT="$TMP/out9g"; ERR="$TMP/err9g"
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c9g "$P"; export HMD_HEADROOM_SUPERVISOR_LABEL="$LABEL9" FAKE_LAUNCHCTL_MODE=fail
   mkdir -p "$HEIMDALL_LAUNCH_AGENTS_DIR"; : > "$HEIMDALL_LAUNCH_AGENTS_DIR/$LABEL9.plist"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'rc=%s\n' "$rc" > "$OUT"
 )
-grep -q '^rc=0$' "$OUT" && [ "$(lines "$TMP/start-c9g.log")" = 1 ] && ok "9g launchctl failing -> the direct spawn still brings the proxy up (exactly once)" || bad "9g no fallback when launchd refuses" "$(cat "$OUT" "$ERR" "$TMP/start-c9g.log" 2>/dev/null)"
+if grep -q '^rc=0$' "$OUT" && [ "$(lines "$TMP/start-c9g.log")" = 1 ]; then ok "9g launchctl failing -> the direct spawn still brings the proxy up (exactly once)"; else bad "9g no fallback when launchd refuses" "$(cat "$OUT" "$ERR" "$TMP/start-c9g.log" 2>/dev/null)"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -403,7 +407,7 @@ exit 0
 EOSH
 chmod +x "$TMP/pathshim/launchctl"; : > "$TMP/real-launchctl.calls"
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c10 "$P"; export HMD_HEADROOM_SUPERVISOR_LABEL="$LABEL9"
   unset LAUNCHCTL                      # the plain `launchctl` on PATH — i.e. the REAL one on a real machine
   export PATH="$TMP/pathshim:$PATH"
@@ -412,9 +416,9 @@ chmod +x "$TMP/pathshim/launchctl"; : > "$TMP/real-launchctl.calls"
   hmd_headroom_chain "$TMP" 2>"$ERR"; rc=$?
   printf 'krc=%s\nrc=%s\n' "$krc" "$rc" > "$OUT"
 )
-grep -q '^krc=1$' "$OUT" && ok "10a hmd_headroom_kick refuses (rc 1) when HOME is not the real passwd home" || bad "10a kick did not refuse" "$(cat "$OUT")"
-[ ! -s "$TMP/real-launchctl.calls" ] && ok "10b the real launchctl was never invoked" || bad "10b the real launchctl was invoked from a synthetic HOME" "$(cat "$TMP/real-launchctl.calls")"
-grep -q '^rc=0$' "$OUT" && [ "$(lines "$TMP/start-c10.log")" = 1 ] && ok "10c the chain falls back to the direct spawn instead" || bad "10c no fallback" "$(cat "$OUT" "$ERR" 2>/dev/null)"
+if grep -q '^krc=1$' "$OUT"; then ok "10a hmd_headroom_kick refuses (rc 1) when HOME is not the real passwd home"; else bad "10a kick did not refuse" "$(cat "$OUT")"; fi
+if [ ! -s "$TMP/real-launchctl.calls" ]; then ok "10b the real launchctl was never invoked"; else bad "10b the real launchctl was invoked from a synthetic HOME" "$(cat "$TMP/real-launchctl.calls")"; fi
+if grep -q '^rc=0$' "$OUT" && [ "$(lines "$TMP/start-c10.log")" = 1 ]; then ok "10c the chain falls back to the direct spawn instead"; else bad "10c no fallback" "$(cat "$OUT" "$ERR" 2>/dev/null)"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -423,7 +427,7 @@ nextport; PD=$P; nextport; PL=$P
 serve "$PL" --lossless
 OUT="$TMP/out11"
 (
-  # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+  # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
   . "$CHAIN"; setup_env c11 "$PD"
   export ANTHROPIC_BASE_URL="http://127.0.0.1:$PD"
   hmd_headroom_drop_if_dead 2>"$TMP/err11a"; printf 'dead_url=%s\n' "${ANTHROPIC_BASE_URL:-unset}" > "$OUT"
@@ -432,10 +436,10 @@ OUT="$TMP/out11"
   setup_env c11c "$PD"; export ANTHROPIC_BASE_URL="https://example.invalid"
   hmd_headroom_drop_if_dead 2>"$TMP/err11c"; printf 'own_url=%s\n' "${ANTHROPIC_BASE_URL:-unset}" >> "$OUT"
 )
-grep -q '^dead_url=unset$' "$OUT" && [ "$(lines "$TMP/err11a")" = 1 ] && ok "11a dead proxy URL dropped, one stderr line" || bad "11a dead URL not dropped" "$(cat "$OUT" "$TMP/err11a")"
-grep -q "^live_url=http://127.0.0.1:$PL\$" "$OUT" && [ ! -s "$TMP/err11b" ] && ok "11b live proxy URL left alone, silent" || bad "11b live URL disturbed" "$(cat "$OUT" "$TMP/err11b")"
-grep -q '^own_url=https://example.invalid$' "$OUT" && [ ! -s "$TMP/err11c" ] && ok "11c operator URL left alone, silent" || bad "11c operator URL disturbed" "$(cat "$OUT" "$TMP/err11c")"
-[ "$(lines "$TMP/start-c11.log")" = 0 ] && ok "11d it never starts anything" || bad "11d the cheap check started a proxy"
+if grep -q '^dead_url=unset$' "$OUT" && [ "$(lines "$TMP/err11a")" = 1 ]; then ok "11a dead proxy URL dropped, one stderr line"; else bad "11a dead URL not dropped" "$(cat "$OUT" "$TMP/err11a")"; fi
+if grep -q "^live_url=http://127.0.0.1:$PL\$" "$OUT" && [ ! -s "$TMP/err11b" ]; then ok "11b live proxy URL left alone, silent"; else bad "11b live URL disturbed" "$(cat "$OUT" "$TMP/err11b")"; fi
+if grep -q '^own_url=https://example.invalid$' "$OUT" && [ ! -s "$TMP/err11c" ]; then ok "11c operator URL left alone, silent"; else bad "11c operator URL disturbed" "$(cat "$OUT" "$TMP/err11c")"; fi
+if [ "$(lines "$TMP/start-c11.log")" = 0 ]; then ok "11d it never starts anything"; else bad "11d the cheap check started a proxy"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -443,7 +447,7 @@ echo "12 — three launch classes, chain level: plain goes direct WITH a warning
 for cls in plain judge required; do
   nextport; OUT="$TMP/out12$cls"; ERR="$TMP/err12$cls"
   (
-    # shellcheck source=../bin/lib/hmd-headroom-chain.sh
+    # shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
     . "$CHAIN"; setup_env "c12$cls" "$P"; export FAKE_HEADROOM_MODE=die
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$P"
     case "$cls" in judge) export HMD_JUDGMENT=1 ;; required) export HMD_HEADROOM_REQUIRED=1 ;; esac
@@ -451,26 +455,28 @@ for cls in plain judge required; do
     printf 'rc=%s\nurl=%s\n' "$rc" "${ANTHROPIC_BASE_URL:-unset}" > "$OUT"
   )
 done
-grep -q '^rc=1$' "$TMP/out12plain" && grep -q '^url=unset$' "$TMP/out12plain" && grep -q "running direct" "$TMP/err12plain" \
-  && ok "12a plain session: rc 1, stale URL dropped, 'running direct' warning — the ONLY class allowed to go direct" \
-  || bad "12a plain session misbehaved" "$(cat "$TMP/out12plain" "$TMP/err12plain")"
+if grep -q '^rc=1$' "$TMP/out12plain" && grep -q '^url=unset$' "$TMP/out12plain" && grep -q "running direct" "$TMP/err12plain"; then
+  ok "12a plain session: rc 1, stale URL dropped, 'running direct' warning — the ONLY class allowed to go direct"
+else
+  bad "12a plain session misbehaved" "$(cat "$TMP/out12plain" "$TMP/err12plain")"
+fi
 for cls in judge required; do
   if grep -q '^rc=3$' "$TMP/out12$cls" && grep -q "REFUSING to run direct" "$TMP/err12$cls" && ! grep -q "running direct" "$TMP/err12$cls" && [ "$(lines "$TMP/err12$cls")" = 1 ]; then
     ok "12b $cls launch: rc 3 and ONE loud stderr line 'REFUSING to run direct' — never a silent direct connection"
   else
     bad "12b $cls launch did not fail loudly" "$(cat "$TMP/out12$cls" "$TMP/err12$cls")"
   fi
-  grep -q "^url=http://127.0.0.1:" "$TMP/out12$cls" && ok "12c $cls launch: the environment is left exactly as found (nothing silently rewritten)" || bad "12c $cls launch rewrote the environment" "$(cat "$TMP/out12$cls")"
+  if grep -q "^url=http://127.0.0.1:" "$TMP/out12$cls"; then ok "12c $cls launch: the environment is left exactly as found (nothing silently rewritten)"; else bad "12c $cls launch rewrote the environment" "$(cat "$TMP/out12$cls")"; fi
 done
 # The guard only bites when the proxy is WANTED and DOWN. Healthy -> routed; not wanted -> direct is fine.
 nextport; serve "$P" --lossless; OUT="$TMP/out12h"
-# shellcheck source=../bin/lib/hmd-headroom-chain.sh
+# shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
 ( . "$CHAIN"; setup_env c12h "$P"; export HMD_JUDGMENT=1; hmd_headroom_chain "$TMP" 2>/dev/null; echo "rc=$?" > "$OUT" )
-grep -q '^rc=0$' "$OUT" && ok "12d a judge launch with a HEALTHY proxy routes normally (the guard is not an over-block)" || bad "12d judge + healthy proxy misrouted" "$(cat "$OUT")"
+if grep -q '^rc=0$' "$OUT"; then ok "12d a judge launch with a HEALTHY proxy routes normally (the guard is not an over-block)"; else bad "12d judge + healthy proxy misrouted" "$(cat "$OUT")"; fi
 nextport; OUT="$TMP/out12o"
-# shellcheck source=../bin/lib/hmd-headroom-chain.sh
+# shellcheck source=../bin/lib/hmd-headroom-chain.sh disable=SC1091
 ( . "$CHAIN"; setup_env c12o "$P"; export HMD_JUDGMENT=1 HMD_HEADROOM_DISABLE=1; hmd_headroom_chain "$TMP" 2>"$TMP/err12o"; echo "rc=$?" > "$OUT" )
-grep -q '^rc=1$' "$OUT" && [ ! -s "$TMP/err12o" ] && ok "12e judge + operator opted OUT of headroom: rc 1, silent — no proxy was wanted, so nothing 'failed'" || bad "12e opted-out judge launch was blocked or noisy" "$(cat "$OUT" "$TMP/err12o")"
+if grep -q '^rc=1$' "$OUT" && [ ! -s "$TMP/err12o" ]; then ok "12e judge + operator opted OUT of headroom: rc 1, silent — no proxy was wanted, so nothing 'failed'"; else bad "12e opted-out judge launch was blocked or noisy" "$(cat "$OUT" "$TMP/err12o")"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 echo
@@ -502,36 +508,48 @@ run_route() { # run_route <tag> <port> [VAR=val ...]  ->  $RROUTE_RC, $TMP/r-<ta
 }
 
 nextport; run_route plain "$P" FAKE_HEADROOM_MODE=die
-{ [ "$RROUTE_RC" = 0 ] && grep -q '^RAN url=unset$' "$TMP/r-plain.log" && grep -q "headroom not routing" "$TMP/r-plain.err"; } \
-  && ok "13a plain session, proxy down: tool runs DIRECT (ABURL unset) with a warning on stderr" \
-  || bad "13a plain-session fallback broke" "rc=$RROUTE_RC log=$(cat "$TMP/r-plain.log") err=$(cat "$TMP/r-plain.err")"
+if [ "$RROUTE_RC" = 0 ] && grep -q '^RAN url=unset$' "$TMP/r-plain.log" && grep -q "headroom not routing" "$TMP/r-plain.err"; then
+  ok "13a plain session, proxy down: tool runs DIRECT (ABURL unset) with a warning on stderr"
+else
+  bad "13a plain-session fallback broke" "rc=$RROUTE_RC log=$(cat "$TMP/r-plain.log") err=$(cat "$TMP/r-plain.err")"
+fi
 
 nextport; run_route judge "$P" FAKE_HEADROOM_MODE=die HMD_JUDGMENT=1
-{ [ "$RROUTE_RC" = 3 ] && [ ! -s "$TMP/r-judge.log" ] && grep -q "REFUSING to run direct" "$TMP/r-judge.err"; } \
-  && ok "13b judge (HMD_JUDGMENT=1), proxy down: exit 3, loud stderr, the tool NEVER ran" \
-  || bad "13b judge launch did not fail loudly" "rc=$RROUTE_RC log=$(cat "$TMP/r-judge.log") err=$(cat "$TMP/r-judge.err")"
+if [ "$RROUTE_RC" = 3 ] && [ ! -s "$TMP/r-judge.log" ] && grep -q "REFUSING to run direct" "$TMP/r-judge.err"; then
+  ok "13b judge (HMD_JUDGMENT=1), proxy down: exit 3, loud stderr, the tool NEVER ran"
+else
+  bad "13b judge launch did not fail loudly" "rc=$RROUTE_RC log=$(cat "$TMP/r-judge.log") err=$(cat "$TMP/r-judge.err")"
+fi
 
 nextport; run_route req "$P" FAKE_HEADROOM_MODE=die HMD_HEADROOM_REQUIRED=1
-{ [ "$RROUTE_RC" = 3 ] && [ ! -s "$TMP/r-req.log" ]; } \
-  && ok "13c HMD_HEADROOM_REQUIRED=1, proxy down: exit 3, the tool NEVER ran" \
-  || bad "13c required launch did not fail" "rc=$RROUTE_RC log=$(cat "$TMP/r-req.log") err=$(cat "$TMP/r-req.err")"
+if [ "$RROUTE_RC" = 3 ] && [ ! -s "$TMP/r-req.log" ]; then
+  ok "13c HMD_HEADROOM_REQUIRED=1, proxy down: exit 3, the tool NEVER ran"
+else
+  bad "13c required launch did not fail" "rc=$RROUTE_RC log=$(cat "$TMP/r-req.log") err=$(cat "$TMP/r-req.err")"
+fi
 
 nextport; DEADGW=$P; nextport
 run_route gwdead "$P" STUB_FALLBACK_URL="http://127.0.0.1:$DEADGW"
-{ [ "$RROUTE_RC" = 3 ] && [ ! -s "$TMP/r-gwdead.log" ] && grep -q "REFUSING to launch" "$TMP/r-gwdead.err" && grep -q "never falls back to a direct connection" "$TMP/r-gwdead.err"; } \
-  && ok "13d OmniRoute fallback gateway DOWN: exit 3, 'REFUSING to launch', the tool NEVER ran (no direct fallback)" \
-  || bad "13d dead fallback gateway was launched into or fell back direct" "rc=$RROUTE_RC log=$(cat "$TMP/r-gwdead.log") err=$(cat "$TMP/r-gwdead.err")"
+if [ "$RROUTE_RC" = 3 ] && [ ! -s "$TMP/r-gwdead.log" ] && grep -q "REFUSING to launch" "$TMP/r-gwdead.err" && grep -q "never falls back to a direct connection" "$TMP/r-gwdead.err"; then
+  ok "13d OmniRoute fallback gateway DOWN: exit 3, 'REFUSING to launch', the tool NEVER ran (no direct fallback)"
+else
+  bad "13d dead fallback gateway was launched into or fell back direct" "rc=$RROUTE_RC log=$(cat "$TMP/r-gwdead.log") err=$(cat "$TMP/r-gwdead.err")"
+fi
 
 nextport; GW=$P; serve "$GW" --lossless; nextport
 run_route gwlive "$P" STUB_FALLBACK_URL="http://127.0.0.1:$GW"
-{ [ "$RROUTE_RC" = 0 ] && grep -q "^RAN url=http://127.0.0.1:$GW\$" "$TMP/r-gwlive.log"; } \
-  && ok "13e fallback gateway ANSWERING: the launch proceeds routed to it (the guard is not an over-block)" \
-  || bad "13e a live fallback gateway was refused" "rc=$RROUTE_RC log=$(cat "$TMP/r-gwlive.log") err=$(cat "$TMP/r-gwlive.err")"
+if [ "$RROUTE_RC" = 0 ] && grep -q "^RAN url=http://127.0.0.1:$GW\$" "$TMP/r-gwlive.log"; then
+  ok "13e fallback gateway ANSWERING: the launch proceeds routed to it (the guard is not an over-block)"
+else
+  bad "13e a live fallback gateway was refused" "rc=$RROUTE_RC log=$(cat "$TMP/r-gwlive.log") err=$(cat "$TMP/r-gwlive.err")"
+fi
 
 nextport; serve "$P" --lossless; run_route live "$P"
-{ [ "$RROUTE_RC" = 0 ] && grep -q "^RAN url=http://127.0.0.1:$P\$" "$TMP/r-live.log"; } \
-  && ok "13f plain session, healthy proxy: still routed through it" \
-  || bad "13f healthy-proxy routing regressed" "rc=$RROUTE_RC log=$(cat "$TMP/r-live.log") err=$(cat "$TMP/r-live.err")"
+if [ "$RROUTE_RC" = 0 ] && grep -q "^RAN url=http://127.0.0.1:$P\$" "$TMP/r-live.log"; then
+  ok "13f plain session, healthy proxy: still routed through it"
+else
+  bad "13f healthy-proxy routing regressed" "rc=$RROUTE_RC log=$(cat "$TMP/r-live.log") err=$(cat "$TMP/r-live.err")"
+fi
 
 echo
 echo "headroom-failsafe: $PASS passed, $FAIL failed"
