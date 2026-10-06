@@ -35,7 +35,6 @@ restore_path() {
 G='\033[38;2;78;204;163m'
 D='\033[38;2;100;100;120m'
 C='\033[38;2;0;212;255m'
-P='\033[38;2;224;86;160m'
 R='\033[0m'
 
 # cmd_activate [dir] [restore-file] — pause what the project does not need; the undo goes to

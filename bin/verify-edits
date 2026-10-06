@@ -61,7 +61,6 @@ MODE="${1:---full}"
 PASS=0
 FAIL=0
 WARN=0
-ISSUES=""
 
 # ── Gate 0: ledger presence (proof the tracker actually ran) ──
 # ABSENT ledger => the PostToolUse edit-tracker hook never fired. "Zero edits" is
@@ -135,7 +134,7 @@ fi
 clear_events=$("$TRACKER" clears 2>/dev/null || true)
 clears_lost=0
 if [ -n "$clear_events" ]; then
-  while IFS='|' read -r clear_ts clear_n; do
+  while IFS='|' read -r _ clear_n; do
     case "$clear_n" in
       ''|*[!0-9]*) ;;
       *) clears_lost=$((clears_lost + clear_n)) ;;

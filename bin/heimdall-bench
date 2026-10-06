@@ -46,9 +46,9 @@ case "${1:-}" in validate|run|summarize) exec "$HARNESS" "$@" ;; esac
 # ── Colors (truecolor with plain fallback, matching the other bins) ──
 if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" || "${TERM:-}" == *256color* ]]; then
   P='\033[38;2;224;86;160m'; C='\033[38;2;0;212;255m'; V='\033[38;2;155;89;182m'
-  G='\033[38;2;78;204;163m'; D='\033[38;2;100;100;120m'; W='\033[38;2;255;200;80m'
+  D='\033[38;2;100;100;120m'; W='\033[38;2;255;200;80m'
 else
-  P='\033[35m'; C='\033[36m'; V='\033[34m'; G='\033[32m'; D='\033[37m'; W='\033[33m'
+  P='\033[35m'; C='\033[36m'; V='\033[34m'; D='\033[37m'; W='\033[33m'
 fi
 B='\033[1m'; R='\033[0m'
 

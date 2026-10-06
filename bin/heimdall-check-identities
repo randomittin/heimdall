@@ -76,8 +76,8 @@ collect_pre_push_stdin() {
   # on a remote-tracking ref (falls back to the full reachable set if no remote
   # refs are known — over-checking is safe). Otherwise check <remote>..<local>.
   local zero="0000000000000000000000000000000000000000"
-  local lref lsha rref rsha revs
-  while read -r lref lsha rref rsha; do
+  local lsha rsha revs
+  while read -r _ lsha _ rsha; do
     [ -n "${lsha:-}" ] || continue
     if [ "$lsha" = "$zero" ]; then
       continue

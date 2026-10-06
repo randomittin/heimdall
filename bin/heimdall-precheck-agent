@@ -341,6 +341,7 @@ if [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
       # judgment posture may have changed.
       printf 'BIFROST - Heimdall fallback-routing disclosure: this spawn inherits ANTHROPIC_BASE_URL=%s, a loopback address consistent with the OmniRoute fallback gateway, not api.anthropic.com. That endpoint may serve a free/no-auth-tier provider whose data-retention posture is not guaranteed to match api.anthropic.com. Generation may run on this path; judgment may not (see bin/lib/hmd-gate-endpoint.sh).\n' "$ADJ_ENV_URL" >&2
 
+      # shellcheck source=lib/hmd-adjudication-set.sh disable=SC1091  # path is $BIN_DIR-derived at runtime; the default run never opens sourced files, source= is for -x
       if [ -f "$ADJ_SET_LIB" ] && . "$ADJ_SET_LIB" 2>/dev/null && command -v hmd_is_adjudication >/dev/null 2>&1; then
         ADJ_SATYPE="$(printf '%s' "$INPUT" | jq -r '.tool_input.subagent_type // empty' 2>/dev/null)" || ADJ_SATYPE=""
         if [ -n "$ADJ_SATYPE" ] && hmd_is_adjudication "$ADJ_SATYPE"; then
