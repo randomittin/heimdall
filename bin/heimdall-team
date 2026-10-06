@@ -120,7 +120,7 @@ LIB_DIR="$BIN_DIR/lib"
 # The SIGNED-PATH scrub — /team/auto carries an Ed25519 key-POSSESSION assertion, so a local
 # REWRITING proxy in this path invalidates the proof of possession. hmd_signed_exec drops
 # the rewriters and keeps a corporate CONNECT proxy (it tunnels TLS and cannot rewrite).
-# shellcheck source=lib/hmd-gate-endpoint.sh
+# shellcheck source=lib/hmd-gate-endpoint.sh disable=SC1091
 . "$LIB_DIR/hmd-gate-endpoint.sh"
 INVITE_CLI="$BIN_DIR/heimdall-invite"
 IDENTITY_CLI="$BIN_DIR/heimdall-identity"
@@ -130,7 +130,7 @@ HAID_CLI="$BIN_DIR/heimdall-haid"
 # source heimdall-presence sources). We reuse it so the AUTO (GitHub) path resolves the exact
 # CP URL presence does and honors the SAME sever/opt-out gate (severed => ZERO egress). Absent
 # lib => the helpers stay undefined and the AUTO path DEFERS to the bearer-secret fallback.
-# shellcheck source=lib/cp-consent.sh
+# shellcheck source=lib/cp-consent.sh disable=SC1091
 [ -f "$LIB_DIR/cp-consent.sh" ] && . "$LIB_DIR/cp-consent.sh"
 
 PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
@@ -394,7 +394,7 @@ ensure_team_gitignored() {
   {
     printf '\n# heimdall team secret — gitignored on a PUBLIC/unverified repo: a bearer\n'
     printf '# secret must never be committed to a world-readable repo. Grow the team\n'
-    printf '# out-of-band with `hmd invite`.\n'
+    printf "# out-of-band with \`hmd invite\`.\n"
     printf '.heimdall/team.json\n'
   } >> "$gi" 2>/dev/null || true
 }
@@ -1117,10 +1117,14 @@ case "$SUB" in
     usage; exit 0 ;;
 
   ""|dispatch)
-    cmd_dispatch "$@"; exit $? ;;
+    cmd_dispatch "$@"
+    # shellcheck disable=SC2317  # cmd_dispatch exits on every path today; the arm keeps its own exit so a future `return` still ends the script with that status
+    exit $? ;;
 
   show|status)
-    cmd_status "$@"; exit $? ;;
+    cmd_status "$@"
+    # shellcheck disable=SC2317  # cmd_status exits on every path today; the arm keeps its own exit so a future `return` still ends the script with that status
+    exit $? ;;
 
   auto)
     cmd_auto ;;

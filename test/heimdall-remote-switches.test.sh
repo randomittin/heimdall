@@ -825,7 +825,7 @@ OUT="$(hmd_app remote-launch on)"; RC=$?
 if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'interactive terminal' && [ ! -e "$HEIMDALL_HOME/remote-launch.json" ]; then
   ok "7a. hmd app remote-launch on without a terminal is refused through the arm and writes nothing"
 else
-  bad "7a. rc=$RC out=$OUT file=$(ls "$HEIMDALL_HOME" 2>&1 | tr '\n' ' ')"
+  bad "7a. rc=$RC out=$OUT file=$(find "$HEIMDALL_HOME" -mindepth 1 -maxdepth 1 -exec basename {} \; 2>&1 | sort | tr '\n' ' ')"
 fi
 OUT="$(hmd_app launch-allow "$ARMS_REPO")"; RC=$?
 if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'interactive terminal' && [ ! -e "$ALLOWLIST" ]; then

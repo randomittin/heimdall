@@ -58,7 +58,7 @@ fi
 PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 BIN_DIR="$PLUGIN_DIR/bin"
 
-# shellcheck source=lib/hmd-headroom-chain.sh
+# shellcheck source=lib/hmd-headroom-chain.sh disable=SC1091
 . "$BIN_DIR/lib/hmd-headroom-chain.sh"
 
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$SELF"; }
@@ -188,7 +188,10 @@ cmd_install() {
   PORT="$(hmd_headroom_port)"
 
   mkdir -p "$(dirname "$PLIST")" || die "cannot create $(dirname "$PLIST")"
-  mkdir -p "$LOGDIR" && chmod 0700 "$LOGDIR" || die "cannot create $LOGDIR"
+  # die when EITHER step fails: a log dir that exists but could not be locked to 0700 is not usable
+  if ! { mkdir -p "$LOGDIR" && chmod 0700 "$LOGDIR"; }; then
+    die "cannot create $LOGDIR"
+  fi
   STAGED="$PLIST.new.$$"
   trap 'rm -f "${STAGED:-}"' EXIT
   stage_plist "$bin" "$PORT" "$STAGED"
