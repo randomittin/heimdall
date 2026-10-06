@@ -100,7 +100,7 @@ def reset_devices():
         os.unlink(os.path.join(ROOT, PUSH.SPOOL_REL, name))
 
 
-T.eq(PUSH.registered_kinds(), {"tile_alert": "push-tile-alert-v1"}, "H2: the kind tile_alert registers with cap push-tile-alert-v1, through register_push_kinds")
+T.eq(PUSH.registered_kinds(), {"tile_alert": "push-tile-alert-v1", "digest": "push-digest-v1"}, "H2: the kinds tile_alert and digest register with caps push-tile-alert-v1 and push-digest-v1, through register_push_kinds")
 T.eq(ALERTS.CAP_ALERTS, "dash-alert-v1", "H1: the capability is dash-alert-v1")
 
 # -- the refusals, in the spec's vocabulary ----------------------------------------------------------------------
@@ -290,7 +290,7 @@ try:
 except Exception as exc:
     refused = getattr(exc, "code", None)
 T.eq(refused, "bad-events", "tile_alert without its registered kind (cap not advertised) is bad-events")
-T.eq(STORE.extension_kinds(), {"tile_alert": "push-tile-alert-v1"}, "bound to companion_push, the store advertises exactly the registered kinds")
+T.eq(STORE.extension_kinds(), {"tile_alert": "push-tile-alert-v1", "digest": "push-digest-v1"}, "bound to companion_push, the store advertises exactly the registered kinds")
 reset_devices()
 
 # -- audit: ids and fixed tokens, never a value -------------------------------------------------------------------
@@ -341,7 +341,7 @@ def register(name, **over):
     return True
 
 
-bad_kinds = [("a built-in name", "question", {}), ("a registered name", "tile_alert", {}), ("an upper-case name", "Probe", {}), ("a one-letter name", "p", {}),
+bad_kinds = [("a built-in name", "question", {}), ("a registered name", "tile_alert", {}), ("H4's registered name", "digest", {}), ("an upper-case name", "Probe", {}), ("a one-letter name", "p", {}),
              ("a hyphenated name", "pro-be", {}), ("an empty phrase", "probe", dict(phrase="")), ("a long phrase", "probe", dict(phrase="x" * 25)),
              ("a phrase with a slash", "probe", dict(phrase="a/b")), ("an unknown channel", "probe", dict(channel="hmd-other")),
              ("an unknown level", "probe", dict(level="critical")), ("a ttl under a minute", "probe", dict(ttl=59)),
@@ -351,9 +351,9 @@ bad_kinds = [("a built-in name", "question", {}), ("a registered name", "tile_al
              ("a suffix with a digit", "probe", dict(suffix="p1")), ("a scope that is not callable", "probe", dict(scope="x"))]
 accepted = [label for label, name, over in bad_kinds if register(name, **over)]
 T.check(not accepted, "register_kind refuses every out-of-range kind with ValueError (%d cases)" % len(bad_kinds), accepted)
-T.eq(P2.registered_kinds(), {"tile_alert": "push-tile-alert-v1"}, "a refused kind leaves nothing half registered")
+T.eq(P2.registered_kinds(), {"tile_alert": "push-tile-alert-v1", "digest": "push-digest-v1"}, "a refused kind leaves nothing half registered")
 T.eq((P2.KINDS, P2.all_kinds()), (("question", "approval", "error", "gate_red", "finished", "test"),
-                                   ("question", "approval", "error", "gate_red", "finished", "test", "tile_alert")),
+                                   ("question", "approval", "error", "gate_red", "finished", "test", "tile_alert", "digest")),
      "KINDS stays the closed six; all_kinds() adds the registered kinds")
 
 
@@ -378,14 +378,19 @@ P2._SECRET.update(tried=True, fn=None)
 T.eq(P2.secret_shaped("a plain sentence"), True, "secret_shaped fails closed when the check cannot be loaded")
 P2._SECRET.update(saved)
 
-T.check(register("digest", phrase="morning report", channel="hmd-updates", level="active", ttl=21600, cap="push-digest-v1", priority=0,
-                 body=lambda fields: "Fixed words.", suffix="digest", scope=lambda fields: "project:%s" % fields.get("project")),
-        "the registry takes H4's digest row of the H2 table")
-digest, other_digest = build("digest", {"project": "proj"}) or {}, build("digest", {"project": "elsewhere"}) or {}
+T.check(P2.registered_kinds().get("digest") == "push-digest-v1" and P2._EXT["digest"]["lines"] == 4 and P2._EXT["digest"]["body_max"] == 160,
+        "the registry holds H4's digest row of the H2 table (dashboard_digest.register_push_kinds: 4 lines, 160 units)")
+digest, other_digest = build("digest", {"project": "proj", "finished": 1}) or {}, build("digest", {"project": "elsewhere", "finished": 1}) or {}
 T.check((digest.get("title"), digest.get("channelId"), digest.get("interruptionLevel"), digest.get("ttl"), "categoryId" in digest)
         == ("proj · morning report", "hmd-updates", "active", 21600, False)
         and re.fullmatch(r"[0-9a-f]{16}\.digest", digest.get("collapseId", "")) and digest.get("collapseId") != other_digest.get("collapseId"),
         "... and builds it byte for byte (title, hmd-updates, no category, active, 21600 s, <project hash>.digest)", digest)
+T.check(not register("digest", phrase="morning report", channel="hmd-updates", level="active", ttl=21600, cap="push-digest2-v1", priority=0,
+                     body=lambda fields: "x", suffix="digest"), "a second `digest` is refused: the name is taken")
+bad_limits = [("body_max under the default", dict(body_max=119)), ("body_max over 200", dict(body_max=201)), ("a bool body_max", dict(body_max=True)),
+              ("lines 0", dict(lines=0)), ("lines 5", dict(lines=5)), ("a bool lines", dict(lines=True))]
+accepted_limits = [label for label, over in bad_limits if register("limits", cap="push-limits-v1", suffix="limits", **over)]
+T.check(not accepted_limits and "limits" not in P2.registered_kinds(), "register_kind refuses an out-of-range body_max or lines", accepted_limits)
 register("boom", cap="push-boom-v1", suffix="boom", body=lambda fields: 1 / 0)
 register("blank", cap="push-blank-v1", suffix="blank", body=lambda fields: "  \n ")
 register("wordy", cap="push-wordy-v1", suffix="wordy", body=lambda fields: "a\n\tb " + "w" * 300)
