@@ -1447,6 +1447,13 @@ class StateCache:
 class UIServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False   # a stale reuse could hand another process our port
+    # A2: the kernel accept queue must hold a burst as large as the connection cap this server
+    # advertises. Left alone, listen() gets socketserver's default of 5, and a burst past that (8
+    # streams opened at once, a page + its state/events fetches) lands faster than the accept loop
+    # can drain it -- one thread spawn per accept -- so the overflow is refused at the TCP layer
+    # (ECONNREFUSED, 1 ms) before any token check or SSE slot ever sees it. A refused client never
+    # holds a slot, so the cap read as "not full" while 8 clients were actually trying to hold it.
+    request_queue_size = MAX_CONNECTIONS
 
     def __init__(self, port, token, cache, allow_hosts=(), trust_proxy=False):
         super().__init__(("127.0.0.1", port), UIHandler)

@@ -30,7 +30,9 @@
 #   - A2: UIHandler.timeout=10s bounds the pre-auth header read (an idle connection
 #     that sends nothing is closed within it); MAX_CONNECTIONS=64 caps concurrent
 #     connections server-wide; MAX_SSE_STREAMS=8 caps concurrent /api/events streams
-#     specifically -> 503 + `Retry-After: 5` past that narrower cap
+#     specifically -> 503 + `Retry-After: 5` past that narrower cap; the listen backlog
+#     (UIServer.request_queue_size) is MAX_CONNECTIONS, so a burst that size is queued
+#     in the kernel and accepted, never refused at the TCP layer before auth/caps run
 #   - A9: when --allow-host is set, /api/state.repo and out-of-repo edits.paths
 #     entries become basenames, and every roster/ledger.team string is scrubbed of
 #     email-shaped substrings and absolute paths; loopback output is byte-for-byte
@@ -446,36 +448,88 @@ PORT_G="$PORT"; BASE_G="$BASE"; AUTH_G="$AUTH"
 # Hold MAX_SSE_STREAMS(8) concurrent /api/events connections open; a 9th, while all
 # 8 are still held, must be refused with 503 + Retry-After: 5 instead of queued or
 # left to hang -- a cap strictly narrower than the server-wide connection cap.
+#
+# "Held" is CONFIRMED, never assumed. Each held stream dumps its response headers to its
+# own file and the 9th is sent only once all 8 show a 200 status line: the server writes
+# that line strictly AFTER it has taken a semaphore slot (_serve_events), so a 200 here
+# means a slot is genuinely occupied. A fixed sleep cannot stand in for this -- the 8
+# curls are separate processes the OS must fork, exec and connect, which under machine
+# load takes arbitrarily long for any one of them; a 9th sent while fewer than 8 were up
+# was then CORRECTLY admitted (rc=200), failing this check for a reason that was never
+# the cap. (A held stream refused at the TCP layer instead is what 27a below pins.)
 SSE_PIDS=()
 sse_i=1
 while [ "$sse_i" -le 8 ]; do
-  curl -s -N --max-time 12 -o /dev/null "$BASE_G/api/events?$AUTH_G" 2>/dev/null &
+  curl -s -N --max-time 90 -D "$TMPROOT/sse-held-$sse_i.hdr" -o /dev/null "$BASE_G/api/events?$AUTH_G" 2>/dev/null &
   SSE_PIDS+=("$!")
   sse_i=$((sse_i + 1))
 done
 PIDS+=("${SSE_PIDS[@]}")
 
-# Give the 8 held streams time to actually clear _gate_then and acquire their
-# semaphore slot (each is a real handshake) before the 9th is sent, so the cap is
-# measured with all 8 slots genuinely occupied, not raced against connection setup.
-sleep 1
+sse_live=0
+sse_i=1
+while [ "$sse_i" -le 8 ]; do
+  wait_for "$TMPROOT/sse-held-$sse_i.hdr" '^HTTP/[0-9.]+ 200' 30 && sse_live=$((sse_live + 1))
+  sse_i=$((sse_i + 1))
+done
 
 HDR9="$TMPROOT/sse-9.hdr"; BODY9="$TMPROOT/sse-9.json"
-# --max-time 8: defensive bound only. If the settle sleep above ever loses the
-# race under heavy load, this request would be accepted as a real 200 SSE
-# stream (infinite by design) instead of the expected 503 -- without a timeout
-# that turns into an indefinite hang instead of a fast, diagnosable "bad".
-rc9="$(curl -s --max-time 8 -D "$HDR9" -o "$BODY9" -w '%{http_code}' "$BASE_G/api/events?$AUTH_G")"
-if [ "$rc9" = "503" ] && grep -qi '^retry-after: *5' "$HDR9" \
-   && jq -e '.error=="too-many-streams" and .retry_after_s==5' "$BODY9" >/dev/null 2>&1; then
-  ok "27. 9th concurrent /api/events past MAX_SSE_STREAMS(8) -> 503, Retry-After: 5, body {\"error\":\"too-many-streams\",\"retry_after_s\":5}"
+if [ "$sse_live" -ne 8 ]; then
+  bad "27. only $sse_live of 8 held /api/events streams came up (200) within 30s each -- the 9th cannot be measured against a full cap"
 else
-  bad "27. 9th concurrent /api/events: rc=$rc9 hdr=$(tr -d '\r' <"$HDR9" 2>/dev/null | grep -i retry-after) body=$(cat "$BODY9" 2>/dev/null)"
+  # --max-time 8: defensive bound only. A 9th that is wrongly accepted becomes a real
+  # 200 SSE stream (infinite by design) instead of the expected 503 -- without a
+  # timeout that turns into an indefinite hang instead of a fast, diagnosable "bad".
+  rc9="$(curl -s --max-time 8 -D "$HDR9" -o "$BODY9" -w '%{http_code}' "$BASE_G/api/events?$AUTH_G")"
+  if [ "$rc9" = "503" ] && grep -qi '^retry-after: *5' "$HDR9" \
+     && jq -e '.error=="too-many-streams" and .retry_after_s==5' "$BODY9" >/dev/null 2>&1; then
+    ok "27. 9th concurrent /api/events past MAX_SSE_STREAMS(8) -> 503, Retry-After: 5, body {\"error\":\"too-many-streams\",\"retry_after_s\":5}"
+  else
+    bad "27. 9th concurrent /api/events: rc=$rc9 hdr=$(tr -d '\r' <"$HDR9" 2>/dev/null | grep -i retry-after) body=$(cat "$BODY9" 2>/dev/null)"
+  fi
 fi
 
 # Kill SSE streams promptly instead of waiting for timeout
 for p in "${SSE_PIDS[@]}"; do kill "$p" 2>/dev/null; done
 for p in "${SSE_PIDS[@]}"; do wait "$p" 2>/dev/null; done
+
+# A2: the listen backlog must hold a burst as large as MAX_CONNECTIONS. Deterministic, no
+# timing: build the real UIServer (bind + listen) but never serve_forever(), so nothing
+# ever accept()s, then connect MAX_CONNECTIONS clients back to back -- every connect has to
+# complete in the kernel queue. socketserver's default backlog of 5 refuses the 7th or so
+# (ECONNREFUSED on macOS, a dropped SYN on Linux): exactly how 8 simultaneous streams lost
+# members before any slot was taken. Stops at the first failure so the RED case is quick.
+BURST="$(python3 - "$REPO/sentinels/hmd-ui.py" 2>&1 <<'PYEOF'
+import importlib.util, socket, sys
+spec = importlib.util.spec_from_file_location("hmd_ui_under_test", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+sys.modules["hmd_ui_under_test"] = mod
+spec.loader.exec_module(mod)
+srv = mod.UIServer(0, "burst-probe-token", None)
+n, up, socks = mod.MAX_CONNECTIONS, 0, []
+try:
+    for _ in range(n):
+        s = socket.socket()
+        s.settimeout(2)
+        socks.append(s)
+        try:
+            s.connect(("127.0.0.1", srv.port))
+        except OSError:
+            break
+        up += 1
+finally:
+    for s in socks:
+        s.close()
+    srv.server_close()
+print("%d %d" % (up, n))
+PYEOF
+)"
+BURST_UP="${BURST%% *}"; BURST_N="${BURST##* }"
+if [ "$BURST_UP" = "$BURST_N" ] && [ "$BURST_N" -gt 0 ] 2>/dev/null; then
+  ok "27a. listen backlog queues a burst of MAX_CONNECTIONS($BURST_N) connects before any accept() -- none refused at the TCP layer"
+else
+  bad "27a. burst of MAX_CONNECTIONS connects before accept(): ${BURST_UP:-?} of ${BURST_N:-?} queued, the rest refused by the kernel (UIServer.request_queue_size too small); probe said: $(printf '%s' "$BURST" | tail -3)"
+fi
 
 # A2: a pre-auth connection that sends nothing at all must not park a thread
 # forever -- UIHandler.timeout (10s) bounds the header read, so the socket is closed
