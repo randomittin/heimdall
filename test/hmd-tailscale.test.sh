@@ -8,6 +8,7 @@
 # documented test seam. Every case that needs a custom PATH/env/stdin runs inside a
 # `( ... )` subshell so it can never leak into the next case.
 
+# shellcheck disable=SC2030,SC2031  # subshell-per-case isolation is the design (see above): the parent never reads these names back, so a subshell-local change being "lost" is the point (same convention as test/headroom-failsafe.test.sh)
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

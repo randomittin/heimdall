@@ -543,6 +543,7 @@ else
   # The scan root is `--source .` (run from inside the materialised copy — see proof
   # G); the mutant swaps that one token for the raw repo top, so only WHAT is walked
   # changes, never how the rest of the gate behaves.
+  # shellcheck disable=SC2016  # $HEIMDALL_TOP is source text for the mutant gate (expanded when that script runs), not for this shell
   sed 's|gitleaks detect --source \. |gitleaks detect --source "$HEIMDALL_TOP" |g' "$WORK/selfscan.scoped" > "$SMUT"
   chmod +x "$SMUT"
   unscoped_rc=0
@@ -720,6 +721,7 @@ else
 
   # (v) FALSIFIABLE — restore the pre-fix absolute-path scan; the SAME entry must stop working.
   cp "$MINI/bin/heimdall-selfscan" "$WORK/selfscan.fp-fixed"
+  # shellcheck disable=SC2016  # $TREE_TMP is source text for the mutant gate (expanded when that script runs), not for this shell
   sed 's|cd "$TREE_TMP" && gitleaks detect --source \. |gitleaks detect --source "$TREE_TMP" |g' \
     "$WORK/selfscan.fp-fixed" > "$MINI/bin/heimdall-selfscan"
   chmod +x "$MINI/bin/heimdall-selfscan"
