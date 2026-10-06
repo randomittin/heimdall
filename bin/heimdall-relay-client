@@ -386,6 +386,7 @@ and the connect threads all emit, and an exception out of emit() ended them.
 import argparse
 import base64
 import collections
+import contextlib
 import functools
 import hashlib
 import http.client
@@ -400,6 +401,7 @@ import signal
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -725,20 +727,25 @@ def emit(obj):
 
 
 def _atomic_write_json(path, obj):
+    """`obj` as one whole JSON document at `path`, or `path` untouched and the error raised. Every call stages in a
+    temp file of its own -- mkstemp: a unique name, O_EXCL, 0600, in the same directory so the rename stays on one
+    filesystem. write_status() runs on the state loop, the stream thread and the connect threads at once, and one
+    temp name per process let a writer's rename pull the file out from under another (ENOENT) or publish a file
+    two writers had both written into."""
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
     os.chmod(d, 0o700)
-    tmp = path + ".tmp-%d" % os.getpid()
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(obj, sort_keys=True, separators=(",", ":")))
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)
+        os.chmod(tmp, 0o600)  # mkstemp's 0600 minus whatever the umask takes away: the status file is exactly 0600
         os.replace(tmp, path)
-    except Exception:
-        os.unlink(tmp)
+    except BaseException:
+        with contextlib.suppress(OSError):  # the temp is already gone: the caller needs the original error
+            os.unlink(tmp)
         raise
 
 
@@ -1223,17 +1230,24 @@ class RelayClient:
         }
 
     _status_failing = False  # the last status write failed: one `error` event per outage, not one per state frame
+    # write_status's lock. Class-level like the flag above, so a client built without __init__ (test/heimdall-app-relay.test.sh
+    # scenario J) still has one; a process runs one client, so it is the lock of that process's one status file. A leaf lock:
+    # nothing but the status write and its one error event runs under it.
+    _status_lock = threading.Lock()
 
     def write_status(self):
-        try:
-            _atomic_write_json(self.status_path, self._status_snapshot())
-        except OSError as e:
-            # bookkeeping only -- surfaced (once per outage), never fatal to the caller; the next call retries
-            if not self._status_failing:
-                self._status_failing = True
-                emit({"event": "error", "detail": "status write failed: %s" % e})
-        else:
-            self._status_failing = False
+        # Snapshot and write under one lock: concurrent callers write in snapshot order, so the file only ever moves
+        # forward (an older snapshot never lands after a newer one), and the once-per-outage flag is not itself racy.
+        with self._status_lock:
+            try:
+                _atomic_write_json(self.status_path, self._status_snapshot())
+            except OSError as e:
+                # bookkeeping only -- surfaced (once per outage), never fatal to the caller; the next call retries
+                if not self._status_failing:
+                    self._status_failing = True
+                    emit({"event": "error", "detail": "status write failed: %s" % e})
+            else:
+                self._status_failing = False
 
     # -- HTTP: one-shot requests --------------------------------------------
     def _request(self, method, path, headers=None, body=None, timeout=CONNECT_TIMEOUT_S, label="request"):
