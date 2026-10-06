@@ -280,6 +280,7 @@ if [ ! -r "$TAILSCALE_LIB" ]; then
   exit 2
 fi
 # shellcheck source=lib/hmd_tailscale.sh
+# shellcheck disable=SC1091  # sourced lib is not a shellcheck input without -x
 . "$TAILSCALE_LIB"
 
 UI_BIN="${HEIMDALL_UI_BIN:-$BIN_DIR/heimdall-ui}"
@@ -295,6 +296,7 @@ SESSION_CODE_RE='^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}$'
 PY3=""
 if [ -r "$LIB_DIR/hmd-python.sh" ]; then
   # shellcheck source=lib/hmd-python.sh
+  # shellcheck disable=SC1091  # sourced lib is not a shellcheck input without -x
   . "$LIB_DIR/hmd-python.sh"
   PY3="$(hmd_python 2>/dev/null || true)"
 fi
@@ -327,6 +329,7 @@ CLIENT_ERR=""
 # ends are open, so the pipe is anonymous from then on; this shell keeps the only write end open as fd 3.
 CTL_DIR=""
 
+# shellcheck disable=SC2329  # runs via the EXIT/INT/TERM traps cmd_connect installs; shellcheck does not follow them
 cleanup() {
   [ "$CLEANED_UP" = true ] && return 0
   CLEANED_UP=true
