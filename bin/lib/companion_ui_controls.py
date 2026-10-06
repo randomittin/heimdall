@@ -99,6 +99,7 @@ it) so every caller can load this one file by path.
 import argparse
 import calendar
 import collections
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -109,6 +110,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -166,7 +168,7 @@ STOP_ID_RE = re.compile(r"s-[0-9a-f]{8}")
 REPO_ID_RE = re.compile(r"r-[0-9a-f]{4}")         # an allowlist id (companion_remote_switches.repo_id)
 TILE_ID_RE = re.compile(r"t-[0-9a-f]{8}")         # a dashboard tile id (bin/lib/companion_dashboards.py)
 AUDIT_OPS = frozenset(("create", "refine", "set-refresh", "refresh", "remove", "set-digest", "confirm", "decline", "expire", "run-failed",
-                       "idle-pause"))             # the dashboards ops an audit line may name, requests and what the laptop did
+                       "idle-pause", "alert-set", "alert-clear", "alert-fired", "alert-refused"))             # the dashboards ops an audit line may name, requests and what the laptop did
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,39}")      # a registered action name: kebab-case
 DETAIL_RE = re.compile(r"[a-z0-9-]{1,40}")
 DEVICE_RE = re.compile(r"[0-9a-f]{8}|direct|unknown")
@@ -471,13 +473,18 @@ def _pending_stop(root, now):
 def _write_stop(root, record):
     _ensure_dir(os.path.join(root, ".heimdall", "ui"))
     path = _stop_path(root)
-    tmp = "%s.tmp.%d" % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # A temp file of its own per call (mkstemp: unique, O_EXCL, 0600): two stop requests handled on two threads of one
+    # process (a double click, the laptop and a phone) must not share one temp name, or one rename pulls the file out
+    # from under the other.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=os.path.basename(path) + ".tmp.")
     try:
-        os.write(fd, json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
+        with os.fdopen(fd, "wb") as f:
+            f.write(json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def consume_stop_request(root, now=None):
@@ -633,10 +640,10 @@ def _charge(root, action):
 # -- handlers: (root, fields, ctx) -> (ok, detail, extra) --------------------------------------------------------
 class _Ctx:
     def __init__(self, device_id, deadline, repo=None, caps=None):
+        self.caps = caps   # the capability set the phone listed (None = unknown): a handler that needs a second cap checks it
         self.device_id = device_id
         self.deadline = deadline
         self.repo = repo   # an expand handler's allowlist entry {id, label, path, merge}: hmd's own path, never the phone's
-        self.caps = caps   # the capability set the phone listed (None = unknown): an op that needs a capability of its own checks it
 
 
 def _attention(root):

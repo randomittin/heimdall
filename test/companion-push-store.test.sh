@@ -797,7 +797,8 @@ class Rig:
 # ═══ 27. caps ═══════════════════════════════════════════════════════════════
 py_case 27 "every state frame lists push-v1 in its caps -- and stops listing it with HMD_PUSH=0 or without the store" rig <<'PYEOF'
 rig = Rig()
-SENDER_CAPS = ["push-v1", "push-digest-v1"]  # the sender's own tokens: the morning report's rides the same kill switch
+SENDER_CAPS = ["push-v1"] + sorted(rig.mod.PUSH_STORE.extension_kinds().values())  # the sender's own tokens: push-v1 and one per registered push kind, all on the one kill switch
+assert "push-tile-alert-v1" in SENDER_CAPS and "push-digest-v1" in SENDER_CAPS, SENDER_CAPS
 base = [c for c in rig.E2E.hmd_caps(rig.client._feature_caps()) if c not in SENDER_CAPS]  # every other token the client lists (resync, z-zlib, login-v1)
 assert base and "resync" in base
 assert rig.caps() == sorted(base + SENDER_CAPS), rig.caps()

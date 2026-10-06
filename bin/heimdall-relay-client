@@ -386,6 +386,7 @@ and the connect threads all emit, and an exception out of emit() ended them.
 import argparse
 import base64
 import collections
+import contextlib
 import functools
 import hashlib
 import http.client
@@ -400,6 +401,7 @@ import signal
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -434,7 +436,9 @@ LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_l
 CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
 VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
 DASH = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_dashboards.py"))
-DIGEST = _load_module("dashboard_digest", os.path.join(LIB_DIR, "dashboard_digest.py"))   # the morning report's cap (push-digest-v1)
+DASH_ALERTS = _load_module("dashboard_alerts", os.path.join(LIB_DIR, "dashboard_alerts.py"))
+if PUSH_STORE is not None and getattr(UI, "PUSH", None) is not None:
+    PUSH_STORE.bind_extension_kinds(UI.PUSH.registered_kinds)   # the store accepts, and hmd advertises, exactly the kinds hmd can send
 WS =_load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
@@ -726,20 +730,25 @@ def emit(obj):
 
 
 def _atomic_write_json(path, obj):
+    """`obj` as one whole JSON document at `path`, or `path` untouched and the error raised. Every call stages in a
+    temp file of its own -- mkstemp: a unique name, O_EXCL, 0600, in the same directory so the rename stays on one
+    filesystem. write_status() runs on the state loop, the stream thread and the connect threads at once, and one
+    temp name per process let a writer's rename pull the file out from under another (ENOENT) or publish a file
+    two writers had both written into."""
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
     os.chmod(d, 0o700)
-    tmp = path + ".tmp-%d" % os.getpid()
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(obj, sort_keys=True, separators=(",", ":")))
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)
+        os.chmod(tmp, 0o600)  # mkstemp's 0600 minus whatever the umask takes away: the status file is exactly 0600
         os.replace(tmp, path)
-    except Exception:
-        os.unlink(tmp)
+    except BaseException:
+        with contextlib.suppress(OSError):  # the temp is already gone: the caller needs the original error
+            os.unlink(tmp)
         raise
 
 
@@ -1224,17 +1233,24 @@ class RelayClient:
         }
 
     _status_failing = False  # the last status write failed: one `error` event per outage, not one per state frame
+    # write_status's lock. Class-level like the flag above, so a client built without __init__ (test/heimdall-app-relay.test.sh
+    # scenario J) still has one; a process runs one client, so it is the lock of that process's one status file. A leaf lock:
+    # nothing but the status write and its one error event runs under it.
+    _status_lock = threading.Lock()
 
     def write_status(self):
-        try:
-            _atomic_write_json(self.status_path, self._status_snapshot())
-        except OSError as e:
-            # bookkeeping only -- surfaced (once per outage), never fatal to the caller; the next call retries
-            if not self._status_failing:
-                self._status_failing = True
-                emit({"event": "error", "detail": "status write failed: %s" % e})
-        else:
-            self._status_failing = False
+        # Snapshot and write under one lock: concurrent callers write in snapshot order, so the file only ever moves
+        # forward (an older snapshot never lands after a newer one), and the once-per-outage flag is not itself racy.
+        with self._status_lock:
+            try:
+                _atomic_write_json(self.status_path, self._status_snapshot())
+            except OSError as e:
+                # bookkeeping only -- surfaced (once per outage), never fatal to the caller; the next call retries
+                if not self._status_failing:
+                    self._status_failing = True
+                    emit({"event": "error", "detail": "status write failed: %s" % e})
+            else:
+                self._status_failing = False
 
     # -- HTTP: one-shot requests --------------------------------------------
     def _request(self, method, path, headers=None, body=None, timeout=CONNECT_TIMEOUT_S, label="request"):
@@ -1956,7 +1972,8 @@ class RelayClient:
                 + ([E2E.CAP_CONTROLS] if CONTROLS is not None else [])
                 + ([VIEW.CAP_VIEW] if VIEW is not None else [])
                 + ([DASH.CAP_DASH] if DASH is not None else [])
-                + ([DIGEST.CAP_DIGEST] if DIGEST is not None and DASH is not None and PUSH_STORE is not None and DIGEST.available() else []))
+                + ([DASH_ALERTS.CAP_ALERTS] if DASH is not None and DASH_ALERTS is not None else [])   # requires dash-v1
+                + (list(PUSH_STORE.extension_kinds().values()) if self._push_ready() else []))          # push-tile-alert-v1, push-digest-v1, ...
 
     def _control(self, action, params, seq):
         """The phone's sealed control commands (REMOTE CONTROLS above): bin/lib/companion_ui_controls.py owns every

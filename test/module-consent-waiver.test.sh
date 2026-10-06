@@ -26,7 +26,23 @@
 # indistinguishable from a bug, so an unexplained one is REFUSED at validate (W7)
 # and a granted one is rendered in status and in the --json receipt (W5, W6).
 #
+# THIS SUITE OWNS ITS CONTROL PLANE. W9 runs the REAL headroom manifest through
+# `add`, and its traffic-proxy `no-signed-traffic-routing` invariant curls
+# $HEIMDALL_DEFAULT_CP_URL/readyz and FAILS CLOSED on anything but 200. Left at its
+# baked-in default that is the LIVE production control plane, so W9 was a statement
+# about the internet: when it did not answer — or the ambient env pinned the default
+# at a dead port, which test/lib/net-default-guard.sh does on purpose for the
+# presence corpus — seven assertions went RED (the real add failed, no
+# invariants.json, no traffic-proxy or storage-codec invariant ran, the receipt hid
+# the waiver), none of which says anything about consent. The suite now serves
+# /readyz itself from a loopback stand-in (test/lib/hermetic-cp.sh, shared with
+# headroom-module and omniroute-module). Consent, the manifest and the engine are
+# untouched, and W10b proves the real waived add still FAILS CLOSED when that
+# control plane is unreachable, so supplying a reachable one is not a weakening.
+#
 # Guarantees proved:
+#   CP  the control plane W9's real add probes is a loopback stand-in this file
+#       owns, and it is a real probe target (200 on /readyz, 404 everywhere else).
 #   W1  Headroom's manifest declares the waiver explicitly, with a reason, and
 #       still ships the disclosure text.
 #   W2  the traffic-proxy CLASS contract is untouched — still consent_required,
@@ -46,6 +62,10 @@
 #   W9  the REAL `hmd modules add headroom` runs past consent unprompted, and
 #       both class contracts' invariants actually execute.
 #   W10 `remove headroom` still leaves the tree BYTE-IDENTICAL to pre-add.
+#   W10b a waiver waives CONSENT ONLY, on the REAL manifest: with the control plane
+#       its no-signed-traffic-routing invariant probes unreachable, the same waived
+#       add gets past consent, is REFUSED at step 7 and rolls back byte-identically.
+#       The falsifier for the stand-in control plane W9 runs against.
 #   W11 FALSIFIER FOR W3 — strip the waiver from the same manifest and the very
 #       same add GATES again. The RED/GREEN pair is what makes W3 mean something
 #       rather than passing against a tool that never gated anybody.
@@ -85,6 +105,13 @@ STATE="$TMP/state/modules"
 # judged. The library documents the override ("overridable so a test can pin both
 # sides of the boundary"); the floor is proven in module-preflight-wiring.
 export HMD_PREFLIGHT_DISK_FLOOR_MB=1
+
+# THE SAME RULE, APPLIED TO THE NETWORK — see "THIS SUITE OWNS ITS CONTROL PLANE"
+# in the header. Started before any add runs, and verified (CP section) before any
+# add result is read as a statement about consent.
+. "$SELF_DIR/lib/hermetic-cp.sh"
+hermetic_cp_start "$TMP" || exit 2
+hermetic_cp_selfcheck
 
 hmd()      { "$MODS" --registry "$REG"      --state "$STATE" "$@"; }
 hmd_real() { "$MODS" --registry "$REAL_REG" --state "$STATE" "$@"; }
@@ -378,6 +405,32 @@ echo "W10 — remove headroom is still byte-identical reversibility"
   || bad "removal left residue"
 REG_SUM_NOW="$(tree_sum "$REAL_REG")"
 [ -n "$REG_SUM_NOW" ] && ok "the registry is readable after the round trip" || bad "registry unreadable"
+
+echo
+echo "W10b — a waiver waives CONSENT ONLY, on the REAL manifest: an unreachable control plane still REFUSES"
+# W8 proves it with a synthetic broken invariant. This is the same property against the
+# REAL headroom manifest and the REAL no-signed-traffic-routing invariant, and it is what
+# keeps W9's green — taken against the stand-in control plane this file supplies — from
+# reading as a weakening: ONE difference from W9, the control plane that invariant probes
+# is a loopback port nothing listens on. The waived add still gets past consent (step 4)
+# and must then be REFUSED at step 7 and rolled back byte-identically. An unreachable
+# check fails closed; it never passes.
+DSTATE="$TMP/downstate/modules"
+DPRE="$(tree_sum "$DSTATE")"
+OUT10B="$(env HEIMDALL_DEFAULT_CP_URL="$(hermetic_cp_dead_url)" \
+            "$MODS" --registry "$REAL_REG" --state "$DSTATE" add headroom < /dev/null 2>&1)"; RC10B=$?
+[ "$RC10B" -ne 0 ] \
+  && ok "the REAL waived add is REFUSED when the control plane is unreachable (exit $RC10B)" \
+  || bad "the real waived add succeeded with an unreachable control plane — an unverifiable invariant PASSED"
+grep -q '\[4/7\] consent' <<<"$OUT10B" && ! grep -qi 'Install it? \[y/N\]' <<<"$OUT10B" \
+  && ok "it got past consent unprompted — the waiver did its job and nothing more" \
+  || bad "the refusal did not come after a waived, unprompted consent step"
+grep -q 'FAILED INVARIANT: no-signed-traffic-routing' <<<"$OUT10B" \
+  && ok "the refusal names the invariant that could not be verified — the waiver did not skip it" \
+  || bad "the refusal did not name no-signed-traffic-routing: $(printf '%s\n' "$OUT10B" | tail -8)"
+[ "$(tree_sum "$DSTATE")" = "$DPRE" ] \
+  && ok "the refused waived add rolled back byte-identically" \
+  || bad "the refused waived add left residue"
 
 echo
 echo "W11 — FALSIFIER: strip the waiver and the SAME add gates again"
