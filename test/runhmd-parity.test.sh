@@ -155,6 +155,7 @@ ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 [ -r "$FIXTURES" ] || { echo "FATAL: shared fixtures missing: $FIXTURES" >&2; exit 2; }
+# shellcheck source=lib/runhmd-fixtures.sh disable=SC1091  # plain shellcheck (no -x) never opens sourced files
 . "$FIXTURES"
 for t in node jq shasum awk sed; do
   command -v "$t" >/dev/null 2>&1 || { echo "FATAL: $t is required" >&2; exit 2; }
