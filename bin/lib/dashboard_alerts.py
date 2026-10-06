@@ -37,7 +37,7 @@ STORE. <repo>/.heimdall/ui/dashboards/alerts.json (0600, beside the tiles; `aler
 nested INSIDE the dashboards lock when both are held -- always in that order). Definitions and arm state only: no panel, no frame data.
 
 Stdlib only. Every function takes `kit` first: the helper namespace companion_dashboards builds (store_dir, read_json, write_json, mkdir,
-touch, find, read_tile, project_names, enabled, audit, take, last_request_at) -- so this module never loads a second copy of the store.
+touch, find, read_tile, enabled, audit, take, last_request_at) -- so this module never loads a second copy of the store.
 """
 import contextlib
 import fcntl
@@ -59,7 +59,6 @@ REARM_GAP_S, DAILY_MAX, IDLE_FLOOR_S, PAUSE_IDLE_S = 3600.0, 6, 300.0, 30 * 8640
 OP_RATE = (6, 6 / 60.0)
 BODY_FIXED = "A tile you watch crossed its limit. Open to see it."
 VALUE_BODY_MAX = 40
-ALERT_DETAILS = ("alerts-off", "push-off", "not-a-number-tile", "too-many-alerts", "unknown-tile", "wrong-project", "rate-limited")
 
 OPS = {"set-alert": (("dashboard_id", "tile_id", "project", "cmp", "value", "hold_s", "with_value"), ()),
        "clear-alert": (("dashboard_id", "tile_id", "project"), ())}
@@ -219,15 +218,14 @@ def _refuse(kit, root, tile_id, detail, **extra):
 
 
 def handle(kit, root, f, ctx, now=None):
-    """(ok, detail, extra) of set-alert / clear-alert (the caller already did the dashboards switch, the kill switch, the exact params
-    and the rid replay): caps, project, switch, rate, tile, push, tile type, the 10-alert cap, then the store."""
+    """(ok, detail, extra) of set-alert / clear-alert (the caller, companion_dashboards.handle, already did the dashboards switch, the
+    kill switch, the exact params, the rid replay and the project check): caps, switch, rate, tile, push, tile type, the 10-alert cap,
+    then the store."""
     now = time.time() if now is None else now
     tile_id = f["tile_id"]
     caps = getattr(ctx, "caps", None)
     if caps is None or CAP_ALERTS not in caps:
         return False, "caps-missing", {}
-    if f["project"] not in kit.project_names(root):
-        return _refuse(kit, root, tile_id, "wrong-project")
     if f["op"] == "set-alert" and not enabled(kit, root):
         return _refuse(kit, root, tile_id, "alerts-off")
     wait = kit.take(root, "alert", *OP_RATE)

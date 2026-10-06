@@ -327,5 +327,137 @@ src = open(os.path.join(LIB, "dashboard_alerts.py")).read()
 T.check("urlopen" not in src and "subprocess" not in src and "socket" not in src, "dashboard_alerts.py has no network, socket or subprocess: it only hands the sender an event")
 mode = stat.S_IMODE(os.stat(os.path.join(DASH.store_dir(ROOT), "alerts.json")).st_mode)
 T.eq(mode, 0o600, "alerts.json is 0600")
+
+# -- the registry itself: validation, the closed KINDS, the kit a kind module gets, H4's digest row ----------------------
+P2 = T.load("companion_push_registry", os.path.join(LIB, "companion_push.py"))
+good = dict(phrase="probe", channel="hmd-updates", level="active", ttl=600, cap="push-probe-v1", priority=1, body=lambda fields: "fixed words", suffix="probe")
+
+
+def register(name, **over):
+    try:
+        P2.register_kind(name, **dict(good, **over))
+    except ValueError:
+        return False
+    return True
+
+
+bad_kinds = [("a built-in name", "question", {}), ("a registered name", "tile_alert", {}), ("an upper-case name", "Probe", {}), ("a one-letter name", "p", {}),
+             ("a hyphenated name", "pro-be", {}), ("an empty phrase", "probe", dict(phrase="")), ("a long phrase", "probe", dict(phrase="x" * 25)),
+             ("a phrase with a slash", "probe", dict(phrase="a/b")), ("an unknown channel", "probe", dict(channel="hmd-other")),
+             ("an unknown level", "probe", dict(level="critical")), ("a ttl under a minute", "probe", dict(ttl=59)),
+             ("a ttl over a day", "probe", dict(ttl=86401)), ("a bool ttl", "probe", dict(ttl=True)), ("a priority over 9", "probe", dict(priority=10)),
+             ("a negative priority", "probe", dict(priority=-1)), ("an upper-case cap", "probe", dict(cap="Push-Probe")),
+             ("a cap over 32 characters", "probe", dict(cap="p" * 33)), ("a body that is not callable", "probe", dict(body="text")),
+             ("a suffix with a digit", "probe", dict(suffix="p1")), ("a scope that is not callable", "probe", dict(scope="x"))]
+accepted = [label for label, name, over in bad_kinds if register(name, **over)]
+T.check(not accepted, "register_kind refuses every out-of-range kind with ValueError (%d cases)" % len(bad_kinds), accepted)
+T.eq(P2.registered_kinds(), {"tile_alert": "push-tile-alert-v1"}, "a refused kind leaves nothing half registered")
+T.eq((P2.KINDS, P2.all_kinds()), (("question", "approval", "error", "gate_red", "finished", "test"),
+                                   ("question", "approval", "error", "gate_red", "finished", "test", "tile_alert")),
+     "KINDS stays the closed six; all_kinds() adds the registered kinds")
+
+
+def build(kind, fields=None, label="proj"):
+    return P2.build_message(T.expo_token("z"), {"kind": kind, "key": kind + ":1", "ep": None, "fields": fields or {}}, label, "1" * 16, T0)
+
+
+kind_dir = os.path.join(TMP, "kind-modules")
+os.makedirs(kind_dir)
+with open(os.path.join(kind_dir, "probe_kinds.py"), "w") as f:
+    f.write('def register_push_kinds(kit):\n'
+            '    kit.register_kind("kitprobe", phrase="kit probe", channel="hmd-updates", level="passive", ttl=600, cap="push-kitprobe-v1",\n'
+            '                      priority=0, suffix="kitprobe", body=lambda fields: "%s %s %s %s" % (\n'
+            '                          kit.utf16_len("a\\U0001F600"), kit.secret_shaped("plain words"), kit.clip("abcdef", 4), kit.BODY_MAX))\n')
+here, modules = P2.HERE, P2.KIND_MODULES
+P2.HERE, P2.KIND_MODULES = kind_dir, ("probe_kinds",)
+P2._load_kind_modules()
+P2.HERE, P2.KIND_MODULES = here, modules
+T.eq((build("kitprobe") or {}).get("body"), "3 False abc… 120", "a kind module's kit hands its body utf16_len, secret_shaped, clip and BODY_MAX (priority 0 is accepted)")
+saved = dict(P2._SECRET)
+P2._SECRET.update(tried=True, fn=None)
+T.eq(P2.secret_shaped("a plain sentence"), True, "secret_shaped fails closed when the check cannot be loaded")
+P2._SECRET.update(saved)
+
+T.check(register("digest", phrase="morning report", channel="hmd-updates", level="active", ttl=21600, cap="push-digest-v1", priority=0,
+                 body=lambda fields: "Fixed words.", suffix="digest", scope=lambda fields: "project:%s" % fields.get("project")),
+        "the registry takes H4's digest row of the H2 table")
+digest, other_digest = build("digest", {"project": "proj"}) or {}, build("digest", {"project": "elsewhere"}) or {}
+T.check((digest.get("title"), digest.get("channelId"), digest.get("interruptionLevel"), digest.get("ttl"), "categoryId" in digest)
+        == ("proj · morning report", "hmd-updates", "active", 21600, False)
+        and re.fullmatch(r"[0-9a-f]{16}\.digest", digest.get("collapseId", "")) and digest.get("collapseId") != other_digest.get("collapseId"),
+        "... and builds it byte for byte (title, hmd-updates, no category, active, 21600 s, <project hash>.digest)", digest)
+register("boom", cap="push-boom-v1", suffix="boom", body=lambda fields: 1 / 0)
+register("blank", cap="push-blank-v1", suffix="blank", body=lambda fields: "  \n ")
+register("wordy", cap="push-wordy-v1", suffix="wordy", body=lambda fields: "a\n\tb " + "w" * 300)
+wordy = build("wordy") or {}
+T.check(build("boom") is None and build("blank") is None, "a registered body that raises, or says nothing, is no message")
+T.check(wordy.get("body", "").startswith("a b www") and P2.utf16_len(wordy["body"]) <= P2.BODY_MAX, "a registered body is whitespace-normalised and clipped to BODY_MAX", wordy)
+
+# -- the spool: refusals, privacy, the bound, ttl, clock skew, damage ----------------------------------------------------
+reset_devices()
+refusals = [PUSH.enqueue_event(ROOT, "tile_alert", {"tile": "t-00000001"}, environ={"HMD_PUSH": "0"}), PUSH.enqueue_event(ROOT, "no_such_kind", {"x": 1}),
+            PUSH.enqueue_event(ROOT, "tile_alert", ["a"]), PUSH.enqueue_event(ROOT, "tile_alert", {"blob": object()}),
+            PUSH.enqueue_event(ROOT, "tile_alert", {"blob": "x" * 5000})]
+T.check(refusals == [False] * 5 and spooled() == [], "enqueue_event refuses HMD_PUSH=0, an unregistered kind, non-object, unserialisable and oversize fields", (refusals, spooled()))
+for k in range(70):
+    PUSH.enqueue_event(ROOT, "tile_alert", {"tile": "t-%08x" % k}, key="k:%d" % k, now=T0 + 1000 + k)
+held_events = PUSH.read_spool(ROOT, T0 + 1100)
+T.check(len(spooled()) == PUSH.SPOOL_MAX_FILES == 64 and held_events[0][1]["key"] == "k:6" and held_events[-1][1]["key"] == "k:69",
+        "the spool is bounded at 64 files, the oldest dropped first", (len(spooled()), [e["key"] for _, e in held_events[:1] + held_events[-1:]]))
+T.eq(held_events[0][1], {"kind": "tile_alert", "key": "k:6", "ep": None, "fields": {"tile": "t-00000006"}}, "a spooled event reads back as the Planner's shape")
+spool_dir = os.path.join(ROOT, PUSH.SPOOL_REL)
+T.eq((stat.S_IMODE(os.stat(spool_dir).st_mode), stat.S_IMODE(os.stat(held_events[0][0]).st_mode)), (0o700, 0o600), "the spool directory is 0700 and each event 0600")
+damaged = ("0000000000001-aaaaaaaa.json", "0000000000002-bbbbbbbb.json")
+with open(os.path.join(spool_dir, damaged[0]), "w") as f:
+    f.write("{not json")
+with open(os.path.join(spool_dir, damaged[1]), "w") as f:
+    f.write("x" * (PUSH.SPOOL_FILE_CAP + 10))
+T.check(len(PUSH.read_spool(ROOT, T0 + 1100)) == 64 and not set(damaged) & set(spooled()), "a malformed or oversize file is removed, never served", spooled()[:3])
+T.eq(PUSH.read_spool(ROOT, T0 + 1069 + 3601), [], "an event older than its kind's ttl (3600 s) is never served")
+T.eq(spooled(), [], "... and its file is removed")
+PUSH.enqueue_event(ROOT, "tile_alert", {"tile": "t-00000001"}, key="future", now=T0 + 5000)
+T.eq(PUSH.read_spool(ROOT, T0 + 4900), [], "an event dated more than 30 s ahead of the clock is never served")
+T.eq(spooled(), [], "... and its file is removed")
+
+# -- one sender: a second monitor leaves the files for the owner; foreground suppresses a tile_alert like any kind --------
+register_phone(["tile_alert"], "k")
+sender = T.FakeExpo()
+clock = [T0 + 6000]
+
+
+def monitor():
+    return PUSH.PushMonitor(ROOT, emit=events.append, config={"coalesce_s": 0.0, "min_gap_s": 0.0}, clock=lambda: clock[0], sleep=lambda s: None,
+                            environ={"HMD_PUSH_EXPO_URL": sender.url}, start_thread=False)
+
+
+def tick(mon, n):
+    clock[0] += 30
+    mon.observe({"ts": n}, clock[0])
+    mon.step(clock[0])
+    mon.step(clock[0] + 10)
+
+
+def enqueue(tag):
+    PUSH.enqueue_event(ROOT, "tile_alert", {"tile": "t-%08x" % tag, "with_value": False}, key="s:%d" % tag, now=clock[0] + 30)
+
+
+owner, second = monitor(), monitor()
+enqueue(1)
+tick(owner, 1)
+T.check(len(sender.messages()) == 1 and spooled() == [], "the sender lock's owner serves a spooled event: one message, the file removed", (len(sender.messages()), spooled()))
+enqueue(2)
+tick(second, 1)
+T.check(len(sender.messages()) == 1 and len(spooled()) == 1, "a monitor that does not own the sender lock sends nothing and leaves the file for the owner", (len(sender.messages()), spooled()))
+tick(owner, 2)
+T.check(len(sender.messages()) == 2 and spooled() == [], "the owner then serves it exactly once", (len(sender.messages()), spooled()))
+STORE.set_app_state(ROOT, "foreground")
+enqueue(3)
+tick(owner, 3)
+T.check(len(sender.messages()) == 2 and any(e.get("kind") == "tile_alert" and e.get("suppressed") == "foreground" for e in events),
+        "a tile_alert is suppressed while the app reports foreground, like every kind but approval", (len(sender.messages()), events[-2:]))
+STORE.set_app_state(ROOT, "background")
+owner.close()
+second.close()
+sender.close()
 fake.close()
 other.close()

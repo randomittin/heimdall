@@ -117,7 +117,7 @@ STATUS_DETAILS = {"live": (None,), "error": ("producer-failed", "timeout"), "pau
 GENERATION_DETAILS = ("no-connector", "ambiguous", "unsafe-query", "generation-failed", "timeout")
 DETAILS = frozenset(GENERATION_DETAILS + ("producer-failed", "rejected-panel", "declined", "expired", "idle", "backoff", "budget"))
 PHASES = frozenset(("generating", "needs-confirm", "live", "error", "paused"))
-ALERT_AUDIT_DETAILS = frozenset(("alerts-off", "push-off", "not-a-number-tile", "too-many-alerts", "unknown-tile", "wrong-project", "rate-limited"))
+ALERT_AUDIT_DETAILS = frozenset(("alerts-off", "push-off", "not-a-number-tile", "too-many-alerts", "unknown-tile", "rate-limited"))
 LIMITS = {"tiles": MAX_TILES, "refresh_min_s": REFRESH_MIN_S, "refresh_max_s": REFRESH_MAX_S,
           "refresh_default_s": REFRESH_DEFAULT_S, "panel_bytes": PANEL_BYTES}
 
@@ -454,7 +454,7 @@ def audit_event(root, op, tile_id, ok, detail, device="local", via="local"):
 def _alert_kit():
     """What dashboard_alerts needs of this module, as one namespace (so it never loads a second copy of the store)."""
     return types.SimpleNamespace(store_dir=store_dir, read_json=_read_json, write_json=_write_json, mkdir=_mkdir, touch=_touch,
-                                 find=_find, read_tile=_read_tile, project_names=project_names, enabled=enabled, audit=audit_event,
+                                 find=_find, read_tile=_read_tile, enabled=enabled, audit=audit_event,
                                  take=_take, last_request_at=lambda root: _load_meta(root)["last_request_at"])
 
 

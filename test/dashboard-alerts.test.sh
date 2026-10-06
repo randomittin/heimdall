@@ -91,6 +91,30 @@ mutant no-push-check dashboard_alerts.py '        if not _push_ready(root):
             return _refuse(kit, root, tile_id, "push-off")' "set-alert with no push registration asking for tile_alert is push-off"
 mutant default-includes-kind companion_push.py '"events": frozenset(wanted) if wanted else _PUSH_KINDS}' '"events": frozenset(wanted) if wanted else _PUSH_KINDS | frozenset(_EXT)}' "a device that did not list tile_alert in its events is sent nothing"
 
+mutant alerts-switch-ignored dashboard_alerts.py 'if f["op"] == "set-alert" and not enabled(kit, root):' 'if False:' "set-alert with the laptop switch off is alerts-off"
+mutant wrong-project-ignored companion_dashboards.py 'if fields["project"] not in project_names(root):' 'if False:' "another project is wrong-project"
+mutant number-tile-unchecked dashboard_alerts.py 'if kind != "number":' 'if False:' "a kv tile is not-a-number-tile"
+mutant no-alert-cap dashboard_alerts.py 'if tile_id not in alerts and len(alerts) >= MAX_ALERTS:' 'if False:' "10 alerts per project, then too-many-alerts"
+mutant no-op-rate-limit dashboard_alerts.py 'if wait > 0:' 'if False:' "set/clear are rate-limited after a burst of 6"
+mutant state-ignores-cap companion_dashboards.py 'alerts=_alerts() is not None and _alerts().CAP_ALERTS in device_caps)' 'alerts=True)' "state: no alert key for a phone without dash-alert-v1"
+mutant no-idle-exemption dashboard_producers.py 'if not present and tid not in alerted:' 'if not present:' "no phone: the alerted tile runs"
+mutant no-idle-floor dashboard_producers.py 'every = max(every, ALERT_IDLE_FLOOR_S)' 'every = every' "with no phone the alerted tile's interval has a 300 s floor"
+mutant never-pauses-idle dashboard_alerts.py '3600.0, 6, 300.0, 30 * 86400.0' '3600.0, 6, 300.0, 3000 * 86400.0' "30 days without phone contact"
+mutant register-no-ttl-range companion_push.py 'and isinstance(ttl, int) and not isinstance(ttl, bool) and 60 <= ttl <= 86400' 'and isinstance(ttl, int) and not isinstance(ttl, bool)' "register_kind refuses every out-of-range kind"
+mutant no-priority-zero companion_push.py '0 <= priority <= 9' '1 <= priority <= 9' "a kind module's kit hands its body"
+mutant kinds-not-closed companion_push.py '    PRIORITY[name] = priority' '    PRIORITY[name] = priority
+    global KINDS
+    KINDS = KINDS + (name,)' "KINDS stays the closed six"
+mutant secret-fails-open companion_push.py 'return True if check is None else bool(check(text))' 'return False if check is None else bool(check(text))' "secret_shaped fails closed"
+mutant spool-unbounded companion_push.py 'for old in names[:max(0, len(names) - SPOOL_MAX_FILES + 1)]:' 'for old in names[:0]:' "the spool is bounded at 64 files"
+mutant spool-ignores-ttl companion_push.py 'now - at > spec["ttl"]' 'False' "an event older than its kind's ttl (3600 s) is never served"
+mutant spool-ignores-skew companion_push.py 'at - now > SPOOL_SKEW_S' 'False' "an event dated more than 30 s ahead of the clock is never served"
+mutant non-owner-serves companion_push.py 'if data is None or not data["devices"] or not self._own_lock():
+            return
+        for path, _ in spooled:' 'if data is None or not data["devices"]:
+            return
+        for path, _ in spooled:' "a monitor that does not own the sender lock sends nothing"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

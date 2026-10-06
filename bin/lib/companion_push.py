@@ -10,11 +10,13 @@ PUSH KINDS BEYOND THE FIVE -- THE REGISTRATION INTERFACE (H2 of hmdapp's docs/HA
 a kind WITHOUT editing this file's tables (H4's `digest`, a morning report, goes in exactly this way):
   1. name the module in KIND_MODULES (one tuple, the pattern of companion_ui_controls.ACTION_MODULES);
   2. define `register_push_kinds(kit)` in it. `kit.register_kind(name, phrase=, channel=, level=, ttl=, cap=, priority=, body=, suffix=,
-     scope=None)` registers one kind; `kit.scrub`, `kit.clip` and `kit.BODY_MAX` are the text tools (the module never imports this one):
-       name      ^[a-z][a-z_]{1,23}$, not taken. It joins KINDS, the per-device kind filter and the `events` the store accepts.
+     scope=None)` registers one kind; `kit.scrub`, `kit.clip`, `kit.utf16_len`, `kit.secret_shaped` (True also when the check cannot
+     load: fail closed) and `kit.BODY_MAX` are the text tools (the module never imports this one):
+       name      ^[a-z][a-z_]{1,23}$, not taken. It joins all_kinds() (KINDS stays the closed six), the per-device kind filter and the
+                 `events` the store accepts.
        phrase    the title tail, "<label> · <phrase>", <= 24 chars;  channel "hmd-attention" | "hmd-updates";  level "active" |
-                 "time-sensitive" | "passive";  ttl Expo ttl seconds, 60..86400;  priority 1..9 (coalescing, highest wins; approval
-                 bypasses; question 5, error 4, gate_red 3, finished 2, test 1)
+                 "time-sensitive" | "passive";  ttl Expo ttl seconds, 60..86400;  priority 0..9 (coalescing, highest wins, 0 loses to
+                 every built-in kind; approval bypasses; question 5, error 4, gate_red 3, finished 2, test 1)
        cap       the capability token (<= 32 chars) hmd lists in its state frames ONLY while the kind is registered, so the app asks
                  for the kind only when it is listed; an unregistered kind in a registration is `bad-events` for that registration
        body      body(fields) -> str, the WHOLE body: fixed words plus allowlisted fields. Clipped to BODY_MAX here; an exception or
@@ -26,7 +28,8 @@ a kind WITHOUT editing this file's tables (H4's `digest`, a morning report, goes
      suppression, coalescing and rate limits as every other event. A second process never takes the lock to send: it would make the
      real sender drop the events it detects (see ONE SENDER PER REPO). A registered kind is opt-in: a device that named no events never
      receives it, and an event older than its ttl is never served.
-`registered_kinds()` -> {kind: cap} is what the store (accepted events) and the relay client (advertised caps) read.
+`registered_kinds()` -> {kind: cap} is what the store (accepted events) and the relay client (advertised caps) read;
+`all_kinds()` is KINDS plus them; `devices_wanting(root, kind)` counts the registered devices that asked for one.
 
 WHAT RUNS WHERE. sentinels/hmd-ui.py's StateCache builds one PushMonitor per process and hands it every
 state it collects (the same slot the native panel publishers use). `observe` is a few dict lookups: it
@@ -237,6 +240,12 @@ def _secret_checker():
     return _SECRET["fn"]
 
 
+def secret_shaped(text):
+    """True when `text` looks like a credential -- and when the check cannot be loaded, so a free-text field is withheld (fail closed)."""
+    check = _secret_checker()
+    return True if check is None else bool(check(text))
+
+
 # ── text: UTF-16 accounting and the scrub pipeline (spec 8.2) ─────────────────────────────────────
 def utf16_len(text):
     """Length in UTF-16 code units -- what a JS string, and so the app's limits, count."""
@@ -425,25 +434,28 @@ _EXT = {}                         # kind -> {"cap", "body", "suffix", "scope", "
 def register_kind(name, *, phrase, channel, level, ttl, cap, priority, body, suffix, scope=None):
     """Register one push kind (module docstring, PUSH KINDS BEYOND THE FIVE). ValueError for anything out of its range: a kind
     is trusted code adding itself at import time, so a malformed one fails loudly instead of half-registering."""
-    global KINDS
     ok = (isinstance(name, str) and KIND_NAME_RE.fullmatch(name) and name not in _KIND_TABLE
           and isinstance(phrase, str) and 0 < len(phrase) <= 24 and phrase.isprintable() and "/" not in phrase
           and channel in CHANNELS and level in LEVELS
           and isinstance(ttl, int) and not isinstance(ttl, bool) and 60 <= ttl <= 86400
           and isinstance(cap, str) and CAP_NAME_RE.fullmatch(cap)
-          and isinstance(priority, int) and not isinstance(priority, bool) and 1 <= priority <= 9
+          and isinstance(priority, int) and not isinstance(priority, bool) and 0 <= priority <= 9
           and callable(body) and isinstance(suffix, str) and SUFFIX_RE.fullmatch(suffix) and (scope is None or callable(scope)))
     if not ok:
         raise ValueError("a push kind is a new kebab name with a phrase, channel, level, ttl, cap, priority, body and suffix")
     _KIND_TABLE[name] = (phrase, channel, None, level, ttl)
     PRIORITY[name] = priority
-    KINDS = KINDS + (name,)
     _EXT[name] = {"cap": cap, "body": body, "suffix": suffix, "scope": scope, "ttl": ttl}
 
 
 def registered_kinds():
     """{kind: cap} of the kinds registered beyond the five (and `test`): what the store accepts and what hmd advertises."""
     return {kind: spec["cap"] for kind, spec in _EXT.items()}
+
+
+def all_kinds():
+    """KINDS (the closed six) followed by the registered kinds, in registration order."""
+    return KINDS + tuple(_EXT)
 
 
 def _load_store():
@@ -1443,7 +1455,8 @@ def source_paths(root):
 def _load_kind_modules():
     """Run register_push_kinds(kit) of every module in KIND_MODULES (trusted code, like companion_ui_controls.ACTION_MODULES). A module
     that cannot load, or raises, leaves its kinds unregistered -- and so unadvertised and refused as `bad-events`."""
-    kit = types.SimpleNamespace(register_kind=register_kind, scrub=scrub, clip=clip, BODY_MAX=BODY_MAX)
+    kit = types.SimpleNamespace(register_kind=register_kind, scrub=scrub, clip=clip, utf16_len=utf16_len, secret_shaped=secret_shaped,
+                                BODY_MAX=BODY_MAX)
     for name in KIND_MODULES:
         hook = getattr(_load_sibling(name), "register_push_kinds", None)
         if callable(hook):
