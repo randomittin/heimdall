@@ -1368,7 +1368,8 @@ write_cfg "$R" '{
   "target_provider": "self-hosted-mixtral"
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
@@ -1385,7 +1386,8 @@ unset HMD_FB_TEST_KEY
 # confirmed "under" reading's text it has no evidence for. ──────────────────
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unknown","crossed":false,"source":"budget"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unknown","crossed":false,"source":"budget"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out_unknown="$(fb --repo "$R" check)"
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 echo "$out_unknown" | grep -qi "CROSSED" \
@@ -1398,7 +1400,8 @@ echo "$out_unknown" | grep -qi "could not be determined" \
 
 R2="$(fresh_repo)"
 write_cfg "$R2" '{"state": "auto"}'
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"budget"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"budget"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out_under="$(fb --repo "$R2" check)"
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 echo "$out_under" | grep -qi "could not be determined" \
@@ -1421,7 +1424,8 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
   && ok "40a. a missing heimdall-session-usage binary does not crash check -- same WAIT verdict as always" \
   || bad "40a. rc=$rc_missing out='$out_missing'"
 
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage 'not valid json {{{')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage 'not valid json {{{')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out_garbage="$(fb --repo "$R" check)"; rc_garbage=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 [ "$rc_garbage" -eq 2 ] && echo "$out_garbage" | grep -q "VERDICT: WAIT" \
@@ -1456,7 +1460,8 @@ write_cfg "$R" '{
   "target_provider": "self-hosted-mixtral"
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"budget"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"budget"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
@@ -1472,7 +1477,8 @@ unset HMD_FB_TEST_KEY
 # pre-exhaustion signal cannot overcome a failing preflight check. ──────────
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 [ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
@@ -1499,7 +1505,8 @@ write_cfg "$R" '{
   "target_provider": "self-hosted-mixtral"
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unknown","crossed":false,"source":"budget"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unknown","crossed":false,"source":"budget"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
@@ -1529,21 +1536,24 @@ write_cfg "$R" '{
   "target_provider": "self-hosted-mixtral"
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"seven_day","percent_real_seven_day":99.0}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"seven_day","percent_real_seven_day":99.0}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: seven_day)" \
   && ok "43b. session-usage crossed+window=seven_day -> [INFO] names the window" \
   || bad "43b. got rc=$rc out='$out'"
 
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && ! echo "$out" | grep -q "(window:" && ! echo "$out" | grep -q " None" \
   && ok "43c. legacy crossed payload with no 'window' key -> unchanged [INFO], no crash, no stray None" \
   || bad "43c. got rc=$rc out='$out'"
 
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","window":"five_hour"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","window":"five_hour"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
@@ -2076,6 +2086,7 @@ home_dir="$(mktemp -d "$HOME/hmd-fallback-test-tilde.XXXXXX")"
 tokf_home="$home_dir/token"
 printf 'not-a-real-token-value' > "$tokf_home"
 chmod 600 "$tokf_home"
+# shellcheck disable=SC2088  # the literal "~/" IS the fixture: bin/heimdall-fallback token-file must expand it itself, so the shell must not
 rel="~/$(basename "$home_dir")/token"
 R="$(fresh_repo)"
 write_cfg "$R" '{"gateway_token_file": "'"$rel"'"}'
@@ -2438,7 +2449,8 @@ write_cfg "$R" '{
   "target_provider": "self-hosted-mixtral"
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"extra:session","windows_seen":["five_hour","seven_day","session"]}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"extra:session","windows_seen":["five_hour","seven_day","session"]}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
@@ -2460,7 +2472,8 @@ unset HMD_FB_TEST_KEY
 # wording (39b/39c's own distinctness contract, still binding). ────────────
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","windows_seen":["five_hour","seven_day"]}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","windows_seen":["five_hour","seven_day"]}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 [ "$rc" -eq 2 ] \
@@ -2482,7 +2495,8 @@ unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 # this changes the WORDING, never the verdict or the routing rc. ──────────
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"budget"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"budget"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 [ "$rc" -eq 2 ] \
@@ -2509,7 +2523,8 @@ write_cfg "$R" '{
   "target_provider": "self-hosted-mixtral"
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"five_hour+extra:session","windows_seen":["five_hour","seven_day","session"]}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"five_hour+extra:session","windows_seen":["five_hour","seven_day","session"]}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
@@ -2539,7 +2554,8 @@ write_cfg "$R" '{
   "target_provider": "self-hosted-mixtral"
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"extra:../../etc/passwd"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"extra:../../etc/passwd"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
@@ -2555,7 +2571,8 @@ unset HMD_FB_TEST_KEY
 # interpolated into the printed note. ──────────────────────────────────────
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto"}'
-export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","windows_seen":"not-a-list"}')"
+HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","windows_seen":"not-a-list"}')"
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 out="$(fb --repo "$R" check)"; rc=$?
 unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 [ "$rc" -eq 2 ] && echo "$out" | grep -qi "BLIND" && ! echo "$out" | grep -qi "could not be determined" \

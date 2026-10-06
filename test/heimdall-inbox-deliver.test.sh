@@ -237,6 +237,7 @@ RC=$?
 OUT2="$(printf '%s' 'garbage' | "$BIN" prompt --repo "$D" 2>&1)"
 RC2=$?
 [ "$RC2" -eq 0 ] && ok "prompt mode: exit 0 on garbage stdin" || bad "exit $RC2 (want 0)"
+[ -z "$OUT2" ] && ok "prompt mode: no output on garbage stdin" || bad "unexpected output: $OUT2"
 rm -rf "$D"
 
 # A3 (HIGH): a delivered phone message must never reach the model as a

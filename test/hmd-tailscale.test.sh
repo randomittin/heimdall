@@ -227,6 +227,7 @@ fi
 if (
   unset HMD_TAILSCALE_BIN
   mkdir -p "$TMPROOT/emptybin"
+  # shellcheck disable=SC2123  # intentional: an empty dir as the WHOLE PATH is the condition under test (tailscale not on PATH)
   PATH="$TMPROOT/emptybin"
   export PATH
   out="$(ts_bin 2>/dev/null)"; rc=$?
@@ -373,6 +374,7 @@ fi
 if (
   unset HMD_TAILSCALE_BIN
   mkdir -p "$TMPROOT/emptybin2"
+  # shellcheck disable=SC2123  # intentional: an empty dir as the WHOLE PATH is the condition under test (tailscale not on PATH)
   PATH="$TMPROOT/emptybin2"
   export PATH
   [ ! -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ] && [ ! -x "/usr/local/bin/tailscale" ] || exit 77

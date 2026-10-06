@@ -35,7 +35,7 @@ TMPROOT="$(mktemp -d)"
 # run every case from a scratch cwd with no .planning (a $PWD fallback then finds
 # nothing to act on), and assert at the end that no ledger checkpoint under the
 # real repo changed during this suite.
-cd "$TMPROOT"
+cd "$TMPROOT" || { echo "FATAL: cannot cd into scratch dir [$TMPROOT] -- refusing to run from a cwd that could be the real repo"; exit 1; }
 unset CLAUDE_PROJECT_DIR
 LEDGER_GLOB="$REPO/.planning/ledger/checkpoints/*.json"
 LEDGER_BEFORE="$(shasum -a 256 $LEDGER_GLOB 2>/dev/null | sort)"

@@ -50,6 +50,7 @@ resolve() {
   # about -- that broken system python is therefore ALSO a candidate the resolver
   # must reject, which is the point.
   ( export HEIMDALL_HOME="$home" PATH="$pathdir:/usr/bin:/bin" HMD_PYTHON=""; unset HMD_PYTHON
+    # shellcheck source=../bin/lib/hmd-python.sh disable=SC1091  # $LIB is bin/lib/hmd-python.sh; plain shellcheck (no -x) never opens sourced files
     . "$LIB" && hmd_python )
 }
 
@@ -94,6 +95,7 @@ fi
 
 # ── 5. HMD_PYTHON override is honoured verbatim (operator's explicit choice) ──
 H="$TMPROOT/h5"; mkdir -p "$H"; P="$TMPROOT/p5"; mkdir -p "$P"
+# shellcheck source=../bin/lib/hmd-python.sh disable=SC1091  # $LIB is bin/lib/hmd-python.sh; plain shellcheck (no -x) never opens sourced files
 out="$( ( export HEIMDALL_HOME="$H" PATH="$P" HMD_PYTHON="$GOOD"; . "$LIB" && hmd_python ) )"
 [ "$out" = "$GOOD" ] && ok "5. HMD_PYTHON override wins" || bad "5. HMD_PYTHON override ignored (out=[$out])"
 
@@ -117,6 +119,7 @@ cached() {  # HOME_DIR [HMD_PYTHON]  -> prints hmd_python_cached's stdout; exit 
   local home="$1" pin="${2:-}"
   ( export HEIMDALL_HOME="$home" PATH="/usr/bin:/bin"; unset HMD_PYTHON
     [ -n "$pin" ] && export HMD_PYTHON="$pin"
+    # shellcheck source=../bin/lib/hmd-python.sh disable=SC1091  # $LIB is bin/lib/hmd-python.sh; plain shellcheck (no -x) never opens sourced files
     . "$LIB" && hmd_python_cached )
 }
 
