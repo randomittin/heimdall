@@ -241,14 +241,28 @@ if mutate "$MTREE/sentinels/hmd-ui.py" 'device_id="direct", seq=None, transport=
 else bad "mutant [direct route + caps]: could not be applied"; fi
 
 # 4. the wiring, by text
-grep -q 'DASH.CAP_DASH' "$REPO/bin/heimdall-relay-client" && grep -q '_dashboards_overlay(self._views_overlay' "$REPO/bin/heimdall-relay-client" \
-  && grep -q 'caps=self.device_caps' "$REPO/bin/heimdall-relay-client" && ok "relay client: cap listed, overlay applied per phone, phone caps passed to dispatch" \
-  || bad "relay client wiring missing"
-grep -q '"dashboards"' "$REPO/sentinels/hmd-ui.py" "$REPO/bin/heimdall-relay-client" && ok 'the "dashboards" key is wired in sentinels/hmd-ui.py and bin/heimdall-relay-client' || bad 'no "dashboards" key wiring'
-grep -q 'remote-dashboards' "$REPO/bin/heimdall-app" && grep -q 'companion_dashboards.py" status-line' "$REPO/bin/heimdall-app" \
-  && ok "heimdall-app: remote-dashboards routed, status line printed" || bad "heimdall-app wiring missing"
-grep -q '"dash-v1"' "$REPO/bin/lib/companion_dashboards.py" && grep -q 'dashboard-request' "$REPO/bin/lib/companion_dashboards.py" \
-  && grep -q 'dashboards' "$REPO/bin/lib/companion_remote_switches.py" && ok "acceptance greps: cap, action name, switch" || bad "acceptance greps failed"
+if grep -q 'DASH.CAP_DASH' "$REPO/bin/heimdall-relay-client" && grep -q '_dashboards_overlay(self._views_overlay' "$REPO/bin/heimdall-relay-client" \
+  && grep -q 'caps=self.device_caps' "$REPO/bin/heimdall-relay-client"; then
+  ok "relay client: cap listed, overlay applied per phone, phone caps passed to dispatch"
+else
+  bad "relay client wiring missing"
+fi
+if grep -q '"dashboards"' "$REPO/sentinels/hmd-ui.py" "$REPO/bin/heimdall-relay-client"; then
+  ok 'the "dashboards" key is wired in sentinels/hmd-ui.py and bin/heimdall-relay-client'
+else
+  bad 'no "dashboards" key wiring'
+fi
+if grep -q 'remote-dashboards' "$REPO/bin/heimdall-app" && grep -q 'companion_dashboards.py" status-line' "$REPO/bin/heimdall-app"; then
+  ok "heimdall-app: remote-dashboards routed, status line printed"
+else
+  bad "heimdall-app wiring missing"
+fi
+if grep -q '"dash-v1"' "$REPO/bin/lib/companion_dashboards.py" && grep -q 'dashboard-request' "$REPO/bin/lib/companion_dashboards.py" \
+  && grep -q 'dashboards' "$REPO/bin/lib/companion_remote_switches.py"; then
+  ok "acceptance greps: cap, action name, switch"
+else
+  bad "acceptance greps failed"
+fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
