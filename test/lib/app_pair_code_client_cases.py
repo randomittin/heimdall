@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -81,6 +82,14 @@ def pair_inits(proc):
 
 def hmd_pub_of(proc, index=0):
     return H.b64_any(pair_inits(proc)[index]["qr"]["hmd_pubkey"])
+
+
+def documented_key_reveal_patterns():
+    """How relay/contract/code-pair.json says each key_reveal payload field is spelled: the pattern of the binding its
+    template names. The contract is read, not restated, so a change on either side of it turns the check red."""
+    contract = json.load(open(H.CODE_PAIR_CONTRACT_PATH))
+    template = contract["frames"]["key_reveal"]["envelope"]["payload"]
+    return {field: re.compile(contract["bindings"][ref.lstrip("$")]["match"]) for field, ref in template.items()}
 
 
 def sealed_frames(relay, sid):
@@ -211,6 +220,13 @@ def case_approve_flow():
                 and kr.get("nonce") is None and kr.get("ciphertext") is None and len(hmd_pub) == 32 and len(nonce) == 32,
                 "key_reveal: a plaintext hmd envelope (seq 0, no ciphertext) carrying two 32-byte values", str(kr))
         T.check(hmd_pub == hmd_pub_of(c), "key_reveal: it reveals the very key the QR carries")
+        documented = documented_key_reveal_patterns()
+        sent, qr_key = kr["payload"], pair_inits(c)[0]["qr"]["hmd_pubkey"]
+        T.check(sorted(documented) == sorted(sent)
+                and all(documented[field].fullmatch(sent[field]) for field in documented)
+                and documented["hmd_pubkey"].fullmatch(qr_key),
+                "key_reveal: hmd_pubkey and nonce are spelled the way relay/contract/code-pair.json documents them, "
+                "and the QR carries hmd_pubkey in that same spelling", "payload %s, QR hmd_pubkey %s" % (sent, qr_key))
         T.check(H.commit_ref(hmd_pub, nonce) == s.relay.registrations[0]["hmd_commit"],
                 "key_reveal: SHA256(domain || key || nonce) opens the commitment registered before any phone key existed")
         T.check(req["sas"] == H.sas_ref(sid, hmd_pub, s.phone.pub) and req["device_label"] == "Pixel 9a"

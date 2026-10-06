@@ -33,6 +33,7 @@ APP_PATH = os.path.join(REPO, "bin", "heimdall-app")
 E2E_PATH = os.path.join(REPO, "bin", "lib", "hmd_relay_e2e.py")
 CODE_HELPER_PATH = os.path.join(REPO, "bin", "lib", "hmd_app_code.py")
 VECTORS_PATH = os.path.join(REPO, "test", "fixtures", "hmdapp-pair-code-vectors.json")
+CODE_PAIR_CONTRACT_PATH = os.path.join(REPO, "relay", "contract", "code-pair.json")
 
 # Fake on purpose: no `gh*_` prefix, so no secret scanner mistakes it for a real credential. Every test
 # that asserts "the token went nowhere but the relay's request body" looks for exactly this string.
