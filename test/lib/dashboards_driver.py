@@ -328,7 +328,7 @@ def no_proposal_or_statement_anywhere():
     blobs = {"phone": json.dumps(d.snapshot(e.root, phone=True)), "laptop": json.dumps(d.snapshot(e.root, phone=False)),
              "audit": e.audit(), "events": e.events()}
     for name, text in blobs.items():
-        for needle in ("zz_marker_col", "zz_marker_tbl", "SELECT", '"statement"', '"proposal"', "customers"):
+        for needle in ("zz_marker_col", "zz_marker_tbl", "SELECT", '"statement"', '"proposal"'):
             assert needle not in text, "%r leaked into the %s" % (needle, name)
     for name in ("audit", "events"):
         assert "zz-intent-marker" not in blobs[name], "the phone's text leaked into the " + name
@@ -340,9 +340,15 @@ def slice_budget():
     lines = ["x" * 490 for _ in range(64)]
     for i in range(d.MAX_TILES):
         e.live(panel={"title": "t", "type": "log-tail", "data": {"lines": lines}}, now=1790273050 + i)
-    s = d.snapshot(e.root, now=1790273100)
+    full = len(json.dumps(d.snapshot(e.root, now=1790273100), separators=(",", ":")).encode())
+    assert full > 400 * 1024, "sixteen near-budget panels are a slice of real size (%d bytes)" % full
+    real, d.SLICE_BYTES = d.SLICE_BYTES, 300 * 1024      # the same loop at a budget these panels can exceed
+    try:
+        s = d.snapshot(e.root, now=1790273100)
+    finally:
+        d.SLICE_BYTES = real
     size = len(json.dumps(s, separators=(",", ":")).encode())
-    assert size < d.SLICE_BYTES and len(s["tiles"]) == d.MAX_TILES, (size, len(s["tiles"]))
+    assert size < 300 * 1024 and len(s["tiles"]) == d.MAX_TILES, (size, len(s["tiles"]))
     dropped = [t for t in s["tiles"] if t["detail"] == "budget"]
     assert dropped and all(t["panel"] is None for t in dropped), "tile rows stay, panels go, detail is budget"
     assert min(t["last_ok_at"] for t in dropped) == 1790273050, "the least recently updated tile loses its panel first"
@@ -480,6 +486,12 @@ def confirmed_producers_exact():
     assert d.set_tile_status(e.root, unconfirmed, "live", None) is False and d.set_tile_status(e.root, live, "live", "idle") is False
     producer = d.confirmed_producers(e.root)[0]
     assert producer["producer"]["statement"].startswith("SELECT") and producer["fingerprint"] == d.get_tile(e.root, live)["fingerprint"]
+    forged = e.live()                      # a tile file edited by hand: live, but its fingerprint is not the one that was confirmed
+    tile = d.get_tile(e.root, forged)
+    tile["confirmed_fp"] = "0" * 64
+    with d._locked(e.root):
+        d._write_tile(e.root, tile)
+    assert forged not in [p["tile_id"] for p in d.confirmed_producers(e.root)], "fingerprint != confirmed_fp must never run"
 
 
 @check

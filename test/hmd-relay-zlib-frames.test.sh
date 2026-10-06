@@ -761,7 +761,7 @@ try:
     first = wait("the first state frame", lambda: (frames("state") or [None])[0])
     first_plain = read(first)
     obj = json.loads(first_plain)
-    assert "z" not in obj and obj["caps"] == ["controls-v1", "login-v1", "push-v1", "resync", "view-v1", "z-zlib"] and "schema_version" in obj["state"], \
+    assert "z" not in obj and obj["caps"] == ["controls-v1", "dash-v1", "login-v1", "push-v1", "resync", "view-v1", "z-zlib"] and "schema_version" in obj["state"], \
         "before any resync the frame must be plain and list hmd's caps"
 
     # the phone saw `resync` in hmd's caps: it sends its resync, listing z-zlib, with a digest hmd never sent
@@ -778,7 +778,7 @@ try:
                   lambda: next((f for f in frames("state") if f["seq"] > first["seq"] and b'"z"' in read(f)[:8]), None))
     wrapper = read(packed)
     inner = json.loads(e2e.unpack_plaintext(wrapper))
-    assert inner["caps"] == ["controls-v1", "login-v1", "push-v1", "resync", "view-v1", "z-zlib"] and "schema_version" in inner["state"], "decoded frame must be a full state"
+    assert inner["caps"] == ["controls-v1", "dash-v1", "login-v1", "push-v1", "resync", "view-v1", "z-zlib"] and "schema_version" in inner["state"], "decoded frame must be a full state"
     assert len(wrapper) < 0.6 * len(first_plain), "%d -> %d" % (len(first_plain), len(wrapper))
     sent = [e for e in events if e.get("event") == "state_sent"]
     assert sent[0]["bytes"] > sent[-1]["bytes"] and all(e["delivered"] for e in sent), sent

@@ -48,15 +48,19 @@ if [ "$(grep -c '^ok \|^FAIL ' "$OUT")" -lt 20 ]; then bad "the driver ran fewer
 
 # 2. mutants: a copy of bin/lib with ONE edit; the named check must fail on it
 mutant() {
-  local label="$1" file="$2" old="$3" new="$4" want="$5" copy="$TMPROOT/m-$RANDOM/bin/lib" out
+  local label="$1" file="$2" old="$3" new="$4" want="$5" file2="${6:-}" old2="${7:-}" new2="${8:-}" copy="$TMPROOT/m-$RANDOM/bin/lib" out
   mkdir -p "$copy" && cp -R "$REPO/bin/lib/." "$copy/"
-  if ! python3 - "$copy/$file" "$old" "$new" <<'PYEOF'
-import sys
-path, old, new = sys.argv[1:4]
-text = open(path, encoding="utf-8").read()
-if text.count(old) != 1:
-    sys.exit("mutation target found %d times: %r" % (text.count(old), old[:60]))
-open(path, "w", encoding="utf-8").write(text.replace(old, new))
+  if ! python3 - "$copy" "$file" "$old" "$new" "$file2" "$old2" "$new2" <<'PYEOF'
+import os, sys
+base, *rest = sys.argv[1:]
+for file, old, new in ((rest[0], rest[1], rest[2]), (rest[3], rest[4], rest[5])):
+    if not file:
+        continue
+    path = os.path.join(base, file)
+    text = open(path, encoding="utf-8").read()
+    if text.count(old) != 1:
+        sys.exit("mutation target found %d times: %r" % (text.count(old), old[:60]))
+    open(path, "w", encoding="utf-8").write(text.replace(old, new))
 PYEOF
   then bad "mutant [$label]: could not be applied (the code it mutates moved)"; return; fi
   out="$(python3 "$DRIVER" "$copy" 2>&1)"
@@ -68,7 +72,8 @@ mutant "drop the switch check" companion_ui_controls.py \
         return None, None, spec["policy"].get("off_detail", "not-allowed")' \
   'if False:
         return None, None, spec["policy"].get("off_detail", "not-allowed")' switch-off-refuses
-mutant "accept dashboard_request (underscore)" companion_dashboards.py 'ACTION = "dashboard-request"' 'ACTION = "dashboard_request"' underscore-is-not-implemented
+mutant "accept dashboard_request (underscore)" companion_dashboards.py 'ACTION = "dashboard-request"' 'ACTION = "dashboard_request"' underscore-is-not-implemented \
+  companion_ui_controls.py 'NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,39}")' 'NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,39}")'
 mutant "accept an extra param" companion_dashboards.py \
   'if not set(required) <= keys or not keys <= set(required) | set(optional):' 'if not set(required) <= keys:' keysets
 mutant "skip the project check" companion_dashboards.py 'if fields["project"] not in project_names(root):' 'if False:' wrong-project
