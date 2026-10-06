@@ -61,7 +61,7 @@ MUTANTS = [
     ("no wrong-code lockout", '            if rec["attempts"] >= CODE_ATTEMPTS:', "            if False:", "confirm-lockout-after-3"),
     ("constant backoff", "    return float(min(2 ** min(max(failures - 1, 0), 20), BACKOFF_CAP_S))", "    return 1.0", "backoff-sequence"),
     ("never pause after failures", '        if st["failures"] >= FAILURES_TO_PAUSE:', "        if False:", "ten-failures-paused-backoff"),
-    ("no idle pause", "                if not present:", "                if False:", "idle-pause-no-query"),
+    ("no idle pause", "                if not present and tid not in alerted:", "                if False:", "idle-pause-no-query"),
     ("password in argv", '                env["PGPASSWORD"] = password', '                argv.append("--password=" + password)',
      "psql:password-not-in-argv"),
     ("session not read-only", "-c default_transaction_read_only=on", "-c default_transaction_read_only=off", "psql:read-only-session"),
