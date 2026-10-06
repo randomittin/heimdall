@@ -60,9 +60,9 @@ for FLAVOUR in inline module; do
   BEFORE="$(inode_of "$D/.heimdall/ui/inbox.jsonl")"
   OUT="$(printf '{}' | "$HOOK" prompt --repo "$D" 2>&1)"
   RC=$?
-  [ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "$FLAVOUR: prompt pop of an empty inbox -> exit 0, nothing printed" || bad "$FLAVOUR: rc=$RC out: $OUT"
+  if [ "$RC" -eq 0 ] && [ -z "$OUT" ]; then ok "$FLAVOUR: prompt pop of an empty inbox -> exit 0, nothing printed"; else bad "$FLAVOUR: rc=$RC out: $OUT"; fi
   AFTER="$(inode_of "$D/.heimdall/ui/inbox.jsonl")"
-  [ "$BEFORE" = "$AFTER" ] && ok "$FLAVOUR: the empty inbox.jsonl is the same inode afterwards ($AFTER)" || bad "$FLAVOUR: inbox.jsonl was $BEFORE, is now $AFTER -- a writer holding it open would write into a removed file"
+  if [ "$BEFORE" = "$AFTER" ]; then ok "$FLAVOUR: the empty inbox.jsonl is the same inode afterwards ($AFTER)"; else bad "$FLAVOUR: inbox.jsonl was $BEFORE, is now $AFTER -- a writer holding it open would write into a removed file"; fi
   rm -rf "$D"
 done
 
@@ -95,11 +95,11 @@ for FLAVOUR in inline module; do
   D="$(make_project)"
   [ "$FLAVOUR" = module ] && with_module "$D"
   run_straddle "$D"
-  printf '%s' "$OUT" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' && ok "$FLAVOUR: decision:block delivered" || bad "$FLAVOUR: no delivery after ${ELAPSED}s: $OUT"
-  printf '%s' "$OUT" | grep -q "slow writer hello" && ok "$FLAVOUR: the reason carries the slow writer's text" || bad "$FLAVOUR: text missing from: $OUT"
-  [ "$ELAPSED" -le 8 ] && ok "$FLAVOUR: delivered in ${ELAPSED}s -- the hold woke for the write, it did not run out its 15s" || bad "$FLAVOUR: took ${ELAPSED}s"
-  grep -q "slow writer hello" "$D/.heimdall/ui/inbox-delivered.jsonl" 2>/dev/null && ok "$FLAVOUR: archived in inbox-delivered.jsonl" || bad "$FLAVOUR: not in the delivered archive"
-  [ ! -s "$D/.heimdall/ui/inbox.jsonl" ] && ok "$FLAVOUR: popped (inbox.jsonl is empty or gone)" || bad "$FLAVOUR: still queued"
+  if printf '%s' "$OUT" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"'; then ok "$FLAVOUR: decision:block delivered"; else bad "$FLAVOUR: no delivery after ${ELAPSED}s: $OUT"; fi
+  if printf '%s' "$OUT" | grep -q "slow writer hello"; then ok "$FLAVOUR: the reason carries the slow writer's text"; else bad "$FLAVOUR: text missing from: $OUT"; fi
+  if [ "$ELAPSED" -le 8 ]; then ok "$FLAVOUR: delivered in ${ELAPSED}s -- the hold woke for the write, it did not run out its 15s"; else bad "$FLAVOUR: took ${ELAPSED}s"; fi
+  if grep -q "slow writer hello" "$D/.heimdall/ui/inbox-delivered.jsonl" 2>/dev/null; then ok "$FLAVOUR: archived in inbox-delivered.jsonl"; else bad "$FLAVOUR: not in the delivered archive"; fi
+  if [ ! -s "$D/.heimdall/ui/inbox.jsonl" ]; then ok "$FLAVOUR: popped (inbox.jsonl is empty or gone)"; else bad "$FLAVOUR: still queued"; fi
   rm -rf "$D"
 done
 

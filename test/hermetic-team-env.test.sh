@@ -82,7 +82,7 @@ echo "C. helper — both vectors on, hermetic_team_env called: share COMMITS, th
 R="$(mkrepo helper-on)"; B="$(ncommits "$R")"
 RES="$(
   export HOME="$OPERATOR" HMD_TEAM_NO_COMMIT=1
-  # shellcheck source=lib/hermetic-team-env.sh
+  # shellcheck source=lib/hermetic-team-env.sh disable=SC1091
   . "$HELPER"
   hermetic_team_env "$SCRATCH" || { echo "HELPER_RC=$?"; exit 0; }
   echo "HELPER_RC=0"

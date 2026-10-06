@@ -43,7 +43,7 @@ fi
 
 PY3=""
 if [ -r "$LIB_DIR/hmd-python.sh" ]; then
-  # shellcheck source=lib/hmd-python.sh
+  # shellcheck source=lib/hmd-python.sh disable=SC1091
   . "$LIB_DIR/hmd-python.sh"
   PY3="$(hmd_python 2>/dev/null || true)"
 fi

@@ -74,6 +74,7 @@ HMD_HEADROOM_HEALTH_MAX_TIME=2
 # real-home.sh answers "is this process the real user in the real home?" — the guard that keeps
 # a synthetic-HOME harness away from the real per-user launchd (see hmd_headroom_kick).
 _HMD_HEADROOM_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+# shellcheck source=real-home.sh disable=SC1091
 [ -r "$_HMD_HEADROOM_LIB_DIR/real-home.sh" ] && . "$_HMD_HEADROOM_LIB_DIR/real-home.sh"
 
 # Set by hmd_headroom_chain on success / failure. Read by the caller and by `hmd modules
@@ -324,6 +325,7 @@ hmd_headroom_reuse_ok() {
 hmd_headroom_reuse_refusal() {
   case "$2" in
     lossy)
+      # shellcheck disable=SC2016 # literal backticks: they quote `0 stream events received` for the operator
       printf 'the Headroom proxy already listening on %s was started WITHOUT lossless mode: it injects headroom_retrieve, so streaming requests reach the provider as stream:false and the client sees `0 stream events received` (upstream #3071/#3130). Restart it (hmd starts one with --lossless), or export HEADROOM_LOSSLESS=0 to accept that and reuse it. Running unproxied.' "$1" ;;
     *)
       printf 'the Headroom proxy already listening on %s cannot be verified as lossless — its pid or environment is not readable from here — and an unverified proxy may be injecting headroom_retrieve, which downgrades streaming to buffered (upstream #3071/#3130). Export HEADROOM_LOSSLESS=0 to reuse it anyway. Running unproxied.' "$1" ;;
@@ -720,6 +722,7 @@ hmd_headroom_report() {
   elif [ "$state" = answering ]; then
     printf 'NOT ROUTED — port %s is answering but is not a Headroom proxy pointed at %s%s' "$port" "$HMD_HEADROOM_UPSTREAM" "$(_hmd_headroom_held_by "$port")"
   else
+    # shellcheck disable=SC2016 # literal backticks around `hmd wrap` in the operator-facing message
     printf 'NOT ROUTED — no Headroom proxy is listening on %s (it starts on the next `hmd wrap`)%s' "$port" "$(_hmd_headroom_supervised_note)"
   fi
 }
@@ -728,6 +731,7 @@ hmd_headroom_report() {
 # point, and also exactly what surprises an operator who kills the proxy to free its port.
 _hmd_headroom_supervised_note() {
   hmd_headroom_supervised || return 0
+  # shellcheck disable=SC2016 # literal backticks around the launchctl command in the operator-facing message
   printf ' Supervised by launchd (%s): it is restarted if it exits, so a plain kill is undone within seconds — stop it with `launchctl bootout gui/%s/%s`.' \
     "$(hmd_headroom_supervisor_label)" "$(id -u)" "$(hmd_headroom_supervisor_label)"
 }
