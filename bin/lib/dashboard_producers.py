@@ -71,6 +71,7 @@ MODEL_OUTPUT_MAX_BYTES = 16384
 PROPOSAL_TTL_S = 24 * 3600        # a pending proposal expires after 24 h
 IDLE_PAUSE_S = 12 * 3600          # no dashboard-request for this long: tiles pause (HMD_DASH_IDLE_PAUSE_S, 0 = never)
 IDLE_ENV = "HMD_DASH_IDLE_PAUSE_S"
+ALERT_IDLE_FLOOR_S = 300.0      # an alerted tile with no phone present runs no more often than this (H1)
 BACKOFF_CAP_S = 1800.0
 FAILURES_TO_PAUSE = 10
 JITTER = 0.10
@@ -1176,7 +1177,7 @@ class Scheduler:
         st["next_at"] = now + backoff_delay(st["failures"])
         return "error", "producer-failed"
 
-    def tick(self, root, records, now=None, present=True, runner=None):
+    def tick(self, root, records, now=None, present=True, runner=None, alerted=()):
         """One pass over the producer records the store says may run: outcomes {tile_id, ran, phase, detail, reason, panel, last_ok_at}
         for the store to apply (nothing for a record that is not due). Not present: no query at all, paused/idle. A `refresh_requested_at`
         newer than the last one seen runs the tile now and forgets its failures -- the one thing that lifts a backoff."""
@@ -1190,7 +1191,7 @@ class Scheduler:
                 if not (isinstance(tid, str) and TILE_ID_RE.fullmatch(tid)):
                     continue
                 st = self._next(tid)
-                if not present:
+                if not present and tid not in alerted:        # an alerted tile keeps running with no phone (H1), at a 300 s floor
                     outcomes.append(_outcome(tid, phase="paused", detail="idle"))
                     continue
                 asked = rec.get("refresh_requested_at")
@@ -1200,7 +1201,10 @@ class Scheduler:
                     continue
                 result = (runner or (lambda r: run_producer(root, r, now=now)))(rec)
                 if result.ok:
-                    st.update(failures=0, next_at=now + max(float(rec.get("refresh_s") or 300), 1.0) * (1 + self._rng.uniform(-JITTER, JITTER)))
+                    every = max(float(rec.get("refresh_s") or 300), 1.0)
+                    if not present:
+                        every = max(every, ALERT_IDLE_FLOOR_S)
+                    st.update(failures=0, next_at=now + every * (1 + self._rng.uniform(-JITTER, JITTER)))
                     outcomes.append(_outcome(tid, ran=True, phase="live", panel=result.panel, last_ok_at=int(now)))
                 else:
                     phase, detail = self.failed(tid, now)
@@ -1217,7 +1221,8 @@ def run_due(root, scheduler, store=None, now=None, drivers=None, home=None, envi
     now = time.time() if now is None else now
     records = [dict(p, intent=(store.get_tile(root, p["tile_id"]) or {}).get("intent")) for p in store.confirmed_producers(root)]
     present = store.phone_present(root, scheduler.idle_pause_s, now)
-    outcomes = scheduler.tick(root, records, now, present=present,
+    alerted = set(store.alerted_tiles(root, now)) if hasattr(store, "alerted_tiles") else set()
+    outcomes = scheduler.tick(root, records, now, present=present, alerted=alerted,
                               runner=lambda r: run_producer(root, r, drivers=drivers, home=home, now=now, environ=environ))
     for o in outcomes:
         tid = o["tile_id"]
