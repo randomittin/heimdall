@@ -2068,13 +2068,20 @@ class RelayClient:
     # -- read-only views (view-v1) --------------------------------------------------------------------------------
     # See READ-ONLY VIEWS in the module docstring. bin/lib/companion_view.py owns every rule; this is only its wire:
     # the sealed `view` command, the state.views slice, and the redaction profile it is run through.
+    def _relay_redactor(self):
+        """The relay's redaction profile (sentinels/hmd-ui.py _transport_redaction) as the one callable every companion slice --
+        state.views, state.dashboards, state.asks -- is run through before it is sealed, exactly as the rest of the state is: emails
+        scrubbed, absolute paths cut to their name, a path below the repo kept repo-relative. None only for the owner's own loopback,
+        which a relay session never is. A failure to establish the profile propagates: no slice is built unredacted by falling back."""
+        redact, strip_root = UI._transport_redaction(self.transport, self.root)
+        return (lambda obj: UI._redact_public(obj, strip_root)) if redact else None
+
     def _view_manager(self):
         """The one ViewManager of this client, created on first use. The relay's redaction profile is established here and
         a failure to establish it propagates: a view is never served unredacted."""
         if self._views is None:
-            redact, strip_root = UI._transport_redaction(self.transport, self.root)
             self._views = VIEW.ViewManager(self.root,
-                                           redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None,
+                                           redact=self._relay_redactor(),
                                            max_slice_bytes=MAX_ENVELOPE_BYTES * 3 // 8, on_change=self._rearm_state,
                                            state=self._latest_state)
         return self._views
@@ -2113,9 +2120,8 @@ class RelayClient:
         if DASH is None:
             return state
         try:
-            redact, strip_root = UI._transport_redaction(self.transport, self.root)
             return DASH.overlay(state, self.root, self.device_caps,
-                                redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None)
+                                redact=self._relay_redactor())
         except Exception as e:
             emit({"event": "error", "detail": "state.dashboards skipped: %s" % type(e).__name__})
             return {k: v for k, v in state.items() if k != "dashboards"}
@@ -2129,9 +2135,8 @@ class RelayClient:
         if ASK is None:
             return state
         try:
-            redact, strip_root = UI._transport_redaction(self.transport, self.root)
             return ASK.overlay(state, self.root, self.device_caps,
-                               redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None)
+                               redact=self._relay_redactor())
         except Exception as e:
             emit({"event": "error", "detail": "state.asks skipped: %s" % type(e).__name__})
             return {k: v for k, v in state.items() if k != "asks"}

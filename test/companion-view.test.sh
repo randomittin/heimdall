@@ -156,7 +156,10 @@ mutant accept-dot-git    bin/lib/companion_view.py 'if any(s in _DENIED_DIRS for
 mutant skip-symlink-check bin/lib/companion_view.py 'if os.path.realpath(candidate) != candidate:' 'if False:' paths
 mutant skip-max-bytes-cut bin/lib/companion_view.py '"max_bytes": max_bytes,' '"max_bytes": 10 ** 9,' size
 mutant skip-cap-check    bin/lib/companion_view.py $'        if not has_cap:\n            return False, "caps-missing", {}' $'        if False:\n            return False, "caps-missing", {}' wire
-mutant skip-redaction    bin/heimdall-relay-client 'redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None' 'redact=None' secrets
+# skip-redaction: _relay_redactor is the one place the relay's redaction profile becomes a callable, and state.views, state.dashboards
+# and state.asks all take theirs from it -- this one site is the whole rule. A second inline copy of that lambda would make the site
+# appear twice and the mutant unbuildable ("found 2 times, not once"): the alarm that the rule has been duplicated again.
+mutant skip-redaction    bin/heimdall-relay-client 'return (lambda obj: UI._redact_public(obj, strip_root)) if redact else None' 'return None' secrets
 mutant drop-turn-mask    bin/lib/companion_view.py $'    if P.secret_shaped(line[:limit + SCAN_MARGIN]):\n        return REDACTED' $'    if False:\n        return REDACTED' transcript,pr
 mutant scan-only-shown-text bin/lib/companion_view.py 'P.secret_shaped(line[:limit + SCAN_MARGIN])' 'P.secret_shaped(line[:limit - 1])' transcript
 mutant skip-tail         bin/lib/companion_view.py 'chosen = turns[-req["tail"]:]' 'chosen = turns' transcript
