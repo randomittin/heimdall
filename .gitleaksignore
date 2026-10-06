@@ -36,3 +36,5 @@ relay/contract/vectors.json:generic-api-key:7
 # benign — RFC 6455 section 1.3 published handshake example (sample nonce and its expected accept value) in the relay WebSocket client test; a public spec vector, no credential. File:rule:line form so a rebase cannot orphan it.
 test/lib/relay_ws_cases.py:generic-api-key:210
 test/lib/relay_ws_cases.py:generic-api-key:213
+# benign — RP4 false-green PREREG lock: the sha256 content hash of a frozen upstream test file whose path ends test_cache_keys.py; the rule reads "keys" + 64 hex as a credential. A file digest, no credential. File:rule:line form.
+evals/benchmark/false-green/PREREG.lock.json:generic-api-key:90
