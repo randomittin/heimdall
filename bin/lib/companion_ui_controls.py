@@ -167,7 +167,7 @@ ACTION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
 STOP_ID_RE = re.compile(r"s-[0-9a-f]{8}")
 REPO_ID_RE = re.compile(r"r-[0-9a-f]{4}")         # an allowlist id (companion_remote_switches.repo_id)
 TILE_ID_RE = re.compile(r"t-[0-9a-f]{8}")         # a dashboard tile id (bin/lib/companion_dashboards.py)
-AUDIT_OPS = frozenset(("create", "refine", "set-refresh", "refresh", "remove", "confirm", "decline", "expire", "run-failed",
+AUDIT_OPS = frozenset(("create", "refine", "set-refresh", "refresh", "remove", "set-digest", "confirm", "decline", "expire", "run-failed",
                        "idle-pause", "alert-set", "alert-clear", "alert-fired", "alert-refused"))             # the dashboards ops an audit line may name, requests and what the laptop did
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,39}")      # a registered action name: kebab-case
 DETAIL_RE = re.compile(r"[a-z0-9-]{1,40}")

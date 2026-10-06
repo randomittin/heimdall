@@ -855,7 +855,7 @@ w = World()
 rig = Rig(w, phone_caps=None)
 assert rig.client.device_caps == frozenset()
 assert rig.login() is None and "login" not in rig.last_frame["state"], "no cap, no state.login"
-assert rig.last_frame["caps"] == ["controls-v1", "dash-alert-v1", "dash-v1", "login-v1", "push-tile-alert-v1", "push-v1", "resync", "view-v1", "z-zlib"], "hmd advertises login-v1 (and controls-v1, push-v1, view-v1) in every state frame"
+assert rig.last_frame["caps"] == ["controls-v1", "dash-alert-v1", "dash-v1", "login-v1", "push-digest-v1", "push-tile-alert-v1", "push-v1", "resync", "view-v1", "z-zlib"], "hmd advertises login-v1 (and controls-v1, push-v1, view-v1) in every state frame"
 assert rig.cmd("login_start", {"kind": "claudeai"}) == {"ok": False, "of_seq": rig.ack()["of_seq"], "detail": "caps-missing"}
 assert rig.cmd("login_code", {"id": "l-00000000", "code": w.full})["detail"] == "caps-missing"
 assert rig.cmd("login_cancel", {"id": "l-00000000"})["detail"] == "caps-missing"
@@ -1050,12 +1050,12 @@ assert E2E.hmd_caps(extra=[E2E.CAP_LOGIN], push=False) == ["login-v1", "resync",
 assert E2E.hmd_caps(extra=("login-v1", "login-v1", 7, None, "", "x" * 33), push=False) == ["login-v1", "resync", "z-zlib"], "junk tokens and duplicates are dropped"
 assert E2E.hmd_caps(extra=None, push=False) == ["resync", "z-zlib"]
 rig.login()
-assert rig.last_frame["caps"] == ["controls-v1", "dash-alert-v1", "dash-v1", "login-v1", "push-tile-alert-v1", "push-v1", "resync", "view-v1", "z-zlib"], rig.last_frame["caps"]
+assert rig.last_frame["caps"] == ["controls-v1", "dash-alert-v1", "dash-v1", "login-v1", "push-digest-v1", "push-tile-alert-v1", "push-v1", "resync", "view-v1", "z-zlib"], rig.last_frame["caps"]
 rig.mod.LOGIN = None  # the feature module failed to import
 rig.client._rearm_state()
 rig.client._tick_once()
 frame = json.loads(rig.E2E.unpack_plaintext(rig.plaintext([p for p in rig.posts if p["type"] == "state"][-1])))
-assert frame["caps"] == ["controls-v1", "dash-alert-v1", "dash-v1", "push-tile-alert-v1", "push-v1", "resync", "view-v1", "z-zlib"], "no module, no cap (and the controls', the push store's and the view channel's own caps are untouched)"
+assert frame["caps"] == ["controls-v1", "dash-alert-v1", "dash-v1", "push-digest-v1", "push-tile-alert-v1", "push-v1", "resync", "view-v1", "z-zlib"], "no module, no cap (and the controls', the push store's and the view channel's own caps are untouched)"
 rig.resync(["login-v1"])
 assert rig.cmd("login_start", {"kind": "claudeai"})["detail"] == "not-implemented"
 assert rig.cmd("login_code", {"id": "l-00000000", "code": "x"})["detail"] == "not-implemented"
