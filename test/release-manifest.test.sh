@@ -45,6 +45,7 @@ make_fake_plugin() {  # $1 = dest dir, $2 = sync script to install as release/sy
   printf '{"redirects":[{"source":"/install","destination":"%s/%s/install.sh","permanent":true}]}\n' "$RAW" "$OLD_TAG" > "$d/vercel.json"
   printf '/install  %s/%s/install.sh  301\n' "$RAW" "$OLD_TAG" > "$d/_redirects"
   printf '# Heimdall\n\nInstall: %s/%s/install.sh\n' "$RAW" "$OLD_TAG" > "$d/README.md"
+  # shellcheck disable=SC2016 # the single-quoted $DEFAULT_REF is script text written into install.sh, not an expansion
   printf '#!/usr/bin/env bash\ninstall() {\n  local DEFAULT_REF="%s"\n  echo "$DEFAULT_REF"\n}\n' "$OLD_TAG" > "$d/install.sh"
   printf '{"version":"0.0.1","heimdall":{"tag":"%s","installScriptUrl":"%s/%s/install.sh","sha256":"%s"}}\n' "$OLD_TAG" "$RAW" "$OLD_TAG" "$OLD_SHA" > "$d/packages/runheimdall/package.json"
   printf '{"version":"0.0.1","heimdall":{"tag":"%s","installScriptUrl":"%s/%s/install.sh","sha256":"%s","defaultCommand":"attack"}}\n' "$OLD_TAG" "$RAW" "$OLD_TAG" "$OLD_SHA" > "$d/packages/runhmd/package.json"
@@ -62,28 +63,41 @@ P1="$WORK/p1"; make_fake_plugin "$P1" "$SYNC_SRC"
 OUT1="$WORK/out1/release-manifest.json"
 if RELEASE_MANIFEST_OUT="$OUT1" run_sync "$P1" "$NEW_TAG" >"$WORK/run1.log"; then ok "sync-release.sh $NEW_TAG exits 0 in a fake plugin repo"; else bad "sync-release.sh $NEW_TAG failed: $(tail -3 "$WORK/run1.log")"; fi
 if [ -f "$OUT1" ]; then ok "release-manifest.json written to RELEASE_MANIFEST_OUT"; else bad "no manifest at $OUT1"; fi
-[ "$(jq -c 'keys_unsorted' "$OUT1" 2>/dev/null)" = '["tag","install_sha256","install_url","minisig_url"]' ] \
-  && ok "keys are exactly tag, install_sha256, install_url, minisig_url, in that order" || bad "key set/order wrong: $(jq -c 'keys_unsorted' "$OUT1" 2>/dev/null)"
-jq -e --arg t "$NEW_TAG" --arg raw "$RAW" \
+if [ "$(jq -c 'keys_unsorted' "$OUT1" 2>/dev/null)" = '["tag","install_sha256","install_url","minisig_url"]' ]; then
+  ok "keys are exactly tag, install_sha256, install_url, minisig_url, in that order"
+else
+  bad "key set/order wrong: $(jq -c 'keys_unsorted' "$OUT1" 2>/dev/null)"
+fi
+if jq -e --arg t "$NEW_TAG" --arg raw "$RAW" \
    '.tag==$t and .install_url==($raw+"/"+$t+"/install.sh") and .minisig_url==("https://github.com/randomittin/heimdall/releases/download/"+$t+"/install.sh.minisig") and (.install_sha256|test("^[0-9a-f]{64}$"))' \
-   "$OUT1" >/dev/null 2>&1 && ok "tag, install_url, minisig_url and a 64-hex install_sha256 for $NEW_TAG" || bad "manifest fields do not describe $NEW_TAG"
+   "$OUT1" >/dev/null 2>&1; then
+  ok "tag, install_url, minisig_url and a 64-hex install_sha256 for $NEW_TAG"
+else
+  bad "manifest fields do not describe $NEW_TAG"
+fi
 TAG_BYTES_SHA="$(shasum -a 256 "$P1/install.sh" | awk '{print $1}')"
-[ "$(jq -r '.install_sha256' "$OUT1" 2>/dev/null)" = "$TAG_BYTES_SHA" ] \
-  && ok "install_sha256 == sha256 of the templated install.sh the tag will hold" || bad "install_sha256 is not the digest of the tag's install.sh"
-[ "$(jq -r '.install_sha256' "$OUT1" 2>/dev/null)" = "$(jq -r '.heimdall.sha256' "$P1/packages/runhmd/package.json")" ] \
-  && ok "install_sha256 == the digest the npx wrapper bakes in" || bad "manifest digest disagrees with the wrapper's"
+if [ "$(jq -r '.install_sha256' "$OUT1" 2>/dev/null)" = "$TAG_BYTES_SHA" ]; then
+  ok "install_sha256 == sha256 of the templated install.sh the tag will hold"
+else
+  bad "install_sha256 is not the digest of the tag's install.sh"
+fi
+if [ "$(jq -r '.install_sha256' "$OUT1" 2>/dev/null)" = "$(jq -r '.heimdall.sha256' "$P1/packages/runhmd/package.json")" ]; then
+  ok "install_sha256 == the digest the npx wrapper bakes in"
+else
+  bad "manifest digest disagrees with the wrapper's"
+fi
 
 # ── 3. --dry writes nothing ──
 P2="$WORK/p2"; make_fake_plugin "$P2" "$SYNC_SRC"
 OUT2="$WORK/out2/release-manifest.json"
 RELEASE_MANIFEST_OUT="$OUT2" run_sync "$P2" "$NEW_TAG" --dry >"$WORK/run2.log"
-[ ! -e "$OUT2" ] && ok "--dry writes no manifest" || bad "--dry wrote $OUT2"
-grep -q 'would write' "$WORK/run2.log" && ok "--dry says it would write the manifest" || bad "--dry did not mention the manifest"
+if [ ! -e "$OUT2" ]; then ok "--dry writes no manifest"; else bad "--dry wrote $OUT2"; fi
+if grep -q 'would write' "$WORK/run2.log"; then ok "--dry says it would write the manifest"; else bad "--dry did not mention the manifest"; fi
 
 # ── 4. the default path is the ignored build-output dir ──
 P3="$WORK/p3"; make_fake_plugin "$P3" "$SYNC_SRC"
 run_sync "$P3" "$NEW_TAG" >/dev/null
-[ -f "$P3/.heimdall/release/release-manifest.json" ] && ok "default output is .heimdall/release/release-manifest.json" || bad "no manifest at the default path"
+if [ -f "$P3/.heimdall/release/release-manifest.json" ]; then ok "default output is .heimdall/release/release-manifest.json"; else bad "no manifest at the default path"; fi
 
 # ── 5. mutants of the script: each must be caught by sync-release.sh's own assertion or by this suite ──
 mutant_dies() {  # <label> <sed-expr>
@@ -96,18 +110,20 @@ mutant_dies() {  # <label> <sed-expr>
     ok "mutant caught: $label"
   fi
 }
+# shellcheck disable=SC2016 # the sed expression is literal source text to mutate, not an expansion
 mutant_dies "manifest digest wrong" 's|--arg sha "\$NEW_SHA" --arg url "\$INSTALL_URL" --arg sig|--arg sha "0000000000000000000000000000000000000000000000000000000000000001" --arg url "$INSTALL_URL" --arg sig|'
+# shellcheck disable=SC2016 # the sed expression is literal source text to mutate, not an expansion
 mutant_dies "manifest tag without the leading v" 's|jq -n --arg tag "\$TAG"|jq -n --arg tag "$VERSION"|'
 
 DM="$WORK/m-nostep"; MSRC="$WORK/m-nostep.sh"
 awk '/^# ── 9\. release-manifest.json/{skip=1} skip&&/^fi$/{skip=0; next} !skip{print}' "$SYNC_SRC" > "$MSRC"
 make_fake_plugin "$DM" "$MSRC"
 RELEASE_MANIFEST_OUT="$DM/out.json" run_sync "$DM" "$NEW_TAG" >/dev/null
-[ ! -f "$DM/out.json" ] && ok "mutant caught: with the manifest step deleted no file appears, and the assertions above would fail" || bad "the step-deleted mutant still produced a manifest (the cases above are vacuous)"
+if [ ! -f "$DM/out.json" ]; then ok "mutant caught: with the manifest step deleted no file appears, and the assertions above would fail"; else bad "the step-deleted mutant still produced a manifest (the cases above are vacuous)"; fi
 
 # ── the human path is wired ──
-grep -q 'release-manifest.json' "$REPO/release/ship.sh" && ok "release/ship.sh attaches release-manifest.json to the Release" || bad "release/ship.sh never mentions release-manifest.json"
-grep -q 'release-manifest.json' "$REPO/release/publish-checklist.md" && ok "release/publish-checklist.md names the manifest asset" || bad "publish-checklist.md never mentions release-manifest.json"
+if grep -q 'release-manifest.json' "$REPO/release/ship.sh"; then ok "release/ship.sh attaches release-manifest.json to the Release"; else bad "release/ship.sh never mentions release-manifest.json"; fi
+if grep -q 'release-manifest.json' "$REPO/release/publish-checklist.md"; then ok "release/publish-checklist.md names the manifest asset"; else bad "publish-checklist.md never mentions release-manifest.json"; fi
 
 echo ""
 echo "release-manifest.test.sh: $PASS passed, $FAIL failed."

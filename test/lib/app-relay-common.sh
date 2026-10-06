@@ -67,7 +67,7 @@ mkdir -p "$HOME/.claude"
 # changes nothing (no second resolve, no second wrapper). Run standalone, it does the same pin itself: one
 # resolve, a wrapper under $TMPROOT (removed by cleanup below) first on PATH. The how and the why live in
 # test/lib/py-pin.sh; HMD_TEST_NO_PY_PIN=1 opts out of both.
-# shellcheck source=py-pin.sh
+# shellcheck source=py-pin.sh disable=SC1091  # plain shellcheck (no -x) never opens sourced files
 . "$PY_PIN_LIB"
 hmd_test_pin_python3 "$TMPROOT/pybin"
 
@@ -113,8 +113,8 @@ wait_for_count() {
   local file="$1" n="$2" re="${3:-.}" secs="${4:-10}" i=0 max c
   max=$(( secs * 10 ))
   while [ "$i" -lt "$max" ]; do
-    c="$(grep -E "$re" "$file" 2>/dev/null | wc -l | tr -d ' ')"
-    [ "$c" -ge "$n" ] && return 0
+    c="$(grep -cE "$re" "$file" 2>/dev/null || true)"   # "0" on no match (grep exits 1); empty while FILE does not exist yet
+    [ "${c:-0}" -ge "$n" ] && return 0
     sleep 0.1; i=$((i + 1))
   done
   return 1
@@ -147,7 +147,9 @@ wait_for_quiescent_count() {
 }
 
 count_matching() {
-  grep -E "$2" "$1" 2>/dev/null | wc -l | tr -d ' '
+  local c
+  c="$(grep -cE "$2" "$1" 2>/dev/null || true)"   # empty (not "0") while FILE does not exist: report 0 either way
+  printf '%s\n' "${c:-0}"
 }
 
 wait_pid_exit() {

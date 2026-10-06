@@ -67,12 +67,13 @@ bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 EXT="$(mktemp -d -t "clone-join.XXXXXX")"
 export HEIMDALL_HOME="$EXT/home"
 mkdir -p "$HEIMDALL_HOME"
+# shellcheck disable=SC2329 # invoked by `trap cleanup EXIT` below; ShellCheck loses that use once the script ends in a top-level exit
 cleanup() { rm -rf "$EXT"; }
 trap cleanup EXIT
 
 # HERMETIC against the operator's team off switch (HMD_TEAM_NO_COMMIT / $HOME/.heimdall/no-team-commit):
 # on a box that has it on, `share` never commits, so S1/S2/B go red for a reason that is not the code.
-# shellcheck source=lib/hermetic-team-env.sh
+# shellcheck source=lib/hermetic-team-env.sh disable=SC1091  # plain shellcheck (no -x) never opens sourced files
 . "$SELF_DIR/lib/hermetic-team-env.sh"; hermetic_team_env "$EXT" || exit 2
 
 PROJECT="acme/private-widget"
@@ -214,9 +215,11 @@ fi
 
 # ── A. NEGATIVE CONTROL — before the session starts, the teammate is NOT on the roster.
 A_ABSENT="False"; roster_has "$FAKE_SECRET" "$TEAMMATE_HAID" || A_ABSENT="True"
-[ "$A_ABSENT" = "True" ] \
-  && ok "A the teammate is ABSENT from the owner's roster before their first session (no pre-seed)" \
-  || bad "A the teammate was already on the roster before their session — the proof would be vacuous"
+if [ "$A_ABSENT" = "True" ]; then
+  ok "A the teammate is ABSENT from the owner's roster before their first session (no pre-seed)"
+else
+  bad "A the teammate was already on the roster before their session — the proof would be vacuous"
+fi
 
 # ── B. PRIMARY (RED-without-fix) — starting a session in the clone (the REAL SessionStart
 #      hook) beats automatically → the teammate lands on the owner's roster. ──
@@ -239,9 +242,11 @@ fi
 # ── C. ISOLATION — the beat lands ONLY in the owner's team, never cross-tenant. ──
 C_ABSENT="False"; roster_has "$OTHER_SECRET" "$TEAMMATE_HAID" || C_ABSENT="True"
 C="$(read_roster "$OTHER_SECRET")"
-[ "$C_ABSENT" = "True" ] \
-  && ok "C a DIFFERENT team secret sees NONE of the teammate's beat (multi-tenant isolation holds — out=$C)" \
-  || bad "C the clone-join beat leaked across teams (a different secret saw the teammate) — out=$C"
+if [ "$C_ABSENT" = "True" ]; then
+  ok "C a DIFFERENT team secret sees NONE of the teammate's beat (multi-tenant isolation holds — out=$C)"
+else
+  bad "C the clone-join beat leaked across teams (a different secret saw the teammate) — out=$C"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════════
 # F. SECURITY FAIL-SAFE — a PUBLIC repo must NOT commit team.json, so a clone of it

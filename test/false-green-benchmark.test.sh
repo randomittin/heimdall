@@ -148,6 +148,7 @@ BEFORE="$(git -C "$REPO" status --porcelain -- "$REL" 2>/dev/null)"
 check "reproduce.sh --dry-run exits 0"                               bash "$REPRO" --dry-run --out "$TMP/never"
 bash "$REPRO" --dry-run --out "$TMP/never" >"$TMP/dry.out" 2>&1
 if grep -Eq 'tasks:[[:space:]]+[0-9]+ ' "$TMP/dry.out" && grep -Eq 'candidates:[[:space:]]+[0-9]+ to judge' "$TMP/dry.out"; then ok "the dry run prints the planned task and candidate counts"; else bad "the dry run prints the planned task and candidate counts"; fi
+# shellcheck disable=SC2016 # the single-quoted grep regex is literal input (\$ escapes the dollar sign), not an expansion
 check "the dry run states a cost of \$0.00 and 'nothing executed'"   grep -Eq 'cost:[[:space:]]+\$0\.00.*|nothing executed' "$TMP/dry.out"
 check "the dry run created no output directory"                      test ! -e "$TMP/never"
 check "the dry run touched nothing in the suite"                     test "$BEFORE" = "$(git -C "$REPO" status --porcelain -- "$REL" 2>/dev/null)"
@@ -213,7 +214,7 @@ echo "[D] data: the committed summary and rows are consistent with the freeze"
 if [ -s "$SUITE/results/judge-calibration.jsonl" ]; then
   check "committed results.json is exactly the summary of the committed raw rows" bash -c "python3 '$SUMMARY' --in '$SUITE/results' | cmp -s - '$SUITE/results.json'"
   check "re-summarizing the committed rows twice is byte-identical"             bash -c "[ \"\$(python3 '$SUMMARY' --in '$SUITE/results' | shasum)\" = \"\$(python3 '$SUMMARY' --in '$SUITE/results' | shasum)\" ]"
-  python3 - "$SUITE" >"$TMP/data.check" 2>&1 <<'PY'
+  if python3 - "$SUITE" >"$TMP/data.check" 2>&1 <<'PY'
 import json, sys
 suite = sys.argv[1]
 cases = json.load(open(suite + "/cases.json"))
@@ -234,7 +235,11 @@ if env.get("tree_dirty") is not False:
 print("\n".join(problems) or "ok")
 sys.exit(1 if problems else 0)
 PY
-  if [ $? -eq 0 ]; then ok "every included candidate was judged exactly once, on the frozen sources, from a clean tree"; else bad "raw data vs freeze: $(cat "$TMP/data.check")"; fi
+  then
+    ok "every included candidate was judged exactly once, on the frozen sources, from a clean tree"
+  else
+    bad "raw data vs freeze: $(cat "$TMP/data.check")"
+  fi
   jqok "the committed summary says what it measured and what it did not" "$SUITE/results.json" '.judge_calibration.headline | test("NOT an agent false-green rate")'
   jqok "the committed summary has the RP4 keys"                       "$SUITE/results.json" 'has("false_green_rate_by_agent") and has("catch_rate") and has("denial_precision") and (.kill_flags|has("false_green_lt_10pct") and has("catch_lt_50pct")) and has("headline")'
 else

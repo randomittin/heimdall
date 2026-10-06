@@ -133,16 +133,16 @@ FOLLOWUP_PROMPT="Add a /api/todos/{id} GET endpoint that returns one todo (404 o
 
 usage() {
   cat <<EOF
-$(printf "${P}${B}")heimdall-demo$(printf "${R}") — scaffold a real full-stack demo task and watch heimdall build it
+$(printf '%b%b' "$P" "$B")heimdall-demo$(printf '%b' "$R") — scaffold a real full-stack demo task and watch heimdall build it
 
-$(printf "${B}")USAGE$(printf "${R}")
+$(printf '%b' "$B")USAGE$(printf '%b' "$R")
   heimdall-demo [dir] [--dry|--run] [--force]
   heimdall-demo --offline [--json]
 
-$(printf "${B}")ARGUMENTS$(printf "${R}")
+$(printf '%b' "$B")ARGUMENTS$(printf '%b' "$R")
   dir            Target project directory (default: ./heimdall-demo-app)
 
-$(printf "${B}")FLAGS$(printf "${R}")
+$(printf '%b' "$B")FLAGS$(printf '%b' "$R")
   --offline      A different demo: an agent writes a bug, \`hmd attack\` DENIES it, the agent
                  fixes it, \`hmd attack\` PROVES it - told by the real attack engine on a bundled
                  fixture pair. No network, no model, nothing written outside a temp dir. It takes
@@ -160,26 +160,26 @@ $(printf "${B}")FLAGS$(printf "${R}")
                  but for a single invocation).
   -h, --help     Show this help.
 
-$(printf "${B}")FIRST-RUN NARRATED ARC$(printf "${R}")
+$(printf '%b' "$B")FIRST-RUN NARRATED ARC$(printf '%b' "$R")
   The very first \`hmd demo\` on a real terminal opens with the watchman wake-up
   (sleep → blink → open → scan → settle) and a narrated build that stages a REAL
   gate catching a REAL planted credential (deny → fix → pass). Shown once, gated
   by \`~/.heimdall/first-run\`. Skip it: press any key, pipe stdout to a file, set
   \`HEIMDALL_NO_INTRO=1\`, or pass \`--no-intro\`. Replay it with \`--intro\`.
 
-$(printf "${B}")PREREQUISITES$(printf "${R}")
+$(printf '%b' "$B")PREREQUISITES$(printf '%b' "$R")
   Dry mode (default): bash + coreutils only — runs on any fresh machine.
   --run mode:         additionally needs \`heimdall\` (and Claude Code) on PATH.
   The scaffolded task itself builds with: python3, pip, pytest (installed by
   the task's own requirements.txt). The optional reel uses asciinema + agg if
   present, and degrades gracefully to a text endframe if they are not.
 
-$(printf "${B}")WHAT IT DOES$(printf "${R}")
+$(printf '%b' "$B")WHAT IT DOES$(printf '%b' "$R")
   Writes a fully-specified canned task (a Todo REST API + single-page frontend
   + tests + README) to <dir>/$TASK_FILE and a ready-to-run plan seed to
   <dir>/$PLAN_FILE, then prints the exact command to run it.
 
-$(printf "${B}")EXAMPLES$(printf "${R}")
+$(printf '%b' "$B")EXAMPLES$(printf '%b' "$R")
   heimdall-demo                     # scaffold ./heimdall-demo-app (safe, dry)
   heimdall-demo /tmp/demo           # custom dir
   heimdall-demo --run               # scaffold and launch heimdall
@@ -199,15 +199,15 @@ for arg in "$@"; do
     --intro)    INTRO_FORCE="on" ;;
     --no-intro) INTRO_FORCE="off" ;;
     -*)
-      printf "  ${P}✘${R} Unknown flag: ${B}%s${R}\n" "$arg" >&2
-      printf "  ${D}Run ${C}heimdall-demo --help${D} for usage.${R}\n" >&2
+      printf "  %b✘%b Unknown flag: %b%s%b\n" "$P" "$R" "$B" "$arg" "$R" >&2
+      printf "  %bRun %bheimdall-demo --help%b for usage.%b\n" "$D" "$C" "$D" "$R" >&2
       exit 2
       ;;
     *)
       if [ -z "$TARGET_DIR" ]; then
         TARGET_DIR="$arg"
       else
-        printf "  ${P}✘${R} Unexpected extra argument: ${B}%s${R}\n" "$arg" >&2
+        printf "  %b✘%b Unexpected extra argument: %b%s%b\n" "$P" "$R" "$B" "$arg" "$R" >&2
         exit 2
       fi
       ;;
@@ -283,22 +283,21 @@ paint_face() { # emotion  [fresh]
 # the rest. Reads as the watchman waking and looking around before the build.
 narrate_wakeup() {
   printf "\n"
-  printf "  ${D}the watchman wakes…${R}  ${D}(press any key to skip)${R}\n\n"
+  printf "  %bthe watchman wakes…%b  %b(press any key to skip)%b\n\n" "$D" "$R" "$D" "$R"
   # sleep → blink → open(idle) → scan(thinking) → settle(idle)
-  local frames="sleep blink idle thinking idle"
-  local holds="0.55 0.30 0.50 0.55 0.45"
-  local first="fresh" i=1 emo hold
-  for emo in $frames; do
-    hold="$(printf '%s\n' $holds | sed -n "${i}p")"
+  local frames=(sleep blink idle thinking idle)
+  local holds=(0.55 0.30 0.50 0.55 0.45)
+  local first="fresh" i=0 emo
+  for emo in "${frames[@]}"; do
     paint_face "$emo" "$first"
     first=""
-    if ! hold_or_skip "$hold"; then
+    if ! hold_or_skip "${holds[i]}"; then
       paint_face "idle"          # skipped → settle on idle immediately
       break
     fi
     i=$((i+1))
   done
-  printf "  ${C}▸${R} ${B}awake.${R} ${D}watching your build.${R}\n"
+  printf "  %b▸%b %bawake.%b %bwatching your build.%b\n" "$C" "$R" "$B" "$R" "$D" "$R"
 }
 
 # Drive the live face for a labelled beat (B3 state→face): repaint the face over
@@ -306,7 +305,7 @@ narrate_wakeup() {
 face_beat() { # emotion  caption  [fresh]
   local emotion="$1" caption="$2" fresh="${3:-}"
   paint_face "$emotion" "$fresh"
-  printf "  ${D}%s${R}\n" "$caption"
+  printf "  %b%s%b\n" "$D" "$caption" "$R"
 }
 
 # B2 — the narrated demo proper, WITH the mandatory real staged failure.
@@ -354,11 +353,11 @@ SUM
 SUM
 
   printf "\n"
-  printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-  printf "  ${B}The task heimdall will build:${R}\n"
-  printf "  ${D}A Todo REST API (FastAPI) + single-page frontend + pytest + README.${R}\n"
-  printf "  ${D}Five real endpoints · runnable acceptance criteria · ~5 files.${R}\n"
-  printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n\n"
+  printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
+  printf "  %bThe task heimdall will build:%b\n" "$B" "$R"
+  printf "  %bA Todo REST API (FastAPI) + single-page frontend + pytest + README.%b\n" "$D" "$R"
+  printf "  %bFive real endpoints · runnable acceptance criteria · ~5 files.%b\n" "$D" "$R"
+  printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n\n" "$V" "$R"
 
   # A throwaway git repo so secret-scan has a real staged diff to inspect.
   ( cd "$city_dir" && git init -q && git config user.email demo@heimdall.local \
@@ -387,7 +386,7 @@ EOF
 
   # ── Beat 1: planning (idle) ──
   write_state "planning" "survey plots" 4 0
-  printf "  ${C}▸${R} ${B}planning${R} ${D}— surveying the plots…${R}\n\n"
+  printf "  %b▸%b %bplanning%b %b— surveying the plots…%b\n\n" "$C" "$R" "$B" "$R" "$D" "$R"
   face_beat "idle" "idle · reading the spec, plotting the waves" "fresh"
   tlm phase --run-id "$RUN_ID" --home "$TLM_HOME" --phase planning --outcome succeeded
   hold_or_skip 0.7 || true
@@ -395,7 +394,7 @@ EOF
 
   # ── Beat 2: building (thinking) — cranes swing, buildings rise per wave ──
   write_state "wave executing" "app.py" 4 2
-  printf "\n  ${C}▸${R} ${B}building${R} ${D}— waves 1 + 2: backend, frontend, tests rise…${R}\n\n"
+  printf "\n  %b▸%b %bbuilding%b %b— waves 1 + 2: backend, frontend, tests rise…%b\n\n" "$C" "$R" "$B" "$R" "$D" "$R"
   face_beat "thinking" "thinking · cranes up, towers rising per wave" "fresh"
   tlm phase --run-id "$RUN_ID" --home "$TLM_HOME" --phase waves --outcome started
   hold_or_skip 0.8 || true
@@ -403,7 +402,7 @@ EOF
 
   # ── Beat 3: the gate inspects (suspicious) — the watchman scans the diff ──
   write_state "secret-scan gate running" "secret-scan" 4 3
-  printf "\n  ${C}▸${R} ${B}gate-inspector${R} ${D}— secret-scan over the staged diff…${R}\n\n"
+  printf "\n  %b▸%b %bgate-inspector%b %b— secret-scan over the staged diff…%b\n\n" "$C" "$R" "$B" "$R" "$D" "$R"
   face_beat "suspicious" "suspicious · inspecting every staged byte" "fresh"
   hold_or_skip 0.8 || true
 
@@ -457,10 +456,10 @@ EOF
   if [ "$scan_rc" -eq 0 ]; then
     # gitleaks absent (soft-degrade) → the gate could not run for real. Be honest:
     # we will NOT fake a failure. Tell the user the gate was unarmed and continue.
-    printf "\n  ${W}⚠${R} ${B}secret-scan could not run for real${R} ${D}(gitleaks not installed).${R}\n"
-    printf "  ${D}The staged-failure demo needs a live scanner. Install it to see the catch:${R}\n"
-    printf "  ${C}brew install gitleaks${R}\n"
-    printf "  ${D}Continuing to the build summary without a faked failure.${R}\n"
+    printf "\n  %b⚠%b %bsecret-scan could not run for real%b %b(gitleaks not installed).%b\n" "$W" "$R" "$B" "$R" "$D" "$R"
+    printf "  %bThe staged-failure demo needs a live scanner. Install it to see the catch:%b\n" "$D" "$R"
+    printf "  %bbrew install gitleaks%b\n" "$C" "$R"
+    printf "  %bContinuing to the build summary without a faked failure.%b\n" "$D" "$R"
   else
     # ── REAL CATCH → write a real gate report.json (H-1 contract) so the stamp
     #    and city name exactly WHAT was caught and WHERE, derived from the gate. ──
@@ -510,11 +509,11 @@ EOF
       "$STAMP_BIN" --report "$report" --branch "heimdall/blocked-secret" \
         --explain "$file:$line" --format full 2>/dev/null || true
     fi
-    printf "  ${RED}${B}caught:${R} ${B}%s${R} ${D}in${R} ${B}%s${R}${D}:${R}${B}%s${R} ${D}— a real gate, a real defect.${R}\n" \
-      "$rule" "$file" "$line"
+    printf "  %b%bcaught:%b %b%s%b %bin%b %b%s%b%b:%b%b%s%b %b— a real gate, a real defect.%b\n" \
+      "$RED" "$B" "$R" "$B" "$rule" "$R" "$D" "$R" "$B" "$file" "$R" "$D" "$R" "$B" "$line" "$R" "$D" "$R"
 
     # ── THE FIX WAVE — remove the credential, re-stage, re-run the SAME gate ──
-    printf "\n  ${C}▸${R} ${B}fix wave${R} ${D}— load the key from the environment, re-stage…${R}\n\n"
+    printf "\n  %b▸%b %bfix wave%b %b— load the key from the environment, re-stage…%b\n\n" "$C" "$R" "$B" "$R" "$D" "$R"
     # The fix phase that sits BETWEEN blocked and passed in the recorded arc (§4).
     tlm phase --run-id "$RUN_ID" --home "$TLM_HOME" --phase fix-wave --outcome started
     cat > "$city_dir/config.py" <<'FIXED'
@@ -591,30 +590,30 @@ EOF
       printf "\n"
       face_beat "passed" "gate ✓ · sparkle — passed the watchman" "fresh"
       show_city
-      printf "  ${G}${B}PASS${R} ${D}— secret-scan re-checked the fixed wave: clean. Bifröst open.${R}\n"
+      printf "  %b%bPASS%b %b— secret-scan re-checked the fixed wave: clean. Bifröst open.%b\n" "$G" "$B" "$R" "$D" "$R"
     else
       # The fixed wave should clear; if the local scanner still objects, do NOT
       # fake a pass — surface the real verdict.
-      printf "\n  ${W}⚠${R} ${B}secret-scan still flags the fixed wave${R} ${D}(exit %s):${R}\n" "$refix_rc"
+      printf "\n  %b⚠%b %bsecret-scan still flags the fixed wave%b %b(exit %s):%b\n" "$W" "$R" "$B" "$R" "$D" "$refix_rc" "$R"
       printf '%s\n' "$scan_out" | sed 's/^/    /'
     fi
   fi
 
   # ── The run summary card (real data: STATE.md + the gate report we wrote) ──
-  printf "\n  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-  printf "  ${C}${B}RUN COMPLETE${R} ${D}— the receipts${R}\n"
-  printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
+  printf "\n  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
+  printf "  %b%bRUN COMPLETE%b %b— the receipts%b\n" "$C" "$B" "$R" "$D" "$R"
+  printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
   if [ -x "$CARD_BIN" ]; then
     "$CARD_BIN" "$city_dir" 2>/dev/null || true
   fi
-  printf "\n  ${B}The catch:${R} ${D}one wave shipped a credential; secret-scan barred it,${R}\n"
-  printf "  ${D}the fix wave loaded it from the environment, the gate re-passed.${R}\n"
-  printf "  ${D}That deny → fix → pass is what a green-only demo can never show.${R}\n"
+  printf "\n  %bThe catch:%b %bone wave shipped a credential; secret-scan barred it,%b\n" "$B" "$R" "$D" "$R"
+  printf "  %bthe fix wave loaded it from the environment, the gate re-passed.%b\n" "$D" "$R"
+  printf "  %bThat deny → fix → pass is what a green-only demo can never show.%b\n" "$D" "$R"
 
   # Settle the watchman (B3 end state).
   printf "\n"
   paint_face "idle" "fresh"
-  printf "  ${C}▸${R} ${D}the watchman settles. ready for your build.${R}\n"
+  printf "  %b▸%b %bthe watchman settles. ready for your build.%b\n" "$C" "$R" "$D" "$R"
 
   # Clean up the throwaway stage — leaves nothing behind.
   rm -rf "$stage" 2>/dev/null || true
@@ -625,29 +624,29 @@ if should_narrate; then
   narrate_wakeup
   narrate_demo
   mark_first_run_done
-  printf "\n  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-  printf "  ${B}That was the tour.${R} ${D}Now scaffold a real project to build for yourself:${R}\n"
-  printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
+  printf "\n  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
+  printf "  %bThat was the tour.%b %bNow scaffold a real project to build for yourself:%b\n" "$B" "$R" "$D" "$R"
+  printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
 fi
 
 # ── Banner ──
 
 printf "\n"
-printf "  ${P}${B}░▒▓█${R} ${C}${B}H E I M D A L L   D E M O${R} ${P}${B}█▓▒░${R}\n"
-printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-printf "  ${D}One command → watch heimdall build a real full-stack app.${R}\n"
+printf "  %b%b░▒▓█%b %b%bH E I M D A L L   D E M O%b %b%b█▓▒░%b\n" "$P" "$B" "$R" "$C" "$B" "$R" "$P" "$B" "$R"
+printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
+printf "  %bOne command → watch heimdall build a real full-stack app.%b\n" "$D" "$R"
 printf "\n"
 
 # ── Idempotency guard ──
 
 if [ -e "$TARGET_DIR" ]; then
   if [ "$FORCE" != true ]; then
-    printf "  ${W}⚠${R} Target already exists: ${B}%s${R}\n" "$TARGET_DIR"
-    printf "  ${D}Re-run with ${C}--force${D} to overwrite, or pick another dir:${R}\n"
-    printf "  ${C}heimdall-demo %s --force${R}\n\n" "$TARGET_DIR"
+    printf "  %b⚠%b Target already exists: %b%s%b\n" "$W" "$R" "$B" "$TARGET_DIR" "$R"
+    printf "  %bRe-run with %b--force%b to overwrite, or pick another dir:%b\n" "$D" "$C" "$D" "$R"
+    printf "  %bheimdall-demo %s --force%b\n\n" "$C" "$TARGET_DIR" "$R"
     exit 1
   fi
-  printf "  ${W}⚠${R} Overwriting existing ${B}%s${R} ${D}(--force)${R}\n" "$TARGET_DIR"
+  printf "  %b⚠%b Overwriting existing %b%s%b %b(--force)%b\n" "$W" "$R" "$B" "$TARGET_DIR" "$R" "$D" "$R"
   rm -rf "${TARGET_DIR:?}/$TASK_FILE" "${TARGET_DIR:?}/${PLAN_FILE}"
 fi
 
@@ -744,16 +743,16 @@ PLAN
 
 # ── Output ──
 
-printf "  ${G}✔${R} Scaffolded demo project\n"
-printf "    ${D}dir   ${R}${C}%s${R}\n" "$ABS_DIR"
-printf "    ${D}task  ${R}%s\n" "$TASK_FILE"
-printf "    ${D}plan  ${R}%s\n" "$PLAN_FILE"
+printf "  %b✔%b Scaffolded demo project\n" "$G" "$R"
+printf "    %bdir   %b%b%s%b\n" "$D" "$R" "$C" "$ABS_DIR" "$R"
+printf "    %btask  %b%s\n" "$D" "$R" "$TASK_FILE"
+printf "    %bplan  %b%s\n" "$D" "$R" "$PLAN_FILE"
 printf "\n"
-printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-printf "  ${B}The task heimdall will build:${R}\n"
-printf "  ${D}A Todo REST API (FastAPI) + single-page frontend + pytest + README.${R}\n"
-printf "  ${D}Five real endpoints, runnable acceptance criteria, ~5 files.${R}\n"
-printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
+printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
+printf "  %bThe task heimdall will build:%b\n" "$B" "$R"
+printf "  %bA Todo REST API (FastAPI) + single-page frontend + pytest + README.%b\n" "$D" "$R"
+printf "  %bFive real endpoints, runnable acceptance criteria, ~5 files.%b\n" "$D" "$R"
+printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
 printf "\n"
 
 # The exact prompt to hand heimdall — points it at the scaffolded task file.
@@ -764,9 +763,9 @@ DEMO_PROMPT="Build the full-stack app specified in .heimdall-demo-task.md, follo
 # and the second-prompt conversion. Pure shell, never fails the run.
 print_endframe() {
   printf "\n"
-  printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-  printf "  ${C}${B}RUN COMPLETE${R} ${D}— the receipts${R}\n"
-  printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
+  printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
+  printf "  %b%bRUN COMPLETE%b %b— the receipts%b\n" "$C" "$B" "$R" "$D" "$R"
+  printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
 
   # 1) The H-5 summary card (degrades to "—" on missing data, never crashes).
   if [ -x "$CARD_BIN" ]; then
@@ -775,40 +774,40 @@ print_endframe() {
 
   # 2) The reel — one shareable artifact (graceful-degrade to a .txt endframe).
   if [ "$NO_REEL" != true ] && [ -x "$REEL_BIN" ]; then
-    printf "\n  ${P}▸${R} ${B}Reel${R} ${D}— rendering the shareable endframe…${R}\n"
+    printf "\n  %b▸%b %bReel%b %b— rendering the shareable endframe…%b\n" "$P" "$R" "$B" "$R" "$D" "$R"
     "$REEL_BIN" endframe "$ABS_DIR" --name heimdall-demo >/dev/null 2>&1 || true
     if [ -d "$ABS_DIR/.planning/reels" ]; then
-      printf "  ${G}✔${R} reel artifacts in ${C}%s/.planning/reels/${R}\n" "$ABS_DIR"
+      printf "  %b✔%b reel artifacts in %b%s/.planning/reels/%b\n" "$G" "$R" "$C" "$ABS_DIR" "$R"
     fi
   fi
 
   # 3) The localhost URL (the demo task serves the app at :8000 via uvicorn).
-  printf "\n  ${B}Run the app you just built:${R}\n"
-  printf "  ${C}cd %s && uvicorn app:app${R}  ${D}→${R}  ${UL}http://localhost:8000${R}\n" "$ABS_DIR"
+  printf "\n  %bRun the app you just built:%b\n" "$B" "$R"
+  printf "  %bcd %s && uvicorn app:app%b  %b→%b  %bhttp://localhost:8000%b\n" "$C" "$ABS_DIR" "$R" "$D" "$R" "$UL" "$R"
 
   # 4) The atomic commits heimdall made (R7: one commit per task).
   if git -C "$ABS_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-    printf "\n  ${B}Atomic commits:${R}\n"
+    printf "\n  %bAtomic commits:%b\n" "$B" "$R"
     git -C "$ABS_DIR" log --oneline -8 2>/dev/null | while IFS= read -r ln; do
-      printf "    ${D}%s${R}\n" "$ln"
+      printf "    %b%s%b\n" "$D" "$ln" "$R"
     done
   fi
 
   # 5) The second-prompt conversion — one concrete follow-up.
-  printf "\n  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-  printf "  ${B}Try one more — exercise the verification layer:${R}\n"
-  printf "  ${C}cd %s && heimdall \"%s\"${R}\n" "$ABS_DIR" "$FOLLOWUP_PROMPT"
-  printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n\n"
+  printf "\n  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n" "$V" "$R"
+  printf "  %bTry one more — exercise the verification layer:%b\n" "$B" "$R"
+  printf "  %bcd %s && heimdall \"%s\"%b\n" "$C" "$ABS_DIR" "$FOLLOWUP_PROMPT" "$R"
+  printf "  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n\n" "$V" "$R"
 }
 
 if [ "$MODE" = "run" ]; then
   if ! command -v heimdall &>/dev/null; then
-    printf "  ${W}⚠${R} ${B}heimdall${R} not found on PATH — cannot auto-run.\n"
-    printf "  ${D}Install it, then paste the command below. Falling back to dry output.${R}\n\n"
+    printf "  %b⚠%b %bheimdall%b not found on PATH — cannot auto-run.\n" "$W" "$R" "$B" "$R"
+    printf "  %bInstall it, then paste the command below. Falling back to dry output.%b\n\n" "$D" "$R"
     MODE="dry"
   else
-    printf "  ${P}▸${R} ${B}Launching heimdall${R} ${D}(--run)${R}\n"
-    printf "  ${D}cd %s && heimdall \"%s\"${R}\n\n" "$ABS_DIR" "$DEMO_PROMPT"
+    printf "  %b▸%b %bLaunching heimdall%b %b(--run)%b\n" "$P" "$R" "$B" "$R" "$D" "$R"
+    printf "  %bcd %s && heimdall \"%s\"%b\n\n" "$D" "$ABS_DIR" "$DEMO_PROMPT" "$R"
     cd "$ABS_DIR"
     # Record a reel WHILE heimdall builds when the recorder + reel bin exist;
     # otherwise run heimdall directly. Either way we return and render the
@@ -824,16 +823,16 @@ if [ "$MODE" = "run" ]; then
 fi
 
 # Dry mode (default & fallback): print the paste-ready next step, execute nothing.
-printf "  ${B}Next step${R} ${D}— paste this to watch heimdall build it:${R}\n"
+printf "  %bNext step%b %b— paste this to watch heimdall build it:%b\n" "$B" "$R" "$D" "$R"
 printf "\n"
-printf "  ${C}cd %s && heimdall \"%s\"${R}\n" "$ABS_DIR" "$DEMO_PROMPT"
+printf "  %bcd %s && heimdall \"%s\"%b\n" "$C" "$ABS_DIR" "$DEMO_PROMPT" "$R"
 printf "\n"
-printf "  ${D}No ${C}heimdall${D} on PATH? Open Claude Code in that dir and say:${R}\n"
-printf "  ${D}  \"%s\"${R}\n" "$DEMO_PROMPT"
+printf "  %bNo %bheimdall%b on PATH? Open Claude Code in that dir and say:%b\n" "$D" "$C" "$D" "$R"
+printf "  %b  \"%s\"%b\n" "$D" "$DEMO_PROMPT" "$R"
 printf "\n"
-printf "  ${D}When the build finishes you'll get a summary card, a shareable reel,${R}\n"
-printf "  ${D}and a suggested follow-up that exercises the verification layer:${R}\n"
-printf "  ${D}  \"%s\"${R}\n" "$FOLLOWUP_PROMPT"
+printf "  %bWhen the build finishes you'll get a summary card, a shareable reel,%b\n" "$D" "$R"
+printf "  %band a suggested follow-up that exercises the verification layer:%b\n" "$D" "$R"
+printf "  %b  \"%s\"%b\n" "$D" "$FOLLOWUP_PROMPT" "$R"
 printf "\n"
-printf "  ${W}▸${R} Safe by default — nothing was executed. Add ${C}--run${R} to launch automatically.\n"
+printf "  %b▸%b Safe by default — nothing was executed. Add %b--run%b to launch automatically.\n" "$W" "$R" "$C" "$R"
 printf "\n"
