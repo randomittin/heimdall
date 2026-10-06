@@ -202,7 +202,7 @@ cmd_squash() {
   fi
 
   local oldest_sha target
-  oldest_sha="$(printf '%s\n' $shas | tail -1)"
+  oldest_sha="${shas##* }"
   target="$(git rev-parse "${oldest_sha}^" 2>/dev/null)" || { echo "squash: cannot resolve parent of $oldest_sha"; return 1; }
 
   if [ "$dry" -eq 1 ]; then

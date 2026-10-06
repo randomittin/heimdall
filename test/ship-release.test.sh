@@ -32,6 +32,7 @@ ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ship-release-test.XXXXXX")"
+# shellcheck disable=SC2329 # invoked indirectly: the EXIT trap on the next line
 cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -114,6 +115,7 @@ fi
 
 # ── Case 3: publish_release is idempotent — existing release -> UPDATE ───────
 C3="$WORK/c3.out"
+# shellcheck disable=SC2030 # case-local by design: this subshell sandboxes its own gh-stub env and PATH
 (
   cd "$REPO" || exit 1
   export GH_STUB_STATE="$WORK/c3state" GH_STUB_MODE="edit-ok"
@@ -134,6 +136,7 @@ fi
 
 # ── Case 4: a gh failure makes the publish path exit NON-ZERO ────────────────
 C4="$WORK/c4.out"
+# shellcheck disable=SC2031 # reads the parent PATH on purpose: case 3 modified it inside its own subshell, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export GH_STUB_STATE="$WORK/c4state" GH_STUB_MODE="create-fail"

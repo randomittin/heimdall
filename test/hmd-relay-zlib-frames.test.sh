@@ -130,6 +130,7 @@ def real_state_plaintext():
 '
 
 # The REAL RelayClient, paired in-process with a fake phone through the real device_bound path.
+# shellcheck disable=SC2016 # Python source: the backticks are docstring text, nothing here should expand
 RIG='
 import argparse, contextlib, importlib.util, io, tempfile
 from importlib.machinery import SourceFileLoader
