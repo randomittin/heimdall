@@ -1251,6 +1251,27 @@ def generate_next(root, store=None, model=None, home=None, drivers=None, environ
     return True
 
 
+def serve(root, store=None, once=False, interval_s=5.0, scheduler=None, sleep=time.sleep, model=None, home=None, drivers=None, environ=None):
+    """The producer half's whole loop for one repo (`hmd dash run`), run as the user's own process -- its environment is where connector
+    passwords are read from. Each pass, only while the store says remote dashboards are on: serve every queued generation (at most
+    SERVE_JOBS_PER_PASS), expire unconfirmed proposals, one refresh pass. Returns 0 after one pass when `once`, 1 without a store."""
+    store = store or _store()
+    if store is None:
+        sys.stderr.write("hmd dash run: the dashboards store (bin/lib/companion_dashboards.py) did not load\n")
+        return 1
+    scheduler = scheduler or Scheduler()
+    while True:
+        if store.enabled(root):
+            for _ in range(SERVE_JOBS_PER_PASS):
+                if not generate_next(root, store=store, model=model, home=home, drivers=drivers, environ=environ):
+                    break
+            store.expire_pending(root)
+            run_due(root, scheduler, store=store, drivers=drivers, home=home, environ=environ)
+        if once:
+            return 0
+        sleep(interval_s)
+
+
 # -- 7. the command line: hmd dash ... ---------------------------------------------------------------------------
 USAGE = ("usage: hmd dash pending|ls [--repo DIR]\n"
          "       hmd dash show <tile> [--repo DIR]\n"
