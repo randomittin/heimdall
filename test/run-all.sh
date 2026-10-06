@@ -57,6 +57,8 @@
 #   test/run-all.sh --timeout 300       # DEFAULT per-suite seconds (default 180); suites
 #                                       # with a measured override keep theirs if it is larger
 #   test/run-all.sh --no-retry          # do not re-run reds serially
+#   HMD_TEST_NO_PY_PIN=1 test/run-all.sh   # leave python3 alone (default: pinned to the real interpreter
+#                                       # when it resolves through a shim; see PYTHON3 PIN below)
 #
 # Exit 0 = every suite that ran passed. Nonzero = at least one FAIL / TIMEOUT / DISCREPANCY,
 # or discovery fell below the floor.
@@ -438,6 +440,25 @@ _abort_sweep() {
 trap cleanup EXIT
 trap '_abort_sweep 130' INT
 trap '_abort_sweep 143' TERM
+
+# ── PYTHON3 PIN (test harness only) ───────────────────────────────────────────────────────
+# On a box where python3 is a pyenv shim every call costs 0.3-0.8 s under load against 0.05 s for the
+# interpreter, and the suites make thousands of calls -- that tax was most of the wall clock of the
+# app-relay / companion-push / controls suites. Resolve the real interpreter ONCE here and put a one-line
+# exec wrapper first on PATH, which every suite spawned below inherits. Only when python3 resolves to
+# something other than the interpreter; HMD_TEST_NO_PY_PIN=1 opts out. The wrapper dir lives under $WORK, so
+# the EXIT trap above removes it with everything else this run created. test/lib/py-pin.sh holds the logic
+# and the reasoning; nothing under bin/ or install.sh reads any of it. A copy of this script run without that
+# file next to it (the throwaway fixture repos of the test/run-all-*.test.sh suites) runs unpinned and says
+# so. Printed straight after the banner so the run header always states which interpreter the suites get.
+# Proof: test/run-all-python-pin.test.sh.
+# shellcheck source=lib/py-pin.sh
+if [ -r "$SELF_DIR/lib/py-pin.sh" ] && . "$SELF_DIR/lib/py-pin.sh"; then
+  hmd_test_pin_python3 "$WORK/pybin"
+else
+  HMD_PY_PIN_NOTE="off (test/lib/py-pin.sh not found next to run-all.sh)"
+fi
+echo "python3 pin: $HMD_PY_PIN_NOTE"
 
 # ── REPO INTEGRITY, BEFORE SIDE (guarantee #8 above) ────────────────────────────────────
 # Snapshot the tree now, before suite #0 has even started. The AFTER side, and the full
