@@ -231,6 +231,7 @@ S2='Team presence is a feature you can see and switch off: it sends {handle, ver
 S3='Telemetry is specified, minimal, and yours to kill: DATA.md documents every field. hmd telemetry off. hmd telemetry purge deletes the local spool — nothing is transmitted in this release.'
 S4='Auto-update checks GitHub Releases for new signed versions. HEIMDALL_NO_AUTOUPDATE=1 (or ~/.heimdall/no-autoupdate) disables it.'
 S5='# gates local · presence opt-out · telemetry documented & killable · the watchman does not sleep'
+# shellcheck disable=SC2016 # literal claim text: the backticks around rr are prose, nothing should expand
 S6='`rr` is the one thing that sends on purpose, and only when you run it: your BYO Claude credential (write-only), your GitHub App installation id, and the literal task text you typed — because that text is the job. It never uploads your working tree; the worker clones your repo from GitHub.'
 ALLOWLIST=("$S1" "$S2" "$S3" "$S4" "$S5" "$S6")
 
@@ -269,9 +270,11 @@ if [ -n "$HITS" ]; then
     fi
   done <<< "$HITS"
 fi
-[ "$VIOLATIONS" -eq 0 ] \
-  && ok "no bare-absolute privacy claim in the read-surfaces" \
-  || bad "$VIOLATIONS bare-absolute privacy claim(s) still present — replace with the scoped set"
+if [ "$VIOLATIONS" -eq 0 ]; then
+  ok "no bare-absolute privacy claim in the read-surfaces"
+else
+  bad "$VIOLATIONS bare-absolute privacy claim(s) still present — replace with the scoped set"
+fi
 
 # ── Guarantee B: the scoped claim set is PRESENT verbatim ───────────────────────
 i=0

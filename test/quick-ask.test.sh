@@ -106,18 +106,30 @@ mutant "touch the dashboards store during an ask" $Q '    cands = candidates(roo
 
 # 3. the wiring, by text
 RC="$REPO/bin/heimdall-relay-client"
-grep -q 'ASK.CAP_ASK' "$RC" && grep -q '_asks_overlay(self._dashboards_overlay' "$RC" && grep -q 'ASK.set_on_change(self.root, self._rearm_state)' "$RC" \
-  && grep -q 'caps=self.device_caps' "$RC" && ok "relay client: cap listed, slice applied per phone, state re-sent when a result lands, phone caps passed to dispatch" \
-  || bad "relay client wiring missing"
-grep -q '"asks"' "$RC" && ok 'the "asks" key is wired in bin/heimdall-relay-client' || bad 'no "asks" key wiring in the relay client'
-grep -q '^ASK = CONTROLS._sibling("companion_quick_ask")' "$RC" && ! grep -q '_load_module("companion_quick_ask"' "$RC" \
-  && ok "relay client: the asks module is the dispatcher's own instance (results live in its memory; a second copy would hold none)" \
-  || bad "relay client loads its own copy of companion_quick_ask: the phone would never see a result (see test/quick-ask-e2e.test.sh)"
+if grep -q 'ASK.CAP_ASK' "$RC" && grep -q '_asks_overlay(self._dashboards_overlay' "$RC" && grep -q 'ASK.set_on_change(self.root, self._rearm_state)' "$RC" \
+  && grep -q 'caps=self.device_caps' "$RC"; then
+  ok "relay client: cap listed, slice applied per phone, state re-sent when a result lands, phone caps passed to dispatch"
+else
+  bad "relay client wiring missing"
+fi
+if grep -q '"asks"' "$RC"; then ok 'the "asks" key is wired in bin/heimdall-relay-client'; else bad 'no "asks" key wiring in the relay client'; fi
+if grep -q '^ASK = CONTROLS._sibling("companion_quick_ask")' "$RC" && ! grep -q '_load_module("companion_quick_ask"' "$RC"; then
+  ok "relay client: the asks module is the dispatcher's own instance (results live in its memory; a second copy would hold none)"
+else
+  bad "relay client loads its own copy of companion_quick_ask: the phone would never see a result (see test/quick-ask-e2e.test.sh)"
+fi
 if grep -q '"asks"' "$REPO/sentinels/hmd-ui.py"; then bad 'hmd-ui carries an "asks" key: answers must never be in the base state'; else ok 'hmd-ui (the base state and its SSE digest) carries no asks key: answers live only in the phone'"'"'s own frames'; fi
-grep -q 'remote-asks' "$REPO/bin/heimdall-app" && grep -q 'companion_quick_ask.py" status-line' "$REPO/bin/heimdall-app" \
-  && ok "heimdall-app: remote-asks routed, status line printed" || bad "heimdall-app wiring missing"
-grep -q '"ask-v1"' "$REPO/bin/lib/companion_quick_ask.py" && grep -q '"quick-ask"' "$REPO/bin/lib/companion_quick_ask.py" \
-  && grep -q 'remote-asks.json' "$REPO/bin/lib/companion_remote_switches.py" && ok "acceptance greps: cap, action name, switch file" || bad "acceptance greps failed"
+if grep -q 'remote-asks' "$REPO/bin/heimdall-app" && grep -q 'companion_quick_ask.py" status-line' "$REPO/bin/heimdall-app"; then
+  ok "heimdall-app: remote-asks routed, status line printed"
+else
+  bad "heimdall-app wiring missing"
+fi
+if grep -q '"ask-v1"' "$REPO/bin/lib/companion_quick_ask.py" && grep -q '"quick-ask"' "$REPO/bin/lib/companion_quick_ask.py" \
+  && grep -q 'remote-asks.json' "$REPO/bin/lib/companion_remote_switches.py"; then
+  ok "acceptance greps: cap, action name, switch file"
+else
+  bad "acceptance greps failed"
+fi
 if grep -Eq 'subprocess|os\.system|eval\(|exec\(' "$REPO/bin/lib/companion_quick_ask.py"; then bad "companion_quick_ask.py starts a process itself (it may only reuse dashboard_producers.run_model)"; else ok "companion_quick_ask.py has no process spawn of its own: the model call is dashboard_producers.run_model"; fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

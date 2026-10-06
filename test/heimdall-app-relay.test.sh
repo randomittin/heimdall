@@ -45,6 +45,8 @@
 
 # shellcheck disable=SC2034  # RELAY_SUITE_TITLE is read by test/lib/app-relay-common.sh (sourced next), never in this file
 RELAY_SUITE_TITLE="heimdall-app-relay (bin/heimdall-relay-client + hmd app connect --relay oracle) -- part 1/3: core protocol"
+# shellcheck source=lib/app-relay-common.sh
+# shellcheck disable=SC1091 # without -x shellcheck cannot follow any sourced file; the path above is for -x runs
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/app-relay-common.sh"
 
 # ── 1. syntax / static shape (claims 9-12, 14) ──────────────────────────────
@@ -357,6 +359,7 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   # rejected per case 23/24) and had to be drained to quiescence first; the
   # replay's effect is counted in ACKS instead, which no state frame is.
   ACKS_BEFORE_REPLAY="$(sealed_acks "$LOG_A/frames.ndjson" "$SESSION_KEY_A" | wc -l | tr -d ' ')"
+  # shellcheck disable=SC2126 # grep|wc -l prints 0 while $INBOX_A does not exist yet; grep -c would print nothing
   INBOX_COUNT_BEFORE="$(grep '"hello from claim4"' "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
   python3 "$FAKE_RELAY" device envelope --session-id "$SID_A" --seq 1 --sender device \
     --type command --nonce "$NONCE1" --ciphertext "$CT1" > "$CTL_A/003.json"
@@ -373,6 +376,7 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
     bad "INV-15: the replay drew no sealed refusal {detail:non-increasing-seq,last:1,of_seq:1,ok:false} (got '${A_REFUSAL:-nothing}')"
   fi
   sleep 1
+  # shellcheck disable=SC2126 # grep|wc -l prints 0 while $INBOX_A does not exist yet; grep -c would print nothing
   INBOX_COUNT_AFTER="$(grep '"hello from claim4"' "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
   ACKS_AFTER_REPLAY="$(sealed_acks "$LOG_A/frames.ndjson" "$SESSION_KEY_A" | wc -l | tr -d ' ')"
   if [ "$INBOX_COUNT_AFTER" -eq "$INBOX_COUNT_BEFORE" ]; then
@@ -408,6 +412,7 @@ print('OK' if not missing and o.get('source') == 'companion' else 'BAD:%r' % (mi
   else
     bad "INV-23: too-long send-message ack mismatch (ok=$ACK2_OK detail=$ACK2_DETAIL)"
   fi
+  # shellcheck disable=SC2126 # grep|wc -l prints 0 while $INBOX_A does not exist yet; grep -c would print nothing
   TOOLONG_INBOX_COUNT="$(grep -F "$(printf '%s' "$LONG_TEXT" | head -c 40)" "$INBOX_A" 2>/dev/null | wc -l | tr -d ' ')"
   if [ "$TOOLONG_INBOX_COUNT" -eq 0 ]; then
     ok "INV-23: too-long send-message produced no inbox record"
