@@ -213,7 +213,7 @@ echo "B. SCOPING (foreign repo not blocked on heimdall internals):"
 FOREIGN="$WORK/foreign"
 mkdir -p "$FOREIGN"
 (
-  cd "$FOREIGN"
+  cd "$FOREIGN" || exit 1
   git init -q
   git config user.email "someone@example.com"
   git config user.name "Some One"
@@ -252,7 +252,7 @@ LEAK_PATH="src/leak.js"
 # same secret here must NOT be flagged (proves the allowlist actually allowlists).
 FIXTURE_PATH="bin/heimdall-demo"
 (
-  cd "$DETECT"
+  cd "$DETECT" || exit 1
   git init -q
   git config user.email "rj@runheimdall.dev"
   git config user.name "RJ"
@@ -357,7 +357,7 @@ else
   if [ "$e_tree" = "clean" ]; then
     ok "pristine clone: tree pass returns verdict=clean — no false positive"
   else
-    bad "pristine clone: tree pass returned '${e_tree:-no verdict emitted}' — false positive in the tree pass"
+    bad "pristine clone: tree pass returned '${e_tree:-no verdict emitted}' — false positive in the tree pass (selfscan overall rc=$clean_rc)"
     grep -E 'BLOCKED|File:|Secret:' "$WORK/e-clean.err" | sed 's/^/      /' | head -10
   fi
   # A clean verdict over a trivial volume means the scan never reached the tree
@@ -426,7 +426,7 @@ else
   if [ -n "$orig_tree" ] && [ -z "$mut_tree" ]; then
     ok "mutation is real AT RUNTIME (original's tree gate reported '$orig_tree'; mutant emits no tree verdict)"
   else
-    bad "mutation not proven by runtime signal (original='${orig_tree:-none}', mutant='${mut_tree:-none}') — the RED below would prove nothing"
+    bad "mutation not proven by runtime signal (original='${orig_tree:-none}', mutant='${mut_tree:-none}', mutant selfscan rc=$mut_rc) — the RED below would prove nothing"
   fi
   # "Sails through" = the working-tree secret is no longer detected. Asserted on
   # the absence of the WORKING TREE block rather than on rc==0: the bundled exit
@@ -533,7 +533,7 @@ else
   if [ "$f_tree" = "clean" ]; then
     ok "secrets in .gitignored paths do NOT block (tree verdict=clean) — no wolf-crying on unpushable files"
   else
-    bad "tree gate returned '${f_tree:-no verdict emitted}' on .gitignored, unpushable files — the every-push-is-blocked failure"
+    bad "tree gate returned '${f_tree:-no verdict emitted}' on .gitignored, unpushable files (selfscan overall rc=$scoped_rc) — the every-push-is-blocked failure"
     grep -iE 'BLOCKED|File:' "$WORK/f-ignored.err" | sed 's/^/      /' | head -8
   fi
 

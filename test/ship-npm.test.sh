@@ -115,7 +115,7 @@ chmod +x "$BIN_STUB/npm"
 DRY="$WORK/dry.out"
 DRY_STATE="$WORK/c1state"; mkdir -p "$DRY_STATE"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$DRY_STATE" NPM_STUB_MODE="publish-ok"
   PATH="$BIN_STUB:$PATH" "$SHIP" --dry-run
 ) >"$DRY" 2>&1
@@ -168,7 +168,7 @@ fi
 # ── Case 2: already published -> LOUD skip, exit 0 (idempotent re-run) ───────
 C2="$WORK/c2.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c2state" NPM_STUB_MODE="already-published"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -193,7 +193,7 @@ fi
 # case goes red — which is the whole point of it existing.
 C3="$WORK/c3.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c3state" NPM_STUB_MODE="publish-fail"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -221,7 +221,7 @@ fi
 # ── Case 4: unauthenticated npm HARD-FAILS in preflight (never warn-and-exit-0) ──
 C4="$WORK/c4.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c4state" NPM_STUB_MODE="not-authed"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -260,7 +260,7 @@ FIX="$WORK/pkgfix"; mkdir -p "$FIX"
 printf '{"name":"runheimdall","version":"0.0.1","files":["bin/runheimdall.js"]}\n' > "$FIX/package.json"
 C5="$WORK/c5.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c5state" NPM_STUB_MODE="publish-ok" SHIP_NPM_DIR="$FIX"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -285,7 +285,7 @@ FIX6="$WORK/pkgok"; mkdir -p "$FIX6"
 printf '{"name":"runheimdall","version":"2.2.6","files":["bin/runheimdall.js"]}\n' > "$FIX6/package.json"
 C6="$WORK/c6.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c6state" NPM_STUB_MODE="publish-ok" SHIP_NPM_DIR="$FIX6"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -336,7 +336,7 @@ FIX8="$WORK/pkglag"; mkdir -p "$FIX8"
 printf '{"name":"runheimdall","version":"2.2.6","files":["bin/runheimdall.js"]}\n' > "$FIX8/package.json"
 C8="$WORK/c8.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c8state" NPM_STUB_MODE="publish-ok-lag" SHIP_NPM_DIR="$FIX8"
   export SHIP_READBACK_MAX_TRIES=2 SHIP_READBACK_DELAY=0
   PATH="$BIN_STUB:$PATH"
@@ -377,7 +377,7 @@ fi
 # versions are immutable, so an undecided ship genuinely must warn). Both directions asserted.
 C9D="$WORK/c9d.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
   SHIP_SOURCE_ONLY=1 . "$SHIP"
@@ -394,7 +394,7 @@ UND="$WORK/pkgundecided"; mkdir -p "$UND"
 printf '{"name":"runheimdall","version":"2.2.6","description":"pre-launch placeholder text","files":["bin/runheimdall.js"]}\n' > "$UND/package.json"
 C9U="$WORK/c9u.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export SHIP_NPM_DIR="$UND"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -452,7 +452,7 @@ fi
 # ── Case 11: the publish stage publishes BOTH, runheimdall first ────────────────
 C11="$WORK/c11.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c11state" NPM_STUB_MODE="publish-ok"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -478,7 +478,7 @@ fi
 C12="$WORK/c12.out"
 mkdir -p "$WORK/c12state"; : > "$WORK/c12state/published-runheimdall-$CUR_VER"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c12state" NPM_STUB_MODE="publish-ok"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -502,7 +502,7 @@ printf '{"name":"runheimdall","version":"2.2.6","files":["bin/runheimdall.js"]}\
 printf '{"name":"runhmd","version":"0.0.1","files":["bin/runhmd.js"]}\n' > "$FIXROOT/packages/runhmd/package.json"
 C13="$WORK/c13.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c13state" NPM_STUB_MODE="publish-ok"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -528,7 +528,7 @@ FIXROOT2="$WORK/fixroot2"; mkdir -p "$FIXROOT2/packages/runheimdall"
 printf '{"name":"runheimdall","version":"2.2.6"}\n' > "$FIXROOT2/packages/runheimdall/package.json"
 C14="$WORK/c14.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c14state" NPM_STUB_MODE="publish-ok"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -546,7 +546,7 @@ fi
 # ── Case 15: publish RIGHTS are proven on the SECOND wrapper too ──────────────────
 C15="$WORK/c15.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c15state" NPM_STUB_MODE="publish-ok" NPM_STUB_NOT_OWNER_OF="runhmd"
   PATH="$BIN_STUB:$PATH"
   # shellcheck disable=SC1090
@@ -570,10 +570,11 @@ HMD_NO="$WORK/heimdall-no-attack"; printf 'case "${1:-}" in\n  demo)\n    :\n   
 HMD_YES="$WORK/heimdall-with-attack"; printf 'case "${1:-}" in\n  demo)\n    :\n    ;;\n  prove|attack)\n    :\n    ;;\nesac\n' > "$HMD_YES"
 notice_for() {  # <hmd bin fixture> <package dir, repo-relative>
   (
-    cd "$REPO"
+    cd "$REPO" || exit 1
     PATH="$BIN_STUB:$PATH"
     # shellcheck disable=SC1090
     SHIP_SOURCE_ONLY=1 . "$SHIP"
+    # shellcheck disable=SC2034  # REPO_ROOT is read by npm_default_command_notice, which `. "$SHIP"` defines; shellcheck cannot follow the source
     REPO_ROOT="$REPO"
     SHIP_HMD_BIN="$1" npm_default_command_notice "$2"
   ) 2>&1
@@ -597,7 +598,7 @@ else
 fi
 C16="$WORK/c16.out"
 (
-  cd "$REPO"
+  cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c16state" NPM_STUB_MODE="publish-ok"
   PATH="$BIN_STUB:$PATH" SHIP_HMD_BIN="$HMD_NO" "$SHIP" --dry-run
 ) >"$C16" 2>&1

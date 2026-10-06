@@ -41,6 +41,7 @@ unset CLAUDE_PLUGIN_ROOT
 # Evaluate hmd_hook_enabled in a fresh subshell so state never leaks between cases.
 # Echoes the function's return code.
 enabled() {
+  # shellcheck source=../bin/lib/hook-enabled.sh disable=SC1091  # plain shellcheck (no -x) never opens sourced files
   ( . "$LIB" 2>/dev/null; hmd_hook_enabled "$1"; printf '%s' "$?" )
 }
 
@@ -127,12 +128,14 @@ rc="$(run_tool enable "$ADVISORY")"
 
 # ── 11. fail toward ENABLED: metadata missing while id is in the file ───────
 run_tool disable "$ADVISORY" >/dev/null
+# shellcheck source=../bin/lib/hook-enabled.sh disable=SC1091  # plain shellcheck (no -x) never opens sourced files
 rc="$( ( export HMD_HOOKS_METADATA="$TMPROOT/nope.json"; . "$LIB"; hmd_hook_enabled "$ADVISORY"; printf '%s' "$?" ) )"
 [ "$rc" = "0" ] && ok "11. disabled id + missing metadata -> enabled (cannot prove not-locked)" \
                 || bad "11. missing metadata resolved to disabled"
 
 # ── 12. fail toward ENABLED: jq absent ──────────────────────────────────────
 mkdir -p "$TMPROOT/emptybin"; ln -sf "$(command -v grep)" "$TMPROOT/emptybin/grep"
+# shellcheck source=../bin/lib/hook-enabled.sh disable=SC1091,SC2123  # PATH is narrowed on purpose to a dir holding only grep, so no jq resolves; plain shellcheck (no -x) never opens sourced files
 rc="$( ( PATH="$TMPROOT/emptybin"; . "$LIB"; hmd_hook_enabled "$ADVISORY"; printf '%s' "$?" ) )"
 [ "$rc" = "0" ] && ok "12. disabled id + no jq on PATH -> enabled" \
                 || bad "12. missing jq resolved to disabled"

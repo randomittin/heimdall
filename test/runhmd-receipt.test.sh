@@ -715,7 +715,7 @@ if section V; then
 echo "[V] hmd receipt verify / keygen"
 VH="$TMP/v-home"; mkdir -p "$VH"; touch "$VH/setup-done"
 VK="$TMP/v-keys"; VS="$TMP/v-store"; VO="$TMP/v-out"; mkdir -p "$VO"
-D_ID=d1d1d1d1d1d1; P_ID=b2b2b2b2b2b2; V_ID=a1b2c3d4e5f6
+D_ID=d1d1d1d1d1d1; P_ID=b2b2b2b2b2b2
 
 echo "  -- keygen: the documented key source --"
 rcpt keygen --dir "$VK"
@@ -1301,7 +1301,7 @@ jq -e '.receipt_url==null' "$AOUT" >/dev/null 2>&1 && [ -f "$AS/$PID.json" ] && 
 attack $CLEAN --json --yes --receipt --public
 jq -e '.visibility=="public"' "$AS/$PID.json" >/dev/null 2>&1 && ok "--receipt --public issues a public receipt (the only kind 'hmd receipt render' publishes)" || bad "--public receipt"
 attack $CLEAN --json --yes --receipt
-jq -e '.visibility=="private"' "$AS/$PID.json" >/dev/null 2>&1 && [ "$(ls "$AS" | grep -c "^$PID")" = "1" ] && ok "re-attacking the same tree replaces its receipt (one file per id) and goes back to private" || bad "re-attack did not replace the receipt"
+jq -e '.visibility=="private"' "$AS/$PID.json" >/dev/null 2>&1 && [ "$(find "$AS" -maxdepth 1 -name "$PID*" | wc -l | tr -d ' ')" = "1" ] && ok "re-attacking the same tree replaces its receipt (one file per id) and goes back to private" || bad "re-attack did not replace the receipt"
 attack $CLEAN --json --yes --receipt --public --out "$TMP/a-out"
 [ "$(jq -r .receipt_url "$TMP/a-out/verdict.json")" = "https://runhmd.dev/r/$PID" ] && python3 "$SCHEMA_PY" validate "$TMP/a-out/verdict.json" >/dev/null 2>&1 \
   && ok "--out DIR: the verdict.json written to disk carries receipt_url too" || bad "--out verdict.json lacks the receipt_url"
