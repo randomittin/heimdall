@@ -765,7 +765,7 @@ _collect_candidates() {
 
 enumerate() {
   local taskdir subdirs reaped cands sessions tsess slug
-  local id tr meta mt age term state name kind nstat sess row
+  local id tr meta mt age term state name kind nstat sess
   local workdir metaf awaitf candf joined j line
   local -a c_id=() c_tr=() c_meta=() c_mtsrc=() c_mt=() mvals=() metapaths=() trpaths=()
   taskdir="$(resolve_taskdir)"

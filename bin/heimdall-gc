@@ -473,7 +473,7 @@ gc_ccversions() {
        return 0 ;;
   esac
 
-  local v name refs p held lpid unref=""
+  local v name p held lpid unref=""
   for v in "$CC_VERSIONS_DIR"/*; do
     [ -f "$v" ] || continue
     name="${v##*/}"

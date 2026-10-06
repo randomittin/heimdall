@@ -1266,7 +1266,7 @@ _keeper_subagent_transcript() {
   id="${owner#agent-}"
   [ -n "$id" ] && [ "$id" != "$owner" ] || return 0
   pd="$(_keeper_projects_dir)"
-  for t in "$pd"/*/"$sess"/subagents/"agent-$id.jsonl"; do
+  for t in "$pd"/*/"$sess/subagents/agent-$id.jsonl"; do
     [ -f "$t" ] || continue
     mt="$(_stamp_mtime "$t" 2>/dev/null)"
     case "$mt" in ''|*[!0-9]*) continue ;; esac
@@ -1328,7 +1328,7 @@ _keeper_loop() {
   mkdir -p "$(dirname "$pidfile")" 2>/dev/null || true
   # claim ownership atomically (last writer wins; the loser sees the mismatch + exits below).
   printf '%s\n' "$$" > "$pidfile.tmp.$$" 2>/dev/null && mv -f "$pidfile.tmp.$$" "$pidfile" 2>/dev/null
-  # shellcheck disable=SC2064 — expand $pidfile/$swait/$$ at trap-fire time, not define time.
+  # Single-quoted on purpose: $pidfile/$swait/$$ expand at trap-fire time, not define time.
   trap 'rm -f "$pidfile.tmp.$$" 2>/dev/null; [ -n "$swait" ] && kill "$swait" 2>/dev/null; [ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile" 2>/dev/null; exit 0' TERM INT
   # owner identity, parsed ONCE from the pidfile's OWN name (see _keeper_owner_alive's header
   # comment above for why: no other evidence survives the detach — a respawned keeper-loop

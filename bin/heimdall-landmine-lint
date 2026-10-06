@@ -326,7 +326,8 @@ scan_unguarded_var() {
     # then the command-word test that decides. Prose containing the word "local"
     # inside a string passes the substring gate and is rejected here.
     case "$line" in
-      *local\ *|*declare\ *|*'	'local\ *) : ;;
+      # `*local\ *` also matches a tab-indented `local `, so no separate tab pattern is needed.
+      *local\ *|*declare\ *) : ;;
       *) continue ;;
     esac
     [[ $line =~ $_RE_LOCAL_WORD ]] || continue
