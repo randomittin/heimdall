@@ -27,12 +27,10 @@ set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIB="$REPO/bin/lib/companion_ui_decisions.py"
-RISK="$REPO/bin/lib/phone_deny_risk.py"
 HOOK="$REPO/bin/heimdall-phone-deny"
 HOOKS_JSON="$REPO/hooks/hooks.json"
 HOOKS_META="$REPO/hooks/hooks.metadata.json"
 HOOKS_TOOL="$REPO/bin/heimdall-hooks"
-UI_PY="$REPO/sentinels/hmd-ui.py"
 
 PASS=0
 FAIL=0

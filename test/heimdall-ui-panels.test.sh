@@ -712,7 +712,6 @@ curl -sN -m 40 -o "$EV_BODY" "$BASE/api/events?$AUTH" &
 EV_PID=$!
 PIDS+=("$EV_PID")
 if wait_for "$EV_BODY" '^data: ' 6; then
-  n0="$(grep -c '^data: ' "$EV_BODY")"
   first="$(grep '^data: ' "$EV_BODY" | head -1 | sed 's/^data: //')"
   if printf '%s' "$first" | jq -e '(.panels|type)=="array" and has("schema_version")' >/dev/null 2>&1; then
     ok "9. first SSE frame carries the panels array alongside the Wave-1 object (L515-517)"

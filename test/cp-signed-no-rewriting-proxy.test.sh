@@ -62,6 +62,8 @@ trap cleanup EXIT
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
+# check NAME EXPR: EXPR is single-quoted on purpose and eval'd here, so a capture variable is read when the
+# assertion RUNS. shellcheck cannot see a read inside a string, hence the SC2034 directive on each capture.
 check(){ if eval "$2"; then ok "$1"; else bad "$1 [expr: $2]"; fi; }
 
 # The suite must control its own baseline: an ambient proxy (or an ambient no_proxy that
@@ -193,6 +195,7 @@ signed_env() {
 # producer always finishes and the exit status means what it says. Every sibling assertion
 # below already counts for this reason. `= "1"` is also strictly stronger than `-q`: it
 # pins EXACTLY one canary line, so a duplicated or partial readback is red too.
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 CANARY_SEEN="$(signed_env | grep -c '^HMD_SCRUB_CANARY=alive$')"
 check "1.1 the readback canary survives, so absence assertions mean something" \
   '[ "$CANARY_SEEN" = "1" ]'
@@ -200,11 +203,13 @@ check "1.1 the readback canary survives, so absence assertions mean something" \
 # 1.2 POSITIVE CONTROL — without the scrub a child really does inherit the routing vars.
 # Everything below asserts a var is ABSENT; if inheritance did not happen in the first
 # place those assertions would pass vacuously.
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 INHERITED="$(HTTPS_PROXY="$RW_URL" HEADROOM_BASE_URL="$RW_URL" env | grep -cE '^(HTTPS_PROXY|HEADROOM_BASE_URL)=')"
 check "1.2 POSITIVE CONTROL — an unscrubbed child inherits both routing vars" \
   '[ "$INHERITED" = "2" ]'
 
 # 1.3 every generic proxy var pointed at loopback is scrubbed, upper and lower case.
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 LOOPBACK_SURVIVORS="$(HTTP_PROXY="$RW_URL" HTTPS_PROXY="$RW_URL" ALL_PROXY="$RW_URL" \
   http_proxy="$RW_URL" https_proxy="$RW_URL" all_proxy="$RW_URL" \
   signed_env | grep -icE '^(http_proxy|https_proxy|all_proxy)=')"
@@ -213,6 +218,7 @@ check "1.3 a LOOPBACK proxy var is scrubbed in every spelling (6 -> 0)" \
 
 # 1.4 Headroom's own namespace names the rewriter itself, so it goes UNCONDITIONALLY —
 # even pointed off-box, HEADROOM_* is by definition a context-rewriting endpoint.
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 HEADROOM_SURVIVORS="$(HEADROOM_BASE_URL=https://headroom.corp.example:8443 \
   HEADROOM_PROXY=https://headroom.corp.example:8443 \
   HEADROOM_PROXY_URL=https://headroom.corp.example:8443 \
@@ -220,6 +226,7 @@ HEADROOM_SURVIVORS="$(HEADROOM_BASE_URL=https://headroom.corp.example:8443 \
 check "1.4 the HEADROOM_* namespace is scrubbed even when it points OFF-box" \
   '[ "$HEADROOM_SURVIVORS" = "0" ]'
 
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 BASEURL_SURVIVORS="$(ANTHROPIC_BASE_URL="$RW_URL" ANTHROPIC_API_URL="$RW_URL" \
   ANTHROPIC_DEFAULT_BASE_URL="$RW_URL" CLAUDE_CODE_BASE_URL="$RW_URL" \
   signed_env | grep -cE '^(ANTHROPIC_BASE_URL|ANTHROPIC_API_URL|ANTHROPIC_DEFAULT_BASE_URL|CLAUDE_CODE_BASE_URL)=')"
@@ -230,6 +237,7 @@ check "1.5 the model base-URL overrides are scrubbed (4 -> 0)" \
 # real off-box host CONNECT-tunnels TLS; it cannot rewrite signed bytes, and in a locked-down
 # estate it is the only way out. Stripping it would break hmd for those users.
 CORP="http://proxy.corp.example:3128"
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 CORP_SURVIVORS="$(HTTP_PROXY="$CORP" HTTPS_PROXY="$CORP" ALL_PROXY="$CORP" \
   http_proxy="$CORP" https_proxy="$CORP" all_proxy="$CORP" \
   signed_env | grep -icE '^(http_proxy|https_proxy|all_proxy)=')"
@@ -239,12 +247,14 @@ check "1.6 a NON-loopback (corporate CONNECT) proxy SURVIVES the scrub (6 -> 6)"
 # 1.7 loopback wears many spellings; the classifier has to parse a host, not match a string.
 for spec in "http://localhost:9" "http://127.9.9.9:9" "http://[::1]:9" "http://0.0.0.0:9" \
             "127.0.0.1:9" "http://user:pw@127.0.0.1:9" "https://LOCALHOST:9" "socks5://127.0.0.1:9"; do
+  # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
   n="$(HTTPS_PROXY="$spec" signed_env | grep -c '^HTTPS_PROXY=')"
   check "1.7 loopback recognised: $spec" '[ "$n" = "0" ]'
 done
 
 # 1.8 …and it must not over-match. A corporate proxy whose USERINFO merely contains a
 # loopback-looking string is still a corporate proxy: parse the host, never the whole value.
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 NOT_LOOPBACK="$(HTTPS_PROXY="http://127.0.0.1:pw@proxy.corp.example:3128" \
   signed_env | grep -c '^HTTPS_PROXY=')"
 check "1.8 a corporate host with loopback-looking USERINFO is NOT scrubbed" \
@@ -253,6 +263,7 @@ check "1.8 a corporate host with loopback-looking USERINFO is NOT scrubbed" \
 # 1.9 credentials are ROUTING-neutral. hmd_gate_exec deliberately leaves them alone (a
 # starved judge is not a protected judge) and the signed path inherits that reasoning: a
 # signed request with no credential is not a safer request, it is a failed one.
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 CREDS="$(CLAUDE_CODE_OAUTH_TOKEN=tok ANTHROPIC_API_KEY=key \
   signed_env | grep -cE '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=')"
 check "1.9 credentials are NOT scrubbed — we neutralize ROUTING, never AUTH" \
@@ -261,6 +272,7 @@ check "1.9 credentials are NOT scrubbed — we neutralize ROUTING, never AUTH" \
 # 1.10 NO_PROXY is a bypass ALLOWLIST. It can only ever REMOVE a proxy hop, never add one,
 # so it can never route signed bytes into a rewriter — and dropping it would silently push
 # an estate's internal hosts back THROUGH the corporate proxy.
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 NOPROXY="$(NO_PROXY=internal.corp no_proxy=internal.corp \
   signed_env | grep -ic '^no_proxy=')"
 check "1.10 NO_PROXY survives — an allowlist can only reduce proxying, never cause it" \
@@ -282,6 +294,7 @@ except Exception as exc:  # noqa: BLE001 — the origin is what is under test, n
     sys.stdout.write("TRANSPORT-ERROR %s" % exc.__class__.__name__)
 PYEOF
 reset_logs
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 HIJACKED="$(TARGET="$CP_URL/readyz" http_proxy="$RW_URL" HTTP_PROXY="$RW_URL" "$PY" "$WORK/client.py")"
 check "2.1 POSITIVE CONTROL — an unscrubbed urllib request IS hijacked to the rewriter" \
   '[ "$(arrivals rewriter)" = "1" ] && [ "$(arrivals cp)" = "0" ] && printf "%s" "$HIJACKED" | grep -q rewriter'
@@ -376,6 +389,7 @@ if [ -n "$NONLOOP" ]; then
   check "2.7 LIVE — a corporate proxy on $NONLOOP still CARRIES the signed request" \
     '[ "$(arrivals corp)" -ge 1 ]'
 else
+  # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
   CORP_KEPT="$(HTTP_PROXY=http://proxy.corp.example:3128 signed_env | grep -c '^HTTP_PROXY=')"
   check "2.7 STRUCTURAL (no non-loopback interface) — a corporate proxy var is preserved" \
     '[ "$CORP_KEPT" = "1" ]'
@@ -399,7 +413,9 @@ echo "4 — the MODULE INVARIANT is a real differential and fails CLOSED"
 echo "---------------------------------------------------------------"
 
 INV_CMD="$(jq -r '.invariants["no-signed-traffic-routing"].command' "$MANIFEST")"
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 INV_EXPECT="$(jq -r '.invariants["no-signed-traffic-routing"].expect' "$MANIFEST")"
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 INV_WHY="$(jq -r '.invariants["no-signed-traffic-routing"].why' "$MANIFEST")"
 
 check "4.1 the invariant declares a non-empty expect marker" '[ -n "$INV_EXPECT" ] && [ "$INV_EXPECT" != "null" ]'
@@ -412,6 +428,7 @@ check "4.4 the why text describes the differential, not a grep" \
 
 # 4.5 THE DIFFERENTIAL PASSES when the scrub is in place — run hermetically by pointing the
 # invariant's control-plane default at the local stand-in.
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 INV_OUT="$(cd "$ROOT" && HEIMDALL_DEFAULT_CP_URL="$CP_URL" bash -c "$INV_CMD" 2>&1)"
 check "4.5 the invariant emits its marker against a live control plane" \
   'printf "%s" "$INV_OUT" | grep -qF "$INV_EXPECT"'
@@ -419,7 +436,9 @@ check "4.5 the invariant emits its marker against a live control plane" \
 # 4.6 FAIL CLOSED. An unreachable control plane is NON_VERIFIED — never a silent pass. The
 # module runner compares stdout against `expect`, so a NON_VERIFIED run fails the invariant
 # and the module is rolled back, which is the required behaviour.
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 NV_OUT="$(cd "$ROOT" && HEIMDALL_DEFAULT_CP_URL="$DEAD_URL" bash -c "$INV_CMD" 2>&1)"
+# shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 NV_RC=$?
 check "4.6 an unreachable control plane reports NON_VERIFIED" \
   'printf "%s" "$NV_OUT" | grep -q "NON_VERIFIED"'
