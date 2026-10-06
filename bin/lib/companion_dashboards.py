@@ -17,6 +17,8 @@ id off its pattern is `bad-params`); `rid` (`q-<8 hex>`) is REQUIRED on every op
     set-refresh  rid op dashboard_id tile_id project refresh_s
     refresh      rid op dashboard_id project [tile_id]       (no tile_id = every tile of that dashboard in this repo)
     remove       rid op dashboard_id project [tile_id]       (no tile_id = every tile of that dashboard in this repo)
+    set-digest   rid op project at tz_min tiles include_values on   (the daily morning-report push; needs the phone's push-digest-v1
+                                                     as well; bin/lib/dashboard_digest.py owns what it means and the refusals push-off and caps-missing)
 
 Ids are `^[dst]-[0-9a-f]{8}$`; `text` 1-240 characters and <= 600 UTF-8 bytes, NFC, no control or bidi character; `refresh_s`
 an integer 60..86400; `shape` {type: <panel types>, format?: <number formats>, series?: 1..6}; `origin` is "import" or absent;
@@ -134,6 +136,7 @@ _OPS = {
     "set-refresh": (("dashboard_id", "tile_id", "project", "refresh_s"), ()),
     "refresh": (("dashboard_id", "project"), ("tile_id",)),
     "remove": (("dashboard_id", "project"), ("tile_id",)),
+    "set-digest": (("project", "at", "tz_min", "tiles", "include_values", "on"), ()),
 }
 TIMELINE_OPS = ("create", "refine", "remove")     # the ops that also get a `remote-action` line in relay-events.jsonl
 
@@ -223,19 +226,24 @@ def parse_params(body):
     op = body.get("op") if isinstance(body, dict) else None
     if not isinstance(op, str) or op not in _OPS:
         raise ValueError("op")
+    if op == "set-digest" and _digest() is None:        # the morning report's rules live in bin/lib/dashboard_digest.py: without it the op is unknown
+        raise ValueError("op")
     required, optional = _OPS[op]
     keys = set(body) - {"op"}
     if not set(required) <= keys or not keys <= set(required) | set(optional):
         raise ValueError("keys")
     checks = {"project": _valid_project, "text": _valid_text, "refresh_s": _valid_refresh, "shape": _valid_shape,
-              "origin": lambda v: v == "import", "author": lambda v: isinstance(v, str) and AUTHOR_RE.fullmatch(v) is not None}
+              "origin": lambda v: v == "import", "author": lambda v: isinstance(v, str) and AUTHOR_RE.fullmatch(v) is not None,
+              "at": lambda v: _digest().valid_at(v), "tz_min": lambda v: _digest().valid_tz(v),
+              "tiles": lambda v: _digest().valid_tiles(v), "include_values": lambda v: isinstance(v, bool),
+              "on": lambda v: isinstance(v, bool)}
     out = {"op": op}
     for key in keys:
         value = body[key]
         valid = (isinstance(value, str) and ID_RES[key].fullmatch(value) is not None) if key in ID_RES else checks[key](value)
         if not valid:
             raise ValueError(key)
-        out[key] = value
+        out[key] = list(value) if isinstance(value, list) else value
     return out
 
 
@@ -628,12 +636,34 @@ def _do_remove(root, meta, f, rid, now):
     return True, "queued", ({"id": f["tile_id"]} if "tile_id" in f else {})
 
 
-_HANDLERS = {"create": _do_create, "refine": _do_refine, "set-refresh": _do_set_refresh, "refresh": _do_refresh, "remove": _do_remove}
+def _digest():
+    """bin/lib/dashboard_digest.py (the morning report: schedule, counters, body), or None when it cannot load."""
+    return _sibling("dashboard_digest")
+
+
+def _do_set_digest(root, meta, f, rid, now):
+    """Store the phone's morning-report schedule. A tile this repo does not hold is another project's: wrong-project. Turning the
+    digest ON needs push (HMD_PUSH is not 0 and a phone registered); turning it OFF is always allowed."""
+    digest = _digest()
+    if any(_find(root, tile_id) is None for tile_id in f["tiles"]):
+        return False, "wrong-project", {}
+    if f["on"]:
+        store = _sibling("companion_push_store")
+        if not digest.available() or store is None or not store.load(root)["tokens"]:
+            return False, "push-off", {}
+    digest.set_config(root, f, now)
+    return True, "queued", {}
+
+
+_HANDLERS = {"create": _do_create, "refine": _do_refine, "set-refresh": _do_set_refresh, "refresh": _do_refresh, "remove": _do_remove,
+             "set-digest": _do_set_digest}
 
 
 def handle(root, fields, ctx=None):
     """The registered action's handler: (ok, detail, extra). The dispatcher already did the kill switch, the laptop switch, the
     exact params, the rid replay and the action's own bucket; this is the project check, the per-op limits and the store."""
+    if fields["op"] == "set-digest" and _digest().CAP_DIGEST not in (getattr(ctx, "caps", None) or ()):
+        return False, "caps-missing", {}               # an op with a capability of its own: the phone must have listed it too
     if fields["project"] not in project_names(root):
         return False, "wrong-project", {}
     now = time.time()

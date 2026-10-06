@@ -105,7 +105,7 @@ A, P = T.a_id, T.p_id
 
 # ── constants and the kill switch (spec 5.1, handoff PN1) ──
 T.eq(CP.PUSH_CAP, "push-v1", "A0a. the capability token is push-v1")
-T.eq(CP.KINDS, ("question", "approval", "error", "gate_red", "finished", "test"), "A0b. the kind set is closed")
+T.eq(CP.KINDS, ("question", "approval", "error", "gate_red", "finished", "digest", "test"), "A0b. the kind set is closed")
 T.eq(CP.EXPO_SEND_URL, "https://exp.host/--/api/v2/push/send", "A0c. default send endpoint")
 T.eq(CP.EXPO_RECEIPTS_URL, "https://exp.host/--/api/v2/push/getReceipts", "A0d. default receipts endpoint")
 T.check(CP.enabled({}) and CP.enabled({"HMD_PUSH": "1"}) and not CP.enabled({"HMD_PUSH": "0"}),

@@ -93,6 +93,7 @@ import re
 import secrets
 import threading
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -101,7 +102,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 PUSH_CAP = "push-v1"
-KINDS = ("question", "approval", "error", "gate_red", "finished", "test")
+KINDS = ("question", "approval", "error", "gate_red", "finished", "digest", "test")
 EXPO_SEND_URL = "https://exp.host/--/api/v2/push/send"
 EXPO_RECEIPTS_URL = "https://exp.host/--/api/v2/push/getReceipts"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
@@ -150,11 +151,13 @@ _KIND_TABLE = {
     "error": ("agent error", "hmd-attention", None, "active", 3600),
     "gate_red": ("push gate red", "hmd-updates", None, "active", 3600),
     "finished": (None, "hmd-updates", None, "active", 3600),
+    "digest": ("morning report", "hmd-updates", None, "active", 21600),
     "test": ("test notification", "hmd-updates", None, "active", 600),
 }
 _FINISHED_PHRASE = {"done": "done, verified", "stopped": "finished, not verified", "verdict": "sweep finished"}
 _APPROVAL_TOOLS = frozenset(("Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"))
-PRIORITY = {"question": 5, "error": 4, "gate_red": 3, "finished": 2, "test": 1}   # coalescing: highest wins
+PRIORITY = {"question": 5, "error": 4, "gate_red": 3, "finished": 2, "test": 1, "digest": 0}   # coalescing: highest wins
+SUBMIT_KINDS = ("digest",)        # kinds PushMonitor.submit accepts: events planned outside the Planner (MERGE POINT: tile_alert joins here)
 
 _EP_RE = re.compile(r"a-[0-9a-f]{10}")
 _PID_RE = re.compile(r"p-[0-9a-f]{8}")
@@ -384,6 +387,27 @@ def _finished_body(fields):
     return " ".join(clauses) or FINISHED_FALLBACK
 
 
+_DIGEST = {"tried": False, "mod": None}
+
+
+def _digest_module():
+    """bin/lib/dashboard_digest.py, loaded once; None when it cannot be (then no digest is scheduled or built)."""
+    if not _DIGEST["tried"]:
+        _DIGEST["tried"] = True
+        _DIGEST["mod"] = _load_sibling("dashboard_digest")
+    return _DIGEST["mod"]
+
+
+def _digest_body(fields):
+    """The morning report's body (<= 4 lines, <= 160 units), or None when there is nothing to say. The module composes it from
+    counts and formatted values; the free text it admits (a tile title) goes through THIS file's secret check and scrub."""
+    mod = _digest_module()
+    if mod is None:
+        return None
+    return mod.compose_body(fields, types.SimpleNamespace(scrub=scrub, clip=clip, utf16_len=utf16_len,
+                                                          secret_shaped=_secret_checker()))
+
+
 def build_message(token, event, label, ref, now):
     """One Expo message for `event` (a Planner event) to `token`, or None when there is nothing to send (an
     approval with under MIN_APPROVAL_TTL_S of life left, an unknown kind or finished variant). Every string
@@ -415,6 +439,10 @@ def build_message(token, event, label, ref, now):
         if phrase is None:
             return None
         body = _finished_body(fields)
+    elif kind == "digest":
+        body = _digest_body(fields)
+        if body is None:
+            return None
     else:
         body = "Notifications from this laptop work."
     ref = data["ref"]
@@ -674,7 +702,7 @@ class Sender:
 
 
 # ── the monitor: observe -> policy -> send, one sender per repo ───────────────────────────────────
-_PUSH_KINDS = frozenset(("question", "approval", "error", "gate_red", "finished"))
+_PUSH_KINDS = frozenset(("question", "approval", "error", "gate_red", "finished", "digest"))
 
 
 def _fingerprint(token):
@@ -847,6 +875,10 @@ class PushMonitor:
         self._sender = None
         self._lock_fd = None
         self._reported = set()
+        self._digest = None             # dashboard_digest.Scheduler, built on the first observe (False: the module did not load)
+        self._digest_rows = None        # the tile values an observe captured for the worker's morning report
+        self._digest_retry_at = 0.0     # no digest attempt before this: a try that came to nothing waits a minute
+        self._dashboards = None         # companion_dashboards, for its `enabled` (False: did not load)
 
     # -- the caller's side: cheap, never raises ------------------------------------------------------
     def observe(self, state, now=None):
@@ -855,6 +887,7 @@ class PushMonitor:
         try:
             now = self._clock() if now is None else now
             self._watch_test_request()
+            rows = self._digest_precheck(state, now)
             ts = state.get("ts") if isinstance(state, dict) else None
             with self._cv:
                 if _num(ts) is not None:
@@ -862,12 +895,76 @@ class PushMonitor:
                         return          # an older collection that finished late: never a transition
                     self._last_ts = ts
                 events = self._planner.observe(state, now)
-                if not events:
+                if rows is not None:
+                    self._digest_rows = rows
+                if not events and rows is None:
                     return
                 self._pending.extend((now, event) for event in events)
                 self._wake_locked()
         except Exception as exc:
             self._error_once("observe", exc)
+
+    def submit(self, event, now=None):
+        """Queue one event that was planned outside the Planner -- see SUBMIT_KINDS -- through the same policy, message builder
+        and limits as any other. True when it was taken. Never raises."""
+        kind = event.get("kind") if isinstance(event, dict) else None
+        if not self.enabled or self._stop.is_set() or kind not in SUBMIT_KINDS or not isinstance(event.get("key"), str):
+            return False
+        try:
+            now = self._clock() if now is None else now
+            with self._cv:
+                self._pending.append((now, event))
+                self._wake_locked()
+            return True
+        except Exception as exc:
+            self._error_once("submit", exc)
+            return False
+
+    # -- the morning report (bin/lib/dashboard_digest.py; handoff H4) -------------------------------------
+    def _scheduler(self):
+        if self._digest is None:
+            mod = _digest_module()
+            self._digest = mod.Scheduler(self.root) if mod is not None else False
+        return self._digest or None
+
+    def _digest_precheck(self, state, now):
+        """The poller's half: one stat() of the schedule file per state, and the tile rows when a digest looks due; else None."""
+        if now < self._digest_retry_at:
+            return None
+        scheduler = self._scheduler()
+        return None if scheduler is None else scheduler.precheck(state, now)
+
+    def _record_digest(self, batch, now):
+        """The worker's half, part 1: count the events this step takes (finished turns, verdicts, alerts) for the next report."""
+        scheduler = self._scheduler()
+        if scheduler is None or not batch:
+            return
+        try:
+            scheduler.record([event for _, event in batch], now)
+        except Exception as exc:
+            self._error_once("digest-record", exc)
+
+    def _dashboards_on(self):
+        """The laptop's remote-dashboards switch: the morning report is a dashboards feature and stops when that goes off."""
+        if self._dashboards is None:
+            self._dashboards = _load_sibling("companion_dashboards") or False
+        return bool(self._dashboards) and self._dashboards.enabled(self.root)
+
+    def _digest_event(self, rows, now):
+        """The worker's half, part 2: today's digest event, or None. Only the repo's sender (the flock owner), with a phone that
+        asked for `digest`, may spend the day; anyone else leaves it for whoever can send it."""
+        if rows is None:
+            return None
+        event = None
+        try:
+            data = self._load()
+            if data is not None and any("digest" in rec["events"] for rec in data["devices"].values()) and self._own_lock():
+                event = self._scheduler().fire(now, rows, self._dashboards_on)
+        except Exception as exc:
+            self._error_once("digest", exc)
+        if event is None:
+            self._digest_retry_at = now + 60.0
+        return event
 
     def _watch_test_request(self):
         """One stat() of the operator's request file per observed state. A request that is new -- a different stamp,
@@ -923,11 +1020,11 @@ class PushMonitor:
             with self._cv:
                 if self._stop.is_set():
                     return
-                if not (self._pending or self._tests or self._tickets
+                if not (self._pending or self._tests or self._tickets or self._digest_rows is not None
                         or any(d["window"] for d in self._devices.values())):
                     self._thread = None
                     return
-                if not (self._pending or self._tests):
+                if not (self._pending or self._tests or self._digest_rows is not None):
                     self._cv.wait(self._next_wait(self._clock()))
 
     def _next_wait(self, now):
@@ -953,6 +1050,11 @@ class PushMonitor:
                 self._pending.clear()
                 tests = list(self._tests)
                 self._tests.clear()
+                rows, self._digest_rows = self._digest_rows, None
+            self._record_digest(batch, now)
+            digest = self._digest_event(rows, now)
+            if digest is not None:
+                batch.append((now, digest))
             if batch:
                 self._accept(batch, now)
             self._flush(now)

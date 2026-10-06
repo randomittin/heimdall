@@ -165,7 +165,7 @@ ACTION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
 STOP_ID_RE = re.compile(r"s-[0-9a-f]{8}")
 REPO_ID_RE = re.compile(r"r-[0-9a-f]{4}")         # an allowlist id (companion_remote_switches.repo_id)
 TILE_ID_RE = re.compile(r"t-[0-9a-f]{8}")         # a dashboard tile id (bin/lib/companion_dashboards.py)
-AUDIT_OPS = frozenset(("create", "refine", "set-refresh", "refresh", "remove", "confirm", "decline", "expire", "run-failed",
+AUDIT_OPS = frozenset(("create", "refine", "set-refresh", "refresh", "remove", "set-digest", "confirm", "decline", "expire", "run-failed",
                        "idle-pause"))             # the dashboards ops an audit line may name, requests and what the laptop did
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,39}")      # a registered action name: kebab-case
 DETAIL_RE = re.compile(r"[a-z0-9-]{1,40}")
@@ -632,10 +632,11 @@ def _charge(root, action):
 
 # -- handlers: (root, fields, ctx) -> (ok, detail, extra) --------------------------------------------------------
 class _Ctx:
-    def __init__(self, device_id, deadline, repo=None):
+    def __init__(self, device_id, deadline, repo=None, caps=None):
         self.device_id = device_id
         self.deadline = deadline
         self.repo = repo   # an expand handler's allowlist entry {id, label, path, merge}: hmd's own path, never the phone's
+        self.caps = caps   # the capability set the phone listed (None = unknown): an op that needs a capability of its own checks it
 
 
 def _attention(root):
@@ -951,7 +952,7 @@ def _run_command(root, action, params, device_id, started, caps=None):
         if spec["cls"] == CLASS_EXPAND and not _audit_ready(root):
             return False, "internal-error", {}, audit_params, False, repo
         _charge(root, action)
-        ctx = _Ctx(device_id, started + _deadline_s(), entry)
+        ctx = _Ctx(device_id, started + _deadline_s(), entry, caps)
         try:
             ok, detail, extra = spec["handler"](root, fields, ctx)
         except _Timeout:
