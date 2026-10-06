@@ -2571,7 +2571,7 @@ class RelayClient:
         return not self.stop_event.is_set()
 
     def run_state_loop(self):
-        self.cache = UI.StateCache(self.root, self.transport)
+        self.cache = UI.StateCache(self.root, self.transport, dash_host=True)   # dash_host: the producer loop runs while remote dashboards are on
         self.cache.start()
         try:
             while not self.stop_event.is_set():

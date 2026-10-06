@@ -2559,6 +2559,44 @@ case "${1:-}" in
     if [ -x "$_app" ]; then exec "$_app" "$@"; fi
     echo "error: heimdall-app not found at $_app" >&2; exit 2
     ;;
+  dash)
+    # Custom dashboards, the laptop side (hmdapp docs/HANDOFF-TO-HEIMDALL-custom-dashboards.md DD4-DD6):
+    # pending|ls|show|confirm|decline|connector add|ls|rm|run -- see bin/lib/dashboard_producers.py. `confirm` and
+    # `connector add` refuse unless stdin is a terminal, so stdin is left exactly as the caller had it: that check is
+    # the whole point. The repo is --repo, else $CLAUDE_PROJECT_DIR, else the git toplevel, else the cwd (the order
+    # `hmd app` uses), so the tile the relay client stored is the tile this lists. The producer loop itself
+    # (`hmd dash run`) is started by the relay client while `hmd app remote-dashboards` is on; run it by hand only
+    # when no client is running.
+    shift
+    _dash_py="$PLUGIN_DIR/bin/lib/dashboard_producers.py"
+    if [ ! -r "$_dash_py" ]; then
+      echo "  Error: dashboard_producers.py not found at $_dash_py" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    _dash_py3=""
+    if [ -r "$PLUGIN_DIR/bin/lib/hmd-python.sh" ]; then
+      # shellcheck source=lib/hmd-python.sh
+      . "$PLUGIN_DIR/bin/lib/hmd-python.sh"
+      _dash_py3="$(hmd_python 2>/dev/null || true)"
+    fi
+    if [ -z "$_dash_py3" ]; then
+      echo "hmd dash needs a working python3 (none resolved by bin/lib/hmd-python.sh)." >&2
+      echo "Install python3, or set HMD_PYTHON=/path/to/python3, then re-run: hmd dash $*" >&2
+      exit 2
+    fi
+    _dash_has_repo=0
+    for _dash_a in "$@"; do
+      [ "$_dash_a" = "--repo" ] && _dash_has_repo=1
+    done
+    if [ "$_dash_has_repo" = 0 ]; then
+      _dash_top="${CLAUDE_PROJECT_DIR:-}"
+      [ -n "$_dash_top" ] || _dash_top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+      [ -n "$_dash_top" ] || _dash_top="$(pwd)"
+      set -- --repo "$_dash_top" "$@"
+    fi
+    exec "$_dash_py3" "$_dash_py" "$@"
+    ;;
   settings-guard)
     # Detect ANTHROPIC_* routing overrides persisted into a Claude Code
     # settings.json env block, which are applied on every launch and

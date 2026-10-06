@@ -50,6 +50,7 @@ volatile-repo-guard
 ui
 inbox
 app
+dash
 settings-guard
 hooks
 caveman-audit

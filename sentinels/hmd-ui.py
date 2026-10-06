@@ -282,6 +282,11 @@ CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companio
 # The custom-dashboards tile store (the phone's dash-v1): this file serves the LAPTOP view of its slice as the additive
 # `dashboards` key of /api/state (no panel data, no confirmation code), so a change in the store moves the digest.
 DASHBOARDS = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_dashboards.py"))
+# The producer loop's supervisor (bin/lib/dashboard_host.py). Only a process that serves the phone asks for one
+# (StateCache(dash_host=True): the relay client); `hmd ui` stays a renderer. It watches the `dashboards.enabled` this file
+# already collects, starts the loop -- a CHILD PROCESS, so a crash there is a restart there and never a missed frame here --
+# while remote dashboards are on, and stops it when they go off.
+DASH_HOST = _load_module("dashboard_host", os.path.join(LIB_DIR, "dashboard_host.py"))
 
 LIVE_USERS_PANEL_ID = "hmd-live-users"
 LIVE_USERS_REFRESH_S = 2
@@ -1026,6 +1031,29 @@ def close_push(monitor):
         _warn("push-close", "hmd-ui: push close: %s\n" % e.__class__.__name__)
 
 
+def new_dash_host(root):
+    return None if DASH_HOST is None else DASH_HOST.ProducerHost(root)
+
+
+def observe_dash(host, state):
+    """Hand one collected state to the producer-loop supervisor. Never raises: a fault there costs a refresh, never a poll."""
+    if host is None:
+        return
+    try:
+        host.observe(state)
+    except Exception as e:
+        _warn("dash-observe", "hmd-ui: dashboards host observe: %s\n" % e.__class__.__name__)
+
+
+def close_dash(host):
+    if host is None:
+        return
+    try:
+        host.close()
+    except Exception as e:
+        _warn("dash-close", "hmd-ui: dashboards host close: %s\n" % e.__class__.__name__)
+
+
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 # N4: a path TOKEN -- '/' or '~/' at the start of the string or right after
@@ -1302,7 +1330,7 @@ class StateCache:
     cheap, not from skipping it; a GET can also be what wakes an idle SSE stream, since
     refresh() notifies the same condition variable wait_for_change() blocks on."""
 
-    def __init__(self, root, transport=None):
+    def __init__(self, root, transport=None, dash_host=False):
         self.root = root
         self.transport = transport
         self._cond = threading.Condition()
@@ -1315,6 +1343,7 @@ class StateCache:
         self._live_users = None   # (value, written_at) of the self-published panel
         self._companion = new_companion_publisher(root)   # A3: chat / hmd-question / agents
         self._push = new_push_monitor(root)               # phone push: transitions -> Expo, on its own thread
+        self._dash = new_dash_host(root) if dash_host else None   # custom dashboards: the producer loop, a child process
 
     def refresh(self, publish=False, partial=False):
         """Collect, publish (state, digest), and wake wait_for_change() waiters if the digest moved.
@@ -1357,6 +1386,7 @@ class StateCache:
                 self._digest = digest
                 self._cond.notify_all()
         observe_push(self._push, state)   # after the waiters are woken: a push never delays a frame
+        observe_dash(self._dash, state)   # likewise: starts or stops the producer loop by `dashboards.enabled`
         return state, digest
 
     def _fresh_locked(self):
@@ -1456,6 +1486,7 @@ class StateCache:
     def stop(self):
         self._stop.set()
         close_push(self._push)
+        close_dash(self._dash)
 
 
 # ── HTTP layer ────────────────────────────────────────────────────────────────

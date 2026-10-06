@@ -81,6 +81,9 @@ TEXT_MAX_CHARS = 240
 TEXT_MAX_BYTES = 600
 SIBLING_TILES_MAX = 15
 SERVE_JOBS_PER_PASS = 50
+INTERVAL_ENV = "HMD_DASH_INTERVAL_S"           # seconds between passes of the loop (0.5..3600; default 5)
+HOST_LOCK_REL = os.path.join(PENDING_REL, "host.lock")   # held for as long as a long-running loop runs: ONE loop per repo
+EXIT_ALREADY_RUNNING = 3                       # the loop of this repo is held by another process (bin/lib/dashboard_host.py retries later)
 
 PSQL_ENV = "HMD_DASH_PSQL"                     # absolute path of the psql binary (default: the one on PATH)
 MODEL_BIN_ENV = "HMD_DASH_MODEL_BIN"           # replaces bin/hmd-exec as the model runner (tests; an operator's own wrapper)
@@ -649,6 +652,10 @@ class PsqlDriver:
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.communicate()
                 raise ProducerError("timeout") from None
+            except BaseException:                   # SIGTERM or Ctrl-C unwinding the loop: psql must not outlive it
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                raise
             if proc.returncode != 0 or len(out) > RAW_OUTPUT_MAX_BYTES:
                 raise ProducerError("producer-failed")
             try:
@@ -816,6 +823,10 @@ def run_model(prompt, timeout_s=None, home=None):
                 os.killpg(proc.pid, signal.SIGKILL)
             proc.communicate()
             raise GenerationError("timeout") from None
+        except BaseException:                       # SIGTERM or Ctrl-C unwinding the loop: the model must not outlive it
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            raise
     except OSError:
         raise GenerationError("generation-failed") from None
     finally:
@@ -1252,25 +1263,59 @@ def generate_next(root, store=None, model=None, home=None, drivers=None, environ
     return True
 
 
-def serve(root, store=None, once=False, interval_s=5.0, scheduler=None, sleep=time.sleep, model=None, home=None, drivers=None, environ=None):
+def interval_setting():
+    """Seconds between passes of the loop: 5, or $HMD_DASH_INTERVAL_S when it is a number in 0.5..3600 (anything else is ignored)."""
+    try:
+        value = float(os.environ.get(INTERVAL_ENV, 5.0))
+    except (TypeError, ValueError):
+        return 5.0
+    return value if math.isfinite(value) and 0.5 <= value <= 3600 else 5.0
+
+
+def serve_pass(root, store, scheduler, model=None, home=None, drivers=None, environ=None):
+    """One pass of the loop, only while the store says remote dashboards are on: serve every queued generation (at most
+    SERVE_JOBS_PER_PASS), expire unconfirmed proposals, one refresh pass."""
+    if store.enabled(root):
+        for _ in range(SERVE_JOBS_PER_PASS):
+            if not generate_next(root, store=store, model=model, home=home, drivers=drivers, environ=environ):
+                break
+        store.expire_pending(root)
+        run_due(root, scheduler, store=store, drivers=drivers, home=home, environ=environ)
+
+
+def serve(root, store=None, once=False, interval_s=5.0, scheduler=None, sleep=time.sleep, model=None, home=None, drivers=None, environ=None,
+          parent=None):
     """The producer half's whole loop for one repo (`hmd dash run`), run as the user's own process -- its environment is where connector
-    passwords are read from. Each pass, only while the store says remote dashboards are on: serve every queued generation (at most
-    SERVE_JOBS_PER_PASS), expire unconfirmed proposals, one refresh pass. Returns 0 after one pass when `once`, 1 without a store."""
+    passwords are read from. Each pass (serve_pass) runs only while the store says remote dashboards are on. Returns 0 after one pass
+    when `once`, 1 without a store.
+    A long-running loop is the ONE loop of its repo: it holds the flock on dash-pending/host.lock, and a second one returns
+    EXIT_ALREADY_RUNNING. `parent` is set by the relay client that supervises this process (bin/lib/dashboard_host.py): the loop then
+    ends, returning 0, when remote dashboards are switched off (the supervisor starts it again when they go on) and when that process
+    is no longer its parent -- nobody supervises an orphan. A pass that raises costs that pass, never the loop."""
     store = store or _store()
     if store is None:
         sys.stderr.write("hmd dash run: the dashboards store (bin/lib/companion_dashboards.py) did not load\n")
         return 1
     scheduler = scheduler or Scheduler()
-    while True:
-        if store.enabled(root):
-            for _ in range(SERVE_JOBS_PER_PASS):
-                if not generate_next(root, store=store, model=model, home=home, drivers=drivers, environ=environ):
-                    break
-            store.expire_pending(root)
-            run_due(root, scheduler, store=store, drivers=drivers, home=home, environ=environ)
-        if once:
-            return 0
-        sleep(interval_s)
+    if once:
+        serve_pass(root, store, scheduler, model, home, drivers, environ)
+        return 0
+    with _locked(os.path.join(root, HOST_LOCK_REL), blocking=False) as held:
+        if not held:
+            sys.stderr.write("hmd dash run: the producer loop of this repo already runs in another process (the relay client, or another "
+                             "`hmd dash run`); not starting a second one\n")
+            return EXIT_ALREADY_RUNNING
+        while parent is None or (os.getppid() == parent and store.enabled(root)):
+            try:
+                serve_pass(root, store, scheduler, model, home, drivers, environ)
+            except Exception as e:
+                _log("pass-failed", error=type(e).__name__)
+            sleep(interval_s)
+    return 0
+
+
+def _exit_on_term(signum, frame):
+    raise SystemExit(0)
 
 
 # -- 7. the command line: hmd dash ... ---------------------------------------------------------------------------
@@ -1278,7 +1323,9 @@ USAGE = ("usage: hmd dash pending|ls [--repo DIR]\n"
          "       hmd dash show <tile> [--repo DIR]\n"
          "       hmd dash confirm <tile> [--code NNNNNN] [--repo DIR]     (needs a terminal)\n"
          "       hmd dash decline <tile> [--repo DIR]\n"
-         "       hmd dash run [--once] [--interval S] [--repo DIR]     (the producer loop; run it as yourself)\n"
+         "       hmd dash run [--once] [--interval S] [--parent PID] [--repo DIR]\n"
+         "                    the producer loop; run it as yourself. The relay client starts it while remote dashboards are on and passes\n"
+         "                    --parent (the loop ends when they go off, or when PID is gone); exit 3 = another process already runs it\n"
          "       hmd dash connector add <name> --engine sqlite --path FILE        (needs a terminal)\n"
          "       hmd dash connector add <name> --engine postgres --host H --port P --dbname D --user U [--password-env VAR] [--sslmode M]\n"
          "       hmd dash connector ls | rm <name>\n")
@@ -1474,15 +1521,18 @@ def main(argv):
         _print_tile(root, tile, time.time())
         return 0
     if cmd == "run":
-        opts, pos = _split_options([a for a in args if a != "--once"], ("--interval",))
+        opts, pos = _split_options([a for a in args if a != "--once"], ("--interval", "--parent"))
         try:
-            interval = float(opts.get("--interval", 5)) if opts is not None else 0.0
+            interval = float(opts.get("--interval", interval_setting())) if opts is not None else 0.0
+            parent = int(opts["--parent"]) if opts is not None and "--parent" in opts else None
         except ValueError:
-            interval = 0.0
-        if opts is None or pos or not 0.5 <= interval <= 3600:
+            interval, parent = 0.0, None
+        if opts is None or pos or not 0.5 <= interval <= 3600 or (parent is not None and parent <= 1):
             sys.stderr.write(USAGE)
             return 2
-        return serve(root, once="--once" in args, interval_s=interval)
+        if "--once" not in args:
+            signal.signal(signal.SIGTERM, _exit_on_term)     # unwind through the children's cleanup, not past it
+        return serve(root, once="--once" in args, interval_s=interval, parent=parent)
     if cmd == "confirm":
         return _cmd_confirm(root, args)
     if cmd == "decline" and len(args) == 1:
