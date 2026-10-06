@@ -4,7 +4,7 @@
   "about": [
     "Wire contract for pair-by-session-code on the hmd relay. Design of record: hmdapp docs/superpowers/specs/2026-10-05-pair-by-session-code.md -- it wins over this file on any disagreement; this file is the relay's exact reading of it. Three parties align to it: the relay (relay/test/code-pair.spec.ts drives the real Worker + Durable Objects with it), the hmd client (bin/heimdall-relay-client, bin/heimdall-app) and the phone app (hmdapp). The pre-existing wire (pair_init, stream, frames, phone claim, revoke) is wire.json and is unchanged, except that hmd's device_bound payload gains `via` (frames.device_bound_to_hmd_code / _qr below) -- wire.json carries the `via: qr` form.",
     "$name in a string is a binding (see `bindings`): a value the relay mints is matched by pattern when the relay is the producer, and takes its example when a client is fed it. Every `body` is the exact JSON the relay accepts or answers: objects have exactly these keys, no more and no fewer. Error bodies are {error:<string>, retry_after_s?:<integer>}; every 429 also carries a Retry-After header equal to retry_after_s.",
-    "Encodings. Every binary value on this wire (install_pubkey, hmd_commit, sig, key_reveal.hmd_pubkey, key_reveal.nonce) is base64url, unpadded, alphabet A-Za-z0-9_- only -- never `=`, `+` or `/`. A 32-byte value is 43 characters, a 64-byte value 86. `code` is exactly 5 characters of constants.code_alphabet, uppercase (the app normalises before it sends; the relay does not). `ts` is epoch seconds as a JSON integer.",
+    "Encodings. Every binary value on this wire (install_pubkey, hmd_commit, sig) is base64url, unpadded, alphabet A-Za-z0-9_- only -- never `=`, `+` or `/` -- except key_reveal.hmd_pubkey and key_reveal.nonce. A 32-byte value is 43 characters, a 64-byte value 86. hmd sends key_reveal.hmd_pubkey and key_reveal.nonce as standard base64 (RFC 4648 section 4), padded: alphabet A-Za-z0-9+/ and one closing `=`, 44 characters for 32 bytes. That is the spelling the QR already carries hmd_pubkey in (wire.json `qr.hmd_pubkey`) and the one bin/heimdall-relay-client emits; test/app-pair-code.test.sh checks it against the `b64std_32` binding below. A receiver of key_reveal MUST accept both fields in that form AND as base64url unpadded, and checks the decoded length (32 bytes), not the spelling: the commitment then binds the bytes. The relay reads neither spelling; it forwards both fields verbatim.`code` is exactly 5 characters of constants.code_alphabet, uppercase (the app normalises before it sends; the relay does not). `ts` is epoch seconds as a JSON integer.",
     "Config gate. GITHUB_CLIENT_ID (a wrangler [vars] entry), GITHUB_CLIENT_SECRET and RELAY_IDENTITY_SECRET (wrangler secrets) must all be set. If any is unset or empty, every route in this file answers 503 `code pairing disabled` before it touches a Durable Object or GitHub, and the QR flow is unaffected -- that is also what a self-hosted relay without a GitHub App answers.",
     "GitHub. The laptop's token (`gh auth token`) is used for exactly one call, GET /user. The phone's token (device flow against the project's GitHub App) is used for exactly two: POST /applications/{client_id}/token (proves it was issued to OUR App and names the user), then DELETE /applications/{client_id}/token (single use by construction). No token is stored or logged; every GitHub call has a 5 s timeout and answers 502 `github unavailable` when it cannot give a verdict.",
     "Every route below lists its `check_order`: the first check that fails answers, so a later one never runs. Throttles are sliding windows (src/pairing.ts recordAttempt): the attempt that crosses the bound is the one refused, and a refused attempt still counts toward the window.",
@@ -63,6 +63,10 @@
     "b64url_64": {
       "match": "^[A-Za-z0-9_-]{86}$",
       "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREnotASecretFIXTUREnotASecretFIXTUREnotASecretx"
+    },
+    "b64std_32": {
+      "match": "^[A-Za-z0-9+/]{43}=$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREno="
     },
     "gh_assertion": {
       "match": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$",
@@ -332,10 +336,10 @@
         "type": "key_reveal",
         "nonce": null,
         "ciphertext": null,
-        "payload": { "hmd_pubkey": "$b64url_32", "nonce": "$b64url_32" }
+        "payload": { "hmd_pubkey": "$b64std_32", "nonce": "$b64std_32" }
       },
       "notes": [
-        "hmd_pubkey is the raw 32-byte X25519 public key of the session's pair_init keypair and nonce is the nonce_h its hmd_commit was computed with; both base64url, unpadded.",
+        "hmd_pubkey is the raw 32-byte X25519 public key of the session's pair_init keypair and nonce is the nonce_h its hmd_commit was computed with; both standard base64 (padded, the `$b64std_32` binding), the spelling the QR carries hmd_pubkey in. Receivers MUST also accept base64url unpadded for either field (see Encodings in `about`); the relay forwards both without reading them.",
         "seq is 0: the frame is not sealed and takes no part in hmd's sealed seq counter."
       ],
       "responses": {
