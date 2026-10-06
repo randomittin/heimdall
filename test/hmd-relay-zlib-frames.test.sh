@@ -122,7 +122,7 @@ def real_state():
 
 def plain_frame(state):
     """The bytes send_hmd_frame serialises a state frame to before any packing: the state plus hmd'"'"'s caps."""
-    return json.dumps({"state": state, "caps": e2e.hmd_caps(extra=[e2e.CAP_LOGIN, e2e.CAP_CONTROLS, "view-v1"])}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps({"state": state, "caps": e2e.hmd_caps(extra=[e2e.CAP_LOGIN, e2e.CAP_CONTROLS, "view-v1", "dash-v1"])}, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def real_state_plaintext():
@@ -437,7 +437,7 @@ rig.send("state", {"state": state})
 got = rig.plaintext(rig.last("state"))
 assert got == plain_frame(state), "before a resync the frame must be exactly the plain {state, caps}"
 obj = json.loads(got)
-assert "z" not in obj and obj["caps"] == ["controls-v1", "login-v1", "push-v1", "resync", "view-v1", "z-zlib"] and obj["state"] == state
+assert "z" not in obj and obj["caps"] == ["controls-v1", "dash-v1", "login-v1", "push-v1", "resync", "view-v1", "z-zlib"] and obj["state"] == state
 # caps outside a resync command are not the handshake: a send-message that carries them changes nothing
 rig.command({"action": "send-message", "params": {"text": "no handshake here"}, "caps": ["z-zlib"]})
 rig.command({"action": "decide", "params": {"id": "p-0", "decision": "deny"}, "caps": ["z-zlib"]})
@@ -465,7 +465,7 @@ assert obj["z"] == "zlib" and list(obj) == ["z", "d"], "expected the envelope, g
 assert rig.E2E.unpack_plaintext(got) == plain_frame(state), "the envelope must inflate to the plain frame"
 assert zlib.decompress(base64.b64decode(obj["d"])) == plain_frame(state)
 inner = json.loads(zlib.decompress(base64.b64decode(obj["d"])))
-assert inner["caps"] == ["controls-v1", "login-v1", "push-v1", "resync", "view-v1", "z-zlib"], "the inner plaintext still carries hmd's caps"
+assert inner["caps"] == ["controls-v1", "dash-v1", "login-v1", "push-v1", "resync", "view-v1", "z-zlib"], "the inner plaintext still carries hmd's caps"
 before, after = len(plain_post["ciphertext"]), len(post["ciphertext"])
 assert after < 0.6 * before, "sealed ciphertext went %d -> %d B, expected <= 60%%" % (before, after)
 print("envelope ciphertext %d -> %d B (%.1f%%)" % (before, after, 100.0 * after / before))
@@ -633,8 +633,8 @@ rig.resync(["z-zlib"])
 state = real_state()
 rig.send("state", {"state": state})
 got = rig.plaintext(rig.last("state"))
-assert json.loads(got)["caps"] == ["controls-v1", "login-v1", "push-v1", "resync", "view-v1"] and "z" not in json.loads(got)
-assert got == json.dumps({"state": state, "caps": ["controls-v1", "login-v1", "push-v1", "resync", "view-v1"]}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+assert json.loads(got)["caps"] == ["controls-v1", "dash-v1", "login-v1", "push-v1", "resync", "view-v1"] and "z" not in json.loads(got)
+assert got == json.dumps({"state": state, "caps": ["controls-v1", "dash-v1", "login-v1", "push-v1", "resync", "view-v1"]}, sort_keys=True, separators=(",", ":")).encode("utf-8")
 try:
     rig.E2E.compress_envelope(plain_frame(state))
 except rig.E2E.E2EError as e:
