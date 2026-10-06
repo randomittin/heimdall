@@ -72,9 +72,9 @@ P="$(make_project)"
 dirty_one_file "$P" "a.txt"
 ( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=3 "$WIP" note ) >/dev/null 2>&1
 ( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=3 "$WIP" note ) >/dev/null 2>&1
-[ "$(ncommits "$P")" -eq 1 ] && ok "no commit yet after 2 of 3 note calls (still 1 commit)" || bad "unexpected commit count=$(ncommits "$P")"
+if [ "$(ncommits "$P")" -eq 1 ]; then ok "no commit yet after 2 of 3 note calls (still 1 commit)"; else bad "unexpected commit count=$(ncommits "$P")"; fi
 ST="$(cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=3 "$WIP" status 2>/dev/null)"
-printf '%s' "$ST" | grep -q "count=2" && ok "status reports count=2 ($ST)" || bad "status did not report count=2: $ST"
+if printf '%s' "$ST" | grep -q "count=2"; then ok "status reports count=2 ($ST)"; else bad "status did not report count=2: $ST"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,12 +84,12 @@ dirty_one_file "$P" "b.txt"
 ( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=3 "$WIP" note ) >/dev/null 2>&1
 ( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=3 "$WIP" note ) >/dev/null 2>&1
 ( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=3 "$WIP" note ) >/dev/null 2>&1
-[ "$(ncommits "$P")" -eq 2 ] && ok "3rd note call created exactly one commit (total=2)" || bad "commit count=$(ncommits "$P") (want 2)"
+if [ "$(ncommits "$P")" -eq 2 ]; then ok "3rd note call created exactly one commit (total=2)"; else bad "commit count=$(ncommits "$P") (want 2)"; fi
 SUBJ="$(git -C "$P" log -1 --format=%s)"
 case "$SUBJ" in wip:*) ok "commit subject is wip:-marked ($SUBJ)" ;; *) bad "commit subject not wip:-marked: $SUBJ" ;; esac
-git -C "$P" log -1 --format=%b | grep -qi "heimdall-wip" && ok "commit body carries the heimdall-wip marker" || bad "no heimdall-wip marker in body"
+if git -C "$P" log -1 --format=%b | grep -qi "heimdall-wip"; then ok "commit body carries the heimdall-wip marker"; else bad "no heimdall-wip marker in body"; fi
 ST="$(cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=3 "$WIP" status 2>/dev/null)"
-printf '%s' "$ST" | grep -q "count=0" && ok "counter reset to 0 after commit" || bad "counter not reset: $ST"
+if printf '%s' "$ST" | grep -q "count=0"; then ok "counter reset to 0 after commit"; else bad "counter not reset: $ST"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,9 +97,9 @@ echo "C. NOTHING DIRTY — threshold hit but clean tree: no empty commit, counte
 P="$(make_project)"
 ( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=2 "$WIP" note ) >/dev/null 2>&1
 ( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=2 "$WIP" note ) >/dev/null 2>&1
-[ "$(ncommits "$P")" -eq 1 ] && ok "no empty commit created on a clean tree (still 1 commit)" || bad "unexpected commit on clean tree, count=$(ncommits "$P")"
+if [ "$(ncommits "$P")" -eq 1 ]; then ok "no empty commit created on a clean tree (still 1 commit)"; else bad "unexpected commit on clean tree, count=$(ncommits "$P")"; fi
 ST="$(cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=2 "$WIP" status 2>/dev/null)"
-printf '%s' "$ST" | grep -q "count=0" && ok "counter still resets at threshold even with nothing dirty" || bad "counter did not reset: $ST"
+if printf '%s' "$ST" | grep -q "count=0"; then ok "counter still resets at threshold even with nothing dirty"; else bad "counter did not reset: $ST"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ P="$(make_project)"
 touch "$P/.heimdall-no-autocommit"
 dirty_one_file "$P" "d.txt"
 ( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=1 "$WIP" note ) >/dev/null 2>&1
-[ "$(ncommits "$P")" -eq 1 ] && ok "no-autocommit flag suppressed the wip commit" || bad "wip commit fired despite .heimdall-no-autocommit"
+if [ "$(ncommits "$P")" -eq 1 ]; then ok "no-autocommit flag suppressed the wip commit"; else bad "wip commit fired despite .heimdall-no-autocommit"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,7 +116,7 @@ echo "E. CHECKPOINT FORCES IMMEDIATE COMMIT — ignores the counter:"
 P="$(make_project)"
 dirty_one_file "$P" "e.txt"
 ( cd "$P" && "$WIP" checkpoint ) >/dev/null 2>&1
-[ "$(ncommits "$P")" -eq 2 ] && ok "checkpoint committed immediately with counter untouched" || bad "checkpoint did not commit, count=$(ncommits "$P")"
+if [ "$(ncommits "$P")" -eq 2 ]; then ok "checkpoint committed immediately with counter untouched"; else bad "checkpoint did not commit, count=$(ncommits "$P")"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -127,12 +127,12 @@ dirty_one_file "$P" "f1.txt"; ( cd "$P" && "$WIP" checkpoint ) >/dev/null 2>&1
 dirty_one_file "$P" "f2.txt"; ( cd "$P" && "$WIP" checkpoint ) >/dev/null 2>&1
 dirty_one_file "$P" "f3.txt"; ( cd "$P" && "$WIP" checkpoint ) >/dev/null 2>&1
 BEFORE_TREE="$(git -C "$P" rev-parse 'HEAD^{tree}')"
-[ "$(ncommits "$P")" -eq 4 ] && ok "setup: 3 wip commits atop initial (total=4)" || bad "setup wrong, count=$(ncommits "$P")"
+if [ "$(ncommits "$P")" -eq 4 ]; then ok "setup: 3 wip commits atop initial (total=4)"; else bad "setup wrong, count=$(ncommits "$P")"; fi
 ( cd "$P" && "$WIP" squash --base "$BASE_SHA" ) >/dev/null 2>&1
-[ "$(ncommits "$P")" -eq 2 ] && ok "3 wip commits squashed into 1 (total=2)" || bad "squash count wrong, count=$(ncommits "$P")"
+if [ "$(ncommits "$P")" -eq 2 ]; then ok "3 wip commits squashed into 1 (total=2)"; else bad "squash count wrong, count=$(ncommits "$P")"; fi
 AFTER_TREE="$(git -C "$P" rev-parse 'HEAD^{tree}')"
-[ "$BEFORE_TREE" = "$AFTER_TREE" ] && ok "tree contents byte-identical before/after squash" || bad "squash altered tree contents"
-[ -f "$P/f1.txt" ] && [ -f "$P/f2.txt" ] && [ -f "$P/f3.txt" ] && ok "all 3 files still present after squash" || bad "squash lost a file"
+if [ "$BEFORE_TREE" = "$AFTER_TREE" ]; then ok "tree contents byte-identical before/after squash"; else bad "squash altered tree contents"; fi
+if [ -f "$P/f1.txt" ] && [ -f "$P/f2.txt" ] && [ -f "$P/f3.txt" ]; then ok "all 3 files still present after squash"; else bad "squash lost a file"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,8 +143,8 @@ dirty_one_file "$P" "g.txt"
 RC1=0; RC2=0
 ( cd "$P" && payload "g.txt" | HEIMDALL_WIP_EDIT_THRESHOLD=2 CLAUDE_PLUGIN_ROOT="$REPO" "$PRECHECK" ) >/dev/null 2>&1 || RC1=$?
 ( cd "$P" && payload "g.txt" | HEIMDALL_WIP_EDIT_THRESHOLD=2 CLAUDE_PLUGIN_ROOT="$REPO" "$PRECHECK" ) >/dev/null 2>&1 || RC2=$?
-[ "$(ncommits "$P")" -eq 2 ] && ok "precheck-edit's 2nd invocation auto-committed via the wired wip-commit call" || bad "no auto-commit via precheck-edit wiring, count=$(ncommits "$P")"
-[ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ] && ok "precheck-edit's own exit-code contract unchanged (0 on a clear file)" || bad "precheck-edit exit codes changed: rc1=$RC1 rc2=$RC2"
+if [ "$(ncommits "$P")" -eq 2 ]; then ok "precheck-edit's 2nd invocation auto-committed via the wired wip-commit call"; else bad "no auto-commit via precheck-edit wiring, count=$(ncommits "$P")"; fi
+if [ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ]; then ok "precheck-edit's own exit-code contract unchanged (0 on a clear file)"; else bad "precheck-edit exit codes changed: rc1=$RC1 rc2=$RC2"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,8 +154,11 @@ dirty_one_file "$P" "h1.txt"
 dirty_one_file "$P" "h2.txt"
 ( cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=9 "$WIP" note ) >/dev/null 2>&1
 ST="$(cd "$P" && HEIMDALL_WIP_EDIT_THRESHOLD=9 "$WIP" status 2>/dev/null)"
-printf '%s' "$ST" | grep -q "count=1" && printf '%s' "$ST" | grep -q "threshold=9" && printf '%s' "$ST" | grep -q "dirty=2" \
-  && ok "status line correct: $ST" || bad "status line wrong: $ST"
+if printf '%s' "$ST" | grep -q "count=1" && printf '%s' "$ST" | grep -q "threshold=9" && printf '%s' "$ST" | grep -q "dirty=2"; then
+  ok "status line correct: $ST"
+else
+  bad "status line wrong: $ST"
+fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,13 +183,21 @@ make_hookless_project() {
 assert_attribution() { # <repo> <label> — grades HEAD's full message
   local msg
   msg="$(git -C "$1" log -1 --format=%B)"
-  [ "$(printf '%s\n' "$msg" | grep -Fxc "$PINNED_TRAILER")" -eq 1 ] \
-    && ok "$2: exactly one runhmd trailer line" || bad "$2: runhmd trailer line count != 1: $msg"
-  printf '%s' "$msg" | grep -qF "$RETIRED_ADDR" \
-    && bad "$2: carries the retired $RETIRED_ADDR address: $msg" || ok "$2: no retired $RETIRED_ADDR address"
-  [ "$(printf '%s\n' "$msg" | git -C "$1" interpret-trailers --only-trailers)" = "$PINNED_TRAILER" ] \
-    && ok "$2: git parses it as the sole trailer (the form GitHub links to the runhmd account)" \
-    || bad "$2: git does not parse the runhmd line as the sole trailer: $msg"
+  if [ "$(printf '%s\n' "$msg" | grep -Fxc "$PINNED_TRAILER")" -eq 1 ]; then
+    ok "$2: exactly one runhmd trailer line"
+  else
+    bad "$2: runhmd trailer line count != 1: $msg"
+  fi
+  if printf '%s' "$msg" | grep -qF "$RETIRED_ADDR"; then
+    bad "$2: carries the retired $RETIRED_ADDR address: $msg"
+  else
+    ok "$2: no retired $RETIRED_ADDR address"
+  fi
+  if [ "$(printf '%s\n' "$msg" | git -C "$1" interpret-trailers --only-trailers)" = "$PINNED_TRAILER" ]; then
+    ok "$2: git parses it as the sole trailer (the form GitHub links to the runhmd account)"
+  else
+    bad "$2: git does not parse the runhmd line as the sole trailer: $msg"
+  fi
 }
 
 P="$(make_hookless_project)"
