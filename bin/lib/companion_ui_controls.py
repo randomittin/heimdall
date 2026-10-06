@@ -111,6 +111,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from importlib.util import module_from_spec, spec_from_file_location
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -134,7 +135,14 @@ RECENT_SCAN_BYTES = 256 * 1024                # how much of an audit generation 
 
 CLASS_READ, CLASS_SAFE_WRITE, CLASS_RISKY_WRITE, CLASS_EXPAND = "read", "safe-write", "risky-write", "expand"
 CLASSES = (CLASS_READ, CLASS_SAFE_WRITE, CLASS_RISKY_WRITE, CLASS_EXPAND)
-EXPAND_SWITCHES = ("launch", "merge")         # the two laptop switches (companion_remote_switches.SWITCHES)
+EXPAND_SWITCHES = ("launch", "merge", "dashboards")   # the laptop switches (companion_remote_switches.SWITCHES)
+# What register_action's `policy` may carry: the per-action rules a sibling module's action needs of this dispatcher and nothing
+# else does. cap: the phone must have listed it (caps-missing). rid_re: a rid is REQUIRED and must be exactly this shape (it is
+# then also handed to the handler as fields["rid"]). replay_detail: the detail a replayed rid's ok ack carries instead of the first
+# one's. global_rate: False = exempt from the all-controls bucket (the action's own `rate` still applies). off_detail: the refusal
+# when its switch is off (default not-allowed). open_switch: the switch is the whole gate, there is no repo allowlist (the action
+# only ever acts on the session's own repo). timeline_ops: only these `op`s are also recorded in relay-events.jsonl.
+POLICY_KEYS = frozenset(("cap", "rid_re", "replay_detail", "global_rate", "off_detail", "open_switch", "timeline_ops"))
 RESERVED_EXPAND = {"launch-session": "launch", "pr-merge": "merge"}   # fixed by CP2: class expand, this switch, always
 KILL_SWITCH_EXEMPT = frozenset(("launch-stop",))   # reduce-direction: ends only what the phone started
 EXPAND_RATES = {"launch-session": ((1, 1 / 60.0),),
@@ -156,6 +164,9 @@ HOOK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ACTION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
 STOP_ID_RE = re.compile(r"s-[0-9a-f]{8}")
 REPO_ID_RE = re.compile(r"r-[0-9a-f]{4}")         # an allowlist id (companion_remote_switches.repo_id)
+TILE_ID_RE = re.compile(r"t-[0-9a-f]{8}")         # a dashboard tile id (bin/lib/companion_dashboards.py)
+AUDIT_OPS = frozenset(("create", "refine", "set-refresh", "refresh", "remove", "confirm", "decline", "expire", "run-failed",
+                       "idle-pause"))             # the dashboards ops an audit line may name, requests and what the laptop did
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,39}")      # a registered action name: kebab-case
 DETAIL_RE = re.compile(r"[a-z0-9-]{1,40}")
 DEVICE_RE = re.compile(r"[0-9a-f]{8}|direct|unknown")
@@ -540,6 +551,8 @@ _AUDIT_FIELDS = {
     "model": lambda v: v in ("sonnet", "opus", "haiku"),
     "method": lambda v: v in ("squash", "merge", "rebase"),
     "number": lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 < v < 10 ** 9,
+    "op": lambda v: v in AUDIT_OPS,
+    "tile_id": lambda v: isinstance(v, str) and TILE_ID_RE.fullmatch(v) is not None,
 }
 
 
