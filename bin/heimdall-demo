@@ -54,14 +54,13 @@ else
 fi
 B='\033[1m'; R='\033[0m'; UL='\033[4m'
 
-# ── Resolve plugin root (bin/heimdall-demo → heimdall/) ──
+# ── Resolve the sibling tools (bin/heimdall-demo → bin/) ──
 
 SELF="$0"
 if command -v readlink &>/dev/null; then
   SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
 fi
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
-PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
 REEL_BIN="$BIN_DIR/heimdall-reel"
 CARD_BIN="$BIN_DIR/summary-card"
 FACE_BIN="$BIN_DIR/heimdall-face"
@@ -257,8 +256,8 @@ mark_first_run_done() {
 # presses a key. bash 3.2-safe: `read -t` accepts fractional seconds on 3.2+.
 # Returns 0 normally, 1 if a key was pressed (caller aborts remaining frames).
 hold_or_skip() { # seconds (decimal)
-  local secs="$1" junk
-  if read -rsn1 -t "$secs" junk 2>/dev/null; then
+  local secs="$1"
+  if read -rsn1 -t "$secs" _ 2>/dev/null; then
     return 1
   fi
   return 0

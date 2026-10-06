@@ -538,6 +538,7 @@ f1_onboard_if_cold() {
   fi
 
   if [ "$is_cold" = "1" ]; then
+    # shellcheck disable=SC2034  # documented F1_* phase global (see the header contract); published, not read in this file
     F1_DID_ONBOARD=1
     _trace_order "onboard"
     if [ -n "${HEIMDALL_TRACE_ORDER:-}" ]; then
@@ -4021,7 +4022,9 @@ Read .planning/CHECKPOINT.md for full context. Resume from where it says.
 "
     printf "  \033[38;2;0;212;255m▸ Checkpoint loaded\033[0m — resuming from last session\n"
   elif [ -f "$state" ]; then
-    local phase=$(grep -m1 "^current_phase:" "$state" 2>/dev/null | sed 's/current_phase: *//')
+    local phase
+    # `|| true`: a STATE.md with no current_phase line makes grep exit 1; under set -e/pipefail that must not abort the launch.
+    phase=$(grep -m1 "^current_phase:" "$state" 2>/dev/null | sed 's/current_phase: *//') || true
     if [ -n "$phase" ] && [ "$phase" != "0" ]; then
       CHECKPOINT_CONTEXT="${CHECKPOINT_CONTEXT}
 --- PRIOR STATE ---
@@ -4919,11 +4922,13 @@ narrate_launch_wakeup() {
 
   # Reuse the demo's exact frame SEQUENCE; faster per-frame holds for the launch
   # variant. Sum of holds = 0.30+0.18+0.28+0.30+0.22 = 1.28s (≤ ~1.5s cap).
-  local frames="sleep blink idle thinking idle"
-  local holds="0.30 0.18 0.28 0.30 0.22"
-  local first=1 i=1 emo hold junk
-  for emo in $frames; do
-    hold="$(printf '%s\n' $holds | sed -n "${i}p")"
+  # wake_frames/wake_holds, not frames/holds: the spinner's `frames` is an ARRAY local, and a
+  # same-named string local made shellcheck read this loop as an unindexed array expansion.
+  local wake_frames="sleep blink idle thinking idle"
+  local wake_holds="0.30 0.18 0.28 0.30 0.22"
+  local first=1 i=1 emo hold
+  for emo in $wake_frames; do
+    hold="$(printf '%s\n' $wake_holds | sed -n "${i}p")"
     # Repaint each 3-line frame in place after the first (cursor up 3 rows).
     [ "$first" -eq 1 ] || printf '\033[3A'
     first=0
@@ -4932,7 +4937,7 @@ narrate_launch_wakeup() {
     done < <("$face" --frame "$emo" "$face_flag" 2>/dev/null)
     # Hold; any keypress within the hold window aborts the remaining frames and
     # settles on idle immediately (read -t is fractional-second on bash 3.2+).
-    if read -rsn1 -t "$hold" junk 2>/dev/null; then
+    if read -rsn1 -t "$hold" _ 2>/dev/null; then
       printf '\033[3A'
       while IFS= read -r _fl; do
         printf '\033[2K  %s\n' "$_fl"

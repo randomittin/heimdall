@@ -1062,7 +1062,7 @@ ok "R9 gitleaks: clean"
 # with HEIMDALL_SKIP_ID_GUARD unset so R9 is unbypassable.
 IDCHECK="$REPO_ROOT/bin/heimdall-check-identities"
 [ -x "$IDCHECK" ] || die "R9: bin/heimdall-check-identities missing/not executable at $IDCHECK"
-if ! ( cd "$CLONE_DIR" && HEIMDALL_SKIP_ID_GUARD= "$IDCHECK" --all ); then
+if ! ( cd "$CLONE_DIR" && HEIMDALL_SKIP_ID_GUARD='' "$IDCHECK" --all ); then
   die "R9: non-allowlisted author/committer identity in pushed history (see above)"
 fi
 ok "R9 identities: all author+committer emails allowlisted"

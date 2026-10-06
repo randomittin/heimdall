@@ -755,7 +755,7 @@ remove_module() {
   # one the marker records. Anything that pre-existed the add is never touched.
   [ -f "$STATE/$STATE_MARKER" ] || return 0
   local remaining
-  remaining="$(ls -A "$STATE" 2>/dev/null | grep -v "^${STATE_MARKER}\$" | head -1)"
+  remaining="$(find -H "$STATE" -mindepth 1 -maxdepth 1 ! -name "$STATE_MARKER" 2>/dev/null | head -1)"  # -H: follow a symlinked $STATE, as ls did
   [ -z "$remaining" ] || return 0
 
   local topmost dir

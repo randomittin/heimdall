@@ -624,6 +624,7 @@ _hmd_headroom_chain_decide() {
   local i=0 deadline=$((SECONDS + HMD_HEADROOM_READY_POLLS / 4 + 1))
   while [ "$i" -lt "$HMD_HEADROOM_READY_POLLS" ] && [ "$SECONDS" -lt "$deadline" ]; do
     if live="$(hmd_headroom_probe "$port")"; then
+      # shellcheck disable=SC2034  # caller-facing output: the sourcing launcher (heimdall-wrap/-route) reads it, see the header
       HMD_HEADROOM_BASE_URL="http://127.0.0.1:$port"
       HMD_HEADROOM_WHY="started the Headroom proxy on $port$started_via (upstream $live)"
       return 0
@@ -666,6 +667,7 @@ hmd_headroom_chain() {
   fi
   if [ "$HMD_HEADROOM_DOWN" = 1 ] || [ -n "$note" ]; then
     printf 'hmd: headroom not routing — %s; running direct%s\n' "${HMD_HEADROOM_WHY:-chain unavailable}" "$note" >&2
+    # shellcheck disable=SC2034  # caller-facing output: launchers read it so the warning is never printed twice, see the header
     HMD_HEADROOM_WARNED=1
   fi
   return 1
