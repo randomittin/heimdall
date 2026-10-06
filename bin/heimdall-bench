@@ -54,12 +54,12 @@ B='\033[1m'; R='\033[0m'
 
 usage() {
   cat <<EOF
-$(printf "${P}${B}")heimdall-bench$(printf "${R}") — reproduce the public benchmark table on your own machine
+$(printf '%b' "$P$B")heimdall-bench$(printf '%b' "$R") — reproduce the public benchmark table on your own machine
 
-$(printf "${B}")USAGE$(printf "${R}")
+$(printf '%b' "$B")USAGE$(printf '%b' "$R")
   heimdall-bench [--dry|--live] [--model <id>] [--task <id>] [--arm raw|heimdall|both] [--table]
 
-$(printf "${B}")FLAGS$(printf "${R}")
+$(printf '%b' "$B")FLAGS$(printf '%b' "$R")
   --dry              Validate the suite + print the capture plan. No API calls. (default)
   --live             Actually invoke Claude and measure (spends API tokens).
   --model <id>       Model id passed through to the Claude CLI (e.g. the flagship).
@@ -69,11 +69,11 @@ $(printf "${B}")FLAGS$(printf "${R}")
   --table            Print the published-format markdown table from the last live run.
   -h, --help         Show this help.
 
-$(printf "${B}")PREREQUISITES$(printf "${R}")
+$(printf '%b' "$B")PREREQUISITES$(printf '%b' "$R")
   Dry mode (default): bash + jq only — runs on any fresh machine, no API.
   --live mode:        additionally needs the \`claude\` CLI with valid auth.
 
-$(printf "${B}")WHAT IT DOES$(printf "${R}")
+$(printf '%b' "$B")WHAT IT DOES$(printf '%b' "$R")
   Runs a fixed suite of representative coding tasks under two arms — raw Claude
   Code vs Claude Code driven through heimdall — and measures, per task x arm:
   tokens (from the CLI's own usage accounting), wall-clock seconds, tests passed
@@ -81,7 +81,7 @@ $(printf "${B}")WHAT IT DOES$(printf "${R}")
   table format the public evals table publishes, so the number in any claim is
   one you can reproduce here. It NEVER hardcodes results.
 
-$(printf "${B}")EXAMPLES$(printf "${R}")
+$(printf '%b' "$B")EXAMPLES$(printf '%b' "$R")
   heimdall-bench                       # dry: see what a live run would measure (no API)
   heimdall-bench --live                # real run, both arms, whole suite
   heimdall-bench --live --model claude-opus-4-8
@@ -101,10 +101,10 @@ while [ $# -gt 0 ]; do
     --dry|--live) SAW_MODE=true; FORWARD+=("$1"); shift ;;
     --model|--task|--arm|--interventions)
       # value-taking flags: forward both the flag and its argument
-      [ $# -ge 2 ] || { printf "  ${P}x${R} %s needs a value\n" "$1" >&2; exit 2; }
+      [ $# -ge 2 ] || { printf '  %bx%b %s needs a value\n' "$P" "$R" "$1" >&2; exit 2; }
       FORWARD+=("$1" "$2"); shift 2 ;;
-    *) printf "  ${P}x${R} Unknown flag: ${B}%s${R}\n" "$1" >&2
-       printf "  ${D}Run ${C}heimdall-bench --help${D} for usage.${R}\n" >&2
+    *) printf '  %bx%b Unknown flag: %b%s%b\n' "$P" "$R" "$B" "$1" "$R" >&2
+       printf '  %bRun %bheimdall-bench --help%b for usage.%b\n' "$D" "$C" "$D" "$R" >&2
        exit 2 ;;
   esac
 done
@@ -112,28 +112,28 @@ done
 # ── --table: print the published-format table from the last live run and exit. ──
 if [ "$SHOW_TABLE" = true ]; then
   if [ ! -s "$RESULTS_MD" ]; then
-    printf "  ${W}!${R} No results yet. Run ${C}heimdall-bench --live${R} first.\n" >&2
+    printf '  %b!%b No results yet. Run %bheimdall-bench --live%b first.\n' "$W" "$R" "$C" "$R" >&2
     exit 1
   fi
-  printf "\n  ${B}Published-format benchmark table${R} ${D}(from the last live run)${R}\n"
-  printf "  ${D}source: %s${R}\n\n" "$RESULTS_MD"
+  printf '\n  %bPublished-format benchmark table%b %b(from the last live run)%b\n' "$B" "$R" "$D" "$R"
+  printf '  %bsource: %s%b\n\n' "$D" "$RESULTS_MD" "$R"
   cat "$RESULTS_MD"
-  printf "\n  ${D}Machine-readable rows: %s${R}\n\n" "$RESULTS_JSONL"
+  printf '\n  %bMachine-readable rows: %s%b\n\n' "$D" "$RESULTS_JSONL" "$R"
   exit 0
 fi
 
 # ── Sanity: the harness must exist and be runnable. ──
-[ -x "$HARNESS" ] || { printf "  ${P}x${R} measurement harness not found: %s\n" "$HARNESS" >&2; exit 1; }
-command -v jq >/dev/null 2>&1 || { printf "  ${P}x${R} jq is required (brew install jq)\n" >&2; exit 1; }
+[ -x "$HARNESS" ] || { printf '  %bx%b measurement harness not found: %s\n' "$P" "$R" "$HARNESS" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { printf '  %bx%b jq is required (brew install jq)\n' "$P" "$R" >&2; exit 1; }
 
 # ── Banner ──
 printf "\n"
-printf "  ${P}${B}░▒▓█${R} ${C}${B}H E I M D A L L   B E N C H${R} ${P}${B}█▓▒░${R}\n"
-printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-printf "  ${D}Reproduce the public table on your machine — same suite, same arms.${R}\n"
+printf '  %b%b░▒▓█%b %b%bH E I M D A L L   B E N C H%b %b%b█▓▒░%b\n' "$P" "$B" "$R" "$C" "$B" "$R" "$P" "$B" "$R"
+printf '  %b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n' "$V" "$R"
+printf '  %bReproduce the public table on your machine — same suite, same arms.%b\n' "$D" "$R"
 if [ "$SAW_MODE" = false ]; then
-  printf "  ${W}>${R} ${D}No mode given — running ${C}--dry${D} (validate + plan, ${B}zero API spend${R}${D}).${R}\n"
-  printf "  ${D}  Add ${C}--live${D} to measure for real.${R}\n"
+  printf '  %b>%b %bNo mode given — running %b--dry%b (validate + plan, %bzero API spend%b%b).%b\n' "$W" "$R" "$D" "$C" "$D" "$B" "$R" "$D" "$R"
+  printf '  %b  Add %b--live%b to measure for real.%b\n' "$D" "$C" "$D" "$R"
 fi
 printf "\n"
 

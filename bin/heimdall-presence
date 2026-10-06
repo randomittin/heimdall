@@ -83,7 +83,7 @@ LIB="$REPO/bin/lib"
 # install. hmd_signed_exec drops the rewriters (HEADROOM_*, loopback proxy vars, the model
 # base-URL pins) and deliberately KEEPS a corporate CONNECT proxy, which tunnels TLS and is
 # often the only egress an estate has.
-# shellcheck source=lib/hmd-gate-endpoint.sh
+# shellcheck source=lib/hmd-gate-endpoint.sh disable=SC1091  # sourced lib is not a shellcheck input without -x
 . "$LIB/hmd-gate-endpoint.sh"
 
 # ── control-plane URL + opt-out consent (SINGLE SOURCE OF TRUTH) ──────────────────
@@ -93,7 +93,7 @@ LIB="$REPO/bin/lib"
 # is ON BY DEFAULT (undecided/connected phone the control plane; only a persisted DECLINE
 # withholds the URL, yielding zero egress). If the lib is somehow absent, DEFAULT stays empty
 # -> offline degrade (fail-safe toward silence).
-# shellcheck source=lib/cp-consent.sh
+# shellcheck source=lib/cp-consent.sh disable=SC1091  # sourced lib is not a shellcheck input without -x
 [ -f "$LIB/cp-consent.sh" ] && . "$LIB/cp-consent.sh"
 HAID_CLI="$SELF_DIR/heimdall-haid"
 IDENTITY_CLI="$SELF_DIR/heimdall-identity"   # forward-compat: preferred when present.
@@ -184,8 +184,10 @@ PYEOF
 # The activity verbs bump/read a LOCAL mtime stamp (bash + stat only, no python, no wire), so
 # they must NOT be swallowed by the no-python / no-crypto degrade the wire verbs need.
 if [ "$SUB" != "activity" ] && [ "$SUB" != "activity-ts" ]; then
-  [ -n "$PY" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
-  [ -f "$LIB/cp_auth.py" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
+  # No interpreter or no signer: degrade offline. Both emitters end in `exit 0`, so this never falls through.
+  if [ -z "$PY" ] || [ ! -f "$LIB/cp_auth.py" ]; then
+    if [ "$SUB" = "roster" ]; then emit_empty_roster; else beat_noop; fi
+  fi
 fi
 
 # ── local config (${HOME}/.heimdall/cp-endpoint.json) — the shipped CP endpoint ──

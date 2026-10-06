@@ -49,6 +49,7 @@ resolve() {
   # machine where /usr/bin/python3 itself is broken -- the incident this test is
   # about -- that broken system python is therefore ALSO a candidate the resolver
   # must reject, which is the point.
+  # shellcheck disable=SC2030,SC2031  # the ( ... ) subshell is the point: HEIMDALL_HOME/PATH/HMD_PYTHON overrides must not leak out of this case
   ( export HEIMDALL_HOME="$home" PATH="$pathdir:/usr/bin:/bin" HMD_PYTHON=""; unset HMD_PYTHON
     # shellcheck source=../bin/lib/hmd-python.sh disable=SC1091  # $LIB is bin/lib/hmd-python.sh; plain shellcheck (no -x) never opens sourced files
     . "$LIB" && hmd_python )
@@ -79,8 +80,11 @@ fi
 H="$TMPROOT/h3"; mkdir -p "$H"; printf '%s\n' "$GOOD" > "$H/.python3-path"
 P="$TMPROOT/p3"; mkdir -p "$P"; ln -s "$BROKEN" "$P/python3"
 out="$(resolve "$H" "$P")"
-[ "$out" = "$GOOD" ] && ok "3. a cached working interpreter is used as-is" \
-                     || bad "3. cached working interpreter not honoured (out=[$out])"
+if [ "$out" = "$GOOD" ]; then
+  ok "3. a cached working interpreter is used as-is"
+else
+  bad "3. cached working interpreter not honoured (out=[$out])"
+fi
 
 # ── 4. no cache, PATH python is broken, system/homebrew may or may not work ──
 # Whatever comes back must RUN. Nothing may come back that does not.
@@ -95,18 +99,21 @@ fi
 
 # ── 5. HMD_PYTHON override is honoured verbatim (operator's explicit choice) ──
 H="$TMPROOT/h5"; mkdir -p "$H"; P="$TMPROOT/p5"; mkdir -p "$P"
-# shellcheck source=../bin/lib/hmd-python.sh disable=SC1091  # $LIB is bin/lib/hmd-python.sh; plain shellcheck (no -x) never opens sourced files
+# shellcheck source=../bin/lib/hmd-python.sh disable=SC1091,SC2030,SC2031  # $LIB is bin/lib/hmd-python.sh; plain shellcheck (no -x) never opens sourced files; the ( ... ) subshell scopes the env overrides on purpose
 out="$( ( export HEIMDALL_HOME="$H" PATH="$P" HMD_PYTHON="$GOOD"; . "$LIB" && hmd_python ) )"
-[ "$out" = "$GOOD" ] && ok "5. HMD_PYTHON override wins" || bad "5. HMD_PYTHON override ignored (out=[$out])"
+if [ "$out" = "$GOOD" ]; then ok "5. HMD_PYTHON override wins"; else bad "5. HMD_PYTHON override ignored (out=[$out])"; fi
 
 # ── 6. the cache is written under HEIMDALL_HOME only ─────────────────────────
 H="$TMPROOT/h6"; mkdir -p "$H"; P="$TMPROOT/p6"; mkdir -p "$P"; ln -s "$GOOD" "$P/python3"
 resolve "$H" "$P" >/dev/null
-[ -r "$H/.python3-path" ] && ok "6. cache written under the isolated HEIMDALL_HOME" \
-                          || bad "6. no cache written under HEIMDALL_HOME"
+if [ -r "$H/.python3-path" ]; then
+  ok "6. cache written under the isolated HEIMDALL_HOME"
+else
+  bad "6. no cache written under HEIMDALL_HOME"
+fi
 
 # ── 7. the lib parses under bash -n ──────────────────────────────────────────
-bash -n "$LIB" && ok "7. lib parses" || bad "7. lib does not parse"
+if bash -n "$LIB"; then ok "7. lib parses"; else bad "7. lib does not parse"; fi
 
 # ── 8-11. hmd_python_cached: the cached interpreter WITHOUT running it ───────
 # The statusline renders every ~300ms and used to pay a `-c pass` launch (30-60ms, far more
@@ -117,6 +124,7 @@ bash -n "$LIB" && ok "7. lib parses" || bad "7. lib does not parse"
 # touch the cache -- and the mirror-image proof is a probe that records if it was run.
 cached() {  # HOME_DIR [HMD_PYTHON]  -> prints hmd_python_cached's stdout; exit status = its rc
   local home="$1" pin="${2:-}"
+  # shellcheck disable=SC2030,SC2031  # the ( ... ) subshell is the point: HEIMDALL_HOME/PATH/HMD_PYTHON overrides must not leak out of this case
   ( export HEIMDALL_HOME="$home" PATH="/usr/bin:/bin"; unset HMD_PYTHON
     [ -n "$pin" ] && export HMD_PYTHON="$pin"
     # shellcheck source=../bin/lib/hmd-python.sh disable=SC1091  # $LIB is bin/lib/hmd-python.sh; plain shellcheck (no -x) never opens sourced files
@@ -133,22 +141,34 @@ if [ "$rc" = 0 ] && [ "$out" = "$PROBE" ] && [ ! -e "$RAN" ]; then
 else
   bad "8. cached path not served as-is, or the interpreter was executed (rc=$rc out=[$out] ran=$([ -e "$RAN" ] && echo yes || echo no))"
 fi
-[ "$(cat "$H/.python3-path")" = "$PROBE" ] && ok "9. leaves the cache untouched (healing is hmd_python's job, never a side effect here)" \
-                                            || bad "9. hmd_python_cached modified the cache: [$(cat "$H/.python3-path")]"
+if [ "$(cat "$H/.python3-path")" = "$PROBE" ]; then
+  ok "9. leaves the cache untouched (healing is hmd_python's job, never a side effect here)"
+else
+  bad "9. hmd_python_cached modified the cache: [$(cat "$H/.python3-path")]"
+fi
 
 H="$TMPROOT/h10"; mkdir -p "$H"
 out="$(cached "$H")"; rc=$?
-[ "$rc" = 1 ] && [ -z "$out" ] && ok "10a. no cache -> prints nothing, non-zero (the caller falls back to hmd_python)" \
-                                 || bad "10a. no cache but got rc=$rc out=[$out]"
+if [ "$rc" = 1 ] && [ -z "$out" ]; then
+  ok "10a. no cache -> prints nothing, non-zero (the caller falls back to hmd_python)"
+else
+  bad "10a. no cache but got rc=$rc out=[$out]"
+fi
 printf '%s\n' "$TMPROOT/does-not-exist-python3" > "$H/.python3-path"
 out="$(cached "$H")"; rc=$?
-[ "$rc" = 1 ] && [ -z "$out" ] && ok "10b. cache names a removed interpreter -> prints nothing, non-zero (a -x test is the one thing it does check)" \
-                                 || bad "10b. served a non-executable cached path: rc=$rc out=[$out]"
+if [ "$rc" = 1 ] && [ -z "$out" ]; then
+  ok "10b. cache names a removed interpreter -> prints nothing, non-zero (a -x test is the one thing it does check)"
+else
+  bad "10b. served a non-executable cached path: rc=$rc out=[$out]"
+fi
 
 H="$TMPROOT/h11"; mkdir -p "$H"; printf '%s\n' "$PROBE" > "$H/.python3-path"
 out="$(cached "$H" "$GOOD")"; rc=$?
-[ "$rc" = 0 ] && [ "$out" = "$GOOD" ] && ok "11. HMD_PYTHON override wins over the cache, verbatim, unprobed" \
-                                       || bad "11. HMD_PYTHON override not honoured (rc=$rc out=[$out])"
+if [ "$rc" = 0 ] && [ "$out" = "$GOOD" ]; then
+  ok "11. HMD_PYTHON override wins over the cache, verbatim, unprobed"
+else
+  bad "11. HMD_PYTHON override not honoured (rc=$rc out=[$out])"
+fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -337,11 +337,13 @@ live_slugs() {
   # Atomic tmp+rename so a concurrent reader never observes a partial file.
   if mkdir -p "$cache_dir" 2>/dev/null; then
     local tmp
-    tmp="$(mktemp "$cache_dir/.live-slugs-cache.XXXXXX" 2>/dev/null)" && {
-      printf '%s' "$_LIVE_SLUGS" > "$tmp" 2>/dev/null \
-        && mv -f "$tmp" "$cache_file" 2>/dev/null \
-        || rm -f "$tmp" 2>/dev/null
-    }
+    if tmp="$(mktemp "$cache_dir/.live-slugs-cache.XXXXXX" 2>/dev/null)"; then
+      # A failed write OR a failed rename discards the temp file, so no debris is left behind.
+      if ! { printf '%s' "$_LIVE_SLUGS" > "$tmp" 2>/dev/null \
+               && mv -f "$tmp" "$cache_file" 2>/dev/null; }; then
+        rm -f "$tmp" 2>/dev/null
+      fi
+    fi
   fi
   printf '%s' "$_LIVE_SLUGS"
 }
@@ -524,6 +526,7 @@ _batch_meta_lookup() {
   # 0x01 alone concatenates every field into $1). This byte crosses into a
   # bash `read` downstream (_join_batches -> enumerate), so it must be 3.2-safe.
   local sep=$'\x1f'
+  # shellcheck disable=SC2016  # $0 below is awk's record variable inside xargs's awk program, not a shell expansion
   printf '%s\0' "$@" | xargs -0 awk -v SEP="$sep" '
     FNR==1 { if (prevf != "") print prevf SEP buf; buf=""; prevf=FILENAME }
     { buf = buf $0 }
@@ -712,7 +715,7 @@ _collect_candidates() {
     for i in "${!outs[@]}"; do
       case "${trs[$i]}" in
         /*) ;;
-        *) trs[$i]="$(_transcript_fallback "$taskdir" "${ids[$i]}")" ;;
+        *) trs[i]="$(_transcript_fallback "$taskdir" "${ids[$i]}")" ;;
       esac
     done
   fi
@@ -821,7 +824,7 @@ enumerate() {
 
     while IFS= read -r line; do mvals+=("$line"); done < <(_batch_mtimes "${c_mtsrc[@]}")
     if [ "${#mvals[@]}" -ne "${#c_mtsrc[@]}" ]; then
-      for j in "${!c_mtsrc[@]}"; do mvals[$j]="$(_mtime "${c_mtsrc[$j]}")"; done
+      for j in "${!c_mtsrc[@]}"; do mvals[j]="$(_mtime "${c_mtsrc[$j]}")"; done
     fi
     for j in "${!c_mtsrc[@]}"; do
       if [ "${c_mtsrc[$j]}" = "$0" ]; then c_mt+=(0); else c_mt+=("${mvals[$j]}"); fi
