@@ -6,6 +6,7 @@
 
 # shellcheck disable=SC2034  # RELAY_SUITE_TITLE is read by test/lib/app-relay-common.sh (sourced next), never in this file
 RELAY_SUITE_TITLE="heimdall-app-relay (bin/heimdall-relay-client + hmd app connect --relay oracle) -- part 3/3: push registration, WebSocket leg"
+# shellcheck source=/dev/null  # sibling helper test/lib/app-relay-common.sh; not followed (no -x)
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/app-relay-common.sh"
 
 # ── Scenario W: the ordering and digest rules, deterministically. Drives
@@ -273,6 +274,7 @@ fi
 # event log, the status file or the relay's request log. The token is assembled at run time (no token-shaped literal
 # is committed). test/companion-push-store.test.sh covers the store and every refusal in-process; this is the same
 # wire through a real process. X2: HMD_PUSH=0 withdraws the cap and the commands ack push-disabled ──────────────────
+# shellcheck disable=SC2153  # REPO is assigned by the sourced test/lib/app-relay-common.sh (not followed without -x)
 PUSH_STORE_LIB="$REPO/bin/lib/companion_push_store.py"
 
 x_json_same() {  # x_json_same ACTUAL EXPECTED -- true when the two JSON texts are the same value
@@ -364,6 +366,7 @@ x_start_session() {
   mkdir -p "$XS_LOG" "$XS_CTL"
   for flag in ${XS_CTL_FLAGS:-}; do : > "$XS_CTL/$flag"; done  # ctl files that must exist before the client's first connect
   port_relay="$(free_port)"; port_ui="$(free_port)"
+  # shellcheck disable=SC2086  # XS_RELAY_ARGS is a deliberately word-split list of extra relay flags
   python3 "$FAKE_RELAY" serve "$port_relay" --log "$XS_LOG" --ctl "$XS_CTL" ${XS_RELAY_ARGS:-} >"$TMPROOT/$tag.srv.out" 2>&1 &
   XS_SRV=$!
   PIDS+=("$XS_SRV")
