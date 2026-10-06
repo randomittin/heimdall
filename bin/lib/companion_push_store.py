@@ -46,6 +46,11 @@ THE TOKEN IS A SECRET (spec 2.3, R3: anyone holding it can put a notification on
 lives only in push.json (0600) and in the memory of whoever called in. This module prints nothing,
 logs nothing, and no error message it raises repeats anything it was given -- they name the rule.
 
+EXTENSION KINDS. `events` accepts the five kinds of EVENT_KINDS and, beyond them, exactly the kinds bin/lib/companion_push.py has
+registered (register_kind): `extension_kinds()` -> {kind: capability}. The relay client advertises each of those capabilities in its
+state frames, so a phone asks for a kind only when it is listed, and a kind that is not registered here is `bad-events` for that
+registration alone (the rest of the phone's notifications keep working).
+
 Stdlib only; loadable by path like the other bin/lib modules, no side effects at import.
 """
 import copy
@@ -57,6 +62,7 @@ import re
 import secrets
 import time
 import unicodedata
+from importlib.util import module_from_spec, spec_from_file_location
 
 APP_REL = os.path.join(".heimdall", "app")
 PUSH_REL = os.path.join(APP_REL, "push.json")
@@ -108,12 +114,34 @@ def _label(value):
     return text
 
 
+_EXTENSION = {"mod": None, "tried": False}
+
+
+def extension_kinds():
+    """{kind: capability token} of the push kinds registered beyond EVENT_KINDS (bin/lib/companion_push.py register_kind: the
+    registration interface in its docstring). Empty when that module cannot load -- so an extension kind is then `bad-events`, and
+    no capability is advertised for it: a kind is accepted exactly while hmd can send it."""
+    if not _EXTENSION["tried"]:
+        _EXTENSION["tried"] = True
+        try:
+            spec = spec_from_file_location("companion_push", os.path.join(os.path.dirname(os.path.abspath(__file__)), "companion_push.py"))
+            mod = module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _EXTENSION["mod"] = mod
+        except Exception:
+            _EXTENSION["mod"] = None
+    mod = _EXTENSION["mod"]
+    return dict(mod.registered_kinds()) if mod is not None else {}
+
+
 def _events(value):
-    """The event list, sorted, when it is a non-empty set of the five kinds without a duplicate."""
-    if (not isinstance(value, (list, tuple)) or not value or len(value) > len(EVENT_KINDS)
+    """The event list, sorted, when it is a non-empty set of the accepted kinds (the five, plus the registered extension kinds)
+    without a duplicate."""
+    allowed = EVENT_KINDS + tuple(sorted(extension_kinds()))
+    if (not isinstance(value, (list, tuple)) or not value or len(value) > len(allowed)
             or not all(isinstance(kind, str) for kind in value)
-            or len(set(value)) != len(value) or not set(value) <= set(EVENT_KINDS)):
-        raise PushStoreError("bad-events", "events must be a non-empty set of %s" % ", ".join(EVENT_KINDS))
+            or len(set(value)) != len(value) or not set(value) <= set(allowed)):
+        raise PushStoreError("bad-events", "events must be a non-empty set of %s" % ", ".join(allowed))
     return sorted(value)
 
 
