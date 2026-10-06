@@ -128,7 +128,6 @@ make_stub heimdall-funnel
 make_stub heimdall-telemetry
 
 HWRAP="$FAKE/bin/heimdall-wrap"
-HMD="$FAKE/bin/heimdall"
 
 # FAKE TOOL BINARIES — every one of the five tools, so the launch path is really
 # exercised for each rather than only for whatever happens to be installed here.
@@ -251,7 +250,7 @@ AFTER_WRAP_SUM="$(tree_sum "$R1")"
   && ok "1c wrap installed the Layer-0 hooks" \
   || bad "1c no pre-commit hook after wrap"
 
-grep -Fqx "$AG_BEGIN" "$R1/AGENTS.md" 2>/dev/null \
+grep -Fqx "$AG_BEGIN" "$R1/AGENTS.md" 2>/dev/null && grep -Fqx "$AG_END" "$R1/AGENTS.md" 2>/dev/null \
   && ok "1d wrap wrote the AGENTS.md fenced block" \
   || bad "1d AGENTS.md fence missing after wrap"
 
