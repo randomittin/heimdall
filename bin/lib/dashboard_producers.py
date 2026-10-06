@@ -17,7 +17,7 @@ READ-ONLY IS STRUCTURAL, NOT A PROMISE (every layer below refuses on its own; te
      allowlisted functions only (ATTACH, PRAGMA, writes, extension loading: denied); postgres runs with default_transaction_read_only=on and
      a statement_timeout the statement cannot SET away.
   3. The set of operations a connector offers is closed: `select` (a checked statement) and `catalogue` (hmd's own constant query for table
-     and column names). bin/lib/connectors/ (issue sources with post_resolution/close_issue) is never imported; no shell is ever spawned.
+     and column names). bin/lib/connectors/ (issue sources that can post and close upstream) is never imported; no shell is ever spawned.
   4. Credentials are an environment-variable NAME in $HEIMDALL_HOME/dashboard-connectors.json (0600); the value is read from hmd's own
      environment into the child's environment only -- never argv, never a file, never a log line, never the model's prompt or process.
   5. Nothing runs unless fingerprint == confirmed_fp AND a receipt (written only by `hmd dash confirm`, after a terminal and the code)
@@ -694,7 +694,7 @@ def _text(v, limit):
 def map_rows(tile, columns, rows, now):
     """The panel candidate for `rows` under the tile's proposed shape: pure code, no model output. MappingError when the rows do not fit."""
     panels = _panels()
-    shape, n, width = tile["proposal"]["shape"], panels.MAX_LIST_ITEMS, panels.MAX_STRING_CHARS
+    shape, n, width = tile["shape"], panels.MAX_LIST_ITEMS, panels.MAX_STRING_CHARS
     kind = shape["type"]
     rows = [[_scalar(c) for c in r] for r in rows]
     if kind == "number":

@@ -53,7 +53,7 @@ def put_tile(root, tile):
 def list_tiles(root):
     out = []
     base = os.path.join(root, BASE)
-    for d in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+    for d in sorted(x for x in os.listdir(base) if os.path.isdir(os.path.join(base, x))) if os.path.isdir(base) else []:
         for name in sorted(os.listdir(os.path.join(base, d))):
             if name.startswith("t-") and name.endswith(".json"):
                 with open(os.path.join(base, d, name), encoding="utf-8") as f:
