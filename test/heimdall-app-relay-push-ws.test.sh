@@ -440,10 +440,10 @@ PYEOF
 
   if wait_for_count "$LOG_X/frames.ndjson" 1 '"type":"state"' 10; then
     X_CAPS="$(state_caps_of "$LOG_X/frames.ndjson" "$KEY_X")"
-    if x_json_same "$X_CAPS" '["controls-v1","dash-alert-v1","dash-v1","login-v1","push-digest-v1","push-tile-alert-v1","push-v1","resync","view-v1","z-zlib"]'; then
+    if x_json_same "$X_CAPS" '["ask-v1","controls-v1","dash-alert-v1","dash-v1","login-v1","push-digest-v1","push-tile-alert-v1","push-v1","resync","view-v1","z-zlib"]'; then
       ok "X: the state frame the relay received lists controls-v1, push-v1, push-digest-v1 and push-tile-alert-v1 beside login-v1, resync, view-v1 and z-zlib in its caps"
     else
-      bad "X: state frame caps are not [controls-v1, dash-alert-v1, dash-v1, login-v1, push-digest-v1, push-tile-alert-v1, push-v1, resync, view-v1, z-zlib]: $X_CAPS"
+      bad "X: state frame caps are not [ask-v1, controls-v1, dash-alert-v1, dash-v1, login-v1, push-digest-v1, push-tile-alert-v1, push-v1, resync, view-v1, z-zlib]: $X_CAPS"
     fi
   else
     bad "X: no state frame ever reached the relay"
@@ -594,10 +594,10 @@ with open(sys.argv[3], 'w', encoding='utf-8') as f:
   fi
   if wait_for_count "$LOG_X/frames.ndjson" 1 '"type":"state"' 10; then
     X_CAPS="$(state_caps_of "$LOG_X/frames.ndjson" "$KEY_X")"
-    if x_json_same "$X_CAPS" '["controls-v1","dash-alert-v1","dash-v1","login-v1","resync","view-v1","z-zlib"]'; then
+    if x_json_same "$X_CAPS" '["ask-v1","controls-v1","dash-alert-v1","dash-v1","login-v1","resync","view-v1","z-zlib"]'; then
       ok "X2: with HMD_PUSH=0 the state frame no longer lists push-v1 (controls-v1, login-v1 and view-v1 are untouched)"
     else
-      bad "X2: state frame caps with HMD_PUSH=0 are not [controls-v1, dash-alert-v1, dash-v1, login-v1, resync, view-v1, z-zlib]: $X_CAPS"
+      bad "X2: state frame caps with HMD_PUSH=0 are not [ask-v1, controls-v1, dash-alert-v1, dash-v1, login-v1, resync, view-v1, z-zlib]: $X_CAPS"
     fi
   else
     bad "X2: no state frame ever reached the relay"
