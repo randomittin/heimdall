@@ -249,7 +249,7 @@ def set_config(root, config, now):
     counters from zero: the first report covers what happens from then on. Today's spent day is never un-spent. Raises OSError."""
     fresh = {"at": config["at"], "tz_min": config["tz_min"], "tiles": list(config["tiles"]),
              "include_values": config["include_values"], "on": config["on"], "set_at": int(now),
-             "project": config["project"]}
+             "project": config.get("project", "")}
 
     def change(state):
         was = state["config"]
@@ -307,7 +307,7 @@ def claim(root, now):
             return False, None
         day, _ = local_day_minute(now, config["tz_min"])
         taken = {"day": day, "counts": dict(state["counts"]), "tiles": list(config["tiles"]),
-                 "include_values": config["include_values"], "project": config["project"]}
+                 "include_values": config["include_values"], "project": config.get("project", "")}
         state.update(last_day=day, last_at=int(now), counts=_zero())
         return True, taken
 
@@ -392,7 +392,7 @@ def make_event(taken, rows):
         return None
     return {"kind": KIND, "key": "d:" + taken["day"], "ep": None,
             "fields": {"finished": counts["finished"], "verdicts": counts["verdicts"], "alerts": counts["alerts"], "tiles": tiles,
-                       "project": taken["project"]}}
+                       "project": taken.get("project", "")}}
 
 
 def _count(v):

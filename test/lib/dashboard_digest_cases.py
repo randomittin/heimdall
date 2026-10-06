@@ -12,6 +12,7 @@ Hermetic: HOME / HEIMDALL_HOME are under <tmp>; every sender talks to a loopback
 assembled at runtime. Each line printed is `ok <text>` or `bad <text>`; the last one is `done`.
 """
 import calendar
+import hashlib
 import json
 import os
 import sys
@@ -33,6 +34,7 @@ SW = T.load("companion_remote_switches", os.path.join(LIB, "companion_remote_swi
 CTL = T.load("companion_ui_controls", os.path.join(LIB, "companion_ui_controls.py"))
 DASH = T.load("companion_dashboards", os.path.join(LIB, "companion_dashboards.py"))
 TOOLS = types.SimpleNamespace(scrub=CP.scrub, clip=CP.clip, utf16_len=CP.utf16_len, secret_shaped=CP._secret_checker())
+PS.bind_extension_kinds(CP.registered_kinds)     # the store accepts exactly what the sender registered (the relay client binds it at start)
 S, att, A = T.state, T.attention, T.a_id
 RC0 = T.receipt(finished_at="r0")
 
@@ -101,7 +103,7 @@ path = os.path.join(r, ".heimdall", "app", "digest.json")
 T.eq((oct(os.stat(path).st_mode & 0o777), oct(os.stat(os.path.dirname(path)).st_mode & 0o777)), ("0o600", "0o700"), "U3c. file 0600 in a 0700 directory")
 T.eq(DG.claim(r, Z + 7 * H + 29 * 60), None, "U3d. nothing to claim before `at`")
 taken = DG.claim(r, Z + 7 * H + 30 * 60)
-T.eq(taken, {"day": "2026-10-06", "counts": ZERO, "tiles": [TA], "include_values": True}, "U3e. at `at` the day's digest is claimed")
+T.eq(taken, {"day": "2026-10-06", "counts": ZERO, "tiles": [TA], "include_values": True, "project": ""}, "U3e. at `at` the day's digest is claimed")
 T.eq(DG.claim(r, Z + 8 * H), None, "U3f. a second claim the same day finds it spent")
 T.eq((DG.claim(r, Z + 86400 + 7 * H + 30 * 60) or {}).get("day"), "2026-10-07", "U3g. the next local day is claimable again")
 r = root("u3off")
@@ -184,7 +186,7 @@ ROWS = [{"title": "Orders", "value": "1,284"}]
 T.eq(DG.make_event(taken, ROWS), None, "U5a. no count and values off: nothing to say")
 T.eq(DG.make_event(dict(taken, include_values=True), ROWS)["fields"]["tiles"], ROWS, "U5b. values on: the rows go in")
 ev = DG.make_event(dict(taken, counts={"finished": 2, "verdicts": 0, "alerts": 0}), ROWS)
-T.eq((ev["kind"], ev["key"], ev["ep"], ev["fields"]), ("digest", "d:2026-10-06", None, {"finished": 2, "verdicts": 0, "alerts": 0, "tiles": []}),
+T.eq((ev["kind"], ev["key"], ev["ep"], ev["fields"]), ("digest", "d:2026-10-06", None, {"finished": 2, "verdicts": 0, "alerts": 0, "tiles": [], "project": ""}),
      "U5c. values off: counts only, however many rows the state offered")
 T.eq(len(DG.make_event(dict(taken, include_values=True), ROWS * 5)["fields"]["tiles"]), 3, "U5d. at most 3 tiles")
 
@@ -298,17 +300,29 @@ audit_path = os.path.join(RW, ".heimdall", "ui", "controls-audit.jsonl")
 audit = open(audit_path, encoding="utf-8").read() if os.path.exists(audit_path) else ""
 T.check('"op":"set-digest"' in audit, "W8a. a schedule is audited by its op", audit[-200:])
 T.check(not any(marker in audit for marker in ("07:30", "digestproj", TOK, "330")), "W8b. the audit line holds no time, project, token or offset")
-T.check('"EVENT_KINDS"' not in "" and "digest" in PS.EVENT_KINDS and PS.register(RW, TOK, "ios", events=["digest", "finished"]) is not None,
-        "W9a. a phone may ask for `digest` in its registration")
+T.check("digest" not in PS.EVENT_KINDS and PS.extension_kinds().get("digest") == "push-digest-v1"
+        and PS.register(RW, TOK, "ios", events=["digest", "finished"]) is not None,
+        "W9a. a phone may ask for `digest` in its registration: a registered kind, not one of the five")
 try:
     PS.register(RW, TOK, "ios", events=["digest", "not-a-kind"])
     refused = None
 except PS.PushStoreError as exc:
     refused = exc.code
 T.eq(refused, "bad-events", "W9b. an unknown kind is still bad-events")
+PS.bind_extension_kinds(None)
+try:
+    PS.register(RW, TOK, "ios", events=["digest"])
+    refused = None
+except PS.PushStoreError as exc:
+    refused = exc.code
+PS.bind_extension_kinds(CP.registered_kinds)
+T.eq(refused, "bad-events", "W9c. where no kind is registered, `digest` is bad-events for that registration")
 relay = open(os.path.join(code, "bin", "heimdall-relay-client"), encoding="utf-8").read()
-T.check("DIGEST.CAP_DIGEST" in relay and "PUSH_STORE is not None and DIGEST.available()" in relay and DG.CAP_DIGEST == "push-digest-v1",
-        "W10. the relay client lists push-digest-v1 beside dash-v1, only while push is on and the push store loaded")
+T.check("DIGEST.CAP_DIGEST" not in relay and "PUSH_STORE.extension_kinds().values()" in relay and DG.CAP_DIGEST == "push-digest-v1"
+        and CP.registered_kinds().get("digest") == DG.CAP_DIGEST,
+        "W10. push-digest-v1 is advertised by the registry (one cap per registered kind), not by a line of its own in the relay client")
+T.eq((CP.KINDS, "digest" in CP.all_kinds(), CP.PRIORITY["digest"]), (("question", "approval", "error", "gate_red", "finished", "test"), True, 0),
+     "W11. digest is registered: KINDS stays the closed six, all_kinds() has it, priority 0 loses to every built-in kind")
 
 # ── M. the sender ──
 DEV = {"token": TOK, "platform": "ios", "registered_at": T.iso(1), "ref": REF, "label": "api server", "events": ["digest"]}
@@ -390,6 +404,17 @@ tick(rig, D1 + 86400 + 7 * H + 30 * 60)
 T.eq(bodies(rig), ["Finished 1", "Finished 1"], "M1g. the next day sends the next digest, its counts restarted")
 rig.close()
 
+# M1i. the collapseId and tag are `<project hash>.digest`, whatever device they go to
+rig = Rig()
+schedule(rig, project="digestproj")
+finish(rig, 10, D1 + 2 * H)
+tick(rig, D1 + 8 * H)
+want = hashlib.sha256(b"project:digestproj").hexdigest()[:16] + ".digest"
+T.eq([(m["collapseId"], m["tag"], m["threadId"]) for m in msgs(rig)], [(want, want, REF)],
+     "M1i. a schedule with a project collapses on <project hash>.digest (sha256 of the project, 16 hex): no raw name in a message")
+T.check("digestproj" not in json.dumps(msgs(rig)), "M1j. the project name itself is never in the message")
+rig.close()
+
 # M1h. a verdict (a new sweep receipt) is counted as one
 rig = Rig()
 schedule(rig)
@@ -442,6 +467,14 @@ schedule(rig)
 finish(rig, 10, D1 + 5 * H)
 tick(rig, D1 + 8 * H)
 T.eq((len(rig.fake.sends()), DG.load(rig.root)["last_day"]), (0, None), "M3g. no phone registered at all: nothing sent, the day is not spent")
+rig.close()
+
+rig = Rig(tokens=[dict(DEV, events=[])])
+schedule(rig)
+finish(rig, 10, D1 + 5 * H)
+tick(rig, D1 + 8 * H)
+T.eq(([m["data"]["kind"] for m in rig.fake.messages()], DG.load(rig.root)["last_day"]), (["finished"], None),
+     "M3h. a phone that named no events gets the five built-in kinds and never a registered one: no digest, the day is not spent")
 rig.close()
 
 # M4. the sender's own policy: foreground, rate limit, kind filter, kill switch
@@ -568,16 +601,36 @@ tick(rig, D1 + 8 * H + 61)
 T.eq(bodies(rig), ["Finished 1"], "M8b. back on: the digest goes out")
 rig.close()
 
-# M9. submit(): an event planned outside the Planner takes the same road
+# M9. a tile_alert another process spools (companion_push.enqueue_event, what dashboard_alerts does) is counted for the report
 rig = Rig()
-ev = {"kind": "digest", "key": "d:manual", "ep": None, "fields": {"finished": 2, "verdicts": 0, "alerts": 0, "tiles": []}}
-T.eq(rig.m.submit(ev, D1 + 8 * H), True, "M9a. a digest event is taken")
-rig.m.step(D1 + 8 * H)
-rig.m.step(D1 + 8 * H + 5)
-T.eq(bodies(rig), ["Finished 2"], "M9b. and sent through the monitor's policy and builder")
-for refused in ({"kind": "question", "key": "q"}, {"kind": "approval", "key": "p"}, {"kind": "digest"}, "x", None, 5):
-    T.eq(rig.m.submit(refused, D1 + 9 * H), False, "M9c. submit refuses %r" % (refused,))
+schedule(rig)
+T.eq(CP.enqueue_event(rig.root, "tile_alert", {"tile": TA, "with_value": False}, key="a:%s:%d" % (TA, D1 + 6 * H), now=D1 + 6 * H), True,
+     "M9a. the alert is spooled for the sender")
+rig.m.observe(IDLE, D1 + 6 * H + 1)
+rig.m.step(D1 + 6 * H + 1)
+T.eq(DG.load(rig.root)["counts"]["alerts"], 1, "M9b. the sender's worker counts the spooled alert for the next report")
+rig.m.observe(IDLE, D1 + 6 * H + 30)
+rig.m.step(D1 + 6 * H + 30)
+T.eq(DG.load(rig.root)["counts"]["alerts"], 1, "M9c. and only once, however many states follow")
+tick(rig, D1 + 8 * H)
+T.eq(bodies(rig), ["Alerts 1"], "M9d. it is in the morning report")
 rig.close()
+rig = Rig()
+schedule(rig, on=False)
+CP.enqueue_event(rig.root, "tile_alert", {"tile": TA, "with_value": False}, key="a:%s:%d" % (TA, D1 + 6 * H), now=D1 + 6 * H)
+rig.m.observe(IDLE, D1 + 6 * H + 1)
+rig.m.step(D1 + 6 * H + 1)
+T.eq(DG.load(rig.root)["counts"]["alerts"], 0, "M9e. with the digest off nothing is counted")
+rig.close()
+
+# M9f. the registry's own limits for this kind: 4 lines, past the default 120 units, up to 160
+worst = {"finished": 99999, "verdicts": 99999, "alerts": 99999, "project": "p",
+         "tiles": [{"title": "Open support tickets awaiting a reply", "value": "123.4 GB"}] * 3}
+built = CP.build_message(TOK, {"kind": "digest", "key": "d:x", "ep": None, "fields": worst}, "api", REF, D1)
+T.check(built is not None and 120 < CP.utf16_len(built["body"]) <= 160 and built["body"].count("\n") == 3,
+        "M9f. the worst-case digest body keeps its 4 lines and is not cut at the default 120 units", built and built["body"])
+T.check(CP.build_message(TOK, {"kind": "digest", "key": "d:x", "ep": None, "fields": {"finished": 0, "tiles": []}}, "api", REF, D1) is None,
+        "M9g. a digest with nothing to say builds no message")
 
 # M10. payload limits end to end; the production store
 rig = Rig(real_store=True)
