@@ -213,6 +213,21 @@ def unknown_tile():
 
 
 @check
+def create_accepts_unseen_tile_ids():
+    e = Env()
+    fresh = dict(e.p("create"), dashboard_id="d-cafecafe", screen_id="s-cafecafe", tile_id="t-cafecafe")
+    assert d.get_tile(e.root, "t-cafecafe") is None and d._all_tiles(e.root) == []
+    assert e.send(fresh)[:2] == (True, "queued"), "a tile hmd has never seen, on a dashboard and a screen it has never seen"
+    tile = d.get_tile(e.root, "t-cafecafe")
+    assert tile is not None and (tile["dashboard_id"], tile["screen_id"], tile["phase"]) == ("d-cafecafe", "s-cafecafe", "generating"), tile
+    unseen = "t-deadbeef"
+    for op in ("refine", "set-refresh", "refresh", "remove"):
+        assert e.send(e.p(op, tile_id=unseen))[:2] == (False, "unknown-tile"), "%s on an id hmd does not hold stays refused" % op
+    assert d.get_tile(e.root, unseen) is None and len(d._all_tiles(e.root)) == 1, "a refused op created or removed nothing"
+    assert e.send(dict(fresh, rid=nid("q")))[:2] == (True, "dup") and len(d._all_tiles(e.root)) == 1, "a second create is a duplicate, not a second tile"
+
+
+@check
 def too_many_tiles():
     e = Env()
     for _ in range(d.MAX_TILES):
@@ -304,15 +319,51 @@ def overlay_gating():
 
 
 @check
-def laptop_view_has_no_code_or_data():
+def desktop_view_has_panels_but_no_code():
     e = Env()
     wait, live = e.pending(), e.live()
-    view = json.dumps(d.snapshot(e.root, phone=False))
-    phone = json.dumps(d.snapshot(e.root, phone=True))
+    desktop, phone = d.snapshot(e.root, phone=False), d.snapshot(e.root, phone=True)
     code = d.confirm_code(wait, d.get_tile(e.root, wait)["fingerprint"])
-    assert code in phone and code not in view, "the six digits are for the phone only"
-    assert '"value":12' not in view and '"value": 12' not in view and "panel_sig" in view
-    assert next(t for t in d.snapshot(e.root, phone=False)["tiles"] if t["tile_id"] == wait)["confirm"].keys() == {"expires_at"}
+    assert code in json.dumps(phone) and code not in json.dumps(desktop), "the six digits are for the phone only"
+    row = lambda s, tid: next(t for t in s["tiles"] if t["tile_id"] == tid)
+    assert row(desktop, live) == row(phone, live) and row(desktop, live)["panel"]["data"] == {"value": 12}, "the same tile, the same panel"
+    without_confirm = lambda t: {k: v for k, v in t.items() if k != "confirm"}
+    assert without_confirm(row(desktop, wait)) == without_confirm(row(phone, wait)) and row(desktop, wait)["confirm"].keys() == {"expires_at"}
+    assert desktop["pending"] == 1 and "pending" not in phone and {k: v for k, v in desktop.items() if k not in ("pending", "tiles")} \
+        == {k: v for k, v in phone.items() if k != "tiles"}
+
+
+def _ui_dir():
+    return os.environ.get("HMD_UI_DIR") or os.path.join(REPO, "sentinels")
+
+
+def _between(text, pattern):
+    match = re.search(pattern, text, re.S)
+    assert match, "pattern not found: " + pattern[:60]
+    return match.group(0)
+
+
+@check
+def desktop_has_no_mutating_route():
+    py = open(os.path.join(_ui_dir(), "hmd-ui.py"), encoding="utf-8").read()
+    html = open(os.path.join(_ui_dir(), "hmd-ui.html"), encoding="utf-8").read()
+    paths = lambda body: set(re.findall(r'path == "(/[^"]*)"', body))
+    post = paths(_between(py, r"def _route_post\(self, _query\):.*?(?=\n    # The HTTP status)"))
+    get = paths(_between(py, r"    def _route\(self, query\):.*?(?=\n    def |\Z)"))
+    assert post == {"/api/send", "/api/control"}, "POST routes: %s" % sorted(post)
+    assert get == {"/", "/api/state", "/api/events"}, "GET routes: %s" % sorted(get)
+    assert not [p for p in post | get if "dashboard" in p or "tile" in p], "no route is about dashboards: they ride /api/state"
+    assert not re.search(r"def do_(PUT|DELETE|PATCH)\b", py), "no other HTTP method is served"
+    assert "caps=" not in _between(py, r"    def _handle_control\(self\):.*?(?=\n    def |\Z)"), "the direct route has no phone caps: a dashboard-request is caps-missing"
+    section = _between(html, r'<section id="p-dashboards".*?</section>')
+    assert not re.search(r"<(button|input|form|select|textarea|a )|contenteditable|onclick", section, re.I), "no control in the dashboards section"
+    functions = re.findall(r"  function (?:renderDashboards|renderDashPanels)\(.*?\n  \}\n", html, re.S)
+    assert len(functions) == 2, "both read-only renderers are present"
+    forbidden = ("fetch(", "XMLHttpRequest", "EventSource", "addEventListener", ".submit(", "sendBeacon", "onclick", "onsubmit", "<button",
+                 "<input", "<form", "<select", "<textarea", "contenteditable", "POST", "PUT", "DELETE", "method")
+    for source in functions:
+        assert not [t for t in forbidden if t in source], [t for t in forbidden if t in source]
+    assert "renderDashPanels(state.dashboards" in html, "the desktop view is drawn from the state slice"
 
 
 @check
