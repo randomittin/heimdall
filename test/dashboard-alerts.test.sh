@@ -84,7 +84,7 @@ mutant rearms-without-floor dashboard_alerts.py '(last is None or now - last >= 
 mutant no-daily-cap dashboard_alerts.py 'if a["fired"]["n"] < DAILY_MAX:' 'if True:' "the 7th crossing of the UTC day is dropped"
 mutant leaks-value dashboard_alerts.py '    if alert["with_value"]:
         fmt' '    if True:
-        fmt' "no number anywhere in the message unless with_value"
+        fmt' "the spooled event holds no number unless with_value"
 mutant no-cap-check dashboard_alerts.py 'if caps is None or CAP_ALERTS not in caps:' 'if False:' "a phone that did not list dash-alert-v1 is caps-missing"
 mutant no-push-check dashboard_alerts.py '        if not _push_ready(root):
             return _refuse(kit, root, tile_id, "push-off")' '        if False:

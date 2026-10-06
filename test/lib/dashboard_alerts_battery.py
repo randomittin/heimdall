@@ -90,7 +90,7 @@ def alert_of(tid, phone=True, caps=CAPS):
 
 
 def register_phone(events, tag="a"):
-    return STORE.register(ROOT, T.expo_token(tag), "ios", ref=(tag * 16)[:16].replace("a", "1"), label="proj", events=events)
+    return STORE.register(ROOT, T.expo_token(tag), "ios", ref=hashlib.sha256(tag.encode()).hexdigest()[:16], label="proj", events=events)
 
 
 def reset_devices():
@@ -252,16 +252,17 @@ mon.observe({"ts": 3}, T0 + 700)
 mon.step(T0 + 700)
 mon.step(T0 + 710)
 sent = fake.messages() if callable(fake.messages) else fake.messages
-T.eq(sent[-1].get("body") if len(sent) == 2 else None, "3,333, limit 4,242", "with_value: '<value>, limit <limit>', formatted, <= 40 characters")
+T.check(len(sent) == 2 and sent[-1].get("body") == "3,333, limit 4,242" and len(sent[-1]["body"]) <= 40,
+        "with_value: '<value>, limit <limit>', formatted, <= 40 characters", (len(sent), sent[-1:], events[-3:], spooled()))
 
 # -- a phone that did not ask for the kind gets nothing ---------------------------------------------------------
+mon.close()                                              # release the sender lock: a second monitor must be able to own it
 reset_devices()
-register_phone(["finished", "question"], "e")
+register_phone(None, "e")                                # no events named: the default five kinds, never a registered one
 other = T.FakeExpo()
 mon2 = PUSH.PushMonitor(ROOT, emit=events.append, config={"coalesce_s": 0.0, "min_gap_s": 0.0}, clock=lambda: T0 + 900, sleep=lambda s: None,
                         environ={"HMD_PUSH_EXPO_URL": other.url() if callable(other.url) else other.url}, start_thread=False)
 extra_tile = make_tile()
-ask("set-alert", extra_tile, cmp="lt", value=40, hold_s=0, with_value=False) if False else None
 PUSH.enqueue_event(ROOT, "tile_alert", {"tile": extra_tile, "with_value": False}, key="x:1", now=T0 + 900)
 mon2.observe({"ts": 1}, T0 + 900)
 mon2.step(T0 + 900)
@@ -297,6 +298,8 @@ T.check(not any(marker in audit for marker in ("4242", "3333", "5000", "3,333", 
 
 # -- idle: an alerted tile runs with no phone (300 s floor); alerts pause after 30 days -----------------------------
 PROD = T.load("dashboard_producers", os.path.join(LIB, "dashboard_producers.py"))
+mon2.close()
+register_phone(["tile_alert"], "h")
 idle_tile = make_tile()
 ask("set-alert", idle_tile, cmp="lt", value=40, hold_s=0, with_value=False)
 plain = make_tile()
@@ -309,7 +312,6 @@ out = sched.tick(ROOT, recs, T0 + 1000, present=False, alerted={idle_tile},
 T.check(calls == [idle_tile] and [o["tile_id"] for o in out if o["detail"] == "idle"] == [plain], "no phone: the alerted tile runs, the plain one is paused idle", (calls, out))
 T.check(sched._state[idle_tile]["next_at"] >= T0 + 1000 + 300, "with no phone the alerted tile's interval has a 300 s floor", sched._state[idle_tile])
 late = T0 + 31 * 86400
-T.check(idle_tile not in DASH.alerted_tiles(ROOT, late) and alert_of_late if False else True, "placeholder")
 rows_late = ALERTS.rows(DASH._alert_kit(), ROOT, late, DASH.list_tiles(ROOT))
 T.eq(rows_late[idle_tile]["paused"], "idle", "30 days without phone contact: the alert row says paused idle")
 T.check(idle_tile not in DASH.alerted_tiles(ROOT, late), "... and the tile loses the idle exemption")
