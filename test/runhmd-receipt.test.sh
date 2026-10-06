@@ -123,18 +123,20 @@ must_reject() {
   fi
 }
 
-[ -f "$RECEIPT_SCHEMA" ] && ok "schema file exists: docs/schemas/runhmd.receipt.v1.json" || bad "schema file exists: docs/schemas/runhmd.receipt.v1.json"
+if [ -f "$RECEIPT_SCHEMA" ]; then ok "schema file exists: docs/schemas/runhmd.receipt.v1.json"; else bad "schema file exists: docs/schemas/runhmd.receipt.v1.json"; fi
+# shellcheck disable=SC2016  # "$id" is a jq key inside the jq program, not a shell variable
 check "schema file is valid JSON titled runhmd.receipt/1 with an \$id and an x-documents entry" \
   jq -e '.title=="runhmd.receipt/1" and (."$id"|type=="string") and ."x-documents"=={"runhmd.receipt/1":"#"}' "$RECEIPT_SCHEMA"
 
-validate "$DENIED_RC"; [ "$VRC" -eq 0 ] && printf '%s' "$(python3 "$SCHEMA_PY" validate "$DENIED_RC" 2>/dev/null)" | grep -q '^ok runhmd.receipt/1' \
-  && ok "valid DENIED receipt accepted (the validator finds the receipt schema from the document's own id)" || bad "valid DENIED receipt accepted (rc=$VRC: $VERR)"
-validate "$PROVEN_RC"; [ "$VRC" -eq 0 ] && ok "valid PROVEN receipt accepted" || bad "valid PROVEN receipt accepted (rc=$VRC: $VERR)"
+validate "$DENIED_RC"; if [ "$VRC" -eq 0 ] && printf '%s' "$(python3 "$SCHEMA_PY" validate "$DENIED_RC" 2>/dev/null)" | grep -q '^ok runhmd.receipt/1'; then
+  ok "valid DENIED receipt accepted (the validator finds the receipt schema from the document's own id)"
+else bad "valid DENIED receipt accepted (rc=$VRC: $VERR)"; fi
+validate "$PROVEN_RC"; if [ "$VRC" -eq 0 ]; then ok "valid PROVEN receipt accepted"; else bad "valid PROVEN receipt accepted (rc=$VRC: $VERR)"; fi
 if python3 "$SCHEMA_PY" validate - <"$DENIED_RC" >/dev/null 2>&1; then ok "reads the receipt from stdin ('-')"; else bad "reads the receipt from stdin ('-')"; fi
 jq 'del(.gates, .regression_tests)' "$DENIED_RC" >"$TMP/rc.minimal.json"
-validate "$TMP/rc.minimal.json"; [ "$VRC" -eq 0 ] && ok "gates and regression_tests are optional (an attack receipt carries neither)" || bad "minimal receipt rejected (rc=$VRC: $VERR)"
+validate "$TMP/rc.minimal.json"; if [ "$VRC" -eq 0 ]; then ok "gates and regression_tests are optional (an attack receipt carries neither)"; else bad "minimal receipt rejected (rc=$VRC: $VERR)"; fi
 jq '.subject.head_sha="4ddffa2c1234567890abcdef1234567890abcdef"' "$DENIED_RC" >"$TMP/rc.sha.json"
-validate "$TMP/rc.sha.json"; [ "$VRC" -eq 0 ] && ok "a 40-hex git head_sha is accepted" || bad "head_sha rejected (rc=$VRC: $VERR)"
+validate "$TMP/rc.sha.json"; if [ "$VRC" -eq 0 ]; then ok "a 40-hex git head_sha is accepted"; else bad "head_sha rejected (rc=$VRC: $VERR)"; fi
 
 must_reject "wrong schema id"                     '.schema="runhmd.receipt/2"'                         'schema'
 must_reject "missing signature"                   'del(.signature)'                                     'signature'
@@ -191,7 +193,7 @@ must_reject "PROVEN with a failed regression test" '.regression_tests={"passed":
 must_reject "a gate marked falsified without a perfect score" '.gates[0].falsify_score=0.9'              'falsify_score' "$PROVEN_RC"
 
 printf 'not json{' >"$TMP/garbage.json"
-validate "$TMP/garbage.json"; [ "$VRC" -eq 1 ] && ok "rejects: input that is not JSON (exit 1)" || bad "rejects: input that is not JSON (rc=$VRC)"
+validate "$TMP/garbage.json"; if [ "$VRC" -eq 1 ]; then ok "rejects: input that is not JSON (exit 1)"; else bad "rejects: input that is not JSON (rc=$VRC)"; fi
 for odd in '{"schema":[]}' '{"schema":{"a":1}}' '[]' 'null' '{"schema":null}'; do
   printf '%s' "$odd" >"$TMP/odd.json"
   validate "$TMP/odd.json"
@@ -200,30 +202,35 @@ for odd in '{"schema":[]}' '{"schema":{"a":1}}' '[]' 'null' '{"schema":null}'; d
 done
 
 # single source: the verdict vocabulary lives in ONE file and the receipt schema points at it
+# shellcheck disable=SC2016  # "$ref" is a jq key inside the jq program, not a shell variable
 check "the receipt schema borrows verdict/attacks/agent/gate/finding vocabulary by \$ref to the verdict schema file, not by copy" \
   jq -e '[.properties.verdict, .properties.attacks, .properties.agent, .properties.id, .properties.regression_tests]
          | all(."$ref"|startswith("runhmd.verdict.v1.json#/"))' "$RECEIPT_SCHEMA"
+# shellcheck disable=SC2016  # "$defs" is a jq key and $k a jq variable inside the jq program, not shell variables
 check "the receipt schema defines none of the shared vocabulary itself (no local verdict/attacks/agent/gate def)" \
   jq -e '(."$defs"|keys) as $k | (["verdict","attacks","agent","gate","regressionTests","counterexample"] - $k)==["verdict","attacks","agent","gate","regressionTests","counterexample"]' "$RECEIPT_SCHEMA"
 mkdir -p "$TMP/loose"; cp "$RECEIPT_SCHEMA" "$VERDICT_SCHEMA" "$TMP/loose/"
 jq '."$defs".finding.properties.severity.enum += ["urgent"]' "$VERDICT_SCHEMA" >"$TMP/loose/runhmd.verdict.v1.json"
 jq '.findings[0].severity="urgent"' "$DENIED_RC" >"$TMP/rc.urgent.json"
-validate "$TMP/rc.urgent.json"; [ "$VRC" -eq 1 ] && printf '%s' "$VERR" | grep -q '/findings/0/severity' \
-  && ok "control: the shipped schemas reject severity 'urgent'" || bad "control: the shipped schemas should reject severity 'urgent' (rc=$VRC)"
+validate "$TMP/rc.urgent.json"; if [ "$VRC" -eq 1 ] && printf '%s' "$VERR" | grep -q '/findings/0/severity'; then
+  ok "control: the shipped schemas reject severity 'urgent'"
+else bad "control: the shipped schemas should reject severity 'urgent' (rc=$VRC)"; fi
 validate --schema "$TMP/loose/runhmd.receipt.v1.json" "$TMP/rc.urgent.json"
-[ "$VRC" -eq 0 ] && ok "single source: loosening the severity enum in the VERDICT schema file changes what the RECEIPT validator accepts" \
-  || bad "the receipt validator does not follow the verdict schema file (rc=$VRC: $VERR)"
+if [ "$VRC" -eq 0 ]; then
+  ok "single source: loosening the severity enum in the VERDICT schema file changes what the RECEIPT validator accepts"
+else bad "the receipt validator does not follow the verdict schema file (rc=$VRC: $VERR)"; fi
 
+# shellcheck disable=SC2016  # the bash -c script is single-quoted on purpose: $1/$2/$id expand in the child shell
 check "every x-invariants id documented in the receipt schema is implemented in the validator" \
   bash -c 'for id in $(jq -r ".\"x-invariants\"[].id" "$1"); do grep -Eq "(^|[^A-Za-z0-9])$id([^A-Za-z0-9]|$)" "$2" || { echo "missing $id"; exit 1; }; done; [ "$(jq ".\"x-invariants\"|length" "$1")" -ge 3 ]' _ "$RECEIPT_SCHEMA" "$SCHEMA_PY"
 
 # a sibling $ref may only name another runhmd.*.json file in the schema directory: never a URL, never a path
 jq '.properties.verdict={"$ref":"https://evil.example/schema.json#/x"}' "$RECEIPT_SCHEMA" >"$TMP/loose/runhmd.receipt.v1.json"
 validate --schema "$TMP/loose/runhmd.receipt.v1.json" "$DENIED_RC"
-[ "$VRC" -eq 2 ] && printf '%s' "$VERR" | grep -q 'never fetched' && ok "a \$ref to a URL fails closed (exit 2), never fetched" || bad "URL \$ref must fail closed (rc=$VRC: $VERR)"
+if [ "$VRC" -eq 2 ] && printf '%s' "$VERR" | grep -q 'never fetched'; then ok "a \$ref to a URL fails closed (exit 2), never fetched"; else bad "URL \$ref must fail closed (rc=$VRC: $VERR)"; fi
 jq '.properties.verdict={"$ref":"../../etc/passwd#/x"}' "$RECEIPT_SCHEMA" >"$TMP/loose/runhmd.receipt.v1.json"
 validate --schema "$TMP/loose/runhmd.receipt.v1.json" "$DENIED_RC"
-[ "$VRC" -eq 2 ] && printf '%s' "$VERR" | grep -q 'etc/passwd' && ok "a \$ref that climbs out of the schema directory fails closed (exit 2, naming the ref)" || bad "path-traversal \$ref must fail closed (rc=$VRC: $VERR)"
+if [ "$VRC" -eq 2 ] && printf '%s' "$VERR" | grep -q 'etc/passwd'; then ok "a \$ref that climbs out of the schema directory fails closed (exit 2, naming the ref)"; else bad "path-traversal \$ref must fail closed (rc=$VRC: $VERR)"; fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -729,11 +736,13 @@ if [ -n "$SEED" ] && ! grep -qF -- "$SEED" "$ROUT" "$RERR" && [ -n "$KID" ] && g
 else bad "keygen output wrong (kid='$KID')"; fi
 before="$(shasum "$VK/runhmd-receipt.key" | awk '{print $1}')"
 rcpt keygen --dir "$VK"
-[ "$RRC" -eq 2 ] && grep -q 'key_exists' "$RERR" && [ "$before" = "$(shasum "$VK/runhmd-receipt.key" | awk '{print $1}')" ] \
-  && ok "keygen refuses to overwrite an existing key (exit 2) and leaves it byte-identical" || bad "keygen overwrote or mis-reported (rc=$RRC)"
+if [ "$RRC" -eq 2 ] && grep -q 'key_exists' "$RERR" && [ "$before" = "$(shasum "$VK/runhmd-receipt.key" | awk '{print $1}')" ]; then
+  ok "keygen refuses to overwrite an existing key (exit 2) and leaves it byte-identical"
+else bad "keygen overwrote or mis-reported (rc=$RRC)"; fi
 HEIMDALL_HOME="$VH" rcpt keygen
-[ "$RRC" -eq 0 ] && [ -f "$VH/signing/runhmd-receipt.key" ] && [ -f "$VH/signing/runhmd-receipt.pub" ] \
-  && ok "keygen with no --dir writes into \$HEIMDALL_HOME/signing (the default key source)" || bad "default keygen location wrong (rc=$RRC)"
+if [ "$RRC" -eq 0 ] && [ -f "$VH/signing/runhmd-receipt.key" ] && [ -f "$VH/signing/runhmd-receipt.pub" ]; then
+  ok "keygen with no --dir writes into \$HEIMDALL_HOME/signing (the default key source)"
+else bad "default keygen location wrong (rc=$RRC)"; fi
 rcpt keygen --dir "$TMP/v-keys-other"
 OTHER_PUB="$TMP/v-keys-other/runhmd-receipt.pub"
 
@@ -763,94 +772,99 @@ receipts = {
 for rid, raw in receipts.items():
     rr.write_receipt(STORE, rid, raw)
 PY
-python3 "$TMP/make-receipts.py" "$PYLIB" "$VK/runhmd-receipt.key" "$VS" "$VO" 2>"$TMP/make.err" && ok "fixtures: DENIED, PROVEN and verdict-attesting receipts signed with the generated key" || bad "fixture setup failed: $(tail -3 "$TMP/make.err" | tr '\n' '|')"
+if python3 "$TMP/make-receipts.py" "$PYLIB" "$VK/runhmd-receipt.key" "$VS" "$VO" 2>"$TMP/make.err"; then ok "fixtures: DENIED, PROVEN and verdict-attesting receipts signed with the generated key"; else bad "fixture setup failed: $(tail -3 "$TMP/make.err" | tr '\n' '|')"; fi
 cp "$VS/$D_ID.json" "$VO/denied.receipt.json"
 
 echo "  -- verify: a genuine receipt --"
 rcpt verify "$VO/denied.receipt.json" --pubkey "$VK/runhmd-receipt.pub"
-[ "$RRC" -eq 0 ] && grep -q "^ok $D_ID DENIED" "$ROUT" && grep -q "$KID" "$ROUT" \
-  && ok "verify FILE --pubkey PUB: exit 0, 'ok <id> <verdict>' naming the signing key" || bad "verify FILE (rc=$RRC: $(cat "$ROUT" "$RERR" | head -3 | tr '\n' '|'))"
+if [ "$RRC" -eq 0 ] && grep -q "^ok $D_ID DENIED" "$ROUT" && grep -q "$KID" "$ROUT"; then
+  ok "verify FILE --pubkey PUB: exit 0, 'ok <id> <verdict>' naming the signing key"
+else bad "verify FILE (rc=$RRC: $(cat "$ROUT" "$RERR" | head -3 | tr '\n' '|'))"; fi
 rcpt verify "$VO/denied.receipt.json" --pubkey "$VK/runhmd-receipt.pub" --json
-jq -e --arg id "$D_ID" --arg kid "$KID" '.ok==true and .id==$id and .verdict=="DENIED" and .key_id==$kid and .visibility=="private" and .created_at=="2026-10-05T12:00:00Z"' "$ROUT" >/dev/null 2>&1 \
-  && ok "verify --json: the canonical output, one JSON object on stdout" || bad "verify --json shape wrong: $(head -c 200 "$ROUT")"
+if jq -e --arg id "$D_ID" --arg kid "$KID" '.ok==true and .id==$id and .verdict=="DENIED" and .key_id==$kid and .visibility=="private" and .created_at=="2026-10-05T12:00:00Z"' "$ROUT" >/dev/null 2>&1; then
+  ok "verify --json: the canonical output, one JSON object on stdout"
+else bad "verify --json shape wrong: $(head -c 200 "$ROUT")"; fi
 rcpt verify "$D_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS"
-[ "$RRC" -eq 0 ] && ok "verify <id> --store DIR: finds the receipt by id" || bad "verify by id with --store (rc=$RRC)"
+if [ "$RRC" -eq 0 ]; then ok "verify <id> --store DIR: finds the receipt by id"; else bad "verify by id with --store (rc=$RRC)"; fi
 ( cd "$REPO" && RUNHMD_RECEIPT_DIR="$VS" RUNHMD_RECEIPT_PUBKEY_FILE="$VK/runhmd-receipt.pub" "$HMD" receipt verify "$P_ID" </dev/null >/dev/null 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "verify <id>: RUNHMD_RECEIPT_DIR selects the store and RUNHMD_RECEIPT_PUBKEY_FILE the trust anchor" || bad "verify by id via env (rc=$rc)"
+if [ "$rc" -eq 0 ]; then ok "verify <id>: RUNHMD_RECEIPT_DIR selects the store and RUNHMD_RECEIPT_PUBKEY_FILE the trust anchor"; else bad "verify by id via env (rc=$rc)"; fi
 mkdir -p "$VH/runhmd/receipts"
 python3 "$TMP/make-receipts.py" "$PYLIB" "$VH/signing/runhmd-receipt.key" "$VH/runhmd/receipts" "$TMP/v-out-home" 2>/dev/null || mkdir -p "$TMP/v-out-home"
 python3 "$TMP/make-receipts.py" "$PYLIB" "$VH/signing/runhmd-receipt.key" "$VH/runhmd/receipts" "$TMP/v-out-home" 2>"$TMP/make.err"
 HEIMDALL_HOME="$VH" rcpt verify "$P_ID"
-[ "$RRC" -eq 0 ] && ok "the default flow needs no flags: keygen, issue, then 'hmd receipt verify <id>' (default store, default trust = the local public key)" || bad "default flow (rc=$RRC: $(cat "$RERR" | head -2 | tr '\n' '|'))"
+if [ "$RRC" -eq 0 ]; then ok "the default flow needs no flags: keygen, issue, then 'hmd receipt verify <id>' (default store, default trust = the local public key)"; else bad "default flow (rc=$RRC: $(cat "$RERR" | head -2 | tr '\n' '|'))"; fi
 
 echo "  -- verify: tampering is caught (exit 1, with the reason) --"
 cp "$VS/$D_ID.json" "$TMP/tamper-store-copy.json"
 before="$(shasum "$VS/$D_ID.json" | awk '{print $1}')"
 flip "$VS/$D_ID.json" 'duplicate settlement' 'duplicate settlemenT'
 rcpt verify "$D_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS"
-[ "$RRC" -eq 1 ] && grep -q 'bad_signature' "$RERR" && [ "$before" != "$(shasum "$VS/$D_ID.json" | awk '{print $1}')" ] \
-  && ok "RP3 acceptance: edit one byte of a STORED receipt and 'hmd receipt verify <id>' exits non-zero (1, bad_signature)" || bad "stored-receipt tamper not caught (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
+if [ "$RRC" -eq 1 ] && grep -q 'bad_signature' "$RERR" && [ "$before" != "$(shasum "$VS/$D_ID.json" | awk '{print $1}')" ]; then
+  ok "RP3 acceptance: edit one byte of a STORED receipt and 'hmd receipt verify <id>' exits non-zero (1, bad_signature)"
+else bad "stored-receipt tamper not caught (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"; fi
 cp "$TMP/tamper-store-copy.json" "$VS/$D_ID.json"
-rcpt verify "$D_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS"; [ "$RRC" -eq 0 ] && ok "control: restoring the byte makes it verify again" || bad "control restore failed (rc=$RRC)"
+rcpt verify "$D_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS"; if [ "$RRC" -eq 0 ]; then ok "control: restoring the byte makes it verify again"; else bad "control restore failed (rc=$RRC)"; fi
 rcpt verify "$VO/denied.receipt.json" --pubkey "$VK/runhmd-receipt.pub" --json >/dev/null
 cp "$VO/denied.receipt.json" "$TMP/t-private-public.json"; flip "$TMP/t-private-public.json" '"visibility":"private"' '"visibility":"public"'
 rcpt verify "$TMP/t-private-public.json" --pubkey "$VK/runhmd-receipt.pub"
-[ "$RRC" -eq 1 ] && grep -q 'bad_signature' "$RERR" && ok "turning a private receipt public (a schema-valid edit) breaks the signature" || bad "private->public edit not caught (rc=$RRC)"
+if [ "$RRC" -eq 1 ] && grep -q 'bad_signature' "$RERR"; then ok "turning a private receipt public (a schema-valid edit) breaks the signature"; else bad "private->public edit not caught (rc=$RRC)"; fi
 cp "$VO/denied.receipt.json" "$TMP/t-verdict.json"; flip "$TMP/t-verdict.json" '"verdict":"DENIED"' '"verdict":"PROVEN"'
 rcpt verify "$TMP/t-verdict.json" --pubkey "$VK/runhmd-receipt.pub"
-[ "$RRC" -eq 1 ] && ok "rewriting DENIED as PROVEN is refused (exit 1)" || bad "DENIED->PROVEN edit not caught (rc=$RRC)"
+if [ "$RRC" -eq 1 ]; then ok "rewriting DENIED as PROVEN is refused (exit 1)"; else bad "DENIED->PROVEN edit not caught (rc=$RRC)"; fi
 head -c 200 "$VO/denied.receipt.json" >"$TMP/t-trunc.json"
-rcpt verify "$TMP/t-trunc.json" --pubkey "$VK/runhmd-receipt.pub"; [ "$RRC" -eq 1 ] && grep -q 'not_json' "$RERR" && ok "a truncated receipt is refused (exit 1, not_json)" || bad "truncated receipt (rc=$RRC)"
+rcpt verify "$TMP/t-trunc.json" --pubkey "$VK/runhmd-receipt.pub"; if [ "$RRC" -eq 1 ] && grep -q 'not_json' "$RERR"; then ok "a truncated receipt is refused (exit 1, not_json)"; else bad "truncated receipt (rc=$RRC)"; fi
 : >"$TMP/t-empty.json"
-rcpt verify "$TMP/t-empty.json" --pubkey "$VK/runhmd-receipt.pub"; [ "$RRC" -eq 1 ] && ok "an empty file is refused (exit 1)" || bad "empty file (rc=$RRC)"
+rcpt verify "$TMP/t-empty.json" --pubkey "$VK/runhmd-receipt.pub"; if [ "$RRC" -eq 1 ]; then ok "an empty file is refused (exit 1)"; else bad "empty file (rc=$RRC)"; fi
 python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2, sort_keys=True, ensure_ascii=False))' "$VO/denied.receipt.json" >"$TMP/t-pretty.json"
 rcpt verify "$TMP/t-pretty.json" --pubkey "$VK/runhmd-receipt.pub"
-[ "$RRC" -eq 1 ] && grep -q 'not_canonical' "$RERR" && ok "a pretty-printed copy is refused (exit 1, not_canonical): only the signed bytes are the receipt" || bad "pretty-printed copy (rc=$RRC)"
+if [ "$RRC" -eq 1 ] && grep -q 'not_canonical' "$RERR"; then ok "a pretty-printed copy is refused (exit 1, not_canonical): only the signed bytes are the receipt"; else bad "pretty-printed copy (rc=$RRC)"; fi
 rcpt verify "$VO/denied.receipt.json" --pubkey "$OTHER_PUB"
-[ "$RRC" -eq 1 ] && grep -q 'unknown_key' "$RERR" && ok "a receipt signed by a key outside the pinned set is refused (exit 1, unknown_key)" || bad "unknown key (rc=$RRC)"
+if [ "$RRC" -eq 1 ] && grep -q 'unknown_key' "$RERR"; then ok "a receipt signed by a key outside the pinned set is refused (exit 1, unknown_key)"; else bad "unknown key (rc=$RRC)"; fi
 rcpt verify "$VO/denied.receipt.json" --pubkey "$OTHER_PUB" --json
-jq -e '.ok==false and .error=="unknown_key" and (.detail|type=="string")' "$ROUT" >/dev/null 2>&1 && ok "verify --json on failure: {ok:false,error,detail} on stdout, exit 1" || bad "verify --json failure shape: $(head -c 200 "$ROUT")"
+if jq -e '.ok==false and .error=="unknown_key" and (.detail|type=="string")' "$ROUT" >/dev/null 2>&1; then ok "verify --json on failure: {ok:false,error,detail} on stdout, exit 1"; else bad "verify --json failure shape: $(head -c 200 "$ROUT")"; fi
 cp "$VS/$P_ID.json" "$VS/$D_ID.swapped.json"; cp "$VS/$P_ID.json" "$TMP/swap.json"
 mkdir -p "$TMP/v-swap"; cp "$VS/$P_ID.json" "$TMP/v-swap/$D_ID.json"
 rcpt verify "$D_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$TMP/v-swap"
-[ "$RRC" -eq 1 ] && grep -q 'id_mismatch' "$RERR" && ok "a genuine receipt filed under another receipt's id is refused (exit 1, id_mismatch)" || bad "id swap (rc=$RRC)"
+if [ "$RRC" -eq 1 ] && grep -q 'id_mismatch' "$RERR"; then ok "a genuine receipt filed under another receipt's id is refused (exit 1, id_mismatch)"; else bad "id swap (rc=$RRC)"; fi
 rm -f "$VS/$D_ID.swapped.json"
 
 echo "  -- verify: configuration problems are exit 2, never a pass and never 'invalid' --"
 HEIMDALL_HOME="$TMP/v-empty-home" rcpt verify "$VO/denied.receipt.json"
-[ "$RRC" -eq 2 ] && grep -q 'no_trust' "$RERR" && ok "no trust anchor anywhere: exit 2 (no_trust), naming --pubkey, not a silent pass" || bad "no trust anchor (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"
-rcpt verify "$TMP/nope.json" --pubkey "$VK/runhmd-receipt.pub"; [ "$RRC" -eq 2 ] && grep -q 'not_found' "$RERR" && ok "a missing file is exit 2 (not_found)" || bad "missing file (rc=$RRC)"
-rcpt verify zzzzzzzzzzzz --pubkey "$VK/runhmd-receipt.pub" --store "$VS"; [ "$RRC" -eq 2 ] && grep -q 'not_found' "$RERR" && ok "an unknown id is exit 2 (not_found)" || bad "unknown id (rc=$RRC)"
+if [ "$RRC" -eq 2 ] && grep -q 'no_trust' "$RERR"; then ok "no trust anchor anywhere: exit 2 (no_trust), naming --pubkey, not a silent pass"; else bad "no trust anchor (rc=$RRC: $(head -2 "$RERR" | tr '\n' '|'))"; fi
+rcpt verify "$TMP/nope.json" --pubkey "$VK/runhmd-receipt.pub"; if [ "$RRC" -eq 2 ] && grep -q 'not_found' "$RERR"; then ok "a missing file is exit 2 (not_found)"; else bad "missing file (rc=$RRC)"; fi
+rcpt verify zzzzzzzzzzzz --pubkey "$VK/runhmd-receipt.pub" --store "$VS"; if [ "$RRC" -eq 2 ] && grep -q 'not_found' "$RERR"; then ok "an unknown id is exit 2 (not_found)"; else bad "unknown id (rc=$RRC)"; fi
 mkdir -p "$TMP/decoy"; cp "$VS/$P_ID.json" "$TMP/decoy/$P_ID.json"
 for hostile in "../decoy/$P_ID" "a/b" ".." "$TMP/decoy/$P_ID"; do
   rcpt verify "$hostile" --pubkey "$VK/runhmd-receipt.pub" --store "$VS/inner-never-created"
-  [ "$RRC" -eq 2 ] && ok "an id like '$hostile' is never resolved against the filesystem: exit 2" || bad "hostile id '$hostile' (rc=$RRC)"
+  if [ "$RRC" -eq 2 ]; then ok "an id like '$hostile' is never resolved against the filesystem: exit 2"; else bad "hostile id '$hostile' (rc=$RRC)"; fi
 done
-rcpt verify "$VO/denied.receipt.json" --pubkey "$TMP/absent.pub"; [ "$RRC" -eq 2 ] && grep -q 'bad_trust' "$RERR" && ok "an unreadable --pubkey file is exit 2 (bad_trust)" || bad "absent pubkey file (rc=$RRC)"
+rcpt verify "$VO/denied.receipt.json" --pubkey "$TMP/absent.pub"; if [ "$RRC" -eq 2 ] && grep -q 'bad_trust' "$RERR"; then ok "an unreadable --pubkey file is exit 2 (bad_trust)"; else bad "absent pubkey file (rc=$RRC)"; fi
 printf 'AAAA\n' >"$TMP/short.pub"
-rcpt verify "$VO/denied.receipt.json" --pubkey "$TMP/short.pub"; [ "$RRC" -eq 2 ] && grep -q 'bad_trust' "$RERR" && ok "a malformed --pubkey file is exit 2, not skipped" || bad "malformed pubkey (rc=$RRC)"
-rcpt verify; [ "$RRC" -eq 2 ] && ok "verify with no target is a usage error (exit 2)" || bad "verify with no target (rc=$RRC)"
-rcpt verify a b; [ "$RRC" -eq 2 ] && ok "verify with two targets is a usage error (exit 2)" || bad "verify with two targets (rc=$RRC)"
-rcpt verify --bogus x; [ "$RRC" -eq 2 ] && ok "an unknown flag is exit 2" || bad "unknown flag (rc=$RRC)"
-rcpt verify "$VO/denied.receipt.json" --pubkey; [ "$RRC" -eq 2 ] && ok "a flag missing its value is exit 2" || bad "missing flag value (rc=$RRC)"
+rcpt verify "$VO/denied.receipt.json" --pubkey "$TMP/short.pub"; if [ "$RRC" -eq 2 ] && grep -q 'bad_trust' "$RERR"; then ok "a malformed --pubkey file is exit 2, not skipped"; else bad "malformed pubkey (rc=$RRC)"; fi
+rcpt verify; if [ "$RRC" -eq 2 ]; then ok "verify with no target is a usage error (exit 2)"; else bad "verify with no target (rc=$RRC)"; fi
+rcpt verify a b; if [ "$RRC" -eq 2 ]; then ok "verify with two targets is a usage error (exit 2)"; else bad "verify with two targets (rc=$RRC)"; fi
+rcpt verify --bogus x; if [ "$RRC" -eq 2 ]; then ok "an unknown flag is exit 2"; else bad "unknown flag (rc=$RRC)"; fi
+rcpt verify "$VO/denied.receipt.json" --pubkey; if [ "$RRC" -eq 2 ]; then ok "a flag missing its value is exit 2"; else bad "missing flag value (rc=$RRC)"; fi
 
 echo "  -- the command itself --"
 snap() { (cd "$1" && find . -type f -exec shasum {} + | sort); }
 s1="$(snap "$VS")"; h1="$(snap "$VK")"
 rcpt verify "$P_ID" --pubkey "$VK/runhmd-receipt.pub" --store "$VS" --json >/dev/null
-[ "$s1" = "$(snap "$VS")" ] && [ "$h1" = "$(snap "$VK")" ] && ok "verify writes nothing (store and key directory byte-identical afterwards)" || bad "verify modified files"
+if [ "$s1" = "$(snap "$VS")" ] && [ "$h1" = "$(snap "$VK")" ]; then ok "verify writes nothing (store and key directory byte-identical afterwards)"; else bad "verify modified files"; fi
 rcpt
-[ "$RRC" -eq 2 ] && grep -q 'verify' "$RERR" && grep -q 'keygen' "$RERR" && [ ! -s "$ROUT" ] && ok "hmd receipt with no subcommand prints the usage on stderr and exits 2" || bad "no-subcommand usage (rc=$RRC)"
-rcpt bogus; [ "$RRC" -eq 2 ] && grep -q 'bogus' "$RERR" && ok "an unknown subcommand is exit 2 and named" || bad "unknown subcommand (rc=$RRC)"
+if [ "$RRC" -eq 2 ] && grep -q 'verify' "$RERR" && grep -q 'keygen' "$RERR" && [ ! -s "$ROUT" ]; then ok "hmd receipt with no subcommand prints the usage on stderr and exits 2"; else bad "no-subcommand usage (rc=$RRC)"; fi
+rcpt bogus; if [ "$RRC" -eq 2 ] && grep -q 'bogus' "$RERR"; then ok "an unknown subcommand is exit 2 and named"; else bad "unknown subcommand (rc=$RRC)"; fi
 rcpt --help
 if [ "$RRC" -eq 0 ] && for w in verify keygen render serve --pubkey --store --json RUNHMD_RECEIPT_KEY_FILE RUNHMD_RECEIPT_PUBKEY_FILE RUNHMD_RECEIPT_DIR; do grep -q -- "$w" "$ROUT" || { echo "missing $w" >&2; exit 1; }; done 2>"$TMP/help.miss" && grep -Eq '^ +1 ' "$ROUT" && grep -Eq '^ +2 ' "$ROUT"; then
   ok "--help documents every subcommand, flag, the key/trust/store environment variables and the exit codes"
 else bad "--help incomplete (rc=$RRC: $(cat "$TMP/help.miss" 2>/dev/null | tr '\n' ' '))"; fi
-[ ! -s "$HEIMDALL_TRACE_ORDER" ] && ok "hmd receipt never fell through to the Claude task-prompt path during this section" || bad "hmd receipt fell through to the task-prompt path: $(head -c 200 "$HEIMDALL_TRACE_ORDER")"
-! grep -En 'shell[[:space:]]*=[[:space:]]*True|os\.system' "$PYLIB/runhmd_receipt.py" "$PYLIB/runhmd_receipt_cli.py" "$RECEIPT_BIN" >/dev/null 2>&1 \
-  && ok "the receipt code never shells out through a shell string" || bad "the receipt code uses shell=True / os.system"
-! grep -En '^[[:space:]]*(import|from)[[:space:]]+(socket|urllib|ssl|ftplib|smtplib|requests)' "$PYLIB/runhmd_receipt.py" "$PYLIB/runhmd_receipt_cli.py" "$RECEIPT_BIN" >/dev/null 2>&1 \
-  && ok "issue/verify code imports no network module (only the local server module does, and only to listen on loopback)" || bad "the receipt core imports a network module"
+if [ ! -s "$HEIMDALL_TRACE_ORDER" ]; then ok "hmd receipt never fell through to the Claude task-prompt path during this section"; else bad "hmd receipt fell through to the task-prompt path: $(head -c 200 "$HEIMDALL_TRACE_ORDER")"; fi
+if ! grep -En 'shell[[:space:]]*=[[:space:]]*True|os\.system' "$PYLIB/runhmd_receipt.py" "$PYLIB/runhmd_receipt_cli.py" "$RECEIPT_BIN" >/dev/null 2>&1; then
+  ok "the receipt code never shells out through a shell string"
+else bad "the receipt code uses shell=True / os.system"; fi
+if ! grep -En '^[[:space:]]*(import|from)[[:space:]]+(socket|urllib|ssl|ftplib|smtplib|requests)' "$PYLIB/runhmd_receipt.py" "$PYLIB/runhmd_receipt_cli.py" "$RECEIPT_BIN" >/dev/null 2>&1; then
+  ok "issue/verify code imports no network module (only the local server module does, and only to listen on loopback)"
+else bad "the receipt core imports a network module"; fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -900,8 +914,9 @@ rr.write_receipt(STORE, "d0d0d0d0d0d0", good[:300] + bytes([good[300] ^ 1]) + go
 rr.write_receipt(STORE, "e0e0e0e0e0e0", good)                                                    # a genuine receipt under another id
 json.dump({"hostile_titles": HOSTILE_TITLES, "meta": HOSTILE_META}, open(OUT, "w"))
 PY
-python3 "$TMP/make-hosting.py" "$PYLIB" "$HK/runhmd-receipt.key" "$HS" "$TMP/hostile.json" 2>"$TMP/make-h.err" \
-  && ok "fixtures: a public PROVEN, a private DENIED and a public DENIED receipt full of hostile text, plus a byte-flipped copy and a mis-filed copy" || bad "hosting fixtures failed: $(tail -3 "$TMP/make-h.err" | tr '\n' '|')"
+if python3 "$TMP/make-hosting.py" "$PYLIB" "$HK/runhmd-receipt.key" "$HS" "$TMP/hostile.json" 2>"$TMP/make-h.err"; then
+  ok "fixtures: a public PROVEN, a private DENIED and a public DENIED receipt full of hostile text, plus a byte-flipped copy and a mis-filed copy"
+else bad "hosting fixtures failed: $(tail -3 "$TMP/make-h.err" | tr '\n' '|')"; fi
 head_of() { tr -d '\r' <"$HHEAD" | grep -i "^$1:" | head -1 | cut -d' ' -f2-; }
 http_do() {  # http_do <curl-args...> <path>: sets HCODE HBODY HHEAD against $BASE
   local path="${*: -1}"; set -- "${@:1:$#-1}"
@@ -911,42 +926,44 @@ http_do() {  # http_do <curl-args...> <path>: sets HCODE HBODY HHEAD against $BA
 
 echo "  -- the local server (loopback only) --"
 rcpt serve --store "$HS" --port 0 --pubkey "$HK/absent.pub"
-[ "$RRC" -eq 2 ] && grep -q 'bad_trust' "$RERR" && ok "serve refuses to start with an unreadable trust file (exit 2): it will not serve what it cannot verify" || bad "serve with a bad trust file (rc=$RRC)"
+if [ "$RRC" -eq 2 ] && grep -q 'bad_trust' "$RERR"; then ok "serve refuses to start with an unreadable trust file (exit 2): it will not serve what it cannot verify"; else bad "serve with a bad trust file (rc=$RRC)"; fi
 HEIMDALL_HOME="$TMP/h-empty-home" rcpt serve --store "$HS" --port 0
-[ "$RRC" -eq 2 ] && grep -q 'no_trust' "$RERR" && ok "serve refuses to start with no trust anchor at all (exit 2, no_trust)" || bad "serve without trust (rc=$RRC)"
-rcpt serve --store "$HS" --port abc --pubkey "$HPUB"; [ "$RRC" -eq 2 ] && ok "serve --port abc is exit 2" || bad "serve --port abc (rc=$RRC)"
-rcpt serve --store "$HS" --port 70000 --pubkey "$HPUB"; [ "$RRC" -eq 2 ] && ok "serve --port 70000 is exit 2" || bad "serve --port 70000 (rc=$RRC)"
-rcpt serve --store "$HS" --host 0.0.0.0 --pubkey "$HPUB"; [ "$RRC" -eq 2 ] && ok "there is no --host: the server only ever binds 127.0.0.1 (exit 2 on the flag)" || bad "serve --host (rc=$RRC)"
+if [ "$RRC" -eq 2 ] && grep -q 'no_trust' "$RERR"; then ok "serve refuses to start with no trust anchor at all (exit 2, no_trust)"; else bad "serve without trust (rc=$RRC)"; fi
+rcpt serve --store "$HS" --port abc --pubkey "$HPUB"; if [ "$RRC" -eq 2 ]; then ok "serve --port abc is exit 2"; else bad "serve --port abc (rc=$RRC)"; fi
+rcpt serve --store "$HS" --port 70000 --pubkey "$HPUB"; if [ "$RRC" -eq 2 ]; then ok "serve --port 70000 is exit 2"; else bad "serve --port 70000 (rc=$RRC)"; fi
+rcpt serve --store "$HS" --host 0.0.0.0 --pubkey "$HPUB"; if [ "$RRC" -eq 2 ]; then ok "there is no --host: the server only ever binds 127.0.0.1 (exit 2 on the flag)"; else bad "serve --host (rc=$RRC)"; fi
 "$HMD" receipt serve --store "$HS" --pubkey "$HPUB" --port 0 </dev/null >"$TMP/serve.out" 2>"$TMP/serve.err" &
 SERVER_PID=$!
 for _ in $(seq 1 150); do grep -q 'http://127.0.0.1:' "$TMP/serve.out" 2>/dev/null && break; sleep 0.1; done
 BASE="$(grep -Eo 'http://127\.0\.0\.1:[0-9]+' "$TMP/serve.out" | head -1)"
-[ -n "$BASE" ] && ok "serve --port 0 listens on an ephemeral loopback port and prints its URL ($BASE)" || { bad "the server did not report a listening URL: $(head -c 300 "$TMP/serve.err")"; BASE="http://127.0.0.1:9"; }
+if [ -n "$BASE" ]; then ok "serve --port 0 listens on an ephemeral loopback port and prints its URL ($BASE)"; else bad "the server did not report a listening URL: $(head -c 300 "$TMP/serve.err")"; BASE="http://127.0.0.1:9"; fi
 store_before="$(cd "$HS" && find . -type f -exec shasum {} + | sort)"
 
 echo "  -- /r/<id>.json serves the exact signed bytes --"
 http_do "/r/$PUB_ID.json"
 if [ "$HCODE" = "200" ] && cmp -s "$HBODY" "$HS/$PUB_ID.json"; then ok "GET /r/<id>.json: 200 and the body is byte-identical to the stored, signed receipt"; else bad "GET /r/<id>.json (code=$HCODE, bytes differ or missing)"; fi
-head_of content-type | grep -qi '^application/json' && ok "GET /r/<id>.json is served as application/json" || bad "content-type of .json is '$(head_of content-type)'"
-head_of x-content-type-options | grep -qi nosniff && ok "responses carry X-Content-Type-Options: nosniff" || bad "no nosniff header"
+if head_of content-type | grep -qi '^application/json'; then ok "GET /r/<id>.json is served as application/json"; else bad "content-type of .json is '$(head_of content-type)'"; fi
+if head_of x-content-type-options | grep -qi nosniff; then ok "responses carry X-Content-Type-Options: nosniff"; else bad "no nosniff header"; fi
 cp "$HBODY" "$TMP/served.json"
 rcpt verify "$TMP/served.json" --pubkey "$HPUB"
-[ "$RRC" -eq 0 ] && ok "the downloaded /r/<id>.json verifies with 'hmd receipt verify' (what was served is what was signed)" || bad "the served bytes do not verify (rc=$RRC: $(head -c 200 "$RERR"))"
-curl -fsS --noproxy '*' "$BASE/r/$PUB_ID.json" 2>/dev/null | jq -e '.schema=="runhmd.receipt/1" and .cost_usd!=null' >/dev/null \
-  && ok "RP3 acceptance verbatim: curl -fsS \$BASE/r/<id>.json | jq -e '.schema==\"runhmd.receipt/1\" and .cost_usd!=null'" || bad "RP3 acceptance line for /r/<id>.json"
-curl -fsS --noproxy '*' "$BASE/r/$PUB_ID.json" 2>/dev/null | grep -q minimal_input \
-  && bad "the served receipt contains minimal_input" || ok "RP3 acceptance: ! curl \$BASE/r/<id>.json | grep -q minimal_input (a receipt holds digests only)"
+if [ "$RRC" -eq 0 ]; then ok "the downloaded /r/<id>.json verifies with 'hmd receipt verify' (what was served is what was signed)"; else bad "the served bytes do not verify (rc=$RRC: $(head -c 200 "$RERR"))"; fi
+if curl -fsS --noproxy '*' "$BASE/r/$PUB_ID.json" 2>/dev/null | jq -e '.schema=="runhmd.receipt/1" and .cost_usd!=null' >/dev/null; then
+  ok "RP3 acceptance verbatim: curl -fsS \$BASE/r/<id>.json | jq -e '.schema==\"runhmd.receipt/1\" and .cost_usd!=null'"
+else bad "RP3 acceptance line for /r/<id>.json"; fi
+if curl -fsS --noproxy '*' "$BASE/r/$PUB_ID.json" 2>/dev/null | grep -q minimal_input; then
+  bad "the served receipt contains minimal_input"
+else ok "RP3 acceptance: ! curl \$BASE/r/<id>.json | grep -q minimal_input (a receipt holds digests only)"; fi
 http_do -I "/r/$PUB_ID.json"
-[ "$HCODE" = "200" ] && [ "$(head_of content-length)" = "$(wc -c <"$HS/$PUB_ID.json" | tr -d ' ')" ] && ok "HEAD /r/<id>.json: 200 with the exact Content-Length and no body" || bad "HEAD (code=$HCODE length=$(head_of content-length))"
+if [ "$HCODE" = "200" ] && [ "$(head_of content-length)" = "$(wc -c <"$HS/$PUB_ID.json" | tr -d ' ')" ]; then ok "HEAD /r/<id>.json: 200 with the exact Content-Length and no body"; else bad "HEAD (code=$HCODE length=$(head_of content-length))"; fi
 
 echo "  -- /r/<id> is HTML, with every dynamic value escaped --"
 http_do "/r/$PUB_ID"
-[ "$HCODE" = "200" ] && head_of content-type | grep -qi '^text/html; charset=utf-8' && grep -q "PROVEN" "$HBODY" && grep -q "$PUB_ID" "$HBODY" && ok "GET /r/<id>: 200 text/html with the verdict and the id" || bad "GET /r/<id> (code=$HCODE type=$(head_of content-type))"
-grep -q "href=\"$PUB_ID.json\"" "$HBODY" && ok "the page links to its own signed JSON by a relative href" || bad "no link to $PUB_ID.json"
-grep -q "hmd receipt verify" "$HBODY" && ok "the page tells the reader how to verify it themselves" || bad "no verify instructions on the page"
+if [ "$HCODE" = "200" ] && head_of content-type | grep -qi '^text/html; charset=utf-8' && grep -q "PROVEN" "$HBODY" && grep -q "$PUB_ID" "$HBODY"; then ok "GET /r/<id>: 200 text/html with the verdict and the id"; else bad "GET /r/<id> (code=$HCODE type=$(head_of content-type))"; fi
+if grep -q "href=\"$PUB_ID.json\"" "$HBODY"; then ok "the page links to its own signed JSON by a relative href"; else bad "no link to $PUB_ID.json"; fi
+if grep -q "hmd receipt verify" "$HBODY"; then ok "the page tells the reader how to verify it themselves"; else bad "no verify instructions on the page"; fi
 CSP="$(head_of content-security-policy)"
 case "$CSP" in *"default-src 'none'"*"base-uri 'none'"*"form-action 'none'"*"frame-ancestors 'none'"*) ok "the Content-Security-Policy header is default-src 'none' (+ base-uri, form-action, frame-ancestors)" ;; *) bad "CSP header is '$CSP'" ;; esac
-head_of referrer-policy | grep -qi 'no-referrer' && ok "Referrer-Policy: no-referrer" || bad "no referrer policy"
+if head_of referrer-policy | grep -qi 'no-referrer'; then ok "Referrer-Policy: no-referrer"; else bad "no referrer policy"; fi
 cp "$HBODY" "$TMP/public-page.html"
 http_do "/r/$HOSTILE_ID"
 cp "$HBODY" "$TMP/hostile-page.html"; HHOSTILE_CODE="$HCODE"
@@ -996,10 +1013,10 @@ case("the inline <style> is allowed by hash ('%s'), not by 'unsafe-inline'" % st
 print("\n".join(out))
 PY
 python3 "$TMP/html-check.py" "$TMP/hostile-page.html" "$TMP/hostile.json" >"$TMP/html-check.out" 2>"$TMP/html-check.err"
-[ "$HHOSTILE_CODE" = "200" ] && ok "GET /r/<id> of a receipt whose every text field is hostile still serves 200 (it is valid, just hostile)" || bad "hostile receipt page (code=$HHOSTILE_CODE)"
+if [ "$HHOSTILE_CODE" = "200" ]; then ok "GET /r/<id> of a receipt whose every text field is hostile still serves 200 (it is valid, just hostile)"; else bad "hostile receipt page (code=$HHOSTILE_CODE)"; fi
 while IFS= read -r line; do case "$line" in "PASS "*) ok "${line#PASS }" ;; "FAIL "*) bad "${line#FAIL }" ;; esac; done <"$TMP/html-check.out"
 [ -s "$TMP/html-check.out" ] || bad "the HTML checker produced no output: $(tail -3 "$TMP/html-check.err" | tr '\n' '|')"
-grep -q 'private' "$TMP/public-page.html" && bad "a public receipt page mentions 'private'" || ok "a public receipt's page does not claim to be private"
+if grep -q 'private' "$TMP/public-page.html"; then bad "a public receipt page mentions 'private'"; else ok "a public receipt's page does not claim to be private"; fi
 
 echo "  -- nothing but verified receipts at /r/<id>[.json] --"
 for bad_route in "/" "/r" "/r/" "/r/zzzzzzzzzzzz" "/r/zzzzzzzzzzzz.json" "/r/$PUB_ID/" "/r/$PUB_ID.json/" "/r/$PUB_ID/card.png" "/r/$PUB_ID.html" "/api/receipts" "/r/$PUB_ID.JSON" "/r/ab" "/R/$PUB_ID"; do
@@ -1012,10 +1029,10 @@ for evil in "/r/../h-secret" "/r/../h-secret.json" "/r/..%2fh-secret.json" "/r/%
   if [ "$HCODE" = "404" ] || [ "$HCODE" = "400" ]; then ok "traversal/odd path $evil is refused ($HCODE)"; else bad "path $evil -> $HCODE"; fi
 done
 http_do -X POST --data 'x=1' "/r/$PUB_ID"
-[ "$HCODE" = "405" ] && head_of allow | grep -qi 'GET' && ok "POST /r/<id> is 405 with an Allow header" || bad "POST -> $HCODE"
-http_do -X PUT --data 'x=1' "/r/$PUB_ID.json"; [ "$HCODE" = "405" ] && ok "PUT is 405" || bad "PUT -> $HCODE"
-http_do -X DELETE "/r/$PUB_ID.json"; [ "$HCODE" = "405" ] && ok "DELETE is 405" || bad "DELETE -> $HCODE"
-http_do "/r/$(printf 'a%.0s' $(seq 1 6000))"; [ "$HCODE" = "404" ] || [ "$HCODE" = "414" ] || [ "$HCODE" = "400" ] && ok "a 6 KB path is refused ($HCODE), no crash" || bad "huge path -> $HCODE"
+if [ "$HCODE" = "405" ] && head_of allow | grep -qi 'GET'; then ok "POST /r/<id> is 405 with an Allow header"; else bad "POST -> $HCODE"; fi
+http_do -X PUT --data 'x=1' "/r/$PUB_ID.json"; if [ "$HCODE" = "405" ]; then ok "PUT is 405"; else bad "PUT -> $HCODE"; fi
+http_do -X DELETE "/r/$PUB_ID.json"; if [ "$HCODE" = "405" ]; then ok "DELETE is 405"; else bad "DELETE -> $HCODE"; fi
+http_do "/r/$(printf 'a%.0s' $(seq 1 6000))"; if [ "$HCODE" = "404" ] || [ "$HCODE" = "414" ] || [ "$HCODE" = "400" ]; then ok "a 6 KB path is refused ($HCODE), no crash"; else bad "huge path -> $HCODE"; fi
 for tampered in "$FLIP_ID" "$SWAP_ID"; do
   for suffix in "" ".json"; do
     http_do "/r/$tampered$suffix"
@@ -1107,7 +1124,7 @@ for form in "/r/$PRIV_ID" "/r/$PRIV_ID.json" "/r/$PRIV_ID?token=x" "/r/$PRIV_ID.
     ok "GET $form is 404, byte for byte the answer for an id that does not exist: no receipt, no sign that it exists"
   else bad "GET $form -> $HCODE: $(head -c 80 "$HBODY")"; fi
 done
-http_do -I "/r/$PRIV_ID.json"; [ "$HCODE" = "404" ] && ok "HEAD /r/<private id>.json is 404 too" || bad "HEAD of a private receipt -> $HCODE"
+http_do -I "/r/$PRIV_ID.json"; if [ "$HCODE" = "404" ]; then ok "HEAD /r/<private id>.json is 404 too"; else bad "HEAD of a private receipt -> $HCODE"; fi
 
 echo "  -- headers: every response is locked down, the HTML page above all --"
 locked_down() {  # the last response (HHEAD) carries the whole lock-down set
@@ -1168,8 +1185,8 @@ if command -v lsof >/dev/null 2>&1; then
   else bad "listening sockets of the serving process: $(printf '%s' "$LISTENING" | tr '\n' '|' | head -c 300)"; fi
 else printf '  SKIP lsof is not installed: the listening address cannot be inspected here\n'; fi
 
-http_do "/r/$PUB_ID.json"; [ "$HCODE" = "200" ] && ok "the server is still serving after every hostile request" || bad "the server stopped serving ($HCODE)"
-[ "$store_before" = "$(cd "$HS" && find . -type f -exec shasum {} + | sort)" ] && ok "the server only reads: the store is byte-identical after every request" || bad "the server modified the store"
+http_do "/r/$PUB_ID.json"; if [ "$HCODE" = "200" ]; then ok "the server is still serving after every hostile request"; else bad "the server stopped serving ($HCODE)"; fi
+if [ "$store_before" = "$(cd "$HS" && find . -type f -exec shasum {} + | sort)" ]; then ok "the server only reads: the store is byte-identical after every request"; else bad "the server modified the store"; fi
 kill "$SERVER_PID" >/dev/null 2>&1; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
 
 echo "  -- hmd receipt render: the same pages as a static tree for runhmd.dev --"
@@ -1181,24 +1198,24 @@ if [ "$RRC" -eq 0 ] && jq -e --arg a "$PUB_ID" --arg c "$HOSTILE_ID" --arg b "$P
   ok "render --json: the two PUBLIC receipts are rendered, the private one is skipped by name, nothing failed"
 else bad "render summary wrong (rc=$RRC: $(head -c 300 "$ROUT") $(head -c 200 "$RERR"))"; fi
 if [ -f "$HO/r/$PUB_ID.json" ] && cmp -s "$HO/r/$PUB_ID.json" "$HS2/$PUB_ID.json" && [ -f "$HO/r/$PUB_ID.html" ]; then ok "render writes r/<id>.json (byte-identical to the signed receipt) and r/<id>.html"; else bad "render output missing or not byte-identical"; fi
-[ ! -e "$HO/r/$PRIV_ID.json" ] && [ ! -e "$HO/r/$PRIV_ID.html" ] && ! grep -rqs "a private finding title" "$HO" && ok "a private receipt is never written into the publishable tree" || bad "private receipt leaked into the static site"
-cmp -s "$HO/r/$PUB_ID.html" "$TMP/public-page.html" && cmp -s "$HO/r/$HOSTILE_ID.html" "$TMP/hostile-page.html" && ok "the static HTML is byte-identical to what the server returned (one code path renders both)" || bad "static HTML differs from the served HTML"
-[ "$(find "$HO" -type f | wc -l | tr -d ' ')" = "4" ] && ok "the tree holds exactly r/<id>.json and r/<id>.html for each public receipt, nothing else" || bad "unexpected files: $(find "$HO" -type f | tr '\n' ' ')"
-python3 "$TMP/html-check.py" "$HO/r/$HOSTILE_ID.html" "$TMP/hostile.json" | grep -q '^FAIL' && bad "the STATIC hostile page fails the escaping checks" || ok "the static hostile page passes every escaping check too"
+if [ ! -e "$HO/r/$PRIV_ID.json" ] && [ ! -e "$HO/r/$PRIV_ID.html" ] && ! grep -rqs "a private finding title" "$HO"; then ok "a private receipt is never written into the publishable tree"; else bad "private receipt leaked into the static site"; fi
+if cmp -s "$HO/r/$PUB_ID.html" "$TMP/public-page.html" && cmp -s "$HO/r/$HOSTILE_ID.html" "$TMP/hostile-page.html"; then ok "the static HTML is byte-identical to what the server returned (one code path renders both)"; else bad "static HTML differs from the served HTML"; fi
+if [ "$(find "$HO" -type f | wc -l | tr -d ' ')" = "4" ]; then ok "the tree holds exactly r/<id>.json and r/<id>.html for each public receipt, nothing else"; else bad "unexpected files: $(find "$HO" -type f | tr '\n' ' ')"; fi
+if python3 "$TMP/html-check.py" "$HO/r/$HOSTILE_ID.html" "$TMP/hostile.json" | grep -q '^FAIL'; then bad "the STATIC hostile page fails the escaping checks"; else ok "the static hostile page passes every escaping check too"; fi
 before="$(cd "$HO" && find . -type f -exec shasum {} + | sort)"
 rcpt render --store "$HS2" --pubkey "$HPUB" --out "$HO"
-[ "$RRC" -eq 0 ] && [ "$before" = "$(cd "$HO" && find . -type f -exec shasum {} + | sort)" ] && ok "re-rendering is idempotent (same bytes)" || bad "re-render changed the tree (rc=$RRC)"
+if [ "$RRC" -eq 0 ] && [ "$before" = "$(cd "$HO" && find . -type f -exec shasum {} + | sort)" ]; then ok "re-rendering is idempotent (same bytes)"; else bad "re-render changed the tree (rc=$RRC)"; fi
 HO2="$TMP/h-site-bad"
 rcpt render --store "$HS" --pubkey "$HPUB" --out "$HO2" --json
 if [ "$RRC" -eq 1 ] && jq -e --arg f "$FLIP_ID" --arg s "$SWAP_ID" '.ok==false and ([.failed[].id]|sort)==([$f,$s]|sort) and (.failed[0].error|type=="string")' "$ROUT" >/dev/null 2>&1; then
   ok "render over a store holding a tampered and a mis-filed receipt exits 1 and names both"
 else bad "render over a bad store (rc=$RRC: $(head -c 300 "$ROUT"))"; fi
-[ ! -e "$HO2/r/$FLIP_ID.json" ] && [ ! -e "$HO2/r/$FLIP_ID.html" ] && [ ! -e "$HO2/r/$SWAP_ID.json" ] && [ -f "$HO2/r/$PUB_ID.json" ] && ok "a receipt that fails verification is never published; the genuine ones still are" || bad "bad receipts were published or good ones were not"
-rcpt render --store "$HS2" --pubkey "$HPUB"; [ "$RRC" -eq 2 ] && ok "render without --out is a usage error (exit 2)" || bad "render without --out (rc=$RRC)"
+if [ ! -e "$HO2/r/$FLIP_ID.json" ] && [ ! -e "$HO2/r/$FLIP_ID.html" ] && [ ! -e "$HO2/r/$SWAP_ID.json" ] && [ -f "$HO2/r/$PUB_ID.json" ]; then ok "a receipt that fails verification is never published; the genuine ones still are"; else bad "bad receipts were published or good ones were not"; fi
+rcpt render --store "$HS2" --pubkey "$HPUB"; if [ "$RRC" -eq 2 ]; then ok "render without --out is a usage error (exit 2)"; else bad "render without --out (rc=$RRC)"; fi
 HEIMDALL_HOME="$TMP/h-empty-home" rcpt render --store "$HS2" --out "$TMP/h-site-notrust"
-[ "$RRC" -eq 2 ] && [ ! -e "$TMP/h-site-notrust" ] && ok "render with no trust anchor is exit 2 and writes nothing" || bad "render without trust (rc=$RRC)"
+if [ "$RRC" -eq 2 ] && [ ! -e "$TMP/h-site-notrust" ]; then ok "render with no trust anchor is exit 2 and writes nothing"; else bad "render without trust (rc=$RRC)"; fi
 rcpt render --store "$TMP/h-no-such-store" --pubkey "$HPUB" --out "$TMP/h-site-empty" --json
-[ "$RRC" -eq 0 ] && jq -e '.ok==true and .rendered==[]' "$ROUT" >/dev/null 2>&1 && ok "render over an empty or missing store succeeds with nothing rendered" || bad "render over a missing store (rc=$RRC)"
+if [ "$RRC" -eq 0 ] && jq -e '.ok==true and .rendered==[]' "$ROUT" >/dev/null 2>&1; then ok "render over an empty or missing store succeeds with nothing rendered"; else bad "render over a missing store (rc=$RRC)"; fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1210,25 +1227,28 @@ echo "[A] hmd attack --receipt"
 AK="$TMP/a-keys"; AS="$TMP/a-store"
 # attack <args...>: from the repo root, stdin from /dev/null; sets AOUT AERR ARC (the env is the caller's)
 attack() { AOUT="$TMP/attack.out"; AERR="$TMP/attack.err"; (cd "$REPO" && "$HMD" attack "$@" </dev/null >"$AOUT" 2>"$AERR"); ARC=$?; }
+# entries <dir>: the non-hidden names directly inside <dir>, one per line, sorted (what `ls <dir>` printed, without parsing ls)
+entries() { find "$1" -mindepth 1 -maxdepth 1 ! -name '.*' -exec basename {} \; | sort; }
 rcpt keygen --dir "$AK" >/dev/null
 export RUNHMD_RECEIPT_KEY_FILE="$AK/runhmd-receipt.key" RUNHMD_RECEIPT_PUBKEY_FILE="$AK/runhmd-receipt.pub" RUNHMD_RECEIPT_DIR="$AS"
 BUGGY=fixtures/attack/buggy-webhook; CLEAN=fixtures/attack/clean-sample
 
 echo "  -- opt-in: without --receipt nothing changes --"
 attack $BUGGY --json --yes
-[ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .receipt_url==null' "$AOUT" >/dev/null 2>&1 && [ ! -e "$AS" ] && ! grep -qi receipt "$AERR" \
-  && ok "no --receipt: receipt_url stays null, no store is created, a configured key is not touched (a signing key in the environment is not consent to write)" || bad "default attack changed (rc=$ARC, store exists: $([ -e "$AS" ] && echo yes || echo no))"
+if [ "$ARC" -eq 1 ] && jq -e '.verdict=="DENIED" and .receipt_url==null' "$AOUT" >/dev/null 2>&1 && [ ! -e "$AS" ] && ! grep -qi receipt "$AERR"; then
+  ok "no --receipt: receipt_url stays null, no store is created, a configured key is not touched (a signing key in the environment is not consent to write)"
+else bad "default attack changed (rc=$ARC, store exists: $([ -e "$AS" ] && echo yes || echo no))"; fi
 
 echo "  -- --receipt on a DENIED target --"
 attack $BUGGY --json --yes --receipt; cp "$AOUT" "$TMP/a.denied.json"; DRC=$ARC; cp "$AERR" "$TMP/a.denied.err"
 AID="$(jq -r .id "$TMP/a.denied.json")"
-[ "$DRC" -eq 1 ] && ok "the exit code is still the verdict's (DENIED = 1) when a receipt is issued" || bad "exit code with --receipt is $DRC, want 1"
-python3 "$SCHEMA_PY" validate "$TMP/a.denied.json" >/dev/null 2>"$TMP/a.err" && ok "the verdict with a populated receipt_url still validates against runhmd.verdict/1" || bad "verdict with receipt_url invalid: $(head -2 "$TMP/a.err" | tr '\n' '|')"
-[ "$(jq -r .receipt_url "$TMP/a.denied.json")" = "https://runhmd.dev/r/$AID" ] && ok "receipt_url is https://runhmd.dev/r/<verdict id>" || bad "receipt_url is '$(jq -r .receipt_url "$TMP/a.denied.json")'"
-[ -f "$AS/$AID.json" ] && grep -q "receipt: $AS/$AID.json" "$TMP/a.denied.err" && ok "the receipt is stored as <store>/<id>.json and its path is reported on stderr (stdout stays pure JSON)" || bad "receipt file or stderr note missing"
+if [ "$DRC" -eq 1 ]; then ok "the exit code is still the verdict's (DENIED = 1) when a receipt is issued"; else bad "exit code with --receipt is $DRC, want 1"; fi
+if python3 "$SCHEMA_PY" validate "$TMP/a.denied.json" >/dev/null 2>"$TMP/a.err"; then ok "the verdict with a populated receipt_url still validates against runhmd.verdict/1"; else bad "verdict with receipt_url invalid: $(head -2 "$TMP/a.err" | tr '\n' '|')"; fi
+if [ "$(jq -r .receipt_url "$TMP/a.denied.json")" = "https://runhmd.dev/r/$AID" ]; then ok "receipt_url is https://runhmd.dev/r/<verdict id>"; else bad "receipt_url is '$(jq -r .receipt_url "$TMP/a.denied.json")'"; fi
+if [ -f "$AS/$AID.json" ] && grep -q "receipt: $AS/$AID.json" "$TMP/a.denied.err"; then ok "the receipt is stored as <store>/<id>.json and its path is reported on stderr (stdout stays pure JSON)"; else bad "receipt file or stderr note missing"; fi
 check "stdout is still exactly one JSON value" jq -e -s 'length==1' "$TMP/a.denied.json"
 rcpt verify "$AID"
-[ "$RRC" -eq 0 ] && grep -q "^ok $AID DENIED" "$ROUT" && ok "hmd receipt verify <id> accepts the receipt the attack just issued" || bad "verify of the issued receipt (rc=$RRC: $(head -c 200 "$RERR"))"
+if [ "$RRC" -eq 0 ] && grep -q "^ok $AID DENIED" "$ROUT"; then ok "hmd receipt verify <id> accepts the receipt the attack just issued"; else bad "verify of the issued receipt (rc=$RRC: $(head -c 200 "$RERR"))"; fi
 cat >"$TMP/a-check.py" <<'PY'
 import hashlib, json, os, sys
 verdict_path, receipt_path, target, plugin_json = sys.argv[1:5]
@@ -1280,65 +1300,71 @@ for off in 3 $((size/3)) $((size/2)) $((size-80)) $((size-2)); do
   cp "$TMP/a-original.json" "$AS/$AID.json"
   python3 -c 'import sys; p,i=sys.argv[1],int(sys.argv[2]); b=bytearray(open(p,"rb").read()); b[i]^=1; open(p,"wb").write(b)' "$AS/$AID.json" "$off"
   rcpt verify "$AID"
-  [ "$RRC" -eq 1 ] && ok "edit one byte (offset $off) of the stored receipt: 'hmd receipt verify $AID' exits 1" || bad "tampered stored receipt at offset $off not rejected (rc=$RRC)"
+  if [ "$RRC" -eq 1 ]; then ok "edit one byte (offset $off) of the stored receipt: 'hmd receipt verify $AID' exits 1"; else bad "tampered stored receipt at offset $off not rejected (rc=$RRC)"; fi
 done
 cp "$TMP/a-original.json" "$AS/$AID.json"
-rcpt verify "$AID"; [ "$RRC" -eq 0 ] && ok "control: the restored receipt verifies again" || bad "restored receipt (rc=$RRC)"
+rcpt verify "$AID"; if [ "$RRC" -eq 0 ]; then ok "control: the restored receipt verifies again"; else bad "restored receipt (rc=$RRC)"; fi
 
 echo "  -- PROVEN, card, flags --"
 attack $CLEAN --json --yes --receipt; cp "$AOUT" "$TMP/a.proven.json"; PRC=$ARC
 PID="$(jq -r .id "$TMP/a.proven.json")"
-[ "$PRC" -eq 0 ] && jq -e --arg u "https://runhmd.dev/r/$PID" '.verdict=="PROVEN" and .receipt_url==$u' "$TMP/a.proven.json" >/dev/null 2>&1 && ok "PROVEN: exit 0 and receipt_url populated" || bad "PROVEN with receipt (rc=$PRC)"
+if [ "$PRC" -eq 0 ] && jq -e --arg u "https://runhmd.dev/r/$PID" '.verdict=="PROVEN" and .receipt_url==$u' "$TMP/a.proven.json" >/dev/null 2>&1; then ok "PROVEN: exit 0 and receipt_url populated"; else bad "PROVEN with receipt (rc=$PRC)"; fi
 rcpt verify "$PID" --json
-jq -e '.ok==true and .verdict=="PROVEN"' "$ROUT" >/dev/null 2>&1 && jq -e '.findings==[]' "$AS/$PID.json" >/dev/null 2>&1 && ok "the PROVEN receipt verifies and carries no findings" || bad "PROVEN receipt (rc=$RRC)"
+if jq -e '.ok==true and .verdict=="PROVEN"' "$ROUT" >/dev/null 2>&1 && jq -e '.findings==[]' "$AS/$PID.json" >/dev/null 2>&1; then ok "the PROVEN receipt verifies and carries no findings"; else bad "PROVEN receipt (rc=$RRC)"; fi
 attack $CLEAN --yes --receipt
-grep -q "VERDICT: PROVEN" "$AOUT" && grep -q "Evidence → runhmd.dev/r/$PID" "$AOUT" && grep -q "receipt: $AS/$PID.json" "$AERR" \
-  && ok "the card shows 'Evidence → runhmd.dev/r/<id>' only now that a receipt exists, and the file path is on stderr" || bad "card with receipt (rc=$ARC: $(cat "$AOUT" | tail -4 | tr '\n' '|'))"
+if grep -q "VERDICT: PROVEN" "$AOUT" && grep -q "Evidence → runhmd.dev/r/$PID" "$AOUT" && grep -q "receipt: $AS/$PID.json" "$AERR"; then
+  ok "the card shows 'Evidence → runhmd.dev/r/<id>' only now that a receipt exists, and the file path is on stderr"
+else bad "card with receipt (rc=$ARC: $(cat "$AOUT" | tail -4 | tr '\n' '|'))"; fi
 attack $CLEAN --yes
-! grep -q "Evidence" "$AOUT" && ok "without --receipt the card has no Evidence line (nothing is invented)" || bad "an Evidence line appeared without a receipt"
+if ! grep -q "Evidence" "$AOUT"; then ok "without --receipt the card has no Evidence line (nothing is invented)"; else bad "an Evidence line appeared without a receipt"; fi
 attack $CLEAN --json --yes --receipt --no-upload
-jq -e '.receipt_url==null' "$AOUT" >/dev/null 2>&1 && [ -f "$AS/$PID.json" ] && ok "--receipt --no-upload: the receipt is issued locally and receipt_url stays null (RP1: null when --no-upload)" || bad "--no-upload (rc=$ARC)"
+if jq -e '.receipt_url==null' "$AOUT" >/dev/null 2>&1 && [ -f "$AS/$PID.json" ]; then ok "--receipt --no-upload: the receipt is issued locally and receipt_url stays null (RP1: null when --no-upload)"; else bad "--no-upload (rc=$ARC)"; fi
 attack $CLEAN --json --yes --receipt --public
-jq -e '.visibility=="public"' "$AS/$PID.json" >/dev/null 2>&1 && ok "--receipt --public issues a public receipt (the only kind 'hmd receipt render' publishes)" || bad "--public receipt"
+if jq -e '.visibility=="public"' "$AS/$PID.json" >/dev/null 2>&1; then ok "--receipt --public issues a public receipt (the only kind 'hmd receipt render' publishes)"; else bad "--public receipt"; fi
 attack $CLEAN --json --yes --receipt
-jq -e '.visibility=="private"' "$AS/$PID.json" >/dev/null 2>&1 && [ "$(find "$AS" -maxdepth 1 -name "$PID*" | wc -l | tr -d ' ')" = "1" ] && ok "re-attacking the same tree replaces its receipt (one file per id) and goes back to private" || bad "re-attack did not replace the receipt"
+if jq -e '.visibility=="private"' "$AS/$PID.json" >/dev/null 2>&1 && [ "$(find "$AS" -maxdepth 1 -name "$PID*" | wc -l | tr -d ' ')" = "1" ]; then ok "re-attacking the same tree replaces its receipt (one file per id) and goes back to private"; else bad "re-attack did not replace the receipt"; fi
 attack $CLEAN --json --yes --receipt --public --out "$TMP/a-out"
-[ "$(jq -r .receipt_url "$TMP/a-out/verdict.json")" = "https://runhmd.dev/r/$PID" ] && python3 "$SCHEMA_PY" validate "$TMP/a-out/verdict.json" >/dev/null 2>&1 \
-  && ok "--out DIR: the verdict.json written to disk carries receipt_url too" || bad "--out verdict.json lacks the receipt_url"
+if [ "$(jq -r .receipt_url "$TMP/a-out/verdict.json")" = "https://runhmd.dev/r/$PID" ] && python3 "$SCHEMA_PY" validate "$TMP/a-out/verdict.json" >/dev/null 2>&1; then
+  ok "--out DIR: the verdict.json written to disk carries receipt_url too"
+else bad "--out verdict.json lacks the receipt_url"; fi
 RUNHMD_RECEIPT_BASE_URL="https://receipts.example.test/team/" attack $CLEAN --json --yes --receipt
-[ "$(jq -r .receipt_url "$AOUT")" = "https://receipts.example.test/team/r/$PID" ] && ok "RUNHMD_RECEIPT_BASE_URL moves the URL" || bad "base URL override (url=$(jq -r .receipt_url "$AOUT"))"
+if [ "$(jq -r .receipt_url "$AOUT")" = "https://receipts.example.test/team/r/$PID" ]; then ok "RUNHMD_RECEIPT_BASE_URL moves the URL"; else bad "base URL override (url=$(jq -r .receipt_url "$AOUT"))"; fi
 printf '%s\n%s\n' "$BUGGY" "$CLEAN" >"$TMP/a-targets.txt"; rm -rf "$AS"
 attack --batch "$TMP/a-targets.txt" --out "$TMP/a-batch" --json --yes --receipt
-[ "$ARC" -eq 1 ] && [ "$(jq -r 'select(.receipt_url!=null)|.id' "$AOUT" | wc -l | tr -d ' ')" = "2" ] && [ "$(ls "$AS" | wc -l | tr -d ' ')" = "2" ] \
-  && ok "--batch --receipt: each target gets its receipt and receipt_url (2 receipts in the store)" || bad "batch receipts (rc=$ARC, store: $(ls "$AS" 2>/dev/null | tr '\n' ' '))"
+if [ "$ARC" -eq 1 ] && [ "$(jq -r 'select(.receipt_url!=null)|.id' "$AOUT" | wc -l | tr -d ' ')" = "2" ] && [ "$(entries "$AS" | wc -l | tr -d ' ')" = "2" ]; then
+  ok "--batch --receipt: each target gets its receipt and receipt_url (2 receipts in the store)"
+else bad "batch receipts (rc=$ARC, store: $(entries "$AS" 2>/dev/null | tr '\n' ' '))"; fi
 for f in "$AS"/*.json; do rcpt verify "$f"; [ "$RRC" -eq 0 ] || { bad "batch receipt $f does not verify"; break; }; done
 
 echo "  -- refusals happen before any work, and never half-succeed --"
 HEIMDALL_HOME="$TMP/a-empty-home" RUNHMD_RECEIPT_KEY_FILE="" attack $BUGGY --json --receipt
-[ "$ARC" -eq 2 ] && jq -e '.error=="no_signing_key" and (has("verdict")|not)' "$AOUT" >/dev/null 2>&1 \
-  && ok "--receipt with no signing key: exit 2 (no_signing_key) even without --yes, no verdict, nothing run (a receipt is never silently skipped)" || bad "no signing key (rc=$ARC: $(head -c 200 "$AOUT"))"
+if [ "$ARC" -eq 2 ] && jq -e '.error=="no_signing_key" and (has("verdict")|not)' "$AOUT" >/dev/null 2>&1; then
+  ok "--receipt with no signing key: exit 2 (no_signing_key) even without --yes, no verdict, nothing run (a receipt is never silently skipped)"
+else bad "no signing key (rc=$ARC: $(head -c 200 "$AOUT"))"; fi
 cp "$AK/runhmd-receipt.key" "$TMP/a-loose.key"; chmod 644 "$TMP/a-loose.key"
 RUNHMD_RECEIPT_KEY_FILE="$TMP/a-loose.key" attack $BUGGY --json --yes --receipt
-[ "$ARC" -eq 2 ] && jq -e '.error=="insecure_key_file"' "$AOUT" >/dev/null 2>&1 && ok "a signing key other users can read is refused (exit 2)" || bad "loose key (rc=$ARC)"
+if [ "$ARC" -eq 2 ] && jq -e '.error=="insecure_key_file"' "$AOUT" >/dev/null 2>&1; then ok "a signing key other users can read is refused (exit 2)"; else bad "loose key (rc=$ARC)"; fi
 attack $BUGGY --yes --public
-[ "$ARC" -eq 2 ] && grep -q -- '--receipt' "$AERR" && [ ! -s "$AOUT" ] && ok "--public without --receipt is a usage error (exit 2) that names --receipt" || bad "--public alone (rc=$ARC)"
+if [ "$ARC" -eq 2 ] && grep -q -- '--receipt' "$AERR" && [ ! -s "$AOUT" ]; then ok "--public without --receipt is a usage error (exit 2) that names --receipt"; else bad "--public alone (rc=$ARC)"; fi
 for base in "http://runhmd.dev" "https://" "ftp://x.test" "https://x.test/?q=1"; do
   RUNHMD_RECEIPT_BASE_URL="$base" attack $CLEAN --json --yes --receipt
-  [ "$ARC" -eq 2 ] && jq -e '.error=="bad_base_url"' "$AOUT" >/dev/null 2>&1 && ok "RUNHMD_RECEIPT_BASE_URL=$base is refused before the attack runs (exit 2)" || bad "bad base $base (rc=$ARC)"
+  if [ "$ARC" -eq 2 ] && jq -e '.error=="bad_base_url"' "$AOUT" >/dev/null 2>&1; then ok "RUNHMD_RECEIPT_BASE_URL=$base is refused before the attack runs (exit 2)"; else bad "bad base $base (rc=$ARC)"; fi
 done
 touch "$TMP/a-afile"
 RUNHMD_RECEIPT_DIR="$TMP/a-afile/store" attack $BUGGY --json --yes --receipt
-[ "$ARC" -eq 5 ] && jq -e '.error=="receipt_failed" and (has("verdict")|not)' "$AOUT" >/dev/null 2>&1 \
-  && ok "a store that cannot be written is exit 5 (receipt_failed) and NO verdict is printed: no URL that points at nothing" || bad "unwritable store (rc=$ARC: $(head -c 200 "$AOUT"))"
+if [ "$ARC" -eq 5 ] && jq -e '.error=="receipt_failed" and (has("verdict")|not)' "$AOUT" >/dev/null 2>&1; then
+  ok "a store that cannot be written is exit 5 (receipt_failed) and NO verdict is printed: no URL that points at nothing"
+else bad "unwritable store (rc=$ARC: $(head -c 200 "$AOUT"))"; fi
 attack $CLEAN --yes --receipt --max-usd 0.50 --no-network
-[ "$ARC" -eq 0 ] && ok "--receipt composes with --max-usd and --no-network" || bad "--receipt with other flags (rc=$ARC)"
+if [ "$ARC" -eq 0 ]; then ok "--receipt composes with --max-usd and --no-network"; else bad "--receipt with other flags (rc=$ARC)"; fi
 
 echo "  -- isolation: the receipt store is the only place --receipt writes --"
 mkdir -p "$TMP/a-iso/h" "$TMP/a-iso/heimdall" "$TMP/a-iso/tmp"; rm -rf "$TMP/a-iso/store"
 git_before="$(git -C "$REPO" status --porcelain)"
 ( cd "$REPO" && HOME="$TMP/a-iso/h" HEIMDALL_HOME="$TMP/a-iso/heimdall" TMPDIR="$TMP/a-iso/tmp" RUNHMD_RECEIPT_DIR="$TMP/a-iso/store" "$HMD" attack $BUGGY --json --yes --receipt >/dev/null 2>&1 )
-[ -z "$(ls -A "$TMP/a-iso/h")" ] && [ -z "$(ls -A "$TMP/a-iso/tmp")" ] && [ "$git_before" = "$(git -C "$REPO" status --porcelain)" ] && [ "$(ls "$TMP/a-iso/store" | wc -l | tr -d ' ')" = "1" ] \
-  && ok "HOME untouched, TMPDIR left empty, the repo tree untouched; exactly one new file, the receipt" || bad "--receipt wrote outside the store: home=[$(ls -A "$TMP/a-iso/h")] tmp=[$(ls -A "$TMP/a-iso/tmp")]"
+if [ -z "$(ls -A "$TMP/a-iso/h")" ] && [ -z "$(ls -A "$TMP/a-iso/tmp")" ] && [ "$git_before" = "$(git -C "$REPO" status --porcelain)" ] && [ "$(entries "$TMP/a-iso/store" | wc -l | tr -d ' ')" = "1" ]; then
+  ok "HOME untouched, TMPDIR left empty, the repo tree untouched; exactly one new file, the receipt"
+else bad "--receipt wrote outside the store: home=[$(ls -A "$TMP/a-iso/h")] tmp=[$(ls -A "$TMP/a-iso/tmp")]"; fi
 unset RUNHMD_RECEIPT_KEY_FILE RUNHMD_RECEIPT_PUBKEY_FILE RUNHMD_RECEIPT_DIR
 fi
 
@@ -1347,17 +1373,18 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 if section D; then
 echo "[D] dispatch, inventory, docs, the hmd prove call site"
-grep -Eq '^  receipt\)' "$REPO/bin/heimdall" && ok "bin/heimdall has a receipt) dispatch arm" || bad "bin/heimdall has no receipt) arm"
-[ -x "$RECEIPT_BIN" ] && ok "bin/heimdall-receipt is executable" || bad "bin/heimdall-receipt is not executable"
-bash -n "$REPO/bin/heimdall" && ok "bin/heimdall still passes bash -n" || bad "bin/heimdall has a syntax error"
-grep -qx 'receipt' "$REPO/packages/runhmd/subcommands.txt" && ok "packages/runhmd/subcommands.txt lists receipt (npx runhmd receipt ... reaches hmd, not 'attack receipt')" || bad "subcommands.txt does not list receipt"
-grep -q '`heimdall-receipt`' "$REPO/docs/INVENTORY.md" && ok "docs/INVENTORY.md lists heimdall-receipt" || bad "INVENTORY.md does not list heimdall-receipt"
+if grep -Eq '^  receipt\)' "$REPO/bin/heimdall"; then ok "bin/heimdall has a receipt) dispatch arm"; else bad "bin/heimdall has no receipt) arm"; fi
+if [ -x "$RECEIPT_BIN" ]; then ok "bin/heimdall-receipt is executable"; else bad "bin/heimdall-receipt is not executable"; fi
+if bash -n "$REPO/bin/heimdall"; then ok "bin/heimdall still passes bash -n"; else bad "bin/heimdall has a syntax error"; fi
+if grep -qx 'receipt' "$REPO/packages/runhmd/subcommands.txt"; then ok "packages/runhmd/subcommands.txt lists receipt (npx runhmd receipt ... reaches hmd, not 'attack receipt')"; else bad "subcommands.txt does not list receipt"; fi
+# shellcheck disable=SC2016  # the backticks are literal markdown being grepped for, never a command substitution
+if grep -q '`heimdall-receipt`' "$REPO/docs/INVENTORY.md"; then ok "docs/INVENTORY.md lists heimdall-receipt"; else bad "INVENTORY.md does not list heimdall-receipt"; fi
 DOC="$REPO/docs/RECEIPTS.md"
-[ -f "$DOC" ] && ok "docs/RECEIPTS.md exists" || bad "docs/RECEIPTS.md is missing"
+if [ -f "$DOC" ]; then ok "docs/RECEIPTS.md exists"; else bad "docs/RECEIPTS.md is missing"; fi
 for need in RUNHMD_RECEIPT_KEY_FILE RUNHMD_RECEIPT_PUBKEY_FILE "release/runhmd-receipt.pub" "release/heimdall-signing.pub" "hmd receipt keygen" "hmd receipt render" "Wiring hmd prove" "issue_receipt" "verdict_digest" "runhmd.prove/1" "RC2" "POST /api/receipts" "runhmd.dev"; do
-  grep -qF -- "$need" "$DOC" 2>/dev/null && ok "docs/RECEIPTS.md covers: $need" || bad "docs/RECEIPTS.md does not mention: $need"
+  if grep -qF -- "$need" "$DOC" 2>/dev/null; then ok "docs/RECEIPTS.md covers: $need"; else bad "docs/RECEIPTS.md does not mention: $need"; fi
 done
-grep -q "hmd prove" "$PYLIB/runhmd_receipt.py" && grep -q "def issue_receipt" "$PYLIB/runhmd_receipt.py" && ok "the module docstring names hmd prove's call site and issue_receipt exists" || bad "prove call site not documented in runhmd_receipt.py"
+if grep -q "hmd prove" "$PYLIB/runhmd_receipt.py" && grep -q "def issue_receipt" "$PYLIB/runhmd_receipt.py"; then ok "the module docstring names hmd prove's call site and issue_receipt exists"; else bad "prove call site not documented in runhmd_receipt.py"; fi
 python3 - "$PYLIB" <<'PY' >"$TMP/prove-site.out" 2>&1
 import inspect, sys
 sys.path.insert(0, sys.argv[1])
@@ -1368,7 +1395,7 @@ assert need <= set(params), sorted(need - set(params))
 assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values()), "issue_receipt must be keyword-only"
 print("prove-site-ok")
 PY
-grep -q prove-site-ok "$TMP/prove-site.out" && ok "issue_receipt takes keyword-only gates/regression_tests: the fields a runhmd.prove/1 document supplies" || bad "issue_receipt signature: $(tail -2 "$TMP/prove-site.out" | tr '\n' '|')"
+if grep -q prove-site-ok "$TMP/prove-site.out"; then ok "issue_receipt takes keyword-only gates/regression_tests: the fields a runhmd.prove/1 document supplies"; else bad "issue_receipt signature: $(tail -2 "$TMP/prove-site.out" | tr '\n' '|')"; fi
 python3 - "$PYLIB" <<'PY' >"$TMP/lazy.out" 2>&1
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -1377,9 +1404,9 @@ loaded = [m for m in ("cp_auth", "runhmd_receipt", "runhmd_receipt_site", "http.
 assert not loaded, loaded
 print("lazy-ok")
 PY
-grep -q lazy-ok "$TMP/lazy.out" && ok "importing the attack CLI loads no crypto, receipt, server or socket module (the default path stays light and offline)" || bad "attack imports too much: $(tail -2 "$TMP/lazy.out" | tr '\n' '|')"
-"$HMD" attack --help 2>/dev/null | grep -q -- '--receipt' && "$HMD" attack --help 2>/dev/null | grep -q -- '--public' && ok "hmd attack --help documents --receipt and --public" || bad "attack --help does not document --receipt/--public"
-[ ! -s "$HEIMDALL_TRACE_ORDER" ] && ok "nothing in this suite fell through to the Claude task-prompt path" || bad "fell through to the task-prompt path: $(head -c 200 "$HEIMDALL_TRACE_ORDER")"
+if grep -q lazy-ok "$TMP/lazy.out"; then ok "importing the attack CLI loads no crypto, receipt, server or socket module (the default path stays light and offline)"; else bad "attack imports too much: $(tail -2 "$TMP/lazy.out" | tr '\n' '|')"; fi
+if "$HMD" attack --help 2>/dev/null | grep -q -- '--receipt' && "$HMD" attack --help 2>/dev/null | grep -q -- '--public'; then ok "hmd attack --help documents --receipt and --public"; else bad "attack --help does not document --receipt/--public"; fi
+if [ ! -s "$HEIMDALL_TRACE_ORDER" ]; then ok "nothing in this suite fell through to the Claude task-prompt path"; else bad "fell through to the task-prompt path: $(head -c 200 "$HEIMDALL_TRACE_ORDER")"; fi
 fi
 
 echo ""
