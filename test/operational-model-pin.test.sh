@@ -122,8 +122,7 @@ ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/op-model-pin.XXXXXX")"
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
+trap 'rm -rf "$TMP"' EXIT
 
 echo "operational-model-pin harness  repo=$REPO"
 echo "--------------------------------------------------------------------"
@@ -271,12 +270,16 @@ for t in $ROUTING_TEMPLATES; do
     bad "routing template $t missing — the tier table an orchestrator reads is gone"
     continue
   fi
-  grep -Fq 'heimdall-model-resolve' "$t" \
-    && ok "$t names bin/heimdall-model-resolve — the agent is told how to obtain the model string" \
-    || bad "$t never names bin/heimdall-model-resolve — its tier table states a rule with no way to apply it"
-  grep -Fq 'HEIMDALL_MODEL_' "$t" \
-    && ok "$t documents the HEIMDALL_MODEL_<TIER> pin as the bench/eval-only escape hatch" \
-    || bad "$t omits HEIMDALL_MODEL_<TIER> — the only legitimate way to pin is undocumented where the rule is stated"
+  if grep -Fq 'heimdall-model-resolve' "$t"; then
+    ok "$t names bin/heimdall-model-resolve — the agent is told how to obtain the model string"
+  else
+    bad "$t never names bin/heimdall-model-resolve — its tier table states a rule with no way to apply it"
+  fi
+  if grep -Fq 'HEIMDALL_MODEL_' "$t"; then
+    ok "$t documents the HEIMDALL_MODEL_<TIER> pin as the bench/eval-only escape hatch"
+  else
+    bad "$t omits HEIMDALL_MODEL_<TIER> — the only legitimate way to pin is undocumented where the rule is stated"
+  fi
   PROSE="$(grep -nE -e "$PROSE_RE" "$t" || true)"
   if [ -z "$PROSE" ]; then
     ok "$t names no model generation in prose either"
@@ -301,15 +304,19 @@ else
   for tier in opus haiku; do
     got="$(env -u HEIMDALL_MODEL_OPUS -u HEIMDALL_MODEL_SONNET -u HEIMDALL_MODEL_HAIKU \
            "$RESOLVE" "$tier" 2>/dev/null)"
-    [ "$got" = "$tier" ] \
-      && ok "default: tier '$tier' resolves to the bare alias '$got' (Claude Code picks the current generation)" \
-      || bad "tier '$tier' resolved to '$got', expected the bare alias '$tier'"
+    if [ "$got" = "$tier" ]; then
+      ok "default: tier '$tier' resolves to the bare alias '$got' (Claude Code picks the current generation)"
+    else
+      bad "tier '$tier' resolved to '$got', expected the bare alias '$tier'"
+    fi
   done
 
   got="$(env -u HEIMDALL_MODEL_SONNET "$RESOLVE" sonnet 2>/dev/null)"
-  [ "$got" = "sonnet[1m]" ] \
-    && ok "default: tier 'sonnet' resolves to '$got' — the 1M-context alias, so long sessions stop compacting" \
-    || bad "tier 'sonnet' resolved to '$got', expected 'sonnet[1m]'"
+  if [ "$got" = "sonnet[1m]" ]; then
+    ok "default: tier 'sonnet' resolves to '$got' — the 1M-context alias, so long sessions stop compacting"
+  else
+    bad "tier 'sonnet' resolved to '$got', expected 'sonnet[1m]'"
+  fi
   # the suffix must not smuggle in a pinned generation
   case "$got" in
     *claude-sonnet-[0-9]*) bad "sonnet resolved to '$got' — a pinned generation, which silently ages" ;;
@@ -329,21 +336,29 @@ else
   esac
   # escape hatch: a cost-capped or pre-1M bench run can opt out
   got="$(env -u HEIMDALL_MODEL_SONNET HEIMDALL_NO_1M=1 "$RESOLVE" sonnet 2>/dev/null)"
-  [ "$got" = "sonnet" ] \
-    && ok "HEIMDALL_NO_1M=1 suppresses the suffix -> '$got' (cost cap / pre-1M bench repro)" \
-    || bad "HEIMDALL_NO_1M=1 gave '$got', expected the bare alias 'sonnet'"
+  if [ "$got" = "sonnet" ]; then
+    ok "HEIMDALL_NO_1M=1 suppresses the suffix -> '$got' (cost cap / pre-1M bench repro)"
+  else
+    bad "HEIMDALL_NO_1M=1 gave '$got', expected the bare alias 'sonnet'"
+  fi
   got="$(HEIMDALL_MODEL_OPUS=claude-opus-9-9 "$RESOLVE" opus 2>/dev/null)"
-  [ "$got" = "claude-opus-9-9" ] \
-    && ok "override: HEIMDALL_MODEL_OPUS still pins opus -> '$got' (bench/eval repro preserved)" \
-    || bad "HEIMDALL_MODEL_OPUS override -> '$got', expected the pinned id — bench reproducibility is broken"
+  if [ "$got" = "claude-opus-9-9" ]; then
+    ok "override: HEIMDALL_MODEL_OPUS still pins opus -> '$got' (bench/eval repro preserved)"
+  else
+    bad "HEIMDALL_MODEL_OPUS override -> '$got', expected the pinned id — bench reproducibility is broken"
+  fi
   got="$(HEIMDALL_MODEL_SONNET=claude-sonnet-9-9 "$RESOLVE" sonnet 2>/dev/null)"
-  [ "$got" = "claude-sonnet-9-9" ] \
-    && ok "override: HEIMDALL_MODEL_SONNET still pins sonnet -> '$got'" \
-    || bad "HEIMDALL_MODEL_SONNET override -> '$got', expected the pinned id"
+  if [ "$got" = "claude-sonnet-9-9" ]; then
+    ok "override: HEIMDALL_MODEL_SONNET still pins sonnet -> '$got'"
+  else
+    bad "HEIMDALL_MODEL_SONNET override -> '$got', expected the pinned id"
+  fi
   got="$(HEIMDALL_MODEL_HAIKU=claude-haiku-9-9 "$RESOLVE" haiku 2>/dev/null)"
-  [ "$got" = "claude-haiku-9-9" ] \
-    && ok "override: HEIMDALL_MODEL_HAIKU still pins haiku -> '$got'" \
-    || bad "HEIMDALL_MODEL_HAIKU override -> '$got', expected the pinned id"
+  if [ "$got" = "claude-haiku-9-9" ]; then
+    ok "override: HEIMDALL_MODEL_HAIKU still pins haiku -> '$got'"
+  else
+    bad "HEIMDALL_MODEL_HAIKU override -> '$got', expected the pinned id"
+  fi
 fi
 
 echo ""

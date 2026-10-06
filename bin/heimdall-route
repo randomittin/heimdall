@@ -76,7 +76,7 @@ EOF
 }
 
 # The chain is a library; sourcing it defines functions and routes nothing.
-# shellcheck source=lib/hmd-headroom-chain.sh
+# shellcheck source=lib/hmd-headroom-chain.sh disable=SC1091
 if [ -r "$BIN_DIR/lib/hmd-headroom-chain.sh" ]; then
   . "$BIN_DIR/lib/hmd-headroom-chain.sh"
 fi
@@ -189,7 +189,7 @@ if [ -n "$FALLBACK_URL" ]; then
   if [ "$_fb_rc" -ne 0 ]; then
     _fb_owner=""
     chain_available && _fb_owner="$(hmd_headroom_port_owner "${FALLBACK_URL##*:}" 2>/dev/null || true)"
-    printf 'hmd route: the OmniRoute fallback gateway %s is not answering (curl exit %s%s) — REFUSING to launch. A fallback session never falls back to a direct connection; start the gateway, or run `hmd fallback off` to leave fallback routing.\n' \
+    printf "hmd route: the OmniRoute fallback gateway %s is not answering (curl exit %s%s) — REFUSING to launch. A fallback session never falls back to a direct connection; start the gateway, or run \`hmd fallback off\` to leave fallback routing.\n" \
       "$FALLBACK_URL" "$_fb_rc" "${_fb_owner:+; port held by $_fb_owner}" >&2
     exit 3
   fi
@@ -215,7 +215,7 @@ if [ -n "$FALLBACK_URL" ]; then
       export ANTHROPIC_MODEL="$_fbmodel"
       printf "  ${D}· fallback: pinned ANTHROPIC_MODEL=%s (hmd fallback model)${R}\n" "$_fbmodel" >&2
     else
-      printf "  ${D}· fallback: ANTHROPIC_MODEL is not set and no fallback_model is configured — OmniRoute will receive bare claude-* ids${R}\n" >&2
+      printf '  %b· fallback: ANTHROPIC_MODEL is not set and no fallback_model is configured — OmniRoute will receive bare claude-* ids%b\n' "$D" "$R" >&2
     fi
     unset _fbmodel
   fi
@@ -271,7 +271,7 @@ if command -v heimdall-fallback >/dev/null 2>&1 && [ -n "${ANTHROPIC_AUTH_TOKEN:
   _tf="$(heimdall-fallback --repo "$PWD" token-file 2>/dev/null || true)"
   if [ -n "$_tf" ] && [ -r "$_tf" ] && [ "$ANTHROPIC_AUTH_TOKEN" = "$(cat "$_tf")" ]; then
     unset ANTHROPIC_AUTH_TOKEN
-    printf "  ${D}· fallback: dropped the OmniRoute gateway token from this unrouted launch (wrong audience)${R}\n" >&2
+    printf '  %b· fallback: dropped the OmniRoute gateway token from this unrouted launch (wrong audience)%b\n' "$D" "$R" >&2
   fi
   unset _tf
 fi

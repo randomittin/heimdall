@@ -684,12 +684,12 @@ obtain_consent() {
 
   if [ "$waived" = "true" ]; then
     printf '  CONSENT WAIVED — this is disclosure, not a question.\n'
-    printf '  Declared in this module'"'"'s own manifest (`consent_waived`), NOT in the\n'
+    printf "  Declared in this module's own manifest (\`consent_waived\`), NOT in the\n"
     printf '  class contract: class %s still requires consent from every OTHER\n' "$consenting"
     printf '  module that claims it. The waiver covers "%s" alone.\n\n' "$name"
     printf '    why: %s\n\n' "$waived_reason"
     printf '  Waived here is the QUESTION only. The class invariants below still run\n'
-    printf '  with the module active, and `hmd modules remove %s` still returns the\n' "$name"
+    printf "  with the module active, and \`hmd modules remove %s\` still returns the\n" "$name"
     printf '  tree byte-identically. Decline it outright: hmd modules optout %s\n\n' "$name"
     CONSENT_JSON="$(jq -n \
       --arg t "$(now_iso)" --arg h "$(sha256_string "$text")" --arg text "$text" \
@@ -1646,7 +1646,7 @@ cmd_status() {
     case "$st" in
       opted-out)
         printf '    state:    OPTED OUT — not installed because you declined it.\n'
-        printf '    Nothing will re-install it, including `hmd update`.\n'
+        printf "    Nothing will re-install it, including \`hmd update\`.\n"
         printf '    Change your mind: hmd modules optin %s\n' "$name" ;;
       failed)
         printf '    state:    not installed — INSTALL FAILED at stage: %s\n' \
@@ -1661,7 +1661,7 @@ cmd_status() {
       deferred)
         printf '    state:    NOT YET ATTEMPTED — not installed; deferred by design.\n'
         printf '    hmd installed fast and left this for the background; it will be\n'
-        printf '    attempted on the next `hmd update`, or now with:\n'
+        printf "    attempted on the next \`hmd update\`, or now with:\n"
         printf '              hmd modules repair %s\n' "$name" ;;
       *)
         printf '    state:    NOT ATTEMPTED — not installed, and no install was tried.\n'
@@ -1956,7 +1956,7 @@ add_preflight() {
     printf '        preflight: %s check(s) the PAYLOAD needs are not met yet.\n' \
       "$(printf '%s\n' "$advisories" | grep -c 'fix:')"
     printf '%s\n' "$advisories"
-    printf '        The module records at its pin now; `hmd modules repair %s`\n' "$name"
+    printf "        The module records at its pin now; \`hmd modules repair %s\`\n" "$name"
     printf '        fetches the payload and requires the fixes above.\n'
   else
     printf '        preflight: every precondition met.\n'
@@ -2248,7 +2248,7 @@ cmd_optout() {
     jq -n --arg n "$name" '{tool:"heimdall-modules", action:"optout", ok:true,
       name:$n, state:"opted-out"}'
   elif [ "$QUIET" -eq 0 ]; then
-    printf '\n  Opted out of "%s". Nothing will install it, including `hmd update`.\n' "$name"
+    printf "\n  Opted out of \"%s\". Nothing will install it, including \`hmd update\`.\n" "$name"
     printf '  Undo: hmd modules optin %s\n\n' "$name"
   fi
   return 0
