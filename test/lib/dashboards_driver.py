@@ -310,12 +310,14 @@ def overlay_gating():
     e = Env()
     e.live()
     state = {"schema_version": 1, "dashboards": d.snapshot(e.root, phone=False)}
+    frozen = json.dumps(state, sort_keys=True)
     assert "dashboards" not in d.overlay(state, e.root, frozenset()), "a phone that never listed dash-v1 must not see the key"
     assert "dashboards" not in d.overlay(state, e.root, frozenset(("controls-v1",)))
     assert d.overlay({"a": 1}, e.root, frozenset()) == {"a": 1}
     got = d.overlay(state, e.root, CAPS)["dashboards"]
     assert got["v"] == 1 and got["tiles"][0]["panel"] is not None, "the phone's slice carries the panel"
-    assert state["dashboards"]["tiles"][0].get("panel") is None, "overlay must copy, never edit the shared state"
+    assert json.dumps(state, sort_keys=True) == frozen, "overlay must copy, never edit the shared state"
+    assert "code" not in json.dumps(state["dashboards"]), "the shared (desktop) view carries no confirmation code"
 
 
 @check

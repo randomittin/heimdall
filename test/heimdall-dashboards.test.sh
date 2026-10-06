@@ -230,7 +230,8 @@ if [ "$(printf '%s\n' "$DESK" | grep -c '^ok ')" -ne 4 ]; then bad "desktop hmd 
 MTREE="$TMPROOT/desk-mutant"
 mkdir -p "$MTREE" && cp -R "$REPO/bin" "$MTREE/bin" && cp -R "$REPO/sentinels" "$MTREE/sentinels"
 if mutate "$MTREE/sentinels/hmd-ui.py" 'device_id="direct", seq=None, transport="direct")' 'device_id="direct", seq=None, transport="direct", caps={"dash-v1"})'; then
-  if desktop_probe mutant "$MTREE" | grep -q '^FAIL control-cannot-create'; then
+  MOUT="$(desktop_probe mutant "$MTREE")"
+  if printf '%s\n' "$MOUT" | grep -q '^FAIL control-cannot-create'; then
     ok "mutant [the direct route handed the phone's caps] lets a tile be created, and the live probe 'control-cannot-create' catches it"
   else bad "mutant [the direct route handed the phone's caps] was NOT caught by the live probe"; fi
 else bad "mutant [direct route + caps]: could not be applied"; fi
