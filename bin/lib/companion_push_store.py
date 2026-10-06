@@ -47,7 +47,8 @@ lives only in push.json (0600) and in the memory of whoever called in. This modu
 logs nothing, and no error message it raises repeats anything it was given -- they name the rule.
 
 EXTENSION KINDS. `events` accepts the five kinds of EVENT_KINDS and, beyond them, exactly the kinds bin/lib/companion_push.py has
-registered (register_kind): `extension_kinds()` -> {kind: capability}. The relay client advertises each of those capabilities in its
+registered (register_kind): `extension_kinds()` -> {kind: capability}, supplied through `bind_extension_kinds(provider)` (the relay
+client binds companion_push.registered_kinds at start; unbound, there are none). The relay client advertises each of those capabilities in its
 state frames, so a phone asks for a kind only when it is listed, and a kind that is not registered here is `bad-events` for that
 registration alone (the rest of the phone's notifications keep working).
 
@@ -62,7 +63,6 @@ import re
 import secrets
 import time
 import unicodedata
-from importlib.util import module_from_spec, spec_from_file_location
 
 APP_REL = os.path.join(".heimdall", "app")
 PUSH_REL = os.path.join(APP_REL, "push.json")
@@ -114,24 +114,27 @@ def _label(value):
     return text
 
 
-_EXTENSION = {"mod": None, "tried": False}
+_EXTENSION = {"provider": None}
+
+
+def bind_extension_kinds(provider):
+    """Name where the registered push kinds come from: `provider()` -> {kind: capability token}, bin/lib/companion_push.py's
+    registered_kinds (the relay client binds it at start). This module imports nothing to find out -- it stays dependency-free."""
+    _EXTENSION["provider"] = provider if callable(provider) else None
 
 
 def extension_kinds():
-    """{kind: capability token} of the push kinds registered beyond EVENT_KINDS (bin/lib/companion_push.py register_kind: the
-    registration interface in its docstring). Empty when that module cannot load -- so an extension kind is then `bad-events`, and
-    no capability is advertised for it: a kind is accepted exactly while hmd can send it."""
-    if not _EXTENSION["tried"]:
-        _EXTENSION["tried"] = True
-        try:
-            spec = spec_from_file_location("companion_push", os.path.join(os.path.dirname(os.path.abspath(__file__)), "companion_push.py"))
-            mod = module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            _EXTENSION["mod"] = mod
-        except Exception:
-            _EXTENSION["mod"] = None
-    mod = _EXTENSION["mod"]
-    return dict(mod.registered_kinds()) if mod is not None else {}
+    """{kind: capability token} of the push kinds registered beyond EVENT_KINDS (companion_push.register_kind: the registration
+    interface in its docstring). Empty while nothing is bound or the provider fails -- so an extension kind is then `bad-events`,
+    and no capability is advertised for it: a kind is accepted exactly while hmd can send it."""
+    provider = _EXTENSION["provider"]
+    if provider is None:
+        return {}
+    try:
+        kinds = provider()
+    except Exception:
+        return {}
+    return {k: v for k, v in kinds.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(kinds, dict) else {}
 
 
 def _events(value):

@@ -435,6 +435,8 @@ CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companio
 VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
 DASH = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_dashboards.py"))
 DASH_ALERTS = _load_module("dashboard_alerts", os.path.join(LIB_DIR, "dashboard_alerts.py"))
+if PUSH_STORE is not None and getattr(UI, "PUSH", None) is not None:
+    PUSH_STORE.bind_extension_kinds(UI.PUSH.registered_kinds)   # the store accepts, and hmd advertises, exactly the kinds hmd can send
 WS =_load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
