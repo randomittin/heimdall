@@ -306,6 +306,7 @@ cmd_tail() {
       END { flush() }
     ' "$f"
   done
+  # shellcheck disable=SC2012  # names are generated above as <ts>__<idx>__<nr>.block (ts stripped to [0-9TZ.:-]), never arbitrary
   ls "$tmp" 2>/dev/null | sort | tail -n "$n" | while IFS= read -r bf; do
     cat "$tmp/$bf"
     echo
