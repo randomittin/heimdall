@@ -37,8 +37,10 @@ TMPROOT="$(mktemp -d)"
 # real repo changed during this suite.
 cd "$TMPROOT" || { echo "FATAL: cannot cd into scratch dir [$TMPROOT] -- refusing to run from a cwd that could be the real repo"; exit 1; }
 unset CLAUDE_PROJECT_DIR
-LEDGER_GLOB="$REPO/.planning/ledger/checkpoints/*.json"
-LEDGER_BEFORE="$(shasum -a 256 $LEDGER_GLOB 2>/dev/null | sort)"
+# ledger_digest -- sha256 of every real-repo ledger checkpoint. The glob is expanded
+# afresh on each call, so a checkpoint CREATED mid-suite shows up in the AFTER digest.
+ledger_digest() { shasum -a 256 "$REPO"/.planning/ledger/checkpoints/*.json 2>/dev/null | sort; }
+LEDGER_BEFORE="$(ledger_digest)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
 # A fresh throwaway git project with a .planning dir (same shape the autosave
@@ -238,7 +240,7 @@ case "$codes" in
 esac
 
 # ── 19. the REAL repo's ledger checkpoints are byte-identical to when we started ──
-LEDGER_AFTER="$(shasum -a 256 $LEDGER_GLOB 2>/dev/null | sort)"
+LEDGER_AFTER="$(ledger_digest)"
 if [ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ]; then
   ok "19. no case wrote into the real repo's .planning/ledger/checkpoints (hermetic)"
 else
