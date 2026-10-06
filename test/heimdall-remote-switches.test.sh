@@ -468,8 +468,11 @@ def gate_checks(libdir):
     rg = git_repo(base, "g14")
     probes = {"interrupt": {}, "save-checkpoint": {}, "hook-toggle": {"id": "parallel-gate", "enabled": False},
               "fallback-mode": {"mode": "off"}, "launch-session": {"repo": repo_a, "branch": "b"},
-              "pr-merge": {"number": 1, "method": "squash"}, "launch-stop": {"id": "l-77"}}
-    files = [os.path.join(home, "remote-launch.json"), os.path.join(home, "remote-merge.json")]
+              "pr-merge": {"number": 1, "method": "squash"}, "launch-stop": {"id": "l-77"},
+              "dashboard-request": {"rid": "q-00000001", "op": "create", "dashboard_id": "d-0a0a0a0a", "screen_id": "s-0b0b0b0b",
+                                    "tile_id": "t-0c0c0c0c", "project": os.path.basename(rg), "text": "daily new customers"}}
+    files = [os.path.join(home, "remote-launch.json"), os.path.join(home, "remote-merge.json"),
+             os.path.join(home, "remote-dashboards.json")]
 
     def snap():
         out = []
@@ -515,7 +518,8 @@ def gate_checks(libdir):
     expect("14j a duplicate name is refused", rejects(name="interrupt", cls="safe-write", handler=hnd))
     C2.register_action("x-view", cls="read", handler=hnd)
     expect("14k a good registration lands in ALLOWED_ACTIONS", "x-view" in C2.ALLOWED_ACTIONS and "x-view" not in C.ALLOWED_ACTIONS)
-    expect("14l the timeline covers the reserved names and launch-stop, nothing else", C._timeline_names() == {"launch-session", "pr-merge", "launch-stop"}, C._timeline_names())
+    expect("14l the timeline covers the reserved names, launch-stop and dashboard-request (its create/refine/remove ops only), nothing else",
+           C._timeline_names() == {"launch-session", "pr-merge", "launch-stop", "dashboard-request"}, C._timeline_names())
     return failed
 
 
@@ -665,7 +669,7 @@ MUTANTS = [
     ("expand-runs-unaudited", "gate", "companion_ui_controls.py",
      "        if spec[\"cls\"] == CLASS_EXPAND and not _audit_ready(root):", "        if False:"),
     ("no-second-record", "gate", "companion_ui_controls.py",
-     "    if name is not None and name in _timeline_names():", "    if False:"),
+     "    if name is not None and name in _timeline_names() and _timeline_row_ok(name, line.get(\"op\")):", "    if False:"),
     ("reserved-name-ungated-without-a-handler", "gate", "companion_ui_controls.py",
      "        detail = \"not-allowed\" if not _switch_on(gate) else \"not-implemented\"", "        detail = \"not-implemented\""),
     ("class-tag-unchecked", "gate", "companion_ui_controls.py",
