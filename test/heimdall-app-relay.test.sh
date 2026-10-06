@@ -1344,12 +1344,142 @@ else
   bad "durable event log: content/order/ts mismatch against stdout (got '$ORDER_OK_J') -- $(cat "$TMPROOT/j.order.err")"
 fi
 
-SECRET_HITS_J="$(grep -Eic 'priv|secret|session_key|"token"' "$EVENT_LOG_J" 2>/dev/null || true)"
-[ -z "$SECRET_HITS_J" ] && SECRET_HITS_J=0
+# event_log_secret_lines FILE -- the lines of an NDJSON event log that leak key material; event_log_secret_hits FILE
+# -- how many (0 for a clean or absent log). A line leaks when it carries
+#   * a FIELD NAME that names a secret: a quoted name containing priv, secret, session_key or token ("priv",
+#     "private_key", "session_key", "relay_session_token", "token", ...) followed by a colon. The optional
+#     backslashes also catch one inside a string value, such as an error detail echoing a response body; or
+#   * a VALUE shaped like 32 bytes of key material under ANY name: padded base64 (44 chars), 64 hex digits, or
+#     unpadded base64url (43 chars) filling a whole string.
+# The one public 32-byte value the client emits, pair_init's qr.hmd_pubkey, is cut out first -- that exact field
+# and nothing else, so a leak sharing its line is still counted.
+#
+# It must not be a bare substring match. The check used to be `grep -Eic 'priv|secret|session_key|"token"'`, and
+# `priv` matches "/private/var/folders/...", the realpath of a macOS $TMPDIR: RelayClient.root is
+# os.path.realpath(--repo), so an error detail naming a file the client touched -- `status write failed: [Errno 2]
+# No such file or directory: '/private/var/.../.heimdall/app/relay.json.tmp-1234'` -- carries one, and
+# write_status() is called from both the state loop and the stream thread, which share that temp name and can race.
+# One such event, which a loaded box can produce, made the old check report a secret that was only a path.
+event_log_secret_lines() {
+  local field_re='\\*"[A-Za-z0-9_.-]*(priv|secret|session_key|token)[A-Za-z0-9_.-]*\\*"[[:space:]]*:'
+  local b64_re='(^|[^A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{43}='
+  local hex_re='(^|[^A-Fa-f0-9])[A-Fa-f0-9]{64}($|[^A-Fa-f0-9])'
+  local b64url_re='"[A-Za-z0-9_-]{43}"'
+  sed -E 's|"hmd_pubkey":"[A-Za-z0-9+/_-]{43}="||g' "$1" 2>/dev/null \
+    | grep -Ei "$field_re|$b64_re|$hex_re|$b64url_re"
+}
+event_log_secret_hits() { event_log_secret_lines "$1" | wc -l | tr -d ' '; }
+
+SECRET_HITS_J="$(event_log_secret_hits "$EVENT_LOG_J")"
 if [ "$SECRET_HITS_J" -eq 0 ]; then
   ok "durable event log: no secret-shaped field (priv/secret/session_key/token) ever written"
 else
-  bad "durable event log: found $SECRET_HITS_J secret-shaped line(s) in the event log"
+  bad "durable event log: found $SECRET_HITS_J secret-shaped line(s) in the event log: $(event_log_secret_lines "$EVENT_LOG_J" | head -3 | cut -c1-240)"
+fi
+
+# Controls, so the scan above can neither cry wolf on a path nor miss a leak. Each row is
+# `want<TAB>description<TAB>one event-log line`, scanned on its own: want=1 plants a leak in a real shape (fresh
+# random key bytes every run), want=0 is something that must stay quiet.
+expect_secret_hits() {
+  local want="$1" desc="$2" line="$3" one="$TMPROOT/j.scan-one.jsonl" got
+  printf '%s\n' "$line" > "$one"
+  got="$(event_log_secret_hits "$one")"
+  if [ "$got" = "$want" ]; then
+    ok "secret scan control: $desc"
+  else
+    bad "secret scan control: $desc (scan counted $got line(s), want $want) -- $line"
+  fi
+}
+
+CONTROLS_J="$TMPROOT/j.scan-controls.tsv"
+python3 - >"$CONTROLS_J" 2>"$TMPROOT/j.scan-controls.err" <<'PYEOF'
+import base64, json, os
+
+key = os.urandom(32)
+padded = base64.b64encode(key).decode()                          # 44 chars ending in '=' -- what E2E.pub_b64 emits
+url_safe = base64.urlsafe_b64encode(key).decode().rstrip("=")    # 43 chars
+hex_key = key.hex()                                              # 64 chars
+public = base64.b64encode(os.urandom(32)).decode()               # a public key: allowed where the client puts one
+tmp_path = "/private/var/folders/t3/17x0hkw12n3g0qy3sjkggbsr0000gn/T/tmp.AbCdEf0123/repo.XyZ789/.heimdall/app/relay.json.tmp-4242"
+
+rows = [
+    (1, '"priv" field holding a base64 key', {"event": "device_bound", "priv": padded}),
+    (1, '"private_key" field', {"event": "error", "private_key": padded}),
+    (1, '"session_key" field', {"event": "device_bound", "session_key": padded}),
+    (1, '"relay_session_token" field with an opaque value', {"event": "pair_init", "relay_session_token": "opaque"}),
+    (1, '"token" field with a short value', {"event": "state_sent", "token": "t"}),
+    (1, "padded base64 key under a harmless name", {"event": "state_sent", "shared": padded}),
+    (1, "64-digit hex key under a harmless name", {"event": "state_sent", "shared": hex_key}),
+    (1, "unpadded base64url key under a harmless name", {"event": "state_sent", "shared": url_safe}),
+    (1, "base64 key inside free text", {"event": "error", "detail": "key derivation failed for " + padded}),
+    (1, "secret field inside an echoed response body",
+        {"event": "error", "detail": 'pair/init HTTP 500: {"relay_session_token":"opaque"}'}),
+    (1, "leak sharing a line with the public hmd_pubkey (by name)",
+        {"event": "pair_init", "qr": {"hmd_pubkey": public}, "session_key": padded}),
+    (1, "leak sharing a line with the public hmd_pubkey (by shape)",
+        {"event": "pair_init", "qr": {"hmd_pubkey": public}, "shared": padded}),
+    (0, "error detail naming a /private/var path (file exists)",
+        {"event": "error", "detail": "status write failed: [Errno 17] File exists: '" + tmp_path.rsplit("/", 1)[0] + "'"}),
+    (0, "error detail naming a /private/var temp file and its rename target",
+        {"event": "error", "detail": "status write failed: [Errno 2] No such file or directory: '" + tmp_path
+                                     + "' -> '" + tmp_path.rsplit(".tmp-", 1)[0] + "'"}),
+    (0, "pair_init with its public key, a uuid session_id and a pairing code",
+        {"event": "pair_init", "exp": 1791264549,
+         "qr": {"exp": 1791264549, "hmd_pubkey": public, "pairing_code": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                "relay": "http://127.0.0.1:53520", "session_id": "e32e227c-3053-4ec4-be99-9487312d3989", "v": 1}}),
+]
+for want, desc, event in rows:
+    print("%d\t%s\t%s" % (want, desc, json.dumps(event, sort_keys=True, separators=(",", ":"))))
+PYEOF
+if [ -s "$CONTROLS_J" ]; then
+  while IFS=$'\t' read -r WANT_J DESC_J LINE_J; do
+    expect_secret_hits "$WANT_J" "$DESC_J" "$LINE_J"
+  done < "$CONTROLS_J"
+else
+  bad "secret scan controls: could not be generated -- $(cat "$TMPROOT/j.scan-controls.err")"
+fi
+
+# The same negative control with an event the real client emits: RelayClient.write_status() with a file where its
+# status dir belongs, so os.makedirs raises FileExistsError naming the path -- under a repo path that holds
+# /private/var/ on every platform, as the realpath of a macOS $TMPDIR does. In-process, the same SourceFileLoader
+# technique as Scenario K.
+NEG_ROOT_J="$TMPROOT/private/var/folders/xx/negctl"
+NEG_EVENTS_J="$TMPROOT/j.negctl.events.jsonl"
+mkdir -p "$NEG_ROOT_J/.heimdall"
+: > "$NEG_ROOT_J/.heimdall/app"
+HMD_RELAY_EVENT_LOG="$NEG_EVENTS_J" python3 - "$RELAY_CLIENT_RUN" "$NEG_ROOT_J" >/dev/null 2>"$TMPROOT/j.negctl.err" <<'PYEOF'
+import importlib.util, os, sys
+from importlib.machinery import SourceFileLoader
+
+client_path, repo_dir = sys.argv[1:3]
+loader = SourceFileLoader("hmd_relay_client_scan_control", client_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+root = os.path.realpath(repo_dir)        # RelayClient.__init__: self.root = os.path.realpath(--repo)
+mod.configure_event_log(root)            # main() does the same right after --repo is parsed
+client = object.__new__(mod.RelayClient)
+client.status_path = os.path.join(root, ".heimdall", "app", "relay.json")
+client._status_snapshot = dict
+client.write_status()
+PYEOF
+NEG_RC_J=$?
+NEG_LINE_J="$(grep 'status write failed' "$NEG_EVENTS_J" 2>/dev/null | head -1)"
+case "$NEG_RC_J:$NEG_LINE_J" in
+  0:*/private/var/*) ok "secret scan control: the real client's own status-write error event names a /private/var path" ;;
+  *) bad "secret scan control: no status-write error event naming a /private/var path (rc=$NEG_RC_J, event='$NEG_LINE_J') -- $(cat "$TMPROOT/j.negctl.err")" ;;
+esac
+if [ "$(grep -Eic 'priv|secret|session_key|"token"' "$NEG_EVENTS_J" 2>/dev/null)" = 1 ]; then
+  ok "secret scan control: the old substring pattern flags that same event, so the negative control is live"
+else
+  bad "secret scan control: the old substring pattern no longer flags the real client's path-bearing event -- the negative control proves nothing"
+fi
+NEG_HITS_J="$(event_log_secret_hits "$NEG_EVENTS_J")"
+if [ "$NEG_HITS_J" = 0 ]; then
+  ok "secret scan control: a real client event naming a /private/var path is not a leak"
+else
+  bad "secret scan control: a real client event naming a /private/var path was flagged as a leak ($NEG_HITS_J line(s))"
 fi
 
 # ── Scenario K: durable event log rotation -- HMD_RELAY_EVENT_LOG rotates
