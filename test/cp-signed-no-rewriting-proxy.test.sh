@@ -63,7 +63,8 @@ PASS=0; FAIL=0
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 # check NAME EXPR: EXPR is single-quoted on purpose and eval'd here, so a capture variable is read when the
-# assertion RUNS. shellcheck cannot see a read inside a string, hence the SC2034 directive on each capture.
+# assertion RUNS. shellcheck cannot see a read inside a string, hence the SC2034 directive on each capture;
+# the same single quotes are why every check call below carries an SC2016 directive.
 check(){ if eval "$2"; then ok "$1"; else bad "$1 [expr: $2]"; fi; }
 
 # The suite must control its own baseline: an ambient proxy (or an ambient no_proxy that
@@ -153,9 +154,10 @@ echo
 echo "1 — the POLICY: hmd_signed_exec scrubs rewriters, keeps corporate proxies"
 echo "----------------------------------------------------------------------"
 
-# shellcheck source=../bin/lib/hmd-gate-endpoint.sh
+# shellcheck source=../bin/lib/hmd-gate-endpoint.sh disable=SC1091  # the default run never opens sourced files; source= is for -x runs
 . "$LIB"
 
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.1 the shipped lib defines hmd_signed_exec" \
   '[ "$(type -t hmd_signed_exec)" = "function" ]'
 
@@ -197,6 +199,7 @@ signed_env() {
 # pins EXACTLY one canary line, so a duplicated or partial readback is red too.
 # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 CANARY_SEEN="$(signed_env | grep -c '^HMD_SCRUB_CANARY=alive$')"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.1 the readback canary survives, so absence assertions mean something" \
   '[ "$CANARY_SEEN" = "1" ]'
 
@@ -205,6 +208,7 @@ check "1.1 the readback canary survives, so absence assertions mean something" \
 # place those assertions would pass vacuously.
 # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 INHERITED="$(HTTPS_PROXY="$RW_URL" HEADROOM_BASE_URL="$RW_URL" env | grep -cE '^(HTTPS_PROXY|HEADROOM_BASE_URL)=')"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.2 POSITIVE CONTROL — an unscrubbed child inherits both routing vars" \
   '[ "$INHERITED" = "2" ]'
 
@@ -213,6 +217,7 @@ check "1.2 POSITIVE CONTROL — an unscrubbed child inherits both routing vars" 
 LOOPBACK_SURVIVORS="$(HTTP_PROXY="$RW_URL" HTTPS_PROXY="$RW_URL" ALL_PROXY="$RW_URL" \
   http_proxy="$RW_URL" https_proxy="$RW_URL" all_proxy="$RW_URL" \
   signed_env | grep -icE '^(http_proxy|https_proxy|all_proxy)=')"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.3 a LOOPBACK proxy var is scrubbed in every spelling (6 -> 0)" \
   '[ "$LOOPBACK_SURVIVORS" = "0" ]'
 
@@ -223,6 +228,7 @@ HEADROOM_SURVIVORS="$(HEADROOM_BASE_URL=https://headroom.corp.example:8443 \
   HEADROOM_PROXY=https://headroom.corp.example:8443 \
   HEADROOM_PROXY_URL=https://headroom.corp.example:8443 \
   signed_env | grep -c '^HEADROOM_')"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.4 the HEADROOM_* namespace is scrubbed even when it points OFF-box" \
   '[ "$HEADROOM_SURVIVORS" = "0" ]'
 
@@ -230,6 +236,7 @@ check "1.4 the HEADROOM_* namespace is scrubbed even when it points OFF-box" \
 BASEURL_SURVIVORS="$(ANTHROPIC_BASE_URL="$RW_URL" ANTHROPIC_API_URL="$RW_URL" \
   ANTHROPIC_DEFAULT_BASE_URL="$RW_URL" CLAUDE_CODE_BASE_URL="$RW_URL" \
   signed_env | grep -cE '^(ANTHROPIC_BASE_URL|ANTHROPIC_API_URL|ANTHROPIC_DEFAULT_BASE_URL|CLAUDE_CODE_BASE_URL)=')"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.5 the model base-URL overrides are scrubbed (4 -> 0)" \
   '[ "$BASEURL_SURVIVORS" = "0" ]'
 
@@ -241,6 +248,7 @@ CORP="http://proxy.corp.example:3128"
 CORP_SURVIVORS="$(HTTP_PROXY="$CORP" HTTPS_PROXY="$CORP" ALL_PROXY="$CORP" \
   http_proxy="$CORP" https_proxy="$CORP" all_proxy="$CORP" \
   signed_env | grep -icE '^(http_proxy|https_proxy|all_proxy)=')"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.6 a NON-loopback (corporate CONNECT) proxy SURVIVES the scrub (6 -> 6)" \
   '[ "$CORP_SURVIVORS" = "6" ]'
 
@@ -249,6 +257,7 @@ for spec in "http://localhost:9" "http://127.9.9.9:9" "http://[::1]:9" "http://0
             "127.0.0.1:9" "http://user:pw@127.0.0.1:9" "https://LOCALHOST:9" "socks5://127.0.0.1:9"; do
   # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
   n="$(HTTPS_PROXY="$spec" signed_env | grep -c '^HTTPS_PROXY=')"
+  # shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
   check "1.7 loopback recognised: $spec" '[ "$n" = "0" ]'
 done
 
@@ -257,6 +266,7 @@ done
 # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 NOT_LOOPBACK="$(HTTPS_PROXY="http://127.0.0.1:pw@proxy.corp.example:3128" \
   signed_env | grep -c '^HTTPS_PROXY=')"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.8 a corporate host with loopback-looking USERINFO is NOT scrubbed" \
   '[ "$NOT_LOOPBACK" = "1" ]'
 
@@ -266,6 +276,7 @@ check "1.8 a corporate host with loopback-looking USERINFO is NOT scrubbed" \
 # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 CREDS="$(CLAUDE_CODE_OAUTH_TOKEN=tok ANTHROPIC_API_KEY=key \
   signed_env | grep -cE '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=')"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.9 credentials are NOT scrubbed — we neutralize ROUTING, never AUTH" \
   '[ "$CREDS" = "2" ]'
 
@@ -275,6 +286,7 @@ check "1.9 credentials are NOT scrubbed — we neutralize ROUTING, never AUTH" \
 # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 NOPROXY="$(NO_PROXY=internal.corp no_proxy=internal.corp \
   signed_env | grep -ic '^no_proxy=')"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "1.10 NO_PROXY survives — an allowlist can only reduce proxying, never cause it" \
   '[ "$NOPROXY" = "2" ]'
 
@@ -296,6 +308,7 @@ PYEOF
 reset_logs
 # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 HIJACKED="$(TARGET="$CP_URL/readyz" http_proxy="$RW_URL" HTTP_PROXY="$RW_URL" "$PY" "$WORK/client.py")"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.1 POSITIVE CONTROL — an unscrubbed urllib request IS hijacked to the rewriter" \
   '[ "$(arrivals rewriter)" = "1" ] && [ "$(arrivals cp)" = "0" ] && printf "%s" "$HIJACKED" | grep -q rewriter'
 
@@ -306,6 +319,7 @@ export HEIMDALL_CP_URL="$CP_URL"
 
 reset_logs
 "$ROOT/bin/heimdall-presence" beat >/dev/null 2>&1
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.2 a clean presence beat reaches the real control plane" \
   '[ "$(arrivals cp)" -ge 1 ]'
 
@@ -316,8 +330,10 @@ reset_logs
 http_proxy="$RW_URL" HTTP_PROXY="$RW_URL" https_proxy="$RW_URL" HTTPS_PROXY="$RW_URL" \
   all_proxy="$RW_URL" ALL_PROXY="$RW_URL" \
   "$ROOT/bin/heimdall-presence" beat >/dev/null 2>&1
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.3 a presence beat under a loopback rewriter still reaches the control plane" \
   '[ "$(arrivals cp)" -ge 1 ]'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.3 …and ZERO signed bytes arrived at the rewriter" \
   '[ "$(arrivals rewriter)" = "0" ]'
 
@@ -326,8 +342,10 @@ reset_logs
 HEADROOM_BASE_URL="$RW_URL" HEADROOM_PROXY="$RW_URL" HEADROOM_PROXY_URL="$RW_URL" \
   http_proxy="$RW_URL" \
   "$ROOT/bin/heimdall-presence" beat >/dev/null 2>&1
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.4 a presence beat under the HEADROOM_* wiring reaches the control plane" \
   '[ "$(arrivals cp)" -ge 1 ]'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.4 …and ZERO signed bytes arrived at the rewriter" \
   '[ "$(arrivals rewriter)" = "0" ]'
 
@@ -338,8 +356,10 @@ export HOME="$WORK/home2"; mkdir -p "$HOME"
 reset_logs
 http_proxy="$RW_URL" HTTP_PROXY="$RW_URL" \
   "$ROOT/bin/heimdall-presence" beat >/dev/null 2>&1
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.5 the /enroll bootstrap reaches the control plane under a rewriter" \
   'grep -q "/enroll" "$WORK/cp.log"'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.5 …and ZERO enrollment bytes arrived at the rewriter" \
   '[ "$(arrivals rewriter)" = "0" ]'
 
@@ -355,10 +375,13 @@ CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" \
   http_proxy="$RW_URL" HTTP_PROXY="$RW_URL" https_proxy="$RW_URL" HTTPS_PROXY="$RW_URL" \
   "$ROOT/bin/heimdall-connect" --endpoint "$CP_URL" \
   --gh-app-installation-id 12345 --repo acme/widgets </dev/null >/dev/null 2>&1
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.6 a signed connect POST /team/cred reaches the control plane" \
   'grep -q "/team/cred" "$WORK/cp.log"'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.6 a signed connect POST /team/install reaches the control plane" \
   'grep -q "/team/install" "$WORK/cp.log"'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "2.6 …and ZERO signed bytes arrived at the rewriter" \
   '[ "$(arrivals rewriter)" = "0" ]'
 
@@ -386,11 +409,13 @@ if [ -n "$NONLOOP" ]; then
   reset_logs
   http_proxy="$CORP_URL" HTTP_PROXY="$CORP_URL" \
     "$ROOT/bin/heimdall-presence" beat >/dev/null 2>&1
+  # shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
   check "2.7 LIVE — a corporate proxy on $NONLOOP still CARRIES the signed request" \
     '[ "$(arrivals corp)" -ge 1 ]'
 else
   # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
   CORP_KEPT="$(HTTP_PROXY=http://proxy.corp.example:3128 signed_env | grep -c '^HTTP_PROXY=')"
+  # shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
   check "2.7 STRUCTURAL (no non-loopback interface) — a corporate proxy var is preserved" \
     '[ "$CORP_KEPT" = "1" ]'
 fi
@@ -418,11 +443,15 @@ INV_EXPECT="$(jq -r '.invariants["no-signed-traffic-routing"].expect' "$MANIFEST
 # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 INV_WHY="$(jq -r '.invariants["no-signed-traffic-routing"].why' "$MANIFEST")"
 
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "4.1 the invariant declares a non-empty expect marker" '[ -n "$INV_EXPECT" ] && [ "$INV_EXPECT" != "null" ]'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "4.2 the invariant is no longer the inverted grep that passed on ZERO hits" \
   '! printf "%s" "$INV_CMD" | grep -q "grep -lE"'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "4.3 the invariant actually drives the signed scrub" \
   'printf "%s" "$INV_CMD" | grep -q "hmd_signed_exec"'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "4.4 the why text describes the differential, not a grep" \
   'printf "%s" "$INV_WHY" | grep -qi "differential"'
 
@@ -430,6 +459,7 @@ check "4.4 the why text describes the differential, not a grep" \
 # invariant's control-plane default at the local stand-in.
 # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 INV_OUT="$(cd "$ROOT" && HEIMDALL_DEFAULT_CP_URL="$CP_URL" bash -c "$INV_CMD" 2>&1)"
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "4.5 the invariant emits its marker against a live control plane" \
   'printf "%s" "$INV_OUT" | grep -qF "$INV_EXPECT"'
 
@@ -440,10 +470,13 @@ check "4.5 the invariant emits its marker against a live control plane" \
 NV_OUT="$(cd "$ROOT" && HEIMDALL_DEFAULT_CP_URL="$DEAD_URL" bash -c "$INV_CMD" 2>&1)"
 # shellcheck disable=SC2034  # read inside the single-quoted check expression below (check() evals it)
 NV_RC=$?
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "4.6 an unreachable control plane reports NON_VERIFIED" \
   'printf "%s" "$NV_OUT" | grep -q "NON_VERIFIED"'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "4.6 …and does NOT emit the pass marker" \
   '! printf "%s" "$NV_OUT" | grep -qF "$INV_EXPECT"'
+# shellcheck disable=SC2016  # single-quoted on purpose: check() evals the expression
 check "4.6 …and exits non-zero so the invariant fails closed" '[ "$NV_RC" -ne 0 ]'
 
 echo
