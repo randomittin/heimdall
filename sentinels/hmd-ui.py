@@ -1685,7 +1685,7 @@ class UIHandler(BaseHTTPRequestHandler):
     # refuses that is not named here is the laptop failing to do what was asked -- a 500.
     CONTROL_STATUS = {
         "not-implemented": 404,
-        "not-allowed": 403, "controls-off": 403,
+        "not-allowed": 403, "controls-off": 403, "caps-missing": 403, "dashboards-off": 403,
         "bad-params": 422, "confirm-required": 422,
         "not-running": 409, "unknown-id": 409, "already-decided": 409, "expired": 409, "already-requested": 409,
         "rate-limited": 429,
