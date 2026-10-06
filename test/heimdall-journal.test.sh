@@ -23,7 +23,8 @@
 #                          prints the file path to stdout; exit 0.
 #   C. ADD COMMITS      — the append is followed by a scoped mechanical commit
 #                          (git add <journal-file> only, not -A) carrying the
-#                          Co-Authored-By: hmd trailer; tree is clean afterward.
+#                          Co-Authored-By: runhmd trailer (exactly one, never the retired
+#                          hmd@runheimdall.dev address); tree is clean afterward.
 #   D. NO-AUTOCOMMIT    — .heimdall-no-autocommit present: entry is still WRITTEN
 #                          (durability never skipped) but NOT committed (tree dirty).
 #   E. INVALID TYPE     — unknown type: exit 2, no file created, no commit.
@@ -109,13 +110,18 @@ rm -rf "$P"
 # ─────────────────────────────────────────────────────────────────────────────
 echo "C. ADD COMMITS — scoped mechanical commit, Co-Authored-By trailer, tree clean:"
 P="$(make_project)"
+# Hooks off: grade the tool's OWN message, not the normalization `hmd init`'s prepare-commit-msg
+# hook applies (it rewrites the retired trailer, which would mask an emitter that still wrote it).
+git -C "$P" config core.hooksPath "$P/.git/no-hooks"
 BEFORE="$(ncommits "$P")"
 FILE="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add decision "extend, do not compete" --body "resume-contract.sh notes are explicitly not-in-git; build an additive tool instead of bending checkpoint's shape to fit.")"
 AFTER="$(ncommits "$P")"
 [ "$AFTER" -eq $((BEFORE + 1)) ] && ok "exactly one new commit landed" || bad "commit count before=$BEFORE after=$AFTER"
 SUBJ="$(git -C "$P" log -1 --format=%s)"
 case "$SUBJ" in "journal: [DECISION]"*) ok "commit subject carries type: $SUBJ" ;; *) bad "unexpected subject: $SUBJ" ;; esac
-git -C "$P" log -1 --format=%b | grep -q "Co-Authored-By: hmd <hmd@runheimdall.dev>" && ok "Co-Authored-By trailer present" || bad "trailer missing"
+TRAILER_BODY="$(git -C "$P" log -1 --format=%b)"
+[ "$(printf '%s\n' "$TRAILER_BODY" | grep -Fxc 'Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>')" -eq 1 ] && ok "exactly one Co-Authored-By: runhmd trailer" || bad "runhmd trailer not present exactly once: $TRAILER_BODY"
+printf '%s' "$TRAILER_BODY" | grep -qF "hmd@runheimdall.dev" && bad "retired hmd@runheimdall.dev address still emitted: $TRAILER_BODY" || ok "no retired hmd@runheimdall.dev address"
 CHANGED="$(git -C "$P" diff --name-only HEAD~1 HEAD)"
 [ "$(printf '%s\n' "$CHANGED" | wc -l | tr -d ' ')" -eq 1 ] && ok "commit touched exactly one file (scoped add, not -A): $CHANGED" || bad "commit touched more than the journal file: $CHANGED"
 [ "$(dirty_count "$P")" -eq 0 ] && ok "tree clean after commit" || bad "tree still dirty after commit"

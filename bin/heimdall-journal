@@ -237,7 +237,7 @@ cmd_add() {
   if ! git add "$file" >/dev/null 2>&1 || \
      ! git commit -m "journal: [$type] $subject" \
        -m "heimdall-journal: mechanical narrative entry" \
-       -m "Co-Authored-By: hmd <hmd@runheimdall.dev>" --no-verify >/dev/null 2>&1; then
+       -m "Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>" --no-verify >/dev/null 2>&1; then
     echo "heimdall-journal: add: warning: entry written but commit failed (dirty index/lock?) — commit $file manually" >&2
   fi
 

@@ -30,6 +30,14 @@ set -uo pipefail
 THRESHOLD="${HEIMDALL_WIP_EDIT_THRESHOLD:-6}"
 case "$THRESHOLD" in ''|*[!0-9]*) THRESHOLD=6 ;; esac
 
+# The CURRENT hmd attribution trailer (CLAUDE.md "Commit attribution"). The `hmd@runheimdall.dev`
+# address was retired 2026-08-20 for the `runhmd` GitHub account. The prepare-commit-msg hook that
+# `hmd init` installs rewrites the old form, but only in a repo that hook is wired into — a fresh
+# worktree before `hmd init` keeps whatever this tool wrote — so every commit emitted here carries
+# the current form itself. Same literal as TRAILER in bin/heimdall-init; section I of
+# test/heimdall-wip-commit.test.sh pins it independently.
+HMD_TRAILER='Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>'
+
 usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
 
 _git_dir()  { git rev-parse --absolute-git-dir 2>/dev/null; }
@@ -117,7 +125,7 @@ _do_commit() { # <subject>
   # itself is untouched, so the edit stays on disk as a pending change.
   _team_no_commit && git reset -q -- ':(top).heimdall/team.json' >/dev/null 2>&1
   git commit -m "$1" -m "heimdall-wip: mechanical mid-task checkpoint" \
-    -m "Co-Authored-By: hmd <hmd@runheimdall.dev>" --no-verify >/dev/null 2>&1
+    -m "$HMD_TRAILER" --no-verify >/dev/null 2>&1
 }
 
 cmd_note() {
@@ -213,7 +221,7 @@ cmd_squash() {
   git reset --soft "$target" >/dev/null 2>&1 || { echo "squash: reset failed"; return 1; }
   git commit -m "wip: squashed ${n} checkpoint commit(s) (heimdall-wip)" \
     -m "$subjects" \
-    -m "Co-Authored-By: hmd <hmd@runheimdall.dev>" --no-verify >/dev/null 2>&1
+    -m "$HMD_TRAILER" --no-verify >/dev/null 2>&1
 }
 
 case "${1:-}" in
