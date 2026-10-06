@@ -274,61 +274,61 @@ unset HMD_ASSUME_NO FAKE_TS_MODE FAKE_TS_LOG FAKE_TS_DNSNAME
 
 # ── 2-5. bare dispatch / usage / unknown subcommand ─────────────────────
 OUT="$("$APP" 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "bare 'heimdall-app' (no subcommand) exits 0" || bad "bare exit $RC"
-printf '%s' "$OUT" | grep -qi "Usage:" && ok "bare invocation prints usage" || bad "bare usage missing: $OUT"
+if [ "$RC" -eq 0 ]; then ok "bare 'heimdall-app' (no subcommand) exits 0"; else bad "bare exit $RC"; fi
+if printf '%s' "$OUT" | grep -qi "Usage:"; then ok "bare invocation prints usage"; else bad "bare usage missing: $OUT"; fi
 
 OUT="$("$APP" frobnicate 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "unknown subcommand exits 2" || bad "unknown subcommand exit $RC"
-printf '%s' "$OUT" | grep -qi "unknown subcommand" && ok "unknown subcommand names itself in the error" || bad "message missing: $OUT"
+if [ "$RC" -eq 2 ]; then ok "unknown subcommand exits 2"; else bad "unknown subcommand exit $RC"; fi
+if printf '%s' "$OUT" | grep -qi "unknown subcommand"; then ok "unknown subcommand names itself in the error"; else bad "message missing: $OUT"; fi
 
 OUT="$("$HEIMDALL" app --help 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "'heimdall app --help' dispatches through bin/heimdall, exit 0" || bad "exit $RC"
-printf '%s' "$OUT" | grep -qi "connect" && ok "'heimdall app --help' help text mentions connect" || bad "help missing connect: $OUT"
+if [ "$RC" -eq 0 ]; then ok "'heimdall app --help' dispatches through bin/heimdall, exit 0"; else bad "exit $RC"; fi
+if printf '%s' "$OUT" | grep -qi "connect"; then ok "'heimdall app --help' help text mentions connect"; else bad "help missing connect: $OUT"; fi
 
 OUT="$("$HMD" app 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "bare 'hmd app' dispatches through bin/hmd, exit 0" || bad "exit $RC: $OUT"
+if [ "$RC" -eq 0 ]; then ok "bare 'hmd app' dispatches through bin/hmd, exit 0"; else bad "exit $RC: $OUT"; fi
 
 # ── 6. bad --https-port (checked before touching tailscale at all) ──────
 D="$(make_repo)"
 OUT="$(FAKE_TS_MODE=online-with-DNSName "$APP" connect --tailscale --repo "$D" --https-port 9999 2>&1)"
 RC=$?
-[ "$RC" -eq 64 ] && ok "connect --https-port 9999 exits 64" || bad "exit $RC (want 64): $OUT"
-printf '%s' "$OUT" | grep -qi "port" && ok "bad-https-port message mentions 'port'" || bad "message: $OUT"
-[ ! -f "$D/.heimdall/app/connect.json" ] && ok "no state file written on bad-https-port failure" || bad "state file unexpectedly written"
+if [ "$RC" -eq 64 ]; then ok "connect --https-port 9999 exits 64"; else bad "exit $RC (want 64): $OUT"; fi
+if printf '%s' "$OUT" | grep -qi "port"; then ok "bad-https-port message mentions 'port'"; else bad "message: $OUT"; fi
+if [ ! -f "$D/.heimdall/app/connect.json" ]; then ok "no state file written on bad-https-port failure"; else bad "state file unexpectedly written"; fi
 rm -rf "$D"
 
 # ── 7-8. install prompt (D1: never silent) ──────────────────────────────
 D="$(make_repo)"
 OUT="$(FAKE_TS_MODE=not-installed "$APP" connect --tailscale --repo "$D" --no-install 2>&1)"
 RC=$?
-[ "$RC" -eq 4 ] && ok "connect --no-install (not installed) exits 4" || bad "exit $RC (want 4): $OUT"
-printf '%s' "$OUT" | grep -qi "not installed" && ok "--no-install failure mentions 'not installed'" || bad "$OUT"
-printf '%s' "$OUT" | grep -qi "hmd would run" && ok "--no-install failure names the manual install command (D1)" || bad "$OUT"
-[ ! -f "$D/.heimdall/app/connect.json" ] && ok "no state file written after --no-install failure" || bad "state file written unexpectedly"
+if [ "$RC" -eq 4 ]; then ok "connect --no-install (not installed) exits 4"; else bad "exit $RC (want 4): $OUT"; fi
+if printf '%s' "$OUT" | grep -qi "not installed"; then ok "--no-install failure mentions 'not installed'"; else bad "$OUT"; fi
+if printf '%s' "$OUT" | grep -qi "hmd would run"; then ok "--no-install failure names the manual install command (D1)"; else bad "$OUT"; fi
+if [ ! -f "$D/.heimdall/app/connect.json" ]; then ok "no state file written after --no-install failure"; else bad "state file written unexpectedly"; fi
 rm -rf "$D"
 
 D="$(make_repo)"
 OUT="$(FAKE_TS_MODE=not-installed "$APP" connect --tailscale --repo "$D" </dev/null 2>&1)"
 RC=$?
-[ "$RC" -eq 4 ] && ok "connect w/o --no-install + closed stdin declines cleanly, exit 4 (no hang)" || bad "exit $RC: $OUT"
-printf '%s' "$OUT" | grep -qi "hmd would run" && ok "closed-stdin decline still shows the manual install command (D1)" || bad "$OUT"
+if [ "$RC" -eq 4 ]; then ok "connect w/o --no-install + closed stdin declines cleanly, exit 4 (no hang)"; else bad "exit $RC: $OUT"; fi
+if printf '%s' "$OUT" | grep -qi "hmd would run"; then ok "closed-stdin decline still shows the manual install command (D1)"; else bad "$OUT"; fi
 rm -rf "$D"
 
 # ── 9-10. not online ─────────────────────────────────────────────────────
 D="$(make_repo)"
 OUT="$(FAKE_TS_MODE=daemon-down "$APP" connect --tailscale --repo "$D" 2>&1)"
 RC=$?
-[ "$RC" -eq 5 ] && ok "connect w/ tailscaled down exits 5" || bad "exit $RC (want 5): $OUT"
-printf '%s' "$OUT" | grep -qi "tailscale up" && ok "daemon-down prints the login hint" || bad "$OUT"
-[ ! -f "$D/.heimdall/app/connect.json" ] && ok "no state file written when daemon is down" || bad "state file written"
+if [ "$RC" -eq 5 ]; then ok "connect w/ tailscaled down exits 5"; else bad "exit $RC (want 5): $OUT"; fi
+if printf '%s' "$OUT" | grep -qi "tailscale up"; then ok "daemon-down prints the login hint"; else bad "$OUT"; fi
+if [ ! -f "$D/.heimdall/app/connect.json" ]; then ok "no state file written when daemon is down"; else bad "state file written"; fi
 rm -rf "$D"
 
 D="$(make_repo)"
 OUT="$(FAKE_TS_MODE=offline "$APP" connect --tailscale --repo "$D" 2>&1)"
 RC=$?
-[ "$RC" -eq 5 ] && ok "connect w/ tailscale logged out exits 5" || bad "exit $RC: $OUT"
-printf '%s' "$OUT" | grep -qi "tailscale up" && ok "logged-out login hint present" || bad "$OUT"
-printf '%s' "$OUT" | grep -qF "https://login.tailscale.com/a/fakeauthtoken123" && ok "logged-out login hint includes the AuthURL" || bad "$OUT"
+if [ "$RC" -eq 5 ]; then ok "connect w/ tailscale logged out exits 5"; else bad "exit $RC: $OUT"; fi
+if printf '%s' "$OUT" | grep -qi "tailscale up"; then ok "logged-out login hint present"; else bad "$OUT"; fi
+if printf '%s' "$OUT" | grep -qF "https://login.tailscale.com/a/fakeauthtoken123"; then ok "logged-out login hint includes the AuthURL"; else bad "$OUT"; fi
 rm -rf "$D"
 
 # ── 11-25. modern funnel, online: the full success path ─────────────────
@@ -336,7 +336,7 @@ D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-online.out"
 FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
-[ "$RC" -eq 0 ] && ok "connect --bg (modern funnel, online) exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
+if [ "$RC" -eq 0 ]; then ok "connect --bg (modern funnel, online) exits 0"; else bad "exit $RC: $(cat "$OUT_FILE")"; fi
 
 if grep -Eq 'https://my-machine\.tail1a2b3\.ts\.net/\?token=[A-Za-z0-9_-]+' "$OUT_FILE"; then
   ok "prints the public URL https://<DNSName>/?token=... (default https-port 443, no :port suffix)"
@@ -369,11 +369,11 @@ SF_HTTPS="$(jq -r '.https_port // empty' "$SF" 2>/dev/null)"
 SF_PID="$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)"
 SF_STARTED="$(jq -r '.started_at // empty' "$SF" 2>/dev/null)"
 
-[ "$SF_HOST" = "my-machine.tail1a2b3.ts.net" ] && ok "state file host == fake DNSName, trailing dot stripped" || bad "host=$SF_HOST"
-[ "$SF_HTTPS" = "443" ] && ok "state file https_port == 443 (default)" || bad "https_port=$SF_HTTPS"
+if [ "$SF_HOST" = "my-machine.tail1a2b3.ts.net" ]; then ok "state file host == fake DNSName, trailing dot stripped"; else bad "host=$SF_HOST"; fi
+if [ "$SF_HTTPS" = "443" ]; then ok "state file https_port == 443 (default)"; else bad "https_port=$SF_HTTPS"; fi
 if [ -n "$SF_PORT" ] && [ "$SF_PORT" -gt 0 ] 2>/dev/null; then ok "state file port is a positive integer"; else bad "port=$SF_PORT"; fi
 if [ -n "$SF_PID" ] && kill -0 "$SF_PID" 2>/dev/null; then ok "state file pid_ui refers to a live process"; else bad "pid_ui=$SF_PID not alive"; fi
-[ -n "$SF_STARTED" ] && ok "state file has a started_at timestamp" || bad "started_at missing"
+if [ -n "$SF_STARTED" ]; then ok "state file has a started_at timestamp"; else bad "started_at missing"; fi
 
 if grep -q '"token"' "$SF" 2>/dev/null; then
   bad "state file LEAKS a 'token' key: $(cat "$SF")"
@@ -421,14 +421,14 @@ OUT_FILE="$TMPROOT/connect-policy.out"
 ERR_FILE="$TMPROOT/connect-policy.err"
 FAKE_TS_MODE=policy-hint-on-funnel-start "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
-[ "$RC" -eq 3 ] && ok "connect under a tailnet policy block exits 3" || bad "exit $RC"
+if [ "$RC" -eq 3 ]; then ok "connect under a tailnet policy block exits 3"; else bad "exit $RC"; fi
 if grep -qF 'funnel: HTTPS is not enabled for your tailnet. To enable HTTPS certificates and Funnel, visit the admin console: https://login.tailscale.com/admin/dns' "$ERR_FILE"; then
   ok "policy hint is printed VERBATIM on stderr"
 else
   bad "stderr: $(cat "$ERR_FILE")"
 fi
-printf '%s' "$(cat "$ERR_FILE")" | grep -qi 'hmd app doctor' && ok "policy-block stderr points at 'hmd app doctor' for diagnostics" || bad "missing doctor pointer: $(cat "$ERR_FILE")"
-[ ! -f "$D/.heimdall/app/connect.json" ] && ok "no state file left behind after a policy-block failure" || bad "state file leaked"
+if printf '%s' "$(cat "$ERR_FILE")" | grep -qi 'hmd app doctor'; then ok "policy-block stderr points at 'hmd app doctor' for diagnostics"; else bad "missing doctor pointer: $(cat "$ERR_FILE")"; fi
+if [ ! -f "$D/.heimdall/app/connect.json" ]; then ok "no state file left behind after a policy-block failure"; else bad "state file leaked"; fi
 POLICY_UI_WAITED=0
 while pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1 && [ "$POLICY_UI_WAITED" -lt 30 ]; do
   sleep 0.1
@@ -452,15 +452,15 @@ else
   REAL_TOKEN="$(grep -Eo 'token=[A-Za-z0-9_-]+' "$OUT_FILE" | head -1 | sed 's/^token=//')"
   STATUS_OUT="$(FAKE_TS_MODE=modern-funnel "$APP" status --repo "$D" 2>&1)"
   SRC=$?
-  [ "$SRC" -eq 0 ] && ok "status exits 0" || bad "status exit $SRC"
+  if [ "$SRC" -eq 0 ]; then ok "status exits 0"; else bad "status exit $SRC"; fi
   if [ -n "$REAL_TOKEN" ] && printf '%s' "$STATUS_OUT" | grep -qF "$REAL_TOKEN"; then
     bad "status output LEAKS the real token"
   else
     ok "status output never contains the real token"
   fi
-  printf '%s' "$STATUS_OUT" | grep -q 'token=<redacted>' && ok "status shows a redacted token placeholder" || bad "no redacted placeholder: $STATUS_OUT"
-  printf '%s' "$STATUS_OUT" | grep -q 'connected: yes' && ok "status reports connected: yes" || bad "$STATUS_OUT"
-  printf '%s' "$STATUS_OUT" | grep -qi 'inbox pending' && ok "status reports the pending inbox count" || bad "$STATUS_OUT"
+  if printf '%s' "$STATUS_OUT" | grep -q 'token=<redacted>'; then ok "status shows a redacted token placeholder"; else bad "no redacted placeholder: $STATUS_OUT"; fi
+  if printf '%s' "$STATUS_OUT" | grep -q 'connected: yes'; then ok "status reports connected: yes"; else bad "$STATUS_OUT"; fi
+  if printf '%s' "$STATUS_OUT" | grep -qi 'inbox pending'; then ok "status reports the pending inbox count"; else bad "$STATUS_OUT"; fi
   FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
 fi
 rm -rf "$D"
@@ -478,7 +478,7 @@ else
   DC_PORT="$(jq -r '.port' "$SF" 2>/dev/null)"
   DISC_OUT="$(FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" 2>&1)"
   DRC=$?
-  [ "$DRC" -eq 0 ] && ok "disconnect exits 0" || bad "exit $DRC: $DISC_OUT"
+  if [ "$DRC" -eq 0 ]; then ok "disconnect exits 0"; else bad "exit $DRC: $DISC_OUT"; fi
   DC_WAITED=0
   while kill -0 "$DC_PID" 2>/dev/null && [ "$DC_WAITED" -lt 30 ]; do
     sleep 0.1
@@ -486,11 +486,11 @@ else
   done
   if kill -0 "$DC_PID" 2>/dev/null; then bad "ui pid still alive after disconnect"; else ok "disconnect kills the ui pid"; fi
   CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 2 "http://127.0.0.1:${DC_PORT}/" 2>/dev/null)"
-  [ "$CODE" = "000" ] && ok "ui port no longer accepts connections after disconnect" || bad "port $DC_PORT still answering (code=$CODE)"
-  [ ! -f "$SF" ] && ok "state file removed after disconnect" || bad "state file still present"
+  if [ "$CODE" = "000" ]; then ok "ui port no longer accepts connections after disconnect"; else bad "port $DC_PORT still answering (code=$CODE)"; fi
+  if [ ! -f "$SF" ]; then ok "state file removed after disconnect"; else bad "state file still present"; fi
   DISC_OUT2="$(FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" 2>&1)"
   DRC2=$?
-  [ "$DRC2" -eq 0 ] && ok "second disconnect (idempotent) exits 0" || bad "exit $DRC2: $DISC_OUT2"
+  if [ "$DRC2" -eq 0 ]; then ok "second disconnect (idempotent) exits 0"; else bad "exit $DRC2: $DISC_OUT2"; fi
 fi
 rm -rf "$D"
 
@@ -498,31 +498,31 @@ rm -rf "$D"
 D="$(make_repo)"
 
 DOC_NI="$(FAKE_TS_MODE=not-installed "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-[ "$DRC" -ne 0 ] && ok "doctor (not-installed) exits nonzero" || bad "exit $DRC (want nonzero)"
-printf '%s' "$DOC_NI" | grep -q 'FAIL.*tailscale installed' && ok "doctor (not-installed) flags 'tailscale installed'" || bad "$DOC_NI"
-printf '%s' "$DOC_NI" | grep -qi 'fix:' && ok "doctor prints a fix hint per failure" || bad "no fix hint: $DOC_NI"
+if [ "$DRC" -ne 0 ]; then ok "doctor (not-installed) exits nonzero"; else bad "exit $DRC (want nonzero)"; fi
+if printf '%s' "$DOC_NI" | grep -q 'FAIL.*tailscale installed'; then ok "doctor (not-installed) flags 'tailscale installed'"; else bad "$DOC_NI"; fi
+if printf '%s' "$DOC_NI" | grep -qi 'fix:'; then ok "doctor prints a fix hint per failure"; else bad "no fix hint: $DOC_NI"; fi
 
 DOC_DD="$(FAKE_TS_MODE=daemon-down "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-[ "$DRC" -ne 0 ] && ok "doctor (daemon-down) exits nonzero" || bad "exit $DRC"
-printf '%s' "$DOC_DD" | grep -q 'ok.*tailscale installed' && ok "doctor (daemon-down): tailscale-installed still ok" || bad "$DOC_DD"
-printf '%s' "$DOC_DD" | grep -q 'FAIL.*tailscale daemon running' && ok "doctor (daemon-down) flags 'tailscale daemon running'" || bad "$DOC_DD"
+if [ "$DRC" -ne 0 ]; then ok "doctor (daemon-down) exits nonzero"; else bad "exit $DRC"; fi
+if printf '%s' "$DOC_DD" | grep -q 'ok.*tailscale installed'; then ok "doctor (daemon-down): tailscale-installed still ok"; else bad "$DOC_DD"; fi
+if printf '%s' "$DOC_DD" | grep -q 'FAIL.*tailscale daemon running'; then ok "doctor (daemon-down) flags 'tailscale daemon running'"; else bad "$DOC_DD"; fi
 
 DOC_OFF="$(FAKE_TS_MODE=offline "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-[ "$DRC" -ne 0 ] && ok "doctor (offline/logged-out) exits nonzero" || bad "exit $DRC"
-printf '%s' "$DOC_OFF" | grep -q 'ok.*tailscale daemon running' && ok "doctor (offline): daemon-running still ok" || bad "$DOC_OFF"
-printf '%s' "$DOC_OFF" | grep -q 'FAIL.*logged in / online' && ok "doctor (offline) flags 'logged in / online'" || bad "$DOC_OFF"
+if [ "$DRC" -ne 0 ]; then ok "doctor (offline/logged-out) exits nonzero"; else bad "exit $DRC"; fi
+if printf '%s' "$DOC_OFF" | grep -q 'ok.*tailscale daemon running'; then ok "doctor (offline): daemon-running still ok"; else bad "$DOC_OFF"; fi
+if printf '%s' "$DOC_OFF" | grep -q 'FAIL.*logged in / online'; then ok "doctor (offline) flags 'logged in / online'"; else bad "$DOC_OFF"; fi
 
 DOC_HAPPY="$(FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-[ "$DRC" -eq 0 ] && ok "doctor (fully happy fake) exits 0" || bad "exit $DRC: $DOC_HAPPY"
-printf '%s' "$DOC_HAPPY" | grep -q 'all checks passed' && ok "doctor (happy) prints the all-checks-passed summary" || bad "$DOC_HAPPY"
+if [ "$DRC" -eq 0 ]; then ok "doctor (fully happy fake) exits 0"; else bad "exit $DRC: $DOC_HAPPY"; fi
+if printf '%s' "$DOC_HAPPY" | grep -q 'all checks passed'; then ok "doctor (happy) prints the all-checks-passed summary"; else bad "$DOC_HAPPY"; fi
 
 DOC_NF="$(FAKE_TS_MODE=no-funnel "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-[ "$DRC" -ne 0 ] && ok "doctor (no-funnel) exits nonzero" || bad "exit $DRC"
-printf '%s' "$DOC_NF" | grep -q 'FAIL.*funnel capability' && ok "doctor (no-funnel) flags 'funnel capability'" || bad "$DOC_NF"
+if [ "$DRC" -ne 0 ]; then ok "doctor (no-funnel) exits nonzero"; else bad "exit $DRC"; fi
+if printf '%s' "$DOC_NF" | grep -q 'FAIL.*funnel capability'; then ok "doctor (no-funnel) flags 'funnel capability'"; else bad "$DOC_NF"; fi
 
 DOC_BADPORT="$(FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" --https-port 9999 2>&1)"; DRC=$?
-[ "$DRC" -ne 0 ] && ok "doctor with a bad --https-port exits nonzero" || bad "exit $DRC"
-printf '%s' "$DOC_BADPORT" | grep -q 'FAIL.*https-port allowed' && ok "doctor flags a bad --https-port" || bad "$DOC_BADPORT"
+if [ "$DRC" -ne 0 ]; then ok "doctor with a bad --https-port exits nonzero"; else bad "exit $DRC"; fi
+if printf '%s' "$DOC_BADPORT" | grep -q 'FAIL.*https-port allowed'; then ok "doctor flags a bad --https-port"; else bad "$DOC_BADPORT"; fi
 
 rm -rf "$D"
 
@@ -540,10 +540,10 @@ HOST_NORM="${HOST_NORM//[^a-z0-9]/-}"
 if [ -n "$HOST_NORM" ]; then
   D="$(make_repo)"
   DOC_SUFFIX="$(FAKE_TS_DNSNAME="${HOST_NORM}-1.tail1234.ts.net." FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-  [ "$DRC" -eq 0 ] && ok "doctor (DNSName w/ -N suffix) still exits 0 -- info, not FAIL" || bad "exit $DRC: $DOC_SUFFIX"
-  printf '%s' "$DOC_SUFFIX" | grep -q 'all checks passed' && ok "doctor (DNSName w/ -N suffix) still reports all checks passed" || bad "$DOC_SUFFIX"
+  if [ "$DRC" -eq 0 ]; then ok "doctor (DNSName w/ -N suffix) still exits 0 -- info, not FAIL"; else bad "exit $DRC: $DOC_SUFFIX"; fi
+  if printf '%s' "$DOC_SUFFIX" | grep -q 'all checks passed'; then ok "doctor (DNSName w/ -N suffix) still reports all checks passed"; else bad "$DOC_SUFFIX"; fi
   EXPECT_SUFFIX_LINE="info  DNSName carries a -N suffix: an older node named ${HOST_NORM} is probably still registered (offline) in the tailnet admin console — remove it at https://login.tailscale.com/admin/machines and re-run 'tailscale up' to reclaim ${HOST_NORM}.tail1234.ts.net"
-  printf '%s' "$DOC_SUFFIX" | grep -qF "$EXPECT_SUFFIX_LINE" && ok "doctor prints the exact -N suffix info line" || bad "$DOC_SUFFIX"
+  if printf '%s' "$DOC_SUFFIX" | grep -qF "$EXPECT_SUFFIX_LINE"; then ok "doctor prints the exact -N suffix info line"; else bad "$DOC_SUFFIX"; fi
   rm -rf "$D"
 
   D="$(make_repo)"
@@ -570,7 +570,7 @@ HOSTEOF
 
   D="$(make_repo)"
   DOC_NORM="$(PATH="$FAKE_HOSTBIN:$PATH" FAKE_TS_DNSNAME='rj-test-host-1.tail1234.ts.net.' FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-  printf '%s' "$DOC_NORM" | grep -qF 'an older node named rj-test-host is' && ok "doctor normalizes a hostname with capitals/spaces (scutil 'RJ Test Host' -> rj-test-host)" || bad "$DOC_NORM"
+  if printf '%s' "$DOC_NORM" | grep -qF 'an older node named rj-test-host is'; then ok "doctor normalizes a hostname with capitals/spaces (scutil 'RJ Test Host' -> rj-test-host)"; else bad "$DOC_NORM"; fi
   if printf '%s' "$DOC_NORM" | grep -qF 'wrong-fallback-should-not-be-used'; then
     bad "doctor used the hostname(1) fallback instead of scutil: $DOC_NORM"
   else
@@ -584,26 +584,26 @@ fi
 
 # ── 56-59. unknown flags rejected on every subcommand ────────────────────
 OUT="$("$APP" connect --bogus-flag 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "connect rejects an unknown flag, exit 2" || bad "exit $RC: $OUT"
+if [ "$RC" -eq 2 ]; then ok "connect rejects an unknown flag, exit 2"; else bad "exit $RC: $OUT"; fi
 
 OUT="$("$APP" status --bogus-flag 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "status rejects an unknown flag, exit 2" || bad "exit $RC: $OUT"
+if [ "$RC" -eq 2 ]; then ok "status rejects an unknown flag, exit 2"; else bad "exit $RC: $OUT"; fi
 
 OUT="$("$APP" disconnect --bogus-flag 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "disconnect rejects an unknown flag, exit 2" || bad "exit $RC: $OUT"
+if [ "$RC" -eq 2 ]; then ok "disconnect rejects an unknown flag, exit 2"; else bad "exit $RC: $OUT"; fi
 
 OUT="$("$APP" doctor --bogus-flag 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "doctor rejects an unknown flag, exit 2" || bad "exit $RC: $OUT"
+if [ "$RC" -eq 2 ]; then ok "doctor rejects an unknown flag, exit 2"; else bad "exit $RC: $OUT"; fi
 
 # ── 60-63. status/disconnect on a repo that was never connected ─────────
 D="$(make_repo)"
 OUT="$(FAKE_TS_MODE=online-with-DNSName "$APP" status --repo "$D" 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "status on a never-connected repo exits 0" || bad "exit $RC"
-printf '%s' "$OUT" | grep -q 'connected: no' && ok "status on a never-connected repo reports connected: no" || bad "$OUT"
+if [ "$RC" -eq 0 ]; then ok "status on a never-connected repo exits 0"; else bad "exit $RC"; fi
+if printf '%s' "$OUT" | grep -q 'connected: no'; then ok "status on a never-connected repo reports connected: no"; else bad "$OUT"; fi
 
 OUT="$("$APP" disconnect --repo "$D" 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "disconnect on a never-connected repo exits 0" || bad "exit $RC"
-printf '%s' "$OUT" | grep -qi 'not connected' && ok "disconnect on a never-connected repo reports not connected" || bad "$OUT"
+if [ "$RC" -eq 0 ]; then ok "disconnect on a never-connected repo exits 0"; else bad "exit $RC"; fi
+if printf '%s' "$OUT" | grep -qi 'not connected'; then ok "disconnect on a never-connected repo reports not connected"; else bad "$OUT"; fi
 rm -rf "$D"
 
 # ── 64-67. legacy funnel CLI (serve + funnel PORT on/off recipe) ────────
@@ -613,16 +613,16 @@ LOG="$TMPROOT/ts-legacy.log"
 OUT_FILE="$TMPROOT/connect-legacy.out"
 FAKE_TS_MODE=legacy-funnel FAKE_TS_LOG="$LOG" "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
 RC=$?
-[ "$RC" -eq 0 ] && ok "connect --bg (legacy funnel CLI) exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
+if [ "$RC" -eq 0 ]; then ok "connect --bg (legacy funnel CLI) exits 0"; else bad "exit $RC: $(cat "$OUT_FILE")"; fi
 if grep -Eq 'https://my-machine\.tail1a2b3\.ts\.net/\?token=[A-Za-z0-9_-]+' "$OUT_FILE"; then
   ok "legacy-funnel connect prints the public URL"
 else
   bad "$(cat "$OUT_FILE")"
 fi
-grep -q '^serve https / http://127.0.0.1:' "$LOG" && ok "legacy funnel start used the 'serve https /' recipe" || bad "ts invocation log: $(cat "$LOG")"
-grep -q '^funnel 443 on$' "$LOG" && ok "legacy funnel start used 'funnel 443 on'" || bad "ts invocation log: $(cat "$LOG")"
+if grep -q '^serve https / http://127.0.0.1:' "$LOG"; then ok "legacy funnel start used the 'serve https /' recipe"; else bad "ts invocation log: $(cat "$LOG")"; fi
+if grep -q '^funnel 443 on$' "$LOG"; then ok "legacy funnel start used 'funnel 443 on'"; else bad "ts invocation log: $(cat "$LOG")"; fi
 FAKE_TS_MODE=legacy-funnel FAKE_TS_LOG="$LOG" "$APP" disconnect --repo "$D" >/dev/null 2>&1
-grep -q '^funnel 443 off$' "$LOG" && ok "legacy funnel stop used 'funnel 443 off'" || bad "ts invocation log: $(cat "$LOG")"
+if grep -q '^funnel 443 off$' "$LOG"; then ok "legacy funnel stop used 'funnel 443 off'"; else bad "ts invocation log: $(cat "$LOG")"; fi
 rm -rf "$D"
 
 # ── 68-72. foreground wait + signal-based teardown ───────────────────────
@@ -693,8 +693,8 @@ D="$(make_repo)"
 LOG="$TMPROOT/ts-a4a.log"
 : > "$LOG"
 OUT="$(FAKE_TS_MODE=legacy-funnel FAKE_TS_LOG="$LOG" "$APP" disconnect --repo "$D" 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "A4a. disconnect w/ no state file still exits 0" || bad "exit $RC: $OUT"
-grep -q '^funnel 443 off$' "$LOG" && ok "A4a. disconnect w/ no state file still calls funnel-stop (no orphaned funnel survives disconnect)" || bad "ts invocation log: $(cat "$LOG")"
+if [ "$RC" -eq 0 ]; then ok "A4a. disconnect w/ no state file still exits 0"; else bad "exit $RC: $OUT"; fi
+if grep -q '^funnel 443 off$' "$LOG"; then ok "A4a. disconnect w/ no state file still calls funnel-stop (no orphaned funnel survives disconnect)"; else bad "ts invocation log: $(cat "$LOG")"; fi
 rm -rf "$D"
 
 # ── A4(b). connect defaults to the fixed port 8710; busy -> exit 6 ───────
@@ -728,7 +728,7 @@ else
   if [ "$RC" -eq 0 ]; then
     SF="$D/.heimdall/app/connect.json"
     DP="$(jq -r '.port // empty' "$SF" 2>/dev/null)"
-    [ "$DP" = "8710" ] && ok "A4b. connect w/ no --port defaults to the fixed port 8710" || bad "port=$DP (want 8710)"
+    if [ "$DP" = "8710" ]; then ok "A4b. connect w/ no --port defaults to the fixed port 8710"; else bad "port=$DP (want 8710)"; fi
     FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
   else
     bad "A4b setup: connect (no --port) failed: $(cat "$OUT_FILE")"
@@ -753,7 +753,7 @@ PYEOF
   done
   exec 3<&- 2>/dev/null || true
   OUT="$(FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --bg 2>&1)"; RC=$?
-  [ "$RC" -eq 6 ] && ok "A4b. connect w/ the fixed default port (8710) busy exits 6" || bad "exit $RC (want 6): $OUT"
+  if [ "$RC" -eq 6 ]; then ok "A4b. connect w/ the fixed default port (8710) busy exits 6"; else bad "exit $RC (want 6): $OUT"; fi
   kill "$HOLD_PID" 2>/dev/null
   wait "$HOLD_PID" 2>/dev/null
   rm -rf "$D"
@@ -766,8 +766,8 @@ cat > "$D/.heimdall/app/connect.json" <<JSON
 {"pid_ui": 1, "port": 9999, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
 JSON
 OUT="$(FAKE_TS_MODE=funnel-still-up "$APP" status --repo "$D" 2>&1)"; RC=$?
-[ "$RC" -ne 0 ] && ok "A4c. status w/ a stale pid + funnel still up exits nonzero" || bad "exit $RC (want nonzero)"
-printf '%s' "$OUT" | grep -qi 'ORPHANED FUNNEL' && ok "A4c. status prints an ORPHANED FUNNEL warning" || bad "$OUT"
+if [ "$RC" -ne 0 ]; then ok "A4c. status w/ a stale pid + funnel still up exits nonzero"; else bad "exit $RC (want nonzero)"; fi
+if printf '%s' "$OUT" | grep -qi 'ORPHANED FUNNEL'; then ok "A4c. status prints an ORPHANED FUNNEL warning"; else bad "$OUT"; fi
 rm -rf "$D"
 
 # ── A4(d). connect tears down a pre-existing funnel before starting a new one ──
@@ -785,10 +785,10 @@ LOG="$TMPROOT/ts-a4d.log"
 OUT_FILE="$TMPROOT/connect-a4d.out"
 FAKE_TS_MODE=funnel-still-up FAKE_TS_LOG="$LOG" "$APP" connect --tailscale --repo "$D" --bg --port 0 >"$OUT_FILE" 2>&1
 RC=$?
-[ "$RC" -eq 0 ] && ok "A4d. connect w/ a pre-existing funnel still exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
-grep -qi 'tearing it down' "$OUT_FILE" && ok "A4d. connect announces tearing down the pre-existing funnel" || bad "$(cat "$OUT_FILE")"
+if [ "$RC" -eq 0 ]; then ok "A4d. connect w/ a pre-existing funnel still exits 0"; else bad "exit $RC: $(cat "$OUT_FILE")"; fi
+if grep -qi 'tearing it down' "$OUT_FILE"; then ok "A4d. connect announces tearing down the pre-existing funnel"; else bad "$(cat "$OUT_FILE")"; fi
 A4D_COUNT="$(grep -c '^funnel' "$LOG")"
-[ "$A4D_COUNT" -gt "$BASELINE_COUNT" ] && ok "A4d. connect issued an extra tailscale funnel call to tear it down ($A4D_COUNT calls vs $BASELINE_COUNT baseline)" || bad "no extra funnel call: $A4D_COUNT vs baseline $BASELINE_COUNT"
+if [ "$A4D_COUNT" -gt "$BASELINE_COUNT" ]; then ok "A4d. connect issued an extra tailscale funnel call to tear it down ($A4D_COUNT calls vs $BASELINE_COUNT baseline)"; else bad "no extra funnel call: $A4D_COUNT vs baseline $BASELINE_COUNT"; fi
 FAKE_TS_MODE=funnel-still-up "$APP" disconnect --repo "$D" >/dev/null 2>&1
 rm -rf "$D"
 
@@ -915,6 +915,8 @@ OUT_FILE="$TMPROOT/connect-a5.out"
 A5_ARGV_LOG="$TMPROOT/a5-argv.log"
 A5_STDIN_LOG="$TMPROOT/a5-qr-stdin.log"
 A5_PY_WRAP="$TMPROOT/a5-python-argv-recorder"
+# SC1091: shellcheck only follows sources under -x; source= serves `-x -P SCRIPTDIR`, disable keeps a plain run clean.
+# shellcheck source=../bin/lib/hmd-python.sh disable=SC1091
 A5_REAL_PY="$(. "$REPO/bin/lib/hmd-python.sh"; hmd_python 2>/dev/null || true)"
 : >"$A5_ARGV_LOG"
 : >"$A5_STDIN_LOG"
@@ -1008,7 +1010,7 @@ if [ -f "$SF" ]; then
     UI_OUT_PATH="$(lsof -a -p "$A6_UI_PID" -d 1 -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
     if [ -n "$UI_OUT_PATH" ] && [ -f "$UI_OUT_PATH" ]; then
       MODE="$(stat -f '%Lp' "$UI_OUT_PATH" 2>/dev/null || stat -c '%a' "$UI_OUT_PATH" 2>/dev/null)"
-      [ "$MODE" = "600" ] && ok "A6. ui log temp file created with mode 0600" || bad "A6. ui log temp file mode=$MODE (want 600): $UI_OUT_PATH"
+      if [ "$MODE" = "600" ]; then ok "A6. ui log temp file created with mode 0600"; else bad "A6. ui log temp file mode=$MODE (want 600): $UI_OUT_PATH"; fi
     else
       bad "A6. lsof found no resolvable stdout path for ui pid $A6_UI_PID"
     fi
@@ -1038,26 +1040,26 @@ ERR_FILE="$TMPROOT/connect-a6-race.err"
 OUT_FILE="$TMPROOT/connect-a6-race.out"
 HEIMDALL_UI_BIN="$FAKE_UI_DIES" FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
-[ "$RC" -eq 6 ] && ok "A6. connect w/ a ui that dies before printing a URL exits 6" || bad "exit $RC (want 6): $(cat "$ERR_FILE")"
+if [ "$RC" -eq 6 ]; then ok "A6. connect w/ a ui that dies before printing a URL exits 6"; else bad "exit $RC (want 6): $(cat "$ERR_FILE")"; fi
 if grep -q 'SECRETVALUE12345' "$ERR_FILE"; then
   bad "A6. die-race stderr LEAKS the raw token: $(cat "$ERR_FILE")"
 else
   ok "A6. die-race stderr never contains the raw token"
 fi
-grep -q 'token=<redacted>' "$ERR_FILE" && ok "A6. die-race stderr shows the redacted placeholder instead" || bad "$(cat "$ERR_FILE")"
+if grep -q 'token=<redacted>' "$ERR_FILE"; then ok "A6. die-race stderr shows the redacted placeholder instead"; else bad "$(cat "$ERR_FILE")"; fi
 rm -rf "$D"
 
 # ── A12. DNSName is validated before use as --allow-host ─────────────────
 D="$(make_repo)"
 OUT="$(FAKE_TS_DNSNAME='evil.example.com' FAKE_TS_MODE=online-with-DNSName "$APP" connect --tailscale --repo "$D" --bg --port 0 2>&1)"; RC=$?
-[ "$RC" -eq 5 ] && ok "A12. connect w/ a non-ts.net DNSName exits 5" || bad "exit $RC (want 5): $OUT"
-printf '%s' "$OUT" | grep -qF 'evil.example.com' && ok "A12. bad-DNSName error quotes the offending value" || bad "$OUT"
-[ ! -f "$D/.heimdall/app/connect.json" ] && ok "A12. no state file written on bad-DNSName failure" || bad "state file leaked"
+if [ "$RC" -eq 5 ]; then ok "A12. connect w/ a non-ts.net DNSName exits 5"; else bad "exit $RC (want 5): $OUT"; fi
+if printf '%s' "$OUT" | grep -qF 'evil.example.com'; then ok "A12. bad-DNSName error quotes the offending value"; else bad "$OUT"; fi
+if [ ! -f "$D/.heimdall/app/connect.json" ]; then ok "A12. no state file written on bad-DNSName failure"; else bad "state file leaked"; fi
 rm -rf "$D"
 
 D="$(make_repo)"
 OUT="$(FAKE_TS_DNSNAME='bad host.ts.net' FAKE_TS_MODE=online-with-DNSName "$APP" connect --tailscale --repo "$D" --bg --port 0 2>&1)"; RC=$?
-[ "$RC" -eq 5 ] && ok "A12. connect w/ a DNSName containing a space exits 5" || bad "exit $RC (want 5): $OUT"
+if [ "$RC" -eq 5 ]; then ok "A12. connect w/ a DNSName containing a space exits 5"; else bad "exit $RC (want 5): $OUT"; fi
 rm -rf "$D"
 
 # ── A14. disconnect never kills a pid that isn't actually heimdall-ui ────
@@ -1070,13 +1072,13 @@ cat > "$D/.heimdall/app/connect.json" <<JSON
 {"pid_ui": $SLEEP_PID, "port": 9999, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
 JSON
 OUT="$(FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "A14. disconnect w/ a non-heimdall-ui pid in state file still exits 0" || bad "exit $RC: $OUT"
+if [ "$RC" -eq 0 ]; then ok "A14. disconnect w/ a non-heimdall-ui pid in state file still exits 0"; else bad "exit $RC: $OUT"; fi
 if kill -0 "$SLEEP_PID" 2>/dev/null; then
   ok "A14. disconnect does NOT kill a pid whose command isn't heimdall-ui (recycled-pid guard)"
 else
   bad "A14. disconnect killed an unrelated sleep process -- pid-identity guard missing"
 fi
-printf '%s' "$OUT" | grep -qi 'not a heimdall-ui process' && ok "A14. disconnect warns when skipping a non-matching pid" || bad "$OUT"
+if printf '%s' "$OUT" | grep -qi 'not a heimdall-ui process'; then ok "A14. disconnect warns when skipping a non-matching pid"; else bad "$OUT"; fi
 kill "$SLEEP_PID" 2>/dev/null
 wait "$SLEEP_PID" 2>/dev/null
 rm -rf "$D"
@@ -1090,10 +1092,10 @@ JSON
 LOG="$TMPROOT/ts-n1a.log"
 : > "$LOG"
 N1A_OUT="$(FAKE_TS_MODE=one-foreign-target FAKE_TS_TARGET_PORT=5601 FAKE_TS_LOG="$LOG" "$APP" disconnect --repo "$D" 2>&1)"; N1A_RC=$?
-[ "$N1A_RC" -eq 7 ] && ok "N1a. disconnect refuses (exit 7) when a foreign target doesn't match hmd's own port" || bad "exit $N1A_RC (want 7): $N1A_OUT"
-printf '%s' "$N1A_OUT" | grep -qF 'FUNNEL STILL PUBLIC' && ok "N1a. refusal prints the loud FUNNEL STILL PUBLIC line" || bad "$N1A_OUT"
-printf '%s' "$N1A_OUT" | grep -qi 'stopped' && bad "N1a. refusal must never claim success: $N1A_OUT" || ok "N1a. refusal never prints 'stopped'"
-grep -q '^funnel reset$' "$LOG" && bad "N1a. refused stop must not have attempted a reset: $(cat "$LOG")" || ok "N1a. refusal never attempted a reset"
+if [ "$N1A_RC" -eq 7 ]; then ok "N1a. disconnect refuses (exit 7) when a foreign target doesn't match hmd's own port"; else bad "exit $N1A_RC (want 7): $N1A_OUT"; fi
+if printf '%s' "$N1A_OUT" | grep -qF 'FUNNEL STILL PUBLIC'; then ok "N1a. refusal prints the loud FUNNEL STILL PUBLIC line"; else bad "$N1A_OUT"; fi
+if printf '%s' "$N1A_OUT" | grep -qi 'stopped'; then bad "N1a. refusal must never claim success: $N1A_OUT"; else ok "N1a. refusal never prints 'stopped'"; fi
+if grep -q '^funnel reset$' "$LOG"; then bad "N1a. refused stop must not have attempted a reset: $(cat "$LOG")"; else ok "N1a. refusal never attempted a reset"; fi
 rm -rf "$D"
 
 # ── N1(b). stop's own rc says success but status still shows it up -> 8 ──
@@ -1103,9 +1105,9 @@ cat > "$D/.heimdall/app/connect.json" <<JSON
 {"pid_ui": 1, "port": 6000, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
 JSON
 N1B_OUT="$(FAKE_TS_MODE=funnel-still-up "$APP" disconnect --repo "$D" 2>&1)"; N1B_RC=$?
-[ "$N1B_RC" -eq 8 ] && ok "N1b. disconnect exits 8 when the stop's own exit code says success but the funnel is still up" || bad "exit $N1B_RC (want 8): $N1B_OUT"
-printf '%s' "$N1B_OUT" | grep -qF 'FUNNEL STILL PUBLIC' && ok "N1b. exit-8 case prints the loud FUNNEL STILL PUBLIC line" || bad "$N1B_OUT"
-printf '%s' "$N1B_OUT" | grep -qi 'stopped' && bad "N1b. must never claim 'stopped' while still public: $N1B_OUT" || ok "N1b. never prints 'stopped'"
+if [ "$N1B_RC" -eq 8 ]; then ok "N1b. disconnect exits 8 when the stop's own exit code says success but the funnel is still up"; else bad "exit $N1B_RC (want 8): $N1B_OUT"; fi
+if printf '%s' "$N1B_OUT" | grep -qF 'FUNNEL STILL PUBLIC'; then ok "N1b. exit-8 case prints the loud FUNNEL STILL PUBLIC line"; else bad "$N1B_OUT"; fi
+if printf '%s' "$N1B_OUT" | grep -qi 'stopped'; then bad "N1b. must never claim 'stopped' while still public: $N1B_OUT"; else ok "N1b. never prints 'stopped'"; fi
 rm -rf "$D"
 
 # ── N1(c). clean stop verifies down -> exit 0, prints 'stopped' ──────────
@@ -1115,8 +1117,8 @@ cat > "$D/.heimdall/app/connect.json" <<JSON
 {"pid_ui": 1, "port": 6000, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
 JSON
 N1C_OUT="$(FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" 2>&1)"; N1C_RC=$?
-[ "$N1C_RC" -eq 0 ] && ok "N1c. clean stop (verified down) exits 0" || bad "exit $N1C_RC: $N1C_OUT"
-printf '%s' "$N1C_OUT" | grep -qi 'stopped' && ok "N1c. clean stop prints 'stopped'" || bad "$N1C_OUT"
+if [ "$N1C_RC" -eq 0 ]; then ok "N1c. clean stop (verified down) exits 0"; else bad "exit $N1C_RC: $N1C_OUT"; fi
+if printf '%s' "$N1C_OUT" | grep -qi 'stopped'; then ok "N1c. clean stop prints 'stopped'"; else bad "$N1C_OUT"; fi
 rm -rf "$D"
 
 # ── N1(d). no state file, exactly one loopback target -> that port is
@@ -1130,8 +1132,8 @@ D="$(make_repo)"
 LOG="$TMPROOT/ts-n1d.log"
 : > "$LOG"
 N1D_OUT="$(FAKE_TS_MODE=one-foreign-target FAKE_TS_TARGET_PORT=5601 FAKE_TS_LOG="$LOG" FAKE_TS_RESET_MARKER="$TMPROOT/n1d.marker" "$APP" disconnect --repo "$D" 2>&1)"; N1D_RC=$?
-[ "$N1D_RC" -eq 0 ] && ok "N1d. no state file + a single loopback target infers that port and stops cleanly" || bad "exit $N1D_RC: $N1D_OUT"
-grep -q '^funnel reset$' "$LOG" && ok "N1d. the discovered single target let the stop proceed (funnel reset attempted, not refused)" || bad "ts invocation log: $(cat "$LOG")"
+if [ "$N1D_RC" -eq 0 ]; then ok "N1d. no state file + a single loopback target infers that port and stops cleanly"; else bad "exit $N1D_RC: $N1D_OUT"; fi
+if grep -q '^funnel reset$' "$LOG"; then ok "N1d. the discovered single target let the stop proceed (funnel reset attempted, not refused)"; else bad "ts invocation log: $(cat "$LOG")"; fi
 rm -rf "$D"
 
 # ── N1(e). no state file, two loopback targets -> ambiguous, refuses ─────
@@ -1139,8 +1141,8 @@ D="$(make_repo)"
 LOG="$TMPROOT/ts-n1e.log"
 : > "$LOG"
 N1E_OUT="$(FAKE_TS_MODE=two-foreign-targets FAKE_TS_LOG="$LOG" "$APP" disconnect --repo "$D" 2>&1)"; N1E_RC=$?
-[ "$N1E_RC" -eq 7 ] && ok "N1e. no state file + two loopback targets is ambiguous, refuses (exit 7)" || bad "exit $N1E_RC (want 7): $N1E_OUT"
-grep -q '^funnel reset$' "$LOG" && bad "N1e. ambiguous case must not attempt a stop: $(cat "$LOG")" || ok "N1e. ambiguous case never attempted a stop"
+if [ "$N1E_RC" -eq 7 ]; then ok "N1e. no state file + two loopback targets is ambiguous, refuses (exit 7)"; else bad "exit $N1E_RC (want 7): $N1E_OUT"; fi
+if grep -q '^funnel reset$' "$LOG"; then bad "N1e. ambiguous case must not attempt a stop: $(cat "$LOG")"; else ok "N1e. ambiguous case never attempted a stop"; fi
 rm -rf "$D"
 
 # ── N1(f). HMD_FUNNEL_FORCE_RESET=1 forces past the N1e ambiguity ────────
@@ -1148,9 +1150,9 @@ D="$(make_repo)"
 LOG="$TMPROOT/ts-n1f.log"
 : > "$LOG"
 N1F_OUT="$(HMD_FUNNEL_FORCE_RESET=1 FAKE_TS_MODE=two-foreign-targets FAKE_TS_LOG="$LOG" FAKE_TS_RESET_MARKER="$TMPROOT/n1f.marker" "$APP" disconnect --repo "$D" 2>&1)"; N1F_RC=$?
-[ "$N1F_RC" -eq 0 ] && ok "N1f. HMD_FUNNEL_FORCE_RESET=1 forces the reset through the same ambiguity, exits 0" || bad "exit $N1F_RC: $N1F_OUT"
-printf '%s' "$N1F_OUT" | grep -qi 'stopped' && ok "N1f. forced reset prints 'stopped'" || bad "$N1F_OUT"
-grep -q '^funnel reset$' "$LOG" && ok "N1f. forced reset actually called funnel reset" || bad "ts invocation log: $(cat "$LOG")"
+if [ "$N1F_RC" -eq 0 ]; then ok "N1f. HMD_FUNNEL_FORCE_RESET=1 forces the reset through the same ambiguity, exits 0"; else bad "exit $N1F_RC: $N1F_OUT"; fi
+if printf '%s' "$N1F_OUT" | grep -qi 'stopped'; then ok "N1f. forced reset prints 'stopped'"; else bad "$N1F_OUT"; fi
+if grep -q '^funnel reset$' "$LOG"; then ok "N1f. forced reset actually called funnel reset"; else bad "ts invocation log: $(cat "$LOG")"; fi
 rm -rf "$D"
 
 # ── N1(g). foreground connect's SIGTERM cleanup exits non-zero (not the
@@ -1182,8 +1184,8 @@ if [ -f "$SF" ]; then
   else
     wait "$N1G_PID" 2>/dev/null
     N1G_RC=$?
-    [ "$N1G_RC" -eq 8 ] && ok "N1g. SIGTERM cleanup exits 8 (not the signal's own code) when the funnel can't be verified down" || bad "exit $N1G_RC (want 8): $(cat "$OUT_FILE")"
-    grep -qF 'FUNNEL STILL PUBLIC' "$OUT_FILE" && ok "N1g. SIGTERM teardown prints the loud FUNNEL STILL PUBLIC line" || bad "$(cat "$OUT_FILE")"
+    if [ "$N1G_RC" -eq 8 ]; then ok "N1g. SIGTERM cleanup exits 8 (not the signal's own code) when the funnel can't be verified down"; else bad "exit $N1G_RC (want 8): $(cat "$OUT_FILE")"; fi
+    if grep -qF 'FUNNEL STILL PUBLIC' "$OUT_FILE"; then ok "N1g. SIGTERM teardown prints the loud FUNNEL STILL PUBLIC line"; else bad "$(cat "$OUT_FILE")"; fi
   fi
 else
   bad "N1g setup: foreground connect never wrote a state file within 10s: $(cat "$OUT_FILE" 2>/dev/null)"
@@ -1231,25 +1233,25 @@ EOF
 D="$(make_repo)"
 
 DOC_MACSYS="$(HMD_TAILSCALE_APP_PLIST="$MACSYS_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-[ "$DRC" -ne 0 ] && ok "doctor (macsys variant) exits nonzero" || bad "exit $DRC: $DOC_MACSYS"
-printf '%s' "$DOC_MACSYS" | grep -q 'FAIL.*tailscale build variant (macsys' && ok "doctor (macsys) flags 'tailscale build variant'" || bad "$DOC_MACSYS"
-printf '%s' "$DOC_MACSYS" | grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)' && ok "doctor (macsys) prints the exact brew-install fix line" || bad "$DOC_MACSYS"
-printf '%s' "$DOC_MACSYS" | grep -q 'FAIL.*funnel capability' && ok "doctor (macsys) also flags 'funnel capability'" || bad "$DOC_MACSYS"
+if [ "$DRC" -ne 0 ]; then ok "doctor (macsys variant) exits nonzero"; else bad "exit $DRC: $DOC_MACSYS"; fi
+if printf '%s' "$DOC_MACSYS" | grep -q 'FAIL.*tailscale build variant (macsys'; then ok "doctor (macsys) flags 'tailscale build variant'"; else bad "$DOC_MACSYS"; fi
+if printf '%s' "$DOC_MACSYS" | grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)'; then ok "doctor (macsys) prints the exact brew-install fix line"; else bad "$DOC_MACSYS"; fi
+if printf '%s' "$DOC_MACSYS" | grep -q 'FAIL.*funnel capability'; then ok "doctor (macsys) also flags 'funnel capability'"; else bad "$DOC_MACSYS"; fi
 
 DOC_APPSTORE="$(HMD_TAILSCALE_APP_PLIST="$APPSTORE_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-[ "$DRC" -ne 0 ] && ok "doctor (appstore variant) exits nonzero" || bad "exit $DRC: $DOC_APPSTORE"
-printf '%s' "$DOC_APPSTORE" | grep -q 'FAIL.*tailscale build variant (appstore' && ok "doctor (appstore) flags 'tailscale build variant'" || bad "$DOC_APPSTORE"
-printf '%s' "$DOC_APPSTORE" | grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)' && ok "doctor (appstore) prints the exact brew-install fix line" || bad "$DOC_APPSTORE"
-printf '%s' "$DOC_APPSTORE" | grep -q 'FAIL.*funnel capability' && ok "doctor (appstore) also flags 'funnel capability'" || bad "$DOC_APPSTORE"
+if [ "$DRC" -ne 0 ]; then ok "doctor (appstore variant) exits nonzero"; else bad "exit $DRC: $DOC_APPSTORE"; fi
+if printf '%s' "$DOC_APPSTORE" | grep -q 'FAIL.*tailscale build variant (appstore'; then ok "doctor (appstore) flags 'tailscale build variant'"; else bad "$DOC_APPSTORE"; fi
+if printf '%s' "$DOC_APPSTORE" | grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)'; then ok "doctor (appstore) prints the exact brew-install fix line"; else bad "$DOC_APPSTORE"; fi
+if printf '%s' "$DOC_APPSTORE" | grep -q 'FAIL.*funnel capability'; then ok "doctor (appstore) also flags 'funnel capability'"; else bad "$DOC_APPSTORE"; fi
 
 DOC_UNKNOWN="$(FAKE_TS_MODE=online-with-DNSName "$APP" doctor --repo "$D" 2>&1)"; DRC=$?
-[ "$DRC" -eq 0 ] && ok "doctor (unrecognized variant) still exits 0" || bad "exit $DRC: $DOC_UNKNOWN"
-printf '%s' "$DOC_UNKNOWN" | grep -q 'warn.*tailscale build variant (unknown' && ok "doctor (unrecognized variant) warns, does not FAIL, 'tailscale build variant'" || bad "$DOC_UNKNOWN"
-printf '%s' "$DOC_UNKNOWN" | grep -q 'ok.*funnel capability' && ok "doctor (unrecognized variant) still passes 'funnel capability'" || bad "$DOC_UNKNOWN"
+if [ "$DRC" -eq 0 ]; then ok "doctor (unrecognized variant) still exits 0"; else bad "exit $DRC: $DOC_UNKNOWN"; fi
+if printf '%s' "$DOC_UNKNOWN" | grep -q 'warn.*tailscale build variant (unknown'; then ok "doctor (unrecognized variant) warns, does not FAIL, 'tailscale build variant'"; else bad "$DOC_UNKNOWN"; fi
+if printf '%s' "$DOC_UNKNOWN" | grep -q 'ok.*funnel capability'; then ok "doctor (unrecognized variant) still passes 'funnel capability'"; else bad "$DOC_UNKNOWN"; fi
 
 STATUS_VARIANT="$(HMD_TAILSCALE_APP_PLIST="$MACSYS_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" status --repo "$D" 2>&1)"
-printf '%s' "$STATUS_VARIANT" | grep -q '^tailscale build variant: macsys$' && ok "status prints 'tailscale build variant: macsys'" || bad "$STATUS_VARIANT"
-printf '%s' "$STATUS_VARIANT" | grep -q '^tailscale binary: ' && ok "status prints the resolved 'tailscale binary:' path" || bad "$STATUS_VARIANT"
+if printf '%s' "$STATUS_VARIANT" | grep -q '^tailscale build variant: macsys$'; then ok "status prints 'tailscale build variant: macsys'"; else bad "$STATUS_VARIANT"; fi
+if printf '%s' "$STATUS_VARIANT" | grep -q '^tailscale binary: '; then ok "status prints the resolved 'tailscale binary:' path"; else bad "$STATUS_VARIANT"; fi
 
 rm -rf "$D"
 
@@ -1263,9 +1265,9 @@ OUT_FILE="$TMPROOT/connect-macsys.out"
 ERR_FILE="$TMPROOT/connect-macsys.err"
 HMD_TAILSCALE_APP_PLIST="$MACSYS_PLIST" FAKE_TS_MODE=online-with-DNSName "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
-[ "$RC" -eq 9 ] && ok "connect on a macsys build exits 9" || bad "exit $RC (want 9): $(cat "$ERR_FILE")"
-grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)' "$ERR_FILE" && ok "connect (macsys) prints the exact brew-install fix line" || bad "$(cat "$ERR_FILE")"
-[ ! -f "$D/.heimdall/app/connect.json" ] && ok "connect (macsys) writes no state file" || bad "state file unexpectedly written"
+if [ "$RC" -eq 9 ]; then ok "connect on a macsys build exits 9"; else bad "exit $RC (want 9): $(cat "$ERR_FILE")"; fi
+if grep -qF 'install the open-source build: brew install tailscale (then: tailscale up)' "$ERR_FILE"; then ok "connect (macsys) prints the exact brew-install fix line"; else bad "$(cat "$ERR_FILE")"; fi
+if [ ! -f "$D/.heimdall/app/connect.json" ]; then ok "connect (macsys) writes no state file"; else bad "state file unexpectedly written"; fi
 MACSYS_UI_WAITED=0
 while pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1 && [ "$MACSYS_UI_WAITED" -lt 30 ]; do
   sleep 0.1
@@ -1290,11 +1292,11 @@ C10_START=$(date +%s)
 HMD_FUNNEL_START_TIMEOUT_S=3 FAKE_TS_MODE=funnel-start-hangs FAKE_TS_LOG="$LOG" "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>"$ERR_FILE"
 RC=$?
 C10_ELAPSED=$(( $(date +%s) - C10_START ))
-[ "$RC" -eq 10 ] && ok "connect w/ a hung funnel-start exits 10 instead of hanging" || bad "exit $RC (want 10): $(cat "$ERR_FILE")"
-[ "$C10_ELAPSED" -le 8 ] && ok "connect w/ a hung funnel-start returns within timeout+5s (${C10_ELAPSED}s elapsed)" || bad "took ${C10_ELAPSED}s, want <=8s"
-grep -qF 'funnel start timed out after 3s' "$ERR_FILE" && ok "connect (timeout) prints the exact timeout message" || bad "$(cat "$ERR_FILE")"
-grep -qi 'hmd app doctor' "$ERR_FILE" && ok "connect (timeout) points at 'hmd app doctor'" || bad "$(cat "$ERR_FILE")"
-[ ! -f "$D/.heimdall/app/connect.json" ] && ok "connect (timeout) leaves no state file after teardown" || bad "state file unexpectedly present"
+if [ "$RC" -eq 10 ]; then ok "connect w/ a hung funnel-start exits 10 instead of hanging"; else bad "exit $RC (want 10): $(cat "$ERR_FILE")"; fi
+if [ "$C10_ELAPSED" -le 8 ]; then ok "connect w/ a hung funnel-start returns within timeout+5s (${C10_ELAPSED}s elapsed)"; else bad "took ${C10_ELAPSED}s, want <=8s"; fi
+if grep -qF 'funnel start timed out after 3s' "$ERR_FILE"; then ok "connect (timeout) prints the exact timeout message"; else bad "$(cat "$ERR_FILE")"; fi
+if grep -qi 'hmd app doctor' "$ERR_FILE"; then ok "connect (timeout) points at 'hmd app doctor'"; else bad "$(cat "$ERR_FILE")"; fi
+if [ ! -f "$D/.heimdall/app/connect.json" ]; then ok "connect (timeout) leaves no state file after teardown"; else bad "state file unexpectedly present"; fi
 HANG_UI_WAITED=0
 while pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1 && [ "$HANG_UI_WAITED" -lt 30 ]; do
   sleep 0.1
@@ -1305,7 +1307,7 @@ if pgrep -f "heimdall-ui --repo $D " >/dev/null 2>&1; then
 else
   ok "connect (timeout) tore down heimdall-ui after the timeout"
 fi
-grep -qE '^funnel (reset|--https=[0-9]+ off)$' "$LOG" && ok "connect (timeout) still invoked funnel-stop during teardown" || bad "no stop invocation in log: $(cat "$LOG" 2>/dev/null)"
+if grep -qE '^funnel (reset|--https=[0-9]+ off)$' "$LOG"; then ok "connect (timeout) still invoked funnel-stop during teardown"; else bad "no stop invocation in log: $(cat "$LOG" 2>/dev/null)"; fi
 rm -rf "$D"
 
 # ── connect prints the same -N suffix hint once in its banner (2026-09-21,
@@ -1315,10 +1317,10 @@ if [ -n "$HOST_NORM" ]; then
   OUT_FILE="$TMPROOT/connect-dns-suffix.out"
   FAKE_TS_DNSNAME="${HOST_NORM}-1.tail1234.ts.net." FAKE_TS_MODE=modern-funnel "$APP" connect --tailscale --repo "$D" --port 0 --bg >"$OUT_FILE" 2>&1
   RC=$?
-  [ "$RC" -eq 0 ] && ok "connect --bg (DNSName w/ -N suffix) still exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
+  if [ "$RC" -eq 0 ]; then ok "connect --bg (DNSName w/ -N suffix) still exits 0"; else bad "exit $RC: $(cat "$OUT_FILE")"; fi
   EXPECT_CONNECT_LINE="DNSName carries a -N suffix: an older node named ${HOST_NORM} is probably still registered (offline) in the tailnet admin console — remove it at https://login.tailscale.com/admin/machines and re-run 'tailscale up' to reclaim ${HOST_NORM}.tail1234.ts.net"
   CONNECT_HINT_COUNT="$(grep -cF "$EXPECT_CONNECT_LINE" "$OUT_FILE")"
-  [ "$CONNECT_HINT_COUNT" -eq 1 ] && ok "connect banner prints the -N suffix hint exactly once" || bad "count=$CONNECT_HINT_COUNT: $(cat "$OUT_FILE")"
+  if [ "$CONNECT_HINT_COUNT" -eq 1 ]; then ok "connect banner prints the -N suffix hint exactly once"; else bad "count=$CONNECT_HINT_COUNT: $(cat "$OUT_FILE")"; fi
   FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
   rm -rf "$D"
 
@@ -1339,16 +1341,16 @@ fi
 
 
 # ── A6: errfile security (no predictable /tmp fallback) ───────────────────
-[ "$(grep -c 'echo "/tmp/' "$APP")" -eq 0 ] && ok "no hardcoded /tmp fallback patterns in bin/heimdall-app" || bad "/tmp fallback pattern found in code"
-grep -B3 'errfile=' "$APP" | grep -q 'umask 077' && ok "errfile mktemp is protected by umask 077" || bad "umask 077 not found before errfile mktemp"
+if [ "$(grep -c 'echo "/tmp/' "$APP")" -eq 0 ]; then ok "no hardcoded /tmp fallback patterns in bin/heimdall-app"; else bad "/tmp fallback pattern found in code"; fi
+if grep -B3 'errfile=' "$APP" | grep -q 'umask 077'; then ok "errfile mktemp is protected by umask 077"; else bad "umask 077 not found before errfile mktemp"; fi
 
 # ── relay mode: --relay and --https-port are mutually exclusive ──────────
 D="$(make_repo)"
 OUT_FILE="$TMPROOT/connect-relay-excl.out"
 "$APP" connect --repo "$D" --relay "https://relay.example.com" --https-port 8443 >"$OUT_FILE" 2>&1
 RC=$?
-[ "$RC" -eq 2 ] && ok "connect --relay with --https-port exits 2" || bad "exit $RC (want 2): $(cat "$OUT_FILE")"
-grep -qi 'mutually exclusive' "$OUT_FILE" && ok "connect --relay+--https-port prints a mutually-exclusive message" || bad "$(cat "$OUT_FILE")"
+if [ "$RC" -eq 2 ]; then ok "connect --relay with --https-port exits 2"; else bad "exit $RC (want 2): $(cat "$OUT_FILE")"; fi
+if grep -qi 'mutually exclusive' "$OUT_FILE"; then ok "connect --relay+--https-port prints a mutually-exclusive message"; else bad "$(cat "$OUT_FILE")"; fi
 rm -rf "$D"
 
 # ── fake bin/heimdall-relay-client -- drives every relay-mode assertion below.
@@ -1458,7 +1460,7 @@ while [ ! -f "$SF" ] && [ "$FG_WAITED" -lt 100 ]; do
   sleep 0.1
   FG_WAITED=$((FG_WAITED + 1))
 done
-[ -f "$SF" ] && ok "relay connect (foreground) writes connect.json" || bad "connect.json never appeared: $(cat "$OUT_FILE")"
+if [ -f "$SF" ]; then ok "relay connect (foreground) writes connect.json"; else bad "connect.json never appeared: $(cat "$OUT_FILE")"; fi
 
 PB_WAITED=0
 while ! grep -q 'phone paired' "$OUT_FILE" 2>/dev/null && [ "$PB_WAITED" -lt 100 ]; do
@@ -1466,17 +1468,17 @@ while ! grep -q 'phone paired' "$OUT_FILE" 2>/dev/null && [ "$PB_WAITED" -lt 100
   PB_WAITED=$((PB_WAITED + 1))
 done
 
-grep -q '##' "$OUT_FILE" && ok "relay connect prints a QR code block (ascii glyphs)" || bad "no QR block: $(cat "$OUT_FILE")"
-grep -q 'PAIRING CODE: ABCDEFGHIJKLMNOPQRSTUVWXY0' "$OUT_FILE" && ok "relay connect prints the pairing code" || bad "pairing code missing: $(cat "$OUT_FILE")"
-grep -qi 'E2E-encrypted' "$OUT_FILE" && ok "relay connect prints the E2E exposure note" || bad "E2E note missing: $(cat "$OUT_FILE")"
-grep -q 'phone paired' "$OUT_FILE" && ok "relay connect prints 'phone paired' on device_bound" || bad "phone-paired message missing: $(cat "$OUT_FILE")"
-grep -q 'public_host=relay.example.com' "$RELAY_LOG" 2>/dev/null && ok "relay client spawned with --public-host <relay hostname>" || bad "public-host not propagated: $(cat "$RELAY_LOG" 2>/dev/null)"
+if grep -q '##' "$OUT_FILE"; then ok "relay connect prints a QR code block (ascii glyphs)"; else bad "no QR block: $(cat "$OUT_FILE")"; fi
+if grep -q 'PAIRING CODE: ABCDEFGHIJKLMNOPQRSTUVWXY0' "$OUT_FILE"; then ok "relay connect prints the pairing code"; else bad "pairing code missing: $(cat "$OUT_FILE")"; fi
+if grep -qi 'E2E-encrypted' "$OUT_FILE"; then ok "relay connect prints the E2E exposure note"; else bad "E2E note missing: $(cat "$OUT_FILE")"; fi
+if grep -q 'phone paired' "$OUT_FILE"; then ok "relay connect prints 'phone paired' on device_bound"; else bad "phone-paired message missing: $(cat "$OUT_FILE")"; fi
+if grep -q 'public_host=relay.example.com' "$RELAY_LOG" 2>/dev/null; then ok "relay client spawned with --public-host <relay hostname>"; else bad "public-host not propagated: $(cat "$RELAY_LOG" 2>/dev/null)"; fi
 
 SF="$D/.heimdall/app/connect.json"
 if [ -f "$SF" ]; then
   ok "connect.json written for relay mode"
-  [ "$(jq -r '.mode // empty' "$SF" 2>/dev/null)" = "relay" ] && ok "connect.json mode == relay" || bad "mode=$(jq -r '.mode // empty' "$SF" 2>/dev/null)"
-  [ "$(jq -r '.relay // empty' "$SF" 2>/dev/null)" = "$RELAY_URL" ] && ok "connect.json relay == $RELAY_URL" || bad "relay mismatch: $(jq -c . "$SF" 2>/dev/null)"
+  if [ "$(jq -r '.mode // empty' "$SF" 2>/dev/null)" = "relay" ]; then ok "connect.json mode == relay"; else bad "mode=$(jq -r '.mode // empty' "$SF" 2>/dev/null)"; fi
+  if [ "$(jq -r '.relay // empty' "$SF" 2>/dev/null)" = "$RELAY_URL" ]; then ok "connect.json relay == $RELAY_URL"; else bad "relay mismatch: $(jq -c . "$SF" 2>/dev/null)"; fi
   if grep -q '"token"' "$SF" 2>/dev/null; then bad "connect.json LEAKS a token key"; else ok "connect.json never contains a token key"; fi
 else
   bad "connect.json missing at $SF"
@@ -1485,42 +1487,42 @@ fi
 RSF="$D/.heimdall/app/relay.json"
 if [ -f "$RSF" ]; then
   ok "relay.json status file written"
-  [ "$(jq -r '.session_id // empty' "$RSF" 2>/dev/null)" = "fake-session-0001" ] && ok "relay.json session_id readable" || bad "session_id mismatch: $(jq -c . "$RSF" 2>/dev/null)"
-  [ "$(jq -r '.paired // empty' "$RSF" 2>/dev/null)" = "true" ] && ok "relay.json paired == true after device_bound" || bad "paired=$(jq -r '.paired // empty' "$RSF" 2>/dev/null)"
+  if [ "$(jq -r '.session_id // empty' "$RSF" 2>/dev/null)" = "fake-session-0001" ]; then ok "relay.json session_id readable"; else bad "session_id mismatch: $(jq -c . "$RSF" 2>/dev/null)"; fi
+  if [ "$(jq -r '.paired // empty' "$RSF" 2>/dev/null)" = "true" ]; then ok "relay.json paired == true after device_bound"; else bad "paired=$(jq -r '.paired // empty' "$RSF" 2>/dev/null)"; fi
 else
   bad "relay.json missing at $RSF"
 fi
 
 STATUS_OUT="$("$APP" status --repo "$D" 2>&1)"
 SRC=$?
-[ "$SRC" -eq 0 ] && ok "status exits 0 for a healthy relay session" || bad "status exit $SRC: $STATUS_OUT"
-printf '%s' "$STATUS_OUT" | grep -q 'mode: relay' && ok "status prints mode: relay" || bad "status missing mode line: $STATUS_OUT"
-printf '%s' "$STATUS_OUT" | grep -q "relay: $RELAY_URL" && ok "status prints the relay URL" || bad "status missing relay URL: $STATUS_OUT"
-printf '%s' "$STATUS_OUT" | grep -q 'session id: fake-session-0001' && ok "status prints the session id" || bad "status missing session id: $STATUS_OUT"
-printf '%s' "$STATUS_OUT" | grep -q 'paired: yes' && ok "status prints paired: yes" || bad "status missing paired: $STATUS_OUT"
-printf '%s' "$STATUS_OUT" | grep -q 'frames sent: 3' && ok "status prints frames_sent from relay.json" || bad "status missing frames_sent: $STATUS_OUT"
-printf '%s' "$STATUS_OUT" | grep -q 'last seq: 7' && ok "status prints last_seq from relay.json" || bad "status missing last_seq: $STATUS_OUT"
-printf '%s' "$STATUS_OUT" | grep -q '2026-09-23T00:00:00Z' && ok "status prints last_delivered from relay.json" || bad "status missing last_delivered: $STATUS_OUT"
-printf '%s' "$STATUS_OUT" | grep -q 'client pid:.*running' && ok "status shows the relay client as running" || bad "status client-alive mismatch: $STATUS_OUT"
-printf '%s' "$STATUS_OUT" | grep -q 'ui pid:.*running' && ok "status shows heimdall-ui as running" || bad "status ui-alive mismatch: $STATUS_OUT"
+if [ "$SRC" -eq 0 ]; then ok "status exits 0 for a healthy relay session"; else bad "status exit $SRC: $STATUS_OUT"; fi
+if printf '%s' "$STATUS_OUT" | grep -q 'mode: relay'; then ok "status prints mode: relay"; else bad "status missing mode line: $STATUS_OUT"; fi
+if printf '%s' "$STATUS_OUT" | grep -q "relay: $RELAY_URL"; then ok "status prints the relay URL"; else bad "status missing relay URL: $STATUS_OUT"; fi
+if printf '%s' "$STATUS_OUT" | grep -q 'session id: fake-session-0001'; then ok "status prints the session id"; else bad "status missing session id: $STATUS_OUT"; fi
+if printf '%s' "$STATUS_OUT" | grep -q 'paired: yes'; then ok "status prints paired: yes"; else bad "status missing paired: $STATUS_OUT"; fi
+if printf '%s' "$STATUS_OUT" | grep -q 'frames sent: 3'; then ok "status prints frames_sent from relay.json"; else bad "status missing frames_sent: $STATUS_OUT"; fi
+if printf '%s' "$STATUS_OUT" | grep -q 'last seq: 7'; then ok "status prints last_seq from relay.json"; else bad "status missing last_seq: $STATUS_OUT"; fi
+if printf '%s' "$STATUS_OUT" | grep -q '2026-09-23T00:00:00Z'; then ok "status prints last_delivered from relay.json"; else bad "status missing last_delivered: $STATUS_OUT"; fi
+if printf '%s' "$STATUS_OUT" | grep -q 'client pid:.*running'; then ok "status shows the relay client as running"; else bad "status client-alive mismatch: $STATUS_OUT"; fi
+if printf '%s' "$STATUS_OUT" | grep -q 'ui pid:.*running'; then ok "status shows heimdall-ui as running"; else bad "status ui-alive mismatch: $STATUS_OUT"; fi
 
 DISC_OUT="$TMPROOT/disconnect-relay-online.out"
 "$APP" disconnect --repo "$D" >"$DISC_OUT" 2>&1
 DRC=$?
-[ "$DRC" -eq 0 ] && ok "disconnect exits 0 for a cooperative relay client" || bad "disconnect exit $DRC: $(cat "$DISC_OUT")"
+if [ "$DRC" -eq 0 ]; then ok "disconnect exits 0 for a cooperative relay client"; else bad "disconnect exit $DRC: $(cat "$DISC_OUT")"; fi
 
 DISC_WAITED=0
 while [ ! -f "$TERM_MARKER" ] && [ "$DISC_WAITED" -lt 30 ]; do
   sleep 0.1
   DISC_WAITED=$((DISC_WAITED + 1))
 done
-[ -f "$TERM_MARKER" ] && ok "relay client's TERM handler ran (marker file written)" || bad "TERM marker never appeared"
-[ -f "$SF" ] && bad "connect.json still present after disconnect" || ok "connect.json removed after disconnect"
-[ -f "$RSF" ] && bad "relay.json still present after disconnect" || ok "relay.json removed after disconnect"
+if [ -f "$TERM_MARKER" ]; then ok "relay client's TERM handler ran (marker file written)"; else bad "TERM marker never appeared"; fi
+if [ -f "$SF" ]; then bad "connect.json still present after disconnect"; else ok "connect.json removed after disconnect"; fi
+if [ -f "$RSF" ]; then bad "relay.json still present after disconnect"; else ok "relay.json removed after disconnect"; fi
 
 wait "$FG_PID"
 RC=$?
-[ "$RC" -eq 0 ] && ok "relay connect (foreground) exits 0 once the client session ends" || bad "exit $RC: $(cat "$OUT_FILE")"
+if [ "$RC" -eq 0 ]; then ok "relay connect (foreground) exits 0 once the client session ends"; else bad "exit $RC: $(cat "$OUT_FILE")"; fi
 rm -rf "$D"
 
 # ── relay mode: client exits 11 (E2E unavailable) before pair_init ────────
@@ -1547,14 +1549,14 @@ fi
 
 wait "$FG_PID"
 RC=$?
-[ "$RC" -eq 11 ] && ok "connect exits 11 when the relay client can't start (E2E unavailable)" || bad "exit $RC (want 11): $(cat "$OUT_FILE")"
-grep -q 'relay E2E unavailable' "$OUT_FILE" && ok "connect surfaces the client's stderr on exit 11" || bad "stderr not surfaced: $(cat "$OUT_FILE")"
+if [ "$RC" -eq 11 ]; then ok "connect exits 11 when the relay client can't start (E2E unavailable)"; else bad "exit $RC (want 11): $(cat "$OUT_FILE")"; fi
+if grep -q 'relay E2E unavailable' "$OUT_FILE"; then ok "connect surfaces the client's stderr on exit 11"; else bad "stderr not surfaced: $(cat "$OUT_FILE")"; fi
 if [ -n "$FG_UI_PID" ] && kill -0 "$FG_UI_PID" 2>/dev/null; then
   bad "ui process still alive after connect exited 11"
 else
   ok "ui process stopped after connect exited 11"
 fi
-[ -f "$SF" ] && bad "connect.json still present after exit 11" || ok "connect.json removed after exit 11"
+if [ -f "$SF" ]; then bad "connect.json still present after exit 11"; else ok "connect.json removed after exit 11"; fi
 rm -rf "$D"
 
 # ── relay mode: client exits 12 (relay unreachable) before pair_init ──────
@@ -1581,14 +1583,14 @@ fi
 
 wait "$FG_PID"
 RC=$?
-[ "$RC" -eq 12 ] && ok "connect exits 12 when the relay is unreachable" || bad "exit $RC (want 12): $(cat "$OUT_FILE")"
-grep -q 'relay unreachable' "$OUT_FILE" && ok "connect surfaces the client's stderr on exit 12" || bad "stderr not surfaced: $(cat "$OUT_FILE")"
+if [ "$RC" -eq 12 ]; then ok "connect exits 12 when the relay is unreachable"; else bad "exit $RC (want 12): $(cat "$OUT_FILE")"; fi
+if grep -q 'relay unreachable' "$OUT_FILE"; then ok "connect surfaces the client's stderr on exit 12"; else bad "stderr not surfaced: $(cat "$OUT_FILE")"; fi
 if [ -n "$FG_UI_PID" ] && kill -0 "$FG_UI_PID" 2>/dev/null; then
   bad "ui process still alive after connect exited 12"
 else
   ok "ui process stopped after connect exited 12"
 fi
-[ -f "$SF" ] && bad "connect.json still present after exit 12" || ok "connect.json removed after exit 12"
+if [ -f "$SF" ]; then bad "connect.json still present after exit 12"; else ok "connect.json removed after exit 12"; fi
 rm -rf "$D"
 
 # ── relay mode: disconnect when the client ignores TERM -> force-kill,
@@ -1598,7 +1600,7 @@ OUT_FILE="$TMPROOT/connect-relay-ignoreterm.out"
 HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=ignore-term \
   "$APP" connect --repo "$D" --port 0 --no-code --relay "https://relay.example.com" --bg >"$OUT_FILE" 2>&1
 RC=$?
-[ "$RC" -eq 0 ] && ok "relay connect --bg (ignore-term client) exits 0" || bad "exit $RC: $(cat "$OUT_FILE")"
+if [ "$RC" -eq 0 ]; then ok "relay connect --bg (ignore-term client) exits 0"; else bad "exit $RC: $(cat "$OUT_FILE")"; fi
 
 SF="$D/.heimdall/app/connect.json"
 IT_CLIENT_PID="$(jq -r '.pid_client // empty' "$SF" 2>/dev/null)"
@@ -1612,8 +1614,8 @@ fi
 DISC_OUT="$TMPROOT/disconnect-relay-ignoreterm.out"
 HMD_RELAY_STOP_TIMEOUT_S=2 "$APP" disconnect --repo "$D" >"$DISC_OUT" 2>&1
 DRC=$?
-[ "$DRC" -eq 8 ] && ok "disconnect exits 8 when the relay client ignores TERM" || bad "disconnect exit $DRC (want 8): $(cat "$DISC_OUT")"
-grep -q 'revoke may not have reached the relay' "$DISC_OUT" && ok "disconnect prints the revoke-may-not-have-reached warning" || bad "warning missing: $(cat "$DISC_OUT")"
+if [ "$DRC" -eq 8 ]; then ok "disconnect exits 8 when the relay client ignores TERM"; else bad "disconnect exit $DRC (want 8): $(cat "$DISC_OUT")"; fi
+if grep -q 'revoke may not have reached the relay' "$DISC_OUT"; then ok "disconnect prints the revoke-may-not-have-reached warning"; else bad "warning missing: $(cat "$DISC_OUT")"; fi
 
 if [ -n "$IT_CLIENT_PID" ] && kill -0 "$IT_CLIENT_PID" 2>/dev/null; then
   bad "relay client still alive after force-kill disconnect"
@@ -1625,8 +1627,8 @@ if [ -n "$IT_UI_PID" ] && kill -0 "$IT_UI_PID" 2>/dev/null; then
 else
   ok "ui process stopped by force-kill disconnect"
 fi
-[ -f "$SF" ] && bad "connect.json still present after disconnect" || ok "connect.json removed after disconnect"
-[ -f "$D/.heimdall/app/relay.json" ] && bad "relay.json still present after disconnect" || ok "relay.json removed after disconnect"
+if [ -f "$SF" ]; then bad "connect.json still present after disconnect"; else ok "connect.json removed after disconnect"; fi
+if [ -f "$D/.heimdall/app/relay.json" ]; then bad "relay.json still present after disconnect"; else ok "relay.json removed after disconnect"; fi
 rm -rf "$D"
 
 # ── doctor --relay: reachable relay (loopback python http.server) -> ok ──
@@ -1654,9 +1656,9 @@ if [ -n "$DOCTOR_SRV_PORT" ]; then
   DOUT="$TMPROOT/doctor-relay-ok.out"
   "$APP" doctor --repo "$D" --relay "http://127.0.0.1:${DOCTOR_SRV_PORT}" >"$DOUT" 2>&1
   DRC=$?
-  [ "$DRC" -eq 0 ] && ok "doctor --relay exits 0 against a reachable loopback server" || bad "doctor exit $DRC: $(cat "$DOUT")"
-  grep -Eq '^ok +relay reachable' "$DOUT" && ok "doctor prints 'ok relay reachable'" || bad "relay-reachable ok line missing: $(cat "$DOUT")"
-  grep -Eq '^skip +tailscale installed \(relay mode\)' "$DOUT" && ok "doctor skips tailscale checks in relay mode" || bad "tailscale skip line missing: $(cat "$DOUT")"
+  if [ "$DRC" -eq 0 ]; then ok "doctor --relay exits 0 against a reachable loopback server"; else bad "doctor exit $DRC: $(cat "$DOUT")"; fi
+  if grep -Eq '^ok +relay reachable' "$DOUT"; then ok "doctor prints 'ok relay reachable'"; else bad "relay-reachable ok line missing: $(cat "$DOUT")"; fi
+  if grep -Eq '^skip +tailscale installed \(relay mode\)' "$DOUT"; then ok "doctor skips tailscale checks in relay mode"; else bad "tailscale skip line missing: $(cat "$DOUT")"; fi
 else
   bad "loopback python http.server never printed a port"
 fi
@@ -1669,9 +1671,9 @@ D="$(make_repo)"
 DOUT="$TMPROOT/doctor-relay-fail.out"
 "$APP" doctor --repo "$D" --relay "https://127.0.0.1:1" >"$DOUT" 2>&1
 DRC=$?
-[ "$DRC" -eq 1 ] && ok "doctor --relay exits 1 (FAIL) against an unreachable relay" || bad "doctor exit $DRC (want 1): $(cat "$DOUT")"
-grep -Eq '^FAIL +relay reachable' "$DOUT" && ok "doctor prints 'FAIL relay reachable'" || bad "FAIL line missing: $(cat "$DOUT")"
-grep -qi 'relay unreachable' "$DOUT" && ok "doctor prints the relay-unreachable fix hint" || bad "fix hint missing: $(cat "$DOUT")"
+if [ "$DRC" -eq 1 ]; then ok "doctor --relay exits 1 (FAIL) against an unreachable relay"; else bad "doctor exit $DRC (want 1): $(cat "$DOUT")"; fi
+if grep -Eq '^FAIL +relay reachable' "$DOUT"; then ok "doctor prints 'FAIL relay reachable'"; else bad "FAIL line missing: $(cat "$DOUT")"; fi
+if grep -qi 'relay unreachable' "$DOUT"; then ok "doctor prints the relay-unreachable fix hint"; else bad "fix hint missing: $(cat "$DOUT")"; fi
 rm -rf "$D"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
