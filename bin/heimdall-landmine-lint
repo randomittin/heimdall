@@ -202,9 +202,12 @@ _RE_TTY_TEST='(!?[[:space:]]*-t[[:space:]]+0)'
 # and drops the whole class-5 finding. `([^A-Za-z0-9_]|$)` is the boundary the
 # preceding word char implies, and it restored the byte-identical finding set.
 _RE_REMOVE_PLUGIN='_heimdall_remove_plugin([^A-Za-z0-9_]|$)'
+# shellcheck disable=SC2016  # ERE source text: the \$ is a literal dollar for =~, so single quotes are deliberate
 _RE_RM_SELF='rm[[:space:]]+-rf[[:space:]]+"?\$(\{)?(0|PLUGIN_DIR|HEIMDALL_HOME)'
+# shellcheck disable=SC2016  # ERE source text: the \$ is a literal dollar for =~, so single quotes are deliberate
 _RE_RM_DOTHEIMDALL='rm[[:space:]]+-rf[[:space:]].*\$HOME/\.heimdall'
 _RE_SOURCE_VERB='(^|[;&]|then|do|else)[[:space:]]*(source|\.)[[:space:]]+'
+# shellcheck disable=SC2016  # ERE source text: the \$ is a literal dollar for =~, so single quotes are deliberate
 _RE_SOURCE_TARGET='\$(\{)?(PLUGIN_DIR|HEIMDALL_HOME|HOME)|\.heimdall|\$0'
 
 # Delete every match of $2 from $1 without forking sed — `s/RE//g` semantics exactly.
@@ -282,10 +285,12 @@ scan_sigpipe() {
   file_is_strict "$file" || return 0
   # Fast bail: no command substitution in this file — nothing to scan.
   grep -qE '\$\(|`' "$file" 2>/dev/null || return 0
+  # shellcheck disable=SC2094  # emit() only prints a finding about $file; nothing in this loop writes to it
   while IFS= read -r line; do
     lineno=$((lineno + 1))
     is_comment "$line" && continue
     # Must be inside a command substitution / assignment context.
+    # shellcheck disable=SC2016  # case pattern: the literal text '$(' is what is being searched for
     case "$line" in
       *'$('*|*'`'*) : ;;
       *) continue ;;
@@ -319,6 +324,7 @@ scan_unguarded_var() {
   local file="$1" line lineno=0
   # Fast bail: no local/declare in this file.
   grep -qE '\blocal\b|\bdeclare\b' "$file" 2>/dev/null || return 0
+  # shellcheck disable=SC2094  # emit() only prints a finding about $file; nothing in this loop writes to it
   while IFS= read -r line; do
     lineno=$((lineno + 1))
     is_comment "$line" && continue
@@ -420,6 +426,7 @@ scan_baked_path() {
   file_is_shell "$file" || return 0
   # Fast bail: no home-literal or /superx path anywhere in this file.
   grep -qE '/(Users|home)/[A-Za-z]|/superx' "$file" 2>/dev/null || return 0
+  # shellcheck disable=SC2094  # emit() only prints a finding about $file; nothing in this loop writes to it
   while IFS= read -r line; do
     lineno=$((lineno + 1))
     is_comment "$line" && continue

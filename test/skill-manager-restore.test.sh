@@ -32,6 +32,7 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
+# shellcheck source=lib/net-default-guard.sh disable=SC1091  # sibling helper test/lib/net-default-guard.sh; plain shellcheck (no -x) never opens sourced files
 . "$REPO/test/lib/net-default-guard.sh"
 
 PASS=0; FAIL=0
@@ -145,7 +146,7 @@ clean_state() {
   case "$STATE_DIR" in "$TMP"/*) ;; *) echo "FATAL: state dir escaped the sandbox: $STATE_DIR"; exit 1 ;; esac
   rm -f "$STATE_DIR"/* "$STATE_DIR"/.lock 2>/dev/null || true
 }
-state_count() { ls "$STATE_DIR"/*.json 2>/dev/null | wc -l | tr -d ' '; }
+state_count() { find "$STATE_DIR" -maxdepth 1 -name '*.json' ! -name '.*' 2>/dev/null | wc -l | tr -d ' '; }
 # stale_left -- how many of the seeded fake-owner restore files (pids 20000000NN) are still in the state dir.
 stale_left() { find "$STATE_DIR" -maxdepth 1 -name '20000000*' | wc -l | tr -d ' '; }
 
@@ -230,22 +231,28 @@ reset_settings; clean_state
 new_live_pid; K1=$LIVE
 RF1="$(sm restore-file "$K1")"
 ACT_OUT="$(sm activate "$PLAIN" "$RF1" 2>&1)"
-[ "$(plugins)" = "demand@t=off extra@t=off fe@t=off perm@t=on rev@t=off" ] \
-  && ok "activate paused the plugins the project does not need" \
-  || bad "after activate: $(plugins)"
+if [ "$(plugins)" = "demand@t=off extra@t=off fe@t=off perm@t=on rev@t=off" ]; then
+  ok "activate paused the plugins the project does not need"
+else
+  bad "after activate: $(plugins)"
+fi
 case "$ACT_OUT" in *"Skills:"*) ok "activate prints the Skills summary" ;; *) bad "no Skills summary: [$ACT_OUT]" ;; esac
-[ -f "$RF1" ] \
-  && ok "activate wrote the restore file at exactly the path restore-file named" \
-  || bad "no restore file at [$RF1] -- activate and restore-file disagree (THE bug)"
+if [ -f "$RF1" ]; then
+  ok "activate wrote the restore file at exactly the path restore-file named"
+else
+  bad "no restore file at [$RF1] -- activate and restore-file disagree (THE bug)"
+fi
 sm restore "$RF1"; RC=$?
-[ "$RC" -eq 0 ] && same_as_s0 \
-  && ok "restore puts settings.json back BYTE for byte (rc 0)" \
-  || bad "after restore rc=$RC plugins=[$(plugins)] (want $S0_PLUGINS)"
-[ ! -e "$RF1" ] && ok "restore deletes the restore file it consumed" || bad "restore left $RF1 behind"
+if [ "$RC" -eq 0 ] && same_as_s0; then
+  ok "restore puts settings.json back BYTE for byte (rc 0)"
+else
+  bad "after restore rc=$RC plugins=[$(plugins)] (want $S0_PLUGINS)"
+fi
+if [ ! -e "$RF1" ]; then ok "restore deletes the restore file it consumed"; else bad "restore left $RF1 behind"; fi
 sm restore "$RF1"; RC=$?
-[ "$RC" -eq 0 ] && same_as_s0 && ok "a second restore is a harmless no-op (rc 0)" || bad "second restore rc=$RC, plugins=[$(plugins)]"
+if [ "$RC" -eq 0 ] && same_as_s0; then ok "a second restore is a harmless no-op (rc 0)"; else bad "second restore rc=$RC, plugins=[$(plugins)]"; fi
 sm restore "$STATE_DIR/987654.json"; RC=$?
-[ "$RC" -eq 0 ] && same_as_s0 && ok "restore of a file that never existed is a no-op (rc 0)" || bad "restore of a missing file rc=$RC"
+if [ "$RC" -eq 0 ] && same_as_s0; then ok "restore of a file that never existed is a no-op (rc 0)"; else bad "restore of a missing file rc=$RC"; fi
 
 # A change made DURING the session survives the restore: only what this launch changed is undone.
 reset_settings; clean_state
@@ -263,11 +270,16 @@ with open(p, "w") as f:
     f.write("\n")
 PY
 sm restore "$RF2" >/dev/null 2>&1
-[ "$(plugins)" = "demand@t=on extra@t=on fe@t=off new@t=on perm@t=on rev@t=on" ] \
-  && ok "restore undoes only this launch's changes: a mid-session install and toggle survive" \
-  || bad "after a mid-session edit + restore: $(plugins)"
-[ "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['model'])" "$SETTINGS")" = "sonnet" ] \
-  && ok "restore leaves unrelated settings alone" || bad "restore reverted an unrelated setting"
+if [ "$(plugins)" = "demand@t=on extra@t=on fe@t=off new@t=on perm@t=on rev@t=on" ]; then
+  ok "restore undoes only this launch's changes: a mid-session install and toggle survive"
+else
+  bad "after a mid-session edit + restore: $(plugins)"
+fi
+if [ "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['model'])" "$SETTINGS")" = "sonnet" ]; then
+  ok "restore leaves unrelated settings alone"
+else
+  bad "restore reverted an unrelated setting"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo "3. through the REAL launcher: the pause lasts exactly as long as the session"
@@ -290,14 +302,16 @@ for SHAPE in "task prompt" interactive "--resume"; do
   else
     bad "$SHAPE: rc=$RC, plugins afterwards [$(plugins)] (want $S0_PLUGINS) -- skills left un-restored"
   fi
-  [ "$(state_count)" = "0" ] && ok "$SHAPE: no restore file left behind" || bad "$SHAPE: $(state_count) restore file(s) left in $STATE_DIR"
+  if [ "$(state_count)" = "0" ]; then ok "$SHAPE: no restore file left behind"; else bad "$SHAPE: $(state_count) restore file(s) left in $STATE_DIR"; fi
 done
 
 reset_settings; clean_state
 STUB_CLAUDE_RC=3 run_launcher "$PLAIN" "fix the bug in x"; RC=$?
-[ "$RC" -eq 3 ] && same_as_s0 \
-  && ok "claude exits 3: the launcher still exits 3 AND restores the skills" \
-  || bad "claude exits 3: launcher rc=$RC, plugins [$(plugins)]"
+if [ "$RC" -eq 3 ] && same_as_s0; then
+  ok "claude exits 3: the launcher still exits 3 AND restores the skills"
+else
+  bad "claude exits 3: launcher rc=$RC, plugins [$(plugins)]"
+fi
 
 # The invariant itself, with a recording stub in place of skill-manager: the path the launcher
 # got from restore-file is the one it hands to activate AND to restore -- and if there is no path,
@@ -355,16 +369,20 @@ for ORDER in "B A" "A B"; do
   else
     bad "[exit $ORDER] restore files: A=[$RFA] B=[$RFB] ($(state_count) in $STATE_DIR)"
   fi
-  [ "$(plugins)" = "demand@t=off extra@t=off fe@t=on perm@t=on rev@t=off" ] \
-    && ok "[exit $ORDER] B's own project got its own plugin (fe@t on) over A's pause" \
-    || bad "[exit $ORDER] while both run: $(plugins)"
+  if [ "$(plugins)" = "demand@t=off extra@t=off fe@t=on perm@t=on rev@t=off" ]; then
+    ok "[exit $ORDER] B's own project got its own plugin (fe@t on) over A's pause"
+  else
+    bad "[exit $ORDER] while both run: $(plugins)"
+  fi
   for W in $ORDER; do
     case "$W" in A) sm restore "$RFA" ;; B) sm restore "$RFB" ;; esac
   done
-  same_as_s0 \
-    && ok "[exit $ORDER] once both have left the original set is back, byte for byte" \
-    || bad "[exit $ORDER] settings left as [$(plugins)] (want $S0_PLUGINS)"
-  [ "$(state_count)" = "0" ] && ok "[exit $ORDER] both restore files consumed" || bad "[exit $ORDER] $(state_count) file(s) left"
+  if same_as_s0; then
+    ok "[exit $ORDER] once both have left the original set is back, byte for byte"
+  else
+    bad "[exit $ORDER] settings left as [$(plugins)] (want $S0_PLUGINS)"
+  fi
+  if [ "$(state_count)" = "0" ]; then ok "[exit $ORDER] both restore files consumed"; else bad "[exit $ORDER] $(state_count) file(s) left"; fi
 done
 
 # The same, through two REAL launchers held open inside claude at the same time. A leaves first:
@@ -387,14 +405,16 @@ for F in "$STATE_DIR"/*.json; do
   OWNER="$(basename "$F" .json)"
   case "$OWNER" in ''|*[!0-9]*) ;; *) kill -0 "$OWNER" 2>/dev/null && ALIVE_OWNERS=$((ALIVE_OWNERS + 1)) ;; esac
 done
-[ "$ALIVE_OWNERS" -eq 2 ] && ok "each file is named for a live launcher pid" || bad "$ALIVE_OWNERS of 2 restore files name a live process"
+if [ "$ALIVE_OWNERS" -eq 2 ]; then ok "each file is named for a live launcher pid"; else bad "$ALIVE_OWNERS of 2 restore files name a live process"; fi
 : > "$TMP/go-a"; wait "$PA"; RCA=$?
 : > "$TMP/go-b"; wait "$PB"; RCB=$?
-[ "$RCA" -eq 0 ] && [ "$RCB" -eq 0 ] && ok "both launchers exit 0" || bad "launcher exits: A=$RCA B=$RCB"
-same_as_s0 \
-  && ok "the first launch to leave does not leave the other's pause behind: original set restored" \
-  || bad "after both launches ended: [$(plugins)] (want $S0_PLUGINS)"
-[ "$(state_count)" = "0" ] && ok "no restore file left" || bad "$(state_count) restore file(s) left"
+if [ "$RCA" -eq 0 ] && [ "$RCB" -eq 0 ]; then ok "both launchers exit 0"; else bad "launcher exits: A=$RCA B=$RCB"; fi
+if same_as_s0; then
+  ok "the first launch to leave does not leave the other's pause behind: original set restored"
+else
+  bad "after both launches ended: [$(plugins)] (want $S0_PLUGINS)"
+fi
+if [ "$(state_count)" = "0" ]; then ok "no restore file left"; else bad "$(state_count) restore file(s) left"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo "5. a launcher that died: its stale file is recovered by the next session"
@@ -410,11 +430,13 @@ else
 fi
 new_live_pid; KL=$LIVE; RFL="$(sm restore-file "$KL")"
 sm activate "$FRONT" "$RFL" >/dev/null 2>&1                 # the NEXT session starts
-[ ! -e "$RFD" ] && ok "the next activate consumed the dead launcher's restore file" || bad "stale file [$RFD] still there after a later activate"
+if [ ! -e "$RFD" ]; then ok "the next activate consumed the dead launcher's restore file"; else bad "stale file [$RFD] still there after a later activate"; fi
 sm restore "$RFL" >/dev/null 2>&1
-same_as_s0 \
-  && ok "the next session restores the ORIGINAL set, not the crashed launch's paused one" \
-  || bad "after recovery + restore: [$(plugins)] (want $S0_PLUGINS)"
+if same_as_s0; then
+  ok "the next session restores the ORIGINAL set, not the crashed launch's paused one"
+else
+  bad "after recovery + restore: [$(plugins)] (want $S0_PLUGINS)"
+fi
 
 # Unreadable debris from a dead owner is dropped without hurting the activation; the same debris
 # from a LIVE owner is left alone (it may be mid-flight, and it is not ours to judge).
@@ -425,12 +447,15 @@ printf '{ not json' > "$STATE_DIR/$KD.json"
 printf '{ not json' > "$STATE_DIR/$KG.json"
 RFL="$(sm restore-file "$KL")"
 sm activate "$PLAIN" "$RFL" >/dev/null 2>&1; RC=$?
-[ "$RC" -eq 0 ] && [ "$(plugins)" = "demand@t=off extra@t=off fe@t=off perm@t=on rev@t=off" ] \
-  && ok "an unreadable stale file does not break the activation (rc 0)" || bad "activate over debris: rc=$RC plugins=[$(plugins)]"
-[ ! -e "$STATE_DIR/$KD.json" ] && ok "...and the dead owner's debris is removed" || bad "dead owner's unreadable file survived"
-[ -e "$STATE_DIR/$KG.json" ] && ok "...while a live owner's file is never swept" || bad "a LIVE owner's restore file was swept"
+if [ "$RC" -eq 0 ] && [ "$(plugins)" = "demand@t=off extra@t=off fe@t=off perm@t=on rev@t=off" ]; then
+  ok "an unreadable stale file does not break the activation (rc 0)"
+else
+  bad "activate over debris: rc=$RC plugins=[$(plugins)]"
+fi
+if [ ! -e "$STATE_DIR/$KD.json" ]; then ok "...and the dead owner's debris is removed"; else bad "dead owner's unreadable file survived"; fi
+if [ -e "$STATE_DIR/$KG.json" ]; then ok "...while a live owner's file is never swept"; else bad "a LIVE owner's restore file was swept"; fi
 sm restore "$RFL" >/dev/null 2>&1
-same_as_s0 && ok "...and restore still round-trips" || bad "debris case: after restore [$(plugins)]"
+if same_as_s0; then ok "...and restore still round-trips"; else bad "debris case: after restore [$(plugins)]"; fi
 
 # The sweep is bounded: one activation recovers at most 64 stale files; the next takes the rest.
 reset_settings; clean_state
@@ -440,12 +465,12 @@ while [ "$I" -le 70 ]; do printf '{"t": 1.0, "changes": {}}' > "$STATE_DIR/$((20
 new_live_pid; KL=$LIVE; RFL="$(sm restore-file "$KL")"
 sm activate "$PLAIN" "$RFL" >/dev/null 2>&1
 LEFT="$(stale_left)"
-[ "$LEFT" = "6" ] && ok "one activation sweeps at most 64 stale files (70 -> 6 left)" || bad "$LEFT stale files left after one activation (want 6)"
+if [ "$LEFT" = "6" ]; then ok "one activation sweeps at most 64 stale files (70 -> 6 left)"; else bad "$LEFT stale files left after one activation (want 6)"; fi
 sm activate "$PLAIN" "$RFL" >/dev/null 2>&1
 LEFT="$(stale_left)"
-[ "$LEFT" = "0" ] && ok "...and the next activation finishes the job" || bad "$LEFT stale files left after the second activation"
+if [ "$LEFT" = "0" ]; then ok "...and the next activation finishes the job"; else bad "$LEFT stale files left after the second activation"; fi
 sm restore "$RFL" >/dev/null 2>&1
-same_as_s0 && ok "...with the skill set intact throughout" || bad "bounded-sweep case: after restore [$(plugins)]"
+if same_as_s0; then ok "...with the skill set intact throughout"; else bad "bounded-sweep case: after restore [$(plugins)]"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo "6. activate with nothing to activate stays quiet and leaves nothing behind"
@@ -458,7 +483,7 @@ else
   bad "no settings.json: rc=$RC out=[$NOSET_OUT]"
 fi
 env -i PATH="$PATH" HOME="$EMPTY_HOME" "$FAKE/bin/skill-manager" restore "$EMPTY_HOME/rf.json"; RC=$?
-[ "$RC" -eq 0 ] && ok "no settings.json: restore exits 0" || bad "no settings.json: restore rc=$RC"
+if [ "$RC" -eq 0 ]; then ok "no settings.json: restore exits 0"; else bad "no settings.json: restore rc=$RC"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo "7. syntax"
