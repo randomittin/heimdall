@@ -626,8 +626,10 @@ if [ "$A_UP" = 1 ] && [ "$B_UP" = 1 ]; then
       '[.edits.paths[] | (contains("a1.txt") or contains("README") or contains("alpha") or contains("stolen") or startswith("/") or startswith(".."))] | any | not' "$SB"
   chk "H2. alpha shows only alpha's edits: its ledger's entry INSIDE beta (a path out of alpha's root) is filtered out (S4)" \
       '.edits == {"count": 2, "paths": ["src/a1.txt", "README.md"]}' "$SA"
+  # shellcheck disable=SC2016  # jq program: $l is a jq variable, not a shell expansion
   chk "H3. beta's chat is beta's conversation only (S1, S5)" \
       '[.panels[] | select(.id=="chat") | .data.lines[]] as $l | ($l | length) == 2 and ($l | map(contains("beta")) | all) and ($l | map(contains("alpha")) | any | not)' "$SB"
+  # shellcheck disable=SC2016  # jq program: $l is a jq variable, not a shell expansion
   chk "H3b. alpha's chat is alpha's conversation only" \
       '[.panels[] | select(.id=="chat") | .data.lines[]] as $l | ($l | length) == 2 and ($l | map(contains("alpha")) | all) and ($l | map(contains("beta")) | any | not)' "$SA"
   chk "H4. attention follows each repo's own transcript: alpha needs_input (its question), beta idle (settled statement)" \
@@ -640,8 +642,10 @@ if [ "$A_UP" = 1 ] && [ "$B_UP" = 1 ]; then
       '.parallelism.turns == 11 and .parallelism.calls == 22 and .parallelism.source == "live"' "$SA"
   WANT_B_CODE="$(python3 "$SC_PY" --repo "$B_REAL")"
   WANT_A_SESS="$(python3 "$SC_PY" --session-id "$SID_A")"
+  # shellcheck disable=SC2016  # jq program: $a / $b are jq variables bound by --arg, not shell expansions
   chk "H6. beta's session code is its repo's code, never alpha's session's (S2, S5)" \
       '.identity.session_code == $b and .identity.session_code != $a' "$SB" --arg b "$WANT_B_CODE" --arg a "$WANT_A_SESS"
+  # shellcheck disable=SC2016  # jq program: $a is a jq variable bound by --arg, not a shell expansion
   chk "H6b. alpha (same repo as the inherited id) shows the code of that session" \
       '.identity.session_code == $a' "$SA" --arg a "$WANT_A_SESS"
   chk "H7. the hmd-question panel follows the same session: alpha's open question is alpha's, beta has none" \
@@ -716,7 +720,7 @@ else
     HMD_PUB_R="$(jq -r 'select(.event=="pair_init") | .qr.hmd_pubkey' "$CLIENT_OUT" | head -1)"
     KEY_R="$(python3 "$FAKE_RELAY" device derive --dev-priv-b64 "$DEV_PRIV_B64" --hmd-pub-b64 "$HMD_PUB_R" --session-id "$SID_R" | jq -r .key_b64)"
     # the FIRST frame can predate the poller's first publish: take the first one that carries the chat panel
-    python3 - "$LOG_R/frames.ndjson" "$KEY_R" "$E2E_MOD" "$STATE_R" <<'PYEOF'
+    if python3 - "$LOG_R/frames.ndjson" "$KEY_R" "$E2E_MOD" "$STATE_R" <<'PYEOF' && [ -s "$STATE_R" ]
 import base64, json, sys, time
 from importlib.util import module_from_spec, spec_from_file_location
 
@@ -747,7 +751,9 @@ while time.time() < deadline:
     time.sleep(0.2)
 sys.exit(1)
 PYEOF
-    [ "$?" -eq 0 ] && [ -s "$STATE_R" ] && GOT_STATE=true
+    then
+      GOT_STATE=true
+    fi
   fi
 
   if [ "$GOT_STATE" = true ]; then
