@@ -66,7 +66,21 @@ bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; [ $# -gt 1 
 skip() { SKIP=$((SKIP+1)); printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hmd-wrap.XXXXXX")"
-cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
+# THE LEAK THIS CLOSES: case 4q runs the --always shim, whose real chain step starts a fake proxy
+# (python http.server) and records its pid in $WORK/fakehome/.heimdall/headroom/proxy.pid. This
+# used to be `rm -rf "$WORK"` alone — it never read that pid file — so every full run left one
+# server alive forever (10 orphans, oldest 2d17h, found on 2026-10-06). Kill by recorded pid, and
+# by the one argv that names THIS run's private dir, before the dir goes.
+cleanup() {
+  local pf pid
+  for pf in "$WORK"/fakehome/.heimdall/headroom/proxy.pid "$WORK"/*/headroom/proxy.pid; do
+    [ -s "$pf" ] || continue
+    pid="$(cat "$pf" 2>/dev/null)"
+    case "$pid" in ''|*[!0-9]*) ;; *) kill "$pid" 2>/dev/null || true ;; esac
+  done
+  pkill -f "$WORK/headroomshim/fake_http_server.py" 2>/dev/null || true
+  rm -rf "$WORK" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 # The five tools §7 names. Pinned here rather than read out of the implementation:
@@ -680,6 +694,38 @@ grep -q "ABURL: unset" "$HRQ_TOOL_OUT" 2>/dev/null \
 grep -q "ABURL: unset" "$HRQ_TOOL_OUT" 2>/dev/null \
   && ok "4s headroom-absent stays fail-open through the shim (no export, tool still runs)" \
   || bad "4s the absent-module case broke or wrongly exported a base URL" "$(cat "$HRQ_TOOL_OUT" 2>/dev/null)"
+
+# 4t-4w: FAIL-SAFE ROUTING THROUGH THE SHIM (the 2026-10-06 outage). A session whose proxy has
+# died must launch DIRECT with a warning; a judge/fallback launch must fail loudly instead; an
+# operator's own base URL is never touched; a nested launch must not inherit a dead proxy URL.
+HRQ_DEAD=$((HRQ_PORT + 1))
+printf '#!/usr/bin/env bash\nexit 1\n' > "$HRQ/dead-headroom"; chmod +x "$HRQ/dead-headroom"
+shim_dead() { # shim_dead <errfile> [VAR=val ...] — run the shim with a proxy that cannot start
+  local errf="$1"; shift
+  : > "$HRQ_TOOL_OUT"
+  ( cd "$R4q" && env -u ANTHROPIC_BASE_URL -u HMD_JUDGMENT -u HEIMDALL_WRAP_SHIM_ACTIVE \
+      HOME="$WORK/fakehome" HEIMDALL_HOME="$WORK/fakehome/.heimdall" PATH="$HRQ/toolbin:$PATH" \
+      HMD_HEADROOM_BIN="$HRQ/dead-headroom" HMD_MODULES_STATE="$HRQ/modstate" HEADROOM_PORT="$HRQ_DEAD" \
+      HMD_HEADROOM_READY_POLLS=4 HMD_TOOL_OUT="$HRQ_TOOL_OUT" HEIMDALL_NO_INTRO=1 "$@" \
+      perl -e 'alarm 30; exec @ARGV or exit 127' -- "$SHIMQ" --version ) >/dev/null 2>"$errf"
+  SHIM_RC=$?
+}
+shim_dead "$HRQ/err4t" ANTHROPIC_BASE_URL="http://127.0.0.1:$HRQ_DEAD"
+{ [ "$SHIM_RC" = 0 ] && grep -q "ABURL: unset" "$HRQ_TOOL_OUT" && grep -q "headroom not routing" "$HRQ/err4t"; } \
+  && ok "4t proxy down + inherited proxy URL: the tool launches DIRECT (ABURL unset) with a stderr warning" \
+  || bad "4t a dead inherited proxy URL reached the tool" "rc=$SHIM_RC out=$(cat "$HRQ_TOOL_OUT") err=$(cat "$HRQ/err4t")"
+shim_dead "$HRQ/err4u" ANTHROPIC_BASE_URL="https://example.invalid"
+grep -q "ABURL: https://example.invalid" "$HRQ_TOOL_OUT" \
+  && ok "4u an operator's own ANTHROPIC_BASE_URL survives a dead proxy untouched" \
+  || bad "4u the operator's base URL was clobbered" "$(cat "$HRQ_TOOL_OUT")"
+shim_dead "$HRQ/err4v" HMD_JUDGMENT=1
+{ [ "$SHIM_RC" = 3 ] && [ ! -s "$HRQ_TOOL_OUT" ] && grep -q "REFUSING to run direct" "$HRQ/err4v"; } \
+  && ok "4v a judge launch (HMD_JUDGMENT=1) with the proxy down exits 3, loudly, and the tool NEVER runs" \
+  || bad "4v the judge launch fell back to direct or stayed silent" "rc=$SHIM_RC out=$(cat "$HRQ_TOOL_OUT") err=$(cat "$HRQ/err4v")"
+shim_dead "$HRQ/err4w" HEIMDALL_WRAP_SHIM_ACTIVE=claude ANTHROPIC_BASE_URL="http://127.0.0.1:$HRQ_DEAD"
+{ grep -q "ABURL: unset" "$HRQ_TOOL_OUT" && grep -q "dropped the inherited ANTHROPIC_BASE_URL" "$HRQ/err4w"; } \
+  && ok "4w the nested (re-entry) arm drops a dead inherited proxy URL instead of exec'ing into it" \
+  || bad "4w a nested launch inherited a dead proxy URL" "out=$(cat "$HRQ_TOOL_OUT") err=$(cat "$HRQ/err4w")"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. DEFAULT RESOLUTION — config → detection → asked once, remembered.

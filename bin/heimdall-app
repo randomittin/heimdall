@@ -143,6 +143,14 @@
 #                              `status` need no terminal. State, 0600: $HEIMDALL_HOME/remote-asks.json. `hmd app status` prints one
 #                              `remote asks:` line. Delegates to bin/lib/companion_remote_switches.py; the rest is
 #                              bin/lib/companion_quick_ask.py.
+#   hmd app remote-alerts on|off|status [--repo DIR]
+#                              Threshold alerts on a number tile (capability dash-alert-v1, which needs dash-v1): the phone
+#                              sets "tell me when this number crosses X" and this laptop evaluates it after every producer
+#                              run, then sends a push (kind tile_alert, capability push-tile-alert-v1) -- a sleeping laptop
+#                              evaluates nothing. Off by default; needs remote dashboards on and a push registration. `on`
+#                              refuses unless stdin is a terminal; `off` and `status` need no terminal. State, 0600:
+#                              $HEIMDALL_HOME/remote-alerts.json. Delegates to bin/lib/companion_remote_switches.py; the
+#                              alerts are bin/lib/dashboard_alerts.py.
 #   hmd app controls on|off|status [--repo DIR]
 #                              The paired phone's remote controls (capability
 #                              controls-v1: interrupt, save-checkpoint, hook-toggle,
@@ -2004,7 +2012,7 @@ case "$CMD" in
   disconnect) cmd_disconnect "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;
   remote-login) cmd_remote_login "$@"; exit $? ;;
-  remote-launch|remote-merge|launch-allow|remote-dashboards|remote-asks) cmd_remote_switches "$CMD" "$@"; exit $? ;;
+  remote-launch|remote-merge|launch-allow|remote-dashboards|remote-asks|remote-alerts) cmd_remote_switches "$CMD" "$@"; exit $? ;;
   controls) cmd_controls "$@"; exit $? ;;
   push-test) cmd_push_test "$@"; exit $? ;;
   *)

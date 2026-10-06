@@ -178,6 +178,22 @@ if command -v heimdall-fallback >/dev/null 2>&1; then
 fi
 
 if [ -n "$FALLBACK_URL" ]; then
+  # FALLBACK ROUTING IS A REQUIRED ROUTE. The gate said ROUTE a moment ago, but a gateway that has
+  # since died would otherwise be launched into (ECONNREFUSED on the first request, mid-session,
+  # with nothing explaining why) — and "just go direct" is exactly what a fallback session must
+  # never do: it is only chosen because the direct path is exhausted. So probe it (<=1s) and, if it
+  # is not answering, fail LOUDLY with a non-zero exit before any tool starts. curl exit 0 means
+  # an HTTP server answered, whatever the status: liveness, not health.
+  _fb_rc=0
+  curl -s -o /dev/null --connect-timeout 0.3 --max-time 1 "$FALLBACK_URL/" 2>/dev/null || _fb_rc=$?
+  if [ "$_fb_rc" -ne 0 ]; then
+    _fb_owner=""
+    chain_available && _fb_owner="$(hmd_headroom_port_owner "${FALLBACK_URL##*:}" 2>/dev/null || true)"
+    printf 'hmd route: the OmniRoute fallback gateway %s is not answering (curl exit %s%s) — REFUSING to launch. A fallback session never falls back to a direct connection; start the gateway, or run `hmd fallback off` to leave fallback routing.\n' \
+      "$FALLBACK_URL" "$_fb_rc" "${_fb_owner:+; port held by $_fb_owner}" >&2
+    exit 3
+  fi
+  unset _fb_rc
   FALLBACK_TOKEN_FILE="$(heimdall-fallback --repo "$PWD" token-file 2>/dev/null || true)"
   if [ -n "$FALLBACK_TOKEN_FILE" ] && [ -r "$FALLBACK_TOKEN_FILE" ]; then
     # Read into the child's env only. Never echoed, never logged, never in argv.
@@ -260,12 +276,18 @@ if command -v heimdall-fallback >/dev/null 2>&1 && [ -n "${ANTHROPIC_AUTH_TOKEN:
   unset _tf
 fi
 
-if route_now && [ -n "${HMD_HEADROOM_BASE_URL:-}" ]; then
+route_rc=0
+route_now || route_rc=$?
+# rc 3: the proxy is REQUIRED for this launch (a judge, or fallback routing) and is down. The chain
+# already said so on stderr; the launch fails here and never proceeds on a direct connection.
+[ "$route_rc" -eq 3 ] && exit 3
+if [ "$route_rc" -eq 0 ] && [ -n "${HMD_HEADROOM_BASE_URL:-}" ]; then
   printf "  ${G}✓${R} ${D}headroom: generation routed via %s — judgment is not (hmd route --status)${R}\n" \
     "$HMD_HEADROOM_BASE_URL" >&2
   export ANTHROPIC_BASE_URL="$HMD_HEADROOM_BASE_URL"
 else
-  printf "  ${D}· headroom: not routing — %s${R}\n" "${HMD_HEADROOM_WHY:-no reason reported}" >&2
+  [ "${HMD_HEADROOM_WARNED:-0}" = 1 ] || \
+    printf "  ${D}· headroom: not routing — %s${R}\n" "${HMD_HEADROOM_WHY:-no reason reported}" >&2
   # FAIL-OPEN means "launch anyway", never "launch anyway, still routed". Without this,
   # a value the child would otherwise inherit ambiently (a previous manual export, an
   # outer shell already routed by its own `hmd route` invocation, a stale session) rides

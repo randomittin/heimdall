@@ -54,15 +54,37 @@ HMD_HEADROOM_UPSTREAM="https://api.anthropic.com"
 # the variable Headroom itself documents — we do not invent a second name for it.
 HMD_HEADROOM_DEFAULT_PORT=8787
 
-# Readiness ceiling: 60 polls x 0.25s = 15s. Measured cold start on this machine is ~2.2s.
-# A ceiling is not a nicety here; it is the difference between "hmd is slow to start" and
-# "hmd hangs", and only one of those is survivable.
-HMD_HEADROOM_READY_POLLS=60
+# Readiness ceiling: 60 polls x 0.25s = 15s. Measured cold start on this machine is ~2.2s
+# (and ~11s under swap pressure on 2026-10-06). A ceiling is not a nicety here; it is the
+# difference between "hmd is slow to start" and "hmd hangs", and only one of those is
+# survivable. Overridable so a suite can shorten it; the wall-clock bound in the readiness
+# loop is derived from it, so the two can never disagree.
+HMD_HEADROOM_READY_POLLS="${HMD_HEADROOM_READY_POLLS:-60}"
+case "$HMD_HEADROOM_READY_POLLS" in ''|*[!0-9]*) HMD_HEADROOM_READY_POLLS=60 ;; esac
+
+# THE PROBE BUDGET. A launch must never be held by a sick listener, so every probe is bounded
+# twice: --connect-timeout (nothing there / backlog full) and --max-time (accepts but never
+# answers). 1s is the WHOLE budget of the liveness probe that decides "route or go direct".
+# /health only runs AFTER something has already answered /livez, and gets 2s because a busy
+# proxy's /health was measured at 1.06s once (2026-10-06) where idle it answers in ~10ms.
+HMD_HEADROOM_PROBE_CONNECT_TIMEOUT=0.3
+HMD_HEADROOM_PROBE_MAX_TIME=1
+HMD_HEADROOM_HEALTH_MAX_TIME=2
+
+# real-home.sh answers "is this process the real user in the real home?" — the guard that keeps
+# a synthetic-HOME harness away from the real per-user launchd (see hmd_headroom_kick).
+_HMD_HEADROOM_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+[ -r "$_HMD_HEADROOM_LIB_DIR/real-home.sh" ] && . "$_HMD_HEADROOM_LIB_DIR/real-home.sh"
 
 # Set by hmd_headroom_chain on success / failure. Read by the caller and by `hmd modules
 # status headroom`, so the user can always see WHY they are or are not proxied.
 HMD_HEADROOM_BASE_URL=""
 HMD_HEADROOM_WHY=""
+# DOWN is 1 when the proxy is WANTED (module added, not opted out, CLI present) but could not be
+# brought up; WARNED is 1 when the chain already said so on stderr. Launchers read WARNED so the
+# same thing is never printed twice.
+HMD_HEADROOM_DOWN=0
+HMD_HEADROOM_WARNED=0
 
 # ── the module's own state, read from the SAME place bin/heimdall-modules writes it ──────
 # Deliberately not a second source of truth: `hmd modules remove headroom` deletes the
@@ -107,6 +129,93 @@ hmd_headroom_port() {
   printf '%s' "$p"
 }
 
+# hmd_headroom_port_state <port> — what is on the port RIGHT NOW, decided by curl's own exit
+# status inside the 1s probe budget:
+#   dead       connection refused: nothing is listening. The ONLY state in which starting a
+#              proxy is safe.
+#   silent     something is listening but did not answer within the budget (hung, saturated
+#              backlog, or busy). Never route into it and never start a second proxy on top.
+#   answering  an HTTP server answered /livez. WHAT it is is /health's question, not this one.
+hmd_headroom_port_state() {
+  local rc
+  curl -s -o /dev/null --connect-timeout "$HMD_HEADROOM_PROBE_CONNECT_TIMEOUT" \
+       --max-time "$HMD_HEADROOM_PROBE_MAX_TIME" "http://127.0.0.1:$1/livez" 2>/dev/null
+  rc=$?
+  case "$rc" in
+    0) printf 'answering' ;;
+    7) printf 'dead' ;;
+    *) printf 'silent' ;;
+  esac
+}
+
+# hmd_headroom_port_owner <port> — "pid N (command)" for whatever LISTENs on the port, best-effort;
+# prints nothing when it cannot tell. The 2026-10-06 trigger was ANOTHER TOOL taking and killing
+# the proxy's port, so a refusal that names the holder turns "something is on my port" into a line
+# an operator can act on instead of a mystery.
+hmd_headroom_port_owner() {
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN -Fpc 2>/dev/null \
+    | awk '/^p/ {pid = substr($0, 2)} /^c/ {printf "pid %s (%s)", pid, substr($0, 2); exit}'
+}
+
+_hmd_headroom_held_by() {
+  local o
+  o="$(hmd_headroom_port_owner "$1")"
+  [ -n "$o" ] && printf ' — the port is held by %s' "$o"
+  return 0
+}
+
+# hmd_headroom_required — must this launch NOT silently fall back to a direct connection when the
+# proxy is wanted but down?
+#   · a JUDGE subprocess (HMD_JUDGMENT truthy — the same test bin/lib/hmd-route-claude applies): a
+#     verdict produced on a path nobody asked for is the false green this repo exists to prevent;
+#   · anything the caller marks HMD_HEADROOM_REQUIRED=1 (OmniRoute fallback routing).
+# Only a plain, non-judge, non-fallback session — which carries its own Anthropic auth — may go
+# direct, and then only with the warning hmd_headroom_chain prints.
+hmd_headroom_required() {
+  case "${HMD_JUDGMENT:-}" in ''|0|false|FALSE|no|NO) : ;; *) return 0 ;; esac
+  case "${HMD_HEADROOM_REQUIRED:-}" in 1|true|TRUE|yes|YES) return 0 ;; esac
+  return 1
+}
+
+# ── OPT-IN LAUNCHD SUPERVISION ──────────────────────────────────────────────────────────
+# `hmd modules supervise headroom install` (bin/heimdall-headroom-supervise) writes a
+# LaunchAgent with KeepAlive for the proxy. THE PLIST'S EXISTENCE IS THE OPT-IN, and the only
+# thing this file reads to learn it — there is no second flag to drift out of step. With it,
+# the chain asks launchd to start the proxy instead of spawning one beside launchd (two
+# starters, one bind winner, and the loser exits and is throttle-looped).
+hmd_headroom_supervisor_label() { printf '%s' "${HMD_HEADROOM_SUPERVISOR_LABEL:-dev.runheimdall.headroom}"; }
+hmd_headroom_supervisor_plist() {
+  printf '%s/%s.plist' "${HEIMDALL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}" "$(hmd_headroom_supervisor_label)"
+}
+hmd_headroom_supervised() { [ -f "$(hmd_headroom_supervisor_plist)" ]; }
+
+# launchctl is reachable only when it cannot hit the REAL per-user launchd by accident: either
+# LAUNCHCTL is a shim (the seam bin/heimdall-dream-schedule already uses) or $HOME is provably
+# the real passwd home. $HOME does not isolate launchd — a harness with HOME=$(mktemp -d) still
+# reaches gui/<uid> — and a kickstart/bootout by LABEL there would act on the developer's live
+# proxy. Same incident class as the header of bin/lib/real-home.sh.
+_hmd_headroom_launchd_reachable() {
+  [ -n "${LAUNCHCTL:-}" ] && [ "$LAUNCHCTL" != "launchctl" ] && return 0
+  type heimdall_home_is_real >/dev/null 2>&1 && heimdall_home_is_real
+}
+
+# hmd_headroom_kick — ask launchd to start the supervised proxy. Loaded -> kickstart (no -k: a
+# RUNNING proxy is never restarted by a launch); not loaded -> bootstrap, whose RunAtLoad starts
+# it. rc 0 only when launchd accepted the request; the caller then polls readiness exactly as it
+# does for a direct spawn, and falls back to a direct spawn on any other rc.
+hmd_headroom_kick() {
+  local lc dom label
+  hmd_headroom_supervised || return 1
+  _hmd_headroom_launchd_reachable || return 1
+  lc="${LAUNCHCTL:-launchctl}"; dom="gui/$(id -u)"; label="$(hmd_headroom_supervisor_label)"
+  if "$lc" print "$dom/$label" >/dev/null 2>&1; then
+    "$lc" kickstart "$dom/$label" >/dev/null 2>&1
+  else
+    "$lc" bootstrap "$dom" "$(hmd_headroom_supervisor_plist)" >/dev/null 2>&1
+  fi
+}
+
 # hmd_headroom_health <port> — is a HEADROOM proxy answering there, pointed at OUR
 # provider? Prints its whole /health body on success. Two refusals matter as much as the
 # accept:
@@ -117,7 +226,7 @@ hmd_headroom_port() {
 # same response that answered those two questions — one fetch, one moment in time.
 hmd_headroom_health() {
   local port="$1" body svc up
-  body="$(curl -s --max-time 3 "http://127.0.0.1:$port/health" 2>/dev/null)" || return 1
+  body="$(curl -s --connect-timeout "$HMD_HEADROOM_PROBE_CONNECT_TIMEOUT" --max-time "$HMD_HEADROOM_HEALTH_MAX_TIME" "http://127.0.0.1:$port/health" 2>/dev/null)" || return 1
   [ -n "$body" ] || return 1
   svc="$(printf '%s' "$body" | jq -r '.service // empty' 2>/dev/null)" || return 1
   [ "$svc" = "headroom-proxy" ] || return 1
@@ -221,12 +330,26 @@ hmd_headroom_reuse_refusal() {
   esac
 }
 
+# _hmd_headroom_detached <cmd...> — exec <cmd> as the leader of a NEW session (own process
+# group, no controlling terminal). The proxy is deliberately shared by every session, yet a bare
+# `&` leaves it in the process group of whichever terminal launched it, so that terminal's ^C,
+# the SIGHUP on closing its window, or a `kill -- -<pgid>` takes the proxy down for EVERY
+# session. macOS ships no setsid(1); perl is on every macOS and most Linux. No perl -> plain
+# exec: detachment is hardening, and its absence must never stop the proxy from starting.
+_hmd_headroom_detached() {
+  if command -v perl >/dev/null 2>&1; then
+    exec perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV or exit 127' -- "$@"
+  fi
+  exec "$@"
+}
+
 # ── the chain ─────────────────────────────────────────────────────────────────────────
-# Returns 0 and sets HMD_HEADROOM_BASE_URL when generation traffic should be routed.
-# Returns non-zero and sets HMD_HEADROOM_WHY in every other case. NEVER returns non-zero
-# by way of an unbounded wait, and never writes to the repo.
-hmd_headroom_chain() {
-  local plugin_dir="$1" port bin logdir live
+# _hmd_headroom_chain_decide <plugin_dir> — the decision. Returns 0 and sets
+# HMD_HEADROOM_BASE_URL when generation traffic should be routed. Returns non-zero and sets
+# HMD_HEADROOM_WHY in every other case. NEVER returns non-zero by way of an unbounded wait,
+# and never writes to the repo. Launchers call hmd_headroom_chain (below), which wraps this.
+_hmd_headroom_chain_decide() {
+  local plugin_dir="$1" port bin logdir live state started_via=""
   HMD_HEADROOM_BASE_URL=""; HMD_HEADROOM_WHY=""
 
   if hmd_headroom_opted_out "$plugin_dir"; then
@@ -240,6 +363,18 @@ hmd_headroom_chain() {
 
   port="$(hmd_headroom_port)"
 
+  # 0. WHAT IS ON THE PORT? Decided inside the 1s probe budget, so a launch is never held by a
+  #    sick listener, and the three situations that need three different answers are told apart.
+  #    `silent` (something listens but does not answer) is neither "reuse it" nor "start one":
+  #    a second proxy built over a hung one cannot bind, and used to cost ~5s plus a full
+  #    readiness wait before the launch went direct anyway.
+  state="$(hmd_headroom_port_state "$port")"
+  if [ "$state" = silent ]; then
+    HMD_HEADROOM_DOWN=1
+    HMD_HEADROOM_WHY="something is listening on port $port but did not answer within ${HMD_HEADROOM_PROBE_MAX_TIME}s (hung or saturated) — not routing into it, and not starting a second proxy on top of it$(_hmd_headroom_held_by "$port")"
+    return 1
+  fi
+
   # 1. ALREADY LIVE? Reuse it — but only after checking it is not the thing this chain
   #    exists to avoid. A second proxy on a busy port would fail to bind anyway, and an
   #    operator who started `headroom proxy` by hand should keep the process they own; what
@@ -250,29 +385,33 @@ hmd_headroom_chain() {
   #    entirely when the operator has opted out of lossless mode: they asked for upstream's
   #    CCR default, and hmd enforces its own default rather than overruling a stated choice.
   local health refusal verified=""
-  if health="$(hmd_headroom_health "$port")"; then
-    live="$(printf '%s' "$health" | jq -r '.checks.upstream.url // empty' 2>/dev/null)"
-    if ! refusal="$(hmd_headroom_reuse_ok "$port" "$health")"; then
-      HMD_HEADROOM_WHY="$refusal"
-      return 1
+  if [ "$state" = answering ]; then
+    if health="$(hmd_headroom_health "$port")"; then
+      live="$(printf '%s' "$health" | jq -r '.checks.upstream.url // empty' 2>/dev/null)"
+      if ! refusal="$(hmd_headroom_reuse_ok "$port" "$health")"; then
+        HMD_HEADROOM_WHY="$refusal"
+        return 1
+      fi
+      hmd_headroom_lossless_wanted && verified=", verified lossless"
+      HMD_HEADROOM_BASE_URL="http://127.0.0.1:$port"
+      HMD_HEADROOM_WHY="reusing the Headroom proxy already listening on $port (upstream $live$verified)"
+      return 0
     fi
-    hmd_headroom_lossless_wanted && verified=", verified lossless"
-    HMD_HEADROOM_BASE_URL="http://127.0.0.1:$port"
-    HMD_HEADROOM_WHY="reusing the Headroom proxy already listening on $port (upstream $live$verified)"
-    return 0
-  fi
 
-  # 2. Something is on the port but it is NOT our proxy -> refuse. Routing a prompt into an
-  #    unidentified listener is the one failure this whole module is supposed to prevent.
-  if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port/health" 2>/dev/null; then
-    HMD_HEADROOM_WHY="port $port is answering but is not a Headroom proxy pointed at $HMD_HEADROOM_UPSTREAM — refusing to route"
+    # 2. Something answers on the port but it is NOT our proxy -> refuse. Routing a prompt into
+    #    an unidentified listener is the one failure this whole module is supposed to prevent.
+    HMD_HEADROOM_DOWN=1
+    HMD_HEADROOM_WHY="port $port is answering but is not a Headroom proxy pointed at $HMD_HEADROOM_UPSTREAM (or its /health did not reply within ${HMD_HEADROOM_HEALTH_MAX_TIME}s) — refusing to route$(_hmd_headroom_held_by "$port")"
     return 1
   fi
 
-  # 3. Start one, detached, with its own log. Output goes to $HEIMDALL_HOME, never the repo.
+  # 3. Nothing is listening ($state = dead) — the one state in which starting a proxy is safe.
+  #    Supervised (the operator opted in): ask launchd, which owns the process and restarts it on
+  #    ANY exit; spawning one beside it would race it for the bind. Otherwise (or if launchd
+  #    refuses) start one detached with its own log. Output goes to $HEIMDALL_HOME, never the repo.
   logdir="${HEIMDALL_HOME:-$HOME/.heimdall}/headroom"
   mkdir -p "$logdir" 2>/dev/null || {
-    HMD_HEADROOM_WHY="cannot create $logdir — running unproxied"; return 1; }
+    HMD_HEADROOM_DOWN=1; HMD_HEADROOM_WHY="cannot create $logdir — running unproxied"; return 1; }
   # Timeout-debt quarantine mitigation (upstream #1171/#2360). hmd launches with no
   # --mode flag, so Headroom's OWN default applies: CACHE mode (cli/proxy.py resolves
   # mode = flag > HEADROOM_MODE env > "cache", and this file sets neither). We do NOT
@@ -468,27 +607,83 @@ hmd_headroom_chain() {
   # rather than being silently overridden by an argument the operator never asked for.
   local lossless_flag=""
   hmd_headroom_lossless_wanted && lossless_flag="--lossless"
-  # shellcheck disable=SC2086  # deliberate: an empty $lossless_flag must expand to NO argument
-  ( HEADROOM_LOSSLESS="${HEADROOM_LOSSLESS:-1}" \
-    HEADROOM_COMPRESSION_TIMEOUT_SECONDS="${HEADROOM_COMPRESSION_TIMEOUT_SECONDS:-30}" \
-    HEADROOM_KOMPRESS_MAX_TOKENS="${HEADROOM_KOMPRESS_MAX_TOKENS:-10000}" \
-    "$bin" proxy --host 127.0.0.1 --port "$port" $lossless_flag >>"$logdir/proxy.log" 2>&1 & echo $! > "$logdir/proxy.pid" ) \
-    || { HMD_HEADROOM_WHY="could not start the Headroom proxy — running unproxied"; return 1; }
+  if hmd_headroom_kick; then
+    started_via=" via launchd"
+  else
+    # shellcheck disable=SC2086  # deliberate: an empty $lossless_flag must expand to NO argument
+    ( HEADROOM_LOSSLESS="${HEADROOM_LOSSLESS:-1}" \
+      HEADROOM_COMPRESSION_TIMEOUT_SECONDS="${HEADROOM_COMPRESSION_TIMEOUT_SECONDS:-30}" \
+      HEADROOM_KOMPRESS_MAX_TOKENS="${HEADROOM_KOMPRESS_MAX_TOKENS:-10000}" \
+      _hmd_headroom_detached "$bin" proxy --host 127.0.0.1 --port "$port" $lossless_flag >>"$logdir/proxy.log" 2>&1 & echo $! > "$logdir/proxy.pid" ) \
+      || { HMD_HEADROOM_DOWN=1; HMD_HEADROOM_WHY="could not start the Headroom proxy — running unproxied"; return 1; }
+  fi
 
   # 4. Bounded readiness. The ceiling is the whole point: a proxy that never becomes ready
-  #    must cost the user 15 seconds once, not a hung session.
-  local i=0
-  while [ "$i" -lt "$HMD_HEADROOM_READY_POLLS" ]; do
+  #    must cost the user 15 seconds once, not a hung session. It is a WALL-CLOCK bound as well
+  #    as a poll count, because each poll can itself spend up to the /health budget.
+  local i=0 deadline=$((SECONDS + HMD_HEADROOM_READY_POLLS / 4 + 1))
+  while [ "$i" -lt "$HMD_HEADROOM_READY_POLLS" ] && [ "$SECONDS" -lt "$deadline" ]; do
     if live="$(hmd_headroom_probe "$port")"; then
       HMD_HEADROOM_BASE_URL="http://127.0.0.1:$port"
-      HMD_HEADROOM_WHY="started the Headroom proxy on $port (upstream $live)"
+      HMD_HEADROOM_WHY="started the Headroom proxy on $port$started_via (upstream $live)"
       return 0
     fi
     sleep 0.25
     i=$((i+1))
   done
+  HMD_HEADROOM_DOWN=1
   HMD_HEADROOM_WHY="the Headroom proxy did not become ready within $((HMD_HEADROOM_READY_POLLS / 4))s — running unproxied"
   return 1
+}
+
+# hmd_headroom_chain <plugin_dir> — the entry point every launcher calls. The DECISION is
+# _hmd_headroom_chain_decide; this wrapper owns what a "no" must do to the ENVIRONMENT:
+#   · never leave OUR loopback proxy URL in the child's env once the chain has declined. A launch
+#     (a hook-spawned `claude -p`, a fallback, a nested session) that inherited
+#     ANTHROPIC_BASE_URL=http://127.0.0.1:<port> from a parent whose proxy has since died would
+#     otherwise go straight into ECONNREFUSED although the chain had just said "unproxied". That
+#     is the 2026-10-06 outage's second half: the launcher kept pointing sessions at a dead port.
+#   · ONLY our URL. An operator's own ANTHROPIC_BASE_URL (a corporate gateway, OmniRoute) is
+#     theirs and is never touched.
+#   · say so ONCE, on stderr, whenever the proxy was wanted but is unavailable, or a URL was
+#     dropped — so "running direct" is never a silent downgrade.
+# Callers that exported nothing before keep working unchanged: this only ever REMOVES our URL.
+hmd_headroom_chain() {
+  local ours note=""
+  HMD_HEADROOM_DOWN=0; HMD_HEADROOM_WARNED=0
+  if _hmd_headroom_chain_decide "$@"; then return 0; fi
+  # rc 3 — REQUIRED and down. A judge or fallback launch never drops to an unrouted connection:
+  # the caller exits non-zero, and the environment is left exactly as found.
+  if [ "$HMD_HEADROOM_DOWN" = 1 ] && hmd_headroom_required; then
+    printf 'hmd: headroom proxy required but unavailable — %s; REFUSING to run direct (a judge or fallback launch never drops to an unrouted connection)\n' "${HMD_HEADROOM_WHY:-chain unavailable}" >&2
+    HMD_HEADROOM_WARNED=1
+    return 3
+  fi
+  ours="http://127.0.0.1:$(hmd_headroom_port)"
+  if [ "${ANTHROPIC_BASE_URL:-}" = "$ours" ]; then
+    unset ANTHROPIC_BASE_URL
+    note=" (dropped the inherited ANTHROPIC_BASE_URL=$ours)"
+  fi
+  if [ "$HMD_HEADROOM_DOWN" = 1 ] || [ -n "$note" ]; then
+    printf 'hmd: headroom not routing — %s; running direct%s\n' "${HMD_HEADROOM_WHY:-chain unavailable}" "$note" >&2
+    HMD_HEADROOM_WARNED=1
+  fi
+  return 1
+}
+
+# hmd_headroom_drop_if_dead — the cheap guard for the shim's RE-ENTRY arm. A launch already inside
+# a wrapped session execs the real tool WITHOUT consulting the chain, so an inherited
+# ANTHROPIC_BASE_URL rides straight through. ONE <=1s liveness probe, only when the inherited
+# value is OUR proxy URL, and it never starts anything (a nested launch is not the place to bring
+# a proxy up). Unless the proxy is answering the stale URL is dropped: direct is always safe.
+hmd_headroom_drop_if_dead() {
+  local port ours
+  port="$(hmd_headroom_port)"; ours="http://127.0.0.1:$port"
+  [ "${ANTHROPIC_BASE_URL:-}" = "$ours" ] || return 0
+  [ "$(hmd_headroom_port_state "$port")" = answering ] && return 0
+  unset ANTHROPIC_BASE_URL
+  printf 'hmd: headroom proxy on :%s is not answering — dropped the inherited ANTHROPIC_BASE_URL, running direct\n' "$port" >&2
+  return 0
 }
 
 # hmd_headroom_report <plugin_dir> — one line the operator can read, for `hmd modules
@@ -507,8 +702,9 @@ hmd_headroom_report() {
     printf 'NOT ROUTED — the headroom CLI is not installed'; return 0
   fi
   port="$(hmd_headroom_port)"
-  local health refusal
-  if health="$(hmd_headroom_health "$port")"; then
+  local health refusal state
+  state="$(hmd_headroom_port_state "$port")"
+  if [ "$state" = answering ] && health="$(hmd_headroom_health "$port")"; then
     live="$(printf '%s' "$health" | jq -r '.checks.upstream.url // empty' 2>/dev/null)"
     if ! refusal="$(hmd_headroom_reuse_ok "$port" "$health")"; then
       # A refusal the operator cannot see is indistinguishable from a silent proxy: they
@@ -516,8 +712,20 @@ hmd_headroom_report() {
       printf 'NOT ROUTED — %s' "$refusal"
       return 0
     fi
-    printf 'ROUTED — generation traffic goes to http://127.0.0.1:%s, which forwards to %s. Judgment does NOT: hmd_gate_exec scrubs it.' "$port" "$live"
+    printf 'ROUTED — generation traffic goes to http://127.0.0.1:%s, which forwards to %s. Judgment does NOT: hmd_gate_exec scrubs it.%s' "$port" "$live" "$(_hmd_headroom_supervised_note)"
+  elif [ "$state" = silent ]; then
+    printf 'NOT ROUTED — something is listening on %s but is not answering (hung or saturated); launches run direct until it does%s' "$port" "$(_hmd_headroom_held_by "$port")"
+  elif [ "$state" = answering ]; then
+    printf 'NOT ROUTED — port %s is answering but is not a Headroom proxy pointed at %s%s' "$port" "$HMD_HEADROOM_UPSTREAM" "$(_hmd_headroom_held_by "$port")"
   else
-    printf 'NOT ROUTED — no Headroom proxy is listening on %s (it starts on the next `hmd wrap`)' "$port"
+    printf 'NOT ROUTED — no Headroom proxy is listening on %s (it starts on the next `hmd wrap`)%s' "$port" "$(_hmd_headroom_supervised_note)"
   fi
+}
+
+# Said whenever the proxy is supervised: a plain kill is UNDONE within seconds, which is the
+# point, and also exactly what surprises an operator who kills the proxy to free its port.
+_hmd_headroom_supervised_note() {
+  hmd_headroom_supervised || return 0
+  printf ' Supervised by launchd (%s): it is restarted if it exits, so a plain kill is undone within seconds — stop it with `launchctl bootout gui/%s/%s`.' \
+    "$(hmd_headroom_supervisor_label)" "$(id -u)" "$(hmd_headroom_supervisor_label)"
 }

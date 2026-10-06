@@ -6,6 +6,31 @@ Spec of record: docs/HANDOFF-TO-HEIMDALL-push-notifications.md and docs/superpow
 POSTs a short, scrubbed summary straight to Expo, which forwards it to APNs / FCM. An ExpoPushToken is
 the only capability needed -- no publisher credential ever sits on a developer's laptop.
 
+PUSH KINDS BEYOND THE FIVE -- THE REGISTRATION INTERFACE (H2 of hmdapp's docs/HANDOFF-TO-HEIMDALL-watch.md). A module under bin/lib adds
+a kind WITHOUT editing this file's tables (H4's `digest`, a morning report, goes in exactly this way):
+  1. name the module in KIND_MODULES (one tuple, the pattern of companion_ui_controls.ACTION_MODULES);
+  2. define `register_push_kinds(kit)` in it. `kit.register_kind(name, phrase=, channel=, level=, ttl=, cap=, priority=, body=, suffix=,
+     scope=None)` registers one kind; `kit.scrub`, `kit.clip`, `kit.utf16_len`, `kit.secret_shaped` (True also when the check cannot
+     load: fail closed) and `kit.BODY_MAX` are the text tools (the module never imports this one):
+       name      ^[a-z][a-z_]{1,23}$, not taken. It joins all_kinds() (KINDS stays the closed six), the per-device kind filter and the
+                 `events` the store accepts.
+       phrase    the title tail, "<label> · <phrase>", <= 24 chars;  channel "hmd-attention" | "hmd-updates";  level "active" |
+                 "time-sensitive" | "passive";  ttl Expo ttl seconds, 60..86400;  priority 0..9 (coalescing, highest wins, 0 loses to
+                 every built-in kind; approval bypasses; question 5, error 4, gate_red 3, finished 2, test 1)
+       cap       the capability token (<= 32 chars) hmd lists in its state frames ONLY while the kind is registered, so the app asks
+                 for the kind only when it is listed; an unregistered kind in a registration is `bad-events` for that registration
+       body      body(fields) -> str, the WHOLE body: fixed words plus allowlisted fields. Clipped to BODY_MAX here; an exception or
+                 an empty string means no message. It must put no number, path or free text in unless its owner opted in.
+       suffix    the collapseId and tag tail, "<scope hash>.<suffix>";  scope(fields) -> str|None is what is hashed (sha256, first 16
+                 hex; default: the device ref), so no raw id ever rides in a message
+  3. send an instance from ANY process with `enqueue_event(root, kind, fields, key=)`. It writes one 0600 file into
+     <repo>/.heimdall/app/push-spool/, and the monitor that owns the sender lock serves it through the same kind filter, foreground
+     suppression, coalescing and rate limits as every other event. A second process never takes the lock to send: it would make the
+     real sender drop the events it detects (see ONE SENDER PER REPO). A registered kind is opt-in: a device that named no events never
+     receives it, and an event older than its ttl is never served.
+`registered_kinds()` -> {kind: cap} is what the store (accepted events) and the relay client (advertised caps) read;
+`all_kinds()` is KINDS plus them; `devices_wanting(root, kind)` counts the registered devices that asked for one.
+
 WHAT RUNS WHERE. sentinels/hmd-ui.py's StateCache builds one PushMonitor per process and hands it every
 state it collects (the same slot the native panel publishers use). `observe` is a few dict lookups: it
 detects TRANSITIONS between consecutive states and queues events; a worker thread -- started on the first
@@ -91,8 +116,10 @@ import math
 import os
 import re
 import secrets
+import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -211,6 +238,12 @@ def _secret_checker():
         fn = getattr(_load_sibling("companion_ui_attention"), "secret_shaped", None)
         _SECRET["fn"] = fn if callable(fn) else None
     return _SECRET["fn"]
+
+
+def secret_shaped(text):
+    """True when `text` looks like a credential -- and when the check cannot be loaded, so a free-text field is withheld (fail closed)."""
+    check = _secret_checker()
+    return True if check is None else bool(check(text))
 
 
 # ── text: UTF-16 accounting and the scrub pipeline (spec 8.2) ─────────────────────────────────────
@@ -384,6 +417,132 @@ def _finished_body(fields):
     return " ".join(clauses) or FINISHED_FALLBACK
 
 
+# ── kinds beyond the five: the registry (module docstring) ───────────────────────────────────────
+KIND_MODULES = ("dashboard_alerts",)            # modules whose register_push_kinds(kit) runs when this one imports (end of file)
+KIND_NAME_RE = re.compile(r"[a-z][a-z_]{1,23}")
+CAP_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+SUFFIX_RE = re.compile(r"[a-z]{2,12}")
+CHANNELS = ("hmd-attention", "hmd-updates")
+LEVELS = ("active", "time-sensitive", "passive")
+SPOOL_REL = os.path.join(".heimdall", "app", "push-spool")
+SPOOL_MAX_FILES = 64              # the spool is bounded: the oldest file goes when a new one would be the 65th
+SPOOL_FILE_CAP = 4096             # one spooled event is a few hundred bytes; a bigger file is not ours
+SPOOL_SKEW_S = 30.0               # an event dated further ahead of this clock than this is never served
+_EXT = {}                         # kind -> {"cap", "body", "suffix", "scope", "ttl"}
+
+
+def register_kind(name, *, phrase, channel, level, ttl, cap, priority, body, suffix, scope=None):
+    """Register one push kind (module docstring, PUSH KINDS BEYOND THE FIVE). ValueError for anything out of its range: a kind
+    is trusted code adding itself at import time, so a malformed one fails loudly instead of half-registering."""
+    ok = (isinstance(name, str) and KIND_NAME_RE.fullmatch(name) and name not in _KIND_TABLE
+          and isinstance(phrase, str) and 0 < len(phrase) <= 24 and phrase.isprintable() and "/" not in phrase
+          and channel in CHANNELS and level in LEVELS
+          and isinstance(ttl, int) and not isinstance(ttl, bool) and 60 <= ttl <= 86400
+          and isinstance(cap, str) and CAP_NAME_RE.fullmatch(cap)
+          and isinstance(priority, int) and not isinstance(priority, bool) and 0 <= priority <= 9
+          and callable(body) and isinstance(suffix, str) and SUFFIX_RE.fullmatch(suffix) and (scope is None or callable(scope)))
+    if not ok:
+        raise ValueError("a push kind is a new kebab name with a phrase, channel, level, ttl, cap, priority, body and suffix")
+    _KIND_TABLE[name] = (phrase, channel, None, level, ttl)
+    PRIORITY[name] = priority
+    _EXT[name] = {"cap": cap, "body": body, "suffix": suffix, "scope": scope, "ttl": ttl}
+
+
+def registered_kinds():
+    """{kind: cap} of the kinds registered beyond the five (and `test`): what the store accepts and what hmd advertises."""
+    return {kind: spec["cap"] for kind, spec in _EXT.items()}
+
+
+def all_kinds():
+    """KINDS (the closed six) followed by the registered kinds, in registration order."""
+    return KINDS + tuple(_EXT)
+
+
+def _load_store():
+    """The registration store by path, bound to this module's registry so it keeps (and does not drop as damaged) a registered kind."""
+    store = _load_sibling("companion_push_store")
+    if store is not None and hasattr(store, "bind_extension_kinds"):
+        store.bind_extension_kinds(registered_kinds)
+    return store
+
+
+def devices_wanting(root, kind):
+    """How many registered devices asked for `kind` (a registered extension kind): 0 when none did, push is off or the store is gone."""
+    if not enabled() or kind not in _EXT:
+        return 0
+    store = _load_store()
+    try:
+        data = _devices_from(store.load(root)) if store is not None else None
+    except Exception:
+        return 0
+    return sum(1 for record in (data["devices"].values() if data else ()) if kind in record["events"])
+
+
+def _spool_dir(root):
+    return os.path.join(root, SPOOL_REL)
+
+
+def enqueue_event(root, kind, fields, key=None, now=None, environ=None):
+    """Hand one event of a registered kind to the repo's sender, from any process. True when it was spooled; False when push is off
+    (HMD_PUSH=0), the kind is not registered, `fields` is not a small JSON object, or the file could not be written (a push is
+    bookkeeping: the caller's own work never fails on it). The file is private (dir 0700, file 0600) and holds only what the
+    caller passed: put in `fields` what the kind's body may say and nothing else."""
+    if not enabled(environ) or kind not in _EXT or not isinstance(fields, dict):
+        return False
+    now = time.time() if now is None else now
+    key = key if isinstance(key, str) and 0 < len(key) <= 80 else "%s:%d" % (kind, int(now))
+    try:
+        raw = json.dumps({"v": 1, "kind": kind, "key": key, "at": now, "fields": fields}, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return False
+    if len(raw) > SPOOL_FILE_CAP:
+        return False
+    directory = _spool_dir(root)
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".json"))
+        for old in names[:max(0, len(names) - SPOOL_MAX_FILES + 1)]:
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(directory, old))
+        _write_private_json(os.path.join(directory, "%013d-%s.json" % (int(now * 1000), secrets.token_hex(4))),
+                            json.loads(raw))
+    except OSError:
+        return False
+    return True
+
+
+def read_spool(root, now):
+    """[(path, event)] of the fresh, well-formed spooled events, oldest first; an expired or malformed file is removed. `event` is the
+    Planner's shape {"kind", "key", "ep", "fields"}. Reads only -- the caller that serves an event removes its file."""
+    directory = _spool_dir(root)
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".json") and ".tmp-" not in n)
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            with open(path, "rb") as f:
+                raw = f.read(SPOOL_FILE_CAP + 1)
+            held = json.loads(raw.decode("utf-8")) if len(raw) <= SPOOL_FILE_CAP else None
+        except OSError:
+            continue
+        except (ValueError, UnicodeDecodeError):
+            held = None
+        held = _dict(held)
+        kind, key, at = held.get("kind"), held.get("key"), _num(held.get("at"))
+        spec = _EXT.get(kind)
+        if (spec is None or held.get("v") != 1 or not isinstance(key, str) or not 0 < len(key) <= 80 or at is None
+                or not isinstance(held.get("fields"), dict) or now - at > spec["ttl"] or at - now > SPOOL_SKEW_S):
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            continue
+        out.append((path, {"kind": kind, "key": key, "ep": None, "fields": held["fields"]}))
+    return out
+
+
 def build_message(token, event, label, ref, now):
     """One Expo message for `event` (a Planner event) to `token`, or None when there is nothing to send (an
     approval with under MIN_APPROVAL_TTL_S of life left, an unknown kind or finished variant). Every string
@@ -392,6 +551,7 @@ def build_message(token, event, label, ref, now):
         return None
     kind, fields = event["kind"], _dict(event.get("fields"))
     phrase, channel, category, level, ttl = _KIND_TABLE[kind]
+    ext = _EXT.get(kind)
     ep = event.get("ep")
     data = {"v": 1, "ref": _ref_for(token, ref), "kind": kind, "ep": ep if isinstance(ep, str) and _EP_RE.fullmatch(ep) else None}
     if kind == "approval":
@@ -415,6 +575,14 @@ def build_message(token, event, label, ref, now):
         if phrase is None:
             return None
         body = _finished_body(fields)
+    elif ext is not None:
+        try:
+            body = ext["body"](fields)
+        except Exception:
+            return None
+        if not isinstance(body, str) or not body.strip():
+            return None
+        body = clip(" ".join(body.split()), BODY_MAX)
     else:
         body = "Notifications from this laptop work."
     ref = data["ref"]
@@ -422,8 +590,17 @@ def build_message(token, event, label, ref, now):
                "body": body, "data": data}
     if category:
         message["categoryId"] = category
+    scope, suffix = ref, kind
+    if ext is not None:
+        suffix = ext["suffix"]
+        try:
+            held = ext["scope"](fields) if ext["scope"] is not None else None
+        except Exception:
+            held = None
+        if isinstance(held, str) and held:
+            scope = hashlib.sha256(held.encode("utf-8")).hexdigest()[:16]
     message.update(channelId=channel, priority="high", interruptionLevel=level, sound="default", ttl=ttl,
-                   collapseId="%s.%s" % (ref, kind), tag="%s.%s" % (ref, kind), threadId=ref)
+                   collapseId="%s.%s" % (scope, suffix), tag="%s.%s" % (scope, suffix), threadId=ref)
     return message
 
 
@@ -693,11 +870,11 @@ def _devices_from(raw):
         token = item.get("token") if isinstance(item, dict) else None
         if not (isinstance(token, str) and _TOKEN_RE.fullmatch(token)) or _fingerprint(token) in devices:
             continue
-        wanted = [k for k in _list(item.get("events")) if k in _PUSH_KINDS]
+        wanted = [k for k in _list(item.get("events")) if k in _PUSH_KINDS or k in _EXT]
         platform = item.get("platform")
         devices[_fingerprint(token)] = {"token": token, "ref": item.get("ref"), "label": item.get("label"),
                                         "platform": platform if platform in ("ios", "android") else None,
-                                        "events": frozenset(wanted) if wanted else _PUSH_KINDS}
+                                        "events": frozenset(wanted) if wanted else _PUSH_KINDS}   # a registered kind is opt-in: never the default
     state = raw.get("app_state")
     return {"devices": devices, "app_state": state if state in ("foreground", "background", "unknown") else "unknown",
             "app_state_at": _iso_epoch(raw.get("app_state_at"))}
@@ -745,7 +922,7 @@ def registered_devices(root, store=None):
     sender would send to, in registry order -- what `hmd app push-test` counts and lists. Never a token. `store`
     reads the registry (default bin/lib/companion_push_store.py, whose load() never raises: no registry is no
     devices); raises RuntimeError when that module cannot be loaded."""
-    store = store if store is not None else _load_sibling("companion_push_store")
+    store = store if store is not None else _load_store()
     if store is None:
         raise RuntimeError("bin/lib/companion_push_store.py could not be loaded")
     data = _devices_from(store.load(root))
@@ -837,6 +1014,9 @@ class PushMonitor:
         self._tests = collections.deque(maxlen=EVENT_QUEUE_CAP)     # request ids of `hmd app push-test`, waiting for the worker
         self._test_stamp = None         # (mtime, size, inode) of the request file as last looked at
         self._test_last = None          # id of the last request queued: a touched file is not served twice
+        self._spooled = collections.deque(maxlen=EVENT_QUEUE_CAP)   # (path, event) read from the spool, waiting for the worker
+        self._spool_stamp = None        # (mtime, inode) of the spool directory as last listed
+        self._spool_seen = collections.OrderedDict()                # file names already queued by this monitor
         self._last_ts = None
         self._devices = {}              # fingerprint -> runtime record (window, last_sent, hourly counters)
         self._ready = []                # approvals to send in this step: (fingerprint, event)
@@ -855,6 +1035,7 @@ class PushMonitor:
         try:
             now = self._clock() if now is None else now
             self._watch_test_request()
+            self._watch_spool(now)
             ts = state.get("ts") if isinstance(state, dict) else None
             with self._cv:
                 if _num(ts) is not None:
@@ -891,6 +1072,32 @@ class PushMonitor:
             self._tests.append(request["id"])
             self._wake_locked()
 
+    def _watch_spool(self, now):
+        """One stat() of the spool directory per observed state; when it changed, the fresh events in it are queued for the worker
+        (a file this monitor already queued is not queued twice). Whether to SERVE them is the worker's call: only the owner of the
+        sender lock does, and it removes the file once it has taken the event."""
+        if not _EXT:
+            return
+        try:
+            st = os.stat(_spool_dir(self.root))
+        except OSError:
+            return
+        stamp = (st.st_mtime_ns, st.st_ino)
+        with self._cv:
+            if stamp == self._spool_stamp:
+                return
+            self._spool_stamp = stamp
+        fresh = [(path, event) for path, event in read_spool(self.root, now) if os.path.basename(path) not in self._spool_seen]
+        if not fresh:
+            return
+        with self._cv:
+            for path, event in fresh:
+                self._spool_seen[os.path.basename(path)] = now
+                while len(self._spool_seen) > SEEN_CAP:
+                    self._spool_seen.popitem(last=False)
+                self._spooled.append((path, event))
+            self._wake_locked()
+
     def _wake_locked(self):
         """Make sure the worker thread is running and tell it there is work. The caller holds self._cv."""
         if self._start_thread and (self._thread is None or not self._thread.is_alive()):
@@ -923,11 +1130,11 @@ class PushMonitor:
             with self._cv:
                 if self._stop.is_set():
                     return
-                if not (self._pending or self._tests or self._tickets
+                if not (self._pending or self._tests or self._spooled or self._tickets
                         or any(d["window"] for d in self._devices.values())):
                     self._thread = None
                     return
-                if not (self._pending or self._tests):
+                if not (self._pending or self._tests or self._spooled):
                     self._cv.wait(self._next_wait(self._clock()))
 
     def _next_wait(self, now):
@@ -953,8 +1160,12 @@ class PushMonitor:
                 self._pending.clear()
                 tests = list(self._tests)
                 self._tests.clear()
+                spooled = list(self._spooled)
+                self._spooled.clear()
             if batch:
                 self._accept(batch, now)
+            if spooled:
+                self._accept_spooled(spooled, now)
             self._flush(now)
             for request_id in tests:
                 self._serve_test(request_id, now)
@@ -981,6 +1192,18 @@ class PushMonitor:
                     dev["window"] = {"opened": detected_at, "cands": [event]}
                 else:
                     dev["window"]["cands"].append(event)
+
+    def _accept_spooled(self, spooled, now):
+        """Events another process handed over (enqueue_event). Served only by the owner of the sender lock and only when a device is
+        registered; the owner removes each file as it takes the event, so it is served once and never replayed. A monitor that does
+        not own the lock leaves the files for the owner, and an event nobody serves ages out at its kind's ttl (read_spool)."""
+        data = self._load()
+        if data is None or not data["devices"] or not self._own_lock():
+            return
+        for path, _ in spooled:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        self._accept([(now, event) for _, event in spooled], now)
 
     def _runtime(self, fp, record):
         """The in-memory state of one device (coalescing window, last send, hourly counters), created on first
@@ -1162,7 +1385,7 @@ class PushMonitor:
     # -- the store, the lock, the log ----------------------------------------------------------------
     def _store(self):
         if self.store is None:
-            self.store = _load_sibling("companion_push_store")
+            self.store = _load_store()
         return self.store
 
     def _load(self):
@@ -1227,3 +1450,20 @@ def source_paths(root):
     """What the sender touches under the repo, for `hmd ui --print-sources`: the registry, the lock, and the
     operator's push-test request and its result."""
     return [os.path.join(root, rel) for rel in (STORE_REL, LOCK_REL, TEST_REQUEST_REL, TEST_RESULT_REL)]
+
+
+def _load_kind_modules():
+    """Run register_push_kinds(kit) of every module in KIND_MODULES (trusted code, like companion_ui_controls.ACTION_MODULES). A module
+    that cannot load, or raises, leaves its kinds unregistered -- and so unadvertised and refused as `bad-events`."""
+    kit = types.SimpleNamespace(register_kind=register_kind, scrub=scrub, clip=clip, utf16_len=utf16_len, secret_shaped=secret_shaped,
+                                BODY_MAX=BODY_MAX)
+    for name in KIND_MODULES:
+        hook = getattr(_load_sibling(name), "register_push_kinds", None)
+        if callable(hook):
+            try:
+                hook(kit)
+            except Exception as exc:
+                sys.stderr.write("companion_push: %s did not register its push kinds (%s)\n" % (name, exc.__class__.__name__))
+
+
+_load_kind_modules()

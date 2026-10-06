@@ -797,9 +797,11 @@ class Rig:
 # ═══ 27. caps ═══════════════════════════════════════════════════════════════
 py_case 27 "every state frame lists push-v1 in its caps -- and stops listing it with HMD_PUSH=0 or without the store" rig <<'PYEOF'
 rig = Rig()
-base = [c for c in rig.E2E.hmd_caps(rig.client._feature_caps()) if c != "push-v1"]  # every other token the client lists (resync, z-zlib, login-v1)
+SENDER_CAPS = ["push-v1"] + sorted(rig.mod.PUSH_STORE.extension_kinds().values())  # the sender's own tokens: push-v1 and one per registered push kind, all on the one kill switch
+assert "push-tile-alert-v1" in SENDER_CAPS, SENDER_CAPS
+base = [c for c in rig.E2E.hmd_caps(rig.client._feature_caps()) if c not in SENDER_CAPS]  # every other token the client lists (resync, z-zlib, login-v1)
 assert base and "resync" in base
-assert rig.caps() == sorted(base + ["push-v1"]), rig.caps()
+assert rig.caps() == sorted(base + SENDER_CAPS), rig.caps()
 with env("HMD_PUSH", "0"):
     assert rig.caps() == base, "the kill switch must withdraw the cap: %r" % rig.caps()
 with env("HMD_PUSH", ""):
@@ -810,7 +812,7 @@ try:
     assert rig.caps() == base, "no store, no cap"
 finally:
     rig.mod.PUSH_STORE = real
-assert rig.caps() == sorted(base + ["push-v1"]), "and it is back once the switch is off"
+assert rig.caps() == sorted(base + SENDER_CAPS), "and it is back once the switch is off"
 print(rig.caps())
 PYEOF
 

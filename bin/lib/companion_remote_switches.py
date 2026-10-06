@@ -47,10 +47,13 @@ from importlib.util import module_from_spec, spec_from_file_location
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 
-SWITCHES = {"launch": "remote-launch.json", "merge": "remote-merge.json", "dashboards": "remote-dashboards.json", "asks": "remote-asks.json"}
-CLI_SWITCH = {"remote-launch": "launch", "remote-merge": "merge", "remote-dashboards": "dashboards", "remote-asks": "asks"}
-SWITCH_WORDS = {"launch": "remote launch", "merge": "remote merge", "dashboards": "remote dashboards", "asks": "remote asks"}
-OPEN_SWITCHES = frozenset(("dashboards",))   # a switch that is the whole gate: its action acts on the session's own repo, no allowlist
+SWITCHES = {"launch": "remote-launch.json", "merge": "remote-merge.json", "dashboards": "remote-dashboards.json",
+            "asks": "remote-asks.json", "alerts": "remote-alerts.json"}
+CLI_SWITCH = {"remote-launch": "launch", "remote-merge": "merge", "remote-dashboards": "dashboards", "remote-asks": "asks",
+              "remote-alerts": "alerts"}
+SWITCH_WORDS = {"launch": "remote launch", "merge": "remote merge", "dashboards": "remote dashboards", "asks": "remote asks",
+                "alerts": "remote alerts"}
+OPEN_SWITCHES = frozenset(("dashboards", "alerts"))   # a switch that is the whole gate: its action acts on the session's own repo, no allowlist
 SWITCH_MAX_BYTES = 4096
 ALLOWLIST_REL = os.path.join("app", "launch-allowlist.json")
 ALLOWLIST_LOCK_REL = os.path.join("app", "launch-allowlist.lock")
@@ -351,6 +354,7 @@ USAGE = ("usage: hmd app remote-launch on|off|status [--repo DIR]\n"
          "       hmd app remote-merge  on|off|status [--repo DIR]\n"
          "       hmd app remote-dashboards on|off|status [--repo DIR]\n"
          "       hmd app remote-asks on|off|status [--repo DIR]\n"
+         "       hmd app remote-alerts on|off|status [--repo DIR]\n"
          "       hmd app launch-allow <repo-path> [--merge] | --remove <id> | --list\n")
 
 
@@ -424,6 +428,11 @@ def _cmd_switch(switch, cmd, rest):
              "and hmd answers from the tiles' current values, read-only: no producer runs, nothing is queried, the coding agent is never "
              "reached. To choose the tile a model sees the question and each live number tile's title and intent (never its value). "
              "It needs remote dashboards on too. Turn it off with: hmd app remote-asks off")
+        return 0
+    elif switch == "alerts":
+        _say("remote alerts: on -- a threshold the phone sets on a number tile is evaluated on this laptop after every producer run and "
+             "delivered as a push (kind tile_alert); it needs remote dashboards on and a push registration. Turn it off with: hmd app "
+             "remote-alerts off")
         return 0
     else:
         _say("remote merge: on -- the paired phone can merge a pull request for a repo allowlisted with --merge, only while "

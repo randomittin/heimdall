@@ -381,10 +381,19 @@ fi
 # Nothing here reads the real .heimdall/fallback.json, touches a real OmniRoute gateway,
 # or makes a network call.
 
-# A loopback URL string bin/heimdall-route only ever pattern-matches and exports; it is
-# never dialed by anything in this suite (faketool just dumps its own env and exits), so
-# it needs no real listener behind it.
-FB_URL="http://127.0.0.1:65432"
+# A loopback URL for the fallback gateway. bin/heimdall-route now PROBES it (<=1s) before it
+# launches into it and refuses — exit 3 — when nothing answers: a fallback session never falls
+# back to a direct connection (test/headroom-failsafe.test.sh section 13 pins that). So these
+# guarantees need a live listener behind the URL: a bare stdlib server on an OS-assigned port.
+# faketool still only dumps its env and exits; the listener only ever sees the liveness probe.
+FB_PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+python3 -m http.server "$FB_PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+LIVE_PIDS="$LIVE_PIDS $!"
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$FB_PORT/" && break
+  sleep 0.2
+done
+FB_URL="http://127.0.0.1:$FB_PORT"
 
 # The fake heimdall-fallback: one script, entirely driven by env vars set immediately
 # before each invocation, so it serves every guarantee below without being rewritten.

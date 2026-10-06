@@ -448,6 +448,9 @@ DASH = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_das
 # slice and hears "a result changed" must be the very copy the controls module registered `quick-ask` from -- a second _load_module copy
 # would hold no results and never be called back.
 ASK = CONTROLS._sibling("companion_quick_ask") if CONTROLS is not None else None
+DASH_ALERTS = _load_module("dashboard_alerts", os.path.join(LIB_DIR, "dashboard_alerts.py"))
+if PUSH_STORE is not None and getattr(UI, "PUSH", None) is not None:
+    PUSH_STORE.bind_extension_kinds(UI.PUSH.registered_kinds)   # the store accepts, and hmd advertises, exactly the kinds hmd can send
 WS =_load_module("hmd_relay_ws", os.path.join(LIB_DIR, "hmd_relay_ws.py"))
 
 # HMD_RELAY_MAX_ENVELOPE_BYTES (default 1048576 == 1 MiB): the largest sealed
@@ -1986,7 +1989,9 @@ class RelayClient:
                 + ([E2E.CAP_CONTROLS] if CONTROLS is not None else [])
                 + ([VIEW.CAP_VIEW] if VIEW is not None else [])
                 + ([DASH.CAP_DASH] if DASH is not None else [])
-                + ([ASK.CAP_ASK] if ASK is not None else []))
+                + ([ASK.CAP_ASK] if ASK is not None else [])
+                + ([DASH_ALERTS.CAP_ALERTS] if DASH is not None and DASH_ALERTS is not None else [])   # requires dash-v1
+                + (list(PUSH_STORE.extension_kinds().values()) if self._push_ready() else []))          # push-tile-alert-v1, ...
 
     def _control(self, action, params, seq):
         """The phone's sealed control commands (REMOTE CONTROLS above): bin/lib/companion_ui_controls.py owns every
