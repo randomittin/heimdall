@@ -53,6 +53,12 @@ trap 'rm -rf "$T"' EXIT
 # ~/.gitignore_global must not change what `git add -A` sweeps in here.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 XDG_CONFIG_HOME="$T/xdg"
 
+# Hermetic against the operator's own switch too: every case below sets the switch itself (env var per
+# `run`, marker in that case's own HOME), so an exported HMD_TEAM_NO_COMMIT must not leak into the A-section
+# controls ("the commit still happens"). This suite tests the switch; it must not INHERIT it.
+# shellcheck source=lib/hermetic-team-env.sh
+. "$ROOT/test/lib/hermetic-team-env.sh"; hermetic_team_env "$T" || exit 2
+
 # The git shim: every call is appended to $GIT_SHIM_LOG, then handed to the real git untouched.
 SHIM="$T/shim"
 mkdir -p "$SHIM"
