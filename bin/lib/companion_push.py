@@ -10,7 +10,7 @@ PUSH KINDS BEYOND THE FIVE -- THE REGISTRATION INTERFACE (H2 of hmdapp's docs/HA
 a kind WITHOUT editing this file's tables (H4's `digest`, a morning report, goes in exactly this way):
   1. name the module in KIND_MODULES (one tuple, the pattern of companion_ui_controls.ACTION_MODULES);
   2. define `register_push_kinds(kit)` in it. `kit.register_kind(name, phrase=, channel=, level=, ttl=, cap=, priority=, body=, suffix=,
-     scope=None)` registers one kind; `kit.scrub`, `kit.clip`, `kit.utf16_len`, `kit.secret_shaped` (True also when the check cannot
+     scope=None, body_max=BODY_MAX, lines=1)` registers one kind; `kit.scrub`, `kit.clip`, `kit.utf16_len`, `kit.secret_shaped` (True also when the check cannot
      load: fail closed) and `kit.BODY_MAX` are the text tools (the module never imports this one):
        name      ^[a-z][a-z_]{1,23}$, not taken. It joins all_kinds() (KINDS stays the closed six), the per-device kind filter and the
                  `events` the store accepts.
@@ -19,8 +19,11 @@ a kind WITHOUT editing this file's tables (H4's `digest`, a morning report, goes
                  every built-in kind; approval bypasses; question 5, error 4, gate_red 3, finished 2, test 1)
        cap       the capability token (<= 32 chars) hmd lists in its state frames ONLY while the kind is registered, so the app asks
                  for the kind only when it is listed; an unregistered kind in a registration is `bad-events` for that registration
-       body      body(fields) -> str, the WHOLE body: fixed words plus allowlisted fields. Clipped to BODY_MAX here; an exception or
-                 an empty string means no message. It must put no number, path or free text in unless its owner opted in.
+       body      body(fields) -> str, the WHOLE body: fixed words plus allowlisted fields. Whitespace is collapsed and the body is
+                 clipped to BODY_MAX here; an exception or an empty string means no message. `lines` (1..4) keeps up to that many
+                 "\n"-separated lines (each collapsed, empty ones dropped) and `body_max` (BODY_MAX..200 UTF-16 units) lifts the
+                 limit, for a kind whose spec says more (`digest`: 4 lines, 160 units). It must put no number, path or free text in
+                 unless its owner opted in.
        suffix    the collapseId and tag tail, "<scope hash>.<suffix>";  scope(fields) -> str|None is what is hashed (sha256, first 16
                  hex; default: the device ref), so no raw id ever rides in a message
   3. send an instance from ANY process with `enqueue_event(root, kind, fields, key=)`. It writes one 0600 file into
@@ -418,7 +421,7 @@ def _finished_body(fields):
 
 
 # ── kinds beyond the five: the registry (module docstring) ───────────────────────────────────────
-KIND_MODULES = ("dashboard_alerts",)            # modules whose register_push_kinds(kit) runs when this one imports (end of file)
+KIND_MODULES = ("dashboard_alerts", "dashboard_digest")   # modules whose register_push_kinds(kit) runs when this one imports (end of file)
 KIND_NAME_RE = re.compile(r"[a-z][a-z_]{1,23}")
 CAP_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 SUFFIX_RE = re.compile(r"[a-z]{2,12}")
@@ -428,10 +431,12 @@ SPOOL_REL = os.path.join(".heimdall", "app", "push-spool")
 SPOOL_MAX_FILES = 64              # the spool is bounded: the oldest file goes when a new one would be the 65th
 SPOOL_FILE_CAP = 4096             # one spooled event is a few hundred bytes; a bigger file is not ours
 SPOOL_SKEW_S = 30.0               # an event dated further ahead of this clock than this is never served
-_EXT = {}                         # kind -> {"cap", "body", "suffix", "scope", "ttl"}
+BODY_LINES_MAX = 4                # most lines a registered kind may keep (lines=)
+BODY_UNITS_MAX = 200              # most UTF-16 units a registered kind may lift its body to (body_max=)
+_EXT = {}                         # kind -> {"cap", "body", "suffix", "scope", "ttl", "body_max", "lines"}
 
 
-def register_kind(name, *, phrase, channel, level, ttl, cap, priority, body, suffix, scope=None):
+def register_kind(name, *, phrase, channel, level, ttl, cap, priority, body, suffix, scope=None, body_max=None, lines=1):
     """Register one push kind (module docstring, PUSH KINDS BEYOND THE FIVE). ValueError for anything out of its range: a kind
     is trusted code adding itself at import time, so a malformed one fails loudly instead of half-registering."""
     ok = (isinstance(name, str) and KIND_NAME_RE.fullmatch(name) and name not in _KIND_TABLE
@@ -440,12 +445,15 @@ def register_kind(name, *, phrase, channel, level, ttl, cap, priority, body, suf
           and isinstance(ttl, int) and not isinstance(ttl, bool) and 60 <= ttl <= 86400
           and isinstance(cap, str) and CAP_NAME_RE.fullmatch(cap)
           and isinstance(priority, int) and not isinstance(priority, bool) and 0 <= priority <= 9
-          and callable(body) and isinstance(suffix, str) and SUFFIX_RE.fullmatch(suffix) and (scope is None or callable(scope)))
+          and callable(body) and isinstance(suffix, str) and SUFFIX_RE.fullmatch(suffix) and (scope is None or callable(scope))
+          and (body_max is None or (isinstance(body_max, int) and not isinstance(body_max, bool) and BODY_MAX <= body_max <= BODY_UNITS_MAX))
+          and isinstance(lines, int) and not isinstance(lines, bool) and 1 <= lines <= BODY_LINES_MAX)
     if not ok:
         raise ValueError("a push kind is a new kebab name with a phrase, channel, level, ttl, cap, priority, body and suffix")
     _KIND_TABLE[name] = (phrase, channel, None, level, ttl)
     PRIORITY[name] = priority
-    _EXT[name] = {"cap": cap, "body": body, "suffix": suffix, "scope": scope, "ttl": ttl}
+    _EXT[name] = {"cap": cap, "body": body, "suffix": suffix, "scope": scope, "ttl": ttl,
+                  "body_max": BODY_MAX if body_max is None else body_max, "lines": lines}
 
 
 def registered_kinds():
@@ -543,6 +551,14 @@ def read_spool(root, now):
     return out
 
 
+def _fit_body(text, spec):
+    """A registered kind's body as it goes out: whitespace collapsed (per line for a kind that keeps more than one), at most
+    spec["lines"] lines, clipped to spec["body_max"] units. The default kind -- one line, BODY_MAX -- is `" ".join(text.split())`."""
+    pieces = text.split("\n") if spec["lines"] > 1 else [text]
+    kept = [" ".join(piece.split()) for piece in pieces]
+    return clip("\n".join([line for line in kept if line][:spec["lines"]]), spec["body_max"])
+
+
 def build_message(token, event, label, ref, now):
     """One Expo message for `event` (a Planner event) to `token`, or None when there is nothing to send (an
     approval with under MIN_APPROVAL_TTL_S of life left, an unknown kind or finished variant). Every string
@@ -582,7 +598,7 @@ def build_message(token, event, label, ref, now):
             return None
         if not isinstance(body, str) or not body.strip():
             return None
-        body = clip(" ".join(body.split()), BODY_MAX)
+        body = _fit_body(body, ext)
     else:
         body = "Notifications from this laptop work."
     ref = data["ref"]
@@ -1216,7 +1232,7 @@ class PushMonitor:
                 spooled = list(self._spooled)
                 self._spooled.clear()
                 rows, self._digest_rows = self._digest_rows, None
-            self._record_digest(batch, now)
+            self._record_digest(batch + spooled, now)         # (when, event) and (path, event): the report counts the event
             digest = self._digest_event(rows, now)
             if digest is not None:
                 batch.append((now, digest))

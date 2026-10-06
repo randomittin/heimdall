@@ -100,6 +100,12 @@ def valid_bool(v):
     return isinstance(v, bool)
 
 
+# What companion_dashboards adds to dashboard-request for this module (the pattern of dashboard_alerts.OPS / CHECKS): the exact key
+# set of `set-digest` and the check of every key it adds to the ones the dashboards table already knows (`project`).
+OPS = {OP: (("project", "at", "tz_min", "tiles", "include_values", "on"), ())}
+CHECKS = {"at": valid_at, "tz_min": valid_tz, "tiles": valid_tiles, "include_values": valid_bool, "on": valid_bool}
+
+
 # -- the schedule ------------------------------------------------------------------------------------------------------
 def local_day_minute(now, tz_min):
     """("YYYY-MM-DD", minutes since local midnight) of the epoch second `now` at the fixed offset `tz_min` (east positive)."""
@@ -133,8 +139,10 @@ def _clean_config(raw):
           and valid_bool(raw.get("include_values")) and valid_bool(raw.get("on")))
     if not ok:
         return None
+    project = raw.get("project")
     return {"at": raw["at"], "tz_min": raw["tz_min"], "tiles": list(raw["tiles"]), "include_values": raw["include_values"],
-            "on": raw["on"], "set_at": raw["set_at"] if _int(raw.get("set_at")) else 0}
+            "on": raw["on"], "set_at": raw["set_at"] if _int(raw.get("set_at")) else 0,
+            "project": project if isinstance(project, str) and 0 < len(project) <= PROJECT_MAX and project.isprintable() else ""}
 
 
 def _clean(raw):
@@ -232,7 +240,8 @@ def set_config(root, config, now):
     """Store the phone's schedule (already validated by the wire). Turning the digest ON (from off, or the first time) starts the
     counters from zero: the first report covers what happens from then on. Today's spent day is never un-spent. Raises OSError."""
     fresh = {"at": config["at"], "tz_min": config["tz_min"], "tiles": list(config["tiles"]),
-             "include_values": config["include_values"], "on": config["on"], "set_at": int(now)}
+             "include_values": config["include_values"], "on": config["on"], "set_at": int(now),
+             "project": config["project"]}
 
     def change(state):
         was = state["config"]
@@ -290,7 +299,7 @@ def claim(root, now):
             return False, None
         day, _ = local_day_minute(now, config["tz_min"])
         taken = {"day": day, "counts": dict(state["counts"]), "tiles": list(config["tiles"]),
-                 "include_values": config["include_values"]}
+                 "include_values": config["include_values"], "project": config["project"]}
         state.update(last_day=day, last_at=int(now), counts=_zero())
         return True, taken
 
@@ -374,7 +383,8 @@ def make_event(taken, rows):
     if not any(counts.values()) and not tiles:
         return None
     return {"kind": KIND, "key": "d:" + taken["day"], "ep": None,
-            "fields": {"finished": counts["finished"], "verdicts": counts["verdicts"], "alerts": counts["alerts"], "tiles": tiles}}
+            "fields": {"finished": counts["finished"], "verdicts": counts["verdicts"], "alerts": counts["alerts"], "tiles": tiles,
+                       "project": taken["project"]}}
 
 
 def _count(v):
