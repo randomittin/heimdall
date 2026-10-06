@@ -86,7 +86,10 @@ def run_mutants():
     source = open(MODULE, encoding="utf-8").read()
     base = tempfile.mkdtemp(prefix="dashprod-mut-")
     try:
+        only = os.environ.get("DASH_MUTANT_ONLY")    # a `|`-separated list of label fragments: a development loop, not CI
         for i, (label, old, new, expect) in enumerate(MUTANTS):
+            if only and not any(fragment in label for fragment in only.split("|")):
+                continue
             count = source.count(old)
             if count == 0 or (count != 1 and old != "sys.stdin.isatty()"):
                 ok("mutant anchor present: %s" % label, False, "%d matches" % count)
@@ -340,6 +343,8 @@ def read_only_structure():
             refused = False
         except TypeError:
             refused = True
+        except Exception:
+            refused = False
         ok("driver-refuses-raw-sql:%r" % (raw,), refused)
     try:
         mod.CheckedStatement("SELECT 1")
@@ -804,7 +809,7 @@ def scheduler():
         ok("refresh-jitter-within-10-percent-%s" % ("high" if high else "low"), out[0]["phase"] == "live" and abs(nxt - low_bound) < 1e-6 and low_bound <= nxt <= high_bound)
     ran = []
     s = mod.Scheduler(idle_pause_s=12 * 3600)
-    out = s.tick(R, [rec], now=time.time(), present=False, runner=lambda r: ran.append(1))
+    out = s.tick(R, [rec], now=time.time(), present=False, runner=lambda r: (ran.append(1), mod.RunResult(False, "producer-failed", None))[1])
     ok("idle-pause-no-query", ran == [] and [(o["phase"], o["detail"]) for o in out] == [("paused", "idle")])
     pending_dir = os.path.join(R, mod.PENDING_REL)
     mod._private_dir(pending_dir)
