@@ -29,12 +29,17 @@ STATE. snapshot() is the additive `dashboards` key, sent ONLY to a phone whose l
 (overlay()), as `{"v":1,"enabled":bool,"limits":{..},"tiles":[..],"requests":[..last 8..]}`; a tile row is `{dashboard_id, screen_id,
 tile_id, intent, origin: phone|import, rev, refresh_s, phase: generating|needs-confirm|live|error|paused, detail, producer_label,
 confirm: null|{code, expires_at}, last_ok_at, panel: null|{id, title, type, data, refresh_s, updated_at, stale}}`. NEVER in it: the
-proposal, the statement, a connector's settings, a path (test/heimdall-dashboards.test.sh plants a marker in each). `phase` is never
+proposal, the statement, a connector's settings, a path (test/heimdall-dashboards.test.sh plants a marker in each). `create` for a tile_id
+hmd has never seen is ACCEPTED, whatever dashboard_id and screen_id it names (the phone creates tiles before hmd lists dash-v1 and
+sends them once it does); refine, set-refresh and a refresh or remove that names a tile are `unknown-tile` for an id hmd does not hold.
+`phase` is never
 `rejected`: the app derives that itself from a panel it will not draw; a declined or expired tile is `error` + detail declined /
 expired, the pair the app's copy table words. `detail` `budget` is hmd's own addition: the slice is held under 512 KiB, and past that
 the panels of the least recently updated tiles are dropped (the rows stay, `panel` null, `detail` budget). snapshot(phone=False) is
-the LAPTOP view that goes into the base `/api/state` (so the digest moves on every change and `hmd ui` can draw its card): no panel
-data (a short signature instead) and no confirmation code -- the six digits are shown on the phone only.
+the DESKTOP view that goes into the base `/api/state` (so the digest moves on every change and `hmd ui` draws the same tiles
+READ-ONLY from the same store): the same rows and panels, but no confirmation code -- the six digits are shown on the phone only.
+`hmd ui` has no route that creates, edits or removes a tile: its only POST routes are /api/send (the inbox) and /api/control, and a
+dashboard-request through /api/control is `caps-missing` (no phone caps on the direct route).
 
 STORE. <repo>/.heimdall/ui/dashboards/<dashboard_id>/<tile_id>.json (dir 0700, file 0600, `<id>.json.<pid>.tmp` -> os.replace, regular
 files only, never a symlink) is ONE tile definition; meta.json beside them holds the request ring, the generation queue and the
@@ -886,19 +891,17 @@ def _row(tile, now, phone):
     if phase == "needs-confirm":
         expires = int(tile["pending_at"] + PENDING_TTL_S)
         row["confirm"] = {"code": confirm_code(tile["tile_id"], tile["fingerprint"]), "expires_at": expires} if phone else {"expires_at": expires}
-    if panel is not None:
-        if phone:
-            row["panel"] = dict(panel, stale=_stale(panel, now))
-        else:                                                     # the laptop view: a signature moves the digest, the numbers stay put
-            row["panel_sig"] = hashlib.sha256(json.dumps(panel, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
-            row["stale"] = _stale(panel, now)
+    if panel is not None:                                         # both views carry the panel: `hmd ui` draws the same tiles, read-only
+        row["panel"] = dict(panel, stale=_stale(panel, now))
     return row
 
 
 def snapshot(root, now=None, phone=True, redact=None):
-    """The `dashboards` key: the phone's slice (phone=True, codes and panels in) or the laptop view for the base state. `redact`
-    is the relay's redaction profile, applied before the size is judged. Held under SLICE_BYTES: past it the panels of the least
-    recently updated tiles go (the rows stay, `panel` null, `detail` budget)."""
+    """The `dashboards` key: the phone's slice (phone=True) or the desktop view for the base state (phone=False) -- the same tiles and
+    the same panels, from the same store; the ONLY difference is that the desktop view carries no confirmation code (`confirm` is
+    {expires_at}), because the six digits are shown on the phone alone, and it adds `pending`, the count waiting for a person.
+    `redact` is the relay's redaction profile, applied before the size is judged. Held under SLICE_BYTES: past it the panels of
+    the least recently updated tiles go (the rows stay, `panel` null, `detail` budget)."""
     now = time.time() if now is None else now
     out = {"v": 1, "enabled": enabled(root), "limits": dict(LIMITS), "tiles": [], "requests": []}
     if not out["enabled"]:
