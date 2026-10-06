@@ -75,8 +75,9 @@ Q=companion_quick_ask.py
 C=companion_ui_controls.py
 mutant "drop the asks switch gate" $C 'if gated is not None and not _switch_on(gated):' 'if False:' switch-off-refuses
 mutant "ignore the phone's caps" $C 'if cap is not None and (caps is None or cap not in caps):' 'if False:' caps-missing
+# the exact key set is enforced twice (the dispatcher, then parse_params): both layers must go before an extra key gets through
 mutant "accept an extra param" $C 'if not set(spec["required"]) <= keys or not keys <= set(spec["required"]) | set(spec["optional"]):' \
-  'if not set(spec["required"]) <= keys:' keysets
+  'if not set(spec["required"]) <= keys:' keysets $Q 'set(body) != {"project", "text"} or ' ''
 mutant "skip the dashboards switch" $Q 'if not _switch_on("dashboards"):' 'if False:' dashboards-off-refuses
 mutant "skip the project check" $Q 'if fields["project"] not in project_names(root):' 'if False:' wrong-project
 mutant "accept a secret-shaped question" $Q 'and not _panels().secret_shaped(v)' 'and True' secret-question-refused
