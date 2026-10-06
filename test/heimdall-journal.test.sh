@@ -84,27 +84,35 @@ W="haid:test.writer-0001"
 # ─────────────────────────────────────────────────────────────────────────────
 echo "A. HELP — usage names all subcommands, exit 0:"
 OUT="$("$JRNL" help 2>&1)"; RC=$?
-[ "$RC" -eq 0 ] && ok "help exits 0" || bad "help exit=$RC"
+if [ "$RC" -eq 0 ]; then ok "help exits 0"; else bad "help exit=$RC"; fi
 ALL_NAMED=1
 for word in add today tail grep path; do
   printf '%s' "$OUT" | grep -q "$word" || ALL_NAMED=0
 done
-[ "$ALL_NAMED" -eq 1 ] && ok "usage names add/today/tail/grep/path" || bad "usage missing a subcommand:
+if [ "$ALL_NAMED" -eq 1 ]; then
+  ok "usage names add/today/tail/grep/path"
+else
+  bad "usage missing a subcommand:
 $OUT"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "B. ADD SHAPE — file header + entry header + body + By:, path printed:"
 P="$(make_project)"
 FILE="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "pyenv shim adds ~400ms" --body "bare python3 goes through the pyenv shim; statusline 2.35-4.09s before, 0.53-0.96s after pointing at the real interpreter." --evidence "measured via hyperfine, n=20")"
 RC=$?
-[ "$RC" -eq 0 ] && ok "add exits 0" || bad "add exit=$RC"
-[ -f "$FILE" ] && ok "printed path exists on disk: $FILE" || bad "printed path does not exist: $FILE"
+if [ "$RC" -eq 0 ]; then ok "add exits 0"; else bad "add exit=$RC"; fi
+if [ -f "$FILE" ]; then ok "printed path exists on disk: $FILE"; else bad "printed path does not exist: $FILE"; fi
 case "$FILE" in *".planning/journal/"*"-haid_test.writer-0001.md") ok "path shaped {date}-{haid-slug}.md under .planning/journal/" ;; *) bad "unexpected path shape: $FILE" ;; esac
-grep -q "^# Journal — " "$FILE" && ok "file header present" || bad "missing file header"
-grep -Eq '^## [0-9T:Z-]+ — \[FINDING\] pyenv shim adds ~400ms$' "$FILE" && ok "entry header shaped correctly" || bad "entry header wrong shape:
+if grep -q "^# Journal — " "$FILE"; then ok "file header present"; else bad "missing file header"; fi
+if grep -Eq '^## [0-9T:Z-]+ — \[FINDING\] pyenv shim adds ~400ms$' "$FILE"; then
+  ok "entry header shaped correctly"
+else
+  bad "entry header wrong shape:
 $(cat "$FILE")"
-grep -q "0.53-0.96s after" "$FILE" && ok "body text present" || bad "body text missing"
-grep -q "^\*\*By:\*\* $W$" "$FILE" && ok "By: attribution present" || bad "By: attribution missing"
+fi
+if grep -q "0.53-0.96s after" "$FILE"; then ok "body text present"; else bad "body text missing"; fi
+if grep -q "^\*\*By:\*\* $W$" "$FILE"; then ok "By: attribution present"; else bad "By: attribution missing"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,15 +124,15 @@ git -C "$P" config core.hooksPath "$P/.git/no-hooks"
 BEFORE="$(ncommits "$P")"
 FILE="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add decision "extend, do not compete" --body "resume-contract.sh notes are explicitly not-in-git; build an additive tool instead of bending checkpoint's shape to fit.")"
 AFTER="$(ncommits "$P")"
-[ "$AFTER" -eq $((BEFORE + 1)) ] && ok "exactly one new commit landed" || bad "commit count before=$BEFORE after=$AFTER"
+if [ "$AFTER" -eq $((BEFORE + 1)) ]; then ok "exactly one new commit landed"; else bad "commit count before=$BEFORE after=$AFTER"; fi
 SUBJ="$(git -C "$P" log -1 --format=%s)"
 case "$SUBJ" in "journal: [DECISION]"*) ok "commit subject carries type: $SUBJ" ;; *) bad "unexpected subject: $SUBJ" ;; esac
 TRAILER_BODY="$(git -C "$P" log -1 --format=%b)"
-[ "$(printf '%s\n' "$TRAILER_BODY" | grep -Fxc 'Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>')" -eq 1 ] && ok "exactly one Co-Authored-By: runhmd trailer" || bad "runhmd trailer not present exactly once: $TRAILER_BODY"
-printf '%s' "$TRAILER_BODY" | grep -qF "hmd@runheimdall.dev" && bad "retired hmd@runheimdall.dev address still emitted: $TRAILER_BODY" || ok "no retired hmd@runheimdall.dev address"
+if [ "$(printf '%s\n' "$TRAILER_BODY" | grep -Fxc 'Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>')" -eq 1 ]; then ok "exactly one Co-Authored-By: runhmd trailer"; else bad "runhmd trailer not present exactly once: $TRAILER_BODY"; fi
+if printf '%s' "$TRAILER_BODY" | grep -qF "hmd@runheimdall.dev"; then bad "retired hmd@runheimdall.dev address still emitted: $TRAILER_BODY"; else ok "no retired hmd@runheimdall.dev address"; fi
 CHANGED="$(git -C "$P" diff --name-only HEAD~1 HEAD)"
-[ "$(printf '%s\n' "$CHANGED" | wc -l | tr -d ' ')" -eq 1 ] && ok "commit touched exactly one file (scoped add, not -A): $CHANGED" || bad "commit touched more than the journal file: $CHANGED"
-[ "$(dirty_count "$P")" -eq 0 ] && ok "tree clean after commit" || bad "tree still dirty after commit"
+if [ "$(printf '%s\n' "$CHANGED" | wc -l | tr -d ' ')" -eq 1 ]; then ok "commit touched exactly one file (scoped add, not -A): $CHANGED"; else bad "commit touched more than the journal file: $CHANGED"; fi
+if [ "$(dirty_count "$P")" -eq 0 ]; then ok "tree clean after commit"; else bad "tree still dirty after commit"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -134,8 +142,8 @@ touch "$P/.heimdall-no-autocommit"
 BEFORE="$(ncommits "$P")"
 FILE="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "no-autocommit path" --body "durability (the append) must never be skipped even when the commit side-effect is opted out.")"
 AFTER="$(ncommits "$P")"
-[ -f "$FILE" ] && grep -q "no-autocommit path" "$FILE" && ok "entry written to disk despite no-autocommit" || bad "entry missing on disk"
-[ "$AFTER" -eq "$BEFORE" ] && ok "no commit created (no-autocommit respected)" || bad "commit fired despite .heimdall-no-autocommit"
+if [ -f "$FILE" ] && grep -q "no-autocommit path" "$FILE"; then ok "entry written to disk despite no-autocommit"; else bad "entry missing on disk"; fi
+if [ "$AFTER" -eq "$BEFORE" ]; then ok "no commit created (no-autocommit respected)"; else bad "commit fired despite .heimdall-no-autocommit"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,26 +151,26 @@ echo "E. INVALID TYPE — rejected outright, nothing written or committed:"
 P="$(make_project)"
 BEFORE="$(ncommits "$P")"
 OUT="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add bogus-type "x" --body "y" 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "exit 2 on invalid type" || bad "exit=$RC (want 2)"
-printf '%s' "$OUT" | grep -qi "invalid type" && ok "clear error message: $OUT" || bad "unclear error: $OUT"
-[ -d "$P/.planning/journal" ] && bad "journal dir created despite rejection" || ok "no journal dir created"
-[ "$(ncommits "$P")" -eq "$BEFORE" ] && ok "no commit created" || bad "commit fired despite invalid type"
+if [ "$RC" -eq 2 ]; then ok "exit 2 on invalid type"; else bad "exit=$RC (want 2)"; fi
+if printf '%s' "$OUT" | grep -qi "invalid type"; then ok "clear error message: $OUT"; else bad "unclear error: $OUT"; fi
+if [ -d "$P/.planning/journal" ]; then bad "journal dir created despite rejection"; else ok "no journal dir created"; fi
+if [ "$(ncommits "$P")" -eq "$BEFORE" ]; then ok "no commit created"; else bad "commit fired despite invalid type"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "F. MISSING SUBJECT — rejected, exit 2:"
 P="$(make_project)"
 OUT="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "" --body "y" 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "exit 2 on empty subject" || bad "exit=$RC (want 2): $OUT"
-[ -d "$P/.planning/journal" ] && bad "journal dir created despite missing subject" || ok "no journal dir created"
+if [ "$RC" -eq 2 ]; then ok "exit 2 on empty subject"; else bad "exit=$RC (want 2): $OUT"; fi
+if [ -d "$P/.planning/journal" ]; then bad "journal dir created despite missing subject"; else ok "no journal dir created"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "G. MISSING BODY — no --body, empty stdin: rejected, exit 2:"
 P="$(make_project)"
 OUT="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "no body given" < /dev/null 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "exit 2 on missing body" || bad "exit=$RC (want 2): $OUT"
-[ -d "$P/.planning/journal" ] && bad "journal dir created despite missing body" || ok "no journal dir created"
+if [ "$RC" -eq 2 ]; then ok "exit 2 on missing body"; else bad "exit=$RC (want 2): $OUT"; fi
+if [ -d "$P/.planning/journal" ]; then bad "journal dir created despite missing body"; else ok "no journal dir created"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,17 +178,21 @@ echo "H. OVERSIZED BODY — rejected outright (not silently truncated):"
 P="$(make_project)"
 BIG="$(printf 'x%.0s' $(seq 1 5000))"
 OUT="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "too big" --body "$BIG" 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "exit 2 on oversized body" || bad "exit=$RC (want 2)"
-[ -d "$P/.planning/journal" ] && bad "journal dir created despite oversized body" || ok "no journal dir / no partial write created"
+if [ "$RC" -eq 2 ]; then ok "exit 2 on oversized body"; else bad "exit=$RC (want 2)"; fi
+if [ -d "$P/.planning/journal" ]; then bad "journal dir created despite oversized body"; else ok "no journal dir / no partial write created"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "I. REFUTED ALIAS — normalizes to [CORRECTION], the first-class type:"
 P="$(make_project)"
 FILE="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add refuted "headroom link to token-spend-forensics" --body "sibling agent measured token-spend-forensics.md is entirely innocent of any headroom link (100% context-lifecycle) — hmd's earlier claim tying the cost delta to headroom was wrong." --evidence "sibling agent measurement, token-spend-forensics.md content audit")"
-grep -q "\[CORRECTION\] headroom link" "$FILE" && ok "refuted normalized to [CORRECTION] in the file" || bad "alias did not normalize:
+if grep -q "\[CORRECTION\] headroom link" "$FILE"; then
+  ok "refuted normalized to [CORRECTION] in the file"
+else
+  bad "alias did not normalize:
 $(cat "$FILE" 2>/dev/null)"
-grep -qi "\[REFUTED\]" "$FILE" && bad "raw REFUTED leaked into the file (should be CORRECTION)" || ok "no raw REFUTED tag leaked"
+fi
+if grep -qi "\[REFUTED\]" "$FILE"; then bad "raw REFUTED leaked into the file (should be CORRECTION)"; else ok "no raw REFUTED tag leaked"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,9 +200,9 @@ echo "J. SAME-DAY APPEND — one writer, one day, two adds: one header, two entr
 P="$(make_project)"
 F1="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "first-entry" --body "body one")"
 F2="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "second-entry" --body "body two")"
-[ "$F1" = "$F2" ] && ok "both adds resolved to the same file" || bad "file path drifted: $F1 vs $F2"
-[ "$(grep -c '^# Journal — ' "$F1")" -eq 1 ] && ok "exactly one file header (not duplicated on 2nd add)" || bad "file header duplicated"
-[ "$(grep -c '^## ' "$F1")" -eq 2 ] && ok "exactly two entry headers accumulated" || bad "entry count wrong: $(grep -c '^## ' "$F1")"
+if [ "$F1" = "$F2" ]; then ok "both adds resolved to the same file"; else bad "file path drifted: $F1 vs $F2"; fi
+if [ "$(grep -c '^# Journal — ' "$F1")" -eq 1 ]; then ok "exactly one file header (not duplicated on 2nd add)"; else bad "file header duplicated"; fi
+if [ "$(grep -c '^## ' "$F1")" -eq 2 ]; then ok "exactly two entry headers accumulated"; else bad "entry count wrong: $(grep -c '^## ' "$F1")"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,9 +210,9 @@ echo "K. HAID OVERRIDE — HEIMDALL_HAID selects the per-writer filename shard:"
 P="$(make_project)"
 FA="$(cd "$P" && HEIMDALL_HAID="haid:writer.a" "$JRNL" add finding "from A" --body "a")"
 FB="$(cd "$P" && HEIMDALL_HAID="haid:writer.b" "$JRNL" add finding "from B" --body "b")"
-[ "$FA" != "$FB" ] && ok "different HEIMDALL_HAID values shard into different files" || bad "both writers collided into one file"
-printf '%s' "$FA" | grep -q "writer.a" && ok "writer A slug reflected in filename" || bad "writer A slug missing from: $FA"
-printf '%s' "$FB" | grep -q "writer.b" && ok "writer B slug reflected in filename" || bad "writer B slug missing from: $FB"
+if [ "$FA" != "$FB" ]; then ok "different HEIMDALL_HAID values shard into different files"; else bad "both writers collided into one file"; fi
+if printf '%s' "$FA" | grep -q "writer.a"; then ok "writer A slug reflected in filename"; else bad "writer A slug missing from: $FA"; fi
+if printf '%s' "$FB" | grep -q "writer.b"; then ok "writer B slug reflected in filename"; else bad "writer B slug missing from: $FB"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -208,10 +220,14 @@ echo "L. TODAY — prints today's file content for the resolved haid:"
 P="$(make_project)"
 ( cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "today-marker-entry" --body "body for today test" ) >/dev/null
 OUT="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" today)"
-printf '%s' "$OUT" | grep -q "today-marker-entry" && ok "today prints the entry just added" || bad "today missing the entry:
+if printf '%s' "$OUT" | grep -q "today-marker-entry"; then
+  ok "today prints the entry just added"
+else
+  bad "today missing the entry:
 $OUT"
+fi
 OUT2="$(cd "$P" && HEIMDALL_HAID="haid:nobody.here" "$JRNL" today)"
-[ -z "$OUT2" ] && ok "today for a writer with no entries prints nothing (not an error)" || bad "today printed unexpected content: $OUT2"
+if [ -z "$OUT2" ]; then ok "today for a writer with no entries prints nothing (not an error)"; else bad "today printed unexpected content: $OUT2"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,12 +237,15 @@ P="$(make_project)"
 ( cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "tail-second" --body "2" ) >/dev/null
 ( cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "tail-third" --body "3" ) >/dev/null
 OUT="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" tail 2)"
-printf '%s' "$OUT" | grep -q "tail-second" && printf '%s' "$OUT" | grep -q "tail-third" \
-  && ok "tail 2 contains the last two entries" || bad "tail 2 missing an expected entry:
+if printf '%s' "$OUT" | grep -q "tail-second" && printf '%s' "$OUT" | grep -q "tail-third"; then
+  ok "tail 2 contains the last two entries"
+else
+  bad "tail 2 missing an expected entry:
 $OUT"
-printf '%s' "$OUT" | grep -q "tail-first" && bad "tail 2 leaked the older 3rd-from-last entry" || ok "tail 2 correctly excludes the older entry"
+fi
+if printf '%s' "$OUT" | grep -q "tail-first"; then bad "tail 2 leaked the older 3rd-from-last entry"; else ok "tail 2 correctly excludes the older entry"; fi
 LAST_LINE_ENTRY="$(printf '%s' "$OUT" | grep '^## ' | tail -1)"
-printf '%s' "$LAST_LINE_ENTRY" | grep -q "tail-third" && ok "most recent entry is last in output order" || bad "ordering wrong, last header: $LAST_LINE_ENTRY"
+if printf '%s' "$LAST_LINE_ENTRY" | grep -q "tail-third"; then ok "most recent entry is last in output order"; else bad "ordering wrong, last header: $LAST_LINE_ENTRY"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,13 +254,17 @@ P="$(make_project)"
 ( cd "$P" && HEIMDALL_HAID="haid:writer.a" "$JRNL" add finding "grep-target-alpha" --body "unique-needle-xyz here" ) >/dev/null
 ( cd "$P" && HEIMDALL_HAID="haid:writer.b" "$JRNL" add decision "unrelated" --body "nothing to see" ) >/dev/null
 OUT="$(cd "$P" && "$JRNL" grep "unique-needle-xyz")"; RC=$?
-[ "$RC" -eq 0 ] && ok "grep exits 0 on a match" || bad "grep exit=$RC on a match"
-printf '%s' "$OUT" | grep -q "unique-needle-xyz" && ok "grep found the planted needle" || bad "grep missed the needle:
+if [ "$RC" -eq 0 ]; then ok "grep exits 0 on a match"; else bad "grep exit=$RC on a match"; fi
+if printf '%s' "$OUT" | grep -q "unique-needle-xyz"; then
+  ok "grep found the planted needle"
+else
+  bad "grep missed the needle:
 $OUT"
+fi
 case "$OUT" in *:*:*) ok "output is file:line:content shaped" ;; *) bad "output not file:line shaped: $OUT" ;; esac
-printf '%s' "$OUT" | grep -q "writer.a" && ok "match attributed to the writer.a shard file" || bad "wrong shard matched"
+if printf '%s' "$OUT" | grep -q "writer.a"; then ok "match attributed to the writer.a shard file"; else bad "wrong shard matched"; fi
 OUT2="$(cd "$P" && "$JRNL" grep "no-such-string-anywhere")"; RC2=$?
-[ "$RC2" -ne 0 ] && ok "grep exits nonzero on no match (real grep semantics passthrough)" || bad "grep exit=$RC2 on no match (want nonzero)"
+if [ "$RC2" -ne 0 ]; then ok "grep exits nonzero on no match (real grep semantics passthrough)"; else bad "grep exit=$RC2 on no match (want nonzero)"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,15 +272,19 @@ echo "O. PATH — deterministic, does not require the file to exist:"
 P="$(make_project)"
 OUT="$(cd "$P" && "$JRNL" path --date 2020-01-01 --haid "haid:fixed.one")"
 case "$OUT" in *".planning/journal/2020-01-01-haid_fixed.one.md") ok "path computed deterministically: $OUT" ;; *) bad "unexpected path: $OUT" ;; esac
-[ -f "$OUT" ] && bad "path subcommand unexpectedly created the file" || ok "path does not create the file"
+if [ -f "$OUT" ]; then bad "path subcommand unexpectedly created the file"; else ok "path does not create the file"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "P. EVIDENCE LINE — --evidence renders a **Evidence:** line:"
 P="$(make_project)"
 FILE="$(cd "$P" && HEIMDALL_HAID="$W" "$JRNL" add finding "with evidence" --body "body text" --evidence "npm test exit 0, 47 passing")"
-grep -q "^\*\*Evidence:\*\* npm test exit 0, 47 passing$" "$FILE" && ok "Evidence line rendered" || bad "Evidence line missing/malformed:
+if grep -q "^\*\*Evidence:\*\* npm test exit 0, 47 passing$" "$FILE"; then
+  ok "Evidence line rendered"
+else
+  bad "Evidence line missing/malformed:
 $(cat "$FILE")"
+fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -269,12 +296,12 @@ for t in finding decision correction communication; do
   U="$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')"
   grep -q "\[$U\] type-$t" "$F" 2>/dev/null || ALL_OK=0
 done
-[ "$ALL_OK" -eq 1 ] && ok "all four canonical types accepted and tagged correctly" || bad "one or more types failed"
+if [ "$ALL_OK" -eq 1 ]; then ok "all four canonical types accepted and tagged correctly"; else bad "one or more types failed"; fi
 rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "R. SYNTAX — bash -n clean on heimdall-journal:"
-bash -n "$JRNL" && ok "bash -n clean" || bad "syntax error in $JRNL"
+if bash -n "$JRNL"; then ok "bash -n clean"; else bad "syntax error in $JRNL"; fi
 
 echo ""
 echo "heimdall-journal.test.sh: $PASS passed, $FAIL failed."
