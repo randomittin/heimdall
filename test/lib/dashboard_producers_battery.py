@@ -859,6 +859,94 @@ def run_due_against_the_store():
 
 
 # -- I. structure ------------------------------------------------------------------------------------------------
+def cli_at(root, *args):
+    done = subprocess.run([sys.executable, MODULE, "--repo", root] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, timeout=60, env=dict(os.environ))
+    return done.returncode, done.stdout, done.stderr
+
+
+@section
+def serve_loop():
+    R4 = os.path.join(T, "repo4")
+    os.makedirs(R4)
+    t = tid()
+    store.put_tile(R4, store.new_tile(t, D1))
+    store.enqueue(R4, {"rid": "q-00000009", "op": "create", "tile_id": t, "dashboard_id": D1, "text": "orders per day", "shape": None,
+                       "refresh_s": 300, "origin": "phone", "author": None, "context": []})
+    store.ENABLED = False
+    mod.serve(R4, store=store, once=True, model=lambda p: proposal_json(), drivers=lambda e, env: Recording())
+    store.ENABLED = True
+    ok("serve:switch-off-serves-nothing", store.get_tile(R4, t)["phase"] == "generating" and len(store._meta(R4)["queue"]) == 1)
+    os.environ["HMD_DASH_MODEL_BIN"] = os.path.join(T, "bin", "fake-hmd-exec")
+    rc, _out, err = cli_at(R4, "run", "--once")
+    ok("serve:run-once-generates-and-opens-the-confirmation", rc == 0 and store.get_tile(R4, t)["phase"] == "needs-confirm"
+       and mod.read_pending(R4, t)["state"] == "pending", err[-200:])
+    with as_tty():
+        done, msg = mod.confirm_tile(R4, t, mod.confirm_code(t, mod.fingerprint(GOOD)), store=store)
+    store.set_last_request(R4, time.time())
+    rc, _out, err = cli_at(R4, "run", "--once")
+    tile = store.get_tile(R4, t)
+    ok("serve:run-once-refreshes-a-confirmed-tile", done and rc == 0 and tile["panel"] and tile["panel"]["data"]["y"] == [3, 5, 8], err[-200:] + msg)
+    os.environ.pop("HMD_DASH_MODEL_BIN", None)
+    ok("serve:bad-interval-is-a-usage-error", cli_at(R4, "run", "--interval", "0")[0] == 2 and cli_at(R4, "run", "--bogus", "1")[0] == 2)
+    ok("serve:without-a-store-it-refuses", subprocess.run([sys.executable, MODULE, "--repo", R4, "run", "--once"], stdin=subprocess.DEVNULL,
+                                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+                                                         env=dict(os.environ, HMD_DASH_STORE_MODULE=os.path.join(T, "no-such-store.py"))).returncode == 1)
+
+
+REAL_STORE = os.path.join(REPO, "bin", "lib", "companion_dashboards.py")
+
+
+@section
+def real_store_contract():
+    """The same flow through bin/lib/companion_dashboards.py itself (present once the protocol half is merged)."""
+    if not os.path.exists(REAL_STORE):
+        print("  note real store not in this tree; contract section skipped")
+        return
+    real = load("real_store_under_test", REAL_STORE)
+    switch = os.path.join(HH, "remote-dashboards.json")
+    with open(switch, "w") as f:
+        json.dump({"enabled": True, "since": "2026-10-06T00:00:00Z"}, f)
+    os.chmod(switch, 0o600)
+    R3 = os.path.join(T, "repo3")
+    os.makedirs(R3)
+    t, did = "t-0000aaaa", "d-0000aaaa"
+    fields = {"rid": "q-00000001", "op": "create", "dashboard_id": did, "screen_id": "s-0000aaaa", "tile_id": t, "project": os.path.basename(R3),
+              "text": "orders per day", "refresh_s": 300, "shape": None, "origin": "import", "author": "ab" * 16}
+    real._write_tile(R3, real._new_tile(fields, time.time()))
+
+    def queue(op, rid):
+        meta = real._load_meta(R3)
+        meta["queue"].append({"rid": rid, "op": op, "tile_id": t, "dashboard_id": did, "text": "orders per day", "shape": None,
+                              "refresh_s": 300, "origin": "import", "author": "ab" * 16, "context": []})
+        real._save_meta(R3, meta)
+    queue("create", "q-00000001")
+    fp = mod.fingerprint(GOOD)
+    ok("real-store:job-served", mod.generate_next(R3, store=real, model=lambda p: proposal_json(), drivers=lambda e, env: Recording()) is True)
+    tile = real.get_tile(R3, t)
+    ok("real-store:needs-confirm-and-code-hash-matches-the-codes-it-shows", tile["phase"] == "needs-confirm" and tile["fingerprint"] == fp
+       and mod.read_pending(R3, t)["code_sha256"] == hashlib.sha256(real.confirm_code(t, fp).encode()).hexdigest())
+    ok("real-store:pending-lists-the-full-statement", any(p["producer"]["statement"] == GOOD["statement"] for p in real.pending_confirmations(R3)))
+    with as_tty():
+        done, msg = mod.confirm_tile(R3, t, real.confirm_code(t, fp), store=real)
+    ok("real-store:confirm-pins-confirmed_fp", done and real.get_tile(R3, t)["confirmed_fp"] == fp, msg)
+    real._save_meta(R3, dict(real._load_meta(R3), last_request_at=time.time()))
+    outcomes = mod.run_due(R3, mod.Scheduler(idle_pause_s=43200), store=real)
+    ok("real-store:panel-published-through-its-validator", bool(outcomes) and outcomes[0]["phase"] == "live"
+       and real.get_tile(R3, t)["panel"]["data"]["y"] == [3, 5, 8], str(outcomes))
+    audit = open(os.path.join(R3, ".heimdall", "ui", "controls-audit.jsonl")).read()
+    ok("real-store:audit-has-the-confirmation-and-no-statement", '"confirm"' in audit and "SELECT" not in audit and "orders" not in audit)
+    snap = real.snapshot(R3, phone=True)
+    text = json.dumps(snap)
+    ok("real-store:slice-is-not-vacuous", snap["enabled"] is True and len(snap["tiles"]) == 1 and snap["tiles"][0]["producer_label"] == "shop (read-only)")
+    ok("real-store:slice-carries-no-statement-or-proposal", all(w not in text for w in ("SELECT", "proposal", "statement", "password")))
+    queue("refine", "q-00000002")
+    mod.generate_next(R3, store=real, model=lambda p: proposal_json(), drivers=lambda e, env: Recording())
+    recording = Recording()
+    mod.run_due(R3, mod.Scheduler(idle_pause_s=43200), store=real, drivers=lambda e, env: recording)
+    ok("real-store:import-refine-never-runs-without-a-fresh-confirmation", recording.selects == [] and not mod.may_run(R3, prod_rec(t, GOOD, TS))[0])
+
+
 @section
 def structure():
     for needle in ("shell=True", "os.system", "os.popen", "import connectors", "from connectors", "post_resolution", "close_issue", "subprocess.run("):

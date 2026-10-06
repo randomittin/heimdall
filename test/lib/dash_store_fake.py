@@ -21,6 +21,15 @@ BASE = os.path.join(".heimdall", "ui", "dashboards")
 AUDIT = os.path.join(".heimdall", "ui", "controls-audit.jsonl")
 PENDING_TTL_S = 24 * 3600
 FORCE_LIVE_ON_REGISTER = False
+ENABLED = True
+
+
+def enabled(root):
+    return ENABLED
+
+
+def expire_pending(root, now=None):
+    return []
 
 
 def fingerprint_of(producer):

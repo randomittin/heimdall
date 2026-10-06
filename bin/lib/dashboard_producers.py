@@ -80,6 +80,7 @@ CONFIRM_DOMAIN = b"hmd-dash-confirm-v1\x00"
 TEXT_MAX_CHARS = 240
 TEXT_MAX_BYTES = 600
 SIBLING_TILES_MAX = 15
+SERVE_JOBS_PER_PASS = 50
 
 PSQL_ENV = "HMD_DASH_PSQL"                     # absolute path of the psql binary (default: the one on PATH)
 MODEL_BIN_ENV = "HMD_DASH_MODEL_BIN"           # replaces bin/hmd-exec as the model runner (tests; an operator's own wrapper)
@@ -1277,6 +1278,7 @@ USAGE = ("usage: hmd dash pending|ls [--repo DIR]\n"
          "       hmd dash show <tile> [--repo DIR]\n"
          "       hmd dash confirm <tile> [--code NNNNNN] [--repo DIR]     (needs a terminal)\n"
          "       hmd dash decline <tile> [--repo DIR]\n"
+         "       hmd dash run [--once] [--interval S] [--repo DIR]     (the producer loop; run it as yourself)\n"
          "       hmd dash connector add <name> --engine sqlite --path FILE        (needs a terminal)\n"
          "       hmd dash connector add <name> --engine postgres --host H --port P --dbname D --user U [--password-env VAR] [--sslmode M]\n"
          "       hmd dash connector ls | rm <name>\n")
@@ -1471,6 +1473,16 @@ def main(argv):
             return _refuse("hmd dash show: no such tile")
         _print_tile(root, tile, time.time())
         return 0
+    if cmd == "run":
+        opts, pos = _split_options([a for a in args if a != "--once"], ("--interval",))
+        try:
+            interval = float(opts.get("--interval", 5)) if opts is not None else 0.0
+        except ValueError:
+            interval = 0.0
+        if opts is None or pos or not 0.5 <= interval <= 3600:
+            sys.stderr.write(USAGE)
+            return 2
+        return serve(root, once="--once" in args, interval_s=interval)
     if cmd == "confirm":
         return _cmd_confirm(root, args)
     if cmd == "decline" and len(args) == 1:
