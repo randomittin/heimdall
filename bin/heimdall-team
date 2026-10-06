@@ -795,7 +795,7 @@ PYEOF
   fi
   # DENIED — actionable, never leaks the token or the reason verbatim beyond the known codes.
   case "$REASON" in
-    *non*collaborator*|*read*only*|*read-only*|*forbidden*|*not*collaborator*)
+    *non*collaborator*|*read*only*|*forbidden*|*not*collaborator*)  # *read*only* already covers read-only / read_only / "read only"
       if [ "$MODE" = loud ]; then
         printf 'heimdall-team: GitHub says you lack write (collaborator) access to %s, so I cannot auto-join you to its team.\n' "$SLUG"
         printf '  Ask a repo admin to add you, then rerun  hmd team  — or start your OWN team with:  hmd team new\n'
