@@ -1991,7 +1991,7 @@ class RelayClient:
                 + ([DASH.CAP_DASH] if DASH is not None else [])
                 + ([ASK.CAP_ASK] if ASK is not None else [])
                 + ([DASH_ALERTS.CAP_ALERTS] if DASH is not None and DASH_ALERTS is not None else [])   # requires dash-v1
-                + (list(PUSH_STORE.extension_kinds().values()) if self._push_ready() else []))          # push-tile-alert-v1, ...
+                + (list(PUSH_STORE.extension_kinds().values()) if self._push_ready() else []))          # push-tile-alert-v1, push-digest-v1, ...
 
     def _control(self, action, params, seq):
         """The phone's sealed control commands (REMOTE CONTROLS above): bin/lib/companion_ui_controls.py owns every
