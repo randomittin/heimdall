@@ -148,6 +148,36 @@ hmd_headroom_port_state() {
   esac
 }
 
+# hmd_headroom_port_owner <port> — "pid N (command)" for whatever LISTENs on the port, best-effort;
+# prints nothing when it cannot tell. The 2026-10-06 trigger was ANOTHER TOOL taking and killing
+# the proxy's port, so a refusal that names the holder turns "something is on my port" into a line
+# an operator can act on instead of a mystery.
+hmd_headroom_port_owner() {
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN -Fpc 2>/dev/null \
+    | awk '/^p/ {pid = substr($0, 2)} /^c/ {printf "pid %s (%s)", pid, substr($0, 2); exit}'
+}
+
+_hmd_headroom_held_by() {
+  local o
+  o="$(hmd_headroom_port_owner "$1")"
+  [ -n "$o" ] && printf ' — the port is held by %s' "$o"
+  return 0
+}
+
+# hmd_headroom_required — must this launch NOT silently fall back to a direct connection when the
+# proxy is wanted but down?
+#   · a JUDGE subprocess (HMD_JUDGMENT truthy — the same test bin/lib/hmd-route-claude applies): a
+#     verdict produced on a path nobody asked for is the false green this repo exists to prevent;
+#   · anything the caller marks HMD_HEADROOM_REQUIRED=1 (OmniRoute fallback routing).
+# Only a plain, non-judge, non-fallback session — which carries its own Anthropic auth — may go
+# direct, and then only with the warning hmd_headroom_chain prints.
+hmd_headroom_required() {
+  case "${HMD_JUDGMENT:-}" in ''|0|false|FALSE|no|NO) : ;; *) return 0 ;; esac
+  case "${HMD_HEADROOM_REQUIRED:-}" in 1|true|TRUE|yes|YES) return 0 ;; esac
+  return 1
+}
+
 # ── OPT-IN LAUNCHD SUPERVISION ──────────────────────────────────────────────────────────
 # `hmd modules supervise headroom install` (bin/heimdall-headroom-supervise) writes a
 # LaunchAgent with KeepAlive for the proxy. THE PLIST'S EXISTENCE IS THE OPT-IN, and the only
@@ -341,7 +371,7 @@ _hmd_headroom_chain_decide() {
   state="$(hmd_headroom_port_state "$port")"
   if [ "$state" = silent ]; then
     HMD_HEADROOM_DOWN=1
-    HMD_HEADROOM_WHY="something is listening on port $port but did not answer within ${HMD_HEADROOM_PROBE_MAX_TIME}s (hung or saturated) — not routing into it, and not starting a second proxy on top of it"
+    HMD_HEADROOM_WHY="something is listening on port $port but did not answer within ${HMD_HEADROOM_PROBE_MAX_TIME}s (hung or saturated) — not routing into it, and not starting a second proxy on top of it$(_hmd_headroom_held_by "$port")"
     return 1
   fi
 
@@ -371,7 +401,7 @@ _hmd_headroom_chain_decide() {
     # 2. Something answers on the port but it is NOT our proxy -> refuse. Routing a prompt into
     #    an unidentified listener is the one failure this whole module is supposed to prevent.
     HMD_HEADROOM_DOWN=1
-    HMD_HEADROOM_WHY="port $port is answering but is not a Headroom proxy pointed at $HMD_HEADROOM_UPSTREAM (or its /health did not reply within ${HMD_HEADROOM_HEALTH_MAX_TIME}s) — refusing to route"
+    HMD_HEADROOM_WHY="port $port is answering but is not a Headroom proxy pointed at $HMD_HEADROOM_UPSTREAM (or its /health did not reply within ${HMD_HEADROOM_HEALTH_MAX_TIME}s) — refusing to route$(_hmd_headroom_held_by "$port")"
     return 1
   fi
 
@@ -622,6 +652,13 @@ hmd_headroom_chain() {
   local ours note=""
   HMD_HEADROOM_DOWN=0; HMD_HEADROOM_WARNED=0
   if _hmd_headroom_chain_decide "$@"; then return 0; fi
+  # rc 3 — REQUIRED and down. A judge or fallback launch never drops to an unrouted connection:
+  # the caller exits non-zero, and the environment is left exactly as found.
+  if [ "$HMD_HEADROOM_DOWN" = 1 ] && hmd_headroom_required; then
+    printf 'hmd: headroom proxy required but unavailable — %s; REFUSING to run direct (a judge or fallback launch never drops to an unrouted connection)\n' "${HMD_HEADROOM_WHY:-chain unavailable}" >&2
+    HMD_HEADROOM_WARNED=1
+    return 3
+  fi
   ours="http://127.0.0.1:$(hmd_headroom_port)"
   if [ "${ANTHROPIC_BASE_URL:-}" = "$ours" ]; then
     unset ANTHROPIC_BASE_URL
