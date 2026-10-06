@@ -40,6 +40,7 @@ ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ship-npm-test.XXXXXX")"
+# shellcheck disable=SC2329 # invoked indirectly: the EXIT trap on the next line
 cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -114,6 +115,7 @@ chmod +x "$BIN_STUB/npm"
 # ── Case 1: --dry-run prints the exact invocation and publishes NOTHING ──────
 DRY="$WORK/dry.out"
 DRY_STATE="$WORK/c1state"; mkdir -p "$DRY_STATE"
+# shellcheck disable=SC2030 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$DRY_STATE" NPM_STUB_MODE="publish-ok"
@@ -167,6 +169,7 @@ fi
 
 # ── Case 2: already published -> LOUD skip, exit 0 (idempotent re-run) ───────
 C2="$WORK/c2.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c2state" NPM_STUB_MODE="already-published"
@@ -192,6 +195,7 @@ fi
 # THE anti-silent-swallow assertion. If ship.sh ever regresses to `|| true` or a warn, this
 # case goes red — which is the whole point of it existing.
 C3="$WORK/c3.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c3state" NPM_STUB_MODE="publish-fail"
@@ -220,6 +224,7 @@ fi
 
 # ── Case 4: unauthenticated npm HARD-FAILS in preflight (never warn-and-exit-0) ──
 C4="$WORK/c4.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c4state" NPM_STUB_MODE="not-authed"
@@ -259,6 +264,7 @@ fi
 FIX="$WORK/pkgfix"; mkdir -p "$FIX"
 printf '{"name":"runheimdall","version":"0.0.1","files":["bin/runheimdall.js"]}\n' > "$FIX/package.json"
 C5="$WORK/c5.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c5state" NPM_STUB_MODE="publish-ok" SHIP_NPM_DIR="$FIX"
@@ -284,6 +290,7 @@ fi
 FIX6="$WORK/pkgok"; mkdir -p "$FIX6"
 printf '{"name":"runheimdall","version":"2.2.6","files":["bin/runheimdall.js"]}\n' > "$FIX6/package.json"
 C6="$WORK/c6.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c6state" NPM_STUB_MODE="publish-ok" SHIP_NPM_DIR="$FIX6"
@@ -319,6 +326,7 @@ if grep -vE '^[[:space:]]*#' "$SHIP" | grep -Eq '\$\([^)]*npm publish'; then
 else
   ok "'npm publish' is NOT captured in \$(...) — it runs on the terminal, so npm web/passkey auth works"
 fi
+# shellcheck disable=SC2016 # the single-quoted pattern is ship.sh's literal source text: "$dir" must reach grep unexpanded
 if grep -Fq '( cd "$dir" && npm publish --access public --auth-type=web )' "$SHIP"; then
   ok "the real publish runs directly (inherits ship.sh's TTY) with --auth-type=web pinned"
 else
@@ -335,6 +343,7 @@ fi
 FIX8="$WORK/pkglag"; mkdir -p "$FIX8"
 printf '{"name":"runheimdall","version":"2.2.6","files":["bin/runheimdall.js"]}\n' > "$FIX8/package.json"
 C8="$WORK/c8.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c8state" NPM_STUB_MODE="publish-ok-lag" SHIP_NPM_DIR="$FIX8"
@@ -376,6 +385,7 @@ fi
 # package.json .description: present → decided → SILENT; absent → undecided → still LOUD (npm
 # versions are immutable, so an undecided ship genuinely must warn). Both directions asserted.
 C9D="$WORK/c9d.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   PATH="$BIN_STUB:$PATH"
@@ -393,6 +403,7 @@ fi
 UND="$WORK/pkgundecided"; mkdir -p "$UND"
 printf '{"name":"runheimdall","version":"2.2.6","description":"pre-launch placeholder text","files":["bin/runheimdall.js"]}\n' > "$UND/package.json"
 C9U="$WORK/c9u.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export SHIP_NPM_DIR="$UND"
@@ -451,6 +462,7 @@ fi
 
 # ── Case 11: the publish stage publishes BOTH, runheimdall first ────────────────
 C11="$WORK/c11.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c11state" NPM_STUB_MODE="publish-ok"
@@ -477,6 +489,7 @@ fi
 # ── Case 12: idempotent per package — one already live, the other still published ──
 C12="$WORK/c12.out"
 mkdir -p "$WORK/c12state"; : > "$WORK/c12state/published-runheimdall-$CUR_VER"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c12state" NPM_STUB_MODE="publish-ok"
@@ -501,6 +514,7 @@ FIXROOT="$WORK/fixroot"; mkdir -p "$FIXROOT/packages/runheimdall" "$FIXROOT/pack
 printf '{"name":"runheimdall","version":"2.2.6","files":["bin/runheimdall.js"]}\n' > "$FIXROOT/packages/runheimdall/package.json"
 printf '{"name":"runhmd","version":"0.0.1","files":["bin/runhmd.js"]}\n' > "$FIXROOT/packages/runhmd/package.json"
 C13="$WORK/c13.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c13state" NPM_STUB_MODE="publish-ok"
@@ -527,6 +541,7 @@ fi
 FIXROOT2="$WORK/fixroot2"; mkdir -p "$FIXROOT2/packages/runheimdall"
 printf '{"name":"runheimdall","version":"2.2.6"}\n' > "$FIXROOT2/packages/runheimdall/package.json"
 C14="$WORK/c14.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c14state" NPM_STUB_MODE="publish-ok"
@@ -545,6 +560,7 @@ fi
 
 # ── Case 15: publish RIGHTS are proven on the SECOND wrapper too ──────────────────
 C15="$WORK/c15.out"
+# shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c15state" NPM_STUB_MODE="publish-ok" NPM_STUB_NOT_OWNER_OF="runhmd"
@@ -566,9 +582,14 @@ fi
 # subcommand treats that as a free-text task prompt and starts an agent session — and an npm
 # version is immutable. Loud when absent, silent when dispatched (also in a combined label), and
 # silent for a wrapper that declares no default command. SHIP_HMD_BIN points the check at a fixture.
-HMD_NO="$WORK/heimdall-no-attack"; printf 'case "${1:-}" in\n  demo)\n    :\n    ;;\n  help)\n    :\n    ;;\nesac\n' > "$HMD_NO"
-HMD_YES="$WORK/heimdall-with-attack"; printf 'case "${1:-}" in\n  demo)\n    :\n    ;;\n  prove|attack)\n    :\n    ;;\nesac\n' > "$HMD_YES"
+HMD_NO="$WORK/heimdall-no-attack"
+# shellcheck disable=SC2016 # fixture text for a fake bin/heimdall: the single-quoted "${1:-}" is literal case-statement source, never an expansion
+printf 'case "${1:-}" in\n  demo)\n    :\n    ;;\n  help)\n    :\n    ;;\nesac\n' > "$HMD_NO"
+HMD_YES="$WORK/heimdall-with-attack"
+# shellcheck disable=SC2016 # fixture text for a fake bin/heimdall: the single-quoted "${1:-}" is literal case-statement source, never an expansion
+printf 'case "${1:-}" in\n  demo)\n    :\n    ;;\n  prove|attack)\n    :\n    ;;\nesac\n' > "$HMD_YES"
 notice_for() {  # <hmd bin fixture> <package dir, repo-relative>
+  # shellcheck disable=SC2030,SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
   (
     cd "$REPO" || exit 1
     PATH="$BIN_STUB:$PATH"
@@ -597,6 +618,7 @@ else
   bad "the notice fired for a wrapper with no default command"
 fi
 C16="$WORK/c16.out"
+# shellcheck disable=SC2031 # case-local by design: this subshell sandboxes its own npm-stub env and PATH, so those changes are meant to be lost
 (
   cd "$REPO" || exit 1
   export NPM_STUB_STATE="$WORK/c16state" NPM_STUB_MODE="publish-ok"

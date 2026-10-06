@@ -644,6 +644,9 @@ run_hook() {
 under() { python3 -c "import sys; sys.exit(0 if float('$1') < float('$2') else 1)"; }
 atleast() { python3 -c "import sys; sys.exit(0 if float('$1') >= float('$2') else 1)"; }
 no_approvals() { [ ! -d "$1/.heimdall/ui/approvals" ] || [ -z "$(ls -A "$1/.heimdall/ui/approvals" 2>/dev/null)" ]; }
+# names_in <dir> -> the entry names in <dir> (dotfiles too, as `ls -A` lists them), sorted, each
+# followed by a space; only used to describe leftovers inside a FAIL line
+names_in() { find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | sed 's|.*/||' | sort | tr '\n' ' '; }
 approvals_json() { # <repo> -> D.pending() as JSON
   python3 - "$LIB" "$1" <<'PYEOF'
 import importlib.util, json, sys
@@ -712,7 +715,7 @@ for v in 0 true yes on "" 2 " 1" "1 "; do
   if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && no_approvals "$R1" && under "$HOOK_S" "$NOOP_MAX_S"; then
     ok "C1b. HMD_PHONE_DENY='$v' is not the opt-in (only exactly 1 arms the hook) -> no-op"
   else
-    bad "C1b. HMD_PHONE_DENY='$v' armed the hook: rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s approvals=$(ls -A "$R1/.heimdall/ui/approvals" 2>/dev/null | tr '\n' ' ')"
+    bad "C1b. HMD_PHONE_DENY='$v' armed the hook: rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s approvals=$(names_in "$R1/.heimdall/ui/approvals")"
   fi
 done
 
@@ -724,7 +727,7 @@ check_noop() { # <label> <repo> <payload> [VAR=val ...]
   if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && no_approvals "$repo" && under "$HOOK_S" "$NOOP_MAX_S"; then
     ok "$label (${HOOK_S}s)"
   else
-    bad "$label -- rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s approvals=$(ls -A "$repo/.heimdall/ui/approvals" 2>/dev/null | tr '\n' ' ')"
+    bad "$label -- rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s approvals=$(names_in "$repo/.heimdall/ui/approvals")"
   fi
 }
 R2="$(mk_repo)"; rm -f "$R2/.heimdall/app/connect.json"; bash_payload "$R2" "git push origin main" > "$TMPROOT/p.push2"
@@ -808,7 +811,7 @@ PYEOF
 # C7 -- armed + connected + risky + nobody answers: the window runs out and the hook does NOTHING
 R7="$(mk_repo)"; bash_payload "$R7" "git push origin main" > "$TMPROOT/p.push7"
 run_hook "$R7" "$TMPROOT/p.push7" "${ARMED[@]}" HMD_PHONE_DENY_WINDOW_S=1
-DEC7="$(ls "$R7/.heimdall/ui/approvals"/p-*.decision 2>/dev/null | head -1)"
+DEC7="$(find "$R7/.heimdall/ui/approvals" -maxdepth 1 -name 'p-*.decision' 2>/dev/null | sort | head -1)"
 if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && [ -z "$HOOK_ERR" ] && atleast "$HOOK_S" 1 && under "$HOOK_S" 6; then
   ok "C7. no reply inside the window -> exit 0 with NO output (the normal permission flow is untouched); waited ${HOOK_S}s"
 else
@@ -818,7 +821,7 @@ if ! ls "$R7/.heimdall/ui/approvals"/p-*.json >/dev/null 2>&1 && [ -n "$DEC7" ] 
    && [ "$(approvals_json "$R7")" = "[]" ]; then
   ok "C7b. on the way out the request is withdrawn and the slot is settled, so a late deny can only be 'expired'"
 else
-  bad "C7b. leftovers after the timeout: $(ls -A "$R7/.heimdall/ui/approvals" 2>/dev/null | tr '\n' ' ')"
+  bad "C7b. leftovers after the timeout: $(names_in "$R7/.heimdall/ui/approvals")"
 fi
 
 # C8 -- the phone denies inside the window: the hook blocks, promptly, with a reason
@@ -944,7 +947,7 @@ if wait_pending "$R12" 8; then
   if [ ! -s "$TMPROOT/c12.out" ] && ! ls "$R12/.heimdall/ui/approvals"/p-*.json >/dev/null 2>&1 && [ "$(approvals_json "$R12")" = "[]" ]; then
     ok "C12. SIGTERM mid-wait -> the request is withdrawn and nothing is printed"
   else
-    bad "C12. leftovers after SIGTERM: out=[$(cat "$TMPROOT/c12.out")] files=$(ls -A "$R12/.heimdall/ui/approvals" | tr '\n' ' ')"
+    bad "C12. leftovers after SIGTERM: out=[$(cat "$TMPROOT/c12.out")] files=$(names_in "$R12/.heimdall/ui/approvals")"
   fi
 else
   bad "C12. the hook never published a request"
@@ -953,6 +956,7 @@ fi
 # C13 -- orphaned (the shell that launched it died, as on Esc): stands down, nothing printed
 R13="$(mk_repo)"; bash_payload "$R13" "git push origin main" > "$TMPROOT/p.push13"
 rm -f "$TMPROOT/c13.pid"
+# shellcheck disable=SC2016  # the sh -c script is single-quoted on purpose: the child shell expands $0..$4 from the positional args after it
 env "${ARMED[@]}" HMD_PHONE_DENY_WINDOW_S=60 sh -c '"$0" --repo "$1" < "$2" > "$4" 2>/dev/null & echo $! > "$3"; sleep 1.5; exit 0' \
   "$HOOK" "$R13" "$TMPROOT/p.push13" "$TMPROOT/c13.pid" "$TMPROOT/c13.out"
 C13_PID="$(cat "$TMPROOT/c13.pid" 2>/dev/null)"; PIDS+=("$C13_PID")
@@ -1074,7 +1078,11 @@ else
   bad "D6. flag-off group launched the script (rc=$GROUP_RC)"
 fi
 run_group HMD_PHONE_DENY=0
-[ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ] && ok "D6b. HMD_PHONE_DENY=0 -> never launched" || bad "D6b. launched with the flag at 0"
+if [ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ]; then
+  ok "D6b. HMD_PHONE_DENY=0 -> never launched"
+else
+  bad "D6b. launched with the flag at 0"
+fi
 run_group HMD_PHONE_DENY=1
 if [ "$GROUP_RC" = 0 ] && [ -e "$TMPROOT/d6.mark" ] && cmp -s "$TMPROOT/d6.stdin" "$TMPROOT/p.d6" \
    && [ "$(cat "$TMPROOT/d6.args")" = "--repo $RD" ]; then
@@ -1084,19 +1092,37 @@ else
 fi
 HEIMDALL_HOME="$TMPROOT/d6home" "$HOOKS_TOOL" disable phone-deny >/dev/null 2>&1
 run_group HMD_PHONE_DENY=1 HEIMDALL_HOME="$TMPROOT/d6home"
-[ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ] && ok "D6d. flag on but the group disabled (heimdall-hooks disable phone-deny) -> never launched" \
-  || bad "D6d. a disabled group still launched"
+if [ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ]; then
+  ok "D6d. flag on but the group disabled (heimdall-hooks disable phone-deny) -> never launched"
+else
+  bad "D6d. a disabled group still launched"
+fi
 HEIMDALL_HOME="$TMPROOT/d6home" "$HOOKS_TOOL" enable phone-deny >/dev/null 2>&1
 run_group HMD_PHONE_DENY=1 HEIMDALL_HOME="$TMPROOT/d6home"
-[ "$GROUP_RC" = 0 ] && [ -e "$TMPROOT/d6.mark" ] && ok "D6e. re-enabled -> launched again" || bad "D6e. re-enabling did not bring the hook back"
+if [ "$GROUP_RC" = 0 ] && [ -e "$TMPROOT/d6.mark" ]; then
+  ok "D6e. re-enabled -> launched again"
+else
+  bad "D6e. re-enabling did not bring the hook back"
+fi
 run_group HMD_PHONE_DENY=1 FAKE_RC=2
-[ "$GROUP_RC" = 0 ] && ok "D6f. a script that exits 2 (the code that BLOCKS a tool call) still leaves the group at exit 0 -- it can never block on its own bug" \
-  || bad "D6f. the group passed a script's exit $GROUP_RC through"
+if [ "$GROUP_RC" = 0 ]; then
+  ok "D6f. a script that exits 2 (the code that BLOCKS a tool call) still leaves the group at exit 0 -- it can never block on its own bug"
+else
+  bad "D6f. the group passed a script's exit $GROUP_RC through"
+fi
 run_group HMD_PHONE_DENY=1 FAKE_RC=1
-[ "$GROUP_RC" = 0 ] && ok "D6g. a script that exits 1 -> group exit 0" || bad "D6g. exit $GROUP_RC"
+if [ "$GROUP_RC" = 0 ]; then
+  ok "D6g. a script that exits 1 -> group exit 0"
+else
+  bad "D6g. exit $GROUP_RC"
+fi
 rm -f "$PLUG/bin/heimdall-phone-deny"
 run_group HMD_PHONE_DENY=1
-[ "$GROUP_RC" = 0 ] && ok "D6h. script missing -> group exit 0, no error" || bad "D6h. missing script gave exit $GROUP_RC"
+if [ "$GROUP_RC" = 0 ]; then
+  ok "D6h. script missing -> group exit 0, no error"
+else
+  bad "D6h. missing script gave exit $GROUP_RC"
+fi
 
 # ══ E. the approvals slice of /api/state ════════════════════════════════════════════════════
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
