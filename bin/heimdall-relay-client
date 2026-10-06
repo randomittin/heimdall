@@ -2121,7 +2121,7 @@ class RelayClient:
             return state
         try:
             return DASH.overlay(state, self.root, self.device_caps,
-                                redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None)
+                                redact=self._relay_redactor())
         except Exception as e:
             emit({"event": "error", "detail": "state.dashboards skipped: %s" % type(e).__name__})
             return {k: v for k, v in state.items() if k != "dashboards"}
@@ -2136,7 +2136,7 @@ class RelayClient:
             return state
         try:
             return ASK.overlay(state, self.root, self.device_caps,
-                               redact=(lambda obj: UI._redact_public(obj, strip_root)) if redact else None)
+                               redact=self._relay_redactor())
         except Exception as e:
             emit({"event": "error", "detail": "state.asks skipped: %s" % type(e).__name__})
             return {k: v for k, v in state.items() if k != "asks"}
