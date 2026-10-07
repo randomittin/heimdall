@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="512" height="512" shape-rendering="crispEdges">
+<title>hmd: Heimdall helm mark</title>
+<rect width="128" height="128" fill="#0B0E12"/>
+<g fill="#4CC2FF">
+<rect x="29" y="29" width="7" height="14"/>
+<rect x="92" y="29" width="7" height="14"/>
+<rect x="29" y="43" width="14" height="7"/>
+<rect x="50" y="43" width="28" height="7"/>
+<rect x="85" y="43" width="14" height="7"/>
+<rect x="36" y="50" width="56" height="14"/>
+<rect x="36" y="64" width="7" height="14"/>
+<rect x="57" y="64" width="14" height="21"/>
+<rect x="85" y="64" width="7" height="14"/>
+<rect x="36" y="78" width="14" height="21"/>
+<rect x="78" y="78" width="14" height="21"/>
+</g>
+</svg>

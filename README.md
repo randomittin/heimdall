@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/randomittin/heimdall/main/launch-docs/assets/hmd-logo-eye-h-mark-dark-bg.png">
-    <img src="https://raw.githubusercontent.com/randomittin/heimdall/main/launch-docs/assets/hmd-logo-eye-h-mark.png" alt="Heimdall — a watchman's eye with an H at its center" height="72">
-  </picture>
+  <img src="https://raw.githubusercontent.com/randomittin/heimdall/main/launch-docs/assets/hmd-mark-512.png" alt="Heimdall: a pixel-art helm" height="128">
 </p>
 
 # runhmd 🛡️

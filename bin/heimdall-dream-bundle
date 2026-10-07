@@ -60,7 +60,7 @@
 #                                seam only; the real bundle always ships whatever bash this
 #                                machine actually has)
 #   HEIMDALL_DREAM_BUNDLE_ICON  source .icns to copy into Contents/Resources (default:
-#                                launch-docs/assets/hmd-logo-eye-h.icns, resolved relative
+#                                launch-docs/assets/hmd-mark.icns, resolved relative
 #                                to this script's own real path — a test seam only; the
 #                                real bundle always ships the repo's actual icon)
 #
@@ -84,7 +84,7 @@ SRC_BASH="${HEIMDALL_DREAM_BUNDLE_BASH:-/bin/bash}"
 # script's OWN real directory so it keeps working from an installed clone
 # (bin/heimdall-dream-schedule and bin/heimdall-dream-permission already resolve this
 # tool itself the same way: BINDIR="$(cd "$(dirname "$0")" && pwd)").
-SRC_ICON="${HEIMDALL_DREAM_BUNDLE_ICON:-$BINDIR/../launch-docs/assets/hmd-logo-eye-h.icns}"
+SRC_ICON="${HEIMDALL_DREAM_BUNDLE_ICON:-$BINDIR/../launch-docs/assets/hmd-mark.icns}"
 DEFAULT_OUT="$HEIMDALL_HOME/bin"
 
 usage() { sed -n '2,32p' "$SELF" | sed 's/^# \{0,1\}//'; }

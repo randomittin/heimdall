@@ -1,4 +1,4 @@
-# launch-docs/assets/ — the wall asset
+# launch-docs/assets/ — the wall asset and the brand mark
 
 "Install once, see your team's watchmen." A real, rendered set of the team
 presence wall, for dropping into a deck, a README badge, or a prospect DM.
@@ -11,11 +11,13 @@ fixture technique `conformance/statusline/viral-statusline.fixture.sh` and
 
 ## Provenance — read this before embedding anything here
 
-**Every asset in this directory is currently `fixture`-provenance. None of them
-may be referenced from README.md.** The renderers are real; some of the data
+**Every `wall*` asset in this directory is currently `fixture`-provenance. None of
+them may be referenced from README.md.** The renderers are real; some of the data
 they rendered is seeded — `wall.png` labels five teammates who do not exist, and
 the "14 merges proven" figure on `wall.svg` / `wall.json` / `wall.txt` counts
-lines in a `printf`-written `beats.log`, not merges this repo proved.
+lines in a `printf`-written `beats.log`, not merges this repo proved. The brand-mark
+files (see "Brand mark" below) are the exception: a static mark with no data render,
+declared `real`, which is why README.md may embed `hmd-mark-512.png`.
 
 That fact is stated honestly below, but prose in *this* file protects nobody: a
 README reader never opens this directory. So provenance is also declared
@@ -61,6 +63,66 @@ receipt-less provenance claim.
 - **`provenance.json`** — the machine-readable provenance declaration the gate
   reads (`schema: asset_provenance_v1`). Not an asset; a receipt about the
   assets.
+
+## Brand mark — the Heimdall helm
+
+The logo is a 10x10 pixel helm, light blue `#4CC2FF` on near-black `#0B0E12`: the
+mark of the hmd app icon, read back from that icon's pixels and never redrawn.
+`hmd-mark-1024.png` is byte-identical to the app icon, and `gen-brand-pack.py verify`
+proves every other file below is that same grid. Unlike the `wall*` files, every one
+of these is declared `real` in `provenance.json` (a static mark: no data render, no
+invented name, number or verdict), which is why README.md and its npm mirror embed
+`hmd-mark-512.png`.
+
+### Which file for what
+
+| Use | File |
+|---|---|
+| README header (README.md and the npm mirror) | `hmd-mark-512.png` at `height="128"`: a 4:1 reduction, 7 px per helm cell, so it stays crisp (at 72 a cell is 3.9 px and the browser smooths it). A PNG, not the SVG, because npm renders the same file |
+| GitHub organisation or user avatar | `hmd-mark-512.png` (`hmd-mark-1024.png` if a larger upload is wanted). The helm fills the middle 55 %, so a circular crop keeps all of it |
+| Repository social preview (Settings, Social preview) | `github-social-1280x640.png` |
+| Favicon | `hmd-favicon.svg` for browsers that take SVG, plus `hmd-favicon.ico` (16, 32 and 48 px frames) for everything else; `hmd-favicon-32.png` where only a PNG will do. `hmd ui` embeds the SVG and the 32 px PNG as `data:` URIs |
+| A web page's iOS home-screen icon (`apple-touch-icon`) | `hmd-apple-touch-icon-180.png` |
+| Docs or slides, on a light or a dark page | `hmd-mark.svg` (with its dark tile) or `hmd-mark-transparent.svg` (the helm alone) |
+| The helm alone as a raster (overlay, sticker) | `hmd-mark-transparent-1024.png` |
+| macOS `.icns` (the `hmd-dream.app` icon, via `bin/heimdall-dream-bundle`) | `hmd-mark.icns` |
+
+### Two canvases, one grid
+
+Both SVGs and every PNG are rendered from the same 10x10 grid, and nothing is
+resampled: each cell is a whole number of pixels.
+
+- **App-icon canvas** (`hmd-mark*`, `github-social-1280x640.png`): the master's own
+  proportions, the helm 55 % of the square. Exact at 128, 256, 512, 1024 px and any
+  multiple of 128.
+- **Favicon canvas** (`hmd-favicon*`, the `.ico` frames, the `.icns` iconset): 16
+  cells, the helm with a 3-cell margin. Exact at 16, 32, 48, 64 px and every power
+  of two above. On the app-icon canvas a cell is 7/8 of a pixel at 16 px and columns
+  of the helm drop out, so never use `hmd-mark*` for a favicon or an icon below
+  128 px.
+
+### Regenerate and check
+
+Standard library only for the pack; macOS `iconutil` for the `.icns`. From the repo
+root:
+
+```bash
+bash launch-docs/assets/generate-logo-assets.sh      # build, verify, then compile hmd-mark.icns; a rerun changes nothing
+python3 launch-docs/assets/gen-brand-pack.py verify  # exit 0 and "clean.", or the files that fail
+```
+
+`verify` reads the master's lattice, colours and cells straight from its pixels,
+then checks every file: it is a valid PNG, ICO or SVG, it is the size its name says,
+and it is the master's grid (the 1024 PNG pixel for pixel, every SVG by rasterising
+it). It also feeds its own checkers a corrupted PNG, a wrong pixel and a broken SVG
+and requires them to be reported, and it requires this README to name every file in
+the pack, so a file added to the pack and left out of the table above turns it red.
+The master here is `hmd-mark-1024.png` itself, so `verify` proves the other files are
+that master's grid; only hmdapp can prove the master is the app icon (`python3
+assets/brand/gen-brand-pack.py verify --src assets/icon.png` there).
+
+Never run `sips -z` or `magick -resize` over a pack image: both smooth, and a
+smoothed pixel-art helm is a different, blurry logo.
 
 ## Why there is no wall.gif
 

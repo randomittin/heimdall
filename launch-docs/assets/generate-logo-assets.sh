@@ -1,167 +1,72 @@
 #!/usr/bin/env bash
-# generate-logo-assets.sh — derive transparent/square/icns assets from hmd-logo-eye-h.png.
+# generate-logo-assets.sh — rebuild the Heimdall helm brand pack and its macOS .icns.
 #
 # WHY THIS EXISTS.
-#   The source asset (hmd-logo-eye-h.png) is a monoline eye/H mark, near-black on an
-#   OPAQUE WHITE background, 1536x1024, no alpha channel. That is unusable anywhere the
-#   surrounding chrome isn't pure white — a dark README, a dark Settings pane, an app
-#   icon slot — the white square would show as a visible box. This script derives the
-#   assets that actually get placed, and does so from the checked-in source every time
-#   rather than leaving the pipeline as unrepeatable shell history.
+#   The mark is a 10x10 pixel helm, light blue #4CC2FF on near-black #0B0E12 — the same
+#   glyph as the hmd app icon. It is flat-colour pixel art, so every size of it has to be
+#   a WHOLE NUMBER OF PIXELS per helm cell. A smoothing resize (`sips -z`, `magick -resize`)
+#   blends the cells into a different, blurry logo, so this script never resamples a pack
+#   image: gen-brand-pack.py reads the lattice, the palette and every cell straight out of
+#   the master's pixels and re-emits each derived file by integer scaling. Nothing is
+#   redrawn by eye and no pixel is ever blended.
 #
-# METHOD (not naive color-keying).
-#   A plain `-transparent white` chroma-key leaves jagged, ringed edges wherever the
-#   source anti-aliased a stroke against white, because those edge pixels are near-white
-#   but not exactly white and get left half-opaque with the WRONG color mixed in. Instead:
-#   grayscale + negate the source to build a MASK (white bg -> alpha 0, black stroke ->
-#   alpha 255, anti-aliased edge -> the correct intermediate alpha), then composite a
-#   solid near-black brand fill through that mask as the alpha channel. This reproduces
-#   the original stroke's anti-aliasing exactly, just against transparency instead of
-#   white.
+# STEPS.
+#   1. build    rewrite every derived file in this directory from hmd-mark-1024.png,
+#               deterministically (the master itself comes back byte-identical)
+#   2. verify   prove each file is a valid PNG/ICO/SVG, the size its name says, and the
+#               master's grid; a nonzero exit stops this script before an icon is
+#               compiled from a pack that did not check out
+#   3. iconset  write the ten PNGs iconutil wants (16..1024 px, each a whole number of
+#               pixels per helm cell) into a scratch directory
+#   4. icns     iconutil compiles that iconset into hmd-mark.icns
 #
-# OUTPUTS (all written to this directory):
-#   hmd-logo-eye-h-transparent.png   full 1536x1024 canvas, background removed
-#   hmd-logo-eye-h-square.png        1024x1024, content trimmed + centered + padded —
-#                                     the .icns source and the square master for any
-#                                     future square placement
-#   hmd-logo-eye-h.icns              full multi-resolution icon set built from the square
-#                                     master via iconutil, for CFBundleIconFile use
-#   hmd-logo-eye-h-mark.png          content trimmed + a small uniform breathing-room
-#                                     margin (NOT padded to square) — the wide mark as-is,
-#                                     for a README header (light backgrounds) or anywhere
-#                                     the source's own 3:2-ish aspect ratio should be kept
-#                                     rather than boxed into a square
-#   hmd-logo-eye-h-mark-dark-bg.png  same crop/margin as the mark above, but filled with
-#                                     a light near-white tone instead of near-black — the
-#                                     near-black mark is close to invisible against a dark
-#                                     README theme (e.g. GitHub dark mode's near-black
-#                                     page background), so this is the
-#                                     prefers-color-scheme:dark counterpart, not a
-#                                     separate design
+# OUTPUTS (all written to this directory; README.md "Brand mark" says which file is for what):
+#   hmd-mark-1024.png              master raster — the one input, rewritten byte-identically
+#   hmd-mark-512.png               512 px raster (README header, org avatar)
+#   hmd-mark-transparent-1024.png  the helm alone, RGBA
+#   github-social-1280x640.png     repository social preview card
+#   hmd-favicon-32.png             32 px favicon PNG
+#   hmd-apple-touch-icon-180.png   iOS home-screen icon of a web page
+#   hmd-favicon.ico                16/32/48 px favicon frames
+#   hmd-mark.svg                   the helm on its dark tile
+#   hmd-mark-transparent.svg       the helm alone
+#   hmd-favicon.svg                16-cell favicon canvas
+#   hmd-mark.icns                  macOS icon set, for CFBundleIconFile (bin/heimdall-dream-bundle)
 #
-# REQUIRES: macOS `sips` + `iconutil` (built in), ImageMagick `magick` (brew). Darwin only
-#   — the outputs are macOS icon artifacts and this script's own alpha-compositing and
-#   iconset assembly rely on tools that don't exist elsewhere.
+# REQUIRES: python3 (standard library only) and macOS `iconutil` (built in) for the last
+#   step. Darwin only: the .icns is a macOS icon artifact and iconutil exists nowhere else.
 #
 # EXIT: 0 ok · 2 usage / missing tool / not Darwin · 3 generation failure
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRC="$HERE/hmd-logo-eye-h.png"
-BRAND_COLOR="#1a1f2b"     # near-black from the source line art — light backgrounds
-BRAND_COLOR_DARK_BG="#e6e8ec" # soft near-white — for the dark-mode README mark only
-ICON_CANVAS=1024          # square master / icns base resolution
-TRIM_FUZZ="2%"            # tolerance for treating near-white as background when trimming
-MARK_PAD_PCT=6            # breathing-room margin on the README-mark, as % of its own size
+PACK="$HERE/gen-brand-pack.py"
+MASTER="$HERE/hmd-mark-1024.png"
+ICNS="$HERE/hmd-mark.icns"
 
 die() { printf 'generate-logo-assets: %s\n' "$1" >&2; exit "${2:-2}"; }
 
-[ "$(uname -s)" = "Darwin" ] || die "requires macOS (sips/iconutil); this host is $(uname -s)"
-command -v magick   >/dev/null 2>&1 || die "ImageMagick 'magick' not found (brew install imagemagick)"
-command -v sips     >/dev/null 2>&1 || die "'sips' not found"
+[ "$(uname -s)" = "Darwin" ] || die "requires macOS (iconutil); this host is $(uname -s)"
+command -v python3  >/dev/null 2>&1 || die "'python3' not found"
 command -v iconutil >/dev/null 2>&1 || die "'iconutil' not found"
-[ -f "$SRC" ] || die "source asset missing: $SRC" 2
+[ -f "$PACK" ]   || die "brand pack builder missing: $PACK"
+[ -f "$MASTER" ] || die "master asset missing: $MASTER"
 
 WORK="$(mktemp -d -t hmd-logo-assets.XXXXXX)"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
-echo "generate-logo-assets: source $SRC"
+echo "generate-logo-assets: master $MASTER"
 
-# ---- 1. build the alpha mask from source luminance (white->0, black->255) --------
-magick "$SRC" -colorspace Gray -negate "$WORK/mask.png" \
-  || die "mask generation failed" 3
+# ---- 1. rewrite every derived file from the master ------------------------------
+python3 "$PACK" build || die "pack build failed" 3
 
-# ---- 2/3. composite a solid fill through the mask as the alpha channel -----------
-# composite_fill <color> <outfile> — reused for the default (near-black, light-
-# background) render and, later, the dark-mode README mark's near-white render.
-# -strip drops ImageMagick's embedded date:create/date:modify/date:timestamp tEXt
-# chunks — without it, re-running this script produces a byte-different PNG every
-# time even though every pixel is identical, which is both noisy in git diffs and
-# leaks local generation timestamps into a shipped asset.
-SRC_W="$(magick identify -format '%w' "$SRC")"
-SRC_H="$(magick identify -format '%h' "$SRC")"
-composite_fill() {
-  local color="$1" outfile="$2"
-  magick -size "${SRC_W}x${SRC_H}" "xc:$color" "$WORK/solid-$$.png" \
-    || die "solid fill generation failed ($color)" 3
-  magick "$WORK/solid-$$.png" "$WORK/mask.png" -alpha off -compose CopyOpacity -composite \
-    -strip "$outfile" \
-    || die "alpha composite failed ($color)" 3
-  rm -f "$WORK/solid-$$.png"
-}
-composite_fill "$BRAND_COLOR" "$HERE/hmd-logo-eye-h-transparent.png"
+# ---- 2. prove the result before anything is compiled from it --------------------
+python3 "$PACK" verify || die "pack verify failed — no icon is compiled from an unverified pack" 3
 
-# ---- 4. find the content bounding box from the ALPHA channel, not RGB ------------
-# (RGB is a uniform brand-color fill everywhere; -trim on it would see one flat color
-#  and do nothing. Trimming the extracted alpha channel finds the real content box.)
-magick "$HERE/hmd-logo-eye-h-transparent.png" -alpha extract "$WORK/alpha-only.png" \
-  || die "alpha extraction failed" 3
-# NOTE: %@ is itself "the trim bounding box" — do NOT also pass a `-trim` verb before
-# it. Doing so applies the trim first (repositioning the page to 0,0) and %@ then
-# reports the residual (near-zero, wrong) box of the ALREADY-trimmed image. Measured
-# regression caught before shipping: with `-trim -format '%@'` this returned
-# `796x431+2+0` instead of the correct `798x431+367+293`, silently cropping out most of
-# the actual artwork.
-TRIM_GEOM="$(magick "$WORK/alpha-only.png" -fuzz "$TRIM_FUZZ" -format '%@' info: 2>/dev/null)" \
-  || die "trim bbox detection failed" 3
-[ -n "$TRIM_GEOM" ] || die "empty trim geometry — is the source blank?" 3
-echo "generate-logo-assets: content bbox $TRIM_GEOM"
+# ---- 3. the ten-size iconset, then 4. the .icns ----------------------------------
+python3 "$PACK" iconset "$WORK/hmd.iconset" >/dev/null || die "iconset generation failed" 3
+iconutil -c icns "$WORK/hmd.iconset" -o "$ICNS" || die "iconutil compile failed" 3
 
-# ---- 5. crop the transparent full canvas to that content box ---------------------
-magick "$HERE/hmd-logo-eye-h-transparent.png" -crop "$TRIM_GEOM" +repage "$WORK/content.png" \
-  || die "content crop failed" 3
-
-# ---- 6. pad the cropped content into a square, centered, transparent border ------
-magick "$WORK/content.png" -background none -gravity center \
-  -extent "${ICON_CANVAS}x${ICON_CANVAS}" -strip "$HERE/hmd-logo-eye-h-square.png" \
-  || die "square canvas extend failed" 3
-
-# ---- 6b. the README/header mark: same content crop, small uniform margin, native
-#          aspect ratio kept (not boxed into a square) ----------------------------
-CONTENT_W="$(magick identify -format '%w' "$WORK/content.png")"
-CONTENT_H="$(magick identify -format '%h' "$WORK/content.png")"
-PAD_X=$(( CONTENT_W * MARK_PAD_PCT / 100 ))
-PAD_Y=$(( CONTENT_H * MARK_PAD_PCT / 100 ))
-magick "$WORK/content.png" -background none -gravity center \
-  -extent "$((CONTENT_W + 2*PAD_X))x$((CONTENT_H + 2*PAD_Y))" -strip \
-  "$HERE/hmd-logo-eye-h-mark.png" \
-  || die "mark canvas extend failed" 3
-
-# ---- 6c. the dark-mode counterpart: same crop geometry, near-white fill ----------
-composite_fill "$BRAND_COLOR_DARK_BG" "$WORK/transparent-dark-bg.png"
-magick "$WORK/transparent-dark-bg.png" -crop "$TRIM_GEOM" +repage "$WORK/content-dark-bg.png" \
-  || die "dark-bg content crop failed" 3
-magick "$WORK/content-dark-bg.png" -background none -gravity center \
-  -extent "$((CONTENT_W + 2*PAD_X))x$((CONTENT_H + 2*PAD_Y))" -strip \
-  "$HERE/hmd-logo-eye-h-mark-dark-bg.png" \
-  || die "dark-bg mark canvas extend failed" 3
-
-# ---- 7. build the .iconset at every size macOS expects, then compile the .icns ---
-ICONSET="$WORK/hmd.iconset"
-mkdir -p "$ICONSET"
-build_size() { # build_size <px> <name>
-  sips -z "$1" "$1" "$HERE/hmd-logo-eye-h-square.png" --out "$ICONSET/$2" >/dev/null \
-    || die "sips resize to ${1}x${1} failed" 3
-}
-build_size 16   icon_16x16.png
-build_size 32   icon_16x16@2x.png
-build_size 32   icon_32x32.png
-build_size 64   icon_32x32@2x.png
-build_size 128  icon_128x128.png
-build_size 256  icon_128x128@2x.png
-build_size 256  icon_256x256.png
-build_size 512  icon_256x256@2x.png
-build_size 512  icon_512x512.png
-cp "$HERE/hmd-logo-eye-h-square.png" "$ICONSET/icon_512x512@2x.png"
-
-iconutil -c icns "$ICONSET" -o "$HERE/hmd-logo-eye-h.icns" \
-  || die "iconutil compile failed" 3
-
-echo "generate-logo-assets: wrote"
-echo "  $HERE/hmd-logo-eye-h-transparent.png"
-echo "  $HERE/hmd-logo-eye-h-square.png"
-echo "  $HERE/hmd-logo-eye-h.icns"
-echo "  $HERE/hmd-logo-eye-h-mark.png"
-echo "  $HERE/hmd-logo-eye-h-mark-dark-bg.png"
+echo "generate-logo-assets: wrote $ICNS"
