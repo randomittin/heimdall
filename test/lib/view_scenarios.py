@@ -584,14 +584,11 @@ def g_latch(st):
     frame = p.state(lambda s: ((s.get("views") or {}).get("result") or {}).get("id") == (res or {}).get("id"), since=before)
     check(frame is not None, "latch: and the result that phone asked for is still served to it, with no new resync")
     before = p.mark()
-    p.rebind(other=True)   # a device that was never paired
-    frame = p.state(lambda s: "views" not in s, since=before)
-    check(frame is not None, "latch: when ANOTHER device binds hmd forgets what the phone listed: the next frame has no views key")
-    before = p.mark()
-    p.resync(VP.FULL_CAPS)
-    frame = p.state(lambda s: "views" in s, since=before)
-    check(frame is not None and frame["body"]["state"]["views"]["result"] is None,
-          "latch: and the result held for the earlier binding is not served to the new one")
+    p.rebind(other=True)   # a device that was never paired: the latch refuses it, and a frame that binds no one strips nothing
+    check(p.state(lambda s: "views" not in s, since=before, timeout=4) is None,
+          "latch: when ANOTHER device's bind is refused hmd keeps what the phone listed too: no frame after it lacks the views key")
+    ack, again = st.view("secret-roadmap-marker.txt")
+    check(again is not None, "latch: and the paired phone is still answered, with no new resync", ack)
     leaks = {n: b for n, b in st.artifacts().items() if "secret-roadmap-marker" in b or "roadmap" in b}
     events = st.artifacts()["events"]
     check(not leaks and '"action":"view"' in events, "latch: the event log records the view command (action, ok, detail) and no file name or content",

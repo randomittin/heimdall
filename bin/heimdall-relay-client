@@ -280,8 +280,8 @@ their modules loaded -- push-v1 also only unless HMD_PUSH=0; see REMOTE CONTROLS
 REGISTRATION below). A phone that sees `resync` sends a sealed command
 `{"action":"resync","params":{"last_seq":N,"digest":"<sha256
 hex>","caps":[..]}}`; hmd acks it ok, keeps its `caps` as the phone's capability set (replaced by
-every resync, kept across a repeat device_bound of the same phone -- a stream reconnect -- and
-forgotten when another device's arrives), and -- when `digest` is not the digest of the
+every resync; no device_bound changes it -- a repeat of the same phone is a stream reconnect and
+another device's is refused -- and a newly bound device starts with none), and -- when `digest` is not the digest of the
 state hmd last sent -- forces a full state frame on the next tick, the same re-send device_bound
 forces. Only while the phone's set holds "z-zlib" is a state frame sealed as `{"z":"zlib","d":
 "<base64 of zlib.compress(that plain plaintext)>"}`, compressed BEFORE the seal. Plain is the
@@ -334,8 +334,8 @@ timeout. The answer is state.views = {"v":1,"enabled":bool,"kinds":["diff","tran
 the kind's own fields, listed in bin/lib/companion_view.py}}, sealed with
 the rest of the state and ONLY in the frames of a phone whose latest sealed resync listed `view-v1` (so only to the one paired
 device: the command itself opened under the latched session key); the newest result replaces the last, it is held in memory
-only, and it is dropped when the phone stops listing the cap or another device binds (the same phone binding again
-keeps it). bin/lib/companion_view.py owns every
+only, and it is dropped when the phone stops listing the cap (a repeated or a refused device_bound leaves it).
+bin/lib/companion_view.py owns every
 rule (the path policy, the symlink refusal, the per-line secret mask, the size cuts, the 20/min limit, the kill switch
 HMD_UI_CONTROLS=0 / .heimdall/app/controls-disabled); this client owns the wire, and applies the relay's redaction profile
 (sentinels/hmd-ui.py _transport_redaction) to the result exactly as it is applied to the rest of the state. A request is
@@ -1184,9 +1184,10 @@ class RelayClient:
                                  # device -- set once, on the first
                                  # device_bound; see _handle_envelope.
         self.device_caps = frozenset()  # the phone's capability tokens: its latest
-                                         # sealed `resync`'s caps (_resync), kept across a
-                                         # repeat device_bound of the same phone, forgotten
-                                         # when another device's arrives; empty = plain frames only
+                                         # sealed `resync`'s caps (_resync); no device_bound
+                                         # changes them (a repeat of the same phone, or a
+                                         # refused foreign one) and a newly bound device
+                                         # starts with none; empty = plain frames only
         self.last_sent_state = None     # the state object of the last state frame sealed --
                                          # what a phone's resync digest is compared with
         self.stop_event = threading.Event()
@@ -1775,6 +1776,7 @@ class RelayClient:
     def _finish_bind(self, pending):
         """What the first device_bound does for a QR bind, once the laptop approved the code bind."""
         self.device_pub = pending["device_pub"]
+        self._adopt_device_caps(None)  # a newly bound device starts with no caps (approved code bind), before its key is set so no resync can land first
         self.paired = True
         self.bound_at = pending["bound_at"]
         self.session_key = pending["key"]  # last: the stream thread reads a set key as "paired"
@@ -1827,10 +1829,10 @@ class RelayClient:
     def _adopt_device_caps(self, raw):
         """Record the phone's capability tokens (E2E.normalize_caps: an array's strings, anything
         else the empty set) and log a `device_caps` event when the set CHANGES. Called only with the
-        `caps` of a `resync` command that OPENED under the paired session key, or with None on a
-        device_bound for a device other than the paired phone (nothing the phone listed is kept for
-        it; a repeat for the paired phone itself never gets here, its caps stay) -- never with
-        anything out of the relay's plaintext frames (see FRAME COMPRESSION AND RESYNC). The set is replaced by one
+        `caps` of a `resync` command that OPENED under the paired session key, or with None when a
+        device is first bound (a new pairing starts with no caps) -- never with anything out of the
+        relay's plaintext frames (see FRAME COMPRESSION AND RESYNC), and never on a repeated or a
+        refused device_bound. The set is replaced by one
         reference assignment, so the state loop's read of it in send_hmd_frame needs no lock: it
         sees the old or the new set, both valid."""
         caps = E2E.normalize_caps(raw)
@@ -2273,9 +2275,11 @@ class RelayClient:
             # about them, and forgetting them here took the dashboards, asks, alerts
             # and views slices (and zlib) away until the phone sent a resync again,
             # which it does on its own rebind, not on hmd's. A repeat with a
-            # DIFFERENT device_pubkey is never trusted or adopted -- loud error, key
-            # and pairing state untouched -- and nothing the paired phone listed is
-            # kept for whoever is on the other end now: its caps are forgotten.
+            # DIFFERENT device_pubkey is never trusted or adopted -- loud error, key,
+            # pairing state and caps untouched: a frame that binds no one must not
+            # strip the paired phone of its slices, as a stray or hostile one would.
+            # The bound device changes only where a key is first latched (below, and
+            # in _finish_bind), and that is where its caps start empty.
             if self.session_key is not None:
                 if device_pub == self.device_pub:
                     self._rearm_state()
@@ -2283,7 +2287,6 @@ class RelayClient:
                     self.write_status()
                     emit({"event": "device_bound", "bound_at": self.bound_at})
                     return
-                self._adopt_device_caps(None)  # a different device: nothing the paired phone listed is kept for it
                 emit({"event": "error",
                       "detail": "device_bound device_pubkey differs from the already latched "
                                 "session key's -- ignored, key not re-derived"})
@@ -2316,6 +2319,7 @@ class RelayClient:
                 emit({"event": "error", "detail": "device_bound key derivation failed: %s" % e})
                 return
             self.device_pub = device_pub
+            self._adopt_device_caps(None)  # a newly bound device starts with no caps (QR bind)
             self.paired = True
             self.bound_at = payload.get("bound_at")
             self._code_bound()

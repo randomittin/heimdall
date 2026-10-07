@@ -37,7 +37,8 @@
 #   15. caps lifecycle: the latest resync replaces the set; bad params change nothing
 #   16. only an AUTHENTICATED resync counts (device_bound payload / forged command / keepalive cannot)
 #   17. device_bound: the SAME phone binding again keeps its caps (slices and zlib ride on, no new resync) and
-#       still forces a resend; another device's device_bound forgets them. Two mutants put the old behaviour back.
+#       still forces a resend; another device's REFUSED device_bound changes nothing (a stray frame cannot strip the
+#       paired phone); a newly bound device (QR or approved code) starts with none. Four mutants put the old behaviour back.
 #   18. resync digest: current -> no resend; stale / nothing sent -> full state forced; desync logged
 #   19. seq stays strictly increasing and every frame opens under its own (seq, "hmd") nonce
 #   20. a python without zlib: no z-zlib listed, plain frames
@@ -154,7 +155,7 @@ class Rig:
     it, and `plaintext()` opens it with the key the phone derived -- the client then has exactly the
     state it has in production (session key, seq counter, device_caps, last_sent_state, event stream)."""
 
-    def __init__(self, bind_extra=None):
+    def __init__(self, bind_extra=None, bound=True):
         loader = SourceFileLoader("hmd_relay_client_zlib_rig", os.path.join(REPO, "bin", "heimdall-relay-client"))
         spec = importlib.util.spec_from_loader(loader.name, loader)
         self.mod = importlib.util.module_from_spec(spec)
@@ -171,9 +172,10 @@ class Rig:
         self.dev_seq = 0
         self.posts = []
         self.client.send_frame_envelope = self._post
-        self.bind(bind_extra)
         self.dev_key = self.E2E.derive_session_key(self.dev_priv, self.client.pub, self.client.session_id)
-        assert self.dev_key == self.client.session_key, "device_bound did not pair the client with the phone key"
+        if bound:
+            self.bind(bind_extra)
+            assert self.dev_key == self.client.session_key, "device_bound did not pair the client with the phone key"
 
     def _post(self, type_, nonce, ciphertext, seq, **kwargs):
         self.posts.append({"type": type_, "seq": seq, "nonce": nonce, "ciphertext": ciphertext})
@@ -593,28 +595,47 @@ assert rig.dev_seq == sent_commands, "the phone must not have to send anything"
 assert all(k in after["state"] for k in SLICES), "a same-device rebind dropped slices: %s" % sorted(after["state"])
 assert json.loads(rig.plaintext(rig.last("state")))["z"] == "zlib", "a same-device rebind must keep frames compressed"
 
-# ANOTHER device claims the session: the latch refuses it (its key is never adopted), and nothing the paired phone
-# listed is kept for whoever is on the other end now -- the paired phone lists its caps again to get them back
+# A device_bound from ANOTHER device: refused by the latch (its key is never adopted). A frame that binds no one takes nothing from
+# the paired phone -- a stray or hostile one must not strip its slices -- so its caps stay and it is served as before
 rig = Rig()
 rig.resync(caps)
 paired = rig.tick(state)
 assert all(k in paired["state"] for k in SLICES), sorted(paired["state"])
+logged = rig.events("device_caps")
 _, other_pub = rig.E2E.generate_keypair()
+rig.client.last_sent_digest = "abc"
 rig.bind(pub=other_pub)
 assert any("differs from the already latched" in e["detail"] for e in rig.events("error")), rig.events("error")
 assert rig.client.session_key == rig.dev_key, "the latch holds: the paired phone key is untouched"
-assert rig.client.device_caps == frozenset(), "a different device's device_bound must forget the caps: %s" % sorted(rig.client.device_caps)
-assert rig.events("device_caps")[-1] == {"event": "device_caps", "caps": []}
+assert rig.client.device_caps == frozenset(caps), "a refused foreign device_bound must keep the paired phone's caps: %s" % sorted(rig.client.device_caps)
+assert rig.events("device_caps") == logged, "a refused device_bound logs no device_caps event"
+assert rig.client.last_sent_digest == "abc", "and changes nothing else: no resend is forced"
+rig.client.last_sent_digest = None
+after = rig.tick(state)
+assert all(k in after["state"] for k in SLICES), "slices vanished after a refused foreign device_bound: %s" % sorted(after["state"])
+assert json.loads(rig.plaintext(rig.last("state")))["z"] == "zlib", "and its frames are still compressed"
+rig.resync(caps)
+assert rig.ack()["ok"] is True, "the paired phone is still heard"
+
+# a genuinely NEW device -- a new session and pairing installs its key: a QR bind, or a code bind the laptop approved -- starts with
+# no caps whatever the client held before (its caps are the ones its own resync lists); a fresh client is a new pairing
+rig = Rig(bound=False)
+rig.client.device_caps = frozenset(caps)  # as if an earlier phone had listed them
+rig.bind()
+assert rig.client.device_caps == frozenset(), "a device bound by QR must start with no caps: %s" % sorted(rig.client.device_caps)
 frame = rig.tick(state)
 assert not [k for k in SLICES if k in frame["state"]], "slices rode to a phone that listed nothing: %s" % sorted(frame["state"])
-assert "z" not in json.loads(rig.plaintext(rig.last("state"))), "and its frames are plain again"
-rig.resync(caps)
-back = rig.tick(state)
-assert all(k in back["state"] for k in SLICES), "a new resync must bring the slices back: %s" % sorted(back["state"])
-assert json.loads(rig.plaintext(rig.last("state")))["z"] == "zlib", "and compression with them"
+assert "z" not in json.loads(rig.plaintext(rig.last("state"))), "and its frames are plain"
+rig = Rig(bound=False)
+rig.client.device_caps = frozenset(caps)
+with contextlib.redirect_stdout(rig.out):
+    rig.client._finish_bind({"device_pub": rig.dev_pub, "bound_at": 1, "key": rig.dev_key})
+assert rig.client.session_key == rig.dev_key, "the approved bind latches the key"
+assert rig.client.device_caps == frozenset(), "a device bound by an approved code must start with no caps: %s" % sorted(rig.client.device_caps)
+assert Rig().client.device_caps == frozenset(), "a new pairing starts with no caps"
 PYEOF
 )"
-printf '%s\n' "$CASE17_BODY" | py_case 17 "client: a same-device device_bound keeps the phone's caps (slices, zlib, no resync); another device's forgets them" rig
+printf '%s\n' "$CASE17_BODY" | py_case 17 "client: a same-device or refused foreign device_bound keeps the phone's caps (slices, zlib, no resync); a newly bound device starts with none" rig
 
 # ═══ 18. resync digest ══════════════════════════════════════════════════════
 py_case 18 "client: resync digest of the last sent state -> no resend; stale or nothing sent -> full state forced" rig <<'PYEOF'
@@ -877,10 +898,18 @@ mutant17 "a same-device device_bound forgets the caps again" \
   $'                if device_pub == self.device_pub:\n' \
   $'                if device_pub == self.device_pub:\n                    self._adopt_device_caps(None)\n' \
   "must keep the phone's caps"
-mutant17 "another device's device_bound keeps the caps" \
-  $'                self._adopt_device_caps(None)  # a different device: nothing the paired phone listed is kept for it\n' \
-  $'                _ = device_pub\n' \
-  "must forget the caps"
+mutant17 "a refused foreign device_bound strips the paired phone's caps" \
+  $'                emit({"event": "error",\n                      "detail": "device_bound device_pubkey differs from the already latched "\n' \
+  $'                self._adopt_device_caps(None)\n                emit({"event": "error",\n                      "detail": "device_bound device_pubkey differs from the already latched "\n' \
+  "refused foreign device_bound must keep"
+mutant17 "a QR bind keeps the caps an earlier device listed" \
+  $'            self._adopt_device_caps(None)  # a newly bound device starts with no caps (QR bind)\n' \
+  $'' \
+  "a device bound by QR must start with no caps"
+mutant17 "an approved code bind keeps the caps an earlier device listed" \
+  $'        self._adopt_device_caps(None)  # a newly bound device starts with no caps (approved code bind), before its key is set so no resync can land first\n' \
+  $'' \
+  "a device bound by an approved code must start with no caps"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ] && exit 0 || exit 1

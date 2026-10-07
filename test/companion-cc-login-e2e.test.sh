@@ -875,10 +875,10 @@ assert login["cc"]["status"] == "unknown" and login["cc"]["checked_at"] == 0, "n
 # the same phone binding again (a stream reconnect) keeps what it listed ...
 rig.bind()
 assert rig.client.device_caps == {"login-v1", "resync"} and rig.login() is not None, "a same-device device_bound must keep the caps"
-# ... another device's device_bound is refused by the latch and forgets them
+# ... and so does another device's device_bound, which the latch refuses: a frame that binds no one strips nothing
 _, other_pub = rig.E2E.generate_keypair()
 rig.bind(other_pub)
-assert rig.client.device_caps == frozenset() and rig.login() is None, "another device's device_bound must forget the caps"
+assert rig.client.device_caps == {"login-v1", "resync"} and rig.login() is not None, "a refused foreign device_bound must keep the caps"
 PYEOF
 
 py_case 24 "a rebind of the same phone keeps the request live and re-sends it (level-triggered state), with no new resync" <<'PYEOF'

@@ -81,9 +81,9 @@ mutant "the loop is started without --parent" bin/lib/dashboard_host.py \
 mutant "a same-device device_bound forgets the caps again" bin/heimdall-relay-client \
   $'                if device_pub == self.device_pub:\n' \
   $'                if device_pub == self.device_pub:\n                    self._adopt_device_caps(None)\n' "3d\." 3f
-mutant "another device's device_bound keeps the caps" bin/heimdall-relay-client \
-  $'                self._adopt_device_caps(None)  # a different device: nothing the paired phone listed is kept for it\n' \
-  $'                _ = device_pub\n' "3e\." 3f
+mutant "a refused foreign device_bound strips the paired phone's caps" bin/heimdall-relay-client \
+  $'                emit({"event": "error",\n                      "detail": "device_bound device_pubkey differs from the already latched "\n' \
+  $'                self._adopt_device_caps(None)\n                emit({"event": "error",\n                      "detail": "device_bound device_pubkey differs from the already latched "\n' "3e\." 3f
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
