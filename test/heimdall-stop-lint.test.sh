@@ -14,13 +14,26 @@
 #   4. A hung linter on PATH cannot hang Stop: exits 0 inside the budget, and
 #      the receipt says complete=false rather than lying green.
 #   5. Every path exits 0 — it is advisory, never a gate.
+#   6. SEVERITY SCOPE. CLAUDE.md defines the gate as "Lint clean (zero
+#      warnings)", but shellcheck's own default threshold also counts info and
+#      style notes, so lint_clean was stricter than the gate it feeds. The tool
+#      now runs shellcheck at -S warning: a file with only an info-level finding
+#      is clean, a file with a warning is not, and HMD_STOP_LINT_SEVERITY=
+#      error|warning|info|style moves the bar (info/style opt in to stricter).
+#      Cases 13-16 pin the argv the tool builds with a recording fake shellcheck
+#      (independent of the installed version); 17-19 prove the verdicts end to
+#      end with the real shellcheck, and say so loudly when it is not usable;
+#      20 checks the tool and this suite pass the gate they implement.
 #
 # ISOLATION: edit-tracker keys its ledger on $TMPDIR/heimdall-edits/
 # $CLAUDE_CODE_SESSION_ID.log. Every case here sets TMPDIR to a private temp
 # dir and a unique session id, so the operator's real ledger is never read or
 # written. HEIMDALL_STATE_FILE is likewise pointed at a fixture file.
+# HMD_STOP_LINT_SEVERITY is unset up front so an operator running strict
+# cannot change what the default-severity cases see; each case sets it itself.
 
 set -u
+unset HMD_STOP_LINT_SEVERITY
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LINT="$REPO/bin/heimdall-stop-lint"
@@ -223,6 +236,176 @@ if bash -n "$LINT" 2>/dev/null; then
   ok "12. bin/heimdall-stop-lint parses under bash -n"
 else
   bad "12. bin/heimdall-stop-lint has a syntax error"
+fi
+
+# ── 13-16. severity contract: pin the argv the tool builds ──────────────────
+# A recording fake shellcheck stands in for the real one, so these cases prove
+# WHAT THE TOOL ASKS FOR with no dependence on the installed shellcheck's
+# version, rc files, or rule levels.
+
+# mk_fake_shellcheck <case-dir> → fakebin/shellcheck appends its argv to fakebin/argv.log
+mk_fake_shellcheck() {
+  mkdir -p "$1/fakebin"
+  cat > "$1/fakebin/shellcheck" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$(dirname "$0")/argv.log"
+exit 0
+EOF
+  chmod +x "$1/fakebin/shellcheck"
+  : > "$1/fakebin/argv.log"
+}
+
+D="$(mk_case sevargv)"
+S="$D/repo/heimdall-state.json"
+mk_fake_shellcheck "$D"
+printf '#!/usr/bin/env bash\necho a\n' > "$D/repo/a.sh"
+track "$D" "$D/repo/a.sh"
+
+rc="$(PATH="$D/fakebin:$PATH" run_lint "$D")"
+if [ "$rc" = "0" ] && [ -s "$D/fakebin/argv.log" ] \
+   && ! grep -qv -- '^-S warning -f gcc ' "$D/fakebin/argv.log" \
+   && [ "$(jq -r '.quality_gates.lint_last_run.shellcheck_severity' "$S")" = "warning" ]; then
+  ok "13. default: shellcheck runs at -S warning, receipt records shellcheck_severity=warning"
+else
+  bad "13. default severity wrong (rc=$rc): argv=[$(head -1 "$D/fakebin/argv.log")] receipt=$(jq -c '.quality_gates.lint_last_run' "$S")"
+fi
+
+sev_bad=""
+for pair in error:error warning:warning info:info style:style INFO:info Style:style; do
+  given="${pair%%:*}"; want="${pair#*:}"
+  : > "$D/fakebin/argv.log"
+  rc="$(HMD_STOP_LINT_SEVERITY="$given" PATH="$D/fakebin:$PATH" run_lint "$D")"
+  if [ "$rc" != "0" ] || [ ! -s "$D/fakebin/argv.log" ] \
+     || grep -qv -- "^-S $want -f gcc " "$D/fakebin/argv.log"; then
+    sev_bad="$sev_bad $given(want $want, got '$(head -1 "$D/fakebin/argv.log")', rc=$rc)"
+  fi
+done
+if [ -z "$sev_bad" ] && [ "$(jq -r '.quality_gates.lint_last_run.shellcheck_severity' "$S")" = "style" ]; then
+  ok "14. HMD_STOP_LINT_SEVERITY error|warning|info|style (any case) → shellcheck -S <that>, receipt follows"
+else
+  bad "14. severity env var not honoured:$sev_bad"
+fi
+
+: > "$D/fakebin/argv.log"
+rc="$(HMD_STOP_LINT_SEVERITY=loud PATH="$D/fakebin:$PATH" run_lint "$D")"
+err="$(cat "$TMPROOT/err")"
+if [ "$rc" = "0" ] && [ -s "$D/fakebin/argv.log" ] \
+   && ! grep -qv -- '^-S warning -f gcc ' "$D/fakebin/argv.log" \
+   && [ "$(grep -c "unknown HMD_STOP_LINT_SEVERITY 'loud'" <<<"$err")" = "1" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run.shellcheck_severity' "$S")" = "warning" ]; then
+  ok "15. unknown severity → falls back to warning, said once on stderr, exit 0"
+else
+  bad "15. bad severity mishandled (rc=$rc): argv=[$(head -1 "$D/fakebin/argv.log")] stderr: $err"
+fi
+
+D="$(mk_case sevempty)"
+rc="$(HMD_STOP_LINT_SEVERITY=loud run_lint "$D")"
+if [ "$rc" = "0" ] && [ ! -s "$TMPROOT/err" ] && [ ! -s "$TMPROOT/out" ]; then
+  ok "16. unknown severity with nothing edited stays silent (case 5's contract holds)"
+else
+  bad "16. unknown severity broke the nothing-edited silence (rc=$rc): $(cat "$TMPROOT/err")"
+fi
+
+# ── 17-19. severity verdicts end to end, with the REAL shellcheck ───────────
+# SC2086 (unquoted expansion) is info level; SC2034 (unused variable) is
+# warning level. The fixtures are classified under THIS shellcheck first: a
+# version, or a ~/.shellcheckrc, that moves either rule makes 17-19 prove
+# nothing, so they SKIP loudly rather than pass or fail for the wrong reason.
+# 13-16 above still hold the contract in that case.
+
+# mk_sc_fixtures <dir> → info.sh (only an info finding) and warn.sh (a warning)
+mk_sc_fixtures() {
+  cat > "$1/info.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+x="$1"
+echo $x
+EOF
+  cat > "$1/warn.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+unused=1
+echo ok
+EOF
+}
+
+SC_OK=0
+SC_WHY="shellcheck not on PATH"
+if command -v shellcheck >/dev/null 2>&1; then
+  P="$TMPROOT/scprobe"; mkdir -p "$P"; mk_sc_fixtures "$P"
+  shellcheck -S info    -f gcc "$P/info.sh" >/dev/null 2>&1; info_at_info=$?
+  shellcheck -S warning -f gcc "$P/info.sh" >/dev/null 2>&1; info_at_warn=$?
+  shellcheck -S warning -f gcc "$P/warn.sh" >/dev/null 2>&1; warn_at_warn=$?
+  if [ "$info_at_info" -eq 1 ] && [ "$info_at_warn" -eq 0 ] && [ "$warn_at_warn" -eq 1 ]; then
+    SC_OK=1
+  else
+    SC_WHY="fixtures classify differently here: info.sh rc=$info_at_info@info/$info_at_warn@warning, warn.sh rc=$warn_at_warn@warning"
+  fi
+fi
+
+if [ "$SC_OK" -ne 1 ]; then
+  echo "  SKIP 17-19: real shellcheck not usable ($SC_WHY); contract cases 13-16 still ran"
+else
+  D="$(mk_case sevinfo)"
+  S="$D/repo/heimdall-state.json"
+  mk_sc_fixtures "$D/repo"
+  track "$D" "$D/repo/info.sh"
+  rc="$(run_lint "$D")"
+  err="$(cat "$TMPROOT/err")"
+  if [ "$rc" = "0" ] && grep -q '1 file(s) checked, clean' <<<"$err" && grep -q 'shellcheck ok' <<<"$err" \
+     && [ "$(lint_clean "$D")" = "true" ] \
+     && [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" = "0" ]; then
+    ok "17. info-only file (SC2086) → clean at the default severity, lint_clean=true"
+  else
+    bad "17. info-only file wrongly counted (rc=$rc lint_clean=$(lint_clean "$D")): $err"
+  fi
+
+  D="$(mk_case sevwarn)"
+  S="$D/repo/heimdall-state.json"
+  mk_sc_fixtures "$D/repo"
+  track "$D" "$D/repo/warn.sh"
+  # Pre-arm green so the flip to false is a real transition, not the initial value.
+  HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+  rc="$(run_lint "$D")"
+  err="$(cat "$TMPROOT/err")"
+  if [ "$rc" = "0" ] && grep -q 'shellcheck 1' <<<"$err" && grep -q 'SC2034' <<<"$err" \
+     && [ "$(lint_clean "$D")" = "false" ] \
+     && [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" -ge 1 ]; then
+    ok "18. warning-level file (SC2034) → NOT clean at the default severity, lint_clean flips false"
+  else
+    bad "18. warning-level file not flagged (rc=$rc lint_clean=$(lint_clean "$D")): $err"
+  fi
+
+  D="$(mk_case sevinfoopt)"
+  S="$D/repo/heimdall-state.json"
+  mk_sc_fixtures "$D/repo"
+  track "$D" "$D/repo/info.sh"
+  HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+  rc="$(HMD_STOP_LINT_SEVERITY=info run_lint "$D")"
+  err="$(cat "$TMPROOT/err")"
+  if [ "$rc" = "0" ] && grep -q 'shellcheck 1' <<<"$err" && grep -q 'SC2086' <<<"$err" \
+     && [ "$(lint_clean "$D")" = "false" ] \
+     && [ "$(jq -r '.quality_gates.lint_last_run.shellcheck_severity' "$S")" = "info" ]; then
+    ok "19. HMD_STOP_LINT_SEVERITY=info → the same info-only file is NOT clean, lint_clean flips false"
+  else
+    bad "19. info opt-in did not tighten the gate (rc=$rc lint_clean=$(lint_clean "$D")): $err"
+  fi
+fi
+
+# ── 20. the tool and its suite pass the gate they implement ─────────────────
+# Self-hosting: source that reads lint_clean=false at the default severity
+# turns its own gate red. Header prose is the usual way to trip it: shellcheck
+# parses any comment line whose first word starts with "shellcheck" as a
+# directive and reports SC1073 (an error) when the rest does not parse.
+if command -v shellcheck >/dev/null 2>&1; then
+  sc_out="$(shellcheck -S warning -f gcc "$LINT" "$REPO/test/heimdall-stop-lint.test.sh" 2>&1)"; sc_rc=$?
+  if [ "$sc_rc" -eq 0 ]; then
+    ok "20. bin/heimdall-stop-lint and its suite are clean at shellcheck -S warning"
+  else
+    bad "20. the tool or its suite fails its own gate (rc=$sc_rc): $sc_out"
+  fi
+else
+  echo "  SKIP 20: shellcheck not on PATH, so the self-hosting check did not run"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

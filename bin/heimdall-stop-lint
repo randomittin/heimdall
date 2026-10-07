@@ -23,7 +23,9 @@
 #   2. Group by language on extension: shell (.sh/.bash), python (.py),
 #      js/ts (.js/.jsx/.mjs/.cjs/.ts/.tsx).
 #   3. Detect what the REPO already uses; never install anything:
-#        shell   bash -n (always)  +  shellcheck if on PATH
+#        shell   bash -n (always)  +  shellcheck -S <severity> if on PATH
+#                (default severity warning; see WHAT COUNTS AS A SHELLCHECK
+#                FINDING below)
 #        python  python3 -c ast.parse (always)  +  ruff if on PATH AND the repo
 #                carries ruff.toml / .ruff.toml / pyproject.toml
 #        js/ts   biome  if biome.json(c) present and node_modules/.bin/biome
@@ -46,10 +48,29 @@
 #                                       (budget exhausted or a checker timed
 #                                       out) with no finding yet
 #        .quality_gates.lint_last_run   {at, files, checked, findings, tools,
-#                                        complete, timeouts, skipped, source}
+#                                        complete, timeouts, skipped, source,
+#                                        + the shellcheck_severity in force}
 #                                        — the receipt. Additive
 #                                        key; `set` creates it, nothing in the
 #                                        schema enumerates quality_gates keys.
+#
+# WHAT COUNTS AS A SHELLCHECK FINDING
+# -----------------------------------
+# CLAUDE.md defines the gate as "Lint clean (zero warnings)". The default
+# threshold of shellcheck also counts info and style notes (SC2086 quoting,
+# SC2001 sed-vs-parameter-expansion, ...), a stricter bar than the gate this
+# tool feeds: a file with zero warnings still read lint_clean=false. So the
+# tool runs `shellcheck -S warning` (error + warning) and
+# HMD_STOP_LINT_SEVERITY moves the bar:
+#   error | warning (default) | info | style
+# Case-insensitive; info and style are the opt-in stricter runs. An unknown
+# value falls back to warning and says so once on stderr (only when shellcheck
+# is about to run). The threshold in force is written into the receipt as
+# lint_last_run.shellcheck_severity, so a "clean" always names the bar it was
+# measured against. bash -n, python ast and the other checkers are untouched.
+# The existing info/style notes in the repo's own scripts are NOT cleaned up
+# here; that is deferred work, and `HMD_STOP_LINT_SEVERITY=info` is how to see
+# them.
 #
 # ADVISORY, FAIL OPEN, ALWAYS EXIT 0
 # ----------------------------------
@@ -85,6 +106,8 @@
 #   HEIMDALL_STATE_FILE overrides the state file (default <repo>/heimdall-
 #   state.json, falling back to <repo>/superx-state.json, matching
 #   bin/heimdall-state).
+#   HMD_STOP_LINT_SEVERITY=error|warning|info|style sets the minimum shellcheck
+#   severity that counts as a finding (default warning).
 
 set -u
 
@@ -112,6 +135,17 @@ case "$BUDGET" in ''|*[!0-9]*) BUDGET=60 ;; esac
 case "$PER_CALL" in ''|*[!0-9]*) PER_CALL=20 ;; esac
 [ "$BUDGET" -lt 1 ] && BUDGET=1
 [ "$PER_CALL" -lt 1 ] && PER_CALL=1
+
+# Minimum shellcheck severity that counts as a finding (see the header). An
+# unknown value is kept in SEVERITY_BAD so it can be said once, later, and only
+# if shellcheck actually runs -- nothing edited must still print nothing.
+SEVERITY_RAW="${HMD_STOP_LINT_SEVERITY:-warning}"
+SEVERITY="$(printf '%s' "$SEVERITY_RAW" | tr '[:upper:]' '[:lower:]')"
+SEVERITY_BAD=""
+case "$SEVERITY" in
+  error|warning|info|style) ;;
+  *) SEVERITY_BAD="$SEVERITY_RAW"; SEVERITY="warning" ;;
+esac
 
 REPO_RAW="$(cd "$REPO" 2>/dev/null && pwd || echo "$REPO")"
 REPO="$(cd "$REPO" 2>/dev/null && pwd -P || echo "$REPO")"
@@ -285,6 +319,9 @@ report() {
 budget_left() { [ "$(remaining)" -gt 0 ]; }
 
 # --- shell -------------------------------------------------------------------
+if [ -n "$SEVERITY_BAD" ] && [ -n "$SHELLCHECK" ] && [ "${#SHELL_FILES[@]}" -gt 0 ]; then
+  say "unknown HMD_STOP_LINT_SEVERITY '$SEVERITY_BAD' (want error|warning|info|style) — using warning"
+fi
 for f in "${SHELL_FILES[@]:-}"; do
   [ -n "$f" ] || continue
   if ! budget_left; then SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); report "$f" "skipped (budget)"; continue; fi
@@ -294,7 +331,7 @@ for f in "${SHELL_FILES[@]:-}"; do
   elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("bash -n timed out")
   else fcount=$((fcount + 1)); parts+=("bash -n FAIL"); detail="$out"; fi
   if [ -n "$SHELLCHECK" ] && budget_left; then
-    run_bounded "$SHELLCHECK" -f gcc "$f"; out="$(tool_out)"; add_tool shellcheck
+    run_bounded "$SHELLCHECK" -S "$SEVERITY" -f gcc "$f"; out="$(tool_out)"; add_tool shellcheck
     if [ "$RUN_RC" -eq 0 ]; then parts+=("shellcheck ok")
     elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("shellcheck timed out")
     else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
@@ -403,7 +440,8 @@ if [ -n "$STATE" ] && [ -f "$STATE" ] && [ -x "$STATE_TOOL" ] && command -v jq >
     --argjson complete "$COMPLETE" \
     --argjson timeouts "$TIMEOUTS" \
     --argjson skipped "$SKIPPED_BUDGET" \
-    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, skipped:$skipped, source:"heimdall-stop-lint"}')"
+    --arg shellcheck_severity "$SEVERITY" \
+    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, skipped:$skipped, shellcheck_severity:$shellcheck_severity, source:"heimdall-stop-lint"}')"
   # Never let a state-tool hiccup (lock contention, malformed file) escape.
   HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_last_run' "$receipt" >/dev/null 2>&1 || true
   if [ "$FINDINGS" -gt 0 ]; then
