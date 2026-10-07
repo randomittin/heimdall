@@ -6,155 +6,166 @@
 
 repo: randomittin/heimdall
 
-generated_ts: 1785869334 (2026-08-04T18:48:54 UTC)
+generated_ts: 1791376206 (2026-10-07T12:30:06 UTC)
 
 ## What was being attempted
-Auto-checkpoint — 2026-08-04T17:59:08Z
+Landed
 
 ## Active goal
 none
 
 ## .planning/CHECKPOINT.md (where we left off)
-<!-- heimdall-auto-checkpoint:begin -->
-## Auto-checkpoint — 2026-08-04T17:59:08Z
+[...trimmed to the last 150 lines...]
+**3. Branch triage — 7 of 8 stranded branches DROPPED**, verified by tree comparison not by
+subject line. Three were byte-identical to main; three would have REVERTED main to older
+designs (one would have deleted the very never-reap guard its subject claimed to add).
+Only Headroom A/B was real → merged. **Nothing deleted: 2 of those worktrees hold live
+agent-memory.**
 
-> Written automatically at session end (mechanical, no LLM). Run `/hmd:save`
-> for a richer human/LLM-authored handoff — it enriches this same file.
+## Landed
+- `bin/heimdall-ctx-meter` — the $369.50 fix, enforced. Silent <150K; ceiling 150K;
+  cliff-near 700K; emergency 800K (the measured quintile boundary where cache-write goes
+  13,320→42,183). Unreadable = NON_VERIFIED, never OK. Statusline publishes (the only place
+  Claude Code exposes context size — no hook receives it), `UserPromptSubmit` reads, notice
+  to **stderr** so the warning never costs context. Its suite was mutation-tested and one
+  mutant SURVIVED (notice moved to stdout) — the frequent paths were unproven; fixed, 68/0.
+- `bin/heimdall-graph` — def/refs/callers/callees/impact/outline. 93,166 B raw vs 1,323 B
+  outline = 70x. **Recovered from a truncated worktree: work complete and green, only the
+  commit step lost.**
+- `heimdall-brief` joined to the graph and actually routed (it was dead code since 17 Jun).
+  1.60x on the prompt, 28.7x downstream.
+- Two fail-OPEN holes closed in the brief path (a second assembler that never failed +
+  an unvalidated invariants ref). **Mutant proof run by me after that agent truncated:**
+  no-op the accumulator → (b3)(b4) RED with rc=0 where refusal required; restore → 31/0.
+- SessionStart hook advisories cut to one line each.
+- Checkpoint depth fixed. **bash 3.2 bug: `printf '- **Branch:** %s\n'` parsed the leading
+  `-` as a flag — EVERY checkpoint ever written on this machine silently lost Branch, HEAD,
+  Phase, goal and dirty-count.** That is why resuming felt like starting over.
 
-### Recent commits
-- deeba30 merge: isolate headroom-module from the machine's install state
-- 9cad9a9 merge: show away teammates as offline instead of erasing them
-- 98497d0 test(headroom): isolate the suite from the machine's install state
-- 11692a2 fix(wall): keep /roster-team online-only; document the 7-day window
-- 3bf6ebb feat(wall): render away teammates as UNMISTAKABLY offline
-- a6002a7 Merge branch 'main' into worktree-agent-a6b198e70de4da905
-- 704fb73 feat(wall): 7-day offline window — server roster + ledger filter
-- 37a8d27 merge: say plainly that the storage-codec half never engages
-- 74d7f8b fix(headroom): the storage-codec half is unreachable via the documented install
-- f94442f fix(headroom): narrow the storage-codec reach claim to what is actually wired
-
-### Resume
-Read this file, then `heimdall` to resume. If a goal is set above, restore it with `/goal <condition>`.
-<!-- heimdall-auto-checkpoint:end -->
-
-# Checkpoint — 2026-08-04
-
-## Why this file got rewritten
-The 2026-08-03 checkpoint recorded commits but NOT the work order, NOT which items were
-awaiting RJ's approval, and NOT the open decisions. Cost: this session had to grep the raw
-transcript JSONL to recover the V2/V11 specs. **A checkpoint that lists commits is a git
-log with extra steps.** What belongs here is what exists ONLY in conversation: work orders,
-approvals, gated decisions, and findings whose evidence is a measurement, not a file.
+## Open
+- 30+ commits unpushed — **push stays with RJ, agent never pushes.**
+- 5 parallel-flaky suites (above).
+- `sentinels/lib/brief.sh` capsule store still empty → `--capsules` wired but unexercised.
+- Reachability gate RULE B loophole: a dead chain citing itself reads as reachable.
+- `launch-docs/log-compression-and-gates.md` markers still unresolved.
 
 ---
 
-## VIRALITY WORK ORDER (V1–V12) — reproduced so it never needs recovering again
-Full text is in the 2026-08-03 transcript.
+# Session record — 2026-08-08 (directives D1–D5 + two specs)
 
-| # | Item | Status |
+## REFUTED THIS SESSION (spec 1.4: the most expensive knowledge to re-derive)
+
+1. **"The $57.73 Stop hook is a wrong-tier bug; export SECURITY_REVIEW_MODEL=haiku."**
+   REFUTED, and it was MY claim to RJ. Wrong hook (the spend is the PostToolUse *agentic*
+   commit/push review, `SG_AGENTIC_MODEL`; the Stop hook posts over raw HTTP, writes no
+   transcript, contributed $0.00) and wrong direction (it downgrades a real vulnerability
+   reviewer). Setting the var also suppresses the plugin's fallback, so a typo silences the
+   reviewer. **The tier stays opus; the line is irreducible.** Honest saving on that surface
+   is ~$8–14/window via `MAX_STOP_HOOK_FIRINGS`. Memo:
+   `docs/analysis/2026-08-08-security-review-tier-decision.md`. Pinned by
+   `test/security-review-tier.test.sh` 13/0. Commit `047d61a`.
+
+2. **Compaction spec B1: "the SessionStart:compact index is the prime suspect, 10–18KB."**
+   REFUTED. Measured **6,601 B/compact** — ~a third of the low estimate, and FIFTH behind
+   `agent_listing_delta` (16,295 B), `compact_summary` (15,061), `attach:file` (10,108) and
+   `hook:SessionStart` (9,311). The real lever is **STANDING overhead ~55,247 tok = ~76% of
+   baseline** (spec item B4, listed fourth → moves to first). The largest single re-injection,
+   `attach:agent_listing_delta`, is not in the spec at all.
+
+3. **Compaction spec B2: "graph-first reading for the orchestrator."** REFUTED as a priority.
+   `tool:Read` is **0.8%** of per-turn additions. The graph's measured 28.7× win is
+   generation-side (spawn briefs), not orchestrator context control.
+
+4. **"Compact every ~2 turns."** Corrected, not refuted: true in PROMPTS (1–5 human prompts
+   between compacts) but the mechanism is **42–80 API requests per compact window**. Median
+   turn is 989 tokens — already small. Writing less per turn fixes nothing.
+
+CONFIRMED: B3 (envelope handbacks) — the agent-orchestration family is **14.4%** of per-turn
+additions and is the one term that grows with parallelism. B5 reinforced: do NOT raise the
+threshold; the 984K–1M regime is where the cache-write cliff lives.
+Findings: `docs/analysis/compaction-arithmetic-findings.md` (commit `5f44c48`).
+
+## THE SESSION'S DOMINANT FINDING
+
+**Dead-on-arrival is the DEFAULT outcome of a build task, not a rare slip.** Building the
+consumer audit produced THREE unwired subsystems in one session: `heimdall-sla` (no
+consumer), `heimdall-tier` (no `tier)` dispatch arm), and the liveness manifest declaring
+seven subsystems that record nothing. An agent told to "build X" delivers X wired to
+nothing, because its acceptance criteria are about X. **Spawn instructions must name the
+consumer as a deliverable, as a separate committed unit.**
+
+Second-order: **agents that batch their commit to the end lose everything.** Five of eight
+agents this session truncated; those that committed per unit lost nothing, and every
+salvage was done from the worktree via git, never from the agent's report.
+
+## LANDED (all local, nothing pushed — push stays with RJ)
+
+`c15ac48` ctx-meter · `db410b2` symbol graph · `a2982b4` brief · `f36aa1b` forensics ·
+SLA (33/0, mutation-proven) · `047d61a` tier refutation (13/0) · `4269b2d` liveness
+(26/1, red is load-bearing) · `bd7e84b` consumer audit (14/3, all three real) ·
+`9b72263` compaction harness (32/0) · `5f44c48` findings · `519dbbc` tier table +
+wiring (29/0, 47/0) · graph overlap Q1–Q4 complete (`c5d6a44`, `01f0063`, `9733a32`,
+`5d1fc99`).
+
+## OPEN
+
+- Resume-probe suite: `checkpoint-completeness` 42/0; `resume-probe` hung past 240s under
+  4-agent git contention — re-running. **Do not claim the probe green until it is.**
+- `heimdall-conformance` shipped with NO suite (its author truncated); agent writing one.
+- Dead-chain reachability still CLEARS (falsifier written and failing) — agent on it.
+- Q4 verdict: the sampling-falsifier guard **does not exist**; sufficient today only because
+  no gate consumes the graph. If one ever does, `symbolgraph.py` never abstains — "no callers"
+  and "blind here" are byte-identical at exit 0, over 552/749 shell files.
+- **Full gate has NOT been run this session** (1374s) — runs once, at the end.
+
+---
+
+# Session 2026-08-08 (second half) — merges, and five of my own claims refuted
+
+## Claims I made that were REFUTED (this is the list that must never be lost)
+
+| My claim | What was measured | Who refuted it |
 |---|---|---|
-Audited 2026-08-04 (read-only, pinned to `801ef7a`). **The original work order text is NOT
-in this repo and is not recoverable from this machine** — `heimdall-path-to-viral.md` does
-not exist, and the transcript store has no copy. V3/V7/V9/V10 names below are
-RECONSTRUCTIONS, not ground truth. Supply the work order or V10 stays unauditable.
+| resume-probe suite HANGS, via heimdall-checkpoint re-entering it | It never hung. Ran 72s and 106s. heimdall-checkpoint never invokes that suite. The "copy of itself" in `ps` is a command-substitution subshell — a fork keeps its parent's argv. It printed nothing for ~100s, which is indistinguishable from a hang, and under 4 agents crossed the 240s budget I killed it at. | probe-fix agent |
+| `bin/lib/reachability.sh` used a flat "something mentions it" rule | The ENGINE was already correct — seeds at live entry points, propagates transitively. The flat rule lived in the TEST's own duplicate detector. `heimdall-deadcode:18`'s claim the engine was "shared verbatim" with the test was aspirational; true only now. | dead-chain agent |
+| The 9 allowlist entries are STALE — remove them | All 9 are genuinely dead. They only read "wired" under the flat rule, because dead libraries were vouching for them. Removing them would have converted 9 acknowledged-dead tools into 9 surprise failures. Agent refused the instruction and was right. | dead-chain agent |
+| (earlier) B1 index injection is "the prime suspect, 10-18KB" | 6,601 B/compact — fifth largest, a third of the low estimate. | compaction measurement |
+| (earlier) B2 graph-first orchestrator reading is a headline | `tool:Read` = 0.8% of per-turn additions. Graph value is generation-side, not orchestrator-side. | compaction measurement |
 
-| # | Item | Verdict | Evidence |
-|---|---|---|---|
-| V1 | Fenced Heimdall block into target AGENTS.md | DONE | `edc1fab`+`139b8b9`; agents-md-injection 26/0, coexist 28/0 |
-| V2 | Positioning flip to verification-forward | **DONE** (`2e0de31`) | landed AFTER the audit pin — the audit's "NOT STARTED" is stale. truth-pass 9/0, version-drift 17/0, npm-drift 1/0 |
-| V3 | Complementary-comparison page + FAQ row | PARTIAL | site `b7492e8`+`b943cfa` built & committed but **UNPUSHED → not live**; `launch-docs/log-runner-and-gate.md` stale (3 UNVERIFIED the HTML already resolved) |
-| V4 | Install optionality + Docker sandbox path | DONE, one path unexercised | `Dockerfile.install` real; version-pin-conformance 7/0. **Image has never been built** — no docker here, zero tests reference it |
-| V5 | Render marked version pins from plugin.json | DONE | `a47f65f`+`17ad2f2`; 7/0, 63 PIN markers, 13 red mutants + 5 green inverses |
-| V6 | Weekly changelog generator | DONE, **not routed** | `0e36d46`; weekly-log-consent 38/0. No `hmd weekly-log` route — absolute path only |
-| V7 | rules-propose (commit says so; checkpoint name disputed) | DONE as scoped | `1ef3e0c`; rules-propose 33/0. Self-declares it implements the FIRST half of corpus SCHEMA §4 and none of the second |
-| V8 | Badge offer + clip verification | DONE | `44acade`+`a4307f6`; badge-auto-offer 37/0 |
-| V9 | Measurability before launch (name unconfirmed) | PARTIAL | cp-funnel-walk 13/0 but **local-proven only** — CP redeploy outstanding, so the funnel records NOTHING in production |
-| V10 | unknown | **CANNOT-DETERMINE** | no V10-tagged commit anywhere; no artifact attributable with evidence |
-| V11 | ACP adapter scoping | DONE (`801ef7a`) | 126 lines, 12 cited URLs, 2 UNVERIFIED. Recommends DON'T BUILD. Approved by RJ 2026-08-04 |
-| V12 | Demo-team seeding for the live wall embed | PARTIAL — **own gate RED** | `011b961`+`9310485` exist ONLY on `worktree-agent-a5bbcf5f39ada9ac4`, NOT on main; site side uncommitted; demo-wall-honesty 16/12 |
+**Pattern: every one of these was refuted by measurement, not argument.** An agent told to
+implement a wrong brief should refute it. Three did. That is the behaviour to keep.
 
-**V12's 12 failures are one root cause + one false alarm** (both confirmed): the test's node
-DOM double omits `document.documentElement`, so the inline script dies at `syncIcon()`,
-`render.json` is never written, and 10 downstream checks read an absent file. H1's "assets
-differ" is false — both hash `44a6978745a0da1b268d86fba4c547ae970860af557c3bce89f217a657bca7c6`.
-Snapshot of the at-risk uncommitted V12 work: `/tmp/v12-snapshot/`.
+## ONE root cause, three symptoms — closed
+`evals/oracles/changelog-bash32/run.test.sh` was not hermetic w.r.t. `GIT_DIR`/`GIT_INDEX_FILE`,
+which git EXPORTS into every hook. Fixture repos resolved to the REAL repo. It produced:
+ 1. a false-RED pre-commit gate blocking every commit -> trained agents into `HMD_SKIP=1`;
+ 2. `core.bare=true` set on the main checkout -> `git status` failed repo-wide with
+    "must be run in a work tree"; every git-based gate would have failed silently;
+ 3. the repo's git identity rewritten to `test@heimdall.dev`.
+Fixed + pinned by `test/oracle-hermeticity.test.sh` (8/0) which reproduces the damage on a
+DECOY repo and asserts byte-identity after. Real repo verified: RJ / rj@runheimdall.dev,
+core.bare=false. NINE test suites had the same `git init --bare "$UNCHECKED_VAR"` shape;
+all guarded, pinned by `test/repo-never-left-bare.test.sh` (7/0, mutation proofs both ways).
+**OWED: the class survey of other `evals/oracles/*/run.test.sh` was never finished** — that
+agent died mid-investigation having just flagged a suspicious `verdict: pass with zero
+per-gate entries`, which is a vacuous-pass smell.
 
-**Unresolved launch-collateral markers (measured, not remembered):** SHOW-HN-DRAFT.md 16
-RECEIPT lines · log-compression-and-gates.md **13** RECEIPT + 3 UNVERIFIED + 1 TODO (the
-"19" previously recorded counted a mixed set — 13 is the honest figure) ·
-HEADROOM-COMPANION-ASK.md 5 UNVERIFIED · log-runner-and-gate.md 3 UNVERIFIED. None
-publishable; each file states its own block internally.
+## Merged to main this session
+2d4f964 reachability engine · e1145f6 autoupdate receipt · 80eae20 conformance suite 64/0
+· de725b7 resume probe ARMED 59/0 · 3776f64 inventory can't vouch for absent falsifier
+· a932d7a all 7 subsystems record reachability · 9e02427 git-init leak guard
+· ebf3d3a salvaged guard lines · 0acf0b9 declaration-surface fix 23/2
 
-**V2 (verbatim):** site H1 → verification-forward lead; cloud bot demoted to the feature
-row; same flip in README line 3 ordering. *Gate: no claim text changes, only ORDER/emphasis
-— the claims falsifier must pass untouched.* Rationale on file: the overnight-bot category
-has an 83k-star incumbent; the verification category has none. The work order said "pushes
-site (authorized)" — **SUPERSEDED**: RJ said 2026-08-04 he does the commit with the release.
-Agent does not push.
-
-**V11 (verbatim):** read the ACP spec + Agent Canvas's agent-server surface; produce a
-1-page feasibility doc — what an hmd ACP adapter exposes (gate_check/verdict/wall), effort
-estimate, where it slots vs MCP Layer 1. No build until RJ reads it. *Gate: the doc cites
-the actual protocol spec, not memory.*
-
----
-
-## Landed this session
-| sha | what |
-|---|---|
-| `92e94fa` | `hmd update` reconciles an old install against the default module set (35/0; falsified 32/3) |
-| `4ec87bb` | bare `hmd update` dispatches — advertised but never routed, fell through to a splash banner that exits 0 (6/0; falsified 5/1) |
-| `087891d` | per-module consent waiver — class contract byte-unchanged, every other traffic-proxy module still asks (65/0) |
-| `2cfbeb9` | local rewriting proxy kept off the signed CP path (44/0; falsified 25/19) |
-
-## THE OPEN DEFECT — blocks the release
-`hmd modules add headroom` prints `Installed "headroom" at pin 0.33.0` while `uv tool list`
-reports `No tools installed`. `installs_via.kind: "upstream"` is validated (~line 427 of
-bin/heimdall-modules) and recorded into DIGEST_JSON (~line 777) but **never executed**.
-Headroom does NOT arrive via `hmd --update` — only its registration does, under a success
-message. Fix agent in flight.
-
-## Findings whose evidence is a measurement (not recoverable by reading the tree)
-- **The inverted invariant.** `no-signed-traffic-routing` passed when it found NO proxy vars
-  in the CP binaries — but that absence is exactly when curl inherits an ambient one.
-  Measured: CP `/readyz` = 200 clean, 000 under a dead ambient `HTTPS_PROXY`, invariant
-  printing `BYPASS-OK` throughout. Fixed in `2cfbeb9`.
-- **Why not blanket `--noproxy '*'`:** a corporate CONNECT proxy tunnels TLS end-to-end,
-  cannot rewrite signed bytes, and is the ONLY egress in locked-down estates. Only a LOCAL
-  REWRITING proxy must be excluded. This is why the fix is narrow — do not "simplify" it.
-- **`test/cp-signed-no-rewriting-proxy.test.sh` is network-dependent.** Probes the live CP
-  and fails closed, so a blip reads red (observed once: 43/1, then 44/0 twice). Correct
-  behaviour; means it cannot gate a push without guaranteed egress.
-- **The board eats uncommitted work.** `test/run-all.sh` falsifiers `git checkout --` the
-  files they mutate, silently destroying uncommitted changes. Cost an hour debugging a
-  "broken" agent whose file had been reverted under it.
-  → `.claude/agent-memory/hmd-heimdall/feedback_board_wipes_uncommitted.md`
-- **Agents truncate at ~106–196k tokens** — SIX today. The ones told to commit early kept
-  their work. `SendMessage` resume-from-transcript works and beats respawning.
-- **The reaper deletes "merged" worktrees that hold uncommitted work.** It removed the
-  docs-rewrite worktree; only a patch taken minutes earlier survived.
-
-## Held back deliberately
-- `/tmp/docs-rewrite.patch` (34KB, applies clean) — README/DATA/install.sh rewrite. Claims
-  Headroom ships as part of hmd (FALSE until the fetch fix lands) and that the CP invariant
-  is re-checked live (only true as of `2cfbeb9`). Its worktree was reaped; **this patch is
-  the only copy.**
-- Launch collateral carries unresolved `[RECEIPT:]` markers — SHOW-HN-DRAFT.md (16) and
-  log-compression-and-gates.md (19) at last count. Not publishable while they stand.
-
-## RJ-ONLY
-- 193+ unpushed commits. The agent never pushes.
-- `sudo xcrun simctl runtime delete 7A7EA18E-070C-4209-8C20-A90FFADC3AF5` — iOS 18.6, zero
-  devices, the only mounted runtime volume (~8G disk + unwires memory). sudo cannot read a
-  password from the agent's shell.
-- Control-plane redeploy · A1 check 4 (production write) · A2 wall recording.
-- **Headroom live install NOT approved.** Needed to convert gates-read-raw from mock-proven
-  to live-proven. No longer disk-blocked (16Gi free).
-
-## Resume
-1. Land the upstream-fetch fix; re-verify `add` reports ABSENT when nothing installed.
-2. Land V2 + V11 when their agents report; reconcile V2's README edit with the held patch.
-3. Trust the V1–V12 audit table over any "unconfirmed" row above.
+## Open, needing RJ
+- **HELD: `worktree-agent-a3a9010888d1f387f`** — agents/heimdall.md 59,364 B -> 38,494 B,
+  the system prompt of EVERY session. This is measured item B4, the #1 lever (~76% of
+  post-compact baseline is standing overhead). Asked twice, no answer yet. NOT merged.
+- Inventory is RED on the real repo by design: checked=8 -> checked=5, non_verified=3,
+  exit 3. 8 of 21 enforcer files missing. No stubs written — a passing stub is worse than
+  an absent file.
+- 2 true dead bins remain: `heimdall-conformance`, `heimdall-sla`. Not exempted on purpose.
+- Spend limit was hit mid-session; 3 agents were killed. All their work was recovered from
+  worktrees. Two had produced nothing not already on main.
 
 ## .planning/STATE.md (current state)
 # Heimdall — STATE (2026-08-03)
@@ -205,23 +216,23 @@ session restart, control-plane redeploy, A1 check 4, A2 recording, push, submiss
 `README.md` · `packages/runheimdall/README.md` · `test/run-all.sh` + ~30 suites.
 
 ## git log --oneline -20
-eb61741 feat(roster): the wall knows everyone on the repo, not just who is beating
-caebaad merge: make three gates report what actually happened
-9c1a217 merge: stop printing "digest-verify" where no digest is verified
-f0b823f fix(gates): make three gates report what actually happened
-ee943aa fix(modules): stop printing "digest-verify" where no digest is verified
-98364a3 feat(roster): salvage repo-roster data layer (module + suite + fixture)
-a6f524c merge: name the binding constraint, and stop the codec seam misreporting itself
-9744d1d docs(headroom): name the BINDING constraint on the storage-codec half
-b9640cb docs(analysis): finish line-number citation corrections
-167e36a docs(analysis): correct two line-number citations in the red-team audit
-10cea10 docs(analysis): HN red-team pre-launch audit — 13 findings, 7 must-fix
-e53feaa fix(memory-codec): register_backend("headroom") was a silent no-op
-d48b307 docs(analysis): HN red-team interim findings
-b4c5223 docs(analysis): start HN red-team audit
-30a8073 heimdall: session-end checkpoint (1 files)
-deeba30 merge: isolate headroom-module from the machine's install state
-9cad9a9 merge: show away teammates as offline instead of erasing them
-98497d0 test(headroom): isolate the suite from the machine's install state
-11692a2 fix(wall): keep /roster-team online-only; document the 7-day window
-3bf6ebb feat(wall): render away teammates as UNMISTAKABLY offline
+5d5e9857 journal: [COMMUNICATION] journal: [COMMUNICATION] journal: [COMMUNICATION] chore(release): v2.4.4
+8121aec7 journal: [COMMUNICATION] journal: [COMMUNICATION] chore(release): v2.4.4
+63440f49 journal: [COMMUNICATION] chore(release): v2.4.4
+a0a86858 chore(release): v2.4.4
+7ef0aa25 journal: [COMMUNICATION] journal: session entries before 2.4.4 ship
+093b2bd7 journal: session entries before 2.4.4 ship
+d7662a8b test(cc-selfheal): make the drain tripwire say what to check
+7135e27b fix(test): cc-selfheal suite drains each detached repair before reading or resetting state
+d515a0a4 chore(test): start cc-selfheal sweep-hermeticity investigation
+296569eb Merge branch 'worktree-agent-a29ccddfff1a63e72'
+4de63856 journal: [COMMUNICATION] journal: [COMMUNICATION] Merge branch 'worktree-agent-ac8e52f3ea1f32f85'
+3a96bcd4 docs(data): disclose phone companion relay, Expo push and pair-by-code; scope README S1
+e968439f journal: [COMMUNICATION] Merge branch 'worktree-agent-ac8e52f3ea1f32f85'
+a2cd28a2 Merge branch 'worktree-agent-ac8e52f3ea1f32f85'
+e93c0d76 journal: session entries
+3810a349 fix(relay-client): a refused foreign device_bound keeps the paired phone's caps
+3d9e6d3f chore(data-md): start companion-relay/push/pair truth-gap pass
+0083e629 Merge branch 'worktree-agent-abc3ab10a6ee2847a'
+d4039e21 journal: [COMMUNICATION] journal: [COMMUNICATION] Merge branch 'worktree-agent-ac8e52f3ea1f32f85'
+0a16bd7d feat(phone-deny): A4 phone deny is on by default; HMD_PHONE_DENY=0 or hmd hooks disable phone-deny turns it off
