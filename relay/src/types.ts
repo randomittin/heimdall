@@ -40,10 +40,23 @@ export interface Env {
    *  distinct from RELAY_SIGNING_SECRET so the two token kinds can never stand in for each
    *  other. */
   RELAY_IDENTITY_SECRET?: string;
-  /** Optional origin every GitHub call is sent to, default `https://api.github.com`.
+  /** Optional origin every GitHub API call is sent to, default `https://api.github.com`.
    *  Declared nowhere in wrangler.toml: only the vitest suite binds it, to point the relay
    *  at its fake GitHub. Not a secret. */
   GITHUB_API_BASE?: string;
+  /** GitHub sign-in through the browser (src/github-oauth.ts): its four routes exist when and
+   *  only when this is exactly the string `"1"` AND code pairing's three values are all set.
+   *  A `[vars]` entry in wrangler.toml (and the canary's), shipped `"0"`: the switch for a safe
+   *  rollout, because the GitHub App's Callback URL has to be registered before a browser
+   *  sign-in can work and a relay that offered one earlier would offer a button that fails at
+   *  GitHub. Anything else, unset included, leaves the routes answering the Worker's 404. Not a
+   *  secret. */
+  GITHUB_OAUTH_WEB?: string;
+  /** Optional origin of GitHub's web side -- the authorize redirect and the token exchange of
+   *  the browser sign-in -- default `https://github.com`. Declared nowhere in wrangler.toml:
+   *  only the vitest suite binds it, beside GITHUB_API_BASE, to point the relay at its fake
+   *  GitHub. Not a secret. */
+  GITHUB_WEB_BASE?: string;
 }
 
 /** "relay" is not in the spec's sender enum — it is used only for the two

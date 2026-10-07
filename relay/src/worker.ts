@@ -13,6 +13,12 @@
 // (src/code-pair.ts) — and the session subpath `code`, where hmd registers a
 // window. All four answer 503 `code pairing disabled` unless the GitHub App's
 // config is set; the QR flow never depends on it.
+//
+// GitHub sign-in through the browser adds four more under `/identity/github/oauth`
+// (src/github-oauth.ts). Those exist only when code pairing's config is set AND the
+// `GITHUB_OAUTH_WEB` flag is exactly "1"; otherwise `routeGithubOauth` answers
+// nothing and the fallthrough at the bottom answers them like any path this Worker
+// never had — a 404, whatever the method, not a 503.
 
 import type { Env } from "./types";
 import {
@@ -22,6 +28,7 @@ import {
   handleIdentityRevoke,
   handlePairCode,
 } from "./code-pair";
+import { routeGithubOauth } from "./github-oauth";
 import { handleHealth } from "./health";
 import { jsonResponse } from "./http";
 import { PAIR_INIT_RETRY_AFTER_S } from "./pairing";
@@ -72,6 +79,10 @@ export default {
     if (request.method === "POST" && url.pathname === "/pair/code") {
       return handlePairCode(request, env);
     }
+
+    // Ahead of the session-path match, though none of its four paths could match it.
+    const oauth = await routeGithubOauth(request, url, env);
+    if (oauth !== null) return oauth;
 
     const match = SESSION_PATH_RE.exec(url.pathname);
     if (match) {

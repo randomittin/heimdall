@@ -19,7 +19,9 @@
 
 import {
   consumePhoneToken,
+  isPlausibleGithubToken,
   verifyLaptopToken,
+  type GithubUser,
   type GithubVerdict,
 } from "./github";
 import { jsonResponse } from "./http";
@@ -82,12 +84,9 @@ export function isValidDeviceLabel(value: unknown): value is string {
   return count <= DEVICE_LABEL_MAX_CHARS;
 }
 
-/** 1..255 visible ASCII characters: the shape every GitHub token has. A value outside it
- *  cannot be one, and is refused without being sent upstream -- an `Authorization` header
- *  built from a newline or a control character is a request-smuggling shape, not a token. */
-export function isPlausibleGithubToken(value: unknown): value is string {
-  return typeof value === "string" && /^[\x21-\x7e]{1,255}$/.test(value);
-}
+// Defined with the one door to GitHub (src/github.ts), which the browser sign-in's code exchange
+// needs it in too; still importable from here, where it always was.
+export { isPlausibleGithubToken };
 
 /** What the phone's install key signs for `/pair/code` (INV-43): the code and a timestamp,
  *  under a domain label, so a signature for one purpose, code or moment is no use for
@@ -179,7 +178,8 @@ export async function readJsonObject(request: Request): Promise<JsonBody> {
 }
 
 const BUCKET_WINDOW_MS = 60_000;
-const BUCKET_RETRY_AFTER_S = 60;
+/** The `Retry-After` of every per-IP throttle here and in src/github-oauth.ts: one window. */
+export const BUCKET_RETRY_AFTER_S = 60;
 
 /** `/identity/github` and `/identity/github/revoke` share one bucket per source IP: both
  *  make the relay call GitHub on an anonymous caller's behalf. */
@@ -189,7 +189,7 @@ const PAIR_CODE_MAX_PER_WINDOW = 20;
 /** Counts one request against the source IP's bucket `name`; true when it is over. The
  *  address is the edge's own `CF-Connecting-IP`, and a missing one (not behind the edge: dev
  *  and the vitest pool) shares a bucket and is throttled like anyone, never unlimited. */
-async function overIpBucket(env: Env, request: Request, name: string, max: number): Promise<boolean> {
+export async function overIpBucket(env: Env, request: Request, name: string, max: number): Promise<boolean> {
   const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
   const stub = env.SESSION.get(env.SESSION.idFromName(`${name}:${ip}`));
   const res = await stub.fetch("http://do-internal/bucket", {
@@ -208,6 +208,28 @@ export function indexStub(env: Env, ghId: number): DurableObjectStub {
 // --------------------------------------------------------------------------------------------
 // POST /identity/github  (spec 6.1)
 // --------------------------------------------------------------------------------------------
+
+/** The body of a successful sign-in -- this route's, and the browser sign-in's redeem
+ *  (src/github-oauth.ts): an assertion naming the user, bound to the phone's install key and
+ *  valid GH_ASSERTION_TTL_S from now. One function, so the two routes cannot drift apart. */
+export async function mintSignIn(
+  config: CodePairConfig,
+  user: GithubUser,
+  installPubkey: string
+): Promise<{ gh_assertion: string; gh_id: number; gh_login: string; exp: number }> {
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = iat + GH_ASSERTION_TTL_S;
+  const assertion = await mintGhAssertion(config.identitySecret, {
+    v: 1,
+    role: "device",
+    gh_id: user.id,
+    gh_login: user.login,
+    install_pubkey: installPubkey,
+    iat,
+    exp,
+  });
+  return { gh_assertion: assertion, gh_id: user.id, gh_login: user.login, exp };
+}
 
 /** The phone's sign-in: its device-flow token proves who it is once, is deleted at GitHub,
  *  and what the phone keeps instead is an assertion bound to its own install key. */
@@ -234,18 +256,7 @@ export async function handleIdentityGithub(request: Request, env: Env): Promise<
   const verdict = await consumePhoneToken(env, config.clientId, config.clientSecret, ghToken);
   if (!verdict.ok) return githubFailureResponse(verdict.reason);
 
-  const iat = Math.floor(Date.now() / 1000);
-  const exp = iat + GH_ASSERTION_TTL_S;
-  const assertion = await mintGhAssertion(config.identitySecret, {
-    v: 1,
-    role: "device",
-    gh_id: verdict.user.id,
-    gh_login: verdict.user.login,
-    install_pubkey: installPubkey as string,
-    iat,
-    exp,
-  });
-  return jsonResponse(200, { gh_assertion: assertion, gh_id: verdict.user.id, gh_login: verdict.user.login, exp });
+  return jsonResponse(200, await mintSignIn(config, verdict.user, installPubkey as string));
 }
 
 // --------------------------------------------------------------------------------------------

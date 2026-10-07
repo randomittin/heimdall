@@ -1,0 +1,271 @@
+{
+  "contract": "hmd-relay-github-oauth",
+  "version": 1,
+  "about": [
+    "Wire contract for GitHub sign-in through the browser on the hmd relay: the OAuth web flow (authorization code + PKCE) in the phone's system browser, brokered by the relay. Design of record: hmdapp docs/HANDOFF-TO-HEIMDALL-github-oauth.md -- it wins over this file on any disagreement; this file is the relay's exact reading of it. Two parties align to it: the relay (relay/test/github-oauth.spec.ts drives the real Worker and Durable Objects with it and fails if a row of it is never asserted) and the phone app (hmdapp, src/auth/githubOAuth.ts). The device flow (POST /identity/github, code-pair.json) is unchanged and stays the fallback.",
+    "$name in a string is a binding (see `bindings`): a value the relay mints is matched by pattern when the relay is the producer. Every JSON `body` is the exact JSON the relay accepts or answers: objects have exactly these keys, no more and no fewer. Error bodies are {error:<string>, retry_after_s?:<integer>}; every 429 that is JSON also carries a Retry-After header equal to retry_after_s. A `location` row is a redirect: the Location header is `base` plus a query with exactly the listed parameters. A `message` row is a fixed HTML page (constants.pages): it echoes nothing from the request.",
+    "Enablement. The four routes exist when and only when all of GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and RELAY_IDENTITY_SECRET are set (code-pair.json `Config gate`) AND the [vars] entry GITHUB_OAUTH_WEB is exactly the string \"1\". Otherwise every one of them, with any method, answers what a relay that never had them answers: probe.off, the Worker's own 404 `not found`. There is no 503 here: the app treats 404, 405, 501 and 503 `code pairing disabled` the same way (falls back to the device flow), and the probe's 404 is its answer that browser sign-in is not offered.",
+    "Every answer of the four routes carries Cache-Control: no-store and Referrer-Policy: no-referrer. Every Location the relay writes toward the app is constants.app_redirect plus values the relay generated or validated against the shapes below (never read from a request, so there is no open redirect and no header injection).",
+    "PKCE is the app's, end to end: the app sends S256(code_verifier) at start, the relay keeps only that challenge, and the verifier never leaves the phone until redeem. The relay is the confidential client toward GitHub (it holds the client secret), so it adds no PKCE of its own on that leg. No GitHub token is returned by any route: the callback exchanges the code, has GitHub check the resulting token (naming the user) and then delete it, and keeps only the user's id and login, for constants.handoff_ttl_s.",
+    "The pass is minted at redeem, not at the callback, so nothing that works as a credential sits in storage: the stored handoff holds identity facts. Its body is POST /identity/github's, field for field (code-pair.json `identity_github.responses.ok`), minted by one shared function."
+  ],
+  "constants": {
+    "app_redirect": "hmdapp://auth/github",
+    "callback_path": "/identity/github/oauth/callback",
+    "state_ttl_s": 600,
+    "handoff_ttl_s": 60,
+    "assertion_ttl_s": 2592000,
+    "max_body_bytes": 4096,
+    "verifier": { "alphabet": "A-Za-z0-9._~-", "min_chars": 43, "max_chars": 128 },
+    "authorization_code": { "alphabet": "visible ASCII, U+0021-U+007E", "min_chars": 1, "max_chars": 256 },
+    "throttles": {
+      "start_per_ip": { "bucket": "oauth-start-throttle:<CF-Connecting-IP>", "max": 10, "window_s": 60 },
+      "callback_per_ip": { "bucket": "oauth-callback-throttle:<CF-Connecting-IP>", "max": 10, "window_s": 60 },
+      "redeem_per_ip": { "bucket": "oauth-redeem-throttle:<CF-Connecting-IP>", "max": 20, "window_s": 60 }
+    },
+    "pages": {
+      "content_type": "text/html; charset=utf-8",
+      "template": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>hmd sign-in</title></head><body><p>{message}</p></body></html>",
+      "headers": {
+        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+        "X-Content-Type-Options": "nosniff"
+      }
+    }
+  },
+  "bindings": {
+    "b64url_32": {
+      "match": "^[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "epoch_seconds": {
+      "match": "^[0-9]{10}$",
+      "type": "integer",
+      "example": 1790000000
+    },
+    "gh_assertion": {
+      "match": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecret.FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "gh_id": {
+      "match": "^[1-9][0-9]{0,15}$",
+      "type": "integer",
+      "example": 1234567
+    },
+    "gh_login": {
+      "match": "^[A-Za-z0-9][A-Za-z0-9_.\\[\\]-]{0,63}$",
+      "example": "octocat"
+    },
+    "authorize_base": {
+      "example": "https://github.com/login/oauth/authorize"
+    },
+    "client_id": {
+      "example": "Iv23liawqpKieqqpgIPj"
+    },
+    "callback_url": {
+      "example": "https://hmd-relay.therishabh16.workers.dev/identity/github/oauth/callback"
+    },
+    "relay_state": {
+      "match": "^[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "app_state": {
+      "match": "^[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "challenge": {
+      "match": "^[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    },
+    "install_pubkey": {
+      "match": "^[A-Za-z0-9_-]{43}$",
+      "example": "FIXTUREnotASecretFIXTUREnotASecretFIXTUREno"
+    }
+  },
+  "probe": {
+    "spec": "section 5.1",
+    "who": "the app, to learn whether this relay offers browser sign-in; it caches the answer per relay for 10 minutes (a 200 and a 404 are both answers; a network failure or a 5xx is not cached)",
+    "request": { "method": "GET", "path": "/identity/github/oauth" },
+    "check_order": [
+      "not enabled -> off",
+      "ok: no storage, no GitHub call, no throttle bucket: it reads the relay's configuration and nothing else"
+    ],
+    "responses": {
+      "ok": {
+        "status": 200,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "body": { "v": 1 }
+      },
+      "off": { "status": 404, "body": { "error": "not found" } }
+    }
+  },
+  "start": {
+    "spec": "section 5.2",
+    "who": "the phone's system browser (ASWebAuthenticationSession or a Custom Tab), opened by the app",
+    "request": {
+      "method": "GET",
+      "path": "/identity/github/oauth/start",
+      "query": {
+        "state": "$b64url_32",
+        "code_challenge": "$b64url_32",
+        "code_challenge_method": "S256",
+        "install_pubkey": "$b64url_32"
+      }
+    },
+    "check_order": [
+      "not enabled -> probe.off (any method)",
+      "state, code_challenge or install_pubkey missing, repeated, or not 43 characters of unpadded base64url decoding to 32 bytes; code_challenge_method missing, repeated or anything but exactly `S256` -> invalid_link (the page echoes nothing)",
+      "per-IP throttle oauth-start-throttle:<ip> -> throttled (a redirect to the app: the shapes were valid, so state is safe to hand back)",
+      "ok: oauth-state:<relay_state> stored for state_ttl_s, then a 302 to GitHub's authorize URL: client_id, redirect_uri (this request's origin + callback_path), state=<relay_state> (32 random bytes, never the app's state), prompt=select_account; no scope, no login"
+    ],
+    "responses": {
+      "redirect_github": {
+        "status": 302,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "location": {
+          "base": "$authorize_base",
+          "query": {
+            "client_id": "$client_id",
+            "redirect_uri": "$callback_url",
+            "state": "$relay_state",
+            "prompt": "select_account"
+          }
+        }
+      },
+      "invalid_link": {
+        "status": 400,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "message": "This sign-in link is not valid. Return to the app and start again."
+      },
+      "throttled": {
+        "status": 302,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "location": {
+          "base": "hmdapp://auth/github",
+          "query": { "error": "temporarily_unavailable", "retry_after_s": "60", "state": "$app_state" }
+        }
+      }
+    }
+  },
+  "callback": {
+    "spec": "section 5.3",
+    "who": "the person's browser, redirected by GitHub after they sign in (code and state) or decline (error and state)",
+    "request": {
+      "method": "GET",
+      "path": "/identity/github/oauth/callback",
+      "query": { "code": "<authorization code>", "state": "$relay_state" }
+    },
+    "check_order": [
+      "not enabled -> probe.off (any method)",
+      "per-IP throttle oauth-callback-throttle:<ip> -> throttled (the pending record is not touched)",
+      "state missing, repeated or not 43 characters of [A-Za-z0-9_-] -> invalid_link, before any record is addressed",
+      "consume oauth-state:<state> (read and delete in one Durable Object request): missing, aged out or already used -> expired (there is no app state to redirect to, so no redirect)",
+      "error present -> denied when GitHub's error is exactly access_denied, server_error otherwise; no GitHub call",
+      "code missing, repeated or not 1..256 visible ASCII characters -> invalid_request",
+      "POST <github web>/login/oauth/access_token with client_id, client_secret, code and the same redirect_uri as start: HTTP 200 with error bad_verification_code -> invalid_request; any other error, a non-200, a timeout, a dropped connection or a body that is not {access_token, token_type: bearer} -> server_error",
+      "the access token goes to the same check-and-delete the device flow uses (POST then DELETE /applications/{client_id}/token): rejected, unavailable, or a delete that did not confirm -> server_error, nothing stored",
+      "ok: oauth-handoff:<hc> stored for handoff_ttl_s, then a 302 to the app with hc and the app's state"
+    ],
+    "responses": {
+      "handoff": {
+        "status": 302,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "location": { "base": "hmdapp://auth/github", "query": { "hc": "$b64url_32", "state": "$app_state" } }
+      },
+      "denied": {
+        "status": 302,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "location": { "base": "hmdapp://auth/github", "query": { "error": "access_denied", "state": "$app_state" } }
+      },
+      "server_error": {
+        "status": 302,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "location": { "base": "hmdapp://auth/github", "query": { "error": "server_error", "state": "$app_state" } }
+      },
+      "invalid_request": {
+        "status": 302,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "location": { "base": "hmdapp://auth/github", "query": { "error": "invalid_request", "state": "$app_state" } }
+      },
+      "invalid_link": {
+        "status": 400,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "message": "This sign-in link is not valid. Return to the app and start again."
+      },
+      "expired": {
+        "status": 400,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "message": "This sign-in expired or was already used. Return to the app and start again."
+      },
+      "throttled": {
+        "status": 429,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "Retry-After": "60" },
+        "message": "Too many sign-in attempts. Close this window and try again in a minute."
+      }
+    }
+  },
+  "redeem": {
+    "spec": "section 5.4",
+    "who": "the app, with the hc it was redirected with and the verifier that never left it; unauthenticated, throttled per IP",
+    "request": {
+      "method": "POST",
+      "path": "/identity/github/oauth/redeem",
+      "headers": { "Content-Type": "application/json" },
+      "body": { "hc": "$b64url_32", "code_verifier": "<43 to 128 characters of [A-Za-z0-9._~-]>" }
+    },
+    "check_order": [
+      "not enabled -> probe.off (any method)",
+      "per-IP throttle oauth-redeem-throttle:<ip> -> throttled",
+      "body over max_body_bytes -> shared.body_too_large; not a JSON object -> shared.invalid_json",
+      "hc not 43 characters of [A-Za-z0-9_-], or code_verifier not 43..128 characters of [A-Za-z0-9._~-] -> invalid (nothing is looked up, nothing is burned)",
+      "consume oauth-handoff:<hc> (read and delete in one Durable Object request): missing, aged out or already used -> gone",
+      "base64url(SHA-256(ASCII(code_verifier))) is not the stored challenge (constant-time compare) -> rejected (the handoff is already burned: a wrong guess cannot be followed by a right one)",
+      "ok: the gh_assertion is minted now, bound to the install_pubkey the start carried, valid assertion_ttl_s"
+    ],
+    "responses": {
+      "ok": {
+        "status": 200,
+        "headers": { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        "body": { "gh_assertion": "$gh_assertion", "gh_id": "$gh_id", "gh_login": "$gh_login", "exp": "$epoch_seconds" }
+      },
+      "invalid": { "status": 400, "body": { "error": "invalid redeem request" } },
+      "rejected": { "status": 400, "body": { "error": "handoff rejected" } },
+      "gone": { "status": 410, "body": { "error": "handoff expired or used" } },
+      "throttled": {
+        "status": 429,
+        "headers": { "Retry-After": "60" },
+        "body": { "error": "too many identity requests", "retry_after_s": 60 }
+      },
+      "invalid_json": { "status": 400, "body": { "error": "invalid json" } },
+      "body_too_large": { "status": 413, "body": { "error": "request too large" } }
+    }
+  },
+  "records": {
+    "about": "Two single-use records, each in the SessionDO instance named by its key (the class every throttle bucket and code-index:<gh_id> already uses: no new class, no migration), under the storage key `oauth_record`. A take reads and deletes in one Durable Object request, with no network await in between, so two racing takes cannot both win; `exp` (epoch seconds) is also checked on read, never trusting the alarm. A miss writes nothing. The alarm reclaims an unconsumed record at exp + 60 s.",
+    "oauth_state": {
+      "instance": "oauth-state:<relay_state>",
+      "storage_key": "oauth_record",
+      "ttl_s": 600,
+      "fields": { "app_state": "$app_state", "challenge": "$challenge", "install_pubkey": "$install_pubkey", "exp": "$epoch_seconds" },
+      "consumed_by": "the first callback with that state, whatever it ends in"
+    },
+    "oauth_handoff": {
+      "instance": "oauth-handoff:<hc>",
+      "storage_key": "oauth_record",
+      "ttl_s": 60,
+      "fields": {
+        "gh_id": "$gh_id",
+        "gh_login": "$gh_login",
+        "install_pubkey": "$install_pubkey",
+        "challenge": "$challenge",
+        "exp": "$epoch_seconds"
+      },
+      "consumed_by": "the first redeem with that hc, whatever it ends in"
+    }
+  },
+  "invariants": {
+    "OAUTH-1": "No GitHub token (access or refresh), authorization code, client secret, state, relay_state, hc, code_verifier, code_challenge, install_pubkey or gh_assertion is logged or part of an error. The only log lines the four routes add are oauth_start, oauth_callback and oauth_redeem, each with an outcome word and nothing from the request.",
+    "OAUTH-2": "No stored value contains the code_verifier, a GitHub token, the authorization code, the client secret or a gh_assertion. The access token lives in local variables of the one callback request and is deleted at GitHub before anything is stored; a refresh token is dropped unused.",
+    "OAUTH-3": "No route returns a GitHub token. What the app receives is the gh_assertion POST /identity/github mints, bound to the same install key.",
+    "OAUTH-4": "A record is consumed by its first use, whatever that use ends in; a handoff is burned by a redeem that presents the wrong verifier."
+  }
+}
