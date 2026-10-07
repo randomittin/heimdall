@@ -4,6 +4,10 @@
 # fake `npm`/`claude` recorders that log calls. Proves: opt-out, throttle, non-native skip,
 # the simulated conflict->repair (uninstall + autoUpdates:true + claude update), idempotent-
 # on-healthy, JSON key-preservation, and never-block.
+#
+# The repair that `check`/`--force` start is DETACHED, so every scenario that starts one waits
+# for it to exit (runheal_wait, below) before it reads results — and before the next scenario's
+# `fresh` resets the fixtures all scenarios share.
 set -uo pipefail
 HEAL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/heimdall-cc-selfheal"
 PASS=0; FAIL=0
@@ -41,6 +45,23 @@ runheal(){ env -i PATH="$BIN:/usr/bin:/bin" HOME="$WORK" HEIMDALL_HOME="$WORK/.h
   HEIMDALL_CLAUDE_CONFIG="$WORK/claude.json" \
   HEIMDALL_CC_UPDATE_RESULT="$WORK/upd.json" HEIMDALL_CC_VERSIONS="$WORK/versions" \
   HEIMDALL_CC_RESULT_STALE_HOURS="${STALE:-6}" "$@"; }
+# `check`/`--force` return at once and leave the repair running DETACHED — that is the product's
+# contract, and scenario 7 asserts it — so "the call returned" says nothing about "the repair
+# finished". Polling the log for a terminal line is wrong twice over:
+#   * every scenario shares one CALLS/LOG/claude.json and `fresh` wipes them. A repair still running
+#     from the PREVIOUS scenario then writes into the NEW one, and its 'self-heal complete' satisfies
+#     the wait before this scenario's own repair has done anything. That is what failed under load:
+#     scenario 7 never waited, so scenario 8 read its leftovers — the record "survived", the clear
+#     "was not logged", and a stray `claude update` showed up in the calls.
+#   * a fixed timeout (the old 5s) is outrun by a loaded box, and a healthy machine logs no terminal
+#     line at all, so that case could only sit the whole timeout out.
+# runheal_wait runs the product and returns only once every process it detached has exited. fd 9 is
+# the write end of the pipe this command substitution drains; the detached repair inherits it (the
+# product redirects only fds 1 and 2) and the substitution cannot return before the last holder is
+# gone. Nothing to time out, and nothing outlives its scenario. Returns the product's own exit
+# status. Use it for every `check`/`--force`; plain `runheal` is for the read-only `status`.
+runheal_wait(){ local rc; rc="$(runheal "$@" 9>&1 >/dev/null; echo "$?")"; return "$rc"; }
+now_ms(){ python3 -c 'import time;print(int(time.time()*1000))'; }
 fresh(){ rm -rf "$WORK/.hmd" "$CALLS" "$WORK/has-conflict" "$WORK/updater-ok" \
   "$WORK/upd.json" "$WORK/versions"; STALE=6; }
 
@@ -59,24 +80,21 @@ mkver(){ mkdir -p "$WORK/versions"; for v in "$@"; do : > "$WORK/versions/$v"; d
 
 # 1) opt-out (env + file) -> no-op, exit 0, no calls
 fresh; mkcfg native false; touch "$WORK/has-conflict"
-runheal env HEIMDALL_NO_SELFHEAL=1 bash "$HEAL" check; rc=$?
+runheal_wait env HEIMDALL_NO_SELFHEAL=1 bash "$HEAL" check; rc=$?
 [ "$rc" = 0 ] && [ ! -s "$CALLS" ] && ok "opt-out env -> no-op exit 0, no repair calls" || bad "opt-out env (rc=$rc)"
 fresh; mkcfg native false; touch "$WORK/has-conflict"; mkdir -p "$WORK/.hmd"; touch "$WORK/.hmd/no-selfheal"
-runheal bash "$HEAL" check; [ ! -s "$CALLS" ] && ok "opt-out file -> no-op" || bad "opt-out file repaired anyway"
+runheal_wait bash "$HEAL" check; [ ! -s "$CALLS" ] && ok "opt-out file -> no-op" || bad "opt-out file repaired anyway"
 
 # 2) non-native install -> skip (never touch npm/brew managed)
 fresh; mkcfg npm false; touch "$WORK/has-conflict"
-runheal bash "$HEAL" --force; sleep 0.5
+runheal_wait bash "$HEAL" --force
 grep -q uninstalled "$CALLS" 2>/dev/null && bad "non-native: repaired (must skip!)" || ok "non-native install -> skipped (no repair)"
 
-# wait for the detached repair to finish (its terminal log line), up to ~5s
-waitheal(){ local L="$WORK/.hmd/cc-selfheal.log" i; for i in $(seq 1 50); do
-  [ -f "$L" ] && grep -qE 'self-heal complete|nothing to repair' "$L" && return 0; sleep 0.1; done; return 0; }
 LOG="$WORK/.hmd/cc-selfheal.log"
 
 # 3) THE REPAIR: native + npm conflict + failing updater -> uninstall + autoUpdates:true + claude update
 fresh; mkcfg native false; touch "$WORK/has-conflict"; touch "$WORK/updater-ok"
-runheal bash "$HEAL" --force; waitheal
+runheal_wait bash "$HEAL" --force
 grep -q "uninstalled @anthropic-ai/claude-code" "$CALLS" && ok "repair: uninstalled the npm-conflict package" || bad "repair: did NOT uninstall the conflict"
 [ ! -f "$WORK/has-conflict" ] && ok "repair: conflict marker cleared (idempotent next run)" || bad "conflict still present"
 grep -q 'verified: claude update' "$LOG" 2>/dev/null && ok "repair: ran + verified claude update" || bad "repair: claude update not verified in log"
@@ -88,7 +106,7 @@ python3 -c "import json,sys; d=json.load(open('$WORK/claude.json')); sys.exit(0 
 # 4) idempotent on a healthy machine (native, no conflict, updater ok) -> NO repair (detection
 #    may PROBE `claude update`, but it must never UNINSTALL or write a 'repaired:' log line).
 fresh; mkcfg native true; touch "$WORK/updater-ok"
-runheal bash "$HEAL" --force; waitheal
+runheal_wait bash "$HEAL" --force
 grep -q 'uninstalled' "$CALLS" 2>/dev/null && bad "healthy: uninstalled something (should no-op)" || ok "healthy: never uninstalls"
 grep -q 'repaired:' "$LOG" 2>/dev/null && bad "healthy: logged a repair (should no-op)" || ok "healthy machine -> pure no-op (no 'repaired:' line)"
 runheal bash "$HEAL" status | grep -qi healthy && ok "status: reports healthy" || bad "status wrong on healthy"
@@ -100,14 +118,20 @@ runheal bash "$HEAL" status | grep -qi 'UNHEALTHY' && ok "status: reports UNHEAL
 
 # 6) throttle: a 2nd check within the window does not re-run (stamp fresh)
 fresh; mkcfg native true; touch "$WORK/updater-ok"
-runheal bash "$HEAL" check; M1="$(stat -f %m "$WORK/.hmd/.cc-selfheal-stamp" 2>/dev/null||stat -c %Y "$WORK/.hmd/.cc-selfheal-stamp" 2>/dev/null)"
-runheal bash "$HEAL" check; M2="$(stat -f %m "$WORK/.hmd/.cc-selfheal-stamp" 2>/dev/null||stat -c %Y "$WORK/.hmd/.cc-selfheal-stamp" 2>/dev/null)"
+runheal_wait bash "$HEAL" check; M1="$(stat -f %m "$WORK/.hmd/.cc-selfheal-stamp" 2>/dev/null||stat -c %Y "$WORK/.hmd/.cc-selfheal-stamp" 2>/dev/null)"
+runheal_wait bash "$HEAL" check; M2="$(stat -f %m "$WORK/.hmd/.cc-selfheal-stamp" 2>/dev/null||stat -c %Y "$WORK/.hmd/.cc-selfheal-stamp" 2>/dev/null)"
 [ "$M1" = "$M2" ] && ok "throttle: 2nd check within window skipped (stamp unchanged)" || bad "throttle not enforced"
 
-# 7) never blocks: check returns fast (repair is detached)
+# 7) never blocks: check returns fast (repair is detached). T1 is read the instant the product
+#    ITSELF returns; the command substitution then outlasts the detached repair (the same fd-9
+#    barrier as runheal_wait), so this scenario cannot leak its repair into scenario 8.
 fresh; mkcfg native false; touch "$WORK/has-conflict"; touch "$WORK/updater-ok"
-T0=$(python3 -c 'import time;print(int(time.time()*1000))'); runheal bash "$HEAL" check; T1=$(python3 -c 'import time;print(int(time.time()*1000))')
-[ "$((T1-T0))" -lt 2000 ] && ok "check non-blocking ($((T1-T0))ms, repair detached)" || bad "check blocked ($((T1-T0))ms)"
+T0=$(now_ms); T1=$({ runheal bash "$HEAL" check >/dev/null; now_ms >&9; } 9>&1)
+[ -n "$T1" ] && [ "$((T1-T0))" -lt 2000 ] && ok "check non-blocking ($((T1-T0))ms, repair detached)" || bad "check blocked ($((T1-T0))ms)"
+# the barrier's own proof: had it returned early, the repair would still be running here
+grep -q 'self-heal complete' "$LOG" 2>/dev/null \
+  && ok "drain: the detached repair had exited before the next scenario began" \
+  || bad "drain: returned while the repair was still running — it would leak into the next scenario"
 
 # ── 8-12) THE OBSOLETE UPDATE-FAILURE RECORD ────────────────────────────────────
 # Claude writes .last-update-result.json only when it ATTEMPTS an install. A transient
@@ -127,7 +151,7 @@ runheal bash "$HEAL" status | grep -q 'obsolete:would-clear' \
   && ok "status: names a dead record as obsolete (not as a live failure)" \
   || bad "status: dead record reported as if live"
 [ -f "$WORK/upd.json" ] && ok "status: read-only (record still present after status)" || bad "status deleted the record!"
-runheal bash "$HEAL" --force; waitheal
+runheal_wait bash "$HEAL" --force
 [ ! -f "$WORK/upd.json" ] && ok "repair: cleared the obsolete update-failure record" || bad "repair: obsolete record survived — banner would persist"
 grep -q 'cleared obsolete update-failure record' "$LOG" 2>/dev/null \
   && ok "repair: logged exactly what it removed (never a silent delete)" \
@@ -141,25 +165,25 @@ grep -q 'self-heal complete' "$LOG" 2>/dev/null \
 
 # 9) RECENT failed record -> never cleared (a live failure retries and rewrites this file)
 fresh; mkcfg native true; touch "$WORK/updater-ok"; mkver 2.1.227; mkupd install_failed 2.1.227 null 1
-runheal bash "$HEAL" --force; waitheal
+runheal_wait bash "$HEAL" --force
 [ -f "$WORK/upd.json" ] && ok "recent failure (<6h) kept — a live fault is never hidden" || bad "recent failure record deleted — would mask a real update failure"
 runheal bash "$HEAL" status | grep -q 'last-update-failed' && ok "status: recent failure reported as live" || bad "status: recent failure not reported as live"
 
 # 10) record names a version we are NOT on -> a staged install may still be pending; keep it
 fresh; mkcfg native true; touch "$WORK/updater-ok"; mkver 2.1.227; mkupd install_failed 2.1.200 2.1.227 48
-runheal bash "$HEAL" --force; waitheal
+runheal_wait bash "$HEAL" --force
 [ -f "$WORK/upd.json" ] && ok "record describing a pending upgrade kept (version_from != newest)" || bad "deleted a record describing an install that never landed"
 
 # 11) npm conflict present -> THAT is the real fault; the record is not the thing to clear
 fresh; mkcfg native true; touch "$WORK/has-conflict"; touch "$WORK/updater-ok"; mkver 2.1.227; mkupd install_failed 2.1.227 null 9
-runheal bash "$HEAL" --force; waitheal
+runheal_wait bash "$HEAL" --force
 grep -q "uninstalled @anthropic-ai/claude-code" "$CALLS" && ok "conflict+stale record: fixed the conflict (the real fault)" || bad "conflict not repaired"
 [ -f "$WORK/upd.json" ] && ok "conflict+stale record: record kept — it may describe the conflict's failures" || bad "cleared a record while a real conflict existed"
 
 # 12) fail closed: an undatable record is never treated as obsolete
 fresh; mkcfg native true; touch "$WORK/updater-ok"; mkver 2.1.227
 printf '{"status":"install_failed","version_from":"2.1.227","version_to":null,"timestamp":"not-a-date"}\n' > "$WORK/upd.json"
-runheal bash "$HEAL" --force; waitheal
+runheal_wait bash "$HEAL" --force
 [ -f "$WORK/upd.json" ] && ok "unparseable timestamp -> fail closed (record kept)" || bad "deleted a record whose age could not be established"
 
 echo "──────────────────────────────────────"
