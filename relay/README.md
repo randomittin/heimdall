@@ -428,7 +428,8 @@ App client id, `Iv23liawqpKieqqpgIPj`; the canary restates it); `GITHUB_CLIENT_S
 they touch a Durable Object or GitHub; the QR flow does not look. The hosted relay origin is
 `https://hmd-relay.therishabh16.workers.dev`. Every GitHub call goes through one function
 (`src/github.ts`): 5 s timeout, `User-Agent: hmd-relay`, no redirect followed, and
-`GITHUB_API_BASE` (unset outside the test suite) as the only seam. Rotating `RELAY_IDENTITY_SECRET`
+`GITHUB_API_BASE` (unset outside the test suite) as the only seam for its API calls (`GITHUB_WEB_BASE` is
+the same seam for the browser sign-in's web side, below). Rotating `RELAY_IDENTITY_SECRET`
 invalidates every assertion, like `RELAY_SIGNING_SECRET` does device tokens: every phone signs in
 again.
 
@@ -465,6 +466,85 @@ token; `not_before` honours an assertion minted at or after it (`iat >= not_befo
 counts consecutive misses within 600 s and is judged by the newest of them; request bodies on these
 routes are capped at 4 KiB and read as a stream.
 
+## GitHub sign-in through the browser
+
+The phone signs in to GitHub with the standard OAuth web flow (authorization code + PKCE) in its
+system browser; GitHub's device flow stays as the automatic fallback and as a choice in the app's
+Profile. GitHub needs the client secret for the code exchange and only this relay holds it
+(`GITHUB_CLIENT_SECRET`), so the relay brokers the flow: the phone never sees a GitHub token, and
+**no route returns one**. What the phone gets is the same `gh_assertion` `POST /identity/github`
+mints (one shared function, `mintSignIn` in `src/code-pair.ts`), bound to the same install key, so
+the phone's sign-in store, the login gate and `/pair/code` are unchanged. Design of record: hmdapp
+`docs/HANDOFF-TO-HEIMDALL-github-oauth.md` (it wins over this section). The wire is
+`contract/github-oauth.json` (every response row, each route's check order, the two records, the
+fixed pages); `test/github-oauth.spec.ts` drives the real Worker and Durable Objects with it, carries
+the handoff's 30 acceptance items as `[n]`-named cases, and fails if a row of it is never asserted.
+
+| Route | Who | What |
+|---|---|---|
+| `GET /identity/github/oauth` | the app | Capability probe: `200 {"v":1}`. No storage, no GitHub call, no throttle bucket. |
+| `GET /identity/github/oauth/start` | the phone's browser | Query `state`, `code_challenge`, `code_challenge_method=S256` and `install_pubkey`, each present exactly once; `state`, `code_challenge` and `install_pubkey` are 43 characters of unpadded base64url (32 bytes). Anything else: a fixed `400` page that echoes nothing, before the bucket and the store. 10/min per IP (over: a redirect to the app, `error=temporarily_unavailable&retry_after_s=60`). Stores `oauth-state:<relay_state>` for 600 s and answers `302` to GitHub's authorize URL (`client_id`, `redirect_uri`, `state=<relay_state>`, `prompt=select_account`; no scope). |
+| `GET /identity/github/oauth/callback` | GitHub, through the person's browser | `code` and `state`, or `error` and `state`. 10/min per IP (over: a `429` page). Takes the state record, exchanges the code with the client secret, has GitHub check the token and **delete it**, stores `oauth-handoff:<hc>` for 60 s and answers `302` to `hmdapp://auth/github?hc=..&state=..`. Before the record is read the only answers are fixed pages (`400` not valid, `400` expired or already used); after it, every ending is a redirect to the app carrying its state, with `error=access_denied`, `invalid_request` or `server_error`. |
+| `POST /identity/github/oauth/redeem` | the app | `{hc, code_verifier}`, the verifier 43 to 128 characters of `[A-Za-z0-9._~-]`. 20/min per IP. Takes the handoff, which this attempt spends whatever follows, checks `base64url(SHA-256(verifier))` against the stored challenge in constant time and mints the pass: `200 {gh_assertion, gh_id, gh_login, exp}`, the body of `POST /identity/github`. `410` for an expired, used or unknown handoff; `400` for a malformed request or a wrong verifier. |
+
+Every answer of the four carries `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
+
+**Enablement.** The routes exist when and only when code pairing's three values are set (above)
+AND the `[vars]` entry `GITHUB_OAUTH_WEB` is exactly the string `"1"`. Off, all four answer what a
+relay that never had them answers: the Worker's `404 {"error":"not found"}`, for any method, never a
+`503`; the app reads a 404 on the probe as "browser sign-in is not offered" and uses the device
+flow. The flag is per Worker and ships `"0"` in both `[vars]` and `[env.canary.vars]` of
+`wrangler.toml`: the GitHub App's Callback URL has to be registered before the first browser
+sign-in can work, and a relay that answered the probe before then would offer a button that fails
+at GitHub.
+
+**Records.** The pending sign-in and the handoff are one Durable Object instance each, named by
+their key, of the same `SessionDO` class every throttle bucket and `code-index:<gh_id>` already use
+(no new class, no migration). `oauth-state:<relay_state>` holds `{app_state, challenge,
+install_pubkey, exp}` and `oauth-handoff:<hc>` holds `{gh_id, gh_login, install_pubkey, challenge,
+exp}`, under the storage key `oauth_record`, `exp` in epoch seconds. The internal handlers
+`/oauth-put` and `/oauth-take` are not in `PUBLIC_SESSION_SUBPATHS`. A take reads and deletes in
+one Durable Object request with no network await between, so two racing takes cannot both win;
+`exp` is checked on every read, never left to the alarm; a miss writes nothing. A record is spent
+by its first use whatever that use ends in: a callback that ends in an error has consumed its
+state, and a redeem with the wrong verifier has burned its handoff, so a wrong guess cannot be
+followed by a right one. The handoff holds identity facts and nothing signed: the pass is minted
+at redeem, so no credential sits in storage.
+
+**Secrets and logging.** The client secret appears only in the body of the request to GitHub's
+token endpoint. The access token (and a refresh token, if the App issues expiring user tokens; it
+is never read) lives in local variables of the one callback request: it is checked and deleted at
+GitHub (`consumePhoneToken`, unchanged) before anything is stored, and no route returns it. A token,
+the `code`, the client secret, either state, `hc`, the verifier, the challenge, the install key and
+the pass are never logged and never part of an error. The only log lines added are `oauth_start`,
+`oauth_callback` and `oauth_redeem`, each `{session_id: "none", outcome}` with `outcome` one of
+`ok`, `denied`, `exchange_failed`, `throttled`, `expired`, `rejected` and nothing from the request.
+A failed exchange also adds one `github_error` line (call `exchange`, a kind and a status); the kind
+is `client_credentials` or `redirect_uri` when GitHub's error says so, which is what a wrong client
+secret or an unregistered Callback URL looks like in the tail, and `error` for any other.
+`scripts/check-no-logged-urls.mjs` covers the new module like the rest.
+
+**Rollout and operator steps.**
+
+1. Deploy with `GITHUB_OAUTH_WEB` at `"0"`, as shipped: the app keeps using the device flow and its
+   Profile says why.
+2. In the GitHub App's settings, General, Callback URL: add `<relay origin>/identity/github/oauth/callback`
+   for the production Worker and for the canary Worker (each is its own origin, and a GitHub App
+   accepts several). Keep "Enable Device Flow" on: it is the fallback.
+3. No new secret: `GITHUB_CLIENT_SECRET` and `RELAY_IDENTITY_SECRET` are the ones already set.
+   Change `GITHUB_OAUTH_WEB` to `"1"` in `[vars]` (and `[env.canary.vars]`) of `wrangler.toml` and deploy.
+4. Check: `curl -s <relay>/identity/github/oauth` prints `{"v":1}`, and the `start` URL with valid
+   parameters answers `302` with a `Location` on `github.com/login/oauth/authorize`.
+5. The app picks the capability up within 10 minutes or at its next launch. Then sign in from a
+   phone on that Worker: the Browser method, then the Code method, then decline at GitHub, then
+   close the browser early.
+
+**Test seams.** `GITHUB_WEB_BASE` (default `https://github.com`, unset outside the test suite) is
+the origin of the authorize redirect and the token exchange, beside `GITHUB_API_BASE`. The suite
+binds both to origins its fake GitHub answers (`test/github-oauth-helpers.ts`'s `FakeGitHubWeb` in
+front of `test/code-pair-helpers.ts`'s `FakeGitHub`), binds `GITHUB_OAUTH_WEB` to `"1"`, and gives
+the specs that need the routes off an env of their own.
+
 ## Storage reclamation (purge schedule)
 
 `SessionDO` used to write its record and delete it on no path at all — not on revoke, not on
@@ -480,6 +560,8 @@ trusting whenever the alarm happened to be set:
 | `/pair/init` throttle bucket | one window + grace after the IP's last request |
 | `identity-throttle:<ip>` / `pair-code-throttle:<ip>` bucket | the same: one window + grace |
 | `code-index:<gh_id>` index | when its last window, counter and lockout have lapsed; a revoke's `not_before` keeps it 30 days |
+| `oauth-state:<relay_state>` / `oauth-handoff:<hc>` record | `exp` + 60s grace if never taken (600 s / 60 s after it was stored); `deleteAll()`ed, alarm included, the moment it is taken, so a used record leaves nothing |
+| `oauth-start-throttle:<ip>` / `oauth-callback-throttle:<ip>` / `oauth-redeem-throttle:<ip>` bucket | the same: one window + grace |
 
 The grace exists so a client that is merely late — a phone reconnecting seconds after its token
 lapsed, hmd re-reading a just-revoked session — meets a truthful `410`/`401` instead of a bare
