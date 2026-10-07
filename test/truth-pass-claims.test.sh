@@ -32,10 +32,13 @@
 # Guarantees:
 #   A. NO BARE ABSOLUTE — grep the four absolute phrases across the read-surfaces;
 #      every hit MUST be part of an allowlisted scoped sentence, else RED.
-#   B. SCOPED SET PRESENT — each of the six VERBATIM scoped sentences appears in
+#   B. SCOPED SET PRESENT — each of the seven VERBATIM scoped sentences appears in
 #      README.md or install.sh (the honest replacement can't be dropped).
 #   C. DATA.md EXISTS and is linked from the README — the scoped claims all cash
 #      out to that receipt, so a dangling claim set is RED.
+#   D. DATA.md NAMES THE PHONE COMPANION'S HOSTS AND OFF SWITCHES — the relay and Expo
+#      hosts are read FROM THE CODE and must appear in DATA.md, beside the switches that
+#      stop them; repointing either host without updating the receipt is RED.
 #
 # --self-test: proves the gate can go red. Copies the repo to a throwaway tmpdir,
 # plants a bare absolute claim there, asserts this script reports it, then discards
@@ -138,6 +141,29 @@ if [ "${1:-}" = "--self-test" ]; then
   fi
   echo "  ✓ carve-out is line-scoped — a real claim beside it still goes RED"
 
+  # Mutant 8 — S7, the phone-companion disclosure, is as falsifiable as S1: strip its
+  # line and Guarantee B must name it, or B would be vacuous for the one sentence that
+  # discloses the relay, Expo push and the gh-token leg.
+  cp -R "$REPO/." "$TMP/" 2>/dev/null
+  grep -v 'The phone companion is opt-in' "$REPO/README.md" > "$TMP/README.md"
+  out="$(TRUTH_PASS_REPO="$TMP" HEIMDALL_SITE_DIR="$NO_SITE" bash "$SELF_DIR/truth-pass-claims.test.sh" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] || ! grep -q 'scoped claim S7 MISSING' <<<"$out"; then
+    echo "  ✗ SELF-TEST FAILED: gate did not flag scoped claim S7 as missing (rc=$rc)" >&2
+    exit 1
+  fi
+  echo "  ✓ gate correctly went RED on a deleted S7 (the phone-companion disclosure)"
+
+  # Mutant 9 — Guarantee D: DATA.md loses every mention of the Expo host. The host is
+  # read from the code, so this proves the gate follows the code, not a retyped string.
+  cp -R "$REPO/." "$TMP/" 2>/dev/null
+  grep -vF 'exp.host' "$REPO/DATA.md" > "$TMP/DATA.md"
+  out="$(TRUTH_PASS_REPO="$TMP" HEIMDALL_SITE_DIR="$NO_SITE" bash "$SELF_DIR/truth-pass-claims.test.sh" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] || ! grep -q 'does not name the companion host' <<<"$out"; then
+    echo "  ✗ SELF-TEST FAILED: gate did not flag the Expo host missing from DATA.md (rc=$rc)" >&2
+    exit 1
+  fi
+  echo "  ✓ gate correctly went RED when DATA.md omits a host the code talks to"
+
   echo "truth-pass-claims --self-test: PASS"
   exit 0
 fi
@@ -220,20 +246,26 @@ fi
 # words in a SCOPED way is added here verbatim, and nowhere else.
 #
 # Each sentence traces to CURRENT code:
-#   S1 -> gates read on-disk; no gate has a network client.
+#   S1 -> gates read on-disk; no gate has a network client. The one carve-out is the
+#         phone companion (bin/heimdall-relay-client + bin/lib/companion_view.py: a diff
+#         the paired phone asks for, sealed end-to-end), so S1 says so.
 #   S2 -> bin/heimdall-presence:712-720 (beat body), :304 (default endpoint).
 #   S3 -> bin/lib/pmr_corpus.py has NO network client; purge empties the local spool.
 #   S4 -> bin/heimdall-autoupdate:76 (releases/latest), :9,:48 (off switch).
 #   S5 -> the install summary tagline.
 #   S6 -> bin/rr:568 (enqueue body {text,...}), :801/:805 (cred + install id).
-S1='Gates run 100% locally. Your code never leaves your machine.'
+#   S7 -> bin/heimdall-app (connect, disconnect, --no-code), bin/heimdall-relay-client
+#         (sealed frames; the gh token in the /code body), bin/lib/companion_push.py
+#         (exp.host, HMD_PUSH=0). Receipt: DATA.md section 9.
+S1='Gates run 100% locally. Your code never leaves your machine unless you pair a phone with hmd app connect.'
 S2='Team presence is a feature you can see and switch off: it sends {handle, verdict, current filename} — never code, never file contents — to your team'\''s endpoint. hmd presence off makes you invisible; hmd presence on --no-files hides filenames.'
 S3='Telemetry is specified, minimal, and yours to kill: DATA.md documents every field. hmd telemetry off. hmd telemetry purge deletes the local spool — nothing is transmitted in this release.'
 S4='Auto-update checks GitHub Releases for new signed versions. HEIMDALL_NO_AUTOUPDATE=1 (or ~/.heimdall/no-autoupdate) disables it.'
 S5='# gates local · presence opt-out · telemetry documented & killable · the watchman does not sleep'
 # shellcheck disable=SC2016 # literal claim text: the backticks around rr are prose, nothing should expand
-S6='`rr` is the one thing that sends on purpose, and only when you run it: your BYO Claude credential (write-only), your GitHub App installation id, and the literal task text you typed — because that text is the job. It never uploads your working tree; the worker clones your repo from GitHub.'
-ALLOWLIST=("$S1" "$S2" "$S3" "$S4" "$S5" "$S6")
+S6='`rr` sends on purpose, and only when you run it: your BYO Claude credential (write-only), your GitHub App installation id, and the literal task text you typed — because that text is the job. It never uploads your working tree; the worker clones your repo from GitHub.'
+S7='The phone companion is opt-in (hmd app connect; hmd app disconnect stops it): by default your session state, and any diff you open on the phone, travel end-to-end sealed through a relay that sees only ciphertext; push notifications send short scrubbed text to Expo (HMD_PUSH=0 turns them off); pairing by code sends your gh auth token to the relay while the code is offered (--no-code pairs by QR instead).'
+ALLOWLIST=("$S1" "$S2" "$S3" "$S4" "$S5" "$S6" "$S7")
 
 echo "truth-pass-claims harness  repo=$REPO"
 echo "surfaces: $REPO_SURFACES"
@@ -298,6 +330,29 @@ if grep -Fq '[DATA.md](DATA.md)' "$REPO/README.md" 2>/dev/null; then
 else
   bad "README does not link to DATA.md — the claim set has no reachable receipt"
 fi
+
+# ── Guarantee D: DATA.md names every host the phone companion talks to, and its off switches ──
+# The receipt is only a receipt if it covers the egress the code actually has. Both hosts
+# are read FROM THE CODE (not retyped here), so repointing the relay or Expo without
+# updating DATA.md goes RED; the switches are the ones the README (S7) promises.
+relay_host="$(grep -m1 -oE '^DEFAULT_RELAY_URL="https://[^"/]+' "$REPO/bin/heimdall-app" 2>/dev/null | sed 's#.*//##')"
+expo_host="$(grep -m1 -oE '^EXPO_SEND_URL = "https://[^"/]+' "$REPO/bin/lib/companion_push.py" 2>/dev/null | sed 's#.*//##')"
+for host in "$relay_host" "$expo_host"; do
+  if [ -z "$host" ]; then
+    bad "could not read a phone-companion host from bin/heimdall-app or bin/lib/companion_push.py"
+  elif grep -Fq "$host" "$REPO/DATA.md" 2>/dev/null; then
+    ok "DATA.md names the companion host $host"
+  else
+    bad "DATA.md does not name the companion host $host the code talks to"
+  fi
+done
+for switch in 'hmd app disconnect' 'HMD_PUSH=0' '--no-code' 'hmd app controls off'; do
+  if grep -Fq -- "$switch" "$REPO/DATA.md" 2>/dev/null; then
+    ok "DATA.md documents the off switch: $switch"
+  else
+    bad "DATA.md does not document the off switch: $switch"
+  fi
+done
 
 echo "--------------------------------------------------------------------"
 printf 'truth-pass-claims: %d passed, %d failed\n' "$PASS" "$FAIL"

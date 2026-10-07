@@ -2,11 +2,14 @@
 
 This is the whole, specified, minimal contract for every byte Heimdall records or
 sends. It is the receipt behind the scoped claims in the README: *gates run
-locally, presence is opt-out, telemetry is documented and killable.* If the code
-and this file ever disagree, that is a bug — file it.
+locally, presence is opt-out, telemetry is documented and killable, the phone
+companion is opt-in.* If the code and this file ever disagree, that is a bug —
+file it.
 
-Heimdall has exactly **five** data surfaces. Three of them can put bytes on the
-network; two of those only ever do so because you asked.
+Heimdall has exactly **eight** data surfaces. Six of them can put bytes on the
+network. Presence and the update check are on by default; the other four — `rr`
+and the three phone-companion surfaces (§9) — only ever do so because you ran
+`rr`, or ran `hmd app connect` and paired a phone.
 
 | Surface | Leaves your machine? | Default | Kill switch |
 |---|---|---|---|
@@ -15,12 +18,15 @@ network; two of those only ever do so because you asked.
 | **Telemetry / Pre-Merge Corpus** (`bin/heimdall-telemetry`, `bin/heimdall-telemetry-corpus`) | **Not in this release.** Written to a LOCAL spool only; the control-plane ingest is a future step (see "Send status" below). | on (T0) | `hmd telemetry off` |
 | **Auto-update version check** (`bin/heimdall-autoupdate`) | Yes — one unauthenticated GET to the public GitHub Releases API. No body, no credential, no code. | on (throttled ~24h) | `HEIMDALL_NO_AUTOUPDATE=1` or `~/.heimdall/no-autoupdate` |
 | **`rr` cloud maintainer** (`bin/rr`) | Yes — **only when you run it.** Sends your BYO Claude credential, your GitHub App installation id, and the literal task text you typed. | off — inert unless invoked | don't run `rr` (`RR_NO_CONTEXT=1` drops the context capsule) |
+| **Phone companion relay** (`bin/heimdall-relay-client`) | Yes — **only while you run `hmd app connect`.** End-to-end sealed frames to *your own* paired phone through the hosted relay (`https://hmd-relay.therishabh16.workers.dev`): session state with repo-relative paths, and — only when the phone asks — a file diff, transcript tail or PR summary. The relay forwards ciphertext and cannot read it (§9). | off — nothing runs until `hmd app connect` | `hmd app disconnect` (or Ctrl-C); `hmd app controls off` / `HMD_UI_CONTROLS=0` refuse phone views and controls; `--relay URL` / `HMD_RELAY_URL` to self-host |
+| **Phone push notifications** (`bin/lib/companion_push.py`) | Yes — **only once a paired phone registered an Expo push token.** hmd POSTs straight to `exp.host`: not through the relay, and **not end-to-end sealed** — Expo, and Apple or Google behind it, can read the text. Title ≤ 48 and body ≤ 120 UTF-16 units: fixed templates plus allowlisted fields (§9). | off — nothing is sent until a phone registers | `HMD_PUSH=0` (exactly `0`); `hmd app disconnect`; delete `<repo>/.heimdall/app/push.json` |
+| **Pair-by-code** (`hmd app connect`) | Yes — **while the 10-minute code window is open.** Your `gh auth token` goes to the relay in a TLS request body; the relay spends it on one `GET /user` to GitHub to learn your numeric GitHub id and, by its INV-39, never stores or logs it (§9). | on whenever `gh auth token` yields a token | `hmd app connect --no-code` (QR pairing — no token leaves); `hmd app identity revoke` |
 
 Everything below documents the *real* shapes emitted by the code, field by field.
 
 **Not listed above: auto-commit.** hmd's automatic checkpoint commits
 (`bin/heimdall-autocommit`) are a **repository-mutation** behavior, not a
-data-collection one, so they are not a sixth row in the table above — nothing
+data-collection one, so they are not another row in the table above — nothing
 they do puts a byte on any network. They write only to your own git history and
 to a local `.heimdall/receipts/unproven.log` file. See SECURITY.md's
 "Auto-commit" section for what gets committed, when it bypasses your commit
@@ -361,23 +367,32 @@ signed payload and executes nothing (no creds, no network).
 
 ## 5. Never collected — by construction, on every surface
 
-- **Source code / file contents** — never read into any record or body. No surface
-  uploads your working tree; `rr`'s worker clones from GitHub instead (§4).
+- **Source code / file contents** — never read into any record or body, with one
+  exception: when you pair a phone, a file diff you ask it to open travels
+  end-to-end sealed to that phone (§9). No surface uploads your working tree;
+  `rr`'s worker clones from GitHub instead (§4).
 - **File paths** — never in the clear. Presence sends only the current *filename*;
   PMR stores only a hashed directory + a coded extension, never the path. (The `rr`
   context capsule may carry planning-doc and commit-subject text you authored — see
-  §4; it is allowlisted, redacted, and gitleaks-gated fail-closed.)
+  §4; it is allowlisted, redacted, and gitleaks-gated fail-closed. The phone
+  companion carries repo-relative paths only inside its sealed frames, and a push
+  body can carry a bare basename out of a question's text — §9.)
 - **Repo names / URLs** — never in telemetry: PMR stores only `repo_class_hash` (a
   non-reversible, domain-separated sha256 of the origin slug). Presence sends a
   normalized project slug, and `rr connect` sends your repo slug, because both are
   addressed *to* your team's own partition.
-- **Prompts** — never captured by the gates, by presence, or by telemetry. **The one
-  exception is `rr`, and only when you invoke it:** `rr "<task>"` transmits the
-  literal task text you typed (§4). Nothing captures a Claude Code session prompt.
+- **Prompts** — never captured by the gates, by presence, or by telemetry. **Two
+  exceptions, each only when you invoke it:** `rr "<task>"` transmits the literal
+  task text you typed (§4), and a paired phone that opens the transcript view is
+  shown the session's one-line turns, prompts included, end-to-end sealed (§9).
+  Nothing else captures a Claude Code session prompt.
 - **Secrets / tokens / credentials / PII** — blocked *before* write by the
   zero-content guard and the gitleaks-pattern secret scan; a matching value is
-  dropped and alarmed, never stored or queued. The one credential that moves is the
-  one you hand `rr connect` on purpose, write-only (§4).
+  dropped and alarmed, never stored or queued. Two credentials move, each on
+  purpose: the one you hand `rr connect`, write-only (§4), and your `gh auth token`,
+  sent to the relay while a pair-by-code window is open (§9; `hmd app connect
+  --no-code` keeps it home). Your phone's Expo push token goes to Expo with every
+  push (§9).
 - **Signing seeds** — the Ed25519 private seed lives only in a `0600` file + the
   signing process; never argv, never logged, never sent.
 
@@ -468,6 +483,155 @@ the request id — never the command, a path or the summary.
 Code runs in, or `hmd hooks disable phone-deny` (`hmd hooks enable phone-deny` brings it back).
 Unset, empty or any other value leaves it on, so a typo cannot silently disable it. Proof:
 `test/heimdall-phone-deny.test.sh`, `test/heimdall-phone-deny-relay.test.sh`.
+
+---
+
+## 9. Phone companion — relay, push, pair-by-code
+
+Three surfaces in the table exist only because you started `hmd app connect` and paired a
+phone. Nothing starts them for you: no hook, installer step or session start runs `hmd app
+connect`. (Phone deny, §8, is the approval path of this same session.)
+
+### The relay leg (`bin/heimdall-relay-client`)
+
+`hmd app connect` publishes through the hosted relay — a Cloudflare Worker plus Durable
+Object whose source is `relay/` in this repo. The origin is baked in at
+`bin/heimdall-app:293` (`DEFAULT_RELAY_URL="https://hmd-relay.therishabh16.workers.dev"`)
+and resolves `--relay URL` > `$HMD_RELAY_URL` > that default; a Worker you deploy yourself
+takes the project's relay out of the path. `hmd app connect --tailscale` is a different
+transport and is **not** sealed end-to-end: it publishes the loopback `hmd ui` through
+Tailscale Funnel at a public hostname guarded by a per-launch token, with absolute paths
+reduced to basenames. Everything below describes the relay transport.
+
+**Sealed.** Every `state`, `command` and `ack` frame is sealed before it leaves the process:
+X25519 agreement with the phone's key, HKDF-SHA256 per session, ChaCha20-Poly1305
+(`bin/lib/hmd_relay_e2e.py`, stdlib only, checked against the RFC vectors; if that check
+fails the client exits 11 rather than send unsealed). The relay stores and forwards
+ciphertext and cannot read it. It does see plaintext metadata: the session id, frame
+sequence numbers, sizes and timing, your IP address (its rate-limit counters are keyed on
+it) and the phone's public key. It keeps only the newest sealed state frame, to replay to a
+reconnecting phone, until the session is revoked or purged (about 5 minutes after a revoke;
+about 30 days for a bound session that was never revoked).
+
+**A state frame** carries the slices `hmd ui` shows (`sentinels/hmd-ui.py:collect_state`):
+identity (handle, HAID, branch, session code), coordination ledger, roster, push-gate
+verdict, sweep receipt, hooks, fallback mode, parallelism, checkpoint, reels, `edits` (the
+repo-relative paths of files this session changed), panels, inbox counts, `approvals` (§8),
+`attention` (the agent's pending question), controls and dashboard tiles (none until you
+switch `hmd app remote-dashboards on`). The relay redaction profile
+(`_transport_redaction`) runs first: absolute paths below the repo become repo-relative,
+paths outside it and `~/` paths become a basename, and emails are masked.
+
+**On request only** (`view-v1`, `bin/lib/companion_view.py`; read-only, only to a phone that
+listed the capability, at most 20 requests per 60 s):
+
+- a file **diff** (`worktree`, `staged` or `head`; at most 256 KiB). Never shown: `.git`,
+  `.heimdall`, `.env*`, `*.pem` `*.key` `*.p12` `*.pfx` `*.jks` `*.keystore`, `id_rsa`-shaped
+  names, `.netrc` `.npmrc` `.pypirc`, any path with a symlink in it, any secret-shaped path;
+  a secret-shaped line is masked `[redacted]` whole. **This is the one place source code
+  itself leaves your machine — to the phone you paired, sealed.**
+- a **transcript** tail of this repo's session or of one subagent (at most 500 turns, each
+  one line of at most 240 characters: a prompt, an assistant text, or a tool call's name,
+  status and first output line; a secret-shaped turn is masked).
+- a **pull-request summary** from your local `gh pr view` (number, title, state, checks,
+  reviewers, URL).
+
+A result lives in memory only and is never logged. The client's local files are
+`<repo>/.heimdall/app/connect.json`, `relay.json` and `relay-events.jsonl` (counts, sizes
+and status codes — never plaintext, tokens or keys; `HMD_RELAY_EVENT_LOG=""` disables the
+log).
+
+**Inbound** (phone to laptop — not egress, listed because it is the other half of the
+channel): a typed message into the agent's inbox, `decide` (deny only, §8), push
+registration, and four remote controls (`interrupt`, `save-checkpoint`, `hook-toggle`,
+`fallback-mode`), on by default. Remote login, launch, merge, dashboards, asks and alerts
+are each **off until you switch them on at the laptop** (`hmd app remote-login`,
+`remote-launch`, `remote-merge`, `remote-dashboards`, `remote-asks`, `remote-alerts`, each
+`on`).
+
+| Switch | Effect |
+|---|---|
+| `hmd app disconnect` (or Ctrl-C in the foreground `connect`) | stops the relay client, which revokes the session at the relay; the phone cannot reconnect. The only switch that stops state frames |
+| `hmd app controls off` / `HMD_UI_CONTROLS=0` | every view and control is refused `controls-off` (`off` writes `<repo>/.heimdall/app/controls-disabled`, `on` removes it). State frames still flow while connected |
+| `--relay URL` / `HMD_RELAY_URL` | publish through a relay you run instead |
+
+### Push notifications (`bin/lib/companion_push.py`)
+
+Sent by hmd itself, **not through the relay**: one HTTPS call class to
+`https://exp.host/--/api/v2/push/send` (and `…/getReceipts`, once, at least 900 s after a
+send), only after a paired phone registered an Expo push token in
+`<repo>/.heimdall/app/push.json`. The sender is the one `hmd ui` or relay-client process per
+repo that holds `push-sender.lock`. **Not sealed:** Expo, and Apple or Google behind it, can
+read the title and body. Redirects are never followed, and `HMD_PUSH_EXPO_URL` is honoured
+only for a loopback host, so it cannot redirect pushes elsewhere.
+
+The exact message (`build_message`):
+
+```
+to             the phone's own Expo push token
+title          "<label> · <phrase>", at most 48 UTF-16 units; the label (at most 24) is the phone's own
+body           at most 120 units: a fixed template over allowlisted fields (below)
+data           {v: 1, ref: <16 hex>, kind, ep: <attention id | null>} (+ pid, exp for an approval)
+categoryId · channelId · priority · interruptionLevel · sound · ttl · collapseId · tag · threadId
+               fixed per kind; the ids are sha256 prefixes, never a raw id
+```
+
+Body fields, all allowlisted: counts and booleans (`3 of 12 gates failing.`, `Suites 40/42
+passed.`, `Ran 4m 12s.`), the tool name of a held approval (`Bash is waiting. Deny within 8
+s.` — never its command), and, for a question, the agent's question summary plus up to three
+option labels of at most 16 units — **the only free text**. That text is replaced whole by a
+constant if it is secret-shaped, and otherwise scrubbed: code spans become `[code]`; emails,
+URLs, query strings, `key=value` secrets, long tokens, long digit runs and hex hashes are
+masked; any path is cut to its last segment, so a bare basename can survive. Never read: an
+approval's command text, paths, branches, repo names, chat text, panels. Two more kinds
+exist only once you enabled dashboards at the laptop (`hmd app remote-dashboards on`, and
+`remote-alerts on` for alerts) and the phone subscribed: `tile_alert` (`<value>, limit
+<limit>`, when you asked for the value) and `digest` (a morning report of at most four lines
+of tile values and counts). Volume is bounded: at most one non-approval message per device
+per 10 s, and 20 non-approval plus 20 approval per device per rolling hour.
+
+| Switch | Effect |
+|---|---|
+| `HMD_PUSH=0` | in the environment of `hmd app connect` / `hmd ui`: nothing is sent, `push-v1` is no longer offered to the phone, a registration is refused `push-disabled`. **Exactly `0`** — `off`, `false` or `no` leave push on |
+| `hmd app disconnect` | ends the processes that send |
+| delete `<repo>/.heimdall/app/push.json` | drops every registration (otherwise they stay until the next relay session binds a phone) |
+
+### Pair-by-code (`hmd app connect`, the relay's `/session/:id/code`)
+
+On whenever `gh auth token` yields a token — inside an `hmd app connect` you started — and
+off with `--no-code` (QR pairing is untouched). The 5-character session code `hmd ui` shows
+is registered with the relay under your GitHub identity, so a phone signed in to GitHub as
+the same user can pair by typing it.
+
+```
+POST /session/:id/code      Authorization: Bearer <relay session token>
+{ "code": "<5 chars>", "gh_token": "<your gh auth token>", "hmd_commit": "<commitment to this session's key>" }
+```
+
+- **Your GitHub token reaches a server you do not run.** It is read once from `gh`, handed
+  to the client on a pipe (on no argv, environment variable or file), held in memory, and
+  sent in that request body over TLS — the client refuses a non-https relay unless it is on
+  loopback. The relay makes one `GET /user` to GitHub per request, to learn your numeric
+  GitHub id and login. Its invariant INV-39 — checked by a test that scans every Durable
+  Object's storage and every log line after a whole pairing — is that the token is never
+  persisted or logged. That is a promise about the relay's code (`relay/`), not something
+  the client can verify. The request repeats about once a minute as the relay's pairing
+  window renews, until a phone binds or the 10-minute code window
+  (`HMD_RELAY_CODE_WINDOW_S`) closes; the token is then dropped from memory.
+- **The phone's side** (`POST /identity/github`, `POST /pair/code`): the phone's GitHub
+  device-flow token is checked against hmd's GitHub App and deleted at GitHub, and replaced
+  by a relay-signed assertion bound to the phone's key. The relay releases a pending pairing
+  only to a phone whose verified GitHub id equals yours. After the bind a 6-digit number
+  shows on both screens and you approve it at the terminal (`--no-confirm` skips that and
+  trusts the relay).
+- **What the relay keeps:** your numeric GitHub id, the code, and the phone's device label
+  and GitHub login live on the session record only until bind, revoke, end or purge
+  (INV-41); a per-GitHub-id index keeps nothing but a revoke timestamp, for up to 30 days.
+
+| Switch | Effect |
+|---|---|
+| `hmd app connect --no-code` | no token leaves; pair by QR |
+| `hmd app identity revoke` | sends your `gh auth token` to the relay once more (same pipe, same https rule) and invalidates every phone sign-in made with your GitHub identity — each phone signs in again. Revoking the GitHub App at github.com does not do this by itself |
 
 ---
 

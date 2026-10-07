@@ -111,7 +111,7 @@ The ❌ rows are kept in view: [`evals/flagship/STATUS.md`](evals/flagship/STATU
 
 **Network posture is default-ON.** Team presence and the cloud features reach the control plane as soon as you use them: a signed heartbeat carrying your handle, verdict, and current filename — scoped to your team, never your code or file contents. That is a feature, and it is on until you switch it off. `hmd presence sever` gives zero egress. Field-by-field contract: [DATA.md](DATA.md). The precisely scoped claims are below.
 
-Gates run 100% locally. Your code never leaves your machine.
+Gates run 100% locally. Your code never leaves your machine unless you pair a phone with hmd app connect.
 
 Team presence is a feature you can see and switch off: it sends {handle, verdict, current filename} — never code, never file contents — to your team's endpoint. hmd presence off makes you invisible; hmd presence on --no-files hides filenames.
 
@@ -119,7 +119,9 @@ Telemetry is specified, minimal, and yours to kill: DATA.md documents every fiel
 
 Auto-update checks GitHub Releases for new signed versions. HEIMDALL_NO_AUTOUPDATE=1 (or ~/.heimdall/no-autoupdate) disables it.
 
-`rr` is the one thing that sends on purpose, and only when you run it: your BYO Claude credential (write-only), your GitHub App installation id, and the literal task text you typed — because that text is the job. It never uploads your working tree; the worker clones your repo from GitHub.
+`rr` sends on purpose, and only when you run it: your BYO Claude credential (write-only), your GitHub App installation id, and the literal task text you typed — because that text is the job. It never uploads your working tree; the worker clones your repo from GitHub.
+
+The phone companion is opt-in (hmd app connect; hmd app disconnect stops it): by default your session state, and any diff you open on the phone, travel end-to-end sealed through a relay that sees only ciphertext; push notifications send short scrubbed text to Expo (HMD_PUSH=0 turns them off); pairing by code sends your gh auth token to the relay while the code is offered (--no-code pairs by QR instead).
 
 Full data contract and every field collected: [DATA.md](DATA.md).
 
