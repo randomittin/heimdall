@@ -278,8 +278,8 @@ class Rig:
     def handle(self, env):
         self.client._handle_envelope(env)
 
-    def bind(self):
-        payload = {"device_pubkey": self.E2E.pub_b64(self.dev_pub), "bound_at": 1}
+    def bind(self, pub=None):
+        payload = {"device_pubkey": self.E2E.pub_b64(self.dev_pub if pub is None else pub), "bound_at": 1}
         self.handle({"v": 1, "session_id": self.client.session_id, "seq": 0, "sender": "relay",
                      "type": "device_bound", "nonce": None, "ciphertext": None, "payload": payload})
 
@@ -872,19 +872,22 @@ login = frame["state"]["login"]
 assert login["enabled"] is True and login["request"] is None and login["result"] is None
 assert set(login["cc"]) == {"status", "method", "account_hint", "config_dir", "checked_at"}, login["cc"]
 assert login["cc"]["status"] == "unknown" and login["cc"]["checked_at"] == 0, "nothing was probed yet"
-# device_bound forgets the caps again
+# the same phone binding again (a stream reconnect) keeps what it listed ...
 rig.bind()
-assert rig.client.device_caps == frozenset() and rig.login() is None
+assert rig.client.device_caps == {"login-v1", "resync"} and rig.login() is not None, "a same-device device_bound must keep the caps"
+# ... another device's device_bound is refused by the latch and forgets them
+_, other_pub = rig.E2E.generate_keypair()
+rig.bind(other_pub)
+assert rig.client.device_caps == frozenset() and rig.login() is None, "another device's device_bound must forget the caps"
 PYEOF
 
-py_case 24 "a rebind of the same phone keeps the request live and re-sends it (level-triggered state)" <<'PYEOF'
+py_case 24 "a rebind of the same phone keeps the request live and re-sends it (level-triggered state), with no new resync" <<'PYEOF'
 w = World(mode="hang")
 rig = Rig(w)
 rid = rig.cmd("login_start", {"kind": "claudeai"})["id"]
 req = wait_for(lambda: rig.mgr.snapshot()["request"], what="the authorize URL")
 rig.bind()
 assert rig.client.last_sent_digest is None, "device_bound must re-arm the next state send"
-rig.resync(["login-v1", "resync", "z-zlib"])
 login = rig.login()
 assert login["request"] == req and login["request"]["id"] == rid, login
 rig.mgr.shutdown("superseded")

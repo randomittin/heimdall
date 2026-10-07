@@ -7,8 +7,9 @@
       --> needs-confirm: the six digits ride the sealed state frame to the phone
       --> `hmd dash confirm` on a pty, the code typed at the prompt (without a terminal, or with a wrong code, it refuses)
       --> the producer runs against a temp sqlite connector --> the sealed state frame carries the panel data
-    plus: a phone that never listed dash-v1 sees no state.dashboards and cannot ask; the switch off ends the loop and refuses requests;
-    the switch on starts it again; the client's own shutdown takes the loop with it.
+    plus: a stream rebind of the same phone keeps its dash-v1 with no new resync and another device's device_bound forgets it; a phone that
+    never listed dash-v1 sees no state.dashboards and cannot ask; the switch off ends the loop and refuses requests; the switch on starts it
+    again; the client's own shutdown takes the loop with it.
 
 Only fakes and temp dirs: HOME / HEIMDALL_HOME / TMPDIR are one temp tree, the model is a script in it, the database a file in it, no
 credential of any kind exists. The only processes signalled are the ones this starts (its client, its fake relay, its own loop child as a
@@ -194,13 +195,23 @@ def tile_file():
 
 
 def relist(p):
-    """What the app does after every (re)bind -- the relay client forgets a phone's caps on each device_bound: list dash-v1 again."""
+    """What the app does after a (re)bind: list dash-v1 again. The client keeps the caps of a same-device rebind (3d) and forgets another
+    device's (3e), so this changes nothing unless they were forgotten."""
     p.resync(DASH_CAPS)
 
 
+def bound_events(st):
+    """How many device_bound events the client has printed: the bind itself, plus one for every repeat the relay sent."""
+    try:
+        with open(st.out, encoding="utf-8", errors="replace") as f:
+            return sum(1 for line in f if '"device_bound"' in line)
+    except OSError:
+        return 0
+
+
 def wait_tile(p, pred, since, timeout):
-    """The first state frame at index >= since with a tile satisfying `pred`. A phone whose newest frame lost state.dashboards (a stream
-    rebind forgot its caps) lists dash-v1 again, exactly as the app does, and keeps waiting."""
+    """The first state frame at index >= since with a tile satisfying `pred`. A phone whose newest frame lost state.dashboards (its caps
+    were forgotten) lists dash-v1 again, exactly as the app does, and keeps waiting."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         f = p.state(lambda s: any(pred(t) for t in tiles(s)), since=since, timeout=min(8, max(1, deadline - time.time())))
@@ -281,6 +292,30 @@ def run(st):
     check(len(procs) == 1 and procs[0][1] == st.client.pid and ("--parent %d" % st.client.pid) in procs[0][2],
           "3c. that loop is the client's own child and was started with the client's pid as --parent", procs)
     if os.environ.get("DASH_E2E_STOP_AFTER") == "3":    # the wrapper's mutant runs only need to get this far
+        return
+
+    # 3d. a stream rebind: the relay's device_bound again with the paired phone's own key. What the phone listed is still held, so
+    # state.dashboards keeps riding with no new resync from the phone
+    bound_before, before = bound_events(st), p.mark()
+    p.rebind()
+    rebound = wait_until(lambda: bound_events(st) > bound_before, 20)
+    lost = p.state(lambda s: "dashboards" not in s, since=before, timeout=4)
+    p.pull()
+    states = [fr for fr in p.frames[before:] if fr["type"] == "state"]
+    check(rebound and lost is None and states and all("dashboards" in fr["body"]["state"] for fr in states),
+          "3d. a same-device device_bound (a stream rebind) keeps the phone's dash-v1: every state frame after it still carries state.dashboards, with no new resync",
+          (rebound, [sorted(fr["body"]["state"])[:4] for fr in states][-2:]))
+
+    # 3e. another device's device_bound is refused by the latch and nothing the paired phone listed is kept for it: its next frame has no
+    # dashboards key; 3f. the paired phone lists dash-v1 again and has them back
+    before = p.mark()
+    p.rebind(other=True)
+    f = p.state(lambda s: "dashboards" not in s, since=before, timeout=15)
+    check(f is not None, "3e. a device_bound for ANOTHER device makes the client forget the phone's caps: its next state frame has no dashboards key")
+    _ack, before = p.resync(DASH_CAPS)
+    f = p.state(lambda s: "dashboards" in s, since=before, timeout=20)
+    check(f is not None, "3f. the paired phone lists dash-v1 again and state.dashboards is back")
+    if os.environ.get("DASH_E2E_STOP_AFTER") == "3f":    # the wrapper's mutants of 3d / 3e
         return
 
     # 4. the phone describes a tile hmd has never seen

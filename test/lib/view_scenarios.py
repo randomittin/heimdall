@@ -578,9 +578,15 @@ def g_latch(st):
     check(p.state(lambda s: ((s.get("views") or {}).get("result") or {}).get("id") == "v-replay", since=before, timeout=2) is None,
           "latch: and is not run")
     before = p.mark()
-    p.rebind()
+    p.rebind()   # the same device again: a stream reconnect, the phone it was
+    check(p.state(lambda s: "views" not in s, since=before, timeout=4) is None,
+          "latch: when the SAME device binds again hmd keeps what the phone listed: no frame after it lacks the views key")
+    frame = p.state(lambda s: ((s.get("views") or {}).get("result") or {}).get("id") == (res or {}).get("id"), since=before)
+    check(frame is not None, "latch: and the result that phone asked for is still served to it, with no new resync")
+    before = p.mark()
+    p.rebind(other=True)   # a device that was never paired
     frame = p.state(lambda s: "views" not in s, since=before)
-    check(frame is not None, "latch: when the device binds again hmd forgets what the phone listed: the next frame has no views key")
+    check(frame is not None, "latch: when ANOTHER device binds hmd forgets what the phone listed: the next frame has no views key")
     before = p.mark()
     p.resync(VP.FULL_CAPS)
     frame = p.state(lambda s: "views" in s, since=before)

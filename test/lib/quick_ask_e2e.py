@@ -199,8 +199,8 @@ def loop_procs():
 
 
 def wait_state(p, pred, since, timeout):
-    """The first state frame at index >= since satisfying `pred`. A phone whose newest frame lost state.asks (a stream rebind made the client
-    forget its caps) lists ask-v1 again, exactly as the app does after every (re)bind, and keeps waiting."""
+    """The first state frame at index >= since satisfying `pred`. A phone whose newest frame lost state.asks (its caps were forgotten, as when
+    another device binds) lists ask-v1 again, exactly as the app does after a (re)bind, and keeps waiting."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         frame = p.state(pred, since=since, timeout=min(5, max(1, deadline - time.time())))

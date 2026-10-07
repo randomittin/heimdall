@@ -48,11 +48,11 @@ if [ "$PASS" -lt 25 ]; then
   printf '  FAIL the scenario ran fewer than 25 checks (%s): it did not get through\n' "$PASS"
 fi
 
-# The suite must be able to go red: a copy of bin/ and sentinels/ with ONE wiring defect, run only as far as step 3, must fail the
-# named check (the scenario honours DASH_E2E_STOP_AFTER=3 for exactly this).
-echo "== mutants: the wiring that starts the loop is what makes the named check pass =="
+# The suite must be able to go red: a copy of bin/ and sentinels/ with ONE defect, run only as far as step 3 (or the step named last), must
+# fail the named check (the scenario honours DASH_E2E_STOP_AFTER=3 and =3f for exactly this).
+echo "== mutants: the wiring that starts the loop, and the rule that keeps the phone's caps, are what make the named check pass =="
 mutant() {
-  local label="$1" file="$2" old="$3" new="$4" want="$5" copy res
+  local label="$1" file="$2" old="$3" new="$4" want="$5" stop="${6:-3}" copy res
   copy="$(mktemp -d)"
   cp -R "$REPO/bin" "$REPO/sentinels" "$copy/"
   if ! python3 - "$copy/$file" "$old" "$new" <<'PYEOF'
@@ -66,7 +66,7 @@ PYEOF
   then
     FAIL=$((FAIL + 1)); printf '  FAIL mutant [%s]: could not be applied (the code it mutates moved)\n' "$label"; rm -rf "$copy"; return
   fi
-  res="$(DASH_E2E_STOP_AFTER=3 python3 "$SCENARIO" "$copy/bin/heimdall-relay-client" 2>&1 </dev/null)"
+  res="$(DASH_E2E_STOP_AFTER="$stop" python3 "$SCENARIO" "$copy/bin/heimdall-relay-client" 2>&1 </dev/null)"
   if printf '%s\n' "$res" | grep -q "^  FAIL $want"; then
     PASS=$((PASS + 1)); printf '  ok   mutant [%s] makes check %s fail\n' "$label" "$want"
   else
@@ -78,6 +78,12 @@ mutant "the state cache never tells the host" sentinels/hmd-ui.py \
   '        observe_dash(self._dash, state)' '        _ = self._dash' "3b\."
 mutant "the loop is started without --parent" bin/lib/dashboard_host.py \
   '"run", "--parent", str(os.getpid())]' '"run"]' "3c\."
+mutant "a same-device device_bound forgets the caps again" bin/heimdall-relay-client \
+  $'                if device_pub == self.device_pub:\n' \
+  $'                if device_pub == self.device_pub:\n                    self._adopt_device_caps(None)\n' "3d\." 3f
+mutant "another device's device_bound keeps the caps" bin/heimdall-relay-client \
+  $'                self._adopt_device_caps(None)  # a different device: nothing the paired phone listed is kept for it\n' \
+  $'                _ = device_pub\n' "3e\." 3f
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
