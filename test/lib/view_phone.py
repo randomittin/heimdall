@@ -82,11 +82,13 @@ class Phone:
                      "nonce": nonce, "ciphertext": ciphertext, "payload": None})
         return seq
 
-    def rebind(self):
-        """The relay's own device_bound frame again, same device key: what a stream reconnect looks like to the client."""
+    def rebind(self, other=False):
+        """The relay's own device_bound frame again: with the same device key by default, which is what a stream reconnect looks like
+        to the client, or with other=True the key of a device that was never paired (the relay claiming the session for someone else)."""
+        pub = E2E.generate_keypair()[1] if other else self.pub
         self._queue({"v": 1, "session_id": self.session_id, "seq": 0, "sender": "relay", "type": "device_bound",
                      "nonce": "", "ciphertext": "",
-                     "payload": {"device_pubkey": E2E.pub_b64(self.pub), "bound_at": int(time.time())}})
+                     "payload": {"device_pubkey": E2E.pub_b64(pub), "bound_at": int(time.time())}})
 
     # -- what the client sent -----------------------------------------------------------------------------------------
     def pull(self):

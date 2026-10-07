@@ -30,7 +30,8 @@
 #            (GH_REPO never does), the document read field for field, the gate joined to the sweep receipt (clean and all-green for THIS
 #            head only), secrets and emails scrubbed, a url only when github.com/<owner>/<repo>/pull/<this number>, every shape the
 #            contract cannot carry, a failing gh, too-large, and the 8 s timeout; gh missing from the PATH (its own stack)
-#   latch    a forged or replayed command is never run; a new binding forgets the phone's caps and the held result
+#   latch    a forged or replayed command is never run; the same device binding again keeps the phone's caps and the held result,
+#            another device's binding forgets both
 #   kill     .heimdall/app/controls-disabled and HMD_UI_CONTROLS=0 -> controls-off, enabled:false
 #   rate     --repo below the git toplevel; the 21st request in a minute is rate-limited
 # and, falsifiably, that each rule is the thing holding: a copy of the client with one rule removed must turn its group red.

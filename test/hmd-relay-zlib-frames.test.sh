@@ -36,7 +36,8 @@
 #   14. resync is acked ok, bad params acked bad-params; acks are never compressed
 #   15. caps lifecycle: the latest resync replaces the set; bad params change nothing
 #   16. only an AUTHENTICATED resync counts (device_bound payload / forged command / keepalive cannot)
-#   17. device_bound forgets the phone's caps and forces a plain resend
+#   17. device_bound: the SAME phone binding again keeps its caps (slices and zlib ride on, no new resync) and
+#       still forces a resend; another device's device_bound forgets them. Two mutants put the old behaviour back.
 #   18. resync digest: current -> no resend; stale / nothing sent -> full state forced; desync logged
 #   19. seq stays strictly increasing and every frame opens under its own (seq, "hmd") nonce
 #   20. a python without zlib: no z-zlib listed, plain frames
@@ -138,6 +139,16 @@ from importlib.machinery import SourceFileLoader
 NEVER = "0" * 64  # a well-formed digest that is never the digest of anything hmd sent
 
 
+class StubCache:
+    """The one thing RelayClient._tick_once reads from the real StateCache."""
+
+    def __init__(self, state):
+        self.state = state
+
+    def latest(self):
+        return self.state, "stub-digest"
+
+
 class Rig:
     """Only the POST is replaced: every frame the client would send is recorded as the phone would receive
     it, and `plaintext()` opens it with the key the phone derived -- the client then has exactly the
@@ -172,8 +183,9 @@ class Rig:
         with contextlib.redirect_stdout(self.out):
             self.client._handle_envelope(env)
 
-    def bind(self, extra=None):
-        payload = {"device_pubkey": self.E2E.pub_b64(self.dev_pub), "bound_at": 1}
+    def bind(self, extra=None, pub=None):
+        """The relay device_bound for the paired phone, or for the device whose public key is `pub`."""
+        payload = {"device_pubkey": self.E2E.pub_b64(self.dev_pub if pub is None else pub), "bound_at": 1}
         payload.update(extra or {})
         self.handle({"v": 1, "session_id": self.client.session_id, "seq": 0, "sender": "relay",
                      "type": "device_bound", "nonce": None, "ciphertext": None, "payload": payload})
@@ -197,6 +209,15 @@ class Rig:
     def send(self, type_, obj):
         with contextlib.redirect_stdout(self.out):
             return self.client.send_hmd_frame(type_, obj)
+
+    def tick(self, state):
+        """The state frame the client own send path seals next, overlays included, opened as the phone would: {state, caps}."""
+        self.client.cache = StubCache(state)
+        sent = len(self.posts)
+        with contextlib.redirect_stdout(self.out):
+            self.client._tick_once()
+        assert len(self.posts) > sent, "the tick sent no state frame"
+        return json.loads(self.E2E.unpack_plaintext(self.plaintext(self.last("state"))))
 
     def plaintext(self, post):
         return self.E2E.open_(self.dev_key, post["seq"], "hmd", post["nonce"], post["ciphertext"])
@@ -545,24 +566,55 @@ rig.send("state", {"state": real_state()})
 assert "z" not in json.loads(rig.plaintext(rig.last("state"))), "no authenticated resync -> plain"
 PYEOF
 
-# ═══ 17. device_bound forgets the caps ══════════════════════════════════════
-py_case 17 "client: device_bound forgets the phone's caps, forces a resend, and the next frame is plain" rig <<'PYEOF'
-rig = Rig()
+# ═══ 17. device_bound: the same phone keeps its caps, another device forgets them ═══
+# One body, run twice: against the real client (it passes), and again by the mutants at the end of this file, against
+# copies of the client with the old behaviour put back in one place each (it must fail on the check named there).
+CASE17_BODY="$(cat <<'PYEOF'
 state = real_state()
-rig.resync(["z-zlib"])
-rig.send("state", {"state": state})
-assert json.loads(rig.plaintext(rig.last("state")))["z"] == "zlib"
+caps = ["ask-v1", "dash-alert-v1", "dash-v1", "login-v1", "resync", "view-v1", "z-zlib"]
+SLICES = ("asks", "dashboards", "login", "views")  # the overlays a phone gets only for the caps it listed
+
+# the SAME phone binds again (hmd stream reconnected, the relay replays device_bound): its caps stay, with no new resync
+rig = Rig()
+rig.resync(caps)
+first = rig.tick(state)
+assert all(k in first["state"] for k in SLICES), "a phone that listed %s must get every slice, got %s" % (caps, sorted(first["state"]))
+assert json.loads(rig.plaintext(rig.last("state")))["z"] == "zlib", "and its frame must be compressed"
+logged = rig.events("device_caps")
 rig.client.last_sent_digest = "abc"
 rig.bind()  # the same device_pubkey again
-assert rig.client.device_caps == frozenset(), "device_bound must forget the phone's caps"
+assert rig.client.device_caps == frozenset(caps), "a same-device device_bound must keep the phone's caps: %s" % sorted(rig.client.device_caps)
+assert rig.events("device_caps") == logged, "keeping the caps logs no device_caps event"
 assert rig.client.last_sent_digest is None, "a rebind must still force the next tick to resend"
+assert len(rig.events("device_bound")) == 2 and not rig.events("error"), (rig.events("device_bound"), rig.events("error"))
+sent_commands = rig.dev_seq
+after = rig.tick(state)  # the very next frame, and the phone has sent no resync since the bind
+assert rig.dev_seq == sent_commands, "the phone must not have to send anything"
+assert all(k in after["state"] for k in SLICES), "a same-device rebind dropped slices: %s" % sorted(after["state"])
+assert json.loads(rig.plaintext(rig.last("state")))["z"] == "zlib", "a same-device rebind must keep frames compressed"
+
+# ANOTHER device claims the session: the latch refuses it (its key is never adopted), and nothing the paired phone
+# listed is kept for whoever is on the other end now -- the paired phone lists its caps again to get them back
+rig = Rig()
+rig.resync(caps)
+paired = rig.tick(state)
+assert all(k in paired["state"] for k in SLICES), sorted(paired["state"])
+_, other_pub = rig.E2E.generate_keypair()
+rig.bind(pub=other_pub)
+assert any("differs from the already latched" in e["detail"] for e in rig.events("error")), rig.events("error")
+assert rig.client.session_key == rig.dev_key, "the latch holds: the paired phone key is untouched"
+assert rig.client.device_caps == frozenset(), "a different device's device_bound must forget the caps: %s" % sorted(rig.client.device_caps)
 assert rig.events("device_caps")[-1] == {"event": "device_caps", "caps": []}
-rig.send("state", {"state": state})
-assert rig.plaintext(rig.last("state")) == plain_frame(state)
-rig.resync(["z-zlib"])
-rig.send("state", {"state": state})
-assert json.loads(rig.plaintext(rig.last("state")))["z"] == "zlib", "a new resync turns compression back on"
+frame = rig.tick(state)
+assert not [k for k in SLICES if k in frame["state"]], "slices rode to a phone that listed nothing: %s" % sorted(frame["state"])
+assert "z" not in json.loads(rig.plaintext(rig.last("state"))), "and its frames are plain again"
+rig.resync(caps)
+back = rig.tick(state)
+assert all(k in back["state"] for k in SLICES), "a new resync must bring the slices back: %s" % sorted(back["state"])
+assert json.loads(rig.plaintext(rig.last("state")))["z"] == "zlib", "and compression with them"
 PYEOF
+)"
+printf '%s\n' "$CASE17_BODY" | py_case 17 "client: a same-device device_bound keeps the phone's caps (slices, zlib, no resync); another device's forgets them" rig
 
 # ═══ 18. resync digest ══════════════════════════════════════════════════════
 py_case 18 "client: resync digest of the last sent state -> no resend; stale or nothing sent -> full state forced" rig <<'PYEOF'
@@ -792,6 +844,43 @@ finally:
     relay.terminate()
     relay.wait(timeout=20)
 PYEOF
+
+# ═══ mutants: case 17 goes red when the old behaviour is put back ═══════════
+# A copy of bin/ and sentinels/ with ONE edit to the client; CASE17_BODY runs against it and must fail on the check that names the edit.
+echo "== mutants: the caps stay with the paired phone, and only with it =="
+mutant17() {
+  local label="$1" old="$2" new="$3" want="$4" copy
+  copy="$(mktemp -d "$TMPROOT/mutant.XXXXXX")"
+  cp -R "$REPO/bin" "$REPO/sentinels" "$copy/"
+  if ! python3 - "$copy/bin/heimdall-relay-client" "$old" "$new" <<'PYEOF'
+import sys
+path, old, new = sys.argv[1:4]
+text = open(path, encoding="utf-8").read()
+if text.count(old) != 1:
+    sys.exit("mutation target found %d times: %r" % (text.count(old), old[:60]))
+open(path, "w", encoding="utf-8").write(text.replace(old, new))
+PYEOF
+  then
+    bad "mutant [$label]: could not be applied (the code it mutates moved)"
+    return
+  fi
+  if { printf '%s\n%s\n%s\n' "$PRELUDE" "$RIG" "$CASE17_BODY"; } | python3 - "$MOD" "$copy" "$TMPROOT" "$VECTORS" >"$TMPROOT/mutant.out" 2>"$TMPROOT/mutant.err"; then
+    bad "mutant [$label] was NOT caught: case 17 still passed"
+  elif grep -qF -- "$want" "$TMPROOT/mutant.err"; then
+    ok "mutant [$label] makes case 17 fail on \"$want\""
+  else
+    bad "mutant [$label] failed, but not on \"$want\":"
+    sed 's/^/       | /' "$TMPROOT/mutant.err"
+  fi
+}
+mutant17 "a same-device device_bound forgets the caps again" \
+  $'                if device_pub == self.device_pub:\n' \
+  $'                if device_pub == self.device_pub:\n                    self._adopt_device_caps(None)\n' \
+  "must keep the phone's caps"
+mutant17 "another device's device_bound keeps the caps" \
+  $'                self._adopt_device_caps(None)  # a different device: nothing the paired phone listed is kept for it\n' \
+  $'                _ = device_pub\n' \
+  "must forget the caps"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ] && exit 0 || exit 1
