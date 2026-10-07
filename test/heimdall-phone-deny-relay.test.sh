@@ -33,6 +33,9 @@
 #      and when the window runs out untouched a late sealed deny is acked `expired`;
 #  11. a sealed `stop` is acked ok with decision "stop", shares the single decision slot with deny,
 #      and the real hook answers it with {continue:false} plus the denied call.
+#  12. the switch, nothing stubbed: the hook is ON BY DEFAULT -- with HMD_PHONE_DENY unset the real hook
+#      raises the request and a sealed deny blocks the action (section 10 is the explicit =1 case) -- and
+#      an explicit HMD_PHONE_DENY=0 makes the same hook print nothing and publish nothing.
 #
 # Hermetic: HOME/HEIMDALL_HOME/TMPDIR are a temp dir, every process this suite starts is reaped on
 # EXIT, every wait is a bounded poll.
@@ -73,6 +76,9 @@ export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
 mkdir -p "$HOME/.claude"
 unset CLAUDE_SESSION_ID SESSION_ID CLAUDE_CODE_SESSION_ID
+# The hook is ON BY DEFAULT: section 12 needs HMD_PHONE_DENY unset, and every other case sets it explicitly
+# on the command it runs, so nothing here may inherit either variable from the caller's environment.
+unset HMD_PHONE_DENY HMD_PHONE_DENY_WINDOW_S
 
 PIDS=()
 cleanup() {
@@ -512,6 +518,37 @@ if [ -n "$STOP_ID" ] && printf '%s' "$ACK" | jq -e --arg id "$STOP_ID" '.ok == t
   ok "11e. real hook + sealed stop: the ack is ok AND the hook prints continue:false with the call denied"
 else
   bad "11e. ack=[${ACK:-<none>}] hook out=[$(cat "$TMPROOT/e2e.hook3.out")] err=[$(cat "$TMPROOT/e2e.hook3.err")] id=[$STOP_ID]"
+fi
+
+# 12. the switch, through the real relay and the real hook. ON BY DEFAULT: with HMD_PHONE_DENY unset the
+# hook raises the request, the phone sees it and denies it with a sealed command, and the action is
+# blocked. With an explicit HMD_PHONE_DENY=0 the same hook (same risky call, same live companion) prints
+# nothing and leaves the approvals directory exactly as it found it.
+jq -cn --arg d "$REPO_T" '{hook_event_name:"PreToolUse",session_id:"s",cwd:$d,tool_name:"Bash",tool_input:{command:"git push origin e2e-default-on"}}' > "$TMPROOT/e2e.payload4"
+env -u CLAUDE_CODE_ENTRYPOINT -u HMD_PHONE_DENY HMD_PHONE_DENY_WINDOW_S=40 "$HOOK" --repo "$REPO_T" \
+  < "$TMPROOT/e2e.payload4" > "$TMPROOT/e2e.hook4.out" 2> "$TMPROOT/e2e.hook4.err" &
+E2E_HOOK4_PID=$!; PIDS+=("$E2E_HOOK4_PID")
+ENTRY="$(wait_for_approvals_state "$LOG/frames.ndjson" "$KEY_B64" summary "git push origin e2e-default-on" 30)"
+DEFAULT_ID="$(printf '%s' "$ENTRY" | jq -r '.id // empty')"
+send_cmd 20 "$(decide_json "${DEFAULT_ID:-p-00000000}" deny)"
+ACK="$(ack_of_ok 20)"
+i=0; while kill -0 "$E2E_HOOK4_PID" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+if [ -n "$DEFAULT_ID" ] && printf '%s' "$ACK" | jq -e --arg id "$DEFAULT_ID" '.ok == true and .id == $id and .decision == "deny"' >/dev/null 2>&1 \
+   && jq -e '.hookSpecificOutput | .hookEventName == "PreToolUse" and .permissionDecision == "deny"' "$TMPROOT/e2e.hook4.out" >/dev/null 2>&1; then
+  ok "12. HMD_PHONE_DENY unset (the default): the real hook raises the request, the phone's sealed deny is acked ok and the action is blocked"
+else
+  bad "12. default-on loop wrong: id=[$DEFAULT_ID] ack=[${ACK:-<none>}] hook out=[$(cat "$TMPROOT/e2e.hook4.out")] err=[$(cat "$TMPROOT/e2e.hook4.err")]"
+fi
+jq -cn --arg d "$REPO_T" '{hook_event_name:"PreToolUse",session_id:"s",cwd:$d,tool_name:"Bash",tool_input:{command:"git push origin e2e-switched-off"}}' > "$TMPROOT/e2e.payload5"
+BEFORE_OFF="$(find "$REPO_T/.heimdall/ui/approvals" -mindepth 1 -maxdepth 1 | sort)"
+env -u CLAUDE_CODE_ENTRYPOINT HMD_PHONE_DENY=0 HMD_PHONE_DENY_WINDOW_S=6 "$HOOK" --repo "$REPO_T" \
+  < "$TMPROOT/e2e.payload5" > "$TMPROOT/e2e.hook5.out" 2> "$TMPROOT/e2e.hook5.err"
+HOOK5_RC=$?
+AFTER_OFF="$(find "$REPO_T/.heimdall/ui/approvals" -mindepth 1 -maxdepth 1 | sort)"
+if [ "$HOOK5_RC" = 0 ] && [ ! -s "$TMPROOT/e2e.hook5.out" ] && [ ! -s "$TMPROOT/e2e.hook5.err" ] && [ "$BEFORE_OFF" = "$AFTER_OFF" ]; then
+  ok "12b. HMD_PHONE_DENY=0 with the companion live: the same risky call prints nothing and publishes no request (approvals dir unchanged)"
+else
+  bad "12b. the switched-off hook did something: rc=$HOOK5_RC out=[$(cat "$TMPROOT/e2e.hook5.out")] err=[$(cat "$TMPROOT/e2e.hook5.err")] new=[$(comm -13 <(printf '%s\n' "$BEFORE_OFF") <(printf '%s\n' "$AFTER_OFF"))]"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

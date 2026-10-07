@@ -135,9 +135,9 @@
       "event": "PreToolUse",
       "index": 7,
       "id": "phone-deny",
-      "description": "Opt-in, OFF unless HMD_PHONE_DENY=1: holds a risky shell command or outside-the-repo write for up to HMD_PHONE_DENY_WINDOW_S (default 10 s, max 120) so the paired phone can deny it, or stop the turn, over the sealed relay. The phone can only reduce what runs, never approve; no reply, no connected companion, an unattended session or any error -> does nothing and exits 0 (Claude Code's normal permission flow proceeds).",
+      "description": "On by default (off: HMD_PHONE_DENY=0, or heimdall-hooks disable phone-deny): holds a risky shell command or outside-the-repo write for up to HMD_PHONE_DENY_WINDOW_S (default 10 s, max 120) so the paired phone can deny it, or stop the turn, over the sealed relay. The phone can only reduce what runs, never approve; no connected companion (a file test on <repo>/.heimdall/app/connect.json skips the hook first), no reply, an unattended session or any error -> does nothing and exits 0 (Claude Code's normal permission flow proceeds).",
       "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
-      "fingerprint": "585dd5585144a44171f115aeb3ac6bf335073b5a7d595b5178b1c099ef9f37fd",
+      "fingerprint": "5f0c424ee1a22e9d7fa2effb7511391e91d642cb6260a879713bc6d1b5fc87f6",
       "locked": false,
       "remote_toggle": false
     },

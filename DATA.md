@@ -414,5 +414,62 @@ would publish a sub-k cell is a defect.
 
 ---
 
+## 8. Phone deny — on by default, deny-only
+
+`bin/heimdall-phone-deny` is a `PreToolUse` hook (hook id `phone-deny`, matcher
+`Bash|Write|Edit|MultiEdit|NotebookEdit`) that lets a phone paired through `hmd app connect`
+refuse a risky action. **It is on by default.** It has no network client of its own — it reads
+and writes files under the repo's `.heimdall/` — and it writes nothing to presence, telemetry or
+the control plane. Whatever reaches a phone rides the `hmd app connect` relay session you started
+yourself, sealed end-to-end (the relay forwards ciphertext only).
+
+**When it does anything.** Only when all of these hold; otherwise it exits 0 having printed and
+written nothing, and Claude Code's normal permission flow decides exactly as it would without it:
+
+- the session is attended (not `claude -p` / an SDK child, not an hmd sub-session);
+- a relay-mode `hmd app connect` is live (`.heimdall/app/connect.json` naming live pids), a device
+  is paired, and the relay did not report "no phone connected" on its last frame;
+- the action is risky: a shell command that pushes, deletes, publishes, deploys, changes something
+  over the network, escalates privilege or changes the system, or a `Write` / `Edit` / `MultiEdit` /
+  `NotebookEdit` whose real path is outside the project root.
+
+With no `connect.json` in the project the hook is skipped after one file test per tool call.
+
+**Deny-only.** The phone has two verbs on a pending request: `deny` (refuse this call) and `stop`
+(refuse it and end the turn). There is no allow, no approve and no edit of the call — the hook's
+whole output is nothing, a deny, or a deny plus `{"continue": false}`; a phone can only reduce what
+runs. While a phone is connected a risky action is held for up to a window
+(`HMD_PHONE_DENY_WINDOW_S`, default 10 s, clamped to 1–120); no reply inside it prints nothing.
+
+**What it writes, for one held action.** One request file,
+`<repo>/.heimdall/ui/approvals/p-<8 hex>.json` (directory `0700`, file `0600`), withdrawn when the
+hook leaves:
+
+```
+id            "p-" + 8 random hex
+tool          the tool label, reduced to [A-Za-z0-9_.:-]
+summary       the shell command, or "<Tool> <path>" for a file tool; control bytes flattened,
+              cut to 200 chars; a secret-shaped summary is stored as null, never written raw
+requested_at  epoch seconds
+expires_at    requested_at + the window
+risk          "high"
+```
+
+A `p-<8 hex>.decision` file (`{id, decision, decided_at}`, no summary) is kept for up to 10
+minutes so a late reply is answered `expired` rather than acknowledged for an action that already ran.
+
+**What reaches the phone.** The live requests (at most 5, those six keys) ride the sealed state
+frame as `approvals`, with absolute repo paths reduced to repo-relative and email addresses masked;
+the phone's `deny` / `stop` comes back as a sealed, replay-guarded `decide` command. A push
+notification, if you registered a device, carries only `<tool> is waiting. Deny within N s.` and
+the request id — never the command, a path or the summary.
+
+**Off switch.** `HMD_PHONE_DENY=0` (also `false`, `no`, `off`; any case) in the environment Claude
+Code runs in, or `hmd hooks disable phone-deny` (`hmd hooks enable phone-deny` brings it back).
+Unset, empty or any other value leaves it on, so a typo cannot silently disable it. Proof:
+`test/heimdall-phone-deny.test.sh`, `test/heimdall-phone-deny-relay.test.sh`.
+
+---
+
 *Questions, or a mismatch between this file and the code? Open an issue —
 `hmd report-bug`.*

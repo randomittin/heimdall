@@ -8,7 +8,7 @@
 #                                       decisions, settle() -- the hook's window ends, and a deny
 #                                       is honoured or refused, never both
 #   bin/lib/phone_deny_risk.py          what counts as a risky action, and its one-line summary
-#   bin/heimdall-phone-deny             the PreToolUse hook: OFF unless HMD_PHONE_DENY=1
+#   bin/heimdall-phone-deny             the PreToolUse hook: ON unless HMD_PHONE_DENY=0 (or false/no/off)
 #   hooks/hooks.json + .metadata.json   the `phone-deny` group and its kill switch
 #   sentinels/hmd-ui.py                 the `approvals` slice of /api/state
 #
@@ -702,20 +702,45 @@ ARMED=(HMD_PHONE_DENY=1)
 # room for a loaded machine (a 3 s bound flaked once while another suite was running).
 NOOP_MAX_S=8
 
-# C1 -- flag off => nothing at all
-R1="$(mk_repo)"; bash_payload "$R1" "git push origin main" > "$TMPROOT/p.push"
-run_hook "$R1" "$TMPROOT/p.push"
-if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && [ -z "$HOOK_ERR" ] && no_approvals "$R1" && under "$HOOK_S" "$NOOP_MAX_S"; then
-  ok "C1. HMD_PHONE_DENY unset -> exit 0, no output, no request, no delay (${HOOK_S}s)"
-else
-  bad "C1. flag-off hook did something: rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s"
-fi
-for v in 0 true yes on "" 2 " 1" "1 "; do
-  run_hook "$R1" "$TMPROOT/p.push" "HMD_PHONE_DENY=$v"
-  if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && no_approvals "$R1" && under "$HOOK_S" "$NOOP_MAX_S"; then
-    ok "C1b. HMD_PHONE_DENY='$v' is not the opt-in (only exactly 1 arms the hook) -> no-op"
+# C1 -- the switch. ON BY DEFAULT: HMD_PHONE_DENY unset arms the hook (a risky action is held, published
+# to the phone, and the phone's deny blocks it); only an explicit off form (0 / false / no / off, any case,
+# surrounding whitespace ignored) disarms it, and every other value (empty, 1, true, junk) leaves it armed.
+# Every case runs a risky action against a companion that can answer, so "on" shows as a held request and
+# "off" as nothing at all.
+deny_roundtrip() { # <label> [VAR=val ...]: a fresh repo + a risky call; the phone denies inside the window
+  local label="$1" repo
+  shift
+  repo="$(mk_repo)"; bash_payload "$repo" "git push origin main" > "$TMPROOT/p.c1"
+  phone_deny "$repo" 0.3
+  run_hook "$repo" "$TMPROOT/p.c1" HMD_PHONE_DENY_WINDOW_S=15 "$@"
+  if [ "$HOOK_RC" = 0 ] && printf '%s' "$HOOK_OUT" | jq -e '
+        (keys == ["hookSpecificOutput"]) and .hookSpecificOutput.hookEventName == "PreToolUse" and
+        .hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1 \
+     && under "$HOOK_S" 8 && [ "$(approvals_json "$repo")" = "[]" ]; then
+    ok "$label (denied in ${HOOK_S}s of a 15s window)"
   else
-    bad "C1b. HMD_PHONE_DENY='$v' armed the hook: rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s approvals=$(names_in "$R1/.heimdall/ui/approvals")"
+    bad "$label -- rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s phone=[$(cat "$TMPROOT/phone.log" 2>/dev/null)]"
+  fi
+}
+deny_roundtrip "C1. HMD_PHONE_DENY unset (the default) -> armed: the risky action is held and the phone's deny blocks it"
+deny_roundtrip "C1a. HMD_PHONE_DENY=1 (explicit on) -> armed, the same as unset" HMD_PHONE_DENY=1
+for v in "" true yes; do
+  deny_roundtrip "C1a. HMD_PHONE_DENY='$v' is not an off form -> still armed" "HMD_PHONE_DENY=$v"
+done
+R1="$(mk_repo)"; bash_payload "$R1" "git push origin main" > "$TMPROOT/p.push"
+R1c="$(mk_repo)"; rm -f "$R1c/.heimdall/app/connect.json"
+run_hook "$R1c" "$TMPROOT/p.push" HMD_PHONE_DENY_WINDOW_S=20
+if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && [ -z "$HOOK_ERR" ] && no_approvals "$R1c" && under "$HOOK_S" "$NOOP_MAX_S"; then
+  ok "C1c. unset + no companion -> exit 0, no output, no request, no hold: default-on costs a session with no phone nothing (${HOOK_S}s)"
+else
+  bad "C1c. the default-on hook did something with no companion: rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s"
+fi
+for v in 0 false no off FALSE No OFF " 0 " " off"; do
+  run_hook "$R1" "$TMPROOT/p.push" "HMD_PHONE_DENY=$v" HMD_PHONE_DENY_WINDOW_S=20
+  if [ "$HOOK_RC" = 0 ] && [ -z "$HOOK_OUT" ] && [ -z "$HOOK_ERR" ] && no_approvals "$R1" && under "$HOOK_S" "$NOOP_MAX_S"; then
+    ok "C1b. HMD_PHONE_DENY='$v' is an explicit off -> exit 0, no output, no request, no hold (${HOOK_S}s of a 20s window)"
+  else
+    bad "C1b. HMD_PHONE_DENY='$v' did not switch the hook off: rc=$HOOK_RC out=[$HOOK_OUT] err=[$HOOK_ERR] ${HOOK_S}s approvals=$(names_in "$R1/.heimdall/ui/approvals")"
   fi
 done
 
@@ -802,10 +827,10 @@ check("C6c. below 1 s is raised to 1 s; above 120 s is cut to 120 s",
       window("0.2") == 1.0 and window("0") == 1.0 and window("-5") == 1.0 and window("9999") == 120.0 and window("120") == 120.0)
 check("C6d. junk, nan and inf fall back to the default, never to 0 or unbounded",
       all(window(v) == 10.0 for v in ("abc", "nan", "inf", "-inf", "1e999", "0x10", "3s")))
-check("C6e. the module is import-safe: nothing ran at import, flag parsing is exact",
-      H.armed({"HMD_PHONE_DENY": "1"}) is True
-      and not any(H.armed({"HMD_PHONE_DENY": v}) for v in ("0", "true", "yes", "", " 1", "1 ", "2"))
-      and H.armed({}) is False)
+check("C6e. the module is import-safe (nothing ran at import) and the flag parse is exact: armed unless one of 0/false/no/off",
+      H.armed({}) is True and H.armed({"HMD_PHONE_DENY": "1"}) is True
+      and all(H.armed({"HMD_PHONE_DENY": v}) is True for v in ("", "1", "true", "yes", "on", "2", "00", "-1", "banana", "o ff"))
+      and not any(H.armed({"HMD_PHONE_DENY": v}) for v in ("0", "false", "no", "off", "FALSE", "False", "No", "OFF", "Off", "oFf", " 0 ", "\toff\n")))
 PYEOF
 
 # C7 -- armed + connected + risky + nobody answers: the window runs out and the hook does NOTHING
@@ -1051,7 +1076,8 @@ else
 fi
 
 # D6 -- the command, run the way Claude Code runs it, against a stand-in script that records how it
-# was launched: flag off or group disabled -> never launched; a crash or a stray exit 2 -> exit 0
+# was launched: HMD_PHONE_DENY=0, no companion state in the project, or the group disabled -> never
+# launched; anything else (unset included: the default is ON) -> launched; a crash or a stray exit 2 -> exit 0
 PLUG="$TMPROOT/plug"
 mkdir -p "$PLUG/bin/lib" "$PLUG/hooks"
 cp "$REPO/bin/lib/hook-enabled.sh" "$PLUG/bin/lib/hook-enabled.sh"
@@ -1072,10 +1098,11 @@ run_group() { # [VAR=val ...] -> GROUP_RC; sets MARK / ARGS / STDIN_COPY files f
   GROUP_RC=$?
 }
 run_group
-if [ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ]; then
-  ok "D6. flag unset -> the hook script is never even launched"
+if [ "$GROUP_RC" = 0 ] && [ -e "$TMPROOT/d6.mark" ] && cmp -s "$TMPROOT/d6.stdin" "$TMPROOT/p.d6" \
+   && [ "$(cat "$TMPROOT/d6.args")" = "--repo $RD" ]; then
+  ok "D6. flag unset (the default is ON) -> launched with the hook payload on stdin, byte for byte, and --repo = the project dir"
 else
-  bad "D6. flag-off group launched the script (rc=$GROUP_RC)"
+  bad "D6. the default-on group did not launch the script: rc=$GROUP_RC mark=$([ -e "$TMPROOT/d6.mark" ] && echo y || echo n) args=[$(cat "$TMPROOT/d6.args" 2>/dev/null)] err=[$(cat "$TMPROOT/d6.err")]"
 fi
 run_group HMD_PHONE_DENY=0
 if [ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ]; then
@@ -1089,6 +1116,27 @@ if [ "$GROUP_RC" = 0 ] && [ -e "$TMPROOT/d6.mark" ] && cmp -s "$TMPROOT/d6.stdin
   ok "D6c. flag on -> launched with the hook payload on stdin, byte for byte, and --repo = the project dir"
 else
   bad "D6c. launch wrong: rc=$GROUP_RC mark=$([ -e "$TMPROOT/d6.mark" ] && echo y || echo n) args=[$(cat "$TMPROOT/d6.args" 2>/dev/null)] err=[$(cat "$TMPROOT/d6.err")]"
+fi
+for v in "" true yes on 2; do
+  run_group "HMD_PHONE_DENY=$v"
+  if [ "$GROUP_RC" = 0 ] && [ -e "$TMPROOT/d6.mark" ]; then
+    ok "D6c2. HMD_PHONE_DENY='$v' (not an off switch) -> launched: the shell gate never suppresses what the script would run"
+  else
+    bad "D6c2. HMD_PHONE_DENY='$v' kept the script from launching (rc=$GROUP_RC)"
+  fi
+done
+RDN="$(mktemp -d "$TMPROOT/nocomp.XXXXXX")"
+run_group CLAUDE_PROJECT_DIR="$RDN"
+if [ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ]; then
+  ok "D6i. no .heimdall/app/connect.json in the project (no phone), flag unset -> never launched: default-on costs a file test and no python"
+else
+  bad "D6i. a project with no companion state launched the script (rc=$GROUP_RC)"
+fi
+run_group CLAUDE_PROJECT_DIR="$RDN" HMD_PHONE_DENY=1
+if [ "$GROUP_RC" = 0 ] && [ ! -e "$TMPROOT/d6.mark" ]; then
+  ok "D6j. ... and the same with HMD_PHONE_DENY=1 -> never launched"
+else
+  bad "D6j. a project with no companion state launched the script with the flag on (rc=$GROUP_RC)"
 fi
 HEIMDALL_HOME="$TMPROOT/d6home" "$HOOKS_TOOL" disable phone-deny >/dev/null 2>&1
 run_group HMD_PHONE_DENY=1 HEIMDALL_HOME="$TMPROOT/d6home"
