@@ -6,9 +6,12 @@ shell command or an outside-the-repo write while hmd holds it for a few seconds;
 anything. A phone only ever REDUCES what runs, and has exactly two verbs for it: `deny` (refuse this
 call) and `stop` (refuse it AND end the turn, like pressing Esc).
 
-OFF BY DEFAULT. The hook does nothing unless HMD_PHONE_DENY=1 (exactly 1), and `heimdall-hooks disable
-phone-deny` switches the whole group off (hooks/hooks.json runs this script only when the flag is set
-and the group is enabled; the script re-checks the flag itself).
+ON BY DEFAULT. Unset, empty or any value that is not an off form leaves the hook armed. HMD_PHONE_DENY=0
+(also false, no, off -- any case, surrounding whitespace ignored) switches it off, and so does
+`heimdall-hooks disable phone-deny`, which switches the whole group off. hooks/hooks.json runs this script
+only when the flag is not 0, the project has a .heimdall/app/connect.json (no companion state, nothing to
+do: a session with no phone pays one file test per tool call and starts no python) and the group is
+enabled; the script re-checks the flag itself, with the full off-form parse.
 
 WHAT IT DOES, when armed, for one PreToolUse call (hook JSON on stdin):
     1. Not an attended session (an hmd sub-session, headless claude -p)   -> nothing.
@@ -46,7 +49,7 @@ moment is the separate remote-controls interrupt work (hmdapp docs/HANDOFF-TO-HE
 H4). Not verified here: what `continue:false` does when the call came from inside a sub-agent (H8 spike).
 
 Usage:  heimdall-phone-deny [--repo DIR] < hook.json        (-h / --help prints this)
-Env:    HMD_PHONE_DENY=1            arm the hook
+Env:    HMD_PHONE_DENY=0            switch the hook off (default: on; also false, no, off)
         HMD_PHONE_DENY_WINDOW_S=N   how long a risky action is held (seconds)
 """
 import json
@@ -62,6 +65,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 LIB_DIR = os.path.join(HERE, "lib")
 
 FLAG_ENV = "HMD_PHONE_DENY"
+OFF_VALUES = frozenset(("0", "false", "no", "off"))
 WINDOW_ENV = "HMD_PHONE_DENY_WINDOW_S"
 DEFAULT_WINDOW_S = 10.0
 MIN_WINDOW_S = 1.0
@@ -78,7 +82,9 @@ STOP_REASON = "Stopped from the paired phone (hmd phone-deny)."
 
 
 def armed(env):
-    return env.get(FLAG_ENV) == "1"
+    """On unless the operator switched the hook off: unset, empty or any value that is not one of OFF_VALUES
+    (case and surrounding whitespace ignored) leaves it armed, so a typo can never silently disable it."""
+    return env.get(FLAG_ENV, "").strip().lower() not in OFF_VALUES
 
 
 def window_seconds(env):
