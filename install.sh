@@ -16,7 +16,7 @@
 #   - pinned to a release ref (HEIMDALL_REF) — what you read is what runs
 #   - idempotent: re-run upgrades cleanly, never errors "already exists"
 #   - reversible: `hmd uninstall` removes everything, touches nothing else
-#   - Gates run 100% locally. Your code never leaves your machine.
+#   - Gates run 100% locally. Your code never leaves your machine unless you pair a phone with hmd app connect.
 #   - the ONLY thing this installer emits is LOCAL, on-machine step telemetry you
 #     fully control (never a network phone-home) — every field is in DATA.md, and
 #     it is off-by-default-capable (HEIMDALL_TELEMETRY=off / hmd telemetry off)
