@@ -22,9 +22,20 @@ compatibility_date = "2026-08-22"
 #                          distinct from RELAY_SIGNING_SECRET.
 # local dev: relay/.dev.vars (gitignored) carries the two secrets. vitest: injected via
 # vitest.config.ts's miniflare bindings (test-only placeholders, and a fake GitHub).
+#
+# GitHub sign-in through the browser (README.md, "GitHub sign-in through the browser") adds four
+# routes under /identity/github/oauth. They exist only when the three values above are all set AND
+# this switch is exactly the string "1"; any other value, "0" included, leaves them answering the
+# Worker's 404 as if they were never there:
+#   GITHUB_OAUTH_WEB       [vars] below, and again in [env.canary.vars]: each Worker has its own
+#                          switch. Shipped "0" on purpose. Flip a Worker to "1" only after the
+#                          GitHub App's Callback URL for THAT Worker is registered
+#                          (<origin>/identity/github/oauth/callback), or the app would offer a
+#                          browser sign-in that fails at GitHub. No new secret is needed.
 
 [vars]
 GITHUB_CLIENT_ID = "Iv23liawqpKieqqpgIPj"
+GITHUB_OAUTH_WEB = "0"
 
 [[durable_objects.bindings]]
 name = "SESSION"
@@ -52,5 +63,7 @@ class_name = "SessionDO"
 
 # `vars` is not inherited into an environment either, so the canary restates the public client id:
 # the same GitHub App as production. Its two secrets are its own (`wrangler secret put ... --env canary`).
+# It restates GITHUB_OAUTH_WEB too, for the same reason; the two Workers' switches are independent.
 [env.canary.vars]
 GITHUB_CLIENT_ID = "Iv23liawqpKieqqpgIPj"
+GITHUB_OAUTH_WEB = "0"

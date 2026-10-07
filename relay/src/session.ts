@@ -148,6 +148,11 @@ const BUCKET_KEY = "bucket_attempts";
  *  holding it is an index, not a session and not a bucket; `alarm` tells them apart by it. */
 const CODE_INDEX_KEY = "code_index";
 
+/** Storage key of the one record an `oauth-state:<relay_state>` or `oauth-handoff:<hc>` instance
+ *  holds (GitHub sign-in through the browser, src/github-oauth.ts). Such an instance is neither
+ *  a session, an index nor a bucket, and `alarm` tells it apart by this key too. */
+const OAUTH_RECORD_KEY = "oauth_record";
+
 /** Storage key of the session's one `key_reveal` envelope (INV-44): the frame a phone that
  *  reconnects is replayed first. */
 const KEY_REVEAL_KEY = "key_reveal";
@@ -494,6 +499,12 @@ export class SessionDO {
         return this.handleIndexResolve(request);
       case "/index-revoke":
         return this.handleIndexRevoke();
+      // GitHub sign-in through the browser: internal like the rest of this block, and for the
+      // same reason out of PUBLIC_SESSION_SUBPATHS.
+      case "/oauth-put":
+        return this.handleOauthPut(request);
+      case "/oauth-take":
+        return this.handleOauthTake();
       default:
         return jsonResponse(404, { error: "not found" });
     }
@@ -1816,6 +1827,44 @@ export class SessionDO {
     return released ? jsonResponse(200, released) : noWindow();
   }
 
+  // -- the record role: an `oauth-state:<relay_state>` / `oauth-handoff:<hc>` instance (src/github-oauth.ts) --
+  //
+  // One record, single use, named by the instance. The Worker owns what is in it and validates
+  // every field; this class only keeps it, and only knows `exp`, in epoch seconds, because the
+  // alarm and the read both need it.
+
+  /** Internal: stores the record and arms the alarm that reclaims it, `exp` plus the usual grace.
+   *  Refuses a body without a numeric `exp`: the one thing this instance cannot do without. */
+  private async handleOauthPut(request: Request): Promise<Response> {
+    const record = await this.internalBody(request);
+    const exp = record?.exp;
+    if (record === null || typeof exp !== "number" || !Number.isFinite(exp)) {
+      return jsonResponse(400, { error: "invalid oauth record" });
+    }
+    await this.ctx.storage.put(OAUTH_RECORD_KEY, record);
+    await this.armPurgeAlarm(exp * 1000 + PURGE_GRACE_MS);
+    return jsonResponse(200, { ok: true });
+  }
+
+  /**
+   * Internal: the record, once. It is read and deleted in this one request with only storage
+   * awaits between -- no network call, no other Durable Object -- so two takes racing for one
+   * record cannot both get it: the property both records' single use rests on. It is consumed
+   * whatever the caller then does with it, and an aged-out one is deleted and refused all the
+   * same: `exp` is checked here on every read, never left to the alarm. A miss answers 404 and
+   * writes nothing, so an instance named by a guess stays empty.
+   */
+  private async handleOauthTake(): Promise<Response> {
+    const record = await this.ctx.storage.get<Record<string, unknown>>(OAUTH_RECORD_KEY);
+    if (record === undefined) return jsonResponse(404, { error: "no such record" });
+    await this.ctx.storage.deleteAll();
+    await this.ctx.storage.deleteAlarm();
+    if (typeof record.exp !== "number" || record.exp * 1000 <= Date.now()) {
+      return jsonResponse(404, { error: "no such record" });
+    }
+    return jsonResponse(200, record);
+  }
+
   /** An internal call's JSON body as an object, or null: these callers are this relay's own
    *  Worker and instances, but a body that is not what they send is refused like any other. */
   private async internalBody(request: Request): Promise<Record<string, unknown> | null> {
@@ -2035,6 +2084,17 @@ export class SessionDO {
       // nobody bound ended as a bare EOF followed by a 404 — see endHmdStream.
       this.endHmdStream(record.session_id, purgeEndReason(record.status));
     } else {
+      // An `oauth-state:` / `oauth-handoff:` instance: one record and nothing else. It goes once
+      // its `exp` and the grace have passed; an alarm that fires before that (the platform may run
+      // one early, and a test does) only re-arms, so a record that is still good is never reclaimed.
+      const oauth = await this.ctx.storage.get<{ exp?: unknown }>(OAUTH_RECORD_KEY);
+      if (oauth !== undefined) {
+        const deadline = typeof oauth.exp === "number" ? oauth.exp * 1000 + PURGE_GRACE_MS : 0;
+        if (now < deadline) {
+          await this.armPurgeAlarm(deadline);
+          return;
+        }
+      }
       // A `code-index:<gh_id>` instance: not a session, but not a throttle bucket either, and
       // it must not be wiped while it still holds an open window, a lockout or a revoke. What
       // has lapsed goes; the rest stays, with the alarm set for when it too is of no use.

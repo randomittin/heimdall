@@ -101,8 +101,16 @@ export const covered = new Set<string>();
 
 /** An actual value against a contract template. A `$binding` that is live is compared to the
  *  live value, otherwise to its pattern; every other leaf is equal, and objects have exactly
- *  the template's keys -- an extra or a missing field is a contract change. */
-export function expectMatch(actual: unknown, template: Json, live: Live, path: string): void {
+ *  the template's keys -- an extra or a missing field is a contract change. `bindings` is the
+ *  binding table of the contract file the template came from: code-pair.json's unless a spec
+ *  for another contract file (github-oauth.json) passes its own. */
+export function expectMatch(
+  actual: unknown,
+  template: Json,
+  live: Live,
+  path: string,
+  bindings: Contract["bindings"] = contract.bindings
+): void {
   if (typeof template === "string") {
     const whole = /^\$([a-z_0-9]+)$/.exec(template);
     if (!whole) {
@@ -114,7 +122,7 @@ export function expectMatch(actual: unknown, template: Json, live: Live, path: s
       expect(actual, `${path} ($${name})`).toEqual(live[name]);
       return;
     }
-    const binding = contract.bindings[name];
+    const binding = bindings[name];
     if (!binding) throw new Error(`the contract names an unbound $${name}`);
     if (binding.type === "integer") expect(Number.isInteger(actual), `${path} ($${name}) is an integer`).toBe(true);
     if (binding.match !== undefined) {
@@ -127,14 +135,14 @@ export function expectMatch(actual: unknown, template: Json, live: Live, path: s
   if (Array.isArray(template)) {
     expect(Array.isArray(actual), path).toBe(true);
     expect((actual as unknown[]).length, `${path} length`).toBe(template.length);
-    template.forEach((item, i) => expectMatch((actual as unknown[])[i], item, live, `${path}[${i}]`));
+    template.forEach((item, i) => expectMatch((actual as unknown[])[i], item, live, `${path}[${i}]`, bindings));
     return;
   }
   if (template !== null && typeof template === "object") {
     expect(typeof actual === "object" && actual !== null && !Array.isArray(actual), `${path} is an object`).toBe(true);
     const got = actual as Record<string, unknown>;
     expect(Object.keys(got).sort(), `${path} keys`).toEqual(Object.keys(template).sort());
-    for (const [key, item] of Object.entries(template)) expectMatch(got[key], item, live, `${path}.${key}`);
+    for (const [key, item] of Object.entries(template)) expectMatch(got[key], item, live, `${path}.${key}`, bindings);
     return;
   }
   expect(actual, path).toBe(template);

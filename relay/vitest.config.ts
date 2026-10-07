@@ -51,6 +51,14 @@ export default defineConfig({
           // answers it itself (test/code-pair-helpers.ts's FakeGitHub), so no test ever
           // reaches the real api.github.com. Production and local dev bind nothing.
           GITHUB_API_BASE: "https://github-api.test",
+          // The same seam for GitHub's web origin (src/github.ts's githubWebOrigin): the authorize
+          // redirect and the token exchange of the browser sign-in go here, and the suite answers
+          // it itself (test/github-oauth-helpers.ts's FakeGitHubWeb). Production binds nothing.
+          GITHUB_WEB_BASE: "https://github-web.test",
+          // The browser sign-in's own switch (src/github-oauth.ts's oauthWebConfig), on for the
+          // suite so its four routes exist. wrangler.toml ships it "0": the specs that need it off
+          // hand the Worker an env of their own, as the config-gate block of code-pair.spec.ts does.
+          GITHUB_OAUTH_WEB: "1",
         },
       },
     }),

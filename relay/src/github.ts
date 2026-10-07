@@ -20,12 +20,31 @@
 //    the user. The token is then deleted at GitHub (single use by construction, INV-39).
 //  - the laptop's is whatever `gh auth token` prints, issued to GitHub CLI, so only `GET /user`
 //    applies. One read, no more.
+//
+// The browser sign-in (src/github-oauth.ts) adds one call and no third kind: the authorization
+// code is exchanged for a token (`exchangeAuthorizationCode`) -- the one call that goes to
+// GitHub's web origin, and the only one that carries the client secret in a body -- and that
+// token is then the phone's kind: checked and deleted by `consumePhoneToken`, unchanged.
 
 import { MAX_GH_LOGIN_LENGTH } from "./pairing";
 import { logEvent } from "./logging";
 import type { Env } from "./types";
 
 const GITHUB_API_ORIGIN = "https://api.github.com";
+const GITHUB_WEB_ORIGIN = "https://github.com";
+
+/** The origin of GitHub's web side -- the authorize page and the token endpoint -- or the
+ *  test seam `GITHUB_WEB_BASE`, without a trailing slash. */
+export function githubWebOrigin(env: Env): string {
+  return (env.GITHUB_WEB_BASE || GITHUB_WEB_ORIGIN).replace(/\/+$/, "");
+}
+
+/** 1..255 visible ASCII characters: the shape every GitHub token has. A value outside it
+ *  cannot be one, and is refused without being sent upstream -- an `Authorization` header
+ *  built from a newline or a control character is a request-smuggling shape, not a token. */
+export function isPlausibleGithubToken(value: unknown): value is string {
+  return typeof value === "string" && /^[\x21-\x7e]{1,255}$/.test(value);
+}
 
 /** How long any one GitHub call may take before the relay stops waiting for it. */
 export const GITHUB_TIMEOUT_MS = 5000;
@@ -47,8 +66,8 @@ const UNAVAILABLE: GithubVerdict = { ok: false, reason: "unavailable" };
 
 type RawAnswer = { failed: false; status: number; body: unknown } | { failed: true };
 
-/** Which of the three calls, as the log names it. */
-type CallName = "user" | "check" | "delete";
+/** Which of the calls, as the log names it. */
+type CallName = "user" | "check" | "delete" | "exchange";
 
 /** `logEvent` wants a session id; a GitHub call belongs to no session. */
 function logGithubError(call: CallName, kind: string, status?: number): void {
@@ -65,13 +84,15 @@ async function githubFetch(
   path: string,
   init: { method: string; headers: Record<string, string>; body?: string }
 ): Promise<RawAnswer> {
-  const origin = (env.GITHUB_API_BASE || GITHUB_API_ORIGIN).replace(/\/+$/, "");
+  // The code exchange is the one call that is not to the API: it goes to GitHub's web origin, and
+  // asks for JSON itself (its own `Accept`), since that endpoint answers form-encoded by default.
+  const toWeb = call === "exchange";
+  const origin = toWeb ? githubWebOrigin(env) : (env.GITHUB_API_BASE || GITHUB_API_ORIGIN).replace(/\/+$/, "");
   try {
     const response = await fetch(`${origin}${path}`, {
       method: init.method,
       headers: {
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
+        ...(toWeb ? {} : { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" }),
         "User-Agent": "hmd-relay",
         ...init.headers,
       },
@@ -200,4 +221,69 @@ export async function consumePhoneToken(
     return UNAVAILABLE;
   }
   return { ok: true, user };
+}
+
+export type ExchangeVerdict =
+  | { ok: true; accessToken: string }
+  | { ok: false; reason: "invalid_grant" | "unavailable" };
+
+const EXCHANGE_UNAVAILABLE: ExchangeVerdict = { ok: false, reason: "unavailable" };
+
+/** What a GitHub `error` code of the exchange is called in the log. A closed set, like
+ *  session.ts's `loggableSender`: GitHub's own text is never what gets written, only one of
+ *  these words -- the two that tell an operator which half of the rollout is wrong (the client
+ *  secret, or a Callback URL that is not registered) and `error` for everything else. */
+function exchangeErrorKind(error: unknown): string {
+  if (error === "incorrect_client_credentials") return "client_credentials";
+  if (error === "redirect_uri_mismatch") return "redirect_uri";
+  return "error";
+}
+
+/**
+ * The browser sign-in's authorization code, exchanged for the person's access token:
+ * `POST <web origin>/login/oauth/access_token`, a JSON body with the client id, the client
+ * secret, the code and the same `redirect_uri` the authorize leg used. GitHub answers HTTP 200
+ * with an `error` field for a code it will not take, so the body is read before the status
+ * means anything more than "this is an answer":
+ *  - `bad_verification_code` is the one verdict about the CODE (expired, used, never issued):
+ *    `invalid_grant`, which the caller answers as a bad request;
+ *  - every other `error`, a status that is not 200, a timeout, a dropped connection, and a body
+ *    that is not the documented `{access_token, token_type: "bearer"}` is GitHub being unable
+ *    to say, and is `unavailable` with a `github_error` line (call `exchange`, a kind, a status).
+ * The token is returned to be checked and deleted (`consumePhoneToken`) and goes nowhere else:
+ * a `refresh_token` beside it, which a GitHub App with expiring user tokens sends, is never read.
+ */
+export async function exchangeAuthorizationCode(
+  env: Env,
+  clientId: string,
+  clientSecret: string,
+  code: string,
+  redirectUri: string
+): Promise<ExchangeVerdict> {
+  const answer = await githubFetch(env, "exchange", "/login/oauth/access_token", {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri }),
+  });
+  if (answer.failed) return EXCHANGE_UNAVAILABLE;
+  if (answer.status !== 200) {
+    logGithubError("exchange", "status", answer.status);
+    return EXCHANGE_UNAVAILABLE;
+  }
+  const body = typeof answer.body === "object" && answer.body !== null ? (answer.body as Record<string, unknown>) : null;
+  if (!body) {
+    logGithubError("exchange", "bad_body", answer.status);
+    return EXCHANGE_UNAVAILABLE;
+  }
+  if ("error" in body) {
+    if (body.error === "bad_verification_code") return { ok: false, reason: "invalid_grant" };
+    logGithubError("exchange", exchangeErrorKind(body.error), answer.status);
+    return EXCHANGE_UNAVAILABLE;
+  }
+  const { access_token: accessToken, token_type: tokenType } = body;
+  if (!isPlausibleGithubToken(accessToken) || typeof tokenType !== "string" || tokenType.toLowerCase() !== "bearer") {
+    logGithubError("exchange", "bad_body", answer.status);
+    return EXCHANGE_UNAVAILABLE;
+  }
+  return { ok: true, accessToken };
 }
