@@ -131,7 +131,7 @@ T0=$(now_ms); T1=$({ runheal bash "$HEAL" check >/dev/null; now_ms >&9; } 9>&1)
 # the barrier's own proof: had it returned early, the repair would still be running here
 grep -q 'self-heal complete' "$LOG" 2>/dev/null \
   && ok "drain: the detached repair had exited before the next scenario began" \
-  || bad "drain: returned while the repair was still running — it would leak into the next scenario"
+  || bad "drain: returned while the repair was still running (does the product still hand fd 9 to its detached repair?) — it would leak into the next scenario"
 
 # ── 8-12) THE OBSOLETE UPDATE-FAILURE RECORD ────────────────────────────────────
 # Claude writes .last-update-result.json only when it ATTEMPTS an install. A transient
