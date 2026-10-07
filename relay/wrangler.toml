@@ -35,7 +35,7 @@ compatibility_date = "2026-08-22"
 
 [vars]
 GITHUB_CLIENT_ID = "Iv23liawqpKieqqpgIPj"
-GITHUB_OAUTH_WEB = "0"
+GITHUB_OAUTH_WEB = "1"
 
 [[durable_objects.bindings]]
 name = "SESSION"
