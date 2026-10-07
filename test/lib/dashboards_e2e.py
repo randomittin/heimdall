@@ -7,7 +7,7 @@
       --> needs-confirm: the six digits ride the sealed state frame to the phone
       --> `hmd dash confirm` on a pty, the code typed at the prompt (without a terminal, or with a wrong code, it refuses)
       --> the producer runs against a temp sqlite connector --> the sealed state frame carries the panel data
-    plus: a stream rebind of the same phone keeps its dash-v1 with no new resync and another device's device_bound forgets it; a phone that
+    plus: a stream rebind of the same phone keeps its dash-v1 with no new resync and another device's refused device_bound leaves it alone; a phone that
     never listed dash-v1 sees no state.dashboards and cannot ask; the switch off ends the loop and refuses requests; the switch on starts it
     again; the client's own shutdown takes the loop with it.
 
@@ -195,16 +195,17 @@ def tile_file():
 
 
 def relist(p):
-    """What the app does after a (re)bind: list dash-v1 again. The client keeps the caps of a same-device rebind (3d) and forgets another
-    device's (3e), so this changes nothing unless they were forgotten."""
+    """What the app does after a (re)bind: list dash-v1 again. The client keeps the caps across a same-device rebind (3d) and a refused
+    foreign one (3e), so this changes nothing unless they were forgotten."""
     p.resync(DASH_CAPS)
 
 
-def bound_events(st):
-    """How many device_bound events the client has printed: the bind itself, plus one for every repeat the relay sent."""
+def count_events(st, needle):
+    """How many lines of the client's own event stream hold `needle`: a device_bound event (the bind itself, plus one for every repeat the
+    relay sent) or the error a refused foreign bind prints."""
     try:
         with open(st.out, encoding="utf-8", errors="replace") as f:
-            return sum(1 for line in f if '"device_bound"' in line)
+            return sum(1 for line in f if needle in line)
     except OSError:
         return 0
 
@@ -296,9 +297,9 @@ def run(st):
 
     # 3d. a stream rebind: the relay's device_bound again with the paired phone's own key. What the phone listed is still held, so
     # state.dashboards keeps riding with no new resync from the phone
-    bound_before, before = bound_events(st), p.mark()
+    bound_before, before = count_events(st, '"device_bound"'), p.mark()
     p.rebind()
-    rebound = wait_until(lambda: bound_events(st) > bound_before, 20)
+    rebound = wait_until(lambda: count_events(st, '"device_bound"') > bound_before, 20)
     lost = p.state(lambda s: "dashboards" not in s, since=before, timeout=4)
     p.pull()
     states = [fr for fr in p.frames[before:] if fr["type"] == "state"]
@@ -306,15 +307,22 @@ def run(st):
           "3d. a same-device device_bound (a stream rebind) keeps the phone's dash-v1: every state frame after it still carries state.dashboards, with no new resync",
           (rebound, [sorted(fr["body"]["state"])[:4] for fr in states][-2:]))
 
-    # 3e. another device's device_bound is refused by the latch and nothing the paired phone listed is kept for it: its next frame has no
-    # dashboards key; 3f. the paired phone lists dash-v1 again and has them back
-    before = p.mark()
+    # 3e. another device's device_bound is refused by the latch, and a frame that binds no one takes nothing from the paired phone: its
+    # dash-v1 stays, so a stray or hostile frame cannot strip its slices
+    refused_before, before = count_events(st, "differs from the already latched"), p.mark()
     p.rebind(other=True)
-    f = p.state(lambda s: "dashboards" not in s, since=before, timeout=15)
-    check(f is not None, "3e. a device_bound for ANOTHER device makes the client forget the phone's caps: its next state frame has no dashboards key")
-    _ack, before = p.resync(DASH_CAPS)
+    refused = wait_until(lambda: count_events(st, "differs from the already latched") > refused_before, 20)
+    lost = p.state(lambda s: "dashboards" not in s, since=before, timeout=4)
+    p.pull()
+    states = [fr for fr in p.frames[before:] if fr["type"] == "state"]
+    check(refused and lost is None and all("dashboards" in fr["body"]["state"] for fr in states),
+          "3e. a device_bound for ANOTHER device is refused and the paired phone keeps its dash-v1: no state frame after it lacks state.dashboards",
+          (refused, [sorted(fr["body"]["state"])[:4] for fr in states][-2:]))
+    # 3f. the latch held: the paired phone's own next command is still heard
+    ack, before = p.resync(DASH_CAPS)
     f = p.state(lambda s: "dashboards" in s, since=before, timeout=20)
-    check(f is not None, "3f. the paired phone lists dash-v1 again and state.dashboards is back")
+    check(ack is not None and ack.get("ok") is True and f is not None,
+          "3f. the paired phone is unaffected: its next sealed command is acked ok and state.dashboards is still there", ack)
     if os.environ.get("DASH_E2E_STOP_AFTER") == "3f":    # the wrapper's mutants of 3d / 3e
         return
 
