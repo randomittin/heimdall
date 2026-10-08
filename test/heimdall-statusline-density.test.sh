@@ -46,6 +46,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 SL="$ROOT/sentinels/hmd-statusline.py"
 GOLD="$ROOT/conformance/statusline/goldens/density"
 SEED=rj
+CODE_SEED=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff   # the session-code seed planted in each render's HOME
 REGEN=0; [ "${1:-}" = "--regen" ] && REGEN=1
 
 pass=0; fail=0
