@@ -141,7 +141,7 @@ export interface KeepalivePayload {
  * `reason` in a `session_ended` frame written down that stream (INV-38).
  * hmd's client logs it verbatim and stops, so each value names what an
  * operator should do next:
- * - `pairing-expired` — the ~60s pairing window lapsed with no phone bound;
+ * - `pairing-expired` — the ~6 minute pairing window lapsed with no phone bound;
  *   run `hmd app connect` again for a fresh code.
  * - `claim-throttled` — more than 10 claim attempts in 60s ended the session
  *   (INV-4).

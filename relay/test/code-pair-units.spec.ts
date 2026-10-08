@@ -13,6 +13,7 @@ import {
   GH_ASSERTION_TTL_S,
   mintDeviceToken,
   mintGhAssertion,
+  PAIRING_CODE_TTL_S,
   verifyDeviceToken,
   verifyGhAssertion,
   verifyInstallSignature,
@@ -56,6 +57,12 @@ async function signRaw(secret: string, payload: string): Promise<string> {
 
 const encodeClaims = (body: unknown): string =>
   base64UrlEncode(new TextEncoder().encode(JSON.stringify(body)));
+
+describe("the pairing window (contract constants.pair_window_s)", () => {
+  it("is the length relay/contract/code-pair.json names", () => {
+    expect(PAIRING_CODE_TTL_S).toBe(contractJson.constants.pair_window_s);
+  });
+});
 
 describe("mintGhAssertion / verifyGhAssertion", () => {
   it("uses the device_token construction: base64url(claims).base64url(HMAC-SHA256(secret, payload))", async () => {

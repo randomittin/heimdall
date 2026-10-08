@@ -47,7 +47,20 @@ export function base64UrlDecode(value: string): Uint8Array {
   return bytes;
 }
 
-export const PAIRING_CODE_TTL_S = 60;
+/**
+ * How long a pairing code stays claimable after `/pair/init` — and with it any session code
+ * registered against that session, which lives exactly as long as the session's window
+ * (relay/contract/code-pair.json `pair_window_s`). hmd keeps a session code offered by running
+ * `/pair/init` again and re-registering it, about every 5 minutes; each registration sends the
+ * laptop's GitHub token, so the interval is kept long and the window made to outlast it (360 s),
+ * rather than the other way round: a window shorter than the interval leaves the code unclaimable
+ * between renewals. The purge lands `PURGE_GRACE_MS` after the window closes (src/session.ts), so
+ * an unclaimed session lives 7 minutes.
+ *
+ * Not a client's to set. `/pair/init` builds the Durable Object's init body itself (src/worker.ts)
+ * and `init` is outside the Worker's public sub-paths, so no request can lengthen this.
+ */
+export const PAIRING_CODE_TTL_S = 360;
 export const MAX_CLAIM_ATTEMPTS = 10;
 export const CLAIM_WINDOW_MS = 60_000;
 export const CLAIM_THROTTLE_RETRY_AFTER_S = 60;

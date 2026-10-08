@@ -4,9 +4,10 @@
 // bound" — then its reconnect met `404` and the client gave up with
 // `session_ended: stream-404`. Seen twice (14:23 and 18:12 IST). The client's
 // own event log timestamps both: the stream closed 120.0 s and 120.1 s after
-// `/pair/init`, i.e. `pair_exp` (60 s) plus `PURGE_GRACE_MS` (60 s) — the
+// `/pair/init`, i.e. `pair_exp` (60 s then) plus `PURGE_GRACE_MS` (60 s) — the
 // storage-reclamation alarm — not early, and not inside the pairing window.
-// The relay did what it was built to do. It just never said why.
+// The relay did what it was built to do. It just never said why. (The window is
+// 360 s now, `PAIRING_CODE_TTL_S`, so the same purge lands 420 s after init.)
 //
 // What these tests pin:
 // - inside the pairing window nothing ends an unclaimed session or touches
@@ -164,6 +165,33 @@ function storedRecord(sessionId: string): Promise<StoredRecord | undefined> {
     state.storage.get<StoredRecord>("state")
   );
 }
+
+// A session code is registered against a session, and lives exactly as long as that session's
+// pairing window. A laptop that keeps its code offered re-runs /pair/init and re-registers it
+// every 5 minutes, so the window a real /pair/init grants has to outlast that: at 60 s the code
+// was claimable for one minute in every five.
+describe("the pairing window a real /pair/init grants", () => {
+  it("is 360 s, so a client that re-registers every 5 minutes never has its code lapse first", async () => {
+    const beforeS = Math.floor(Date.now() / 1000);
+    const init = await pairInit();
+    const afterS = Math.floor(Date.now() / 1000);
+
+    expect(init.exp).toBeGreaterThanOrEqual(beforeS + 360);
+    expect(init.exp).toBeLessThanOrEqual(afterS + 360);
+  });
+
+  it("is the relay's own to set: a pairing_ttl_s in the public request body is never read", async () => {
+    const res = await SELF.fetch(`${BASE}/pair/init`, {
+      method: "POST",
+      headers: { "CF-Connecting-IP": crypto.randomUUID(), "content-type": "application/json" },
+      body: JSON.stringify({ pairing_ttl_s: 86_400 }),
+    });
+    const afterS = Math.floor(Date.now() / 1000);
+
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as PairInitBody).exp).toBeLessThanOrEqual(afterS + 360);
+  });
+});
 
 describe("an unclaimed session inside its pairing window", () => {
   it("is not ended, announced or purged by an alarm that fires before the window closes", async () => {

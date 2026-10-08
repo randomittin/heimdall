@@ -23,7 +23,7 @@ Durable Object per `session_id` (the single serialization point for that session
 - **phone leg** (WebSocket): `wss://.../session/:id/ws?pairing_code=<code>` for the first claim,
   or `?device_token=<token>` to reconnect after binding.
 - **pairing**: `POST /pair/init` (unauthenticated) creates a session and returns a session id, a
-  single-use ~60s pairing code, and the hmd-side bearer token.
+  single-use pairing code (claimable for 6 minutes), and the hmd-side bearer token.
 - **health**: `GET /health` (unauthenticated; `HEAD` too) answers `200 {"ok":true,"version":"<build>"}`
   from the Worker alone — it never reaches a Durable Object — and is what the deploy pipeline's
   canary check polls. `version` is `BUILD_ID`, the commit sha the pipeline injects with `wrangler
@@ -142,7 +142,9 @@ Response `200`:
   "exp": 1234567890
 }
 ```
-(`exp` = unix-seconds pairing code expiry, ~60s out.)
+(`exp` = unix-seconds pairing code expiry, 360s out: `PAIRING_CODE_TTL_S`, `src/pairing.ts`. The
+relay's own figure — nothing in the request can change it. It is longer than the ~5 minutes at which
+hmd re-registers a session code, so that code is never unclaimable between renewals.)
 
 ### `GET /session/:id/stream` — hmd leg, requires `Authorization: Bearer <relay_session_token>`
 
@@ -554,7 +556,7 @@ trusting whenever the alarm happened to be set:
 
 | Session state | Reclaimed at |
 |---|---|
-| `pending`, unclaimed | `pair_exp` + 60s grace (i.e. ~2 minutes after `/pair/init`) |
+| `pending`, unclaimed | `pair_exp` + 60s grace (i.e. ~7 minutes after `/pair/init`) |
 | `bound` | the `device_token`'s `exp` + 60s grace — 30 days, the last moment it could reconnect |
 | `ended` (revoked, expired, or claim-throttled) | 5 minutes after it ended |
 | `/pair/init` throttle bucket | one window + grace after the IP's last request |
@@ -569,8 +571,8 @@ lapsed, hmd re-reading a just-revoked session — meets a truthful `410`/`401` i
 hmd's stream — after first telling hmd why, below — then `deleteAll()`s; it logs `session_purged`
 with the `session_id` and status.
 
-An unclaimed session therefore lives ~2 minutes: nothing ends it on a timer before its pairing
-window (60 s) closes, and the purge lands 60 s after that. That second minute is invisible to the
+An unclaimed session therefore lives ~7 minutes: nothing ends it on a timer before its pairing
+window (360 s) closes, and the purge lands 60 s after that. That last minute is invisible to the
 phone (a claim after the window is `410`), but it is what hmd's client sees as the end of a
 `connect` nobody scanned in time.
 
@@ -585,7 +587,7 @@ plaintext control frame, then closes the stream:
 
 | `payload.reason` | When |
 |---|---|
-| `pairing-expired` | the ~60 s pairing window lapsed with no phone bound — at the purge, or when a late claim finds it so. Re-run `hmd app connect` for a fresh code |
+| `pairing-expired` | the ~6 min pairing window lapsed with no phone bound — at the purge, or when a late claim finds it so. Re-run `hmd app connect` for a fresh code |
 | `claim-throttled` | more than 10 claim attempts in 60 s ended the session (INV-4) |
 | `expired` | a bound session's `device_token` lapsed and storage was reclaimed |
 | `ended` | an already-ended session was reclaimed with a stream still attached |
@@ -600,7 +602,8 @@ and the reconnect meets `404`. Each announcement is logged as `session_end_annou
 Before this, the same end was a bare EOF followed by `404`, which hmd's client logged as "stream
 closed by relay with no local cause … likely the relay's own stream-lifetime bound" and
 `session_ended: stream-404`. That is the 2026-10-02 field bug: two `connect`s whose QR no phone
-bound, both ended by this purge, at 120.0 s and 120.1 s after `/pair/init`.
+bound, both ended by this purge, at 120.0 s and 120.1 s after `/pair/init` (the pairing window was
+60 s then; at 360 s the same purge lands 420 s after).
 
 #### Verifying a deploy
 
@@ -608,7 +611,8 @@ bound, both ended by this purge, at 120.0 s and 120.1 s after `/pair/init`.
 node relay/scripts/pairing-expiry-probe.mjs --relay https://<worker>
 ```
 
-Plays hmd for one throwaway session no phone claims and holds its stream ~2.5 minutes. Exit `0`:
+Plays hmd for one throwaway session no phone claims and holds its stream 7.5 minutes (the purge lands
+420 s after init: the 360 s pairing window plus 60 s grace). Exit `0`:
 the relay announced a reason before the stream ended. `1`: bare EOF — a relay that predates
 INV-38. `3`: still open at `--hold-s`. Prints timings, statuses and frame types only, never a
 token, a code or a URL.

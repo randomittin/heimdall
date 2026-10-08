@@ -849,7 +849,7 @@ export class SessionDO {
    * subpaths it will ever forward here (a public `POST /session/:id/init`
    * now gets a 404 from worker.ts before this Durable Object is even
    * touched). Accepts an optional `pairing_ttl_s` override — production
-   * callers never set it (default 60s applies); tests use it to construct an
+   * callers never set it (PAIRING_CODE_TTL_S applies); tests use it to construct an
    * already-expired session deterministically, without waiting or mocking
    * the clock. */
   private async handleInit(request: Request): Promise<Response> {
