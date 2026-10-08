@@ -46,6 +46,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 SL="$ROOT/sentinels/hmd-statusline.py"
 GOLD="$ROOT/conformance/statusline/goldens/density"
 SEED=rj
+CODE_SEED=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff   # the session-code seed planted in each render's HOME
 REGEN=0; [ "${1:-}" = "--regen" ] && REGEN=1
 
 pass=0; fail=0
@@ -66,6 +67,11 @@ render_case() {
   tier="$1"; color="$2"; cols="$(cols_for "$tier")"
   WS="$(mktemp -d)"; HOMED="$(mktemp -d)"; TMPD="$(mktemp -d)"
   mkdir -p "$WS/.heimdall"
+  # The Row1 session code is keyed by the machine's session-code seed, which a render only READS (a render writes
+  # nothing). The throwaway HOME gets a FIXED one, so the code -- and therefore every golden -- is the same on any
+  # machine, and the goldens keep covering the code's segment. No seed would mean no code on Row1 at all.
+  mkdir -p "$HOMED/.heimdall" && chmod 700 "$HOMED/.heimdall"
+  printf '%s\n' "$CODE_SEED" > "$HOMED/.heimdall/session-code.key" && chmod 600 "$HOMED/.heimdall/session-code.key"
   printf '{"handle":"rj","seed":"rj","created":0}\n' > "$WS/.heimdall/identity.json"
   # Row3 gate verdict via the legacy single-verdict file (read by hmd_ledger).
   printf '{"verdict":"pass","passed":3,"total":3}\n' > "$WS/.heimdall/statusline.json"

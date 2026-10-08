@@ -60,6 +60,11 @@ hex characters is never replaced and never guessed around: there is no code
 (session_code_for raises ValueError) and every reader degrades to "no code" --
 the QR still pairs. A code is also unpredictable only up to its 25 bits: what
 stops a guess is the relay (one GitHub identity, a throttle, a lockout), not this.
+The seed is MADE by whatever first needs a code to register or serve -- the
+SessionStart hook's record_session, `hmd ui`, `hmd app`, the CLI -- and only READ by
+the statusline (create_seed=False): a render writes nothing, so the same stdin
+renders the same bytes whatever the home directory is, and until a seed exists the
+statusline shows no code rather than one nobody registered.
 
 ONE CODE, WHOEVER ASKS (resolve_session_code)
 The statusline hashes the live session_id on its stdin; a process that is NOT
@@ -135,16 +140,19 @@ def _heimdall_home():
     return os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall")
 
 
-def _seed():
-    """The machine's session-code seed (see THE SEED in the module docstring), made on first use. link(2) makes the
-    file once, so two processes starting together end up reading the same one. ValueError when there is none and
-    none can be made, or what is stored is not exactly 64 hex characters."""
+def _seed(create=True):
+    """The machine's session-code seed (see THE SEED in the module docstring). With `create`, made on first use:
+    link(2) makes the file once, so two processes starting together end up reading the same one. Without it this only
+    READS -- nothing is created, so a caller that must write nothing (the statusline's render) never does. ValueError
+    when there is none (and none is to be made, or none can be), or what is stored is not exactly 64 hex characters."""
     home = _heimdall_home()
     cached = _SEEDS.get(home)
     if cached is not None:
         return cached
     private = _private()
     raw = private.read(home, "", _KEY_NAME, 128)
+    if raw is None and not create:
+        raise ValueError("no session code key yet in %s" % home)
     if raw is None:
         try:
             os.makedirs(home, mode=0o700, exist_ok=True)
@@ -163,11 +171,13 @@ def _seed():
     return _SEEDS[home]
 
 
-def session_code_for(session_id=None, repo=None):
+def session_code_for(session_id=None, repo=None, create_seed=True):
     """(code, source) for `session_id` if it is a non-empty string, else for
     `repo` if IT is a non-empty string. `source` is the literal string
     "session_id" or "repo" naming which one won, so a caller (or a test)
-    never has to re-derive that from the inputs.
+    never has to re-derive that from the inputs. `create_seed=False` makes the
+    machine's seed if it is missing no more than a ValueError: a caller that
+    must write nothing asks that way.
 
     Raises ValueError when neither argument is a usable non-empty string, or when
     the machine's seed cannot be read (THE SEED, in the module docstring).
@@ -182,7 +192,7 @@ def session_code_for(session_id=None, repo=None):
         raw, source = repo, "repo"
     else:
         raise ValueError("session_code_for: need a non-empty session_id or repo")
-    digest = hmac.new(_seed(), _DOMAIN + source.encode("ascii") + b"\x00" + raw.encode("utf-8"),
+    digest = hmac.new(_seed(create_seed), _DOMAIN + source.encode("ascii") + b"\x00" + raw.encode("utf-8"),
                       hashlib.sha256).digest()
     top32 = int.from_bytes(digest[:4], "big")     # first 32 bits of the digest
     top25 = top32 >> (32 - _TOTAL_BITS)           # keep only the FIRST 25 of those
@@ -233,11 +243,12 @@ def live_session_id(repo):
     return sid
 
 
-def resolve_session_code(repo=None, session_id=None, pinned_session_id=None):
+def resolve_session_code(repo=None, session_id=None, pinned_session_id=None, create_seed=True):
     """(code, source): THE derivation every reader of "this session's code" goes through (see ONE CODE, WHOEVER
     ASKS in the module docstring). `session_id` is the caller's own live id (the statusline's stdin),
     `pinned_session_id` an id the caller inherited that names one of the repo's own transcripts. Raises
-    ValueError exactly when session_code_for would: no session known and no repo path to fall back to, or no seed."""
+    ValueError exactly when session_code_for would: no session known and no repo path to fall back to, or no seed
+    (with `create_seed=False`, none YET: the statusline passes it, since a render writes nothing)."""
     sid = None
     for candidate in (session_id, pinned_session_id):
         if isinstance(candidate, str) and candidate.strip():
@@ -245,7 +256,7 @@ def resolve_session_code(repo=None, session_id=None, pinned_session_id=None):
             break
     if sid is None:
         sid = live_session_id(repo)
-    return session_code_for(session_id=sid, repo=repo)
+    return session_code_for(session_id=sid, repo=repo, create_seed=create_seed)
 
 
 def record_session(repo, session_id, pid):
@@ -310,6 +321,11 @@ def main(argv=None):
         try:
             if args.record_session:
                 record_session(args.repo, args.session_id, args.pid)
+                # a recorded session is one the statusline is about to show a code for, and the statusline only READS the
+                # seed (it writes nothing at render): this is where it comes to exist. Best effort -- no seed, no code shown
+                import contextlib
+                with contextlib.suppress(ValueError):
+                    _seed()
             else:
                 forget_session(args.repo, args.session_id)
         except (ValueError, OSError) as exc:
