@@ -527,8 +527,10 @@ def _session_code(session_id, cwd):
     sentinels/hmd-ui.py's /api/state read it from, so they can never disagree).
 
     `session_id` first (the live Claude Code conversation id riding statusline's
-    stdin JSON — see `data.get("session_id")` in main() below); falls back to
-    `cwd` when there is none, mirroring `session_code_for()`'s own precedence.
+    stdin JSON — see `data.get("session_id")` in main() below); with none, the
+    session the SessionStart hook recorded for `cwd` (.heimdall/app/session.json),
+    then `cwd` itself — resolve_session_code's own precedence, the one every other
+    reader of this code (`hmd ui`, `hmd app`, the pair window) goes through.
     Never raises: a missing/broken lib, or neither input being a usable string,
     is just another way to have no code — the caller renders nothing rather than
     guess (fail OPEN, never a blank statusline over it)."""
@@ -536,10 +538,33 @@ def _session_code(session_id, cwd):
         spec = importlib.util.spec_from_file_location("hmd_session_code", _SESSION_CODE_LIB)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        code, _source = mod.session_code_for(session_id=session_id or None, repo=cwd)
+        code, _source = mod.resolve_session_code(repo=cwd, session_id=session_id or None)
     except Exception:
         return None
     return code if isinstance(code, str) and code else None
+
+
+def _paired_note(cwd, code):
+    """`📱 <device> paired via code` while a phone that paired with THIS session's code is still connected, else
+    None. The relay client that bound it keeps <cwd>/.heimdall/app/paired-<code>.json (bin/heimdall-relay-client:
+    via, the relay-claimed device label, pid) and removes it when it ends; a file whose process is gone -- a
+    client killed without cleaning up -- counts for nothing. The label is the phone's own word, so only
+    printable characters of it are shown, and at most 24. Never raises, never forks: one small read."""
+    if not code:
+        return None
+    try:
+        with open(os.path.join(cwd, ".heimdall", "app", "paired-%s.json" % code), "r", encoding="utf-8") as f:
+            rec = json.loads(f.read(4096))
+        if not isinstance(rec, dict) or rec.get("via") != "code":
+            return None
+        pid = rec.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        os.kill(pid, 0)
+        label = "".join(ch for ch in str(rec.get("device_label") or "") if ch.isprintable())[:24].strip()
+    except Exception:
+        return None
+    return "📱 %s paired via code" % (label or "phone")
 
 
 def _sigil_override_seed(seed):
@@ -2149,7 +2174,7 @@ def subagent_ghost(agents):
 
 # ── Row1 identity — WHOLE-SEGMENT drop (Spec v2 §2/§7: text drops per tier, NEVER
 # mid-token) ─────────────────────────────────────────────────────────────────────
-def row1_left(handle, model, repo_seg, cseg, avail, code=None):
+def row1_left(handle, model, repo_seg, cseg, avail, code=None, paired=None):
     """The Row1 identity left run — `⛭ HEIMDALL │ rj · Opus 4.8 │ heimdall:branch +2 ~1`
     — reduced to fit `avail` cells by dropping WHOLE segments, never slicing a token with
     an ellipsis (the `rj · Opus …` / `heimdall:statu…` mid-word clip from the 80c render).

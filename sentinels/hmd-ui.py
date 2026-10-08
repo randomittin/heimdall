@@ -414,20 +414,19 @@ def repo_session(root):
 
 def collect_session_code(root):
     """identity.session_code -- the same 5-char code the companion app shows for this
-    paired session (bin/lib/hmd_session_code.py, the one source both this file and
-    sentinels/hmd-statusline.py read). `hmd app connect` pairs ONE `hmd ui` instance
-    per repo (.planning/plans/PLAN-hmd-app-connect.md; its state file
-    <repo>/.heimdall/app/connect.json is repo-keyed, not per-Claude-session), so this
-    is REPO-scoped here -- the live Claude Code session_id, when this process has inherited
-    one that names a transcript of THIS repo (repo_session().pinned: an id inherited from a
-    shell that belongs to another repo is ignored), wins when present; otherwise `root` is
-    the input. Never raises."""
+    paired session (bin/lib/hmd_session_code.py, the one source this file, the statusline,
+    bin/lib/hmd_app_code.py and `hmd app` all read). This process is not Claude Code's
+    statusline, so it has no live session id on a stdin: the id it uses is, in order, one
+    it inherited that names a transcript of THIS repo (repo_session().pinned: an id
+    inherited from a shell that belongs to another repo is ignored), else the session the
+    SessionStart hook recorded in <root>/.heimdall/app/session.json while its process is
+    alive (resolve_session_code), else `root` itself. Never raises."""
     if SESSION_CODE is None:
         return None
     session = repo_session(root)
-    sid = session.id if session is not None and session.pinned else None
+    pinned = session.id if session is not None and session.pinned else None
     try:
-        code, _source = SESSION_CODE.session_code_for(session_id=sid or None, repo=root)
+        code, _source = SESSION_CODE.resolve_session_code(repo=root, pinned_session_id=pinned or None)
     except Exception:
         return None
     return code if isinstance(code, str) and code else None

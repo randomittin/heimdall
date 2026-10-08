@@ -45,21 +45,47 @@ otherwise the repo's filesystem path. Two different inputs collide only by
 the ordinary odds of a 25-bit hash (1 in 2**25 per pair -- see
 test/hmd-session-code.test.sh's 50-input probabilistic no-collision case).
 
+ONE CODE, WHOEVER ASKS (resolve_session_code)
+The statusline hashes the live session_id on its stdin; a process that is NOT
+Claude Code's statusline -- `hmd ui`'s /api/state, `hmd app connect` run from a
+plain terminal, the pair window -- has no such stdin, and used to fall back to the
+repo path, so the code it showed or registered was not the one typed from the
+statusline. The SessionStart hook now records the live session in
+<repo>/.heimdall/app/session.json {session_id, pid, ts} (0600; record_session) and
+removes it at SessionEnd (forget_session). resolve_session_code is the ONE function
+every reader goes through, with one precedence:
+    1. the caller's own live session id (the statusline's stdin);
+    2. a pinned id (the session this process inherited, when it names one of the
+       repo's own transcripts -- sentinels/hmd-ui.py's repo_session);
+    3. the session recorded in session.json, while the pid it names is alive;
+    4. the repo path.
+The statusline, /api/state, bin/lib/hmd_app_code.py and `hmd app` therefore agree by
+construction: they differ only when no session is known to any of them.
+
 CLI
     python3 hmd_session_code.py --session-id ID     code for that session
     python3 hmd_session_code.py --repo DIR          code for that repo
     python3 hmd_session_code.py --repo DIR --json   {"code": ..., "source": ...}
+    python3 hmd_session_code.py --record-session --repo DIR --session-id ID --pid N
+                                                    write DIR/.heimdall/app/session.json
+    python3 hmd_session_code.py --forget-session --repo DIR --session-id ID
+                                                    remove it, when it names ID
 
 --session-id wins when both are given, matching session_code_for()'s own
 precedence below.
 """
 import hashlib
+import os
 import sys
 
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_LENGTH = 5
 _BITS_PER_CHAR = 5                            # 2**5 == len(CODE_ALPHABET)
 _TOTAL_BITS = _BITS_PER_CHAR * CODE_LENGTH    # 25
+
+SESSION_FILE_REL = os.path.join(".heimdall", "app", "session.json")
+_SID_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+_SID_MAX = 128
 
 
 def session_code_for(session_id=None, repo=None):
@@ -90,6 +116,113 @@ def session_code_for(session_id=None, repo=None):
     return "".join(chars), source
 
 
+def valid_session_id(session_id):
+    """A Claude Code session id as a file-name-safe key: 1..128 of [A-Za-z0-9_-]."""
+    return (isinstance(session_id, str) and 0 < len(session_id) <= _SID_MAX
+            and all(ch in _SID_CHARS for ch in session_id))
+
+
+def _pid_alive(pid):
+    """Signal 0 delivers nothing; it only asks whether the pid exists and is ours to signal. A pid that
+    belongs to another user is not Claude Code (the same user started it), so EPERM counts as gone."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def session_file(repo):
+    return os.path.join(repo, SESSION_FILE_REL)
+
+
+def live_session_id(repo):
+    """The session id <repo>/.heimdall/app/session.json records, while that file is whole and the process it
+    names is alive; else None. Never raises: a missing, torn or foreign-looking file is no session."""
+    if not isinstance(repo, str) or not repo.strip():
+        return None
+    import json  # lazy: the statusline's render path only comes here when its own stdin named no session
+    try:
+        with open(session_file(repo), "r", encoding="utf-8") as f:
+            rec = json.loads(f.read(4096))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    sid = rec.get("session_id")
+    if not valid_session_id(sid) or not _pid_alive(rec.get("pid")):
+        return None
+    return sid
+
+
+def resolve_session_code(repo=None, session_id=None, pinned_session_id=None):
+    """(code, source): THE derivation every reader of "this session's code" goes through (see ONE CODE, WHOEVER
+    ASKS in the module docstring). `session_id` is the caller's own live id (the statusline's stdin),
+    `pinned_session_id` an id the caller inherited that names one of the repo's own transcripts. Raises
+    ValueError exactly when session_code_for would: no session known and no repo path to fall back to."""
+    sid = None
+    for candidate in (session_id, pinned_session_id):
+        if isinstance(candidate, str) and candidate.strip():
+            sid = candidate
+            break
+    if sid is None:
+        sid = live_session_id(repo)
+    return session_code_for(session_id=sid, repo=repo)
+
+
+def record_session(repo, session_id, pid):
+    """Write <repo>/.heimdall/app/session.json {session_id, pid, ts}: 0600, atomically, the directory 0700 (the
+    mode every file hmd keeps there has). `pid` is the Claude Code process that owns the session -- the file
+    only counts while it is alive. Raises ValueError for an id or pid that could not have come from Claude Code."""
+    import contextlib
+    import json
+    import tempfile
+    import time
+    if not valid_session_id(session_id):
+        raise ValueError("record_session: not a session id: %r" % (session_id,))
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("record_session: not a pid: %r" % (pid,))
+    path = session_file(repo)
+    app = os.path.dirname(path)
+    os.makedirs(app, exist_ok=True)
+    os.chmod(app, 0o700)
+    fd, tmp = tempfile.mkstemp(dir=app, prefix="session.json.tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"session_id": session_id, "pid": pid, "ts": int(time.time())},
+                               sort_keys=True, separators=(",", ":")))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return path
+
+
+def forget_session(repo, session_id):
+    """Remove session.json when -- and only when -- it names `session_id`: a session that started later in the same
+    repo owns the file now, and an earlier one ending must not take its record away. True when removed."""
+    import json
+    path = session_file(repo)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rec = json.loads(f.read(4096))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict) or rec.get("session_id") != session_id:
+        return False
+    try:
+        os.unlink(path)
+    except OSError:
+        return False
+    return True
+
+
 def main(argv=None):
     # Lazy: session_code_for() (the hot render path, loaded in-process by
     # sentinels/hmd-statusline.py's _session_code()) never touches argparse or
@@ -106,7 +239,30 @@ def main(argv=None):
     parser.add_argument("--session-id", default=None, help="Claude Code session_id")
     parser.add_argument("--repo", default=None, help="repo path (fallback input)")
     parser.add_argument("--json", action="store_true", help='emit {"code": ..., "source": ...}')
+    parser.add_argument("--record-session", action="store_true",
+                        help="write <repo>/.heimdall/app/session.json for --session-id, owned by --pid")
+    parser.add_argument("--forget-session", action="store_true",
+                        help="remove <repo>/.heimdall/app/session.json if it names --session-id")
+    parser.add_argument("--pid", type=int, default=None, help="the Claude Code process (with --record-session)")
     args = parser.parse_args(argv)
+
+    if args.record_session or args.forget_session:
+        if args.record_session and args.forget_session:
+            print("error: --record-session and --forget-session are exclusive", file=sys.stderr)
+            return 2
+        if not args.repo or not args.session_id or (args.record_session and args.pid is None):
+            print("error: --record-session needs --repo, --session-id and --pid; "
+                  "--forget-session needs --repo and --session-id", file=sys.stderr)
+            return 2
+        try:
+            if args.record_session:
+                record_session(args.repo, args.session_id, args.pid)
+            else:
+                forget_session(args.repo, args.session_id)
+        except (ValueError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        return 0
 
     try:
         code, source = session_code_for(session_id=args.session_id, repo=args.repo)
