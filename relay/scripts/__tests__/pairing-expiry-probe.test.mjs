@@ -2,24 +2,24 @@
 // whether a relay announces why it ends that session (INV-38) or closes the
 // stream bare — the 2026-10-02 field bug. Only the pure parts are covered
 // here: argument parsing, per-line frame summaries and the verdict. The network
-// loop needs a live relay and a two-minute wait, and is exercised by running
+// loop needs a live relay and a seven-minute wait, and is exercised by running
 // the probe (relay/README.md, "Verifying a deploy").
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { parseArgs, summarizeFrame, verdictFor } from '../pairing-expiry-probe.mjs';
 
-test('parseArgs holds the stream long enough to see the 120 s purge by default', () => {
+test('parseArgs holds the stream long enough to see the 420 s purge by default', () => {
   assert.deepEqual(parseArgs(['--relay', 'https://relay.example.test']), {
     relay: 'https://relay.example.test',
-    holdS: 150,
+    holdS: 450,
   });
 });
 
 test('parseArgs takes an explicit --hold-s and strips a trailing slash from --relay', () => {
-  assert.deepEqual(parseArgs(['--relay', 'https://relay.example.test/', '--hold-s', '200']), {
+  assert.deepEqual(parseArgs(['--relay', 'https://relay.example.test/', '--hold-s', '500']), {
     relay: 'https://relay.example.test',
-    holdS: 200,
+    holdS: 500,
   });
 });
 
@@ -34,12 +34,12 @@ test('parseArgs rejects a relay that is not an http(s) URL', () => {
 
 test('parseArgs rejects a --hold-s too short to reach the purge', () => {
   assert.throws(
-    () => parseArgs(['--relay', 'https://relay.example.test', '--hold-s', '100']),
-    /--hold-s must be a number of at least 125/
+    () => parseArgs(['--relay', 'https://relay.example.test', '--hold-s', '400']),
+    /--hold-s must be a number of at least 425/
   );
   assert.throws(
     () => parseArgs(['--relay', 'https://relay.example.test', '--hold-s', 'soon']),
-    /--hold-s must be a number of at least 125/
+    /--hold-s must be a number of at least 425/
   );
 });
 

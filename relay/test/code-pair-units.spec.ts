@@ -13,6 +13,8 @@ import {
   GH_ASSERTION_TTL_S,
   mintDeviceToken,
   mintGhAssertion,
+  PAIRING_CODE_TTL_S,
+  purgeMinDelayMs,
   verifyDeviceToken,
   verifyGhAssertion,
   verifyInstallSignature,
@@ -56,6 +58,26 @@ async function signRaw(secret: string, payload: string): Promise<string> {
 
 const encodeClaims = (body: unknown): string =>
   base64UrlEncode(new TextEncoder().encode(JSON.stringify(body)));
+
+describe("the pairing window (contract constants.pair_window_s)", () => {
+  it("is the length relay/contract/code-pair.json names", () => {
+    expect(PAIRING_CODE_TTL_S).toBe(contractJson.constants.pair_window_s);
+  });
+});
+
+describe("purgeMinDelayMs (the optional RELAY_PURGE_MIN_DELAY_MS binding)", () => {
+  it("is no floor when the binding is absent, so production arms every alarm exactly where the code says", () => {
+    expect(purgeMinDelayMs(undefined)).toBe(0);
+  });
+
+  it("reads the binding as milliseconds", () => {
+    expect(purgeMinDelayMs("3600000")).toBe(3_600_000);
+  });
+
+  it.each(["", "soon", "-5", "0", "NaN", "Infinity"])("falls back to no floor for %j rather than trusting it", (raw) => {
+    expect(purgeMinDelayMs(raw)).toBe(0);
+  });
+});
 
 describe("mintGhAssertion / verifyGhAssertion", () => {
   it("uses the device_token construction: base64url(claims).base64url(HMAC-SHA256(secret, payload))", async () => {

@@ -38,6 +38,15 @@ export default defineConfig({
           // other test holds open (~2.6s, the keepalive-reconnect test) and
           // short enough to observe twice inside one test's budget.
           RELAY_STREAM_MAX_LIFETIME_MS: "8000",
+          // src/session.ts arms a storage-reclamation alarm on every Durable Object it touches, 2 to
+          // 7 minutes out, and a spec file runs about two minutes in storage that is not reset
+          // between tests -- so the first of hundreds of alarms falls due as a file ends. A due alarm
+          // wakes its object through the runner's module import, ahead of the running test: 481 of
+          // them stalled the runner ~214 s in test/code-pair.spec.ts (longest stretch 101 s), at a
+          // pairing window of 60 s and of 360 s alike. A floor of an hour keeps every purge alarm past
+          // the life of a run; the specs that exercise the purge call runDurableObjectAlarm, which
+          // needs no due alarm. Production and local dev bind nothing.
+          RELAY_PURGE_MIN_DELAY_MS: "3600000",
           // Pair-by-session-code config (src/code-pair.ts's codePairingConfig): all three
           // must be set or every code-pairing route answers 503. Test-only placeholders on
           // the same terms as RELAY_SIGNING_SECRET above -- obviously fake, never a real

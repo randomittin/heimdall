@@ -75,7 +75,8 @@ import {
 // timeout, so the 5 s default would fail them for being thorough. 20 s is that with headroom for
 // a slower CI runner. It is not a cure for a stall: the 110 s+ stalls this file once had were
 // the INV-39 sweep below walking every Durable Object the earlier tests had left behind, and a
-// bigger number would only have hidden them.
+// bigger number would only have hidden them. The other kind of stall -- purge alarms falling due
+// while the file is still running -- is pinned by "the alarms the suite's own pairings arm" below.
 vi.setConfig({ testTimeout: 20_000 });
 
 const fake = new FakeGitHub();
@@ -1459,6 +1460,45 @@ describe("INV-41: a window's identifying fields live no longer than the window",
     expect(await storedIndex(user.id)).toBeUndefined();
     // a deadline already past would set an alarm that is due at once and fires again: for ever
     expect(await runInDurableObject(indexStub(user.id), (_i, state) => state.storage.getAlarm())).toBeNull();
+  });
+});
+
+// ============================================================================================
+// The suite's own alarms
+// ============================================================================================
+
+// Every request here comes from a fresh IP, so each leaves a throttle bucket behind, and each
+// pairing leaves a session and an index: hundreds of Durable Objects with a purge alarm 2 to 7
+// minutes out, in storage that is not reset between tests. This file takes about two minutes, so
+// the first of those alarms fell due as it ended, and in workerd under vitest-pool-workers a due
+// alarm wakes its object through the runner's module import, ahead of whatever the running test is
+// waiting on. Measured on this file: 481 due alarms stalled the runner for ~214 s in five stretches
+// (the longest 101 s) and failed whichever test the onset reached (INV-40 in one run, INV-41 in
+// another), with the same code at a pairing window of 60 s and of 360 s alike. vitest.config.ts
+// binds RELAY_PURGE_MIN_DELAY_MS so that no purge alarm falls due inside the file's life; the purge
+// itself is still driven above, with runDurableObjectAlarm, which does not need the alarm to be due.
+describe("the alarms the suite's own pairings arm", () => {
+  const AN_HOUR_MS = 3_600_000;
+  const alarmOf = (stub: DurableObjectStub): Promise<number | null> =>
+    runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
+
+  it("fall due after the file has ended: a throttle bucket's, a session's and an index's", async () => {
+    const before = Date.now();
+    const ip = freshIp();
+    const res = await SELF.fetch(`${BASE}/pair/init`, { method: "POST", headers: { "CF-Connecting-IP": ip } });
+    expect(res.status).toBe(200);
+    const { session_id: sessionId } = (await res.json()) as { session_id: string };
+    const user = newUser();
+    await openWindow(fake, user);
+
+    const bucket = typedEnv.SESSION.get(typedEnv.SESSION.idFromName(`pair-init-throttle:${ip}`));
+    for (const [name, stub] of [
+      ["bucket", bucket],
+      ["session", sessionStub(sessionId)],
+      ["index", indexStub(user.id)],
+    ] as const) {
+      expect(await alarmOf(stub), name).toBeGreaterThanOrEqual(before + AN_HOUR_MS);
+    }
   });
 });
 

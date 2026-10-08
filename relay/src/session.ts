@@ -46,6 +46,7 @@ import {
   DEVICE_TOKEN_TTL_S,
   PAIR_INIT_MAX_PER_WINDOW,
   PAIR_INIT_WINDOW_MS,
+  purgeMinDelayMs,
   PAIR_INIT_RETRY_AFTER_S,
 } from "./pairing";
 import {
@@ -613,7 +614,7 @@ export class SessionDO {
       PAIR_INIT_MAX_PER_WINDOW
     );
     await this.ctx.storage.put(PAIR_INIT_KEY, attempts);
-    await this.ctx.storage.setAlarm(now + PAIR_INIT_WINDOW_MS + PURGE_GRACE_MS);
+    await this.armPurgeAlarm(now + PAIR_INIT_WINDOW_MS + PURGE_GRACE_MS);
     return jsonResponse(200, { throttled });
   }
 
@@ -623,9 +624,17 @@ export class SessionDO {
    * a bind pushes the deadline out to the device token's expiry, an end pulls
    * it in to a short grace — and `alarm()` re-derives from the record anyway,
    * so an alarm that fires early only costs one re-schedule.
+   *
+   * `RELAY_PURGE_MIN_DELAY_MS`, when bound, is a floor under the deadline: never sooner than now
+   * plus it. Only the vitest suite binds it, because a purge alarm that falls due while a spec file
+   * is still running wakes its object through the test runner and stalls the run (test/code-pair.spec.ts,
+   * "the alarms the suite's own pairings arm"). A later alarm only delays reclamation, and `alarm()`
+   * re-derives its decision from the record, so nothing is purged that should not be. Unbound, as
+   * in production, the deadline is used exactly as given.
    */
   private async armPurgeAlarm(atMs: number): Promise<void> {
-    await this.ctx.storage.setAlarm(atMs);
+    const floorMs = purgeMinDelayMs(this.env.RELAY_PURGE_MIN_DELAY_MS);
+    await this.ctx.storage.setAlarm(floorMs > 0 ? Math.max(atMs, Date.now() + floorMs) : atMs);
   }
 
   /** Milliseconds of stream idleness before the next `keepalive`. Falls back
@@ -849,7 +858,7 @@ export class SessionDO {
    * subpaths it will ever forward here (a public `POST /session/:id/init`
    * now gets a 404 from worker.ts before this Durable Object is even
    * touched). Accepts an optional `pairing_ttl_s` override — production
-   * callers never set it (default 60s applies); tests use it to construct an
+   * callers never set it (PAIRING_CODE_TTL_S applies); tests use it to construct an
    * already-expired session deterministically, without waiting or mocking
    * the clock. */
   private async handleInit(request: Request): Promise<Response> {

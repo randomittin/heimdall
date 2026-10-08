@@ -2,15 +2,16 @@
 // pairing-expiry-probe.mjs — plays hmd's relay client for a session no phone
 // will ever claim, and reports whether the relay says why it ends that session.
 //
-// It is the 2026-10-02 field bug as a two-minute check: `POST /pair/init`, open
+// It is the 2026-10-02 field bug as a seven-minute check: `POST /pair/init`, open
 // `GET /session/:id/stream`, claim nothing, and hold the stream until the relay
-// closes it (the storage-reclamation alarm, ~120 s after init: the 60 s pairing
-// window plus 60 s grace). A relay that predates INV-38 closes with a bare EOF
-// and answers the reconnect with 404 — what hmd's client logged as "stream
-// closed by relay with no local cause" then `session_ended: stream-404`. A
-// relay that has it writes `session_ended` with `payload.reason` first.
+// closes it (the storage-reclamation alarm, ~420 s after init: the 360 s pairing
+// window, src/pairing.ts's PAIRING_CODE_TTL_S, plus 60 s grace). A relay that
+// predates INV-38 closes with a bare EOF and answers the reconnect with 404 —
+// what hmd's client logged as "stream closed by relay with no local cause" then
+// `session_ended: stream-404`. A relay that has it writes `session_ended` with
+// `payload.reason` first.
 //
-//   node relay/scripts/pairing-expiry-probe.mjs --relay https://<worker> [--hold-s 150]
+//   node relay/scripts/pairing-expiry-probe.mjs --relay https://<worker> [--hold-s 450]
 //
 // Exit 0: the relay announced a reason. 1: bare EOF (the field bug). 2: usage or
 // a network/HTTP failure. 3: the stream was still open at the deadline.
@@ -22,9 +23,9 @@
 
 import { pathToFileURL } from 'node:url';
 
-const DEFAULT_HOLD_S = 150;
-/** The purge lands ~120 s after init; anything shorter cannot observe it. */
-const MIN_HOLD_S = 125;
+const DEFAULT_HOLD_S = 450;
+/** The purge lands ~420 s after init; anything shorter cannot observe it. */
+const MIN_HOLD_S = 425;
 const RECONNECT_DELAY_MS = 2000;
 
 export function parseArgs(argv) {
@@ -40,7 +41,7 @@ export function parseArgs(argv) {
   if (!/^https?:\/\//.test(relay)) throw new Error('--relay must be an http(s) URL');
   if (!Number.isFinite(holdS) || holdS < MIN_HOLD_S) {
     throw new Error(
-      `--hold-s must be a number of at least ${MIN_HOLD_S} (the purge lands ~120 s after init)`
+      `--hold-s must be a number of at least ${MIN_HOLD_S} (the purge lands ~420 s after init)`
     );
   }
   return { relay: relay.replace(/\/+$/, ''), holdS };
@@ -67,7 +68,7 @@ export function verdictFor({ closed, announcedReason }) {
       exitCode: 3,
       message:
         'INCONCLUSIVE: the stream was still open at the deadline -- raise --hold-s ' +
-        '(the purge lands ~120 s after init)',
+        '(the purge lands ~420 s after init)',
     };
   }
   if (announcedReason) {
