@@ -1366,7 +1366,7 @@ cmd_connect_relay() {
   fi
   if [ "$code_requested" = true ]; then
     client_args+=(--code "$code")
-    [ "$NO_CONFIRM" = true ] && client_args+=(--no-confirm)
+    [ "$CONFIRM" != true ] && client_args+=(--no-confirm)
     "$RELAY_CLIENT_BIN" "${client_args[@]}" <&4 3>&- 4>&- >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
     CLIENT_PID=$!
     exec 4<&-
@@ -1389,7 +1389,7 @@ cmd_connect_relay() {
 
   # What _relay_event reads and sets while it renders the client's events (see its comment).
   local pair_init_seen=false warned_expired=false pairing_exp=0 seen_lines=0 client_rc=0
-  local code_resolved=false code_active=false code_shown=false client_gone=false
+  local code_resolved=false code_active=false code_shown=false client_gone=false paired_announced=false
   local bg_code_deadline=$(( $(date +%s) + 30 ))
 
   while :; do
@@ -1435,6 +1435,234 @@ cmd_connect_relay() {
 
   echo "hmd app: relay session ended (client exit $client_rc)"
   return "$client_rc"
+}
+
+# cmd_pair_window: `hmd app pair-window [--stop] --session SID ...` -- see the usage block. Both forms are what the
+# SessionStart / SessionEnd hooks run, so they print nothing a hook would put in front of the model except the one
+# line the usage block promises for a signed-out gh, and they never fail a session: every refusal is exit 0 except a
+# call that is itself malformed (2).
+cmd_pair_window() {
+  local SID="" OWNER="" REPO="" RELAY_URL="" STOP=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) SID="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift 1; fi ;;
+      --pid) OWNER="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift 1; fi ;;
+      --repo) REPO="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift 1; fi ;;
+      --relay) RELAY_URL="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift 1; fi ;;
+      --stop) STOP=true; shift ;;
+      *) echo "hmd app pair-window: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+  if ! _pw_valid_sid "$SID"; then
+    echo "hmd app pair-window: --session needs a Claude Code session id (letters, digits, - and _)" >&2
+    return 2
+  fi
+  case "$OWNER" in
+    *[!0-9]*) echo "hmd app pair-window: --pid must be a number" >&2; return 2 ;;
+  esac
+  REPO="$(resolve_repo_value "$REPO")"
+  REPO="$(cd "$REPO" 2>/dev/null && pwd -P)" || { echo "hmd app pair-window: not a directory: $REPO" >&2; return 2; }
+  if [ "$STOP" = true ]; then
+    _pw_stop "$REPO" "$SID"
+    return 0
+  fi
+  _pw_start "$REPO" "$SID" "$OWNER" "$RELAY_URL"
+}
+
+# _pw_stop REPO SID -- the session ended (or the operator said so): forget it, close its window. The record goes
+# first and the wait is short -- SessionEnd gives a hook little time, and the supervisor finishes revoking on its own.
+_pw_stop() {
+  local repo="$1" sid="$2" f="$1/.heimdall/app/pair-window-$2.json"
+  [ -z "$PY3" ] || "$PY3" "$LIB_DIR/hmd_session_code.py" --forget-session --repo "$repo" --session-id "$sid" >/dev/null 2>&1 || true
+  if _pw_app_dir_plain "$repo" && [ -f "$f" ] && [ ! -L "$f" ]; then
+    _pair_window_stop_file "$f" 2
+  fi
+}
+
+# _pw_start REPO SID OWNER RELAY -- record the session, then open its window if it can have one. The record comes
+# first and stands on its own: every reader of the session code agrees with the statusline even where no window opens.
+_pw_start() {
+  local repo="$1" sid="$2" owner="$3" relay="$4" code f pid="" i=0 probe=""
+  if [ -n "$owner" ] && [ -n "$PY3" ]; then
+    "$PY3" "$LIB_DIR/hmd_session_code.py" --record-session --repo "$repo" --session-id "$sid" --pid "$owner" >/dev/null 2>&1 || true
+  fi
+  case "${HMD_PAIR_WINDOW:-}" in
+    0|off|false|no) echo "hmd app: pair window off (HMD_PAIR_WINDOW=${HMD_PAIR_WINDOW})"; return 0 ;;
+  esac
+  _session_attended || return 0
+  [ -n "$PY3" ] && [ -x "$RELAY_CLIENT_BIN" ] || return 0
+  code="$("$PY3" "$LIB_DIR/hmd_session_code.py" --session-id "$sid" 2>/dev/null)" || return 0
+  printf '%s' "$code" | grep -Eq "$SESSION_CODE_RE" || return 0
+  f="$repo/.heimdall/app/pair-window-$sid.json"
+  if _pw_app_dir_plain "$repo" && [ -f "$f" ] && _pid_is_pair_window "$(jq -r '.pid // empty' "$f" 2>/dev/null)"; then
+    echo "hmd app: pair window already open -- session code $code"
+    return 0
+  fi
+  if ! _gh_token_into probe; then
+    echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
+    return 0
+  fi
+  printf -v probe '%s' ""  # the probe only asked whether gh can give a token; the supervisor reads its own
+  relay="${relay:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
+  # the supervisor is this script run again as its own top-level process: its $$ is its real pid (a subshell's is the
+  # parent's), and nohup + disown + /dev/null detach it from the hook so it outlives it, as heimdall-presence's keeper does
+  nohup "$SELF" pair-window-loop --session "$sid" --repo "$repo" --relay "$relay" ${owner:+--pid "$owner"} </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  while [ "$i" -lt 60 ]; do
+    pid="$(jq -r '.pid // empty' "$f" 2>/dev/null)"
+    _pid_is_pair_window "$pid" && break
+    i=$((i + 1))
+    sleep 0.1
+  done
+  if _pid_is_pair_window "$pid"; then
+    echo "hmd app: pair window open -- session code $code"
+  else
+    echo "hmd app: pair window not confirmed -- if the code does not pair, run: hmd app connect"
+  fi
+}
+
+# The supervisor's own state. GLOBAL on purpose, never `local`: _pw_cleanup runs from a signal trap after the
+# function that set it has returned (the rule cleanup() above documents).
+PW_SID=""
+PW_REPO=""
+PW_CODE=""
+PW_OWNER=""
+PW_RELAY=""
+PW_RELAY_HOST=""
+PW_STARTED=""
+PW_LAST_RC=""
+PW_CLIENT_PID=""
+PW_NAP=""
+PW_CLEANED=false
+
+# _pw_write_state STATE [REASON] -- this supervisor's state file, <repo>/.heimdall/app/pair-window-<sid>.json: what
+# `hmd app connect|disconnect` and the SessionEnd hook find it by. Written through bin/lib/hmd_private_state.py (no
+# link followed, 0600) with the JSON on its stdin; a failure (a link in the way, no python) is the caller's to act on.
+_pw_write_state() {
+  [ -n "$PY3" ] || return 1
+  jq -cn --argjson pid "$$" --arg sid "$PW_SID" --arg code "$PW_CODE" --argjson owner "${PW_OWNER:-null}" \
+    --arg state "$1" --arg reason "${2:-}" --arg started "$PW_STARTED" --argjson crc "${PW_LAST_RC:-null}" \
+    '{pid: $pid, session_id: $sid, code: $code, owner_pid: $owner, state: $state, reason: $reason, started_at: $started, last_client_exit: $crc}' \
+    | "$PY3" "$LIB_DIR/hmd_private_state.py" write --root "$PW_REPO" --rel .heimdall/app --name "pair-window-$PW_SID.json" 2>/dev/null
+}
+
+# shellcheck disable=SC2329  # runs via the traps cmd_pair_window_loop installs
+_pw_cleanup() {
+  [ "$PW_CLEANED" = true ] && return 0
+  PW_CLEANED=true
+  [ -z "$PW_NAP" ] || kill "$PW_NAP" 2>/dev/null
+  _relay_stop_client "$PW_CLIENT_PID" || true  # TERM first: the client revokes its relay session itself
+  exec 3>&-
+  if [ -n "$PW_SID" ] && [ -n "$PW_REPO" ] && [ -n "$PY3" ] \
+      && [ "$(jq -r '.pid // empty' "$PW_REPO/.heimdall/app/pair-window-$PW_SID.json" 2>/dev/null)" = "$$" ]; then
+    "$PY3" "$LIB_DIR/hmd_private_state.py" remove --root "$PW_REPO" --rel .heimdall/app --name "pair-window-$PW_SID.json" >/dev/null 2>&1 || true
+  fi
+}
+
+# _pw_nap SECONDS -- sleep, but wake at once for a trapped signal (a foreground sleep would hold the trap until it ends).
+_pw_nap() {
+  sleep "$1" &
+  PW_NAP=$!
+  wait "$PW_NAP" 2>/dev/null
+  PW_NAP=""
+}
+
+# _pw_owner_alive -- 0 while the Claude Code process the window belongs to lives (or none was named).
+_pw_owner_alive() {
+  [ -z "$PW_OWNER" ] || kill -0 "$PW_OWNER" 2>/dev/null
+}
+
+# _pw_launch_client TOKEN_VAR -- start the headless relay client for this window and hand it the GitHub token held
+# in the variable TOKEN_VAR on its stdin, then clear the variable. The token travels exactly as in cmd_connect_relay:
+# a pipe whose directory entry is removed as soon as both ends are open, so it is on no argv, no environment variable
+# and no file. The client's event log is off (HMD_RELAY_EVENT_LOG=""): a window renews about once a minute for as long
+# as the session lives, and its events are nobody's to read. HMD_RELAY_CODE_WINDOW_S is the client's own cap on how long
+# one process offers the code (10 minutes by default); a window with no terminal runs for the session, so the cap is
+# raised to its ceiling (24 h) and the supervisor opens the next one when it ends.
+_pw_launch_client() {
+  local __var="$1" ctl
+  ctl="$(umask 077; mktemp -d)" || return 1
+  if ! mkfifo "$ctl/in" 2>/dev/null; then
+    rm -rf "$ctl"
+    return 1
+  fi
+  exec 3<>"$ctl/in"
+  exec 4<"$ctl/in"
+  rm -rf "$ctl"
+  HMD_RELAY_EVENT_LOG="" HMD_RELAY_CODE_WINDOW_S="${HMD_RELAY_CODE_WINDOW_S:-86400}" \
+    "$RELAY_CLIENT_BIN" --relay "$PW_RELAY" --repo "$PW_REPO" --ui-port 0 --public-host "$PW_RELAY_HOST" \
+      --code "$PW_CODE" --no-confirm --code-only <&4 3>&- 4>&- >/dev/null 2>&1 &
+  PW_CLIENT_PID=$!
+  exec 4<&-
+  printf '%s\n' "${!__var}" >&3
+  printf -v "$__var" '%s' ""
+  exec 3>&-
+}
+
+# cmd_pair_window_loop: INTERNAL -- the detached supervisor `hmd app pair-window` starts (see _pw_start). Keeps one
+# `heimdall-relay-client --code --no-confirm --code-only` offering this session's code: a new window when the client's
+# ends or the relay ends its session, a retry (HMD_PAIR_WINDOW_RETRY_S, default 60) when it could not be offered, and
+# no more at all when the relay will not take the code (no usable token, code pairing off) or ten tries in a row
+# failed. It ends -- stopping its client first, which revokes the relay session -- when the Claude Code process named by
+# --pid is gone, or on TERM/INT/HUP, which is how `pair-window --stop`, `hmd app disconnect` and `--confirm` stop it.
+cmd_pair_window_loop() {
+  local fails=0 started rc ran delay tok="" restart_s retry_s
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) PW_SID="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift 1; fi ;;
+      --repo) PW_REPO="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift 1; fi ;;
+      --relay) PW_RELAY="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift 1; fi ;;
+      --pid) PW_OWNER="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift 1; fi ;;
+      *) return 2 ;;
+    esac
+  done
+  _pw_valid_sid "$PW_SID" || return 2
+  [ -d "$PW_REPO" ] && [ -n "$PW_RELAY" ] && [ -n "$PY3" ] && [ -x "$RELAY_CLIENT_BIN" ] || return 2
+  case "$PW_OWNER" in *[!0-9]*) return 2 ;; esac
+  PW_CODE="$("$PY3" "$LIB_DIR/hmd_session_code.py" --session-id "$PW_SID" 2>/dev/null)" || return 1
+  PW_RELAY_HOST="$(printf '%s' "$PW_RELAY" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*$##; s#:.*$##')"
+  PW_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  restart_s="${HMD_PAIR_WINDOW_RESTART_S:-5}"
+  retry_s="${HMD_PAIR_WINDOW_RETRY_S:-60}"
+  case "$restart_s" in ''|*[!0-9]*) restart_s=5 ;; esac
+  case "$retry_s" in ''|*[!0-9]*) retry_s=60 ;; esac
+  trap '_pw_cleanup; exit 0' TERM INT HUP
+  trap _pw_cleanup EXIT
+  # no state file, no way to stop this by name: a supervisor that cannot be found does not run
+  _pw_write_state starting || return 1
+  while :; do
+    _pw_owner_alive || break
+    _gh_token_into tok || break  # signed out since the session began: no window (the QR still pairs)
+    _pw_launch_client tok || break
+    started="$(date +%s)"
+    _pw_write_state running
+    while kill -0 "$PW_CLIENT_PID" 2>/dev/null; do
+      if ! _pw_owner_alive; then
+        _relay_stop_client "$PW_CLIENT_PID" || true
+        break 2
+      fi
+      _pw_nap 5
+    done
+    wait "$PW_CLIENT_PID" 2>/dev/null
+    rc=$?
+    PW_CLIENT_PID=""
+    PW_LAST_RC="$rc"
+    # 2 a call this script got wrong, 3 the relay will not take the code (no usable GitHub token, code pairing off
+    # there), 11 no E2E crypto: another try changes nothing
+    case "$rc" in 2|3|11) break ;; esac
+    ran=$(( $(date +%s) - started ))
+    case "$rc" in
+      0|5) fails=0; delay="$restart_s" ;;  # a clean end, or the window's whole lifetime passed unclaimed
+      *)
+        if [ "$ran" -ge 30 ]; then fails=0; else fails=$((fails + 1)); fi
+        [ "$fails" -ge 10 ] && break
+        delay="$retry_s"
+        ;;
+    esac
+    _pw_write_state waiting
+    _pw_nap "$delay"
+  done
+  return 0
 }
 
 # cmd_identity: `hmd app identity revoke` -- see the usage block. The relay client does the one HTTP call
@@ -1792,7 +2020,11 @@ cmd_disconnect() {
   done
   REPO="$(resolve_repo_value "$REPO")"
   local state_file="$REPO/.heimdall/app/connect.json"
-  local vrc
+  local vrc pw_stopped
+
+  # a pair window is a way for a phone in, so disconnect closes it too (it is opened again by the next session)
+  pw_stopped="$(_pair_window_stop_all "$REPO")"
+  [ "${pw_stopped:-0}" -gt 0 ] && echo "hmd app disconnect: stopped $pw_stopped pair window(s)"
 
   if [ -f "$state_file" ] && [ "$(jq -r '.mode // empty' "$state_file" 2>/dev/null)" = "relay" ]; then
     cmd_disconnect_relay "$REPO" "$state_file"
@@ -2161,6 +2393,8 @@ case "$CMD" in
     exit 0
     ;;
   connect) cmd_connect "$@"; exit $? ;;
+  pair-window) cmd_pair_window "$@"; exit $? ;;
+  pair-window-loop) cmd_pair_window_loop "$@"; exit $? ;;
   identity) cmd_identity "$@"; exit $? ;;
   status) cmd_status "$@"; exit $? ;;
   disconnect) cmd_disconnect "$@"; exit $? ;;
