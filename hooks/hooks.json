@@ -306,7 +306,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled pair-window-start && exit 0; INPUT=$(cat); APP=\"$HMDP/bin/heimdall-app\"; [ -x \"$APP\" ] || exit 0; SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); [ -n \"$SID\" ] || exit 0; ( \"$APP\" pair-window --session \"$SID\" --pid \"$PPID\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1 & ); exit 0"
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled pair-window-start && exit 0; INPUT=$(cat); APP=\"$HMDP/bin/heimdall-app\"; [ -x \"$APP\" ] || exit 0; SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); [ -n \"$SID\" ] || exit 0; TP=$(printf '%s' \"$INPUT\" | jq -r '.transcript_path // empty' 2>/dev/null || true); ( \"$APP\" pair-window --session \"$SID\" --pid \"$PPID\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" ${TP:+--transcript \"$TP\"} >/dev/null 2>&1 & ); exit 0"
           }
         ]
       }

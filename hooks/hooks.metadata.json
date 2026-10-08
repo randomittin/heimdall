@@ -345,9 +345,9 @@
       "event": "SessionStart",
       "index": 12,
       "id": "pair-window-start",
-      "description": "Records this session (<repo>/.heimdall/app/session.json, 0600) so every reader of the 5-character session code agrees with the statusline, and -- when gh is signed in -- opens its pair-by-code window in the background (hmd app pair-window): a phone signed in to the same GitHub account that types the code pairs at once, with no number to compare and a notice in the session and on the statusline. Sends the laptop's gh token to the relay (over TLS, on a pipe) about once a minute for as long as the session lives and the window is unclaimed. Skipped when gh is signed out, in an unattended session (claude -p, an hmd sub-session) and under HMD_PAIR_WINDOW=0; disabling it (heimdall-hooks disable pair-window-start) leaves pairing to hmd app connect. Paired with pair-window-stop.",
+      "description": "Records this session (<repo>/.heimdall/app/session.json, 0600) so every reader of the 5-character session code agrees with the statusline, and -- when gh is signed in -- opens its pair-by-code window in the background (hmd app pair-window): a phone signed in to the same GitHub account that types the code pairs at once, with no number to compare and a notice in the session and on the statusline. Sends the laptop's gh token to the relay (over TLS, on a pipe) each time it registers the code, no more often than every 5 minutes (HMD_PAIR_WINDOW_RENEW_MIN_S; the relay keeps a registration 60 s, so the code is claimable the minute after each) while the window is unclaimed, and stops for good after 4 hours (HMD_PAIR_WINDOW_IDLE_H, 0 = never) with no phone paired and no activity in the session (the transcript this hook hands it); a new session or hmd app connect opens it again. Skipped when gh is signed out, in an unattended session (claude -p, an hmd sub-session) and under HMD_PAIR_WINDOW=0; disabling it (heimdall-hooks disable pair-window-start) leaves pairing to hmd app connect. Paired with pair-window-stop.",
       "matcher": "",
-      "fingerprint": "0f85e8005296eac05f5d23be442e3145b9188efe62917468e1abbe680013a24d",
+      "fingerprint": "de3ca542ee634462a0cb08faefb82d6cf60ee7be06c51f897390a872c603553b",
       "locked": false,
       "remote_toggle": false
     },
