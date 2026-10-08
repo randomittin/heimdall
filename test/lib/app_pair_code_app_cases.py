@@ -163,11 +163,12 @@ def case_default_transport():
                 "--no-code: the QR flow prints exactly as it always did (header, QR, pairing code, warning)", app.tail())
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT)
-        app = s.app(recorder=True)  # stdin is a pipe: nobody to confirm a phone with
+        app = s.app(recorder=True)  # stdin is a pipe: nobody to ask, and nobody needs to be (pairing by code asks nothing)
         app.close_stdin()
         app.wait_text("PAIRING CODE:", 30)
-        T.check("code pairing off — no terminal to confirm a phone at" in app.text() and "[--code]" not in s.read("argv"),
-                "no terminal on stdin (and no --no-confirm): the code is not offered, one line says so, the QR is shown", app.tail())
+        argv = s.read("argv").splitlines()
+        T.check("no terminal to confirm" not in app.text() and "[--code]" in argv and "[--no-confirm]" in argv,
+                "no terminal on stdin: the code is still offered, to a client that is told --no-confirm, and nothing says otherwise", app.tail())
 
 
 def case_token_path_and_code():
@@ -199,7 +200,7 @@ def case_token_path_and_code():
         T.check(H.TOKEN.encode() not in out and s.leaked() == [],
                 "the token is in no output of the app and on no disk (repo, HOME, TMPDIR, the recorder's files)",
                 str(s.leaked()))
-        T.check("[--no-confirm]" not in argv and "[--code]" in argv, "a plain connect asks the client for --code and nothing else")
+        T.check("[--no-confirm]" in argv and "[--code]" in argv, "a plain connect asks the client for --code and --no-confirm")
 
 
 def case_off_paths():
@@ -236,7 +237,10 @@ def case_flags():
         for args, rc, text in ((("--tailscale", "--relay", "http://127.0.0.1:1"), 2, "--relay and --tailscale are mutually exclusive"),
                                (("--tailscale", "--no-code"), 2, "belong to the relay transport"),
                                (("--relay",), 2, "--relay needs a URL"),
-                               (("--bg",), 64, "code pairing confirms at this terminal — drop --bg, add --no-confirm, or use the QR")):
+                               (("--confirm", "--bg"), 64, "--confirm asks at this terminal and --bg leaves it"),
+                               (("--confirm",), 64, "--confirm asks at this terminal and stdin is not one"),
+                               (("--confirm", "--no-confirm"), 2, "--confirm and --no-confirm are mutually exclusive"),
+                               (("--confirm", "--no-code"), 2, "cannot be combined with --no-code")):
             s.events("events-1", PAIR_INIT)
             app = s.app(*args, recorder=True)
             app.close_stdin()
