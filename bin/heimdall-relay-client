@@ -1781,22 +1781,21 @@ class RelayClient:
             self._code_state = "approving"
             self._key_revealed = True  # before the post: whatever becomes of it, the relay may have read this key
             pending = {"device_pub": device_pub, "bound_at": payload.get("bound_at"), "key": key,
-                       "sid": self.session_id, "token": self.token, "timer": None}
+                       "sid": self.session_id, "token": self.token, "timer": None,
+                       "label": label, "login": login if valid_login(login) else "unknown"}
             self._pending = pending
         if not self._post_key_reveal():
             self._resolve_approval(False, "reveal-failed", pending)
             return
-        login = payload.get("gh_login")
-        timeout_s = int(APPROVAL_TIMEOUT_S) if APPROVAL_TIMEOUT_S == int(APPROVAL_TIMEOUT_S) else APPROVAL_TIMEOUT_S
-        event = {"event": "approve_request", "sas": sas_for(pending["sid"], self.pub, device_pub),
-                 "device_label": clean_text(payload.get("device_label") or "", 32) or "unnamed device",
-                 "gh_login": login if valid_login(login) else "unknown", "timeout_s": timeout_s}
         if self._no_confirm:
-            event["auto"] = True
-        emit(event)
-        if self._no_confirm:
+            # Nobody is asked, so there is no number to compute, show or write down: no approve_request event, and
+            # nothing of the SAS in the status file, the event log or any frame.
             self._resolve_approval(True, "auto", pending)
-        elif not self._control_open:
+            return
+        timeout_s = int(APPROVAL_TIMEOUT_S) if APPROVAL_TIMEOUT_S == int(APPROVAL_TIMEOUT_S) else APPROVAL_TIMEOUT_S
+        emit({"event": "approve_request", "sas": sas_for(pending["sid"], self.pub, device_pub),
+              "device_label": pending["label"], "gh_login": pending["login"], "timeout_s": timeout_s})
+        if not self._control_open:
             self._resolve_approval(False, "eof", pending)
         else:
             timer = threading.Timer(APPROVAL_TIMEOUT_S, self._resolve_approval, args=(False, "timeout", pending))
@@ -1836,8 +1835,73 @@ class RelayClient:
         self._forget_push_registrations()
         self._rearm_state()
         self.write_status()
+        emit({"event": "code_paired", "device_label": pending["label"], "gh_login": pending["login"],
+              "bound_at": self.bound_at})
         emit({"event": "device_bound", "bound_at": self.bound_at})
         self.state_ready.set()
+        self._leave_pairing_traces(pending)  # after state_ready: the first frame never waits on a disk write
+
+    def _claim_is_mine(self, login):
+        """True when a claim's GitHub login is the one the relay verified this laptop's token as when it opened the
+        window (compared without case: GitHub logins are case-insensitive). The relay releases a window only to its
+        owner's own identity, so a claim that names another is a relay that is wrong or lying -- and with no person
+        comparing a number, that is the one thing left to notice it with."""
+        mine = self._window_login
+        return valid_login(login) and isinstance(mine, str) and login.lower() == mine.lower()
+
+    def _refuse_claim(self, reason):
+        """A bind by code that must not pair, refused before a key was derived, revealed or sealed: say so, end the
+        session the relay bound it to, and renew the window (a fresh session and key; the same code)."""
+        emit({"event": "code_rejected", "reason": reason})
+        self._revoke_session(self.session_id, self.token)
+        self._renew_now.set()
+
+    def _paired_marker_path(self):
+        return os.path.join(self.root, ".heimdall", "app", "paired-%s.json" % self._code)
+
+    def _leave_pairing_traces(self, pending):
+        """A phone paired by code: leave the two things that make that visible to the operator -- the marker the
+        statusline reads (`<device> paired via code`, for as long as this process lives) and a notice in the
+        session's inbox, which heimdall-inbox-deliver hands the Claude session at its next boundary. Both name the
+        phone only by what the relay CLAIMED, already cleaned. Best effort: a bookkeeping fault is reported as an
+        `error` event and never undoes a bind."""
+        label, login = pending["label"], pending["login"]
+        try:
+            _atomic_write_json(self._paired_marker_path(),
+                               {"via": "code", "device_label": label, "gh_login": login,
+                                "bound_at": self.bound_at, "pid": os.getpid()})
+        except OSError as e:
+            emit({"event": "error", "detail": "paired marker not written: %s" % e})
+        if INBOX is None:
+            return
+        for shown in (label, "unnamed device"):  # a label the inbox's secret scan refuses must not cost the notice
+            text = ("[hmd notice] A phone just paired to this session by its session code %s. Relay-claimed device "
+                    "name: '%s'. GitHub account: @%s, the account this laptop's gh is signed in to. If this was not "
+                    "you, run `hmd app disconnect` to end the pairing and `hmd app identity revoke` to sign every "
+                    "phone out." % (self._code, shown, login))
+            try:
+                INBOX.append(self.root, text)
+                return
+            except INBOX.InboxError as e:
+                last = e.code
+            except OSError as e:
+                last = str(e)
+                break
+        emit({"event": "error", "detail": "pairing notice not queued: %s" % last})
+
+    def _remove_paired_marker(self):
+        """Take the statusline's marker down -- only a marker this very process wrote."""
+        if not self._code:
+            return
+        path = self._paired_marker_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                owner = json.load(f).get("pid")
+        except (OSError, ValueError, AttributeError):
+            return
+        if owner == os.getpid():
+            with contextlib.suppress(OSError):
+                os.unlink(path)
 
     # -- stream --------------------------------------------------------------
     def _open_stream(self):
@@ -2729,6 +2793,7 @@ class RelayClient:
         self._gh_secret = None  # a stopped client offers no code window, so it keeps no token
         self._login_shutdown()  # before the (network-bound) revoke: a login process must not outlive us
         self.revoke()
+        self._remove_paired_marker()
         self.write_status()
         emit({"event": "session_ended", "reason": reason})
 
@@ -2758,8 +2823,16 @@ def build_argparser():
                           "(approve / reject) from the lines after it. The token travels in a request body, so "
                           "the relay must be https:// or on this machine (localhost / a loopback address)")
     ap.add_argument("--no-confirm", action="store_true",
-                     help="with --code: approve a phone that claimed by code without asking the laptop. The relay "
-                          "is then trusted to deliver the right keys")
+                     help="with --code: pair a phone that claimed by code without asking the laptop, no SAS "
+                          "computed or shown, provided the claim names this laptop's own GitHub login (a claim "
+                          "naming another is refused and nothing is revealed). The relay is then trusted to "
+                          "deliver the right keys; without this flag the laptop is asked to compare the SAS")
+    ap.add_argument("--code-only", action="store_true",
+                     help="with --code: this client is a headless pair window -- nobody is shown its QR -- so it "
+                          "ends instead of idling as a QR-only session: exit %d when the code cannot be offered at "
+                          "all (no usable GitHub token, code pairing disabled), %d when it could not be this time "
+                          "(a clash, an unreachable relay), %d when the window's whole lifetime passed unclaimed"
+                          % (CODE_ONLY_EXIT_OFF, CODE_ONLY_EXIT_RETRY, CODE_ONLY_EXIT_ENDED))
     ap.add_argument("--identity-revoke", action="store_true",
                      help="instead of a session: read the laptop's GitHub token from stdin, ask the relay to "
                           "revoke every phone sign-in for that GitHub user, print one event, exit (the same "
@@ -2817,6 +2890,8 @@ def main(argv=None):
         ap.error("the following arguments are required: %s" % ", ".join(missing))
     if args.no_confirm and not args.code:
         ap.error("--no-confirm needs --code")
+    if args.code_only and not args.code:
+        ap.error("--code-only needs --code")
 
     # Configured before the first possible emit() below (mirrors _split_relay
     # being computed here AND again inside RelayClient.__init__ -- a cheap
