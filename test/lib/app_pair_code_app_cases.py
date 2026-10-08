@@ -114,7 +114,7 @@ exit 2
 
     def app(self, *args, recorder=False, env=None, tty=False):
         """`hmd app connect` with --repo and --port 0 (never the fixed 8710: the machine's own sessions live
-        there). `tty=True` gives it a terminal on stdin -- pair by code is only offered at one, or with --no-confirm."""
+        there). `tty=True` gives it a terminal on stdin -- only --confirm needs one."""
         argv = [H.APP_PATH, "connect", "--repo", self.sb.repo, "--port", "0"] + list(args)
         extra = dict(env or {})
         if recorder:

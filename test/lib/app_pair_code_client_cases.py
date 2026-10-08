@@ -280,12 +280,15 @@ def case_no_confirm_and_qr_bind():
     with Scenario() as s:
         c = s.client(extra=("--no-confirm",))
         c.wait_event("code_window")
-        sid, req = await_request(s, c)
+        sid = s.bind()
         bound = c.wait_event("device_bound")
+        paired = c.wait_event("code_paired")
         c.wait_for(lambda: s.relay.frames_of(sid, "state"), 15)
-        T.check(bool(req) and req.get("auto") is True and bool(bound) and bool(s.relay.frames_of(sid, "key_reveal"))
+        T.check(bool(bound) and bool(paired) and paired["gh_login"] == "octocat" and paired["device_label"] == "Pixel 9a"
+                and c.count_events("approve_request") == 0 and bool(s.relay.frames_of(sid, "key_reveal"))
                 and bool(s.relay.frames_of(sid, "state")),
-                "--no-confirm: approve_request is flagged auto and the session pairs without a control line", c.tail())
+                "--no-confirm: the claim pairs at once -- no approve_request (no SAS), a code_paired event naming what the relay claimed",
+                c.tail())
     for via in ("qr", None):
         with Scenario(ttl=2) as s:
             c = s.client(env={"HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2", "HMD_RELAY_CODE_RENEW_MIN_S": "0.5"})

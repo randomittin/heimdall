@@ -10,8 +10,10 @@
 #                                           known-answer vectors, registration, token hygiene, key_reveal + SAS +
 #                                           laptop approval, reject / timeout / closed input, renewal, QR bind
 #   test/lib/app_pair_code_app_cases.py     the REAL bin/heimdall-app: transport default, the token's path, the
-#                                           code `hmd ui` shows, every "off" path, --bg / --no-confirm, the
-#                                           prompt and its escape stripping, identity revoke, one whole pairing
+#                                           code `hmd ui` shows, every "off" path, the --confirm refusals (no
+#                                           terminal, --bg), the --confirm prompt and its escape stripping,
+#                                           identity revoke, one whole pairing (code-only pairing, the default
+#                                           since 2026-10-08, is test/app-pair-confirm.test.sh)
 # plus the static checks the handoff lists for the client and for the token's path.
 set -u
 
