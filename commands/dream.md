@@ -50,7 +50,7 @@ Then run the executable checks over the rules this repo already wrote down, and 
 what they find into the same morning report:
 
 ```bash
-heimdall-conformance all         # commit-per-unit · brief-routing · gate-runs-once · gates-at-end
+heimdall-conformance all         # commit-per-unit · brief-routing · gate-runs-once · gates-at-end · suite-runs-once
 heimdall-conformance inventory   # every normative rule with a CHECKED / UNCHECKABLE verdict
 ```
 
