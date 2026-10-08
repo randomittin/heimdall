@@ -842,6 +842,14 @@ CODE_RENEW_MARGIN_S = _env_seconds("HMD_RELAY_CODE_RENEW_MARGIN_S", 1.5)
 CODE_RENEW_MIN_S = _env_seconds("HMD_RELAY_CODE_RENEW_MIN_S", 5.0)
 APPROVAL_TIMEOUT_S = _env_seconds("HMD_RELAY_APPROVAL_TIMEOUT_S", 60.0)
 
+# What a --code-only client exits with when its code window cannot be offered or ends unbound (0 stays "a clean end"):
+# OFF -- the relay will not take this laptop's code at all (no usable GitHub token, or code pairing disabled there), so
+# trying again changes nothing; RETRY -- it could not be offered this time (a clash, an unreachable or unwell relay), so
+# a later try may; ENDED -- the window's whole lifetime passed unclaimed, and a new one is for the caller to open.
+CODE_ONLY_EXIT_OFF = 3
+CODE_ONLY_EXIT_RETRY = 4
+CODE_ONLY_EXIT_ENDED = 5
+
 
 def b64url(raw):
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -1234,6 +1242,9 @@ class RelayClient:
         # state "off", nothing read from stdin -- unless --code was given.
         self._code = getattr(args, "code", None)
         self._no_confirm = bool(getattr(args, "no_confirm", False))
+        self._code_only = bool(getattr(args, "code_only", False))
+        self.exit_code = 0             # what main() returns: 0, or why a --code-only client ended (CODE_ONLY_EXIT_*)
+        self._window_login = None      # the GitHub login the relay verified this laptop's token as when it opened the window
         self._stdin = None             # _StdinLines over fd 0: the token line, then the operator's answers
         self._control_open = True      # False once stdin ended: nobody is left to answer an approval
         self._gh_secret = None         # the laptop's GitHub token. Memory only, dropped when the window ends
@@ -1556,6 +1567,16 @@ class RelayClient:
             self.write_status()
             emit({"event": "session_ended", "reason": "key-revealed"})
             self.stop_event.set()
+        if self._code_only:
+            # A pair window nobody can see the QR of has no other purpose: end, and say why in the exit code
+            # (CODE_ONLY_EXIT_*), so whoever opened it knows whether opening another could do any better.
+            if event == "code_window_closed":
+                self.exit_code = CODE_ONLY_EXIT_ENDED
+            elif reason in ("no-gh", "disabled"):
+                self.exit_code = CODE_ONLY_EXIT_OFF
+            else:
+                self.exit_code = CODE_ONLY_EXIT_RETRY
+            self.stop_event.set()
 
     def _code_bound(self):
         """A bind that needed no approval (the QR's) ended the window: the token has nothing left to do."""
@@ -1586,6 +1607,7 @@ class RelayClient:
             self._code_state = "open"
             self._code_deadline = now + CODE_WINDOW_TOTAL_S
             self._last_renew_at = now
+            self._window_login = login
             self._schedule_lapse(exp)
         emit({"event": "code_window", "code": self._code, "gh_login": login, "exp": exp})
         threading.Thread(target=self._control_loop, name="code-control", daemon=True).start()
@@ -1657,6 +1679,7 @@ class RelayClient:
                 old = (self.session_id, self.token)
                 self.session_id, self.token, self.exp = new_id, new_token, data["exp"]
                 self.priv, self.pub, self._commit_nonce = priv, pub, nonce
+                self._window_login = login
                 self._key_revealed = False  # a fresh key that no one has seen: binds are accepted on it again
                 self._code_renewals += 1
                 renewal = self._code_renewals
@@ -1736,8 +1759,17 @@ class RelayClient:
         return False
 
     def _begin_approval(self, payload, device_pub):
-        """A phone claimed the window by code. hmd reveals its key, shows the SAS, and seals NOTHING until the
-        laptop answers (or --no-confirm answers for it)."""
+        """A phone claimed the window by code. Asked (this client's default, and `hmd app connect --confirm`): hmd
+        reveals its key, shows the SAS, and seals NOTHING until the laptop answers. Unasked (--no-confirm, what
+        `hmd app connect` passes unless --confirm): the claim must name THIS laptop's own GitHub login, which is
+        checked here, before a key is derived or revealed, and then the session pairs with no SAS computed, shown
+        or logged -- the person who would have compared it has been replaced by that check, and the trust the
+        compare placed in nobody now rests on the relay (the module docstring's PAIR BY SESSION CODE)."""
+        login = payload.get("gh_login")
+        label = clean_text(payload.get("device_label") or "", 32) or "unnamed device"
+        if self._no_confirm and not self._claim_is_mine(login):
+            self._refuse_claim("identity-mismatch")
+            return
         try:
             key = E2E.derive_session_key(self.priv, device_pub, self.session_id)
         except Exception as e:
