@@ -4,7 +4,8 @@
 # The phone half is hmdapp's src/attach (docs/HANDOFF-TO-HEIMDALL-cursor-parity.md CP6; asked for again in docs/HANDOFF-TO-HEIMDALL-chat-replies.md
 # section A). The wire under test, through the REAL bin/heimdall-relay-client against test/lib/fake-relay.py (a hermetic stand-in for the
 # relay; test/lib/view_phone.py plays the paired phone and seals with the real bin/lib/hmd_relay_e2e.py -- nothing about the client is mocked,
-# and no case imports the client or bin/lib/companion_attach.py):
+# and no case imports the client or bin/lib/companion_attach.py; the few that must see inside one call -- a decode that never ran, a write that
+# never started, a link on the way down -- run the dispatcher by path in a fresh interpreter: test/lib/attach_inproc.py):
 #     cap      attach-v1 in every state frame's caps -- and NOT required in the phone's own resync (the shipped app never lists it)
 #     command  {"action":"attach-begin","params":{"rid","name","mime","bytes","w","h","n","sha256"}}   ack {id: att-<8 hex>, result: {chunk_max}}
 #              {"action":"attach-chunk","params":{"rid","id","idx","b64"}}                              ack {}
@@ -13,21 +14,30 @@
 #              bin/heimdall-inbox-deliver hands to the Claude session behind its provenance marker
 #
 # What it proves (the cases live in test/lib/attach_scenarios.py, one group per concern):
-#   wire     the cap, the three ack shapes, a phone that never listed attach-v1 can attach, begin de-duplicated on its rid
-#   happy    two chunks (256 KiB + the rest) -> the file, its modes, its sha256, the inbox line, the delivered text with the marker; the path in no
+#   wire     the cap, the three ack shapes, a phone that never listed attach-v1 can attach, begin de-duplicated on its rid -- and a rid ANOTHER
+#            action used is not a replay
+#   happy    two chunks (256 KiB + the rest) -> the file, its modes, its sha256, the inbox record, the delivered text with the marker; the path in no
 #            frame, event, log or audit line; Exif/GPS/XMP/IPTC/comment/thumbnail stripped from a JPEG and eXIf/text/time from a PNG; the size in the
-#            line from the file, not the phone; a hostile `name` ("../../x") never part of any path; a masked secret; stripped escapes; the pin
+#            line from the file (and equal to the phone's); a hostile `name` ("../../x") never part of any path; a masked secret; stripped escapes;
+#            the pin; the note and the pin's note QUOTED as JSON strings on lines of their own, so a note cannot forge a second hmd-looking
+#            '[image attached: ...]' line
 #   max      exactly 2 MiB in 8 chunks (~3.7 MB of sealed frames on ONE stream connection) through the real client, on the NDJSON leg
 #            (max) and on the WebSocket leg the hosted relay speaks (maxws): the client's per-connection byte cap must not drop the stream
 #            on the phone's own authenticated frames
 #   refuse   bad mime, oversize, 9 chunks, every malformed param, an id that is not att-<8 hex>, a wrong-size, over-long or malformed chunk, a
 #            replayed chunk, out-of-order chunks, a missing chunk (incomplete: the upload stays open), a commit replayed, a magic mismatch, a sha
-#            mismatch, a corrupted chunk, a cut JPEG, a bad PNG checksum, a frame header that says 9000x9000 -- and after every refusal nothing
-#            stored and nothing queued
-#   gate     the kill switch (controls-off), an attachments directory that is a symlink, the direct route (not-implemented), controls.actions
-#   keep     the 20 newest and 24 h, a symlink removed as a link, a stranger's file untouched, the sweep when the client starts
+#            mismatch, a corrupted chunk, a cut JPEG, a bad PNG checksum, a frame header that says 9000x9000, a declared size that is not the
+#            file's (also swapped sides), a 42-megapixel PNG bomb at begin and at commit, the 40-megapixel boundary, a note one character over
+#            what the record holds (refused BEFORE the file is written) and one at the limit -- and after every refusal nothing stored and
+#            nothing queued
+#   gate     the kill switch (controls-off), an attachments directory, `.heimdall/app` or `.heimdall` that is a symlink (refused, nothing
+#            written outside, the sweep does not follow it either), a directory another account owns (refused before any chmod), the direct
+#            route (not-implemented), controls.actions
+#   keep     the 20 newest and 24 h, a symlink removed as a link, a stranger's file untouched, the sweep when the client starts, and a picture
+#            whose inbox record is still waiting kept past both limits until the record is delivered
 #   off      HMD_ATTACH=0: the cap is not listed and every command is not-implemented (a phone that was not offered cannot attach)
-#   rate     3 open uploads at most (too-many), then rate-limited with retry_after_s
+#   rate     3 open uploads at most (too-many), then rate-limited with retry_after_s; a burst of chunks past its bucket is refused without
+#            one base64 decode
 # and, falsifiably, that each rule is the thing holding: a copy with one rule removed must turn its group red.
 #
 # Hermetic: HOME/HEIMDALL_HOME/TMPDIR are temp dirs, every process this suite starts is reaped on exit, every wait is bounded.
@@ -47,7 +57,7 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 
 echo "companion-attach (the phone's picture: attach-v1 through the real relay client)"
 
-for f in "$CLIENT" "$SCEN" "$MODULE" "$REPO/test/lib/view_phone.py" "$REPO/test/lib/fake-relay.py" "$REPO/bin/heimdall-inbox-deliver"; do
+for f in "$CLIENT" "$SCEN" "$MODULE" "$REPO/test/lib/attach_inproc.py" "$REPO/test/lib/view_phone.py" "$REPO/test/lib/fake-relay.py" "$REPO/bin/heimdall-inbox-deliver"; do
   if [ ! -e "$f" ]; then
     printf 'FATAL: required file missing: %s\n' "$f" >&2
     printf '\n0 passed, 1 failed\n'
@@ -165,12 +175,22 @@ mutant skip-chunk-size    bin/lib/companion_attach.py '        if idx >= up.n or
 mutant skip-exif-strip    bin/lib/companion_attach.py '    return marker in _JPEG_STRUCTURAL' '    return True' happy
 mutant skip-png-strip     bin/lib/companion_attach.py '        if kind in _PNG_KEEP:' '        if True:' happy
 mutant skip-secret-mask   bin/lib/companion_attach.py '        text = rx.sub(MASK, text)' '        text = text' happy
-mutant loose-file-mode    bin/lib/companion_attach.py '        os.fchmod(fd, 0o600)' '        os.fchmod(fd, 0o644)' happy
-mutant loose-dir-mode     bin/lib/companion_attach.py $'    os.chmod(path, 0o700)\n    return path' $'    os.chmod(path, 0o755)\n    return path' happy
-mutant no-path-in-line    bin/lib/companion_attach.py 'text = "[image attached: %s (%dx%d)" % (path, width, height)' 'text = "[image attached: %s (%dx%d)" % ("-", width, height)' happy
-mutant follow-dir-symlink bin/lib/companion_attach.py '    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():' '    if False:' gate
+mutant loose-file-mode    bin/lib/companion_attach.py '            os.fchmod(fd, 0o600)' '            os.fchmod(fd, 0o644)' happy
+mutant loose-dir-mode     bin/lib/companion_attach.py '                os.fchmod(fd, 0o700)' '                os.fchmod(fd, 0o755)' happy
+mutant no-path-in-line    bin/lib/companion_attach.py '"[image attached: %s (%dx%d)]" % (path, width, height)' '"[image attached: %s (%dx%d)]" % ("-", width, height)' happy
+mutant follow-dir-symlink bin/lib/companion_attach.py '_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW' '_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY' gate
+mutant skip-owner-check   bin/lib/companion_attach.py '        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():' '        if False:' gate
 mutant ignore-off-switch  bin/lib/companion_attach.py '        if not enabled() or ctx.caps is None:' '        if False:' off,gate
-mutant keep-everything    bin/lib/companion_attach.py '        if rank >= KEEP or now - mtime >= KEEP_TTL_S:' '        if False:' keep
+mutant keep-everything    bin/lib/companion_attach.py '            expendable = rank >= KEEP or now - mtime >= KEEP_TTL_S' '            expendable = False' keep
+mutant evict-waiting      bin/lib/companion_attach.py '            if expendable and waiting is not None and name not in waiting:' '            if expendable:' keep
+mutant raw-note           bin/lib/companion_attach.py '        lines.append("phone note: " + _quoted(message))' '        lines.append("phone note: " + message)' happy
+mutant raw-pin-note       bin/lib/companion_attach.py '        lines.append(where + ": " + _quoted(pin["note"]) if pin["note"] else where)' '        lines.append(where + ": " + pin["note"] if pin["note"] else where)' happy
+mutant no-pixel-cap-begin bin/lib/companion_attach.py '    if w * h > MAX_PIXELS:' '    if False:' refuse
+mutant no-pixel-cap-commit bin/lib/companion_attach.py ' or width * height > MAX_PIXELS:' ':' refuse
+mutant no-size-match      bin/lib/companion_attach.py '    if (width, height) != (up.w, up.h):' '    if False:' refuse
+mutant note-after-write   bin/lib/companion_attach.py '    if len(text) > inbox.MAX_TEXT_CHARS:' '    if False:' refuse
+mutant charge-after-decode bin/lib/companion_ui_controls.py '    charged = spec["policy"].get("max_bytes", MAX_COMMAND_BYTES) > LARGE_COMMAND_BYTES' '    charged = False' rate
+mutant rid-without-action bin/lib/companion_ui_controls.py '        key = (action, rid)' '        key = rid' wire
 mutant cap-not-listed     bin/heimdall-relay-client '([ATTACH.CAP_ATTACH] if ATTACH is not None and ATTACH.enabled() else [])' '[]' wire
 mutant no-startup-sweep   bin/heimdall-relay-client '        ATTACH.sweep(client.root)  # a picture past its TTL does not outlive a restart' '        client.root  # mutant' keep
 mutant stream-cap-counts-all bin/heimdall-relay-client '                    stream_total_bytes -= size' '                    stream_total_bytes -= 0' max
