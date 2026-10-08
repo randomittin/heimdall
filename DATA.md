@@ -531,8 +531,8 @@ listed the capability, at most 20 requests per 60 s):
   a secret-shaped line is masked `[redacted]` whole. **This is the one place source code
   itself leaves your machine — to the phone you paired, sealed.**
 - a **transcript** tail of this repo's session or of one subagent (at most 500 turns, each
-  one line of at most 240 characters: a prompt, an assistant text, or a tool call's name,
-  status and first output line; a secret-shaped turn is masked).
+  of at most 400 characters, its line breaks kept: a prompt, an assistant text, or a tool
+  call's name, status and first output line; a secret-shaped turn is masked).
 - a **pull-request summary** from your local `gh pr view` (number, title, state, checks,
   reviewers, URL).
 

@@ -22,8 +22,9 @@
 #            the relay's redaction profile on the result, the 2000-character line cut
 #   params   the exact key set of each kind, every wrong type and range, and the contract's fourth kind, reel (not-implemented)
 #   size     max_bytes at a hunk boundary, a first hunk kept in part, the slice budget, the 1 MiB envelope, zlib, the 2000-file cap
-#   transcript  the repo's own session written into the client's HOME: the turns exactly (prompt, assistant text, one line per tool call;
-#            no thinking, sidechain, caveat or noise), tail, the newest-first slice budget, the 4 MiB read window, a secret masked whole
+#   transcript  the repo's own session written into the client's HOME: the turns exactly (prompt and assistant text with their line breaks
+#            kept, one line per tool call; no thinking, sidechain, caveat or noise), the 400-character cut the phone makes too, tail, the
+#            newest-first slice budget (and the sealed frame it bounds, plain and zlib), the 4 MiB read window, a secret masked whole
 #            even when the cut would have half shown it, no output line for a call that named .env, a symlinked session or agent file
 #            never followed, agent_id (sidechain file, metadata role, an older session's agent, unknown, hostile ids)
 #   pr       a fake gh first on the client's PATH: its argv is exactly `pr view --json <fields>`, a GH_TOKEN reaches it only by environment
@@ -161,8 +162,12 @@ mutant skip-cap-check    bin/lib/companion_view.py $'        if not has_cap:\n  
 # and state.asks all take theirs from it -- this one site is the whole rule. A second inline copy of that lambda would make the site
 # appear twice and the mutant unbuildable ("found 2 times, not once"): the alarm that the rule has been duplicated again.
 mutant skip-redaction    bin/heimdall-relay-client 'return (lambda obj: UI._redact_public(obj, strip_root)) if redact else None' 'return None' secrets
-mutant drop-turn-mask    bin/lib/companion_view.py $'    if P.secret_shaped(line[:limit + SCAN_MARGIN]):\n        return REDACTED' $'    if False:\n        return REDACTED' transcript,pr
-mutant scan-only-shown-text bin/lib/companion_view.py 'P.secret_shaped(line[:limit + SCAN_MARGIN])' 'P.secret_shaped(line[:limit - 1])' transcript
+mutant drop-turn-mask    bin/lib/companion_view.py $'    if P.secret_shaped(text[:limit + SCAN_MARGIN]):\n        return REDACTED' $'    if False:\n        return REDACTED' transcript,pr
+mutant scan-only-shown-text bin/lib/companion_view.py 'P.secret_shaped(text[:limit + SCAN_MARGIN])' 'P.secret_shaped(text[:limit - 1])' transcript
+mutant turn-cap-240      bin/lib/companion_view.py 'TURN_CHARS = 400' 'TURN_CHARS = 240' transcript
+mutant collapse-turn-newlines bin/lib/companion_view.py '"s": _multi_line(text, TURN_CHARS)' '"s": _one_line(text, TURN_CHARS)' transcript
+mutant lone-cr-is-no-break bin/lib/companion_view.py 'for line in raw.splitlines()' 'for line in raw.split("\n")' transcript
+mutant keep-blank-runs   bin/lib/companion_view.py '_BLANK_RUN = re.compile(r"\n{3,}")' '_BLANK_RUN = re.compile(r"\n{999,}")' transcript
 mutant skip-tail         bin/lib/companion_view.py 'chosen = turns[-req["tail"]:]' 'chosen = turns' transcript
 mutant show-denied-output bin/lib/companion_view.py 'if lines and not _names_denied(call):' 'if lines:' transcript
 mutant follow-transcript-symlink bin/lib/companion_view.py 'os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |' 'os.open(path, os.O_RDONLY | os.O_NONBLOCK |' transcript

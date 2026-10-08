@@ -20,7 +20,7 @@ rule about what may be shown:
                 "files":[{"path","status":"M|A|D|R|C|T|U|?","add","del","binary"[,"old_path"]}],
                 "hunks":[{"path","header":"@@ -a,b +c,d @@ ...","lines":[{"t":"+"|"-"|" "|"\\","s":<text>}]}]}
                {"id","kind":"transcript","at","truncated":bool,"agent":null|{"id","role","state"},
-                "turns":[{"role":"user"|"assistant"|"tool","s":<one line, at most 240 characters>}]}
+                "turns":[{"role":"user"|"assistant"|"tool","s":<the turn's text, at most 400 characters, line breaks kept>}]}
                {"id","kind":"pr","at","number","title","state":"open|closed|merged","draft":bool,
                 "mergeable":"MERGEABLE|CONFLICTING|UNKNOWN","head":<40 hex>,"checks":[{"name","status"}],
                 "reviewers":[{"login","state"}],"gate":null|{"clear_to_push":bool,"receipt_head":<40 hex>|null,
@@ -49,12 +49,14 @@ What the phone can never be shown, in the order it is checked (the diff rules fi
 Transcript: the session hmd_session_resolve picks for this repo (the one rule every hmd-ui collector shares: never
 another repo's session), or -- with agent_id, a plain [A-Za-z0-9_-] key -- that subagent's `agent-<id>.jsonl` under this
 repo's sessions (agent.role is its spawn-time agentType, agent.state is "": the roster owns the state). Only the last 4 MiB of the
-file is read, opened without following a link. Each turn is ONE line of at most 240 characters: a prompt, an
-assistant text, or a tool call's `<name> · <ok|error|exit N> · <first line of its output>` (never the output itself;
-no output line at all when the call named a path the diff view would refuse, .env and key files among them). Thinking,
-images, sidechain chatter and local-command noise are left out. A turn whose text is secret-shaped is "[redacted]" whole
-(the check reaches past the cut, so a key the length limit would have half shown is never half shown); the newest `tail`
-turns are kept and so many of them as fit the slice budget; `truncated` says older ones were left out.
+file is read, opened without following a link. Each turn is text of at most 400 characters (the phone's own cut, MAX_TURN_CHARS in
+hmdapp src/views/guards.ts; a longer one ends in an ellipsis, and a line break counts as a character): a prompt or an assistant text
+with its line breaks kept (each one a newline whatever the transcript used, every line's whitespace collapsed to single spaces, a
+run of blank lines cut to one, none at either end), or a tool call's `<name> · <ok|error|exit N> · <first line of its output>` (one
+line; never the output itself; no output line at all when the call named a path the diff view would refuse, .env and key files
+among them). Thinking, images, sidechain chatter and local-command noise are left out. A turn whose text is secret-shaped is
+"[redacted]" whole (the check reaches past the cut, so a key the length limit would have half shown is never half shown); the
+newest `tail` turns are kept and so many of them as fit the slice budget; `truncated` says older ones were left out.
 
 PR: `gh pr view --json number,title,state,isDraft,mergeable,headRefOid,statusCheckRollup,reviews,url` run as an argv list in
 the checkout, read-only, under the contract's 8 s bound and a 4 MiB output cap, in a whitelisted environment (gh's own login
@@ -117,7 +119,7 @@ MAX_FILES, MAX_HUNKS, MAX_LINES = 2000, 5000, 20000
 MAX_LINE_CHARS, MAX_HEADER_CHARS = 2000, 500
 REDACTED = "[redacted]"
 DEFAULT_TAIL, MAX_TAIL = 200, 500             # transcript turns asked for; the phone's own cap is 500
-TURN_CHARS = 240                              # one line a turn (the contract); the phone cuts at 400
+TURN_CHARS = 400                              # a turn's text: the phone's own cut (hmdapp src/views/guards.ts MAX_TURN_CHARS)
 SCAN_MARGIN = 256                             # how far past the shown text a secret may start and still be seen
 TRANSCRIPT_WINDOW = 4 * 1024 * 1024           # bytes read from the END of a transcript; earlier turns are never parsed
 META_BYTES = 65536                            # a subagent's metadata file
@@ -130,6 +132,7 @@ MAX_SAFE_INT = 2 ** 53 - 1
 
 _RID = re.compile(r"[A-Za-z0-9_-]{1,32}")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_BLANK_RUN = re.compile(r"\n{3,}")            # two or more blank lines in a row
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _PEM_BEGIN = re.compile(r"-----BEGIN[ A-Z]*PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END[ A-Z]*PRIVATE KEY-----")
@@ -477,13 +480,25 @@ def _read_tail(path, limit):
     return b"".join(chunks), start > 0
 
 
-def _one_line(raw, limit):
-    """`raw` as one line the phone may see: whitespace collapsed to single spaces, "[redacted]" when the part that can be
-    shown -- and a margin past it, so a secret the cut would have half shown is caught -- is secret-shaped, else cut at `limit`."""
-    line = " ".join(raw.split())
-    if P.secret_shaped(line[:limit + SCAN_MARGIN]):
+def _mask_or_cut(text, limit):
+    """`text`, its whitespace already normalized, as the phone may see it: "[redacted]" when the part that can be shown -- and a
+    margin past it, so a secret the cut would have half shown is caught -- is secret-shaped, else cut at `limit` characters."""
+    if P.secret_shaped(text[:limit + SCAN_MARGIN]):
         return REDACTED
-    return line if len(line) <= limit else line[:limit - 1] + "…"
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _one_line(raw, limit):
+    """`raw` as one line the phone may see: every run of whitespace, line breaks included, becomes one space."""
+    return _mask_or_cut(" ".join(raw.split()), limit)
+
+
+def _multi_line(raw, limit):
+    """`raw` as the lines of a turn the phone may see: each line break (CRLF, a lone CR, U+2028, ...) is one newline, each line's
+    whitespace collapses to single spaces, a run of blank lines is cut to one and none is left at either end. A newline counts
+    as a character toward `limit`, as it does on the phone."""
+    lines = "\n".join(" ".join(line.split()) for line in raw.splitlines())
+    return _mask_or_cut(_BLANK_RUN.sub("\n\n", lines).strip(), limit)
 
 
 def _cut(text, limit):
@@ -936,7 +951,7 @@ class ViewManager:
         truncated = partial or len(chosen) < len(turns)
         shown, used = [], BASE_JSON_BYTES + _jsize(agent)
         for role, text in reversed(chosen):
-            turn = {"role": role, "s": _one_line(text, TURN_CHARS)}
+            turn = {"role": role, "s": _multi_line(text, TURN_CHARS)}
             size = _jsize(turn) + 1
             if used + size > self._budget:
                 truncated = True
