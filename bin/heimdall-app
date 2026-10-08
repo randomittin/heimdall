@@ -10,7 +10,7 @@
 #   bin/heimdall-ui            the loopback companion web UI this publishes
 #
 # Usage:
-#   hmd app connect [--repo DIR] [--port N] [--relay URL] [--bg] [--no-code] [--no-confirm]
+#   hmd app connect [--repo DIR] [--port N] [--relay URL] [--bg] [--no-code] [--confirm]
 #                              With no transport flag: publish through the hosted Cloudflare relay (the
 #                              DEFAULT, https://hmd-relay.therishabh16.workers.dev; HMD_RELAY_URL overrides
 #                              it and --relay URL overrides both) -- see the relay block below.
@@ -49,21 +49,50 @@
 #                              down later with `hmd app disconnect`).
 #                              PAIR BY CODE (on whenever `gh auth token` yields a
 #                              token, off with --no-code): the 5-character session
-#                              code `hmd ui` shows is registered with the relay
-#                              under this laptop's GitHub identity and printed as
-#                              SESSION CODE -- typing it in the app pairs a phone
-#                              signed in to GitHub as the same user, no QR. The
+#                              code the statusline shows is registered with the
+#                              relay under this laptop's GitHub identity and
+#                              printed as SESSION CODE -- typing it in the app
+#                              pairs a phone signed in to GitHub as the same user,
+#                              at once: no QR, no number to compare, no question
+#                              here (with --bg too, and with no terminal). The
 #                              token goes to the relay client on a pipe, once, and
-#                              is on no argv, environment variable or file. A phone
-#                              that claims the code shows a 6-digit number; the
-#                              same number is shown here and you approve it
-#                              (y/N, 60 s) -- nothing is sent to the phone until
-#                              you do. --no-confirm approves for you (the relay is
-#                              then trusted to deliver the right keys); --bg needs
-#                              it, there being no terminal to ask at (exit 64
-#                              without it). The code is offered for 10 minutes. No
-#                              gh, signed out, a code clash or a relay that cannot
-#                              do it prints one line and leaves the QR as it was.
+#                              is on no argv, environment variable or file. The
+#                              claim must name this laptop's own GitHub login or it
+#                              is refused and nothing is revealed; past that the
+#                              relay is trusted to deliver the right keys, and a
+#                              pairing leaves a notice in the Claude session and on
+#                              the statusline. --confirm asks instead: the phone
+#                              shows a 6-digit number, the same number is shown
+#                              here and you approve it (y/N, 60 s) -- nothing is
+#                              sent to the phone until you do. It needs a terminal
+#                              and cannot be combined with --bg (exit 64);
+#                              --no-confirm is accepted and means the default. The
+#                              code is offered for 10 minutes. No gh, signed out, a
+#                              code clash or a relay that cannot do it prints one
+#                              line and leaves the QR as it was. When this
+#                              session's pair window (below) already offers the
+#                              code, connect says so and leaves the code to it;
+#                              --confirm stops that window first, the compare
+#                              needing the code for itself.
+#   hmd app pair-window --session SID [--pid N] [--repo DIR] [--relay URL]
+#   hmd app pair-window --stop --session SID [--repo DIR]
+#                              One Claude Code session's pair-by-code window, with no
+#                              terminal: the SessionStart hook runs the first form, the
+#                              SessionEnd hook the second. It records the session
+#                              (<repo>/.heimdall/app/session.json, so every reader of the
+#                              session code agrees) and, when `gh` is signed in, starts a
+#                              detached supervisor that keeps a `heimdall-relay-client
+#                              --code --no-confirm --code-only` registered for this
+#                              session's code, opens a new window each time the client's
+#                              own ends (HMD_PAIR_WINDOW_RESTART_S, default 5), and stops
+#                              when the Claude process --pid names is gone, on --stop, or
+#                              on `hmd app disconnect`. The code is the statusline's; a
+#                              phone that types it pairs at once, with the notice and no
+#                              compare. gh signed out prints one line (scan the QR) and
+#                              opens nothing; HMD_PAIR_WINDOW=0 turns it off; an
+#                              unattended session (claude -p, an hmd sub-session) gets
+#                              none. `hmd hooks disable pair-window-start` opts out of the
+#                              hook.
 #   hmd app identity revoke [--relay URL]
 #                              Revoke every phone sign-in made with this laptop's
 #                              GitHub identity (`gh auth token` is sent to the
@@ -203,8 +232,8 @@
 #                              back.
 #   hmd app -h|--help          This help.
 #
-# Exit codes (connect): 64 bad --https-port (or --bg with code pairing and no
-# --no-confirm), 4 tailscale not installed
+# Exit codes (connect): 64 bad --https-port (or --confirm without a terminal, or
+# with --bg), 4 tailscale not installed
 # (declined the install prompt, or --no-install), 5 tailscale installed but
 # not online, or its DNSName fails validation, 3 the tailnet's policy blocks
 # Funnel (HTTPS certs / the Funnel node attribute aren't granted -- the CLI's
@@ -665,6 +694,101 @@ _ctl_send() {
   printf '%s\n' "$1" 2>/dev/null >&3 || true
 }
 
+# ── the pair window: one Claude Code session's code, offered with no terminal (see `hmd app pair-window` above) ─────
+
+# _session_attended -- 0 when a person is typing into this session. False for a headless `claude -p` / SDK session
+# and for hmd's own sub-sessions: they share a repo, and its hooks, with the real one and must not each open a
+# window (bin/heimdall-inbox-deliver's attended_session, the same rule for the same reason).
+_session_attended() {
+  case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-cli|sdk-ts|sdk-py|mcp|claude-code-github-action) return 1 ;; esac
+  [ -z "${HMD_AGENT_TYPE:-}" ] || return 1
+  case "$(printf '%s' "${HMD_JUDGMENT:-}" | tr '[:upper:]' '[:lower:]')" in ''|0|false) return 0 ;; *) return 1 ;; esac
+}
+
+# _pw_valid_sid SID -- a Claude Code session id as a file-name-safe key (it names the window's state file).
+_pw_valid_sid() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{1,128}$'; }
+
+# _pw_app_dir_plain REPO -- 0 when <REPO>/.heimdall and <REPO>/.heimdall/app are real directories. A link there would
+# carry a window's state wherever it points, so nothing is listed or signalled through one (what is WRITTEN there goes
+# through bin/lib/hmd_private_state.py, which refuses a link itself).
+_pw_app_dir_plain() {
+  local d="$1/.heimdall"
+  [ -d "$d" ] && [ ! -L "$d" ] && [ -d "$d/app" ] && [ ! -L "$d/app" ]
+}
+
+# _pid_is_pair_window PID -- the recycled-pid safety of _pid_is_heimdall_ui (A14), for a window's supervisor.
+_pid_is_pair_window() {
+  local pid="$1" cmd
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(ps -o command= -p "$pid" 2>/dev/null || ps -o comm= -p "$pid" 2>/dev/null || true)"
+  case "$cmd" in
+    *heimdall-app*pair-window-loop*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _pw_live_files REPO -- one state file per line: every <REPO>/.heimdall/app/pair-window-*.json whose supervisor is
+# alive. A file whose supervisor is gone is cleared on the way.
+_pw_live_files() {
+  local repo="$1" f pid
+  _pw_app_dir_plain "$repo" || return 0
+  for f in "$repo"/.heimdall/app/pair-window-*.json; do
+    { [ -f "$f" ] && [ ! -L "$f" ]; } || continue
+    pid="$(jq -r '.pid // empty' "$f" 2>/dev/null)"
+    if _pid_is_pair_window "$pid"; then printf '%s\n' "$f"; else rm -f "$f" 2>/dev/null || true; fi
+  done
+}
+
+# _pair_window_holds REPO CODE -- 0 when a live pair window of this repo offers CODE.
+_pair_window_holds() {
+  local f
+  while IFS= read -r f; do
+    [ "$(jq -r '.code // empty' "$f" 2>/dev/null)" = "$2" ] && return 0
+  done < <(_pw_live_files "$1")
+  return 1
+}
+
+# _pair_window_stop_file FILE [WAIT_S] -- TERM the supervisor the file names (it stops its client, which revokes its
+# session, and removes the file itself) and wait up to WAIT_S seconds (default 20) for it to be gone; past 5 s of
+# patience it is killed outright. A short WAIT_S (the SessionEnd hook's) leaves a slow clean-up to finish on its own.
+_pair_window_stop_file() {
+  local f="$1" wait_s="${2:-20}" pid steps=0 max
+  pid="$(jq -r '.pid // empty' "$f" 2>/dev/null)"
+  max=$((wait_s * 5))
+  if _pid_is_pair_window "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null && [ "$steps" -lt "$max" ]; do
+      sleep 0.2
+      steps=$((steps + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      [ "$wait_s" -ge 5 ] && _kill_tree KILL "$pid"
+      return 0
+    fi
+  fi
+  rm -f "$f" 2>/dev/null || true
+}
+
+# _pair_window_stop_all REPO -- stop every live window of the repo; prints how many it stopped.
+_pair_window_stop_all() {
+  local f n=0
+  while IFS= read -r f; do
+    _pair_window_stop_file "$f" 20
+    n=$((n + 1))
+  done < <(_pw_live_files "$1")
+  printf '%s' "$n"
+}
+
+# _pair_window_stop_code REPO CODE -- stop the live window(s) of the repo that offer CODE.
+_pair_window_stop_code() {
+  local f
+  while IFS= read -r f; do
+    [ "$(jq -r '.code // empty' "$f" 2>/dev/null)" = "$2" ] && _pair_window_stop_file "$f" 20
+  done < <(_pw_live_files "$1")
+  return 0
+}
+
 # _relay_event LINE -- what `hmd app connect` does with one event line the relay client printed. It reads and
 # sets cmd_connect_relay's own variables (pair_init_seen, pairing_exp, code_*, ...): bash scopes `local`
 # dynamically, and the loop that feeds it keeps them alive for exactly as long as it needs them.
@@ -717,6 +841,9 @@ _relay_event() {
       echo "  SESSION CODE: $wcode"
       echo "  In the hmd app tap \"Enter code\" and type $wcode."
       echo "  Only a phone signed in to GitHub as @$wlogin can use it. Valid for 10 min."
+      if [ "$CONFIRM" != true ]; then
+        echo "  No number to compare: a claim must name @$wlogin, and past that the relay is trusted (--confirm asks you)."
+      fi
       echo ""
       ;;
     code_unavailable)
@@ -740,12 +867,11 @@ _relay_event() {
       echo "hmd app: pairing rejected — device revoked"
       ;;
     approve_request)
-      local sas label login auto tmo ans
+      local sas label login tmo ans
       [ "$client_gone" = true ] && return 0  # the client exited: nobody is left to answer
       sas="$(printf '%s' "$line" | jq -r '.sas // empty' 2>/dev/null | tr -cd '0-9')"
       label="$(_clean_text "$(printf '%s' "$line" | jq -r '.device_label // empty' 2>/dev/null)")"
       login="$(_clean_text "$(printf '%s' "$line" | jq -r '.gh_login // empty' 2>/dev/null)")"
-      auto="$(printf '%s' "$line" | jq -r '.auto // empty' 2>/dev/null)"
       tmo="$(printf '%s' "$line" | jq -r '.timeout_s // 60' 2>/dev/null)"
       tmo="${tmo%%.*}"
       case "$tmo" in ''|*[!0-9]*) tmo=60 ;; esac
