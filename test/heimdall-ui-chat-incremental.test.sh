@@ -8,8 +8,10 @@
 # Two oracles, neither of them the incremental code grading itself:
 #
 #   1. DIFFERENTIAL. RefPublisher below is the pre-incremental `_refresh_derived` (parse_entries ->
-#      is_headless -> derive_turns -> format every turn -> fit_lines), copied VERBATIM from
-#      bin/lib/companion_ui_publish.py @ fccf7701 and run on a byte-identical twin of every transcript
+#      is_headless -> derive_turns -> format every turn -> fit_lines), copied from
+#      bin/lib/companion_ui_publish.py @ fccf7701 -- plus the one change the publisher has made since: a
+#      mid-turn (non-final) turn is a chat line like any other, and `final` only decides whether the NEWEST
+#      turn may be the hmd-question -- and run on a byte-identical twin of every transcript
 #      this suite builds. After every single mutation the two must agree on: tick()'s return value, the
 #      derived lines / question / mtime, the headless verdict, and the BYTES of the chat.json and
 #      hmd-question.json panel files -- and the ChatTail engine, driven directly, must agree with a fresh
@@ -78,7 +80,7 @@ def check(name, cond, detail=""):
     results.append((bool(cond), name, detail))
 
 
-# ── the frozen reference: the pre-incremental pipeline, verbatim @ fccf7701 ─────────────────────────
+# ── the reference: the pre-incremental pipeline @ fccf7701, mid-turn turns shown (see the header) ─────
 def ref_parse_entries(text):
     out = []
     for ln in text.split("\n"):
@@ -129,7 +131,7 @@ def ref_derive_turns(entries, fallback_ts):
         prompt = CP.human_prompt(e)
         if prompt is not None:
             turns.append({"role": "you", "ts": ts, "text": prompt, "mid": None, "final": True})
-    return [t for t in turns if t["final"]]
+    return turns
 
 
 def ref_view(read_tail, path, tail_bytes, mtime):
@@ -142,7 +144,7 @@ def ref_view(read_tail, path, tail_bytes, mtime):
     lines = [ln for ln in (CP.format_line(t["role"], t["text"], t["ts"]) for t in turns) if ln]
     last = turns[-1] if turns else None
     question = None
-    if last is not None and last["role"] == "hmd" and CP.is_question(last["text"]):
+    if last is not None and last["role"] == "hmd" and last["final"] and CP.is_question(last["text"]):
         question = CP.question_markdown(last["text"])
     return ref_is_headless(entries), CP.fit_lines(lines), question
 
@@ -171,7 +173,7 @@ class RefPublisher(CP.CompanionPublisher):
             lines = [ln for ln in (CP.format_line(t["role"], t["text"], t["ts"]) for t in turns) if ln]
             last = turns[-1] if turns else None
             question = None
-            if last is not None and last["role"] == "hmd" and CP.is_question(last["text"]):
+            if last is not None and last["role"] == "hmd" and last["final"] and CP.is_question(last["text"]):
                 question = CP.question_markdown(last["text"])
             self._derived = {"stamp": stamp, "mtime": mtime, "lines": CP.fit_lines(lines), "question": question}
             return self._derived
@@ -575,6 +577,7 @@ def section_2():
               0 < window < total)
 
     # a merged assistant turn [final part, tool part] cut by the window start: dropping the first part flips `final`
+    # (the turn's line stays; whether it may be the hmd-question goes)
     failures = []
     for tb in range(300, 1400, 37):
         g = Gen(30)

@@ -57,7 +57,11 @@ value are both normative.
 
 - P15. `MAX_FILE_BYTES = 65536` per panel file (checked before read and before write).
 - P16. `MAX_TITLE_CHARS = 120` (mirrors `bin/heimdall-activity`'s `SCRUB_MAX=120`).
-- P17. `MAX_STRING_CHARS = 500` per string leaf inside `data`.
+- P17. `MAX_STRING_CHARS = 500` per string leaf inside `data`. One exception, the phone
+  app's own (hmdapp `guards.ts` `MAX_CHAT_LINE_CHARS`): each line of the `chat`
+  log-tail panel — whole messages, not labels — may carry `MAX_CHAT_LINE_CHARS = 8000`
+  characters, its `HH:MM role ` head included. The cap is by panel id: every other
+  log-tail, the `hmd-question` text and every title keep 500.
 - P18. `MAX_LIST_ITEMS = 200` per list (kv rows, table rows, points per series,
   log-tail lines) — the `bin/lib/watch_data.read_feed(limit=200)` precedent.
 - P19. `MAX_SERIES = 6` (dataviz: categorical hues in fixed order, never a generated 7th).
@@ -142,7 +146,8 @@ value are both normative.
 
 - P39. `write_panel` (the `hmd ui panel set` CLI, P37/P38) is UNCHANGED: a
   log-tail panel whose `data.lines` exceeds `MAX_LIST_ITEMS`, whose file
-  exceeds `MAX_FILE_BYTES`, or any of whose lines exceeds `MAX_STRING_CHARS`,
+  exceeds `MAX_FILE_BYTES`, or any of whose lines exceeds its panel's line cap
+  (`MAX_STRING_CHARS`; `MAX_CHAT_LINE_CHARS` for `chat`, P17),
   is still REFUSED WHOLE at publish time, exactly as P17/P18/P20 state.
   Nothing below changes what a producer may write through the blessed CLI in
   one shot.
@@ -153,7 +158,9 @@ value are both normative.
   (P1 says one writer per file; it does not say that writer must be this
   CLI) is no longer required to already fit inside the publish-time caps to
   be served at all: `HMD_UI_LOG_TAIL_LINES` (default 200), `HMD_UI_LOG_TAIL_BYTES`
-  (default 65536), `HMD_UI_LOG_LINE_MAX` (default 2000 chars/line), each read
+  (default 65536), `HMD_UI_LOG_LINE_MAX` (default 2000 chars/line, and never
+  narrower than the panel's own write-time cap, so a `chat` line of 8000 is
+  served whole), each read
   fresh from the environment on every read. A line longer than the char limit
   is cut to exactly that many characters, the last being an ellipsis; the
   list is then trimmed from the OLD end (line 0 first), on whole-line

@@ -45,6 +45,8 @@ PANEL_TYPES = ("kv", "table", "number", "timeseries", "bars", "markdown", "log-t
 MAX_FILE_BYTES = 65536        # per panel file, checked before read AND before write
 MAX_TITLE_CHARS = 120         # mirrors bin/heimdall-activity's SCRUB_MAX=120
 MAX_STRING_CHARS = 500        # per string leaf inside data
+MAX_CHAT_LINE_CHARS = 8000    # per line of the `chat` log-tail: whole messages, "HH:MM role " head included (hmdapp guards.ts)
+CHAT_PANEL_ID = "chat"        # the one panel MAX_CHAT_LINE_CHARS applies to: the app applies it by id AND type log-tail
 MAX_LIST_ITEMS = 200          # per list (rows, points-per-series, lines) -- read_feed(limit=200)
 MAX_SERIES = 6                # dataviz: fixed categorical hue order, never a 7th generated hue
 MAX_COLUMNS = 32              # a table wider than this is not a dashboard tile
@@ -75,7 +77,7 @@ GIT_TIMEOUT_S = 3
 # still refuses the whole panel, at both write time and read time.
 HMD_UI_LOG_TAIL_LINES = "HMD_UI_LOG_TAIL_LINES"   # env; default 200 (== MAX_LIST_ITEMS)
 HMD_UI_LOG_TAIL_BYTES = "HMD_UI_LOG_TAIL_BYTES"   # env; default 65536 (== MAX_FILE_BYTES)
-HMD_UI_LOG_LINE_MAX = "HMD_UI_LOG_LINE_MAX"       # env; default 2000 chars/line
+HMD_UI_LOG_LINE_MAX = "HMD_UI_LOG_LINE_MAX"       # env; default 2000 chars/line (8000 for the chat panel: see log_line_cap)
 _LOG_TAIL_LINES_DEFAULT = 200
 _LOG_TAIL_BYTES_DEFAULT = 65536
 _LOG_LINE_MAX_DEFAULT = 2000
@@ -313,6 +315,14 @@ def bound_log_tail(lines, max_lines=None, max_bytes=None, max_line_chars=None):
     return kept, len(cut) - len(kept)
 
 
+def log_line_cap(pid):
+    """The most characters one line of the log-tail panel `pid` may carry at write time. The `chat`
+    panel's lines are whole messages, so they get MAX_CHAT_LINE_CHARS -- the one exception to P17,
+    which the phone app's guard applies to that id alone; every other log-tail's lines are P17's
+    MAX_STRING_CHARS."""
+    return MAX_CHAT_LINE_CHARS if pid == CHAT_PANEL_ID else MAX_STRING_CHARS
+
+
 def _validate_log_tail(data, max_line_chars=MAX_STRING_CHARS, max_lines=MAX_LIST_ITEMS):
     _check_keys(data, ("lines", "truncated", "dropped_lines"), "data")
     lines = _check_list(data.get("lines"), "data.lines", cap=max_lines)
@@ -333,8 +343,7 @@ _VALIDATORS = {
     "timeseries": _validate_timeseries,
     "bars": _validate_bars,
     "markdown": _validate_markdown,
-    "log-tail": _validate_log_tail,
-}
+}   # log-tail is dispatched in validate_panel: its line cap depends on the panel's id
 
 
 def validate_panel(obj, log_tail_bounds=None):
@@ -348,7 +357,9 @@ def validate_panel(obj, log_tail_bounds=None):
     max_line_chars/max_lines (see bound_log_tail) so already-trimmed content
     validates against the SAME bound the trim used, rather than the stricter
     publish-time default. `write_panel()` never passes it -- every write-time
-    caller keeps the original MAX_STRING_CHARS/MAX_LIST_ITEMS caps verbatim."""
+    caller keeps the original caps verbatim: MAX_LIST_ITEMS lines and
+    log_line_cap(id) characters a line (MAX_STRING_CHARS, but MAX_CHAT_LINE_CHARS
+    for the `chat` panel)."""
     if not isinstance(obj, dict):
         raise PanelError("panel must be a JSON object")
     if "source" in obj:
@@ -369,8 +380,8 @@ def validate_panel(obj, log_tail_bounds=None):
     data = obj.get("data")
     if not isinstance(data, dict):
         raise PanelError("data must be an object")
-    if ptype == "log-tail" and log_tail_bounds:
-        _validate_log_tail(data, **log_tail_bounds)
+    if ptype == "log-tail":
+        _validate_log_tail(data, **(log_tail_bounds or {"max_line_chars": log_line_cap(pid)}))
     else:
         _VALIDATORS[ptype](data)
     refresh_s = obj.get("refresh_s")
@@ -497,7 +508,9 @@ def _read_panel_file(path, now):
     A log-tail panel's `data.lines` is bounded (bound_log_tail) BEFORE
     validation, to whatever HMD_UI_LOG_TAIL_LINES/_BYTES/HMD_UI_LOG_LINE_MAX
     currently say -- read fresh every call so a test (or an operator) can
-    retune it without a restart. This is the ONLY place serve-time content is
+    retune it without a restart. The line bound's DEFAULT is never narrower
+    than the panel's own write-time cap (log_line_cap), so a `chat` line of
+    MAX_CHAT_LINE_CHARS is served whole. This is the ONLY place serve-time content is
     ever reshaped; every other invariant (secret scrub, source-rejection,
     MAX_FILE_BYTES, the closed type set, ...) is enforced completely
     unchanged, below, by validate_panel."""
@@ -525,7 +538,7 @@ def _read_panel_file(path, now):
             and isinstance(obj["data"].get("lines"), list):
         max_lines = _log_tail_env_int(HMD_UI_LOG_TAIL_LINES, _LOG_TAIL_LINES_DEFAULT)
         max_bytes = _log_tail_env_int(HMD_UI_LOG_TAIL_BYTES, _LOG_TAIL_BYTES_DEFAULT)
-        max_chars = _log_tail_env_int(HMD_UI_LOG_LINE_MAX, _LOG_LINE_MAX_DEFAULT)
+        max_chars = _log_tail_env_int(HMD_UI_LOG_LINE_MAX, max(_LOG_LINE_MAX_DEFAULT, log_line_cap(obj.get("id"))))
         bounded, dropped = bound_log_tail(obj["data"]["lines"], max_lines, max_bytes, max_chars)
         obj["data"] = dict(obj["data"])
         obj["data"]["lines"] = bounded
