@@ -74,6 +74,18 @@ to drive its own UI; nothing else is ever written to stdout.
      "pairing_code":..,"exp":..,"hmd_pubkey":..},"exp":..}
         `qr`, serialized compact+sorted (which this whole line already is), IS
         the exact QR payload string heimdall-app renders (Decision 7.2 shape).
+    {"event":"code_paired","device_label":..,"gh_login":..,"bound_at":..}
+                                                       a phone paired by typing the
+                                                       session code, emitted just
+                                                       before its device_bound: what
+                                                       the relay CLAIMED the device
+                                                       and GitHub account to be, both
+                                                       cleaned. With --no-confirm
+                                                       this is the only trace of the
+                                                       claim -- no approve_request,
+                                                       no SAS -- and the statusline
+                                                       marker and an inbox notice
+                                                       follow it
     {"event":"device_bound","bound_at":..}            session key derived --
                                                        may repeat across a
                                                        stream reconnect
@@ -2952,7 +2964,10 @@ def main(argv=None):
     stream_thread.start()
 
     client.run_state_loop()
-    return 0
+    client._remove_paired_marker()  # an end the relay announced (session_ended) comes here, not through shutdown()
+    if client.exit_code:
+        client.shutdown("code-window-ended")  # a --code-only window that ended here: the session it left open is revoked
+    return client.exit_code
 
 
 if __name__ == "__main__":
