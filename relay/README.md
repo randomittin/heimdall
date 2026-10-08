@@ -576,6 +576,19 @@ window (360 s) closes, and the purge lands 60 s after that. That last minute is 
 phone (a claim after the window is `410`), but it is what hmd's client sees as the end of a
 `connect` nobody scanned in time.
 
+**`RELAY_PURGE_MIN_DELAY_MS` is test-only and is never set in production.** `wrangler.toml` does
+not declare it, so production and `wrangler dev` purge exactly on the schedule above; only
+`vitest.config.ts` binds it, at one hour. Bound, it puts a floor under the purge alarm of the
+per-IP throttle buckets and of the `code-index:<gh_id>` indexes (never sooner than now plus the
+value), and under no other: a session's and a sign-in record's alarm keep their real schedule,
+which the specs assert. Why: a spec file leaves hundreds of those two kinds of object behind (a
+fresh IP per request, a fresh GitHub id per pairing), they fall due about two minutes after their
+last request, and under vitest-pool-workers a due alarm wakes its object through the runner's
+module import, ahead of the running test. 481 of them stalled `test/code-pair.spec.ts` for ~214 s
+and timed out whichever test they reached. The purge specs drive `alarm()` with
+`runDurableObjectAlarm`, which needs no due alarm, so the floor changes none of what they assert.
+An absent, empty, non-numeric, zero or negative value is no floor.
+
 ### hmd is told why a session ended (INV-38)
 
 Whenever the relay ends hmd's `GET /stream` because the **session** is over, it first writes one

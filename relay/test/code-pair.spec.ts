@@ -1468,37 +1468,51 @@ describe("INV-41: a window's identifying fields live no longer than the window",
 // ============================================================================================
 
 // Every request here comes from a fresh IP, so each leaves a throttle bucket behind, and each
-// pairing leaves a session and an index: hundreds of Durable Objects with a purge alarm 2 to 7
-// minutes out, in storage that is not reset between tests. This file takes about two minutes, so
-// the first of those alarms fell due as it ended, and in workerd under vitest-pool-workers a due
-// alarm wakes its object through the runner's module import, ahead of whatever the running test is
-// waiting on. Measured on this file: 481 due alarms stalled the runner for ~214 s in five stretches
-// (the longest 101 s) and failed whichever test the onset reached (INV-40 in one run, INV-41 in
+// pairing leaves a session and an index for a fresh GitHub id: hundreds of Durable Objects in
+// storage that is not reset between tests. A bucket is purged one window and a grace after its
+// last request, an index the same once its last window or attempt has lapsed (src/session.ts):
+// about two minutes. This file takes about as long, so the first of those alarms fell due as it
+// ended, and in workerd under vitest-pool-workers a due alarm wakes its object through the
+// runner's module import, ahead of whatever the running test is waiting on. Measured on this
+// file: 481 due alarms (~85% buckets) stalled the runner for ~214 s in five stretches (the
+// longest 101 s) and failed whichever test the onset reached (INV-40 in one run, INV-41 in
 // another), with the same code at a pairing window of 60 s and of 360 s alike. vitest.config.ts
-// binds RELAY_PURGE_MIN_DELAY_MS so that no purge alarm falls due inside the file's life; the purge
+// binds RELAY_PURGE_MIN_DELAY_MS, which src/session.ts applies to those two kinds of object and
+// to no other: a session's alarm is 5 to 7 minutes out, and an OAuth record's is asserted to the
+// second (test/github-oauth.spec.ts), so both keep the schedule the code gives them. The purge
 // itself is still driven above, with runDurableObjectAlarm, which does not need the alarm to be due.
 describe("the alarms the suite's own pairings arm", () => {
   const AN_HOUR_MS = 3_600_000;
   const alarmOf = (stub: DurableObjectStub): Promise<number | null> =>
     runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
+  const bucketStub = (kind: string, ip: string): DurableObjectStub =>
+    typedEnv.SESSION.get(typedEnv.SESSION.idFromName(`${kind}:${ip}`));
 
-  it("fall due after the file has ended: a throttle bucket's, a session's and an index's", async () => {
+  it("fall due after the file has ended: both kinds of throttle bucket's and an index's", async () => {
     const before = Date.now();
-    const ip = freshIp();
-    const res = await SELF.fetch(`${BASE}/pair/init`, { method: "POST", headers: { "CF-Connecting-IP": ip } });
+    const initIp = freshIp();
+    const identityIp = freshIp();
+    const res = await SELF.fetch(`${BASE}/pair/init`, { method: "POST", headers: { "CF-Connecting-IP": initIp } });
     expect(res.status).toBe(200);
-    const { session_id: sessionId } = (await res.json()) as { session_id: string };
+    // A body the Worker refuses, but only after it has counted the request against the bucket.
+    expect((await signInRequest({}, identityIp)).status).toBe(400);
     const user = newUser();
     await openWindow(fake, user);
 
-    const bucket = typedEnv.SESSION.get(typedEnv.SESSION.idFromName(`pair-init-throttle:${ip}`));
     for (const [name, stub] of [
-      ["bucket", bucket],
-      ["session", sessionStub(sessionId)],
+      ["pair-init bucket", bucketStub("pair-init-throttle", initIp)],
+      ["identity bucket", bucketStub("identity-throttle", identityIp)],
       ["index", indexStub(user.id)],
     ] as const) {
       expect(await alarmOf(stub), name).toBeGreaterThanOrEqual(before + AN_HOUR_MS);
     }
+  });
+
+  it("do not move a session's: its alarm is where the code puts it, the pairing window plus the 60 s grace", async () => {
+    const init = await pairInit();
+    const pairExp = (await storedRecord(init.session_id))?.pair_exp;
+    expect(pairExp).toBeTypeOf("number");
+    expect(await alarmOf(sessionStub(init.session_id))).toBe((pairExp as number) + 60_000);
   });
 });
 

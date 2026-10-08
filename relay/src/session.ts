@@ -614,7 +614,7 @@ export class SessionDO {
       PAIR_INIT_MAX_PER_WINDOW
     );
     await this.ctx.storage.put(PAIR_INIT_KEY, attempts);
-    await this.armPurgeAlarm(now + PAIR_INIT_WINDOW_MS + PURGE_GRACE_MS);
+    await this.armPerCallerPurgeAlarm(now + PAIR_INIT_WINDOW_MS + PURGE_GRACE_MS);
     return jsonResponse(200, { throttled });
   }
 
@@ -624,17 +624,32 @@ export class SessionDO {
    * a bind pushes the deadline out to the device token's expiry, an end pulls
    * it in to a short grace — and `alarm()` re-derives from the record anyway,
    * so an alarm that fires early only costs one re-schedule.
-   *
-   * `RELAY_PURGE_MIN_DELAY_MS`, when bound, is a floor under the deadline: never sooner than now
-   * plus it. Only the vitest suite binds it, because a purge alarm that falls due while a spec file
-   * is still running wakes its object through the test runner and stalls the run (test/code-pair.spec.ts,
-   * "the alarms the suite's own pairings arm"). A later alarm only delays reclamation, and `alarm()`
-   * re-derives its decision from the record, so nothing is purged that should not be. Unbound, as
-   * in production, the deadline is used exactly as given.
    */
   private async armPurgeAlarm(atMs: number): Promise<void> {
+    await this.ctx.storage.setAlarm(atMs);
+  }
+
+  /**
+   * `armPurgeAlarm` for the instances a caller names rather than a session: a per-IP throttle bucket
+   * and a GitHub id's code index. Each is purged one window and a grace after the caller's last
+   * request, about two minutes, and a test run leaves hundreds of them behind (a fresh IP per
+   * request, a fresh GitHub id per pairing), so the lot falls due while a spec file is still running.
+   * A due alarm wakes its object through the test runner's module import, ahead of the running test,
+   * and stalls the run (test/code-pair.spec.ts, "the alarms the suite's own pairings arm").
+   *
+   * `RELAY_PURGE_MIN_DELAY_MS`, when bound, is a floor under the deadline: never sooner than now
+   * plus it. Only the vitest suite binds it. A later alarm only delays reclamation, and `alarm()`
+   * re-derives its decision from what the instance holds, so nothing is purged that should not be.
+   * Unbound, as in production, the deadline is used exactly as given.
+   *
+   * Applied to those two roles and no other, on purpose: a session's alarm is 5 to 7 minutes out,
+   * so it cannot fall due inside a spec file, and a sign-in record's (`oauth-state:`,
+   * `oauth-handoff:`) is asserted to the second (test/github-oauth.spec.ts). A floor under either
+   * would move a schedule the suite exists to pin.
+   */
+  private async armPerCallerPurgeAlarm(atMs: number): Promise<void> {
     const floorMs = purgeMinDelayMs(this.env.RELAY_PURGE_MIN_DELAY_MS);
-    await this.ctx.storage.setAlarm(floorMs > 0 ? Math.max(atMs, Date.now() + floorMs) : atMs);
+    await this.armPurgeAlarm(floorMs > 0 ? Math.max(atMs, Date.now() + floorMs) : atMs);
   }
 
   /** Milliseconds of stream idleness before the next `keepalive`. Falls back
@@ -1718,7 +1733,7 @@ export class SessionDO {
     const previous = (await this.ctx.storage.get<number[]>(BUCKET_KEY)) ?? [];
     const { attempts, throttled } = recordAttempt(previous, now, windowMs, max);
     await this.ctx.storage.put(BUCKET_KEY, attempts);
-    await this.armPurgeAlarm(now + windowMs + PURGE_GRACE_MS);
+    await this.armPerCallerPurgeAlarm(now + windowMs + PURGE_GRACE_MS);
     return jsonResponse(200, { throttled });
   }
 
@@ -1740,7 +1755,7 @@ export class SessionDO {
       return;
     }
     await this.ctx.storage.put(CODE_INDEX_KEY, state);
-    await this.armPurgeAlarm(deadline + PURGE_GRACE_MS);
+    await this.armPerCallerPurgeAlarm(deadline + PURGE_GRACE_MS);
   }
 
   /** Internal: a session opens `code` in this GitHub id's index. 409 if another session of the
@@ -2113,7 +2128,7 @@ export class SessionDO {
         const deadline = lastDeadline(index);
         if (deadline !== null) {
           await this.ctx.storage.put(CODE_INDEX_KEY, index);
-          await this.armPurgeAlarm(deadline + PURGE_GRACE_MS);
+          await this.armPerCallerPurgeAlarm(deadline + PURGE_GRACE_MS);
           return;
         }
       }
