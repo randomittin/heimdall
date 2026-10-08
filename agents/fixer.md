@@ -35,7 +35,7 @@ For each open issue (oldest first):
    - Read the relevant source files
    - Apply the minimal fix (don't refactor unrelated code)
    - Add/update tests covering the fix
-   - Run existing tests to ensure no regressions
+   - Run ONLY the test file(s) you added or edited, ONCE, after the fix is written — no neighbouring or regression suites (the orchestrator's one full sweep covers regressions); a failure plausibly caused by machine load gets ONE solo re-run (`CLAUDE.md` "When the full gate runs")
 
 5. **Commit** the fix on the fix branch (local only — you NEVER push):
    ```
@@ -49,6 +49,7 @@ For each open issue (oldest first):
    bin/heimdall-attest emit --repo . --base main \
      --evidence "<the runnable acceptance/test command>" --print
    ```
+   `--evidence` is the SAME scoped command as step 4 — attest executes it to record the real exit; never widen it to a neighbouring or full suite.
    If `evidence.all_passed` is not `true`, STOP — a proof-less fix is un-PR-able.
    Comment the blocker on the issue instead of opening a PR.
 

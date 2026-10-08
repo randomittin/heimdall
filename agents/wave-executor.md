@@ -19,7 +19,7 @@ You execute all tasks in a single wave. Parallel where possible. Each task verif
 2. For each task in this wave:
    a. Read files listed in "Read first"
    b. Implement the action
-   c. Run acceptance criteria -- if ANY fail, fix and re-verify
+   c. Run the task's acceptance criteria ONCE, after its changes are written, on its own test file(s) only -- if ANY fail, fix and re-run only the failing criterion
    d. Commit: `git add -A && git commit -m "task: [task name]"`
 3. Write results to `.planning/SUMMARY-{phase}-wave-{N}.md`
 
@@ -32,6 +32,7 @@ NEVER write stub, dummy, placeholder, shim, mock, TODO, or skeleton code. Every 
 - Each task = one atomic git commit
 - Acceptance criteria are BLOCKING. Task not done until ALL pass.
 - Criterion fails after 2 fix attempts? Report as blocked, move on.
+- Test once, at the end (`CLAUDE.md` "When the full gate runs"): a task's criteria run ONCE on its own test file(s) — no neighbouring suites, no re-running a child's file after it reports, no suite runs at integration. A failure plausibly caused by machine load gets ONE solo re-run. The orchestrator runs the one full sweep.
 - Write all files to the PROJECT directory, never to Heimdall plugin dir.
 
 ## Parallelism

@@ -134,7 +134,7 @@ Issue detected
 
 1. Create feature branch: `fix/<issue-number>-<short-description>`
 2. Spawn coder agent with issue context
-3. Run test suite via test-runner agent
+3. Run ONLY the test file(s) the fix adds or edits, once (the coder's own run counts) — no separate suite pass per fix
 4. Run lint via lint-quality agent
 5. Run review via reviewer agent
 6. Create PR with:
@@ -152,7 +152,7 @@ Group related small fixes into a patch release. The agent prepares the release a
 who holds the credentials, runs it. Never run `release/ship.sh` or any tag, push or publish step yourself.
 
 1. Collect fixes from `maintainer.release_queue`
-2. Ensure all tests pass together
+2. Run the ONE full sweep on the frozen release tree — the only full run for the whole batch; per-fix runs neither substitute for it nor repeat
 3. Bump version (patch for fixes, minor for features) on a `release/v<version>` branch
 4. Generate changelog from commit messages
 5. Open the release PR (version bump + changelog) with the exact release command for this repo's release

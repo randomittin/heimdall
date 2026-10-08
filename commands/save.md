@@ -42,7 +42,7 @@ Write a concise handoff note that another Claude session can read and immediatel
 - [ ] Task 5
 
 ## Resume Instructions
-[Exact next step: "Run tests in src/auth/, fix any failures, then proceed to Task 4"]
+[Exact next step: "Finish Task 3 (file X), run only src/auth/login.test.ts once, then proceed to Task 4; full sweep still pending"]
 
 ## Key Context
 - [Decision 1: chose X over Y because Z]
@@ -97,6 +97,9 @@ The whole file is injected verbatim into the preamble on every `heimdall` launch
 What "injected" does and does not mean: no key in this file changes behaviour mechanically. `model_routing.default_code` used to pick the main agent's own launch model at `bin/heimdall:3918` when set — removed 2026-08-18, because that pinned the main agent exactly the way CLAUDE.md's "Model routing" directive forbids, merely gated behind an opt-in file instead of unconditional; no code path ever applied it to a delegated coding subagent spawn, so pinning this launch was its entire real effect, not a documented alternate use. The main agent now runs unpinned on the operator's own Claude Code default regardless of this file's contents. Everything in the file, default_code included, is text the orchestrator reads and is expected to honour when IT spawns delegated subagents — same as the commands, parallelism numbers, governance, avoid_dirs, preferences. That is an instruction to a model, not an enforced setting, so verify it was honoured rather than assuming the file made it so.
 
 ### 4. Git checkpoint
+
+A save is one of the moments the full sweep runs (`CLAUDE.md` "When the full gate runs") — but only a save of FINISHED work (nothing in progress, no fix pending) with no sweep since the last edit: run the project's full test command (`commands.test` in settings.json) ONCE first, nothing editing, and note the result under Resume Instructions. A save of unfinished work does NOT sweep — grading a tree that is still moving proves nothing; write "full sweep pending" under Resume Instructions instead. Never sweep twice for one tree.
+
 ```bash
 git add -A && git commit -m "heimdall: checkpoint — [brief description]"
 ```

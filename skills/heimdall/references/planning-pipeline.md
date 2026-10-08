@@ -67,7 +67,7 @@ For each wave, in order:
 1. **Fresh context per wave**: each wave-executor agent starts with ONLY the plan, context doc, and relevant source files — NOT accumulated state from prior waves. This prevents context bloat.
 2. **Parallel within wave**: spawn one agent per task in the wave, all running concurrently
 3. **Wait for wave completion**: all tasks in wave N must finish before wave N+1 starts
-4. **Per-task verification**: after each task completes, run its acceptance criteria immediately
+4. **Per-task verification**: after each task completes, run its acceptance criteria immediately, ONCE — its own test file(s) and greps, never a neighbouring or full suite (test once, at the end: `CLAUDE.md` "When the full gate runs")
 5. **Failure handling**: if a task fails, retry once with narrower scope. If still failing, pause the pipeline and escalate.
 
 **Oracle independence — spawn the reference in a SEPARATE wave/agent (mandatory).** When a `differential` oracle is wired, the reference half MUST be authored independently of the implementation — by a different agent, in a separate wave, with disjoint context and file scope. A shared author means a shared spec misconception passes undetected in both halves and the diff falsely reports PASS. Enforcement:
@@ -93,9 +93,9 @@ During wave execution, adjust parallelism based on task progress:
 Monitor via dispatch queue status: if `pending > 0` and `running < 10`, scale up.
 
 ## Phase 6: Verify
-- Spawn a **verifier agent** to check ALL acceptance criteria across all waves
+- Spawn a **verifier agent** to check ALL acceptance criteria across all waves — each criterion once, on the tree as it stands
 - Verify requirement coverage: every original requirement maps to a passing check
-- Run the full test suite, linter, and type checker
+- Last step, only once the verifier and reviewer have nothing left to hand back: ONE full sweep — full test suite, linter, type checker — on the frozen tree. It is the only full run in the pipeline (not per wave, not per merge), and a fix that lands after it spends it
 - Update `.planning/PLAN-{phase}.md` with verification results
 
 ## Phase 7: Ship
@@ -121,7 +121,7 @@ After the planner creates a plan with acceptance criteria (Phase 3), synthesize 
 2. Aggregate into a single goal condition string (max 4000 chars)
 3. Focus on observable outcomes from conversation transcript (the evaluator has no filesystem access — it only reads what appears in the conversation)
 4. Always include baseline checks:
-   - "all tests pass"
+   - "all tests pass" (met by the ONE full sweep's output reaching the transcript — never run suites mid-wave just to feed the evaluator)
    - "lint clean"
    - "build succeeds"
    - "no unfinished, skeleton, or dummy code in changed files"
@@ -182,7 +182,7 @@ while task_not_complete:
   2. IDENTIFY — Determine next actions (which agents to spawn/continue)
   3. EXECUTE — Spawn agents, respecting current autonomy level
   4. QUALITY — After each sub-project completes:
-     a. Run tests (spawn test-runner if needed)
+     a. No suite run here — the sub-project's agent ran its own test file(s) once; the one full sweep is Phase 6
      b. Run lint (spawn lint-quality)
      c. Check for conflicts in conflict_log
   5. UPDATE — Write results to heimdall-state.json

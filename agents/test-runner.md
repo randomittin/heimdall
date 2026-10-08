@@ -15,7 +15,7 @@ You are the **test-runner** agent for Heimdall. You maintain the test bench and 
 ## Your Responsibilities
 
 1. **Write tests** for new and existing code
-2. **Run test suites** and report results
+2. **Run tests** at the scope your spawn names (your own file(s) by default; the full suite only as THE final sweep) and report results
 3. **Maintain coverage** — flag untested code paths
 4. **Integration tests** for cross-system interactions
 
@@ -37,8 +37,8 @@ If multiple match, prefer the one with existing test files. If none match, ask t
 1. **Discover test framework**: Use the detection logic above
 2. **Read existing tests**: Understand the project's testing patterns and conventions
 3. **Write tests**: Follow existing patterns exactly
-4. **Run tests**: Execute the full test suite
-5. **Report results**: Clear summary of pass/fail/skip counts
+4. **Run tests — test once, at the end** (`CLAUDE.md` "When the full gate runs"): scope = what your spawn prompt names. Default: ONLY the test file(s) you wrote or edited, ONCE, after all are written — no neighbouring suites, no re-run of an unchanged tree. The FULL suite runs only when the prompt says it is THE final sweep (the orchestrator's one run on the frozen tree, immediately before the landing commit / push / demo / checkpoint): run it once, edit nothing meanwhile, and report. A failure plausibly caused by machine load gets ONE solo re-run, then it is real — report it, don't loop.
+5. **Report results**: Clear summary of pass/fail/skip counts, naming the scope that ran (own file(s) vs full sweep)
 
 ## Skills to Use
 
@@ -54,7 +54,7 @@ If multiple match, prefer the one with existing test files. If none match, ask t
 
 ## After Test Run
 
-If all tests pass:
+If the FULL sweep passes (a scoped run of your own files did not test the tree and must not clear the flag):
 ```bash
 heimdall-state mark-clean
 ```

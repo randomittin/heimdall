@@ -301,9 +301,10 @@ When to use session-fork vs Agent tool:
 1. Identify ALL files that need changes from the task description (quick grep/glob, no deep reading)
 2. Group by independence: files that don't import each other → same wave (parallel)
 3. Spawn one agent per file or per independent group — ALL agents in ONE message with `run_in_background: true`
-4. Wait for all to complete
+4. Wait for all to complete — do not re-run their test files or run neighbouring suites; each agent ran its own file(s) once and reported
 5. Spawn verifier agent to check acceptance criteria
-6. Clean up: mark plan complete
+6. Once nothing can hand back another fix: the ONE full sweep on the frozen tree (§6c), then the landing commit
+7. Clean up: mark plan complete
 
 **KEY**: Do NOT deep-read files before spawning. Tell each agent WHAT to do and let IT read the files. You are an orchestrator — delegate, don't investigate.
 
@@ -535,7 +536,7 @@ When spawning an agent, provide:
    - Docs agents: `claude-md-management:claude-md-improver`
 3. **Context**: a delta brief, built by `bin/heimdall-brief build --task <id> --spec <text> [--symbols a,b] [--files p,q] [--capsules x,y]` and pasted in — symbol spans + their callers + touched-file outlines + capsule closure, never the plan text. Exit 1 (INCOMPLETE) or 3 (NON_VERIFIED) means **do not spawn**. See `skills/heimdall/references/agent-templates.md`
 4. **Constraints**: what NOT to do (prevent overlap with other wave agents)
-5. **Acceptance criteria**: the specific checks this agent must pass before reporting done
+5. **Acceptance criteria**: the specific checks this agent must pass before reporting done — test criteria scoped to its OWN test file(s), run ONCE after its changes are written; never a neighbouring or full suite (§6c)
 6. **State updates**: commands to run on completion (`heimdall-state set ...`)
 
 ### 4d. Closing Idle Agents — automatic, no human input
@@ -638,12 +639,16 @@ When multiple skills give contradictory instructions:
    ```
 3. Before any PR, run a reflection pass over unresolved conflicts
 
-### 6c. Test Bench
+### 6c. Test Bench — test once, at the end
 
-Always maintain a ready test bench:
+Operator directive 2026-10-08: avoid over-testing the same stuff; save testing for the end. The measured case and the full rule are in `CLAUDE.md` "When the full gate runs".
+
 - Tests are written alongside implementation (or before, if TDD pattern is active)
 - After any code change, mark state as dirty: `heimdall-state mark-dirty`
-- Test runner clears dirty flag when tests pass: `heimdall-state mark-clean`
+- Spawned agents run ONLY the test file(s) they add or edit, ONCE, after all their changes are written; a failure plausibly caused by machine load gets ONE solo re-run. That is not their default — put it in every spawn prompt (§4c item 5)
+- You do not re-run an agent's suite after it reports, and you do not re-run suites per merge: its reported run stands until the sweep
+- ONE full sweep, on the final frozen tree, immediately before the landing commit / push / demo / `/hmd:save` checkpoint — in the background (it is a long command), nothing editing while it runs. Never start it while a reviewer, verifier or agent can still hand back a fix: a sweep a late fix invalidates is a wasted half hour, and a cancelled one is worse
+- Only a green full sweep clears the dirty flag (`heimdall-state mark-clean`) — a scoped run of one agent's files did not test the tree
 
 ---
 

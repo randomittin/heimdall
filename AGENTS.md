@@ -19,6 +19,11 @@ we sell. Read this before your first edit.
 - **Every assertion must be falsifiable.** Before you call a test done, break the
   thing it covers and watch it go RED, then revert and watch it go GREEN. A test that
   cannot fail is not a gate — it is decoration.
+- **Test once, at the end.** Run only the test file(s) you add or edit, once, after
+  your changes are written; the full sweep (`bash test/run-all.sh`) runs once, on the
+  final frozen tree, immediately before the landing commit — see CLAUDE.md "When the
+  full gate runs". The break-it-and-watch-it-go-RED check above is a run on a
+  different tree, not a repeat.
 - **Quality gates run before push** (`heimdall-state check-quality-gates`): tests
   green, lint clean, no untested changes.
 

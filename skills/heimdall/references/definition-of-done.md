@@ -10,7 +10,7 @@ when it "should work". Small-but-broken FAILS.
 
 ## The Checklist
 
-- [ ] **Tests pass** — the full suite ran fresh THIS turn, exit 0, output pristine. No skipped or `.only` tests left behind.
+- [ ] **Tests pass** — the test file(s) YOU added or edited ran ONCE, after your last edit: exit 0, output pristine. No skipped or `.only` tests left behind. Neighbouring suites and the full sweep are not a per-agent box — the orchestrator runs ONE full sweep on the final frozen tree immediately before the landing commit / push / demo / checkpoint (`CLAUDE.md` "When the full gate runs"), and for THAT run this box reads: the full sweep ran fresh on the frozen tree, exit 0.
 - [ ] **Acceptance criteria runnable** — every criterion is a grep / curl / test / file-existence command that was actually run, not prose. Each exits 0.
 - [ ] **No stubs** — zero `// TODO`, `pass`, `throw new Error('not implemented')`, empty bodies, fake data, or placeholder returns. Every line is production-ready.
 - [ ] **Lint / build clean** — linter and build ran fresh, zero warnings, zero errors.

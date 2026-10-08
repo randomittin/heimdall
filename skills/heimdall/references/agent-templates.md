@@ -88,6 +88,7 @@ Constraints:
 - Only modify files in [SCOPE]
 - Do not touch [OUT-OF-SCOPE areas]
 - Write tests alongside implementation
+- Test once, at the end: run ONLY the test file(s) you add or edit, ONCE, after all changes are written — no neighbouring or regression suites, no baseline sweep; ONE solo re-run for a failure plausibly caused by machine load. The orchestrator runs the one full sweep.
 
 After completion, run:
   heimdall-state set '.plan.sub_projects[INDEX].status' '"complete"'
@@ -95,8 +96,10 @@ After completion, run:
 
 ## Test Runner Agent
 
+Two uses; name which one in the prompt. **Write/extend tests**: scope is the file list you give it — it runs ONLY those, ONCE, after writing them. **THE final sweep**: spawn it ONCE, on the final frozen tree, immediately before the landing commit / push / demo / `/hmd:save` checkpoint, and only when no fix can still land (`CLAUDE.md` "When the full gate runs") — never per wave, never per merge.
+
 ```
-Run the test suite and report results for the [PROJECT] project.
+Run [ONLY these test files, once: <list> | THE ONE FINAL SWEEP — the full test suite, tree frozen, edit nothing] for the [PROJECT] project and report results.
 
 Focus areas:
 - [Specific modules to test]
@@ -104,10 +107,10 @@ Focus areas:
 
 Protocol:
 1. Discover test framework from package.json/config
-2. Run full test suite
-3. Report pass/fail/skip counts
+2. Run the scope above ONCE — no re-run of an unchanged tree; ONE solo re-run only if a failure is plausibly caused by machine load
+3. Report pass/fail/skip counts and name the scope that ran
 4. Flag any untested code paths in recently changed files
-5. If all pass: run `heimdall-state mark-clean`
+5. If the FULL sweep passed: run `heimdall-state mark-clean` (a scoped run never clears it)
 6. If failures: report details with file paths and error messages
 ```
 
@@ -184,6 +187,7 @@ Constraints:
 - Ensure WCAG AA accessibility compliance
 - Mobile-first responsive approach
 - Do not change business logic or API code
+- Test files you add or edit (component, snapshot, a11y): run ONLY those, ONCE, after all changes are written
 
 After completion, run:
   heimdall-state set '.plan.sub_projects[INDEX].status' '"complete"'
@@ -207,6 +211,7 @@ Constraints:
 - Migrations MUST be reversible (up + down)
 - Zero-downtime pattern: additive first -> backfill -> switch -> drop old
 - Index every FK column; flag any endpoint making >5 queries (N+1)
+- Migration/query test files you add or edit: run ONLY those, ONCE, after all changes are written
 
 Output: schema w/ columns+types+constraints+indexes, migration list (reversible: yes/no),
 query optimization table (current vs optimized + improvement).
@@ -265,6 +270,8 @@ main, never merges; a human merges).
 For multiple unrelated issues: spawn one `hmd:fixer` per issue, each
 `run_in_background: true` and `isolation: worktree`, so branches don't conflict.
 
+Test once, at the end: the fixer runs ONLY the test file(s) the fix adds or edits (once), and its attest evidence is that same scoped command — never a neighbouring or full suite.
+
 ## Parallel Role Team Template
 
 For large tasks requiring 3+ parallel workers.
@@ -291,7 +298,7 @@ Agent(subagent_type: "hmd:design",       description: "UI/UX, component design, 
 Agent(subagent_type: "hmd:coder",        description: "auth module — src/auth/**")
 Agent(subagent_type: "hmd:coder",        description: "API endpoints — src/api/**")
 Agent(subagent_type: "hmd:coder",        description: "UI components — src/components/**")
-Agent(subagent_type: "hmd:test-runner",  description: "test suite as code lands")
+Agent(subagent_type: "hmd:test-runner",  description: "THE one full sweep, frozen tree, last wave")
 Agent(subagent_type: "hmd:lint-quality", description: "lint after each coder completes")
 Agent(subagent_type: "hmd:reviewer",     description: "review all changes before merge")
 Agent(subagent_type: "hmd:docs-writer",  description: "sync docs with implementation")
@@ -307,11 +314,11 @@ Coordination is wave ordering, not one flat batch:
 - Wave 0: architect alone → decomposition plan. Plan is approved before wave 1 spawns.
 - Wave 1: design + auth coder + API coder — parallel, disjoint scopes
 - Wave 2: frontend coder — depends on API + design
-- Wave 3: test-runner + lint-quality
-- Wave 4: reviewer — after all coders and tests
-- Wave 5: docs-writer — last, with full context
+- Wave 3: lint-quality + reviewer — after all coders (each coder already ran its own test file(s), once)
+- Wave 4: docs-writer — with full context
+- Wave 5: test-runner — THE one full sweep, on the frozen tree, once nothing above can hand back a fix
 
-Within a wave: ALL agents in ONE message. Between waves: let the wave return first.
+Within a wave: ALL agents in ONE message. Between waves: let the wave return first. Every implementation spawn prompt carries the test rule: run ONLY your own test file(s), ONCE, after all changes are written (`CLAUDE.md` "When the full gate runs").
 
 ### When a named agent is genuinely right
 

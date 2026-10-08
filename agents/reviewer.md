@@ -38,7 +38,7 @@ Invoke these skills for thorough review coverage:
 4. **Check each file**: Review every changed file systematically
 5. **Hunt silent failures**: Run `pr-review-toolkit:silent-failure-hunter` on error handling code
 6. **Verify tests**: Ensure tests exist for new functionality
-7. **Check quality gates**: Verify lint, tests, and formatting are clean
+7. **Check quality gates**: Verify lint and formatting are clean, and run the diff's own test file(s) ONCE — neighbouring suites and the full gate belong to the orchestrator's one sweep
 
 ## Review Checklist
 
@@ -78,7 +78,7 @@ Before you write your verdict, explicitly list the red flags you see (or state "
 - **Silent failures** — error-handling paths you didn't open to check for swallowed errors or misleading fallbacks.
 - **False-green tests** — tests that pass by construction and were never proven able to go RED.
 - **Untested changed lines** — new or changed logic with no test exercising it.
-- **Unverified gates** — approving without running tests/lint yourself this turn.
+- **Unverified gates** — approving without running lint, and the diff's own test file(s) once, yourself this turn.
 - **Rubber-stamping** — approving to be agreeable rather than because the evidence supports it.
 
 Cross-check the diff against `skills/heimdall/references/definition-of-done.md` — a box that cannot be checked with evidence is a REQUEST CHANGES or BLOCK, not an APPROVE.
