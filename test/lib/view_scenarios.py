@@ -32,6 +32,7 @@ import view_phone as VP  # noqa: E402
 
 FAKE_RELAY = os.path.join(HERE, "fake-relay.py")
 BUDGET = 1048576 * 3 // 8  # the slice budget the client derives from its 1 MiB envelope cap
+TURN = 400  # a transcript turn's cap: the phone's own (hmdapp src/views/guards.ts MAX_TURN_CHARS); a line break counts as one character
 KINDS = ["diff", "transcript", "pr"]  # what state.views.kinds lists
 PASS = FAIL = 0
 
@@ -790,25 +791,25 @@ def g_transcript(st):
         a_entry(t_use("t4", "Grep", pattern="x")),
         t_result("t4", [{"type": "text", "text": "src/a.ts:3: match\nsrc/b.ts"}]),
         a_entry(t_text("The key is %s use it" % tok)),
-        a_entry(t_text("w" * 230 + " " + tok)),
+        a_entry(t_text("w" * (TURN - 10) + " " + tok)),
         a_entry(t_text("mail someone@example.com about /etc/hosts")),
         u_entry("Caveat: injected by the harness", isMeta=True),
         u_entry("<local-command-stdout>noise</local-command-stdout>"),
         a_entry(t_text("SIDECHAIN-CHATTER"), isSidechain=True),
         "{this line is not json",
-        a_entry(t_text("L" * 400)),
+        a_entry(t_text("L" * (TURN + 1))),
         a_entry(t_text("done"), t_use("t9", "Bash", command="sleep 100")),
     ])
-    want = [("user", "Fix the flaky test please"), ("assistant", "Looking at it now. I will run the suite."),
+    want = [("user", "Fix the flaky test please"), ("assistant", "Looking at it now.\n\nI will run the suite."),
             ("tool", "Bash · exit 2 · FAIL src/a.test.ts"), ("tool", "Read · ok"), ("tool", "Bash · ok"),
             ("tool", "Grep · ok · src/a.ts:3: match"), ("assistant", "[redacted]"), ("assistant", "[redacted]"),
-            ("assistant", "mail [email] about hosts"), ("assistant", "L" * 239 + "…"), ("assistant", "done")]
+            ("assistant", "mail [email] about hosts"), ("assistant", "L" * (TURN - 1) + "…"), ("assistant", "done")]
     ack, res = st.ask("transcript")
     check(res is not None and res["kind"] == "transcript" and res["agent"] is None and res["truncated"] is False and isinstance(res["at"], float)
           and ack.get("id") == res["id"], "transcript: the session's own transcript answers {kind:transcript, agent:null, truncated:false, at, turns[]}",
           res and {k: res[k] for k in ("kind", "agent", "truncated")})
     check(turns_of(res) == want,
-          "transcript: the turns are the prompts, the assistant's text (one line each, cut at 240) and one line per tool call (name, ok|error|exit N, first output line) -- "
+          "transcript: the turns are the prompts, the assistant's text (its line breaks kept, cut at 400) and one line per tool call (name, ok|error|exit N, first output line) -- "
           "never thinking, sidechain chatter, injected caveats, local-command noise, an unreadable line or an unanswered call", turns_of(res))
     check(turns_of(res) is not None and ("tool", "Read · ok") in turns_of(res) and ("tool", "Bash · ok") in turns_of(res),
           "transcript: a tool call that named .env or .env.local shows no output line at all, not even its first")
@@ -817,16 +818,60 @@ def g_transcript(st):
           "transcript: tail N keeps the newest N turns and says truncated:true", turns_of(three))
     ack, mid = st.ask("transcript", tail=len(want))
     check(mid is not None and turns_of(mid) == want and mid["truncated"] is False, "transcript: tail equal to the turn count is not truncated")
+    # a turn keeps its line breaks, and is cut where the phone cuts: at TURN characters, a line break counted as one
+    lead = ("w" * 90 + "\n") * 3
+    lead += "w" * (TURN - 9 - len(lead) - 1) + " "  # TURN - 9 characters: of the token that follows, only 8 are inside the cut
+    exact = "\n".join(["x" * 39] * 9 + ["x" * 40])  # TURN characters, 9 of them line breaks
+    write_session(st, "s1b-lines", [
+        u_entry("Plan:\n- one\n- two\n\nGo."),
+        a_entry(t_text("\n\n  first   line  \r\n\r\n\r\n\tsecond\tline\rthird fourth\n\n")),
+        a_entry(t_text("y" * 300)),
+        a_entry(t_text(exact)),
+        a_entry(t_text(exact + "x")),
+        a_entry(t_text("status ok\nstill ok\nthe key is %s\nbye" % tok)),
+        a_entry(t_text(lead + tok)),
+    ])
+    ack, lines = st.ask("transcript")
+    got = turns_of(lines) or []
+    check(got[:1] == [("user", "Plan:\n- one\n- two\n\nGo.")],
+          "transcript: a turn's line breaks come back as they were sent -- a prompt of three lines and a blank one is the same prompt, not one run-on line", got[:1])
+    check(got[1:2] == [("assistant", "first line\n\nsecond line\nthird\nfourth")],
+          "transcript: whatever the transcript used for a line break (CRLF, a lone CR, U+2028) is one newline, each line's whitespace collapses to single spaces, "
+          "a run of blank lines is cut to one and none is left at either end", got[1:2])
+    check(got[2:5] == [("assistant", "y" * 300), ("assistant", exact), ("assistant", "\n".join(["x" * 39] * 10) + "…")] and len(got[3][1]) == len(got[4][1]) == TURN,
+          "transcript: a turn is cut where the phone cuts, at 400 characters and not 240: 300 and exactly 400 (line breaks counted) come whole, 401 is 399 and an ellipsis", got[2:5])
+    check(got[5:7] == [("assistant", "[redacted]")] * 2,
+          "transcript: a secret on any line masks the whole multi-line turn, and one that starts inside the cut and ends past it is never half shown", got[5:7])
     cut = "gh" + "p_"
     leaked = [n for n in (tok, cut, "HIDDEN-THOUGHT", "SIDECHAIN-CHATTER", "ENVMARKER_ONE", "ENVMARKER_TWO", "someone@example.com") if st.found_in_views(n)]
     check(not leaked, "transcript: no secret (not even the first characters of one the cut would have shown), no thinking, no .env output and no email is in any frame or file", leaked)
-    write_session(st, "s2-big", [u_entry("%04d %s" % (i, "字" * 300)) for i in range(500)])
+    write_session(st, "s2-big", [u_entry("%04d %s" % (i, "字" * (TURN + 100))) for i in range(500)])
     ack, big = st.ask("transcript", tail=500)
     size = len(json.dumps(big, separators=(",", ":"))) if big else None
     check(big is not None and big["truncated"] is True and 0 < len(big["turns"]) < 500 and size <= BUDGET and big["turns"][-1]["s"].startswith("0499 ")
-          and big["turns"][0]["s"][:4] != "0000" and all(len(t["s"]) == 240 for t in big["turns"]),
-          "transcript: a result is held to the slice budget by dropping the OLDEST turns (the newest is always kept), each turn at most 240 characters",
+          and big["turns"][0]["s"][:4] != "0000" and all(len(t["s"]) == TURN for t in big["turns"]),
+          "transcript: a result is held to the slice budget by dropping the OLDEST turns (the newest is always kept), each turn at most 400 characters",
           big and (len(big["turns"]), size))
+    # the worst frame a turn can make: 12 bytes an emoji once escaped, two a line break -- 500 turns of it must still fit the slice, and the frame its envelope
+    write_session(st, "s2b-lines-big", [u_entry("%04d\n%s" % (i, "\n".join(["😀" * 20] * 30))) for i in range(500)])
+    before = st.phone.mark()
+    st.phone.resync(["resync", "view-v1"])  # a phone that did not list z-zlib: plain frames
+    ack, many = st.ask("transcript", tail=500)
+    plain = st.phone.state(lambda s: ((s.get("views") or {}).get("result") or {}).get("id") == (many or {}).get("id"), since=before)
+    size = len(json.dumps(many, separators=(",", ":"))) if many else None
+    check(many is not None and many["truncated"] is True and 0 < len(many["turns"]) < 500 and size <= BUDGET and many["turns"][-1]["s"].startswith("0499\n")
+          and all(len(t["s"]) == TURN and "\n" in t["s"] for t in many["turns"]),
+          "transcript: 500 long multi-line turns of emoji are held to the slice budget (12 bytes a character, two a line break), the newest kept, each at most 400 characters with its line breaks",
+          many and (len(many["turns"]), size))
+    check(plain is not None and plain["z"] is False and plain["envelope_bytes"] < 1048576,
+          "transcript: sealed plain (a phone without z-zlib) that frame is still under the 1 MiB envelope cap", plain and plain["envelope_bytes"])
+    before = st.phone.mark()
+    st.phone.resync(VP.FULL_CAPS)
+    # a plain frame the client already had in flight may still land after `before`: only a compressed one answers the resync
+    squeezed = st.phone.wait(lambda f: f["type"] == "state" and f["z"] and ((f["body"]["state"].get("views") or {}).get("result") or {}).get("id") == (many or {}).get("id"),
+                             since=before)
+    check(squeezed is not None and plain is not None and squeezed["envelope_bytes"] < plain["envelope_bytes"],
+          "transcript: for a phone that listed z-zlib the same frame goes out zlib-compressed and smaller", squeezed and squeezed["envelope_bytes"])
     pad = json.dumps({"type": "progress", "pad": "x" * 60000})
     write_session(st, "s3-window", [u_entry("OLDEST-MARKER")] + [pad] * 90 + [u_entry("recent one"), a_entry(t_text("recent two"))])
     ack, win = st.ask("transcript")
