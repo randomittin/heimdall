@@ -28,6 +28,12 @@ export interface Env {
    *  RELAY_KEEPALIVE_MS above — vitest-only, absent in wrangler.toml, not a
    *  secret. */
   RELAY_STREAM_MAX_LIFETIME_MS?: string;
+  /** Optional floor, in milliseconds from now, under which the relay never arms a storage-
+   *  reclamation alarm (src/session.ts's armPurgeAlarm). Declared nowhere in wrangler.toml --
+   *  production and `wrangler dev` arm every alarm exactly when the code says; only the vitest
+   *  suite binds it (vitest.config.ts), so that no purge alarm falls due while a spec file is
+   *  still running. Not a secret. */
+  RELAY_PURGE_MIN_DELAY_MS?: string;
   /** Pair-by-session-code (src/code-pair.ts). The public client id of the project's GitHub
    *  App: a `[vars]` entry in wrangler.toml, not a secret. Optional in the type because
    *  all three of this and the two below must be set for code pairing to run; any one

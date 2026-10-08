@@ -79,6 +79,19 @@ export const PAIR_INIT_WINDOW_MS = 60_000;
 export const PAIR_INIT_RETRY_AFTER_S = 60;
 
 /**
+ * The optional `RELAY_PURGE_MIN_DELAY_MS` binding (src/types.ts) as a number of milliseconds: how
+ * far from now a storage-reclamation alarm is armed at the soonest. 0 -- no floor, every alarm
+ * exactly where the code puts it -- for an absent, empty, non-numeric, zero or negative value, so a
+ * bad binding can never move a purge earlier or switch reclamation off. Only the vitest suite
+ * binds it.
+ */
+export function purgeMinDelayMs(raw: string | undefined): number {
+  if (raw === undefined) return 0;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+/**
  * Generic sliding-window counter. `attempts` is a persisted list of prior
  * timestamps (ms); returns the pruned+appended list plus whether THIS attempt
  * is the one that crosses `maxInWindow`.
