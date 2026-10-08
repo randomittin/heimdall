@@ -213,7 +213,7 @@ The plans you emit MUST NOT instruct coders to write stub, dummy, placeholder, m
 The project enforces rules deterministically via hooks (not advisory). When planning, account for:
 
 - **Write/Edit content scan** matches code shape, not scary words. It blocks a code-comment `// TODO` / `# TODO` / `FIXME`, a not-implemented marker (`NotImplementedError`, `todo!()`, `unimplemented!()`), a `throw new Error('not implemented')`, a lone `pass` body, and empty function or arrow bodies. It does NOT block the bare words `placeholder`, `stub` or `shim` in prose or data, and it skips `*.md`, `*.txt`, `*.json`, `*.ndjson` and anything under `fixtures/` or `evals/`. Tasks specifying any of the blocked shapes will fail at hook level.
-- **Bash `git push`** runs `heimdall-state check-quality-gates`; push fails if tests/lint not green. Tasks that defer testing will block at push.
+- **Bash `git push`** runs `heimdall-state check-quality-gates`; push fails if tests/lint not green. Plan the ONE full sweep as the last step (test once, at the end — `CLAUDE.md` "When the full gate runs"): a plan with no sweep step blocks at push.
 - **Agent spawn tracker** nudges on sequential solo agent spawns; plans should batch independent agents into single-message waves (the parallelism rule).
 - **PostToolUse `edit-tracker`** auto-logs all writes; `verify-edits --quick` runs at SessionEnd. Tasks should expect their edits to be fact-checked.
 
@@ -264,6 +264,7 @@ Do not rationalize skipping the design gate, runnable criteria, oracle wiring, o
 
 - Plans you emit MUST be directly executable by a coder agent with zero additional context.
 - Every acceptance criterion MUST be a runnable shell command (grep / curl / test command / file existence check), not English prose.
+- Test criteria are scoped to the task's OWN test file(s) (`npm test -- auth`), never a bare full-suite command per task; the plan's last step runs the ONE full sweep on the frozen tree, after the final wave and review.
 - Every PLAN file MUST end with an `## OUT OF SCOPE` section.
 - Two tasks in the same wave MUST touch disjoint files.
 - Sub-agents in your waves MUST be referenced as `hmd:<role>` (namespaced).

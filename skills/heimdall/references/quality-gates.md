@@ -10,11 +10,12 @@ Every piece of work Heimdall produces passes through mandatory quality gates bef
 
 **State key**: `.quality_gates.tests_passing`
 
-**Protocol**:
+**Protocol** (test once, at the end — `CLAUDE.md` "When the full gate runs"):
 1. After any code change, the state is marked dirty: `heimdall-state mark-dirty`
-2. Test runner executes the full test suite
-3. If all pass: `heimdall-state mark-clean`
-4. If any fail: tests_passing remains false, push is blocked
+2. Agents run only their own test file(s), once; nobody runs the full suite per change or per merge
+3. ONCE, on the final frozen tree, immediately before the landing commit / push / demo / checkpoint, and only when no fix can still land: test runner executes the full test suite
+4. If all pass: `heimdall-state mark-clean`
+5. If any fail: tests_passing remains false, push is blocked
 
 ## Gate 2: Lint Clean
 

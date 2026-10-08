@@ -45,6 +45,8 @@ PROJECTS: Task spans multiple repos → one agent per repo, parallel.
 
 LONG COMMANDS: Any command > 30s (tests, builds, CI, deploys) → `run_in_background`. Continue other work.
 
+TESTING: Test once, at the end. Spawned agents run ONLY the test file(s) they add or edit, ONCE, after all their changes are written (no neighbouring or regression suites; ONE solo re-run for a failure plausibly caused by machine load) — put that in every spawn prompt. You never re-run suites per merge. ONE full sweep on the final frozen tree, immediately before the landing commit / push / demo / `/hmd:save` checkpoint, and never while a fix can still land. Rule + measured case: `CLAUDE.md` "When the full gate runs"; orchestrator detail: `agents/heimdall.md` §6c.
+
 MULTIPLE REQUESTS: User gave N requests → N agents, all parallel.
 
 Violating parallelism is a bug. Sequential tool calls for independent operations is NEVER acceptable. Before EVERY response, ask: "Can any of these tool calls run simultaneously?" If yes → batch them.

@@ -68,3 +68,4 @@ NEVER write stub, dummy, placeholder, shim, mock, TODO, or skeleton code. Every 
 - Do not introduce new design libraries without orchestrator approval
 - If the project has a design system, extend it rather than bypassing it
 - If you need assets (icons, images), note the dependency — NEVER create placeholder assets or stub components
+- Test once, at the end (`CLAUDE.md` "When the full gate runs"): test files you add or edit (component, snapshot, a11y) → run ONLY those, ONCE, after all your changes are written; no neighbouring suites. A failure plausibly caused by machine load gets ONE solo re-run. The orchestrator runs the one full sweep.

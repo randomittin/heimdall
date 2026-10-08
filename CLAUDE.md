@@ -103,18 +103,38 @@ linked co-author with an avatar.
 - Canonical checklist agents cross-check: `skills/heimdall/references/definition-of-done.md`
 
 ## When the full gate runs — ONCE, immediately before the landing commit
-The full sweep (`bash test/run-all.sh`, 320 suites, ~1600s) runs at exactly one
-moment: right before the commit that lands a completed unit of work. Not at session
-start, not after each file edit, not at mid-work checkpoints, not "whenever it feels
-done". Running it more often costs half an hour a pop and — worse — grades a tree
-that is still being edited, which attributes a verdict to a state of the code that
-never existed.
+Test once, at the end — operator directive 2026-10-08: avoid over-testing the same
+stuff; save testing for the end. The full sweep (`bash test/run-all.sh`, 320 suites,
+~1600s) runs at exactly one moment: on the final frozen tree, immediately before
+whichever of these comes first — the commit that lands a completed unit of work, the
+push, a demo, a `/hmd:save` checkpoint of finished work. One sweep serves all of them
+while the tree stays unedited. Not at session start, not after each file edit, not
+after each merge, not at mid-work checkpoints (`wip:` auto-commits, a save of
+unfinished work), not "whenever it feels done". Running it more often costs half an
+hour a pop and — worse — grades a tree that is still being edited, which attributes a
+verdict to a state of the code that never existed.
 
 - **Freeze the tree first.** `run-all.sh` reads the working tree as it finds it. No
   edits, and no agents editing, while it runs. A verdict over a moving tree is not a
   verdict.
-- **Per-suite runs stay cheap and stay encouraged.** `bash test/<one>.test.sh` during
-  work is the normal loop — run it constantly. What is restricted is the full sweep.
+- **Start it only when no follow-up fix is still possible.** A sweep begun while a
+  reviewer, verifier or agent can still hand back a change is spent the moment that
+  change lands, and a cancelled sweep costs the same half hour as a finished one.
+- **Per-suite runs: your own suite only, once.** An agent runs
+  `bash test/<one>.test.sh` for ONLY the test file(s) it adds or edits, ONCE, after
+  ALL its changes are written — no neighbouring or "regression" suites, no baseline
+  sweep. Once means once per state of the tree: a re-run needs an edit that targets
+  the failure (the TDD RED run and a break-it-and-watch-it-go-RED check each run a
+  different tree), while a second run of an unchanged tree is the waste. A failure
+  plausibly caused by machine load (timeout, port clash, agents running alongside)
+  gets ONE solo re-run, then it is real: fix it or report it. Regressions elsewhere
+  are the sweep's job.
+- **The orchestrator does not re-run suites per merge.** It takes each agent's
+  reported run as given, integrates, and runs the one sweep at the end.
+- **Measured, 2026-10-08 chat-replies wave:** three coder agents hit their 50-turn
+  limit mid-regression after running 10–25 neighbouring suites each, one suite was
+  re-run three times under load, and the orchestrator re-ran the same suites after
+  merging, then cancelled a full sweep when fixes landed.
 - **The `git push` hook stack is unchanged and stays.** It is a fail-closed backstop,
   not a duplicate of this rule: the pre-commit sweep is the agent's discipline, the
   pre-push gate is the machine's guarantee.

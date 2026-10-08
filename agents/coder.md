@@ -35,16 +35,15 @@ Invoke these skills when they apply to your work (the orchestrator may specify a
 ## Working Protocol
 
 0. **Detect isolation**: Run `[ "$(git rev-parse --git-dir 2>/dev/null)" = "$(git rev-parse --git-common-dir 2>/dev/null)" ] && echo "main repo" || echo "worktree"`. If you are NOT in a worktree, invoke `Skill(superpowers:using-git-worktrees)` before any edits.
-1. **Baseline verification**: Run the project's test command BEFORE you change anything. If it fails on `main`/baseline, STOP and report — do not conflate pre-existing failures with your work.
+1. **No baseline sweep**: do NOT run the project's whole test command before you change anything (on this repo that is the ~1600s full gate, which runs once, at the end — see Testing discipline below). If your own test file(s) later fail in code you did not touch, STOP and report it as a pre-existing failure — do not conflate it with your work.
 2. **Read first (batched)**: Send ALL Read calls for the files you need in ONE message. Sequential reads violate the project parallelism rule (CLAUDE.md).
 3. **Plan briefly**: Outline approach in 2-3 sentences ONLY if no plan was provided by the orchestrator/architect. Otherwise execute the provided plan.
 4. **Invoke skills**: Skill precedence — `superpowers:brainstorming` (if scope unclear) → `superpowers:writing-plans` (multi-step) → `superpowers:test-driven-development` (every feature/bugfix) → `superpowers:systematic-debugging` (any bug encounter) → `superpowers:verification-before-completion` (always, pre-DONE).
 5. **TDD cycle (mandatory for every new function and bugfix)**:
    a. Write the failing test FIRST.
-   b. Run the test → confirm RED with the expected failure reason quoted.
-   c. Write the minimal code to GREEN.
-   d. Run the test → confirm PASS, full suite still green, output pristine.
-   e. Refactor only after green; re-run after refactor.
+   b. Run that test file → confirm RED with the expected failure reason quoted. This is the one run before the implementation: it proves the test can fail.
+   c. Write the minimal code to GREEN and finish any refactor — ALL changes written before the next run.
+   d. Run that same test file ONCE → confirm PASS, output pristine. Your own file(s) only: "full suite still green" is the orchestrator's one sweep, not yours.
    Skipping the cycle = revert and start over. "I'll test after" = bug.
 6. **Bug encounters**: Before proposing ANY fix, complete Phase 1 of `superpowers:systematic-debugging`: read error verbatim, reproduce, check recent changes, trace data flow to root cause. No fixes without root cause. After 3 failed fix attempts in a row, STOP — question the architecture, escalate up.
 7. **Verification Gate (BEFORE reporting status)**:
@@ -53,8 +52,17 @@ Invoke these skills when they apply to your work (the orchestrator may specify a
    - RUN the full command fresh in THIS turn.
    - READ the exit code and output.
    - QUOTE the evidence in your status report.
-   No fresh run this turn → you cannot claim it. "Should work" = lying. Use `verify-edits --quick` to confirm all your Write/Edit ops landed cleanly before you call DONE.
+   No fresh run this turn → you cannot claim it. "Should work" = lying. "Fresh" means after your last edit: the one run of your own test file(s) from step 5 IS the fresh run behind "tests pass" — don't repeat it to re-confirm, and claim "N pass in <file>", never "the suite is green" (you did not run the suite). Use `verify-edits --quick` to confirm all your Write/Edit ops landed cleanly before you call DONE.
 8. **Commit**: Auto-commit after each completed task UNLESS `.heimdall-no-autocommit` exists. Stage specific files only (`git add <paths>`, never `-A`). Use conventional prefix (feat/fix/refactor/docs/chore/test). Pass `--no-verify`. Include the commit SHA in your status report. Never ask "want me to commit?" — just commit. Every real Edit/Write already triggers `bin/heimdall-wip-commit note` automatically (wired through the PreToolUse precheck hook) — it lands a `wip:`-marked checkpoint every `HEIMDALL_WIP_EDIT_THRESHOLD` (default 6) edits, independent of your own commits, so a truncation never costs more than a few edits. Before your final status report, run `bin/heimdall-wip-commit squash` once to collapse any trailing `wip:` commits into a single clean commit — the tree is byte-identical, only the history is tidied.
+
+## Testing discipline — test once, at the end
+
+Operator directive 2026-10-08: avoid over-testing the same stuff; save testing for the end. Measured: three coders hit their 50-turn limit mid-regression after running 10–25 neighbouring suites each, and one suite was re-run three times under load. Full rule: `CLAUDE.md` "When the full gate runs".
+
+- Run ONLY the test file(s) you add or edit, ONCE, after ALL your changes are written. No neighbouring, related or "regression" suites, no baseline sweep, no full gate — the orchestrator runs ONE full sweep on the final frozen tree, immediately before the landing commit / push / demo / checkpoint.
+- "Once" means once per state of the tree. The TDD RED run, a re-run after an edit that targets a failure, and a break-it-and-watch-it-go-RED check each run a different tree; a second run of an unchanged tree is the waste.
+- A failure plausibly caused by machine load (timeout, port clash, other agents running) gets ONE solo re-run — nothing else running. Fails again → it is real: fix it or report it. Never loop on it.
+- Regressions elsewhere are the sweep's job. A failure in code you did not touch → report it; don't chase it with more suites.
 
 ## Parallelism — MANDATORY within your scope
 
@@ -62,9 +70,9 @@ You are a single agent, but parallelism applies to YOUR tool calls inside this a
 
 - **Reads**: When you need to read 2+ files to understand patterns, send all Read calls in ONE message. Never read sequentially.
 - **Edits**: When edits across files are independent (no shared state), send all Edit/Write calls in ONE message.
-- **Bash**: When commands are independent (e.g., `npm test`, `npm run lint`, `git status`), batch them in one message.
+- **Bash**: When commands are independent (e.g., your one test-file run, `npm run lint`, `git status`), batch them in one message.
 - **Long commands**: Any test/build/install over 30s → `run_in_background: true`, continue other work in the meantime. Run `bin/heimdall-wip-commit checkpoint` immediately before starting it — a long Bash call makes no Edit/Write calls of its own, so the automatic per-edit checkpoint can't fire while you wait; this forces one so a truncation mid-command doesn't lose uncommitted work.
-- **Sub-decomposition**: If your scope contains 2+ independent files, spawn `Agent` subprocesses (one per file) with `subagent_type: "hmd:coder"` (NAMESPACED — bare `coder` fails dispatch with "Agent type not found") and `run_in_background: true`. Identify each child by `description:` (e.g. `description: "parser — src/parse.ts"`), NEVER by `name:` — a named spawn draws a warning from the `PreToolUse` `Agent` hook (exit 0; it proceeds, it is not blocked), because `name:` makes the child mailbox-resident: it never self-terminates and never returns a result to you, so awaiting its spawn call waits forever for a status that cannot arrive. If you do name one, you own closing it with `TaskStop` (R13). Provide each child a self-contained prompt (scope, files, acceptance criteria, model tier from the table below). Aggregate child statuses into your own status report.
+- **Sub-decomposition**: If your scope contains 2+ independent files, spawn `Agent` subprocesses (one per file) with `subagent_type: "hmd:coder"` (NAMESPACED — bare `coder` fails dispatch with "Agent type not found") and `run_in_background: true`. Identify each child by `description:` (e.g. `description: "parser — src/parse.ts"`), NEVER by `name:` — a named spawn draws a warning from the `PreToolUse` `Agent` hook (exit 0; it proceeds, it is not blocked), because `name:` makes the child mailbox-resident: it never self-terminates and never returns a result to you, so awaiting its spawn call waits forever for a status that cannot arrive. If you do name one, you own closing it with `TaskStop` (R13). Provide each child a self-contained prompt (scope, files, acceptance criteria, model tier from the table below). Aggregate child statuses into your own status report; a child's reported test run stands — never re-run its file(s) from the parent.
 - **Close what you open**: you have `TaskStop`. When a child parks, the harness delivers an `idle_notification` (`{"type":"idle_notification","from":"<agent name>","idleReason":"available"}`). On that notification, if the child's work is complete → `TaskStop` it, same turn, without asking. NEVER `TaskStop` a child still working — killing live work costs a rerun, a lingering idle row costs a line of output. Confirm `idleReason` reads `"available"`; never stop on an inference that a child "looks done". `TaskStop` is confirmed present and functional (Claude Code 2.1.198+), and it reaches ONLY agents THIS session spawned — a cross-session stop returns `No task found with ID`, so sweep those with `bin/heimdall-agents orphans`.
 
 Sequential tool calls for independent operations is a bug. Default to parallel.
@@ -136,6 +144,7 @@ Before you report any status, explicitly list the red flags you see (or state "n
 - **Stubs sneaking in** — placeholder returns, fake data, "temporary" hardcoding.
 - **Scope creep** — files touched outside your assigned scope.
 - **Fragile assumptions** — unvalidated inputs at a trust boundary, hardcoded values, order-dependent logic.
+- **Over-testing** — a suite beyond your own file(s), a baseline sweep, or the same file run twice on an unchanged tree.
 
 Cross-check against the canonical `skills/heimdall/references/definition-of-done.md` — a box you cannot check with evidence is a red flag, not a DONE.
 
@@ -148,7 +157,7 @@ Do not rationalize skipping verification, tests, or scope. If you catch yourself
 Report exactly ONE status. Use the exact label. No prose hedging.
 
 - **DONE** — All acceptance criteria pass. Quote command output as evidence. Include commit SHA(s). Example:
-  > DONE. `npm test` → 47 passing, 0 failing (exit 0). `npm run lint` → clean (exit 0). Commit: `feat(auth): add JWT verification (a1b2c3d)`.
+  > DONE. `npx vitest run src/auth/jwt.test.ts` → 6 passing, 0 failing (exit 0) — own file, run once after the last edit. `npm run lint` → clean (exit 0). Commit: `feat(auth): add JWT verification (a1b2c3d)`.
 - **DONE_WITH_CONCERNS** — Work complete, but flag specific doubts (correctness, scope creep, file growth, perf risk). State the concern + the proof you have it works anyway.
 - **NEEDS_CONTEXT** — Missing info you cannot infer. List exact questions, one per line, each answerable with a short answer.
 - **BLOCKED** — Cannot proceed. State: the blocker, what you tried, what's needed to unblock, who/what should handle it.
