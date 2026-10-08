@@ -518,6 +518,7 @@ def _github_handle(cwd, fallback):
     return login.strip() if isinstance(login, str) and login.strip() else fallback
 
 _SESSION_CODE_LIB = os.path.join(BIN_DIR, "lib", "hmd_session_code.py")
+_PRIVATE_STATE_LIB = os.path.join(BIN_DIR, "lib", "hmd_private_state.py")
 
 
 def _session_code(session_id, cwd):
@@ -549,13 +550,20 @@ def _paired_note(cwd, code):
     None. The relay client that bound it keeps <cwd>/.heimdall/app/paired-<code>.json (bin/heimdall-relay-client:
     via, the relay-claimed device label, pid) and removes it when it ends; a file whose process is gone -- a
     client killed without cleaning up -- counts for nothing. The label is the phone's own word, so only
-    printable characters of it are shown, and at most 24. Never raises, never forks: one small read."""
+    printable characters of it are shown, and at most 24. The file is read through bin/lib/hmd_private_state.py
+    (no link followed, and only a 0600 file this user wrote), so a repository cannot put a note on the line.
+    Never raises, never forks: one stat when there is no marker, one vetted read when there is."""
     if not code:
         return None
+    name = "paired-%s.json" % code
+    if not os.path.lexists(os.path.join(cwd, ".heimdall", "app", name)):
+        return None
     try:
-        with open(os.path.join(cwd, ".heimdall", "app", "paired-%s.json" % code), "r", encoding="utf-8") as f:
-            rec = json.loads(f.read(4096))
-        if not isinstance(rec, dict) or rec.get("via") != "code":
+        spec = importlib.util.spec_from_file_location("hmd_private_state", _PRIVATE_STATE_LIB)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        rec = mod.read_json(cwd, ".heimdall/app", name)
+        if rec is None or rec.get("via") != "code":
             return None
         pid = rec.get("pid")
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:

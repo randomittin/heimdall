@@ -469,6 +469,9 @@ INBOX = _load_module("companion_ui_inbox", os.path.join(LIB_DIR, "companion_ui_i
 DECISIONS = _load_module("companion_ui_decisions", os.path.join(LIB_DIR, "companion_ui_decisions.py"))
 E2E = _load_module("hmd_relay_e2e", os.path.join(LIB_DIR, "hmd_relay_e2e.py"))
 PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "companion_push_store.py"))
+# the pairing marker is the one file this client keeps in a tree a repository controls without going through that
+# module's own walk, so it goes through the same vetted one (no link followed, 0600, ours): bin/lib/hmd_private_state.py
+PRIVATE = _load_module("hmd_private_state", os.path.join(LIB_DIR, "hmd_private_state.py"))
 LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
 CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
 VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
@@ -1868,20 +1871,25 @@ class RelayClient:
         self._revoke_session(self.session_id, self.token)
         self._renew_now.set()
 
-    def _paired_marker_path(self):
-        return os.path.join(self.root, ".heimdall", "app", "paired-%s.json" % self._code)
+    _MARKER_REL = ".heimdall/app"
+
+    def _paired_marker_name(self):
+        return "paired-%s.json" % self._code
 
     def _leave_pairing_traces(self, pending):
         """A phone paired by code: leave the two things that make that visible to the operator -- the marker the
         statusline reads (`<device> paired via code`, for as long as this process lives) and a notice in the
         session's inbox, which heimdall-inbox-deliver hands the Claude session at its next boundary. Both name the
-        phone only by what the relay CLAIMED, already cleaned. Best effort: a bookkeeping fault is reported as an
-        `error` event and never undoes a bind."""
+        phone only by what the relay CLAIMED, already cleaned. The marker is written through hmd_private_state (no
+        link anywhere below the repo is followed; 0600). Best effort: a bookkeeping fault is reported as an `error`
+        event and never undoes a bind."""
         label, login = pending["label"], pending["login"]
         try:
-            _atomic_write_json(self._paired_marker_path(),
-                               {"via": "code", "device_label": label, "gh_login": login,
-                                "bound_at": self.bound_at, "pid": os.getpid()})
+            if PRIVATE is None:
+                raise OSError("bin/lib/hmd_private_state.py failed to import")
+            body = json.dumps({"via": "code", "device_label": label, "gh_login": login,
+                               "bound_at": self.bound_at, "pid": os.getpid()}, sort_keys=True, separators=(",", ":"))
+            PRIVATE.write(self.root, self._MARKER_REL, self._paired_marker_name(), body.encode("utf-8"))
         except OSError as e:
             emit({"event": "error", "detail": "paired marker not written: %s" % e})
         if INBOX is None:
@@ -1903,17 +1911,11 @@ class RelayClient:
 
     def _remove_paired_marker(self):
         """Take the statusline's marker down -- only a marker this very process wrote."""
-        if not self._code:
+        if not self._code or PRIVATE is None:
             return
-        path = self._paired_marker_path()
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                owner = json.load(f).get("pid")
-        except (OSError, ValueError, AttributeError):
-            return
-        if owner == os.getpid():
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+        rec = PRIVATE.read_json(self.root, self._MARKER_REL, self._paired_marker_name())
+        if rec is not None and rec.get("pid") == os.getpid():
+            PRIVATE.remove(self.root, self._MARKER_REL, self._paired_marker_name())
 
     # -- stream --------------------------------------------------------------
     def _open_stream(self):
