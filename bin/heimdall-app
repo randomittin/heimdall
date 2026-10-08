@@ -882,11 +882,7 @@ _relay_event() {
       echo "  relay-claimed GitHub user: @${login:-unknown}"
       echo "  (the relay says so -- only the number below shows which phone this is)"
       echo "  The phone shows:  ${sas:0:3} ${sas:3:3}"
-      if [ "$auto" = true ]; then
-        echo "  --no-confirm: approved without asking."
-        return 0
-      fi
-      if [ ! -t 0 ]; then  # connect only offers a code at a terminal; this keeps a prompt from ever waiting on a pipe
+      if [ ! -t 0 ]; then  # --confirm needs a terminal (checked before anything starts); this keeps a prompt from ever waiting on a pipe
         echo "  No terminal to confirm at -- the pairing is rejected."
         _ctl_send reject
         return 0
@@ -900,9 +896,21 @@ _relay_event() {
         *) _ctl_send reject ;;
       esac
       ;;
+    code_paired)
+      local plabel plogin
+      plabel="$(_clean_text "$(printf '%s' "$line" | jq -r '.device_label // empty' 2>/dev/null)")"
+      plogin="$(_clean_text "$(printf '%s' "$line" | jq -r '.gh_login // empty' 2>/dev/null)")"
+      code_active=false
+      paired_announced=true  # its device_bound follows at once and is not announced a second time
+      echo "hmd app: phone paired via code -- relay-claimed device '${plabel:-unnamed device}', GitHub @${plogin:-unknown}"
+      ;;
     device_bound)
       code_active=false
-      echo "hmd app: phone paired"
+      if [ "$paired_announced" = true ]; then
+        paired_announced=false
+      else
+        echo "hmd app: phone paired"
+      fi
       ;;
     stream_drop)
       echo "hmd app: relay stream dropped -- the client will attempt to reconnect" >&2
@@ -929,7 +937,7 @@ _relay_drain() {
 
 cmd_connect() {
   local REPO="" PORT="8710" NO_INSTALL=false BG=false
-  local RELAY_URL="" RELAY_SET=false HTTPS_PORT_SET=false TAILSCALE=false NO_CODE=false NO_CONFIRM=false
+  local RELAY_URL="" RELAY_SET=false HTTPS_PORT_SET=false TAILSCALE=false NO_CODE=false NO_CONFIRM=false CONFIRM=false
   HTTPS_PORT="443"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -953,7 +961,8 @@ cmd_connect() {
         ;;
       --tailscale) TAILSCALE=true; shift ;;
       --no-code) NO_CODE=true; shift ;;
-      --no-confirm) NO_CONFIRM=true; shift ;;
+      --confirm) CONFIRM=true; shift ;;
+      --no-confirm) NO_CONFIRM=true; shift ;;  # the default since pairing by code stopped asking; kept so old command lines work
       --no-install) NO_INSTALL=true; shift ;;
       --bg) BG=true; shift ;;
       *) echo "hmd app connect: unknown flag: $1" >&2; return 2 ;;
@@ -978,14 +987,22 @@ cmd_connect() {
   if [ -z "$RELAY_URL" ] && [ "$TAILSCALE" != true ] && [ "$HTTPS_PORT_SET" != true ] && [ "$NO_INSTALL" != true ]; then
     RELAY_URL="${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}"
   fi
-  if [ -z "$RELAY_URL" ] && { [ "$NO_CODE" = true ] || [ "$NO_CONFIRM" = true ]; }; then
-    echo "hmd app connect: --no-code and --no-confirm belong to the relay transport, not Tailscale Funnel" >&2
+  if [ -z "$RELAY_URL" ] && { [ "$NO_CODE" = true ] || [ "$CONFIRM" = true ] || [ "$NO_CONFIRM" = true ]; }; then
+    echo "hmd app connect: --no-code, --confirm and --no-confirm belong to the relay transport, not Tailscale Funnel" >&2
+    return 2
+  fi
+  if [ "$CONFIRM" = true ] && [ "$NO_CONFIRM" = true ]; then
+    echo "hmd app connect: --confirm and --no-confirm are mutually exclusive" >&2
+    return 2
+  fi
+  if [ "$CONFIRM" = true ] && [ "$NO_CODE" = true ]; then
+    echo "hmd app connect: --confirm compares a phone that pairs by code; it cannot be combined with --no-code" >&2
     return 2
   fi
 
   if [ -n "$RELAY_URL" ]; then
     RELAY_MODE=true
-    cmd_connect_relay "$REPO" "$PORT" "$BG" "$RELAY_URL" "$NO_CODE" "$NO_CONFIRM"
+    cmd_connect_relay "$REPO" "$PORT" "$BG" "$RELAY_URL" "$NO_CODE" "$CONFIRM"
     return $?
   fi
 
@@ -1209,7 +1226,7 @@ cmd_connect() {
 # its own stdout, and tears it down. $1: REPO (already resolved). $2: PORT.
 # $3: BG (true/false). $4: RELAY_URL.
 cmd_connect_relay() {
-  local REPO="$1" PORT="$2" BG="$3" RELAY_URL="$4" NO_CODE="${5:-false}" NO_CONFIRM="${6:-false}"
+  local REPO="$1" PORT="$2" BG="$3" RELAY_URL="$4" NO_CODE="${5:-false}" CONFIRM="${6:-false}"
 
   if [ ! -x "$UI_BIN" ]; then
     echo "hmd app connect: heimdall-ui not found at $UI_BIN" >&2
@@ -1224,36 +1241,44 @@ cmd_connect_relay() {
     return 2
   fi
 
-  # Pair by code (see the usage block): decided now, before anything is started, so a --bg that could not
-  # confirm at a terminal fails before it leaves a process behind. The token lives in gh_tok only until it has
-  # been written to the client's pipe; it is never passed as an argument or exported.
+  # --confirm asks at THIS terminal, so it needs one and cannot outlive this command (--bg returns and leaves
+  # nobody to ask). Both are settled before anything starts: nothing to tear down, no token read. Without
+  # --confirm nothing is asked, so a pipe or --bg pairs by code like any other run.
+  if [ "$CONFIRM" = true ]; then
+    if [ "$BG" = true ]; then
+      echo "hmd app connect: --confirm asks at this terminal and --bg leaves it, so nobody would be left to ask -- drop one of them" >&2
+      return 64
+    fi
+    if [ ! -t 0 ]; then
+      echo "hmd app connect: --confirm asks at this terminal and stdin is not one -- run it at a terminal, or drop --confirm" >&2
+      return 64
+    fi
+  fi
+
+  # Pair by code (see the usage block). The token lives in gh_tok only until it has been written to the client's
+  # pipe; it is never passed as an argument or exported. A pair window this session already has open holds the
+  # code (one live window per GitHub id and code on the relay), so a plain connect leaves it there and says so,
+  # while --confirm, which needs the code for a window that asks, stops that one first.
   local code_requested=false code="" gh_tok=""
   if [ "$NO_CODE" != true ]; then
     if code="$(_session_code_for_repo "$REPO")"; then
-      if _gh_token_into gh_tok; then
-        code_requested=true
-      else
-        echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
+      if [ "$CONFIRM" = true ]; then
+        _pair_window_stop_code "$REPO" "$code"
+      elif _pair_window_holds "$REPO" "$code"; then
+        echo "hmd app: session code $code is already open for pairing in this session's window -- type it in the app. This connect pairs by QR."
+        code=""
+      fi
+      if [ -n "$code" ]; then
+        if _gh_token_into gh_tok; then
+          code_requested=true
+        else
+          echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
+        fi
       fi
     else
       code=""
       echo "hmd app: code pairing off — could not derive this session's code. Scan the QR."
     fi
-  fi
-  if [ "$code_requested" = true ] && [ "$BG" = true ] && [ "$NO_CONFIRM" != true ]; then
-    gh_tok=""
-    echo "hmd app connect: code pairing confirms at this terminal — drop --bg, add --no-confirm, or use the QR" >&2
-    return 64
-  fi
-  if [ "$code_requested" = true ] && [ "$NO_CONFIRM" != true ] && [ ! -t 0 ]; then
-    # A phone that claims the code is approved by a person looking at two screens; with no terminal there is
-    # nobody to ask, so the code is not offered at all (a code that rejects every phone would only mislead).
-    code_requested=false
-    gh_tok=""
-    echo "hmd app: code pairing off — no terminal to confirm a phone at (run this at a terminal, or add --no-confirm). Scan the QR."
-  fi
-  if [ "$code_requested" = true ] && [ "$NO_CONFIRM" = true ]; then
-    echo "hmd app: --no-confirm trusts the relay to deliver the right keys."
   fi
 
   mkdir -p "$REPO/.heimdall/app" 2>/dev/null || true
