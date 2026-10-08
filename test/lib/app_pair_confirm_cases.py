@@ -123,8 +123,12 @@ def write_gh(bindir, mode):
     os.chmod(path, 0o755)
 
 
-def seed_of(heimdall_home):
-    with open(os.path.join(heimdall_home, "session-code.key"), encoding="ascii") as f:
+def seed_of(heimdall_home, wait=30.0):
+    """The machine's seed, once whatever is about to derive the first code has made it (a hook's background process
+    records the session before it derives anything, so the file can lag the session record by a moment)."""
+    path = os.path.join(heimdall_home, "session-code.key")
+    wait_until(lambda: os.path.exists(path), wait)
+    with open(path, encoding="ascii") as f:
         return f.read().strip()
 
 
