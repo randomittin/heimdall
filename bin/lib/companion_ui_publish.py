@@ -27,12 +27,18 @@ src/contract/guards.ts, src/session/tabs/agents/parse.ts):
                 other `data` key, so the serve-side `truncated`/`dropped_lines`
                 markers (companion_ui_panels.bound_log_tail) must never fire: the
                 publisher pre-bounds with that same helper at the app's own limits
-                (200 lines, 500 UTF-16 units each) and keeps the newest slice.
-                Line: "<HH:MM> <you|hmd> <text>", newline -> " ⏎ ".
-  hmd-question  markdown  {"text": ...}  (<= 500 units), present only while the
-                last thing in the conversation is an hmd reply ending in `?`
-                (bin/heimdall's INPUT convention) -- gone the moment anything
-                (typed prompt or delivered phone answer) follows it.
+                (200 lines, 8000 UTF-16 units each, "HH:MM role " head included --
+                guards.ts MAX_CHAT_LINE_CHARS, which the app applies to this panel
+                alone; the panel file's 64 KiB cap bounds the total) and keeps the
+                newest slice. Line: "<HH:MM> <you|hmd> <text>", newline -> " ⏎ ".
+                A turn is a line whether or not it has ended: hmd's mid-turn text (a
+                message that stops for a tool) is published as it is written, so the
+                phone is not silent while a long tool-using turn runs.
+  hmd-question  markdown  {"text": ...}  (<= 500 units: the cap every other string
+                leaf keeps), present only while the last thing in the conversation is
+                a FINAL hmd reply ending in `?` (bin/heimdall's INPUT convention) --
+                gone the moment anything (typed prompt, delivered phone answer, or
+                hmd's next mid-turn text) follows it.
   agents        table     agent|role|model|status|started|elapsed, status in
                 running|pending|finished|unknown (projection of heimdall-agents).
 
@@ -55,7 +61,8 @@ CHAT_ID, CHAT_TITLE = "chat", "Chat"
 QUESTION_ID, QUESTION_TITLE = "hmd-question", "hmd asks"
 AGENTS_ID, AGENTS_TITLE = "agents", "Agents"
 REFRESH_S = 30                  # stale after max(30*3, 30) = 90s, same as the hmdapp publishers
-APP_MAX_UNITS = 500             # hmdapp guards.ts MAX_STRING_CHARS -- JS string length = UTF-16 units
+APP_MAX_UNITS = 500             # hmdapp guards.ts MAX_STRING_CHARS -- JS string length = UTF-16 units; the hmd-question text
+CHAT_LINE_MAX_UNITS = P.MAX_CHAT_LINE_CHARS   # hmdapp guards.ts MAX_CHAT_LINE_CHARS (8000): one chat line, "HH:MM role " head included
 TAIL_BYTES_DEFAULT = 1 << 20    # env HMD_UI_CHAT_TAIL_BYTES; never a full-file read
 FP_BYTES = 256                  # ChatTail: bytes before its resume offset re-read to prove the file is the one cached
 SYNC_ATTEMPTS = 3               # ChatTail: reads retried when a write lands under them, before one plain read
@@ -254,8 +261,10 @@ class _Part(object):
     phone message or one assistant text block. `off` is the file offset of the entry's line
     (what the tail window cuts by); `ts` is None when the entry has no usable timestamp (the
     file's mtime stands in at format time). Consecutive parts of one assistant message are a
-    single turn (see _merges). `key`/`line` memoize the formatted line on the FIRST part of
-    a turn, valid for the (part count, timestamp) it was formatted for."""
+    single turn (see _merges). `final` is True for every `you` part and for an assistant text that
+    ends its message (no tool, not stopped for one); mid-turn text is a part too, just not final.
+    `key`/`line` memoize the formatted line on the FIRST part of a turn, valid for the (part
+    count, timestamp) it was formatted for."""
     __slots__ = ("off", "role", "mid", "text", "final", "ts", "key", "line")
 
     def __init__(self, off, role, mid, text, final, ts):
@@ -268,9 +277,10 @@ def entry_parts(e, off):
     """The conversation parts of one transcript entry, usually none or one: operator
     prompts, delivered phone messages (both role `you`, text exactly as delivered so the app
     can pair them with its outbox entry) and assistant text blocks. A turn is its run of
-    parts (_merges) and is shown when any part is the FINAL main-chain text of the turn:
-    mid-turn narration (a message that stops for a tool) and sub-agent turns are not the
-    chat; tool calls and results are never read."""
+    parts (_merges) and every turn is chat, the one still running included: mid-turn text (a
+    message that stops for a tool) is published as it is written, flagged not `final` -- only
+    a FINAL reply (no tool, not stopped for one) can be the hmd-question. Sub-agent turns, API
+    errors, tool calls and results are not the conversation and are never read."""
     if e.get("type") == "assistant":
         if e.get("isSidechain") or e.get("isApiErrorMessage"):
             return ()
@@ -313,7 +323,7 @@ def format_line(role, raw_text, ts):
     head = "%s %s " % (time.strftime("%H:%M", time.localtime(ts)), role)
     if P.secret_shaped(str(raw_text)) or P.secret_shaped(text):
         return head + "[redacted]"
-    line = head + cut_utf16(text, APP_MAX_UNITS - utf16_len(head))
+    line = head + cut_utf16(text, CHAT_LINE_MAX_UNITS - utf16_len(head))
     return head + "[redacted]" if P.secret_shaped(line) else line
 
 
@@ -457,7 +467,7 @@ def fit_lines(lines):
     shrinks by the exact serialized size so JSON escaping can never push the file
     past MAX_FILE_BYTES."""
     kept, _dropped = P.bound_log_tail(lines, max_lines=P.MAX_LIST_ITEMS, max_bytes=P.MAX_FILE_BYTES,
-                                      max_line_chars=P.MAX_STRING_CHARS)
+                                      max_line_chars=P.MAX_CHAT_LINE_CHARS)
     while kept and _serialized_size(kept) > P.MAX_FILE_BYTES - ENVELOPE_SLACK:
         kept = kept[1:]
     return kept
@@ -679,9 +689,10 @@ class ChatTail(object):
 
     def view(self, fallback_ts):
         """(headless, lines, question) for the window. `lines` are the newest panel lines in the
-        publisher's format, bounded as fit_lines does; `question` is the hmd-question markdown for
-        the last shown turn, or None. `fallback_ts` (the file's mtime) times a turn whose entry
-        has no usable timestamp."""
+        publisher's format, one per turn (a running turn's mid-turn text included), bounded as
+        fit_lines does; `question` is the hmd-question markdown when the NEWEST turn is a final
+        hmd reply ending in `?`, else None. `fallback_ts` (the file's mtime) times a turn whose
+        entry has no usable timestamp."""
         parts = self._window()[0]
         lines, last = [], None
         i = len(parts)
@@ -691,8 +702,6 @@ class ChatTail(object):
                 j -= 1
             turn = parts[j:i]
             i = j
-            if not any(p.final for p in turn):
-                continue
             if last is None:
                 last = turn
             line = self._line(turn, fallback_ts)
@@ -700,7 +709,7 @@ class ChatTail(object):
                 lines.append(line)
         lines.reverse()
         question = None
-        if last is not None and last[0].role == "hmd":
+        if last is not None and last[0].role == "hmd" and any(p.final for p in last):
             text = "\n".join(p.text for p in last)
             if is_question(text):
                 question = self._question(last[0], len(last), text)

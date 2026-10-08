@@ -12,9 +12,14 @@
 #   chat          log-tail  {"lines": [...]}  ONLY -- the app rejects any other `data`
 #                 key (guards.ts unexpectedDataKey) so NO truncated/dropped_lines
 #                 markers; every line "<HH:MM> <you|hmd> <text>" (parse.ts
-#                 CHAT_LINE_RE), <= 500 UTF-16 units (guards.ts MAX_STRING_CHARS),
-#                 <= 200 lines, newlines as the U+23CE marker.
-#   hmd-question  markdown  {"text": ...}     ONLY, <= 500 units.
+#                 CHAT_LINE_RE), <= 8000 UTF-16 units, its head included (guards.ts
+#                 MAX_CHAT_LINE_CHARS, an exception the app applies to the `chat`
+#                 panel alone), <= 200 lines, newlines as the U+23CE marker. hmd's
+#                 mid-turn text (a message that stops for a tool) is a line too, so
+#                 the phone is not silent while a tool-using turn runs.
+#   hmd-question  markdown  {"text": ...}     ONLY, <= 500 units (guards.ts
+#                 MAX_STRING_CHARS, which every other string leaf keeps), and only
+#                 ever a FINAL reply.
 #   agents        table     columns agent|role|model|status|started|elapsed,
 #                 status in running|pending|finished|unknown.
 # Everything below reads panels back through companion_ui_panels.read_panels --
@@ -239,9 +244,10 @@ if chat:
           chat["type"] == "log-tail" and chat["title"] == "Chat" and chat["refresh_s"] == 30, str(chat)[:200])
     check("1c. chat data has exactly the key `lines` (the app rejects any other key)",
           list(chat["data"].keys()) == ["lines"], str(list(chat["data"].keys())))
-    want = ["%s you hello there" % HHMM(T0), "%s hmd Hi! ⏎  ⏎ second para" % HHMM(T0 + 60)]
-    check("1d. only the operator prompt and the FINAL main-chain reply become lines (tool results, "
-          "task notifications, intermediate narration, sidechain turns excluded; newline -> U+23CE)",
+    want = ["%s you hello there" % HHMM(T0), "%s hmd let me look" % HHMM(T0 + 2),
+            "%s hmd Hi! ⏎  ⏎ second para" % HHMM(T0 + 60)]
+    check("1d. the operator prompt, hmd's mid-turn text and the FINAL main-chain reply become lines (tool "
+          "calls and results, task notifications and sidechain turns excluded; newline -> U+23CE)",
           chat["data"]["lines"] == want, repr(chat["data"]["lines"]))
     check("1e. updated_at is the transcript's last-activity time, not the publish time",
           abs(chat["updated_at"] - (T0 + 60)) < 1, str(chat["updated_at"] - T0))
@@ -287,7 +293,7 @@ check("3a. secret-shaped prompts/replies (incl. one split across a newline) beco
 raw = open(os.path.join(root, ".heimdall", "ui", "panels", "chat.json"), encoding="utf-8").read()
 check("3b. no secret substring ever reaches the panel file", STRIPE not in raw and "Zx9Cv8Bn7Mq6Wr5Ty4Ui3Op2" not in raw)
 
-# ── 4. bounds: <= 200 lines, <= 500 UTF-16 units each, file <= 65536 bytes ───────────
+# ── 4. bounds: <= 200 lines, <= 8000 UTF-16 units each, file <= 65536 bytes ──────────
 root, d = new_repo()
 entries = []
 for i in range(320):
@@ -303,8 +309,8 @@ ls = chat["data"]["lines"] if chat else []
 check("4a. line count <= 200 and the NEWEST turns are the ones kept",
       chat is not None and 0 < len(ls) <= 200 and ls[-1].startswith(HHMM(T0 + 319 * 2 + 1) + " hmd reply 319"),
       "n=%d last=%r" % (len(ls), ls[-1][:40] if ls else ""))
-check("4b. every line <= 500 UTF-16 units (the app's MAX_STRING_CHARS), emoji counted as 2",
-      all(utf16(x) <= 500 for x in ls), str(max((utf16(x) for x in ls), default=0)))
+check("4b. every line <= 8000 UTF-16 units (the app's MAX_CHAT_LINE_CHARS), emoji counted as 2",
+      all(utf16(x) <= 8000 for x in ls), str(max((utf16(x) for x in ls), default=0)))
 check("4c. file <= MAX_FILE_BYTES and `data` still only `lines` (no truncated/dropped_lines markers)",
       os.path.getsize(fp) <= P.MAX_FILE_BYTES and chat is not None and list(chat["data"].keys()) == ["lines"],
       str(os.path.getsize(fp)))
@@ -591,6 +597,210 @@ cells = [r[0] for r in ap["data"]["rows"]] if ap else []
 check("11l. a secret-shaped description becomes `[redacted]` (row kept, panel still served); newlines/tabs/"
       "control bytes are flattened", cells == ["[redacted]", "two lines andctl"], repr(cells))
 
+# ── 12. hmd's mid-turn text is chat: the phone is not silent while a tool-using turn runs ──────────────
+def a_text_tool(text, ts, mid, ep="cli"):
+    """The older transcript shape: ONE entry holding a text block and the tool_use that ends its message."""
+    e = base(ts, ep)
+    e.update({"type": "assistant", "message": {"id": mid, "role": "assistant", "stop_reason": "tool_use",
+                                               "content": [{"type": "text", "text": text},
+                                                           {"type": "tool_use", "id": "toolu_z", "name": "Bash",
+                                                            "input": {"command": "ls"}}]}})
+    return e
+
+
+def a_error(text, ts, mid):
+    e = a_text(text, ts, mid)
+    e["isApiErrorMessage"] = True
+    return e
+
+
+def chat_lines(r, now):
+    return served(r, now).get("chat", {"data": {"lines": []}})["data"]["lines"]
+
+
+CHATP = lambda r: os.path.join(r, ".heimdall", "ui", "panels", "chat.json")
+
+root, d = new_repo()
+tp = write_transcript(d, "sess-mid", [
+    u_human("fix the build", T0),
+    a_text("Looking at the failing test first.", T0 + 2, "m1", stop="tool_use"),
+    a_tool(T0 + 3, "m1"),
+    u_tool_result(T0 + 4),
+])
+pub = CP.CompanionPublisher(root)
+changed = pub.tick(now=T0 + 10)
+lines = chat_lines(root, T0 + 10)
+check("12a. a turn that is still running is not silent: its mid-turn text is a chat line, in the plain "
+      "`HH:MM hmd <text>` shape older apps read (no marker, no extra key)",
+      changed is True and lines == ["%s you fix the build" % HHMM(T0),
+                                    "%s hmd Looking at the failing test first." % HHMM(T0 + 2)], repr(lines))
+append_transcript(tp, [a_text("Found it: a stale fixture.", T0 + 20, "m2", stop="tool_use"), a_tool(T0 + 21, "m2"),
+                       u_tool_result(T0 + 22), a_text("Fixed. The build is green.", T0 + 40, "m3")])
+changed = pub.tick(now=T0 + 50)
+lines = chat_lines(root, T0 + 50)
+check("12b. every mid-turn text and then the final reply are lines, in transcript order, one per message",
+      changed is True and [ln[10:] for ln in lines] == ["fix the build", "Looking at the failing test first.",
+                                                       "Found it: a stale fixture.", "Fixed. The build is green."],
+      repr(lines))
+check("12c. an idle tick rewrites nothing (the SSE digest stays quiet)", pub.tick(now=T0 + 60) is False)
+
+root, d = new_repo()
+tp = write_transcript(d, "sess-live", [u_human("go", T0)])
+pub = CP.CompanionPublisher(root)
+pub.tick(now=T0 + 5)
+append_transcript(tp, [a_text("on it", T0 + 8, "m1", stop="tool_use"), a_tool(T0 + 9, "m1")])
+c1 = pub.tick(now=T0 + 12)
+check("12d. mid-turn text appended to a live transcript republishes the chat on the very next tick",
+      c1 is True and [ln[10:] for ln in chat_lines(root, T0 + 12)] == ["go", "on it"],
+      repr(chat_lines(root, T0 + 12)))
+
+root, d = new_repo()
+write_transcript(d, "s", [u_human("go", T0), a_text_tool("checking the logs", T0 + 3, "m1"), u_tool_result(T0 + 4)])
+CP.CompanionPublisher(root).tick(now=T0 + 20)
+check("12e. a text block that shares its entry with the tool_use ending its message is published too",
+      [ln[10:] for ln in chat_lines(root, T0 + 20)] == ["go", "checking the logs"], repr(chat_lines(root, T0 + 20)))
+
+root, d = new_repo()
+write_transcript(d, "s", [u_human("go", T0),
+                          a_text("sub-agent narration", T0 + 2, "s1", stop="tool_use", sidechain=True),
+                          a_error("API Error: 529 overloaded", T0 + 3, "e1"),
+                          a_text("main narration", T0 + 4, "m1", stop="tool_use"), a_tool(T0 + 5, "m1")])
+CP.CompanionPublisher(root).tick(now=T0 + 20)
+check("12f. sub-agent narration and API-error messages stay out of the chat; the main chain's narration is in",
+      [ln[10:] for ln in chat_lines(root, T0 + 20)] == ["go", "main narration"], repr(chat_lines(root, T0 + 20)))
+
+root, d = new_repo()
+write_transcript(d, "s", [u_human("go", T0), a_text("exporting " + STRIPE + " now", T0 + 2, "m1", stop="tool_use"),
+                          a_tool(T0 + 3, "m1")])
+CP.CompanionPublisher(root).tick(now=T0 + 20)
+check("12g. a secret-shaped mid-turn text becomes `hmd [redacted]` like any other turn, and no secret reaches "
+      "the panel file", chat_lines(root, T0 + 20)[-1].endswith(" hmd [redacted]")
+      and STRIPE not in open(CHATP(root), encoding="utf-8").read(), repr(chat_lines(root, T0 + 20)))
+
+root, d = new_repo()
+tp = write_transcript(d, "s", [u_human("plan?", T0), a_text("Which one: A or B?", T0 + 5, "m1")])
+pub = CP.CompanionPublisher(root)
+pub.tick(now=T0 + 10)
+had_q = "hmd-question" in served(root, T0 + 10)
+append_transcript(tp, [u_task_notification(T0 + 20),
+                       a_text("The background build just finished, looking at it.", T0 + 22, "m2", stop="tool_use"),
+                       a_tool(T0 + 23, "m2")])
+pub.tick(now=T0 + 30)
+sv = served(root, T0 + 30)
+check("12h. hmd speaking again mid-turn is the last thing said: the older question is withdrawn (hmd-question "
+      "gone) while the narration is a chat line", had_q and "hmd-question" not in sv and not os.path.exists(QPATH(root))
+      and sv["chat"]["data"]["lines"][-1].endswith(" hmd The background build just finished, looking at it."),
+      str(list(sv)))
+
+# ── 13. the chat line cap: whole messages up to the app's MAX_CHAT_LINE_CHARS (8000); hmd-question and every
+#        other panel stay at 500 ───────────────────────────────────────────────────────────────────────────
+def chat_of(entries, now=T0 + 900):
+    r, dd = new_repo()
+    write_transcript(dd, "s", entries)
+    CP.CompanionPublisher(r).tick(now=now)
+    return chat_lines(r, now), r
+
+
+HEAD = lambda ts, role="hmd": "%s %s " % (HHMM(ts), role)      # the 10-unit `HH:MM role ` head every line starts with
+
+check("13a. the contract numbers: a chat line 8000 (the app's MAX_CHAT_LINE_CHARS), every other string leaf and the "
+      "hmd-question text 500",
+      getattr(P, "MAX_CHAT_LINE_CHARS", None) == 8000 and getattr(CP, "CHAT_LINE_MAX_UNITS", None) == 8000
+      and P.MAX_STRING_CHARS == 500 and CP.APP_MAX_UNITS == 500,
+      "%r %r" % (getattr(P, "MAX_CHAT_LINE_CHARS", None), getattr(CP, "CHAT_LINE_MAX_UNITS", None)))
+
+lines, _r = chat_of([u_human("go", T0), a_text("x" * 7990, T0 + 5, "m1")])
+check("13b. a reply whose line, its 10-unit head included, is exactly 8000 units arrives whole: no cut, no ellipsis "
+      "(served through read_panels, the path /api/state and the relay use)",
+      lines[-1] == HEAD(T0 + 5) + "x" * 7990 and utf16(lines[-1]) == 8000, "%d units" % utf16(lines[-1]))
+lines, _r = chat_of([u_human("go", T0), a_text("x" * 7991, T0 + 5, "m1")])
+check("13c. one unit more is cut: the line is exactly 8000 units and its last is the ellipsis (the shape the app "
+      "reads as 'cut by hmd')",
+      lines[-1] == HEAD(T0 + 5) + "x" * 7989 + "…" and utf16(lines[-1]) == 8000, "%d units" % utf16(lines[-1]))
+
+reply = ("First paragraph, a sentence that keeps going. " * 60).strip() + "\n\n```python\nfor i in range(3):\n    print(i)\n```" \
+        "\n\nLast sentence, ends here."
+lines, _r = chat_of([u_human("go", T0), a_text(reply, T0 + 5, "m1")])
+check("13d. a 3000-character reply with paragraphs and fenced code arrives whole: the head plus all of it, no "
+      "trailing ellipsis (the app's acceptance case)",
+      len(reply) > 2800 and lines[-1] == HEAD(T0 + 5) + reply.replace("\n", " ⏎ ")
+      and lines[-1].endswith("Last sentence, ends here."), repr(lines[-1][-60:]))
+
+lines, _r = chat_of([u_human("go", T0), a_text("\U0001F600" * 5000, T0 + 5, "m1")])
+check("13e. an astral boundary (emoji, 2 units each) is cut at the cap or one short of it, ellipsis last, never over "
+      "(the two lengths the app reads as cut)",
+      utf16(lines[-1]) in (7999, 8000) and lines[-1].endswith("…"), "%d units" % utf16(lines[-1]))
+
+lines, _r = chat_of([u_human("q" * 7990, T0)])
+check("13f. the operator's own message gets the same cap: exactly 8000 units whole",
+      lines == [HEAD(T0, "you") + "q" * 7990], "%d units" % utf16(lines[-1]) if lines else "no line")
+lines, _r = chat_of([u_human("q" * 7991, T0)])
+check("13g. ...and one unit more is cut to 8000 with the ellipsis",
+      lines == [HEAD(T0, "you") + "q" * 7989 + "…"], "%d units" % utf16(lines[-1]) if lines else "no line")
+
+
+def put(pid, ptype, data):
+    r, _dd = new_repo()
+    try:
+        P.write_panel(r, pid, {"id": pid, "title": "t", "type": ptype, "data": data, "updated_at": T0})
+        return None
+    except P.PanelError as e:
+        return str(e)
+
+
+put_chat_ok, put_chat_bad = put("chat", "log-tail", {"lines": ["x" * 8000]}), put("chat", "log-tail", {"lines": ["x" * 8001]})
+put_job_ok, put_job_bad = put("job-log", "log-tail", {"lines": ["x" * 500]}), put("job-log", "log-tail", {"lines": ["x" * 501]})
+put_q_bad = put("hmd-question", "markdown", {"text": "x" * 501})
+check("13h. write_panel holds the `chat` log-tail to 8000 characters a line and everything else -- any other log-tail, "
+      "the hmd-question text -- to 500: the app applies its exception by panel id",
+      put_chat_ok is None and put_chat_bad is not None and "8000" in put_chat_bad
+      and put_job_ok is None and put_job_bad is not None and "500" in put_job_bad
+      and put_q_bad is not None and "500" in put_q_bad, repr((put_chat_ok, put_chat_bad, put_job_ok, put_job_bad, put_q_bad)))
+
+
+def place(r, pid, line):
+    os.makedirs(P.panels_dir(r), exist_ok=True)
+    with open(P.panel_path(r, pid), "w", encoding="utf-8") as f:
+        json.dump({"id": pid, "title": "t", "type": "log-tail", "data": {"lines": [line]}, "updated_at": T0}, f)
+
+
+r, _dd = new_repo()
+place(r, "chat", "c" * 8000)
+place(r, "job-log", "j" * 3000)
+sv = served(r, T0 + 1)
+check("13i. the serve-side bound is never narrower than the write cap: a hand-placed `chat` line of 8000 is served "
+      "whole, any other log-tail line is still cut at HMD_UI_LOG_LINE_MAX's default of 2000, ellipsis last",
+      sv["chat"]["data"]["lines"] == ["c" * 8000] and sv["job-log"]["data"]["lines"] == ["j" * 1999 + "…"],
+      repr({k: len(v["data"]["lines"][0]) for k, v in sv.items() if k in ("chat", "job-log")}))
+os.environ["HMD_UI_LOG_LINE_MAX"] = "1000"
+try:
+    sv = served(r, T0 + 1)
+finally:
+    del os.environ["HMD_UI_LOG_LINE_MAX"]
+check("13j. an operator's explicit HMD_UI_LOG_LINE_MAX still wins over the chat default",
+      sv["chat"]["data"]["lines"] == ["c" * 999 + "…"], repr(len(sv["chat"]["data"]["lines"][0])))
+
+entries = []
+for i in range(60):
+    entries.append(u_human("p%02d" % i, T0 + 2 * i))
+    entries.append(a_text(("日本語データ" * 1700)[:7990], T0 + 2 * i + 1, "mt%d" % i))
+lines, r = chat_of(entries)
+panel = served(r, T0 + 900)["chat"]
+check("13k. the total stays bounded however long the messages: 60 maximum-size 3-byte messages -> the panel file <= "
+      "MAX_FILE_BYTES, data keys exactly [lines], the NEWEST turn kept, far below the 128K units a state frame may "
+      "carry for chat", os.path.getsize(CHATP(r)) <= P.MAX_FILE_BYTES and list(panel["data"].keys()) == ["lines"]
+      and lines[-1].startswith(HEAD(T0 + 2 * 59 + 1)) and utf16(lines[-1]) == 8000 and 0 < len(lines) < 120
+      and sum(utf16(x) for x in lines) <= 128 * 1024,
+      "%d bytes, %d lines, %d units" % (os.path.getsize(CHATP(r)), len(lines), sum(utf16(x) for x in lines)))
+
+reply = "background " * 600 + "\n\nA) first option\nB) second option\n\nWhich should I do?"
+lines, r = chat_of([u_human("go", T0), a_text(reply, T0 + 5, "m1")])
+q = served(r, T0 + 900).get("hmd-question")
+t = q["data"]["text"] if q else ""
+check("13l. one long question: the chat line carries it whole while hmd-question stays <= 500 units with its END kept",
+      lines[-1] == HEAD(T0 + 5) + reply.replace("\n", " ⏎ ") and q is not None and utf16(t) <= 500
+      and t.endswith("A) first option\nB) second option\n\nWhich should I do?"), repr(t[:60]))
+
 failed = [r for r in results if not r[0]]
 for okv, name, detail in results:
     print(("OK   " if okv else "FAIL ") + name + ("" if okv else "  [%s]" % detail))
@@ -618,7 +828,8 @@ if [ ! -x "$UI" ]; then
   exit 1
 fi
 
-# A transcript for $1 (a repo root) holding the turns passed as "role|text" args.
+# A transcript for $1 (a repo root) holding the turns passed as "role|text" args: role `you` (a typed prompt),
+# `hmd` (a final reply) or `narr` (mid-turn text: a message that stops for a tool).
 plant_transcript() {
   local root="$1" sid="$2"; shift 2
   python3 - "$root" "$sid" "$@" <<'PYEOF'
@@ -636,7 +847,8 @@ with open(os.path.join(d, sid + ".jsonl"), "a", encoding="utf-8") as f:
             base.update({"type": "user", "message": {"role": "user", "content": text}, "origin": {"kind": "human"}})
         else:
             base.update({"type": "assistant", "message": {"id": "m%d%d" % (os.getpid(), i), "role": "assistant",
-                         "stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}})
+                         "stop_reason": "tool_use" if role == "narr" else "end_turn",
+                         "content": [{"type": "text", "text": text}]}})
         f.write(json.dumps(base) + "\n")
 PYEOF
 }
@@ -799,6 +1011,27 @@ else
   bad "L9. hmd ui (kill switch) did not come up: $(head -c 400 "$TMPROOT/off.err")"
 fi
 unset HMD_UI_COMPANION_PANELS
+
+# A mid-turn line and a maximum-size line, end to end: transcript -> poller -> write_panel -> read_panels ->
+# /api/state, here through a public host so _redact_public (the scrub the relay's frames also take) walks the lines.
+LONGREPO="$TMPROOT/long-repo"
+mkdir -p "$LONGREPO/.heimdall"
+( cd "$LONGREPO" && git init -q . ) >/dev/null 2>&1
+LONGMSG="$(python3 -c 'print("y" * 7990)')"
+plant_transcript "$LONGREPO" long-sess "you|summarise the repo" "narr|Reading the layout first." "hmd|$LONGMSG"
+LONGHOST="long.example.ts.net"
+if start_server "$LONGREPO" "$TMPROOT/long" --allow-host "$LONGHOST"; then
+  LONG_EXPR='.panels[] | select(.id=="chat") | ((.data|keys)==["lines"]) and (.data.lines|length)==3
+             and (.data.lines[1] | test("^[0-9]{2}:[0-9]{2} hmd Reading the layout first\\.$"))
+             and (.data.lines[2] | length)==8000 and (.data.lines[2] | endswith("yyyy"))'
+  if state_until "$S_PORT" "$S_TOKEN" "$LONGHOST" "$LONG_EXPR" 10; then
+    ok "L10. /api/state serves the mid-turn line and a maximum-size line (exactly 8000 units, head included) whole, public scrub included"
+  else
+    bad "L10. long chat lines in /api/state: $(jq -c '.panels[]|select(.id=="chat")|[.data.lines[]|length]' "$LIVE_STATE" 2>/dev/null) err: $(head -c 300 "$TMPROOT/long.err")"
+  fi
+else
+  bad "L10. hmd ui (long lines) did not come up: $(head -c 400 "$TMPROOT/long.err")"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
