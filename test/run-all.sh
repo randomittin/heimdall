@@ -216,6 +216,9 @@ suite_timeout() {
     # 2026-10-06 beside other suites: quick-ask.test.sh 331s (60 passed, 0 failed), quick-ask-e2e.test.sh about 140s.
     quick-ask.test.sh)               override=900 ;;
     quick-ask-e2e.test.sh)           override=600 ;;
+    # companion-attach: one real relay client per group through the fake relay (a 2 MiB picture over both stream legs among them), and each
+    # mutant re-runs its groups on a copy of the tree, six at a time -- minutes of honest work, not a hang.
+    companion-attach.test.sh)        override=900 ;;
     # measured 428s SOLO (57 passed, 0 failed) on an M-series mac, 2026-08-04 — BEFORE
     # claude-mem's install step was retired 2026-09-04 (see CLAUDE.md); the real total is
     # now lower than this by roughly the ~21s/install claude-mem line below, which no

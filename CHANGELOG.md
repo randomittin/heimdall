@@ -22,6 +22,9 @@ real history is in git:
 
 ## [Unreleased]
 
+### Added
+- **attach-v1** — the phone can attach a picture to a message (JPEG or PNG, at most 2 MiB, up to four a message): `attach-begin`, 256 KiB `attach-chunk`s and `attach-commit`, over the relay only. hmd checks the declared size and sha256 and the magic bytes, rewrites the file by a strict byte-level whitelist (no Exif, GPS, XMP, IPTC, comment or thumbnail; nothing it cannot parse is kept), stores it 0600 as `<repo>/.heimdall/app/attachments/<id>.jpg|png` (the 20 newest, none past 24 hours) and queues ONE inbox record naming its path, which the inbox delivery hands the session behind its provenance marker so Claude can `Read` it. Listed in the state frames' caps; the shipped app does not list it in its own resync, so hmd does not require that. `hmd app controls off` refuses it `controls-off`; `HMD_ATTACH=0` stops listing it and answers `not-implemented`. `bin/lib/companion_attach.py`, `test/companion-attach.test.sh`.
+
 ### Changed
 - **`/level` renamed to `/autonomy`** — the command that controls how much the agent does before asking is now `/hmd:autonomy` (with `/hmd:autonomy +` / `-` to cycle and `/hmd:autonomy <1|2|3>` to set). "Autonomy" names what it actually controls. Levels, semantics, and the on-disk config key (`.project.autonomy_level`) are unchanged — no existing user's saved setting resets on upgrade.
 
