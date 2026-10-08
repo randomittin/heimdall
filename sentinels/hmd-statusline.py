@@ -2195,6 +2195,11 @@ def row1_left(handle, model, repo_seg, cseg, avail, code=None, paired=None):
     (already ASCII-safe — see hmd_termcaps.py's `_ASCII_MAP`) rather than a new bracket
     glyph, so the code degrades correctly on ascii-tier terminals too.
 
+    `paired` — `📱 <device> paired via code` (`_paired_note()`), appended after the code in the same
+    clause while a phone that typed THIS session's code is connected, so a pairing nobody expected is
+    visible where the operator looks. It rides the code's own `handle_on` bit (and needs a code), so a
+    run with no phone paired is BYTE-IDENTICAL to before this param existed.
+
     `avail` None → no width pressure, the full run is returned."""
     brand = f"{BLUE}{BOLD}⛭ HEIMDALL{X}"
 
@@ -2204,6 +2209,8 @@ def row1_left(handle, model, repo_seg, cseg, avail, code=None, paired=None):
             idt = f"{handle} · {model}" if model_on else str(handle)
             if code:
                 idt += f" · {code}"
+                if paired:
+                    idt += f" · {paired}"
             s += f"{SEP}{DIM}{idt}{X}"
         if repo_on:
             s += f"{SEP}{repo_seg}" + (cseg if counts_on else "")
@@ -2485,8 +2492,9 @@ def main():
     # wall — because those match on what the ledger and the roster already know him as.
     # Row1 is the one place a human is being INTRODUCED, so it is the one place that spends
     # a lookup on the name that human answers to in public.
+    session_code = _session_code(session_id, cwd)
     left1 = row1_left(_github_handle(cwd, handle), model, repo_seg, cseg, avail1,
-                       code=_session_code(session_id, cwd))
+                       code=session_code, paired=_paired_note(cwd, session_code))
 
     # ── Row2 — the context gauge (CTX%·↓tokens on the fill, $cost on the track end) ──
     # narrow → bar-only (labels off). render_gauge splices the labels inside the bar's cell

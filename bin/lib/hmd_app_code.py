@@ -4,9 +4,11 @@
 
 `hmd app connect` offers this same code for pairing by typing it on the phone, and the statusline and
 /api/state show it too, so all three must print ONE value. The rule that decides it -- the Claude Code
-session this repo's instance reads when its id names one of the repo's own transcripts, else the repo
-path -- lives in sentinels/hmd-ui.py's collect_session_code. This asks that very function, with the root
-resolved the way `hmd ui --repo DIR` resolves it, instead of deriving anything a second time.
+session this repo's instance reads when its id names one of the repo's own transcripts, else the session
+the SessionStart hook recorded for the repo (.heimdall/app/session.json, while its process lives), else the
+repo path -- is bin/lib/hmd_session_code.py's resolve_session_code, reached through sentinels/hmd-ui.py's
+collect_session_code. This asks that very function, with the root resolved the way `hmd ui --repo DIR`
+resolves it, instead of deriving anything a second time.
 
     python3 hmd_app_code.py --repo DIR      the code on stdout (exit 0);
                                             nothing on stdout and exit 1 when none can be derived
