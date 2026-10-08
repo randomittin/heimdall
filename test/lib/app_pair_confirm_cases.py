@@ -344,7 +344,8 @@ def case_auto_pair():
         T.check(bool(bound) and c.count_events("approve_request") == 0 and c.p.stdin is not None and not c.p.stdin.closed,
                 "3. a claim with the same GitHub identity: device_bound is emitted with no prompt, no answer on stdin, no terminal",
                 c.tail())
-        T.check(opened is not None and "state" in opened and "key_reveal" in frames and frames.index("key_reveal") < frames.index("state"),
+        T.check(opened is not None and "state" in opened and "key_reveal" in frames and "state" in frames
+                and frames.index("key_reveal") < frames.index("state"),
                 "3. the key reveal still precedes the bind, and the first state frame opens under the key derived from it",
                 str(frames))
     with Scn() as s:  # and through `hmd app connect` itself, at no terminal
