@@ -9,11 +9,13 @@ A read-only advisor: **does this machine need a cleanup, and is Heimdall causing
 disk + memory pressure, counts Heimdall's own leaked python, and SUGGESTS the fix. It never
 deletes or kills anything unless you explicitly ask for the scoped self-reap.
 
-Pairs with **mac-deep-clean** (the executor that actually reclaims disk) — a separate,
-user-installed skill, NOT bundled with Heimdall. This skill is the *trigger* — the thing
-that notices you need it — and it checks whether mac-deep-clean is actually installed
-(`~/.claude/skills/mac-deep-clean/SKILL.md` or the project-level equivalent) before ever
-naming it, falling back to plain read-only investigation commands when it's absent.
+Pairs with **mac-deep-clean** (the executor that actually reclaims disk) — shipped with
+Heimdall as `skills/mac-deep-clean/` and invoked as `hmd:mac-deep-clean`. This skill is the
+*trigger* — the thing that notices you need it — and it checks the executor is actually
+present before ever naming it: the plugin-shipped `<plugin>/skills/mac-deep-clean/SKILL.md`,
+or a copy you installed yourself (`~/.claude/skills/mac-deep-clean/SKILL.md` or the
+project-level equivalent — still counted, and named as plain `mac-deep-clean`). It falls
+back to plain read-only investigation commands when neither exists.
 
 ## Why this exists (the lesson it encodes)
 
@@ -76,10 +78,10 @@ Overall exit code = the worst section. Thresholds override via `HMD_SYSMON_*` en
     the persistent holder instead: `heimdall-cleanup --advise` detects the cheaply-visible
     ones (mounted OS/simulator runtime volumes, running hypervisors) and says the holder is
     unidentified when it cannot see one. Never prescribe a reboot as *the* fix.
-- **disk WARN/CRIT** → hand off to **mac-deep-clean** (tiered, read-only investigation first,
-  then deletes only caches / dead repos / SDK-simulator bloat) — IF it's installed. Otherwise
-  the suggestion names manual, read-only investigation commands instead (never a skill absent
-  from this machine).
+- **disk WARN/CRIT** → hand off to **mac-deep-clean** (`hmd:mac-deep-clean`; tiered, read-only
+  investigation first, then deletes only caches / dead repos / SDK-simulator bloat) — IF it's
+  present (the plugin-shipped copy, or one you installed). Otherwise the suggestion names
+  manual, read-only investigation commands instead (never a skill absent from this machine).
 
 Do NOT auto-delete or auto-reboot. Suggest; let the user confirm.
 
@@ -118,6 +120,7 @@ for.
 - [ ] `--filter-orphans` matches `mock_cp.py`/`presence-doctor` orphans but NOT a foreign
       python nor a non-orphan (proven by `test/heimdall-sysmon.test.sh`).
 - [ ] A reap suggestion appears iff `procs` is WARN/CRIT; a mac-deep-clean suggestion iff `disk`
-      is WARN/CRIT AND the skill is actually installed — otherwise a manual read-only fallback
+      is WARN/CRIT AND the skill is actually present (plugin-shipped → `hmd:mac-deep-clean`,
+      user/project-installed → `mac-deep-clean`) — otherwise a manual read-only fallback
       (proven by the mac-deep-clean-availability cases in `test/heimdall-sysmon.test.sh` and
       `test/sys-cleanup.test.sh`).

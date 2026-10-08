@@ -14,7 +14,7 @@
 # procs whose cmdline carries heimdall's OWN signature (mock_cp.py / presence-doctor / a
 # heimdall-tagged python) AND are orphaned to launchd — the exact leak, nothing else.
 #
-# macOS-correct throughout (learned the hard way — see the mac-deep-clean skill):
+# macOS-correct throughout (learned the hard way — see skills/mac-deep-clean/SKILL.md):
 #   • `df -h /` LIES (/ is the sealed read-only snapshot) → true free = diskutil Container
 #     Free Space on /System/Volumes/Data.
 #   • `ps aux` RSS undercounts (shared/compressed pages) → memory pressure read from
@@ -403,13 +403,29 @@ if [ "$orphan_barepy" -gt 0 ] && [ "$orphan_hmd" -gt 0 ]; then
   _line "procs" "-" "+ ${orphan_barepy} unattributed bare-stdin python orphan(s) (ownership unproven)"
 fi
 
-# best-effort: is the mac-deep-clean skill actually installed? Checked at the same
-# locations bin/detect-skills scans (user + project level) — NEVER claim a skill the
-# user doesn't have (the launch-audit lesson: a suggestion is a claim, and pointing at
-# an absent target makes it an overclaim).
-_mac_deep_clean_installed() {
-  [ -f "${HOME:-}/.claude/skills/mac-deep-clean/SKILL.md" ] && return 0
-  [ -f "${CLAUDE_PROJECT_DIR:-.}/.claude/skills/mac-deep-clean/SKILL.md" ] && return 0
+# the plugin root this script ships in: CLAUDE_PLUGIN_ROOT wins (the harness exports it to
+# hooks), else the parent of THIS script's real bin/ — symlinks followed, so an invocation
+# through a link still lands in the actual plugin tree. Same idiom as bin/stack-pack.
+_hmd_plugin_root() {
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; return 0; fi
+  local self="${BASH_SOURCE[0]}"
+  self="$(readlink -f "$self" 2>/dev/null || printf '%s' "$self")"
+  ( cd "$(dirname "$self")/.." 2>/dev/null && pwd )
+}
+
+# best-effort: how is the mac-deep-clean skill reachable? Prints the name to invoke and
+# returns 0, or returns 1 when it is nowhere on this machine. Three places, in order: user
+# level, then project level (the locations bin/detect-skills scans — a copy the user
+# installed themselves still counts, invoked as plain `mac-deep-clean`), then the copy hmd
+# itself SHIPS at <plugin>/skills/mac-deep-clean (the plugin namespace is `hmd`, so it is
+# invoked as `hmd:mac-deep-clean`). NEVER claim a skill the user doesn't have (the
+# launch-audit lesson: a suggestion is a claim, and pointing at an absent target makes it
+# an overclaim).
+_mac_deep_clean_skill() {
+  [ -f "${HOME:-}/.claude/skills/mac-deep-clean/SKILL.md" ] && { echo "mac-deep-clean"; return 0; }
+  [ -f "${CLAUDE_PROJECT_DIR:-.}/.claude/skills/mac-deep-clean/SKILL.md" ] && { echo "mac-deep-clean"; return 0; }
+  local root; root="$(_hmd_plugin_root)"
+  [ -n "$root" ] && [ -f "$root/skills/mac-deep-clean/SKILL.md" ] && { echo "hmd:mac-deep-clean"; return 0; }
   return 1
 }
 
@@ -440,8 +456,8 @@ if [ "$mem_status" != "ok" ]; then
   echo "      heimdall-cleanup --advise    # names the holder when one is detectable"
 fi
 if [ "$disk_status" != "ok" ]; then
-  if _mac_deep_clean_installed; then
-    echo "  • disk is ${disk_used_pct}% full — run the deep clean: invoke the 'mac-deep-clean' skill"
+  if mdc_skill="$(_mac_deep_clean_skill)"; then
+    echo "  • disk is ${disk_used_pct}% full — run the deep clean: invoke the '${mdc_skill}' skill"
     echo "    (tiered, read-only investigation first; deletes only caches / dead repos / SDK bloat)."
   else
     echo "  • disk is ${disk_used_pct}% full — no mac-deep-clean skill installed here; reclaim"

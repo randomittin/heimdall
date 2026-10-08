@@ -78,25 +78,84 @@ grep -q 'mac-deep-clean' <<<"$d" && ok "disk WARN → suggests mac-deep-clean" \
   || bad "disk WARN did not suggest mac-deep-clean"
 [ "$drc" = 2 ] && ok "forced-full disk → exit 2 (crit)" || bad "forced-full disk exit != 2 (got $drc)"
 
-# 6. disk suggestion is HONEST about mac-deep-clean's actual install state (never overclaims)
+# 6. disk suggestion is HONEST about mac-deep-clean's actual availability (never overclaims).
+#    Three places count: a USER-level copy and a PROJECT-level copy (both invoked as plain
+#    `mac-deep-clean`), and the copy hmd itself SHIPS at <plugin>/skills/mac-deep-clean (the
+#    plugin namespace is `hmd`, so that one is invoked as `hmd:mac-deep-clean`).
+#    CLAUDE_PLUGIN_ROOT is the plugin-root seam: pointing it at a temp dir simulates "the
+#    plugin has / lacks the skill" without touching this checkout and without depending on
+#    whatever this machine's real ~/.claude holds.
 MDC_HOME="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-sysmon-test.XXXXXX")"
-mkdir -p "$MDC_HOME/with/.claude/skills/mac-deep-clean" "$MDC_HOME/without"
+mkdir -p "$MDC_HOME/with/.claude/skills/mac-deep-clean" "$MDC_HOME/without" \
+         "$MDC_HOME/plugin-with/skills/mac-deep-clean" "$MDC_HOME/plugin-without"
 printf -- '---\nname: mac-deep-clean\n---\nfixture\n' > "$MDC_HOME/with/.claude/skills/mac-deep-clean/SKILL.md"
+printf -- '---\nname: mac-deep-clean\n---\nfixture\n' > "$MDC_HOME/plugin-with/skills/mac-deep-clean/SKILL.md"
 
-d_has="$(HOME="$MDC_HOME/with" CLAUDE_PROJECT_DIR="$MDC_HOME/without" HMD_SYSMON_DISK_WARN_PCT=0 HMD_SYSMON_DISK_CRIT_PCT=0 "$BIN" 2>&1)"
+# forced-full disk so the disk suggestion always fires.  $1=HOME  $2=CLAUDE_PROJECT_DIR  $3=CLAUDE_PLUGIN_ROOT
+disk_suggestion() {
+  HOME="$1" CLAUDE_PROJECT_DIR="$2" CLAUDE_PLUGIN_ROOT="$3" \
+    HMD_SYSMON_DISK_WARN_PCT=0 HMD_SYSMON_DISK_CRIT_PCT=0 "$BIN" 2>&1
+}
+
+d_has="$(disk_suggestion "$MDC_HOME/with" "$MDC_HOME/without" "$MDC_HOME/plugin-without")"
 printf '%s\n' "$d_has" | grep -q "invoke the 'mac-deep-clean' skill" \
-  && ok "disk WARN + skill installed -> suggestion names it" \
-  || bad "disk WARN + skill installed but suggestion text missing: $d_has"
+  && ok "disk WARN + user-level skill -> suggestion names it" \
+  || bad "disk WARN + user-level skill but suggestion text missing: $d_has"
 
-d_no="$(HOME="$MDC_HOME/without" CLAUDE_PROJECT_DIR="$MDC_HOME/without" HMD_SYSMON_DISK_WARN_PCT=0 HMD_SYSMON_DISK_CRIT_PCT=0 "$BIN" 2>&1)"
-if printf '%s\n' "$d_no" | grep -q "invoke the 'mac-deep-clean' skill"; then
-  bad "disk WARN + skill NOT installed but suggestion still says to invoke it (overclaim)"
+d_proj="$(disk_suggestion "$MDC_HOME/without" "$MDC_HOME/with" "$MDC_HOME/plugin-without")"
+printf '%s\n' "$d_proj" | grep -q "invoke the 'mac-deep-clean' skill" \
+  && ok "disk WARN + project-level skill -> suggestion names it" \
+  || bad "disk WARN + project-level skill but suggestion text missing: $d_proj"
+
+d_plug="$(disk_suggestion "$MDC_HOME/without" "$MDC_HOME/without" "$MDC_HOME/plugin-with")"
+printf '%s\n' "$d_plug" | grep -q "invoke the 'hmd:mac-deep-clean' skill" \
+  && ok "disk WARN + plugin-shipped skill, no user copy -> suggestion names hmd:mac-deep-clean" \
+  || bad "disk WARN + plugin-shipped skill but suggestion text missing: $d_plug"
+
+d_no="$(disk_suggestion "$MDC_HOME/without" "$MDC_HOME/without" "$MDC_HOME/plugin-without")"
+if printf '%s\n' "$d_no" | grep -Eq "invoke the '(hmd:)?mac-deep-clean' skill"; then
+  bad "disk WARN + skill nowhere (no user, project or plugin copy) but suggestion still says to invoke it (overclaim)"
 else
-  ok "disk WARN + skill not installed -> no overclaim; falls back to manual investigation"
+  ok "disk WARN + skill nowhere -> no overclaim; falls back to manual investigation"
 fi
 printf '%s\n' "$d_no" | grep -q 'heimdall-cleanup --apply' \
   && ok "disk WARN fallback still points at heimdall-cleanup --apply" \
   || bad "disk WARN fallback missing heimdall-cleanup --apply: $d_no"
+
+# 6b. with CLAUDE_PLUGIN_ROOT UNSET the plugin root resolves from the script's OWN location.
+#     A symlinked invocation must still land in the real plugin tree (so the copy this checkout
+#     ships is found) ...
+ln -s "$BIN" "$MDC_HOME/sysmon-link"
+d_self="$(env -u CLAUDE_PLUGIN_ROOT HOME="$MDC_HOME/without" CLAUDE_PROJECT_DIR="$MDC_HOME/without" \
+  HMD_SYSMON_DISK_WARN_PCT=0 HMD_SYSMON_DISK_CRIT_PCT=0 "$MDC_HOME/sysmon-link" 2>&1)"
+printf '%s\n' "$d_self" | grep -q "invoke the 'hmd:mac-deep-clean' skill" \
+  && ok "no CLAUDE_PLUGIN_ROOT: shipped skill found from the script's own (symlink-resolved) location" \
+  || bad "no CLAUDE_PLUGIN_ROOT: shipped skill not found via the script location: $d_self"
+#     ... and a script sitting in a plugin tree that LACKS the skill must not claim one.
+mkdir -p "$MDC_HOME/bare-plugin/bin"
+cp "$BIN" "$MDC_HOME/bare-plugin/bin/heimdall-sysmon"
+d_bare="$(env -u CLAUDE_PLUGIN_ROOT HOME="$MDC_HOME/without" CLAUDE_PROJECT_DIR="$MDC_HOME/without" \
+  HMD_SYSMON_DISK_WARN_PCT=0 HMD_SYSMON_DISK_CRIT_PCT=0 "$MDC_HOME/bare-plugin/bin/heimdall-sysmon" 2>&1)"
+if printf '%s\n' "$d_bare" | grep -Eq "invoke the '(hmd:)?mac-deep-clean' skill"; then
+  bad "script in a plugin tree WITHOUT skills/mac-deep-clean still tells the user to invoke it (overclaim)"
+else
+  ok "script in a plugin tree without the skill -> no overclaim"
+fi
+
+# 6c. the skill hmd claims to ship is actually in the repo, loadable (frontmatter name = dir name),
+#     and portable (no author-machine absolute home paths baked in).
+SHIPPED="$ROOT/skills/mac-deep-clean/SKILL.md"
+if [ -f "$SHIPPED" ] && [ "$(sed -n '1,2p' "$SHIPPED" | tr '\n' '|')" = "---|name: mac-deep-clean|" ] \
+   && grep -q '^description: ' "$SHIPPED"; then
+  ok "hmd ships skills/mac-deep-clean/SKILL.md with name + description frontmatter"
+else
+  bad "skills/mac-deep-clean/SKILL.md missing or its frontmatter is not name: mac-deep-clean + description"
+fi
+if [ -f "$SHIPPED" ] && ! grep -nE '/Users/|/home/' "$SHIPPED" >/dev/null 2>&1; then
+  ok "shipped mac-deep-clean skill is portable (no absolute home paths)"
+else
+  bad "shipped mac-deep-clean skill is missing or carries an absolute /Users/ or /home/ path"
+fi
 
 rm -rf "$MDC_HOME"
 
