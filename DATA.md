@@ -625,10 +625,16 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
   the client can verify. The request repeats about once a minute as the relay's pairing
   window renews, until a phone binds or the 10-minute code window
   (`HMD_RELAY_CODE_WINDOW_S`) closes; the token is then dropped from memory. The
-  SessionStart hook `pair-window-start` does the same for the whole life of every
-  attended Claude Code session while `gh` is signed in (it reads `gh auth token` again each
-  time a window opens, and sends it about once a minute until a phone pairs);
-  `hmd hooks disable pair-window-start` or `HMD_PAIR_WINDOW=0` stops it.
+  SessionStart hook `pair-window-start` does the same for every attended Claude Code
+  session while `gh` is signed in, but backed off: it reads `gh auth token` again each time
+  a window opens and sends it no more often than every 5 minutes
+  (`HMD_PAIR_WINDOW_RENEW_MIN_S`) until a phone pairs. The relay keeps a registration only
+  60 s, so the code is claimable for the minute after each one and not in between
+  (`HMD_PAIR_WINDOW_RENEW_MIN_S=30` keeps it claimable nearly always, at the cost of the token
+  going out about every 50 s). After 4 hours (`HMD_PAIR_WINDOW_IDLE_H`, `0` = never) with no
+  phone paired and no activity in the session it stops sending the token for good; a new
+  session or `hmd app connect` opens a window again.
+  `hmd hooks disable pair-window-start` or `HMD_PAIR_WINDOW=0` stops it altogether.
 - **The phone's side** (`POST /identity/github`, `POST /pair/code`): the phone's GitHub
   device-flow token is checked against hmd's GitHub App and deleted at GitHub, and replaced
   by a relay-signed assertion bound to the phone's key. The relay releases a pending pairing

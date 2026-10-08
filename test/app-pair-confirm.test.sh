@@ -3,11 +3,14 @@
 # 5-character session code on a phone signed in to the same GitHub account pairs at once, with no 6-digit compare, also with
 # `hmd app connect --bg` and with no terminal; --confirm restores the compare; one session code is derived for the statusline,
 # `hmd ui`, `hmd app` and the pair window; every session keeps a window open; a pairing leaves a notice and a statusline note.
+# The window's token back-off: it re-registers its code -- the gh token is in that request -- no more often than a floor and
+# stops after HMD_PAIR_WINDOW_IDLE_H hours with no pairing and no activity in its session.
 #
 # Hermetic, like test/app-pair-code.test.sh: a loopback relay (test/lib/fake_relay_code.py), a `gh` script in the sandbox's PATH
 # that prints an obviously fake token, throwaway HOME / repo / TMPDIR / HEIMDALL_HOME, free ports, nothing on the network.
-#   test/lib/app_pair_confirm_cases.py  the spec's nine acceptance tests (the file's header says which check proves which) and
-#                                       one case for each finding of the security review of bin/lib/hmd_session_code.py
+#   test/lib/app_pair_confirm_cases.py  the spec's nine acceptance tests (the file's header says which check proves which),
+#                                       one case for each finding of the security review of bin/lib/hmd_session_code.py, and
+#                                       the back-off's: renewals counted over simulated time, the idle stop on an injected clock
 # plus the static checks below. Acceptance 7's "hmd ui lists the device and revoke removes it" is NOT here: that is CP4, which
 # this tree does not have (see the cases file's header).
 set -u
@@ -61,6 +64,21 @@ if jq -e '[.hooks.SessionStart[].hooks[].command | select(contains("pair-window 
   ok "SessionStart opens the window and SessionEnd closes it, once each"
 else
   bad "the pair-window hooks are not wired exactly once each"
+fi
+if jq -e '[.hooks.SessionStart[].hooks[].command | select(contains("pair-window --session"))][0] | contains(".transcript_path") and contains("--transcript")' \
+     "$REPO/hooks/hooks.json" >/dev/null; then
+  ok "the SessionStart hook hands the window its session's transcript (the activity the idle stop watches)"
+else
+  bad "the pair-window-start hook does not pass the session's transcript_path to the window"
+fi
+help_text="$("$APP" --help 2>/dev/null)"
+missing_docs="$(for want in HMD_PAIR_WINDOW_IDLE_H HMD_PAIR_WINDOW_RENEW_MIN_S HMD_PAIR_WINDOW_RENEW_LEAD_S --transcript; do
+  printf '%s' "$help_text" | grep -q -- "$want" || printf '%s ' "$want"
+done)"
+if [ -z "$missing_docs" ]; then
+  ok "the usage text documents the window's renewal floor, margin and idle stop (and --transcript)"
+else
+  bad "the usage text does not mention: $missing_docs"
 fi
 if grep -nE '(export|declare -x|env) +[A-Za-z_]*(GH|GITHUB)_?TOKEN|GH_TOKEN=|GITHUB_TOKEN=' "$APP" >"$TMPROOT/env.out"; then
   bad "bin/heimdall-app puts a token in an environment variable: $(head -3 "$TMPROOT/env.out")"

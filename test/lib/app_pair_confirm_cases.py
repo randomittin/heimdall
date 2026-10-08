@@ -22,7 +22,12 @@ The spec's nine acceptance tests, in its own numbering (a case's checks are pref
 plus one case for each finding of the security review of hmd_session_code.py:
   S1 no state file is written, chmod'ed or read through a link
   S2 the code is not derivable from a repo path or a session id, and not taken from a file a checkout could plant
+and the back-off of the pair window's token (see "B / I" below):
+  B  the window re-registers its code -- the gh token is in that request -- no more often than a floor, a margin ahead of
+     the lapse, and the client rides out the relay purging its lapsed session instead of ending
+  I  and stops for good after HMD_PAIR_WINDOW_IDLE_H hours with no pairing and no activity in the session
 """
+import argparse
 import hashlib
 import hmac
 import json
@@ -32,6 +37,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -41,6 +47,7 @@ from fake_relay_code import FakeCodeRelay  # noqa: E402
 
 T = H.Tally()
 E2E = H.load_module("hmd_relay_e2e", H.E2E_PATH)
+CLIENT = H.load_module("hmd_relay_client", H.CLIENT_PATH)
 
 REPO = H.REPO
 SESSION_CODE_PY = os.path.join(REPO, "bin", "lib", "hmd_session_code.py")
@@ -235,10 +242,10 @@ class Scn:
         wait_until(lambda: self.relay.registrations, 40)
         return self.relay.registrations[0]["code"] if self.relay.registrations else None
 
-    def hook(self, ident, sid, **extra):
+    def hook(self, ident, sid, payload=None, **extra):
         env = self.env(CLAUDE_PLUGIN_ROOT=REPO, CLAUDE_PROJECT_DIR=self.repo, **extra)
-        return run(["sh", "-c", hook_commands()[ident]], env, stdin=json.dumps({"session_id": sid, "source": "startup"}),
-                   timeout=60, cwd=self.repo)
+        stdin = json.dumps(dict({"session_id": sid, "source": "startup"}, **(payload or {})))
+        return run(["sh", "-c", hook_commands()[ident]], env, stdin=stdin, timeout=60, cwd=self.repo)
 
     def window_state(self, sid):
         try:
@@ -566,6 +573,355 @@ def case_gh_signed_out_and_two_sessions():
         T.check(isinstance(pids[0], int) and wait_until(lambda: not alive(pids[0]), 30), "9. ...and then it closes too", "")
 
 
+# -- B / I: the pair window sends the token far less often, and stops when nobody is there -------------------------------
+# A window with no terminal re-registers its code with the relay each time the relay's registration of it lapses, and the
+# laptop's gh token is in that request's body. The relay keeps a registration PAIRING_CODE_TTL_S = 60 s (relay/src/pairing.ts;
+# `pair_window_s` in relay/contract/code-pair.json), so the token went out once a minute for as long as the session lived.
+#   B  now it goes out no more often than HMD_PAIR_WINDOW_RENEW_MIN_S (300 s) after the last time -- and a margin ahead of
+#      the lapse, with the old registration freed first so the relay does not refuse the new one as a clash, whenever the
+#      relay keeps a registration longer than that. Against the relay's real 60 s the floor wins: the code is claimable for
+#      the minute after each registration and dark in between, which is the price of the back-off
+#   I  and the window stops for good after HMD_PAIR_WINDOW_IDLE_H hours (4; 0 never) with no pairing and no activity in the
+#      session (the modification time of the transcript the SessionStart hook hands it); a new session, or `hmd app connect`,
+#      opens it again. Time is injected (HMD_PAIR_WINDOW_NOW_FILE) and the relay's timings are scaled down: nothing sleeps hours.
+def simulated_renewals(due, ttl, hours):
+    """(registered_at, lapses_at) of every registration over `hours` of simulated time against a relay that keeps one `ttl`
+    seconds, each renewed when `due(registered_at, lapses_at)` says. No clock is read and nothing sleeps; a schedule that does
+    not move on ends the run (the checks that follow fail it) instead of spinning here."""
+    regs, t = [], 0.0
+    while t < hours * 3600 and len(regs) < 100000:
+        regs.append((t, t + ttl))
+        nxt = due(t, t + ttl)
+        if nxt <= t:
+            break
+        t = nxt
+    return regs
+
+
+def case_renewal_schedule():
+    due = getattr(CLIENT, "code_renewal_due", None)
+    T.check(callable(due), "B1. the relay client schedules a code window's renewal in one pure function, code_renewal_due()")
+    if not callable(due):
+        return
+    floor, lead = 300.0, 10.0
+    schedule = lambda registered, lapses: due(registered, lapses, floor, lead)
+    for ttl in (60, 290, 305, 600, 3600):
+        regs = simulated_renewals(schedule, ttl, 4)
+        gaps = [b[0] - a[0] for a, b in zip(regs, regs[1:])]
+        most = max(sum(1 for other in regs if at <= other[0] < at + 300.0) for at, _lapse in regs)
+        T.check(len(regs) >= 2 and most == 1 and min(gaps) >= floor - 1e-9,
+                "B1. against a relay that keeps a registration %d s: over 4 simulated hours never more than one renewal in any 5 minutes (%d in all)"
+                % (ttl, len(regs)), "most in 5 min %d, first gaps %s" % (most, gaps[:3]))
+    for ttl in (305, 600, 3600):
+        regs = simulated_renewals(schedule, ttl, 4)
+        pairs = list(zip(regs, regs[1:]))
+        T.check(bool(pairs) and all(b[0] < a[1] and a[1] - b[0] <= lead + 1e-9 for a, b in pairs),
+                "B2. a relay that keeps a registration %d s is renewed before it lapses, never more than the %d s margin ahead" % (ttl, lead),
+                str([round(a[1] - b[0], 1) for a, b in pairs[:3]]))
+    regs = simulated_renewals(schedule, 60, 4)
+    pairs = list(zip(regs, regs[1:]))
+    T.check(len(regs) == 48 and bool(pairs) and all(abs((b[0] - a[0]) - 300.0) < 1e-9 and abs((b[0] - a[1]) - 240.0) < 1e-9 for a, b in pairs),
+            "B3. against the relay's real 60 s the 5-minute floor wins: 48 registrations in 4 hours, each renewed 300 s after the last "
+            "(the code is dark for the 240 s between a lapse and the next)", "%d registrations" % len(regs))
+    T.check(abs(due(0.0, 60.0, 5.0, -1.5) - 61.5) < 1e-9 and abs(due(0.0, 2.0, 0.5, 10.0) - 1.0) < 1e-9,
+            "B4. `hmd app connect`'s own schedule is unchanged (5 s floor, renewed 1.5 s after the lapse), and a short registration is never renewed "
+            "at once, over and over, by a long margin (the margin is capped at half its life)",
+            "connect %r short %r" % (due(0.0, 60.0, 5.0, -1.5), due(0.0, 2.0, 0.5, 10.0)))
+
+
+def offline_client(sandbox):
+    """A RelayClient pointed at a port nothing listens on, for what is decided in memory (the way
+    test/lib/app_pair_code_client_cases.py drives one)."""
+    return CLIENT.RelayClient(argparse.Namespace(relay="http://127.0.0.1:1", repo=sandbox.repo, tick_s=2.0,
+                                                 status_file=os.path.join(sandbox.root, "relay.json"), public_host=None, ui_port=1))
+
+
+def case_stream_waits_for_renewal():
+    sandbox = H.Sandbox()
+    try:
+        client = offline_client(sandbox)
+        now = time.monotonic()
+        client._last_renew_at, client._code_renew_at = now, now + 3.0
+        client._renew_now.clear()
+        due_of = getattr(client, "_renewal_due", None)
+        if callable(due_of):
+            scheduled = due_of()
+            client._renew_now.set()
+            asked = due_of()
+            client._renew_now.clear()
+            T.check(abs(scheduled - (now + 3.0)) < 1e-6 and abs(asked - (now + CLIENT.CODE_RENEW_MIN_S)) < 1e-6,
+                    "B5. the schedule says when the registration is about to lapse; an event (a bind refused, the relay ending the session) asks for "
+                    "the renewal at once, but never sooner than the floor after the last", "scheduled %+.2f s, asked %+.2f s" % (scheduled - now, asked - now))
+        else:
+            T.check(False, "B5. the client answers when its next renewal is due in one place, _renewal_due()")
+        # The relay purges a registration nobody claimed 60 s after it lapsed and tells hmd's stream; the stream thread then waits for
+        # the replacement. With a 5-minute floor that replacement is minutes away, and a fixed 30 s of patience would end the client
+        # (exit 0) for the supervisor to relaunch -- sending the token again, long before the floor.
+        epoch = client._stream_epoch
+        threading.Timer(1.2, lambda: setattr(client, "_stream_epoch", epoch + 1)).start()  # the renewal swaps the session in 1.2 s
+        began = time.monotonic()
+        swapped = client._await_window_swap(epoch, timeout=0.4)
+        T.check(swapped, "B5. a stream whose session was purged waits for the renewal that is scheduled; it does not give up on a fixed patience",
+                "gave up after %.1f s with the renewal due in %.1f s" % (time.monotonic() - began, now + 3.0 - time.monotonic()))
+    finally:
+        sandbox.close()
+
+
+class purging_lapsed_sessions:
+    """What the real relay's storage alarm does to a registration nobody claimed -- PURGE_GRACE_MS, 60 s after it lapses; `after_s`
+    here -- ends the session and tells hmd's stream so (a session_ended, then a stream that answers 410)."""
+
+    def __init__(self, relay, after_s):
+        self.relay, self.after_s, self.stop = relay, after_s, threading.Event()
+
+    def _run(self):
+        done = set()
+        while not self.stop.wait(0.1):
+            with self.relay.lock:
+                sessions = list(self.relay.sessions.values())
+            for sess in sessions:
+                if sess.id not in done and not sess.ended and time.time() >= sess.exp + self.after_s:
+                    done.add(sess.id)
+                    self.relay.end_session(sess.id, "pairing-expired")
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self.stop.set()
+        self.thread.join(5)
+
+
+def one_live_window_per_code(relay):
+    """relay/src/code-index.ts registerEntry, for the fake: a code another session of the account holds -- not lapsed, not revoked --
+    is refused with the 409 the real relay answers, so a renewal ahead of the lapse that does not free the old one first is refused."""
+    held = {}
+
+    def answer(registration):
+        sid, code = registration["session_id"], registration["code"]
+        other = held.get(code)
+        if other is not None and other != sid and relay.get(other).exp > time.time() and other not in relay.revokes:
+            return 409, {"error": "code in use by another open window"}
+        held[code] = sid
+        return None
+    return answer
+
+
+def start_window(s, sid=SID1, transcript=None, **knobs):
+    """`hmd app pair-window` for session `sid`, owned by this process, against the scenario's relay; `knobs` go to the supervisor."""
+    argv = [H.APP_PATH, "pair-window", "--session", sid, "--pid", str(os.getpid()), "--repo", s.repo, "--relay", s.relay.url]
+    if transcript:
+        argv += ["--transcript", transcript]
+    return run(argv, s.env(**knobs))
+
+
+def window_pid(s, sid=SID1, timeout=20):
+    wait_until(lambda: s.window_state(sid), timeout)
+    pid = (s.window_state(sid) or {}).get("pid")
+    return pid if isinstance(pid, int) else None
+
+
+def case_renewal_floor_live():
+    # A registration lasts 2 s here and the floor is 8 s (the real relay: 60 s and 300 s). The old loop renewed about 5 s on, and the
+    # purge a relay does of a lapsed session lands inside the floor: the client has to ride it out, not end and be relaunched.
+    knobs = {"HMD_PAIR_WINDOW_RENEW_MIN_S": "8", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2", "HMD_PAIR_WINDOW_RESTART_S": "1"}
+    with Scn(ttl=2) as s, purging_lapsed_sessions(s.relay, 2.0):
+        out = start_window(s, **knobs)
+        if not (out.returncode == 0 and wait_until(lambda: s.relay.registrations, 40)):
+            T.check(False, "B6. (setup) the window opens and registers its code", out.stdout + out.stderr)
+            return
+        t0 = s.relay.registrations[0]["at"]
+        time.sleep(max(0.0, t0 + 7.0 - time.time()))
+        early = len(s.relay.registrations)
+        wait_until(lambda: len(s.relay.registrations) >= 2, 30)
+        regs = list(s.relay.registrations)
+        gap = regs[1]["at"] - regs[0]["at"] if len(regs) >= 2 else 0.0
+        T.check(early == 1 and gap >= 7.6,
+                "B6. with a floor of 8 s the token goes out once in the first 7 s, and the next registration comes after the floor (not ~5 s on)",
+                "registrations in the first 7 s: %d, first gap %.1f s" % (early, gap))
+        T.check(len({r["code"] for r in regs}) == 1 and alive(window_pid(s) or 0),
+                "B6. ...the same code each time, and the supervisor never ended", str(len(regs)))
+
+
+def case_renewal_before_lapse_live():
+    # A registration lasts 8 s, the floor is 2 s and the margin 3 s: each renewal is due about 5 s on, inside the registration.
+    knobs = {"HMD_PAIR_WINDOW_RENEW_MIN_S": "2", "HMD_PAIR_WINDOW_RENEW_LEAD_S": "3", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2"}
+    with Scn(ttl=8) as s:
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        out = start_window(s, **knobs)
+        if not (out.returncode == 0 and wait_until(lambda: len(s.relay.registrations) >= 3, 60)):
+            T.check(False, "B7. (setup) the window registers three times", "%s %s registrations %d" % (out.stdout, out.stderr, len(s.relay.registrations)))
+            return
+        regs, reqs = list(s.relay.registrations)[:3], list(s.relay.requests)
+        before = [regs[i + 1]["at"] < s.relay.get(regs[i]["session_id"]).exp for i in (0, 1)]
+        gaps = [regs[i + 1]["at"] - regs[i]["at"] for i in (0, 1)]
+        T.check(all(before) and all(g >= 1.9 for g in gaps),
+                "B7. a relay that keeps a registration longer than the floor sees each renewal before the last one lapses, and not before the floor",
+                "before lapse %s, gaps %s" % (before, [round(g, 1) for g in gaps]))
+        at = lambda line: reqs.index(line) if line in reqs else float("inf")
+        freed = [at("POST /session/%s/revoke" % regs[i]["session_id"]) < at("POST /session/%s/code" % regs[i + 1]["session_id"]) for i in (0, 1)]
+        T.check(len({r["session_id"] for r in regs}) == 3 and all(freed),
+                "B7. the old registration is freed first, so the relay does not refuse the new one as a clash and the token is not sent a second time",
+                "sessions %d, freed first %s" % (len({r["session_id"] for r in regs}), freed))
+
+
+class Clock:
+    """The window supervisor's injected clock: HMD_PAIR_WINDOW_NOW_FILE names a file holding the epoch second it reads as now, so
+    rewriting the file moves hours of idle time in no time at all."""
+
+    def __init__(self, root):
+        self.path = os.path.join(root, "pair-window-now")
+        self.base = int(time.time())
+        self.set(0)
+
+    def set(self, offset_s):
+        tmp = self.path + ".tmp"
+        write_private(tmp, "%d\n" % (self.base + int(offset_s)))
+        os.replace(tmp, self.path)
+
+
+def idle_knobs(clock, **extra):
+    return dict({"HMD_PAIR_WINDOW_NOW_FILE": clock.path, "HMD_PAIR_WINDOW_POLL_S": "0.2"}, **extra)
+
+
+def open_window_or_fail(s, label, **kw):
+    """Start the window and wait for its first registration; the supervisor's pid, or None after a failed check."""
+    out = start_window(s, **kw)
+    if out.returncode == 0 and wait_until(lambda: s.relay.registrations, 40):
+        return window_pid(s)
+    T.check(False, "%s (setup) the window opens and registers its code" % label, "rc %r %s %s" % (out.returncode, out.stdout, out.stderr))
+    return None
+
+
+def case_idle_stop():
+    with Scn() as s:
+        clock = Clock(s.sb.root)
+        knobs = idle_knobs(clock)
+        sup = open_window_or_fail(s, "I1.", **knobs)
+        if sup is None:
+            return
+        window_sid = s.relay.latest().id
+        kids = [int(p) for p in run(["pgrep", "-P", str(sup)], s.env()).stdout.split()]
+        argvs = [H.argv_of(p) for p in [sup] + kids]
+        clock.set(4 * 3600 - 120)
+        time.sleep(1.5)
+        T.check(alive(sup) and s.window_state(SID1) is not None and len(s.relay.registrations) == 1,
+                "I1. four hours less two minutes with no pairing and no activity: the window is still open (the default is four hours)",
+                "alive %r state %r registrations %d" % (alive(sup), s.window_state(SID1), len(s.relay.registrations)))
+        clock.set(4 * 3600 + 120)
+        stopped = wait_until(lambda: not alive(sup), 25)
+        revoked = wait_until(lambda: window_sid in s.relay.revokes, 20)
+        T.check(stopped and revoked and s.window_state(SID1) is None,
+                "I1. four hours and two minutes: the supervisor ends, its relay session is revoked and its state file is gone -- nothing says a window is live",
+                "stopped %r revoked %r state %r" % (stopped, revoked, s.window_state(SID1)))
+        time.sleep(1.0)
+        session = os.path.join(s.repo, ".heimdall", "app", "session.json")
+        T.check(len(s.relay.registrations) == 1 and os.path.exists(session),
+                "I1. the code is not registered again, and the session stays recorded (so `hmd app connect` and the statusline still agree on its code)",
+                "registrations %d, session.json %r" % (len(s.relay.registrations), os.path.exists(session)))
+        needle = H.TOKEN.encode()
+        leaks = H.files_containing(s.repo, needle) + H.files_containing(s.sb.home, needle) + H.files_containing(s.sb.tmp, needle)
+        T.check(kids and not any(H.TOKEN in a for a in argvs) and leaks == [],
+                "I1. the token was in no argv of the supervisor or its client, and is in no file under the repo, the home or the temp dir: only on the pipe",
+                "argvs %r leaks %r" % (argvs, leaks))
+        again = start_window(s, **knobs)  # a new session
+        reopened = again.returncode == 0 and "pair window open" in again.stdout and wait_until(lambda: len(s.relay.registrations) >= 2, 40)
+        new_sup = window_pid(s)
+        T.check(bool(reopened) and new_sup is not None and new_sup != sup and alive(new_sup),
+                "I1. a new session opens the window again", "rc %r out %r pid %r" % (again.returncode, again.stdout, new_sup))
+
+
+def case_idle_stop_off():
+    with Scn() as s:
+        clock = Clock(s.sb.root)
+        sup = open_window_or_fail(s, "I2.", **idle_knobs(clock, HMD_PAIR_WINDOW_IDLE_H="0"))
+        if sup is None:
+            return
+        clock.set(1000 * 3600)
+        time.sleep(2.0)
+        T.check(alive(sup) and s.window_state(SID1) is not None and len(s.relay.registrations) == 1,
+                "I2. HMD_PAIR_WINDOW_IDLE_H=0 never stops it: a thousand hours with no pairing and no activity and the window is still open",
+                "alive %r state %r" % (alive(sup), s.window_state(SID1)))
+
+
+def case_idle_stop_activity():
+    with Scn() as s:
+        clock = Clock(s.sb.root)
+        transcript = os.path.join(s.sb.root, "session.jsonl")
+        write_private(transcript, "{}\n")
+        os.utime(transcript, (clock.base, clock.base))
+        sup = open_window_or_fail(s, "I3.", transcript=transcript, **idle_knobs(clock, HMD_PAIR_WINDOW_IDLE_H="1"))
+        if sup is None:
+            return
+        clock.set(1800)
+        os.utime(transcript, (clock.base + 1800, clock.base + 1800))  # the session did something half an hour in
+        time.sleep(1.0)
+        clock.set(5000)  # 1 h 23 min since the window opened, but 53 min since that activity
+        time.sleep(1.5)
+        T.check(alive(sup) and s.window_state(SID1) is not None,
+                "I3. HMD_PAIR_WINDOW_IDLE_H=1: activity in the session half an hour in keeps the window open past the hour it was opened",
+                "alive %r" % alive(sup))
+        clock.set(1800 + 3600 + 60)  # an hour and a minute since that activity
+        T.check(wait_until(lambda: not alive(sup), 25) and s.window_state(SID1) is None,
+                "I3. ...and it stops an hour after the last activity, the override honored", "alive %r" % alive(sup))
+
+
+def case_idle_stop_spares_a_pairing():
+    with Scn() as s:
+        clock = Clock(s.sb.root)
+        sup = open_window_or_fail(s, "I4.", **idle_knobs(clock))
+        if sup is None:
+            return
+        code = s.relay.registrations[0]["code"]
+        s.bind(s.relay.latest().id)
+        marker = os.path.join(s.repo, ".heimdall", "app", "paired-%s.json" % code)
+        paired = wait_until(lambda: os.path.exists(marker), 40)
+        clock.set(5 * 3600)
+        time.sleep(2.0)
+        try:
+            with open(marker, encoding="utf-8") as f:
+                serving = json.load(f).get("pid")
+        except (OSError, ValueError):
+            serving = None
+        T.check(paired and alive(sup) and isinstance(serving, int) and alive(serving),
+                "I4. five hours on with a phone paired by the code: neither the window nor the client serving the phone is stopped",
+                "paired %r supervisor %r client %r" % (paired, alive(sup), serving))
+
+
+def case_hook_hands_over_the_transcript():
+    with Scn() as s:
+        transcript = os.path.join(s.sb.root, "session.jsonl")
+        write_private(transcript, "{}\n")
+        started = s.hook("pair-window-start", SID1, payload={"transcript_path": transcript})
+        sup = window_pid(s, timeout=30)
+        argv = H.argv_of(sup) if sup else ""
+        T.check(started.returncode == 0 and started.stdout == "" and "--transcript %s" % transcript in argv,
+                "I5. the SessionStart hook hands the window the session's transcript, the activity its idle stop watches",
+                "rc %r out %r argv %r" % (started.returncode, started.stdout, argv))
+
+
+def case_idle_stop_connect_reopens():
+    with Scn() as s:
+        clock = Clock(s.sb.root)
+        sup = open_window_or_fail(s, "I6.", **idle_knobs(clock))
+        if sup is None:
+            return
+        code = s.relay.registrations[0]["code"]
+        clock.set(4 * 3600 + 120)
+        wait_until(lambda: not alive(sup), 25)
+        app = s.app("--relay", s.relay.url, "--bg")
+        app.close_stdin()
+        rc = app.wait_exit(90)
+        wait_until(lambda: len(s.relay.registrations) >= 2, 30)
+        regs = list(s.relay.registrations)
+        T.check(rc == 0 and "SESSION CODE:" in app.text() and "already open for pairing" not in app.text()
+                and len(regs) >= 2 and regs[-1]["code"] == code and regs[-1]["session_id"] != regs[0]["session_id"],
+                "I6. once the window has stopped, `hmd app connect` registers the session's code itself and does not say a window already holds it",
+                "rc %r registrations %d %s" % (rc, len(regs), app.tail()))
+
+
 # -- S1 ------------------------------------------------------------------------------------------------------------
 def case_no_links_followed():
     with Scn() as s:
@@ -667,8 +1023,11 @@ def case_code_not_derivable():
 
 def main():
     for case in (case_one_code, case_hooks, case_auto_pair, case_bg, case_identity_mismatch, case_no_sas_anywhere,
-                 case_notice_and_statusline, case_confirm, case_gh_signed_out_and_two_sessions, case_no_links_followed,
-                 case_code_not_derivable):
+                 case_notice_and_statusline, case_confirm, case_gh_signed_out_and_two_sessions,
+                 case_renewal_schedule, case_stream_waits_for_renewal, case_renewal_floor_live, case_renewal_before_lapse_live,
+                 case_idle_stop, case_idle_stop_off, case_idle_stop_activity, case_idle_stop_spares_a_pairing,
+                 case_hook_hands_over_the_transcript, case_idle_stop_connect_reopens,
+                 case_no_links_followed, case_code_not_derivable):
         try:
             case()
         except Exception as exc:  # a case that dies is a failure, not a crash of the whole run
