@@ -624,13 +624,21 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
   persisted or logged. That is a promise about the relay's code (`relay/`), not something
   the client can verify. The request repeats about once a minute as the relay's pairing
   window renews, until a phone binds or the 10-minute code window
-  (`HMD_RELAY_CODE_WINDOW_S`) closes; the token is then dropped from memory.
+  (`HMD_RELAY_CODE_WINDOW_S`) closes; the token is then dropped from memory. The
+  SessionStart hook `pair-window-start` does the same for the whole life of every
+  attended Claude Code session while `gh` is signed in (it reads `gh auth token` again each
+  time a window opens, and sends it about once a minute until a phone pairs);
+  `hmd hooks disable pair-window-start` or `HMD_PAIR_WINDOW=0` stops it.
 - **The phone's side** (`POST /identity/github`, `POST /pair/code`): the phone's GitHub
   device-flow token is checked against hmd's GitHub App and deleted at GitHub, and replaced
   by a relay-signed assertion bound to the phone's key. The relay releases a pending pairing
-  only to a phone whose verified GitHub id equals yours. After the bind a 6-digit number
-  shows on both screens and you approve it at the terminal (`--no-confirm` skips that and
-  trusts the relay).
+  only to a phone whose verified GitHub id equals yours, and hmd checks the claim's login
+  against yours again before it reveals anything. By default that is the whole gate: the
+  phone pairs at once, with no number to compare, so the relay is trusted to deliver the
+  right keys at pairing time (a relay that substituted its own key could read the session).
+  `hmd app connect --confirm` restores the compare: a 6-digit number shows on both screens
+  and you approve it at the terminal. Every pairing by code leaves a notice in the Claude
+  session and on the statusline, so one you did not expect is visible.
 - **What the relay keeps:** your numeric GitHub id, the code, and the phone's device label
   and GitHub login live on the session record only until bind, revoke, end or purge
   (INV-41); a per-GitHub-id index keeps nothing but a revoke timestamp, for up to 30 days.
