@@ -9,7 +9,7 @@ Everything that reaches dispatch() already passed its transport's own gate: a re
 device's latched session key and passed the replay guard, a direct request passed the token / Host / backoff gate.
 
 WIRE. Command plaintext is `{"action": A, "params": {...}}` for A in ALLOWED_ACTIONS. `params` is an exact key set
-(the action's keys plus an optional `rid`), exact types, and the whole command is at most 1 KiB, else `bad-params`.
+(the action's keys plus an optional `rid`), exact types, and the whole command is at most 1 KiB (an action's policy `max_bytes` may raise that: attach-chunk carries 256 KiB of a picture), else `bad-params`.
 
     interrupt         {}                          ack ok  {"id":"s-<8 hex>","result":{"via":"hook","effective":
                                                   "next-tool-boundary"}}; detail already-pending (same id) | not-running
@@ -147,7 +147,9 @@ GATE_SWITCHES = ("asks",)    # the laptop switches that gate a NON-expand action
 # only ever acts on the session's own repo). timeline_ops: only these `op`s are also recorded in relay-events.jsonl. gate_switch: a
 # GATE_SWITCHES laptop switch that must be on for an action that is not expand (a read action behind its own consent); off = its
 # off_detail, answered before the params are read, the rid memory or any bucket is touched.
-POLICY_KEYS = frozenset(("cap", "rid_re", "replay_detail", "global_rate", "off_detail", "open_switch", "timeline_ops", "gate_switch"))
+MAX_COMMAND_CEILING = 1024 * 1024   # the most a policy max_bytes may raise the command limit to: the 1 MiB envelope
+# max_bytes: the whole command may be this long (MAX_COMMAND_BYTES up to MAX_COMMAND_CEILING) instead of MAX_COMMAND_BYTES -- attach-chunk carries a picture.
+POLICY_KEYS = frozenset(("cap", "rid_re", "replay_detail", "global_rate", "off_detail", "open_switch", "timeline_ops", "gate_switch", "max_bytes"))
 RESERVED_EXPAND = {"launch-session": "launch", "pr-merge": "merge"}   # fixed by CP2: class expand, this switch, always
 KILL_SWITCH_EXEMPT = frozenset(("launch-stop",))   # reduce-direction: ends only what the phone started
 EXPAND_RATES = {"launch-session": ((1, 1 / 60.0),),
@@ -571,14 +573,14 @@ def _clean_audit(params):
 
 
 def _validate(action, params):
-    """(rid, fields) for a well-formed command, else _Refusal("bad-params"). Exact key set, exact types, <= 1 KiB."""
+    """(rid, fields) for a well-formed command, else _Refusal("bad-params"). Exact key set, exact types, <= 1 KiB (or the action's policy max_bytes)."""
     spec = _ACTIONS[action]
     if params is None:
         params = {}
     if not isinstance(params, dict):
         raise _Refusal("bad-params")
     size = len(json.dumps({"action": action, "params": params}, separators=(",", ":")).encode("utf-8"))
-    if size > MAX_COMMAND_BYTES:
+    if size > spec["policy"].get("max_bytes", MAX_COMMAND_BYTES):
         raise _Refusal("bad-params")
     rid = params.get("rid")
     rid_re = spec["policy"].get("rid_re")
@@ -813,6 +815,9 @@ def register_action(name, *, cls, handler, required=(), optional=(), fields=_no_
     policy = dict(policy or {})
     if not set(policy) <= POLICY_KEYS or (policy.get("open_switch") and cls != CLASS_EXPAND):
         raise ValueError("unknown policy key, or open_switch on an action that is not expand")
+    limit = policy.get("max_bytes", MAX_COMMAND_BYTES)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not MAX_COMMAND_BYTES <= limit <= MAX_COMMAND_CEILING:
+        raise ValueError("max_bytes is a whole number of bytes from the default command limit up to the 1 MiB envelope")
     if policy.get("gate_switch") is not None and (policy["gate_switch"] not in GATE_SWITCHES or cls == CLASS_EXPAND):
         raise ValueError("gate_switch names a GATE_SWITCHES switch and belongs to an action that is not expand")
     _ACTIONS[name] = {"cls": cls, "switch": switch, "repo_field": repo_field, "required": tuple(required),
@@ -838,11 +843,11 @@ register_action("fallback-mode", cls=CLASS_RISKY_WRITE, handler=_do_fallback_mod
 # -- actions a sibling module owns ------------------------------------------------------------------------------
 # A module named here registers its own action(s) through register_actions(kit) when this one imports (trusted code only,
 # like every register_action call); one that cannot load, or raises, simply leaves its action off the allowlist.
-ACTION_MODULES = ("companion_dashboards", "companion_quick_ask")
+ACTION_MODULES = ("companion_dashboards", "companion_quick_ask", "companion_attach")
 
 
 def _load_action_modules():
-    kit = types.SimpleNamespace(register_action=register_action, CLASS_EXPAND=CLASS_EXPAND, CLASS_READ=CLASS_READ, Refusal=_Refusal, audit=_audit,
+    kit = types.SimpleNamespace(register_action=register_action, CLASS_EXPAND=CLASS_EXPAND, CLASS_READ=CLASS_READ, CLASS_SAFE_WRITE=CLASS_SAFE_WRITE, Refusal=_Refusal, audit=_audit,
                                 iso=_iso, controls_enabled=controls_enabled)
     for name in ACTION_MODULES:
         hook = getattr(_sibling(name), "register_actions", None)

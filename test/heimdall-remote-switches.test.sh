@@ -471,7 +471,10 @@ def gate_checks(libdir):
               "pr-merge": {"number": 1, "method": "squash"}, "launch-stop": {"id": "l-77"},
               "dashboard-request": {"rid": "q-00000001", "op": "create", "dashboard_id": "d-0a0a0a0a", "screen_id": "s-0b0b0b0b",
                                     "tile_id": "t-0c0c0c0c", "project": os.path.basename(rg), "text": "daily new customers"},
-              "quick-ask": {"rid": "q-00000002", "project": os.path.basename(rg), "text": "how many orders today"}}
+              "quick-ask": {"rid": "q-00000002", "project": os.path.basename(rg), "text": "how many orders today"},
+              "attach-begin": {"rid": "a-00000001", "name": "shot.jpg", "mime": "image/jpeg", "bytes": 1, "w": 1, "h": 1, "n": 1, "sha256": "0" * 64},
+              "attach-chunk": {"rid": "a-00000001-0", "id": "att-00000000", "idx": 0, "b64": "AA=="},
+              "attach-commit": {"rid": "a-00000001-c", "id": "att-00000000"}}
     files = [os.path.join(home, "remote-launch.json"), os.path.join(home, "remote-merge.json"),
              os.path.join(home, "remote-dashboards.json"), os.path.join(home, "remote-asks.json")]
 

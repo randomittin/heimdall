@@ -9,7 +9,8 @@ be decided from the phone, and "allow" is refused for every request) -- and, to 
 `push-v1`, the phone's sealed push registration (see PUSH REGISTRATION below) -- and, to an hmd that
 lists `login-v1`, the phone's sealed remote Claude Code login (see REMOTE CLAUDE CODE LOGIN below) -- and, to an hmd that
 lists `controls-v1`, the phone's sealed remote controls (see REMOTE CONTROLS below) -- and, to an hmd that lists
-`view-v1`, the phone's sealed read-only `view` request: a file's diff (see READ-ONLY VIEWS below).
+`view-v1`, the phone's sealed read-only `view` request: a file's diff (see READ-ONLY VIEWS below) -- and, to an hmd that lists
+`attach-v1`, the phone's sealed picture upload (see ATTACHED IMAGES below).
 
 Spawned by `bin/heimdall-app connect --relay <url>` as a sibling process to a
 local `hmd ui`; this process owns the ONE relay session for its lifetime and is
@@ -361,6 +362,20 @@ behind `hmd app remote-asks on`, off by default), acked {"ok":true,"detail":"que
 resync listed `ask-v1`, held in memory only, and it sends the state again the moment a result changes. The command event names the
 action only: never the question, never an answer.
 
+ATTACHED IMAGES (capability `attach-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-cursor-parity.md CP6, the phone half in its src/attach): `caps` also
+lists `attach-v1` whenever bin/lib/companion_attach.py registered its actions and the operator did not set HMD_ATTACH=0. The phone seals
+    {"action":"attach-begin","params":{"rid","name","mime","bytes","w","h","n","sha256"}}   ack ok {"id":"att-<8 hex>","result":{"chunk_max":262144}}
+    {"action":"attach-chunk","params":{"rid","id","idx","b64"}}                                 ack ok {}
+    {"action":"attach-commit","params":{"rid","id","message"?,"pin"?}}                         ack ok {"id":<inbox record id>,"result":{"queued":true}}
+which bin/lib/companion_ui_controls.py dispatches like any registered action (class safe-write: the kill switch, the audit line, the rid
+de-duplication and the rate buckets are the dispatcher's; a command reaches it only as a frame that opened under the paired device's key).
+The shipped app does not list `attach-v1` in its own resync, so nothing here requires the phone to. A refusal is {"ok":false,"detail":<code>},
+the codes are listed in companion_attach.py. The picture is verified and cleaned there, written 0600 as
+<repo>/.heimdall/app/attachments/<id>.jpg|png (the 20 newest, none past 24 h: swept after every commit and once when this client starts)
+and handed to the Claude session as ONE inbox record naming its absolute path; the provenance marker is added when the record is delivered.
+No path, name, note or byte of a picture is in any ack, state frame, audit line or event: the `command` event names the action only. A picture is up to 8 frames of ~466 KB: a command frame that opened under the session key
+is credited back against the stream's running byte cap (STREAM_READ_CAP_BYTES), on both legs, so its frames do not trip `overflow`.
+
 EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
 to import -- both mean the same thing: refuse to start a plaintext relay
@@ -450,6 +465,8 @@ DASH = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_das
 # slice and hears "a result changed" must be the very copy the controls module registered `quick-ask` from -- a second _load_module copy
 # would hold no results and never be called back.
 ASK = CONTROLS._sibling("companion_quick_ask") if CONTROLS is not None else None
+# Likewise ONE instance for attach: the uploads that are open live in the memory of the copy the dispatcher registered its handlers from.
+ATTACH = CONTROLS._sibling("companion_attach") if CONTROLS is not None else None
 DASH_ALERTS = _load_module("dashboard_alerts", os.path.join(LIB_DIR, "dashboard_alerts.py"))
 if PUSH_STORE is not None and getattr(UI, "PUSH", None) is not None:
     PUSH_STORE.bind_extension_kinds(UI.PUSH.registered_kinds)   # the store accepts, and hmd advertises, exactly the kinds hmd can send
@@ -513,6 +530,10 @@ except (TypeError, ValueError):
 # would read back as a false overflow. On overflow: abort the read, drop the
 # stream, reconnect through the normal retry path, emit stream_drop with
 # reason "overflow" and the offending byte counts -- see _stream_loop.
+# attach-v1 changes the premise "real inbound traffic never approaches it": a picture is up to 8 command frames of ~466 KB each. A frame
+# that OPENED under the session key and advanced last_device_seq is the paired phone's own traffic -- unforgeable by the relay, bounded by
+# the replay guard and the dispatcher's rate buckets -- so its bytes are credited back once it has been handled (both legs). The per-message
+# cap is unchanged, and everything else (junk, a frame that does not open, a replayed seq) counts toward the running total exactly as before.
 STREAM_READ_CAP_BYTES = MAX_ENVELOPE_BYTES + 1
 
 # HMD_RELAY_STREAM_ROTATE_S (default 540s == 9 minutes): plan a self-initiated
@@ -1996,6 +2017,7 @@ class RelayClient:
                 + ([VIEW.CAP_VIEW] if VIEW is not None else [])
                 + ([DASH.CAP_DASH] if DASH is not None else [])
                 + ([ASK.CAP_ASK] if ASK is not None else [])
+                + ([ATTACH.CAP_ATTACH] if ATTACH is not None and ATTACH.enabled() else [])      # the phone's picture upload (companion_attach.py)
                 + ([DASH_ALERTS.CAP_ALERTS] if DASH is not None and DASH_ALERTS is not None else [])   # requires dash-v1
                 + (list(PUSH_STORE.extension_kinds().values()) if self._push_ready() else []))          # push-tile-alert-v1, push-digest-v1, ...
 
@@ -2379,6 +2401,7 @@ class RelayClient:
                     overflow_info = {"line_bytes": len(line), "total_bytes": stream_total_bytes,
                                       "cap_bytes": STREAM_READ_CAP_BYTES}
                     break
+                size = len(line)
                 line = line.strip()
                 if not line:
                     continue
@@ -2387,7 +2410,10 @@ class RelayClient:
                 except (ValueError, UnicodeDecodeError):
                     emit({"event": "error", "detail": "malformed frame from stream (not JSON)"})
                     continue
+                accepted = self.last_device_seq
                 self._handle_envelope(env)
+                if self.last_device_seq != accepted:  # a command that opened under the session key: the phone's own traffic, not a flood
+                    stream_total_bytes -= size
         except socket.timeout:
             drop_reason = "rotate" if time.monotonic() >= rotate_deadline else "idle"
         except (OSError, http.client.HTTPException) as e:
@@ -2443,7 +2469,10 @@ class RelayClient:
                         except ValueError:
                             emit({"event": "error", "detail": "malformed frame from stream (not JSON)"})
                             continue
+                        accepted = self.last_device_seq
                         self._handle_envelope(env)
+                        if self.last_device_seq != accepted:  # as in _read_ndjson: the phone's own authenticated traffic is credited back
+                            ws.total_bytes = max(0, ws.total_bytes - len(event[1]))
                     elif kind == "binary":
                         emit({"event": "error", "detail": "unexpected binary message from stream -- ignored"})
                     if self.stop_event.is_set():
@@ -2809,6 +2838,8 @@ def main(argv=None):
         client.code_start()  # after the signal handlers: Ctrl-C while the window registers still revokes
 
     client.login_startup()
+    if ATTACH is not None:
+        ATTACH.sweep(client.root)  # a picture past its TTL does not outlive a restart
 
     stream_thread =threading.Thread(target=client._stream_loop, name="relay-stream", daemon=True)
     stream_thread.start()

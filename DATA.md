@@ -549,10 +549,17 @@ are each **off until you switch them on at the laptop** (`hmd app remote-login`,
 `remote-launch`, `remote-merge`, `remote-dashboards`, `remote-asks`, `remote-alerts`, each
 `on`).
 
+**A picture from the phone** (`attach-v1`, `bin/lib/companion_attach.py`; JPEG or PNG, at most 2 MiB, relay only) is the one thing the
+phone can leave on disk: hmd checks its size, sha256 and magic bytes, strips Exif, GPS, XMP, IPTC, comments and thumbnails with a
+byte-level whitelist (anything it cannot parse is refused) and keeps it as `<repo>/.heimdall/app/attachments/<id>.jpg|png` (file 0600,
+directory 0700; the 20 newest, none past 24 hours; git-ignored with the rest of `.heimdall/`). One inbox record names the file's absolute
+path so the session can read it; that path is in no frame sent to the phone, no audit line and no event. Never executed, never uploaded.
+
 | Switch | Effect |
 |---|---|
 | `hmd app disconnect` (or Ctrl-C in the foreground `connect`) | stops the relay client, which revokes the session at the relay; the phone cannot reconnect. The only switch that stops state frames |
 | `hmd app controls off` / `HMD_UI_CONTROLS=0` | every view and control is refused `controls-off` (`off` writes `<repo>/.heimdall/app/controls-disabled`, `on` removes it). State frames still flow while connected |
+| `HMD_ATTACH=0` | in the environment of `hmd app connect`: `attach-v1` is no longer offered to the phone and every attach command is refused `not-implemented`. **Exactly `0`**. `hmd app controls off` refuses them `controls-off` instead |
 | `--relay URL` / `HMD_RELAY_URL` | publish through a relay you run instead |
 
 ### Push notifications (`bin/lib/companion_push.py`)
