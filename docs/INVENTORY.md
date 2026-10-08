@@ -211,12 +211,13 @@ Spawn discipline (CLAUDE.md "Parallelism"): batch independent calls; one agent p
 
 ## 6. Skills and commands
 
-**Skills** (`skills/*/SKILL.md`, 5):
+**Skills** (`skills/*/SKILL.md`, 6):
 
 | Skill | Description (frontmatter, abridged) |
 |---|---|
 | `heimdall` | The orchestrator superskill: analyzes prompts, assigns skills, decomposes into sub-projects, spawns parallel agents, enforces gates, tracks token budget; maintainer mode. References: `skills/heimdall/references/` (agent-templates, communication-templates, definition-of-done, git-workflow, identity-and-ledger, image-triage, journal, maintainer-guide, planning-pipeline, plugin-autoinstall, quality-gates, stack-packs, statusline-ledger) |
 | `designmatch` | Match a React Native screen to a Claude Design HTML canonical at ≥95% visual parity; Playwright canonical renderer, pixelmatch + SSIM diff harness |
+| `mac-deep-clean` | macOS deep clean, invoked as `hmd:mac-deep-clean`: tiered, read-only-first, confirm-gated disk reclaim (caches, dead repos, worktrees, SDK/simulator bloat, System Data) + memory-leak diagnosis; the executor `system-health` and `heimdall-cleanup --deep` hand off to (they detect a plugin-shipped or user-installed copy) |
 | `self-improve` | karpathy/autoresearch ported to hmd's routing/planning: evidence → hypothesis → bounded experiment → keep only if it beats baseline |
 | `stacks` | Stack-specific knowledge packs (`ls skills/stacks/` → fastapi, nextjs, react-native, spring-boot) loaded onto a role agent |
 | `system-health` | Disk/memory cleanup advisor; catches hmd's own runaway presence keeper; hands off to mac-deep-clean |

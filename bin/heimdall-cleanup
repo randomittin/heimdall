@@ -54,9 +54,10 @@
 #   heimdall-cleanup --code          READ-ONLY consumer audit: every executable in bin/ must
 #                                    name what invokes it, or it is reported dead. Delegates
 #                                    wholesale to bin/heimdall-deadcode. Deletes NOTHING.
-#   heimdall-cleanup --deep          SUGGEST-only handoff to the mac-deep-clean skill — ONLY if
-#                                    it's actually installed (never claims one that isn't) — for
-#                                    the heavier, confirm-gated disk cleanup. Reaps NOTHING itself.
+#   heimdall-cleanup --deep          SUGGEST-only handoff to the mac-deep-clean skill — hmd ships it
+#                                    (`hmd:mac-deep-clean`) and a user-installed copy counts too,
+#                                    ONLY if one is actually present (never claims one that isn't)
+#                                    — for the heavier, confirm-gated disk cleanup. Reaps NOTHING itself.
 #   heimdall-cleanup --auto          the HOOK path (SessionStart/End). Runs gc (hmd disk) always;
 #                                    reaps orphaned hmd python ONLY on a genuine runaway
 #                                    (count >= ORPHAN_CRIT) so a live session's keeper is never
@@ -107,13 +108,20 @@ opted_out() {
   return 1
 }
 
-# best-effort: is the mac-deep-clean skill actually installed? Checked at the same
-# locations bin/detect-skills scans (user + project level) — NEVER claim a skill the
-# user doesn't have (the launch-audit lesson: a suggestion is a claim, and pointing at
-# an absent target makes it an overclaim).
-_mac_deep_clean_installed() {
-  [ -f "${HOME:-}/.claude/skills/mac-deep-clean/SKILL.md" ] && return 0
-  [ -f "${REPO:-.}/.claude/skills/mac-deep-clean/SKILL.md" ] && return 0
+# best-effort: how is the mac-deep-clean skill reachable? Prints the name to invoke and
+# returns 0, or returns 1 when it is nowhere on this machine. The same three places, in the
+# same order, as bin/heimdall-sysmon: user level, then project level (the locations
+# bin/detect-skills scans — a copy the user installed themselves still counts, invoked as
+# plain `mac-deep-clean`), then the copy hmd itself SHIPS at <plugin>/skills/mac-deep-clean
+# (the plugin namespace is `hmd`, so it is invoked as `hmd:mac-deep-clean`). The plugin root
+# is CLAUDE_PLUGIN_ROOT when the harness sets it, else the parent of this script's bin/
+# (SELF_DIR — the anchor every sibling lookup above already relies on). NEVER claim a skill
+# the user doesn't have (the launch-audit lesson: a suggestion is a claim, and pointing at an
+# absent target makes it an overclaim).
+_mac_deep_clean_skill() {
+  [ -f "${HOME:-}/.claude/skills/mac-deep-clean/SKILL.md" ] && { echo "mac-deep-clean"; return 0; }
+  [ -f "${REPO:-.}/.claude/skills/mac-deep-clean/SKILL.md" ] && { echo "mac-deep-clean"; return 0; }
+  [ -f "${CLAUDE_PLUGIN_ROOT:-$SELF_DIR/..}/skills/mac-deep-clean/SKILL.md" ] && { echo "hmd:mac-deep-clean"; return 0; }
   return 1
 }
 
@@ -797,7 +805,8 @@ do_advise() {
 
 # ── DEEP (suggest-only handoff — reaps NOTHING) ───────────────────────────────────
 do_deep() {
-  if _mac_deep_clean_installed; then
+  local skill
+  if skill="$(_mac_deep_clean_skill)"; then
     cat <<'EOF'
 heimdall-cleanup --deep — heavier disk cleanup is CONFIRM-GATED, not automatic.
 
@@ -805,7 +814,9 @@ This step reclaims user-facing disk beyond heimdall's own footprint (SDK/simulat
 bloat, dead repos, large caches). It is handed to the tiered mac-deep-clean skill,
 which investigates READ-ONLY first and deletes only after you confirm each tier.
 
-  → invoke the 'mac-deep-clean' skill (macOS) for the guided, confirm-gated sweep.
+EOF
+    printf "  → invoke the '%s' skill (macOS) for the guided, confirm-gated sweep.\n" "$skill"
+    cat <<'EOF'
 
 heimdall-cleanup itself never auto-deletes anything outside heimdall's own garbage.
 For that safe subset run:  heimdall-cleanup --apply

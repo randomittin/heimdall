@@ -70,6 +70,7 @@ The single map of Heimdall's knowledge tree. Every committed Markdown doc earns 
 | --- | --- | --- |
 | [../skills/heimdall/SKILL.md](../skills/heimdall/SKILL.md) | The orchestrator superskill (+ [references/](../skills/heimdall/references)). | Load-bearing (runtime) |
 | [../skills/designmatch/SKILL.md](../skills/designmatch/SKILL.md) | Visual-parity design-match skill (+ [references/](../skills/designmatch/references)). | Load-bearing (runtime) |
+| [../skills/mac-deep-clean/SKILL.md](../skills/mac-deep-clean/SKILL.md) | macOS deep disk/memory cleanup skill (`hmd:mac-deep-clean`). | Load-bearing (runtime) |
 | [../skills/self-improve/SKILL.md](../skills/self-improve/SKILL.md) | Self-improvement skill. | Load-bearing (runtime) |
 | [../skills/stacks/README.md](../skills/stacks/README.md) | Stack skill packs (fastapi, nextjs, react-native, spring-boot). | Load-bearing (runtime) |
 | [../agents/](../agents) | 16 agent definitions (architect, coder, reviewer, seeker, fixer, …) loaded by path. | Load-bearing (runtime) |

@@ -228,28 +228,63 @@ killed_sorted="$(sort -n "$WORK/killed" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//
 if [ "$killed_sorted" = "100 101 102" ]; then ok "--auto on a runaway reaps EXACTLY the hmd orphans"
 else bad "--auto runaway reap wrong — want '100 101 102' got '$killed_sorted'"; fi
 
-# ── 11. --deep's handoff HONESTLY reflects whether mac-deep-clean is actually installed ──
-# mac-deep-clean is a SEPARATE, user-installed skill, never bundled with heimdall — pointing
-# at it when it's absent is an overclaim (the launch-audit lesson). Isolate both branches with
-# their own HOME/REPO fixtures so the result never depends on this machine's real state.
-mkdir -p "$WORK/home-with-mdc/.claude/skills/mac-deep-clean" "$WORK/proj-no-mdc"
+# ── 11. --deep's handoff HONESTLY reflects whether mac-deep-clean is actually reachable ──
+# Pointing at a skill that is nowhere on this machine is an overclaim (the launch-audit
+# lesson). Three places count: a USER-level or PROJECT-level copy (invoked as plain
+# `mac-deep-clean`) and the copy hmd itself SHIPS at <plugin>/skills/mac-deep-clean (the plugin
+# namespace is `hmd`, so that one is invoked as `hmd:mac-deep-clean`). Every branch gets its own
+# HOME / REPO / CLAUDE_PLUGIN_ROOT fixture, so the result never depends on this machine's real
+# state — CLAUDE_PLUGIN_ROOT pointed at a temp dir is how "the plugin has / lacks the skill"
+# is simulated without touching this checkout.
+mkdir -p "$WORK/home-with-mdc/.claude/skills/mac-deep-clean" "$WORK/proj-no-mdc" \
+         "$WORK/proj-with-mdc/.claude/skills/mac-deep-clean" "$WORK/home-no-mdc" \
+         "$WORK/plugin-with-mdc/skills/mac-deep-clean" "$WORK/plugin-no-mdc"
 printf -- '---\nname: mac-deep-clean\n---\nfixture\n' > "$WORK/home-with-mdc/.claude/skills/mac-deep-clean/SKILL.md"
-mkdir -p "$WORK/home-no-mdc"
+printf -- '---\nname: mac-deep-clean\n---\nfixture\n' > "$WORK/proj-with-mdc/.claude/skills/mac-deep-clean/SKILL.md"
+printf -- '---\nname: mac-deep-clean\n---\nfixture\n' > "$WORK/plugin-with-mdc/skills/mac-deep-clean/SKILL.md"
 
-out_has="$(HOME="$WORK/home-with-mdc" bash "$CLEAN" --deep --repo "$WORK/proj-no-mdc" 2>&1)"
+# $1=HOME  $2=--repo dir  $3=CLAUDE_PLUGIN_ROOT
+deep_out() { HOME="$1" CLAUDE_PLUGIN_ROOT="$3" bash "$CLEAN" --deep --repo "$2" 2>&1; }
+
+out_has="$(deep_out "$WORK/home-with-mdc" "$WORK/proj-no-mdc" "$WORK/plugin-no-mdc")"
 printf '%s\n' "$out_has" | grep -q "invoke the 'mac-deep-clean' skill" \
   && ok "--deep: skill installed (user-level) -> handoff names it" \
   || bad "--deep: skill installed but handoff text missing: $out_has"
 
-out_no="$(HOME="$WORK/home-no-mdc" bash "$CLEAN" --deep --repo "$WORK/proj-no-mdc" 2>&1)"
-if printf '%s\n' "$out_no" | grep -q "invoke the 'mac-deep-clean' skill"; then
-  bad "--deep: skill NOT installed but handoff still tells the user to invoke it (overclaim)"
+out_proj="$(deep_out "$WORK/home-no-mdc" "$WORK/proj-with-mdc" "$WORK/plugin-no-mdc")"
+printf '%s\n' "$out_proj" | grep -q "invoke the 'mac-deep-clean' skill" \
+  && ok "--deep: skill installed (project-level) -> handoff names it" \
+  || bad "--deep: project-level skill but handoff text missing: $out_proj"
+
+out_plug="$(deep_out "$WORK/home-no-mdc" "$WORK/proj-no-mdc" "$WORK/plugin-with-mdc")"
+printf '%s\n' "$out_plug" | grep -q "invoke the 'hmd:mac-deep-clean' skill" \
+  && ok "--deep: plugin-shipped skill, no user copy -> handoff names hmd:mac-deep-clean" \
+  || bad "--deep: plugin-shipped skill but handoff text missing: $out_plug"
+
+out_no="$(deep_out "$WORK/home-no-mdc" "$WORK/proj-no-mdc" "$WORK/plugin-no-mdc")"
+if printf '%s\n' "$out_no" | grep -Eq "invoke the '(hmd:)?mac-deep-clean' skill"; then
+  bad "--deep: skill nowhere (no user, project or plugin copy) but handoff still tells the user to invoke it (overclaim)"
 else
-  ok "--deep: skill not installed -> no overclaim in the handoff text"
+  ok "--deep: skill nowhere -> no overclaim in the handoff text"
 fi
 printf '%s\n' "$out_no" | grep -q 'heimdall-cleanup --apply' \
   && ok "--deep: absent-skill fallback still points at hmd's own safe subset" \
   || bad "--deep: absent-skill fallback missing the --apply pointer: $out_no"
+
+# with CLAUDE_PLUGIN_ROOT UNSET the plugin root resolves from the script's own location: this
+# checkout ships the skill, so the handoff must name it ...
+out_self="$(env -u CLAUDE_PLUGIN_ROOT HOME="$WORK/home-no-mdc" bash "$CLEAN" --deep --repo "$WORK/proj-no-mdc" 2>&1)"
+printf '%s\n' "$out_self" | grep -q "invoke the 'hmd:mac-deep-clean' skill" \
+  && ok "--deep: no CLAUDE_PLUGIN_ROOT -> shipped skill found from the script's own location" \
+  || bad "--deep: shipped skill not found via the script location: $out_self"
+# ... and a copy of the script in a plugin tree that LACKS the skill must not claim one.
+mkdir -p "$WORK/bare-plugin/bin"; cp "$CLEAN" "$WORK/bare-plugin/bin/heimdall-cleanup"
+out_bare="$(env -u CLAUDE_PLUGIN_ROOT HOME="$WORK/home-no-mdc" bash "$WORK/bare-plugin/bin/heimdall-cleanup" --deep --repo "$WORK/proj-no-mdc" 2>&1)"
+if printf '%s\n' "$out_bare" | grep -Eq "invoke the '(hmd:)?mac-deep-clean' skill"; then
+  bad "--deep: script in a plugin tree WITHOUT skills/mac-deep-clean still tells the user to invoke it (overclaim)"
+else
+  ok "--deep: script in a plugin tree without the skill -> no overclaim"
+fi
 
 echo
 printf 'sys-cleanup: %d passed, %d failed\n' "$PASS" "$FAIL"
