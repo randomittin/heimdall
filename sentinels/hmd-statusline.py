@@ -532,14 +532,18 @@ def _session_code(session_id, cwd):
     session the SessionStart hook recorded for `cwd` (.heimdall/app/session.json),
     then `cwd` itself — resolve_session_code's own precedence, the one every other
     reader of this code (`hmd ui`, `hmd app`, the pair window) goes through.
-    Never raises: a missing/broken lib, or neither input being a usable string,
-    is just another way to have no code — the caller renders nothing rather than
+    The code is keyed by the machine's session-code seed, which a render only READS
+    (create_seed=False -- the SessionStart hook, `hmd ui` and `hmd app` are what make it):
+    a render writes nothing, so the same stdin renders the same bytes whatever the home
+    directory is, and with no seed yet there is no code to show.
+    Never raises: a missing/broken lib, no seed yet, or neither input being a usable
+    string, is just another way to have no code — the caller renders nothing rather than
     guess (fail OPEN, never a blank statusline over it)."""
     try:
         spec = importlib.util.spec_from_file_location("hmd_session_code", _SESSION_CODE_LIB)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        code, _source = mod.resolve_session_code(repo=cwd, session_id=session_id or None)
+        code, _source = mod.resolve_session_code(repo=cwd, session_id=session_id or None, create_seed=False)
     except Exception:
         return None
     return code if isinstance(code, str) and code else None

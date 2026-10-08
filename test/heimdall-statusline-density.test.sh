@@ -66,6 +66,11 @@ render_case() {
   tier="$1"; color="$2"; cols="$(cols_for "$tier")"
   WS="$(mktemp -d)"; HOMED="$(mktemp -d)"; TMPD="$(mktemp -d)"
   mkdir -p "$WS/.heimdall"
+  # The Row1 session code is keyed by the machine's session-code seed, which a render only READS (a render writes
+  # nothing). The throwaway HOME gets a FIXED one, so the code -- and therefore every golden -- is the same on any
+  # machine, and the goldens keep covering the code's segment. No seed would mean no code on Row1 at all.
+  mkdir -p "$HOMED/.heimdall" && chmod 700 "$HOMED/.heimdall"
+  printf '%s\n' "$CODE_SEED" > "$HOMED/.heimdall/session-code.key" && chmod 600 "$HOMED/.heimdall/session-code.key"
   printf '{"handle":"rj","seed":"rj","created":0}\n' > "$WS/.heimdall/identity.json"
   # Row3 gate verdict via the legacy single-verdict file (read by hmd_ledger).
   printf '{"verdict":"pass","passed":3,"total":3}\n' > "$WS/.heimdall/statusline.json"

@@ -60,6 +60,11 @@ hex characters is never replaced and never guessed around: there is no code
 (session_code_for raises ValueError) and every reader degrades to "no code" --
 the QR still pairs. A code is also unpredictable only up to its 25 bits: what
 stops a guess is the relay (one GitHub identity, a throttle, a lockout), not this.
+The seed is MADE by whatever first needs a code to register or serve -- the
+SessionStart hook's record_session, `hmd ui`, `hmd app`, the CLI -- and only READ by
+the statusline (create_seed=False): a render writes nothing, so the same stdin
+renders the same bytes whatever the home directory is, and until a seed exists the
+statusline shows no code rather than one nobody registered.
 
 ONE CODE, WHOEVER ASKS (resolve_session_code)
 The statusline hashes the live session_id on its stdin; a process that is NOT
@@ -316,6 +321,11 @@ def main(argv=None):
         try:
             if args.record_session:
                 record_session(args.repo, args.session_id, args.pid)
+                # a recorded session is one the statusline is about to show a code for, and the statusline only READS the
+                # seed (it writes nothing at render): this is where it comes to exist. Best effort -- no seed, no code shown
+                import contextlib
+                with contextlib.suppress(ValueError):
+                    _seed()
             else:
                 forget_session(args.repo, args.session_id)
         except (ValueError, OSError) as exc:
