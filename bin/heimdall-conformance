@@ -34,6 +34,11 @@
 #                     waste (the full gate costs ~1374s).
 #   gates-at-end      the first full-gate run of a session must come AFTER some
 #                     work. Gating an unchanged tree proves nothing.
+#   suite-runs-once   the same single suite (`bash test/<name>.test.sh`) run 3+
+#                     times with no edit between the runs. Operator rule,
+#                     2026-10-08: "test once, at the end" — one solo re-run (2
+#                     runs) is the allowance for a load-caused failure, the
+#                     third is waste.
 #
 # FAIL-CLOSED, ALWAYS
 # Repo rule: "gates must fail closed: an unreachable verifier is NON_VERIFIED,
@@ -190,15 +195,20 @@ EOF
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-# THE SESSION TRANSCRIPT CLASSIFIER  (shared by checks 3 and 4)
+# THE SESSION TRANSCRIPT CLASSIFIER  (shared by checks 3, 4 and 5)
 # ═════════════════════════════════════════════════════════════════════════════
 # Ground truth for "what did this session actually do" is the Claude Code
 # transcript: ~/.claude/projects/<slug>/<session>.jsonl, one JSON object per
-# line. We classify two event kinds and ignore everything else:
+# line. We classify three event kinds and ignore everything else:
 #
 #   GATE    a Bash tool_use whose command runs the FULL gate (test/run-all.sh
 #           with no --filter). A filtered run is a targeted re-run, not the
 #           1374s full gate, and must not count.
+#   SUITE   a Bash tool_use running ONE suite (`bash test/<name>.test.sh`), one
+#           event per suite invoked — a single call may run several (`a && b`).
+#           The detail is the canonical `test/<name>.test.sh`, so every spelling
+#           of one suite (absolute path, ./, nohup/time/env wrappers) is a single
+#           identity. `test/run-all.sh` is GATE, never a suite.
 #   MUTATE  a Write/Edit/NotebookEdit tool_use — i.e. actual work.
 #
 # Parsing is done entirely in jq. Shelling the command string out to grep would
@@ -210,6 +220,15 @@ EOF
 # against a real 14-invocation session with zero false positives: `pgrep -f
 # run-all.sh`, `wc -l test/run-all.sh`, and a python string literal that merely
 # CONTAINED "bash test/run-all.sh" were all correctly excluded.
+#
+# A suite run is read the same way: `test/<name>.test.sh` in command position,
+# behind bash/sh/zsh or executed directly, after the same wrappers. `suite_of`
+# also strips bare `VAR=value` prefixes (the gate classifier only knows the
+# `env VAR=value` form). Flags are deliberately NOT skipped: `bash -n x.test.sh`
+# is a syntax check, not a run, and counting it would cry wolf — a missed
+# `bash -x` run is the cheaper error. Only a name of [A-Za-z0-9._-] is a suite,
+# and `test/run-all.sh` carries no `.test.sh` suffix, so the full gate can never
+# be mistaken for one.
 _classify_program() {
   cat <<'JQ'
 def segments:
@@ -224,11 +243,18 @@ def is_full_gate:
   | (($s | test("^(bash|sh|zsh)\\s+[^ ]*test/run-all\\.sh(\\s|$)"))
      or ($s | test("^\\.?/?[^ ]*test/run-all\\.sh(\\s|$)")))
     and ($s | test("--filter") | not);
+def suite_of:
+  unwrap
+  | sub("^([A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)+";"")
+  | capture("^(?:(?:bash|sh|zsh)\\s+|(?:\\./)?)(?:\\S*/)?test/(?<name>[A-Za-z0-9._-]+)\\.test\\.sh(?:\\s|$|[<>&])")
+  | "test/\(.name).test.sh";
 select(.type == "assistant") | .timestamp as $ts
 | .message.content[]? | select(.type == "tool_use")
 | if .name == "Bash" then
-    ((.input.command // "") | segments | map(select(is_full_gate)))
-    | select(length > 0) | .[] | [$ts, "GATE", (.[0:100])]
+    (.input.command // "") as $cmd
+    | (($cmd | segments | map(select(is_full_gate)))
+       | select(length > 0) | .[] | [$ts, "GATE", (.[0:100])]),
+      ($cmd | segments[] | suite_of | [$ts, "SUITE", .])
   elif (.name == "Write" or .name == "Edit" or .name == "NotebookEdit") then
     [$ts, "MUTATE", ((.input.file_path // "?") | tostring)]
   else empty end
@@ -286,18 +312,22 @@ _under_full_gate() {
 }
 
 # Shared load: fills EV (the event stream) or exits 3.
+#   $1  event kinds that count as "something to inspect"    (default GATE|MUTATE)
+#   $2  how those kinds read in the NON_VERIFIED message    (default gate/edit)
+# A check is judged only on the kinds IT reads. The full-gate checks keep the
+# default so SUITE events they never look at cannot fill their anti-vacuous count:
+# a transcript of nothing but suite runs says nothing about gate discipline.
 EV=""
 _load_events() {
-  local t
+  local kinds="${1:-GATE|MUTATE}" label="${2:-gate/edit}" t n
   t="$(_resolve_transcript)"
   [ -n "$t" ] || nonverified "no session transcript found for $REPO (set HMD_CONF_TRANSCRIPT)"
   [ -r "$t" ] || nonverified "session transcript is unreadable: $t"
   EV="$(_events)" || nonverified "could not parse session transcript: $t"
-  local n
-  n="$(printf '%s' "$EV" | grep -c '[^[:space:]]')"
+  n="$(printf '%s\n' "$EV" | awk -F'\t' -v k="^($kinds)\$" '$2 ~ k { c++ } END { print c + 0 }')"
   # An empty classification is NOT a clean session. It means we learned nothing
   # about gate discipline from this transcript.
-  [ "${n:-0}" -gt 0 ] || nonverified "session transcript yielded 0 gate/edit events: $t"
+  [ "${n:-0}" -gt 0 ] || nonverified "session transcript yielded 0 $label events: $t"
   note "transcript $t"
 }
 
@@ -372,6 +402,65 @@ EOF
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+# CHECK 5 — suite-runs-once
+# ═════════════════════════════════════════════════════════════════════════════
+# Operator rule (2026-10-08): test ONCE, at the end. Running one suite again over
+# a tree nobody edited recomputes a verdict already on screen — the waste of check
+# 3, one suite at a time instead of the full gate.
+#
+# The rule is NOT "ran it twice". A suite that failed because the machine was
+# loaded deserves ONE solo re-run, and a check that flags it gets muted, which is
+# how gates die. So two runs are allowed — the run and its one re-run — and the
+# THIRD run with no edit between is the violation: the failure was not load, and
+# running a deterministic suite again cannot change its answer.
+#
+# Counted per suite. A Write/Edit/NotebookEdit resets EVERY suite's count: the
+# tree changed, so every earlier verdict is stale and the next run is new
+# information. A streak is reported once, when it ends (the next edit, or the end
+# of the transcript), with its full run count. A Bash call running several suites
+# counts each of them.
+#
+# Edits made THROUGH Bash (sed -i, a heredoc, tee) are not MUTATE events — the same
+# tool-call-only discipline as checks 3 and 4, which keeps this check out of the
+# business of guessing at shell. A re-run after a Bash-made edit therefore reads as
+# "no edit between"; edit with Edit/Write and the count resets as intended.
+#
+# usage() and the header say "3+": keep them in step with this number.
+SUITE_RUNS_ALLOWED=2
+check_suite_runs_once() {
+  _load_events 'GATE|MUTATE|SUITE' 'gate/edit/suite'
+  local rows tag a b c d total=0 flagged=0
+  rows="$(printf '%s\n' "$EV" | awk -F'\t' -v allowed="$SUITE_RUNS_ALLOWED" '
+    function ts(x) { return x == "" ? "?" : x }
+    function emit_streak(   i, s) {
+      for (i = 1; i <= k; i++) {
+        s = order[i]
+        if (runs[s] > allowed) printf "V\t%s\t%d\t%s\t%s\n", s, runs[s], first[s], last[s]
+      }
+      split("", runs); k = 0
+    }
+    $2 == "SUITE" {
+      s = $3; total++
+      if (!(s in runs)) { order[++k] = s; first[s] = ts($1) }
+      runs[s]++; last[s] = ts($1)
+    }
+    $2 == "MUTATE" { emit_streak() }
+    END { emit_streak(); printf "T\t%d\n", total }
+  ')" || nonverified "suite-runs-once: could not count suite runs (awk failed) — no verdict"
+  while IFS=$'\t' read -r tag a b c d; do
+    case "$tag" in
+      V) viol "suite run more than $SUITE_RUNS_ALLOWED times with no edit between	suite=$a	runs=$b	first=$c	last=$d"
+         flagged=$((flagged + 1)) ;;
+      T) total="$a" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  [ "$flagged" -gt 0 ] || okline "no suite run more than $SUITE_RUNS_ALLOWED times with no edit between	suite_runs=$total"
+  note "suite-runs-once saw $total suite invocation(s)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
 # inventory — THE HONESTY LINE
 # ═════════════════════════════════════════════════════════════════════════════
 # See bin/lib/rule-inventory.sh for the extractor and the classification rules.
@@ -387,7 +476,8 @@ checks
   brief-routing     every spawn-instruction doc routes through heimdall-brief
   gate-runs-once    two full-gate runs with no edit between them
   gates-at-end      a full-gate run before any work in the session
-  all               all four, aggregated
+  suite-runs-once   one suite run 3+ times with no edit between (one solo re-run is allowed)
+  all               all five, aggregated
 
 inventory
   inventory         print every normative rule with a CHECKED/UNCHECKABLE verdict
@@ -405,11 +495,13 @@ main() {
     brief-routing)   check_brief_routing ;;
     gate-runs-once)  check_gate_runs_once ;;
     gates-at-end)    check_gates_at_end ;;
+    suite-runs-once) check_suite_runs_once ;;
     all)
       check_commit_per_unit
       check_brief_routing
       check_gate_runs_once
       check_gates_at_end
+      check_suite_runs_once
       ;;
     inventory)       shift; rule_inventory "$@"; return $? ;;
     ''|-h|--help)    usage ;;

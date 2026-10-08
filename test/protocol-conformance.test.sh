@@ -58,8 +58,13 @@
 #                            NON_VERIFIED for the exact agents it exists to police.
 #   K. EXIT-CODE CONTRACT    0 conformant · 1 violation · 2 usage/dependency · 3
 #                            NON_VERIFIED, with 2 never confusable with 1.
-#   M. MUTATION PROOFS       nine mutants of the tool, each disarming one rule, each
-#                            required to flip a verdict from RED to GREEN.
+#   L. SUITE RUNS ONCE       the THIRD run of one suite with no edit between is a violation
+#                            (two is the allowed solo re-run); an edit resets the count;
+#                            suites are counted apart, and every suite in a multi-suite
+#                            Bash call counts; mentions of a suite that are not runs of it
+#                            do not; the full-gate checks are untouched by suite events.
+#   M. MUTATION PROOFS       thirteen mutants of the tool, each disarming one rule, each
+#                            required to flip a verdict.
 #
 # HERMETIC BY CONSTRUCTION
 # Every verdict below is read from a fixture whose expected answer is known by
@@ -617,6 +622,190 @@ conf --help
   && ok "(K) --help keeps the usage exit, so a mistyped check can never read as conformant" \
   || bad "(K) --help exited $RC"
 
+# ═══ (L) SUITE RUNS ONCE ═══════════════════════════════════════════════════════════
+# Operator rule (2026-10-08): "test once, at the end". Re-running a suite over a tree
+# nobody edited recomputes a verdict already on screen. ONE solo re-run is the allowance
+# — the honest response to a failure caused by machine load — so the line sits at the
+# THIRD run of the same suite with no Write/Edit/NotebookEdit between consecutive runs.
+# Every fixture is hand-built JSONL whose per-suite run counts are known exactly, and
+# only tool-call events are read: no prose is parsed.
+SUITE_A='bash test/alpha.test.sh'
+SUITE_B='bash test/beta.test.sh'
+viol_count() { grep -c '^VIOLATION' <<<"$1"; }
+
+T_S2="$WORK/suite-two.jsonl"            # A A             -> the one allowed solo re-run
+{ ev_bash s1 "$SUITE_A"; ev_bash s2 "$SUITE_A"; } > "$T_S2"
+
+T_S3="$WORK/suite-three.jsonl"          # A A A           -> one run too many
+{ ev_bash s1 "$SUITE_A"; ev_bash s2 "$SUITE_A"; ev_bash s3 "$SUITE_A"; } > "$T_S3"
+
+T_S4="$WORK/suite-four.jsonl"           # A A A A         -> ONE streak, reported once
+{ ev_bash s1 "$SUITE_A"; ev_bash s2 "$SUITE_A"; ev_bash s3 "$SUITE_A"; ev_bash s4 "$SUITE_A"; } > "$T_S4"
+
+T_S3E="$WORK/suite-three-edit.jsonl"    # A A edit A      -> the edit starts a new count
+{ ev_bash s1 "$SUITE_A"; ev_bash s2 "$SUITE_A"; ev_edit e1 a.sh; ev_bash s3 "$SUITE_A"; } > "$T_S3E"
+
+T_SRST="$WORK/suite-reset.jsonl"        # A A A edit A A  -> only the first streak is over the line
+{
+  ev_bash s1 "$SUITE_A"; ev_bash s2 "$SUITE_A"; ev_bash s3 "$SUITE_A"
+  ev_write e1 a.sh
+  ev_bash s4 "$SUITE_A"; ev_bash s5 "$SUITE_A"
+} > "$T_SRST"
+
+T_S22="$WORK/suite-two-each.jsonl"      # A B A B         -> two suites, counted apart
+{ ev_bash s1 "$SUITE_A"; ev_bash s2 "$SUITE_B"; ev_bash s3 "$SUITE_A"; ev_bash s4 "$SUITE_B"; } > "$T_S22"
+
+T_SM1="$WORK/suite-multi-one.jsonl"     # (A&&B) B B      -> B reaches 3 only if the call counted it
+{ ev_bash s1 "$SUITE_A && $SUITE_B"; ev_bash s2 "$SUITE_B"; ev_bash s3 "$SUITE_B"; } > "$T_SM1"
+
+T_SM2="$WORK/suite-multi-two.jsonl"     # (A&&B) (A&&B)   -> two of each, still allowed
+{ ev_bash s1 "$SUITE_A && $SUITE_B"; ev_bash s2 "$SUITE_A && $SUITE_B"; } > "$T_SM2"
+
+T_SM3="$WORK/suite-multi-three.jsonl"   # (A&&B) (B;A) (A&&B) -> both suites reach 3
+{ ev_bash s1 "$SUITE_A && $SUITE_B"; ev_bash s2 "$SUITE_B; $SUITE_A"; ev_bash s3 "$SUITE_A && $SUITE_B"; } > "$T_SM3"
+
+T_SPELL="$WORK/suite-spellings.jsonl"   # seven spellings of ONE suite, no edit between
+{
+  ev_bash p1 'cd /tmp && bash test/alpha.test.sh'
+  ev_bash p2 'nohup bash test/alpha.test.sh'
+  ev_bash p3 'env HEIMDALL_TEST_SLOW=1 bash test/alpha.test.sh'
+  ev_bash p4 './test/alpha.test.sh'
+  ev_bash p5 'time bash test/alpha.test.sh'
+  ev_bash p6 'HEIMDALL_TEST_SLOW=1 bash test/alpha.test.sh 2>&1 | tail -3'
+  ev_bash p7 'bash /some/worktree/test/alpha.test.sh > /dev/null'
+} > "$T_SPELL"
+
+T_SNOISE="$WORK/suite-noise.jsonl"      # mentions of a suite that are NOT runs of it
+{
+  ev_edit n0 a.sh
+  ev_bash n1 'cat test/alpha.test.sh'
+  ev_bash n2 'grep -n assert test/alpha.test.sh'
+  ev_bash n3 'wc -l test/alpha.test.sh'
+  ev_bash n4 'pgrep -f test/alpha.test.sh'
+  ev_bash n5 'bash -n test/alpha.test.sh'
+  ev_bash n6 "python3 -c 'print(\"bash test/alpha.test.sh\")'"
+  ev_bash n7 'bash test/run-all.sh --filter alpha'
+  ev_bash n8 'bash test/run-all.sh'
+} > "$T_SNOISE"
+
+T_SWORK="$WORK/suite-after-work.jsonl"  # edit A A A       -> real work happened, then one suite 3x
+{ ev_edit e1 a.sh; ev_bash s1 "$SUITE_A"; ev_bash s2 "$SUITE_A"; ev_bash s3 "$SUITE_A"; } > "$T_SWORK"
+
+HMD_CONF_TRANSCRIPT="$T_S2" conf suite-runs-once
+[ "$RC" = 0 ] && has "$OUT" '^OK.*suite_runs=2' && [ "$(viol_count "$OUT")" = 0 ] \
+  && ok "(L) the SAME suite twice with no edit is allowed — the one solo re-run for a load-caused failure" \
+  || bad "(L) the allowed solo re-run was flagged (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_S3" conf suite-runs-once
+[ "$RC" = 1 ] && has "$OUT" '^VIOLATION.*suite=test/alpha.test.sh.*runs=3.*first=s1.*last=s3' \
+  && ok "(L) the THIRD run of one suite with no edit between is a violation, naming the suite and the run count" \
+  || bad "(L) three unedited runs were not flagged (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_S4" conf suite-runs-once
+[ "$RC" = 1 ] && [ "$(viol_count "$OUT")" = 1 ] && has "$OUT" 'suite=test/alpha.test.sh.*runs=4.*last=s4' \
+  && ok "(L) a longer streak is ONE violation carrying the full run count (4), not one per run past the line" \
+  || bad "(L) a four-run streak was mis-reported (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_S3E" conf suite-runs-once
+[ "$RC" = 0 ] && has "$OUT" '^OK.*suite_runs=3' \
+  && ok "(L) three runs with an EDIT between them are two units of work — the edit resets the count" \
+  || bad "(L) an edit between runs did not reset the count (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_SRST" conf suite-runs-once
+[ "$RC" = 1 ] && [ "$(viol_count "$OUT")" = 1 ] && has "$OUT" 'runs=3.*first=s1.*last=s3' \
+  && ok "(L) the count restarts at the edit: a 3-run streak, an edit, then 2 more runs is exactly ONE violation" \
+  || bad "(L) the post-edit runs were pooled with the pre-edit streak (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_S22" conf suite-runs-once
+[ "$RC" = 0 ] && has "$OUT" '^OK.*suite_runs=4' \
+  && ok "(L) two DIFFERENT suites run twice each pass — counts are per suite, never pooled" \
+  || bad "(L) distinct suites were pooled into one count (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_SM1" conf suite-runs-once
+[ "$RC" = 1 ] && has "$OUT" '^VIOLATION.*suite=test/beta.test.sh.*runs=3' && ! has "$OUT" '^VIOLATION.*alpha' \
+  && ok "(L) a Bash call running TWO suites counts the SECOND one too (beta reaches 3 only through the && call)" \
+  || bad "(L) the second suite of a multi-suite call was not counted (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_SM2" conf suite-runs-once
+[ "$RC" = 0 ] && has "$OUT" '^OK.*suite_runs=4' \
+  && ok "(L) a two-suite call counts each suite ONCE per call — 2 calls is 2 runs of each, still allowed" \
+  || bad "(L) a multi-suite call was over-counted (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_SM3" conf suite-runs-once
+[ "$RC" = 1 ] && [ "$(viol_count "$OUT")" = 2 ] \
+  && has "$OUT" '^VIOLATION.*suite=test/alpha.test.sh.*runs=3' && has "$OUT" '^VIOLATION.*suite=test/beta.test.sh.*runs=3' \
+  && ok "(L) three calls each running both suites flag BOTH, whatever the order or separator inside the call (&& and ;)" \
+  || bad "(L) a multi-suite call did not flag both suites (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_SPELL" conf suite-runs-once
+[ "$RC" = 1 ] && has "$OUT" 'suite=test/alpha.test.sh.*runs=7' \
+  && ok "(L) all seven real spellings count (&& · nohup · env · ./ · time · bare VAR=1 with a pipe · absolute path) — no false negatives" \
+  || bad "(L) a spelling of a suite run was missed (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_SNOISE" conf suite-runs-once
+[ "$RC" = 0 ] && has "$OUT" '^OK.*suite_runs=0' \
+  && ok "(L) command position is required: cat/grep/wc/pgrep/bash -n/a python literal/run-all.sh are NOT suite runs" \
+  || bad "(L) a false positive in the suite classifier (rc=$RC): $OUT$ERR"
+
+# The pre-existing checks must be blind to the new event kind. A transcript holding ONLY
+# suite runs teaches the full-gate checks nothing about gate discipline, so they stay
+# NON_VERIFIED on it exactly as before — suite events may not fill their anti-vacuous count.
+HMD_CONF_TRANSCRIPT="$T_S3" conf gate-runs-once
+[ "$RC" = 3 ] && has "$ERR" 'yielded 0 gate/edit events' && [ -z "$OUT" ] \
+  && ok "(L) the full-gate checks are UNCHANGED by suite events: a suite-only transcript is still NON_VERIFIED for them" \
+  || bad "(L) suite events leaked into gate-runs-once's anti-vacuous count (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_SWORK" conf gate-runs-once
+L_RC1="$RC"
+HMD_CONF_TRANSCRIPT="$T_SWORK" conf gates-at-end
+L_RC2="$RC"
+HMD_CONF_TRANSCRIPT="$T_SWORK" conf suite-runs-once
+[ "$L_RC1" = 0 ] && [ "$L_RC2" = 0 ] && [ "$RC" = 1 ] \
+  && ok "(L) independent of the full-gate checks: one transcript is clean for both of them and a violation here" \
+  || bad "(L) the checks are not separable: gate-runs-once=$L_RC1 gates-at-end=$L_RC2 suite-runs-once=$RC"
+
+HMD_CONF_TRANSCRIPT="$T_SWORK" HMD_CONF_REPO="$FR" conf all
+[ "$RC" = 1 ] && has "$OUT" '^VIOLATION.*suite=test/alpha.test.sh.*runs=3' \
+  && ok "(L) \`all\` runs suite-runs-once too — its violation surfaces in the aggregate" \
+  || bad "(L) the aggregate run lost the suite check (rc=$RC): $OUT$ERR"
+
+HMD_CONF_TRANSCRIPT="$T_CLEAN" HMD_CONF_REPO="$FR" conf all
+has "$OUT" '^OK.*suite_runs=0' \
+  && ok "(L) \`all\` over a session with no suite runs reports the suite check OK — it is not killed before it runs" \
+  || bad "(L) the aggregate run never reached a clean suite-runs-once verdict (rc=$RC): $OUT$ERR"
+
+# Fail closed, like every other transcript check: nothing to inspect is never "clean".
+HMD_CONF_TRANSCRIPT="$WORK/eventfree.jsonl" conf suite-runs-once
+[ "$RC" = 3 ] && has "$ERR" '^NON_VERIFIED' && has "$ERR" 'yielded 0 gate/edit/suite events' && [ -z "$OUT" ] \
+  && ok "(L) a transcript with nothing to inspect is NON_VERIFIED (exit 3) — never an assumed-clean session" \
+  || bad "(L) an event-free transcript exited $RC stdout[$OUT] stderr[$ERR]"
+
+HMD_CONF_TRANSCRIPT="$WORK/corrupt.jsonl" conf suite-runs-once
+[ "$RC" = 3 ] && has "$ERR" 'could not parse' && [ -z "$OUT" ] \
+  && ok "(L) a corrupt transcript is NON_VERIFIED, with nothing green on stdout" \
+  || bad "(L) a corrupt transcript exited $RC stdout[$OUT] stderr[$ERR]"
+
+HMD_CONF_TRANSCRIPT="$WORK/absent.jsonl" conf suite-runs-once
+[ "$RC" = 3 ] && has "$ERR" 'unreadable' && [ -z "$OUT" ] \
+  && ok "(L) a missing transcript is NON_VERIFIED — an unreachable verifier is never OPEN" \
+  || bad "(L) a missing transcript exited $RC stdout[$OUT] stderr[$ERR]"
+
+# The counter itself failing must be loud too. This awk shim dies ONLY on the counting
+# program (the anti-vacuous load before it still works), so a clean-looking "0 suite
+# runs" can only come from a counter that was never allowed to speak.
+mkdir -p "$WORK/awkshim"
+printf '#!/bin/sh\ncase "$*" in *emit_streak*) exit 2 ;; esac\nexec %s "$@"\n' "$(command -v awk)" > "$WORK/awkshim/awk"
+chmod +x "$WORK/awkshim/awk"
+PATH="$WORK/awkshim:$PATH" HMD_CONF_TRANSCRIPT="$T_S2" conf suite-runs-once
+[ "$RC" = 3 ] && has "$ERR" '^NON_VERIFIED.*could not count suite runs' && ! has "$OUT" '^OK' \
+  && ok "(L) a counter that cannot run is NON_VERIFIED (exit 3) — a broken aggregator never reads as a clean session" \
+  || bad "(L) a failing counter was not fail-closed (rc=$RC): $OUT$ERR"
+
+conf --help
+has "$ERR" 'suite-runs-once.*3[+]' && has "$ERR" 'all  *all five' \
+  && ok "(L) --help documents suite-runs-once and says \`all\` aggregates five checks" \
+  || bad "(L) the usage text does not mention the new check: $ERR"
+
 # ═══════════════════════════════════════════════════════════════════════════════════
 # (M) MUTATION PROOFS — break the rule, prove the tool goes RED
 # ═══════════════════════════════════════════════════════════════════════════════════
@@ -755,6 +944,57 @@ else
   [ "$RC" = 3 ] && has "$ERR" 'no worktree root' \
     && ok "M9 KILLED: resolving \$REPO to the launching worktree turns (J) into NON_VERIFIED -> the main-checkout resolution is load-bearing" \
     || bad "M9 SURVIVED: with resolution collapsed the run still exited $RC: $OUT$ERR"
+fi
+
+# ── M10 — suite counts never reset: the edit rule disarmed ─────────────────────────
+# Flips a CLEAN verdict into an accused one: (L)'s "3 runs with an edit between" fixture
+# must go red once nothing resets the count, or that assertion is not watching the reset.
+M10="$(mutant conf.m10 's|\$2 == "MUTATE" *{ emit_streak() }|$2 == "NEVER" { emit_streak() }|')"
+if [ -z "$M10" ]; then
+  bad "M10 NOT APPLIED: the suite-count reset no longer matches — this mutation proof is dead"
+else
+  HMD_CONF_TRANSCRIPT="$T_S3E" confx "$M10" suite-runs-once
+  [ "$RC" = 1 ] && has "$OUT" '^VIOLATION' \
+    && ok "M10 KILLED: a count that survives edits accuses the edited session -> (L)'s reset assertion is a real check" \
+    || bad "M10 SURVIVED: the mutant that never resets still passed the edited session (rc=$RC): $OUT"
+fi
+
+# ── M11 — the allowance widened by one: the solo re-run becomes two ────────────────
+M11="$(mutant conf.m11 's|^SUITE_RUNS_ALLOWED=2$|SUITE_RUNS_ALLOWED=3|')"
+if [ -z "$M11" ]; then
+  bad "M11 NOT APPLIED: the SUITE_RUNS_ALLOWED initialiser no longer matches"
+else
+  HMD_CONF_TRANSCRIPT="$T_S3" confx "$M11" suite-runs-once
+  [ "$RC" = 0 ] \
+    && ok "M11 KILLED: one extra allowed run turns the third-run violation green -> (L) pins the boundary" \
+    || bad "M11 SURVIVED: a widened allowance still flagged the third run (rc=$RC): $OUT"
+fi
+
+# ── M12 — every suite conflated into one identity ──────────────────────────────────
+# Flips a CLEAN verdict into an accused one: with all suites sharing a name, (L)'s
+# "two different suites twice each" fixture reads as four runs of one suite.
+M12="$(mutant conf.m12 's|\[\$ts, "SUITE", \.]|[$ts, "SUITE", "test/conflated.test.sh"]|')"
+if [ -z "$M12" ]; then
+  bad "M12 NOT APPLIED: the SUITE event emitter no longer matches"
+else
+  HMD_CONF_TRANSCRIPT="$T_S22" confx "$M12" suite-runs-once
+  [ "$RC" = 1 ] && has "$OUT" '^VIOLATION' \
+    && ok "M12 KILLED: pooling every suite into one count accuses two clean suites -> (L)'s per-suite assertion is a real check" \
+    || bad "M12 SURVIVED: the mutant that conflates suites still passed the two-suite fixture (rc=$RC): $OUT"
+fi
+
+# ── M13 — the counter's failure guard removed ──────────────────────────────────────
+# Without the `|| nonverified` a counter that dies leaves zero rows and zero violations,
+# which reads as a clean "0 suite runs". The awk shim of (L) must turn that silent pass
+# into exit 0 here, or the fail-closed assertion above it is not watching the guard.
+M13="$(mutant conf.m13 's/ || nonverified "suite-runs-once: could not count.*$//')"
+if [ -z "$M13" ]; then
+  bad "M13 NOT APPLIED: the counter's failure guard no longer matches — this mutation proof is dead"
+else
+  PATH="$WORK/awkshim:$PATH" HMD_CONF_TRANSCRIPT="$T_S2" confx "$M13" suite-runs-once
+  [ "$RC" = 0 ] && has "$OUT" '^OK' \
+    && ok "M13 KILLED: with the guard gone a dead counter passes silently -> (L)'s fail-closed assertion is a real check" \
+    || bad "M13 SURVIVED: the mutant with no counter guard still failed closed (rc=$RC): $OUT$ERR"
 fi
 
 # ── the mutants must not have leaked into the real tool ────────────────────────────
