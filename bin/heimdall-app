@@ -1498,7 +1498,7 @@ _pw_start() {
     echo "hmd app: pair window already open -- session code $code"
     return 0
   fi
-  if ! _gh_token_into probe; then
+  if ! _gh_token_into probe || [ -z "$probe" ]; then
     echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
     return 0
   fi
