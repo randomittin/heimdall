@@ -9,7 +9,7 @@ Everything that reaches dispatch() already passed its transport's own gate: a re
 device's latched session key and passed the replay guard, a direct request passed the token / Host / backoff gate.
 
 WIRE. Command plaintext is `{"action": A, "params": {...}}` for A in ALLOWED_ACTIONS. `params` is an exact key set
-(the action's keys plus an optional `rid`), exact types, and the whole command is at most 1 KiB (an action's policy `max_bytes` may raise that: attach-chunk carries 256 KiB of a picture), else `bad-params`.
+(the action's keys plus an optional `rid`), exact types, and the whole command is at most 1 KiB (an action's policy `max_bytes` may raise that: attach-chunk carries 256 KiB of a picture), else `bad-params`. A command whose limit is over LARGE_COMMAND_BYTES is charged to its rate buckets BEFORE its params are read, so a flood of big ones is refused `rate-limited` without a byte of them being parsed or decoded.
 
     interrupt         {}                          ack ok  {"id":"s-<8 hex>","result":{"via":"hook","effective":
                                                   "next-tool-boundary"}}; detail already-pending (same id) | not-running
@@ -22,8 +22,9 @@ WIRE. Command plaintext is `{"action": A, "params": {...}}` for A in ALLOWED_ACT
 
 Every refusal is `{"ok": false, "detail": <code>}`; the codes common to all four are `not-implemented` (unknown
 action), `bad-params`, `controls-off` (kill switch), `rate-limited` (+ `retry_after_s`), `timeout` (the 5 s bound ran
-out: the effect may have landed, the next state frame is the truth), `internal-error`. A repeated `rid` is answered
-with the stored ack plus `dup: true` and the handler does not run again. dispatch() returns (ok, detail, extra); `extra`
+out: the effect may have landed, the next state frame is the truth), `internal-error`. A repeated `rid` OF THE SAME ACTION is answered
+with the stored ack plus `dup: true` and the handler does not run again (the memory is keyed on (action, rid): a rid another action
+used is not a replay). dispatch() returns (ok, detail, extra); `extra`
 is merged into the sealed ack next to ok / of_seq / detail and holds only `id`, `result` (<= 1 KiB, hmd-computed values,
 never free text), `dup`, `retry_after_s`.
 
@@ -125,7 +126,7 @@ DEADLINE_ENV = "HMD_UI_CONTROL_DEADLINE_S"   # operator knob for a slow disk / a
                                              # window is 8 s and the phone waits 10), CONTROL_DEADLINE_S when unset or junk
 MAX_COMMAND_BYTES = 1024          # the whole command plaintext
 MAX_RESULT_BYTES = 1024           # an ack's `result`, serialized
-RID_MEMORY = 64                   # rid -> ack pairs kept per repo
+RID_MEMORY = 64                   # (action, rid) -> ack pairs kept per repo
 STOP_TTL_S = 120.0                # a stop request older than this is never honoured
 CHECKPOINT_COALESCE_S = 5.0       # a save within this of a good one is `coalesced`
 AUDIT_MAX_BYTES = 1024 * 1024
@@ -148,6 +149,7 @@ GATE_SWITCHES = ("asks",)    # the laptop switches that gate a NON-expand action
 # GATE_SWITCHES laptop switch that must be on for an action that is not expand (a read action behind its own consent); off = its
 # off_detail, answered before the params are read, the rid memory or any bucket is touched.
 MAX_COMMAND_CEILING = 1024 * 1024   # the most a policy max_bytes may raise the command limit to: the 1 MiB envelope
+LARGE_COMMAND_BYTES = 64 * 1024     # a policy max_bytes over this: the command is charged to its rate buckets before its params are validated or decoded
 # max_bytes: the whole command may be this long (MAX_COMMAND_BYTES up to MAX_COMMAND_CEILING) instead of MAX_COMMAND_BYTES -- attach-chunk carries a picture.
 POLICY_KEYS = frozenset(("cap", "rid_re", "replay_detail", "global_rate", "off_detail", "open_switch", "timeline_ops", "gate_switch", "max_bytes"))
 RESERVED_EXPAND = {"launch-session": "launch", "pr-merge": "merge"}   # fixed by CP2: class expand, this switch, always
@@ -622,7 +624,7 @@ class _Bucket:
 _GLOBAL_RATE = (5, 10 / 60.0)    # all controls: 10 a minute, burst 5
 _LOCK = threading.Lock()
 _BUCKETS = {}                    # (root, bucket name) -> _Bucket
-_RIDS = {}                       # root -> OrderedDict(rid -> (ok, detail, extra))
+_RIDS = {}                       # root -> OrderedDict((action, rid) -> (ok, detail, extra))
 _CHECKPOINTS = {}                # root -> (monotonic, result) of the last good save
 
 
@@ -947,6 +949,12 @@ def _run_command(root, action, params, device_id, started, caps=None):
     gated = spec["policy"].get("gate_switch")
     if gated is not None and not _switch_on(gated):   # a laptop switch in front of a non-expand action: refused before anything is read
         return False, spec["policy"].get("off_detail", "not-allowed"), {}, {}, False, None
+    charged = spec["policy"].get("max_bytes", MAX_COMMAND_BYTES) > LARGE_COMMAND_BYTES
+    if charged:   # a command that may carry a big body pays BEFORE the body is parsed or decoded: a flood of them is refused unread
+        try:
+            _charge(root, action)
+        except _Refusal as r:
+            return False, r.detail, _bounded(r.extra), {}, False, None
     try:
         rid, fields = _validate(action, params)
         refusal = None
@@ -962,16 +970,18 @@ def _run_command(root, action, params, device_id, started, caps=None):
                 return False, detail, {}, audit_params, False, repo
         if refusal is not None:
             raise refusal
+        key = (action, rid)   # the rid memory is per action: a rid another action used is not a replay of this one
         if rid is not None:
             with _LOCK:
-                hit = _RIDS.get(root, {}).get(rid)
+                hit = _RIDS.get(root, {}).get(key)
             if hit is not None:
                 ok, detail, extra = hit
                 replay = spec["policy"].get("replay_detail")
                 return ok, (replay if ok and replay else detail), dict(extra, dup=True), audit_params, True, repo
         if spec["cls"] == CLASS_EXPAND and not _audit_ready(root):
             return False, "internal-error", {}, audit_params, False, repo
-        _charge(root, action)
+        if not charged:
+            _charge(root, action)
         ctx = _Ctx(device_id, started + _deadline_s(), entry, caps)
         try:
             ok, detail, extra = spec["handler"](root, fields, ctx)
@@ -981,7 +991,7 @@ def _run_command(root, action, params, device_id, started, caps=None):
         if rid is not None:
             with _LOCK:
                 store = _RIDS.setdefault(root, collections.OrderedDict())
-                store[rid] = (ok, detail, extra)
+                store[key] = (ok, detail, extra)
                 while len(store) > RID_MEMORY:
                     store.popitem(last=False)
         return ok, detail, extra, audit_params, False, repo
