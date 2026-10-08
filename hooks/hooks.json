@@ -301,6 +301,14 @@
             "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled volatile-repo-guard && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; VG=\"$PLUGIN/bin/heimdall-volatile-repo-guard\"; if [ -x \"$VG\" ]; then if command -v perl >/dev/null 2>&1; then perl -e 'alarm 5; exec @ARGV' \"$VG\" check --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; else \"$VG\" check --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>&1 >/dev/null; fi; fi; exit 0"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled pair-window-start && exit 0; INPUT=$(cat); APP=\"$HMDP/bin/heimdall-app\"; [ -x \"$APP\" ] || exit 0; SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); [ -n \"$SID\" ] || exit 0; ( \"$APP\" pair-window --session \"$SID\" --pid \"$PPID\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1 & ); exit 0"
+          }
+        ]
       }
     ],
     "SubagentStop": [
@@ -378,6 +386,14 @@
           {
             "type": "command",
             "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled session-end-sweep && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; export PLUGIN; CKPT=\"$PLUGIN/bin/heimdall-checkpoint\"; if [ -x \"$CKPT\" ] && { [ -d .planning ] || [ -f heimdall-state.json ] || [ -f superx-state.json ]; }; then perl -e 'alarm 10; exec @ARGV' \"$CKPT\" write . >/dev/null 2>&1; CKRC=$?; if [ \"$CKRC\" -eq 142 ]; then echo \"hmd: SessionEnd checkpoint write cut short after 10s \u2014 .planning/CHECKPOINT.md may be stale; run /hmd:save\" >&2; elif [ \"$CKRC\" -ne 0 ]; then echo \"hmd: SessionEnd checkpoint write failed (rc=$CKRC) \u2014 .planning/CHECKPOINT.md may be stale; run /hmd:save\" >&2; fi; fi; AC=\"$PLUGIN/bin/heimdall-autocommit\"; if [ -x \"$AC\" ] && [ ! -f .heimdall-no-autocommit ] && [ ! -f .superx-no-autocommit ] && git rev-parse --git-dir >/dev/null 2>&1 && [ -n \"$(git status --porcelain 2>/dev/null)\" ]; then perl -e 'alarm 10; exec @ARGV' \"$AC\" \"session-end checkpoint\" >/dev/null 2>&1; ACRC=$?; if [ \"$ACRC\" -eq 142 ]; then echo \"hmd: SessionEnd autocommit cut short after 10s \u2014 edits may be uncommitted; run git status\" >&2; elif [ \"$ACRC\" -ne 0 ]; then echo \"hmd: SessionEnd autocommit failed (rc=$ACRC) \u2014 edits may be uncommitted; run git status\" >&2; fi; fi; (\"$PLUGIN/bin/parallelism-tracker\" grade 2>&1 || true; \"$PLUGIN/bin/verify-edits\" --quick 2>&1 || true; CLEAN=\"$PLUGIN/bin/heimdall-cleanup\"; GC=\"$PLUGIN/bin/heimdall-gc\"; if [ -x \"$CLEAN\" ]; then \"$CLEAN\" --auto --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1; elif [ -x \"$GC\" ]; then \"$GC\" run --quiet >/dev/null 2>&1; fi; if [ -x \"$PLUGIN/bin/heimdall-reel\" ] && { [ -d .planning ] || [ -f heimdall-state.json ] || [ -f superx-state.json ]; }; then \"$PLUGIN/bin/heimdall-reel\" record . --name \"run-$(date +%Y%m%d-%H%M%S 2>/dev/null || echo run)\" >/dev/null 2>&1; fi; \"$PLUGIN/bin/summary-card\" --receipt . >/dev/null 2>&1; CTXSYNC=\"$PLUGIN/bin/heimdall-context-sync\"; if [ -x \"$CTXSYNC\" ] && [ -d .git ]; then \"$CTXSYNC\" sync --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1 || true; fi) >/dev/null 2>&1 & FAREWELL=\"$PLUGIN/sentinels/hmd-farewell.sh\"; [ -x \"$FAREWELL\" ] && bash \"$FAREWELL\" 2>/dev/null || true"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled pair-window-stop && exit 0; INPUT=$(cat); APP=\"$HMDP/bin/heimdall-app\"; [ -x \"$APP\" ] || exit 0; SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); [ -n \"$SID\" ] || exit 0; \"$APP\" pair-window --stop --session \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" >/dev/null 2>&1 || true; exit 0"
           }
         ]
       }

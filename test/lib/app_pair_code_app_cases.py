@@ -13,7 +13,7 @@ Two kinds of stand-in for the relay client, each where it proves something the o
 Proven here: the transport default (hosted relay, HMD_RELAY_URL, --relay, in that precedence); the token
 reaches the client on stdin only -- not argv, not environment, not a file -- and `gh` is asked exactly
 `auth token`; the code is the one `hmd ui` shows; every way pair by code can be off prints one line and
-leaves the QR; --bg needs --no-confirm; the prompt shows the SAS, strips escape sequences from what the phone
+leaves the QR; a plain connect passes --no-confirm (code-only pairing, proved end to end by test/app-pair-confirm.test.sh) while --confirm needs a terminal and refuses --bg; the --confirm prompt shows the SAS, strips escape sequences from what the phone
 called itself, and an answer other than yes (or no answer) rejects; identity revoke; and one full pairing.
 """
 import hashlib
@@ -114,7 +114,7 @@ exit 2
 
     def app(self, *args, recorder=False, env=None, tty=False):
         """`hmd app connect` with --repo and --port 0 (never the fixed 8710: the machine's own sessions live
-        there). `tty=True` gives it a terminal on stdin -- pair by code is only offered at one, or with --no-confirm."""
+        there). `tty=True` gives it a terminal on stdin -- only --confirm needs one."""
         argv = [H.APP_PATH, "connect", "--repo", self.sb.repo, "--port", "0"] + list(args)
         extra = dict(env or {})
         if recorder:
@@ -163,11 +163,12 @@ def case_default_transport():
                 "--no-code: the QR flow prints exactly as it always did (header, QR, pairing code, warning)", app.tail())
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT)
-        app = s.app(recorder=True)  # stdin is a pipe: nobody to confirm a phone with
+        app = s.app(recorder=True)  # stdin is a pipe: nobody to ask, and nobody needs to be (pairing by code asks nothing)
         app.close_stdin()
         app.wait_text("PAIRING CODE:", 30)
-        T.check("code pairing off — no terminal to confirm a phone at" in app.text() and "[--code]" not in s.read("argv"),
-                "no terminal on stdin (and no --no-confirm): the code is not offered, one line says so, the QR is shown", app.tail())
+        argv = s.read("argv").splitlines()
+        T.check("no terminal to confirm" not in app.text() and "[--code]" in argv and "[--no-confirm]" in argv,
+                "no terminal on stdin: the code is still offered, to a client that is told --no-confirm, and nothing says otherwise", app.tail())
 
 
 def case_token_path_and_code():
@@ -199,7 +200,7 @@ def case_token_path_and_code():
         T.check(H.TOKEN.encode() not in out and s.leaked() == [],
                 "the token is in no output of the app and on no disk (repo, HOME, TMPDIR, the recorder's files)",
                 str(s.leaked()))
-        T.check("[--no-confirm]" not in argv and "[--code]" in argv, "a plain connect asks the client for --code and nothing else")
+        T.check("[--no-confirm]" in argv and "[--code]" in argv, "a plain connect asks the client for --code and --no-confirm")
 
 
 def case_off_paths():
@@ -236,7 +237,10 @@ def case_flags():
         for args, rc, text in ((("--tailscale", "--relay", "http://127.0.0.1:1"), 2, "--relay and --tailscale are mutually exclusive"),
                                (("--tailscale", "--no-code"), 2, "belong to the relay transport"),
                                (("--relay",), 2, "--relay needs a URL"),
-                               (("--bg",), 64, "code pairing confirms at this terminal — drop --bg, add --no-confirm, or use the QR")):
+                               (("--confirm", "--bg"), 64, "--confirm asks at this terminal and --bg leaves it"),
+                               (("--confirm",), 64, "--confirm asks at this terminal and stdin is not one"),
+                               (("--confirm", "--no-confirm"), 2, "--confirm and --no-confirm are mutually exclusive"),
+                               (("--confirm", "--no-code"), 2, "cannot be combined with --no-code")):
             s.events("events-1", PAIR_INIT)
             app = s.app(*args, recorder=True)
             app.close_stdin()
@@ -253,8 +257,8 @@ def case_bg_with_no_confirm():
         rc = app.wait_exit(40)
         out = app.text()
         T.check(rc == 0 and "SESSION CODE:" in out and "running in background" in out
-                and out.count("--no-confirm trusts the relay to deliver the right keys") == 1,
-                "--bg --no-confirm: returns 0 once the code is on screen, the trust warning printed once", "rc %r %s" % (rc, app.tail()))
+                and out.count("No number to compare") == 1,
+                "--bg --no-confirm: returns 0 once the code is on screen, the no-compare trust note printed once", "rc %r %s" % (rc, app.tail()))
         T.check(len(s.relay.registrations) == 1 and s.relay.registrations[0]["token_ok"], "...and the window is registered with the relay")
         sid = s.relay.latest().id
         s.relay.inject_device_bound(sid, s.phone.pub_b64url, via="code")
@@ -281,7 +285,7 @@ def case_prompt():
         with AppScenario() as s:
             s.events("events-1", PAIR_INIT, WINDOW, REQUEST)
             s.events("events-2", then)
-            app = s.app(recorder=True, tty=True)
+            app = s.app("--confirm", recorder=True, tty=True)
             shown = app.wait_text("Approve [y/N]:", 40)
             if answer is None:
                 app.close_stdin()
@@ -303,12 +307,17 @@ def case_prompt():
                 T.check("SESSION CODE: 4SELK" in out and "type 4SELK." in out and "as @octocat can use it. Valid for 10 min." in out,
                         "the SESSION CODE block names the code, the GitHub login and the 10 minutes")
     with AppScenario() as s:
-        s.events("events-1", PAIR_INIT, WINDOW, dict(REQUEST, auto=True))
-        app = s.app("--no-confirm", recorder=True)
+        s.events("events-1", PAIR_INIT, WINDOW, {"event": "code_paired", "device_label": NASTY, "gh_login": "octo\x1bcat", "bound_at": 1},
+                 {"event": "device_bound", "bound_at": 1})
+        app = s.app(recorder=True)
         app.close_stdin()
-        app.wait_text("approved without asking", 40)
-        T.check("Approve [y/N]" not in app.text() and "[--no-confirm]" in s.read("argv") and "approved without asking" in app.text(),
-                "--no-confirm: the client is told, the prompt never appears, what was approved is still shown", app.tail())
+        app.wait_text("phone paired via code", 40)
+        out = app.text()
+        T.check("Approve [y/N]" not in out and "[--no-confirm]" in s.read("argv") and out.count("phone paired") == 1
+                and "relay-claimed device 'Evil[2J]0;pwnPhone', GitHub @octocat" in out
+                and has_none_of(app.out(), b"\x1b", b"\x07", b"\x00", "\u0085".encode(), "\u009b".encode()),
+                "default connect: the client is told --no-confirm, no prompt appears, a code bind is announced once as relay-claimed "
+                "(escape bytes of the phone's label and login gone)", app.tail())
     with AppScenario() as s:
         renewal = dict(PAIR_INIT, renewal=1)
         s.events("events-1", PAIR_INIT, WINDOW, renewal, dict(WINDOW, renewal=1), {"event": "code_window_closed", "reason": "expired"})
@@ -348,7 +357,7 @@ def case_identity_revoke():
 # -- one whole pairing -------------------------------------------------------------------------------
 def case_end_to_end():
     with AppScenario(relay=True) as s:
-        app = s.app("--relay", s.relay.url, tty=True)
+        app = s.app("--relay", s.relay.url, "--confirm", tty=True)
         T.check(app.wait_text("SESSION CODE:", 40), "end to end: the app prints the SESSION CODE after the relay verified the token", app.tail())
         sid = s.relay.latest().id
         s.relay.inject_device_bound(sid, s.phone.pub_b64url, via="code", device_label="Pixel 9a")
@@ -370,7 +379,7 @@ def case_end_to_end():
         T.check("phone paired" in app.text() and opened is not None and "state" in opened,
                 "end to end: y pairs the session and the first sealed state frame opens under the phone's key", app.tail())
     with AppScenario(relay=True) as s:
-        app = s.app("--relay", s.relay.url, tty=True)
+        app = s.app("--relay", s.relay.url, "--confirm", tty=True)
         app.wait_text("SESSION CODE:", 40)
         sid = s.relay.latest().id
         s.relay.inject_device_bound(sid, s.phone.pub_b64url, via="code")

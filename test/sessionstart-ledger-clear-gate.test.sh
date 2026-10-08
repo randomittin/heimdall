@@ -417,12 +417,22 @@ fi
 #                                           (the 09-14 loss of 16 commits)
 # Both are registered in hooks/hooks.metadata.json (ids above) and covered by
 # their own suites, so this tripwire fired for exactly the reason it exists.
+#
+# 12 -> 13 on 2026-10-08, one entry, known and advisory:
+#   SessionStart[12] pair-window-start   -- bin/heimdall-app pair-window: records the
+#                                           session in .heimdall/app/session.json and
+#                                           opens its pair-by-code window, so the code
+#                                           the statusline shows is always one a phone
+#                                           can type. Registered in
+#                                           hooks/hooks.metadata.json, switchable with
+#                                           `heimdall-hooks disable pair-window-start`,
+#                                           covered by test/app-pair-confirm.test.sh.
 # ══════════════════════════════════════════════════════════════════════════
 SS_COUNT="$(jq '.hooks.SessionStart | length' "$HOOKS_JSON")"
-if [ "$SS_COUNT" -eq 12 ]; then
-  ok "G9 all 12 SessionStart entries still present"
+if [ "$SS_COUNT" -eq 13 ]; then
+  ok "G9 all 13 SessionStart entries still present"
 else
-  bad "G9 expected 12 SessionStart entries, found $SS_COUNT"
+  bad "G9 expected 13 SessionStart entries, found $SS_COUNT"
 fi
 
 # The caveman `rules` entry specifically: it is the ONLY thing that puts hmd's

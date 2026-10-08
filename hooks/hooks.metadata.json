@@ -342,6 +342,16 @@
       "remote_toggle": false
     },
     {
+      "event": "SessionStart",
+      "index": 12,
+      "id": "pair-window-start",
+      "description": "Records this session (<repo>/.heimdall/app/session.json, 0600) so every reader of the 5-character session code agrees with the statusline, and -- when gh is signed in -- opens its pair-by-code window in the background (hmd app pair-window): a phone signed in to the same GitHub account that types the code pairs at once, with no number to compare and a notice in the session and on the statusline. Sends the laptop's gh token to the relay (over TLS, on a pipe) about once a minute for as long as the session lives and the window is unclaimed. Skipped when gh is signed out, in an unattended session (claude -p, an hmd sub-session) and under HMD_PAIR_WINDOW=0; disabling it (heimdall-hooks disable pair-window-start) leaves pairing to hmd app connect. Paired with pair-window-stop.",
+      "matcher": "",
+      "fingerprint": "0f85e8005296eac05f5d23be442e3145b9188efe62917468e1abbe680013a24d",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "SubagentStop",
       "index": 0,
       "id": "subagent-metric",
@@ -428,6 +438,16 @@
       "description": "Foreground, each alarm-bounded (10s): checkpoint write, then autocommit — the never-lose contract; both must land before the hook returns (a checkpoint written but not committed is lost on `git worktree remove`). Background: parallelism grade, verify-edits --quick, cleanup, reel, summary-card, context-sync; then the farewell.",
       "matcher": "",
       "fingerprint": "b6ac5b343006ce0e541f7ac3c352d6fccd75c8b3899adfa0bb547969f84994da",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
+      "event": "SessionEnd",
+      "index": 2,
+      "id": "pair-window-stop",
+      "description": "Forgets this session (removes <repo>/.heimdall/app/session.json when it names this session) and closes its pair-by-code window (hmd app pair-window --stop), which revokes its relay session. Disabling it with pair-window-start enabled leaves a window to end with the Claude process instead (its supervisor exits when that is gone).",
+      "matcher": "",
+      "fingerprint": "5d59c26d5f9e04495a380021de9f51401499b65065b08e2ed30154ae6be6e984",
       "locked": false,
       "remote_toggle": false
     },
