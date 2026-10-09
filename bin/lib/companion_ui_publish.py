@@ -34,6 +34,16 @@ src/contract/guards.ts, src/session/tabs/agents/parse.ts):
                 A turn is a line whether or not it has ended: hmd's mid-turn text (a
                 message that stops for a tool) is published as it is written, so the
                 phone is not silent while a long tool-using turn runs.
+                Phone messages are lines from the moment they are SENT: the inbox store
+                (companion_ui_inbox: inbox.jsonl pending, inbox-delivered.jsonl delivered) is read
+                every tick and each record is a `you` line at its send `ts`, so a message is on the
+                phone's chat before any hook pops it and keeps its send time after delivery. The
+                transcript's copy of a delivered message (the hook's attachment / Stop feedback, or
+                the prompt tmux typed) is dropped in favour of the record's line -- one line per
+                message, the record `id` the identity that carries it from pending to delivered --
+                and stays the fallback for a copy whose record the store no longer holds (see
+                merge_phone). `ask_id` / `via` on a record are never read: a sheet answer and a
+                chat message are the same line. The `hmd-question` panel below stays transcript-only.
   hmd-question  markdown  {"text": ...}  (<= 500 units: the cap every other string
                 leaf keeps), present only while the last thing in the conversation is
                 a FINAL hmd reply ending in `?` (bin/heimdall's INPUT convention) --
@@ -44,7 +54,10 @@ src/contract/guards.ts, src/session/tabs/agents/parse.ts):
 
 Stdlib only.
 """
+import bisect
+import collections
 import json
+import math
 import os
 import re
 import sys
@@ -54,6 +67,7 @@ from datetime import datetime
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+import companion_ui_inbox as INBOX  # noqa: E402
 import companion_ui_panels as P  # noqa: E402
 import hmd_session_resolve as SESSION  # noqa: E402
 
@@ -71,6 +85,11 @@ MAX_CANDIDATES = 8              # newest transcripts examined per tick
 TTL_MARGIN_S = 3600             # never publish what read_panels would reap within the hour (flap loop)
 ENVELOPE_SLACK = 512            # bytes of the panel file that are not `data`
 NEWLINE_MARK = " ⏎ "       # parse.ts NEWLINE_MARKER_RE / ' ?⏎ ?'
+PHONE_COPY_WINDOW_S = 120       # a hook's transcript copy of a delivery is written within this of the pop that stamped `delivered_at`
+PHONE_CLOCK_SKEW_S = 2          # ...and never before it by more than this (a transcript stamp is ms, never trusted to equal the pop's)
+TYPED_COPY_LAG_S = 900          # tmux types a delivery as a prompt, which queues behind a running turn for up to this long
+DELIVERED_TAIL_BYTES = 256 * 1024   # the newest archive lines read per change; the chat only ever shows the newest 200 lines
+MAX_PHONE_RECORDS = 400         # phone messages one merge considers (the newest)
 
 # Ported from hmdapp scripts/hmd-chat-panel.sh: harness-injected "prompts" that are
 # not something the operator typed.
@@ -139,9 +158,10 @@ def slug_dirs(root):
 
 def source_paths(root):
     """What the native publishers read, for `hmd ui --print-sources`: the TAIL of the
-    newest interactive session transcript of this repo, text blocks only."""
+    newest interactive session transcript of this repo, text blocks only, and the TAIL of the
+    inbox delivery archive (the pending inbox.jsonl is listed by the server itself)."""
     return ([os.path.join(d, "<session>.jsonl") for d in slug_dirs(root)]
-            + [os.path.join(root, ".heimdall", ".agents-count-cache")])
+            + [os.path.join(root, INBOX.DELIVERED_REL), os.path.join(root, ".heimdall", ".agents-count-cache")])
 
 
 def _default_read_tail(path, nbytes):
@@ -264,13 +284,15 @@ class _Part(object):
     single turn (see _merges). `final` is True for every `you` part and for an assistant text that
     ends its message (no tool, not stopped for one); mid-turn text is a part too, just not final.
     `key`/`line` memoize the formatted line on the FIRST part of a turn, valid for the (part
-    count, timestamp) it was formatted for."""
-    __slots__ = ("off", "role", "mid", "text", "final", "ts", "key", "line")
+    count, timestamp) it was formatted for. `phone` marks a `you` part that is an inbox-delivered
+    phone message (the hook's copy), as opposed to something the operator typed."""
+    __slots__ = ("off", "role", "mid", "text", "final", "ts", "key", "line", "phone")
 
-    def __init__(self, off, role, mid, text, final, ts):
+    def __init__(self, off, role, mid, text, final, ts, phone=False):
         self.off, self.role, self.mid, self.text, self.final, self.ts = off, role, mid, text, final, ts
         self.key = None
         self.line = None
+        self.phone = phone
 
 
 def entry_parts(e, off):
@@ -294,7 +316,7 @@ def entry_parts(e, off):
     phone = phone_messages(e)
     if phone:
         ts = _epoch(e.get("timestamp"), None)
-        return tuple(_Part(off, "you", None, t, True, ts) for t in phone)
+        return tuple(_Part(off, "you", None, t, True, ts, True) for t in phone)
     prompt = human_prompt(e)
     if prompt is None:
         return ()
@@ -305,6 +327,139 @@ def _merges(prev, cur):
     """True when `cur` continues `prev`'s turn: one assistant message arrives as one transcript
     entry per content block, all sharing the message id."""
     return cur.role == "hmd" and prev.role == "hmd" and bool(cur.mid) and prev.mid == cur.mid
+
+
+# ── phone messages, from the inbox store ─────────────────────────────────────
+PhoneMsg = collections.namedtuple("PhoneMsg", ("id", "ts", "delivered_at", "text", "key"))
+
+
+def _finite(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _phone_msg(r):
+    """The PhoneMsg of one store record, None when it cannot be placed in the chat (no usable `ts`
+    or text). `key` is the text with every whitespace run collapsed -- what a typed copy is matched
+    by. Nothing else on the record is read: `ask_id`, `via`, `source` and anything a later version
+    adds are not the chat's business, and a sheet answer is the same line as a chat message."""
+    ts, text = r.get("ts"), r.get("text")
+    if not _finite(ts) or not isinstance(text, str) or not text.strip():
+        return None
+    at, rid = r.get("delivered_at"), r.get("id")
+    return PhoneMsg(rid if isinstance(rid, str) else None, float(ts), float(at) if _finite(at) else None,
+                    text, " ".join(text.split()))
+
+
+def _store_stamp(path):
+    """(mtime_ns, size) of a store file, None when it is not there: what says the store moved."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _jsonl_tail(path, nbytes):
+    """The JSON objects on the last `nbytes` of `path`, oldest first; [] when it cannot be read. A
+    corrupt line, one that is not UTF-8, and the partial first line a seek lands in are skipped."""
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            f.seek(max(0, size - nbytes))
+            chunk = f.read()
+    except OSError:
+        return []
+    lines = chunk.split(b"\n")
+    if size > nbytes:
+        del lines[0]
+    out = []
+    for ln in lines:
+        try:
+            o = json.loads(ln.decode("utf-8"))
+        except ValueError:      # JSONDecodeError and UnicodeDecodeError both
+            continue
+        if isinstance(o, dict):
+            out.append(o)
+    return out
+
+
+def read_phone_records(root, since):
+    """The inbox store's phone messages that belong in the chat, oldest send first: every pending one
+    (companion_ui_inbox.list_pending) and every delivered one (the archive's tail) delivered no earlier
+    than `since` -- when the transcript window opens; an older delivery is another session's, and with no
+    window there is no delivered message to show. Pending is read before delivered, so a message popped
+    between the two reads is seen twice (merged by `id`, the delivered record wins) and never not at all.
+    Never raises: a store that cannot be read is an empty one, and nothing about a message is logged."""
+    try:
+        pending = INBOX.list_pending(root)
+    except (OSError, ValueError):
+        pending = []
+    by_id, anonymous = {}, []
+    for r in pending + _jsonl_tail(os.path.join(root, INBOX.DELIVERED_REL), DELIVERED_TAIL_BYTES):
+        m = _phone_msg(r)
+        if m is None or (m.delivered_at is not None
+                         and (since is None or m.delivered_at < since - PHONE_COPY_WINDOW_S)):
+            continue
+        if m.id is None:
+            anonymous.append(m)
+        else:
+            by_id[m.id] = m
+    return sorted(list(by_id.values()) + anonymous, key=lambda m: m.ts)[-MAX_PHONE_RECORDS:]
+
+
+def merge_phone(parts, msgs):
+    """`parts` (a transcript window) with the store's phone messages `msgs` as `you` parts at their SEND
+    time, and the transcript's own copy of each delivered one taken out -- one line per message.
+
+    A copy is found without trusting its text, which the hook rewrites (a run of backticks is spaced
+    out, a long delivery is cut, a batch is one folded block that cannot always be split back): a
+    phone part written within PHONE_COPY_WINDOW_S after a stored delivery's `delivered_at` (and no more
+    than PHONE_CLOCK_SKEW_S before it) is that delivery's copy. tmux delivers by typing: a typed `you`
+    part with the record's text (whitespace-collapsed, as tmux flattens a newline) within
+    TYPED_COPY_LAG_S after `delivered_at` is the copy of a delivery no hook copy claimed -- once per typed
+    part, so the operator's own later `yes` is never swallowed by an earlier delivered one. A copy with no
+    record behind it is not in `msgs` to be matched and stays as it was.
+
+    Placement is by time: a message goes before the first transcript part written after it, and
+    never inside a turn (the parts of one assistant message stay one line). A part with no timestamp
+    counts as written when the part before it was. Returns `parts` itself when `msgs` is empty."""
+    if not msgs:
+        return parts
+    drop, claimed = set(), set()
+    stamps = sorted({m.delivered_at for m in msgs if m.delivered_at is not None})
+    for p in parts:
+        if p.phone and p.ts is not None and stamps:
+            i = bisect.bisect_right(stamps, p.ts + PHONE_CLOCK_SKEW_S) - 1
+            if i >= 0 and p.ts - stamps[i] <= PHONE_COPY_WINDOW_S:
+                drop.add(id(p))
+                claimed.add(stamps[i])
+    typed = None
+    for m in msgs:
+        if m.delivered_at is None or m.delivered_at in claimed:
+            continue
+        if typed is None:
+            typed = {}
+            for p in parts:
+                if p.role == "you" and not p.phone and p.ts is not None:
+                    typed.setdefault(" ".join(p.text.split()), []).append(p)
+        for p in typed.get(m.key, ()):
+            if id(p) not in drop and m.delivered_at - PHONE_CLOCK_SKEW_S <= p.ts <= m.delivered_at + TYPED_COPY_LAG_S:
+                drop.add(id(p))
+                break
+    new = [_Part(-1, "you", None, m.text, True, m.ts) for m in msgs]
+    out, ni, written = [], 0, float("-inf")
+    for p in parts:
+        if id(p) in drop:
+            continue
+        if p.ts is not None and p.ts > written:
+            written = p.ts
+        if not (out and _merges(out[-1], p)):
+            while ni < len(new) and new[ni].ts < written:
+                out.append(new[ni])
+                ni += 1
+        out.append(p)
+    out.extend(new[ni:])
+    return out
 
 
 def clean_text(raw):
@@ -693,7 +848,17 @@ class ChatTail(object):
         fit_lines does; `question` is the hmd-question markdown when the NEWEST turn is a final
         hmd reply ending in `?`, else None. `fallback_ts` (the file's mtime) times a turn whose
         entry has no usable timestamp."""
-        parts = self._window()[0]
+        lines, last = self._turn_lines(self._window()[0], fallback_ts)
+        question = None
+        if last is not None and last[0].role == "hmd" and any(p.final for p in last):
+            text = "\n".join(p.text for p in last)
+            if is_question(text):
+                question = self._question(last[0], len(last), text)
+        return self.headless(), fit_lines(lines), question
+
+    def _turn_lines(self, parts, fallback_ts):
+        """(lines, newest turn) of `parts`: one formatted line per turn, the newest 200 (the panel's
+        capacity) found walking back from the end, returned oldest first."""
         lines, last = [], None
         i = len(parts)
         while i > 0 and len(lines) < P.MAX_LIST_ITEMS:
@@ -708,12 +873,18 @@ class ChatTail(object):
             if line:
                 lines.append(line)
         lines.reverse()
-        question = None
-        if last is not None and last[0].role == "hmd" and any(p.final for p in last):
-            text = "\n".join(p.text for p in last)
-            if is_question(text):
-                question = self._question(last[0], len(last), text)
-        return self.headless(), fit_lines(lines), question
+        return lines, last
+
+    def first_ts(self):
+        """When the window opens: the earliest timestamp among its parts, None when none has one."""
+        stamps = [p.ts for p in self._window()[0] if p.ts is not None]
+        return min(stamps) if stamps else None
+
+    def phone_lines(self, fallback_ts, msgs):
+        """The lines `view()` returns with the inbox store's phone messages `msgs` merged in (see
+        merge_phone). Only the lines: the hmd-question is the transcript's alone."""
+        lines, _ = self._turn_lines(merge_phone(self._window()[0], msgs), fallback_ts)
+        return fit_lines(lines)
 
     @staticmethod
     def _line(turn, fallback_ts):
@@ -746,7 +917,8 @@ class CompanionPublisher(object):
         self._read_tail = read_tail or _default_read_tail
         self._list_agents = list_agents
         self._tail_bytes = tail_bytes or _env_int("HMD_UI_CHAT_TAIL_BYTES", TAIL_BYTES_DEFAULT)
-        self._derived = None        # {"stamp", "mtime", "lines", "question"} of the transcript last read
+        self._derived = None        # {"stamp", "mtime", "lines", "question", "tail"} of the transcript last read
+        self._phone = None          # (change key, derived) of the last pass that merged the inbox store in
         self._tails = {}            # transcript path -> its ChatTail, least recently used first
         self._headless = set()      # transcripts known to be sdk/-p sessions
         self._written = {}          # panel id -> the content last written
@@ -785,9 +957,31 @@ class CompanionPublisher(object):
                 self._tails.pop(path, None)
                 continue
             _, lines, question = tail.view(mtime)
-            self._derived = {"stamp": stamp, "mtime": mtime, "lines": lines, "question": question}
+            self._derived = {"stamp": stamp, "mtime": mtime, "lines": lines, "question": question, "tail": tail}
             return self._derived
         return None
+
+    def _with_phone(self, derived):
+        """`derived` with the inbox store's phone messages in its chat lines (merge_phone). The
+        transcript-only lines stand when the store holds nothing for this chat, and when the merge
+        itself fails -- a bug here costs the phone lines, never the chat (the class is logged, never
+        a message). Re-derived only when the transcript or one of the two store files moved."""
+        tail = derived.get("tail")
+        if tail is None:
+            return derived
+        key = (derived["stamp"], _store_stamp(os.path.join(self.root, INBOX.INBOX_REL)),
+               _store_stamp(os.path.join(self.root, INBOX.DELIVERED_REL)))
+        if self._phone is not None and self._phone[0] == key:
+            return self._phone[1]
+        merged = derived
+        try:
+            msgs = read_phone_records(self.root, tail.first_ts())
+            if msgs:
+                merged = dict(derived, lines=tail.phone_lines(derived["mtime"], msgs))
+        except Exception as e:      # noqa: BLE001 -- an optional enrichment must not take the chat panel down with it
+            sys.stderr.write("hmd-ui: companion phone lines not merged: %s\n" % e.__class__.__name__)
+        self._phone = (key, merged)
+        return merged
 
     def _tail_of(self, path):
         """The ChatTail of `path`, kept for the next tick (the MAX_TAILS most recently used are)."""
@@ -890,6 +1084,7 @@ class CompanionPublisher(object):
         derived = self._refresh_derived(now)
         if derived is None:
             return False
+        derived = self._with_phone(derived)
         changed = self._publish_chat(derived, now)
         changed = self._publish_question(derived, now) or changed
         return self._publish_agents(now) or changed
