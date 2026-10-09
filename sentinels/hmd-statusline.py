@@ -521,36 +521,33 @@ _SESSION_CODE_LIB = os.path.join(BIN_DIR, "lib", "hmd_session_code.py")
 _PRIVATE_STATE_LIB = os.path.join(BIN_DIR, "lib", "hmd_private_state.py")
 
 
-def _session_code(session_id, cwd):
-    """The 5-char code identifying this session on the statusline — the SAME code
-    the companion app shows for the paired `hmd ui` backend on this repo
-    (bin/lib/hmd_session_code.py is the one place both this file and
-    sentinels/hmd-ui.py's /api/state read it from, so they can never disagree).
-
-    `session_id` first (the live Claude Code conversation id riding statusline's
-    stdin JSON — see `data.get("session_id")` in main() below); with none, the
-    session the SessionStart hook recorded for `cwd` (.heimdall/app/session.json),
-    then `cwd` itself — resolve_session_code's own precedence, the one every other
-    reader of this code (`hmd ui`, `hmd app`, the pair window) goes through.
+def _session_code(repo):
+    """The 5-char code shown on the statusline — the code of the REPO, the SAME one the
+    companion app is given for the paired `hmd ui` backend on it and `hmd app connect`,
+    the pair window and the relay client offer (bin/lib/hmd_session_code.py's
+    resolve_session_code is the one place every reader gets it from, so they can never
+    disagree). It is deliberately NOT a function of the Claude Code session id riding this
+    statusline's stdin: a repo has a new session at every start, resume and /clear, and a
+    code that changed with them would be one the phone no longer knows.
     The code is keyed by the machine's session-code seed, which a render only READS
     (create_seed=False -- the SessionStart hook, `hmd ui` and `hmd app` are what make it):
     a render writes nothing, so the same stdin renders the same bytes whatever the home
     directory is, and with no seed yet there is no code to show.
-    Never raises: a missing/broken lib, no seed yet, or neither input being a usable
-    string, is just another way to have no code — the caller renders nothing rather than
-    guess (fail OPEN, never a blank statusline over it)."""
+    Never raises: a missing/broken lib, no seed yet, or no usable repo path is just
+    another way to have no code — the caller renders nothing rather than guess (fail
+    OPEN, never a blank statusline over it)."""
     try:
         spec = importlib.util.spec_from_file_location("hmd_session_code", _SESSION_CODE_LIB)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        code, _source = mod.resolve_session_code(repo=cwd, session_id=session_id or None, create_seed=False)
+        code, _source = mod.resolve_session_code(repo, create_seed=False)
     except Exception:
         return None
     return code if isinstance(code, str) and code else None
 
 
 def _paired_note(cwd, code):
-    """`📱 <device> paired via code` while a phone that paired with THIS session's code is still connected, else
+    """`📱 <device> paired via code` while a phone that paired with THIS repo's code is still connected, else
     None. The relay client that bound it keeps <cwd>/.heimdall/app/paired-<code>.json (bin/heimdall-relay-client:
     via, the relay-claimed device label, pid) and removes it when it ends; a file whose process is gone -- a
     client killed without cleaning up -- counts for nothing. The label is the phone's own word, so only
@@ -2504,9 +2501,14 @@ def main():
     # wall — because those match on what the ledger and the roster already know him as.
     # Row1 is the one place a human is being INTRODUCED, so it is the one place that spends
     # a lookup on the name that human answers to in public.
-    session_code = _session_code(session_id, cwd)
+    # The code is the repo's, keyed on the directory Claude Code was started in (workspace.project_dir -- what
+    # CLAUDE_PROJECT_DIR names for every hook and for `hmd app connect` run from a session), not on the live cwd,
+    # which follows a `cd` into a subdirectory and would show another repo path's code there.
+    project_dir = ws.get("project_dir")
+    code_dir = project_dir if isinstance(project_dir, str) and project_dir.strip() else cwd
+    session_code = _session_code(code_dir)
     left1 = row1_left(_github_handle(cwd, handle), model, repo_seg, cseg, avail1,
-                       code=session_code, paired=_paired_note(cwd, session_code))
+                       code=session_code, paired=_paired_note(code_dir, session_code))
 
     # ── Row2 — the context gauge (CTX%·↓tokens on the fill, $cost on the track end) ──
     # narrow → bar-only (labels off). render_gauge splices the labels inside the bar's cell

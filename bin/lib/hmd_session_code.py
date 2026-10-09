@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""hmd_session_code.py -- deterministic 5-char code identifying an hmd session
-(stdlib only, no runtime deps).
+"""hmd_session_code.py -- the deterministic 5-char code a repo is paired by, and the record of which Claude Code
+sessions are alive in it (stdlib only, no runtime deps).
 
 WHY THIS EXISTS
 The companion app (/Users/rj/Downloads/hmdapp) shows each paired `hmd ui` backend
@@ -11,14 +11,12 @@ draws 5 characters from crypto-random bytes and retries on collision against
 the codes already assigned to other sessions paired on that device
 (src/store/sessions.ts holds the assignment). There is no derivation there to
 match -- the value is random, chosen once, and never a function of anything
-hmd knows (not the session id, not the repo). That makes hmd, not the app,
-the only place a DETERMINISTIC code can live: the same input always produces
-the same code here, so sentinels/hmd-statusline.py and sentinels/hmd-ui.py's
-/api/state both read it from this ONE module and can never disagree with
-each other. The app's own generator is unchanged by this file; matching its
-alphabet (below) is what lets a code minted here already pass the app's own
-validation the day it switches to reading this value instead of rolling its
-own -- see the coder's report for the exact one-line change that needs.
+hmd knows. That makes hmd, not the app, the only place a DETERMINISTIC code can
+live: the same input always produces the same code here, so sentinels/hmd-statusline.py
+and sentinels/hmd-ui.py's /api/state both read it from this ONE module and can
+never disagree with each other. The app's own generator is unchanged by this file;
+matching its alphabet (below) is what lets a code minted here already pass the app's
+own validation the day it switches to reading this value instead of rolling its own.
 
 ALPHABET -- matches hmdapp's CODE_ALPHABET EXACTLY (src/sessioncode/code.ts):
 
@@ -40,12 +38,14 @@ DERIVATION
            HMAC-SHA256(seed, "hmd-session-code-v1" 0x00 kind 0x00 input.encode("utf-8")),
     MSB-first, cut into five 5-bit groups, each indexing CODE_ALPHABET.
 
-`input` is the Claude Code session_id when the caller has one (the live
-identifier riding statusLine's stdin JSON, one per Claude Code conversation);
-otherwise the repo's filesystem path; `kind` says which of the two it is. The
-same input always gives the same code ON ONE MACHINE. Two different inputs
-collide only by the ordinary odds of a 25-bit hash (1 in 2**25 per pair -- see
-test/hmd-session-code.test.sh's 50-input probabilistic no-collision case).
+What a person is shown is ALWAYS the code of the REPO: kind "repo", input canonical_repo(path) -- the real path,
+links resolved. It is a function of the repo and the machine's seed and of nothing else: not of the Claude Code
+session (a repo has a new one at every start, resume and /clear, and several at once), not of who asks, not of
+whether a session record exists. The statusline, `hmd ui`'s /api/state, bin/lib/hmd_app_code.py, `hmd app connect`,
+the pair window and the relay client (which renders the same /api/state for the phone) all get it from
+resolve_session_code, so a code typed from any one of them is the code every other one offers, and the code a phone
+holds is still the right one after the session it was read from has ended. session_code_for itself is the primitive
+under that (it can also hash a bare session id, kind "session_id"; no hmd surface shows such a code).
 
 THE SEED. The code is a bearer secret: typed on a phone signed in to the same
 GitHub account it pairs that phone, with no number to compare. So it must not be
@@ -66,37 +66,26 @@ the statusline (create_seed=False): a render writes nothing, so the same stdin
 renders the same bytes whatever the home directory is, and until a seed exists the
 statusline shows no code rather than one nobody registered.
 
-ONE CODE, WHOEVER ASKS (resolve_session_code)
-The statusline hashes the live session_id on its stdin; a process that is NOT
-Claude Code's statusline -- `hmd ui`'s /api/state, `hmd app connect` run from a
-plain terminal, the pair window -- has no such stdin, and used to fall back to the
-repo path, so the code it showed or registered was not the one typed from the
-statusline. The SessionStart hook now records the live session in
-<repo>/.heimdall/app/session.json {session_id, pid, ts} (0600; record_session) and
-removes it at SessionEnd (forget_session). resolve_session_code is the ONE function
-every reader goes through, with one precedence:
-    1. the caller's own live session id (the statusline's stdin);
-    2. a pinned id (the session this process inherited, when it names one of the
-       repo's own transcripts -- sentinels/hmd-ui.py's repo_session);
-    3. the session recorded in session.json, while the pid it names is alive --
-       and only a file this user wrote: it is read through hmd_private_state.read,
-       so a link, a file of someone else's, or one a git checkout planted (0644)
-       is no session;
-    4. the repo path.
-The statusline, /api/state, bin/lib/hmd_app_code.py and `hmd app` therefore agree by
-construction: they differ only when no session is known to any of them.
+LIVE SESSIONS (record_session, live_sessions, forget_session)
+The code does not need them; the pair window does. A repo's window must outlive any one session of it and end when none
+is left, so the SessionStart hook records each session in <repo>/.heimdall/app/sessions/<session id>.json
+{session_id, pid, ts[, transcript]} (0600, written through hmd_private_state: no link followed) and the SessionEnd hook
+removes it. live_sessions lists the ones whose Claude process is still alive -- and only files this user wrote: a link,
+a file of someone else's or one a git checkout planted (0644) is no session -- and the newest modification time of their
+transcripts, the "activity" the window's idle stop watches across all of them.
 
 CLI
-    python3 hmd_session_code.py --session-id ID     code for that session
-    python3 hmd_session_code.py --repo DIR          code for that repo
-    python3 hmd_session_code.py --repo DIR --json   {"code": ..., "source": ...}
-    python3 hmd_session_code.py --record-session --repo DIR --session-id ID --pid N
-                                                    write DIR/.heimdall/app/session.json
+    python3 hmd_session_code.py --repo DIR            the repo's code (what every surface shows)
+    python3 hmd_session_code.py --repo DIR --json     {"code": ..., "source": "repo"}
+    python3 hmd_session_code.py --session-id ID       the code a bare session id hashes to (a primitive, shown nowhere)
+    python3 hmd_session_code.py --record-session --repo DIR --session-id ID --pid N [--transcript FILE]
+                                                      write DIR/.heimdall/app/sessions/ID.json
     python3 hmd_session_code.py --forget-session --repo DIR --session-id ID
-                                                    remove it, when it names ID
+                                                      remove it
+    python3 hmd_session_code.py --live-sessions --repo DIR
+                                                      {"sessions": N, "activity": T} over the live ones
 
---session-id wins when both are given, matching session_code_for()'s own
-precedence below.
+--session-id wins over --repo for the code, matching session_code_for()'s own precedence below.
 """
 import hashlib
 import hmac
@@ -108,11 +97,10 @@ CODE_LENGTH = 5
 _BITS_PER_CHAR = 5                            # 2**5 == len(CODE_ALPHABET)
 _TOTAL_BITS = _BITS_PER_CHAR * CODE_LENGTH    # 25
 
-SESSION_FILE_REL = os.path.join(".heimdall", "app", "session.json")
-_APP_REL = ".heimdall/app"
-_SESSION_NAME = "session.json"
+SESSIONS_REL = ".heimdall/app/sessions"
 _SID_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 _SID_MAX = 128
+_TRANSCRIPT_MAX = 2000                        # a record is read back at most hmd_private_state.READ_LIMIT (4096) bytes long
 
 _KEY_NAME = "session-code.key"
 _KEY_HEX = frozenset("0123456789abcdef")
@@ -171,13 +159,23 @@ def _seed(create=True):
     return _SEEDS[home]
 
 
+def canonical_repo(repo):
+    """The one spelling of a repo's path that its code is keyed on: ~ expanded, links and `..` resolved. Every reader
+    reaches the code through here (resolve_session_code), so a path given as a link, a relative path or with a
+    trailing slash is the same repo. ValueError when `repo` is not a non-empty string."""
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError("canonical_repo: need a non-empty repo path")
+    return os.path.realpath(os.path.expanduser(repo))
+
+
 def session_code_for(session_id=None, repo=None, create_seed=True):
     """(code, source) for `session_id` if it is a non-empty string, else for
     `repo` if IT is a non-empty string. `source` is the literal string
     "session_id" or "repo" naming which one won, so a caller (or a test)
     never has to re-derive that from the inputs. `create_seed=False` makes the
     machine's seed if it is missing no more than a ValueError: a caller that
-    must write nothing asks that way.
+    must write nothing asks that way. This is the primitive: it keys on the string it is given, and
+    what a person is shown is resolve_session_code's -- the repo's, canonicalised.
 
     Raises ValueError when neither argument is a usable non-empty string, or when
     the machine's seed cannot be read (THE SEED, in the module docstring).
@@ -203,6 +201,14 @@ def session_code_for(session_id=None, repo=None, create_seed=True):
     return "".join(chars), source
 
 
+def resolve_session_code(repo, create_seed=True):
+    """(code, "repo"): THE derivation every reader of "this repo's code" goes through (see DERIVATION in the module
+    docstring): the code of canonical_repo(repo), whoever asks and whatever Claude Code session -- if any -- they are in.
+    Raises ValueError when there is no repo path, or no seed (with `create_seed=False`, none YET: the statusline passes
+    it, since a render writes nothing)."""
+    return session_code_for(repo=canonical_repo(repo), create_seed=create_seed)
+
+
 def valid_session_id(session_id):
     """A Claude Code session id as a file-name-safe key: 1..128 of [A-Za-z0-9_-]."""
     return (isinstance(session_id, str) and 0 < len(session_id) <= _SID_MAX
@@ -221,70 +227,81 @@ def _pid_alive(pid):
     return True
 
 
-def session_file(repo):
-    return os.path.join(repo, SESSION_FILE_REL)
+def _record_name(session_id):
+    return session_id + ".json"
 
 
-def live_session_id(repo):
-    """The session id <repo>/.heimdall/app/session.json records, while that file is a regular file this user wrote
-    (hmd_private_state.read: no link anywhere below the repo, ours, 0600), whole, and the process it names is alive;
-    else None. Never raises: a missing, torn, planted or foreign-looking file is no session."""
-    if not isinstance(repo, str) or not repo.strip():
-        return None
-    try:
-        rec = _private().read_json(repo, _APP_REL, _SESSION_NAME)
-    except Exception:
-        return None
-    if rec is None:
-        return None
-    sid = rec.get("session_id")
-    if not valid_session_id(sid) or not _pid_alive(rec.get("pid")):
-        return None
-    return sid
-
-
-def resolve_session_code(repo=None, session_id=None, pinned_session_id=None, create_seed=True):
-    """(code, source): THE derivation every reader of "this session's code" goes through (see ONE CODE, WHOEVER
-    ASKS in the module docstring). `session_id` is the caller's own live id (the statusline's stdin),
-    `pinned_session_id` an id the caller inherited that names one of the repo's own transcripts. Raises
-    ValueError exactly when session_code_for would: no session known and no repo path to fall back to, or no seed
-    (with `create_seed=False`, none YET: the statusline passes it, since a render writes nothing)."""
-    sid = None
-    for candidate in (session_id, pinned_session_id):
-        if isinstance(candidate, str) and candidate.strip():
-            sid = candidate
-            break
-    if sid is None:
-        sid = live_session_id(repo)
-    return session_code_for(session_id=sid, repo=repo, create_seed=create_seed)
-
-
-def record_session(repo, session_id, pid):
-    """Write <repo>/.heimdall/app/session.json {session_id, pid, ts}: 0600, atomically, the directory 0700, through
-    hmd_private_state.write -- a link anywhere below the repo, or a directory of someone else's, is refused (OSError)
-    with nothing created, chmod'ed or written through it. `pid` is the Claude Code process that owns the session --
-    the file only counts while it is alive. Raises ValueError for an id or pid that could not have come from Claude
-    Code."""
+def record_session(repo, session_id, pid, transcript=None):
+    """Write <repo>/.heimdall/app/sessions/<session_id>.json {session_id, pid, ts[, transcript]}: 0600, atomically, the
+    directories 0700, through hmd_private_state.write -- a link anywhere below the repo, or a directory of someone else's,
+    is refused (OSError) with nothing created, chmod'ed or written through it. `pid` is the Claude Code process that owns
+    the session -- the record only counts while it is alive. `transcript` is the session's transcript (an absolute path,
+    which is kept; anything else is not): its modification time is the session's activity. Raises ValueError for an id
+    or pid that could not have come from Claude Code."""
     import json
     import time
     if not valid_session_id(session_id):
         raise ValueError("record_session: not a session id: %r" % (session_id,))
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         raise ValueError("record_session: not a pid: %r" % (pid,))
-    body = json.dumps({"session_id": session_id, "pid": pid, "ts": int(time.time())},
-                      sort_keys=True, separators=(",", ":"))
-    _private().write(repo, _APP_REL, _SESSION_NAME, body.encode("utf-8"))
-    return session_file(repo)
+    rec = {"session_id": session_id, "pid": pid, "ts": int(time.time())}
+    if isinstance(transcript, str) and os.path.isabs(transcript) and len(transcript) <= _TRANSCRIPT_MAX and "\x00" not in transcript:
+        rec["transcript"] = transcript
+    _private().write(repo, SESSIONS_REL, _record_name(session_id),
+                     json.dumps(rec, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return os.path.join(repo, SESSIONS_REL, _record_name(session_id))
 
 
 def forget_session(repo, session_id):
-    """Remove session.json when -- and only when -- it names `session_id`: a session that started later in the same
-    repo owns the file now, and an earlier one ending must not take its record away. True when removed."""
-    private = _private()
-    rec = private.read_json(repo, _APP_REL, _SESSION_NAME)
-    if rec is None or rec.get("session_id") != session_id:
+    """Remove the record of `session_id`. True when it was removed. Other sessions' records are untouched: a repo has
+    several sessions at once, and one ending must not take another's away."""
+    if not valid_session_id(session_id):
         return False
-    return private.remove(repo, _APP_REL, _SESSION_NAME)
+    return _private().remove(repo, SESSIONS_REL, _record_name(session_id))
+
+
+def live_sessions(repo):
+    """[{"session_id", "pid", "transcript"}] for every session recorded for `repo` whose process is alive. A record whose
+    process is gone is removed on the way (a Claude that was killed runs no SessionEnd hook). Only a record this user
+    wrote counts (hmd_private_state.read_json: no link, ours, 0600); one that is not, or that names another session than
+    its file does, is skipped and left alone. Never raises: no directory is no session."""
+    private = _private()
+    live = []
+    try:
+        names = private.names(repo, SESSIONS_REL)
+    except Exception:
+        return live
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        sid = name[:-len(".json")]
+        try:
+            rec = private.read_json(repo, SESSIONS_REL, name)
+        except Exception:
+            continue
+        if rec is None or rec.get("session_id") != sid or not valid_session_id(sid):
+            continue
+        if not _pid_alive(rec.get("pid")):
+            private.remove(repo, SESSIONS_REL, name)
+            continue
+        transcript = rec.get("transcript")
+        live.append({"session_id": sid, "pid": rec["pid"], "transcript": transcript if isinstance(transcript, str) else None})
+    return live
+
+
+def sessions_activity(sessions):
+    """The newest modification time (epoch seconds, an int) of the transcripts of `sessions` (live_sessions' answer) that
+    exist, 0 when none does: the last time anything happened in any session of the repo."""
+    newest = 0
+    for rec in sessions:
+        path = rec.get("transcript")
+        if not path:
+            continue
+        try:
+            newest = max(newest, int(os.stat(path).st_mtime))
+        except OSError:
+            continue
+    return newest
 
 
 def main(argv=None):
@@ -298,43 +315,54 @@ def main(argv=None):
 
     parser = argparse.ArgumentParser(
         prog="hmd_session_code.py",
-        description="Deterministic 5-char hmd session code (stdlib only).",
+        description="The 5-char hmd code of a repo (stdlib only), and the record of the sessions alive in it.",
     )
-    parser.add_argument("--session-id", default=None, help="Claude Code session_id")
-    parser.add_argument("--repo", default=None, help="repo path (fallback input)")
+    parser.add_argument("--session-id", default=None, help="Claude Code session_id (hashed as-is by the code form: a "
+                                                          "primitive, shown nowhere; the key of a session record)")
+    parser.add_argument("--repo", default=None, help="repo path: the code every hmd surface shows is this repo's")
     parser.add_argument("--json", action="store_true", help='emit {"code": ..., "source": ...}')
     parser.add_argument("--record-session", action="store_true",
-                        help="write <repo>/.heimdall/app/session.json for --session-id, owned by --pid")
+                        help="write <repo>/.heimdall/app/sessions/<id>.json for --session-id, owned by --pid")
     parser.add_argument("--forget-session", action="store_true",
-                        help="remove <repo>/.heimdall/app/session.json if it names --session-id")
+                        help="remove <repo>/.heimdall/app/sessions/<id>.json")
+    parser.add_argument("--live-sessions", action="store_true",
+                        help='print {"sessions": N, "activity": T} for the sessions recorded in --repo whose process lives')
     parser.add_argument("--pid", type=int, default=None, help="the Claude Code process (with --record-session)")
+    parser.add_argument("--transcript", default=None, help="the session's transcript, an absolute path (with --record-session)")
     args = parser.parse_args(argv)
 
-    if args.record_session or args.forget_session:
-        if args.record_session and args.forget_session:
-            print("error: --record-session and --forget-session are exclusive", file=sys.stderr)
+    if args.record_session or args.forget_session or args.live_sessions:
+        if args.record_session + args.forget_session + args.live_sessions > 1:
+            print("error: --record-session, --forget-session and --live-sessions are exclusive", file=sys.stderr)
             return 2
-        if not args.repo or not args.session_id or (args.record_session and args.pid is None):
-            print("error: --record-session needs --repo, --session-id and --pid; "
-                  "--forget-session needs --repo and --session-id", file=sys.stderr)
+        needs_session = args.record_session or args.forget_session
+        if not args.repo or (needs_session and not args.session_id) or (args.record_session and args.pid is None):
+            print("error: --record-session needs --repo, --session-id and --pid; --forget-session needs --repo and "
+                  "--session-id; --live-sessions needs --repo", file=sys.stderr)
             return 2
         try:
             if args.record_session:
-                record_session(args.repo, args.session_id, args.pid)
+                record_session(args.repo, args.session_id, args.pid, args.transcript)
                 # a recorded session is one the statusline is about to show a code for, and the statusline only READS the
                 # seed (it writes nothing at render): this is where it comes to exist. Best effort -- no seed, no code shown
                 import contextlib
                 with contextlib.suppress(ValueError):
                     _seed()
-            else:
+            elif args.forget_session:
                 forget_session(args.repo, args.session_id)
+            else:
+                sessions = live_sessions(args.repo)
+                print(json.dumps({"sessions": len(sessions), "activity": sessions_activity(sessions)}))
         except (ValueError, OSError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         return 0
 
     try:
-        code, source = session_code_for(session_id=args.session_id, repo=args.repo)
+        if args.session_id:
+            code, source = session_code_for(session_id=args.session_id, repo=args.repo)
+        else:
+            code, source = resolve_session_code(args.repo)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

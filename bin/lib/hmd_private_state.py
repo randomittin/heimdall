@@ -197,6 +197,21 @@ def read_json(root, rel, name, limit=READ_LIMIT):
     return obj if isinstance(obj, dict) else None
 
 
+def names(root, rel):
+    """The names in <root>/<rel>, sorted: [] when it is missing or the way to it is not a plain directory of ours. The
+    names are only names -- read() and read_json() vet each file before anything is believed. Creates nothing."""
+    try:
+        dirfd = open_dir(root, rel, False)
+    except OSError:
+        return []
+    try:
+        return sorted(os.listdir(dirfd))
+    except OSError:
+        return []
+    finally:
+        os.close(dirfd)
+
+
 def remove(root, rel, name):
     """Unlink <root>/<rel>/<name> (a link goes as a link, never followed) through the vetted directory. True when it
     went; False when it was not there or the way to it is not a plain directory of ours."""
