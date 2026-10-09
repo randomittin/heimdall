@@ -352,6 +352,26 @@
       "remote_toggle": false
     },
     {
+      "event": "SessionStart",
+      "index": 13,
+      "id": "inbox-wake-register",
+      "description": "Records this session's wake coordinates for bin/heimdall-inbox-wake: its pid, terminal and, when it runs inside tmux, its own pane (TMUX_PANE, validated as %N, plus the tmux socket) under <repo>/.heimdall/ui/wake/<pid>.json at 0600, and prunes records of dead sessions. Attended sessions only (never headless claude -p / SDK or an hmd sub-session). Reads the hook payload on stdin, changes nothing else, exits 0 on every path.",
+      "matcher": "",
+      "fingerprint": "122090db1ff14a2241322f04f5fb7a61818a766947f9586f3baa4f697438bdcf",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
+      "event": "SessionStart",
+      "index": 14,
+      "id": "inbox-wake-arm-start",
+      "description": "Starts bin/heimdall-inbox-wake watch as an asyncRewake hook (runs in the background; exit 2 wakes the model) so a session left idle at an empty prompt from the start is woken when a phone message arrives. One watcher per session (a second exits at once), woken-once per record id, bounded to 8h (the hook timeout) and re-armed by inbox-wake-arm-stop. The wake text is a constant and carries no phone text; the inbox-deliver hooks still hand the message over behind their provenance marker. Fires only for a pending record the paired phone wrote, while the session is idle, no Stop hold is live and nobody is typing.",
+      "matcher": "",
+      "fingerprint": "94f76df2d5906716bb081dc8b2ae09f495221afbdd453c245ba08b6c7bfb32d6",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
       "event": "SubagentStop",
       "index": 0,
       "id": "subagent-metric",
@@ -418,6 +438,16 @@
       "description": "Delivers companion-app inbox messages via heimdall-inbox-deliver stop. With the inbox empty it long-polls when a companion is connected (a live <repo>/.heimdall/app/connect.json; attended sessions only -- never headless claude -p or hmd sub-sessions) after ANY last message, up to 300s (hook timeout 330), or when hmd's last message ended in a question, up to 240s. Either hold ends the moment the session's terminal is read (the operator typing, or a prompt just sent; on macOS only while a keyboard or pointer was used in the last 10s, so a terminal focus report with nobody there does not count), because a prompt typed behind a running Stop hook queues until it exits; whatever is queued then rides that prompt via the UserPromptSubmit hook. HMD_INBOX_TTY=off disables that release and a path pins the terminal; HMD_INBOX_PRESENCE_CMD replaces the keyboard-idle source; with no terminal or no ps the hold runs unchanged. HMD_INBOX_GATED=1 keeps the question wait off (near-instant return) unless <repo>/.heimdall/ui/inbox.wait exists, so opting in to the 240s question wait requires that marker file; a connected companion is the implicit opt-in for the 300s wait. Export HMD_INBOX_WAIT_S=0 to never hold a turn.",
       "matcher": "",
       "fingerprint": "18525a6125fbcbde7cc1c65e91604dbfa1cbe6fe1a3f294df559693052cc3fd2",
+      "locked": false,
+      "remote_toggle": false
+    },
+    {
+      "event": "Stop",
+      "index": 5,
+      "id": "inbox-wake-arm-stop",
+      "description": "Re-arms bin/heimdall-inbox-wake watch (asyncRewake) at the end of every turn, so a session that has just gone idle is woken when a phone message arrives later -- including after the 300s Stop hold of inbox-deliver-stop has ended. A watcher that is already armed for the session makes this a no-op. Same constant wake text, same once-per-record ledger and same 8h bound as inbox-wake-arm-start.",
+      "matcher": "",
+      "fingerprint": "71d683a803e725cc40b3442b8a957d994d58b932a05038de0713177dbeac33cc",
       "locked": false,
       "remote_toggle": false
     },

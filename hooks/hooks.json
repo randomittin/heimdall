@@ -309,6 +309,25 @@
             "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled pair-window-start && exit 0; INPUT=$(cat); APP=\"$HMDP/bin/heimdall-app\"; [ -x \"$APP\" ] || exit 0; SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); [ -n \"$SID\" ] || exit 0; TP=$(printf '%s' \"$INPUT\" | jq -r '.transcript_path // empty' 2>/dev/null || true); ( \"$APP\" pair-window --session \"$SID\" --pid \"$PPID\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" ${TP:+--transcript \"$TP\"} >/dev/null 2>&1 & ); exit 0"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled inbox-wake-register && exit 0; HOOK=\"$HMDP/bin/heimdall-inbox-wake\"; [ -x \"$HOOK\" ] || exit 0; \"$HOOK\" register --repo \"${CLAUDE_PROJECT_DIR:-.}\" --pid \"$PPID\"; exit 0",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled inbox-wake-arm-start && exit 0; HOOK=\"$HMDP/bin/heimdall-inbox-wake\"; [ -x \"$HOOK\" ] || exit 0; exec \"$HOOK\" watch --repo \"${CLAUDE_PROJECT_DIR:-.}\" --pid \"$PPID\"",
+            "timeout": 28800,
+            "asyncRewake": true
+          }
+        ]
       }
     ],
     "SubagentStop": [
@@ -368,6 +387,16 @@
             "type": "command",
             "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled inbox-deliver-stop && exit 0; PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-inbox-deliver\"; REPO=\"${CLAUDE_PROJECT_DIR:-.}\"; if [ -x \"$HOOK\" ]; then if [ -f \"$REPO/.heimdall/ui/inbox.wait\" ]; then \"$HOOK\" stop --repo \"$REPO\"; else HMD_INBOX_GATED=1 \"$HOOK\" stop --repo \"$REPO\"; fi; fi; exit 0",
             "timeout": 330
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HMDP=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; [ -r \"$HMDP/bin/lib/hook-enabled.sh\" ] && . \"$HMDP/bin/lib/hook-enabled.sh\" 2>/dev/null && ! hmd_hook_enabled inbox-wake-arm-stop && exit 0; HOOK=\"$HMDP/bin/heimdall-inbox-wake\"; [ -x \"$HOOK\" ] || exit 0; exec \"$HOOK\" watch --repo \"${CLAUDE_PROJECT_DIR:-.}\" --pid \"$PPID\"",
+            "timeout": 28800,
+            "asyncRewake": true
           }
         ]
       }
