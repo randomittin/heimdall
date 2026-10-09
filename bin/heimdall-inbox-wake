@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""heimdall-inbox-wake -- wake an IDLE Claude Code session when a phone message lands.
+
+WHY. bin/heimdall-inbox-deliver hands a queued phone message to a session at a hook
+boundary (prompt, tool, Stop). A session left at an empty prompt has no boundary: the
+Stop long-poll ends after 300s and nothing runs until the operator types (measured: a
+phone "yes" waited 2h40m, docs/HANDOFF-TO-HEIMDALL-phone-replies-reach-session.md G2).
+This tool is the missing trigger. It never carries the message: it only makes the
+session take a turn, and the deliver hooks hand the content over behind their
+provenance marker exactly as before.
+
+MECHANISMS (Claude Code 2.1.295, checked against the installed binary and a live pty run):
+  rewake  Claude Code's hook field asyncRewake runs a hook in the background and, when it
+          exits 2, queues a task-notification (priority next) whose body is the hook's
+          stderr. `watch` is that hook: it blocks until a phone message is pending, the
+          session is idle and nobody is holding or typing, then prints WAKE_NOTICE (fixed
+          text) to stderr and exits 2. Works in any terminal.
+  tmux    When the session was started inside tmux, `register` (SessionStart) recorded its
+          pane. `watch` types WAKE_PROMPT (fixed text) plus Enter into THAT pane, so the
+          wake is a real user turn and the UserPromptSubmit hook delivers the message in
+          it. Only after the pane is proven to be this session's own and the terminal has
+          been unread for TMUX_QUIET_S (a half-typed draft is never submitted).
+
+SECURITY. A wake needs a pending record with source "companion" -- the one value
+bin/lib/companion_ui_inbox.append writes, reached only through the paired device's
+authenticated route. Nothing from a message reaches the wake: both texts are constants,
+the pane is read from the session's own SessionStart record and re-proven by process
+ancestry, and the message itself still arrives through the marked delivery hooks.
+
+BOUNDS. One watcher per session (flock on wake/<pid>.lock, freed by the kernel on any
+death). One wake per record id (inbox-wake.json ledger, capped), so a delivery hook that is
+switched off cannot turn one message into a wake loop. Lifetime capped (HMD_INBOX_WAKE_MAX_S,
+default 8h; hooks.json's timeout matches and the next Stop re-arms). It looks once a second
+with a stat, spawns nothing while the inbox is empty, and exits when its session dies.
+Every path exits 0 except a wake, which exits 2 -- a bug here never blocks a hook.
+
+Modes:
+  register   SessionStart hook (stdin JSON). Records this session's pane/terminal under
+             <repo>/.heimdall/ui/wake/<pid>.json (0600) and prunes dead sessions.
+  watch      The asyncRewake hook (also armed on every Stop). Exit 2 = wake the model.
+  status     Prints {"watchers": N, "registered": N} for the repo.
+Args: --repo DIR  --pid CLAUDE_PID (the hook shell's $PPID).
+Env:  HMD_INBOX_WAKE=off|rewake|tmux (default: tmux where proven, else rewake), HMD_INBOX_WAKE_MAX_S,
+      HMD_INBOX_WAKE_POLL_S, HMD_INBOX_WAKE_TMUX_QUIET_S, HMD_CLAUDE_SESSIONS_DIR (status files).
+"""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+SOURCE = "companion"                       # companion_ui_inbox.append's record source
+WAKE_PROMPT = "phone message waiting"      # typed into the pane: constant, never message text
+WAKE_NOTICE = ("A message from the operator's paired phone is waiting in the companion inbox. "
+               "This notice carries no message text: the companion inbox hook hands it over, "
+               "marked as data from the phone, at your next tool call or prompt. "
+               "Make one harmless tool call (for example `true` in Bash) to receive it now.")
+PROGRAMMATIC_ENTRYPOINTS = frozenset(("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action"))
+SWITCHED_OFF = frozenset(("off", "0", "false", "no", "none"))
+PANE_RE = re.compile(r"^%[0-9]{1,9}$")
+HOLD_FRESH_S = 4.0            # inbox-waiting (the Stop hold's heartbeat) younger than this: a hold will deliver
+TYPING_RECENT_S = 10.0        # a terminal read this recently: somebody is at the keyboard
+DEFAULT_POLL_S = 1.0
+DEFAULT_MAX_S = 8 * 3600.0
+DEFAULT_TMUX_QUIET_S = 30.0
+LEDGER_CAP = 200
+PROBE_TIMEOUT_S = 3.0
+ANCESTOR_HOPS = 16
+MAX_INBOX_READ = 4 * 1024 * 1024
+
+
+def env_float(name, default):
+    try:
+        v = float(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+    return v if v >= 0 else default
+
+
+def ui_paths(root):
+    d = os.path.join(root, ".heimdall", "ui")
+    return {"dir": d, "inbox": os.path.join(d, "inbox.jsonl"), "waiting": os.path.join(d, "inbox-waiting"),
+            "ledger": os.path.join(d, "inbox-wake.json"), "ledger_lock": os.path.join(d, "inbox-wake.lock"),
+            "wake": os.path.join(d, "wake")}
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def write_json_0600(path, obj):
+    ensure_dir(os.path.dirname(path))
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(tmp, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def read_json(path, cap=65536):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.loads(f.read(cap))
+    except (OSError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def attended_session():
+    # Same rule as bin/heimdall-inbox-deliver: headless claude -p / SDK children and hmd's
+    # own sub-sessions share these hooks and must never be woken for the operator's phone.
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").strip() in PROGRAMMATIC_ENTRYPOINTS:
+        return False
+    if os.environ.get("HMD_AGENT_TYPE", "").strip():
+        return False
+    return os.environ.get("HMD_JUDGMENT", "").strip().lower() in ("", "0", "false")
+
+
+def pid_alive(pid):
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def probe(argv):
+    # stdout of argv or None: ps and tmux are signals that may be missing, never errors.
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=PROBE_TIMEOUT_S)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return done.stdout.decode("utf-8", "replace") if done.returncode == 0 else None
+
+
+def pending_ids(root):
+    # Ids of pending records the paired phone wrote. Message text is never kept: the wake
+    # needs only "is there one" and "have I woken for it".
+    try:
+        with open(ui_paths(root)["inbox"], "rb") as f:
+            raw = f.read(MAX_INBOX_READ).decode("utf-8", "replace")
+    except OSError:
+        return []
+    ids = []
+    for line in raw.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(rec, dict) and rec.get("source") == SOURCE and isinstance(rec.get("id"), str)
+                and rec["id"] and isinstance(rec.get("text"), str) and rec["text"].strip()):
+            ids.append(rec["id"])
+    return ids
+
+
+class Ledger(object):
+    """inbox-wake.json: {"woken": {record id: epoch}} under an exclusive flock, so two
+    sessions of one repo can never both wake for the same message."""
+
+    def __init__(self, root):
+        self.p = ui_paths(root)
+        self.fh = None
+
+    def __enter__(self):
+        ensure_dir(self.p["dir"])
+        fd = os.open(self.p["ledger_lock"], os.O_WRONLY | os.O_CREAT, 0o600)
+        os.chmod(self.p["ledger_lock"], 0o600)
+        self.fh = os.fdopen(fd, "w")
+        fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        with contextlib.suppress(OSError):
+            self.fh.close()
+        return False
+
+    def woken(self):
+        rec = read_json(self.p["ledger"]) or {}
+        w = rec.get("woken")
+        return w if isinstance(w, dict) else {}
+
+    def save(self, woken):
+        keep = dict(sorted(woken.items(), key=lambda kv: kv[1])[-LEDGER_CAP:])
+        write_json_0600(self.p["ledger"], {"woken": keep})
+
+
+def claim(root, ids):
+    # The ids this caller is first to wake for (recorded), or [] when another watcher beat it.
+    with Ledger(root) as led:
+        seen = led.woken()
+        fresh = [i for i in ids if i not in seen]
+        if fresh:
+            now = time.time()
+            seen.update({i: now for i in fresh})
+            led.save(seen)
+    return fresh
+
+
+def unclaim(root, ids):
+    with Ledger(root) as led:
+        seen = led.woken()
+        for i in ids:
+            seen.pop(i, None)
+        led.save(seen)
+
+
+def session_status(pid):
+    base = os.environ.get("HMD_CLAUDE_SESSIONS_DIR") or os.path.join(
+        os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "sessions")
+    rec = read_json(os.path.join(base, "%d.json" % pid))
+    if rec is None or rec.get("pid") != pid:
+        return None
+    st = rec.get("status")
+    return st if isinstance(st, str) else None
+
+
+def hold_alive(root):
+    try:
+        return 0 <= time.time() - os.stat(ui_paths(root)["waiting"]).st_mtime <= HOLD_FRESH_S
+    except OSError:
+        return False
+
+
+def terminal_of(pid):
+    out = (probe(["ps", "-o", "tty=", "-p", str(pid)]) or "").strip()
+    if not out or out in ("?", "??", "-") or out.startswith("/") or ".." in out:
+        return None
+    return os.path.join("/dev", out)
+
+
+def terminal_read_ago(dev):
+    # Seconds since the terminal was last READ (a keystroke taken off the pty), or None.
+    try:
+        return max(0.0, time.time() - os.stat(dev).st_atime)
+    except (OSError, TypeError):
+        return None
+
+
+def ancestors(pid):
+    seen, chain = set(), []
+    for _ in range(ANCESTOR_HOPS):
+        if pid <= 1 or pid in seen:
+            break
+        seen.add(pid)
+        chain.append(pid)
+        fields = (probe(["ps", "-o", "ppid=", "-p", str(pid)]) or "").split()
+        if not fields or not fields[0].isdigit():
+            break
+        pid = int(fields[0])
+    return chain
+
+
+def tmux_base(rec):
+    sock = rec.get("tmux_socket")
+    argv = ["tmux"]
+    if isinstance(sock, str) and sock.startswith("/"):
+        argv += ["-S", sock]
+    return argv
+
+
+def own_pane(rec, pid):
+    # True only when the recorded pane exists and its process is an ancestor of this
+    # session: the pane is provably the one claude runs in, not a string we were handed.
+    pane = rec.get("tmux_pane")
+    if not isinstance(pane, str) or not PANE_RE.match(pane):
+        return False
+    listing = probe(tmux_base(rec) + ["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
+    if listing is None:
+        return False
+    chain = set(ancestors(pid))
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == pane and fields[1].isdigit() and int(fields[1]) in chain:
+            return True
+    return False
+
+
+def type_prompt(rec):
+    base = tmux_base(rec) + ["send-keys", "-t", rec["tmux_pane"]]
+    return all(probe(argv) is not None for argv in (base + ["-l", WAKE_PROMPT], base + ["Enter"]))
+
+
+def load_registration(root, pid):
+    rec = read_json(os.path.join(ui_paths(root)["wake"], "%d.json" % pid))
+    return rec if rec is not None and rec.get("pid") == pid else {}
+
+
+def wake_mode():
+    m = os.environ.get("HMD_INBOX_WAKE", "").strip().lower()
+    return m if m in ("rewake", "tmux") or m in SWITCHED_OFF else ""
+
+
+def prune_dead(root):
+    d = ui_paths(root)["wake"]
+    for name in os.listdir(d) if os.path.isdir(d) else ():
+        m = re.match(r"^([0-9]+)\.(json|lock)$", name)
+        if m and not pid_alive(int(m.group(1))):
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(d, name))
+
+
+def cmd_register(root, pid, payload):
+    if not attended_session() or wake_mode() in SWITCHED_OFF or not pid_alive(pid):
+        return 0
+    pane, tmux_env = os.environ.get("TMUX_PANE", ""), os.environ.get("TMUX", "")
+    sock = tmux_env.split(",")[0] if tmux_env else ""
+    rec = {"pid": pid, "session_id": payload.get("session_id") if isinstance(payload.get("session_id"), str) else "",
+           "tty": terminal_of(pid), "registered_at": time.time(),
+           "tmux_pane": pane if PANE_RE.match(pane) else "",
+           "tmux_socket": sock if sock.startswith("/") and ".." not in sock else ""}
+    ensure_dir(ui_paths(root)["wake"])
+    write_json_0600(os.path.join(ui_paths(root)["wake"], "%d.json" % pid), rec)
+    prune_dead(root)
+    return 0
+
+
+def take_instance_lock(root, pid):
+    ensure_dir(ui_paths(root)["wake"])
+    path = os.path.join(ui_paths(root)["wake"], "%d.lock" % pid)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def wake_action(root, pid):
+    # "tmux" (typed a prompt into the session's own pane), "rewake" (the caller exits 2) or
+    # None (conditions not met this tick). Claims the pending ids before acting, so a second
+    # watcher never wakes for them; a failed keystroke gives them back and falls to rewake.
+    mode = wake_mode()
+    if mode in SWITCHED_OFF:
+        return None
+    ids = pending_ids(root)
+    if not ids or session_status(pid) == "busy" or hold_alive(root):
+        return None
+    reg = load_registration(root, pid)
+    dev = reg.get("tty") if isinstance(reg.get("tty"), str) else terminal_of(pid)
+    read_ago = terminal_read_ago(dev)
+    if read_ago is not None and read_ago < TYPING_RECENT_S:
+        return None        # somebody is at the keyboard: their prompt carries the message
+    fresh = claim(root, ids)
+    if not fresh:
+        return None
+    quiet = env_float("HMD_INBOX_WAKE_TMUX_QUIET_S", DEFAULT_TMUX_QUIET_S)
+    if mode != "rewake" and (read_ago is None or read_ago >= quiet) and own_pane(reg, pid):
+        if type_prompt(reg):
+            return "tmux"
+        unclaim(root, fresh)
+        fresh = claim(root, fresh)
+        if not fresh:
+            return None
+    return "rewake"
+
+
+def cmd_watch(root, pid):
+    if not attended_session() or wake_mode() in SWITCHED_OFF or not pid_alive(pid):
+        return 0
+    lock = take_instance_lock(root, pid)
+    if lock is None:
+        return 0            # a watcher is already armed for this session
+    poll_s = max(0.05, env_float("HMD_INBOX_WAKE_POLL_S", DEFAULT_POLL_S))
+    deadline = time.time() + env_float("HMD_INBOX_WAKE_MAX_S", DEFAULT_MAX_S)
+    while time.time() < deadline and pid_alive(pid):
+        action = wake_action(root, pid)
+        if action == "rewake":
+            sys.stderr.write(WAKE_NOTICE + "\n")
+            return 2
+        time.sleep(poll_s)
+    return 0
+
+
+def cmd_status(root):
+    d = ui_paths(root)["wake"]
+    names = os.listdir(d) if os.path.isdir(d) else []
+    live = [n for n in names if n.endswith(".json") and pid_alive(int(n.split(".")[0]) if n.split(".")[0].isdigit() else 0)]
+    print(json.dumps({"registered": len(live), "pending": len(pending_ids(root))}))
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="heimdall-inbox-wake", add_help=True)
+    ap.add_argument("mode", choices=("register", "watch", "status"))
+    ap.add_argument("--repo", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    ap.add_argument("--pid", type=int, default=os.getppid())
+    args = ap.parse_args(argv)
+    root = os.path.abspath(args.repo)
+    try:
+        if args.mode == "status":
+            return cmd_status(root)
+        if args.mode == "register":
+            try:
+                payload = json.loads(sys.stdin.read(65536) or "{}")
+            except ValueError:
+                payload = {}
+            return cmd_register(root, args.pid, payload if isinstance(payload, dict) else {})
+        return cmd_watch(root, args.pid)
+    except Exception:
+        return 0            # a wake-mechanism bug must never block or wake anything
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
