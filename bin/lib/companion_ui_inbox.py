@@ -56,9 +56,19 @@ also the delivery receipt log. summary() is the `inbox` slice /api/state serves 
 {pending, consumer, oldest_age_s, expired, delivered} -- where `delivered` is the last 20 archive entries as
 {id, delivered_at, via, read_at} ONLY, never text (the id is the uuid POST /api/send returned), and `consumer`
 is read from .heimdall/ui/inbox-waiting, the marker bin/heimdall-inbox-deliver's stop long-poll rewrites every
-poll while it waits (stale after 2x the poll interval), falling back to a configured tmux target, then "none".
+poll while it waits (stale after 2x the poll interval), falling back to a configured tmux target, then to an
+armed wake ("wake", below), then "none".
 Queued -> delivered is therefore the message leaving `pending` and its id appearing in `delivered` with a
 timestamp.
+  WAKE. "wake" says bin/heimdall-inbox-wake has a watcher armed for a live session and a companion is connected,
+  so a message that lands makes the idle session take a turn by itself (an asyncRewake hook, or a prompt typed
+  into the session's own tmux pane) and the deliver hooks hand it over in that turn. It is read from what that
+  hook leaves under .heimdall/ui/wake/: <claude pid>.json (the SessionStart registration: ours, 0600, naming that
+  pid) and <claude pid>.lock (ours, 0600) under an exclusive flock for as long as that session's watcher lives --
+  the kernel frees it on any death, so a killed session stops counting at once -- plus the live-companion rule the
+  watcher itself applies (.heimdall/app/connect.json), since it never wakes without one. It is checked last and only
+  ever stands in for "none", so a client that does not know the value (hmdapp's guard drops an unknown consumer and
+  keeps the rest of the slice) loses the upgrade, never a state it understood.
   DELIVERED TO SESSION. `delivered_at` is the moment a delivery hook popped the message into the session's
   context -- "delivered to session". It is NOT "read" and NOT "acted on": nothing in it says the model has seen
   the text. `read_at` is that: the timestamp of the first main-chain assistant entry the session transcript
@@ -115,6 +125,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -130,6 +141,10 @@ INBOX_REL = os.path.join(".heimdall", "ui", "inbox.jsonl")
 DELIVERED_REL = os.path.join(".heimdall", "ui", "inbox-delivered.jsonl")
 WAITING_REL = os.path.join(".heimdall", "ui", "inbox-waiting")      # the stop long-poll's heartbeat marker
 TMUX_TARGET_REL = os.path.join(".heimdall", "ui", "tmux-target")
+WAKE_DIR_REL = os.path.join(".heimdall", "ui", "wake")   # bin/heimdall-inbox-wake: <claude pid>.json (SessionStart registration), <claude pid>.lock (flock held while that session's watcher is armed)
+WAKE_LOCK_RE = re.compile(r"^([0-9]{1,9})\.lock$")       # a pid is at most 9 digits; a longer name is not one
+PRIVATE = 0o077       # mode bits a file the wake hook wrote must not carry (it writes them 0600)
+NOT_SHARED = 0o022    # mode bits connect.json must not carry: nobody else may write it
 CONNECT_REL = os.path.join(".heimdall", "app", "connect.json")      # `hmd app connect`: names the ui and relay-client pids
 POLL_INTERVAL_S = 2.0                   # bin/heimdall-inbox-deliver's stop long-poll cadence
 WAITING_STALE_S = 2 * POLL_INTERVAL_S   # an inbox-waiting older than this: its long-poll is gone
@@ -657,12 +672,110 @@ def tmux_target(root):
         return ""
 
 
+def _own_live_pid(pid):
+    """True for a pid that is alive AND signalable by this user: one recycled by somebody else's process is not ours."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _open_own(path, forbidden):
+    """An O_RDONLY descriptor on `path` when it is a regular file this user owns that carries none of the `forbidden`
+    mode bits, else None. Opened without following a symlink and judged by fstat on the open descriptor, so neither
+    a link nor a file swapped in between a check and the use gets through."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        ours = stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & forbidden
+    except OSError:
+        ours = False
+    if not ours:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _read_own_json(path, forbidden):
+    """The JSON object in a file `_open_own` accepts, else None (missing, foreign, malformed, not an object)."""
+    fd = _open_own(path, forbidden)
+    if fd is None:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as f:
+            obj = json.loads(f.read(65536).decode("utf-8", "replace"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _lock_held(path):
+    """True while some process holds a flock on `path` (a file `_open_own` accepts). The probe asks for a shared
+    lock without waiting: refused = an exclusive holder is alive; granted = nobody is, and closing the descriptor
+    drops it at once. The grant lasts microseconds; a watcher that starts inside that window stands down once and
+    the next Stop re-arms it."""
+    fd = _open_own(path, PRIVATE)
+    if fd is None:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return False
+
+
+def _companion_connected(root):
+    """The wake hook's own test for "a phone can reach this session right now": connect.json (`hmd app connect`) is
+    ours, nobody else can write it, and every process it names (pid_ui, pid_client) is alive and ours. A watcher
+    never wakes without one, so this status never claims a wake without one either."""
+    rec = _read_own_json(os.path.join(root, CONNECT_REL), NOT_SHARED)
+    pids = [rec[k] for k in ("pid_ui", "pid_client") if k in rec] if rec else []
+    return bool(pids) and all(_own_live_pid(p) for p in pids)
+
+
+def wake_armed(root):
+    """True when bin/heimdall-inbox-wake has a watcher armed for a live session of this user AND a companion is
+    connected: the two things its `watch` needs before it wakes anything. The session shows up as
+    .heimdall/ui/wake/<pid>.json (`register`, at SessionStart: names that pid), a <pid>.lock some process holds an
+    exclusive flock on (the watcher, for as long as it lives: the kernel frees it on any death) and a pid that is
+    still alive. Every file is judged by the rules the hook writes it under -- ours, 0600, a regular file, never a
+    link -- so one dropped into a checkout cannot claim a wake. Anything unreadable is "not armed"."""
+    wake_dir = os.path.join(root, WAKE_DIR_REL)
+    try:
+        names = os.listdir(wake_dir)
+    except OSError:
+        return False
+    for name in names:
+        m = WAKE_LOCK_RE.match(name)
+        if m is None:
+            continue
+        pid = int(m.group(1))
+        reg = _read_own_json(os.path.join(wake_dir, "%d.json" % pid), PRIVATE)
+        if (reg is not None and reg.get("pid") == pid and _own_live_pid(pid)
+                and _lock_held(os.path.join(wake_dir, "%d.lock" % pid))):
+            return _companion_connected(root)
+    return False
+
+
 def consumer_state(root, now=None):
     """Who would take the next phone message: "waiting" (a `stop` long-poll is live:
     its inbox-waiting marker was refreshed within WAITING_STALE_S -- twice the poll
     interval, so a killed hook stops counting within seconds), else "tmux" (a tmux
-    target is configured), else "none" (the next delivery needs a turn boundary). A
-    marker stamped in the future by more than that is clock noise, not a listener."""
+    target is configured), else "wake" (nothing is listening, but an idle session has
+    a wake armed: see wake_armed -- the message makes it take a turn by itself), else
+    "none" (the next delivery needs a turn boundary). "wake" is checked last so it only
+    ever stands in for "none". A marker stamped in the future by more than that is
+    clock noise, not a listener."""
     now = time.time() if now is None else now
     try:
         age = now - os.stat(os.path.join(root, WAITING_REL)).st_mtime
@@ -670,7 +783,9 @@ def consumer_state(root, now=None):
         age = None
     if age is not None and -WAITING_STALE_S <= age <= WAITING_STALE_S:
         return "waiting"
-    return "tmux" if tmux_target(root) else "none"
+    if tmux_target(root):
+        return "tmux"
+    return "wake" if wake_armed(root) else "none"
 
 
 def _oldest_age_s(records, now):
@@ -689,7 +804,7 @@ def _expired_ids(records, now):
 
 def summary(root, now=None):
     """The whole `inbox` slice of /api/state in one call:
-    {"pending": n, "consumer": "waiting"|"tmux"|"none", "oldest_age_s": float|None,
+    {"pending": n, "consumer": "waiting"|"tmux"|"wake"|"none", "oldest_age_s": float|None,
     "expired": [id, ...], "delivered": [{"id", "delivered_at", "via", "read_at"}, ...]}.
     `pending` is read before `delivered`, so a message seen as delivered really was; an
     unreadable source degrades its own field (nothing pending / no receipts), never the slice."""
