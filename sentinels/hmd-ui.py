@@ -413,20 +413,16 @@ def repo_session(root):
 
 
 def collect_session_code(root):
-    """identity.session_code -- the same 5-char code the companion app shows for this
-    paired session (bin/lib/hmd_session_code.py, the one source this file, the statusline,
-    bin/lib/hmd_app_code.py and `hmd app` all read). This process is not Claude Code's
-    statusline, so it has no live session id on a stdin: the id it uses is, in order, one
-    it inherited that names a transcript of THIS repo (repo_session().pinned: an id
-    inherited from a shell that belongs to another repo is ignored), else the session the
-    SessionStart hook recorded in <root>/.heimdall/app/session.json while its process is
-    alive (resolve_session_code), else `root` itself. Never raises."""
+    """identity.session_code -- the 5-char code of THIS repo, the one the companion app is
+    given for this paired backend (bin/lib/hmd_session_code.py, the one source this file, the
+    statusline, bin/lib/hmd_app_code.py, `hmd app` and the pair window all read). It is keyed
+    by the machine's seed and `root`'s real path and by nothing else: not by a Claude Code
+    session id this process inherited, and not by whichever session is newest -- so every
+    surface, in every session and none, shows the same code. Never raises."""
     if SESSION_CODE is None:
         return None
-    session = repo_session(root)
-    pinned = session.id if session is not None and session.pinned else None
     try:
-        code, _source = SESSION_CODE.resolve_session_code(repo=root, pinned_session_id=pinned or None)
+        code, _source = SESSION_CODE.resolve_session_code(root)
     except Exception:
         return None
     return code if isinstance(code, str) and code else None

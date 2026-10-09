@@ -2,7 +2,9 @@
 # test/app-pair-confirm.test.sh -- code-only pairing (hmdapp's docs/HANDOFF-TO-HEIMDALL-pair-confirm-in-session.md): typing the
 # 5-character session code on a phone signed in to the same GitHub account pairs at once, with no 6-digit compare, also with
 # `hmd app connect --bg` and with no terminal; --confirm restores the compare; one session code is derived for the statusline,
-# `hmd ui`, `hmd app` and the pair window; every session keeps a window open; a pairing leaves a notice and a statusline note.
+# `hmd ui`, `hmd app`, the pair window and the relay client -- the code of the REPO, never of a session id; the window is the
+# repo's too: a restart (start, resume, compact) opens it again under the same code and one session ending does not close a
+# window another live session, or a running `hmd app connect`, needs; a pairing leaves a notice and a statusline note.
 # The window's token back-off: it re-registers its code -- the gh token is in that request -- no more often than a floor and
 # stops after HMD_PAIR_WINDOW_IDLE_H hours with no pairing and no activity in its session.
 #
@@ -64,6 +66,12 @@ if jq -e '[.hooks.SessionStart[].hooks[].command | select(contains("pair-window 
   ok "SessionStart opens the window and SessionEnd closes it, once each"
 else
   bad "the pair-window hooks are not wired exactly once each"
+fi
+if jq -e '[.hooks.SessionStart[] | select(any(.hooks[]; .command | contains("pair-window --session"))) | has("matcher") | not] == [true]' \
+     "$REPO/hooks/hooks.json" >/dev/null; then
+  ok "the SessionStart hook has no matcher, so it runs for every source (startup, resume, clear, compact) and reopens a window that is not open"
+else
+  bad "the pair-window-start hook is limited by a matcher: a resume or a compact would not reopen the window"
 fi
 if jq -e '[.hooks.SessionStart[].hooks[].command | select(contains("pair-window --session"))][0] | contains(".transcript_path") and contains("--transcript")' \
      "$REPO/hooks/hooks.json" >/dev/null; then
