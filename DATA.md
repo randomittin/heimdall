@@ -627,7 +627,10 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
   `HMD_PAIR_WINDOW_IDLE_H` hours (default 4, at most 24; `HMD_RELAY_CODE_WINDOW_S` sets it in
   seconds) pass; the token is then dropped from memory. A renewal the relay cannot take at
   the moment (unreachable, throttling, failing) is tried again 30 s on
-  (`HMD_RELAY_CODE_RENEW_RETRY_S`) and does not close the window. The
+  (`HMD_RELAY_CODE_RENEW_RETRY_S`) and does not close the window. `--confirm` keeps the
+  same schedule; a phone turned down at the compare has the window registered again at
+  once instead (`HMD_RELAY_CODE_RENEW_EVENT_MIN_S`, 5 s after the last registration), one
+  more send of the token for each rejection. The
   SessionStart hook `pair-window-start` does the same for every attended Claude Code
   session while `gh` is signed in, but backed off: it reads `gh auth token` again each time
   a window opens and sends it no more often than every 5 minutes

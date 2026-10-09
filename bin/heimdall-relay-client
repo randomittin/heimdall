@@ -865,6 +865,13 @@ APPROVAL_TIMEOUT_S = _env_seconds("HMD_RELAY_APPROVAL_TIMEOUT_S", 60.0)
 # How long after a renewal the relay could not take (unreachable, throttling, failing) the next try is. The window stays
 # open meanwhile: only its own lifetime (CODE_WINDOW_TOTAL_S) or the relay's word on the code ends it.
 CODE_RENEW_RETRY_S = _env_seconds("HMD_RELAY_CODE_RENEW_RETRY_S", 30.0)
+# The floor under a renewal an EVENT asks for -- a claim the laptop turned down at the compare, a bind refused, the relay ending
+# the session: the least time after the last registration that one is made, where CODE_RENEW_MIN_S is the floor under the timer's
+# schedule. Unset it IS that floor, so the unattended pair window and a plain connect never send the token faster than the schedule
+# because a relay keeps ending their sessions. `hmd app connect --confirm`, attended at a terminal, sets it to 5 s: a phone turned
+# down there has had its session revoked, so the code is dark until the next registration, and minutes of schedule are no time to
+# keep it dark -- while the timer itself stays on the schedule.
+CODE_RENEW_EVENT_MIN_S = _env_seconds("HMD_RELAY_CODE_RENEW_EVENT_MIN_S", CODE_RENEW_MIN_S)
 
 
 def code_renewal_due(registered_at, expires_at, floor_s, lead_s):
@@ -1676,11 +1683,11 @@ class RelayClient:
 
     def _renewal_due(self):
         """When (time.monotonic()) the next renewal is due: when the registration is about to lapse (code_renewal_due),
-        or -- when an event asked for one (a bind refused, the relay ending the session) -- at once, but never sooner
-        than CODE_RENEW_MIN_S after the last."""
+        or -- when an event asked for one (a claim turned down, a bind refused, the relay ending the session) -- at once, but
+        never sooner than CODE_RENEW_EVENT_MIN_S after the last."""
         with self._code_lock:
             last, scheduled = self._last_renew_at, self._code_renew_at
-        return last + CODE_RENEW_MIN_S if self._renew_now.is_set() else scheduled
+        return last + CODE_RENEW_EVENT_MIN_S if self._renew_now.is_set() else scheduled
 
     def _code_loop(self):
         """Offers the code for CODE_WINDOW_TOTAL_S: each time the current session's window is about to lapse
@@ -1765,11 +1772,13 @@ class RelayClient:
             self._revoke_session(*old)
 
     def _retry_renewal(self):
-        """A renewal the relay could not take now: the window stays open and the next try is CODE_RENEW_RETRY_S on, never
-        sooner than the floor after the last registration (each try that reaches the relay sends the laptop's GitHub token).
+        """A renewal the relay could not take now: the window stays open and the next try is CODE_RENEW_RETRY_S on. A try is
+        never made sooner than a floor after the last registration (each one that reaches the relay sends the laptop's GitHub
+        token) -- CODE_RENEW_MIN_S for the timer's, CODE_RENEW_EVENT_MIN_S for an event's -- so one made CODE_RENEW_RETRY_S
+        after it is not either, and a retry of a turned-down claim's renewal is not held to the timer's floor.
         An unpaired client lives on and keeps its code; only the window's own lifetime (_code_deadline) ends it."""
         with self._code_lock:
-            self._code_renew_at = max(time.monotonic() + CODE_RENEW_RETRY_S, self._last_renew_at + CODE_RENEW_MIN_S)
+            self._code_renew_at = time.monotonic() + CODE_RENEW_RETRY_S
 
     def _interrupt_stream(self):
         """Cut the connection the stream thread is blocked reading, so it reopens at once on the session this
