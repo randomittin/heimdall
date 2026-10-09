@@ -5,9 +5,10 @@ the REAL bin/heimdall-relay-client, bin/heimdall-app, the SessionStart/SessionEn
 sandbox's PATH (never the real relay, never the real GitHub, never a real token). Run by test/app-pair-confirm.test.sh.
 
 The spec's nine acceptance tests, in its own numbering (a case's checks are prefixed with the number they prove):
-  1  the statusline's code, bin/lib/hmd_app_code.py --repo and /api/state identity.session_code are ONE value, and it is the
-     code of the session session.json records
-  2  the SessionStart hook creates session.json (0600) and opens the window; the SessionEnd hook removes it and stops the window;
+  1  the statusline's code, bin/lib/hmd_app_code.py --repo, /api/state identity.session_code and the SESSION CODE `hmd app connect`
+     prints are ONE value -- the code of the REPO, the same in every session id, with or without a session record, whatever
+     session id a process inherited
+  2  the SessionStart hook records its session (0600) and opens the window; the SessionEnd hook forgets it and stops the window;
      a window outlives the client's own code window (the supervisor opens the next one)
   3  a claim with the same GitHub identity pairs: device_bound, no prompt, no answer on stdin, no terminal
   4  `hmd app connect --bg` pairs by code and exits 0; the exit-64 refusal is gone from the code and from the usage text
@@ -18,10 +19,14 @@ The spec's nine acceptance tests, in its own numbering (a case's checks are pref
      exist in this tree (hmdapp's alignment doc, P1-7); the notice, the statusline note, `hmd app disconnect` (which closes
      the window) and `hmd app identity revoke` are what a pairing nobody expected can be undone with.
   8  --confirm restores the 6-digit compare (approve and reject at a terminal), and fails clearly without one or with --bg
-  9  gh signed out: no window, one line, the session unaffected; two sessions in one repo keep separate codes
+  9  gh signed out: no window, one line, the session unaffected; two sessions in one repo share ONE window and one code
 plus one case for each finding of the security review of hmd_session_code.py:
   S1 no state file is written, chmod'ed or read through a link
   S2 the code is not derivable from a repo path or a session id, and not taken from a file a checkout could plant
+the window being the repo's, not a session's (see "W" below):
+  W  a session ending (or restarting: resume, compact) does not leave the code dark -- the next start opens the window again,
+     under the same code; ending one session does not close a window another live session, or a running `hmd app connect`
+     client, still needs; a Claude that died without a SessionEnd ends it; the idle stop counts activity in ALL the repo's sessions
 and the back-off of the pair window's token (see "B / I" below):
   B  the window re-registers its code -- the gh token is in that request -- no more often than a floor, a margin ahead of
      the lapse, and the client rides out the relay purging its lapsed session instead of ending
@@ -151,11 +156,22 @@ def statusline_fixture():
     return path
 
 
-def render(sl, sid):
-    """The statusline for session `sid` in sandbox `sl`, escape codes stripped."""
+def repo_code(seed, repo):
+    """The code of a repo under `seed`, by the independent reference: what is keyed is the repo's real path."""
+    return ref_code(seed, "repo", os.path.realpath(repo))
+
+
+def render(sl, sid, current_dir=None, project_dir=None, **env):
+    """The statusline for session `sid` in sandbox `sl`, escape codes stripped. `current_dir` and `project_dir` move the
+    payload's workspace (a session that `cd`ed into a subdirectory has another current_dir and the same project_dir); `env`
+    is added to the render's environment."""
     blob = json.loads(sl.claude_blob)
     blob["session_id"] = sid
-    _ms, _rc, out = sl.render(STATUSLINE, json.dumps(blob).encode(), COLUMNS="200")
+    if current_dir:
+        blob["cwd"] = blob["workspace"]["current_dir"] = current_dir
+    if project_dir:
+        blob["workspace"]["project_dir"] = project_dir
+    _ms, _rc, out = sl.render(STATUSLINE, json.dumps(blob).encode(), COLUMNS="200", **env)
     return ANSI.sub("", out.decode("utf-8", "replace"))
 
 
@@ -247,9 +263,18 @@ class Scn:
         stdin = json.dumps(dict({"session_id": sid, "source": "startup"}, **(payload or {})))
         return run(["sh", "-c", hook_commands()[ident]], env, stdin=stdin, timeout=60, cwd=self.repo)
 
-    def window_state(self, sid):
+    def window_state(self):
+        """The repo's window state file (a repo has one window, whatever its sessions), or None."""
         try:
-            with open(os.path.join(self.repo, ".heimdall", "app", "pair-window-%s.json" % sid), encoding="utf-8") as f:
+            with open(os.path.join(self.repo, ".heimdall", "app", "pair-window.json"), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def session_record(self, sid):
+        """The record the SessionStart hook keeps of session `sid`, or None."""
+        try:
+            with open(os.path.join(self.repo, ".heimdall", "app", "sessions", "%s.json" % sid), encoding="utf-8") as f:
                 return json.load(f)
         except (OSError, ValueError):
             return None
@@ -258,38 +283,55 @@ class Scn:
 # -- 1 -------------------------------------------------------------------------------------------------------------
 def case_one_code():
     sl = SL.Sandbox(statusline_fixture())
-    try:
-        env = sl.env()
-        code_cli(env, "--session-id", "seed-probe")  # the first use makes the machine's seed
-        seed = seed_of(os.path.join(sl.home, ".heimdall"))
-        expected = ref_code(seed, "session_id", SID1)
-        app_dir = os.path.join(sl.ws, ".heimdall", "app")
-        os.makedirs(app_dir, exist_ok=True)
-        os.chmod(app_dir, 0o700)
-        session = os.path.join(app_dir, "session.json")
-        write_private(session, json.dumps({"session_id": SID1, "pid": os.getpid(), "ts": int(time.time())}))
-        line_code = row_code(render(sl, SID1))
-        helper = run([sys.executable, APP_CODE_PY, "--repo", sl.ws], env).stdout.strip()
-        state = run([UI_BIN, "--repo", sl.ws, "--print-state"], env, timeout=180)
+    with Scn() as s:
         try:
-            shown = json.loads(state.stdout)["identity"]["session_code"]
-        except (ValueError, KeyError, TypeError):
-            shown = None
-        T.check(line_code == helper == shown == expected and len(expected) == 5,
-                "1. with session.json present the statusline code, hmd_app_code.py --repo and /api/state identity.session_code "
-                "are one value, the code of the recorded session",
-                "statusline %r helper %r state %r expected %r" % (line_code, helper, shown, expected))
-        os.unlink(session)
-        bare = run([sys.executable, APP_CODE_PY, "--repo", sl.ws], env).stdout.strip()
-        gone = subprocess.Popen(["true"])
-        gone.wait()
-        write_private(session, json.dumps({"session_id": SID1, "pid": gone.pid, "ts": 1}))
-        dead = run([sys.executable, APP_CODE_PY, "--repo", sl.ws], env).stdout.strip()
-        T.check(bare != expected and dead == bare,
-                "1. without session.json, or with one whose process is gone, hmd_app_code.py falls back to the repo's own code "
-                "(it is the file that makes the codes agree)", "bare %r dead %r expected %r" % (bare, dead, expected))
-    finally:
-        sl.close()
+            env = sl.env()
+            code_cli(env, "--session-id", "seed-probe")  # the first use makes the machine's seed
+            heimdall_home = os.path.join(sl.home, ".heimdall")
+            expected = repo_code(seed_of(heimdall_home), sl.ws)
+            sub = os.path.join(sl.ws, "sub")
+            os.makedirs(sub, exist_ok=True)
+            # connect, through the same seed, prints the code a person types
+            conn_env = s.env(HEIMDALL_HOME=heimdall_home)
+            app = H.Proc([H.APP_PATH, "connect", "--repo", sl.ws, "--port", "0", "--relay", s.relay.url, "--bg"], conn_env, cwd=sl.ws)
+            s.procs.append(app)
+            app.close_stdin()
+            app.wait_exit(90)
+            run([H.APP_PATH, "disconnect", "--repo", sl.ws], conn_env, timeout=120)
+            printed = re.search(r"SESSION CODE: ([A-HJ-NP-Z2-9]{5})", app.text())
+            printed = printed.group(1) if printed else None
+            bare = [row_code(render(sl, SID1)), row_code(render(sl, SID2))]
+            helper_bare = run([sys.executable, APP_CODE_PY, "--repo", sl.ws], env).stdout.strip()
+            T.check(len(expected) == 5 and bare == [expected, expected] and helper_bare == expected and printed == expected,
+                    "1. with NO session record the statusline of two session ids in one repo, hmd_app_code.py --repo and the SESSION CODE "
+                    "`hmd app connect` prints are one value: the repo's own code",
+                    "statusline %r helper %r connect %r expected %r" % (bare, helper_bare, printed, expected))
+            # the records the SessionStart hook keeps, and the single session.json an older hook left: neither moves the code
+            for sid in (SID1, SID2):
+                code_cli(env, "--record-session", "--repo", sl.ws, "--session-id", sid, "--pid", str(os.getpid()))
+            app_dir = os.path.join(sl.ws, ".heimdall", "app")
+            write_private(os.path.join(app_dir, "session.json"), json.dumps({"session_id": SID1, "pid": os.getpid(), "ts": int(time.time())}))
+            recorded = [row_code(render(sl, SID1)), row_code(render(sl, SID2)), row_code(render(sl, "no-such-session"))]
+            sub_cwd = row_code(render(sl, SID1, current_dir=sub, project_dir=sl.ws))
+            helper = run([sys.executable, APP_CODE_PY, "--repo", sl.ws], env).stdout.strip()
+            cli = code_cli(env, "--repo", sl.ws)[1]
+            state = run([UI_BIN, "--repo", sl.ws, "--print-state"], dict(env, CLAUDE_CODE_SESSION_ID=SID2), timeout=180)
+            try:
+                shown = json.loads(state.stdout)["identity"]["session_code"]
+            except (ValueError, KeyError, TypeError):
+                shown = None
+            T.check(recorded == [expected] * 3 and sub_cwd == expected and helper == cli == shown == expected,
+                    "1. ...and with session records (and a stale session.json) for two sessions, any session id, a cwd that `cd`ed into a "
+                    "subdirectory (project_dir unchanged) and a session id inherited by `hmd ui`: still that one code, in /api/state too",
+                    "statusline %r sub %r helper %r cli %r state %r expected %r" % (recorded, sub_cwd, helper, cli, shown, expected))
+            fresh_home = tempfile.mkdtemp(prefix="pair-confirm-nohome.")
+            blank = row_code(render(sl, SID1, HEIMDALL_HOME=fresh_home))
+            T.check(blank is None and not os.path.exists(os.path.join(fresh_home, "session-code.key")),
+                    "1. a render in a home with no seed shows no code and makes no seed (only a session start, `hmd ui` or `hmd app` does)",
+                    "code %r files %r" % (blank, os.listdir(fresh_home)))
+        finally:
+            run([H.APP_PATH, "disconnect", "--repo", sl.ws], s.env(HEIMDALL_HOME=os.path.join(sl.home, ".heimdall")), timeout=120)
+            sl.close()
 
 
 # -- 2 -------------------------------------------------------------------------------------------------------------
@@ -299,33 +341,29 @@ def case_hooks():
         T.check(sorted(cmds) == ["pair-window-start", "pair-window-stop"],
                 "2. hooks.json carries both pair-window hooks, registered in hooks.metadata.json under those ids", str(sorted(cmds)))
         started = s.hook("pair-window-start", SID1)
-        session = os.path.join(s.repo, ".heimdall", "app", "session.json")
-        T.check(wait_until(lambda: os.path.exists(session), 20) and started.returncode == 0 and started.stdout == "",
-                "2. SessionStart: session.json is created, and the hook says nothing a session would put in front of the model",
+        T.check(wait_until(lambda: s.session_record(SID1), 20) and started.returncode == 0 and started.stdout == "",
+                "2. SessionStart: the session is recorded, and the hook says nothing a session would put in front of the model",
                 "rc %r out %r err %r" % (started.returncode, started.stdout, started.stderr))
-        try:
-            with open(session, encoding="utf-8") as f:
-                rec = json.load(f)
-        except (OSError, ValueError):
-            rec = {}
-        T.check(mode_of(session) == 0o600 and sorted(rec) == ["pid", "session_id", "ts"] and rec.get("session_id") == SID1
+        record = os.path.join(s.repo, ".heimdall", "app", "sessions", "%s.json" % SID1)
+        rec = s.session_record(SID1) or {}
+        T.check(mode_of(record) == 0o600 and sorted(rec) == ["pid", "session_id", "ts"] and rec.get("session_id") == SID1
                 and rec.get("pid") == os.getpid(),
-                "2. session.json is 0600 and is exactly {session_id, pid, ts}, owned by the hook's parent process", str(rec))
+                "2. the record is 0600 and is exactly {session_id, pid, ts}, owned by the hook's parent process", str(rec))
         seed = seed_of(s.home)
-        T.check(wait_until(lambda: s.relay.registrations, 30) and s.relay.registrations[0]["code"] == ref_code(seed, "session_id", SID1)
+        T.check(wait_until(lambda: s.relay.registrations, 30) and s.relay.registrations[0]["code"] == repo_code(seed, s.repo)
                 and s.relay.registrations[0]["token_ok"],
-                "2. the window is registered with the relay under the session's code, with gh's token",
+                "2. the window is registered with the relay under the repo's code, with gh's token",
                 str(s.relay.registrations[:1]))
-        state = s.window_state(SID1) or {}
+        state = s.window_state() or {}
         sup = state.get("pid")
-        T.check(isinstance(sup, int) and alive(sup) and state.get("code") == ref_code(seed, "session_id", SID1),
-                "2. a supervisor is running for the session and names its code", str(state))
+        T.check(isinstance(sup, int) and alive(sup) and state.get("code") == repo_code(seed, s.repo),
+                "2. a supervisor is running for the repo and names its code", str(state))
         window_sid = s.relay.latest().id
         stopped = s.hook("pair-window-stop", SID1)
-        T.check(stopped.returncode == 0 and not os.path.exists(session),
-                "2. SessionEnd: session.json is gone", "rc %r %s" % (stopped.returncode, stopped.stderr))
+        T.check(stopped.returncode == 0 and s.session_record(SID1) is None,
+                "2. SessionEnd: the session's record is gone", "rc %r %s" % (stopped.returncode, stopped.stderr))
         T.check(isinstance(sup, int) and wait_until(lambda: not alive(sup), 30) and wait_until(lambda: window_sid in s.relay.revokes, 30),
-                "2. the supervisor is gone and its relay session was revoked", "alive %r revokes %r" % (alive(sup), s.relay.revokes))
+                "2. the last session ended: the supervisor is gone and its relay session was revoked", "alive %r revokes %r" % (alive(sup), s.relay.revokes))
     # a window with no terminal outlives the client's own code window: the supervisor opens the next one
     knobs = {"HMD_RELAY_CODE_WINDOW_S": "3", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2", "HMD_RELAY_CODE_RENEW_MIN_S": "0.5",
              "HMD_PAIR_WINDOW_RESTART_S": "1"}
@@ -337,7 +375,7 @@ def case_hooks():
         span = lambda: (s.relay.registrations[-1]["at"] - s.relay.registrations[0]["at"]) if s.relay.registrations else 0.0
         wait_until(lambda: span() >= 5.0, 60)
         regs = list(s.relay.registrations)
-        sup = (s.window_state(SID1) or {}).get("pid")
+        sup = (s.window_state() or {}).get("pid")
         T.check(span() >= 5.0 and len({r["code"] for r in regs}) == 1 and isinstance(sup, int) and alive(sup),
                 "2. past the client's own 3 s window the code is registered again (a new client), the same code, supervisor alive",
                 "span %.1f regs %d" % (span(), len(regs)))
@@ -469,8 +507,8 @@ def case_notice_and_statusline():
     sl = SL.Sandbox(statusline_fixture())
     with Scn() as s:
         try:
-            ok, code, err = code_cli(sl.env(), "--session-id", SID1)
-            T.check(ok == 0 and len(code) == 5, "7. (setup) the session's code", err)
+            ok, code, err = code_cli(sl.env(), "--repo", sl.ws)
+            T.check(ok == 0 and len(code) == 5, "7. (setup) the repo's code, the one the statusline shows", err)
             c = s.client(code, repo=sl.ws)
             c.wait_event("code_window")
             T.check("paired via code" not in render(sl, SID1), "7. before anyone pairs the statusline has no pairing note")
@@ -549,38 +587,115 @@ def case_gh_signed_out_and_two_sessions():
                 and s.relay.requests == [],
                 "9. gh signed out: no window, one line saying to scan the QR, the relay never contacted", out.stdout + out.stderr)
         started = s.hook("pair-window-start", SID1)
-        T.check(started.returncode == 0 and started.stdout == "" and wait_until(
-                lambda: os.path.exists(os.path.join(s.repo, ".heimdall", "app", "session.json")), 20) and s.relay.requests == [],
+        T.check(started.returncode == 0 and started.stdout == "" and wait_until(lambda: s.session_record(SID1), 20) and s.relay.requests == [],
                 "9. ...and the SessionStart hook is silent and the session unaffected (the session is still recorded, no window opens)",
                 "rc %r out %r" % (started.returncode, started.stdout))
     with Scn() as s:
-        args = ["--pid", str(os.getpid()), "--repo", s.repo, "--relay", s.relay.url]
-        first = run([H.APP_PATH, "pair-window", "--session", SID1] + args, s.env())
-        second = run([H.APP_PATH, "pair-window", "--session", SID2] + args, s.env())
-        T.check(first.returncode == 0 and second.returncode == 0 and wait_until(lambda: len(s.relay.registrations) >= 2, 40),
-                "9. two sessions in one repo each open a window", first.stdout + second.stdout)
+        first = start_window(s, SID1)
+        second = start_window(s, SID2)
+        T.check(first.returncode == 0 and second.returncode == 0 and "pair window open" in first.stdout
+                and "already open" in second.stdout,
+                "9. two sessions in one repo: the first opens the window, the second finds it open and joins it",
+                first.stdout + second.stdout)
+        wait_until(lambda: s.relay.registrations, 40)
         seed = seed_of(s.home)
-        want = {ref_code(seed, "session_id", SID1), ref_code(seed, "session_id", SID2)}
         got = {r["code"] for r in s.relay.registrations}
-        pids = [(s.window_state(sid) or {}).get("pid") for sid in (SID1, SID2)]
-        T.check(len(want) == 2 and got == want and all(isinstance(p, int) and alive(p) for p in pids),
-                "9. ...and keep separate codes, each the one its session's statusline shows, both windows alive together",
-                "want %s got %s pids %s" % (sorted(want), sorted(got), pids))
+        sup = (s.window_state() or {}).get("pid")
+        T.check(got == {repo_code(seed, s.repo)} and isinstance(sup, int) and alive(sup),
+                "9. ...ONE window, one code: the repo's -- the one every session's statusline shows",
+                "want %s got %s pid %s" % (repo_code(seed, s.repo), sorted(got), sup))
         run([H.APP_PATH, "pair-window", "--stop", "--session", SID2, "--repo", s.repo], s.env())
-        T.check(isinstance(pids[1], int) and wait_until(lambda: not alive(pids[1]), 30) and alive(pids[0]),
-                "9. stopping one session's window leaves the other's open", "pids %s" % pids)
+        time.sleep(1.0)
+        T.check(isinstance(sup, int) and alive(sup),
+                "9. stopping one session leaves the window open for the other", "pid %s" % sup)
         run([H.APP_PATH, "pair-window", "--stop", "--session", SID1, "--repo", s.repo], s.env())
-        T.check(isinstance(pids[0], int) and wait_until(lambda: not alive(pids[0]), 30), "9. ...and then it closes too", "")
+        T.check(isinstance(sup, int) and wait_until(lambda: not alive(sup), 30), "9. ...and the last one's end closes it", "")
+
+
+# -- W: the window is the repo's, not a session's --------------------------------------------------------------------
+def case_window_is_the_repos():
+    knobs = {"HMD_PAIR_WINDOW_POLL_S": "0.2"}
+    # a session ends and the next one starts -- resumed, then after a compact -- and the code works again, as the same code
+    with Scn() as s:
+        first_code = None
+        for sid, source in ((SID1, "startup"), (SID2, "resume"), (SID1, "compact")):
+            before = len(s.relay.registrations)
+            started = s.hook("pair-window-start", sid, payload={"source": source}, **knobs)
+            opened = wait_until(lambda: len(s.relay.registrations) > before, 40)
+            sup = window_pid(s)
+            seed = seed_of(s.home)
+            code = s.relay.registrations[-1]["code"] if s.relay.registrations else None
+            first_code = first_code or code
+            T.check(started.returncode == 0 and opened and isinstance(sup, int) and alive(sup) and code == first_code == repo_code(seed, s.repo),
+                    "W1. SessionStart (%s) with no window open registers the repo's code again, the same one as the session before" % source,
+                    "rc %r opened %r code %r first %r" % (started.returncode, opened, code, first_code))
+            window_sid = s.relay.latest().id
+            s.hook("pair-window-stop", sid)
+            T.check(isinstance(sup, int) and wait_until(lambda: not alive(sup), 30) and wait_until(lambda: window_sid in s.relay.revokes, 30),
+                    "W1. ...and the SessionEnd of the only session closes it (its relay session is revoked)", "alive %r" % alive(sup))
+    # two sessions: the first ending does not close the window the second still needs
+    with Scn() as s:
+        start_window(s, SID1, **knobs)
+        sup = window_pid(s)
+        wait_until(lambda: s.relay.registrations, 40)
+        window_sid = s.relay.latest().id
+        joined = start_window(s, SID2)
+        T.check("already open" in joined.stdout and window_pid(s) == sup,
+                "W2. a second session of the repo joins the window already open (one supervisor)", joined.stdout)
+        run([H.APP_PATH, "pair-window", "--stop", "--session", SID1, "--repo", s.repo], s.env())
+        time.sleep(1.5)
+        T.check(isinstance(sup, int) and alive(sup) and window_sid not in s.relay.revokes and s.session_record(SID1) is None
+                and s.session_record(SID2) is not None,
+                "W2. session A ends while B lives: A's record goes, the window stays open and its relay session is not revoked",
+                "alive %r revokes %r" % (alive(sup or 0), s.relay.revokes))
+        run([H.APP_PATH, "pair-window", "--stop", "--session", SID2, "--repo", s.repo], s.env())
+        T.check(isinstance(sup, int) and wait_until(lambda: not alive(sup), 30) and wait_until(lambda: window_sid in s.relay.revokes, 30),
+                "W2. ...and B ending, the last, closes it", "alive %r" % alive(sup or 0))
+    # a running `hmd app connect` client needs the window too
+    with Scn() as s:
+        start_window(s, SID1, **knobs)
+        sup = window_pid(s)
+        wait_until(lambda: s.relay.registrations, 40)
+        window_sid = s.relay.latest().id
+        app = s.app("--relay", s.relay.url, "--bg")
+        app.close_stdin()
+        rc = app.wait_exit(90)
+        T.check(rc == 0 and "held by this repo's pair window" in app.text(),
+                "W3. (setup) connect --bg with the window open pairs by QR and leaves the code to the window", "rc %r %s" % (rc, app.tail()))
+        run([H.APP_PATH, "pair-window", "--stop", "--session", SID1, "--repo", s.repo], s.env())
+        time.sleep(1.5)
+        T.check(isinstance(sup, int) and alive(sup) and window_sid not in s.relay.revokes,
+                "W3. the only session ends while the connect client runs: the window stays", "alive %r" % alive(sup or 0))
+        run([H.APP_PATH, "disconnect", "--repo", s.repo], s.env(), timeout=120)
+        T.check(isinstance(sup, int) and wait_until(lambda: not alive(sup), 30),
+                "W3. `hmd app disconnect` closes it", "alive %r" % alive(sup or 0))
+    # a Claude that is killed runs no SessionEnd: its window ends all the same
+    with Scn() as s:
+        doomed = subprocess.Popen(["sleep", "300"])
+        try:
+            out = run([H.APP_PATH, "pair-window", "--session", SID1, "--pid", str(doomed.pid), "--repo", s.repo, "--relay", s.relay.url],
+                      s.env(**knobs))
+            sup = window_pid(s)
+            wait_until(lambda: s.relay.registrations, 40)
+            T.check(out.returncode == 0 and isinstance(sup, int) and alive(sup),
+                    "W4. (setup) a window owned by a Claude process opens", out.stdout + out.stderr)
+        finally:
+            doomed.kill()
+            doomed.wait()
+        T.check(isinstance(sup, int) and wait_until(lambda: not alive(sup), 30) and s.window_state() is None,
+                "W4. the process dies without a SessionEnd: the supervisor notices, ends, and its state file goes", "alive %r" % alive(sup or 0))
 
 
 # -- B / I: the pair window sends the token far less often, and stops when nobody is there -------------------------------
 # A window with no terminal re-registers its code with the relay each time the relay's registration of it lapses, and the
-# laptop's gh token is in that request's body. The relay keeps a registration PAIRING_CODE_TTL_S = 60 s (relay/src/pairing.ts;
-# `pair_window_s` in relay/contract/code-pair.json), so the token went out once a minute for as long as the session lived.
+# laptop's gh token is in that request's body. The relay keeps a registration PAIRING_CODE_TTL_S = 360 s (relay/src/pairing.ts;
+# `pair_window_s` in relay/contract/code-pair.json). It was 60 s, and the token then went out once a minute for as long as the
+# session lived.
 #   B  now it goes out no more often than HMD_PAIR_WINDOW_RENEW_MIN_S (300 s) after the last time -- and a margin ahead of
-#      the lapse, with the old registration freed first so the relay does not refuse the new one as a clash, whenever the
-#      relay keeps a registration longer than that. Against the relay's real 60 s the floor wins: the code is claimable for
-#      the minute after each registration and dark in between, which is the price of the back-off
+#      the lapse (HMD_PAIR_WINDOW_RENEW_LEAD_S, 10 s), with the old registration freed first so the relay does not refuse the
+#      new one as a clash, whenever the relay keeps a registration longer than that. Against the relay's real 360 s the renewal
+#      falls 350 s on, inside the registration, so the code is claimable all the time; a relay that kept one only 60 s would
+#      leave it dark between a lapse and the floor, which is the price of the back-off
 #   I  and the window stops for good after HMD_PAIR_WINDOW_IDLE_H hours (4; 0 never) with no pairing and no activity in the
 #      session (the modification time of the transcript the SessionStart hook hands it); a new session, or `hmd app connect`,
 #      opens it again. Time is injected (HMD_PAIR_WINDOW_NOW_FILE) and the relay's timings are scaled down: nothing sleeps hours.
@@ -605,14 +720,14 @@ def case_renewal_schedule():
         return
     floor, lead = 300.0, 10.0
     schedule = lambda registered, lapses: due(registered, lapses, floor, lead)
-    for ttl in (60, 290, 305, 600, 3600):
+    for ttl in (60, 290, 305, 360, 600, 3600):
         regs = simulated_renewals(schedule, ttl, 4)
         gaps = [b[0] - a[0] for a, b in zip(regs, regs[1:])]
         most = max(sum(1 for other in regs if at <= other[0] < at + 300.0) for at, _lapse in regs)
         T.check(len(regs) >= 2 and most == 1 and min(gaps) >= floor - 1e-9,
                 "B1. against a relay that keeps a registration %d s: over 4 simulated hours never more than one renewal in any 5 minutes (%d in all)"
                 % (ttl, len(regs)), "most in 5 min %d, first gaps %s" % (most, gaps[:3]))
-    for ttl in (305, 600, 3600):
+    for ttl in (305, 360, 600, 3600):
         regs = simulated_renewals(schedule, ttl, 4)
         pairs = list(zip(regs, regs[1:]))
         T.check(bool(pairs) and all(b[0] < a[1] and a[1] - b[0] <= lead + 1e-9 for a, b in pairs),
@@ -621,8 +736,13 @@ def case_renewal_schedule():
     regs = simulated_renewals(schedule, 60, 4)
     pairs = list(zip(regs, regs[1:]))
     T.check(len(regs) == 48 and bool(pairs) and all(abs((b[0] - a[0]) - 300.0) < 1e-9 and abs((b[0] - a[1]) - 240.0) < 1e-9 for a, b in pairs),
-            "B3. against the relay's real 60 s the 5-minute floor wins: 48 registrations in 4 hours, each renewed 300 s after the last "
+            "B3. against a relay that keeps a registration only 60 s (the relay's old TTL) the 5-minute floor wins: 48 registrations in 4 hours, each renewed 300 s after the last "
             "(the code is dark for the 240 s between a lapse and the next)", "%d registrations" % len(regs))
+    regs = simulated_renewals(schedule, 360, 4)
+    pairs = list(zip(regs, regs[1:]))
+    T.check(len(regs) == 42 and bool(pairs) and all(abs((b[0] - a[0]) - 350.0) < 1e-9 and abs((a[1] - b[0]) - 10.0) < 1e-9 for a, b in pairs),
+            "B3. against the relay's real 360 s the window renews 350 s on, 10 s before the lapse: 42 registrations in 4 hours, and the code is "
+            "never dark", "%d registrations" % len(regs))
     T.check(abs(due(0.0, 60.0, 5.0, -1.5) - 61.5) < 1e-9 and abs(due(0.0, 2.0, 0.5, 10.0) - 1.0) < 1e-9,
             "B4. `hmd app connect`'s own schedule is unchanged (5 s floor, renewed 1.5 s after the lapse), and a short registration is never renewed "
             "at once, over and over, by a long margin (the margin is capped at half its life)",
@@ -710,16 +830,17 @@ def one_live_window_per_code(relay):
 
 
 def start_window(s, sid=SID1, transcript=None, **knobs):
-    """`hmd app pair-window` for session `sid`, owned by this process, against the scenario's relay; `knobs` go to the supervisor."""
+    """`hmd app pair-window` for session `sid`, owned by this process, against the scenario's relay; `knobs` go to the supervisor
+    (only the call that opens the window starts one: a session joining an open window passes none)."""
     argv = [H.APP_PATH, "pair-window", "--session", sid, "--pid", str(os.getpid()), "--repo", s.repo, "--relay", s.relay.url]
     if transcript:
         argv += ["--transcript", transcript]
     return run(argv, s.env(**knobs))
 
 
-def window_pid(s, sid=SID1, timeout=20):
-    wait_until(lambda: s.window_state(sid), timeout)
-    pid = (s.window_state(sid) or {}).get("pid")
+def window_pid(s, timeout=20):
+    wait_until(lambda: s.window_state(), timeout)
+    pid = (s.window_state() or {}).get("pid")
     return pid if isinstance(pid, int) else None
 
 
@@ -807,20 +928,19 @@ def case_idle_stop():
         argvs = [H.argv_of(p) for p in [sup] + kids]
         clock.set(4 * 3600 - 120)
         time.sleep(1.5)
-        T.check(alive(sup) and s.window_state(SID1) is not None and len(s.relay.registrations) == 1,
+        T.check(alive(sup) and s.window_state() is not None and len(s.relay.registrations) == 1,
                 "I1. four hours less two minutes with no pairing and no activity: the window is still open (the default is four hours)",
-                "alive %r state %r registrations %d" % (alive(sup), s.window_state(SID1), len(s.relay.registrations)))
+                "alive %r state %r registrations %d" % (alive(sup), s.window_state(), len(s.relay.registrations)))
         clock.set(4 * 3600 + 120)
         stopped = wait_until(lambda: not alive(sup), 25)
         revoked = wait_until(lambda: window_sid in s.relay.revokes, 20)
-        T.check(stopped and revoked and s.window_state(SID1) is None,
+        T.check(stopped and revoked and s.window_state() is None,
                 "I1. four hours and two minutes: the supervisor ends, its relay session is revoked and its state file is gone -- nothing says a window is live",
-                "stopped %r revoked %r state %r" % (stopped, revoked, s.window_state(SID1)))
+                "stopped %r revoked %r state %r" % (stopped, revoked, s.window_state()))
         time.sleep(1.0)
-        session = os.path.join(s.repo, ".heimdall", "app", "session.json")
-        T.check(len(s.relay.registrations) == 1 and os.path.exists(session),
-                "I1. the code is not registered again, and the session stays recorded (so `hmd app connect` and the statusline still agree on its code)",
-                "registrations %d, session.json %r" % (len(s.relay.registrations), os.path.exists(session)))
+        T.check(len(s.relay.registrations) == 1 and s.session_record(SID1) is not None,
+                "I1. the code is not registered again, and the session stays recorded (a window opened later still finds it)",
+                "registrations %d, record %r" % (len(s.relay.registrations), s.session_record(SID1)))
         needle = H.TOKEN.encode()
         leaks = H.files_containing(s.repo, needle) + H.files_containing(s.sb.home, needle) + H.files_containing(s.sb.tmp, needle)
         T.check(kids and not any(H.TOKEN in a for a in argvs) and leaks == [],
@@ -841,31 +961,35 @@ def case_idle_stop_off():
             return
         clock.set(1000 * 3600)
         time.sleep(2.0)
-        T.check(alive(sup) and s.window_state(SID1) is not None and len(s.relay.registrations) == 1,
+        T.check(alive(sup) and s.window_state() is not None and len(s.relay.registrations) == 1,
                 "I2. HMD_PAIR_WINDOW_IDLE_H=0 never stops it: a thousand hours with no pairing and no activity and the window is still open",
-                "alive %r state %r" % (alive(sup), s.window_state(SID1)))
+                "alive %r state %r" % (alive(sup), s.window_state()))
 
 
 def case_idle_stop_activity():
     with Scn() as s:
         clock = Clock(s.sb.root)
-        transcript = os.path.join(s.sb.root, "session.jsonl")
-        write_private(transcript, "{}\n")
-        os.utime(transcript, (clock.base, clock.base))
-        sup = open_window_or_fail(s, "I3.", transcript=transcript, **idle_knobs(clock, HMD_PAIR_WINDOW_IDLE_H="1"))
+        transcripts = []
+        for name in ("a", "b"):
+            path = os.path.join(s.sb.root, "session-%s.jsonl" % name)
+            write_private(path, "{}\n")
+            os.utime(path, (clock.base, clock.base))
+            transcripts.append(path)
+        sup = open_window_or_fail(s, "I3.", transcript=transcripts[0], **idle_knobs(clock, HMD_PAIR_WINDOW_IDLE_H="1"))
         if sup is None:
             return
+        start_window(s, SID2, transcript=transcripts[1])  # a second session joins the window
         clock.set(1800)
-        os.utime(transcript, (clock.base + 1800, clock.base + 1800))  # the session did something half an hour in
+        os.utime(transcripts[1], (clock.base + 1800, clock.base + 1800))  # the OTHER session did something half an hour in
         time.sleep(1.0)
         clock.set(5000)  # 1 h 23 min since the window opened, but 53 min since that activity
         time.sleep(1.5)
-        T.check(alive(sup) and s.window_state(SID1) is not None,
-                "I3. HMD_PAIR_WINDOW_IDLE_H=1: activity in the session half an hour in keeps the window open past the hour it was opened",
+        T.check(alive(sup) and s.window_state() is not None,
+                "I3. HMD_PAIR_WINDOW_IDLE_H=1: activity in ANY session of the repo (here the second one) keeps the window open past the hour",
                 "alive %r" % alive(sup))
         clock.set(1800 + 3600 + 60)  # an hour and a minute since that activity
-        T.check(wait_until(lambda: not alive(sup), 25) and s.window_state(SID1) is None,
-                "I3. ...and it stops an hour after the last activity, the override honored", "alive %r" % alive(sup))
+        T.check(wait_until(lambda: not alive(sup), 25) and s.window_state() is None,
+                "I3. ...and it stops an hour after the last activity of any session, the override honored", "alive %r" % alive(sup))
 
 
 def case_idle_stop_spares_a_pairing():
@@ -895,11 +1019,12 @@ def case_hook_hands_over_the_transcript():
         transcript = os.path.join(s.sb.root, "session.jsonl")
         write_private(transcript, "{}\n")
         started = s.hook("pair-window-start", SID1, payload={"transcript_path": transcript})
+        recorded = wait_until(lambda: (s.session_record(SID1) or {}).get("transcript") == transcript, 30)
         sup = window_pid(s, timeout=30)
-        argv = H.argv_of(sup) if sup else ""
-        T.check(started.returncode == 0 and started.stdout == "" and "--transcript %s" % transcript in argv,
-                "I5. the SessionStart hook hands the window the session's transcript, the activity its idle stop watches",
-                "rc %r out %r argv %r" % (started.returncode, started.stdout, argv))
+        T.check(started.returncode == 0 and started.stdout == "" and recorded and isinstance(sup, int) and alive(sup),
+                "I5. the SessionStart hook records the session's transcript with it -- the activity the window's idle stop watches, "
+                "across every session of the repo -- and the window opens",
+                "rc %r out %r record %r" % (started.returncode, started.stdout, s.session_record(SID1)))
 
 
 def case_idle_stop_connect_reopens():
@@ -945,21 +1070,21 @@ def case_no_links_followed():
         T.check(rc != 0 and os.listdir(victim2) == [] and mode_of(victim2) == 0o755,
                 "S1. so is a symlinked .heimdall/app", "rc %r %s" % (rc, err))
         plain = os.path.join(s.sb.root, "plain")
-        os.makedirs(os.path.join(plain, ".heimdall", "app"))
+        os.makedirs(os.path.join(plain, ".heimdall", "app", "sessions"))
         target = os.path.join(s.sb.root, "keep.txt")
         write_private(target, "keep")
-        session = os.path.join(plain, ".heimdall", "app", "session.json")
+        session = os.path.join(plain, ".heimdall", "app", "sessions", "%s.json" % SID1)
         os.symlink(target, session)
         rc, _out, err = code_cli(env, "--record-session", "--repo", plain, "--session-id", SID1, "--pid", str(os.getpid()))
         T.check(rc == 0 and open(target).read() == "keep" and not os.path.islink(session) and mode_of(session) == 0o600,
-                "S1. a link planted AT session.json is replaced, never written through", "rc %r %s" % (rc, err))
+                "S1. a link planted AT a session's record is replaced, never written through", "rc %r %s" % (rc, err))
         os.unlink(session)
+        write_private(target, json.dumps({"session_id": SID1, "pid": os.getpid(), "ts": 1}))
         os.symlink(target, session)
-        helper_linked = run([sys.executable, APP_CODE_PY, "--repo", plain], env).stdout.strip()
+        linked = json.loads(code_cli(env, "--live-sessions", "--repo", plain)[1] or "{}").get("sessions")
         os.unlink(session)
-        helper_bare = run([sys.executable, APP_CODE_PY, "--repo", plain], env).stdout.strip()
-        T.check(helper_linked == helper_bare and helper_bare != "",
-                "S1. a session.json reached through a link is no session when read", "%r %r" % (helper_linked, helper_bare))
+        T.check(linked == 0,
+                "S1. a session record reached through a link is no session when read", "live sessions through a link: %r" % linked)
         # the marker the relay client leaves, in a repo whose .heimdall/app is a link
         victim3 = os.path.join(s.sb.root, "victim3")
         os.makedirs(victim3)
@@ -984,10 +1109,10 @@ def case_code_not_derivable():
         rc_b, code_b, _ = code_cli(env_b, "--session-id", SID1)
         _rc, repo_code, _ = code_cli(env_a, "--repo", s_a.repo)
         seed_a = seed_of(s_a.home)
-        T.check(rc_a == 0 and rc_b == 0 and code_a == ref_code(seed_a, "session_id", SID1) and repo_code == ref_code(seed_a, "repo", s_a.repo),
+        T.check(rc_a == 0 and rc_b == 0 and code_a == ref_code(seed_a, "session_id", SID1) and repo_code == ref_code(seed_a, "repo", os.path.realpath(s_a.repo)),
                 "S2. the code is the HMAC of its input under the machine's seed (checked against an independent computation)",
                 "%r %r" % (code_a, repo_code))
-        T.check(code_a != old_code(SID1) and repo_code != old_code(s_a.repo) and code_a != code_b,
+        T.check(code_a != old_code(SID1) and repo_code != old_code(os.path.realpath(s_a.repo)) and code_a != code_b,
                 "S2. so it is not the plain hash of a session id or a repo path, and another machine's seed gives another code",
                 "a %r b %r plain %r" % (code_a, code_b, old_code(SID1)))
         key = os.path.join(s_a.home, "session-code.key")
@@ -997,15 +1122,20 @@ def case_code_not_derivable():
         app_dir = os.path.join(s_a.repo, ".heimdall", "app")
         os.makedirs(app_dir, exist_ok=True)
         os.chmod(app_dir, 0o700)
-        session = os.path.join(app_dir, "session.json")
+        os.makedirs(os.path.join(app_dir, "sessions"), exist_ok=True)
         planted = json.dumps({"session_id": SID2, "pid": os.getpid(), "ts": int(time.time())})
-        write_private(session, planted, mode=0o644)  # what a git checkout leaves behind
-        repo_own = run([sys.executable, APP_CODE_PY, "--repo", s_a.repo], env_a).stdout.strip()
-        os.chmod(session, 0o600)
-        trusted = run([sys.executable, APP_CODE_PY, "--repo", s_a.repo], env_a).stdout.strip()
-        T.check(repo_own != ref_code(seed_a, "session_id", SID2) and trusted == ref_code(seed_a, "session_id", SID2),
-                "S2. a session.json a checkout planted (0644) is not believed; the same file at 0600 -- as the hook writes it -- is",
-                "planted %r trusted %r" % (repo_own, trusted))
+        record = os.path.join(app_dir, "sessions", "%s.json" % SID2)
+        write_private(record, planted, mode=0o644)  # what a git checkout leaves behind
+        write_private(os.path.join(app_dir, "session.json"), planted)  # and a file an older hook wrote
+        live = lambda: json.loads(code_cli(env_a, "--live-sessions", "--repo", s_a.repo)[1] or "{}").get("sessions")
+        planted_live = live()
+        os.chmod(record, 0o600)
+        trusted_live = live()
+        helper = run([sys.executable, APP_CODE_PY, "--repo", s_a.repo], env_a).stdout.strip()
+        T.check(planted_live == 0 and trusted_live == 1 and helper == repo_code,
+                "S2. a session record a checkout planted (0644) is no live session; the same file at 0600 -- as the hook writes it -- is; "
+                "and no file in the repo, a session.json included, moves the code",
+                "planted %r trusted %r helper %r repo %r" % (planted_live, trusted_live, helper, repo_code))
         os.chmod(key, 0o644)
         rc_open, out_open, _ = code_cli(env_a, "--session-id", SID1)
         os.chmod(key, 0o600)
@@ -1022,12 +1152,14 @@ def case_code_not_derivable():
 
 
 def main():
-    for case in (case_one_code, case_hooks, case_auto_pair, case_bg, case_identity_mismatch, case_no_sas_anywhere,
-                 case_notice_and_statusline, case_confirm, case_gh_signed_out_and_two_sessions,
-                 case_renewal_schedule, case_stream_waits_for_renewal, case_renewal_floor_live, case_renewal_before_lapse_live,
-                 case_idle_stop, case_idle_stop_off, case_idle_stop_activity, case_idle_stop_spares_a_pairing,
-                 case_hook_hands_over_the_transcript, case_idle_stop_connect_reopens,
-                 case_no_links_followed, case_code_not_derivable):
+    cases = (case_one_code, case_hooks, case_auto_pair, case_bg, case_identity_mismatch, case_no_sas_anywhere,
+             case_notice_and_statusline, case_confirm, case_gh_signed_out_and_two_sessions, case_window_is_the_repos,
+             case_renewal_schedule, case_stream_waits_for_renewal, case_renewal_floor_live, case_renewal_before_lapse_live,
+             case_idle_stop, case_idle_stop_off, case_idle_stop_activity, case_idle_stop_spares_a_pairing,
+             case_hook_hands_over_the_transcript, case_idle_stop_connect_reopens,
+             case_no_links_followed, case_code_not_derivable)
+    wanted = sys.argv[1:]  # case names to run alone (a quick look while working on one); none runs them all
+    for case in [c for c in cases if not wanted or c.__name__ in wanted]:
         try:
             case()
         except Exception as exc:  # a case that dies is a failure, not a crash of the whole run

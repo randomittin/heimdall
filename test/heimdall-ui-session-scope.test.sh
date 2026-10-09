@@ -543,8 +543,8 @@ with Env():
           UI.collect_session_code(croot) == want_repo, [UI.collect_session_code(croot), want_repo])
 with Env(CLAUDE_CODE_SESSION_ID="code-sess"):
     fresh()
-    check("U17b. a same-repo inherited id -> the code of that session (the statusline's own code)",
-          UI.collect_session_code(croot) == want_sess, [UI.collect_session_code(croot), want_sess])
+    check("U17b. a same-repo inherited id does NOT change it: the code is the repo's, one for every session of the repo",
+          UI.collect_session_code(croot) == want_repo != want_sess, [UI.collect_session_code(croot), want_repo, want_sess])
 with Env(CLAUDE_CODE_SESSION_ID="code-foreign", CLAUDE_SESSION_ID="code-foreign", SESSION_ID="code-foreign"):
     fresh()
     got = UI.collect_session_code(croot)
@@ -642,12 +642,13 @@ if [ "$A_UP" = 1 ] && [ "$B_UP" = 1 ]; then
       '.parallelism.turns == 11 and .parallelism.calls == 22 and .parallelism.source == "live"' "$SA"
   WANT_B_CODE="$(python3 "$SC_PY" --repo "$B_REAL")"
   WANT_A_SESS="$(python3 "$SC_PY" --session-id "$SID_A")"
+  WANT_A_CODE="$(python3 "$SC_PY" --repo "$A_REAL")"
   # shellcheck disable=SC2016  # jq program: $a / $b are jq variables bound by --arg, not shell expansions
   chk "H6. beta's session code is its repo's code, never alpha's session's (S2, S5)" \
       '.identity.session_code == $b and .identity.session_code != $a' "$SB" --arg b "$WANT_B_CODE" --arg a "$WANT_A_SESS"
   # shellcheck disable=SC2016  # jq program: $a is a jq variable bound by --arg, not a shell expansion
-  chk "H6b. alpha (same repo as the inherited id) shows the code of that session" \
-      '.identity.session_code == $a' "$SA" --arg a "$WANT_A_SESS"
+  chk "H6b. alpha (same repo as the inherited id) shows its repo's code, not that session's" \
+      '.identity.session_code == $r and .identity.session_code != $a' "$SA" --arg r "$WANT_A_CODE" --arg a "$WANT_A_SESS"
   chk "H7. the hmd-question panel follows the same session: alpha's open question is alpha's, beta has none" \
       '([.panels[] | select(.id=="hmd-question")] | length) == 1 and ([.panels[] | select(.id=="hmd-question") | .data.text | contains("alpha")] | all)' "$SA"
   chk "H7b. ... beta publishes no question" \

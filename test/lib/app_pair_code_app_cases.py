@@ -304,8 +304,9 @@ def case_prompt():
                         out[-500:])
                 T.check(has_none_of(app.out(), b"\x1b", b"\x07", b"\x00", "\u0085".encode(), "\u009b".encode()),
                         "no escape, bell, NUL or C1 control of the phone's label or login reaches the terminal")
-                T.check("SESSION CODE: 4SELK" in out and "type 4SELK." in out and "as @octocat can use it. Valid for 10 min." in out,
-                        "the SESSION CODE block names the code, the GitHub login and the 10 minutes")
+                T.check("SESSION CODE: 4SELK" in out and "type 4SELK." in out and "as @octocat can use it. It is this repo's code" in out
+                        and "Valid for 10 min" not in out,
+                        "the SESSION CODE block names the code and the GitHub login, says it is the repo's code, and no longer promises 10 minutes")
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT, WINDOW, {"event": "code_paired", "device_label": NASTY, "gh_login": "octo\x1bcat", "bound_at": 1},
                  {"event": "device_bound", "bound_at": 1})

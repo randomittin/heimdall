@@ -144,7 +144,7 @@ Groups per event: UserPromptSubmit 4 · PreToolUse 7 · PostToolUse 4 · Session
 | SessionStart | `caveman-rules` | no | * | Prints caveman rules into context |
 | SessionStart | `settings-guard` | no | * | Advisory: ANTHROPIC_* overrides persisted in a settings.json env block |
 | SessionStart | `volatile-repo-guard` | no | * | Advisory: clone on volatile disk holding unpushed work |
-| SessionStart | `pair-window-start` | no | * | Records the session in `.heimdall/app/session.json` and opens its pair-by-code window in the background (`hmd app pair-window`); skipped when gh is signed out or the session is unattended |
+| SessionStart | `pair-window-start` | no | * | Records the session in `.heimdall/app/sessions/<id>.json` and opens the repo's pair-by-code window in the background (`hmd app pair-window`) when none is open, under the repo's one code; skipped when gh is signed out or the session is unattended |
 | SubagentStop | `subagent-metric` | no | * | Records a task outcome for the finished subagent |
 | SubagentStop | `subagent-429-detect` | no | * | Scans the subagent transcript for a 429; marks for fallback routing |
 | Stop | `stop-metric-reminder` | no | * | Metric reminder at main-agent Stop |
@@ -152,7 +152,7 @@ Groups per event: UserPromptSubmit 4 · PreToolUse 7 · PostToolUse 4 · Session
 | Stop | `stop-429-detect` | no | * | Scans the main transcript for a 429 |
 | Stop | `stop-lint` | no | * | Batch-lints every path edited this session; records a real lint receipt (`bin/heimdall-stop-lint`) |
 | SessionEnd | `presence-keeper-stop` | no | * | Stops this session's keeper |
-| SessionEnd | `pair-window-stop` | no | * | Forgets this session's `session.json` and closes its pair window (`hmd app pair-window --stop`) |
+| SessionEnd | `pair-window-stop` | no | * | Forgets this session's record and closes the repo's pair window (`hmd app pair-window --stop`) unless another live session of the repo, or a running `hmd app connect` client, still needs it |
 | SessionEnd | `session-end-sweep` | no | * | Foreground, alarm-bounded: checkpoint write, then autocommit (the never-lose contract). Background: parallelism grade, `verify-edits --quick`, cleanup, reel, summary card, context-sync; then the farewell |
 | PreCompact | `precompact-checkpoint` | no | * | Auto-checkpoint `.planning/CHECKPOINT.md` before compaction rewrites context (`bin/heimdall-precompact-checkpoint`) |
 
