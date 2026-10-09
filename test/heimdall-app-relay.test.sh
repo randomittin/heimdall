@@ -1330,24 +1330,46 @@ def load(path):
     return out
 
 
+def logged(event):
+    """What the durable log keeps of a stdout line: the whole line, but for the pair_init QR's pairing_code -- a bearer secret
+    for as long as its session lives, which the 0600 log under the repo outlives. stdout keeps it (`hmd app connect` renders
+    the QR from it). That one field is the only cut: anything else that differs is still a mismatch."""
+    qr = event.get("qr") if event.get("event") == "pair_init" else None
+    if isinstance(qr, dict):
+        return dict(event, qr={k: v for k, v in qr.items() if k != "pairing_code"})
+    return event
+
+
 stdout_events = load(sys.argv[1])
 log_events = load(sys.argv[2])
-if len(stdout_events) != len(log_events) or not stdout_events:
-    print("RESULT order_ok False")
-    sys.exit(0)
-for so, lo in zip(stdout_events, log_events):
-    lo = dict(lo)
-    ts = lo.pop("ts", None)
-    if lo != so or not isinstance(ts, str) or not ts.endswith("Z"):
-        print("RESULT order_ok False")
-        sys.exit(0)
-print("RESULT order_ok True")
+order_ok = bool(stdout_events) and len(stdout_events) == len(log_events)
+if order_ok:
+    for so, lo in zip(stdout_events, log_events):
+        lo = dict(lo)
+        ts = lo.pop("ts", None)
+        if lo != logged(so) or not isinstance(ts, str) or not ts.endswith("Z"):
+            order_ok = False
+            break
+print("RESULT order_ok %s" % order_ok)
+
+# the cut itself: stdout's pair_init line holds the code, and neither the field nor a code's value is anywhere in the log
+codes = [e["qr"]["pairing_code"] for e in stdout_events
+         if e.get("event") == "pair_init" and isinstance(e.get("qr"), dict) and e["qr"].get("pairing_code")]
+with open(sys.argv[2]) as f:
+    raw_log = f.read()
+print("RESULT code_cut %s" % bool(codes and "pairing_code" not in raw_log and not any(code in raw_log for code in codes)))
 PYEOF
 ORDER_OK_J="$(grep -o 'RESULT order_ok [A-Za-z]*' "$ORDER_OUT_J" | awk '{print $3}')"
 if [ "$ORDER_OK_J" = "True" ]; then
-  ok "durable event log: every line matches stdout in order, plus one added ISO-8601 UTC 'ts' field"
+  ok "durable event log: every line matches stdout in order, plus one added ISO-8601 UTC 'ts' field (the pair_init QR's pairing_code aside)"
 else
   bad "durable event log: content/order/ts mismatch against stdout (got '$ORDER_OK_J') -- $(cat "$TMPROOT/j.order.err")"
+fi
+CODE_CUT_J="$(grep -o 'RESULT code_cut [A-Za-z]*' "$ORDER_OUT_J" | awk '{print $3}')"
+if [ "$CODE_CUT_J" = "True" ]; then
+  ok "durable event log: pair_init carries its pairing_code on stdout and never in the log (neither the field nor the code's value)"
+else
+  bad "durable event log: the pairing_code was written to the event log, or pair_init never carried one on stdout (got '$CODE_CUT_J') -- $(cat "$TMPROOT/j.order.err")"
 fi
 
 # event_log_secret_lines FILE -- the lines of an NDJSON event log that leak key material; event_log_secret_hits FILE
@@ -1362,9 +1384,12 @@ fi
 #
 # It must not be a bare substring match. The check used to be `grep -Eic 'priv|secret|session_key|"token"'`, and
 # `priv` matches "/private/var/folders/...", the realpath of a macOS $TMPDIR: RelayClient.root is
-# os.path.realpath(--repo), so an error detail naming a file the client touched -- `status write failed: [Errno 2]
-# No such file or directory: '/private/var/.../.heimdall/app/relay.json.tmp-1234'` -- carries one, and
-# write_status() is called from both the state loop and the stream thread, which share that temp name and can race.
+# os.path.realpath(--repo), so an error detail naming a path the client touched carries one. It was `status write failed:
+# [Errno 2] No such file or directory: '/private/var/.../.heimdall/app/relay.json.tmp-1234'` while write_status() -- called
+# from both the state loop and the stream thread -- shared one temp name and could race. Now every state file is written
+# through bin/lib/hmd_private_state.py, which walks down from the root one directory at a time, so a refusal below the
+# root names only the component (`Not a directory: 'app'`); the path that is still named is the root's own, which the
+# walk opens by its real path first (a repo deleted or replaced under a running client).
 # One such event, which a loaded box can produce, made the old check report a secret that was only a path.
 event_log_secret_lines() {
   local field_re='\\*"[A-Za-z0-9_.-]*(priv|secret|session_key|token)[A-Za-z0-9_.-]*\\*"[[:space:]]*:'
@@ -1445,14 +1470,16 @@ else
   bad "secret scan controls: could not be generated -- $(cat "$TMPROOT/j.scan-controls.err")"
 fi
 
-# The same negative control with an event the real client emits: RelayClient.write_status() with a file where its
-# status dir belongs, so os.makedirs raises FileExistsError naming the path -- under a repo path that holds
-# /private/var/ on every platform, as the realpath of a macOS $TMPDIR does. In-process, the same SourceFileLoader
-# technique as Scenario K.
+# The same negative control with an event the real client emits: RelayClient.write_status() with a file where the repo root
+# belongs, so the first step of the walk bin/lib/hmd_private_state.py makes down from the root -- opening the root by its
+# real path -- raises NotADirectoryError naming that path -- under a repo path that holds /private/var/ on every platform,
+# as the realpath of a macOS $TMPDIR does. (A file where .heimdall/app belongs no longer does: the walk's refusal there
+# names only `app`, relative to the directory before it, so it carries no path to scan.) In-process, the same
+# SourceFileLoader technique as Scenario K.
 NEG_ROOT_J="$TMPROOT/private/var/folders/xx/negctl"
 NEG_EVENTS_J="$TMPROOT/j.negctl.events.jsonl"
-mkdir -p "$NEG_ROOT_J/.heimdall"
-: > "$NEG_ROOT_J/.heimdall/app"
+mkdir -p "$(dirname "$NEG_ROOT_J")"
+: > "$NEG_ROOT_J"
 HMD_RELAY_EVENT_LOG="$NEG_EVENTS_J" python3 - "$RELAY_CLIENT_RUN" "$NEG_ROOT_J" >/dev/null 2>"$TMPROOT/j.negctl.err" <<'PYEOF'
 import importlib.util, os, sys
 from importlib.machinery import SourceFileLoader
@@ -1753,6 +1780,9 @@ cat > "$REPO_N/.heimdall/app/relay.json" <<JSON
  "last_seq":1,"frames_sent":1,"last_delivered":"2026-01-01T00:00:01Z","pid":$$,
  "last_command_at":null,"started_at":1,"event_log":"$EVENT_LOG_N"}
 JSON
+# what hmd's own writers leave is 0600 (bin/lib/hmd_private_state.py), and `hmd app status` believes no other kind of state file:
+# a checked-in one is 0644 and is no state at all. So the hand-synthesized fixtures are made the way the real ones are.
+chmod 600 "$REPO_N/.heimdall/app/connect.json" "$REPO_N/.heimdall/app/relay.json" "$EVENT_LOG_N"
 
 STATUS_OUT_N="$("$APP" status --repo "$REPO_N" 2>"$TMPROOT/n.status.err")"
 
@@ -1779,6 +1809,7 @@ cat > "$REPO_N2/.heimdall/app/relay.json" <<JSON
  "last_seq":0,"frames_sent":0,"last_delivered":null,"pid":$$,
  "last_command_at":null,"started_at":1,"event_log":null}
 JSON
+chmod 600 "$REPO_N2/.heimdall/app/connect.json" "$REPO_N2/.heimdall/app/relay.json"   # 0600 like the real ones (see above)
 
 STATUS_OUT_N2="$("$APP" status --repo "$REPO_N2" 2>"$TMPROOT/n2.status.err")"
 if printf '%s\n' "$STATUS_OUT_N2" | grep -qF "event log: disabled"; then
