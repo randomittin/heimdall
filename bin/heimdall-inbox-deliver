@@ -43,7 +43,7 @@
 # text instead of stopping.
 #
 # THE INBOX FILE PROTOCOL. One JSON object per line, in
-# <repo>/.heimdall/ui/inbox.jsonl: {"id","ts","text","source"} (plus "answers","ask" on an
+# <repo>/.heimdall/ui/inbox.jsonl: {"id","ts","text","source"} (plus "answers","sig" on an
 # answer to an open question, see ANSWER FRAMING). A sibling
 # tool, bin/lib/companion_ui_inbox.py, owns writing that file for real and
 # exposes append(root,text) / list_pending(root) / pop_all(root) /
@@ -153,26 +153,43 @@
 #
 # ANSWER FRAMING (docs/HANDOFF-TO-HEIMDALL-phone-replies-reach-session.md 4(a)). A phone message
 # received while hmd was waiting on a question carries a stamp from bin/lib/companion_ui_inbox.py
-# append(): "answers" (that question's attention id) and "ask" (its summary), set at receive time
+# append(): "answers" (that question's attention id) and "sig" (its seal, below), set at receive time
 # from what hmd itself derives -- never from the sender, never from the text. stop, prompt and tool
-# deliver such a record as THE OPERATOR'S ANSWER to that question -- the question (a JSON string),
-# its ask id, the answer in the usual quoted block, and no untrusted-data caution -- while that
+# deliver a record whose seal verifies as THE OPERATOR'S ANSWER to that question -- the question (a JSON
+# string), its ask id, the answer in the usual quoted block, and no untrusted-data caution -- while that
 # question is still the open one, re-derived at delivery from the transcript of the session being
-# served (bin/lib/companion_ui_attention.py; the copy beside this script first). Once it is not
+# served (bin/lib/companion_ui_attention.py; the copy beside this script first). That derivation is the
+# only source of the question's text: the record carries none, and a field "ask" in one is never read,
+# so a late message names the ask id only. Once it is not
 # (answered at the laptop, closed, a newer question asked) the message is an ordinary operator
 # message that says it arrived late. A record with no stamp is an ordinary message under the
 # untrusted marker, exactly as before. tmux types the text as a real prompt and is unchanged.
-#   WHO CAN PRODUCE THE FRAMING. Only a stamp append() wrote counts, and append() stamps only
-#     inside the relay client -- the E2E-paired channel, where a command is a frame that opened
-#     under the paired device's session key; the direct bearer-token route is never stamped. At
-#     delivery: source "companion" and an id of exactly attention's own shape ("a-" and ten hex
-#     digits). A hand-appended line, a stamp of another shape, text that merely reads like a
-#     header or an answer: ignored, untrusted framing.
-#     The frame is built from the record's stamp and the live derivation, never by reading the
+#   WHO CAN PRODUCE THE FRAMING. Only a record the relay client SEALED. inbox.jsonl lives under the
+#     repo, so anything that can write a file -- a checked-in or planted line, another process, a
+#     tool the model ran -- can write "source", "answers" and "ask"; none of them is evidence of
+#     anything. append() stamps only inside the relay client (the E2E-paired channel, where a
+#     command is a frame that opened under the paired device's session key; the direct bearer-token
+#     route is never stamped) and seals the stamp: "sig" is HMAC-SHA256 over exactly (id, ts, text,
+#     answers) under a per-machine key at $HEIMDALL_HOME/app/inbox-answer.key (0600, outside every
+#     repo, made on first use by the sealing side). At delivery stamp_sealed() recomputes it with the
+#     key read here, by this script's own code and never the repo's copy of the library; anything
+#     that does not verify is an ordinary message under the untrusted marker, still delivered: no
+#     stamp, a stamp of another shape, an edited or copied record, another machine's key, a key that
+#     is missing, a symlink or readable by others, text that merely reads like a header or an answer.
+#     Honest limit: whoever can read that key file (same user, outside the repo) can seal.
+#     The frame is built from the verified stamp and the live derivation, never by reading the
 #     message, the transcript or any tool output for something that looks like an answer.
 #   NOTHING IN THE FRAME FORGES THE FRAME. The hook's own lines start at column 0; every line of
 #     delivered text is indented four spaces inside a fence it cannot close (a run of backticks is
 #     broken up), and the question is one JSON-quoted line, so neither can open a second header.
+#     Before that, defang() leaves the text unable to look like more than text: NEL, LS and PS
+#     become real newlines (indented like the rest), and every less-than sign (so the wrapper tag
+#     Claude Code closes around hook output cannot be closed from inside), control, bidi, zero-width,
+#     tag and other format character becomes a visible escape such as ‮. The question line
+#     gets the same escape. tmux is not framed and is untouched.
+#   RECORDS ARE SPLIT ON NEWLINE ONLY. The inline fallback used str.splitlines(), which also cuts at
+#     U+2028, U+2029 and U+0085: a message carrying one sat raw inside its JSON line, was cut into
+#     fragments, and was lost -- and a text could be shaped so a fragment parsed as a record of its own.
 #   SAME LEADING WORDS. The answer and labelled headers begin as the plain marker does, because
 #     the chat publisher (bin/lib/companion_ui_publish.py phone_messages) recognises a delivery by
 #     them and reads the quoted block as the operator's own line.
@@ -304,11 +321,11 @@ Modes:
            --json is accepted (output is always JSON either way).
 
 Answers:
-  A phone message received while hmd was waiting on a question is stamped with that question's id at
-  receive time. stop, prompt and tool deliver it as the operator's own answer to that question
-  (the question text, its ask id, the quoted answer, no untrusted-data caution) while it is still
-  the open one, and as an ordinary message that says it arrived late once it is not. A message
-  with no stamp keeps the untrusted-data marker. Every dequeue records which mode popped it
+  A phone message received while hmd was waiting on a question is stamped with that question's id, and
+  sealed, at receive time. stop, prompt and tool deliver it as the operator's own answer to that question
+  (the question text, derived now from the session, its ask id, the quoted answer, no untrusted-data
+  caution) while it is still the open one, and as an ordinary message that says it arrived late once it
+  is not. A message with no valid seal keeps the untrusted-data marker. Every dequeue records which mode popped it
   (via) in the delivery receipt. See ANSWER FRAMING in this file's header.
 
 Env:
@@ -408,7 +425,7 @@ if [ "$MODE" = tool ]; then
 fi
 
 PY_SRC=$(cat <<'PYEOF'
-import fcntl, json, os, re, select, shlex, shutil, subprocess, sys, time
+import fcntl, hashlib, hmac, json, os, re, select, shlex, shutil, stat, subprocess, sys, time, unicodedata
 
 MODE, REPO_EXPLICIT, DEFAULT_REPO = sys.argv[1], sys.argv[2], sys.argv[3]
 # argv[4] is the pid of the shell that launched this script (PPID in the bash
@@ -476,6 +493,13 @@ SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")   # hmd_session_resolve.py: 
 ASK_MAX_CHARS = 160                                   # attention's SUMMARY_MAX
 MAX_NOTES_CHARS = 1500                                # the labels above the quoted block: marker + labels + 8000-char body stay under 10000
 VIA_VALUES = ("stop", "prompt", "tool", "tmux", "cli")   # the delivery paths bin/lib/companion_ui_inbox.py records
+SEAL_KEY_REL = os.path.join("app", "inbox-answer.key")   # under HEIMDALL_HOME: the key the relay client seals an answer stamp with (mirrors bin/lib/companion_ui_inbox.py)
+SEAL_KEY_BYTES = 32                                      # a key shorter than this is no key
+SEAL_KEY_MAX_BYTES = 4096                                # never read more of the key file than this
+SEAL_DOMAIN = b"hmd-inbox-answer-v1\n"                   # prefixes what is sealed, byte for byte as bin/lib/companion_ui_inbox.py writes it
+LINE_BREAKS_RE = re.compile("[\u0085  ]")      # NEL, line separator, paragraph separator: a line break to a reader, not to a split on newline
+KEEP_FORMAT = frozenset("‌‍")                  # the two joiners real text needs (emoji sequences, Indic and Persian scripts)
+ESCAPED_CATEGORIES = frozenset(("Cc", "Cf", "Cs"))      # control, format (bidi, zero-width, tag characters and the like), surrogate
 
 
 def truncate(s, cap):
@@ -605,7 +629,7 @@ class _Flock(object):
 
 def _parse_lines(raw):
     items = []
-    for line in raw.splitlines():
+    for line in raw.split("\n"):   # never splitlines(): U+2028, U+2029 and U+0085 sit raw inside a record's JSON string
         line = line.strip()
         if not line:
             continue
@@ -654,7 +678,7 @@ def stamp_delivered(raw, delivered_at, via=None):
     # known via, the mode that popped it; any other line is kept as it was, so a pop
     # never silently loses a byte.
     out = []
-    for line in raw.splitlines():
+    for line in raw.split("\n"):   # never splitlines(), see _parse_lines
         if not line.strip():
             continue
         try:
@@ -949,21 +973,91 @@ def one_line(s, cap):
     return truncate(" ".join(_CONTROL_CHARS_RE.sub(" ", str(s or "")).split()), cap)
 
 
+def seal_key():
+    # The per-machine key the relay client seals an answer stamp with (bin/lib/companion_ui_inbox.py), or None. Only
+    # read here -- the sealing side alone makes it -- and only trusted as a regular file this user owns that nobody
+    # else can read, opened without following a symlink and judged on the open descriptor. No key means nothing
+    # verifies, so every stamp then reads as an ordinary message: the cautious side.
+    home = os.environ.get("HEIMDALL_HOME") or (os.path.join(os.environ["HOME"], ".heimdall") if os.environ.get("HOME") else "")
+    if not home:
+        return None
+    try:
+        fd = os.open(os.path.join(home, SEAL_KEY_REL),
+                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            return None
+        key = os.read(fd, SEAL_KEY_MAX_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return key if len(key) >= SEAL_KEY_BYTES else None
+
+
+def stamp_sealed(key, rec):
+    # True only when rec["sig"] is the HMAC-SHA256 that bin/lib/companion_ui_inbox.py made over exactly (id, ts, text,
+    # answers) with this machine's key. It is the ONLY evidence of an answer stamp: nothing else in a record (source,
+    # an id of the right shape, an ask) says anything, because whatever can write inbox.jsonl -- a checked-in file,
+    # another process, a tool the model ran -- can write those. A changed field, a sig moved onto another record, a
+    # seal under another key: none verifies.
+    rid, ts, text, ans, sig = (rec.get(k) for k in ("id", "ts", "text", "answers", "sig"))
+    if not (isinstance(rid, str) and isinstance(text, str) and isinstance(sig, str)
+            and isinstance(ans, str) and ASK_ID_RE.fullmatch(ans)):
+        return False
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return False
+    body = json.dumps([rid, ts, text, ans], ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    want = hmac.new(key, SEAL_DOMAIN + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(want.encode("ascii"), sig.encode("utf-8", "replace"))
+
+
+def escape_char(ch):
+    cp = ord(ch)
+    return "\\u%04x" % cp if cp <= 0xFFFF else "\\U%08x" % cp
+
+
+def needs_escape(ch):
+    # The less-than sign (no tag can open: above all, nothing can close the wrapper Claude Code puts around hook
+    # output), and every control, format (bidi, zero-width, word joiner, soft hyphen, tag characters and the like) or
+    # surrogate character, plus the variation selectors supplement. Newline and tab stay, and so do the two joiners.
+    if ch == "<":
+        return True
+    if ch in "\n\t" or ch in KEEP_FORMAT:
+        return False
+    return unicodedata.category(ch) in ESCAPED_CATEGORIES or 0xE0100 <= ord(ch) <= 0xE01EF
+
+
+def escape_chars(text):
+    # Each such character becomes a visible escape such as ‮: nothing is dropped silently, nothing acts unseen.
+    return "".join(escape_char(ch) if needs_escape(ch) else ch for ch in text)
+
+
+def defang(text):
+    # Delivered text, made safe to quote. NEL, LS and PS become real newlines first, so the indentation that keeps every
+    # line of the text off column 0 reaches what a reader would take for a line start; then escape_chars.
+    return escape_chars(LINE_BREAKS_RE.sub("\n", text))
+
+
 def messages_of(items):
-    # What each popped record says, and the stamp it carries. A stamp counts only on a record the paired
-    # phone's receive path wrote -- source "companion" and an id of exactly attention's own shape; on
-    # anything else it is ignored and the message stays an ordinary one.
-    out = []
+    # What each popped record says, and the stamp it can claim. A stamp counts only when it is SEALED (stamp_sealed);
+    # the question's text is never read from a record -- label_messages derives it now. The key is read once, and only
+    # when a record claims a stamp at all.
+    out, key, key_read = [], None, False
     for it in items:
         if not isinstance(it, dict):
             continue
         t = sanitize(it.get("text", ""))
         if not t.strip():
             continue
-        ans = it.get("answers")
-        stamped = it.get("source") == "companion" and isinstance(ans, str) and bool(ASK_ID_RE.fullmatch(ans))
-        out.append({"text": t, "kind": "plain", "answers": ans if stamped else None,
-                    "ask": one_line(it.get("ask"), ASK_MAX_CHARS) if stamped else ""})
+        claims = it.get("answers") is not None
+        if claims and not key_read:
+            key, key_read = seal_key(), True
+        sealed = claims and key is not None and stamp_sealed(key, it)
+        out.append({"text": defang(t), "kind": "plain", "answers": it["answers"] if sealed else None, "ask": ""})
     return out
 
 
@@ -1018,7 +1112,7 @@ def label_messages(root, hook, msgs):
             continue
         if now_open is not None and now_open["id"] == m["answers"]:
             m["kind"] = "answer"
-            m["ask"] = one_line(now_open.get("summary"), ASK_MAX_CHARS) or m["ask"]
+            m["ask"] = one_line(now_open.get("summary"), ASK_MAX_CHARS)   # the live derivation or nothing: a record's own ask is never read
         else:
             m["kind"] = "late"
 
@@ -1036,7 +1130,7 @@ def notes_for(msgs):
             which = "the message below" if len(msgs) == 1 else "every message below"
         else:
             which = ("message %s" if len(idx) == 1 else "messages %s") % ", ".join(str(i) for i in idx)
-        quoted = (" " + json.dumps(ask, ensure_ascii=False)) if ask else ""
+        quoted = (" " + escape_chars(json.dumps(ask, ensure_ascii=False))) if ask else ""
         if kind == "answer":
             lines.append("Operator's answer to your open question%s (ask %s), sent from their paired phone: %s."
                          % (quoted, ask_id, which))

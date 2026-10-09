@@ -12,23 +12,27 @@ Message file: one JSON object per line, appended to
 <repo>/.heimdall/ui/inbox.jsonl:
     {"id": str (uuid4), "ts": float (epoch), "text": str, "source": "companion"}
 plus, only on a message received while hmd was waiting on a question, the stamp
-    "answers": str (that question's attention id, "a-<10 hex>"), "ask": str (its one-line summary)
+    "answers": str (that question's attention id, "a-<10 hex>"), "sig": str (64 hex: the seal over the record)
 -- see Answers, below.
 
 Answers (the phone's reply to a question hmd is waiting on): append() asks
 bin/lib/companion_ui_attention.py what is open right now -- the SAME derivation the phone's own `attention`
 slice is read from -- and when that is a question (state needs_input, kind question) stamps the record with the
-episode id as "answers" and the question's one-line summary as "ask" (left out when attention withheld the
-summary as secret-shaped). The stamp is set HERE, at receive time, from what hmd itself derives: never from a
+episode id as "answers", and SEALS it: "sig" is HMAC-SHA256 over exactly (id, ts, text, answers) under a per-machine
+key at $HEIMDALL_HOME/app/inbox-answer.key (0600, in a 0700 directory, outside every repo; made here on first use).
+The question's text is not stored: bin/heimdall-inbox-deliver derives it at delivery from the session's own
+attention state. The stamp is set HERE, at receive time, from what hmd itself derives: never from a
 field the sender supplied and never from the message text. And only on the E2E-paired channel: append() stamps
 only when it runs INSIDE the relay client of this repo (connect.json's pid_client is this process), where a
 command is a frame that opened under the paired device's session key -- the phone's sealed `send-message`. A
 send through the direct bearer-token route (POST /api/send, served by `hmd ui`) is never stamped; it is not the
-paired channel. bin/heimdall-inbox-deliver frames a stamped record as the operator's answer to that question
-while it is still the open one, and as a late message once it is not; no question open -> no stamp -> an
-ordinary chat message. A text that opens with
+paired channel. bin/heimdall-inbox-deliver frames a record whose seal verifies as the operator's answer to that
+question while it is still the open one, and as a late message once it is not; no question open -> no stamp -> an
+ordinary chat message. Every field of a record is forgeable by whatever can write inbox.jsonl (a checked-in or
+planted line, another process, a tool the model ran); only the seal is not, so a record without a valid one is an
+ordinary message under the untrusted-data framing whatever else it claims. A text that opens with
 SYSTEM_NOTICE_PREFIX is hmd's own notice (the relay client's pairing notice), not something typed on the phone,
-and is never stamped. A failure to derive the question costs the stamp, never the message.
+and is never stamped. A failure to derive the question, or to read or make the key, costs the stamp, never the message.
 
 Validation (append() -- nothing is ever written on a failure):
     - text is first run through _strip_control_chars() (control/escape bytes
@@ -119,8 +123,11 @@ standalone with zero intra-repo import coupling.
 """
 import argparse
 import bisect
+import contextlib
 import datetime
 import fcntl
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -153,6 +160,10 @@ RECEIPTS_TAIL_BYTES = 256 * 1024        # the newest archive lines hold them; ne
 GIT_TIMEOUT_S = 3
 VIA_VALUES = ("stop", "prompt", "tool", "tmux", "cli")   # who dequeued: bin/heimdall-inbox-deliver's modes, and `hmd ui inbox pop`
 SYSTEM_NOTICE_PREFIX = "[hmd notice]"   # opens a text hmd itself queues (bin/heimdall-relay-client's pairing notice): never an answer
+SEAL_KEY_REL = os.path.join("app", "inbox-answer.key")   # under $HEIMDALL_HOME: the per-machine key an answer stamp is sealed with
+SEAL_KEY_BYTES = 32                     # a key shorter than this is no key
+SEAL_KEY_MAX_BYTES = 4096               # never read more of the key file than this
+SEAL_DOMAIN = b"hmd-inbox-answer-v1\n"  # prefixes what is sealed, so this seal is never valid as any other HMAC under the key
 EXPIRE_AFTER_S = 2 * 3600.0             # pending this long -> listed in inbox.expired: nothing is taking turns to receive it
 READ_LOOKBACK_S = 3600.0                # read_at is looked up only for a delivery this recent (the phone watches the last few minutes)
 READ_TAIL_BYTES = 512 * 1024            # the tail of the session transcript searched for the assistant entry after a delivery
@@ -403,9 +414,70 @@ def open_ask(root):
 
 
 # ── writing ──────────────────────────────────────────────────────────────────
+def _heimdall_home():
+    """$HEIMDALL_HOME, else ~/.heimdall (bin/lib/companion_remote_switches.py's resolution); None with neither it
+    nor HOME -- there is no /tmp fallback, a directory other users can write."""
+    explicit = os.environ.get("HEIMDALL_HOME")
+    if explicit:
+        return explicit
+    home = os.environ.get("HOME")
+    return os.path.join(home, ".heimdall") if home else None
+
+
+def _read_seal_key(path):
+    """The key in `path` when _open_own accepts it (a regular file this user owns that nobody else can read, no
+    symlink followed, judged on the open descriptor) and it is long enough, else None."""
+    fd = _open_own(path, PRIVATE)
+    if fd is None:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as f:
+            key = f.read(SEAL_KEY_MAX_BYTES)
+    except OSError:
+        return None
+    return key if len(key) >= SEAL_KEY_BYTES else None
+
+
+def _seal_key():
+    """The per-machine key an answer stamp is sealed with: SEAL_KEY_REL under $HEIMDALL_HOME, 0600 in a 0700
+    directory, outside every repo. Made here when absent -- written whole to a private temp file and linked into
+    place, so a racing second maker gets EEXIST and reads the winner's key, never a half-written one. None when it
+    can be neither read nor made: no key, no seal, no stamp -- and the message still goes through."""
+    home = _heimdall_home()
+    if home is None:
+        return None
+    path = os.path.join(home, SEAL_KEY_REL)
+    key = _read_seal_key(path)
+    if key is not None:
+        return key
+    tmp = "%s.%s.tmp" % (path, uuid.uuid4().hex)
+    try:
+        _ensure_dir(os.path.dirname(path))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(os.urandom(SEAL_KEY_BYTES))
+            f.flush()
+            os.fsync(f.fileno())
+        with contextlib.suppress(FileExistsError):   # EEXIST: another maker linked its key first, and that one is the key
+            os.link(tmp, path)
+    except OSError:
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    return _read_seal_key(path)
+
+
+def _seal(key, rec_id, ts, text, answers):
+    """The seal of an answer stamp: HMAC-SHA256 (hex) over exactly (id, ts, text, answers).
+    bin/heimdall-inbox-deliver's stamp_sealed recomputes it; the two must stay byte for byte the same."""
+    body = json.dumps([rec_id, ts, text, answers], ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    return hmac.new(key, SEAL_DOMAIN + body, hashlib.sha256).hexdigest()
+
+
 def append(root, text):
     """Validate `text` and atomically append one message to inbox.jsonl. Returns
-    the new record {id, ts, text, source}, plus {answers, ask} when hmd was waiting on a question
+    the new record {id, ts, text, source}, plus {answers, sig} when hmd was waiting on a question
     as it arrived (see Answers in the module docstring). Raises InboxError -- nothing is ever
     written on a validation failure (including the queue already being at
     MAX_PENDING), and the exception never carries `text`."""
@@ -423,10 +495,10 @@ def append(root, text):
     record = {"id": str(uuid.uuid4()), "ts": time.time(), "text": text, "source": "companion"}
     typed_on_phone = not text.lstrip().startswith(SYSTEM_NOTICE_PREFIX)
     ask = open_ask(root) if typed_on_phone and _in_paired_relay_client(root) else None
-    if ask is not None:
+    key = _seal_key() if ask is not None else None
+    if key is not None:
         record["answers"] = ask["id"]
-        if ask["summary"]:
-            record["ask"] = ask["summary"]
+        record["sig"] = _seal(key, record["id"], record["ts"], text, ask["id"])
     line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
     path = _inbox_path(root)
     _ensure_dir(os.path.dirname(path))
