@@ -427,12 +427,22 @@ fi
 #                                           hooks/hooks.metadata.json, switchable with
 #                                           `heimdall-hooks disable pair-window-start`,
 #                                           covered by test/app-pair-confirm.test.sh.
+#
+# 13 -> 15 on 2026-10-09, two entries, known and advisory (phone wake, handoff
+# phone-replies-reach-session §4(b)):
+#   SessionStart[13] inbox-wake-register  -- bin/heimdall-inbox-wake: records this
+#                                           session's pid (and tmux pane) so a
+#                                           paired-phone message can wake it
+#   SessionStart[14] inbox-wake-arm-start -- bin/heimdall-inbox-wake: arms the
+#                                           asyncRewake watcher for an idle session
+# Both are registered in hooks/hooks.metadata.json, switchable with
+# `heimdall-hooks disable <id>`, covered by test/heimdall-inbox-wake.test.sh.
 # ══════════════════════════════════════════════════════════════════════════
 SS_COUNT="$(jq '.hooks.SessionStart | length' "$HOOKS_JSON")"
-if [ "$SS_COUNT" -eq 13 ]; then
-  ok "G9 all 13 SessionStart entries still present"
+if [ "$SS_COUNT" -eq 15 ]; then
+  ok "G9 all 15 SessionStart entries still present"
 else
-  bad "G9 expected 13 SessionStart entries, found $SS_COUNT"
+  bad "G9 expected 15 SessionStart entries, found $SS_COUNT"
 fi
 
 # The caveman `rules` entry specifically: it is the ONLY thing that puts hmd's
