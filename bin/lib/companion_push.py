@@ -104,7 +104,10 @@ LOGGING. Callers get one event per planned message through `emit`:
 STORE. The registered devices live behind bin/lib/companion_push_store.py (load / remove_tokens); this
 module never writes them except to drop a token Expo said is gone (DeviceNotRegistered, from a ticket or a
 receipt fetched >= 900 s after the send). The store reports when the app last said foreground / background as
-an ISO-8601 UTC timestamp (`app_state_at`); it is read here as epoch seconds.
+an ISO-8601 UTC timestamp (`app_state_at`); it is read here as epoch seconds. Where a notification goes, which
+kinds it may be and whether it is held back all come from that one record, and the store believes only a record
+it sealed itself (its docstring, WHAT IS BELIEVED): a push.json a checkout or another process planted names no
+device here, however well formed. The sender lock is opened the same way, without following a link.
 
 Stdlib only. Loadable by path, like every companion_* module.
 """
@@ -228,6 +231,20 @@ def _load_sibling(name):
         return mod
     except Exception:
         return None
+
+
+_PRIVATE = {"mod": None}
+
+
+def _private_state():
+    """bin/lib/hmd_private_state.py by path, loaded once: how this module opens the sender lock under the repo's .heimdall without
+    following a link. OSError when it cannot be loaded -- there is no fallback to a plain open()."""
+    if _PRIVATE["mod"] is None:
+        mod = _load_sibling("hmd_private_state")
+        if mod is None:
+            raise OSError("bin/lib/hmd_private_state.py could not be loaded")
+        _PRIVATE["mod"] = mod
+    return _PRIVATE["mod"]
 
 
 _SECRET = {"tried": False, "fn": None}
@@ -1481,10 +1498,9 @@ class PushMonitor:
         at the first event that has a registered device to tell and never released before close() / process exit."""
         if self._lock_fd is not None:
             return True
-        path = os.path.join(self.root, LOCK_REL)
+        directory, name = os.path.split(LOCK_REL)
         try:
-            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            fd = _private_state().open_lockfile(self.root, directory, name)   # no link on the way, a file of ours, 0600: nothing is created through a planted link
         except OSError as exc:
             self._error_once("lock", exc)
             return False

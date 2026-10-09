@@ -567,7 +567,9 @@ path so the session can read it; that path is in no frame sent to the phone, no 
 Sent by hmd itself, **not through the relay**: one HTTPS call class to
 `https://exp.host/--/api/v2/push/send` (and `…/getReceipts`, once, at least 900 s after a
 send), only after a paired phone registered an Expo push token in
-`<repo>/.heimdall/app/push.json`. The sender is the one `hmd ui` or relay-client process per
+`<repo>/.heimdall/app/push.json` — a record hmd seals with a per-machine key (the one the inbox seals
+answers with), so a `push.json` that is checked in, planted or linked names no device; one written before
+sealing is ignored and the phone registers again at its next connect. The sender is the one `hmd ui` or relay-client process per
 repo that holds `push-sender.lock`. **Not sealed:** Expo, and Apple or Google behind it, can
 read the title and body. Redirects are never followed, and `HMD_PUSH_EXPO_URL` is honoured
 only for a loopback host, so it cannot redirect pushes elsewhere.
