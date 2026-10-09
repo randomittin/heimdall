@@ -611,8 +611,8 @@ else
   A2_BASE="http://127.0.0.1:$A2_PORT"; A2_AUTH="$A2_TP=$A2_TOKEN"
   ok "A2.0 second server up on $A2_BASE"
 
-  if a2_until '.inbox | (keys == ["consumer","delivered","oldest_age_s","pending"]) and .pending == 0 and .consumer == "none" and .oldest_age_s == null and .delivered == []' 5; then
-    ok "A2.1 fresh inbox slice is exactly {pending:0, consumer:\"none\", oldest_age_s:null, delivered:[]}"
+  if a2_until '.inbox | (keys == ["consumer","delivered","expired","oldest_age_s","pending"]) and .pending == 0 and .consumer == "none" and .oldest_age_s == null and .expired == [] and .delivered == []' 5; then
+    ok "A2.1 fresh inbox slice is exactly {pending:0, consumer:\"none\", oldest_age_s:null, expired:[], delivered:[]}"
   else
     bad "A2.1 unexpected inbox slice: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
   fi
@@ -665,8 +665,8 @@ else
   else
     bad "A2.5b hook output: $(cat "$TMPROOT/a2-stop2.out")"
   fi
-  if a2_until ".inbox.pending == 0 and (.inbox.delivered | map(.id) | index(\"$A2_ID2\") != null) and (.inbox.delivered[0] | keys == [\"delivered_at\",\"id\"]) and all(.inbox.delivered[]; keys == [\"delivered_at\",\"id\"])" 10; then
-    ok "A2.5c after delivery: pending 0, id from the 202 is in inbox.delivered, every entry is exactly {delivered_at, id}"
+  if a2_until ".inbox.pending == 0 and (.inbox.delivered | map(.id) | index(\"$A2_ID2\") != null) and (.inbox.delivered[0] | keys == [\"delivered_at\",\"id\",\"read_at\",\"via\"]) and all(.inbox.delivered[]; keys == [\"delivered_at\",\"id\",\"read_at\",\"via\"]) and ([.inbox.delivered[] | select(.id == \"$A2_ID2\") | .via] == [\"stop\"])" 10; then
+    ok "A2.5c after delivery: pending 0, id from the 202 is in inbox.delivered with via stop, every entry is exactly {delivered_at, id, via, read_at}"
   else
     bad "A2.5c inbox after idle delivery: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
   fi
@@ -699,8 +699,8 @@ else
   A2_ID3="$(a2_post "popped by the CLI")"
   ( cd "$A2_FIX" && HEIMDALL_WATCH_ROOT="$A2_FIX" exec "$UI" inbox pop --json ) > "$TMPROOT/a2-pop.json" 2>&1
   A2_POP_AT="$(jq -r --arg id "$A2_ID3" '.[0] | select(.id == $id) | .delivered_at' "$TMPROOT/a2-pop.json" 2>/dev/null)"
-  if [ -n "$A2_POP_AT" ] && [ "$A2_POP_AT" != "null" ] && a2_until "[.inbox.delivered[] | select(.id == \"$A2_ID3\") | .delivered_at] == [$A2_POP_AT]" 5; then
-    ok "A2.7 hmd ui inbox pop stamps the same delivered_at that /api/state then serves"
+  if [ -n "$A2_POP_AT" ] && [ "$A2_POP_AT" != "null" ] && a2_until "[.inbox.delivered[] | select(.id == \"$A2_ID3\") | .delivered_at] == [$A2_POP_AT] and ([.inbox.delivered[] | select(.id == \"$A2_ID3\") | .via] == [\"cli\"])" 5; then
+    ok "A2.7 hmd ui inbox pop stamps the same delivered_at (via cli) that /api/state then serves"
   else
     bad "A2.7 pop output: $(cat "$TMPROOT/a2-pop.json"); inbox: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
   fi
@@ -741,7 +741,8 @@ with open(delivered, "w") as f:
     f.write("\n".join(lines) + "\n")
 got = M.delivered_receipts(root)
 check("last 20 valid receipts, oldest first", [r["id"] for r in got] == ["id-%d" % i for i in range(5, 25)])
-check("each entry is exactly {id, delivered_at}", all(sorted(r) == ["delivered_at", "id"] for r in got))
+check("each entry is exactly {id, delivered_at, via, read_at}",
+      all(sorted(r) == ["delivered_at", "id", "read_at", "via"] for r in got))
 check("never any message text", "secret-text" not in json.dumps(got) and "old format" not in json.dumps(got))
 check("legacy / malformed / non-numeric lines skipped", all(r["id"].startswith("id-") for r in got))
 

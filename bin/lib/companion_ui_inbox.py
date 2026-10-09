@@ -11,6 +11,24 @@ job panels exactly (single-file contract, imported by both writer and reader).
 Message file: one JSON object per line, appended to
 <repo>/.heimdall/ui/inbox.jsonl:
     {"id": str (uuid4), "ts": float (epoch), "text": str, "source": "companion"}
+plus, only on a message received while hmd was waiting on a question, the stamp
+    "answers": str (that question's attention id, "a-<10 hex>"), "ask": str (its one-line summary)
+-- see Answers, below.
+
+Answers (the phone's reply to a question hmd is waiting on): append() asks
+bin/lib/companion_ui_attention.py what is open right now -- the SAME derivation the phone's own `attention`
+slice is read from -- and when that is a question (state needs_input, kind question) stamps the record with the
+episode id as "answers" and the question's one-line summary as "ask" (left out when attention withheld the
+summary as secret-shaped). The stamp is set HERE, at receive time, from what hmd itself derives: never from a
+field the sender supplied and never from the message text. And only on the E2E-paired channel: append() stamps
+only when it runs INSIDE the relay client of this repo (connect.json's pid_client is this process), where a
+command is a frame that opened under the paired device's session key -- the phone's sealed `send-message`. A
+send through the direct bearer-token route (POST /api/send, served by `hmd ui`) is never stamped; it is not the
+paired channel. bin/heimdall-inbox-deliver frames a stamped record as the operator's answer to that question
+while it is still the open one, and as a late message once it is not; no question open -> no stamp -> an
+ordinary chat message. A text that opens with
+SYSTEM_NOTICE_PREFIX is hmd's own notice (the relay client's pairing notice), not something typed on the phone,
+and is never stamped. A failure to derive the question costs the stamp, never the message.
 
 Validation (append() -- nothing is ever written on a failure):
     - text is first run through _strip_control_chars() (control/escape bytes
@@ -31,15 +49,24 @@ Delivery: `pop_all()` moves every pending line to
 empty, under the SAME lock append() takes -- a message can never be observed as
 both pending and delivered, and a message appended mid-pop is never lost.
 
-Receipts (A2): pop_all() stamps every archived message with `delivered_at` (epoch
-seconds of that pop), so the archive is also the delivery receipt log. summary() is
-the `inbox` slice /api/state serves -- {pending, consumer, oldest_age_s, delivered}
--- where `delivered` is the last 20 archive entries as {id, delivered_at} ONLY, never
-text (the id is the uuid POST /api/send returned), and `consumer` is read from
-.heimdall/ui/inbox-waiting, the marker bin/heimdall-inbox-deliver's stop long-poll
-rewrites every poll while it waits (stale after 2x the poll interval), falling back
-to a configured tmux target, then "none". Queued -> delivered is therefore the
-message leaving `pending` and its id appearing in `delivered` with a timestamp.
+Receipts (A2, docs/HANDOFF-TO-HEIMDALL-phone-replies-reach-session.md 4(d)): pop_all(root, via=)
+stamps every archived message with `delivered_at` (epoch seconds of that pop) and `via` (who dequeued it: stop |
+prompt | tool | tmux, the modes of bin/heimdall-inbox-deliver, or cli for `hmd ui inbox pop`), so the archive is
+also the delivery receipt log. summary() is the `inbox` slice /api/state serves --
+{pending, consumer, oldest_age_s, expired, delivered} -- where `delivered` is the last 20 archive entries as
+{id, delivered_at, via, read_at} ONLY, never text (the id is the uuid POST /api/send returned), and `consumer`
+is read from .heimdall/ui/inbox-waiting, the marker bin/heimdall-inbox-deliver's stop long-poll rewrites every
+poll while it waits (stale after 2x the poll interval), falling back to a configured tmux target, then "none".
+Queued -> delivered is therefore the message leaving `pending` and its id appearing in `delivered` with a
+timestamp.
+  DELIVERED TO SESSION. `delivered_at` is the moment a delivery hook popped the message into the session's
+  context -- "delivered to session". It is NOT "read" and NOT "acted on": nothing in it says the model has seen
+  the text. `read_at` is that: the timestamp of the first main-chain assistant entry the session transcript
+  holds at/after `delivered_at`, null while there is none (and for a cli pop, which delivered to no session, and
+  for a delivery older than READ_LOOKBACK_S, which is no longer looked up). `via` is null for a line archived
+  before it was recorded.
+  NOT DELIVERED. `expired` lists the ids of messages still pending EXPIRE_AFTER_S after they were sent, so a
+  laptop that has stopped taking turns is visible on the phone instead of reading as "queued" for ever.
 
 Capacity (N3): a token holder could otherwise POST unbounded 2000-char messages
 forever, forcing every /api/state 2s poll and every /api/send to re-parse an
@@ -81,6 +108,8 @@ imported from companion_ui_panels.py) so bin/heimdall-ui can exec either script
 standalone with zero intra-repo import coupling.
 """
 import argparse
+import bisect
+import datetime
 import fcntl
 import json
 import math
@@ -90,6 +119,9 @@ import subprocess
 import sys
 import time
 import uuid
+from importlib.util import module_from_spec, spec_from_file_location
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 MAX_TEXT_CHARS = 2000
 MAX_PENDING = 200                    # N3: append() refuses a new message at/above this many pending
@@ -98,11 +130,17 @@ INBOX_REL = os.path.join(".heimdall", "ui", "inbox.jsonl")
 DELIVERED_REL = os.path.join(".heimdall", "ui", "inbox-delivered.jsonl")
 WAITING_REL = os.path.join(".heimdall", "ui", "inbox-waiting")      # the stop long-poll's heartbeat marker
 TMUX_TARGET_REL = os.path.join(".heimdall", "ui", "tmux-target")
+CONNECT_REL = os.path.join(".heimdall", "app", "connect.json")      # `hmd app connect`: names the ui and relay-client pids
 POLL_INTERVAL_S = 2.0                   # bin/heimdall-inbox-deliver's stop long-poll cadence
 WAITING_STALE_S = 2 * POLL_INTERVAL_S   # an inbox-waiting older than this: its long-poll is gone
 RECEIPTS_LIMIT = 20                     # inbox.delivered[] is the last this-many deliveries
 RECEIPTS_TAIL_BYTES = 256 * 1024        # the newest archive lines hold them; never read the whole file
 GIT_TIMEOUT_S = 3
+VIA_VALUES = ("stop", "prompt", "tool", "tmux", "cli")   # who dequeued: bin/heimdall-inbox-deliver's modes, and `hmd ui inbox pop`
+SYSTEM_NOTICE_PREFIX = "[hmd notice]"   # opens a text hmd itself queues (bin/heimdall-relay-client's pairing notice): never an answer
+EXPIRE_AFTER_S = 2 * 3600.0             # pending this long -> listed in inbox.expired: nothing is taking turns to receive it
+READ_LOOKBACK_S = 3600.0                # read_at is looked up only for a delivery this recent (the phone watches the last few minutes)
+READ_TAIL_BYTES = 512 * 1024            # the tail of the session transcript searched for the assistant entry after a delivery
 
 # ── secret scrub: bin/heimdall-activity:167-179, ported the same way
 # companion_ui_panels.py:63-74 ports it. Order and families are the activity
@@ -300,10 +338,60 @@ def peek(root):
     return pending[0] if pending else None
 
 
+# ── the open question (stamped on a message at receive time) ─────────────────
+_MODULES = {}   # sibling module name -> module, or None once it failed to load
+
+
+def _sibling(name):
+    """A sibling bin/lib module loaded by path (None when it cannot load), once -- the way
+    companion_attach.py loads this module."""
+    if name not in _MODULES:
+        try:
+            spec = spec_from_file_location(name, os.path.join(HERE, name + ".py"))
+            mod = module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception:
+            mod = None
+        _MODULES[name] = mod
+    return _MODULES[name]
+
+
+def _in_paired_relay_client(root):
+    """True only when THIS process is the relay client of `root`'s `hmd app connect --relay`
+    (connect.json's pid_client): the one place a command arrives as a frame that opened under the paired
+    device's session key. The `hmd ui` server that takes POST /api/send is another pid, so it never matches;
+    a missing, unreadable or stale connect.json does not match either -- the cautious side, an ordinary message."""
+    try:
+        with open(os.path.join(root, CONNECT_REL), "rb") as f:
+            rec = json.loads(f.read(65536).decode("utf-8"))
+    except (OSError, ValueError):
+        return False
+    pid = rec.get("pid_client") if isinstance(rec, dict) else None
+    return isinstance(pid, int) and not isinstance(pid, bool) and pid == os.getpid()
+
+
+def open_ask(root):
+    """The question hmd is waiting on right now, as {"id", "summary"}, else None: the `attention` derivation of
+    bin/lib/companion_ui_attention.py -- the one the phone's own attention slice is read from -- kept when it is a
+    question. `summary` is None when attention withheld it. Any failure to derive is None: a send must never be
+    lost to its stamp, and an unstamped message is simply an ordinary one."""
+    attention = _sibling("companion_ui_attention")
+    if attention is None:
+        return None
+    try:
+        a = attention.collect(root)
+    except Exception:
+        return None
+    if a.get("state") == "needs_input" and a.get("kind") == "question" and isinstance(a.get("id"), str):
+        return {"id": a["id"], "summary": a.get("summary")}
+    return None
+
+
 # ── writing ──────────────────────────────────────────────────────────────────
 def append(root, text):
     """Validate `text` and atomically append one message to inbox.jsonl. Returns
-    the new record {id, ts, text, source}. Raises InboxError -- nothing is ever
+    the new record {id, ts, text, source}, plus {answers, ask} when hmd was waiting on a question
+    as it arrived (see Answers in the module docstring). Raises InboxError -- nothing is ever
     written on a validation failure (including the queue already being at
     MAX_PENDING), and the exception never carries `text`."""
     if not isinstance(text, str):
@@ -318,6 +406,12 @@ def append(root, text):
                          "text looks like it carries a secret/credential (bin/heimdall-activity "
                          "secret_shaped family); refused, nothing written")
     record = {"id": str(uuid.uuid4()), "ts": time.time(), "text": text, "source": "companion"}
+    typed_on_phone = not text.lstrip().startswith(SYSTEM_NOTICE_PREFIX)
+    ask = open_ask(root) if typed_on_phone and _in_paired_relay_client(root) else None
+    if ask is not None:
+        record["answers"] = ask["id"]
+        if ask["summary"]:
+            record["ask"] = ask["summary"]
     line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
     path = _inbox_path(root)
     _ensure_dir(os.path.dirname(path))
@@ -354,10 +448,11 @@ def _rotate_if_oversized(path, max_bytes):
     os.replace(path, path + ".1")
 
 
-def _stamp_delivered(raw_lines, delivered_at):
+def _stamp_delivered(raw_lines, delivered_at, via=None):
     """The archive form of a popped batch: every line that is a JSON object gains
-    `delivered_at` (the receipt delivered_receipts() reads back); any other line
-    is kept as it was, so a pop never silently loses a byte."""
+    `delivered_at` (the receipt delivered_receipts() reads back) and, for a known `via`
+    (VIA_VALUES), who dequeued it; any other line is kept as it was, so a pop never
+    silently loses a byte."""
     out = []
     for line in raw_lines:
         try:
@@ -366,15 +461,18 @@ def _stamp_delivered(raw_lines, delivered_at):
             obj = None
         if isinstance(obj, dict):
             obj["delivered_at"] = delivered_at
+            if via in VIA_VALUES:
+                obj["via"] = via
             line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
         out.append(line)
     return out
 
 
-def pop_all(root):
+def pop_all(root, via=None):
     """Deliver every pending message: append the current inbox.jsonl content to
     inbox-delivered.jsonl -- each message stamped with the `delivered_at` epoch
-    of this pop, its delivery receipt -- (rotating it to inbox-delivered.jsonl.1
+    of this pop and the `via` that popped it (one of VIA_VALUES; anything else
+    records none) -- its delivery receipt -- (rotating it to inbox-delivered.jsonl.1
     first if it's already at MAX_INBOX_BYTES -- see _rotate_if_oversized) and
     truncate inbox.jsonl to empty, under the SAME lock append() takes. Returns
     the list of delivered records, receipt included (oldest first); [] when
@@ -390,7 +488,7 @@ def pop_all(root):
         _ensure_dir(os.path.dirname(delivered_path))
         _rotate_if_oversized(delivered_path, MAX_INBOX_BYTES)
         with _open_append_0600(delivered_path) as df:
-            df.writelines(_stamp_delivered(raw_lines, delivered_at))
+            df.writelines(_stamp_delivered(raw_lines, delivered_at, via))
             df.flush()
             os.fsync(df.fileno())
         # Truncate in place, still inside the lock so nothing can land between
@@ -401,7 +499,7 @@ def pop_all(root):
         with open(path, "w", encoding="utf-8") as f:
             f.truncate(0)
         os.chmod(path, 0o600)
-    return [dict(r, delivered_at=delivered_at) for r in records]
+    return [dict(r, delivered_at=delivered_at, **({"via": via} if via in VIA_VALUES else {})) for r in records]
 
 
 # ── receipts, consumer, summary: the /api/state `inbox` slice ─────────────────
@@ -413,10 +511,11 @@ _RECEIPTS_CACHE = {}  # path -> ((mtime_ns, size), receipts) -- see delivered_re
 
 
 def _read_receipts(path, size):
-    """The last RECEIPTS_LIMIT stamped lines of the archive as {id, delivered_at},
+    """The last RECEIPTS_LIMIT stamped lines of the archive as {id, delivered_at, via},
     oldest first, reading only its tail. A line that is not a JSON object with a
     string `id` and a finite numeric `delivered_at` -- a pre-receipt archive line,
-    a corrupt one -- is skipped, never raised and never given an invented time."""
+    a corrupt one -- is skipped, never raised and never given an invented time; a
+    `via` that is not one of VIA_VALUES (a line archived before it was recorded) is None."""
     with open(path, "rb") as f:
         if size > RECEIPTS_TAIL_BYTES:
             f.seek(size - RECEIPTS_TAIL_BYTES)
@@ -429,17 +528,103 @@ def _read_receipts(path, size):
         except ValueError:  # JSONDecodeError and UnicodeDecodeError both
             continue
         if isinstance(obj, dict) and isinstance(obj.get("id"), str) and _is_number(obj.get("delivered_at")):
-            out.append({"id": obj["id"], "delivered_at": obj["delivered_at"]})
+            via = obj.get("via")
+            out.append({"id": obj["id"], "delivered_at": obj["delivered_at"],
+                        "via": via if via in VIA_VALUES else None})
     return out[-RECEIPTS_LIMIT:]
 
 
-def delivered_receipts(root):
+_ASSISTANT_CACHE = {}   # transcript path -> ((mtime_ns, size), (assistant times, time the tail reaches back to))
+_READ_AT = {}           # (repo root, receipt id) -> read_at, once a receipt has one: it never moves
+
+
+def _parse_iso(ts):
+    try:
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+def _assistant_times(root):
+    """(sorted epoch times of the main-chain assistant entries in the tail of this repo's session
+    transcript, the time that tail reaches back to) -- ([], inf) when there is no transcript to read. The
+    session is the one every hmd-ui collector reads (hmd_session_resolve); only READ_TAIL_BYTES of it are
+    read, and an unchanged transcript costs one stat."""
+    attention = _sibling("companion_ui_attention")
+    session = attention.SESSION.resolve(root) if attention is not None else None
+    if session is None:
+        return [], math.inf
+    try:
+        st = os.stat(session.path)
+    except OSError:
+        return [], math.inf
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _ASSISTANT_CACHE.get(session.path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    cut = st.st_size > READ_TAIL_BYTES
+    try:
+        with open(session.path, "rb") as f:
+            if cut:
+                f.seek(st.st_size - READ_TAIL_BYTES)
+                f.readline()  # the seek landed mid-line: drop that partial first line
+            chunk = f.read()
+    except OSError:
+        return [], math.inf
+    times, first = [], None
+    for line in chunk.splitlines():
+        if b'"timestamp"' not in line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        t = _parse_iso(e.get("timestamp")) if isinstance(e, dict) else None
+        if t is None:
+            continue
+        first = t if first is None else first
+        if e.get("type") == "assistant" and not e.get("isSidechain"):
+            times.append(t)
+    times.sort()
+    value = (times, (math.inf if first is None else first) if cut else 0.0)
+    if len(_ASSISTANT_CACHE) > 16:
+        _ASSISTANT_CACHE.clear()
+    _ASSISTANT_CACHE[session.path] = (key, value)
+    return value
+
+
+def _read_times(root, receipts, now):
+    """{receipt id: read_at} for the receipts of `receipts` that have one: the first main-chain assistant entry
+    at/after `delivered_at`. Looked up only for a delivery within READ_LOOKBACK_S, never for a cli pop (it
+    delivered to no session), and only when the transcript tail reaches back past the delivery -- a time that
+    cannot be told is left out, never guessed. A resolved time is kept for the life of the process."""
+    out, todo = {}, []
+    for r in receipts:
+        known = _READ_AT.get((root, r["id"]))
+        if known is not None:
+            out[r["id"]] = known
+        elif r["via"] != "cli" and now - r["delivered_at"] <= READ_LOOKBACK_S:
+            todo.append(r)
+    if todo:
+        times, reaches = _assistant_times(root)
+        for r in todo:
+            i = bisect.bisect_left(times, r["delivered_at"])
+            if r["delivered_at"] >= reaches and i < len(times):
+                if len(_READ_AT) > 512:
+                    _READ_AT.clear()
+                out[r["id"]] = _READ_AT[(root, r["id"])] = times[i]
+    return out
+
+
+def delivered_receipts(root, now=None):
     """The delivery receipts /api/state serves as inbox.delivered: the last
-    RECEIPTS_LIMIT of inbox-delivered.jsonl as [{"id", "delivered_at"}], oldest
-    first -- the uuid POST /api/send returned and the epoch pop_all stamped, and
-    NEVER the message text. Cached on the archive's (mtime_ns, size), like
-    _cached_records, so the every-request poll costs one stat while nothing is
-    delivered. Returns fresh dict copies."""
+    RECEIPTS_LIMIT of inbox-delivered.jsonl as [{"id", "delivered_at", "via", "read_at"}], oldest
+    first -- the uuid POST /api/send returned, the epoch pop_all stamped (DELIVERED TO SESSION: a
+    hook popped it into the session's context, which is not the model having read it), who popped
+    it, and the first assistant entry after that when the transcript has one (null otherwise) --
+    and NEVER the message text. The archive part is cached on its (mtime_ns, size), like
+    _cached_records, so the every-request poll costs one stat while nothing is delivered. Returns
+    fresh dict copies."""
     path = _delivered_path(root)
     try:
         st = os.stat(path)
@@ -454,7 +639,8 @@ def delivered_receipts(root):
         except OSError:
             return []
         _RECEIPTS_CACHE[path] = cached
-    return [dict(r) for r in cached[1]]
+    read = _read_times(root, cached[1], time.time() if now is None else now)
+    return [dict(r, read_at=read.get(r["id"])) for r in cached[1]]
 
 
 def tmux_target(root):
@@ -495,12 +681,18 @@ def _oldest_age_s(records, now):
     return None
 
 
+def _expired_ids(records, now):
+    """Ids of the pending messages sent EXPIRE_AFTER_S or more before `now`."""
+    return [r["id"] for r in records
+            if isinstance(r.get("id"), str) and _is_number(r.get("ts")) and now - r["ts"] >= EXPIRE_AFTER_S]
+
+
 def summary(root, now=None):
     """The whole `inbox` slice of /api/state in one call:
     {"pending": n, "consumer": "waiting"|"tmux"|"none", "oldest_age_s": float|None,
-    "delivered": [{"id", "delivered_at"}, ...]}. `pending` is read before
-    `delivered`, so a message seen as delivered really was; an unreadable source
-    degrades its own field (nothing pending / no receipts), never the slice."""
+    "expired": [id, ...], "delivered": [{"id", "delivered_at", "via", "read_at"}, ...]}.
+    `pending` is read before `delivered`, so a message seen as delivered really was; an
+    unreadable source degrades its own field (nothing pending / no receipts), never the slice."""
     now = time.time() if now is None else now
     try:
         records = _cached_records(_inbox_path(root))
@@ -509,7 +701,8 @@ def summary(root, now=None):
     return {"pending": len(records),
             "consumer": consumer_state(root, now),
             "oldest_age_s": _oldest_age_s(records, now),
-            "delivered": delivered_receipts(root)}
+            "expired": _expired_ids(records, now),
+            "delivered": delivered_receipts(root, now)}
 
 
 # ── CLI: `hmd ui inbox ls|pop|peek` (exec'd by bin/heimdall-ui) ───────────────
@@ -551,7 +744,7 @@ def _cmd_ls(args):
 
 
 def _cmd_pop(args):
-    _print_rows(pop_all(resolve_root(args.repo)), args.json)
+    _print_rows(pop_all(resolve_root(args.repo), via="cli"), args.json)
     return 0
 
 
