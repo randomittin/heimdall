@@ -2,9 +2,9 @@
 """hmd_private_state.py -- small state files that only this user may read or change, written and read without ever
 following a link (stdlib only).
 
-WHY THIS EXISTS. Files hmd keeps under <repo>/.heimdall/ -- the session record the SessionStart hook writes, the
+WHY THIS EXISTS. Files hmd keeps under <repo>/.heimdall/ -- the session records the SessionStart hook writes, the
 marker a paired phone leaves for the statusline, the pair window's state -- live in a tree a repository controls: a
-cloned repo can carry `.heimdall` or `.heimdall/app` as a symlink, or a ready-made `session.json`. A plain
+cloned repo can carry `.heimdall` or `.heimdall/app` as a symlink, or a ready-made session record. A plain
 open()/chmod()/rename() through such a path writes, or chmods, wherever the link points, and a plain read trusts
 whatever a checkout planted. The pattern here is bin/lib/companion_attach.py's (_open_attachments, after its
 security review), applied to a directory chosen by the caller:

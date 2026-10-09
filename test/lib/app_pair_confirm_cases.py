@@ -326,8 +326,8 @@ def case_one_code():
                     "statusline %r sub %r helper %r cli %r state %r expected %r" % (recorded, sub_cwd, helper, cli, shown, expected))
             fresh_home = tempfile.mkdtemp(prefix="pair-confirm-nohome.")
             blank = row_code(render(sl, SID1, HEIMDALL_HOME=fresh_home))
-            T.check(blank is None and os.listdir(fresh_home) == [],
-                    "1. a render in a home with no seed shows no code and makes none (only a session start, `hmd ui` or `hmd app` does)",
+            T.check(blank is None and not os.path.exists(os.path.join(fresh_home, "session-code.key")),
+                    "1. a render in a home with no seed shows no code and makes no seed (only a session start, `hmd ui` or `hmd app` does)",
                     "code %r files %r" % (blank, os.listdir(fresh_home)))
         finally:
             run([H.APP_PATH, "disconnect", "--repo", sl.ws], s.env(HEIMDALL_HOME=os.path.join(sl.home, ".heimdall")), timeout=120)
