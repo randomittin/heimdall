@@ -1676,5 +1676,158 @@ if grep -Eq '^FAIL +relay reachable' "$DOUT"; then ok "doctor prints 'FAIL relay
 if grep -qi 'relay unreachable' "$DOUT"; then ok "doctor prints the relay-unreachable fix hint"; else bad "fix hint missing: $(cat "$DOUT")"; fi
 rm -rf "$D"
 
+# ── connect when the port is already held: reuse / replace / step around ─────────────────────────────────
+# The live bug: a `hmd ui` left running for the repo (its relay client gone) made `hmd app connect --port N` exit 6
+# ("hmd ui: cannot bind 127.0.0.1:N: Address already in use"). Every ui below is the real bin/heimdall-ui, except the
+# one deliberately older than /healthz; the relay client is the fake above; ports come from the kernel, never 8710.
+t_free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
+
+# t_start_ui REPO PORT -- a real `hmd ui` for REPO on PORT, as an earlier connect (or `hmd ui` typed by hand) leaves
+# behind; sets T_UI_PID once it has printed its URL. Tracked in PIDS so the exit trap reaps it.
+t_start_ui() {
+  local repo="$1" port="$2" out waited=0
+  out="$(mktemp "$TMPROOT/ui-out.XXXXXX")"
+  ( cd "$repo" && exec "$UI" --repo "$repo" --port "$port" --no-open ) >"$out" 2>&1 &
+  T_UI_PID=$!
+  PIDS+=("$T_UI_PID")
+  while ! grep -q '^http://127.0.0.1:' "$out" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+}
+
+# t_connect REPO PORT -- `connect --bg` against the fake relay client; sets T_RC, and T_OUTF holds what it printed.
+t_connect() {
+  T_OUTF="$(mktemp "$TMPROOT/connect-out.XXXXXX")"
+  HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=pair-bind FAKE_RELAY_LOG="$T_RELAY_LOG" \
+    "$APP" connect --repo "$1" --port "$2" --no-code --relay "https://relay.example.com" --bg >"$T_OUTF" 2>&1
+  T_RC=$?
+}
+
+# The /healthz route those decisions rest on: the live ui answers it for its own loopback origin, with the token
+# gate untouched everywhere else.
+D="$(make_repo)"
+P1="$(t_free_port)"
+t_start_ui "$D" "$P1"
+HEALTH_BODY="$(curl -s --noproxy '*' --max-time 5 "http://127.0.0.1:$P1/healthz")"
+if [ "$(printf '%s' "$HEALTH_BODY" | jq -r '[.ok, .service, .pid] | @csv' 2>/dev/null)" = "true,\"hmd-ui\",$T_UI_PID" ]; then ok "/healthz answers {ok, service: hmd-ui, pid} without a token"; else bad "/healthz body: $HEALTH_BODY"; fi
+if [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 -H 'Host: evil.example' "http://127.0.0.1:$P1/healthz")" = "403" ]; then ok "/healthz refuses a Host that is not the loopback origin (403)"; else bad "/healthz answered a foreign Host"; fi
+if [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 "http://127.0.0.1:$P1/api/state")" = "401" ]; then ok "/api/state still demands the token (401)"; else bad "/api/state answered without a token"; fi
+
+# 1. the live bug: a stale ui for THIS repo, no relay client -- connect reuses it and starts the client against it
+T_RELAY_LOG="$TMPROOT/stale-reuse-relay.log"; : > "$T_RELAY_LOG"
+STALE_PID="$T_UI_PID"
+t_connect "$D" "$P1"
+if [ "$T_RC" -eq 0 ]; then ok "connect --port N w/ a stale same-repo ui on N exits 0 (was exit 6, cannot bind)"; else bad "exit $T_RC (want 0): $(cat "$T_OUTF")"; fi
+SF="$D/.heimdall/app/connect.json"
+if [ "$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)" = "$STALE_PID" ] && [ "$(jq -r '.port // empty' "$SF" 2>/dev/null)" = "$P1" ]; then ok "reuse: connect.json records the stale ui's pid and port"; else bad "connect.json: $(jq -c . "$SF" 2>/dev/null)"; fi
+if kill -0 "$STALE_PID" 2>/dev/null; then ok "reuse: the stale ui is still the live process (not restarted)"; else bad "stale ui $STALE_PID is gone"; fi
+if grep -q "ui_port=$P1 " "$T_RELAY_LOG"; then ok "reuse: the relay client was started against the reused ui's port"; else bad "relay log: $(cat "$T_RELAY_LOG")"; fi
+if grep -qi 'reusing the hmd ui' "$T_OUTF"; then ok "reuse: connect says it reused the running ui"; else bad "no reuse notice: $(cat "$T_OUTF")"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+if kill -0 "$STALE_PID" 2>/dev/null; then bad "disconnect left the adopted ui running"; else ok "disconnect stops the adopted ui like one connect started"; fi
+rm -rf "$D"
+
+# 2. a same-repo ui that is not a working one -- here an older build, which has no /healthz and answers 401 to it --
+# is stopped (it is this user's python running <...>/sentinels/hmd-ui.py --repo <this repo>) and a fresh ui binds
+# the SAME port
+D="$(make_repo)"
+P2="$(t_free_port)"
+OLD_UI_DIR="$TMPROOT/old-build/sentinels"
+mkdir -p "$OLD_UI_DIR"
+cat > "$OLD_UI_DIR/hmd-ui.py" <<'OLD_UI_EOF'
+import http.server, sys
+port = int(sys.argv[sys.argv.index("--port") + 1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(401)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+class S(http.server.ThreadingHTTPServer):
+    allow_reuse_address = False
+S(("127.0.0.1", port), H).serve_forever()
+OLD_UI_EOF
+python3 "$OLD_UI_DIR/hmd-ui.py" --repo "$D" --port "$P2" --no-open >/dev/null 2>&1 &
+OLD_PID=$!
+PIDS+=("$OLD_PID")
+OLD_WAITED=0
+while ! { : <>"/dev/tcp/127.0.0.1/$P2"; } 2>/dev/null && [ "$OLD_WAITED" -lt 50 ]; do
+  sleep 0.1
+  OLD_WAITED=$((OLD_WAITED + 1))
+done
+T_RELAY_LOG="$TMPROOT/stale-replace-relay.log"; : > "$T_RELAY_LOG"
+t_connect "$D" "$P2"
+if [ "$T_RC" -eq 0 ]; then ok "connect w/ an older/unhealthy same-repo ui on the port exits 0"; else bad "exit $T_RC (want 0): $(cat "$T_OUTF")"; fi
+SF="$D/.heimdall/app/connect.json"
+NEW_PID="$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)"
+if kill -0 "$OLD_PID" 2>/dev/null; then bad "replace: the old ui $OLD_PID is still running"; else ok "replace: the unhealthy same-repo ui was stopped"; fi
+if [ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ] && kill -0 "$NEW_PID" 2>/dev/null; then ok "replace: connect.json records a fresh live ui"; else bad "connect.json: $(jq -c . "$SF" 2>/dev/null)"; fi
+if [ "$(jq -r '.port // empty' "$SF" 2>/dev/null)" = "$P2" ]; then ok "replace: the fresh ui is on the same port"; else bad "port: $(jq -r '.port // empty' "$SF" 2>/dev/null) (want $P2): $(cat "$T_OUTF")"; fi
+if [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 "http://127.0.0.1:$P2/healthz")" = "200" ]; then ok "replace: the port now answers /healthz (the real hmd-ui)"; else bad "fresh ui does not answer /healthz"; fi
+if grep -q "ui_port=$P2 " "$T_RELAY_LOG"; then ok "replace: the relay client was started against the fresh ui"; else bad "relay log: $(cat "$T_RELAY_LOG")"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
+# 3. the port is held by ANOTHER repo's hmd ui -- untouched; connect takes the next free port, says so, records it
+D="$(make_repo)"
+D_OTHER="$(make_repo)"
+P3="$(t_free_port)"
+t_start_ui "$D_OTHER" "$P3"
+OTHER_PID="$T_UI_PID"
+T_RELAY_LOG="$TMPROOT/other-repo-relay.log"; : > "$T_RELAY_LOG"
+t_connect "$D" "$P3"
+if [ "$T_RC" -eq 0 ]; then ok "connect w/ another repo's ui on the port exits 0"; else bad "exit $T_RC (want 0): $(cat "$T_OUTF")"; fi
+SF="$D/.heimdall/app/connect.json"
+GOT_PORT="$(jq -r '.port // empty' "$SF" 2>/dev/null)"
+if [ -n "$GOT_PORT" ] && [ "$GOT_PORT" -gt "$P3" ] 2>/dev/null; then ok "other repo: connect.json records a later port ($GOT_PORT > $P3)"; else bad "port=$GOT_PORT (want > $P3): $(cat "$T_OUTF")"; fi
+if kill -0 "$OTHER_PID" 2>/dev/null; then ok "other repo: its ui was never signalled"; else bad "the other repo's ui $OTHER_PID was killed"; fi
+if [ "$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)" != "$OTHER_PID" ]; then ok "other repo: connect started its own ui"; else bad "connect adopted the other repo's ui"; fi
+if grep -q "using port $GOT_PORT" "$T_OUTF"; then ok "other repo: connect prints which port it used"; else bad "no port notice: $(cat "$T_OUTF")"; fi
+if grep -q "ui_port=$GOT_PORT " "$T_RELAY_LOG"; then ok "other repo: the relay client was started against the new port"; else bad "relay log: $(cat "$T_RELAY_LOG")"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+if kill -0 "$OTHER_PID" 2>/dev/null; then ok "other repo: its ui survives this repo's disconnect"; else bad "disconnect took the other repo's ui down"; fi
+rm -rf "$D" "$D_OTHER"
+
+# 4. a foreign (not hmd) listener on the port -- untouched, next free port
+D="$(make_repo)"
+P4="$(t_free_port)"
+python3 - "$P4" <<'FOREIGN_EOF' &
+import socket, sys, time
+s = socket.socket()
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(5)
+time.sleep(120)
+FOREIGN_EOF
+FOREIGN_PID=$!
+PIDS+=("$FOREIGN_PID")
+FOREIGN_WAITED=0
+while ! { : <>"/dev/tcp/127.0.0.1/$P4"; } 2>/dev/null && [ "$FOREIGN_WAITED" -lt 50 ]; do
+  sleep 0.1
+  FOREIGN_WAITED=$((FOREIGN_WAITED + 1))
+done
+T_RELAY_LOG="$TMPROOT/foreign-relay.log"; : > "$T_RELAY_LOG"
+t_connect "$D" "$P4"
+SF="$D/.heimdall/app/connect.json"
+GOT_PORT="$(jq -r '.port // empty' "$SF" 2>/dev/null)"
+if [ "$T_RC" -eq 0 ] && [ -n "$GOT_PORT" ] && [ "$GOT_PORT" != "$P4" ]; then ok "connect w/ a foreign listener on the port exits 0 on another port"; else bad "exit $T_RC port=$GOT_PORT: $(cat "$T_OUTF")"; fi
+if kill -0 "$FOREIGN_PID" 2>/dev/null; then ok "foreign listener: never signalled"; else bad "the foreign listener was killed"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
+# 5. a same-repo ui that a LIVE relay client is serving is neither stale nor ours to stop: refused, untouched
+D="$(make_repo)"
+P5="$(t_free_port)"
+T_RELAY_LOG="$TMPROOT/live-relay.log"; : > "$T_RELAY_LOG"
+t_connect "$D" "$P5"
+SF="$D/.heimdall/app/connect.json"
+LIVE_UI="$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)"
+LIVE_CLIENT="$(jq -r '.pid_client // empty' "$SF" 2>/dev/null)"
+t_connect "$D" "$P5"
+if [ "$T_RC" -eq 6 ] && grep -q 'already connected' "$T_OUTF"; then ok "a second connect on a live session's port exits 6 and says already connected"; else bad "exit $T_RC: $(cat "$T_OUTF")"; fi
+if [ -n "$LIVE_UI" ] && kill -0 "$LIVE_UI" 2>/dev/null && [ -n "$LIVE_CLIENT" ] && kill -0 "$LIVE_CLIENT" 2>/dev/null; then ok "live session: its ui and client were left running"; else bad "live session was disturbed (ui=$LIVE_UI client=$LIVE_CLIENT)"; fi
+if [ "$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)" = "$LIVE_UI" ]; then ok "live session: connect.json still names its ui"; else bad "connect.json changed: $(jq -c . "$SF" 2>/dev/null)"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
