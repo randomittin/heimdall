@@ -45,6 +45,14 @@ that named no events never gets one (a registered kind is opt-in). The `tile_ale
 dashboard_alerts hands companion_push.enqueue_event: the sender's worker reads them from the push spool and counts them here (record)
 whether or not it is the process that serves them.
 
+TRUST. Every file this module touches under the repo goes through bin/lib/hmd_private_state.py (loaded by path beside this file, the
+pattern of companion_push_store.py): the way down from the repo root is walked one component at a time without following a link, a
+file is written to a fresh 0600 temp and renamed into place, the lock file is opened the same way, and digest.json is READ only when it
+is a regular file this user owns with no group or other permission bits, reached through no link, in a directory nobody else can write.
+A repository can carry `.heimdall/app` as a link or a ready-made digest.json (a checkout leaves 0644); neither is a schedule. What is
+read back picks nothing -- not a day, a counter or what a push says -- so a refused file reads as no schedule, and a refused way is an
+OSError, which the sender logs and skips: a refusal never crashes its caller.
+
 Stdlib only. Loadable by path, like every companion_* module; no side effects at import.
 """
 import contextlib
@@ -54,17 +62,21 @@ import json
 import math
 import os
 import re
-import secrets
-import stat
 import time
+from importlib.util import module_from_spec, spec_from_file_location
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 CAP_DIGEST = "push-digest-v1"
 KIND = "digest"
 OP = "set-digest"
 APP_REL = os.path.join(".heimdall", "app")
-STORE_REL = os.path.join(APP_REL, "digest.json")
-LOCK_REL = STORE_REL + ".lock"
+STORE_NAME = "digest.json"
+LOCK_NAME = STORE_NAME + ".lock"
+STORE_REL = os.path.join(APP_REL, STORE_NAME)
+LOCK_REL = os.path.join(APP_REL, LOCK_NAME)
 READ_CAP_BYTES = 16384
+PRIVATE = 0o077                 # mode bits a file of ours must not carry: only 0600 is believed
+NOT_SHARED = 0o022              # mode bits the directory holding it must not carry: nobody else may write into it
 LOCK_TIMEOUT_S = 1.0
 LOCK_POLL_S = 0.005
 RETRY_S = 60.0                  # a process whose attempt came to nothing looks again no sooner than this
@@ -168,57 +180,55 @@ def _clean(raw):
     return state
 
 
-def _path(root):
-    return os.path.join(root, STORE_REL)
+_STATE = []   # [the hmd_private_state module] once it loaded
 
 
-def _read_json(path):
-    """The JSON object in `path`: a regular file only, no symlink followed; None when absent, oversized or unusable."""
+def _state():
+    """bin/lib/hmd_private_state.py, loaded by path beside this file (it is not a package): the ONLY way this module touches a file under
+    the repo -- the pattern of companion_push_store._state. There is no fallback to plain open()/chmod()/rename(): a helper that cannot
+    be loaded is an OSError here, so a write is refused and a read finds no schedule."""
+    if not _STATE:
+        try:
+            spec = spec_from_file_location("hmd_private_state", os.path.join(HERE, "hmd_private_state.py"))
+            mod = module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as exc:
+            raise OSError("hmd_private_state is not available: %s" % (exc,))
+        _STATE.append(mod)
+    return _STATE[0]
+
+
+def _read_json(root):
+    """The JSON object digest.json holds when it is ours to believe -- a regular file this user owns, 0600, reached through no link, in a
+    directory nobody else can write, at most READ_CAP_BYTES -- else None: a planted, linked, foreign, loose, oversized, unparsable or
+    non-object file, a way through a link, or no helper to look with is no schedule and no counts, never an exception."""
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
-    except OSError:
-        return None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
-        raw = os.read(fd, READ_CAP_BYTES + 1)
-    finally:
-        os.close(fd)
-    try:
-        obj = json.loads(raw.decode("utf-8")) if len(raw) <= READ_CAP_BYTES else None
-    except (ValueError, UnicodeDecodeError):
+        raw = _state().read(root, APP_REL, STORE_NAME, READ_CAP_BYTES, forbidden=PRIVATE, dir_forbidden=NOT_SHARED)
+        obj = None if raw is None else json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
         return None
     return obj if isinstance(obj, dict) else None
 
 
 def load(root):
-    """The stored state, validated field by field; a missing, damaged or foreign file is the default (no schedule). Never raises."""
-    return _clean(_read_json(_path(root)))
+    """The stored state, validated field by field; a missing, damaged, planted or foreign file is the default (no schedule). Never raises."""
+    return _clean(_read_json(root))
 
 
 def _write(root, state):
-    path = _path(root)
-    tmp = "%s.tmp-%d-%s" % (path, os.getpid(), secrets.token_hex(4))
+    """Replace digest.json with `state`: hmd_private_state writes a fsynced 0600 temp file and renames it into place, so a reader sees the
+    old file or the new one, and a link at digest.json is replaced, never written through. OSError when anything on the way is a link
+    or not ours."""
     body = json.dumps(dict(state, v=1), sort_keys=True, separators=(",", ":"))
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(body)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    _state().write(root, APP_REL, STORE_NAME, body.encode("utf-8"))
 
 
 @contextlib.contextmanager
 def _locked(root):
-    directory = os.path.join(root, APP_REL)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    os.chmod(directory, 0o700)
-    fd = os.open(os.path.join(root, LOCK_REL), os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    """An exclusive flock on digest.json.lock, opened by hmd_private_state (the directory walked without a link and forced to 0700; the
+    file a regular one of ours, forced to 0600) -- companion_push_store._Flock's pattern. Taken without blocking and retried until
+    LOCK_TIMEOUT_S, so a writer that was stopped holding it costs the caller an OSError, not a hang."""
+    fd = _state().open_lockfile(root, APP_REL, LOCK_NAME)
     try:
         deadline = time.monotonic() + LOCK_TIMEOUT_S
         while True:
@@ -450,10 +460,10 @@ class Scheduler:
 
     def _current(self):
         try:
-            st = os.stat(_path(self.root))
-            stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+            st = _state().stat_file(self.root, APP_REL, STORE_NAME)    # None: a link, a file not ours, or a way that is not ours
         except OSError:
-            stamp = None
+            st = None
+        stamp = None if st is None else (st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode)    # the mode is part of what `load` believes
         if stamp != self._stamp:
             self._stamp = stamp
             state = load(self.root) if stamp is not None else None

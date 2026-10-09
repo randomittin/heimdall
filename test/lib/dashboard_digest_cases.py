@@ -135,12 +135,34 @@ DG.set_config(r, CFG, Z)
 DG.record(r, [EV["done"], EV["alert"]])
 got = DG.claim(r, Z + 8 * H)
 T.eq((got["counts"], DG.load(r)["counts"]), ({"finished": 1, "verdicts": 0, "alerts": 1}, ZERO), "U3o. a claim hands over the counts and restarts them")
+DECOY = json.dumps({"v": 1, "config": dict(CFG, set_at=1, project="decoy"), "last_day": None, "last_at": None,
+                    "counts": {"finished": 3, "verdicts": 0, "alerts": 0}, "seen": []}, sort_keys=True)
+
+
+def mode(path):
+    return oct(os.lstat(path).st_mode & 0o777)
+
+
+def slurp(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def plant(directory, name="digest.json", mode_bits=0o600, text=None):
+    """A file in a 0700 `directory`, made with the mode asked for whatever the umask: a checkout leaves 0644, the owner's own tools 0600."""
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(DECOY if text is None else text)
+    os.chmod(path, mode_bits)
+    return path
+
+
 r = root("u7")
-os.makedirs(os.path.join(r, ".heimdall", "app"), exist_ok=True)
 for junk in ("not json", "[1]", '{"config":{"at":"7:30","tz_min":0,"tiles":[],"include_values":false,"on":true}}',
              '{"config":{"at":"07:30","tz_min":0,"tiles":["x"],"include_values":false,"on":true}}', '{"counts":{"finished":"9"},"seen":"x"}'):
-    with open(os.path.join(r, ".heimdall", "app", "digest.json"), "w") as f:
-        f.write(junk)
+    plant(os.path.join(r, ".heimdall", "app"), "digest.json", 0o600, junk)
     got = DG.load(r)
     T.check(got["config"] is None and got["counts"] == ZERO and got["seen"] == [], "U3p. a damaged store reads as no schedule: %s" % junk[:30])
 
@@ -647,4 +669,128 @@ if sent:
     T.check(CP.utf16_len(sent[0]["title"]) <= 48 and CP.utf16_len(sent[0]["body"]) <= 160 and sent[0]["body"].count("\n") <= 3 and len(wire.encode("utf-8")) < 3500,
             "M10b. title <= 48, body <= 160 units in <= 4 lines, the whole message well under 3500 B", (sent[0]["title"], sent[0]["body"]))
 rig.close()
+
+# ── L. link-safe state: nothing is read, created, written or chmod'ed through a link, and a planted digest.json is nobody's schedule ──
+import fcntl
+import time
+
+
+def raises_oserror(call, *args):
+    try:
+        call(*args)
+    except OSError:
+        return True
+    return False
+
+
+def fingerprint(top):
+    """Every directory and file under `top` with its mode (and a file's bytes): the same before and after means nothing was created, written or chmod'ed."""
+    seen = []
+    for here, dirs, names in os.walk(top):
+        dirs.sort()
+        seen.append((here, mode(here)))
+        seen.extend((os.path.join(here, n), mode(os.path.join(here, n)), slurp(os.path.join(here, n))) for n in sorted(names))
+    return seen
+
+
+def blocked(tag, r, behind):
+    """`r` reaches its digest state only through a link into `behind`, which holds a valid, due, 0600 schedule: that schedule is not believed,
+    and storing, counting or claiming is refused (an OSError the sender logs and skips) with nothing behind the link created, written or chmod'ed."""
+    before = fingerprint(behind)
+    T.eq((DG.load(r)["config"], DG.Scheduler(r).precheck(dash(), Z + 8 * H)), (None, None), "%sa. the schedule behind the link is not believed: none, nothing due" % tag)
+    T.eq([raises_oserror(DG.set_config, r, CFG, Z), raises_oserror(DG.record, r, [EV["done"]]), raises_oserror(DG.claim, r, Z + 8 * H)], [True] * 3,
+         "%sb. storing, counting and claiming through the link are refused" % tag)
+    T.check(fingerprint(behind) == before, "%sc. nothing behind the link was created, written or chmod'ed" % tag)
+
+
+v1 = root("l-v1")                       # L1. .heimdall/app is a link out of the repo (a cloned repo can carry one)
+plant(v1)
+os.chmod(v1, 0o755)
+r = root("l1")
+os.makedirs(os.path.join(r, ".heimdall"))
+os.symlink(v1, os.path.join(r, ".heimdall", "app"))
+blocked("L1", r, v1)
+v2 = root("l-v2")                       # L2. so is .heimdall itself
+plant(os.path.join(v2, "app"))
+os.chmod(v2, 0o755)
+os.chmod(os.path.join(v2, "app"), 0o755)
+r = root("l2")
+os.symlink(v2, os.path.join(r, ".heimdall"))
+blocked("L2", r, v2)
+
+v3 = root("l-v3")                       # L3. digest.json itself is a link to a valid schedule elsewhere
+decoy = plant(v3, "decoy.json")
+before = fingerprint(v3)
+r = root("l3")
+app = os.path.join(r, ".heimdall", "app")
+os.makedirs(app, mode=0o700)
+os.symlink(decoy, os.path.join(app, "digest.json"))
+T.eq((DG.load(r)["config"], DG.Scheduler(r).precheck(dash(), Z + 8 * H)), (None, None), "L3a. a digest.json that is a link is not believed: none, nothing due")
+DG.set_config(r, dict(CFG, tiles=[TA]), Z)
+T.check(not os.path.islink(os.path.join(app, "digest.json")) and DG.load(r)["config"]["tiles"] == [TA] and fingerprint(v3) == before,
+        "L3b. a schedule is stored by replacing the link, never by writing through it")
+
+v4 = root("l-v4")                       # L4. the lock file is a link (to a file, and to nothing)
+keep = plant(v4, "keep.txt", 0o644, "keep")
+before = fingerprint(v4)
+r = root("l4")
+app = os.path.join(r, ".heimdall", "app")
+os.makedirs(app, mode=0o700)
+os.symlink(keep, os.path.join(app, "digest.json.lock"))
+T.check(raises_oserror(DG.set_config, r, CFG, Z) and fingerprint(v4) == before and DG.load(r)["config"] is None,
+        "L4a. a lock file that is a link is refused: no schedule stored, the file behind it neither written nor chmod'ed")
+r = root("l4b")
+app = os.path.join(r, ".heimdall", "app")
+os.makedirs(app, mode=0o700)
+os.symlink(os.path.join(v4, "new.txt"), os.path.join(app, "digest.json.lock"))
+T.check(raises_oserror(DG.set_config, r, CFG, Z) and fingerprint(v4) == before, "L4b. a dangling link at the lock is not created through")
+
+r = root("l5")                          # L5. every touch tightens what is there
+app = os.path.join(r, ".heimdall", "app")
+lock = plant(app, "digest.json.lock", 0o666, "")
+DG.set_config(r, CFG, Z)
+T.eq((mode(lock), mode(os.path.join(app, "digest.json")), mode(app)), ("0o600", "0o600", "0o700"),
+     "L5. a loose lock file is made 0600; the store is 0600 in a 0700 directory")
+
+r = root("l6")                          # L6. a planted digest.json: due, switched on, with counts -- what a checkout would leave (0644)
+app = os.path.join(r, ".heimdall", "app")
+planted = plant(app, "digest.json", 0o644)
+T.eq((DG.load(r)["config"], DG.load(r)["counts"]), (None, ZERO), "L6a. a 0644 digest.json (what a checkout leaves) is not believed: no schedule, no counts")
+T.eq((DG.Scheduler(r).precheck(dash(), Z + 8 * H), DG.claim(r, Z + 8 * H)), (None, None), "L6b. nothing is due from it and nothing can be claimed")
+T.eq((mode(planted), slurp(planted).decode()), ("0o644", DECOY), "L6c. a file that was not believed is left as found: no day spent, no rewrite")
+DG.set_config(r, CFG, Z)
+T.eq((mode(planted), DG.load(r)["config"]["on"], DG.load(r)["counts"]), ("0o600", True, ZERO),
+     "L6d. the phone's schedule replaces it by a file of ours; none of its counts survive")
+
+r = root("l7")                          # L7. the directory holding it
+app = os.path.join(r, ".heimdall", "app")
+plant(app)
+os.chmod(app, 0o777)
+T.eq(DG.Scheduler(r).precheck(dash(), Z + 8 * H), None, "L7a. a valid 0600 file in a directory anyone can write into is not believed")
+os.chmod(app, 0o700)
+T.eq(DG.Scheduler(r).precheck(dash(), Z + 8 * H), [], "L7b. the same file in a directory that is ours alone is (the control)")
+
+r = root("l8")                          # L8. damage that is not a parse error
+plant(os.path.join(r, ".heimdall", "app"), "digest.json", 0o600, "[" * 16000)
+try:
+    got = DG.load(r)["config"]
+except RecursionError:
+    got = "RecursionError"
+T.eq(got, None, "L8. a deeply nested file is no schedule, and never an exception")
+
+rig = Rig()                             # L9. the sender over a planted digest.json
+planted = plant(os.path.join(rig.root, ".heimdall", "app"), "digest.json", 0o644)
+tick(rig, D1 + 8 * H)
+T.eq((len(rig.fake.sends()), mode(planted), slurp(planted).decode()), (0, "0o644", DECOY),
+     "L9. a planted digest.json (0644, on, due, with counts) sends no push: the sender takes no schedule, no day and no count from it")
+rig.close()
+
+r = root("l10")                         # L10. the lock stays bounded: a stopped holder costs an OSError, not a hang
+DG.set_config(r, CFG, Z)
+held = os.open(os.path.join(r, ".heimdall", "app", "digest.json.lock"), os.O_WRONLY)
+fcntl.flock(held, fcntl.LOCK_EX)
+started = time.monotonic()
+T.check(raises_oserror(DG.set_config, r, dict(CFG, at="08:00"), Z + 1) and time.monotonic() - started < 10 and DG.load(r)["config"]["at"] == "07:30",
+        "L10. a writer stopped holding the lock costs the caller an OSError after about a second, not a hang; the store is untouched")
+os.close(held)
 print("done")
