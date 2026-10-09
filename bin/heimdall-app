@@ -391,6 +391,102 @@ if [ -r "$LIB_DIR/hmd-python.sh" ]; then
   PY3="$(hmd_python 2>/dev/null || true)"
 fi
 
+# ── repo state: reached without following a link, believed only when it is ours, and never an instruction ─────────────────────
+# What hmd app keeps in <repo>/.heimdall/app (connect.json, relay.json, pair-window.json, the paired-<code>.json marker) lives in a
+# tree the repository controls: a cloned repo can carry `.heimdall` or `.heimdall/app` as a link, a connect.json of its own, or a
+# pid that is another program's. So no such file is written, removed or read with a shell redirection, rm, test or jq on its path:
+# every one goes through bin/lib/hmd_private_state.py, which walks down from the repo root a component at a time without following a
+# link, writes 0600, and reads back only a regular file this user owns with no group or other permission bits (anything else is no
+# state at all). And what a believed file says is data, not an instruction: it never chooses the relay (that is --relay,
+# HMD_RELAY_URL or the default), a file to open, or a process to signal -- a pid is signalled only after the process itself has been
+# looked at (_pid_is_heimdall_ui, _pid_is_relay_client, _pid_is_pair_window: this user's, the right program, working on THIS repo).
+APP_REL=".heimdall/app"
+
+# _state_read REPO NAME -- the file's bytes on stdout; nothing, and 1, when it is missing or not to be trusted
+_state_read() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" "$LIB_DIR/hmd_private_state.py" read --root "$1" --rel "$APP_REL" --name "$2" 2>/dev/null
+}
+
+# _state_write REPO NAME -- stdin becomes the file (0600; a link at the name is replaced, never written through); 1 when refused
+_state_write() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" "$LIB_DIR/hmd_private_state.py" write --root "$1" --rel "$APP_REL" --name "$2" 2>/dev/null
+}
+
+# _state_remove REPO NAME -- unlink the file (a link goes as a link, never followed); nothing is said when it cannot
+_state_remove() {
+  [ -n "$PY3" ] || return 0
+  "$PY3" "$LIB_DIR/hmd_private_state.py" remove --root "$1" --rel "$APP_REL" --name "$2" >/dev/null 2>&1 || true
+}
+
+# _doc_field DOC JQ_PATH -- one field of a JSON document held in a variable: nothing when it has none
+_doc_field() {
+  printf '%s' "$1" | jq -r "$2 // empty" 2>/dev/null
+}
+
+# _state_mtime REPO NAME -- the modification time (epoch second) of <repo>/.heimdall/app/NAME, taken without following a link, when
+# that is a regular file of this user's; nothing, and 1, otherwise
+_state_mtime() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" -I -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("hmd_private_state", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+st = mod.stat_file(sys.argv[2], ".heimdall/app", sys.argv[3])
+if st is None:
+    sys.exit(1)
+print(int(st.st_mtime))' "$LIB_DIR/hmd_private_state.py" "$1" "$2" 2>/dev/null
+}
+
+# _real_dir DIR -- the real path of the directory DIR; 1 when it is not one
+_real_dir() {
+  (cd "$1" 2>/dev/null && pwd -P)
+}
+
+# _proc_mine PID -- 0 when PID is a live process of this user
+_proc_mine() {
+  local uid
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null || return 1
+  uid="$(ps -o uid= -p "$1" 2>/dev/null | tr -d ' ')"
+  [ -n "$uid" ] && [ "$uid" = "$(id -u)" ]
+}
+
+# _argv_repo PID ARGS -- the real path of the directory the command line ARGS (the part of PID's argv after the program) gives as
+# `--repo`; a relative one is resolved against PID's own working directory, as the process itself resolved it. 1 when there is
+# none or it is not a directory.
+_argv_repo() {
+  local pid="$1" val cwd real
+  case " $2" in *" --repo "*) ;; *) return 1 ;; esac
+  val="${2#*--repo }"
+  val="${val%% --*}"
+  case "$val" in
+    /*) ;;
+    *)
+      cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+      [ -n "$cwd" ] || return 1
+      val="$cwd/$val"
+      ;;
+  esac
+  real="$(_real_dir "$val")" || return 1
+  [ -n "$real" ] || return 1
+  printf '%s' "$real"
+}
+
+# _connect_state_ready REPO -- the directory connect.json goes in made (0700) or verified, without following a link, BEFORE connect
+# starts anything; otherwise the one line that says why it will not start (connect's exit 2) and 1.
+_connect_state_ready() {
+  if [ -z "$PY3" ]; then
+    echo "hmd app connect: refusing to start -- python3 not found (set HMD_PYTHON=/path/to/python3), so connect.json cannot be written safely"
+    return 1
+  fi
+  if ! "$PY3" "$LIB_DIR/hmd_private_state.py" ensure --root "$1" --rel "$APP_REL" >/dev/null 2>&1; then
+    echo "hmd app connect: refusing to start -- $1/.heimdall/app is not a plain directory of yours (a link, or another account's), so connect.json cannot be written safely"
+    return 1
+  fi
+}
+
 # ── connect()'s teardown state -- GLOBAL on purpose, never `local` ─────────
 # A trap registered inside a function fires later, at actual process exit,
 # after that function has already `return`ed and bash has popped its locals.
@@ -407,7 +503,8 @@ V_KIND=""         # _ui_port_verdict's answer about the port it was asked of, an
 V_PID=""
 FUNNEL_UP=false
 STATE_WRITTEN=false
-STATE_FILE=""
+STATE_REPO=""     # the repo whose connect.json (and, in relay mode, relay.json) this run wrote: cleanup() removes them again
+REPO_REAL=""      # that repo's real path: the repo every adopted ui cleanup() may signal must be rendering
 UI_OUT=""
 CLEANED_UP=false
 # --relay mode's own teardown state, same "GLOBAL, never local" rule as
@@ -415,7 +512,6 @@ CLEANED_UP=false
 # the tailscale fields above it actually applies.
 RELAY_MODE=false
 CLIENT_PID=""
-RELAY_STATE_FILE=""
 CLIENT_OUT=""
 CLIENT_ERR=""
 # Pair by code: the private directory the relay client's control pipe is made in. It is removed the moment both
@@ -449,15 +545,13 @@ cleanup() {
   fi
   # An adopted ui is not this shell's child, so its pid may have been handed to another process while this ran
   # (a child's cannot be): signal it only while it still looks like a ui.
-  if [ -n "$UI_PID" ] && kill -0 "$UI_PID" 2>/dev/null && { [ "$UI_REUSED" != true ] || _pid_is_heimdall_ui "$UI_PID"; }; then
+  if [ -n "$UI_PID" ] && kill -0 "$UI_PID" 2>/dev/null && { [ "$UI_REUSED" != true ] || _pid_is_heimdall_ui "$UI_PID" "$REPO_REAL"; }; then
     kill "$UI_PID" >/dev/null 2>&1 || true
     wait "$UI_PID" 2>/dev/null || true
   fi
-  if [ "$STATE_WRITTEN" = true ] && [ -n "$STATE_FILE" ]; then
-    rm -f "$STATE_FILE" 2>/dev/null || true
-  fi
-  if [ -n "$RELAY_STATE_FILE" ]; then
-    rm -f "$RELAY_STATE_FILE" 2>/dev/null || true
+  if [ "$STATE_WRITTEN" = true ] && [ -n "$STATE_REPO" ]; then
+    _state_remove "$STATE_REPO" connect.json
+    [ "$RELAY_MODE" = true ] && _state_remove "$STATE_REPO" relay.json
   fi
   if [ -n "$UI_OUT" ]; then
     rm -f "$UI_OUT" 2>/dev/null || true
@@ -501,28 +595,27 @@ resolve_repo_value() {
 # bin/heimdall-gc:175. heimdall-ui execs into sentinels/hmd-ui.py partway
 # through startup (see bin/heimdall-ui), so a live process shows either name
 # depending on how far it got.
+#
+# A pid read back from a state file is further not enough on its own: a number a checkout planted, or another repo's hmd, would
+# pass a name match. So each of the three below asks for all of it -- the process is this user's, runs the program, and works on
+# THIS repo (its `--repo` resolves to REPO_REAL, the real path of the repo) -- the check _ui_proc_repo made for a stale ui.
+
+# _pid_is_heimdall_ui PID REPO_REAL [published] -- 0 when PID is a loopback hmd ui rendering REPO_REAL (with "published", one
+# fronted by a Funnel too: --allow-host / --trust-proxy)
 _pid_is_heimdall_ui() {
-  local pid="$1" cmd
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  cmd="$(ps -o command= -p "$pid" 2>/dev/null || ps -o comm= -p "$pid" 2>/dev/null || true)"
-  case "$cmd" in
-    *heimdall-ui*|*hmd-ui.py*) return 0 ;;
-    *) return 1 ;;
-  esac
+  local seen
+  seen="$(_ui_proc_repo "$1" "${3:-}")" || return 1
+  [ -n "$2" ] && [ "$seen" = "$2" ]
 }
 
-# Relay analogue of _pid_is_heimdall_ui above -- same recycled-pid safety
-# rationale (A14), for bin/heimdall-relay-client instead of heimdall-ui.
+# _pid_is_relay_client PID REPO_REAL -- 0 when PID is a bin/heimdall-relay-client run with `--repo` REPO_REAL
 _pid_is_relay_client() {
-  local pid="$1" cmd
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  cmd="$(ps -o command= -p "$pid" 2>/dev/null || ps -o comm= -p "$pid" 2>/dev/null || true)"
-  case "$cmd" in
-    *heimdall-relay-client*) return 0 ;;
-    *) return 1 ;;
-  esac
+  local cmd seen
+  _proc_mine "$1" || return 1
+  cmd="$(ps -ww -o command= -p "$1" 2>/dev/null)"
+  case "$cmd" in *"/heimdall-relay-client "*) ;; *) return 1 ;; esac
+  seen="$(_argv_repo "$1" "${cmd#*/heimdall-relay-client }")" || return 1
+  [ -n "$2" ] && [ "$seen" = "$2" ]
 }
 
 # A4: "is a public funnel actually configured right now" -- real
@@ -774,86 +867,66 @@ _session_attended() {
 # _pw_valid_sid SID -- a Claude Code session id as a file-name-safe key (it names the session's record).
 _pw_valid_sid() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{1,128}$'; }
 
-# _pw_app_dir_plain REPO -- 0 when <REPO>/.heimdall and <REPO>/.heimdall/app are real directories. A link there would
-# carry a window's state wherever it points, so nothing is listed or signalled through one (what is WRITTEN there goes
-# through bin/lib/hmd_private_state.py, which refuses a link itself).
-_pw_app_dir_plain() {
-  local d="$1/.heimdall"
-  [ -d "$d" ] && [ ! -L "$d" ] && [ -d "$d/app" ] && [ ! -L "$d/app" ]
-}
-
-# _pid_is_pair_window PID -- the recycled-pid safety of _pid_is_heimdall_ui (A14), for a window's supervisor.
+# _pid_is_pair_window PID REPO_REAL -- 0 when PID is a `heimdall-app pair-window-loop --repo REPO_REAL`: the supervisor of THIS repo's window.
 _pid_is_pair_window() {
-  local pid="$1" cmd
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  cmd="$(ps -o command= -p "$pid" 2>/dev/null || ps -o comm= -p "$pid" 2>/dev/null || true)"
-  case "$cmd" in
-    *heimdall-app*pair-window-loop*) return 0 ;;
-    *) return 1 ;;
-  esac
+  local cmd seen
+  _proc_mine "$1" || return 1
+  cmd="$(ps -ww -o command= -p "$1" 2>/dev/null)"
+  case "$cmd" in *"/heimdall-app pair-window-loop "*) ;; *) return 1 ;; esac
+  seen="$(_argv_repo "$1" "${cmd#*/heimdall-app pair-window-loop }")" || return 1
+  [ -n "$2" ] && [ "$seen" = "$2" ]
 }
 
-# _pw_state_file REPO -- the state file of the repo's window (a repo has one).
-_pw_state_file() { printf '%s/.heimdall/app/pair-window.json' "$1"; }
-
-# _pw_live_files REPO -- the repo's window state file, when its supervisor is alive (nothing otherwise). A file whose
-# supervisor is gone is cleared on the way.
-_pw_live_files() {
-  local repo="$1" f pid
-  _pw_app_dir_plain "$repo" || return 0
-  f="$(_pw_state_file "$repo")"
-  { [ -f "$f" ] && [ ! -L "$f" ]; } || return 0
-  pid="$(jq -r '.pid // empty' "$f" 2>/dev/null)"
-  if _pid_is_pair_window "$pid"; then printf '%s\n' "$f"; else rm -f "$f" 2>/dev/null || true; fi
+# _pw_live REPO -- the repo's believed pair-window.json (a repo has one window) on stdout, and 0, while the supervisor it names is
+# alive and is this repo's; otherwise 1. A believed file whose supervisor is gone is cleared on the way.
+_pw_live() {
+  local doc real
+  doc="$(_state_read "$1" pair-window.json)" || return 1
+  real="$(_real_dir "$1")" || return 1
+  if _pid_is_pair_window "$(_doc_field "$doc" .pid)" "$real"; then
+    printf '%s' "$doc"
+    return 0
+  fi
+  _state_remove "$1" pair-window.json
+  return 1
 }
 
 # _pair_window_holds REPO CODE -- 0 when this repo's pair window is live and offers CODE.
 _pair_window_holds() {
-  local f
-  while IFS= read -r f; do
-    [ "$(jq -r '.code // empty' "$f" 2>/dev/null)" = "$2" ] && return 0
-  done < <(_pw_live_files "$1")
-  return 1
+  local doc
+  doc="$(_pw_live "$1")" || return 1
+  [ "$(_doc_field "$doc" .code)" = "$2" ]
 }
 
-# _pair_window_stop_file FILE [WAIT_S] -- TERM the supervisor the file names (it stops its client, which revokes its
-# session, and removes the file itself) and wait up to WAIT_S seconds (default 20) for it to be gone; past 5 s of
-# patience it is killed outright. A short WAIT_S (the SessionEnd hook's) leaves a slow clean-up to finish on its own.
-_pair_window_stop_file() {
-  local f="$1" wait_s="${2:-20}" pid steps=0 max
-  pid="$(jq -r '.pid // empty' "$f" 2>/dev/null)"
+# _pair_window_stop REPO [WAIT_S] -- TERM the live window's supervisor (it stops its client, which revokes its session, and
+# removes the file itself) and wait up to WAIT_S seconds (default 20) for it to be gone; past 5 s of patience it is killed
+# outright. A short WAIT_S (the SessionEnd hook's) leaves a slow clean-up to finish on its own. 1 when the repo has no live window.
+_pair_window_stop() {
+  local repo="$1" wait_s="${2:-20}" doc pid real steps=0 max
+  doc="$(_pw_live "$repo")" || return 1
+  pid="$(_doc_field "$doc" .pid)"
+  real="$(_real_dir "$repo")" || return 1
   max=$((wait_s * 5))
-  if _pid_is_pair_window "$pid"; then
-    kill -TERM "$pid" 2>/dev/null || true
-    while kill -0 "$pid" 2>/dev/null && [ "$steps" -lt "$max" ]; do
-      sleep 0.2
-      steps=$((steps + 1))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-      [ "$wait_s" -ge 5 ] && _kill_tree KILL "$pid"
-      return 0
-    fi
+  kill -TERM "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$steps" -lt "$max" ]; do
+    sleep 0.2
+    steps=$((steps + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    [ "$wait_s" -ge 5 ] && _pid_is_pair_window "$pid" "$real" && _kill_tree KILL "$pid"
+    return 0
   fi
-  rm -f "$f" 2>/dev/null || true
+  _state_remove "$repo" pair-window.json
 }
 
-# _pair_window_stop_all REPO -- stop every live window of the repo; prints how many it stopped.
+# _pair_window_stop_all REPO -- stop the repo's live window; prints how many it stopped (0 or 1).
 _pair_window_stop_all() {
-  local f n=0
-  while IFS= read -r f; do
-    _pair_window_stop_file "$f" 20
-    n=$((n + 1))
-  done < <(_pw_live_files "$1")
-  printf '%s' "$n"
+  if _pair_window_stop "$1" 20; then printf '1'; else printf '0'; fi
 }
 
-# _pair_window_stop_code REPO CODE -- stop the live window(s) of the repo that offer CODE.
+# _pair_window_stop_code REPO CODE -- stop the repo's live window when it offers CODE.
 _pair_window_stop_code() {
-  local f
-  while IFS= read -r f; do
-    [ "$(jq -r '.code // empty' "$f" 2>/dev/null)" = "$2" ] && _pair_window_stop_file "$f" 20
-  done < <(_pw_live_files "$1")
+  _pair_window_holds "$1" "$2" && _pair_window_stop "$1" 20
   return 0
 }
 
@@ -1046,43 +1119,31 @@ _port_listeners() {
   lsof -nP -iTCP:"$1" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p\([0-9][0-9]*\)$/\1/p'
 }
 
-# _ui_proc_repo PID -- prints the real path of the repo the process PID renders, and returns 0, ONLY when PID is positively a
-# loopback-only hmd ui of this user: the same uid, argv `<python> <...>/sentinels/hmd-ui.py ... --repo <dir> ...` and neither
-# --allow-host nor --trust-proxy (those make a ui a published, Funnel-fronted one). A relative --repo is resolved against the
-# process's own working directory, as the ui itself resolved it. Anything it cannot read as that returns 1: not ours to touch.
+# _ui_proc_repo PID [published] -- prints the real path of the repo the process PID renders, and returns 0, ONLY when PID is
+# positively a loopback-only hmd ui of this user: the same uid, argv `<python> <...>/sentinels/hmd-ui.py ... --repo <dir> ...` and
+# neither --allow-host nor --trust-proxy (those make a ui a published, Funnel-fronted one; "published" accepts that kind too -- the
+# ui a Tailscale connect starts). A relative --repo is resolved against the process's own working directory, as the ui itself
+# resolved it. Anything it cannot read as that returns 1: not ours to touch.
 _ui_proc_repo() {
-  local pid="$1" uid cmd rest val cwd real
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  uid="$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')"
-  [ -n "$uid" ] && [ "$uid" = "$(id -u)" ] || return 1
+  local pid="$1" published="${2:-}" cmd rest
+  _proc_mine "$pid" || return 1
   cmd="$(ps -ww -o command= -p "$pid" 2>/dev/null)"
   case "$(printf '%s' "${cmd%% *}" | tr '[:upper:]' '[:lower:]')" in *python*) ;; *) return 1 ;; esac
   case "$cmd" in *"/sentinels/hmd-ui.py "*) ;; *) return 1 ;; esac
   rest="${cmd#*/sentinels/hmd-ui.py }"
-  case " $rest " in *" --allow-host "*|*" --trust-proxy "*) return 1 ;; esac
-  case " $rest" in *" --repo "*) ;; *) return 1 ;; esac
-  val="${rest#*--repo }"
-  val="${val%% --*}"
-  case "$val" in
-    /*) ;;
-    *)
-      cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
-      [ -n "$cwd" ] || return 1
-      val="$cwd/$val"
-      ;;
-  esac
-  real="$(cd "$val" 2>/dev/null && pwd -P)" || return 1
-  [ -n "$real" ] || return 1
-  printf '%s' "$real"
+  if [ "$published" != published ]; then
+    case " $rest " in *" --allow-host "*|*" --trust-proxy "*) return 1 ;; esac
+  fi
+  _argv_repo "$pid" "$rest"
 }
 
-# _ui_serves_client REPO PID -- 0 when REPO's connect.json names PID as its ui and a live relay client as its client: a
-# running session, not a leftover.
+# _ui_serves_client REPO REPO_REAL PID -- 0 when REPO's believed connect.json names PID as its ui and a live relay client OF THIS REPO
+# as its client: a running session, not a leftover.
 _ui_serves_client() {
-  local f="$1/.heimdall/app/connect.json"
-  [ -f "$f" ] && [ ! -L "$f" ] || return 1
-  [ "$(jq -r '.pid_ui // empty' "$f" 2>/dev/null)" = "$2" ] || return 1
-  _pid_is_relay_client "$(jq -r '.pid_client // empty' "$f" 2>/dev/null)"
+  local doc
+  doc="$(_state_read "$1" connect.json)" || return 1
+  [ "$(_doc_field "$doc" .pid_ui)" = "$3" ] || return 1
+  _pid_is_relay_client "$(_doc_field "$doc" .pid_client)" "$2"
 }
 
 # _ui_health_ok PORT PID -- 0 when 127.0.0.1:PORT answers GET /healthz (sentinels/hmd-ui.py) as an hmd ui that IS process PID
@@ -1166,7 +1227,7 @@ _ui_port_verdict() {
     return 0
   fi
   V_PID="$pid"
-  if _ui_serves_client "$repo" "$pid"; then
+  if _ui_serves_client "$repo" "$repo_real" "$pid"; then
     V_KIND=live
   elif _ui_health_ok "$port" "$pid"; then
     V_KIND=reuse
@@ -1412,7 +1473,8 @@ cmd_connect() {
     # needed since jq's own "file not found" stderr is redirected away and
     # an empty result behaves identically to the port being unknown.
     local stale_port=""
-    stale_port="$(jq -r '.port // empty' "$REPO/.heimdall/app/connect.json" 2>/dev/null)"
+    stale_port="$(_doc_field "$(_state_read "$REPO" connect.json)" .port)"
+    _ui_port_ok "$stale_port" || stale_port=""
     # N1: best-effort here, deliberately -- surfaces the same loud warning
     # and never claims success it doesn't have, but a stale funnel that
     # won't clear must not block a fresh connect attempt; cmd_status's
@@ -1420,8 +1482,10 @@ cmd_connect() {
     _funnel_stop_and_verify "hmd app connect" "$HTTPS_PORT" "$stale_port" || true
   fi
 
-  mkdir -p "$REPO/.heimdall/app" 2>/dev/null || true
-  STATE_FILE="$REPO/.heimdall/app/connect.json"
+  # the state directory is made (or refused) before anything is started: a link on the way to connect.json is no place to write
+  _connect_state_ready "$REPO" || return 2
+  REPO_REAL="$(_real_dir "$REPO")"
+  STATE_REPO="$REPO"
 
   # A6: mktemp is required, not best-effort -- the old fallback
   # (/tmp/hmd-app-ui.$$.out) is a predictable, symlink-plantable path. umask
@@ -1504,15 +1568,19 @@ cmd_connect() {
     pub_url="https://$host:$HTTPS_PORT/?token=$token"
   fi
 
-  jq -n \
+  if jq -n \
     --argjson pid_ui "$UI_PID" \
     --argjson port "$actual_port" \
     --argjson https_port "$HTTPS_PORT" \
     --arg host "$host" \
     --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{pid_ui: $pid_ui, port: $port, https_port: $https_port, host: $host, started_at: $started_at}' \
-    >"$STATE_FILE" 2>/dev/null
-  [ -s "$STATE_FILE" ] && STATE_WRITTEN=true
+    | _state_write "$REPO" connect.json; then
+    STATE_WRITTEN=true
+  else
+    echo "hmd app connect: connect.json could not be written -- tearing down" >&2
+    return 2
+  fi
 
   echo ""
   echo "hmd app: connected -- public URL:"
@@ -1587,6 +1655,12 @@ cmd_connect_relay() {
     fi
   fi
 
+  # The state directory is made (or refused) before anything starts and before any token is read: a link on the way to connect.json,
+  # or a directory of another account's, is no place to put the pids, and nothing is left to tear down.
+  _connect_state_ready "$REPO" || return 2
+  REPO_REAL="$(_real_dir "$REPO")"
+  STATE_REPO="$REPO"
+
   # Pair by code (see the usage block). The token lives in gh_tok only until it has been written to the client's
   # pipe; it is never passed as an argument or exported. The repo's pair window, when open, holds the
   # code (one live window per GitHub id and code on the relay), so a plain connect leaves it there and says so,
@@ -1612,10 +1686,6 @@ cmd_connect_relay() {
       echo "hmd app: code pairing off — could not derive this repo's code. Scan the QR."
     fi
   fi
-
-  mkdir -p "$REPO/.heimdall/app" 2>/dev/null || true
-  STATE_FILE="$REPO/.heimdall/app/connect.json"
-  RELAY_STATE_FILE="$REPO/.heimdall/app/relay.json"
 
   # A6: mktemp required, not a predictable /tmp fallback; umask 077 so every
   # temp file that can carry pairing/session data (the client's own stdout
@@ -1690,15 +1760,19 @@ cmd_connect_relay() {
     CLIENT_PID=$!
   fi
 
-  jq -n \
+  if jq -n \
     --argjson pid_ui "$UI_PID" \
     --argjson pid_client "$CLIENT_PID" \
     --argjson port "$actual_port" \
     --arg relay "$RELAY_URL" \
     --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{mode: "relay", pid_ui: $pid_ui, pid_client: $pid_client, port: $port, relay: $relay, started_at: $started_at}' \
-    >"$STATE_FILE" 2>/dev/null
-  [ -s "$STATE_FILE" ] && STATE_WRITTEN=true
+    | _state_write "$REPO" connect.json; then
+    STATE_WRITTEN=true
+  else
+    echo "hmd app connect: connect.json could not be written -- tearing down" >&2
+    return 2
+  fi
 
   # What _relay_event reads and sets while it renders the client's events (see its comment).
   local pair_init_seen=false warned_expired=false pairing_exp=0 seen_lines=0 client_rc=0
@@ -1800,10 +1874,11 @@ _pw_sessions() {
 # _pw_connect_live REPO -- 0 while a `hmd app connect` relay client of REPO is running (connect.json says relay mode and
 # the client it names is alive and is one): somebody is using this repo's phone link, and the window it holds stays.
 _pw_connect_live() {
-  local f="$1/.heimdall/app/connect.json"
-  { [ -f "$f" ] && [ ! -L "$f" ]; } || return 1
-  [ "$(jq -r '.mode // empty' "$f" 2>/dev/null)" = "relay" ] || return 1
-  _pid_is_relay_client "$(jq -r '.pid_client // empty' "$f" 2>/dev/null)"
+  local doc real
+  doc="$(_state_read "$1" connect.json)" || return 1
+  real="$(_real_dir "$1")" || return 1
+  [ "$(_doc_field "$doc" .mode)" = "relay" ] || return 1
+  _pid_is_relay_client "$(_doc_field "$doc" .pid_client)" "$real"
 }
 
 # _pw_stop REPO SID -- the session ended (or the operator said so): forget it, and close the repo's window unless it is
@@ -1811,15 +1886,12 @@ _pw_connect_live() {
 # and the wait is short -- SessionEnd gives a hook little time, and the supervisor finishes revoking on its own. A window
 # that is kept does not run for ever: its supervisor ends it when the last of those is gone.
 _pw_stop() {
-  local repo="$1" sid="$2" f live
+  local repo="$1" sid="$2" live
   [ -z "$PY3" ] || "$PY3" "$LIB_DIR/hmd_session_code.py" --forget-session --repo "$repo" --session-id "$sid" >/dev/null 2>&1 || true
   live="$(_pw_sessions "$repo")" || return 0  # who else is here cannot be told: the supervisor's own look ends the window
   case "$live" in "0 "*) ;; *) return 0 ;; esac
   _pw_connect_live "$repo" && return 0
-  f="$(_pw_state_file "$repo")"
-  if _pw_app_dir_plain "$repo" && [ -f "$f" ] && [ ! -L "$f" ]; then
-    _pair_window_stop_file "$f" 2
-  fi
+  _pair_window_stop "$repo" 2 || true
 }
 
 # _pw_start REPO SID OWNER RELAY TRANSCRIPT -- record the session, then open the repo's window if it is not open and can
@@ -1828,7 +1900,7 @@ _pw_stop() {
 # modification time is the session's activity for the idle stop (an absolute path, or none -- a relative one is ignored
 # here as the record ignores it, never a reason not to open).
 _pw_start() {
-  local repo="$1" sid="$2" owner="$3" relay="$4" transcript="$5" code f pid="" i=0 probe=""
+  local repo="$1" sid="$2" owner="$3" relay="$4" transcript="$5" code pid="" i=0 probe=""
   case "$transcript" in /*) ;; *) transcript="" ;; esac
   if [ -n "$PY3" ]; then
     "$PY3" "$LIB_DIR/hmd_session_code.py" --record-session --repo "$repo" --session-id "$sid" --pid "$owner" ${transcript:+--transcript "$transcript"} >/dev/null 2>&1 || true
@@ -1840,11 +1912,12 @@ _pw_start() {
   [ -n "$PY3" ] && [ -x "$RELAY_CLIENT_BIN" ] || return 0
   code="$("$PY3" "$LIB_DIR/hmd_session_code.py" --repo "$repo" 2>/dev/null)" || return 0
   printf '%s' "$code" | grep -Eq "$SESSION_CODE_RE" || return 0
-  f="$(_pw_state_file "$repo")"
-  if _pw_app_dir_plain "$repo" && [ -f "$f" ] && _pid_is_pair_window "$(jq -r '.pid // empty' "$f" 2>/dev/null)"; then
+  if _pw_live "$repo" >/dev/null; then
     echo "hmd app: pair window already open -- session code $code"
     return 0
   fi
+  # a state directory that cannot be used link-free (a link, another account's) takes no window: nothing is started, and a hook says nothing
+  "$PY3" "$LIB_DIR/hmd_private_state.py" ensure --root "$repo" --rel "$APP_REL" >/dev/null 2>&1 || return 0
   if ! _gh_token_into probe || [ -z "$probe" ]; then
     echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
     return 0
@@ -1856,12 +1929,12 @@ _pw_start() {
   nohup "$SELF" pair-window-loop --repo "$repo" --relay "$relay" </dev/null >/dev/null 2>&1 &
   disown 2>/dev/null || true
   while [ "$i" -lt 60 ]; do
-    pid="$(jq -r '.pid // empty' "$f" 2>/dev/null)"
-    _pid_is_pair_window "$pid" && break
+    pid="$(_doc_field "$(_state_read "$repo" pair-window.json)" .pid)"
+    _pid_is_pair_window "$pid" "$repo" && break
     i=$((i + 1))
     sleep 0.1
   done
-  if _pid_is_pair_window "$pid"; then
+  if _pid_is_pair_window "$pid" "$repo"; then
     echo "hmd app: pair window open -- session code $code"
   else
     echo "hmd app: pair window not confirmed -- if the code does not pair, run: hmd app connect"
@@ -1904,9 +1977,8 @@ _pw_cleanup() {
   [ -z "$PW_NAP" ] || kill "$PW_NAP" 2>/dev/null
   _relay_stop_client "$PW_CLIENT_PID" || true  # TERM first: the client revokes its relay session itself
   exec 3>&-
-  if [ -n "$PW_REPO" ] && [ -n "$PY3" ] \
-      && [ "$(jq -r '.pid // empty' "$(_pw_state_file "$PW_REPO")" 2>/dev/null)" = "$$" ]; then
-    "$PY3" "$LIB_DIR/hmd_private_state.py" remove --root "$PW_REPO" --rel .heimdall/app --name pair-window.json >/dev/null 2>&1 || true
+  if [ -n "$PW_REPO" ] && [ "$(_doc_field "$(_state_read "$PW_REPO" pair-window.json)" .pid)" = "$$" ]; then
+    _state_remove "$PW_REPO" pair-window.json
   fi
 }
 
@@ -1984,10 +2056,8 @@ _connect_window_knobs() {
 # <repo>/.heimdall/app/paired-<code>.json, its own pid in it, for as long as it serves the pairing -- the file the statusline
 # reads for `paired via code`. Read only from a plain .heimdall/app and never through a link.
 _pw_paired() {
-  local m="$PW_REPO/.heimdall/app/paired-$PW_CODE.json"
   [ -n "$PW_CLIENT_PID" ] || return 1
-  _pw_app_dir_plain "$PW_REPO" && [ -f "$m" ] && [ ! -L "$m" ] || return 1
-  [ "$(jq -r '.pid // empty' "$m" 2>/dev/null)" = "$PW_CLIENT_PID" ]
+  [ "$(_doc_field "$(_state_read "$PW_REPO" "paired-$PW_CODE.json")" .pid)" = "$PW_CLIENT_PID" ]
 }
 
 # _pw_idle -- 0 when this window has had nobody for PW_IDLE_S seconds (HMD_PAIR_WINDOW_IDLE_H hours; 0 never): no phone paired
@@ -2194,9 +2264,10 @@ cmd_status() {
   done
   REPO="$(resolve_repo_value "$REPO")"
 
-  local connect_state_file="$REPO/.heimdall/app/connect.json"
-  if [ -f "$connect_state_file" ] && [ "$(jq -r '.mode // empty' "$connect_state_file" 2>/dev/null)" = "relay" ]; then
-    cmd_status_relay "$REPO" "$connect_state_file"
+  local connect_doc
+  connect_doc="$(_state_read "$REPO" connect.json)"
+  if [ "$(_doc_field "$connect_doc" .mode)" = "relay" ]; then
+    cmd_status_relay "$REPO" "$connect_doc"
     return $?
   fi
 
@@ -2226,17 +2297,16 @@ cmd_status() {
     echo "funnel status: unavailable"
   fi
 
-  local state_file="$REPO/.heimdall/app/connect.json"
   local orphaned=false
-  if [ -f "$state_file" ]; then
+  if [ -n "$connect_doc" ]; then
     local host port https_port pid_ui started_at alive
-    host="$(jq -r '.host // empty' "$state_file" 2>/dev/null)"
-    port="$(jq -r '.port // empty' "$state_file" 2>/dev/null)"
-    https_port="$(jq -r '.https_port // empty' "$state_file" 2>/dev/null)"
-    pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
-    started_at="$(jq -r '.started_at // empty' "$state_file" 2>/dev/null)"
+    host="$(_clean_text "$(_doc_field "$connect_doc" .host)")"
+    port="$(_clean_text "$(_doc_field "$connect_doc" .port)")"
+    https_port="$(_clean_text "$(_doc_field "$connect_doc" .https_port)")"
+    pid_ui="$(_clean_text "$(_doc_field "$connect_doc" .pid_ui)")"
+    started_at="$(_clean_text "$(_doc_field "$connect_doc" .started_at)")"
     alive="not running"
-    _pid_is_heimdall_ui "$pid_ui" && alive="running"
+    _pid_is_heimdall_ui "$pid_ui" "$(_real_dir "$REPO")" published && alive="running"
     echo "connected: yes"
     echo "  ui pid: ${pid_ui:-?} ($alive)"
     echo "  local port: ${port:-?}"
@@ -2294,29 +2364,31 @@ cmd_status() {
 # above. $1: REPO (already resolved). $2: connect.json's path (already
 # confirmed to exist with mode "relay" by the caller).
 cmd_status_relay() {
-  local REPO="$1" state_file="$2"
+  local REPO="$1" doc="$2" repo_real relay_doc
   local relay pid_ui pid_client port started_at
-  relay="$(jq -r '.relay // empty' "$state_file" 2>/dev/null)"
-  pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
-  pid_client="$(jq -r '.pid_client // empty' "$state_file" 2>/dev/null)"
-  port="$(jq -r '.port // empty' "$state_file" 2>/dev/null)"
-  started_at="$(jq -r '.started_at // empty' "$state_file" 2>/dev/null)"
+  repo_real="$(_real_dir "$REPO")"
+  # shown, never used: which relay a session runs against is the environment's to say, not a file in the repo's
+  relay="$(_clean_text "$(_doc_field "$doc" .relay)")"
+  pid_ui="$(_clean_text "$(_doc_field "$doc" .pid_ui)")"
+  pid_client="$(_clean_text "$(_doc_field "$doc" .pid_client)")"
+  port="$(_clean_text "$(_doc_field "$doc" .port)")"
+  started_at="$(_clean_text "$(_doc_field "$doc" .started_at)")"
 
-  local relay_state_file="$REPO/.heimdall/app/relay.json"
+  relay_doc="$(_state_read "$REPO" relay.json)"
   local session_id="" paired="" bound_at="" frames_sent="" last_seq="" last_delivered="" event_log=""
-  if [ -f "$relay_state_file" ]; then
-    session_id="$(jq -r '.session_id // empty' "$relay_state_file" 2>/dev/null)"
-    paired="$(jq -r '.paired // empty' "$relay_state_file" 2>/dev/null)"
-    bound_at="$(jq -r '.bound_at // empty' "$relay_state_file" 2>/dev/null)"
-    frames_sent="$(jq -r '.frames_sent // empty' "$relay_state_file" 2>/dev/null)"
-    last_seq="$(jq -r '.last_seq // empty' "$relay_state_file" 2>/dev/null)"
-    last_delivered="$(jq -r '.last_delivered // empty' "$relay_state_file" 2>/dev/null)"
-    event_log="$(jq -r '.event_log // empty' "$relay_state_file" 2>/dev/null)"
+  if [ -n "$relay_doc" ]; then
+    session_id="$(_clean_text "$(_doc_field "$relay_doc" .session_id)")"
+    paired="$(_doc_field "$relay_doc" .paired)"
+    bound_at="$(_clean_text "$(_doc_field "$relay_doc" .bound_at)")"
+    frames_sent="$(_clean_text "$(_doc_field "$relay_doc" .frames_sent)")"
+    last_seq="$(_clean_text "$(_doc_field "$relay_doc" .last_seq)")"
+    last_delivered="$(_clean_text "$(_doc_field "$relay_doc" .last_delivered)")"
+    event_log="$(_clean_text "$(_doc_field "$relay_doc" .event_log)")"
   fi
 
   local ui_alive="not running" client_alive="not running"
-  _pid_is_heimdall_ui "$pid_ui" && ui_alive="running"
-  _pid_is_relay_client "$pid_client" && client_alive="running"
+  _pid_is_heimdall_ui "$pid_ui" "$repo_real" && ui_alive="running"
+  _pid_is_relay_client "$pid_client" "$repo_real" && client_alive="running"
 
   echo "mode: relay"
   echo "connected: yes"
@@ -2339,10 +2411,10 @@ cmd_status_relay() {
     # that direction before. Best-effort throughout: a missing/unreadable
     # file (log configured but no event written yet) just falls through to
     # the "no events written yet" default below, never an error.
+    # The path relay.json records is only shown: the mtime is taken from the client's own log file in the repo's state directory
+    # (bin/lib/hmd_private_state.py: no link followed, a file of ours), never from a path a file chose.
     local event_log_mtime="" event_log_when=""
-    if [ -f "$event_log" ]; then
-      event_log_mtime="$(stat -f %m "$event_log" 2>/dev/null || stat -c %Y "$event_log" 2>/dev/null || true)"
-    fi
+    event_log_mtime="$(_state_mtime "$REPO" relay-events.jsonl || true)"
     if [ -n "$event_log_mtime" ]; then
       event_log_when="$(date -u -r "$event_log_mtime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
         || date -u -d "@$event_log_mtime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
@@ -2466,6 +2538,23 @@ cmd_push_test() {
   fi
 }
 
+# _stop_recorded_ui PID REPO_REAL [published] -- stop the ui a state file names, but only when that process is a ui of THIS repo (see
+# _pid_is_heimdall_ui); anything else -- a recycled pid, another repo's ui, whatever a checkout planted -- is left alone and said so.
+_stop_recorded_ui() {
+  local pid="$1" waited=0
+  if _pid_is_heimdall_ui "$pid" "$2" "${3:-}"; then
+    kill "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    _pid_is_heimdall_ui "$pid" "$2" "${3:-}" && kill -9 "$pid" 2>/dev/null
+  elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    echo "hmd app disconnect: pid $pid in state file is not a heimdall-ui process of this repo -- not killing it" >&2
+  fi
+  return 0
+}
+
 cmd_disconnect() {
   local REPO=""
   while [ $# -gt 0 ]; do
@@ -2478,19 +2567,20 @@ cmd_disconnect() {
     esac
   done
   REPO="$(resolve_repo_value "$REPO")"
-  local state_file="$REPO/.heimdall/app/connect.json"
-  local vrc pw_stopped
+  local connect_doc repo_real vrc pw_stopped
+  connect_doc="$(_state_read "$REPO" connect.json)"
+  repo_real="$(_real_dir "$REPO")"
 
   # a pair window is a way for a phone in, so disconnect closes it too (it is opened again by the next session)
   pw_stopped="$(_pair_window_stop_all "$REPO")"
   [ "${pw_stopped:-0}" -gt 0 ] && echo "hmd app disconnect: stopped $pw_stopped pair window(s)"
 
-  if [ -f "$state_file" ] && [ "$(jq -r '.mode // empty' "$state_file" 2>/dev/null)" = "relay" ]; then
-    cmd_disconnect_relay "$REPO" "$state_file"
+  if [ "$(_doc_field "$connect_doc" .mode)" = "relay" ]; then
+    cmd_disconnect_relay "$REPO" "$repo_real" "$connect_doc"
     return $?
   fi
 
-  if [ ! -f "$state_file" ]; then
+  if [ -z "$connect_doc" ]; then
     # A4(a): a funnel can outlive its state file (crash, a manual rm, a prior
     # bug) -- disconnect is the one command that guarantees no funnel
     # survives it, so it always attempts a stop, never conditional on state.
@@ -2530,10 +2620,12 @@ cmd_disconnect() {
   fi
 
   local pid_ui https_port port
-  pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
-  https_port="$(jq -r '.https_port // empty' "$state_file" 2>/dev/null)"
-  port="$(jq -r '.port // empty' "$state_file" 2>/dev/null)"
-  [ -n "$https_port" ] || https_port=443
+  pid_ui="$(_doc_field "$connect_doc" .pid_ui)"
+  case "$pid_ui" in ''|*[!0-9]*) pid_ui="" ;; esac
+  https_port="$(_doc_field "$connect_doc" .https_port)"
+  case "$https_port" in 443|8443|10000) ;; *) https_port=443 ;; esac
+  port="$(_doc_field "$connect_doc" .port)"
+  _ui_port_ok "$port" || port=""  # only ever the backend a funnel target is recognised as hmd's own by -- never a port to reuse
 
   # A11/A13: pass hmd's own backend port so ts_funnel_stop recognizes its
   # own target instead of conservatively refusing (exit 7) to reset it.
@@ -2542,19 +2634,9 @@ cmd_disconnect() {
 
   # A14: verify identity before signaling -- a recycled pid must never take
   # an unrelated process down with it.
-  if _pid_is_heimdall_ui "$pid_ui"; then
-    kill "$pid_ui" 2>/dev/null || true
-    local waited=0
-    while kill -0 "$pid_ui" 2>/dev/null && [ "$waited" -lt 30 ]; do
-      sleep 0.1
-      waited=$((waited + 1))
-    done
-    kill -9 "$pid_ui" 2>/dev/null || true
-  elif [ -n "$pid_ui" ] && kill -0 "$pid_ui" 2>/dev/null; then
-    echo "hmd app disconnect: pid $pid_ui in state file is not a heimdall-ui process -- not killing it" >&2
-  fi
+  _stop_recorded_ui "$pid_ui" "$repo_real" published
 
-  rm -f "$state_file" 2>/dev/null || true
+  _state_remove "$REPO" connect.json
   # N1: disconnect must never claim success while the funnel is still
   # publicly reachable -- only print "stopped" (and only exit 0) once
   # _funnel_stop_and_verify has actually confirmed it's down. The ui
@@ -2569,43 +2651,34 @@ cmd_disconnect() {
 # $1: REPO (already resolved). $2: connect.json's path (already confirmed to
 # exist with mode "relay" by the caller).
 cmd_disconnect_relay() {
-  local REPO="$1" state_file="$2"
+  local REPO="$1" repo_real="$2" doc="$3"
   local pid_ui pid_client
-  pid_ui="$(jq -r '.pid_ui // empty' "$state_file" 2>/dev/null)"
-  pid_client="$(jq -r '.pid_client // empty' "$state_file" 2>/dev/null)"
-  local relay_state_file="$REPO/.heimdall/app/relay.json"
+  pid_ui="$(_doc_field "$doc" .pid_ui)"
+  pid_client="$(_doc_field "$doc" .pid_client)"
+  case "$pid_ui" in ''|*[!0-9]*) pid_ui="" ;; esac
+  case "$pid_client" in ''|*[!0-9]*) pid_client="" ;; esac
   local rc=0
 
-  # A14: verify identity before signaling -- a recycled pid must never take
-  # an unrelated process down with it.
-  if _pid_is_relay_client "$pid_client"; then
+  # A14: verify identity before signaling -- a recycled pid, another repo's process or a number a checkout planted must never
+  # take an unrelated process down with it: it has to be a relay client run for THIS repo.
+  if _pid_is_relay_client "$pid_client" "$repo_real"; then
     _relay_stop_client "$pid_client"
     rc=$?
   elif [ -n "$pid_client" ] && kill -0 "$pid_client" 2>/dev/null; then
-    echo "hmd app disconnect: pid $pid_client in state file is not a heimdall-relay-client process -- not killing it" >&2
+    echo "hmd app disconnect: pid $pid_client in state file is not a heimdall-relay-client process of this repo -- not killing it" >&2
   fi
 
   if [ "$rc" -ne 0 ]; then
     echo "hmd app disconnect: revoke may not have reached the relay -- the pairing session stays open until its token expires" >&2
   fi
 
-  if _pid_is_heimdall_ui "$pid_ui"; then
-    kill "$pid_ui" 2>/dev/null || true
-    local waited=0
-    while kill -0 "$pid_ui" 2>/dev/null && [ "$waited" -lt 30 ]; do
-      sleep 0.1
-      waited=$((waited + 1))
-    done
-    kill -9 "$pid_ui" 2>/dev/null || true
-  elif [ -n "$pid_ui" ] && kill -0 "$pid_ui" 2>/dev/null; then
-    echo "hmd app disconnect: pid $pid_ui in state file is not a heimdall-ui process -- not killing it" >&2
-  fi
+  _stop_recorded_ui "$pid_ui" "$repo_real"
 
   # Unconditional either way, matching cmd_disconnect's own documented
   # rationale above: a bad revoke must not leave the ui process or either
   # state file behind too.
-  rm -f "$state_file" 2>/dev/null || true
-  rm -f "$relay_state_file" 2>/dev/null || true
+  _state_remove "$REPO" connect.json
+  _state_remove "$REPO" relay.json
 
   [ "$rc" -eq 0 ] && echo "hmd app disconnect: stopped"
   return "$rc"
@@ -2639,10 +2712,10 @@ cmd_doctor() {
   if [ -n "$RELAY_URL" ]; then
     relay_mode=true
   else
-    local doctor_state_file="$REPO/.heimdall/app/connect.json"
-    if [ -f "$doctor_state_file" ] && [ "$(jq -r '.mode // empty' "$doctor_state_file" 2>/dev/null)" = "relay" ]; then
+    if [ "$(_doc_field "$(_state_read "$REPO" connect.json)" .mode)" = "relay" ]; then
       relay_mode=true
-      RELAY_URL="$(jq -r '.relay // empty' "$doctor_state_file" 2>/dev/null)"
+      # a file in the repo says THAT a relay is in use, never which one: doctor asks the relay the environment (or the default) names
+      RELAY_URL="${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}"
     fi
   fi
 

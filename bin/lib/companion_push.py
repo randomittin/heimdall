@@ -916,20 +916,36 @@ def _devices_from(raw):
 # ── operator test: `hmd app push-test` asks the sender for one `test` message per device ──────────
 # The module docstring says why it is a request and not a send. These are the two files and the five functions
 # both sides use; PushMonitor._serve_test is the sender's half.
-def _read_small_json(path):
-    """The JSON object in `path`, or None: a missing, oversized, unparsable or non-object file is simply no record."""
+def _read_small_json(root, rel):
+    """The JSON object in <root>/<rel>, or None: a missing, oversized, unparsable or non-object file is simply no record -- and so
+    is one reached through a link (at .heimdall, .heimdall/app or the file), one that is not this user's, or one with any group or
+    other permission bit (a checkout leaves 0644; the request and the result are written 0600). Read through hmd_private_state."""
+    directory, name = os.path.split(rel)
     try:
-        with open(path, "rb") as f:
-            raw = f.read(TEST_FILE_CAP + 1)
+        return _private_state().read_json(root, directory, name, TEST_FILE_CAP)
     except OSError:
         return None
-    if len(raw) > TEST_FILE_CAP:
-        return None
+
+
+def _write_small_json(root, rel, obj):
+    """Replace <root>/<rel> with `obj` through hmd_private_state: a fully written, fsynced 0600 temp file renamed into place, so a
+    reader sees the old file or the new one and never half of either, and a link anywhere on the way -- at the file included -- is
+    refused (OSError) or replaced, never written through. Raises OSError."""
+    directory, name = os.path.split(rel)
+    state = _private_state()
     try:
-        obj = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return None
-    return obj if isinstance(obj, dict) else None
+        dirfd = state.open_dir(root, directory, False)   # a link on the way is an OSError here; a directory not made yet is made by write()
+    except FileNotFoundError:
+        dirfd = None
+    if dirfd is not None:
+        try:
+            writable = bool(os.fstat(dirfd).st_mode & 0o200)
+        finally:
+            os.close(dirfd)
+        if not writable:   # one the operator made read-only stays that way: write() would put it back to 0700 and succeed
+            import errno
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.path.join(root, directory))
+    state.write(root, directory, name, json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
 def _write_private_json(path, obj):
@@ -966,26 +982,25 @@ def request_test(root, now=None):
     """Ask the sender of this repo for a test notification: write the request it watches, return its id (16 hex).
     Raises OSError when the request cannot be written."""
     request_id = secrets.token_hex(8)
-    _write_private_json(os.path.join(root, TEST_REQUEST_REL),
-                        {"v": 1, "id": request_id, "at": int(time.time() if now is None else now)})
+    _write_small_json(root, TEST_REQUEST_REL, {"v": 1, "id": request_id, "at": int(time.time() if now is None else now)})
     return request_id
 
 
 def withdraw_test_request(root, request_id):
     """Remove the request when it is still `request_id`'s -- nobody picked it up, so a sender that starts later
-    must not find it. Another request's file is left alone."""
-    path = os.path.join(root, TEST_REQUEST_REL)
-    held = _read_small_json(path)
+    must not find it. Another request's file is left alone, and so is anything not to be believed (a link, a file that is
+    not this user's private one): it is unlinked through hmd_private_state, never followed."""
+    held = _read_small_json(root, TEST_REQUEST_REL)
     if held is not None and held.get("id") == request_id:
         with contextlib.suppress(OSError):
-            os.unlink(path)
+            _private_state().remove(root, *os.path.split(TEST_REQUEST_REL))
 
 
 def read_test_request(root, now):
     """The request a sender should serve, {"id", "at"}, or None: well-formed, written no more than
     TEST_REQUEST_TTL_S before `now` (or TEST_REQUEST_SKEW_S after it), and not yet answered -- a result for its id,
     "sending" included, means some sender has it."""
-    held = _dict(_read_small_json(os.path.join(root, TEST_REQUEST_REL)))
+    held = _dict(_read_small_json(root, TEST_REQUEST_REL))
     request_id, at = held.get("id"), _num(held.get("at"))
     if not (isinstance(request_id, str) and _REQUEST_ID_RE.fullmatch(request_id)) or at is None:
         return None
@@ -1000,7 +1015,7 @@ def read_test_result(root, request_id):
     """The sender's answer to `request_id` -- {"state": "sending" | "done", "results": [{"device", "ok", "detail",
     "suppressed"}]} -- or None when there is none yet. Every field is re-validated on the way in: a result file is
     only ever read, never trusted."""
-    held = _read_small_json(os.path.join(root, TEST_RESULT_REL))
+    held = _read_small_json(root, TEST_RESULT_REL)
     if held is None or held.get("id") != request_id or held.get("state") not in ("sending", "done"):
         return None
     results = []
@@ -1140,8 +1155,10 @@ class PushMonitor:
         """One stat() of the operator's request file per observed state. A request that is new -- a different stamp,
         then a fresh, well-formed, unanswered id -- is queued for the worker, which decides the rest."""
         try:
-            st = os.stat(os.path.join(self.root, TEST_REQUEST_REL))
+            st = _private_state().stat_file(self.root, *os.path.split(TEST_REQUEST_REL))   # a regular file of ours, never through a link
         except OSError:
+            return
+        if st is None:
             return
         stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
         with self._cv:
@@ -1402,8 +1419,7 @@ class PushMonitor:
     def _test_result(self, request_id, state, results):
         """Write the answer the CLI is waiting for. A write that fails costs the CLI its answer, never the send."""
         try:
-            _write_private_json(os.path.join(self.root, TEST_RESULT_REL),
-                                {"v": 1, "id": request_id, "state": state, "results": results})
+            _write_small_json(self.root, TEST_RESULT_REL, {"v": 1, "id": request_id, "state": state, "results": results})
         except OSError as exc:
             self._error_once("test-result", exc)
 
