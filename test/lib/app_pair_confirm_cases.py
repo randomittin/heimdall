@@ -1151,12 +1151,133 @@ def case_code_not_derivable():
                 "%r/%r %r/%r %r/%r" % (rc_open, out_open, rc_bad, out_bad, rc_link, out_link))
 
 
+# -- U: an unpaired `hmd app connect` client stays up and keeps its code claimable ---------------------------------------
+# The live bug (2026-10-09, `hmd app connect --bg`, no phone paired; relay-events.jsonl): the code window registered at 02:17:01,
+# was renewed ONCE at 02:23:02 -- 1.5 s after the relay's 360 s registration lapsed, which is the relay client's own default
+# schedule -- and at 02:29:02 logged `code_window_closed reason=expired`: the client's 600 s cap on how long one process offers a
+# code (HMD_RELAY_CODE_WINDOW_S) had passed, so the next renewal was refused. The last session then lapsed unpaired, the relay
+# purged it 60 s on (`session_ended pairing-expired`), a client with no window open took that as the end, and nothing restarted
+# it: the session code answered 404. Only the pair window's supervisor had been given the 300 s floor, the 10 s lead and the 24 h
+# cap (b1d0e601); connect launched its client with the defaults. Now connect gets the same schedule, the cap is the window's
+# idle bound (HMD_PAIR_WINDOW_IDLE_H), and a renewal the relay cannot take now is retried instead of closing the window.
+# Scaled down: the relay keeps a registration 6 s (real 360 s) and purges a lapsed session 2 s on (60 s); floor 2 s, lead 2 s.
+CONNECT_KNOBS = {"HMD_PAIR_WINDOW_RENEW_MIN_S": "2", "HMD_PAIR_WINDOW_RENEW_LEAD_S": "2", "HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2",
+                 "HMD_RELAY_CODE_RENEW_RETRY_S": "1"}
+
+
+def events_path(s):
+    return os.path.join(s.sb.root, "connect-events.jsonl")
+
+
+def connect_bg(s, **extra):
+    """`hmd app connect --bg` against the scenario's relay on the scaled schedule, its event log on: (exit code, the client's pid)."""
+    app = s.app("--relay", s.relay.url, "--bg", env=dict(CONNECT_KNOBS, HMD_RELAY_EVENT_LOG=events_path(s), **extra))
+    app.close_stdin()
+    rc = app.wait_exit(90)
+    try:
+        with open(os.path.join(s.repo, ".heimdall", "app", "connect.json"), encoding="utf-8") as f:
+            pid = json.load(f).get("pid_client")
+    except (OSError, ValueError):
+        pid = 0
+    return rc, pid if isinstance(pid, int) else 0
+
+
+def ending_events(s):
+    """Events in the client's log that say its code window or its session is over."""
+    try:
+        with open(events_path(s), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return [e for e in events if e.get("event") in ("code_window_closed", "code_unavailable", "session_ended")]
+
+
+def failing_first(n, status=503):
+    """A /pair/init hook: the first `n` calls are answered `status`, the rest as the relay does."""
+    left = [n]
+
+    def answer():
+        if left[0] > 0:
+            left[0] -= 1
+            return status, {"error": "unavailable"}
+        return None
+    return answer
+
+
+def case_connect_stays_up():
+    with Scn(ttl=6) as s, purging_lapsed_sessions(s.relay, 2.0):
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        rc, pid = connect_bg(s)
+        if not (rc == 0 and wait_until(lambda: len(s.relay.registrations) >= 5, 90)):
+            T.check(False, "U1. (setup) connect --bg registers the code five times, two registration lifetimes and more",
+                    "rc %r registrations %d" % (rc, len(s.relay.registrations)))
+            return
+        regs = list(s.relay.registrations)
+        lapses = [s.relay.get(r["session_id"]).exp for r in regs]
+        ahead = all(regs[i + 1]["at"] < lapses[i] for i in range(len(regs) - 1))
+        gaps = [regs[i + 1]["at"] - regs[i]["at"] for i in range(len(regs) - 1)]
+        T.check(ahead and min(gaps) >= 1.9 and len({r["code"] for r in regs}) == 1,
+                "U1. an unpaired connect client renews its code before each registration lapses (not after it), no sooner than the floor, always the same code",
+                "ahead %s gaps %s" % (ahead, [round(g, 1) for g in gaps]))
+        fresh = s.relay.get(s.relay.registrations[-1]["session_id"])
+        over = ending_events(s)
+        T.check(alive(pid) and fresh.exp > time.time() and not over,
+                "U1. after more than two registration lifetimes the client is still up, the code is claimable now, and nothing closed or ended it",
+                "alive %s, lapses in %.1f s, events %s" % (alive(pid), fresh.exp - time.time(), over))
+        opened, _pub = s.paired_state(s.bind(fresh.id))
+        T.check(opened is not None, "U1. ...and a phone that types the code then pairs", "")
+
+
+def case_connect_idle_bound():
+    # HMD_PAIR_WINDOW_IDLE_H (hours, fractions allowed) bounds how long an unpaired connect keeps offering its code: 0.004 h = 14.4 s here.
+    # The fixed 10 minutes it replaces would still be offering it when this gives up looking.
+    with Scn(ttl=6) as s, purging_lapsed_sessions(s.relay, 2.0):
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        rc, pid = connect_bg(s, HMD_PAIR_WINDOW_IDLE_H="0.004")
+        gone = rc == 0 and wait_until(lambda: not alive(pid), 60)
+        n = len(s.relay.registrations)
+        time.sleep(3)
+        T.check(gone and 2 <= n <= 6 and len(s.relay.registrations) == n,
+                "U2. an unpaired window's lifetime is the idle bound (HMD_PAIR_WINDOW_IDLE_H), not a fixed 10 minutes: past it the code is not registered again and the client is gone",
+                "rc %r, client gone %s, registrations %d then %d" % (rc, gone, n, len(s.relay.registrations)))
+
+
+def case_connect_pairing_expired_reinits():
+    # The relay ends the session an unpaired client holds with pairing-expired (a laptop that slept past the registration: the purge lands
+    # before the client's own schedule does) and the first /pair/init after it is refused. The client re-inits on its retry -- the same
+    # code behind a new session -- and does not exit. Before, one refused /pair/init closed the window for good and the purge ended the client.
+    with Scn(ttl=60) as s:
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        rc, pid = connect_bg(s)
+        if not (rc == 0 and wait_until(lambda: s.relay.registrations, 40)):
+            T.check(False, "U3. (setup) connect --bg registers the code", "rc %r" % rc)
+            return
+        first = s.relay.registrations[0]["session_id"]
+        s.relay.pair_init_status = failing_first(1)
+        s.relay.end_session(first, "pairing-expired")
+        renewed = wait_until(lambda: len(s.relay.registrations) >= 2, 60)
+        regs = list(s.relay.registrations)
+        over = ending_events(s)
+        T.check(renewed and regs[1]["session_id"] != first and regs[1]["code"] == regs[0]["code"] and alive(pid) and not over,
+                "U3. a session the relay ended as pairing-expired is re-initialised -- /pair/init again, the same code re-registered -- even when the first /pair/init is refused; the client does not exit",
+                "renewed %s, registrations %d, alive %s, events %s" % (renewed, len(regs), alive(pid), over))
+        opened, _pub = s.paired_state(s.bind(regs[-1]["session_id"]))
+        T.check(opened is not None, "U3. ...and the re-initialised session pairs a phone that types the code", "")
+
+
 def main():
     cases = (case_one_code, case_hooks, case_auto_pair, case_bg, case_identity_mismatch, case_no_sas_anywhere,
              case_notice_and_statusline, case_confirm, case_gh_signed_out_and_two_sessions, case_window_is_the_repos,
              case_renewal_schedule, case_stream_waits_for_renewal, case_renewal_floor_live, case_renewal_before_lapse_live,
              case_idle_stop, case_idle_stop_off, case_idle_stop_activity, case_idle_stop_spares_a_pairing,
              case_hook_hands_over_the_transcript, case_idle_stop_connect_reopens,
+             case_connect_stays_up, case_connect_idle_bound, case_connect_pairing_expired_reinits,
              case_no_links_followed, case_code_not_derivable)
     wanted = sys.argv[1:]  # case names to run alone (a quick look while working on one); none runs them all
     for case in [c for c in cases if not wanted or c.__name__ in wanted]:

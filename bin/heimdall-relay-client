@@ -862,6 +862,9 @@ CODE_RENEW_MIN_S = _env_seconds("HMD_RELAY_CODE_RENEW_MIN_S", 5.0)
 _CODE_RENEW_LEAD = _env_seconds("HMD_RELAY_CODE_RENEW_LEAD_S", 0.0)
 CODE_RENEW_LEAD_S = _CODE_RENEW_LEAD if _CODE_RENEW_LEAD > 0 else -CODE_RENEW_MARGIN_S  # signed: negative is AFTER the lapse
 APPROVAL_TIMEOUT_S = _env_seconds("HMD_RELAY_APPROVAL_TIMEOUT_S", 60.0)
+# How long after a renewal the relay could not take (unreachable, throttling, failing) the next try is. The window stays
+# open meanwhile: only its own lifetime (CODE_WINDOW_TOTAL_S) or the relay's word on the code ends it.
+CODE_RENEW_RETRY_S = _env_seconds("HMD_RELAY_CODE_RENEW_RETRY_S", 30.0)
 
 
 def code_renewal_due(registered_at, expires_at, floor_s, lead_s):
@@ -933,6 +936,13 @@ def _refusal_reason(status, raw):
     if status == 401 and detail == "github token rejected":
         return "no-gh"
     return "http-%d" % status
+
+
+def _transient_refusal(reason):
+    """True for an answer to a code registration that says nothing about the code itself -- the relay unreachable,
+    throttling or failing -- so a renewal that met it is tried again. The rest (no-gh, disabled, conflict, a 4xx, a 200
+    that is not the documented one) is the relay's word, and ends the window."""
+    return reason in ("unreachable", "http-429") or reason.startswith("http-5")
 
 
 class _StdinLines:
@@ -1702,7 +1712,7 @@ class RelayClient:
             return
         data, rc = self._post_pair_init()
         if rc != 0:
-            self._code_end("code_unavailable", "unreachable")
+            self._retry_renewal()  # no token went out with it, and a laptop that wakes before its network does keeps its code
             return
         new_id, new_token = data["session_id"], data["relay_session_token"]
         priv, pub = E2E.generate_keypair()
@@ -1726,7 +1736,10 @@ class RelayClient:
             login, exp, reason = self._register_code(new_id, new_token, commit_for(pub, nonce))
         if reason is not None:
             self._revoke_session(new_id, new_token)
-            self._code_end("code_unavailable", reason)
+            if _transient_refusal(reason):
+                self._retry_renewal()
+            else:
+                self._code_end("code_unavailable", reason)
             return
         with self._code_lock:
             installed = self._code_state == "open"
@@ -1751,6 +1764,13 @@ class RelayClient:
         if not freed:
             self._revoke_session(*old)
 
+    def _retry_renewal(self):
+        """A renewal the relay could not take now: the window stays open and the next try is CODE_RENEW_RETRY_S on, never
+        sooner than the floor after the last registration (each try that reaches the relay sends the laptop's GitHub token).
+        An unpaired client lives on and keeps its code; only the window's own lifetime (_code_deadline) ends it."""
+        with self._code_lock:
+            self._code_renew_at = max(time.monotonic() + CODE_RENEW_RETRY_S, self._last_renew_at + CODE_RENEW_MIN_S)
+
     def _interrupt_stream(self):
         """Cut the connection the stream thread is blocked reading, so it reopens at once on the session this
         client holds now. A connection that is already down needs no cutting -- the thread reopens on its own."""
@@ -1768,8 +1788,9 @@ class RelayClient:
         is due -- minutes away behind the pair window's floor, with the relay having purged the lapsed session long before
         -- and `timeout` is the patience for it to finish once it has begun. A fixed patience would end the client
         instead, and the supervisor would relaunch it, sending the token, far sooner than the floor allows."""
-        deadline = max(self._renewal_due(), time.monotonic()) + timeout
-        while epoch == self._stream_epoch and time.monotonic() < deadline:
+        began = time.monotonic()
+        # re-read each pass: a renewal that failed is retried later, and the patience moves with it
+        while epoch == self._stream_epoch and time.monotonic() < max(self._renewal_due(), began) + timeout:
             if self.stop_event.wait(0.2):
                 return False
         return epoch != self._stream_epoch

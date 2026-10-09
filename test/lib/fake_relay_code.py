@@ -77,6 +77,7 @@ class FakeCodeRelay:
         self.code_status = None      # callable(registration dict) -> (status, body) or None for the default
         self.identity_status = None  # callable(identity dict) -> (status, body) or None for the default
         self.frames_status = None    # callable(envelope dict) -> (status, body) or None for the default; recorded first
+        self.pair_init_status = None  # callable() -> (status, body) or None for the default; answered before a session is made
         self.ignore_revokes = False  # a hostile relay: a revoke is recorded and answered, the session stays open
         self.lock = threading.Lock()
         self.sessions = {}
@@ -213,6 +214,11 @@ class _Handler(BaseHTTPRequestHandler):
         relay = self.relay
         raw = self._body()
         if self.path == "/pair/init":
+            if relay.pair_init_status is not None:
+                answer = relay.pair_init_status()
+                if answer is not None:
+                    self._json(*answer)
+                    return
             sess = relay.new_session()
             self._json(200, {"session_id": sess.id, "pairing_code": sess.pairing_code,
                              "relay_session_token": sess.token, "exp": sess.exp})
