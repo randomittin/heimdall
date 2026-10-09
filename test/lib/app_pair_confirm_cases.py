@@ -507,8 +507,8 @@ def case_notice_and_statusline():
     sl = SL.Sandbox(statusline_fixture())
     with Scn() as s:
         try:
-            ok, code, err = code_cli(sl.env(), "--session-id", SID1)
-            T.check(ok == 0 and len(code) == 5, "7. (setup) the session's code", err)
+            ok, code, err = code_cli(sl.env(), "--repo", sl.ws)
+            T.check(ok == 0 and len(code) == 5, "7. (setup) the repo's code, the one the statusline shows", err)
             c = s.client(code, repo=sl.ws)
             c.wait_event("code_window")
             T.check("paired via code" not in render(sl, SID1), "7. before anyone pairs the statusline has no pairing note")
@@ -1012,11 +1012,12 @@ def case_hook_hands_over_the_transcript():
         transcript = os.path.join(s.sb.root, "session.jsonl")
         write_private(transcript, "{}\n")
         started = s.hook("pair-window-start", SID1, payload={"transcript_path": transcript})
+        recorded = wait_until(lambda: (s.session_record(SID1) or {}).get("transcript") == transcript, 30)
         sup = window_pid(s, timeout=30)
-        argv = H.argv_of(sup) if sup else ""
-        T.check(started.returncode == 0 and started.stdout == "" and "--transcript %s" % transcript in argv,
-                "I5. the SessionStart hook hands the window the session's transcript, the activity its idle stop watches",
-                "rc %r out %r argv %r" % (started.returncode, started.stdout, argv))
+        T.check(started.returncode == 0 and started.stdout == "" and recorded and isinstance(sup, int) and alive(sup),
+                "I5. the SessionStart hook records the session's transcript with it -- the activity the window's idle stop watches, "
+                "across every session of the repo -- and the window opens",
+                "rc %r out %r record %r" % (started.returncode, started.stdout, s.session_record(SID1)))
 
 
 def case_idle_stop_connect_reopens():
