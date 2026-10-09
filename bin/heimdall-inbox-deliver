@@ -194,6 +194,18 @@
 #     the chat publisher (bin/lib/companion_ui_publish.py phone_messages) recognises a delivery by
 #     them and reads the quoted block as the operator's own line.
 #
+# LINKS. The repo tree is attacker-shaped: a checkout can carry .heimdall, .heimdall/ui, .heimdall/app or any file in them
+# (inbox.jsonl, inbox-delivered.jsonl, inbox.jsonl.lock, inbox-state.json, inbox-waiting, tmux-target, connect.json) as a
+# symlink, and HEIMDALL_HOME/app can be one too. Every create, write, append, rename, truncate, remove, lock, stat, list,
+# watch and read this tool makes under the repo -- and of the seal key under HEIMDALL_HOME -- goes through
+# bin/lib/hmd_private_state.py, the copy beside THIS script: it walks down from the root one component at a time with
+# O_NOFOLLOW and refuses a link, or a directory of another account's, anywhere on the way. Nothing is created, chmod'ed,
+# truncated, locked, renamed, unlinked or written through a link, and nothing a link leads to is believed. A refusal is no
+# queue: reads are empty, the pop is refused with every message still pending (the archive is vetted before the inbox is
+# claimed), the status files are not written, and a Stop hold that cannot publish its inbox-waiting marker stands down at
+# once rather than hold a turn nobody can reach. The hook still exits 0, with no output. A shared-library copy found in a
+# repo is used only if it is link-safe too (companion_ui_inbox.link_safe); otherwise the inline implementation runs.
+#
 # TOOL-BOUNDARY DELIVERY (hmdapp docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md, ask 2).
 # Measured on the operator's Mac, queued -> delivered_at was 75s, 110s and 808s: a
 # message waited for the end of the turn. hooks/hooks.json now wires `tool` into
@@ -425,7 +437,7 @@ if [ "$MODE" = tool ]; then
 fi
 
 PY_SRC=$(cat <<'PYEOF'
-import fcntl, hashlib, hmac, json, os, re, select, shlex, shutil, stat, subprocess, sys, time, unicodedata
+import hashlib, hmac, json, os, re, select, shlex, shutil, subprocess, sys, time, unicodedata
 
 MODE, REPO_EXPLICIT, DEFAULT_REPO = sys.argv[1], sys.argv[2], sys.argv[3]
 # argv[4] is the pid of the shell that launched this script (PPID in the bash
@@ -493,7 +505,8 @@ SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")   # hmd_session_resolve.py: 
 ASK_MAX_CHARS = 160                                   # attention's SUMMARY_MAX
 MAX_NOTES_CHARS = 1500                                # the labels above the quoted block: marker + labels + 8000-char body stay under 10000
 VIA_VALUES = ("stop", "prompt", "tool", "tmux", "cli")   # the delivery paths bin/lib/companion_ui_inbox.py records
-SEAL_KEY_REL = os.path.join("app", "inbox-answer.key")   # under HEIMDALL_HOME: the key the relay client seals an answer stamp with (mirrors bin/lib/companion_ui_inbox.py)
+SEAL_KEY_DIR = "app"                                     # under HEIMDALL_HOME: the key the relay client seals an answer stamp with (mirrors bin/lib/companion_ui_inbox.py)
+SEAL_KEY_NAME = "inbox-answer.key"
 SEAL_KEY_BYTES = 32                                      # a key shorter than this is no key
 SEAL_KEY_MAX_BYTES = 4096                                # never read more of the key file than this
 SEAL_DOMAIN = b"hmd-inbox-answer-v1\n"                   # prefixes what is sealed, byte for byte as bin/lib/companion_ui_inbox.py writes it
@@ -555,76 +568,32 @@ def resolve_repo(hook):
     return DEFAULT_REPO
 
 
-def paths_for(root):
-    d = os.path.join(root, ".heimdall", "ui")
-    return {
-        "dir": d,
-        "inbox": os.path.join(d, "inbox.jsonl"),
-        "delivered": os.path.join(d, "inbox-delivered.jsonl"),
-        "lock": os.path.join(d, "inbox.jsonl.lock"),
-        "state": os.path.join(d, "inbox-state.json"),
-        "waiting": os.path.join(d, "inbox-waiting"),
-        "connect": os.path.join(root, ".heimdall", "app", "connect.json"),
-    }
+UI_REL = ".heimdall/ui"      # directories below the repo root, walked link-free by hmd_private_state
+APP_REL = ".heimdall/app"
+INBOX_NAME = "inbox.jsonl"
+DELIVERED_NAME = "inbox-delivered.jsonl"
+LOCK_NAME = "inbox.jsonl.lock"
+STATE_NAME = "inbox-state.json"
+WAITING_NAME = "inbox-waiting"
+CONNECT_NAME = "connect.json"
+TMUX_TARGET_NAME = "tmux-target"
+INBOX_READ_MAX = 16 * 1024 * 1024   # mirrors bin/lib/companion_ui_inbox.py: inbox.jsonl cannot near it, a bigger file is not read
+READ_CAP = 65536
+STATE = None                 # bin/lib/hmd_private_state.py beside this script, loaded by main(): the only way this tool touches a file under a repo or HEIMDALL_HOME
 
 
-# N2: bin/lib/companion_ui_inbox.py's own _ensure_dir/_open_append_0600 force
-# the .heimdall/ui directory to 0700 and every file in it to 0600, on every
-# touch (not just first creation), because phone messages are private to the
-# repo owner. The inline fallback below implements the SAME on-disk protocol
-# as that module (append/list_pending/pop_all/peek over the same files) and
-# must carry the same permission floor -- otherwise a repo running the
-# fallback (no bin/lib/companion_ui_inbox.py importable) writes
-# inbox.jsonl/inbox-delivered.jsonl/the lock file at os.makedirs()'s and
-# open()'s own defaults (0755/0644), world-readable. These two helpers are
-# mirrored verbatim from that module so both paths agree on the permission
-# model.
-def _ensure_dir(path, mode=0o700):
-    """Create the directory (and parents) if missing, then force its mode to
-    the given mode regardless of umask or a wider pre-existing mode."""
-    os.makedirs(path, exist_ok=True)
-    os.chmod(path, mode)
-
-
-def _open_append_0600(path):
-    """Open path for text append, creating it at mode 0600 if missing, and
-    forcing 0600 even when it already exists (O_CREAT's mode argument is
-    only applied -- and only umask-limited -- on the create branch, so a
-    file left over from before this fix would otherwise keep its old, wider
-    mode forever)."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    os.chmod(path, 0o600)
-    return os.fdopen(fd, "a", encoding="utf-8")
-
-
-class _Flock(object):
-    """Exclusive fcntl flock, held for one read/mutate critical section."""
-
-    def __init__(self, lock_path):
-        self.lock_path = lock_path
-        self.fh = None
-
-    def __enter__(self):
-        # Same 0600 self-healing fix as _open_append_0600 above -- this lock
-        # file lives in the same directory and is just as readable by any
-        # local user if left at a default 0644. Content is never read back
-        # (the file exists only to hold the flock), so truncating it on
-        # every acquisition -- the same approach companion_ui_inbox.py's own
-        # _FlockCtx uses for its lock file -- is harmless.
-        _ensure_dir(os.path.dirname(self.lock_path))
-        fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.chmod(self.lock_path, 0o600)
-        self.fh = os.fdopen(fd, "w")
-        fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        fh, self.fh = self.fh, None
-        if fh is None:
-            return False
-        _silently(lambda: fcntl.flock(fh.fileno(), fcntl.LOCK_UN))
-        _silently(fh.close)
-        return False
+def load_private_state():
+    # bin/lib/hmd_private_state.py beside THIS script (the plugin's own copy, never a repo's), loaded by path. N2: it also
+    # carries the permission floor bin/lib/companion_ui_inbox.py has -- 0700 directories and 0600 files on every touch,
+    # not just first creation, because phone messages are private to the repo owner. There is no fallback to plain
+    # open()/chmod()/rename(): a helper that cannot be loaded is an exception, which the wrapper at the bottom turns into
+    # exit 0 and nothing delivered.
+    from importlib.util import module_from_spec, spec_from_file_location
+    path = os.path.join(os.path.dirname(os.path.realpath(SELF_PATH)), "lib", "hmd_private_state.py")
+    spec = spec_from_file_location("hmd_private_state", path)
+    mod = module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _parse_lines(raw):
@@ -645,26 +614,21 @@ def _parse_lines(raw):
 # --- inline fallback: same file protocol as bin/lib/companion_ui_inbox.py ---
 
 def inline_append(root, text, source="companion"):
-    p = paths_for(root)
-    _ensure_dir(p["dir"])
-    with _Flock(p["lock"]):
-        obj = {"id": "%x" % (int(time.time() * 1e6) ^ os.getpid()),
-               "ts": time.time(), "text": sanitize(text),
-               "source": str(source or "companion")}
-        with _open_append_0600(p["inbox"]) as f:
-            f.write(json.dumps(obj) + "\n")
+    obj = {"id": "%x" % (int(time.time() * 1e6) ^ os.getpid()),
+           "ts": time.time(), "text": sanitize(text),
+           "source": str(source or "companion")}
+    STATE.append(root, UI_REL, INBOX_NAME, (json.dumps(obj) + "\n").encode("utf-8"), lock_name=LOCK_NAME)
 
 
 def inline_list_pending(root):
-    p = paths_for(root)
-    _ensure_dir(p["dir"])
-    with _Flock(p["lock"]):
-        try:
-            with open(p["inbox"], "r") as f:
-                raw = f.read()
-        except OSError:
-            raw = ""
-    return _parse_lines(raw)
+    # Empty when the way to the queue is a link or another account's directory, or the file is a link, not ours or too
+    # big: nothing behind a refusal is believed.
+    try:
+        with STATE.lock(root, UI_REL, LOCK_NAME):
+            raw = STATE.read(root, UI_REL, INBOX_NAME, INBOX_READ_MAX, forbidden=0)
+    except OSError:
+        raw = None
+    return _parse_lines((raw or b"").decode("utf-8", "replace"))
 
 
 def inline_peek(root):
@@ -695,35 +659,36 @@ def stamp_delivered(raw, delivered_at, via=None):
 
 
 def inline_pop_all(root, via=None):
-    p = paths_for(root)
-    _ensure_dir(p["dir"])
-    with _Flock(p["lock"]):
+    with STATE.lock(root, UI_REL, LOCK_NAME):
         # An empty inbox has nothing to pop, so it stays exactly where it is (what
         # companion_ui_inbox.pop_all does). Renaming it away strands a writer that has created
         # or opened the file and not yet written: a plain append takes no flock, the event-driven
         # hold wakes on the create, pops the empty file, and the line then lands in an inode that
         # was renamed and removed. See test/heimdall-inbox-lockless-writer.test.sh.
+        st = STATE.stat_file(root, UI_REL, INBOX_NAME)
+        if st is None or st.st_size == 0:
+            return []  # no inbox file (a link or a foreign file is none): nothing queued to pop
+        # The archive is vetted BEFORE the inbox is claimed: a refusal (a link at the archive, a directory of another
+        # account's) raises here, with every message still pending in inbox.jsonl.
+        archive = STATE.open_append(root, UI_REL, DELIVERED_NAME)
         try:
-            if os.stat(p["inbox"]).st_size == 0:
-                return []
-        except OSError:
-            return []  # no inbox file: nothing queued to pop
-        tmp = "%s.popped.%d.%d" % (p["inbox"], os.getpid(), int(time.time() * 1000))
-        try:
-            os.rename(p["inbox"], tmp)
-        except OSError:
-            return []  # nothing queued to pop
-        try:
-            with open(tmp, "r") as f:
-                raw = f.read()
-        except OSError:
-            raw = ""
-        if raw.strip():
-            raw = stamp_delivered(raw, round(time.time(), 3), via)
-            with _open_append_0600(p["delivered"]) as d:
-                d.write(raw)
-        _silently(lambda: os.remove(tmp))
-        return _parse_lines(raw)
+            tmp = "%s.popped.%d.%d" % (INBOX_NAME, os.getpid(), int(time.time() * 1000))
+            try:
+                STATE.rename(root, UI_REL, INBOX_NAME, tmp)
+            except OSError:
+                return []  # nothing queued to pop
+            raw = STATE.read(root, UI_REL, tmp, INBOX_READ_MAX, forbidden=0)
+            if raw is None:
+                return []  # nothing read, so nothing archived: the renamed file stays where it is, never deleted unread
+            text = raw.decode("utf-8", "surrogateescape")
+            if text.strip():
+                text = stamp_delivered(text, round(time.time(), 3), via)
+                STATE.write_all(archive, text.encode("utf-8", "surrogateescape"))
+                os.fsync(archive)
+            _silently(lambda: STATE.remove(root, UI_REL, tmp))
+            return _parse_lines(text)
+        finally:
+            os.close(archive)
 
 
 def load_inbox_module(root):
@@ -736,7 +701,11 @@ def load_inbox_module(root):
         m = _m
     except Exception:
         m = None  # sibling module absent/broken -- inline fallback covers it
-    if m is not None and all(hasattr(m, fn) for fn in ("append", "list_pending", "pop_all", "peek")):
+    # Only a copy that can reach repo state without following a link (it found its hmd_private_state: link_safe) is
+    # trusted with the queue; a copy vendored without its helper, or from before it, is not, and the inline
+    # implementation above -- which is -- takes over.
+    if (m is not None and all(hasattr(m, fn) for fn in ("append", "list_pending", "pop_all", "peek"))
+            and callable(getattr(m, "link_safe", None)) and m.link_safe()):
         return m
     return None
 
@@ -748,53 +717,39 @@ def get_ops(root):
     return inline_append, inline_list_pending, inline_pop_all, inline_peek
 
 
-def _write_json_0600(path, obj):
-    # Atomically replace path with obj as JSON, at mode 0600 (tmp file plus
-    # rename, so a reader never sees a half-written file).
-    _ensure_dir(os.path.dirname(path))
-    tmp = "%s.tmp.%d" % (path, os.getpid())
+def _write_json_0600(root, name, obj):
+    # Atomically replace <root>/.heimdall/ui/<name> with obj as JSON, at mode 0600: a temp file made O_EXCL and fsync'ed,
+    # renamed over the real name inside the vetted directory, so a reader never sees a half-written file, a pre-existing
+    # 0644 file from before this fix is fully replaced (old mode included) and a link at the name is replaced, never
+    # written through. True when it was written; False on any refusal -- a link or another account's directory on the
+    # way -- and then nothing was written.
     try:
-        # Same self-healing 0600 pattern as _open_append_0600 / _Flock above:
-        # O_CREAT's mode argument is umask-limited and only applied on the
-        # create branch, so the explicit chmod forces 0600 even if a prior
-        # crashed run left this exact tmp path behind at a wider mode. The
-        # final path inherits tmp's mode via os.replace's rename semantics,
-        # so a pre-existing 0644 file from before this fix is fully replaced
-        # -- old mode included -- on the next write, not just newly-created
-        # ones.
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.chmod(tmp, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(obj, f)
-        os.replace(tmp, path)
-    except Exception:
-        _silently(lambda: os.remove(tmp))
+        STATE.write(root, UI_REL, name, json.dumps(obj).encode("utf-8"))
+    except OSError:
+        return False
+    return True
 
 
 def write_state(root, waiting):
-    _write_json_0600(paths_for(root)["state"], {"waiting": bool(waiting), "since": time.time()})
+    return _write_json_0600(root, STATE_NAME, {"waiting": bool(waiting), "since": time.time()})
 
 
 def write_waiting(root, since, until):
     # The "a stop long-poll is live" marker. Rewritten on every poll: its mtime
     # is the heartbeat bin/lib/companion_ui_inbox.py judges (stale after 2x the
-    # poll interval), the body only names the poller and its budget.
-    _write_json_0600(paths_for(root)["waiting"],
-                     {"pid": os.getpid(), "since": since, "until": until, "ts": time.time()})
+    # poll interval), the body only names the poller and its budget. False when
+    # it could not be published (a refusal): see cmd_stop, which then stands down.
+    return _write_json_0600(root, WAITING_NAME,
+                            {"pid": os.getpid(), "since": since, "until": until, "ts": time.time()})
 
 
 def clear_waiting(root):
     # Remove the marker, but only while it is still ours: with two sessions
     # long-polling one repo the file belongs to whichever wrote it last, and
     # removing the other's would make a live listener look absent.
-    path = paths_for(root)["waiting"]
-    try:
-        with open(path, "r") as f:
-            owner = json.load(f).get("pid")
-    except (OSError, ValueError, AttributeError):
-        return
-    if owner == os.getpid():
-        _silently(lambda: os.remove(path))
+    rec = STATE.read_json(root, UI_REL, WAITING_NAME, forbidden=0)
+    if rec is not None and rec.get("pid") == os.getpid():
+        STATE.remove(root, UI_REL, WAITING_NAME)
 
 
 def _pid_alive(pid, eperm_alive=False):
@@ -834,12 +789,9 @@ def companion_connected(root):
     # A connect.json that names no pid at all is trusted as written.
     if not attended_session():
         return False
-    try:
-        with open(paths_for(root)["connect"], "r", encoding="utf-8") as f:
-            rec = json.loads(f.read(65536))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(rec, dict):
+    # Read through hmd_private_state: a link at .heimdall or .heimdall/app, or at connect.json itself, is no connect.json.
+    rec = STATE.read_json(root, APP_REL, CONNECT_NAME, READ_CAP, forbidden=0)
+    if rec is None:
         return False
     return all(_pid_alive(rec[k]) for k in ("pid_ui", "pid_client") if k in rec)
 
@@ -976,26 +928,14 @@ def one_line(s, cap):
 def seal_key():
     # The per-machine key the relay client seals an answer stamp with (bin/lib/companion_ui_inbox.py), or None. Only
     # read here -- the sealing side alone makes it -- and only trusted as a regular file this user owns that nobody
-    # else can read, opened without following a symlink and judged on the open descriptor. No key means nothing
+    # else can read, in a directory nobody else can write, reached through no link at any level (neither the key file
+    # nor HEIMDALL_HOME/app may be one), judged on the open descriptors by hmd_private_state. No key means nothing
     # verifies, so every stamp then reads as an ordinary message: the cautious side.
     home = os.environ.get("HEIMDALL_HOME") or (os.path.join(os.environ["HOME"], ".heimdall") if os.environ.get("HOME") else "")
     if not home:
         return None
-    try:
-        fd = os.open(os.path.join(home, SEAL_KEY_REL),
-                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
-    except OSError:
-        return None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-            return None
-        key = os.read(fd, SEAL_KEY_MAX_BYTES)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
-    return key if len(key) >= SEAL_KEY_BYTES else None
+    key = STATE.read(home, SEAL_KEY_DIR, SEAL_KEY_NAME, SEAL_KEY_MAX_BYTES, forbidden=0o077, dir_forbidden=0o022)
+    return key if key is not None and len(key) >= SEAL_KEY_BYTES else None
 
 
 def stamp_sealed(key, rec):
@@ -1283,16 +1223,16 @@ class InboxWatch(object):
     # While the file exists the watch sits on the file; before it exists (nothing was ever
     # queued, or a rename-style pop moved it away) it sits on the directory.
 
-    def __init__(self, inbox_path):
-        self.path = inbox_path
+    def __init__(self, root):
+        self.root = root
         self.kq = None
         self.fd = None
         self.sig = None
 
     def signature(self):
-        try:
-            st = os.stat(self.path)
-        except OSError:
+        # Taken through hmd_private_state: None for a missing file, a link, a foreign file or a link on the way.
+        st = STATE.stat_file(self.root, UI_REL, INBOX_NAME)
+        if st is None:
             return None
         return (st.st_ino, st.st_size, st.st_mtime_ns)
 
@@ -1302,15 +1242,21 @@ class InboxWatch(object):
         flags = None if os.environ.get("HMD_INBOX_WATCH", "").strip().lower() == "poll" else kqueue_flags()
         if flags is None:
             return
-        target, fflags = (self.path, flags[1]) if self.sig is not None else (os.path.dirname(self.path), flags[0])
+        # The descriptor comes from hmd_private_state too -- the queue file while it exists, else the directory that will
+        # hold it, each vetted (no link on the way, ours) -- so nothing is opened through a link. None: the stat poll waits.
+        try:
+            if self.sig is not None:
+                fd, fflags = STATE.open_read(self.root, UI_REL, INBOX_NAME, forbidden=0), flags[1]
+            else:
+                fd, fflags = STATE.open_dir(self.root, UI_REL, False), flags[0]
+        except OSError:
+            return
+        if fd is None:
+            return
         try:
             kq = select.kqueue()
         except OSError:
-            return
-        try:
-            fd = os.open(target, getattr(os, "O_EVTONLY", os.O_RDONLY))
-        except OSError:
-            kq.close()
+            os.close(fd)
             return
         try:
             kq.control([select.kevent(fd, filter=select.KQ_FILTER_VNODE,
@@ -1377,13 +1323,14 @@ def cmd_stop(hook, root):
     typing = typing_probe()  # after the deadline is fixed: finding the terminal comes out of the hold, never on top of it
     write_state(root, True)
     delivered_ctx = None
-    watch = InboxWatch(paths_for(root)["inbox"])
+    watch = InboxWatch(root)
     try:
         while not hook_orphaned(ppid0):
             lap_start = time.monotonic()
             if typing is not None and typing():
                 break  # somebody is typing into this session: hand the turn back, nothing popped; what is queued rides their prompt
-            write_waiting(root, since, deadline)
+            if not write_waiting(root, since, deadline):
+                break  # the marker cannot be published (a link or another account's directory on the way): nothing can queue into or be seen waiting in that tree, so nobody is held
             watch.arm()  # after our own marker write (which would wake it) and before the look at the queue (so nothing slips between)
             delivered_ctx = render_delivery(root, hook, pop_with(pop_all_fn, root, "stop"))
             if delivered_ctx:
@@ -1411,12 +1358,8 @@ def resolve_tmux_target(root):
     t = os.environ.get("HMD_TMUX_TARGET", "").strip()
     if t:
         return t
-    try:
-        with open(os.path.join(root, ".heimdall", "ui", "tmux-target"), "r") as f:
-            t = f.read().strip()
-    except OSError:
-        t = ""
-    return t
+    raw = STATE.read(root, UI_REL, TMUX_TARGET_NAME, 4096, forbidden=0)   # a link on the way is no target: it would name a pane to type into
+    return raw.decode("utf-8", "replace").strip() if raw is not None else ""
 
 
 def _tmux_send(args):
@@ -1470,25 +1413,24 @@ def cmd_tool(hook, root):
 
 def cmd_status(root):
     _, list_pending_fn, _, _ = get_ops(root)
-    items = list_pending_fn(root)
-    waiting = False
     try:
-        with open(paths_for(root)["state"], "r") as f:
-            st = json.load(f)
-        if isinstance(st, dict):
-            waiting = bool(st.get("waiting"))
-    except Exception:
-        waiting = False
+        items = list_pending_fn(root)
+    except OSError:
+        items = []  # a refusal reads as an empty inbox
+    st = STATE.read_json(root, UI_REL, STATE_NAME, forbidden=0)
+    waiting = bool(st.get("waiting")) if st is not None else False
     print(json.dumps({"pending": len(items), "waiting": waiting}))
 
 
 def main():
+    global STATE
     raw_stdin = sys.stdin.read() if MODE in ("stop", "prompt", "tool") else ""
     hook = read_stdin_json(raw_stdin)
     root = resolve_repo(hook)
     if not root:
         return
     root = os.path.abspath(root)
+    STATE = load_private_state()
     if MODE == "stop":
         cmd_stop(hook, root)
     elif MODE == "tmux":

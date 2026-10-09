@@ -159,6 +159,8 @@ EXPAND_RATES = {"launch-session": ((1, 1 / 60.0),),
 HOOKS_METADATA_ENV = "HMD_HOOKS_METADATA"   # the same override bin/lib/hook-enabled.sh honours
 
 AUDIT_REL = os.path.join(".heimdall", "ui", "controls-audit.jsonl")
+AUDIT_DIR = os.path.join(".heimdall", "ui")    # the audit log is written, rotated and read through bin/lib/hmd_private_state.py: no link at any level is followed
+AUDIT_NAME = "controls-audit.jsonl"
 KILL_SWITCH_REL = os.path.join(".heimdall", "app", "controls-disabled")
 STOP_REQUEST_REL = os.path.join(".heimdall", "ui", "stop-request.json")
 STOP_CONSUMED_REL = os.path.join(".heimdall", "ui", "stop-request.consumed")
@@ -344,36 +346,41 @@ def _iso(t):
 
 
 def _audit(root, line):
+    """Append one line to <repo>/.heimdall/ui/controls-audit.jsonl (0600, dir 0700), rotating it at AUDIT_MAX_BYTES. The
+    repo tree is attacker-shaped, so every touch goes through bin/lib/hmd_private_state.py: a link at .heimdall,
+    .heimdall/ui or the log itself is refused and nothing is created, chmod'ed or written through it -- the audit log is
+    then disabled for this process, exactly as for any other write failure."""
     if root in _AUDIT_OFF:
         return
     try:
-        _ensure_dir(os.path.join(root, ".heimdall", "ui"))
+        state = _sibling("hmd_private_state")
+        if state is None:
+            raise OSError("hmd_private_state is not available")
         path = os.path.join(root, AUDIT_REL)
-        try:
-            if os.stat(path).st_size >= AUDIT_MAX_BYTES:
-                os.replace(path, path + ".1")
-        except OSError:
+        st = state.stat_file(root, AUDIT_DIR, AUDIT_NAME)
+        if st is None:
             _LAST_CACHE.pop(path, None)
+        elif st.st_size >= AUDIT_MAX_BYTES:
+            with contextlib.suppress(OSError):
+                state.rename(root, AUDIT_DIR, AUDIT_NAME, AUDIT_NAME + ".1")
         data = (json.dumps(line, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        state.append(root, AUDIT_DIR, AUDIT_NAME, data)
     except OSError as e:
         _AUDIT_OFF.add(root)
         sys.stderr.write("companion_ui_controls: audit log disabled for this process (%s)\n" % type(e).__name__)
 
 
-def _tail_last(path, size):
+def _tail_last(root, name, size):
+    state = _sibling("hmd_private_state")
+    fd = state.open_read(root, AUDIT_DIR, name, forbidden=0) if state is not None else None
+    if fd is None:
+        return None
     try:
-        with open(path, "rb") as f:
-            f.seek(max(0, size - 8192))
-            chunk = f.read(8192)
+        chunk = os.pread(fd, 8192, max(0, size - 8192))
     except OSError:
         return None
+    finally:
+        os.close(fd)
     for raw in reversed(chunk.splitlines()):
         try:
             obj = json.loads(raw.decode("utf-8"))
@@ -389,18 +396,21 @@ def _tail_last(path, size):
 
 def last_control(root):
     """{action, ok, at} of the newest audit line (params never), or None. Stat-cached: an unchanged log costs a stat."""
+    state = _sibling("hmd_private_state")
+    if state is None:
+        return None
     base = os.path.join(root, AUDIT_REL)
-    for path in (base, base + ".1"):
-        try:
-            st = os.stat(path)
-        except OSError:
+    for name in (AUDIT_NAME, AUDIT_NAME + ".1"):
+        path = os.path.join(os.path.dirname(base), name)   # the cache key only: the file is reached through hmd_private_state
+        st = state.stat_file(root, AUDIT_DIR, name)        # None for a link at the log, or on the way to it
+        if st is None:
             continue
         stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
         hit = _LAST_CACHE.get(path)
         if hit is not None and hit[0] == stamp:
             value = hit[1]
         else:
-            value = _tail_last(path, st.st_size)
+            value = _tail_last(root, name, st.st_size)
             _LAST_CACHE[path] = (stamp, value)
         if value is not None:
             return value
@@ -408,9 +418,14 @@ def last_control(root):
 
 
 def audit_count(root):
-    """How many commands the audit log (current generation) holds -- for `hmd app status`."""
+    """How many commands the audit log (current generation) holds -- for `hmd app status`. 0 for a log that is a link, or
+    behind one."""
+    state = _sibling("hmd_private_state")
+    fd = state.open_read(root, AUDIT_DIR, AUDIT_NAME, forbidden=0) if state is not None else None
+    if fd is None:
+        return 0
     try:
-        with open(os.path.join(root, AUDIT_REL), "rb") as f:
+        with os.fdopen(fd, "rb") as f:
             return sum(1 for _ in f)
     except OSError:
         return 0
@@ -911,9 +926,11 @@ def _audit_ready(root):
     """True when this command's audit line can be written: an expand command is never run unrecorded."""
     if root in _AUDIT_OFF:
         return False
+    state = _sibling("hmd_private_state")
+    if state is None:
+        return False
     try:
-        _ensure_dir(os.path.join(root, ".heimdall", "ui"))
-        os.close(os.open(os.path.join(root, AUDIT_REL), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+        os.close(state.open_append(root, AUDIT_DIR, AUDIT_NAME))   # made 0600 in a 0700 directory, or refused: a link anywhere on the way
     except OSError:
         return False
     return True

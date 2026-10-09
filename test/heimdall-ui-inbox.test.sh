@@ -969,6 +969,248 @@ WAKEPY
   fi
 fi
 
+# ═══ S. nothing in the repo tree is ever followed through a link ═══════════════════════════════════
+# A checkout can carry .heimdall, .heimdall/ui, .heimdall/app, .heimdall/ui/wake or any file in them as a symlink.
+# Every create/write/append/rename/truncate/lock/stat/read of inbox state -- bin/lib/companion_ui_inbox.py, the
+# controls audit log of bin/lib/companion_ui_controls.py, and `hmd ui inbox` -- goes through
+# bin/lib/hmd_private_state.py: a link at any level (a directory or the file itself) is refused, and nothing
+# behind it is created, written, chmod'ed, truncated, locked, renamed, or believed. Each case builds a repo tree
+# and a victim directory OUTSIDE it that holds the real state (so following a link reads valid data) and compares
+# a full snapshot (bytes, mode, mtime) of the victim before and after.
+S_UNIT="$TMPROOT/s-links.py"
+cat > "$S_UNIT" <<'LINKPY'
+import fcntl
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+repo, ui_bin = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(repo, "bin", "lib"))
+verdicts = []
+
+
+def check(name, cond, detail=""):
+    verdicts.append("%s %s%s" % ("OK " if cond else "BAD", name,
+                                 "" if cond else "  <<" + str(detail)[:300].replace("\n", " ") + ">>"))
+
+
+try:
+    import companion_ui_inbox as M
+    import companion_ui_controls as C
+except Exception as exc:
+    print("BAD the modules under test import: %r" % (exc,))
+    sys.exit(0)
+
+work = tempfile.mkdtemp()
+QUEUED = "queued by the phone"
+RECORD = json.dumps({"id": "m1", "ts": time.time(), "text": QUEUED, "source": "companion"}) + "\n"
+AUDIT_LINE = json.dumps({"ts": "2026-01-01T00:00:00.000Z", "action": "launch-stop", "ok": True}) + "\n"
+UI_FILES = {"inbox.jsonl": RECORD.encode(),
+            "inbox-delivered.jsonl": b'{"id":"d1","ts":1,"text":"t","delivered_at":5.0,"via":"stop"}\n',
+            "inbox.jsonl.lock": b"",
+            "inbox-waiting": b"{}",
+            "tmux-target": b"sess:0.0\n",
+            "controls-audit.jsonl": AUDIT_LINE.encode()}
+
+
+def put(path, data, mode):
+    with open(path, "wb") as f:
+        f.write(data)
+    os.chmod(path, mode)
+
+
+def snap(path):
+    top = os.lstat(path)
+    rows = ["ROOT %o %d" % (top.st_mode, top.st_mtime_ns)]
+    for dp, dns, fns in os.walk(path):
+        for n in dns + fns:
+            p = os.path.join(dp, n)
+            st = os.lstat(p)
+            body = open(p, "rb").read() if stat.S_ISREG(st.st_mode) else b""
+            rows.append("%s %o %d %d %r" % (os.path.relpath(p, path), st.st_mode, st.st_size, st.st_mtime_ns, body))
+    return sorted(rows)
+
+
+def tree():
+    """A repo whose .heimdall/ui holds a queued message and every state file, .heimdall/app a connect.json naming THIS
+    process as ui and relay client, plus a victim directory outside it with one 0644 file."""
+    base = tempfile.mkdtemp(dir=work)
+    root = os.path.join(base, "repo")
+    ui = os.path.join(root, ".heimdall", "ui")
+    app = os.path.join(root, ".heimdall", "app")
+    os.makedirs(ui, 0o700)
+    os.makedirs(app, 0o700)
+    for name, data in UI_FILES.items():
+        put(os.path.join(ui, name), data, 0o600)
+    put(os.path.join(app, "connect.json"),
+        json.dumps({"mode": "relay", "pid_ui": os.getpid(), "pid_client": os.getpid()}).encode(), 0o600)
+    victim = os.path.join(base, "victim")
+    os.mkdir(victim, 0o755)
+    put(os.path.join(victim, "foreign"), b"SENTINEL\n", 0o644)
+    return root, victim
+
+
+def linked_dir(level):
+    root, victim = tree()
+    os.rename(os.path.join(root, level), os.path.join(victim, "moved"))
+    os.symlink(os.path.join(victim, "moved"), os.path.join(root, level))
+    return root, victim
+
+
+def linked_file(rel):
+    root, victim = tree()
+    path = os.path.join(root, rel)
+    target = os.path.join(victim, "moved-" + os.path.basename(rel))
+    os.rename(path, target)
+    os.symlink(target, path)
+    return root, victim
+
+
+def case(label, build, op, want):
+    """op(root) must leave the victim byte-for-byte as it was and: raise OSError (want "refused"), raise OSError or
+    return something empty ("nothing"), or return what the predicate `want` accepts."""
+    root, victim = build()
+    before = snap(victim)
+    got, err = None, None
+    try:
+        got = op(root)
+    except Exception as exc:
+        err = exc
+    moved = snap(victim) != before
+    if want == "refused":
+        good = isinstance(err, OSError)
+    elif want == "nothing":
+        good = isinstance(err, OSError) or (err is None and not got)
+    else:
+        good = err is None and bool(want(got))
+    check(label, good and not moved, "got=%r err=%r victim-changed=%r" % (got, err, moved))
+
+
+def pop(r):
+    return M.pop_all(r, via="cli")
+
+
+def audit_write(r):
+    return C._audit(r, {"ts": "2026-01-01T00:00:00.000Z", "action": "launch-stop", "ok": True})
+
+
+def empty_summary(s):
+    return s["pending"] == 0 and s["consumer"] == "none" and s["delivered"] == [] and s["oldest_age_s"] is None
+
+
+STATE_OPS = (
+    ("append", lambda r: M.append(r, "hello"), "refused"),
+    ("pop_all", pop, "nothing"),
+    ("list_pending", M.list_pending, "nothing"),
+    ("peek", M.peek, "nothing"),
+    ("pending_count", M.pending_count, "nothing"),
+    ("summary", M.summary, empty_summary),
+    ("delivered_receipts", M.delivered_receipts, "nothing"),
+    ("consumer_state", M.consumer_state, lambda c: c == "none"),
+    ("tmux_target", M.tmux_target, "nothing"),
+    ("audit log write", audit_write, "nothing"),
+    ("audit log last_control", C.last_control, "nothing"),
+    ("audit log count", C.audit_count, "nothing"),
+)
+
+for level in (".heimdall", ".heimdall/ui"):
+    for name, op, want in STATE_OPS:
+        case("a link at %s: %s is refused or sees nothing, and nothing behind the link changes" % (level, name),
+             lambda level=level: linked_dir(level), op, want)
+
+UI = os.path.join(".heimdall", "ui")
+FILE_OPS = {
+    "inbox.jsonl": (("append", lambda r: M.append(r, "hello"), "refused"), ("pop_all", pop, "nothing"),
+                    ("list_pending", M.list_pending, "nothing"), ("peek", M.peek, "nothing"),
+                    ("pending_count", M.pending_count, "nothing"),
+                    ("summary", M.summary, lambda s: s["pending"] == 0 and s["oldest_age_s"] is None and s["expired"] == [])),
+    "inbox-delivered.jsonl": (("pop_all", pop, "refused"), ("delivered_receipts", M.delivered_receipts, "nothing"),
+                              ("summary", M.summary, lambda s: s["delivered"] == [])),
+    "inbox.jsonl.lock": (("append", lambda r: M.append(r, "hello"), "refused"), ("pop_all", pop, "refused")),
+    "inbox-waiting": (("consumer_state", M.consumer_state, lambda c: c == "tmux"),),   # the linked marker is not believed; the real tmux-target is the consumer
+    "tmux-target": (("tmux_target", M.tmux_target, "nothing"),),
+    "controls-audit.jsonl": (("audit log write", audit_write, "nothing"), ("audit log last_control", C.last_control, "nothing"),
+                             ("audit log count", C.audit_count, "nothing")),
+}
+for fname, ops in FILE_OPS.items():
+    for name, op, want in ops:
+        case("a link at %s/%s: %s is refused or sees nothing, and nothing behind the link changes" % (UI, fname, name),
+             lambda fname=fname: linked_file(os.path.join(UI, fname)), op, want)
+
+# a refused archive must not cost the queued message: the pop claims nothing before the archive is vetted
+root, victim = linked_file(os.path.join(UI, "inbox-delivered.jsonl"))
+refused_pop = False
+try:
+    M.pop_all(root, via="cli")
+except OSError:
+    refused_pop = True
+with open(os.path.join(root, UI, "inbox.jsonl"), "rb") as f:
+    kept = QUEUED.encode() in f.read()
+check("a link at the archive: the refused pop leaves the message queued in inbox.jsonl", refused_pop and kept, (refused_pop, kept))
+
+# rotation never writes through a link at the old generation: the rename replaces the link itself
+root, victim = tree()
+archive = os.path.join(root, UI, "inbox-delivered.jsonl")
+put(archive, b"x" * (M.MAX_INBOX_BYTES + 10), 0o600)
+os.symlink(os.path.join(victim, "foreign"), archive + ".1")
+before = snap(victim)
+popped = M.pop_all(root, via="cli")
+check("rotation over a link at inbox-delivered.jsonl.1 replaces the link and writes nothing through it",
+      len(popped) == 1 and not os.path.islink(archive + ".1") and os.path.getsize(archive + ".1") > M.MAX_INBOX_BYTES
+      and snap(victim) == before, (popped, os.path.islink(archive + ".1")))
+
+# connect.json decides whether this process may stamp an answer and whether a phone is connected
+for label, build in (("a link at .heimdall/app", lambda: linked_dir(".heimdall/app")),
+                     ("a link at .heimdall/app/connect.json", lambda: linked_file(".heimdall/app/connect.json"))):
+    case("%s: this process is not taken for the paired relay client" % label, build, M._in_paired_relay_client, lambda v: v is False)
+    case("%s: no companion is taken for connected" % label, build, M._companion_connected, lambda v: v is False)
+
+# a link at the wake directory must not make a registration and a held lock behind it count as an armed wake
+held = []
+
+
+def wake_tree():
+    root, victim = tree()
+    me = os.getpid()
+    wake = os.path.join(victim, "wake")
+    os.mkdir(wake, 0o700)
+    put(os.path.join(wake, "%d.json" % me), json.dumps({"pid": me}).encode(), 0o600)
+    fd = os.open(os.path.join(wake, "%d.lock" % me), os.O_WRONLY | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    held.append(fd)
+    os.symlink(wake, os.path.join(root, UI, "wake"))
+    return root, victim
+
+
+case("a link at .heimdall/ui/wake: a registration and a held lock behind it are not an armed wake", wake_tree, M.wake_armed,
+     lambda v: v is False)
+for fd in held:
+    os.close(fd)
+
+# `hmd ui inbox` (what an operator types) with .heimdall/ui a link: no traceback, nothing believed, nothing written
+for sub in ("ls", "peek", "pop"):
+    root, victim = linked_dir(".heimdall/ui")
+    before = snap(victim)
+    done = subprocess.run([ui_bin, "inbox", sub, "--json"], cwd=root, capture_output=True, text=True, timeout=60,
+                          env=dict(os.environ, HEIMDALL_WATCH_ROOT=root))
+    check("hmd ui inbox %s with .heimdall/ui a link: no traceback, the message behind it is not shown, nothing changes" % sub,
+          "Traceback" not in done.stderr and done.returncode in (0, 1) and QUEUED not in done.stdout and snap(victim) == before,
+          (done.returncode, done.stdout[:120], done.stderr[:200]))
+print("\n".join(verdicts))
+LINKPY
+S_OUT="$(python3 "$S_UNIT" "$REPO" "$UI" 2>&1)"
+S_BAD="$(printf '%s\n' "$S_OUT" | grep -c '^BAD' || true)"
+S_OK="$(printf '%s\n' "$S_OUT" | grep -c '^OK' || true)"
+if [ "$S_BAD" = "0" ] && [ "$S_OK" -ge 50 ]; then
+  ok "S. a link anywhere below the repo is never followed: inbox state, archive, locks, consumer files, audit log, connect.json, wake dir, hmd ui inbox ($S_OK checks)"
+else
+  bad "S. link safety: $(printf '%s\n' "$S_OUT" | grep -v '^OK' | head -50)"
+fi
+
 # ═══ 20. server survived every malformed/oversize/secret/control-char/
 # capacity/rotation payload ═════════════════════════════════════════════════
 if kill -0 "$SRV_PID" 2>/dev/null; then
