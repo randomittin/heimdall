@@ -38,6 +38,12 @@ SECURITY (each gate is a test in test/heimdall-inbox-wake.test.sh).
   built only from that validated pane id, the socket path and constants, run without a shell, with -l.
   What exit 2 means. asyncRewake treats exit 2 as "wake the model", and argparse exits 2 on a bad
   argument, so usage errors are caught and exit 0: only a real wake exits 2.
+  Links. The repo tree is attacker-shaped: a checkout can carry .heimdall, .heimdall/ui, .heimdall/ui/wake, or any file
+  in them, as a symlink. Every file this tool reads, writes, locks, stats or removes under the repo goes through
+  bin/lib/hmd_private_state.py, which walks down from the repo root one component at a time with O_NOFOLLOW and refuses
+  a link or another account's directory anywhere on the way: nothing is created, chmod'ed, truncated, locked, renamed
+  or unlinked outside the repo, and nothing a link leads to is believed. A refusal ends the command with exit 0, no wake
+  and no output (stderr is the wake notice's channel: only a constant ever goes there).
 
 BOUNDS. One watcher per session (flock on wake/<pid>.lock, freed by the kernel on any
 death). One wake per record id (inbox-wake.json ledger, capped), so a delivery hook that is
@@ -57,10 +63,10 @@ Env:  HMD_INBOX_WAKE=off|rewake|tmux (default: tmux where proven, else rewake), 
 import argparse
 import contextlib
 import fcntl
+import importlib.util
 import json
 import os
 import re
-import stat
 import subprocess
 import sys
 import time
@@ -89,6 +95,11 @@ LEDGER_CAP = 200
 PROBE_TIMEOUT_S = 3.0
 ANCESTOR_HOPS = 16
 MAX_INBOX_READ = 4 * 1024 * 1024
+UI_REL = ".heimdall/ui"       # directories below the repo root, walked link-free by hmd_private_state
+WAKE_REL = ".heimdall/ui/wake"
+APP_REL = ".heimdall/app"
+READ_CAP = 65536
+STATE = None                  # bin/lib/hmd_private_state.py, loaded by main(): the only way this tool touches a repo file
 
 
 def env_float(name, default):
@@ -99,70 +110,15 @@ def env_float(name, default):
     return v if v >= 0 else default
 
 
-def ui_paths(root):
-    d = os.path.join(root, ".heimdall", "ui")
-    return {"dir": d, "inbox": os.path.join(d, "inbox.jsonl"), "waiting": os.path.join(d, "inbox-waiting"),
-            "ledger": os.path.join(d, "inbox-wake.json"), "ledger_lock": os.path.join(d, "inbox-wake.lock"),
-            "wake": os.path.join(d, "wake"), "connect": os.path.join(root, ".heimdall", "app", "connect.json")}
-
-
-def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
-    os.chmod(path, 0o700)
-
-
-def write_json_0600(path, obj):
-    ensure_dir(os.path.dirname(path))
-    tmp = "%s.tmp.%d" % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.chmod(tmp, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(obj, f)
-    os.replace(tmp, path)
-
-
-def read_json(path, cap=65536):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.loads(f.read(cap))
-    except (OSError, ValueError):
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
-def read_owned(path, forbidden, cap):
-    # The text of a regular file this user owns that carries none of the `forbidden` mode bits, else
-    # None. Opened with O_NOFOLLOW and judged by fstat on the open descriptor, so a symlink or a
-    # file swapped in between check and read cannot slip past.
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError:
-        return None
-    try:
-        with os.fdopen(fd, "rb") as f:
-            st = os.fstat(f.fileno())
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & forbidden:
-                return None
-            return f.read(cap).decode("utf-8", "replace")
-    except OSError:
-        return None
-
-
-def read_json_owned(path, forbidden):
-    raw = read_owned(path, forbidden, 65536)
-    try:
-        obj = json.loads(raw) if raw is not None else None
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
-def dir_is_ours(path):
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return False
-    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & NOT_SHARED
+def _load_private_state():
+    # bin/lib/hmd_private_state.py, loaded by path beside this file (it is not a package; bin/heimdall-relay-client's
+    # _load_module does the same). There is no fallback to plain open()/chmod()/rename(): a helper that cannot be loaded
+    # is an exception, which main() turns into exit 0 and no wake.
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib", "hmd_private_state.py")
+    spec = importlib.util.spec_from_file_location("hmd_private_state", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def attended_session():
@@ -201,7 +157,7 @@ def own_live_pid(pid):
 def companion_connected(root):
     # A phone can reach this session right now: connect.json (hmd app connect) is ours, not writable by
     # anyone else, and names at least one process, every one of them alive and ours (pid_ui, pid_client).
-    rec = read_json_owned(ui_paths(root)["connect"], NOT_SHARED)
+    rec = STATE.read_json(root, APP_REL, "connect.json", READ_CAP, forbidden=NOT_SHARED)
     if rec is None:
         return False
     pids = [rec[k] for k in ("pid_ui", "pid_client") if k in rec]
@@ -222,10 +178,9 @@ def pending_ids(root):
     # Ids of pending records the paired phone wrote, from an inbox only our own tooling can have
     # produced (see SECURITY). Message text is never kept: the wake needs only "is there one" and
     # "have I woken for it".
-    p = ui_paths(root)
-    raw = read_owned(p["inbox"], PRIVATE, MAX_INBOX_READ) if dir_is_ours(p["dir"]) else None
+    raw = STATE.read(root, UI_REL, "inbox.jsonl", MAX_INBOX_READ, forbidden=PRIVATE, dir_forbidden=NOT_SHARED)
     ids = []
-    for line in (raw or "").splitlines():
+    for line in (raw or b"").decode("utf-8", "replace").splitlines():
         try:
             rec = json.loads(line)
         except ValueError:
@@ -238,33 +193,36 @@ def pending_ids(root):
 
 class Ledger(object):
     """inbox-wake.json: {"woken": {record id: epoch}} under an exclusive flock, so two
-    sessions of one repo can never both wake for the same message."""
+    sessions of one repo can never both wake for the same message. The lock file is opened, and the
+    ledger read and replaced, through hmd_private_state: a link on the way to the lock is refused
+    (OSError), a link at the ledger is not believed and is replaced by the real file, never followed."""
 
     def __init__(self, root):
-        self.p = ui_paths(root)
-        self.fh = None
+        self.root = root
+        self.fd = None
 
     def __enter__(self):
-        ensure_dir(self.p["dir"])
-        fd = os.open(self.p["ledger_lock"], os.O_WRONLY | os.O_CREAT, 0o600)
-        os.chmod(self.p["ledger_lock"], 0o600)
-        self.fh = os.fdopen(fd, "w")
-        fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        self.fd = STATE.open_lockfile(self.root, UI_REL, "inbox-wake.lock")
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(self.fd)
+            raise
         return self
 
     def __exit__(self, *exc):
         with contextlib.suppress(OSError):
-            self.fh.close()
+            os.close(self.fd)
         return False
 
     def woken(self):
-        rec = read_json(self.p["ledger"]) or {}
+        rec = STATE.read_json(self.root, UI_REL, "inbox-wake.json", READ_CAP, forbidden=PRIVATE) or {}
         w = rec.get("woken")
         return w if isinstance(w, dict) else {}
 
     def save(self, woken):
         keep = dict(sorted(woken.items(), key=lambda kv: kv[1])[-LEDGER_CAP:])
-        write_json_0600(self.p["ledger"], {"woken": keep})
+        STATE.write(self.root, UI_REL, "inbox-wake.json", json.dumps({"woken": keep}).encode("utf-8"))
 
 
 def claim(root, ids):
@@ -282,7 +240,8 @@ def claim(root, ids):
 def session_status(pid):
     base = os.environ.get("HMD_CLAUDE_SESSIONS_DIR") or os.path.join(
         os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "sessions")
-    rec = read_json(os.path.join(base, "%d.json" % pid))
+    # Claude Code's own status file, outside the repo: no mode is demanded of it, but a link is not believed.
+    rec = STATE.read_json(base, "", "%d.json" % pid, READ_CAP, forbidden=0)
     if rec is None or rec.get("pid") != pid:
         return None
     st = rec.get("status")
@@ -290,10 +249,8 @@ def session_status(pid):
 
 
 def hold_alive(root):
-    try:
-        return 0 <= time.time() - os.stat(ui_paths(root)["waiting"]).st_mtime <= HOLD_FRESH_S
-    except OSError:
-        return False
+    st = STATE.stat_file(root, UI_REL, "inbox-waiting")
+    return st is not None and 0 <= time.time() - st.st_mtime <= HOLD_FRESH_S
 
 
 def terminal_of(pid):
@@ -365,7 +322,7 @@ def type_prompt():
 
 
 def load_registration(root, pid):
-    rec = read_json_owned(os.path.join(ui_paths(root)["wake"], "%d.json" % pid), PRIVATE)
+    rec = STATE.read_json(root, WAKE_REL, "%d.json" % pid, READ_CAP, forbidden=PRIVATE)
     return rec if rec is not None and rec.get("pid") == pid else {}
 
 
@@ -375,12 +332,10 @@ def wake_mode():
 
 
 def prune_dead(root):
-    d = ui_paths(root)["wake"]
-    for name in os.listdir(d) if os.path.isdir(d) else ():
+    for name in STATE.names(root, WAKE_REL):
         m = re.match(r"^([0-9]+)\.(json|lock)$", name)
         if m and not pid_alive(int(m.group(1))):
-            with contextlib.suppress(OSError):
-                os.remove(os.path.join(d, name))
+            STATE.remove(root, WAKE_REL, name)
 
 
 def cmd_register(root, pid, payload):
@@ -389,16 +344,13 @@ def cmd_register(root, pid, payload):
     pane, sock = session_tmux()
     rec = {"pid": pid, "session_id": payload.get("session_id") if isinstance(payload.get("session_id"), str) else "",
            "tty": terminal_of(pid), "registered_at": time.time(), "tmux_pane": pane, "tmux_socket": sock}
-    ensure_dir(ui_paths(root)["wake"])
-    write_json_0600(os.path.join(ui_paths(root)["wake"], "%d.json" % pid), rec)
+    STATE.write(root, WAKE_REL, "%d.json" % pid, json.dumps(rec).encode("utf-8"))
     prune_dead(root)
     return 0
 
 
 def take_instance_lock(root, pid):
-    ensure_dir(ui_paths(root)["wake"])
-    path = os.path.join(ui_paths(root)["wake"], "%d.lock" % pid)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    fd = STATE.open_lockfile(root, WAKE_REL, "%d.lock" % pid)     # OSError = refused: main() exits 0, no wake
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -446,9 +398,8 @@ def cmd_watch(root, pid):
 
 
 def cmd_status(root):
-    d = ui_paths(root)["wake"]
     live = 0
-    for name in os.listdir(d) if os.path.isdir(d) else ():
+    for name in STATE.names(root, WAKE_REL):
         m = re.match(r"^([0-9]+)\.json$", name)
         live += bool(m and pid_alive(int(m.group(1))))
     print(json.dumps({"registered": live, "pending": len(pending_ids(root))}))
@@ -456,6 +407,7 @@ def cmd_status(root):
 
 
 def main(argv):
+    global STATE
     ap = argparse.ArgumentParser(prog="heimdall-inbox-wake", add_help=True)
     ap.add_argument("mode", choices=("register", "watch", "status"))
     ap.add_argument("--repo", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
@@ -466,6 +418,7 @@ def main(argv):
         return 0            # argparse exits 2 on a bad argument, and under asyncRewake exit 2 WAKES the model
     root = os.path.abspath(args.repo)
     try:
+        STATE = _load_private_state()
         if args.mode == "status":
             return cmd_status(root)
         if args.mode == "register":
@@ -476,7 +429,9 @@ def main(argv):
             return cmd_register(root, args.pid, payload if isinstance(payload, dict) else {})
         return cmd_watch(root, args.pid)
     except Exception:
-        return 0            # a wake-mechanism bug must never block or wake anything
+        # a refusal (OSError from hmd_private_state: a link or another account's directory on the way) and a
+        # wake-mechanism bug end here alike: nothing was written through a link, nothing wakes, exit 0, no output
+        return 0
 
 
 if __name__ == "__main__":

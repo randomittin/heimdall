@@ -21,6 +21,11 @@ security review), applied to a directory chosen by the caller:
     no group or other permission bits and at most `limit` bytes. A file a git checkout planted is 0644 and fails
     that test, which is the point: a repository cannot make this user's tools believe it.
 
+Beyond write/read/remove: open_lockfile() hands a caller a flock-able descriptor of a file it owns under the same walk,
+stat_file() the stat of a marker file (its mtime, say) without following a link, and read() takes the mode bits a caller
+tolerates -- `forbidden` for the file, `dir_forbidden` for the directory holding it -- for state another tool already
+keeps looser than 0600 (bin/heimdall-inbox-wake uses all three: its locks, its heartbeat and connect.json).
+
 The root itself is opened by its real path (the caller named it; /var -> /private/var and the like are fine).
 
 CLI (for the shell tools, so a state file never goes through a shell redirection):
@@ -158,9 +163,38 @@ def create_once(root, rel, name, data):
         os.close(dirfd)
 
 
-def read(root, rel, name, limit=READ_LIMIT):
+def open_lockfile(root, rel, name):
+    """The descriptor of <root>/<rel>/<name>, which the caller flocks and closes. The file is made (0600) when it is
+    missing, opened WITHOUT following a link inside the vetted directory, checked (fstat of what was actually opened) to
+    be a regular file this process owns, and forced to 0600 with fchmod of that descriptor -- never chmod of a path.
+    OSError, with nothing created, changed or locked, when anything on the way is a link, a plain file or another
+    account's, or when the name is a directory, a link (a dangling one is not created through) or a FIFO (O_NONBLOCK:
+    the open cannot hang the hook on one)."""
+    _plain_name(name)
+    dirfd = open_dir(root, rel, True)
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dirfd)
+    finally:
+        os.close(dirfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise OSError("%s is not a lock file of ours" % name)
+        os.fchmod(fd, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read(root, rel, name, limit=READ_LIMIT, forbidden=0o077, dir_forbidden=0):
     """The bytes of <root>/<rel>/<name>, or None when it is missing or not to be trusted: reached through a link, not
-    a regular file, not ours, readable or writable by group or other, or larger than `limit`. Creates nothing."""
+    a regular file (a FIFO is refused without blocking), not ours, carrying any of the mode bits in `forbidden`, larger
+    than `limit`, or held in a directory carrying any of the bits in `dir_forbidden`. `forbidden` defaults to 0o077, so
+    only a 0600 file passes; a caller that needs "nobody else can write it" passes 0o022, one that needs nothing beyond
+    "ours" passes 0. `dir_forbidden` defaults to 0 (the directory's mode is not judged); 0o022 refuses a directory
+    somebody else could swap the file in. Both mode checks are made on the descriptors actually opened. Creates
+    nothing."""
     try:
         _plain_name(name)
         dirfd = open_dir(root, rel, False)
@@ -168,15 +202,17 @@ def read(root, rel, name, limit=READ_LIMIT):
         return None
     try:
         try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+            if os.fstat(dirfd).st_mode & dir_forbidden:
+                return None
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
         except OSError:
             return None
         try:
             st = os.fstat(fd)
-            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077
+            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & forbidden
                     or st.st_size > limit):
                 return None
-            return os.read(fd, limit)
+            return os.read(fd, min(limit, st.st_size))
         except OSError:
             return None
         finally:
@@ -185,9 +221,9 @@ def read(root, rel, name, limit=READ_LIMIT):
         os.close(dirfd)
 
 
-def read_json(root, rel, name, limit=READ_LIMIT):
+def read_json(root, rel, name, limit=READ_LIMIT, forbidden=0o077, dir_forbidden=0):
     """read(), parsed: the object, or None for anything that is not a JSON object."""
-    raw = read(root, rel, name, limit)
+    raw = read(root, rel, name, limit, forbidden, dir_forbidden)
     if raw is None:
         return None
     try:
@@ -195,6 +231,24 @@ def read_json(root, rel, name, limit=READ_LIMIT):
     except (ValueError, UnicodeDecodeError):
         return None
     return obj if isinstance(obj, dict) else None
+
+
+def stat_file(root, rel, name):
+    """The os.stat_result of <root>/<rel>/<name>, taken from the vetted directory without following a link, when that
+    is a regular file this process owns; None when it is missing, a link or anything else, not ours, or the way to it is
+    not a plain directory of ours. Creates nothing. For a caller that needs a marker's mtime and none of its content."""
+    try:
+        _plain_name(name)
+        dirfd = open_dir(root, rel, False)
+    except OSError:
+        return None
+    try:
+        st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(dirfd)
+    return st if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() else None
 
 
 def names(root, rel):
