@@ -114,6 +114,23 @@ def write_raw(root, data):
         f.write(data)
 
 
+def write_sealed(root, state):
+    """Plant `state` the way the store itself would have written it (sealed with this machine key), so the shape rules a
+    case exercises are what is under test, not the seal."""
+    os.makedirs(os.path.dirname(push_json(root)), exist_ok=True)
+    store._write(root, state)
+
+
+def tamper(root, edit):
+    """Change what the stored file says -- the JSON stays well formed and the file keeps its owner and mode -- the way a
+    checkout, another process or a tool could."""
+    with open(push_json(root), "rb") as f:
+        obj = json.loads(f.read().decode("utf-8"))
+    edit(obj)
+    with open(push_json(root), "wb") as f:
+        f.write(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
 def refuse(code, fn, *args, **kwargs):
     """The PushStoreError fn(*args) raises, with `code`. AssertionError when it returns or raises anything else."""
     try:
@@ -228,11 +245,11 @@ os.unlink(push_json(root))
 os.mkdir(push_json(root))  # a directory where the file belongs
 assert store.load(root) == DEFAULT
 os.rmdir(push_json(root))
-write_raw(root, json.dumps({"app_state": "weird", "app_state_at": 5}).encode())
+write_sealed(root, {"app_state": "weird", "app_state_at": 5})
 assert store.load(root) == DEFAULT
-write_raw(root, json.dumps({"app_state": "background", "app_state_at": "soon"}).encode())
+write_sealed(root, {"app_state": "background", "app_state_at": "soon"})
 assert store.load(root) == dict(DEFAULT, app_state="background"), store.load(root)
-write_raw(root, json.dumps({"app_state": "unknown", "app_state_at": "2026-10-03T10:05:00Z"}).encode())
+write_sealed(root, {"app_state": "unknown", "app_state_at": "2026-10-03T10:05:00Z"})
 assert store.load(root) == DEFAULT, "an unknown state carries no timestamp"
 print("%d corrupt shapes" % (len(variants) + 4))
 PYEOF
@@ -246,17 +263,17 @@ half = {"token": tok("h"), "platform": "bogus", "registered_at": "2026-10-03T10:
 junk = [{"token": "short", "platform": "ios", "registered_at": "2026-10-03T10:00:00Z"}, 5, None, "s",
         {"token": tok("i"), "registered_at": "yesterday"}, {"token": tok("j")},
         {"registered_at": "2026-10-03T10:00:00Z"}, {"token": 7, "registered_at": "2026-10-03T10:00:00Z"}]
-write_raw(root, json.dumps({"v": 1, "tokens": [junk[0], good, junk[1], half] + junk[2:],
-                            "app_state": "foreground", "app_state_at": "2026-10-03T10:05:00Z"}).encode())
+write_sealed(root, {"v": 1, "tokens": [junk[0], good, junk[1], half] + junk[2:],
+                    "app_state": "foreground", "app_state_at": "2026-10-03T10:05:00Z"})
 got = store.load(root)
 assert got["tokens"] == [good, {"token": tok("h"), "platform": None, "registered_at": "2026-10-03T10:00:01Z",
                                 "ref": "0123456789abcdef"}], got["tokens"]
 assert got["app_state"] == "foreground" and got["app_state_at"] == "2026-10-03T10:05:00Z"
 many = [{"token": tok(i), "platform": "ios", "registered_at": "2026-10-03T10:00:%02dZ" % i} for i in range(8)]
-write_raw(root, json.dumps({"tokens": many}).encode())
+write_sealed(root, {"tokens": many})
 assert [e["token"] for e in store.load(root)["tokens"]] == [tok(i) for i in range(3, 8)], "the 5 newest"
 dup = [dict(many[0]), dict(many[1]), dict(many[0], registered_at="2026-10-03T10:00:09Z")]
-write_raw(root, json.dumps({"tokens": dup}).encode())
+write_sealed(root, {"tokens": dup})
 got = store.load(root)["tokens"]
 assert [e["token"] for e in got] == [tok(1), tok(0)] and got[1]["registered_at"] == "2026-10-03T10:00:09Z", got
 PYEOF
@@ -272,7 +289,8 @@ assert set(entry) == {"token", "platform", "registered_at"}, sorted(entry)
 assert entry["token"] == t and entry["platform"] == "ios" and ISO.match(entry["registered_at"]), entry
 assert got["app_state"] == "unknown" and got["app_state_at"] is None
 raw = json.load(open(push_json(root)))
-assert raw["v"] == 1 and raw["tokens"] == [entry]
+assert raw["v"] == 2 and raw["tokens"] == [entry], raw
+assert re.fullmatch(r"[0-9a-f]{64}", raw["sig"]), "the stored record carries its HMAC seal: %r" % (raw.get("sig"),)
 full = store.register(root, tok("s"), "android", ref="9f3c2a1b7d4e6f80", label="api server",
                       events=["question", "approval"])
 assert full["ref"] == "9f3c2a1b7d4e6f80" and full["label"] == "api server" and full["events"] == ["approval", "question"], full
@@ -576,7 +594,7 @@ imports = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, (ast.Im
            for a in (n.names if isinstance(n, ast.Import) else [ast.alias(name=n.module)])}
 assert not printed, "the store must not print"
 assert not imports & {"logging", "sys", "traceback", "warnings"}, imports
-stdlib_only = imports <= {"copy", "errno", "fcntl", "json", "os", "re", "secrets", "time", "unicodedata"}
+stdlib_only = imports <= {"contextlib", "copy", "errno", "fcntl", "hashlib", "hmac", "importlib", "json", "os", "re", "time", "unicodedata"}
 assert stdlib_only, "unexpected import: %r" % (imports,)
 secret = tok("S3cretS3cretS3cret")
 probe = r"""
@@ -642,7 +660,7 @@ procs = [subprocess.Popen([sys.executable, WORKER, STORE_PATH, root, str(start),
 assert [p.wait(timeout=120) for p in procs] == [0] * 10
 raw = json.load(open(push_json(root)))
 got = store.load(root)
-assert raw["v"] == 1 and got["app_state"] in ("foreground", "background") and ISO.match(got["app_state_at"]), got
+assert raw["v"] == 2 and got["app_state"] in ("foreground", "background") and ISO.match(got["app_state_at"]), got
 assert 1 <= len(got["tokens"]) <= store.MAX_TOKENS, len(got["tokens"])
 for e in got["tokens"]:
     assert e["token"].split("[")[1].startswith("m"), e
@@ -1012,6 +1030,246 @@ assert rig.command("app_state", {"state": "active"}) == {"ok": True, "of_seq": 3
 with env("HMD_PUSH", "0"):
     off = Rig(seed=stale)
 assert store.load(off.root) == DEFAULT, "stale tokens go even when push is switched off"
+PYEOF
+
+# ═══ Part C: the repo cannot plant what the sender trusts ══════════════════
+# push.json decides WHERE a notification goes (the token), WHAT it may be about (events, label) and WHETHER it goes at all
+# (app_state: a phone that says it is looking silences the push). It sits under .heimdall/, a tree a repository controls: a
+# checked-in file, a planted link, another process. So the store believes only a record it SEALED itself -- HMAC-SHA256 over the
+# whole record and the repo's real path, under the per-machine key bin/lib/companion_ui_inbox.py already seals answers with --
+# in a 0600 file hmd_private_state reached without following a link. A registration is made only by the relay client, and only
+# from a frame that opened under the paired phone's session key (cases 37-40); the sender reads nothing else (41) and takes
+# its lock without following a link either (42).
+
+py_case 37 "a push.json a checkout or another process planted -- unsealed, a foreign token, forced prefs -- is never believed" <<'PYEOF'
+root = fresh()
+foreign = tok("F")
+planted = {"v": 1, "tokens": [{"token": foreign, "platform": "ios", "registered_at": "2026-10-03T10:00:00Z",
+                               "ref": "0123456789abcdef", "label": "evil", "events": ["question", "approval"]}],
+           "app_state": "background", "app_state_at": "2026-10-03T10:05:00Z"}
+write_raw(root, json.dumps(planted).encode())          # what a checkout leaves behind
+os.chmod(push_json(root), 0o644)
+assert store.load(root) == DEFAULT, "a checked-in push.json was believed: %r" % (store.load(root),)
+os.chmod(push_json(root), 0o600)                       # the same bytes from a process that did chmod it: still no seal
+assert store.load(root) == DEFAULT, "an unsealed 0600 push.json was believed: %r" % (store.load(root),)
+spec = spec_from_file_location("companion_push", os.path.join(REPO, "bin", "lib", "companion_push.py"))
+CP = module_from_spec(spec)
+spec.loader.exec_module(CP)
+assert CP.registered_devices(root) == [], "the sender would notify a planted device: %r" % (CP.registered_devices(root),)
+store.register(fresh(), tok("k"), "ios")               # this machine has a key by now, so the parse below is reached
+write_raw(root, b"[" * 30000 + b"]" * 30000)           # a 0600 plant under the read cap that is only deep: no exception, no record
+os.chmod(push_json(root), 0o600)
+assert store.load(root) == DEFAULT, "a deeply nested plant was believed or raised"
+store.register(root, tok("r"), "ios")                  # the phone's own registration replaces the plant outright
+got = store.load(root)
+assert [e["token"] for e in got["tokens"]] == [tok("r")] and got["app_state"] == "unknown", got
+assert foreign.encode() not in open(push_json(root), "rb").read(), "the planted token survived into the sealed file"
+PYEOF
+
+py_case 38 "tampered prefs are ignored: a swapped or added token, forced app_state, widened events, a rewritten label, a missing or wrong seal" <<'PYEOF'
+NOW = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def sealed_root():
+    root = fresh()
+    store.register(root, tok("a"), "ios", ref="0123456789abcdef", label="mine", events=["question"])
+    store.set_app_state(root, "background")
+    assert len(store.load(root)["tokens"]) == 1 and store.load(root)["app_state"] == "background", "the honest file must load"
+    return root
+
+
+edits = {
+    "a second, foreign token": lambda o: o["tokens"].append(dict(o["tokens"][0], token=tok("F"))),
+    "the token swapped": lambda o: o["tokens"][0].update(token=tok("F")),
+    "app_state forced to foreground": lambda o: o.update(app_state="foreground", app_state_at=NOW),
+    "app_state forgotten": lambda o: o.update(app_state="unknown", app_state_at=None),
+    "events widened": lambda o: o["tokens"][0].update(events=["approval", "error", "finished", "gate_red", "question"]),
+    "events narrowed": lambda o: o["tokens"][0].update(events=["error"]),
+    "label rewritten": lambda o: o["tokens"][0].update(label="evil"),
+    "ref rewritten": lambda o: o["tokens"][0].update(ref="fedcba9876543210"),
+    "the seal dropped": lambda o: o.pop("sig", None),
+    "the seal blanked": lambda o: o.update(sig=""),
+    "the seal not a string": lambda o: o.update(sig=7),
+    "the seal one digit short": lambda o: o.update(sig=o.get("sig", "")[:-1]),
+    "the seal not ASCII": lambda o: o.update(sig="é" * 64),
+    "the version rolled back to the unsealed format": lambda o: o.update(v=1),
+}
+for name, edit in edits.items():
+    root = sealed_root()
+    tamper(root, edit)
+    got = store.load(root)
+    assert got == DEFAULT, "%s: the tampered file was believed: %r" % (name, got)
+    store.register(root, tok("b"), "android")          # and the next honest write recovers it
+    assert [e["token"] for e in store.load(root)["tokens"]] == [tok("b")], name
+# a sealed file is good for the repo it was sealed for, and for the machine that sealed it
+src = sealed_root()
+dst = fresh()
+os.makedirs(os.path.dirname(push_json(dst)))
+with open(push_json(dst), "wb") as f:
+    f.write(open(push_json(src), "rb").read())
+os.chmod(push_json(dst), 0o600)
+assert store.load(dst) == DEFAULT, "a file sealed for another repo was believed"
+home_a = os.environ["HEIMDALL_HOME"]
+os.environ["HEIMDALL_HOME"] = tempfile.mkdtemp(prefix="other-machine-", dir=TMPROOT)
+try:
+    store.register(fresh(), tok("b"), "ios")           # this other machine now has a key of its own
+    assert store.load(src) == DEFAULT, "a file sealed under another machine key was believed"
+finally:
+    os.environ["HEIMDALL_HOME"] = home_a
+assert len(store.load(src)["tokens"]) == 1, "and it is believed again under its own machine key"
+# no machine key, and nowhere to make one: nothing can be sealed, so nothing is written (the OSError the relay client acks as write-failed)
+saved = {name: os.environ.pop(name, None) for name in ("HEIMDALL_HOME", "HOME")}
+try:
+    root = fresh()
+    refused = False
+    try:
+        store.register(root, tok("a"), "ios")
+    except OSError:
+        refused = True
+    assert refused, "a registration was written with no machine key to seal it"
+    assert not os.path.exists(push_json(root)) and store.load(root) == DEFAULT
+finally:
+    for name, value in saved.items():
+        if value is not None:
+            os.environ[name] = value
+print("%d edits, a transplant, a foreign key and no key" % len(edits))
+PYEOF
+
+py_case 39 "a sealed file reached any way but a plain 0600 file of ours in a plain directory of ours is ignored: mode, link, linked or writable directory" <<'PYEOF'
+def sealed_root():
+    root = fresh()
+    store.register(root, tok("a"), "ios")
+    assert store.load(root)["tokens"], "the honest file must load"
+    return root
+
+
+for wide in (0o644, 0o640, 0o660, 0o666, 0o604):
+    root = sealed_root()
+    os.chmod(push_json(root), wide)
+    assert store.load(root) == DEFAULT, "a push.json of mode %o was believed" % wide
+root = sealed_root()                                   # the file is a link to an honest sealed copy
+copy = os.path.join(root, "copy.json")
+os.replace(push_json(root), copy)
+os.symlink(copy, push_json(root))
+assert store.load(root) == DEFAULT, "a symlinked push.json was believed"
+root = sealed_root()                                   # .heimdall/app is a link to a directory holding an honest sealed file
+app = os.path.dirname(push_json(root))
+moved = os.path.join(root, "elsewhere")
+os.rename(app, moved)
+os.symlink(moved, app)
+assert store.load(root) == DEFAULT, "a linked .heimdall/app was believed"
+os.chmod(moved, 0o755)
+blob, listing = open(os.path.join(moved, "push.json"), "rb").read(), sorted(os.listdir(moved))
+refused = False
+try:
+    store.register(root, tok("b"), "ios")
+except OSError:
+    refused = True
+assert refused, "a registration went through a linked .heimdall/app"
+assert mode(moved) == 0o755, "the store chmod'ed what a link pointed at: %o" % mode(moved)
+assert open(os.path.join(moved, "push.json"), "rb").read() == blob and sorted(os.listdir(moved)) == listing, "a write went through the link"
+root = sealed_root()                                   # a directory somebody else could swap a file into
+os.chmod(os.path.dirname(push_json(root)), 0o777)
+assert store.load(root) == DEFAULT, "a world-writable .heimdall/app was believed"
+os.chmod(os.path.dirname(push_json(root)), 0o750)
+assert len(store.load(root)["tokens"]) == 1, "a directory nobody else can write into is fine"
+PYEOF
+
+py_case 40 "registration comes only from the paired phone's sealed frame: a forged, unsealed, second-device or pre-pairing frame registers nothing" rig <<'PYEOF'
+def frame(r, key, params, sealed=True):
+    r.dev_seq += 1
+    env_ = {"v": 1, "session_id": r.client.session_id, "seq": r.dev_seq, "sender": "device", "type": "command",
+            "nonce": None, "ciphertext": None, "payload": None}
+    body = json.dumps({"action": "register_push", "params": params}).encode("utf-8")
+    if sealed:
+        env_["nonce"], env_["ciphertext"] = r.E2E.seal(key, r.dev_seq, "device", body)
+    else:
+        env_["payload"] = {"action": "register_push", "params": params}
+    r.handle(env_)
+
+
+rig = Rig()
+foreign = tok("F")
+forged = dict(GOOD, token=foreign, ref="fedcba9876543210")
+
+
+def nothing(r):
+    assert store.load(r.root) == DEFAULT, "a registration got through: %r" % (store.load(r.root),)
+    assert not os.path.exists(push_json(r.root)), "a refused frame created the registry"
+
+
+attacker_priv, _ = rig.E2E.generate_keypair()
+frame(rig, rig.E2E.derive_session_key(attacker_priv, rig.client.pub, rig.client.session_id), forged)   # sealed, but not by the paired phone
+nothing(rig)
+assert rig.ack()["detail"] == "decrypt-failed", rig.ack()
+frame(rig, None, forged, sealed=False)                 # not sealed at all
+nothing(rig)
+assert rig.ack()["detail"] == "decrypt-failed", rig.ack()
+second_priv, second_pub = rig.E2E.generate_keypair()
+rig.bind(second_pub)                                   # a second device: the latch refuses it, and so does the command path
+frame(rig, rig.E2E.derive_session_key(second_priv, rig.client.pub, rig.client.session_id), forged)
+nothing(rig)
+early = Rig(bind=False)                                # no phone paired yet: there is no session key to open anything under
+frame(early, early.dev_key, forged)
+nothing(early)
+ack = rig.command("register_push", dict(GOOD))         # the paired phone's own sealed frame is the one way in
+assert ack["ok"] is True, ack
+assert [e["token"] for e in store.load(rig.root)["tokens"]] == [GOOD["token"]], store.load(rig.root)
+assert foreign.encode() not in open(push_json(rig.root), "rb").read()
+PYEOF
+
+py_case 41 "the sender notifies only what the store sealed: a planted token gets no push, the phone's registered one does" <<'PYEOF'
+sys.path.insert(0, os.path.join(REPO, "test", "lib"))
+import push_test_lib as T
+spec = spec_from_file_location("companion_push", os.path.join(REPO, "bin", "lib", "companion_push.py"))
+CP = module_from_spec(spec)
+spec.loader.exec_module(CP)
+fake = T.FakeExpo()
+try:
+    root = fresh()
+    foreign, mine = T.expo_token("e"), T.expo_token("m")
+    write_raw(root, json.dumps({"v": 1, "tokens": [{"token": foreign, "platform": "ios", "registered_at": "2026-10-03T10:00:00Z"}],
+                                "app_state": "background", "app_state_at": "2026-10-03T10:05:00Z"}).encode())
+    now = 1_900_000_000.0
+    monitor = CP.PushMonitor(root, clock=lambda: now, sleep=lambda s: None, environ={"HMD_PUSH_EXPO_URL": fake.url}, start_thread=False)
+
+    def approval(n):
+        monitor.observe(T.state(), now)
+        monitor.observe(T.state(approvals=[T.approval(T.p_id(n), expires_at=now + 600)]), now + 1)
+        monitor.step(now + 1)
+
+    approval(1)
+    assert fake.messages() == [], "a push went to a planted token: %r" % ([m["to"] for m in fake.messages()],)
+    store.register(root, mine, "ios", ref="0123456789abcdef", label="api server", events=["approval"])
+    approval(2)
+    assert [m["to"] for m in fake.messages()] == [mine], [m["to"] for m in fake.messages()]
+    monitor.close()
+finally:
+    fake.close()
+PYEOF
+
+py_case 42 "the sender takes its lock without following a link: a linked .heimdall/app or a linked push-sender.lock creates and opens nothing" <<'PYEOF'
+spec = spec_from_file_location("companion_push", os.path.join(REPO, "bin", "lib", "companion_push.py"))
+CP = module_from_spec(spec)
+spec.loader.exec_module(CP)
+env = {"HMD_PUSH_EXPO_URL": "http://127.0.0.1:9/"}
+root = fresh()
+outside = tempfile.mkdtemp(prefix="outside-", dir=TMPROOT)
+os.makedirs(os.path.join(root, ".heimdall"))
+os.symlink(outside, os.path.join(root, ".heimdall", "app"))
+monitor = CP.PushMonitor(root, environ=env, start_thread=False)
+assert monitor._own_lock() is False, "the sender lock was taken through a linked .heimdall/app"
+assert os.listdir(outside) == [], "a lock file was created through a linked .heimdall/app: %r" % os.listdir(outside)
+monitor.close()
+root = fresh()
+app = os.path.join(root, ".heimdall", "app")
+os.makedirs(app)
+victim = os.path.join(root, "victim.lock")
+os.symlink(victim, os.path.join(app, "push-sender.lock"))   # a dangling link: opening it with O_CREAT would create the target
+monitor = CP.PushMonitor(root, environ=env, start_thread=False)
+assert monitor._own_lock() is False, "the sender lock was taken through a linked push-sender.lock"
+assert not os.path.exists(victim), "the link's target was created"
+monitor.close()
 PYEOF
 
 echo ""

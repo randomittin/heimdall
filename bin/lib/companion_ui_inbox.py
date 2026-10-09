@@ -115,6 +115,14 @@ file that predates this fix (0755/0644) self-heals the next time it's touched.
 Phone messages are private to the repo owner; no other local account should be
 able to read them.
 
+Links: the repo tree is attacker-shaped -- a checkout can carry .heimdall, .heimdall/ui, .heimdall/app, .heimdall/ui/wake or any
+file in them as a symlink. Every create, write, append, rename, truncate, lock, stat, list and read this module makes under the repo
+-- and of the seal key under $HEIMDALL_HOME -- goes through bin/lib/hmd_private_state.py, which walks down from the root one
+component at a time with O_NOFOLLOW and refuses a link or another account's directory anywhere on the way: nothing is created,
+chmod'ed, truncated, locked, renamed or written through a link, and nothing a link leads to is believed. A refusal is an OSError
+from append() and pop_all() (nothing was written or dequeued: a refused archive costs no queued message) and an empty answer from
+every read (list_pending, peek, summary, receipts, consumer state). There is no fallback to plain open().
+
 Stdlib only (json, os, re, sys, time, uuid, fcntl, argparse, subprocess) --
 Decision 1's zero-toolchain posture, matching companion_ui_panels.py. This file is
 deliberately self-contained (secret_shaped and resolve_root are ported, not
@@ -132,7 +140,6 @@ import json
 import math
 import os
 import re
-import stat
 import subprocess
 import sys
 import time
@@ -160,7 +167,18 @@ RECEIPTS_TAIL_BYTES = 256 * 1024        # the newest archive lines hold them; ne
 GIT_TIMEOUT_S = 3
 VIA_VALUES = ("stop", "prompt", "tool", "tmux", "cli")   # who dequeued: bin/heimdall-inbox-deliver's modes, and `hmd ui inbox pop`
 SYSTEM_NOTICE_PREFIX = "[hmd notice]"   # opens a text hmd itself queues (bin/heimdall-relay-client's pairing notice): never an answer
-SEAL_KEY_REL = os.path.join("app", "inbox-answer.key")   # under $HEIMDALL_HOME: the per-machine key an answer stamp is sealed with
+UI_DIR = os.path.join(".heimdall", "ui")      # the directories hmd_private_state walks, one component at a time, without following a link
+APP_DIR = os.path.join(".heimdall", "app")
+INBOX_NAME = "inbox.jsonl"
+DELIVERED_NAME = "inbox-delivered.jsonl"
+LOCK_NAME = "inbox.jsonl.lock"          # the flock file: never the data file itself
+WAITING_NAME = "inbox-waiting"
+TMUX_TARGET_NAME = "tmux-target"
+CONNECT_NAME = "connect.json"
+INBOX_READ_MAX = 16 * 1024 * 1024       # inbox.jsonl cannot near this (MAX_PENDING x MAX_TEXT_CHARS is under 2 MiB); a bigger file is not read
+SEAL_KEY_DIR = "app"                    # under $HEIMDALL_HOME: the per-machine key an answer stamp is sealed with
+SEAL_KEY_NAME = "inbox-answer.key"
+SEAL_KEY_REL = os.path.join(SEAL_KEY_DIR, SEAL_KEY_NAME)
 SEAL_KEY_BYTES = 32                     # a key shorter than this is no key
 SEAL_KEY_MAX_BYTES = 4096               # never read more of the key file than this
 SEAL_DOMAIN = b"hmd-inbox-answer-v1\n"  # prefixes what is sealed, so this seal is never valid as any other HMAC under the key
@@ -230,112 +248,97 @@ def _delivered_path(root):
     return os.path.join(root, DELIVERED_REL)
 
 
-def _lock_path(root):
-    return _inbox_path(root) + ".lock"
+_STATE = []   # [the hmd_private_state module] once it loaded
 
 
-# ── filesystem permissions (A10): the .heimdall/ui directory and everything
-# in it are forced to 0700/0600 on every touch, not just first creation, so
-# a directory/file that predates this fix (0755/0644, from os.makedirs()'s
-# and open()'s own defaults) self-heals the next time it's touched. Phone
-# messages are private to the repo owner -- no other local account should be
-# able to read them.
-def _ensure_dir(path, mode=0o700):
-    """Create `path` (and parents) if missing, then force its mode to `mode`
-    regardless of umask or a wider pre-existing mode."""
-    os.makedirs(path, exist_ok=True)
-    os.chmod(path, mode)
-
-
-def _open_append_0600(path):
-    """Open `path` for text append, creating it at mode 0600 if missing, and
-    forcing 0600 even when it already exists (O_CREAT's mode argument is
-    only applied -- and only umask-limited -- on the create branch, so a
-    file left over from before this fix would otherwise keep its old, wider
-    mode forever)."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    os.chmod(path, 0o600)
-    return os.fdopen(fd, "a", encoding="utf-8")
-
-
-class _FlockCtx:
-    """A minimal exclusive-flock context manager on a dedicated lock file --
-    mirrors bin/lib/work_queue.py's _FlockCtx and bin/lib/cp_team_queue.py's
-    _PartitionLock. Held for the whole read-modify-write so append() and
-    pop_all() can never interleave. The lock file itself is kept at mode
-    0600 (A10), same self-healing chmod-on-every-open as the data files --
-    it lives in the same directory and is just as readable by any local
-    user if left at a default 0644."""
-
-    def __init__(self, lock_path):
-        self.lock_path = lock_path
-        self._fh = None
-
-    def __enter__(self):
-        _ensure_dir(os.path.dirname(self.lock_path))
-        fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.chmod(self.lock_path, 0o600)
-        self._fh = os.fdopen(fd, "w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *exc):
+def _state():
+    """bin/lib/hmd_private_state.py, loaded by path beside this file (it is not a package): the ONLY way this module touches
+    a file under a repo or under $HEIMDALL_HOME. Every walk down from the root refuses a link at any level and a directory of
+    another account's, makes files 0600 in 0700 directories (on every touch, so a directory or file that predates this fix at
+    0755/0644 self-heals -- phone messages are private to the repo owner) and opens nothing through a link. There is no
+    fallback to plain open()/chmod()/rename(): a helper that cannot be loaded is an OSError here -- append() and pop_all() are
+    refused, nothing written -- and an empty answer for a read."""
+    if not _STATE:
         try:
-            fcntl.flock(self._fh, fcntl.LOCK_UN)
-        finally:
-            self._fh.close()
+            spec = spec_from_file_location("hmd_private_state", os.path.join(HERE, "hmd_private_state.py"))
+            mod = module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as exc:
+            raise OSError("hmd_private_state is not available: %s" % (exc,))
+        _STATE.append(mod)
+    return _STATE[0]
+
+
+def link_safe():
+    """True when this copy found its helper, so it reaches repo state only without following a link. A copy of this library
+    vendored into a repo without its helper (or from before it) is not that: bin/heimdall-inbox-deliver takes a repo's copy
+    only on this, and otherwise runs its own inline implementation, which is."""
+    try:
+        _state()
+    except OSError:
         return False
+    return True
 
 
 # ── reading ──────────────────────────────────────────────────────────────────
-def _read_all(path):
-    """Every line in `path` as (records, raw_lines). A line that fails to parse
+def _read_all(root):
+    """Every line in inbox.jsonl as (records, raw_lines), read through hmd_private_state: ([], []) when the file is
+    missing, reached through a link, not ours, not a regular file or over INBOX_READ_MAX. A line that fails to parse
     as a JSON object is dropped from `records` (fail-open, matching
     companion_ui_panels.read_panels dropping an invalid panel) but its raw bytes
     stay in `raw_lines` so pop_all() never silently loses a byte of the file --
-    an unparsable line is still delivered, just never returned as a record."""
-    if not os.path.exists(path):
+    an unparsable line is still delivered, just never returned as a record. Lines end at a newline and nowhere else
+    (U+2028 and its kin sit raw inside a record's JSON string)."""
+    try:
+        raw = _state().read(root, UI_DIR, INBOX_NAME, INBOX_READ_MAX, forbidden=0)
+    except OSError:
+        raw = None
+    if raw is None:
         return [], []
     records = []
     raw_lines = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            raw_lines.append(line if line.endswith("\n") else line + "\n")
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(obj, dict):
-                records.append(obj)
+    for line in raw.decode("utf-8", "surrogateescape").split("\n"):
+        if not line.strip():
+            continue
+        raw_lines.append(line + "\n")
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            records.append(obj)
     return records, raw_lines
 
 
 _READ_CACHE = {}  # path -> ((mtime_ns, size), records) -- see _cached_records
 
 
-def _cached_records(path):
-    """The records _read_all(path) would return, skipping the reopen+reparse
-    when `path`'s (mtime_ns, size) match the last read done by THIS process --
+def _cached_records(root):
+    """The records _read_all(root) would return, skipping the reopen+reparse
+    when inbox.jsonl's (mtime_ns, size) match the last read done by THIS process --
     the O(1)-ish path behind list_pending()/pending_count() (N3): /api/state's
     2s poll and the post-append recount in POST /api/send both call one of
     those on every hit, far more often than inbox.jsonl actually changes.
     Correctness: append()/pop_all() always change the file's size, so a change
     from ANY process is visible on this process's very next call -- the cache
-    can serve at most one call stale, never indefinitely. Returns the cached
+    can serve at most one call stale, never indefinitely. The stat is taken through
+    hmd_private_state (a link, a foreign file or a directory of another account's on the way is no file: []).
+    Returns the cached
     list object itself (not a copy) -- internal use only; list_pending() and
     pending_count() are the copy-safe public API built on top of this."""
+    path = _inbox_path(root)
     try:
-        st = os.stat(path)
+        st = _state().stat_file(root, UI_DIR, INBOX_NAME)
     except OSError:
+        st = None
+    if st is None:
         _READ_CACHE.pop(path, None)
         return []
     key = (st.st_mtime_ns, st.st_size)
     cached = _READ_CACHE.get(path)
     if cached is not None and cached[0] == key:
         return cached[1]
-    records, _ = _read_all(path)
+    records, _ = _read_all(root)
     _READ_CACHE[path] = (key, records)
     return records
 
@@ -346,14 +349,14 @@ def list_pending(root):
     non-object line is dropped, never raised. Returns fresh dict copies every
     call, even when served from the _cached_records cache, so a caller can
     never mutate a cached structure."""
-    return [dict(r) for r in _cached_records(_inbox_path(root))]
+    return [dict(r) for r in _cached_records(root)]
 
 
 def pending_count(root):
     """len(list_pending(root)) without the per-call dict copies -- the cheap
     count MAX_PENDING enforcement (append()) and an /api/state-style summary
     actually need; O(1)-ish via the same _cached_records cache."""
-    return len(_cached_records(_inbox_path(root)))
+    return len(_cached_records(root))
 
 
 def peek(root):
@@ -388,11 +391,10 @@ def _in_paired_relay_client(root):
     device's session key. The `hmd ui` server that takes POST /api/send is another pid, so it never matches;
     a missing, unreadable or stale connect.json does not match either -- the cautious side, an ordinary message."""
     try:
-        with open(os.path.join(root, CONNECT_REL), "rb") as f:
-            rec = json.loads(f.read(65536).decode("utf-8"))
-    except (OSError, ValueError):
+        rec = _state().read_json(root, APP_DIR, CONNECT_NAME, 65536, forbidden=0)
+    except OSError:
         return False
-    pid = rec.get("pid_client") if isinstance(rec, dict) else None
+    pid = rec.get("pid_client") if rec is not None else None
     return isinstance(pid, int) and not isinstance(pid, bool) and pid == os.getpid()
 
 
@@ -424,48 +426,37 @@ def _heimdall_home():
     return os.path.join(home, ".heimdall") if home else None
 
 
-def _read_seal_key(path):
-    """The key in `path` when _open_own accepts it (a regular file this user owns that nobody else can read, no
-    symlink followed, judged on the open descriptor) and it is long enough, else None."""
-    fd = _open_own(path, PRIVATE)
-    if fd is None:
-        return None
+def _read_seal_key(home):
+    """The key under `home` when hmd_private_state accepts it -- a regular file this user owns that nobody else can read,
+    reached through no link (neither the key file nor $HEIMDALL_HOME/app may be one), in a directory nobody else can write,
+    judged on the open descriptors -- and it is long enough, else None."""
     try:
-        with os.fdopen(fd, "rb") as f:
-            key = f.read(SEAL_KEY_MAX_BYTES)
+        key = _state().read(home, SEAL_KEY_DIR, SEAL_KEY_NAME, SEAL_KEY_MAX_BYTES, forbidden=PRIVATE, dir_forbidden=NOT_SHARED)
     except OSError:
         return None
-    return key if len(key) >= SEAL_KEY_BYTES else None
+    return key if key is not None and len(key) >= SEAL_KEY_BYTES else None
 
 
 def _seal_key():
     """The per-machine key an answer stamp is sealed with: SEAL_KEY_REL under $HEIMDALL_HOME, 0600 in a 0700
     directory, outside every repo. Made here when absent -- written whole to a private temp file and linked into
-    place, so a racing second maker gets EEXIST and reads the winner's key, never a half-written one. None when it
-    can be neither read nor made: no key, no seal, no stamp -- and the message still goes through."""
+    place (hmd_private_state.create_once), so a racing second maker gets EEXIST and reads the winner's key, never a
+    half-written one. The way down from $HEIMDALL_HOME is walked link-free: a link at app, or at the key, makes no key
+    and writes nothing through it. None when it can be neither read nor made: no key, no seal, no stamp -- and the
+    message still goes through."""
     home = _heimdall_home()
     if home is None:
         return None
-    path = os.path.join(home, SEAL_KEY_REL)
-    key = _read_seal_key(path)
+    key = _read_seal_key(home)
     if key is not None:
         return key
-    tmp = "%s.%s.tmp" % (path, uuid.uuid4().hex)
     try:
-        _ensure_dir(os.path.dirname(path))
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(os.urandom(SEAL_KEY_BYTES))
-            f.flush()
-            os.fsync(f.fileno())
+        os.makedirs(home, exist_ok=True)   # the root is the operator's own choice (a link AT it is fine); everything below it is walked link-free
         with contextlib.suppress(FileExistsError):   # EEXIST: another maker linked its key first, and that one is the key
-            os.link(tmp, path)
+            _state().create_once(home, SEAL_KEY_DIR, SEAL_KEY_NAME, os.urandom(SEAL_KEY_BYTES))
     except OSError:
         return None
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-    return _read_seal_key(path)
+    return _read_seal_key(home)
 
 
 def _seal(key, rec_id, ts, text, answers):
@@ -500,9 +491,8 @@ def append(root, text):
         record["answers"] = ask["id"]
         record["sig"] = _seal(key, record["id"], record["ts"], text, ask["id"])
     line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-    path = _inbox_path(root)
-    _ensure_dir(os.path.dirname(path))
-    with _FlockCtx(_lock_path(root)):
+    state = _state()
+    with state.lock(root, UI_DIR, LOCK_NAME):
         # N3: reject before writing once MAX_PENDING is already reached -- checked
         # under the SAME lock the write itself takes, so two concurrent senders
         # (different threads or processes) can never both observe "under the cap"
@@ -511,28 +501,26 @@ def append(root, text):
             raise InboxError("inbox-full",
                              "pending queue is at the %d-message cap; drain it (delivery, or "
                              "`hmd ui inbox pop`) before sending more" % MAX_PENDING)
-        with _open_append_0600(path) as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
+        state.append(root, UI_DIR, INBOX_NAME, line.encode("utf-8"))   # fsync'ed; a link on the way is an OSError, nothing written
     return record
 
 
-def _rotate_if_oversized(path, max_bytes):
-    """If `path` already exists at/above `max_bytes`, move it to `<path>.1`
+def _rotate_if_oversized(root, max_bytes):
+    """If inbox-delivered.jsonl already exists at/above `max_bytes`, move it to `inbox-delivered.jsonl.1`
     (clobbering any previous `.1` -- single-generation rotation, not a numbered
-    log1/log2/... series) so the next writer starts a fresh file. Called with
+    log1/log2/... series -- a link at `.1` is replaced, never written through) so the next writer starts a fresh file.
+    Called with
     the caller's lock already held, so the rename can never race a concurrent
     writer of the same path. N3: inbox-delivered.jsonl has no structural size
     ceiling the way inbox.jsonl does (MAX_PENDING already bounds that one);
     pop_all() calls this before appending each new batch so the archive can't
-    grow without bound over a repo's lifetime."""
-    try:
-        if os.path.getsize(path) < max_bytes:
-            return
-    except OSError:
+    grow without bound over a repo's lifetime. The size is taken, and the rename made, inside the vetted
+    directory: a link at the archive is no archive and is not rotated."""
+    state = _state()
+    st = state.stat_file(root, UI_DIR, DELIVERED_NAME)
+    if st is None or st.st_size < max_bytes:
         return
-    os.replace(path, path + ".1")
+    state.rename(root, UI_DIR, DELIVERED_NAME, DELIVERED_NAME + ".1")
 
 
 def _stamp_delivered(raw_lines, delivered_at, via=None):
@@ -565,27 +553,21 @@ def pop_all(root, via=None):
     the list of delivered records, receipt included (oldest first); [] when
     nothing was pending (and nothing is touched on disk, including rotation, in
     that case)."""
-    path = _inbox_path(root)
-    delivered_path = _delivered_path(root)
-    with _FlockCtx(_lock_path(root)):
-        records, raw_lines = _read_all(path)
+    state = _state()
+    with state.lock(root, UI_DIR, LOCK_NAME):
+        records, raw_lines = _read_all(root)
         if not raw_lines:
             return []
         delivered_at = round(time.time(), 3)
-        _ensure_dir(os.path.dirname(delivered_path))
-        _rotate_if_oversized(delivered_path, MAX_INBOX_BYTES)
-        with _open_append_0600(delivered_path) as df:
-            df.writelines(_stamp_delivered(raw_lines, delivered_at, via))
-            df.flush()
-            os.fsync(df.fileno())
-        # Truncate in place, still inside the lock so nothing can land between
-        # the read above and this truncate. open(..., "w") already truncates on
-        # open; the explicit truncate(0) just says so out loud. chmod after, in
-        # case inbox.jsonl predates this fix and still carries a wider mode
-        # (A10) -- truncating alone never changes a file's permission bits.
-        with open(path, "w", encoding="utf-8") as f:
-            f.truncate(0)
-        os.chmod(path, 0o600)
+        _rotate_if_oversized(root, MAX_INBOX_BYTES)
+        batch = "".join(_stamp_delivered(raw_lines, delivered_at, via)).encode("utf-8", "surrogateescape")
+        # The archive is written (and fsync'ed) BEFORE anything is dequeued: a refusal here -- a link at the archive, a
+        # directory of another account's -- raises with every message still pending in inbox.jsonl.
+        state.append(root, UI_DIR, DELIVERED_NAME, batch)
+        # Truncate in place, still inside the lock so nothing can land between the read above and this truncate: ftruncate of
+        # the vetted descriptor (the file keeps its inode), and 0600 forced after, in case inbox.jsonl predates this fix
+        # and still carries a wider mode (A10) -- truncating alone never changes a file's permission bits.
+        state.truncate(root, UI_DIR, INBOX_NAME)
     return [dict(r, delivered_at=delivered_at, **({"via": via} if via in VIA_VALUES else {})) for r in records]
 
 
@@ -597,17 +579,24 @@ def _is_number(v):
 _RECEIPTS_CACHE = {}  # path -> ((mtime_ns, size), receipts) -- see delivered_receipts
 
 
-def _read_receipts(path, size):
+def _read_receipts(root):
     """The last RECEIPTS_LIMIT stamped lines of the archive as {id, delivered_at, via},
-    oldest first, reading only its tail. A line that is not a JSON object with a
+    oldest first, reading only its tail (through a descriptor hmd_private_state vetted: no link, ours, a regular file;
+    [] when it is not one). A line that is not a JSON object with a
     string `id` and a finite numeric `delivered_at` -- a pre-receipt archive line,
     a corrupt one -- is skipped, never raised and never given an invented time; a
     `via` that is not one of VIA_VALUES (a line archived before it was recorded) is None."""
-    with open(path, "rb") as f:
-        if size > RECEIPTS_TAIL_BYTES:
-            f.seek(size - RECEIPTS_TAIL_BYTES)
-            f.readline()  # the seek landed mid-line: drop that partial first line
-        chunk = f.read()
+    fd = _state().open_read(root, UI_DIR, DELIVERED_NAME, forbidden=0)
+    if fd is None:
+        return []
+    try:
+        size = os.fstat(fd).st_size
+        start = max(0, size - RECEIPTS_TAIL_BYTES)
+        chunk = os.pread(fd, size - start, start)
+    finally:
+        os.close(fd)
+    if start:
+        chunk = chunk.partition(b"\n")[2]  # the cut landed mid-line: drop that partial first line
     out = []
     for line in chunk.splitlines():
         try:
@@ -714,15 +703,17 @@ def delivered_receipts(root, now=None):
     fresh dict copies."""
     path = _delivered_path(root)
     try:
-        st = os.stat(path)
+        st = _state().stat_file(root, UI_DIR, DELIVERED_NAME)
     except OSError:
+        st = None
+    if st is None:
         _RECEIPTS_CACHE.pop(path, None)
         return []
     key = (st.st_mtime_ns, st.st_size)
     cached = _RECEIPTS_CACHE.get(path)
     if cached is None or cached[0] != key:
         try:
-            cached = (key, _read_receipts(path, st.st_size))
+            cached = (key, _read_receipts(root))
         except OSError:
             return []
         _RECEIPTS_CACHE[path] = cached
@@ -738,10 +729,10 @@ def tmux_target(root):
     if target:
         return target
     try:
-        with open(os.path.join(root, TMUX_TARGET_REL), "r", encoding="utf-8") as f:
-            return f.read(512).strip()
-    except (OSError, ValueError):
-        return ""
+        raw = _state().read(root, UI_DIR, TMUX_TARGET_NAME, 4096, forbidden=0)   # a link on the way is no target: it would name a pane to type into
+    except OSError:
+        raw = None
+    return raw.decode("utf-8", "replace").strip() if raw is not None else ""
 
 
 def _own_live_pid(pid):
@@ -755,44 +746,26 @@ def _own_live_pid(pid):
     return True
 
 
-def _open_own(path, forbidden):
-    """An O_RDONLY descriptor on `path` when it is a regular file this user owns that carries none of the `forbidden`
-    mode bits, else None. Opened without following a symlink and judged by fstat on the open descriptor, so neither
-    a link nor a file swapped in between a check and the use gets through."""
+def _read_own_json(root, rel, name, forbidden):
+    """The JSON object in <root>/<rel>/<name> when hmd_private_state accepts the file -- reached through no link, a regular
+    file this user owns that carries none of the `forbidden` mode bits, judged on the open descriptors -- else None
+    (missing, foreign, malformed, not an object)."""
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError:
+        return _state().read_json(root, rel, name, 65536, forbidden)
+    except (OSError, RecursionError):
         return None
-    try:
-        st = os.fstat(fd)
-        ours = stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & forbidden
-    except OSError:
-        ours = False
-    if not ours:
-        os.close(fd)
-        return None
-    return fd
 
 
-def _read_own_json(path, forbidden):
-    """The JSON object in a file `_open_own` accepts, else None (missing, foreign, malformed, not an object)."""
-    fd = _open_own(path, forbidden)
-    if fd is None:
-        return None
-    try:
-        with os.fdopen(fd, "rb") as f:
-            obj = json.loads(f.read(65536).decode("utf-8", "replace"))
-    except (OSError, ValueError, RecursionError):
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
-def _lock_held(path):
-    """True while some process holds a flock on `path` (a file `_open_own` accepts). The probe asks for a shared
+def _lock_held(root, name):
+    """True while some process holds a flock on <.heimdall/ui/wake>/<name> (a file hmd_private_state accepts: a regular
+    file of ours, 0600, reached through no link). The probe asks for a shared
     lock without waiting: refused = an exclusive holder is alive; granted = nobody is, and closing the descriptor
     drops it at once. The grant lasts microseconds; a watcher that starts inside that window stands down once and
     the next Stop re-arms it."""
-    fd = _open_own(path, PRIVATE)
+    try:
+        fd = _state().open_read(root, WAKE_DIR_REL, name, forbidden=PRIVATE)
+    except OSError:
+        return False
     if fd is None:
         return False
     try:
@@ -810,7 +783,7 @@ def _companion_connected(root):
     """The wake hook's own test for "a phone can reach this session right now": connect.json (`hmd app connect`) is
     ours, nobody else can write it, and every process it names (pid_ui, pid_client) is alive and ours. A watcher
     never wakes without one, so this status never claims a wake without one either."""
-    rec = _read_own_json(os.path.join(root, CONNECT_REL), NOT_SHARED)
+    rec = _read_own_json(root, APP_DIR, CONNECT_NAME, NOT_SHARED)
     pids = [rec[k] for k in ("pid_ui", "pid_client") if k in rec] if rec else []
     return bool(pids) and all(_own_live_pid(p) for p in pids)
 
@@ -822,9 +795,8 @@ def wake_armed(root):
     exclusive flock on (the watcher, for as long as it lives: the kernel frees it on any death) and a pid that is
     still alive. Every file is judged by the rules the hook writes it under -- ours, 0600, a regular file, never a
     link -- so one dropped into a checkout cannot claim a wake. Anything unreadable is "not armed"."""
-    wake_dir = os.path.join(root, WAKE_DIR_REL)
     try:
-        names = os.listdir(wake_dir)
+        names = _state().names(root, WAKE_DIR_REL)   # [] when .heimdall, .heimdall/ui or the wake directory is a link
     except OSError:
         return False
     for name in names:
@@ -832,9 +804,9 @@ def wake_armed(root):
         if m is None:
             continue
         pid = int(m.group(1))
-        reg = _read_own_json(os.path.join(wake_dir, "%d.json" % pid), PRIVATE)
+        reg = _read_own_json(root, WAKE_DIR_REL, "%d.json" % pid, PRIVATE)
         if (reg is not None and reg.get("pid") == pid and _own_live_pid(pid)
-                and _lock_held(os.path.join(wake_dir, "%d.lock" % pid))):
+                and _lock_held(root, "%d.lock" % pid)):
             return _companion_connected(root)
     return False
 
@@ -850,9 +822,10 @@ def consumer_state(root, now=None):
     clock noise, not a listener."""
     now = time.time() if now is None else now
     try:
-        age = now - os.stat(os.path.join(root, WAITING_REL)).st_mtime
+        marker = _state().stat_file(root, UI_DIR, WAITING_NAME)   # a link at the marker, or on the way to it, is no listener
     except OSError:
-        age = None
+        marker = None
+    age = now - marker.st_mtime if marker is not None else None
     if age is not None and -WAITING_STALE_S <= age <= WAITING_STALE_S:
         return "waiting"
     if tmux_target(root):
@@ -882,7 +855,7 @@ def summary(root, now=None):
     unreadable source degrades its own field (nothing pending / no receipts), never the slice."""
     now = time.time() if now is None else now
     try:
-        records = _cached_records(_inbox_path(root))
+        records = _cached_records(root)
     except OSError:
         records = []
     return {"pending": len(records),

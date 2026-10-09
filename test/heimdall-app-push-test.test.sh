@@ -863,6 +863,7 @@ subprocess.run(["git", "init", "-q", root], check=True)
 subprocess.run(["git", "-C", root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "fixture"],
                check=True)
 TOK = T.expo_token("t")
+os.environ["HEIMDALL_HOME"] = env["HEIMDALL_HOME"]     # the registration is sealed under the machine key the sender processes below use
 STORE.register(root, TOK, "ios", label="api server")
 env["HEIMDALL_WATCH_ROOT"] = root
 
