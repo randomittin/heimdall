@@ -43,9 +43,11 @@ import json
 import os
 import stat
 import sys
+import time
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 READ_LIMIT = 4096
+_CREATE_TRIES = 8   # an O_CREAT open that races another maker of the same name is tried this often (see _open_creating)
 
 
 def _vet_dir(fd, name):
@@ -173,6 +175,21 @@ def create_once(root, rel, name, data):
         os.close(dirfd)
 
 
+def _open_creating(dirfd, name, flags):
+    """os.open(name, flags, 0o600) inside the vetted directory, tried again when it reports the name as missing. With O_CREAT in a
+    directory we hold that cannot honestly be "not found" -- yet two processes creating the same new name at the same instant make
+    the loser see ENOENT here on macOS (APFS), measured at about one in eight for four racing makers, and the loser is entitled
+    to the file the winner just made. A name that stays missing through every try (the directory itself was removed under us) is
+    the FileNotFoundError it was."""
+    for attempt in range(_CREATE_TRIES):
+        try:
+            return os.open(name, flags, 0o600, dir_fd=dirfd)
+        except FileNotFoundError:
+            if attempt == _CREATE_TRIES - 1:
+                raise
+            time.sleep(0.002)
+
+
 def _open_vetted(root, rel, name, flags, what):
     """The descriptor of <root>/<rel>/<name> opened with `flags` (O_WRONLY, plus O_APPEND when asked): the file is made
     (0600) when it is missing, opened WITHOUT following a link inside the vetted directory, checked (fstat of what was
@@ -181,7 +198,7 @@ def _open_vetted(root, rel, name, flags, what):
     _plain_name(name)
     dirfd = open_dir(root, rel, True)
     try:
-        fd = os.open(name, flags | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dirfd)
+        fd = _open_creating(dirfd, name, flags | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK)
     finally:
         os.close(dirfd)
     try:

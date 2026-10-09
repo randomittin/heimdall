@@ -9,14 +9,32 @@ the notifications reads it back. One file, <repo>/.heimdall/app/push.json (direc
 0600, atomic temp-file-and-rename writes, one exclusive flock over push.json.lock around every
 read-modify-write):
 
-    {"v":1,"tokens":[{"token":..,"platform":..,"registered_at":..,"ref":..,"label":..,"events":[..]}],
-     "app_state":"foreground"|"background"|"unknown","app_state_at":"<iso>"|null}
+    {"v":2,"tokens":[{"token":..,"platform":..,"registered_at":..,"ref":..,"label":..,"events":[..]}],
+     "app_state":"foreground"|"background"|"unknown","app_state_at":"<iso>"|null,"sig":"<64 hex>"}
+
+WHAT IS BELIEVED. push.json decides where a notification goes (the token), what it may be about (events, label) and whether it
+goes at all (app_state: a phone that says it is looking silences the push), and it sits in <repo>/.heimdall, a tree a repository
+controls: a checked-in file, a planted link, another process. So a record is believed only when ALL of this holds, and anything
+else is the default state -- no devices, nothing sent:
+  * hmd_private_state (bin/lib/hmd_private_state.py) reached it: the way down from the repo root is walked one component at a time
+    without following a link and through directories this user owns, none of them writable by anyone else, and the file itself is a
+    regular file of this user's with no group or other permission bit (a checkout leaves 0644). Every read, write and lock of the
+    store goes through it, so a link at .heimdall/app, push.json or the lock is refused, never written through or chmod'ed through;
+  * its "sig" verifies: HMAC-SHA256 over the whole record (version, every token entry with its ref, label and events, app_state)
+    and the repo's real path, under the per-machine key bin/lib/companion_ui_inbox.py already seals answers with
+    ($HEIMDALL_HOME/app/inbox-answer.key, 0600 in a 0700 directory outside every repo; made here on first use), with a domain prefix
+    of its own, so the seal is valid for this store only, for this repo only and for this machine only. Only register(),
+    unregister(), remove_tokens() and set_app_state() write a record, and bin/heimdall-relay-client calls them only for a frame that
+    opened under the paired phone's session key.
+MIGRATION. A push.json written before sealing ("v":1, no "sig") is ignored: never read as devices, never deleted. The phone
+registers again at its next connect -- the relay client forgets an earlier session's registrations at every pairing anyway -- and
+the first registration replaces the file. Until then nothing is pushed.
 
 PUBLIC INTERFACE (the notification sender is written against exactly this):
 
     load(repo_root) -> {"tokens": [{"token": str, "platform": str|None, "registered_at": iso}],
                         "app_state": "foreground"|"background"|"unknown", "app_state_at": iso|None}
-        A missing, unreadable, oversized, unparsable or wrongly-shaped file is the default
+        A missing, unreadable, oversized, unparsable, wrongly-shaped, unsealed or otherwise untrusted file (WHAT IS BELIEVED, above) is the default
         {"tokens": [], "app_state": "unknown", "app_state_at": None}; a damaged entry is dropped, never
         an exception. Takes no lock (the file is only ever replaced whole), and hands back copies.
         A token's entry also carries `ref`, `label` and `events` when the phone supplied them (the
@@ -54,18 +72,32 @@ registration alone (the rest of the phone's notifications keep working).
 
 Stdlib only; loadable by path like the other bin/lib modules, no side effects at import.
 """
+import contextlib
 import copy
 import errno
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 import re
-import secrets
 import time
 import unicodedata
+from importlib.util import module_from_spec, spec_from_file_location
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 APP_REL = os.path.join(".heimdall", "app")
-PUSH_REL = os.path.join(APP_REL, "push.json")
+PUSH_NAME = "push.json"
+LOCK_NAME = "push.json.lock"
+PUSH_REL = os.path.join(APP_REL, PUSH_NAME)
+RECORD_VERSION = 2             # 1 was the unsealed file: ignored, see MIGRATION
+SEAL_KEY_DIR = "app"           # under $HEIMDALL_HOME: the per-machine key bin/lib/companion_ui_inbox.py seals answers with
+SEAL_KEY_NAME = "inbox-answer.key"
+SEAL_KEY_BYTES = 32            # a key shorter than this is no key
+SEAL_KEY_MAX_BYTES = 4096      # never read more of the key file than this
+SEAL_DOMAIN = b"hmd-push-store-v1\n"   # prefixes what is sealed, so this seal is never valid as any other HMAC under the key
+PRIVATE = 0o077                # mode bits a file of ours must not carry: only 0600 is believed
+NOT_SHARED = 0o022             # mode bits a directory holding one must not carry: nobody else may write into it
 MAX_TOKENS = 5                 # newest wins: a sixth registration evicts the oldest
 READ_CAP_BYTES = 65536         # five entries are ~1 KiB; a file bigger than this is not ours
 LOCK_TIMEOUT_S = 3.0           # the relay client's stream thread must never wedge behind a stuck writer
@@ -152,40 +184,87 @@ def _now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-# -- paths and permissions ----------------------------------------------------------------------------
-def _path(repo_root):
-    return os.path.join(repo_root, PUSH_REL)
+# -- the private-state helper, the machine key and the seal -----------------------------------------------
+_STATE = []   # [the hmd_private_state module] once it loaded
 
 
-def _ensure_dir(repo_root):
-    """Create <repo>/.heimdall/app and force 0700 on it, on every touch, so a directory that predates
-    this (or a hostile umask) self-heals."""
-    directory = os.path.join(repo_root, APP_REL)
-    os.makedirs(directory, exist_ok=True)
-    os.chmod(directory, 0o700)
+def _state():
+    """bin/lib/hmd_private_state.py, loaded by path beside this file (it is not a package): the ONLY way this module touches a
+    file under a repo or under $HEIMDALL_HOME -- the pattern of bin/lib/companion_ui_inbox.py (_state). It walks down from the root
+    without following a link, makes files 0600 in 0700 directories (on every touch, so one that predates this self-heals) and opens
+    nothing through a link. There is no fallback to plain open()/chmod()/rename(): a helper that cannot be loaded is an OSError
+    here, so a write is refused and a read finds no record."""
+    if not _STATE:
+        try:
+            spec = spec_from_file_location("hmd_private_state", os.path.join(HERE, "hmd_private_state.py"))
+            mod = module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as exc:
+            raise OSError("hmd_private_state is not available: %s" % (exc,))
+        _STATE.append(mod)
+    return _STATE[0]
 
 
-def _unlink(path):
+def _heimdall_home():
+    """$HEIMDALL_HOME, else ~/.heimdall (bin/lib/companion_remote_switches.py's resolution); None with neither it nor HOME -- there
+    is no /tmp fallback, a directory other users can write. Read on every call: a key is never cached past a change of home."""
+    explicit = os.environ.get("HEIMDALL_HOME")
+    if explicit:
+        return explicit
+    home = os.environ.get("HOME")
+    return os.path.join(home, ".heimdall") if home else None
+
+
+def _read_seal_key(home):
+    """The key under `home` when hmd_private_state accepts it -- a regular file this user owns that nobody else can read, reached
+    through no link, in a directory nobody else can write -- and it is long enough, else None."""
     try:
-        os.unlink(path)
+        key = _state().read(home, SEAL_KEY_DIR, SEAL_KEY_NAME, SEAL_KEY_MAX_BYTES, forbidden=PRIVATE, dir_forbidden=NOT_SHARED)
     except OSError:
-        return False
-    return True
+        return None
+    return key if key is not None and len(key) >= SEAL_KEY_BYTES else None
+
+
+def _seal_key(make):
+    """The per-machine key a record is sealed with (companion_ui_inbox._seal_key: the same file). With `make`, made when absent --
+    written whole to a private temp file and linked into place (create_once), so a racing second maker gets EEXIST and reads the
+    winner's key, never a half-written one. A reader passes False and creates nothing: no key means nothing was ever sealed.
+    None when it can be neither read nor made."""
+    home = _heimdall_home()
+    if home is None:
+        return None
+    key = _read_seal_key(home)
+    if key is not None or not make:
+        return key
+    try:
+        os.makedirs(home, exist_ok=True)   # the root is the operator's own choice (a link AT it is fine); everything below it is walked link-free
+        with contextlib.suppress(FileExistsError):   # EEXIST: another maker linked its key first, and that one is the key
+            _state().create_once(home, SEAL_KEY_DIR, SEAL_KEY_NAME, os.urandom(SEAL_KEY_BYTES))
+    except OSError:
+        return None
+    return _read_seal_key(home)
+
+
+def _seal(key, repo_root, record):
+    """The seal of a record: HMAC-SHA256 (hex) over the repo's real path and the record (everything but "sig"), as one JSON array so
+    no choice of path can shift a byte of the record into it."""
+    body = json.dumps([os.path.realpath(repo_root), record], sort_keys=True, separators=(",", ":")).encode("ascii")
+    return hmac.new(key, SEAL_DOMAIN + body, hashlib.sha256).hexdigest()
 
 
 class _Flock:
     """An exclusive flock on push.json.lock -- a dedicated file, never the data file, whose replacement
-    by rename would otherwise orphan the lock. Acquired without blocking and retried until
-    LOCK_TIMEOUT_S, so a writer that was stopped holding it costs the caller an OSError, not a hang."""
+    by rename would otherwise orphan the lock -- opened by hmd_private_state (no link, a file of ours, 0600).
+    Acquired without blocking and retried until LOCK_TIMEOUT_S, so a writer that was stopped holding it
+    costs the caller an OSError, not a hang."""
 
     def __init__(self, repo_root):
-        self.lock_path = _path(repo_root) + ".lock"
+        self.repo_root = repo_root
         self._fd = None
 
     def __enter__(self):
-        fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = _state().open_lockfile(self.repo_root, APP_REL, LOCK_NAME)
         try:
-            os.chmod(self.lock_path, 0o600)
             deadline = time.monotonic() + LOCK_TIMEOUT_S
             while True:
                 try:
@@ -210,21 +289,31 @@ class _Flock:
 
 
 # -- reading -------------------------------------------------------------------------------------------
-def _read_json(path):
-    """The JSON object in `path`, or None -- a missing, oversized, unparsable or non-object file is
-    simply no record, never an exception."""
+_SIG_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _read_record(repo_root):
+    """The record push.json holds when it is ours to believe (see WHAT IS BELIEVED), else None -- a missing, unreachable,
+    foreign, linked, group- or world-accessible, oversized, unparsable, non-object, unsealed or wrongly sealed file is simply no
+    record, never an exception. The file is read through hmd_private_state; the seal is checked before anything in the record is
+    looked at."""
     try:
-        with open(path, "rb") as f:
-            raw = f.read(READ_CAP_BYTES + 1)
+        raw = _state().read(repo_root, APP_REL, PUSH_NAME, READ_CAP_BYTES, forbidden=PRIVATE, dir_forbidden=NOT_SHARED)
+        key = _seal_key(False) if raw is not None else None
     except OSError:
         return None
-    if len(raw) > READ_CAP_BYTES:
+    if raw is None or key is None:
         return None
     try:
         obj = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return None
-    return obj if isinstance(obj, dict) else None
+    if not isinstance(obj, dict):
+        return None
+    sig = obj.pop("sig", None)
+    if obj.get("v") != RECORD_VERSION or not isinstance(sig, str) or _SIG_RE.fullmatch(sig) is None:
+        return None
+    return obj if hmac.compare_digest(sig, _seal(key, repo_root, obj)) else None
 
 
 def _clean_entry(raw):
@@ -268,33 +357,25 @@ def _clean(raw):
 
 
 def load(repo_root):
-    return _clean(_read_json(_path(repo_root)))
+    return _clean(_read_record(repo_root))
 
 
 # -- writing -------------------------------------------------------------------------------------------
 def _write(repo_root, state):
-    """Replace push.json with `state`: a fully written, fsynced 0600 temp file renamed into place, so a
-    reader sees the old file or the new one and never half of either."""
-    path = _path(repo_root)
-    tmp = "%s.tmp-%d-%s" % (path, os.getpid(), secrets.token_hex(4))
-    body = json.dumps(dict(state, v=1), sort_keys=True, separators=(",", ":"))
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(body)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        _unlink(tmp)
-        raise
+    """Replace push.json with `state`, sealed: hmd_private_state writes a fully written, fsynced 0600 temp file and renames it
+    into place, so a reader sees the old file or the new one and never half of either, and a link at push.json is replaced, never
+    written through. OSError when anything on the way is a link or not ours, or when there is no machine key to seal with."""
+    key = _seal_key(True)
+    if key is None:
+        raise OSError(errno.EACCES, "push registrations cannot be sealed: no per-machine key under $HEIMDALL_HOME")
+    record = dict(state, v=RECORD_VERSION)
+    body = json.dumps(dict(record, sig=_seal(key, repo_root, record)), sort_keys=True, separators=(",", ":"))
+    _state().write(repo_root, APP_REL, PUSH_NAME, body.encode("ascii"))
 
 
 def _update(repo_root, change):
     """Run change(state) -> (changed, result) over the current state under the exclusive lock; the
     file is rewritten only when `changed`. Returns `result`."""
-    _ensure_dir(repo_root)
     with _Flock(repo_root):
         state = load(repo_root)
         changed, result = change(state)
@@ -329,7 +410,7 @@ def register(repo_root, token, platform=None, *, ref=None, label=None, events=No
 def _drop(repo_root, doomed):
     """Remove the entries `doomed(entry)` selects; how many went. Nothing on disk is touched when the
     file does not exist or nothing matches."""
-    if not os.path.exists(_path(repo_root)):
+    if _state().stat_file(repo_root, APP_REL, PUSH_NAME) is None:
         return 0
 
     def change(state):
