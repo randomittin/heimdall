@@ -42,8 +42,20 @@ remote controls, bin/lib/companion_ui_controls.py; both behind the same token / 
                       (the digest covers `panels`, so a `hmd ui panel set` lands as soon
                       as the poller sees the panels dir move -- WATCH_INTERVAL_S plus one
                       cheap collect -- not at the next POLL_INTERVAL_S)
+    /healthz          liveness for the local `hmd app connect`, the ONE route answered without the token. Served
+                      only for a GET whose request target is exactly "/healthz" (no query, fragment, prefix,
+                      dot-segment, encoded, case or absolute-form variant), from a loopback peer, by a ui that is
+                      NOT exposed (no --allow-host, no --trust-proxy: behind a Funnel or a proxy every peer is the
+                      local proxy, so the peer address proves nothing and the route is simply absent), with no
+                      proxy header (X-Forwarded-For, Forwarded, X-Real-IP, Via) and exactly one Host header, this
+                      server's own loopback origin (127.0.0.1:<port> / localhost:<port>). Anything else meets the
+                      ordinary gate below, exactly as an unauthenticated request to any other route does.
+                      {"ok", "service": "hmd-ui", "schema", "pid"}: 200 while the state poller has made progress
+                      in the last HEALTH_STALE_S seconds, 503 when it has not. No state, no path, no token --
+                      connect asks it whether the `hmd ui` left running on its port is the live process it found
+                      there (pid) and still working, before reusing it
 
-Auth, in this order, on EVERY route:
+Auth, in this order, on EVERY route (but /healthz above):
     0. Host header must be 127.0.0.1:<port>, localhost:<port>, or one of --allow-host's
        names (bare, or with ANY numeric port, e.g. ":443"/":8443"/":10000" --
        case-insensitive, no wildcard/suffix matching on the hostname)  -> else 403
@@ -78,6 +90,7 @@ import argparse
 import hashlib
 import hmac
 import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -116,6 +129,8 @@ HEADER_READ_TIMEOUT_S = 10.0   # A2: UIHandler.timeout -- bounds the pre-auth he
 MAX_CONNECTIONS = 64           # A2: hard cap on concurrent connections/threads, server-wide
 MAX_SSE_STREAMS = 8            # A2: lower cap on live /api/events streams specifically
 SSE_RETRY_AFTER_S = 5          # A2: Retry-After seconds on the 503 an over-cap SSE request gets
+HEALTH_STALE_S = 30.0          # /healthz says 503 once the state poller has completed no pass for this long
+HEALTH_PROXY_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via")   # any one means a hop forwarded the request: no /healthz
 
 # ── sources: the complete list of what this process reads ────────────────────
 # Relative to the target repo root. `--print-sources` prints exactly these (made
@@ -1333,6 +1348,7 @@ class StateCache:
         self._state = None
         self._digest = None
         self._refreshed_at = None   # time.monotonic() of the last completed refresh, or None
+        self._last_ok_at = None     # the same moment, but never cleared by invalidate(): what idle_s() measures from
         self._stop = threading.Event()
         self._warmed = threading.Event()   # set by the warmer: the slow answers are fresh, a pass is due
         self._live_users = None   # (value, written_at) of the self-published panel
@@ -1377,6 +1393,7 @@ class StateCache:
         with self._cond:
             self._state = state
             self._refreshed_at = time.monotonic()
+            self._last_ok_at = self._refreshed_at
             if digest != self._digest:
                 self._digest = digest
                 self._cond.notify_all()
@@ -1402,6 +1419,13 @@ class StateCache:
                 if self._fresh_locked():
                     return self._state, self._digest
             return self.refresh()
+
+    def idle_s(self):
+        """Seconds since a refresh last completed, or None before the first one: /healthz's measure of a poller
+        that has stopped making progress (invalidate() does not reset it)."""
+        with self._cond:
+            at = self._last_ok_at
+        return None if at is None else time.monotonic() - at
 
     def invalidate(self):
         """Force the next latest() to recompute rather than serve a cached snapshot --
@@ -1485,6 +1509,14 @@ class StateCache:
 
 
 # ── HTTP layer ────────────────────────────────────────────────────────────────
+def _is_loopback_addr(addr):
+    """True for a loopback address (127.0.0.0/8, ::1); False for any other, and for text that is no address at all."""
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return False
+
+
 class UIServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False   # a stale reuse could hand another process our port
@@ -1501,6 +1533,7 @@ class UIServer(ThreadingHTTPServer):
         self.token = token
         self.cache = cache
         self.port = self.server_address[1]
+        self.started_at = time.monotonic()   # /healthz: a poller that never finished a pass is judged from here
         self.trust_proxy = bool(trust_proxy)
         self.public_host = None
         hosts = {"127.0.0.1:%d" % self.port, "localhost:%d" % self.port}
@@ -1513,6 +1546,7 @@ class UIServer(ThreadingHTTPServer):
                 self.public_host = n
             hosts.add(n)
             names.add(n)
+        self.exposed = bool(self.public_host) or self.trust_proxy   # published behind a proxy / Funnel: no /healthz
         self.allowed_hosts = frozenset(hosts)
         self.allow_host_names = frozenset(names)  # bare names; _host_ok matches these w/ ANY port
         self._backoff_lock = threading.Lock()
@@ -1703,6 +1737,9 @@ class UIHandler(BaseHTTPRequestHandler):
         self._gate_then(self._route_post)
 
     def do_GET(self):
+        if self._health_request():
+            self._serve_health()
+            return
         self._gate_then(self._route)
 
     def _route_post(self, _query):
@@ -1818,6 +1855,30 @@ class UIHandler(BaseHTTPRequestHandler):
         self.server.cache.invalidate()
         queued = len(INBOX.list_pending(root))
         self._send_json(202, {"id": record["id"], "queued": queued})
+
+    def _health_request(self):
+        """True only for the one request /healthz answers without the token (the conditions are listed in the module
+        docstring). Each is a way the route stays out of reach of anything but the local connect: the RAW request
+        target is compared (the stdlib folds "//healthz" into "/healthz" before do_GET runs), an exposed ui has no
+        such route, the peer must be loopback, a proxy header means a hop forwarded the request, and the Host -- which
+        a client picks freely -- is the last of the checks, never the only one. Everything else is left to _gate_then."""
+        server = self.server
+        words = self.requestline.split()
+        hosts = self.headers.get_all("Host") or []
+        return (self.command == "GET" and len(words) >= 2 and words[1] == "/healthz"
+                and not server.exposed
+                and _is_loopback_addr(self.client_address[0])
+                and all(self.headers.get(h) is None for h in HEALTH_PROXY_HEADERS)
+                and len(hosts) == 1
+                and hosts[0].strip().lower() in ("127.0.0.1:%d" % server.port, "localhost:%d" % server.port))
+
+    def _serve_health(self):
+        """GET /healthz, reached only through _health_request: it reads no source, counts toward no backoff, and
+        says only that this process is an hmd-ui, which one, and whether its state poller is making progress."""
+        idle = self.server.cache.idle_s()
+        quiet = idle if idle is not None else time.monotonic() - self.server.started_at
+        ok = quiet < HEALTH_STALE_S
+        self._send_json(200 if ok else 503, {"ok": ok, "service": "hmd-ui", "schema": SCHEMA_VERSION, "pid": os.getpid()})
 
     def _gate_then(self, handler):
         parts = urlsplit(self.path)

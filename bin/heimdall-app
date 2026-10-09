@@ -78,6 +78,23 @@
 #                              offers the code, connect says so and leaves the code to
 #                              it; --confirm stops that window first, the compare
 #                              needing the code for itself.
+#                              THE PORT (--port N, default 8710; 0 = any free port) may
+#                              already be held, and connect settles it by what holds it
+#                              rather than failing to bind: a loopback `hmd ui` of THIS
+#                              repo that no relay client is serving (one a connect left
+#                              running when its client went) is reused if its /healthz
+#                              answers as that process, and stopped and started afresh on
+#                              the same port if it does not (an older build, stuck or
+#                              stopped); one a live relay client serves is left alone and
+#                              connect says to disconnect first (exit 6); anything else --
+#                              another repo's ui, a published (Funnel) ui, another user's
+#                              process, a foreign program -- is never signalled: the next
+#                              free port above it is used, printed, and recorded in
+#                              connect.json. Only a process connect can positively name is
+#                              ever stopped: this user's, python running
+#                              <...>/sentinels/hmd-ui.py with --repo resolving to this repo
+#                              and neither --allow-host nor --trust-proxy, re-checked
+#                              before each signal. (--tailscale keeps its fixed port.)
 #   hmd app pair-window --session SID [--pid N] [--repo DIR] [--relay URL] [--transcript FILE]
 #   hmd app pair-window --stop --session SID [--repo DIR]
 #                              The REPO's pair-by-code window, with no terminal: the
@@ -374,6 +391,9 @@ fi
 UI_PID=""
 HTTPS_PORT=""
 ACTUAL_PORT=""
+UI_REUSED=false   # UI_PID is a ui connect found already running and adopted, not a child of this shell
+V_KIND=""         # _ui_port_verdict's answer about the port it was asked of, and the pid it names (see there)
+V_PID=""
 FUNNEL_UP=false
 STATE_WRITTEN=false
 STATE_FILE=""
@@ -416,7 +436,9 @@ cleanup() {
     _funnel_stop_and_verify "hmd app connect" "$HTTPS_PORT" "$ACTUAL_PORT"
     funnel_stop_rc=$?
   fi
-  if [ -n "$UI_PID" ] && kill -0 "$UI_PID" 2>/dev/null; then
+  # An adopted ui is not this shell's child, so its pid may have been handed to another process while this ran
+  # (a child's cannot be): signal it only while it still looks like a ui.
+  if [ -n "$UI_PID" ] && kill -0 "$UI_PID" 2>/dev/null && { [ "$UI_REUSED" != true ] || _pid_is_heimdall_ui "$UI_PID"; }; then
     kill "$UI_PID" >/dev/null 2>&1 || true
     wait "$UI_PID" 2>/dev/null || true
   fi
@@ -970,6 +992,270 @@ _relay_drain() {
   done 5< <(tail -n +"$((seen_lines + 1))" "$CLIENT_OUT" 2>/dev/null)
 }
 
+# ── `hmd ui` on a port something already holds ───────────────────────────────────────────────────────────────
+# connect asks hmd ui for one fixed port (8710 unless --port says otherwise) and hmd ui will not share a port: it exits with
+# "cannot bind". A `hmd ui` an earlier connect left running -- its relay client gone, the ui not -- used to turn every later
+# connect into exit 6. _relay_start_ui settles the port by what holds it, and touches only what it can positively name:
+#   nothing          a ui is started there, as before.
+#   this repo's ui   a loopback-only `hmd ui` (sentinels/hmd-ui.py, this user's, --repo resolving to this repo) that no relay
+#                    client is serving. ADOPTED when GET /healthz answers as that very process and it is making progress;
+#                    otherwise (an older build without the route, stuck, stopped) STOPPED and a fresh ui started on the same
+#                    port. One a live relay client of this repo serves is neither stale nor ours to stop: exit 6, "disconnect".
+#   anything else    another repo's ui, a published (Funnel) ui, another user's process, a foreign program, a listener lsof
+#                    cannot name: never signalled. The next free port above it is used, printed, and recorded in connect.json.
+# Each decision is a fresh look at the port (so, after any stop too), and a bind lost to a race is retried on the next port
+# instead of being trusted to the probe that came before it.
+
+# _ui_port_ok PORT -- 0 when PORT is a fixed port (1-65535). 0 means "any free port" and cannot be held; anything else is
+# left to hmd ui's own argument parsing, which refuses it as it always has.
+_ui_port_ok() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 5 ] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# _tcp_open PORT -- 0 when something accepts a TCP connection on 127.0.0.1:PORT. One connect, given 2 s (a listener whose
+# accept queue is full never answers), closed at once: the peer reads an empty request and drops it without a word.
+_tcp_open() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" -I -c 'import socket, sys
+sock = socket.socket()
+sock.settimeout(2)
+try:
+    sock.connect(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()' "$1" 2>/dev/null
+}
+
+# _port_listeners PORT -- the pid of every process with a LISTEN socket on PORT (lsof), one per line; nothing when there is
+# none or no lsof to ask.
+_port_listeners() {
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p\([0-9][0-9]*\)$/\1/p'
+}
+
+# _ui_proc_repo PID -- prints the real path of the repo the process PID renders, and returns 0, ONLY when PID is positively a
+# loopback-only hmd ui of this user: the same uid, argv `<python> <...>/sentinels/hmd-ui.py ... --repo <dir> ...` and neither
+# --allow-host nor --trust-proxy (those make a ui a published, Funnel-fronted one). A relative --repo is resolved against the
+# process's own working directory, as the ui itself resolved it. Anything it cannot read as that returns 1: not ours to touch.
+_ui_proc_repo() {
+  local pid="$1" uid cmd rest val cwd real
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  uid="$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [ -n "$uid" ] && [ "$uid" = "$(id -u)" ] || return 1
+  cmd="$(ps -ww -o command= -p "$pid" 2>/dev/null)"
+  case "$(printf '%s' "${cmd%% *}" | tr '[:upper:]' '[:lower:]')" in *python*) ;; *) return 1 ;; esac
+  case "$cmd" in *"/sentinels/hmd-ui.py "*) ;; *) return 1 ;; esac
+  rest="${cmd#*/sentinels/hmd-ui.py }"
+  case " $rest " in *" --allow-host "*|*" --trust-proxy "*) return 1 ;; esac
+  case " $rest" in *" --repo "*) ;; *) return 1 ;; esac
+  val="${rest#*--repo }"
+  val="${val%% --*}"
+  case "$val" in
+    /*) ;;
+    *)
+      cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+      [ -n "$cwd" ] || return 1
+      val="$cwd/$val"
+      ;;
+  esac
+  real="$(cd "$val" 2>/dev/null && pwd -P)" || return 1
+  [ -n "$real" ] || return 1
+  printf '%s' "$real"
+}
+
+# _ui_serves_client REPO PID -- 0 when REPO's connect.json names PID as its ui and a live relay client as its client: a
+# running session, not a leftover.
+_ui_serves_client() {
+  local f="$1/.heimdall/app/connect.json"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  [ "$(jq -r '.pid_ui // empty' "$f" 2>/dev/null)" = "$2" ] || return 1
+  _pid_is_relay_client "$(jq -r '.pid_client // empty' "$f" 2>/dev/null)"
+}
+
+# _ui_health_ok PORT PID -- 0 when 127.0.0.1:PORT answers GET /healthz (sentinels/hmd-ui.py) as an hmd ui that IS process PID
+# and is making progress: 200, ok, service hmd-ui, pid PID. A ui from before the route answers 401, a stuck or stopped one
+# does not answer within 3 s: neither can be reused. The client closes with a RST: the ui binds without SO_REUSEADDR, so a
+# TIME_WAIT left on its port would keep the replacement from binding the port this is about to free.
+_ui_health_ok() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" -I - "$1" "$2" <<'PYEOF'
+import json, socket, struct, sys
+
+port, pid = int(sys.argv[1]), int(sys.argv[2])
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+healthy = False
+try:
+    sock.settimeout(3)
+    sock.connect(("127.0.0.1", port))
+    sock.sendall(("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n" % port).encode())
+    raw = b""
+    while len(raw) < 65536:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        raw += chunk
+    head, _, body = raw.partition(b"\r\n\r\n")
+    doc = json.loads(body.decode("utf-8"))
+    healthy = (head.split(b" ", 2)[1] == b"200" and doc.get("ok") is True
+               and doc.get("service") == "hmd-ui" and doc.get("pid") == pid)
+except (OSError, ValueError, IndexError, AttributeError):
+    healthy = False
+finally:
+    sock.close()
+sys.exit(0 if healthy else 1)
+PYEOF
+}
+
+# _ui_stop PID REPO_REAL -- stop the hmd ui PID and wait until it is gone. It is re-read as a ui of this repo before every
+# signal -- a pid can be handed to another process the moment the old one exits -- and one that is no longer is left alone
+# (0: nothing of ours remains). SIGCONT first, so a stopped process can act on the TERM; a process still there after
+# HMD_UI_STOP_TIMEOUT_S (default 5) is killed. 0 once it is gone, 1 if it is not.
+_ui_stop() {
+  local pid="$1" repo_real="$2" timeout="${HMD_UI_STOP_TIMEOUT_S:-5}" steps=0 seen
+  case "$timeout" in ''|*[!0-9]*) timeout=5 ;; esac
+  seen="$(_ui_proc_repo "$pid")" || return 0
+  [ "$seen" = "$repo_real" ] || return 0
+  kill -CONT "$pid" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$steps" -lt $((timeout * 10)) ]; do
+    sleep 0.1
+    steps=$((steps + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    seen="$(_ui_proc_repo "$pid")" && [ "$seen" = "$repo_real" ] && kill -KILL "$pid" 2>/dev/null
+    steps=0
+    while kill -0 "$pid" 2>/dev/null && [ "$steps" -lt 20 ]; do
+      sleep 0.1
+      steps=$((steps + 1))
+    done
+  fi
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+# _ui_port_verdict REPO REPO_REAL PORT -- sets V_KIND (and V_PID) from a fresh look at 127.0.0.1:PORT:
+#   free    nothing listens there
+#   reuse   a loopback hmd ui of REPO_REAL (V_PID), no relay client serving it, healthy
+#   stale   the same, but not healthy: an older build, stuck, stopped
+#   live    the same, and REPO's connect.json shows a live relay client serving it
+#   other   anything else, or a listener that cannot be named: never touched
+_ui_port_verdict() {
+  local repo="$1" repo_real="$2" port="$3" listeners pid prepo
+  V_KIND="" V_PID=""
+  listeners="$(_port_listeners "$port")"
+  if [ -z "$listeners" ] && ! _tcp_open "$port"; then
+    V_KIND=free
+    return 0
+  fi
+  pid="$listeners"
+  if [ "$(printf '%s\n' "$listeners" | grep -c .)" -ne 1 ] || ! prepo="$(_ui_proc_repo "$pid")" || [ "$prepo" != "$repo_real" ]; then
+    V_KIND=other
+    return 0
+  fi
+  V_PID="$pid"
+  if _ui_serves_client "$repo" "$pid"; then
+    V_KIND=live
+  elif _ui_health_ok "$port" "$pid"; then
+    V_KIND=reuse
+  else
+    V_KIND=stale
+  fi
+}
+
+# _ui_next_free_port PORT -- prints the first port above PORT that nothing listens on (looks at up to 200); 1 when none.
+_ui_next_free_port() {
+  local p="$1" i=0
+  while [ "$i" -lt 200 ] && [ "$p" -lt 65535 ]; do
+    p=$((p + 1))
+    i=$((i + 1))
+    [ -n "$(_port_listeners "$p")" ] && continue
+    _tcp_open "$p" && continue
+    printf '%s' "$p"
+    return 0
+  done
+  return 1
+}
+
+# _relay_start_ui REPO PORT -- bring up (or adopt) the loopback hmd ui cmd_connect_relay reports against; the policy is the
+# block comment above. Sets UI_PID, ACTUAL_PORT and UI_REUSED; UI_OUT is the ui's own output. 0 when a ui is up, 6 with the
+# reason already printed when none can be.
+_relay_start_ui() {
+  local repo="$1" port="$2" wanted="$2" repo_real="" tries=0 stops=0 next url_line waited
+  local url_re='^http://127\.0\.0\.1:[0-9]+/\?token='
+  repo_real="$(cd "$repo" 2>/dev/null && pwd -P)" || repo_real=""
+  UI_REUSED=false
+  while [ "$tries" -lt 12 ]; do
+    tries=$((tries + 1))
+    if [ -n "$repo_real" ] && _ui_port_ok "$port"; then
+      _ui_port_verdict "$repo" "$repo_real" "$port"
+      [ "$V_KIND" = stale ] && [ "$stops" -ge 2 ] && V_KIND=other
+      if [ "$V_KIND" = reuse ]; then
+        UI_PID="$V_PID"
+        ACTUAL_PORT="$port"
+        UI_REUSED=true
+        echo "hmd app: reusing the hmd ui already running for this repo (pid $UI_PID, port $port)"
+        return 0
+      elif [ "$V_KIND" = live ]; then
+        echo "hmd app connect: this repo is already connected -- its hmd ui (pid $V_PID, port $port) is served by a live relay client; run 'hmd app disconnect' first" >&2
+        return 6
+      elif [ "$V_KIND" = stale ]; then
+        stops=$((stops + 1))
+        echo "hmd app connect: the hmd ui for this repo on port $port (pid $V_PID) is not answering as a working one -- stopping it to start a fresh one" >&2
+        _ui_stop "$V_PID" "$repo_real" || echo "hmd app connect: hmd ui pid $V_PID did not stop" >&2
+        continue
+      elif [ "$V_KIND" = other ]; then
+        if ! next="$(_ui_next_free_port "$port")"; then
+          echo "hmd app connect: port $port is held by another process and no free port was found above it" >&2
+          return 6
+        fi
+        port="$next"
+        continue
+      fi
+    fi
+    : >"$UI_OUT"
+    # Loopback only -- no --allow-host/--trust-proxy. Unlike the tailscale path, nothing ever proxies public HTTP
+    # traffic to this port: the relay client talks to the relay itself and reads ui state over loopback, so
+    # heimdall-ui's trust boundary never needs extending to a public hostname.
+    (
+      cd "$repo" 2>/dev/null || exit 2
+      HEIMDALL_WATCH_ROOT="$repo" exec "$UI_BIN" --repo "$repo" --port "$port" --no-open
+    ) >"$UI_OUT" 2>&1 &
+    UI_PID=$!
+    url_line="" waited=0
+    while [ "$waited" -lt 100 ]; do
+      kill -0 "$UI_PID" 2>/dev/null || break
+      url_line="$(grep -E "$url_re" "$UI_OUT" 2>/dev/null | head -1)"
+      [ -n "$url_line" ] && break
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    if [ -z "$url_line" ]; then
+      if kill -0 "$UI_PID" 2>/dev/null; then
+        echo "hmd app connect: heimdall-ui did not print a URL within 10s:" >&2
+      else
+        wait "$UI_PID" 2>/dev/null
+        if _ui_port_ok "$port" && grep -q 'cannot bind' "$UI_OUT" 2>/dev/null && next="$(_ui_next_free_port "$port")"; then
+          UI_PID=""   # the port was taken between the look and the bind: that ui is gone, ask the next port
+          port="$next"
+          continue
+        fi
+        echo "hmd app connect: heimdall-ui exited before it started listening:" >&2
+      fi
+      _print_redacted "$UI_OUT" >&2
+      return 6
+    fi
+    ACTUAL_PORT="$(printf '%s' "$url_line" | sed -E 's#^http://127\.0\.0\.1:([0-9]+)/.*#\1#')"
+    if _ui_port_ok "$wanted" && [ "$ACTUAL_PORT" != "$wanted" ]; then
+      echo "hmd app: port $wanted is held by something else -- using port $ACTUAL_PORT instead (recorded in connect.json)"
+    fi
+    return 0
+  done
+  echo "hmd app connect: could not start heimdall-ui after $tries attempts" >&2
+  return 6
+}
+
 cmd_connect() {
   local REPO="" PORT="8710" NO_INSTALL=false BG=false
   local RELAY_URL="" RELAY_SET=false HTTPS_PORT_SET=false TAILSCALE=false NO_CODE=false NO_CONFIRM=false CONFIRM=false
@@ -1336,42 +1622,16 @@ cmd_connect_relay() {
     return 2
   fi
 
-  # Loopback only -- no --allow-host/--trust-proxy. Unlike the tailscale
-  # path, nothing ever proxies public HTTP traffic to this port: the relay
-  # client talks to the relay itself and reads ui state over loopback, so
-  # heimdall-ui's trust boundary never needs extending to a public hostname.
-  (
-    cd "$REPO" 2>/dev/null || exit 2
-    HEIMDALL_WATCH_ROOT="$REPO" exec "$UI_BIN" --repo "$REPO" --port "$PORT" --no-open
-  ) >"$UI_OUT" 2>&1 &
-  UI_PID=$!
-
+  # From here on, teardown must happen even on Ctrl-C / kill / normal exit (cleanup is a no-op until there is a ui).
   trap 'cleanup; exit 130' INT
   trap 'cleanup; exit 143' TERM
   trap 'cleanup; exit 129' HUP
   trap cleanup EXIT
 
-  local url_re='^http://127\.0\.0\.1:[0-9]+/\?token='
-  local waited=0 url_line=""
-  while [ "$waited" -lt 100 ]; do
-    if ! kill -0 "$UI_PID" 2>/dev/null; then
-      echo "hmd app connect: heimdall-ui exited before it started listening:" >&2
-      _print_redacted "$UI_OUT" >&2
-      return 6
-    fi
-    url_line="$(grep -E "$url_re" "$UI_OUT" 2>/dev/null | head -1)"
-    [ -n "$url_line" ] && break
-    sleep 0.1
-    waited=$((waited + 1))
-  done
-  if [ -z "$url_line" ]; then
-    echo "hmd app connect: heimdall-ui did not print a URL within 10s:" >&2
-    _print_redacted "$UI_OUT" >&2
-    return 6
-  fi
-  local actual_port
-  actual_port="$(printf '%s' "$url_line" | sed -E 's#^http://127\.0\.0\.1:([0-9]+)/.*#\1#')"
-  ACTUAL_PORT="$actual_port"
+  # Start the loopback ui -- or adopt the one a former connect left on the port, or step around whatever else holds it
+  # (_relay_start_ui). What the client is told, and connect.json records, is the port the ui is really on.
+  _relay_start_ui "$REPO" "$PORT" || return $?
+  local actual_port="$ACTUAL_PORT"
 
   local relay_host
   relay_host="$(printf '%s' "$RELAY_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*$##; s#:.*$##')"
