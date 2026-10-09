@@ -688,12 +688,14 @@ def case_window_is_the_repos():
 
 # -- B / I: the pair window sends the token far less often, and stops when nobody is there -------------------------------
 # A window with no terminal re-registers its code with the relay each time the relay's registration of it lapses, and the
-# laptop's gh token is in that request's body. The relay keeps a registration PAIRING_CODE_TTL_S = 60 s (relay/src/pairing.ts;
-# `pair_window_s` in relay/contract/code-pair.json), so the token went out once a minute for as long as the session lived.
+# laptop's gh token is in that request's body. The relay keeps a registration PAIRING_CODE_TTL_S = 360 s (relay/src/pairing.ts;
+# `pair_window_s` in relay/contract/code-pair.json). It was 60 s, and the token then went out once a minute for as long as the
+# session lived.
 #   B  now it goes out no more often than HMD_PAIR_WINDOW_RENEW_MIN_S (300 s) after the last time -- and a margin ahead of
-#      the lapse, with the old registration freed first so the relay does not refuse the new one as a clash, whenever the
-#      relay keeps a registration longer than that. Against the relay's real 60 s the floor wins: the code is claimable for
-#      the minute after each registration and dark in between, which is the price of the back-off
+#      the lapse (HMD_PAIR_WINDOW_RENEW_LEAD_S, 10 s), with the old registration freed first so the relay does not refuse the
+#      new one as a clash, whenever the relay keeps a registration longer than that. Against the relay's real 360 s the renewal
+#      falls 350 s on, inside the registration, so the code is claimable all the time; a relay that kept one only 60 s would
+#      leave it dark between a lapse and the floor, which is the price of the back-off
 #   I  and the window stops for good after HMD_PAIR_WINDOW_IDLE_H hours (4; 0 never) with no pairing and no activity in the
 #      session (the modification time of the transcript the SessionStart hook hands it); a new session, or `hmd app connect`,
 #      opens it again. Time is injected (HMD_PAIR_WINDOW_NOW_FILE) and the relay's timings are scaled down: nothing sleeps hours.
@@ -718,14 +720,14 @@ def case_renewal_schedule():
         return
     floor, lead = 300.0, 10.0
     schedule = lambda registered, lapses: due(registered, lapses, floor, lead)
-    for ttl in (60, 290, 305, 600, 3600):
+    for ttl in (60, 290, 305, 360, 600, 3600):
         regs = simulated_renewals(schedule, ttl, 4)
         gaps = [b[0] - a[0] for a, b in zip(regs, regs[1:])]
         most = max(sum(1 for other in regs if at <= other[0] < at + 300.0) for at, _lapse in regs)
         T.check(len(regs) >= 2 and most == 1 and min(gaps) >= floor - 1e-9,
                 "B1. against a relay that keeps a registration %d s: over 4 simulated hours never more than one renewal in any 5 minutes (%d in all)"
                 % (ttl, len(regs)), "most in 5 min %d, first gaps %s" % (most, gaps[:3]))
-    for ttl in (305, 600, 3600):
+    for ttl in (305, 360, 600, 3600):
         regs = simulated_renewals(schedule, ttl, 4)
         pairs = list(zip(regs, regs[1:]))
         T.check(bool(pairs) and all(b[0] < a[1] and a[1] - b[0] <= lead + 1e-9 for a, b in pairs),
@@ -734,8 +736,13 @@ def case_renewal_schedule():
     regs = simulated_renewals(schedule, 60, 4)
     pairs = list(zip(regs, regs[1:]))
     T.check(len(regs) == 48 and bool(pairs) and all(abs((b[0] - a[0]) - 300.0) < 1e-9 and abs((b[0] - a[1]) - 240.0) < 1e-9 for a, b in pairs),
-            "B3. against the relay's real 60 s the 5-minute floor wins: 48 registrations in 4 hours, each renewed 300 s after the last "
+            "B3. against a relay that keeps a registration only 60 s (the relay's old TTL) the 5-minute floor wins: 48 registrations in 4 hours, each renewed 300 s after the last "
             "(the code is dark for the 240 s between a lapse and the next)", "%d registrations" % len(regs))
+    regs = simulated_renewals(schedule, 360, 4)
+    pairs = list(zip(regs, regs[1:]))
+    T.check(len(regs) == 42 and bool(pairs) and all(abs((b[0] - a[0]) - 350.0) < 1e-9 and abs((a[1] - b[0]) - 10.0) < 1e-9 for a, b in pairs),
+            "B3. against the relay's real 360 s the window renews 350 s on, 10 s before the lapse: 42 registrations in 4 hours, and the code is "
+            "never dark", "%d registrations" % len(regs))
     T.check(abs(due(0.0, 60.0, 5.0, -1.5) - 61.5) < 1e-9 and abs(due(0.0, 2.0, 0.5, 10.0) - 1.0) < 1e-9,
             "B4. `hmd app connect`'s own schedule is unchanged (5 s floor, renewed 1.5 s after the lapse), and a short registration is never renewed "
             "at once, over and over, by a long margin (the margin is capped at half its life)",

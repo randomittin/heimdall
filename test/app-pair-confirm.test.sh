@@ -63,7 +63,7 @@ else
 fi
 if jq -e '[.hooks.SessionStart[].hooks[].command | select(contains("pair-window --session"))] | length == 1' "$REPO/hooks/hooks.json" >/dev/null \
    && jq -e '[.hooks.SessionEnd[].hooks[].command | select(contains("pair-window --stop"))] | length == 1' "$REPO/hooks/hooks.json" >/dev/null; then
-  ok "SessionStart opens the window and SessionEnd closes it, once each"
+  ok "SessionStart opens the window and SessionEnd stops it (unless another session or a connect client needs it), once each"
 else
   bad "the pair-window hooks are not wired exactly once each"
 fi
