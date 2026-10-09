@@ -64,6 +64,12 @@ MUTANTS = [
     ("spooled-alerts-not-counted", "companion_push.py", "self._record_digest(batch + spooled, now)", "self._record_digest(batch, now)"),
     ("push-scrub-bypassed", "dashboard_digest.py", "body=lambda fields: compose_body(fields, kit),",
      'body=lambda fields: compose_body(fields, __import__("types").SimpleNamespace(scrub=lambda t, n=0: t, clip=kit.clip, utf16_len=kit.utf16_len, secret_shaped=kit.secret_shaped)),'),
+    ("planted-file-mode-ignored", "dashboard_digest.py", "forbidden=PRIVATE, dir_forbidden=NOT_SHARED", "forbidden=0, dir_forbidden=NOT_SHARED"),
+    ("shared-directory-believed", "dashboard_digest.py", "forbidden=PRIVATE, dir_forbidden=NOT_SHARED", "forbidden=PRIVATE, dir_forbidden=0"),
+    ("lock-opened-through-a-link", "dashboard_digest.py", "fd = _state().open_lockfile(root, APP_REL, LOCK_NAME)",
+     "fd = os.open(os.path.join(root, LOCK_REL), os.O_WRONLY | os.O_CREAT, 0o600)"),
+    ("write-through-a-link", "dashboard_digest.py", '_state().write(root, APP_REL, STORE_NAME, body.encode("utf-8"))',
+     'open(os.path.join(root, STORE_REL), "wb").write(body.encode("utf-8"))'),
 ]
 
 
