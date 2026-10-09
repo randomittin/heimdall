@@ -399,6 +399,10 @@ STATUS FILE (default <repo>/.heimdall/app/relay.json, atomic 0600 write, 0700
 dir, rewritten on every state change -- never holds a token or key):
     {session_id, relay, paired, bound_at, last_seq, frames_sent,
      last_delivered, last_command_at, started_at, pid, event_log}
+It and the event log below are written through bin/lib/hmd_private_state.py, like every other state file this client keeps in
+the repo: a link at .heimdall, at .heimdall/app or at the file is never written through (a cloned repo can carry any of them).
+A write refused that way is reported once per outage -- an `error` event for the status file, a stderr line for the log -- and
+the client keeps running.
 
 EVENT LOG (HMD_RELAY_EVENT_LOG; default <repo>/.heimdall/app/relay-events.jsonl,
 atomic per-line append, 0600, 0700 dir; set to "" to disable -- no file is ever
@@ -406,7 +410,9 @@ created in that case): a durable copy of every line this process ever writes
 to stdout (see STDOUT CONTRACT above -- unchanged, byte-for-byte), each with
 one added "ts" (ISO-8601 UTC, millisecond precision) field the stdout copy
 omits. Same secrets discipline as STATUS FILE above -- never a token, key, or
-command/state plaintext. Rotates at EVENT_LOG_MAX_BYTES (4 MiB),
+command/state plaintext. The one line that carries a bearer secret, pair_init (the QR's pairing_code, good for the minutes its
+session lives), is logged WITHOUT it -- exp and the rest of the QR stay; stdout keeps it whole, `hmd app connect` renders the QR
+from it. Rotates at EVENT_LOG_MAX_BYTES (4 MiB),
 single-generation (path -> path.1, clobbering any previous .1 -- same
 mechanism as bin/lib/companion_ui_inbox.py's _rotate_if_oversized). A write
 failure (unwritable dir, disk full, ...) drops that line and never blocks or
@@ -423,7 +429,6 @@ and the connect threads all emit, and an exception out of emit() ended them.
 import argparse
 import base64
 import collections
-import contextlib
 import functools
 import hashlib
 import http.client
@@ -438,7 +443,6 @@ import signal
 import socket
 import ssl
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -639,6 +643,7 @@ EVENT_LOG_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB, single-generation rotation to .1
 _event_log_path = None       # resolved by configure_event_log(); None before
                               # that call AND whenever logging is disabled --
                               # both cases mean "emit() writes nothing extra"
+_state_root = None           # the repo root the state files below it are walked from, link-free; set by configure_event_log()
 
 # emit() is called from two threads with no prior coordination between them
 # (main()'s stream_thread running RelayClient._stream_loop, and the main
@@ -704,28 +709,51 @@ def configure_event_log(repo_root):
     `repo_root` into module state -- emit() is a bare function called before
     any RelayClient exists (see main(), and the pair_init/e2e-unavailable
     error paths above it), so this can't live on an instance the way
-    status_path does. Idempotent; main() calls it exactly once, right after
-    --repo is parsed, so even the earliest emit() calls are covered."""
-    global _event_log_path
+    status_path does. `repo_root` is also the root every state file below it
+    is walked from (_state_target). Idempotent; main() calls it exactly once,
+    right after --repo is parsed, so even the earliest emit() calls are
+    covered."""
+    global _event_log_path, _state_root
+    _state_root = repo_root
     if _EVENT_LOG_ENV == "":
         _event_log_path = None
         return
     _event_log_path = _EVENT_LOG_ENV or os.path.join(repo_root, ".heimdall", "app", "relay-events.jsonl")
 
 
-def _rotate_event_log_if_oversized(path):
-    """Single-generation rotation: path -> path.1 (clobbering any previous
-    .1) once `path` is already >= EVENT_LOG_MAX_BYTES, so the next append
-    starts a fresh file -- identical mechanism to
-    bin/lib/companion_ui_inbox.py's _rotate_if_oversized, minus its flock
-    (that file has multiple writers; this one has exactly one -- a single
-    relay-client process owns its own event log for its whole lifetime)."""
-    try:
-        if os.path.getsize(path) < EVENT_LOG_MAX_BYTES:
-            return
-    except OSError:
-        return
-    os.replace(path, path + ".1")
+def _state_target(path):
+    """(root, rel, name) to hand bin/lib/hmd_private_state.py for the state file at `path`. Below the repo root
+    (_state_root: where every default state file lives, <root>/.heimdall/app/...) the walk starts AT the root, one
+    component at a time, so a link at .heimdall or .heimdall/app -- a cloned repo can carry either -- is refused rather
+    than written through. A path the operator pointed elsewhere (--status-file, HMD_RELAY_EVENT_LOG) is theirs to have
+    named: its nearest directory that exists is the root (the helper opens a root by its real path) and whatever is
+    created or written below that is walked the same link-free way."""
+    path = os.path.abspath(path)
+    top = None
+    # the root as it was spelled and as it really is: RelayClient.root is a real path, a caller's --repo (or a test's tempdir,
+    # /var -> /private/var) may not be, and a default state path under the repo must never miss the root and fall to the
+    # operator's-own-path branch below, which follows what it finds
+    for base in ((os.path.abspath(_state_root), os.path.realpath(_state_root)) if _state_root else ()):
+        if path.startswith(base + os.sep):
+            top = base
+            break
+    if top is None:
+        top = os.path.dirname(path)
+        while not os.path.isdir(top) and os.path.dirname(top) != top:
+            top = os.path.dirname(top)
+    rel = os.path.relpath(os.path.dirname(path), top)
+    return top, "" if rel == "." else rel, os.path.basename(path)
+
+
+def _loggable(obj):
+    """`obj` as the durable log may keep it. stdout keeps every line whole -- `hmd app connect` renders the QR from the
+    pair_init line -- but the QR's pairing_code is a bearer secret for as long as its session lives, and the log
+    outlives that (0600, under the repo, rotated to .1): the pair_init event is logged without it, exp and the rest of
+    the QR (relay, session id, hmd's public key) stay."""
+    qr = obj.get("qr") if obj.get("event") == "pair_init" else None
+    if isinstance(qr, dict) and "pairing_code" in qr:
+        return dict(obj, qr={k: v for k, v in qr.items() if k != "pairing_code"})
+    return obj
 
 
 def _event_log_timestamp():
@@ -737,30 +765,35 @@ def _append_event_log(obj):
     """Best-effort durable copy of one emit() line, plus an ISO-8601 UTC "ts"
     field the stdout copy never carries (STDOUT CONTRACT is unchanged).
     Never raises and never blocks the caller on failure: a broken log
-    (unwritable dir, disk full, ...) drops this line, reports the outage once
+    (unwritable dir, disk full, a link where the log or the directory it
+    lives in should be, ...) drops this line, reports the outage once
     (see _sink_failed) and is tried again by the next emit -- persisting
     events is a debugging convenience, not a correctness gate the actual
     relay session depends on, but a log that hit a full disk must come back
     when space does, so it is never switched off. Broad except-and-report is
     deliberate, matching this file's own convention at every non-critical
     I/O boundary (e.g. run_state_loop's per-tick try/except, or
-    _atomic_write_json's try/except above)."""
+    write_status's try/except below).
+
+    The append and the single-generation rotation (path -> path.1, clobbering
+    any previous .1 -- the mechanism of bin/lib/companion_ui_inbox.py's
+    _rotate_if_oversized, minus its flock: that file has multiple writers,
+    this one has exactly one, a single relay-client process owning its own
+    event log for its whole lifetime) are bin/lib/hmd_private_state.py's
+    append(): a link anywhere on the way to the log, or at it, is refused,
+    and a link planted at path.1 is replaced by the rotation, never written
+    through. The pair_init line goes in without its pairing_code
+    (_loggable)."""
     if _event_log_path is None:
         return
     try:
-        d = os.path.dirname(_event_log_path)
-        os.makedirs(d, exist_ok=True)
-        os.chmod(d, 0o700)
-        _rotate_event_log_if_oversized(_event_log_path)
-        record = dict(obj)
+        if PRIVATE is None:
+            raise OSError("bin/lib/hmd_private_state.py failed to import")
+        record = dict(_loggable(obj))
         record["ts"] = _event_log_timestamp()
         line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        fd = os.open(_event_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        os.chmod(_event_log_path, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
+        root, rel, name = _state_target(_event_log_path)
+        PRIVATE.append(root, rel, name, line.encode("utf-8"), rotate_at=EVENT_LOG_MAX_BYTES)
     except Exception as e:
         _sink_failed("event log", e)
     else:
@@ -780,26 +813,17 @@ def emit(obj):
 
 
 def _atomic_write_json(path, obj):
-    """`obj` as one whole JSON document at `path`, or `path` untouched and the error raised. Every call stages in a
-    temp file of its own -- mkstemp: a unique name, O_EXCL, 0600, in the same directory so the rename stays on one
-    filesystem. write_status() runs on the state loop, the stream thread and the connect threads at once, and one
-    temp name per process let a writer's rename pull the file out from under another (ENOENT) or publish a file
-    two writers had both written into."""
-    d = os.path.dirname(path)
-    os.makedirs(d, exist_ok=True)
-    os.chmod(d, 0o700)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".tmp-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(obj, sort_keys=True, separators=(",", ":")))
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)  # mkstemp's 0600 minus whatever the umask takes away: the status file is exactly 0600
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):  # the temp is already gone: the caller needs the original error
-            os.unlink(tmp)
-        raise
+    """`obj` as one whole JSON document at `path`, or `path` untouched and the error raised. bin/lib/hmd_private_state.py
+    writes it: every call stages in a temp file of its own -- a unique name, O_EXCL, 0600, in the same directory so the
+    rename stays on one filesystem -- and renames it over `path` relative to the directory it vetted. write_status()
+    runs on the state loop, the stream thread and the connect threads at once, and one temp name per process let a
+    writer's rename pull the file out from under another (ENOENT) or publish a file two writers had both written
+    into. No link on the way to `path` (under the repo: .heimdall, .heimdall/app) is followed -- OSError instead --
+    and one AT `path` is replaced, never written through."""
+    if PRIVATE is None:
+        raise OSError("bin/lib/hmd_private_state.py failed to import")
+    root, rel, name = _state_target(path)
+    PRIVATE.write(root, rel, name, json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
 def _split_relay(url):

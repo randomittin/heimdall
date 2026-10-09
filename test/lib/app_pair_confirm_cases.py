@@ -1156,6 +1156,163 @@ def case_code_not_derivable():
                 "%r/%r %r/%r %r/%r" % (rc_open, out_open, rc_bad, out_bad, rc_link, out_link))
 
 
+# -- S3 ------------------------------------------------------------------------------------------------------------
+# Everything else the phone companion keeps in a tree a repository controls: the relay client's event log (and its rotation to .1),
+# status file relay.json and pair_init line; connect.json and relay.json (hmd app connect / status / disconnect); the pair window's
+# state; push.json and its lock; the push-test request; digest.json and its lock. A cloned repo can carry `.heimdall` or
+# `.heimdall/app` as a link, or a link at any of those names. None of them may be written, chmod'ed, removed, locked or READ through
+# one, and what the link names stays byte for byte, mode for mode as it was -- with a live process named in the state a hostile repo
+# planted (0600, so only the link, never the mode, is what refuses it), which `disconnect` and `pair-window --stop` must not signal.
+def tree_state(root):
+    rows = {".": (mode_of(root), b"")}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for n in dirnames + filenames:
+            p = os.path.join(dirpath, n)
+            st = os.lstat(p)
+            rows[os.path.relpath(p, root)] = (stat.S_IMODE(st.st_mode), open(p, "rb").read() if stat.S_ISREG(st.st_mode) else b"")
+    return rows
+
+
+def linked_repo(s, level, pid):
+    """(repo, victim) -- a repo whose .heimdall (level "heimdall") or .heimdall/app (level "app") is a link to a directory of 0755
+    that holds a sentinel and the state a hostile checkout would plant, naming `pid`."""
+    repo = os.path.join(s.sb.root, "repo-linked-" + level)
+    victim = os.path.join(s.sb.root, "victim-" + level)
+    app_dir = victim if level == "app" else os.path.join(victim, "app")
+    os.makedirs(app_dir)
+    os.makedirs(repo if level == "heimdall" else os.path.join(repo, ".heimdall"))
+    os.symlink(victim, os.path.join(repo, ".heimdall") if level == "heimdall" else os.path.join(repo, ".heimdall", "app"))
+    write_private(os.path.join(victim, "sentinel"), "SENTINEL")
+    token = "ExponentPushToken[plantedplanted1]"
+    for name, doc in (("connect.json", {"mode": "relay", "pid_ui": pid, "pid_client": pid, "port": 1, "relay": "http://127.0.0.1:1/", "started_at": "x"}),
+                      ("relay.json", {"session_id": "planted", "relay": "http://127.0.0.1:1/", "paired": True, "pid": pid, "event_log": None}),
+                      ("pair-window.json", {"pid": pid, "code": "ABCDE", "state": "open"}),
+                      ("push.json", {"v": 1, "tokens": [{"token": token, "platform": "ios", "registered_at": "2026-01-01T00:00:00Z"}],
+                                     "app_state": "unknown"}),
+                      ("push-test", {"v": 1, "id": "0123456789abcdef", "at": int(time.time())})):
+        write_private(os.path.join(app_dir, name), json.dumps(doc))
+    os.chmod(victim, 0o755)
+    return repo, victim
+
+
+def client_writers(repo, secret):
+    """The relay client's own writers against `repo`, in this process: a pair_init event (event log, stdout) and the status file."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        CLIENT.configure_event_log(repo)
+        client = CLIENT.RelayClient(argparse.Namespace(relay="http://127.0.0.1:9", repo=repo, ui_port=0, public_host=None,
+                                                       status_file=None, tick_s=2.0))
+        client.session_id, client.exp, client.pub = "sess-S3", int(time.time()) + 360, bytes(range(32))
+        client._emit_pair_init({"pairing_code": secret})
+    return out.getvalue(), err.getvalue()
+
+
+def refuses(fn, *args):
+    try:
+        fn(*args)
+    except OSError:
+        return True
+    return False
+
+
+def case_state_files_link_safe():
+    secret = "ZZPAIRCODEZZ0123456789AB"
+    token = "ExponentPushToken[abcdefghij123]"
+    with Scn() as s:
+        env = s.env()
+        sleeper = subprocess.Popen(["sleep", "300"])
+        try:
+            push_store = H.load_module("companion_push_store", os.path.join(REPO, "bin", "lib", "companion_push_store.py"))
+            push = H.load_module("companion_push", os.path.join(REPO, "bin", "lib", "companion_push.py"))
+            digest = H.load_module("dashboard_digest", os.path.join(REPO, "bin", "lib", "dashboard_digest.py"))
+            for level, where in (("heimdall", ".heimdall"), ("app", ".heimdall/app")):
+                repo, victim = linked_repo(s, level, sleeper.pid)
+                before = tree_state(victim)
+                _out, err = client_writers(repo, secret)
+                libs = {"push store": refuses(push_store.register, repo, token, "ios"),
+                        "push-test request": refuses(push.request_test, repo),
+                        "digest": refuses(digest._write, repo, digest._zero())}
+                push.withdraw_test_request(repo, "0123456789abcdef")  # the planted request has this id: it must not be unlinked
+                reads = (push_store.load(repo)["tokens"] == [] and push.read_test_request(repo, time.time()) is None
+                         and digest.load(repo) == digest._clean(None))
+                for argv in (["status", "--repo", repo], ["disconnect", "--repo", repo],
+                             ["pair-window", "--stop", "--session", SID1, "--repo", repo]):
+                    run([H.APP_PATH] + argv, env, timeout=120)
+                connect = H.Proc([H.APP_PATH, "connect", "--repo", repo, "--port", "0", "--relay", s.relay.url, "--bg"], env, cwd=repo)
+                s.procs.append(connect)
+                connect.wait_exit(60)
+                T.check(tree_state(victim) == before and alive(sleeper.pid),
+                        "S3. %s is a link: the event log, relay.json, connect.json/relay.json, the pair window, push.json, the push-test "
+                        "files and digest.json write, remove, signal and chmod nothing behind it" % where,
+                        "victim changed %s, planted process alive %s, relay client stderr %s"
+                        % (sorted(k for k in set(tree_state(victim)) | set(before) if tree_state(victim).get(k) != before.get(k)),
+                           alive(sleeper.pid), err[-200:]))
+                T.check(all(libs.values()) and reads,
+                        "S3. so are the push store, the push-test request and digest.json (writes refused with OSError, reads see no record) "
+                        "when %s is a link" % where, "refused %s, reads %s" % (libs, reads))
+                T.check(connect.rc == 2 and "refusing to start" in connect.text() and "connect.json" in connect.text(),
+                        "S3. `hmd app connect` refuses to start, saying so, when %s is a link -- before it starts anything" % where,
+                        "rc %r %s" % (connect.rc, connect.tail()))
+            # a repo with plain directories: pair_init is logged without its bearer code, every other writer still works, and a link
+            # AT a file name (the log, its rotation, the status file, the stores and their locks, connect.json) is replaced or refused
+            clean = os.path.join(s.sb.root, "clean-repo")
+            os.makedirs(clean)
+            out, _err = client_writers(clean, secret)
+            app_dir = os.path.join(clean, ".heimdall", "app")
+            log = os.path.join(app_dir, "relay-events.jsonl")
+            log_text = open(log, encoding="utf-8").read()
+            pair = [json.loads(line) for line in log_text.splitlines() if '"pair_init"' in line]
+            T.check(len(pair) == 1 and secret not in log_text and "pairing_code" not in pair[0]["qr"]
+                    and set(pair[0]["qr"]) == {"v", "relay", "session_id", "exp", "hmd_pubkey"} and pair[0]["exp"] == pair[0]["qr"]["exp"]
+                    and secret in out and mode_of(log) == 0o600 and mode_of(app_dir) == 0o700
+                    and json.load(open(os.path.join(app_dir, "relay.json")))["session_id"] == "sess-S3",
+                    "S3. the pair_init line in relay-events.jsonl has no pairing_code (exp and the rest of the QR stay), stdout still carries it for "
+                    "the QR, and the log, the status file and their directory are 0600/0700", "log %r" % log_text[:300])
+            target = os.path.join(s.sb.root, "elsewhere.txt")
+            write_private(target, "SENTINEL")
+            os.unlink(log)
+            os.symlink(target, log)
+            status = os.path.join(app_dir, "relay.json")
+            os.unlink(status)
+            os.symlink(target, status)
+            client_writers(clean, secret)
+            T.check(open(target).read() == "SENTINEL" and os.path.islink(log) and not os.path.islink(status) and mode_of(status) == 0o600,
+                    "S3. a link AT the event log is refused (the client carries on), a link AT relay.json is replaced -- neither written through")
+            os.unlink(log)
+            with open(log, "wb") as f:
+                f.write(b"x" * CLIENT.EVENT_LOG_MAX_BYTES)
+            os.chmod(log, 0o600)
+            os.symlink(target, log + ".1")
+            client_writers(clean, secret)
+            T.check(open(target).read() == "SENTINEL" and not os.path.islink(log + ".1")
+                    and os.path.getsize(log + ".1") == CLIENT.EVENT_LOG_MAX_BYTES and os.path.getsize(log) < 8192,
+                    "S3. the event log's rotation replaces a link planted at relay-events.jsonl.1, never writes through it")
+            for name in ("push.json", "push-test"):
+                os.symlink(target, os.path.join(app_dir, name))
+            push_store.register(clean, token, "ios")
+            push.request_test(clean)
+            for name in ("push.json", "push-test"):
+                p = os.path.join(app_dir, name)
+                T.check(open(target).read() == "SENTINEL" and not os.path.islink(p) and mode_of(p) == 0o600,
+                        "S3. a link AT %s is replaced by the write, never written through" % name)
+            for lock in ("push.json.lock", "digest.json.lock"):
+                os.symlink(target, os.path.join(app_dir, lock))
+            T.check(refuses(push_store.register, clean, token, "ios") and refuses(digest._write, clean, digest._zero())
+                    and open(target).read() == "SENTINEL",
+                    "S3. a link AT push.json.lock or digest.json.lock is refused, not locked or created through")
+            os.makedirs(os.path.join(s.repo, ".heimdall", "app"))
+            connect_json = os.path.join(s.repo, ".heimdall", "app", "connect.json")
+            os.symlink(target, connect_json)
+            app = s.app("--relay", s.relay.url, "--bg")
+            app.wait_exit(60)
+            state = json.load(open(connect_json)) if os.path.isfile(connect_json) and not os.path.islink(connect_json) else {}
+            T.check(open(target).read() == "SENTINEL" and state.get("mode") == "relay" and mode_of(connect_json) == 0o600,
+                    "S3. a link AT connect.json is replaced by connect's own write, never written through", "app %s" % app.tail())
+        finally:
+            sleeper.kill()
+            sleeper.wait()
+
+
 # -- U: an unpaired `hmd app connect` client stays up and keeps its code claimable ---------------------------------------
 # The live bug (2026-10-09, `hmd app connect --bg`, no phone paired; relay-events.jsonl): the code window registered at 02:17:01,
 # was renewed ONCE at 02:23:02 -- 1.5 s after the relay's 360 s registration lapsed, which is the relay client's own default
@@ -1416,7 +1573,7 @@ def main():
              case_hook_hands_over_the_transcript, case_idle_stop_connect_reopens,
              case_connect_stays_up, case_connect_idle_bound, case_connect_pairing_expired_reinits,
              case_confirm_event_floor, case_confirm_stays_up, case_confirm_reject_renews_at_once, case_confirm_idle_bound,
-             case_no_links_followed, case_code_not_derivable)
+             case_no_links_followed, case_state_files_link_safe, case_code_not_derivable)
     wanted = sys.argv[1:]  # case names to run alone (a quick look while working on one); none runs them all
     for case in [c for c in cases if not wanted or c.__name__ in wanted]:
         try:

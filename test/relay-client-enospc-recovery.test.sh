@@ -316,7 +316,8 @@ down = {"on": False}
 
 
 def os_open(path, flags, *args, **kwargs):
-    if down["on"] and path == log_path:
+    # the log is opened by name inside the directory bin/lib/hmd_private_state.py vetted (dir_fd), not by its full path
+    if down["on"] and os.path.basename(path) == os.path.basename(log_path):
         raise enospc()
     return real_os_open(path, flags, *args, **kwargs)
 
