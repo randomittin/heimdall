@@ -21,7 +21,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 python3 -I - "$LIB" "$WORK" > "$WORK/driver.out" 2>&1 <<'PYDRIVER'
-import fcntl, importlib.util, os, signal, stat, sys, tempfile, threading
+import fcntl, importlib.util, os, signal, stat, subprocess, sys, tempfile, threading
 
 lib, work = sys.argv[1], sys.argv[2]
 spec = importlib.util.spec_from_file_location("hmd_private_state", lib)
@@ -610,6 +610,208 @@ def _open_read_level(level):
 
 for _level in LEVELS:
     _open_read_level(_level)
+
+
+# ---- ensure_dir / append (+ rotation) / the CLI's read and ensure -----------------------------------------------------
+# The relay client's event log (append + one-generation rotation), the status file, connect.json and the pair window all go
+# through these: none of them may follow a link at any level, at the file name or at the rotation name.
+
+def _ensure_level(level):
+    @case("ensure_dir: refused when %s is a link, nothing created or chmod'ed behind it" % level)
+    def _():
+        root, victim = linked(level)
+        before = snap(victim)
+        return refused(ps.ensure_dir, root, REL) and snap(victim) == before
+
+
+for _level in LEVELS:
+    _ensure_level(_level)
+
+
+@case("ensure_dir: makes a missing chain 0700 and is a no-op the second time")
+def _():
+    base = tempfile.mkdtemp(prefix="e.", dir=work)
+    root = os.path.join(base, "repo")
+    os.mkdir(root, 0o755)
+    ps.ensure_dir(root, REL)
+    ps.ensure_dir(root, REL)
+    return [mode(os.path.join(root, d)) for d in LEVELS] == [0o700] * 3
+
+
+@case("append: creates the file 0600 in 0700 directories, and a second append adds to the first")
+def _():
+    base = tempfile.mkdtemp(prefix="a.", dir=work)
+    root = os.path.join(base, "repo")
+    os.mkdir(root, 0o755)
+    ps.append(root, REL, "log", b"one\n")
+    ps.append(root, REL, "log", b"two\n")
+    p = os.path.join(root, REL, "log")
+    return open(p, "rb").read() == b"one\ntwo\n" and mode(p) == 0o600 and [mode(os.path.join(root, d)) for d in LEVELS] == [0o700] * 3
+
+
+@case("append: an existing 0644 file is tightened to 0600 and kept")
+def _():
+    root, _victim = tree()
+    p = os.path.join(root, REL, "log")
+    put(p, b"old\n", 0o644)
+    ps.append(root, REL, "log", b"new\n")
+    return open(p, "rb").read() == b"old\nnew\n" and mode(p) == 0o600
+
+
+@case("append: a link at the name is refused and the file it points at is untouched")
+def _():
+    root, victim = tree()
+    os.symlink(os.path.join(victim, "foreign"), os.path.join(root, REL, "log"))
+    before = snap(victim)
+    return refused(ps.append, root, REL, "log", b"x\n") and snap(victim) == before
+
+
+def _append_rotating_level(level):
+    @case("append: refused when %s is a link, nothing written behind it" % level)
+    def _():
+        root, victim = linked(level)
+        before = snap(victim)
+        return refused(ps.append, root, REL, "f", b"x\n", rotate_at=1) and snap(victim) == before
+
+
+for _level in LEVELS:
+    _append_rotating_level(_level)
+
+
+@case("append: rotates to <name>.1 once the file holds rotate_at bytes (clobbering the old .1) and starts a fresh file")
+def _():
+    root, _victim = tree()
+    p = os.path.join(root, REL, "log")
+    put(p, b"A" * 10, 0o600)
+    put(p + ".1", b"stale-generation", 0o600)
+    ps.append(root, REL, "log", b"fresh\n", rotate_at=10)
+    ps.append(root, REL, "log", b"more\n", rotate_at=10)
+    return (open(p + ".1", "rb").read() == b"A" * 10 and open(p, "rb").read() == b"fresh\nmore\n"
+            and mode(p) == 0o600 and mode(p + ".1") == 0o600)
+
+
+@case("append: below rotate_at nothing is rotated")
+def _():
+    root, _victim = tree()
+    p = os.path.join(root, REL, "log")
+    put(p, b"A" * 9, 0o600)
+    ps.append(root, REL, "log", b"x", rotate_at=10)
+    return open(p, "rb").read() == b"A" * 9 + b"x" and not os.path.exists(p + ".1")
+
+
+@case("append: a link planted at <name>.1 is replaced by the rotation, never written through")
+def _():
+    root, victim = tree()
+    p = os.path.join(root, REL, "log")
+    put(p, b"A" * 10, 0o600)
+    os.symlink(os.path.join(victim, "foreign"), p + ".1")
+    ps.append(root, REL, "log", b"fresh\n", rotate_at=10)
+    return (open(os.path.join(victim, "foreign"), "rb").read() == b"SENTINEL" and not os.path.islink(p + ".1")
+            and open(p + ".1", "rb").read() == b"A" * 10 and open(p, "rb").read() == b"fresh\n")
+
+
+@case("append: a FIFO at the name is refused at once (the open cannot hang the client)")
+def _():
+    root, _victim = tree()
+    os.mkfifo(os.path.join(root, REL, "fifo"))
+    signal.alarm(5)
+    try:
+        return refused(ps.append, root, REL, "fifo", b"x\n")
+    finally:
+        signal.alarm(0)
+
+
+@case("append: a looser file that is rotated is tightened first, so the old generation is 0600 too")
+def _():
+    root, _victim = tree()
+    p = os.path.join(root, REL, "log")
+    put(p, b"A" * 10, 0o644)
+    ps.append(root, REL, "log", b"fresh\n", rotate_at=10)
+    return open(p + ".1", "rb").read() == b"A" * 10 and mode(p + ".1") == 0o600 and mode(p) == 0o600
+
+
+@case("append(lock_name=, rotate_at=): the rotation and the write both wait for the flock, then land in order")
+def _():
+    root, _victim = tree()
+    p = os.path.join(root, REL, "log")
+    put(p, b"A" * 10, 0o600)
+    held = ps.open_lockfile(root, REL, "log.lock")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    done = threading.Event()
+
+    def writer():
+        ps.append(root, REL, "log", b"fresh\n", lock_name="log.lock", rotate_at=10)
+        done.set()
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    blocked = not done.wait(0.4)
+    untouched = contents(p) == b"A" * 10 and not os.path.exists(p + ".1")
+    os.close(held)
+    thread.join(5)
+    return blocked and untouched and done.is_set() and contents(p + ".1") == b"A" * 10 and contents(p) == b"fresh\n"
+
+
+@case("append(lock_name=, rotate_at=): a refused lock leaves the log un-rotated and unwritten, and nothing behind the link is touched")
+def _():
+    root, victim = tree()
+    p = os.path.join(root, REL, "log")
+    put(p, b"A" * 10, 0o600)
+    os.symlink(os.path.join(victim, "foreign"), os.path.join(root, REL, "log.lock"))
+    before = snap(victim)
+    return (refused(ps.append, root, REL, "log", b"x", lock_name="log.lock", rotate_at=10)
+            and contents(p) == b"A" * 10 and not os.path.exists(p + ".1") and snap(victim) == before)
+
+
+def cli(*args, stdin=b""):
+    return subprocess.run([sys.executable, "-I", lib] + list(args), input=stdin, capture_output=True, timeout=30)
+
+
+@case("cli read: prints a 0600 file and exits 0; a 0644 file needs --forbidden 022")
+def _():
+    root, _victim = tree()
+    put(os.path.join(root, REL, "j"), b'{"a": 1}', 0o600)
+    put(os.path.join(root, REL, "k"), b'{"b": 2}', 0o644)
+    ok_read = cli("read", "--root", root, "--rel", REL, "--name", "j")
+    strict = cli("read", "--root", root, "--rel", REL, "--name", "k")
+    loose = cli("read", "--root", root, "--rel", REL, "--name", "k", "--forbidden", "022")
+    return (ok_read.returncode == 0 and ok_read.stdout == b'{"a": 1}' and strict.returncode == 1 and strict.stdout == b""
+            and loose.returncode == 0 and loose.stdout == b'{"b": 2}')
+
+
+@case("cli read: a missing file, a link at the name and a link at any level print nothing and exit 1")
+def _():
+    root, victim = tree()
+    os.symlink(os.path.join(victim, "foreign"), os.path.join(root, REL, "link"))
+    runs = [cli("read", "--root", root, "--rel", REL, "--name", n, "--forbidden", "0") for n in ("absent", "link")]
+    for level in LEVELS:
+        lroot, _v = linked(level)
+        runs.append(cli("read", "--root", lroot, "--rel", REL, "--name", "f", "--forbidden", "0"))
+    return all(r.returncode == 1 and r.stdout == b"" for r in runs)
+
+
+@case("cli read: --limit refuses a bigger file")
+def _():
+    root, _victim = tree()
+    put(os.path.join(root, REL, "big"), b"x" * 100, 0o600)
+    small = cli("read", "--root", root, "--rel", REL, "--name", "big", "--limit", "99")
+    exact = cli("read", "--root", root, "--rel", REL, "--name", "big", "--limit", "100")
+    return small.returncode == 1 and small.stdout == b"" and exact.returncode == 0 and len(exact.stdout) == 100
+
+
+@case("cli ensure: creates the chain 0700 (exit 0); a link at any level exits 1 and creates nothing behind it")
+def _():
+    base = tempfile.mkdtemp(prefix="n.", dir=work)
+    root = os.path.join(base, "repo")
+    os.mkdir(root, 0o755)
+    made = cli("ensure", "--root", root, "--rel", REL)
+    good = made.returncode == 0 and [mode(os.path.join(root, d)) for d in LEVELS] == [0o700] * 3
+    for level in LEVELS:
+        lroot, lvictim = linked(level)
+        before = snap(lvictim)
+        r = cli("ensure", "--root", lroot, "--rel", REL)
+        good = good and r.returncode == 1 and snap(lvictim) == before
+    return good
 
 
 failures = 0

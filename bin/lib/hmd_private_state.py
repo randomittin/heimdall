@@ -23,11 +23,13 @@ points, and a plain read trusts whatever a checkout planted. The pattern here is
 
 Beyond write/read/remove: open_lockfile() hands a caller a flock-able descriptor of a file it owns under the same walk
 and lock() holds an exclusive flock on one for a with block; open_append() hands back an append-only descriptor (0600,
-vetted) and append() writes to it -- under a lock when given a lock name -- and fsyncs; truncate() empties a file in place
-and rename() renames inside the vetted directory (a link at the target is replaced, never written through); open_read()
-hands back a vetted read-only descriptor and stat_file() the stat of a marker file (its mtime, say) without following a
-link; read() takes the mode bits a caller tolerates -- `forbidden` for the file, `dir_forbidden` for the directory holding
-it -- for state another tool already keeps looser than 0600 (bin/heimdall-inbox-wake, bin/heimdall-inbox-deliver and
+vetted) and append() writes to it -- under a lock when given a lock name, after the one-generation rotation to <name>.1
+a log needs when given a size to rotate at (the relay client's event log) -- and fsyncs; truncate() empties a file in
+place and rename() renames inside the vetted directory (a link at the target is replaced, never written through);
+open_read() hands back a vetted read-only descriptor and stat_file() the stat of a marker file (its mtime, say) without
+following a link; ensure_dir() makes the directory itself, for a caller that wants to refuse BEFORE it starts anything;
+read() takes the mode bits a caller tolerates -- `forbidden` for the file, `dir_forbidden` for the directory holding it
+-- for state another tool already keeps looser than 0600 (bin/heimdall-inbox-wake, bin/heimdall-inbox-deliver and
 bin/lib/companion_ui_inbox.py use them for the inbox, its archive, their locks, markers and connect.json).
 
 The root itself is opened by its real path (the caller named it; /var -> /private/var and the like are fine).
@@ -35,6 +37,11 @@ The root itself is opened by its real path (the caller named it; /var -> /privat
 CLI (for the shell tools, so a state file never goes through a shell redirection):
     python3 hmd_private_state.py write  --root DIR --rel REL --name NAME     the file's bytes on stdin
     python3 hmd_private_state.py remove --root DIR --rel REL --name NAME
+    python3 hmd_private_state.py read   --root DIR --rel REL --name NAME [--limit BYTES] [--forbidden OCTAL]
+                                                                          the file's bytes on stdout; nothing and exit 1
+                                                                          when it is missing or not to be trusted
+                                                                          (read()'s rules: --forbidden defaults to 077)
+    python3 hmd_private_state.py ensure --root DIR --rel REL                 the directory made (0700) or verified
 exit 0 done, 1 refused or failed (the reason on stderr), 2 usage.
 """
 import contextlib
@@ -175,6 +182,13 @@ def create_once(root, rel, name, data):
         os.close(dirfd)
 
 
+def ensure_dir(root, rel):
+    """Make <root>/<rel> when it is missing and leave it a 0700 directory of ours, walking down without following a link.
+    OSError, with nothing created or changed behind it, when anything on the way is a link, a plain file or another
+    account's -- for a caller that must refuse before it starts anything, rather than at its first write."""
+    os.close(open_dir(root, rel, True))
+
+
 def _open_creating(dirfd, name, flags):
     """os.open(name, flags, 0o600) inside the vetted directory, tried again when it reports the name as missing. With O_CREAT in a
     directory we hold that cannot honestly be "not found" -- yet two processes creating the same new name at the same instant make
@@ -242,8 +256,27 @@ def open_append(root, rel, name):
     return _open_vetted(root, rel, name, os.O_WRONLY | os.O_APPEND, "a file")
 
 
-def _append(root, rel, name, data):
+def _open_for_append(root, rel, name, rotate_at):
+    """open_append(), for a log that is first rotated when it already holds `rotate_at` bytes: it is renamed to <name>.1
+    (rename(): whatever is there, a link included, is replaced, never written through) and the descriptor returned is a
+    fresh file's. The size is read from the descriptor open_append vetted -- and forced to 0600 -- so a link at the name
+    is refused before anything is rotated, and the generation that moves is already 0600."""
     fd = open_append(root, rel, name)
+    if rotate_at is None:
+        return fd
+    try:
+        if os.fstat(fd).st_size < rotate_at:
+            return fd
+    except BaseException:
+        os.close(fd)
+        raise
+    os.close(fd)
+    rename(root, rel, name, name + ".1")
+    return open_append(root, rel, name)
+
+
+def _append(root, rel, name, data, rotate_at):
+    fd = _open_for_append(root, rel, name, rotate_at)
     try:
         write_all(fd, data)
         os.fsync(fd)
@@ -251,15 +284,19 @@ def _append(root, rel, name, data):
         os.close(fd)
 
 
-def append(root, rel, name, data, lock_name=None):
+def append(root, rel, name, data, lock_name=None, rotate_at=None):
     """Append `data` (bytes) to <root>/<rel>/<name> and fsync it. With `lock_name` the write is made while holding the
-    exclusive flock on <root>/<rel>/<lock_name> (see lock()): append with a lock. OSError, with nothing written, when
-    anything on the way is a link, a plain file or another account's."""
+    exclusive flock on <root>/<rel>/<lock_name> (see lock()): append with a lock. With `rotate_at`, a file already
+    holding that many bytes is first renamed to <name>.1 -- clobbering any previous .1 -- and the data starts a fresh file
+    (the one generation a log needs). The rotation is a check-then-rename: a log with several writers passes `lock_name`,
+    which then covers the check, the rename and the write; one with a single writer needs no lock. OSError, with nothing
+    written, when anything on the way is a link, a plain file or another account's, or the name is a link, a directory or
+    a FIFO."""
     if lock_name is None:
-        _append(root, rel, name, data)
+        _append(root, rel, name, data, rotate_at)
         return
     with lock(root, rel, lock_name):
-        _append(root, rel, name, data)
+        _append(root, rel, name, data, rotate_at)
 
 
 def truncate(root, rel, name):
@@ -416,16 +453,32 @@ def remove(root, rel, name):
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(prog="hmd_private_state.py", description=__doc__.split("\n")[0])
-    parser.add_argument("action", choices=("write", "remove"))
+    parser.add_argument("action", choices=("write", "remove", "read", "ensure"))
     parser.add_argument("--root", required=True)
     parser.add_argument("--rel", default="")
-    parser.add_argument("--name", required=True)
+    parser.add_argument("--name")
+    parser.add_argument("--limit", type=int, default=65536)
+    parser.add_argument("--forbidden", default="077", help="octal mode bits the file must not carry (read)")
     args = parser.parse_args(argv)
+    if args.action != "ensure" and not args.name:
+        parser.error("--name is required for %s" % args.action)
+    try:
+        forbidden = int(args.forbidden, 8)
+    except ValueError:
+        parser.error("--forbidden is octal digits")
     try:
         if args.action == "write":
             write(args.root, args.rel, args.name, sys.stdin.buffer.read(1 << 20))
-        else:
+        elif args.action == "remove":
             remove(args.root, args.rel, args.name)
+        elif args.action == "ensure":
+            ensure_dir(args.root, args.rel)
+        else:
+            data = read(args.root, args.rel, args.name, args.limit, forbidden)
+            if data is None:
+                return 1
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
     except OSError as exc:
         print("hmd_private_state: %s" % exc, file=sys.stderr)
         return 1
