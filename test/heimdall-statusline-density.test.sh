@@ -67,9 +67,13 @@ render_case() {
   tier="$1"; color="$2"; cols="$(cols_for "$tier")"
   WS="$(mktemp -d)"; HOMED="$(mktemp -d)"; TMPD="$(mktemp -d)"
   mkdir -p "$WS/.heimdall"
-  # The Row1 session code is keyed by the machine's session-code seed, which a render only READS (a render writes
-  # nothing). The throwaway HOME gets a FIXED one, so the code -- and therefore every golden -- is the same on any
-  # machine, and the goldens keep covering the code's segment. No seed would mean no code on Row1 at all.
+  # The Row1 session code is the REPO's: keyed by the machine's session-code seed (a render only READS it -- a render
+  # writes nothing) and by the realpath of the repo, workspace.project_dir (pinned in the stdin JSON below). The
+  # throwaway HOME gets a FIXED seed and the JSON a FIXED project_dir, so the code -- and therefore every golden -- is
+  # the same on any machine and on every run, and the goldens keep covering the code's segment. No seed would mean no
+  # code on Row1 at all. This fixture used to get its determinism from a fixed session_id; the code is per-repo now
+  # (no session id), so that determinism moved to the repo path. Left unpinned, project_dir falls back to current_dir
+  # -- a fresh mktemp -d per render -- and the code, hence every full/mid golden, would change on every run.
   mkdir -p "$HOMED/.heimdall" && chmod 700 "$HOMED/.heimdall"
   printf '%s\n' "$CODE_SEED" > "$HOMED/.heimdall/session-code.key" && chmod 600 "$HOMED/.heimdall/session-code.key"
   printf '{"handle":"rj","seed":"rj","created":0}\n' > "$WS/.heimdall/identity.json"
@@ -78,7 +82,9 @@ render_case() {
   # a FRESH roster cache — three teammates so the Row1 team cluster renders.
   printf '%s\n' '[{"handle":"nadia","haid":"haid:nadia","verdict":"working","file":"auth.ts","age_seconds":4},{"handle":"arjun","haid":"haid:arjun","verdict":"watching","file":"db.go","age_seconds":9},{"handle":"priya","haid":"haid:priya","verdict":"deny","file":"api.py","age_seconds":6}]' \
     > "$WS/.heimdall/.roster-cache.json"
-  printf '{"workspace":{"current_dir":"%s","repo":{"name":"heimdall","branch":"statusline-v1"}},"model":{"display_name":"Opus 4.8"},"context_window":{"used_percentage":42,"total_input_tokens":128000},"session_id":"density","cost":{"total_cost_usd":0.87,"total_duration_ms":3840000},"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":7207},"seven_day":{"used_percentage":12}}}' "$WS" \
+  # project_dir is pinned on purpose (see the session-code note above): a fixed path -- it need not exist, only its
+  # realpath is read -- so the per-repo code is the same every run; current_dir stays the throwaway workspace.
+  printf '{"workspace":{"project_dir":"/hmd-density-fixture/repo","current_dir":"%s","repo":{"name":"heimdall","branch":"statusline-v1"}},"model":{"display_name":"Opus 4.8"},"context_window":{"used_percentage":42,"total_input_tokens":128000},"session_id":"density","cost":{"total_cost_usd":0.87,"total_duration_ms":3840000},"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":7207},"seven_day":{"used_percentage":12}}}' "$WS" \
     | env -i PATH="$PATH" HOME="$HOMED" \
         HEIMDALL_IDENTITY_DIR="$WS/.heimdall" HMD_HAID="$SEED" HMD_NOW=7 \
         HEIMDALL_CP_URL="http://127.0.0.1:1" COLUMNS="$cols" LANG=en_US.UTF-8 \
