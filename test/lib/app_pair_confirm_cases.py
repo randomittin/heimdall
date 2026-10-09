@@ -36,6 +36,7 @@ and the attended window's (see "C" below):
      HMD_PAIR_WINDOW_IDLE_H hours), and a phone turned down at the compare still has the window renewed at once
 """
 import argparse
+import concurrent.futures
 import contextlib
 import hashlib
 import hmac
@@ -1567,6 +1568,51 @@ def case_confirm_idle_bound():
                 "app rc %r, client gone %s, registrations %d then %d" % (rc, not alive(pid), n, len(s.relay.registrations)))
 
 
+# -- running them: a process per case, a few at a time ---------------------------------------------------------------------------
+# The cases are independent of one another -- each has its own sandbox (HOME, repo, TMPDIR, HEIMDALL_HOME), its own relay on a port
+# the OS hands out and its own clock -- and nearly all of their time is spent waiting: for a registration to lapse, a window to open,
+# a client to notice. Run one after another they took longer than the sweep's 400 s budget on a loaded machine. So with no case named,
+# every case runs in a process of its own (`app_pair_confirm_cases.py CASE`), CASE_JOBS at a time, and what each printed is reported in
+# the order the cases are declared, under one tally. Naming cases runs just those, in this process, one after another.
+CASE_JOBS = 6
+RESULT_LINE = re.compile(r"^  (ok|FAIL) +\d+\. (.*)$")
+TALLY_LINE = re.compile(r"^(\d+) passed, (\d+) failed$")
+
+
+def case_in_child(name):
+    """(exit code, everything it printed, stderr included) of one case run alone in a process of its own."""
+    proc = subprocess.run([sys.executable, os.path.realpath(__file__), name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return proc.returncode, proc.stdout
+
+
+def report_children(names, run_one=case_in_child):
+    """Run each named case through `run_one` (in a process of its own), CASE_JOBS at a time, and print what they printed in the order
+    given: the result lines renumbered as one run's, each child's own tally folded into this one. A child that ends without a tally
+    (killed, crashed) is one failure that says so. The exit status of the whole."""
+    passed = failed = shown = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CASE_JOBS) as pool:
+        children = [(name, pool.submit(run_one, name)) for name in names]
+        for name, child in children:
+            code, text = child.result()
+            tallied = False
+            for line in text.splitlines():
+                tally, result = TALLY_LINE.match(line), RESULT_LINE.match(line)
+                if tally:
+                    tallied = True
+                    passed, failed = passed + int(tally.group(1)), failed + int(tally.group(2))
+                elif result:
+                    shown += 1
+                    print("  %s%d. %s" % ("ok   " if result.group(1) == "ok" else "FAIL ", shown, result.group(2)))
+                elif line.strip():
+                    print(line)
+            if not tallied:
+                shown, failed = shown + 1, failed + 1
+                print("  FAIL %d. %s ended without a tally (exit %r) -- %s" % (shown, name, code, " ".join(text.split())[-300:]))
+            sys.stdout.flush()
+    T.passed, T.failed = passed, failed
+    return T.finish()
+
+
 def main():
     cases = (case_one_code, case_hooks, case_auto_pair, case_bg, case_identity_mismatch, case_no_sas_anywhere,
              case_notice_and_statusline, case_confirm, case_gh_signed_out_and_two_sessions, case_window_is_the_repos,
@@ -1576,8 +1622,10 @@ def main():
              case_connect_stays_up, case_connect_idle_bound, case_connect_pairing_expired_reinits,
              case_confirm_event_floor, case_confirm_stays_up, case_confirm_reject_renews_at_once, case_confirm_idle_bound,
              case_no_links_followed, case_state_files_link_safe, case_code_not_derivable)
-    wanted = sys.argv[1:]  # case names to run alone (a quick look while working on one); none runs them all
-    for case in [c for c in cases if not wanted or c.__name__ in wanted]:
+    wanted = sys.argv[1:]  # case names to run alone, here (a quick look while working on one); none runs them all, a process each
+    if not wanted:
+        return report_children([c.__name__ for c in cases])
+    for case in [c for c in cases if c.__name__ in wanted]:
         try:
             case()
         except Exception as exc:  # a case that dies is a failure, not a crash of the whole run

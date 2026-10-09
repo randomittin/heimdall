@@ -42,7 +42,9 @@
 #
 # Hermetic: HOME / HEIMDALL_HOME / TMPDIR are a temp dir, fixture repos are temp dirs, every server is reaped on EXIT,
 # every wait is a bounded poll. Secret-shaped strings are assembled at RUNTIME. No live relay client is ever signalled
-# (section 7's stand-in for one is a bash loop that merely carries the name in its argv, killed when the section ends).
+# (section 7's stand-in for one is a bash loop that merely carries `.../heimdall-relay-client --repo <repo>` in its argv, with
+# a 0600 connect.json naming it -- the two things `hmd app status` checks before it believes a relay session -- killed when the
+# section ends).
 
 set -u
 
@@ -880,10 +882,14 @@ else
   bad "7i. rc=$RC out=$OUT"
 fi
 mkdir -p "$ARMS_RELAY/.heimdall/app"
-bash -c 'while :; do sleep 0.2; done' heimdall-relay-client &
+# What bin/heimdall-app believes before it reports a relay session (3493a152: repo files are data, never an instruction): connect.json
+# is a 0600 file of ours, and the pid it names is a process whose argv is `.../heimdall-relay-client ... --repo <this repo>`. The
+# stand-in carries exactly that shape and nothing else.
+bash -c 'while :; do sleep 0.2; done' "$TMPROOT/heimdall-relay-client" --repo "$ARMS_RELAY" &
 ARMS_CLIENT=$!
 PIDS+=("$ARMS_CLIENT")
 jq -n --argjson pid "$ARMS_CLIENT" '{mode: "relay", pid_ui: null, pid_client: $pid, port: 1, relay: "https://relay.example.com", started_at: "2026-10-06T00:00:00Z"}' > "$ARMS_RELAY/.heimdall/app/connect.json"
+chmod 600 "$ARMS_RELAY/.heimdall/app/connect.json"
 OUT="$(hmd_app status --repo "$ARMS_RELAY")"; RC=$?
 kill "$ARMS_CLIENT" 2>/dev/null
 { wait "$ARMS_CLIENT"; } 2>/dev/null
