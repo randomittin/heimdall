@@ -70,9 +70,15 @@
 #                              code is the REPO's: the one every surface of this
 #                              repo shows, whichever Claude session asks. It is kept
 #                              registered while this runs -- the relay holds a
-#                              registration 360 s and connect renews it as it lapses,
-#                              for up to HMD_RELAY_CODE_WINDOW_S (10 minutes unless
-#                              set). No gh, signed out, a code clash or a relay that
+#                              registration 360 s and connect renews it on the pair
+#                              window's schedule (HMD_PAIR_WINDOW_RENEW_MIN_S 300,
+#                              HMD_PAIR_WINDOW_RENEW_LEAD_S 10: about every 350 s,
+#                              ahead of the lapse) for up to HMD_PAIR_WINDOW_IDLE_H
+#                              hours (default 4; HMD_RELAY_CODE_WINDOW_S sets the
+#                              seconds instead) with no phone paired, and retries a
+#                              renewal the relay could not take (--confirm, attended
+#                              at a terminal, keeps the client's own timings: renewed as
+#                              it lapses, 10 minutes). No gh, signed out, a code clash or a relay that
 #                              cannot do it prints one line and leaves the QR as it
 #                              was. When this repo's pair window (below) already
 #                              offers the code, connect says so and leaves the code to
@@ -134,7 +140,7 @@
 #                              goes out about every 5 minutes. Against a relay that keeps
 #                              a registration for less than the floor the code is
 #                              claimable only that long after each one. `hmd app connect`
-#                              renews as each of its registrations lapses while it runs.
+#                              renews on this schedule while it runs.
 #                              The window stops for good after HMD_PAIR_WINDOW_IDLE_H
 #                              hours (default 4, 0 = never) with no phone paired by its
 #                              code and no activity in ANY session of the repo -- the
@@ -1662,7 +1668,14 @@ cmd_connect_relay() {
   if [ "$code_requested" = true ]; then
     client_args+=(--code "$code")
     [ "$CONFIRM" != true ] && client_args+=(--no-confirm)
-    "$RELAY_CLIENT_BIN" "${client_args[@]}" <&4 3>&- 4>&- >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
+    # --confirm is an attended compare at this terminal: its window keeps the client's own timings (renewed 5 s after a rejected
+    # phone, offered 10 minutes). Without it nobody is watching a --bg window, so it runs on the pair window's schedule.
+    local win_s min_s lead_s launch=("$RELAY_CLIENT_BIN")
+    if [ "$CONFIRM" != true ]; then
+      read -r win_s min_s lead_s <<<"$(_connect_window_knobs)"
+      launch=(env HMD_RELAY_CODE_WINDOW_S="$win_s" HMD_RELAY_CODE_RENEW_MIN_S="$min_s" HMD_RELAY_CODE_RENEW_LEAD_S="$lead_s" "$RELAY_CLIENT_BIN")
+    fi
+    "${launch[@]}" "${client_args[@]}" <&4 3>&- 4>&- >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
     CLIENT_PID=$!
     exec 4<&-
     printf '%s\n' "$gh_tok" >&3
@@ -1930,6 +1943,26 @@ _pw_now() {
 # would be no floor at all).
 _pw_seconds_ok() {
   printf '%s' "$1" | grep -Eq '^[0-9]+(\.[0-9]+)?$' && awk -v n="$1" 'BEGIN { exit !(n > 0 && n <= 86400) }'
+}
+
+# _connect_window_knobs -- "WINDOW_S RENEW_MIN_S RENEW_LEAD_S": the code-window timings `hmd app connect` launches its relay client
+# with, the pair window's own (_pw_launch_client). An unpaired connect keeps its code claimable: the client renews it about every
+# RENEW_MIN_S seconds, RENEW_LEAD_S ahead of the relay's lapse and never after it, and offers it for WINDOW_S -- HMD_PAIR_WINDOW_IDLE_H
+# hours (default 4; 0 or over a day is the client's ceiling, 24 h) unless HMD_RELAY_CODE_WINDOW_S names the seconds. The client's own
+# defaults (renew 1.5 s after each lapse, give up after 10 minutes) left a `connect --bg` code answering 404 after about 12 minutes.
+_connect_window_knobs() {
+  local win min lead idle_h
+  min="${HMD_PAIR_WINDOW_RENEW_MIN_S:-${HMD_RELAY_CODE_RENEW_MIN_S:-300}}"
+  lead="${HMD_PAIR_WINDOW_RENEW_LEAD_S:-${HMD_RELAY_CODE_RENEW_LEAD_S:-10}}"
+  _pw_seconds_ok "$min" || min=300
+  _pw_seconds_ok "$lead" || lead=10
+  win="${HMD_RELAY_CODE_WINDOW_S:-}"
+  if ! _pw_seconds_ok "$win"; then
+    idle_h="${HMD_PAIR_WINDOW_IDLE_H:-4}"
+    printf '%s' "$idle_h" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || idle_h=4
+    win="$(awk -v h="$idle_h" 'BEGIN { s = h * 3600; if (h == 0 || s > 86400) s = 86400; if (s < 1) s = 1; printf "%d", s }')"
+  fi
+  printf '%s %s %s' "$win" "$min" "$lead"
 }
 
 # _pw_paired -- 0 while a phone that paired by this window's code is connected to this window's client: the client leaves

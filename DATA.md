@@ -622,9 +622,12 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
   GitHub id and login. Its invariant INV-39 — checked by a test that scans every Durable
   Object's storage and every log line after a whole pairing — is that the token is never
   persisted or logged. That is a promise about the relay's code (`relay/`), not something
-  the client can verify. The request repeats about once a minute as the relay's pairing
-  window renews, until a phone binds or the 10-minute code window
-  (`HMD_RELAY_CODE_WINDOW_S`) closes; the token is then dropped from memory. The
+  the client can verify. `hmd app connect` repeats the request on the pair window's schedule
+  -- about every 5 minutes, 10 s ahead of the relay's 360 s lapse -- until a phone binds or
+  `HMD_PAIR_WINDOW_IDLE_H` hours (default 4, at most 24; `HMD_RELAY_CODE_WINDOW_S` sets it in
+  seconds) pass; the token is then dropped from memory. A renewal the relay cannot take at
+  the moment (unreachable, throttling, failing) is tried again 30 s on
+  (`HMD_RELAY_CODE_RENEW_RETRY_S`) and does not close the window. The
   SessionStart hook `pair-window-start` does the same for every attended Claude Code
   session while `gh` is signed in, but backed off: it reads `gh auth token` again each time
   a window opens and sends it no more often than every 5 minutes
