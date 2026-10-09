@@ -31,10 +31,15 @@ and the back-off of the pair window's token (see "B / I" below):
   B  the window re-registers its code -- the gh token is in that request -- no more often than a floor, a margin ahead of
      the lapse, and the client rides out the relay purging its lapsed session instead of ending
   I  and stops for good after HMD_PAIR_WINDOW_IDLE_H hours with no pairing and no activity in the session
+and the attended window's (see "C" below):
+  C  `hmd app connect --confirm` renews its code on the same schedule as a plain connect (ahead of the relay's lapse, offered for
+     HMD_PAIR_WINDOW_IDLE_H hours), and a phone turned down at the compare still has the window renewed at once
 """
 import argparse
+import contextlib
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -1169,17 +1174,22 @@ def events_path(s):
     return os.path.join(s.sb.root, "connect-events.jsonl")
 
 
+def client_pid(s):
+    """The relay client's pid as connect.json records it, 0 until it does."""
+    try:
+        with open(os.path.join(s.repo, ".heimdall", "app", "connect.json"), encoding="utf-8") as f:
+            pid = json.load(f).get("pid_client")
+    except (OSError, ValueError):
+        return 0
+    return pid if isinstance(pid, int) else 0
+
+
 def connect_bg(s, **extra):
     """`hmd app connect --bg` against the scenario's relay on the scaled schedule, its event log on: (exit code, the client's pid)."""
     app = s.app("--relay", s.relay.url, "--bg", env=dict(CONNECT_KNOBS, HMD_RELAY_EVENT_LOG=events_path(s), **extra))
     app.close_stdin()
     rc = app.wait_exit(90)
-    try:
-        with open(os.path.join(s.repo, ".heimdall", "app", "connect.json"), encoding="utf-8") as f:
-            pid = json.load(f).get("pid_client")
-    except (OSError, ValueError):
-        pid = 0
-    return rc, pid if isinstance(pid, int) else 0
+    return rc, client_pid(s)
 
 
 def ending_events(s):
@@ -1271,6 +1281,133 @@ def case_connect_pairing_expired_reinits():
         T.check(opened is not None, "U3. ...and the re-initialised session pairs a phone that types the code", "")
 
 
+# -- C: `hmd app connect --confirm` renews on the same schedule as a plain connect ---------------------------------------------
+# aced1d76 put a plain connect on the pair window's schedule (renewed ahead of the relay's 360 s lapse, never sooner than a 300 s
+# floor, offered for HMD_PAIR_WINDOW_IDLE_H hours) and left --confirm on the client's own timings: the floor broke case 8's "n
+# rejects, the window renews". A phone turned down at the compare has had its session revoked, so the code is dark until the next
+# registration, and the floor would keep it dark for 300 s. A --confirm window now runs on the same schedule -- a terminal that sat
+# at a prompt through the relay's 360 s must not find its code gone -- and what a rejection asks for is an EVENT, renewed as soon
+# as HMD_RELAY_CODE_RENEW_EVENT_MIN_S (5 s) after the last registration allows, while the periodic timer keeps the schedule.
+# Scaled down like U: the relay keeps a registration 6 s (real 360 s) and purges a lapsed session 2 s on (60 s); floor 2 s, lead 2 s.
+def connect_confirm(s, **extra):
+    """`hmd app connect --confirm` at a pseudo-terminal against the scenario's relay on the scaled schedule (`extra` adds to or
+    replaces CONNECT_KNOBS), its event log on: (the app, the client's pid once connect.json names it, else 0)."""
+    app = s.app("--relay", s.relay.url, "--confirm", tty=True, env=dict(CONNECT_KNOBS, HMD_RELAY_EVENT_LOG=events_path(s), **extra))
+    wait_until(lambda: client_pid(s), 40)
+    return app, client_pid(s)
+
+
+def case_confirm_event_floor():
+    # In memory, against the relay's real window (a registration lapses 360 s on): the timer's renewal is on the shared schedule
+    # (300 s floor, 10 s lead: 350 s on, ahead of the lapse) and a renewal an event asks for -- a claim turned down at the compare --
+    # is due once the event floor allows (5 s), not once the schedule's does; and one the relay could not take is tried again 30 s on.
+    event_floor = getattr(CLIENT, "CODE_RENEW_EVENT_MIN_S", None)
+    T.check(isinstance(event_floor, float),
+            "C0. the relay client has a floor of its own for a renewal an event asks for (CODE_RENEW_EVENT_MIN_S), apart from the schedule's",
+            "got %r" % (event_floor,))
+    sandbox = H.Sandbox()
+    saved = (CLIENT.CODE_RENEW_MIN_S, CLIENT.CODE_RENEW_LEAD_S, event_floor)
+    try:
+        CLIENT.CODE_RENEW_MIN_S, CLIENT.CODE_RENEW_LEAD_S, CLIENT.CODE_RENEW_EVENT_MIN_S = 300.0, 10.0, 5.0
+        client = offline_client(sandbox)
+        began = time.monotonic()
+        client._code_state, client._code_deadline, client._last_renew_at = "open", began + 4 * 3600, began
+        client._schedule_lapse(time.time() + 360.0)
+        client._renew_now.clear()
+        timer = client._renewal_due() - began
+        client._renew_now.set()
+        asked = client._renewal_due() - began
+        T.check(abs(timer - 350.0) < 0.5 and abs(asked - 5.0) < 0.5,
+                "C0. a registration that lapses in 360 s is renewed 350 s on by the timer (10 s ahead of the lapse), and 5 s on when an event asks "
+                "-- not 300 s on, the schedule's floor", "timer %+.2f s, event %+.2f s" % (timer, asked))
+        client._last_renew_at = time.monotonic() - 20.0  # the claim was turned down 20 s after the registration
+        with contextlib.redirect_stdout(io.StringIO()):
+            client._renew_window()  # nothing listens at the relay's address: /pair/init is unreachable
+        retry_in = client._code_renew_at - time.monotonic()
+        T.check(abs(retry_in - CLIENT.CODE_RENEW_RETRY_S) < 1.0,
+                "C0. a renewal an event asked for that the relay could not take is tried again %d s on (HMD_RELAY_CODE_RENEW_RETRY_S), not "
+                "at the schedule's floor after the last registration" % CLIENT.CODE_RENEW_RETRY_S, "retry in %+.1f s" % retry_in)
+    finally:
+        CLIENT.CODE_RENEW_MIN_S, CLIENT.CODE_RENEW_LEAD_S, CLIENT.CODE_RENEW_EVENT_MIN_S = saved
+        sandbox.close()
+
+
+def case_confirm_stays_up():
+    with Scn(ttl=6) as s, purging_lapsed_sessions(s.relay, 2.0):
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        app, pid = connect_confirm(s)
+        if not (pid and wait_until(lambda: len(s.relay.registrations) >= 5, 90)):
+            T.check(False, "C1. (setup) connect --confirm registers the code five times, two registration lifetimes and more",
+                    "client pid %r, registrations %d, %s" % (pid, len(s.relay.registrations), app.tail()))
+            return
+        regs = list(s.relay.registrations)
+        lapses = [s.relay.get(r["session_id"]).exp for r in regs]
+        ahead = all(regs[i + 1]["at"] < lapses[i] for i in range(len(regs) - 1))
+        gaps = [regs[i + 1]["at"] - regs[i]["at"] for i in range(len(regs) - 1)]
+        T.check(ahead and min(gaps) >= 1.9 and len({r["code"] for r in regs}) == 1,
+                "C1. a --confirm client renews its code before each registration lapses (not after it), no sooner than the floor, always the same code",
+                "ahead %s gaps %s" % (ahead, [round(g, 1) for g in gaps]))
+        fresh = s.relay.get(s.relay.registrations[-1]["session_id"])
+        over = ending_events(s)
+        T.check(alive(pid) and fresh.exp > time.time() and not over,
+                "C1. after more than two registration lifetimes the client is still up, the code is claimable now, and nothing closed or ended it",
+                "alive %s, lapses in %.1f s, events %s" % (alive(pid), fresh.exp - time.time(), over))
+        seen = len(s.relay.registrations)
+        wait_until(lambda: len(s.relay.registrations) > seen, 20)  # a window has just opened: the next renewal is seconds off
+        sid = s.bind(s.relay.registrations[-1]["session_id"])
+        asked = app.wait_text("Approve [y/N]:", 30)
+        app.send("y\n")
+        app.wait_text("phone paired", 30)
+        opened, _pub = s.paired_state(sid)
+        T.check(asked and opened is not None, "C1. ...and a phone that types the code is still asked to compare, and pairs on y", app.tail())
+
+
+def case_confirm_reject_renews_at_once():
+    # The relay keeps a registration 16 s here, the schedule's floor is 12 s and its lead 4 s (a timer renewal 12 s on); the event
+    # floor is 0.3 s. A claim turned down at the terminal has its session revoked: the window must be back long before the floor, and
+    # from then on the timer must be the schedule's again.
+    knobs = {"HMD_PAIR_WINDOW_RENEW_MIN_S": "12", "HMD_PAIR_WINDOW_RENEW_LEAD_S": "4", "HMD_RELAY_CODE_RENEW_EVENT_MIN_S": "0.3"}
+    with Scn(ttl=16) as s:
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        app, _pid = connect_confirm(s, **knobs)
+        if not app.wait_text("SESSION CODE:", 60):
+            T.check(False, "C2. (setup) connect --confirm shows its session code", app.tail())
+            return
+        sid = s.bind(device_label="Pixel 9a")
+        asked = app.wait_text("Approve [y/N]:", 30)
+        answered_at = time.time()
+        app.send("n\n")
+        app.wait_text("pairing rejected", 30)
+        wait_until(lambda: len(s.relay.registrations) >= 2, 30)
+        regs = list(s.relay.registrations)
+        lag = regs[1]["at"] - answered_at if len(regs) >= 2 else float("inf")
+        T.check(asked and len(regs) >= 2 and lag < 4.0 and sid in s.relay.revokes and s.relay.frames_of(sid, "state") == []
+                and regs[1]["session_id"] != sid and regs[1]["code"] == regs[0]["code"],
+                "C2. n rejects: the session is revoked, nothing was sealed, and the same code is registered again at once -- not after the schedule's 12 s floor",
+                "asked %s, registrations %d, re-registered %.1f s after the answer, revoked %s" % (asked, len(regs), lag, sid in s.relay.revokes))
+        wait_until(lambda: len(s.relay.registrations) >= 3, 40)
+        regs = list(s.relay.registrations)
+        gap = regs[2]["at"] - regs[1]["at"] if len(regs) >= 3 else 0.0
+        before = len(regs) >= 3 and regs[2]["at"] < s.relay.get(regs[1]["session_id"]).exp
+        T.check(len(regs) >= 3 and gap >= 11.5 and before,
+                "C2. ...and from that registration on the timer keeps the schedule: the next renewal is no sooner than the 12 s floor after it, and before it lapses",
+                "registrations %d, gap %.1f s, before the lapse %s" % (len(regs), gap, before))
+
+
+def case_confirm_idle_bound():
+    # HMD_PAIR_WINDOW_IDLE_H bounds how long an unanswered --confirm window is offered, as it does a plain connect's: 0.004 h = 14.4 s
+    # here. The fixed 10 minutes it replaces would still be offering the code when this gives up looking.
+    with Scn(ttl=6) as s, purging_lapsed_sessions(s.relay, 2.0):
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        app, pid = connect_confirm(s, HMD_PAIR_WINDOW_IDLE_H="0.004")
+        rc = app.wait_exit(60)
+        n = len(s.relay.registrations)
+        time.sleep(3)
+        T.check(rc is not None and not alive(pid) and 2 <= n <= 6 and len(s.relay.registrations) == n,
+                "C3. an unanswered --confirm window lives as long as the idle bound (HMD_PAIR_WINDOW_IDLE_H), not a fixed 10 minutes: past it the code is not registered again and the client is gone",
+                "app rc %r, client gone %s, registrations %d then %d" % (rc, not alive(pid), n, len(s.relay.registrations)))
+
+
 def main():
     cases = (case_one_code, case_hooks, case_auto_pair, case_bg, case_identity_mismatch, case_no_sas_anywhere,
              case_notice_and_statusline, case_confirm, case_gh_signed_out_and_two_sessions, case_window_is_the_repos,
@@ -1278,6 +1415,7 @@ def main():
              case_idle_stop, case_idle_stop_off, case_idle_stop_activity, case_idle_stop_spares_a_pairing,
              case_hook_hands_over_the_transcript, case_idle_stop_connect_reopens,
              case_connect_stays_up, case_connect_idle_bound, case_connect_pairing_expired_reinits,
+             case_confirm_event_floor, case_confirm_stays_up, case_confirm_reject_renews_at_once, case_confirm_idle_bound,
              case_no_links_followed, case_code_not_derivable)
     wanted = sys.argv[1:]  # case names to run alone (a quick look while working on one); none runs them all
     for case in [c for c in cases if not wanted or c.__name__ in wanted]:

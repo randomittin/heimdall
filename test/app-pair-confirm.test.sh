@@ -80,11 +80,11 @@ else
   bad "the pair-window-start hook does not pass the session's transcript_path to the window"
 fi
 help_text="$("$APP" --help 2>/dev/null)"
-missing_docs="$(for want in HMD_PAIR_WINDOW_IDLE_H HMD_PAIR_WINDOW_RENEW_MIN_S HMD_PAIR_WINDOW_RENEW_LEAD_S --transcript; do
+missing_docs="$(for want in HMD_PAIR_WINDOW_IDLE_H HMD_PAIR_WINDOW_RENEW_MIN_S HMD_PAIR_WINDOW_RENEW_LEAD_S HMD_RELAY_CODE_RENEW_EVENT_MIN_S --transcript; do
   printf '%s' "$help_text" | grep -q -- "$want" || printf '%s ' "$want"
 done)"
 if [ -z "$missing_docs" ]; then
-  ok "the usage text documents the window's renewal floor, margin and idle stop (and --transcript)"
+  ok "the usage text documents the window's renewal floor, margin and idle stop (and --transcript), and the floor a turned-down --confirm claim renews at"
 else
   bad "the usage text does not mention: $missing_docs"
 fi

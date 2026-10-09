@@ -75,10 +75,15 @@
 #                              HMD_PAIR_WINDOW_RENEW_LEAD_S 10: about every 350 s,
 #                              ahead of the lapse) for up to HMD_PAIR_WINDOW_IDLE_H
 #                              hours (default 4; HMD_RELAY_CODE_WINDOW_S sets the
-#                              seconds instead) with no phone paired, and retries a
-#                              renewal the relay could not take (--confirm, attended
-#                              at a terminal, keeps the client's own timings: renewed as
-#                              it lapses, 10 minutes). No gh, signed out, a code clash or a relay that
+#                              seconds instead) with no phone paired, and tries a
+#                              renewal the relay could not take again 30 s on
+#                              (HMD_RELAY_CODE_RENEW_RETRY_S). --confirm keeps the
+#                              same schedule; a phone you turn down at the compare is
+#                              the exception: its window is renewed at once, as soon as
+#                              HMD_RELAY_CODE_RENEW_EVENT_MIN_S (default 5) seconds
+#                              after the last registration allow, so another claim can
+#                              follow -- one more send of the token each. No gh, signed
+#                              out, a code clash or a relay that
 #                              cannot do it prints one line and leaves the QR as it
 #                              was. When this repo's pair window (below) already
 #                              offers the code, connect says so and leaves the code to
@@ -1668,14 +1673,14 @@ cmd_connect_relay() {
   if [ "$code_requested" = true ]; then
     client_args+=(--code "$code")
     [ "$CONFIRM" != true ] && client_args+=(--no-confirm)
-    # --confirm is an attended compare at this terminal: its window keeps the client's own timings (renewed 5 s after a rejected
-    # phone, offered 10 minutes). Without it nobody is watching a --bg window, so it runs on the pair window's schedule.
-    local win_s min_s lead_s launch=("$RELAY_CLIENT_BIN")
-    if [ "$CONFIRM" != true ]; then
-      read -r win_s min_s lead_s <<<"$(_connect_window_knobs)"
-      launch=(env HMD_RELAY_CODE_WINDOW_S="$win_s" HMD_RELAY_CODE_RENEW_MIN_S="$min_s" HMD_RELAY_CODE_RENEW_LEAD_S="$lead_s" "$RELAY_CLIENT_BIN")
-    fi
-    "${launch[@]}" "${client_args[@]}" <&4 3>&- 4>&- >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
+    # The window runs on the pair window's schedule, --confirm included: a terminal left at a prompt through the relay's 360 s
+    # lapse must not find its code gone. What differs is a phone turned down at the compare -- its window is renewed at once
+    # (the fourth knob), the timer staying on the schedule.
+    local win_s min_s lead_s event_s
+    read -r win_s min_s lead_s event_s <<<"$(_connect_window_knobs "$CONFIRM")"
+    env HMD_RELAY_CODE_WINDOW_S="$win_s" HMD_RELAY_CODE_RENEW_MIN_S="$min_s" HMD_RELAY_CODE_RENEW_LEAD_S="$lead_s" \
+      HMD_RELAY_CODE_RENEW_EVENT_MIN_S="$event_s" \
+      "$RELAY_CLIENT_BIN" "${client_args[@]}" <&4 3>&- 4>&- >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
     CLIENT_PID=$!
     exec 4<&-
     printf '%s\n' "$gh_tok" >&3
@@ -1945,24 +1950,34 @@ _pw_seconds_ok() {
   printf '%s' "$1" | grep -Eq '^[0-9]+(\.[0-9]+)?$' && awk -v n="$1" 'BEGIN { exit !(n > 0 && n <= 86400) }'
 }
 
-# _connect_window_knobs -- "WINDOW_S RENEW_MIN_S RENEW_LEAD_S": the code-window timings `hmd app connect` launches its relay client
-# with, the pair window's own (_pw_launch_client). An unpaired connect keeps its code claimable: the client renews it about every
-# RENEW_MIN_S seconds, RENEW_LEAD_S ahead of the relay's lapse and never after it, and offers it for WINDOW_S -- HMD_PAIR_WINDOW_IDLE_H
-# hours (default 4; 0 or over a day is the client's ceiling, 24 h) unless HMD_RELAY_CODE_WINDOW_S names the seconds. The client's own
-# defaults (renew 1.5 s after each lapse, give up after 10 minutes) left a `connect --bg` code answering 404 after about 12 minutes.
+# _connect_window_knobs CONFIRM -- "WINDOW_S RENEW_MIN_S RENEW_LEAD_S EVENT_MIN_S": the code-window timings `hmd app connect` launches its
+# relay client with, the pair window's own (_pw_launch_client), `--confirm` (CONFIRM = true) included. An unpaired connect keeps its code
+# claimable: the client renews it about every RENEW_MIN_S seconds, RENEW_LEAD_S ahead of the relay's lapse and never after it, and offers
+# it for WINDOW_S -- HMD_PAIR_WINDOW_IDLE_H hours (default 4; 0 or over a day is the client's ceiling, 24 h) unless HMD_RELAY_CODE_WINDOW_S
+# names the seconds. The client's own defaults (renew 1.5 s after each lapse, give up after 10 minutes) left a `connect --bg` code
+# answering 404 after about 12 minutes. EVENT_MIN_S is the least time after a registration that a renewal an EVENT asks for is made. It is
+# RENEW_MIN_S -- a connect nobody is attending must not send the token faster than the schedule because a relay keeps ending its sessions --
+# except for --confirm: attended at a terminal, a phone turned down at the compare has had its session revoked, so its window is renewed
+# as soon as HMD_RELAY_CODE_RENEW_EVENT_MIN_S (default 5 s, never above RENEW_MIN_S) allows, while the timer stays on the schedule.
 _connect_window_knobs() {
-  local win min lead idle_h
+  local confirm="${1:-false}" win min lead idle_h event
   min="${HMD_PAIR_WINDOW_RENEW_MIN_S:-${HMD_RELAY_CODE_RENEW_MIN_S:-300}}"
   lead="${HMD_PAIR_WINDOW_RENEW_LEAD_S:-${HMD_RELAY_CODE_RENEW_LEAD_S:-10}}"
   _pw_seconds_ok "$min" || min=300
   _pw_seconds_ok "$lead" || lead=10
+  event="$min"
+  if [ "$confirm" = true ]; then
+    event="${HMD_RELAY_CODE_RENEW_EVENT_MIN_S:-5}"
+    _pw_seconds_ok "$event" || event=5
+    event="$(awk -v e="$event" -v m="$min" 'BEGIN { print (e < m ? e : m) }')"
+  fi
   win="${HMD_RELAY_CODE_WINDOW_S:-}"
   if ! _pw_seconds_ok "$win"; then
     idle_h="${HMD_PAIR_WINDOW_IDLE_H:-4}"
     printf '%s' "$idle_h" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || idle_h=4
     win="$(awk -v h="$idle_h" 'BEGIN { s = h * 3600; if (h == 0 || s > 86400) s = 86400; if (s < 1) s = 1; printf "%d", s }')"
   fi
-  printf '%s %s %s' "$win" "$min" "$lead"
+  printf '%s %s %s %s' "$win" "$min" "$lead" "$event"
 }
 
 # _pw_paired -- 0 while a phone that paired by this window's code is connected to this window's client: the client leaves
@@ -1998,7 +2013,9 @@ _pw_idle() {
 # session, and its events are nobody's to read. HMD_RELAY_CODE_WINDOW_S is the client's own cap on how long
 # one process offers the code (10 minutes by default); a window with no terminal runs for the sessions, so the cap is
 # raised to its ceiling (24 h) and the supervisor opens the next one when it ends. Each renewal sends the token again, so
-# the client is given the floor between two of them and the margin ahead of a lapse (PW_RENEW_MIN_S, PW_RENEW_LEAD_S).
+# the client is given the floor between two of them and the margin ahead of a lapse (PW_RENEW_MIN_S, PW_RENEW_LEAD_S) -- the
+# same floor for a renewal an event asks for, which a HMD_RELAY_CODE_RENEW_EVENT_MIN_S in the environment (meant for --confirm)
+# must not lower for a window nobody attends.
 _pw_launch_client() {
   local __var="$1" ctl
   ctl="$(umask 077; mktemp -d)" || return 1
@@ -2011,6 +2028,7 @@ _pw_launch_client() {
   rm -rf "$ctl"
   HMD_RELAY_EVENT_LOG="" HMD_RELAY_CODE_WINDOW_S="${HMD_RELAY_CODE_WINDOW_S:-86400}" \
     HMD_RELAY_CODE_RENEW_MIN_S="$PW_RENEW_MIN_S" HMD_RELAY_CODE_RENEW_LEAD_S="$PW_RENEW_LEAD_S" \
+    HMD_RELAY_CODE_RENEW_EVENT_MIN_S="$PW_RENEW_MIN_S" \
     "$RELAY_CLIENT_BIN" --relay "$PW_RELAY" --repo "$PW_REPO" --ui-port 0 --public-host "$PW_RELAY_HOST" \
       --code "$PW_CODE" --no-confirm --code-only <&4 3>&- 4>&- >/dev/null 2>&1 &
   PW_CLIENT_PID=$!
