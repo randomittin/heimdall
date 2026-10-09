@@ -1714,6 +1714,125 @@ if [ "$(printf '%s' "$HEALTH_BODY" | jq -r '[.ok, .service, .pid] | @csv' 2>/dev
 if [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 -H 'Host: evil.example' "http://127.0.0.1:$P1/healthz")" = "403" ]; then ok "/healthz refuses a Host that is not the loopback origin (403)"; else bad "/healthz answered a foreign Host"; fi
 if [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 "http://127.0.0.1:$P1/api/state")" = "401" ]; then ok "/api/state still demands the token (401)"; else bad "/api/state answered without a token"; fi
 
+# /healthz is the one answer given without the token, so every way past its conditions must land on the ordinary gate
+# (401, or 403 for a foreign Host) and never on the health body: exact "/healthz" only (no query, prefix, dot-segment,
+# encoded, case, suffix or absolute-form variant -- and none of them reaches another route), GET only, a loopback peer,
+# a ui that is not exposed (--allow-host / --trust-proxy), no proxy header, one Host that is the ui's own loopback origin.
+hz_code() { curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 --path-as-is "$@"; }
+HZ_BAD=""
+for hz_path in '/healthz?x=1' '/healthz?token=wrong' '/healthz/' '/healthz/../api/state' '/healthz/..%2fapi%2fstate' '/healthz%2f' '/%68ealthz' '/healthz;x=1' '//healthz' '/HEALTHZ' '/healthz.json' '/healthz%00'; do
+  [ "$(hz_code "http://127.0.0.1:$P1$hz_path")" = "401" ] || HZ_BAD="$HZ_BAD $hz_path"
+done
+if [ -z "$HZ_BAD" ]; then ok "/healthz: every path variant (query, prefix, dot-segment, encoded, case, suffix) meets the token gate (401)"; else bad "path variants not refused with 401:$HZ_BAD"; fi
+if [ "$(hz_code -X POST "http://127.0.0.1:$P1/healthz")" = "401" ] && [ "$(hz_code -I "http://127.0.0.1:$P1/healthz")" = "401" ]; then ok "/healthz: POST and HEAD meet the token gate (GET only)"; else bad "/healthz answered POST or HEAD"; fi
+if [ "$(hz_code -H 'X-Forwarded-For: 203.0.113.9' "http://127.0.0.1:$P1/healthz")" = "401" ] && [ "$(hz_code -H 'Host: 127.0.0.1:1' "http://127.0.0.1:$P1/healthz")" = "403" ]; then ok "/healthz: a proxy header (401) or another port in Host (403) is refused"; else bad "/healthz answered a proxied or wrong-port request"; fi
+
+# an exposed ui (--allow-host, or --trust-proxy) has no /healthz at all: behind a Funnel or a proxy every peer is the local
+# proxy, so a loopback peer address proves nothing
+t_exposed_healthz() {
+  local label="$1" port pid waited=0 body
+  shift
+  port="$(t_free_port)"
+  ( cd "$D" && exec "$UI" --repo "$D" --port "$port" --no-open "$@" ) >/dev/null 2>&1 &
+  pid=$!
+  PIDS+=("$pid")
+  while ! { : <>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  body="$(curl -s --noproxy '*' --max-time 5 "http://127.0.0.1:$port/healthz")"
+  if [ "$(hz_code "http://127.0.0.1:$port/healthz")" = "401" ] && ! printf '%s' "$body" | grep -q '"pid"'; then ok "/healthz: an exposed ui ($label) does not serve it, even to a loopback peer"; else bad "exposed ui ($label) answered /healthz: $body"; fi
+}
+t_exposed_healthz "--allow-host" --allow-host funnel.example.ts.net
+t_exposed_healthz "--trust-proxy" --trust-proxy
+
+# the real handler, driven as if the request came from each peer (a socketpair carries the bytes; the peer address is
+# what the handler reads as client_address): non-loopback peers, exposed servers, Host, header and method variants
+HZ_REPO="$(make_repo)"
+IFS= read -r -d '' HZ_PY <<'HZ_PY_EOF' || true
+import importlib.util, json, os, socket, sys
+
+spec = importlib.util.spec_from_file_location("hmd_ui_under_test", sys.argv[1])
+ui = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ui)
+root = os.path.realpath(sys.argv[2])
+cache = ui.StateCache(root, {"bind": "loopback", "public_host": None, "trust_proxy": False})
+plain = ui.UIServer(0, "tok", cache)
+published = ui.UIServer(0, "tok", cache, allow_hosts=("funnel.example.ts.net",))
+proxied = ui.UIServer(0, "tok", cache, trust_proxy=True)
+
+
+def serve(server, peer, method="GET", path="/healthz", host=None, extra=""):
+    if host is None:
+        host = "127.0.0.1:%d" % server.port
+    request = ("%s %s HTTP/1.1\r\nHost: %s\r\n%sConnection: close\r\n\r\n" % (method, path, host, extra)).encode()
+    client, handler_end = socket.socketpair()
+    client.settimeout(5)
+    client.sendall(request)
+    ui.UIHandler(handler_end, (peer, 40000), server)
+    handler_end.close()
+    raw = b""
+    while True:
+        chunk = client.recv(65536)
+        if not chunk:
+            break
+        raw += chunk
+    client.close()
+    head, _, body = raw.partition(b"\r\n\r\n")
+    return int(head.split(b" ", 2)[1]), body.decode("utf-8", "replace")
+
+
+lines = []
+
+
+def check(label, good):
+    lines.append("%s %s" % ("ok" if good else "FAIL", label))
+
+
+def refused(result, want=None):
+    status, body = result
+    return status != 200 and '"pid"' not in body and (want is None or status == want)
+
+
+for peer in ("127.0.0.1", "::1"):
+    status, body = serve(plain, peer)
+    doc = json.loads(body) if status == 200 else {}
+    check("loopback peer %s: 200 with only ok/service/schema/pid, no path" % peer,
+          status == 200 and set(doc) == {"ok", "service", "schema", "pid"} and doc["ok"] is True
+          and doc["pid"] == os.getpid() and root not in body)
+for peer in ("10.1.2.3", "192.168.0.7", "203.0.113.9", "fe80::1", "", "not-an-address"):
+    check("non-loopback peer %r: refused with 401, no pid" % peer, refused(serve(plain, peer), 401))
+for label, server in (("--allow-host", published), ("--trust-proxy", proxied)):
+    check("exposed server (%s): refused with 401 even for a loopback peer" % label, refused(serve(server, "127.0.0.1"), 401))
+check("Host localhost:PORT is the loopback origin too: 200", serve(plain, "127.0.0.1", host="localhost:%d" % plain.port)[0] == 200)
+for number, host in enumerate(("127.0.0.1", "127.0.0.1:1", "localhost", "evil.example", "evil.example:%d" % plain.port, "funnel.example.ts.net"), 2):
+    check("Host %r: refused with 403" % host, refused(serve(plain, "127.0.0.%d" % number, host=host), 403))
+check("two Host headers: refused with 401", refused(serve(plain, "127.0.0.1", extra="Host: evil.example\r\n"), 401))
+for header in ("X-Forwarded-For: 203.0.113.9", "Forwarded: for=203.0.113.9", "X-Real-IP: 203.0.113.9", "Via: 1.1 proxy"):
+    check("proxy header %s: refused with 401" % header.split(":")[0], refused(serve(plain, "127.0.0.1", extra=header + "\r\n"), 401))
+for method in ("HEAD", "POST"):
+    check("method %s: refused with 401" % method, refused(serve(plain, "127.0.0.1", method=method), 401))
+check("method PUT: refused", refused(serve(plain, "127.0.0.1", method="PUT")))
+for path in ("/healthz?x=1", "/healthz/", "/healthz/../api/state", "//healthz", "/healthz%2e", "http://127.0.0.1:%d/healthz" % plain.port):
+    check("path %s: refused with 401" % path, refused(serve(plain, "127.0.0.1", path=path), 401))
+for server in (plain, published, proxied):
+    server.server_close()
+print("\n".join(lines))
+print("done")
+HZ_PY_EOF
+HZ_PY_OUT="$(python3 -I -c "$HZ_PY" "$REPO/sentinels/hmd-ui.py" "$HZ_REPO" 2>&1)"
+if [ "$(printf '%s\n' "$HZ_PY_OUT" | tail -1)" = "done" ]; then
+  while IFS= read -r hz_line; do
+    case "$hz_line" in
+      "ok "*) ok "/healthz handler: ${hz_line#ok }" ;;
+      "FAIL "*) bad "/healthz handler: ${hz_line#FAIL }" ;;
+    esac
+  done <<< "$HZ_PY_OUT"
+else
+  bad "/healthz handler matrix did not run to the end: $(printf '%s' "$HZ_PY_OUT" | tail -5)"
+fi
+rm -rf "$HZ_REPO"
+
 # 1. the live bug: a stale ui for THIS repo, no relay client -- connect reuses it and starts the client against it
 T_RELAY_LOG="$TMPROOT/stale-reuse-relay.log"; : > "$T_RELAY_LOG"
 STALE_PID="$T_UI_PID"

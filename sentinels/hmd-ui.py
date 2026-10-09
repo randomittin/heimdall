@@ -42,13 +42,18 @@ remote controls, bin/lib/companion_ui_controls.py; both behind the same token / 
                       (the digest covers `panels`, so a `hmd ui panel set` lands as soon
                       as the poller sees the panels dir move -- WATCH_INTERVAL_S plus one
                       cheap collect -- not at the next POLL_INTERVAL_S)
-    /healthz          liveness, the ONE route answered without the token, and only for a request whose Host
-                      is this server's own loopback origin (127.0.0.1:<port> / localhost:<port> -- never an
-                      --allow-host name, so a Funnel or a rebound DNS name still meets the token gate):
-                      {"ok", "service": "hmd-ui", "schema", "pid"}; 200 while the state poller has made
-                      progress in the last HEALTH_STALE_S seconds, 503 when it has not. It carries no state,
-                      no path and no token -- `hmd app connect` asks it whether a `hmd ui` left running on its
-                      port is the live process it found there (pid) and still working, before reusing it
+    /healthz          liveness for the local `hmd app connect`, the ONE route answered without the token. Served
+                      only for a GET whose request target is exactly "/healthz" (no query, fragment, prefix,
+                      dot-segment, encoded, case or absolute-form variant), from a loopback peer, by a ui that is
+                      NOT exposed (no --allow-host, no --trust-proxy: behind a Funnel or a proxy every peer is the
+                      local proxy, so the peer address proves nothing and the route is simply absent), with no
+                      proxy header (X-Forwarded-For, Forwarded, X-Real-IP, Via) and exactly one Host header, this
+                      server's own loopback origin (127.0.0.1:<port> / localhost:<port>). Anything else meets the
+                      ordinary gate below, exactly as an unauthenticated request to any other route does.
+                      {"ok", "service": "hmd-ui", "schema", "pid"}: 200 while the state poller has made progress
+                      in the last HEALTH_STALE_S seconds, 503 when it has not. No state, no path, no token --
+                      connect asks it whether the `hmd ui` left running on its port is the live process it found
+                      there (pid) and still working, before reusing it
 
 Auth, in this order, on EVERY route (but /healthz above):
     0. Host header must be 127.0.0.1:<port>, localhost:<port>, or one of --allow-host's
@@ -85,6 +90,7 @@ import argparse
 import hashlib
 import hmac
 import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -124,6 +130,7 @@ MAX_CONNECTIONS = 64           # A2: hard cap on concurrent connections/threads,
 MAX_SSE_STREAMS = 8            # A2: lower cap on live /api/events streams specifically
 SSE_RETRY_AFTER_S = 5          # A2: Retry-After seconds on the 503 an over-cap SSE request gets
 HEALTH_STALE_S = 30.0          # /healthz says 503 once the state poller has completed no pass for this long
+HEALTH_PROXY_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Via")   # any one means a hop forwarded the request: no /healthz
 
 # ── sources: the complete list of what this process reads ────────────────────
 # Relative to the target repo root. `--print-sources` prints exactly these (made
@@ -1506,6 +1513,14 @@ class StateCache:
 
 
 # ── HTTP layer ────────────────────────────────────────────────────────────────
+def _is_loopback_addr(addr):
+    """True for a loopback address (127.0.0.0/8, ::1); False for any other, and for text that is no address at all."""
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return False
+
+
 class UIServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False   # a stale reuse could hand another process our port
@@ -1535,6 +1550,7 @@ class UIServer(ThreadingHTTPServer):
                 self.public_host = n
             hosts.add(n)
             names.add(n)
+        self.exposed = bool(self.public_host) or self.trust_proxy   # published behind a proxy / Funnel: no /healthz
         self.allowed_hosts = frozenset(hosts)
         self.allow_host_names = frozenset(names)  # bare names; _host_ok matches these w/ ANY port
         self._backoff_lock = threading.Lock()
@@ -1725,6 +1741,9 @@ class UIHandler(BaseHTTPRequestHandler):
         self._gate_then(self._route_post)
 
     def do_GET(self):
+        if self._health_request():
+            self._serve_health()
+            return
         self._gate_then(self._route)
 
     def _route_post(self, _query):
@@ -1841,16 +1860,25 @@ class UIHandler(BaseHTTPRequestHandler):
         queued = len(INBOX.list_pending(root))
         self._send_json(202, {"id": record["id"], "queued": queued})
 
-    def _loopback_origin(self):
-        """True when the Host header is exactly this server's own loopback origin -- NOT an --allow-host name."""
-        host = (self.headers.get("Host") or "").strip().lower()
-        return host in ("127.0.0.1:%d" % self.server.port, "localhost:%d" % self.server.port)
+    def _health_request(self):
+        """True only for the one request /healthz answers without the token (the conditions are listed in the module
+        docstring). Each is a way the route stays out of reach of anything but the local connect: the RAW request
+        target is compared (the stdlib folds "//healthz" into "/healthz" before do_GET runs), an exposed ui has no
+        such route, the peer must be loopback, a proxy header means a hop forwarded the request, and the Host -- which
+        a client picks freely -- is the last of the checks, never the only one. Everything else is left to _gate_then."""
+        server = self.server
+        words = self.requestline.split()
+        hosts = self.headers.get_all("Host") or []
+        return (self.command == "GET" and len(words) >= 2 and words[1] == "/healthz"
+                and not server.exposed
+                and _is_loopback_addr(self.client_address[0])
+                and all(self.headers.get(h) is None for h in HEALTH_PROXY_HEADERS)
+                and len(hosts) == 1
+                and hosts[0].strip().lower() in ("127.0.0.1:%d" % server.port, "localhost:%d" % server.port))
 
     def _serve_health(self):
-        """GET /healthz (see the module docstring): the one answer given without the token. Reached only
-        for a loopback-origin Host, so the DNS-rebinding and Funnel gates are untouched; it reads no source,
-        counts toward no backoff, and says only that this process is an hmd-ui, which one, and whether its
-        state poller is making progress."""
+        """GET /healthz, reached only through _health_request: it reads no source, counts toward no backoff, and
+        says only that this process is an hmd-ui, which one, and whether its state poller is making progress."""
         idle = self.server.cache.idle_s()
         quiet = idle if idle is not None else time.monotonic() - self.server.started_at
         ok = quiet < HEALTH_STALE_S
@@ -1858,9 +1886,6 @@ class UIHandler(BaseHTTPRequestHandler):
 
     def _gate_then(self, handler):
         parts = urlsplit(self.path)
-        if self.command in ("GET", "HEAD") and parts.path == "/healthz" and self._loopback_origin():
-            self._serve_health()
-            return
         query = parse_qs(parts.query, keep_blank_values=False)
         ip = self._client_ip()
         host_ok = self._host_ok()
