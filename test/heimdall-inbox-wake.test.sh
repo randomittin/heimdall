@@ -6,7 +6,9 @@
 # companion), while the session is idle, nobody holds the Stop long-poll and nobody types; inside tmux it
 # types a FIXED prompt into the session's own pane instead. Tests 15-20 are the security cases: forged
 # or dropped inbox, no live companion, text in argv, a pane that is not this session's, exit 2 on bad
-# arguments, unquoted interpolation in hooks.json. Exit 0 = every proof holds. Own-file run only.
+# arguments, unquoted interpolation in hooks.json. Tests 21-22 are the link cases: a symlink planted at any level of
+# .heimdall/ui/wake (or at one of the files in it) never redirects a write, chmod, unlink or lock outside the repo and
+# nothing behind it is believed. Exit 0 = every proof holds. Own-file run only.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -243,6 +245,92 @@ for ID in inbox-wake-register inbox-wake-arm-start inbox-wake-arm-stop; do
   printf '%s' "$C" | grep -q -E 'eval |`|INPUT=|jq |\| *(ba)?sh' && bad "$ID: evals or interpolates the payload" || ok "$ID: no eval, backtick, jq or payload variable"
   printf '%s' "$C" | grep -q '"$HOOK"' && ok "$ID: the binary path is quoted" || bad "$ID: unquoted binary path"
 done
+
+echo "21. SECURITY (links in the tree): a symlink at .heimdall, .heimdall/ui, .heimdall/ui/wake or .heimdall/app never redirects a write, chmod, unlink or lock outside the repo, and nothing behind it is believed:"
+# The attacker is a repository (or another process) that ships a symlink at one level of the wake state, pointing OUTSIDE the
+# repo. Each case builds a perfectly valid project (private ui, live companion, a pending phone record, a dead pid's
+# leftovers), moves ONE level of it out into the victim directory $V and leaves a symlink in its place, so the link is the
+# only thing wrong. $V is snapshotted first: after the run every entry (mode, size, mtime, content) must be what it was.
+snap() {
+  python3 - "$1" <<'PYSNAP'
+import hashlib, os, sys
+root = sys.argv[1]
+rows = ["ROOT %o %d" % (os.lstat(root).st_mode, os.lstat(root).st_mtime_ns)]
+for dp, dns, fns in os.walk(root):
+    for n in dns + fns:
+        p = os.path.join(dp, n)
+        st = os.lstat(p)
+        h = hashlib.sha1(open(p, "rb").read()).hexdigest() if os.path.isfile(p) and not os.path.islink(p) else "-"
+        rows.append("%s %o %d %d %s" % (os.path.relpath(p, root), st.st_mode, st.st_size, st.st_mtime_ns, h))
+print("\n".join(sorted(rows)))
+PYSNAP
+}
+newvictim() { V="$(mktemp -d "$WORK/victim.XXXXXX")"; chmod 755 "$V"; printf 'SENTINEL' > "$V/foreign"; chmod 644 "$V/foreign"; }
+untouched() { [ "$(snap "$V")" = "$BEFORE" ]; }
+shown() { diff <(printf '%s\n' "$BEFORE") <(snap "$V") | head -4 | tr '\n' ' '; }
+reg() { printf '{"session_id":"s9"}' | "$BIN" register --repo "$D" --pid "$CP"; RC=$?; }
+linked() {
+  newproj; rec k1 "hi" companion; newvictim
+  sleep 0.1 & KD=$!; wait "$KD" 2>/dev/null
+  for f in "$KD.json" "$KD.lock"; do printf '{}' > "$D/.heimdall/ui/wake/$f"; chmod 600 "$D/.heimdall/ui/wake/$f"; done
+  case "$1" in
+    heimdall) mv "$D/.heimdall" "$V/t"; ln -s "$V/t" "$D/.heimdall" ;;
+    ui)       mv "$D/.heimdall/ui" "$V/t"; ln -s "$V/t" "$D/.heimdall/ui" ;;
+    wake)     mv "$D/.heimdall/ui/wake" "$V/t"; ln -s "$V/t" "$D/.heimdall/ui/wake" ;;
+    app)      mv "$D/.heimdall/app" "$V/t"; ln -s "$V/t" "$D/.heimdall/app" ;;
+  esac
+  chmod 755 "$V/t"; BEFORE="$(snap "$V")"
+}
+for L in heimdall ui wake; do
+  linked "$L"; reg
+  [ "$RC" -eq 0 ] && untouched && ok "register through a symlinked $L: exit 0; nothing behind the link written, chmod'ed, created or pruned" || bad "register via $L link: rc=$RC changed: $(shown)"
+done
+for L in heimdall ui wake app; do
+  linked "$L"; watch 2
+  quiet_wake && untouched && ok "watch through a symlinked $L: no wake; no lock, ledger or registration touched behind the link" || bad "watch via $L link: rc=$RC out=$OUT changed: $(shown)"
+done
+linked heimdall; OUT="$("$BIN" status --repo "$D")"
+[ "$OUT" = '{"registered": 0, "pending": 0}' ] && untouched && ok "status through a symlinked .heimdall sees no sessions and no pending record" || bad "status via link: $OUT changed: $(shown)"
+newproj; newvictim; rm -rf "$D/.heimdall"; ln -s "$V" "$D/.heimdall"; BEFORE="$(snap "$V")"; reg
+[ "$RC" -eq 0 ] && untouched && ok "register: .heimdall linked to an empty outside directory -- nothing is created inside it" || bad "created behind the link: rc=$RC $(shown)"
+newproj; newvictim; rm -rf "$D/.heimdall/ui/wake"; ln -s "$V/not-there" "$D/.heimdall/ui/wake"; BEFORE="$(snap "$V")"; reg
+[ "$RC" -eq 0 ] && untouched && [ ! -e "$V/not-there" ] && ok "register: wake is a dangling link -- the target is not created" || bad "dangling wake link: rc=$RC $(shown)"
+
+echo "22. SECURITY (links at the file): a link at the registration, a lock, the ledger, a dead pid's leftover or a heartbeat is replaced or ignored -- never written, chmod'ed, locked or believed:"
+mode_of() { python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$1"; }
+newproj; newvictim; BEFORE="$(snap "$V")"; ln -sf "$V/foreign" "$D/.heimdall/ui/wake/$CP.json"; reg
+[ "$RC" -eq 0 ] && untouched && [ ! -L "$D/.heimdall/ui/wake/$CP.json" ] && [ "$(jq -r .pid "$D/.heimdall/ui/wake/$CP.json")" = "$CP" ] && ok "registration: a link at wake/<pid>.json is replaced by the real record; the file it pointed at is untouched" || bad "registration link: rc=$RC $(shown)"
+newproj; newvictim; sleep 0.1 & KD=$!; wait "$KD" 2>/dev/null
+ln -s "$V/foreign" "$D/.heimdall/ui/wake/$KD.json"; ln -s "$V/missing" "$D/.heimdall/ui/wake/$KD.lock"; BEFORE="$(snap "$V")"; reg
+[ "$RC" -eq 0 ] && untouched && [ ! -e "$V/missing" ] && [ ! -L "$D/.heimdall/ui/wake/$KD.json" ] && [ ! -L "$D/.heimdall/ui/wake/$KD.lock" ] && ok "prune: a dead pid's leftover that is a link goes as a link; what it pointed at stays" || bad "prune of links: rc=$RC $(shown)"
+newproj; newvictim; rec k2 hi companion; ln -s "$V/foreign" "$D/.heimdall/ui/wake/$CP.lock"; BEFORE="$(snap "$V")"; watch 2
+quiet_wake && untouched && ok "instance lock: wake/<pid>.lock linked to a foreign file -- never opened or locked, no wake" || bad "instance lock link: rc=$RC out=$OUT $(shown)"
+newproj; newvictim; rec k3 hi companion; ln -s "$V/created-through-link" "$D/.heimdall/ui/wake/$CP.lock"; BEFORE="$(snap "$V")"; watch 2
+quiet_wake && untouched && [ ! -e "$V/created-through-link" ] && ok "instance lock: a dangling link at wake/<pid>.lock is not created through" || bad "dangling instance lock: rc=$RC out=$OUT $(shown)"
+newproj; newvictim; rec k4 hi companion; ln -s "$V/foreign" "$D/.heimdall/ui/inbox-wake.lock"; BEFORE="$(snap "$V")"; watch 2
+quiet_wake && untouched && ok "ledger lock: inbox-wake.lock linked to a foreign file -- not opened, not chmod'ed, no wake" || bad "ledger lock link: rc=$RC out=$OUT $(shown)"
+newproj; newvictim; rec k5 hi companion; ln -s "$V/created-through-link" "$D/.heimdall/ui/inbox-wake.lock"; BEFORE="$(snap "$V")"; watch 2
+quiet_wake && untouched && [ ! -e "$V/created-through-link" ] && ok "ledger lock: a dangling link at inbox-wake.lock is not created through" || bad "dangling ledger lock: rc=$RC out=$OUT $(shown)"
+newproj; newvictim; rec k6 hi companion; printf '{"woken": {"k6": 1}}' > "$V/foreign"; BEFORE="$(snap "$V")"; ln -s "$V/foreign" "$D/.heimdall/ui/inbox-wake.json"; watch 10
+[ "$RC" -eq 2 ] && untouched && [ ! -L "$D/.heimdall/ui/inbox-wake.json" ] && [ "$(jq -r '.woken | keys[0]' "$D/.heimdall/ui/inbox-wake.json")" = "k6" ] && ok "ledger: a link at inbox-wake.json is not believed (it cannot silence a wake), is replaced by the real ledger, and its target is untouched" || bad "ledger link: rc=$RC out=$OUT $(shown)"
+newproj; newvictim; rec k7 hi companion; : > "$V/hb"
+( for _ in $(seq 1 100); do : > "$V/hb"; sleep 0.1; done ) & TMPS="$TMPS $!"
+ln -s "$V/hb" "$D/.heimdall/ui/inbox-waiting"; watch 10
+[ "$RC" -eq 2 ] && ok "heartbeat: inbox-waiting linked to a fresh file is not a live Stop hold (a link cannot silence a wake)" || bad "heartbeat link: rc=$RC out=$OUT"
+newproj; newvictim; rec k8 hi companion; printf '{"pid":%s,"status":"busy"}' "$CP" > "$V/busy.json"
+rm "$D/sessions/$CP.json"; ln -s "$V/busy.json" "$D/sessions/$CP.json"; watch 10
+[ "$RC" -eq 2 ] && ok "session status: sessions/<pid>.json linked to a 'busy' record is not believed" || bad "status link: rc=$RC out=$OUT"
+newproj; newvictim; rec k9 hi companion; mv "$D/.heimdall/app/connect.json" "$V/connect.json"; ln -s "$V/connect.json" "$D/.heimdall/app/connect.json"; watch 2
+quiet_wake && ok "connect.json: a link to a valid record never counts as a live companion" || bad "connect.json link: rc=$RC out=$OUT"
+tmux_proj; newvictim; rec k10 hi companion; mv "$D/.heimdall/ui/wake/$CP.json" "$V/reg.json"; ln -s "$V/reg.json" "$D/.heimdall/ui/wake/$CP.json"
+twatch "$$" 10
+grep -q "send-keys" "$REC" && bad "typed into the pane a linked registration named" || ok "registration: a link at wake/<pid>.json is not believed -- no keystroke"
+[ "$RC" -eq 2 ] && ok "falls back to the rewake exit" || bad "rc=$RC"
+newproj; rec g1 hi companion; : > "$D/.heimdall/ui/inbox-wake.lock"; chmod 644 "$D/.heimdall/ui/inbox-wake.lock"; watch 10
+[ "$RC" -eq 2 ] && [ "$(mode_of "$D/.heimdall/ui/inbox-wake.lock")" = "0o600" ] && [ "$(mode_of "$D/.heimdall/ui/inbox-wake.json")" = "0o600" ] && [ "$(mode_of "$D/.heimdall/ui/wake/$CP.lock")" = "0o600" ] && ok "control: an ordinary tree wakes, and the lock files and ledger are 0600 (a looser lock is tightened)" || bad "modes: rc=$RC lock=$(mode_of "$D/.heimdall/ui/inbox-wake.lock") ledger=$(mode_of "$D/.heimdall/ui/inbox-wake.json")"
+newproj; sleep 0.1 & KD=$!; wait "$KD" 2>/dev/null; W="$D/.heimdall/ui/wake"
+for f in "$KD.json" "$KD.lock"; do printf '{}' > "$W/$f"; done; printf 'keep' > "$W/notes.txt"; reg
+[ ! -e "$W/$KD.json" ] && [ ! -e "$W/$KD.lock" ] && [ -f "$W/$CP.json" ] && [ -f "$W/notes.txt" ] && ok "control: an ordinary tree still prunes a dead pid's files and keeps the live session's and everything else" || bad "prune control: $(ls "$W" | tr '\n' ' ')"
 
 echo ""
 echo "heimdall-inbox-wake.test.sh: $PASS passed, $FAIL failed."
