@@ -1576,6 +1576,8 @@ class RealRig:
     def __init__(self):
         _n[0] += 1
         self.root = os.path.join(tmp, "repo%d" % _n[0])
+        os.makedirs(self.root)   # a repo is there before anything registers into it: the store walks down from the root it is given
+        #                          (bin/lib/hmd_private_state.py opens it by its real path) and makes only what is below it
         self.fake = T.FakeExpo()
         self.events = []
         self.m = CP.PushMonitor(self.root, emit=self.events.append, config={"min_run_s": 0, "timeout_s": 3.0},
