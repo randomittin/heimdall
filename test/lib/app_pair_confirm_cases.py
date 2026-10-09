@@ -1296,8 +1296,10 @@ def case_state_files_link_safe():
                 T.check(open(target).read() == "SENTINEL" and not os.path.islink(p) and mode_of(p) == 0o600,
                         "S3. a link AT %s is replaced by the write, never written through" % name)
             for lock in ("push.json.lock", "digest.json.lock"):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(os.path.join(app_dir, lock))  # the writes above made the push store's lock: the link takes its place
                 os.symlink(target, os.path.join(app_dir, lock))
-            T.check(refuses(push_store.register, clean, token, "ios") and refuses(digest._write, clean, digest._zero())
+            T.check(refuses(push_store.register, clean, token, "ios") and refuses(digest._update, clean, lambda state: (True, None))
                     and open(target).read() == "SENTINEL",
                     "S3. a link AT push.json.lock or digest.json.lock is refused, not locked or created through")
             os.makedirs(os.path.join(s.repo, ".heimdall", "app"))

@@ -765,6 +765,7 @@ mkdir -p "$D/.heimdall/app"
 cat > "$D/.heimdall/app/connect.json" <<JSON
 {"pid_ui": 1, "port": 9999, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
 JSON
+chmod 600 "$D/.heimdall/app/connect.json"
 OUT="$(FAKE_TS_MODE=funnel-still-up "$APP" status --repo "$D" 2>&1)"; RC=$?
 if [ "$RC" -ne 0 ]; then ok "A4c. status w/ a stale pid + funnel still up exits nonzero"; else bad "exit $RC (want nonzero)"; fi
 if printf '%s' "$OUT" | grep -qi 'ORPHANED FUNNEL'; then ok "A4c. status prints an ORPHANED FUNNEL warning"; else bad "$OUT"; fi
@@ -1071,6 +1072,7 @@ mkdir -p "$D/.heimdall/app"
 cat > "$D/.heimdall/app/connect.json" <<JSON
 {"pid_ui": $SLEEP_PID, "port": 9999, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
 JSON
+chmod 600 "$D/.heimdall/app/connect.json"
 OUT="$(FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" 2>&1)"; RC=$?
 if [ "$RC" -eq 0 ]; then ok "A14. disconnect w/ a non-heimdall-ui pid in state file still exits 0"; else bad "exit $RC: $OUT"; fi
 if kill -0 "$SLEEP_PID" 2>/dev/null; then
@@ -1089,6 +1091,7 @@ mkdir -p "$D/.heimdall/app"
 cat > "$D/.heimdall/app/connect.json" <<JSON
 {"pid_ui": 1, "port": 6000, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
 JSON
+chmod 600 "$D/.heimdall/app/connect.json"
 LOG="$TMPROOT/ts-n1a.log"
 : > "$LOG"
 N1A_OUT="$(FAKE_TS_MODE=one-foreign-target FAKE_TS_TARGET_PORT=5601 FAKE_TS_LOG="$LOG" "$APP" disconnect --repo "$D" 2>&1)"; N1A_RC=$?
@@ -1104,6 +1107,7 @@ mkdir -p "$D/.heimdall/app"
 cat > "$D/.heimdall/app/connect.json" <<JSON
 {"pid_ui": 1, "port": 6000, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
 JSON
+chmod 600 "$D/.heimdall/app/connect.json"
 N1B_OUT="$(FAKE_TS_MODE=funnel-still-up "$APP" disconnect --repo "$D" 2>&1)"; N1B_RC=$?
 if [ "$N1B_RC" -eq 8 ]; then ok "N1b. disconnect exits 8 when the stop's own exit code says success but the funnel is still up"; else bad "exit $N1B_RC (want 8): $N1B_OUT"; fi
 if printf '%s' "$N1B_OUT" | grep -qF 'FUNNEL STILL PUBLIC'; then ok "N1b. exit-8 case prints the loud FUNNEL STILL PUBLIC line"; else bad "$N1B_OUT"; fi
@@ -1116,6 +1120,7 @@ mkdir -p "$D/.heimdall/app"
 cat > "$D/.heimdall/app/connect.json" <<JSON
 {"pid_ui": 1, "port": 6000, "https_port": 443, "host": "my-machine.tail1a2b3.ts.net", "started_at": "2026-01-01T00:00:00Z"}
 JSON
+chmod 600 "$D/.heimdall/app/connect.json"
 N1C_OUT="$(FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" 2>&1)"; N1C_RC=$?
 if [ "$N1C_RC" -eq 0 ]; then ok "N1c. clean stop (verified down) exits 0"; else bad "exit $N1C_RC: $N1C_OUT"; fi
 if printf '%s' "$N1C_OUT" | grep -qi 'stopped'; then ok "N1c. clean stop prints 'stopped'"; else bad "$N1C_OUT"; fi
@@ -1369,6 +1374,7 @@ FAKE_RELAY_BIN="$TMPROOT/heimdall-relay-client"
 cat > "$FAKE_RELAY_BIN" <<'FAKE_RELAY_EOF'
 #!/usr/bin/env bash
 set -u
+umask 077   # the real client writes relay.json 0600 (bin/lib/hmd_private_state.py), the only kind `hmd app status` believes
 RELAY_URL="" REPO="" UI_PORT="" PUBLIC_HOST="" STATUS_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1945,6 +1951,124 @@ t_connect "$D" "$P5"
 if [ "$T_RC" -eq 6 ] && grep -q 'already connected' "$T_OUTF"; then ok "a second connect on a live session's port exits 6 and says already connected"; else bad "exit $T_RC: $(cat "$T_OUTF")"; fi
 if [ -n "$LIVE_UI" ] && kill -0 "$LIVE_UI" 2>/dev/null && [ -n "$LIVE_CLIENT" ] && kill -0 "$LIVE_CLIENT" 2>/dev/null; then ok "live session: its ui and client were left running"; else bad "live session was disturbed (ui=$LIVE_UI client=$LIVE_CLIENT)"; fi
 if [ "$(jq -r '.pid_ui // empty' "$SF" 2>/dev/null)" = "$LIVE_UI" ]; then ok "live session: connect.json still names its ui"; else bad "connect.json changed: $(jq -c . "$SF" 2>/dev/null)"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
+# ── repo state is untrusted: nothing a repository's own files say picks the relay, a pid to signal or where to write ────────
+# Security finding "untrusted-repo-state in bin/heimdall-app". A checkout can plant .heimdall/app/connect.json (a relay URL, pids, a
+# port, a pair window's pid) and can carry .heimdall, .heimdall/app or connect.json itself as a link. The files planted below are
+# 0600, so only their CONTENT (never their mode) is in question; every state file is read and written through
+# bin/lib/hmd_private_state.py, and a pid a file names is signalled only once its own argv has been looked at.
+
+# a loopback listener that counts the connections made to it: the planted relay must never see one
+PLANT_HITS="$TMPROOT/planted-relay.hits"
+PLANT_PORT_FILE="$TMPROOT/planted-relay.port"
+: > "$PLANT_HITS"
+python3 - "$PLANT_HITS" >"$PLANT_PORT_FILE" <<'PLANT_RELAY_EOF' &
+import socket, sys
+srv = socket.socket()
+srv.bind(("127.0.0.1", 0))
+srv.listen(5)
+print(srv.getsockname()[1], flush=True)
+while True:
+    conn, _ = srv.accept()
+    with open(sys.argv[1], "a") as hits:
+        hits.write("hit\n")
+    conn.close()
+PLANT_RELAY_EOF
+PIDS+=("$!")
+PLANT_PORT=""
+PLANT_WAITED=0
+while [ -z "$PLANT_PORT" ] && [ "$PLANT_WAITED" -lt 100 ]; do
+  PLANT_PORT="$(head -1 "$PLANT_PORT_FILE" 2>/dev/null)"
+  [ -n "$PLANT_PORT" ] || sleep 0.1
+  PLANT_WAITED=$((PLANT_WAITED + 1))
+done
+
+# 1. a planted connect.json names a foreign relay: doctor asks only the relay the environment names, connect hands its client
+# the relay argv/env/default gave -- the planted one is never contacted (the token travels to the relay the client is given)
+D="$(make_repo)"
+mkdir -p "$D/.heimdall/app"
+printf '{"mode":"relay","pid_ui":1,"pid_client":1,"port":1,"relay":"http://127.0.0.1:%s","started_at":"x"}\n' "$PLANT_PORT" >"$D/.heimdall/app/connect.json"
+chmod 600 "$D/.heimdall/app/connect.json"
+PLANT_DOUT="$TMPROOT/doctor-planted.out"
+HMD_RELAY_URL="https://127.0.0.1:1" "$APP" doctor --repo "$D" >"$PLANT_DOUT" 2>&1
+if [ -n "$PLANT_PORT" ] && [ ! -s "$PLANT_HITS" ] && ! grep -q "$PLANT_PORT" "$PLANT_DOUT"; then ok "planted connect.json: doctor never asks the relay the file names"; else bad "planted relay contacted ($(wc -l <"$PLANT_HITS" | tr -d ' ') hits): $(cat "$PLANT_DOUT")"; fi
+T_RELAY_LOG="$TMPROOT/planted-relay.log"; : > "$T_RELAY_LOG"
+HMD_RELAY_URL="https://relay.example.com" HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=pair-bind FAKE_RELAY_LOG="$T_RELAY_LOG" \
+  "$APP" connect --repo "$D" --port 0 --no-code --bg >"$TMPROOT/planted-connect.out" 2>&1
+if grep -q '^relay=https://relay.example.com ' "$T_RELAY_LOG" && ! grep -q "$PLANT_PORT" "$T_RELAY_LOG" "$TMPROOT/planted-connect.out" && [ ! -s "$PLANT_HITS" ]; then ok "planted connect.json: connect gives its client the relay the environment names, never the one the file names"; else bad "relay log: $(cat "$T_RELAY_LOG") / out: $(cat "$TMPROOT/planted-connect.out")"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
+# 2. planted state names pids that are not this repo's ui, relay client and pair window supervisor -- another repo's REAL hmd ui,
+# and two decoys that carry the right names (heimdall-relay-client, heimdall-app pair-window-loop) for ANOTHER repo: status and
+# disconnect leave all three running
+D="$(make_repo)"
+D_OTHER="$(make_repo)"
+t_start_ui "$D_OTHER" "$(t_free_port)"
+PLANT_UI="$T_UI_PID"
+DECOY_DIR="$TMPROOT/decoys"
+mkdir -p "$DECOY_DIR"
+for decoy in heimdall-relay-client heimdall-app; do
+  printf '#!/usr/bin/env bash\nwhile :; do sleep 1; done\n' >"$DECOY_DIR/$decoy"
+  chmod +x "$DECOY_DIR/$decoy"
+done
+"$DECOY_DIR/heimdall-relay-client" --repo "$D_OTHER" >/dev/null 2>&1 &
+PLANT_CLIENT=$!
+PIDS+=("$PLANT_CLIENT")
+"$DECOY_DIR/heimdall-app" pair-window-loop --repo "$D_OTHER" >/dev/null 2>&1 &
+PLANT_WINDOW=$!
+PIDS+=("$PLANT_WINDOW")
+mkdir -p "$D/.heimdall/app"
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"https://relay.example.com","started_at":"x"}\n' "$PLANT_UI" "$PLANT_CLIENT" >"$D/.heimdall/app/connect.json"
+printf '{"pid":%s,"code":"ABCDE","state":"running"}\n' "$PLANT_WINDOW" >"$D/.heimdall/app/pair-window.json"
+chmod 600 "$D/.heimdall/app/connect.json" "$D/.heimdall/app/pair-window.json"
+sleep 0.5
+PLANT_STATUS="$("$APP" status --repo "$D" 2>&1)"
+PLANT_OUT="$("$APP" disconnect --repo "$D" 2>&1)"; PLANT_RC=$?
+if kill -0 "$PLANT_UI" 2>/dev/null; then ok "planted pid_ui (another repo's real hmd ui): disconnect never signals it"; else bad "another repo's ui $PLANT_UI was killed: $PLANT_OUT"; fi
+if kill -0 "$PLANT_CLIENT" 2>/dev/null; then ok "planted pid_client (a process named heimdall-relay-client for another repo): never signalled"; else bad "the decoy relay client $PLANT_CLIENT was killed: $PLANT_OUT"; fi
+if kill -0 "$PLANT_WINDOW" 2>/dev/null; then ok "planted pair-window pid (a heimdall-app pair-window-loop of another repo): never signalled"; else bad "the decoy supervisor $PLANT_WINDOW was killed: $PLANT_OUT"; fi
+if [ "$PLANT_RC" -eq 0 ] && ! printf '%s' "$PLANT_STATUS" | grep -q '(running)'; then ok "planted pids: status calls none of them a running part of this repo, and disconnect still exits 0"; else bad "rc $PLANT_RC; status: $PLANT_STATUS"; fi
+rm -rf "$D" "$D_OTHER"
+
+# 3. a link anywhere on the way to the state is never written through: `.heimdall` or `.heimdall/app` leading out of the repo makes
+# connect refuse to start (exit 2, one line naming connect.json) and status, disconnect and pair-window --stop write nothing
+# behind it; a link AT connect.json is replaced by connect's own write and what it pointed at is left alone
+for PLANT_LEVEL in .heimdall .heimdall/app; do
+  D="$(make_repo)"
+  PLANT_VICTIM="$(mktemp -d "$TMPROOT/victim.XXXXXX")"
+  chmod 755 "$PLANT_VICTIM"
+  if [ "$PLANT_LEVEL" = ".heimdall" ]; then
+    mkdir -p "$PLANT_VICTIM/app"
+    ln -s "$PLANT_VICTIM" "$D/.heimdall"
+    PLANT_WANT="/app "
+  else
+    mkdir -p "$D/.heimdall"
+    ln -s "$PLANT_VICTIM" "$D/.heimdall/app"
+    PLANT_WANT=""
+  fi
+  PLANT_OUT="$(HMD_RELAY_URL="https://relay.example.com" HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=pair-bind \
+    "$APP" connect --repo "$D" --port 0 --no-code --bg 2>&1)"; PLANT_RC=$?
+  "$APP" status --repo "$D" >/dev/null 2>&1
+  "$APP" disconnect --repo "$D" >/dev/null 2>&1
+  "$APP" pair-window --stop --session link-test --repo "$D" >/dev/null 2>&1
+  PLANT_SEEN="$(cd "$PLANT_VICTIM" && find . -mindepth 1 | sed 's#^\.##' | LC_ALL=C sort | tr '\n' ' ')"
+  if [ "$PLANT_RC" -eq 2 ] && printf '%s' "$PLANT_OUT" | grep -q 'refusing to start' && printf '%s' "$PLANT_OUT" | grep -q 'connect.json'; then ok "$PLANT_LEVEL is a link: connect refuses to start (exit 2) and names connect.json"; else bad "$PLANT_LEVEL link: exit $PLANT_RC: $PLANT_OUT"; fi
+  if [ "$PLANT_SEEN" = "$PLANT_WANT" ]; then ok "$PLANT_LEVEL is a link: connect, status, disconnect and pair-window --stop write nothing behind it"; else bad "$PLANT_LEVEL link: the target now holds '$PLANT_SEEN' (want '$PLANT_WANT')"; fi
+  rm -rf "$D" "$PLANT_VICTIM"
+done
+D="$(make_repo)"
+mkdir -p "$D/.heimdall/app"
+PLANT_TARGET="$TMPROOT/outside-connect.txt"
+printf 'SENTINEL' >"$PLANT_TARGET"
+ln -s "$PLANT_TARGET" "$D/.heimdall/app/connect.json"
+HMD_RELAY_URL="https://relay.example.com" HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=pair-bind \
+  "$APP" connect --repo "$D" --port 0 --no-code --bg >"$TMPROOT/link-connect.out" 2>&1
+PLANT_JSON="$D/.heimdall/app/connect.json"
+if [ "$(cat "$PLANT_TARGET")" = "SENTINEL" ] && [ ! -L "$PLANT_JSON" ] && [ "$(jq -r '.mode // empty' "$PLANT_JSON" 2>/dev/null)" = "relay" ] \
+   && [ -n "$(find "$PLANT_JSON" -maxdepth 0 -type f -perm 600 2>/dev/null)" ]; then ok "a link AT connect.json is replaced by connect's own 0600 write, never written through"; else bad "target '$(cat "$PLANT_TARGET")', connect.json: $(ls -l "$PLANT_JSON" 2>&1): $(cat "$TMPROOT/link-connect.out")"; fi
 "$APP" disconnect --repo "$D" >/dev/null 2>&1
 rm -rf "$D"
 

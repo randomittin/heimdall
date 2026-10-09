@@ -187,7 +187,7 @@ def sent_kinds(rig):
 def put_request(root, rid, at, raw=None):
     directory = os.path.join(root, ".heimdall", "app")
     os.makedirs(directory, exist_ok=True)
-    with open(os.path.join(directory, "push-test"), "w", encoding="utf-8") as f:
+    with open(os.path.join(directory, "push-test"), "w", encoding="utf-8", opener=lambda p, fl: os.open(p, fl, 0o600)) as f:
         f.write(raw if raw is not None else json.dumps({"v": 1, "id": rid, "at": at}))
 
 
@@ -474,7 +474,7 @@ T.check("/r/.heimdall/app/push-test" in paths and "/r/.heimdall/app/push-test.re
 def put_result(root, rid, state, results):
     directory = os.path.join(root, ".heimdall", "app")
     os.makedirs(directory, exist_ok=True)
-    with open(os.path.join(directory, "push-test.result"), "w", encoding="utf-8") as f:
+    with open(os.path.join(directory, "push-test.result"), "w", encoding="utf-8", opener=lambda p, fl: os.open(p, fl, 0o600)) as f:
         json.dump({"v": 1, "id": rid, "state": state, "results": results}, f)
 
 
@@ -780,7 +780,7 @@ c.close()
 # ── B12. a stale request is not served by a sender that starts later; an answered one is not served again ──
 c = Case()
 os.makedirs(os.path.dirname(c.path("push-test")), exist_ok=True)
-with open(c.path("push-test"), "w", encoding="utf-8") as f:
+with open(c.path("push-test"), "w", encoding="utf-8", opener=lambda p, fl: os.open(p, fl, 0o600)) as f:
     json.dump({"v": 1, "id": "9" * 16, "at": int(time.time()) - 120}, f)
 c.start_sender("a")
 time.sleep(1.5)
@@ -983,7 +983,7 @@ def repo(tokens=()):
 def write_result(root, rid, state, results):
     directory = os.path.join(root, ".heimdall", "app")
     os.makedirs(directory, exist_ok=True)
-    with open(os.path.join(directory, "push-test.result"), "w", encoding="utf-8") as f:
+    with open(os.path.join(directory, "push-test.result"), "w", encoding="utf-8", opener=lambda p, fl: os.open(p, fl, 0o600)) as f:
         json.dump({"v": 1, "id": rid, "state": state, "results": results}, f)
 
 
