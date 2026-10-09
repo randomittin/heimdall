@@ -3,11 +3,11 @@
 following a link (stdlib only).
 
 WHY THIS EXISTS. Files hmd keeps under <repo>/.heimdall/ -- the session records the SessionStart hook writes, the
-marker a paired phone leaves for the statusline, the pair window's state -- live in a tree a repository controls: a
-cloned repo can carry `.heimdall` or `.heimdall/app` as a symlink, or a ready-made session record. A plain
-open()/chmod()/rename() through such a path writes, or chmods, wherever the link points, and a plain read trusts
-whatever a checkout planted. The pattern here is bin/lib/companion_attach.py's (_open_attachments, after its
-security review), applied to a directory chosen by the caller:
+marker a paired phone leaves for the statusline, the pair window's state, the companion inbox and its archive, locks and
+audit log -- live in a tree a repository controls: a cloned repo can carry `.heimdall` or `.heimdall/app` as a symlink,
+or a ready-made session record. A plain open()/chmod()/rename() through such a path writes, or chmods, wherever the link
+points, and a plain read trusts whatever a checkout planted. The pattern here is bin/lib/companion_attach.py's
+(_open_attachments, after its security review), applied to a directory chosen by the caller:
 
   * the way down from the root is walked ONE COMPONENT AT A TIME, each opened with O_NOFOLLOW relative to the one
     before and fstat'ed to be a directory this process owns (open_dir): a link anywhere below the root, or a
@@ -21,10 +21,14 @@ security review), applied to a directory chosen by the caller:
     no group or other permission bits and at most `limit` bytes. A file a git checkout planted is 0644 and fails
     that test, which is the point: a repository cannot make this user's tools believe it.
 
-Beyond write/read/remove: open_lockfile() hands a caller a flock-able descriptor of a file it owns under the same walk,
-stat_file() the stat of a marker file (its mtime, say) without following a link, and read() takes the mode bits a caller
-tolerates -- `forbidden` for the file, `dir_forbidden` for the directory holding it -- for state another tool already
-keeps looser than 0600 (bin/heimdall-inbox-wake uses all three: its locks, its heartbeat and connect.json).
+Beyond write/read/remove: open_lockfile() hands a caller a flock-able descriptor of a file it owns under the same walk
+and lock() holds an exclusive flock on one for a with block; open_append() hands back an append-only descriptor (0600,
+vetted) and append() writes to it -- under a lock when given a lock name -- and fsyncs; truncate() empties a file in place
+and rename() renames inside the vetted directory (a link at the target is replaced, never written through); open_read()
+hands back a vetted read-only descriptor and stat_file() the stat of a marker file (its mtime, say) without following a
+link; read() takes the mode bits a caller tolerates -- `forbidden` for the file, `dir_forbidden` for the directory holding
+it -- for state another tool already keeps looser than 0600 (bin/heimdall-inbox-wake, bin/heimdall-inbox-deliver and
+bin/lib/companion_ui_inbox.py use them for the inbox, its archive, their locks, markers and connect.json).
 
 The root itself is opened by its real path (the caller named it; /var -> /private/var and the like are fine).
 
@@ -34,6 +38,7 @@ CLI (for the shell tools, so a state file never goes through a shell redirection
 exit 0 done, 1 refused or failed (the reason on stderr), 2 usage.
 """
 import contextlib
+import fcntl
 import json
 import os
 import stat
@@ -113,6 +118,13 @@ def _drop(dirfd, name):
         os.unlink(name, dir_fd=dirfd)
 
 
+def write_all(fd, data):
+    """Write every byte of `data` to the descriptor: a short write is continued, never dropped."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
 def _stage(dirfd, name, data):
     """Write `data` to a fresh temp file beside `name` (0600, never an existing file, never through a link); the
     temp's name is returned."""
@@ -120,9 +132,7 @@ def _stage(dirfd, name, data):
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
     try:
         os.fchmod(fd, 0o600)
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view):]
+        write_all(fd, data)
         os.fsync(fd)
     except BaseException:
         os.close(fd)
@@ -163,6 +173,28 @@ def create_once(root, rel, name, data):
         os.close(dirfd)
 
 
+def _open_vetted(root, rel, name, flags, what):
+    """The descriptor of <root>/<rel>/<name> opened with `flags` (O_WRONLY, plus O_APPEND when asked): the file is made
+    (0600) when it is missing, opened WITHOUT following a link inside the vetted directory, checked (fstat of what was
+    actually opened) to be a regular file this process owns, and forced to 0600 with fchmod of that descriptor -- never
+    chmod of a path. O_NONBLOCK: the open cannot hang a hook on a FIFO."""
+    _plain_name(name)
+    dirfd = open_dir(root, rel, True)
+    try:
+        fd = os.open(name, flags | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dirfd)
+    finally:
+        os.close(dirfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise OSError("%s is not %s of ours" % (name, what))
+        os.fchmod(fd, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def open_lockfile(root, rel, name):
     """The descriptor of <root>/<rel>/<name>, which the caller flocks and closes. The file is made (0600) when it is
     missing, opened WITHOUT following a link inside the vetted directory, checked (fstat of what was actually opened) to
@@ -170,20 +202,113 @@ def open_lockfile(root, rel, name):
     OSError, with nothing created, changed or locked, when anything on the way is a link, a plain file or another
     account's, or when the name is a directory, a link (a dangling one is not created through) or a FIFO (O_NONBLOCK:
     the open cannot hang the hook on one)."""
-    _plain_name(name)
-    dirfd = open_dir(root, rel, True)
+    return _open_vetted(root, rel, name, os.O_WRONLY, "a lock file")
+
+
+@contextlib.contextmanager
+def lock(root, rel, name):
+    """An exclusive flock on <root>/<rel>/<name> (open_lockfile: the same refusals) held for the body of a with
+    statement and dropped when it ends, an exception included. Two openers of one name share one inode, so the lock
+    excludes."""
+    fd = open_lockfile(root, rel, name)
     try:
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dirfd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor drops the lock
+
+
+def open_append(root, rel, name):
+    """The descriptor of <root>/<rel>/<name> for appending, which the caller closes: made 0600 when missing, never
+    reached through a link, a regular file of ours (open_lockfile's refusals). A caller that must not claim anything
+    before its destination is known to be writable opens it first and writes with write_all()."""
+    return _open_vetted(root, rel, name, os.O_WRONLY | os.O_APPEND, "a file")
+
+
+def _append(root, rel, name, data):
+    fd = open_append(root, rel, name)
+    try:
+        write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def append(root, rel, name, data, lock_name=None):
+    """Append `data` (bytes) to <root>/<rel>/<name> and fsync it. With `lock_name` the write is made while holding the
+    exclusive flock on <root>/<rel>/<lock_name> (see lock()): append with a lock. OSError, with nothing written, when
+    anything on the way is a link, a plain file or another account's."""
+    if lock_name is None:
+        _append(root, rel, name, data)
+        return
+    with lock(root, rel, lock_name):
+        _append(root, rel, name, data)
+
+
+def truncate(root, rel, name):
+    """Empty <root>/<rel>/<name> in place -- ftruncate of the vetted descriptor, so the file keeps its inode, which a
+    lockless writer may hold open -- and force it to 0600. True when it was emptied, False when it is not there. OSError
+    when anything on the way is a link, a plain file or another account's, or when the name is a link, a directory, a FIFO
+    or not ours: nothing behind a link is truncated or chmod'ed."""
+    _plain_name(name)
+    dirfd = open_dir(root, rel, False)
+    try:
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+        except FileNotFoundError:
+            return False
     finally:
         os.close(dirfd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
-            raise OSError("%s is not a lock file of ours" % name)
+            raise OSError("%s is not a file of ours" % name)
+        os.ftruncate(fd, 0)
         os.fchmod(fd, 0o600)
-    except BaseException:
+    finally:
         os.close(fd)
-        raise
+    return True
+
+
+def rename(root, rel, src, dst):
+    """Rename <root>/<rel>/<src> to <root>/<rel>/<dst> inside the vetted directory, replacing what is at <dst>: a link
+    there is replaced, never written through, and a link at <src> moves as a link. OSError when the way is not plain
+    directories of ours or <src> is missing."""
+    _plain_name(src)
+    _plain_name(dst)
+    dirfd = open_dir(root, rel, False)
+    try:
+        os.replace(src, dst, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+    finally:
+        os.close(dirfd)
+
+
+def open_read(root, rel, name, forbidden=0o077, dir_forbidden=0):
+    """A read-only descriptor of <root>/<rel>/<name>, which the caller closes, or None when it is missing or not to be
+    trusted: reached through a link, not a regular file (a FIFO is refused without blocking), not ours, carrying any of the
+    mode bits in `forbidden` (default 0o077: only a 0600 file), or held in a directory carrying any of the bits in
+    `dir_forbidden`. Both mode checks are made on the descriptors actually opened. Creates nothing."""
+    try:
+        _plain_name(name)
+        dirfd = open_dir(root, rel, False)
+    except OSError:
+        return None
+    try:
+        if os.fstat(dirfd).st_mode & dir_forbidden:
+            return None
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+    except OSError:
+        return None
+    finally:
+        os.close(dirfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & forbidden:
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
     return fd
 
 
@@ -195,30 +320,18 @@ def read(root, rel, name, limit=READ_LIMIT, forbidden=0o077, dir_forbidden=0):
     "ours" passes 0. `dir_forbidden` defaults to 0 (the directory's mode is not judged); 0o022 refuses a directory
     somebody else could swap the file in. Both mode checks are made on the descriptors actually opened. Creates
     nothing."""
-    try:
-        _plain_name(name)
-        dirfd = open_dir(root, rel, False)
-    except OSError:
+    fd = open_read(root, rel, name, forbidden, dir_forbidden)
+    if fd is None:
         return None
     try:
-        try:
-            if os.fstat(dirfd).st_mode & dir_forbidden:
-                return None
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
-        except OSError:
+        size = os.fstat(fd).st_size
+        if size > limit:
             return None
-        try:
-            st = os.fstat(fd)
-            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & forbidden
-                    or st.st_size > limit):
-                return None
-            return os.read(fd, min(limit, st.st_size))
-        except OSError:
-            return None
-        finally:
-            os.close(fd)
+        return os.read(fd, min(limit, size))
+    except OSError:
+        return None
     finally:
-        os.close(dirfd)
+        os.close(fd)
 
 
 def read_json(root, rel, name, limit=READ_LIMIT, forbidden=0o077, dir_forbidden=0):

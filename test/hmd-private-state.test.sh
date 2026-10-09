@@ -21,7 +21,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 python3 -I - "$LIB" "$WORK" > "$WORK/driver.out" 2>&1 <<'PYDRIVER'
-import fcntl, importlib.util, os, signal, stat, sys, tempfile
+import fcntl, importlib.util, os, signal, stat, sys, tempfile, threading
 
 lib, work = sys.argv[1], sys.argv[2]
 spec = importlib.util.spec_from_file_location("hmd_private_state", lib)
@@ -329,6 +329,287 @@ def _():
         return ps.read(root, REL, "fifo", forbidden=0) is None
     finally:
         signal.alarm(0)
+
+
+# ---- append, append with a lock, lock, truncate, rename, open_read, write_all: what bin/heimdall-inbox-deliver,
+# ---- bin/lib/companion_ui_inbox.py and the controls audit log use for every write, delete, lock and read of repo state
+
+def contents(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def locked_once(root, rel, name):
+    with ps.lock(root, rel, name):
+        return True
+
+
+@case("append: makes <rel>/<name> 0600 inside 0700 directories it made, whatever the umask, and appends after what is there")
+def _():
+    for um in (0o022, 0o000):
+        old = os.umask(um)
+        try:
+            base = tempfile.mkdtemp(prefix="a.", dir=work)
+            root = os.path.join(base, "repo")
+            os.mkdir(root, 0o755)
+            ps.append(root, REL, "log", b"one\n")
+            ps.append(root, REL, "log", b"two\n")
+            path = os.path.join(root, REL, "log")
+            if contents(path) != b"one\ntwo\n" or mode(path) != 0o600 or [mode(os.path.join(root, d)) for d in LEVELS] != [0o700] * 3:
+                return False
+        finally:
+            os.umask(old)
+    return True
+
+
+@case("append: an existing looser file is tightened to 0600 and keeps its bytes and its inode")
+def _():
+    root, _victim = tree()
+    path = os.path.join(root, REL, "log")
+    put(path, b"old\n", 0o644)
+    before = os.stat(path).st_ino
+    ps.append(root, REL, "log", b"new\n")
+    return contents(path) == b"old\nnew\n" and mode(path) == 0o600 and os.stat(path).st_ino == before
+
+
+@case("append: a link at the name -- dangling or to a foreign file -- is refused and the target is neither created nor touched")
+def _():
+    root, victim = tree()
+    os.symlink(os.path.join(victim, "foreign"), os.path.join(root, REL, "l1"))
+    os.symlink(os.path.join(victim, "not-there"), os.path.join(root, REL, "l2"))
+    before = snap(victim)
+    return (refused(ps.append, root, REL, "l1", b"x") and refused(ps.append, root, REL, "l2", b"x")
+            and not os.path.exists(os.path.join(victim, "not-there")) and snap(victim) == before)
+
+
+def _append_level(level):
+    @case("append: a link at %s is refused; nothing behind it is created, chmod'ed or written" % level)
+    def _():
+        root, victim = linked(level)
+        before = snap(victim)
+        return refused(ps.append, root, REL, "log", b"x") and snap(victim) == before
+
+
+for _level in LEVELS:
+    _append_level(_level)
+
+
+@case("append and open_append: a directory or a FIFO at the name is refused at once (nothing can hang a hook)")
+def _():
+    root, _victim = tree()
+    os.mkdir(os.path.join(root, REL, "adir"))
+    os.mkfifo(os.path.join(root, REL, "fifo"))
+    signal.alarm(5)
+    try:
+        return (refused(ps.append, root, REL, "adir", b"x") and refused(ps.append, root, REL, "fifo", b"x")
+                and refused(ps.open_append, root, REL, "fifo"))
+    finally:
+        signal.alarm(0)
+
+
+@case("append, truncate, rename, open_read, lock: a name with a slash or a dot-dot is refused")
+def _():
+    root, _victim = tree()
+    bad_names = ("../x", "a/b", "..", "")
+    return (all(refused(ps.append, root, REL, n, b"x") for n in bad_names)
+            and all(refused(ps.truncate, root, REL, n) for n in bad_names)
+            and all(refused(ps.rename, root, REL, "f", n) for n in bad_names)
+            and all(ps.open_read(root, REL, n) is None for n in bad_names)
+            and all(refused(locked_once, root, REL, n) for n in bad_names))
+
+
+@case("append(lock_name=): the write waits for an exclusive flock held on <rel>/<lock_name> and lands once it is dropped")
+def _():
+    root, _victim = tree()
+    held = ps.open_lockfile(root, REL, "log.lock")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    done = threading.Event()
+
+    def writer():
+        ps.append(root, REL, "log", b"under lock\n", lock_name="log.lock")
+        done.set()
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    blocked = not done.wait(0.4)
+    absent = not os.path.exists(os.path.join(root, REL, "log"))
+    os.close(held)
+    thread.join(5)
+    return blocked and absent and done.is_set() and contents(os.path.join(root, REL, "log")) == b"under lock\n"
+
+
+@case("append(lock_name=): a link at the lock name is refused and nothing is written")
+def _():
+    root, victim = tree()
+    os.symlink(os.path.join(victim, "foreign"), os.path.join(root, REL, "log.lock"))
+    before = snap(victim)
+    return (refused(ps.append, root, REL, "log", b"x", lock_name="log.lock")
+            and not os.path.exists(os.path.join(root, REL, "log")) and snap(victim) == before)
+
+
+@case("write_all: every byte of a buffer far larger than a pipe buffer reaches a descriptor open_append returned")
+def _():
+    root, _victim = tree()
+    path = os.path.join(root, REL, "big")
+    fd = ps.open_append(root, REL, "big")
+    try:
+        ps.write_all(fd, b"x" * 300000)
+    finally:
+        os.close(fd)
+    return os.path.getsize(path) == 300000 and mode(path) == 0o600
+
+
+@case("lock: holds an exclusive flock for the body, drops it afterwards and when the body raises")
+def _():
+    root, _victim = tree()
+    other = ps.open_lockfile(root, REL, "k.lock")
+    try:
+        with ps.lock(root, REL, "k.lock"):
+            contended = refused(fcntl.flock, other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        free_after = not refused(fcntl.flock, other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(other, fcntl.LOCK_UN)
+        raised = False
+        try:
+            with ps.lock(root, REL, "k.lock"):
+                raise ValueError("body failed")
+        except ValueError:
+            raised = True
+        free_after_raise = not refused(fcntl.flock, other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return contended and free_after and raised and free_after_raise
+    finally:
+        os.close(other)
+
+
+def _lock_cm_level(level):
+    @case("lock: a link at %s is refused before anything behind it is created, chmod'ed or locked" % level)
+    def _():
+        root, victim = linked(level)
+        before = snap(victim)
+        return refused(locked_once, root, REL, "k.lock") and snap(victim) == before
+
+
+for _level in LEVELS:
+    _lock_cm_level(_level)
+
+
+@case("truncate: empties the file in place (same inode), forces 0600, says True; False for a missing file")
+def _():
+    root, _victim = tree()
+    path = os.path.join(root, REL, "f")
+    put(path, b"hello", 0o644)
+    before = os.stat(path).st_ino
+    return (ps.truncate(root, REL, "f") is True and contents(path) == b"" and mode(path) == 0o600
+            and os.stat(path).st_ino == before and ps.truncate(root, REL, "nope") is False)
+
+
+@case("truncate: a link at the name is refused; the target keeps its bytes, mode and mtime")
+def _():
+    root, victim = tree()
+    os.symlink(os.path.join(victim, "foreign"), os.path.join(root, REL, "link"))
+    before = snap(victim)
+    return refused(ps.truncate, root, REL, "link") and snap(victim) == before and contents(os.path.join(victim, "foreign")) == b"SENTINEL"
+
+
+@case("truncate: a directory or a FIFO at the name is refused at once")
+def _():
+    root, _victim = tree()
+    os.mkdir(os.path.join(root, REL, "adir"))
+    os.mkfifo(os.path.join(root, REL, "fifo"))
+    signal.alarm(5)
+    try:
+        return refused(ps.truncate, root, REL, "adir") and refused(ps.truncate, root, REL, "fifo")
+    finally:
+        signal.alarm(0)
+
+
+def _truncate_level(level):
+    @case("truncate: a link at %s is refused; nothing behind it is truncated or chmod'ed" % level)
+    def _():
+        root, victim = linked(level)
+        before = snap(victim)
+        return refused(ps.truncate, root, REL, "f") and snap(victim) == before
+
+
+for _level in LEVELS:
+    _truncate_level(_level)
+
+
+@case("rename: moves <name> to <new> inside the vetted directory; a link at <new> is replaced, never written through")
+def _():
+    root, victim = tree()
+    d = os.path.join(root, REL)
+    put(os.path.join(d, "a"), b"AAA", 0o600)
+    os.symlink(os.path.join(victim, "foreign"), os.path.join(d, "b"))
+    before = snap(victim)
+    ps.rename(root, REL, "a", "b")
+    return (contents(os.path.join(d, "b")) == b"AAA" and not os.path.islink(os.path.join(d, "b"))
+            and not os.path.exists(os.path.join(d, "a")) and snap(victim) == before)
+
+
+@case("rename: a missing source is an OSError")
+def _():
+    root, _victim = tree()
+    return refused(ps.rename, root, REL, "nope", "other")
+
+
+def _rename_level(level):
+    @case("rename: a link at %s is refused; nothing behind it is moved or replaced" % level)
+    def _():
+        root, victim = linked(level)
+        before = snap(victim)
+        return refused(ps.rename, root, REL, "f", "g") and snap(victim) == before
+
+
+for _level in LEVELS:
+    _rename_level(_level)
+
+
+@case("open_read: a descriptor of a regular file of ours (0600 unless `forbidden` says otherwise); None for missing, link, directory, FIFO")
+def _():
+    root, victim = tree()
+    d = os.path.join(root, REL)
+    fd = ps.open_read(root, REL, "f")
+    first = fd is not None and os.read(fd, 10) == b"hello"
+    if fd is not None:
+        os.close(fd)
+    os.symlink(os.path.join(victim, "foreign"), os.path.join(d, "link"))
+    os.mkdir(os.path.join(d, "adir"))
+    os.mkfifo(os.path.join(d, "fifo"))
+    put(os.path.join(d, "loose"), b"x", 0o644)
+    signal.alarm(5)
+    try:
+        nothing = all(ps.open_read(root, REL, n, forbidden=0) is None for n in ("nope", "link", "adir", "fifo"))
+        strict = ps.open_read(root, REL, "loose") is None
+        fd2 = ps.open_read(root, REL, "loose", forbidden=0o022)
+    finally:
+        signal.alarm(0)
+    allowed = fd2 is not None
+    if fd2 is not None:
+        os.close(fd2)
+    return first and nothing and strict and allowed
+
+
+@case("open_read: dir_forbidden refuses a file held in a directory somebody else could write")
+def _():
+    root, _victim = tree()
+    os.chmod(os.path.join(root, REL), 0o777)
+    refused_dir = ps.open_read(root, REL, "f", dir_forbidden=0o022) is None
+    fd = ps.open_read(root, REL, "f")
+    allowed = fd is not None
+    if fd is not None:
+        os.close(fd)
+    return refused_dir and allowed
+
+
+def _open_read_level(level):
+    @case("open_read: None when %s is a link" % level)
+    def _():
+        root, _victim = linked(level)
+        return ps.open_read(root, REL, "f", forbidden=0) is None
+
+
+for _level in LEVELS:
+    _open_read_level(_level)
 
 
 failures = 0

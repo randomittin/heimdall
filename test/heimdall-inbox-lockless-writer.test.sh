@@ -49,7 +49,7 @@ make_project() {
   printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$$" "$$" > "$d/.heimdall/app/connect.json"
   printf '%s' "$d"
 }
-with_module() { mkdir -p "$1/bin/lib"; cp "$REPO/bin/lib/companion_ui_inbox.py" "$1/bin/lib/companion_ui_inbox.py"; }
+with_module() { mkdir -p "$1/bin/lib"; cp "$REPO/bin/lib/companion_ui_inbox.py" "$1/bin/lib/companion_ui_inbox.py"; cp "$REPO/bin/lib/hmd_private_state.py" "$1/bin/lib/hmd_private_state.py"; }
 inode_of() { python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_ino)' "$1" 2>/dev/null || echo gone; }
 
 echo "1. a pop of an EMPTY inbox leaves the file where it is (same inode), with and without the real module:"

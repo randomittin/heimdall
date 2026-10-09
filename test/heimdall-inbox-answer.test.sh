@@ -115,7 +115,8 @@ class Project(object):
                            "relay": "x", "started_at": "t"}, f)
         if with_module:
             os.makedirs(os.path.join(self.root, "bin", "lib"))
-            shutil.copy(os.path.join(REPO, "bin", "lib", "companion_ui_inbox.py"), os.path.join(self.root, "bin", "lib"))
+            for lib in ("companion_ui_inbox.py", "hmd_private_state.py"):   # the library vendors its link-safe helper with it
+                shutil.copy(os.path.join(REPO, "bin", "lib", lib), os.path.join(self.root, "bin", "lib"))
         self.sid = str(uuid.uuid4())
         pdir = os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", self.root))
         os.makedirs(pdir)
@@ -648,6 +649,164 @@ p.put(id="new", ts=1000.0 + M.EXPIRE_AFTER_S + 5, text="fresh")
 check("nothing is expired before EXPIRE_AFTER_S", M.summary(p.root, now=1000.0 + M.EXPIRE_AFTER_S - 1)["expired"] == [])
 check("a message still pending EXPIRE_AFTER_S after it was sent is listed by id, the fresh one is not",
       M.summary(p.root, now=1000.0 + M.EXPIRE_AFTER_S + 1)["expired"] == ["old"])
+
+# ── links: nothing in the repo tree, and nothing on the way to the seal key, is ever followed ───────────────────────
+# A checkout can carry .heimdall, .heimdall/ui or any state file in it as a symlink, and $HEIMDALL_HOME/app can be one too.
+# The hook (both flavours: inline fallback and the shared library) and the library must refuse the link: nothing behind it
+# is read as the queue, written, truncated, renamed, locked, chmod'ed or created, the hook still exits 0, and it holds nobody.
+# The victim directory sits OUTSIDE the repo and holds the real files, so following a link would read valid state.
+import contextlib
+import stat as stat_mod
+
+
+def snap(path):
+    top = os.lstat(path)
+    rows = ["ROOT %o %d" % (top.st_mode, top.st_mtime_ns)]
+    for dp, dns, fns in os.walk(path):
+        for n in dns + fns:
+            q = os.path.join(dp, n)
+            st = os.lstat(q)
+            body = open(q, "rb").read() if stat_mod.S_ISREG(st.st_mode) else b""
+            rows.append("%s %o %d %d %r" % (os.path.relpath(q, path), st.st_mode, st.st_size, st.st_mtime_ns, body))
+    return sorted(rows)
+
+
+def new_victim(tag):
+    victim = os.path.join(TMP, "victim-" + tag)
+    os.makedirs(victim)
+    return victim
+
+
+@contextlib.contextmanager
+def heimdall_home(home):
+    old = os.environ.get("HEIMDALL_HOME")
+    os.environ["HEIMDALL_HOME"] = home
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("HEIMDALL_HOME", None)
+        else:
+            os.environ["HEIMDALL_HOME"] = old
+
+
+def hook(p, mode, wait="12"):
+    """(returncode, stdout, stderr, seconds) of one hook run; a hold that outlives the timeout reads as returncode None."""
+    payload = {"session_id": p.sid, "transcript_path": p.tx, "cwd": p.root, "hook_event_name": EVENTS.get(mode, ""),
+               "stop_hook_active": False, "last_assistant_message": "Done."}
+    t0 = time.time()
+    try:
+        done = subprocess.run([HOOK, mode, "--repo", p.root], input=json.dumps(payload), capture_output=True, text=True,
+                              timeout=40, env=dict(os.environ, HMD_INBOX_WAIT_S=wait))
+    except subprocess.TimeoutExpired:
+        return None, "", "", time.time() - t0
+    return done.returncode, done.stdout, done.stderr, time.time() - t0
+
+
+PLANTED = "planted behind a link"
+MINE = "a message of the phone"
+SIDE_FILES = {"inbox-delivered.jsonl": b'{"id":"old","ts":1,"text":"t","delivered_at":1.0}\n',
+              "inbox.jsonl.lock": b"SENTINEL\n", "inbox-state.json": b'{"waiting": true, "since": 1}',
+              "inbox-waiting": b'{"pid": 1, "since": 1, "until": 2, "ts": 1}'}
+
+for with_module in (False, True):
+    flavour = "module" if with_module else "inline"
+
+    # a link at a directory level of the repo tree, the queue (and connect.json) behind it
+    for level in (".heimdall", ".heimdall/ui"):
+        p = Project(with_module=with_module)
+        p.put(text=PLANTED)
+        victim = new_victim("%s-%s" % (flavour, level.replace("/", "-").strip(".")))
+        os.rename(os.path.join(p.root, level), os.path.join(victim, "moved"))
+        os.symlink(os.path.join(victim, "moved"), os.path.join(p.root, level))
+        before = snap(victim)
+        for mode in ("prompt", "tool", "stop"):
+            rc, out, err, took = hook(p, mode)
+            check("%s: a link at %s: %s delivers nothing from behind it, exits 0 at once and holds nobody" % (flavour, level, mode),
+                  rc == 0 and out == "" and took < 8, (rc, out[:160], err[:160], took))
+        check("%s: a link at %s: nothing behind it was written, truncated, renamed, locked, chmod'ed or created" % (flavour, level),
+              snap(victim) == before, "the victim changed")
+
+    # a link at one file of the queue
+    for name in ("inbox.jsonl", "inbox-delivered.jsonl", "inbox.jsonl.lock", "inbox-state.json", "inbox-waiting"):
+        p = Project(with_module=with_module)
+        ui = os.path.join(p.root, ".heimdall", "ui")
+        victim = new_victim("%s-%s" % (flavour, name))
+        target = os.path.join(victim, "moved-" + name)
+        if name == "inbox.jsonl":
+            p.put(text=PLANTED)
+            os.rename(p.inbox, target)
+        else:
+            p.put(text=MINE)
+            with open(target, "wb") as f:
+                f.write(SIDE_FILES[name])
+            os.chmod(target, 0o600)
+        os.symlink(target, os.path.join(ui, name))
+        before = snap(victim)
+        if name == "inbox.jsonl":
+            for mode in ("prompt", "tool", "stop"):
+                rc, out, err, took = hook(p, mode, wait="0")
+                check("%s: a link at inbox.jsonl: %s delivers nothing from behind it" % (flavour, mode),
+                      rc == 0 and out == "", (rc, out[:160], err[:160]))
+        elif name in ("inbox-delivered.jsonl", "inbox.jsonl.lock"):
+            rc, out, err, took = hook(p, "prompt")
+            check("%s: a link at %s: the pop is refused -- exit 0, nothing delivered, the message stays queued" % (flavour, name),
+                  rc == 0 and out == "" and [r["text"] for r in p.pending()] == [MINE], (rc, out[:160], err[:160], p.pending()))
+        elif name == "inbox-state.json":
+            rc, out, err, took = hook(p, "stop", wait="0")
+            check("%s: a link at inbox-state.json: the status mirror is not written, and the message is still delivered" % flavour,
+                  rc == 0 and MINE in (context_of(out) or ""), (rc, out[:160], err[:160]))
+        else:
+            os.remove(p.inbox)    # nothing queued: the hold on a connected companion publishes its marker, and a link AT the marker is replaced
+            rc, out, err, took = hook(p, "stop", wait="2")
+            check("%s: a link at inbox-waiting: the hold's marker replaces the link instead of being written through it, and is gone after" % flavour,
+                  rc == 0 and out == "" and not os.path.lexists(os.path.join(ui, name)), (rc, out[:160], err[:160], took))
+        check("%s: a link at %s: nothing behind it was written, truncated, renamed, locked, chmod'ed or created" % (flavour, name),
+              snap(victim) == before, "the victim changed")
+
+# the per-machine seal key lives under $HEIMDALL_HOME, outside every repo, but a link on the way to it is not believed either
+p = Project()
+p.ask()
+rec = M.append(p.root, "yes")
+victim = new_victim("key-dir-hook")
+os.rename(os.path.join(HOME_DIR, "app"), os.path.join(victim, "app"))
+os.symlink(os.path.join(victim, "app"), os.path.join(HOME_DIR, "app"))
+before = snap(victim)
+ctx = context_of(run_hook(p, "prompt")) or ""
+check("a link at $HEIMDALL_HOME/app: a stamp sealed under the key behind it does not verify -- an ordinary message, still delivered",
+      "answers" in rec and ctx.startswith(PLAIN_MARK) and "Operator's answer" not in ctx and "\n    yes" in ctx, (rec, ctx[:300]))
+check("... and the hook wrote nothing behind the link", snap(victim) == before, "the victim changed")
+os.unlink(os.path.join(HOME_DIR, "app"))
+os.rename(os.path.join(victim, "app"), os.path.join(HOME_DIR, "app"))
+
+home = os.path.join(TMP, "home-app-link")
+os.makedirs(home)
+victim = new_victim("key-dir-make")
+os.symlink(victim, os.path.join(home, "app"))
+before = snap(victim)
+with heimdall_home(home):
+    p = Project()
+    p.ask()
+    rec = M.append(p.root, "yes")
+    made = M._seal_key()
+check("a link at $HEIMDALL_HOME/app: no key is made behind it, nothing is chmod'ed, the message is queued unstamped",
+      made is None and "answers" not in rec and p.pending() == [rec] and snap(victim) == before, (made, rec, p.pending()))
+
+home = os.path.join(TMP, "home-key-link")
+os.makedirs(os.path.join(home, "app"))
+victim = new_victim("key-file")
+with open(os.path.join(victim, "key"), "wb") as f:
+    f.write(os.urandom(32))
+os.chmod(os.path.join(victim, "key"), 0o600)
+os.symlink(os.path.join(victim, "key"), os.path.join(home, "app", "inbox-answer.key"))
+before = snap(victim)
+with heimdall_home(home):
+    p = Project()
+    p.ask()
+    rec = M.append(p.root, "yes")
+    made = M._seal_key()
+check("a link at the key file itself: it is no key, nothing is written through it, the message is queued unstamped",
+      made is None and "answers" not in rec and p.pending() == [rec] and snap(victim) == before, (made, rec, p.pending()))
 
 shutil.rmtree(TMP, ignore_errors=True)
 PYEOF

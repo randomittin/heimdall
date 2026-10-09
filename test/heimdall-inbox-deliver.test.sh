@@ -89,7 +89,7 @@ bounded_stop() {
 }
 # with_module DIR -- make DIR carry bin/lib/companion_ui_inbox.py, so the tool
 # under test takes the shared-library path instead of the inline fallback.
-with_module() { mkdir -p "$1/bin/lib"; cp "$REPO/bin/lib/companion_ui_inbox.py" "$1/bin/lib/companion_ui_inbox.py"; }
+with_module() { mkdir -p "$1/bin/lib"; cp "$REPO/bin/lib/companion_ui_inbox.py" "$1/bin/lib/companion_ui_inbox.py"; cp "$REPO/bin/lib/hmd_private_state.py" "$1/bin/lib/hmd_private_state.py"; }
 # set_atime FILE AGE_S -- stamp FILE's access time AGE_S seconds in the past, mtime
 # untouched: the stand-in for "the terminal was last read AGE_S ago". Python, not
 # touch -d, so it means the same thing on BSD and GNU.
