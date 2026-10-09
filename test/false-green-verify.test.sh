@@ -59,7 +59,7 @@ work_root = os.path.join(tmp, "work")
 os.makedirs(work_root)
 fg_verify.GITHUB = "file://%s/" % remotes
 fg_verify.CLONE_RETRY_S = 0                  # the retry pause is for real networks; its mechanics are tested in [R]
-HERMETIC_ENV = (["{python} -m venv --system-site-packages .venv"], None)       # no PyPI: pytest comes from the interpreter's own site-packages
+HERMETIC_ENV = (["{python} -m venv --system-site-packages --without-pip .venv"], None)       # no PyPI: pytest comes from the interpreter's own site-packages; no pip either: ensurepip is ~4 s of CPU per workspace and nothing here installs anything
 fg_verify.env_steps = lambda tree: HERMETIC_ENV
 
 def git(root, *args):
