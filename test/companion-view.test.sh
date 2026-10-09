@@ -125,21 +125,56 @@ PYEOF
 }
 
 # mutant NAME FILE-IN-TREE OLD NEW GROUPS -- the suite's own cases for GROUPS must go red on the changed copy.
-mutant() {
-  local name="$1" rel="$2" old="$3" new="$4" groups="$5" dir out rc
+#
+# The mutants are independent of one another: each has its own copy of the tree, its own temp dir, and its own relay and client on
+# ports the OS hands out. Run one after another they were ~300 s of this suite's ~370 s -- nearly all of it waiting on sockets and
+# on the cases' own bounded waits -- which left a 400 s budget no room for a loaded machine. So `mutant` starts one and returns,
+# keeping at most MUTANT_JOBS in flight, and collect_mutants (called once, after the last) waits for them and reports each in the
+# order it was declared. A background job cannot add to PASS/FAIL itself, so its verdict is two lines in $TMPROOT/verdict.NAME:
+# ok|bad, then the message ok/bad prints.
+MUTANT_JOBS=6
+MUTANT_PIDS=()
+MUTANT_NAMES=()
+
+run_mutant() {
+  local name="$1" rel="$2" old="$3" new="$4" groups="$5" dir out rc verdict="$TMPROOT/verdict.$1"
   dir="$(mutant_tree "$name")"
-  if ! mutate "$dir/$rel" "$old" "$new" 2>"$TMPROOT/mut.err"; then
-    bad "mutant $name could not be built: $(cat "$TMPROOT/mut.err")"
+  if ! mutate "$dir/$rel" "$old" "$new" 2>"$TMPROOT/mut.$name.err"; then
+    printf 'bad\nmutant %s could not be built: %s\n' "$name" "$(cat "$TMPROOT/mut.$name.err")" >"$verdict"
     return
   fi
-  out="$TMPROOT/mut.out.$RANDOM"
+  out="$TMPROOT/mut.$name.out"
   python3 "$SCEN" main --client "$dir/bin/heimdall-relay-client" --groups "$groups" >"$out" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ] && grep -q '^  FAIL ' "$out"; then
-    ok "mutant $name turns the suite red ($(grep -c '^  FAIL ' "$out") checks failed: $(grep -m1 '^  FAIL ' "$out" | cut -c8-90))"
+    printf 'ok\nmutant %s turns the suite red (%s checks failed: %s)\n' "$name" "$(grep -c '^  FAIL ' "$out")" "$(grep -m1 '^  FAIL ' "$out" | cut -c8-90)" >"$verdict"
   else
-    bad "mutant $name NOT caught (exit $rc) -- the rule it removes is not what the cases test"
+    printf 'bad\nmutant %s NOT caught (exit %s) -- the rule it removes is not what the cases test\n' "$name" "$rc" >"$verdict"
   fi
+}
+
+mutant() {
+  local started=${#MUTANT_PIDS[@]}
+  # every mutant started before the last MUTANT_JOBS has been waited for by now: the one MUTANT_JOBS back is the oldest still possibly running
+  if [ "$started" -ge "$MUTANT_JOBS" ]; then
+    wait "${MUTANT_PIDS[$((started - MUTANT_JOBS))]}"
+  fi
+  run_mutant "$@" &
+  MUTANT_PIDS+=("$!")
+  MUTANT_NAMES+=("$1")
+}
+
+collect_mutants() {
+  local name kind message
+  wait
+  for name in "${MUTANT_NAMES[@]}"; do
+    if [ ! -s "$TMPROOT/verdict.$name" ]; then
+      bad "mutant $name left no verdict (its job died before it could write one)"
+      continue
+    fi
+    { IFS= read -r kind; IFS= read -r message; } <"$TMPROOT/verdict.$name"
+    if [ "$kind" = ok ]; then ok "$message"; else bad "$message"; fi
+  done
 }
 
 echo "-- the real client: main stack (groups wire diff paths secrets params size transcript pr latch kill)"
@@ -177,6 +212,8 @@ mutant pr-forward-gh-repo bin/lib/companion_view.py '"GH_CONFIG_DIR", "GH_HOST",
 mutant pr-no-timeout     bin/lib/companion_view.py 'GH_DEADLINE_S = 8.0' 'GH_DEADLINE_S = 3600.0' pr
 mutant pr-trust-exit-code bin/lib/companion_view.py $'        if code != 0:  # not logged in, no pull request for this branch, offline, ...: nothing to show\n            raise ViewError("not-found")' $'        if False:\n            raise ViewError("not-found")' pr
 mutant gate-ignore-head  bin/lib/companion_view.py 'green = covered == head and receipt.get("tree_clean") is True' 'green = receipt.get("tree_clean") is True' pr
+
+collect_mutants
 
 echo ""
 echo "$PASS passed, $FAIL failed"
