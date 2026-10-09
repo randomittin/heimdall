@@ -209,14 +209,21 @@
 # backstop and as the cadence of the marker heartbeat, typing release, orphan guard and
 # companion check; MIN_LAP_S keeps a busy directory from spinning the hold.
 #
-# ASYNC REWAKE (Claude Code 2.1.287; static evidence from the binary, not run live). The
-# settings schema has a hook field asyncRewake ("runs in the background and wakes the
-# model on exit code 2"); on exit 2 the handler queues a task-notification at priority
-# next whose body is the hook's stderr, else stdout. It is honoured in interactive
-# sessions and headless ones with streaming input only. Whether an IDLE session at an
-# empty prompt drains that queue was not exercised, so nothing here builds on it: the
-# 300s hold still covers an idle session, and a message left after it waits for the
-# operator.
+# ASYNC REWAKE (verified live on Claude Code 2.1.295: the real TUI under a pty, hooks from a
+# throwaway project). The settings schema has a hook field asyncRewake ("runs in the
+# background and wakes the model on exit code 2"); on exit 2 the handler queues a
+# task-notification at priority next whose body is the hook's stderr, else stdout. It is
+# honoured in interactive sessions and headless ones with streaming input only. An IDLE
+# session at an empty prompt DOES drain that queue: a Stop hook started a 20s asyncRewake
+# hook, nothing was typed, and 21.6s after that Stop the session took a turn on its own and
+# answered the hook's stderr. That turn ran UserPromptSubmit (its prompt was the
+# task-notification), so the prompt mode below delivers the pending message in it; its Stop
+# payload had stop_hook_active=true, where the stop mode stands down on purpose.
+# bin/heimdall-inbox-wake is that hook: it only wakes the session and never carries message
+# text, so the 300s hold still covers the stretch right after a Stop and the wake covers the
+# session left idle after it. Not woken: headless and sub-agent sessions, a session with
+# HMD_INBOX_WAKE=off or its wake hooks switched off, and any session while no companion is
+# connected.
 #
 # EVERY MODE EXITS 0. A delivery-mechanism bug must never block or crash a
 # Stop/UserPromptSubmit turn. Message text is sanitized (control characters

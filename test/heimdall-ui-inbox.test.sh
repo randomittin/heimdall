@@ -788,6 +788,185 @@ PYEOF
   else
     bad "A2.8 module-level contract: $A2_UNIT_OUT"
   fi
+
+  # ═══ A2.9 a wake armed for the idle session: inbox.consumer == "wake" ═══
+  # bin/heimdall-inbox-wake leaves, per session, .heimdall/ui/wake/<claude pid>.json (SessionStart `register`)
+  # and <claude pid>.lock, an exclusive flock held for as long as that session's `watch` lives (the kernel frees
+  # it on any death). The queue is empty here (A2.7 popped the last message), so a real watcher only idles, and
+  # connect.json from A2.4 names live same-user pids: the companion a wake insists on. Real register, real
+  # watch, real server, real HTTP.
+  unset HMD_INBOX_WAKE
+  WAKE="$REPO/bin/heimdall-inbox-wake"
+  sleep 600 &
+  A2_CLAUDE=$!                       # stands in for the claude process the hook is armed for
+  PIDS+=("$A2_CLAUDE")
+  printf '{"session_id":"s9"}' | "$WAKE" register --repo "$A2_FIX" --pid "$A2_CLAUDE"
+  if [ -f "$A2_UIDIR/wake/$A2_CLAUDE.json" ] && a2_until '.inbox.pending == 0 and .inbox.consumer == "none"' 6; then
+    ok "A2.9a a registered session with no armed watcher is not a wake: consumer none"
+  else
+    bad "A2.9a: wake dir: $(ls -l "$A2_UIDIR/wake" 2>&1); inbox: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null)"
+  fi
+  HMD_INBOX_WAKE_POLL_S=0.2 HMD_INBOX_WAKE_MAX_S=120 "$WAKE" watch --repo "$A2_FIX" --pid "$A2_CLAUDE" >/dev/null 2>&1 &
+  A2_WATCH=$!
+  PIDS+=("$A2_WATCH")
+  if a2_until '.inbox.consumer == "wake" and (.inbox | keys == ["consumer","delivered","expired","oldest_age_s","pending"])' 10; then
+    ok "A2.9b a real armed watcher on a live session, companion connected -> consumer wake, same five-key slice"
+  else
+    bad "A2.9b consumer never became wake: $(jq -c '.inbox' "$A2_STATE" 2>/dev/null); wake dir: $(ls -l "$A2_UIDIR/wake" 2>&1)"
+  fi
+  printf 'sess:0.0\n' > "$A2_UIDIR/tmux-target"
+  if a2_until '.inbox.consumer == "tmux"' 6; then ok "A2.9c a configured tmux target outranks the armed wake"; else bad "A2.9c: $(jq -c '.inbox' "$A2_STATE")"; fi
+  rm -f "$A2_UIDIR/tmux-target"
+  if a2_until '.inbox.consumer == "wake"' 6; then ok "A2.9d target removed -> wake again"; else bad "A2.9d: $(jq -c '.inbox' "$A2_STATE")"; fi
+  kill "$A2_WATCH" 2>/dev/null; wait "$A2_WATCH" 2>/dev/null || true
+  if a2_until '.inbox.consumer == "none"' 6; then ok "A2.9e watcher killed (the kernel frees its lock) -> consumer none"; else bad "A2.9e consumer stuck: $(jq -c '.inbox' "$A2_STATE")"; fi
+  kill "$A2_CLAUDE" 2>/dev/null; wait "$A2_CLAUDE" 2>/dev/null || true
+
+  # ═══ A2.10 every gate behind "wake", at module level (files built the way the hook leaves them) ═══
+  A2_WUNIT="$TMPROOT/a2-wake-unit.py"
+  cat > "$A2_WUNIT" <<'WAKEPY'
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.join(sys.argv[1], "bin", "lib"))
+import companion_ui_inbox as M
+
+me = os.getpid()    # a live pid of this user: stands in for the claude session and for the companion's processes
+gone = subprocess.Popen([sys.executable, "-c", "0"])
+gone.wait()         # its pid is dead now
+verdicts = []
+
+
+def check(name, cond):
+    verdicts.append("%s %s" % ("OK " if cond else "BAD", name))
+
+
+def project():
+    root = tempfile.mkdtemp()
+    wake = os.path.join(root, ".heimdall", "ui", "wake")
+    os.makedirs(wake)
+    os.makedirs(os.path.join(root, ".heimdall", "app"))
+    return root, wake
+
+
+def write(path, obj, mode=0o600):
+    with open(path, "w") as f:
+        json.dump(obj, f)
+    os.chmod(path, mode)
+
+
+def register(wake, pid=me, named=None, mode=0o600):    # what `heimdall-inbox-wake register` leaves
+    write(os.path.join(wake, "%d.json" % pid), {"pid": pid if named is None else named}, mode)
+
+
+def connect(root, pid=me, mode=0o600):                  # what `hmd app connect` leaves
+    write(os.path.join(root, ".heimdall", "app", "connect.json"), {"mode": "relay", "pid_ui": pid, "pid_client": pid}, mode)
+
+
+def arm(wake, pid=me):                                  # `heimdall-inbox-wake watch`: an exclusive flock on <pid>.lock while it lives
+    fd = os.open(os.path.join(wake, "%d.lock" % pid), os.O_WRONLY | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def consumer(root):
+    return M.consumer_state(root)
+
+
+root, wake = project()
+register(wake)
+connect(root)
+fd = arm(wake)
+check("registered session + held lock + live companion -> wake", consumer(root) == "wake")
+served = M.summary(root)
+check("summary() serves it inside the unchanged five-key slice",
+      served["consumer"] == "wake" and sorted(served) == ["consumer", "delivered", "expired", "oldest_age_s", "pending"])
+os.close(fd)
+check("watcher gone (lock freed, files left behind) -> none", consumer(root) == "none")
+
+root, wake = project()
+connect(root)
+fd = arm(wake)
+check("a held lock nobody registered -> none", consumer(root) == "none")
+register(wake, mode=0o644)
+check("a registration other users can read was not written by the hook -> none", consumer(root) == "none")
+register(wake, named=me + 1)
+check("a registration naming another pid -> none", consumer(root) == "none")
+os.close(fd)
+
+root, wake = project()
+register(wake)
+connect(root)
+fd = arm(wake)
+os.chmod(os.path.join(wake, "%d.lock" % me), 0o644)
+check("a lock file other users can read -> none", consumer(root) == "none")
+os.close(fd)
+
+root, wake = project()
+register(wake)
+connect(root)
+real = os.path.join(root, "elsewhere.lock")
+held = os.open(real, os.O_WRONLY | os.O_CREAT, 0o600)
+fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+os.symlink(real, os.path.join(wake, "%d.lock" % me))
+check("a symlinked lock file is never followed -> none", consumer(root) == "none")
+os.close(held)
+
+root, wake = project()
+register(wake, pid=gone.pid)
+connect(root)
+fd = arm(wake, pid=gone.pid)
+check("a held lock for a pid that no longer exists -> none", consumer(root) == "none")
+os.close(fd)
+
+root, wake = project()
+register(wake)
+fd = arm(wake)
+check("no connect.json: the watcher would never wake -> none", consumer(root) == "none")
+connect(root, pid=gone.pid)
+check("connect.json naming a dead process -> none", consumer(root) == "none")
+connect(root, mode=0o666)
+check("a world-writable connect.json -> none", consumer(root) == "none")
+connect(root)
+check("the live, private connect.json -> wake", consumer(root) == "wake")
+os.close(fd)
+
+root, wake = project()
+register(wake)
+connect(root)
+fd = arm(wake)
+marker = os.path.join(root, ".heimdall", "ui", "inbox-waiting")
+with open(marker, "w") as f:
+    f.write("{}")
+check("a live stop long-poll outranks an armed wake", consumer(root) == "waiting")
+os.remove(marker)
+os.environ["HMD_TMUX_TARGET"] = "env:0.0"
+check("a configured tmux target outranks it too: wake only ever upgrades none", consumer(root) == "tmux")
+del os.environ["HMD_TMUX_TARGET"]
+check("with neither, the armed wake is the consumer", consumer(root) == "wake")
+os.close(fd)
+check("and none the moment the watcher dies", consumer(root) == "none")
+
+root, wake = project()
+register(wake)
+connect(root)
+for odd in ("99999999999999999999.lock", "x.lock", "%d.lock.tmp" % me):
+    open(os.path.join(wake, odd), "w").close()
+check("names that are not <pid>.lock are ignored, never an error", consumer(root) == "none")
+print("\n".join(verdicts))
+WAKEPY
+  A2_WU_OUT="$(python3 "$A2_WUNIT" "$REPO" 2>&1)"
+  A2_WU_BAD="$(printf '%s\n' "$A2_WU_OUT" | grep -c '^BAD' || true)"
+  A2_WU_OK="$(printf '%s\n' "$A2_WU_OUT" | grep -c '^OK' || true)"
+  if [ "$A2_WU_BAD" = "0" ] && [ "$A2_WU_OK" -ge 18 ]; then
+    ok "A2.10 consumer wake: registration, held lock, live pid, live companion and precedence all gate it ($A2_WU_OK checks)"
+  else
+    bad "A2.10 wake gates: $A2_WU_OUT"
+  fi
 fi
 
 # ═══ 20. server survived every malformed/oversize/secret/control-char/
