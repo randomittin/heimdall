@@ -274,6 +274,39 @@ assert_class_absent  "$LINT6_OUT" "1-SIGPIPE" "errexit-only, no pipefail"
 assert_class_present "$LINT7_OUT" "1-SIGPIPE" "errexit AND pipefail together (positive control)"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# A4. CLASS-4 READ-AS-SUBCOMMAND — a helper's `read` ARGUMENT is not the builtin.
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression fence for a real false positive found 2026-10-10 at bin/heimdall-app:408:
+# `"$PY3" "$LIB_DIR/hmd_private_state.py" read --root "$1" …` runs a helper's `read`
+# SUBCOMMAND. Class 4 strips quoted words before hunting the `read` command word, which
+# left that line looking as if it OPENED with `read`, so the prompt rule fired, blocked
+# every push, and failed this suite's CLEAN-TREE proof. Planted at known lines: the
+# line-start and the after-`&&` forms must stay quiet, and the real builtin prompt beside
+# them must remain the only class-4 finding. Do NOT reflow the heredoc without updating
+# the expected line below.
+echo "A4. CLASS-4 READ-AS-SUBCOMMAND (a helper's read argument is not the builtin):"
+FIX8="$FIX_DIR/heimdall-fixture8"
+cat > "$FIX8" <<'FIXTURE8'
+#!/usr/bin/env bash
+set -euo pipefail
+helper_read() {
+  "$PY3" "$LIB_DIR/helper.py" read --root "$1" --name "$2" 2>/dev/null
+}
+helper_read_chained() {
+  [ -f "$1" ] && "$PY3" "$LIB_DIR/helper.py" read --name "$2"
+}
+real_prompt() { read -p "Proceed? [y/N] " ans; echo "$ans"; }
+FIXTURE8
+chmod +x "$FIX8"
+LINT8_OUT="$("$LINT" "$FIX8" 2>/dev/null || true)"
+c4_lines8="$(grep -F '  4-TTY-READ  ' <<<"$LINT8_OUT" | sed -E 's/^[^:]*:([0-9]+).*/\1/' | tr '\n' ' ')"
+if [ "$c4_lines8" = "9 " ]; then
+  ok "helper 'read' subcommands (lines 4, 7) not flagged; the real builtin prompt (line 9) still is"
+else
+  bad "expected a class-4 finding at line 9 only, got: ${c4_lines8:-none}"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # B. CLEAN-TREE — zero false positives on the real shipped scripts.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "B. CLEAN-TREE (no false positives on the real current tree):"
@@ -301,7 +334,13 @@ fi
 # landmine lint as a blocking step. We DO NOT push to origin — we drive the hook.
 echo "C. GATE-BLOCKS-A-PUSH (R9, hook-driven, no origin):"
 CLONE="$WORK/clone"
-if git clone --quiet --local "$REPO" "$CLONE" 2>/dev/null; then
+# Shallow on purpose. selfscan's history gates (gitleaks over --all, the identity walk)
+# cost O(commits) per hook run and this section runs the hook three times, yet nothing
+# here is about history: the proof is that a landmine planted in the TREE blocks the push.
+# The single tip commit still carries the whole real tree, so the lint and the tree-secret
+# scan examine all of it exactly as before; history-wide behaviour is test/selfscan.test.sh's
+# job. (`--local` ignores `--depth`, hence the file:// URL.)
+if git clone --quiet --depth 1 "file://$REPO" "$CLONE" 2>/dev/null; then
   # Match this repo's relocatable wiring: hooks live in .heimdall/git-hooks and
   # core.hooksPath points there (relative). The clone carries .heimdall/git-hooks
   # in-tree; wire core.hooksPath so the native hook is live.

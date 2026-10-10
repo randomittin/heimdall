@@ -521,6 +521,13 @@ scan_tty_read() {
     strip_matches "$bare" "$_RE_SQ_STRING"; bare="$STRIPPED"
     # Must contain a `read` command word (start of line or after ;/&&/|| / `(`).
     [[ $bare =~ $_RE_READ_WORD ]] || continue
+    # Stripping the quoted words in FRONT of a `read` can leave it looking like the first
+    # word of the command: `"$PY3" "$LIB/x.py" read --root "$1"` strips to ` read --root `,
+    # yet there `read` is a SUBCOMMAND of the helper, not the builtin (bin/heimdall-app:408
+    # tripped this and blocked the push). The builtin must ALSO sit at a command boundary in
+    # the line as written. That is an intersection of two verdicts, so it can only ever remove
+    # a finding that was this false positive, never add one.
+    [[ $line =~ $_RE_READ_WORD ]] || continue
     # Skip `read` that pulls from a pipe/file/herestring/process-sub (not stdin):
     #   trailing `< …`, `<<< …`, `<<EOF`, or the line is the body of `… | while`.
     case "$bare" in
@@ -637,13 +644,50 @@ scan_order_destroy() {
 }
 
 # ── Run every detector over every in-scope file ───────────────────────────────
-for f in "${FILES[@]}"; do
-  scan_sigpipe        "$f"
-  scan_unguarded_var  "$f"
-  scan_baked_path     "$f"
-  scan_tty_read       "$f"
-  scan_order_destroy  "$f"
-done
+scan_file() {
+  scan_sigpipe        "$1"
+  scan_unguarded_var  "$1"
+  scan_baked_path     "$1"
+  scan_tty_read       "$1"
+  scan_order_destroy  "$1"
+}
+
+# The files are independent and the run is bound by bash `while read` loops (up to four
+# passes walk each file's lines), so a tree-sized scan is split into contiguous chunks
+# scanned by concurrent workers. Contiguous chunks concatenated in worker order print the
+# findings in exactly the order a sequential walk would. A handful of explicit files (the
+# fixtures) stay inline: the fan-out costs more than it saves there. Each worker writes its
+# finding count LAST, so a worker that dies (a `set -e` abort, a kill) leaves no count and
+# the run fails closed (exit 2) instead of certifying a tree it never finished scanning.
+SCAN_JOBS=4
+if [ "${#FILES[@]}" -lt 16 ]; then
+  for f in "${FILES[@]}"; do scan_file "$f"; done
+else
+  SCAN_TMP="$(mktemp -d)"
+  trap 'rm -rf "$SCAN_TMP"' EXIT
+  chunk=$(( (${#FILES[@]} + SCAN_JOBS - 1) / SCAN_JOBS ))
+  for (( w = 0; w < SCAN_JOBS; w++ )); do
+    (
+      FINDINGS=0
+      for (( k = w * chunk; k < (w + 1) * chunk && k < ${#FILES[@]}; k++ )); do
+        scan_file "${FILES[$k]}"
+      done > "$SCAN_TMP/out.$w"
+      printf '%s\n' "$FINDINGS" > "$SCAN_TMP/count.$w"
+    ) &
+  done
+  wait
+  for (( w = 0; w < SCAN_JOBS; w++ )); do
+    n=""
+    if [ -f "$SCAN_TMP/count.$w" ]; then read -r n < "$SCAN_TMP/count.$w" || n=""; fi
+    case "$n" in
+      ''|*[!0-9]*)
+        echo "heimdall-landmine-lint: scan worker $w did not finish — refusing to certify the tree" >&2
+        exit 2 ;;
+    esac
+    cat "$SCAN_TMP/out.$w"
+    FINDINGS=$((FINDINGS + n))
+  done
+fi
 
 if [ "$FINDINGS" -gt 0 ]; then
   echo "" >&2
