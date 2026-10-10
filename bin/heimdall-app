@@ -74,7 +74,18 @@
 #                              window's schedule (HMD_PAIR_WINDOW_RENEW_MIN_S 300,
 #                              HMD_PAIR_WINDOW_RENEW_LEAD_S 10: about every 350 s,
 #                              ahead of the lapse) for up to HMD_PAIR_WINDOW_IDLE_H
-#                              hours (default 4; HMD_RELAY_CODE_WINDOW_S sets the
+#                              hours (default 0, never stop: a connect that pairs by code is
+#                              watched, and when its client ends for a reason that is not
+#                              final -- pairing-expired, a window that ran out, a crash, a
+#                              relay that did not answer -- the next one is started after a
+#                              back-off (HMD_CONNECT_RESTART_S 5, doubling to
+#                              HMD_CONNECT_RESTART_MAX_S 300), so the code stays claimable
+#                              for as long as connect runs, also with --bg, which leaves a
+#                              watcher behind; never after `hmd app disconnect`, the phone's
+#                              revoke or an auth failure, and not past an explicit
+#                              HMD_PAIR_WINDOW_IDLE_H above 0, which is a bound that ends it;
+#                              a phone that comes back by code is logged as "re-paired by
+#                              code"; HMD_RELAY_CODE_WINDOW_S sets the
 #                              seconds instead) with no phone paired, and tries a
 #                              renewal the relay could not take again 30 s on
 #                              (HMD_RELAY_CODE_RENEW_RETRY_S). --confirm keeps the
@@ -437,6 +448,54 @@ st = mod.stat_file(sys.argv[2], ".heimdall/app", sys.argv[3])
 if st is None:
     sys.exit(1)
 print(int(st.st_mtime))' "$LIB_DIR/hmd_private_state.py" "$1" "$2" 2>/dev/null
+}
+
+# _state_read_loose REPO NAME -- the file's bytes, believed when it is a regular file of this user's that nobody else can write: the
+# 0644 file an older hmd left passes, a link, another account's file or a group/world-writable one does not. Nothing, and 1, otherwise.
+_state_read_loose() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" "$LIB_DIR/hmd_private_state.py" read --root "$1" --rel "$APP_REL" --name "$2" --forbidden 022 2>/dev/null
+}
+
+# _state_mode REPO NAME -- the permission bits (four octal digits) of <repo>/.heimdall/app/NAME, taken without following a link, when
+# that is a regular file of this user's; nothing, and 1, otherwise
+_state_mode() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" -I -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("hmd_private_state", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+st = mod.stat_file(sys.argv[2], ".heimdall/app", sys.argv[3])
+if st is None:
+    sys.exit(1)
+print("%04o" % (st.st_mode & 0o7777))' "$LIB_DIR/hmd_private_state.py" "$1" "$2" 2>/dev/null
+}
+
+# _connect_doc REPO -- connect.json's content, or nothing and 1. A 0600 file of this user's is believed as ever. A file an older hmd
+# wrote is 0644 (the shell's umask), which _state_read refuses -- and which made status say `connected: no` of a live session, and
+# disconnect leave it running. Such a file is believed only while it names something this repo really runs: its relay client or its
+# ui, each looked at as a process (this user's, the right program, working on THIS repo). A file a checkout planted names nothing of
+# the kind, so it stays no state at all. Nothing is changed on disk: connect writes the file 0600 again, disconnect removes it.
+_connect_doc() {
+  local doc real
+  doc="$(_state_read "$1" connect.json)" && { printf '%s' "$doc"; return 0; }
+  doc="$(_state_read_loose "$1" connect.json)" || return 1
+  real="$(_real_dir "$1")" || return 1
+  if _pid_is_relay_client "$(_doc_field "$doc" .pid_client)" "$real" \
+      || _pid_is_heimdall_ui "$(_doc_field "$doc" .pid_ui)" "$real" published; then
+    printf '%s' "$doc"
+    return 0
+  fi
+  return 1
+}
+
+# _connect_loose_note REPO -- "connect.json is mode 0644 (...)" when connect.json is a file of this user's with group or other permission
+# bits (hmd app writes 0600); nothing otherwise
+_connect_loose_note() {
+  local mode
+  mode="$(_state_mode "$1" connect.json)" || return 0
+  case "${mode: -2}" in 00) return 0 ;; esac
+  printf 'connect.json is mode %s (hmd app writes 0600; an older hmd wrote 0644)' "$mode"
 }
 
 # _real_dir DIR -- the real path of the directory DIR; 1 when it is not one
@@ -939,6 +998,7 @@ _relay_event() {
   case "$ev" in
     pair_init)
       pair_init_seen=true
+      ever_started=true
       local qr_json pcode exp remain now renewal
       qr_json="$(printf '%s' "$line" | jq -c '.qr // empty' 2>/dev/null)"
       exp="$(printf '%s' "$line" | jq -r '.exp // empty' 2>/dev/null)"
@@ -946,6 +1006,7 @@ _relay_event() {
       [ -n "$exp" ] && pairing_exp="$exp"
       # a renewal is the SAME session code behind a fresh session: its QR is not printed again
       [ -n "$renewal" ] && return 0
+      [ "$generation" -gt 1 ] && return 0  # a client started by the supervisor: nobody is shown its QR
       pcode="$(printf '%s' "$qr_json" | jq -r '.pairing_code // empty' 2>/dev/null)"
       echo ""
       if [ "$code_requested" = true ]; then
@@ -1001,6 +1062,7 @@ _relay_event() {
       ;;
     code_window_closed)
       code_active=false
+      window_closed=true
       warned_expired=true
       echo "hmd app connect: code window closed — rerun to pair" >&2
       ;;
@@ -1043,7 +1105,16 @@ _relay_event() {
       plogin="$(_clean_text "$(printf '%s' "$line" | jq -r '.gh_login // empty' 2>/dev/null)")"
       code_active=false
       paired_announced=true  # its device_bound follows at once and is not announced a second time
-      echo "hmd app: phone paired via code -- relay-claimed device '${plabel:-unnamed device}', GitHub @${plogin:-unknown}"
+      if [ "$paired_before" = true ]; then
+        # a phone back on the code after an earlier pairing of this run: the app's silent re-pair, which nobody else would see
+        echo "hmd app: phone re-paired by code -- relay-claimed device '${plabel:-unnamed device}', GitHub @${plogin:-unknown}" >&2
+      else
+        echo "hmd app: phone paired via code -- relay-claimed device '${plabel:-unnamed device}', GitHub @${plogin:-unknown}"
+      fi
+      paired_before=true
+      ;;
+    session_ended)
+      ended_reason="$(printf '%s' "$line" | jq -r '.reason // empty' 2>/dev/null)"
       ;;
     device_bound)
       code_active=false
@@ -1060,6 +1131,8 @@ _relay_event() {
       local msg
       msg="$(printf '%s' "$line" | jq -r '.message // .error // empty' 2>/dev/null)"
       echo "hmd app connect: relay client error: ${msg:-$line}" >&2
+      case "${msg:-$line}" in *"pair/init HTTP 401"*|*"pair/init HTTP 403"*) auth_failed=true ;; esac
+      case "${msg:-$line}" in *"E2E unavailable"*) e2e_missing=true ;; esac
       ;;
     *) : ;;
   esac
@@ -1141,7 +1214,7 @@ _ui_proc_repo() {
 # as its client: a running session, not a leftover.
 _ui_serves_client() {
   local doc
-  doc="$(_state_read "$1" connect.json)" || return 1
+  doc="$(_connect_doc "$1")" || return 1
   [ "$(_doc_field "$doc" .pid_ui)" = "$3" ] || return 1
   _pid_is_relay_client "$(_doc_field "$doc" .pid_client)" "$2"
 }
@@ -1473,7 +1546,7 @@ cmd_connect() {
     # needed since jq's own "file not found" stderr is redirected away and
     # an empty result behaves identically to the port being unknown.
     local stale_port=""
-    stale_port="$(_doc_field "$(_state_read "$REPO" connect.json)" .port)"
+    stale_port="$(_doc_field "$(_connect_doc "$REPO")" .port)"
     _ui_port_ok "$stale_port" || stale_port=""
     # N1: best-effort here, deliberately -- surfaces the same loud warning
     # and never claims success it doesn't have, but a stale funnel that
@@ -1619,6 +1692,141 @@ cmd_connect() {
   return "$ui_rc"
 }
 
+# ── `hmd app connect` keeps the relay client it pairs by code with up ─────────────────────────────────────────────────────────────
+# A client that ended at pairing-expired after its window left the phone unable to pair until someone noticed. A connect that pairs by
+# code (not --confirm, which is attended at its terminal; not QR-only, whose QR nobody else sees) now watches its client and starts the
+# next one when it ends for a reason that is not final, after a back-off. The helpers below read and set cmd_connect_relay's own
+# locals (dynamic scope, as _relay_event does): supervise, ever_started, ended_reason, fails, generation, started_ts, ...
+#   final     the client said local-disconnect (hmd app disconnect, a signal), revoked or ended (the phone's revoke); the relay answered
+#             its /pair/init 401 or 403, or the stream 401 (an auth failure); there is no E2E (another try changes nothing); the
+#             operator bounded the window (HMD_PAIR_WINDOW_IDLE_H above 0) and it closed; connect.json is no longer this run's (a
+#             disconnect ran, or a newer connect took over); ten starts in a row each ended within 30 s.
+#   anything  else -- pairing-expired, a window that ran out, a crash, a relay that did not answer -- is followed by a new client:
+#             --code-only, the same code behind a new session, after HMD_CONNECT_RESTART_S seconds (default 5) doubled with each end
+#             that came within 30 s of its start, up to HMD_CONNECT_RESTART_MAX_S (default 300).
+# _relay_write_state -- connect.json for the ui and client that run now
+_relay_write_state() {
+  jq -n --argjson pid_ui "$UI_PID" --argjson pid_client "$CLIENT_PID" --argjson port "$actual_port" --arg relay "$RELAY_URL" \
+    --arg started_at "$relay_started_at" \
+    '{mode: "relay", pid_ui: $pid_ui, pid_client: $pid_client, port: $port, relay: $relay, started_at: $started_at}' \
+    | _state_write "$REPO" connect.json
+}
+
+# _relay_still_mine -- 0 while connect.json is this run's (it names this run's ui)
+_relay_still_mine() {
+  [ "$(_doc_field "$(_connect_doc "$REPO")" .pid_ui)" = "$UI_PID" ]
+}
+
+# _relay_respawn -- start the next relay client: --code-only (it ends with a code that says whether another try can do better, as the
+# pair window's does), the GitHub token read again and handed over on a private pipe exactly as the first was, connect.json naming it.
+# 1 when it could not be started or connect.json is no longer this run's.
+_relay_respawn() {
+  local tok="" ctl win_s min_s lead_s event_s repaired=""
+  [ "$paired_before" = true ] && repaired=1
+  if ! _gh_token_into tok; then
+    echo "hmd app connect: laptop not signed in to GitHub (gh auth login) -- the code cannot be offered again" >&2
+    return 1
+  fi
+  ctl="$(umask 077; mktemp -d)" || return 1
+  if ! mkfifo "$ctl/in" 2>/dev/null; then
+    rm -rf "$ctl"
+    return 1
+  fi
+  exec 3<>"$ctl/in"
+  exec 4<"$ctl/in"
+  rm -rf "$ctl"
+  read -r win_s min_s lead_s event_s <<<"$(_connect_window_knobs false)"
+  : >"$CLIENT_OUT"
+  : >"$CLIENT_ERR"
+  HMD_RELAY_REPAIRED="$repaired" HMD_RELAY_CODE_WINDOW_S="$win_s" HMD_RELAY_CODE_RENEW_MIN_S="$min_s" HMD_RELAY_CODE_RENEW_LEAD_S="$lead_s" \
+    HMD_RELAY_CODE_RENEW_EVENT_MIN_S="$event_s" \
+    "$RELAY_CLIENT_BIN" "${client_args[@]}" --code-only <&4 3>&- 4>&- >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
+  CLIENT_PID=$!
+  exec 4<&-
+  printf '%s\n' "$tok" >&3
+  tok=""
+  exec 3>&-
+  generation=$((generation + 1))
+  started_ts="$(date +%s)"
+  seen_lines=0 pair_init_seen=false code_resolved=false code_active=false client_gone=false
+  ended_reason="" auth_failed=false e2e_missing=false window_closed=false self_stopped=false
+  _relay_write_state || return 1
+  _relay_still_mine
+}
+
+# _relay_supervise_step -- the client is gone (client_rc, and what its events said): 0 once the next one runs, 1 when connect is over
+_relay_supervise_step() {
+  local ran delay
+  [ "$supervise" = true ] && [ "$ever_started" = true ] || return 1
+  if [ "$self_stopped" != true ]; then
+    case "$ended_reason" in local-disconnect|revoked|ended) return 1 ;; esac
+  fi
+  case "$ended_reason" in stream-401) return 1 ;; esac
+  [ "$auth_failed" = true ] && return 1
+  [ "$e2e_missing" = true ] && return 1
+  if [ "$window_closed" = true ] && _connect_capped; then return 1; fi
+  _relay_still_mine || { STATE_WRITTEN=false; return 1; }
+  ran=$(( $(date +%s) - started_ts ))
+  if [ "$ran" -ge 30 ]; then fails=0; else fails=$((fails + 1)); fi
+  if [ "$fails" -ge 10 ]; then
+    echo "hmd app connect: the relay client ended $fails times in a row within 30 s of its start -- not starting another; run hmd app connect again" >&2
+    return 1
+  fi
+  delay="$restart_s"
+  [ "$fails" -gt 1 ] && delay=$(( restart_s * (1 << (fails - 1)) ))
+  [ "$delay" -gt "$restart_max_s" ] && delay="$restart_max_s"
+  echo "hmd app connect: the relay client ended (${ended_reason:-exit $client_rc}) -- starting another in ${delay}s so the code stays claimable" >&2
+  _pw_nap "$delay"
+  _relay_still_mine || { STATE_WRITTEN=false; return 1; }
+  if ! _relay_respawn; then
+    _relay_stop_client "$CLIENT_PID" || true
+    return 1
+  fi
+  return 0
+}
+
+# _relay_loop HANDOFF -- the wait loop of cmd_connect_relay: renders the client's events, returns 0 once `--bg` (HANDOFF true) has what
+# it came for, and returns 10 when the client is gone for good (or, with nothing to supervise, gone at all).
+_relay_loop() {
+  local handoff="$1" now2
+  while :; do
+    if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
+      wait "$CLIENT_PID" 2>/dev/null
+      client_rc=$?
+      client_gone=true
+      _relay_drain  # whatever it printed between the last look and its exit
+      _relay_supervise_step && continue
+      return 10
+    fi
+
+    _relay_drain
+
+    # a window that ran out is followed by the next one at once, not when the relay ends the unclaimed session a minute on: the client
+    # is asked to stop, which revokes its session and frees the code
+    if [ "$supervise" = true ] && [ "$window_closed" = true ] && [ "$self_stopped" != true ] && ! _connect_capped; then
+      self_stopped=true
+      _relay_stop_client "$CLIENT_PID" || true
+      continue
+    fi
+
+    # --bg returns once pairing has started -- and, when a code was asked for, once the relay has answered
+    # for it (or 30 s have passed), so the SESSION CODE is on screen before this leaves.
+    if [ "$pair_init_seen" = true ] && [ "$handoff" = true ] \
+        && { [ "$code_requested" != true ] || [ "$code_resolved" = true ] || [ "$(date +%s)" -ge "$bg_code_deadline" ]; }; then
+      return 0
+    fi
+
+    if [ "$pair_init_seen" = true ] && [ "$warned_expired" = false ] && [ "$code_active" != true ] && [ "$pairing_exp" -gt 0 ] && [ "$supervise" != true ]; then
+      now2="$(date +%s)"
+      if [ "$now2" -gt $((pairing_exp + 5)) ]; then
+        echo "hmd app connect: pairing code expired -- Ctrl-C and reconnect to mint a new one" >&2
+        warned_expired=true
+      fi
+    fi
+    sleep 0.2
+  done
+}
+
 # cmd_connect_relay: the --relay counterpart to cmd_connect's tailscale path
 # above -- publish through the Cloudflare relay instead of Tailscale Funnel.
 # Never reimplements bin/heimdall-relay-client's own logic (E2E crypto, the
@@ -1760,14 +1968,9 @@ cmd_connect_relay() {
     CLIENT_PID=$!
   fi
 
-  if jq -n \
-    --argjson pid_ui "$UI_PID" \
-    --argjson pid_client "$CLIENT_PID" \
-    --argjson port "$actual_port" \
-    --arg relay "$RELAY_URL" \
-    --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{mode: "relay", pid_ui: $pid_ui, pid_client: $pid_client, port: $port, relay: $relay, started_at: $started_at}' \
-    | _state_write "$REPO" connect.json; then
+  local relay_started_at
+  relay_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if _relay_write_state; then
     STATE_WRITTEN=true
   else
     echo "hmd app connect: connect.json could not be written -- tearing down" >&2
@@ -1778,41 +1981,40 @@ cmd_connect_relay() {
   local pair_init_seen=false warned_expired=false pairing_exp=0 seen_lines=0 client_rc=0
   local code_resolved=false code_active=false code_shown=false client_gone=false paired_announced=false
   local bg_code_deadline=$(( $(date +%s) + 30 ))
+  # What the supervisor decides by (see _relay_supervise_step): only a connect that pairs by code with no compare to answer has one.
+  local supervise=false ever_started=false paired_before=false ended_reason="" auth_failed=false e2e_missing=false window_closed=false
+  local self_stopped=false fails=0 generation=1 started_ts loop_rc=0
+  local restart_s="${HMD_CONNECT_RESTART_S:-5}" restart_max_s="${HMD_CONNECT_RESTART_MAX_S:-300}"
+  case "$restart_s" in ''|*[!0-9]*) restart_s=5 ;; esac
+  case "$restart_max_s" in ''|*[!0-9]*) restart_max_s=300 ;; esac
+  [ "$code_requested" = true ] && [ "$CONFIRM" != true ] && supervise=true
+  started_ts="$(date +%s)"
 
-  while :; do
-    if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
-      wait "$CLIENT_PID" 2>/dev/null
-      client_rc=$?
-      client_gone=true
-      _relay_drain  # whatever it printed between the last look and its exit
-      break
-    fi
-
-    _relay_drain
-
-    # --bg returns once pairing has started -- and, when a code was asked for, once the relay has answered
-    # for it (or 30 s have passed), so the SESSION CODE is on screen before this leaves.
-    if [ "$pair_init_seen" = true ] && [ "$BG" = true ] \
-        && { [ "$code_requested" != true ] || [ "$code_resolved" = true ] || [ "$(date +%s)" -ge "$bg_code_deadline" ]; }; then
-      echo "hmd app: running in background (ui pid $UI_PID, relay client pid $CLIENT_PID). Tear down with: hmd app disconnect"
-      trap - INT TERM HUP EXIT
+  _relay_loop "$BG"
+  loop_rc=$?
+  if [ "$loop_rc" -eq 0 ]; then
+    echo "hmd app: running in background (ui pid $UI_PID, relay client pid $CLIENT_PID). Tear down with: hmd app disconnect"
+    trap - INT TERM HUP EXIT
+    exec 3>&-  # the client sees its stdin end: with --no-confirm nothing was ever going to be said on it
+    if [ "$supervise" = true ]; then
+      # the wait loop goes on in a process of its own, with the ui and the client under its care: it starts the next client when this
+      # one ends for a reason that is not final, and tears everything down (cleanup) when it does end
+      (
+        exec </dev/null >/dev/null 2>&1
+        trap 'cleanup; exit 143' TERM
+        trap 'cleanup; exit 130' INT
+        trap 'cleanup; exit 129' HUP
+        trap cleanup EXIT
+        _relay_loop false
+      ) &
+      disown "$!" 2>/dev/null || true
+    else
       disown "$UI_PID" 2>/dev/null || true
       disown "$CLIENT_PID" 2>/dev/null || true
       rm -f "$UI_OUT" "$CLIENT_OUT" "$CLIENT_ERR" 2>/dev/null || true
-      exec 3>&-  # the client sees its stdin end: with --no-confirm nothing was ever going to be said on it
-      return 0
     fi
-
-    if [ "$pair_init_seen" = true ] && [ "$warned_expired" = false ] && [ "$code_active" != true ] && [ "$pairing_exp" -gt 0 ]; then
-      local now2
-      now2="$(date +%s)"
-      if [ "$now2" -gt $((pairing_exp + 5)) ]; then
-        echo "hmd app connect: pairing code expired -- Ctrl-C and reconnect to mint a new one" >&2
-        warned_expired=true
-      fi
-    fi
-    sleep 0.2
-  done
+    return 0
+  fi
 
   if [ "$pair_init_seen" != true ]; then
     echo "hmd app connect: relay client exited before pairing could start:" >&2
@@ -1875,7 +2077,7 @@ _pw_sessions() {
 # the client it names is alive and is one): somebody is using this repo's phone link, and the window it holds stays.
 _pw_connect_live() {
   local doc real
-  doc="$(_state_read "$1" connect.json)" || return 1
+  doc="$(_connect_doc "$1")" || return 1
   real="$(_real_dir "$1")" || return 1
   [ "$(_doc_field "$doc" .mode)" = "relay" ] || return 1
   _pid_is_relay_client "$(_doc_field "$doc" .pid_client)" "$real"
@@ -2045,11 +2247,19 @@ _connect_window_knobs() {
   fi
   win="${HMD_RELAY_CODE_WINDOW_S:-}"
   if ! _pw_seconds_ok "$win"; then
-    idle_h="${HMD_PAIR_WINDOW_IDLE_H:-4}"
-    printf '%s' "$idle_h" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || idle_h=4
+    idle_h="${HMD_PAIR_WINDOW_IDLE_H:-0}"
+    printf '%s' "$idle_h" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || idle_h=0
     win="$(awk -v h="$idle_h" 'BEGIN { s = h * 3600; if (h == 0 || s > 86400) s = 86400; if (s < 1) s = 1; printf "%d", s }')"
   fi
   printf '%s %s %s %s' "$win" "$min" "$lead" "$event"
+}
+
+# _connect_capped -- 0 when the operator bounded how long connect offers its code: HMD_PAIR_WINDOW_IDLE_H above 0. Connect then ends
+# when that window does. Unset (the default) or 0, the code is offered for as long as connect runs: the client's own window is 24 h at
+# most, and the supervisor (_relay_supervise_step) opens the next one when it closes.
+_connect_capped() {
+  local h="${HMD_PAIR_WINDOW_IDLE_H:-0}"
+  printf '%s' "$h" | grep -Eq '^[0-9]+(\.[0-9]+)?$' && awk -v h="$h" 'BEGIN { exit !(h > 0) }'
 }
 
 # _pw_paired -- 0 while a phone that paired by this window's code is connected to this window's client: the client leaves
@@ -2264,8 +2474,16 @@ cmd_status() {
   done
   REPO="$(resolve_repo_value "$REPO")"
 
-  local connect_doc
-  connect_doc="$(_state_read "$REPO" connect.json)"
+  local connect_doc loose
+  connect_doc="$(_connect_doc "$REPO")"
+  loose="$(_connect_loose_note "$REPO")"
+  if [ -n "$loose" ] && [ -z "$connect_doc" ]; then
+    # a file of ours that is not 0600 and that nothing running backs: said plainly, never taken for "nothing is connected here"
+    echo "$loose, and no running relay client or ui of this repo backs it: ignored (a leftover; hmd app disconnect clears it)"
+    echo "connected: no"
+    return 1
+  fi
+  [ -n "$loose" ] && echo "note: $loose; read because it names this repo's running relay client or ui"
   if [ "$(_doc_field "$connect_doc" .mode)" = "relay" ]; then
     cmd_status_relay "$REPO" "$connect_doc"
     return $?
@@ -2391,7 +2609,7 @@ cmd_status_relay() {
   _pid_is_relay_client "$pid_client" "$repo_real" && client_alive="running"
 
   echo "mode: relay"
-  echo "connected: yes"
+  if [ "$client_alive" = running ]; then echo "connected: yes"; else echo "connected: no"; fi
   echo "  relay: ${relay:-?}"
   echo "  session id: ${session_id:-?}"
   if [ "$paired" = "true" ]; then
@@ -2433,11 +2651,11 @@ cmd_status_relay() {
   # while the ui lingers (or both gone but state left behind) both need a
   # human to run disconnect rather than silently look "connected".
   if [ "$client_alive" = "not running" ] && [ "$ui_alive" = "running" ]; then
-    echo "WARNING: relay client is not running but heimdall-ui still is -- run: hmd app disconnect" >&2
+    echo "relay client not running -- hmd ui is up, but the phone can neither pair nor reach this session; run: hmd app disconnect, then hmd app connect"
     return 1
   fi
   if [ "$client_alive" = "not running" ] && [ "$ui_alive" = "not running" ]; then
-    echo "stale -- run hmd app disconnect" >&2
+    echo "relay client not running (stale) -- run hmd app disconnect" >&2
     return 1
   fi
 
@@ -2568,8 +2786,12 @@ cmd_disconnect() {
   done
   REPO="$(resolve_repo_value "$REPO")"
   local connect_doc repo_real vrc pw_stopped
-  connect_doc="$(_state_read "$REPO" connect.json)"
+  connect_doc="$(_connect_doc "$REPO")"
   repo_real="$(_real_dir "$REPO")"
+  if [ -z "$connect_doc" ] && [ -n "$(_connect_loose_note "$REPO")" ]; then
+    _state_remove "$REPO" connect.json
+    echo "hmd app disconnect: removed a leftover connect.json that backed no running relay client or ui of this repo"
+  fi
 
   # a pair window is a way for a phone in, so disconnect closes it too (it is opened again by the next session)
   pw_stopped="$(_pair_window_stop_all "$REPO")"
@@ -2712,7 +2934,7 @@ cmd_doctor() {
   if [ -n "$RELAY_URL" ]; then
     relay_mode=true
   else
-    if [ "$(_doc_field "$(_state_read "$REPO" connect.json)" .mode)" = "relay" ]; then
+    if [ "$(_doc_field "$(_connect_doc "$REPO")" .mode)" = "relay" ]; then
       relay_mode=true
       # a file in the repo says THAT a relay is in use, never which one: doctor asks the relay the environment (or the default) names
       RELAY_URL="${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}"

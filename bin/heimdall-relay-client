@@ -1951,7 +1951,10 @@ class RelayClient:
         # `_begin_approval` always names the phone; a bind finished without it (a test driving this directly) is an
         # unnamed one, never a KeyError in the middle of a pairing
         label, login = pending.get("label") or "unnamed device", pending.get("login") or "unknown"
-        emit({"event": "code_paired", "device_label": label, "gh_login": login, "bound_at": self.bound_at})
+        paired = {"event": "code_paired", "device_label": label, "gh_login": login, "bound_at": self.bound_at}
+        if os.environ.get("HMD_RELAY_REPAIRED") == "1":
+            paired["repaired"] = True  # `hmd app connect` replaced a client a phone had paired to: this pairing is a re-pair
+        emit(paired)
         emit({"event": "device_bound", "bound_at": self.bound_at})
         self.state_ready.set()
         self._leave_pairing_traces(label, login)  # after state_ready: the first frame never waits on a disk write

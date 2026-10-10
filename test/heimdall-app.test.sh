@@ -2072,5 +2072,52 @@ if [ "$(cat "$PLANT_TARGET")" = "SENTINEL" ] && [ ! -L "$PLANT_JSON" ] && [ "$(j
 "$APP" disconnect --repo "$D" >/dev/null 2>&1
 rm -rf "$D"
 
+# ── hmdapp's docs/HANDOFF-TO-HEIMDALL-session-restart-repair.md, items 3 and 4: status tells the truth ───────────────────────────
+# A connect.json an older hmd wrote is 0644 and hmd app believes only a 0600 file of yours, so status fell through to the Tailscale
+# branch and said `connected: no` of a live session. (a) the writer leaves 0600 (3493a152); (b) a legacy 0644 file that names this repo's
+# live relay client is read as the relay session it is, and status says plainly that the file was loose; (c) a stale one is called out
+# the same way -- no Tailscale branch -- and disconnect clears it; (d) a ui that is up with its client gone says "relay client not running".
+D="$(make_repo)"
+LEG_OUT="$TMPROOT/legacy-connect.out"
+HMD_RELAY_URL="https://relay.example.com" HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=pair-bind \
+  "$APP" connect --repo "$D" --port 0 --no-code --bg >"$LEG_OUT" 2>&1
+if [ -n "$(find "$D/.heimdall/app/connect.json" -maxdepth 0 -type f -perm 600 2>/dev/null)" ]; then ok "relay connect writes connect.json 0600"; else bad "mode: $(ls -l "$D/.heimdall/app/connect.json" 2>&1): $(cat "$LEG_OUT")"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+LEG_PORT="$(t_free_port)"
+t_start_ui "$D" "$LEG_PORT"
+LEG_UI="$T_UI_PID"
+"$DECOY_DIR/heimdall-relay-client" --repo "$D" >/dev/null 2>&1 &
+LEG_CLIENT=$!
+PIDS+=("$LEG_CLIENT")
+mkdir -p "$D/.heimdall/app"
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":%s,"relay":"https://relay.example.com","started_at":"x"}\n' "$LEG_UI" "$LEG_CLIENT" "$LEG_PORT" >"$D/.heimdall/app/connect.json"
+chmod 644 "$D/.heimdall/app/connect.json"
+LEG_STATUS="$("$APP" status --repo "$D" 2>&1)"
+if printf '%s\n' "$LEG_STATUS" | grep -q '^mode: relay' && ! printf '%s\n' "$LEG_STATUS" | grep -qi 'tailscale'; then ok "a legacy 0644 connect.json naming this repo's live relay client is read as relay mode, never as the Tailscale branch"; else bad "$LEG_STATUS"; fi
+if printf '%s\n' "$LEG_STATUS" | grep -q 'connect.json is mode 0644'; then ok "...and status says plainly that the file was loose"; else bad "$LEG_STATUS"; fi
+kill "$LEG_CLIENT" "$LEG_UI" 2>/dev/null
+wait "$LEG_CLIENT" 2>/dev/null
+sleep 0.5
+LEG_STALE="$("$APP" status --repo "$D" 2>&1)"
+if printf '%s\n' "$LEG_STALE" | grep -q 'connect.json is mode 0644' && printf '%s\n' "$LEG_STALE" | grep -q '^connected: no' && ! printf '%s\n' "$LEG_STALE" | grep -qi 'tailscale'; then ok "a stale legacy connect.json is called out plainly: connected: no, and no Tailscale branch"; else bad "$LEG_STALE"; fi
+"$APP" disconnect --repo "$D" >"$TMPROOT/legacy-disconnect.out" 2>&1
+if [ ! -e "$D/.heimdall/app/connect.json" ]; then ok "disconnect clears a stale legacy connect.json"; else bad "still there: $(cat "$TMPROOT/legacy-disconnect.out")"; fi
+rm -rf "$D"
+D="$(make_repo)"
+LEG_PORT="$(t_free_port)"
+t_start_ui "$D" "$LEG_PORT"
+LEG_UI="$T_UI_PID"
+( : ) &
+LEG_DEAD=$!
+wait "$LEG_DEAD" 2>/dev/null
+mkdir -p "$D/.heimdall/app"
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":%s,"relay":"https://relay.example.com","started_at":"x"}\n' "$LEG_UI" "$LEG_DEAD" "$LEG_PORT" >"$D/.heimdall/app/connect.json"
+chmod 600 "$D/.heimdall/app/connect.json"
+LEG_GONE="$("$APP" status --repo "$D" 2>&1)"; LEG_GONE_RC=$?
+if printf '%s\n' "$LEG_GONE" | grep -q 'relay client not running' && printf '%s\n' "$LEG_GONE" | grep -q '^connected: no' && [ "$LEG_GONE_RC" -ne 0 ]; then ok "a ui that is up with its relay client gone: status says 'relay client not running', connected: no, exits non-zero"; else bad "rc $LEG_GONE_RC: $LEG_GONE"; fi
+kill "$LEG_UI" 2>/dev/null
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
