@@ -1572,6 +1572,152 @@ def case_confirm_idle_bound():
 # The cases are independent of one another -- each has its own sandbox (HOME, repo, TMPDIR, HEIMDALL_HOME), its own relay on a port
 # the OS hands out and its own clock -- and nearly all of their time is spent waiting: for a registration to lapse, a window to open,
 # a client to notice. Run one after another they took longer than the sweep's 400 s budget on a loaded machine. So with no case named,
+# -- R: `hmd app connect` keeps its relay client up (item 4 of hmdapp's docs/HANDOFF-TO-HEIMDALL-session-restart-repair.md) ------------
+# The operator's clients died twice at pairing-expired after the idle cap and left the phone unable to pair until someone noticed. A
+# connect that pairs by code now supervises its client: a recoverable end (a crash, pairing-expired, a relay that did not answer) is
+# followed by a new client -- the same code behind a new session -- after a back-off; a deliberate end (`hmd app disconnect`, the phone's
+# revoke, an auth failure) is not. HMD_PAIR_WINDOW_IDLE_H defaults to 0 (never stop): the code stays claimable for as long as connect
+# runs, and an explicit value is still a cap that ends it (U2, C3). Scaled down like U: floor 2 s, back-off 1 s up to 2 s.
+RESPAWN_KNOBS = dict(CONNECT_KNOBS, HMD_CONNECT_RESTART_S="1", HMD_CONNECT_RESTART_MAX_S="2")
+
+
+def connect_events(s, name):
+    """The events of one name in the client's log, in order."""
+    try:
+        with open(events_path(s), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    found = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("event") == name:
+            found.append(event)
+    return found
+
+
+def new_client(s, old, timeout=60):
+    """The pid connect.json names once it is a live client other than `old`; 0 if none shows up in `timeout` seconds."""
+    seen = [0]
+
+    def moved():
+        seen[0] = client_pid(s)
+        return seen[0] not in (0, old) and alive(seen[0])
+    return seen[0] if wait_until(moved, timeout) else 0
+
+
+def case_connect_respawns_a_crashed_client():
+    with Scn(ttl=6) as s, purging_lapsed_sessions(s.relay, 2.0):
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        rc, pid = connect_bg(s, **RESPAWN_KNOBS)
+        if not (rc == 0 and pid and wait_until(lambda: s.relay.registrations, 40)):
+            T.check(False, "R1. (setup) connect --bg registers the code", "rc %r pid %r" % (rc, pid))
+            return
+        argv = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], stdout=subprocess.PIPE, text=True).stdout
+        T.check("--no-confirm" in argv and "--confirm" not in argv.replace("--no-confirm", ""),
+                "R1. a plain connect's client is code-only by default: --no-confirm, no number to compare", argv.strip()[-200:])
+        before = len(s.relay.registrations)
+        os.kill(pid, 9)
+        new = new_client(s, pid)
+        T.check(new != 0, "R1. a client that crashed is replaced: connect.json names a new, live client", "pid %r then %r" % (pid, new))
+        if not new:
+            return
+        fresh = wait_until(lambda: len(s.relay.registrations) > before, 60)
+        regs = list(s.relay.registrations)
+        T.check(fresh and regs[-1]["code"] == regs[0]["code"], "R1. the replacement offers the same code again",
+                "registrations %d (was %d)" % (len(regs), before))
+        # the replacement may first meet the crashed client's registration, which has not lapsed yet: that attempt is revoked and retried, so
+        # the phone types the code against a registration whose session is still live
+        def live():
+            sessions = [s.relay.get(r["session_id"]) for r in s.relay.registrations]
+            return [x for x in sessions if x is not None and not x.ended and x.exp > time.time() + 1]
+        wait_until(live, 40)
+        target = live()
+        opened, _pub = s.paired_state(s.bind(target[-1].id)) if target else (None, b"")
+        T.check(opened is not None, "R1. ...and a phone that types the code pairs on it", "live sessions %d" % len(target))
+
+
+def case_connect_logs_a_repair():
+    # A phone that pairs by code on a session connect had to replace says so: one line on connect's output and `repaired` on the
+    # client's code_paired event. The first pairing is announced as before, and carries no such flag.
+    with Scn(ttl=6) as s, purging_lapsed_sessions(s.relay, 2.0):
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        app = s.app("--relay", s.relay.url, env=dict(RESPAWN_KNOBS, HMD_RELAY_EVENT_LOG=events_path(s)))
+        app.close_stdin()
+        if not wait_until(lambda: client_pid(s) and s.relay.registrations, 40):
+            T.check(False, "R2. (setup) connect registers the code", app.tail())
+            return
+        first = client_pid(s)
+        s.bind(s.relay.registrations[-1]["session_id"])
+        T.check(wait_until(lambda: "phone paired via code" in app.text(), 30), "R2. the first pairing by code is announced as a pairing",
+                app.tail())
+        before = len(s.relay.registrations)
+        os.kill(first, 9)
+        new = new_client(s, first)
+        if not (new and wait_until(lambda: len(s.relay.registrations) > before, 60)):
+            T.check(False, "R2. (setup) the crashed client is replaced and registers the code", app.tail())
+            return
+        s.bind(s.relay.registrations[-1]["session_id"])
+        said = wait_until(lambda: "phone re-paired by code" in app.err().decode("utf-8", "replace"), 30)  # on stderr, as the line promises
+        paired = connect_events(s, "code_paired")
+        T.check(said, "R2. a pairing by code on a replaced client is logged on connect's output as a re-pair", app.tail())
+        T.check(len(paired) >= 2 and not paired[0].get("repaired") and paired[-1].get("repaired") is True,
+                "R2. the client's code_paired event says repaired on the second pairing and not on the first", json.dumps(paired)[-300:])
+
+
+def case_connect_stays_down_when_ended_on_purpose():
+    # (a) the phone's revoke ends the session for good, (b) `hmd app disconnect` stops everything, (c) a relay that refuses the new
+    # session's /pair/init with 401 is an auth failure: tried once, not for ever. None of the three is followed by a new client.
+    with Scn(ttl=60) as s:
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        rc, pid = connect_bg(s, **RESPAWN_KNOBS)
+        if not (rc == 0 and pid and wait_until(lambda: s.relay.registrations, 40)):
+            T.check(False, "R3. (setup) connect --bg registers the code", "rc %r" % rc)
+            return
+        sid = s.bind(s.relay.registrations[-1]["session_id"])
+        s.paired_state(sid)
+        regs = len(s.relay.registrations)
+        s.relay.end_session(sid, "revoked")
+        gone = wait_until(lambda: not alive(pid), 30)
+        time.sleep(4)
+        state = os.path.exists(os.path.join(s.repo, ".heimdall", "app", "connect.json"))
+        T.check(gone and not state and len(s.relay.registrations) == regs and not client_pid(s),
+                "R3. a session the phone revoked is not replaced: the client is gone, connect.json is gone, nothing registers the code again",
+                "gone %s, connect.json %s, registrations %d then %d" % (gone, state, regs, len(s.relay.registrations)))
+    with Scn(ttl=60) as s:
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        rc, pid = connect_bg(s, **RESPAWN_KNOBS)
+        if not (rc == 0 and pid and wait_until(lambda: s.relay.registrations, 40)):
+            T.check(False, "R3. (setup) connect --bg registers the code", "rc %r" % rc)
+            return
+        regs = len(s.relay.registrations)
+        run([H.APP_PATH, "disconnect", "--repo", s.repo], s.env(), timeout=120)
+        time.sleep(4)
+        T.check(not alive(pid) and not client_pid(s) and len(s.relay.registrations) == regs,
+                "R3. hmd app disconnect is not followed by a new client", "alive %s, registrations %d then %d" % (alive(pid), regs, len(s.relay.registrations)))
+    with Scn(ttl=60) as s:
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        rc, pid = connect_bg(s, **RESPAWN_KNOBS)
+        if not (rc == 0 and pid and wait_until(lambda: s.relay.registrations, 40)):
+            T.check(False, "R3. (setup) connect --bg registers the code", "rc %r" % rc)
+            return
+        asked = [0]
+
+        def refuse():
+            asked[0] += 1
+            return 401, {"error": "unauthorized"}
+        s.relay.pair_init_status = refuse
+        os.kill(pid, 9)
+        wait_until(lambda: asked[0] >= 1, 30)
+        time.sleep(5)
+        T.check(asked[0] == 1 and not client_pid(s),
+                "R3. an auth failure on the new session's /pair/init is tried once and ends connect, not retried for ever",
+                "/pair/init asked %d times, client pid %r" % (asked[0], client_pid(s)))
+
+
 # every case runs in a process of its own (`app_pair_confirm_cases.py CASE`), CASE_JOBS at a time, and what each printed is reported in
 # the order the cases are declared, under one tally. Naming cases runs just those, in this process, one after another.
 CASE_JOBS = 6
@@ -1621,6 +1767,7 @@ def main():
              case_hook_hands_over_the_transcript, case_idle_stop_connect_reopens,
              case_connect_stays_up, case_connect_idle_bound, case_connect_pairing_expired_reinits,
              case_confirm_event_floor, case_confirm_stays_up, case_confirm_reject_renews_at_once, case_confirm_idle_bound,
+             case_connect_respawns_a_crashed_client, case_connect_logs_a_repair, case_connect_stays_down_when_ended_on_purpose,
              case_no_links_followed, case_state_files_link_safe, case_code_not_derivable)
     wanted = sys.argv[1:]  # case names to run alone, here (a quick look while working on one); none runs them all, a process each
     if not wanted:

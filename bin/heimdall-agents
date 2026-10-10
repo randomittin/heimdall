@@ -97,7 +97,9 @@
 #                    carries agent_type/description/worktree_path/
 #                    worktree_branch straight from the harness's own spawn-time
 #                    .meta.json, null when absent — see bin/heimdall-agent-resume,
-#                    which composes on top of this rather than re-deriving it)
+#                    which composes on top of this rather than re-deriving it —
+#                    plus model (the .meta.json's) and started_at (epoch seconds
+#                    of the transcript's first record), null when unknown)
 #   count            print the number of LIVE subagents (statusline consumes this)
 #   orphans [--json] OPERATOR VIEW: only the agents that need attention —
 #                    parked mailbox teammates, provably-dead orphans, wedged and
@@ -953,17 +955,32 @@ _enumerate_classify_slow() {
 # rather than the row being dropped or the tool erroring. Consumed by
 # bin/heimdall-agent-resume so THAT tool never has to re-derive the
 # id -> transcript -> meta.json resolution this file already owns.
+#
+# model (the .meta.json's own spawn-time `model`) and started_at (epoch seconds of the
+# `timestamp` on the transcript's FIRST record -- the moment the harness spawned the
+# agent) are the two facts the phone's Agents tab shows that `age_secs` (time since the
+# transcript last changed) cannot give. `input` pulls ONE value from the transcript, so a
+# transcript of tens of MB costs one buffered read, never a scan; a transcript that is
+# missing, empty, or opens with a non-JSON line or a record without a timestamp yields
+# null, never an error (the row is never dropped for it).
 _meta_extra() {
-  local m="$1"
+  local m="$1" tr out
   if [ -n "$m" ] && [ -f "$m" ]; then
-    jq -c '{
-      agent_type:      (.agentType // null),
-      description:     (.description // null),
-      worktree_path:   (.worktreePath // null),
-      worktree_branch: (.worktreeBranch // null)
-    }' "$m" 2>/dev/null && return 0
+    tr="${m%.meta.json}.jsonl"
+    [ -f "$tr" ] || tr=/dev/null
+    # Output, not exit status, says it worked: jq exits 2 when the transcript's first line is
+    # not JSON even though `try` caught it and the object (the meta's fields intact) printed.
+    out="$(jq -c -n 'input as $m | (try input catch null) as $t | {
+      agent_type:      ($m.agentType // null),
+      description:     ($m.description // null),
+      worktree_path:   ($m.worktreePath // null),
+      worktree_branch: ($m.worktreeBranch // null),
+      model:           (if ($m.model | type) == "string" then $m.model else null end),
+      started_at:      (try ($t.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null)
+    }' "$m" "$tr" 2>/dev/null)"
+    [ -n "$out" ] && { printf '%s' "$out"; return 0; }
   fi
-  printf '%s' '{"agent_type":null,"description":null,"worktree_path":null,"worktree_branch":null}'
+  printf '%s' '{"agent_type":null,"description":null,"worktree_path":null,"worktree_branch":null,"model":null,"started_at":null}'
 }
 
 # Enrich TAB rows (id/age/state/name/meta) into the public JSON contract. `meta`

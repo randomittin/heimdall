@@ -194,6 +194,17 @@
 #     the chat publisher (bin/lib/companion_ui_publish.py phone_messages) recognises a delivery by
 #     them and reads the quoted block as the operator's own line.
 #
+# CLOSING THE QUESTION (handoff 4(a)4). Delivering a verified answer ENDS the attention episode it answers: label_messages
+# calls close_episode (bin/lib/companion_ui_attention.py) for the open question's id, in every delivery path -- stop, prompt,
+# tool and tmux (tmux judges the batch before it types a key; a cli pop delivers to no session and never closes). /api/state's
+# attention then leaves needs_input (working, a new id, since = the delivery) at once, instead of whenever the session next
+# takes a turn, so the phone's "hmd asks" row clears; and an answer to the same question that is delivered afterwards finds
+# it closed and is framed late. Only a record whose seal verified gets that far: an unsealed, forged, edited or stale stamp
+# is an ordinary or a late message and closes nothing. The close is one flock'ed check-and-write, so two deliveries racing
+# for one question cannot both be its answer: the loser's message is late. A batch is one delivery: every sealed answer to
+# the open question in it is an answer, and the question closes once. A marker that cannot be written (a link, another
+# account's directory) costs the close and never the answer -- the question simply stays open until the transcript moves.
+#
 # LINKS. The repo tree is attacker-shaped: a checkout can carry .heimdall, .heimdall/ui, .heimdall/app or any file in them
 # (inbox.jsonl, inbox-delivered.jsonl, inbox.jsonl.lock, inbox-state.json, inbox-waiting, tmux-target, connect.json) as a
 # symlink, and HEIMDALL_HOME/app can be one too. Every create, write, append, rename, truncate, remove, lock, stat, list,
@@ -337,8 +348,10 @@ Answers:
   sealed, at receive time. stop, prompt and tool deliver it as the operator's own answer to that question
   (the question text, derived now from the session, its ask id, the quoted answer, no untrusted-data
   caution) while it is still the open one, and as an ordinary message that says it arrived late once it
-  is not. A message with no valid seal keeps the untrusted-data marker. Every dequeue records which mode popped it
-  (via) in the delivery receipt. See ANSWER FRAMING in this file's header.
+  is not. A message with no valid seal keeps the untrusted-data marker. Delivering a sealed answer (any mode, tmux
+  included) also ends that question's attention episode, so the phone stops showing it as open and a second answer
+  to it is framed late. Every dequeue records which mode popped it (via) in the delivery receipt. See ANSWER
+  FRAMING and CLOSING THE QUESTION in this file's header.
 
 Env:
   HMD_INBOX_WAIT_S   seconds to long-poll in `stop` mode. Default 240, or 300
@@ -1038,8 +1051,23 @@ def open_ask(root, hook):
     except Exception:
         return None  # no verdict -> no open question -> a stamped message reads as late: the cautious side
     if a.get("state") == "needs_input" and a.get("kind") == "question" and isinstance(a.get("id"), str):
-        return {"id": a["id"], "summary": a.get("summary")}
+        return {"id": a["id"], "summary": a.get("summary"), "attention": attention}
     return None
+
+
+def end_episode(root, ask):
+    # The open question in ask (open_ask) has just been answered by a delivery whose seal verified: end its attention episode,
+    # so the phone's row clears and a further answer to it is late. True when THIS delivery owns the answer -- it ended the
+    # episode, or the ending could not be recorded (a link or another account's directory on the way, an attention copy that
+    # predates close_episode, any fault): the answer is still the answer, the question just stays open until the transcript
+    # moves, as before. False only when an earlier delivery had already ended it: that one took the answer, this is late.
+    close = getattr(ask.get("attention"), "close_episode", None)
+    if close is None:
+        return True
+    try:
+        return close(root, ask["id"]) is not False
+    except Exception:
+        return True
 
 
 def label_messages(root, hook, msgs):
@@ -1047,10 +1075,14 @@ def label_messages(root, hook, msgs):
     if not any(m["answers"] for m in msgs):
         return
     now_open = open_ask(root, hook)
+    answered = None   # whether this delivery owns the open question's answer: settled once, for the whole batch
     for m in msgs:
         if not m["answers"]:
             continue
-        if now_open is not None and now_open["id"] == m["answers"]:
+        is_open = now_open is not None and now_open["id"] == m["answers"]
+        if is_open and answered is None:
+            answered = end_episode(root, now_open)
+        if is_open and answered:
             m["kind"] = "answer"
             m["ask"] = one_line(now_open.get("summary"), ASK_MAX_CHARS)   # the live derivation or nothing: a record's own ask is never read
         else:
@@ -1377,7 +1409,12 @@ def cmd_tmux(root):
     # hook, a second tmux run) can never be handed the same one. Listing,
     # typing and only then popping left a window in which a message was both
     # typed into the pane AND delivered through a hook.
-    for text in texts_of(pop_with(pop_all_fn, root, "tmux")):
+    items = pop_with(pop_all_fn, root, "tmux")
+    # A verified answer ends its question's episode like in every other mode. Judged BEFORE a key is typed (the typed
+    # text becomes a prompt entry in the transcript, which would close the question by itself and make it look late); the
+    # text typed is the plain text either way, and a fault here must never keep it from being typed.
+    _silently(lambda: label_messages(root, {}, messages_of(items)))
+    for text in texts_of(items):
         _tmux_send(["tmux", "send-keys", "-t", target, "-l", tmux_safe(text)])
         _tmux_send(["tmux", "send-keys", "-t", target, "Enter"])
 
