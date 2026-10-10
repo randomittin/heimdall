@@ -51,11 +51,25 @@ switched off cannot turn one message into a wake loop. Lifetime capped (HMD_INBO
 default 8h; hooks.json's timeout matches and the next Stop re-arms). It looks once a second
 with a stat, spawns nothing while the inbox is empty, and exits when its session dies.
 
+TMUX OPT-IN (`hmd app connect --tmux`). The tmux path above is tried first for any session whose pane is proven; the opt-in is the
+operator saying so, on the record, and it settles one question the default leaves to the exit-2 notice: a terminal read 10-30s ago
+may hold a half-typed draft, so the default answers it with the notice (a turn taken by a task-notification). For a session whose
+pane connect.json's `tmux` list names, tmux IS the delivery path: that window is waited out -- nothing claimed, nothing typed, nothing
+printed -- until the terminal has been quiet, or the operator submits their own prompt and the UserPromptSubmit hook delivers the message.
+The notice stays the fallback for a pane that cannot be proven right now, so a message is never stuck. The opt-in never loosens a gate:
+the same proof (own_pane), the same fixed prompt, and HMD_INBOX_WAKE=off|rewake still win. `optin` is connect's check, made before it
+starts anything: tmux must be on PATH, a session of this repo must have registered (its own TMUX_PANE/TMUX, recorded by `register`),
+tmux's own list-panes must show that pane's process as an ancestor of that claude pid and as this user's, and the socket must be a unix
+socket this user owns. It is read-only (one list-panes per session, nothing typed, nothing written), prints the verified sessions as
+[{"pid","pane","socket"}], and otherwise says why on stderr and exits 1. connect.json's entry matches by pane and socket, not by pid,
+so the opt-in follows the pane across a Claude Code restart; the proof is repeated by every watcher.
+
 Modes:
   register   SessionStart hook (stdin JSON). Records this session's pane/terminal under
              <repo>/.heimdall/ui/wake/<pid>.json (0600) and prunes dead sessions.
   watch      The asyncRewake hook (also armed on every Stop). Exit 2 = wake the model.
   status     Prints {"registered": N, "pending": N} for the repo (live sessions, phone records).
+  optin      `hmd app connect --tmux`'s check (see TMUX OPT-IN). Not a hook: exit 1 with the reason on stderr.
 Args: --repo DIR  --pid CLAUDE_PID (the hook shell's $PPID).
 Env:  HMD_INBOX_WAKE=off|rewake|tmux (default: tmux where proven, else rewake), HMD_INBOX_WAKE_MAX_S,
       HMD_INBOX_WAKE_POLL_S, HMD_INBOX_WAKE_TMUX_QUIET_S, HMD_CLAUDE_SESSIONS_DIR (status files).
@@ -67,11 +81,13 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import time
 
-SOURCE = "companion"                       # companion_ui_inbox.append's record source
+SOURCE = "companion"                      # companion_ui_inbox.append's record source
 WAKE_PROMPT = "phone message waiting"      # typed into the pane: constant, never message text
 # Measured live (Claude Code 2.1.295: the real TUI under a pty, hooks from a throwaway project only): a Stop
 # hook started a 20s asyncRewake hook, nothing was typed, and 21.6s after that Stop the idle session took a turn
@@ -154,14 +170,29 @@ def own_live_pid(pid):
     return True
 
 
-def companion_connected(root):
-    # A phone can reach this session right now: connect.json (hmd app connect) is ours, not writable by
-    # anyone else, and names at least one process, every one of them alive and ours (pid_ui, pid_client).
-    rec = STATE.read_json(root, APP_REL, "connect.json", READ_CAP, forbidden=NOT_SHARED)
+def connect_record(root):
+    # connect.json (hmd app connect), believed only when it is ours and nobody else can write it; None otherwise
+    return STATE.read_json(root, APP_REL, "connect.json", READ_CAP, forbidden=NOT_SHARED)
+
+
+def companion_connected(rec):
+    # A phone can reach this session right now: connect.json names at least one process,
+    # every one of them alive and ours (pid_ui, pid_client).
     if rec is None:
         return False
     pids = [rec[k] for k in ("pid_ui", "pid_client") if k in rec]
     return bool(pids) and all(own_live_pid(p) for p in pids)
+
+
+def tmux_optin(rec, reg):
+    # `hmd app connect --tmux` named this session's pane in connect.json's `tmux` list, and the pane and socket agree with both the
+    # SessionStart record and the session's own environment. The pid in an entry only says who was checked then: the entry matches by
+    # pane, so the opt-in follows the pane across a Claude Code restart, and own_pane() proves the pane again every time before a key.
+    pane, sock = session_tmux()
+    entries = rec.get("tmux") if rec is not None else None
+    if not pane or not sock or not isinstance(entries, list) or reg.get("tmux_pane") != pane or reg.get("tmux_socket") != sock:
+        return False
+    return any(isinstance(e, dict) and e.get("pane") == pane and e.get("socket") == sock for e in entries)
 
 
 def probe(argv):
@@ -282,6 +313,11 @@ def ancestors(pid):
     return chain
 
 
+def valid_socket(sock):
+    # what the first field of $TMUX looks like: an absolute path with no "..", no newline and a sane length
+    return isinstance(sock, str) and sock.startswith("/") and ".." not in sock and "\n" not in sock and len(sock) < 512
+
+
 def session_tmux():
     # (pane, socket) from THIS process's environment, which a hook inherits from claude: the live truth
     # about where the session runs, unlike a file anybody could drop into the repo. "" when absent or
@@ -289,12 +325,38 @@ def session_tmux():
     pane = os.environ.get("TMUX_PANE", "")
     tm = os.environ.get("TMUX", "")
     sock = tm.split(",")[0] if tm else ""
-    ok_sock = sock.startswith("/") and ".." not in sock and "\n" not in sock and len(sock) < 512
-    return (pane if PANE_RE.match(pane) else "", sock if ok_sock else "")
+    return (pane if PANE_RE.match(pane) else "", sock if valid_socket(sock) else "")
 
 
 def tmux_argv(sock):
     return ["tmux", "-S", sock] if sock else ["tmux"]
+
+
+def process_is_ours(pid):
+    out = (probe(["ps", "-o", "uid=", "-p", str(pid)]) or "").strip()
+    return out.isdigit() and int(out) == os.geteuid()
+
+
+def socket_is_ours(sock):
+    # a unix socket this user owns (os.stat follows a link, so a link to somebody else's socket is theirs)
+    try:
+        st = os.stat(sock)
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISSOCK(st.st_mode) and st.st_uid == os.geteuid()
+
+
+def pane_belongs(pane, sock, pid):
+    # tmux itself lists `pane` (on the server at `sock`) with a process that is an ancestor of claude's `pid` and is this user's
+    listing = probe(tmux_argv(sock) + ["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
+    if listing is None:
+        return False
+    chain = set(ancestors(pid))
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == pane and fields[1].isdigit() and int(fields[1]) in chain:
+            return process_is_ours(int(fields[1]))
+    return False
 
 
 def own_pane(reg, pid):
@@ -303,15 +365,7 @@ def own_pane(reg, pid):
     pane, sock = session_tmux()
     if not pane or reg.get("tmux_pane") != pane or reg.get("tmux_socket") != sock:
         return False
-    listing = probe(tmux_argv(sock) + ["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
-    if listing is None:
-        return False
-    chain = set(ancestors(pid))
-    for line in listing.splitlines():
-        fields = line.split()
-        if len(fields) == 2 and fields[0] == pane and fields[1].isdigit() and int(fields[1]) in chain:
-            return True
-    return False
+    return pane_belongs(pane, sock, pid)
 
 
 def type_prompt():
@@ -363,20 +417,27 @@ def wake_action(root, pid):
     # "tmux" (typed a prompt into the session's own pane), "rewake" (the caller exits 2) or
     # None (conditions not met this tick). Claims the pending ids before acting, so a second
     # watcher never wakes for them.
-    if wake_mode() in SWITCHED_OFF:
+    mode = wake_mode()
+    if mode in SWITCHED_OFF:
         return None
     ids = pending_ids(root)
-    if not ids or session_status(pid) == "busy" or hold_alive(root) or not companion_connected(root):
+    if not ids or session_status(pid) == "busy" or hold_alive(root):
+        return None
+    conn = connect_record(root)
+    if not companion_connected(conn):
         return None
     reg = load_registration(root, pid)
     dev = reg.get("tty") if isinstance(reg.get("tty"), str) else terminal_of(pid)
     read_ago = terminal_read_ago(dev)
     if read_ago is not None and read_ago < TYPING_RECENT_S:
         return None        # somebody is at the keyboard: their prompt carries the message
+    quiet = env_float("HMD_INBOX_WAKE_TMUX_QUIET_S", DEFAULT_TMUX_QUIET_S)
+    settled = read_ago is None or read_ago >= quiet      # unread for the quiet window: no half-typed draft can be pending
+    if mode != "rewake" and not settled and tmux_optin(conn, reg):
+        return None        # --tmux: the pane is the delivery path, so a draft's window is waited out (nothing claimed), not answered with the notice
     if not claim(root, ids):
         return None
-    quiet = env_float("HMD_INBOX_WAKE_TMUX_QUIET_S", DEFAULT_TMUX_QUIET_S)
-    if wake_mode() != "rewake" and (read_ago is None or read_ago >= quiet) and own_pane(reg, pid) and type_prompt():
+    if mode != "rewake" and settled and own_pane(reg, pid) and type_prompt():
         return "tmux"
     return "rewake"
 
@@ -397,6 +458,56 @@ def cmd_watch(root, pid):
     return 0
 
 
+def registered_sessions(root):
+    # (pid, registration) of the sessions of this repo that registered at SessionStart: a record this user wrote (0600, reached
+    # through no link) naming a process that is alive and signalable by this user
+    found = []
+    for name in STATE.names(root, WAKE_REL):
+        m = re.match(r"^([0-9]+)\.json$", name)
+        if m and own_live_pid(int(m.group(1))):
+            reg = load_registration(root, int(m.group(1)))
+            if reg:
+                found.append((int(m.group(1)), reg))
+    return found
+
+
+def refuse(why):
+    sys.stderr.write(why + "\n")
+    return 1
+
+
+def cmd_optin(root):
+    # See TMUX OPT-IN. A session with THIS process among its descendants is the one asking (connect run inside it) and the only one
+    # considered; run from another pane, every registered session of the repo is. Read-only: nothing typed, nothing written.
+    if shutil.which("tmux") is None:
+        return refuse("tmux was not found on PATH")
+    sessions = registered_sessions(root)
+    if not sessions:
+        return refuse("no Claude Code session of this repo has registered with the wake hook "
+                      "(a session registers at SessionStart: start Claude Code in this repo with the hmd hooks on)")
+    asking = set(ancestors(os.getpid()))
+    pool = [s for s in sessions if s[0] in asking] or sessions
+    in_tmux = [(pid, reg) for pid, reg in pool
+               if PANE_RE.match(str(reg.get("tmux_pane"))) and valid_socket(reg.get("tmux_socket"))]
+    if not in_tmux:
+        return refuse("this repo's Claude Code session is not running inside tmux "
+                      "(its pane is recorded when it starts: start it from a tmux pane)")
+    verified, why = [], ""
+    for pid, reg in in_tmux:
+        pane, sock = reg["tmux_pane"], reg["tmux_socket"]
+        if not socket_is_ours(sock):
+            why = "the tmux socket %s is not a socket this user owns" % sock
+        elif not pane_belongs(pane, sock, pid):
+            why = ("tmux does not list pane %s as this session's own (its process is not an ancestor of Claude Code pid %d, "
+                   "or is not this user's)" % (pane, pid))
+        else:
+            verified.append({"pid": pid, "pane": pane, "socket": sock})
+    if not verified:
+        return refuse(why)
+    print(json.dumps(verified))
+    return 0
+
+
 def cmd_status(root):
     live = 0
     for name in STATE.names(root, WAKE_REL):
@@ -409,7 +520,7 @@ def cmd_status(root):
 def main(argv):
     global STATE
     ap = argparse.ArgumentParser(prog="heimdall-inbox-wake", add_help=True)
-    ap.add_argument("mode", choices=("register", "watch", "status"))
+    ap.add_argument("mode", choices=("register", "watch", "status", "optin"))
     ap.add_argument("--repo", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     ap.add_argument("--pid", type=int, default=os.getppid())
     try:
@@ -421,6 +532,8 @@ def main(argv):
         STATE = _load_private_state()
         if args.mode == "status":
             return cmd_status(root)
+        if args.mode == "optin":
+            return cmd_optin(root)
         if args.mode == "register":
             try:
                 payload = json.loads(sys.stdin.read(65536) or "{}")

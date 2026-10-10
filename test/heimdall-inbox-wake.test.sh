@@ -332,6 +332,73 @@ newproj; sleep 0.1 & KD=$!; wait "$KD" 2>/dev/null; W="$D/.heimdall/ui/wake"
 for f in "$KD.json" "$KD.lock"; do printf '{}' > "$W/$f"; done; printf 'keep' > "$W/notes.txt"; reg
 [ ! -e "$W/$KD.json" ] && [ ! -e "$W/$KD.lock" ] && [ -f "$W/$CP.json" ] && [ -f "$W/notes.txt" ] && ok "control: an ordinary tree still prunes a dead pid's files and keeps the live session's and everything else" || bad "prune control: $(ls "$W" | tr '\n' ' ')"
 
+echo "23. --tmux (optin): the pane recorded is one tmux itself lists as THIS session's own, on a socket this user owns -- a read-only question, nothing typed, nothing written:"
+SOCK="$WORK/tmux.sock"; python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$SOCK"
+optin_proj() {            # tmux_proj, but the registration names a real unix socket of ours (what `hmd app connect --tmux` demands)
+  newproj; quiet_tty; REC="$WORK/rec.$CP"; : > "$REC"
+  printf '{"pid":%s,"tty":"%s","tmux_pane":"%%7","tmux_socket":"%s"}' "$CP" "$QT" "$SOCK" > "$D/.heimdall/ui/wake/$CP.json"
+  chmod 600 "$D/.heimdall/ui/wake/$CP.json"
+}
+# optin PANE_PID -- `optin` with the fake tmux (list-panes answers %7 -> PANE_PID); sets OUT (stdout), ERR (stderr), RC
+optin() { ERR="$WORK/optin.err"; OUT="$(PATH="$FAKE:$PATH" TMUX_RECORD="$REC" PANE_PID="$1" "$BIN" optin --repo "$D" 2>"$ERR")"; RC=$?; }
+optin_proj; BEFORE="$(snap "$D")"; optin "$$"
+[ "$RC" -eq 0 ] && [ "$(printf '%s' "$OUT" | jq -c .)" = "[{\"pid\":$CP,\"pane\":\"%7\",\"socket\":\"$SOCK\"}]" ] && ok "prints the verified session: its claude pid, pane %7 and socket" || bad "rc=$RC out=$OUT err=$(cat "$ERR")"
+[ "$(snap "$D")" = "$BEFORE" ] && ok "optin changes nothing on disk (no state is written by the check itself)" || bad "optin wrote: $(diff <(printf '%s\n' "$BEFORE") <(snap "$D") | head -4 | tr '\n' ' ')"
+BADLINES="$(grep -v -x -F -e "-S $SOCK list-panes -a -F #{pane_id} #{pane_pid}" "$REC")"
+[ -z "$BADLINES" ] && [ -s "$REC" ] && ok "the only tmux call is the read-only list-panes on the recorded socket (nothing typed)" || bad "unexpected tmux argv: $BADLINES"
+
+echo "24. --tmux (optin) refusals: each one says WHY on stderr, exits 1 and prints nothing on stdout:"
+NOTMUX="$WORK/nopath"; mkdir -p "$NOTMUX"; ln -sf "$(command -v ps)" "$NOTMUX/ps"
+PYBIN="$(python3 -c 'import sys; print(sys.executable)')"       # the interpreter itself: a python3 shim on PATH may need bash, which the tmux-less PATH below lacks
+optin_proj; ERR="$WORK/optin.err"; OUT="$(PATH="$NOTMUX" "$PYBIN" "$BIN" optin --repo "$D" 2>"$ERR")"; RC=$?
+[ "$RC" -eq 1 ] && [ -z "$OUT" ] && grep -q "tmux was not found on PATH" "$ERR" && ok "tmux missing: refused" || bad "rc=$RC out=$OUT err=$(cat "$ERR")"
+newproj; REC="$WORK/rec.none"; : > "$REC"; optin "$$"
+[ "$RC" -eq 1 ] && [ -z "$OUT" ] && grep -q "not running inside tmux" "$ERR" && ok "a session registered with no tmux pane: refused as not in tmux" || bad "rc=$RC out=$OUT err=$(cat "$ERR")"
+optin_proj; rm "$D/.heimdall/ui/wake/$CP.json"; optin "$$"
+[ "$RC" -eq 1 ] && [ -z "$OUT" ] && grep -q "no Claude Code session of this repo has registered" "$ERR" && ok "no registered session: refused" || bad "rc=$RC out=$OUT err=$(cat "$ERR")"
+optin_proj; chmod 644 "$D/.heimdall/ui/wake/$CP.json"; optin "$$"
+[ "$RC" -eq 1 ] && [ -z "$OUT" ] && grep -q "no Claude Code session of this repo has registered" "$ERR" && ok "a registration that is not 0600 and ours is not a session (a checkout can drop one)" || bad "rc=$RC out=$OUT err=$(cat "$ERR")"
+optin_proj; optin 99999
+[ "$RC" -eq 1 ] && [ -z "$OUT" ] && grep -q "as this session's own" "$ERR" && ok "tmux's pane %7 has a process that is not an ancestor of the session: refused" || bad "rc=$RC out=$OUT err=$(cat "$ERR")"
+optin_proj; printf '{"pid":%s,"tty":"%s","tmux_pane":"%%7","tmux_socket":"%s"}' "$CP" "$QT" "$WORK/not-a-socket" > "$D/.heimdall/ui/wake/$CP.json"; : > "$WORK/not-a-socket"; optin "$$"
+[ "$RC" -eq 1 ] && [ -z "$OUT" ] && grep -q "not a socket this user owns" "$ERR" && ok "a registered socket that is not a unix socket of ours: refused, the reason names the socket" || bad "rc=$RC out=$OUT err=$(cat "$ERR")"
+[ ! -s "$REC" ] && ok "...before tmux is asked anything about it" || bad "asked tmux about a socket that is not ours: $(cat "$REC")"
+
+echo "25. --tmux (watch): connect.json naming the session's pane makes tmux the delivery path -- a draft's quiet window is waited out, not answered with the exit-2 notice; nothing else loosens:"
+optin_conn() {            # connect.json as `hmd app connect --tmux` writes it: the `tmux` list names pane + socket
+  printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t","tmux":[{"pid":%s,"pane":"%s","socket":"%s"}]}\n' "$CP" "$CP" "$CP" "${1-%7}" "$SOCK" > "$D/.heimdall/app/connect.json"
+}
+# swatch PANE_PID MAX_S -- twatch with the opted-in socket in the session's own environment
+swatch() { PATH="$FAKE:$PATH" TMUX_RECORD="$REC" PANE_PID="$1" TMUX_PANE="%7" TMUX="$SOCK,1,0" watch "$2"; }
+aged() { python3 -c 'import os,sys,time; t=time.time()-float(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$QT" "$1"; }
+optin_proj; rec p0 "hi" companion; aged 15
+swatch "$$" 10
+[ "$RC" -eq 2 ] && ! grep -q "send-keys" "$REC" && ok "control: WITHOUT the opt-in a terminal read 15s ago gets the exit-2 notice (test 12)" || bad "control: rc=$RC rec=$(cat "$REC")"
+optin_proj; optin_conn; rec p1 "SECRET-PHONE-TEXT" companion; aged 15
+swatch "$$" 3
+quiet_wake && ! grep -q "send-keys" "$REC" && ok "opted in, terminal read 15s ago (a draft may be pending): no notice and no keystroke" || bad "rc=$RC out=$OUT rec=$(cat "$REC")"
+[ ! -e "$D/.heimdall/ui/inbox-wake.json" ] && ok "...and the record is left unclaimed, so the wake still comes once the terminal is quiet" || bad "claimed while waiting: $(cat "$D/.heimdall/ui/inbox-wake.json")"
+optin_proj; optin_conn; rec p2 "SECRET-PHONE-TEXT" companion
+swatch "$$" 3
+grep -q -- "-S $SOCK send-keys -t %7 -l phone message waiting" "$REC" && grep -q -- "-S $SOCK send-keys -t %7 Enter" "$REC" && ok "opted in, terminal quiet: the FIXED prompt + Enter go into the session's own pane" || bad "tmux calls: $(cat "$REC")"
+grep -q "SECRET-PHONE-TEXT" "$REC" && bad "phone text reached tmux" || ok "no phone text sent to the pane"
+[ "$RC" -eq 0 ] && ok "rc 0: no notice after a keystroke wake" || bad "rc=$RC out=$OUT"
+optin_proj; optin_conn; rec p3 "hi" companion
+swatch "99999" 10
+! grep -q "send-keys" "$REC" && [ "$RC" -eq 2 ] && ok "opted in but the pane is not provably the session's: nothing typed, the exit-2 notice is the fallback (never stuck)" || bad "rc=$RC out=$OUT rec=$(cat "$REC")"
+optin_proj; optin_conn "%8"; rec p4 "hi" companion; aged 15
+swatch "$$" 10
+[ "$RC" -eq 2 ] && ! grep -q "send-keys" "$REC" && ok "an opt-in that names another pane is not this session's: the default behaviour stands (exit-2 notice)" || bad "rc=$RC rec=$(cat "$REC")"
+optin_proj; optin_conn; rec p5 "hi" companion
+HMD_INBOX_WAKE=rewake swatch "$$" 10
+[ "$RC" -eq 2 ] && ! grep -q "send-keys" "$REC" && ok "HMD_INBOX_WAKE=rewake still means no keystrokes, opt-in or not (a restriction always wins)" || bad "rc=$RC rec=$(cat "$REC")"
+optin_proj; optin_conn; rec p6 "hi" companion
+HMD_INBOX_WAKE=off swatch "$$" 2
+quiet_wake && ! grep -q "send-keys" "$REC" && ok "HMD_INBOX_WAKE=off still wakes nothing" || bad "rc=$RC out=$OUT rec=$(cat "$REC")"
+optin_proj; optin_conn; rec p7 "hi" companion; chmod 666 "$D/.heimdall/app/connect.json"
+swatch "$$" 2
+quiet_wake && ! grep -q "send-keys" "$REC" && ok "a world-writable connect.json (its opt-in included) is not believed: no wake, no keystroke" || bad "rc=$RC out=$OUT rec=$(cat "$REC")"
+
 echo ""
 echo "heimdall-inbox-wake.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1

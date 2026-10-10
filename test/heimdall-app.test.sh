@@ -2119,5 +2119,111 @@ kill "$LEG_UI" 2>/dev/null
 "$APP" disconnect --repo "$D" >/dev/null 2>&1
 rm -rf "$D"
 
+# ── `hmd app connect --tmux`: the session's own tmux pane is the delivery path (hmdapp's docs/HANDOFF-TO-HEIMDALL-phone-replies-reach-session.md 4(b)) ──
+# connect asks bin/heimdall-inbox-wake optin, which proves that tmux lists the pane a registered session of this repo runs in as that
+# session's own (ancestry) on a socket this user owns -- a read-only question -- and records the pane in connect.json's `tmux` list. Nothing
+# is typed here, and nothing a phone sends is ever typed later: the watcher types only its fixed prompt (test/heimdall-inbox-wake.test.sh).
+# tmux itself is a fake on PATH that records its arguments and answers list-panes with pane %7 -> TM_PANE_PID.
+TMUX_SOCK="$TMPROOT/tmux.sock"
+python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$TMUX_SOCK"
+FAKE_TMUX_DIR="$TMPROOT/faketmux"
+mkdir -p "$FAKE_TMUX_DIR"
+cat > "$FAKE_TMUX_DIR/tmux" <<'FAKE_TMUX_EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$TMUX_RECORD"
+case "$*" in *list-panes*) printf '%%7 %s\n%%8 1\n' "$PANE_PID" ;; esac
+exit 0
+FAKE_TMUX_EOF
+chmod +x "$FAKE_TMUX_DIR/tmux"
+TM_REC="$TMPROOT/tmux.rec"
+TM_RELAY_LOG="$TMPROOT/tmux-relay.log"
+# a copy of the wake tool that runs with a PATH that has no tmux (only ps), for the tmux-missing refusal
+NOTMUX_DIR="$TMPROOT/notmux"
+mkdir -p "$NOTMUX_DIR"
+ln -sf "$(command -v ps)" "$NOTMUX_DIR/ps"
+WAKE_NO_TMUX="$TMPROOT/wake-no-tmux"
+printf '#!/bin/sh\nPATH="%s" exec "%s" "%s" "$@"\n' "$NOTMUX_DIR" "$(python3 -c 'import sys; print(sys.executable)')" "$REPO/bin/heimdall-inbox-wake" >"$WAKE_NO_TMUX"
+chmod +x "$WAKE_NO_TMUX"
+# tm_repo [PANE] -- a repo with a live "claude" (a sleep child of this shell, which is the fake pane's process) registered at SessionStart
+tm_repo() {
+  D="$(make_repo)"
+  mkdir -p "$D/.heimdall/ui/wake"
+  chmod 700 "$D/.heimdall/ui" "$D/.heimdall/ui/wake"
+  sleep 300 &
+  TM_CLAUDE=$!
+  PIDS+=("$TM_CLAUDE")
+  printf '{"pid":%s,"tty":null,"tmux_pane":"%s","tmux_socket":"%s"}' "$TM_CLAUDE" "${1-%7}" "${1-$TMUX_SOCK}" >"$D/.heimdall/ui/wake/$TM_CLAUDE.json"
+  chmod 600 "$D/.heimdall/ui/wake/$TM_CLAUDE.json"
+}
+# tm_try [connect args] -- connect --tmux against $D; sets TM_RC and TM_OUT. TM_PANE_PID is the process tmux says runs pane %7 (this shell)
+tm_try() {
+  TM_OUT="$TMPROOT/tmux-try.out"
+  : >"$TM_REC"
+  : >"$TM_RELAY_LOG"
+  PATH="$FAKE_TMUX_DIR:$PATH" TMUX_RECORD="$TM_REC" PANE_PID="${TM_PANE_PID:-$$}" HMD_RELAY_URL="https://relay.example.com" \
+    HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=pair-bind FAKE_RELAY_LOG="$TM_RELAY_LOG" \
+    "$APP" connect --repo "$D" --port 0 --no-code --bg --tmux "$@" >"$TM_OUT" 2>&1
+  TM_RC=$?
+}
+# tm_refused WANT -- exit 2 with `hmd app connect --tmux: ...WANT...`, and nothing started: no connect.json, the relay client never run
+tm_refused() {
+  [ "$TM_RC" -eq 2 ] && grep -q "hmd app connect --tmux: .*$1" "$TM_OUT" && [ ! -e "$D/.heimdall/app/connect.json" ] && [ ! -s "$TM_RELAY_LOG" ]
+}
+
+if "$APP" --help | grep -q -- '--tmux' && "$APP" --help | grep -q 'phone message waiting'; then ok "--help documents connect --tmux and the one fixed prompt it types"; else bad "help text lacks --tmux / the fixed prompt"; fi
+
+tm_repo
+tm_try
+CJ="$D/.heimdall/app/connect.json"
+if [ "$TM_RC" -eq 0 ] && [ "$(jq -r '.mode' "$CJ" 2>/dev/null)" = "relay" ] \
+   && [ "$(jq -c '.tmux' "$CJ" 2>/dev/null)" = "[{\"pid\":$TM_CLAUDE,\"pane\":\"%7\",\"socket\":\"$TMUX_SOCK\"}]" ]; then ok "connect --tmux (relay): exit 0, and connect.json's tmux list names the session's pid, pane and socket"; else bad "rc=$TM_RC tmux=$(jq -c '.tmux' "$CJ" 2>&1): $(cat "$TM_OUT")"; fi
+if grep -q 'list-panes' "$TM_REC" && ! grep -q 'send-keys' "$TM_REC"; then ok "connect --tmux asks tmux to list panes and types nothing"; else bad "tmux calls: $(cat "$TM_REC")"; fi
+if grep -q 'tmux wake on' "$TM_OUT" && grep -q 'phone message waiting' "$TM_OUT"; then ok "connect says tmux wake is on, with the pane and the fixed prompt it will type"; else bad "no tmux line: $(cat "$TM_OUT")"; fi
+if [ -n "$(find "$CJ" -maxdepth 0 -type f -perm 600 2>/dev/null)" ]; then ok "connect.json carrying the tmux list is still 0600"; else bad "mode: $(ls -l "$CJ" 2>&1)"; fi
+TM_STATUS="$("$APP" status --repo "$D" 2>&1)"
+if printf '%s\n' "$TM_STATUS" | grep -q '^tmux wake: on.*%7'; then ok "status prints the tmux wake line with the pane"; else bad "$TM_STATUS"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+if [ ! -e "$CJ" ]; then ok "disconnect removes connect.json, and the opt-in with it"; else bad "connect.json still there: $(cat "$CJ")"; fi
+: >"$TM_REC"
+HMD_RELAY_URL="https://relay.example.com" HEIMDALL_RELAY_CLIENT_BIN="$FAKE_RELAY_BIN" FAKE_RELAY_MODE=pair-bind \
+  "$APP" connect --repo "$D" --port 0 --no-code --bg >"$TM_OUT" 2>&1
+if [ "$(jq -r 'has("tmux")' "$CJ" 2>/dev/null)" = "false" ] && ! "$APP" status --repo "$D" 2>&1 | grep -q '^tmux wake'; then ok "connect without --tmux records no opt-in, and status has no tmux wake line"; else bad "tmux key present without --tmux: $(cat "$CJ" 2>&1)"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
+tm_repo
+: >"$TM_REC"
+PATH="$FAKE_TMUX_DIR:$PATH" TMUX_RECORD="$TM_REC" PANE_PID="$$" FAKE_TS_MODE=modern-funnel \
+  "$APP" connect --tailscale --repo "$D" --port 0 --bg --tmux >"$TM_OUT" 2>&1
+CJ="$D/.heimdall/app/connect.json"
+if [ "$(jq -c '.tmux' "$CJ" 2>/dev/null)" = "[{\"pid\":$TM_CLAUDE,\"pane\":\"%7\",\"socket\":\"$TMUX_SOCK\"}]" ] && [ "$(jq -r 'has("https_port")' "$CJ")" = "true" ]; then ok "connect --tailscale --tmux records the same tmux list in the Funnel connect.json"; else bad "$(cat "$CJ" 2>&1): $(cat "$TM_OUT")"; fi
+FAKE_TS_MODE=modern-funnel "$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
+tm_repo
+rm "$D/.heimdall/ui/wake/$TM_CLAUDE.json"
+tm_try
+if tm_refused "no Claude Code session of this repo has registered"; then ok "connect --tmux with no registered session: refused (exit 2), nothing started"; else bad "rc=$TM_RC: $(cat "$TM_OUT")"; fi
+rm -rf "$D"
+tm_repo ""
+tm_try
+if tm_refused "not running inside tmux"; then ok "connect --tmux with a session that is not in tmux: refused (exit 2), nothing started"; else bad "rc=$TM_RC: $(cat "$TM_OUT")"; fi
+rm -rf "$D"
+tm_repo
+TM_PANE_PID=99999 tm_try
+if tm_refused "as this session's own" && ! grep -q 'send-keys' "$TM_REC"; then ok "connect --tmux where tmux's pane is not the session's own: refused (exit 2), nothing started, nothing typed"; else bad "rc=$TM_RC: $(cat "$TM_OUT")"; fi
+rm -rf "$D"
+tm_repo
+HEIMDALL_INBOX_WAKE_BIN="$WAKE_NO_TMUX" tm_try
+if tm_refused "tmux was not found on PATH"; then ok "connect --tmux with no tmux on PATH: refused (exit 2), nothing started"; else bad "rc=$TM_RC: $(cat "$TM_OUT")"; fi
+HEIMDALL_INBOX_WAKE_BIN="$TMPROOT/no-such-wake-tool" tm_try
+if tm_refused "heimdall-inbox-wake not found"; then ok "connect --tmux without the wake tool: refused (exit 2), nothing started"; else bad "rc=$TM_RC: $(cat "$TM_OUT")"; fi
+TM_FORGED="$TMPROOT/wake-forged"
+printf '#!/bin/sh\necho %s\n' "'[{\"pid\":1,\"pane\":\"%7; touch $TMPROOT/tmux-pwned\",\"socket\":\"/x\"}]'" >"$TM_FORGED"
+chmod +x "$TM_FORGED"
+HEIMDALL_INBOX_WAKE_BIN="$TM_FORGED" tm_try
+if tm_refused "no usable answer" && [ ! -e "$TMPROOT/tmux-pwned" ]; then ok "an answer that is not a pane id and an absolute socket is never recorded: refused (exit 2)"; else bad "rc=$TM_RC: $(cat "$TM_OUT")"; fi
+rm -rf "$D"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

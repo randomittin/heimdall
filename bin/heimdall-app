@@ -10,7 +10,7 @@
 #   bin/heimdall-ui            the loopback companion web UI this publishes
 #
 # Usage:
-#   hmd app connect [--repo DIR] [--port N] [--relay URL] [--bg] [--no-code] [--confirm]
+#   hmd app connect [--repo DIR] [--port N] [--relay URL] [--bg] [--no-code] [--confirm] [--tmux]
 #                              With no transport flag: publish through the hosted Cloudflare relay (the
 #                              DEFAULT, https://hmd-relay.therishabh16.workers.dev; HMD_RELAY_URL overrides
 #                              it and --relay URL overrides both) -- see the relay block below.
@@ -117,6 +117,25 @@
 #                              <...>/sentinels/hmd-ui.py with --repo resolving to this repo
 #                              and neither --allow-host nor --trust-proxy, re-checked
 #                              before each signal. (--tailscale keeps its fixed port.)
+#   hmd app connect [...] --tmux
+#                              Opt in to the session's own tmux pane as the delivery path for a phone message that lands while
+#                              Claude Code sits idle at its prompt (either transport: add --tmux to any connect above). The wake
+#                              types ONE fixed prompt, "phone message waiting", plus Enter into that pane -- a real user turn -- and
+#                              the companion inbox hooks hand the session the message in that turn, marked as data from the paired
+#                              phone. Nothing the phone sent is ever typed. Checked BEFORE anything starts (exit 2, one line saying
+#                              why, nothing started, nothing typed): tmux is on PATH; a Claude Code session of this repo has
+#                              registered (its SessionStart hook records the pane from its own TMUX_PANE/TMUX; run from inside a
+#                              session only that session is considered, from another pane every registered session of the repo);
+#                              the pane is on a tmux socket this user owns; and tmux itself lists the pane's process as an ancestor
+#                              of that session's claude pid and as this user's. The panes go in connect.json's `tmux` list, so the
+#                              opt-in lives and ends with this connect (disconnect removes it) and `hmd app status` prints a
+#                              `tmux wake:` line while it is on; to change it, disconnect and connect again. What it changes: a
+#                              terminal read 10-30 s ago may hold a half-typed draft, which the default answers with the exit-2 wake
+#                              notice; with the opt-in that window is waited out and the prompt typed once the terminal has been
+#                              quiet. A pane that cannot be proven at that moment still falls back to the notice, so a message is
+#                              never stuck. It loosens no gate: the same pane proof is repeated before every key, and
+#                              HMD_INBOX_WAKE=off (nothing) or =rewake (no keystrokes) in the session's environment still win.
+#                              Delegates to bin/heimdall-inbox-wake (`optin` checks, `watch` types).
 #   hmd app pair-window --session SID [--pid N] [--repo DIR] [--relay URL] [--transcript FILE]
 #   hmd app pair-window --stop --session SID [--repo DIR]
 #                              The REPO's pair-by-code window, with no terminal: the
@@ -311,7 +330,7 @@
 # Funnel (HTTPS certs / the Funnel node attribute aren't granted -- the CLI's
 # own hint is printed VERBATIM on stderr, per hmd_tailscale.sh's
 # ts_funnel_start contract), 6 `hmd ui` did not come up in time (including a
-# busy fixed port), 2 a required file/flag/tool is missing or malformed, 9
+# busy fixed port), 2 a required file/flag/tool is missing or malformed (a failed --tmux check included), 9
 # the installed tailscale build is macsys/App Store -- ts_variant identifies
 # it and Funnel is refused before the ui ever starts (2026-09-21
 # tailscale-macsys-funnel-cli-error-3: --help advertises the modern funnel
@@ -331,6 +350,8 @@
 # In --relay mode the same file instead holds:
 #   {"mode": "relay", "pid_ui": N, "pid_client": N, "port": N, "relay": "...",
 #    "started_at": "..."}
+# With --tmux either shape also holds "tmux": [{"pid": N, "pane": "%N", "socket": "/abs/path"}] -- the panes connect --tmux
+# verified; the key is absent without the flag.
 # and bin/heimdall-relay-client maintains its own status file,
 # <repo>/.heimdall/app/relay.json:
 #   {"session_id": "...", "relay": "...", "paired": bool, "bound_at": N|null,
@@ -386,6 +407,7 @@ fi
 
 UI_BIN="${HEIMDALL_UI_BIN:-$BIN_DIR/heimdall-ui}"
 INBOX_DELIVER_BIN="${HEIMDALL_INBOX_DELIVER_BIN:-$BIN_DIR/heimdall-inbox-deliver}"
+INBOX_WAKE_BIN="${HEIMDALL_INBOX_WAKE_BIN:-$BIN_DIR/heimdall-inbox-wake}"
 RELAY_CLIENT_BIN="${HEIMDALL_RELAY_CLIENT_BIN:-$BIN_DIR/heimdall-relay-client}"
 QR_PY="$LIB_DIR/hmd_qr.py"
 # The hosted relay `hmd app connect` publishes through when no transport flag says otherwise: the one origin the
@@ -546,6 +568,45 @@ _connect_state_ready() {
   fi
 }
 
+# _tmux_optin_prepare REPO -- `connect --tmux`'s check, made before anything starts (see the usage block): bin/heimdall-inbox-wake optin
+# proves, with tmux's own answer, which panes are the own panes of this repo's registered sessions. On success TMUX_OPTIN holds the list
+# (connect.json's `tmux` key), rebuilt here from the two validated fields -- a pane id and an absolute socket path -- plus the pid, and
+# nothing else the tool printed; otherwise the one line that says why goes to stderr and the return is 1 (connect's exit 2).
+_tmux_optin_prepare() {
+  local out why errf
+  if [ ! -x "$INBOX_WAKE_BIN" ]; then
+    echo "hmd app connect --tmux: heimdall-inbox-wake not found at $INBOX_WAKE_BIN" >&2
+    return 1
+  fi
+  errf="$(mktemp)" || { echo "hmd app connect --tmux: mktemp failed to create a temp file" >&2; return 1; }
+  out="$("$INBOX_WAKE_BIN" optin --repo "$1" 2>"$errf")"
+  why="$(_clean_text "$(head -c 400 "$errf")")"
+  rm -f "$errf"
+  TMUX_OPTIN="$(printf '%s' "$out" | jq -c 'if type == "array" and length > 0 and length <= 16 and all(.[]; type == "object"
+      and (.pid | type == "number" and . > 1 and . == floor)
+      and (.pane | type == "string" and test("^%[0-9]{1,9}$"))
+      and (.socket | type == "string" and startswith("/") and (contains("..") | not) and (contains("\n") | not) and length < 512))
+    then [.[] | {pid, pane, socket}] else empty end' 2>/dev/null)"
+  if [ -z "$TMUX_OPTIN" ]; then
+    echo "hmd app connect --tmux: ${why:-the wake tool gave no usable answer}" >&2
+    return 1
+  fi
+}
+
+# _tmux_optin_say -- one line once connect.json carries the opt-in: which panes, and the one thing that will be typed into them
+_tmux_optin_say() {
+  [ -n "$TMUX_OPTIN" ] || return 0
+  echo "hmd app: tmux wake on -- an idle session is woken by typing \"phone message waiting\" into pane $(printf '%s' "$TMUX_OPTIN" | jq -r '[.[] | "\(.pane) (Claude Code pid \(.pid))"] | join(", ")') -- nothing the phone sends is ever typed"
+}
+
+# _status_tmux_line DOC -- `tmux wake: on -- pane %7 (Claude Code pid N)` when connect.json (DOC) carries the --tmux opt-in; nothing otherwise
+_status_tmux_line() {
+  local panes
+  panes="$(_clean_text "$(printf '%s' "$1" | jq -r '[(.tmux // [])[] | select(type == "object") | "\(.pane) (Claude Code pid \(.pid))"] | join(", ")' 2>/dev/null)")"
+  [ -n "$panes" ] && echo "tmux wake: on -- pane $panes"
+  return 0
+}
+
 # ── connect()'s teardown state -- GLOBAL on purpose, never `local` ─────────
 # A trap registered inside a function fires later, at actual process exit,
 # after that function has already `return`ed and bash has popped its locals.
@@ -555,6 +616,7 @@ _connect_state_ready() {
 # which sets PORT/TOKEN/BASE/AUTH/OUT as globals "for the caller to copy out
 # immediately" -- here the "caller" is the trap itself, not another function.
 UI_PID=""
+TMUX_OPTIN=""     # --tmux: the verified panes as connect.json's `tmux` list (JSON), "" without the flag; _relay_write_state rewrites it each time
 HTTPS_PORT=""
 ACTUAL_PORT=""
 UI_REUSED=false   # UI_PID is a ui connect found already running and adopted, not a child of this shell
@@ -1403,7 +1465,7 @@ _relay_start_ui() {
 
 cmd_connect() {
   local REPO="" PORT="8710" NO_INSTALL=false BG=false
-  local RELAY_URL="" RELAY_SET=false HTTPS_PORT_SET=false TAILSCALE=false NO_CODE=false NO_CONFIRM=false CONFIRM=false
+  local RELAY_URL="" RELAY_SET=false HTTPS_PORT_SET=false TAILSCALE=false NO_CODE=false NO_CONFIRM=false CONFIRM=false TMUX_WAKE=false
   HTTPS_PORT="443"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1431,6 +1493,7 @@ cmd_connect() {
       --no-confirm) NO_CONFIRM=true; shift ;;  # the default since pairing by code stopped asking; kept so old command lines work
       --no-install) NO_INSTALL=true; shift ;;
       --bg) BG=true; shift ;;
+      --tmux) TMUX_WAKE=true; shift ;;
       *) echo "hmd app connect: unknown flag: $1" >&2; return 2 ;;
     esac
   done
@@ -1464,6 +1527,12 @@ cmd_connect() {
   if [ "$CONFIRM" = true ] && [ "$NO_CODE" = true ]; then
     echo "hmd app connect: --confirm compares a phone that pairs by code; it cannot be combined with --no-code" >&2
     return 2
+  fi
+
+  # --tmux is checked before anything starts: a refusal (exit 2) leaves nothing to tear down
+  TMUX_OPTIN=""
+  if [ "$TMUX_WAKE" = true ]; then
+    _tmux_optin_prepare "$REPO" || return 2
   fi
 
   if [ -n "$RELAY_URL" ]; then
@@ -1647,9 +1716,12 @@ cmd_connect() {
     --argjson https_port "$HTTPS_PORT" \
     --arg host "$host" \
     --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{pid_ui: $pid_ui, port: $port, https_port: $https_port, host: $host, started_at: $started_at}' \
+    --argjson tmux "${TMUX_OPTIN:-null}" \
+    '{pid_ui: $pid_ui, port: $port, https_port: $https_port, host: $host, started_at: $started_at}
+      + (if $tmux == null then {} else {tmux: $tmux} end)' \
     | _state_write "$REPO" connect.json; then
     STATE_WRITTEN=true
+    _tmux_optin_say
   else
     echo "hmd app connect: connect.json could not be written -- tearing down" >&2
     return 2
@@ -1707,8 +1779,9 @@ cmd_connect() {
 # _relay_write_state -- connect.json for the ui and client that run now
 _relay_write_state() {
   jq -n --argjson pid_ui "$UI_PID" --argjson pid_client "$CLIENT_PID" --argjson port "$actual_port" --arg relay "$RELAY_URL" \
-    --arg started_at "$relay_started_at" \
-    '{mode: "relay", pid_ui: $pid_ui, pid_client: $pid_client, port: $port, relay: $relay, started_at: $started_at}' \
+    --arg started_at "$relay_started_at" --argjson tmux "${TMUX_OPTIN:-null}" \
+    '{mode: "relay", pid_ui: $pid_ui, pid_client: $pid_client, port: $port, relay: $relay, started_at: $started_at}
+      + (if $tmux == null then {} else {tmux: $tmux} end)' \
     | _state_write "$REPO" connect.json
 }
 
@@ -1972,6 +2045,7 @@ cmd_connect_relay() {
   relay_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   if _relay_write_state; then
     STATE_WRITTEN=true
+    _tmux_optin_say
   else
     echo "hmd app connect: connect.json could not be written -- tearing down" >&2
     return 2
@@ -2574,6 +2648,7 @@ cmd_status() {
     "$PY3" "$LIB_DIR/companion_quick_ask.py" status-line --repo "$REPO" 2>/dev/null
   fi
 
+  _status_tmux_line "$connect_doc"
   [ "$orphaned" = true ] && return 1
   return 0
 }
@@ -2665,6 +2740,7 @@ cmd_status_relay() {
     pending="$(printf '%s' "$inbox_json" | jq -r '.pending // empty' 2>/dev/null)"
     echo "inbox pending: ${pending:-0}"
   fi
+  _status_tmux_line "$doc"
   if [ -n "$PY3" ] && [ -r "$LIB_DIR/companion_cc_login.py" ]; then
     "$PY3" "$LIB_DIR/companion_cc_login.py" status-line --repo "$REPO" 2>/dev/null
   fi
