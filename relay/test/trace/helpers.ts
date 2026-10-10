@@ -137,6 +137,36 @@ export function nextCloseCode(socket: WebSocket): Promise<number> {
   });
 }
 
+/**
+ * What the relay refused a phone upgrade with. A refusal a client must be able to read (React
+ * Native hides the HTTP status of a refused handshake) is a 101 closed at once with a code and a
+ * reason -- `gone`, `ended` or `invalid-token`, see test/refused-upgrade.spec.ts -- not a plain
+ * 401/410. Resolves `null` when the upgrade was answered any other way (a plain HTTP status) or
+ * its socket stayed open for `withinMs`, so a mutant that lets the upgrade through fails an
+ * assertion on the value instead of hanging until the test times out. A socket still open at the
+ * deadline is closed.
+ */
+export function refusal(res: Response, withinMs = 2000): Promise<{ code: number; reason: string } | null> {
+  const socket = res.status === 101 ? res.webSocket : null;
+  if (!socket) return Promise.resolve(null);
+  socket.accept();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      socket.close();
+      resolve(null);
+    }, withinMs);
+    socket.addEventListener(
+      "close",
+      (event) => {
+        clearTimeout(timer);
+        const { code, reason } = event as unknown as { code: number; reason: string };
+        resolve({ code, reason });
+      },
+      { once: true }
+    );
+  });
+}
+
 export function makeEnvelope(overrides: Partial<Envelope> & Pick<Envelope, "session_id">): Envelope {
   return {
     v: 1,

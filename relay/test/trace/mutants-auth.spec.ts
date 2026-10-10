@@ -29,6 +29,7 @@ import {
   revoke,
   wsUpgrade,
   reconnectQuery,
+  refusal,
 } from "./helpers";
 
 describe("MUT-INV-6-token-in-query", () => {
@@ -106,14 +107,17 @@ describe("MUT-INV-10-delayed-revoke", () => {
     // would also make the "fails after revoke" assertion below vacuously pass.
     const preRevoke = await wsUpgrade(init.session_id, reconnectQuery(deviceToken));
     expect(preRevoke.status).toBe(101);
-    preRevoke.webSocket?.accept();
-    preRevoke.webSocket?.close();
+    // A refusal is a 101 too (closed at once, with a code and a reason), so the status alone no
+    // longer proves the token is good: the baseline is that the socket is NOT refused.
+    expect(await refusal(preRevoke, 300), "a good token is not refused").toBeNull();
 
     const revokeRes = await revoke(init.session_id, init.relay_session_token);
     expect(revokeRes.status).toBe(200);
 
-    // Immediately — no delay, no sleep — attempt reconnect with the old token.
+    // Immediately — no delay, no sleep — attempt reconnect with the old token. The token still
+    // verifies, so the relay tells it why: 4001 / "ended". A mutant that lets it through leaves
+    // the socket open, which `refusal` reports as null.
     const reconnect = await wsUpgrade(init.session_id, reconnectQuery(deviceToken));
-    expect(reconnect.status).toBe(410);
+    expect(await refusal(reconnect)).toEqual({ code: 4001, reason: "ended" });
   });
 });
