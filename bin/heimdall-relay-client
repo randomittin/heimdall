@@ -374,6 +374,14 @@ behind `hmd app remote-asks on`, off by default), acked {"ok":true,"detail":"que
 resync listed `ask-v1`, held in memory only, and it sends the state again the moment a result changes. The command event names the
 action only: never the question, never an answer.
 
+MATCHED ANSWERS (capability `ask-answer-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-phone-replies-reach-session.md 4(a), bin/lib/companion_ui_inbox.py
+owns every rule): `caps` also lists `ask-answer-v1` while INBOX.answers_supported() -- the question derivation loads and can end an episode.
+It changes nothing on the wire the phone sends: an answer is the ordinary sealed `send-message` {"text":..} (acked {"ok":true,"of_seq":N,"id":..}).
+What it tells the phone is what hmd then does with one received while a question is open: stamps and seals it with that question's attention
+id, delivers it to the session AS the operator's answer to that question, and ENDS the question's episode on delivery -- state.attention
+leaves needs_input (working, a new id, since = the delivery) so the "hmd asks" row clears, and a second answer to it is delivered as late.
+A phone that never sees the token (an older hmd) has an ordinary message and a row that clears when the transcript moves.
+
 ATTACHED IMAGES (capability `attach-v1`; hmdapp's docs/HANDOFF-TO-HEIMDALL-cursor-parity.md CP6, the phone half in its src/attach): `caps` also
 lists `attach-v1` whenever bin/lib/companion_attach.py registered its actions and the operator did not set HMD_ATTACH=0. The phone seals
     {"action":"attach-begin","params":{"rid","name","mime","bytes","w","h","n","sha256"}}   ack ok {"id":"att-<8 hex>","result":{"chunk_max":262144}}
@@ -2229,6 +2237,7 @@ class RelayClient:
                 + ([VIEW.CAP_VIEW] if VIEW is not None else [])
                 + ([DASH.CAP_DASH] if DASH is not None else [])
                 + ([ASK.CAP_ASK] if ASK is not None else [])
+                + ([INBOX.CAP_ASK_ANSWER] if INBOX is not None and INBOX.answers_supported() else [])   # a phone answer is matched to the open question (companion_ui_inbox.py)
                 + ([ATTACH.CAP_ATTACH] if ATTACH is not None and ATTACH.enabled() else [])      # the phone's picture upload (companion_attach.py)
                 + ([DASH_ALERTS.CAP_ALERTS] if DASH is not None and DASH_ALERTS is not None else [])   # requires dash-v1
                 + (list(PUSH_STORE.extension_kinds().values()) if self._push_ready() else []))          # push-tile-alert-v1, push-digest-v1, ...

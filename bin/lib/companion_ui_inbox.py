@@ -34,6 +34,14 @@ ordinary message under the untrusted-data framing whatever else it claims. A tex
 SYSTEM_NOTICE_PREFIX is hmd's own notice (the relay client's pairing notice), not something typed on the phone,
 and is never stamped. A failure to derive the question, or to read or make the key, costs the stamp, never the message.
 
+ASK-ANSWER-V1 (capability, listed in `caps` of every state frame by bin/heimdall-relay-client while answers_supported()): a phone
+that sees it knows hmd matches the answer it sends -- over the E2E-paired relay, as an ordinary `send-message` {text}, no new
+param -- to the question hmd is waiting on, hands the session that answer AS the operator's answer to that question, and ENDS the
+question's attention episode when the delivery is made: state.attention leaves needs_input (working, a new id, since = the
+delivery) and its "hmd asks" row clears, and a second answer to the same question is delivered as late. Without the token (an
+older hmd, or the direct bearer-token route, which is never stamped) a phone answer is an ordinary message, and the row clears
+only once the session's next transcript entry does.
+
 Validation (append() -- nothing is ever written on a failure):
     - text is first run through _strip_control_chars() (control/escape bytes
       gone, \n and \t kept) -- the same byte class bin/heimdall-inbox-deliver's
@@ -167,6 +175,7 @@ RECEIPTS_TAIL_BYTES = 256 * 1024        # the newest archive lines hold them; ne
 GIT_TIMEOUT_S = 3
 VIA_VALUES = ("stop", "prompt", "tool", "tmux", "cli")   # who dequeued: bin/heimdall-inbox-deliver's modes, and `hmd ui inbox pop`
 SYSTEM_NOTICE_PREFIX = "[hmd notice]"   # opens a text hmd itself queues (bin/heimdall-relay-client's pairing notice): never an answer
+CAP_ASK_ANSWER = "ask-answer-v1"        # the capability token the relay client lists to the phone while answers_supported(): see ASK-ANSWER-V1
 UI_DIR = os.path.join(".heimdall", "ui")      # the directories hmd_private_state walks, one component at a time, without following a link
 APP_DIR = os.path.join(".heimdall", "app")
 INBOX_NAME = "inbox.jsonl"
@@ -413,6 +422,17 @@ def open_ask(root):
     if a.get("state") == "needs_input" and a.get("kind") == "question" and isinstance(a.get("id"), str):
         return {"id": a["id"], "summary": a.get("summary")}
     return None
+
+
+def answers_supported():
+    """True when hmd can really match a phone answer to the open question AND end that question's episode when the answer is
+    delivered -- what listing CAP_ASK_ANSWER to the phone promises: the attention derivation loads, it can end an episode
+    (close_episode, with the link-safe helper it writes the marker through) and this copy reaches repo state without following a
+    link. The loads are memoised, so this reads no file and is cheap enough to ask for the caps of every state frame."""
+    attention = _sibling("companion_ui_attention")
+    return (attention is not None and callable(getattr(attention, "collect", None))
+            and callable(getattr(attention, "close_episode", None))
+            and getattr(attention, "PRIVATE", None) is not None and link_safe())
 
 
 # ── writing ──────────────────────────────────────────────────────────────────

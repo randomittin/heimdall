@@ -1211,6 +1211,55 @@ else
   bad "S. link safety: $(printf '%s\n' "$S_OUT" | grep -v '^OK' | head -50)"
 fi
 
+# ═══ T. ask-answer-v1: the capability hmd lists once it can match a phone answer to the open question ═════════
+# The relay client adds INBOX.CAP_ASK_ANSWER to the caps of every state frame when INBOX.answers_supported(); the
+# frames themselves are checked where the exact caps list is (test/hmd-relay-zlib-frames.test.sh,
+# test/companion-cc-login-e2e.test.sh). Here: the token, and that hmd never claims it without the machinery behind it.
+T_UNIT="$TMPROOT/ask_answer_cap.py"
+cat > "$T_UNIT" <<'CAPPY'
+import os
+import sys
+import types
+
+sys.path.insert(0, os.path.join(sys.argv[1], "bin", "lib"))
+verdicts = []
+
+
+def check(name, cond, detail=""):
+    verdicts.append("%s %s%s" % ("OK " if cond else "BAD", name, "" if cond else "  <<" + str(detail)[:300] + ">>"))
+
+
+import companion_ui_inbox as M
+
+check("the capability token is ask-answer-v1 (<= 32 chars, the relay's token limit)",
+      M.CAP_ASK_ANSWER == "ask-answer-v1" and len(M.CAP_ASK_ANSWER) <= 32, getattr(M, "CAP_ASK_ANSWER", None))
+check("answers_supported() is true while the attention derivation and the link-safe helper are loaded",
+      M.answers_supported() is True, M.answers_supported())
+saved = M._MODULES.get("companion_ui_attention")
+try:
+    M._MODULES["companion_ui_attention"] = None
+    check("... false when the attention derivation cannot load: no question can be matched, so the phone is not told it can",
+          M.answers_supported() is False)
+    M._MODULES["companion_ui_attention"] = types.SimpleNamespace(collect=lambda root: {})
+    check("... false for an attention copy that cannot end the episode (no close_episode): matching without closing is not the capability",
+          M.answers_supported() is False)
+finally:
+    if saved is None:
+        M._MODULES.pop("companion_ui_attention", None)
+    else:
+        M._MODULES["companion_ui_attention"] = saved
+check("... true again once the real derivation is back", M.answers_supported() is True)
+print("\n".join(verdicts))
+CAPPY
+T_OUT="$(python3 "$T_UNIT" "$REPO" 2>&1)"
+T_BAD="$(printf '%s\n' "$T_OUT" | grep -c '^BAD' || true)"
+T_OK="$(printf '%s\n' "$T_OUT" | grep -c '^OK' || true)"
+if [ "$T_BAD" = "0" ] && [ "$T_OK" -ge 5 ]; then
+  ok "T. ask-answer-v1: the token, and hmd lists it only while a phone answer can be matched and the episode closed ($T_OK checks)"
+else
+  bad "T. ask-answer-v1: $(printf '%s\n' "$T_OUT" | grep -v '^OK' | head -20)"
+fi
+
 # ═══ 20. server survived every malformed/oversize/secret/control-char/
 # capacity/rotation payload ═════════════════════════════════════════════════
 if kill -0 "$SRV_PID" 2>/dev/null; then
