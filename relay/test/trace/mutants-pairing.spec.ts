@@ -69,18 +69,18 @@ describe("MUT-INV-3-precock-leak", () => {
     expect(first.type).toBe("device_bound");
     expect(first.ciphertext).toBeNull();
 
-    // And no second message (the leaked precock frame) follows shortly after.
+    // And no second message (the leaked precock frame) follows shortly after. The relay's own
+    // presence frame (`peer`) ends every accepted phone socket and is not what is hunted here: a
+    // buffered pre-claim `state` that leaked would still arrive as a `state` and fail this.
     let extra: unknown = "none";
     await Promise.race([
       new Promise<void>((resolve) => {
-        socket.addEventListener(
-          "message",
-          (event) => {
-            extra = JSON.parse((event as unknown as { data: string }).data);
-            resolve();
-          },
-          { once: true }
-        );
+        socket.addEventListener("message", (event) => {
+          const frame = JSON.parse((event as unknown as { data: string }).data) as Record<string, unknown>;
+          if (frame.type === "peer") return;
+          extra = frame;
+          resolve();
+        });
       }),
       new Promise((resolve) => setTimeout(resolve, 50)),
     ]);

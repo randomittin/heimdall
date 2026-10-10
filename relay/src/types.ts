@@ -77,7 +77,8 @@ export type FrameType =
   | "device_bound"
   | "session_ended"
   | "keepalive"
-  | "key_reveal";
+  | "key_reveal"
+  | "peer";
 
 /**
  * The wire envelope (spec §2.3). `nonce`/`ciphertext` are null for the three
@@ -143,6 +144,17 @@ export interface KeepalivePayload {
   ts: number; // epoch seconds
 }
 
+/** Payload of the `peer` control frame, the presence frame the relay writes to the phone's leg:
+ *  whether hmd is attached to the session right now. Sent as the last thing an accepted phone
+ *  socket carries and again at every hmd attach and detach (src/session.ts's `announcePresence`).
+ *  It is a level, never an edge — a repeat is harmless and a client keeps the last one — and it
+ *  is the relay's view of hmd's socket: a laptop that dies without a close frame reads as online
+ *  until the edge notices the dead connection. Plaintext, relay-originated, and refused from both
+ *  legs: neither `isDeviceFrame` nor `isHmdFrame` accepts the type. */
+export interface PeerPayload {
+  hmd_online: boolean;
+}
+
 /**
  * Why the relay ended a session that hmd still held a `GET /stream` for — the
  * `reason` in a `session_ended` frame written down that stream (INV-38).
@@ -174,7 +186,8 @@ export interface ErrorResponse {
  * deliberately absent from the accepted `type` set below: it is
  * relay-originated only, on the one leg (hmd's `GET /stream`) the relay itself
  * writes, so accepting one inbound would only widen the surface with a frame
- * that has no meaning in that direction.
+ * that has no meaning in that direction. `peer`, the phone leg's presence
+ * frame, is absent for the same reason: neither leg may originate it.
  *
  * **This is not a leg gate on its own, and must never be used as one.** It
  * accepts `sender: "relay"` and the two relay-originated control types, which
@@ -209,7 +222,7 @@ export function isEnvelope(value: unknown): value is Envelope {
  * `command` is the whole set. The app emits nothing else — `RelayTransport`
  * has one `ws.send`, always `sender: "device"`, `type: "command"` — and
  * `state`/`ack` are hmd's to originate, while `device_bound`/`session_ended`/
- * `keepalive` are the relay's. A frame claiming any of those from the phone
+ * `keepalive`/`peer` are the relay's. A frame claiming any of those from the phone
  * socket is a forgery attempt by definition, never a client that drifted.
  */
 export function isDeviceFrame(value: unknown): value is Envelope {

@@ -61,11 +61,15 @@ async function claimDevice(
 
 function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
-    socket.addEventListener(
-      "message",
-      (event) => resolve(JSON.parse((event as unknown as { data: string }).data)),
-      { once: true }
-    );
+    const onMessage = (event: MessageEvent): void => {
+      const frame = JSON.parse(event.data as string) as Record<string, unknown>;
+      // Presence (`peer`) is level-triggered and lands wherever hmd's leg changes, so it is set
+      // aside here the way a keepalive is on hmd's stream; test/presence.spec.ts reads it.
+      if (frame.type === "peer") return;
+      socket.removeEventListener("message", onMessage);
+      resolve(frame);
+    };
+    socket.addEventListener("message", onMessage);
   });
 }
 

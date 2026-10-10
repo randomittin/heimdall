@@ -115,11 +115,15 @@ export function reconnectQuery(deviceToken: string): string {
 
 export function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
-    socket.addEventListener(
-      "message",
-      (event) => resolve(JSON.parse((event as unknown as { data: string }).data)),
-      { once: true }
-    );
+    const onMessage = (event: MessageEvent): void => {
+      const frame = JSON.parse(event.data as string) as Record<string, unknown>;
+      // Presence (`peer`) is level-triggered and lands wherever hmd's leg changes, so it is set
+      // aside here the way a keepalive is on hmd's stream; test/presence.spec.ts reads it.
+      if (frame.type === "peer") return;
+      socket.removeEventListener("message", onMessage);
+      resolve(frame);
+    };
+    socket.addEventListener("message", onMessage);
   });
 }
 
@@ -128,6 +132,36 @@ export function nextCloseCode(socket: WebSocket): Promise<number> {
     socket.addEventListener(
       "close",
       (event) => resolve((event as unknown as { code: number }).code),
+      { once: true }
+    );
+  });
+}
+
+/**
+ * What the relay refused a phone upgrade with. A refusal a client must be able to read (React
+ * Native hides the HTTP status of a refused handshake) is a 101 closed at once with a code and a
+ * reason -- `gone`, `ended` or `invalid-token`, see test/refused-upgrade.spec.ts -- not a plain
+ * 401/410. Resolves `null` when the upgrade was answered any other way (a plain HTTP status) or
+ * its socket stayed open for `withinMs`, so a mutant that lets the upgrade through fails an
+ * assertion on the value instead of hanging until the test times out. A socket still open at the
+ * deadline is closed.
+ */
+export function refusal(res: Response, withinMs = 2000): Promise<{ code: number; reason: string } | null> {
+  const socket = res.status === 101 ? res.webSocket : null;
+  if (!socket) return Promise.resolve(null);
+  socket.accept();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      socket.close();
+      resolve(null);
+    }, withinMs);
+    socket.addEventListener(
+      "close",
+      (event) => {
+        clearTimeout(timer);
+        const { code, reason } = event as unknown as { code: number; reason: string };
+        resolve({ code, reason });
+      },
       { once: true }
     );
   });

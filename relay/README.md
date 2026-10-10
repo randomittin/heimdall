@@ -352,9 +352,11 @@ carries no `jti`, so revoking one device means ending the session.
   supersede (reconnect after a network drop)" suite.
 - `400` — `device_pubkey` is missing, or doesn't decode to exactly 32 bytes (`pairing_code`
   claim only).
-- `401` — `pairing_code` doesn't match; or `device_token` is invalid/expired; or the token is
-  pubkey-bound and `device_pubkey` is absent or does not match the bound key.
-- `410` — pairing code already claimed, or expired.
+- `401` — `pairing_code` doesn't match. A `device_token` that is invalid, expired, or pubkey-bound
+  with a `device_pubkey` that is absent or does not match is no longer a `401`: it is a `101`
+  that closes `4003` / `"invalid-token"` ("A refused upgrade says why", below).
+- `410` — pairing code already claimed, or expired. A `device_token` reconnect to an ended
+  session is no longer a `410` either: it is a `101` that closes `4001` / `"ended"`.
 - `429` + `Retry-After: 60` — more than 10 claim attempts against one session within 60s. On
   this leg the status is not observable to a React Native client (see INV-25 under
   "Deviations"); it is reported honestly for any other caller.
@@ -370,7 +372,7 @@ Every message is gated four ways before a byte reaches hmd's stream:
    phone and the relay here.
 2. **Provenance.** Only `sender: "device"` with `type: "command"` is forwarded (`isDeviceFrame`,
    `src/types.ts`). Anything else — `sender:"relay"`, `device_bound`, `session_ended`,
-   `keepalive`, `state`, `ack`, `sender:"hmd"` — is dropped and logged, never forwarded. This is
+   `keepalive`, `peer`, `state`, `ack`, `sender:"hmd"` — is dropped and logged, never forwarded. This is
    the single most important gate in the file: hmd re-derives its session key from *any*
    `device_bound` it reads off its stream, so forwarding a phone-sent one rebound the session to
    the sender's own X25519 key — a full end-to-end break by a party holding no credential at all.
@@ -384,10 +386,64 @@ Every message is gated four ways before a byte reaches hmd's stream:
    credential working indefinitely. A socket accepted before this field existed carries no
    `token_exp` and is served until it drops — the relay has no honest expiry to apply to it.
 
-Close codes on this leg: `1009` oversize, `4001` session ended/revoked, `4002` superseded,
-`4003` device token expired. All four mean "reconnect" to the app except `4001`; a reconnect
-after `4001`/`4003` meets a truthful `410`/`401` at the upgrade, which is how the operator
-learns to re-pair.
+Close codes on this leg: `1009` oversize, `4001` session ended/revoked (and, on a refused upgrade,
+`gone`), `4002` superseded, `4003` device token expired (and, on a refused upgrade,
+`invalid-token`). `1009` and `4002` mean "reconnect" to the app; `4001` means the pairing is over.
+
+#### A refused upgrade says why (101, then close)
+
+React Native does not expose the HTTP status of a refused WebSocket handshake: a `404`, a `401`,
+a `410` and a dead network all reach the app as an error with no relay close code, and the app
+took every one for an ordinary drop and retried a restarted laptop session's dead pairing for
+ever (hmdapp's `docs/HANDOFF-TO-HEIMDALL-session-restart-repair.md`, item 1). So the relay
+refuses a phone upgrade the way a client can read: it answers `101` and closes the socket at
+once, with no message first, with a close code and a reason (`contract/wire.json`,
+`phone.refused_upgrade`; `test/refused-upgrade.spec.ts`):
+
+| the relay found | close | reason | told to | replaces |
+|---|---|---|---|---|
+| no session record (purged, or never issued) | `4001` | `gone` | anyone, whatever it presents | `404 session not found` |
+| a `device_token` that does not verify for this session and key | `4003` | `invalid-token` | anyone | `401 invalid device token` |
+| a token that verifies, on an ended session | `4001` | `ended` | only the holder of that token | `410 session ended` |
+
+The order of the checks is the leak check. `gone` and `invalid-token` say what the `404` and
+`401` already said, to the same callers, so they add nothing a caller could not learn before, and
+session ids are `crypto.randomUUID()` (122 random bits), so existence is not enumerable. `ended`
+stays behind the token check, as the `410` was: a stranger holding only a session id gets
+`invalid-token` for a live and for an ended session alike. Every other refusal is still a plain
+HTTP status: a missing `Upgrade` header, plaintext `ws`, both or neither credential (`400`), and
+every `pairing_code` claim refusal on an existing session (`400`/`401`/`410`/`429`); a
+`pairing_code` claim on a session with no record is `gone` like any other upgrade. Only the reason
+word is logged (`upgrade_refused`), never a credential; the edge's own request log now shows these
+refusals as `101`.
+
+A credential-free `GET /session/:id/status` was considered and deliberately not added: it would
+hand anyone who holds an old session id (a screenshotted QR, a log line) a lifecycle and
+laptop-presence oracle for as long as the session lives, and the closes above plus the `peer`
+frame below already tell a connecting phone everything that route would.
+
+#### Presence: the `peer` frame
+
+A bound session whose hmd client died without revoking (a reboot) stays bound for 30 days, keeps
+accepting phone sockets and replays hmd's last `state`, which a phone would render as live. So the
+relay tells the phone whether hmd is attached, in a plaintext, relay-originated `peer` control
+frame (`contract/wire.json`, `phone.peer`; `test/presence.spec.ts`):
+
+```json
+{"v":1,"session_id":"<uuid>","seq":0,"sender":"relay","type":"peer","nonce":null,"ciphertext":null,"payload":{"hmd_online":true}}
+```
+
+It is sent (a) as the **last** thing an accepted phone socket carries, after `device_bound`,
+`key_reveal` and the replayed `state`, so the order a phone has always seen is unchanged, and (b)
+to every open phone socket at every hmd attach and detach: either transport of `GET /stream`
+opening, an NDJSON stream ending, hmd's WebSocket closing or erroring with no revoke (also while
+the Durable Object is hibernated), or the relay closing it (oversize). It is level-triggered: a
+repeat is harmless and a client keeps the last one, and a superseding hmd socket is one attach,
+never a detach. Nothing is sent once a session is over (`session_ended`, then the close).
+`hmd_online` is the relay's view of hmd's socket: a laptop that dies without a close frame reads
+online until the edge notices the dead connection (minutes), because a relay timer to find out
+sooner would keep the object awake. Neither leg can originate a `peer` (`isDeviceFrame` and
+`isHmdFrame` refuse it), and a client that does not know the type drops it (`decodeRelayFrame`).
 
 ### `POST /session/:id/revoke` — hmd leg, requires the same bearer
 
@@ -650,7 +706,8 @@ shipped this keeps running.
 ```
 
 `type` is a closed set: `state` | `command` | `ack` | `device_bound` | `session_ended` |
-`keepalive` | `key_reveal` (hmd->phone, plaintext, once per session — "Pair by session code").
+`keepalive` | `key_reveal` (hmd->phone, plaintext, once per session — "Pair by session code") |
+`peer` (relay->phone, plaintext presence — "Presence: the `peer` frame").
 `nonce` / `ciphertext` are forwarded byte-identical in both directions — the relay
 does not decode, validate, or transform them — and are `null` on the plaintext control
 types (`key_reveal` included). `payload` is a relay-side addition (never present on `state` / `command` / `ack`) that
@@ -658,7 +715,8 @@ carries plaintext relay-originated data — a `device_bound` sent to the *phone*
 `{device_token, exp}`; a `device_bound` written into *hmd's* `GET /stream` carries
 `{device_pubkey, bound_at}` instead (see the `ws` endpoint above) — the two are the same frame
 `type` on two different legs, never both fields at once. A `keepalive` (hmd's stream only)
-carries `{ts}`. Client tracks should only trust a relay-minted field this way when it arrives
+carries `{ts}`; a `peer` (the phone's leg only) carries `{hmd_online}`. Client tracks should only
+trust a relay-minted field this way when it arrives
 via `device_bound`, never inside a `state`/`command`/`ack` frame's `payload`.
 
 A client that does not recognise a control `type` should skip that line, not treat it as an

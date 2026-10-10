@@ -15,6 +15,7 @@ import {
   revoke,
   wsUpgrade,
   reconnectQuery,
+  refusal,
   TEST_DEVICE_PUBKEY,
 } from "./helpers";
 
@@ -28,9 +29,12 @@ describe("MUT-INV-29-partial-revoke", () => {
     const revokeRes = await revoke(init.session_id, init.relay_session_token);
     expect(revokeRes.status).toBe(200);
 
-    // 1. New device_token reconnect attempts are blocked.
+    // 1. New device_token reconnect attempts are blocked: the token still verifies, so the relay
+    //    refuses it as a 101 closed at once with 4001 / "ended" (a platform that hides the HTTP
+    //    status of a refused handshake can read that). A mutant that lets the reconnect through
+    //    leaves the socket open, which `refusal` reports as null.
     const byToken = await wsUpgrade(init.session_id, reconnectQuery(deviceToken));
-    expect(byToken.status).toBe(410);
+    expect(await refusal(byToken)).toEqual({ code: 4001, reason: "ended" });
 
     // 2. The ORIGINAL pairing_code is also blocked — revoke is not scoped to
     //    "reconnect" alone, it kills every entry point into the session.
@@ -54,16 +58,18 @@ describe("MUT-INV-30-token-resurrection", () => {
     // Baseline: prove the token actually worked for reconnect BEFORE revoke.
     const preRevoke = await wsUpgrade(init.session_id, reconnectQuery(oldDeviceToken));
     expect(preRevoke.status).toBe(101);
-    preRevoke.webSocket?.accept();
-    preRevoke.webSocket?.close();
+    // A refusal is a 101 too, so the baseline is that the socket is NOT refused.
+    expect(await refusal(preRevoke, 300), "a good token is not refused").toBeNull();
 
     await revoke(init.session_id, init.relay_session_token);
 
-    // Retry the old token twice — proving permanence, not a transient blip.
+    // Retry the old token twice — proving permanence, not a transient blip. Each is refused with
+    // 4001 / "ended" (the token verifies, the session is over); a resurrected token would leave
+    // the socket open, which `refusal` reports as null.
     const attempt1 = await wsUpgrade(init.session_id, reconnectQuery(oldDeviceToken));
-    expect(attempt1.status).toBe(410);
+    expect(await refusal(attempt1)).toEqual({ code: 4001, reason: "ended" });
     const attempt2 = await wsUpgrade(init.session_id, reconnectQuery(oldDeviceToken));
-    expect(attempt2.status).toBe(410);
+    expect(await refusal(attempt2)).toEqual({ code: 4001, reason: "ended" });
 
     // The only forward path is an entirely fresh pairing cycle.
     const fresh = await pairInit();

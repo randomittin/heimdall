@@ -19,6 +19,7 @@ import type {
   DeviceBoundToPhonePayload,
   DeviceBoundToHmdPayload,
   KeepalivePayload,
+  PeerPayload,
   SessionEndedPayload,
   SessionEndReason,
   Envelope,
@@ -215,13 +216,21 @@ const ENDED_GRACE_MS = 5 * 60_000;
 /**
  * WebSocket close codes this relay originates on the phone leg, alongside
  * `4001` (revoked) and `4002` (superseded) which predate this file's hardening
- * pass. Both below tell the app the same thing operationally — reconnect, and
- * the upgrade will answer honestly (`401` for a lapsed token, `410` for an
- * ended session) — rather than leaving it pushing frames into a socket the
- * relay has stopped serving.
+ * pass. `4001` tells the app the session is over; `4003` tells it its device
+ * token is no good — one that failed to verify at the upgrade (`refuseUpgrade`)
+ * or whose `exp` passed on an open socket — rather than leaving it pushing
+ * frames into a socket the relay has stopped serving.
  */
 const CLOSE_SESSION_ENDED = 4001;
-const CLOSE_TOKEN_EXPIRED = 4003;
+const CLOSE_TOKEN_REJECTED = 4003;
+/**
+ * The close reason of a refused phone upgrade (`refuseUpgrade`), the word the
+ * app reads: `gone` (no session record) and `ended` (a verified token on an
+ * ended session) ride `CLOSE_SESSION_ENDED`, `invalid-token` rides
+ * `CLOSE_TOKEN_REJECTED`. Pinned in relay/contract/wire.json's
+ * `phone.refused_upgrade`.
+ */
+type RefusedUpgradeReason = "gone" | "ended" | "invalid-token";
 /** RFC 6455's "message too big" — INV-16, on both WebSocket legs. */
 const CLOSE_MESSAGE_TOO_BIG = 1009;
 /**
@@ -258,7 +267,8 @@ function loggableType(value: unknown): string {
     value === "device_bound" ||
     value === "session_ended" ||
     value === "keepalive" ||
-    value === "key_reveal"
+    value === "key_reveal" ||
+    value === "peer"
     ? value
     : "other";
 }
@@ -352,6 +362,22 @@ function socketGeneration(socket: WebSocket): number {
  */
 function lineToMessage(line: string): string {
   return line.endsWith("\n") ? line.slice(0, -1) : line;
+}
+
+/** The presence frame, one WebSocket message on the phone's leg: a plaintext control frame the
+ *  relay originates (seq 0, no nonce, no ciphertext) saying whether hmd is attached. */
+function peerFrame(sessionId: string, hmdOnline: boolean): string {
+  const payload: PeerPayload = { hmd_online: hmdOnline };
+  return JSON.stringify({
+    v: 1,
+    session_id: sessionId,
+    seq: 0,
+    sender: "relay",
+    type: "peer",
+    nonce: null,
+    ciphertext: null,
+    payload,
+  });
 }
 
 /**
@@ -735,6 +761,7 @@ export class SessionDO {
       this.hmdStreamController = null;
       this.clearKeepalive();
       this.clearStreamLifetime();
+      this.announceDetached();
       return false;
     }
     this.armKeepalive();
@@ -852,6 +879,7 @@ export class SessionDO {
         session_id: this.cachedSessionId ?? "unknown",
       });
       this.closeHmdStream();
+      this.announceDetached();
     }, this.streamMaxLifetimeMs());
   }
 
@@ -859,6 +887,79 @@ export class SessionDO {
     if (this.streamLifetimeTimer === null) return;
     clearTimeout(this.streamLifetimeTimer);
     this.streamLifetimeTimer = null;
+  }
+
+  /**
+   * Whether hmd's leg is attached right now: the NDJSON stream's controller, or an open hmd
+   * WebSocket. Re-derived on every call, like every other read of a socket here, because after a
+   * hibernation this instance has never seen the sockets it is asked about. `except` names a socket
+   * that is going away and must not count even if the runtime still reports it open.
+   */
+  private hmdOnline(except?: WebSocket): boolean {
+    if (this.hmdStreamController !== null) return true;
+    return this.socketsNewestFirst(HMD_TAG).some(
+      ({ socket }) => socket !== except && socket.readyState === WebSocket.OPEN
+    );
+  }
+
+  /**
+   * Tells the phone whether hmd is attached: one `peer` presence frame to every open phone socket,
+   * not only the newest, because delivery-driven superseding (`supersedeOlderSockets`) has not yet
+   * said which of two live sockets the app kept, and a frame sent to one it dropped is harmless.
+   * Called at every hmd attach and detach. A repeat is harmless: the frame is a level, and a
+   * client keeps the last one it saw. A caller that knows better than the socket set can passes
+   * `online` (an attach, whose fresh socket the runtime may not yet report open). A socket that is
+   * closing is skipped, and a send that throws is not an error: a phone that is gone is no reason
+   * to fail the hmd transition that announced it.
+   */
+  private announcePresence(sessionId: string, online = this.hmdOnline()): void {
+    const frame = peerFrame(sessionId, online);
+    for (const { socket } of this.socketsNewestFirst(DEVICE_TAG)) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      try {
+        socket.send(frame);
+      } catch {
+        // Torn down between the readyState check and the send: nobody left to tell.
+      }
+    }
+  }
+
+  /** hmd's leg went away somewhere that has only the cached session id to go on — a stream's
+   *  `cancel`, a failed write, the lifetime timer. Nothing to say before a record was ever read. */
+  private announceDetached(): void {
+    if (this.cachedSessionId !== null) this.announcePresence(this.cachedSessionId);
+  }
+
+  /** An hmd WebSocket is gone — closed by hmd, errored, or closed by this relay: tell the phone
+   *  that hmd is offline, unless another hmd leg is still attached. Then nothing is sent at all: a
+   *  superseded socket leaving is no detach, and its replacement already announced the attach. */
+  private announceHmdSocketGone(gone: WebSocket, sessionId: string | null | undefined): void {
+    if (typeof sessionId !== "string" || this.hmdOnline(gone)) return;
+    this.announcePresence(sessionId, false);
+  }
+
+  /**
+   * Refuses a phone's upgrade in a form a client that cannot read an HTTP status can still read.
+   * React Native hides the status of a refused WebSocket handshake — a 404, a 401, a 410 and a dead
+   * network all reach the app as an error with no relay close code — so the app retried a pairing
+   * that was over, for ever. The upgrade is answered 101 and the socket closed at once with `code`
+   * and `reason`, no message first. A plain accept, not a hibernatable one: nothing is kept and
+   * there is nothing to wake for.
+   *
+   * Who may be told what is the caller's order of checks (handleWsUpgrade, handleDeviceTokenClaim):
+   * `gone` and `invalid-token` are credential-free and say exactly what the 404 and 401 they
+   * replace said, to the same callers; `ended` comes only after the token has verified for this
+   * very session, as the 410 did, so a stranger holding only a session id cannot tell a live
+   * session from an ended one. Only the reason word is logged, never a credential (INV-8).
+   */
+  private refuseUpgrade(code: number, reason: RefusedUpgradeReason, sessionId?: string): Response {
+    logEvent("upgrade_refused", { session_id: sessionId ?? "unknown", reason });
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.accept();
+    server.close(code, reason);
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   private checkBearer(request: Request, record: SessionRecord): boolean {
@@ -955,6 +1056,7 @@ export class SessionDO {
         owner.hmdStreamController = null;
         owner.clearKeepalive();
         owner.clearStreamLifetime();
+        owner.announceDetached();
       },
     });
     // The `device_bound` held while hmd's stream was down goes out first, and
@@ -963,6 +1065,8 @@ export class SessionDO {
     if (pending !== undefined && this.writeToHmdStream(pending)) {
       await this.ctx.storage.delete(PENDING_HMD_CONTROL_KEY);
     }
+    // Computed, not assumed: a held frame that failed to write has just dropped this very stream.
+    this.announcePresence(record.session_id);
     logEvent("hmd_stream_open", { session_id: record.session_id, transport: "ndjson" });
     return new Response(stream, {
       status: 200,
@@ -1009,6 +1113,9 @@ export class SessionDO {
     if (pending !== undefined && this.sendToHmdSocket(server, pending)) {
       await this.ctx.storage.delete(PENDING_HMD_CONTROL_KEY);
     }
+    // Said outright rather than derived: the socket just accepted is hmd, whatever readyState the
+    // runtime reports for a socket it has not yet handed a client.
+    this.announcePresence(sessionId, true);
     logEvent("hmd_stream_open", { session_id: sessionId, transport: "ws" });
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -1226,7 +1333,9 @@ export class SessionDO {
     }
 
     const record = await this.loadRecord();
-    if (!record) return jsonResponse(404, { error: "session not found" });
+    // No record — purged, or never issued — is told as a close, to every caller and whatever it
+    // presents: it says what the 404 said (see refuseUpgrade).
+    if (!record) return this.refuseUpgrade(CLOSE_SESSION_ENDED, "gone");
 
     const url = new URL(request.url);
     const pairingCode = url.searchParams.get("pairing_code");
@@ -1269,9 +1378,11 @@ export class SessionDO {
       Date.now(),
       devicePubkey
     );
-    if (!claims) return jsonResponse(401, { error: "invalid device token" });
+    if (!claims) return this.refuseUpgrade(CLOSE_TOKEN_REJECTED, "invalid-token", record.session_id);
+    // After the token, never before: that a session has ended is only told to a holder of a token
+    // that verifies for it, as the 410 this replaces was.
     if (record.status === "ended") {
-      return jsonResponse(410, { error: "session ended" });
+      return this.refuseUpgrade(CLOSE_SESSION_ENDED, "ended", record.session_id);
     }
     // The fix this feature exists for: without this, a phone reconnecting
     // here got nothing until hmd's next digest change — see
@@ -1468,6 +1579,10 @@ export class SessionDO {
       server.send(JSON.stringify(replayEnvelope));
       logEvent("state_replayed", { session_id: sessionId, seq: replayEnvelope.seq });
     }
+    // Last, so the order a phone has always seen (device_bound, key_reveal, the replayed state) is
+    // unchanged. A replayed state is hmd's last word, not proof that hmd is here; this is what lets
+    // the phone tell the two apart.
+    server.send(peerFrame(sessionId, this.hmdOnline()));
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -1988,7 +2103,7 @@ export class SessionDO {
         leg: "device",
         reason: "device_token_expired",
       });
-      this.closeSocket(ws, CLOSE_TOKEN_EXPIRED, "device token expired");
+      this.closeSocket(ws, CLOSE_TOKEN_REJECTED, "device token expired");
       return;
     }
 
@@ -2027,6 +2142,9 @@ export class SessionDO {
         reason: "envelope_exceeds_size_cap",
       });
       this.closeSocket(ws, CLOSE_MESSAGE_TOO_BIG, "frame exceeds size cap");
+      // The relay closed hmd's leg itself: the phone is told, whether or not the runtime also
+      // reports this close to `webSocketClose` (a repeat is harmless).
+      this.announceHmdSocketGone(ws, attachment.sid ?? this.cachedSessionId);
       return;
     }
     logEvent("frame_rejected", {
@@ -2144,17 +2262,23 @@ export class SessionDO {
     wasClean: boolean
   ): Promise<void> {
     const record = await this.loadRecord();
-    logEvent(this.isHmdSocket(ws) ? "hmd_socket_closed" : "device_socket_closed", {
+    const hmd = this.isHmdSocket(ws);
+    logEvent(hmd ? "hmd_socket_closed" : "device_socket_closed", {
       session_id: record?.session_id ?? "unknown",
       code,
       wasClean,
     });
+    // hmd's socket closed with no revoke — a laptop that slept, rebooted or lost its network. Only
+    // while the session is bound: a revoke or an end has already told the phone, and closed it.
+    if (hmd && record?.status === "bound") this.announceHmdSocketGone(ws, record.session_id);
   }
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     const record = await this.loadRecord();
-    logEvent(this.isHmdSocket(ws) ? "hmd_socket_error" : "device_socket_error", {
+    const hmd = this.isHmdSocket(ws);
+    logEvent(hmd ? "hmd_socket_error" : "device_socket_error", {
       session_id: record?.session_id ?? "unknown",
     });
+    if (hmd && record?.status === "bound") this.announceHmdSocketGone(ws, record.session_id);
   }
 }
