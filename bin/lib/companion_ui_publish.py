@@ -50,7 +50,14 @@ src/contract/guards.ts, src/session/tabs/agents/parse.ts):
                 gone the moment anything (typed prompt, delivered phone answer, or
                 hmd's next mid-turn text) follows it.
   agents        table     agent|role|model|status|started|elapsed, status in
-                running|pending|finished|unknown (projection of heimdall-agents).
+                running|pending|finished|unknown (projection of heimdall-agents, whose list
+                carries each agent's `model` and `started_at`). Never decided by a hook: a
+                SubagentStop is no proof an agent finished.
+
+One writer per panel. These three ids are this module's: `hmd ui panel set` refuses them
+(companion_ui_panels.NATIVE_PANEL_IDS) and a file somebody else wrote over is repaired on the
+next tick (_current / _publish_agents), instead of standing until the content next changed --
+which, for an agents panel whose rows had no clock in them, was never.
 
 Stdlib only.
 """
@@ -161,7 +168,8 @@ def source_paths(root):
     newest interactive session transcript of this repo, text blocks only, and the TAIL of the
     inbox delivery archive (the pending inbox.jsonl is listed by the server itself)."""
     return ([os.path.join(d, "<session>.jsonl") for d in slug_dirs(root)]
-            + [os.path.join(root, INBOX.DELIVERED_REL), os.path.join(root, ".heimdall", ".agents-count-cache")])
+            + [os.path.join(root, INBOX.DELIVERED_REL), os.path.join(root, ".heimdall", ".agents-count-cache"),
+               os.path.join(root, ".heimdall", ".agents-count-cache.fail")])
 
 
 def _default_read_tail(path, nbytes):
@@ -544,8 +552,12 @@ def question_markdown(raw):
 AGENT_COLUMNS = ("agent", "role", "model", "status", "started", "elapsed")   # parse.ts looks columns up by name
 IDLE_ROW = ("—", "idle", "", "", "", "")      # parse.ts drops role == 'idle'; its presence = "published, none running"
 FINISHED_TTL_S = 600            # a finished agent stays listed this long (the hmdapp publisher's FINISHED_TTL)
-FRESH_SPAWN_S = 30              # first seen this soon after its last write => its start time is known
+FRESH_SPAWN_S = 30              # first seen this soon after its last write => its start time is known (a list without `started_at` only)
 AGENTS_PROBE_MIN_S = 10         # `heimdall-agents list` costs ~0.3s: never more often than this
+AGENTS_RECHECK_MIN_S = 3        # ...or this, when somebody else wrote the panel and the list is read again before deciding who is right
+IDLE_REPROBE_S = 60             # a cached count of 0 is believed for at most this long without a real `heimdall-agents list`
+AGENTS_HEARTBEAT_S = 60         # a panel listing a running agent is rewritten at least this often (it greys out as stale after 90s)
+AGENT_CLOCK_SKEW_S = 60         # a recorded spawn time further ahead of now than this is a clock fault, not a start
 COUNT_CACHE_MAX_AGE_S = 60      # the statusline refreshes its count every render; older => no statusline
 AGENT_ROW_CAP = 100
 AGENT_CELL_CAP = 80
@@ -574,11 +586,31 @@ def fmt_elapsed(seconds):
     return "%dh%02dm" % (s // 3600, (s % 3600) // 60)
 
 
+def _epoch_secs(value, now):
+    """`value` (the list's `started_at`) as epoch seconds, None when it cannot be a spawn time: not a finite positive
+    number, or ahead of `now` by more than the clock skew allowed."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value) if 0 < value <= now + AGENT_CLOCK_SKEW_S else None
+
+
+def _agent_identity(data):
+    """What a panel of agents says that the moment of a probe cannot change: which agents, in which role, in which status.
+    started / elapsed / model are cosmetic and differ between two pollers of one repo. None for anything that is not
+    this panel's table."""
+    rows = data.get("rows") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return None
+    return sorted((str(r[0]), str(r[1]), str(r[3])) for r in rows if isinstance(r, list) and len(r) == len(AGENT_COLUMNS))
+
+
 def agent_rows(agents, now, seen):
     """Table rows for `heimdall-agents list --json` output. `seen` ({id: {first,
-    finished_at}}) is the publisher's memory: the list carries no start time (its
-    `age_secs` is time since the agent's transcript last changed), so a start time is
-    claimed ONLY for an agent first seen while still fresh -- never guessed."""
+    finished_at}}) is the publisher's memory. An agent's start is the list's own `started_at`
+    (the spawn timestamp the harness wrote as its transcript's first record) whenever it has
+    one, however late the agent was first seen. Only a list without it falls back to a guess:
+    `age_secs` is time since the transcript last changed, not since it started, so a start
+    is then claimed ONLY for an agent first seen while still fresh -- never guessed."""
     keep = []
     for a in agents:
         if not isinstance(a, dict):
@@ -593,6 +625,9 @@ def agent_rows(agents, now, seen):
         if rec is None:
             rec = seen[aid] = {"first": (now - age) if (status != "finished" and age <= FRESH_SPAWN_S) else None,
                                "finished_at": None}
+        started = _epoch_secs(a.get("started_at"), now)
+        if started is not None:
+            rec["first"] = started
         if status == "finished" and rec["finished_at"] is None:
             rec["finished_at"] = now - age
         first = rec["first"]
@@ -600,7 +635,8 @@ def agent_rows(agents, now, seen):
         name = a.get("name")
         label = a.get("description") or (name if name and name != "-" else None) or aid
         keep.append((_STATUS_RANK[status], aid, [
-            agent_cell(label), agent_cell(a.get("agent_type"), 64), "", status,
+            agent_cell(label), agent_cell(a.get("agent_type"), 64),
+            agent_cell(a["model"], 64) if isinstance(a.get("model"), str) else "", status,
             time.strftime("%H:%M:%S", time.localtime(first)) if first else "",
             fmt_elapsed(end - first) if first and end else ""]))
     if len(seen) > 500:
@@ -926,6 +962,9 @@ class CompanionPublisher(object):
         self._agent_rows = None     # rows from the last successful probe
         self._last_probe = 0.0
         self._last_nonidle = 0.0
+        self._looked = None         # when the list was last read (or this publisher began): a cached count of 0 is believed from there
+        self._stamps = {}           # panel id -> (mtime_ns, size) of the file this publisher last wrote; None when it did not read back as ours
+        self._beat = 0.0            # when the agents panel was last written
 
     # transcript selection
     def _candidates(self):
@@ -992,70 +1031,124 @@ class CompanionPublisher(object):
         return tail
 
     # writing
-    def _write(self, pid, title, ptype, data, updated_at):
+    def _write(self, pid, title, ptype, data, updated_at, content):
+        """Publish one panel, remembering what was written (`content`) and which file that made (its stamp): what
+        `_current` tells this publisher's own file from one that was written over it."""
         try:
             P.write_panel(self.root, pid, {"id": pid, "title": title, "type": ptype, "data": data,
                                            "refresh_s": REFRESH_S, "updated_at": updated_at})
         except (P.PanelError, OSError) as e:
             sys.stderr.write("hmd-ui: companion panel %s not published: %s\n" % (pid, e))
             return False
+        self._written[pid] = content
+        # The stamp is kept only while the file still reads as ours: a foreign write landing between the replace and this
+        # stat leaves none, which the next tick reads as "not our file" and repairs.
+        self._stamps[pid] = self._stamp(pid) if self._reads(pid, title, ptype, data) else None
         return True
+
+    def _stamp(self, pid):
+        return _store_stamp(P.panel_path(self.root, pid))
+
+    def _reads(self, pid, title, ptype, data, key=None):
+        """True when the panel file on disk says `title`/`ptype`/`data` -- with `key`, says the same as `data` as far as
+        `key` can tell. A bounded read: whoever wrote the file, it is never trusted to be small."""
+        try:
+            with open(P.panel_path(self.root, pid), "rb") as f:
+                obj = json.loads(f.read(P.MAX_FILE_BYTES + 1).decode("utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(obj, dict) or obj.get("title") != title or obj.get("type") != ptype:
+            return False
+        if key is None:
+            return obj.get("data") == data
+        mine = key(data)
+        return mine is not None and key(obj.get("data")) == mine
+
+    def _moved(self, pid):
+        """True when the panel file is not the one this publisher last wrote: somebody else has written it."""
+        stamp = self._stamp(pid)
+        return stamp is not None and pid in self._stamps and stamp != self._stamps[pid]
+
+    def _current(self, pid, content, title, ptype, data, key=None):
+        """True when panel `pid` already says what is to be published, so nothing is written. The file this publisher
+        last wrote is current while its content is. A file that moved since -- written over by a script, by `hmd ui panel
+        set` before the CLI refused these ids, or by a sibling poller (`hmd ui` and the relay client each run one) -- is
+        current only when it still reads the same (as far as `key` can tell, for a panel two pollers word a little
+        differently); anything else is repaired now, not left standing until the content next changes. A panel this
+        publisher has not written yet is always written."""
+        stamp = self._stamp(pid)
+        if stamp is None or pid not in self._stamps:
+            return False
+        if stamp != self._stamps[pid]:
+            if not self._reads(pid, title, ptype, data, key):
+                return False
+            self._stamps[pid] = stamp
+        return self._written.get(pid) == content
 
     def _exists(self, pid):
         return os.path.exists(P.panel_path(self.root, pid))
 
     def _publish_chat(self, derived, now):
         lines = derived["lines"]
-        exists = self._exists(CHAT_ID)
-        if not lines and not exists:
+        if not lines and not self._exists(CHAT_ID):
             return False
-        if exists and self._written.get(CHAT_ID) == lines:
+        data = {"lines": lines}
+        if self._current(CHAT_ID, lines, CHAT_TITLE, "log-tail", data):
             return False
-        if not self._write(CHAT_ID, CHAT_TITLE, "log-tail", {"lines": lines}, min(now, derived["mtime"])):
-            return False
-        self._written[CHAT_ID] = list(lines)
-        return True
+        return self._write(CHAT_ID, CHAT_TITLE, "log-tail", data, min(now, derived["mtime"]), list(lines))
 
     def _publish_question(self, derived, now):
         text = derived["question"]
-        exists = self._exists(QUESTION_ID)
         if text is None:
             self._written.pop(QUESTION_ID, None)
-            if not exists:
+            self._stamps.pop(QUESTION_ID, None)
+            if not self._exists(QUESTION_ID):
                 return False
             try:
                 return P.remove_panel(self.root, QUESTION_ID)
             except OSError as e:
                 sys.stderr.write("hmd-ui: companion panel %s not removed: %s\n" % (QUESTION_ID, e.__class__.__name__))
                 return False
-        if exists and self._written.get(QUESTION_ID) == text:
+        data = {"text": text}
+        if self._current(QUESTION_ID, text, QUESTION_TITLE, "markdown", data):
             return False
-        if not self._write(QUESTION_ID, QUESTION_TITLE, "markdown", {"text": text}, min(now, derived["mtime"])):
-            return False
-        self._written[QUESTION_ID] = text
-        return True
+        return self._write(QUESTION_ID, QUESTION_TITLE, "markdown", data, min(now, derived["mtime"]), text)
 
     def _agents_count(self, now):
         """The statusline's cached live-subagent count (.heimdall/.agents-count-cache, a
         plain one-line file it refreshes on every render), or None when absent, stale
-        or garbled -- then the answer has to come from a probe."""
+        or garbled -- then the answer has to come from a probe. Also None when the refresh AFTER that figure failed or
+        timed out (the statusline's `.agents-count-cache.fail` marker is newer): the figure is then the last good count,
+        not the current one, and a wrong 0 would hide running agents."""
         p = os.path.join(self.root, ".heimdall", ".agents-count-cache")
         try:
-            if now - os.stat(p).st_mtime > COUNT_CACHE_MAX_AGE_S:
+            st = os.stat(p)
+            if now - st.st_mtime > COUNT_CACHE_MAX_AGE_S:
                 return None
+            try:
+                if os.stat(p + ".fail").st_mtime >= st.st_mtime:
+                    return None
+            except OSError:
+                pass            # no failure marker: the last refresh was clean
             with open(p, "r", encoding="utf-8", errors="replace") as f:
                 v = f.readline().strip()
         except OSError:
             return None
         return int(v) if v.isdigit() else None
 
-    def _agents_rows(self, now):
+    def _agents_rows(self, now, force=False):
+        """The rows to publish. A fresh cached count of 0 spares the probe, but is believed for at most IDLE_REPROBE_S at
+        a time. `force` (somebody else wrote the panel) reads the list again at once, whatever the count says, to decide
+        who is right."""
         if self._list_agents is None:
             return None
         count = self._agents_count(now)
         recent = self._last_nonidle > 0 and now - self._last_nonidle < FINISHED_TTL_S
-        if (count is None or count > 0 or recent) and now - self._last_probe >= AGENTS_PROBE_MIN_S:
-            self._last_probe = now
+        if self._looked is None:
+            self._looked = now
+        believed = count == 0 and not recent and not force and now - self._looked < IDLE_REPROBE_S
+        if not believed and now - self._last_probe >= (AGENTS_RECHECK_MIN_S if force else AGENTS_PROBE_MIN_S):
+            self._last_probe = self._looked = now
             agents = self._list_agents()
             if isinstance(agents, list):
                 rows = agent_rows(agents, now, self._agent_seen)
@@ -1063,19 +1156,28 @@ class CompanionPublisher(object):
                     self._last_nonidle = now
                 self._agent_rows = rows or [list(IDLE_ROW)]
             # a failed probe keeps whatever was last published: no flap to "idle"
-        elif self._agent_rows is None or (count == 0 and not recent):
+        elif self._agent_rows is None or believed:
             self._agent_rows = [list(IDLE_ROW)]
         return self._agent_rows
 
     def _publish_agents(self, now):
-        rows = self._agents_rows(now)
+        """One owner for the panel: this publisher's rows win over any other writer's, on the very next tick. A write by
+        somebody else is not taken on trust either way -- the list is read again first (`force`), so a sibling poller
+        that saw a transition a moment ago is believed and a script that marks running agents finished is repaired.
+        While an agent runs the panel is rewritten at least every AGENTS_HEARTBEAT_S so it never greys out as stale."""
+        moved = self._moved(AGENTS_ID)
+        rows = self._agents_rows(now, force=moved)
         if rows is None:
             return False
-        if self._exists(AGENTS_ID) and self._written.get(AGENTS_ID) == rows:
+        data = {"columns": list(AGENT_COLUMNS), "rows": rows}
+        if self._current(AGENTS_ID, rows, AGENTS_TITLE, "table", data, key=_agent_identity):
+            if moved:
+                self._beat = now        # the write that moved the file (a sibling poller's, reading the same) refreshed it as ours would
+            if now - self._beat < AGENTS_HEARTBEAT_S or not any(r[3] == "running" for r in rows):
+                return False
+        if not self._write(AGENTS_ID, AGENTS_TITLE, "table", data, now, [list(r) for r in rows]):
             return False
-        if not self._write(AGENTS_ID, AGENTS_TITLE, "table", {"columns": list(AGENT_COLUMNS), "rows": rows}, now):
-            return False
-        self._written[AGENTS_ID] = [list(r) for r in rows]
+        self._beat = now
         return True
 
     def tick(self, now=None):

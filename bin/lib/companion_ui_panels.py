@@ -59,6 +59,10 @@ ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 NUMBER_FORMATS = ("count", "duration_s", "bytes", "percent")
 PANELS_REL = os.path.join(".heimdall", "ui", "panels")
 GIT_TIMEOUT_S = 3
+# Panels hmd publishes itself (bin/lib/companion_ui_publish.py, run by `hmd ui`): one writer per file, so `panel set`
+# refuses them -- a second writer either lost its write on the next tick or, until then, hid running agents from the phone.
+NATIVE_PANEL_IDS = ("agents", "chat", "hmd-question")
+NATIVE_PANELS_OFF_ENV = "HMD_UI_COMPANION_PANELS"   # =0 switches those publishers off (sentinels/hmd-ui.py): nothing owns the ids then
 
 # -- bounded log-tail (serve-side only) -----------------------------------------
 # write_panel()'s caps above (MAX_LIST_ITEMS/MAX_STRING_CHARS/MAX_FILE_BYTES) are
@@ -635,6 +639,10 @@ def _read_data_json(spec):
 
 
 def _cmd_set(args):
+    if args.id in NATIVE_PANEL_IDS and os.environ.get(NATIVE_PANELS_OFF_ENV) != "0":
+        raise PanelError("the `%s` panel is published by hmd itself (`hmd ui`, from the session transcript): a second writer is "
+                         "overwritten on the next tick, and until then replaces what the phone shows. Publish under another id, "
+                         "or set %s=0 where `hmd ui` runs to take the panel over" % (args.id, NATIVE_PANELS_OFF_ENV))
     root = resolve_root(args.repo)
     data = _read_data_json(args.data_json)
     body = {"id": args.id, "title": args.title, "type": args.type, "data": data, "updated_at": time.time()}

@@ -147,6 +147,7 @@ SOURCE_FILES = (
     ".heimdall/ui/dashboards/",           # custom-dashboard tiles + meta.json: companion_dashboards.snapshot (laptop view)
     ".heimdall/ui/inbox.jsonl",           # undelivered companion messages: companion_ui_inbox.list_pending
     ".heimdall/.agents-count-cache",      # live-subagent count (one integer), read only after a turn ends
+    ".heimdall/.agents-count-cache.fail", # the statusline's failed-refresh marker (mtime only): a count it outdates is not believed
 )
 # Under $TMPDIR: parallelism-tracker's live per-session counters (key=value text).
 # READ ONLY. `parallelism-tracker grade` is deliberately NOT called: it is the
