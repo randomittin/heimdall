@@ -756,6 +756,89 @@ del att.open
 check("U16c. one 10 MiB final line: reads stay inside the 4 MiB window cap (+ head probe), result is the default shape",
       g == DEFAULT and dt < 1.0 and BYTES[0] <= 5 * 1024 * 1024, [g, dt, BYTES[0]])
 
+# U18 -- ending a question's episode (docs/HANDOFF-TO-HEIMDALL-phone-replies-reach-session.md 4(a)4): close_episode()
+# records that a verified delivery answered the episode; collect() then reports it as working -- a new id, since = the
+# close, nothing to answer -- until the transcript moves on. Only a private marker is believed.
+ASKED = "Should I push heimdall main?"
+g, root, p = case([tx.entry("prompt", age=60), tx.entry("end", age=10, text=ASKED)])
+asked = dict(g)
+check("U18. (setup) the question is open: needs_input/question, options yes/no",
+      g["state"] == "needs_input" and g["kind"] == "question" and [o["key"] for o in g["options"]] == ["yes", "no"], g)
+t_close = time.time()
+check("U18a. close_episode returns True when it is the call that closed the episode", att.close_episode(root, asked["id"], now=t_close) is True)
+g = run(root)
+check("U18b. the closed episode is no longer needs_input: working, kind/summary/options null, a NEW id, since = the close",
+      g["state"] == "working" and g["kind"] is None and g["summary"] is None and g["options"] is None
+      and ID_RE.match(g["id"] or "") and g["id"] != asked["id"] and abs(g["since"] - round(t_close, 3)) < 0.002, g)
+closed_view = dict(g)
+g = run(root)
+check("U18c. ... and it stays so on every later call: the same id and since", g["id"] == closed_view["id"] and g["since"] == closed_view["since"], g)
+check("U18d. closing it again returns False: the first closer's claim is the only one", att.close_episode(root, asked["id"]) is False)
+marker = os.path.join(root, ".heimdall", "ui", "attention-closed.json")
+check("U18e. the marker is private: a regular file, mode 0600, in a 0700 directory",
+      oct(os.stat(marker).st_mode & 0o777) == "0o600" and oct(os.stat(os.path.dirname(marker)).st_mode & 0o777) == "0o700",
+      (oct(os.stat(marker).st_mode), oct(os.stat(os.path.dirname(marker)).st_mode)))
+tx.append(p, tx.entry("prompt", age=2))
+g = run(root)
+check("U18f. once the transcript moves on the derivation is the transcript's own again (a new prompt -> working, a third id)",
+      g["state"] == "working" and g["id"] not in (asked["id"], closed_view["id"]), g)
+tx.append(p, tx.entry("end", age=1, text=ASKED))
+g = run(root)
+check("U18g. the SAME question asked again is a new episode, open again: needs_input with its own id",
+      g["state"] == "needs_input" and g["id"] not in (asked["id"], closed_view["id"]) and g["summary"] == ASKED, g)
+g, root_b, p_b = case([tx.entry("prompt", age=60), tx.entry("end", age=10, text="Which stack?")])
+att.close_episode(root_b, "a-" + "0" * 10)
+check("U18h. closing another episode's id changes nothing here: still needs_input, same id",
+      run(root_b)["state"] == "needs_input" and run(root_b)["id"] == g["id"])
+bad_ids = []
+for junk in ("nope", "", None, 7, "a-" + "0" * 9, "a-" + "G" * 10, "a-" + "0" * 10 + "\n"):
+    try:
+        att.close_episode(root_b, junk)
+    except ValueError:
+        continue
+    bad_ids.append(junk)
+check("U18i. an id that is not an attention id (a-<10 hex>) is refused with ValueError, never recorded", not bad_ids, bad_ids)
+for n in range(att.CLOSED_KEEP + 5):
+    att.close_episode(root_b, "a-%010x" % (n + 1))
+kept = [e["id"] for e in json.load(open(os.path.join(root_b, ".heimdall", "ui", "attention-closed.json")))["closed"]]
+check("U18j. the marker keeps the newest %d closed episodes and drops the oldest" % att.CLOSED_KEEP,
+      len(kept) == att.CLOSED_KEEP and kept[-1] == "a-%010x" % (att.CLOSED_KEEP + 5) and "a-%010x" % 1 not in kept, kept)
+
+g, root_c, p_c = case([tx.entry("prompt", age=60), tx.entry("end", age=10, text=ASKED)])
+planted = os.path.join(root_c, ".heimdall", "ui", "attention-closed.json")
+os.makedirs(os.path.dirname(planted), exist_ok=True)
+body = json.dumps({"v": 1, "closed": [{"id": g["id"], "at": time.time()}]})
+with open(planted, "w") as f:
+    f.write(body)
+os.chmod(planted, 0o644)
+now_c = run(root_c)
+check("U18k. a marker that is not private (0644: what a checkout carries) is not believed: still needs_input, same id",
+      now_c["state"] == "needs_input" and now_c["id"] == g["id"], now_c)
+os.chmod(planted, 0o600)
+with open(planted, "w") as f:
+    f.write("{not json")
+now_c = run(root_c)
+check("U18l. a marker that is not JSON is not believed either: still needs_input", now_c["state"] == "needs_input" and now_c["id"] == g["id"], now_c)
+
+g, root_d, p_d = case([tx.entry("prompt", age=60), tx.entry("end", age=10, text=ASKED)])
+victim = os.path.join(TMPROOT, "victim-ui")
+os.makedirs(victim)
+with open(os.path.join(victim, "attention-closed.json"), "w") as f:
+    f.write(json.dumps({"v": 1, "closed": [{"id": g["id"], "at": time.time()}]}))
+os.chmod(os.path.join(victim, "attention-closed.json"), 0o600)
+os.makedirs(os.path.join(root_d, ".heimdall"), exist_ok=True)
+os.symlink(victim, os.path.join(root_d, ".heimdall", "ui"))
+now_d = run(root_d)
+check("U18m. .heimdall/ui a link: the marker behind it is not believed (still needs_input)", now_d["state"] == "needs_input" and now_d["id"] == g["id"], now_d)
+try:
+    att.close_episode(root_d, g["id"])
+    refused = False
+except OSError:
+    refused = True
+check("U18n. ... and close_episode refuses it with OSError, writing nothing behind the link",
+      refused and os.listdir(victim) == ["attention-closed.json"]
+      and json.load(open(os.path.join(victim, "attention-closed.json")))["closed"][0]["id"] == g["id"], os.listdir(victim))
+
 # U17 -- the wire shape, over everything collected above
 problems = []
 for g in SEEN:

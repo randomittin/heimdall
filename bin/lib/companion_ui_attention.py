@@ -73,6 +73,21 @@ any other resumed work moves the state to `working`: cleared. NOT errors: a user
 retry notice (Claude Code is still retrying), a failed tool call (a red test run is routine), a sub-agent's
 (sidechain) error, and the same synthetic entry with the flag false ("No response requested.").
 
+ENDING A QUESTION'S EPISODE (docs/HANDOFF-TO-HEIMDALL-phone-replies-reach-session.md 4(a)4). The derivation above only
+learns a question was answered when the transcript next moves, which for a phone answer is whenever the session next takes a
+turn. close_episode(root, id) is the explicit end: bin/heimdall-inbox-deliver calls it once a SEALED phone answer to the open
+question has been delivered to the session (stop, prompt, tool or tmux; a cli pop delivers to no session and never does), and
+collect() then reports that episode as `working` -- kind, summary and options null, a new id, `since` the moment it closed --
+until the transcript moves on to something of its own, so the phone's "hmd asks" row clears at once and a second answer to the
+same question is delivered as late. It is a record, not a derivation: <repo>/.heimdall/ui/attention-closed.json,
+{"v":1,"closed":[{"id","at"}...]}, the newest CLOSED_KEEP episodes, written atomically under its own flock through
+bin/lib/hmd_private_state.py (0600 in a 0700 directory, never through a link) and read back only as a regular file this user
+owns that nobody else can read (a checked-in 0644 file is not believed). Only the question's own episode id ends: a NEW question,
+even the same words, is a new episode and open. close_episode returns True for the call that closed the episode and False when
+an earlier call had (the first delivery owns the answer), raises ValueError for anything that is not an attention id and OSError
+when the marker cannot be written; collect() never raises over it. Honest limit: a process of the same user can write the
+marker, as it can write every other file hmd keeps there; it can hide a question from the phone, nothing more.
+
 Session choice: bin/lib/hmd_session_resolve.py, the ONE rule every hmd-ui collector shares -- an
 inherited CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / SESSION_ID only when it names a transcript
 under THIS repo's own project dir, else the newest top-level *.jsonl whose entrypoint is not
@@ -84,18 +99,23 @@ Stdlib only. Self-contained: secret_shaped is ported (companion_ui_inbox.py:94-1
 import calendar
 import hashlib
 import json
+import math
 import os
 import re
 import sys
 import threading
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE =os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import hmd_session_resolve as SESSION  # noqa: E402
+try:
+    import hmd_private_state as PRIVATE  # noqa: E402
+except Exception:   # a copy vendored without its helper reads and writes no marker: nothing is ever closed, the derivation is unchanged
+    PRIVATE = None
 
-STATES = ("working", "needs_input", "needs_approval", "idle", "ended")
+STATES =("working", "needs_input", "needs_approval", "idle", "ended")
 KINDS = ("question", "permission", "done", "stopped", "error")
 SUMMARY_MAX = 160
 OPTIONS_MAX = 8
@@ -146,6 +166,13 @@ def secret_shaped(v):
         return False
     return any(rx.search(v) for rx in _SECRET_RES)
 
+
+EPISODE_ID_RE = re.compile(r"a-[0-9a-f]{10}")      # _episode_id's own shape
+CLOSED_DIR = os.path.join(".heimdall", "ui")       # walked below the repo root by hmd_private_state, one component at a time, without following a link
+CLOSED_NAME = "attention-closed.json"              # the episodes a verified delivery answered (see ENDING A QUESTION'S EPISODE)
+CLOSED_LOCK = "attention-closed.lock"
+CLOSED_KEEP = 16                                   # the newest this-many closed episodes are remembered
+CLOSED_READ_MAX = 64 * 1024                        # the marker cannot near this (CLOSED_KEEP short rows); a bigger file is not read
 
 _LOCK = threading.RLock()
 _EVIDENCE = {}    # transcript path -> ((mtime_ns, size), evidence)
@@ -632,6 +659,47 @@ def _approval_attention(approvals, turn):
     return out
 
 
+def _read_closed(root):
+    """The (id, at) rows of root's closed-episode marker, oldest first, [] when it is missing or not to be trusted: read through
+    hmd_private_state (no link on the way, a regular file this user owns, mode 0600 -- a checked-in 0644 file is nothing), a
+    JSON object, rows that are an attention id with a finite time and nothing else. Never raises."""
+    if PRIVATE is None:
+        return []
+    try:
+        rec = PRIVATE.read_json(root, CLOSED_DIR, CLOSED_NAME, CLOSED_READ_MAX, forbidden=0o077)
+    except (OSError, RecursionError):
+        return []
+    rows = rec.get("closed") if rec is not None else None
+    out = []
+    for row in rows if isinstance(rows, list) else ():
+        eid, at = (row.get("id"), row.get("at")) if isinstance(row, dict) else (None, None)
+        if (isinstance(eid, str) and EPISODE_ID_RE.fullmatch(eid) and isinstance(at, (int, float))
+                and not isinstance(at, bool) and math.isfinite(at)):
+            out.append((eid, float(at)))
+    return out[-CLOSED_KEEP:]
+
+
+def close_episode(root, episode_id, now=None):
+    """End the attention episode `episode_id` (a needs_input question) of `root`: a verified delivery answered it. True when
+    THIS call closed it, False when it was already closed -- the first delivery owns the answer, so the caller of the second
+    treats its own as late. ValueError when `episode_id` is not an attention id (a-<10 hex>); OSError, with nothing written
+    behind a link, when the marker cannot be written. Check-and-write is one flock, so two deliveries racing for one question
+    cannot both win."""
+    if not (isinstance(episode_id, str) and EPISODE_ID_RE.fullmatch(episode_id)):
+        raise ValueError("not an attention id (a-<10 hex>)")
+    if PRIVATE is None:
+        raise OSError("hmd_private_state is not available")
+    at = round(time.time() if now is None else float(now), 3)
+    with PRIVATE.lock(root, CLOSED_DIR, CLOSED_LOCK):
+        rows = _read_closed(root)
+        if any(eid == episode_id for eid, _ in rows):
+            return False
+        rows = (rows + [(episode_id, at)])[-CLOSED_KEEP:]
+        PRIVATE.write(root, CLOSED_DIR, CLOSED_NAME, json.dumps(
+            {"v": 1, "closed": [{"id": eid, "at": t} for eid, t in rows]}, separators=(",", ":")).encode("utf-8"))
+    return True
+
+
 def collect(root, turn=None, sweep_receipt=None, checkpoint=None, quality_gate=None, now=None, denied=None,
             approvals=None):
     """The `attention` dict for `root`. `turn` is parallelism.turns; the three slices only decide
@@ -653,6 +721,11 @@ def collect(root, turn=None, sweep_receipt=None, checkpoint=None, quality_gate=N
             if verdict is None:
                 return out
             state, anchor, kind, summary, options = verdict
+            if state == "needs_input":
+                closed_at = dict(_read_closed(root)).get(
+                    _episode_id(os.path.splitext(os.path.basename(path))[0], anchor[0], state))
+                if closed_at is not None:   # a verified delivery answered this question: its episode is over, the session has the answer
+                    state, anchor, kind, summary, options = "working", (anchor[0], closed_at), None, None, None
             if len(_EPISODE) > 16:
                 _EPISODE.clear()
             _EPISODE[path] = {"state": state, "anchor": anchor}
