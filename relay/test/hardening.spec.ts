@@ -68,9 +68,32 @@ async function claimDevice(init: PairInitBody): Promise<{ socket: WebSocket; dev
 
 function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
+    const onMessage = (event: MessageEvent): void => {
+      const frame = JSON.parse(event.data as string) as Record<string, unknown>;
+      // Presence (`peer`) is level-triggered and lands wherever hmd's leg changes, so it is set
+      // aside here the way a keepalive is on hmd's stream; test/presence.spec.ts reads it.
+      if (frame.type === "peer") return;
+      socket.removeEventListener("message", onMessage);
+      resolve(frame);
+    };
+    socket.addEventListener("message", onMessage);
+  });
+}
+
+/** The close an upgrade the relay answered 101 was refused with: a device_token that does not verify
+ *  is no longer a plain 401 but a 4003 / "invalid-token" close (test/refused-upgrade.spec.ts). */
+async function refusedUpgradeClose(res: Response): Promise<{ code: number; reason: string }> {
+  expect(res.status).toBe(101);
+  const socket = res.webSocket;
+  if (!socket) throw new Error("expected a websocket in the 101 response");
+  socket.accept();
+  return new Promise((resolve) => {
     socket.addEventListener(
-      "message",
-      (event) => resolve(JSON.parse((event as unknown as { data: string }).data)),
+      "close",
+      (event) => {
+        const { code, reason } = event as unknown as { code: number; reason: string };
+        resolve({ code, reason });
+      },
       { once: true }
     );
   });
@@ -441,7 +464,7 @@ describe("finding 6 — device_token is bound to the device's X25519 public key"
       init.session_id,
       `device_token=${encodeURIComponent(deviceToken)}&device_pubkey=${OTHER_DEVICE_PUBKEY}`
     );
-    expect(res.status).toBe(401);
+    expect(await refusedUpgradeClose(res)).toEqual({ code: 4003, reason: "invalid-token" });
   });
 
   it("rejects a reconnect omitting device_pubkey on a pubkey-bound token with 401", async () => {
@@ -449,7 +472,7 @@ describe("finding 6 — device_token is bound to the device's X25519 public key"
     const { deviceToken } = await claimDevice(init);
 
     const res = await upgrade(init.session_id, `device_token=${encodeURIComponent(deviceToken)}`);
-    expect(res.status).toBe(401);
+    expect(await refusedUpgradeClose(res)).toEqual({ code: 4003, reason: "invalid-token" });
   });
 
   /**
@@ -504,7 +527,7 @@ describe("finding 13 — device_token claims are validated fail-closed", () => {
     } as never);
 
     const res = await upgrade(init.session_id, `device_token=${encodeURIComponent(noExp)}`);
-    expect(res.status).toBe(401);
+    expect(await refusedUpgradeClose(res)).toEqual({ code: 4003, reason: "invalid-token" });
   });
 
   it("rejects a correctly-signed token whose payload decodes to null with 401, not a crash", async () => {
@@ -516,7 +539,7 @@ describe("finding 13 — device_token claims are validated fail-closed", () => {
     const nullClaims = await mintDeviceToken(typedEnv.RELAY_SIGNING_SECRET, null as never);
 
     const res = await upgrade(init.session_id, `device_token=${encodeURIComponent(nullClaims)}`);
-    expect(res.status).toBe(401);
+    expect(await refusedUpgradeClose(res)).toEqual({ code: 4003, reason: "invalid-token" });
   });
 });
 

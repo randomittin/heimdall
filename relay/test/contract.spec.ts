@@ -227,7 +227,11 @@ function inbox(socket: WebSocket): () => Promise<Record<string, unknown>> {
   const queue: Record<string, unknown>[] = [];
   let wake: (() => void) | null = null;
   socket.addEventListener("message", (event) => {
-    queue.push(JSON.parse((event as unknown as { data: string }).data) as Record<string, unknown>);
+    const frame = JSON.parse((event as unknown as { data: string }).data) as Record<string, unknown>;
+    // Presence (`peer`) is level-triggered and lands wherever hmd's leg changes, so it is set
+    // aside here the way a keepalive is on hmd's stream; test/presence.spec.ts replays its fixture.
+    if (frame.type === "peer") return;
+    queue.push(frame);
     wake?.();
   });
   return async () => {

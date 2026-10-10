@@ -588,7 +588,12 @@ describe("what hmd may send on its socket", () => {
     const { phone } = await bindPhone(init);
     await hmd.next();
     const toPhone: unknown[] = [];
-    phone.addEventListener("message", (event) => toPhone.push((event as unknown as { data: unknown }).data));
+    phone.addEventListener("message", (event) => {
+      const { data } = event as unknown as { data: unknown };
+      // Presence (`peer`) is the relay's own frame, not something hmd's message could have caused.
+      if (typeof data === "string" && (JSON.parse(data) as { type?: string }).type === "peer") return;
+      toPhone.push(data);
+    });
 
     const log = await withRelayLog(async (captured) => {
       // A well-formed hmd frame: in this phase hmd POSTs those over HTTP.
