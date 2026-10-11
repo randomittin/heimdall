@@ -292,6 +292,11 @@ def A(file, prims, fragment, cls, reason, guards=(), names=(), triggers=()):
             "triggers": tuple(triggers)}
 
 
+# The 2026-10-11 batching rule ("collect every pending agent result and merge them ALL, then run ONE sweep") is stated in three
+# instruction files, so one reason covers all of them. It is a local sequencing rule, not a crossing of the human merge boundary.
+BATCH_RULE = ("sequencing rule for the orchestrator: integrate every pending delegated agent result locally in one batch, then run ONE sweep; "
+              "it names no PR merge and no push, and publishing stays a separate step behind the pre-push quality gates and the operator's own push")
+
 ALLOW = [
     # ── instruction text that tells an agent to ship, release or deploy ──────────────────────────────────────
     # HUMAN-REQUESTED is for a row that only fires when the user asks for that action. KNOWN-GAP is for text that
@@ -315,18 +320,23 @@ ALLOW = [
       "risk-preference sentence (escalate rather than auto-merge badly); it instructs no merge"),
     A("agents/heimdall.md", "p-release", "cutting a release", "DOC",
       "pointer saying when to read git-workflow.md (naming a branch, cutting a release, choosing a bump); not an instruction to release"),
+    A("agents/heimdall.md", "p-merge", "merge them ALL", "DOC", BATCH_RULE),
     A("skills/heimdall/references/git-workflow.md", "p-release", "cutting a release", "DOC",
       "pointer saying when to read this file (naming a branch, cutting a release, choosing a bump); not an instruction to release"),
     A("skills/heimdall/references/maintainer-guide.md", "auto-merge", "better than a bad auto-merge", "DOC",
       "risk-preference sentence (escalate rather than auto-merge badly); it instructs no merge"),
     A("skills/heimdall/references/quality-gates.md", "git-push", "intercepts `git push` commands", "DOC",
       "describes what the PreToolUse hook does to a push (runs check-quality-gates); instructs no push"),
+    A("skills/heimdall/SKILL.md", "p-merge", "merge them ALL", "DOC", BATCH_RULE),
     A("CLAUDE.md", "git-push", "(enforced before git push)", "DOC",
       "section heading naming the pre-push quality gates; instructs no push"),
     A("CLAUDE.md", "git-push", "The `git push` hook stack", "DOC",
       "describes the pre-push hook stack that blocks a bad push; instructs no push"),
     A("CLAUDE.md", "git-push", "PreToolUse `git push` chain", "DOC",
       "describes the PreToolUse push-gate chain and its dedup with the native hook; instructs no push"),
+    A("CLAUDE.md", "p-merge", "merge them ALL", "DOC", BATCH_RULE),
+    A("CLAUDE.md", "p-merge", "merging agent fixes one at a time", "DOC",
+      "measured-cost sentence recording why merging agent fixes one at a time staled the last green sweep receipt; it instructs no merge"),
     A("packages/runheimdall/CLAUDE.md", "git-push", "(enforced before git push)", "DOC",
       "section heading naming the pre-push quality gates; instructs no push"),
     A("bin/heimdall-precheck-bash", "git-push", "CLAUDE.md enforces quality gates before git push", "DOC",

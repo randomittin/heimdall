@@ -54,6 +54,10 @@ cleanup() {
 }
 trap cleanup EXIT
 unset HEIMDALL_HOME 2>/dev/null || true
+# `mark-clean` only sets lint_clean against a passing lint_last_run receipt (bin/heimdall-stop-lint writes it), and the gate
+# blocks without it. These fixtures prove sweep receipts, not lint evidence, so they waive lint explicitly and visibly (the
+# waiver is logged in the fixture's state), as test/conflict-log.test.sh and test/checkpoint-depth.test.sh do.
+LINT_WAIVER="fixture: run-all-incremental proves sweep receipts, not lint evidence"
 
 # ── fixture: a repo with the real tools plus 12 fake suites; alpha/beta/gamma each name one thing a diff can touch ───────
 SUITES="alpha beta gamma f01 f02 f03 f04 f05 f06 f07 f08 f09"
@@ -99,7 +103,7 @@ gate() { # dir -> GOUT, GRC
 newfix() { # name [commit-date] -> FIX; builds the fixture and records a green FULL baseline sweep
   FIX="$WORK/$1"; mkfix "$FIX" "${2:-}"
   ( cd "$FIX" && HEIMDALL_STATE_FILE="$FIX.state.json" "$STATE_BIN" init >/dev/null 2>&1 \
-    && HEIMDALL_STATE_FILE="$FIX.state.json" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
+    && HMD_LINT_WAIVER="$LINT_WAIVER" HEIMDALL_STATE_FILE="$FIX.state.json" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
   runit "$FIX"
 }
 touchfile() { printf '%s\n' "# changed $(date +%s)-$RANDOM" >> "$1/$2"; }   # a trailing comment: valid in every fixture script, a real diff for git
@@ -148,7 +152,7 @@ eq "A3b exit 0" "$RC" "0"
 
 echo "-- A4. a module a script depends on selects the suites that run that script --------------------"
 F="$WORK/a4"; mkfix "$F"; printf '%s\n' 'source "$(dirname "$0")/lib/shared.sh"' > "$F/bin/tool-b"; echo 'echo shared v1' > "$F/bin/lib/shared.sh"; cm "$F" "tool-b sources shared.sh"
-( cd "$F" && HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" init >/dev/null 2>&1 && HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
+( cd "$F" && HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" init >/dev/null 2>&1 && HMD_LINT_WAIVER="$LINT_WAIVER" HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
 runit "$F"; touchfile "$F" bin/lib/shared.sh; cm "$F" "edit shared lib"
 runit "$F" --since-green
 eq "A4a beta (runs tool-b, which sources the changed lib) ran; no suite mentions shared.sh itself" "$(ran "$F")" "beta"
@@ -377,7 +381,7 @@ echo "-- F. red under load, green alone: FLAKY-UNDER-LOAD in the receipt; a real
 F="$WORK/f1"; mkfix "$F"
 printf '%s\n' '#!/usr/bin/env bash' 'if [ ! -f "$FLAKY_MARK" ]; then : > "$FLAKY_MARK"; echo "  FAIL contention-only failure"; echo "0 passed, 1 failed"; exit 1; fi' 'echo "1 passed, 0 failed"' > "$F/test/flaky.test.sh"
 cm "$F" "add a flaky suite"
-( cd "$F" && HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" init >/dev/null 2>&1 && HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
+( cd "$F" && HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" init >/dev/null 2>&1 && HMD_LINT_WAIVER="$LINT_WAIVER" HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
 rm -f "$WORK/flaky.mark"; FLAKY_MARK="$WORK/flaky.mark" runit "$F"
 eq "F1a the run is green: a suite green on its solo re-run counts as green" "$RC" "0"
 has "F1b the run says FLAKY-UNDER-LOAD" "$OUT" "FLAKY-UNDER-LOAD"
