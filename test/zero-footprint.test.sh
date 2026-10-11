@@ -24,7 +24,12 @@
 #                 byte-identical - snapshot AND `find $HOME -newer marker` - and the temp dir is removed on every
 #                 exit path. Writes aimed at protected paths are refused with exit 2. Mutants of the wrapper
 #                 (each protection removed in turn) must make the same assertions go RED.
-#   E. npx        the packed tarball, run through npx with an isolated npm cache, leaves HOME untouched too.
+#                 Nothing here waits on a published release tag: the installer the wrapper may run is always a local
+#                 file (a stand-in, or the tree's own install.sh - digest-checked, a tampered copy refused), and the
+#                 cases that run the real hmd are pinned to the release the checkout's hmd reports (a release's own
+#                 pre-push sweep runs before its tag exists - see "no dependency on a published release tag" below).
+#   E. npx        the packed tarball, run through npx with an isolated npm cache, leaves HOME untouched too
+#                 (same pin, same tripwire as the real-hmd cases of D).
 #
 # Everything runs against a throwaway HOME / TMPDIR / project repo under one mktemp dir. The suite never
 # touches the developer's real HOME: it only reads from it (git config is pointed away).
@@ -599,24 +604,82 @@ if make_mutant cleanup 's/fs.rmSync(root, { recursive: true, force: true });/voi
 fi
 reset_tmp
 
-# The real hmd and the real engine through the wrapper.
+# The tree's own install.sh, served from disk - never from the tag URL, which does not exist until the release is
+# tagged. A release bakes in the digest of exactly these bytes (release/sync-release.sh), so a pin set to the genuine
+# file must accept it and refuse any other bytes. HEIMDALL_INSTALL_SOURCE_ONLY makes the genuine installer inert (its
+# main() returns at once), so the accepting case installs nothing and cannot leave a footprint.
+TREE_INSTALLER="$REPO/install.sh"
+TREE_SHA="$(rf_sha256 "$TREE_INSTALLER")"
+TAMPERED_INSTALLER="$STUBS/install-tampered.sh"
+cat > "$TAMPERED_INSTALLER" <<'PAYLOAD'
+printf 'ran\n' > "${STUB_INSTALL_MARK:-/dev/null}"; exit 0
+PAYLOAD
+cat "$TREE_INSTALLER" >> "$TAMPERED_INSTALLER"
+tampered_refused() {  # <label> - checksum mismatch, and neither the payload nor hmd ran
+  if [ "$RC" -ne 0 ] && ! ran_install && ! ran_hmd && grep -q 'checksum mismatch' "$ERR"; then ok "$1"
+  else bad "$1 (exit $RC; payload ran: $(ran_install && echo yes || echo no))"; dump; fi
+}
+new_home; reset_tmp
+zf_case RUNHMD_INSTALL_SCRIPT="$TAMPERED_INSTALLER" RUNHMD_SHA256="$TREE_SHA" -- attack .
+tampered_refused "the tree's install.sh with a payload prepended, pinned to the genuine digest: refused, the payload never ran"
+assert_clean "…and nothing was left behind"
+zf_case RUNHMD_INSTALL_SCRIPT="$TREE_INSTALLER" RUNHMD_SHA256="$TREE_SHA" HEIMDALL_INSTALL_SOURCE_ONLY=1 -- attack .
+if grep -q 'verified install.sh' "$ERR" && grep -q 'no hmd was found' "$ERR" && ! ran_hmd; then
+  ok "control: the genuine install.sh under the same pin is verified and run (inert: it installs nothing, so no hmd is found)"
+else
+  bad "control: the genuine install.sh was not verified and run under its own digest (exit $RC)"; dump
+fi
+assert_clean "…and, installing nothing, it left nothing behind"
+if make_mutant digest 's/if (actual !== EXPECTED_SHA) {/if (false) {/'; then
+  new_home; reset_tmp; WRAP_UT="$MUTANT_JS"
+  zf_case RUNHMD_INSTALL_SCRIPT="$TAMPERED_INSTALLER" RUNHMD_SHA256="$TREE_SHA" -- attack .
+  WRAP_UT="$WRAP"
+  if ran_install; then ok "mutant: digest check removed -> the tampered installer runs (the refusal check above can go red)"
+  else bad "mutant: the tampered installer was still refused with the digest check removed (exit $RC)"; dump; fi
+fi
+reset_tmp
+
+# The real hmd and the real engine through the wrapper - no dependency on a published release tag.
+# `hmd --version` resolves from the nearest git TAG, while the wrapper pins the release this tree is being cut as. In a
+# release's own pre-push sweep that tag does not exist yet: the real hmd reports the PREVIOUS release, package.json
+# already pins the next one, and the wrapper (rightly) goes to install the pinned release from a tag nobody has
+# published - HTTP 404 on raw.githubusercontent.com - so the release could never get past its own gate. What these
+# cases prove (the real engine, run through the wrapper, leaves nothing behind and makes no network call) has nothing
+# to do with WHICH release is pinned - the stand-in cases above own the pin comparison - so the wrapper is pinned to
+# the release this checkout's hmd reports (RUNHMD_TAG) and handed a tripwire as its installer (RUNHMD_INSTALL_SCRIPT:
+# the stand-in, in its failing mode). Were the wrapper to want an install anyway, it would trip the wire instead of
+# reaching the network, and every group below asserts the wire was never touched.
 JAIL_OK=0; jail_usable && JAIL_OK=1
 CUR_PATH="$REAL_PATH"
-new_home; reset_tmp
-run_in "$H" "$PROJ" -- "$NODE_BIN" "$WRAP" "$REPO_FIX/clean-sample" --json --yes
+mkdir -p "$WORK/probe-home" "$WORK/probe-tmp"
+REAL_HMD_VER="$(env -i HOME="$WORK/probe-home" PATH="$REAL_PATH" TMPDIR="$WORK/probe-tmp" hmd --version 2>/dev/null \
+  | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+[ -n "$REAL_HMD_VER" ] || bad "the checkout's hmd reports no readable version, so the real-hmd cases cannot be pinned to it"
+REAL_MARK="$LOGS/real-install-mark"
+REAL_ENV=(RUNHMD_TAG="v$REAL_HMD_VER" RUNHMD_INSTALL_SCRIPT="$STUB_INSTALLER" RUNHMD_SHA256="$INSTALLER_SHA"
+  STUB_INSTALL_MODE=fail STUB_INSTALL_MARK="$REAL_MARK")
+real_run() {  # <runhmd args...> - the checkout's real hmd through the wrapper, pinned and tripwired as above
+  run_in "$H" "$PROJ" "${REAL_ENV[@]}" -- "$NODE_BIN" "$WRAP" "$@"
+}
+assert_no_install() {  # <label> - the hmd the wrapper found satisfied its pin: no installer ran, so no fetch either
+  if [ ! -e "$REAL_MARK" ]; then ok "$1"; else bad "$1 (the wrapper wanted an install: it tripped the wire)"; fi
+}
+new_home; reset_tmp; rm -f "$REAL_MARK"
+real_run "$REPO_FIX/clean-sample" --json --yes
 if [ "$RC" -eq 0 ] && jq -e '.verdict == "PROVEN"' "$OUT" >/dev/null 2>&1; then ok "runhmd <path> through the real hmd: PROVEN (exit 0)"; else bad "runhmd <path> (exit $RC)"; dump; fi
-run_in "$H" "$PROJ" -- "$NODE_BIN" "$WRAP" attack "$REPO_FIX/buggy-webhook" --json --yes
+real_run attack "$REPO_FIX/buggy-webhook" --json --yes
 if [ "$RC" -eq 1 ] && jq -e '.verdict == "DENIED"' "$OUT" >/dev/null 2>&1; then ok "runhmd attack <buggy fixture>: DENIED (exit 1)"; else bad "runhmd attack buggy (exit $RC)"; dump; fi
-run_in "$H" "$PROJ" -- "$NODE_BIN" "$WRAP" demo --offline --json
+real_run demo --offline --json
 if [ "$RC" -eq 0 ] && jq -e '.sequence == ["DENIED","PROVEN"]' "$OUT" >/dev/null 2>&1; then ok "runhmd demo --offline --json: DENIED -> PROVEN (exit 0)"; else bad "runhmd demo --offline (exit $RC)"; dump; fi
 assert_clean "…all three left the real home (no ~/.heimdall/.run-count), the repo and the temp dir untouched"
+assert_no_install "…and none needed an installer: the checkout's hmd satisfied the pin, so no fetch was attempted"
 new_home; reset_tmp
 run_in "$H" "$PROJ" PYTHONDONTWRITEBYTECODE=1 -- hmd attack "$REPO_FIX/clean-sample" --json --yes
 assert_dirty "control: the real hmd run directly, without the wrapper, does leave a footprint (~/.heimdall/.run-count) - the check above can go red"
 reset_tmp
 if [ "$JAIL_OK" -eq 1 ]; then
-  new_home; reset_tmp; PREFIX=(sandbox-exec -p "$NETJAIL_PROFILE")
-  run_in "$H" "$PROJ" -- "$NODE_BIN" "$WRAP" demo --offline --json
+  new_home; reset_tmp; rm -f "$REAL_MARK"; PREFIX=(sandbox-exec -p "$NETJAIL_PROFILE")
+  real_run demo --offline --json
   PREFIX=()
   if [ "$RC" -eq 0 ] && jq -e '.sequence == ["DENIED","PROVEN"]' "$OUT" >/dev/null 2>&1 && ! grep -q 'Killed' "$ERR"; then
     ok "runhmd demo --offline (wrapper + real hmd + real engine) completes with the network killed"
@@ -624,6 +687,7 @@ if [ "$JAIL_OK" -eq 1 ]; then
     bad "runhmd demo --offline under the network sandbox (exit $RC)"; dump
   fi
   assert_clean "…and left nothing behind"
+  assert_no_install "…and the wrapper never reached for an installer, nor the network behind it"
 else
   skip "no network sandbox: the wrapper path's zero-network proof is NOT run here"
 fi
@@ -642,10 +706,10 @@ else
     bad "npm pack produced no tarball"
   else
     npx_run() {  # <runhmd args...>
-      run_in "$H" "$PROJ" npm_config_cache="$WORK/npm-cache" TMPDIR="$WORK/npx-tmp" npm_config_update_notifier=false \
+      run_in "$H" "$PROJ" "${REAL_ENV[@]}" npm_config_cache="$WORK/npm-cache" TMPDIR="$WORK/npx-tmp" npm_config_update_notifier=false \
         npm_config_audit=false npm_config_fund=false -- npx --yes --offline --package="$TGZ" runhmd "$@"
     }
-    new_home; reset_tmp
+    new_home; reset_tmp; rm -f "$REAL_MARK"
     npx_run --version
     if [ "$RC" -eq 0 ] && grep -q '^runhmd ' "$OUT"; then ok "npx runhmd --version answers from the packed tarball (exit 0)"; else bad "npx runhmd --version (exit $RC)"; dump; fi
     npx_run demo --offline --json
@@ -655,6 +719,7 @@ else
       PREFIX=(sandbox-exec -p "$NETJAIL_PROFILE"); npx_run demo --offline --json; PREFIX=()
       if [ "$RC" -eq 0 ] && jq -e '.sequence == ["DENIED","PROVEN"]' "$OUT" >/dev/null 2>&1; then ok "npx runhmd demo --offline completes with the network killed"; else bad "npx runhmd demo --offline under the network sandbox (exit $RC)"; dump; fi
     fi
+    assert_no_install "…neither npx run needed an installer: pinned to the hmd this checkout reports, so no fetch was attempted"
   fi
 fi
 reset_tmp
