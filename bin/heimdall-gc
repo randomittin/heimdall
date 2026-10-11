@@ -69,7 +69,7 @@
 # fatal. --dry-run reports every decision but mutates nothing.
 #
 # Usage:
-#   heimdall-gc [run|worktrees|procs|temp|ccversions] [--quick] [--dry-run] [--quiet]
+#   heimdall-gc [run|worktrees|procs|uis|temp|ccversions] [--quick] [--dry-run] [--quiet]
 #               [--repo <path>] [--home <dir>]
 #
 # Test/override seams (env):
@@ -102,7 +102,7 @@ SUB=""; QUICK=0; DRYRUN=0; QUIET=0; REPO=""; HOME_OVERRIDE=""
 usage() { sed -n '2,88p' "$0" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    run|worktrees|procs|processes|temp|temp-files|ccversions|cc-versions) SUB="$1" ;;
+    run|worktrees|procs|processes|uis|temp|temp-files|ccversions|cc-versions) SUB="$1" ;;
     --quick)          QUICK=1 ;;
     --dry-run|-n)     DRYRUN=1 ;;
     --quiet|-q)       QUIET=1 ;;
@@ -144,6 +144,8 @@ STOP_HOOK_TTL_HOURS="${HMD_GC_STOP_HOOK_TTL_HOURS:-24}"
 LOG_MAX_BYTES="${HMD_GC_LOG_MAX_BYTES:-1048576}"
 LOG_TAIL_LINES="${HMD_GC_LOG_TAIL_LINES:-200}"
 LOG_TTL_HOURS="${HMD_GC_LOG_TTL_HOURS:-168}"
+UI_MIN_AGE_S="${HMD_GC_UI_MIN_AGE_S:-3600}"
+UI_HELPER="$SELF_DIR/lib/hmd_ui_procs.py"
 
 # ── counters ─────────────────────────────────────────────────────────────────────
 WT_REAPED=0
@@ -156,6 +158,7 @@ CCV_REAPED=0
 CCV_BYTES=0
 CCV_KEPT=0
 STOP_HOOK_REAPED=0
+UI_REAPED=0
 
 # ── helpers ──────────────────────────────────────────────────────────────────────
 _report() { [ "$QUIET" = 1 ] && return 0; printf '[gc:%s] %s\n' "$1" "$2" >&2; }
@@ -509,6 +512,30 @@ gc_ccversions() {
 }
 
 # ── receipt ──────────────────────────────────────────────────────────────────────
+# ── 5. UI SERVERS — orphaned `hmd ui` / relay-client processes ───────────────────────────────
+# A test suite whose cleanup never saw the pid, or a connect that moved to another port, leaves a
+# `sentinels/hmd-ui.py` running with ppid 1 -- and each one re-runs hooks/identity/agents every poll
+# interval (handoff 2026-10-11: 14 of them, up to two days old). bin/lib/hmd_ui_procs.py owns the
+# positive identification: this user's python running <...>/sentinels/hmd-ui.py or
+# bin/heimdall-relay-client, ppid 1, --repo gone or under a temp dir, no live relay client pointing
+# at the ui via --ui-port, older than HMD_GC_UI_MIN_AGE_S (default 1h: no suite runs that long). A
+# real repo is never touched. Reports go through _report; the receipt line is unchanged.
+gc_uis() {
+  [ "${HMD_GC_BREAK:-}" = uis ] && { _report "ui" "forced break (test seam)"; return 1; }
+  [ -r "$UI_HELPER" ] || return 0
+  local py line
+  local -a args=(reap --min-age "$UI_MIN_AGE_S")
+  py="$(command -v python3 2>/dev/null)" || return 0
+  [ "$DRYRUN" = 1 ] && args+=(--dry-run)
+  while IFS= read -r line; do
+    case "$line" in
+      reaped\ *)  UI_REAPED=$((UI_REAPED + 1)); _report "ui" "$line" ;;
+      would-reap\ *|SURVIVED\ *) _report "ui" "$line" ;;
+    esac
+  done < <("$py" -I "$UI_HELPER" "${args[@]}" 2>/dev/null)
+  return 0
+}
+
 print_receipt() {
   [ "$QUIET" = 1 ] && return 0
   local kb=$(((TEMP_BYTES + 512) / 1024))
@@ -523,12 +550,14 @@ print_receipt() {
 case "$SUB" in
   worktrees)  gc_worktrees || true;   print_receipt ;;
   procs)      gc_procs || true;       gc_keeper_orphans || true;  print_receipt ;;
+  uis)        gc_uis || true;         print_receipt ;;
   temp)       gc_temp || true;        print_receipt ;;
   ccversions) gc_ccversions || true;  print_receipt ;;
   run)
     gc_worktrees || true
     gc_procs || true
     gc_keeper_orphans || true
+    gc_uis || true
     gc_temp || true
     gc_ccversions || true
     print_receipt ;;
