@@ -117,6 +117,13 @@ verdict to a state of the code that never existed.
 - **Freeze the tree first.** `run-all.sh` reads the working tree as it finds it. No
   edits, and no agents editing, while it runs. A verdict over a moving tree is not a
   verdict.
+- **Quiet gate (`--wait-quiet`, opt-in).** Use it on a shared, busy machine to start
+  the sweep on a settled box. It is relative and bounded: it waits until the 15-min load
+  average is below `HMD_QUIET_FACTOR` (default 1.5) × CPU count on 3 consecutive 30 s
+  checks, and gives up after `HMD_QUIET_MAX_WAIT_S` (default 1200 s). Do not use an
+  absolute load threshold to block a sweep; it can stay high for hours and defer the run
+  forever. On a shared busy machine, lower `--jobs` instead of waiting. When the bound
+  passes, the sweep runs anyway with half the jobs and `HMD_TEST_REDUCED_PARALLELISM=1`.
 - **Start it only when no follow-up fix is still possible.** A sweep begun while a
   reviewer, verifier or agent can still hand back a change is spent the moment that
   change lands, and a cancelled sweep costs the same half hour as a finished one.
