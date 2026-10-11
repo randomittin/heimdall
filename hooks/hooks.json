@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; printf '%s' \"$INPUT\" | \"$PLUGIN/bin/heimdall-precheck-bash\""
+            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-}\"; [ -x \"$PLUGIN/bin/heimdall-precheck-bash\" ] || PLUGIN=\"$(git rev-parse --show-toplevel 2>/dev/null)\"; if [ ! -x \"$PLUGIN/bin/heimdall-precheck-bash\" ]; then echo \"heimdall: precheck-bash not found (CLAUDE_PLUGIN_ROOT unset or stale, and the cwd repo is not a heimdall checkout) - Bash call allowed UNCHECKED, the commit/push gates did not run\" >&2; exit 0; fi; printf '%s' \"$INPUT\" | \"$PLUGIN/bin/heimdall-precheck-bash\""
           }
         ]
       },
@@ -76,7 +76,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; \"$PLUGIN/bin/parallelism-tracker\" check Agent || true; printf '%s' \"$INPUT\" | \"$PLUGIN/bin/heimdall-precheck-agent\""
+            "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-}\"; [ -x \"$PLUGIN/bin/heimdall-precheck-agent\" ] || PLUGIN=\"$(git rev-parse --show-toplevel 2>/dev/null)\"; if [ ! -x \"$PLUGIN/bin/heimdall-precheck-agent\" ]; then echo \"heimdall: precheck-agent not found (CLAUDE_PLUGIN_ROOT unset or stale, and the cwd repo is not a heimdall checkout) - Agent spawn allowed UNCHECKED, the spawn gates did not run\" >&2; exit 0; fi; \"$PLUGIN/bin/parallelism-tracker\" check Agent || true; printf '%s' \"$INPUT\" | \"$PLUGIN/bin/heimdall-precheck-agent\""
           }
         ]
       },

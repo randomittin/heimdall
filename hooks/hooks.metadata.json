@@ -67,7 +67,7 @@
       "id": "bash-gate-chain",
       "description": "git-guard stale-lock clear, commit secret scan, pre-push quality/secret/selfscan/oracle/corpus gates (exit 2 blocks).",
       "matcher": "Bash",
-      "fingerprint": "89380acf14f0081e868dab8f447a2373f1f9484050da491c18dd422e2d3bead9",
+      "fingerprint": "e02f487713dad2ac0bd4735e7401ea88bdd4698b2feaab695ce04fc2e75720cc",
       "locked": true,
       "remote_toggle": false
     },
@@ -87,7 +87,7 @@
       "id": "agent-precheck",
       "description": "Named-agent notice and the brief-adoption gate that rewrites oversized spawn prompts (heimdall-precheck-agent).",
       "matcher": "Agent",
-      "fingerprint": "c118a62f324f57c64222c0c5efd06e84482a41aec44f0fea7082348df7ee0ef7",
+      "fingerprint": "c1d3fad20c8b39fb88bbac42201847a8dc2e64d1da1dc522b4f3f14a8bb4b3b7",
       "locked": true,
       "remote_toggle": false
     },

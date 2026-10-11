@@ -20,6 +20,17 @@
 # must match line for line (the script's own `case "${1:-}"` -h guard is the one
 # line filtered out — it is the only statement not in the inline string).
 #
+# TWO DELIBERATE DELTAS (2026-10-11, "precheck never blocks silently in another
+# repo") — the one place the script is NOT the historical inline chain any more,
+# each updated here on purpose and pinned by its own case:
+#   * a deny (exit 2) also states its verdict on STDERR (case 24). stdout is
+#     unchanged; equiv() therefore compares a deny's stderr with that mirrored
+#     line removed, and skips the xtrace comparison for denies (the mirror is the
+#     only statement that differs).
+#   * with CLAUDE_PLUGIN_ROOT unset the plugin root is the script's own location,
+#     never the cwd's git toplevel (case 21); the shipped hooks.json wrappers fail
+#     open with one stderr line instead of exiting 127 (cases 25, 26).
+#
 # WHERE THE REFERENCE COMES FROM: the working tree's hooks.json while it still
 # carries the inline string; once hooks.json has been swapped to the wrapper, the
 # newest commit of hooks.json whose Bash command still carried the inline chain
@@ -167,7 +178,9 @@ equiv() {
   local why=""
   for m in script shipped; do
     cmp -s "$TMPROOT/$tag.inline.out" "$TMPROOT/$tag.$m.out" || why="$why stdout($m)"
-    cmp -s "$TMPROOT/$tag.inline.err" "$TMPROOT/$tag.$m.err" || why="$why stderr($m)"
+    # a deny (rc 2) mirrors its stdout verdict onto stderr — the deliberate delta (case 24);
+    # remove exactly that line and the rest of stderr must still be the historical bytes
+    { if [ "$(cat "$TMPROOT/$tag.$m.rc")" = 2 ]; then grep -vxF -f "$TMPROOT/$tag.$m.out" "$TMPROOT/$tag.$m.err"; else cat "$TMPROOT/$tag.$m.err"; fi; } | cmp -s "$TMPROOT/$tag.inline.err" - || why="$why stderr($m)"
     cmp -s "$TMPROOT/$tag.inline.rc"  "$TMPROOT/$tag.$m.rc"  || why="$why rc($m)"
   done
   # the -h guard is the ONE statement the script has that the string does not.
@@ -177,7 +190,8 @@ equiv() {
   # program — the multiset of executed statements is.
   grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
   LC_ALL=C sort "$TMPROOT/$tag.trace-inline.err" > "$TMPROOT/$tag.trace-inline.sorted"
-  cmp -s "$TMPROOT/$tag.trace-inline.sorted" "$TMPROOT/$tag.trace-script.filtered" || why="$why xtrace"
+  # denies are exempt from the trace comparison: the stderr mirror is a statement the string never had
+  [ "$(cat "$TMPROOT/$tag.inline.rc")" = 2 ] || cmp -s "$TMPROOT/$tag.trace-inline.sorted" "$TMPROOT/$tag.trace-script.filtered" || why="$why xtrace"
   # the expected branch really ran (guards against three copies of a wrong thing agreeing)
   local rc; rc="$(cat "$TMPROOT/$tag.inline.rc")"
   if [ -z "$why" ]; then
@@ -303,31 +317,33 @@ expect 19 "falsify via stack file" err '^falsify demo-domain'
 equiv 20 "command carrying \\n, \\t, quotes and backslashes in the payload" "$CWD_PLAIN" "$PLUGIN_FULL" "$(pl $'printf \'a\\tb\\n\' "q\\"q" \\\\ end')"
 expect_rc 20 0
 
-# ── 21. no CLAUDE_PLUGIN_ROOT, cwd not a git repo: PLUGIN falls back to pwd ─
-# Both resolve PLUGIN to $PWD, which has no bin/ — every gate self-skips and the
-# trailing parallelism-tracker call is the one thing that fails. bash itself
-# reports that missing file, and bash names the SOURCE in that diagnostic
-# ("bash: " for -c, "<script>: line N: " for a file). The chain's own `2>&1`
-# folds it onto STDOUT, so this single case compares stderr and rc exactly and
-# stdout with bash's own source-name prefix stripped — the only tolerance in
-# this file, and it is bash's, not the chain's.
-run_variant c21 inline "$CWD_NOGIT" "" "$(pl 'ls')"
-run_variant c21 script "$CWD_NOGIT" "" "$(pl 'ls')"
-strip_bash_prefix() { sed -E 's#^(bash|/[^:]+): (line [0-9]+: )?#<bash>: #' "$1"; }
-if cmp -s "$TMPROOT/c21.inline.err" "$TMPROOT/c21.script.err" \
-   && cmp -s "$TMPROOT/c21.inline.rc" "$TMPROOT/c21.script.rc" \
-   && [ "$(strip_bash_prefix "$TMPROOT/c21.inline.out")" = "$(strip_bash_prefix "$TMPROOT/c21.script.out")" ] \
-   && grep -q 'parallelism-tracker: No such file' "$TMPROOT/c21.script.out" \
-   && [ "$(cat "$TMPROOT/c21.inline.rc")" = 0 ]; then
-  ok "21. PLUGIN falls back to pwd without CLAUDE_PLUGIN_ROOT; identical modulo bash's own source-name prefix  [rc=0]"
+# ── 21. no CLAUDE_PLUGIN_ROOT: the plugin root is the script's OWN location ──
+# 2026-10-11, deliberate change vs the historical inline chain, which fell back to
+# the cwd's git toplevel (then pwd): in any repo that is not a heimdall checkout it
+# looked for bin/ in the wrong place. The copy inside PLUGIN_FULL (fake gate bins,
+# incl. a fake parallelism-tracker) runs with CLAUDE_PLUGIN_ROOT unset from a
+# foreign git repo and from a non-git dir; ITS tracker must be the one that runs.
+c21_bad=""
+for cwd in "$CWD_PLAIN" "$CWD_NOGIT"; do
+  ( cd "$cwd" && printf '%s' "$(pl 'ls')" | env -u CLAUDE_PLUGIN_ROOT bash "$PLUGIN_FULL/bin/heimdall-precheck-bash" ) >"$TMPROOT/c21.out" 2>"$TMPROOT/c21.err"
+  rc=$?
+  { [ "$rc" = 0 ] && grep -qx 'tracker check Bash' "$TMPROOT/c21.out" && ! grep -q 'No such file' "$TMPROOT/c21.out" "$TMPROOT/c21.err" && [ ! -s "$TMPROOT/c21.err" ]; } \
+    || c21_bad="$c21_bad $(basename "$cwd")(rc=$rc: $(head -c 120 "$TMPROOT/c21.out"))"
+done
+if [ -z "$c21_bad" ]; then
+  ok "21. CLAUDE_PLUGIN_ROOT unset: plugin root comes from the script's own location, not the cwd repo (foreign git repo and non-git dir)"
 else
-  bad "21. PLUGIN fallback diverged" "inline: $(cat "$TMPROOT/c21.inline.out") | script: $(cat "$TMPROOT/c21.script.out")"
+  bad "21. plugin root resolved from the cwd instead of the script's own location" "$c21_bad"
 fi
 
 # ── 22. missing $PLUGIN/bin/heimdall-state → falls back to `heimdall-state` by name on PATH
 # Whether PATH has one (real bin → "No heimdall-state.json found", exit 1) or not
 # (bash "command not found", exit 127) depends on the machine; either way both
 # forms must agree, and the chain must land in the UNAVAILABLE-warn-and-allow branch.
+# bash names the SOURCE in a missing-command diagnostic ("bash: " for -c,
+# "<script>: line N: " for a file); strip that prefix — the one tolerance here is
+# bash's, not the chain's.
+strip_bash_prefix() { sed -E 's#^(bash|/[^:]+): (line [0-9]+: )?#<bash>: #' "$1"; }
 run_variant c22 inline "$CWD_PLAIN" "$PLUGIN_NOHSTATE" "$(pl 'git push')"
 run_variant c22 script "$CWD_PLAIN" "$PLUGIN_NOHSTATE" "$(pl 'git push')"
 if cmp -s "$TMPROOT/c22.inline.out" "$TMPROOT/c22.script.out" \
@@ -347,6 +363,58 @@ elif grep -qF '"$PLUGIN/bin/heimdall-precheck-bash"' <<<"$SHIPPED" && ! grep -q 
   ok "23. hooks.json ships the wrapper one-liner calling \$PLUGIN/bin/heimdall-precheck-bash with its exit code propagated (no '|| true')"
 else
   bad "23. hooks.json Bash command is neither the inline chain nor the precheck-bash wrapper" "$SHIPPED"
+fi
+
+# ── 24. every deny states its reason on stderr too ──────────────────────────
+# Claude Code surfaces ONLY stderr for an exit-2 hook and ignores stdout, so the
+# stdout-only verdict showed up as "hook error … No stderr output": a blocked
+# `git push` with no stated reason (seen live in a foreign repo whose own quality
+# gates were failing). Cases 5,7,9,10,13,14,15,16 above are the deny branches.
+c24_bad=""
+for n in 5 7 9 10 13 14 15 16; do
+  for m in script shipped; do
+    { grep -q '^{"error": "BLOCKED' "$TMPROOT/c$n.$m.out" && grep -qxF -f "$TMPROOT/c$n.$m.out" "$TMPROOT/c$n.$m.err"; } || c24_bad="$c24_bad c$n.$m"
+  done
+done
+if [ -z "$c24_bad" ]; then
+  ok "24. every deny branch (8 cases x script+shipped) repeats its verdict on stderr, stdout unchanged"
+else
+  bad "24. deny verdict missing from stderr (exit 2 + empty stderr = a silent block):$c24_bad"
+fi
+
+# ── 25. shipped Bash hook, CLAUDE_PLUGIN_ROOT unset, session cwd in ANOTHER repo ─
+# The wrapper must not resolve the plugin root to the cwd repo and then exit 127 on
+# every Bash call: fail OPEN, stdout empty, exactly one stderr line saying why.
+c25_bad=""
+for cwd in "$CWD_PLAIN" "$CWD_NOGIT"; do
+  ( cd "$cwd" && printf '%s' "$(pl 'git push origin main')" | env -u CLAUDE_PLUGIN_ROOT bash -c "$SHIPPED" ) >"$TMPROOT/c25.out" 2>"$TMPROOT/c25.err"
+  rc=$?
+  { [ "$rc" = 0 ] && [ ! -s "$TMPROOT/c25.out" ] && [ "$(wc -l <"$TMPROOT/c25.err" | tr -d ' ')" = 1 ] && grep -q 'precheck-bash not found' "$TMPROOT/c25.err"; } \
+    || c25_bad="$c25_bad $(basename "$cwd")(rc=$rc: $(head -c 120 "$TMPROOT/c25.err"))"
+done
+# …while a cwd that IS a heimdall checkout (hmd developing itself, env var unset) still resolves to it.
+CWD_DEV="$TMPROOT/cwd-dev"; mkdir -p "$CWD_DEV"; cp -R "$PLUGIN_FULL/bin" "$CWD_DEV/bin"; ( cd "$CWD_DEV" && git init -q )
+( cd "$CWD_DEV" && printf '%s' "$(pl 'ls')" | env -u CLAUDE_PLUGIN_ROOT bash -c "$SHIPPED" ) >"$TMPROOT/c25.out" 2>"$TMPROOT/c25.err"
+grep -qx 'tracker check Bash' "$TMPROOT/c25.out" || c25_bad="$c25_bad dev-checkout($(head -c 120 "$TMPROOT/c25.err"))"
+if [ -z "$c25_bad" ]; then
+  ok "25. env var unset in a foreign cwd: Bash hook fails open with one stderr line (no 127); a heimdall-checkout cwd still resolves"
+else
+  bad "25. Bash hook wrapper mishandles an unset CLAUDE_PLUGIN_ROOT:$c25_bad"
+fi
+
+# ── 26. same for the Agent hook (the other unguarded `$PLUGIN/bin/<script>` call) ─
+AGENT_SHIPPED="$(jq -r '.hooks.PreToolUse[] | select(.matcher=="Agent") | .hooks[0].command' "$HOOKS_JSON")"
+c26_bad=""
+for cwd in "$CWD_PLAIN" "$CWD_NOGIT"; do
+  ( cd "$cwd" && printf '%s' '{"tool_name":"Agent","tool_input":{}}' | env -u CLAUDE_PLUGIN_ROOT bash -c "$AGENT_SHIPPED" ) >"$TMPROOT/c26.out" 2>"$TMPROOT/c26.err"
+  rc=$?
+  { [ "$rc" = 0 ] && [ ! -s "$TMPROOT/c26.out" ] && [ "$(wc -l <"$TMPROOT/c26.err" | tr -d ' ')" = 1 ] && grep -q 'precheck-agent not found' "$TMPROOT/c26.err"; } \
+    || c26_bad="$c26_bad $(basename "$cwd")(rc=$rc: $(head -c 120 "$TMPROOT/c26.err"))"
+done
+if [ -z "$c26_bad" ]; then
+  ok "26. env var unset in a foreign cwd: Agent hook fails open with one stderr line (no 127)"
+else
+  bad "26. Agent hook wrapper mishandles an unset CLAUDE_PLUGIN_ROOT:$c26_bad"
 fi
 
 printf '\n  heimdall-precheck-bash: %d passed, %d failed\n' "$PASS" "$FAIL"
