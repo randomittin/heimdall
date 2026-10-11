@@ -84,4 +84,25 @@ if [ ! -f "$SERVER" ] || [ ! -f "$PAGE" ]; then
   exit 2
 fi
 
+# An hmd ui an earlier launch left behind for THIS repo -- detached (ppid 1), no relay client serving it -- is superseded by this
+# one: stop it, or it keeps re-running hooks/identity/agents every poll for nothing (handoff 2026-10-11: two superseded servers
+# were left running when `hmd app connect` moved to the next port). Only a server of this repo that nothing owns is touched
+# (bin/lib/hmd_ui_procs.py supersede); a ui in another terminal, another repo's, a published one, one a client serves: never.
+# Best effort and bounded; HMD_UI_NO_SUPERSEDE=1 opts out. Not for the one-shot modes (--print-*).
+ui_launch=1
+for a in "$@"; do
+  case "$a" in -h|--help|--print-sources|--print-deny-list|--print-state) ui_launch=0 ;; esac
+done
+if [ "$ui_launch" = 1 ] && [ -z "${HMD_UI_NO_SUPERSEDE:-}" ] && [ -r "$LIB_DIR/hmd_ui_procs.py" ]; then
+  ui_repo="" ui_prev=""
+  for a in "$@"; do
+    [ "$ui_prev" = "--repo" ] && ui_repo="$a"
+    case "$a" in --repo=*) ui_repo="${a#--repo=}" ;; esac
+    ui_prev="$a"
+  done
+  [ -n "$ui_repo" ] || ui_repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  ui_out="$("$PY3" -I "$LIB_DIR/hmd_ui_procs.py" supersede --repo "$ui_repo" 2>/dev/null || true)"
+  case "$ui_out" in *"reaped "*) printf 'hmd ui: stopped a superseded hmd ui left behind for this repo\n' >&2 ;; esac
+fi
+
 exec "$PY3" "$SERVER" "$@"

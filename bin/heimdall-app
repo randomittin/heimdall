@@ -1385,6 +1385,26 @@ _ui_next_free_port() {
   return 1
 }
 
+# _ui_stop_superseded REPO REPO_REAL PORT -- stop the hmd uis an earlier connect left behind for THIS repo on any OTHER port:
+# detached (ppid 1), loopback-only, no relay client serving them. The port-based decisions below only ever look at PORT, so a
+# ui on 8711 stayed up -- re-running hooks/identity/agents every poll for nothing -- once connect had moved on to 8713 (handoff
+# 2026-10-11). The ui on PORT itself is left to those decisions (reused, replaced or refused). bin/lib/hmd_ui_procs.py does the
+# identification and the stop (SIGTERM, wait, SIGKILL); it never signals anything it cannot positively name. Best effort: 0 always.
+_ui_stop_superseded() {
+  local helper="$LIB_DIR/hmd_ui_procs.py" line timeout="${HMD_UI_STOP_TIMEOUT_S:-5}"
+  local -a keep=()
+  [ -n "$PY3" ] && [ -n "$2" ] && [ -r "$helper" ] || return 0
+  case "$timeout" in ''|*[!0-9]*) timeout=5 ;; esac
+  _ui_port_ok "$3" && keep=(--keep-port "$3")
+  while IFS= read -r line; do
+    case "$line" in
+      reaped\ *)   echo "hmd app connect: stopped a superseded hmd ui left behind for this repo (${line#reaped })" >&2 ;;
+      SURVIVED\ *) echo "hmd app connect: a superseded hmd ui did not stop (${line#SURVIVED })" >&2 ;;
+    esac
+  done < <("$PY3" -I "$helper" supersede --repo "$2" ${keep[@]+"${keep[@]}"} --timeout "$timeout" 2>/dev/null)
+  return 0
+}
+
 # _relay_start_ui REPO PORT -- bring up (or adopt) the loopback hmd ui cmd_connect_relay reports against; the policy is the
 # block comment above. Sets UI_PID, ACTUAL_PORT and UI_REUSED; UI_OUT is the ui's own output. 0 when a ui is up, 6 with the
 # reason already printed when none can be.
@@ -1393,6 +1413,7 @@ _relay_start_ui() {
   local url_re='^http://127\.0\.0\.1:[0-9]+/\?token='
   repo_real="$(cd "$repo" 2>/dev/null && pwd -P)" || repo_real=""
   UI_REUSED=false
+  _ui_stop_superseded "$repo" "$repo_real" "$port"
   while [ "$tries" -lt 12 ]; do
     tries=$((tries + 1))
     if [ -n "$repo_real" ] && _ui_port_ok "$port"; then

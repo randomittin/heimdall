@@ -1853,6 +1853,71 @@ if grep -qi 'reusing the hmd ui' "$T_OUTF"; then ok "reuse: connect says it reus
 if kill -0 "$STALE_PID" 2>/dev/null; then bad "disconnect left the adopted ui running"; else ok "disconnect stops the adopted ui like one connect started"; fi
 rm -rf "$D"
 
+# 1b. the measured leak: an earlier connect's ui for THIS repo, detached (ppid 1), no relay client, on ANOTHER port than the one
+# connect is asked for. The port-based replace path never looks there, so the old server kept running -- re-running
+# hooks/identity/agents every poll -- after connect moved on to a new port (handoff 2026-10-11: :8711 and :8712 left behind when
+# connect moved to :8713 and :8714). connect now stops it.
+D="$(make_repo)"
+P5="$(t_free_port)"; P6="$(t_free_port)"
+SUP_DIR="$TMPROOT/superseded-build/sentinels"; mkdir -p "$SUP_DIR"
+cat > "$SUP_DIR/hmd-ui.py" <<'SUP_UI_EOF'
+import http.server, sys
+port = int(sys.argv[sys.argv.index("--port") + 1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(401)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+class S(http.server.ThreadingHTTPServer):
+    allow_reuse_address = False
+S(("127.0.0.1", port), H).serve_forever()
+SUP_UI_EOF
+( python3 "$SUP_DIR/hmd-ui.py" --repo "$D" --port "$P5" --no-open >/dev/null 2>&1 & )
+SUP_WAITED=0
+while ! { : <>"/dev/tcp/127.0.0.1/$P5"; } 2>/dev/null && [ "$SUP_WAITED" -lt 50 ]; do sleep 0.1; SUP_WAITED=$((SUP_WAITED + 1)); done
+SUP_PID="$(lsof -nP -iTCP:"$P5" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p\([0-9][0-9]*\)$/\1/p' | head -1)"
+PIDS+=("$SUP_PID")
+T_RELAY_LOG="$TMPROOT/superseded-relay.log"; : > "$T_RELAY_LOG"
+t_connect "$D" "$P6"
+if [ "$T_RC" -eq 0 ]; then ok "connect exits 0 with a detached same-repo ui left behind on another port"; else bad "exit $T_RC (want 0): $(cat "$T_OUTF")"; fi
+SUP_WAITED=0
+while kill -0 "$SUP_PID" 2>/dev/null && [ "$SUP_WAITED" -lt 50 ]; do sleep 0.1; SUP_WAITED=$((SUP_WAITED + 1)); done
+if ! kill -0 "$SUP_PID" 2>/dev/null; then ok "superseded: the same-repo ui left behind on another port is stopped (not left re-running hooks every poll)"; else bad "the old ui (pid $SUP_PID, port $P5) is still running: $(cat "$T_OUTF")"; fi
+if grep -q 'superseded hmd ui' "$T_OUTF"; then ok "superseded: connect says it stopped one"; else bad "no superseded notice: $(cat "$T_OUTF")"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
+# 1c. the replace path must END a stale ui that ignores SIGTERM: SIGKILL after HMD_UI_STOP_TIMEOUT_S, and the fresh ui binds the
+# SAME port (a pid that lingers keeps the port, and the leak)
+D="$(make_repo)"
+P7="$(t_free_port)"
+TP_DIR="$TMPROOT/term-proof-build/sentinels"; mkdir -p "$TP_DIR"
+cat > "$TP_DIR/hmd-ui.py" <<'TP_UI_EOF'
+import http.server, signal, sys
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+port = int(sys.argv[sys.argv.index("--port") + 1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(401)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+class S(http.server.ThreadingHTTPServer):
+    allow_reuse_address = False
+S(("127.0.0.1", port), H).serve_forever()
+TP_UI_EOF
+( python3 "$TP_DIR/hmd-ui.py" --repo "$D" --port "$P7" --no-open >/dev/null 2>&1 & )
+TP_WAITED=0
+while ! { : <>"/dev/tcp/127.0.0.1/$P7"; } 2>/dev/null && [ "$TP_WAITED" -lt 50 ]; do sleep 0.1; TP_WAITED=$((TP_WAITED + 1)); done
+TP_PID="$(lsof -nP -iTCP:"$P7" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p\([0-9][0-9]*\)$/\1/p' | head -1)"
+PIDS+=("$TP_PID")
+T_RELAY_LOG="$TMPROOT/term-proof-relay.log"; : > "$T_RELAY_LOG"
+HMD_UI_STOP_TIMEOUT_S=1 t_connect "$D" "$P7"
+if [ "$T_RC" -eq 0 ]; then ok "replace: connect --port N over a SIGTERM-proof stale ui on N exits 0"; else bad "exit $T_RC (want 0): $(cat "$T_OUTF")"; fi
+if ! kill -0 "$TP_PID" 2>/dev/null; then ok "replace: the stale ui that ignores SIGTERM is gone (SIGKILL after the timeout, waited for)"; else bad "the stale ui (pid $TP_PID) outlived the replace: $(cat "$T_OUTF")"; fi
+if grep -q 'stopping it to start a fresh one' "$T_OUTF" && ! grep -q 'did not stop' "$T_OUTF"; then ok "replace: connect announced the stop and did not report a failure to stop"; else bad "replace output: $(cat "$T_OUTF")"; fi
+"$APP" disconnect --repo "$D" >/dev/null 2>&1
+rm -rf "$D"
+
 # 2. a same-repo ui that is not a working one -- here an older build, which has no /healthz and answers 401 to it --
 # is stopped (it is this user's python running <...>/sentinels/hmd-ui.py --repo <this repo>) and a fresh ui binds
 # the SAME port
