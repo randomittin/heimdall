@@ -84,6 +84,7 @@ TIMEOUT=180
 MIN_SUITES=100
 FILTER=""
 INCLUDE_LIVE=0
+WAIT_QUIET=0
 RETRY_REDS=1
 JOBS="$( { sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4; } | head -1 )"
 case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
@@ -140,6 +141,8 @@ _load_disp() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --include-live) INCLUDE_LIVE=1; shift ;;
+    # the quiet gate (test/lib/run-all-guards.sh): wait for a settled machine, bounded, then run anyway
+    --wait-quiet)   WAIT_QUIET=1; shift ;;
     --no-retry)     RETRY_REDS=0; shift ;;
     --jobs)         JOBS="${2:-4}"; shift 2 ;;
     --timeout)      TIMEOUT="${2:-180}"; shift 2 ;;
@@ -309,6 +312,20 @@ timeout_run() {
     my $st  = $?;
     $got = waitpid($pid, 0) if $got == -1 && !$timed_out;
     alarm 0;
+    # Whatever the suite left running in ITS process group (a server started inside a command substitution
+    # whose cleanup trap never saw the pid, a daemon) dies with the suite. Without this a leaked hmd ui outlived
+    # the sweep -- 2026-10-11: 14 of them, up to two days old, each re-running hooks/identity/agents every poll.
+    # kill(0, -$pid) is true only while some member of the group is alive; RUN_ALL_LEAK_FILE (set per suite by
+    # run_one) gets one ps line per survivor so the end-of-sweep guard can name the suite.
+    if (kill(0, -$pid)) {
+      if (defined $ENV{RUN_ALL_LEAK_FILE} && open(my $lf, ">>", $ENV{RUN_ALL_LEAK_FILE})) {
+        for my $l (split /\n/, `ps -axo pid=,pgid=,command= 2>/dev/null`) { print $lf "$l\n" if $l =~ /^\s*\d+\s+$pid\s/; }
+        close $lf;
+      }
+      kill("TERM", -$pid);
+      select(undef, undef, undef, 1);
+      kill("KILL", -$pid);
+    }
     exit 124 if $timed_out;
     exit(($st & 127) ? 128 + ($st & 127) : ($st >> 8));
   ' -- "$secs" "$@"
@@ -553,7 +570,7 @@ run_one() {
   local idx="$1" suite="$2" t0 t1 rc budget
   budget="$(suite_timeout "$suite")"
   t0=$(date +%s)
-  timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1
+  RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1
   rc=$?
   t1=$(date +%s)
   printf '%s\n' "$rc" >"$WORK/$idx.rc"
@@ -622,6 +639,17 @@ _heartbeat_check() {
   LAST_PROGRESS_T=$now
 }
 
+# THE QUIET GATE and the ORPHAN GUARD live in test/lib/run-all-guards.sh (see its header for the why). Absent next to a
+# copy of this script (the fixture repos of the test/run-all-*.test.sh suites), neither runs and the sweep is as before.
+# shellcheck source=lib/run-all-guards.sh disable=SC1091  # the default run never opens sourced files
+if [ -r "$SELF_DIR/lib/run-all-guards.sh" ]; then . "$SELF_DIR/lib/run-all-guards.sh"; fi
+if [ "$WAIT_QUIET" -eq 1 ]; then
+  if type hmd_test_wait_quiet >/dev/null 2>&1; then
+    hmd_test_wait_quiet
+  else
+    echo "quiet gate: unavailable (test/lib/run-all-guards.sh not found next to run-all.sh) -- running now"
+  fi
+fi
 START=$(date +%s)
 LOAD_START="$(_load_avg)"
 LOAD_START_DISP="$(_load_disp "$LOAD_START")"
@@ -699,6 +727,10 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
   done
   [ -t 1 ] && printf '\r%*s\r' 44 ''
 fi
+# ORPHAN GUARD: name the suites that left processes behind (timeout_run already killed them) and assert no hmd ui /
+# relay client on a temp or deleted repo survives the sweep. Silent when clean; survivors of SIGKILL turn the sweep RED.
+ORPHAN_SURVIVORS=0
+if type hmd_test_orphan_guard >/dev/null 2>&1; then hmd_test_orphan_guard "$REPO" "$WORK"; fi
 END=$(date +%s)
 LOAD_END="$(_load_avg)"
 LOAD_END_DISP="$(_load_disp "$LOAD_END")"
@@ -1015,7 +1047,7 @@ if [ -n "$EVIDENCE" ]; then
   done
 fi
 
-BAD=$((n_fail + n_timeout + n_discrep + n_treeviol))
+BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0}))
 
 # ── SWEEP RECEIPT ─────────────────────────────────────────────────────────────────────────
 # Turns "the sweep is green" into a checkable FACT instead of a claim. Three real

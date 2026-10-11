@@ -646,6 +646,15 @@ build_notif_index() {
     [ -f "$f" ] && existing="$existing $f"
   done
   [ -n "$existing" ] || { _NOTIF_IDX=" "; return 0; }
+  # Incremental: bin/lib/agents_notif_index.pl reads only the bytes appended to each transcript since the last call
+  # (a per-transcript cache of inode + offset + last status per task id) instead of re-grepping up to 16 MB per
+  # transcript on every statusline tick. Anything wrong with it falls through to the full grep below.
+  local helper
+  helper="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")" 2>/dev/null && pwd)/lib/agents_notif_index.pl"
+  # shellcheck disable=SC2086
+  if [ -r "$helper" ] && _NOTIF_IDX="$(perl "$helper" "${HEIMDALL_HOME:-${HOME:-/nonexistent}/.heimdall}/notif-index" $existing 2>/dev/null)" && [ -n "$_NOTIF_IDX" ]; then
+    return 0
+  fi
   # shellcheck disable=SC2086
   _NOTIF_IDX="$(grep -hF '<task-notification>' $existing 2>/dev/null \
     | perl -ne 'while(m{<task-id>([^<]+)</task-id>.*?<status>([^<]+)</status>}g){print "$1\t$2\n"}' 2>/dev/null \

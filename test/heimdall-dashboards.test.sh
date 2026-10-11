@@ -43,8 +43,24 @@ done
 
 TMPROOT="$(mktemp -d)"
 PIDS=()
+# desk_reap -- stop every hmd ui server a desktop_probe started. desktop_probe runs inside $(...), so the
+# PIDS+=("$!") it does lands in THAT subshell's copy of the array and never reaches cleanup(): the servers
+# outlived the suite (2026-10-11: 14 of them, ppid 1, up to two days old, each re-running hooks/identity/agents
+# every poll). The pid FILE under the probe's own desk.* dir is what survives the subshell.
+desk_reap() {
+  local pf p i
+  for pf in "$TMPROOT"/desk.*/server.pid; do
+    [ -f "$pf" ] || continue
+    p="$(cat "$pf" 2>/dev/null)"; rm -f "$pf"
+    case "$p" in ''|*[!0-9]*) continue ;; esac
+    kill "$p" 2>/dev/null || continue
+    i=0; while kill -0 "$p" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+    if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null || true; fi
+  done
+}
 cleanup() {
   local p
+  desk_reap
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && wait "$p" 2>/dev/null; done
   rm -rf "$TMPROOT"
@@ -149,7 +165,7 @@ ui_mutant "a control and a request in the desktop renderer" hmd-ui.html \
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 
 # desktop_probe LABEL TREE -> `ok NAME` / `FAIL NAME` lines; TREE holds bin/ and sentinels/ (the real repo, or a mutated copy)
-desktop_probe() {
+_desktop_probe() {
   local label="$1" tree="$2" home repo port out url auth base code before after bad_routes spec m path i
   home="$(mktemp -d "$TMPROOT/desk.XXXXXX")"
   repo="$home/repo"; mkdir -p "$repo" "$home/h" "$home/.claude"
@@ -178,6 +194,7 @@ PYEOF
   ( cd "$repo" && exec env HOME="$home" HEIMDALL_HOME="$home/h" HEIMDALL_WATCH_ROOT="$repo" HMD_UI_COMPANION_PANELS=0 \
       HEIMDALL_FALLBACK_ASSUME_REACHABLE=0 HEIMDALL_FALLBACK_PROBE_TIMEOUT=1 "$tree/bin/heimdall-ui" --repo "$repo" --port "$port" --no-open ) >"$out" 2>&1 &
   PIDS+=("$!")
+  printf '%s\n' "$!" >"$home/server.pid"
   url=""; i=0
   while [ "$i" -lt 200 ]; do
     url="$(grep -E "^http://127\.0\.0\.1:$port/\?(t|token)=[A-Za-z0-9_-]+\$" "$out" 2>/dev/null | head -1)"
@@ -220,6 +237,14 @@ PYEOF
     case "$code" in 2*) bad_routes="$bad_routes $spec=$code" ;; esac
   done
   if [ -z "$bad_routes" ] && [ "$before" = "$(store_sum)" ]; then echo "ok no-other-route-answers"; else echo "FAIL no-other-route-answers$bad_routes"; fi
+}
+
+# desktop_probe LABEL TREE -- _desktop_probe, and whichever way it ends the server it started dies with it
+desktop_probe() {
+  local rc=0
+  _desktop_probe "$@" || rc=$?
+  desk_reap
+  return "$rc"
 }
 
 DESK="$(desktop_probe real "$REPO")"
