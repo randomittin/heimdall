@@ -648,6 +648,7 @@ Operator directive 2026-10-08: avoid over-testing the same stuff; save testing f
 - Spawned agents run ONLY the test file(s) they add or edit, ONCE, after all their changes are written; a failure plausibly caused by machine load gets ONE solo re-run. That is not their default — put it in every spawn prompt (§4c item 5)
 - You do not re-run an agent's suite after it reports, and you do not re-run suites per merge: its reported run stands until the sweep
 - ONE full sweep, on the final frozen tree, immediately before the landing commit / push / demo / `/hmd:save` checkpoint — in the background (it is a long command), nothing editing while it runs. Never start it while a reviewer, verifier or agent can still hand back a fix: a sweep a late fix invalidates is a wasted half hour, and a cancelled one is worse
+- Batch before you sweep: collect every pending agent result and merge them ALL, then run ONE sweep; never merge anything between a green sweep and its push; if new work arrives after a sweep started, queue it for the next batch instead of merging; a failing suite gets fixed and the fix rides the next batch; use the incremental sweep (`run-all.sh --since-green`, being added) for small follow-up batches and the full sweep before a release; never start a second sweep while one runs. `bin/heimdall-conformance` fails `sweep-staled-by-merge` and `sweeps-overlap` on the session transcript
 - Only a green full sweep clears the dirty flag (`heimdall-state mark-clean`) — a scoped run of one agent's files did not test the tree
 
 ---
@@ -794,6 +795,8 @@ same message anyway. Parallelism (§0 item 2, spawn all independent agents in ON
 message) governs how many agents go out together; it says nothing about how much
 any ONE of them is asked to do, and conflating the two is the failure this rule
 corrects.
+
+**The merge-side twin: integrate in batches.** Delegated results come back one at a time but are merged all together — collect every pending result, merge them ALL, then run the ONE sweep (§6c). Merging one agent's fix at a time stales every green receipt in between, which is how ~9 full sweeps were spent in a day. Rule: `CLAUDE.md` "When the full gate runs".
 
 **Why this is a rule now, not a style preference.** A char-count breakdown of
 one session's own transcript history is the evidence, and it is unflattering to

@@ -95,7 +95,7 @@ Monitor via dispatch queue status: if `pending > 0` and `running < 10`, scale up
 ## Phase 6: Verify
 - Spawn a **verifier agent** to check ALL acceptance criteria across all waves — each criterion once, on the tree as it stands
 - Verify requirement coverage: every original requirement maps to a passing check
-- Last step, only once the verifier and reviewer have nothing left to hand back: ONE full sweep — full test suite, linter, type checker — on the frozen tree. It is the only full run in the pipeline (not per wave, not per merge), and a fix that lands after it spends it
+- Last step, only once the verifier and reviewer have nothing left to hand back: ONE full sweep — full test suite, linter, type checker — on the frozen tree. It is the only full run in the pipeline (not per wave, not per merge), and a fix that lands after it spends it. Batch before you sweep: merge every pending agent result BEFORE it, never between a green sweep and the push; work that arrives mid-sweep waits for the next batch, and no second sweep starts while one runs (`CLAUDE.md` "When the full gate runs")
 - Update `.planning/PLAN-{phase}.md` with verification results
 
 ## Phase 7: Ship

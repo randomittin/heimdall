@@ -63,7 +63,16 @@
 #                            suites are counted apart, and every suite in a multi-suite
 #                            Bash call counts; mentions of a suite that are not runs of it
 #                            do not; the full-gate checks are untouched by suite events.
-#   M. MUTATION PROOFS       thirteen mutants of the tool, each disarming one rule, each
+#   N. SWEEP STALED BY A MERGE  a full-gate run that completed GREEN, then a merge/commit of
+#                            real work before the next push, then ANOTHER full-gate run: the
+#                            first sweep was wasted by an unbatched merge. A RED sweep, a push,
+#                            a real edit and hook-owned (.planning/.heimdall) commits do not
+#                            count; foreground and background (task-notification) runs both do.
+#   O. SWEEPS OVERLAP        a second full-gate run started while the first was still running
+#                            (start/end read from the tool_result / task-notification); the
+#                            immediate background ack is NOT an end; a foreground run with no
+#                            recorded result is never an accusation.
+#   M. MUTATION PROOFS       nineteen mutants of the tool, each disarming one rule, each
 #                            required to flip a verdict.
 #
 # HERMETIC BY CONSTRUCTION
@@ -802,9 +811,184 @@ PATH="$WORK/awkshim:$PATH" HMD_CONF_TRANSCRIPT="$T_S2" conf suite-runs-once
   || bad "(L) a failing counter was not fail-closed (rc=$RC): $OUT$ERR"
 
 conf --help
-has "$ERR" 'suite-runs-once.*3[+]' && has "$ERR" 'all  *all five' \
-  && ok "(L) --help documents suite-runs-once and says \`all\` aggregates five checks" \
-  || bad "(L) the usage text does not mention the new check: $ERR"
+has "$ERR" 'suite-runs-once.*3[+]' && has "$ERR" 'all  *all seven' \
+  && has "$ERR" 'sweep-staled-by-merge' && has "$ERR" 'sweeps-overlap' \
+  && ok "(L) --help documents suite-runs-once and the two sweep checks, and says \`all\` aggregates seven checks" \
+  || bad "(L) the usage text does not mention the new checks: $ERR"
+
+# ═══ (N) SWEEP STALED BY AN UNBATCHED MERGE ════════════════════════════════════════
+# Operator directive (2026-10-11): merge EVERY pending agent result first, then run ONE
+# sweep. A merge or commit of real work between a GREEN sweep and the next sweep stales the
+# green receipt, so the first sweep was a wasted ~70 minutes — measured, ~9 full sweeps in
+# one day, each staled by a merge that landed one agent at a time. Only tool calls are read:
+# a Bash `git merge|commit|cherry-pick|pull|rebase|am|revert` in command position is the
+# staling event; a `git push` (or release/ship.sh) closes the batch; a RED sweep is the
+# sanctioned reason to re-sweep; and .planning/ + .heimdall/ are hook-owned (journal, state,
+# receipts), so touching them never stales a sweep.
+ev_run() { # ev_run <ts> <tool_use id> <fg|bg> <command>   a Bash tool_use that carries an id
+  printf '{"type":"assistant","timestamp":"%s","message":{"content":[{"type":"tool_use","id":"%s","name":"Bash","input":{"command":%s,"run_in_background":%s}}]}}\n' \
+    "$1" "$2" "$(jq -n --arg c "$4" '$c')" "$([ "$3" = bg ] && echo true || echo false)"
+}
+ev_result() { # ev_result <ts> <tool_use id> [error]   the tool_result (for a bg run: its immediate ack)
+  printf '{"type":"user","timestamp":"%s","message":{"content":[{"type":"tool_result","tool_use_id":"%s","content":"x"%s}]}}\n' \
+    "$1" "$2" "$([ "${3:-}" = error ] && echo ',"is_error":true')"
+}
+ev_notify() { # ev_notify <ts> <tool_use id> <completed|failed|killed> <exit code>   a bg task's notification
+  jq -nc --arg ts "$1" --arg t "<task-notification><task-id>b$2</task-id><tool-use-id>$2</tool-use-id><status>$3</status><summary>Background command \"sweep\" $3 (exit code $4)</summary></task-notification>" \
+    '{type:"user",timestamp:$ts,message:{content:$t}}'
+}
+gate_fg() { ev_run "$1" "$2" fg 'bash test/run-all.sh'; ev_result "${1}e" "$2" "${3:-}"; }
+gate_bg() { ev_run "$1" "$2" bg 'bash test/run-all.sh > /tmp/sweep.out 2>&1'; ev_result "${1}a" "$2"; }
+ev_ack() { # ev_ack <ts> <tool_use id> <task id>   the real "running in background" ack, which NAMES the task
+  jq -nc --arg ts "$1" --arg id "$2" --arg t "Command running in background with ID: $3. Output is being written to: /tmp/$3.output. You will be notified when it completes." \
+    '{type:"user",timestamp:$ts,message:{content:[{type:"tool_result",tool_use_id:$id,content:$t,is_error:false}]}}'
+}
+ev_notify_task() { # ev_notify_task <ts> <task id> <status> <exit code>   a notification that names ONLY the task
+  jq -nc --arg ts "$1" --arg t "<task-notification><task-id>$2</task-id><status>$3</status><summary>Background command \"sweep\" $3 (exit code $4)</summary></task-notification>" \
+    '{type:"user",timestamp:$ts,message:{content:$t}}'
+}
+ev_stop() { # ev_stop <ts> <task id>   the orchestrator stops a background task
+  printf '{"type":"assistant","timestamp":"%s","message":{"content":[{"type":"tool_use","id":"stop-%s","name":"TaskStop","input":{"task_id":"%s"}}]}}\n' "$1" "$2" "$2"
+}
+auto_gate() { # auto_gate <ts> <id> <task id>   a compound sweep call the harness moved to the background itself (no run_in_background)
+  ev_run "$1" "$2" fg 'bash test/run-all.sh > /tmp/s.log 2>&1; echo "exit $?"; tail -2 /tmp/s.log'; ev_ack "${1}a" "$2" "$3"
+}
+
+nchk() { # nchk <group> <check> <label> <transcript> <expected violations> [ere the output must match]
+  local grp="$1" chk="$2" label="$3" t="$4" want="$5" ere="${6:-}" want_rc=0
+  [ "$want" -gt 0 ] && want_rc=1
+  HMD_CONF_TRANSCRIPT="$t" conf "$chk"
+  if [ "$RC" = "$want_rc" ] && [ "$(viol_count "$OUT")" = "$want" ] && { [ -z "$ere" ] || has "$OUT" "$ere"; }; then
+    ok "($grp) $label"
+  else
+    bad "($grp) $label — rc=$RC (want $want_rc), violations=$(viol_count "$OUT") (want $want): $OUT$ERR"
+  fi
+}
+
+T_N_BAD="$WORK/n-bad.jsonl"          # work, GREEN sweep, merge, sweep   -> the first sweep was wasted
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash m1 'git merge worktree-agent-b'; gate_fg g2 id2; } > "$T_N_BAD"
+T_N_COMMIT="$WORK/n-commit.jsonl"    # a commit of real work instead of a merge
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash m1 'git add src/x.sh && git commit -m "fix: x"'; gate_fg g2 id2; } > "$T_N_COMMIT"
+T_N_C="$WORK/n-dashc.jsonl"          # git -C <dir> merge, behind a cd
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash m1 'cd /tmp && git -C /r merge agent-x'; gate_fg g2 id2; } > "$T_N_C"
+T_N_BG="$WORK/n-bg.jsonl"            # background sweep: green means the notification says completed (exit code 0)
+{ ev_edit e1 a.sh; gate_bg g1 id1; ev_notify g1n id1 completed 0; ev_bash m1 'git merge worktree-agent-b'; gate_bg g2 id2; ev_notify g2n id2 completed 0; } > "$T_N_BG"
+T_N_BATCH="$WORK/n-batch.jsonl"      # merge, merge, ONE sweep, landing commit, push -> the disciplined flow
+{ ev_bash m1 'git merge worktree-agent-a'; ev_bash m2 'git merge worktree-agent-b'; gate_fg g1 id1; ev_bash c1 'git commit -m "feat: land"'; ev_bash p1 'git push origin main'; } > "$T_N_BATCH"
+T_N_PUSH="$WORK/n-push.jsonl"        # green sweep, push, merge, sweep   -> the push closed the batch
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash p1 'git push origin main'; ev_bash m1 'git merge worktree-agent-b'; gate_fg g2 id2; } > "$T_N_PUSH"
+T_N_SHIP="$WORK/n-ship.jsonl"        # release/ship.sh pushes, so it closes the batch the same way
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash p1 'bash release/ship.sh'; ev_bash m1 'git merge worktree-agent-b'; gate_fg g2 id2; } > "$T_N_SHIP"
+T_N_RED="$WORK/n-red.jsonl"          # RED sweep, merge the fix, sweep   -> fix + re-sweep is the sanctioned flow
+{ ev_edit e1 a.sh; gate_fg g1 id1 error; ev_bash m1 'git merge worktree-agent-fix'; gate_fg g2 id2; } > "$T_N_RED"
+T_N_BGRED="$WORK/n-bgred.jsonl"      # the same, for a background sweep that ended failed (exit code 1)
+{ ev_edit e1 a.sh; gate_bg g1 id1; ev_notify g1n id1 failed 1; ev_bash m1 'git merge worktree-agent-fix'; gate_bg g2 id2; ev_notify g2n id2 completed 0; } > "$T_N_BGRED"
+T_N_HOOKC="$WORK/n-hookc.jsonl"      # only a hook-owned commit (journal) between the sweeps
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash m1 'git add .planning/journal/2026-10-11.md && git commit -m "journal: note"'; gate_fg g2 id2; } > "$T_N_HOOKC"
+T_N_MIXED="$WORK/n-mixed.jsonl"      # a hook-owned path AND a source path in one commit -> real work
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash m1 'git add .planning/x.md src/y.sh && git commit -m "z"'; gate_fg g2 id2; } > "$T_N_MIXED"
+T_N_MWRITE="$WORK/n-mwrite.jsonl"    # merge, then only a hook-owned write -> the merge still staled the sweep
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash m1 'git merge worktree-agent-b'; ev_write w1 /r/.planning/STATE.md; gate_fg g2 id2; } > "$T_N_MWRITE"
+T_N_EDIT="$WORK/n-edit.jsonl"        # merge, then a REAL edit -> the edit alone required a new sweep
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash m1 'git merge worktree-agent-b'; ev_edit e2 src/x.sh; gate_fg g2 id2; } > "$T_N_EDIT"
+T_N_NOISE="$WORK/n-noise.jsonl"      # things that look like a merge and are not
+{
+  ev_edit e1 a.sh; gate_fg g1 id1
+  ev_bash n1 'git merge-base main HEAD'; ev_bash n2 'git merge --abort'; ev_bash n3 'git log --merges -3'
+  ev_bash n4 'echo git merge x'; ev_bash n5 'git commit --dry-run'; ev_bash n6 'git status'
+  gate_fg g2 id2
+} > "$T_N_NOISE"
+
+nchk N sweep-staled-by-merge "a merge between a GREEN sweep and the next sweep is flagged, naming all three events" "$T_N_BAD" 1 '^VIOLATION.*green=g1.*merge=m1.*next_gate=g2'
+nchk N sweep-staled-by-merge "a commit of real work stales the green sweep exactly as a merge does" "$T_N_COMMIT" 1 'green=g1.*merge=m1.*next_gate=g2'
+nchk N sweep-staled-by-merge "git -C <dir> merge behind a cd still counts" "$T_N_C" 1 'merge=m1'
+nchk N sweep-staled-by-merge "a background sweep is green when its notification says completed (exit code 0)" "$T_N_BG" 1 'green=g1.*merge=m1.*next_gate=g2'
+nchk N sweep-staled-by-merge "merge, merge, ONE sweep, landing commit, push is the disciplined flow — clean" "$T_N_BATCH" 0 '^OK.*gate_runs=1'
+nchk N sweep-staled-by-merge "a push closes the batch: a merge after it belongs to the next one" "$T_N_PUSH" 0
+nchk N sweep-staled-by-merge "release/ship.sh pushes too, so it closes the batch the same way" "$T_N_SHIP" 0
+nchk N sweep-staled-by-merge "a RED sweep, the merge of its fix, then a re-sweep is the sanctioned flow — clean" "$T_N_RED" 0
+nchk N sweep-staled-by-merge "...and so is a RED background sweep (notification: failed, exit code 1)" "$T_N_BGRED" 0
+nchk N sweep-staled-by-merge "a commit of ONLY hook-owned files (.planning/journal) never stales a sweep" "$T_N_HOOKC" 0
+nchk N sweep-staled-by-merge "one real source path in a commit makes it real work, whatever else it stages" "$T_N_MIXED" 1 'merge=m1'
+nchk N sweep-staled-by-merge "a hook-owned WRITE does not excuse a merge: the merge still staled the sweep" "$T_N_MWRITE" 1 'merge=m1.*next_gate=g2'
+nchk N sweep-staled-by-merge "a REAL edit after the merge independently required a new sweep — not blamed on the merge" "$T_N_EDIT" 0
+nchk N sweep-staled-by-merge "command position is required: merge-base/--abort/log --merges/echo/--dry-run/status are not merges" "$T_N_NOISE" 0 '^OK.*gate_runs=2'
+
+T_N_AUTO="$WORK/n-auto.jsonl"        # compound sweeps the harness moved to the background itself; notifications name only the task
+{ ev_edit e1 a.sh; auto_gate g1 id1 tq1; ev_notify_task g1n tq1 completed 0; ev_bash m1 'git merge worktree-agent-b'; auto_gate g2 id2 tq2; ev_notify_task g2n tq2 completed 0; } > "$T_N_AUTO"
+T_N_ENVPUSH="$WORK/n-envpush.jsonl"  # a push behind VAR=value still closes the batch
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_bash p1 'HMD_SKIP=1 git push origin main'; ev_bash m1 'git merge worktree-agent-b'; gate_fg g2 id2; } > "$T_N_ENVPUSH"
+nchk N sweep-staled-by-merge "a sweep that is the LAST command of its call reports green_exit=gate (the exit status is the gate's own)" "$T_N_BAD" 1 'next_gate=g2.*green_exit=gate'
+nchk N sweep-staled-by-merge "an auto-backgrounded compound sweep is joined to its task-only notification through the ack's task id, and reports green_exit=call (a trailing command owns the exit status)" "$T_N_AUTO" 1 'green=g1.*merge=m1.*next_gate=g2.*green_exit=call'
+nchk N sweep-staled-by-merge "VAR=value in front of git push is still a push" "$T_N_ENVPUSH" 0
+
+HMD_CONF_TRANSCRIPT="$T_N_BAD" HMD_CONF_REPO="$FR" conf all
+[ "$RC" = 1 ] && has "$OUT" '^VIOLATION.*green=g1.*merge=m1.*next_gate=g2' \
+  && ok "(N) \`all\` runs sweep-staled-by-merge too — its violation surfaces in the aggregate" \
+  || bad "(N) the aggregate run lost the sweep-staled-by-merge check (rc=$RC): $OUT$ERR"
+
+# ═══ (O) SWEEPS OVERLAP ════════════════════════════════════════════════════════════
+# Never start a second sweep while one runs: two overlapping full-gate runs grade a tree
+# neither run owns and cost two half hours for one verdict. Intervals come from the
+# transcript — a foreground run ends at its tool_result, a background run at its
+# task-notification (the immediate "running in background" ack is NOT the end). Row order
+# is the clock, so the opaque timestamps used by these fixtures are only labels.
+T_O_BG="$WORK/o-bg.jsonl"            # sweep 2 starts while sweep 1 still runs (both background)
+{ ev_edit e1 a.sh; gate_bg g1 id1; gate_bg g2 id2; ev_notify g1n id1 completed 0; ev_notify g2n id2 completed 0; } > "$T_O_BG"
+T_O_SEQ="$WORK/o-seq.jsonl"          # sweep 2 starts only after sweep 1 reported; plus a stray unrelated task
+{ ev_edit e1 a.sh; ev_result s0 other; ev_notify s0n other completed 0; gate_bg g1 id1; ev_notify g1n id1 completed 0; ev_edit e2 b.sh; gate_bg g2 id2; ev_notify g2n id2 completed 0; } > "$T_O_SEQ"
+T_O_OPEN="$WORK/o-open.jsonl"        # sweep 1 never reported back; sweep 2 started anyway
+{ ev_edit e1 a.sh; gate_bg g1 id1; gate_bg g2 id2; } > "$T_O_OPEN"
+T_O_PAR="$WORK/o-par.jsonl"          # two foreground runs issued in ONE message, results afterwards
+{ ev_edit e1 a.sh; ev_run g1 id1 fg 'bash test/run-all.sh'; ev_run g2 id2 fg 'bash test/run-all.sh'; ev_result g1e id1; ev_result g2e id2; } > "$T_O_PAR"
+T_O_FGSEQ="$WORK/o-fgseq.jsonl"      # foreground sweeps one after the other
+{ ev_edit e1 a.sh; gate_fg g1 id1; ev_edit e2 b.sh; gate_fg g2 id2; } > "$T_O_FGSEQ"
+T_O_FAIL="$WORK/o-fail.jsonl"        # sweep 1 ended FAILED, then sweep 2: sequential, not overlapping
+{ ev_edit e1 a.sh; gate_bg g1 id1; ev_notify g1n id1 failed 1; gate_bg g2 id2; ev_notify g2n id2 completed 0; } > "$T_O_FAIL"
+
+nchk O sweeps-overlap "a second sweep started before the first one's notification is flagged — and the immediate bg ack did not end it" "$T_O_BG" 1 '^VIOLATION.*first=g1.*second=g2.*first_ended=g1n'
+nchk O sweeps-overlap "sweeps that run one after the other, each ending before the next starts, are clean (a stray unrelated task changes nothing)" "$T_O_SEQ" 0 '^OK.*gate_runs=2'
+nchk O sweeps-overlap "a sweep that never reported completion while the next one started is flagged, with first_ended=never" "$T_O_OPEN" 1 'first=g1.*second=g2.*first_ended=never'
+nchk O sweeps-overlap "two foreground runs issued in one message overlap" "$T_O_PAR" 1 'first=g1.*second=g2.*first_ended=g1e'
+nchk O sweeps-overlap "foreground sweeps in sequence are clean" "$T_O_FGSEQ" 0 '^OK.*gate_runs=2'
+nchk O sweeps-overlap "a FAILED sweep still ended: the next sweep starting after it is not an overlap" "$T_O_FAIL" 0
+nchk O sweeps-overlap "a foreground run with no recorded result cannot be judged — never an accusation (the bare dupe fixture)" "$T_DUPE" 0 '^OK.*gate_runs=2'
+
+# The shape a real session actually has: the call carries no run_in_background, the harness
+# backgrounds it itself, the ack NAMES the task, and the notification names ONLY the task.
+T_O_TASK="$WORK/o-task.jsonl"        # two such sweeps overlapping
+{ ev_edit e1 a.sh; auto_gate g1 id1 tq1; auto_gate g2 id2 tq2; ev_notify_task g1n tq1 completed 0; ev_notify_task g2n tq2 completed 0; } > "$T_O_TASK"
+T_O_TASKSEQ="$WORK/o-taskseq.jsonl"  # the same two, one after the other
+{ ev_edit e1 a.sh; auto_gate g1 id1 tq1; ev_notify_task g1n tq1 completed 0; auto_gate g2 id2 tq2; ev_notify_task g2n tq2 completed 0; } > "$T_O_TASKSEQ"
+T_O_STOP="$WORK/o-stop.jsonl"        # sweep 1 is stopped with TaskStop, then sweep 2 starts
+{ ev_edit e1 a.sh; auto_gate g1 id1 tq1; ev_stop s1 tq1; auto_gate g2 id2 tq2; ev_notify_task g2n tq2 completed 0; } > "$T_O_STOP"
+T_O_CHAIN="$WORK/o-chain.jsonl"      # three runs that never report back: each is reported ONCE, as the earlier party
+{ ev_edit e1 a.sh; gate_bg g1 id1; gate_bg g2 id2; gate_bg g3 id3; } > "$T_O_CHAIN"
+nchk O sweeps-overlap "a run the harness moved to the background itself (the ack names its task) overlaps the next one, joined through task-only notifications" "$T_O_TASK" 1 'first=g1.*second=g2.*first_ended=g1n'
+nchk O sweeps-overlap "...and the same two runs one after the other are clean" "$T_O_TASKSEQ" 0 '^OK.*gate_runs=2'
+nchk O sweeps-overlap "a sweep ended with TaskStop is over: the next sweep starting after it is not an overlap" "$T_O_STOP" 0
+nchk O sweeps-overlap "three runs that never report back give two violations (each reported once as the earlier party), not one per later run" "$T_O_CHAIN" 2
+
+HMD_CONF_TRANSCRIPT="$T_O_BG" HMD_CONF_REPO="$FR" conf all
+[ "$RC" = 1 ] && has "$OUT" '^VIOLATION.*first=g1.*second=g2.*first_ended=g1n' \
+  && ok "(O) \`all\` runs sweeps-overlap too — its violation surfaces in the aggregate" \
+  || bad "(O) the aggregate run lost the sweeps-overlap check (rc=$RC): $OUT$ERR"
+
+# Both new checks fail closed and carry the detector self-check, like every transcript check.
+for c in sweep-staled-by-merge sweeps-overlap; do
+  HMD_CONF_TRANSCRIPT="$WORK/absent.jsonl" conf "$c"
+  [ "$RC" = 3 ] && has "$ERR" '^NON_VERIFIED' && [ -z "$OUT" ] \
+    && ok "($c) a missing transcript is NON_VERIFIED — never an assumed-clean session" \
+    || bad "($c) a missing transcript exited $RC stdout[$OUT] stderr[$ERR]"
+  HMD_CONF_TRANSCRIPT="$WORK/eventfree.jsonl" conf "$c"
+  [ "$RC" = 3 ] && has "$ERR" 'yielded 0 gate/edit events' && [ -z "$OUT" ] \
+    && ok "($c) a transcript with nothing to inspect is NON_VERIFIED" \
+    || bad "($c) an event-free transcript exited $RC stdout[$OUT] stderr[$ERR]"
+  HMD_CONF_UNDER_GATE=1 HMD_CONF_TRANSCRIPT="$T_NOISE" conf "$c"
+  [ "$RC" = 1 ] && has "$OUT" '^VIOLATION.*detector self-check' \
+    && ok "($c) carries the detector self-check: under the full gate, 0 parsed gate runs is a violation" \
+    || bad "($c) the self-check did not fire (rc=$RC): $OUT$ERR"
+done
 
 # ═══════════════════════════════════════════════════════════════════════════════════
 # (M) MUTATION PROOFS — break the rule, prove the tool goes RED
@@ -996,6 +1180,40 @@ else
     && ok "M13 KILLED: with the guard gone a dead counter passes silently -> (L)'s fail-closed assertion is a real check" \
     || bad "M13 SURVIVED: the mutant with no counter guard still failed closed (rc=$RC): $OUT$ERR"
 fi
+
+# ── M14..M19 — the two sweep checks (N, O): disarm one rule, the verdict must flip ──────
+mut_flips() { # mut_flips <id> <sed-script> <check> <transcript> <rc-shipped> <rc-mutant> <what it disarms>
+  local id="$1" script="$2" chk="$3" t="$4" before="$5" after="$6" what="$7" vb="${8:-}" va="${9:-}" m="" real_rc="" real_v="" mut_v=""
+  m="$(mutant "conf.$id" "$script")"
+  if [ -z "$m" ]; then bad "$id NOT APPLIED: the sed pattern no longer matches bin/heimdall-conformance ($what)"; return 0; fi
+  HMD_CONF_TRANSCRIPT="$t" confx "$CONF" "$chk"; real_rc="$RC"; real_v="$(viol_count "$OUT")"
+  HMD_CONF_TRANSCRIPT="$t" confx "$m" "$chk"; mut_v="$(viol_count "$OUT")"
+  if [ "$real_rc" = "$before" ] && [ "$RC" = "$after" ] && { [ -z "$vb" ] || { [ "$real_v" = "$vb" ] && [ "$mut_v" = "$va" ]; }; }; then
+    ok "$id KILLED: $what"
+  else
+    bad "$id SURVIVED: shipped rc=$real_rc (want $before), mutant rc=$RC (want $after) — $what"
+  fi
+}
+mut_flips M14 's#if (green [&][&] staled)#if (0)#' sweep-staled-by-merge "$T_N_BAD" 1 0 \
+  "a check that never accuses lets the wasted sweep through -> (N)'s violation assertion is a real check"
+mut_flips M15 's#if (out == "ok") { green = 1#if (1) { green = 1#' sweep-staled-by-merge "$T_N_RED" 0 1 \
+  "a RED sweep counted as green accuses the sanctioned fix-and-re-sweep -> (N)'s red-sweep exemption is real"
+mut_flips M16 's#\$2 == "PUSH" { reset() }#$2 == "NEVER" { reset() }#' sweep-staled-by-merge "$T_N_PUSH" 0 1 \
+  "a push that does not close the batch accuses the next batch -> (N)'s push assertion is real"
+mut_flips M17 's#(kind == "RESULT" [&][&] mode\[n\] == "fg")#(kind == "RESULT")#' sweeps-overlap "$T_O_BG" 1 0 \
+  "letting the immediate background ack end a run hides the overlap -> (O)'s ack assertion is real"
+mut_flips M18 's#^def hook_path:.*$#def hook_path: false;#' sweep-staled-by-merge "$T_N_HOOKC" 0 1 \
+  "with nothing hook-owned, a journal commit stales the sweep -> (N)'s hook-owned commit exemption is real"
+mut_flips M18b 's#^def hook_path:.*$#def hook_path: false;#' sweep-staled-by-merge "$T_N_MWRITE" 1 0 \
+  "with nothing hook-owned, a .planning write counts as an edit and excuses the merge -> (N)'s hook-owned write assertion is real"
+mut_flips M19 's#\$2 == "MUTATE" [&][&] \$4 != "hook" { reset() }#$2 == "NEVER" { reset() }#' sweep-staled-by-merge "$T_N_EDIT" 0 1 \
+  "an edit that does not excuse the re-sweep blames the merge for it -> (N)'s real-edit assertion is real"
+mut_flips M20 's#task2n\[\$5\] = id2n\[\$3\]#task2n[$5] = 0#' sweeps-overlap "$T_O_TASKSEQ" 0 1 \
+  "a notification that cannot be joined to its sweep through the ack's task id leaves every run still running -> (O)'s task-id join is real"
+mut_flips M21 's#"NOTIFY", (.input.task_id#"NOSUCH", (.input.task_id#' sweeps-overlap "$T_O_STOP" 0 1 \
+  "a TaskStop that does not end its run makes the stopped sweep overlap its successor -> (O)'s TaskStop assertion is real"
+mut_flips M22 's#; reported\[j\] = 1##' sweeps-overlap "$T_O_CHAIN" 1 1 \
+  "re-reporting one lost run against every later run buries the signal -> (O)'s report-once assertion is real" 2 3
 
 # ── the mutants must not have leaked into the real tool ────────────────────────────
 cmp -s "$CONF" "$MUT/conf.m1" 2>/dev/null \

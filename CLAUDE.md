@@ -127,6 +127,17 @@ verdict to a state of the code that never existed.
 - **Start it only when no follow-up fix is still possible.** A sweep begun while a
   reviewer, verifier or agent can still hand back a change is spent the moment that
   change lands, and a cancelled sweep costs the same half hour as a finished one.
+- **Batch before you sweep (operator directive 2026-10-11).** Collect every pending
+  agent result and merge them ALL, then run ONE sweep. Never merge anything between a
+  green sweep and its push. If new work arrives after a sweep started, queue it for
+  the next batch instead of merging. A failing suite gets fixed, and the fix rides the
+  next batch. Use the incremental sweep (`run-all.sh --since-green`, being added) for
+  small follow-up batches and the full sweep before a release. Never start a second
+  sweep while one runs. Measured 2026-10-11: ~9 full sweeps (~70 min each) in one day
+  — merging agent fixes one at a time staled the last green receipt every time, two
+  sweeps overlapped, one wait sat for hours on an absolute load threshold, and whole
+  sweeps were re-run to tell load flakes from real failures (re-run the one failing
+  suite solo instead).
 - **Per-suite runs: your own suite only, once.** An agent runs
   `bash test/<one>.test.sh` for ONLY the test file(s) it adds or edits, ONCE, after
   ALL its changes are written — no neighbouring or "regression" suites, no baseline
@@ -147,7 +158,10 @@ verdict to a state of the code that never existed.
   pre-push gate is the machine's guarantee.
 - **Already machine-enforced.** `bin/heimdall-conformance` reads the session
   transcript and fails `gate-runs-once` (two full-gate runs with no edit between them)
-  and `gates-at-end` (the first full-gate run must come AFTER real work). This section
+  and `gates-at-end` (the first full-gate run must come AFTER real work). It also fails
+  `sweep-staled-by-merge` (a green sweep, then a merge or commit of real work before
+  the push, then another sweep) and `sweeps-overlap` (two full-gate runs whose
+  start/end intervals overlap). This section
   is the human-readable statement of a rule the enforcer already checks — if the two
   ever disagree, the enforcer is authoritative and this text is the bug.
 

@@ -24,6 +24,9 @@ we sell. Read this before your first edit.
   final frozen tree, immediately before the landing commit — see CLAUDE.md "When the
   full gate runs". The break-it-and-watch-it-go-RED check above is a run on a
   different tree, not a repeat.
+- **Batch before you sweep.** Merge every pending agent result first, then run ONE
+  sweep; never merge anything between a green sweep and its push, and never start a
+  second sweep while one runs — see CLAUDE.md "When the full gate runs".
 - **Quality gates run before push** (`heimdall-state check-quality-gates`): tests
   green, lint clean, no untested changes.
 

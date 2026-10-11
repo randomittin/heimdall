@@ -39,6 +39,13 @@
 #                     2026-10-08: "test once, at the end" — one solo re-run (2
 #                     runs) is the allowance for a load-caused failure, the
 #                     third is waste.
+#   sweep-staled-by-merge  a full-gate run completed GREEN, then a merge/commit of
+#                     non-hook-owned work landed before the next push, then ANOTHER
+#                     full-gate run started: the first sweep was wasted by an unbatched
+#                     merge. Operator directive, 2026-10-11 ("batch before you sweep":
+#                     merge every pending agent result FIRST, then run ONE sweep).
+#   sweeps-overlap    two full-gate runs whose start/end intervals overlap — a second
+#                     sweep started while the first was still running.
 #
 # FAIL-CLOSED, ALWAYS
 # Repo rule: "gates must fail closed: an unreachable verifier is NON_VERIFIED,
@@ -195,11 +202,11 @@ EOF
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
-# THE SESSION TRANSCRIPT CLASSIFIER  (shared by checks 3, 4 and 5)
+# THE SESSION TRANSCRIPT CLASSIFIER  (shared by checks 3 to 7)
 # ═════════════════════════════════════════════════════════════════════════════
 # Ground truth for "what did this session actually do" is the Claude Code
 # transcript: ~/.claude/projects/<slug>/<session>.jsonl, one JSON object per
-# line. We classify three event kinds and ignore everything else:
+# line. We classify seven event kinds and ignore everything else:
 #
 #   GATE    a Bash tool_use whose command runs the FULL gate (test/run-all.sh
 #           with no --filter). A filtered run is a targeted re-run, not the
@@ -209,7 +216,25 @@ EOF
 #           The detail is the canonical `test/<name>.test.sh`, so every spelling
 #           of one suite (absolute path, ./, nohup/time/env wrappers) is a single
 #           identity. `test/run-all.sh` is GATE, never a suite.
-#   MUTATE  a Write/Edit/NotebookEdit tool_use — i.e. actual work.
+#   MUTATE  a Write/Edit/NotebookEdit tool_use — i.e. actual work. Its 4th column says
+#           whether the path is hook-owned (`hook`: under .planning/ or .heimdall/,
+#           written and committed by hooks) or real work (`work`).
+#   MERGE   a Bash `git merge|commit|cherry-pick|pull|rebase|am|revert` in command
+#           position — the integration that stales a green sweep. A `git commit` is
+#           spared when every `git add` in the SAME call stages only hook-owned paths.
+#   PUSH    a Bash `git push` (or `release/ship.sh`, which pushes): it closes the batch.
+#   RESULT  a tool_result (ts, tool_use id, ok|error, bg task id) — where a FOREGROUND run
+#           ends. An ack ("Command running in background with ID: x") names the task in
+#           the last column and is NOT an end; its run is a background run even when the
+#           call never set run_in_background (the harness auto-backgrounds long ones).
+#   NOTIFY  a background task's <task-notification> (ts, task id, tool_use id, ok|error;
+#           ok = status completed with no non-zero exit code) — where a BACKGROUND run
+#           ends. Newer harnesses name only the TASK in it, so the ack's task id is the
+#           join key. A TaskStop/KillShell call is a NOTIFY too (error): a stopped run
+#           is over.
+# GATE rows also carry the tool_use id, fg|bg, and whether the gate was the LAST command
+# of its call (1/0): RESULT/NOTIFY are joined to them by id, and the exit status can only
+# be read as the gate's own when nothing follows it in the call.
 #
 # Parsing is done entirely in jq. Shelling the command string out to grep would
 # reintroduce the /bin/sh echo-escape trap that test/gate-echo-parser-guard.sh
@@ -248,17 +273,74 @@ def suite_of:
   | sub("^([A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)+";"")
   | capture("^(?:(?:bash|sh|zsh)\\s+|(?:\\./)?)(?:\\S*/)?test/(?<name>[A-Za-z0-9._-]+)\\.test\\.sh(?:\\s|$|[<>&])")
   | "test/\(.name).test.sh";
-select(.type == "assistant") | .timestamp as $ts
-| .message.content[]? | select(.type == "tool_use")
-| if .name == "Bash" then
-    (.input.command // "") as $cmd
-    | (($cmd | segments | map(select(is_full_gate)))
-       | select(length > 0) | .[] | [$ts, "GATE", (.[0:100])]),
-      ($cmd | segments[] | suite_of | [$ts, "SUITE", .])
-  elif (.name == "Write" or .name == "Edit" or .name == "NotebookEdit") then
-    [$ts, "MUTATE", ((.input.file_path // "?") | tostring)]
-  else empty end
-| @tsv
+# `git [-C dir] <sub> <rest>` in command position -> {sub, rest, line}; nothing otherwise.
+def git_cmd:
+  . as $seg | unwrap | sub("^([A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)+";"")
+  | capture("^git(?:\\s+-[Cc]\\s+\\S+)*\\s+(?<sub>[a-z][a-z-]*)(?:\\s+(?<rest>.*))?$")
+  | .rest = (.rest // "") | .line = $seg;
+# Hooks write and commit these themselves (journal, state, receipts): never real work.
+def hook_path: test("(^|/)\\.(planning|heimdall)/");
+# Does EVERY `git add` in this call stage only hook-owned paths? (no `git add` at all: false)
+def call_hook_only($segs):
+  [$segs[] | git_cmd | select(.sub == "add") | .rest | [splits("\\s+")][]
+   | select(length > 0 and (startswith("-") | not))]
+  | length > 0 and all(hook_path);
+def git_row($ts; $hook_only):
+  git_cmd
+  | if .sub == "push" then
+      select(.rest | test("(^|\\s)(--dry-run|-n)(\\s|$)") | not)
+      | [$ts, "PUSH", .line[0:100]]
+    elif (.sub | IN("merge", "cherry-pick", "pull", "rebase", "am", "revert")) then
+      select(.rest | test("(^|\\s)--(abort|quit|dry-run)(\\s|$)") | not)
+      | [$ts, "MERGE", .line[0:100]]
+    elif .sub == "commit" then
+      select(.rest | test("(^|\\s)--dry-run(\\s|$)") | not)
+      | select(($hook_only and (.rest | test("(^|\\s)(-[a-zA-Z]*a[a-zA-Z]*|--all)(\\s|$)") | not)) | not)
+      | [$ts, "MERGE", .line[0:100]]
+    else empty end;
+# release/ship.sh pushes: it closes the batch exactly as `git push` does.
+def ship_row($ts):
+  select(unwrap | test("^((bash|sh|zsh)\\s+)?(\\./)?[^ ]*release/ship\\.sh(\\s|$)"))
+  | [$ts, "PUSH", .[0:100]];
+def assistant_rows:
+  select(.type == "assistant") | .timestamp as $ts
+  | .message.content[]? | select(.type == "tool_use")
+  | (.id // "") as $id
+  | (if (.input.run_in_background // false) == true then "bg" else "fg" end) as $mode
+  | if .name == "Bash" then
+      ((.input.command // "") | segments | map(select(length > 0))) as $segs
+      | call_hook_only($segs) as $hook_only
+      | ($segs | length) as $n
+      | ($segs | to_entries[]) as $e
+      | $e.value as $seg
+      | (($seg | select(is_full_gate)
+          | [$ts, "GATE", (.[0:100]), $id, $mode, (if $e.key == $n - 1 then "1" else "0" end)]),
+         ($seg | suite_of | [$ts, "SUITE", .]),
+         ($seg | git_row($ts; $hook_only)),
+         ($seg | ship_row($ts)))
+    elif (.name == "Write" or .name == "Edit" or .name == "NotebookEdit") then
+      ((.input.file_path // "?") | tostring) as $p
+      | [$ts, "MUTATE", $p, (if ($p | hook_path) then "hook" else "work" end)]
+    elif (.name == "TaskStop" or .name == "KillShell") then
+      [$ts, "NOTIFY", (.input.task_id // .input.shell_id // ""), "", "error"]
+    else empty end;
+def user_rows:
+  select(.type == "user") | .timestamp as $ts
+  | ((.message.content | arrays | .[] | select(type == "object" and .type == "tool_result")
+      | (if (.content | type) == "string" then .content
+         elif (.content | type) == "array" then ([.content[] | objects | .text? | strings] | join(""))
+         else "" end) as $body
+      | [$ts, "RESULT", (.tool_use_id // ""), (if .is_error == true then "error" else "ok" end),
+         (($body | capture("Command running in background with ID: (?<t>[A-Za-z0-9_-]+)") | .t) // "")]),
+     (((.message.content | strings),
+       (.message.content | arrays | .[] | select(type == "object" and .type == "text") | .text | strings))
+      | select(test("<task-notification>"))
+      | ((capture("<task-id>(?<t>[^<]+)</task-id>") | .t) // "") as $task
+      | ((capture("<tool-use-id>(?<u>[^<]+)</tool-use-id>") | .u) // "") as $use
+      | select($task != "" or $use != "")
+      | [$ts, "NOTIFY", $task, $use,
+         (if test("<status>completed</status>") and (test("exit code [1-9]") | not) then "ok" else "error" end)]));
+(assistant_rows, user_rows) | @tsv
 JQ
 }
 
@@ -314,17 +396,20 @@ _under_full_gate() {
 # Shared load: fills EV (the event stream) or exits 3.
 #   $1  event kinds that count as "something to inspect"    (default GATE|MUTATE)
 #   $2  how those kinds read in the NON_VERIFIED message    (default gate/edit)
+#   $3  event kinds kept in EV for the check to read    (default GATE|MUTATE|SUITE — all
+#       the older checks ever saw; the count above is taken BEFORE this filter)
 # A check is judged only on the kinds IT reads. The full-gate checks keep the
 # default so SUITE events they never look at cannot fill their anti-vacuous count:
 # a transcript of nothing but suite runs says nothing about gate discipline.
 EV=""
 _load_events() {
-  local kinds="${1:-GATE|MUTATE}" label="${2:-gate/edit}" t n
+  local kinds="${1:-GATE|MUTATE}" label="${2:-gate/edit}" keep="${3:-GATE|MUTATE|SUITE}" t n
   t="$(_resolve_transcript)"
   [ -n "$t" ] || nonverified "no session transcript found for $REPO (set HMD_CONF_TRANSCRIPT)"
   [ -r "$t" ] || nonverified "session transcript is unreadable: $t"
   EV="$(_events)" || nonverified "could not parse session transcript: $t"
   n="$(printf '%s\n' "$EV" | awk -F'\t' -v k="^($kinds)\$" '$2 ~ k { c++ } END { print c + 0 }')"
+  EV="$(printf '%s\n' "$EV" | awk -F'\t' -v k="^($keep)\$" '$2 ~ k')"
   # An empty classification is NOT a clean session. It means we learned nothing
   # about gate discipline from this transcript.
   [ "${n:-0}" -gt 0 ] || nonverified "session transcript yielded 0 $label events: $t"
@@ -461,6 +546,149 @@ EOF
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+# CHECK 6 — sweep-staled-by-merge
+# ═════════════════════════════════════════════════════════════════════════════
+# Operator directive (2026-10-11): "batch before you sweep". Collect every pending
+# agent result, merge them ALL, then run ONE sweep — never merge anything between a
+# green sweep and its push. Measured the same day: ~9 full sweeps of ~70 minutes,
+# because agent fixes were merged one at a time and every merge staled the last green
+# receipt.
+#
+# The pattern: a full-gate run COMPLETES GREEN -> a MERGE (git merge/commit/cherry-pick/
+# pull/rebase/am/revert, in command position) lands before any PUSH -> ANOTHER
+# full-gate run starts. The first sweep was spent for nothing.
+#
+# What does NOT count, so the check cannot cry wolf (a check that cries wolf gets muted):
+#   * a RED sweep. Fix, merge the fix, re-sweep is the sanctioned flow ("a failing suite
+#     gets fixed and the fix rides the next batch"). Green means the foreground
+#     tool_result is not an error, or the background task-notification says completed
+#     with no non-zero exit code; a run whose outcome is not on the record is not green.
+#   * a PUSH (git push, release/ship.sh): it closes the batch, so a later merge belongs
+#     to the next one.
+#   * hook-owned files. .planning/ and .heimdall/ are written and committed by hooks
+#     (journal, state, receipts): a commit whose every `git add` in the same call names
+#     only those, and a Write/Edit under them, never stale a sweep. A commit whose
+#     staged paths cannot be seen (no `git add` in the call, or `-a`) is treated as work.
+#   * a real Write/Edit after the merge: the edit independently required the new sweep,
+#     so the re-sweep is not blamed on the merge (the same reading as gate-runs-once).
+#
+# LIMIT, stated plainly: "green" is the exit status the harness reports for the CALL. When
+# the sweep is the last command of its call that is the gate's own status (green_exit=gate).
+# When commands follow it (`; echo "exit $?"; tail ...`) the status is theirs and can mask
+# a red sweep, so the violation says green_exit=call and wants a human glance before it is
+# believed. Run the sweep as the last command of its call for an exact verdict.
+#
+# Row order in the append-only transcript is the clock, so the verdict is arithmetic on
+# order and never parses a timestamp. A merge DURING a sweep is not examined here — only
+# merges that land after a sweep completed green.
+check_sweep_staled_by_merge() {
+  _load_events 'GATE|MUTATE' 'gate/edit' 'GATE|MUTATE|MERGE|PUSH|RESULT|NOTIFY'
+  local rows tag a b c gates=0 flagged=0
+  rows="$(printf '%s\n' "$EV" | awk -F'\t' '
+    function ts(x) { return x == "" ? "?" : x }
+    function gate_of(kind, a, b) {
+      if (kind == "RESULT") return (a in mode) ? a : ""
+      if (b != "" && (b in mode)) return b
+      return (a in task2gate) ? task2gate[a] : ""
+    }
+    function ends(kind, g) { return g != "" && ((kind == "RESULT" && mode[g] == "fg") || (kind == "NOTIFY" && mode[g] == "bg")) }
+    function reset() { green = 0; staled = 0 }
+    $2 == "GATE" {
+      gates++
+      if (green && staled) { printf "V\t%s\t%s\t%s\t%s\n", green_at, staled_at, ts($1), green_exit }
+      reset()
+      mode[$4] = $5; last[$4] = $6; started[$4] = ts($1)
+    }
+    $2 == "RESULT" && ($3 in mode) && $5 != "" { mode[$3] = "bg"; task2gate[$5] = $3 }
+    $2 == "RESULT" || $2 == "NOTIFY" {
+      g = gate_of($2, $3, $4); out = ($2 == "RESULT") ? $4 : $5
+      if (ends($2, g)) {
+        if (out == "ok") { green = 1; green_at = started[g]; green_exit = (last[g] == 1 ? "gate" : "call"); staled = 0 } else { reset() }
+      }
+    }
+    $2 == "MERGE" && green && !staled { staled = 1; staled_at = ts($1) }
+    $2 == "MUTATE" && $4 != "hook" { reset() }
+    $2 == "PUSH" { reset() }
+    END { printf "T\t%d\n", gates }
+  ')" || nonverified "sweep-staled-by-merge: could not read the sweep history (awk failed) — no verdict"
+  while IFS=$'\t' read -r tag a b c d; do
+    case "$tag" in
+      V) viol "a green sweep was staled by a merge/commit before the next sweep — merge every pending result FIRST, then sweep ONCE	green=$a	merge=$b	next_gate=$c	green_exit=$d"
+         flagged=$((flagged + 1)) ;;
+      T) gates="$a" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  _selfcheck_detector "$gates"
+  [ "$flagged" -gt 0 ] || okline "no green sweep was staled by a merge before the next sweep	gate_runs=$gates"
+  note "sweep-staled-by-merge saw $gates full-gate invocation(s)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 7 — sweeps-overlap
+# ═════════════════════════════════════════════════════════════════════════════
+# "Never start a second sweep while one runs." Two overlapping full-gate runs grade a
+# tree neither one owns and spend two half hours on one verdict — measured 2026-10-11,
+# when two sweeps ran at once.
+#
+# Each run is an interval read from the transcript. It STARTS at its tool_use; it ENDS
+# at its tool_result when it ran in the foreground and at its task-notification when it
+# ran in the background — the immediate "Command running in background" tool_result is
+# only an ack and is NOT the end. Row order is the clock, so two runs overlap when the
+# second STARTS before the first has ENDED; that also catches two foreground runs issued
+# in ONE message (both tool_uses precede both results).
+#
+# A background run that never reported back is still running as far as the record shows,
+# so a sweep started after it overlaps it (first_ended=never). A FOREGROUND run with no
+# recorded result cannot be judged and is never an accusation: the harness always returns
+# a foreground tool_result, so its absence means the record is cut, not that the run was
+# still going.
+check_sweeps_overlap() {
+  _load_events 'GATE|MUTATE' 'gate/edit' 'GATE|RESULT|NOTIFY'
+  local rows tag a b c gates=0 flagged=0
+  rows="$(printf '%s\n' "$EV" | awk -F'\t' '
+    function ts(x) { return x == "" ? "?" : x }
+    function gate_of(kind, a, b) {
+      if (kind == "RESULT") return (a in id2n) ? id2n[a] : 0
+      if (b != "" && (b in id2n)) return id2n[b]
+      return (a in task2n) ? task2n[a] : 0
+    }
+    function ends(kind, n) { return n > 0 && ((kind == "RESULT" && mode[n] == "fg") || (kind == "NOTIFY" && mode[n] == "bg")) }
+    $2 == "GATE" {
+      gates++
+      for (j = 1; j < gates; j++) if (!ended[j] && !reported[j]) { cand++; cj[cand] = j; ck[cand] = gates; reported[j] = 1 }
+      id2n[$4] = gates; mode[gates] = $5; st[gates] = ts($1)
+    }
+    $2 == "RESULT" && ($3 in id2n) && $5 != "" { mode[id2n[$3]] = "bg"; task2n[$5] = id2n[$3] }
+    $2 == "RESULT" || $2 == "NOTIFY" {
+      n = gate_of($2, $3, $4)
+      if (ends($2, n) && !ended[n]) { ended[n] = 1; en[n] = ts($1) }
+    }
+    END {
+      for (i = 1; i <= cand; i++) {
+        j = cj[i]; k = ck[i]
+        if (mode[j] == "fg" && !ended[j]) continue
+        printf "V\t%s\t%s\t%s\n", st[j], st[k], (ended[j] ? en[j] : "never")
+      }
+      printf "T\t%d\n", gates
+    }
+  ')" || nonverified "sweeps-overlap: could not read the sweep history (awk failed) — no verdict"
+  while IFS=$'\t' read -r tag a b c; do
+    case "$tag" in
+      V) viol "a second full-gate run started while the first was still running — never start a sweep while one runs	first=$a	second=$b	first_ended=$c"
+         flagged=$((flagged + 1)) ;;
+      T) gates="$a" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  _selfcheck_detector "$gates"
+  [ "$flagged" -gt 0 ] || okline "no two full-gate runs overlapped	gate_runs=$gates"
+  note "sweeps-overlap saw $gates full-gate invocation(s)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
 # inventory — THE HONESTY LINE
 # ═════════════════════════════════════════════════════════════════════════════
 # See bin/lib/rule-inventory.sh for the extractor and the classification rules.
@@ -477,7 +705,9 @@ checks
   gate-runs-once    two full-gate runs with no edit between them
   gates-at-end      a full-gate run before any work in the session
   suite-runs-once   one suite run 3+ times with no edit between (one solo re-run is allowed)
-  all               all five, aggregated
+  sweep-staled-by-merge  a green full-gate run, a merge/commit of real work before the next push, then another full-gate run
+  sweeps-overlap    a second full-gate run started while the first was still running
+  all               all seven, aggregated
 
 inventory
   inventory         print every normative rule with a CHECKED/UNCHECKABLE verdict
@@ -496,12 +726,16 @@ main() {
     gate-runs-once)  check_gate_runs_once ;;
     gates-at-end)    check_gates_at_end ;;
     suite-runs-once) check_suite_runs_once ;;
+    sweep-staled-by-merge) check_sweep_staled_by_merge ;;
+    sweeps-overlap)  check_sweeps_overlap ;;
     all)
       check_commit_per_unit
       check_brief_routing
       check_gate_runs_once
       check_gates_at_end
       check_suite_runs_once
+      check_sweep_staled_by_merge
+      check_sweeps_overlap
       ;;
     inventory)       shift; rule_inventory "$@"; return $? ;;
     ''|-h|--help)    usage ;;
