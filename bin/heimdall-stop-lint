@@ -18,8 +18,15 @@
 #
 # WHAT IT DOES
 # ------------
-#   1. `edit-tracker paths` → keep the ones that still exist as regular files.
-#      Nothing edited → exit 0, print nothing.
+#   1. `edit-tracker paths` → keep the ones that still exist as regular files
+#      AND live inside --repo. Dropped: anything outside the repo (the Claude
+#      scratchpad under $TMPDIR, /private/tmp/claude-*, another checkout, a
+#      `..` escape) and, relative to the repo root, `.claude/worktrees/` (stale
+#      agent worktrees), `.heimdall/` (generated hooks) and any `node_modules/`.
+#      The test is repo-relative, never an absolute-path pattern, so a session
+#      whose repo IS a worktree still lints its own files. The receipt's
+#      `excluded` counts what was dropped.
+#      Nothing edited (or everything excluded) → exit 0, print nothing.
 #   2. Group by language on extension: shell (.sh/.bash), python (.py),
 #      js/ts (.js/.jsx/.mjs/.cjs/.ts/.tsx).
 #   3. Detect what the REPO already uses; never install anything:
@@ -33,7 +40,11 @@
 #                eslint if an eslint config is present and node_modules/.bin/
 #                       eslint (or PATH eslint) exists; package.json
 #                       scripts.lint naming "eslint"/"biome" is an accepted
-#                       hint when the config file lives elsewhere
+#                       hint when the config file lives elsewhere. Runs
+#                       `eslint --no-fix -f json -o <tmp> <file>`: json is core
+#                       in ESLint 8 AND 9 (the unix formatter is gone in 9) and
+#                       --output-file keeps Node's stderr noise out of the
+#                       report. See ESLINT: FINDING vs TOOL ERROR below.
 #                tsc    if tsconfig.json present and node_modules/.bin/tsc (or
 #                       PATH tsc) exists — runs ONCE, project-wide, `--noEmit`;
 #                       only diagnostics naming an edited file are counted
@@ -45,10 +56,12 @@
 #        .quality_gates.lint_clean      true  ⇔ every file checked, 0 findings
 #                                       false ⇔ any finding
 #                                       UNCHANGED when the run was incomplete
-#                                       (budget exhausted or a checker timed
-#                                       out) with no finding yet
+#                                       (budget exhausted, a checker timed
+#                                       out, or a checker failed to run) with
+#                                       no finding yet
 #        .quality_gates.lint_last_run   {at, files, checked, findings, tools,
-#                                        complete, timeouts, skipped, source,
+#                                        complete, timeouts, tool_errors,
+#                                        skipped, excluded, source,
 #                                        + the shellcheck_severity in force}
 #                                        — the receipt. Additive
 #                                        key; `set` creates it, nothing in the
@@ -71,6 +84,26 @@
 # The existing info/style notes in the repo's own scripts are NOT cleaned up
 # here; that is deferred work, and `HMD_STOP_LINT_SEVERITY=info` is how to see
 # them.
+#
+# ESLINT: FINDING vs TOOL ERROR
+# -----------------------------
+# ESLint exits 0 (no errors), 1 (lint errors) or 2 (config error / crash). This
+# tool used to read every non-zero exit as "N findings" through `-f unix`,
+# which ESLint 9 removed: every call exited 2 and was counted as a finding, so
+# a repo whose `eslint .` was clean read lint_clean=false and the push gate
+# blocked. Now a non-zero exit is a FINDING only when it is exit 1 AND ESLint
+# left a parseable JSON report with at least one problem (the report existing
+# is what proves ESLint finished linting). Anything else (exit 2, a crash with
+# no report, a missing binary or interpreter = exit 127) is a TOOL ERROR:
+#   * reported loudly, per file, with ESLint's own diagnostics
+#   * counted in the receipt's tool_errors, never in findings
+#   * the run is marked complete=false
+#   * lint_clean is LEFT EXACTLY AS IT WAS (a real finding from another checker
+#     in the same run still turns it false). A tool that could not run is no
+#     evidence of a problem (red would repeat the phantom-findings bug) and no
+#     evidence of cleanliness (green would be a hand flip with extra steps):
+#     the same non-verdict a timed-out checker already is.
+# The other checkers keep their existing reading of a non-zero exit.
 #
 # ADVISORY, FAIL OPEN, ALWAYS EXIT 0
 # ----------------------------------
@@ -153,6 +186,22 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 [ -z "$TRACKER" ] && TRACKER="$HERE/edit-tracker"
 STATE_TOOL="$HERE/heimdall-state"
 
+# repo_relpath <abs-file> → prints the path relative to $REPO and returns 0 when
+# the file is a lint target of THIS repo; returns 1 otherwise. The directory is
+# resolved physically first (pwd -P), so a `..` escape, a symlinked spelling
+# (macOS /var → /private/var) or a symlinked directory pointing outside cannot
+# pass the prefix test. The exclusions are anchored at the repo root on purpose:
+# an absolute "*/.claude/worktrees/*" pattern would also drop every file of a
+# session whose repo IS a worktree.
+repo_relpath() {
+  local p="$1" dir rp
+  dir="$(cd "${p%/*}/" 2>/dev/null && pwd -P)" || return 1
+  p="$dir/${p##*/}"
+  case "$p" in "$REPO"/*) rp="${p#"$REPO"/}" ;; *) return 1 ;; esac
+  case "/$rp" in /.claude/worktrees/*|/.heimdall/*|*/node_modules/*) return 1 ;; esac
+  printf '%s' "$rp"
+}
+
 TAG="[heimdall] stop-lint:"
 say() { [ "$QUIET" -eq 1 ] && return 0; printf '%s %s\n' "$TAG" "$*" >&2; }
 
@@ -160,11 +209,12 @@ say() { [ "$QUIET" -eq 1 ] && return 0; printf '%s %s\n' "$TAG" "$*" >&2; }
 [ -x "$TRACKER" ] || exit 0
 
 FILES=()
+EXCLUDED=0
 while IFS= read -r p; do
   [ -n "$p" ] || continue
   case "$p" in /*) ;; *) p="$REPO/$p" ;; esac
   [ -f "$p" ] || continue
-  FILES+=("$p")
+  if rp="$(repo_relpath "$p")"; then FILES+=("$REPO/$rp"); else EXCLUDED=$((EXCLUDED + 1)); fi
 done < <("$TRACKER" paths 2>/dev/null || true)
 
 [ "${#FILES[@]}" -gt 0 ] || exit 0
@@ -205,8 +255,11 @@ remaining() { local now; now=$(date +%s); echo $(( BUDGET - (now - START_TS) ));
 RUN_RC=0
 RUN_TIMEOUT=0
 TIMEOUTS=0
+TOOL_ERRORS=0
 RUN_OUT="$(mktemp "${TMPDIR:-/tmp}/hmd-stop-lint.XXXXXX" 2>/dev/null || echo /dev/null)"
-trap 'rm -f "$RUN_OUT"' EXIT
+# ESLint's --output-file target (see ESLINT: FINDING vs TOOL ERROR in the header)
+ESLINT_JSON="$(mktemp "${TMPDIR:-/tmp}/hmd-stop-lint-eslint.XXXXXX" 2>/dev/null || echo /dev/null)"
+trap 'rm -f "$RUN_OUT" "$ESLINT_JSON"' EXIT
 run_bounded() {
   local rem cap
   rem=$(remaining)
@@ -246,6 +299,19 @@ run_in_repo() {
   cd "$prev" 2>/dev/null || true
 }
 tool_out() { cat "$RUN_OUT" 2>/dev/null; }
+
+# ESLint's `-f json` report, read from the --output-file target. A report that
+# exists and parses as an array proves ESLint FINISHED a lint run (a crash or a
+# config error never writes one). eslint_problems prints the problem count and
+# fails when there is no usable report; eslint_lines lists the problems in the
+# `path:line:col: message [Severity/rule]` shape the unix formatter had.
+eslint_problems() {
+  [ -s "$ESLINT_JSON" ] || return 1
+  jq -e 'if type == "array" then [.[].messages | length] | add // 0 else empty end' "$ESLINT_JSON" 2>/dev/null
+}
+eslint_lines() {
+  jq -r '.[] | .filePath as $f | .messages[] | "\($f):\(.line // 0):\(.column // 0): \(.message) [\(if .severity == 2 then "Error" else "Warning" end)/\(.ruleId // "parse")]"' "$ESLINT_JSON" 2>/dev/null
+}
 
 # node tool resolution: repo-local first, PATH second, never npx-install
 node_bin() {
@@ -385,11 +451,16 @@ if [ "${#JS_FILES[@]}" -gt 0 ]; then
         else fcount=$((fcount + 1)); parts+=("biome FAIL"); detail="$out"; fi
       fi
       if [ -n "$ESLINT" ] && budget_left; then
-        run_in_repo "$ESLINT" --no-fix -f unix "$f"; out="$(tool_out)"; add_tool eslint
+        : > "$ESLINT_JSON"  # the previous file's report must never be read as this one's
+        run_in_repo "$ESLINT" --no-fix -f json -o "$ESLINT_JSON" "$f"; out="$(tool_out)"; add_tool eslint
         if [ "$RUN_RC" -eq 0 ]; then parts+=("eslint ok")
         elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("eslint timed out")
-        else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
-          fcount=$((fcount + n)); parts+=("eslint $n"); detail="${detail}${detail:+$'\n'}$out"; fi
+        elif [ "$RUN_RC" -eq 1 ] && n="$(eslint_problems)" && [ "$n" -gt 0 ]; then
+          fcount=$((fcount + n)); parts+=("eslint $n"); detail="${detail}${detail:+$'\n'}$(eslint_lines)"
+        else
+          TOOL_ERRORS=$((TOOL_ERRORS + 1)); parts+=("eslint tool error (exit $RUN_RC)")
+          detail="${detail}${detail:+$'\n'}${out:-ESLint exited $RUN_RC without a readable JSON report}"
+        fi
       fi
       if [ -n "$TSC" ] && [ -n "$TSC_OUT" ]; then
         rf="$(rel "$f")"
@@ -413,11 +484,15 @@ fi
 COMPLETE=true
 [ "$SKIPPED_BUDGET" -gt 0 ] && COMPLETE=false
 [ "$TIMEOUTS" -gt 0 ] && COMPLETE=false
+[ "$TOOL_ERRORS" -gt 0 ] && COMPLETE=false
 
 if [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ]; then
-  verdict="clean"; [ "$FINDINGS" -gt 0 ] && verdict="$FINDINGS finding(s)"
+  verdict="clean"
+  if [ "$FINDINGS" -gt 0 ]; then verdict="$FINDINGS finding(s)"
+  elif [ "$TOOL_ERRORS" -gt 0 ]; then verdict="no findings"; fi
   extra=""; [ "$SKIPPED_BUDGET" -gt 0 ] && extra=", $SKIPPED_BUDGET skipped (budget ${BUDGET}s exhausted)"
   [ "$TIMEOUTS" -gt 0 ] && extra="$extra, $TIMEOUTS checker call(s) timed out (per-call cap ${PER_CALL}s) — verdict incomplete"
+  [ "$TOOL_ERRORS" -gt 0 ] && extra="$extra, $TOOL_ERRORS checker call(s) failed to run (tool error, not lint findings) — verdict incomplete, lint_clean not moved by them"
   say "$CHECKED file(s) checked, $verdict$extra"
 fi
 
@@ -439,9 +514,11 @@ if [ -n "$STATE" ] && [ -f "$STATE" ] && [ -x "$STATE_TOOL" ] && command -v jq >
     --argjson tools "$tools_json" \
     --argjson complete "$COMPLETE" \
     --argjson timeouts "$TIMEOUTS" \
+    --argjson tool_errors "$TOOL_ERRORS" \
     --argjson skipped "$SKIPPED_BUDGET" \
+    --argjson excluded "$EXCLUDED" \
     --arg shellcheck_severity "$SEVERITY" \
-    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, skipped:$skipped, shellcheck_severity:$shellcheck_severity, source:"heimdall-stop-lint"}')"
+    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, tool_errors:$tool_errors, skipped:$skipped, excluded:$excluded, shellcheck_severity:$shellcheck_severity, source:"heimdall-stop-lint"}')"
   # Never let a state-tool hiccup (lock contention, malformed file) escape.
   HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_last_run' "$receipt" >/dev/null 2>&1 || true
   if [ "$FINDINGS" -gt 0 ]; then

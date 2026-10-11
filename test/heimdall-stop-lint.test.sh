@@ -24,6 +24,18 @@
 #      (independent of the installed version); 17-19 prove the verdicts end to
 #      end with the real shellcheck, and say so loudly when it is not usable;
 #      20 checks the tool and this suite pass the gate they implement.
+#   7. ESLINT 9 + TOOL ERRORS. `eslint -f unix` (the unix formatter was removed
+#      in ESLint 9) exits 2 for every file, and the tool counted each of those
+#      as a lint finding, so a repo whose `eslint .` was clean read
+#      lint_clean=false and the push gate blocked. The tool now reads `-f json`
+#      (core in 8 and 9) from --output-file, and an eslint that fails to RUN
+#      (config error, crash, missing interpreter) is a TOOL ERROR: reported
+#      loudly, counted in the receipt's tool_errors, the run marked incomplete,
+#      lint_clean left exactly as it was. Cases 21-23 use a fake ESLint 9.
+#   8. SCOPE. Only files inside --repo are lint targets: `.claude/worktrees/`,
+#      `.heimdall/`, `node_modules/` and anything outside the repo (a Claude
+#      scratchpad, another checkout, a `..` escape) are excluded, and a session
+#      whose repo IS a worktree still lints its own files. Cases 24-26.
 #
 # ISOLATION: edit-tracker keys its ledger on $TMPDIR/heimdall-edits/
 # $CLAUDE_CODE_SESSION_ID.log. Every case here sets TMPDIR to a private temp
@@ -406,6 +418,172 @@ if command -v shellcheck >/dev/null 2>&1; then
   fi
 else
   echo "  SKIP 20: shellcheck not on PATH, so the self-hosting check did not run"
+fi
+
+# ── 21-23. ESLint 9, and an eslint that cannot run is not a finding ──────────
+# A fake ESLint 9 stands in for the real one: `json` is a core formatter, `unix`
+# is not (it exits 2, as the real one does). It also writes Node's usual
+# module-type warning to stderr on every run, so the tool must read the report
+# from --output-file rather than from a stdout+stderr stream such noise corrupts.
+
+# mk_fake_eslint <case-dir> [shebang] → fakebin/eslint, argv in fakebin/argv.log.
+# FAKE_ESLINT_MODE is read at run time: clean (default) | findings | cfgerr | crash
+mk_fake_eslint() {
+  mkdir -p "$1/fakebin"
+  printf '%s\n' "${2:-#!/bin/sh}" > "$1/fakebin/eslint"
+  cat >> "$1/fakebin/eslint" <<'EOF'
+printf '%s\n' "$*" >> "$(dirname "$0")/argv.log"
+fmt=""; out=""; file=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f) fmt="$2"; shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    -*) shift ;;
+    *)  file="$1"; shift ;;
+  esac
+done
+[ "${FAKE_ESLINT_MODE:-clean}" = silent ] && exit 1
+echo "(node:1) Warning: Module type of file:///eslint.config.js is not specified" >&2
+case "${FAKE_ESLINT_MODE:-clean}" in
+  cfgerr) printf 'Oops! Something went wrong! :(\nESLint could not find an eslint.config file.\n' >&2; exit 2 ;;
+  crash)  printf "TypeError: Cannot read properties of undefined (reading 'rules')\n" >&2; exit 1 ;;
+esac
+if [ "$fmt" != json ]; then
+  printf 'Oops! Something went wrong! :(\nThe %s formatter is no longer part of core ESLint.\n' "$fmt" >&2
+  exit 2
+fi
+if [ "${FAKE_ESLINT_MODE:-clean}" = findings ]; then
+  report=$(printf '[{"filePath":"%s","messages":[{"ruleId":"no-undef","severity":2,"message":"x is not defined","line":1,"column":1},{"ruleId":"no-unused-vars","severity":1,"message":"y is never used","line":2,"column":5}],"errorCount":1,"warningCount":1}]' "$file")
+  rc=1
+else
+  report=$(printf '[{"filePath":"%s","messages":[],"errorCount":0,"warningCount":0}]' "$file")
+  rc=0
+fi
+if [ -n "$out" ]; then printf '%s\n' "$report" > "$out"; else printf '%s\n' "$report"; fi
+exit "$rc"
+EOF
+  chmod +x "$1/fakebin/eslint"
+  : > "$1/fakebin/argv.log"
+}
+
+# mk_js_case <name> [shebang] → a case with an eslint config, the fake eslint
+# and a tracked a.js
+mk_js_case() {
+  local d; d="$(mk_case "$1")"
+  printf 'export default [];\n' > "$d/repo/eslint.config.js"
+  printf 'const a = 1;\nconsole.log(a);\n' > "$d/repo/a.js"
+  mk_fake_eslint "$d" "${2:-}"
+  track "$d" "$d/repo/a.js"
+  printf '%s' "$d"
+}
+
+D="$(mk_js_case eslintclean)"
+rc="$(PATH="$D/fakebin:$PATH" run_lint "$D")"
+err="$(cat "$TMPROOT/err")"
+if [ "$rc" = "0" ] && grep -q 'eslint ok' <<<"$err" && grep -q '1 file(s) checked, clean' <<<"$err" \
+   && [ "$(lint_clean "$D")" = "true" ] \
+   && grep -q -- '-f json' "$D/fakebin/argv.log" && ! grep -q -- '-f unix' "$D/fakebin/argv.log"; then
+  ok "21. ESLint 9 (no unix formatter): asks for -f json, clean file → 'eslint ok', lint_clean=true"
+else
+  bad "21. ESLint 9 clean file misreported (rc=$rc lint_clean=$(lint_clean "$D")): argv=[$(head -1 "$D/fakebin/argv.log")] $err"
+fi
+
+D="$(mk_js_case eslintfind)"
+S="$D/repo/heimdall-state.json"
+HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+rc="$(FAKE_ESLINT_MODE=findings PATH="$D/fakebin:$PATH" run_lint "$D")"
+err="$(cat "$TMPROOT/err")"
+if [ "$rc" = "0" ] && grep -q 'eslint 2' <<<"$err" && grep -q 'no-undef' <<<"$err" \
+   && [ "$(lint_clean "$D")" = "false" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" = "2" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" = "0" ]; then
+  ok "22. ESLint 9 problems are counted from the JSON report (2) and listed, lint_clean flips false"
+else
+  bad "22. ESLint 9 findings misreported (rc=$rc lint_clean=$(lint_clean "$D")): $err"
+fi
+
+# 23. Four ways eslint fails to RUN: a config error (exit 2), a crash (exit 1
+# with no report), a crash that says nothing at all (exit 1, no report, no
+# output: the tool must still be loud), a missing interpreter (exit 127). None
+# is a lint finding, and
+# none may move lint_clean: green would be evidence nobody produced, red would
+# be the phantom findings this replaces, so it is left as it was, in BOTH states.
+for variant in cfgerr crash silent nointerp; do
+  shebang=""; mode="$variant"; want_text="Oops! Something went wrong"
+  [ "$variant" = crash ] && want_text="TypeError"
+  [ "$variant" = silent ] && want_text="ESLint exited 1 without a readable JSON report"
+  if [ "$variant" = nointerp ]; then
+    shebang="#!/usr/bin/env hmd_no_such_node"; mode=clean; want_text="No such file or directory"
+  fi
+  why=""
+  for arm in true false; do
+    D="$(mk_js_case "eslinterr-$variant-$arm" "$shebang")"
+    S="$D/repo/heimdall-state.json"
+    HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' "$arm" >/dev/null
+    rc="$(FAKE_ESLINT_MODE="$mode" PATH="$D/fakebin:$PATH" run_lint "$D")"
+    err="$(cat "$TMPROOT/err")"
+    if [ "$rc" != "0" ] || ! grep -q 'eslint tool error' <<<"$err" || grep -q 'eslint [0-9]' <<<"$err" \
+       || grep -q 'finding(s)' <<<"$err" || ! grep -q "$want_text" <<<"$err" \
+       || [ "$(lint_clean "$D")" != "$arm" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
+      why="$why [armed=$arm rc=$rc lint_clean=$(lint_clean "$D") receipt=$(jq -c '.quality_gates.lint_last_run' "$S") stderr: $err]"
+    fi
+  done
+  if [ -z "$why" ]; then
+    ok "23. eslint $variant → loud tool error with its own diagnostics, no findings, run incomplete, lint_clean left as armed (true and false)"
+  else
+    bad "23. eslint $variant mishandled:$why"
+  fi
+done
+
+# ── 24-26. only the session's repo is linted ───────────────────────────────
+# Stale agent worktrees (.claude/worktrees/*), the Claude scratchpad under
+# $TMPDIR, node_modules, .heimdall/ and a `..` escape all sit in the edit
+# ledger, none is part of what gets pushed, and linting them burned the budget.
+D="$(mk_case scope)"
+R="$D/repo"
+S="$R/heimdall-state.json"
+mkdir -p "$R/.claude/worktrees/agent-x" "$R/node_modules/pkg" "$R/.heimdall/hooks" "$D/tmp/scratchpad" "$D/outside"
+for f in "$R/.claude/worktrees/agent-x/broken.sh" "$R/node_modules/pkg/broken.sh" \
+         "$R/.heimdall/hooks/broken.sh" "$D/tmp/scratchpad/broken.sh" "$D/outside/broken.sh"; do
+  printf '#!/usr/bin/env bash\nif [ 1 -eq 1 ]; then\n  echo unterminated\n' > "$f"
+done
+track "$D" "$R/.claude/worktrees/agent-x/broken.sh" "$R/node_modules/pkg/broken.sh" \
+  "$R/.heimdall/hooks/broken.sh" "$D/tmp/scratchpad/broken.sh" "$R/../outside/broken.sh"
+HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+before="$(cat "$S")"
+rc="$(run_lint "$D")"
+after="$(cat "$S")"
+if [ "$rc" = "0" ] && [ ! -s "$TMPROOT/err" ] && [ ! -s "$TMPROOT/out" ] && [ "$before" = "$after" ]; then
+  ok "24. broken files only under worktrees/node_modules/.heimdall/scratchpad/outside the repo → silent, state untouched"
+else
+  bad "24. out-of-repo paths were linted or recorded (rc=$rc lint_clean=$(lint_clean "$D")): $(cat "$TMPROOT/err")"
+fi
+
+printf '#!/usr/bin/env bash\nset -u\necho "ok"\n' > "$R/good.sh"
+track "$D" "$R/good.sh"
+rc="$(PATH="$(dirname "$(command -v bash)"):$(dirname "$(command -v python3)"):$(dirname "$(command -v jq)"):/usr/bin:/bin" run_lint "$D")"
+err="$(cat "$TMPROOT/err")"
+if [ "$rc" = "0" ] && grep -q '1 file(s) checked, clean' <<<"$err" && ! grep -q 'broken.sh' <<<"$err" \
+   && [ "$(lint_clean "$D")" = "true" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run.files' "$S")" = "1" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run.excluded' "$S")" = "5" ]; then
+  ok "25. next to the 5 excluded paths, the in-repo file is still linted; receipt files=1 excluded=5"
+else
+  bad "25. in-repo file not isolated from excluded paths (rc=$rc lint_clean=$(lint_clean "$D")): $err receipt=$(jq -c '.quality_gates.lint_last_run' "$S")"
+fi
+
+D="$TMPROOT/wtself"; W="$D/main/.claude/worktrees/agent-1"
+mkdir -p "$W" "$D/tmp"
+printf '#!/usr/bin/env bash\nif [ 1 -eq 1 ]; then\n  echo unterminated\n' > "$W/broken.sh"
+track "$D" "$W/broken.sh"
+TMPDIR="$D/tmp" CLAUDE_CODE_SESSION_ID="stoplint-wtself" "$LINT" --repo "$W" 2>"$TMPROOT/err" >"$TMPROOT/out"; rc=$?
+if [ "$rc" = "0" ] && grep -q 'bash -n FAIL' "$TMPROOT/err"; then
+  ok "26. a session whose repo IS a worktree still lints its own files (exclusion is repo-relative)"
+else
+  bad "26. repo-inside-worktree files were skipped (rc=$rc): $(cat "$TMPROOT/err")"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
