@@ -1,6 +1,6 @@
 {
   "name": "runhmd",
-  "version": "2.4.4",
+  "version": "2.4.5",
   "description": "Front door to hmd: `npx runhmd <path>` runs `hmd attack <path>`, any other hmd subcommand passes through. Installs the pinned, sha256-verified hmd first when it is missing or too old. Nothing ships unproven.",
   "bin": {
     "runhmd": "bin/runhmd.js"
@@ -37,9 +37,9 @@
   "license": "MIT",
   "author": "Heimdall",
   "heimdall": {
-    "tag": "v2.4.4",
-    "installScriptUrl": "https://raw.githubusercontent.com/randomittin/heimdall/v2.4.4/install.sh",
-    "sha256": "226cc1a3679023297c8cd47860e2a3a207953b21c9a1b6aeb9c67c0f9db75d2b",
+    "tag": "v2.4.5",
+    "installScriptUrl": "https://raw.githubusercontent.com/randomittin/heimdall/v2.4.5/install.sh",
+    "sha256": "37c250d638bdf3666d32f10483ae8c8308c57a96a56bb8e49b4c122dc3923191",
     "defaultCommand": "attack"
   }
 }
