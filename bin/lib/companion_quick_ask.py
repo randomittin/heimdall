@@ -416,11 +416,11 @@ def _save_stamps(root, stamps):
 
 
 def _finish(root, rid, text, tiles, detail):
+    _audit(root, text is not None, detail)    # before the row shows as ended: whoever reads `done` finds its `answer` line already audited
     with _LOCK:
         for row in _RESULTS.get(root, []):
             if row["rid"] == rid and row["phase"] == "working":
                 row.update(phase="done" if text is not None else "failed", answer=text, tiles=list(tiles), detail=detail, at=int(time.time()))
-    _audit(root, text is not None, detail)
     _changed(root)
 
 
