@@ -18,22 +18,34 @@
 #
 # WHAT IT DOES
 # ------------
-#   1. `edit-tracker paths` → keep the ones that still exist as regular files.
-#      Nothing edited → exit 0, print nothing.
+#   1. `edit-tracker paths` → keep the ones that still exist as regular files
+#      AND live inside --repo. Dropped: anything outside the repo (the Claude
+#      scratchpad under $TMPDIR, /private/tmp/claude-*, another checkout, a
+#      `..` escape) and, relative to the repo root, `.claude/worktrees/` (stale
+#      agent worktrees), `.heimdall/` (generated hooks) and any `node_modules/`.
+#      The test is repo-relative, never an absolute-path pattern, so a session
+#      whose repo IS a worktree still lints its own files. The receipt's
+#      `excluded` counts what was dropped.
+#      Nothing edited (or everything excluded) → exit 0, print nothing.
 #   2. Group by language on extension: shell (.sh/.bash), python (.py),
 #      js/ts (.js/.jsx/.mjs/.cjs/.ts/.tsx).
 #   3. Detect what the REPO already uses; never install anything:
-#        shell   bash -n (always)  +  shellcheck -S <severity> if on PATH
-#                (default severity warning; see WHAT COUNTS AS A SHELLCHECK
-#                FINDING below)
-#        python  python3 -c ast.parse (always)  +  ruff if on PATH AND the repo
-#                carries ruff.toml / .ruff.toml / pyproject.toml
-#        js/ts   biome  if biome.json(c) present and node_modules/.bin/biome
-#                       (or PATH biome) exists
+#        shell   bash -n (always)  +  shellcheck -S <severity> -f json if on
+#                PATH (default severity warning; see WHAT COUNTS AS A
+#                SHELLCHECK FINDING below)
+#        python  python3 -c ast.parse (always)  +  ruff check --output-format
+#                json if on PATH AND the repo carries ruff.toml / .ruff.toml /
+#                pyproject.toml
+#        js/ts   biome lint --reporter=json  if biome.json(c) present and
+#                       node_modules/.bin/biome (or PATH biome) exists
 #                eslint if an eslint config is present and node_modules/.bin/
 #                       eslint (or PATH eslint) exists; package.json
 #                       scripts.lint naming "eslint"/"biome" is an accepted
-#                       hint when the config file lives elsewhere
+#                       hint when the config file lives elsewhere. Runs
+#                       `eslint --no-fix -f json -o <tmp> <file>`: json is core
+#                       in ESLint 8 AND 9 (the unix formatter is gone in 9) and
+#                       --output-file keeps Node's stderr noise out of the
+#                       report. See ESLINT: FINDING vs TOOL ERROR below.
 #                tsc    if tsconfig.json present and node_modules/.bin/tsc (or
 #                       PATH tsc) exists — runs ONCE, project-wide, `--noEmit`;
 #                       only diagnostics naming an edited file are counted
@@ -45,10 +57,12 @@
 #        .quality_gates.lint_clean      true  ⇔ every file checked, 0 findings
 #                                       false ⇔ any finding
 #                                       UNCHANGED when the run was incomplete
-#                                       (budget exhausted or a checker timed
-#                                       out) with no finding yet
+#                                       (budget exhausted, a checker timed
+#                                       out, or a checker failed to run) with
+#                                       no finding yet
 #        .quality_gates.lint_last_run   {at, files, checked, findings, tools,
-#                                        complete, timeouts, skipped, source,
+#                                        complete, timeouts, tool_errors,
+#                                        skipped, excluded, source,
 #                                        + the shellcheck_severity in force}
 #                                        — the receipt. Additive
 #                                        key; `set` creates it, nothing in the
@@ -71,6 +85,43 @@
 # The existing info/style notes in the repo's own scripts are NOT cleaned up
 # here; that is deferred work, and `HMD_STOP_LINT_SEVERITY=info` is how to see
 # them.
+#
+# FINDING vs TOOL ERROR (every checker)
+# -------------------------------------
+# A non-zero exit is not a finding. ESLint exits 0 (clean), 1 (lint errors) or 2
+# (config error / crash), and this tool used to read every non-zero exit as "N
+# findings" through `-f unix`, which ESLint 9 removed: every call exited 2 and
+# was counted as a finding, so a repo whose `eslint .` was clean read
+# lint_clean=false and the push gate blocked. The other checkers had the same
+# flaw, and their exit codes do not even agree on what non-zero means: the
+# ShellCheck exit 1 is findings, 2 is a file it could not process, 3 and 4 are a
+# bad flag or format; ruff 1 is findings, 2 a config error or bad flag, 101 a
+# panic (a file it cannot read is an E902 entry in its report, not a lint
+# problem); Biome exits 1 for findings AND for a config error.
+# So every JSON checker (eslint -f json -o <tmp>, shellcheck -f json, ruff
+# --output-format json, biome --reporter=json) is read the same way: exit 0 is
+# clean, a timeout is its own non-verdict, and any other exit is a FINDING only
+# when it is exit 1 AND the tool's own JSON report lists at least one problem
+# (the report existing is what proves the tool finished linting; the problems
+# are counted from it, never scraped from text). Anything else (exit 2 or more,
+# a crash, a config error, an unsupported flag, a report that is unreadable or
+# holds only the tool's own diagnostics, a missing binary or interpreter =
+# exit 126/127) is a TOOL ERROR. The report is read from STDOUT (ESLint: from
+# --output-file): ruff, biome and node warn on stderr, which a merged stream
+# would corrupt. The checkers with no report draw the same line from what they
+# have: bash -n (126/127 = could not start; any other non-zero is a syntax
+# error), python3 ast.parse (exit 1 is a syntax error only when its output names
+# a SyntaxError, IndentationError or TabError) and tsc (it type-checked only if
+# it exited 0 or printed a diagnostic that names a file; anything else never got
+# as far as checking). A TOOL ERROR is:
+#   * reported loudly, per file, with the tool's own diagnostics
+#   * counted in the receipt's tool_errors, never in findings
+#   * the run is marked complete=false
+#   * lint_clean is LEFT EXACTLY AS IT WAS (a real finding from another checker
+#     in the same run still turns it false). A tool that could not run is no
+#     evidence of a problem (red would repeat the phantom-findings bug) and no
+#     evidence of cleanliness (green would be a hand flip with extra steps):
+#     the same non-verdict a timed-out checker already is.
 #
 # ADVISORY, FAIL OPEN, ALWAYS EXIT 0
 # ----------------------------------
@@ -153,6 +204,22 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 [ -z "$TRACKER" ] && TRACKER="$HERE/edit-tracker"
 STATE_TOOL="$HERE/heimdall-state"
 
+# repo_relpath <abs-file> → prints the path relative to $REPO and returns 0 when
+# the file is a lint target of THIS repo; returns 1 otherwise. The directory is
+# resolved physically first (pwd -P), so a `..` escape, a symlinked spelling
+# (macOS /var → /private/var) or a symlinked directory pointing outside cannot
+# pass the prefix test. The exclusions are anchored at the repo root on purpose:
+# an absolute "*/.claude/worktrees/*" pattern would also drop every file of a
+# session whose repo IS a worktree.
+repo_relpath() {
+  local p="$1" dir rp
+  dir="$(cd "${p%/*}/" 2>/dev/null && pwd -P)" || return 1
+  p="$dir/${p##*/}"
+  case "$p" in "$REPO"/*) rp="${p#"$REPO"/}" ;; *) return 1 ;; esac
+  case "/$rp" in /.claude/worktrees/*|/.heimdall/*|*/node_modules/*) return 1 ;; esac
+  printf '%s' "$rp"
+}
+
 TAG="[heimdall] stop-lint:"
 say() { [ "$QUIET" -eq 1 ] && return 0; printf '%s %s\n' "$TAG" "$*" >&2; }
 
@@ -160,11 +227,12 @@ say() { [ "$QUIET" -eq 1 ] && return 0; printf '%s %s\n' "$TAG" "$*" >&2; }
 [ -x "$TRACKER" ] || exit 0
 
 FILES=()
+EXCLUDED=0
 while IFS= read -r p; do
   [ -n "$p" ] || continue
   case "$p" in /*) ;; *) p="$REPO/$p" ;; esac
   [ -f "$p" ] || continue
-  FILES+=("$p")
+  if rp="$(repo_relpath "$p")"; then FILES+=("$REPO/$rp"); else EXCLUDED=$((EXCLUDED + 1)); fi
 done < <("$TRACKER" paths 2>/dev/null || true)
 
 [ "${#FILES[@]}" -gt 0 ] || exit 0
@@ -194,7 +262,7 @@ HAVE_PERL=0; command -v perl >/dev/null 2>&1 && HAVE_PERL=1
 START_TS=$(date +%s)
 remaining() { local now; now=$(date +%s); echo $(( BUDGET - (now - START_TS) )); }
 
-# run_bounded <cmd...> → tool stdout+stderr in the file $RUN_OUT, rc in RUN_RC.
+# run_bounded <cmd...> → tool stdout in the file $RUN_OUT, stderr in $RUN_ERR, rc in RUN_RC.
 # Output goes to a FILE, not a `$(...)` pipe, on purpose: a `$(...)` capture
 # waits for the pipe to CLOSE, and a linter that forks a child (a `sh` wrapper
 # around a real binary, a daemonised worker) leaves that child holding the
@@ -205,15 +273,21 @@ remaining() { local now; now=$(date +%s); echo $(( BUDGET - (now - START_TS) ));
 RUN_RC=0
 RUN_TIMEOUT=0
 TIMEOUTS=0
+TOOL_ERRORS=0
+# stdout (a JSON checker's report) and stderr are kept in separate files: ruff,
+# biome and node print warnings to stderr that would corrupt a merged stream.
 RUN_OUT="$(mktemp "${TMPDIR:-/tmp}/hmd-stop-lint.XXXXXX" 2>/dev/null || echo /dev/null)"
-trap 'rm -f "$RUN_OUT"' EXIT
+RUN_ERR="$(mktemp "${TMPDIR:-/tmp}/hmd-stop-lint-err.XXXXXX" 2>/dev/null || echo /dev/null)"
+# ESLint's --output-file target (see FINDING vs TOOL ERROR in the header)
+ESLINT_JSON="$(mktemp "${TMPDIR:-/tmp}/hmd-stop-lint-eslint.XXXXXX" 2>/dev/null || echo /dev/null)"
+trap 'rm -f "$RUN_OUT" "$RUN_ERR" "$ESLINT_JSON"' EXIT
 run_bounded() {
   local rem cap
   rem=$(remaining)
   cap=$PER_CALL
   [ "$rem" -lt "$cap" ] && cap=$rem
   [ "$cap" -lt 1 ] && cap=1
-  : > "$RUN_OUT" 2>/dev/null
+  : > "$RUN_OUT" 2>/dev/null; : > "$RUN_ERR" 2>/dev/null
   # perl forks the tool and WAITS rather than exec-ing it: with a plain
   # `alarm N; exec @ARGV` the process bash owns dies by SIGALRM, and bash
   # prints "Alarm clock: 14" to the hook's stderr for every timeout (a
@@ -230,9 +304,9 @@ run_bounded() {
       local $SIG{ALRM} = sub { kill "TERM", $pid; select undef,undef,undef,0.2; kill "KILL", $pid; waitpid $pid, 0; exit 124 };
       alarm $t; waitpid $pid, 0; alarm 0;
       exit(($? & 127) ? 128 + ($? & 127) : ($? >> 8));
-    ' "$cap" "$@" >"$RUN_OUT" 2>&1 </dev/null
+    ' "$cap" "$@" >"$RUN_OUT" 2>"$RUN_ERR" </dev/null
   else
-    "$@" >"$RUN_OUT" 2>&1 </dev/null
+    "$@" >"$RUN_OUT" 2>"$RUN_ERR" </dev/null
   fi
   RUN_RC=$?
   RUN_TIMEOUT=0
@@ -241,11 +315,86 @@ run_bounded() {
 # run_in_repo <cmd...> → run_bounded with cwd = $REPO (RUN_RC still set here)
 run_in_repo() {
   local prev; prev="$PWD"
-  cd "$REPO" 2>/dev/null || { RUN_RC=1; RUN_TIMEOUT=0; : > "$RUN_OUT"; return; }
+  cd "$REPO" 2>/dev/null || { RUN_RC=1; RUN_TIMEOUT=0; : > "$RUN_OUT"; : > "$RUN_ERR"; return; }
   run_bounded "$@"
   cd "$prev" 2>/dev/null || true
 }
-tool_out() { cat "$RUN_OUT" 2>/dev/null; }
+tool_out() { cat "$RUN_OUT" "$RUN_ERR" 2>/dev/null; }
+# What a tool said, for a tool-error report: its stdout (a JSON report squeezed
+# onto one line: ruff pretty-prints, and the MAX_DETAIL_LINES cut would keep only
+# the first few brackets of it) and then its stderr.
+tool_report() { { jq -c . "$RUN_OUT" 2>/dev/null || cat "$RUN_OUT"; cat "$RUN_ERR"; } 2>/dev/null; }
+
+# ESLint's `-f json` report, read from the --output-file target. A report that
+# exists and parses as an array proves ESLint FINISHED a lint run (a crash or a
+# config error never writes one). eslint_problems prints the problem count and
+# fails when there is no usable report; eslint_lines lists the problems in the
+# `path:line:col: message [Severity/rule]` shape the unix formatter had.
+eslint_problems() {
+  [ -s "$ESLINT_JSON" ] || return 1
+  jq -e 'if type == "array" then [.[].messages | length] | add // 0 else empty end' "$ESLINT_JSON" 2>/dev/null
+}
+eslint_lines() {
+  jq -r '.[] | .filePath as $f | .messages[] | "\($f):\(.line // 0):\(.column // 0): \(.message) [\(if .severity == 2 then "Error" else "Warning" end)/\(.ruleId // "parse")]"' "$ESLINT_JSON" 2>/dev/null
+}
+
+# The other JSON checkers print their report on STDOUT ($RUN_OUT). Each
+# *_problems prints the number of lint problems in it and succeeds only when the
+# report proves the tool FINISHED linting (a crash, a config error or a bad flag
+# never prints one); each *_lines lists them as `path:line:col: message`.
+sc_problems() { jq -e 'if type == "array" then length else empty end' "$RUN_OUT" 2>/dev/null; }
+sc_lines() {
+  jq -r '.[] | "\(.file):\(.line):\(.column): \(.level): \(.message) [SC\(.code)]"' "$RUN_OUT" 2>/dev/null
+}
+# ruff reports a file it cannot read as an E902 entry: the tool failing, not a lint problem.
+ruff_problems() { jq -e 'if type == "array" then [.[] | select(.code != "E902")] | length else empty end' "$RUN_OUT" 2>/dev/null; }
+ruff_lines() {
+  jq -r '.[] | select(.code != "E902") | "\(.filename):\(.location.row // 0):\(.location.column // 0): \(.code // "syntax-error") \(.message)"' "$RUN_OUT" 2>/dev/null
+}
+# Biome's diagnostics also carry its own failures (internalError/io "No files were
+# processed", configuration, ...): only the lint, parse, suppression, assist and
+# plugin categories are problems in the linted file.
+BIOME_JQ='def finding: select((.category // "") | test("^(lint|parse|suppressions|assist|plugin)(/|$)"));'
+biome_problems() { jq -e "$BIOME_JQ"' if type == "object" and (.diagnostics | type) == "array" then [.diagnostics[] | finding] | length else empty end' "$RUN_OUT" 2>/dev/null; }
+biome_lines() {
+  jq -r "$BIOME_JQ"' .diagnostics[] | finding | "\(.location.path.file // "?"): \(.category) \(.description)"' "$RUN_OUT" 2>/dev/null
+}
+
+# classify_json <problems-fn> → CK=ok|timeout|findings|error (and CK_N, the
+# problem count) for the run just made. See FINDING vs TOOL ERROR in the header:
+# exit 0 is clean, a timeout is already a non-verdict, any other non-zero exit
+# is a finding only when it is exit 1 AND the tool's JSON report lists problems.
+CK=""; CK_N=0
+classify_json() {
+  CK_N=0
+  if [ "$RUN_RC" -eq 0 ]; then CK=ok
+  elif [ "$RUN_TIMEOUT" -eq 1 ]; then CK=timeout
+  elif [ "$RUN_RC" -eq 1 ] && CK_N="$("$1")" && [ "$CK_N" -gt 0 ]; then CK=findings
+  else CK=error; CK_N=0; fi
+}
+
+# tool_error <label> [exit-1 headline] → the checker never reached a verdict (could
+# not start, config error, crash, unusable report): counted in tool_errors, never
+# in findings, and the run becomes incomplete. Exit 1 normally means "findings",
+# so the optional headline says why this one is not.
+tool_error() {
+  local body; body="$(tool_report)"
+  [ "$RUN_RC" -eq 1 ] && [ -n "${2:-}" ] && body="$2${body:+$'\n'}$body"
+  [ -n "$body" ] || body="$1 exited $RUN_RC and printed nothing"
+  TOOL_ERRORS=$((TOOL_ERRORS + 1)); parts+=("$1 tool error (exit $RUN_RC)")
+  detail="${detail}${detail:+$'\n'}$body"
+}
+
+# apply_verdict <label> <lines-fn> [exit-1 headline] → fold classify_json's
+# verdict into this file's parts / fcount / detail.
+apply_verdict() {
+  case "$CK" in
+    ok)       parts+=("$1 ok") ;;
+    timeout)  parts+=("$1 timed out") ;;
+    findings) fcount=$((fcount + CK_N)); parts+=("$1 $CK_N"); detail="${detail}${detail:+$'\n'}$("$2")" ;;
+    *)        tool_error "$1" "${3:-$1 exited 1 without a readable JSON report}" ;;
+  esac
+}
 
 # node tool resolution: repo-local first, PATH second, never npx-install
 node_bin() {
@@ -329,13 +478,11 @@ for f in "${SHELL_FILES[@]:-}"; do
   run_bounded bash -n "$f"; out="$(tool_out)"; add_tool "bash -n"
   if [ "$RUN_RC" -eq 0 ]; then parts+=("bash -n ok")
   elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("bash -n timed out")
+  elif [ "$RUN_RC" -eq 126 ] || [ "$RUN_RC" -eq 127 ]; then tool_error "bash -n"  # could not start: no verdict on the file
   else fcount=$((fcount + 1)); parts+=("bash -n FAIL"); detail="$out"; fi
   if [ -n "$SHELLCHECK" ] && budget_left; then
-    run_bounded "$SHELLCHECK" -S "$SEVERITY" -f gcc "$f"; out="$(tool_out)"; add_tool shellcheck
-    if [ "$RUN_RC" -eq 0 ]; then parts+=("shellcheck ok")
-    elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("shellcheck timed out")
-    else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
-      fcount=$((fcount + n)); parts+=("shellcheck $n"); detail="${detail}${detail:+$'\n'}$out"; fi
+    run_bounded "$SHELLCHECK" -S "$SEVERITY" -f json "$f"; add_tool shellcheck
+    classify_json sc_problems; apply_verdict shellcheck sc_lines
   fi
   CHECKED=$((CHECKED + 1)); FINDINGS=$((FINDINGS + fcount))
   report "$f" "$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')" "$detail"
@@ -351,14 +498,13 @@ for f in "${PY_FILES[@]:-}"; do
     run_bounded "$PY" -c 'import ast,sys; ast.parse(open(sys.argv[1],"rb").read(), sys.argv[1])' "$f"; out="$(tool_out)"; add_tool "python3 ast"
     if [ "$RUN_RC" -eq 0 ]; then parts+=("ast ok")
     elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("ast timed out")
-    else fcount=$((fcount + 1)); parts+=("ast FAIL"); detail="$(printf '%s\n' "$out" | grep -E 'SyntaxError|line [0-9]+' | tail -n 3)"; [ -z "$detail" ] && detail="$out"; fi
+    elif [ "$RUN_RC" -eq 1 ] && grep -qE '(Syntax|Indentation|Tab)Error:' <<<"$out"; then
+      fcount=$((fcount + 1)); parts+=("ast FAIL"); detail="$(printf '%s\n' "$out" | grep -E 'SyntaxError|line [0-9]+' | tail -n 3)"; [ -z "$detail" ] && detail="$out"
+    else tool_error ast "python3 exited 1 without a SyntaxError in its output"; fi
   fi
   if [ -n "$RUFF" ] && budget_left; then
-    run_bounded "$RUFF" check --no-fix --output-format concise "$f"; out="$(tool_out)"; add_tool ruff
-    if [ "$RUN_RC" -eq 0 ]; then parts+=("ruff ok")
-    elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("ruff timed out")
-    else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
-      fcount=$((fcount + n)); parts+=("ruff $n"); detail="${detail}${detail:+$'\n'}$out"; fi
+    run_bounded "$RUFF" check --no-fix --output-format json "$f"; add_tool ruff
+    classify_json ruff_problems; apply_verdict ruff ruff_lines
   fi
   if [ "${#parts[@]}" -eq 0 ]; then report "$f" "no python checker available"; continue; fi
   CHECKED=$((CHECKED + 1)); FINDINGS=$((FINDINGS + fcount))
@@ -370,34 +516,37 @@ if [ "${#JS_FILES[@]}" -gt 0 ]; then
   if [ -z "$BIOME" ] && [ -z "$ESLINT" ] && [ -z "$TSC" ]; then
     say "no js/ts linter found in $(rel "$REPO") (${#JS_FILES[@]} edited file(s) skipped; looked for biome, eslint, tsc — nothing installed)"
   else
-    TSC_OUT=""
+    TSC_OUT=""; TSC_STATE=""; TSC_RC=0
     if [ -n "$TSC" ] && budget_left; then
       run_in_repo "$TSC" --noEmit -p tsconfig.json --pretty false; TSC_OUT="$(tool_out)"; add_tool tsc
-      [ "$RUN_TIMEOUT" -eq 1 ] && say "tsc timed out after ${PER_CALL}s — type results omitted"
+      # tsc type-checked iff it exited 0 or printed a diagnostic that names a file;
+      # anything else (a crash, a missing module or interpreter, a config error)
+      # never got as far as checking, and must not read as "tsc ok" per file.
+      if [ "$RUN_TIMEOUT" -eq 1 ]; then TSC_STATE=timeout; say "tsc timed out after ${PER_CALL}s — type results omitted"
+      elif [ "$RUN_RC" -eq 0 ] || grep -qE '\([0-9]+,[0-9]+\): error TS[0-9]+' <<<"$TSC_OUT"; then TSC_STATE=ok
+      else TSC_STATE=error; TSC_RC=$RUN_RC; parts=(); detail=""; tool_error tsc; report tsc "tool error (exit $RUN_RC)" "$detail"; fi
     fi
     for f in "${JS_FILES[@]}"; do
       if ! budget_left; then SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); report "$f" "skipped (budget)"; continue; fi
       parts=(); detail=""; fcount=0
       if [ -n "$BIOME" ] && budget_left; then
-        run_in_repo "$BIOME" lint --reporter=summary "$f"; out="$(tool_out)"; add_tool biome
-        if [ "$RUN_RC" -eq 0 ]; then parts+=("biome ok")
-        elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("biome timed out")
-        else fcount=$((fcount + 1)); parts+=("biome FAIL"); detail="$out"; fi
+        run_in_repo "$BIOME" lint --reporter=json "$f"; add_tool biome
+        classify_json biome_problems; apply_verdict biome biome_lines
       fi
       if [ -n "$ESLINT" ] && budget_left; then
-        run_in_repo "$ESLINT" --no-fix -f unix "$f"; out="$(tool_out)"; add_tool eslint
-        if [ "$RUN_RC" -eq 0 ]; then parts+=("eslint ok")
-        elif [ "$RUN_TIMEOUT" -eq 1 ]; then parts+=("eslint timed out")
-        else n=$(printf '%s\n' "$out" | grep -c ':[0-9]*:[0-9]*:'); [ "$n" -lt 1 ] && n=1
-          fcount=$((fcount + n)); parts+=("eslint $n"); detail="${detail}${detail:+$'\n'}$out"; fi
+        : > "$ESLINT_JSON"  # the previous file's report must never be read as this one's
+        run_in_repo "$ESLINT" --no-fix -f json -o "$ESLINT_JSON" "$f"; add_tool eslint
+        classify_json eslint_problems; apply_verdict eslint eslint_lines "ESLint exited 1 without a readable JSON report"
       fi
-      if [ -n "$TSC" ] && [ -n "$TSC_OUT" ]; then
+      if [ "$TSC_STATE" = error ]; then parts+=("tsc tool error (exit $TSC_RC)")
+      elif [ -n "$TSC" ]; then
         rf="$(rel "$f")"
         hits="$(printf '%s\n' "$TSC_OUT" | grep -F "$rf" | grep -E 'error TS[0-9]+')"
         if [ -n "$hits" ]; then n=$(printf '%s\n' "$hits" | wc -l | tr -d ' ')
           fcount=$((fcount + n)); parts+=("tsc $n"); detail="${detail}${detail:+$'\n'}$hits"
+        elif [ "$TSC_STATE" = timeout ]; then parts+=("tsc timed out")
         else parts+=("tsc ok"); fi
-      elif [ -n "$TSC" ]; then parts+=("tsc ok"); fi
+      fi
       if [ "${#parts[@]}" -eq 0 ]; then report "$f" "skipped (budget)"; SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); continue; fi
       CHECKED=$((CHECKED + 1)); FINDINGS=$((FINDINGS + fcount))
       report "$f" "$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')" "$detail"
@@ -413,11 +562,15 @@ fi
 COMPLETE=true
 [ "$SKIPPED_BUDGET" -gt 0 ] && COMPLETE=false
 [ "$TIMEOUTS" -gt 0 ] && COMPLETE=false
+[ "$TOOL_ERRORS" -gt 0 ] && COMPLETE=false
 
 if [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ]; then
-  verdict="clean"; [ "$FINDINGS" -gt 0 ] && verdict="$FINDINGS finding(s)"
+  verdict="clean"
+  if [ "$FINDINGS" -gt 0 ]; then verdict="$FINDINGS finding(s)"
+  elif [ "$TOOL_ERRORS" -gt 0 ]; then verdict="no findings"; fi
   extra=""; [ "$SKIPPED_BUDGET" -gt 0 ] && extra=", $SKIPPED_BUDGET skipped (budget ${BUDGET}s exhausted)"
   [ "$TIMEOUTS" -gt 0 ] && extra="$extra, $TIMEOUTS checker call(s) timed out (per-call cap ${PER_CALL}s) — verdict incomplete"
+  [ "$TOOL_ERRORS" -gt 0 ] && extra="$extra, $TOOL_ERRORS checker call(s) failed to run (tool error, not lint findings) — verdict incomplete, lint_clean not moved by them"
   say "$CHECKED file(s) checked, $verdict$extra"
 fi
 
@@ -439,9 +592,11 @@ if [ -n "$STATE" ] && [ -f "$STATE" ] && [ -x "$STATE_TOOL" ] && command -v jq >
     --argjson tools "$tools_json" \
     --argjson complete "$COMPLETE" \
     --argjson timeouts "$TIMEOUTS" \
+    --argjson tool_errors "$TOOL_ERRORS" \
     --argjson skipped "$SKIPPED_BUDGET" \
+    --argjson excluded "$EXCLUDED" \
     --arg shellcheck_severity "$SEVERITY" \
-    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, skipped:$skipped, shellcheck_severity:$shellcheck_severity, source:"heimdall-stop-lint"}')"
+    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, tool_errors:$tool_errors, skipped:$skipped, excluded:$excluded, shellcheck_severity:$shellcheck_severity, source:"heimdall-stop-lint"}')"
   # Never let a state-tool hiccup (lock contention, malformed file) escape.
   HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_last_run' "$receipt" >/dev/null 2>&1 || true
   if [ "$FINDINGS" -gt 0 ]; then
