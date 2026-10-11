@@ -76,6 +76,11 @@ make_fake_repo() {  # $1 = dest dir
   git init -q --bare "$bare"
   git -C "$d" remote add origin "$bare"
   git -C "$d" push -q -u origin main
+  # ship.sh now demands a green FULL sweep receipt at HEAD before it bumps anything (release/ship.sh require_full_sweep_receipt).
+  # Record one in a home dir OUTSIDE the repo -- inside it the receipt would be an untracked file, and these cases assert a clean tree.
+  mkdir -p "$d.home/receipts"
+  jq -n --arg repo "$(git -C "$d" rev-parse --show-toplevel)" --arg head "$(git -C "$d" rev-parse HEAD)" \
+    '{repo:$repo, head_sha:$head, tree_clean:true, exit_code:0, kind:"full"}' > "$d.home/receipts/last-full-green.json"
 }
 
 # Stub bin: gh always authenticates; gitleaks + landmine behaviour is env-driven.
@@ -132,7 +137,7 @@ C2="$WORK/c2.out"
 (
   cd "$PLUG2"
   export GUARD_GITLEAKS_RC=1
-  PATH="$STUB:$PATH" bash "$PLUG2/release/ship.sh" --no-npm
+  PATH="$STUB:$PATH" HEIMDALL_HOME="$PLUG2.home" bash "$PLUG2/release/ship.sh" --no-npm
 ) >"$C2" 2>&1
 c2_rc=$?
 if [ "$c2_rc" -ne 0 ]; then
@@ -154,7 +159,7 @@ C3="$WORK/c3.out"
 (
   cd "$PLUG3"
   export GUARD_GITLEAKS_RC=0 SHIP_LANDMINE_LINT="$LANDMINE_FAIL"
-  PATH="$STUB:$PATH" bash "$PLUG3/release/ship.sh" --no-npm
+  PATH="$STUB:$PATH" HEIMDALL_HOME="$PLUG3.home" bash "$PLUG3/release/ship.sh" --no-npm
 ) >"$C3" 2>&1
 c3_rc=$?
 if [ "$c3_rc" -ne 0 ]; then
@@ -185,7 +190,7 @@ C4="$WORK/c4.out"
   cd "$PLUG4"
   export GUARD_GITLEAKS_RC=0 SHIP_LANDMINE_LINT="$LANDMINE_OK"
   export SHIP_RENDERER="$NOOP" SHIP_SYNC_RELEASE="$NOOP"
-  PATH="$STUB:$PATH" bash "$PLUG4/release/ship.sh" --no-npm
+  PATH="$STUB:$PATH" HEIMDALL_HOME="$PLUG4.home" bash "$PLUG4/release/ship.sh" --no-npm
 ) >"$C4" 2>&1
 # The bump commit must exist now (the run may exit non-zero later at R9 — that is expected).
 # `case` glob, not `git … | grep -q`: pipefail + grep -q's early exit SIGPIPEs git and would

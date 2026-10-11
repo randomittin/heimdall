@@ -28,6 +28,12 @@ HMD_STATE_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -r "$HMD_STATE_SELF_DIR/lib/hook-owned-path.sh" ]; then
   . "$HMD_STATE_SELF_DIR/lib/hook-owned-path.sh"
 fi
+# Shared incremental-sweep policy (bin/lib/sweep-chain.sh): the SAME rules `test/run-all.sh --since-green` applied when it chose
+# the suites, re-checked below before an incremental receipt may stand in for a full sweep. Defensive like the lib above: absent
+# => cmd_check_quality_gates REFUSES incremental receipts (never waves them through); every other subcommand is unaffected.
+if [ -r "$HMD_STATE_SELF_DIR/lib/sweep-chain.sh" ]; then
+  . "$HMD_STATE_SELF_DIR/lib/sweep-chain.sh"
+fi
 
 # State file: prefer HEIMDALL_STATE_FILE, fall back to legacy SUPERX_STATE_FILE.
 # Default to heimdall-state.json, but adopt a pre-existing legacy superx-state.json
@@ -197,6 +203,62 @@ cmd_add_conflict() {
   echo "Conflict logged."
 }
 
+# _sweep_run_hint REPO FULL_RECEIPT -- the remediation every sweep-receipt failure names. `--since-green` when a green, clean,
+# FULL receipt of this repo exists to chain to (the incremental run escalates to a full sweep by itself when the diff demands
+# it); a plain full sweep when none does.
+_sweep_run_hint() {
+  local repo="$1" anchor="$2" base
+  if [ -f "$anchor" ] && jq -e '.exit_code == 0 and .tree_clean == true and ((.kind // "full") == "full")' "$anchor" >/dev/null 2>&1 \
+     && [ "$(jq -r '.repo // empty' "$anchor")" = "$repo" ]; then
+    base="$(jq -r '.head_sha // empty' "$anchor")"
+    if [ -n "$base" ] && git -C "$repo" merge-base --is-ancestor "$base" HEAD 2>/dev/null; then
+      echo "bash test/run-all.sh --since-green"; return 0
+    fi
+  fi
+  echo "bash test/run-all.sh"
+}
+
+# _sweep_chain_violation REPO RECEIPT FULL_RECEIPT -- prints why an INCREMENTAL receipt may not stand in for a full sweep (the
+# sentence continues "incremental sweep receipt ..."), or nothing when it may. It must (1) chain: name the base of the last green
+# FULL sweep, which must still be that anchor and an ancestor of what it graded; (2) have analysed the HEAD it graded; (3) satisfy
+# the selection rules of bin/lib/sweep-chain.sh, which are RE-DERIVED from git here with the gate's own limits -- never taken on
+# the writer's word, and never loosened by an environment variable.
+_sweep_chain_violation() {
+  local repo="$1" receipt="$2" anchor="$3" base a_sha head sel_head epoch why sel disc
+  base="$(jq -r '.base_full_sha // empty' "$receipt")"
+  if [ -z "$base" ]; then echo "does not chain to a green FULL sweep: it names no base_full_sha"; return 0; fi
+  if [ ! -f "$anchor" ] || ! jq -e . "$anchor" >/dev/null 2>&1; then
+    echo "does not chain to a green FULL sweep: there is no valid last-full-green receipt at $anchor"; return 0
+  fi
+  if ! jq -e '.exit_code == 0 and .tree_clean == true and ((.kind // "full") == "full")' "$anchor" >/dev/null 2>&1 \
+     || [ "$(jq -r '.repo // empty' "$anchor")" != "$repo" ]; then
+    echo "does not chain to a green FULL sweep: $anchor is not a green, clean FULL sweep of this repo"; return 0
+  fi
+  a_sha="$(jq -r '.head_sha // empty' "$anchor")"
+  if [ "$a_sha" != "$base" ]; then
+    echo "does not chain to the last green FULL sweep: it is based on ${base:0:12}, the last full green is ${a_sha:0:12}"; return 0
+  fi
+  head="$(jq -r '.head_sha // empty' "$receipt")"
+  sel_head="$(jq -r '.selection.analyzed_head_sha // empty' "$receipt")"
+  if [ "$sel_head" != "$head" ]; then
+    echo "violates the selection rules: the selection analysed ${sel_head:0:12}, not the HEAD it graded (${head:0:12})"; return 0
+  fi
+  if ! command -v hmd_sweep_rules_violation >/dev/null 2>&1; then
+    echo "violates the selection rules: they cannot be verified (bin/lib/sweep-chain.sh is missing next to heimdall-state)"; return 0
+  fi
+  epoch="$(jq -r '.selection.finished_epoch // empty' "$receipt")"
+  case "$epoch" in ''|*[!0-9]*) echo "violates the selection rules: it records no selection.finished_epoch"; return 0 ;; esac
+  why="$(hmd_sweep_rules_violation "$repo" "$base" "$head" "$epoch" "$HMD_SWEEP_LIMIT_FILES" "$HMD_SWEEP_LIMIT_BASE_DAYS" "$HMD_SWEEP_LIMIT_BASE_COMMITS")" || true
+  if [ -n "$why" ]; then echo "violates the selection rules: $why"; return 0; fi
+  sel="$(jq -r '.selection.suites_selected // empty' "$receipt")"
+  disc="$(jq -r '.selection.suites_discovered // empty' "$receipt")"
+  case "${sel}x${disc}" in x*|*x|*[!0-9x]*) echo "violates the selection rules: it records no suite counts"; return 0 ;; esac
+  if [ $((sel * 100)) -gt $((HMD_SWEEP_LIMIT_SELECTED_PCT * disc)) ]; then
+    echo "violates the selection rules: ${sel} of ${disc} suites selected, over the ${HMD_SWEEP_LIMIT_SELECTED_PCT}% limit"; return 0
+  fi
+  return 0
+}
+
 cmd_check_quality_gates() {
   ensure_state
   local tests lint reflection dirty
@@ -241,17 +303,22 @@ cmd_check_quality_gates() {
   # reporter). grep 'receipts/last-sweep.json' to find all three call sites.
   local sweep_repo
   if sweep_repo="$(git rev-parse --show-toplevel 2>/dev/null)"; then
-    local receipt cur_sha
+    local receipt cur_sha full_receipt hint
     receipt="${HEIMDALL_HOME:-$sweep_repo/.heimdall}/receipts/last-sweep.json"
+    # The chain anchor an incremental receipt must lead back to: written by test/run-all.sh ONLY for a green, clean, FULL sweep.
+    full_receipt="${HEIMDALL_HOME:-$sweep_repo/.heimdall}/receipts/last-full-green.json"
     cur_sha="$(git -C "$sweep_repo" rev-parse HEAD 2>/dev/null || true)"
+    hint="$(_sweep_run_hint "$sweep_repo" "$full_receipt")"
     if [ ! -f "$receipt" ]; then
-      echo "GATE FAILED: no sweep receipt at $receipt — a full sweep has never recorded a result in this checkout. Run: bash test/run-all.sh" >&2
+      echo "GATE FAILED: no sweep receipt at $receipt — a full sweep has never recorded a result in this checkout. Run: $hint" >&2
       failed=1
     elif ! jq -e . "$receipt" >/dev/null 2>&1; then
-      echo "GATE FAILED: sweep receipt at $receipt is not valid JSON. Re-run: bash test/run-all.sh" >&2
+      echo "GATE FAILED: sweep receipt at $receipt is not valid JSON. Re-run: $hint" >&2
       failed=1
     else
-      local r_repo r_sha r_clean r_rc
+      local r_repo r_sha r_clean r_rc r_kind chain_why flaky_names
+      # A receipt without `kind` predates incremental sweeps, when every receipt was a full one.
+      r_kind=$(jq -r '.kind // "full"' "$receipt")
       r_repo=$(jq -r '.repo // empty' "$receipt")
       r_sha=$(jq -r '.head_sha // empty' "$receipt")
       r_clean=$(jq -r '.tree_clean // false' "$receipt")
@@ -300,17 +367,37 @@ cmd_check_quality_gates() {
       fi
 
       if [ -n "$r_repo" ] && [ "$r_repo" != "$sweep_repo" ]; then
-        echo "GATE FAILED: sweep receipt at $receipt was recorded for a different repo ($r_repo, this checkout is $sweep_repo). Run: bash test/run-all.sh" >&2
+        echo "GATE FAILED: sweep receipt at $receipt was recorded for a different repo ($r_repo, this checkout is $sweep_repo). Run: $hint" >&2
         failed=1
       elif [ -n "$sha_stale" ]; then
-        echo "GATE FAILED: sweep receipt is STALE — ${sha_stale}. Run: bash test/run-all.sh" >&2
+        echo "GATE FAILED: sweep receipt is STALE — ${sha_stale}. Run: $hint" >&2
         failed=1
       elif [ "$r_clean" != "true" ]; then
-        echo "GATE FAILED: sweep receipt recorded a DIRTY tree — its green does not describe what would be pushed. Commit or stash, then run: bash test/run-all.sh" >&2
+        echo "GATE FAILED: sweep receipt recorded a DIRTY tree — its green does not describe what would be pushed. Commit or stash, then run: $hint" >&2
         failed=1
       elif [ "$r_rc" != "0" ]; then
-        echo "GATE FAILED: sweep receipt recorded a FAILING run (exit $r_rc). Fix the failures, then run: bash test/run-all.sh" >&2
+        echo "GATE FAILED: sweep receipt recorded a FAILING run (exit $r_rc). Fix the failures, then run: $hint" >&2
         failed=1
+      else
+        case "$r_kind" in
+          full) : ;;
+          incremental)
+            chain_why="$(_sweep_chain_violation "$sweep_repo" "$receipt" "$full_receipt")"
+            if [ -n "$chain_why" ]; then
+              echo "GATE FAILED: incremental sweep receipt ${chain_why}. Run: $hint" >&2
+              failed=1
+            else
+              echo "NOTICE: $(jq -r '"sweep receipt is INCREMENTAL -- \(.selection.suites_selected) of \(.selection.suites_discovered) suites re-run for \(.selection.files_changed) changed file(s), chained to the full green at \(.base_full_sha[0:12]) (a release still needs a full sweep)."' "$receipt")" >&2
+            fi ;;
+          *)
+            echo "GATE FAILED: sweep receipt has unknown kind '${r_kind}' -- only full and incremental sweeps are accepted. Run: $hint" >&2
+            failed=1 ;;
+        esac
+        # Counted green, never hidden: a suite that failed under parallel load and passed alone is named whenever the gate passes.
+        flaky_names="$(jq -r '[.flaky_under_load[]?.suite] | join(", ")' "$receipt" 2>/dev/null || true)"
+        if [ "$failed" -eq 0 ] && [ -n "$flaky_names" ]; then
+          echo "NOTICE: sweep receipt counts green, but these suites failed under parallel load and passed only on a solo re-run: ${flaky_names} (flaky_under_load in the receipt has the failing lines)." >&2
+        fi
       fi
     fi
   fi

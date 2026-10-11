@@ -32,7 +32,11 @@
 #      reported as DISCREPANCY and they fail the run.
 #   7. NO FALSE REDS FROM PARALLELISM. Suites run in parallel for speed, but every suite
 #      that goes red is automatically RE-RUN ALONE before being reported. A suite is only
-#      called red if it is red on its own. One that passes alone is reported PARALLEL-FLAKY.
+#      called red if it is red on its own. One that passes alone is reported FLAKY-UNDER-LOAD:
+#      it COUNTS GREEN (the solo re-run is the verdict, as it always was -- contention is not a
+#      property of the code), but it is never hidden: the receipt keeps the suite, both exit
+#      codes and the failing lines the parallel run printed (flaky_under_load), the run prints it
+#      loudly, and the push gate names it whenever it passes. A suite that is red ALONE stays red.
 #   8. THE TREE ITSELF IS A GUARANTEE. A frozen `git status` is taken before the first suite
 #      starts and again after the very last one (including solo red re-runs) finishes. Any
 #      tracked file a suite added, modified, deleted, or TYPE-CHANGED (e.g. swapped for a
@@ -57,11 +61,33 @@
 #   test/run-all.sh --timeout 300       # DEFAULT per-suite seconds (default 180); suites
 #                                       # with a measured override keep theirs if it is larger
 #   test/run-all.sh --no-retry          # do not re-run reds serially
+#   test/run-all.sh --since-green       # INCREMENTAL: only the suites a diff since the last green FULL sweep can
+#                                       # affect (see "Incremental sweeps" below); escalates to a full sweep itself
 #   HMD_TEST_NO_PY_PIN=1 test/run-all.sh   # leave python3 alone (default: pinned to the real interpreter
 #                                       # when it resolves through a shim; see PYTHON3 PIN below)
 #
 # Exit 0 = every suite that ran passed. Nonzero = at least one FAIL / TIMEOUT / DISCREPANCY,
-# or discovery fell below the floor.
+# or discovery fell below the floor. Exit 2 = bad arguments, or --since-green on a dirty tree;
+# exit 3 = nothing to run / discovery below the floor; exit 4 = another sweep holds the lock.
+#
+# Incremental sweeps (--since-green). The ~500-suite sweep takes ~70 min, and it used to be re-run for every small merge
+# because any new commit staled the last green receipt. Receipts now carry a kind:
+#   full         every suite. A GREEN, clean one is also kept as receipts/last-full-green.json -- the chain anchor.
+#   incremental  base = the anchor's HEAD; diff base..HEAD (hook-owned paths excluded; the tree must be clean). A suite is
+#                selected when it names a changed path or the basename of a changed bin/ script or module (the suite and the
+#                test/lib helpers it uses are searched; scripts that call a changed script widen the set), or is itself a
+#                changed test file; a suite that was red in the previous run is always carried forward. The receipt records
+#                base_full_sha, suites_run and the selection reason. Cumulative: it always diffs from the full green.
+#   (a --filter run is neither: its receipt goes to receipts/last-filtered.json and never reaches the push gate.)
+# ALWAYS a full sweep -- the run says "ESCALATED TO FULL SWEEP" and records escalation_reason -- when the diff touches test
+# or gate infrastructure (test/run-all.sh, test/lib/**, hooks/hooks.json, .heimdall/hooks/*, bin/heimdall-state, the
+# precheck/gate/receipt code), changes more than 40 files, would select more than 20% of the suites, when the full green is
+# older than 7 days or 200 commits or not an ancestor of HEAD, or when there is no green full sweep to chain to.
+# The push gate (bin/heimdall-state check-quality-gates) accepts a green incremental receipt for HEAD only while it chains to
+# the anchor and those rules held (it re-checks them with the same bin/lib/sweep-chain.sh), and asks for `--since-green` when
+# a base exists. release/ship.sh (any tag, Release or npm publish) still requires a green FULL receipt at HEAD.
+# One sweep at a time: the sweep holds an flock on receipts/sweep.lock; a second run in the same checkout is refused (exit 4),
+# naming the running pid. The kernel drops the lock when the holder dies, so a crashed sweep never wedges the next.
 
 set -uo pipefail
 
@@ -90,6 +116,7 @@ JOBS="$( { sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/nul
 case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
 [ "$JOBS" -gt 6 ] && JOBS=6
 [ "$JOBS" -lt 1 ] && JOBS=1
+SINCE_GREEN=0
 
 # ── SYSTEM LOAD / CORE CAPTURE (instrumentation only — never a gate) ─────────────────────
 # WHY THIS EXISTS: a real sweep went RED (6 FAIL, 8 TIMEOUT, 7410s wall clock) on a box
@@ -138,6 +165,17 @@ _load_disp() {
   [ -n "$1" ] && printf '%s' "$1" | awk '{printf "%s/%s/%s", $1, $2, $3}' || printf 'n/a'
 }
 
+# Where this run's receipts and its sweep lock live. Set here, not at the receipt block far below, because the lock (taken
+# before any suite is chosen) and the incremental selection (which reads last-full-green.json) both need them first.
+RECEIPT_HOME="${HEIMDALL_HOME:-$REPO/.heimdall}"
+RECEIPT_DIR="$RECEIPT_HOME/receipts"
+RECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"
+RECEIPT_REPO_CANON="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || echo "$REPO")"
+
+# _seq_to N -- 0..N-1, and NOTHING for N=0. `seq 0 -1` counts DOWN on BSD/macOS and printed "0 -1", which turned a sweep with
+# no suite to run (a legitimate incremental outcome) into a crash on an unset RUN[0].
+_seq_to() { local i=0; while [ "$i" -lt "$1" ]; do printf '%s\n' "$i"; i=$((i + 1)); done; }
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --include-live) INCLUDE_LIVE=1; shift ;;
@@ -148,13 +186,18 @@ while [ $# -gt 0 ]; do
     --timeout)      TIMEOUT="${2:-180}"; shift 2 ;;
     --min)          MIN_SUITES="${2:-100}"; shift 2 ;;
     --filter)       FILTER="${2:-}"; shift 2 ;;
-    -h|--help)      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --since-green)  SINCE_GREEN=1; shift ;;
+    -h|--help)      sed -n '2,/^set -uo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "run-all: unknown argument '$1' (try --help)" >&2; exit 2 ;;
   esac
 done
 for n in "$JOBS" "$TIMEOUT" "$MIN_SUITES"; do
   case "$n" in ''|*[!0-9]*) echo "run-all: --jobs/--timeout/--min must be integers" >&2; exit 2 ;; esac
 done
+if [ "$SINCE_GREEN" -eq 1 ] && [ -n "$FILTER" ]; then
+  echo "run-all: --since-green cannot be combined with --filter -- an incremental receipt must describe the whole tree; a filtered run describes a subset" >&2
+  exit 2
+fi
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; BLD=$'\033[1m'; OFF=$'\033[0m'
 if [ ! -t 1 ]; then RED=""; GRN=""; YEL=""; DIM=""; BLD=""; OFF=""; fi
@@ -372,9 +415,131 @@ if [ "$DISCOVERED" -eq 0 ]; then
   exit 3
 fi
 
+# ── ONE SWEEP AT A TIME ───────────────────────────────────────────────────────────────────
+# Two sweeps in one checkout fight over the same CPUs (load 17-26 on 10 cores already produced false reds and timeouts), over
+# the working tree the integrity guard grades, and over the receipt the push gate reads -- and the second one's verdict is
+# worthless. The second is REFUSED, naming the first. The lock is an flock(2) on receipts/sweep.lock, held on fd 9 for the life
+# of THIS process: the kernel drops it when the process dies (SIGKILL included), so a crashed sweep never wedges the next one and
+# no pid-liveness guessing is needed. macOS has no flock(1); perl (already required by timeout_run) takes the lock on the
+# inherited descriptor. fd 9 is CLOSED (9>&-) for every suite and background job below, so nothing a suite leaks can keep the
+# lock held once the sweep is gone. The holder writes pid/repo/start time into the file, which is what the refusal prints.
+# Proof: test/run-all-incremental.test.sh section E.
+SWEEP_LOCK_FILE="$RECEIPT_DIR/sweep.lock"
+_sweep_lock_acquire() {
+  local rc holder_pid="" holder_repo holder_started i=0
+  if ! mkdir -p "$RECEIPT_DIR" 2>/dev/null || ! : >> "$SWEEP_LOCK_FILE" 2>/dev/null; then
+    echo "run-all: cannot create $SWEEP_LOCK_FILE -- running WITHOUT the one-sweep-at-a-time lock" >&2
+    return 0
+  fi
+  exec 9>>"$SWEEP_LOCK_FILE"
+  perl -e 'use Fcntl qw(:flock); open(my $fh, ">&=", 9) or exit 2; flock($fh, LOCK_EX | LOCK_NB) or exit 1; exit 0'
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf 'pid=%s\nrepo=%s\nstarted=%s\n' "$$" "$RECEIPT_REPO_CANON" "$(date '+%Y-%m-%dT%H:%M:%S%z')" > "$SWEEP_LOCK_FILE" 2>/dev/null || true
+    return 0
+  fi
+  exec 9>&-
+  if [ "$rc" -ne 1 ]; then
+    echo "run-all: could not take the sweep lock (perl flock failed, rc=$rc) -- running WITHOUT the one-sweep-at-a-time lock" >&2
+    return 0
+  fi
+  # Held. The holder publishes its pid right after taking the lock, so give it a moment before naming it.
+  while [ "$i" -lt 20 ]; do
+    holder_pid="$(sed -n 's/^pid=//p' "$SWEEP_LOCK_FILE" 2>/dev/null)"
+    if [ -n "$holder_pid" ] && kill -0 "$holder_pid" 2>/dev/null; then break; fi
+    sleep 0.1; i=$((i + 1))
+  done
+  holder_repo="$(sed -n 's/^repo=//p' "$SWEEP_LOCK_FILE" 2>/dev/null)"
+  holder_started="$(sed -n 's/^started=//p' "$SWEEP_LOCK_FILE" 2>/dev/null)"
+  echo "run-all: another sweep is already running (pid ${holder_pid:-unknown}${holder_repo:+, repo $holder_repo}${holder_started:+, started $holder_started})." >&2
+  echo "         One sweep at a time: a second only competes with it for the machine and for the receipt the push gate reads." >&2
+  echo "         Wait for it (lock: $SWEEP_LOCK_FILE)${holder_pid:+, or stop it first: kill $holder_pid}. Refusing to start." >&2
+  exit 4
+}
+_sweep_lock_acquire
+
+# ── INCREMENTAL SELECTION (--since-green) ─────────────────────────────────────────────────
+# Narrows ALL to the suites a diff since the last green FULL sweep can affect, or leaves it whole and says why (an escalation is
+# a normal outcome, never an error). The rules live in bin/lib/sweep-chain.sh, shared with the push gate that re-checks them.
+SWEEP_KIND=full; [ -n "$FILTER" ] && SWEEP_KIND=filtered
+ESC_REASON=""
+INC_BASE_SHA=""; INC_HEAD_SHA=""; INC_NOW=0; INC_FILES=0; INC_SELECTED=0; INC_REASON=""
+INC_MAX_FILES=0; INC_MAX_PCT=0; INC_MAX_DAYS=0; INC_MAX_COMMITS=0
+_since_green_select() {
+  local lib="$REPO/bin/lib/sweep-chain.sh" anchor="$RECEIPT_DIR/last-full-green.json"
+  local head base dirty reason="" sel_work sel_reason nsel nfiles a_repo a_rc a_clean a_kind carried="" p
+  if [ ! -r "$lib" ]; then
+    echo "run-all: --since-green needs $lib (the selection policy shared with the push gate) -- not found" >&2; exit 2
+  fi
+  # shellcheck source=../bin/lib/sweep-chain.sh disable=SC1091  # the default run never opens sourced files; source= is for -x -P SCRIPTDIR
+  . "$lib"
+  head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" || { echo "run-all: --since-green needs a git checkout" >&2; exit 2; }
+  # The same "no uncommitted CODE" predicate as the receipt's tree_clean (_receipt_dirty_lines below): hook-owned paths and the
+  # untracked receipts dir do not count. An incremental receipt must describe HEAD, so a dirty tree is refused, not graded.
+  dirty="$(git -C "$REPO" status --porcelain=v1 --no-renames 2>/dev/null \
+    | grep -Ev '^(\?\?|.M|M.|A.|.A) '"$HMD_HOOK_OWNED_PATH_RE"'$' | grep -Ev '^\?\? \.heimdall/(receipts/)?$' || true)"
+  if [ -n "$dirty" ]; then
+    echo "run-all: --since-green refused -- uncommitted changes in the working tree:" >&2
+    printf '%s\n' "$dirty" | sed 's/^/  /' >&2
+    echo "         an incremental receipt must describe HEAD. Commit (or stash) first, then re-run." >&2
+    exit 2
+  fi
+  if [ ! -f "$anchor" ]; then
+    reason="no green full sweep receipt to chain to (no $anchor)"
+  elif ! jq -e . "$anchor" >/dev/null 2>&1; then
+    reason="no green full sweep receipt to chain to ($anchor is not valid JSON)"
+  else
+    a_repo="$(jq -r '.repo // empty' "$anchor")"; base="$(jq -r '.head_sha // empty' "$anchor")"
+    a_rc="$(jq -r 'if (.exit_code|type)=="number" then .exit_code else -1 end' "$anchor")"
+    a_clean="$(jq -r '.tree_clean // false' "$anchor")"; a_kind="$(jq -r '.kind // "full"' "$anchor")"
+    if [ "$a_repo" != "$RECEIPT_REPO_CANON" ] || [ -z "$base" ] || [ "$a_rc" != 0 ] || [ "$a_clean" != true ] || [ "$a_kind" != full ]; then
+      reason="no green full sweep receipt to chain to ($anchor is not a green, clean FULL sweep of this repo)"
+    fi
+  fi
+  INC_NOW="$(date +%s)"
+  INC_MAX_FILES="$(hmd_sweep_tighten "${HMD_SWEEP_MAX_FILES:-}" "$HMD_SWEEP_LIMIT_FILES")"
+  INC_MAX_PCT="$(hmd_sweep_tighten "${HMD_SWEEP_MAX_SELECTED_PCT:-}" "$HMD_SWEEP_LIMIT_SELECTED_PCT")"
+  INC_MAX_DAYS="$(hmd_sweep_tighten "${HMD_SWEEP_MAX_BASE_DAYS:-}" "$HMD_SWEEP_LIMIT_BASE_DAYS")"
+  INC_MAX_COMMITS="$(hmd_sweep_tighten "${HMD_SWEEP_MAX_BASE_COMMITS:-}" "$HMD_SWEEP_LIMIT_BASE_COMMITS")"
+  if [ -z "$reason" ]; then
+    reason="$(hmd_sweep_rules_violation "$REPO" "$base" "$head" "$INC_NOW" "$INC_MAX_FILES" "$INC_MAX_DAYS" "$INC_MAX_COMMITS")" || true
+  fi
+  if [ -z "$reason" ]; then
+    sel_work="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-select.XXXXXX")"
+    # Reds of the previous run (of this repo) travel with the next incremental one until they pass.
+    if [ -f "$RECEIPT_FILE" ] && [ "$(jq -r '.repo // empty' "$RECEIPT_FILE" 2>/dev/null)" = "$RECEIPT_REPO_CANON" ]; then
+      jq -r '.non_green_suites[]?' "$RECEIPT_FILE" > "$sel_work/carried.txt" 2>/dev/null || true
+      carried="$sel_work/carried.txt"
+    fi
+    sel_reason="$(hmd_sweep_select "$REPO" "$base" "$head" "$sel_work" "$carried")"
+    nsel="$(wc -l < "$sel_work/selected.txt" | tr -d ' ')"
+    nfiles="$(wc -l < "$sel_work/changed.txt" | tr -d ' ')"
+    if [ $((nsel * 100)) -gt $((INC_MAX_PCT * GLOB_COUNT)) ]; then
+      reason="${nsel} of the ${GLOB_COUNT} suites would be re-run, over the ${INC_MAX_PCT}% limit -- a change that wide is a full sweep"
+    else
+      ALL=()
+      while IFS= read -r p; do [ -n "$p" ] && ALL+=("$REPO/test/$p"); done < "$sel_work/selected.txt"
+      SWEEP_KIND=incremental
+      INC_BASE_SHA="$base"; INC_HEAD_SHA="$head"; INC_FILES="$nfiles"; INC_SELECTED="$nsel"; INC_REASON="$sel_reason"
+      echo "incremental: HEAD ${head:0:12} vs the last green full sweep ${base:0:12} -> ${nsel} of ${GLOB_COUNT} suites selected"
+      echo "             ${sel_reason}"
+      if [ "$nsel" -gt 0 ]; then sed 's/^/             select /' "$sel_work/selected.txt" | sed -n '1,30p'; fi
+    fi
+    rm -rf "$sel_work"
+  fi
+  if [ "$SWEEP_KIND" != incremental ]; then
+    ESC_REASON="$reason"
+    echo "${YEL}${BLD}run-all: ESCALATED TO FULL SWEEP${OFF} -- ${reason}"
+  fi
+}
+if [ "$SINCE_GREEN" -eq 1 ]; then
+  _since_green_select
+  DISCOVERED=${#ALL[@]}
+fi
+
 # ── PARTITION: live (skipped by default) vs runnable ───────────────────────────────────────
 RUN=(); SKIP=(); SKIP_WHY=()
-for s in "${ALL[@]}"; do
+for s in ${ALL[@]+"${ALL[@]}"}; do
   why="$(live_reason "$s")"
   if [ -n "$why" ] && [ "$INCLUDE_LIVE" -eq 0 ]; then
     SKIP+=("$s"); SKIP_WHY+=("$why")
@@ -384,7 +549,7 @@ for s in "${ALL[@]}"; do
 done
 TO_RUN=${#RUN[@]}
 
-if [ "$TO_RUN" -eq 0 ]; then
+if [ "$TO_RUN" -eq 0 ] && [ "$SWEEP_KIND" != incremental ]; then
   echo "${RED}${BLD}FATAL${OFF} every discovered suite was classified live — nothing would run." >&2
   exit 3
 fi
@@ -439,7 +604,12 @@ _gate_marker_release() {
   rm -f "$GATE_MARKER" 2>/dev/null || true
 }
 # shellcheck disable=SC2329  # invoked by the EXIT trap below; shellcheck does not follow trap handlers
-cleanup() { rm -rf "$WORK"; _gate_marker_release; }
+cleanup() {
+  rm -rf "$WORK"; _gate_marker_release
+  # The lock itself is the kernel's (it goes when this process does); only the owner NOTE is ours to retire, so a later refusal
+  # never names a finished sweep. Only when it is still our own note -- a refused second run must not blank the holder's.
+  if [ "$(sed -n 's/^pid=//p' "$SWEEP_LOCK_FILE" 2>/dev/null)" = "$$" ]; then : > "$SWEEP_LOCK_FILE" 2>/dev/null || true; fi
+}
 
 # INT/TERM MUST END THE RUN. This used to be `trap cleanup EXIT INT TERM`, and a trap handler
 # that does not `exit` stops nothing: bash ran cleanup (rm -rf "$WORK") and RESUMED the script
@@ -570,7 +740,7 @@ run_one() {
   local idx="$1" suite="$2" t0 t1 rc budget
   budget="$(suite_timeout "$suite")"
   t0=$(date +%s)
-  RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1
+  RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1 9>&-
   rc=$?
   t1=$(date +%s)
   printf '%s\n' "$rc" >"$WORK/$idx.rc"
@@ -661,7 +831,7 @@ NDONE=0
 LAST_PROGRESS_T=$START
 while [ "$next" -lt "$TO_RUN" ] || [ ${#PIDS[@]} -gt 0 ]; do
   while [ ${#PIDS[@]} -lt "$JOBS" ] && [ "$next" -lt "$TO_RUN" ]; do
-    run_one "$next" "${RUN[$next]}" &
+    run_one "$next" "${RUN[$next]}" 9>&- &
     PIDS+=($!)
     PIDIDX+=("$next")
     next=$((next + 1))
@@ -691,18 +861,18 @@ done
 # ── RE-RUN EVERY RED ALONE ────────────────────────────────────────────────────────────────
 # Parallel execution can produce a FALSE red when two suites contend for shared state. A red
 # is therefore never reported until it has been reproduced with the suite running by itself.
-FLAKY=()
+FLAKY=(); FLAKY_IDX=()
 if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
   # Cheap prepass (just reads already-written tiny .rc files, same pattern CLASSIFY RESULTS
   # below already does 3x per suite) so each retry's progress line can carry a real N/total
   # instead of an unknown denominator.
   total_reds=0
-  for i in $(seq 0 $((TO_RUN - 1))); do
+  for i in $(_seq_to "$TO_RUN"); do
     rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
     [ "$rc" != "0" ] && total_reds=$((total_reds + 1))
   done
   retried=0
-  for i in $(seq 0 $((TO_RUN - 1))); do
+  for i in $(_seq_to "$TO_RUN"); do
     rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
     [ "$rc" = "0" ] && continue
     retried=$((retried + 1))
@@ -719,10 +889,10 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
     # a FOREGROUND command returns (up to the suite's whole budget -- 900s for
     # install-stranger), whereas `wait` is interrupted at once and the suite is still a live
     # descendant for _abort_sweep to stop.
-    run_one "$i" "${RUN[$i]}" &
+    run_one "$i" "${RUN[$i]}" 9>&- &
     wait $!
     newrc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
-    [ "$newrc" = "0" ] && FLAKY+=("${RUN[$i]}")
+    if [ "$newrc" = "0" ]; then FLAKY+=("${RUN[$i]}"); FLAKY_IDX+=("$i"); fi
     _progress_line retry "$retried" "$total_reds" "$i"
   done
   [ -t 1 ] && printf '\r%*s\r' 44 ''
@@ -730,7 +900,7 @@ fi
 # ORPHAN GUARD: name the suites that left processes behind (timeout_run already killed them) and assert no hmd ui /
 # relay client on a temp or deleted repo survives the sweep. Silent when clean; survivors of SIGKILL turn the sweep RED.
 ORPHAN_SURVIVORS=0
-if type hmd_test_orphan_guard >/dev/null 2>&1; then hmd_test_orphan_guard "$REPO" "$WORK"; fi
+if [ "$TO_RUN" -gt 0 ] && type hmd_test_orphan_guard >/dev/null 2>&1; then hmd_test_orphan_guard "$REPO" "$WORK"; fi
 END=$(date +%s)
 LOAD_END="$(_load_avg)"
 LOAD_END_DISP="$(_load_disp "$LOAD_END")"
@@ -825,7 +995,7 @@ _mtime_of() {
 # _attribute MTIME — best-effort candidate suite list; see the long rationale above.
 _attribute() {
   local target="$1" i s0 s1 hit="" sfx
-  for i in $(seq 0 $((TO_RUN - 1))); do
+  for i in $(_seq_to "$TO_RUN"); do
     for sfx in "" ".parallel"; do
       [ -f "$WORK/$i.t0$sfx" ] || continue
       s0="$(cat "$WORK/$i.t0$sfx" 2>/dev/null || echo 0)"
@@ -880,7 +1050,7 @@ FAILED=(); TIMEDOUT=(); UNPARSED=(); DISCREP=()
 NONGREEN=()   # "idx|name|status" for every suite that did not come back green
 ROWS=()
 
-for i in $(seq 0 $((TO_RUN - 1))); do
+for i in $(_seq_to "$TO_RUN"); do
   suite="${RUN[$i]}"; name="$(basename "$suite")"
   rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
   dur="$(cat "$WORK/$i.dur" 2>/dev/null || echo 0)"
@@ -1006,7 +1176,7 @@ if [ "$n_unparsed" -gt 0 ]; then
   echo ""
 fi
 if [ "${#FLAKY[@]}" -gt 0 ]; then
-  echo "${YEL}${BLD}PARALLEL-FLAKY (${#FLAKY[@]})${OFF} — red under --jobs $JOBS, green alone (shared-state contention):"
+  echo "${YEL}${BLD}FLAKY-UNDER-LOAD (${#FLAKY[@]})${OFF} — red under --jobs $JOBS, green alone (shared-state contention); counted GREEN, recorded in the receipt (flaky_under_load) with the parallel run's failing lines:"
   for x in ${FLAKY[@]+"${FLAKY[@]}"}; do echo "  bash test/$(basename "$x")"; done
   echo ""
 fi
@@ -1031,6 +1201,15 @@ echo "        ${GRN}${n_pass} pass${OFF}  ${RED}${n_fail} fail${OFF}  ${RED}${n_
 echo "assertions: ${tot_p} passed, ${tot_f} failed  (parsed detail; exit codes above are authoritative)"
 echo "wall clock: ${ELAPSED}s"
 echo "load avg:   start ${LOAD_START_DISP} (1m/5m/15m) -> end ${LOAD_END_DISP} (1m/5m/15m)   cpu_count=${NCPU:-n/a}"
+if [ "$SWEEP_KIND" = incremental ]; then
+  echo "sweep kind: incremental (chained to the full green at ${INC_BASE_SHA:0:12}; ${INC_SELECTED} of ${GLOB_COUNT} suites selected; the push gate accepts this receipt, release/ship.sh does not)"
+elif [ -n "$ESC_REASON" ]; then
+  echo "sweep kind: full (escalated from --since-green: ${ESC_REASON})"
+elif [ "$SWEEP_KIND" = filtered ]; then
+  echo "sweep kind: filtered (/${FILTER}/ -- a subset: recorded in receipts/last-filtered.json, never read by the push gate)"
+else
+  echo "sweep kind: full"
+fi
 if [ "$n_treeviol" -eq 0 ]; then
   echo "tree-integrity: clean (before/after git status match; no tracked file touched, no root litter, no new stash)"
 else
@@ -1062,9 +1241,11 @@ BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0}))
 # bin/heimdall-state cmd_check_quality_gates (the gate), bin/heimdall-delivery-audit
 # print_section_b (the reporter). grep 'receipts/last-sweep.json' to find all three.
 RECEIPT_RC=0; [ "$BAD" -gt 0 ] && RECEIPT_RC=1
-RECEIPT_HOME="${HEIMDALL_HOME:-$REPO/.heimdall}"
-RECEIPT_DIR="$RECEIPT_HOME/receipts"
-RECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"
+# RECEIPT_HOME / RECEIPT_DIR / RECEIPT_FILE / RECEIPT_REPO_CANON are set near the top (the sweep lock lives in the same dir).
+# A FILTERED run grades a subset of the suites. It must NOT replace the receipt the push gate reads -- a subset's green is not a
+# sweep's green, and overwriting a green full receipt of this very HEAD would only buy one more full sweep -- and it can never
+# anchor an incremental chain, so its receipt goes to a file of its own.
+[ "$SWEEP_KIND" = filtered ] && RECEIPT_FILE="$RECEIPT_DIR/last-filtered.json"
 if command -v jq >/dev/null 2>&1; then
   RECEIPT_HEAD_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "")"
   # Canonical (symlink-resolved) toplevel, NOT a bare `cd && pwd` value: the reader
@@ -1073,7 +1254,7 @@ if command -v jq >/dev/null 2>&1; then
   # (/var/folders/... -> /private/var/folders/...) a logical $REPO and git's
   # canonical toplevel are the same directory but different strings, which false-
   # positived the repo-mismatch check in test/sweep-receipt-gate.test.sh case C.
-  RECEIPT_REPO_CANON="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || echo "$REPO")"
+  # (RECEIPT_REPO_CANON itself is computed near the top: the sweep lock records it too.)
   # tree_clean means "no uncommitted CODE" -- not "zero bytes of git-status
   # output". A modified/staged/deleted TRACKED entry always counts, in ANY
   # directory, with no exemption: that is exactly "this green does not describe
@@ -1129,6 +1310,31 @@ if command -v jq >/dev/null 2>&1; then
   }
   RECEIPT_TREE_CLEAN=false
   [ -z "$(_receipt_dirty_lines)" ] && RECEIPT_TREE_CLEAN=true
+  # New receipt fields. non_green_suites feeds the NEXT incremental run's carry-forward; flaky_under_load keeps what the parallel
+  # run printed for a suite that then passed alone, so "counted green" never means "hidden"; an incremental receipt records
+  # exactly what the push gate re-checks (see bin/lib/sweep-chain.sh).
+  NONGREEN_JSON="$(printf '%s\n' ${NONGREEN[@]+"${NONGREEN[@]}"} | awk -F'|' 'NF > 1 {print $2}' | jq -R . | jq -s . 2>/dev/null || echo '[]')"
+  FLAKY_JSON='[]'
+  if [ "${#FLAKY_IDX[@]}" -gt 0 ]; then
+    : > "$WORK/flaky.ndjson"
+    for fx in "${FLAKY_IDX[@]}"; do
+      fx_lines="$(LC_ALL=C sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$WORK/$fx.out.parallel" 2>/dev/null | grep -E '^[[:space:]]*(FAIL|bad)[[:space:]]' | head -n 3 | sed 's/^[[:space:]]*//')" || true
+      jq -nc --arg suite "$(basename "${RUN[$fx]}")" --argjson pe "$(cat "$WORK/$fx.rc.parallel" 2>/dev/null || echo 1)" \
+        --argjson se "$(cat "$WORK/$fx.rc" 2>/dev/null || echo 0)" --arg lines "$fx_lines" \
+        '{suite:$suite, parallel_exit:$pe, solo_exit:$se, parallel_fail_lines:($lines | split("\n") | map(select(length > 0)))}' \
+        >> "$WORK/flaky.ndjson" 2>/dev/null || true
+    done
+    FLAKY_JSON="$(jq -s '.' "$WORK/flaky.ndjson" 2>/dev/null || echo '[]')"
+  fi
+  SUITES_RUN_JSON=null; SELECTION_JSON=null
+  if [ "$SWEEP_KIND" = incremental ]; then
+    SUITES_RUN_JSON="$(printf '%s\n' ${RUN[@]+"${RUN[@]}"} | awk 'NF {n = split($0, a, "/"); print a[n]}' | jq -R . | jq -s . 2>/dev/null || echo '[]')"
+    SELECTION_JSON="$(jq -n --arg reason "$INC_REASON" --arg head "$INC_HEAD_SHA" --argjson files "$INC_FILES" \
+      --argjson sel "$INC_SELECTED" --argjson disc "$GLOB_COUNT" --argjson epoch "$INC_NOW" --argjson mf "$INC_MAX_FILES" \
+      --argjson mp "$INC_MAX_PCT" --argjson md "$INC_MAX_DAYS" --argjson mc "$INC_MAX_COMMITS" \
+      '{reason:$reason, analyzed_head_sha:$head, files_changed:$files, suites_selected:$sel, suites_discovered:$disc,
+        finished_epoch:$epoch, limits:{max_files:$mf, max_selected_pct:$mp, max_base_days:$md, max_base_commits:$mc}}' 2>/dev/null || echo null)"
+  fi
   if mkdir -p "$RECEIPT_DIR" 2>/dev/null; then
     RECEIPT_TMP="$(mktemp "$RECEIPT_DIR/.last-sweep.XXXXXX" 2>/dev/null || true)"
     if [ -n "$RECEIPT_TMP" ] && jq -n \
@@ -1153,6 +1359,13 @@ if command -v jq >/dev/null 2>&1; then
       --argjson load_end_5m "$(_load_field "$LOAD_END" 2)" \
       --argjson load_end_15m "$(_load_field "$LOAD_END" 3)" \
       --argjson cpu_count "${NCPU:-null}" \
+      --arg kind "$SWEEP_KIND" \
+      --arg esc_reason "$ESC_REASON" \
+      --arg base_full_sha "$INC_BASE_SHA" \
+      --argjson suites_run "$SUITES_RUN_JSON" \
+      --argjson selection "$SELECTION_JSON" \
+      --argjson flaky "$FLAKY_JSON" \
+      --argjson nongreen "$NONGREEN_JSON" \
       '{finished_at:$finished_at, repo:$repo, head_sha:$head_sha, tree_clean:$tree_clean,
         exit_code:$exit_code, suites_total:$suites_total, suites_passed:$suites_passed,
         suites_failed:$suites_failed, suites_timeout:$suites_timeout,
@@ -1161,10 +1374,22 @@ if command -v jq >/dev/null 2>&1; then
         duration_s:$duration_s,
         load_start_1m:$load_start_1m, load_start_5m:$load_start_5m, load_start_15m:$load_start_15m,
         load_end_1m:$load_end_1m, load_end_5m:$load_end_5m, load_end_15m:$load_end_15m,
-        cpu_count:$cpu_count}' > "$RECEIPT_TMP" 2>/dev/null; then
-      mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null \
-        && echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})" \
-        || echo "${YEL}run-all: could not move sweep receipt into place at ${RECEIPT_FILE}${OFF}" >&2
+        cpu_count:$cpu_count, kind:$kind, flaky_under_load:$flaky, non_green_suites:$nongreen}
+       + (if $kind == "incremental" then {base_full_sha:$base_full_sha, suites_run:$suites_run, selection:$selection} else {} end)
+       + (if $esc_reason != "" then {escalated_from:"since-green", escalation_reason:$esc_reason} else {} end)' > "$RECEIPT_TMP" 2>/dev/null; then
+      if mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null; then
+        echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})"
+        # The chain anchor: ONLY a green, clean, genuinely FULL sweep. Reds, incrementals and filtered runs never touch it.
+        if [ "$SWEEP_KIND" = full ] && [ "$RECEIPT_RC" = 0 ] && [ "$RECEIPT_TREE_CLEAN" = true ]; then
+          if cp "$RECEIPT_FILE" "$RECEIPT_DIR/.last-full-green.$$" 2>/dev/null && mv "$RECEIPT_DIR/.last-full-green.$$" "$RECEIPT_DIR/last-full-green.json" 2>/dev/null; then
+            echo "full-green anchor: ${RECEIPT_DIR}/last-full-green.json (incremental sweeps chain to this; a release needs it)"
+          else
+            echo "${YEL}run-all: could not write last-full-green.json -- incremental sweeps will have no base to chain to${OFF}" >&2
+          fi
+        fi
+      else
+        echo "${YEL}run-all: could not move sweep receipt into place at ${RECEIPT_FILE}${OFF}" >&2
+      fi
     else
       [ -n "$RECEIPT_TMP" ] && rm -f "$RECEIPT_TMP" 2>/dev/null
       echo "${YEL}run-all: could not write sweep receipt (jq build failed) — pre-push gate will see this as no receipt${OFF}" >&2
@@ -1191,7 +1416,7 @@ fi
 # exit_code semantics exactly. Best-effort and silent when there is no
 # heimdall-state.json in this checkout or the binary is missing -- state tracking
 # is opt-in (`hmd init` owns creating it), never a reason to fail the sweep itself.
-if [ "$RECEIPT_RC" = 0 ] && [ -x "$REPO/bin/heimdall-state" ]; then
+if [ "$RECEIPT_RC" = 0 ] && [ "$SWEEP_KIND" != filtered ] && [ -x "$REPO/bin/heimdall-state" ]; then
   ( cd "$REPO" && "$REPO/bin/heimdall-state" mark-tests-clean >/dev/null 2>&1 ) || true
 fi
 
@@ -1204,5 +1429,9 @@ if [ "$BAD" -gt 0 ]; then
   [ -n "$EVIDENCE" ] && echo "  read it: ${EVIDENCE}/INDEX.txt"
   exit 1
 fi
-echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed, tree untouched."
+if [ "$SWEEP_KIND" = incremental ]; then
+  echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} selected suites passed (incremental: ${INC_SELECTED} of ${GLOB_COUNT}, chained to the full green at ${INC_BASE_SHA:0:12}), tree untouched."
+else
+  echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed, tree untouched."
+fi
 exit 0
