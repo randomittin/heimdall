@@ -31,7 +31,8 @@
 #      (core in 8 and 9) from --output-file, and an eslint that fails to RUN
 #      (config error, crash, missing interpreter) is a TOOL ERROR: reported
 #      loudly, counted in the receipt's tool_errors, the run marked incomplete,
-#      lint_clean left exactly as it was. Cases 21-23 use a fake ESLint 9.
+#      lint_clean FORCED FALSE with receipt reason tool-error (a stale true must
+#      never survive a run that checked nothing; cases 35-37). Cases 21-23 use a fake ESLint 9.
 #   8. SCOPE. Only files inside --repo are lint targets: `.claude/worktrees/`,
 #      `.heimdall/`, `node_modules/` and anything outside the repo (a Claude
 #      scratchpad, another checkout, a `..` escape) are excluded, and a session
@@ -213,8 +214,9 @@ else
 fi
 if [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" = "false" ] \
    && [ "$(jq -r '.quality_gates.lint_last_run.timeouts // 0' "$S")" -ge 1 ] \
-   && [ "$(lint_clean "$D")" = "true" ]; then
-  ok "8. incomplete run: receipt complete=false, timeouts>=1, pre-armed lint_clean left UNCHANGED"
+   && [ "$(lint_clean "$D")" = "false" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run.reason' "$S")" = "incomplete" ]; then
+  ok "8. incomplete run: receipt complete=false, timeouts>=1, reason=incomplete, pre-armed lint_clean forced to false"
 else
   bad "8. incomplete run misrecorded: $(jq -c '.quality_gates' "$S")"
 fi
@@ -534,7 +536,7 @@ for variant in cfgerr crash silent nointerp; do
     err="$(cat "$TMPROOT/err")"
     if [ "$rc" != "0" ] || ! grep -q 'eslint tool error' <<<"$err" || grep -q 'eslint [0-9]' <<<"$err" \
        || grep -q 'finding(s)' <<<"$err" || ! grep -q "$want_text" <<<"$err" \
-       || [ "$(lint_clean "$D")" != "$arm" ] \
+       || [ "$(lint_clean "$D")" != "false" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
@@ -542,7 +544,7 @@ for variant in cfgerr crash silent nointerp; do
     fi
   done
   if [ -z "$why" ]; then
-    ok "23. eslint $variant → loud tool error with its own diagnostics, no findings, run incomplete, lint_clean left as armed (true and false)"
+    ok "23. eslint $variant → loud tool error with its own diagnostics, no findings, run incomplete, lint_clean forced to false (armed true and false)"
   else
     bad "23. eslint $variant mishandled:$why"
   fi
@@ -751,7 +753,7 @@ for tool in shellcheck ruff biome; do
       want_text="$(tool_err_text "$tool" "$variant")"
       if [ "$rc" != "0" ] || ! grep -q "$tool tool error" <<<"$err" || grep -q "$tool [0-9]" <<<"$err" \
          || grep -q 'finding(s)' <<<"$err" || ! grep -qF -- "$want_text" <<<"$err" \
-         || [ "$(lint_clean "$D")" != "$arm" ] \
+         || [ "$(lint_clean "$D")" != "false" ] \
          || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
          || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
          || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
@@ -759,7 +761,7 @@ for tool in shellcheck ruff biome; do
       fi
     done
     if [ -z "$why" ]; then
-      ok "27-29. $tool $variant → loud tool error with its own diagnostics, no findings, run incomplete, lint_clean left as armed (true and false)"
+      ok "27-29. $tool $variant → loud tool error with its own diagnostics, no findings, run incomplete, lint_clean forced to false (armed true and false)"
     else
       bad "27-29. $tool $variant mishandled:$why"
     fi
@@ -821,7 +823,7 @@ else
     rc="$(run_lint "$D")"
     err="$(cat "$TMPROOT/err")"
     if [ "$rc" != "0" ] || ! grep -q 'ruff tool error (exit 2)' <<<"$err" || grep -q 'ruff [0-9]' <<<"$err" \
-       || [ "$(lint_clean "$D")" != "$arm" ] \
+       || [ "$(lint_clean "$D")" != "false" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
@@ -829,7 +831,7 @@ else
     fi
   done
   if [ -z "$why" ]; then
-    ok "30. real ruff, broken ruff.toml (exit 2) → tool error, no finding, lint_clean left as armed (true and false)"
+    ok "30. real ruff, broken ruff.toml (exit 2) → tool error, no finding, lint_clean forced to false (armed true and false)"
   else
     bad "30. real ruff config error mishandled:$why"
   fi
@@ -860,7 +862,7 @@ EOF
     err="$(cat "$TMPROOT/err")"
     want_text="command not found"; [ "$variant" = fatal ] && want_text="Fatal Python error"
     if [ "$rc" != "0" ] || ! grep -q 'ast tool error' <<<"$err" || grep -q 'ast FAIL' <<<"$err" \
-       || ! grep -qF -- "$want_text" <<<"$err" || [ "$(lint_clean "$D")" != "$arm" ] \
+       || ! grep -qF -- "$want_text" <<<"$err" || [ "$(lint_clean "$D")" != "false" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
@@ -868,7 +870,7 @@ EOF
     fi
   done
   if [ -z "$why" ]; then
-    ok "31. python3 $variant → 'ast tool error', not a syntax finding, lint_clean left as armed (true and false)"
+    ok "31. python3 $variant → 'ast tool error', not a syntax finding, lint_clean forced to false (armed true and false)"
   else
     bad "31. python3 $variant counted as a syntax error or mishandled:$why"
   fi
@@ -890,7 +892,7 @@ for arm in true false; do
   rc="$(PATH="$D/fakebin:$PATH" run_lint "$D")"
   err="$(cat "$TMPROOT/err")"
   if [ "$rc" != "0" ] || ! grep -q 'bash -n tool error (exit 126)' <<<"$err" || grep -q 'bash -n FAIL' <<<"$err" \
-     || ! grep -q 'bad interpreter' <<<"$err" || [ "$(lint_clean "$D")" != "$arm" ] \
+     || ! grep -q 'bad interpreter' <<<"$err" || [ "$(lint_clean "$D")" != "false" ] \
      || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
      || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
      || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
@@ -898,7 +900,7 @@ for arm in true false; do
   fi
 done
 if [ -z "$why" ]; then
-  ok "32. bash -n that cannot start (exit 126) → tool error, not a syntax finding, lint_clean left as armed (true and false)"
+  ok "32. bash -n that cannot start (exit 126) → tool error, not a syntax finding, lint_clean forced to false (armed true and false)"
 else
   bad "32. bash -n exit 126 counted as a syntax error or mishandled:$why"
 fi
@@ -962,7 +964,7 @@ for variant in crash nointerp; do
     want_text="Cannot find module"; [ "$variant" = nointerp ] && want_text="No such file or directory"
     if [ "$rc" != "0" ] || ! grep -q 'tsc tool error' <<<"$err" || grep -q 'tsc ok' <<<"$err" \
        || grep -q 'tsc [0-9]' <<<"$err" || ! grep -qF -- "$want_text" <<<"$err" \
-       || [ "$(lint_clean "$D")" != "$arm" ] \
+       || [ "$(lint_clean "$D")" != "false" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
        || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
@@ -970,11 +972,87 @@ for variant in crash nointerp; do
     fi
   done
   if [ -z "$why" ]; then
-    ok "34. tsc $variant → one tool error (not 'tsc ok'), lint_clean left as armed (true and false)"
+    ok "34. tsc $variant → one tool error (not 'tsc ok'), lint_clean forced to false (armed true and false)"
   else
     bad "34. tsc $variant read as clean or mishandled:$why"
   fi
 done
+
+# ── 35-37. THE GATE NEVER PASSES ON STALE OR ABSENT EVIDENCE ─────────────────
+# Security review of the stop-lint changes ("fail-open-state-drift"): a run that
+# reached no verdict (a linter that failed to RUN, or a run that linted nothing)
+# used to leave lint_clean as it was, so an earlier true -- a stale run, or a
+# `mark-clean` hand flip -- survived it and the push gate passed on old evidence.
+# Now a tool error forces lint_clean false, and the receipt carries the reason and
+# the files it covers (the gate re-reads both: test/sweep-receipt-gate.test.sh L).
+
+# 35. a tool error forces lint_clean false, whatever it was armed with
+D="$(mk_lint_case shellcheck "reason-toolerr")"
+S="$D/repo/heimdall-state.json"
+HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+rc="$(PATH="$D/fakebin:$PATH" FAKE_MODE=crash run_lint "$D")"
+R="$(jq -c '.quality_gates.lint_last_run' "$S")"
+if [ "$rc" = "0" ] && [ "$(lint_clean "$D")" = "false" ] \
+   && [ "$(jq -r '.reason' <<<"$R")" = "tool-error" ] \
+   && [ "$(jq -r '.complete | tostring' <<<"$R")" = "false" ] \
+   && [ "$(jq -r '.paths | length' <<<"$R")" = "1" ] \
+   && [[ "$(jq -r '.paths[0]' <<<"$R")" == */a.sh ]]; then
+  ok "35. tool error → lint_clean forced false (armed true), receipt reason=tool-error, paths name the covered file"
+else
+  bad "35. tool error left lint_clean=$(lint_clean "$D") or lost reason/paths (rc=$rc receipt=$R)"
+fi
+
+# 36. the two ordinary verdicts record their reason and the files they cover
+D="$(mk_case reason-clean)"
+printf '#!/usr/bin/env bash\necho a\n' > "$D/repo/a.sh"
+track "$D" "$D/repo/a.sh"
+rc="$(run_lint "$D")"
+R="$(jq -c '.quality_gates.lint_last_run' "$D/repo/heimdall-state.json")"
+D2="$(mk_case reason-findings)"
+printf '#!/usr/bin/env bash\nif then\n' > "$D2/repo/b.sh"
+track "$D2" "$D2/repo/b.sh"
+rc2="$(run_lint "$D2")"
+R2="$(jq -c '.quality_gates.lint_last_run' "$D2/repo/heimdall-state.json")"
+if [ "$rc" = "0" ] && [ "$(jq -r '.reason' <<<"$R")" = "clean" ] && [ "$(lint_clean "$D")" = "true" ] \
+   && [ "$(jq -r '.paths | length' <<<"$R")" = "1" ] \
+   && [ "$rc2" = "0" ] && [ "$(jq -r '.reason' <<<"$R2")" = "findings" ] && [ "$(lint_clean "$D2")" = "false" ]; then
+  ok "36. receipt reason=clean + covered path (lint_clean true), reason=findings (lint_clean false)"
+else
+  bad "36. receipt reason/paths wrong (clean: rc=$rc $R ; findings: rc=$rc2 $R2)"
+fi
+
+# 37. a run that lints NOTHING writes no receipt and leaves lint_clean alone (documented) --
+#     and that bare true no longer passes the push gate: the gate wants evidence behind it
+D="$(mk_case zerofiles)"
+S="$D/repo/heimdall-state.json"
+HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.tests_passing' true >/dev/null
+rc="$(run_lint "$D")"
+gate_out="$(cd "$TMPROOT" && HEIMDALL_STATE_FILE="$S" "$STATE" check-quality-gates 2>&1)"; gate_rc=$?
+if [ "$rc" = "0" ] && [ ! -s "$TMPROOT/err" ] && [ "$(lint_clean "$D")" = "true" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run' "$S")" = "null" ] \
+   && [ "$gate_rc" = "2" ] && grep -q 'Lint not clean' <<<"$gate_out" && grep -q 'no-evidence' <<<"$gate_out"; then
+  ok "37. nothing edited → no receipt, lint_clean untouched, and a bare lint_clean=true no longer passes the push gate (no-evidence)"
+else
+  bad "37. zero-file run or the gate behind it is wrong (rc=$rc gate_rc=$gate_rc lint_clean=$(lint_clean "$D") gate: $gate_out)"
+fi
+
+# 38. END TO END: the receipt this tool really writes is what the push gate accepts, and it
+#     goes stale the moment a file it covers is modified afterwards
+D="$(mk_case e2e-gate)"
+printf '#!/usr/bin/env bash\necho a\n' > "$D/repo/a.sh"
+track "$D" "$D/repo/a.sh"
+S="$D/repo/heimdall-state.json"
+HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.tests_passing' true >/dev/null
+rc="$(run_lint "$D")"
+g1="$(cd "$TMPROOT" && HEIMDALL_STATE_FILE="$S" "$STATE" check-quality-gates 2>&1)"; g1rc=$?
+touch -t 203612310000 "$D/repo/a.sh"
+g2="$(cd "$TMPROOT" && HEIMDALL_STATE_FILE="$S" "$STATE" check-quality-gates 2>&1)"; g2rc=$?
+if [ "$rc" = "0" ] && [ "$g1rc" = "0" ] && [ "$g2rc" = "2" ] && grep -q 'stale' <<<"$g2"; then
+  ok "38. end to end: a real stop-lint receipt passes the gate; modifying a covered file afterwards makes it stale"
+else
+  bad "38. real receipt vs gate: rc=$rc first gate rc=$g1rc ($g1) after touch rc=$g2rc ($g2)"
+fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

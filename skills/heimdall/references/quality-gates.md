@@ -28,8 +28,8 @@ Every piece of work Heimdall produces passes through mandatory quality gates bef
 **Protocol**:
 1. Run project's configured linter (e.g., `npm run lint`)
 2. Run project's formatter in check mode (e.g., `npm run prettier:check`)
-3. If clean: `heimdall-state set '.quality_gates.lint_clean' 'true'`
-4. If violations: lint_clean remains false, push is blocked
+3. If clean: `bin/heimdall-stop-lint` records the run (`.quality_gates.lint_last_run` plus `lint_clean`) at Stop. Never hand-set `lint_clean`: the push gate re-reads `lint_last_run` and rejects a missing, failing, incomplete, tool-error or stale (a covered file edited after the run) receipt, and `heimdall-state mark-clean` only sets it against a passing one
+4. If violations, or a linter that could not run: lint_clean is false, push is blocked. A broken linter blocks until fixed or explicitly waived: `HMD_LINT_WAIVER='<reason>' heimdall-state mark-clean` (recorded in `.quality_gates.lint_waiver_log`, voided by the next lint run)
 
 ## Gate 3: Conflict Reflection
 

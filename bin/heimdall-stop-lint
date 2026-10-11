@@ -54,19 +54,37 @@
 #      then a one-line total.
 #   5. Record via `heimdall-state` (only when a state file already exists —
 #      `hmd init` owns creating it):
-#        .quality_gates.lint_clean      true  ⇔ every file checked, 0 findings
-#                                       false ⇔ any finding
-#                                       UNCHANGED when the run was incomplete
-#                                       (budget exhausted, a checker timed
-#                                       out, or a checker failed to run) with
-#                                       no finding yet
+#        .quality_gates.lint_clean      true  ⇔ every file checked, 0 findings,
+#                                             the run complete
+#                                       false ⇔ anything else: a finding, a
+#                                       checker that failed to run (reason
+#                                       tool-error), a timeout or an exhausted
+#                                       budget (reason incomplete). A run that
+#                                       reached no verdict must not leave an
+#                                       earlier true standing: that drift let a
+#                                       stale green (or a `mark-clean` hand
+#                                       flip) pass the push gate on the
+#                                       evidence of a run that checked nothing.
 #        .quality_gates.lint_last_run   {at, files, checked, findings, tools,
 #                                        complete, timeouts, tool_errors,
-#                                        skipped, excluded, source,
-#                                        + the shellcheck_severity in force}
-#                                        — the receipt. Additive
+#                                        skipped, excluded, source, reason,
+#                                        paths, + the shellcheck_severity in
+#                                        force} — the receipt. `reason` is
+#                                        clean | findings | tool-error |
+#                                        incomplete; `paths` are the absolute
+#                                        files the verdict covers, so the gate
+#                                        can tell evidence that predates a
+#                                        later edit of one of them. Additive
 #                                        key; `set` creates it, nothing in the
 #                                        schema enumerates quality_gates keys.
+#      A run that reaches no file at all (nothing edited, everything excluded,
+#      or only files of types with no checker) records NOTHING: no new evidence,
+#      and it never refreshes an old verdict. The gate therefore does not take
+#      a lint_clean=true as evidence by itself: `heimdall-state
+#      check-quality-gates` re-reads lint_last_run and refuses a missing,
+#      failing, incomplete, tool-error or stale (a covered file edited after
+#      the run) receipt, and `mark-clean` can no longer set lint_clean true
+#      without one.
 #
 # WHAT COUNTS AS A SHELLCHECK FINDING
 # -----------------------------------
@@ -117,11 +135,18 @@
 #   * reported loudly, per file, with the tool's own diagnostics
 #   * counted in the receipt's tool_errors, never in findings
 #   * the run is marked complete=false
-#   * lint_clean is LEFT EXACTLY AS IT WAS (a real finding from another checker
-#     in the same run still turns it false). A tool that could not run is no
-#     evidence of a problem (red would repeat the phantom-findings bug) and no
-#     evidence of cleanliness (green would be a hand flip with extra steps):
-#     the same non-verdict a timed-out checker already is.
+#   * lint_clean is set FALSE, with receipt reason "tool-error". A tool that
+#     could not run is no evidence of cleanliness, and leaving lint_clean as it
+#     was let an EARLIER true (a stale run, or a `mark-clean` hand flip) survive
+#     a run that checked nothing, so the push gate passed on old evidence. The
+#     phantom-findings bug is not repeated: the failure is counted in
+#     tool_errors, never in findings, and the reason says why. TRADE-OFF: a
+#     linter that is broken (config error, crash, missing interpreter) now
+#     BLOCKS the push until it is fixed, or explicitly and visibly waived:
+#     HMD_LINT_WAIVER='<reason>' heimdall-state mark-clean (recorded in
+#     .quality_gates.lint_waiver / lint_waiver_log, voided by the next lint
+#     run). A timed-out checker or an exhausted budget is the same non-verdict
+#     (reason "incomplete").
 #
 # ADVISORY, FAIL OPEN, ALWAYS EXIT 0
 # ----------------------------------
@@ -130,6 +155,9 @@
 # 0; a missing tracker, missing state file, unreadable file, absent linter,
 # or crashed linter is at most one stderr line, never a failure. Findings are
 # the signal; the exit code is not.
+# Fail open is about the HOOK (it never wedges the session), not about the state
+# it leaves: every run that reaches no verdict leaves lint_clean FALSE, never a
+# stale true.
 #
 # BOUNDED RUNTIME
 # ---------------
@@ -259,6 +287,10 @@ done
 
 # ── 3. detect checkers (never install) ───────────────────────────────────────
 HAVE_PERL=0; command -v perl >/dev/null 2>&1 && HAVE_PERL=1
+# The receipt's `at` is when the run STARTED, not when it ended: the gate calls a covered
+# file stale when it was modified after `at`, so a file edited WHILE this run was linting
+# (after its checker had already read it) must read as newer than the evidence.
+START_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 START_TS=$(date +%s)
 remaining() { local now; now=$(date +%s); echo $(( BUDGET - (now - START_TS) )); }
 
@@ -441,6 +473,7 @@ add_tool() { local t; for t in "${TOOLS_USED[@]:-}"; do [ "$t" = "$1" ] && retur
 
 # ── 4. run ───────────────────────────────────────────────────────────────────
 CHECKED=0
+CHECKED_PATHS=()
 FINDINGS=0
 SKIPPED_BUDGET=0
 MAX_DETAIL_LINES=6
@@ -484,7 +517,7 @@ for f in "${SHELL_FILES[@]:-}"; do
     run_bounded "$SHELLCHECK" -S "$SEVERITY" -f json "$f"; add_tool shellcheck
     classify_json sc_problems; apply_verdict shellcheck sc_lines
   fi
-  CHECKED=$((CHECKED + 1)); FINDINGS=$((FINDINGS + fcount))
+  CHECKED=$((CHECKED + 1)); CHECKED_PATHS+=("$f"); FINDINGS=$((FINDINGS + fcount))
   report "$f" "$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')" "$detail"
 done
 
@@ -507,7 +540,7 @@ for f in "${PY_FILES[@]:-}"; do
     classify_json ruff_problems; apply_verdict ruff ruff_lines
   fi
   if [ "${#parts[@]}" -eq 0 ]; then report "$f" "no python checker available"; continue; fi
-  CHECKED=$((CHECKED + 1)); FINDINGS=$((FINDINGS + fcount))
+  CHECKED=$((CHECKED + 1)); CHECKED_PATHS+=("$f"); FINDINGS=$((FINDINGS + fcount))
   report "$f" "$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')" "$detail"
 done
 
@@ -548,7 +581,7 @@ if [ "${#JS_FILES[@]}" -gt 0 ]; then
         else parts+=("tsc ok"); fi
       fi
       if [ "${#parts[@]}" -eq 0 ]; then report "$f" "skipped (budget)"; SKIPPED_BUDGET=$((SKIPPED_BUDGET + 1)); continue; fi
-      CHECKED=$((CHECKED + 1)); FINDINGS=$((FINDINGS + fcount))
+      CHECKED=$((CHECKED + 1)); CHECKED_PATHS+=("$f"); FINDINGS=$((FINDINGS + fcount))
       report "$f" "$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')" "$detail"
     done
   fi
@@ -570,7 +603,7 @@ if [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ]; then
   elif [ "$TOOL_ERRORS" -gt 0 ]; then verdict="no findings"; fi
   extra=""; [ "$SKIPPED_BUDGET" -gt 0 ] && extra=", $SKIPPED_BUDGET skipped (budget ${BUDGET}s exhausted)"
   [ "$TIMEOUTS" -gt 0 ] && extra="$extra, $TIMEOUTS checker call(s) timed out (per-call cap ${PER_CALL}s) — verdict incomplete"
-  [ "$TOOL_ERRORS" -gt 0 ] && extra="$extra, $TOOL_ERRORS checker call(s) failed to run (tool error, not lint findings) — verdict incomplete, lint_clean not moved by them"
+  [ "$TOOL_ERRORS" -gt 0 ] && extra="$extra, $TOOL_ERRORS checker call(s) failed to run (tool error, not lint findings) — verdict incomplete, lint_clean set false (reason tool-error)"
   say "$CHECKED file(s) checked, $verdict$extra"
 fi
 
@@ -584,8 +617,16 @@ fi
 if [ -n "$STATE" ] && [ -f "$STATE" ] && [ -x "$STATE_TOOL" ] && command -v jq >/dev/null 2>&1 \
    && { [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ]; }; then
   tools_json="$(printf '%s\n' "${TOOLS_USED[@]:-}" | grep -v '^$' | jq -R . | jq -sc .)"
+  paths_json="$(printf '%s\n' "${CHECKED_PATHS[@]:-}" | grep -v '^$' | jq -R . | jq -sc .)"
+  # Why this run did or did not earn lint_clean. tool-error outranks findings: it is
+  # the actionable label (a linter is broken) and the receipt still carries the
+  # findings count next to it.
+  REASON=clean
+  if [ "$TOOL_ERRORS" -gt 0 ]; then REASON=tool-error
+  elif [ "$FINDINGS" -gt 0 ]; then REASON=findings
+  elif [ "$COMPLETE" != true ]; then REASON=incomplete; fi
   receipt="$(jq -nc \
-    --arg at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    --arg at "$START_AT" \
     --argjson files "${#FILES[@]}" \
     --argjson checked "$CHECKED" \
     --argjson findings "$FINDINGS" \
@@ -596,14 +637,17 @@ if [ -n "$STATE" ] && [ -f "$STATE" ] && [ -x "$STATE_TOOL" ] && command -v jq >
     --argjson skipped "$SKIPPED_BUDGET" \
     --argjson excluded "$EXCLUDED" \
     --arg shellcheck_severity "$SEVERITY" \
-    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, tool_errors:$tool_errors, skipped:$skipped, excluded:$excluded, shellcheck_severity:$shellcheck_severity, source:"heimdall-stop-lint"}')"
+    --argjson paths "$paths_json" \
+    --arg reason "$REASON" \
+    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, tool_errors:$tool_errors, skipped:$skipped, excluded:$excluded, shellcheck_severity:$shellcheck_severity, reason:$reason, paths:$paths, source:"heimdall-stop-lint"}')"
   # Never let a state-tool hiccup (lock contention, malformed file) escape.
   HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_last_run' "$receipt" >/dev/null 2>&1 || true
-  if [ "$FINDINGS" -gt 0 ]; then
-    HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_clean' false >/dev/null 2>&1 || true
-  elif [ "$COMPLETE" = true ]; then
-    HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_clean' true >/dev/null 2>&1 || true
-  fi
+  # lint_clean is EARNED by a complete run with no findings and set false by every other
+  # outcome: a finding, a checker that failed to run (reason tool-error), a timeout or an
+  # exhausted budget (reason incomplete). Leaving it as it was on those let an earlier
+  # true survive a run that reached no verdict, and the push gate passed on it.
+  if [ "$REASON" = clean ]; then LINT_CLEAN=true; else LINT_CLEAN=false; fi
+  HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_clean' "$LINT_CLEAN" >/dev/null 2>&1 || true
 fi
 
 exit 0

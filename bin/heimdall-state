@@ -87,7 +87,7 @@ Commands:
   add-conflict <json>           Append a conflict entry to conflict_log
   check-quality-gates           Exit 0 if all gates pass, exit 2 if not
   mark-dirty                    Mark tests as needing re-run
-  mark-clean                    Mark all quality gates as passing
+  mark-clean                    Mark tests/dirty clean; lint_clean only against a passing lint_last_run (HMD_LINT_WAIVER=<reason> waives, logged)
   mark-tests-clean              Mark only tests_passing=true/dirty=false (leaves lint_clean alone)
   add-agent <id> <type>         Track an agent in agent_history
   add-tokens <count>            Add tokens to budget tracker (warns if over limit)
@@ -210,8 +210,25 @@ cmd_check_quality_gates() {
     echo "GATE FAILED: Tests not passing" >&2
     failed=1
   fi
-  if [ "$lint" != "true" ]; then
-    echo "GATE FAILED: Lint not clean" >&2
+  # ── LINT EVIDENCE ── `lint_clean` alone is a boolean anyone can flip (`mark-clean` did,
+  # with nothing run), and bin/heimdall-stop-lint used to leave a stale true standing when
+  # a linter failed to run or a run linted nothing -- so the gate passed on old evidence.
+  # The flag now only counts when the receipt it claims to summarise (lint_last_run) is
+  # complete, has 0 findings and 0 tool errors, and is not older than an edit to a file it
+  # covers. TRADE-OFF: a broken linter therefore blocks the push until it is fixed or
+  # explicitly waived (HMD_LINT_WAIVER='<reason>' heimdall-state mark-clean records the
+  # waiver in state and in a log; it is honoured here loudly, and only against the exact
+  # receipt it was issued for, so the next lint run voids it).
+  local lint_problem lint_waiver=""
+  lint_problem=$(lint_evidence_problem)
+  if [ "$lint" = "true" ] && [ -n "$lint_problem" ]; then lint_waiver=$(lint_waiver_reason); fi
+  if [ -n "$lint_waiver" ]; then
+    echo "LINT WAIVED: ${lint_waiver} -- the lint evidence is NOT passing (${lint_problem})" >&2
+  elif [ "$lint" != "true" ] || [ -n "$lint_problem" ]; then
+    echo "GATE FAILED: Lint not clean${lint_problem:+ -- $lint_problem}" >&2
+    if [ -n "$lint_problem" ]; then
+      echo "  Fix it and let bin/heimdall-stop-lint re-run, or waive explicitly (logged): HMD_LINT_WAIVER='<reason>' heimdall-state mark-clean" >&2
+    fi
     failed=1
   fi
   if [ "$reflection" != "true" ]; then
@@ -331,12 +348,77 @@ cmd_mark_dirty() {
   release_lock
 }
 
+# ── lint evidence ────────────────────────────────────────────────────────────────────
+# lint_evidence_problem -> prints why .quality_gates.lint_last_run is NOT passing evidence,
+# or nothing when it is. The receipt is written only by bin/heimdall-stop-lint; passing
+# means: it exists, no linter failed to run (tool-error), no findings, the run finished
+# (not a timeout / exhausted budget), it lists the files it covers, and none of those
+# files was modified after the run (stale). A deleted covered file cannot be wrong, so it
+# is skipped. The reason code is the first word: no-evidence, tool-error, findings,
+# incomplete, no-coverage, stale. Fails CLOSED: anything unreadable is a problem.
+lint_evidence_problem() {
+  local problem at_epoch p m
+  problem=$(jq -r '
+    .quality_gates.lint_last_run as $r
+    | if ($r | type) != "object" or ($r.source // "") != "heimdall-stop-lint" then
+        "no-evidence: no lint_last_run receipt from bin/heimdall-stop-lint, so lint_clean has nothing behind it"
+      elif ($r.tool_errors // 0) != 0 then
+        "tool-error: \($r.tool_errors) linter call(s) failed to run, and a linter that cannot run is no evidence of clean"
+      elif ($r.findings // 0) != 0 then
+        "findings: \($r.findings) lint finding(s) in the last run"
+      elif $r.complete != true then
+        "incomplete: the last lint run did not finish (checker timeout or budget exhausted)"
+      elif ($r.paths | type) != "array" then
+        "no-coverage: the receipt does not list the files it covers, so it cannot be checked for staleness"
+      elif (try ($r.at | fromdateiso8601) catch null) == null then
+        "no-evidence: the receipt has no readable timestamp"
+      else empty end' "$STATE_FILE" 2>/dev/null) || problem="no-evidence: lint_last_run could not be read from $STATE_FILE"
+  if [ -z "$problem" ]; then
+    {
+      read -r at_epoch || problem="no-evidence: the receipt timestamp could not be read"
+      while [ -z "$problem" ] && IFS= read -r p; do
+        [ -e "$p" ] || continue
+        m=$(stat -c %Y "$p" 2>/dev/null || stat -f %m "$p" 2>/dev/null || echo 0)
+        if [ "$m" -gt "$at_epoch" ]; then
+          problem="stale: $p was modified after the lint run that covers it, so that run is not evidence for what would be pushed - re-run bin/heimdall-stop-lint"
+        fi
+      done
+    } < <(jq -r '.quality_gates.lint_last_run | (.at | fromdateiso8601), .paths[]' "$STATE_FILE" 2>/dev/null)
+  fi
+  printf '%s' "$problem"
+}
+
+# lint_waiver_reason -> prints the recorded waiver's reason iff it was issued against the
+# receipt that is in the state file NOW (a later lint run replaces the receipt, voiding it).
+lint_waiver_reason() {
+  jq -r '.quality_gates as $g | ($g.lint_waiver // {}) as $w
+    | if ($w.reason // "") != "" and ($w.receipt_at // null) == ($g.lint_last_run.at // null)
+      then "\($w.reason) (waived \($w.at // "?"))" else empty end' "$STATE_FILE" 2>/dev/null || true
+}
+
 cmd_mark_clean() {
   ensure_state
   acquire_lock
-  local tmp
+  local tmp problem
+  problem=$(lint_evidence_problem)
   tmp=$(mktemp)
-  jq '.quality_gates.dirty = false | .quality_gates.tests_passing = true | .quality_gates.lint_clean = true' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  # lint_clean is EARNED by a passing lint_last_run, never asserted: this used to set it
+  # true with nothing run, which is how a stale green reached the push gate. Without
+  # evidence it is set false (a stale true is dropped) and the reason is printed; the one
+  # way past is an explicit, visible waiver (HMD_LINT_WAIVER=<reason>), recorded in state
+  # and in lint_waiver_log, and bound to the receipt it was issued against.
+  if [ -z "$problem" ]; then
+    jq '.quality_gates.dirty = false | .quality_gates.tests_passing = true | .quality_gates.lint_clean = true' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  elif [ -n "${HMD_LINT_WAIVER:-}" ]; then
+    jq --arg reason "$HMD_LINT_WAIVER" --arg problem "$problem" --arg at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+      '.quality_gates.dirty = false | .quality_gates.tests_passing = true | .quality_gates.lint_clean = true
+       | .quality_gates.lint_waiver = {reason: $reason, at: $at, problem: $problem, receipt_at: (.quality_gates.lint_last_run.at // null)}
+       | .quality_gates.lint_waiver_log = ((.quality_gates.lint_waiver_log // []) + [.quality_gates.lint_waiver])' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+    echo "LINT WAIVED by HMD_LINT_WAIVER: ${HMD_LINT_WAIVER} -- lint_clean=true is a waiver, not evidence (${problem}); recorded in .quality_gates.lint_waiver and lint_waiver_log" >&2
+  else
+    jq '.quality_gates.dirty = false | .quality_gates.tests_passing = true | .quality_gates.lint_clean = false' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+    echo "mark-clean: lint_clean NOT set -- ${problem}. Run bin/heimdall-stop-lint over the edited files, or waive explicitly: HMD_LINT_WAIVER='<reason>' heimdall-state mark-clean" >&2
+  fi
   release_lock
 }
 
