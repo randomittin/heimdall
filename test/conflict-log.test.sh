@@ -54,7 +54,7 @@ cd "$WORK"
 # ══════════════════════════════════════════════════════════════════════════
 heimdall-state init >/dev/null 2>&1
 heimdall-state set '.quality_gates.tests_passing' true >/dev/null 2>&1
-heimdall-state set '.quality_gates.lint_clean' true >/dev/null 2>&1
+HMD_LINT_WAIVER='fixture: this suite proves conflict reflection, not lint evidence' heimdall-state mark-clean >/dev/null 2>&1
 
 # ── 1. baseline: fresh state passes the gate (default reflection = true) ───
 if heimdall-state check-quality-gates >/dev/null 2>&1; then

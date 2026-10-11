@@ -146,7 +146,7 @@ if [ -x "$HS" ]; then
   # make_project() needs one for sections 0/1's branch/HEAD/worktree checks -- so a
   # legitimate PASS here now needs a receipt too, not just the 4 legacy booleans.
   P="$(make_project)"
-  ( cd "$P" && "$HS" init >/dev/null 2>&1 && "$HS" mark-clean >/dev/null 2>&1 )
+  ( cd "$P" && "$HS" init >/dev/null 2>&1 && HMD_LINT_WAIVER="fixture: checkpoint-depth is not about lint evidence" "$HS" mark-clean >/dev/null 2>&1 )
   P_CANON="$(git -C "$P" rev-parse --show-toplevel)"
   P_SHA="$(git -C "$P" rev-parse HEAD)"
   mkdir -p "$P/.heimdall/receipts"

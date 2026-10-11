@@ -129,7 +129,7 @@ fi
 
 # === CASE 2: verdict available and PASSING -> must NOT block =================
 C="$(new_cwd 2)"
-( cd "$C" && "$FAKE_PLUGIN/bin/heimdall-state" init >/dev/null 2>&1 && "$FAKE_PLUGIN/bin/heimdall-state" mark-clean >/dev/null 2>&1 )
+( cd "$C" && "$FAKE_PLUGIN/bin/heimdall-state" init >/dev/null 2>&1 && HMD_LINT_WAIVER="fixture: pre-push blocking is not about lint evidence" "$FAKE_PLUGIN/bin/heimdall-state" mark-clean >/dev/null 2>&1 )
 run_hook "$C" "git push origin main"
 if [ "$RC" = 0 ]; then
   ok "clean gates => push PROCEEDS (exit 0)"

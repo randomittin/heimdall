@@ -70,6 +70,9 @@ ROOT="$(cd "$HERE/.." && pwd)"
 RUN_ALL="$ROOT/test/run-all.sh"
 STATE_BIN="$ROOT/bin/heimdall-state"
 AUDIT_BIN="$ROOT/bin/heimdall-delivery-audit"
+# Fixtures that need a green gate but are not about lint waive it explicitly (section L):
+# mark-clean no longer sets lint_clean without a passing lint_last_run.
+LINT_FIXTURE_WAIVER="fixture: this suite proves the sweep-receipt gate, not lint evidence"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
@@ -97,7 +100,7 @@ newrepo() {  # <dir>
 }
 
 mk_state() {  # <dir> — heimdall-state.json with all four legacy gate flags green
-  ( cd "$1" && "$STATE_BIN" init >/dev/null 2>&1 && "$STATE_BIN" mark-clean >/dev/null 2>&1 )
+  ( cd "$1" && "$STATE_BIN" init >/dev/null 2>&1 && HMD_LINT_WAIVER="$LINT_FIXTURE_WAIVER" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
 }
 
 write_receipt() {  # <home> <repo> <head_sha> <tree_clean:true|false> <exit_code:0|1>
@@ -243,7 +246,7 @@ SUB_A_RC=$?
   && ok "A9 receipt tree_clean stays true -- untracked .planning/ledger/checkpoints/ file is the documented TEAM MODE carve-out, not a stale-green code change" \
   || bad "A9 tree_clean flipped false for an untracked substrate-only file" "$(cat "$RWS_RECEIPT" 2>/dev/null)"
 ( cd "$RWS" && HEIMDALL_STATE_FILE="$RWS_STATE" "$STATE_BIN" init >/dev/null 2>&1 \
-  && HEIMDALL_STATE_FILE="$RWS_STATE" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
+  && HEIMDALL_STATE_FILE="$RWS_STATE" HMD_LINT_WAIVER="$LINT_FIXTURE_WAIVER" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
 SUB_GATE1_OUT="$(cd "$RWS" && HEIMDALL_HOME="$RWS/.heimdall" HEIMDALL_STATE_FILE="$RWS_STATE" "$STATE_BIN" check-quality-gates 2>&1)"; SUB_GATE1_RC=$?
 [ "$SUB_GATE1_RC" = 0 ] \
   && ok "A10 check-quality-gates PASSES against this receipt -- an untracked runtime/coordination file alone never blocks the gate" \
@@ -489,6 +492,100 @@ OUT_K8="$(gate_run "$RK" "$HOME_K3" 2>&1)"; RC_K8=$?
   || bad "K8 expected exit 2, got $RC_K8" "$OUT_K8"
 echo "$OUT_K8" | grep -qi "STALE" \
   && ok "K9 message says STALE" || bad "K9 message does not say STALE" "$OUT_K8"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# L. LINT EVIDENCE -- the gate and mark-clean never pass on stale, failing or ABSENT
+#    lint evidence (security review of the stop-lint changes: "fail-open-state-drift").
+#    lint_clean alone is a boolean anyone can flip -- `mark-clean` did, with nothing
+#    run -- and bin/heimdall-stop-lint left a stale true standing when a linter failed
+#    to run or a run linted nothing. Non-git fixture dirs: the sweep-receipt block is a
+#    documented no-op there, so the lint check is the only live variable.
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "L. lint evidence (check-quality-gates + mark-clean)"
+LROOT="$WORK/lint-evidence"; mkdir -p "$LROOT"
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+lstate() {  # <dir> <heimdall-state args...> -- always against that dir's own state file
+  local d="$1"; shift
+  ( cd "$d" && HEIMDALL_STATE_FILE="$d/heimdall-state.json" "$STATE_BIN" "$@" )
+}
+lint_fixture() {  # <name> -> dir: every OTHER gate green, lint_clean=true (the stale / hand-set claim), one lintable file
+  local d="$LROOT/$1"; mkdir -p "$d"
+  lstate "$d" init >/dev/null 2>&1
+  lstate "$d" set '.quality_gates.tests_passing' true >/dev/null 2>&1
+  lstate "$d" set '.quality_gates.lint_clean' true >/dev/null 2>&1
+  printf '#!/usr/bin/env bash\necho a\n' > "$d/a.sh"
+  printf '%s' "$d"
+}
+lint_receipt() {  # <dir> <at> <findings> <tool_errors> <complete:true|false> -> a receipt shaped like bin/heimdall-stop-lint's
+  lstate "$1" set '.quality_gates.lint_last_run' "$(jq -nc --arg at "$2" --argjson f "$3" --argjson t "$4" --argjson c "$5" --arg p "$1/a.sh" \
+    '{at:$at, files:1, checked:1, findings:$f, tools:["bash -n"], complete:$c, timeouts:0, tool_errors:$t, skipped:0, excluded:0, shellcheck_severity:"warning", reason:"fixture", paths:[$p], source:"heimdall-stop-lint"}')" >/dev/null 2>&1
+}
+lint_gate() {  # <dir> -> LG_OUT, LG_RC
+  LG_OUT="$(cd "$1" && HEIMDALL_STATE_FILE="$1/heimdall-state.json" "$STATE_BIN" check-quality-gates 2>&1)"; LG_RC=$?
+}
+lint_gate_blocks() {  # <label> <reason-code> (reads LG_OUT / LG_RC)
+  if [ "$LG_RC" = 2 ] && grep -q 'Lint not clean' <<<"$LG_OUT" && grep -q -- "$2" <<<"$LG_OUT"; then ok "$1"
+  else bad "$1 -- expected exit 2 naming '$2', got exit $LG_RC" "$LG_OUT"; fi
+}
+
+D="$(lint_fixture ok)"; lint_receipt "$D" "$(now_iso)" 0 0 true; lint_gate "$D"
+[ "$LG_RC" = 0 ] && ok "L1 passing receipt (complete, 0 findings, 0 tool errors, covered file unchanged) + lint_clean=true -> gate PASSES" \
+  || bad "L1 expected exit 0, got $LG_RC" "$LG_OUT"
+
+D="$(lint_fixture none)"; lint_gate "$D"
+lint_gate_blocks "L2 lint_clean=true with NO lint_last_run (a hand flip) -> gate BLOCKS" "no-evidence"
+
+D="$(lint_fixture findings)"; lint_receipt "$D" "$(now_iso)" 2 0 true; lint_gate "$D"
+lint_gate_blocks "L3 lint_clean=true but the receipt says findings=2 (the observed mark-clean drift) -> gate BLOCKS" "findings"
+
+D="$(lint_fixture toolerr)"; lint_receipt "$D" "$(now_iso)" 0 1 false; lint_gate "$D"
+lint_gate_blocks "L4 lint_clean=true but the receipt has a tool error -> gate BLOCKS (tool-error)" "tool-error"
+grep -q 'HMD_LINT_WAIVER' <<<"$LG_OUT" && ok "L4b the block names the explicit, logged waiver as the way past a broken linter" \
+  || bad "L4b block message does not name HMD_LINT_WAIVER" "$LG_OUT"
+
+D="$(lint_fixture incomplete)"; lint_receipt "$D" "$(now_iso)" 0 0 false; lint_gate "$D"
+lint_gate_blocks "L5 a receipt with complete=false (timeout / budget exhausted) -> gate BLOCKS" "incomplete"
+
+D="$(lint_fixture stale)"; lint_receipt "$D" "2020-01-01T00:00:00Z" 0 0 true; lint_gate "$D"
+lint_gate_blocks "L6 a passing receipt OLDER than an edit to a file it covers -> gate BLOCKS (stale)" "stale"
+
+D="$(lint_fixture nocover)"
+lstate "$D" set '.quality_gates.lint_last_run' "$(jq -nc --arg at "$(now_iso)" '{at:$at, complete:true, findings:0, tool_errors:0, source:"heimdall-stop-lint"}')" >/dev/null 2>&1
+lint_gate "$D"
+lint_gate_blocks "L7 a receipt that does not list the files it covers cannot be checked for staleness -> gate BLOCKS" "no-coverage"
+
+D="$(lint_fixture mc-none)"
+MC_OUT="$(lstate "$D" mark-clean 2>&1)"; MC_RC=$?
+if [ "$MC_RC" = 0 ] && [ "$(jq -r '.quality_gates.lint_clean' "$D/heimdall-state.json")" = "false" ] \
+   && [ "$(jq -r '.quality_gates.tests_passing' "$D/heimdall-state.json")" = "true" ] && grep -q 'NOT set' <<<"$MC_OUT"; then
+  ok "L8 mark-clean with no passing lint_last_run does NOT set lint_clean (drops a stale true), says so, still marks tests clean"
+else
+  bad "L8 mark-clean claimed lint_clean without evidence (rc=$MC_RC)" "$MC_OUT $(jq -c .quality_gates "$D/heimdall-state.json")"
+fi
+
+D="$(lint_fixture mc-ok)"; lstate "$D" set '.quality_gates.lint_clean' false >/dev/null 2>&1; lint_receipt "$D" "$(now_iso)" 0 0 true
+lstate "$D" mark-clean >/dev/null 2>&1
+[ "$(jq -r '.quality_gates.lint_clean' "$D/heimdall-state.json")" = "true" ] \
+  && ok "L9 mark-clean WITH a passing lint_last_run sets lint_clean" \
+  || bad "L9 mark-clean did not set lint_clean despite passing evidence" "$(jq -c .quality_gates "$D/heimdall-state.json")"
+
+D="$(lint_fixture waiver)"; lint_receipt "$D" "$(now_iso)" 0 1 false
+WS="$D/heimdall-state.json"
+WV_OUT="$(HMD_LINT_WAIVER='eslint config broken, tracked in #12' lstate "$D" mark-clean 2>&1)"
+if [ "$(jq -r '.quality_gates.lint_clean' "$WS")" = "true" ] \
+   && [ "$(jq -r '.quality_gates.lint_waiver.reason' "$WS")" = "eslint config broken, tracked in #12" ] \
+   && [ "$(jq -r '.quality_gates.lint_waiver_log | length' "$WS")" = "1" ] && grep -q 'LINT WAIVED' <<<"$WV_OUT"; then
+  ok "L10 HMD_LINT_WAIVER on mark-clean records an explicit, visible waiver (state + log) and says so"
+else
+  bad "L10 waiver not recorded visibly" "$WV_OUT $(jq -c .quality_gates "$WS")"
+fi
+lint_gate "$D"
+{ [ "$LG_RC" = 0 ] && grep -q 'LINT WAIVED' <<<"$LG_OUT"; } \
+  && ok "L11 the gate honours the recorded waiver, LOUDLY (never a silent pass)" \
+  || bad "L11 expected exit 0 plus a LINT WAIVED line, got $LG_RC" "$LG_OUT"
+lint_receipt "$D" "2031-01-01T00:00:00Z" 0 1 false; lint_gate "$D"
+lint_gate_blocks "L12 a NEW lint run voids the waiver (it was issued against the previous receipt) -> gate BLOCKS again" "tool-error"
 
 echo
 printf "  Results: %d passed, %d failed\n" "$PASS" "$FAIL"
