@@ -7,7 +7,7 @@
       "id": "parallel-gate",
       "description": "Injects a delegation directive when a prompt looks multi-part (heuristic, ~1ms).",
       "matcher": "",
-      "fingerprint": "f80665a729244616f95ecd0a2f68dc1a26a1864be48a60911ba1c87611e8e30f",
+      "fingerprint": "b7a91574dd20ba9dbfa16093e3daafa768fe82d9747f12db4ffd789f8b16d187",
       "locked": false,
       "remote_toggle": true
     },
@@ -17,7 +17,7 @@
       "id": "ctx-meter-notice",
       "description": "Prints the context-window meter notice from heimdall-ctx-meter.",
       "matcher": "",
-      "fingerprint": "b4ec5067ce255dd6706497e87e9ccc30b0c433c06d4795b556f3b8fdbdb640e5",
+      "fingerprint": "1ee9504ef0706b674d8dbe95a2419e609ebf995595f74713f63fc55df709cbb1",
       "locked": false,
       "remote_toggle": true
     },
@@ -27,7 +27,7 @@
       "id": "secret-paste-filter",
       "description": "REFUSES a prompt carrying a pasted credential so the value is never transmitted (heimdall-secret-filter).",
       "matcher": "",
-      "fingerprint": "92095206bf33235fa490d733acbebb02debf55a1d0d981f9bcd5ca658a36eb01",
+      "fingerprint": "615eec9f6ece60e21620adccf87ca355a2dc952162428a51622bd50359efce55",
       "locked": true,
       "remote_toggle": false
     },
@@ -37,7 +37,7 @@
       "id": "caveman-level-context",
       "description": "Adds the current caveman compression level as additionalContext on every prompt.",
       "matcher": "",
-      "fingerprint": "d573a9aed96110192381b8a50ef55662d9fdf9f1e786cc247a82ed8f0ee5d370",
+      "fingerprint": "61b371631adb8e461f3822e757668d25249af2d4924097ebc11720a15d255528",
       "locked": false,
       "remote_toggle": true
     },
@@ -47,7 +47,7 @@
       "id": "inbox-deliver-prompt",
       "description": "Fallback delivery of companion-app inbox messages via heimdall-inbox-deliver prompt: pops immediately at UserPromptSubmit, never waits, no-op when the inbox is empty.",
       "matcher": "",
-      "fingerprint": "078cef18503cc09afdc17ac8c6b12016fbb54d950ba5dbd3f4452b1de9106dd8",
+      "fingerprint": "cbd460e7d35c3ed5b43c572c7bd7890d9aa52823172cd2148de38c5c2766e25a",
       "locked": false,
       "remote_toggle": false
     },
@@ -57,7 +57,7 @@
       "id": "phone-control-prompt",
       "description": "Drops a pending phone `interrupt` request (<repo>/.heimdall/ui/stop-request.json) at UserPromptSubmit via heimdall-phone-control prompt, so a stale stop flag can never end the NEXT turn. A file test runs first, so nothing pending costs no process. Attended sessions only. Not remote_toggle: the phone cannot switch off its own stop path.",
       "matcher": "",
-      "fingerprint": "6c10c005f06563f818e7c1fa1bc423d2c0a265e595c3df1d43ce43499b754f56",
+      "fingerprint": "c0b563e981f7ed60cd89e9665861218dd55848e6cb594d566e7d7c532612d907",
       "locked": false,
       "remote_toggle": false
     },
@@ -67,7 +67,7 @@
       "id": "bash-gate-chain",
       "description": "git-guard stale-lock clear, commit secret scan, pre-push quality/secret/selfscan/oracle/corpus gates (exit 2 blocks).",
       "matcher": "Bash",
-      "fingerprint": "89380acf14f0081e868dab8f447a2373f1f9484050da491c18dd422e2d3bead9",
+      "fingerprint": "5f177c3fa2ba4dfc09ffee2d7e8759f03d097b7c0b46fed4719e5a21da114c35",
       "locked": true,
       "remote_toggle": false
     },
@@ -77,7 +77,7 @@
       "id": "parallelism-tracker-read",
       "description": "Counts Read/Grep/Glob calls for the parallelism grade.",
       "matcher": "Read|Grep|Glob",
-      "fingerprint": "3334862e18768af3c358c7de8b132c453c5c48bf8f74d676ac6fc3ab8b83a962",
+      "fingerprint": "0cdeb5b09785c67bbcf8fd84124e7b9c777cf1db9f5631b02c7d829753917241",
       "locked": false,
       "remote_toggle": true
     },
@@ -87,7 +87,7 @@
       "id": "agent-precheck",
       "description": "Named-agent notice and the brief-adoption gate that rewrites oversized spawn prompts (heimdall-precheck-agent).",
       "matcher": "Agent",
-      "fingerprint": "c118a62f324f57c64222c0c5efd06e84482a41aec44f0fea7082348df7ee0ef7",
+      "fingerprint": "dabe96416c7faa94a2a26fb679be1a30916d46b6b140dd02cece21a82cfa9a75",
       "locked": true,
       "remote_toggle": false
     },
@@ -97,7 +97,7 @@
       "id": "stub-gate",
       "description": "BIFROST stub gate: blocks Write/Edit content matching an unfinished-code shape (exit 2).",
       "matcher": "Write|Edit",
-      "fingerprint": "7d928d43b6a30e7f33ee8792637addb5a32a1dddf7003359cca31120864a7fad",
+      "fingerprint": "7b4af3570e71a13c08155455c8e131e04c21c58be6cc51e4d6c008b6facaa407",
       "locked": true,
       "remote_toggle": false
     },
@@ -107,7 +107,7 @@
       "id": "edit-claim-prewarn",
       "description": "Advisory collision pre-warning when a live teammate holds a claim on the file (heimdall-precheck-edit).",
       "matcher": "Edit|MultiEdit|Write",
-      "fingerprint": "040330e1f87513058b30939367db18949e3633e61064dd4b4d555c91b1d8a4f1",
+      "fingerprint": "cb76a63ec76328cb166cfce6f525f608ca45e4a37a007fa57644bf4b28712176",
       "locked": false,
       "remote_toggle": false
     },
@@ -117,7 +117,7 @@
       "id": "secret-read-guard",
       "description": "BLOCKS Read/Grep/Glob/Bash reads of credential-bearing files before they enter model context.",
       "matcher": "Read|Grep|Glob|Bash",
-      "fingerprint": "011c97a6a143978ce55ee947f7376826ce5f225fda68a5f6a53bf37a62393f15",
+      "fingerprint": "251dc7d46f4f79c62bf421776cbf1e94b42c7f5338127410df0a8b74652cc89a",
       "locked": true,
       "remote_toggle": false
     },
@@ -127,7 +127,7 @@
       "id": "lintconfig-guard",
       "description": "Deny edits to linter/formatter/typechecker config (anti-evasion; operator override HMD_ALLOW_LINTCONFIG_EDIT=1)",
       "matcher": "Write|Edit|MultiEdit|Bash",
-      "fingerprint": "add8171bbbe6d7011a8216cf17c98d0ef772f830f6d07bff5d68183b573dfd84",
+      "fingerprint": "1d2add74eb09e62ccfe93b18625ec56722a175b4e2bb7202a552c6db296e6058",
       "locked": true,
       "remote_toggle": false
     },
@@ -137,7 +137,7 @@
       "id": "phone-deny",
       "description": "On by default (off: HMD_PHONE_DENY=0, or heimdall-hooks disable phone-deny): holds a risky shell command or outside-the-repo write for up to HMD_PHONE_DENY_WINDOW_S (default 10 s, max 120) so the paired phone can deny it, or stop the turn, over the sealed relay. The phone can only reduce what runs, never approve; no connected companion (a file test on <repo>/.heimdall/app/connect.json skips the hook first), no reply, an unattended session or any error -> does nothing and exits 0 (Claude Code's normal permission flow proceeds).",
       "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
-      "fingerprint": "5f0c424ee1a22e9d7fa2effb7511391e91d642cb6260a879713bc6d1b5fc87f6",
+      "fingerprint": "3a9b90153424cf663c390f0f9956b6e2cae5082e6a216fa15799e21425dc3ef1",
       "locked": false,
       "remote_toggle": false
     },
@@ -147,7 +147,7 @@
       "id": "inbox-deliver-pretool",
       "description": "Mid-turn delivery of companion-app inbox messages before a tool runs, via heimdall-inbox-deliver tool: pops the queue and returns it as hookSpecificOutput.additionalContext behind the companion-inbox provenance marker, so a phone message reaches the running turn at its next tool boundary instead of when the turn ends. A file-size test on <repo>/.heimdall/ui/inbox.jsonl runs before anything else, so an empty inbox costs no python and no git. Never consumes for a headless claude -p / SDK session, an hmd sub-session or a subagent's own tool call; never carries a permissionDecision. Every receipt is stamped exactly as the Stop path stamps it.",
       "matcher": "*",
-      "fingerprint": "006164cb1d93eb7556ab1eca94cd0e2f4914343f68a6232c07900a09f3764f92",
+      "fingerprint": "9c22a8496b58f6c8b3b93842c1227b703302bbd4673708d843f4e16c2cca9ac3",
       "locked": false,
       "remote_toggle": false
     },
@@ -157,7 +157,7 @@
       "id": "phone-control-pretool",
       "description": "Honours the phone's `interrupt` before a tool runs, via heimdall-phone-control stop: a stop request younger than 120 s is consumed once (renamed to stop-request.consumed) and answered with {continue:false, stopReason}. A file test on <repo>/.heimdall/ui/stop-request.json runs first, so a tool call with nothing pending costs one shell builtin. Attended sessions only; never blocks on its own failure. Not remote_toggle: the phone cannot switch off its own stop path.",
       "matcher": "*",
-      "fingerprint": "33726e9338420fd925f6942bca341d4e25452914b1976d969b787b8522c9762b",
+      "fingerprint": "bee556b0e574515f370a0667f630bdf4edaf1c511d5f97e8c8bc9e5b4f0c8d57",
       "locked": false,
       "remote_toggle": false
     },
@@ -167,7 +167,7 @@
       "id": "corpus-capture",
       "description": "Captures a failed oracle report into the regression corpus after a Bash call.",
       "matcher": "Bash",
-      "fingerprint": "72e1d9cdb35228d6a1a1076a3b601c119689a56032387a4aa50c3e468ca9e769",
+      "fingerprint": "17e233e07beec6fd490edd7186fdc12ce6cbef9d224d7ce10cac94aa8752f74a",
       "locked": false,
       "remote_toggle": true
     },
@@ -177,7 +177,7 @@
       "id": "edit-tracker",
       "description": "Logs every edit, marks heimdall-state dirty (arms the pre-push quality gate), autocommits at 5+ changed files.",
       "matcher": "Write|Edit|MultiEdit|NotebookEdit",
-      "fingerprint": "67b84708a942f8593aae148097a4c9a36c63aab68c489fb6c057d3119a1ee26c",
+      "fingerprint": "222148d21b59f1d4191895ed80a6fc1030f61e8d361253e416a29bde9702620f",
       "locked": true,
       "remote_toggle": false
     },
@@ -187,7 +187,7 @@
       "id": "context-sync",
       "description": "Background, throttled heimdall-context-sync after a Write/Edit.",
       "matcher": "Write|Edit",
-      "fingerprint": "ba1bacbb6baa0f5f1a9186094e82114f862f4cbee51cccb20dcf365e0300d8b8",
+      "fingerprint": "989abb43f9bcd48170e5a5d1acd307bc4f0af5ddde2e5b22d7a42450e876680e",
       "locked": false,
       "remote_toggle": false
     },
@@ -197,7 +197,7 @@
       "id": "journal-commit",
       "description": "Writes a journal entry when a Bash call landed a new git commit.",
       "matcher": "Bash",
-      "fingerprint": "ef3ec6696a95f634e842131b2a0603de618224864080790b0d50ba31af1a5e70",
+      "fingerprint": "b4b0da8999d68c3a204817970ad852f7f463d6ea554af0f656b3d87e4d43acce",
       "locked": false,
       "remote_toggle": false
     },
@@ -207,7 +207,7 @@
       "id": "inbox-deliver-posttool",
       "description": "Mid-turn delivery of companion-app inbox messages after a tool ran, via heimdall-inbox-deliver tool: the same pop, marker, caps and receipts as inbox-deliver-pretool, returned as PostToolUse additionalContext next to the tool result and read on the model's next request. Fires on every tool call, so a file-size test on <repo>/.heimdall/ui/inbox.jsonl runs first and an empty inbox costs no python and no git. Never consumes for a headless claude -p / SDK session, an hmd sub-session or a subagent's own tool call.",
       "matcher": "*",
-      "fingerprint": "1e2f12e71357c615b660c27c11226bbf460f46a49f53f8c826e504f05537f764",
+      "fingerprint": "56e5630fca9909d45458fcbd2f1ada5ea47d99aeb3ee2a48ee75223af1b07912",
       "locked": false,
       "remote_toggle": false
     },
@@ -217,7 +217,7 @@
       "id": "phone-control-posttool",
       "description": "Honours the phone's `interrupt` after a tool ran, via heimdall-phone-control stop: the same single-use, 120 s request as phone-control-pretool, so a stop lands the moment a long tool call returns instead of one model reply later. File-test fast path; attended sessions only; never blocks on its own failure. Not remote_toggle.",
       "matcher": "*",
-      "fingerprint": "acc38cbac8e2f69282499732584cecb2ac21d460e78213b440e0ab9b16448460",
+      "fingerprint": "63099b469fd1513511960b50ab5575f20309b212151784769f33082401fabcf3",
       "locked": false,
       "remote_toggle": false
     },
@@ -227,7 +227,7 @@
       "id": "session-bootstrap",
       "description": "Autoupdate check, statusline register, selfheal, tracker builds, state init, stack detect, team/presence beat, reap/cleanup advice, checkpoint notice.",
       "matcher": "",
-      "fingerprint": "e8234fe30341fdc7f5bb0d6102853dcaca25404fcc23c2664e77ae969f33a213",
+      "fingerprint": "f37a091f5dba51bb727d94f1b103a813f401b6f2ff6f65a7d7016f423536649a",
       "locked": false,
       "remote_toggle": false
     },
@@ -237,7 +237,7 @@
       "id": "resume-probe",
       "description": "Runs heimdall-resume-probe (10s alarm) when a CHECKPOINT.md exists and prints its head.",
       "matcher": "",
-      "fingerprint": "43b61c54637592aefbbc49d10faadf73974816ef5b4011c2044671ebe4089160",
+      "fingerprint": "9624c0228ff477d723ddb8c6e31ed3a7cc30c18be58458bbf21713b20b7a7ecc",
       "locked": false,
       "remote_toggle": true
     },
@@ -247,7 +247,7 @@
       "id": "maintain-resume-hint",
       "description": "heimdall-maintain-loop resume-hint.",
       "matcher": "",
-      "fingerprint": "255dc069d5993a1f505f99ae99410e8989a3ef024f67924c5aa34ec48cf10884",
+      "fingerprint": "5134324628d5a402d6ef4cf149ae038ea9112d42b35ef048acf987f5d74396eb",
       "locked": false,
       "remote_toggle": true
     },
@@ -257,7 +257,7 @@
       "id": "quota-resume-hint",
       "description": "heimdall-quota-resume resume-hint.",
       "matcher": "",
-      "fingerprint": "92bb68d091d58f77c8b198142ef2d67e6cc2437ced0db63c78cb4e23aca86bb0",
+      "fingerprint": "4182fdf865854c56534c4d5ae42d322644ade455fc218517595db44a212a4397",
       "locked": false,
       "remote_toggle": true
     },
@@ -267,7 +267,7 @@
       "id": "dream-notice",
       "description": "heimdall-dream-notice for the repo.",
       "matcher": "",
-      "fingerprint": "e99050636e047e42bf9ed6cde01fdb15ba42b9d7a0da215964416b2e67ba7aa4",
+      "fingerprint": "143dee05b75839b364e10c0d1498fc15edf6dee94d7265a30348731363c747fa",
       "locked": false,
       "remote_toggle": true
     },
@@ -277,7 +277,7 @@
       "id": "presence-keeper-start",
       "description": "Starts the presence keeper for this session in the background (paired with presence-keeper-stop).",
       "matcher": "",
-      "fingerprint": "5ac2bdaddce4896ff26b93eb7160f252945bb4a59e10bbe316073ff999f54946",
+      "fingerprint": "454097eb5ee58a04b96e4b516586eec25b117148b375d77c6fb8d9e92c43c2a0",
       "locked": false,
       "remote_toggle": false
     },
@@ -287,7 +287,7 @@
       "id": "presence-connect-prompt",
       "description": "heimdall-presence connect-prompt.",
       "matcher": "",
-      "fingerprint": "467e89bcab759e9834fdad3e5e17bac128ddb4c742608feae3c7822b166771b2",
+      "fingerprint": "006a281ea3602816d2d8d916ba957c049e4e6a701b172d5e93ce61c8777ebcad",
       "locked": false,
       "remote_toggle": true
     },
@@ -297,7 +297,7 @@
       "id": "ai-select",
       "description": "heimdall-ai-select session-start.",
       "matcher": "",
-      "fingerprint": "a0401ff9f4709db8b107a388b24fe01d5b939e4ef095a8344714757e4938a52e",
+      "fingerprint": "62f0341061b9e553c42588db44b8b226a816e5b17d65311a7d18b5c34c9e03a6",
       "locked": false,
       "remote_toggle": false
     },
@@ -307,7 +307,7 @@
       "id": "claude-mem-scrub",
       "description": "Restarts a claude-mem daemon that is running with a routing/fallback-credential-contaminated env (credential egress fix C-1).",
       "matcher": "",
-      "fingerprint": "a66bb9cf1b00b806de78c958d1d6b19a992fd537a0c8e9071c9445ff63358bbc",
+      "fingerprint": "db59074a7202b7af9ee4d751096326fb342f20f0d382b22a21dfaf88ca808470",
       "locked": true,
       "remote_toggle": false
     },
@@ -317,7 +317,7 @@
       "id": "caveman-rules",
       "description": "Prints the caveman compression rules into session context.",
       "matcher": "",
-      "fingerprint": "167e83fc43c2004d52548b72d74c002483e4f13d335f12e67371fd5681a1a212",
+      "fingerprint": "467fb01e0189888329d02f1c257148cda1381114453b826d56b655c41b891454",
       "locked": false,
       "remote_toggle": true
     },
@@ -327,7 +327,7 @@
       "id": "settings-guard",
       "description": "Advisory: warns about ANTHROPIC_* overrides persisted in a Claude Code settings.json env block (5s alarm).",
       "matcher": "",
-      "fingerprint": "7868c341d50697b5e914cbc3c1103642a45480b5c98e02e397aef96e6b5b2114",
+      "fingerprint": "89af74c0dfc30a96f302910f614a30a2e1a30cd0c288cee7c39b6ab846ddc379",
       "locked": false,
       "remote_toggle": false
     },
@@ -337,7 +337,7 @@
       "id": "volatile-repo-guard",
       "description": "Advisory: warns when the clone sits on volatile disk holding unpushed work (5s alarm).",
       "matcher": "",
-      "fingerprint": "c8aa653659fb8e14c718fc38194e79ca00cb7af82d1b344b045ca58109e9323f",
+      "fingerprint": "9154aa778f729a982cb836d22ac2ba1a8fb11be4908f3d2ef075ed09c3d5c6dc",
       "locked": false,
       "remote_toggle": false
     },
@@ -347,7 +347,7 @@
       "id": "pair-window-start",
       "description": "Records this session (<repo>/.heimdall/app/sessions/<id>.json, 0600) and -- when gh is signed in and no window is open -- opens the REPO's pair-by-code window in the background (hmd app pair-window). The window and its code belong to the repo, not to a session: the code is the same one the statusline and hmd app connect show in every session, and it is opened again at every start, resume, /clear and compact, so a restart never leaves the code dark. A phone signed in to the same GitHub account that types the code pairs at once, with no number to compare and a notice in the session and on the statusline. Sends the laptop's gh token to the relay (over TLS, on a pipe) each time it registers the code: the relay keeps a registration 360 s, so it renews about every 350 s (HMD_PAIR_WINDOW_RENEW_MIN_S floor 300 s, HMD_PAIR_WINDOW_RENEW_LEAD_S 10 s ahead of the lapse) and the code stays claimable. Stops for good after 4 hours (HMD_PAIR_WINDOW_IDLE_H, 0 = never) with no phone paired and no activity in any session of the repo, or when no session of the repo is alive and no hmd app connect client runs; the next session or hmd app connect opens it again. Skipped when gh is signed out, in an unattended session (claude -p, an hmd sub-session) and under HMD_PAIR_WINDOW=0; disabling it (heimdall-hooks disable pair-window-start) leaves pairing to hmd app connect. Paired with pair-window-stop.",
       "matcher": "",
-      "fingerprint": "de3ca542ee634462a0cb08faefb82d6cf60ee7be06c51f897390a872c603553b",
+      "fingerprint": "d4e0c1252de7931c217be3245b309eb0633671cecd2a6048565363f8a7e1fc3c",
       "locked": false,
       "remote_toggle": false
     },
@@ -357,7 +357,7 @@
       "id": "inbox-wake-register",
       "description": "Records this session's wake coordinates for bin/heimdall-inbox-wake: its pid, terminal and, when it runs inside tmux, its own pane (TMUX_PANE, validated as %N, plus the tmux socket) under <repo>/.heimdall/ui/wake/<pid>.json at 0600, and prunes records of dead sessions. Attended sessions only (never headless claude -p / SDK or an hmd sub-session). Reads the hook payload on stdin, changes nothing else, exits 0 on every path.",
       "matcher": "",
-      "fingerprint": "122090db1ff14a2241322f04f5fb7a61818a766947f9586f3baa4f697438bdcf",
+      "fingerprint": "a1f3dafe093c8d14d011072147a483a8c0a6e449f94679e86ab21d6342f5203b",
       "locked": false,
       "remote_toggle": false
     },
@@ -367,7 +367,7 @@
       "id": "inbox-wake-arm-start",
       "description": "Starts bin/heimdall-inbox-wake watch as an asyncRewake hook (runs in the background; exit 2 wakes the model) so a session left idle at an empty prompt from the start is woken when a phone message arrives. One watcher per session (a second exits at once), woken-once per record id, bounded to 8h (the hook timeout) and re-armed by inbox-wake-arm-stop. The wake text is a constant and carries no phone text; the inbox-deliver hooks still hand the message over behind their provenance marker. Fires only for a pending record the paired phone wrote, while the session is idle, no Stop hold is live and nobody is typing.",
       "matcher": "",
-      "fingerprint": "94f76df2d5906716bb081dc8b2ae09f495221afbdd453c245ba08b6c7bfb32d6",
+      "fingerprint": "072ad43917e126ddd7c0977f132b4401b168a1c998398de88a8e0fe89f965a62",
       "locked": false,
       "remote_toggle": false
     },
@@ -377,7 +377,7 @@
       "id": "subagent-metric",
       "description": "Records a heimdall-metric task outcome for the finished subagent.",
       "matcher": "",
-      "fingerprint": "e631cbb84435f3b2b30f2968040cdd0d93a05759ba2d8fc41e7bc9b7e12b9df6",
+      "fingerprint": "adb50bd73bae88ec01ee8e5988cb48799e129c99d96415242efbb12311fcb7cf",
       "locked": false,
       "remote_toggle": true
     },
@@ -387,7 +387,7 @@
       "id": "subagent-429-detect",
       "description": "Scans the subagent transcript for a 429/rate-limit and marks it for fallback routing.",
       "matcher": "",
-      "fingerprint": "9b1d7cd7e6b6ebada6d666ec2bfad86513a0cbe5856c850b3f84f67e43a0e6bb",
+      "fingerprint": "98ce1b970509ec22070678304491487a1cea511908afc3b30ac318b2de098249",
       "locked": false,
       "remote_toggle": false
     },
@@ -397,7 +397,7 @@
       "id": "stop-metric-reminder",
       "description": "Metric reminder at main-agent Stop.",
       "matcher": "",
-      "fingerprint": "900027c81a27da24c394012aebbc844e519ccffe74ddaa4a74ad2ba1cdeda030",
+      "fingerprint": "a0b7edb7cd35a08a51c293d395232f78bc3928534b037b081ed22e12635c5a87",
       "locked": false,
       "remote_toggle": true
     },
@@ -407,7 +407,7 @@
       "id": "stop-claim-check",
       "description": "Detects a stale present-tense process-status claim in the final message (heimdall-claim-check).",
       "matcher": "",
-      "fingerprint": "7346d00e5258a0c354697045aeabc1f3c63b524e4302127608c355b26f27cddc",
+      "fingerprint": "893b5a136738bd4a037489ac4add3c25086817b5ccf087025c37da2fba80cf4d",
       "locked": false,
       "remote_toggle": false
     },
@@ -417,7 +417,7 @@
       "id": "stop-429-detect",
       "description": "Scans the main transcript for a 429/rate-limit and marks it for fallback routing.",
       "matcher": "",
-      "fingerprint": "7cfa765e629c950551529d021ea8659f6a49b229e2787e03fa202c3a794cd14c",
+      "fingerprint": "e5f1eabe26e56a903bfb0af048b85aca3b1ab63c6c22cc1785ee76f51f20bd04",
       "locked": false,
       "remote_toggle": false
     },
@@ -427,7 +427,7 @@
       "id": "stop-lint",
       "description": "Batch-lint every path edited this session at Stop; records a real lint receipt into heimdall-state",
       "matcher": "",
-      "fingerprint": "aaba0ca672f9b367eefd7a1c2b1d0425affbcd493cbe8093868d23f12fb37e26",
+      "fingerprint": "ef18702f39059433ac3d3ece195d7c5d7b8d84ee3d064e8394a1ba42df2962e8",
       "locked": false,
       "remote_toggle": false
     },
@@ -437,7 +437,7 @@
       "id": "inbox-deliver-stop",
       "description": "Delivers companion-app inbox messages via heimdall-inbox-deliver stop. With the inbox empty it long-polls when a companion is connected (a live <repo>/.heimdall/app/connect.json; attended sessions only -- never headless claude -p or hmd sub-sessions) after ANY last message, up to 300s (hook timeout 330), or when hmd's last message ended in a question, up to 240s. Either hold ends the moment the session's terminal is read (the operator typing, or a prompt just sent; on macOS only while a keyboard or pointer was used in the last 10s, so a terminal focus report with nobody there does not count), because a prompt typed behind a running Stop hook queues until it exits; whatever is queued then rides that prompt via the UserPromptSubmit hook. HMD_INBOX_TTY=off disables that release and a path pins the terminal; HMD_INBOX_PRESENCE_CMD replaces the keyboard-idle source; with no terminal or no ps the hold runs unchanged. HMD_INBOX_GATED=1 keeps the question wait off (near-instant return) unless <repo>/.heimdall/ui/inbox.wait exists, so opting in to the 240s question wait requires that marker file; a connected companion is the implicit opt-in for the 300s wait. Export HMD_INBOX_WAIT_S=0 to never hold a turn.",
       "matcher": "",
-      "fingerprint": "18525a6125fbcbde7cc1c65e91604dbfa1cbe6fe1a3f294df559693052cc3fd2",
+      "fingerprint": "e4ac54d949cb27de569a6c0881e2fde91b0c0c366459c504ce528a65df57da56",
       "locked": false,
       "remote_toggle": false
     },
@@ -447,7 +447,7 @@
       "id": "inbox-wake-arm-stop",
       "description": "Re-arms bin/heimdall-inbox-wake watch (asyncRewake) at the end of every turn, so a session that has just gone idle is woken when a phone message arrives later -- including after the 300s Stop hold of inbox-deliver-stop has ended. A watcher that is already armed for the session makes this a no-op. Same constant wake text, same once-per-record ledger and same 8h bound as inbox-wake-arm-start.",
       "matcher": "",
-      "fingerprint": "71d683a803e725cc40b3442b8a957d994d58b932a05038de0713177dbeac33cc",
+      "fingerprint": "169a4f822fdf6c8676a8f72423299350e71d5219dde763cb7a22023f6aa99ed8",
       "locked": false,
       "remote_toggle": false
     },
@@ -457,7 +457,7 @@
       "id": "presence-keeper-stop",
       "description": "Stops this session's presence keeper (disabling it with presence-keeper-start enabled leaks a keeper process).",
       "matcher": "",
-      "fingerprint": "1e6f5fee065e40ff17de9c6da3463e11c19ac1d95ba815ab911a798537f36448",
+      "fingerprint": "1b26c0cc3e3b2c78ba518cd5b1248f880c1ab323b814e5587f6e51b8428fec64",
       "locked": false,
       "remote_toggle": false
     },
@@ -467,7 +467,7 @@
       "id": "session-end-sweep",
       "description": "Foreground, each alarm-bounded (10s): checkpoint write, then autocommit — the never-lose contract; both must land before the hook returns (a checkpoint written but not committed is lost on `git worktree remove`). Background: parallelism grade, verify-edits --quick, cleanup, reel, summary-card, context-sync; then the farewell.",
       "matcher": "",
-      "fingerprint": "b6ac5b343006ce0e541f7ac3c352d6fccd75c8b3899adfa0bb547969f84994da",
+      "fingerprint": "d16e0f6719b946647fa132de22d44fed27aafb2068324b7fa66b1d5533f1986c",
       "locked": false,
       "remote_toggle": false
     },
@@ -477,7 +477,7 @@
       "id": "pair-window-stop",
       "description": "Forgets this session (removes its record under <repo>/.heimdall/app/sessions/) and closes the repo's pair-by-code window (hmd app pair-window --stop), which revokes its relay session -- unless another live session of the repo, or a running hmd app connect client, still needs the window, in which case it stays and ends with the last of them. Disabling it with pair-window-start enabled leaves a window to end when no session of the repo has a live Claude process (its supervisor looks every few seconds).",
       "matcher": "",
-      "fingerprint": "5d59c26d5f9e04495a380021de9f51401499b65065b08e2ed30154ae6be6e984",
+      "fingerprint": "3038001d43d4f85c0a255848f228bd13f14adbb5f66d9fd67dcf68d5bcbf31fe",
       "locked": false,
       "remote_toggle": false
     },
@@ -487,7 +487,7 @@
       "id": "precompact-checkpoint",
       "description": "Auto-checkpoint .planning/CHECKPOINT.md before compaction rewrites context (fail-open, stdout suppressed)",
       "matcher": "",
-      "fingerprint": "c009fdfc1feebe12b88ceaa061bc25d583924ba9ad443cd804f1896021a4bb9b",
+      "fingerprint": "11b64790a32cf076d9b5525a789ccc9630f0c59c1c31ce476a3565b9a719753c",
       "locked": false,
       "remote_toggle": false
     }

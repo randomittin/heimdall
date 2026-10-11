@@ -20,6 +20,25 @@
 # must match line for line (the script's own `case "${1:-}"` -h guard is the one
 # line filtered out — it is the only statement not in the inline string).
 #
+# THREE DELIBERATE DELTAS (2026-10-11, "precheck never blocks silently in another
+# repo", then "never execute the session's repo") — the one place the script is
+# NOT the historical inline chain any more, each updated here on purpose and
+# pinned by its own case:
+#   * a deny (exit 2) also states its verdict on STDERR (case 24). stdout is
+#     unchanged; equiv() therefore compares a deny's stderr with that mirrored
+#     line removed, and skips the xtrace comparison for denies (the mirror is the
+#     only statement that differs).
+#   * with CLAUDE_PLUGIN_ROOT unset the plugin root is the script's own location,
+#     never the cwd's git toplevel (case 21); the shipped hooks.json wrappers
+#     resolve CLAUDE_PLUGIN_ROOT, then the install at ~/.heimdall, and NEVER the
+#     session's repo -- a bin/ planted there is never run -- and with neither found
+#     they fail open with one stderr line instead of exiting 127 (cases 25, 26;
+#     test/hooks-no-cwd-exec.test.sh covers every other hook command).
+#   * the push gate is armed wherever `git push` is a command word (`git -C d push`,
+#     `x && git push`, `FOO=1 git push`, ...), not only at the start of the line
+#     (cases 17, 27, 28, 29). equiv() drops the matcher's own xtrace lines, which
+#     differ by design; every other statement is still compared.
+#
 # WHERE THE REFERENCE COMES FROM: the working tree's hooks.json while it still
 # carries the inline string; once hooks.json has been swapped to the wrapper, the
 # newest commit of hooks.json whose Bash command still carried the inline chain
@@ -167,7 +186,9 @@ equiv() {
   local why=""
   for m in script shipped; do
     cmp -s "$TMPROOT/$tag.inline.out" "$TMPROOT/$tag.$m.out" || why="$why stdout($m)"
-    cmp -s "$TMPROOT/$tag.inline.err" "$TMPROOT/$tag.$m.err" || why="$why stderr($m)"
+    # a deny (rc 2) mirrors its stdout verdict onto stderr — the deliberate delta (case 24);
+    # remove exactly that line and the rest of stderr must still be the historical bytes
+    { if [ "$(cat "$TMPROOT/$tag.$m.rc")" = 2 ]; then grep -vxF -f "$TMPROOT/$tag.$m.out" "$TMPROOT/$tag.$m.err"; else cat "$TMPROOT/$tag.$m.err"; fi; } | cmp -s "$TMPROOT/$tag.inline.err" - || why="$why stderr($m)"
     cmp -s "$TMPROOT/$tag.inline.rc"  "$TMPROOT/$tag.$m.rc"  || why="$why rc($m)"
   done
   # the -h guard is the ONE statement the script has that the string does not.
@@ -175,9 +196,12 @@ equiv() {
   # pipeline run concurrently and bash -x interleaves their lines in whichever
   # order the kernel schedules them, so line order is not a property of the
   # program — the multiset of executed statements is.
-  grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
-  LC_ALL=C sort "$TMPROOT/$tag.trace-inline.err" > "$TMPROOT/$tag.trace-inline.sorted"
-  cmp -s "$TMPROOT/$tag.trace-inline.sorted" "$TMPROOT/$tag.trace-script.filtered" || why="$why xtrace"
+  # ...and the push matcher (delta 3): its setup lines and its `grep -qE ...push...` call differ by design.
+  local mtr='^\+ (SQ=|GP_|grep -qE .*push)'
+  grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | grep -vE "$mtr" | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
+  LC_ALL=C sort "$TMPROOT/$tag.trace-inline.err" | grep -vE "$mtr" > "$TMPROOT/$tag.trace-inline.sorted"
+  # denies are exempt from the trace comparison: the stderr mirror is a statement the string never had
+  [ "$(cat "$TMPROOT/$tag.inline.rc")" = 2 ] || cmp -s "$TMPROOT/$tag.trace-inline.sorted" "$TMPROOT/$tag.trace-script.filtered" || why="$why xtrace"
   # the expected branch really ran (guards against three copies of a wrong thing agreeing)
   local rc; rc="$(cat "$TMPROOT/$tag.inline.rc")"
   if [ -z "$why" ]; then
@@ -284,13 +308,21 @@ expect 16 "deny" out '^{"error": "BLOCKED: corpus regression'
 expect_rc 16 2
 
 # ── 17-18. the core.hooksPath= payloads (text in the COMMAND, not the cwd) ──
-equiv 17 "command text 'git config core.hooksPath=…; git push' (push not at ^): no push gate" "$CWD_PLAIN" "$PLUGIN_FULL" "$(pl 'git config core.hooksPath=.heimdall/hooks && git push')"
-if grep -q 'heimdall-state' "$TMPROOT/c17.inline.err" "$TMPROOT/c17.inline.out"; then
-  bad "17. reference ran the push gate on a command whose push is not at line start"
+# 17 is DELTA 3 (the push matcher): the historical `^git\s+push` waved this through (rc 0, no gate),
+# the script gates it. Both are run so the change stays pinned from both sides.
+C17_PAYLOAD="$(pl 'git config core.hooksPath=.heimdall/hooks && git push')"
+run_variant c17 inline "$CWD_PLAIN" "$PLUGIN_FULL" "$C17_PAYLOAD" FAKE_HSTATE_RC=2
+run_variant c17 script "$CWD_PLAIN" "$PLUGIN_FULL" "$C17_PAYLOAD" FAKE_HSTATE_RC=2
+if [ "$(cat "$TMPROOT/c17.inline.rc")" = 0 ] && ! grep -q 'heimdall-state' "$TMPROOT/c17.inline.err" "$TMPROOT/c17.inline.out"; then
+  ok "17a. the historical ^git\\s+push never armed the push gate on 'x && git push'"
 else
-  ok "17. …reference did not arm the push gate (regex anchored at ^git\\s+push)"
+  bad "17a. the reference unexpectedly gated 'x && git push'"
 fi
-expect_rc 17 0
+if [ "$(cat "$TMPROOT/c17.script.rc")" = 2 ] && grep -q '^{"error": "BLOCKED: pre-push quality gate failed' "$TMPROOT/c17.script.out"; then
+  ok "17b. the script gates 'x && git push' (quality gate rc 2 -> BLOCKED, exit 2)"
+else
+  bad "17b. the script did not gate 'x && git push'" "rc=$(cat "$TMPROOT/c17.script.rc"): $(head -c 200 "$TMPROOT/c17.script.out")"
+fi
 
 equiv 18 "command text 'git -c core.hooksPath= commit': -c form matches neither guard nor commit regex" "$CWD_PLAIN" "$PLUGIN_FULL" "$(pl 'git -c core.hooksPath= commit -m x')"
 expect_rc 18 0
@@ -303,31 +335,33 @@ expect 19 "falsify via stack file" err '^falsify demo-domain'
 equiv 20 "command carrying \\n, \\t, quotes and backslashes in the payload" "$CWD_PLAIN" "$PLUGIN_FULL" "$(pl $'printf \'a\\tb\\n\' "q\\"q" \\\\ end')"
 expect_rc 20 0
 
-# ── 21. no CLAUDE_PLUGIN_ROOT, cwd not a git repo: PLUGIN falls back to pwd ─
-# Both resolve PLUGIN to $PWD, which has no bin/ — every gate self-skips and the
-# trailing parallelism-tracker call is the one thing that fails. bash itself
-# reports that missing file, and bash names the SOURCE in that diagnostic
-# ("bash: " for -c, "<script>: line N: " for a file). The chain's own `2>&1`
-# folds it onto STDOUT, so this single case compares stderr and rc exactly and
-# stdout with bash's own source-name prefix stripped — the only tolerance in
-# this file, and it is bash's, not the chain's.
-run_variant c21 inline "$CWD_NOGIT" "" "$(pl 'ls')"
-run_variant c21 script "$CWD_NOGIT" "" "$(pl 'ls')"
-strip_bash_prefix() { sed -E 's#^(bash|/[^:]+): (line [0-9]+: )?#<bash>: #' "$1"; }
-if cmp -s "$TMPROOT/c21.inline.err" "$TMPROOT/c21.script.err" \
-   && cmp -s "$TMPROOT/c21.inline.rc" "$TMPROOT/c21.script.rc" \
-   && [ "$(strip_bash_prefix "$TMPROOT/c21.inline.out")" = "$(strip_bash_prefix "$TMPROOT/c21.script.out")" ] \
-   && grep -q 'parallelism-tracker: No such file' "$TMPROOT/c21.script.out" \
-   && [ "$(cat "$TMPROOT/c21.inline.rc")" = 0 ]; then
-  ok "21. PLUGIN falls back to pwd without CLAUDE_PLUGIN_ROOT; identical modulo bash's own source-name prefix  [rc=0]"
+# ── 21. no CLAUDE_PLUGIN_ROOT: the plugin root is the script's OWN location ──
+# 2026-10-11, deliberate change vs the historical inline chain, which fell back to
+# the cwd's git toplevel (then pwd): in any repo that is not a heimdall checkout it
+# looked for bin/ in the wrong place. The copy inside PLUGIN_FULL (fake gate bins,
+# incl. a fake parallelism-tracker) runs with CLAUDE_PLUGIN_ROOT unset from a
+# foreign git repo and from a non-git dir; ITS tracker must be the one that runs.
+c21_bad=""
+for cwd in "$CWD_PLAIN" "$CWD_NOGIT"; do
+  ( cd "$cwd" && printf '%s' "$(pl 'ls')" | env -u CLAUDE_PLUGIN_ROOT bash "$PLUGIN_FULL/bin/heimdall-precheck-bash" ) >"$TMPROOT/c21.out" 2>"$TMPROOT/c21.err"
+  rc=$?
+  { [ "$rc" = 0 ] && grep -qx 'tracker check Bash' "$TMPROOT/c21.out" && ! grep -q 'No such file' "$TMPROOT/c21.out" "$TMPROOT/c21.err" && [ ! -s "$TMPROOT/c21.err" ]; } \
+    || c21_bad="$c21_bad $(basename "$cwd")(rc=$rc: $(head -c 120 "$TMPROOT/c21.out"))"
+done
+if [ -z "$c21_bad" ]; then
+  ok "21. CLAUDE_PLUGIN_ROOT unset: plugin root comes from the script's own location, not the cwd repo (foreign git repo and non-git dir)"
 else
-  bad "21. PLUGIN fallback diverged" "inline: $(cat "$TMPROOT/c21.inline.out") | script: $(cat "$TMPROOT/c21.script.out")"
+  bad "21. plugin root resolved from the cwd instead of the script's own location" "$c21_bad"
 fi
 
 # ── 22. missing $PLUGIN/bin/heimdall-state → falls back to `heimdall-state` by name on PATH
 # Whether PATH has one (real bin → "No heimdall-state.json found", exit 1) or not
 # (bash "command not found", exit 127) depends on the machine; either way both
 # forms must agree, and the chain must land in the UNAVAILABLE-warn-and-allow branch.
+# bash names the SOURCE in a missing-command diagnostic ("bash: " for -c,
+# "<script>: line N: " for a file); strip that prefix — the one tolerance here is
+# bash's, not the chain's.
+strip_bash_prefix() { sed -E 's#^(bash|/[^:]+): (line [0-9]+: )?#<bash>: #' "$1"; }
 run_variant c22 inline "$CWD_PLAIN" "$PLUGIN_NOHSTATE" "$(pl 'git push')"
 run_variant c22 script "$CWD_PLAIN" "$PLUGIN_NOHSTATE" "$(pl 'git push')"
 if cmp -s "$TMPROOT/c22.inline.out" "$TMPROOT/c22.script.out" \
@@ -347,6 +381,190 @@ elif grep -qF '"$PLUGIN/bin/heimdall-precheck-bash"' <<<"$SHIPPED" && ! grep -q 
   ok "23. hooks.json ships the wrapper one-liner calling \$PLUGIN/bin/heimdall-precheck-bash with its exit code propagated (no '|| true')"
 else
   bad "23. hooks.json Bash command is neither the inline chain nor the precheck-bash wrapper" "$SHIPPED"
+fi
+
+# ── 24. every deny states its reason on stderr too ──────────────────────────
+# Claude Code surfaces ONLY stderr for an exit-2 hook and ignores stdout, so the
+# stdout-only verdict showed up as "hook error … No stderr output": a blocked
+# `git push` with no stated reason (seen live in a foreign repo whose own quality
+# gates were failing). Cases 5,7,9,10,13,14,15,16 above are the deny branches.
+c24_bad=""
+for n in 5 7 9 10 13 14 15 16; do
+  for m in script shipped; do
+    { grep -q '^{"error": "BLOCKED' "$TMPROOT/c$n.$m.out" && grep -qxF -f "$TMPROOT/c$n.$m.out" "$TMPROOT/c$n.$m.err"; } || c24_bad="$c24_bad c$n.$m"
+  done
+done
+if [ -z "$c24_bad" ]; then
+  ok "24. every deny branch (8 cases x script+shipped) repeats its verdict on stderr, stdout unchanged"
+else
+  bad "24. deny verdict missing from stderr (exit 2 + empty stderr = a silent block):$c24_bad"
+fi
+
+# ── 25-26. the shipped hooks, CLAUDE_PLUGIN_ROOT unset, session cwd in ANOTHER repo ─
+# The wrappers must never resolve the plugin root from the cwd repo -- not to run its gates, and
+# not to exit 127 either: a hostile clone that ships bin/heimdall-precheck-bash (or -agent, or the
+# parallelism-tracker the wrapper calls) must get no code execution on any tool call. Resolution is
+# CLAUDE_PLUGIN_ROOT, then the install at $HOME/.heimdall; with neither the hook fails OPEN, stdout
+# empty, exactly one stderr line saying why. Acceptable because the gates are heimdall's own repo
+# policy (nothing of ours to run in a repo that is not ours) and the native pre-push hook / CI stay
+# the fail-closed backstop; failing closed here would block every Bash call of a session.
+PLANT_MARK="$TMPROOT/planted.marker"
+mk_planted() {  # mk_planted <dir> -- a hostile clone: every script the wrappers could call, planted
+  local d="$1" s
+  mkdir -p "$d/bin"; ( cd "$d" && git init -q )
+  for s in heimdall-precheck-bash heimdall-precheck-agent parallelism-tracker; do
+    printf '#!/bin/sh\necho "PLANTED %s ran" >> "%s"\necho "PLANTED %s ran"\nexit 0\n' "$s" "$PLANT_MARK" "$s" > "$d/bin/$s"; chmod +x "$d/bin/$s"
+  done
+}
+CWD_PLANTED="$TMPROOT/cwd-planted"; mk_planted "$CWD_PLANTED"
+EMPTY_HOME="$TMPROOT/home-empty"; mkdir -p "$EMPTY_HOME"
+INSTALL_HOME="$TMPROOT/home-install"; mkdir -p "$INSTALL_HOME"; cp -R "$PLUGIN_FULL" "$INSTALL_HOME/.heimdall"
+mk_fake "$INSTALL_HOME/.heimdall" heimdall-precheck-agent 'cat >/dev/null; echo "agent-gate ran"'
+STALE_ROOT="$TMPROOT/stale-root"; mkdir -p "$STALE_ROOT"
+CWD_DEV="$TMPROOT/cwd-dev"; mkdir -p "$CWD_DEV"; cp -R "$PLUGIN_FULL/bin" "$CWD_DEV/bin"; ( cd "$CWD_DEV" && git init -q )
+
+# hook_run <shipped-command> <cwd> <payload> [ENV...] -> $TMPROOT/h.{out,err,rc}; the plant marker starts absent
+hook_run() {
+  local cmd="$1" cwd="$2" payload="$3"; shift 3
+  rm -f "$PLANT_MARK"
+  ( cd "$cwd" && printf '%s' "$payload" | env "$@" bash -c "$cmd" ) >"$TMPROOT/h.out" 2>"$TMPROOT/h.err"
+  printf '%s' "$?" >"$TMPROOT/h.rc"
+}
+# fails_open <shipped> <payload> <notice-pattern> <cwd> [ENV...] -> prints what is wrong (nothing when fine):
+# rc 0, no stdout, ONE stderr line naming the gap, and nothing planted in the cwd ran
+fails_open() {
+  local why="" cmd="$1" payload="$2" pat="$3" cwd="$4"; shift 4
+  hook_run "$cmd" "$cwd" "$payload" "$@"
+  [ "$(cat "$TMPROOT/h.rc")" = 0 ] || why="$why rc=$(cat "$TMPROOT/h.rc")"
+  [ ! -s "$TMPROOT/h.out" ] || why="$why stdout=$(head -c 80 "$TMPROOT/h.out")"
+  { [ "$(wc -l <"$TMPROOT/h.err" | tr -d ' ')" = 1 ] && grep -q "$pat" "$TMPROOT/h.err"; } || why="$why stderr=$(head -c 160 "$TMPROOT/h.err")"
+  [ ! -e "$PLANT_MARK" ] || why="$why EXECUTED-FROM-CWD($(head -c 80 "$PLANT_MARK"))"
+  printf '%s' "$why"
+}
+AGENT_SHIPPED="$(jq -r '.hooks.PreToolUse[] | select(.matcher=="Agent") | .hooks[0].command' "$HOOKS_JSON")"
+BASH_PAYLOAD="$(pl 'git push origin main')"
+AGENT_PAYLOAD='{"tool_name":"Agent","tool_input":{}}'
+
+c25_bad=""
+for cwd in "$CWD_PLANTED" "$CWD_PLAIN" "$CWD_NOGIT" "$CWD_DEV"; do
+  w="$(fails_open "$SHIPPED" "$BASH_PAYLOAD" 'precheck-bash not found' "$cwd" -u CLAUDE_PLUGIN_ROOT HOME="$EMPTY_HOME")"
+  [ -z "$w" ] || c25_bad="$c25_bad $(basename "$cwd")[$w]"
+done
+w="$(fails_open "$SHIPPED" "$BASH_PAYLOAD" 'precheck-bash not found' "$CWD_PLANTED" CLAUDE_PLUGIN_ROOT="$STALE_ROOT" HOME="$EMPTY_HOME")"
+[ -z "$w" ] || c25_bad="$c25_bad stale-root[$w]"
+# ...while the install at ~/.heimdall is found, and runs ITS tracker, never the clone's
+hook_run "$SHIPPED" "$CWD_PLANTED" "$(pl 'ls')" -u CLAUDE_PLUGIN_ROOT HOME="$INSTALL_HOME"
+{ [ "$(cat "$TMPROOT/h.rc")" = 0 ] && grep -qx 'tracker check Bash' "$TMPROOT/h.out" && [ ! -e "$PLANT_MARK" ]; } \
+  || c25_bad="$c25_bad install-dir[rc=$(cat "$TMPROOT/h.rc") out=$(head -c 80 "$TMPROOT/h.out") planted=$([ -e "$PLANT_MARK" ] && echo ran || echo no)]"
+if [ -z "$c25_bad" ]; then
+  ok "25. Bash hook, env unset: a foreign repo (even one shaped like a heimdall checkout, or with planted bin/) is never run; one stderr line, rc 0; ~/.heimdall still resolves"
+else
+  bad "25. Bash hook wrapper mishandles an unset CLAUDE_PLUGIN_ROOT:$c25_bad"
+fi
+
+c26_bad=""
+for cwd in "$CWD_PLANTED" "$CWD_PLAIN" "$CWD_NOGIT" "$CWD_DEV"; do
+  w="$(fails_open "$AGENT_SHIPPED" "$AGENT_PAYLOAD" 'precheck-agent not found' "$cwd" -u CLAUDE_PLUGIN_ROOT HOME="$EMPTY_HOME")"
+  [ -z "$w" ] || c26_bad="$c26_bad $(basename "$cwd")[$w]"
+done
+w="$(fails_open "$AGENT_SHIPPED" "$AGENT_PAYLOAD" 'precheck-agent not found' "$CWD_PLANTED" CLAUDE_PLUGIN_ROOT="$STALE_ROOT" HOME="$EMPTY_HOME")"
+[ -z "$w" ] || c26_bad="$c26_bad stale-root[$w]"
+hook_run "$AGENT_SHIPPED" "$CWD_PLANTED" "$AGENT_PAYLOAD" -u CLAUDE_PLUGIN_ROOT HOME="$INSTALL_HOME"
+{ [ "$(cat "$TMPROOT/h.rc")" = 0 ] && grep -qx 'agent-gate ran' "$TMPROOT/h.out" && [ ! -e "$PLANT_MARK" ]; } \
+  || c26_bad="$c26_bad install-dir[rc=$(cat "$TMPROOT/h.rc") out=$(head -c 80 "$TMPROOT/h.out") planted=$([ -e "$PLANT_MARK" ] && echo ran || echo no)]"
+if [ -z "$c26_bad" ]; then
+  ok "26. Agent hook, env unset: same -- never the clone's scripts, one stderr line, rc 0; ~/.heimdall still resolves"
+else
+  bad "26. Agent hook wrapper mishandles an unset CLAUDE_PLUGIN_ROOT:$c26_bad"
+fi
+
+# ── 27. every form of `git push` is gated (DELTA 3) ─────────────────────────
+# FAKE_HSTATE_RC=2 fails the quality gate, so a gated push is rc 2 + BLOCKED on stdout AND stderr.
+c27_bad=""
+check_gated() {
+  run_variant c27 script "$CWD_PLAIN" "$PLUGIN_FULL" "$(pl "$1")" FAKE_HSTATE_RC=2
+  { [ "$(cat "$TMPROOT/c27.script.rc")" = 2 ] \
+    && grep -q '^{"error": "BLOCKED: pre-push quality gate failed' "$TMPROOT/c27.script.out" \
+    && grep -qF 'BLOCKED: pre-push quality gate failed' "$TMPROOT/c27.script.err"; } || c27_bad="$c27_bad [$1]"
+}
+N27=0
+while IFS= read -r form; do
+  [ -n "$form" ] || continue
+  N27=$((N27 + 1)); check_gated "$form"
+done <<'EOF'
+git push
+git push origin main
+git  push   --force-with-lease
+git -C /tmp/other-repo push
+git -C "/tmp/dir with space" push origin HEAD
+git -c user.name=x push
+git --git-dir=/tmp/x/.git push
+git --git-dir /tmp/x/.git --work-tree /tmp/x push
+git --no-pager push
+ls && git push
+ls; git push
+false || git push
+echo ok | git push
+(git push)
+{ git push; }
+FOO=1 git push
+GIT_SSH_COMMAND="ssh -i /tmp/k" git push
+A=1 B="x y" git push
+env GIT_TRACE=1 git push
+sudo git push
+command git push
+nohup git push &
+/usr/bin/git push
+./git push
+if true; then git push; fi
+git add -A && git commit -m x && git push -u origin HEAD
+bash -c "git push"
+sh -c 'cd /tmp && git push'
+x=$(git push)
+EOF
+N27=$((N27 + 1)); check_gated $'cd /tmp\ngit push'
+if [ -z "$c27_bad" ]; then
+  ok "27. all $N27 push forms are gated (git -C <dir>, -c, --git-dir, && ; || | ( { env-prefix, wrappers, path, then, sh -c, \$(), newline)"
+else
+  bad "27. push forms that walked past the gate:$c27_bad"
+fi
+
+# ── 28. text that merely MENTIONS a push, and other subcommands, are not push-gated ─
+c28_bad=""
+N28=0
+while IFS= read -r form; do
+  [ -n "$form" ] || continue
+  N28=$((N28 + 1))
+  run_variant c28 script "$CWD_PLAIN" "$PLUGIN_FULL" "$(pl "$form")" FAKE_HSTATE_RC=2
+  { [ "$(cat "$TMPROOT/c28.script.rc")" = 0 ] && ! grep -qE 'heimdall-state|BLOCKED' "$TMPROOT/c28.script.out" "$TMPROOT/c28.script.err"; } || c28_bad="$c28_bad [$form]"
+done <<'EOF'
+ls -la
+echo "git push"
+echo git push
+grep -rn "git push" bin/
+git commit -m "document git push flow" --no-verify
+git stash push -m wip
+git pushd
+git push-all
+git log --oneline
+printf 'run git push when done\n'
+git remote add push-mirror https://example.invalid/x.git
+EOF
+if [ -z "$c28_bad" ]; then
+  ok "28. $N28 commands that only mention a push, or run another subcommand, do not arm the push gate"
+else
+  bad "28. the push gate fired on something that is not a push:$c28_bad"
+fi
+
+# ── 29. the matcher stays fast on a large command (heredoc-sized payload) ───
+BIG="$(awk 'BEGIN{for(i=0;i<1500;i++)printf "echo item%d; ls /tmp/x%d | grep -c a && ", i, i; print "true"}')"
+T0=$SECONDS
+run_variant c29 script "$CWD_PLAIN" "$PLUGIN_FULL" "$(pl "$BIG")" FAKE_HSTATE_RC=2
+T1=$SECONDS
+if [ "$(cat "$TMPROOT/c29.script.rc")" = 0 ] && ! grep -q 'heimdall-state' "$TMPROOT/c29.script.err" && [ $((T1 - T0)) -lt 10 ]; then
+  ok "29. a ${#BIG}-char command with no push is matched in $((T1 - T0))s (< 10s), no gate"
+else
+  bad "29. large no-push command" "rc=$(cat "$TMPROOT/c29.script.rc") elapsed=$((T1 - T0))s"
 fi
 
 printf '\n  heimdall-precheck-bash: %d passed, %d failed\n' "$PASS" "$FAIL"

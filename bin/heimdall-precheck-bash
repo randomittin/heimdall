@@ -29,7 +29,7 @@
 # behaviour belongs in a SEPARATE commit against this file, with that test
 # updated on purpose.
 #
-# CONTRACT (unchanged from the inline form):
+# CONTRACT (inline form + the two 2026-10-11 deltas marked below the -h guard):
 #   stdin   the PreToolUse JSON payload; `.tool_input.command` is the Bash
 #           command about to run. An empty or malformed payload is treated as an
 #           empty command (jq's own parse error goes to stderr, nothing blocks).
@@ -37,14 +37,14 @@
 #           (Plus whatever parallelism-tracker prints — its stderr is folded into
 #           stdout by the trailing `2>&1`, exactly as the inline did.)
 #   stderr  every advisory: gate verdicts, "UNAVAILABLE" notices, the native-hook
-#           delegation line, falsify/corpus output.
+#           delegation line, falsify/corpus output, and a copy of every deny verdict.
 #   exit 2  DENY — a gate failed (secret in staged diff, quality gate rc 2, push
 #           secret gate, self-scan, non-falsifiable oracle, corpus regression).
 #   exit 0  everything else, including "gate never evaluated" (the quality-gate
 #           verdict UNAVAILABLE branch warns and allows, as before).
 #
-# ENV honoured (unchanged):
-#   CLAUDE_PLUGIN_ROOT  plugin root; falls back to the cwd's git toplevel, then pwd.
+# ENV honoured (HMD_SKIP et al. unchanged; CLAUDE_PLUGIN_ROOT's fallback changed):
+#   CLAUDE_PLUGIN_ROOT  plugin root; unset -> this script's own bin/.. (NEVER the cwd repo).
 #   HMD_SKIP            the NATIVE pre-push hook's own bypass. It does NOT bypass
 #                       this layer: `HMD_SKIP=1` only prevents the dedup guard from
 #                       DELEGATING the oracle+corpus gates to .heimdall/hooks/pre-push,
@@ -65,9 +65,40 @@ case "${1:-}" in
   -h|--help) sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
+# SINCE THE EXTRACTION — three deliberate deltas from the historical inline chain
+# (2026-10-11, "precheck never blocks silently in another repo"; then "never execute the session's
+# repo"). test/heimdall-precheck-bash.test.sh cases 17, 21 and 24-29 pin them; every other branch is
+# still byte-identical to the inline string.
+#
+#   1. deny(): a deny states its verdict on stderr TOO. Claude Code surfaces ONLY stderr for an
+#      exit-2 hook and ignores stdout, so the stdout-only verdict surfaced as "hook error ... No
+#      stderr output" — a blocked `git push` with no stated reason (seen live from a session whose cwd
+#      was another repo with failing quality gates of its own). stdout is unchanged for anything that
+#      parses it. Same dual emit as bin/heimdall-precheck-agent and the Write|Edit stub gate.
+#   2. PLUGIN: with CLAUDE_PLUGIN_ROOT unset, the root is where THIS script lives, not the cwd's git
+#      toplevel. This script is only ever run as <root>/bin/heimdall-precheck-bash, so its own location
+#      is the one answer that cannot name a foreign repo; the cwd fallback pointed every gate bin (and
+#      the trailing parallelism-tracker) at a repo with no bin/.
+#
+#   3. PUSH MATCHER: the push gate used to be armed by `^git\s+push` alone, so every other way of typing
+#      the same push walked past the quality, secret, self-scan, oracle and corpus gates: `git -C <dir>
+#      push`, `x && git push`, `; git push`, `FOO=1 git push`, `(git push)`, `sudo git push`,
+#      `/usr/bin/git push`, `bash -c "git push"`. It now matches `git` as a COMMAND WORD: at the start of
+#      a line, after ; & | ( { ` $( ! then/do/else, after env assignments and wrapper words (sudo, command,
+#      env, exec, time, nohup, nice, builtin, xargs), or as the first word of a `sh -c`/`eval` string; then
+#      git's global options (-C <dir>, -c k=v, --git-dir[=]<dir>, --no-pager, ...) and then `push` as a
+#      whole word (so `git pushd` is not a push). Text that only MENTIONS a push (`echo "git push"`,
+#      `grep -rn "git push" docs/`, a commit message) and other subcommands (`git stash push`) stay
+#      unmatched: a push gate that fired on prose would cost a full gate run per grep. Indirection no regex
+#      can see (`$GIT push`, `xargs -n 1 git push`) is the native pre-push hook's job (core.hooksPath).
+#
+# The gates themselves still read the CWD repo's own state (heimdall-state.json, .planning/, evals/):
+# that is the policy for "the repo being pushed", correctly applied in a foreign repo.
+deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
+
 INPUT=$(cat)
 CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty')
-PLUGIN="${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+PLUGIN="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}"
 SCAN="$PLUGIN/bin/secret-scan"
 GITGUARD="$PLUGIN/bin/heimdall-git-guard"
 if [ -x "$GITGUARD" ] && printf '%s\n' "$CMD" | grep -qE '(^|[;&|]|[[:space:]])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+(add|commit|merge|rebase|stash|cherry-pick|revert|am|apply|pull)([[:space:]]|$)'; then
@@ -77,22 +108,26 @@ if printf '%s\n' "$CMD" | grep -qE '(^|[;&|]\s*)git\s+commit'; then
   if [ -x "$SCAN" ]; then
     if ! OUT=$("$SCAN" 2>&1); then
       ESC=$(printf '%s' "$OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-      printf '{"error": "BLOCKED: secret detected in staged changes by gitleaks. A credential must never enter history. Remove it from the staged diff before committing. --- %s"}' "$ESC"
-      exit 2
+      deny "$(printf '{"error": "BLOCKED: secret detected in staged changes by gitleaks. A credential must never enter history. Remove it from the staged diff before committing. --- %s"}' "$ESC")"
     else
       printf '%s\n' "$OUT" >&2
     fi
   fi
 fi
-if printf '%s\n' "$CMD" | grep -qE '^git\s+push'; then
+SQ="'"
+GP_VAL='("[^"]*"|'"$SQ"'[^'"$SQ"']*'"$SQ"'|[^[:space:]]*)'
+GP_START='(^|[;&|({`!]|\$\(|(^|[[:space:]])(then|do|else|elif)[[:space:]]|(sh|bash|zsh|dash|ksh)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*c[[:space:]]+["'"$SQ"']|eval[[:space:]]+["'"$SQ"'])[[:space:]]*'
+GP_PRE='([A-Za-z_][A-Za-z0-9_]*='"$GP_VAL"'[[:space:]]+|(sudo|command|env|exec|time|nohup|nice|builtin|xargs)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)*'
+GP_OPT='([[:space:]]+(-[Cc][[:space:]]+'"$GP_VAL"'|--(git-dir|work-tree|namespace|super-prefix|config-env)[[:space:]]+'"$GP_VAL"'|--?[A-Za-z][A-Za-z-]*(='"$GP_VAL"')?))*'
+GP_RE="${GP_START}${GP_PRE}([^[:space:]]*/)?git${GP_OPT}[[:space:]]+push([[:space:]]|\$|[;&|)}\"${SQ}])"
+if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
   HSTATE="$PLUGIN/bin/heimdall-state"
   [ -x "$HSTATE" ] || HSTATE=heimdall-state
   QGOUT=$("$HSTATE" check-quality-gates 2>&1)
   QGRC=$?
   if [ "$QGRC" = 2 ]; then
     ESC=$(printf '%s' "$QGOUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-    printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing. --- %s"}' "$ESC"
-    exit 2
+    deny "$(printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing. --- %s"}' "$ESC")"
   elif [ "$QGRC" = 0 ]; then
     printf '%s\n' "$QGOUT" >&2
   else
@@ -101,8 +136,7 @@ if printf '%s\n' "$CMD" | grep -qE '^git\s+push'; then
   if [ -x "$SCAN" ]; then
     if ! OUT=$(SECRET_SCAN_REQUIRE=1 "$SCAN" --require 2>&1); then
       ESC=$(printf '%s' "$OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-      printf '{"error": "BLOCKED: pre-push secret gate failed (gitleaks). A secret in the push range or a missing scanner blocks the push — gitleaks must be present and the range clean. --- %s"}' "$ESC"
-      exit 2
+      deny "$(printf '{"error": "BLOCKED: pre-push secret gate failed (gitleaks). A secret in the push range or a missing scanner blocks the push — gitleaks must be present and the range clean. --- %s"}' "$ESC")"
     else
       printf '%s\n' "$OUT" >&2
     fi
@@ -111,8 +145,7 @@ if printf '%s\n' "$CMD" | grep -qE '^git\s+push'; then
   if [ -x "$SELFSCAN" ]; then
     if ! OUT=$("$SELFSCAN" 2>&1); then
       ESC=$(printf '%s' "$OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-      printf '{"error": "BLOCKED: pre-push self-scan failed (gitleaks over Heimdall OWN full history). A secret anywhere in this repo history, or a missing scanner, blocks the push. Agents commit --no-verify (bypassing the pre-commit gate), so this full-history self-scan is the backstop. Scrub the secret from history (git filter-repo) or install gitleaks. --- %s"}' "$ESC"
-      exit 2
+      deny "$(printf '{"error": "BLOCKED: pre-push self-scan failed (gitleaks over Heimdall OWN full history). A secret anywhere in this repo history, or a missing scanner, blocks the push. Agents commit --no-verify (bypassing the pre-commit gate), so this full-history self-scan is the backstop. Scrub the secret from history (git filter-repo) or install gitleaks. --- %s"}' "$ESC")"
     else
       printf '%s\n' "$OUT" >&2
     fi
@@ -147,8 +180,7 @@ if printf '%s\n' "$CMD" | grep -qE '^git\s+push'; then
                 "$STAMP" --violation "oracle gate $DOM is not falsifiable (score < 1.0)" --branch "heimdall/blocked/$DOM" >&2 2>/dev/null || true
               fi
             fi
-            printf '{"error": "BLOCKED: oracle gate %s is not falsifiable (score < 1.0). A green test suite over a non-falsifiable gate must not pass push. Harden the gate until bin/falsify reports 1.0."}' "$DOM"
-            exit 2
+            deny "$(printf '{"error": "BLOCKED: oracle gate %s is not falsifiable (score < 1.0). A green test suite over a non-falsifiable gate must not pass push. Harden the gate until bin/falsify reports 1.0."}' "$DOM")"
           fi
         fi
       fi
@@ -159,9 +191,8 @@ if printf '%s\n' "$CMD" | grep -qE '^git\s+push'; then
     if ! "$CORPUS" run >&2; then
       STAMP="$PLUGIN/bin/heimdall-stamp"
       [ -x "$STAMP" ] && "$STAMP" --violation "corpus regression — a case the gates once caught is no longer caught" --branch "heimdall/blocked/corpus" >&2 2>/dev/null || true
-      printf '{"error": "BLOCKED: corpus regression — bin/corpus run is nonzero. A case the gates once caught is no longer caught (CI inversion, H-8). The gates are regression-tested by the failures they once caught; restore 100%% catch before push."}'
-      exit 2
+      deny "$(printf '{"error": "BLOCKED: corpus regression — bin/corpus run is nonzero. A case the gates once caught is no longer caught (CI inversion, H-8). The gates are regression-tested by the failures they once caught; restore 100%% catch before push."}')"
     fi
   fi
 fi
-"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/parallelism-tracker" check Bash 2>&1 || true
+"$PLUGIN/bin/parallelism-tracker" check Bash 2>&1 || true

@@ -47,7 +47,9 @@ _hmd_hook_metadata_path() {
     printf '%s/../../hooks/hooks.metadata.json' "$(dirname "$_src")"
     return 0
   fi
-  printf '%s/hooks/hooks.metadata.json' "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  # Never the cwd's repo: a stranger's metadata must not decide which hooks are locked. Nothing found
+  # -> print nothing; hmd_hook_enabled's own `[ -f ]` guard then lands on "enabled".
+  return 0
 }
 
 # hmd_hook_enabled <id>  → 0 enabled (run the hook), 1 disabled (exit 0 early)

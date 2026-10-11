@@ -76,7 +76,7 @@
 #   instead, the SessionEnd entry must include this prefix (before the autocommit
 #   early-exit, so state saves even when autocommit is off):
 #     "SessionEnd": [{ "hooks": [{ "type": "command", "command":
-#        "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel)}\"; CKPT=\"$PLUGIN/bin/heimdall-checkpoint\"; if [ -x \"$CKPT\" ] && { [ -d .planning ] || [ -f heimdall-state.json ]; }; then \"$CKPT\" write . >/dev/null 2>&1 || true; fi; ..." }] }]
+#        "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; CKPT=\"$PLUGIN/bin/heimdall-checkpoint\"; if [ -x \"$CKPT\" ] && { [ -d .planning ] || [ -f heimdall-state.json ]; }; then \"$CKPT\" write . >/dev/null 2>&1 || true; fi; ..." }] }]
 
 set -uo pipefail
 

@@ -696,15 +696,15 @@ cmd_hooks_json() {
 hmd does NOT edit hooks/hooks.json itself (siblings own that file right now).
 The two entries below are what SessionStart and UserPromptSubmit need to wire
 this tool in, in the same style already used by this repo's hooks.json
-(PLUGIN root resolved via ${CLAUDE_PLUGIN_ROOT} with a git-toplevel fallback,
-guarded by [ -x ]).
+(PLUGIN root resolved via ${CLAUDE_PLUGIN_ROOT} with the ~/.heimdall install as the
+fallback -- never the session's git repo -- guarded by [ -x ]).
 
 --- SessionStart (append as one more object in the "SessionStart" array) ---
 {
   "hooks": [
     {
       "type": "command",
-      "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then \"$CAV\" rules; fi; exit 0"
+      "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then \"$CAV\" rules; fi; exit 0"
     }
   ]
 }
@@ -714,7 +714,7 @@ guarded by [ -x ]).
   "hooks": [
     {
       "type": "command",
-      "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then LVL=\"$(\"$CAV\" get 2>/dev/null)\"; if [ -n \"$LVL\" ]; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"HMD OUTPUT COMPRESSION - level: %s. Apply this level'\"'\"'s rules (heimdall-caveman rules). Code/commits/security: write normal.\"}}' \"$LVL\"; fi; fi; exit 0"
+      "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$HOME/.heimdall}\"; CAV=\"$PLUGIN/bin/heimdall-caveman\"; if [ -x \"$CAV\" ]; then LVL=\"$(\"$CAV\" get 2>/dev/null)\"; if [ -n \"$LVL\" ]; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"HMD OUTPUT COMPRESSION - level: %s. Apply this level'\"'\"'s rules (heimdall-caveman rules). Code/commits/security: write normal.\"}}' \"$LVL\"; fi; fi; exit 0"
     }
   ]
 }
