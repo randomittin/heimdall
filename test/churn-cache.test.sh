@@ -82,6 +82,32 @@ ok "measured per call, before -> after: $MEAS"
 if [ "$(scanned "$BIG")" -gt 0 ] 2>/dev/null; then :; fi
 if [ "$(scanned "$BIG")" = 0 ]; then ok "the big transcript's warm call reads 0 bytes"; else bad "warm big transcript not 0 bytes"; fi
 
+echo "-- A2. the cache is private: written atomically, never through a link (security review of 91623b61) --"
+# CHURN_HELPER lets the RED run point these cases at the pre-fix helper; unset, they test the real one.
+HSEC="${CHURN_HELPER:-$HELPER}"
+SEC="$T/sec"; VICTIM="$T/victim"; mkdir -p "$SEC" "$VICTIM"
+S3="$T/s3.jsonl"; { filler one; notif c1 completed; } > "$S3"
+md5() { perl -MDigest::MD5=md5_hex -e 'print md5_hex($ARGV[0])' "$1"; }
+mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+WANT3="$(oracle "$S3" | norm)"
+ln -s "$VICTIM" "$SEC/linkdir"
+OUT="$(perl "$HSEC" "$SEC/linkdir" "$S3" 2>/dev/null)"
+if [ -z "$(ls -A "$VICTIM")" ] && [ "$(printf '%s' "$OUT" | norm)" = "$WANT3" ]; then ok "a cache dir that is a symlink is refused: nothing written behind the link, the answer unchanged"; else bad "symlinked cache dir: victim now holds [$(ls -A "$VICTIM" | tr '\n' ' ')], answer [$OUT]"; fi
+rm -f "$VICTIM"/* "$VICTIM"/.tmp-* 2>/dev/null
+mkdir -p "$SEC/d2"; chmod 700 "$SEC/d2"; echo precious > "$VICTIM/target.txt"
+ln -s "$VICTIM/target.txt" "$SEC/d2/$(md5 "$S3").idx"
+OUT="$(perl "$HSEC" "$SEC/d2" "$S3" 2>/dev/null)"
+if [ "$(cat "$VICTIM/target.txt")" = precious ] && [ ! -L "$SEC/d2/$(md5 "$S3").idx" ] && [ "$(printf '%s' "$OUT" | norm)" = "$WANT3" ]; then ok "a link planted at the cache file's own path is replaced by a real file, never written through"; else bad "planted cache-file link: victim [$(cat "$VICTIM/target.txt")] still a link? [$([ -L "$SEC/d2/$(md5 "$S3").idx" ] && echo yes || echo no)]"; fi
+mkdir -p "$SEC/d3"; chmod 700 "$SEC/d3"; echo precious > "$VICTIM/tmp-target.txt"
+# the old scheme wrote <cache file>.<pid>.tmp with a plain open(); a shell knows the pid an exec'd perl will have, so the link goes exactly there
+OUT="$(VT="$VICTIM/tmp-target.txt" CF="$SEC/d3/$(md5 "$S3").idx" HP="$HSEC" D3="$SEC/d3" S="$S3" sh -c 'ln -s "$VT" "$CF.$$.tmp"; exec perl "$HP" "$D3" "$S"' 2>/dev/null)"
+if [ "$(cat "$VICTIM/tmp-target.txt")" = precious ] && [ "$(printf '%s' "$OUT" | norm)" = "$WANT3" ]; then ok "a link planted at the old predictable temp name (<cache>.<pid>.tmp) is never written through"; else bad "planted temp-name link: victim now [$(cat "$VICTIM/tmp-target.txt")]"; fi
+mkdir -p "$SEC/d4"; chmod 777 "$SEC/d4"
+perl "$HSEC" "$SEC/d4" "$S3" >/dev/null 2>&1
+perl "$HSEC" "$SEC/fresh" "$S3" >/dev/null 2>&1
+if [ "$(mode "$SEC/d4")" = 700 ] && [ "$(mode "$SEC/fresh")" = 700 ] && [ "$(mode "$SEC/d4/$(md5 "$S3").idx")" = 600 ] && [ -z "$(ls -A "$SEC/d4" | grep -v '\.idx$')" ]; then ok "cache dir 0700 (a loose one of ours tightened), cache file 0600, no temp file left behind"; else bad "modes: d4 $(mode "$SEC/d4") fresh $(mode "$SEC/fresh") file $(mode "$SEC/d4/$(md5 "$S3").idx") leftovers [$(ls -A "$SEC/d4" | grep -v '\.idx$' | tr '\n' ' ')]"; fi
+if grep -q 'HEIMDALL_HOME' "$REPO/bin/heimdall-agents" && grep -q 'notif-index' "$REPO/bin/heimdall-agents" && ! grep -q 'hmd-notif-index' "$REPO/bin/heimdall-agents"; then ok "bin/heimdall-agents keeps the cache under \$HEIMDALL_HOME, not under a predictable /tmp name"; else bad "bin/heimdall-agents still names a /tmp cache dir"; fi
+
 echo "-- B. an idle hmd ui stops re-running its spawn-backed collectors every poll --"
 PYOUT="$(python3 -I - "$REPO/sentinels/hmd-ui.py" <<'PYEOF'
 import importlib.util, sys, threading, time

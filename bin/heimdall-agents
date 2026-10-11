@@ -652,7 +652,7 @@ build_notif_index() {
   local helper
   helper="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")" 2>/dev/null && pwd)/lib/agents_notif_index.pl"
   # shellcheck disable=SC2086
-  if [ -r "$helper" ] && _NOTIF_IDX="$(perl "$helper" "${TMPDIR:-/tmp}/hmd-notif-index-$(id -u)" $existing 2>/dev/null)" && [ -n "$_NOTIF_IDX" ]; then
+  if [ -r "$helper" ] && _NOTIF_IDX="$(perl "$helper" "${HEIMDALL_HOME:-${HOME:-/nonexistent}/.heimdall}/notif-index" $existing 2>/dev/null)" && [ -n "$_NOTIF_IDX" ]; then
     return 0
   fi
   # shellcheck disable=SC2086
