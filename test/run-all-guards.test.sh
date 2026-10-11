@@ -72,10 +72,10 @@ R="$(gate 55.00 HMD_QUIET_FACTOR=6)"
 case "$R" in *"outcome=quiet jobs=6"*) ok "HMD_QUIET_FACTOR scales the relative threshold (6 x 10 = 60 > 55: quiet)" ;; *) bad "factor override: $R" ;; esac
 echo "1.00 2.00 55.00" > "$T/load"
 ( sleep 1; echo "1.00 2.00 3.00" > "$T/load" ) &
-R="$( export PATH="$T/shim:$PATH"; NCPU=10 JOBS=6 HMD_QUIET_POLL_S=0.2 HMD_QUIET_MAX_WAIT_S=20; out="$(hmd_test_wait_quiet)"; printf '%s|outcome=%s jobs=%s' "$out" "$QUIET_GATE_OUTCOME" "$JOBS" )"
+R="$( export PATH="$T/shim:$PATH"; NCPU=10 JOBS=6 HMD_QUIET_POLL_S=0.2 HMD_QUIET_MAX_WAIT_S=20; hmd_test_wait_quiet >"$T/gate.out"; printf '%s|outcome=%s jobs=%s' "$(cat "$T/gate.out")" "$QUIET_GATE_OUTCOME" "$JOBS" )"
 wait
 case "$R" in *"outcome=quiet jobs=6"*) ok "load that drops while waiting opens the gate (no reduction)" ;; *) bad "load drop: $R" ;; esac
-R="$( export PATH="$T/shim:$PATH"; NCPU=""; JOBS=6; out="$(hmd_test_wait_quiet)"; printf '%s|outcome=%s' "$out" "$QUIET_GATE_OUTCOME" )"
+R="$( export PATH="$T/shim:$PATH"; NCPU=""; JOBS=6; hmd_test_wait_quiet >"$T/gate.out"; printf '%s|outcome=%s' "$(cat "$T/gate.out")" "$QUIET_GATE_OUTCOME" )"
 case "$R" in *"not waiting"*"outcome=unreadable") ok "an unknown cpu count never blocks the sweep" ;; *) bad "unknown cpu: $R" ;; esac
 
 echo "-- 2. timeout_run kills what a suite left in its process group --"
