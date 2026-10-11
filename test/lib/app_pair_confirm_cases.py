@@ -832,6 +832,7 @@ def one_live_window_per_code(relay):
             return 409, {"error": "code in use by another open window"}
         held[code] = sid
         return None
+    answer.held = held  # code -> the session the relay holds it for: an accepted registration puts one here, a refused one (409) never does
     return answer
 
 
@@ -1609,6 +1610,21 @@ def new_client(s, old, timeout=60):
     return seen[0] if wait_until(moved, timeout) else 0
 
 
+def replacement_window(s, since, timeout=60):
+    """The live session the relay holds the session code for once it has ACCEPTED a registration made after the first `since` of them; None if
+    none shows up in `timeout` seconds. A client that replaces a crashed one may first meet the crashed one's window, which has not lapsed
+    yet: the relay answers 409 (the fake records that attempt all the same), the client revokes it and ends, and connect starts another. So a
+    refused registration is not a window a phone can type the code against, and neither is the crashed client's own."""
+    seen = [None]
+
+    def accepted():
+        holder = s.relay.code_status.held.get(s.relay.registrations[0]["code"])
+        sess = s.relay.get(holder) if holder in {r["session_id"] for r in list(s.relay.registrations)[since:]} else None
+        seen[0] = sess if sess is not None and not sess.ended and sess.exp > time.time() + 1 else None
+        return seen[0] is not None
+    return seen[0] if wait_until(accepted, timeout) else None
+
+
 def case_connect_respawns_a_crashed_client():
     with Scn(ttl=6) as s, purging_lapsed_sessions(s.relay, 2.0):
         s.relay.code_status = one_live_window_per_code(s.relay)
@@ -1629,15 +1645,11 @@ def case_connect_respawns_a_crashed_client():
         regs = list(s.relay.registrations)
         T.check(fresh and regs[-1]["code"] == regs[0]["code"], "R1. the replacement offers the same code again",
                 "registrations %d (was %d)" % (len(regs), before))
-        # the replacement may first meet the crashed client's registration, which has not lapsed yet: that attempt is revoked and retried, so
-        # the phone types the code against a registration whose session is still live
-        def live():
-            sessions = [s.relay.get(r["session_id"]) for r in s.relay.registrations]
-            return [x for x in sessions if x is not None and not x.ended and x.exp > time.time() + 1]
-        wait_until(live, 40)
-        target = live()
-        opened, _pub = s.paired_state(s.bind(target[-1].id)) if target else (None, b"")
-        T.check(opened is not None, "R1. ...and a phone that types the code pairs on it", "live sessions %d" % len(target))
+        # the replacement may first meet the crashed client's registration, which has not lapsed yet: that attempt is refused, revoked and
+        # retried, so the phone types the code against the registration the relay accepted, whose session is live
+        window = replacement_window(s, before, 40)
+        opened, _pub = s.paired_state(s.bind(window.id)) if window else (None, b"")
+        T.check(opened is not None, "R1. ...and a phone that types the code pairs on it", "accepted replacement window %s" % (window.id if window else None))
 
 
 def case_connect_logs_a_repair():
@@ -1657,10 +1669,13 @@ def case_connect_logs_a_repair():
         before = len(s.relay.registrations)
         os.kill(first, 9)
         new = new_client(s, first)
-        if not (new and wait_until(lambda: len(s.relay.registrations) > before, 60)):
+        # the replacement may first meet the crashed client's window, which has not lapsed yet: refused, revoked, retried -- the phone types the
+        # code against the registration the relay accepted
+        window = replacement_window(s, before) if new else None
+        if window is None:
             T.check(False, "R2. (setup) the crashed client is replaced and registers the code", app.tail())
             return
-        s.bind(s.relay.registrations[-1]["session_id"])
+        s.bind(window.id)
         said = wait_until(lambda: "phone re-paired by code" in app.err().decode("utf-8", "replace"), 30)  # on stderr, as the line promises
         paired = connect_events(s, "code_paired")
         T.check(said, "R2. a pairing by code on a replaced client is logged on connect's output as a re-pair", app.tail())
