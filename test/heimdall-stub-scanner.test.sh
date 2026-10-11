@@ -54,7 +54,7 @@ run_case() {
   expect="$1"; name="$2"; fpath="$3"; content="$4"
   json="$(jq -n --arg fp "$fpath" --arg c "$content" \
     '{tool_name:"Write", tool_input:{file_path:$fp, content:$c}}')"
-  printf '%s' "$json" | bash -c "$CMD" >/dev/null 2>&1
+  printf '%s' "$json" | CLAUDE_PLUGIN_ROOT="$PLUGIN" bash -c "$CMD" >/dev/null 2>&1
   rc=$?
   if [ "$rc" -eq 2 ]; then got="block"; else got="allow"; fi
   if [ "$got" = "$expect" ]; then
@@ -75,7 +75,7 @@ run_receipt() {
   name="$1"; fpath="$2"; content="$3"; want_shape="$4"
   json="$(jq -n --arg fp "$fpath" --arg c "$content" \
     '{tool_name:"Write", tool_input:{file_path:$fp, content:$c}}')"
-  out="$(printf '%s' "$json" | bash -c "$CMD" 2>/dev/null)"
+  out="$(printf '%s' "$json" | CLAUDE_PLUGIN_ROOT="$PLUGIN" bash -c "$CMD" 2>/dev/null)"
   rc=$?
   err="$(printf '%s' "$out" | jq -r '.error // empty' 2>/dev/null)"
   ok=1

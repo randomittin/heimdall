@@ -65,9 +65,10 @@ case "${1:-}" in
   -h|--help) sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-# SINCE THE EXTRACTION — two deliberate deltas from the historical inline chain
-# (2026-10-11, "precheck never blocks silently in another repo"). test/heimdall-precheck-bash.test.sh
-# cases 21 and 24-26 pin them; every other branch is still byte-identical to the inline string.
+# SINCE THE EXTRACTION — three deliberate deltas from the historical inline chain
+# (2026-10-11, "precheck never blocks silently in another repo"; then "never execute the session's
+# repo"). test/heimdall-precheck-bash.test.sh cases 17, 21 and 24-29 pin them; every other branch is
+# still byte-identical to the inline string.
 #
 #   1. deny(): a deny states its verdict on stderr TOO. Claude Code surfaces ONLY stderr for an
 #      exit-2 hook and ignores stdout, so the stdout-only verdict surfaced as "hook error ... No
@@ -78,6 +79,18 @@ esac
 #      toplevel. This script is only ever run as <root>/bin/heimdall-precheck-bash, so its own location
 #      is the one answer that cannot name a foreign repo; the cwd fallback pointed every gate bin (and
 #      the trailing parallelism-tracker) at a repo with no bin/.
+#
+#   3. PUSH MATCHER: the push gate used to be armed by `^git\s+push` alone, so every other way of typing
+#      the same push walked past the quality, secret, self-scan, oracle and corpus gates: `git -C <dir>
+#      push`, `x && git push`, `; git push`, `FOO=1 git push`, `(git push)`, `sudo git push`,
+#      `/usr/bin/git push`, `bash -c "git push"`. It now matches `git` as a COMMAND WORD: at the start of
+#      a line, after ; & | ( { ` $( ! then/do/else, after env assignments and wrapper words (sudo, command,
+#      env, exec, time, nohup, nice, builtin, xargs), or as the first word of a `sh -c`/`eval` string; then
+#      git's global options (-C <dir>, -c k=v, --git-dir[=]<dir>, --no-pager, ...) and then `push` as a
+#      whole word (so `git pushd` is not a push). Text that only MENTIONS a push (`echo "git push"`,
+#      `grep -rn "git push" docs/`, a commit message) and other subcommands (`git stash push`) stay
+#      unmatched: a push gate that fired on prose would cost a full gate run per grep. Indirection no regex
+#      can see (`$GIT push`, `xargs -n 1 git push`) is the native pre-push hook's job (core.hooksPath).
 #
 # The gates themselves still read the CWD repo's own state (heimdall-state.json, .planning/, evals/):
 # that is the policy for "the repo being pushed", correctly applied in a foreign repo.
@@ -101,7 +114,13 @@ if printf '%s\n' "$CMD" | grep -qE '(^|[;&|]\s*)git\s+commit'; then
     fi
   fi
 fi
-if printf '%s\n' "$CMD" | grep -qE '^git\s+push'; then
+SQ="'"
+GP_VAL='("[^"]*"|'"$SQ"'[^'"$SQ"']*'"$SQ"'|[^[:space:]]*)'
+GP_START='(^|[;&|({`!]|\$\(|(^|[[:space:]])(then|do|else|elif)[[:space:]]|(sh|bash|zsh|dash|ksh)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*c[[:space:]]+["'"$SQ"']|eval[[:space:]]+["'"$SQ"'])[[:space:]]*'
+GP_PRE='([A-Za-z_][A-Za-z0-9_]*='"$GP_VAL"'[[:space:]]+|(sudo|command|env|exec|time|nohup|nice|builtin|xargs)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)*'
+GP_OPT='([[:space:]]+(-[Cc][[:space:]]+'"$GP_VAL"'|--(git-dir|work-tree|namespace|super-prefix|config-env)[[:space:]]+'"$GP_VAL"'|--?[A-Za-z][A-Za-z-]*(='"$GP_VAL"')?))*'
+GP_RE="${GP_START}${GP_PRE}([^[:space:]]*/)?git${GP_OPT}[[:space:]]+push([[:space:]]|\$|[;&|)}\"${SQ}])"
+if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
   HSTATE="$PLUGIN/bin/heimdall-state"
   [ -x "$HSTATE" ] || HSTATE=heimdall-state
   QGOUT=$("$HSTATE" check-quality-gates 2>&1)
