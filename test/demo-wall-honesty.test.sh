@@ -72,90 +72,34 @@ run() { perl -e 'alarm shift; exec @ARGV' "$@"; }
 # still shows up as a changed line instead of disappearing invisibly.
 stamp_of() { stat -f '%N %m %z' "$1" 2>/dev/null || stat -c '%n %Y %s' "$1" 2>/dev/null || printf '%s 0 0\n' "$1"; }
 
-# Full recursive (path, mtime, size) snapshot of the real ~/.heimdall, used by
-# C3 below instead of a bare top-directory mtime compare.
+# Full recursive snapshot of ONE directory tree, used by C3 below: every path's
+# (name, mtime, size) plus a content checksum of every regular file, so an in-place
+# overwrite that keeps the size and lands in the same second still shows up. There is
+# deliberately NO exclusion list: the only tree this is ever pointed at is one this
+# test created and owns (C3's sentinel HOME), so there is no other writer to allow for.
 #
-# WHY A DIRECTORY-MTIME COMPARE IS NOT ENOUGH: this machine's live statusline
-# (refreshInterval: 2s in the operator's Claude Code settings) and its hooks
-# are entirely unrelated to this seeder, yet both legitimately write under the
-# real ~/.heimdall on their own schedule:
-#   - sentinels/hmd-statusline.py's persist_rate_limits() writes
-#     ~/.heimdall/rate-limits.json via tmp+os.replace() on every render.
-#   - the PreToolUse ctx-meter hook writes ~/.heimdall/ctx/<session-id>.json
-#     on every tool call (bin/heimdall-ctx-meter notice).
-#   - the statusline's throttled presence beat drives bin/heimdall-status-json,
-#     which writes ~/.heimdall/ledger/repos/<repo_key>.json (one file PER repo,
-#     since the mirror-race fix in docs/analysis/2026-08-29-statusline-roster-
-#     inflation.md — repo_key() lives in sentinels/hmd_ledger.py) via the same
-#     tmp+rename pattern (opposite tmp-name order: <path>.tmp.<pid> vs
-#     rate-limits' <path>.<pid>.tmp), falling back to the legacy
-#     ~/.heimdall/ledger/status.json only for an unmigrated install or an
-#     explicit HMD_STATUS_OUT/--out override.
-#   - the statusline's swarm_shared() (sentinels/hmd-statusline.py) opens
-#     ~/.heimdall/shared-memory.db read-only (`mode=ro`) every render to read
-#     bin/shared-memory's namespaced snapshot. SQLite's WAL protocol still
-#     requires a reader to record its lock in the -shm index and can touch
-#     -wal on transaction start/end, so shared-memory.db-shm's mtime advances
-#     on a fixed ~2s cadence (confirmed: `stat -f %m` on that file alone,
-#     sampled every 2s with nothing else running, ticks every sample) even
-#     though the connection never writes a row. The main .db file's content
-#     is untouched by this reader — only the two WAL side-files move.
-#   - hooks/heimdall-429-detect.sh's trace_emit() appends one bounded JSONL
-#     line to ~/.heimdall/429-detect-trace.jsonl on EVERY Stop/SubagentStop
-#     hook firing. The path defaults to $HOME/.heimdall regardless of which
-#     repo/worktree fired the hook (--repo/CLAUDE_PROJECT_DIR only gates
-#     whether the hook runs at all, never where it writes), so it is a single
-#     machine-wide file, never scoped to this repo, this worktree, or this
-#     seeder — and it is DEFAULT ON (that file's own header explains why;
-#     HMD_429_DETECT_TRACE=0 disables it). Caught live: a 15-25-way
-#     concurrent `test/run-all.sh` sweep failed C3 with the seeder's dry-run
-#     producing zero writes of its own — some unrelated concurrent session's
-#     subagent stopped mid-snapshot-window and appended a line. Rotates in
-#     place past HMD_429_DETECT_TRACE_MAX_BYTES (default 256KiB) via
-#     tail+rename to "$file".trim.$$, same tmp+rename shape as the writers
-#     above.
-# A tmp+rename INSIDE a directory bumps that directory's OWN mtime too (not
-# just the file's) — so a bare `ls -lTd ~/.heimdall` before/after false-
-# positived on all of these, none of which have anything to do with the seeder
-# (confirmed by grep: none of these paths appear anywhere in
-# bin/heimdall-seed-demo-wall).
-#
-# THE FIX IS A FULL SNAPSHOT DIFF, NOT A LOOSER CHECK: this walks every path
-# under ~/.heimdall and stamps each one — STRICTLY MORE sensitive than the old
-# check (a write to ANY file anywhere in the tree now fails C3, including an
-# in-place content overwrite with no rename at all, which the old directory-
-# mtime compare would have missed entirely) except for the writers named
-# above. The FIXED-name writers are excluded BY EXACT PATH — never a
-# wildcarded directory — so a genuine escape into a sibling file, even right
-# next to rate-limits.json or the legacy ledger/status.json, still fails the
-# gate. ctx/ and ledger/repos/ are the two subtrees excluded wholesale,
-# because each is inherently dynamic (a new file per Claude Code session, or
-# per repo on this machine, not a fixed name) — both are independently
-# hook/keeper-driven and the seeder never references either. shared-memory.db
-# itself (the actual data) is NOT excluded — only its two WAL side-files are,
-# by exact name — so a real write of demo data into that DB still fails C3.
-home_heimdall_snapshot() {
-  [ -d "$HOME/.heimdall" ] || return 0
-  local rl="$HOME/.heimdall/rate-limits.json"
-  local lg="$HOME/.heimdall/ledger/status.json"
-  local lgdir="$HOME/.heimdall/ledger"
-  local lgrepos="$HOME/.heimdall/ledger/repos"
-  local ctx="$HOME/.heimdall/ctx"
-  local smshm="$HOME/.heimdall/shared-memory.db-shm"
-  local smwal="$HOME/.heimdall/shared-memory.db-wal"
-  local tr429="$HOME/.heimdall/429-detect-trace.jsonl"
-  find "$HOME/.heimdall" -mindepth 1 2>/dev/null | sort | while IFS= read -r f; do
-    case "$f" in
-      "$rl"|"$rl".*.tmp) continue ;;  # statusline rate-limit persister
-      "$lg"|"$lg".tmp.*) continue ;;  # heimdall-status-json persister (legacy global mirror)
-      "$lgdir") continue ;;           # the rename above also bumps ledger/'s own mtime
-      "$lgrepos"|"$lgrepos"/*) continue ;;  # heimdall-status-json persister (per-repo mirror:
-                                             # dynamic per-repo filename, like ctx/ below)
-      "$ctx"|"$ctx"/*) continue ;;    # per-session ctx-meter hook writes
-      "$smshm"|"$smwal") continue ;;  # statusline swarm_shared()'s read-only WAL reader lock
-      "$tr429"|"$tr429".trim.*) continue ;;  # heimdall-429-detect.sh trace_emit() (Stop/SubagentStop, machine-wide)
-    esac
+# WHY C3 SNAPSHOTS A SENTINEL AND NOT THE REAL ~/.heimdall (it used to, and was racy):
+# the real ~/.heimdall is a shared, live directory that every Claude Code session and
+# hmd hook on the machine writes on its own schedule, none of it related to the seeder.
+# The 2.4.6 release sweep failed C3 with a `5408c5408` diff; line 5408 of that snapshot
+# was ~/.heimdall/notif-index (its directory mtime), next to notif-index/<md5>.idx and
+# data/routine-*/planning/metrics.jsonl. Those were another live session's writes:
+# bin/heimdall-agents keeps a per-transcript cache at
+# ${HEIMDALL_HOME:-$HOME/.heimdall}/notif-index/<md5 of the transcript path>.idx
+# (bin/lib/agents_notif_index.pl) and refreshes it on every agents render; the idx that
+# moved was the transcript of a session in an unrelated repo, still growing, and a
+# scheduled routine appends to its own metrics.jsonl. A shared tree can only be compared
+# through an exclusion list, and that list never stops growing (rate-limits.json, ctx/,
+# ledger/, the shared-memory WAL side-files, the 429-detect trace, and now notif-index/
+# and data/): every new machine-wide writer re-breaks C3 on a busy machine. A sentinel
+# tree has no other writer, so the compare needs no allowance and is strictly more
+# sensitive than the list was.
+tree_snapshot() {
+  local root="$1" f
+  [ -d "$root" ] || return 0
+  find "$root" -mindepth 1 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
     stamp_of "$f"
+    [ -f "$f" ] && cksum < "$f"
   done
 }
 
@@ -256,15 +200,36 @@ grep -q 'HEIMDALL_SEED_LIVE_CONFIRM' "$LIVE_OUT" 2>/dev/null \
   && ok "C2 the refusal names the exact opt-in, so going live is deliberate not discovered" \
   || bad "C2 the refusal does not name \$HEIMDALL_SEED_LIVE_CONFIRM"
 
-# The real presence state must be untouched by any exercise above. Snapshot
-# every path under ~/.heimdall (see home_heimdall_snapshot() above for why a
-# bare directory-mtime compare is not enough on this machine).
-HOME_STAMP_BEFORE="$(home_heimdall_snapshot)"
-run 120 bash "$SEEDER" --count 3 >/dev/null 2>&1
-HOME_STAMP_AFTER="$(home_heimdall_snapshot)"
-[ "$HOME_STAMP_BEFORE" = "$HOME_STAMP_AFTER" ] \
-  && ok "C3 a dry-run leaves the real ~/.heimdall untouched (full recursive snapshot)" \
-  || bad "C3 the real ~/.heimdall was modified by a dry-run: $(diff <(printf '%s' "$HOME_STAMP_BEFORE") <(printf '%s' "$HOME_STAMP_AFTER"))"
+# C3. The dry-run must not touch the caller's ~/.heimdall. It is exercised under a
+# SENTINEL HOME: a private tree this test owns, seeded with canary files, with HOME and
+# HEIMDALL_HOME both pointed at it, so a write the seeder (or anything it spawns) makes
+# through either lands in the sentinel, where ANY change fails the full-tree snapshot.
+# The real ~/.heimdall cannot be diffed (see tree_snapshot() above); C4 below still
+# checks it, by the one thing only this seeder could put there.
+SENT_HOME="$TMP/sentinel-home"
+mkdir -p "$SENT_HOME/.heimdall/ledger" "$SENT_HOME/.heimdall/ctx"
+printf '{"canary":true}\n' >"$SENT_HOME/.heimdall/rate-limits.json"
+printf 'canary\n' >"$SENT_HOME/.heimdall/ledger/status.json"
+SENT_BEFORE="$(tree_snapshot "$SENT_HOME")"
+C3_ROSTER="$TMP/c3-roster.json"
+( export HOME="$SENT_HOME" HEIMDALL_HOME="$SENT_HOME/.heimdall"; run 120 bash "$SEEDER" --count 3 --json >"$C3_ROSTER" 2>"$TMP/c3.err" )
+C3_ROWS="$($JQ -r '(.online // []) | length' "$C3_ROSTER" 2>/dev/null || echo 0)"
+[ "$C3_ROWS" = "3" ] \
+  && ok "C3a the dry-run ran to completion under the sentinel HOME (3 rows), so the untouched check below is not vacuous" \
+  || bad "C3a the dry-run under the sentinel HOME produced '$C3_ROWS' rows, not 3: $(tail -3 "$TMP/c3.err" 2>/dev/null)"
+SENT_AFTER="$(tree_snapshot "$SENT_HOME")"
+[ "$SENT_BEFORE" = "$SENT_AFTER" ] \
+  && ok "C3b a dry-run leaves its caller's ~/.heimdall untouched (full-tree snapshot, no exclusions)" \
+  || bad "C3b the dry-run modified the caller's ~/.heimdall: $(diff <(printf '%s\n' "$SENT_BEFORE") <(printf '%s\n' "$SENT_AFTER"))"
+# The detector must be able to fail. A same-size in-place overwrite and a brand-new file
+# are the two shapes a stray write takes; each must change the snapshot.
+printf 'Z' | dd of="$SENT_HOME/.heimdall/ledger/status.json" bs=1 count=1 conv=notrunc 2>/dev/null
+SENT_OVERWRITTEN="$(tree_snapshot "$SENT_HOME")"
+: >"$SENT_HOME/.heimdall/stray-file"
+SENT_CREATED="$(tree_snapshot "$SENT_HOME")"
+[ "$SENT_OVERWRITTEN" != "$SENT_AFTER" ] && [ "$SENT_CREATED" != "$SENT_OVERWRITTEN" ] \
+  && ok "C3c the snapshot sees a same-size in-place overwrite and a new file (the check can fail)" \
+  || bad "C3c the snapshot missed an in-place overwrite or a new file, so C3b proves nothing"
 
 if [ -d "$HOME/.heimdall" ] && grep -rqs "$SEED_PROJECT" "$HOME/.heimdall" 2>/dev/null; then
   bad "C4 the demo project '$SEED_PROJECT' leaked into the real ~/.heimdall"
