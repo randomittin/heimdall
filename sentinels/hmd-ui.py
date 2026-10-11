@@ -113,6 +113,19 @@ PAGE_PATH = os.path.join(HERE, "hmd-ui.html")
 SCHEMA_VERSION = 1
 POLL_INTERVAL_S = 2.0          # the BACKSTOP: a pass at least this often, and the period of the slow collectors' refresh
 WATCH_INTERVAL_S = 0.1         # between passes StateCache.run stats WATCH_SOURCES this often (a stat each, no read)
+# A ui nobody has looked at (no GET, no SSE stream, no relay client) for IDLE_AFTER_S is IDLE: its warmer then runs the
+# spawn-backed collectors at most once per IDLE_WARM_INTERVAL_S instead of every POLL_INTERVAL_S. A leaked or forgotten ui
+# otherwise forks hooks/identity/fallback/agents/quality-gate every 2 s for as long as it lives (handoff 2026-10-11: 14 such
+# servers were most of a 10-core box's load). Looking at it again (observe()) restores the poll rate within one tick.
+def _idle_env(name, default):
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return float(default)
+
+
+IDLE_AFTER_S = _idle_env("HMD_UI_IDLE_AFTER_S", "60")
+IDLE_WARM_INTERVAL_S = _idle_env("HMD_UI_IDLE_WARM_S", "30")
 REFRESH_MIN_GAP_S = 0.25       # a poller pass never starts sooner than this after the previous one began
 KEEPALIVE_S = 15.0
 CMD_TIMEOUT_S = 8
@@ -1351,6 +1364,7 @@ class StateCache:
         self._refreshed_at = None   # time.monotonic() of the last completed refresh, or None
         self._last_ok_at = None     # the same moment, but never cleared by invalidate(): what idle_s() measures from
         self._stop = threading.Event()
+        self._observed_at = time.monotonic()   # last time something READ this ui (observe()): the warmer idles without it
         self._warmed = threading.Event()   # set by the warmer: the slow answers are fresh, a pass is due
         self._live_users = None   # (value, written_at) of the self-published panel
         self._companion = new_companion_publisher(root)   # A3: chat / hmd-question / agents
@@ -1362,6 +1376,8 @@ class StateCache:
         `partial` is the poller's pass: the subprocess-backed collectors serve their last answer
         however old (see _subprocess_reuse). Every other caller -- a GET, the first pass -- re-spawns
         once the subprocess TTL ran out, exactly as before."""
+        if not partial:
+            self.observe()   # a GET or the first pass; the poller's own partial passes must not keep a ui warm
         _subprocess_reuse.any_age = partial
         try:
             return self._refresh(publish)
@@ -1412,6 +1428,7 @@ class StateCache:
         collection at all. Recomputes synchronously, at most once per
         POLL_INTERVAL_S, only when empty (first request) or stale (poller fell
         behind, or invalidate() was just called)."""
+        self.observe()
         with self._cond:
             if self._fresh_locked():
                 return self._state, self._digest
@@ -1420,6 +1437,11 @@ class StateCache:
                 if self._fresh_locked():
                     return self._state, self._digest
             return self.refresh()
+
+    def observe(self):
+        """Note that something is reading this ui (a GET, an SSE stream, the relay client calling wait_for_change): the warmer
+        keeps the spawn-backed answers fresh at POLL_INTERVAL_S only for a ui that is being looked at."""
+        self._observed_at = time.monotonic()
 
     def idle_s(self):
         """Seconds since a refresh last completed, or None before the first one: /healthz's measure of a poller
@@ -1438,6 +1460,7 @@ class StateCache:
     def wait_for_change(self, seen_digest, timeout):
         """Block until the digest differs from `seen_digest` or `timeout` elapses.
         Returns (state, digest) -- the caller compares digests to decide whether to emit."""
+        self.observe()
         with self._cond:
             if self._digest != seen_digest:
                 return self._state, self._digest
@@ -1489,8 +1512,14 @@ class StateCache:
         re-run the collectors whose answer costs a process spawn (SLOW_COLLECTORS), so the answers
         the poller's partial passes reuse are fresh, then tell it a pass is due. What they return is
         discarded -- only the refreshed caches matter -- so a change that lands meanwhile is never
-        queued behind 0.3-1.5 s of spawns."""
+        queued behind 0.3-1.5 s of spawns. A ui nobody has looked at for IDLE_AFTER_S skips them, running them at most once
+        per IDLE_WARM_INTERVAL_S (observe() ends the idleness)."""
+        warmed_at = 0.0
         while not self._stop.wait(POLL_INTERVAL_S):
+            now = time.monotonic()
+            if now - self._observed_at > IDLE_AFTER_S and now - warmed_at < IDLE_WARM_INTERVAL_S:
+                continue
+            warmed_at = now
             for collect in SLOW_COLLECTORS:
                 try:
                     collect(self.root)
