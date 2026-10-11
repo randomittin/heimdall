@@ -36,6 +36,16 @@
 #      `.heimdall/`, `node_modules/` and anything outside the repo (a Claude
 #      scratchpad, another checkout, a `..` escape) are excluded, and a session
 #      whose repo IS a worktree still lints its own files. Cases 24-26.
+#   9. EVERY CHECKER, NOT JUST ESLINT. The shellcheck (-f json), ruff
+#      (--output-format json) and biome (--reporter=json) calls read a non-zero
+#      exit as findings too and scraped the count from text (biome: 1 per failed
+#      run), although their exit codes mean different things (shellcheck 2-4
+#      and ruff 2 are failures, biome's 1 is both). Each now counts findings
+#      from its own JSON report and treats a failed run (config error, bad flag
+#      or format, crash, missing binary, a report of only tool-side
+#      diagnostics) as a tool error, with the receipt semantics of 7.
+#      bash -n, python3's ast.parse and tsc get the same line drawn from what
+#      they have to go on. Cases 27-34.
 #
 # ISOLATION: edit-tracker keys its ledger on $TMPDIR/heimdall-edits/
 # $CLAUDE_CODE_SESSION_ID.log. Every case here sets TMPDIR to a private temp
@@ -275,7 +285,7 @@ track "$D" "$D/repo/a.sh"
 
 rc="$(PATH="$D/fakebin:$PATH" run_lint "$D")"
 if [ "$rc" = "0" ] && [ -s "$D/fakebin/argv.log" ] \
-   && ! grep -qv -- '^-S warning -f gcc ' "$D/fakebin/argv.log" \
+   && ! grep -qv -- '^-S warning -f json ' "$D/fakebin/argv.log" \
    && [ "$(jq -r '.quality_gates.lint_last_run.shellcheck_severity' "$S")" = "warning" ]; then
   ok "13. default: shellcheck runs at -S warning, receipt records shellcheck_severity=warning"
 else
@@ -288,7 +298,7 @@ for pair in error:error warning:warning info:info style:style INFO:info Style:st
   : > "$D/fakebin/argv.log"
   rc="$(HMD_STOP_LINT_SEVERITY="$given" PATH="$D/fakebin:$PATH" run_lint "$D")"
   if [ "$rc" != "0" ] || [ ! -s "$D/fakebin/argv.log" ] \
-     || grep -qv -- "^-S $want -f gcc " "$D/fakebin/argv.log"; then
+     || grep -qv -- "^-S $want -f json " "$D/fakebin/argv.log"; then
     sev_bad="$sev_bad $given(want $want, got '$(head -1 "$D/fakebin/argv.log")', rc=$rc)"
   fi
 done
@@ -302,7 +312,7 @@ fi
 rc="$(HMD_STOP_LINT_SEVERITY=loud PATH="$D/fakebin:$PATH" run_lint "$D")"
 err="$(cat "$TMPROOT/err")"
 if [ "$rc" = "0" ] && [ -s "$D/fakebin/argv.log" ] \
-   && ! grep -qv -- '^-S warning -f gcc ' "$D/fakebin/argv.log" \
+   && ! grep -qv -- '^-S warning -f json ' "$D/fakebin/argv.log" \
    && [ "$(grep -c "unknown HMD_STOP_LINT_SEVERITY 'loud'" <<<"$err")" = "1" ] \
    && [ "$(jq -r '.quality_gates.lint_last_run.shellcheck_severity' "$S")" = "warning" ]; then
   ok "15. unknown severity → falls back to warning, said once on stderr, exit 0"
@@ -585,6 +595,386 @@ if [ "$rc" = "0" ] && grep -q 'bash -n FAIL' "$TMPROOT/err"; then
 else
   bad "26. repo-inside-worktree files were skipped (rc=$rc): $(cat "$TMPROOT/err")"
 fi
+
+# ── 27-29. shellcheck, ruff and biome: "ran and found problems" vs "failed to run" ──
+# ESLint was fixed first (21-23). The other JSON-capable checkers had the same
+# flaw: every non-zero exit was read as findings, and the count was scraped from
+# text (gcc and concise output) or not taken at all (biome: 1 per failed run).
+# Their exit codes do not even agree on what non-zero means. ShellCheck: 1 is
+# findings but 2 is "a file could not be processed" (it still prints `[]`) and 3
+# or 4 a bad flag or format. Ruff: 1 is findings but 2 is a failure, and a file
+# it cannot read is an E902 *violation* at exit 1. Biome: 1 is findings AND a
+# config error. So a non-zero exit is a FINDING only when it is exit 1 AND the
+# tool's own JSON report (stdout; ruff and biome warn on stderr, which would
+# corrupt a merged stream) holds at least one problem. Anything else is a TOOL
+# ERROR: loud, counted in tool_errors and never in findings, run incomplete,
+# lint_clean left exactly as it was, in BOTH states. Fake binaries stand in for
+# the tools (FAKE_MODE is read at run time) so this holds on any machine; 30
+# repeats it against the real ruff when one is usable.
+
+# mk_fake_linter <tool> <case-dir> [shebang] → fakebin/<tool> (shellcheck|ruff|biome).
+# Its argv goes to fakebin/argv.log and FAKE_MODE picks the behaviour at run time.
+mk_fake_linter() {
+  local tool="$1" d="$2"
+  mkdir -p "$d/fakebin"
+  printf '%s\n' "${3:-#!/bin/sh}" > "$d/fakebin/$tool"
+  cat >> "$d/fakebin/$tool" <<'EOF'
+printf '%s\n' "$*" >> "$(dirname "$0")/argv.log"
+for a in "$@"; do file="$a"; done
+EOF
+  case "$tool" in
+    shellcheck) cat >> "$d/fakebin/$tool" <<'EOF'
+case "${FAKE_MODE:-clean}" in
+  clean)         printf '[]\n'; exit 0 ;;
+  findings)      printf '[{"file":"%s","line":3,"endLine":3,"column":1,"endColumn":7,"level":"warning","code":2034,"message":"unused appears unused. Verify use (or export if used externally).","fix":null},{"file":"%s","line":5,"endLine":5,"column":1,"endColumn":2,"level":"error","code":1072,"message":"Unexpected end of file.","fix":null}]\n' "$file" "$file"; exit 1 ;;
+  unprocessable) printf '%s: openBinaryFile: does not exist (No such file or directory)\n' "$file" >&2; printf '[]\n'; exit 2 ;;
+  badflag)       printf "unrecognized option \`-f'\n\nUsage: shellcheck [OPTIONS...] FILES...\n" >&2; exit 3 ;;
+  badformat)     printf 'Unknown format json\nSupported formats:\n  gcc\n  tty\n' >&2; exit 4 ;;
+  crash)         printf 'shellcheck: Prelude.head: empty list\n' >&2; exit 1 ;;
+  textout)       printf '%s:3:1: warning: unused appears unused. Verify use (or export if used externally). [SC2034]\n' "$file"; exit 1 ;;
+  silent)        exit 1 ;;
+esac
+EOF
+      ;;
+    ruff) cat >> "$d/fakebin/$tool" <<'EOF'
+echo 'warning: The top-level linter settings are deprecated in favour of their counterparts in the `lint` section.' >&2
+case "${FAKE_MODE:-clean}" in
+  clean)    printf '[]'; exit 0 ;;
+  findings) printf '[{"cell":null,"code":"F401","end_location":{"column":10,"row":1},"filename":"%s","fix":null,"location":{"column":8,"row":1},"message":"`os` imported but unused","noqa_row":1,"severity":"error","url":"https://docs.astral.sh/ruff/rules/unused-import"},{"cell":null,"code":"invalid-syntax","end_location":{"column":8,"row":3},"filename":"%s","fix":null,"location":{"column":7,"row":3},"message":"Expected a parameter or the end of the parameter list","noqa_row":null,"severity":"error","url":null}]' "$file" "$file"; exit 1 ;;
+  ioerr)    printf '[{"cell":null,"code":"E902","end_location":{"column":1,"row":1},"filename":"%s","fix":null,"location":{"column":1,"row":1},"message":"No such file or directory (os error 2)","noqa_row":null,"severity":"error","url":"https://docs.astral.sh/ruff/rules/io-error"}]' "$file"; exit 1 ;;
+  cfgerr)   printf 'ruff failed\n  Cause: Failed to parse ruff.toml\n  Cause: TOML parse error at line 1, column 7\n' >&2; exit 2 ;;
+  badflag)  printf "error: unexpected argument '--output-format' found\n" >&2; exit 2 ;;
+  panic)    printf "thread 'main' panicked at crates/ruff/src/lib.rs:1:1:\n" >&2; exit 101 ;;
+  silent)   exit 1 ;;
+esac
+EOF
+      ;;
+    biome) cat >> "$d/fakebin/$tool" <<'EOF'
+echo 'The --reporter=json option is unstable/experimental and its output might change between patch releases.' >&2
+case "${FAKE_MODE:-clean}" in
+  clean)    printf '{"summary":{"changed":0,"unchanged":1,"matches":0,"duration":{"secs":0,"nanos":1000},"errors":0,"warnings":0,"skipped":0,"suggestedFixesSkipped":0,"diagnosticsNotPrinted":0},"diagnostics":[],"command":"lint"}\n'; exit 0 ;;
+  findings) printf '{"summary":{"changed":0,"unchanged":1,"matches":0,"duration":{"secs":0,"nanos":1000},"errors":1,"warnings":1,"skipped":0,"suggestedFixesSkipped":0,"diagnosticsNotPrinted":0},"diagnostics":[{"category":"lint/suspicious/noDebugger","severity":"error","description":"This is an unexpected use of the debugger statement.","message":[],"advices":{"advices":[]},"verboseAdvices":{"advices":[]},"location":{"path":{"file":"%s"},"span":[0,9],"sourceCode":"debugger;"},"tags":["fixable"],"source":null},{"category":"lint/style/useConst","severity":"warning","description":"This let declares a variable that is only assigned once.","message":[],"advices":{"advices":[]},"verboseAdvices":{"advices":[]},"location":{"path":{"file":"%s"},"span":[10,13],"sourceCode":"debugger;let a = 1;"},"tags":["fixable"],"source":null}],"command":"lint"}\n' "$file" "$file"; exit 1 ;;
+  nofiles)  printf '{"summary":{"changed":0,"unchanged":0,"matches":0,"duration":{"secs":0,"nanos":1000},"errors":1,"warnings":0,"skipped":0,"suggestedFixesSkipped":0,"diagnosticsNotPrinted":0},"diagnostics":[{"category":"internalError/io","severity":"error","description":"No files were processed in the specified paths.","message":[],"advices":{"advices":[]},"verboseAdvices":{"advices":[]},"location":{"path":null,"span":null,"sourceCode":null},"tags":[],"source":null}],"command":"lint"}\n'; exit 1 ;;
+  cfgerr)   printf 'biome.json:2:3 deserialize\n\n  x Found an unknown key `linterr`.\n' >&2; exit 1 ;;
+  badflag)  printf 'Unknown option --reporter=json\n' >&2; exit 1 ;;
+  panic)    printf "thread 'main' panicked at crates/biome_cli/src/lib.rs:1:1:\n" >&2; exit 101 ;;
+  silent)   exit 1 ;;
+esac
+EOF
+      ;;
+  esac
+  chmod +x "$d/fakebin/$tool"
+  : > "$d/fakebin/argv.log"
+}
+
+# mk_lint_case <tool> <name> [shebang] → a case with the fake <tool> wired in and
+# one tracked file for it to lint
+mk_lint_case() {
+  local tool="$1" name="$2" d
+  d="$(mk_case "$name")"
+  mk_fake_linter "$tool" "$d" "${3:-}"
+  case "$tool" in
+    shellcheck) printf '#!/usr/bin/env bash\necho a\n' > "$d/repo/a.sh"; track "$d" "$d/repo/a.sh" ;;
+    ruff)       printf 'line-length = 88\n' > "$d/repo/ruff.toml"; printf 'x = 1\n' > "$d/repo/a.py"; track "$d" "$d/repo/a.py" ;;
+    biome)      printf '{}\n' > "$d/repo/biome.json"; printf 'const a = 1;\n' > "$d/repo/a.js"; track "$d" "$d/repo/a.js" ;;
+  esac
+  printf '%s' "$d"
+}
+
+# tool_err_text <tool> <variant> → the diagnostic the stderr report must carry
+tool_err_text() {
+  case "$1:$2" in
+    shellcheck:unprocessable) echo 'openBinaryFile: does not exist' ;;
+    shellcheck:badflag)       echo 'unrecognized option' ;;
+    shellcheck:badformat)     echo 'Unknown format json' ;;
+    shellcheck:crash)         echo 'Prelude.head: empty list' ;;
+    shellcheck:textout)       echo 'unused appears unused' ;;
+    ruff:cfgerr)              echo 'Failed to parse ruff.toml' ;;
+    ruff:badflag)             echo "unexpected argument '--output-format'" ;;
+    ruff:ioerr)               echo 'No such file or directory (os error 2)' ;;
+    ruff:panic|biome:panic)   echo 'panicked at' ;;
+    biome:cfgerr)             echo 'Found an unknown key' ;;
+    biome:badflag)            echo 'Unknown option' ;;
+    biome:nofiles)            echo 'No files were processed in the specified paths' ;;
+    *:silent)                 echo "$1 exited 1 without a readable JSON report" ;;
+    *:nointerp)               echo 'No such file or directory' ;;
+  esac
+}
+
+for tool in shellcheck ruff biome; do
+  case "$tool" in
+    shellcheck) argv_re='^-S warning -f json '; mark='SC2034'
+                variants=(unprocessable badflag badformat crash textout silent nointerp) ;;
+    ruff)       argv_re='^check --no-fix --output-format json '; mark='F401'
+                variants=(cfgerr badflag ioerr panic silent nointerp) ;;
+    biome)      argv_re='^lint --reporter=json '; mark='noDebugger'
+                variants=(cfgerr badflag nofiles panic silent nointerp) ;;
+  esac
+
+  D="$(mk_lint_case "$tool" "$tool-clean")"
+  rc="$(PATH="$D/fakebin:$PATH" run_lint "$D")"
+  err="$(cat "$TMPROOT/err")"
+  if [ "$rc" = "0" ] && grep -q "$tool ok" <<<"$err" && grep -q '1 file(s) checked, clean' <<<"$err" \
+     && [ "$(lint_clean "$D")" = "true" ] && grep -q -- "$argv_re" "$D/fakebin/argv.log" \
+     && ! grep -qE 'gcc|concise|summary' "$D/fakebin/argv.log"; then
+    ok "27-29. $tool clean → '$tool ok', lint_clean=true, asked for its JSON report: $(head -1 "$D/fakebin/argv.log" | cut -d' ' -f1-4)"
+  else
+    bad "27-29. $tool clean misreported (rc=$rc lint_clean=$(lint_clean "$D")): argv=[$(head -1 "$D/fakebin/argv.log")] $err"
+  fi
+
+  D="$(mk_lint_case "$tool" "$tool-find")"
+  S="$D/repo/heimdall-state.json"
+  HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+  rc="$(FAKE_MODE=findings PATH="$D/fakebin:$PATH" run_lint "$D")"
+  err="$(cat "$TMPROOT/err")"
+  if [ "$rc" = "0" ] && grep -q "$tool 2" <<<"$err" && grep -q "$mark" <<<"$err" \
+     && ! grep -q 'tool error' <<<"$err" \
+     && [ "$(lint_clean "$D")" = "false" ] \
+     && [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" = "2" ] \
+     && [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" = "0" ] \
+     && [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" = "true" ]; then
+    ok "27-29. $tool findings → 2 counted from the JSON report (stderr noise ignored) and listed, lint_clean flips false"
+  else
+    bad "27-29. $tool findings misreported (rc=$rc lint_clean=$(lint_clean "$D")): $err receipt=$(jq -c '.quality_gates.lint_last_run' "$S")"
+  fi
+
+  for variant in "${variants[@]}"; do
+    why=""
+    for arm in true false; do
+      shebang=""; mode="$variant"
+      if [ "$variant" = nointerp ]; then shebang="#!/usr/bin/env hmd_no_such_interp"; mode=clean; fi
+      D="$(mk_lint_case "$tool" "$tool-err-$variant-$arm" "$shebang")"
+      S="$D/repo/heimdall-state.json"
+      HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' "$arm" >/dev/null
+      rc="$(FAKE_MODE="$mode" PATH="$D/fakebin:$PATH" run_lint "$D")"
+      err="$(cat "$TMPROOT/err")"
+      want_text="$(tool_err_text "$tool" "$variant")"
+      if [ "$rc" != "0" ] || ! grep -q "$tool tool error" <<<"$err" || grep -q "$tool [0-9]" <<<"$err" \
+         || grep -q 'finding(s)' <<<"$err" || ! grep -qF -- "$want_text" <<<"$err" \
+         || [ "$(lint_clean "$D")" != "$arm" ] \
+         || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
+         || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
+         || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
+        why="$why [armed=$arm rc=$rc lint_clean=$(lint_clean "$D") receipt=$(jq -c '.quality_gates.lint_last_run' "$S") stderr: $err]"
+      fi
+    done
+    if [ -z "$why" ]; then
+      ok "27-29. $tool $variant → loud tool error with its own diagnostics, no findings, run incomplete, lint_clean left as armed (true and false)"
+    else
+      bad "27-29. $tool $variant mishandled:$why"
+    fi
+  done
+done
+
+# ── 30. the same against the REAL ruff ───────────────────────────────────────
+# The fakes above pin the contract; this pins the parse against the binary's
+# actual JSON. The exit codes are classified under THIS ruff first and the cases
+# SKIP loudly when they differ, as 17-19 do for shellcheck.
+RUFF_OK=0
+RUFF_WHY="ruff not on PATH"
+if command -v ruff >/dev/null 2>&1; then
+  P="$TMPROOT/ruffprobe"; mkdir -p "$P"
+  printf 'x = 1\n' > "$P/clean.py"; printf 'import os\n' > "$P/unused.py"; printf 'line-length = \n[\n' > "$P/bad.toml"
+  ruff check --isolated --no-fix --output-format json "$P/clean.py" >/dev/null 2>&1; r_clean=$?
+  ruff check --isolated --no-fix --output-format json "$P/unused.py" >/dev/null 2>&1; r_find=$?
+  ruff check --config "$P/bad.toml" --no-fix --output-format json "$P/clean.py" >/dev/null 2>&1; r_cfg=$?
+  if [ "$r_clean" -eq 0 ] && [ "$r_find" -eq 1 ] && [ "$r_cfg" -eq 2 ]; then
+    RUFF_OK=1
+  else
+    RUFF_WHY="exit codes differ here: clean=$r_clean unused-import=$r_find broken-config=$r_cfg (want 0/1/2)"
+  fi
+fi
+
+if [ "$RUFF_OK" -ne 1 ]; then
+  echo "  SKIP 30: real ruff not usable ($RUFF_WHY); the fake-ruff cases of 28 still ran"
+else
+  D="$(mk_case rruffclean)"
+  printf 'line-length = 88\n' > "$D/repo/ruff.toml"; printf 'x = 1\n' > "$D/repo/a.py"; track "$D" "$D/repo/a.py"
+  rc="$(run_lint "$D")"
+  err="$(cat "$TMPROOT/err")"
+  if [ "$rc" = "0" ] && grep -q 'ruff ok' <<<"$err" && [ "$(lint_clean "$D")" = "true" ]; then
+    ok "30. real ruff, clean file → 'ruff ok', lint_clean=true"
+  else
+    bad "30. real ruff clean file misreported (rc=$rc lint_clean=$(lint_clean "$D")): $err"
+  fi
+
+  D="$(mk_case rruffunused)"
+  S="$D/repo/heimdall-state.json"
+  printf 'line-length = 88\n' > "$D/repo/ruff.toml"; printf 'import os\n' > "$D/repo/a.py"; track "$D" "$D/repo/a.py"
+  HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+  rc="$(run_lint "$D")"
+  err="$(cat "$TMPROOT/err")"
+  if [ "$rc" = "0" ] && grep -q 'ruff 1' <<<"$err" && grep -q 'F401' <<<"$err" \
+     && [ "$(lint_clean "$D")" = "false" ] \
+     && [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" = "0" ]; then
+    ok "30. real ruff, unused import → 1 finding (F401) parsed from its JSON, lint_clean flips false"
+  else
+    bad "30. real ruff finding misreported (rc=$rc lint_clean=$(lint_clean "$D")): $err"
+  fi
+
+  why=""
+  for arm in true false; do
+    D="$(mk_case "rruffcfg-$arm")"
+    S="$D/repo/heimdall-state.json"
+    printf 'line-length = \n[\n' > "$D/repo/ruff.toml"; printf 'x = 1\n' > "$D/repo/a.py"; track "$D" "$D/repo/a.py"
+    HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' "$arm" >/dev/null
+    rc="$(run_lint "$D")"
+    err="$(cat "$TMPROOT/err")"
+    if [ "$rc" != "0" ] || ! grep -q 'ruff tool error (exit 2)' <<<"$err" || grep -q 'ruff [0-9]' <<<"$err" \
+       || [ "$(lint_clean "$D")" != "$arm" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
+      why="$why [armed=$arm rc=$rc lint_clean=$(lint_clean "$D") stderr: $err]"
+    fi
+  done
+  if [ -z "$why" ]; then
+    ok "30. real ruff, broken ruff.toml (exit 2) → tool error, no finding, lint_clean left as armed (true and false)"
+  else
+    bad "30. real ruff config error mishandled:$why"
+  fi
+fi
+
+# ── 31-34. the checkers with no JSON report draw the same line ───────────────
+# python3 ast.parse: a syntax error is a SyntaxError-family traceback at exit 1
+# (case 3, real python). A shim with no interpreter behind it (pyenv, exit 127)
+# or an interpreter that dies on startup is not a syntax error in the file.
+for variant in pyenv fatal; do
+  why=""
+  for arm in true false; do
+    D="$(mk_case "pyerr-$variant-$arm")"
+    S="$D/repo/heimdall-state.json"
+    mkdir -p "$D/fakebin"
+    cat > "$D/fakebin/python3" <<'EOF'
+#!/bin/sh
+case "${FAKE_MODE:-}" in
+  pyenv) echo "pyenv: python3: command not found" >&2; exit 127 ;;
+  fatal) echo "Fatal Python error: init_fs_encoding: failed to get the Python codec of the filesystem encoding" >&2; exit 1 ;;
+esac
+exit 0
+EOF
+    chmod +x "$D/fakebin/python3"
+    printf 'x = 1\n' > "$D/repo/a.py"; track "$D" "$D/repo/a.py"
+    HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' "$arm" >/dev/null
+    rc="$(FAKE_MODE="$variant" PATH="$D/fakebin:$PATH" run_lint "$D")"
+    err="$(cat "$TMPROOT/err")"
+    want_text="command not found"; [ "$variant" = fatal ] && want_text="Fatal Python error"
+    if [ "$rc" != "0" ] || ! grep -q 'ast tool error' <<<"$err" || grep -q 'ast FAIL' <<<"$err" \
+       || ! grep -qF -- "$want_text" <<<"$err" || [ "$(lint_clean "$D")" != "$arm" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
+      why="$why [armed=$arm rc=$rc lint_clean=$(lint_clean "$D") stderr: $err]"
+    fi
+  done
+  if [ -z "$why" ]; then
+    ok "31. python3 $variant → 'ast tool error', not a syntax finding, lint_clean left as armed (true and false)"
+  else
+    bad "31. python3 $variant counted as a syntax error or mishandled:$why"
+  fi
+done
+
+# bash -n: exit 126/127 mean it could not be started; any other non-zero is a
+# syntax error (case 1). The fake bash fails only `bash -n` and hands every other
+# invocation (the tool's own shebang, the state tool) to the real one.
+REAL_BASH="$(command -v bash)"
+why=""
+for arm in true false; do
+  D="$(mk_case "bashnoexec-$arm")"
+  S="$D/repo/heimdall-state.json"
+  mkdir -p "$D/fakebin"
+  printf '#!/bin/sh\n[ "$1" = -n ] && { echo "bash: bad interpreter: Permission denied" >&2; exit 126; }\nexec %s "$@"\n' "$REAL_BASH" > "$D/fakebin/bash"
+  chmod +x "$D/fakebin/bash"
+  printf '#!/usr/bin/env bash\necho a\n' > "$D/repo/a.sh"; track "$D" "$D/repo/a.sh"
+  HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' "$arm" >/dev/null
+  rc="$(PATH="$D/fakebin:$PATH" run_lint "$D")"
+  err="$(cat "$TMPROOT/err")"
+  if [ "$rc" != "0" ] || ! grep -q 'bash -n tool error (exit 126)' <<<"$err" || grep -q 'bash -n FAIL' <<<"$err" \
+     || ! grep -q 'bad interpreter' <<<"$err" || [ "$(lint_clean "$D")" != "$arm" ] \
+     || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
+     || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
+     || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
+    why="$why [armed=$arm rc=$rc lint_clean=$(lint_clean "$D") stderr: $err]"
+  fi
+done
+if [ -z "$why" ]; then
+  ok "32. bash -n that cannot start (exit 126) → tool error, not a syntax finding, lint_clean left as armed (true and false)"
+else
+  bad "32. bash -n exit 126 counted as a syntax error or mishandled:$why"
+fi
+
+# tsc runs once, project-wide: it type-checked iff it printed `error TS...` or
+# exited 0. A crash or a missing interpreter prints none, and used to read as a
+# clean "tsc ok" for every edited file.
+# mk_tsc_case <name> [shebang] → a case whose only js/ts checker is a fake tsc
+mk_tsc_case() {
+  local d
+  d="$(mk_case "$1")"
+  mkdir -p "$d/repo/node_modules/.bin"
+  printf '{}\n' > "$d/repo/tsconfig.json"
+  printf 'const a: number = "s";\n' > "$d/repo/a.ts"
+  printf '%s\n' "${2:-#!/bin/sh}" > "$d/repo/node_modules/.bin/tsc"
+  cat >> "$d/repo/node_modules/.bin/tsc" <<'EOF'
+case "${FAKE_MODE:-clean}" in
+  clean)    exit 0 ;;
+  findings) printf "a.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.\n"; exit 2 ;;
+  crash)    printf "node:internal/modules/cjs/loader:1228\n  throw err;\nError: Cannot find module 'typescript/lib/tsc.js'\n" >&2; exit 1 ;;
+esac
+EOF
+  chmod +x "$d/repo/node_modules/.bin/tsc"
+  track "$d" "$d/repo/a.ts"
+  printf '%s' "$d"
+}
+
+D="$(mk_tsc_case tscclean)"
+rc="$(run_lint "$D")"
+err="$(cat "$TMPROOT/err")"
+if [ "$rc" = "0" ] && grep -q 'tsc ok' <<<"$err" && grep -q '1 file(s) checked, clean' <<<"$err" && [ "$(lint_clean "$D")" = "true" ]; then
+  ok "33. tsc clean → 'tsc ok', lint_clean=true"
+else
+  bad "33. tsc clean misreported (rc=$rc lint_clean=$(lint_clean "$D")): $err"
+fi
+
+D="$(mk_tsc_case tscfind)"
+S="$D/repo/heimdall-state.json"
+HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+rc="$(FAKE_MODE=findings run_lint "$D")"
+err="$(cat "$TMPROOT/err")"
+if [ "$rc" = "0" ] && grep -q 'tsc 1' <<<"$err" && grep -q 'TS2322' <<<"$err" && ! grep -q 'tool error' <<<"$err" \
+   && [ "$(lint_clean "$D")" = "false" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" = "1" ] \
+   && [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" = "0" ]; then
+  ok "33. tsc diagnostics naming the edited file → counted, lint_clean flips false"
+else
+  bad "33. tsc findings misreported (rc=$rc lint_clean=$(lint_clean "$D")): $err"
+fi
+
+for variant in crash nointerp; do
+  why=""
+  for arm in true false; do
+    shebang=""; mode="$variant"
+    if [ "$variant" = nointerp ]; then shebang="#!/usr/bin/env hmd_no_such_node"; mode=clean; fi
+    D="$(mk_tsc_case "tscerr-$variant-$arm" "$shebang")"
+    S="$D/repo/heimdall-state.json"
+    HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' "$arm" >/dev/null
+    rc="$(FAKE_MODE="$mode" run_lint "$D")"
+    err="$(cat "$TMPROOT/err")"
+    want_text="Cannot find module"; [ "$variant" = nointerp ] && want_text="No such file or directory"
+    if [ "$rc" != "0" ] || ! grep -q 'tsc tool error' <<<"$err" || grep -q 'tsc ok' <<<"$err" \
+       || grep -q 'tsc [0-9]' <<<"$err" || ! grep -qF -- "$want_text" <<<"$err" \
+       || [ "$(lint_clean "$D")" != "$arm" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.findings' "$S")" != "0" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.tool_errors' "$S")" != "1" ] \
+       || [ "$(jq -r '.quality_gates.lint_last_run.complete | tostring' "$S")" != "false" ]; then
+      why="$why [armed=$arm rc=$rc lint_clean=$(lint_clean "$D") stderr: $err]"
+    fi
+  done
+  if [ -z "$why" ]; then
+    ok "34. tsc $variant → one tool error (not 'tsc ok'), lint_clean left as armed (true and false)"
+  else
+    bad "34. tsc $variant read as clean or mishandled:$why"
+  fi
+done
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
