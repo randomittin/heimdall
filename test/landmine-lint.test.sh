@@ -307,6 +307,61 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# A5. CLASS-4 REDIRECTED BLOCK — a `read` inside a block whose CLOSER redirects stdin.
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression fence for a real false positive found 2026-10-12 at bin/heimdall-state:465, in
+# lint_evidence_problem: `{ read -r at_epoch || …; while … read -r p; do …; done; } < <(jq …)`. The
+# group's stdin IS the process substitution, so that bare `read` consumes jq's output, never the
+# terminal; but class 4 only looked for a redirect on the `read` line itself, so it blocked every push
+# (and failed this suite's CLEAN-TREE and hook proofs). A redirect on the CLOSING line of the enclosing
+# block now counts, for `{ … }` groups and loops, at any nesting depth. A closer carrying only a `>`
+# redirect is not a stdin redirect, and a bare read in a function has no redirected block around it:
+# both must stay flagged. Do NOT reflow the heredoc without updating the line numbers below.
+echo "A5. CLASS-4 REDIRECTED BLOCK (a read inside a block whose closer redirects stdin):"
+FIX9="$FIX_DIR/heimdall-fixture9"
+cat > "$FIX9" <<'FIXTURE9'
+#!/usr/bin/env bash
+set -euo pipefail
+group_from_procsub() {
+  {
+    read -r first || first=""
+    echo "$first"
+  } < <(printf 'a\n')
+}
+loop_from_file() {
+  while true; do
+    read -r line || break
+    echo "$line"
+  done < /etc/hostname
+}
+nested_in_redirected_group() {
+  {
+    if true; then
+      read -r inner
+    fi
+  } < <(printf 'b\n')
+}
+group_without_stdin_redirect() {
+  {
+    read -r ans
+    echo "$ans"
+  } > /dev/null
+}
+bare_in_function() {
+  read -r ans
+  echo "$ans"
+}
+FIXTURE9
+chmod +x "$FIX9"
+LINT9_OUT="$("$LINT" "$FIX9" 2>/dev/null || true)"
+c4_lines9="$(grep -F '  4-TTY-READ  ' <<<"$LINT9_OUT" | sed -E 's/^[^:]*:([0-9]+).*/\1/' | tr '\n' ' ')"
+if [ "$c4_lines9" = "24 29 " ]; then
+  ok "reads in blocks closed by '} < <(cmd)' / 'done < file' (lines 5, 11, 18) not flagged; the '} > /dev/null' group (24) and the bare function read (29) still are"
+else
+  bad "expected class-4 findings at lines 24 and 29 only, got: ${c4_lines9:-none}"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # B. CLEAN-TREE — zero false positives on the real shipped scripts.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "B. CLEAN-TREE (no false positives on the real current tree):"

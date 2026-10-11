@@ -196,6 +196,9 @@ _RE_KEYPRESS_FLAG='(^|[[:space:]])-[A-Za-z]*[sn][A-Za-z0-9]*([[:space:]]|$)'
 _RE_TTY_GUARD='\[\[?[[:space:]]+!?[[:space:]]*-t[[:space:]]+0[[:space:]]'
 _RE_YES_GATE='(ASSUME_YES|_uyes|--yes|-y)'
 _RE_TTY_TEST='(!?[[:space:]]*-t[[:space:]]+0)'
+# The CLOSING line of a compound command that redirects STDIN: `} < <(cmd)`, `} < file`, `} <<EOF`, `done < file`, `) < file`.
+# A `>` / `2>` redirect on the closer is not one, so it does not match.
+_RE_STDIN_CLOSER='^[[:space:]]*([}]|done|[)]|fi|esac)[[:space:]]*<'
 # `\b` is spelled out here ON PURPOSE. macOS `grep -E` honours `\b` as a word
 # boundary, but bash's `=~` compiles through libc regcomp, which treats it as a
 # literal `b` — so a verbatim '_heimdall_remove_plugin\b' silently stops matching
@@ -459,6 +462,30 @@ scan_baked_path() {
   done < "$file"
 }
 
+# Is the `read` on line index $1 inside a compound command (a `{ … }` group, a loop, a subshell) whose CLOSING line
+# redirects stdin — `} < <(cmd)`, `done < file`? Then it consumes that stream, never the terminal: the same "reads a
+# file/pipe, not stdin" case as the same-line `<` skip in scan_tty_read, with the redirect on the closer instead
+# (found 2026-10-12 at bin/heimdall-state, `{ read -r a || …; while … read -r p; do …; done; } < <(jq …)`).
+# Block extents come from indentation, as the enclosing-scope guard search does: walking down from the read, a line
+# indented LESS than the current level closes one more enclosing level. The first closer that redirects stdin answers
+# yes; a closer without one is stepped over (the read may sit in a nested block of a redirected one); reaching column
+# 0 answers no. It can only ever REMOVE a finding, never add one, and only in this shape.
+# Reads the caller's `lines` array (bash dynamic scope), so call it from scan_tty_read only.
+read_in_redirected_block() {
+  local idx="$1" n="${#lines[@]}" l lead cur j
+  l="${lines[$idx]}"; lead="${l%%[![:space:]]*}"; cur="${#lead}"
+  for (( j=idx+1; j<n && cur>0; j++ )); do
+    l="${lines[$j]}"
+    case "$l" in *[![:space:]]*) : ;; *) continue ;; esac   # a blank line closes nothing
+    is_comment "$l" && continue
+    lead="${l%%[![:space:]]*}"
+    [ "${#lead}" -lt "$cur" ] || continue
+    if [[ $l =~ $_RE_STDIN_CLOSER ]]; then return 0; fi
+    cur="${#lead}"
+  done
+  return 1
+}
+
 # ── CLASS 4 — TTY-READ: interactive PROMPT read with no TTY/--yes guard ────────
 # The bug: an interactive PROMPT `read` (`read -p "…?"`, `read -rt 60 -p "…"`, or a
 # bare `read VAR` soliciting a human answer) that, on a non-TTY stdin (piped
@@ -476,6 +503,8 @@ scan_baked_path() {
 #   * `… | while … read …` and `done < <(…)` (reads a pipe, never the terminal),
 #   * `while IFS= read -r line` frame/stream loops (consume a piped/process-sub
 #     stream, never the terminal — bin/heimdall's face-render loops),
+#   * a `read` inside a block whose CLOSING line redirects stdin (`} < <(cmd)`,
+#     `done < file`) — it consumes that stream (read_in_redirected_block above),
 #   * a keypress POLL: `read -rsn1 -t … junk` (a `-s`/-n silent/char read with NO
 #     `-p` prompt — waits for "any key", does not solicit a typed answer),
 #   * a PROMPT read guarded by `[ -t 0 ]` (or a `--yes`/-y refusal) in its scope.
@@ -588,6 +617,8 @@ scan_tty_read() {
       esac
     done
     [ "$guarded" -eq 1 ] && continue
+    # Last, so it only ever runs for a would-be finding: a block closed by a stdin redirect feeds this read.
+    read_in_redirected_block "$i" && continue
     emit "$file" "$lineno" "4-TTY-READ" "$line" \
       "interactive PROMPT 'read' from inherited stdin with no '[ -t 0 ]' / --yes guard (a '-t N' timeout is NOT a guard — it still stalls every non-TTY call) → hangs/stalls on a non-TTY stdin; gate it with '[ -t 0 ]'"
   done
