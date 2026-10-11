@@ -97,6 +97,9 @@ ship.sh — bump, scan, push, verify, and release in one step.
   release/ship.sh --no-npm     ship without publishing to npm
   release/ship.sh -h           this help
 
+A release (tag, GitHub Release or npm publish) requires a green FULL sweep receipt at HEAD
+(receipts/last-full-green.json, written by `bash test/run-all.sh`); the incremental `--since-green`
+receipt the push gate accepts is not enough, and nothing is bumped without it.
 Stops at the first failure. Nothing is pushed if the local scan finds leaks.
 A run that CANNOT publish a release or publish to npm fails loudly in preflight — it
 never bumps, warns, and exits 0 (that silent skip is what stranded v2.2.3/v2.0.17/v2.0.13
@@ -726,6 +729,39 @@ preflight_release_prereqs() {
   ok "release prereqs: gh present + authenticated, notes generator present"
 }
 
+# require_full_sweep_receipt — a release (a tag, a GitHub Release, an npm publish) ships what is at HEAD, and only a FULL sweep
+# proves HEAD: the incremental `test/run-all.sh --since-green` receipt the push gate accepts re-ran only the suites a diff could
+# reach, which is the right trade for a push and the wrong one for a version number. So release/ship.sh reads the chain anchor
+# (receipts/last-full-green.json, written by test/run-all.sh ONLY for a green, clean, full sweep) and demands that it is a green
+# FULL sweep of THIS repo at HEAD -- commits that touch only hook-owned paths (bin/lib/hook-owned-path.sh) do not stale it, any
+# other commit does. Runs in preflight, before anything is bumped, committed or pushed.
+require_full_sweep_receipt() {
+  local home="${HEIMDALL_HOME:-$REPO_ROOT/.heimdall}" fr canon head r_sha other
+  fr="$home/receipts/last-full-green.json"
+  command -v jq >/dev/null 2>&1 || die "jq not found — the sweep receipt cannot be read, so a release cannot be authorised. Install it (brew install jq)."
+  head="$(git rev-parse HEAD 2>/dev/null)" || die "not a git checkout — cannot check the sweep receipt"
+  canon="$(git rev-parse --show-toplevel)"
+  if [ ! -f "$fr" ] || ! jq -e . "$fr" >/dev/null 2>&1; then
+    die "a release requires a green FULL sweep receipt at HEAD, and there is none ($fr). Run: bash test/run-all.sh  — an incremental --since-green receipt is not enough for a release."
+  fi
+  jq -e '.exit_code == 0 and .tree_clean == true and ((.kind // "full") == "full")' "$fr" >/dev/null 2>&1 \
+    || die "a release requires a green FULL sweep receipt at HEAD, but $fr is not a green, clean full sweep. Run: bash test/run-all.sh"
+  [ "$(jq -r '.repo // empty' "$fr")" = "$canon" ] \
+    || die "a release requires a green FULL sweep receipt at HEAD, but $fr was recorded for a different repo. Run: bash test/run-all.sh"
+  r_sha="$(jq -r '.head_sha // empty' "$fr")"
+  if [ "$r_sha" != "$head" ]; then
+    other="changed"
+    if [ -r "$REPO_ROOT/bin/lib/hook-owned-path.sh" ] && git merge-base --is-ancestor "$r_sha" "$head" 2>/dev/null; then
+      # shellcheck source=../bin/lib/hook-owned-path.sh disable=SC1091
+      . "$REPO_ROOT/bin/lib/hook-owned-path.sh"
+      other="$(git diff --name-only "$r_sha" "$head" | sed '/^$/d' | grep -Ev "^${HMD_HOOK_OWNED_PATH_RE}\$" || true)"
+    fi
+    [ -z "$other" ] \
+      || die "the green FULL sweep receipt is STALE: it graded ${r_sha:0:12}, HEAD is ${head:0:12} (commits landed since). A release needs a green FULL sweep receipt at HEAD. Run: bash test/run-all.sh"
+  fi
+  ok "green FULL sweep receipt at HEAD (${head:0:12})"
+}
+
 # reconcile_orphan_release — the recovery path the old flow never had. If the CURRENT manifest
 # version has no tag and no Release, a prior ship died between the bump commit and the tag.
 # Bumping past it would orphan it permanently (the v2.2.3 defect). Refuse, and name the fix.
@@ -898,6 +934,7 @@ fi
 if [ "$RELEASE_ONLY" -eq 1 ]; then
   step "Release-only — publishing the version already in the manifest"
   preflight_release_prereqs
+  require_full_sweep_receipt
   RO_VERSION="$(read_version)"
   TAG="v$RO_VERSION"
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-ro.XXXXXX")" || die "mktemp failed"
@@ -930,6 +967,7 @@ fi
 if [ "$NPM_ONLY" -eq 1 ]; then
   step "npm-only — publishing the version already in the manifest to npm"
   preflight_npm_prereqs
+  require_full_sweep_receipt
   NPM_ONLY_VERSION="$(read_version)"
   publish_npm_all "$NPM_ONLY_VERSION"
   printf '\n%s%s✓ npm reconciled to %s%s\n' "$G" "$B" "$NPM_ONLY_VERSION" "$R"
@@ -953,6 +991,7 @@ if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
   # for the same reason and at the same moment: an unauthenticated npm discovered at the END
   # of a ship leaves a bumped, tagged, released version that `npx runheimdall` cannot install.
   preflight_release_prereqs
+  require_full_sweep_receipt
   if [ "$DO_NPM" -eq 1 ]; then
     preflight_npm_prereqs
   else
