@@ -88,7 +88,10 @@ else
   bad "bare plugin => the actual gate logic ran (named cause present)" "output=$OUT"
 fi
 
-OUT="$(cd "$C" && "$BARE/heimdall-state" mark-clean 2>&1)"; RC=$?
+# mark-clean only sets lint_clean against a passing lint_last_run receipt (bin/heimdall-stop-lint writes
+# it), so this fixture, which is about lib isolation and not lint evidence, waives lint explicitly and
+# visibly (logged in state), exactly as test/conflict-log.test.sh and test/checkpoint-depth.test.sh do.
+OUT="$(cd "$C" && HMD_LINT_WAIVER="fixture: lib isolation is not about lint evidence" "$BARE/heimdall-state" mark-clean 2>&1)"; RC=$?
 if [ "$RC" = 0 ]; then
   ok "bare plugin => mark-clean succeeds (exit 0)"
 else
