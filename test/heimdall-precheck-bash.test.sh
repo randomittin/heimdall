@@ -199,8 +199,12 @@ equiv() {
   # ...and the push matcher (delta 3): its setup lines and its `grep -qE ...push...` call differ by design.
   # the kill guard (2026-10-12) adds GP_KILL_NORM (one tr) and one case on it, dropped the same way (its python3 call only runs for kill commands);
   # test/hmd-server-kill-guard.test.sh pins its behaviour
-  local mtr='^(\+ (SQ=|GP_|case |grep -qE .*push)|\+\+ tr -d )'
-  grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | grep -vE "$mtr" | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
+  # the lint-since-push guard (2026-10-12, c6e42770) sets SLINT and opens with a second [ N = 2 ] test on the gate's verdict, ahead of the gate's own:
+  # SLINT= is dropped like the matcher's lines, and of the [ N = 2 ] tests exactly ONE is dropped from the script's side, by count, so the gate's own
+  # test must still be matched by the reference's. The rest of the guard runs only when the gate FAILED -- a deny, exempt below -- and
+  # test/heimdall-stop-lint.test.sh pins what it does
+  local mtr='^(\+ (SQ=|GP_|SLINT=|case |grep -qE .*push)|\+\+ tr -d )'
+  grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | grep -vE "$mtr" | awk '/^\+ .\[. [0-9]+ = 2 .\].$/ && !guard_test++ { next } { print }' | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
   LC_ALL=C sort "$TMPROOT/$tag.trace-inline.err" | grep -vE "$mtr" > "$TMPROOT/$tag.trace-inline.sorted"
   # denies are exempt from the trace comparison: the stderr mirror is a statement the string never had
   [ "$(cat "$TMPROOT/$tag.inline.rc")" = 2 ] || cmp -s "$TMPROOT/$tag.trace-inline.sorted" "$TMPROOT/$tag.trace-script.filtered" || why="$why xtrace"

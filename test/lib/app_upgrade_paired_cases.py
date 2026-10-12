@@ -31,8 +31,8 @@ a revoke is final (a second scenario, the 2.4.6 client alone):
       is not listed again by any later read, restart of the readers, or `hmd app status`, and its push token is gone
   R4  plain `hmd app disconnect` ends the 2.4.6 client through the relay (its session is revoked), leaving nothing listed or notified
   R5  nothing started here is left running
-and every other way a phone ends (a third scenario, a connect run with three phones, new clients):
-  E1  the starting point: three phones bound, each with a push token and a device record
+and every other way a phone ends (a third scenario, a connect run's phone and two more added by `hmd app add-device`, new clients):
+  E1  the starting point: three phones bound -- the first by the connect run, one more by each add-device run -- each with a push token and a device record
   E2  `disconnect --device` for a phone whose client crashed does not claim a revoke -- the relay session cannot be revoked from here --
       says so and exits non-zero, yet removes that phone's push token and record and leaves the others alone
   E3  plain `disconnect` with several phones revokes each one's relay session through its client and leaves no token and no record
@@ -340,7 +340,7 @@ def run_revoked_legacy(s, old):
 
 
 def case_every_end_reaches_the_relay():
-    # a connect run with three phones, each holding a push token. A phone whose client crashed (kill -9) cannot be revoked from here -- its
+    # a connect run's phone and two more added with `hmd app add-device` (one window per use), each holding a push token. A phone whose client crashed (kill -9) cannot be revoked from here -- its
     # session token lived in that client's memory only -- so `--device` says so, in words and in its exit status, and still removes what is
     # local; plain `disconnect` ends every other phone through its own client, which revokes its relay session and takes out its tokens.
     with C.Scn() as s:
@@ -357,7 +357,9 @@ def case_every_end_reaches_the_relay():
                 sid = s.bind(device_label="Phone 1")
                 opened, hmd = C.phone_state(s, phone, sid)
             else:
-                sid, opened, hmd = C.pair_next(s, phone, "Phone %d" % (n + 1), n)
+                # a connect pairs ONE phone and closes the code: each further phone is one `add-device` run, which ends once its phone paired
+                proc, sid, opened, hmd = C.add_phone(s, phone, "Phone %d" % (n + 1), n)
+                proc.wait_exit(30)
             sids.append(sid if opened is not None else None)
             keys.append(hmd)
         tokens = ["ExponentPushToken[%s]" % (c * 22) for c in "DEF"]
@@ -365,7 +367,7 @@ def case_every_end_reaches_the_relay():
         note_started(s)
         pids = C.device_pids(s)
         T.check(None not in sids and all(pushed) and C.push_tokens(s) == sorted(tokens) and len(device_records(s)) == 3 and len(pids) == 3,
-                "E1. (setup) a connect run has three phones bound, each with a push token and a device record",
+                "E1. (setup) a connect run has three phones bound -- one by the connect, two added with `hmd app add-device` -- each with a push token and a device record",
                 "sids %r pushed %r tokens %r records %r pids %r" % (sids, pushed, C.push_tokens(s), device_records(s), pids))
         if None in sids or len(pids) != 3:
             return
