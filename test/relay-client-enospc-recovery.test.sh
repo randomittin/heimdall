@@ -92,7 +92,7 @@ While the file FLAG exists the disk is "full": every write this process makes to
 OSError(ENOSPC) -- stdout and stderr (regular files, as `hmd app connect --relay` redirects them), open() /
 os.fdopen() writes, os.write(), and the creation of a new file by open() / os.open(). Reads, sockets, pipes
 and child processes are untouched. Removing FLAG is "space came back". The code under test imports nothing
-from here: only the primitives it calls are wrapped. SIGUSR1 writes the live thread names to FLAG.threads."""
+from here: only the primitives it calls are wrapped. SIGUSR2 writes the live thread names to FLAG.threads (SIGUSR1 stays with the relay client: it revokes the phone)."""
 import builtins
 import errno
 import io
@@ -222,7 +222,7 @@ os.write = os_write
 sys.stdout = io.TextIOWrapper(io.BufferedWriter(FullRaw(1)), encoding="utf-8", errors="backslashreplace")
 sys.stderr = io.TextIOWrapper(io.BufferedWriter(FullRaw(2)), encoding="utf-8", errors="backslashreplace",
                               line_buffering=True, write_through=True)
-signal.signal(signal.SIGUSR1, dump_threads)
+signal.signal(signal.SIGUSR2, dump_threads)
 runpy.run_path(SCRIPT, run_name="__main__")
 PYEOF
 
@@ -780,7 +780,7 @@ def thread_names():
     path = flag + ".threads"
     if os.path.exists(path):
         os.remove(path)
-    os.kill(client.pid, signal.SIGUSR1)
+    os.kill(client.pid, signal.SIGUSR2)
     if not wait_until(lambda: os.path.exists(path), 5):
         return []
     with open(path) as f:

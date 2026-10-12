@@ -1428,6 +1428,10 @@ class RelayClient:
 
     # -- the phone this client serves (bin/lib/hmd_devices.py) ------------------------------------------
     DEVICE_TOUCH_S = 15.0  # the least time between two refreshes of the record's `last_seen`
+    # Class-level like _status_failing above: write_status() reaches _touch_device(), and a client built without __init__
+    # (test/heimdall-app-relay.test.sh scenario J) has no phone bound -- nothing to refresh, not an AttributeError.
+    _device_id = None
+    _device_written_at = 0.0
 
     def _record_device(self, label, login, via):
         """The phone just bound: it gets a record of its own, so that `hmd app status` lists it, `hmd app disconnect --device` can
