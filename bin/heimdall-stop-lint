@@ -179,7 +179,32 @@
 # .log. test/heimdall-stop-lint.test.sh sets both to a private temp dir + a
 # unique session id, so it can only ever read a ledger it wrote itself.
 #
+# SINCE THE LAST PUSH (--since-push)
+# ----------------------------------
+# The Stop hook lints only what `edit-tracker paths` lists: THIS session's own Write/Edit calls. Work a sub-agent did in its own
+# worktree and that was merged into the branch is in no session's ledger, so the push gate had no lint evidence for it and the only
+# way past was HMD_LINT_WAIVER. `--since-push` lints everything a push would ship instead:
+#   files   = `git diff --name-only <base>..HEAD` + uncommitted changes (staged, unstaged, untracked and not ignored)
+#   base    = @{u}, else origin/<branch>, else HEAD of the last full green sweep (receipts/last-full-green.json under
+#             $HEIMDALL_HOME or <repo>/.heimdall, when it is an ancestor of HEAD), else none: every tracked file counts as unpushed
+#   filter  = as on the Stop path: existing regular files inside --repo, never .claude/worktrees, .heimdall or node_modules
+#   tools   = the same selection and severity rules as the Stop path
+#   budget  = the same --budget / --per-call. Files past it are "skipped (budget)", the receipt is complete=false (reason
+#             incomplete) and the push gate refuses it: a big diff needs a bigger --budget, never a waiver. The change list is
+#             read with one git call and filtered without forking per path, so listing a huge diff costs no budget.
+#   receipt = the usual fields plus mode ("since-push"; "tracked-edits" on the Stop path), base_sha, base_ref and scope: every
+#             lintable-by-type file the run enumerated, whether or not a checker is installed for it.
+#   A since-push run ALWAYS records a receipt, even when the diff holds nothing lintable (checked 0, paths [], clean): "nothing
+#   lintable is about to be pushed" is the evidence a docs-only push needs, and without it that push needs a waiver. A run that
+#   cannot list the diff records an incomplete receipt, never a vacuous clean one.
+#   `heimdall-state check-quality-gates` re-derives the scope with `--since-push --list --upstream-only` and fails a receipt that
+#   does not cover it (reason "uncovered", naming the file and this command); bin/heimdall-precheck-bash runs this mode itself
+#   when the lint evidence is missing, stale or uncovered.
+#   --list           print the lintable files the run would cover (absolute paths, one per line); run nothing, write nothing
+#   --upstream-only  with --since-push: do nothing (an empty --list) unless @{u} or origin/<branch> resolves, i.e. a last push exists
+#
 # Usage:
+#   heimdall-stop-lint --since-push [--list] [--upstream-only] [--repo DIR] [--budget SECONDS] [--per-call SECONDS] [--quiet]
 #   heimdall-stop-lint [--repo DIR] [--budget SECONDS] [--per-call SECONDS]
 #                      [--tracker PATH] [--quiet]
 #   HEIMDALL_STATE_FILE overrides the state file (default <repo>/heimdall-
@@ -195,10 +220,16 @@ BUDGET=60
 PER_CALL=20
 TRACKER=""
 QUIET=0
+SINCE_PUSH=0
+LIST_ONLY=0
+UPSTREAM_ONLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)     REPO="${2:-.}"; shift 2 ;;
+    --since-push)    SINCE_PUSH=1; shift ;;
+    --list)          LIST_ONLY=1; shift ;;
+    --upstream-only) UPSTREAM_ONLY=1; shift ;;
     --budget)   BUDGET="${2:-60}"; shift 2 ;;
     --per-call) PER_CALL="${2:-20}"; shift 2 ;;
     --tracker)  TRACKER="${2:-}"; shift 2 ;;
@@ -244,26 +275,69 @@ repo_relpath() {
   dir="$(cd "${p%/*}/" 2>/dev/null && pwd -P)" || return 1
   p="$dir/${p##*/}"
   case "$p" in "$REPO"/*) rp="${p#"$REPO"/}" ;; *) return 1 ;; esac
-  case "/$rp" in /.claude/worktrees/*|/.heimdall/*|*/node_modules/*) return 1 ;; esac
+  excluded_rel "$rp" && return 1
   printf '%s' "$rp"
+}
+
+# excluded_rel <repo-relative path> → true when it is not a lint target: stale agent worktrees, generated hooks, node_modules.
+excluded_rel() { case "/$1" in /.claude/worktrees/*|/.heimdall/*|*/node_modules/*) return 0 ;; esac; return 1; }
+
+# add_git_path <path relative to the git top> → the same rules as repo_relpath for a path git printed, applied textually: a work
+# tree of thousands of changed paths cannot afford a subshell (cd + pwd -P) for each one, and git's own paths cannot escape the top.
+add_git_path() {
+  local abs="$TOP/$1" rp
+  [ -f "$abs" ] || return 0
+  case "$abs" in "$REPO"/*) rp="${abs#"$REPO"/}" ;; *) EXCLUDED=$((EXCLUDED + 1)); return 0 ;; esac
+  if excluded_rel "$rp"; then EXCLUDED=$((EXCLUDED + 1)); else FILES+=("$REPO/$rp"); fi
 }
 
 TAG="[heimdall] stop-lint:"
 say() { [ "$QUIET" -eq 1 ] && return 0; printf '%s %s\n' "$TAG" "$*" >&2; }
 
 # ── 1. edited paths ──────────────────────────────────────────────────────────
-[ -x "$TRACKER" ] || exit 0
-
+MODE="tracked-edits"; BASE_SHA=""; BASE_REF=""; MODE_NOTE=""; ENUM_FAILED=0
 FILES=()
 EXCLUDED=0
-while IFS= read -r p; do
-  [ -n "$p" ] || continue
-  case "$p" in /*) ;; *) p="$REPO/$p" ;; esac
-  [ -f "$p" ] || continue
-  if rp="$(repo_relpath "$p")"; then FILES+=("$REPO/$rp"); else EXCLUDED=$((EXCLUDED + 1)); fi
-done < <("$TRACKER" paths 2>/dev/null || true)
-
-[ "${#FILES[@]}" -gt 0 ] || exit 0
+if [ "$SINCE_PUSH" -eq 0 ]; then
+  [ -x "$TRACKER" ] || exit 0
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$p" in /*) ;; *) p="$REPO/$p" ;; esac
+    [ -f "$p" ] || continue
+    if rp="$(repo_relpath "$p")"; then FILES+=("$REPO/$rp"); else EXCLUDED=$((EXCLUDED + 1)); fi
+  done < <("$TRACKER" paths 2>/dev/null || true)
+  [ "${#FILES[@]}" -gt 0 ] || exit 0
+else
+  # Everything a push would ship (see SINCE THE LAST PUSH in the header): the diff against what the remote already has, plus the
+  # uncommitted work. The base is the first of @{u}, origin/<branch>, the last full green sweep's HEAD that resolves.
+  MODE="since-push"
+  TOP="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null)" \
+    || { say "--since-push needs a git work tree and $REPO is not one - nothing linted"; exit 0; }
+  TOP="$(cd "$TOP" && pwd -P)"
+  if BASE_SHA="$(git -C "$TOP" rev-parse --verify -q '@{u}^{commit}' 2>/dev/null)"; then BASE_REF='@{u}'
+  elif BRANCH="$(git -C "$TOP" symbolic-ref --short -q HEAD 2>/dev/null)" && [ -n "$BRANCH" ] \
+       && BASE_SHA="$(git -C "$TOP" rev-parse --verify -q "refs/remotes/origin/$BRANCH^{commit}" 2>/dev/null)"; then BASE_REF="origin/$BRANCH"
+  elif [ "$UPSTREAM_ONLY" -eq 1 ]; then exit 0
+  elif FG="${HEIMDALL_HOME:-$TOP/.heimdall}/receipts/last-full-green.json" && [ -f "$FG" ] && command -v jq >/dev/null 2>&1 \
+       && BASE_SHA="$(jq -r '.head_sha // empty' "$FG" 2>/dev/null)" && [ -n "$BASE_SHA" ] \
+       && git -C "$TOP" merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null; then BASE_REF="last-full-green"
+  else BASE_SHA=""; BASE_REF="none"; fi
+  MODE_NOTE="since-push (base ${BASE_REF}${BASE_SHA:+ ${BASE_SHA:0:9}}): "
+  # One listing, three sources, NUL-separated and de-duplicated: committed since the base (every tracked file when no base is
+  # known), staged + unstaged changes, and untracked files that are not ignored. A listing that fails is a run with no verdict.
+  RAW="$(mktemp "${TMPDIR:-/tmp}/hmd-stop-lint-diff.XXXXXX" 2>/dev/null)" || RAW=""
+  if [ -n "$RAW" ] && {
+       if [ -n "$BASE_SHA" ]; then git -C "$TOP" diff --name-only --no-renames -z "$BASE_SHA" HEAD; else git -C "$TOP" ls-files -z; fi \
+         && git -C "$TOP" diff --name-only --no-renames -z HEAD \
+         && git -C "$TOP" ls-files -z --others --exclude-standard
+     } > "$RAW" 2>/dev/null; then
+    while IFS= read -r -d '' p; do add_git_path "$p"; done < <(sort -zu "$RAW")
+  else
+    ENUM_FAILED=1
+    say "could not list what changed since the last push - the run has no verdict"
+  fi
+  [ -n "$RAW" ] && rm -f "$RAW"
+fi
 
 # ── 2. group by language ─────────────────────────────────────────────────────
 SHELL_FILES=(); PY_FILES=(); JS_FILES=(); OTHER=0
@@ -274,7 +348,7 @@ for f in "${FILES[@]}"; do
     *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx)   JS_FILES+=("$f") ;;
     *)
       # extensionless files with a bash/sh shebang are shell too (bin/ tools)
-      if [ "${f%.*}" = "$f" ] \
+      if [[ "${f##*/}" != *.* ]] \
          && head -c 64 "$f" 2>/dev/null | head -1 | grep -qE '^#!.*\b(ba)?sh\b'; then
         SHELL_FILES+=("$f")
       elif head -c 64 "$f" 2>/dev/null | head -1 | grep -qE '^#!.*python'; then
@@ -284,6 +358,16 @@ for f in "${FILES[@]}"; do
       fi ;;
   esac
 done
+
+# The scope of a --since-push run: every file of a lintable TYPE in the diff, whether or not a checker for it is installed here (a
+# receipt must not become unsatisfiable because a repo has no eslint). Recorded in the receipt as `scope`; --list prints it so the
+# push gate can re-derive it with the very same code.
+LINTABLE=()
+for f in "${SHELL_FILES[@]:-}" "${PY_FILES[@]:-}" "${JS_FILES[@]:-}"; do [ -n "$f" ] && LINTABLE+=("$f"); done
+if [ "$LIST_ONLY" -eq 1 ]; then
+  [ "${#LINTABLE[@]}" -gt 0 ] && printf '%s\n' "${LINTABLE[@]}" | sort
+  exit 0
+fi
 
 # ── 3. detect checkers (never install) ───────────────────────────────────────
 HAVE_PERL=0; command -v perl >/dev/null 2>&1 && HAVE_PERL=1
@@ -596,15 +680,17 @@ COMPLETE=true
 [ "$SKIPPED_BUDGET" -gt 0 ] && COMPLETE=false
 [ "$TIMEOUTS" -gt 0 ] && COMPLETE=false
 [ "$TOOL_ERRORS" -gt 0 ] && COMPLETE=false
+[ "$ENUM_FAILED" -eq 1 ] && COMPLETE=false
 
-if [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ]; then
+if [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ] || [ "$MODE" = since-push ]; then
   verdict="clean"
   if [ "$FINDINGS" -gt 0 ]; then verdict="$FINDINGS finding(s)"
   elif [ "$TOOL_ERRORS" -gt 0 ]; then verdict="no findings"; fi
   extra=""; [ "$SKIPPED_BUDGET" -gt 0 ] && extra=", $SKIPPED_BUDGET skipped (budget ${BUDGET}s exhausted)"
   [ "$TIMEOUTS" -gt 0 ] && extra="$extra, $TIMEOUTS checker call(s) timed out (per-call cap ${PER_CALL}s) — verdict incomplete"
   [ "$TOOL_ERRORS" -gt 0 ] && extra="$extra, $TOOL_ERRORS checker call(s) failed to run (tool error, not lint findings) — verdict incomplete, lint_clean set false (reason tool-error)"
-  say "$CHECKED file(s) checked, $verdict$extra"
+  if [ "$SKIPPED_BUDGET" -gt 0 ] && [ "$MODE" = since-push ]; then extra="$extra; re-run with a larger --budget (the push gate refuses an incomplete lint run)"; fi
+  say "${MODE_NOTE}$CHECKED file(s) checked, $verdict$extra"
 fi
 
 # ── 5. record ────────────────────────────────────────────────────────────────
@@ -615,9 +701,11 @@ if [ -z "$STATE" ]; then
 fi
 
 if [ -n "$STATE" ] && [ -f "$STATE" ] && [ -x "$STATE_TOOL" ] && command -v jq >/dev/null 2>&1 \
-   && { [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ]; }; then
+   && { [ "$CHECKED" -gt 0 ] || [ "$SKIPPED_BUDGET" -gt 0 ] || [ "$MODE" = since-push ]; }; then
   tools_json="$(printf '%s\n' "${TOOLS_USED[@]:-}" | grep -v '^$' | jq -R . | jq -sc .)"
   paths_json="$(printf '%s\n' "${CHECKED_PATHS[@]:-}" | grep -v '^$' | jq -R . | jq -sc .)"
+  scope_json=null
+  [ "$MODE" = since-push ] && scope_json="$(printf '%s\n' "${LINTABLE[@]:-}" | grep -v '^$' | jq -R . | jq -sc .)"
   # Why this run did or did not earn lint_clean. tool-error outranks findings: it is
   # the actionable label (a linter is broken) and the receipt still carries the
   # findings count next to it.
@@ -638,8 +726,12 @@ if [ -n "$STATE" ] && [ -f "$STATE" ] && [ -x "$STATE_TOOL" ] && command -v jq >
     --argjson excluded "$EXCLUDED" \
     --arg shellcheck_severity "$SEVERITY" \
     --argjson paths "$paths_json" \
+    --argjson scope "$scope_json" \
+    --arg mode "$MODE" \
+    --arg base_sha "$BASE_SHA" \
+    --arg base_ref "$BASE_REF" \
     --arg reason "$REASON" \
-    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, tool_errors:$tool_errors, skipped:$skipped, excluded:$excluded, shellcheck_severity:$shellcheck_severity, reason:$reason, paths:$paths, source:"heimdall-stop-lint"}')"
+    '{at:$at, files:$files, checked:$checked, findings:$findings, tools:$tools, complete:$complete, timeouts:$timeouts, tool_errors:$tool_errors, skipped:$skipped, excluded:$excluded, shellcheck_severity:$shellcheck_severity, reason:$reason, paths:$paths, mode:$mode, base_sha:(if $base_sha == "" then null else $base_sha end), base_ref:(if $base_ref == "" then null else $base_ref end), scope:$scope, source:"heimdall-stop-lint"}')"
   # Never let a state-tool hiccup (lock contention, malformed file) escape.
   HEIMDALL_STATE_FILE="$STATE" "$STATE_TOOL" set '.quality_gates.lint_last_run' "$receipt" >/dev/null 2>&1 || true
   # lint_clean is EARNED by a complete run with no findings and set false by every other

@@ -123,11 +123,27 @@ GP_RE="${GP_START}${GP_PRE}([^[:space:]]*/)?git${GP_OPT}[[:space:]]+push([[:spac
 if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
   HSTATE="$PLUGIN/bin/heimdall-state"
   [ -x "$HSTATE" ] || HSTATE=heimdall-state
+  SLINT="$PLUGIN/bin/heimdall-stop-lint"
   QGOUT=$("$HSTATE" check-quality-gates 2>&1)
   QGRC=$?
+  # Work merged from sub-agent worktrees is in no session's edit-tracker ledger, so the per-turn lint receipt never covers it. When
+  # the lint evidence is missing, stale or does not cover the push, lint everything changed since the last push (bounded well inside
+  # the hook's own time: a push gate that times out is a gate that lets the push through) and evaluate the gate once more.
+  if [ "$QGRC" = 2 ] && [ -x "$SLINT" ] && printf '%s' "$QGOUT" | grep -qE 'Lint not clean -- (no-evidence|stale|uncovered|no-coverage)'; then
+    printf 'heimdall: the lint receipt does not cover what this push ships - running %s --since-push (bounded)\n' "$SLINT" >&2
+    if command -v perl >/dev/null 2>&1; then perl -e 'alarm 45; exec @ARGV' "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true
+    else "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true; fi
+    QGOUT=$("$HSTATE" check-quality-gates 2>&1)
+    QGRC=$?
+  fi
   if [ "$QGRC" = 2 ]; then
     ESC=$(printf '%s' "$QGOUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-    deny "$(printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing. --- %s"}' "$ESC")"
+    HINT=""
+    if printf '%s' "$QGOUT" | grep -q 'Lint not clean'; then
+      HINT=" Lint evidence for what this push ships: run \`$SLINT --since-push --repo $PWD\` (lints every file changed since the last push, merged agent work included; add --budget 300 for a big diff). A waiver is not the answer."
+    fi
+    HINT_ESC=$(printf '%s' "$HINT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+    deny "$(printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing.%s --- %s"}' "$HINT_ESC" "$ESC")"
   elif [ "$QGRC" = 0 ]; then
     printf '%s\n' "$QGOUT" >&2
   else
