@@ -20,9 +20,10 @@ client left behind is a dead record, never a listed device. At most MAX_DEVICES 
     hmd_devices.py list     --repo R           JSON array of the live devices, oldest pairing first
     hmd_devices.py count    --repo R           how many are live
     hmd_devices.py has-pid  --repo R PID       exit 0 when a live device is served by PID
-    hmd_devices.py resolve  --repo R NAME      "<id> <pid>" of the live device NAME names (its label, any case, or its id);
-                                               exit 1 for none, 2 for more than one (their ids on stderr)
-    hmd_devices.py forget   --repo R ID        remove the record and the push tokens only that device held
+    hmd_devices.py resolve  --repo R [--dead] NAME   "<id> <pid>" of the live device NAME names (its label, any case, or its id), or with
+                                               --dead of the one whose client is gone; exit 1 for none, 2 for more than one (ids on stderr)
+    hmd_devices.py forget   --repo R ID        remove the push tokens only that device held, then its record; exit 1, record kept, when the
+                                               tokens could not be removed
     hmd_devices.py signal   --repo R ID        the signal that revokes ID's phone: USR1, or TERM for a client older than the records
     hmd_devices.py limit                       how many phones one repo may have paired at once (HMD_PAIR_MAX_DEVICES, default 4)
 
@@ -36,6 +37,13 @@ state file of its own. A legacy phone's id cannot be the fingerprint of its key 
 hash of the client's pid and the bind time. The client never refreshes the record, so it holds the push tokens it had when it was made
 and, while its client runs, every token in the store that no other record claims; and it is revoked with TERM (see `signal`), the one
 signal that client handles.
+
+A REVOKE IS FINAL. forget() removes the push tokens first -- the record is what names them, so tokens that cannot be removed leave it and
+the revoke is reported as failed, never as done -- and then the record. A legacy record is not removed but rewritten as a tombstone
+(`revoked`): it is made from files its client left, and a removed one would be made again for as long as that client runs or its files
+stay. A revoked record is no device: live(), so every list, count, limit and push check, skips it. A phone whose client is gone (it
+crashed) cannot be revoked at the relay from here -- its session token lived in that client's memory only -- so `resolve --dead` finds
+its record, for the caller to clean up and to say so.
 
 Stdlib only; loadable by path like the other bin/lib modules, no side effects at import.
 """
@@ -226,15 +234,20 @@ def records(root):
 
 
 def live(root, except_pid=None):
-    """The records whose client is running, except the one `except_pid` serves."""
-    return [r for r in records(root) if r["pid"] != except_pid and client_alive(r["pid"], root)]
+    """The records whose client is running, except the one `except_pid` serves. A revoked record is gone, whatever its client left."""
+    return [r for r in records(root) if r["pid"] != except_pid and not r.get("revoked") and client_alive(r["pid"], root)]
+
+
+def stale(root):
+    """The records of the phones whose client is no longer running and that were never revoked: what a crashed client left behind."""
+    return [r for r in records(root) if not r.get("revoked") and not client_alive(r["pid"], root)]
 
 
 def push_fps_of(root, rec):
     """The fingerprints of the push tokens `rec`'s phone holds: the ones its record lists and, for a phone bound through a client older
     than the records -- which never listed any, and registers more on its own -- every token in the store that no other record claims."""
     mine = {fp for fp in rec["push_fps"] if isinstance(fp, str)}
-    if rec.get("legacy"):
+    if rec.get("legacy") and not rec.get("revoked"):
         claimed = {fp for r in records(root) if r["id"] != rec["id"] for fp in r["push_fps"] if isinstance(fp, str)}
         mine |= _store_fps(root) - claimed
     return mine
@@ -245,12 +258,12 @@ def held_push_fps(root, except_pid=None):
     return {fp for r in live(root, except_pid) for fp in push_fps_of(root, r)}
 
 
-def _drop_push_tokens(root, fps):
-    """Remove the push tokens whose fingerprint is in `fps` and that no live device holds. False when the store could not be edited: a
-    token left in it belongs to a phone nobody is paired with, and the next pairing clears it."""
+def _drop_push_tokens(root, fps, except_pid=None):
+    """Remove the push tokens whose fingerprint is in `fps` and that no live device (other than the one `except_pid` serves) holds. False
+    when the store could not be edited: the tokens are then still in it, and the caller says so."""
     try:
         store = _sibling("companion_push_store")
-        keep = held_push_fps(root)
+        keep = held_push_fps(root, except_pid)
         doomed = [e["token"] for e in store.load(root)["tokens"] if token_fp(e["token"]) in fps and token_fp(e["token"]) not in keep]
         if doomed:
             store.remove_tokens(root, doomed)
@@ -260,17 +273,29 @@ def _drop_push_tokens(root, fps):
 
 
 def forget(root, dev_id):
-    """The device is gone (its client ended or was revoked): drop its record and the push tokens only it held."""
+    """The device is gone (its client ended, or it was revoked): its push tokens go FIRST, then its record -- the record is what names the
+    tokens, so tokens that cannot be removed leave it, and the answer is False: nothing is then to be reported as revoked. A phone bound
+    through a client older than the records keeps its record as a tombstone (`revoked`) instead of losing it: that record is made from
+    files its client left, and a removed one would be made again for as long as the client runs. True when both are done."""
     rec = next((r for r in records(root) if r["id"] == dev_id), None)
-    fps = push_fps_of(root, rec) if rec is not None else set()  # before the record goes: a legacy phone's tokens are the ones no record claims
-    remove_record(root, dev_id)
-    if fps:
-        _drop_push_tokens(root, fps)
+    if rec is None or rec.get("revoked"):
+        return True
+    if not _drop_push_tokens(root, push_fps_of(root, rec), rec["pid"]):
+        return False
+    if not rec.get("legacy"):
+        remove_record(root, dev_id)
+        return True
+    try:
+        write_record(root, dict(rec, revoked=True, caps=[], push_fps=[]))
+    except OSError:
+        return False
+    return True
 
 
-def resolve(root, wanted):
-    """The live records `wanted` names: the one whose id it is, else every one whose label it is (compared without case)."""
-    devices = live(root)
+def resolve(root, wanted, dead=False):
+    """The live records `wanted` names -- with `dead`, the stale ones -- the one whose id it is, else every one whose label it is
+    (compared without case)."""
+    devices = stale(root) if dead else live(root)
     by_id = [r for r in devices if r["id"] == wanted.lower()]
     return by_id or [r for r in devices if r["label"].lower() == wanted.lower()]
 
@@ -279,6 +304,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="hmd_devices.py", description=__doc__.split("\n")[0])
     ap.add_argument("action", choices=("list", "count", "has-pid", "resolve", "forget", "signal", "limit"))
     ap.add_argument("--repo", default="")
+    ap.add_argument("--dead", action="store_true", help="resolve: the phones whose client is gone, not the running ones")
     ap.add_argument("arg", nargs="?")
     args = ap.parse_intermixed_args(argv)  # `has-pid --repo R PID`: the argument comes after the option
     if args.action != "limit" and not args.repo:
@@ -298,7 +324,7 @@ def main(argv=None):
     elif args.action == "has-pid":
         return 0 if args.arg.isdigit() and any(r["pid"] == int(args.arg) for r in live(root)) else 1
     elif args.action == "resolve":
-        found = resolve(root, args.arg)
+        found = resolve(root, args.arg, args.dead)
         if not found:
             return 1
         if len(found) > 1:
@@ -306,7 +332,9 @@ def main(argv=None):
             return 2
         print("%s %d" % (found[0]["id"], found[0]["pid"]))
     elif _ID_RE.match(args.arg):
-        forget(root, args.arg)
+        if not forget(root, args.arg):
+            print("hmd_devices: %s: its push tokens could not be removed, so its record is kept" % args.arg, file=sys.stderr)
+            return 1
     else:
         ap.error("forget takes a device id")
     return 0

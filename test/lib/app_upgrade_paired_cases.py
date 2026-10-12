@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """test/lib/app_upgrade_paired_cases.py -- upgrade while paired: a phone bound to a relay client that v2.4.6 started must survive the
-upgrade to the per-phone device records (v2.4.7) without that client being restarted and without the phone pairing again.
+upgrade to the per-phone device records (v2.4.7) without that client being restarted and without the phone pairing again -- and a
+revoke of that phone, or of any phone, must be final.
 
 The OLD side is real: bin/ and everything else of the v2.4.6 tag (74e33748), extracted with `git archive` into a scratch directory,
 runs `hmd app connect --bg` against test/lib/fake_relay_code.py exactly as the operator's did (HMD_PAIR_WINDOW_IDLE_H=0), and a fake
@@ -17,11 +18,28 @@ hold (the numbers are the checks'):
   U7  the record the new code made of it carries what 2.4.6 kept: label, login, how it paired, when, its capabilities, its push tokens
   U8  a SECOND phone pairs by the code the new pair window offers, and the first phone's push registrations -- the one it made before
       and the one it made after the upgrade -- are not cleared by that pairing; the first phone still works
-  U9  `hmd app disconnect --device` revokes the 2.4.6 client's relay session (it ends it with TERM: that client has no SIGUSR1
-      handler, and SIGUSR1 would kill it with no revoke), takes out its push registrations and leaves the second phone alone
-  U10 nothing started here is left running
+  U9  revoking the second phone takes out ITS push token and leaves the first phone's (the 2.4.6 client's, which no record lists
+      tokens for) where they were
+  U10 `hmd app disconnect --device` revokes the 2.4.6 client's relay session (it ends it with TERM: that client has no SIGUSR1
+      handler, and SIGUSR1 would kill it with no revoke) and takes out its push registrations
+  U11 nothing started here is left running
+a revoke is final (a second scenario, the 2.4.6 client alone):
+  R1  the phone is listed once and holds a push token
+  R2  a revoke whose push token cannot be removed (the store is locked) does not report success, keeps the device's record, and
+      leaves the token where it can still be removed
+  R3  a legacy phone that was revoked -- its record forgotten while its 2.4.6 client still runs, as drift or a slow exit would leave it --
+      is not listed again by any later read, restart of the readers, or `hmd app status`, and its push token is gone
+  R4  plain `hmd app disconnect` ends the 2.4.6 client through the relay (its session is revoked), leaving nothing listed or notified
+  R5  nothing started here is left running
+and every other way a phone ends (a third scenario, a connect run with three phones, new clients):
+  E1  the starting point: three phones bound, each with a push token and a device record
+  E2  `disconnect --device` for a phone whose client crashed does not claim a revoke -- the relay session cannot be revoked from here --
+      says so and exits non-zero, yet removes that phone's push token and record and leaves the others alone
+  E3  plain `disconnect` with several phones revokes each one's relay session through its client and leaves no token and no record
+  E4  nothing started here is left running
 """
 import contextlib
+import fcntl
 import json
 import os
 import shutil
@@ -40,6 +58,7 @@ OLD_REF = "74e33748185af9b5ca4efdcc99a8c386e99e1122"  # v2.4.6
 APP_REL = (".heimdall", "app")
 TOKEN_A = "ExponentPushToken[AAAAAAAAAAAAAAAAAAAAAA]"
 TOKEN_A2 = "ExponentPushToken[CCCCCCCCCCCCCCCCCCCCCC]"
+TOKEN_B = "ExponentPushToken[BBBBBBBBBBBBBBBBBBBBBB]"
 CAPS = ["push-v1", "resync", "view-v1"]
 STARTED = set()  # the pids of the processes this test started, as the scratch repo's own state names them
 
@@ -96,10 +115,13 @@ def started(pid):
     return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
 
 
+def devices_cli(s, *args):
+    return C.run([sys.executable, C.DEVICES_PY] + list(args) + ["--repo", s.repo], s.env())
+
+
 def listed(s):
-    p = C.run([sys.executable, C.DEVICES_PY, "list", "--repo", s.repo], s.env())
     try:
-        return json.loads(p.stdout)
+        return json.loads(devices_cli(s, "list").stdout)
     except ValueError:
         return []
 
@@ -107,6 +129,18 @@ def listed(s):
 def leftovers(paths):
     out = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True).stdout
     return [ln.strip() for ln in out.splitlines() if any(p in ln for p in paths) and "ps -axww" not in ln]
+
+
+def nothing_left(tag, paths):
+    """The check that no process whose command line names the scratch directories outlives the run. Only a pid this test itself recorded
+    as one it started is ever signalled -- never anything by name."""
+    gone = C.wait_until(lambda: not leftovers(paths), 30)
+    left = leftovers(paths)
+    for line in left:
+        with contextlib.suppress(OSError, ValueError):
+            if int(line.split()[0]) in STARTED:
+                os.kill(int(line.split()[0]), 9)
+    T.check(gone, "%s. nothing the 2.4.6 client, the new window or the test started is left running" % tag, "\n".join(left))
 
 
 def old_connect(s, old):
@@ -132,13 +166,7 @@ def case_upgrade_while_paired():
         with C.Scn() as s:
             s.sb.repo = sl.ws  # the repo is the statusline sandbox's workspace, so the statusline renders THIS repo's marker
             run_upgrade(s, sl, old)
-        gone = C.wait_until(lambda: not leftovers(paths), 30)
-        left = leftovers(paths)
-        for line in left:  # only a pid this test itself recorded as one it started is ever signalled -- never anything by name
-            with contextlib.suppress(OSError, ValueError):
-                if int(line.split()[0]) in STARTED:
-                    os.kill(int(line.split()[0]), 9)
-        T.check(gone, "U10. nothing the 2.4.6 client, the new window or the test started is left running", "\n".join(left))
+        nothing_left("U11", paths)
     finally:
         sl.close()
         shutil.rmtree(old, ignore_errors=True)
@@ -210,7 +238,7 @@ def run_upgrade(s, sl, old):
     sid_b, opened_b, hmd_b = C.pair_next(s, phone_b, "iPhone 15", 1, timeout=60)
     kept = C.push_tokens(s)
     note_started(s)
-    status_two =C.ANSI.sub("", C.app_status(s, HMD_PAIR_WINDOW_IDLE_H="0").stdout)
+    status_two = C.ANSI.sub("", C.app_status(s, HMD_PAIR_WINDOW_IDLE_H="0").stdout)
     ack_b = C.phone_says(s, phone_b, hmd_b, sid_b, 1, "from the iphone") if sid_b else None
     T.check(rotated and sid_b is not None and opened_b is not None and kept == sorted([TOKEN_A, TOKEN_A2])
             and pixel("send-message", {"text": "still here"}) and bool(ack_b and ack_b.get("ok"))
@@ -219,24 +247,158 @@ def run_upgrade(s, sl, old):
             "U8. a second phone pairs by the code and the first phone's push registrations survive it, both phones work and both are listed",
             "tokens %r sid_b %r status %s" % (kept, sid_b, status_two[-500:]))
 
+    # -- revoking the second phone: its token goes, the first phone's (which no record lists) stay -------------------------------------
+    ack_reg = C.phone_command(s, phone_b, hmd_b, sid_b, 2, "register_push",
+                              {"v": 1, "provider": "expo", "token": TOKEN_B, "platform": "ios", "ref": "00112233445566ff",
+                               "label": "phone", "events": ["approval"]}) if sid_b else None
+    both = C.push_tokens(s)
+    gone_b = C.run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "iPhone 15"], s.env(HMD_TAILSCALE_BIN="/usr/bin/false"),
+                   stdin="", timeout=120)
+    revoked_b = C.wait_until(lambda: sid_b in s.relay.revokes, 30)
+    left = C.wait_until(lambda: C.push_tokens(s) == sorted([TOKEN_A, TOKEN_A2]), 20)
+    T.check(bool(ack_reg and ack_reg.get("ok")) and both == sorted([TOKEN_A, TOKEN_A2, TOKEN_B]) and gone_b.returncode == 0 and revoked_b
+            and left and pixel("send-message", {"text": "still here after the iphone went"}) and sid_a not in s.relay.revokes,
+            "U9. revoking the second phone takes out ITS push token and leaves the first phone's (the 2.4.6 client's) where they were",
+            "tokens %r then %r revoked %s rc %r %s" % (both, C.push_tokens(s), revoked_b, gone_b.returncode, gone_b.stderr[-300:]))
+
     # -- `hmd app disconnect --device` on the 2.4.6 client ----------------------------------------------------------------------------
     gone = C.run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "Pixel 9a"], s.env(HMD_TAILSCALE_BIN="/usr/bin/false"),
                  stdin="", timeout=120)
     revoked = C.wait_until(lambda: sid_a in s.relay.revokes, 30)
     ended = C.wait_until(lambda: not C.alive(pid), 20)
-    ack_b2 = C.phone_says(s, phone_b, hmd_b, sid_b, 2, "still here too") if sid_b else None
-    T.check(gone.returncode == 0 and revoked and ended and sid_b not in s.relay.revokes and bool(ack_b2 and ack_b2.get("ok"))
-            and C.wait_until(lambda: C.push_tokens(s) == [], 20),
-            "U9. `disconnect --device` revokes the 2.4.6 client's relay session, takes out its push tokens (both) and leaves the other phone alone",
+    T.check(gone.returncode == 0 and revoked and ended and C.wait_until(lambda: C.push_tokens(s) == [], 20),
+            "U10. `disconnect --device` revokes the 2.4.6 client's relay session and takes out its push tokens (both)",
             "rc %r revoked %s ended %s revokes %r tokens %r %s%s" % (gone.returncode, revoked, ended, s.relay.revokes, C.push_tokens(s),
                                                                      gone.stdout[-200:], gone.stderr[-300:]))
 
 
-def main():
+def case_revoked_legacy_stays_revoked():
+    old = old_tree()
+    if old is None:
+        T.check(True, "R0. (skipped) v2.4.6 is not in this clone's history: the old client cannot be started")
+        return
+    paths = [old]
     try:
-        case_upgrade_while_paired()
-    except Exception as exc:  # a case that dies is a failure, not a crash of the run
-        T.check(False, "case_upgrade_while_paired raised %s: %s" % (type(exc).__name__, exc))
+        with C.Scn() as s:
+            paths += [s.sb.root, os.path.realpath(s.sb.root)]
+            run_revoked_legacy(s, old)
+        nothing_left("R5", paths)
+    finally:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def hold_push_lock(s):
+    """An exclusive flock on the push store's lock file, the one its writers take: they wait their 3 s and fail."""
+    fd = os.open(os.path.join(s.repo, *APP_REL, "push.json.lock"), os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def run_revoked_legacy(s, old):
+    proc, rc = old_connect(s, old)
+    registered = C.wait_until(lambda: s.relay.registrations, 40)
+    if not (rc == 0 and registered and C.client_pid(s)):
+        T.check(False, "R1. (setup) the 2.4.6 `hmd app connect --bg` is running and offers the code", "rc %r %s" % (rc, proc.tail()))
+        return
+    sid_a, pid = s.relay.latest().id, C.client_pid(s)
+    s.bind(sid_a, device_label="Pixel 9a")
+    _opened, hmd_a = C.phone_state(s, s.phone, sid_a)
+    pushed = C.register_push(s, s.phone, hmd_a, sid_a, TOKEN_A, "0123456789abcdef")
+    devices = listed(s)
+    dev_id = devices[0]["id"] if len(devices) == 1 else None
+    note_started(s)
+    T.check(bool(hmd_a) and pushed and dev_id and C.push_tokens(s) == [TOKEN_A],
+            "R1. (setup) the 2.4.6 client's phone is listed once and holds a push token", "devices %r tokens %r" % (devices, C.push_tokens(s)))
+    if not dev_id:
+        return
+
+    fd = hold_push_lock(s)
+    try:
+        blocked = devices_cli(s, "forget", dev_id)
+    finally:
+        os.close(fd)
+    T.check(blocked.returncode != 0 and [x["id"] for x in listed(s)] == [dev_id] and C.push_tokens(s) == [TOKEN_A],
+            "R2. a revoke whose push token cannot be removed does not report success, keeps the device's record and leaves the token to be removed",
+            "rc %r listed %r tokens %r %s" % (blocked.returncode, listed(s), C.push_tokens(s), blocked.stderr[-300:]))
+
+    done = devices_cli(s, "forget", dev_id)
+    reads = [listed(s), listed(s)]  # each read is a process of its own: nothing carries over between them but the files
+    counted = devices_cli(s, "count").stdout.strip()
+    resolved = C.run([sys.executable, C.DEVICES_PY, "resolve", "--repo", s.repo, "Pixel 9a"], s.env()).returncode
+    status = C.ANSI.sub("", C.app_status(s, HMD_PAIR_WINDOW_IDLE_H="0").stdout)
+    T.check(done.returncode == 0 and C.alive(pid) and reads == [[], []] and counted == "0" and resolved == 1
+            and "devices:" not in status and C.push_tokens(s) == [],
+            "R3. a revoked legacy phone is not listed again -- by later reads, a restart of the readers or `hmd app status` -- though its "
+            "2.4.6 client and the files it left are still there, and its push token is gone",
+            "rc %r alive %s reads %r count %r resolve %r tokens %r status %s" % (done.returncode, C.alive(pid), reads, counted, resolved,
+                                                                                C.push_tokens(s), status[-300:]))
+    ended = C.run([H.APP_PATH, "disconnect", "--repo", s.repo], s.env(HMD_TAILSCALE_BIN="/usr/bin/false"), stdin="", timeout=180)
+    T.check(ended.returncode == 0 and C.wait_until(lambda: sid_a in s.relay.revokes, 30) and C.wait_until(lambda: not C.alive(pid), 20)
+            and listed(s) == [] and C.push_tokens(s) == [],
+            "R4. plain `hmd app disconnect` ends the 2.4.6 client through the relay: its session is revoked, and nothing is left listed or notified",
+            "rc %r revokes %r alive %s %s%s" % (ended.returncode, s.relay.revokes, C.alive(pid), ended.stdout[-200:], ended.stderr[-300:]))
+
+
+def case_every_end_reaches_the_relay():
+    # a connect run with three phones, each holding a push token. A phone whose client crashed (kill -9) cannot be revoked from here -- its
+    # session token lived in that client's memory only -- so `--device` says so, in words and in its exit status, and still removes what is
+    # local; plain `disconnect` ends every other phone through its own client, which revokes its relay session and takes out its tokens.
+    with C.Scn() as s:
+        app = s.app("--relay", s.relay.url, "--bg")
+        app.close_stdin()
+        rc = app.wait_exit(90)
+        if not (rc == 0 and C.wait_until(lambda: s.relay.registrations, 40)):
+            T.check(False, "E1. (setup) connect --bg offers the code", "rc %r %s" % (rc, app.tail()))
+            return
+        phones = [s.phone, H.Phone(C.E2E), H.Phone(C.E2E)]
+        sids, keys = [], []
+        for n, phone in enumerate(phones):
+            if n == 0:
+                sid = s.bind(device_label="Phone 1")
+                opened, hmd = C.phone_state(s, phone, sid)
+            else:
+                sid, opened, hmd = C.pair_next(s, phone, "Phone %d" % (n + 1), n)
+            sids.append(sid if opened is not None else None)
+            keys.append(hmd)
+        tokens = ["ExponentPushToken[%s]" % (c * 22) for c in "DEF"]
+        pushed = [sids[n] is not None and C.register_push(s, phone, keys[n], sids[n], tokens[n], "%016x" % (n + 1)) for n, phone in enumerate(phones)]
+        note_started(s)
+        pids = C.device_pids(s)
+        T.check(None not in sids and all(pushed) and C.push_tokens(s) == sorted(tokens) and len(device_records(s)) == 3 and len(pids) == 3,
+                "E1. (setup) a connect run has three phones bound, each with a push token and a device record",
+                "sids %r pushed %r tokens %r records %r pids %r" % (sids, pushed, C.push_tokens(s), device_records(s), pids))
+        if None in sids or len(pids) != 3:
+            return
+        os.kill(pids["Phone 1"], 9)  # the exact client this connect run started for the first phone
+        C.wait_until(lambda: "Phone 1" not in C.device_pids(s), 20)
+        env = s.env(HMD_TAILSCALE_BIN="/usr/bin/false")
+        gone = C.run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "Phone 1"], env, stdin="", timeout=120)
+        T.check(gone.returncode != 0 and "client is not running" in gone.stderr and "NOT be revoked" in gone.stderr
+                and "revoked device" not in gone.stdout + gone.stderr
+                and C.wait_until(lambda: C.push_tokens(s) == sorted(tokens[1:]), 20)
+                and "device-%s.json" % C.device_fp(phones[0]) not in device_records(s) and sorted(C.device_pids(s)) == ["Phone 2", "Phone 3"]
+                and not any(sid in s.relay.revokes for sid in sids),
+                "E2. `disconnect --device` for a phone whose client is gone does not claim a revoke: it says the relay session could not be "
+                "revoked from here and exits non-zero, yet removes that phone's push token and record and leaves the others alone",
+                "rc %r tokens %r records %r revokes %r %s%s" % (gone.returncode, C.push_tokens(s), device_records(s), s.relay.revokes,
+                                                              gone.stdout[-200:], gone.stderr[-400:]))
+        end = C.run([H.APP_PATH, "disconnect", "--repo", s.repo], env, stdin="", timeout=180)
+        T.check(end.returncode == 0 and C.wait_until(lambda: sids[1] in s.relay.revokes and sids[2] in s.relay.revokes, 30)
+                and C.wait_until(lambda: not C.alive(pids["Phone 2"]) and not C.alive(pids["Phone 3"]), 20)
+                and C.wait_until(lambda: C.push_tokens(s) == [] and not device_records(s), 20),
+                "E3. plain `hmd app disconnect` with several phones revokes each one's relay session through its own client, and leaves "
+                "no push token and no device record",
+                "rc %r revokes %r tokens %r records %r %s%s" % (end.returncode, s.relay.revokes, C.push_tokens(s), device_records(s),
+                                                              end.stdout[-200:], end.stderr[-300:]))
+        nothing_left("E4", [s.sb.root, os.path.realpath(s.sb.root)])
+
+
+def main():
+    for case in (case_upgrade_while_paired, case_revoked_legacy_stays_revoked, case_every_end_reaches_the_relay):
+        try:
+            case()
+        except Exception as exc:  # a case that dies is a failure, not a crash of the run
+            T.check(False, "%s raised %s: %s" % (case.__name__, type(exc).__name__, exc))
     return T.finish()
 
 
