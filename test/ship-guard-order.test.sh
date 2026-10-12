@@ -135,7 +135,7 @@ PLUG2="$WORK/plug2"; make_fake_repo "$PLUG2"
 BASE2="$(git -C "$PLUG2" rev-parse HEAD)"
 C2="$WORK/c2.out"
 (
-  cd "$PLUG2"
+  cd "$PLUG2" || exit 1
   export GUARD_GITLEAKS_RC=1
   PATH="$STUB:$PATH" HEIMDALL_HOME="$PLUG2.home" bash "$PLUG2/release/ship.sh" --no-npm
 ) >"$C2" 2>&1
@@ -157,7 +157,7 @@ PLUG3="$WORK/plug3"; make_fake_repo "$PLUG3"
 BASE3="$(git -C "$PLUG3" rev-parse HEAD)"
 C3="$WORK/c3.out"
 (
-  cd "$PLUG3"
+  cd "$PLUG3" || exit 1
   export GUARD_GITLEAKS_RC=0 SHIP_LANDMINE_LINT="$LANDMINE_FAIL"
   PATH="$STUB:$PATH" HEIMDALL_HOME="$PLUG3.home" bash "$PLUG3/release/ship.sh" --no-npm
 ) >"$C3" 2>&1
@@ -182,12 +182,11 @@ assert_no_dangling_bump "landmine-fail" "$PLUG3" "$BASE3"
 # dies later at R9 (bin/heimdall-check-identities is absent in the fake repo) — but by then
 # the bump commit already exists, which is exactly what this case asserts.
 PLUG4="$WORK/plug4"; make_fake_repo "$PLUG4"
-BASE4="$(git -C "$PLUG4" rev-parse HEAD)"
 NOOP="$WORK/noop"; printf '#!/usr/bin/env bash\nexit 0\n' > "$NOOP"; chmod +x "$NOOP"
 LANDMINE_OK="$WORK/landmine-ok"; printf '#!/usr/bin/env bash\nexit 0\n' > "$LANDMINE_OK"; chmod +x "$LANDMINE_OK"
 C4="$WORK/c4.out"
 (
-  cd "$PLUG4"
+  cd "$PLUG4" || exit 1
   export GUARD_GITLEAKS_RC=0 SHIP_LANDMINE_LINT="$LANDMINE_OK"
   export SHIP_RENDERER="$NOOP" SHIP_SYNC_RELEASE="$NOOP"
   PATH="$STUB:$PATH" HEIMDALL_HOME="$PLUG4.home" bash "$PLUG4/release/ship.sh" --no-npm
