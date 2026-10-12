@@ -1694,14 +1694,16 @@ def case_connect_stays_down_when_ended_on_purpose():
             return
         sid = s.bind(s.relay.registrations[-1]["session_id"])
         s.paired_state(sid)
-        regs = len(s.relay.registrations)
         s.relay.end_session(sid, "revoked")
-        gone = wait_until(lambda: not alive(pid), 30)
+        # the only phone revoked its own session: connect ends -- the client that served it and the one that was offering the code for the
+        # next phone with it -- and nothing registers the code again (the successor's registration, made once the phone was bound, comes before)
+        gone = wait_until(lambda: not alive(pid) and not client_pid(s) and not device_pids(s), 30)
+        state = wait_until(lambda: not os.path.exists(os.path.join(s.repo, ".heimdall", "app", "connect.json")), 30)
+        regs = len(s.relay.registrations)
         time.sleep(4)
-        state = os.path.exists(os.path.join(s.repo, ".heimdall", "app", "connect.json"))
-        T.check(gone and not state and len(s.relay.registrations) == regs and not client_pid(s),
-                "R3. a session the phone revoked is not replaced: the client is gone, connect.json is gone, nothing registers the code again",
-                "gone %s, connect.json %s, registrations %d then %d" % (gone, state, regs, len(s.relay.registrations)))
+        T.check(gone and state and len(s.relay.registrations) == regs and not client_pid(s),
+                "R3. a session the phone revoked is not replaced: every client is gone, connect.json is gone, nothing registers the code again",
+                "gone %s, connect.json gone %s, registrations %d then %d" % (gone, state, regs, len(s.relay.registrations)))
     with Scn(ttl=60) as s:
         s.relay.code_status = one_live_window_per_code(s.relay)
         rc, pid = connect_bg(s, **RESPAWN_KNOBS)
@@ -1731,6 +1733,451 @@ def case_connect_stays_down_when_ended_on_purpose():
         T.check(asked[0] == 1 and not client_pid(s),
                 "R3. an auth failure on the new session's /pair/init is tried once and ends connect, not retried for ever",
                 "/pair/init asked %d times, client pid %r" % (asked[0], client_pid(s)))
+
+
+# -- M: more than one phone under the repo's one code ---------------------------------------------------------------------
+# hmdapp's docs/HANDOFF-TO-HEIMDALL-second-phone.md: a relay session binds ONE device and releases its code at the bind (INV-41), so
+# after the first phone the repo's code was dead. The laptop now opens a fresh relay session under the same code for each further
+# device -- one relay client per device, every one reading the same repo state -- and keeps every bound one connected:
+#   M1  a second phone (same GitHub login) pairs by the code while the first is bound; both receive state under their own key
+#       and both can send; `hmd app status` lists each (label, GitHub login, id, paired-at, last seen, caps)
+#   M2  `hmd app disconnect --device LABEL|ID` revokes that phone's relay session and nobody else's; the other keeps working;
+#       an unknown or ambiguous name is refused; plain `hmd app disconnect` still ends all
+#   M3  at most four phones: the window is not offered past that, a client asked to is refused with `device-limit`, and `status`
+#       says how to make room
+#   M4  `hmd app connect` (no pair window open) hands the code to a pair window once its client has paired a phone, so the
+#       iPhone after the Pixel works there too
+#   M10 HMD_PAIR_MAX_DEVICES is the opt-out (1 = the one-phone behavior, garbage fails closed); M11 every added phone leaves a notice in the
+#       session; M12 a planted record naming another repo's client is no device and is never signalled; M13 a connect whose state is gone
+#       ends every client it started
+#   M8  a phone's client that crashes (kill -9) with two bound is replaced -- through the pair window's pool (M8) or through a connect's own
+#   M9  clients (M9): the other phone is untouched, the crashed one pairs again by the code on the window already open and is logged as a
+#       re-pair, a fresh window follows
+#   M7  the GitHub-account check is made for every phone: a second claim naming another login is refused, the first is untouched
+#   M6  each phone's push registration is its own: a second pairing leaves the first's, a revoke takes out only that phone's
+#   M5  --confirm keeps its compare: a phone approved at the terminal does not open a window that would pair the next one unasked
+def phone_state(s, phone, sid, timeout=30):
+    """(the first state frame of relay session `sid` opened with `phone`'s key, hmd's revealed key): (None, b"") when it has none."""
+    wait_until(lambda: s.relay.frames_of(sid, "state") and s.relay.frames_of(sid, "key_reveal"), timeout)
+    reveals, states = s.relay.frames_of(sid, "key_reveal"), s.relay.frames_of(sid, "state")
+    if not reveals or not states:
+        return None, b""
+    hmd_pub = H.b64_any(reveals[0]["payload"]["hmd_pubkey"])
+    return phone.open_hmd_frame(hmd_pub, sid, states[0]), hmd_pub
+
+
+def phone_says(s, phone, hmd_pub, sid, seq, text, timeout=20):
+    """`phone` sends `text` as a send-message command on relay session `sid` (sealed under its own key) and the ack that opens, or None."""
+    return phone_command(s, phone, hmd_pub, sid, seq, "send-message", {"text": text}, timeout)
+
+
+def phone_command(s, phone, hmd_pub, sid, seq, action, params, timeout=20):
+    """`phone` sends the command `action` on relay session `sid`, sealed under its own key; the ack that opens, or None."""
+    key = E2E.derive_session_key(phone.priv, hmd_pub, sid)
+    nonce, ciphertext = E2E.seal(key, seq, "device", json.dumps({"action": action, "params": params}).encode("utf-8"))
+    envelope = {"v": 1, "session_id": sid, "seq": seq, "sender": "device", "type": "command", "nonce": nonce, "ciphertext": ciphertext}
+    before = len(s.relay.frames_of(sid, "ack"))
+    s.relay.get(sid).outbox.put(json.dumps(envelope, sort_keys=True, separators=(",", ":")))
+    if not wait_until(lambda: len(s.relay.frames_of(sid, "ack")) > before, timeout):
+        return None
+    return phone.open_hmd_frame(hmd_pub, sid, s.relay.frames_of(sid, "ack")[-1])
+
+
+def device_fp(phone):
+    """The id `hmd app status` gives a phone: the first 8 hex of the SHA-256 of its raw public key (INV-29's {device_pubkey_fp})."""
+    return hashlib.sha256(phone.pub).hexdigest()[:8]
+
+
+def pair_next(s, phone, label, previous, timeout=40):
+    """Wait for the window to offer the code again (a registration beyond the `previous` ones), bind `phone` on that new relay session
+    as `label`, and return (the session id, the state it opened to, hmd's key) -- the session id is None when no window came."""
+    if not wait_until(lambda: len(s.relay.registrations) > previous, timeout):
+        return None, None, b""
+    sid = s.relay.latest().id
+    s.relay.inject_device_bound(sid, phone.pub_b64url, via="code", device_label=label)
+    opened, hmd_pub = phone_state(s, phone, sid)
+    return sid, opened, hmd_pub
+
+
+def app_status(s, **env):
+    """`hmd app status` for the scenario's repo, with the tailscale lookups pointed at a binary that answers nothing."""
+    return run([H.APP_PATH, "status", "--repo", s.repo], s.env(HMD_TAILSCALE_BIN="/usr/bin/false", **env), timeout=60)
+
+
+def two_phones(s, knobs):
+    """The pair window opened, phone A ('Pixel 9a') and then phone B ('iPhone 15') paired by its code: (sid_a, sid_b, hmd_a, hmd_b, phone_b)."""
+    phone_b = H.Phone(E2E)
+    out = start_window(s, SID1, **knobs)
+    wait_until(lambda: s.relay.registrations, 40)
+    sid_a = s.relay.latest().id if s.relay.registrations else None
+    if out.returncode != 0 or sid_a is None:
+        return None, None, b"", b"", phone_b
+    s.bind(sid_a, device_label="Pixel 9a")
+    _opened, hmd_a = phone_state(s, s.phone, sid_a)
+    sid_b, _opened_b, hmd_b = pair_next(s, phone_b, "iPhone 15", 1)
+    return sid_a, sid_b, hmd_a, hmd_b, phone_b
+
+
+def case_second_phone():
+    knobs = {"HMD_PAIR_WINDOW_POLL_S": "0.2"}
+    with Scn() as s:
+        phone_b = H.Phone(E2E)
+        out = start_window(s, SID1, **knobs)
+        T.check(out.returncode == 0 and wait_until(lambda: s.relay.registrations, 40),
+                "M1. (setup) the repo's pair window opens and registers its code", out.stdout + out.stderr)
+        sid_a, code = s.relay.latest().id, s.relay.registrations[0]["code"]
+        s.bind(sid_a, device_label="Pixel 9a")
+        opened_a, hmd_a = phone_state(s, s.phone, sid_a)
+        T.check(opened_a is not None and "state" in opened_a, "M1. (setup) the first phone pairs by the code and gets state", "")
+        offered = wait_until(lambda: len(s.relay.registrations) >= 2, 40)
+        sid_b = s.relay.latest().id
+        T.check(offered and sid_b != sid_a and s.relay.registrations[1]["code"] == code and sid_a not in s.relay.revokes
+                and not s.relay.get(sid_a).ended,
+                "M1. once a phone is bound the SAME code is offered again under a fresh relay session, and the first phone's stays bound",
+                "registrations %d revokes %r" % (len(s.relay.registrations), s.relay.revokes))
+        phone_b_sid, opened_b, hmd_b = pair_next(s, phone_b, "iPhone 15", 1)
+        T.check(phone_b_sid == sid_b and opened_b is not None and "state" in opened_b and hmd_a != hmd_b,
+                "M1. a second phone (same GitHub login) pairs by that code while the first is bound and gets state under its OWN key",
+                "sid %r opened %r" % (phone_b_sid, opened_b))
+        ack_a = phone_says(s, s.phone, hmd_a, sid_a, 1, "from the pixel")
+        ack_b = phone_says(s, phone_b, hmd_b, sid_b, 1, "from the iphone")
+        T.check(bool(ack_a and ack_a.get("ok")) and bool(ack_b and ack_b.get("ok")),
+                "M1. both phones can send a message, each acknowledged on its own session", "a %r b %r" % (ack_a, ack_b))
+        status = app_status(s)
+        out_text = ANSI.sub("", status.stdout)
+        T.check(status.returncode == 0 and "devices: 2 paired" in out_text and "Pixel 9a" in out_text and "iPhone 15" in out_text
+                and device_fp(s.phone) in out_text and device_fp(phone_b) in out_text and out_text.count("@octocat") >= 2
+                and "paired " in out_text and "last seen" in out_text,
+                "M1. `hmd app status` names each paired device: label, id, GitHub login, paired-at, last seen",
+                out_text[-700:])
+
+
+def case_device_revoke():
+    knobs = {"HMD_PAIR_WINDOW_POLL_S": "0.2"}
+    with Scn() as s:
+        sid_a, sid_b, hmd_a, hmd_b, phone_b = two_phones(s, knobs)
+        T.check(sid_a is not None and sid_b is not None, "M2. (setup) two phones are paired", "")
+        if sid_a is None or sid_b is None:
+            return
+        env = s.env(HMD_TAILSCALE_BIN="/usr/bin/false")
+        nobody = run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "nobody"], env, timeout=120)
+        T.check(nobody.returncode != 0 and "no paired device" in nobody.stderr and not s.relay.revokes,
+                "M2. an unknown device name is refused with a clear line and revokes nothing", nobody.stdout + nobody.stderr)
+        gone = run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "Pixel 9a"], env, timeout=120)
+        T.check(gone.returncode == 0 and wait_until(lambda: sid_a in s.relay.revokes, 30) and sid_b not in s.relay.revokes,
+                "M2. `disconnect --device Pixel 9a` revokes THAT phone's relay session at the relay and no other",
+                "rc %r revokes %r %s" % (gone.returncode, s.relay.revokes, gone.stderr))
+        after = ANSI.sub("", app_status(s).stdout)
+        T.check("devices: 1 paired" in after and "iPhone 15" in after and "Pixel 9a" not in after,
+                "M2. its record is gone and the other phone is still listed", after[-500:])
+        ack_b = phone_says(s, phone_b, hmd_b, sid_b, 2, "still here")
+        T.check(bool(ack_b and ack_b.get("ok")) and not s.relay.get(sid_b).ended and sid_b not in s.relay.revokes,
+                "M2. the other phone keeps working: its message is acknowledged and its relay session was never revoked", "ack %r" % (ack_b,))
+        reopened = wait_until(lambda: len(s.relay.registrations) >= 3, 40)
+        T.check(reopened and s.relay.registrations[-1]["code"] == s.relay.registrations[0]["code"],
+                "M2. the freed place is offered again under the same code", "registrations %d" % len(s.relay.registrations))
+        by_id = run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", device_fp(phone_b)], env, timeout=120)
+        T.check(by_id.returncode == 0 and wait_until(lambda: sid_b in s.relay.revokes, 30),
+                "M2. a device is named by its id as well as its label", by_id.stdout + by_id.stderr)
+    with Scn() as s:
+        sid_a, sid_b, _hmd_a, _hmd_b, _phone_b = two_phones(s, knobs)
+        if sid_a is None or sid_b is None:
+            T.check(False, "M2. (setup) two phones are paired", "")
+            return
+        run([H.APP_PATH, "disconnect", "--repo", s.repo], s.env(HMD_TAILSCALE_BIN="/usr/bin/false"), timeout=120)
+        T.check(wait_until(lambda: sid_a in s.relay.revokes and sid_b in s.relay.revokes, 30),
+                "M2. plain `hmd app disconnect` keeps its meaning: every phone's session is revoked", "revokes %r" % s.relay.revokes)
+
+
+def case_device_cap():
+    knobs = {"HMD_PAIR_WINDOW_POLL_S": "0.2"}
+    with Scn() as s:
+        out = start_window(s, SID1, **knobs)
+        wait_until(lambda: s.relay.registrations, 40)
+        code = s.relay.registrations[0]["code"] if s.relay.registrations else None
+        sids = []
+        phones = [s.phone] + [H.Phone(E2E) for _ in range(3)]
+        for n, phone in enumerate(phones):
+            sid, opened, _pub = pair_next(s, phone, "Phone %d" % (n + 1), n)
+            sids.append(sid if opened is not None else None)
+        T.check(out.returncode == 0 and None not in sids, "M3. (setup) four phones pair by the one code", "sids %r" % sids)
+        time.sleep(3)
+        T.check(len(s.relay.registrations) == 4 and not s.relay.revokes,
+                "M3. with four phones bound the window is not offered again (no fifth registration, nothing revoked)",
+                "registrations %d revokes %r" % (len(s.relay.registrations), s.relay.revokes))
+        status = ANSI.sub("", app_status(s).stdout)
+        T.check("devices: 4 paired" in status and "limit 4" in status and "disconnect --device" in status,
+                "M3. `hmd app status` says the limit is reached and how to make room", status[-600:])
+        extra = s.client(code, extra=("--no-confirm", "--code-only"))
+        refused = extra.wait_event("code_unavailable", timeout=20)
+        T.check(bool(refused) and refused.get("reason") == "device-limit" and extra.wait_exit(20) == CLIENT.CODE_ONLY_EXIT_RETRY
+                and len(s.relay.registrations) == 4,
+                "M3. a client asked to offer the code with four phones bound is refused (`device-limit`) before it sends the token again",
+                extra.tail())
+        run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "Phone 1"], s.env(HMD_TAILSCALE_BIN="/usr/bin/false"), timeout=120)
+        T.check(wait_until(lambda: len(s.relay.registrations) == 5, 40),
+                "M3. revoking one makes room: the window is offered again", "registrations %d" % len(s.relay.registrations))
+
+
+PUSH_STORE_PY = os.path.join(REPO, "bin", "lib", "companion_push_store.py")
+
+
+def push_tokens(s):
+    """The push tokens the repo's signed store holds, read the way the sender reads them (a process of its own, the sandbox's key)."""
+    code = ("import json,importlib.util as u;sp=u.spec_from_file_location('ps',%r);m=u.module_from_spec(sp);sp.loader.exec_module(m);"
+            "print(json.dumps(sorted(e['token'] for e in m.load(%r)['tokens'])))" % (PUSH_STORE_PY, os.path.realpath(s.repo)))
+    p = run([sys.executable, "-c", code], s.env())
+    try:
+        return json.loads(p.stdout)
+    except ValueError:
+        return None
+
+
+def register_push(s, phone, hmd_pub, sid, token, ref):
+    params = {"v": 1, "provider": "expo", "token": token, "platform": "android", "ref": ref, "label": "phone", "events": ["approval"]}
+    ack = phone_command(s, phone, hmd_pub, sid, 1, "register_push", params)
+    return bool(ack and ack.get("ok"))
+
+
+def case_device_push():
+    knobs = {"HMD_PAIR_WINDOW_POLL_S": "0.2"}
+    token_a, token_b = "ExponentPushToken[AAAAAAAAAAAAAAAAAAAAAA]", "ExponentPushToken[BBBBBBBBBBBBBBBBBBBBBB]"
+    with Scn() as s:
+        phone_b = H.Phone(E2E)
+        start_window(s, SID1, **knobs)
+        wait_until(lambda: s.relay.registrations, 40)
+        sid_a = s.relay.latest().id
+        s.bind(sid_a, device_label="Pixel 9a")
+        _opened, hmd_a = phone_state(s, s.phone, sid_a)
+        T.check(register_push(s, s.phone, hmd_a, sid_a, token_a, "0123456789abcdef") and push_tokens(s) == [token_a],
+                "M6. (setup) the first phone registers its push token", "tokens %r" % (push_tokens(s),))
+        sid_b, _opened_b, hmd_b = pair_next(s, phone_b, "iPhone 15", 1)
+        T.check(sid_b is not None and push_tokens(s) == [token_a],
+                "M6. a second phone pairing does not clear the first phone's push registration (only an earlier session's goes)",
+                "tokens %r" % (push_tokens(s),))
+        T.check(sid_b is not None and register_push(s, phone_b, hmd_b, sid_b, token_b, "fedcba9876543210")
+                and push_tokens(s) == sorted([token_a, token_b]),
+                "M6. each phone has its own registration in the one signed store", "tokens %r" % (push_tokens(s),))
+        run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "Pixel 9a"], s.env(HMD_TAILSCALE_BIN="/usr/bin/false"), timeout=120)
+        T.check(wait_until(lambda: push_tokens(s) == [token_b], 20),
+                "M6. revoking a phone removes ITS push registration and no other phone's", "tokens %r" % (push_tokens(s),))
+
+
+def case_connect_second_phone():
+    with Scn() as s:
+        phone_b = H.Phone(E2E)
+        app = s.app("--relay", s.relay.url, "--bg")
+        app.close_stdin()
+        rc = app.wait_exit(90)
+        T.check(rc == 0 and "SESSION CODE:" in app.text(), "M4. (setup) connect --bg offers the code", "rc %r %s" % (rc, app.tail()))
+        sid_a = s.relay.latest().id
+        s.bind(sid_a, device_label="Pixel 9a")
+        opened_a, _hmd_a = phone_state(s, s.phone, sid_a)
+        sid_b, opened_b, _hmd_b = pair_next(s, phone_b, "iPhone 15", 1)
+        T.check(opened_a is not None and sid_b is not None and sid_b != sid_a and opened_b is not None and sid_a not in s.relay.revokes,
+                "M4. a second phone pairs by the code of a connect whose first client already paired a phone; the first stays bound",
+                "registrations %d revokes %r" % (len(s.relay.registrations), s.relay.revokes))
+        text = ANSI.sub("", app_status(s).stdout)
+        T.check("devices: 2 paired" in text and "Pixel 9a" in text and "iPhone 15" in text,
+                "M4. `hmd app status` lists both phones of a connect", text[-600:])
+
+
+DEVICES_PY = os.path.join(REPO, "bin", "lib", "hmd_devices.py")
+
+
+def device_pids(s):
+    """{label: pid} of the phones `hmd app status` lists: the repo's live device records."""
+    p = run([sys.executable, DEVICES_PY, "list", "--repo", s.repo], s.env())
+    try:
+        return {d["label"]: d["pid"] for d in json.loads(p.stdout)}
+    except ValueError:
+        return {}
+
+
+def crash_one_of_two(s, tag, sid_b, hmd_b, phone_b):
+    """Two phones are bound ('Pixel 9a' is s.phone, 'iPhone 15' is phone_b) and a third window is open. The first phone's client is killed
+    (kill -9): the other is untouched, the open window takes the crashed phone back -- it pairs again by the code and is listed once more --
+    and a fresh window follows it."""
+    pids = device_pids(s)
+    pid_a, pid_b = pids.get("Pixel 9a"), pids.get("iPhone 15")
+    T.check(bool(pid_a) and bool(pid_b) and wait_until(lambda: len(s.relay.registrations) >= 3, 40),
+            "%s. (setup) two phones are bound and a third window is open" % tag, "pids %r registrations %d" % (pids, len(s.relay.registrations)))
+    if not (pid_a and pid_b):
+        return
+    os.kill(pid_a, 9)
+    ack_b = phone_says(s, phone_b, hmd_b, sid_b, 1, "still here")
+    T.check(alive(pid_b) and sid_b not in s.relay.revokes and bool(ack_b and ack_b.get("ok")),
+            "%s. the other phone is untouched by the crash: its client lives, its session was not revoked, its message is acknowledged" % tag,
+            "ack %r revokes %r" % (ack_b, s.relay.revokes))
+    gone = wait_until(lambda: "devices: 1 paired" in ANSI.sub("", app_status(s).stdout), 20)
+    sid_a2, opened, _pub = pair_next(s, s.phone, "Pixel 9a", 2)  # the window already open: the app pairs again by the code
+    T.check(gone and sid_a2 is not None and opened is not None
+            and wait_until(lambda: "devices: 2 paired" in ANSI.sub("", app_status(s).stdout), 20),
+            "%s. the crashed phone is replaced: the dead client is not listed, the phone pairs again by the code and is listed once more" % tag,
+            "gone %r opened %r" % (gone, opened))
+    T.check(wait_until(lambda: len(s.relay.registrations) >= 4, 40),
+            "%s. a fresh window follows, so a third phone can still pair" % tag, "registrations %d" % len(s.relay.registrations))
+
+
+def case_pool_replaces_a_crashed_client():
+    with Scn() as s:
+        _sid_a, sid_b, _hmd_a, hmd_b, phone_b = two_phones(s, {"HMD_PAIR_WINDOW_POLL_S": "0.2"})
+        if sid_b is None:
+            T.check(False, "M8. (setup) two phones are paired by the pair window", "")
+            return
+        crash_one_of_two(s, "M8", sid_b, hmd_b, phone_b)
+
+
+def case_connect_replaces_a_crashed_client():
+    with Scn() as s:
+        phone_b = H.Phone(E2E)
+        app = s.app("--relay", s.relay.url, "--bg", env={"HMD_RELAY_EVENT_LOG": events_path(s)})
+        app.close_stdin()
+        rc = app.wait_exit(90)
+        wait_until(lambda: s.relay.registrations, 40)
+        if rc != 0 or not s.relay.registrations:
+            T.check(False, "M9. (setup) connect --bg offers the code", "rc %r %s" % (rc, app.tail()))
+            return
+        sid_a = s.relay.registrations[-1]["session_id"]
+        s.bind(sid_a, device_label="Pixel 9a")
+        phone_state(s, s.phone, sid_a)
+        sid_b, _opened, hmd_b = pair_next(s, phone_b, "iPhone 15", 1)
+        if sid_b is None:
+            T.check(False, "M9. (setup) a second phone pairs under the connect", "")
+            return
+        crash_one_of_two(s, "M9", sid_b, hmd_b, phone_b)
+        paired = connect_events(s, "code_paired")
+        T.check(len(paired) >= 3 and not paired[0].get("repaired") and not paired[1].get("repaired") and paired[-1].get("repaired") is True,
+                "M9. the returning phone's pairing is logged as a re-pair (`repaired`), a new second phone's is not", json.dumps(paired)[-400:])
+
+
+def case_pair_max_devices():
+    # the opt-out: HMD_PAIR_MAX_DEVICES lowers how many phones a repo may pair (default 4); the way in is limited, so garbage fails closed
+    seen = {}
+    for value in (None, "", "2", "1", "9", "0", "many"):
+        env = {"PATH": os.environ.get("PATH", "")}
+        if value is not None:
+            env["HMD_PAIR_MAX_DEVICES"] = value
+        seen[value] = run([sys.executable, DEVICES_PY, "limit"], env).stdout.strip()
+    T.check(seen == {None: "4", "": "4", "2": "2", "1": "1", "9": "4", "0": "1", "many": "1"},
+            "M10. HMD_PAIR_MAX_DEVICES: default 4, never above 4, and a value that is not a whole number of 1 or more counts as 1", str(seen))
+    with Scn() as s:
+        start_window(s, SID1, HMD_PAIR_WINDOW_POLL_S="0.2", HMD_PAIR_MAX_DEVICES="1")
+        wait_until(lambda: s.relay.registrations, 40)
+        code = s.relay.registrations[0]["code"] if s.relay.registrations else None
+        s.bind(s.relay.latest().id, device_label="Pixel 9a")
+        opened, _hmd = phone_state(s, s.phone, s.relay.latest().id)
+        time.sleep(3)
+        status = ANSI.sub("", app_status(s, HMD_PAIR_MAX_DEVICES="1").stdout)
+        T.check(opened is not None and len(s.relay.registrations) == 1 and "limit 1" in status,
+                "M10. with HMD_PAIR_MAX_DEVICES=1 the code is not offered again once a phone is bound -- the one-phone behavior -- and status says the limit",
+                "registrations %d %s" % (len(s.relay.registrations), status[-300:]))
+        extra = s.client(code, extra=("--no-confirm", "--code-only"), env={"HMD_PAIR_MAX_DEVICES": "1"})
+        refused = extra.wait_event("code_unavailable", timeout=20)
+        T.check(bool(refused) and refused.get("reason") == "device-limit" and len(s.relay.registrations) == 1,
+                "M10. ...and a client asked to offer the code past that limit is refused before it sends the token", extra.tail())
+
+
+def case_added_device_notice():
+    with Scn() as s:
+        _sid_a, sid_b, _hmd_a, _hmd_b, _phone_b = two_phones(s, {"HMD_PAIR_WINDOW_POLL_S": "0.2"})
+        inbox = os.path.join(s.repo, ".heimdall", "ui", "inbox.jsonl")
+        wait_until(lambda: os.path.exists(inbox) and len(open(inbox, encoding="utf-8").read().splitlines()) >= 2, 20)
+        lines = open(inbox, encoding="utf-8").read().splitlines() if os.path.exists(inbox) else []
+        texts = [json.loads(line).get("text", "") for line in lines if line.strip()]
+        T.check(sid_b is not None and len(texts) == 2 and "Pixel 9a" in texts[0] and "iPhone 15" in texts[1]
+                and "phone 2 of the 4" in texts[1] and "disconnect --device 'iPhone 15'" in texts[1] and "phone 2 of" not in texts[0],
+                "M11. every phone that adds itself leaves its own notice in the session: the added one says it is phone 2 of the 4 allowed, "
+                "that it paired while another was bound, and how to remove just it", json.dumps(texts)[-500:])
+
+
+def case_planted_device_record():
+    # a device record is a file in the repo's state; the process it names is looked at, never believed: a record naming the relay client of
+    # ANOTHER repo lists no device and signals nothing
+    with Scn() as s, tempfile.TemporaryDirectory(prefix="pair-confirm-other.") as other:
+        foreign = s.client(H.CODE, repo=other)
+        T.check(bool(foreign.wait_event("code_window", timeout=40)), "M12. (setup) a relay client of another repo is running", foreign.tail())
+        plant = ("import importlib.util as u;sp=u.spec_from_file_location('d',%r);m=u.module_from_spec(sp);sp.loader.exec_module(m);"
+                 "m.write_record(%r,{'v':1,'id':'deadbeef','label':'Planted','gh_login':'octocat','via':'code','code':None,'bound_at':1,"
+                 "'last_seen':1,'caps':[],'push_fps':[],'pid':%d})" % (DEVICES_PY, os.path.realpath(s.repo), foreign.pid))
+        run([sys.executable, "-c", plant], s.env())
+        status = ANSI.sub("", app_status(s).stdout)
+        gone = run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "Planted"], s.env(HMD_TAILSCALE_BIN="/usr/bin/false"), timeout=60)
+        time.sleep(1)
+        T.check("Planted" not in status and gone.returncode != 0 and "no paired device" in gone.stderr and alive(foreign.pid),
+                "M12. a planted record naming another repo's relay client lists no device, and `disconnect --device` signals nothing",
+                "status %s | rc %r %s | alive %r" % (status[-200:], gone.returncode, gone.stderr.strip()[-200:], alive(foreign.pid)))
+
+
+def case_connect_watcher_ends_with_its_state():
+    # `hmd app disconnect` can read connect.json just before a successor client is started: the successor must not be left behind when the
+    # state is gone -- the run ends with its state, every client it started included
+    with Scn() as s:
+        app = s.app("--relay", s.relay.url, "--bg")
+        app.close_stdin()
+        rc = app.wait_exit(90)
+        wait_until(lambda: s.relay.registrations, 40)
+        if rc != 0 or not s.relay.registrations:
+            T.check(False, "M13. (setup) connect --bg offers the code", "rc %r %s" % (rc, app.tail()))
+            return
+        s.bind(s.relay.registrations[-1]["session_id"], device_label="Pixel 9a")
+        phone_state(s, s.phone, s.relay.latest().id)
+        T.check(wait_until(lambda: len(s.relay.registrations) >= 2, 40), "M13. (setup) the successor client offers the code", "")
+        successor, first = client_pid(s), device_pids(s).get("Pixel 9a")
+        os.kill(first, 9)  # nothing is bound any more: the watcher holds only the successor
+        wait_until(lambda: not alive(first), 10)
+        time.sleep(2.5)
+        os.unlink(os.path.join(s.repo, ".heimdall", "app", "connect.json"))
+        T.check(bool(successor) and wait_until(lambda: not alive(successor), 30),
+                "M13. a connect whose state is gone ends every client it started (the successor included), bound phone or none",
+                "successor %r alive %r" % (successor, alive(successor or 0)))
+
+
+def case_second_phone_identity():
+    # the GitHub-account check is made for EVERY phone: a second claim naming another login is refused as the first would be -- nothing
+    # revealed, derived, sealed or bound on its session, which is revoked -- while the first phone is untouched and a genuine one still pairs
+    knobs = {"HMD_PAIR_WINDOW_POLL_S": "0.2", "HMD_PAIR_WINDOW_RENEW_MIN_S": "2"}
+    with Scn() as s:
+        start_window(s, SID1, **knobs)
+        wait_until(lambda: s.relay.registrations, 40)
+        sid_a = s.relay.latest().id
+        s.bind(sid_a, device_label="Pixel 9a")
+        opened_a, _hmd_a = phone_state(s, s.phone, sid_a)
+        wait_until(lambda: len(s.relay.registrations) >= 2, 40)
+        sid_b = s.relay.latest().id
+        T.check(opened_a is not None and sid_b != sid_a, "M7. (setup) the first phone is bound and the code is offered again", "")
+        s.relay.inject_device_bound(sid_b, H.Phone(E2E).pub_b64url, via="code", device_label="Mallory", gh_login="mallory")
+        refused = wait_until(lambda: sid_b in s.relay.revokes, 30)
+        T.check(refused and not s.relay.frames_of(sid_b, "key_reveal") and not s.relay.frames_of(sid_b, "state")
+                and sid_a not in s.relay.revokes and not s.relay.get(sid_a).ended,
+                "M7. a second claim naming another GitHub login is refused: its session revoked, nothing revealed or sealed, the first phone untouched",
+                "revokes %r frames %r" % (s.relay.revokes, [e.get("type") for _sid, e in s.relay.frames if _sid == sid_b]))
+        third, opened_c, _hmd_c = pair_next(s, H.Phone(E2E), "iPhone 15", 2)
+        status = ANSI.sub("", app_status(s).stdout)
+        T.check(third is not None and opened_c is not None and "devices: 2 paired" in status and "Mallory" not in status
+                and "Pixel 9a" in status and "iPhone 15" in status,
+                "M7. the window is offered again after the refusal: a genuine second phone pairs, and the refused one is no device",
+                status[-500:])
+
+
+def case_confirm_pairs_one():
+    with Scn() as s:
+        app = s.app("--relay", s.relay.url, "--confirm", tty=True)
+        T.check(app.wait_text("SESSION CODE:", 60), "M5. (setup) connect --confirm offers the code", app.tail())
+        sid = s.relay.latest().id
+        s.bind(sid, device_label="Pixel 9a")
+        T.check(app.wait_text("Approve [y/N]:", 30), "M5. (setup) the claim is put to the terminal", app.tail())
+        app.send("y\n")
+        T.check(app.wait_text("phone paired via code", 30), "M5. (setup) the approved phone pairs", app.tail())
+        time.sleep(3)
+        T.check(len(s.relay.registrations) == 1 and s.window_state() is None,
+                "M5. --confirm opens no window that would pair a next phone without the compare: one registration, no pair window",
+                "registrations %d window %r" % (len(s.relay.registrations), s.window_state()))
+        out = start_window(s, SID1)  # nor does a session's hook open one beside it: that window pairs with no compare
+        time.sleep(2)
+        T.check("connect --confirm" in out.stdout and s.window_state() is None and len(s.relay.registrations) == 1,
+                "M5. a pair window is not opened beside a running connect --confirm either (the SessionStart hook says why and registers nothing)",
+                "%s registrations %d window %r" % (out.stdout.strip()[-200:], len(s.relay.registrations), s.window_state()))
 
 
 # every case runs in a process of its own (`app_pair_confirm_cases.py CASE`), CASE_JOBS at a time, and what each printed is reported in
@@ -1783,7 +2230,11 @@ def main():
              case_connect_stays_up, case_connect_idle_bound, case_connect_pairing_expired_reinits,
              case_confirm_event_floor, case_confirm_stays_up, case_confirm_reject_renews_at_once, case_confirm_idle_bound,
              case_connect_respawns_a_crashed_client, case_connect_logs_a_repair, case_connect_stays_down_when_ended_on_purpose,
-             case_no_links_followed, case_state_files_link_safe, case_code_not_derivable)
+             case_no_links_followed, case_state_files_link_safe, case_code_not_derivable,
+             case_second_phone, case_device_revoke, case_device_cap, case_device_push, case_connect_second_phone,
+             case_second_phone_identity, case_pool_replaces_a_crashed_client, case_connect_replaces_a_crashed_client,
+             case_pair_max_devices, case_added_device_notice, case_planted_device_record, case_connect_watcher_ends_with_its_state,
+             case_confirm_pairs_one)
     wanted = sys.argv[1:]  # case names to run alone, here (a quick look while working on one); none runs them all, a process each
     if not wanted:
         return report_children([c.__name__ for c in cases])

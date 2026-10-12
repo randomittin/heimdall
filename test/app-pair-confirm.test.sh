@@ -88,6 +88,12 @@ if [ -z "$missing_docs" ]; then
 else
   bad "the usage text does not mention: $missing_docs"
 fi
+if printf '%s' "$help_text" | grep -q -- 'disconnect \[--repo DIR\] --device LABEL|ID' \
+   && printf '%s' "$help_text" | grep -q 'devices: N paired' && printf '%s' "$help_text" | grep -q 'Up to 4'; then
+  ok "the usage text documents more than one phone: the limit of 4, the devices \`hmd app status\` lists, and disconnect --device"
+else
+  bad "the usage text does not document disconnect --device, the devices line of status, or the limit of 4 phones"
+fi
 if grep -nE '(export|declare -x|env) +[A-Za-z_]*(GH|GITHUB)_?TOKEN|GH_TOKEN=|GITHUB_TOKEN=' "$APP" >"$TMPROOT/env.out"; then
   bad "bin/heimdall-app puts a token in an environment variable: $(head -3 "$TMPROOT/env.out")"
 else
