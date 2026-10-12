@@ -315,10 +315,10 @@ def case_prompt():
         app.wait_text("phone paired via code", 40)
         out = app.text()
         T.check("Approve [y/N]" not in out and "[--no-confirm]" in s.read("argv") and out.count("phone paired") == 1
-                and "relay-claimed device 'Evil[2J]0;pwnPhone', GitHub @octocat" in out
+                and "relay-claimed device 'Evil2J0pwnPhone', GitHub @octocat" in out
                 and has_none_of(app.out(), b"\x1b", b"\x07", b"\x00", "\u0085".encode(), "\u009b".encode()),
                 "default connect: the client is told --no-confirm, no prompt appears, a code bind is announced once as relay-claimed "
-                "(escape bytes of the phone's label and login gone)", app.tail())
+                "(the phone's label and login reduced to plain text: escape bytes and the rest of the sequences gone, the label quoted)", app.tail())
     with AppScenario() as s:
         renewal = dict(PAIR_INIT, renewal=1)
         s.events("events-1", PAIR_INIT, WINDOW, renewal, dict(WINDOW, renewal=1), {"event": "code_window_closed", "reason": "expired"})
