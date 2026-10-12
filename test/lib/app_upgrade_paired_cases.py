@@ -192,7 +192,7 @@ def run_upgrade(s, sl, old):
                                        "label": "phone", "events": ["approval"]})
 
     resynced = pixel("resync", {"last_seq": 0, "digest": "0" * 64, "caps": CAPS})
-    pushed = push(TOKEN_A, "0123456789abcdef")  # gitleaks:allow
+    pushed = push(TOKEN_A, "aaaaaaaaaaaaaaaa")
     before = connect_json(s)
     t0 = started(pid)
     marker = os.path.join(s.repo, *APP_REL, "paired-%s.json" % s.relay.registrations[0]["code"])
@@ -234,7 +234,7 @@ def run_upgrade(s, sl, old):
 
     # -- a second phone pairs on the window the new code opened; the first keeps everything it had --------------------------------
     phone_b = H.Phone(C.E2E)
-    rotated = push(TOKEN_A2, "fedcba9876543210")  # the first phone registers again AFTER the upgrade, through the old client  # gitleaks:allow
+    rotated = push(TOKEN_A2, "cccccccccccccccc")  # the first phone registers again AFTER the upgrade, through the old client
     sid_b, opened_b, hmd_b = C.pair_next(s, phone_b, "iPhone 15", 1, timeout=60)
     kept = C.push_tokens(s)
     note_started(s)
@@ -303,7 +303,7 @@ def run_revoked_legacy(s, old):
     sid_a, pid = s.relay.latest().id, C.client_pid(s)
     s.bind(sid_a, device_label="Pixel 9a")
     _opened, hmd_a = C.phone_state(s, s.phone, sid_a)
-    pushed = C.register_push(s, s.phone, hmd_a, sid_a, TOKEN_A, "0123456789abcdef")  # gitleaks:allow
+    pushed = C.register_push(s, s.phone, hmd_a, sid_a, TOKEN_A, "aaaaaaaaaaaaaaaa")
     devices = listed(s)
     dev_id = devices[0]["id"] if len(devices) == 1 else None
     note_started(s)

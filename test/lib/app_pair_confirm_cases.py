@@ -2168,13 +2168,13 @@ def case_device_push():
         sid_a = s.relay.latest().id
         s.bind(sid_a, device_label="Pixel 9a")
         _opened, hmd_a = phone_state(s, s.phone, sid_a)
-        T.check(register_push(s, s.phone, hmd_a, sid_a, token_a, "0123456789abcdef") and push_tokens(s) == [token_a],
+        T.check(register_push(s, s.phone, hmd_a, sid_a, token_a, "aaaaaaaaaaaaaaaa") and push_tokens(s) == [token_a],
                 "M6. (setup) the first phone registers its push token", "tokens %r" % (push_tokens(s),))
         _proc, sid_b, _opened_b, hmd_b = add_phone(s, phone_b, "iPhone 15", 1)
         T.check(sid_b is not None and push_tokens(s) == [token_a],
                 "M6. an added phone pairing does not clear the first phone's push registration (only an earlier session's goes)",
                 "tokens %r" % (push_tokens(s),))
-        T.check(sid_b is not None and register_push(s, phone_b, hmd_b, sid_b, token_b, "fedcba9876543210")
+        T.check(sid_b is not None and register_push(s, phone_b, hmd_b, sid_b, token_b, "bbbbbbbbbbbbbbbb")
                 and push_tokens(s) == sorted([token_a, token_b]),
                 "M6. each phone has its own registration in the one signed store", "tokens %r" % (push_tokens(s),))
         run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "iPhone 15"], s.env(HMD_TAILSCALE_BIN="/usr/bin/false"), timeout=120)
