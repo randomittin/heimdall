@@ -16,7 +16,9 @@
 #   selected  = a suite is selected when it references a changed path, or the basename of a changed bin/ script or module (the
 #               suite file AND the test/lib helpers it uses are searched), or is itself a changed test file. The set of changed
 #               paths is first widened through scripts that call/source a changed script (a suite that runs tool-b never names
-#               bin/lib/shared.sh, which tool-b sources).
+#               bin/lib/shared.sh, which tool-b sources). "References" means a WHOLE-TOKEN match (`rr` is not in "error", `heimdall`
+#               is not in `heimdall-state`), and a script that only mentions a changed one in a COMMENT is not a caller of it. Both
+#               loosenesses turned a 3-file diff into "516 of 517 suites" on 2026-10-12: a comment chain reached the dispatcher.
 #   escalate  = ALWAYS a full sweep when the diff touches test/gate infrastructure (HMD_SWEEP_INFRA_RE), exceeds
 #               HMD_SWEEP_LIMIT_FILES files, would select more than HMD_SWEEP_LIMIT_SELECTED_PCT percent of the suites, or the
 #               base is more than HMD_SWEEP_LIMIT_BASE_DAYS days / HMD_SWEEP_LIMIT_BASE_COMMITS commits old, or is not an ancestor
@@ -44,6 +46,9 @@ HMD_SWEEP_LIMIT_BASE_DAYS=7
 # hook auto-commits (journal, ledger checkpoints) inflate the commit count of an otherwise small diff, so this is generous;
 # the file and age limits are the ones that normally bind.
 HMD_SWEEP_LIMIT_BASE_COMMITS=200
+# Widening that fans out past this many names has reached a hub (a dispatcher, a registry): nothing narrow comes of it, and searching
+# hundreds of names takes minutes (measured: 926 names, 75 s). The selection then is every suite, so the run escalates -- and says why.
+HMD_SWEEP_WIDEN_MAX_NAMES=200
 
 # Test infrastructure and the receipt/gate code: a change here can alter what EVERY suite proves, so it is never incremental.
 HMD_SWEEP_INFRA_RE='test/run-all\.sh|test/lib/.*|hooks/hooks\.json|hooks/hooks\.metadata\.json|\.heimdall/hooks/.*|bin/heimdall-state|bin/heimdall-precheck-bash|bin/heimdall-gate-run|bin/lib/hook-owned-path\.sh|bin/lib/sweep-chain\.sh|release/ship\.sh'
@@ -95,12 +100,34 @@ hmd_sweep_rules_violation() {
   return 0
 }
 
+# hmd_sweep_name_regex NAMES_FILE -- ONE extended regex (on stdout) matching any line of NAMES_FILE as a WHOLE TOKEN: the character before
+#   the name and the one after it must not continue a file name (letters, digits, `_`, `.`, `-`; a `.` that ends a sentence does not count).
+#   Plain substring matching put `rr` (bin/rr) inside "error" and `heimdall` (bin/heimdall) inside every heimdall-* name, which is how a
+#   three-file diff selected 516 of 517 suites on 2026-10-12. Prints nothing and returns 1 when NAMES_FILE holds no name.
+hmd_sweep_name_regex() {
+  local alt
+  alt="$(sed '/^$/d; s/[][\\.*+?(){}|^$]/\\&/g' "$1" | paste -sd'|' -)"
+  [ -n "$alt" ] || return 1
+  printf '(^|[^A-Za-z0-9_.-])(%s)($|[^A-Za-z0-9_.-]|\\.($|[^A-Za-z0-9_]))' "$alt"
+}
+
+# hmd_sweep_callers REPO REGEX_FILE -- the code files (bin, hooks, sentinels, release, adapters, install.sh) that RUN or SOURCE a name matched
+#   by REGEX_FILE. A match on a comment-only line is a remark, not a call: on 2026-10-12 four scripts that only mentioned
+#   bin/heimdall-conformance in a comment became its "callers", one of them led on to the dispatcher bin/heimdall, and the dispatcher's
+#   name is in every suite. `#!` interpreter lines and C `#include`s are code, so they still count.
+hmd_sweep_callers() {
+  git -C "$1" grep --no-color -nIE -f "$2" -- bin hooks sentinels release adapters install.sh 2>/dev/null | awk '
+    { f = $0; sub(/:.*/, "", f); l = $0; sub(/^[^:]*:[0-9]+:/, "", l)
+      if (f !~ /\.[ch]$/ && l ~ /^[ \t]*#[^!]/) next
+      if (!(f in seen)) { seen[f] = 1; print f } }'
+}
+
 # hmd_sweep_select REPO BASE HEAD WORKDIR [CARRIED_FILE]
 #   Writes WORKDIR/changed.txt (the diff) and WORKDIR/selected.txt (suite basenames to run, one per line); prints the reason.
 #   CARRIED_FILE lists suites that were red last time (one basename per line); those still on disk are always included.
 hmd_sweep_select() {
   local repo="$1" base="$2" head="$3" work="$4" carried="${5:-}"
-  local pat="$work/patterns.txt" hits="$work/hits.txt" refs="$work/refs.txt" libpat="$work/libpat.txt"
+  local pat="$work/patterns.txt" hits="$work/hits.txt" refs="$work/refs.txt" libpat="$work/libpat.txt" re="$work/regex.txt"
   local p r l round added nchanged nsel ncarry=0
   hmd_sweep_changed_files "$repo" "$base" "$head" > "$work/changed.txt"
   : > "$pat"
@@ -113,11 +140,12 @@ hmd_sweep_select() {
     esac
   done < "$work/changed.txt"
 
-  # Widen through the code that calls or sources a changed file (three hops at most): a suite runs tool-b, never the lib it sources.
+  # Widen through the code that runs or sources a changed file (three hops at most): a suite runs tool-b, never the lib it sources.
   round=0
-  while [ "$round" -lt 3 ] && [ -s "$pat" ]; do
+  while [ "$round" -lt 3 ] && [ -s "$pat" ] && [ "$(wc -l < "$pat" | tr -d ' ')" -le "$HMD_SWEEP_WIDEN_MAX_NAMES" ]; do
     round=$((round + 1)); added=0
-    git -C "$repo" grep -lF -f "$pat" -- bin hooks sentinels release adapters install.sh > "$refs" 2>/dev/null || true
+    hmd_sweep_name_regex "$pat" > "$re" || break
+    hmd_sweep_callers "$repo" "$re" > "$refs" || true
     while IFS= read -r r; do
       [ -n "$r" ] || continue
       if grep -qxF -- "$r" "$pat"; then continue; fi
@@ -126,10 +154,19 @@ hmd_sweep_select() {
     [ "$added" -eq 1 ] || break
   done
 
-  # Suites (and the test/lib helpers they use) that mention any of it.
+  nchanged="$(wc -l < "$work/changed.txt" | tr -d ' ')"
+  r="$(wc -l < "$pat" | tr -d ' ')"
+  if [ "$r" -gt "$HMD_SWEEP_WIDEN_MAX_NAMES" ]; then
+    ( cd "$repo" && ls test/*.test.sh 2>/dev/null ) | sed 's#^test/##' | sort -u > "$work/selected.txt"
+    printf '%s changed file(s), hook-owned paths excluded; the code that calls them fans out to %s names (limit %s), which is a hub -- every suite is selected' \
+      "$nchanged" "$r" "$HMD_SWEEP_WIDEN_MAX_NAMES"
+    return 0
+  fi
+
+  # Suites (and the test/lib helpers they use) that mention any of it. A comment counts here, unlike above: a suite's header names what it tests.
   : > "$hits"
-  if [ -s "$pat" ]; then
-    ( cd "$repo" && grep -lsF -f "$pat" -- test/*.test.sh test/lib/* 2>/dev/null ) | sort -u > "$hits" || true
+  if [ -s "$pat" ] && hmd_sweep_name_regex "$pat" > "$re"; then
+    ( cd "$repo" && grep -lsE -f "$re" -- test/*.test.sh test/lib/* 2>/dev/null ) | sort -u > "$hits" || true
   fi
   round=0
   while [ "$round" -lt 3 ]; do
@@ -138,7 +175,8 @@ hmd_sweep_select() {
       case "$l" in test/lib/*) printf '%s\n' "${l##*/}" >> "$libpat" ;; esac
     done < "$hits"
     [ -s "$libpat" ] || break
-    ( cd "$repo" && grep -lsF -f "$libpat" -- test/*.test.sh test/lib/* 2>/dev/null ) | sort -u > "$work/hits.more" || true
+    hmd_sweep_name_regex "$libpat" > "$re" || break
+    ( cd "$repo" && grep -lsE -f "$re" -- test/*.test.sh test/lib/* 2>/dev/null ) | sort -u > "$work/hits.more" || true
     cat "$hits" "$work/hits.more" | sort -u > "$work/hits.next"
     if cmp -s "$hits" "$work/hits.next"; then break; fi
     mv "$work/hits.next" "$hits"

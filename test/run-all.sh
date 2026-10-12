@@ -63,6 +63,8 @@
 #   test/run-all.sh --no-retry          # do not re-run reds serially
 #   test/run-all.sh --since-green       # INCREMENTAL: only the suites a diff since the last green FULL sweep can
 #                                       # affect (see "Incremental sweeps" below); escalates to a full sweep itself
+#   test/run-all.sh --dry-run           # print which suites WOULD run (with --since-green: the selection, its reason, or the
+#                                       # escalation) and stop: no suite, no receipt, no lock, no sweep marker
 #   HMD_TEST_NO_PY_PIN=1 test/run-all.sh   # leave python3 alone (default: pinned to the real interpreter
 #                                       # when it resolves through a shim; see PYTHON3 PIN below)
 #
@@ -75,7 +77,8 @@
 #   full         every suite. A GREEN, clean one is also kept as receipts/last-full-green.json -- the chain anchor.
 #   incremental  base = the anchor's HEAD; diff base..HEAD (hook-owned paths excluded; the tree must be clean). A suite is
 #                selected when it names a changed path or the basename of a changed bin/ script or module (the suite and the
-#                test/lib helpers it uses are searched; scripts that call a changed script widen the set), or is itself a
+#                test/lib helpers it uses are searched; scripts that call a changed script widen the set; a name matches only as
+#                a WHOLE token, and a script that merely mentions a changed one in a comment is no caller of it), or is itself a
 #                changed test file; a suite that was red in the previous run is always carried forward. The receipt records
 #                base_full_sha, suites_run and the selection reason. Cumulative: it always diffs from the full green.
 #   (a --filter run is neither: its receipt goes to receipts/last-filtered.json and never reaches the push gate.)
@@ -117,6 +120,7 @@ case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
 [ "$JOBS" -gt 6 ] && JOBS=6
 [ "$JOBS" -lt 1 ] && JOBS=1
 SINCE_GREEN=0
+DRY_RUN=0
 
 # ── SYSTEM LOAD / CORE CAPTURE (instrumentation only — never a gate) ─────────────────────
 # WHY THIS EXISTS: a real sweep went RED (6 FAIL, 8 TIMEOUT, 7410s wall clock) on a box
@@ -187,6 +191,7 @@ while [ $# -gt 0 ]; do
     --min)          MIN_SUITES="${2:-100}"; shift 2 ;;
     --filter)       FILTER="${2:-}"; shift 2 ;;
     --since-green)  SINCE_GREEN=1; shift ;;
+    --dry-run)      DRY_RUN=1; shift ;;
     -h|--help)      sed -n '2,/^set -uo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "run-all: unknown argument '$1' (try --help)" >&2; exit 2 ;;
   esac
@@ -456,7 +461,8 @@ _sweep_lock_acquire() {
   echo "         Wait for it (lock: $SWEEP_LOCK_FILE)${holder_pid:+, or stop it first: kill $holder_pid}. Refusing to start." >&2
   exit 4
 }
-_sweep_lock_acquire
+# A dry run executes nothing and writes nothing, so it neither needs the lock nor may be refused by a sweep that holds it.
+[ "$DRY_RUN" -eq 1 ] || _sweep_lock_acquire
 
 # ── INCREMENTAL SELECTION (--since-green) ─────────────────────────────────────────────────
 # Narrows ALL to the suites a diff since the last green FULL sweep can affect, or leaves it whole and says why (an escalation is
@@ -465,9 +471,18 @@ SWEEP_KIND=full; [ -n "$FILTER" ] && SWEEP_KIND=filtered
 ESC_REASON=""
 INC_BASE_SHA=""; INC_HEAD_SHA=""; INC_NOW=0; INC_FILES=0; INC_SELECTED=0; INC_REASON=""
 INC_MAX_FILES=0; INC_MAX_PCT=0; INC_MAX_DAYS=0; INC_MAX_COMMITS=0
+# _list_suites FILE LABEL LIMIT -- the first LIMIT names in FILE (one per line) as "LABEL name", then how many more there are.
+_list_suites() {
+  local total
+  total="$(wc -l < "$1" | tr -d ' ')"
+  sed -n "1,${3}p" "$1" | sed "s/^/             $2 /"
+  [ "$total" -le "$3" ] || echo "             ... and $((total - $3)) more"
+}
 _since_green_select() {
   local lib="$REPO/bin/lib/sweep-chain.sh" anchor="$RECEIPT_DIR/last-full-green.json"
   local head base dirty reason="" sel_work sel_reason nsel nfiles a_repo a_rc a_clean a_kind carried="" p
+  local list_max=30                                  # how many suites a run prints; a dry run exists to read the list, so it prints all
+  [ "$DRY_RUN" -eq 1 ] && list_max=100000
   if [ ! -r "$lib" ]; then
     echo "run-all: --since-green needs $lib (the selection policy shared with the push gate) -- not found" >&2; exit 2
   fi
@@ -516,6 +531,10 @@ _since_green_select() {
     nfiles="$(wc -l < "$sel_work/changed.txt" | tr -d ' ')"
     if [ $((nsel * 100)) -gt $((INC_MAX_PCT * GLOB_COUNT)) ]; then
       reason="${nsel} of the ${GLOB_COUNT} suites would be re-run, over the ${INC_MAX_PCT}% limit -- a change that wide is a full sweep"
+      # Say what drove it, so a surprising escalation can be read off the run instead of re-derived: the reason and a sample of the selection.
+      echo "incremental: HEAD ${head:0:12} vs the last green full sweep ${base:0:12} -> ${nsel} of ${GLOB_COUNT} suites would be selected"
+      echo "             ${sel_reason}"
+      _list_suites "$sel_work/selected.txt" "would select" "$list_max"
     else
       ALL=()
       while IFS= read -r p; do [ -n "$p" ] && ALL+=("$REPO/test/$p"); done < "$sel_work/selected.txt"
@@ -523,7 +542,7 @@ _since_green_select() {
       INC_BASE_SHA="$base"; INC_HEAD_SHA="$head"; INC_FILES="$nfiles"; INC_SELECTED="$nsel"; INC_REASON="$sel_reason"
       echo "incremental: HEAD ${head:0:12} vs the last green full sweep ${base:0:12} -> ${nsel} of ${GLOB_COUNT} suites selected"
       echo "             ${sel_reason}"
-      if [ "$nsel" -gt 0 ]; then sed 's/^/             select /' "$sel_work/selected.txt" | sed -n '1,30p'; fi
+      _list_suites "$sel_work/selected.txt" select "$list_max"
     fi
     rm -rf "$sel_work"
   fi
@@ -552,6 +571,18 @@ TO_RUN=${#RUN[@]}
 if [ "$TO_RUN" -eq 0 ] && [ "$SWEEP_KIND" != incremental ]; then
   echo "${RED}${BLD}FATAL${OFF} every discovered suite was classified live — nothing would run." >&2
   exit 3
+fi
+
+# ── DRY RUN: the plan, then stop ─────────────────────────────────────────────────────────
+# Before WORK, the traps, the gate marker, the snapshots and the receipts exist: nothing below this point has happened. An incremental
+# selection printed its own reason and list above; a full one lists its first suites here.
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "dry run: ${TO_RUN} suite(s) would run (${SWEEP_KIND}); ${#SKIP[@]} skipped as live. Nothing was executed; no receipt, lock or sweep marker was written."
+  if [ "$SWEEP_KIND" != incremental ] && [ "$TO_RUN" -gt 0 ]; then
+    printf '%s\n' "${RUN[@]}" | sed 's#.*/#             would run #' | sed -n '1,30p'
+    [ "$TO_RUN" -le 30 ] || echo "             ... and $((TO_RUN - 30)) more"
+  fi
+  exit 0
 fi
 
 WORK="$(mktemp -d -t heimdall-run-all.XXXXXX)"

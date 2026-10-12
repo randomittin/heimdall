@@ -9,7 +9,9 @@
 #
 # Proven here, against throwaway git repos holding the REAL run-all.sh / bin/heimdall-state / release/ship.sh and fake suites:
 #   A  selection: an unaffected suite is skipped; a suite naming a changed path, a changed test file, or a script a changed
-#      module feeds is selected; a red suite from the previous run is carried forward
+#      module feeds is selected; a red suite from the previous run is carried forward. A script that only REMARKS on a changed
+#      one in a comment is no caller (the 2026-10-12 incident: a comment chain reached the dispatcher and selected 516 of 517
+#      suites), a name matches only as a WHOLE token (bin/rr is not "error"), and --dry-run prints the selection and runs nothing
 #   B  escalation to a full sweep: test/gate infrastructure touched, base too old, too many files, too large a selection,
 #      no green full base at all; a dirty tree is refused (an incremental receipt must describe HEAD)
 #   C  the gate: accepts a chained incremental (hook-owned-path exemption intact), rejects an unchained one, and asks for
@@ -61,6 +63,14 @@ LINT_WAIVER="fixture: run-all-incremental proves sweep receipts, not lint eviden
 
 # ── fixture: a repo with the real tools plus 12 fake suites; alpha/beta/gamma each name one thing a diff can touch ───────
 SUITES="alpha beta gamma f01 f02 f03 f04 f05 f06 f07 f08 f09"
+mksuite() { # dir name ref -- a fixture suite whose header comment names what it "exercises"; it logs itself to $MARKLOG when it runs
+  local d="$1" s="$2" ref="$3"
+  printf '%s\n' '#!/usr/bin/env bash' "# fixture suite $s -- exercises: $ref" \
+    '[ -n "${MARKLOG:-}" ] && echo '"$s"' >> "$MARKLOG"' \
+    '[ "${SLOW_SUITE:-}" = '"$s"' ] && sleep "${SLOW_SECS:-0}"' \
+    '[ "${FAIL_SUITE:-}" = '"$s"' ] && { echo "  FAIL assertion in '"$s"'"; echo "0 passed, 1 failed"; exit 1; }' \
+    'echo "1 passed, 0 failed"' > "$d/test/$s.test.sh"
+}
 mkfix() { # dir [commit-date]
   local d="$1" s ref
   mkdir -p "$d/test/lib" "$d/bin/lib" "$d/docs" "$d/hooks"
@@ -76,11 +86,7 @@ mkfix() { # dir [commit-date]
   echo "# helper" > "$d/test/lib/helper.sh"; echo '{}' > "$d/hooks/hooks.json"
   for s in $SUITES; do
     case "$s" in alpha) ref="bin/tool-a" ;; beta) ref="bin/tool-b" ;; gamma) ref="docs/guide.md" ;; *) ref="nothing" ;; esac
-    printf '%s\n' '#!/usr/bin/env bash' "# fixture suite $s -- exercises: $ref" \
-      '[ -n "${MARKLOG:-}" ] && echo '"$s"' >> "$MARKLOG"' \
-      '[ "${SLOW_SUITE:-}" = '"$s"' ] && sleep "${SLOW_SECS:-0}"' \
-      '[ "${FAIL_SUITE:-}" = '"$s"' ] && { echo "  FAIL assertion in '"$s"'"; echo "0 passed, 1 failed"; exit 1; }' \
-      'echo "1 passed, 0 failed"' > "$d/test/$s.test.sh"
+    mksuite "$d" "$s" "$ref"
   done
   git -C "$d" add -A
   if [ -n "${2:-}" ]; then GIT_AUTHOR_DATE="$2" GIT_COMMITTER_DATE="$2" git -C "$d" commit -qm "fixture"
@@ -167,6 +173,71 @@ eq "A5c the red run recorded its non-green suites" "$(rj "$(LAST "$F")" '.non_gr
 runit "$F" --since-green
 eq "A5d the incremental run re-ran alpha (changed) AND f05 (red last time)" "$(ran "$F")" "alpha f05"
 has "A5e the reason says why f05 was included" "$(rj "$(LAST "$F")" '.selection.reason')" "carried"
+
+echo "-- A6. the 2026-10-12 incident: one bin script + two test files + hook-owned commits select ONLY what they touch --"
+# The real diff (9604b229..079423b5) was bin/heimdall-conformance, test/conflict-log.test.sh, test/ship-guard-order.test.sh and a hook-owned
+# journal entry, and `--since-green` escalated: "516 of the 517 suites would be re-run". The mechanism, in miniature: bin/leaf merely REMARKS
+# on bin/conformer in a comment, bin/hub (the dispatcher) runs bin/leaf, so leaf and then hub counted as callers of conformer -- and the bare
+# name `hub` is in nearly every suite. 18 suites mention `hub`; 32 suites in all, so the 20% rule (6 suites) has room to tell narrow from wide.
+newincident() { # name -> FIX: the shape above, committed, with a green FULL baseline sweep on top
+  local i
+  FIX="$WORK/$1"; mkfix "$FIX"
+  printf '#!/bin/sh\necho conformer\n' > "$FIX/bin/conformer"
+  printf '%s\n' '#!/bin/sh' '# bin/conformer already walks the transcript this way; this remark is all the script says about it.' 'echo leaf' > "$FIX/bin/leaf"
+  printf '%s\n' '#!/bin/sh' 'exec "$(dirname "$0")/leaf" "$@"' > "$FIX/bin/hub"
+  mksuite "$FIX" conf "bin/conformer"
+  mksuite "$FIX" jr ".planning/journal .planning/ledger/checkpoints"
+  for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18; do mksuite "$FIX" "g$i" "hub fixture"; done
+  cm "$FIX" "incident shape"
+  ( cd "$FIX" && HEIMDALL_STATE_FILE="$FIX.state.json" "$STATE_BIN" init >/dev/null 2>&1 \
+    && HMD_LINT_WAIVER="$LINT_WAIVER" HEIMDALL_STATE_FILE="$FIX.state.json" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
+  runit "$FIX"
+}
+newincident a6; F="$FIX"
+eq "A6 baseline: all 32 suites ran green" "$RC:$(ran "$F" | wc -w | tr -d ' ')" "0:32"
+touchfile "$F" bin/conformer; touchfile "$F" test/f01.test.sh; touchfile "$F" test/f02.test.sh
+mkdir -p "$F/.planning/journal" "$F/.planning/ledger/checkpoints"
+echo entry > "$F/.planning/journal/2026-10-12-haid_x.md"; echo '{}' > "$F/.planning/ledger/checkpoints/haid_x.json"
+cm "$F" "conformer + two test files + hook-owned journal and ledger"
+runit "$F" --since-green
+eq "A6a exit 0" "$RC" "0"
+lacks "A6b the run did not escalate" "$OUT" "ESCALATED"
+eq "A6c ONLY the suite naming bin/conformer and the two changed test files ran" "$(ran "$F")" "conf f01 f02"
+eq "A6d the receipt is incremental" "$(rj "$(LAST "$F")" '.kind')" "incremental"
+has "A6e hook-owned journal and ledger paths are not part of the diff: 3 changed files" "$(rj "$(LAST "$F")" '.selection.reason')" "3 changed file(s)"
+has "A6f the run prints the selected list" "$OUT" "select conf.test.sh"
+newincident a6w; F="$FIX"
+touchfile "$F" bin/hub; cm "$F" "edit the dispatcher itself"
+runit "$F" --since-green
+has "A6g a change to a file 18 of 32 suites name is a genuinely wide one: the run escalates" "$OUT" "ESCALATED TO FULL"
+eq "A6h all 32 suites ran" "$(ran "$F" | wc -w | tr -d ' ')" "32"
+has "A6i the escalation prints WHY the selection was too wide" "$OUT" "would select"
+
+echo "-- A7. a name matches only as a WHOLE token: bin/rr is not in 'error', and not in bin/rr-extra --------"
+F="$WORK/a7"; mkfix "$F"
+printf '#!/bin/sh\necho rr\n' > "$F/bin/rr"; printf '#!/bin/sh\necho extra\n' > "$F/bin/rr-extra"
+mksuite "$F" rrrun "bin/rr"; mksuite "$F" rrdot "see bin/rr."; mksuite "$F" rrextra "bin/rr-extra"; mksuite "$F" errmsg "error handling"
+cm "$F" "rr fixtures"
+( cd "$F" && HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" init >/dev/null 2>&1 && HMD_LINT_WAIVER="$LINT_WAIVER" HEIMDALL_STATE_FILE="$F.state.json" "$STATE_BIN" mark-clean >/dev/null 2>&1 )
+runit "$F"
+touchfile "$F" bin/rr; cm "$F" "edit rr"
+runit "$F" --since-green
+eq "A7a only the suites that name bin/rr ran (a sentence-final period still ends the name)" "$(ran "$F")" "rrdot rrrun"
+eq "A7b the receipt is incremental" "$(rj "$(LAST "$F")" '.kind')" "incremental"
+
+echo "-- A8. --dry-run prints the selection and runs nothing: no suite, no receipt ---------------------------"
+newincident a8; F="$FIX"
+touchfile "$F" bin/conformer; cm "$F" "edit conformer"
+BEFORE="$(cat "$(LAST "$F")")"
+runit "$F" --since-green --dry-run
+eq "A8a exit 0" "$RC" "0"
+eq "A8b no suite ran" "$(ran "$F")" ""
+eq "A8c the receipt the push gate reads is untouched" "$(cat "$(LAST "$F")")" "$BEFORE"
+has "A8d it lists the selected suite" "$OUT" "select conf.test.sh"
+has "A8e it says nothing was executed" "$OUT" "dry run"
+runit "$F" --dry-run
+eq "A8f a plain --dry-run runs nothing either" "$RC:$(ran "$F")" "0:"
+has "A8g and counts what a full sweep would run" "$OUT" "32 suite(s) would run"
 
 # ══ B. ESCALATION ═════════════════════════════════════════════════════════════════════════════════════════════════════
 echo "-- B1. test infrastructure changed: a full sweep, whatever else the diff holds -------------------"
