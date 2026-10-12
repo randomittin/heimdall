@@ -974,7 +974,12 @@ assert rig.command("register_push", dict(GOOD)) == {"ok": False, "of_seq": 1, "d
 assert rig.command("app_state", {"state": "active"}) == {"ok": False, "of_seq": 2, "detail": "write-failed"}
 assert rig.command("unregister_push", {"ref": GOOD["ref"]}) == {"ok": True, "of_seq": 3, "ref": GOOD["ref"], "removed": False}
 assert [c["detail"] for c in rig.events("command")] == ["write-failed", "write-failed", None]
-assert not rig.events("error"), rig.events("error")
+# The one error event the unwritable directory also causes, and the only one allowed: the bound phone's own record
+# (bin/lib/hmd_devices.py) lives under .heimdall/app too, so the bind could not write it either. It is reported, never a reason
+# to drop the pairing, and it names only the path component -- not the token, the ref, the label or anything else the phone sent.
+import errno
+errors = rig.events("error")
+assert [e["detail"] for e in errors] == ["device record not written: [Errno %d] %s: 'app'" % (errno.ENOTDIR, os.strerror(errno.ENOTDIR))], errors
 assert GOOD["token"] not in rig.out.getvalue()
 PYEOF
 
