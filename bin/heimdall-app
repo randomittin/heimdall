@@ -3001,12 +3001,34 @@ _stop_recorded_ui() {
   return 0
 }
 
+# _disconnect_gone_device REPO WANTED -- `hmd app disconnect --device` for a phone no running client serves. A client that crashed took its
+# relay session token with it -- the token lives in that client's memory, never on disk -- so that session cannot be revoked from here, and
+# this says so and exits 1 rather than let a local cleanup pass for a revoke. The phone's record and push registrations ARE removed
+# (hmd_devices.py forget), so it stops being listed and notified. 1 as well for a name no phone has, 2 for one that fits several.
+_disconnect_gone_device() {
+  local repo="$1" wanted="$2" found rc id
+  found="$("$PY3" "$LIB_DIR/hmd_devices.py" resolve --dead --repo "$repo" "$wanted" 2>/dev/null)"
+  rc=$?
+  case "$rc" in
+    0) ;;
+    2) echo "hmd app disconnect: more than one paired device is called '$(_clean_text "$wanted")' -- name one by its id" >&2; return 2 ;;
+    *) echo "hmd app disconnect: no paired device '$(_clean_text "$wanted")' -- hmd app status lists the paired ones" >&2; return 1 ;;
+  esac
+  id="${found%% *}"
+  if "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$repo" "$id" >/dev/null 2>&1; then
+    echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): its client is not running, so its relay session could NOT be revoked from here -- it stays open until it expires (hmd app identity revoke signs every phone out); its record and push registrations were removed" >&2
+  else
+    echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): its client is not running, so its relay session could NOT be revoked from here, and its push registrations could not be removed either -- run this again (hmd app identity revoke signs every phone out)" >&2
+  fi
+  return 1
+}
+
 # _disconnect_device REPO WANTED -- `hmd app disconnect --device`: revoke ONE phone. WANTED is its label (any case) or its id, as `hmd app
 # status` lists them. The relay client serving that phone is asked (SIGUSR1) to revoke its relay session -- which invalidates that phone's
 # token at the relay -- and to end; its record and the push registrations only it held go with it. Every other phone's client, the
 # window and the ui are left alone. 1 for no such device, 2 for a name that fits several (name one by its id).
 _disconnect_device() {
-  local repo="$1" wanted="$2" found rc id pid repo_real
+  local repo="$1" wanted="$2" found rc id pid repo_real sig
   if [ -z "$wanted" ]; then
     echo "hmd app disconnect: --device needs a device label or id (hmd app status lists them)" >&2
     return 2
@@ -3017,25 +3039,33 @@ _disconnect_device() {
   case "$rc" in
     0) ;;
     2) echo "hmd app disconnect: more than one paired device is called '$(_clean_text "$wanted")' -- name one by its id (hmd app status lists them)" >&2; return 2 ;;
-    *) echo "hmd app disconnect: no paired device '$(_clean_text "$wanted")' -- hmd app status lists the paired ones" >&2; return 1 ;;
+    *) _disconnect_gone_device "$repo" "$wanted"; return $? ;;
   esac
   id="${found%% *}"
   pid="${found##* }"
+  # SIGUSR1 revokes the phone of a client that has the handler; a client started by v2.4.6 or earlier has none (USR1 would end it with
+  # no revoke), so its phone is revoked with TERM, which that client answers by revoking its session and ending (hmd_devices.py signal)
+  sig="$("$PY3" "$LIB_DIR/hmd_devices.py" signal --repo "$repo" "$id" 2>/dev/null)"
+  case "$sig" in TERM|USR1) ;; *) sig=USR1 ;; esac
   repo_real="$(_real_dir "$repo")"
   rc=0
   # A14: verify identity before signaling -- a recycled pid must never take an unrelated process down with it.
   if _pid_is_relay_client "$pid" "$repo_real"; then
-    _relay_stop_client "$pid" USR1
+    _relay_stop_client "$pid" "$sig"
     rc=$?
   else
     echo "hmd app disconnect: pid $pid of device $id is not a heimdall-relay-client process of this repo -- not signalling it" >&2
     rc=1
   fi
-  "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$repo" "$id" >/dev/null 2>&1 || true
+  # the push registrations go before success is reported: a revoke that left them would keep notifying the phone it revoked
+  local frc=0
+  "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$repo" "$id" >/dev/null 2>&1 || frc=1
+  [ "$frc" -eq 0 ] || echo "hmd app disconnect: device $id: its push registrations could not be removed, so it may still be notified and its record is kept -- run this again" >&2
   if [ "$rc" -ne 0 ]; then
     echo "hmd app disconnect: revoke of device $id may not have reached the relay -- its session stays open until its token expires" >&2
     return "$rc"
   fi
+  [ "$frc" -eq 0 ] || return 1
   echo "hmd app disconnect: revoked device $id ($(_clean_text "$wanted")) -- the other devices stay connected"
 }
 
@@ -3060,9 +3090,15 @@ cmd_disconnect() {
     _disconnect_device "$REPO" "$DEVICE"
     return $?
   fi
-  local connect_doc repo_real vrc pw_stopped
+  local connect_doc repo_real vrc pw_stopped devs=""
   connect_doc="$(_connect_doc "$REPO")"
   repo_real="$(_real_dir "$REPO")"
+  # every phone paired right now, listed before anything below ends a client (the pair windows closed next end them too, and a list names
+  # running clients only): the relay path forgets each of them once its client is gone -- its push registrations removed, a record that a
+  # client older than the records left behind tombstoned
+  if [ -n "$PY3" ]; then
+    devs="$("$PY3" "$LIB_DIR/hmd_devices.py" list --repo "$REPO" 2>/dev/null | jq -r '.[] | "\(.id) \(.pid)"' 2>/dev/null)" || devs=""
+  fi
   if [ -z "$connect_doc" ] && [ -n "$(_connect_loose_note "$REPO")" ]; then
     _state_remove "$REPO" connect.json
     echo "hmd app disconnect: removed a leftover connect.json that backed no running relay client or ui of this repo"
@@ -3074,7 +3110,7 @@ cmd_disconnect() {
   _stop_device_clients "$REPO" "$repo_real" || true  # every phone's client, an added one too: each revokes its own relay session
 
   if [ "$(_doc_field "$connect_doc" .mode)" = "relay" ]; then
-    cmd_disconnect_relay "$REPO" "$repo_real" "$connect_doc"
+    cmd_disconnect_relay "$REPO" "$repo_real" "$connect_doc" "$devs"
     return $?
   fi
 
@@ -3155,7 +3191,7 @@ cmd_disconnect_relay() {
   pid_client="$(_doc_field "$doc" .pid_client)"
   case "$pid_ui" in ''|*[!0-9]*) pid_ui="" ;; esac
   case "$pid_client" in ''|*[!0-9]*) pid_client="" ;; esac
-  local rc=0
+  local rc=0 did dpid devs="${4:-}"  # devs: "<id> <pid>" per phone paired when this disconnect began, listed by cmd_disconnect before any client went
   # every phone's client, an added one too: each revokes its own relay session on TERM
   _stop_device_clients "$REPO" "$repo_real" || rc=$?
 
@@ -3171,6 +3207,13 @@ cmd_disconnect_relay() {
   if [ "$rc" -ne 0 ]; then
     echo "hmd app disconnect: revoke may not have reached the relay -- the pairing session stays open until its token expires" >&2
   fi
+  # every phone that was bound goes from the records now that its client is gone -- a client older than the records removed none of it --
+  # and one whose push registrations cannot be removed is reported, never counted as disconnected
+  while read -r did dpid; do
+    [ -n "$did" ] || continue
+    "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$REPO" "$did" >/dev/null 2>&1 \
+      || { echo "hmd app disconnect: device $did: its push registrations could not be removed, so it may still be notified and its record is kept" >&2; rc=1; }
+  done <<<"$devs"
 
   _stop_recorded_ui "$pid_ui" "$repo_real"
 
