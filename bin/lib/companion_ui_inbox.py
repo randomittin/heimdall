@@ -808,17 +808,43 @@ def _companion_connected(root):
     return bool(pids) and all(_own_live_pid(p) for p in pids)
 
 
-def wake_armed(root):
-    """True when bin/heimdall-inbox-wake has a watcher armed for a live session of this user AND a companion is
-    connected: the two things its `watch` needs before it wakes anything. The session shows up as
-    .heimdall/ui/wake/<pid>.json (`register`, at SessionStart: names that pid), a <pid>.lock some process holds an
-    exclusive flock on (the watcher, for as long as it lives: the kernel frees it on any death) and a pid that is
-    still alive. Every file is judged by the rules the hook writes it under -- ours, 0600, a regular file, never a
-    link -- so one dropped into a checkout cannot claim a wake. Anything unreadable is "not armed"."""
+PANE_RE = re.compile(r"^%[0-9]{1,9}$")   # a tmux pane id as TMUX_PANE spells it: what bin/heimdall-inbox-wake records and types into
+
+
+def _valid_socket(sock):
+    """The first field of $TMUX as bin/heimdall-inbox-wake accepts it: an absolute path with no "..", no newline and a sane length."""
+    return isinstance(sock, str) and sock.startswith("/") and ".." not in sock and "\n" not in sock and len(sock) < 512
+
+
+def _pane_opted_in(reg, entries):
+    """True when this registered session's own pane and socket -- what `register` recorded from the session's environment -- are
+    one connect.json's `tmux` list names (`hmd app connect --tmux`, which checked them against tmux itself before writing the
+    list). The match the wake applies itself (tmux_optin): by pane and socket, never by the pid in an entry, so the opt-in
+    follows the pane across a Claude Code restart."""
+    pane, sock = reg.get("tmux_pane"), reg.get("tmux_socket")
+    if not (isinstance(pane, str) and PANE_RE.match(pane) and _valid_socket(sock)):
+        return False
+    return any(isinstance(e, dict) and e.get("pane") == pane and e.get("socket") == sock for e in entries)
+
+
+def wake_path(root):
+    """None, "wake" or "tmux": how bin/heimdall-inbox-wake would reach an idle session of this repo, read from the files it leaves.
+    None unless it has a watcher armed for a live session of this user AND a companion is connected: the two things its `watch`
+    needs before it wakes anything. A session shows up as .heimdall/ui/wake/<pid>.json (`register`, at SessionStart: names that
+    pid), a <pid>.lock some process holds an exclusive flock on (the watcher, for as long as it lives: the kernel frees it on any
+    death) and a pid that is still alive. Every file is judged by the rules the hook writes it under -- ours, 0600, a regular
+    file, never a link -- so one dropped into a checkout cannot claim a wake. Anything unreadable is "not armed".
+    "tmux" when EVERY armed session's own pane is named by connect.json's `tmux` list (_pane_opted_in): the operator said, on the
+    record, that tmux is the delivery path -- the wake types its fixed prompt into that pane and the deliver hook pops the message
+    in the turn it starts. Anything less (no list, another pane or socket, a malformed pane or socket, one armed session of
+    several not named) is "wake": the default wake may answer with its exit-2 notice instead, and any of the sessions may be the one
+    that takes the message, so claiming tmux would be a guess. This is the path that is armed, not a promise about the next
+    message (a pane that cannot be proven at wake time falls back to the notice): `via` in inbox.delivered[] says what happened."""
     try:
         names = _state().names(root, WAKE_DIR_REL)   # [] when .heimdall, .heimdall/ui or the wake directory is a link
     except OSError:
-        return False
+        return None
+    armed = []
     for name in names:
         m = WAKE_LOCK_RE.match(name)
         if m is None:
@@ -827,19 +853,29 @@ def wake_armed(root):
         reg = _read_own_json(root, WAKE_DIR_REL, "%d.json" % pid, PRIVATE)
         if (reg is not None and reg.get("pid") == pid and _own_live_pid(pid)
                 and _lock_held(root, "%d.lock" % pid)):
-            return _companion_connected(root)
-    return False
+            armed.append(reg)
+    if not armed or not _companion_connected(root):
+        return None
+    conn = _read_own_json(root, APP_DIR, CONNECT_NAME, NOT_SHARED)
+    entries = conn.get("tmux") if conn else None
+    return "tmux" if isinstance(entries, list) and all(_pane_opted_in(reg, entries) for reg in armed) else "wake"
+
+
+def wake_armed(root):
+    """True when wake_path says an idle session of this repo has a wake armed, by either path."""
+    return wake_path(root) is not None
 
 
 def consumer_state(root, now=None):
     """Who would take the next phone message: "waiting" (a `stop` long-poll is live:
     its inbox-waiting marker was refreshed within WAITING_STALE_S -- twice the poll
     interval, so a killed hook stops counting within seconds), else "tmux" (a tmux
-    target is configured), else "wake" (nothing is listening, but an idle session has
-    a wake armed: see wake_armed -- the message makes it take a turn by itself), else
-    "none" (the next delivery needs a turn boundary). "wake" is checked last so it only
-    ever stands in for "none". A marker stamped in the future by more than that is
-    clock noise, not a listener."""
+    target is configured, or the armed wake's path is tmux: see wake_path -- its fixed
+    prompt is typed into the session's own pane), else "wake" (nothing is listening,
+    but an idle session has a wake armed: see wake_path -- the message makes it take a
+    turn by itself), else "none" (the next delivery needs a turn boundary). The wake's
+    two values are checked last, so they only ever stand in for "none". A marker stamped
+    in the future by more than that is clock noise, not a listener."""
     now = time.time() if now is None else now
     try:
         marker = _state().stat_file(root, UI_DIR, WAITING_NAME)   # a link at the marker, or on the way to it, is no listener
@@ -850,7 +886,7 @@ def consumer_state(root, now=None):
         return "waiting"
     if tmux_target(root):
         return "tmux"
-    return "wake" if wake_armed(root) else "none"
+    return wake_path(root) or "none"
 
 
 def _oldest_age_s(records, now):

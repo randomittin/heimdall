@@ -859,12 +859,15 @@ def write(path, obj, mode=0o600):
     os.chmod(path, mode)
 
 
-def register(wake, pid=me, named=None, mode=0o600):    # what `heimdall-inbox-wake register` leaves
-    write(os.path.join(wake, "%d.json" % pid), {"pid": pid if named is None else named}, mode)
+def register(wake, pid=me, named=None, mode=0o600, pane="", sock=""):    # what `heimdall-inbox-wake register` leaves (pane and socket "" outside tmux)
+    write(os.path.join(wake, "%d.json" % pid), {"pid": pid if named is None else named, "tmux_pane": pane, "tmux_socket": sock}, mode)
 
 
-def connect(root, pid=me, mode=0o600):                  # what `hmd app connect` leaves
-    write(os.path.join(root, ".heimdall", "app", "connect.json"), {"mode": "relay", "pid_ui": pid, "pid_client": pid}, mode)
+def connect(root, pid=me, mode=0o600, tmux=None):       # what `hmd app connect` leaves (`hmd app connect --tmux` adds the tmux list)
+    rec = {"mode": "relay", "pid_ui": pid, "pid_client": pid}
+    if tmux is not None:
+        rec["tmux"] = tmux
+    write(os.path.join(root, ".heimdall", "app", "connect.json"), rec, mode)
 
 
 def arm(wake, pid=me):                                  # `heimdall-inbox-wake watch`: an exclusive flock on <pid>.lock while it lives
@@ -957,13 +960,74 @@ connect(root)
 for odd in ("99999999999999999999.lock", "x.lock", "%d.lock.tmp" % me):
     open(os.path.join(wake, odd), "w").close()
 check("names that are not <pid>.lock are ignored, never an error", consumer(root) == "none")
+
+# A tmux wake path (`hmd app connect --tmux`): the armed session's own pane, as `register` recorded it from the session's environment,
+# is one connect.json's tmux list names -- the opt-in that makes tmux the delivery path, where the default wake may take either.
+PANE, SOCK = "%7", "/tmp/tmux-501/default"
+OPTED = [{"pid": me, "pane": PANE, "socket": SOCK}]
+other = os.getppid()    # a second live pid of this user, standing in for a second claude session of the repo
+
+root, wake = project()
+register(wake, pane=PANE, sock=SOCK)
+connect(root, tmux=OPTED)
+fd = arm(wake)
+check("armed session + its pane named in connect.json's tmux list -> tmux", consumer(root) == "tmux")
+served = M.summary(root)
+check("summary() serves tmux inside the unchanged five-key slice",
+      served["consumer"] == "tmux" and sorted(served) == ["consumer", "delivered", "expired", "oldest_age_s", "pending"])
+connect(root)
+check("no tmux list in connect.json (no opt-in on record) -> wake", consumer(root) == "wake")
+connect(root, tmux=[{"pid": me, "pane": "%8", "socket": SOCK}])
+check("an opt-in naming another pane -> wake", consumer(root) == "wake")
+connect(root, tmux=[{"pid": me, "pane": PANE, "socket": "/tmp/tmux-501/other"}])
+check("an opt-in naming another socket -> wake", consumer(root) == "wake")
+connect(root, tmux=PANE)
+check("a tmux field that is not a list -> wake", consumer(root) == "wake")
+connect(root, tmux=[OPTED[0], "junk", 7])
+check("junk entries beside a matching one are skipped, the match still counts -> tmux", consumer(root) == "tmux")
+connect(root, tmux=OPTED, mode=0o666)
+check("a world-writable connect.json is no companion and its opt-in is not believed -> none", consumer(root) == "none")
+connect(root, tmux=OPTED)
+marker = os.path.join(root, ".heimdall", "ui", "inbox-waiting")
+with open(marker, "w") as f:
+    f.write("{}")
+check("a live stop long-poll still outranks an armed tmux wake", consumer(root) == "waiting")
+os.remove(marker)
+os.close(fd)
+check("watcher gone (registration and opt-in left behind) -> none", consumer(root) == "none")
+
+root, wake = project()
+register(wake, pane="%7;touch x", sock=SOCK)
+connect(root, tmux=[{"pid": me, "pane": "%7;touch x", "socket": SOCK}])
+fd = arm(wake)
+check("a pane that is not %N is never a tmux path, even when both files name it -> wake", consumer(root) == "wake")
+os.close(fd)
+
+root, wake = project()
+register(wake, pane=PANE, sock="/tmp/../etc/tmux")
+connect(root, tmux=[{"pid": me, "pane": PANE, "socket": "/tmp/../etc/tmux"}])
+fd = arm(wake)
+check("a socket path with .. is never a tmux path -> wake", consumer(root) == "wake")
+os.close(fd)
+
+root, wake = project()
+register(wake, pane=PANE, sock=SOCK)
+register(wake, pid=other, pane="%9", sock=SOCK)
+connect(root, tmux=OPTED)
+fd, fd2 = arm(wake), arm(wake, pid=other)
+check("two armed sessions, only one of them opted in -> wake (either may take the message)", consumer(root) == "wake")
+connect(root, tmux=OPTED + [{"pid": other, "pane": "%9", "socket": SOCK}])
+check("both opted in -> tmux", consumer(root) == "tmux")
+os.close(fd2)
+check("the second session's watcher gone: the first, opted in, is the whole armed set -> tmux", consumer(root) == "tmux")
+os.close(fd)
 print("\n".join(verdicts))
 WAKEPY
   A2_WU_OUT="$(python3 "$A2_WUNIT" "$REPO" 2>&1)"
   A2_WU_BAD="$(printf '%s\n' "$A2_WU_OUT" | grep -c '^BAD' || true)"
   A2_WU_OK="$(printf '%s\n' "$A2_WU_OUT" | grep -c '^OK' || true)"
-  if [ "$A2_WU_BAD" = "0" ] && [ "$A2_WU_OK" -ge 18 ]; then
-    ok "A2.10 consumer wake: registration, held lock, live pid, live companion and precedence all gate it ($A2_WU_OK checks)"
+  if [ "$A2_WU_BAD" = "0" ] && [ "$A2_WU_OK" -ge 33 ]; then
+    ok "A2.10 consumer wake/tmux: registration, held lock, live pid, live companion, the tmux opt-in and precedence all gate it ($A2_WU_OK checks)"
   else
     bad "A2.10 wake gates: $A2_WU_OUT"
   fi
