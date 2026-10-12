@@ -8,7 +8,9 @@
 # or dropped inbox, no live companion, text in argv, a pane that is not this session's, exit 2 on bad
 # arguments, unquoted interpolation in hooks.json. Tests 21-22 are the link cases: a symlink planted at any level of
 # .heimdall/ui/wake (or at one of the files in it) never redirects a write, chmod, unlink or lock outside the repo and
-# nothing behind it is believed. Exit 0 = every proof holds. Own-file run only.
+# nothing behind it is believed. Test 26 is the phone's receipt: consumer tmux while the tmux wake path is armed, via tmux for a delivery that
+# followed the wake's typed prompt (a mark the wake writes, read by the deliver hook), via prompt for every other one.
+# Exit 0 = every proof holds. Own-file run only.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -120,6 +122,7 @@ cat > "$FAKE/tmux" <<'FAKETMUX'
 #!/bin/sh
 printf '%s\n' "$*" >> "$TMUX_RECORD"
 case "$*" in *list-panes*) printf '%%7 %s\n%%8 1\n' "$PANE_PID" ;; esac
+case "$*" in *send-keys*) [ -z "${TMUX_FAIL_KEYS:-}" ] || exit 1 ;; esac
 exit 0
 FAKETMUX
 chmod +x "$FAKE/tmux"
@@ -398,6 +401,82 @@ quiet_wake && ! grep -q "send-keys" "$REC" && ok "HMD_INBOX_WAKE=off still wakes
 optin_proj; optin_conn; rec p7 "hi" companion; chmod 666 "$D/.heimdall/app/connect.json"
 swatch "$$" 2
 quiet_wake && ! grep -q "send-keys" "$REC" && ok "a world-writable connect.json (its opt-in included) is not believed: no wake, no keystroke" || bad "rc=$RC out=$OUT rec=$(cat "$REC")"
+
+echo "26. receipts (what the phone sees): consumer tmux while the tmux wake path is armed; via tmux once the prompt hook pops a message the wake typed for; via prompt for every other delivery:"
+unset HMD_TMUX_TARGET
+DELIVER="$REPO/bin/heimdall-inbox-deliver"
+# slice -- the inbox slice /api/state serves for $D, from the library hmd ui itself imports
+slice() {
+  python3 - "$REPO/bin/lib" "$D" <<'PYSLICE'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import companion_ui_inbox as M
+print(json.dumps(M.summary(sys.argv[2])))
+PYSLICE
+}
+consumer_is() { [ "$(slice | jq -r .consumer)" = "$1" ]; }
+# armed MAX_S -- the session's real watcher in the background (AW), started once its instance lock exists; disarm kills it
+armed() {
+  PATH="$FAKE:$PATH" TMUX_RECORD="$REC" PANE_PID="$$" TMUX_PANE="%7" TMUX="$SOCK,1,0" HMD_CLAUDE_SESSIONS_DIR="$D/sessions" HMD_INBOX_WAKE_MAX_S="$1" "$BIN" watch --repo "$D" --pid "$CP" >/dev/null 2>&1 &
+  AW=$!; TMPS="$TMPS $AW"
+  for _ in $(seq 1 50); do [ -e "$D/.heimdall/ui/wake/$CP.lock" ] && break; sleep 0.1; done
+}
+disarm() { kill "$AW" 2>/dev/null; wait "$AW" 2>/dev/null; }
+# deliver_prompt TEXT -- the UserPromptSubmit hook for a submitted prompt TEXT (DOUT: what it handed the session); via_of ID -- the archive's via
+deliver_prompt() { DOUT="$(jq -nc --arg p "$1" --arg cwd "$D" '{hook_event_name:"UserPromptSubmit",prompt:$p,cwd:$cwd}' | "$DELIVER" prompt --repo "$D" 2>/dev/null)"; }
+via_of() { jq -r --arg id "$1" 'select(.id == $id) | .via // "none"' "$D/.heimdall/ui/inbox-delivered.jsonl"; }
+typed_text() { sed -n 's/.*send-keys -t %7 -l //p' "$REC"; }       # what the wake typed into the pane
+optin_proj; optin_conn; armed 30
+consumer_is tmux && ok "armed watcher + registration naming pane %7 + connect.json's tmux list naming it: consumer tmux" || bad "slice: $(slice)"
+[ "$(slice | jq -c 'keys')" = '["consumer","delivered","expired","oldest_age_s","pending"]' ] && ok "...inside the unchanged five-key slice" || bad "slice: $(slice)"
+optin_conn "%8"
+consumer_is wake && ok "a tmux list naming another pane: consumer wake (the default wake path, which may answer with the notice)" || bad "slice: $(slice)"
+printf '{"mode":"relay","pid_ui":%s,"pid_client":%s,"port":1,"relay":"x","started_at":"t"}\n' "$CP" "$CP" > "$D/.heimdall/app/connect.json"
+consumer_is wake && ok "no tmux opt-in recorded in connect.json: consumer wake" || bad "slice: $(slice)"
+optin_conn; chmod 666 "$D/.heimdall/app/connect.json"
+consumer_is none && ok "a world-writable connect.json is no companion and its opt-in is not believed: consumer none" || bad "slice: $(slice)"
+chmod 600 "$D/.heimdall/app/connect.json"; disarm
+consumer_is none && ok "watcher gone: consumer none (a registration and an opt-in alone arm nothing)" || bad "slice: $(slice)"
+
+optin_proj; optin_conn; rec w1 "SECRET-PHONE-TEXT" companion; L="$D/.heimdall/ui/inbox-wake.json"
+swatch "$$" 3
+[ "$(jq -r '.typed | keys | join(",")' "$L" 2>&1)" = "w1" ] && [ "$(jq -r '.woken | keys | join(",")' "$L")" = "w1" ] && ok "the keystroke wake records w1 as woken AND typed-for in the ledger" || bad "ledger: $(cat "$L" 2>&1)"
+[ "$(typed_text)" = "phone message waiting" ] && ok "(what it typed is the fixed prompt)" || bad "typed: $(typed_text)"
+deliver_prompt "$(typed_text)"
+[ "$(via_of w1)" = "tmux" ] && ok "the prompt hook answering the typed prompt archives w1 via tmux, not prompt" || bad "via=$(via_of w1)"
+printf '%s' "$DOUT" | grep -q "SECRET-PHONE-TEXT" && ok "...and the same call hands the message to the session" || bad "deliver output: $DOUT"
+[ "$(slice | jq -r '.delivered[0] | "\(.id) \(.via)"')" = "w1 tmux" ] && ok "inbox.delivered[] (the phone's receipt) reads via tmux" || bad "receipts: $(slice | jq -c .delivered)"
+
+optin_proj; optin_conn; rec w2 "hello" companion
+deliver_prompt "just an ordinary prompt"
+[ "$(via_of w2)" = "prompt" ] && [ "$(slice | jq -r '.delivered[0].via')" = "prompt" ] && ok "an ordinary prompt delivery (nothing typed) stays via prompt, in the archive and in the receipt" || bad "via=$(via_of w2)"
+optin_proj; optin_conn; rec w3 "hi" companion
+deliver_prompt "phone message waiting"
+[ "$(via_of w3)" = "prompt" ] && ok "the same words typed by the operator with no wake behind them: via prompt (words alone are no evidence)" || bad "via=$(via_of w3)"
+newproj; rec w4 "hi" companion; watch 10
+deliver_prompt "$OUT"
+[ "$RC" -eq 2 ] && [ "$(via_of w4)" = "prompt" ] && [ "$(jq -r '.typed | length' "$D/.heimdall/ui/inbox-wake.json")" = "0" ] && ok "the exit-2 notice wakes a turn nobody typed: via prompt and nothing recorded as typed" || bad "rc=$RC via=$(via_of w4) ledger=$(cat "$D/.heimdall/ui/inbox-wake.json")"
+
+optin_proj; optin_conn; rec w5 "hi" companion
+swatch "$$" 3; deliver_prompt "my own prompt, submitted before the wake's"
+[ "$(via_of w5)" = "prompt" ] && ok "a typed-for record popped by a prompt that is not the wake's own typed text: via prompt" || bad "via=$(via_of w5)"
+optin_proj; optin_conn; rec w6 "hi" companion; L="$D/.heimdall/ui/inbox-wake.json"
+swatch "$$" 3; jq -c '.typed |= with_entries(.value -= 3600)' "$L" > "$WORK/aged.json" && cat "$WORK/aged.json" > "$L"
+deliver_prompt "$(typed_text)"
+[ "$(via_of w6)" = "prompt" ] && ok "a typed mark an hour old is not what this prompt answers: via prompt" || bad "via=$(via_of w6)"
+optin_proj; optin_conn; rec w7 "hi" companion; L="$D/.heimdall/ui/inbox-wake.json"
+TMUX_FAIL_KEYS=1 swatch "$$" 10
+[ "$RC" -eq 2 ] && [ "$(jq -r '.typed | length' "$L")" = "0" ] && ok "keys that did not go in leave no typed mark, and the notice is the fallback" || bad "rc=$RC ledger=$(cat "$L" 2>&1)"
+deliver_prompt "phone message waiting"
+[ "$(via_of w7)" = "prompt" ] && ok "...so that delivery is via prompt" || bad "via=$(via_of w7)"
+
+optin_proj; optin_conn; rec w8 "hi" companion; L="$D/.heimdall/ui/inbox-wake.json"
+swatch "$$" 3; cp "$L" "$WORK/forged.json"; chmod 600 "$WORK/forged.json"; cp "$WORK/forged.json" "$WORK/forged.orig"; rm "$L"; ln -s "$WORK/forged.json" "$L"
+deliver_prompt "$(typed_text)"
+[ "$(via_of w8)" = "prompt" ] && cmp -s "$WORK/forged.json" "$WORK/forged.orig" && ok "a LINK at the ledger is not believed (and not written): via prompt" || bad "via=$(via_of w8)"
+optin_proj; optin_conn; rec w9 "hi" companion; L="$D/.heimdall/ui/inbox-wake.json"
+swatch "$$" 3; chmod 644 "$L"; deliver_prompt "$(typed_text)"
+[ "$(via_of w9)" = "prompt" ] && ok "a ledger other users can read (all a checkout can ship) is not believed: via prompt" || bad "via=$(via_of w9)"
 
 echo ""
 echo "heimdall-inbox-wake.test.sh: $PASS passed, $FAIL failed."

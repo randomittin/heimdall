@@ -222,11 +222,19 @@ def pending_ids(root):
     return ids
 
 
+def newest(marks):
+    return dict(sorted(marks.items(), key=lambda kv: kv[1])[-LEDGER_CAP:])
+
+
 class Ledger(object):
-    """inbox-wake.json: {"woken": {record id: epoch}} under an exclusive flock, so two
-    sessions of one repo can never both wake for the same message. The lock file is opened, and the
-    ledger read and replaced, through hmd_private_state: a link on the way to the lock is refused
-    (OSError), a link at the ledger is not believed and is replaced by the real file, never followed."""
+    """inbox-wake.json: {"woken": {record id: epoch}, "typed": {record id: epoch}} under an exclusive flock. "woken" is every wake
+    (the exit-2 notice and the keystroke alike), so two sessions of one repo can never both wake for the same message. "typed" is
+    the keystroke wake alone: the ids a prompt is being typed into the session's own pane for, written BEFORE the keys go in (and
+    taken back if they do not), so that bin/heimdall-inbox-deliver's prompt hook -- the first thing the typed prompt runs --
+    finds it and archives the message via "tmux" instead of "prompt", which is what the phone's receipts then show. The notice's
+    turn is a task-notification nobody typed and marks nothing. The lock file is opened, and the ledger read and replaced,
+    through hmd_private_state: a link on the way to the lock is refused (OSError), a link at the ledger is not believed and is
+    replaced by the real file, never followed."""
 
     def __init__(self, root):
         self.root = root
@@ -246,26 +254,39 @@ class Ledger(object):
             os.close(self.fd)
         return False
 
-    def woken(self):
+    def marks(self, key):
         rec = STATE.read_json(self.root, UI_REL, "inbox-wake.json", READ_CAP, forbidden=PRIVATE) or {}
-        w = rec.get("woken")
-        return w if isinstance(w, dict) else {}
+        m = rec.get(key)
+        return m if isinstance(m, dict) else {}
 
-    def save(self, woken):
-        keep = dict(sorted(woken.items(), key=lambda kv: kv[1])[-LEDGER_CAP:])
-        STATE.write(self.root, UI_REL, "inbox-wake.json", json.dumps({"woken": keep}).encode("utf-8"))
+    def save(self, woken, typed):
+        body = json.dumps({"woken": newest(woken), "typed": newest(typed)})
+        STATE.write(self.root, UI_REL, "inbox-wake.json", body.encode("utf-8"))
 
 
 def claim(root, ids):
     # The ids this caller is first to wake for (recorded), or [] when another watcher beat it.
     with Ledger(root) as led:
-        seen = led.woken()
+        seen = led.marks("woken")
         fresh = [i for i in ids if i not in seen]
         if fresh:
             now = time.time()
             seen.update({i: now for i in fresh})
-            led.save(seen)
+            led.save(seen, led.marks("typed"))
     return fresh
+
+
+def mark_typed(root, ids, typed):
+    # Record (typed=True) or take back (False) that a prompt is being typed for these ids (see Ledger): the mark goes in first, so the hook
+    # the keys run can never beat it, and comes out again when they did not go in.
+    with Ledger(root) as led:
+        marks = led.marks("typed")
+        for i in ids:
+            if typed:
+                marks[i] = time.time()
+            else:
+                marks.pop(i, None)
+        led.save(led.marks("woken"), marks)
 
 
 def session_status(pid):
@@ -435,10 +456,15 @@ def wake_action(root, pid):
     settled = read_ago is None or read_ago >= quiet      # unread for the quiet window: no half-typed draft can be pending
     if mode != "rewake" and not settled and tmux_optin(conn, reg):
         return None        # --tmux: the pane is the delivery path, so a draft's window is waited out (nothing claimed), not answered with the notice
-    if not claim(root, ids):
+    fresh = claim(root, ids)
+    if not fresh:
         return None
-    if mode != "rewake" and settled and own_pane(reg, pid) and type_prompt():
-        return "tmux"
+    if mode != "rewake" and settled and own_pane(reg, pid):
+        mark_typed(root, fresh, True)         # BEFORE the keys, so the prompt hook they run finds it (see Ledger); a refusal ends the tick with no key typed
+        if type_prompt():
+            return "tmux"
+        with contextlib.suppress(OSError):
+            mark_typed(root, fresh, False)    # no keys went in: the notice below is this wake, and no delivery by tmux follows it
     return "rewake"
 
 

@@ -145,7 +145,8 @@
 #     without a shell, with the hook's own privileges, so it is operator-only: set it
 #     in the environment, never from anything a phone message can reach.
 #   RECEIPTS. Every dequeue stamps delivered_at and via (stop | prompt | tool | tmux: the mode
-#     that popped it) into the archived line (inbox-delivered.jsonl, 0600); /api/state's
+#     that popped it -- except that a prompt pop in the turn bin/heimdall-inbox-wake typed a prompt for is
+#     stamped tmux, see prompt_via) into the archived line (inbox-delivered.jsonl, 0600); /api/state's
 #     inbox.delivered[] is the last 20 of those as {id, delivered_at, via, read_at} -- never
 #     text. delivered_at means DELIVERED TO SESSION: a hook popped the message into the session's
 #     context. It does not say the model read it; read_at (bin/lib/companion_ui_inbox.py) is the
@@ -1419,9 +1420,39 @@ def cmd_tmux(root):
         _tmux_send(["tmux", "send-keys", "-t", target, "Enter"])
 
 
+WAKE_LEDGER_NAME = "inbox-wake.json"    # bin/heimdall-inbox-wake's ledger: {"woken": {record id: epoch}, "typed": {record id: epoch}}
+WAKE_PROMPT = "phone message waiting"   # the fixed prompt that tool types into the session's own tmux pane (its WAKE_PROMPT), word for word
+TMUX_WAKE_WINDOW_S = 120.0              # a typed mark older than this is not what the prompt being submitted answers
+PRIVATE_FILE = 0o077                    # mode bits the wake's ledger must not carry: it writes 0600, and a checkout cannot ship that
+
+
+def prompt_via(root, hook, list_pending_fn):
+    # The via a prompt-mode pop is stamped with (RECEIPTS, in the header). "tmux" when this turn is the one bin/heimdall-inbox-wake typed
+    # for: the prompt being submitted is its fixed WAKE_PROMPT word for word AND a record still queued has a typed mark in the wake's
+    # ledger -- written by the wake before it typed, no older than TMUX_WAKE_WINDOW_S. Anything else is "prompt": the operator's own
+    # prompt (the same words with no wake behind them included), the exit-2 notice's turn, a wake whose keys never went in, a stale mark,
+    # a ledger that is a link, not ours or readable by others (read through hmd_private_state like every repo file). Read from state,
+    # never guessed, and a fault here costs the label, never the delivery.
+    try:
+        if str(hook.get("prompt") or "").strip() != WAKE_PROMPT:
+            return "prompt"
+        rec = STATE.read_json(root, UI_REL, WAKE_LEDGER_NAME, READ_CAP, forbidden=PRIVATE_FILE)
+        typed = rec.get("typed") if rec is not None else None
+        if not isinstance(typed, dict):
+            return "prompt"
+        now = time.time()
+        for item in list_pending_fn(root):
+            at = typed.get(item.get("id"))
+            if isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= now - at <= TMUX_WAKE_WINDOW_S:
+                return "tmux"
+        return "prompt"
+    except Exception:
+        return "prompt"
+
+
 def cmd_prompt(hook, root):
-    _, _, pop_all_fn, _ = get_ops(root)
-    ctx = render_delivery(root, hook, pop_with(pop_all_fn, root, "prompt"))
+    _, list_pending_fn, pop_all_fn, _ = get_ops(root)
+    ctx = render_delivery(root, hook, pop_with(pop_all_fn, root, prompt_via(root, hook, list_pending_fn)))
     if not ctx:
         return
     print(json.dumps({"hookSpecificOutput": {
