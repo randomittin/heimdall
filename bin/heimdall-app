@@ -3112,7 +3112,7 @@ _stop_recorded_ui() {
 # token at the relay -- and to end; its record and the push registrations only it held go with it. Every other phone's client, the
 # window and the ui are left alone. 1 for no such device, 2 for a name that fits several (name one by its id).
 _disconnect_device() {
-  local repo="$1" wanted="$2" found rc id pid repo_real
+  local repo="$1" wanted="$2" found rc id pid repo_real sig
   if [ -z "$wanted" ]; then
     echo "hmd app disconnect: --device needs a device label or id (hmd app status lists them)" >&2
     return 2
@@ -3127,11 +3127,15 @@ _disconnect_device() {
   esac
   id="${found%% *}"
   pid="${found##* }"
+  # SIGUSR1 revokes the phone of a client that has the handler; a client started by v2.4.6 or earlier has none (USR1 would end it with
+  # no revoke), so its phone is revoked with TERM, which that client answers by revoking its session and ending (hmd_devices.py signal)
+  sig="$("$PY3" "$LIB_DIR/hmd_devices.py" signal --repo "$repo" "$id" 2>/dev/null)"
+  case "$sig" in TERM|USR1) ;; *) sig=USR1 ;; esac
   repo_real="$(_real_dir "$repo")"
   rc=0
   # A14: verify identity before signaling -- a recycled pid must never take an unrelated process down with it.
   if _pid_is_relay_client "$pid" "$repo_real"; then
-    _relay_stop_client "$pid" USR1
+    _relay_stop_client "$pid" "$sig"
     rc=$?
   else
     echo "hmd app disconnect: pid $pid of device $id is not a heimdall-relay-client process of this repo -- not signalling it" >&2

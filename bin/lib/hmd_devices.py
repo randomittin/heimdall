@@ -23,11 +23,24 @@ client left behind is a dead record, never a listed device. At most MAX_DEVICES 
     hmd_devices.py resolve  --repo R NAME      "<id> <pid>" of the live device NAME names (its label, any case, or its id);
                                                exit 1 for none, 2 for more than one (their ids on stderr)
     hmd_devices.py forget   --repo R ID        remove the record and the push tokens only that device held
+    hmd_devices.py signal   --repo R ID        the signal that revokes ID's phone: USR1, or TERM for a client older than the records
     hmd_devices.py limit                       how many phones one repo may have paired at once (HMD_PAIR_MAX_DEVICES, default 4)
+
+UPGRADE WHILE PAIRED. A relay client that v2.4.6 (or earlier) started and that is still running has its phone bound but wrote no record
+-- it cannot be asked to, and must not be restarted for it. Every read of the records (records(), so list, count, resolve, has-pid, the
+relay client's own limit and push checks) therefore makes the record such a client never did, from what it did leave: the status file
+relay.json (paired, when), for a phone that paired by code the marker paired-<code>.json (label, GitHub login, when), the event log's last
+device_caps (capabilities), the signed push store (its tokens). The record is marked "legacy": true and stored with create_once, so
+it is made once however many readers race and read as any other afterwards. Nothing the client runs on is touched -- no signal, no
+state file of its own. A legacy phone's id cannot be the fingerprint of its key (the key lived only in that client's memory): it is the
+hash of the client's pid and the bind time. The client never refreshes the record, so it holds the push tokens it had when it was made
+and, while its client runs, every token in the store that no other record claims; and it is revoked with TERM (see `signal`), the one
+signal that client handles.
 
 Stdlib only; loadable by path like the other bin/lib modules, no side effects at import.
 """
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -41,6 +54,7 @@ REL = ".heimdall/app"
 _NAME_RE = re.compile(r"device-([0-9a-f]{8})\.json\Z")
 _ID_RE = re.compile(r"[0-9a-f]{8}\Z")
 CLIENT_MARK = "heimdall-relay-client"
+_MARKER_RE = re.compile(r"paired-([A-HJ-NP-Z2-9]{5})\.json\Z")  # the marker a client leaves for a phone that paired by code
 
 
 def _sibling(name):
@@ -128,14 +142,86 @@ def _valid(rec, dev_id):
         and isinstance(rec.get("caps"), list) and isinstance(rec.get("push_fps"), list)
 
 
+def _whole(value):
+    """`value` as a whole number, or None when it is not a number."""
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _store_fps(root):
+    """Fingerprints of the push tokens in the repo's signed store: a client older than the records kept every one its one phone
+    registered there. A store that cannot be read holds nothing to claim."""
+    try:
+        return {token_fp(e["token"]) for e in _sibling("companion_push_store").load(root)["tokens"]}
+    except (OSError, ValueError, ImportError, AttributeError, KeyError):
+        return set()
+
+
+def _logged_caps(root):
+    """The capabilities the phone last listed in the event log (a bind starts with none): [] when the log is off or holds none. It is
+    the only place a client older than the records ever put them."""
+    caps = []
+    for line in (PRIVATE.read(root, REL, "relay-events.jsonl", 8 << 20) or b"").decode("utf-8", "replace").splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("event") in ("device_bound", "code_paired"):
+            caps = []
+        elif ev.get("event") == "device_caps" and isinstance(ev.get("caps"), list):
+            caps = [c for c in ev["caps"] if isinstance(c, str)]
+    return caps
+
+
+def _legacy_candidates(root):
+    """{pid: what is known of its phone} for the clients that left only what v2.4.6 and earlier kept: the status file relay.json of the
+    client that wrote it last (`paired`, when) and, for a phone that paired by code, the marker paired-<code>.json (label, GitHub login,
+    when). Both are read through hmd_private_state; a pid is only a candidate until client_alive has looked at the process."""
+    found = {}
+    status = PRIVATE.read_json(root, REL, "relay.json")
+    if status is not None and status.get("paired") is True and _whole(status.get("pid")) and _whole(status.get("bound_at")) is not None:
+        found[_whole(status["pid"])] = {"label": "unnamed device", "gh_login": "unknown", "via": "qr", "code": None,
+                                        "bound_at": _whole(status["bound_at"])}
+    for name in PRIVATE.names(root, REL):
+        m = _MARKER_RE.match(name)
+        mark = PRIVATE.read_json(root, REL, name) if m else None
+        if mark is not None and mark.get("via") == "code" and _whole(mark.get("pid")) and _whole(mark.get("bound_at")) is not None:
+            found[_whole(mark["pid"])] = {"label": clean(mark.get("device_label") or "", 32) or "unnamed device",
+                                          "gh_login": clean(mark.get("gh_login") or "", 39) or "unknown",
+                                          "via": "code", "code": m.group(1), "bound_at": _whole(mark["bound_at"])}
+    return found
+
+
+def _migrate(root, named):
+    """The records of the phones whose client is older than the records, made now from what that client left (UPGRADE WHILE PAIRED in the
+    module docstring): one per running client that has a phone bound and that no record (`named`: their pids) names. Read-time and
+    idempotent -- once a record is stored its pid is named and nothing is made again -- and it touches neither the client nor its relay
+    session. A record that cannot be stored is still returned: the phone is listed whether or not the directory takes the file."""
+    made = []
+    for pid, info in _legacy_candidates(root).items():
+        if pid in named or not client_alive(pid, root):
+            continue
+        st = PRIVATE.stat_file(root, REL, "relay.json")
+        ident = hashlib.sha256(("hmd-legacy-device-v1:%d:%d" % (pid, info["bound_at"])).encode("ascii")).hexdigest()[:8]
+        rec = dict(info, v=1, id=ident, pid=pid, legacy=True, last_seen=max(info["bound_at"], int(st.st_mtime)) if st else info["bound_at"],
+                   caps=_logged_caps(root), push_fps=sorted(_store_fps(root)))
+        with contextlib.suppress(OSError):
+            PRIVATE.create_once(root, REL, record_name(ident), json.dumps(rec, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        made.append(rec)
+    return made
+
+
 def records(root):
-    """Every well-formed record, live or not, oldest pairing first."""
+    """Every well-formed record, live or not, oldest pairing first -- those of phones bound through a client older than the records
+    included (_migrate)."""
     found = []
     for name in PRIVATE.names(root, REL):
         m = _NAME_RE.match(name)
         rec = PRIVATE.read_json(root, REL, name) if m else None
         if rec is not None and _valid(rec, m.group(1)):
             found.append(rec)
+    found += _migrate(root, {r["pid"] for r in found})
     return sorted(found, key=lambda r: (r["bound_at"], r["id"]))
 
 
@@ -144,9 +230,19 @@ def live(root, except_pid=None):
     return [r for r in records(root) if r["pid"] != except_pid and client_alive(r["pid"], root)]
 
 
+def push_fps_of(root, rec):
+    """The fingerprints of the push tokens `rec`'s phone holds: the ones its record lists and, for a phone bound through a client older
+    than the records -- which never listed any, and registers more on its own -- every token in the store that no other record claims."""
+    mine = {fp for fp in rec["push_fps"] if isinstance(fp, str)}
+    if rec.get("legacy"):
+        claimed = {fp for r in records(root) if r["id"] != rec["id"] for fp in r["push_fps"] if isinstance(fp, str)}
+        mine |= _store_fps(root) - claimed
+    return mine
+
+
 def held_push_fps(root, except_pid=None):
     """Fingerprints of the push tokens that live devices (other than the one `except_pid` serves) registered."""
-    return {fp for r in live(root, except_pid) for fp in r["push_fps"] if isinstance(fp, str)}
+    return {fp for r in live(root, except_pid) for fp in push_fps_of(root, r)}
 
 
 def _drop_push_tokens(root, fps):
@@ -166,9 +262,10 @@ def _drop_push_tokens(root, fps):
 def forget(root, dev_id):
     """The device is gone (its client ended or was revoked): drop its record and the push tokens only it held."""
     rec = next((r for r in records(root) if r["id"] == dev_id), None)
+    fps = push_fps_of(root, rec) if rec is not None else set()  # before the record goes: a legacy phone's tokens are the ones no record claims
     remove_record(root, dev_id)
-    if rec is not None and rec["push_fps"]:
-        _drop_push_tokens(root, set(rec["push_fps"]))
+    if fps:
+        _drop_push_tokens(root, fps)
 
 
 def resolve(root, wanted):
@@ -180,17 +277,20 @@ def resolve(root, wanted):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hmd_devices.py", description=__doc__.split("\n")[0])
-    ap.add_argument("action", choices=("list", "count", "has-pid", "resolve", "forget", "limit"))
+    ap.add_argument("action", choices=("list", "count", "has-pid", "resolve", "forget", "signal", "limit"))
     ap.add_argument("--repo", default="")
     ap.add_argument("arg", nargs="?")
     args = ap.parse_intermixed_args(argv)  # `has-pid --repo R PID`: the argument comes after the option
     if args.action != "limit" and not args.repo:
         ap.error("%s needs --repo" % args.action)
     root = os.path.realpath(args.repo)
-    if args.action in ("has-pid", "resolve", "forget") and not args.arg:
+    if args.action in ("has-pid", "resolve", "forget", "signal") and not args.arg:
         ap.error("%s needs an argument" % args.action)
     if args.action == "limit":
         print(max_devices())
+    elif args.action == "signal":
+        rec = next((r for r in records(root) if r["id"] == args.arg), None)
+        print("TERM" if rec is not None and rec.get("legacy") else "USR1")
     elif args.action == "list":
         print(json.dumps([shown(r) for r in live(root)], sort_keys=True))
     elif args.action == "count":
