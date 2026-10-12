@@ -48,6 +48,12 @@
 #      bash -n, python3's ast.parse and tsc get the same line drawn from what
 #      they have to go on. Cases 27-34.
 #
+#  10. SINCE THE LAST PUSH. The Stop hook lints only this session's tracked edits, so work a
+#      sub-agent did in its own worktree and that was MERGED is in no ledger and the push gate
+#      had no lint evidence for it (a waiver was the only way past). `--since-push` lints the
+#      diff against the upstream + uncommitted work, records mode + base_sha, honours the
+#      budget (skipped = incomplete) and satisfies the gate's coverage check. Cases 39-45.
+#
 # ISOLATION: edit-tracker keys its ledger on $TMPDIR/heimdall-edits/
 # $CLAUDE_CODE_SESSION_ID.log. Every case here sets TMPDIR to a private temp
 # dir and a unique session id, so the operator's real ledger is never read or
@@ -1052,6 +1058,212 @@ if [ "$rc" = "0" ] && [ "$g1rc" = "0" ] && [ "$g2rc" = "2" ] && grep -q 'stale' 
   ok "38. end to end: a real stop-lint receipt passes the gate; modifying a covered file afterwards makes it stale"
 else
   bad "38. real receipt vs gate: rc=$rc first gate rc=$g1rc ($g1) after touch rc=$g2rc ($g2)"
+fi
+
+# ── 39-45. --since-push: LINT EVERYTHING THAT CHANGED SINCE THE LAST PUSH ────
+# Every case uses a scratch git repo with a bare origin (so @{u} resolves) and none of them registers a
+# file with the edit tracker unless it says so: the files are "merged work" no session ledger ever saw.
+unset HEIMDALL_HOME GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+
+# mk_push_case <name> → mk_case plus a git repo whose `main` is pushed to a bare origin
+mk_push_case() {
+  local d
+  d="$(mk_case "$1")"
+  git init -q --bare "$d/remote.git" >/dev/null 2>&1
+  git -C "$d/repo" init -q -b main >/dev/null 2>&1
+  git -C "$d/repo" config user.email t@example.com
+  git -C "$d/repo" config user.name tester
+  git -C "$d/repo" config commit.gpgsign false
+  git -C "$d/repo" config core.hooksPath /dev/null
+  printf '#!/usr/bin/env bash\necho already-pushed\n' > "$d/repo/pushed.sh"
+  git -C "$d/repo" add pushed.sh
+  git -C "$d/repo" commit -q -m base >/dev/null 2>&1
+  git -C "$d/repo" remote add origin "$d/remote.git"
+  git -C "$d/repo" push -q -u origin main >/dev/null 2>&1
+  printf '%s' "$d"
+}
+
+# commit_in <case> <message> <file...> → commit files that already exist in the case's repo
+commit_in() {
+  local d="$1" msg="$2"
+  shift 2
+  git -C "$d/repo" add -- "$@" && git -C "$d/repo" commit -q -m "$msg" >/dev/null 2>&1
+}
+
+# push_gate <case> → rc of the real gate (output in $TMPROOT/gate), run from INSIDE the case's repo because
+# the coverage check reads that repo; a fresh full-sweep receipt is written so only the lint gate decides.
+push_gate() {
+  local d="$1" top
+  top="$(git -C "$d/repo" rev-parse --show-toplevel)"
+  mkdir -p "$d/home/receipts"
+  jq -n --arg repo "$top" --arg sha "$(git -C "$d/repo" rev-parse HEAD)" \
+    '{kind:"full", repo:$repo, head_sha:$sha, tree_clean:true, exit_code:0}' > "$d/home/receipts/last-sweep.json"
+  HEIMDALL_STATE_FILE="$d/repo/heimdall-state.json" "$STATE" set '.quality_gates.tests_passing' true >/dev/null
+  ( cd "$d/repo" && HEIMDALL_HOME="$d/home" HEIMDALL_STATE_FILE="$d/repo/heimdall-state.json" "$STATE" check-quality-gates >"$TMPROOT/gate" 2>&1 )
+  printf '%s' "$?"
+}
+
+# 39. committed files edit-tracker never saw are linted (the already-pushed one is out of scope), the receipt records
+#     mode + base sha, and a finding in a merged file blocks the gate
+D="$(mk_push_case sp-findings)"
+S="$D/repo/heimdall-state.json"
+printf '#!/usr/bin/env bash\necho merged-ok\n' > "$D/repo/merged_ok.sh"
+printf '#!/usr/bin/env bash\nif then\n' > "$D/repo/merged_bad.sh"
+commit_in "$D" "merge: agent work" merged_ok.sh merged_bad.sh
+BASE="$(git -C "$D/repo" rev-parse origin/main)"
+rc="$(run_lint "$D" --since-push)"
+err="$(cat "$TMPROOT/err")"
+R="$(jq -c '.quality_gates.lint_last_run' "$S")"
+grc="$(push_gate "$D")"; gate="$(cat "$TMPROOT/gate")"
+if [ "$rc" = "0" ] && grep -q 'merged_bad.sh' <<<"$err" && grep -q 'bash -n FAIL' <<<"$err" \
+   && [ "$(lint_clean "$D")" = "false" ] \
+   && [ "$(jq -r '.mode' <<<"$R")" = "since-push" ] && [ "$(jq -r '.base_sha' <<<"$R")" = "$BASE" ] \
+   && jq -e '.paths | map(endswith("/merged_ok.sh")) | any' <<<"$R" >/dev/null \
+   && jq -e '.paths | map(endswith("/merged_bad.sh")) | any' <<<"$R" >/dev/null \
+   && ! jq -e '.paths | map(endswith("/pushed.sh")) | any' <<<"$R" >/dev/null \
+   && [ "$grc" = "2" ] && grep -q 'Lint not clean' <<<"$gate" && grep -q 'findings' <<<"$gate"; then
+  ok "39. --since-push lints committed files the tracker never saw (not the already-pushed one), records mode + base_sha, a finding blocks the gate"
+else
+  bad "39. since-push over merged files wrong (rc=$rc grc=$grc receipt=$R stderr: $err gate: $gate)"
+fi
+
+# 40. a CLEAN merged diff earns a receipt the gate accepts WITHOUT a waiver
+D="$(mk_push_case sp-clean)"
+S="$D/repo/heimdall-state.json"
+printf '#!/usr/bin/env bash\necho a\n' > "$D/repo/a.sh"
+printf 'def f():\n    return 1\n' > "$D/repo/b.py"
+printf '# notes\n' > "$D/repo/NOTES.md"
+commit_in "$D" "merge: agent work" a.sh b.py NOTES.md
+grc0="$(push_gate "$D")"; gate0="$(cat "$TMPROOT/gate")"
+rc="$(run_lint "$D" --since-push)"
+err="$(cat "$TMPROOT/err")"
+grc1="$(push_gate "$D")"; gate1="$(cat "$TMPROOT/gate")"
+if [ "$grc0" = "2" ] && grep -q 'no-evidence' <<<"$gate0" \
+   && [ "$rc" = "0" ] && grep -q '2 file(s) checked, clean' <<<"$err" && [ "$(lint_clean "$D")" = "true" ] \
+   && [ "$grc1" = "0" ] && ! grep -q 'WAIVED' <<<"$gate1" && ! grep -q 'Lint not clean' <<<"$gate1" \
+   && [ "$(jq -r '.quality_gates.lint_waiver // "none"' "$S")" = "none" ]; then
+  ok "40. clean merged diff: the gate says no-evidence first; one --since-push run later it passes with no waiver"
+else
+  bad "40. clean since-push diff / gate wrong (grc0=$grc0 rc=$rc grc1=$grc1 stderr: $err gate0: $gate0 gate1: $gate1)"
+fi
+
+# 41. THE HOLE: a Stop-hook receipt (tracked edits) that does not cover a merged file no longer satisfies the push
+#     gate. It says "uncovered", names the file and the exact command, and --since-push satisfies it.
+D="$(mk_push_case sp-uncovered)"
+printf '#!/usr/bin/env bash\necho mine\n' > "$D/repo/mine.sh"
+printf '#!/usr/bin/env bash\necho merged\n' > "$D/repo/merged.sh"
+commit_in "$D" "merge: agent work" mine.sh merged.sh
+track "$D" "$D/repo/mine.sh"
+rc="$(run_lint "$D")"
+R="$(jq -c '.quality_gates.lint_last_run' "$D/repo/heimdall-state.json")"
+grc0="$(push_gate "$D")"; gate0="$(cat "$TMPROOT/gate")"
+rc2="$(run_lint "$D" --since-push)"
+grc1="$(push_gate "$D")"; gate1="$(cat "$TMPROOT/gate")"
+if [ "$rc" = "0" ] && [ "$(jq -r '.mode' <<<"$R")" = "tracked-edits" ] && [ "$(lint_clean "$D")" = "true" ] \
+   && [ "$grc0" = "2" ] && grep -q 'uncovered' <<<"$gate0" && grep -q 'merged.sh' <<<"$gate0" \
+   && grep -q 'heimdall-stop-lint --since-push' <<<"$gate0" \
+   && [ "$rc2" = "0" ] && [ "$grc1" = "0" ] && ! grep -q 'WAIVED' <<<"$gate1"; then
+  ok "41. a tracked-edits receipt that misses a merged file fails the gate (uncovered, names the file + the exact command); --since-push satisfies it"
+else
+  bad "41. coverage check wrong (rc=$rc mode=$(jq -r '.mode' <<<"$R") grc0=$grc0 gate0: $gate0 | rc2=$rc2 grc1=$grc1 gate1: $gate1)"
+fi
+
+# 42. A diff bigger than the budget does not hang: the tail is "skipped (budget)", the receipt says incomplete, and the
+#     gate refuses it instead of passing on the files that were reached
+D="$(mk_push_case sp-budget)"
+S="$D/repo/heimdall-state.json"
+mkdir -p "$D/fakebin"
+printf '#!/bin/sh\nsleep 1\necho "[]"\n' > "$D/fakebin/shellcheck"
+chmod +x "$D/fakebin/shellcheck"
+for i in 1 2 3 4 5 6; do printf '#!/usr/bin/env bash\necho %s\n' "$i" > "$D/repo/f$i.sh"; done
+commit_in "$D" "merge: agent work" f1.sh f2.sh f3.sh f4.sh f5.sh f6.sh
+HEIMDALL_STATE_FILE="$S" "$STATE" set '.quality_gates.lint_clean' true >/dev/null
+t0=$(date +%s)
+rc="$(PATH="$D/fakebin:$PATH" run_lint "$D" --since-push --budget 3 --per-call 2)"
+t1=$(date +%s)
+err="$(cat "$TMPROOT/err")"
+R="$(jq -c '.quality_gates.lint_last_run' "$S")"
+grc="$(push_gate "$D")"; gate="$(cat "$TMPROOT/gate")"
+if [ "$rc" = "0" ] && [ $((t1 - t0)) -lt 15 ] && grep -q 'skipped (budget)' <<<"$err" \
+   && [ "$(jq -r '.complete | tostring' <<<"$R")" = "false" ] && [ "$(jq -r '.reason' <<<"$R")" = "incomplete" ] \
+   && [ "$(jq -r '.skipped' <<<"$R")" -ge 1 ] && [ "$(lint_clean "$D")" = "false" ] \
+   && [ "$grc" = "2" ] && grep -q 'Lint not clean' <<<"$gate" && grep -q 'incomplete' <<<"$gate"; then
+  ok "42. over-budget diff: bounded wall clock, tail 'skipped (budget)', receipt incomplete, lint_clean false, gate refuses"
+else
+  bad "42. budget handling wrong (rc=$rc secs=$((t1 - t0)) receipt=$R stderr: $err gate: $gate)"
+fi
+
+# 43. base fallbacks: no @{u} → origin/<branch> → the last full green receipt's head → everything tracked;
+#     --list prints the scope and writes no receipt; --upstream-only is empty without an upstream
+D="$(mk_push_case sp-fallback)"
+S="$D/repo/heimdall-state.json"
+printf '#!/usr/bin/env bash\necho x\n' > "$D/repo/x.sh"
+commit_in "$D" "x" x.sh
+git -C "$D/repo" branch --unset-upstream >/dev/null 2>&1
+rc1="$(run_lint "$D" --since-push --list)"; list1="$(cat "$TMPROOT/out")"
+R1="$(jq -c '.quality_gates.lint_last_run' "$S")"
+rc2="$(run_lint "$D" --since-push)"; R2="$(jq -c '.quality_gates.lint_last_run' "$S")"
+git -C "$D/repo" remote remove origin >/dev/null 2>&1
+FIRST="$(git -C "$D/repo" rev-list --max-parents=0 HEAD)"
+mkdir -p "$D/home/receipts"
+jq -n --arg sha "$FIRST" '{head_sha:$sha}' > "$D/home/receipts/last-full-green.json"
+rc3="$(HEIMDALL_HOME="$D/home" run_lint "$D" --since-push)"; R3="$(jq -c '.quality_gates.lint_last_run' "$S")"
+rm -f "$D/home/receipts/last-full-green.json"
+rc4="$(run_lint "$D" --since-push)"; R4="$(jq -c '.quality_gates.lint_last_run' "$S")"
+rc5="$(run_lint "$D" --since-push --list --upstream-only)"; list5="$(cat "$TMPROOT/out")"
+if [ "$rc1" = "0" ] && grep -q '/x\.sh$' <<<"$list1" && ! grep -q 'pushed\.sh' <<<"$list1" && [ "$R1" = "null" ] \
+   && [ "$rc2" = "0" ] && [ "$(jq -r '.base_ref' <<<"$R2")" = "origin/main" ] && [ "$(jq -r '.paths | length' <<<"$R2")" = "1" ] \
+   && [ "$rc3" = "0" ] && [ "$(jq -r '.base_ref' <<<"$R3")" = "last-full-green" ] && [ "$(jq -r '.base_sha' <<<"$R3")" = "$FIRST" ] \
+   && [ "$rc4" = "0" ] && [ "$(jq -r '.base_ref' <<<"$R4")" = "none" ] && [ "$(jq -r '.base_sha' <<<"$R4")" = "null" ] \
+   && [ "$(jq -r '.paths | length' <<<"$R4")" = "2" ] \
+   && [ "$rc5" = "0" ] && [ -z "$list5" ]; then
+  ok "43. base falls back @{u} → origin/<branch> → last full green → none (all tracked); --list writes no receipt; --upstream-only is empty without an upstream"
+else
+  bad "43. base fallback wrong (rc1-5=$rc1/$rc2/$rc3/$rc4/$rc5 list1=$list1 R1=$R1 R2=$R2 R3=$R3 R4=$R4 list5=$list5)"
+fi
+
+# 44. uncommitted work is in scope (staged, untracked, a pushed file edited since); ignored files and node_modules are not
+D="$(mk_push_case sp-dirty)"
+mkdir -p "$D/repo/node_modules/dep"
+printf '#!/usr/bin/env bash\necho s\n' > "$D/repo/staged.sh"
+git -C "$D/repo" add staged.sh
+printf '#!/usr/bin/env bash\necho u\n' > "$D/repo/untracked.sh"
+printf '#!/usr/bin/env bash\necho i\n' > "$D/repo/ignored.sh"
+printf 'ignored.sh\n' > "$D/repo/.gitignore"
+printf '#!/usr/bin/env bash\necho n\n' > "$D/repo/node_modules/dep/dep.sh"
+printf 'echo more\n' >> "$D/repo/pushed.sh"
+rc="$(run_lint "$D" --since-push --list)"; list="$(cat "$TMPROOT/out")"
+if [ "$rc" = "0" ] && grep -q '/staged\.sh$' <<<"$list" && grep -q '/untracked\.sh$' <<<"$list" && grep -q '/pushed\.sh$' <<<"$list" \
+   && ! grep -q 'ignored\.sh' <<<"$list" && ! grep -q 'node_modules' <<<"$list"; then
+  ok "44. uncommitted work is in scope (staged, untracked, a pushed file edited since); ignored files and node_modules are not"
+else
+  bad "44. since-push scope wrong (rc=$rc list: $list)"
+fi
+
+# 45. outside a git work tree --since-push says so, exits 0 and records nothing
+D="$(mk_case sp-nogit)"
+before="$(cat "$D/repo/heimdall-state.json")"
+rc="$(run_lint "$D" --since-push)"
+if [ "$rc" = "0" ] && grep -q 'needs a git work tree' "$TMPROOT/err" && [ "$before" = "$(cat "$D/repo/heimdall-state.json")" ]; then
+  ok "45. --since-push outside a git work tree: says so, exit 0, state untouched"
+else
+  bad "45. no-git --since-push wrong (rc=$rc stderr: $(cat "$TMPROOT/err"))"
+fi
+
+# 46. an EXTENSIONLESS bash tool (bin/ style) in a directory whose name has a dot is still linted: the extension test
+#     must look at the file name, not the whole path (a worktree lives under .claude/, a mktemp dir is tmp.XXXX)
+D="$(mk_push_case sp-dotdir)"
+mkdir -p "$D/repo/dotted.dir"
+printf '#!/usr/bin/env bash\nif then\n' > "$D/repo/dotted.dir/brokentool"
+commit_in "$D" "merge: agent work" dotted.dir/brokentool
+track "$D" "$D/repo/dotted.dir/brokentool"
+rc1="$(run_lint "$D")"; err1="$(cat "$TMPROOT/err")"
+rc2="$(run_lint "$D" --since-push)"; err2="$(cat "$TMPROOT/err")"
+if [ "$rc1" = "0" ] && grep -q 'brokentool' <<<"$err1" && grep -q 'bash -n FAIL' <<<"$err1" \
+   && [ "$rc2" = "0" ] && grep -q 'brokentool' <<<"$err2" && grep -q 'bash -n FAIL' <<<"$err2"; then
+  ok "46. an extensionless bash tool in a dotted directory is linted (tracked edits and --since-push)"
+else
+  bad "46. extension test looked at the whole path (rc=$rc1/$rc2 tracked: $err1 | since-push: $err2)"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

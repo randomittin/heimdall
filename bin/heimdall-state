@@ -283,6 +283,7 @@ cmd_check_quality_gates() {
   # receipt it was issued for, so the next lint run voids it).
   local lint_problem lint_waiver=""
   lint_problem=$(lint_evidence_problem)
+  if [ -z "$lint_problem" ]; then lint_problem=$(lint_push_coverage_problem); fi
   if [ "$lint" = "true" ] && [ -n "$lint_problem" ]; then lint_waiver=$(lint_waiver_reason); fi
   if [ -n "$lint_waiver" ]; then
     echo "LINT WAIVED: ${lint_waiver} -- the lint evidence is NOT passing (${lint_problem})" >&2
@@ -473,6 +474,30 @@ lint_evidence_problem() {
     } < <(jq -r '.quality_gates.lint_last_run | (.at | fromdateiso8601), .paths[]' "$STATE_FILE" 2>/dev/null)
   fi
   printf '%s' "$problem"
+}
+
+# lint_push_coverage_problem -> prints why the lint receipt does not cover what a push would ship, or nothing. Work merged from
+# sub-agent worktrees is in no session's edit-tracker ledger, so a Stop-hook receipt (tracked edits) can be complete, clean and
+# fresh and still say nothing about it. The scope is re-derived by bin/heimdall-stop-lint itself (`--since-push --list`, the same
+# code that wrote the receipt): every lintable-by-type file the push would carry must be in the receipt's `scope` (since-push
+# receipts) or `paths` (tracked-edits receipts). Only enforced when a last push exists (@{u} or origin/<branch>: --upstream-only)
+# and the tool sits next to this script; anything that cannot be derived returns nothing, so this only ever ADDS a failure
+# when it can name the files. Always returns 0: it is called inside $(...) under set -e.
+lint_push_coverage_problem() {
+  local sl="$HMD_STATE_SELF_DIR/heimdall-stop-lint" top want missing n
+  [ -x "$sl" ] || return 0
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  want="$("$sl" --since-push --list --upstream-only --repo "$top" 2>/dev/null)" || return 0
+  [ -n "$want" ] || return 0
+  missing="$(jq -c --arg want "$want" --arg top "$top/" '
+      (.quality_gates.lint_last_run | (.scope // .paths // [])) as $have
+      | ($want | split("\n") | map(select(. != ""))) - $have
+      | {n: length, first: (.[0:3] | map(ltrimstr($top)) | join(", "))}' "$STATE_FILE" 2>/dev/null)" || return 0
+  n="$(jq -r '.n // 0' <<<"$missing" 2>/dev/null)" || return 0
+  [ "${n:-0}" -gt 0 ] || return 0
+  printf 'uncovered: %s lintable file(s) changed since the last push are not covered by the lint receipt (e.g. %s) - run: %s --since-push' \
+    "$n" "$(jq -r '.first' <<<"$missing" 2>/dev/null)" "$sl"
+  return 0
 }
 
 # lint_waiver_reason -> prints the recorded waiver's reason iff it was issued against the

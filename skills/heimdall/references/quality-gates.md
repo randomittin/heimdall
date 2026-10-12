@@ -29,7 +29,7 @@ Every piece of work Heimdall produces passes through mandatory quality gates bef
 1. Run project's configured linter (e.g., `npm run lint`)
 2. Run project's formatter in check mode (e.g., `npm run prettier:check`)
 3. If clean: `bin/heimdall-stop-lint` records the run (`.quality_gates.lint_last_run` plus `lint_clean`) at Stop. Never hand-set `lint_clean`: the push gate re-reads `lint_last_run` and rejects a missing, failing, incomplete, tool-error or stale (a covered file edited after the run) receipt, and `heimdall-state mark-clean` only sets it against a passing one
-4. If violations, or a linter that could not run: lint_clean is false, push is blocked. A broken linter blocks until fixed or explicitly waived: `HMD_LINT_WAIVER='<reason>' heimdall-state mark-clean` (recorded in `.quality_gates.lint_waiver_log`, voided by the next lint run)
+4. If violations, or a linter that could not run: lint_clean is false, push is blocked. Work merged from sub-agent worktrees is in no session's edit-tracker ledger, so the gate also requires the receipt to cover everything changed since the last push: run `bin/heimdall-stop-lint --since-push` (`bin/heimdall-precheck-bash` runs it for you when the evidence is missing, stale or uncovered; a large diff needs `--budget`, not a waiver). A broken linter blocks until fixed or explicitly waived: `HMD_LINT_WAIVER='<reason>' heimdall-state mark-clean` (recorded in `.quality_gates.lint_waiver_log`, voided by the next lint run)
 
 ## Gate 3: Conflict Reflection
 
