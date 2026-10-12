@@ -239,8 +239,10 @@ def live(root, except_pid=None):
 
 
 def stale(root):
-    """The records of the phones whose client is no longer running and that were never revoked: what a crashed client left behind."""
-    return [r for r in records(root) if not r.get("revoked") and not client_alive(r["pid"], root)]
+    """The records of the phones whose client is no longer running and that were never revoked: what a crashed client left behind. A pid
+    that is another repo's live relay client is no crashed client of this one: such a record is planted or foreign, no device of this repo
+    and not this repo's to clean up, so it is not listed here."""
+    return [r for r in records(root) if not r.get("revoked") and not client_alive(r["pid"])]
 
 
 def push_fps_of(root, rec):

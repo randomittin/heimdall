@@ -691,7 +691,9 @@ cleanup() {
     # process's own pending exit code -- a relay pairing session's lifetime
     # is the relay's call, not this process's. (cmd_disconnect_relay is the
     # one place a failed revoke DOES change the exit code, to 8.)
-    [ -z "$STATE_REPO" ] || _stop_device_clients "$STATE_REPO" "$REPO_REAL" || true  # every phone's client (an added one too): each revokes its own relay session
+    # only a connect that wrote its own state (STATE_WRITTEN) owns the session: one refused as "already connected" started nothing and ends nobody's
+    # client -- not the live session's, not a phone's whose record was made from a client older than the records
+    [ "$STATE_WRITTEN" != true ] || [ -z "$STATE_REPO" ] || _stop_device_clients "$STATE_REPO" "$REPO_REAL" || true  # every phone's client (an added one too): each revokes its own relay session
     if ! _relay_stop_client "$CLIENT_PID"; then
       echo "hmd app connect: relay client had to be force-killed -- the pairing session stays open until its token expires" >&2
     fi
