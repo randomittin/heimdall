@@ -298,7 +298,7 @@ def case_prompt():
                     "prompt answered %r -> the client is told %s and the screen says %r" % (answer, word, want),
                     "control %r %s" % (s.read("control"), app.tail()))
             if answer == "y\n":
-                T.check("The phone shows:  817 531" in out and "relay-claimed device name: 'Evil[2J]0;pwnPhone'" in out
+                T.check("The phone shows:  817 531" in out and "relay-claimed device name: 'Evil2J0pwnPhone'" in out
                         and "relay-claimed GitHub user: @octocat" in out,
                         "the prompt shows the SAS as 817 531 and the phone's label and login, each marked relay-claimed (escape bytes gone, the rest is plain text)",
                         out[-500:])
