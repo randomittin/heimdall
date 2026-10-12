@@ -38,3 +38,10 @@ test/lib/relay_ws_cases.py:generic-api-key:210
 test/lib/relay_ws_cases.py:generic-api-key:213
 # benign — RP4 false-green PREREG lock: the sha256 content hash of a frozen upstream test file whose path ends test_cache_keys.py; the rule reads "keys" + 64 hex as a credential. A file digest, no credential. File:rule:line form.
 evals/benchmark/false-green/PREREG.lock.json:generic-api-key:90
+
+# benign test fixture — the 16-hex push-registration refs (a counting run and its reverse) that the second-phone push cases pass to register_push beside a fake Expo push id; the rule misreads the nearby identifier as a credential assignment. A ref is a client-chosen registration handle, not a secret of any kind. The tree now carries low-entropy refs, so these cover only the frozen history copies: the second-phone commit 59ebf056 (2 lines), the carry-over commit 1c83dd4a (2 lines) and the revoke commit f048b724 (1 line). Commit-scoped fingerprints, so no future leak can hide behind them.
+59ebf056a7d032279c5e2028a2d7b4dff3f6d672:test/lib/app_pair_confirm_cases.py:generic-api-key:1952
+59ebf056a7d032279c5e2028a2d7b4dff3f6d672:test/lib/app_pair_confirm_cases.py:generic-api-key:1958
+1c83dd4ace2d50118376c36ef3430733fe034ea1:test/lib/app_upgrade_paired_cases.py:generic-api-key:167
+1c83dd4ace2d50118376c36ef3430733fe034ea1:test/lib/app_upgrade_paired_cases.py:generic-api-key:209
+f048b72482ac04e94c8e52ce70cdbbc202274241:test/lib/app_upgrade_paired_cases.py:generic-api-key:306
