@@ -89,6 +89,12 @@ to drive its own UI; nothing else is ever written to stdout.
     {"event":"device_bound","bound_at":..}            session key derived --
                                                        may repeat across a
                                                        stream reconnect
+    {"event":"code_unavailable","reason":"device-limit"}
+                                                       the repo already has the
+                                                       most phones it may (see
+                                                       MORE THAN ONE PHONE): the
+                                                       token is not even read and
+                                                       no window is registered
     {"event":"state_sent","seq":N,"bytes":B,"delivered":bool}
     {"event":"device_caps","caps":[..]}               the phone's capability set
                                                        (from its latest sealed
@@ -283,6 +289,16 @@ amplification loop: ONE refusal per distinct stale seq (a frame replayed, or sen
 STALE_REFUSAL_MEMORY seqs are remembered) and at most STALE_REFUSAL_BURST refusals in any STALE_REFUSAL_WINDOW_S, whatever
 the flood. A frame past either bound is dropped as it always was -- the `error` event still names it. The refusal is an
 ordinary ack frame: hmd's own next seq and nonce, sealed, delivered under the ACK RETRY rules above.
+
+MORE THAN ONE PHONE. A relay session binds exactly one device, so a repo's second phone is a second client: another process of this
+program, on a relay session of its own, offering the same code once the first phone's bind released it. Each client serves one phone and
+keeps one record of it, <repo>/.heimdall/app/device-<id>.json (bin/lib/hmd_devices.py: label and GitHub login as the relay claimed them,
+paired-at, last seen, capabilities, fingerprints of the push tokens it registered), written through hmd_private_state and removed when the
+client ends. `hmd app status` lists those records; `hmd app disconnect --device X` sends the client of X SIGUSR1, which revokes that phone's
+relay session (its token stops working) and ends this client with session_ended reason "device-revoked", where SIGTERM is the whole run's
+end ("local-disconnect"). A pairing clears the push registrations that no live device holds, never another phone's. At most
+hmd_devices.MAX_DEVICES (4) phones are bound at once; bin/heimdall-app's pair window opens the next window as soon as a client has bound
+a phone. Every phone is checked as the first was: the claim must name this laptop's GitHub login (or, under --confirm, the SAS is compared).
 
 FRAME COMPRESSION AND RESYNC (the FINAL wire of hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md
 Ask 5, section 5; hmdapp's docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with
@@ -484,7 +500,9 @@ PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "compani
 # the pairing marker is the one file this client keeps in a tree a repository controls without going through that
 # module's own walk, so it goes through the same vetted one (no link followed, 0600, ours): bin/lib/hmd_private_state.py
 PRIVATE = _load_module("hmd_private_state", os.path.join(LIB_DIR, "hmd_private_state.py"))
-LOGIN = _load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
+# one record per phone this repo has paired (bin/lib/hmd_devices.py): a relay session binds ONE device, so a second phone is a second client
+DEVICES = _load_module("hmd_devices", os.path.join(LIB_DIR, "hmd_devices.py"))
+LOGIN =_load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
 CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
 VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
 DASH = _load_module("companion_dashboards", os.path.join(LIB_DIR, "companion_dashboards.py"))
@@ -1300,6 +1318,10 @@ class RelayClient:
                                          # starts with none; empty = plain frames only
         self.last_sent_state = None     # the state object of the last state frame sealed --
                                          # what a phone's resync digest is compared with
+        self._device_id = None          # bin/lib/hmd_devices.py: the id of the phone this client serves, once it is bound
+        self._device_meta = None        # what the relay claimed of it: {"label", "gh_login", "via"}
+        self._push_fps = set()          # fingerprints of the push tokens this phone registered (never the tokens)
+        self._device_written_at = 0.0   # time.monotonic() of the last write of the device's record
         self.stop_event = threading.Event()
         self.state_ready = threading.Event()
         self._stopping = False
@@ -1381,6 +1403,51 @@ class RelayClient:
                     emit({"event": "error", "detail": "status write failed: %s" % e})
             else:
                 self._status_failing = False
+        self._touch_device()
+
+    # -- the phone this client serves (bin/lib/hmd_devices.py) ------------------------------------------
+    DEVICE_TOUCH_S = 15.0  # the least time between two refreshes of the record's `last_seen`
+
+    def _record_device(self, label, login, via):
+        """The phone just bound: it gets a record of its own, so that `hmd app status` lists it, `hmd app disconnect --device` can
+        name it, and a second client (another phone, same code) can tell whose push registrations are whose."""
+        if DEVICES is None or self.device_pub is None:
+            return
+        self._device_id = DEVICES.device_id(self.device_pub)
+        self._device_meta = {"label": label, "gh_login": login, "via": via}
+        self._write_device_record()
+
+    def _write_device_record(self):
+        """Write (or refresh) this phone's record. Bookkeeping: a failure is reported, never a reason to drop a pairing."""
+        if DEVICES is None or self._device_id is None:
+            return
+        self._device_written_at = time.monotonic()
+        rec = dict(self._device_meta, v=1, id=self._device_id, code=self._code, bound_at=int(self.bound_at or time.time()),
+                   last_seen=int(time.time()), caps=sorted(self.device_caps), push_fps=sorted(self._push_fps), pid=os.getpid())
+        try:
+            DEVICES.write_record(self.root, rec)
+        except OSError as e:
+            emit({"event": "error", "detail": "device record not written: %s" % e})
+
+    def _touch_device(self):
+        """Refresh `last_seen` (at most every DEVICE_TOUCH_S): called wherever the status file is, i.e. whenever the phone was just answered."""
+        if self._device_id is not None and time.monotonic() - self._device_written_at >= self.DEVICE_TOUCH_S:
+            self._write_device_record()
+
+    def _forget_device(self):
+        """This client is done with its phone (it ended, or was revoked): its record and the push tokens only it held go."""
+        if DEVICES is None or self._device_id is None:
+            return
+        device_id, self._device_id = self._device_id, None
+        try:
+            DEVICES.forget(self.root, device_id)
+        except OSError as e:
+            emit({"event": "error", "detail": "device record not removed: %s" % e})
+
+    def _remove_pairing_traces(self):
+        """What the pairing left that outlives a bind: the statusline's marker and the phone's record."""
+        self._remove_paired_marker()
+        self._forget_device()
 
     # -- HTTP: one-shot requests --------------------------------------------
     def _request(self, method, path, headers=None, body=None, timeout=CONNECT_TIMEOUT_S, label="request"):
@@ -1675,6 +1742,10 @@ class RelayClient:
         key, register the window. Whatever goes wrong ends code mode with ONE code_unavailable event and leaves
         the QR session exactly as it was."""
         self._stdin = _StdinLines(0)
+        if DEVICES is not None and len(DEVICES.live(self.root)) >= DEVICES.max_devices():
+            # the token is not even read: no window is offered for a fifth phone, and nothing is sent to the relay for it
+            self._code_end("code_unavailable", "device-limit")
+            return
         token = self._read_token()
         if token is None:
             self._code_end("code_unavailable", "no-gh")
@@ -1954,18 +2025,21 @@ class RelayClient:
         self.bound_at = pending["bound_at"]
         self.session_key = pending["key"]  # last: the stream thread reads a set key as "paired"
         self._forget_push_registrations()
-        self._rearm_state()
-        self.write_status()
         # `_begin_approval` always names the phone; a bind finished without it (a test driving this directly) is an
         # unnamed one, never a KeyError in the middle of a pairing
         label, login = pending.get("label") or "unnamed device", pending.get("login") or "unknown"
+        returning = self._is_returning_phone()  # before its record is written again
+        self._record_device(label, login, "code")
+        self._rearm_state()
+        self.write_status()
         paired = {"event": "code_paired", "device_label": label, "gh_login": login, "bound_at": self.bound_at}
-        if os.environ.get("HMD_RELAY_REPAIRED") == "1":
-            paired["repaired"] = True  # `hmd app connect` replaced a client a phone had paired to: this pairing is a re-pair
+        repaired = returning or os.environ.get("HMD_RELAY_REPAIRED") == "1"
+        if repaired:
+            paired["repaired"] = True  # the phone had paired here before (its client is gone), or `hmd app connect` replaced a client it had paired to
         emit(paired)
         emit({"event": "device_bound", "bound_at": self.bound_at})
         self.state_ready.set()
-        self._leave_pairing_traces(label, login)  # after state_ready: the first frame never waits on a disk write
+        self._leave_pairing_traces(label, login, repaired)  # after state_ready: the first frame never waits on a disk write
 
     def _claim_is_mine(self, login):
         """True when a claim's GitHub login is the one the relay verified this laptop's token as when it opened the
@@ -1987,7 +2061,16 @@ class RelayClient:
     def _paired_marker_name(self):
         return "paired-%s.json" % self._code
 
-    def _leave_pairing_traces(self, label, login):
+    def _is_returning_phone(self):
+        """True when this phone's key already has a device record whose client is gone: it paired here before and that client ended without
+        removing the record (it crashed), so this pairing by code is the phone coming back -- the app's silent re-pair."""
+        if DEVICES is None or self.device_pub is None:
+            return False
+        dev_id = DEVICES.device_id(self.device_pub)
+        return any(r["id"] == dev_id and r["pid"] != os.getpid() and not DEVICES.client_alive(r["pid"], self.root)
+                   for r in DEVICES.records(self.root))
+
+    def _leave_pairing_traces(self, label, login, repaired=False):
         """A phone paired by code: leave the two things that make that visible to the operator -- the marker the
         statusline reads (`<device> paired via code`, for as long as this process lives) and a notice in the
         session's inbox, which heimdall-inbox-deliver hands the Claude session at its next boundary. Both name the
@@ -2007,11 +2090,16 @@ class RelayClient:
             emit({"event": "error", "detail": "paired marker not written: %s" % e})
         if INBOX is None:
             return
+        phones = len(DEVICES.live(self.root)) if DEVICES is not None else 1
         for shown in (label, "unnamed device"):  # a label the inbox's secret scan refuses must not cost the notice
-            text = ("[hmd notice] A phone just paired to this session by its session code %s. Relay-claimed device "
+            text = ("[hmd notice] A phone just %s to this session by its session code %s. Relay-claimed device "
                     "name: '%s'. GitHub account: @%s, the account this laptop's gh is signed in to. If this was not "
                     "you, run `hmd app disconnect` to end the pairing and `hmd app identity revoke` to sign every "
-                    "phone out." % (self._code, shown, login))
+                    "phone out." % ("re-paired" if repaired else "paired", self._code, shown, login))
+            if phones > 1:  # a phone that added itself while another was bound is told to the operator as exactly that
+                text += (" This is phone %d of the %d this repo allows: it paired while another phone was bound. `hmd app disconnect "
+                         "--device '%s'` removes just this one, and HMD_PAIR_MAX_DEVICES=1 stops the code being offered once a phone "
+                         "is bound." % (phones, DEVICES.max_devices(), shown))
             try:
                 INBOX.append(self.root, text)
                 return
@@ -2089,6 +2177,7 @@ class RelayClient:
             had_ask = ASK is not None and ASK.CAP_ASK in self.device_caps
             self.device_caps = caps
             emit({"event": "device_caps", "caps": sorted(caps)})
+            self._write_device_record()  # no-op until the phone is bound: a bind's own reset comes before its record
             if LOGIN is not None and LOGIN.CAP_LOGIN in caps and not had_login:
                 self._rearm_state()  # state.login rides only for a phone that lists login-v1: send it now
             if VIEW is not None and (VIEW.CAP_VIEW in caps) != had_view:
@@ -2163,6 +2252,9 @@ class RelayClient:
             return False, e.code, {}
         except OSError:
             return False, "write-failed", {}
+        if DEVICES is not None:
+            self._push_fps.add(DEVICES.token_fp(params["token"]))
+            self._write_device_record()  # so a revoke of THIS phone takes out its registration, and no other phone's
         return True, None, {"ref": entry["ref"], "events": entry["events"]}
 
     def _unregister_push(self, params):
@@ -2183,6 +2275,10 @@ class RelayClient:
             return False, e.code, {}
         except OSError:
             return False, "write-failed", {}
+        if DEVICES is not None and self._push_fps:
+            still_held = {DEVICES.token_fp(entry["token"]) for entry in PUSH_STORE.load(self.root)["tokens"]}
+            self._push_fps &= still_held
+            self._write_device_record()
         return True, None, {"ref": ref, "removed": removed}
 
     def _app_state(self, params):
@@ -2215,9 +2311,13 @@ class RelayClient:
         if PUSH_STORE is None:
             return
         try:
+            # another phone of this repo, bound through a client of its own, keeps what IT registered: only tokens no live device holds go
+            keep = DEVICES.held_push_fps(self.root, os.getpid()) if DEVICES is not None else set()
             held = PUSH_STORE.load(self.root)
-            if held["tokens"] or held["app_state"] != "unknown":
-                PUSH_STORE.remove_tokens(self.root, [entry["token"] for entry in held["tokens"]])
+            doomed = [entry["token"] for entry in held["tokens"] if not keep or DEVICES.token_fp(entry["token"]) not in keep]
+            if doomed:
+                PUSH_STORE.remove_tokens(self.root, doomed)
+            if not keep and held["app_state"] != "unknown":
                 PUSH_STORE.set_app_state(self.root, "unknown")
         except OSError as e:
             emit({"event": "error", "detail": "push registrations from an earlier session were not cleared: %s" % e})
@@ -2570,6 +2670,9 @@ class RelayClient:
             self.bound_at = payload.get("bound_at")
             self._code_bound()
             self._forget_push_registrations()
+            qr_login = payload.get("gh_login")
+            self._record_device(clean_text(payload.get("device_label") or "", 32) or "unnamed device",
+                                qr_login if valid_login(qr_login) else "unknown", "qr")
             # §7c, 2026-09-25: force the next tick to re-send state even if its
             # digest hasn't changed since the last publish. A (re)bind means the
             # phone's own local state was just reset -- INV-22's digest dedup
@@ -2921,7 +3024,7 @@ class RelayClient:
         self._gh_secret = None  # a stopped client offers no code window, so it keeps no token
         self._login_shutdown()  # before the (network-bound) revoke: a login process must not outlive us
         self.revoke()
-        self._remove_paired_marker()
+        self._remove_pairing_traces()
         self.write_status()
         emit({"event": "session_ended", "reason": reason})
 
@@ -3063,11 +3166,22 @@ def main(argv=None):
         return rc
 
     def _on_signal(_signum, _frame):
+        if client._stopping:
+            return  # a second signal while the first is still revoking the session: let that finish, never cut it short
         client.shutdown("local-disconnect")
+        sys.exit(0)
+
+    def _on_device_revoke(_signum, _frame):
+        # `hmd app disconnect --device`: this phone's session is revoked and nobody else's. It is a reason of its own so that the
+        # supervisor of a `hmd app connect` run, which ends on a local disconnect, knows this one is not the whole run's end.
+        if client._stopping:
+            return
+        client.shutdown("device-revoked")
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGUSR1, _on_device_revoke)
 
     if args.code:
         client.code_start()  # after the signal handlers: Ctrl-C while the window registers still revokes
@@ -3080,7 +3194,7 @@ def main(argv=None):
     stream_thread.start()
 
     client.run_state_loop()
-    client._remove_paired_marker()  # an end the relay announced (session_ended) comes here, not through shutdown()
+    client._remove_pairing_traces()  # an end the relay announced (session_ended) comes here, not through shutdown()
     if client.exit_code:
         client.shutdown("code-window-ended")  # a --code-only window that ended here: the session it left open is revoked
     return client.exit_code
