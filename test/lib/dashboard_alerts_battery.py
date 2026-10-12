@@ -455,7 +455,13 @@ tick(second, 1)
 T.check(len(sender.messages()) == 1 and len(spooled()) == 1, "a monitor that does not own the sender lock sends nothing and leaves the file for the owner", (len(sender.messages()), spooled()))
 tick(owner, 2)
 T.check(len(sender.messages()) == 2 and spooled() == [], "the owner then serves it exactly once", (len(sender.messages()), spooled()))
+# set_app_state stamps the WALL clock but the monitors run on `clock` (T0 + 6000, 01:40 UTC): read against it, a report stamped before ~01:27 UTC
+# is older than foreground_ttl_s (900 s), so for the first 87 minutes of every UTC day the suppression asserted below silently did not apply.
+# The record is still written and sealed by the store itself; only its timestamp is moved onto the clock the monitors read it on.
+wall_stamp = STORE._now_iso
+STORE._now_iso = lambda: T.iso(clock[0])
 STORE.set_app_state(ROOT, "foreground")
+STORE._now_iso = wall_stamp
 enqueue(3)
 tick(owner, 3)
 T.check(len(sender.messages()) == 2 and any(e.get("kind") == "tile_alert" and e.get("suppressed") == "foreground" for e in events),
