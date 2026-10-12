@@ -197,7 +197,9 @@ equiv() {
   # order the kernel schedules them, so line order is not a property of the
   # program — the multiset of executed statements is.
   # ...and the push matcher (delta 3): its setup lines and its `grep -qE ...push...` call differ by design.
-  local mtr='^\+ (SQ=|GP_|grep -qE .*push)'
+  # the kill guard (2026-10-12) adds GP_KILL_NORM (one tr) and one case on it, dropped the same way (its python3 call only runs for kill commands);
+  # test/hmd-server-kill-guard.test.sh pins its behaviour
+  local mtr='^(\+ (SQ=|GP_|case |grep -qE .*push)|\+\+ tr -d )'
   grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | grep -vE "$mtr" | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
   LC_ALL=C sort "$TMPROOT/$tag.trace-inline.err" | grep -vE "$mtr" > "$TMPROOT/$tag.trace-inline.sorted"
   # denies are exempt from the trace comparison: the stderr mirror is a statement the string never had
