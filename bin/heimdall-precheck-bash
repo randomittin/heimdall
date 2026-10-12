@@ -120,6 +120,37 @@ GP_START='(^|[;&|({`!]|\$\(|(^|[[:space:]])(then|do|else|elif)[[:space:]]|(sh|ba
 GP_PRE='([A-Za-z_][A-Za-z0-9_]*='"$GP_VAL"'[[:space:]]+|(sudo|command|env|exec|time|nohup|nice|builtin|xargs)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)*'
 GP_OPT='([[:space:]]+(-[Cc][[:space:]]+'"$GP_VAL"'|--(git-dir|work-tree|namespace|super-prefix|config-env)[[:space:]]+'"$GP_VAL"'|--?[A-Za-z][A-Za-z-]*(='"$GP_VAL"')?))*'
 GP_RE="${GP_START}${GP_PRE}([^[:space:]]*/)?git${GP_OPT}[[:space:]]+push([[:space:]]|\$|[;&|)}\"${SQ}])"
+# KILLS BY NAME OR BY A COMPUTED PID are denied (2026-10-12 16:29Z incident). A sub-agent debugging its own temp-repo test ran
+# `pkill -f heimdall-relay-client`; the pattern matched EVERY relay client on the machine -- the operator's two live phone
+# clients and the routine's -- and a client answers SIGTERM by revoking its phone pairing, so both phones were unpaired. A text
+# match on the name is walked around by quoting, a character class, a partial pattern, a variable, a looked-up pid, xargs,
+# sh -c or env/command/exec, so bin/lib/hmd_kill_guard.py reads the command the way a shell does and denies pkill/killall of
+# any pattern and kill of anything that is not a literal pid (its docstring has the rule).
+#
+# BEST-EFFORT DEFENSE IN DEPTH, NOT A SECURITY BOUNDARY: no text guard on shell is complete (bash grammar is larger than any
+# lexer here, and a verb can be built at run time). The protection that does not depend on reading shell is that a stray
+# signal must not be able to unpair a phone (a design decision still open with the operator).
+#
+# FAILS CLOSED. The guard runs for any command that mentions kill or fuser, in any case, once quotes and backslashes are
+# removed (so p''kill and PKILL are still caught; starting python is not free). Only `ok` with exit 0 passes: exit 3 denies with
+# the guard's reason, and ANYTHING else -- a crash, no output, python3 or the helper missing -- denies too, because a guard that
+# could not answer has not cleared the command. The quotes are removed with tr, not ${CMD//[...]/}: bash's pattern
+# substitution is quadratic and took minutes on a 100 KB command. Its own xtrace lines (GP_KILL_*, one tr, one case) are
+# dropped by equiv() in test/heimdall-precheck-bash.test.sh; test/hmd-server-kill-guard.test.sh pins the rest.
+GP_KILL_NORM=$(tr -d "'\"\\\\" <<<"$CMD")
+case $GP_KILL_NORM in
+  *[Kk][Ii][Ll][Ll]*|*[Ff][Uu][Ss][Ee][Rr]*)
+    GP_KILL_WHY=$(python3 -I -S "$PLUGIN/bin/lib/hmd_kill_guard.py" <<<"$CMD" 2>/dev/null)
+    GP_KILL_RC=$?
+    case $GP_KILL_RC:$GP_KILL_WHY in
+      0:ok) ;;
+      *)
+        [ "$GP_KILL_RC" = 3 ] || GP_KILL_WHY="the guard itself failed (exit $GP_KILL_RC) or said nothing, so this command could not be checked"
+        GP_KILL_ESC=$(printf '%s' "$GP_KILL_WHY" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+        # shellcheck disable=SC2016  # the deny message quotes $! literally
+        deny "$(printf '{"error": "BLOCKED: hmd kill guard: %s. A kill by name or by a computed pid can hit EVERY heimdall-relay-client, heimdall-app and hmd-ui on this machine, including the operator live phone relay clients, and SIGTERM makes a client revoke its phone pairing (2026-10-12 16:29Z: one pkill -f heimdall-relay-client unpaired two live phones). Read the pid first (pgrep -fl, ps, lsof -ti) and kill the literal number of a process you started: kill 4242, or kill $! right after starting it in the background. Reap leftovers of temp repos with heimdall-gc uis, which only ever selects orphans whose --repo is gone or a temp dir. Ending a real client is the operator job: hmd app disconnect. This guard is best-effort defense in depth, not a security boundary."}' "$GP_KILL_ESC")" ;;
+    esac ;;
+esac
 if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
   HSTATE="$PLUGIN/bin/heimdall-state"
   [ -x "$HSTATE" ] || HSTATE=heimdall-state
