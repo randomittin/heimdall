@@ -124,7 +124,7 @@ nonverified() { printf 'NON_VERIFIED\t%s\n' "$1" >&2; exit 3; }
 check_commit_per_unit() {
   [ -d "$WORKTREES" ] || nonverified "commit-per-unit: no worktree root at $WORKTREES"
 
-  local d id dirty live total=0 inspected=0 t age now
+  local d id dirty total=0 inspected=0 t age now
   now="$(hmd_live_now)"
 
   for d in "$WORKTREES"/agent-*; do
@@ -437,8 +437,8 @@ _selfcheck_detector() {
 # That is unambiguous waste, and it is what actually happened 7 times today.
 check_gate_runs_once() {
   _load_events
-  local ts kind detail pending="" gates=0 dupes=0
-  while IFS=$'\t' read -r ts kind detail; do
+  local ts kind _ pending="" gates=0 dupes=0
+  while IFS=$'\t' read -r ts kind _; do
     [ -n "${kind:-}" ] || continue
     if [ "$kind" = "GATE" ]; then
       gates=$((gates + 1))
@@ -466,8 +466,8 @@ EOF
 # consumes the full 1374s to tell you something you already knew.
 check_gates_at_end() {
   _load_events
-  local ts kind detail seen_mutate=0 gates=0 early=0
-  while IFS=$'\t' read -r ts kind detail; do
+  local ts kind _ seen_mutate=0 gates=0 early=0
+  while IFS=$'\t' read -r ts kind _; do
     [ -n "${kind:-}" ] || continue
     if [ "$kind" = "MUTATE" ]; then
       seen_mutate=1

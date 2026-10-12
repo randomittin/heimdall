@@ -47,7 +47,7 @@ export HEIMDALL_STATE_FILE="$WORK/heimdall-state.json"
 # this repo's own checkout. A non-git cwd makes that block a documented no-op
 # (test/sweep-receipt-gate.test.sh section I), so only the reflection-flag logic
 # under test can affect the verdict here.
-cd "$WORK"
+cd "$WORK" || exit 1
 
 # ══════════════════════════════════════════════════════════════════════════
 # Setup: fresh state, bypass the tests/lint gates so only reflection is live
