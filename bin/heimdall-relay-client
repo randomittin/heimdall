@@ -94,6 +94,8 @@ to drive its own UI; nothing else is ever written to stdout.
                                                        session a former client left bound
                                                        to its phone (SESSION RESUME below):
                                                        no pair_init, no QR, no re-pair
+    {"event":"resume_none"}                           --resume-only found no stored login to resume (a client
+                                                       for ONE more phone; it never pairs): the process ends 0
     {"event":"code_unavailable","reason":"device-limit"}
                                                        the repo already has the
                                                        most phones it may (see
@@ -3280,6 +3282,9 @@ def build_argparser():
                      help="attach to the relay session a former client of this repo left bound to its phone (its login is stored outside "
                           "the repo, see SESSION RESUME) instead of opening a new one, when it was last alive within "
                           "HMD_SESSION_RESUME_H hours; with none to resume, pair as usual")
+    ap.add_argument("--resume-only", action="store_true",
+                    help="like --resume, but never pairs: a client for ONE more phone whose login is stored (each phone has a client of its own; "
+                         "`hmd app connect` and the pair window start one per stored login). With none to resume it says resume_none and exits 0")
     return ap
 
 
@@ -3335,6 +3340,8 @@ def main(argv=None):
         ap.error("--no-confirm needs --code")
     if args.code_only and not args.code:
         ap.error("--code-only needs --code")
+    if args.resume_only and (args.code or args.code_only or args.resume):
+        ap.error("--resume-only serves a phone that is paired already: it takes no --code, --code-only or --resume")
 
     # Configured before the first possible emit() below (mirrors _split_relay
     # being computed here AND again inside RelayClient.__init__ -- a cheap
@@ -3371,7 +3378,10 @@ def main(argv=None):
         return 11
 
     client = RelayClient(args)
-    resumed = args.resume and client.resume()
+    resumed = (args.resume or args.resume_only) and client.resume()
+    if args.resume_only and not resumed:
+        emit({"event": "resume_none"})  # another client took the login first, or none is stored any more: a phone is never paired from here
+        return 0
     if not resumed:
         client.priv, client.pub = E2E.generate_keypair()
         rc = client.pair_init()

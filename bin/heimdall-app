@@ -261,6 +261,12 @@
 #                              client of an added phone is not replaced: run add-device again. Exit 0 a phone
 #                              paired, 1 none did (expired, refused, nothing to add to), 2 usage or tooling, 3 gh
 #                              signed out, 64 --confirm without a terminal.
+#   (a restart)                Every paired phone comes back by itself, the first and each one added with add-device: a relay session binds ONE
+#                              phone, so each has a client of its own and the login of its session stored (bin/lib/hmd_session_login.py). `hmd app
+#                              connect` -- also its supervisor's respawn and its look every HMD_RESUME_RECONCILE_S seconds (default 15) -- and the
+#                              SessionStart pair window start one `heimdall-relay-client --resume-only` for every stored login no live client
+#                              serves, each resuming ITS phone's session (its own seq blocks, the store lock) while that phone's client was last
+#                              alive within HMD_SESSION_RESUME_H hours (default 24; per phone). No phone is asked to pair again.
 #   hmd app doctor [--repo DIR] [--https-port 443|8443|10000] [--relay URL]
 #                              One line per check, a fix hint on every failure.
 #                              Exits 0 only if every check passes. With
@@ -1918,6 +1924,8 @@ _relay_respawn() {
   exec 4<"$ctl/in"
   rm -rf "$ctl"
   read -r win_s min_s lead_s event_s <<<"$(_connect_window_knobs false)"
+  local resume_n
+  resume_n="$(_resumable_count "$REPO" "$RELAY_URL")"  # before the client below takes one: the other phones' logins get a client each
   : >"$CLIENT_OUT"
   : >"$CLIENT_ERR"
   HMD_RELAY_REPAIRED="$repaired" HMD_RELAY_CODE_WINDOW_S="$win_s" HMD_RELAY_CODE_RENEW_MIN_S="$min_s" HMD_RELAY_CODE_RENEW_LEAD_S="$lead_s" \
@@ -1928,6 +1936,7 @@ _relay_respawn() {
   printf '%s\n' "$tok" >&3
   tok=""
   exec 3>&-
+  _resume_phones "$REPO" "$RELAY_URL" "$actual_port" "$relay_host" $((resume_n > 0 ? resume_n - 1 : 0))
   generation=$((generation + 1))
   started_ts="$(date +%s)"
   seen_lines=0 pair_init_seen=false code_resolved=false code_active=false client_gone=false
@@ -1982,6 +1991,12 @@ _relay_loop() {
     fi
 
     _relay_drain
+
+    # a phone whose client died (an added phone's has no supervisor of its own) is brought back: once the client above has settled which
+    # session it serves, any stored login no live client holds gets a client of its own
+    if [ "$pair_init_seen" = true ] && _resume_due; then
+      _resume_phones "$REPO" "$RELAY_URL" "$actual_port" "$relay_host"
+    fi
 
     # a window that ran out is followed by the next one at once, not when the relay ends the unclaimed session a minute on: the client
     # is asked to stop, which revokes its session and frees the code
@@ -2108,6 +2123,9 @@ cmd_connect_relay() {
   relay_host="$(printf '%s' "$RELAY_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*$##; s#:.*$##')"
 
   local client_args=(--relay "$RELAY_URL" --repo "$REPO" --ui-port "$actual_port" --public-host "$relay_host")
+  # counted BEFORE the client below starts: it resumes one stored login, and every other phone's login gets a client of its own (_resume_phones)
+  local resume_n
+  resume_n="$(_resumable_count "$REPO" "$RELAY_URL")"
   # a client that was stopped did not unpair its phone: this one (and every respawn of it) resumes that session when its login is stored
   client_args+=(--resume)
   if [ "$code_requested" = true ]; then
@@ -2157,6 +2175,7 @@ cmd_connect_relay() {
   if _relay_write_state; then
     STATE_WRITTEN=true
     _tmux_optin_say
+    _resume_phones "$REPO" "$RELAY_URL" "$actual_port" "$relay_host" $((resume_n > 0 ? resume_n - 1 : 0))  # every other paired phone comes back too
   else
     echo "hmd app connect: connect.json could not be written -- tearing down" >&2
     return 2
@@ -2457,6 +2476,54 @@ _connect_capped() {
   printf '%s' "$h" | grep -Eq '^[0-9]+(\.[0-9]+)?$' && awk -v h="$h" 'BEGIN { exit !(h > 0) }'
 }
 
+# _resumable_count REPO RELAY -- how many phones have a stored login a client could resume right now (bin/lib/hmd_session_login.py: this relay,
+# within HMD_SESSION_RESUME_H, no live client serving it, its secret readable). 0 when that cannot be told.
+_resumable_count() {
+  local n=""
+  [ -n "$PY3" ] && n="$("$PY3" "$LIB_DIR/hmd_session_login.py" resumable --repo "$1" --relay "$2" 2>/dev/null | jq -r 'length' 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+# _resume_due -- 0 at most every HMD_RESUME_RECONCILE_S seconds (default 15): time for the next look for a phone whose client is gone.
+RESUME_NEXT_AT=0
+_resume_due() {
+  local every="${HMD_RESUME_RECONCILE_S:-15}"
+  case "$every" in ''|*[!0-9]*) every=15 ;; esac
+  [ "$SECONDS" -ge "$RESUME_NEXT_AT" ] || return 1
+  RESUME_NEXT_AT=$((SECONDS + every))
+  return 0
+}
+
+# _resume_phones REPO RELAY PORT HOST [N] -- every paired phone comes back by itself: a relay session binds ONE phone, so each phone whose stored
+# login can be resumed gets a `heimdall-relay-client --resume-only` of its own (it claims one login under the store lock and never pairs; a
+# phone's login keeps its own seq blocks). N of them are started -- N omitted: one per resumable login right now; a caller that starts a --resume
+# client itself counts before it starts it and passes one less, since that client takes one. Returns once each started client serves its phone
+# (a device record names it) or has ended, at most 30 s: a pair window offers its code, and counts the phones, only after the phones are back.
+_resume_phones() {
+  local repo="$1" relay="$2" port="$3" host="$4" n="${5:-}" i=0 pid pids="" pending waited=0
+  [ -n "$PY3" ] && [ -x "$RELAY_CLIENT_BIN" ] || return 0
+  [ -n "$n" ] || n="$(_resumable_count "$repo" "$relay")"
+  case "$n" in ''|*[!0-9]*) return 0 ;; esac
+  while [ "$i" -lt "$n" ]; do
+    nohup "$RELAY_CLIENT_BIN" --relay "$relay" --repo "$repo" --ui-port "${port:-0}" --public-host "$host" --resume-only </dev/null >/dev/null 2>&1 &
+    pids="$pids $!"
+    disown "$!" 2>/dev/null || true
+    i=$((i + 1))
+  done
+  while [ -n "$pids" ] && [ "$waited" -lt 60 ]; do
+    pending=""
+    for pid in $pids; do
+      kill -0 "$pid" 2>/dev/null || continue
+      "$PY3" "$LIB_DIR/hmd_devices.py" has-pid --repo "$repo" "$pid" >/dev/null 2>&1 || pending="$pending $pid"
+    done
+    pids="$pending"
+    [ -z "$pids" ] || sleep 0.5
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
 # _dev_count REPO -- how many phones of REPO are paired right now: the live relay clients with a device record (bin/lib/hmd_devices.py,
 # which reads <repo>/.heimdall/app/device-*.json through hmd_private_state: no link followed). 0 when that cannot be told.
 _dev_count() {
@@ -2583,6 +2650,7 @@ cmd_pair_window_loop() {
   # no state file, no way to stop this by name: a supervisor that cannot be found does not run
   limit="$(_dev_limit)"
   _pw_write_state starting || return 1
+  _resume_phones "$PW_REPO" "$PW_RELAY" 0 "$PW_RELAY_HOST"  # after a restart every paired phone comes back before the window offers its code
   while :; do
     _pw_refresh_owners
     _pw_owner_alive || break
@@ -2604,6 +2672,7 @@ cmd_pair_window_loop() {
     started="$(date +%s)"
     _pw_write_state running
     while kill -0 "$PW_CLIENT_PID" 2>/dev/null; do
+      if _resume_due; then _resume_phones "$PW_REPO" "$PW_RELAY" 0 "$PW_RELAY_HOST"; fi  # a phone whose client died comes back
       _pw_refresh_owners
       if ! _pw_owner_alive; then
         _pw_stop_clients

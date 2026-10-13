@@ -31,6 +31,7 @@ nothing to claim. A login a revoke removed cannot be brought back: every writer 
 
 CLI (the shell tools; nothing secret is ever printed):
     python3 hmd_session_login.py list   --repo DIR                                   the logins of that repo, as JSON, secret-free
+    python3 hmd_session_login.py resumable --repo DIR --relay URL                    the logins a client could resume now (one client per phone), as JSON
     python3 hmd_session_login.py revoke --repo DIR (--device-id ID | --all)           revoke those sessions AT THE RELAY with the stored
         login and discard what was confirmed. exit 0 every one confirmed (revoked, or the relay says it is already gone), 1 one or more
         could NOT be confirmed (the reason on stderr; an unreachable relay keeps the login so the command can be run again; a login
@@ -324,6 +325,26 @@ def load_resumable(root, relay, reserve=SEQ_BLOCK):
 
 
 # -- revoking at the relay with a stored login --------------------------------------------------------------------------------------
+def resumable(root, relay):
+    """The logins a client could claim right now (public records, newest first): this relay, not `revoking`, its client last alive within
+    HMD_SESSION_RESUME_H -- a login past it is discarded here, as load_resumable does -- no live client holding it and its secret readable.
+    What `hmd app connect` and the pair window count to start one client per phone (a relay session binds exactly one)."""
+    limit = resume_limit_s()
+    found = []
+    with _locked():
+        for rec in records(root):
+            if not _same_relay(rec.get("relay"), relay) or rec.get("revoking"):
+                continue
+            if time.time() - float(rec.get("last_alive") or 0) > limit:
+                _discard_unlocked(root, rec["session_id"])
+                continue
+            mark = rec.get("hmd_seq")
+            if _held(root, rec.get("pid")) or secret_of(root, rec) is None or not isinstance(mark, int) or isinstance(mark, bool) or mark < 0:
+                continue
+            found.append(public(rec))
+    return found
+
+
 def _revoke_at_relay(rec, token, timeout=15):
     """POST /session/:id/revoke with the stored bearer: "revoked", "gone" (the relay no longer has it: 404/410), "rejected" (it does not
     accept this login: 401/403) or "failed: why". No proxy -- the relay client dials the relay directly too."""
@@ -542,7 +563,8 @@ def _revoke_logins(root, device_id=None, forget_local=False):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hmd_session_login.py", description=__doc__.split("\n")[0])
-    ap.add_argument("action", choices=("list", "revoke"))
+    ap.add_argument("action", choices=("list", "revoke", "resumable"))
+    ap.add_argument("--relay", default=None, help="resumable: the relay whose logins are counted")
     ap.add_argument("--repo", required=True)
     ap.add_argument("--device-id", default=None)
     ap.add_argument("--all", action="store_true")
@@ -552,6 +574,11 @@ def main(argv=None):
     root = os.path.realpath(args.repo)
     if args.action == "list":
         print(json.dumps([public(r) for r in records(root)], sort_keys=True))
+        return 0
+    if args.action == "resumable":
+        if not args.relay:
+            ap.error("resumable takes --relay URL")
+        print(json.dumps([{"session_id": r["session_id"], "device_id": r.get("device_id")} for r in resumable(root, args.relay)], sort_keys=True))
         return 0
     if bool(args.device_id) == bool(args.all):
         ap.error("revoke takes --device-id ID or --all")

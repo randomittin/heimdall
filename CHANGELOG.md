@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   printed, the stored login (Keychain item and file) is deleted under the store lock, and a `session_login_forgotten` event (`relay-events.jsonl`) and a line in
   `$HEIMDALL_HOME/logs/app.log` record session, device, expiry and that the relay was NOT told. Exit 0 only once the delete and its log succeeded. Test:
   `test/app-session-forget-local.test.sh`.
+- `hmd app`: every paired phone comes back by itself after a restart, not only the first. A relay session binds one phone, so each phone has a client of its own and the
+  login of its session stored; `hmd app connect` (also its supervisor's respawn, and its look every `HMD_RESUME_RECONCILE_S` seconds, default 15) and the SessionStart pair
+  window now start one `heimdall-relay-client --resume-only` for every stored login that no live client serves, each resuming its own phone's session (its own seq blocks and
+  store lock, no re-pair, no nonce reuse) while that phone's client was last alive within `HMD_SESSION_RESUME_H` hours -- the limit applies per phone. Phones added with
+  `hmd app add-device` are included. `--resume-only` never pairs: with no login left to claim it says `resume_none` and exits 0. Test: `test/app-session-multi-resume.test.sh`.
 
 ## Changelog status
 
