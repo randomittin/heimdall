@@ -197,7 +197,7 @@ equiv() {
   # order the kernel schedules them, so line order is not a property of the
   # program — the multiset of executed statements is.
   # ...and the push matcher (delta 3): its setup lines and its `grep -qE ...push...` call differ by design.
-  # the kill guard (2026-10-12) adds GP_KILL_NORM (one tr) and one case on it, dropped the same way (its python3 call only runs for kill commands);
+  # the kill guard (2026-10-12) adds GP_KILL_NORM (one tr) and one case on it, and its HMD_KILL_GUARD opt-out (2026-10-13) one case more, dropped the same way (its python3 call only runs for kill commands);
   # test/hmd-server-kill-guard.test.sh pins its behaviour
   # the lint-since-push guard (2026-10-12, c6e42770) sets SLINT and opens with a second [ N = 2 ] test on the gate's verdict, ahead of the gate's own:
   # SLINT= is dropped like the matcher's lines, and of the [ N = 2 ] tests exactly ONE is dropped from the script's side, by count, so the gate's own

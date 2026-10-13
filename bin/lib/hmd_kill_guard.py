@@ -31,6 +31,7 @@ able to unpair a phone (a design decision still open with the operator). Do not 
 Protocol: the command text on stdin; stdout `ok` and exit 0 = nothing wrong; one reason line and exit 3 = deny. Anything else (a
 crash, no output, another exit status) is NOT a clearance, and bin/heimdall-precheck-bash denies on it. A command that does not
 mention kill (or fuser) is not this guard's business and gets `ok`. HMD_KILL_GUARD_TIMEOUT_S (default 5) bounds the run.
+HMD_KILL_GUARD=off (also 0, false, no) is read by the hook, bin/heimdall-precheck-bash, which then never starts this file.
 """
 import os
 import re

@@ -54,6 +54,9 @@
 #   SECRET_SCAN_REQUIRE is SET (=1) by this script for the push-range scan.
 #   Anything the delegated bins read (HMD_GIT_GUARD_PGREP, HEIMDALL_HOME, ...)
 #   passes straight through.
+#   HMD_KILL_GUARD     off, 0, false or no (any case) turns the kill guard off: none of it runs and nothing is printed.
+#                       Unset or any other value leaves it ON. Only that guard: every other gate still runs. An env switch,
+#                       not `heimdall-hooks disable`: the guard sits in this chain, a LOCKED hooks.json group.
 #
 # Deliberately NO `set -e`, `set -u` or `pipefail`: the inline string ran under
 # Claude Code's plain `sh -c`/`bash -c` defaults, and its logic depends on them —
@@ -62,7 +65,7 @@
 #
 # -h, --help   print this header (the hook never passes arguments).
 case "${1:-}" in
-  -h|--help) sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 # SINCE THE EXTRACTION — three deliberate deltas from the historical inline chain
@@ -137,7 +140,16 @@ GP_RE="${GP_START}${GP_PRE}([^[:space:]]*/)?git${GP_OPT}[[:space:]]+push([[:spac
 # could not answer has not cleared the command. The quotes are removed with tr, not ${CMD//[...]/}: bash's pattern
 # substitution is quadratic and took minutes on a 100 KB command. Its own xtrace lines (GP_KILL_*, one tr, one case) are
 # dropped by equiv() in test/heimdall-precheck-bash.test.sh; test/hmd-server-kill-guard.test.sh pins the rest.
-GP_KILL_NORM=$(tr -d "'\"\\\\" <<<"$CMD")
+# OPT-OUT (2026-10-13): HMD_KILL_GUARD=off, 0, false or no (any case) turns this guard off for an operator who finds it too broad (it
+# denies every pkill and killall). None of it runs then -- not the tr below, not python3, not the helper -- and nothing is printed.
+# Unset, empty or any other value leaves it ON, so a typo cannot silently remove it, and it switches off THIS guard only: the commit
+# secret gate and the push gates still run. It is an environment switch and not `heimdall-hooks disable <id>` on purpose: that tool
+# names one hooks.json group, this guard sits inside bash-gate-chain, which is LOCKED because it also carries the secret and push
+# gates, and a metadata entry with no live group fails `heimdall-hooks check`. The deny below tells the user about the switch.
+case ${HMD_KILL_GUARD:-} in
+  [Oo][Ff][Ff]|0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]) GP_KILL_NORM= ;;
+  *) GP_KILL_NORM=$(tr -d "'\"\\\\" <<<"$CMD") ;;
+esac
 case $GP_KILL_NORM in
   *[Kk][Ii][Ll][Ll]*|*[Ff][Uu][Ss][Ee][Rr]*)
     GP_KILL_WHY=$(python3 -I -S "$PLUGIN/bin/lib/hmd_kill_guard.py" <<<"$CMD" 2>/dev/null)
@@ -148,7 +160,7 @@ case $GP_KILL_NORM in
         [ "$GP_KILL_RC" = 3 ] || GP_KILL_WHY="the guard itself failed (exit $GP_KILL_RC) or said nothing, so this command could not be checked"
         GP_KILL_ESC=$(printf '%s' "$GP_KILL_WHY" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
         # shellcheck disable=SC2016  # the deny message quotes $! literally
-        deny "$(printf '{"error": "BLOCKED: hmd kill guard: %s. A kill by name or by a computed pid can hit EVERY heimdall-relay-client, heimdall-app and hmd-ui on this machine, including the operator live phone relay clients, and SIGTERM makes a client revoke its phone pairing (2026-10-12 16:29Z: one pkill -f heimdall-relay-client unpaired two live phones). Read the pid first (pgrep -fl, ps, lsof -ti) and kill the literal number of a process you started: kill 4242, or kill $! right after starting it in the background. Reap leftovers of temp repos with heimdall-gc uis, which only ever selects orphans whose --repo is gone or a temp dir. Ending a real client is the operator job: hmd app disconnect. This guard is best-effort defense in depth, not a security boundary."}' "$GP_KILL_ESC")" ;;
+        deny "$(printf '{"error": "BLOCKED: hmd kill guard: %s. A kill by name or by a computed pid can hit EVERY heimdall-relay-client, heimdall-app and hmd-ui on this machine, including the operator live phone relay clients, and SIGTERM makes a client revoke its phone pairing (2026-10-12 16:29Z: one pkill -f heimdall-relay-client unpaired two live phones). Read the pid first (pgrep -fl, ps, lsof -ti) and kill the literal number of a process you started: kill 4242, or kill $! right after starting it in the background. Reap leftovers of temp repos with heimdall-gc uis, which only ever selects orphans whose --repo is gone or a temp dir. Ending a real client is the operator job: hmd app disconnect. This guard is best-effort defense in depth, not a security boundary. If it is too broad for you, turn it off with HMD_KILL_GUARD=off (0, false or no also work) in the environment Claude Code runs in; nothing else in this hook is affected."}' "$GP_KILL_ESC")" ;;
     esac ;;
 esac
 if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
