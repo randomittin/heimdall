@@ -36,6 +36,10 @@
 # independent of the real host's memory entirely — see
 # test/heimdall-memory-budget.test.sh for that tool's own contract.
 set -uo pipefail
+# Every temp path this suite makes lives under ONE private dir that is removed on exit, so a standalone run of this file leaves
+# nothing behind either (test/run-all.sh reports the suites that do).
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-pool-memory-limit.XXXXXX")" || exit 1; export TMPDIR
+trap 'rm -rf "$TMPDIR"' EXIT
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"

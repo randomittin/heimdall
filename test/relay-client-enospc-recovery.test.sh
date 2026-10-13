@@ -92,7 +92,7 @@ While the file FLAG exists the disk is "full": every write this process makes to
 OSError(ENOSPC) -- stdout and stderr (regular files, as `hmd app connect --relay` redirects them), open() /
 os.fdopen() writes, os.write(), and the creation of a new file by open() / os.open(). Reads, sockets, pipes
 and child processes are untouched. Removing FLAG is "space came back". The code under test imports nothing
-from here: only the primitives it calls are wrapped. SIGUSR2 writes the live thread names to FLAG.threads (SIGUSR1 stays with the relay client: it revokes the phone)."""
+from here: only the primitives it calls are wrapped. SIGUSR2 writes the live thread names to FLAG.threads (SIGUSR1 stays with the relay client, which ignores it: a signal is no revoke)."""
 import builtins
 import errno
 import io

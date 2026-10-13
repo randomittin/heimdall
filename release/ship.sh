@@ -45,8 +45,8 @@
 #   release/ship.sh --print-next   print the next version per the bump flag, exit (no mutation)
 #   release/ship.sh --check    local scan + pending-commit preview, do NOT push/bump
 #   release/ship.sh --dry-run  print the exact `gh release` + `npm publish` commands, publish NOTHING
-#   release/ship.sh --release-only  publish the manifest's current version (orphan recovery)
-#   release/ship.sh --npm-only publish the manifest's current version to npm ONLY (npm drift recovery)
+#   release/ship.sh --release-only  publish the manifest's current version (orphan recovery; signs the tagged commit's install.sh)
+#   release/ship.sh --npm-only publish the manifest's current version to npm ONLY, from the tagged commit's files (npm drift recovery)
 #   release/ship.sh --no-npm   ship without publishing to npm
 #   release/ship.sh -h         this help
 
@@ -61,6 +61,12 @@ BRANCH="main"
 # publish_npm refuses to publish if either ever disagrees. runheimdall is first, so it is the
 # default package for every helper below that is called without a package argument.
 NPM_PKG_DIRS="packages/runheimdall packages/runhmd"
+# Where the npm helpers read the wrappers (and the default-command notice reads bin/heimdall) from. Empty = this working tree, which is what a full ship has just committed. --npm-only
+# sets it to an export of the TAGGED commit, so a recovery publish reads those files and never the working tree (see "The release commit and the sweep receipt" below). Assigned
+# here so that a stray environment variable of the same name cannot redirect a publish.
+NPM_EXPORT_ROOT=""
+# The commit a post-tag run grades and ships from: require_full_sweep_receipt <tag> sets it to the commit that tag names.
+RELEASE_COMMIT=""
 # The author/committer identity allowlist is NOT duplicated here — R9 (b) below
 # delegates to bin/heimdall-check-identities, the single source of truth shared
 # with the native pre-push hook, so the release gate and pre-push gate can never
@@ -100,6 +106,11 @@ ship.sh — bump, scan, push, verify, and release in one step.
 A release (tag, GitHub Release or npm publish) requires a green FULL sweep receipt at HEAD
 (receipts/last-full-green.json, written by `bash test/run-all.sh`); the incremental `--since-green`
 receipt the push gate accepts is not enough, and nothing is bumped without it.
+--release-only and --npm-only run AFTER the tag exists, so they grade the TAGGED commit, not HEAD: the receipt
+must have graded the tag's own `chore(release): vX.Y.Z` commit, or the commit it was bumped from (journal and
+ledger commits aside) while that commit only re-pins version files. Commits after the tag do not matter:
+--npm-only publishes the files of the tagged commit (never the working tree) and --release-only signs the
+tagged commit's install.sh. Anything else refuses, naming the tag's commit and why.
 Stops at the first failure. Nothing is pushed if the local scan finds leaks.
 A run that CANNOT publish a release or publish to npm fails loudly in preflight — it
 never bumps, warns, and exits 0 (that silent skip is what stranded v2.2.3/v2.0.17/v2.0.13
@@ -135,6 +146,206 @@ write_version() {  # $1=new version — rewrite plugin.json's version field in p
   grep -Eq "\"version\"[[:space:]]*:[[:space:]]*\"${new}\"" "$tmp" \
     || { rm -f "$tmp"; die "version rewrite did not take (manifest format unexpected)"; }
   mv "$tmp" "$PLUGIN_MANIFEST"
+}
+
+# ── The release commit and the sweep receipt ─────────────────────────────────
+# WHY THIS EXISTS (the bump staled its own receipt). A full ship grades the green FULL sweep receipt BEFORE it bumps, so it grades the commit it was asked to ship.
+# The bump then commits `chore(release): vX.Y.Z` -- one commit no sweep ever saw -- and tags it, and from then on every check of the receipt at HEAD refused it: a
+# `--npm-only` run after a failed or skipped npm publish (the npm-drift recovery) died with "graded <the commit before the bump>, HEAD is <the bump>" although nothing had
+# landed since. The ship had invalidated its own authority.
+#
+# THE RULE (the post-tag modes only, --npm-only and --release-only; a NEW full ship still grades the commit it is about to bump, strictly). The tag v<version> names the release
+# commit T, and a post-tag run grades T and ships T -- HEAD is not looked at. The receipt that graded <receipt-sha> covers T when
+#   - <receipt-sha> is T itself (a sweep recorded at the bump), or
+#   - <receipt-sha> is T's one parent -- the commit the ship graded and then bumped -- give or take commits that touch only paths this repo's OWN hooks write
+#     (bin/lib/hook-owned-path.sh: journal entries, ledger records; the standing rule, the very one the ship applied to that commit before it bumped), AND T does nothing but
+#     re-pin version files: exactly one parent, titled exactly `chore(release): v<version>`, really moves the manifest version, and changes only files the bump writes
+#     (release_commit_pins_only).
+# The tag must also name what it is called: T's own manifest says <version>. Everything after T is irrelevant -- journal commits, code commits, an uncommitted edit -- because
+# nothing the receipt proves is read from it.
+#
+# HEAD OR THE TAG? THE TAG. An earlier version of this rule graded HEAD and walked the chain from the receipt through the hook-owned commits on either side of the bump. That
+# graded the wrong object: what a release ships is T, so the receipt is graded at T and what ships is T's own bytes, never the working tree's.
+#   --npm-only     exports packages/ of T (and bin/heimdall, for the default-command notice) with `git archive` into a throwaway directory and publishes THERE (export_commit_files,
+#                  NPM_EXPORT_ROOT). An uncommitted edit under packages/, or a commit that landed after the tag, cannot ship without proof.
+#   --release-only signs T's install.sh -- the bytes the tag serves and bin/heimdall-autoupdate verifies the signature against -- and refuses a release-manifest.json whose
+#                  install_sha256 is not that file's (the manifest is ignored build output, so it cannot be read from T; what it claims is checked against T instead).
+#   Not read from T, on purpose: the release notes (Release prose, editable afterwards with `gh release edit`; nothing installs or verifies it) and the working tree's plugin.json,
+#   which only names WHICH tag a recovery run is about -- T's own manifest must say the same version, and the files that ship come from T.
+# A --release-only run that has to CREATE the tag (the ship died between the bump and the tag) has no T to grade: it tags HEAD, so it must pass the strict ordinary check at HEAD,
+# exactly as a full ship does. And a sweep recorded at a HEAD past the tag proves HEAD, not T, so it does not cover the tag: the refusal says so and names the commit to re-sweep.
+#
+# FAIL CLOSED. Anything that cannot be answered (a tag that does not resolve, a commit that is no ancestor, a file git cannot show, a mode, a status the bump never produces, an
+# export that is not T's own bytes) is a refusal that names its reason. None of the functions below tags, commits or pushes; the only thing they write is the export.
+
+# RELEASE_BUMP_PATHS -- every file the version bump writes and commits, one per line, enumerated from the bump step at the bottom of this script: write_version (the manifest),
+# bump_default_ref (install.sh), render_version_surfaces (VERSION, README.md) and sync_release_artifacts (release/sync-release.sh: both npx wrappers' package.json,
+# packages/runheimdall/README.md -- the byte copy of README.md -- vercel.json, _redirects; the manifest again). test/ship-npm-only-after-bump.test.sh runs the REAL bump and
+# fails unless the files it changes are exactly this list, and checks the newest real `chore(release)` commit against the shape rule, so a bump that learns a new file cannot
+# go unnoticed. CHANGELOG.md is the one other path the exemption admits, and only in its release heading (the bump writes it nowhere today).
+RELEASE_BUMP_PATHS=".claude-plugin/plugin.json
+VERSION
+README.md
+install.sh
+_redirects
+vercel.json
+packages/runheimdall/README.md
+packages/runheimdall/package.json
+packages/runhmd/package.json"
+
+# What a pure re-pin blanks before two versions of a file are compared: every X.Y.Z and every 64-hex sha256 digest (install.sh's digest moves with its DEFAULT_REF).
+RELEASE_PIN_BLANK='s/[0-9]+\.[0-9]+\.[0-9]+/X.Y.Z/g; s/[0-9a-fA-F]{64}/<sha256>/g'
+
+# manifest_version_at <commit> -- the plugin manifest's version (X.Y.Z) as recorded in that commit; prints nothing when it is absent, unreadable or not semver.
+manifest_version_at() {
+  local v
+  v="$(git show "${1}:${PLUGIN_MANIFEST}" 2>/dev/null | jq -r '.version // empty' 2>/dev/null)" || v=""
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s' "$v"
+  return 0
+}
+
+# non_hook_changes <from> <to> -- print every path that differs between the two commits minus the shapes this repo's OWN hooks write (bin/lib/hook-owned-path.sh).
+# Empty output + exit 0 = nothing a human or an agent wrote changed. Exit 1 with nothing printed = it cannot be answered (<from> is no ancestor of <to>, the shared allowlist
+# is missing, git failed): the caller must read that as "changed". --no-renames so a file renamed INTO a hook-owned shape still shows the path it left.
+non_hook_changes() {
+  local from="$1" to="$2" paths
+  [ -r "$REPO_ROOT/bin/lib/hook-owned-path.sh" ] || return 1
+  git merge-base --is-ancestor "$from" "$to" 2>/dev/null || return 1
+  paths="$(git diff --name-only --no-renames "$from" "$to" 2>/dev/null)" || return 1
+  # shellcheck source=../bin/lib/hook-owned-path.sh disable=SC1091
+  . "$REPO_ROOT/bin/lib/hook-owned-path.sh"
+  printf '%s\n' "$paths" | sed '/^$/d' | grep -Ev "^${HMD_HOOK_OWNED_PATH_RE}\$" || true
+}
+
+# version_pins_only <parent> <commit> <path> -- 0 iff <path> reads the same in both commits once every X.Y.Z and every 64-hex digest is blanked. A file git cannot show on
+# either side is a refusal, never two empty streams that compare equal.
+version_pins_only() {
+  local a="$1" b="$2" path="$3"
+  git cat-file -e "${a}:${path}" 2>/dev/null && git cat-file -e "${b}:${path}" 2>/dev/null || return 1
+  cmp -s <(git show "${a}:${path}" 2>/dev/null | sed -E "$RELEASE_PIN_BLANK") \
+         <(git show "${b}:${path}" 2>/dev/null | sed -E "$RELEASE_PIN_BLANK")
+}
+
+# changelog_release_heading_only <parent> <commit> <version> -- 0 iff the CHANGELOG.md diff touches nothing but the release heading: lines added are `## [<version>]...`
+# headings, lines removed are the `## [Unreleased]...` or `## [<version>]...` heading they replace, and blank lines. A body line, another release's heading or a diff with no
+# hunk at all fails. Read from a zero-context diff: the file header precedes the first `@@` and is skipped, so a body line that merely starts with `--` cannot pass for one.
+changelog_release_heading_only() {
+  local a="$1" b="$2" ver="$3" out line in_hunk=0
+  out="$(git diff -U0 --no-color --no-renames "$a" "$b" -- CHANGELOG.md 2>/dev/null)" || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "@@"*) in_hunk=1; continue ;;
+    esac
+    [ "$in_hunk" -eq 1 ] || continue
+    case "$line" in
+      "\\ "*) ;;   # "\ No newline at end of file"
+      "+## [${ver}]"*|"-## [${ver}]"*|"-## [Unreleased]"*) ;;
+      *) [[ "$line" =~ ^[+-][[:space:]]*$ ]] || return 1 ;;
+    esac
+  done <<<"$out"
+  [ "$in_hunk" -eq 1 ]
+}
+
+# release_commit_pins_only <commit> -- 0 iff <commit> is a version bump and NOTHING but a version bump: exactly one parent; subject exactly `chore(release): v<version>`; the
+# manifest version really moved; every changed path is one the bump writes (RELEASE_BUMP_PATHS) or CHANGELOG.md; every one an in-place edit with its file mode untouched; each
+# file differing from its parent only in version numbers and sha256 digests (CHANGELOG.md only in its release heading). Prints WHY NOT on one line and returns 1 otherwise.
+# Needs only git and the commit, not a receipt or a tag, so it can be pointed at any historical bump.
+release_commit_pins_only() {
+  local rc="$1" ver tag old_ver p1="" extra="" subject changed meta path status omode nmode
+  ver="$(manifest_version_at "$rc")"
+  [ -n "$ver" ] || { printf 'cannot read a semver version from %s in the release commit' "$PLUGIN_MANIFEST"; return 1; }
+  tag="v$ver"
+  read -r _ p1 extra <<<"$(git rev-list --parents -n 1 "$rc" 2>/dev/null)" || true
+  [ -n "$p1" ] || { printf 'the release commit has no parent'; return 1; }
+  [ -z "$extra" ] || { printf 'the release commit has more than one parent, a version bump has exactly one'; return 1; }
+  subject="$(git log -1 --format=%s "$rc" 2>/dev/null)" || subject=""
+  [ "$subject" = "chore(release): $tag" ] \
+    || { printf 'the release commit is titled "%s", not "chore(release): %s"' "$subject" "$tag"; return 1; }
+  old_ver="$(manifest_version_at "$p1")"
+  [ "$old_ver" != "$ver" ] \
+    || { printf 'the release commit does not move the manifest version (it is still %s)' "$ver"; return 1; }
+  changed="$(git diff --raw --no-renames "$p1" "$rc" 2>/dev/null)" || changed=""
+  [ -n "$changed" ] || { printf 'cannot list the files the release commit changes'; return 1; }
+  while IFS=$'\t' read -r meta path; do
+    [ -n "$path" ] || continue
+    read -r omode nmode _ _ status <<<"$meta"
+    omode="${omode#:}"
+    if [ "$path" != "CHANGELOG.md" ] && ! grep -Fxq -- "$path" <<<"$RELEASE_BUMP_PATHS"; then
+      printf '%s is not a file the version bump writes' "$path"; return 1
+    fi
+    case "$status" in
+      M) ;;
+      A) printf '%s is added in the release commit, only in-place edits of version files are exempt' "$path"; return 1 ;;
+      D) printf '%s is deleted in the release commit, only in-place edits of version files are exempt' "$path"; return 1 ;;
+      *) printf '%s changes type (%s) in the release commit, only in-place edits of version files are exempt' "$path" "$status"; return 1 ;;
+    esac
+    [ "$omode" = "$nmode" ] || { printf '%s changes its file mode (%s to %s) in the release commit' "$path" "$omode" "$nmode"; return 1; }
+    if [ "$path" = "CHANGELOG.md" ]; then
+      changelog_release_heading_only "$p1" "$rc" "$ver" \
+        || { printf 'CHANGELOG.md changes more than the %s release heading' "$tag"; return 1; }
+    else
+      version_pins_only "$p1" "$rc" "$path" \
+        || { printf '%s changes more than version numbers and sha256 digests' "$path"; return 1; }
+    fi
+  done <<<"$changed"
+  return 0
+}
+
+# receipt_covers_tag <receipt-sha> <tag> <commit> -- can the receipt that graded <receipt-sha> vouch for <commit>, the release commit tag <tag> names? Prints what the receipt graded
+# ("the tagged commit itself", "the commit the tag was bumped from (<sha>)", ...) and returns 0 when it can; prints the reason and returns 1 when it cannot. The rule, and why it is
+# the tag and not HEAD, are at the top of this section. Nothing past <commit> is looked at.
+receipt_covers_tag() {
+  local r_sha="$1" tag="$2" rc="$3" ver tag_ver p1 changes why
+  ver="${tag#v}"
+  tag_ver="$(manifest_version_at "$rc")"
+  [ "$tag_ver" = "$ver" ] \
+    || { printf 'tag %s names %s, whose manifest says %s, not %s' "$tag" "${rc:0:12}" "${tag_ver:-<unreadable>}" "$ver"; return 1; }
+  if [ "$r_sha" = "$rc" ]; then printf 'the tagged commit itself'; return 0; fi
+  why="$(release_commit_pins_only "$rc")" \
+    || { printf '%s, so only a receipt that graded the tagged commit itself can cover it' "$why"; return 1; }
+  p1="$(git rev-parse -q --verify "${rc}^" 2>/dev/null)" || { printf 'the tagged commit has no parent'; return 1; }
+  if [ "$r_sha" = "$p1" ]; then printf 'the commit the tag was bumped from (%s)' "${p1:0:12}"; return 0; fi
+  changes="$(non_hook_changes "$r_sha" "$p1")" \
+    || { printf 'the receipt graded %s, which is not an ancestor of %s, the commit the tag was bumped from' "${r_sha:0:12}" "${p1:0:12}"; return 1; }
+  [ -z "$changes" ] \
+    || { printf 'the receipt graded %s, not the tagged commit or the commit it was bumped from (%s): commits landed in between that touch: %s' \
+           "${r_sha:0:12}" "${p1:0:12}" "$(printf '%s\n' "$changes" | head -3 | paste -sd, -)"; return 1; }
+  printf '%s, which only journal/ledger commits separate from the commit the tag was bumped from (%s)' "${r_sha:0:12}" "${p1:0:12}"
+}
+
+# sha256_of <file> -- its bare sha256 hex digest (sha256sum on Linux, shasum on macOS); fails when neither is installed.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+# export_commit_files <commit> <dest-dir> <path>... -- write the named tracked paths of <commit> under <dest-dir>, exactly as that commit holds them (git archive: nothing is read from
+# the working tree or the index), then PROVE it: every file the commit holds under those paths must be there and, for a regular file, hash to the commit's own blob. `git archive`
+# obeys .gitattributes and $GIT_DIR/info/attributes -- export-ignore drops a file, export-subst and eol/filter rules rewrite one -- and a publish that quietly differs from the tag is
+# the very thing this export exists to prevent, so a mismatch is a refusal, never a warning.
+export_commit_files() {
+  local commit="$1" dest="$2" listing entry meta path mode oid
+  shift 2
+  mkdir -p "$dest" || die "cannot create $dest"
+  git archive --format=tar "$commit" -- "$@" | tar -x -f - -C "$dest" \
+    || die "could not export $* of ${commit:0:12} (git archive failed) — nothing is published or signed from files that cannot be read back out of the commit"
+  listing="$(git ls-tree -r -z "$commit" -- "$@" | tr '\0' '\n')" || die "could not list $* of ${commit:0:12}"
+  while IFS= read -r entry; do
+    meta="${entry%%$'\t'*}"; path="${entry#*$'\t'}"
+    read -r mode _ oid <<<"$meta"
+    [ -e "$dest/$path" ] || [ -L "$dest/$path" ] \
+      || die "the export of ${commit:0:12} is not byte-identical to the commit ($path was not written) — a .gitattributes or info/attributes rule (export-ignore, export-subst, eol) changed what git archive wrote, and bytes the receipt did not prove must not ship"
+    case "$mode" in
+      100644|100755)
+        [ "$(git hash-object --no-filters -- "$dest/$path")" = "$oid" ] \
+          || die "the export of ${commit:0:12} is not byte-identical to the commit ($path differs from the commit's blob) — a .gitattributes or info/attributes rule (export-ignore, export-subst, eol) changed what git archive wrote, and bytes the receipt did not prove must not ship" ;;
+    esac
+  done <<<"$listing"
 }
 
 # ── Release notes + publication ──────────────────────────────────────────────
@@ -272,9 +483,9 @@ publish_release() {
 # that release until it is signed; that is the point.) See SIGNING.md for key generation + rotation.
 DEFAULT_SIGNING_KEY="$HOME/.heimdall/signing/heimdall-signing.key"
 
-sign_release_artifact() {  # $1 = tag (vX.Y.Z). Best-effort: WARN + return 0 when it cannot sign.
+sign_release_artifact() {  # $1 = tag (vX.Y.Z), [$2 = the file to sign: --release-only passes the tagged commit's install.sh]. Best-effort: WARN + return 0 when it cannot sign.
   local tag="$1"
-  local artifact="${SHIP_ARTIFACT:-${REPO_ROOT:-$PWD}/install.sh}"
+  local artifact="${2:-${SHIP_ARTIFACT:-${REPO_ROOT:-$PWD}/install.sh}}"
   # Resolve the key at CALL time so `HEIMDALL_SIGNING_KEY=... ship.sh` and the sourced test seam
   # both take effect (a source-time global would freeze the default before the env is set).
   local seckey="${HEIMDALL_SIGNING_KEY:-$DEFAULT_SIGNING_KEY}"
@@ -336,8 +547,8 @@ sign_release_artifact() {  # $1 = tag (vX.Y.Z). Best-effort: WARN + return 0 whe
 # that never ran sync-release has nothing to attach), but one that IS present and cannot be
 # attached, or that names a different tag, is a loud failure — the site gate would otherwise
 # render a stale version, which is the drift this asset exists to remove.
-publish_release_manifest() {  # $1 = tag (vX.Y.Z)
-  local tag="$1"
+publish_release_manifest() {  # $1 = tag (vX.Y.Z), [$2 = that tag's install.sh as the tagged commit holds it: --release-only passes it, so the manifest is checked against the tag, not the working tree]
+  local tag="$1" artifact="${2:-}"
   local manifest="${SHIP_MANIFEST:-${REPO_ROOT:-$PWD}/.heimdall/release/release-manifest.json}"
   if [ ! -f "$manifest" ]; then
     warn "release manifest: $manifest not found — $tag has NO release-manifest.json asset; the site's version-sync gate reads it."
@@ -346,6 +557,14 @@ publish_release_manifest() {  # $1 = tag (vX.Y.Z)
   fi
   [ "$(jq -r '.tag // empty' "$manifest" 2>/dev/null)" = "$tag" ] \
     || die "release manifest $manifest is not for $tag — re-run release/sync-release.sh $tag, then: gh release upload $tag $manifest --clobber"
+  if [ -n "$artifact" ]; then
+    # The manifest is ignored build output, so it cannot be read from the tagged commit; what it claims about install.sh is checked against the tagged commit's own copy instead.
+    local want have
+    want="$(sha256_of "$artifact")" || die "release manifest: cannot hash $artifact (neither sha256sum nor shasum is installed)"
+    have="$(jq -r '.install_sha256 // empty' "$manifest" 2>/dev/null)"
+    [ "$have" = "$want" ] \
+      || die "release manifest $manifest describes install.sh sha256 ${have:-<none>}, but $tag holds install.sh sha256 $want — it was not generated for the bytes this tag serves. Regenerate it from the tagged files (release/sync-release.sh $tag), then: gh release upload $tag $manifest --clobber"
+  fi
   local out rc
   if ! out="$(gh release upload "$tag" "$manifest" --clobber 2>&1)"; then
     rc=$?; printf '%s\n' "$out" >&2
@@ -435,8 +654,8 @@ npm_pkg_rels() {
   fi
 }
 
-# npm_pkg_dir [rel] — absolute dir of one wrapper (default: the first, runheimdall)
-npm_pkg_dir() { printf '%s' "${SHIP_NPM_DIR:-${REPO_ROOT:-$PWD}/${1:-${NPM_PKG_DIRS%% *}}}"; }
+# npm_pkg_dir [rel] — absolute dir of one wrapper (default: the first, runheimdall). Under NPM_EXPORT_ROOT when --npm-only has exported the tagged commit's files, this working tree otherwise.
+npm_pkg_dir() { printf '%s' "${SHIP_NPM_DIR:-${NPM_EXPORT_ROOT:-${REPO_ROOT:-$PWD}}/${1:-${NPM_PKG_DIRS%% *}}}"; }
 
 npm_pkg_field() {  # $1=field [$2=rel] — read a top-level string field out of that wrapper's package.json
   local field="$1" file v
@@ -531,12 +750,12 @@ npm_positioning_notice() {  # [$1=rel]
 # path to `hmd attack <path>`: a release whose bin/heimdall has no `attack` subcommand treats that
 # as a free-text task prompt and starts an agent session — and an npm version is immutable. A
 # WARN, not a die: shipping the rest of a release before `hmd attack` lands is the operator's
-# call, but it has to be a SEEN call. SHIP_HMD_BIN points the check at a fixture (test seam).
+# call, but it has to be a SEEN call. SHIP_HMD_BIN points the check at a fixture (test seam). Under --npm-only the bin/heimdall it reads is the tagged commit's own copy (NPM_EXPORT_ROOT).
 npm_default_command_notice() {
   local rel="${1:-${NPM_PKG_DIRS%% *}}" dflt name hmd_bin
   dflt="$(jq -r '.heimdall.defaultCommand // empty' "$(npm_pkg_dir "$rel")/package.json" 2>/dev/null || true)"
   [ -n "$dflt" ] || return 0
-  hmd_bin="${SHIP_HMD_BIN:-${REPO_ROOT:-$PWD}/bin/heimdall}"
+  hmd_bin="${SHIP_HMD_BIN:-${NPM_EXPORT_ROOT:-${REPO_ROOT:-$PWD}}/bin/heimdall}"
   if [ -f "$hmd_bin" ] && grep -Eq "^  ([a-z0-9-]+\|)*${dflt}(\|[a-z0-9-]+)*\)[[:space:]]*(#.*)?\$" "$hmd_bin"; then
     return 0
   fi
@@ -729,14 +948,18 @@ preflight_release_prereqs() {
   ok "release prereqs: gh present + authenticated, notes generator present"
 }
 
-# require_full_sweep_receipt — a release (a tag, a GitHub Release, an npm publish) ships what is at HEAD, and only a FULL sweep
-# proves HEAD: the incremental `test/run-all.sh --since-green` receipt the push gate accepts re-ran only the suites a diff could
+# require_full_sweep_receipt [<tag>] — a release (a tag, a GitHub Release, an npm publish) ships what a FULL sweep proved, and only a FULL
+# sweep proves a commit: the incremental `test/run-all.sh --since-green` receipt the push gate accepts re-ran only the suites a diff could
 # reach, which is the right trade for a push and the wrong one for a version number. So release/ship.sh reads the chain anchor
 # (receipts/last-full-green.json, written by test/run-all.sh ONLY for a green, clean, full sweep) and demands that it is a green
-# FULL sweep of THIS repo at HEAD -- commits that touch only hook-owned paths (bin/lib/hook-owned-path.sh) do not stale it, any
-# other commit does. Runs in preflight, before anything is bumped, committed or pushed.
+# FULL sweep of THIS repo. Runs in preflight, before anything is bumped, committed, tagged, pushed or published.
+#   Bare (a full ship): the receipt must cover HEAD, the commit about to be bumped -- commits that touch only hook-owned paths
+#   (bin/lib/hook-owned-path.sh) do not stale it, any other commit does.
+#   With a <tag> (--release-only and --npm-only, which run AFTER the tag exists): the receipt must cover the commit that tag names, and HEAD is
+#   not looked at at all -- receipt_covers_tag holds the rule, and "The release commit and the sweep receipt" above the reasoning. On success
+#   RELEASE_COMMIT is that commit: the one these modes ship from.
 require_full_sweep_receipt() {
-  local home="${HEIMDALL_HOME:-$REPO_ROOT/.heimdall}" fr canon head r_sha other
+  local tag="${1:-}" home="${HEIMDALL_HOME:-$REPO_ROOT/.heimdall}" fr canon head r_sha other rc how
   fr="$home/receipts/last-full-green.json"
   command -v jq >/dev/null 2>&1 || die "jq not found — the sweep receipt cannot be read, so a release cannot be authorised. Install it (brew install jq)."
   head="$(git rev-parse HEAD 2>/dev/null)" || die "not a git checkout — cannot check the sweep receipt"
@@ -749,13 +972,18 @@ require_full_sweep_receipt() {
   [ "$(jq -r '.repo // empty' "$fr")" = "$canon" ] \
     || die "a release requires a green FULL sweep receipt at HEAD, but $fr was recorded for a different repo. Run: bash test/run-all.sh"
   r_sha="$(jq -r '.head_sha // empty' "$fr")"
+  if [ -n "$tag" ]; then
+    rc="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}" 2>/dev/null)" \
+      || die "tag $tag does not exist (or names no commit): a post-tag run grades, and --npm-only publishes, the commit the tag names, and ${tag#v} was never tagged here. Finish the release first (release/ship.sh --release-only), then re-run."
+    how="$(receipt_covers_tag "$r_sha" "$tag" "$rc")" \
+      || die "the green FULL sweep receipt is STALE for tag $tag (${rc:0:12}): ${how}. A post-tag run grades the commit the tag names, not HEAD, so it needs a receipt that graded that commit or the one it was bumped from. Re-sweep it (check out ${rc:0:12}, run: bash test/run-all.sh) or cut a new release."
+    RELEASE_COMMIT="$rc"
+    ok "green FULL sweep receipt covers tag $tag (${rc:0:12}): it graded ${how}"
+    return 0
+  fi
   if [ "$r_sha" != "$head" ]; then
-    other="changed"
-    if [ -r "$REPO_ROOT/bin/lib/hook-owned-path.sh" ] && git merge-base --is-ancestor "$r_sha" "$head" 2>/dev/null; then
-      # shellcheck source=../bin/lib/hook-owned-path.sh disable=SC1091
-      . "$REPO_ROOT/bin/lib/hook-owned-path.sh"
-      other="$(git diff --name-only "$r_sha" "$head" | sed '/^$/d' | grep -Ev "^${HMD_HOOK_OWNED_PATH_RE}\$" || true)"
-    fi
+    # Commits since the graded one that touch only hook-owned paths never stale it. A question that cannot be answered (not an ancestor, no allowlist) counts as "changed".
+    other="$(non_hook_changes "$r_sha" "$head")" || other="changed"
     [ -z "$other" ] \
       || die "the green FULL sweep receipt is STALE: it graded ${r_sha:0:12}, HEAD is ${head:0:12} (commits landed since). A release needs a green FULL sweep receipt at HEAD. Run: bash test/run-all.sh"
   fi
@@ -915,6 +1143,14 @@ if [ "$DRY_RUN" -eq 1 ]; then
       done
 
       step "Exact npm commands that would run"
+      if [ "$NPM_ONLY" -eq 1 ]; then
+        DRY_RC="$(git rev-parse -q --verify "refs/tags/${DRY_TAG}^{commit}" 2>/dev/null || true)"
+        if [ -n "$DRY_RC" ]; then
+          printf '  note: --npm-only publishes the files of tag %s (%s), exported from git into a temp dir -- not this working tree; the dirs below hold the working tree'\''s copy of them.\n' "$DRY_TAG" "${DRY_RC:0:12}"
+        else
+          printf '  note: tag %s does not exist, so a real --npm-only run would refuse: it publishes the files of the commit that tag names.\n' "$DRY_TAG"
+        fi
+      fi
       # Run attached to the terminal (no $(...) capture) so npm's browser/web 2FA works for a
       # passkey/WebAuthn account; --auth-type=web pins that flow. See publish_npm for the full why.
       for DRY_REL in $(npm_pkg_rels); do
@@ -934,13 +1170,25 @@ fi
 if [ "$RELEASE_ONLY" -eq 1 ]; then
   step "Release-only — publishing the version already in the manifest"
   preflight_release_prereqs
-  require_full_sweep_receipt
   RO_VERSION="$(read_version)"
   TAG="v$RO_VERSION"
+  RO_TAG_EXISTS=0
+  if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then RO_TAG_EXISTS=1; fi
+  if [ "$RO_TAG_EXISTS" -eq 1 ]; then
+    # The tag exists, so the receipt must cover the commit it names -- not HEAD -- and that commit's own install.sh is what is signed and described below.
+    require_full_sweep_receipt "$TAG"
+  else
+    # No tag yet: this run creates it at HEAD, so there is no tagged commit to grade instead and HEAD itself must be covered, as for a full ship.
+    warn "tag $TAG does not exist yet — this run creates it at HEAD, so the receipt must cover HEAD itself"
+    require_full_sweep_receipt
+    RELEASE_COMMIT="$(git rev-parse HEAD)"
+  fi
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-ro.XXXXXX")" || die "mktemp failed"
   trap 'rm -rf "$TMP_DIR" 2>/dev/null || true' EXIT
+  # install.sh is the Release asset clients verify the signature against: take it from the commit the receipt proved, never from the working tree.
+  export_commit_files "$RELEASE_COMMIT" "$TMP_DIR/tagged" install.sh
 
-  if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+  if [ "$RO_TAG_EXISTS" -eq 0 ]; then
     git tag "$TAG" || die "git tag $TAG failed"
     ok "tagged $TAG"
   else
@@ -948,11 +1196,12 @@ if [ "$RELEASE_ONLY" -eq 1 ]; then
   fi
   git push origin "$TAG" 2>/dev/null || warn "tag $TAG already on origin (or push skipped) — continuing"
 
+  # The notes are Release prose -- editable afterwards with `gh release edit`, and nothing installs or verifies them -- so they are still built from this checkout's CHANGELOG.md and history.
   RO_NOTES="$TMP_DIR/notes.md"
   build_release_notes "$TAG" "$RO_NOTES"
   publish_release "$TAG" "$RO_NOTES"
-  sign_release_artifact "$TAG"
-  publish_release_manifest "$TAG"
+  sign_release_artifact "$TAG" "$TMP_DIR/tagged/install.sh"
+  publish_release_manifest "$TAG" "$TMP_DIR/tagged/install.sh"
   printf '\n%s%s✓ Released %s%s — https://github.com/randomittin/heimdall/releases/tag/%s\n' \
     "$G" "$B" "$TAG" "$R" "$TAG"
   exit 0
@@ -964,11 +1213,23 @@ fi
 # that did not exist while `npm view runheimdall version` reported 2.0.5 and the repo shipped
 # 2.2.6 — the only way to "fix" npm was to cut a fresh release, which is precisely what let the
 # gap grow to twenty patch versions instead of closing it.
+# What is published is the TAGGED commit's own files: the receipt proves that commit, so packages/ is exported out of git into a throwaway directory and npm publishes from THERE.
+# The working tree is never read by the publish -- an uncommitted edit under packages/, or a commit that landed after the tag, cannot ship without proof.
 if [ "$NPM_ONLY" -eq 1 ]; then
   step "npm-only — publishing the version already in the manifest to npm"
-  preflight_npm_prereqs
-  require_full_sweep_receipt
   NPM_ONLY_VERSION="$(read_version)"
+  NPM_ONLY_TAG="v$NPM_ONLY_VERSION"
+  require_full_sweep_receipt "$NPM_ONLY_TAG"
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-npm.XXXXXX")" || die "mktemp failed"
+  trap 'rm -rf "$TMP_DIR" 2>/dev/null || true' EXIT
+  export_commit_files "$RELEASE_COMMIT" "$TMP_DIR" packages
+  # bin/heimdall is what the pinned install puts on a user's PATH: the default-command notice checks the tagged commit's copy of it (when that commit has one).
+  if git cat-file -e "${RELEASE_COMMIT}:bin/heimdall" 2>/dev/null; then
+    export_commit_files "$RELEASE_COMMIT" "$TMP_DIR" bin/heimdall
+  fi
+  NPM_EXPORT_ROOT="$TMP_DIR"
+  ok "exported packages of tag $NPM_ONLY_TAG (${RELEASE_COMMIT:0:12}) — npm publishes those files, not the working tree"
+  preflight_npm_prereqs
   publish_npm_all "$NPM_ONLY_VERSION"
   printf '\n%s%s✓ npm reconciled to %s%s\n' "$G" "$B" "$NPM_ONLY_VERSION" "$R"
   exit 0
