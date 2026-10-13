@@ -28,7 +28,10 @@ we sell. Read this before your first edit.
   sweep; never merge anything between a green sweep and its push, and never start a
   second sweep while one runs — see CLAUDE.md "When the full gate runs".
 - **Quality gates run before push** (`heimdall-state check-quality-gates`): tests
-  green, lint clean, no untested changes.
+  green, lint clean, no untested changes. The gate is chosen per repo pushed: heimdall's
+  own sweep repo gets that gate; a repo with `.heimdall/repo-checks.json` passes on a
+  green, current receipt of its own checks (`bin/heimdall-repo-checks run`); any other
+  repo gets a warning. Anything uncertain gets the strict gate — CLAUDE.md "Push gate".
 
 ## Environment
 

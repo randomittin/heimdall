@@ -5,6 +5,73 @@ All notable changes to Heimdall (formerly superx) will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] -- 2.4.8
+
+### Added
+- **A repo can declare its own checks, and the push gate passes it on a record of them** — `.heimdall/repo-checks.json` (`{"schema":1,"checks":[{"name","cmd"}]}`, committed) plus `bin/heimdall-repo-checks run|status [--repo PATH]`: `run` executes each check from the repo root in order and writes `.heimdall/receipts/repo-checks.json` atomically (`head_sha`, `tree_sha`, `decl_sha256`, `dirty`, `exit_code`, `finished_at`, per-check `exit_code`/`secs`); `status` says whether it is green and current. The gate recomputes the commit, its tree and the committed declaration's hash from git objects and also requires a clean tree at run time, a green exit and exactly the declared checks; a stale, red, dirty, missing, mismatched, malformed or invalid record blocks and names the runner. A receipt attests ONE commit: the hook hands the commits the push sends as sources to `status --pushes` (each refspec's source resolved by git, HEAD for a bare push) and every one must be the receipt's `head_sha`; `--all`, `--mirror`, `--tags`, a wildcard refspec, an option it cannot read and push configuration that picks the refs (`push.default=matching`, any `remote.<name>.push`) cannot be tied to one receipt and block. The receipt's fields, types and formats are defined ONCE, in `bin/lib/hmd_repo_receipt.py`, which `run` builds the receipt with and `status` verifies it against; a test walks that definition (a receipt `run` writes passes, every field mutated alone fails). Like `last-sweep.json` it is a cooperating-agent control, not a security boundary against someone who can write the file. Test: `test/heimdall-push-gate-per-repo.test.sh`.
+
+### Changed
+- `hmd app`: a stopped laptop relay client no longer unpairs the phone. Once a phone is bound, the client's relay session login (bearer
+  token, hmd key, seq marks) is stored outside the repo -- the macOS Keychain (written over `security -i` stdin, never argv), else a 0600
+  file under `$HEIMDALL_HOME` (`bin/lib/hmd_session_login.py`). A TERM, Ctrl-C, KILL or crash revokes nothing; `hmd app connect` and its
+  respawns start the client with `--resume`, which reattaches to the same relay session for `HMD_SESSION_RESUME_H` hours (default 24)
+  without pairing again. Only `hmd app disconnect`, `hmd app disconnect --device`, a revoke from the phone or a refused login unpair:
+  disconnect revokes at the relay through the stored login, also for a crashed client (it used to say "could NOT be revoked"). SIGUSR1 is
+  no longer a revoke trigger. No relay change, no relay deploy needed.
+- `hmd app disconnect --forget-local`: the explicit way out of a stored login whose relay revoke can never be confirmed (stuck `revoking`, a relay that stays
+  down or refuses it). Without the flag nothing changes -- an unconfirmed revoke still fails loudly and keeps the login -- and no other flag implies it. With it
+  (all phones, or one with `--device`) the revoke is tried first; a login still unconfirmed is dropped here: the relay session id, a warning that the phone can
+  keep connecting until that session expires and when (absolute UTC, the stored session expiry: the bind plus the relay's 30-day device-token lifetime) are
+  printed, the stored login (Keychain item and file) is deleted under the store lock, and a `session_login_forgotten` event (`relay-events.jsonl`) and a line in
+  `$HEIMDALL_HOME/logs/app.log` record session, device, expiry and that the relay was NOT told. Exit 0 only once the delete and its log succeeded. Test:
+  `test/app-session-forget-local.test.sh`.
+- `hmd app`: every paired phone comes back by itself after a restart, not only the first. A relay session binds one phone, so each phone has a client of its own and the
+  login of its session stored; `hmd app connect` (also its supervisor's respawn, and its look every `HMD_RESUME_RECONCILE_S` seconds, default 15) and the SessionStart pair
+  window now start one `heimdall-relay-client --resume-only` for every stored login that no live client serves, each resuming its own phone's session (its own seq blocks and
+  store lock, no re-pair, no nonce reuse) while that phone's client was last alive within `HMD_SESSION_RESUME_H` hours -- the limit applies per phone. Phones added with
+  `hmd app add-device` are included. `--resume-only` never pairs: with no login left to claim it says `resume_none` and exits 0. Test: `test/app-session-multi-resume.test.sh`.
+- `hmd app disconnect` and `--forget-local` can no longer race a resume (security review of the multi-phone resume): a disconnect MARKS FIRST -- every stored login
+  goes `revoking` in one hold of the store lock, before a window, the supervisor, a client or the relay is touched -- so no resume claims it afterwards (a periodic look,
+  a respawn, the pair window and a `--resume-only` client all claim under that same lock and skip what is marked or gone); then the connect supervisor (its pid is
+  `pid_watcher` in `connect.json`) is stopped and waited for, then the clients, and only then is the relay asked to revoke (or the login dropped), so nothing is
+  left running that could reattach, respawn or look again; a connect's periodic look also stops once `connect.json` is gone. A client that got through anyway ends
+  itself, revoking its session, within `HMD_SESSION_LOGIN_CHECK_S` (2 s) of its login being marked or gone; a store it merely cannot read ends nothing. Tests:
+  `test/app-session-revoke-race.test.sh`.
+- **The push gate runs each repo's own checks, not heimdall's** — the quality gate used to run in the session's cwd for any push, so a push of the site (six gates of its own) was blocked for lacking heimdall's sweep receipt. `bin/lib/hmd_push_target.py` now names the repo each push goes to by asking git itself (`-C` chains, `--git-dir`, `GIT_DIR`, subdirectories, linked worktrees; `--work-tree` cannot act as a decoy) and its class: **sweep** (`test/run-all.sh` names `last-sweep.json`: heimdall's own regime, the old gate unchanged and fail closed, now run inside that repo), **repo-checks** (a green, current receipt of its own checks) or **unmanaged** (one warning, the push goes on). The class is read from the COMMITS a push can carry (HEAD, its upstream, `origin/HEAD`, `origin/<branch>`, the refspecs named), never the work tree, and the strictest wins: an uncommitted marker edit changes nothing, and a pushed commit that drops a marker cannot downgrade a repo whose upstream still has it. The shell is read by a conservative model (`$( )`, backticks, `eval`, `sh -c`, here-strings and heredocs fed to shells, `xargs`, `pushd`/`popd`, chains of `cd` as sets of possible states); any construct it does not model exactly (a dynamic or conditional `cd`, `cd -`, a function, `source`, `alias`, a script piped to a shell, `find -exec`, an unknown git option or subcommand, an unmodelled `GIT_*` variable, a marker that cannot be inspected) makes the command uncertain, and then EVERY repo involved gets the strict sweep gate, never a warning; a repo that declares its own checks keeps owing the receipt under uncertainty (for commits nobody can list, so it is refused until the command is restated), and a strict gate that was never evaluated (`heimdall-state` has no state there) blocks instead of allowing. Every error path is strict too: git exiting non-zero, timing out or printing something it does not print, a ref that cannot be placed, a marker that is a link, a submodule or a directory, a resolver that crashes, a corrupt or oddly typed receipt or declaration; the tests force each one (a `git` on PATH that fails, prints nonsense or hangs at each call the resolver makes). A real shell is the judge of the model: every command of a corpus is RUN by bash and zsh with a git that records where it was started, and the repositories the pushes really went to are compared with the resolver's answer. It found a `cd` behind `env`/`nice`/`xargs` (a process runs it, not this shell), the last element of a pipeline (zsh runs it in the current shell), `CDPATH=` and `command cd` (bash runs the builtin, zsh does not); the same review made `env` with any option and assignments to `HOME`, `PWD`, `OLDPWD`, `BASH_ENV` and `ENV` uncertain. The secret, self-scan, oracle and corpus stages are not relaxed. Tests: `test/heimdall-push-gate-per-repo.test.sh`, and `test/heimdall-push-gate-target-repo.test.sh` for the case that was reported (the session in heimdall, the push to another repo by `cd`, by `-C` or from it, each graded on that repo's own record).
+
+### Fixed
+- `release/ship.sh --npm-only` and `--release-only` no longer refuse the sweep receipt a full ship has just used, and they now ship the tagged commit's own files. The ship grades the
+  receipt BEFORE its version bump, so its own `chore(release): vX.Y.Z` commit (one no sweep ever saw) made that receipt look stale, and the npm-drift recovery died with "graded <the commit
+  before the bump>, HEAD is <the bump>" although nothing had landed since. These two post-tag modes now grade the TAGGED commit, not HEAD: the tag `v<version>` names the release commit T,
+  and the receipt covers it when it graded T itself, or the commit T was bumped from (journal and ledger commits, the hook-owned paths, aside: the rule the ship applied to that commit)
+  while T does nothing but re-pin version files. That means every changed path is one the bump writes (`RELEASE_BUMP_PATHS`) or `CHANGELOG.md`, the edits are in place with file modes
+  untouched, each file differs from its parent only in version numbers and sha256 digests (`CHANGELOG.md` only in the release heading), the commit has exactly one parent, its subject is
+  exactly `chore(release): v<version>` and the manifest version really moved; T's own manifest must also say the version the tag is named for. Commits after the tag (journal or code) and
+  uncommitted edits are irrelevant, because nothing is read from them: `--npm-only` exports `packages/` of T with `git archive` into a temporary directory (removed on exit) and publishes
+  from there, so an uncommitted edit under `packages/` can no longer ship without proof (the export is checked against T's blobs, and an `export-ignore`, `export-subst` or `eol` rule that
+  would change a file refuses instead); `--release-only` signs T's `install.sh` (the bytes the tag serves, which `bin/heimdall-autoupdate` verifies) instead of the working tree's, and
+  refuses a `release-manifest.json` whose `install_sha256` is not T's. A `--release-only` run that must create the tag has no tagged commit to grade and still needs the receipt to cover
+  HEAD, as a full ship does. A sweep recorded at a HEAD past the tag proves HEAD, not the tag, so it no longer covers the tag: the refusal names the tag's commit, the reason and the commit
+  to re-sweep. The release notes are not read from T (Release prose, editable afterwards). A new full ship (it grades the commit it is about to bump), the pre-push gate and
+  `bin/heimdall-state` are unchanged. Test: `test/ship-npm-only-after-bump.test.sh` (the real full ship in a throwaway repo, then the real `--npm-only` and `--release-only` with nothing
+  landed in between, with a journal commit, a code commit and an uncommitted edit after the tag -- what is published and signed is compared with the tag's files -- and the shapes that must
+  still be refused).
+- **The per-repo push gate, last security review (2026-10-14)** -- three findings against the gate described under Changed, each with its tests in `test/heimdall-push-gate-per-repo.test.sh`
+  (`test/heimdall-precheck-bash.test.sh` filters two more trace lines of the old gate's call). (1) *A resolver that cannot answer fell back to the WRONG repository.* A timeout (`HMD_PUSH_TARGET_TIMEOUT_S`),
+  a crash or a missing resolver ran the strict gate on ONE directory (the hook's own cwd), so a push to another repository by `-C` / `cd`, or from the payload's cwd, went ungraded. Now the strict
+  gate runs against EVERY candidate -- the session's cwd, the payload's cwd and each `-C` / `cd` / `--git-dir` / `--work-tree` directory the parser had reached (the resolver prints them itself when it times
+  out or fails, without asking git; the hook adds the two cwds when it gets no answer at all) -- and the push is blocked unless all of them pass. A push whose repository git names but whose work tree cannot
+  be confirmed from the other end (a dotfiles layout) is graded on those directories as well, not only on the cwd's; a gate directory the hook cannot enter blocks (it used to run the gate wherever the hook
+  was). Tests C50-C53. (2) *Gate scope mismatch.* One resolved (git directory, work tree) pair now feeds classification, refspec resolution, the receipt lookup and the `heimdall-state` check: each resolver
+  row carries it (`class`, work tree, extra, git directory), every git call about the pushed repository runs with `GIT_DIR` and `GIT_WORK_TREE` pinned to it, `heimdall-repo-checks status --git-dir` verifies the
+  pair from both ends and reads the receipt inside that work tree, and the hook runs `heimdall-state` in that work tree with the same pair exported. A `GIT_*` variable the resolver does not reproduce
+  (`GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_NAMESPACE`, `GIT_INDEX_FILE`, ...) gave the push another view of the refs than the one the gate classified; it now makes the command uncertain (transport and
+  identity variables such as `GIT_SSH_COMMAND` keep the class). Tests B "pair" and B "GIT_*", C54-C59. (3) *Self-audit.* The receipt is read as ONE regular file inside the repository: a symlinked `.heimdall`,
+  `.heimdall/receipts` or receipt is never followed (and `run` will not write through one), the file is opened once with `O_NOFOLLOW` and checked on that descriptor, at most 1 MiB is read (a committed
+  declaration over 1 MiB is refused too) and nesting deep enough to exhaust the parser is "not valid JSON", not a crash; `status` names HEAD once and reads the tree and the declaration of that commit, so a
+  HEAD that moves between its reads cannot mix two commits; one regex that backtracked quadratically on a long command (a signal cannot interrupt a regex, so the resolver's own timeout never fired) is two linear
+  searches. Tests A10, B "linear time", C60-C61. The unmanaged-repo warning, the secret and self-scan gates and every earlier class rule are unchanged.
+
 ## Changelog status
 
 This file was not maintained between the last curated entry below (from when the

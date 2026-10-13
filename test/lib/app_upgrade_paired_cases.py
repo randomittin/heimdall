@@ -33,9 +33,10 @@ a revoke is final (a second scenario, the 2.4.6 client alone):
   R5  nothing started here is left running
 and every other way a phone ends (a third scenario, a connect run's phone and two more added by `hmd app add-device`, new clients):
   E1  the starting point: three phones bound -- the first by the connect run, one more by each add-device run -- each with a push token and a device record
-  E2  `disconnect --device` for a phone whose client crashed does not claim a revoke -- the relay session cannot be revoked from here --
-      says so and exits non-zero, yet removes that phone's push token and record and leaves the others alone
-  E3  plain `disconnect` with several phones revokes each one's relay session through its client and leaves no token and no record
+  E2  `disconnect --device` for a phone whose client crashed revokes its relay session through the login that client stored when the phone
+      bound (no client is left to ask), exits 0, and removes that phone's push token and record, leaving the others alone
+  E3  plain `disconnect` with several phones revokes each one's relay session -- through the login its client stored, the client is then
+      stopped -- and leaves no token and no record
   E4  nothing started here is left running
 """
 import contextlib
@@ -340,9 +341,9 @@ def run_revoked_legacy(s, old):
 
 
 def case_every_end_reaches_the_relay():
-    # a connect run's phone and two more added with `hmd app add-device` (one window per use), each holding a push token. A phone whose client crashed (kill -9) cannot be revoked from here -- its
-    # session token lived in that client's memory only -- so `--device` says so, in words and in its exit status, and still removes what is
-    # local; plain `disconnect` ends every other phone through its own client, which revokes its relay session and takes out its tokens.
+    # a connect run's phone and two more added with `hmd app add-device` (one window per use), each holding a push token. A phone whose client crashed (kill -9) is still revoked from here (2.4.8): its
+    # client stored the session's login outside the repo when the phone bound, so `--device` revokes through that login, exits 0 and removes
+    # what is local; plain `disconnect` revokes every other phone's session the same way, stops its client and takes out its tokens.
     with C.Scn() as s:
         app = s.app("--relay", s.relay.url, "--bg")
         app.close_stdin()
@@ -375,20 +376,19 @@ def case_every_end_reaches_the_relay():
         C.wait_until(lambda: "Phone 1" not in C.device_pids(s), 20)
         env = s.env(HMD_TAILSCALE_BIN="/usr/bin/false")
         gone = C.run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "Phone 1"], env, stdin="", timeout=120)
-        T.check(gone.returncode != 0 and "client is not running" in gone.stderr and "NOT be revoked" in gone.stderr
-                and "revoked device" not in gone.stdout + gone.stderr
+        T.check(gone.returncode == 0 and "revoked device" in gone.stdout + gone.stderr and "NOT be revoked" not in gone.stderr
                 and C.wait_until(lambda: C.push_tokens(s) == sorted(tokens[1:]), 20)
                 and "device-%s.json" % C.device_fp(phones[0]) not in device_records(s) and sorted(C.device_pids(s)) == ["Phone 2", "Phone 3"]
-                and not any(sid in s.relay.revokes for sid in sids),
-                "E2. `disconnect --device` for a phone whose client is gone does not claim a revoke: it says the relay session could not be "
-                "revoked from here and exits non-zero, yet removes that phone's push token and record and leaves the others alone",
+                and sids[0] in s.relay.revokes and sids[1] not in s.relay.revokes and sids[2] not in s.relay.revokes,
+                "E2. `disconnect --device` for a phone whose client is gone revokes its relay session through the login its client stored "
+                "(no client is left to ask), exits 0, removes that phone's push token and record and leaves the others alone",
                 "rc %r tokens %r records %r revokes %r %s%s" % (gone.returncode, C.push_tokens(s), device_records(s), s.relay.revokes,
                                                               gone.stdout[-200:], gone.stderr[-400:]))
         end = C.run([H.APP_PATH, "disconnect", "--repo", s.repo], env, stdin="", timeout=180)
         T.check(end.returncode == 0 and C.wait_until(lambda: sids[1] in s.relay.revokes and sids[2] in s.relay.revokes, 30)
                 and C.wait_until(lambda: not C.alive(pids["Phone 2"]) and not C.alive(pids["Phone 3"]), 20)
                 and C.wait_until(lambda: C.push_tokens(s) == [] and not device_records(s), 20),
-                "E3. plain `hmd app disconnect` with several phones revokes each one's relay session through its own client, and leaves "
+                "E3. plain `hmd app disconnect` with several phones revokes each one's relay session (through the login its client stored, then the client is stopped), and leaves "
                 "no push token and no device record",
                 "rc %r revokes %r tokens %r records %r %s%s" % (end.returncode, s.relay.revokes, C.push_tokens(s), device_records(s),
                                                               end.stdout[-200:], end.stderr[-300:]))

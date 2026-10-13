@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# heimdall-repo-checks -- a repository's OWN checks, run and recorded, so the push gate can pass a push on that record.
+#
+# This file is only the launcher. The behaviour, the usage and the contract (`heimdall-repo-checks --help` prints them) are in
+# bin/lib/hmd_repo_checks.py; the receipt's ONE definition -- what `run` writes and `status` accepts -- is in bin/lib/hmd_repo_receipt.py.
+# Python runs isolated (-I -S), like the other hook helpers, so nothing from the cwd or the environment is imported.
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+exec python3 -I -S "$(cd "$(dirname "$SELF")" && pwd)/lib/hmd_repo_checks.py" "$@"
