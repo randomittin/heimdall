@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-all-guards.sh -- sourced by test/run-all.sh. Three things the runner does about the machine it runs on.
+# run-all-guards.sh -- sourced by test/run-all.sh. Five things the runner does about the machine it runs on.
 # Defined here, not inline, so test/run-all-guards.test.sh can drive them without a fixture sweep, and so a
 # copy of run-all.sh run without this file next to it (the throwaway fixture repos of the test/run-all-*.test.sh
 # suites) simply runs without them, as it always did.
@@ -30,10 +30,11 @@
 #   2026-10-13: free space on the dev machine dropped 1.6 GB while agents ran suites. A suite that makes a temp dir with mktemp and
 #   never removes it (a missing `trap 'rm -rf' EXIT`, or an early abort before the cleanup line) leaves it in the machine's TMPDIR
 #   for good, and nothing said so. Now:
-#     * hmd_test_tmp_begin makes ONE run-level root (TMP_ROOT = $TMPDIR/hmd-ra.XXXXXX -- short on purpose, a unix socket path under it
-#       must stay inside the 104-byte macOS limit) and takes the before-snapshot of the directories the outside check watches;
-#     * run_one gives each suite a fresh $TMP_ROOT/<idx> as ITS TMPDIR, so everything it makes through mktemp / $TMPDIR / python
-#       tempfile lands there;
+#     * hmd_test_tmp_begin makes ONE run-level root (TMP_ROOT = $TMPDIR/hr.XXXX) and takes the before-snapshot of the directories the outside
+#       check watches;
+#     * run_one gives each suite a fresh $TMP_ROOT/s<N> (N = its index; the receipt's tmp_dirs says which suite had which) as ITS TMPDIR, so
+#       everything it makes through mktemp / $TMPDIR / python tempfile lands there. Both names are as short as they can be on purpose: a unix
+#       socket path has to fit macOS's 104 bytes, and every byte of the per-suite dir comes out of what a suite can use (hmd_test_sock_preflight);
 #     * hmd_test_suite_tmp_settle, called AFTER timeout_run has returned -- timeout_run reaps the suite's whole process group first,
 #       so nothing is still writing -- measures what is left (top-level entries + du bytes + a sample of names) into
 #       $WORK/<idx>.tmpleak, then removes it (chmod first: a suite that leaves a read-only tree must not leak forever);
@@ -51,6 +52,20 @@
 #   Needs from the caller: RUN, TO_RUN, WORK (and RED/YEL/BLD/OFF for colour, optional). Sets TMP_ROOT (begin) and TMP_GUARD_RAN,
 #   TMP_FINDINGS, TMP_LEAK_SUITES, TMP_LEAK_BYTES, TMP_OUTSIDE_COUNT (guard); writes $WORK/tmp-leaks.tsv, tmp-outside.tsv (what the
 #   receipt is built from), tmp-section.txt (the loud text) and tmp-summary.txt (the summary lines).
+#
+# hmd_test_disk_preflight / hmd_test_sock_preflight   REFUSE TO START a sweep that cannot work (always on; run-all.sh calls them before the lock, the work dir,
+#     any trap or receipt exists, so a refusal leaves nothing behind; neither runs on a dry run).
+#   * disk (exit 5): if the volume holding TMPDIR, or the one holding the repo, has less than HMD_TEST_MIN_FREE_GB (default 5; 0 = off) GB free, the sweep is
+#     refused with a message naming the volume and what is free. A sweep writes real data (fixtures, clones, git history) and the machine had just lost 1.6 GB
+#     to suite leftovers. Free space comes from `df -Pk` looked up through PATH (so the tests can fake it); a df that cannot answer skips that check with a
+#     notice -- a preflight must not be the reason a sweep cannot run.
+#   * sockets (exit 6): macOS caps a unix socket path at 104 bytes including the NUL (103 usable). Every byte of the per-suite temp dir comes out of what a suite
+#     can use, so the dir is named as short as possible ($TMPDIR/hr.XXXX/s<N>) and its length is CHECKED: headroom = 103 - length(the widest per-suite dir, in the
+#     longer of its logical and its `cd -P` spelling -- macOS /var is /private/var). The longest socket path the suites can build is COMPUTED (hmd_test_sock_need:
+#     the files under test/ that name AF_UNIX and the $VAR/.../x.sock paths in them, behind the 14 bytes of the suite's own mktemp dir). Under that need the sweep
+#     is REFUSED: a suite is certain to fail. Under HMD_TEST_SOCK_HEADROOM (default 60) it is a loud WARNING and a receipt field (tmp_sock) -- on stock macOS TMPDIR
+#     is already 48 bytes, so 60 cannot hold there and a refusal would block every sweep. Sockets are NEVER moved to the shared /tmp to buy room: that is exactly
+#     the kind of leak this machinery exists to catch.
 
 hmd_test_wait_quiet() {
   local max_wait="${HMD_QUIET_MAX_WAIT_S:-1200}" poll="${HMD_QUIET_POLL_S:-30}" need="${HMD_QUIET_CHECKS:-3}"
@@ -155,7 +170,7 @@ hmd_test_tmp_snapshot() {
 hmd_test_tmp_begin() {
   local work="$1" base="${TMPDIR:-/tmp}"
   base="${base%/}"; [ -n "$base" ] || base=/tmp
-  TMP_ROOT="$(mktemp -d "$base/hmd-ra.XXXXXX" 2>/dev/null)" || TMP_ROOT=""
+  TMP_ROOT="$(mktemp -d "$base/hr.XXXX" 2>/dev/null)" || TMP_ROOT="$(mktemp -d "$base/hr.XXXXXX" 2>/dev/null)" || TMP_ROOT=""
   if [ -z "$TMP_ROOT" ]; then
     echo "run-all: could not create the per-suite temp root under $base -- suites share the machine TMPDIR this run and their leftovers are NOT accounted for" >&2
     return 0
@@ -242,6 +257,10 @@ hmd_test_tmp_guard() {
   if [ "$strict" -eq 1 ]; then limit_txt="the strict limit (any leftover)"; else limit_txt="the ${max_mb} MB limit"; fi
   : > "$work/tmp-leaks.tsv"; : > "$work/tmp-leaks-over.tsv"; : > "$work/tmp-leaks-under.tsv"
   : > "$work/tmp-outside.tsv"; : > "$work/tmp-section.txt"; : > "$work/tmp-summary.txt"
+  # name -> dir map, for attribution: which per-suite dir (s<N>) belonged to which suite, so a path found in a log, an orphan's cwd or a leftover traces back to its suite.
+  : > "$work/tmp-dirs.tsv"
+  while [ "$i" -lt "${TO_RUN:-0}" ]; do printf '%s\ts%d\n' "${RUN[$i]##*/}" "$i" >> "$work/tmp-dirs.tsv"; i=$((i + 1)); done
+  i=0
 
   # 1. what each suite left in its own TMPDIR. A suite re-run alone (a red) has one line per run: the worst one counts.
   while [ "$i" -lt "${TO_RUN:-0}" ]; do
@@ -324,8 +343,94 @@ hmd_test_tmp_guard() {
     fi
   fi
 
+  if [ -n "${SOCK_HEADROOM:-}" ]; then
+    printf 'tmp sockets: %s bytes left under the per-suite temp dir for a unix socket path (limit 104; target %s; the longest socket the suites build needs %s)%s\n' "$SOCK_HEADROOM" "${SOCK_TARGET:-?}" "${SOCK_NEED:-?}" "$([ "$SOCK_HEADROOM" -lt "${SOCK_TARGET:-0}" ] && printf ' -- BELOW TARGET')" >> "$work/tmp-summary.txt"
+  fi
   TMP_LEAK_SUITES=$n_leak; TMP_LEAK_BYTES=$sum_b; TMP_OUTSIDE_COUNT=$n_out
   TMP_FINDINGS=$n_over
   [ "$strict" -eq 1 ] && TMP_FINDINGS=$((n_over + n_out))
+  return 0
+}
+
+# ── PREFLIGHTS: refuse to START a sweep that cannot work ──────────────────────────────────────────────────────────────────────────
+
+# _hmd_df_free PATH -- "<free KB><TAB><mount point>" of the volume holding PATH (df -Pk: column 4 is Available in 1024-byte blocks, column 6 on is
+# the mount point, which can hold spaces), "" when df cannot say. `df` is looked up through PATH on purpose: the tests put a fake one first.
+_hmd_df_free() {
+  df -Pk "$1" 2>/dev/null | awk 'NR == 2 { m = $6; for (i = 7; i <= NF; i++) m = m " " $i; print $4 "\t" m }'
+}
+
+# _hmd_disk_refuse WHAT FREE_KB MOUNT MIN_GB -- one refusal line, on stderr.
+_hmd_disk_refuse() {
+  echo "run-all: refusing to start -- only $(hmd_test_fmt_bytes $(( $2 * 1024 ))) free on the volume holding $1 (mounted on $3); a sweep needs at least $4 GB free (HMD_TEST_MIN_FREE_GB)." >&2
+}
+
+# hmd_test_disk_preflight REPO -- return 1 (refusal on stderr) when the volume holding TMPDIR, or the one holding the repo, has less than
+# HMD_TEST_MIN_FREE_GB (default 5; 0 turns the check off) GB free. One volume holding both is reported once. A df that cannot answer skips that check
+# with a notice: a preflight must never be the reason a sweep cannot run on a machine where df itself is broken.
+hmd_test_disk_preflight() {
+  local repo="$1" min_gb="${HMD_TEST_MIN_FREE_GB:-5}" tdir="${TMPDIR:-/tmp}" tab=$'\t' min_kb t r tk tmnt rk rmnt short=0
+  case "$min_gb" in ''|*[!0-9]*) min_gb=5 ;; esac
+  [ "$min_gb" -gt 0 ] || return 0
+  min_kb=$((min_gb * 1048576))
+  t="$(_hmd_df_free "$tdir")"; r="$(_hmd_df_free "$repo")"
+  tk="${t%%"$tab"*}"; tmnt="${t#*"$tab"}"; rk="${r%%"$tab"*}"; rmnt="${r#*"$tab"}"
+  case "$tk" in ''|*[!0-9]*) tk="" ;; esac
+  case "$rk" in ''|*[!0-9]*) rk="" ;; esac
+  [ -n "$tk" ] || echo "run-all: could not read the free space of the volume holding TMPDIR=$tdir with df -- no disk check for it" >&2
+  [ -n "$rk" ] || echo "run-all: could not read the free space of the volume holding the repo $repo with df -- no disk check for it" >&2
+  if [ -n "$tk" ] && [ -n "$rk" ] && [ "$tmnt" = "$rmnt" ]; then
+    if [ "$tk" -lt "$min_kb" ]; then _hmd_disk_refuse "TMPDIR=$tdir and the repo $repo" "$tk" "$tmnt" "$min_gb"; short=1; fi
+  else
+    if [ -n "$tk" ] && [ "$tk" -lt "$min_kb" ]; then _hmd_disk_refuse "TMPDIR=$tdir" "$tk" "$tmnt" "$min_gb"; short=1; fi
+    if [ -n "$rk" ] && [ "$rk" -lt "$min_kb" ]; then _hmd_disk_refuse "the repo $repo" "$rk" "$rmnt" "$min_gb"; short=1; fi
+  fi
+  [ "$short" -eq 1 ] || return 0
+  echo "         Nothing was run and no receipt was written. Free space first (hmd system-health, or the mac-deep-clean skill), or lower HMD_TEST_MIN_FREE_GB on purpose." >&2
+  return 1
+}
+
+# hmd_test_sock_need REPO -- "<bytes> <file>": the longest unix-socket path, counted from the per-suite temp dir, that a suite can build; "0 -" when none does.
+# Read off the suites: every file under test/ that names AF_UNIX, and the shell-style socket paths in it ($VAR/.../name.sock), behind the 14 bytes ("/tmp.XXXXXXXX/")
+# of the mktemp dir a suite makes under its TMPDIR. A heuristic over what the suites WRITE, not a proof about what bin/ builds at run time -- but hmd ui, the relay
+# client, the ledger, the MCP servers and the dashboards listen on TCP or stdio, so the suites that bind a unix socket themselves are the whole list today. This
+# guard's own files are skipped: they name AF_UNIX and .sock in order to look for them.
+hmd_test_sock_need() {
+  local repo="$1" f rel n best=0 best_f="-"
+  for f in $(grep -lIE 'AF_UNIX' "$repo"/test/*.test.sh "$repo"/test/lib/* 2>/dev/null); do
+    case "${f##*/}" in run-all-guards.sh|run-all-guards.test.sh) continue ;; esac
+    while IFS= read -r rel; do
+      rel="${rel#*/}"
+      n=$(( ${#rel} + 14 ))
+      if [ "$n" -gt "$best" ]; then best=$n; best_f="${f##*/}"; fi
+    done < <(grep -ohIE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/[A-Za-z0-9_./-]*\.sock' "$f" 2>/dev/null)
+  done
+  printf '%s %s\n' "$best" "$best_f"
+}
+
+# hmd_test_sock_preflight REPO NSUITES -- will a unix socket path still fit under the per-suite temp dir? macOS caps sun_path at 104 bytes INCLUDING the NUL, so a
+# socket path may be 103 bytes; headroom = 103 - length(the widest per-suite dir). That dir is $TMPDIR/hr.XXXX/s<NSUITES> -- in the longer of its logical and its
+# `cd -P` spelling, since a suite that does `cd "$TMPDIR" && pwd -P` builds its socket path from the canonical one (macOS: /var is /private/var). Sets SOCK_DIR,
+# SOCK_HEADROOM, SOCK_NEED, SOCK_TARGET (the receipt's tmp_sock). Returns 1 (refusal on stderr) when the headroom is below SOCK_NEED, the longest socket path the suites
+# build: a suite is then certain to fail, so the sweep does not start. Below HMD_TEST_SOCK_HEADROOM (default 60) it only warns (stdout): on stock macOS TMPDIR is
+# already 48 bytes, so 60 cannot hold there and a refusal would block every sweep. Sockets are never moved to the shared /tmp to buy room.
+hmd_test_sock_preflight() {
+  local repo="$1" n="${2:-0}" target="${HMD_TEST_SOCK_HEADROOM:-60}" base="${TMPDIR:-/tmp}" canon need_line need need_f
+  SOCK_DIR=""; SOCK_HEADROOM=""; SOCK_NEED=""; SOCK_TARGET=""
+  case "$target" in ''|*[!0-9]*) target=60 ;; esac
+  base="${base%/}"; [ -n "$base" ] || base=/tmp
+  canon="$(cd -P "$base" 2>/dev/null && pwd)"
+  if [ -n "$canon" ] && [ "${#canon}" -gt "${#base}" ]; then base="$canon"; fi
+  SOCK_DIR="$base/hr.XXXX/s$n"
+  SOCK_HEADROOM=$((103 - ${#SOCK_DIR}))
+  need_line="$(hmd_test_sock_need "$repo")"; need="${need_line%% *}"; need_f="${need_line#* }"
+  SOCK_NEED=$need; SOCK_TARGET=$target
+  if [ "$SOCK_HEADROOM" -lt "$need" ]; then
+    echo "run-all: refusing to start -- the per-suite temp dir (e.g. $SOCK_DIR, ${#SOCK_DIR} bytes) leaves only $SOCK_HEADROOM of the 103 bytes a unix socket path may have (macOS sun_path is 104 with the NUL), and $need_f builds one that needs $need. Use a shorter TMPDIR. Nothing was run and no receipt was written." >&2
+    return 1
+  fi
+  if [ "$SOCK_HEADROOM" -lt "$target" ]; then
+    echo "${YEL:-}sock paths:${OFF:-} only $SOCK_HEADROOM bytes are left under the per-suite temp dir ($SOCK_DIR) for a unix socket path (macOS limit 104; target $target, HMD_TEST_SOCK_HEADROOM changes it; the longest socket the suites build needs $need) -- a shorter TMPDIR gives more room"
+  fi
   return 0
 }
