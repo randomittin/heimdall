@@ -56,6 +56,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bin/heimdall-state` are unchanged. Test: `test/ship-npm-only-after-bump.test.sh` (the real full ship in a throwaway repo, then the real `--npm-only` and `--release-only` with nothing
   landed in between, with a journal commit, a code commit and an uncommitted edit after the tag -- what is published and signed is compared with the tag's files -- and the shapes that must
   still be refused).
+- **The per-repo push gate, last security review (2026-10-14)** -- three findings against the gate described under Changed, each with its tests in `test/heimdall-push-gate-per-repo.test.sh`
+  (`test/heimdall-precheck-bash.test.sh` filters two more trace lines of the old gate's call). (1) *A resolver that cannot answer fell back to the WRONG repository.* A timeout (`HMD_PUSH_TARGET_TIMEOUT_S`),
+  a crash or a missing resolver ran the strict gate on ONE directory (the hook's own cwd), so a push to another repository by `-C` / `cd`, or from the payload's cwd, went ungraded. Now the strict
+  gate runs against EVERY candidate -- the session's cwd, the payload's cwd and each `-C` / `cd` / `--git-dir` / `--work-tree` directory the parser had reached (the resolver prints them itself when it times
+  out or fails, without asking git; the hook adds the two cwds when it gets no answer at all) -- and the push is blocked unless all of them pass. A push whose repository git names but whose work tree cannot
+  be confirmed from the other end (a dotfiles layout) is graded on those directories as well, not only on the cwd's; a gate directory the hook cannot enter blocks (it used to run the gate wherever the hook
+  was). Tests C50-C53. (2) *Gate scope mismatch.* One resolved (git directory, work tree) pair now feeds classification, refspec resolution, the receipt lookup and the `heimdall-state` check: each resolver
+  row carries it (`class`, work tree, extra, git directory), every git call about the pushed repository runs with `GIT_DIR` and `GIT_WORK_TREE` pinned to it, `heimdall-repo-checks status --git-dir` verifies the
+  pair from both ends and reads the receipt inside that work tree, and the hook runs `heimdall-state` in that work tree with the same pair exported. A `GIT_*` variable the resolver does not reproduce
+  (`GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_NAMESPACE`, `GIT_INDEX_FILE`, ...) gave the push another view of the refs than the one the gate classified; it now makes the command uncertain (transport and
+  identity variables such as `GIT_SSH_COMMAND` keep the class). Tests B "pair" and B "GIT_*", C54-C59. (3) *Self-audit.* The receipt is read as ONE regular file inside the repository: a symlinked `.heimdall`,
+  `.heimdall/receipts` or receipt is never followed (and `run` will not write through one), the file is opened once with `O_NOFOLLOW` and checked on that descriptor, at most 1 MiB is read (a committed
+  declaration over 1 MiB is refused too) and nesting deep enough to exhaust the parser is "not valid JSON", not a crash; `status` names HEAD once and reads the tree and the declaration of that commit, so a
+  HEAD that moves between its reads cannot mix two commits; one regex that backtracked quadratically on a long command (a signal cannot interrupt a regex, so the resolver's own timeout never fired) is two linear
+  searches. Tests A10, B "linear time", C60-C61. The unmanaged-repo warning, the secret and self-scan gates and every earlier class rule are unchanged.
 
 ## Changelog status
 

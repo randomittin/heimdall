@@ -97,7 +97,12 @@ over the subcommand, a builtin behind a wrapper that starts a process such as `e
 assignment to `HOME`/`CDPATH`/`PWD`/`OLDPWD`, an unknown git option or subcommand, an unmodelled `GIT_*` variable, a
 marker that cannot be inspected) makes the command uncertain, and then EVERY repo involved gets the **sweep** class:
 never a warning. Every error path is strict too (git failing, timing out or printing something unexpected, a resolver
-that crashes, a corrupt receipt or declaration); the test forces each one. The secret scan, self-scan, oracle and
+that crashes, a corrupt receipt or declaration); the test forces each one. A resolver that times out, crashes or is
+missing is never a reason to grade ONE repository: the strict gate runs against the session's cwd, the payload's cwd and
+every `-C` / `cd` / `--git-dir` / `--work-tree` directory the parser reached, and the push is blocked unless all pass.
+One resolved (git directory, work tree) pair feeds every stage (the class, the refspec sources, the receipt lookup and
+the `heimdall-state` check); nothing re-derives the repository from a path. A receipt under a symlinked `.heimdall`
+or `receipts` is never read, and one over 1 MiB is not parsed. The secret scan, self-scan, oracle and
 corpus stages are not part of this rule and are not relaxed. The repo-checks receipt
 is a cooperating-agent control, not a security boundary against someone who can write it, exactly like
 `last-sweep.json`. See `CLAUDE.md` "Push gate" and `test/heimdall-push-gate-per-repo.test.sh`.

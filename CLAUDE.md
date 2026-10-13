@@ -214,7 +214,16 @@ warning but isn't blocked; don't drop the gate altogether.* The gate is now chos
   asks **git itself** which git directory each push operates on: the same options and `GIT_*`
   environment go to `git rev-parse`, and the work tree root it finds is checked from the other end.
   `--work-tree` / `GIT_WORK_TREE` cannot point a push at a decoy, and a subdirectory or linked
-  worktree of heimdall is heimdall.
+  worktree of heimdall is heimdall. That (git directory, work tree) pair is resolved ONCE (2026-10-14)
+  and is the one every stage reads: the class and the refspec sources are read with `GIT_DIR` and
+  `GIT_WORK_TREE` pinned to it, each resolver row carries it (`class<TAB>work tree<TAB>extra<TAB>git dir`),
+  the hook hands it to `heimdall-repo-checks status --git-dir` (which verifies it from both ends, reads git
+  with the pair pinned and the receipt inside that work tree) and runs `heimdall-state` in that work tree
+  with the same two variables exported. Nothing re-derives "the repository" from a path, so the stages
+  cannot end up looking at different ones. A `GIT_*` variable the resolver does not reproduce
+  (`GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_NAMESPACE`, `GIT_INDEX_FILE`, ...) would give the push
+  another view of the refs than the gate reads, so it makes the command uncertain; the transport and
+  identity ones (`GIT_SSH_COMMAND`, `GIT_TERMINAL_PROMPT`, `GIT_TRACE*`, ...) keep the class.
 - **The class is read from the COMMITS, not the work tree.** The commits inspected are HEAD, its
   upstream (`@{upstream}`, `@{push}`), `origin/HEAD`, `origin/<branch>` and whatever the push names
   (refspecs, `--all`, `--mirror`, `--tags`), read with `git ls-tree` / `git cat-file`; the STRICTEST
@@ -245,6 +254,16 @@ warning but isn't blocked; don't drop the gate altogether.* The gate is now chos
   `run` writes passes, every field mutated alone fails).
 - **(c) unmanaged.** One `WARNING` line on stderr, exit 0, and only when the command was understood
   EXACTLY, git resolved the repo, and no commit inspected has either marker.
+- **A resolver that cannot answer is graded against EVERY candidate (2026-10-14).** A timeout
+  (`HMD_PUSH_TARGET_TIMEOUT_S`), a crash or a missing file never falls back to ONE repository: the strict
+  gate runs against the session's cwd, the payload's cwd and each `-C` / `cd` / `--git-dir` / `--work-tree`
+  directory the parser had reached (the resolver prints them itself when it fails, without asking git; the
+  hook adds the two cwds when it gets nothing at all), and the push is blocked unless all of them pass. A
+  push git names but whose repository cannot be placed (a dotfiles layout: `--git-dir=X --work-tree=Y` with
+  no link back from Y) is graded on those directories too, not only on the cwd's. A gate directory the
+  hook cannot enter blocks (a candidate that does not exist is skipped: nothing can be pushed from it). The
+  receipt is read as one regular file inside the repository (no link in `.heimdall` or `receipts` is
+  followed, at most 1 MiB, one commit named once and used throughout), never as whatever a path leads to.
 - **Fail closed.** Any construct not modelled exactly makes the whole command uncertain, and then EVERY
   repo involved (the resolved ones and the cwd one) gets class (a), never a warning. Followed exactly:
   quotes, `~`, `;` `&&` `||` `|` `&`, subshells, `$( )` and backticks, `cd`/`pushd`/`popd` as a SET of
