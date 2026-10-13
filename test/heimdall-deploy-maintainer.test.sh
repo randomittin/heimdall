@@ -2,6 +2,10 @@
 # deploy-maintainer.sh guard: --dry-run needs no creds + prints the plan; bad --repo rejected;
 # no token VALUE ever reaches stdout (dry-run collects none); the constraint banner is present.
 set -uo pipefail
+# Every temp path this suite makes lives under ONE private dir that is removed on exit, also on INT/TERM/HUP, and a bare mktemp lands in it even where the
+# platform's mktemp ignores TMPDIR (test/lib/private-tmp.sh); a standalone run leaves nothing behind, and test/run-all.sh reports the suites that do.
+# shellcheck source=lib/private-tmp.sh disable=SC1091  # the default run never opens sourced files
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/private-tmp.sh" && hmd_private_tmp heimdall-deploy-maintainer || exit 1
 S="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/deploy/cloud-run/deploy-maintainer.sh"
 P=0; F=0; ok(){ P=$((P+1)); printf '  PASS %s\n' "$1"; }; bad(){ F=$((F+1)); printf '  FAIL %s\n' "$1"; }
 [ -x "$S" ] || { echo "FATAL: $S not executable"; exit 2; }
