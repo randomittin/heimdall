@@ -5,7 +5,26 @@ All notable changes to Heimdall (formerly superx) will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] -- 2.4.8
+## Changelog status
+
+This file was not maintained between the last curated entry below (from when the
+project was still called superx) and the current plugin version. The version of
+record is `.claude-plugin/plugin.json`, mirrored into `VERSION` and the README badge
+by `bin/heimdall-render-version` -- it is deliberately not repeated here, because a
+hand-typed version drifts on the next bump (test/version-pin-conformance.test.sh
+exists for exactly that reason). No release notes for the gap have been
+reconstructed, deliberately: writing them after the fact would be invention. The
+real history is in git:
+
+- `git log --oneline <tag-of-the-last-curated-entry-below>..HEAD`
+- `bin/generate-changelog` (renders from commits, never hand-typed)
+- `hmd weekly-log` (drafts only)
+
+## [Unreleased]
+
+## [2.4.8] - 2026-10-14 <!-- HEIMDALL:PIN:FROZEN -->
+
+The resume release. A stopped or crashed laptop client no longer unpairs the phone: each phone's relay login is stored outside the repo and resumed for 24 h, and only an explicit disconnect or a revoke unpairs. The push gate now grades each push against the repo being pushed, with that repo's own checks. 2.4.7 never reached npm; take 2.4.8 instead. <!-- HEIMDALL:PIN:FROZEN -->
 
 ### Added
 - **A repo can declare its own checks, and the push gate passes it on a record of them** — `.heimdall/repo-checks.json` (`{"schema":1,"checks":[{"name","cmd"}]}`, committed) plus `bin/heimdall-repo-checks run|status [--repo PATH]`: `run` executes each check from the repo root in order and writes `.heimdall/receipts/repo-checks.json` atomically (`head_sha`, `tree_sha`, `decl_sha256`, `dirty`, `exit_code`, `finished_at`, per-check `exit_code`/`secs`); `status` says whether it is green and current. The gate recomputes the commit, its tree and the committed declaration's hash from git objects and also requires a clean tree at run time, a green exit and exactly the declared checks; a stale, red, dirty, missing, mismatched, malformed or invalid record blocks and names the runner. A receipt attests ONE commit: the hook hands the commits the push sends as sources to `status --pushes` (each refspec's source resolved by git, HEAD for a bare push) and every one must be the receipt's `head_sha`; `--all`, `--mirror`, `--tags`, a wildcard refspec, an option it cannot read and push configuration that picks the refs (`push.default=matching`, any `remote.<name>.push`) cannot be tied to one receipt and block. The receipt's fields, types and formats are defined ONCE, in `bin/lib/hmd_repo_receipt.py`, which `run` builds the receipt with and `status` verifies it against; a test walks that definition (a receipt `run` writes passes, every field mutated alone fails). Like `last-sweep.json` it is a cooperating-agent control, not a security boundary against someone who can write the file. Test: `test/heimdall-push-gate-per-repo.test.sh`.
@@ -40,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The push gate runs each repo's own checks, not heimdall's** — the quality gate used to run in the session's cwd for any push, so a push of the site (six gates of its own) was blocked for lacking heimdall's sweep receipt. `bin/lib/hmd_push_target.py` now names the repo each push goes to by asking git itself (`-C` chains, `--git-dir`, `GIT_DIR`, subdirectories, linked worktrees; `--work-tree` cannot act as a decoy) and its class: **sweep** (`test/run-all.sh` names `last-sweep.json`: heimdall's own regime, the old gate unchanged and fail closed, now run inside that repo), **repo-checks** (a green, current receipt of its own checks) or **unmanaged** (one warning, the push goes on). The class is read from the COMMITS a push can carry (HEAD, its upstream, `origin/HEAD`, `origin/<branch>`, the refspecs named), never the work tree, and the strictest wins: an uncommitted marker edit changes nothing, and a pushed commit that drops a marker cannot downgrade a repo whose upstream still has it. The shell is read by a conservative model (`$( )`, backticks, `eval`, `sh -c`, here-strings and heredocs fed to shells, `xargs`, `pushd`/`popd`, chains of `cd` as sets of possible states); any construct it does not model exactly (a dynamic or conditional `cd`, `cd -`, a function, `source`, `alias`, a script piped to a shell, `find -exec`, an unknown git option or subcommand, an unmodelled `GIT_*` variable, a marker that cannot be inspected) makes the command uncertain, and then EVERY repo involved gets the strict sweep gate, never a warning; a repo that declares its own checks keeps owing the receipt under uncertainty (for commits nobody can list, so it is refused until the command is restated), and a strict gate that was never evaluated (`heimdall-state` has no state there) blocks instead of allowing. Every error path is strict too: git exiting non-zero, timing out or printing something it does not print, a ref that cannot be placed, a marker that is a link, a submodule or a directory, a resolver that crashes, a corrupt or oddly typed receipt or declaration; the tests force each one (a `git` on PATH that fails, prints nonsense or hangs at each call the resolver makes). A real shell is the judge of the model: every command of a corpus is RUN by bash and zsh with a git that records where it was started, and the repositories the pushes really went to are compared with the resolver's answer. It found a `cd` behind `env`/`nice`/`xargs` (a process runs it, not this shell), the last element of a pipeline (zsh runs it in the current shell), `CDPATH=` and `command cd` (bash runs the builtin, zsh does not); the same review made `env` with any option and assignments to `HOME`, `PWD`, `OLDPWD`, `BASH_ENV` and `ENV` uncertain. The secret, self-scan, oracle and corpus stages are not relaxed. Tests: `test/heimdall-push-gate-per-repo.test.sh`, and `test/heimdall-push-gate-target-repo.test.sh` for the case that was reported (the session in heimdall, the push to another repo by `cd`, by `-C` or from it, each graded on that repo's own record).
 
 ### Fixed
+- **Tests no longer fill the disk with leftover temp folders** -- on 2026-10-13 the disk reached 0 bytes free mid-session. `bin/heimdall-agents` made a `mktemp -d` work dir per call and removed it only on normal return, so the statusline's timeout kill stranded one each time (3,731 `hmd-agents.*` dirs); it now needs no on-disk work dir. `test/lib/dashboard_alerts_battery.py` never removed its dir (782 `hmd-alerts-*`). On this macOS a template-less `mktemp` ignores `TMPDIR`, so tests that set a throwaway `HOME` and ran `uv` leaked `tmp.*` dirs; the new `test/lib/private-tmp.sh` keeps a test's temp files, mktemp calls and pip/uv caches in one private root removed on EXIT, INT, TERM and HUP, adopted by `install-stranger`, `update-signed-apply` and `heimdall-deploy-maintainer`. The sweep gives each suite its own TMPDIR and removes it, records `tmp_leaks` and `tmp_outside` in the receipt, fails a suite that leaves over 50 MB inside or outside its TMPDIR, refuses to start below 5 GB free (exit 5) and refuses socket paths without headroom (exit 6). Not heimdall's and not fixed here: the `pip-unpack-*` dirs (2.2 GB), which come from Claude Code's own `~/.claude/security/agent-sdk-venv` pip bootstrap. About 300 other suites still use bare `mktemp` and can leak if killed.
 - `release/ship.sh --npm-only` and `--release-only` no longer refuse the sweep receipt a full ship has just used, and they now ship the tagged commit's own files. The ship grades the
   receipt BEFORE its version bump, so its own `chore(release): vX.Y.Z` commit (one no sweep ever saw) made that receipt look stale, and the npm-drift recovery died with "graded <the commit
   before the bump>, HEAD is <the bump>" although nothing had landed since. These two post-tag modes now grade the TAGGED commit, not HEAD: the tag `v<version>` names the release commit T,
@@ -72,22 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HEAD that moves between its reads cannot mix two commits; one regex that backtracked quadratically on a long command (a signal cannot interrupt a regex, so the resolver's own timeout never fired) is two linear
   searches. Tests A10, B "linear time", C60-C61. The unmanaged-repo warning, the secret and self-scan gates and every earlier class rule are unchanged.
 
-## Changelog status
-
-This file was not maintained between the last curated entry below (from when the
-project was still called superx) and the current plugin version. The version of
-record is `.claude-plugin/plugin.json`, mirrored into `VERSION` and the README badge
-by `bin/heimdall-render-version` -- it is deliberately not repeated here, because a
-hand-typed version drifts on the next bump (test/version-pin-conformance.test.sh
-exists for exactly that reason). No release notes for the gap have been
-reconstructed, deliberately: writing them after the fact would be invention. The
-real history is in git:
-
-- `git log --oneline <tag-of-the-last-curated-entry-below>..HEAD`
-- `bin/generate-changelog` (renders from commits, never hand-typed)
-- `hmd weekly-log` (drafts only)
-
-## [Unreleased]
+### Not in this release
+- The kill guard is not narrowed yet (the 2.4.7 notes said 2.4.8); it still denies kills by name or computed pid. `HMD_KILL_GUARD=off` still turns it off.
+- `release/ship.sh` does not yet commit, check and push the site's version pins, and a full ship still publishes npm from the working tree rather than the tag; both are planned for 2.4.9.
+- The push gate still allows a push, with a warning, when `heimdall-state` cannot give a verdict in a heimdall checkout that was never initialised.
 
 ## [2.4.7] - 2026-10-13 <!-- HEIMDALL:PIN:FROZEN -->
 
