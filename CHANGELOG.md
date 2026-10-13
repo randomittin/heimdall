@@ -36,16 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/app-session-revoke-race.test.sh`.
 
 ### Fixed
-- `release/ship.sh --npm-only` and `--release-only` no longer refuse the sweep receipt a full ship has just used. The ship grades the receipt BEFORE its version bump, so its
-  own `chore(release): vX.Y.Z` commit (one no sweep ever saw) made that receipt look stale, and the npm-drift recovery died with "graded <the commit before the bump>, HEAD is
-  <the bump>" although nothing had landed since. In these two post-tag modes the receipt now also covers HEAD when the only change past the graded commit is the TAGGED
-  `chore(release): vX.Y.Z` commit and that commit does nothing but re-pin version files: every changed path is one the bump writes (`RELEASE_BUMP_PATHS`) or `CHANGELOG.md`, the
-  edits are in place with file modes untouched, each file differs from its parent only in version numbers and sha256 digests (`CHANGELOG.md` only in the release heading), the
-  commit has exactly one parent, its subject is exactly `chore(release): v<version>`, the manifest version really moved, and the tag `v<version at HEAD>` names it. Journal and
-  ledger commits (the hook-owned paths) never stale a receipt, before or after the bump. `--npm-only` publishes the working tree at HEAD, not a checkout of the tag, so HEAD stays
-  what is graded and the tagged bump is one more allowed hop in the chain, not a second thing to grade. Anything else still refuses, now with the reason the exemption did not apply.
-  A new full ship (it grades the commit it is about to bump), the pre-push gate and `bin/heimdall-state` are unchanged. Test: `test/ship-npm-only-after-bump.test.sh` (the real full
-  ship in a throwaway repo, then the real `--npm-only` with nothing landed in between, and the shapes that must still be refused).
+- `release/ship.sh --npm-only` and `--release-only` no longer refuse the sweep receipt a full ship has just used, and they now ship the tagged commit's own files. The ship grades the
+  receipt BEFORE its version bump, so its own `chore(release): vX.Y.Z` commit (one no sweep ever saw) made that receipt look stale, and the npm-drift recovery died with "graded <the commit
+  before the bump>, HEAD is <the bump>" although nothing had landed since. These two post-tag modes now grade the TAGGED commit, not HEAD: the tag `v<version>` names the release commit T,
+  and the receipt covers it when it graded T itself, or the commit T was bumped from (journal and ledger commits, the hook-owned paths, aside: the rule the ship applied to that commit)
+  while T does nothing but re-pin version files. That means every changed path is one the bump writes (`RELEASE_BUMP_PATHS`) or `CHANGELOG.md`, the edits are in place with file modes
+  untouched, each file differs from its parent only in version numbers and sha256 digests (`CHANGELOG.md` only in the release heading), the commit has exactly one parent, its subject is
+  exactly `chore(release): v<version>` and the manifest version really moved; T's own manifest must also say the version the tag is named for. Commits after the tag (journal or code) and
+  uncommitted edits are irrelevant, because nothing is read from them: `--npm-only` exports `packages/` of T with `git archive` into a temporary directory (removed on exit) and publishes
+  from there, so an uncommitted edit under `packages/` can no longer ship without proof (the export is checked against T's blobs, and an `export-ignore`, `export-subst` or `eol` rule that
+  would change a file refuses instead); `--release-only` signs T's `install.sh` (the bytes the tag serves, which `bin/heimdall-autoupdate` verifies) instead of the working tree's, and
+  refuses a `release-manifest.json` whose `install_sha256` is not T's. A `--release-only` run that must create the tag has no tagged commit to grade and still needs the receipt to cover
+  HEAD, as a full ship does. A sweep recorded at a HEAD past the tag proves HEAD, not the tag, so it no longer covers the tag: the refusal names the tag's commit, the reason and the commit
+  to re-sweep. The release notes are not read from T (Release prose, editable afterwards). A new full ship (it grades the commit it is about to bump), the pre-push gate and
+  `bin/heimdall-state` are unchanged. Test: `test/ship-npm-only-after-bump.test.sh` (the real full ship in a throwaway repo, then the real `--npm-only` and `--release-only` with nothing
+  landed in between, with a journal commit, a code commit and an uncommitted edit after the tag -- what is published and signed is compared with the tag's files -- and the shapes that must
+  still be refused).
 
 ## Changelog status
 
