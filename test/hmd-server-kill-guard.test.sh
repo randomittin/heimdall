@@ -19,6 +19,9 @@
 #   * the guard fails CLOSED: a command that mentions kill and that it cannot fully read (unbalanced quote, unterminated or
 #     expanded heredoc, $'...', a verb in a variable, nesting too deep, an exception, a timeout) is denied, and the hook denies
 #     when the guard itself is missing, crashes, says nothing or prints garbage
+#   * HMD_KILL_GUARD=off (also 0, false, no, in any case) turns the guard off for an operator who finds it too broad: none of it
+#     runs (a missing or crashing helper cannot block) and nothing is printed, while every other gate of the hook still runs;
+#     unset, empty or any other value leaves it on, and the deny tells the user about the switch
 #   * no committed test, helper or bin script pattern-kills an hmd server
 #   * bin/lib/hmd_ui_procs.py's reaper (heimdall-gc uis, run-all.sh's end-of-sweep guard) only ever selects orphans whose
 #     repo is gone or under a temp dir -- never a live client of an existing non-temp repo -- and never guesses a repo
@@ -69,24 +72,26 @@ sys.stdout.write("not ok \"quoted\" back\\slash\n")
 sys.exit(3)'
 
 RC=0
-run_hook() {  # run_hook <command> [plugin root]  -> RC, $TMPROOT/out (stdout), $TMPROOT/err (stderr)
-  local root="${2:-$PLUGIN}"
-  jq -nc --arg c "$1" '{tool_input: {command: $c}}' \
-    | env CLAUDE_PLUGIN_ROOT="$root" bash "$root/bin/heimdall-precheck-bash" >"$TMPROOT/out" 2>"$TMPROOT/err"
+run_hook() {  # run_hook <command> [plugin root] [VAR=val ...]  -> RC, $TMPROOT/out (stdout), $TMPROOT/err (stderr)
+  local cmd="$1" root="${2:-$PLUGIN}"
+  shift $(( $# < 2 ? $# : 2 ))
+  # HMD_KILL_GUARD is unset first, so what the operator exports in their own shell never changes a case; a case that needs it passes it
+  jq -nc --arg c "$cmd" '{tool_input: {command: $c}}' \
+    | env -u HMD_KILL_GUARD CLAUDE_PLUGIN_ROOT="$root" "$@" bash "$root/bin/heimdall-precheck-bash" >"$TMPROOT/out" 2>"$TMPROOT/err"
   RC=$?
 }
-denied() {  # denied <command> <label> [plugin root]: exit 2 and a valid JSON deny naming the guard
+denied() {  # denied <command> <label> [plugin root] [VAR=val ...]: exit 2 and a valid JSON deny naming the guard
   N=$((N + 1))
-  run_hook "$1" "${3:-$PLUGIN}"
+  run_hook "$1" "${3:-$PLUGIN}" "${@:4}"
   if [ "$RC" = 2 ] && jq -e '.error | test("hmd kill guard")' "$TMPROOT/out" >/dev/null 2>&1; then
     ok "$N. denied: $2"
   else
     bad "$N. NOT denied: $2" "rc=$RC stdout=$(head -c 160 "$TMPROOT/out") stderr=$(head -c 120 "$TMPROOT/err")"
   fi
 }
-allowed() {  # allowed <command> <label> [plugin root]: not this guard's deny, and the guard did not fail
+allowed() {  # allowed <command> <label> [plugin root] [VAR=val ...]: not this guard's deny, and the guard did not fail
   N=$((N + 1))
-  run_hook "$1" "${3:-$PLUGIN}"
+  run_hook "$1" "${3:-$PLUGIN}" "${@:4}"
   if [ "$RC" != 2 ] && ! grep -q 'hmd kill guard' "$TMPROOT/out" "$TMPROOT/err"; then
     ok "$N. allowed: $2"
   else
@@ -238,6 +243,57 @@ else
   bad "$N. a garbage reason" "rc=$RC stdout=$(head -c 200 "$TMPROOT/out")"
 fi
 allowed 'ls -la' "a command that does not mention kill never reaches the guard, so a crashing helper cannot block it" "$CRASH"
+
+# --- the opt-out: HMD_KILL_GUARD=off (also 0, false, no, any case) turns the guard off; unset, empty or anything else leaves it on ---
+# run_hook starts every case with HMD_KILL_GUARD unset, so every case above ran with the default (on); a case that wants a value passes it.
+for v in off OFF Off 0 false FALSE no No; do
+  allowed 'pkill -f heimdall-relay-client' "HMD_KILL_GUARD=$v: a pkill by pattern is not denied" "$PLUGIN" HMD_KILL_GUARD="$v"
+done
+allowed 'kill $(pgrep -f heimdall-relay-client)' "HMD_KILL_GUARD=off: a kill of a computed pid is not denied" "$PLUGIN" HMD_KILL_GUARD=off
+allowed "$INCIDENT" "HMD_KILL_GUARD=off: the 2026-10-12 incident command is not denied (the operator's own call)" "$PLUGIN" HMD_KILL_GUARD=off
+allowed "echo 'it will kill" "HMD_KILL_GUARD=off: a command the guard cannot read is not denied" "$PLUGIN" HMD_KILL_GUARD=off
+allowed 'kill 4242' "HMD_KILL_GUARD=off: the helper is never consulted, so a missing one cannot block" "$BARE" HMD_KILL_GUARD=off
+allowed 'kill 4242' "HMD_KILL_GUARD=off: nor one that crashes" "$CRASH" HMD_KILL_GUARD=off
+for v in on ON 1 true yes '' banana offf; do
+  denied 'pkill -f heimdall-relay-client' "HMD_KILL_GUARD='$v': anything but off, 0, false or no leaves the guard on" "$PLUGIN" HMD_KILL_GUARD="$v"
+done
+QUIET="$TMPROOT/plugin-quiet"   # its tracker prints nothing, so the chain's own stdout is empty when nothing denies
+mkroot "$QUIET"
+cp "$GUARD" "$QUIET/bin/lib/hmd_kill_guard.py"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$QUIET/bin/parallelism-tracker"
+chmod +x "$QUIET/bin/parallelism-tracker"
+N=$((N + 1))
+run_hook 'pkill -f heimdall-relay-client' "$QUIET" HMD_KILL_GUARD=off
+if [ "$RC" = 0 ] && [ ! -s "$TMPROOT/out" ] && [ ! -s "$TMPROOT/err" ]; then
+  ok "$N. HMD_KILL_GUARD=off prints nothing: exit 0, empty stdout, empty stderr"
+else
+  bad "$N. HMD_KILL_GUARD=off was not silent" "rc=$RC stdout=$(head -c 160 "$TMPROOT/out") stderr=$(head -c 160 "$TMPROOT/err")"
+fi
+SECRETS="$TMPROOT/plugin-secrets"   # a secret scanner that always fails: the opt-out must leave the hook's other gates alone
+mkroot "$SECRETS"
+printf '#!/usr/bin/env bash\necho "leak found" >&2\nexit 1\n' >"$SECRETS/bin/secret-scan"
+chmod +x "$SECRETS/bin/secret-scan"
+N=$((N + 1))
+run_hook 'git commit -m x' "$SECRETS" HMD_KILL_GUARD=off
+if [ "$RC" = 2 ] && jq -e '.error | test("secret detected in staged changes")' "$TMPROOT/out" >/dev/null 2>&1; then
+  ok "$N. HMD_KILL_GUARD=off switches off only the kill guard: the commit secret gate still denies"
+else
+  bad "$N. HMD_KILL_GUARD=off disturbed another gate" "rc=$RC stdout=$(head -c 200 "$TMPROOT/out")"
+fi
+N=$((N + 1))
+run_hook 'pkill -f heimdall-relay-client'
+if [ "$RC" = 2 ] && jq -e '.error | test("HMD_KILL_GUARD=off")' "$TMPROOT/out" >/dev/null 2>&1 && grep -q 'HMD_KILL_GUARD=off' "$TMPROOT/err"; then
+  ok "$N. the deny tells the user how to turn the guard off (HMD_KILL_GUARD=off), in its JSON verdict and on stderr"
+else
+  bad "$N. the deny does not mention HMD_KILL_GUARD=off" "rc=$RC stdout=$(head -c 200 "$TMPROOT/out")"
+fi
+N=$((N + 1))
+run_hook 'kill 4242' "$CRASH"
+if [ "$RC" = 2 ] && jq -e '.error | test("HMD_KILL_GUARD=off")' "$TMPROOT/out" >/dev/null 2>&1; then
+  ok "$N. a deny because the guard itself failed names the switch too (the one case where the user cannot fix the guard)"
+else
+  bad "$N. the guard-failed deny does not mention HMD_KILL_GUARD=off" "rc=$RC stdout=$(head -c 200 "$TMPROOT/out")"
+fi
 
 # --- the guard itself: protocol, timeout ---
 N=$((N + 1))
