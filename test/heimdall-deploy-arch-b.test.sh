@@ -20,6 +20,10 @@
 #
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 set -uo pipefail
+# Every temp path this suite makes lives under ONE private dir that is removed on exit, so a standalone run of this file leaves
+# nothing behind either (test/run-all.sh reports the suites that do).
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-deploy-arch-b.XXXXXX")" || exit 1; export TMPDIR
+trap 'rm -rf "$TMPDIR"' EXIT
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"

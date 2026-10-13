@@ -52,6 +52,16 @@
 #      below for what counts, what is deliberately excluded (`.planning/`, `~/.heimdall/`,
 #      anything outside the repo — suites legitimately write there), and how a violation is
 #      attributed to a specific suite without a git call per suite.
+#   9. TEMP DIRS ARE ACCOUNTED FOR. Each suite runs with its OWN TMPDIR (a fresh dir under one run-level root,
+#      $TMPDIR/hr.XXXX/s<N>, named as short as it can be: a unix socket path under it has to fit macOS's 104 bytes), so everything it makes through mktemp / $TMPDIR lands there. After the suite
+#      exits -- and after its process group has been reaped, which is why this comes second -- the runner measures
+#      what is left (top-level entries, bytes), removes it, and records it in the receipt (tmp_leaks). A suite that
+#      left more than HMD_TEST_TMP_LEAK_MAX_MB (default 50) MB behind, or anything at all under HMD_TEST_STRICT_TMP=1,
+#      fails the run (TMP LEAK); a smaller leftover is a loud warning (TMP LEFTOVERS). New top-level entries in /tmp and
+#      in the real $TMPDIR (a hard-coded /tmp path) are reported and attributed by mtime window (tmp_outside): a
+#      warning, never deleted, a failure only under strict. It exists because free space dropped 1.6 GB while agents
+#      ran suites that never removed their mktemp dirs, and nothing said so. Without test/lib/run-all-guards.sh next
+#      to this script (a fixture copy) suites share TMPDIR as before. Proof: test/run-all-guards.test.sh sections 5-8.
 #
 # Usage:
 #   test/run-all.sh                     # all non-live suites, parallel, with red re-runs
@@ -67,10 +77,17 @@
 #                                       # escalation) and stop: no suite, no receipt, no lock, no sweep marker
 #   HMD_TEST_NO_PY_PIN=1 test/run-all.sh   # leave python3 alone (default: pinned to the real interpreter
 #                                       # when it resolves through a shim; see PYTHON3 PIN below)
+#   HMD_TEST_STRICT_TMP=1 test/run-all.sh  # ANY leftover in a suite's own TMPDIR fails the run (default: only more than
+#                                       # HMD_TEST_TMP_LEAK_MAX_MB, 50); HMD_TEST_TMP_WATCH=dir:dir replaces /tmp:$TMPDIR as the
+#                                       # directories watched for writes outside TMPDIR (guarantee 9)
+#   HMD_TEST_MIN_FREE_GB=N test/run-all.sh # refuse to start under N GB free on the TMPDIR / repo volumes (default 5; 0 = no check);
+#                                       # HMD_TEST_SOCK_HEADROOM=N: warn under N bytes left for a unix socket path (default 60)
 #
 # Exit 0 = every suite that ran passed. Nonzero = at least one FAIL / TIMEOUT / DISCREPANCY,
 # or discovery fell below the floor. Exit 2 = bad arguments, or --since-green on a dirty tree;
 # exit 3 = nothing to run / discovery below the floor; exit 4 = another sweep holds the lock.
+# exit 5 = REFUSED, too little free disk on the volume holding TMPDIR or the repo (HMD_TEST_MIN_FREE_GB, default 5); exit 6 = REFUSED, the per-suite temp dir leaves
+# fewer bytes than a unix socket path some suite builds needs (macOS caps one at 104). Both refusals come before anything exists: no lock, no work dir, no receipt.
 #
 # Incremental sweeps (--since-green). The ~500-suite sweep takes ~70 min, and it used to be re-run for every small merge
 # because any new commit staled the last green receipt. Receipts now carry a kind:
@@ -107,6 +124,12 @@ if ! . "$REPO/bin/lib/hook-owned-path.sh" 2>/dev/null; then
   echo "run-all.sh: missing/unreadable $REPO/bin/lib/hook-owned-path.sh -- cannot safely evaluate REPO INTEGRITY or the sweep receipt's tree_clean. Aborting." >&2
   exit 2
 fi
+
+# THE GUARD LIBRARY (test/lib/run-all-guards.sh): the quiet gate, the orphan guard, the per-suite TMPDIR accounting, and the two PREFLIGHTS below (free disk, room for a
+# unix socket path). Sourced this early because the preflights run before anything else exists -- no lock, no work dir, no receipt. It only defines functions. Absent next
+# to a copy of this script (the fixture repos of the test/run-all-*.test.sh suites) none of it runs and the sweep is as before.
+# shellcheck source=lib/run-all-guards.sh disable=SC1091  # the default run never opens sourced files
+if [ -r "$SELF_DIR/lib/run-all-guards.sh" ]; then . "$SELF_DIR/lib/run-all-guards.sh"; fi
 
 # ── defaults ──
 TIMEOUT=180
@@ -461,6 +484,16 @@ _sweep_lock_acquire() {
   echo "         Wait for it (lock: $SWEEP_LOCK_FILE)${holder_pid:+, or stop it first: kill $holder_pid}. Refusing to start." >&2
   exit 4
 }
+# ── PREFLIGHT: refuse to START a sweep that cannot work (test/lib/run-all-guards.sh; none of it on a dry run, which executes nothing) ───────────────────────────────
+# Before the lock, the work dir, the traps, the gate marker and any receipt exist, so a refusal leaves NOTHING behind: no lock note, no marker, no receipt, no temp dir.
+#   exit 5  too little free disk on the volume holding TMPDIR or the repo (HMD_TEST_MIN_FREE_GB, default 5): a sweep writes real data, and the machine had just lost
+#           1.6 GB to leftovers.
+#   exit 6  the per-suite temp dir ($TMPDIR/hr.XXXX/s<N>) leaves fewer bytes than a unix socket path a suite builds needs (macOS caps one at 104). Sockets are never
+#           moved to the shared /tmp to get room; the fix is a shorter TMPDIR. A headroom under HMD_TEST_SOCK_HEADROOM (60) only warns.
+if [ "$DRY_RUN" -eq 0 ]; then
+  if type hmd_test_disk_preflight >/dev/null 2>&1; then hmd_test_disk_preflight "$REPO" || exit 5; fi
+  if type hmd_test_sock_preflight >/dev/null 2>&1; then hmd_test_sock_preflight "$REPO" "$GLOB_COUNT" || exit 6; fi
+fi
 # A dry run executes nothing and writes nothing, so it neither needs the lock nor may be refused by a sweep that holds it.
 [ "$DRY_RUN" -eq 1 ] || _sweep_lock_acquire
 
@@ -637,6 +670,12 @@ _gate_marker_release() {
 # shellcheck disable=SC2329  # invoked by the EXIT trap below; shellcheck does not follow trap handlers
 cleanup() {
   rm -rf "$WORK"; _gate_marker_release
+  # The per-suite temp root (test/lib/run-all-guards.sh). run_one removes each suite's own dir right after the suite; this is the net
+  # for an aborted sweep (INT/TERM mid-suite): whatever a still-dying suite left, writable or not, goes too.
+  if [ -n "${TMP_ROOT:-}" ] && [ -d "$TMP_ROOT" ] && [ ! -L "$TMP_ROOT" ]; then
+    chmod -R u+rwX "$TMP_ROOT" 2>/dev/null
+    rm -rf "$TMP_ROOT" 2>/dev/null || { sleep 0.3; rm -rf "$TMP_ROOT" 2>/dev/null; }
+  fi
   # The lock itself is the kernel's (it goes when this process does); only the owner NOTE is ours to retire, so a later refusal
   # never names a finished sweep. Only when it is still our own note -- a refused second run must not blank the holder's.
   if [ "$(sed -n 's/^pid=//p' "$SWEEP_LOCK_FILE" 2>/dev/null)" = "$$" ]; then : > "$SWEEP_LOCK_FILE" 2>/dev/null || true; fi
@@ -768,12 +807,22 @@ _hook_owned_path() {
 
 # ── EXECUTE (bounded parallelism; bash 3.2 has no `wait -n`, so poll with kill -0) ─────────
 run_one() {
-  local idx="$1" suite="$2" t0 t1 rc budget
+  local idx="$1" suite="$2" t0 t1 rc budget stmp=""
   budget="$(suite_timeout "$suite")"
   t0=$(date +%s)
-  RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1 9>&-
+  # PER-SUITE TMPDIR: a fresh dir under the run's temp root (hmd_test_tmp_begin), so what the suite makes through mktemp / $TMPDIR is
+  # measurable and removable. Without the lib (TMP_ROOT empty) the suite runs exactly as before.
+  [ -n "${TMP_ROOT:-}" ] && mkdir -p "$TMP_ROOT/s$idx" 2>/dev/null && stmp="$TMP_ROOT/s$idx"
+  if [ -n "$stmp" ]; then
+    RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" TMPDIR="$stmp" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1 9>&-
+  else
+    RUN_ALL_LEAK_FILE="$WORK/$idx.leaked" timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1 9>&-
+  fi
   rc=$?
   t1=$(date +%s)
+  # SETTLE: measure, record and remove the suite's own TMPDIR. After timeout_run, never before: it has already killed the suite's whole
+  # process group, so nothing is still writing into the directory being measured. t1 is taken above, so this is not billed to the suite.
+  [ -z "$stmp" ] || hmd_test_suite_tmp_settle "$stmp" "$WORK/$idx.tmpleak"
   printf '%s\n' "$rc" >"$WORK/$idx.rc"
   printf '%s\n' "$((t1 - t0))" >"$WORK/$idx.dur"
   printf '%s\n' "$budget" >"$WORK/$idx.budget"
@@ -842,8 +891,7 @@ _heartbeat_check() {
 
 # THE QUIET GATE and the ORPHAN GUARD live in test/lib/run-all-guards.sh (see its header for the why). Absent next to a
 # copy of this script (the fixture repos of the test/run-all-*.test.sh suites), neither runs and the sweep is as before.
-# shellcheck source=lib/run-all-guards.sh disable=SC1091  # the default run never opens sourced files
-if [ -r "$SELF_DIR/lib/run-all-guards.sh" ]; then . "$SELF_DIR/lib/run-all-guards.sh"; fi
+# (the guard library was sourced at the top of this script: the preflights run before anything else exists)
 if [ "$WAIT_QUIET" -eq 1 ]; then
   if type hmd_test_wait_quiet >/dev/null 2>&1; then
     hmd_test_wait_quiet
@@ -851,6 +899,10 @@ if [ "$WAIT_QUIET" -eq 1 ]; then
     echo "quiet gate: unavailable (test/lib/run-all-guards.sh not found next to run-all.sh) -- running now"
   fi
 fi
+# PER-SUITE TMPDIR ROOT + the before-snapshot of what the outside-TMPDIR check watches (test/lib/run-all-guards.sh; absent next to a
+# fixture copy of this script -> TMP_ROOT stays empty and suites share TMPDIR as they always did).
+TMP_ROOT=""; TMP_GUARD_RAN=0; TMP_FINDINGS=0
+if type hmd_test_tmp_begin >/dev/null 2>&1; then hmd_test_tmp_begin "$WORK"; fi
 START=$(date +%s)
 LOAD_START="$(_load_avg)"
 LOAD_START_DISP="$(_load_disp "$LOAD_START")"
@@ -932,6 +984,9 @@ fi
 # relay client on a temp or deleted repo survives the sweep. Silent when clean; survivors of SIGKILL turn the sweep RED.
 ORPHAN_SURVIVORS=0
 if [ "$TO_RUN" -gt 0 ] && type hmd_test_orphan_guard >/dev/null 2>&1; then hmd_test_orphan_guard "$REPO" "$WORK"; fi
+# TEMP GUARD: what each suite left in its own TMPDIR (over HMD_TEST_TMP_LEAK_MAX_MB, or anything under HMD_TEST_STRICT_TMP=1, fails the
+# run via TMP_FINDINGS) and what appeared outside any TMPDIR; builds the section/summary text printed below and the receipt's tmp_* keys.
+if [ "$TO_RUN" -gt 0 ] && [ -n "$TMP_ROOT" ] && type hmd_test_tmp_guard >/dev/null 2>&1; then hmd_test_tmp_guard "$WORK"; fi
 END=$(date +%s)
 LOAD_END="$(_load_avg)"
 LOAD_END_DISP="$(_load_disp "$LOAD_END")"
@@ -1224,6 +1279,8 @@ if [ "$n_treeviol" -gt 0 ]; then
   echo "  this is a REAL CORRUPTION SIGNAL, not advisory — a suite wrote where only a human or git should."
   echo ""
 fi
+# TMP LEAK (fails the run) / TMP LEFTOVERS and TMP OUTSIDE TMPDIR (loud warnings): the text comes from hmd_test_tmp_guard.
+if [ -s "$WORK/tmp-section.txt" ]; then cat "$WORK/tmp-section.txt"; echo ""; fi
 
 # ── SUMMARY ───────────────────────────────────────────────────────────────────────────────
 echo "--------------------------------------------------------------------------------------"
@@ -1246,6 +1303,7 @@ if [ "$n_treeviol" -eq 0 ]; then
 else
   echo "${RED}tree-integrity: VIOLATED (${n_treeviol} finding(s) -- see TREE INTEGRITY VIOLATION above)${OFF}"
 fi
+if [ -s "$WORK/tmp-summary.txt" ]; then cat "$WORK/tmp-summary.txt"; fi
 if [ -n "$EVIDENCE" ]; then
   echo "evidence:   ${EVIDENCE}   (${#NONGREEN[@]} non-green suite output(s) + INDEX.txt — kept, not deleted)"
   for e in ${NONGREEN[@]+"${NONGREEN[@]}"}; do
@@ -1257,7 +1315,7 @@ if [ -n "$EVIDENCE" ]; then
   done
 fi
 
-BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0}))
+BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0} + ${TMP_FINDINGS:-0}))
 
 # ── SWEEP RECEIPT ─────────────────────────────────────────────────────────────────────────
 # Turns "the sweep is green" into a checkable FACT instead of a claim. Three real
@@ -1357,6 +1415,15 @@ if command -v jq >/dev/null 2>&1; then
     done
     FLAKY_JSON="$(jq -s '.' "$WORK/flaky.ndjson" 2>/dev/null || echo '[]')"
   fi
+  # Temp-dir accounting: [{suite, bytes, entries, sample}] and [{path, bytes, mtime, suites}] built from the guard's TSV files.
+  TMP_LEAKS_JSON='[]'; TMP_OUTSIDE_JSON='[]'; TMP_ON_JSON=false; TMP_DIRS_JSON='{}'; TMP_SOCK_JSON=null
+  if [ "${TMP_GUARD_RAN:-0}" = 1 ]; then
+    TMP_ON_JSON=true
+    TMP_DIRS_JSON="$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): .[1]}) | add // {}' "$WORK/tmp-dirs.tsv" 2>/dev/null || echo '{}')"
+    TMP_SOCK_JSON="$(jq -n --arg dir "${SOCK_DIR:-}" --argjson headroom "${SOCK_HEADROOM:-null}" --argjson need "${SOCK_NEED:-null}" --argjson target "${SOCK_TARGET:-null}" '{dir: $dir, headroom: $headroom, need: $need, target: $target}' 2>/dev/null || echo null)"
+    TMP_LEAKS_JSON="$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {suite: .[0], bytes: (.[1] | tonumber), entries: (.[2] | tonumber), sample: (.[3] // "")})' "$WORK/tmp-leaks.tsv" 2>/dev/null || echo '[]')"
+    TMP_OUTSIDE_JSON="$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {path: .[0], bytes: (.[1] | tonumber), mtime: (.[2] | tonumber), suites: (.[3] | split(" "))})' "$WORK/tmp-outside.tsv" 2>/dev/null || echo '[]')"
+  fi
   SUITES_RUN_JSON=null; SELECTION_JSON=null
   if [ "$SWEEP_KIND" = incremental ]; then
     SUITES_RUN_JSON="$(printf '%s\n' ${RUN[@]+"${RUN[@]}"} | awk 'NF {n = split($0, a, "/"); print a[n]}' | jq -R . | jq -s . 2>/dev/null || echo '[]')"
@@ -1397,6 +1464,7 @@ if command -v jq >/dev/null 2>&1; then
       --argjson selection "$SELECTION_JSON" \
       --argjson flaky "$FLAKY_JSON" \
       --argjson nongreen "$NONGREEN_JSON" \
+      --argjson tmp_leaks "$TMP_LEAKS_JSON" --argjson tmp_outside "$TMP_OUTSIDE_JSON" --argjson tmp_on "$TMP_ON_JSON" --argjson tmp_dirs "$TMP_DIRS_JSON" --argjson tmp_sock "$TMP_SOCK_JSON" --arg tmp_root "${TMP_ROOT:-}" \
       '{finished_at:$finished_at, repo:$repo, head_sha:$head_sha, tree_clean:$tree_clean,
         exit_code:$exit_code, suites_total:$suites_total, suites_passed:$suites_passed,
         suites_failed:$suites_failed, suites_timeout:$suites_timeout,
@@ -1406,6 +1474,7 @@ if command -v jq >/dev/null 2>&1; then
         load_start_1m:$load_start_1m, load_start_5m:$load_start_5m, load_start_15m:$load_start_15m,
         load_end_1m:$load_end_1m, load_end_5m:$load_end_5m, load_end_15m:$load_end_15m,
         cpu_count:$cpu_count, kind:$kind, flaky_under_load:$flaky, non_green_suites:$nongreen}
+       + (if $tmp_on then {tmp_leaks:$tmp_leaks, tmp_outside:$tmp_outside, tmp_root:$tmp_root, tmp_dirs:$tmp_dirs, tmp_sock:$tmp_sock} else {} end)
        + (if $kind == "incremental" then {base_full_sha:$base_full_sha, suites_run:$suites_run, selection:$selection} else {} end)
        + (if $esc_reason != "" then {escalated_from:"since-green", escalation_reason:$esc_reason} else {} end)' > "$RECEIPT_TMP" 2>/dev/null; then
       if mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null; then
@@ -1457,6 +1526,7 @@ if [ "$BAD" -gt 0 ]; then
   else
     echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s) not green."
   fi
+  [ "${TMP_FINDINGS:-0}" -gt 0 ] && echo "  temp-dir leaks: ${TMP_FINDINGS} finding(s) -- see TMP LEAK above; a suite must remove what it makes (trap 'rm -rf \"\$T\"' EXIT)"
   [ -n "$EVIDENCE" ] && echo "  read it: ${EVIDENCE}/INDEX.txt"
   exit 1
 fi
