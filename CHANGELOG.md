@@ -5,6 +5,17 @@ All notable changes to Heimdall (formerly superx) will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] -- 2.4.8
+
+### Changed
+- `hmd app`: a stopped laptop relay client no longer unpairs the phone. Once a phone is bound, the client's relay session login (bearer
+  token, hmd key, seq marks) is stored outside the repo -- the macOS Keychain (written over `security -i` stdin, never argv), else a 0600
+  file under `$HEIMDALL_HOME` (`bin/lib/hmd_session_login.py`). A TERM, Ctrl-C, KILL or crash revokes nothing; `hmd app connect` and its
+  respawns start the client with `--resume`, which reattaches to the same relay session for `HMD_SESSION_RESUME_H` hours (default 24)
+  without pairing again. Only `hmd app disconnect`, `hmd app disconnect --device`, a revoke from the phone or a refused login unpair:
+  disconnect revokes at the relay through the stored login, also for a crashed client (it used to say "could NOT be revoked"). SIGUSR1 is
+  no longer a revoke trigger. No relay change, no relay deploy needed.
+
 ## Changelog status
 
 This file was not maintained between the last curated entry below (from when the

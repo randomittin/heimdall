@@ -43,7 +43,8 @@
 #                              `pair_init` event, "phone paired" on
 #                              `device_bound`, then waits in the foreground --
 #                              Ctrl-C, TERM, or HUP sends the client SIGTERM
-#                              (it revokes the session itself) before tearing
+#                              (a bound phone's session is left open: the next connect
+#                              resumes it -- only `hmd app disconnect` unpairs) before tearing
 #                              down the ui and state files. --bg returns once
 #                              pairing has started, leaving both running (tear
 #                              down later with `hmd app disconnect`).
@@ -217,7 +218,11 @@
 #                              remove the state file. Idempotent: a second call
 #                              with nothing connected still exits 0 -- and even
 #                              then a funnel-stop is always attempted, so a
-#                              funnel never outlives this command.
+#                              funnel never outlives this command. Relay mode: every
+#                              session login stored for the repo (bin/lib/hmd_session_login.py)
+#                              is revoked at the relay first, so a client that was stopped
+#                              or crashed does not leave its phone bound; one the relay
+#                              cannot confirm is reported and fails the command.
 #   hmd app disconnect [--repo DIR] --device LABEL|ID
 #                              Revoke ONE phone (relay mode): its label (any case) or
 #                              its id, as `hmd app status` lists them. Its relay session
@@ -1183,6 +1188,15 @@ _relay_event() {
       echo "this session -- E2E-encrypted; the relay sees only ciphertext."
       echo ""
       ;;
+    session_resumed)
+      # --resume attached to the session a former client left bound to its phone: no QR, no code window, no pairing -- the phone keeps working
+      pair_init_seen=true
+      ever_started=true
+      code_resolved=true
+      code_active=false
+      paired_before=true
+      echo "hmd app: resumed the paired phone's session -- no re-pair (a stopped client does not unpair it; hmd app disconnect does)"
+      ;;
     code_window)
       local wcode wlogin
       code_resolved=true
@@ -2083,6 +2097,8 @@ cmd_connect_relay() {
   relay_host="$(printf '%s' "$RELAY_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*$##; s#:.*$##')"
 
   local client_args=(--relay "$RELAY_URL" --repo "$REPO" --ui-port "$actual_port" --public-host "$relay_host")
+  # a client that was stopped did not unpair its phone: this one (and every respawn of it) resumes that session when its login is stored
+  client_args+=(--resume)
   if [ "$code_requested" = true ]; then
     # The token reaches the client on its stdin and nowhere else: a pipe made here whose directory entry is
     # removed as soon as both ends are open, so it is anonymous before a byte is written. This shell keeps the
@@ -3017,6 +3033,25 @@ _disconnect_gone_device() {
     *) echo "hmd app disconnect: no paired device '$(_clean_text "$wanted")' -- hmd app status lists the paired ones" >&2; return 1 ;;
   esac
   id="${found%% *}"
+  # The login its client stored when the phone bound (bin/lib/hmd_session_login.py) revokes the relay session from here, with no client
+  # left to ask. 0 confirmed, 3 nothing stored for it (a client older than the stored logins: the old outcome below), else not confirmed.
+  local lrc=0
+  "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$repo" --device-id "$id" || lrc=$?
+  case "$lrc" in
+    0)
+      if "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$repo" "$id" >/dev/null 2>&1; then
+        echo "hmd app disconnect: revoked device $id ($(_clean_text "$wanted")) through its stored login -- its client was not running; the other devices stay connected"
+        return 0
+      fi
+      echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): revoked at the relay, but its push registrations could not be removed, so it may still be notified and its record is kept -- run this again" >&2
+      return 1
+      ;;
+    3) ;;
+    *)
+      echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): its relay session could NOT be confirmed revoked -- its record and login are kept; run this again once the relay is reachable (hmd app identity revoke signs every phone out)" >&2
+      return 1
+      ;;
+  esac
   if "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$repo" "$id" >/dev/null 2>&1; then
     echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): its client is not running, so its relay session could NOT be revoked from here -- it stays open until it expires (hmd app identity revoke signs every phone out); its record and push registrations were removed" >&2
   else
@@ -3045,16 +3080,26 @@ _disconnect_device() {
   esac
   id="${found%% *}"
   pid="${found##* }"
-  # SIGUSR1 revokes the phone of a client that has the handler; a client started by v2.4.6 or earlier has none (USR1 would end it with
-  # no revoke), so its phone is revoked with TERM, which that client answers by revoking its session and ending (hmd_devices.py signal)
+  # The login this phone's client stored when it bound revokes the relay session from here: a signal is no revoke any more (SIGUSR1 is
+  # ignored, and a TERM only stops a client). 0 confirmed, 3 nothing stored (a client older than the stored logins -- it revokes on the
+  # signal below, as it always did), else not confirmed: loud, and nothing is removed so that this can be run again.
+  local lrc=0
+  "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$repo" --device-id "$id" || lrc=$?
+  if [ "$lrc" -ne 0 ] && [ "$lrc" -ne 3 ]; then
+    echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): its relay session could NOT be confirmed revoked -- it stays connected; run this again once the relay is reachable" >&2
+    return 1
+  fi
   sig="$("$PY3" "$LIB_DIR/hmd_devices.py" signal --repo "$repo" "$id" 2>/dev/null)"
   case "$sig" in TERM|USR1) ;; *) sig=USR1 ;; esac
+  [ "$lrc" -eq 0 ] && sig=TERM  # revoked: the client is only stopped now (it ends on the relay's session_ended too)
   repo_real="$(_real_dir "$repo")"
   rc=0
   # A14: verify identity before signaling -- a recycled pid must never take an unrelated process down with it.
   if _pid_is_relay_client "$pid" "$repo_real"; then
     _relay_stop_client "$pid" "$sig"
     rc=$?
+  elif [ "$lrc" -eq 0 ] && ! kill -0 "$pid" 2>/dev/null; then
+    rc=0  # it already ended, on the relay's own session_ended
   else
     echo "hmd app disconnect: pid $pid of device $id is not a heimdall-relay-client process of this repo -- not signalling it" >&2
     rc=1
@@ -3109,7 +3154,15 @@ cmd_disconnect() {
   # a pair window is a way for a phone in, so disconnect closes it too (it is opened again by the next session)
   pw_stopped="$(_pair_window_stop_all "$REPO")"
   [ "${pw_stopped:-0}" -gt 0 ] && echo "hmd app disconnect: stopped $pw_stopped pair window(s)"
-  _stop_device_clients "$REPO" "$repo_real" || true  # every phone's client, an added one too: each revokes its own relay session
+  # A stopped client does not unpair its phone, so the revoke is done from here: every session login stored for this repo is revoked at the
+  # relay (bin/lib/hmd_session_login.py) -- whether its client runs, crashed or is gone -- BEFORE the clients are stopped. One the relay
+  # could not confirm is reported and fails the command; 3 is no stored login at all (nothing to revoke from here).
+  LOGIN_REVOKE_RC=0
+  if [ -n "$PY3" ]; then
+    "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$REPO" --all || LOGIN_REVOKE_RC=$?
+    [ "$LOGIN_REVOKE_RC" -eq 3 ] && LOGIN_REVOKE_RC=0
+  fi
+  _stop_device_clients "$REPO" "$repo_real" || true  # every phone's client, an added one too (a client older than the stored logins revokes on this TERM)
 
   if [ "$(_doc_field "$connect_doc" .mode)" = "relay" ]; then
     cmd_disconnect_relay "$REPO" "$repo_real" "$connect_doc" "$devs"
@@ -3196,6 +3249,7 @@ cmd_disconnect_relay() {
   local rc=0 did dpid devs="${4:-}"  # devs: "<id> <pid>" per phone paired when this disconnect began, listed by cmd_disconnect before any client went
   # every phone's client, an added one too: each revokes its own relay session on TERM
   _stop_device_clients "$REPO" "$repo_real" || rc=$?
+  [ "${LOGIN_REVOKE_RC:-0}" -ne 0 ] && rc=1  # a stored login the relay could not confirm revoked (said above) is no clean disconnect
 
   # A14: verify identity before signaling -- a recycled pid, another repo's process or a number a checkout planted must never
   # take an unrelated process down with it: it has to be a relay client run for THIS repo.

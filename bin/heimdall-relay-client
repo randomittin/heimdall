@@ -89,6 +89,11 @@ to drive its own UI; nothing else is ever written to stdout.
     {"event":"device_bound","bound_at":..}            session key derived --
                                                        may repeat across a
                                                        stream reconnect
+    {"event":"session_resumed","session_id":..,"bound_at":..}
+                                                       --resume attached to the relay
+                                                       session a former client left bound
+                                                       to its phone (SESSION RESUME below):
+                                                       no pair_init, no QR, no re-pair
     {"event":"code_unavailable","reason":"device-limit"}
                                                        the repo already has the
                                                        most phones it may (see
@@ -294,14 +299,27 @@ MORE THAN ONE PHONE. A relay session binds exactly one device, so a repo's secon
 program, on a relay session of its own, offering the same code once the first phone's bind released it. Each client serves one phone and
 keeps one record of it, <repo>/.heimdall/app/device-<id>.json (bin/lib/hmd_devices.py: label and GitHub login as the relay claimed them,
 paired-at, last seen, capabilities, fingerprints of the push tokens it registered), written through hmd_private_state and removed when the
-client ends. `hmd app status` lists those records; `hmd app disconnect --device X` sends the client of X SIGUSR1, which revokes that phone's
-relay session (its token stops working) and ends this client with session_ended reason "device-revoked", where SIGTERM is the whole run's
-end ("local-disconnect"). A pairing clears the push registrations that no live device holds, never another phone's. One phone pairs by
+client ends. `hmd app status` lists those records; `hmd app disconnect --device X` revokes that phone's relay session at the relay with the
+login stored for it (SESSION RESUME below), so its token stops working and this client ends on the relay's own session_ended -- not on a
+signal: a signal is no revoke (SIGUSR1 is ignored). A pairing clears the push registrations that no live device holds, never another phone's. One phone pairs by
 default and the code closes at its bind; `hmd app add-device` (bin/heimdall-app) opens ONE more window under the code for a limited time,
 and each use admits one phone. At most hmd_devices.MAX_DEVICES (4) phones are bound at once (HMD_PAIR_MAX_DEVICES can only lower that).
 Every phone is checked as the first was: the claim must name this laptop's GitHub login (or, under --confirm, the SAS is compared). The
 name a phone claims is reduced by safe_label (letters, digits, space, - _ . ' ( ), 40 characters) before it reaches a notice, a record, an
 event or a log.
+
+SESSION RESUME (bin/lib/hmd_session_login.py owns every rule; operator decision, 2.4.8: a stopped laptop client must not unpair the phone).
+Once a phone is bound the client stores the login its relay session is attached with -- the bearer token, the hmd private key, the
+phone's public key, and two seq marks: hmd_seq, a CEILING above every seq sent (reserved SEQ_RESERVE ahead, moved on before it is
+reached) and last_device_seq, the replay guard -- OUTSIDE the repo: the macOS Keychain (written over `security -i` stdin, never argv),
+else a 0600 file under $HEIMDALL_HOME. A SIGTERM, Ctrl-C, SIGKILL or crash does NOT revoke it (session_ended reason "stopped"); a client
+started with --resume (`hmd app connect` and its respawns pass it) attaches to the SAME relay session -- no /pair/init, the phone is not
+asked to pair again -- derives the key from what it stored, sends a full state frame at once and emits {"event":"session_resumed"}. That
+works for HMD_SESSION_RESUME_H hours (default 24) after the old client was last alive; past it the login is discarded and the phone pairs
+again. A client whose login could not be stored still revokes on a stop, and an unbound client always does. The session is revoked, and
+the stored login discarded, ONLY by `hmd app disconnect` / `--device` (at the relay, through the login), by the phone's own revoke, or when
+the relay refuses the login (stream 401/404/410). The relay already allows all of this: the hmd bearer has no expiry or status gate and
+survives the hmd socket closing, a bound session lives until its device token expires, and /revoke needs no live socket.
 
 FRAME COMPRESSION AND RESYNC (the FINAL wire of hmdapp's docs/HANDOFF-TO-HEIMDALL-zero-lag-sync.md
 Ask 5, section 5; hmdapp's docs/HANDBACK-FROM-HEIMDALL-zlib-frames.md records what hmd does with
@@ -415,7 +433,7 @@ and handed to the Claude session as ONE inbox record naming its absolute path; t
 No path, name, note or byte of a picture is in any ack, state frame, audit line or event: the `command` event names the action only. A picture is up to 8 frames of ~466 KB: a command frame that opened under the session key
 is credited back against the stream's running byte cap (STREAM_READ_CAP_BYTES), on both legs, so its frames do not trip `overflow`.
 
-EXIT CODES: 0 clean end (session_ended, or a signal-driven revoke); 2 usage;
+EXIT CODES: 0 clean end (session_ended, or a signal stop); 2 usage;
 11 no E2E backend (`e2e_available()` false, or bin/lib/hmd_relay_e2e.py failed
 to import -- both mean the same thing: refuse to start a plaintext relay
 session); 12 relay unreachable or `/pair/init` did not return 200; 1 an
@@ -506,6 +524,8 @@ PUSH_STORE = _load_module("companion_push_store", os.path.join(LIB_DIR, "compani
 PRIVATE = _load_module("hmd_private_state", os.path.join(LIB_DIR, "hmd_private_state.py"))
 # one record per phone this repo has paired (bin/lib/hmd_devices.py): a relay session binds ONE device, so a second phone is a second client
 DEVICES = _load_module("hmd_devices", os.path.join(LIB_DIR, "hmd_devices.py"))
+# the login this client's relay session is attached with, kept outside the repo once a phone is bound (bin/lib/hmd_session_login.py)
+LOGIN_STORE = _load_module("hmd_session_login", os.path.join(LIB_DIR, "hmd_session_login.py"))
 LOGIN =_load_module("companion_cc_login", os.path.join(LIB_DIR, "companion_cc_login.py"))
 CONTROLS = _load_module("companion_ui_controls", os.path.join(LIB_DIR, "companion_ui_controls.py"))
 VIEW = _load_module("companion_view", os.path.join(LIB_DIR, "companion_view.py"))
@@ -1441,6 +1461,7 @@ class RelayClient:
         self._device_id = DEVICES.device_id(self.device_pub)
         self._device_meta = {"label": label, "gh_login": login, "via": via}
         self._write_device_record()
+        self._keep_login()
 
     def _write_device_record(self):
         """Write (or refresh) this phone's record. Bookkeeping: a failure is reported, never a reason to drop a pairing."""
@@ -1458,6 +1479,7 @@ class RelayClient:
         """Refresh `last_seen` (at most every DEVICE_TOUCH_S): called wherever the status file is, i.e. whenever the phone was just answered."""
         if self._device_id is not None and time.monotonic() - self._device_written_at >= self.DEVICE_TOUCH_S:
             self._write_device_record()
+            self._login_update()  # the stored login's `last_alive`: what HMD_SESSION_RESUME_H counts from
 
     def _forget_device(self):
         """This client is done with its phone (it ended, or was revoked): its record and the push tokens only it held go."""
@@ -1468,6 +1490,103 @@ class RelayClient:
             DEVICES.forget(self.root, device_id)
         except OSError as e:
             emit({"event": "error", "detail": "device record not removed: %s" % e})
+
+    # -- the stored login (bin/lib/hmd_session_login.py; SESSION RESUME in the module docstring) --------------------------------
+    SEQ_RESERVE = 1000  # seqs the stored login reserves ahead: a resumed client starts at its ceiling, so it never repeats a seq
+    # Class-level like _device_id above: a client built without __init__ keeps no login, and a stop of it revokes as it always did.
+    _login_kept = False
+    _login_failing = False
+    _seq_ceiling = 0
+
+    def _keep_login(self):
+        """A phone just bound: keep the login this session is attached with, OUTSIDE the repo, so that a stopped client can be resumed and
+        `hmd app disconnect` can revoke through it. When it cannot be kept the client says so and goes on -- and stopping IT revokes its
+        session as before: never a session that nobody can resume and nobody can end."""
+        if LOGIN_STORE is None or self._login_kept or self.session_key is None:
+            return
+        self._seq_ceiling = self.hmd_seq + self.SEQ_RESERVE
+        try:
+            LOGIN_STORE.save(self.root, self.relay_url, self.session_id,
+                             {"token": self.token, "priv": base64.b64encode(self.priv).decode("ascii")},
+                             pub=base64.b64encode(self.pub).decode("ascii"), device_pub=base64.b64encode(self.device_pub).decode("ascii"),
+                             device_id=self._device_id, device_meta=self._device_meta, bound_at=self.bound_at,
+                             hmd_seq=self._seq_ceiling, last_device_seq=self.last_device_seq, pid=os.getpid())
+        except OSError as e:
+            emit({"event": "error", "detail": "session login not kept (%s): this client cannot be resumed, and stopping it revokes its "
+                                              "session" % e})
+            return
+        self._login_kept = True
+
+    def _login_update(self, **fields):
+        """Refresh the stored login (last alive, the seq marks). Never brings back a login a disconnect removed."""
+        if not self._login_kept or LOGIN_STORE is None:
+            return
+        try:
+            LOGIN_STORE.update(self.root, self.session_id, last_alive=int(time.time()), pid=os.getpid(), **fields)
+            self._login_failing = False
+        except OSError as e:
+            if not self._login_failing:  # one `error` event per outage, not one per refresh
+                self._login_failing = True
+                emit({"event": "error", "detail": "session login not refreshed: %s" % e})
+
+    def _reserve_seq(self):
+        """Under self.lock, right after a seq was taken: well before the ceiling the stored login holds is reached, move it on."""
+        if self._login_kept and self.hmd_seq >= self._seq_ceiling - self.SEQ_RESERVE // 2:
+            self._seq_ceiling = self.hmd_seq + self.SEQ_RESERVE
+            self._login_update(hmd_seq=self._seq_ceiling)
+
+    def _discard_login(self):
+        """The session is over for good -- the relay ended it, or refused this login: the stored login goes with it."""
+        if not self._login_kept or LOGIN_STORE is None:
+            return
+        self._login_kept = False
+        try:
+            LOGIN_STORE.discard(self.root, self.session_id)
+        except OSError as e:
+            emit({"event": "error", "detail": "session login not removed: %s" % e})
+
+    def resume(self):
+        """`--resume`: attach to the relay session a former client of this repo left bound to its phone, instead of opening a new one
+        (the phone is not asked to pair again). True when it did; False -- nothing stored, past HMD_SESSION_RESUME_H, held by a live
+        client, or unusable -- and the caller pairs afresh. The key is derived from the stored private key and the phone's public key, so
+        frames flow at once; the seq starts at the stored ceiling, above every seq the old client sent."""
+        if LOGIN_STORE is None:
+            return False
+        try:
+            rec = LOGIN_STORE.load_resumable(self.root, self.relay_url)
+        except OSError as e:
+            emit({"event": "error", "detail": "stored session login unreadable: %s" % e})
+            return False
+        if rec is None:
+            return False
+        try:
+            priv, pub = base64.b64decode(rec["priv"], validate=True), base64.b64decode(rec["pub"], validate=True)
+            device_pub = E2E.pub_from_b64(rec["device_pub"])
+            session_key = E2E.derive_session_key(priv, device_pub, rec["session_id"])
+            ceiling, last_device_seq = int(rec["hmd_seq"]), int(rec.get("last_device_seq") or 0)
+        except (KeyError, TypeError, ValueError, E2E.E2EError) as e:
+            emit({"event": "error", "detail": "stored session login unusable (%s) -- discarded, pairing afresh" % e})
+            LOGIN_STORE.discard(self.root, rec.get("session_id"))
+            return False
+        self.session_id, self.token = rec["session_id"], rec["token"]
+        self.priv, self.pub, self.device_pub, self.session_key = priv, pub, device_pub, session_key
+        self.hmd_seq, self.last_device_seq = ceiling, last_device_seq
+        self.paired, self.bound_at = True, rec.get("bound_at")
+        self._login_kept = True
+        self._seq_ceiling = ceiling + self.SEQ_RESERVE
+        self._login_update(hmd_seq=self._seq_ceiling)
+        self._device_id = rec.get("device_id")
+        self._device_meta = rec.get("device_meta") or {"label": "unnamed device", "gh_login": "unknown", "via": "qr"}
+        old = next((r for r in DEVICES.records(self.root) if r["id"] == self._device_id), None) if DEVICES is not None else None
+        if old is not None:  # what the phone already held carries over: its push tokens and its capabilities
+            self._push_fps = set(old.get("push_fps") or [])
+            self.device_caps = E2E.normalize_caps(old.get("caps"))
+        self._write_device_record()
+        self._rearm_state()
+        emit({"event": "session_resumed", "session_id": self.session_id, "bound_at": self.bound_at})
+        self.write_status()
+        self.state_ready.set()
+        return True
 
     def _remove_pairing_traces(self):
         """What the pairing left that outlives a bind: the statusline's marker and the phone's record."""
@@ -1609,6 +1728,7 @@ class RelayClient:
                     self._acks_idle.wait()
             seq = self.hmd_seq
             self.hmd_seq += 1
+            self._reserve_seq()
             nonce, ciphertext = E2E.seal(self.session_key, seq, "hmd", plaintext)
             if is_ack:
                 self._acks_in_flight += 1
@@ -2571,6 +2691,7 @@ class RelayClient:
                                 ack_deadline=ack_deadline)
             return
         self.last_device_seq = seq
+        self._login_update(last_device_seq=seq)  # the replay guard survives a stop: a resumed client refuses what this one refused
         self.last_command_at = time.time()
         try:
             obj = json.loads(plaintext.decode("utf-8"))
@@ -3049,8 +3170,15 @@ class RelayClient:
         self.stop_event.set()
         self._gh_secret = None  # a stopped client offers no code window, so it keeps no token
         self._login_shutdown()  # before the (network-bound) revoke: a login process must not outlive us
-        self.revoke()
-        self._remove_pairing_traces()
+        if self._login_kept:
+            # A phone is bound and its login is stored: stopping this client -- a TERM, Ctrl-C, a crash that got this far -- does NOT
+            # unpair it. The relay session stays open for the next client to resume (--resume); `hmd app disconnect` revokes it through
+            # the stored login, and so does nothing else of ours. The phone's record and the statusline marker stay with it.
+            self._login_update()
+            reason = "stopped" if reason == "local-disconnect" else reason
+        else:
+            self.revoke()  # nothing bound, nothing stored: the session is simply ended, which also frees its code at the relay
+            self._remove_pairing_traces()
         self.write_status()
         emit({"event": "session_ended", "reason": reason})
 
@@ -3094,6 +3222,10 @@ def build_argparser():
                      help="instead of a session: read the laptop's GitHub token from stdin, ask the relay to "
                           "revoke every phone sign-in for that GitHub user, print one event, exit (the same "
                           "https-or-loopback relay rule as --code applies)")
+    ap.add_argument("--resume", action="store_true",
+                     help="attach to the relay session a former client of this repo left bound to its phone (its login is stored outside "
+                          "the repo, see SESSION RESUME) instead of opening a new one, when it was last alive within "
+                          "HMD_SESSION_RESUME_H hours; with none to resume, pair as usual")
     return ap
 
 
@@ -3185,11 +3317,12 @@ def main(argv=None):
         return 11
 
     client = RelayClient(args)
-    client.priv, client.pub = E2E.generate_keypair()
-
-    rc = client.pair_init()
-    if rc != 0:
-        return rc
+    resumed = args.resume and client.resume()
+    if not resumed:
+        client.priv, client.pub = E2E.generate_keypair()
+        rc = client.pair_init()
+        if rc != 0:
+            return rc
 
     def _on_signal(_signum, _frame):
         if client._stopping:
@@ -3197,19 +3330,14 @@ def main(argv=None):
         client.shutdown("local-disconnect")
         sys.exit(0)
 
-    def _on_device_revoke(_signum, _frame):
-        # `hmd app disconnect --device`: this phone's session is revoked and nobody else's. It is a reason of its own so that the
-        # supervisor of a `hmd app connect` run, which ends on a local disconnect, knows this one is not the whole run's end.
-        if client._stopping:
-            return
-        client.shutdown("device-revoked")
-        sys.exit(0)
-
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGUSR1, _on_device_revoke)
+    # SIGUSR1 used to revoke one phone (`hmd app disconnect --device`). A signal is no authenticated request -- anything of this user's
+    # can send one -- so it is no trigger now: `hmd app disconnect` revokes at the relay with the stored login, and the relay's own end of the
+    # session reaches this client over its stream.
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
-    if args.code:
+    if args.code and not resumed:  # a resumed session is bound already: there is no code window left to offer
         client.code_start()  # after the signal handlers: Ctrl-C while the window registers still revokes
 
     client.login_startup()
@@ -3221,6 +3349,7 @@ def main(argv=None):
 
     client.run_state_loop()
     client._remove_pairing_traces()  # an end the relay announced (session_ended) comes here, not through shutdown()
+    client._discard_login()          # ... and so does the end of a login the relay refused: the session is over, the stored login goes
     if client.exit_code:
         client.shutdown("code-window-ended")  # a --code-only window that ended here: the session it left open is revoked
     return client.exit_code
