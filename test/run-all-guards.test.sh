@@ -25,7 +25,7 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/run-all-guards.XXXXXX")"; T="$(cd "$T" && pwd -P)"
 MARK="runallguards$$"
-cleanup() { pkill -f "$MARK" 2>/dev/null || true; pkill -f "$T/fake/" 2>/dev/null || true; sleep 0.2; pkill -9 -f "$T/fake/" 2>/dev/null || true; rm -rf "$T"; }
+cleanup() { pkill -f "$MARK" 2>/dev/null || true; pkill -f "$T/fake/" 2>/dev/null || true; sleep 0.2; pkill -9 -f "$T/fake/" 2>/dev/null || true; rm -f "/tmp/$MARK-hardcoded.dat"; chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -120,7 +120,105 @@ for needle in '--wait-quiet)' 'hmd_test_wait_quiet' 'hmd_test_orphan_guard' 'RUN
 done
 if bash -n "$RUNALL" 2>/dev/null; then ok "run-all.sh still parses"; else bad "run-all.sh no longer parses"; fi
 
-echo "-- 5. this suite leaves nothing running --"
+echo "-- 5. every suite gets its own TMPDIR: measured once the suite is gone, then removed (hmd_test_tmp_begin / hmd_test_suite_tmp_settle) --"
+# 2026-10-13: free space dropped 1.6 GB while agents ran suites; a suite's mktemp leftovers now land in a private dir the runner empties.
+unset HMD_TEST_STRICT_TMP HMD_TEST_TMP_LEAK_MAX_MB HMD_TEST_TMP_WATCH
+mkdir -p "$T/rt" "$T/work"; TMP_ROOT=""
+TMPDIR="$T/rt" hmd_test_tmp_begin "$T/work"
+if [ -n "${TMP_ROOT:-}" ] && [ -d "${TMP_ROOT:-/nonexistent}" ] && [ "$(dirname "${TMP_ROOT:-/}")" = "$T/rt" ]; then ok "one run-level temp root is made under the runner's TMPDIR"; else bad "temp root: '${TMP_ROOT:-}'"; fi
+mkdir -p "${TMP_ROOT:-$T/rt/none}/0" "${TMP_ROOT:-$T/rt/none}/1" "${TMP_ROOT:-$T/rt/none}/2"
+: > "$T/leak-clean"; : > "$T/leak-leaky"; : > "$T/leak-bg"
+TMPDIR="$TMP_ROOT/0" timeout_run 60 bash -c 'd="$(mktemp -d)" || exit 1; echo x > "$d/f"; rm -rf "$d"; exit 0'
+hmd_test_suite_tmp_settle "$TMP_ROOT/0" "$T/leak-clean"
+if [ ! -e "$TMP_ROOT/0" ] && [ ! -s "$T/leak-clean" ]; then ok "a suite that removes what it makes: nothing recorded, its TMPDIR is gone"; else bad "clean suite: left=$(cat "$T/leak-clean")"; fi
+TMPDIR="$TMP_ROOT/1" timeout_run 60 bash -c 'd="$(mktemp -d)" || exit 1; dd if=/dev/zero of="$d/blob" bs=1048576 count=3 2>/dev/null; mkdir -p "$d/ro/sub"; : > "$d/ro/sub/f"; chmod 555 "$d/ro/sub" "$d/ro"; exit 0'
+hmd_test_suite_tmp_settle "$TMP_ROOT/1" "$T/leak-leaky"
+IFS=$'\t' read -r LB LE LS < "$T/leak-leaky"
+if [ "${LB:-0}" -ge 3145728 ] && [ "${LE:-0}" = 1 ] && [ -n "${LS:-}" ]; then ok "a leaky suite's mktemp landed in ITS dir: ${LB} bytes in ${LE} top-level entry (${LS})"; else bad "leaky record: '$(cat "$T/leak-leaky")'"; fi
+if [ ! -e "$TMP_ROOT/1" ]; then ok "the leftover is removed -- a read-only (chmod 555) subtree included"; else bad "leaky dir survived: $(ls -A "$TMP_ROOT/1")"; fi
+cat > "$T/bg-suite.sh" <<'BGEOF'
+( exec -a "$BG_MARK-writer" bash -c 'while :; do echo x >> "$TMPDIR/bg.log"; sleep 0.05; done' ) &
+sleep 0.3
+exit 0
+BGEOF
+BG_MARK="$MARK" TMPDIR="$TMP_ROOT/2" timeout_run 60 bash "$T/bg-suite.sh"
+if pgrep -f "$MARK-writer" >/dev/null 2>&1; then bad "the suite's background writer outlived timeout_run -- the settle would race it"; else ok "the process group is reaped FIRST (timeout_run returns only after it), so nothing still writes when the dir is measured"; fi
+hmd_test_suite_tmp_settle "$TMP_ROOT/2" "$T/leak-bg"; sleep 0.3
+if [ ! -e "$TMP_ROOT/2" ] && [ -s "$T/leak-bg" ]; then ok "what the reaped writer left (bg.log) is recorded, the dir is removed, and nothing re-populates it"; else bad "bg dir: exists=$([ -e "$TMP_ROOT/2" ] && echo yes || echo no) record='$(cat "$T/leak-bg")'"; fi
+mkdir -p "$T/not-mine/x"; : > "$T/leak-x"
+hmd_test_suite_tmp_settle "$T/not-mine" "$T/leak-x"
+if [ -d "$T/not-mine/x" ] && [ ! -s "$T/leak-x" ]; then ok "settle only ever touches a directory inside this run's temp root (a stray path is left alone)"; else bad "settle removed or recorded a path outside the root"; fi
+
+echo "-- 6. end-of-sweep tmp guard: limit, strict mode, outside-TMPDIR attribution --"
+GW="$T/gwork"; mkdir -p "$GW" "$T/watch"
+RUN=("$T/a.test.sh" "$T/b.test.sh" "$T/c.test.sh"); TO_RUN=3
+printf '5242880\t1\tfat-dir\n' > "$GW/0.tmpleak"; printf '1024\t2\tx,y\n' > "$GW/1.tmpleak"
+hmd_test_tmp_guard "$GW" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 0 ] && [ "${TMP_LEAK_SUITES:-x}" = 2 ] && [ "${TMP_LEAK_BYTES:-x}" = 5243904 ] && grep -q 'TMP LEFTOVERS (2)' "$GW/tmp-section.txt" && ! grep -q 'TMP LEAK' "$GW/tmp-section.txt"; then ok "default limit (50 MB): a 5 MB and a 1 KB leftover are warnings, neither fails the run"; else bad "default policy: findings=${TMP_FINDINGS:-} suites=${TMP_LEAK_SUITES:-} bytes=${TMP_LEAK_BYTES:-} section=$(cat "$GW/tmp-section.txt")"; fi
+HMD_TEST_TMP_LEAK_MAX_MB=1 hmd_test_tmp_guard "$GW" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 1 ] && grep -q 'TMP LEAK (1)' "$GW/tmp-section.txt" && grep -q 'a.test.sh' "$GW/tmp-section.txt" && grep -q 'TMP LEFTOVERS (1)' "$GW/tmp-section.txt"; then ok "over HMD_TEST_TMP_LEAK_MAX_MB (5 MB > 1 MB): that suite is the one finding and is named; the 1 KB one stays a warning"; else bad "limit policy: findings=${TMP_FINDINGS:-} section=$(cat "$GW/tmp-section.txt")"; fi
+HMD_TEST_STRICT_TMP=1 hmd_test_tmp_guard "$GW" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 2 ] && grep -q 'TMP LEAK (2)' "$GW/tmp-section.txt"; then ok "HMD_TEST_STRICT_TMP=1: any leftover at all fails, even 1 KB"; else bad "strict policy: findings=${TMP_FINDINGS:-} section=$(cat "$GW/tmp-section.txt")"; fi
+rm -f "$GW"/*.tmpleak
+hmd_test_tmp_guard "$GW" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 0 ] && [ "${TMP_LEAK_SUITES:-x}" = 0 ] && grep -q '^tmp dirs: *clean' "$GW/tmp-summary.txt" && [ ! -s "$GW/tmp-section.txt" ]; then ok "no leftovers: the summary says clean, there is no section, nothing fails"; else bad "clean policy: findings=${TMP_FINDINGS:-} summary=$(cat "$GW/tmp-summary.txt")"; fi
+HMD_TEST_TMP_WATCH="$T/watch" TMPDIR="$T/rt" hmd_test_tmp_begin "$GW"
+mkdir "$T/watch/hit-dir"; echo x > "$T/watch/hit-file"; mkdir "$T/watch/old-foreign"; touch -t 200001010000 "$T/watch/old-foreign"
+NOW="$(date +%s)"; echo "$((NOW - 5))" > "$GW/0.t0"; echo "$((NOW + 5))" > "$GW/0.t1"; echo "$((NOW - 500))" > "$GW/1.t0"; echo "$((NOW - 400))" > "$GW/1.t1"
+HMD_TEST_TMP_WATCH="$T/watch" hmd_test_tmp_guard "$GW" >/dev/null
+HITS="$(awk -F'\t' '$1 ~ /hit-/ && $4 == "a.test.sh"' "$GW/tmp-outside.tsv" | wc -l | tr -d ' ')"
+if [ "$HITS" = 2 ] && ! grep -q 'old-foreign' "$GW/tmp-outside.tsv" && ! grep -q 'b.test.sh' "$GW/tmp-outside.tsv" && [ "${TMP_OUTSIDE_COUNT:-x}" = 2 ]; then ok "new entries outside TMPDIR are attributed to the suite running when they were written (mtime window); one no suite was running for is not"; else bad "outside attribution: hits=$HITS count=${TMP_OUTSIDE_COUNT:-} tsv=$(cat "$GW/tmp-outside.tsv")"; fi
+if [ "${TMP_FINDINGS:-x}" = 0 ] && grep -q 'TMP OUTSIDE TMPDIR (2)' "$GW/tmp-section.txt" && grep -q '^tmp outside: *2 new' "$GW/tmp-summary.txt"; then ok "outside-TMPDIR entries are a loud warning by default (cannot be proved the suite's), not a failure"; else bad "outside default: findings=${TMP_FINDINGS:-} section=$(cat "$GW/tmp-section.txt")"; fi
+HMD_TEST_STRICT_TMP=1 HMD_TEST_TMP_WATCH="$T/watch" hmd_test_tmp_guard "$GW" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 2 ]; then ok "HMD_TEST_STRICT_TMP=1 turns the attributed outside entries into findings"; else bad "outside strict: findings=${TMP_FINDINGS:-}"; fi
+
+echo "-- 7. through the REAL run-all.sh (fixture repo): own TMPDIR per suite, receipt, summary line, exit status --"
+FX="$T/fx"; mkdir -p "$FX/test/lib" "$FX/bin/lib" "$T/hh" "$T/watch2" "$T/ert"
+cp "$RUNALL" "$FX/test/run-all.sh"; cp "$LIB" "$FX/test/lib/run-all-guards.sh"; cp "$REPO/bin/lib/hook-owned-path.sh" "$FX/bin/lib/hook-owned-path.sh"
+git -C "$FX" init -q >/dev/null 2>&1; git -C "$FX" add -A >/dev/null 2>&1
+git -C "$FX" -c user.email=t@example.com -c user.name=t -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -q --no-verify -m fixture >/dev/null 2>&1
+fx_run() { # [K=V ...] -- one fixture sweep, output in $T/fx.out; exit status is the sweep's
+  ( cd "$FX" && env -u HMD_TEST_STRICT_TMP -u HMD_TEST_TMP_LEAK_MAX_MB -u HMD_TEST_TMP_WATCH TMPDIR="$T/ert" HEIMDALL_HOME="$T/hh" "$@" bash "$FX/test/run-all.sh" --min 1 --jobs 2 --no-retry > "$T/fx.out" 2>&1 )
+}
+cat > "$FX/test/clean.test.sh" <<'EOF'
+d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT; echo x > "$d/f"
+case "$TMPDIR" in */hmd-ra.*/[0-9]*) echo "clean: 1 passed, 0 failed." ;; *) echo "clean: 0 passed, 1 failed. (TMPDIR=$TMPDIR)"; exit 1 ;; esac
+EOF
+cat > "$FX/test/leaky.test.sh" <<'EOF'
+d="$(mktemp -d)"; dd if=/dev/zero of="$d/blob" bs=1048576 count=3 2>/dev/null
+mkdir -p "$d/ro/sub"; : > "$d/ro/sub/f"; chmod 555 "$d/ro/sub" "$d/ro"
+echo "leaky: 1 passed, 0 failed."
+EOF
+sed "s#@MARK@#$MARK#g" > "$FX/test/outside.test.sh" <<'EOF'
+printf 'x' > "/tmp/@MARK@-hardcoded.dat"
+echo "outside: 1 passed, 0 failed."
+EOF
+fx_run; RC=$?
+RCPT="$T/hh/receipts/last-sweep.json"
+if [ "$RC" -eq 0 ] && grep -q 'RUN GREEN' "$T/fx.out"; then ok "default limit: a 3 MB leftover and an outside write are reported, the sweep stays green (and clean.test.sh saw its own TMPDIR)"; else bad "default sweep rc=$RC: $(tail -25 "$T/fx.out")"; fi
+if grep -qE '^tmp dirs: +1 suite\(s\) left [0-9.]+ MB in their own TMPDIR \(removed\); 0 over the 50 MB limit' "$T/fx.out" && grep -qE '^  leaky\.test\.sh +[0-9.]+ MB in 1 entry' "$T/fx.out"; then ok "the summary line and the leftover table name the leaky suite (and only it)"; else bad "summary: $(grep -E 'tmp |leaky' "$T/fx.out")"; fi
+if jq -e '.tmp_leaks | length == 1 and .[0].suite == "leaky.test.sh" and .[0].bytes >= 3145728 and .[0].entries >= 1' "$RCPT" >/dev/null 2>&1; then ok "receipt tmp_leaks = [{suite: leaky.test.sh, bytes >= 3 MB, entries >= 1}]"; else bad "receipt tmp_leaks: $(jq -c .tmp_leaks "$RCPT" 2>&1)"; fi
+if grep -q "$MARK-hardcoded" "$T/fx.out" && jq -e --arg m "$MARK-hardcoded" '.tmp_outside | map(select((.path | contains($m)) and (.suites | index("outside.test.sh")))) | length == 1' "$RCPT" >/dev/null 2>&1; then ok "a hard-coded /tmp write is caught, attributed to outside.test.sh, printed and in the receipt (tmp_outside)"; else bad "outside: $(grep -E 'outside|hardcoded' "$T/fx.out") receipt=$(jq -c .tmp_outside "$RCPT" 2>&1)"; fi
+if [ -z "$(ls -A "$T/ert")" ]; then ok "after the sweep nothing is left under the runner's TMPDIR: every suite's dir and the temp root are gone"; else bad "left under TMPDIR: $(ls -A "$T/ert")"; fi
+rm -f "$FX/test/outside.test.sh"
+fx_run HMD_TEST_TMP_LEAK_MAX_MB=1; RC=$?
+if [ "$RC" -eq 1 ] && grep -q 'TMP LEAK (1)' "$T/fx.out" && grep -q 'RUN RED' "$T/fx.out" && jq -e '.exit_code == 1' "$RCPT" >/dev/null 2>&1; then ok "a leftover over HMD_TEST_TMP_LEAK_MAX_MB fails the sweep (exit 1, RUN RED, receipt exit_code 1)"; else bad "limit sweep rc=$RC: $(tail -20 "$T/fx.out")"; fi
+rm -f "$FX"/test/*.test.sh
+printf 'mktemp -d >/dev/null\necho "tiny: 1 passed, 0 failed."\n' > "$FX/test/tiny.test.sh"
+fx_run HMD_TEST_STRICT_TMP=1 HMD_TEST_TMP_WATCH="$T/watch2"; RC=$?
+if [ "$RC" -eq 1 ] && grep -q 'TMP LEAK (1)' "$T/fx.out"; then ok "HMD_TEST_STRICT_TMP=1: an empty leftover directory alone fails the sweep"; else bad "strict sweep rc=$RC: $(tail -20 "$T/fx.out")"; fi
+rm -f "$FX"/test/*.test.sh
+printf 'd="$(mktemp -d)"; trap '"'"'rm -rf "$d"'"'"' EXIT\necho "tidy: 1 passed, 0 failed."\n' > "$FX/test/tidy.test.sh"
+fx_run HMD_TEST_STRICT_TMP=1 HMD_TEST_TMP_WATCH="$T/watch2"; RC=$?
+if [ "$RC" -eq 0 ] && grep -qE '^tmp dirs: +clean' "$T/fx.out" && grep -qE '^tmp outside: +none' "$T/fx.out" && jq -e '.tmp_leaks == [] and .tmp_outside == []' "$RCPT" >/dev/null 2>&1; then ok "a tidy suite passes even strict: summary says clean/none, receipt arrays are empty"; else bad "tidy sweep rc=$RC: $(tail -20 "$T/fx.out")"; fi
+
+echo "-- 8. wiring in run-all.sh --"
+for needle in 'TMPDIR="$stmp" timeout_run' 'hmd_test_suite_tmp_settle' 'hmd_test_tmp_begin' 'hmd_test_tmp_guard' 'TMP_FINDINGS' 'tmp_leaks'; do
+  if grep -qF -- "$needle" "$RUNALL"; then ok "run-all.sh carries: $needle"; else bad "run-all.sh is missing: $needle"; fi
+done
+if bash -n "$RUNALL" 2>/dev/null; then ok "run-all.sh still parses"; else bad "run-all.sh no longer parses"; fi
+
+echo "-- 9. this suite leaves nothing running --"
 LEFT="$(pgrep -f "$MARK|$T/fake/" 2>/dev/null | tr '\n' ' ')"
 if [ -z "${LEFT// /}" ]; then ok "no process of this suite is left running"; else bad "still running: $LEFT"; fi
 
