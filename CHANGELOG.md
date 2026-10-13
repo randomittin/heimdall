@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window now start one `heimdall-relay-client --resume-only` for every stored login that no live client serves, each resuming its own phone's session (its own seq blocks and
   store lock, no re-pair, no nonce reuse) while that phone's client was last alive within `HMD_SESSION_RESUME_H` hours -- the limit applies per phone. Phones added with
   `hmd app add-device` are included. `--resume-only` never pairs: with no login left to claim it says `resume_none` and exits 0. Test: `test/app-session-multi-resume.test.sh`.
+- `hmd app disconnect` and `--forget-local` can no longer race a resume (security review of the multi-phone resume): a disconnect MARKS FIRST -- every stored login
+  goes `revoking` in one hold of the store lock, before a window, the supervisor, a client or the relay is touched -- so no resume claims it afterwards (a periodic look,
+  a respawn, the pair window and a `--resume-only` client all claim under that same lock and skip what is marked or gone); then the connect supervisor (its pid is
+  `pid_watcher` in `connect.json`) is stopped and waited for, then the clients, and only then is the relay asked to revoke (or the login dropped), so nothing is
+  left running that could reattach, respawn or look again; a connect's periodic look also stops once `connect.json` is gone. A client that got through anyway ends
+  itself, revoking its session, within `HMD_SESSION_LOGIN_CHECK_S` (2 s) of its login being marked or gone; a store it merely cannot read ends nothing. Tests:
+  `test/app-session-revoke-race.test.sh`.
 
 ## Changelog status
 

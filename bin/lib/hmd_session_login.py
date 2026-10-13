@@ -32,6 +32,8 @@ nothing to claim. A login a revoke removed cannot be brought back: every writer 
 CLI (the shell tools; nothing secret is ever printed):
     python3 hmd_session_login.py list   --repo DIR                                   the logins of that repo, as JSON, secret-free
     python3 hmd_session_login.py resumable --repo DIR --relay URL                    the logins a client could resume now (one client per phone), as JSON
+    python3 hmd_session_login.py mark   --repo DIR (--device-id ID | --all)          mark those logins `revoking`, ALL in one hold of the store lock: what a
+        disconnect does FIRST, before a supervisor, a window, a client or the relay is touched; exit 0 marked, 3 none selected, 1 could not be marked
     python3 hmd_session_login.py revoke --repo DIR (--device-id ID | --all)           revoke those sessions AT THE RELAY with the stored
         login and discard what was confirmed. exit 0 every one confirmed (revoked, or the relay says it is already gone), 1 one or more
         could NOT be confirmed (the reason on stderr; an unreachable relay keeps the login so the command can be run again; a login
@@ -482,6 +484,50 @@ def forget_login(root, sid, reason):
     return True
 
 
+def mark_revoking(root, sids):
+    """Mark every login in `sids` `revoking` -- ALL of them in ONE hold of the store lock, durably -- and return the session ids that were there to
+    mark. This is the first thing a disconnect does, before a window, a supervisor, a client or the relay is touched: from then on no resume claims
+    one of them (a periodic look, a respawn, the pair window and a client started a moment ago all claim under this same lock and skip what is
+    marked) and a live client of one ends itself (login_state). OSError when the lock or a write fails; what was written stays."""
+    marked = []
+    with _locked():
+        for sid in sids:
+            acct = account(root, sid)
+            rec = _read_meta(acct)
+            if rec is None:
+                continue
+            if not rec.get("revoking"):
+                _write_meta(acct, dict(rec, revoking=True))
+            marked.append(sid)
+    return marked
+
+
+def login_state(root, sid):
+    """What a running client may believe about its own stored login: "ok"; "revoking" (a disconnect marked it); "gone" (the store can be read and
+    holds no such login: discarded, forgotten or deleted); or "unreadable" (the store, or the file, cannot be read or trusted -- a link, not 0600, not
+    ours: no reason to end anybody's session, so nothing acts on it)."""
+    base = home()
+    if base is None:
+        return "unreadable"
+    try:
+        acct = account(root, sid)
+        fd = PRIVATE.open_dir(base, REL, False)
+    except OSError:
+        return "unreadable"
+    try:
+        present = acct + ".json" in os.listdir(fd)
+    except OSError:
+        return "unreadable"
+    finally:
+        os.close(fd)
+    if not present:
+        return "gone"
+    rec = _read_meta(acct)
+    if rec is None:
+        return "unreadable"
+    return "revoking" if rec.get("revoking") else "ok"
+
+
 def status(root, sid):
     """"resumable" while the login is stored, "revoking" once a disconnect asked for it to be revoked (it is then kept only for that revoke to
     be repeated, and no resume claims it), "gone" when it is not stored -- or cannot be read."""
@@ -521,6 +567,10 @@ def _revoke_logins(root, device_id=None, forget_local=False):
         failed += 1
         sys.stderr.write("session login %s: it cannot be read (is it a 0600 file of ours?), so it could NOT be revoked from here -- it is kept\n"
                          % name)
+    try:  # every selected login is marked in ONE hold of the lock, before any relay call: none stays claimable while an earlier one is being revoked
+        mark_revoking(root, [r["session_id"] for r in chosen])
+    except OSError:
+        pass  # each is marked again, one at a time, below -- and one that cannot be marked is reported there
     for rec in chosen:
         sid, short = rec["session_id"], rec["session_id"][:8]
         try:
@@ -563,7 +613,7 @@ def _revoke_logins(root, device_id=None, forget_local=False):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hmd_session_login.py", description=__doc__.split("\n")[0])
-    ap.add_argument("action", choices=("list", "revoke", "resumable"))
+    ap.add_argument("action", choices=("list", "revoke", "resumable", "mark"))
     ap.add_argument("--relay", default=None, help="resumable: the relay whose logins are counted")
     ap.add_argument("--repo", required=True)
     ap.add_argument("--device-id", default=None)
@@ -581,7 +631,15 @@ def main(argv=None):
         print(json.dumps([{"session_id": r["session_id"], "device_id": r.get("device_id")} for r in resumable(root, args.relay)], sort_keys=True))
         return 0
     if bool(args.device_id) == bool(args.all):
-        ap.error("revoke takes --device-id ID or --all")
+        ap.error("%s takes --device-id ID or --all" % args.action)
+    if args.action == "mark":
+        chosen = [r["session_id"] for r in records(root) if args.all or r.get("device_id") == args.device_id]
+        try:
+            mark_revoking(root, chosen)
+        except OSError as e:
+            sys.stderr.write("hmd_session_login: the logins could not be marked revoking (%s)\n" % e)
+            return 1
+        return 0 if chosen else 3
     _confirmed, forgotten, failed, selected = _revoke_logins(root, None if args.all else args.device_id, args.forget_local)
     if selected == 0:
         return 3

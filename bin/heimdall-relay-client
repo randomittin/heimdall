@@ -1510,6 +1510,10 @@ class RelayClient:
     # frame is retried like any frame that got no answer, a repeated nonce cannot be taken back. The phone needs only a seq above the last
     # it accepted (INV-14), so the jump from one client to the next costs it nothing.
     SEQ_RESERVE = _SEQ_RESERVE
+    try:  # HMD_SESSION_LOGIN_CHECK_S: how often a client looks at its own stored login (_login_guard)
+        LOGIN_CHECK_S = min(max(float(os.environ.get("HMD_SESSION_LOGIN_CHECK_S", "2")), 0.05), 3600.0)
+    except ValueError:
+        LOGIN_CHECK_S = 2.0
     # Class-level like _device_id above: a client built without __init__ keeps no login, and a stop of it revokes as it always did.
     _login_kept = False
     _login_failing = False
@@ -1584,6 +1588,22 @@ class RelayClient:
             LOGIN_STORE.discard(self.root, self.session_id)
         except OSError as e:
             emit({"event": "error", "detail": "session login not removed: %s" % e})
+
+    def _login_guard(self):
+        """Until this client ends: look at its stored login every LOGIN_CHECK_S seconds -- the first look at once, which is the look after attach -- and
+        end the client when a disconnect has marked the login `revoking` or the login is GONE (discarded, forgotten, deleted): an orderly shutdown,
+        which revokes its session at the relay. Every resume start already claims under the store lock and skips what is marked or gone; this is for
+        the client that got its claim a moment earlier, or that no stop found (a client is found by its device record, which is written only after its
+        claim). A store that merely cannot be read (login_state "unreadable") is no reason to end anybody's session."""
+        while True:
+            if self._login_kept and LOGIN_STORE is not None and not self._stopping:
+                state = LOGIN_STORE.login_state(self.root, self.session_id)
+                if state in ("revoking", "gone"):
+                    emit({"event": "error", "detail": "the stored session login is %s: this client ends and revokes its session" % state})
+                    self.shutdown("local-disconnect")
+                    return
+            if self.stop_event.wait(self.LOGIN_CHECK_S):
+                return
 
     def resume(self):
         """`--resume`: attach to the relay session a former client of this repo left bound to its phone, instead of opening a new one
@@ -3405,6 +3425,7 @@ def main(argv=None):
         client.code_start()  # after the signal handlers: Ctrl-C while the window registers still revokes
 
     client.login_startup()
+    threading.Thread(target=client._login_guard, name="login-guard", daemon=True).start()  # a disconnect that marked this login ends this client
     if ATTACH is not None:
         ATTACH.sweep(client.root)  # a picture past its TTL does not outlive a restart
 
@@ -3412,8 +3433,9 @@ def main(argv=None):
     stream_thread.start()
 
     client.run_state_loop()
-    client._remove_pairing_traces()  # an end the relay announced (session_ended) comes here, not through shutdown()
-    client._discard_login()          # ... and so does the end of a login the relay refused: the session is over, the stored login goes
+    if not client._stopping:  # a shutdown (the login guard's) has done its own: an unconfirmed revoke must not lose the login
+        client._remove_pairing_traces()  # an end the relay announced (session_ended) comes here, not through shutdown()
+        client._discard_login()          # ... and so does the end of a login the relay refused: the session is over, the stored login goes
     if client.exit_code:
         client.shutdown("code-window-ended")  # a --code-only window that ended here: the session it left open is revoked
     return client.exit_code

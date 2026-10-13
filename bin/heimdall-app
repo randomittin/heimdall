@@ -243,6 +243,10 @@
 #                              <repo>/.heimdall/app/relay-events.jsonl and a line in $HEIMDALL_HOME/logs/app.log -- recording session,
 #                              device, expiry and that the relay was NOT told. For one phone with --device, else every stored login. Exit 0
 #                              only once the local delete (and its log) succeeded.
+#                              Every disconnect MARKS FIRST: all stored logins go `revoking` under the store lock before anything else is touched
+#                              (no resume -- a periodic look, a respawn, the pair window -- claims a marked login, and a live client of one ends
+#                              itself), then the connect supervisor, the pair windows and the clients are stopped, and only then is the relay
+#                              asked to revoke (or, with --forget-local, the login dropped): nothing is left running that could reattach.
 #   hmd app add-device [--repo DIR] [--relay URL] [--confirm]
 #                              Pair ONE more phone, on purpose. The repo pairs one phone by default and closes its
 #                              code at the bind; this opens a single extra window under the same code -- registered
@@ -802,6 +806,40 @@ _pid_is_relay_client() {
   case "$cmd" in *"/heimdall-relay-client "*) ;; *) return 1 ;; esac
   seen="$(_argv_repo "$1" "${cmd#*/heimdall-relay-client }")" || return 1
   [ -n "$2" ] && [ "$seen" = "$2" ]
+}
+
+# _pid_is_connect_watcher PID REPO_REAL -- 0 when PID is the supervisor of a `hmd app connect` of REPO_REAL: this user's, this very script running
+# `connect` (a forked subshell shows its parent's argv), with `--repo` resolving to the repo
+_pid_is_connect_watcher() {
+  local cmd seen
+  _proc_mine "$1" || return 1
+  cmd="$(ps -ww -o command= -p "$1" 2>/dev/null)"
+  case "$cmd" in *"/heimdall-app connect "*) ;; *) return 1 ;; esac
+  seen="$(_argv_repo "$1" "${cmd#*/heimdall-app connect }")" || return 1
+  [ -n "$2" ] && [ "$seen" = "$2" ]
+}
+
+# _stop_connect_watcher CONNECT_DOC REPO_REAL -- stop the supervisor connect.json names (pid_watcher), by TERM, and wait for it: its own teardown ends
+# the clients and the ui it runs. Done by a disconnect BEFORE any client is stopped, so that nothing is respawned or looked up behind it: after
+# this returns no supervisor of the repo is left (one that outlives 60 s is killed). A pid that is not this repo's supervisor is never signalled.
+_stop_connect_watcher() {
+  local pid waited=0
+  pid="$(_doc_field "$1" .pid_watcher)"
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  if ! _pid_is_connect_watcher "$pid" "$2"; then
+    if kill -0 "$pid" 2>/dev/null; then echo "hmd app disconnect: pid $pid in state file is not a connect supervisor of this repo -- not stopping it" >&2; fi
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  while _pid_is_connect_watcher "$pid" "$2" && [ "$waited" -lt 600 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if _pid_is_connect_watcher "$pid" "$2"; then
+    kill -KILL "$pid" 2>/dev/null || true
+    echo "hmd app disconnect: the connect supervisor (pid $pid) did not end within 60 s and was killed" >&2
+  fi
+  return 0
 }
 
 # A4: "is a public funnel actually configured right now" -- real
@@ -1894,9 +1932,11 @@ cmd_connect() {
 _relay_write_state() {
   jq -n --argjson pid_ui "$UI_PID" --argjson pid_client "$CLIENT_PID" --argjson port "$actual_port" --arg relay "$RELAY_URL" \
     --arg started_at "$relay_started_at" --argjson tmux "${TMUX_OPTIN:-null}" --arg confirm "${CONFIRM:-false}" \
+    --argjson pid_watcher "${WATCHER_PID:-null}" \
     '{mode: "relay", pid_ui: $pid_ui, pid_client: $pid_client, port: $port, relay: $relay, started_at: $started_at}
       + (if $tmux == null then {} else {tmux: $tmux} end)
-      + (if $confirm == "true" then {confirm: true} else {} end)' \
+      + (if $confirm == "true" then {confirm: true} else {} end)
+      + (if $pid_watcher == null then {} else {pid_watcher: $pid_watcher} end)' \
     | _state_write "$REPO" connect.json
 }
 
@@ -1994,7 +2034,7 @@ _relay_loop() {
 
     # a phone whose client died (an added phone's has no supervisor of its own) is brought back: once the client above has settled which
     # session it serves, any stored login no live client holds gets a client of its own
-    if [ "$pair_init_seen" = true ] && _resume_due; then
+    if [ "$pair_init_seen" = true ] && _resume_due && _relay_still_mine; then  # not once a disconnect has taken connect.json
       _resume_phones "$REPO" "$RELAY_URL" "$actual_port" "$relay_host"
     fi
 
@@ -2172,6 +2212,7 @@ cmd_connect_relay() {
 
   local relay_started_at
   relay_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  WATCHER_PID="$$"  # the process that supervises this connect (a --bg connect's watcher records its own pid below): `hmd app disconnect` stops it by this
   if _relay_write_state; then
     STATE_WRITTEN=true
     _tmux_optin_say
@@ -2209,6 +2250,15 @@ cmd_connect_relay() {
         trap 'cleanup; exit 130' INT
         trap 'cleanup; exit 129' HUP
         trap cleanup EXIT
+        # this subshell's own pid, which $$ does not give (it is the parent's): a child it forks names it as its parent. Recorded in connect.json,
+        # so that `hmd app disconnect` can stop this supervisor -- it respawns clients and looks for phones whose client died -- before any client
+        sleep 30 &
+        WATCHER_KID=$!
+        WATCHER_PID="$(ps -o ppid= -p "$WATCHER_KID" 2>/dev/null | tr -d ' ')"
+        kill "$WATCHER_KID" 2>/dev/null
+        wait "$WATCHER_KID" 2>/dev/null
+        case "$WATCHER_PID" in ''|*[!0-9]*) WATCHER_PID="" ;; esac
+        _relay_write_state || true
         _relay_loop false
       ) &
       disown "$!" 2>/dev/null || true
@@ -3168,11 +3218,7 @@ _disconnect_device() {
   # ignored, and a TERM only stops a client). 0 confirmed, 3 nothing stored (a client older than the stored logins -- it revokes on the
   # signal below, as it always did), else not confirmed: loud, and nothing is removed so that this can be run again.
   local lrc=0
-  "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$repo" --device-id "$id" ${FORGET_LOCAL:+--forget-local} || lrc=$?
-  if [ "$lrc" -ne 0 ] && [ "$lrc" -ne 3 ] && [ "$lrc" -ne 4 ]; then
-    echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): its relay session could NOT be confirmed revoked -- it stays connected; run this again once the relay is reachable" >&2
-    return 1
-  fi
+  "$PY3" "$LIB_DIR/hmd_session_login.py" mark --repo "$repo" --device-id "$id" >/dev/null || true  # marked FIRST: nothing resumes it from now on, and its client ends itself if the stop below misses it
   # TERM, always: SIGUSR1 is no revoke any more (a new client ignores it). A client older than the stored logins revokes on TERM, and so does
   # a new one that keeps no login (it could not store one, or it is gone) -- through the revoke it makes itself; one that was revoked above is
   # only stopped (it ends on the relay's session_ended too).
@@ -3183,11 +3229,17 @@ _disconnect_device() {
   if _pid_is_relay_client "$pid" "$repo_real"; then
     _relay_stop_client "$pid" "$sig"
     rc=$?
-  elif [ "$lrc" -eq 0 ] && ! kill -0 "$pid" 2>/dev/null; then
-    rc=0  # it already ended, on the relay's own session_ended
+  elif ! kill -0 "$pid" 2>/dev/null; then
+    rc=0  # it already ended (on the relay's own session_ended, or by itself once its login was marked)
   else
     echo "hmd app disconnect: pid $pid of device $id is not a heimdall-relay-client process of this repo -- not signalling it" >&2
     rc=1
+  fi
+  # only now, with the login marked and the client stopped, the relay is asked (or, with --forget-local, the login is dropped)
+  "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$repo" --device-id "$id" ${FORGET_LOCAL:+--forget-local} || lrc=$?
+  if [ "$lrc" -ne 0 ] && [ "$lrc" -ne 3 ] && [ "$lrc" -ne 4 ]; then
+    echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): its client was stopped, but its relay session could NOT be confirmed revoked -- its record and login are kept; run this again once the relay is reachable" >&2
+    return 1
   fi
   # the push registrations go before success is reported: a revoke that left them would keep notifying the phone it revoked
   local frc=0
@@ -3242,12 +3294,20 @@ cmd_disconnect() {
     echo "hmd app disconnect: removed a leftover connect.json that backed no running relay client or ui of this repo"
   fi
 
+  # Disconnect MARKS FIRST: every stored login of this repo goes `revoking` -- all of them, in one hold of the store lock -- before a window, the
+  # supervisor, a client or the relay is touched. From then on no resume claims one: a periodic look, a respawn, the pair window and a client started
+  # a moment ago all claim under that same lock and skip what is marked, and a live client of one ends itself.
+  if [ -n "$PY3" ]; then "$PY3" "$LIB_DIR/hmd_session_login.py" mark --repo "$REPO" --all >/dev/null || true; fi
   # a pair window is a way for a phone in, so disconnect closes it too (it is opened again by the next session)
   pw_stopped="$(_pair_window_stop_all "$REPO")"
   [ "${pw_stopped:-0}" -gt 0 ] && echo "hmd app disconnect: stopped $pw_stopped pair window(s)"
-  # A stopped client does not unpair its phone, so the revoke is done from here: every session login stored for this repo is revoked at the
-  # relay (bin/lib/hmd_session_login.py) -- whether its client runs, crashed or is gone -- BEFORE the clients are stopped. One the relay
-  # could not confirm is reported and fails the command; 3 is no stored login at all (nothing to revoke from here).
+  # The connect supervisor goes next, BEFORE any client: it respawns a client that ends and looks for phones whose client is gone, so left running it
+  # would start one behind this disconnect. TERM runs its own teardown (the clients and the ui it runs); it is waited for.
+  _stop_connect_watcher "$connect_doc" "$repo_real"
+  # Then every phone's client is stopped (a login marked `revoking` makes each revoke its own session as it ends; a client older than the stored
+  # logins revokes on this TERM too), and only then is the revoke made at the relay through the stored logins -- whether a client ran, crashed or is
+  # gone. One the relay could not confirm is reported and fails the command; 3 is no stored login at all (nothing to revoke from here).
+  _stop_device_clients "$REPO" "$repo_real" || true
   LOGIN_REVOKE_RC=0
   local login_forgotten=false
   if [ -n "$PY3" ]; then
@@ -3261,7 +3321,6 @@ cmd_disconnect() {
   if [ "$LOGIN_REVOKE_RC" -ne 0 ]; then
     echo "hmd app disconnect: a stored session login could NOT be confirmed revoked at the relay -- it is kept (so are the device records), nothing here claims the phone is unpaired; run hmd app disconnect again once that is fixed" >&2
   fi
-  _stop_device_clients "$REPO" "$repo_real" || true  # every phone's client, an added one too (a client older than the stored logins revokes on this TERM)
   if [ "$login_forgotten" = true ] && [ "$LOGIN_REVOKE_RC" -eq 0 ]; then
     # logins forgotten locally: their phones' records and push registrations go with them, whichever way the clients ended
     local fdid fdpid

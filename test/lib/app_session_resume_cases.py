@@ -87,6 +87,7 @@ class Relay:
         self.inits = 0
         self.down = False          # /revoke answers 503 while set
         self.revoke_status = None  # /revoke answers this status while set (a relay that refuses: 403)
+        self.revoke_delay = 0      # seconds a /revoke waits before it is answered (a slow relay: the revoke is in flight meanwhile)
         self.stream_status = None  # GET /stream answers this status while set
         relay = self
 
@@ -135,6 +136,8 @@ class Relay:
                 if m.group(2) == "revoke":
                     if relay.down or relay.revoke_status:
                         return self.reply(relay.revoke_status or 503, {"error": "unavailable"})
+                    if relay.revoke_delay:
+                        time.sleep(relay.revoke_delay)
                     with relay.lock:
                         s["revoked"] = True
                         relay.revokes.append(m.group(1))
@@ -265,13 +268,15 @@ class Sandbox:
 
 
 class Client:
-    def __init__(self, sb, relay, tag, resume=False, **env):
+    def __init__(self, sb, relay, tag, resume=False, resume_only=False, **env):
         self.out_path = os.path.join(sb.tmp, tag + ".out")
         self.err_path = os.path.join(sb.tmp, tag + ".err")
         self.log_path = os.path.join(sb.repo, ".heimdall", "app", "relay-events.jsonl")
         argv = [sys.executable, CLIENT, "--relay", relay.url, "--repo", sb.repo, "--ui-port", "1", "--tick-s", "0.2"]
         if resume:
             argv.append("--resume")
+        if resume_only:
+            argv.append("--resume-only")
         self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=open(self.out_path, "w"),
                                      stderr=open(self.err_path, "w"), env=sb.env(**env))
         STARTED.append(self.proc.pid)
