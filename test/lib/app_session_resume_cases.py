@@ -447,8 +447,9 @@ def scenario_disconnect_all():
         c1, sid, _key = bind_phone(sb, relay)
         run_app(sb, "disconnect", "--repo", sb.repo)
         gone = wait_until(lambda: c1.proc.poll() is not None, 20)
-        check("R6", "`hmd app disconnect` revokes the relay session of a live client's phone, ends the client and removes the login",
-              relay.revokes == [sid] and bool(gone) and not sb.logins())
+        check("R6", "`hmd app disconnect` revokes the relay session of a live client's phone, ends the client and removes the login (the "
+                    "client, stopped once its login is gone, may revoke the session once more itself: the relay takes that twice)",
+              set(relay.revokes) == {sid} and bool(gone) and not sb.logins())
     finally:
         kill_leftovers(c1)
         relay.close()
