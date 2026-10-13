@@ -35,6 +35,11 @@ CLI (the shell tools; nothing secret is ever printed):
         login and discard what was confirmed. exit 0 every one confirmed (revoked, or the relay says it is already gone), 1 one or more
         could NOT be confirmed (the reason on stderr; an unreachable relay keeps the login so the command can be run again; a login
         the relay refuses is discarded and reported), 3 no stored login selected (the caller falls back to what it did before).
+        --forget-local (never implied by anything else): a login whose revoke the relay does not confirm is not kept but dropped here --
+        the session id, the warning that its phone can keep connecting until the session expires and when (absolute UTC: session_exp, the
+        bind plus the relay's 30-day device-token lifetime) go to stderr, the Keychain item and the file are deleted under the store lock,
+        and a session_login_forgotten event (the repo's relay-events.jsonl) and a line ($HEIMDALL_HOME/logs/app.log) record session, device,
+        expiry and that the relay was NOT told. Exit 4: nothing failed, but at least one login was dropped without the relay's word.
 """
 import argparse
 import contextlib
@@ -59,6 +64,10 @@ _SID_RE = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
 STORE_LOCK = "sessions.lock"
 SEQ_BLOCK = 1000  # seqs handed out at a time unless the caller says otherwise
 _MONOTONIC = ("hmd_seq", "last_device_seq", "last_alive")  # fields that only ever grow: a writer holding a stale copy cannot take one back
+DEVICE_TOKEN_TTL_S = 30 * 24 * 3600  # relay/src/pairing.ts DEVICE_TOKEN_TTL_S: a bound session lives until its device token's exp, the bind plus this
+APP_LOG_REL, APP_LOG = "logs", "app.log"  # $HEIMDALL_HOME/logs/app.log: the human-readable line of what was done to a stored login
+EVENT_LOG_MAX_BYTES = 4 * 1024 * 1024  # where the relay client's event log rotates (bin/heimdall-relay-client)
+FORGOTTEN = 4  # exit of `revoke --forget-local`: nothing failed, but a login was dropped here with the relay NOT told
 
 
 def _sibling(name):
@@ -170,6 +179,8 @@ def save(root, relay, sid, secret, **fields):
     acct = account(root, sid)
     now = int(time.time())
     rec = dict(fields, v=1, repo=os.path.realpath(root), relay=relay, session_id=sid, created_at=now, last_alive=now)
+    bound = fields.get("bound_at")  # the client never sees the device token, so its exp is kept from what the relay documents: the bind + 30 days
+    rec["session_exp"] = int(bound if isinstance(bound, (int, float)) and not isinstance(bound, bool) else now) + DEVICE_TOKEN_TTL_S
     text = json.dumps(secret, sort_keys=True, separators=(",", ":"))
     if _backend() == "keychain":
         try:
@@ -332,6 +343,124 @@ def _revoke_at_relay(rec, token, timeout=15):
         return "failed: %s" % type(e).__name__
 
 
+def session_exp(rec):
+    """Epoch second the relay stops serving this session -- until then its phone can keep connecting: the stored `session_exp`, else the
+    bind (the login's creation, for a record without one) plus the relay's fixed device-token lifetime."""
+    exp = rec.get("session_exp")
+    if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+        return int(exp)
+    base = rec.get("bound_at") if isinstance(rec.get("bound_at"), (int, float)) and not isinstance(rec.get("bound_at"), bool) else rec.get("created_at")
+    return int(base if isinstance(base, (int, float)) and not isinstance(base, bool) else 0) + DEVICE_TOKEN_TTL_S
+
+
+def _iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def _clean(text, limit):
+    return "".join(ch for ch in str(text) if not (ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F))[:limit]
+
+
+def _remove_strict(root, rec):
+    """Delete a login for good and be sure of it, under the store lock: the Keychain item (read back, never taken on trust), then the metadata
+    file. None when both are gone, else what is still there -- and then the metadata stays, because it is what names the item."""
+    acct = account(root, rec["session_id"])
+    if rec.get("secret_in") == "keychain":
+        try:
+            _kc_del(acct)
+            if _kc_get(acct) is not None:
+                return "the Keychain item could not be removed"
+        except (OSError, subprocess.SubprocessError) as e:
+            return "the Keychain item could not be removed (%s)" % type(e).__name__
+    base = home()
+    if base is not None:
+        PRIVATE.remove(base, REL, acct + ".json")
+        if acct + ".json" in PRIVATE.names(base, REL):
+            return "the login file could not be removed"
+    return None
+
+
+def _event_log_target(root):
+    """(dir, rel, name) of the relay client's event log -- HMD_RELAY_EVENT_LOG: "" is off (None), a path is that file, else the repo's
+    <repo>/.heimdall/app/relay-events.jsonl."""
+    env = os.environ.get("HMD_RELAY_EVENT_LOG")
+    if env == "":
+        return None
+    if env:
+        return os.path.dirname(os.path.abspath(env)), "", os.path.basename(env)
+    return os.path.realpath(root), ".heimdall/app", "relay-events.jsonl"
+
+
+def _record_forgotten(root, rec, reason):
+    """The log entry of a forget -- a `session_login_forgotten` event in the relay client's event log and a line in the app log -- written
+    once the delete succeeded, so a log never claims what did not happen. The paths written; [] when no log took it."""
+    now, exp = time.time(), session_exp(rec)
+    meta = rec.get("device_meta") if isinstance(rec.get("device_meta"), dict) else {}
+    label, why = _clean(meta.get("label") or "", 40), _clean(reason, 200)
+    event = {"event": "session_login_forgotten", "ts": "%s.%03dZ" % (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)), int(now * 1000) % 1000),
+             "session_id": rec["session_id"], "device_id": rec.get("device_id"), "device_label": label, "relay": rec.get("relay"),
+             "session_exp": exp, "session_exp_at": _iso(exp), "relay_told": False, "reason": why, "by": "hmd app disconnect --forget-local"}
+    line = ("%s hmd app: session login forgotten locally (hmd app disconnect --forget-local): session %s, device %s (%s) -- the relay was NOT told "
+            "(%s); the phone can keep connecting until %s\n" % (_iso(now), rec["session_id"], rec.get("device_id"), label, why, _iso(exp)))
+    sinks = [(os.path.join(home() or "", APP_LOG_REL, APP_LOG), (home(), APP_LOG_REL, APP_LOG, line.encode("utf-8"), None))]
+    target = _event_log_target(root)
+    if target is not None:
+        data = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        sinks.append((os.path.join(*target), target + (data, EVENT_LOG_MAX_BYTES)))
+    wrote = []
+    for shown, (base, rel, name, data, rotate) in sinks:
+        try:
+            if base is None:
+                raise OSError("no HEIMDALL_HOME or HOME")
+            PRIVATE.append(base, rel, name, data, rotate_at=rotate)
+            wrote.append(shown)
+        except OSError as e:
+            sys.stderr.write("session %s: the forget could not be logged to %s (%s)\n" % (rec["session_id"], shown, e))
+    return wrote
+
+
+def forget_login(root, sid, reason):
+    """--forget-local: drop the stored login of session `sid` although the relay did not confirm its revoke (`reason` says why). The relay
+    session id, the warning that the phone can keep connecting until the session expires and when (absolute UTC, session_exp) go to stderr;
+    the delete -- Keychain item and file, verified -- runs under the store lock; then the forget is logged (_record_forgotten). True only
+    when the login is gone AND the log took the entry (a login already gone counts as done); False keeps what could not be removed."""
+    try:
+        with _locked():
+            rec = _read_meta(account(root, sid))
+            if rec is None:
+                return True  # a concurrent revoke or discard has already ended it
+            exp, meta = session_exp(rec), rec.get("device_meta") if isinstance(rec.get("device_meta"), dict) else {}
+            risk = ("the phone can keep connecting to that session until it expires: %s (epoch %d)" % (_iso(exp), exp) if exp > time.time()
+                    else "that session's lifetime ended at %s (epoch %d), so nothing is left open at the relay" % (_iso(exp), exp))
+            sys.stderr.write("session %s: the relay revoke could NOT be confirmed (%s), so --forget-local drops the stored login anyway\n"
+                             "  device %s (%s)\n  WARNING: the relay was NOT told -- %s\n"
+                             % (sid, _clean(reason, 200), rec.get("device_id"), _clean(meta.get("label") or "", 40), risk))
+            problem = _remove_strict(root, rec)
+            if problem:
+                sys.stderr.write("session %s: %s -- the login is KEPT, run this again\n" % (sid, problem))
+                return False
+    except OSError as e:
+        sys.stderr.write("session %s: the login could not be forgotten (%s) -- it is kept, run this again\n" % (sid, e))
+        return False
+    device_id = rec.get("device_id")
+    if isinstance(device_id, str):  # a phone whose client is gone goes with its login (push registrations, device record); a LIVE client's record stays: disconnect finds that client by it
+        try:
+            devices = _sibling("hmd_devices")
+            record = next((r for r in devices.records(root) if r["id"] == device_id), None)
+            if record is not None and not devices.client_alive(record["pid"], os.path.realpath(root)) and not devices.forget(root, device_id):
+                sys.stderr.write("session %s: device %s: its push registrations could not be removed, so its record is kept -- run this again\n"
+                                 % (sid, device_id))
+        except (OSError, ValueError, ImportError, AttributeError, KeyError) as e:
+            sys.stderr.write("session %s: device %s could not be forgotten (%s) -- run this again\n" % (sid, device_id, e))
+    wrote = _record_forgotten(root, rec, reason)
+    if not wrote:
+        sys.stderr.write("session %s: the login is deleted but the forget could NOT be logged anywhere -- note it down yourself: relay NOT told, "
+                         "session expires %s\n" % (sid, _iso(exp)))
+        return False
+    print("session %s: login forgotten locally (relay NOT told); logged to %s" % (sid, ", ".join(wrote)))
+    return True
+
+
 def status(root, sid):
     """"resumable" while the login is stored, "revoking" once a disconnect asked for it to be revoked (it is then kept only for that revoke to
     be repeated, and no resume claims it), "gone" when it is not stored -- or cannot be read."""
@@ -352,13 +481,20 @@ def unreadable(root):
             if n.startswith(prefix) and n.endswith(".json") and _read_meta(n[: -len(".json")]) is None]
 
 
-def revoke_logins(root, device_id=None):
-    """Revoke the stored sessions of this repo (all, or the one device's) at the relay. (confirmed, failed, selected). ONLY a revoke the
+def revoke_logins(root, device_id=None, forget_local=False):
+    """(confirmed, failed, selected) of _revoke_logins; a login dropped by --forget-local counts as done (it is not a failure)."""
+    confirmed, forgotten, failed, selected = _revoke_logins(root, device_id, forget_local)
+    return confirmed + forgotten, failed, selected
+
+
+def _revoke_logins(root, device_id=None, forget_local=False):
+    """Revoke the stored sessions of this repo (all, or the one device's) at the relay. (confirmed, forgotten, failed, selected); `forgotten` is
+    only ever above 0 with `forget_local`: a login whose revoke is not confirmed is then dropped here (forget_login). ONLY a revoke the
     relay confirmed -- done, or the session no longer there -- removes a login. Everything else keeps it and says so, loudly: a relay that
     cannot be reached or will not take it (5xx, 401, 403), a secret that cannot be read (a locked or emptied Keychain), and a login file
     that cannot be read at all, which is never walked past. The stored login is the only thing that can end that session from here."""
     chosen = [r for r in records(root) if device_id is None or r.get("device_id") == device_id]
-    confirmed = failed = 0
+    confirmed = forgotten = failed = 0
     blind = unreadable(root)
     for name in blind:
         failed += 1
@@ -374,11 +510,17 @@ def revoke_logins(root, device_id=None):
                 if not rec.get("revoking"):
                     _write_meta(account(root, sid), dict(rec, revoking=True))
         except OSError as e:
+            if forget_local and forget_login(root, sid, "it could not be marked for revoke (%s)" % e):
+                forgotten += 1
+                continue
             failed += 1
             sys.stderr.write("session %s: it could not be marked for revoke (%s) -- it is kept, run this again\n" % (short, e))
             continue
         secret = secret_of(root, rec)
         if secret is None:
+            if forget_local and forget_login(root, sid, "its stored secret cannot be read"):
+                forgotten += 1
+                continue
             failed += 1
             sys.stderr.write("session %s: its stored secret cannot be read (a locked or emptied Keychain?), so it could NOT be revoked "
                              "from here -- the login is kept, run this again\n" % short)
@@ -389,10 +531,13 @@ def revoke_logins(root, device_id=None):
             confirmed += 1
             print("session %s: %s at the relay" % (short, "revoked" if state == "revoked" else "already gone"))
         else:
-            failed += 1
             why = "the relay refused the stored login" if state == "rejected" else state
+            if forget_local and forget_login(root, sid, why):
+                forgotten += 1
+                continue
+            failed += 1
             sys.stderr.write("session %s: the revoke could NOT be confirmed (%s) -- the login is kept, run this again\n" % (short, why))
-    return confirmed, failed, len(chosen) + len(blind)
+    return confirmed, forgotten, failed, len(chosen) + len(blind)
 
 
 def main(argv=None):
@@ -401,6 +546,8 @@ def main(argv=None):
     ap.add_argument("--repo", required=True)
     ap.add_argument("--device-id", default=None)
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--forget-local", action="store_true",
+                    help="revoke: a login the relay does not confirm is dropped HERE anyway -- loudly, logged, the relay NOT told")
     args = ap.parse_args(argv)
     root = os.path.realpath(args.repo)
     if args.action == "list":
@@ -408,10 +555,12 @@ def main(argv=None):
         return 0
     if bool(args.device_id) == bool(args.all):
         ap.error("revoke takes --device-id ID or --all")
-    _confirmed, failed, selected = revoke_logins(root, None if args.all else args.device_id)
+    _confirmed, forgotten, failed, selected = _revoke_logins(root, None if args.all else args.device_id, args.forget_local)
     if selected == 0:
         return 3
-    return 1 if failed else 0
+    if failed:
+        return 1
+    return FORGOTTEN if forgotten else 0
 
 
 if __name__ == "__main__":

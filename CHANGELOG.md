@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without pairing again. Only `hmd app disconnect`, `hmd app disconnect --device`, a revoke from the phone or a refused login unpair:
   disconnect revokes at the relay through the stored login, also for a crashed client (it used to say "could NOT be revoked"). SIGUSR1 is
   no longer a revoke trigger. No relay change, no relay deploy needed.
+- `hmd app disconnect --forget-local`: the explicit way out of a stored login whose relay revoke can never be confirmed (stuck `revoking`, a relay that stays
+  down or refuses it). Without the flag nothing changes -- an unconfirmed revoke still fails loudly and keeps the login -- and no other flag implies it. With it
+  (all phones, or one with `--device`) the revoke is tried first; a login still unconfirmed is dropped here: the relay session id, a warning that the phone can
+  keep connecting until that session expires and when (absolute UTC, the stored session expiry: the bind plus the relay's 30-day device-token lifetime) are
+  printed, the stored login (Keychain item and file) is deleted under the store lock, and a `session_login_forgotten` event (`relay-events.jsonl`) and a line in
+  `$HEIMDALL_HOME/logs/app.log` record session, device, expiry and that the relay was NOT told. Exit 0 only once the delete and its log succeeded. Test:
+  `test/app-session-forget-local.test.sh`.
 
 ## Changelog status
 

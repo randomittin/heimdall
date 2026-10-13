@@ -517,6 +517,8 @@ def run(a):
         sys.stdout.write(open(path).read() + "\\n")
         return 0
     if a[0] == "delete-generic-password":
+        if os.environ.get("FAKE_SECURITY_REFUSE_DELETE"):
+            return 1
         if os.path.exists(path):
             os.remove(path)
             return 0

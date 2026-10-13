@@ -232,6 +232,17 @@
 #                              are left alone. Exit 1 for a name no paired phone has, 2
 #                              for one that fits several (use the id). Plain `disconnect`
 #                              keeps its meaning: everything, every phone included.
+#   hmd app disconnect [--repo DIR] [--device LABEL|ID] --forget-local
+#                              The explicit way out of a stored login whose relay revoke can never be confirmed (a login stuck
+#                              `revoking`, a relay that stays down or refuses it). Without the flag such a revoke is a loud failure that
+#                              keeps the login, and nothing else implies it. With it the revoke is tried first; a login the relay still
+#                              does not confirm is dropped HERE: the relay session id, a warning that the phone can keep connecting until
+#                              that session expires, and when that is (absolute UTC time: the stored session expiry, the bind plus the
+#                              relay's 30-day device-token lifetime) are printed, the stored login (Keychain item and 0600 file) is deleted
+#                              under the store lock, and the forget is logged -- a session_login_forgotten event in
+#                              <repo>/.heimdall/app/relay-events.jsonl and a line in $HEIMDALL_HOME/logs/app.log -- recording session,
+#                              device, expiry and that the relay was NOT told. For one phone with --device, else every stored login. Exit 0
+#                              only once the local delete (and its log) succeeded.
 #   hmd app add-device [--repo DIR] [--relay URL] [--confirm]
 #                              Pair ONE more phone, on purpose. The repo pairs one phone by default and closes its
 #                              code at the bind; this opens a single extra window under the same code -- registered
@@ -3036,11 +3047,15 @@ _disconnect_gone_device() {
   # The login its client stored when the phone bound (bin/lib/hmd_session_login.py) revokes the relay session from here, with no client
   # left to ask. 0 confirmed, 3 nothing stored for it (a client older than the stored logins: the old outcome below), else not confirmed.
   local lrc=0
-  "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$repo" --device-id "$id" || lrc=$?
+  "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$repo" --device-id "$id" ${FORGET_LOCAL:+--forget-local} || lrc=$?
   case "$lrc" in
-    0)
+    0|4)  # 4: --forget-local dropped the login with the relay NOT told (said above): the phone is forgotten here, never reported as revoked
       if "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$repo" "$id" >/dev/null 2>&1; then
-        echo "hmd app disconnect: revoked device $id ($(_clean_text "$wanted")) through its stored login -- its client was not running; the other devices stay connected"
+        if [ "$lrc" -eq 4 ]; then
+          echo "hmd app disconnect: forgot device $id ($(_clean_text "$wanted")) locally (--forget-local) -- the relay was NOT told, see the warning above; the other devices stay connected"
+        else
+          echo "hmd app disconnect: revoked device $id ($(_clean_text "$wanted")) through its stored login -- its client was not running; the other devices stay connected"
+        fi
         return 0
       fi
       echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): revoked at the relay, but its push registrations could not be removed, so it may still be notified and its record is kept -- run this again" >&2
@@ -3084,8 +3099,8 @@ _disconnect_device() {
   # ignored, and a TERM only stops a client). 0 confirmed, 3 nothing stored (a client older than the stored logins -- it revokes on the
   # signal below, as it always did), else not confirmed: loud, and nothing is removed so that this can be run again.
   local lrc=0
-  "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$repo" --device-id "$id" || lrc=$?
-  if [ "$lrc" -ne 0 ] && [ "$lrc" -ne 3 ]; then
+  "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$repo" --device-id "$id" ${FORGET_LOCAL:+--forget-local} || lrc=$?
+  if [ "$lrc" -ne 0 ] && [ "$lrc" -ne 3 ] && [ "$lrc" -ne 4 ]; then
     echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): its relay session could NOT be confirmed revoked -- it stays connected; run this again once the relay is reachable" >&2
     return 1
   fi
@@ -3114,11 +3129,16 @@ _disconnect_device() {
     return "$rc"
   fi
   [ "$frc" -eq 0 ] || return 1
+  if [ "$lrc" -eq 4 ]; then
+    echo "hmd app disconnect: forgot device $id ($(_clean_text "$wanted")) locally (--forget-local) -- the relay was NOT told, see the warning above; the other devices stay connected"
+    return 0
+  fi
   echo "hmd app disconnect: revoked device $id ($(_clean_text "$wanted")) -- the other devices stay connected"
 }
 
 cmd_disconnect() {
   local REPO="" DEVICE="" DEVICE_GIVEN=false
+  FORGET_LOCAL=""  # --forget-local, and only it, turns a revoke the relay will not confirm into a loud local forget; the helpers below read it
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo)
@@ -3130,6 +3150,7 @@ cmd_disconnect() {
         DEVICE_GIVEN=true
         if [ $# -ge 2 ]; then shift 2; else shift 1; fi
         ;;
+      --forget-local) FORGET_LOCAL=true; shift ;;
       *) echo "hmd app disconnect: unknown flag: $1" >&2; return 2 ;;
     esac
   done
@@ -3159,9 +3180,11 @@ cmd_disconnect() {
   # relay (bin/lib/hmd_session_login.py) -- whether its client runs, crashed or is gone -- BEFORE the clients are stopped. One the relay
   # could not confirm is reported and fails the command; 3 is no stored login at all (nothing to revoke from here).
   LOGIN_REVOKE_RC=0
+  local login_forgotten=false
   if [ -n "$PY3" ]; then
-    "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$REPO" --all || LOGIN_REVOKE_RC=$?
+    "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$REPO" --all ${FORGET_LOCAL:+--forget-local} || LOGIN_REVOKE_RC=$?
     [ "$LOGIN_REVOKE_RC" -eq 3 ] && LOGIN_REVOKE_RC=0
+    if [ "$LOGIN_REVOKE_RC" -eq 4 ]; then LOGIN_REVOKE_RC=0; login_forgotten=true; fi  # dropped here with the relay NOT told (the warning is above)
   elif ls "${HEIMDALL_HOME:-${HOME:-/nonexistent}/.heimdall}/app/sessions/"*.json >/dev/null 2>&1; then
     echo "hmd app disconnect: python3 is missing and session logins are stored, so they could NOT be revoked at the relay from here" >&2
     LOGIN_REVOKE_RC=1
@@ -3170,6 +3193,15 @@ cmd_disconnect() {
     echo "hmd app disconnect: a stored session login could NOT be confirmed revoked at the relay -- it is kept (so are the device records), nothing here claims the phone is unpaired; run hmd app disconnect again once that is fixed" >&2
   fi
   _stop_device_clients "$REPO" "$repo_real" || true  # every phone's client, an added one too (a client older than the stored logins revokes on this TERM)
+  if [ "$login_forgotten" = true ] && [ "$LOGIN_REVOKE_RC" -eq 0 ]; then
+    # logins forgotten locally: their phones' records and push registrations go with them, whichever way the clients ended
+    local fdid fdpid
+    while read -r fdid fdpid; do
+      [ -n "$fdid" ] || continue
+      "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$REPO" "$fdid" >/dev/null 2>&1 \
+        || echo "hmd app disconnect: device $fdid: its push registrations could not be removed, so it may still be notified and its record is kept -- run this again" >&2
+    done <<<"$devs"
+  fi
 
   if [ "$(_doc_field "$connect_doc" .mode)" = "relay" ]; then
     cmd_disconnect_relay "$REPO" "$repo_real" "$connect_doc" "$devs"
