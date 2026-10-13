@@ -14,8 +14,11 @@ WHERE. Never in the repo (a repository controls everything under it), never in a
     refused) it is held in the metadata file itself;
   * the METADATA half is a 0600 JSON file, $HEIMDALL_HOME/app/sessions/<account>.json (HEIMDALL_HOME, else ~/.heimdall), written
     through bin/lib/hmd_private_state.py: session id, relay, device id and label, when it bound, when its client was last alive (and its
-    pid), and the two sequence numbers a resumed client must never go back on -- hmd_seq is a CEILING above every seq the client has
-    sent (the client reserves ahead), last_device_seq the phone's newest accepted command seq (the replay guard).
+    pid), and the two sequence numbers a resumed client must never go back on -- hmd_seq is the HIGH-WATER of the seq blocks handed out
+    (reserve_block: a client seals only inside a block it was handed, and the block is durable before it is used, so a seq -- and with it
+    a nonce, which is only sender tag || seq -- is never sealed twice under one key, whatever kills the client), last_device_seq the
+    phone's newest accepted command seq (the replay guard). Fields like these only ever grow (_merge), and every read-modify-write runs
+    under one exclusive store lock (_locked).
 HMD_SESSION_LOGIN_STORE=file|keychain|auto (default auto: the Keychain on macOS when `security` is on PATH) picks the secret's home.
 
 LIMIT. A login whose client was last alive more than HMD_SESSION_RESUME_H hours ago (default 24; 0 = never resume) is discarded on
@@ -29,6 +32,7 @@ CLI (the shell tools; nothing secret is ever printed):
         the relay refuses is discarded and reported), 3 no stored login selected (the caller falls back to what it did before).
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -47,6 +51,9 @@ SERVICE = "heimdall-relay-session"
 DEFAULT_RESUME_H = 24.0
 SECRET_LIMIT = 16384
 _SID_RE = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
+STORE_LOCK = "sessions.lock"
+SEQ_BLOCK = 1000  # seqs handed out at a time unless the caller says otherwise
+_MONOTONIC = ("hmd_seq", "last_device_seq", "last_alive")  # fields that only ever grow: a writer holding a stale copy cannot take one back
 
 
 def _sibling(name):
@@ -128,6 +135,30 @@ def _write_meta(sid_account, rec):
     PRIVATE.write(base, REL, sid_account + ".json", json.dumps(rec, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
+@contextlib.contextmanager
+def _locked():
+    """The store's one exclusive lock. Every read-modify-write of a login runs under it, so that two writers -- a client's refresh and
+    its seq reservation, two clients, a client and a command-line revoke -- cannot interleave and lose one another's update. Held only
+    for file reads and writes, never across the network."""
+    base = home()
+    if base is None:
+        raise OSError("no HEIMDALL_HOME or HOME to keep a session login under")
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    PRIVATE.ensure_dir(base, REL)
+    with PRIVATE.lock(base, REL, STORE_LOCK):
+        yield
+
+
+def _merge(old, fields):
+    """`old` with `fields` applied -- except that a monotonic field never goes down."""
+    new = dict(old)
+    for key, value in fields.items():
+        prev = old.get(key)
+        grows = key in _MONOTONIC and isinstance(prev, (int, float)) and isinstance(value, (int, float)) and not isinstance(value, bool)
+        new[key] = max(prev, value) if grows else value
+    return new
+
+
 def save(root, relay, sid, secret, **fields):
     """Keep the login of session `sid` (secret = {"token", "priv"}; fields = the metadata). The secret first, the metadata last, so a
     record never names a secret that was not kept. Raises OSError when nothing could be written."""
@@ -145,22 +176,46 @@ def save(root, relay, sid, secret, **fields):
         rec["secret_in"] = "file"
     if rec["secret_in"] == "file":
         rec["secret"] = secret
-    _write_meta(acct, rec)
+    with _locked():
+        old = _read_meta(acct)
+        _write_meta(acct, _merge(old, rec) if old else rec)
 
 
 def update(root, sid, **fields):
     """Change fields of a login that still exists. False when it is gone -- discarded, revoked or never kept -- and then NOTHING is
     written: an update must never bring back a login that was removed."""
     acct = account(root, sid)
-    rec = _read_meta(acct)
-    if rec is None:
-        return False
-    _write_meta(acct, dict(rec, **fields))
+    with _locked():
+        rec = _read_meta(acct)
+        if rec is None:
+            return False
+        _write_meta(acct, _merge(rec, fields))
     return True
+
+
+def reserve_block(root, sid, n):
+    """Hand the next `n` seqs of this session to the caller -- durably, BEFORE it seals anything in them (write-ahead). (lo, hi): every seq in
+    [lo, hi) is the caller's alone and was never handed out before; None when the login is gone. OSError when it cannot be written, and
+    the caller then seals nothing outside the block it already holds. A frame's nonce is only sender tag || seq, so a seq sealed twice
+    under one key is a nonce reused: the block is the one thing standing between a killed client and that."""
+    acct = account(root, sid)
+    with _locked():
+        rec = _read_meta(acct)
+        if rec is None:
+            return None
+        lo = rec.get("hmd_seq")
+        if not isinstance(lo, int) or isinstance(lo, bool) or lo < 0:
+            raise OSError("the stored seq mark is not usable")
+        _write_meta(acct, _merge(rec, {"hmd_seq": lo + n, "last_alive": int(time.time())}))
+    return lo, lo + n
 
 
 def discard(root, sid):
     """Remove a login, its Keychain item included."""
+    _discard_unlocked(root, sid)
+
+
+def _discard_unlocked(root, sid):
     acct = account(root, sid)
     rec = _read_meta(acct)
     if rec is not None and rec.get("secret_in") == "keychain":
@@ -218,24 +273,33 @@ def _held(root, pid):
     return _sibling("hmd_devices").client_alive(pid, os.path.realpath(root))
 
 
-def load_resumable(root, relay):
-    """The newest login of this repo, on this relay, that may be resumed -- its client last alive within HMD_SESSION_RESUME_H and no
-    other client holding it -- with its secret ({"token","priv"}) in it; None when there is none. A login past the limit, or whose secret
-    is gone, is discarded here: the phone pairs again."""
+def load_resumable(root, relay, reserve=SEQ_BLOCK):
+    """CLAIM the newest login of this repo, on this relay, that may be resumed -- its client last alive within HMD_SESSION_RESUME_H and no
+    other client holding it -- under the store lock: its secret ({"token","priv"}) and the seq block [seq_lo, seq_hi) the new client owns
+    come back with it, and the block is durable before this returns. It starts one whole block above the stored high-water: a block
+    whose write a power cut lost may still have been used, so the next client skips one. None when there is none. A login past the limit,
+    or whose secret is gone, is discarded here: the phone pairs again."""
     limit = resume_limit_s()
-    for rec in records(root):
-        if not _same_relay(rec.get("relay"), relay):
-            continue
-        if time.time() - float(rec.get("last_alive") or 0) > limit:
-            discard(root, rec["session_id"])
-            continue
-        if _held(root, rec.get("pid")):
-            continue
-        secret = secret_of(root, rec)
-        if secret is None:
-            discard(root, rec["session_id"])
-            continue
-        return dict(public(rec), **secret)
+    with _locked():
+        for rec in records(root):
+            if not _same_relay(rec.get("relay"), relay):
+                continue
+            if time.time() - float(rec.get("last_alive") or 0) > limit:
+                _discard_unlocked(root, rec["session_id"])
+                continue
+            if _held(root, rec.get("pid")):
+                continue
+            secret = secret_of(root, rec)
+            if secret is None:
+                _discard_unlocked(root, rec["session_id"])
+                continue
+            mark = rec.get("hmd_seq")
+            if not isinstance(mark, int) or isinstance(mark, bool) or mark < 0:
+                continue
+            lo = mark + reserve
+            _write_meta(account(root, rec["session_id"]),
+                        _merge(rec, {"hmd_seq": lo + reserve, "pid": os.getpid(), "last_alive": int(time.time())}))
+            return dict(public(rec), seq_lo=lo, seq_hi=lo + reserve, **secret)
     return None
 
 

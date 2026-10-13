@@ -310,8 +310,10 @@ event or a log.
 
 SESSION RESUME (bin/lib/hmd_session_login.py owns every rule; operator decision, 2.4.8: a stopped laptop client must not unpair the phone).
 Once a phone is bound the client stores the login its relay session is attached with -- the bearer token, the hmd private key, the
-phone's public key, and two seq marks: hmd_seq, a CEILING above every seq sent (reserved SEQ_RESERVE ahead, moved on before it is
-reached) and last_device_seq, the replay guard -- OUTSIDE the repo: the macOS Keychain (written over `security -i` stdin, never argv),
+phone's public key, and two seq marks: hmd_seq, the high-water of the seq BLOCKS handed out (a frame's nonce is only sender tag || seq, so
+a seq is never sealed twice under one key: a block of SEQ_RESERVE / HMD_SESSION_SEQ_RESERVE seqs is durable BEFORE anything is sealed in
+it, a client seals only inside a block it holds -- nothing at all when the next cannot be reserved -- and a resume starts a block above
+the high-water; the phone needs only a seq above the last it accepted) and last_device_seq, the replay guard -- OUTSIDE the repo: the macOS Keychain (written over `security -i` stdin, never argv),
 else a 0600 file under $HEIMDALL_HOME. A SIGTERM, Ctrl-C, SIGKILL or crash does NOT revoke it (session_ended reason "stopped"); a client
 started with --resume (`hmd app connect` and its respawns pass it) attaches to the SAME relay session -- no /pair/init, the phone is not
 asked to pair again -- derives the key from what it stored, sends a full state frame at once and emits {"event":"session_resumed"}. That
@@ -666,6 +668,13 @@ ACK_MIN_ATTEMPT_S = 0.5
 STALE_REFUSAL_BURST = 8
 STALE_REFUSAL_WINDOW_S = 1.0
 STALE_REFUSAL_MEMORY = 256
+
+# HMD_SESSION_SEQ_RESERVE (default 1000): how many seqs the stored session login hands this client at a time (SESSION RESUME, and the
+# seq blocks above RelayClient.SEQ_RESERVE). Overridable so a test can cross a block boundary in a few frames.
+try:
+    _SEQ_RESERVE = min(max(int(os.environ.get("HMD_SESSION_SEQ_RESERVE", "1000")), 4), 1000000)
+except (TypeError, ValueError):
+    _SEQ_RESERVE = 1000
 
 # State retry (see STATE FRAMES in the module docstring): a state POST that got no
 # usable answer is re-sent by the next tick, after the next of these waits -- 250 ms,
@@ -1492,11 +1501,18 @@ class RelayClient:
             emit({"event": "error", "detail": "device record not removed: %s" % e})
 
     # -- the stored login (bin/lib/hmd_session_login.py; SESSION RESUME in the module docstring) --------------------------------
-    SEQ_RESERVE = 1000  # seqs the stored login reserves ahead: a resumed client starts at its ceiling, so it never repeats a seq
+    # SEQ BLOCKS. A frame's nonce is only sender tag || seq, so a seq must never be sealed twice under one key -- not by a client the kill
+    # -9 stopped half way, and not by the one that resumes after it. The stored login hands out blocks of SEQ_RESERVE seqs, durably,
+    # BEFORE anything is sealed in them (reserve_block, under the store lock); this client seals only inside a block it holds (_seq_limit
+    # is the end of the last), asks for the next within half a block of the end, and when it cannot get it seals NOTHING more: a refused
+    # frame is retried like any frame that got no answer, a repeated nonce cannot be taken back. The phone needs only a seq above the last
+    # it accepted (INV-14), so the jump from one client to the next costs it nothing.
+    SEQ_RESERVE = _SEQ_RESERVE
     # Class-level like _device_id above: a client built without __init__ keeps no login, and a stop of it revokes as it always did.
     _login_kept = False
     _login_failing = False
-    _seq_ceiling = 0
+    _seq_refusing = False
+    _seq_limit = 0
 
     def _keep_login(self):
         """A phone just bound: keep the login this session is attached with, OUTSIDE the repo, so that a stopped client can be resumed and
@@ -1504,36 +1520,58 @@ class RelayClient:
         session as before: never a session that nobody can resume and nobody can end."""
         if LOGIN_STORE is None or self._login_kept or self.session_key is None:
             return
-        self._seq_ceiling = self.hmd_seq + self.SEQ_RESERVE
+        block_end = self.hmd_seq + self.SEQ_RESERVE  # the first block is this client's from here on: [hmd_seq, block_end)
         try:
             LOGIN_STORE.save(self.root, self.relay_url, self.session_id,
                              {"token": self.token, "priv": base64.b64encode(self.priv).decode("ascii")},
                              pub=base64.b64encode(self.pub).decode("ascii"), device_pub=base64.b64encode(self.device_pub).decode("ascii"),
                              device_id=self._device_id, device_meta=self._device_meta, bound_at=self.bound_at,
-                             hmd_seq=self._seq_ceiling, last_device_seq=self.last_device_seq, pid=os.getpid())
+                             hmd_seq=block_end, last_device_seq=self.last_device_seq, pid=os.getpid())
         except OSError as e:
             emit({"event": "error", "detail": "session login not kept (%s): this client cannot be resumed, and stopping it revokes its "
                                               "session" % e})
             return
         self._login_kept = True
+        self._seq_limit = block_end
 
     def _login_update(self, **fields):
-        """Refresh the stored login (last alive, the seq marks). Never brings back a login a disconnect removed."""
+        """Refresh the stored login (last alive, the replay mark). True when it was written; False when it could not be, or is gone (a
+        disconnect removed it -- an update never brings one back)."""
         if not self._login_kept or LOGIN_STORE is None:
-            return
+            return False
         try:
-            LOGIN_STORE.update(self.root, self.session_id, last_alive=int(time.time()), pid=os.getpid(), **fields)
-            self._login_failing = False
+            written = LOGIN_STORE.update(self.root, self.session_id, last_alive=int(time.time()), pid=os.getpid(), **fields)
         except OSError as e:
             if not self._login_failing:  # one `error` event per outage, not one per refresh
                 self._login_failing = True
                 emit({"event": "error", "detail": "session login not refreshed: %s" % e})
+            return False
+        self._login_failing = False
+        return written
 
-    def _reserve_seq(self):
-        """Under self.lock, right after a seq was taken: well before the ceiling the stored login holds is reached, move it on."""
-        if self._login_kept and self.hmd_seq >= self._seq_ceiling - self.SEQ_RESERVE // 2:
-            self._seq_ceiling = self.hmd_seq + self.SEQ_RESERVE
-            self._login_update(hmd_seq=self._seq_ceiling)
+    def _seq_available(self):
+        """Under self.lock: may the next seq be sealed? Only inside a block the stored login has durably handed to this client. Within half
+        a block of the end the next one is asked for (a failure then costs nothing yet); at the end with none held, nothing is sealed."""
+        if not self._login_kept:
+            return True
+        if self.hmd_seq >= self._seq_limit - self.SEQ_RESERVE // 2:
+            self._extend_seq_block()
+        return self.hmd_seq < self._seq_limit
+
+    def _extend_seq_block(self):
+        try:
+            block = LOGIN_STORE.reserve_block(self.root, self.session_id, self.SEQ_RESERVE)
+        except OSError as e:
+            block = None
+            if not self._login_failing:
+                self._login_failing = True
+                emit({"event": "error", "detail": "seq block not reserved: %s" % e})
+        if block is None:
+            return
+        self._login_failing = False
+        lo, hi = block
+        self.hmd_seq = max(self.hmd_seq, lo)  # another holder of this login took the blocks in between: ours starts past them
+        self._seq_limit = hi
 
     def _discard_login(self):
         """The session is over for good -- the relay ended it, or refused this login: the stored login goes with it."""
@@ -1553,7 +1591,7 @@ class RelayClient:
         if LOGIN_STORE is None:
             return False
         try:
-            rec = LOGIN_STORE.load_resumable(self.root, self.relay_url)
+            rec = LOGIN_STORE.load_resumable(self.root, self.relay_url, self.SEQ_RESERVE)
         except OSError as e:
             emit({"event": "error", "detail": "stored session login unreadable: %s" % e})
             return False
@@ -1563,18 +1601,16 @@ class RelayClient:
             priv, pub = base64.b64decode(rec["priv"], validate=True), base64.b64decode(rec["pub"], validate=True)
             device_pub = E2E.pub_from_b64(rec["device_pub"])
             session_key = E2E.derive_session_key(priv, device_pub, rec["session_id"])
-            ceiling, last_device_seq = int(rec["hmd_seq"]), int(rec.get("last_device_seq") or 0)
+            seq_lo, seq_hi, last_device_seq = int(rec["seq_lo"]), int(rec["seq_hi"]), int(rec.get("last_device_seq") or 0)
         except (KeyError, TypeError, ValueError, E2E.E2EError) as e:
             emit({"event": "error", "detail": "stored session login unusable (%s) -- discarded, pairing afresh" % e})
             LOGIN_STORE.discard(self.root, rec.get("session_id"))
             return False
         self.session_id, self.token = rec["session_id"], rec["token"]
         self.priv, self.pub, self.device_pub, self.session_key = priv, pub, device_pub, session_key
-        self.hmd_seq, self.last_device_seq = ceiling, last_device_seq
+        self.hmd_seq, self._seq_limit, self.last_device_seq = seq_lo, seq_hi, last_device_seq  # the block load_resumable made durable
         self.paired, self.bound_at = True, rec.get("bound_at")
         self._login_kept = True
-        self._seq_ceiling = ceiling + self.SEQ_RESERVE
-        self._login_update(hmd_seq=self._seq_ceiling)
         self._device_id = rec.get("device_id")
         self._device_meta = rec.get("device_meta") or {"label": "unnamed device", "gh_login": "unknown", "via": "qr"}
         old = next((r for r in DEVICES.records(self.root) if r["id"] == self._device_id), None) if DEVICES is not None else None
@@ -1726,9 +1762,15 @@ class RelayClient:
             if not is_ack:
                 while self._acks_in_flight:
                     self._acks_idle.wait()
+            if not self._seq_available():
+                if not self._seq_refusing:
+                    self._seq_refusing = True
+                    emit({"event": "error", "detail": "no seq block from the stored session login: sealing nothing until one is reserved "
+                                                      "(a nonce must never repeat under one key)"})
+                return None, None  # no usable answer: a state frame is retried by the next tick, like any frame the relay did not take
+            self._seq_refusing = False
             seq = self.hmd_seq
             self.hmd_seq += 1
-            self._reserve_seq()
             nonce, ciphertext = E2E.seal(self.session_key, seq, "hmd", plaintext)
             if is_ack:
                 self._acks_in_flight += 1
