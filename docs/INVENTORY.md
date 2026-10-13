@@ -373,6 +373,7 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `edit-tracker` (+ `.c`) | PostToolUse edit ledger; autocommit trigger; tool-loop detector |
 | `parallelism-tracker` (+ `.c`, `build-tracker.sh`) | counts solo turns; parallelism grade; loop detector (`HMD_LOOP_THRESHOLD`) |
 | `heimdall-state` | CRUD on `heimdall-state.json` (quality gates, phase) |
+| `heimdall-repo-checks` | a repo's OWN declared checks (`.heimdall/repo-checks.json`), run and recorded as a receipt bound to commit, tree and declaration (`run`, `status`); what the push gate passes a non-sweep repo on. `bin/lib/hmd_push_target.py` is the resolver that names the repo(s) a push goes to (asked of git) and their class: sweep / repo-checks / unmanaged, fail closed |
 | `heimdall-checkpoint` | mechanical, LLM-free auto-save of forward session state |
 | `heimdall-precompact-checkpoint` | PreCompact entry point driving `heimdall-checkpoint` |
 | `heimdall-autocommit` | shared mechanics for the two automatic checkpoint commits |

@@ -79,6 +79,23 @@ heimdall-state check-quality-gates
 
 This exits with code 2 (blocking the push) if any gate fails. The error message tells the user which gates failed.
 
+**Which gate runs is chosen per repository pushed** (2026-10-13), not by the session's cwd. The hook asks
+`bin/lib/hmd_push_target.py` which repositories the command pushes (the cwd, a `-C <dir>` chain, `cd <dir> && ...`,
+subshells, wrappers, `sh -c`; git itself names the git directory) and gives each the gate its class owes:
+
+| Class | Marker | Gate |
+|---|---|---|
+| sweep | `<toplevel>/test/run-all.sh` names `last-sweep.json` (heimdall's own sweep regime; tracked code, never the receipt) | `heimdall-state check-quality-gates`, run inside that repo: unchanged, fail closed |
+| repo-checks | `.heimdall/repo-checks.json` declares the repo's own checks | passes ONLY on a green, current, clean-tree receipt of them bound to the commit, its tree and the declaration (`bin/heimdall-repo-checks run` writes it, `status` verifies it); stale, red, dirty, missing, mismatched or invalid blocks and names the runner command |
+| unmanaged | neither, and git positively resolved the repo | one `WARNING` line on stderr; the push proceeds |
+
+Anything uncertain (a command that cannot be read in full, a target held in a variable or missing, an unknown git
+option or subcommand, a `GIT_*` variable set in a way that is not modelled, a marker that is unreadable or tracked yet
+missing from disk) is the **sweep** class on the repo resolved, else on the cwd: never a warning. The secret scan,
+self-scan, oracle and corpus stages are not part of this rule and are not relaxed. The repo-checks receipt is a
+cooperating-agent control, not a security boundary against someone who can write it, exactly like `last-sweep.json`.
+See `CLAUDE.md` "Push gate" and `test/heimdall-push-gate-per-repo.test.sh`.
+
 ## Manual Override
 
 At autonomy level 3, if the user explicitly says "push anyway" or "force push", the main agent can bypass gates by running:

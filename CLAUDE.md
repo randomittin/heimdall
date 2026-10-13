@@ -200,6 +200,54 @@ group, and only where the SAME check fires twice for one action.
   be a real gate weakening, so the dedup guard explicitly excludes it.
   See `hooks/hooks.json` (the guard) and `test/pre-push-gate-dedup.test.sh` (the proof).
 
+## Push gate: each repo's own checks, not heimdall's (2026-10-13)
+The PreToolUse push chain (`bin/heimdall-precheck-bash`) used to run heimdall's sweep gate
+(`heimdall-state check-quality-gates`: the state booleans, the lint receipt and
+`.heimdall/receipts/last-sweep.json`) in the session's cwd for ANY push, so a push of another repo
+(the site, with six gates of its own) was blocked for lacking a receipt only heimdall's
+`test/run-all.sh` can write. Operator rule, verbatim: *run each repo's own checks, not heimdall's; a
+repo with its own record of passing checks passes on that record; a repo hmd doesn't manage gets a
+warning but isn't blocked; don't drop the gate altogether.* The gate is now chosen per repo pushed:
+
+- **Which repo.** `bin/lib/hmd_push_target.py` reads the command the way a shell does (the cwd,
+  `git -C <dir>` chains, `cd <dir> && ...`, subshells, wrappers, `sh -c`, `export GIT_DIR=...`) and
+  asks **git itself** which git directory each push operates on: the same options and `GIT_*`
+  environment go to `git rev-parse`, and the work tree root it finds is checked from the other end.
+  `--work-tree` / `GIT_WORK_TREE` cannot point a push at a decoy, and a subdirectory or linked
+  worktree of heimdall is heimdall.
+- **(a) sweep.** Marker: `<toplevel>/test/run-all.sh` is a regular file that names `last-sweep.json`
+  (heimdall's own sweep regime; that script writes the receipt `check-quality-gates` reads). The marker
+  is tracked code, never the receipt, so deleting a receipt cannot downgrade a repo, and another
+  project's `test/run-all.sh` is not mistaken for it. The old gate, unchanged and fail closed, now run
+  inside that repo (a cwd in a subdirectory reads the toplevel's state).
+- **(b) repo-checks.** `<repo>/.heimdall/repo-checks.json` = `{"schema":1,"checks":[{"name","cmd"}]}`.
+  `bin/heimdall-repo-checks run [--repo PATH]` runs each check from the repo root, in order, and writes
+  `<repo>/.heimdall/receipts/repo-checks.json` atomically. The gate passes ONLY on a receipt that is
+  green, for the HEAD being pushed, recorded on a tree with no uncommitted tracked changes, bound to the
+  commit (`head_sha`), its tree (`tree_sha`) and the declaration's bytes (`decl_sha256`) (all three
+  recomputed by the gate), and listing exactly the declared checks. Stale, red, dirty, missing,
+  mismatched, invalid, or an absent runner blocks, and the block names the runner command (`status
+  [--repo PATH]` prints the verdict). The hook reads the receipt and never re-runs a repo's commands.
+  Track `repo-checks.json`, gitignore `.heimdall/receipts/`.
+- **(c) unmanaged.** One `WARNING` line on stderr, exit 0, and only for a repo git resolved AND that
+  positively carries neither marker.
+- **Fail closed.** Anything uncertain is class (a) on the repo resolved, else on the cwd, never a
+  warning: a command it cannot read in full, a target held in a variable or missing, a git option or
+  subcommand it does not know (an alias may be a push), a `GIT_*` variable set in a way it does not
+  model, a sourced script, a cwd that is not a repo, a marker that is present but unreadable or tracked
+  yet missing from disk (a sparse or no-checkout worktree). A resolver that is missing or crashes means
+  the old sweep gate on the cwd. Best effort, said plainly: shell cannot be read completely, so the
+  native hook (`core.hooksPath`) stays the hard backstop.
+- **A cooperating-agent control, not a security boundary.** Like `last-sweep.json`, the repo-checks
+  receipt is a plain local file: the binding catches stale, copied, mismatched and
+  hand-edited-by-accident receipts, not someone who can write the file and its hashes.
+- **Not relaxed.** The push-range secret scan, the full-history self-scan, the oracle and corpus
+  stages, the commit secret gate, git-guard and the kill guard are not part of this rule: they run as
+  before and still read the session's cwd repo. Proof: `test/heimdall-push-gate-per-repo.test.sh`
+  (classes, forged receipts, fail-closed, a differential against git itself) and
+  `test/heimdall-push-gate-target-repo.test.sh` (the operator's case: the session is in heimdall and
+  the push goes to X by `cd X && ...`, by `-C X`, or from X itself, each graded on X's own record).
+
 ## Model routing (2026-08-11 directive)
 - **Main Claude Code agent: never pinned.** It runs on the user's own default. hmd
   does not hardcode opus — or anything else — for the main agent.
