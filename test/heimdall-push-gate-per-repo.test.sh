@@ -15,31 +15,44 @@
 # warning but isn't blocked. Don't drop the gate altogether."
 #   target   the repo the push goes to, ASKED OF GIT: the cwd, `git -C <dir>`, `cd <dir> && ...`, --git-dir, GIT_DIR, a linked
 #            worktree, a subdirectory -- git names the git directory the push operates on, and the work tree root is checked back
+#   class    read from the COMMITS a push can carry (HEAD, its upstream @{u}/@{push}, origin/HEAD, origin/<branch>, the refspecs
+#            named) with `git ls-tree` / `git cat-file`, never from the work tree, and the STRICTEST class over them wins
 #   (a) sweep        the repo carries heimdall's sweep regime (test/run-all.sh naming last-sweep.json)
 #                    -> the old gate, unchanged, fail closed
 #   (b) repo-checks  .heimdall/repo-checks.json declares the repo's own checks -> passes ONLY on a
 #                    green, current, clean-tree receipt (.heimdall/receipts/repo-checks.json) bound to the
 #                    commit, its tree and the declaration it was recorded for
-#   (c) unmanaged    one WARNING line on stderr, exit 0 -- ONLY for a repository git resolved AND that positively carries none
-#                    of heimdall's markers. Anything uncertain (a command it cannot read in full, a variable or missing target,
-#                    a git option or subcommand it does not know -- an alias may be a push --, a GIT_* variable set in a way it
-#                    does not model, a repository git cannot place, a marker that is present but unreadable or tracked yet missing
-#                    from disk) is the strict class (a) on the repo resolved, else the cwd: never down to a warning.
+#   (c) unmanaged    one WARNING line on stderr, exit 0 -- ONLY when the command was understood EXACTLY, git resolved the repository
+#                    AND no commit inspected has either marker. Any construct not modelled exactly (a `cd` that is dynamic, `cd -`,
+#                    through CDPATH or inside if/for/case/{ }, a function, `source`, `alias`, a script piped to a shell, an expansion
+#                    hiding a substitution, find -exec ... git push, xargs handing over the subcommand, a git option or subcommand it
+#                    does not know -- an alias may be a push --, an unmodelled GIT_* variable, a repository git cannot place, a marker
+#                    that cannot be inspected) makes the whole command uncertain, and then EVERY repo involved gets the strict class (a).
 # Secret / self-scan gates are not part of this rule and are not relaxed (section D proves it).
 #
 # Everything here runs in throwaway repos under one mktemp dir, removed on exit. The hook is the
 # REAL bin/heimdall-precheck-bash with a fake plugin root around it (fake heimdall-state that
 # records where and whether it was called, fake secret-scan); no real push is ever made.
 #
-#   A  bin/heimdall-repo-checks  run / status, receipt binding, forged and mismatched receipts
-#   B  bin/lib/hmd_push_target.py  (the target resolver + classifier): classes, forms, fail-closed, git differential
+#   A  bin/heimdall-repo-checks  run / status, receipt binding, forged and mismatched receipts, and the ONE receipt definition
+#      (bin/lib/hmd_repo_receipt.py): a receipt `run` writes passes, every field mutated on its own fails
+#   B  bin/lib/hmd_push_target.py  (the target resolver + classifier): classes, forms, fail-closed, git differential,
+#      the parse model (substitutions, eval, sh -c, xargs, pushd, chains of cd, cd - / ~ / "$VAR"), classes from commits
 #   C  the hook: each class, target != cwd, multi-target, downgrade attempts, forged receipts, resolver missing
 #   D  security gates stay on
+#
+# Proofs worth knowing by name: A7 (one receipt definition, every field mutated alone), A8 (a receipt attests ONE commit), A9 (a corrupt record is
+# never green), B "the class is read from the COMMITS" (an uncommitted marker edit or deletion changes nothing; HEAD, @{u}, origin and the
+# refspecs, strictest wins), B "the shell differential" (every corpus command is RUN by real bash and zsh with a recording git, and the
+# repositories the pushes really went to are compared with the resolver's answer), B "EVERY error path is strict" (a git that fails, prints
+# nonsense or hangs at each call the resolver makes), C40-C43 (refspecs vs the receipt), C44-C48 (the hook's own error paths).
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RC_BIN="$REPO/bin/heimdall-repo-checks"
 HELPER="$REPO/bin/lib/hmd_push_target.py"
+RC_PY="$REPO/bin/lib/hmd_repo_checks.py"          # the runner/gate behind the launcher
+RC_DEF="$REPO/bin/lib/hmd_repo_receipt.py"        # the ONE definition of the receipt
 HOOK="$REPO/bin/heimdall-precheck-bash"
 
 PASS=0
@@ -61,7 +74,8 @@ ZERO64="0000000000000000000000000000000000000000000000000000000000000000"
 new_repo() {  # new_repo <name> -> physical path of a fresh repo with one commit
   local d="$W/repos/$1"
   mkdir -p "$d"
-  ( cd "$d" && git init -q && git config user.email t@t && git config user.name t && git config commit.gpgsign false \
+  # the branch is main: `push origin main` names a ref that exists, as it does in a real checkout (an unknown refspec is strict)
+  ( cd "$d" && git init -q && git symbolic-ref HEAD refs/heads/main && git config user.email t@t && git config user.name t && git config commit.gpgsign false \
       && printf 'v1\n' > file.txt && printf '.heimdall/receipts/\n' > .gitignore && git add -A && git commit -q -m init )
   ( cd "$d" && pwd -P )
 }
@@ -101,11 +115,13 @@ receipt_of() { printf '%s/.heimdall/receipts/repo-checks.json' "$1"; }
 section "0. the pieces exist and parse"
 [ -x "$RC_BIN" ] && ok "0a. bin/heimdall-repo-checks is executable" || bad "0a. bin/heimdall-repo-checks missing or not executable"
 bash -n "$RC_BIN" 2>/dev/null && ok "0b. bash -n bin/heimdall-repo-checks" || bad "0b. bin/heimdall-repo-checks does not parse"
-if python3 -I -S -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$HELPER" 2>/dev/null; then
-  ok "0c. bin/lib/hmd_push_target.py parses"
-else
-  bad "0c. bin/lib/hmd_push_target.py missing or does not parse"
-fi
+for py in "$HELPER" "$RC_PY" "$RC_DEF"; do
+  if python3 -I -S -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$py" 2>/dev/null; then
+    ok "0c. ${py#"$REPO"/} parses"
+  else
+    bad "0c. ${py#"$REPO"/} missing or does not parse"
+  fi
+done
 bash -n "$HOOK" 2>/dev/null && ok "0d. bash -n bin/heimdall-precheck-bash" || bad "0d. bin/heimdall-precheck-bash does not parse"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -171,11 +187,15 @@ status_of "$A3"
 A3B="$(mk_checks a3b "$(decl_json touches 'echo changed > file.txt')")"
 run_checks "$A3B"
 jq -e '.dirty == true' "$(receipt_of "$A3B")" >/dev/null 2>&1 && ok "A3b. a check that modifies a tracked file leaves dirty:true" || bad "A3b. tree dirtied by a check not recorded"
-# A3c. ...and so does a check that rewrites its own declaration (here an untracked one, so only the declaration hash can tell)
-A3C="$(new_repo a3c)"; mkdir -p "$A3C/.heimdall"
-decl_json rewrites 'jq . .heimdall/repo-checks.json > .heimdall/tmp.json && cp .heimdall/tmp.json .heimdall/repo-checks.json' > "$A3C/.heimdall/repo-checks.json"
+# A3c. ...and so does a check that rewrites its own declaration
+A3C="$(mk_checks a3c "$(decl_json rewrites 'jq . .heimdall/repo-checks.json > .heimdall/tmp.json && cp .heimdall/tmp.json .heimdall/repo-checks.json')")"
 run_checks "$A3C"
 jq -e '.dirty == true' "$(receipt_of "$A3C")" >/dev/null 2>&1 && ok "A3c. a check that rewrites the declaration it ran under leaves dirty:true" || bad "A3c. declaration rewritten by a check not recorded" "$(head -c 300 "$(receipt_of "$A3C")")"
+# A3d. a declaration that is not committed is not what a push carries: the checks run, the receipt is dirty, and status refuses (HEAD declares nothing)
+A3D="$(new_repo a3d)"; mkdir -p "$A3D/.heimdall"; printf '%s\n' "$GREEN_DECL" > "$A3D/.heimdall/repo-checks.json"
+run_checks "$A3D"
+{ [ "$RCRC" = 0 ] && jq -e '.dirty == true' "$(receipt_of "$A3D")" >/dev/null 2>&1; } && ok "A3d. an uncommitted declaration: the checks run, the receipt records dirty:true" || bad "A3d. uncommitted declaration" "rc=$RCRC $(head -c 300 "$(receipt_of "$A3D")")"
+bash "$RC_BIN" status --repo "$A3D" >"$W/o" 2>&1; { [ "$?" = 2 ] && grep -q 'repo-checks.json' "$W/o"; } && ok "A3d. ...and status refuses: the commit declares no checks" || bad "A3d. status of an uncommitted declaration" "$(cat "$W/o")"
 
 # A4. status verdicts on crafted receipts (each mutation of a fresh green one)
 A4="$(mk_checks a4 "$GREEN_DECL")"
@@ -210,18 +230,25 @@ jq -n --arg h "$HEAD_A4" --slurpfile g "$W/a4.green" '{schema:1, head_sha:$h, di
 expect_status "A4. FORGED: hand-written exit_code 0 for the current commit, declared checks, no tree_sha/decl_sha256 -> NOT GREEN" 1 'tree'
 jq -n --arg h "$HEAD_A4" --arg t "$TREE_A4" --arg z "$ZERO64" --slurpfile g "$W/a4.green" '{schema:1, head_sha:$h, tree_sha:$t, dirty:false, exit_code:0, decl_sha256:$z, finished_at:"2026-10-13T00:00:00Z", checks:$g[0].checks}' > "$(receipt_of "$A4")"
 expect_status "A4. FORGED: right commit and tree, a declaration hash guessed wrong -> NOT GREEN" 1 'declaration'
-# the declaration, byte for byte: the same checks reformatted are not the declaration the receipt was recorded for
+# the verdict is the COMMIT's: an uncommitted edit of the declaration on disk changes nothing about what a push carries
 jq . "$W/a4.decl" > "$A4/.heimdall/repo-checks.json"
-status_of "$A4"; { [ "$STRC" = 1 ] && grep -qi 'declaration changed' <<<"$STOUT"; } && ok "A4. the same checks, reformatted -> NOT GREEN (the receipt is bound to the declaration's bytes)" || bad "A4. reformatted declaration accepted" "rc=$STRC $STOUT"
+status_of "$A4"; [ "$STRC" = 0 ] && ok "A4. an uncommitted edit (reformatting) of the declaration on disk does not change the verdict: the commit is what is pushed" || bad "A4. uncommitted declaration edit changed the verdict" "$STOUT"
+printf '%s\n' "$(decl_json z 'true')" > "$A4/.heimdall/repo-checks.json"
+status_of "$A4"; [ "$STRC" = 0 ] && ok "A4. ...also an uncommitted edit that names other checks" || bad "A4. uncommitted edit of the check list changed the verdict" "$STOUT"
 cp "$W/a4.decl" "$A4/.heimdall/repo-checks.json"
-status_of "$A4"; [ "$STRC" = 0 ] && ok "A4. ...and the original bytes restored -> GREEN again" || bad "A4. restored declaration is not green" "$STOUT"
-# a commit after the run stales it; an edited declaration voids it
+# a commit after the run stales it
 printf 'v2\n' > "$A4/file.txt"; commit_all "$A4" "after the run"
 status_of "$A4"; { [ "$STRC" = 1 ] && grep -qi 'stale' <<<"$STOUT"; } && ok "A4. a commit after the run -> STALE" || bad "A4. commit after run not stale" "rc=$STRC $STOUT"
 run_checks "$A4"; status_of "$A4"; [ "$STRC" = 0 ] && ok "A4. re-run at the new HEAD -> GREEN again" || bad "A4. re-run did not turn green" "$STOUT"
-cp "$(receipt_of "$A4")" "$W/a4.green"
-jq '.checks[0].cmd = "true"' "$A4/.heimdall/repo-checks.json" > "$W/decl.edited" && cp "$W/decl.edited" "$A4/.heimdall/repo-checks.json"
-status_of "$A4"; { [ "$STRC" = 1 ] && grep -qi 'declaration' <<<"$STOUT"; } && ok "A4. declaration edited after the run -> NOT GREEN (the receipt is for other checks)" || bad "A4. edited declaration not detected" "rc=$STRC $STOUT"
+# the declaration AS COMMITTED, byte for byte: the same checks reformatted and committed, the receipt re-pointed at the new commit and tree
+A4B="$(mk_checks a4b "$GREEN_DECL")"; run_checks "$A4B"; cp "$(receipt_of "$A4B")" "$W/a4b.green"
+jq . "$A4B/.heimdall/repo-checks.json" > "$W/a4b.decl" && cp "$W/a4b.decl" "$A4B/.heimdall/repo-checks.json"; commit_all "$A4B" "reformat the declaration"
+jq --arg h "$(git -C "$A4B" rev-parse HEAD)" --arg t "$(git -C "$A4B" rev-parse 'HEAD^{tree}')" '.head_sha = $h | .tree_sha = $t' "$W/a4b.green" > "$(receipt_of "$A4B")"
+status_of "$A4B"; { [ "$STRC" = 1 ] && grep -qi 'declaration changed' <<<"$STOUT"; } && ok "A4. the same checks, reformatted and COMMITTED -> NOT GREEN (the receipt is bound to the committed declaration's bytes)" || bad "A4. reformatted committed declaration accepted" "rc=$STRC $STOUT"
+A4C="$(mk_checks a4c "$GREEN_DECL")"; run_checks "$A4C"; cp "$(receipt_of "$A4C")" "$W/a4c.green"
+printf '%s\n' "$(decl_json only 'true')" > "$A4C/.heimdall/repo-checks.json"; commit_all "$A4C" "other checks"
+jq --arg h "$(git -C "$A4C" rev-parse HEAD)" --arg t "$(git -C "$A4C" rev-parse 'HEAD^{tree}')" '.head_sha = $h | .tree_sha = $t' "$W/a4c.green" > "$(receipt_of "$A4C")"
+status_of "$A4C"; { [ "$STRC" = 1 ] && grep -qi 'declaration' <<<"$STOUT"; } && ok "A4. a receipt for the old checks, re-pointed at a commit that declares other ones -> NOT GREEN" || bad "A4. old receipt accepted for new checks" "rc=$STRC $STOUT"
 
 # A5. refusals and usage
 NODECL="$(new_repo nodecl)"
@@ -250,6 +277,126 @@ bash "$RC_BIN" --help >"$W/o" 2>&1; { [ "$?" = 0 ] && grep -q 'repo-checks.json'
 A6="$(mk_checks a6 "$GREEN_DECL")"
 HMD_TEST_TOKEN='tok-9f3a1c-do-not-leak' GH_TOKEN='ghp_do_not_leak_0123456789' ORDER="$W/order.log" bash "$RC_BIN" run --repo "$A6" >"$W/rc.out" 2>"$W/rc.err"
 if ! grep -rqE 'do-not-leak|do_not_leak' "$W/rc.out" "$W/rc.err" "$(receipt_of "$A6")"; then ok "A6. no token from the environment reaches the receipt, stdout or stderr"; else bad "A6. a token leaked into the runner's output"; fi
+
+# A7. ONE definition of the receipt (bin/lib/hmd_repo_receipt.py): a receipt `run` writes passes the gate, and every field of it
+# mutated on its own -- deleted, retyped, given a wrong value, malformed -- fails the gate. The field list is read FROM the definition,
+# so a field added there without a mutation below fails this test instead of slipping through unchecked.
+A7="$(mk_checks a7 "$GREEN_DECL")"; run_checks "$A7"; R7="$(receipt_of "$A7")"; cp "$R7" "$W/a7.green"
+status_of "$A7"; [ "$STRC" = 0 ] && ok "A7. a receipt written by run passes the gate" || bad "A7. run's own receipt does not pass the gate" "rc=$STRC $STOUT"
+DEF="$(python3 -I -S -c 'import sys; sys.path.insert(0, sys.argv[1]); import hmd_repo_receipt as m; print(" ".join(m.FIELD_NAMES)); print(" ".join(m.CHECK_FIELD_NAMES))' "$REPO/bin/lib")"
+DEF_TOP="$(sed -n 1p <<<"$DEF")"; DEF_CHK="$(sed -n 2p <<<"$DEF")"
+sorted_words() { tr ' ' '\n' | sort | tr '\n' ' '; }
+[ "$(printf '%s' "$DEF_TOP" | sorted_words)" = "$(jq -r 'keys | join(" ")' "$W/a7.green" | sorted_words)" ] \
+  && ok "A7. the top-level fields run wrote ARE the fields the definition names ($DEF_TOP)" || bad "A7. run's fields differ from the definition" "definition: $DEF_TOP | receipt: $(jq -r 'keys | join(" ")' "$W/a7.green")"
+[ "$(printf '%s' "$DEF_CHK" | sorted_words)" = "$(jq -r '.checks[0] | keys | join(" ")' "$W/a7.green" | sorted_words)" ] \
+  && ok "A7. ...and each recorded check has exactly the definition's fields ($DEF_CHK)" || bad "A7. a recorded check's fields differ from the definition" "definition: $DEF_CHK | receipt: $(jq -r '.checks[0] | keys | join(" ")' "$W/a7.green")"
+refused_after() {  # refused_after <label> <jq filter over the green receipt>
+  jq "$2" "$W/a7.green" > "$R7" 2>/dev/null; status_of "$A7"
+  if [ "$STRC" = 1 ] && grep -q 'NOT GREEN' <<<"$STOUT"; then ok "A7. $1 -> refused"; else bad "A7. $1 was NOT refused" "rc=$STRC $STOUT"; fi
+  cp "$W/a7.green" "$R7"
+}
+H1="$(printf '1%.0s' $(seq 1 40))"
+for f in $DEF_TOP; do
+  refused_after "$f deleted" "del(.$f)"
+  refused_after "$f retyped (an object where a scalar or list belongs)" ".$f = {\"x\": 1}"
+  case "$f" in
+    schema)      refused_after "schema = 2" '.schema = 2' ;;
+    head_sha)    refused_after "head_sha of another commit (well formed)" ".head_sha = \"$H1\""
+                 refused_after "head_sha upper-cased (format)" '.head_sha |= ascii_upcase'
+                 refused_after "head_sha abbreviated to 12 digits (format)" '.head_sha |= .[0:12]'
+                 refused_after "head_sha one digit too long (format)" '.head_sha |= . + "0"' ;;
+    tree_sha)    refused_after "tree_sha of another tree (well formed)" ".tree_sha = \"$H1\""
+                 refused_after "tree_sha upper-cased (format)" '.tree_sha |= ascii_upcase'
+                 refused_after "tree_sha abbreviated to 12 digits (format)" '.tree_sha |= .[0:12]' ;;
+    decl_sha256) refused_after "decl_sha256 of another declaration (well formed)" ".decl_sha256 = \"$ZERO64\""
+                 refused_after "decl_sha256 one digit short (format)" '.decl_sha256 |= .[0:63]'
+                 refused_after "decl_sha256 upper-cased (format)" '.decl_sha256 |= ascii_upcase' ;;
+    dirty)       refused_after "dirty = true" '.dirty = true'
+                 refused_after "dirty as the string \"false\" (type)" '.dirty = "false"' ;;
+    exit_code)   refused_after "exit_code = 1" '.exit_code = 1'
+                 refused_after "exit_code as the string \"0\" (type)" '.exit_code = "0"'
+                 refused_after "exit_code as the boolean false (type)" '.exit_code = false' ;;
+    finished_at) refused_after "finished_at not a timestamp (format)" '.finished_at = "yesterday"'
+                 refused_after "finished_at without the Z (format)" '.finished_at |= rtrimstr("Z")' ;;
+    checks)      refused_after "checks emptied" '.checks = []'
+                 refused_after "checks as a string (type)" '.checks = "none"' ;;
+    *)           bad "A7. the definition has a field ($f) this test has no value mutation for: add one" ;;
+  esac
+done
+for f in $DEF_CHK; do
+  refused_after "checks[0].$f deleted" "del(.checks[0].$f)"
+  refused_after "checks[0].$f retyped" ".checks[0].$f = {\"x\": 1}"
+  case "$f" in
+    name)      refused_after "checks[0].name another check's name" '.checks[0].name = "other"' ;;
+    cmd)       refused_after "checks[0].cmd another command" '.checks[0].cmd = "true"' ;;
+    exit_code) refused_after "checks[0].exit_code = 1" '.checks[0].exit_code = 1'
+               refused_after "checks[0].exit_code as a string (type)" '.checks[0].exit_code = "0"' ;;
+    secs)      refused_after "checks[0].secs negative" '.checks[0].secs = -1'
+               refused_after "checks[0].secs as a string (type)" '.checks[0].secs = "3"' ;;
+    *)         bad "A7. the definition has a check field ($f) this test has no value mutation for: add one" ;;
+  esac
+done
+refused_after "an unknown top-level field added" '.extra = 1'
+refused_after "an unknown field added to a recorded check" '.checks[0].extra = 1'
+status_of "$A7"; [ "$STRC" = 0 ] && ok "A7. ...and after all of them the untouched receipt still passes" || bad "A7. the untouched receipt no longer passes" "$STOUT"
+# the writer and the checker import the same definition; the resolver reads the declaration's path from it too
+grep -q 'rr.build_receipt' "$RC_PY" && grep -q 'rr.verify_receipt' "$RC_PY" && ! grep -q 'jq' "$RC_BIN" \
+  && ok "A7. run builds with build_receipt and status verifies with verify_receipt, both from hmd_repo_receipt (no second schema in the launcher)" || bad "A7. the writer or the checker is not on the shared definition"
+if python3 -I -S -c 'import sys; sys.path.insert(0, sys.argv[1]); import hmd_repo_receipt as r, hmd_push_target as t; sys.exit(0 if t.DECLARATION == r.DECLARATION else 1)' "$REPO/bin/lib" 2>/dev/null; then
+  ok "A7. the resolver classifies by the very declaration path the runner reads"
+else
+  bad "A7. the resolver's declaration path is not the shared one"
+fi
+
+# A8. a receipt attests ONE commit: every commit a push names as a source must be it. `status --pushes <ids>` is what the hook asks; the resolver
+# computes the ids (a refspec's source resolved by git, HEAD for a bare push, - when no commit travels, ? when the commits cannot be listed)
+A8="$(mk_checks a8 "$GREEN_DECL")"; printf 'v2\n' > "$A8/file.txt"; commit_all "$A8" second; run_checks "$A8"
+HEAD_A8="$(git -C "$A8" rev-parse HEAD)"; PREV_A8="$(git -C "$A8" rev-parse 'HEAD~1')"
+expect_pushes() {  # expect_pushes <label> <--pushes value> <want rc> <pattern>
+  bash "$RC_BIN" status --repo "$A8" --pushes "$2" >"$W/st.out" 2>&1; local rc=$?
+  if [ "$rc" = "$3" ] && grep -qiE -- "$4" "$W/st.out"; then ok "A8. $1"; else bad "A8. $1" "want rc=$3 /$4/, got rc=$rc: $(head -c 300 "$W/st.out")"; fi
+}
+expect_pushes "--pushes the receipt's own commit -> GREEN"                          "$HEAD_A8"                 0 'GREEN'
+expect_pushes "--pushes the same commit twice -> GREEN"                             "$HEAD_A8,$HEAD_A8"        0 'GREEN'
+expect_pushes "--pushes - (a push that carries no commit) -> GREEN"                 "-"                        0 'GREEN'
+expect_pushes "--pushes another commit -> NOT GREEN, says what the push carries"    "$PREV_A8"                 1 'NOT GREEN.*the push carries'
+expect_pushes "--pushes the receipt's commit and another -> NOT GREEN"              "$HEAD_A8,$PREV_A8"        1 'the push carries'
+expect_pushes "--pushes ? (not modelled) -> NOT GREEN"                              '?'                        1 'cannot be tied'
+expect_pushes "--pushes with an empty value -> NOT GREEN"                           ''                         1 'cannot be tied'
+expect_pushes "--pushes with a malformed id -> NOT GREEN"                           'not-an-id'                1 'cannot be tied'
+expect_pushes "--pushes with an abbreviated id -> NOT GREEN"                        "${HEAD_A8:0:12}"          1 'cannot be tied'
+expect_pushes "--pushes with an id and an empty element -> NOT GREEN"               "$HEAD_A8,"                1 'cannot be tied'
+bash "$RC_BIN" status --repo "$A8" >"$W/st.out" 2>&1; [ "$?" = 0 ] && ok "A8. status without --pushes is the plain question: is the receipt green and current" || bad "A8. status without --pushes" "$(cat "$W/st.out")"
+bash "$RC_BIN" run --repo "$A8" --pushes "$HEAD_A8" >"$W/st.out" 2>&1; [ "$?" = 2 ] && ok "A8. run takes no --pushes (exit 2)" || bad "A8. run accepted --pushes"
+bash "$RC_BIN" status --repo "$A8" --pushes >"$W/st.out" 2>&1; [ "$?" = 2 ] && ok "A8. --pushes without a value -> exit 2" || bad "A8. --pushes without a value"
+
+# A9. every record that cannot be read is NOT GREEN: a corrupt receipt, or one that makes the reader fail, never reads as green
+A9="$(mk_checks a9 "$GREEN_DECL")"; run_checks "$A9"; R9="$(receipt_of "$A9")"; cp "$R9" "$W/a9.green"
+corrupt_receipt() {  # corrupt_receipt <what it is> <command that prints the bad receipt>...
+  local label="$1"; shift
+  "$@" > "$R9" 2>/dev/null
+  status_of "$A9"
+  if [ "$STRC" != 0 ] && ! grep -q '^repo-checks: GREEN' <<<"$STOUT"; then ok "A9. a receipt that is $label -> not green  [rc=$STRC]"; else bad "A9. a receipt that is $label was accepted" "rc=$STRC $STOUT"; fi
+  cp "$W/a9.green" "$R9"
+}
+corrupt_receipt "empty" printf ''
+corrupt_receipt "a lone brace" printf '{'
+corrupt_receipt "an empty array" printf '[]'
+corrupt_receipt "null" printf 'null'
+corrupt_receipt "a string" printf '"x"'
+corrupt_receipt "a number" printf '0'
+corrupt_receipt "binary bytes" printf '\377\376\000\001'
+corrupt_receipt "100000 brackets deep (past the parser's recursion limit)" python3 -c 'print("[" * 100000)'
+corrupt_receipt "an object with a non-finite number" printf '{"schema":1,"checks":[{"secs":1e999}]}'
+rm -f "$R9"; mkdir "$R9"; status_of "$A9"
+{ [ "$STRC" != 0 ] && ! grep -q '^repo-checks: GREEN' <<<"$STOUT"; } && ok "A9. a receipt path that is a directory -> not green  [rc=$STRC]" || bad "A9. a receipt path that is a directory" "rc=$STRC $STOUT"
+rmdir "$R9"; cp "$W/a9.green" "$R9"
+N9=0
+for bad_decl in 'not json' '[]' 'null' '{"schema":1,"checks":"x"}' '{"schema":1,"checks":[1]}' '{"schema":"1","checks":[{"name":"a","cmd":"true"}]}' $'\xff\xfe' ''; do
+  N9=$((N9 + 1)); BD9="$(mk_checks "a9decl$N9" "$bad_decl")"
+  bash "$RC_BIN" status --repo "$BD9" >"$W/o" 2>&1; rc=$?
+  { [ "$rc" = 2 ] && ! grep -q '^repo-checks: GREEN' "$W/o"; } && ok "A9. a committed declaration that is [$(printf '%s' "$bad_decl" | head -c 24 | tr -c '[:print:]' '?')] -> status refuses  [rc=2]" || bad "A9. a committed declaration that is [$bad_decl]" "rc=$rc $(head -c 200 "$W/o")"
+done
 
 # ════════════════════════════════════════════════════════════════════════════
 section "B. bin/lib/hmd_push_target.py -- which repo, which class"
@@ -281,8 +428,22 @@ check_plan() {  # check_plan <label> <base> <command> <class:dir>...   (exact li
   local label="$1" base="$2" cmd="$3" want="" got e; shift 3
   for e in "$@"; do want="${want}${e%%:*}${TAB}${e#*:}"$'\n'; done
   # shellcheck disable=SC2086  # PLAN_ENV is a list of VAR=value words on purpose
-  got="$(printf '%s' "$cmd" | env HOME="$HOMEDIR" $PLAN_ENV python3 -I -S "$HELPER" "$base" 2>"$W/plan.err"; printf x)"; got="${got%x}"
+  # the third column (the commits a repo-checks push names, see check_sources) is not part of the class/directory comparison
+  got="$(printf '%s' "$cmd" | env HOME="$HOMEDIR" PATH="${PLAN_PATH:-$PATH}" $PLAN_ENV python3 -I -S "$HELPER" "$base" 2>"$W/plan.err" | awk -F'\t' 'BEGIN { OFS = "\t" } { print $1, $2 }'; printf x)"; got="${got%x}"
   if [ "$got" = "$want" ]; then ok "B. $label"; else bad "B. $label" "command: $cmd | want: $(printf '%s' "$want" | tr '\n\t' '|~') | got: $(printf '%s' "$got" | tr '\n\t' '|~') $(head -c 200 "$W/plan.err")"; fi
+}
+check_strict() {  # check_strict <label> <base> <command> [silent]: at least one row and EVERY row strict: sweep, or a repo-checks row for commits nobody can
+                  # list (`?`, which always blocks: a repo that declares checks keeps owing the receipt under uncertainty). `silent` also accepts no answer
+  local label="$1" base="$2" cmd="$3" mode="${4:-}" got            # at all: the hook then runs the strict gate on the cwd itself
+  got="$(printf '%s' "$cmd" | env HOME="$HOMEDIR" PATH="${PLAN_PATH:-$PATH}" $PLAN_ENV python3 -I -S "$HELPER" "$base" 2>"$W/plan.err")"
+  if [ -z "$got" ] && [ "$mode" = silent ]; then ok "B. strict: $label (no answer: the hook falls back to the strict gate on the cwd)"
+  elif [ -n "$got" ] && [ -z "$(printf '%s\n' "$got" | grep -v "^sweep${TAB}" | grep -v "^repo-checks${TAB}.*${TAB}?\$")" ]; then ok "B. strict: $label"
+  else bad "B. strict: $label" "command: $cmd | got: $(printf '%s' "$got" | tr '\n\t' '|~') $(head -c 200 "$W/plan.err")"; fi
+}
+check_sources() {  # check_sources <label> <base> <command> <the repo-checks row's third column: full ids comma-separated, - (no commit) or ? (cannot be listed)>
+  local label="$1" base="$2" cmd="$3" want="$4" got
+  got="$(printf '%s' "$cmd" | env HOME="$HOMEDIR" PATH="${PLAN_PATH:-$PATH}" $PLAN_ENV python3 -I -S "$HELPER" "$base" 2>"$W/plan.err" | awk -F'\t' '$1 == "repo-checks" { print $3; exit }')"
+  if [ "$got" = "$want" ]; then ok "B. sources: $label"; else bad "B. sources: $label" "command: $cmd | want '$want' | got '$got' $(head -c 200 "$W/plan.err")"; fi
 }
 # the three classes
 check_plan "a repo with heimdall's sweep writer is class sweep"           "$SWEEP" 'git push'                 "sweep:$SWEEP"
@@ -390,22 +551,414 @@ check_plan "a bare repository cannot be placed in a work tree -> strict"     "$P
 check_plan "text that only mentions a push -> strict on the cwd"             "$PLAIN" 'echo "git push" > /dev/null'  "sweep:$PLAIN"
 check_plan "a heredoc body is data, not a command -> nothing found -> strict" "$PLAIN" $'cat <<EOF\ngit -C '"$CHK"$' push\nEOF'  "sweep:$PLAIN"
 check_plan "empty command -> strict on the cwd"                              "$PLAIN" ''                             "sweep:$PLAIN"
-check_plan "an unreadable rest of the command adds the strict gate on the cwd" "$PLAIN" "git -C $CHK push \"never closed" "repo-checks:$CHK" "sweep:$PLAIN"
-check_plan "a resolved target plus an unresolvable one: both gated"          "$PLAIN" "git -C $CHK push && git -C \"\$X\" push" "repo-checks:$CHK" "sweep:$PLAIN"
-check_plan "an unknown git subcommand may be an alias of a push"             "$PLAIN" "git -C $CHK push && git -C $CHK pp" "repo-checks:$CHK" "sweep:$PLAIN"
+# an uncertain command gives EVERY repo involved the strict class -- the resolved ones too, whatever their own class says
+check_plan "an unreadable rest of the command: the resolved repo and the cwd both strict" "$PLAIN" "git -C $CHK push \"never closed" "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
+check_plan "a resolved target plus an unresolvable one: both strict"         "$PLAIN" "git -C $CHK push && git -C \"\$X\" push" "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
+check_plan "an unknown git subcommand may be an alias of a push"             "$PLAIN" "git -C $CHK push && git -C $CHK pp" "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
 check_plan "an alias alone: no push is seen -> strict"                       "$PLAIN" "git -c alias.pp=push -C $CHK pp" "sweep:$PLAIN"
 check_plan "a git option this does not know"                                 "$PLAIN" 'git --frobnicate push'        "sweep:$PLAIN"
 check_plan "a command name held in a variable"                               "$PLAIN" '$GIT push'                    "sweep:$PLAIN"
 check_plan "...also quoted, with an argument for the push"                   "$PLAIN" "\"\$GIT\" -C $CHK push"       "sweep:$PLAIN"
 check_plan "env -C <dir> runs git elsewhere: not followed -> strict"         "$PLAIN" "env -C $CHK git push"         "sweep:$PLAIN"
-check_plan "a sourced script may cd or export anything"                      "$PLAIN" 'source ./env.sh && git push'  "unmanaged:$PLAIN" "sweep:$PLAIN"
-check_plan "a bare GIT_DIR= assignment may update an exported variable"      "$PLAIN" "GIT_DIR=$SWEEP/.git; git push" "unmanaged:$PLAIN" "sweep:$PLAIN"
-check_plan "re-exporting GIT_DIR without a value is not modelled"            "$PLAIN" 'export GIT_DIR; git push'     "unmanaged:$PLAIN" "sweep:$PLAIN"
-check_plan "declare/local/readonly of a GIT_* name is not modelled"          "$PLAIN" "declare GIT_DIR=$SWEEP/.git; git push" "unmanaged:$PLAIN" "sweep:$PLAIN"
+check_plan "a sourced script may cd or export anything"                      "$PLAIN" 'source ./env.sh && git push'  "sweep:$PLAIN"
+check_plan "a bare GIT_DIR= assignment may update an exported variable"      "$PLAIN" "GIT_DIR=$SWEEP/.git; git push" "sweep:$PLAIN"
+check_plan "re-exporting GIT_DIR without a value is not modelled"            "$PLAIN" 'export GIT_DIR; git push'     "sweep:$PLAIN"
+check_plan "declare/local/readonly of a GIT_* name is not modelled"          "$PLAIN" "declare GIT_DIR=$SWEEP/.git; git push" "sweep:$PLAIN"
 PLAN_ENV="CDPATH=$W/repos"
 check_plan "a relative cd with CDPATH set may land elsewhere -> strict"      "$PLAIN" 'cd chk && git push'           "sweep:$PLAIN"
 check_plan "...but ./<dir> is not searched through CDPATH"                   "$W/repos" 'cd ./chk && git push'       "repo-checks:$CHK"
 PLAN_ENV=""
+
+# ── the shell model: each construct below is either followed EXACTLY (and gated by the class of what it really pushes) or flagged
+#    (and then every repo involved is strict). Nothing in between: no construct may let a push slip to the warn-only class. ──
+read -r NEST_BACKTICKS <<EOF
+echo \`echo \\\`git -C $CHK push\\\`\`
+EOF
+check_plan "\$( ): a push in a substitution is a push, at the directory its command runs in" "$PLAIN" "echo \"\$(cd $CHK && git push)\""   "repo-checks:$CHK"
+check_plan "\$( ): the substitution's own cd stays inside it"                  "$PLAIN" "x=\$(cd $CHK && pwd); git push"          "unmanaged:$PLAIN"
+check_plan "backticks"                                                         "$PLAIN" "echo \`git -C $CHK push\`"               "repo-checks:$CHK"
+check_plan "escaped, nested backticks are not read -> strict"                  "$PLAIN" "$NEST_BACKTICKS"                         "sweep:$PLAIN"
+check_plan "eval runs in the CURRENT shell: its cd carries on"                 "$PLAIN" "eval 'cd $CHK'; git push"                "repo-checks:$CHK"
+check_plan "eval of a string with a variable in it cannot be read -> strict"   "$PLAIN" 'eval "cd $X"; git push'                  "sweep:$PLAIN"
+check_plan "sh -c is a subshell: its cd does not carry out"                    "$PLAIN" "sh -c 'cd $CHK'; git push"               "unmanaged:$PLAIN"
+check_plan "sh -c \"\$VAR\" cannot be read: the resolved push and the cwd both strict" "$PLAIN" "sh -c \"\$CMD\"; git -C $CHK push" "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
+check_plan "xargs git -C <dir> push"                                           "$PLAIN" "xargs git -C $CHK push"                  "repo-checks:$CHK"
+check_plan "xargs git -C <dir>: the subcommand may arrive on stdin -> strict"  "$PLAIN" "xargs git -C $CHK"                         "sweep:$PLAIN"
+check_plan "a here-string fed to a shell is a script"                          "$PLAIN" "bash <<< 'git -C $CHK push'"             "repo-checks:$CHK"
+check_plan "a heredoc fed to a shell is a script"                              "$PLAIN" $'bash <<EOF\ngit -C '"$CHK"$' push\nEOF' "repo-checks:$CHK"
+check_plan "a script piped into a shell cannot be seen -> strict"              "$PLAIN" "echo 'git -C $CHK push' | sh"            "sweep:$PLAIN"
+check_plan "a here-string fed to cat is only data"                             "$PLAIN" "cat <<< 'git push'; git -C $CHK push"    "repo-checks:$CHK"
+check_plan "a heredoc body the shell expands runs its substitutions: not read -> strict" "$PLAIN" $'cat <<EOF\n$(git -C '"$CHK"$' push)\nEOF' "sweep:$PLAIN"
+check_plan "a QUOTED heredoc is data even with a \$( ) in it"                  "$PLAIN" $'cat <<\'EOF\'\n$(git -C '"$CHK"$' push)\nEOF\ngit -C '"$CHK"$' push' "repo-checks:$CHK"
+check_plan "an expansion that hides a substitution (\${x:-\$( )}) is not read -> strict" "$PLAIN" "echo \${X:-\$(git -C $CHK push)}" "sweep:$PLAIN"
+check_plan "find -exec ... git push carries a push in its arguments -> strict" "$PLAIN" "find . -exec git -C $CHK push \\;"        "sweep:$PLAIN"
+check_plan "perl -e with a git push in it -> strict"                           "$PLAIN" "perl -e 'system(\"git -C $CHK push\")'"  "sweep:$PLAIN"
+check_plan "trap with a push in it, and a push to <dir> -> both strict"        "$PLAIN" "trap 'git push' EXIT; git -C $CHK push"  "sweep:$CHK" "repo-checks:$CHK" "sweep:$PLAIN"
+check_plan "echo and a commit message that mention a push are only text"       "$PLAIN" "echo \"git push\"; git commit -m \"git push\"; git -C $CHK push" "repo-checks:$CHK"
+check_plan "pushd with no argument swaps the stack: not modelled -> strict"    "$PLAIN" 'pushd; git push'                         "sweep:$PLAIN"
+check_plan "cd A && cd B && git push: the last cd wins"                        "$PLAIN" "cd $CHK && cd $SWEEP && git push"        "sweep:$SWEEP"
+check_plan "cd A; cd <relative to A>; git push"                                "$W/repos" "cd chk; cd ../sweep; git push"         "sweep:$SWEEP"
+check_plan "cd A || cd B: a cd into a directory that exists cannot fail, B never runs" "$PLAIN" "cd $CHK || cd $SWEEP; git push"   "repo-checks:$CHK"
+check_plan "test -d A && cd A; git push: it may or may not move, so BOTH are gated" "$PLAIN" "test -d $CHK && cd $CHK; git push"   "repo-checks:$CHK" "unmanaged:$PLAIN"
+check_plan "false || cd A && git push: gated at both"                          "$PLAIN" "false || cd $CHK && git push"            "repo-checks:$CHK" "unmanaged:$PLAIN"
+check_plan "a cd into a directory that does not exist leaves the cwd unknown -> strict" "$PLAIN" "cd /no/such/dir; git push"     "sweep:$PLAIN"
+check_plan "a cd in a backgrounded list does not carry out"                    "$PLAIN" "cd $CHK & git push"                      "unmanaged:$PLAIN"
+check_plan "a cd inside if / while / for / case is not modelled -> strict"     "$PLAIN" "if cd $CHK; then git push; fi"           "sweep:$PLAIN"
+check_plan "a cd inside a brace group is not modelled -> strict"               "$PLAIN" "{ cd $CHK; git push; }"                  "sweep:$PLAIN"
+check_plan "a function definition is not read -> strict"                       "$PLAIN" "f() { cd $CHK; }; f; git push"           "sweep:$PLAIN"
+check_plan "an alias may turn any word into a push -> strict"                  "$PLAIN" "alias git='git -C $CHK'; git push"       "sweep:$PLAIN"
+check_plan "cd - : OLDPWD is not known -> strict"                              "$PLAIN" 'cd -; git push'                          "sweep:$PLAIN"
+check_plan "cd ~ : the home directory is where the push then runs (here not a repo) -> strict" "$PLAIN" 'cd ~; git push'          "sweep:$PLAIN"
+check_plan "cd with no argument goes home, likewise"                           "$PLAIN" 'cd; git push'                            "sweep:$PLAIN"
+check_plan "cd to a quoted path with a space"                                  "$PLAIN" "cd '$SPACED' && git push"                "repo-checks:$SPACED"
+check_plan "cd to a quoted path with a space that does not exist -> strict"    "$PLAIN" "cd '$W/no such dir'; git push"           "sweep:$PLAIN"
+check_plan "sudo -D <dir> runs git elsewhere -> strict"                        "$PLAIN" "sudo -D $CHK git push"                   "sweep:$PLAIN"
+check_plan "sudo -i runs a login shell in another directory -> strict"         "$PLAIN" "sudo -i git push"                        "sweep:$PLAIN"
+
+# ── the class is read from the COMMITS, never the work tree; the stricter of HEAD, its upstream, origin and the refspecs wins ──
+set_upstream() {  # set_upstream <repo> <sha>: refs/remotes/origin/<branch> = sha, the branch tracks it -- no remote is ever contacted
+  local d="$1" sha="$2" br
+  br="$(git -C "$d" symbolic-ref --short HEAD)"
+  git -C "$d" config remote.origin.url "$W/no-such-remote.git"
+  git -C "$d" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+  git -C "$d" update-ref "refs/remotes/origin/$br" "$sha"
+  git -C "$d" config "branch.$br.remote" origin
+  git -C "$d" config "branch.$br.merge" "refs/heads/$br"
+}
+head_of() { git -C "$1" rev-parse HEAD; }
+SW_DEL="$(mk_sweep swdel)"; rm "$SW_DEL/test/run-all.sh"
+check_plan "an UNCOMMITTED deletion of the marker on disk does not change the class"            "$SW_DEL" 'git push' "sweep:$SW_DEL"
+SW_EDIT="$(mk_sweep swedit)"; printf 'echo hi\n' > "$SW_EDIT/test/run-all.sh"
+check_plan "an uncommitted edit that drops the marker's receipt name does not either"           "$SW_EDIT" 'git push' "sweep:$SW_EDIT"
+PL_ADD="$(new_repo pladd)"; mkdir -p "$PL_ADD/test" "$PL_ADD/.heimdall"
+printf 'RECEIPT_FILE="$X/last-sweep.json"\n' > "$PL_ADD/test/run-all.sh"; printf '%s\n' "$GREEN_DECL" > "$PL_ADD/.heimdall/repo-checks.json"
+check_plan "markers ADDED on disk and not committed do not change the class"                    "$PL_ADD" 'git push' "unmanaged:$PL_ADD"
+PL_STG="$(new_repo plstg)"; mkdir -p "$PL_STG/test"; printf 'RECEIPT_FILE="$X/last-sweep.json"\n' > "$PL_STG/test/run-all.sh"; git -C "$PL_STG" add -A
+check_plan "...nor does a marker that is only staged"                                           "$PL_STG" 'git push' "unmanaged:$PL_STG"
+SW_DROP="$(mk_sweep swdrop)"; set_upstream "$SW_DROP" "$(head_of "$SW_DROP")"; git -C "$SW_DROP" rm -q test/run-all.sh; git -C "$SW_DROP" commit -q -m "drop the marker"
+check_plan "the pushed commit DROPS the marker, its upstream (@{u}) still has it -> sweep, the stricter" "$SW_DROP" 'git push' "sweep:$SW_DROP"
+SW_DROP2="$(mk_sweep swdrop2)"; BR2="$(git -C "$SW_DROP2" symbolic-ref --short HEAD)"
+git -C "$SW_DROP2" update-ref "refs/remotes/origin/$BR2" "$(head_of "$SW_DROP2")"; git -C "$SW_DROP2" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$BR2"
+git -C "$SW_DROP2" rm -q test/run-all.sh; git -C "$SW_DROP2" commit -q -m "drop the marker"
+check_plan "...the same with no branch upstream, only origin/HEAD keeping it"                   "$SW_DROP2" 'git push' "sweep:$SW_DROP2"
+SW_SWAP="$(mk_sweep swswap)"; set_upstream "$SW_SWAP" "$(head_of "$SW_SWAP")"
+git -C "$SW_SWAP" rm -q test/run-all.sh; mkdir -p "$SW_SWAP/.heimdall"; printf '%s\n' "$GREEN_DECL" > "$SW_SWAP/.heimdall/repo-checks.json"; commit_all "$SW_SWAP" "swap the marker for a declaration"
+check_plan "HEAD declares checks, its upstream is a sweep repo -> sweep, the stricter"          "$SW_SWAP" 'git push' "sweep:$SW_SWAP"
+UP_DECL="$(mk_checks updecl "$GREEN_DECL")"; set_upstream "$UP_DECL" "$(head_of "$UP_DECL")"; git -C "$UP_DECL" rm -q .heimdall/repo-checks.json; git -C "$UP_DECL" commit -q -m "drop the declaration"
+check_plan "HEAD declares nothing, its upstream declares checks -> repo-checks"                  "$UP_DECL" 'git push' "repo-checks:$UP_DECL"
+RS="$(new_repo refspec)"; RS_BR="$(git -C "$RS" symbolic-ref --short HEAD)"
+git -C "$RS" checkout -q -b other; mkdir -p "$RS/test"; printf 'RECEIPT_FILE="$X/last-sweep.json"\n' > "$RS/test/run-all.sh"; commit_all "$RS" "a branch that carries the marker"; git -C "$RS" checkout -q "$RS_BR"
+check_plan "HEAD has no marker, but 'push origin other' pushes a branch that does -> sweep"      "$RS" 'git push origin other' "sweep:$RS"
+check_plan "...also as src:dst"                                                                 "$RS" 'git push origin other:main' "sweep:$RS"
+check_plan "...and a +force refspec"                                                            "$RS" 'git push origin +other:main' "sweep:$RS"
+check_plan "...and after --"                                                                    "$RS" 'git push origin -- other' "sweep:$RS"
+check_plan "--all pushes every branch, so the marked one counts"                                "$RS" 'git push --all' "sweep:$RS"
+check_plan "pushing the branch you are on is only HEAD: unmanaged"                              "$RS" "git push origin $RS_BR" "unmanaged:$RS"
+check_plan "deleting a branch (:other) carries no commit: unmanaged"                            "$RS" 'git push origin :other' "unmanaged:$RS"
+check_plan "a refspec that names nothing git knows cannot be placed -> strict"                  "$RS" 'git push origin nosuchbranch' "sweep:$RS"
+LNK="$(new_repo lnk)"; mkdir -p "$LNK/test"; ln -s /no/such "$LNK/test/run-all.sh"; commit_all "$LNK" "marker is a link"
+check_plan "a marker that is a symlink in the commit cannot be read -> strict"                  "$LNK" 'git push' "sweep:$LNK"
+UNBORN="$W/repos/unborn"; mkdir -p "$UNBORN"; git -C "$UNBORN" init -q
+check_plan "a repository with no commit has nothing to inspect -> strict"                       "$UNBORN" 'git push' "sweep:$UNBORN"
+
+# ── hardening of the shell model: a wrapper that starts a process runs no builtin in THIS shell, a pipeline's last element may, and the
+#    variables a cd depends on are not modelled ──
+check_strict "env cd: /usr/bin/env starts a process, so the cd is lost and the push runs where the shell was"  "$PLAIN" "env cd $CHK; git push"
+check_strict "nice cd, nohup cd and xargs cd likewise"                       "$PLAIN" "nice cd $CHK; nohup cd $CHK; echo | xargs cd $CHK; git push"
+check_strict "sudo cd likewise"                                              "$PLAIN" "sudo cd $CHK; git push"
+check_strict "command cd: bash runs the builtin, zsh an external cd, so it is not modelled" "$PLAIN" "command cd $CHK; git push"
+check_plan "builtin cd runs the builtin in THIS shell, in both"              "$PLAIN" "builtin cd $CHK; git push"   "repo-checks:$CHK"
+check_plan "time cd likewise"                                                "$PLAIN" "time cd $CHK; git push"      "repo-checks:$CHK"
+check_plan "the last element of a pipeline may run in the current shell (zsh, bash lastpipe): both outcomes are gated" "$PLAIN" "echo | cd $CHK; git push" "unmanaged:$PLAIN" "repo-checks:$CHK"
+check_strict "env -u GIT_DIR undoes an exported GIT_DIR: not modelled"       "$PLAIN" "export GIT_DIR=$CHK/.git; env -u GIT_DIR git push"
+check_strict "env -i git push"                                               "$PLAIN" "env -i git push"
+check_strict "env -S 'git push'"                                             "$PLAIN" "env -S 'git push'"
+# the home directory of these runs is a repository of its own (unmanaged), so an unmodelled change of HOME shows as a row that is not strict
+PLAN_ENV="HOME=$PLAIN"
+check_strict "HOME=<dir> cd: the cd goes to the temporary HOME"              "$SWEEP" "HOME=$CHK cd; git push"
+check_strict "HOME=<dir>; cd ~: the home directory moved"                    "$SWEEP" "HOME=$CHK; cd ~; git push"
+check_strict "export HOME=<dir>; cd"                                         "$SWEEP" "export HOME=$CHK; cd; git push"
+check_strict "unset HOME; cd"                                                "$SWEEP" "unset HOME; cd; git push"
+check_plan "...and a plain cd to that home is followed exactly"              "$SWEEP" "cd; git push"                "unmanaged:$PLAIN"
+PLAN_ENV=""
+check_strict "CDPATH=<dir>; cd <name>: a relative name may be found elsewhere" "$W/repos" "CDPATH=$W/cdp; cd chk; git push"
+check_strict "OLDPWD=<dir>; cd -"                                            "$PLAIN" "OLDPWD=$CHK; cd -; git push"
+check_strict "PWD=<dir> git push"                                            "$PLAIN" "PWD=$CHK git push"
+check_strict "BASH_ENV=<file> runs a file in every shell it starts"          "$PLAIN" "BASH_ENV=./x.sh bash -c 'git push'"
+
+# ── the third column of a sweep row says whether it is only the strict FALLBACK (the command or git could not be read), or a marker was found ──
+fb_column() { printf '%s' "$2" | env HOME="$HOMEDIR" python3 -I -S "$HELPER" "$1" 2>/dev/null | awk -F'\t' 'NR == 1 { print $3 }'; }
+[ "$(fb_column "$PLAIN" 'git -C "$X" push')" = fallback ] && ok "B. an uncertain command's strict row is marked fallback" || bad "B. an uncertain command's strict row is not marked fallback" "$(fb_column "$PLAIN" 'git -C "$X" push')"
+[ -z "$(fb_column "$SWEEP" 'git push')" ] && ok "B. a sweep row found through a marker is NOT marked fallback" || bad "B. a marker-derived sweep row is marked fallback"
+[ "$(fb_column "$DANGLE" 'git push')" = fallback ] && ok "B. a marker that cannot be read is a fallback row too" || bad "B. an unreadable marker's strict row is not marked fallback"
+
+# ── the receipt attests ONE commit: the resolver names the commits a push sends as sources (the third column of a repo-checks row) ──
+SRC="$(mk_checks srcs "$GREEN_DECL")"; printf 'v2\n' > "$SRC/file.txt"; commit_all "$SRC" second
+SRC_HEAD="$(head_of "$SRC")"; SRC_PREV="$(git -C "$SRC" rev-parse 'HEAD~1')"; SRC_BR="$(git -C "$SRC" symbolic-ref --short HEAD)"
+git -C "$SRC" branch other "$SRC_PREV"; git -C "$SRC" tag v1 "$SRC_PREV"
+SRC_CFG="$(mk_checks srccfg "$GREEN_DECL")"; SRC_CFG_HEAD="$(head_of "$SRC_CFG")"
+git -C "$SRC_CFG" config remote.origin.url "$W/no-such-remote.git"; git -C "$SRC_CFG" config remote.origin.push 'refs/heads/main:refs/heads/main'
+check_sources "a bare push sends HEAD"                           "$SRC" 'git push'                                    "$SRC_HEAD"
+check_sources "push <remote> <the branch HEAD is on>"            "$SRC" "git push origin $SRC_BR"                     "$SRC_HEAD"
+check_sources "push <remote> HEAD"                               "$SRC" 'git push origin HEAD'                        "$SRC_HEAD"
+check_sources "src:dst takes the source"                         "$SRC" 'git push origin HEAD:refs/heads/x'           "$SRC_HEAD"
+check_sources "another branch: its own commit"                   "$SRC" 'git push origin other'                       "$SRC_PREV"
+check_sources "HEAD~1:main"                                      "$SRC" 'git push origin HEAD~1:main'                 "$SRC_PREV"
+check_sources "a full sha as the source"                         "$SRC" "git push origin $SRC_HEAD:main"              "$SRC_HEAD"
+check_sources "a tag: the commit it points to"                   "$SRC" 'git push origin v1'                          "$SRC_PREV"
+check_sources "tag <name> syntax"                                "$SRC" 'git push origin tag v1'                      "$SRC_PREV"
+check_sources "several refspecs: every source"                   "$SRC" "git push origin $SRC_BR other"               "$SRC_HEAD,$SRC_PREV"
+check_sources "several pushes in one command: the union"         "$SRC" 'git push; git push origin other'             "$SRC_HEAD,$SRC_PREV"
+check_sources "a deletion carries no commit"                     "$SRC" 'git push origin :other'                      "-"
+check_sources "--delete carries no commit"                       "$SRC" 'git push --delete origin other'              "-"
+check_sources "--all cannot be listed"                           "$SRC" 'git push --all'                              "?"
+check_sources "--tags cannot be listed"                          "$SRC" 'git push --tags'                             "?"
+check_sources "--mirror cannot be listed"                        "$SRC" 'git push --mirror'                           "?"
+check_sources "a wildcard refspec cannot be listed"              "$SRC" "git push origin 'refs/heads/*:refs/heads/*'" "?"
+check_sources "push.default=matching picks the refs"             "$SRC" 'git -c push.default=matching push'           "?"
+check_sources "a configured remote.<name>.push picks the refs of a bare push" "$SRC_CFG" 'git push'                   "?"
+check_sources "...but an explicit refspec overrides it"          "$SRC_CFG" "git push origin $SRC_BR"                 "$SRC_CFG_HEAD"
+check_plan "a refspec that names no commit cannot be placed: the strict class" "$SRC" 'git push origin nosuch'           "sweep:$SRC"
+
+# ── EVERY error path is strict: a git that fails, prints nonsense or hangs, at each call the resolver makes, is never read as "no markers" ──
+BROKEN="$W/brokengit"; mkdir -p "$BROKEN"
+cat > "$BROKEN/git" <<'FAKEGIT_EOF'
+#!/usr/bin/env bash
+# a git that misbehaves for ONE kind of call and is the real git otherwise. FAKE_GIT_BREAK is <subcommand>[:<text the arguments must contain>];
+# FAKE_GIT_MODE is fail (exit 128), garbage (exit 0, nonsense on stdout), empty (exit 0, nothing) or hang (sleeps, replacing this process)
+sub="${FAKE_GIT_BREAK%%:*}"; pat=""
+[ "$FAKE_GIT_BREAK" = "$sub" ] || pat="${FAKE_GIT_BREAK#*:}"
+hit=0
+case " $* " in
+  *" $sub "*) if [ -z "$pat" ]; then hit=1; else case "$*" in *"$pat"*) hit=1 ;; esac; fi ;;
+esac
+if [ "$hit" = 1 ]; then
+  case "${FAKE_GIT_MODE:-fail}" in
+    fail)    echo "fatal: simulated git failure" >&2; exit 128 ;;
+    garbage) echo "garbage that is not what git prints"; exit 0 ;;
+    empty)   exit 0 ;;
+    hang)    exec sleep 20 ;;
+  esac
+fi
+exec "$FAKE_GIT_REAL" "$@"
+FAKEGIT_EOF
+chmod +x "$BROKEN/git"
+REAL_GIT="$(command -v git)"
+ERRREPO="$(new_repo errrepo)"; set_upstream "$ERRREPO" "$(head_of "$ERRREPO")"; git -C "$ERRREPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+check_plan "fixture: with a healthy git this repository and command are unmanaged, so a broken-git answer of 'unmanaged' below would be a real downgrade" "$ERRREPO" 'git push' "unmanaged:$ERRREPO"
+PLAN_PATH="$BROKEN:$PATH"
+for spec in 'rev-parse:--absolute-git-dir' 'rev-parse:--show-toplevel' 'rev-parse:HEAD' 'rev-parse:refs/remotes/origin' 'symbolic-ref' 'for-each-ref' 'config' 'ls-tree'; do
+  for mode in fail garbage; do
+    PLAN_ENV="FAKE_GIT_REAL=$REAL_GIT FAKE_GIT_BREAK=$spec FAKE_GIT_MODE=$mode"
+    check_strict "git [$spec] answers '$mode' -> every row is the strict class, never unmanaged" "$ERRREPO" 'git push'
+  done
+done
+for spec in 'rev-parse:--absolute-git-dir' 'rev-parse:HEAD' 'rev-parse:refs/remotes/origin'; do
+  PLAN_ENV="FAKE_GIT_REAL=$REAL_GIT FAKE_GIT_BREAK=$spec FAKE_GIT_MODE=empty"
+  check_strict "git [$spec] succeeds with no output -> strict" "$ERRREPO" 'git push'
+done
+PLAN_ENV="FAKE_GIT_REAL=$REAL_GIT FAKE_GIT_BREAK=cat-file FAKE_GIT_MODE=fail"
+check_strict "git [cat-file] fails on a repository whose test/run-all.sh has to be read -> strict" "$OTHER_RUNNER" 'git push'
+for spec in 'ls-tree' 'rev-parse:HEAD'; do
+  PLAN_ENV="FAKE_GIT_REAL=$REAL_GIT FAKE_GIT_BREAK=$spec FAKE_GIT_MODE=hang HMD_PUSH_TARGET_TIMEOUT_S=1"
+  check_strict "git [$spec] hangs past the resolver's timeout -> strict" "$ERRREPO" 'git push' silent
+done
+PLAN_ENV=""; PLAN_PATH=""
+# a marker that is not what it should be, in the commit: every shape is strict, none is "no marker"
+RUNDIR="$(mk_sweep rundir)"; git -C "$RUNDIR" rm -q test/run-all.sh; mkdir -p "$RUNDIR/test/run-all.sh"; printf 'x\n' > "$RUNDIR/test/run-all.sh/k"; commit_all "$RUNDIR" "run-all.sh becomes a directory"
+check_plan "a commit whose test/run-all.sh is a directory is strict: a marker that is not a regular file" "$RUNDIR" 'git push' "sweep:$RUNDIR"
+
+# ── the shell differential: every command below is RUN by real bash (and zsh when installed), with a git that only records where it was started
+#    and with which options; the repositories those pushes really went to are then compared with what the resolver answers. Either every real
+#    push is gated at least as strictly as its repository's own class, or the whole plan is the strict class. A model that is wrong in a way
+#    that lets a push through shows up here as a command where the two disagree. ──
+FAKEBIN="$W/fakebin"; mkdir -p "$FAKEBIN" "$W/cdp"
+cat > "$FAKEBIN/git" <<'FAKEGIT_EOF'
+#!/usr/bin/env bash
+{ printf '%s' "$(pwd -P)"; printf '\037%s' "${GIT_DIR-}" "${GIT_WORK_TREE-}" "$@"; printf '\n'; } >> "$HMD_DIFF_LOG"
+exit 0
+FAKEGIT_EOF
+chmod +x "$FAKEBIN/git"
+ln -s "$SWEEP" "$W/cdp/chk"
+HOMEREPO="$(new_repo homerepo)"     # the HOME of every differential run is a repository (unmanaged), so a wrong idea of where `cd` goes shows
+DIFF_FIXTURES="$(jq -nc --arg plain "$PLAIN" --arg chk "$CHK" --arg sweep "$SWEEP" --arg spaced "$SPACED" --arg other "$OTHER_RUNNER" --arg wrepos "$W/repos" --arg cdp "$W/cdp" --arg fakegit "$FAKEBIN/git" \
+  '{paths: {PLAIN: $plain, CHK: $chk, SWEEP: $sweep, SPACED: $spaced, OTHER: $other, WREPOS: $wrepos, CDP: $cdp, FAKEGIT: $fakegit},
+    classes: {($plain): "unmanaged", ($chk): "repo-checks", ($sweep): "sweep", ($spaced): "repo-checks", ($other): "unmanaged"}}')"
+DIFF_SHELLS="bash"; command -v zsh >/dev/null 2>&1 && DIFF_SHELLS="bash zsh"
+cat > "$W/diff-shells.py" <<'DIFF_PY_EOF'
+import json, os, subprocess, sys
+
+fx = json.loads(os.environ["HMD_DIFF_FIXTURES"])
+paths, classes = fx["paths"], fx["classes"]
+helper, fakebin, log = os.environ["HMD_DIFF_HELPER"], os.environ["HMD_DIFF_FAKEBIN"], os.environ["HMD_DIFF_LOG"]
+real_git, home = os.environ["HMD_DIFF_REALGIT"], os.environ["HMD_DIFF_HOME"]
+RANK = {"unmanaged": 0, "repo-checks": 1, "sweep": 2}
+CORPUS = [
+    ("PLAIN", "git push"),
+    ("PLAIN", "git -C @CHK@ push"),
+    ("PLAIN", "git -C '@SPACED@' push"),
+    ("PLAIN", 'git -C "@SPACED@" push'),
+    ("WREPOS", "git -C chk push"),
+    ("PLAIN", "git --git-dir=@CHK@/.git push"),
+    ("PLAIN", "GIT_DIR=@CHK@/.git git push"),
+    ("PLAIN", "export GIT_DIR=@SWEEP@/.git; git push"),
+    ("PLAIN", "export GIT_DIR=@SWEEP@/.git; unset GIT_DIR; git push"),
+    ("PLAIN", "cd @CHK@ && git push"),
+    ("PLAIN", "cd @CHK@; cd @SWEEP@; git push"),
+    ("WREPOS", "cd chk; cd ../sweep; git push"),
+    ("PLAIN", "cd '@SPACED@' && git push"),
+    ("PLAIN", 'cd "@SPACED@" && git push'),
+    ("PLAIN", "pushd @CHK@ >/dev/null && git push"),
+    ("PLAIN", "pushd @CHK@ >/dev/null; popd >/dev/null; git push"),
+    ("SWEEP", "(cd @CHK@ && git push)"),
+    ("SWEEP", "(cd @CHK@) && git push"),
+    ("PLAIN", 'echo "$(cd @CHK@ && git push)"'),
+    ("PLAIN", "x=$(cd @CHK@ && pwd); git push"),
+    ("PLAIN", "echo `cd @CHK@ && git push`"),
+    ("PLAIN", "eval 'cd @CHK@'; git push"),
+    ("PLAIN", 'eval "cd @CHK@ && git push"'),
+    ("PLAIN", "sh -c 'cd @CHK@ && git push'"),
+    ("PLAIN", 'bash -c "cd @CHK@ && git push"'),
+    ("PLAIN", "sh -c 'cd @CHK@'; git push"),
+    ("PLAIN", "bash <<< 'git -C @CHK@ push'"),
+    ("PLAIN", "bash <<EOF\ngit -C @CHK@ push\nEOF"),
+    ("PLAIN", "echo x | xargs git -C @CHK@ push"),
+    ("PLAIN", "env FOO=1 git -C @CHK@ push"),
+    ("PLAIN", "command git -C @CHK@ push"),
+    ("PLAIN", "@FAKEGIT@ -C @CHK@ push"),
+    ("PLAIN", "time git -C @CHK@ push"),
+    ("PLAIN", "nohup git -C @CHK@ push"),
+    ("PLAIN", "test -d @CHK@ && cd @CHK@; git push"),
+    ("PLAIN", "false || cd @CHK@ && git push"),
+    ("PLAIN", "cd @CHK@ & git push"),
+    ("PLAIN", "cd @CHK@ | cat; git push"),
+    ("PLAIN", "echo | cd @CHK@; git push"),
+    ("PLAIN", "echo | cd @CHK@ && git push"),
+    ("PLAIN", "env cd @CHK@; git push"),
+    ("PLAIN", "echo | xargs cd @CHK@; git push"),
+    ("PLAIN", "nice cd @CHK@; git push"),
+    ("PLAIN", "command cd @CHK@; git push"),
+    ("PLAIN", "builtin cd @CHK@; git push"),
+    ("PLAIN", "time cd @CHK@; git push"),
+    ("PLAIN", "export GIT_DIR=@CHK@/.git; env -u GIT_DIR git push"),
+    ("SWEEP", "HOME=@CHK@ cd; git push"),
+    ("SWEEP", "HOME=@CHK@; cd; git push"),
+    ("SWEEP", "export HOME=@CHK@; cd ~; git push"),
+    ("WREPOS", "CDPATH=@CDP@; cd chk; git push"),
+    ("PLAIN", 'cd "$D" && git push'),
+    ("PLAIN", "cd $D; git push"),
+    ("PLAIN", 'git -C "$D" push'),
+    ("PLAIN", 'git -C "$(echo @CHK@)" push'),
+    ("PLAIN", "cd -; git push"),
+    ("PLAIN", "cd ~; git push"),
+    ("PLAIN", "cd; git push"),
+    ("PLAIN", 'eval "cd $D"; git push'),
+    ("PLAIN", "D2=@CHK@; git -C $D2 push"),
+    ("PLAIN", "echo 'git -C @CHK@ push' | sh"),
+    ("PLAIN", "if cd @CHK@; then git push; fi"),
+    ("PLAIN", "{ cd @CHK@; git push; }"),
+    ("PLAIN", "f() { cd @CHK@; }; f; git push"),
+    ("PLAIN", "alias git='git -C @CHK@'; git push"),
+    ("PLAIN", "cd /no/such/dir; git push"),
+    ("PLAIN", "source ./nothing.sh; git push"),
+]
+
+
+def shell_pushes(shell, base, cmd):
+    """The repositories (physical top level; None where git cannot place the push) the shell's pushes really went to."""
+    open(log, "w").close()
+    env = dict(os.environ, PATH=fakebin + os.pathsep + os.environ["PATH"], HOME=home, HMD_DIFF_LOG=log, D=paths["CHK"])
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "CDPATH", "BASH_ENV", "ENV"):
+        env.pop(name, None)
+    subprocess.run([shell, "-c", cmd], cwd=base, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=60)
+    repos = []
+    with open(log, "rb") as fh:
+        records = [r for r in fh.read().split(b"\n") if r]
+    for record in records:
+        cwd, gdir, gwt, *args = record.decode("utf-8", "replace").split("\x1f")
+        i = 0
+        while i < len(args):
+            if args[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+                i += 2
+            elif args[i].startswith("-"):
+                i += 1
+            else:
+                break
+        if i >= len(args) or args[i] != "push":
+            continue
+        genv = dict(os.environ)
+        for name in ("GIT_DIR", "GIT_WORK_TREE"):
+            genv.pop(name, None)
+        if gdir:
+            genv["GIT_DIR"] = gdir
+        if gwt:
+            genv["GIT_WORK_TREE"] = gwt
+        got = subprocess.run([real_git] + args[:i] + ["rev-parse", "--absolute-git-dir"], cwd=cwd, env=genv,
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        if got.returncode != 0 or not got.stdout.strip():
+            repos.append(None)
+            continue
+        gd = os.path.realpath(got.stdout.strip())
+        repos.append(os.path.dirname(gd) if os.path.basename(gd) == ".git" else gd)
+    return repos
+
+
+def plan_rows(base, cmd):
+    got = subprocess.run([sys.executable, "-I", "-S", helper, base], input=cmd, capture_output=True, text=True,
+                         env=dict(os.environ, HOME=home, HMD_PUSH_TARGET_TIMEOUT_S="60"))
+    return [line.split("\t") for line in got.stdout.splitlines() if line]
+
+
+def verdict(repos, rows):
+    """"strict" when the plan is the strict class throughout (or gave no answer: the hook then runs the strict gate); "exact" when every real
+    push is covered by a row of its own repository at least as strict as that repository's class; None when a push slipped through."""
+    if not rows or all(r[0] == "sweep" or (r[0] == "repo-checks" and r[2:] == ["?"]) for r in rows):
+        return "strict"
+    for repo in repos:
+        need = RANK[classes.get(repo, "unmanaged")] if repo else 99
+        if not any(r[1] == repo and RANK.get(r[0], 0) >= need for r in rows):
+            return None
+    return "exact"
+
+
+bad, stats = [], {}
+for shell in sys.argv[1:]:
+    exact = strict = pushes = 0
+    for key, template in CORPUS:
+        cmd = template
+        for name, value in paths.items():
+            cmd = cmd.replace("@%s@" % name, value)
+        base = paths[key]
+        try:
+            repos = shell_pushes(shell, base, cmd)
+        except subprocess.TimeoutExpired:
+            bad.append("%s in %s: the shell did not finish: %r" % (shell, key, cmd))
+            continue
+        rows = plan_rows(base, cmd)
+        pushes += len(repos)
+        got = verdict(repos, rows)
+        if got is None:
+            bad.append("%s in %s: %r\n         real pushes went to: %s\n         the plan says: %s"
+                       % (shell, key, cmd, [os.path.basename(r) if r else None for r in repos], rows))
+        elif got == "exact" and repos:
+            exact += 1
+        else:
+            strict += 1
+    stats[shell] = (exact, strict, pushes)
+    if exact < 25:
+        bad.append("%s: only %d commands were resolved exactly; the corpus no longer exercises the exact path" % (shell, exact))
+for line in bad:
+    print("FAIL " + line)
+for shell, (e, s, p) in stats.items():
+    print("SUMMARY %s: %d commands, %d resolved exactly, %d strict, %d real pushes" % (shell, len(CORPUS), e, s, p))
+sys.exit(1 if bad else 0)
+DIFF_PY_EOF
+DIFF_OUT="$(HMD_DIFF_FIXTURES="$DIFF_FIXTURES" HMD_DIFF_HELPER="$HELPER" HMD_DIFF_FAKEBIN="$FAKEBIN" HMD_DIFF_LOG="$W/diff.log" HMD_DIFF_REALGIT="$REAL_GIT" HMD_DIFF_HOME="$HOMEREPO" \
+  python3 -I -S "$W/diff-shells.py" $DIFF_SHELLS 2>&1)"; DIFF_RC=$?
+if [ "$DIFF_RC" = 0 ]; then ok "B. shell differential (real shell vs resolver): no push slipped through. $(grep '^SUMMARY' <<<"$DIFF_OUT" | tr '\n' ';')"
+else bad "B. shell differential: the resolver and a real shell disagree about where a push goes" "$(printf '%s' "$DIFF_OUT" | head -c 4000)"; fi
+
 # the real heimdall repo is class sweep: if run-all.sh stops naming the receipt, this goes RED
 REPO_P="$(cd "$REPO" && pwd -P)"
 check_plan "THIS repo (test/run-all.sh) is a sweep repo" "$REPO" 'git push'                        "sweep:$REPO_P"
@@ -417,7 +970,7 @@ mk_plugin() {  # mk_plugin <name> [--no-resolver] [--real-state] -> path
   mkdir -p "$d/bin/lib"
   cp "$HOOK" "$d/bin/heimdall-precheck-bash"
   cp "$RC_BIN" "$d/bin/heimdall-repo-checks" 2>/dev/null
-  cp "$HELPER" "$d/bin/lib/hmd_push_target.py" 2>/dev/null
+  cp "$HELPER" "$RC_PY" "$RC_DEF" "$d/bin/lib/" 2>/dev/null
   for opt in "$@"; do
     case "$opt" in
       --no-resolver) rm -f "$d/bin/lib/hmd_push_target.py" ;;
@@ -545,7 +1098,10 @@ denies "C12. ...says why" '(?i)uncommitted'
 
 B_EDIT="$(mk_checks bedit "$GREEN_DECL")"; run_checks "$B_EDIT"; printf '%s\n' "$(decl_json only 'true')" > "$B_EDIT/.heimdall/repo-checks.json"
 run_hook "$PLUGIN" "$B_EDIT" 'git push'
-expect_rc "C13. (b) declaration edited after the receipt -> BLOCKED" 2
+expect_rc "C13. (b) an UNCOMMITTED edit of the declaration changes nothing about the commit pushed: the receipt for HEAD still passes" 0
+git -C "$B_EDIT" add -A; git -C "$B_EDIT" commit -q -m "declare other checks"
+run_hook "$PLUGIN" "$B_EDIT" 'git push'
+expect_rc "C13b. ...but once that edit is COMMITTED the old receipt is for another commit -> BLOCKED" 2
 
 B_BAD="$(mk_checks bbad 'this is not json')"
 run_hook "$PLUGIN" "$B_BAD" 'git push'
@@ -633,6 +1189,99 @@ run_hook "$PLUGIN" "$W/link-sweep" 'git push' FAKE_HSTATE_RC=2
 strict_blocks "C26. a cwd that is a symlink to a sweep repo -> the sweep repo's strict gate" "$SWEEP"
 run_hook "$PLUGIN" "$WT_PLAIN" 'git push' FAKE_HSTATE_RC=2
 { [ "$RC" = 0 ] && [ "$(grep -c 'WARNING' <<<"$ERR")" = 1 ] && [ "$(state_calls)" = 0 ]; } && ok "C27. ...while a worktree of an unmanaged repo (positively no markers) still only warns  [rc=0]" || bad "C27. worktree of an unmanaged repo" "rc=$RC calls=$(state_calls) $ERR"
+
+# ── the class comes from the commits: what is on disk, uncommitted, cannot loosen or tighten the gate ──
+run_hook "$PLUGIN" "$SW_DEL" 'git push' FAKE_HSTATE_RC=2
+strict_blocks "C30. the marker deleted on disk (uncommitted) -> still the sweep repo's strict gate" "$SW_DEL"
+run_hook "$PLUGIN" "$PL_ADD" 'git push' FAKE_HSTATE_RC=2
+{ [ "$RC" = 0 ] && [ "$(state_calls)" = 0 ] && [ "$(grep -c 'WARNING' <<<"$ERR")" = 1 ]; } && ok "C30b. markers added on disk and not committed do not make a repo managed: still only the warning  [rc=0]" || bad "C30b. uncommitted markers" "rc=$RC calls=$(state_calls) $ERR"
+run_hook "$PLUGIN" "$SW_DROP" 'git push' FAKE_HSTATE_RC=2
+strict_blocks "C31. the pushed commit drops the marker but its upstream keeps it -> the strict gate" "$SW_DROP"
+run_hook "$PLUGIN" "$RS" 'git push origin other' FAKE_HSTATE_RC=2
+strict_blocks "C31b. pushing a branch that carries the marker from a HEAD that does not -> the strict gate" "$RS"
+
+# ── the shell read exactly, or strict -- at the hook, where it decides a push ──
+run_hook "$PLUGIN" "$PLAIN" "eval 'cd $B_RED'; git push"
+expect_rc "C32. eval's cd carries on: the push after it goes to the red (b) repo and is BLOCKED by that record" 2
+run_hook "$PLUGIN" "$PLAIN" "git push; bash <<< 'git -C $B_RED push'"
+expect_rc "C32b. a push inside a here-string fed to a shell is graded on its target's record (the red (b) repo) -> BLOCKED" 2
+run_hook "$PLUGIN" "$PLAIN" "git push; echo 'git -C $B_GREEN push' | sh" FAKE_HSTATE_RC=2
+strict_blocks "C32c. a script piped into a shell cannot be seen -> the strict gate on the cwd, not the warning" "$PLAIN"
+run_hook "$PLUGIN" "$PLAIN" "test -d $B_RED && cd $B_RED; git push"
+expect_rc "C32d. a cd that may or may not happen: BOTH possible targets are gated -> BLOCKED by the red record" 2
+run_hook "$PLUGIN" "$PLAIN" "test -d $B_GREEN && cd $B_GREEN; git push"
+expect_rc "C32e. ...and when every possible target passes (a green record, an unmanaged cwd) the push goes on" 0
+run_hook "$PLUGIN" "$PLAIN" 'cd -; git push' FAKE_HSTATE_RC=2
+strict_blocks "C32f. cd - : OLDPWD is unknown -> the strict gate" "$PLAIN"
+run_hook "$PLUGIN" "$PLAIN" "git -C $B_GREEN push; source ./x.sh" FAKE_HSTATE_RC=2
+{ [ "$RC" = 2 ] && [ "$(state_cwds | sed -n 1p)" = "$B_GREEN" ]; } && ok "C32g. an uncertain command makes the resolved (b) repo strict too: its green receipt alone does not pass it  [rc=2]" || bad "C32g. uncertain command left a resolved repo on its own class" "rc=$RC cwds=$(state_cwds | tr '\n' ' ') $OUT"
+
+# ── the receipt attests ONE commit: a push that names another commit, or commits that cannot be listed, is not covered by it ──
+run_checks "$SRC"; run_checks "$SRC_CFG"
+for form in 'git push' 'git push origin main' 'git push origin HEAD' "git push origin $SRC_HEAD:main" 'git push origin :other' 'git push --delete origin other'; do
+  run_hook "$PLUGIN" "$SRC" "$form" FAKE_HSTATE_RC=2
+  expect_rc "C40. [$form] sends only the commit the receipt is for -> allowed" 0
+done
+for form in 'git push origin other' 'git push origin HEAD~1:main' "git push origin $SRC_PREV:main" "git push origin $SRC_BR other" 'git push origin v1' 'git push origin tag v1' 'git push; git push origin other'; do
+  run_hook "$PLUGIN" "$SRC" "$form" FAKE_HSTATE_RC=2
+  expect_rc "C41. [$form] names a commit the receipt is not for -> BLOCKED" 2
+  denies "C41. ...says what the push carries" 'the push carries'
+done
+for form in 'git push --all' 'git push --tags' 'git push --mirror' "git push origin 'refs/heads/*:refs/heads/*'" 'git -c push.default=matching push'; do
+  run_hook "$PLUGIN" "$SRC" "$form" FAKE_HSTATE_RC=2
+  expect_rc "C42. [$form] names commits that cannot be listed -> BLOCKED" 2
+  denies "C42. ...says they cannot be tied to the receipt" 'cannot be tied'
+done
+run_hook "$PLUGIN" "$SRC_CFG" 'git push' FAKE_HSTATE_RC=2
+expect_rc "C42b. a configured remote.<name>.push picks the refs of a bare push -> BLOCKED" 2
+run_hook "$PLUGIN" "$SRC_CFG" "git push origin $SRC_BR" FAKE_HSTATE_RC=2
+expect_rc "C42c. ...while an explicit refspec overrides it -> allowed" 0
+run_hook "$PLUGIN_REAL" "$SRC" 'git push origin nosuch'
+expect_rc "C43. a refspec that names no commit is the strict class, and a repository with no sweep record cannot pass it (a gate never evaluated does not stand in)" 2
+denies "C43. ...and the block says the push cannot be graded" 'cannot grade this push'
+run_hook "$PLUGIN_REAL" "$B_GREEN" 'git push; source ./x.sh'
+expect_rc "C43b. an uncertain command in a repo that declares checks is BLOCKED even with a green receipt (the strict gate was never evaluated)" 2
+run_hook "$PLUGIN" "$B_GREEN" 'git push; source ./x.sh' FAKE_HSTATE_RC=0
+expect_rc "C43b. ...and when the strict gate passes, the receipt row still blocks it: the commits cannot be listed" 2
+denies "C43b. ...cannot be tied to the receipt" 'cannot be tied'
+run_hook "$PLUGIN_REAL" "$PLAIN" 'git -C "$X" push'
+expect_rc "C43c. an uncertain command in an unmanaged repo is not waved through as unmanaged: the strict gate was never evaluated, so BLOCKED" 2
+denies "C43c. ...says it cannot grade the push" 'cannot grade this push'
+run_hook "$PLUGIN_REAL" "$PLAIN" 'git push'
+{ [ "$RC" = 0 ] && grep -q 'WARNING' <<<"$ERR"; } && ok "C43d. ...while the same push stated plainly is only the unmanaged warning  [rc=0]" || bad "C43d. plain push of an unmanaged repo" "rc=$RC $ERR"
+
+# ── every error path is strict: a git that fails at any call the resolver makes never turns into the unmanaged warning or a pass ──
+for spec in 'ls-tree' 'rev-parse:HEAD' 'rev-parse:--absolute-git-dir' 'symbolic-ref' 'for-each-ref' 'config'; do
+  run_hook "$PLUGIN" "$ERRREPO" 'git push' "PATH=$BROKEN:$PLUGIN/bin:$PATH" FAKE_GIT_REAL="$REAL_GIT" FAKE_GIT_BREAK="$spec" FAKE_GIT_MODE=fail FAKE_HSTATE_RC=2
+  strict_blocks "C44. git fails in [$spec]: the strict gate runs (and blocks here), never the unmanaged warning" "$ERRREPO"
+done
+run_hook "$PLUGIN" "$B_GREEN" 'git push' "PATH=$BROKEN:$PLUGIN/bin:$PATH" FAKE_GIT_REAL="$REAL_GIT" FAKE_GIT_BREAK=ls-tree FAKE_GIT_MODE=fail FAKE_HSTATE_RC=2
+strict_blocks "C44b. git fails reading the markers of a repo whose green receipt would pass: the strict gate, not the receipt" "$B_GREEN"
+run_hook "$PLUGIN_REAL" "$ERRREPO" 'git push' "PATH=$BROKEN:$PLUGIN_REAL/bin:$PATH" FAKE_GIT_REAL="$REAL_GIT" FAKE_GIT_BREAK=ls-tree FAKE_GIT_MODE=fail
+expect_rc "C44c. git fails, and the strict gate is the REAL heimdall-state of a checkout that never armed it: BLOCKED, not 'UNAVAILABLE, allowing'" 2
+denies "C44c. ...says it cannot grade the push" 'cannot grade this push'
+B_CORRUPT="$(mk_checks bcorrupt "$GREEN_DECL")"; run_checks "$B_CORRUPT"
+for bad_receipt in '' '{' '[]' 'null' '"x"' '0' '{"schema":1}'; do
+  printf '%s' "$bad_receipt" > "$(receipt_of "$B_CORRUPT")"
+  run_hook "$PLUGIN" "$B_CORRUPT" 'git push'
+  expect_rc "C45. a receipt that is [$bad_receipt] -> BLOCKED" 2
+done
+N47=0
+for bad_decl in 'not json' '[]' 'null' '{"schema":1,"checks":"x"}' '{"schema":1,"checks":[1]}' $'\xff\xfe' ''; do
+  N47=$((N47 + 1)); BD47="$(mk_checks "c47decl$N47" "$bad_decl")"
+  run_hook "$PLUGIN" "$BD47" 'git push'
+  expect_rc "C47. a committed declaration that is [$(printf '%s' "$bad_decl" | head -c 24 | tr -c '[:print:]' '?')] -> BLOCKED" 2
+done
+PLUGIN_CRASH="$(mk_plugin crash)"; printf 'import sys\nsys.stderr.write("simulated crash\\n")\nsys.exit(3)\n' > "$PLUGIN_CRASH/bin/lib/hmd_push_target.py"
+run_hook "$PLUGIN_CRASH" "$B_GREEN" 'git push' FAKE_HSTATE_RC=2
+strict_blocks "C48. the resolver crashes (exit 3, no answer): the strict gate on the cwd, not the repo's own record" "$B_GREEN"
+PLUGIN_LIE="$(mk_plugin lie)"; printf 'import sys\nsys.stdout.write("allow\\t" + sys.argv[1] + "\\n")\n' > "$PLUGIN_LIE/bin/lib/hmd_push_target.py"
+run_hook "$PLUGIN_LIE" "$B_GREEN" 'git push' FAKE_HSTATE_RC=2
+strict_blocks "C48b. the resolver answers with a class nobody knows: the strict gate" "$B_GREEN"
+PLUGIN_NOEXTRA="$(mk_plugin noextra)"; printf 'import sys\nsys.stdout.write("repo-checks\\t%s\\n")\n' "$B_GREEN" > "$PLUGIN_NOEXTRA/bin/lib/hmd_push_target.py"
+run_hook "$PLUGIN_NOEXTRA" "$B_GREEN" 'git push' FAKE_HSTATE_RC=2
+expect_rc "C48c. a repo-checks row without its list of pushed commits means 'cannot be listed': BLOCKED even though the receipt is green" 2
+denies "C48c. ...cannot be tied to the receipt" 'cannot be tied'
 
 # ── no resolver: gated exactly as before ──
 run_hook "$PLUGIN_NORES" "$PLAIN" 'git push' FAKE_HSTATE_RC=2

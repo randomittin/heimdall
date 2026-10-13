@@ -76,7 +76,7 @@ mk_plugin() {  # mk_plugin <name> [--no-resolver] [--real-state] -> a fake plugi
   mkdir -p "$d/bin/lib"
   cp "$HOOK" "$d/bin/heimdall-precheck-bash"
   cp "$RC_BIN" "$d/bin/heimdall-repo-checks" 2>/dev/null
-  cp "$HELPER" "$d/bin/lib/hmd_push_target.py" 2>/dev/null
+  cp "$HELPER" "$REPO/bin/lib/hmd_repo_checks.py" "$REPO/bin/lib/hmd_repo_receipt.py" "$d/bin/lib/" 2>/dev/null
   for opt in "$@"; do
     case "$opt" in
       --no-resolver) rm -f "$d/bin/lib/hmd_push_target.py" ;;

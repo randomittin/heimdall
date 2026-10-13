@@ -133,7 +133,8 @@ mk_plugin() {  # mk_plugin <name> [omit-bin...] -> path
   # the wrapper form of the hook resolves the script under $PLUGIN/bin
   cp "$SCRIPT" "$d/bin/heimdall-precheck-bash"; chmod +x "$d/bin/heimdall-precheck-bash"
   # the per-repo push gate: the resolver the script asks which repo a push goes to, and the runner it consults for repo-checks repos
-  mkdir -p "$d/bin/lib"; cp "$REPO/bin/lib/hmd_push_target.py" "$d/bin/lib/"; cp "$REPO/bin/heimdall-repo-checks" "$d/bin/"; chmod +x "$d/bin/heimdall-repo-checks"
+  mkdir -p "$d/bin/lib"; cp "$REPO/bin/lib/hmd_push_target.py" "$REPO/bin/lib/hmd_repo_checks.py" "$REPO/bin/lib/hmd_repo_receipt.py" "$d/bin/lib/"
+  cp "$REPO/bin/heimdall-repo-checks" "$d/bin/"; chmod +x "$d/bin/heimdall-repo-checks"
   local o; for o in "$@"; do rm -f "$d/bin/$o"; done
   printf '%s' "$d"
 }
@@ -142,10 +143,13 @@ PLUGIN_NOSTAMP="$(mk_plugin nostamp heimdall-stamp)"
 PLUGIN_NOHSTATE="$(mk_plugin nohstate heimdall-state)"
 
 # ── cwd fixtures ────────────────────────────────────────────────────────────
-# A push is gated by the class of the repo it goes to. These fixtures stand for HEIMDALL'S OWN repo, whose class is "sweep"
-# (its test/run-all.sh, the writer of the sweep receipt, names last-sweep.json), so each push below still meets the
-# heimdall-state gate it always met.
-mark_sweep() { mkdir -p "$1/test"; printf 'RECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"\n' > "$1/test/run-all.sh"; }
+# A push is gated by the class of the repo it goes to, read from the COMMITS. These fixtures stand for HEIMDALL'S OWN repo, whose
+# class is "sweep" (its test/run-all.sh, the writer of the sweep receipt, names last-sweep.json, and is committed), so each push
+# below still meets the heimdall-state gate it always met.
+mark_sweep() {
+  mkdir -p "$1/test"; printf 'RECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"\n' > "$1/test/run-all.sh"
+  ( cd "$1" && git add test/run-all.sh && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m "the sweep writer" )
+}
 mk_cwd() {  # mk_cwd <name> -> a real git repo with the evals scaffolding the chain reads from CWD
   local d="$TMPROOT/cwd-$1"
   mkdir -p "$d/evals/oracles/demo-domain" "$d/evals/corpus"
@@ -221,7 +225,8 @@ equiv() {
   # the per-repo push gate (2026-10-13, delta 4) adds the class dispatch: PG_* variables, the resolver and payload-cwd calls, the
   # loop over the plan and the cd into the repo pushed and back. None of those statements exists in the inline string (it has no
   # cd, IFS or read at all); the statements INSIDE the sweep branch -- the old quality gate, verbatim -- are still compared.
-  local mtr='^(\+ (SQ=|GP_|SLINT=|PG_|IFS=|read -r PG_|cd |case |grep -qE .*push)|\+\+ (tr -d |jq -r .\.cwd|python3 -I -S .*hmd_push_target\.py|printf .sweep))'
+  # ...and, in the never-evaluated branch, the one extra test of whether the row is only the strict fallback (`[ "$PG_EXTRA" = fallback ]`)
+  local mtr='^(\+ (SQ=|GP_|SLINT=|PG_|IFS=|read -r PG_|cd |case |grep -qE .*push|.\[. .. = fallback .\].)|\+\+ (tr -d |jq -r .\.cwd|python3 -I -S .*hmd_push_target\.py|printf .sweep))'
   grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | grep -vE "$mtr" | awk '/^\+ .\[. [0-9]+ = 2 .\].$/ && !guard_test++ { next } { print }' | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
   LC_ALL=C sort "$TMPROOT/$tag.trace-inline.err" | grep -vE "$mtr" > "$TMPROOT/$tag.trace-inline.sorted"
   # denies are exempt from the trace comparison: the stderr mirror is a statement the string never had
