@@ -68,10 +68,11 @@ case "${1:-}" in
   -h|--help) sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-# SINCE THE EXTRACTION — three deliberate deltas from the historical inline chain
+# SINCE THE EXTRACTION — four deliberate deltas from the historical inline chain
 # (2026-10-11, "precheck never blocks silently in another repo"; then "never execute the session's
-# repo"). test/heimdall-precheck-bash.test.sh cases 17, 21 and 24-29 pin them; every other branch is
-# still byte-identical to the inline string.
+# repo"; 2026-10-13, "each repo's own checks, not heimdall's"). test/heimdall-precheck-bash.test.sh
+# cases 17, 21 and 24-29 pin the first three, test/heimdall-push-gate-per-repo.test.sh the fourth;
+# every other branch is still byte-identical to the inline string.
 #
 #   1. deny(): a deny states its verdict on stderr TOO. Claude Code surfaces ONLY stderr for an
 #      exit-2 hook and ignores stdout, so the stdout-only verdict surfaced as "hook error ... No
@@ -94,9 +95,26 @@ esac
 #      `grep -rn "git push" docs/`, a commit message) and other subcommands (`git stash push`) stay
 #      unmatched: a push gate that fired on prose would cost a full gate run per grep. Indirection no regex
 #      can see (`$GIT push`, `xargs -n 1 git push`) is the native pre-push hook's job (core.hooksPath).
-#
-# The gates themselves still read the CWD repo's own state (heimdall-state.json, .planning/, evals/):
-# that is the policy for "the repo being pushed", correctly applied in a foreign repo.
+#   4. PER-REPO TEST/LINT GATE: the quality gate (`heimdall-state check-quality-gates`: the state
+#      booleans, the lint receipt and heimdall's sweep receipt) used to run in the session's cwd for ANY
+#      push, so a push of another repository was held to heimdall's own sweep: the site, with six gates of
+#      its own, was blocked for lacking a receipt only heimdall's test/run-all.sh can write. The hook now
+#      asks bin/lib/hmd_push_target.py which repositories the command pushes (cwd, `git -C <dir>`,
+#      `cd <dir> && ...`, subshells, wrappers, `sh -c`) and gives each the gate its class owes:
+#        sweep        <toplevel>/test/run-all.sh names last-sweep.json (heimdall's own regime): the old gate,
+#                     unchanged and fail-closed, now run INSIDE that repository (a push of repo B no longer
+#                     answers to repo A's state, and a cwd in a subdirectory reads the toplevel's state);
+#        repo-checks  <toplevel>/.heimdall/repo-checks.json declares the repo's own checks: pass ONLY on a
+#                     green, current, clean-tree receipt (bin/heimdall-repo-checks status). Read, never
+#                     re-run: a hook must not execute what a repository says to execute. Stale, red, dirty,
+#                     missing, invalid or an absent runner all block, naming the runner command;
+#        unmanaged    anything else: one WARNING line on stderr, the push goes on.
+#      The marker is the sweep WRITER in the repo's tracked code, never its receipt, so deleting a receipt
+#      cannot downgrade a repo. A resolver that is missing or gives no answer, or a class this does not
+#      know, runs the sweep gate on the cwd exactly as before: the change only ever narrows a gate to the
+#      repository pushed. NOT relaxed, and still reading the CWD repo as they always did: the push-range
+#      secret scan, the full-history self-scan and the oracle and corpus stages below (and, earlier in the
+#      chain, the commit secret scan, git-guard and the kill guard).
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
 
 INPUT=$(cat)
@@ -167,31 +185,65 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
   HSTATE="$PLUGIN/bin/heimdall-state"
   [ -x "$HSTATE" ] || HSTATE=heimdall-state
   SLINT="$PLUGIN/bin/heimdall-stop-lint"
-  QGOUT=$("$HSTATE" check-quality-gates 2>&1)
-  QGRC=$?
-  # Work merged from sub-agent worktrees is in no session's edit-tracker ledger, so the per-turn lint receipt never covers it. When
-  # the lint evidence is missing, stale or does not cover the push, lint everything changed since the last push (bounded well inside
-  # the hook's own time: a push gate that times out is a gate that lets the push through) and evaluate the gate once more.
-  if [ "$QGRC" = 2 ] && [ -x "$SLINT" ] && printf '%s' "$QGOUT" | grep -qE 'Lint not clean -- (no-evidence|stale|uncovered|no-coverage)'; then
-    printf 'heimdall: the lint receipt does not cover what this push ships - running %s --since-push (bounded)\n' "$SLINT" >&2
-    if command -v perl >/dev/null 2>&1; then perl -e 'alarm 45; exec @ARGV' "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true
-    else "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true; fi
-    QGOUT=$("$HSTATE" check-quality-gates 2>&1)
-    QGRC=$?
-  fi
-  if [ "$QGRC" = 2 ]; then
-    ESC=$(printf '%s' "$QGOUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-    HINT=""
-    if printf '%s' "$QGOUT" | grep -q 'Lint not clean'; then
-      HINT=" Lint evidence for what this push ships: run \`$SLINT --since-push --repo $PWD\` (lints every file changed since the last push, merged agent work included; add --budget 300 for a big diff). A waiver is not the answer."
-    fi
-    HINT_ESC=$(printf '%s' "$HINT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-    deny "$(printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing.%s --- %s"}' "$HINT_ESC" "$ESC")"
-  elif [ "$QGRC" = 0 ]; then
-    printf '%s\n' "$QGOUT" >&2
-  else
-    printf 'heimdall: quality-gate verdict UNAVAILABLE (exit %s) - the gates were NEVER EVALUATED, which is not a pass. Run `heimdall-state init` then `heimdall-state mark-clean` in this checkout to arm the pre-push gate. Allowing push to proceed. --- %s\n' "$QGRC" "$QGOUT" >&2
-  fi
+  # PER-REPO TEST/LINT GATE (delta 4 in the header above): one gate per repository this command pushes, chosen by the class
+  # bin/lib/hmd_push_target.py gives it -- sweep (heimdall's own regime: the quality gate below, unchanged, run in THAT repository),
+  # repo-checks (its own declared checks: a green, current, clean-tree receipt, read here, never re-run) or unmanaged (one warning,
+  # the push goes on). No answer from the resolver, or a class this does not know, is the sweep gate on the cwd: it only ever narrows.
+  # The payload's cwd (the shell's own) is where the resolver starts reading paths from; without one it is this process's cwd.
+  PG_HOME="$PWD"
+  PG_BASE=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
+  PG_PLAN=$(python3 -I -S "$PLUGIN/bin/lib/hmd_push_target.py" "$PG_BASE" <<<"$CMD" 2>/dev/null)
+  case $PG_PLAN in '') PG_PLAN=$(printf 'sweep\t%s' "$PG_HOME") ;; esac
+  while IFS=$'\t' read -r PG_CLASS PG_DIR; do
+    case "$PG_CLASS" in
+      repo-checks)
+        PG_RUN="$PLUGIN/bin/heimdall-repo-checks"
+        if [ -x "$PG_RUN" ]; then
+          PG_OUT=$("$PG_RUN" status --repo "$PG_DIR" 2>&1)
+          PG_RC=$?
+        else
+          PG_OUT="repo-checks: NOT GREEN - $PG_RUN is missing, so the record of this repository's own checks cannot be read"
+          PG_RC=127
+        fi
+        if [ "$PG_RC" = 0 ]; then
+          printf '%s\n' "$PG_OUT" >&2
+        else
+          ESC=$(printf '%s' "$PG_OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          PG_ESC=$(printf '%s' "$PG_DIR" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: pre-push repo-checks gate failed for %s. This repository declares its own checks (.heimdall/repo-checks.json), so a push needs a green, current, clean-tree record of them (the heimdall sweep rules do not apply to it). --- %s"}' "$PG_ESC" "$ESC")"
+        fi ;;
+      unmanaged)
+        printf 'heimdall: WARNING - %s is not managed by hmd (no heimdall sweep regime, no .heimdall/repo-checks.json), so no test or lint gate ran for this push; the secret gates below still apply. To gate it, declare its checks in .heimdall/repo-checks.json and record them: %s/bin/heimdall-repo-checks run --repo %s\n' "$PG_DIR" "$PLUGIN" "$PG_DIR" >&2 ;;
+      *)
+        cd "$PG_DIR" 2>/dev/null || true   # a directory that vanished: the gate then runs where the hook is, as it always did
+        QGOUT=$("$HSTATE" check-quality-gates 2>&1)
+        QGRC=$?
+        # Work merged from sub-agent worktrees is in no session's edit-tracker ledger, so the per-turn lint receipt never covers it. When
+        # the lint evidence is missing, stale or does not cover the push, lint everything changed since the last push (bounded well inside
+        # the hook's own time: a push gate that times out is a gate that lets the push through) and evaluate the gate once more.
+        if [ "$QGRC" = 2 ] && [ -x "$SLINT" ] && printf '%s' "$QGOUT" | grep -qE 'Lint not clean -- (no-evidence|stale|uncovered|no-coverage)'; then
+          printf 'heimdall: the lint receipt does not cover what this push ships - running %s --since-push (bounded)\n' "$SLINT" >&2
+          if command -v perl >/dev/null 2>&1; then perl -e 'alarm 45; exec @ARGV' "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true
+          else "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true; fi
+          QGOUT=$("$HSTATE" check-quality-gates 2>&1)
+          QGRC=$?
+        fi
+        if [ "$QGRC" = 2 ]; then
+          ESC=$(printf '%s' "$QGOUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          HINT=""
+          if printf '%s' "$QGOUT" | grep -q 'Lint not clean'; then
+            HINT=" Lint evidence for what this push ships: run \`$SLINT --since-push --repo $PWD\` (lints every file changed since the last push, merged agent work included; add --budget 300 for a big diff). A waiver is not the answer."
+          fi
+          HINT_ESC=$(printf '%s' "$HINT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing.%s --- %s"}' "$HINT_ESC" "$ESC")"
+        elif [ "$QGRC" = 0 ]; then
+          printf '%s\n' "$QGOUT" >&2
+        else
+          printf 'heimdall: quality-gate verdict UNAVAILABLE (exit %s) - the gates were NEVER EVALUATED, which is not a pass. Run `heimdall-state init` then `heimdall-state mark-clean` in this checkout to arm the pre-push gate. Allowing push to proceed. --- %s\n' "$QGRC" "$QGOUT" >&2
+        fi ;;
+    esac
+  done <<<"$PG_PLAN"
+  cd "$PG_HOME" 2>/dev/null || true
   if [ -x "$SCAN" ]; then
     if ! OUT=$(SECRET_SCAN_REQUIRE=1 "$SCAN" --require 2>&1); then
       ESC=$(printf '%s' "$OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')

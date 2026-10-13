@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# heimdall-repo-checks -- a repository's OWN checks, run and recorded, so the push gate can pass a push on that record.
+#
+# WHY. The PreToolUse push gate (bin/heimdall-precheck-bash) used to demand heimdall's sweep receipt of EVERY repository
+# it was asked to push, so a repository with six gates of its own (the site) was blocked for lacking a receipt that only
+# heimdall's own test/run-all.sh can write. A repository now declares its checks here and records a green run; the gate
+# passes its push on that record (`status` below is what the hook calls) and runs none of heimdall's sweep rules for it.
+#
+# DECLARATION  <repo>/.heimdall/repo-checks.json  (tracked)
+#                {"schema":1,"checks":[{"name":"integrity","cmd":"python3 gates/site-integrity.py"}, ...]}
+#              name: unique, non-empty. cmd: a shell command, run with `bash -c` from the repository root.
+# RECEIPT      <repo>/.heimdall/receipts/repo-checks.json  (ignored build output; written by `run`, atomically)
+#                {"schema":1,"head_sha":"<full sha>","tree_sha":"<sha of HEAD's tree>","decl_sha256":"<sha256 of the declaration>",
+#                 "dirty":false,"exit_code":0,"finished_at":"<UTC>",
+#                 "checks":[{"name":"...","cmd":"...","exit_code":0,"secs":3}, ...]}
+#
+# Usage:
+#   heimdall-repo-checks run    [--repo PATH]   run every declared check, in order, from the repo root, one after the
+#                                               other even when one fails; record each check's exit code and seconds
+#   heimdall-repo-checks status [--repo PATH]   is the receipt green AND current? prints one verdict line
+#   heimdall-repo-checks -h | --help
+#   --repo PATH   any path inside the repository (default: the cwd); the toplevel is resolved with git
+#
+# GREEN AND CURRENT, all of it (anything less is NOT GREEN, and the push gate blocks):
+#   1. a receipt exists, is valid JSON, schema 1
+#   2. head_sha is the repository's HEAD now (a commit after the run makes it STALE)
+#   3. tree_sha is the tree of that HEAD, recomputed now
+#   4. decl_sha256 is the sha256 of the declaration file as it is now: the receipt is for THESE checks, byte for byte
+#   5. dirty is the boolean false: no tracked file had uncommitted changes before the run, and no check left any behind
+#      (untracked files are not changes). A receipt that cannot prove a clean tree never counts.
+#   6. exit_code is the number 0 and every recorded check exited 0
+#   7. the recorded checks (name and cmd, in order) are the declared ones: a receipt listing fewer or other checks never counts
+#
+# WHAT THE BINDING IS, AND IS NOT. head_sha + tree_sha + decl_sha256 tie a receipt to the commit, the content and the check list
+# it was recorded for, and the gate recomputes all three, so a receipt copied from another commit or checkout, left over from an
+# older declaration, or written by hand without them is refused. It is a COOPERATING-AGENT CONTROL, not a security boundary,
+# exactly like heimdall's own .heimdall/receipts/last-sweep.json: the receipt is a plain local file, so anyone who can write it
+# can also write all three values correctly, or edit the declaration. It catches the stale, the mismatched, the copied and the
+# hand-edited-by-accident; it does not stop a local adversary, and the native hook of the repository and CI stay the backstop.
+#
+# EXIT  run: 0 every check green and the receipt written | 1 a check failed (the red receipt is still written) | 2 refused
+#       status: 0 green and current | 1 not | 2 refused
+#       refused (2): no .heimdall/repo-checks.json, an invalid declaration, not a git repository, a bad argument,
+#       jq, git or a sha256 tool missing, or the receipt cannot be written. `run` on a dirty tree exits 0 and warns: the
+#       checks passed, but the receipt it wrote will not satisfy the gate until the changes are committed and the checks run again.
+#
+# NO SECRETS. No flag takes a token; the environment is never printed or recorded (the checks inherit it unchanged); the
+# receipt holds names, commands (they are in the tracked declaration), exit codes and seconds, never output.
+#
+# Deliberately NO `set -e`: every step's exit code is read and decided on explicitly, and a failing check must not end the run.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNNER="$SELF_DIR/heimdall-repo-checks"
+
+usage() { sed -n '2,48p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+die() { printf 'heimdall-repo-checks: %s\n' "$2" >&2; exit "$1"; }
+
+SUB="${1:-}"
+case "$SUB" in
+  run|status) shift ;;
+  -h|--help) usage; exit 0 ;;
+  '') usage >&2; exit 2 ;;
+  *) printf 'heimdall-repo-checks: unknown command: %s\n' "$SUB" >&2; usage >&2; exit 2 ;;
+esac
+REPO_ARG="."
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) [ $# -ge 2 ] || die 2 "--repo needs a path"; REPO_ARG="$2"; shift 2 ;;
+    --repo=*) REPO_ARG="${1#--repo=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die 2 "unexpected argument: $1 (usage: heimdall-repo-checks run|status [--repo PATH])" ;;
+  esac
+done
+
+command -v jq >/dev/null 2>&1 || die 2 "jq is required"
+command -v git >/dev/null 2>&1 || die 2 "git is required"
+TOP="$(git -C "$REPO_ARG" rev-parse --show-toplevel 2>/dev/null)" || die 2 "not a git repository: $REPO_ARG"
+[ -n "$TOP" ] || die 2 "cannot resolve the toplevel of $REPO_ARG"
+DECL="$TOP/.heimdall/repo-checks.json"
+RECEIPT="$TOP/.heimdall/receipts/repo-checks.json"
+
+[ -f "$DECL" ] || die 2 "$TOP declares no checks of its own: $DECL does not exist. Declare them ({\"schema\":1,\"checks\":[{\"name\":\"...\",\"cmd\":\"...\"}]}) and track the file."
+jq -e '
+  type == "object" and .schema == 1 and (.checks | type) == "array" and (.checks | length) > 0
+  and all(.checks[]; type == "object" and (.name | type == "string" and length > 0) and (.cmd | type == "string" and length > 0))
+  and ([.checks[].name] | length) == ([.checks[].name] | unique | length)
+' "$DECL" >/dev/null 2>&1 \
+  || die 2 "$DECL is not a valid declaration: want {\"schema\":1,\"checks\":[{\"name\":\"...\",\"cmd\":\"...\"}, ...]} with at least one check, each with a non-empty name (unique) and cmd"
+
+head_sha() { git -C "$TOP" rev-parse HEAD 2>/dev/null; }
+tree_sha() { git -C "$TOP" rev-parse 'HEAD^{tree}' 2>/dev/null; }
+# sha256_of FILE -- the hex digest, or nothing when no sha256 tool exists (the callers refuse on nothing).
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" 2>/dev/null | sed 's/^.*= //'
+  fi
+}
+# tree_dirty: 0 when a tracked file has uncommitted changes, or when that cannot be read (what cannot be proven clean is not clean).
+tree_dirty() {
+  local changes
+  changes="$(git -C "$TOP" status --porcelain --untracked-files=no 2>/dev/null)" || return 0
+  [ -n "$changes" ]
+}
+
+cmd_run() {
+  local head tree decl_sha decl_after dirty n i name cmd t0 secs rc results="" failed=0 code finished rdir tmp
+  head="$(head_sha)" || die 2 "cannot read HEAD of $TOP (no commits yet?)"
+  tree="$(tree_sha)" || die 2 "cannot read the tree of HEAD in $TOP"
+  decl_sha="$(sha256_of "$DECL")"
+  [ -n "$decl_sha" ] || die 2 "cannot hash $DECL: no sha256 tool (shasum, sha256sum or openssl) found"
+  dirty=false
+  if tree_dirty; then dirty=true; fi
+  n="$(jq '.checks | length' "$DECL")"
+  printf 'heimdall-repo-checks: running %s check(s) of %s at %s\n' "$n" "$TOP" "${head:0:12}" >&2
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    name="$(jq -r --argjson i "$i" '.checks[$i].name' "$DECL")"
+    cmd="$(jq -r --argjson i "$i" '.checks[$i].cmd' "$DECL")"
+    printf '== [%s/%s] %s\n' "$((i + 1))" "$n" "$name" >&2
+    t0="$(date +%s)"
+    ( cd "$TOP" && exec bash -c "$cmd" </dev/null )
+    rc=$?
+    secs=$(( $(date +%s) - t0 ))
+    results="${results}$(jq -nc --arg n "$name" --arg c "$cmd" --argjson e "$rc" --argjson s "$secs" '{name: $n, cmd: $c, exit_code: $e, secs: $s}')"$'\n'
+    if [ "$rc" -eq 0 ]; then
+      printf '   PASS %s (%ss)\n' "$name" "$secs" >&2
+    else
+      printf '   FAIL %s (exit %s, %ss)\n' "$name" "$rc" "$secs" >&2
+      failed=$((failed + 1))
+    fi
+    i=$((i + 1))
+  done
+  if tree_dirty; then dirty=true; fi
+  decl_after="$(sha256_of "$DECL")"
+  if [ "$decl_after" != "$decl_sha" ]; then
+    dirty=true
+    printf 'heimdall-repo-checks: a check rewrote %s while it ran, so the receipt does not describe the declared checks\n' "$DECL" >&2
+  fi
+  if [ "$(head_sha)" != "$head" ]; then
+    printf 'heimdall-repo-checks: HEAD moved while the checks ran; the receipt describes %s, so it is stale already\n' "${head:0:12}" >&2
+  fi
+  code=0
+  if [ "$failed" -ne 0 ]; then code=1; fi
+  finished="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  rdir="$(dirname "$RECEIPT")"
+  mkdir -p "$rdir" || die 2 "cannot create $rdir"
+  tmp="$(mktemp "$rdir/.repo-checks.XXXXXX")" || die 2 "cannot write in $rdir"
+  trap 'rm -f "$tmp"' EXIT
+  printf '%s' "$results" \
+    | jq -s --arg head "$head" --arg tree "$tree" --arg decl "$decl_sha" --argjson dirty "$dirty" --argjson code "$code" --arg at "$finished" \
+        '{schema: 1, head_sha: $head, tree_sha: $tree, decl_sha256: $decl, dirty: $dirty, exit_code: $code, finished_at: $at, checks: .}' > "$tmp" \
+    || die 2 "cannot build the receipt"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$RECEIPT" || die 2 "cannot write $RECEIPT"
+  trap - EXIT
+  if [ "$dirty" = true ]; then
+    printf 'heimdall-repo-checks: WARNING - tracked files had uncommitted changes before or after the run, so the receipt records dirty:true and will NOT satisfy the push gate. Commit, then run again.\n' >&2
+  fi
+  if [ "$code" -eq 0 ]; then
+    printf 'heimdall-repo-checks: %s/%s check(s) passed - receipt %s\n' "$n" "$n" "$RECEIPT" >&2
+  else
+    printf 'heimdall-repo-checks: %s of %s check(s) FAILED - the red receipt is at %s\n' "$failed" "$n" "$RECEIPT" >&2
+  fi
+  [ "$code" -eq 0 ]
+}
+
+# not_green <reason> -- the one verdict line (stdout), always ending with the command that turns it green; exits 1.
+not_green() {
+  printf 'repo-checks: NOT GREEN - %s. Run: %s run --repo %s\n' "$1" "$RUNNER" "$TOP"
+  exit 1
+}
+
+cmd_status() {
+  local head tree decl_sha rec_head rec_shown rec_tree rec_decl failing why
+  head="$(head_sha)" || not_green "cannot read HEAD of $TOP (no commits yet)"
+  tree="$(tree_sha)" || not_green "cannot read the tree of HEAD in $TOP"
+  decl_sha="$(sha256_of "$DECL")"
+  [ -n "$decl_sha" ] || not_green "cannot hash $DECL: no sha256 tool (shasum, sha256sum or openssl) found"
+  [ -f "$RECEIPT" ] || not_green "no receipt at $RECEIPT (the declared checks have never been recorded in this checkout)"
+  jq -e . "$RECEIPT" >/dev/null 2>&1 || not_green "the receipt at $RECEIPT is not valid JSON"
+  jq -e '.schema == 1' "$RECEIPT" >/dev/null 2>&1 || not_green "the receipt has an unknown schema (want 1)"
+  rec_head="$(jq -r '.head_sha // empty' "$RECEIPT")"
+  if [ "$rec_head" != "$head" ]; then
+    rec_shown="${rec_head:0:12}"
+    not_green "STALE: the receipt is for ${rec_shown:-<none>}, HEAD is ${head:0:12} (commits landed since the checks ran)"
+  fi
+  rec_tree="$(jq -r '.tree_sha // empty' "$RECEIPT")"
+  if [ "$rec_tree" != "$tree" ]; then
+    rec_shown="${rec_tree:0:12}"
+    not_green "the receipt's tree sha (${rec_shown:-<none>}) is not the tree of HEAD (${tree:0:12}), so it does not describe this commit's content"
+  fi
+  rec_decl="$(jq -r '.decl_sha256 // empty' "$RECEIPT")"
+  if [ "$rec_decl" != "$decl_sha" ]; then
+    rec_shown="${rec_decl:0:12}"
+    not_green "the declaration changed since the receipt was written (its sha256 is ${decl_sha:0:12}, the receipt is for ${rec_shown:-<none>})"
+  fi
+  jq -e '.dirty == false' "$RECEIPT" >/dev/null 2>&1 \
+    || not_green "the checks ran with uncommitted tracked changes (dirty is not false), so the record does not describe the commit being pushed"
+  if ! jq -e '(.exit_code | type) == "number" and .exit_code == 0 and (.checks | type) == "array" and ([.checks[] | .exit_code] | all(. == 0))' "$RECEIPT" >/dev/null 2>&1; then
+    failing="$(jq -r '[.checks[]? | select(.exit_code != 0) | .name] | join(", ")' "$RECEIPT" 2>/dev/null)"
+    why="the receipt does not record a clean run (exit_code is not the number 0)"
+    if [ -n "$failing" ]; then why="check(s) failed: $failing"; fi
+    not_green "RED - $why"
+  fi
+  if [ "$(jq -c '[.checks[] | {name, cmd}]' "$DECL")" != "$(jq -c '[.checks[]? | {name, cmd}]' "$RECEIPT")" ]; then
+    not_green "the receipt records other checks than the declared ones (the declaration lists $(jq '.checks | length' "$DECL"), the receipt names $(jq '[.checks[]?] | length' "$RECEIPT"))"
+  fi
+  printf 'repo-checks: GREEN - %s check(s) passed at %s on a clean tree (finished %s)\n' \
+    "$(jq '.checks | length' "$RECEIPT")" "${head:0:12}" "$(jq -r '.finished_at // "?"' "$RECEIPT")"
+}
+
+case "$SUB" in
+  run) cmd_run; exit $? ;;
+  status) cmd_status; exit $? ;;
+esac
