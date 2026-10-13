@@ -3,8 +3,9 @@
 test/lib/app_pair_code_app_cases.py share: a throwaway sandbox (HOME, repo, TMPDIR), a process
 wrapper that keeps everything a child printed, the "phone" side of a pairing (a keypair plus the
 independent hashlib references for the commitment and the SAS), a file scanner for "this secret is
-nowhere on disk", and the ok/FAIL tally in the suite convention ("  ok   N. ..." / "  FAIL N. ..."
-and a final "P passed, F failed" line).
+nowhere on disk", the ok/FAIL tally in the suite convention ("  ok   N. ..." / "  FAIL N. ..."
+and a final "P passed, F failed" line), and the runner that gives each case of a case file a process
+of its own, a few at a time (run_main).
 
 Nothing here talks to the real relay or the real GitHub: the relay is test/lib/fake_relay_code.py on
 a loopback port, `gh` is a script the test writes into the sandbox, and TOKEN is an obviously fake
@@ -13,11 +14,13 @@ string that matches no real credential pattern.
 Stdlib only.
 """
 import base64
+import concurrent.futures
 import hashlib
 import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -74,6 +77,73 @@ class Tally:
         print("\n%d passed, %d failed" % (self.passed, self.failed))
         sys.stdout.flush()
         return 0 if self.failed == 0 else 1
+
+
+# -- running a case file: a process per case, a few at a time -----------------------------------------------------
+# The cases of a file are independent of one another -- each has its own sandbox (HOME, repo, TMPDIR, HEIMDALL_HOME), its own relay
+# on a port the OS hands out and its own clock -- and nearly all of their time goes to waiting: for a client to start, a window to
+# renew, a prompt to appear, a TTL to lapse. Run one after another the two files took 285 s solo (86 s of it CPU), most of the
+# sweep's 400 s suite budget and past it on a loaded machine. So with no case named, a file's main() runs every case in a process of
+# its own (`<file> CASE`), CASE_JOBS at a time, and reports what each printed in the order the cases are declared, under one tally.
+# Naming cases runs just those, in this process, one after another.
+CASE_JOBS = 6
+RESULT_LINE = re.compile(r"^  (ok|FAIL) +\d+\. (.*)$")
+TALLY_LINE = re.compile(r"^(\d+) passed, (\d+) failed$")
+
+
+def case_in_child(script, name):
+    """(exit code, everything it printed, stderr included) of one case run alone in a process of its own."""
+    proc = subprocess.run([sys.executable, script, name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          encoding="utf-8", errors="replace")
+    return proc.returncode, proc.stdout
+
+
+def report_children(tally, script, names):
+    """Run each named case of `script` in a process of its own, CASE_JOBS at a time, and print what they printed in the order given:
+    the result lines renumbered as one run's, each child's tally folded into `tally`. A child that ends without a tally (killed,
+    crashed) is one failure that says so. The exit status of the whole."""
+    passed = failed = shown = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CASE_JOBS) as pool:
+        children = [(name, pool.submit(case_in_child, script, name)) for name in names]
+        for name, child in children:
+            code, text = child.result()
+            tallied = False
+            for line in text.splitlines():
+                counts, result = TALLY_LINE.match(line), RESULT_LINE.match(line)
+                if counts:
+                    tallied = True
+                    passed, failed = passed + int(counts.group(1)), failed + int(counts.group(2))
+                elif result:
+                    shown += 1
+                    print("  %s%d. %s" % ("ok   " if result.group(1) == "ok" else "FAIL ", shown, result.group(2)))
+                elif line.strip():
+                    print(line)
+            if not tallied:
+                shown, failed = shown + 1, failed + 1
+                print("  FAIL %d. %s ended without a tally (exit %r) -- %s" % (shown, name, code, " ".join(text.split())[-300:]))
+            sys.stdout.flush()
+    tally.passed, tally.failed = passed, failed
+    return tally.finish()
+
+
+def run_main(tally, script, cases):
+    """The main() of a case file. No argument: every case, each in a process of its own (report_children). Arguments name the cases to
+    run alone, here, one after another -- a quick look while working on one; a name that is no case of the file is exit 2, not a
+    green run of nothing."""
+    by_name = {case.__name__: case for case in cases}
+    wanted = sys.argv[1:]
+    unknown = [name for name in wanted if name not in by_name]
+    if unknown:
+        print("no such case: %s (cases: %s)" % (", ".join(unknown), ", ".join(by_name)), file=sys.stderr)
+        return 2
+    if not wanted:
+        return report_children(tally, script, list(by_name))
+    for name in wanted:
+        try:
+            by_name[name]()
+        except Exception as exc:  # a case that dies is a failure, not a crash of the whole run
+            tally.check(False, "%s raised %s: %s" % (name, type(exc).__name__, exc))
+    return tally.finish()
 
 
 # -- independent references (hashlib only, never the code under test) ---------------------------------

@@ -401,13 +401,10 @@ def case_end_to_end():
 
 
 def main():
-    for case in (case_default_transport, case_token_path_and_code, case_off_paths, case_flags,
-                 case_bg_with_no_confirm, case_prompt, case_identity_revoke, case_end_to_end):
-        try:
-            case()
-        except Exception as exc:  # a case that dies is a failure, not a crash of the whole run
-            T.check(False, "%s raised %s: %s" % (case.__name__, type(exc).__name__, exc))
-    return T.finish()
+    # no case named: each in a process of its own, a few at a time (pair_code_harness.run_main); `CASE...` runs just those, here
+    return H.run_main(T, os.path.realpath(__file__),
+                      (case_default_transport, case_token_path_and_code, case_off_paths, case_flags,
+                       case_bg_with_no_confirm, case_prompt, case_identity_revoke, case_end_to_end))
 
 
 if __name__ == "__main__":
