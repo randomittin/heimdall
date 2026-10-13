@@ -59,7 +59,8 @@
 #      left more than HMD_TEST_TMP_LEAK_MAX_MB (default 50) MB behind, or anything at all under HMD_TEST_STRICT_TMP=1,
 #      fails the run (TMP LEAK); a smaller leftover is a loud warning (TMP LEFTOVERS). New top-level entries in /tmp and
 #      in the real $TMPDIR (a hard-coded /tmp path) are reported and attributed by mtime window (tmp_outside): a
-#      warning, never deleted, a failure only under strict. It exists because free space dropped 1.6 GB while agents
+#      warning, never deleted; a failure under strict, and when one is over the same MB limit (TMP LEAK OUTSIDE TMPDIR: a child
+#      started with env -i drops TMPDIR and writes to the real one). It exists because free space dropped 1.6 GB while agents
 #      ran suites that never removed their mktemp dirs, and nothing said so. Without test/lib/run-all-guards.sh next
 #      to this script (a fixture copy) suites share TMPDIR as before. Proof: test/run-all-guards.test.sh sections 5-8.
 #

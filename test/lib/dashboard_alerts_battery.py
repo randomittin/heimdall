@@ -3,10 +3,12 @@
 the push kind `tile_alert`). Real modules, hermetic: HEIMDALL_HOME and the repo are a temp dir, the Expo endpoint is test/lib/push_test_lib.py's
 loopback FakeExpo, the clock is injected (publish_panel(now=...)). Prints `ok <text>` / `bad <text>` lines; exit 0 even when something is bad
 (the bash runner tallies). Usage: dashboard_alerts_battery.py [--lib DIR]  (DIR = a copy of bin/lib; the mutant runs point it at a patched one)."""
+import atexit
 import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -22,6 +24,7 @@ if "--lib" in sys.argv:
     LIB = sys.argv[sys.argv.index("--lib") + 1]
 
 TMP = tempfile.mkdtemp(prefix="hmd-alerts-")
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)     # one battery run per mutant: nothing removed this dir, and 782 of them (104 MB) piled up in one user temp dir
 HOME = os.path.join(TMP, "home")
 ROOT = os.path.join(TMP, "proj")
 os.makedirs(HOME, mode=0o700)

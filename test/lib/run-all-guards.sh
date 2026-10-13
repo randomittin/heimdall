@@ -49,6 +49,11 @@
 #           and are ignored. A WARNING by default and never deleted -- attribution is a mtime hint (suites overlap --jobs wide, and
 #           the machine has other writers), so failing the sweep on it would make a busy box randomly red; HMD_TEST_STRICT_TMP=1
 #           (for a quiet machine) makes them findings too.
+#         - THE EXCEPTION IS SIZE (2026-10-14): an outside entry over the same HMD_TEST_TMP_LEAK_MAX_MB limit is a FINDING too (TMP LEAK OUTSIDE
+#           TMPDIR). It is the same disk, and the shape that filled it was a 100 MB pip-unpack-* dir written outside any TMPDIR by a child started with
+#           `env -i` (which drops TMPDIR): below the limit a warning is enough, above it a red sweep is the point. HMD_TEST_TMP_OUTSIDE_MAX (default
+#           2000) bounds how many new entries are examined, and the ones beyond it are COUNTED and said loudly (NOT FULLY CHECKED) -- the old fixed 300,
+#           taken in name order, skipped a pip-* dir behind 300 hmd-agents.* ones without a word.
 #   Needs from the caller: RUN, TO_RUN, WORK (and RED/YEL/BLD/OFF for colour, optional). Sets TMP_ROOT (begin) and TMP_GUARD_RAN,
 #   TMP_FINDINGS, TMP_LEAK_SUITES, TMP_LEAK_BYTES, TMP_OUTSIDE_COUNT (guard); writes $WORK/tmp-leaks.tsv, tmp-outside.tsv (what the
 #   receipt is built from), tmp-section.txt (the loud text) and tmp-summary.txt (the summary lines).
@@ -179,7 +184,15 @@ hmd_test_tmp_begin() {
   # `mktemp -d -t p` answered with the user temp dir whatever TMPDIR said), which would put every suite's `mktemp -d` straight back OUTSIDE its
   # own dir. Probe once; only when it ignores TMPDIR, put a shim first on PATH (the suites inherit it) that answers exactly those forms from
   # $TMPDIR and passes everything else -- explicit templates, -p, -u -- to the real mktemp. A mktemp that honours TMPDIR gets no shim.
-  local probe="$TMP_ROOT/.probe" got real
+  hmd_test_mktemp_shim "$TMP_ROOT"
+  hmd_test_tmp_snapshot "$work/tmp-outside-before.txt"
+}
+
+# hmd_test_mktemp_shim DIR -- the probe-and-shim described above, on its own, so a suite run ALONE (test/lib/private-tmp.sh) gets the same answer as one run by the
+# sweep: a template-less mktemp lands under $TMPDIR. DIR is owned (and removed) by the caller; the probe dir and the shim live in it. Sets and exports
+# HMD_MKTEMP_SHIM_DIR when it installs a shim -- a child whose PATH is rebuilt (`env -i ... PATH=...`) puts that directory first to keep the shim.
+hmd_test_mktemp_shim() {
+  local dir="$1" probe="$1/.probe" got real
   mkdir -p "$probe" 2>/dev/null
   got="$(TMPDIR="$probe" mktemp -d 2>/dev/null)"
   case "$got" in
@@ -190,7 +203,7 @@ hmd_test_tmp_begin() {
       case "$real" in
         /*\'*|/*\ *|'') echo "run-all: this platform's mktemp ignores TMPDIR and no usable path to it was found -- suites' mktemp dirs may land outside their own TMPDIR" >&2 ;;
         /*)
-          mkdir -p "$TMP_ROOT/.shim" 2>/dev/null
+          mkdir -p "$dir/.shim" 2>/dev/null
           { printf '#!/bin/sh\nreal=%s\n' "'$real'"; cat <<'SHIMEOF'
 d=""; prefix=tmp
 if [ "$#" -eq 1 ] && [ "$1" = -d ]; then d=-d
@@ -202,13 +215,13 @@ fi
 base="${TMPDIR:-/tmp}"; base="${base%/}"
 exec "$real" $d "$base/$prefix.XXXXXXXX"
 SHIMEOF
-          } > "$TMP_ROOT/.shim/mktemp" 2>/dev/null && chmod +x "$TMP_ROOT/.shim/mktemp" && { PATH="$TMP_ROOT/.shim:$PATH"; export PATH; }
+          } > "$dir/.shim/mktemp" 2>/dev/null && chmod +x "$dir/.shim/mktemp" && { PATH="$dir/.shim:$PATH"; HMD_MKTEMP_SHIM_DIR="$dir/.shim"; export PATH HMD_MKTEMP_SHIM_DIR; }
           ;;
       esac
       ;;
   esac
   rmdir "$probe" 2>/dev/null
-  hmd_test_tmp_snapshot "$work/tmp-outside-before.txt"
+  return 0
 }
 
 # hmd_test_suite_tmp_settle DIR LEAKFILE -- DIR is a suite's own TMPDIR ($TMP_ROOT/<idx>) and its suite has ended AND its process group
@@ -248,15 +261,16 @@ _hmd_tmp_rows() {
 # and the summary lines in $WORK/tmp-summary.txt, which run-all.sh prints where its other sections go.
 hmd_test_tmp_guard() {
   local work="$1" tab=$'\t' max_mb="${HMD_TEST_TMP_LEAK_MAX_MB:-50}" strict=0 max_b i=0 j line b e s name rest why limit_txt dirs foreign_txt
-  local n_leak=0 n_over=0 sum_b=0 n_out=0 n_foreign=0 p mt kb cands s0 s1 sfx checked=0
+  local n_leak=0 n_over=0 sum_b=0 n_out=0 n_foreign=0 p mt kb cands s0 s1 sfx checked=0 n_out_big=0 n_new=0 n_skip=0 out_cap
   local R="${RED:-}" Y="${YEL:-}" B="${BLD:-}" O="${OFF:-}"
   TMP_GUARD_RAN=1; TMP_FINDINGS=0; TMP_LEAK_SUITES=0; TMP_LEAK_BYTES=0; TMP_OUTSIDE_COUNT=0
   [ "${HMD_TEST_STRICT_TMP:-0}" = 1 ] && strict=1
   case "$max_mb" in ''|*[!0-9]*) max_mb=50 ;; esac
   max_b=$((max_mb * 1048576))
+  out_cap="${HMD_TEST_TMP_OUTSIDE_MAX:-2000}"; case "$out_cap" in ''|*[!0-9]*|0) out_cap=2000 ;; esac
   if [ "$strict" -eq 1 ]; then limit_txt="the strict limit (any leftover)"; else limit_txt="the ${max_mb} MB limit"; fi
   : > "$work/tmp-leaks.tsv"; : > "$work/tmp-leaks-over.tsv"; : > "$work/tmp-leaks-under.tsv"
-  : > "$work/tmp-outside.tsv"; : > "$work/tmp-section.txt"; : > "$work/tmp-summary.txt"
+  : > "$work/tmp-outside.tsv"; : > "$work/tmp-outside-big.tsv"; : > "$work/tmp-section.txt"; : > "$work/tmp-summary.txt"
   # name -> dir map, for attribution: which per-suite dir (s<N>) belonged to which suite, so a path found in a log, an orphan's cwd or a leftover traces back to its suite.
   : > "$work/tmp-dirs.tsv"
   while [ "$i" -lt "${TO_RUN:-0}" ]; do printf '%s\ts%d\n' "${RUN[$i]##*/}" "$i" >> "$work/tmp-dirs.tsv"; i=$((i + 1)); done
@@ -286,6 +300,7 @@ hmd_test_tmp_guard() {
     checked=1
     hmd_test_tmp_snapshot "$work/tmp-outside-after.txt"
     LC_ALL=C comm -13 "$work/tmp-outside-before.txt" "$work/tmp-outside-after.txt" > "$work/tmp-outside-new.txt" 2>/dev/null
+    n_new="$(wc -l < "$work/tmp-outside-new.txt" | tr -d '[:space:]')"; case "$n_new" in ''|*[!0-9]*) n_new=0 ;; esac
     : > "$work/tmp-windows.txt"
     j=0
     while [ "$j" -lt "${TO_RUN:-0}" ]; do
@@ -307,7 +322,12 @@ hmd_test_tmp_guard() {
       kb="$(du -sk "$p" 2>/dev/null | awk '{print $1}')"
       printf '%s\t%s\t%s\t%s\n' "$p" "$(( ${kb:-0} * 1024 ))" "$mt" "$cands" >> "$work/tmp-outside.tsv"
       n_out=$((n_out + 1))
-    done < <(head -n 300 "$work/tmp-outside-new.txt")
+      if [ "$(( ${kb:-0} * 1024 ))" -gt "$max_b" ]; then
+        printf '%s\t%s\t%s\t%s\n' "$p" "$(( ${kb:-0} * 1024 ))" "$mt" "$cands" >> "$work/tmp-outside-big.tsv"
+        n_out_big=$((n_out_big + 1))
+      fi
+    done < <(head -n "$out_cap" "$work/tmp-outside-new.txt")
+    [ "$n_new" -le "$out_cap" ] || n_skip=$((n_new - out_cap))
   fi
 
   # 3. the loud text, then the summary lines.
@@ -321,6 +341,15 @@ hmd_test_tmp_guard() {
     _hmd_tmp_rows "$work/tmp-leaks-under.tsv" 15 >> "$work/tmp-section.txt"
   fi
   dirs="$(hmd_test_tmp_watch_dirs | paste -sd, -)"
+  if [ "$n_out_big" -gt 0 ]; then
+    printf '%s%sTMP LEAK OUTSIDE TMPDIR (%d)%s -- new top-level entr%s of more than %d MB in %s while these suites ran, written outside their own TMPDIR (a hard-coded /tmp path, or a child started with env -i, which drops TMPDIR). NOT removed (attribution is by mtime window), but a leak this size is what filled the disk (a pip-unpack-* dir is 100 MB), so it fails the run:\n' "$R" "$B" "$n_out_big" "$O" "$([ "$n_out_big" = 1 ] && echo y || echo ies)" "$max_mb" "$dirs" >> "$work/tmp-section.txt"
+    LC_ALL=C sort -t "$tab" -k2,2nr "$work/tmp-outside-big.tsv" | head -n 10 | while IFS="$tab" read -r p b mt cands; do
+      printf '  %-60s %9s  (mtime %s -- running then: %s)\n' "$p" "$(hmd_test_fmt_bytes "$b")" "$mt" "$cands" >> "$work/tmp-section.txt"
+    done
+  fi
+  if [ "$n_skip" -gt 0 ]; then
+    printf '%s%sTMP OUTSIDE TMPDIR NOT FULLY CHECKED%s -- %d new top-level entries appeared in %s, only the first %d (by name) were examined; HMD_TEST_TMP_OUTSIDE_MAX raises the bound\n' "$Y" "$B" "$O" "$n_new" "$dirs" "$out_cap" >> "$work/tmp-section.txt"
+  fi
   if [ "$n_out" -gt 0 ]; then
     printf '%s%sTMP OUTSIDE TMPDIR (%d)%s -- new top-level entr%s in %s while these suites ran (a hard-coded /tmp path, or a suite that reset TMPDIR). NOT removed: whose they are cannot be proved, attribution is by mtime window and suites overlap:\n' "$Y" "$B" "$n_out" "$O" "$([ "$n_out" = 1 ] && echo y || echo ies)" "$dirs" >> "$work/tmp-section.txt"
     LC_ALL=C sort -t "$tab" -k2,2nr "$work/tmp-outside.tsv" | head -n 20 | while IFS="$tab" read -r p b mt cands; do
@@ -336,6 +365,7 @@ hmd_test_tmp_guard() {
   if [ "$checked" -eq 1 ]; then
     foreign_txt=""
     [ "$n_foreign" -eq 0 ] || foreign_txt="; $n_foreign more had no suite running when written (other processes) and are ignored"
+    [ "$n_skip" -eq 0 ] || foreign_txt="$foreign_txt; $n_skip more new entries were NOT examined (HMD_TEST_TMP_OUTSIDE_MAX=$out_cap)"
     if [ "$n_out" -gt 0 ]; then
       printf 'tmp outside: %d new entr%s at the top level of %s while suites ran (listed above, NOT removed)%s\n' "$n_out" "$([ "$n_out" = 1 ] && echo y || echo ies)" "$dirs" "$foreign_txt" >> "$work/tmp-summary.txt"
     else
@@ -347,7 +377,7 @@ hmd_test_tmp_guard() {
     printf 'tmp sockets: %s bytes left under the per-suite temp dir for a unix socket path (limit 104; target %s; the longest socket the suites build needs %s)%s\n' "$SOCK_HEADROOM" "${SOCK_TARGET:-?}" "${SOCK_NEED:-?}" "$([ "$SOCK_HEADROOM" -lt "${SOCK_TARGET:-0}" ] && printf ' -- BELOW TARGET')" >> "$work/tmp-summary.txt"
   fi
   TMP_LEAK_SUITES=$n_leak; TMP_LEAK_BYTES=$sum_b; TMP_OUTSIDE_COUNT=$n_out
-  TMP_FINDINGS=$n_over
+  TMP_FINDINGS=$((n_over + n_out_big))
   [ "$strict" -eq 1 ] && TMP_FINDINGS=$((n_over + n_out))
   return 0
 }
