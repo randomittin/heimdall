@@ -35,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself, revoking its session, within `HMD_SESSION_LOGIN_CHECK_S` (2 s) of its login being marked or gone; a store it merely cannot read ends nothing. Tests:
   `test/app-session-revoke-race.test.sh`.
 
+### Fixed
+- `release/ship.sh --npm-only` and `--release-only` no longer refuse the sweep receipt a full ship has just used. The ship grades the receipt BEFORE its version bump, so its
+  own `chore(release): vX.Y.Z` commit (one no sweep ever saw) made that receipt look stale, and the npm-drift recovery died with "graded <the commit before the bump>, HEAD is
+  <the bump>" although nothing had landed since. In these two post-tag modes the receipt now also covers HEAD when the only change past the graded commit is the TAGGED
+  `chore(release): vX.Y.Z` commit and that commit does nothing but re-pin version files: every changed path is one the bump writes (`RELEASE_BUMP_PATHS`) or `CHANGELOG.md`, the
+  edits are in place with file modes untouched, each file differs from its parent only in version numbers and sha256 digests (`CHANGELOG.md` only in the release heading), the
+  commit has exactly one parent, its subject is exactly `chore(release): v<version>`, the manifest version really moved, and the tag `v<version at HEAD>` names it. Journal and
+  ledger commits (the hook-owned paths) never stale a receipt, before or after the bump. `--npm-only` publishes the working tree at HEAD, not a checkout of the tag, so HEAD stays
+  what is graded and the tagged bump is one more allowed hop in the chain, not a second thing to grade. Anything else still refuses, now with the reason the exemption did not apply.
+  A new full ship (it grades the commit it is about to bump), the pre-push gate and `bin/heimdall-state` are unchanged. Test: `test/ship-npm-only-after-bump.test.sh` (the real full
+  ship in a throwaway repo, then the real `--npm-only` with nothing landed in between, and the shapes that must still be refused).
+
 ## Changelog status
 
 This file was not maintained between the last curated entry below (from when the

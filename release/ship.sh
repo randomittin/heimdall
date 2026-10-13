@@ -100,6 +100,10 @@ ship.sh — bump, scan, push, verify, and release in one step.
 A release (tag, GitHub Release or npm publish) requires a green FULL sweep receipt at HEAD
 (receipts/last-full-green.json, written by `bash test/run-all.sh`); the incremental `--since-green`
 receipt the push gate accepts is not enough, and nothing is bumped without it.
+--release-only and --npm-only run AFTER the tag exists, so they also accept the receipt that graded the
+commit BEFORE this version's own tagged `chore(release): vX.Y.Z` commit, provided that commit only re-pins
+version files (a full ship checks the receipt before it bumps; its own bump must not stale it for the
+recovery run). Anything else past the graded commit still refuses, with the reason.
 Stops at the first failure. Nothing is pushed if the local scan finds leaks.
 A run that CANNOT publish a release or publish to npm fails loudly in preflight — it
 never bumps, warns, and exits 0 (that silent skip is what stranded v2.2.3/v2.0.17/v2.0.13
@@ -135,6 +139,172 @@ write_version() {  # $1=new version — rewrite plugin.json's version field in p
   grep -Eq "\"version\"[[:space:]]*:[[:space:]]*\"${new}\"" "$tmp" \
     || { rm -f "$tmp"; die "version rewrite did not take (manifest format unexpected)"; }
   mv "$tmp" "$PLUGIN_MANIFEST"
+}
+
+# ── The release commit and the sweep receipt ─────────────────────────────────
+# WHY THIS EXISTS (the bump staled its own receipt). A full ship grades the green FULL sweep receipt BEFORE it bumps, so it grades the commit it was asked to ship.
+# The bump then commits `chore(release): vX.Y.Z` -- one commit no sweep ever saw -- and tags it, and from then on every check of the receipt at HEAD refused it: a
+# `--npm-only` run after a failed or skipped npm publish (the npm-drift recovery) died with "graded <the commit before the bump>, HEAD is <the bump>" although nothing had
+# landed since. The ship had invalidated its own authority.
+#
+# THE RULE (the post-tag modes only, --npm-only and --release-only; a NEW full ship still grades the commit it is about to bump, strictly). The receipt that graded
+# <receipt-sha> covers HEAD when every hop of the chain
+#     receipt -> [hook-owned commits] -> parent of the release commit -> [the release commit] -> [hook-owned commits] -> HEAD
+# is one that cannot change what was proven:
+#   - a hook-owned commit touches only paths this repo's OWN hooks write (bin/lib/hook-owned-path.sh: journal entries, ledger records) -- the standing rule, unchanged;
+#   - the release commit is the commit the tag v<version at HEAD> names, has exactly one parent, is titled exactly `chore(release): v<version>`, really moves the manifest
+#     version, and re-pins version files and nothing else (release_commit_pins_only).
+#
+# HEAD OR THE TAG? --npm-only publishes the WORKING TREE: `npm publish` runs inside packages/<name> of this checkout and nothing is ever checked out from the tag. What ships is
+# HEAD, so HEAD is what the receipt must vouch for. Grading the tag commit instead would certify bytes that are not the bytes published whenever HEAD has moved past the tag
+# (a code commit landed after the release would sail through). So the receipt is still graded at HEAD and the tagged bump is one more allowed hop in the chain. That also
+# answers the journal question: journal/ledger auto-commits landing after the bump are hook-owned hops like any other and never stale the receipt. --release-only tags (when
+# need be), signs and publishes from HEAD too, so the same reasoning holds. A --release-only run that has to CREATE the tag (the ship died between the bump and the tag) cannot
+# use the exemption -- with no tag nothing says this commit was ever shipped -- and needs a fresh sweep, exactly as before.
+#
+# FAIL CLOSED. Anything that cannot be answered (a tag that does not resolve, a commit that is no ancestor, a file git cannot show, a mode, a status the bump never produces) is
+# a refusal that names its reason; require_full_sweep_receipt appends that reason to its STALE message. Nothing below writes, tags, commits or pushes.
+
+# RELEASE_BUMP_PATHS -- every file the version bump writes and commits, one per line, enumerated from the bump step at the bottom of this script: write_version (the manifest),
+# bump_default_ref (install.sh), render_version_surfaces (VERSION, README.md) and sync_release_artifacts (release/sync-release.sh: both npx wrappers' package.json,
+# packages/runheimdall/README.md -- the byte copy of README.md -- vercel.json, _redirects; the manifest again). test/ship-npm-only-after-bump.test.sh runs the REAL bump and
+# fails unless the files it changes are exactly this list, and checks the newest real `chore(release)` commit against the shape rule, so a bump that learns a new file cannot
+# go unnoticed. CHANGELOG.md is the one other path the exemption admits, and only in its release heading (the bump writes it nowhere today).
+RELEASE_BUMP_PATHS=".claude-plugin/plugin.json
+VERSION
+README.md
+install.sh
+_redirects
+vercel.json
+packages/runheimdall/README.md
+packages/runheimdall/package.json
+packages/runhmd/package.json"
+
+# What a pure re-pin blanks before two versions of a file are compared: every X.Y.Z and every 64-hex sha256 digest (install.sh's digest moves with its DEFAULT_REF).
+RELEASE_PIN_BLANK='s/[0-9]+\.[0-9]+\.[0-9]+/X.Y.Z/g; s/[0-9a-fA-F]{64}/<sha256>/g'
+
+# manifest_version_at <commit> -- the plugin manifest's version (X.Y.Z) as recorded in that commit; prints nothing when it is absent, unreadable or not semver.
+manifest_version_at() {
+  local v
+  v="$(git show "${1}:${PLUGIN_MANIFEST}" 2>/dev/null | jq -r '.version // empty' 2>/dev/null)" || v=""
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s' "$v"
+  return 0
+}
+
+# non_hook_changes <from> <to> -- print every path that differs between the two commits minus the shapes this repo's OWN hooks write (bin/lib/hook-owned-path.sh).
+# Empty output + exit 0 = nothing a human or an agent wrote changed. Exit 1 with nothing printed = it cannot be answered (<from> is no ancestor of <to>, the shared allowlist
+# is missing, git failed): the caller must read that as "changed". --no-renames so a file renamed INTO a hook-owned shape still shows the path it left.
+non_hook_changes() {
+  local from="$1" to="$2" paths
+  [ -r "$REPO_ROOT/bin/lib/hook-owned-path.sh" ] || return 1
+  git merge-base --is-ancestor "$from" "$to" 2>/dev/null || return 1
+  paths="$(git diff --name-only --no-renames "$from" "$to" 2>/dev/null)" || return 1
+  # shellcheck source=../bin/lib/hook-owned-path.sh disable=SC1091
+  . "$REPO_ROOT/bin/lib/hook-owned-path.sh"
+  printf '%s\n' "$paths" | sed '/^$/d' | grep -Ev "^${HMD_HOOK_OWNED_PATH_RE}\$" || true
+}
+
+# version_pins_only <parent> <commit> <path> -- 0 iff <path> reads the same in both commits once every X.Y.Z and every 64-hex digest is blanked. A file git cannot show on
+# either side is a refusal, never two empty streams that compare equal.
+version_pins_only() {
+  local a="$1" b="$2" path="$3"
+  git cat-file -e "${a}:${path}" 2>/dev/null && git cat-file -e "${b}:${path}" 2>/dev/null || return 1
+  cmp -s <(git show "${a}:${path}" 2>/dev/null | sed -E "$RELEASE_PIN_BLANK") \
+         <(git show "${b}:${path}" 2>/dev/null | sed -E "$RELEASE_PIN_BLANK")
+}
+
+# changelog_release_heading_only <parent> <commit> <version> -- 0 iff the CHANGELOG.md diff touches nothing but the release heading: lines added are `## [<version>]...`
+# headings, lines removed are the `## [Unreleased]...` or `## [<version>]...` heading they replace, and blank lines. A body line, another release's heading or a diff with no
+# hunk at all fails. Read from a zero-context diff: the file header precedes the first `@@` and is skipped, so a body line that merely starts with `--` cannot pass for one.
+changelog_release_heading_only() {
+  local a="$1" b="$2" ver="$3" out line in_hunk=0
+  out="$(git diff -U0 --no-color --no-renames "$a" "$b" -- CHANGELOG.md 2>/dev/null)" || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "@@"*) in_hunk=1; continue ;;
+    esac
+    [ "$in_hunk" -eq 1 ] || continue
+    case "$line" in
+      "\\ "*) ;;   # "\ No newline at end of file"
+      "+## [${ver}]"*|"-## [${ver}]"*|"-## [Unreleased]"*) ;;
+      *) [[ "$line" =~ ^[+-][[:space:]]*$ ]] || return 1 ;;
+    esac
+  done <<<"$out"
+  [ "$in_hunk" -eq 1 ]
+}
+
+# release_commit_pins_only <commit> -- 0 iff <commit> is a version bump and NOTHING but a version bump: exactly one parent; subject exactly `chore(release): v<version>`; the
+# manifest version really moved; every changed path is one the bump writes (RELEASE_BUMP_PATHS) or CHANGELOG.md; every one an in-place edit with its file mode untouched; each
+# file differing from its parent only in version numbers and sha256 digests (CHANGELOG.md only in its release heading). Prints WHY NOT on one line and returns 1 otherwise.
+# Needs only git and the commit, not a receipt or a tag, so it can be pointed at any historical bump.
+release_commit_pins_only() {
+  local rc="$1" ver tag old_ver p1="" extra="" subject changed meta path status omode nmode
+  ver="$(manifest_version_at "$rc")"
+  [ -n "$ver" ] || { printf 'cannot read a semver version from %s in the release commit' "$PLUGIN_MANIFEST"; return 1; }
+  tag="v$ver"
+  read -r _ p1 extra <<<"$(git rev-list --parents -n 1 "$rc" 2>/dev/null)" || true
+  [ -n "$p1" ] || { printf 'the release commit has no parent'; return 1; }
+  [ -z "$extra" ] || { printf 'the release commit has more than one parent, a version bump has exactly one'; return 1; }
+  subject="$(git log -1 --format=%s "$rc" 2>/dev/null)" || subject=""
+  [ "$subject" = "chore(release): $tag" ] \
+    || { printf 'the release commit is titled "%s", not "chore(release): %s"' "$subject" "$tag"; return 1; }
+  old_ver="$(manifest_version_at "$p1")"
+  [ "$old_ver" != "$ver" ] \
+    || { printf 'the release commit does not move the manifest version (it is still %s)' "$ver"; return 1; }
+  changed="$(git diff --raw --no-renames "$p1" "$rc" 2>/dev/null)" || changed=""
+  [ -n "$changed" ] || { printf 'cannot list the files the release commit changes'; return 1; }
+  while IFS=$'\t' read -r meta path; do
+    [ -n "$path" ] || continue
+    read -r omode nmode _ _ status <<<"$meta"
+    omode="${omode#:}"
+    if [ "$path" != "CHANGELOG.md" ] && ! grep -Fxq -- "$path" <<<"$RELEASE_BUMP_PATHS"; then
+      printf '%s is not a file the version bump writes' "$path"; return 1
+    fi
+    case "$status" in
+      M) ;;
+      A) printf '%s is added in the release commit, only in-place edits of version files are exempt' "$path"; return 1 ;;
+      D) printf '%s is deleted in the release commit, only in-place edits of version files are exempt' "$path"; return 1 ;;
+      *) printf '%s changes type (%s) in the release commit, only in-place edits of version files are exempt' "$path" "$status"; return 1 ;;
+    esac
+    [ "$omode" = "$nmode" ] || { printf '%s changes its file mode (%s to %s) in the release commit' "$path" "$omode" "$nmode"; return 1; }
+    if [ "$path" = "CHANGELOG.md" ]; then
+      changelog_release_heading_only "$p1" "$rc" "$ver" \
+        || { printf 'CHANGELOG.md changes more than the %s release heading' "$tag"; return 1; }
+    else
+      version_pins_only "$p1" "$rc" "$path" \
+        || { printf '%s changes more than version numbers and sha256 digests' "$path"; return 1; }
+    fi
+  done <<<"$changed"
+  return 0
+}
+
+# release_bump_covers_head <receipt-sha> <head> -- can the receipt that graded <receipt-sha> still vouch for <head>, given that <head> may carry this release's own tagged version
+# bump? The chain and the HEAD-vs-tag reasoning are at the top of this section. Prints "v<version> (<release commit>)" and returns 0 when it can; prints the reason and returns 1
+# when it cannot. The version comes from HEAD's own manifest and must agree with the working tree's (what --npm-only reads and publishes).
+release_bump_covers_head() {
+  local r_sha="$1" head="$2" ver wt_ver tag rc p1 changes why
+  ver="$(manifest_version_at "$head")"
+  [ -n "$ver" ] || { printf 'cannot read a semver version from %s at HEAD' "$PLUGIN_MANIFEST"; return 1; }
+  wt_ver="$(read_version 2>/dev/null)" || wt_ver=""
+  [ "$wt_ver" = "$ver" ] || { printf 'the working-tree manifest says %s but HEAD says %s' "${wt_ver:-<unreadable>}" "$ver"; return 1; }
+  tag="v$ver"
+  rc="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}" 2>/dev/null)" \
+    || { printf 'tag %s does not exist, so no commit here was ever released' "$tag"; return 1; }
+  git merge-base --is-ancestor "$rc" "$head" 2>/dev/null \
+    || { printf 'tag %s (%s) is not an ancestor of HEAD' "$tag" "${rc:0:12}"; return 1; }
+  changes="$(non_hook_changes "$rc" "$head")" \
+    || { printf 'cannot tell what changed between tag %s (%s) and HEAD' "$tag" "${rc:0:12}"; return 1; }
+  [ -z "$changes" ] \
+    || { printf 'commits landed after %s (%s) that touch: %s' "$tag" "${rc:0:12}" "$(printf '%s\n' "$changes" | head -3 | paste -sd, -)"; return 1; }
+  why="$(release_commit_pins_only "$rc")" || { printf '%s' "$why"; return 1; }
+  p1="$(git rev-parse -q --verify "${rc}^" 2>/dev/null)" || { printf 'the release commit has no parent'; return 1; }
+  if [ "$p1" != "$r_sha" ]; then
+    changes="$(non_hook_changes "$r_sha" "$p1")" \
+      || { printf 'the receipt graded %s, which is not an ancestor of the release commit parent %s' "${r_sha:0:12}" "${p1:0:12}"; return 1; }
+    [ -z "$changes" ] \
+      || { printf 'commits landed between the graded commit %s and the %s bump that touch: %s' "${r_sha:0:12}" "$tag" "$(printf '%s\n' "$changes" | head -3 | paste -sd, -)"; return 1; }
+  fi
+  printf '%s (%s)' "$tag" "${rc:0:12}"
 }
 
 # ── Release notes + publication ──────────────────────────────────────────────
@@ -735,8 +905,12 @@ preflight_release_prereqs() {
 # (receipts/last-full-green.json, written by test/run-all.sh ONLY for a green, clean, full sweep) and demands that it is a green
 # FULL sweep of THIS repo at HEAD -- commits that touch only hook-owned paths (bin/lib/hook-owned-path.sh) do not stale it, any
 # other commit does. Runs in preflight, before anything is bumped, committed or pushed.
+#
+# `require_full_sweep_receipt post-tag` is the form --release-only and --npm-only use: they run AFTER the tag exists, so the tagged `chore(release): vX.Y.Z` commit the ship
+# itself made counts as one more allowed hop of the chain -- release_bump_covers_head holds the rule, and the reasoning for grading HEAD rather than the tag. A full ship calls
+# this bare: it is about to make that commit, so it grades the commit it will bump, strictly.
 require_full_sweep_receipt() {
-  local home="${HEIMDALL_HOME:-$REPO_ROOT/.heimdall}" fr canon head r_sha other
+  local post_tag="${1:-}" home="${HEIMDALL_HOME:-$REPO_ROOT/.heimdall}" fr canon head r_sha other via why
   fr="$home/receipts/last-full-green.json"
   command -v jq >/dev/null 2>&1 || die "jq not found — the sweep receipt cannot be read, so a release cannot be authorised. Install it (brew install jq)."
   head="$(git rev-parse HEAD 2>/dev/null)" || die "not a git checkout — cannot check the sweep receipt"
@@ -750,14 +924,19 @@ require_full_sweep_receipt() {
     || die "a release requires a green FULL sweep receipt at HEAD, but $fr was recorded for a different repo. Run: bash test/run-all.sh"
   r_sha="$(jq -r '.head_sha // empty' "$fr")"
   if [ "$r_sha" != "$head" ]; then
-    other="changed"
-    if [ -r "$REPO_ROOT/bin/lib/hook-owned-path.sh" ] && git merge-base --is-ancestor "$r_sha" "$head" 2>/dev/null; then
-      # shellcheck source=../bin/lib/hook-owned-path.sh disable=SC1091
-      . "$REPO_ROOT/bin/lib/hook-owned-path.sh"
-      other="$(git diff --name-only "$r_sha" "$head" | sed '/^$/d' | grep -Ev "^${HMD_HOOK_OWNED_PATH_RE}\$" || true)"
+    # Commits since the graded one that touch only hook-owned paths never stale it. A question that cannot be answered (not an ancestor, no allowlist) counts as "changed".
+    other="$(non_hook_changes "$r_sha" "$head")" || other="changed"
+    if [ -n "$other" ]; then
+      why=""
+      if [ "$post_tag" = "post-tag" ]; then
+        if via="$(release_bump_covers_head "$r_sha" "$head")"; then
+          ok "green FULL sweep receipt covers HEAD (${head:0:12}) through the tagged release commit ${via} — it only re-pins version files"
+          return 0
+        fi
+        why=" The release-commit exemption does not apply: ${via}."
+      fi
+      die "the green FULL sweep receipt is STALE: it graded ${r_sha:0:12}, HEAD is ${head:0:12} (commits landed since). A release needs a green FULL sweep receipt at HEAD.${why} Run: bash test/run-all.sh"
     fi
-    [ -z "$other" ] \
-      || die "the green FULL sweep receipt is STALE: it graded ${r_sha:0:12}, HEAD is ${head:0:12} (commits landed since). A release needs a green FULL sweep receipt at HEAD. Run: bash test/run-all.sh"
   fi
   ok "green FULL sweep receipt at HEAD (${head:0:12})"
 }
@@ -934,7 +1113,7 @@ fi
 if [ "$RELEASE_ONLY" -eq 1 ]; then
   step "Release-only — publishing the version already in the manifest"
   preflight_release_prereqs
-  require_full_sweep_receipt
+  require_full_sweep_receipt post-tag
   RO_VERSION="$(read_version)"
   TAG="v$RO_VERSION"
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-ro.XXXXXX")" || die "mktemp failed"
@@ -967,7 +1146,7 @@ fi
 if [ "$NPM_ONLY" -eq 1 ]; then
   step "npm-only — publishing the version already in the manifest to npm"
   preflight_npm_prereqs
-  require_full_sweep_receipt
+  require_full_sweep_receipt post-tag
   NPM_ONLY_VERSION="$(read_version)"
   publish_npm_all "$NPM_ONLY_VERSION"
   printf '\n%s%s✓ npm reconciled to %s%s\n' "$G" "$B" "$NPM_ONLY_VERSION" "$R"
