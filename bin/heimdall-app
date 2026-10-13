@@ -3193,7 +3193,7 @@ cmd_disconnect_relay() {
   pid_client="$(_doc_field "$doc" .pid_client)"
   case "$pid_ui" in ''|*[!0-9]*) pid_ui="" ;; esac
   case "$pid_client" in ''|*[!0-9]*) pid_client="" ;; esac
-  local rc=0 did dpid devs="${4:-}"  # devs: "<id> <pid>" per phone paired when this disconnect began, listed by cmd_disconnect before any client went
+  local rc=0 did devs="${4:-}"  # devs: "<id> <pid>" per phone paired when this disconnect began, listed by cmd_disconnect before any client went
   # every phone's client, an added one too: each revokes its own relay session on TERM
   _stop_device_clients "$REPO" "$repo_real" || rc=$?
 
@@ -3211,7 +3211,7 @@ cmd_disconnect_relay() {
   fi
   # every phone that was bound goes from the records now that its client is gone -- a client older than the records removed none of it --
   # and one whose push registrations cannot be removed is reported, never counted as disconnected
-  while read -r did dpid; do
+  while read -r did _; do
     [ -n "$did" ] || continue
     "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$REPO" "$did" >/dev/null 2>&1 \
       || { echo "hmd app disconnect: device $did: its push registrations could not be removed, so it may still be notified and its record is kept" >&2; rc=1; }
