@@ -574,16 +574,13 @@ def case_code_needs_tls_or_loopback():
 
 
 def main():
-    for case in (case_vectors_and_helpers, case_registration_and_hygiene, case_no_token, case_refusals,
-                 case_approve_flow, case_reject_timeout_eof, case_no_confirm_and_qr_bind, case_renewal,
-                 case_qr_only_unchanged, case_code_needs_tls_or_loopback, case_burn_guard_holds_in_every_code_state,
-                 case_code_end_on_a_burned_key, case_burned_key_binds_nothing, case_window_renewed_after_a_burn_pairs,
-                 case_burned_key_ends_the_session_when_the_window_does):
-        try:
-            case()
-        except Exception as exc:  # a case that dies is a failure, not a crash of the whole run
-            T.check(False, "%s raised %s: %s" % (case.__name__, type(exc).__name__, exc))
-    return T.finish()
+    # no case named: each in a process of its own, a few at a time (pair_code_harness.run_main); `CASE...` runs just those, here
+    return H.run_main(T, os.path.realpath(__file__),
+                      (case_vectors_and_helpers, case_registration_and_hygiene, case_no_token, case_refusals,
+                       case_approve_flow, case_reject_timeout_eof, case_no_confirm_and_qr_bind, case_renewal,
+                       case_qr_only_unchanged, case_code_needs_tls_or_loopback, case_burn_guard_holds_in_every_code_state,
+                       case_code_end_on_a_burned_key, case_burned_key_binds_nothing, case_window_renewed_after_a_burn_pairs,
+                       case_burned_key_ends_the_session_when_the_window_does))
 
 
 if __name__ == "__main__":
