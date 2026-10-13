@@ -171,6 +171,15 @@ if [ "$HITS" = 2 ] && ! grep -q 'old-foreign' "$GW/tmp-outside.tsv" && ! grep -q
 if [ "${TMP_FINDINGS:-x}" = 0 ] && grep -q 'TMP OUTSIDE TMPDIR (2)' "$GW/tmp-section.txt" && grep -q '^tmp outside: *2 new' "$GW/tmp-summary.txt"; then ok "outside-TMPDIR entries are a loud warning by default (cannot be proved the suite's), not a failure"; else bad "outside default: findings=${TMP_FINDINGS:-} section=$(cat "$GW/tmp-section.txt")"; fi
 HMD_TEST_STRICT_TMP=1 HMD_TEST_TMP_WATCH="$T/watch" hmd_test_tmp_guard "$GW" >/dev/null
 if [ "${TMP_FINDINGS:-x}" = 2 ]; then ok "HMD_TEST_STRICT_TMP=1 turns the attributed outside entries into findings"; else bad "outside strict: findings=${TMP_FINDINGS:-}"; fi
+# 2026-10-14: a pip-unpack-sized leak written OUTSIDE any TMPDIR (a child started with `env -i` drops TMPDIR) only warned. Over the limit it now fails, and the scan is never capped silently.
+mkdir "$T/watch/pip-unpack-big"; dd if=/dev/zero of="$T/watch/pip-unpack-big/x.whl" bs=1048576 count=2 2>/dev/null
+NOW="$(date +%s)"; echo "$((NOW - 5))" > "$GW/0.t0"; echo "$((NOW + 600))" > "$GW/0.t1"
+HMD_TEST_TMP_LEAK_MAX_MB=1 HMD_TEST_TMP_WATCH="$T/watch" hmd_test_tmp_guard "$GW" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 1 ] && grep -q 'TMP LEAK OUTSIDE TMPDIR (1)' "$GW/tmp-section.txt" && grep -q 'pip-unpack-big' "$GW/tmp-section.txt" && awk -F'\t' '$1 ~ /pip-unpack-big/ && $2 >= 2097152' "$GW/tmp-outside.tsv" | grep -q .; then ok "an outside entry over HMD_TEST_TMP_LEAK_MAX_MB (a 2 MB pip-unpack-big against a 1 MB limit) is the one finding, named, with its size in tmp_outside; the small outside entries stay warnings"; else bad "outside big: findings=${TMP_FINDINGS:-} section=$(cat "$GW/tmp-section.txt") tsv=$(cat "$GW/tmp-outside.tsv")"; fi
+HMD_TEST_TMP_WATCH="$T/watch" hmd_test_tmp_guard "$GW" >/dev/null
+if [ "${TMP_FINDINGS:-x}" = 0 ] && ! grep -q 'TMP LEAK OUTSIDE' "$GW/tmp-section.txt"; then ok "under the default 50 MB limit the same 2 MB outside entry is only a warning"; else bad "outside big, default limit: findings=${TMP_FINDINGS:-} section=$(cat "$GW/tmp-section.txt")"; fi
+HMD_TEST_TMP_OUTSIDE_MAX=1 HMD_TEST_TMP_WATCH="$T/watch" hmd_test_tmp_guard "$GW" >/dev/null
+if grep -q 'NOT FULLY CHECKED' "$GW/tmp-section.txt" && grep -q 'NOT examined' "$GW/tmp-summary.txt"; then ok "more new entries than HMD_TEST_TMP_OUTSIDE_MAX: the rest are counted and named in the section and the summary, never dropped silently"; else bad "outside cap: section=$(cat "$GW/tmp-section.txt") summary=$(cat "$GW/tmp-summary.txt")"; fi
 
 echo "-- 7. through the REAL run-all.sh (fixture repo): own TMPDIR per suite, receipt, summary line, exit status --"
 FX="$T/fx"; mkdir -p "$FX/test/lib" "$FX/bin/lib" "$T/hh" "$T/watch2" "$T/ert"
