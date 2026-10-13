@@ -8,7 +8,7 @@
 # routine's) all logged `session_ended reason=local-disconnect` within 0.5s and their phones were unpaired. Who: a sub-agent
 # that, debugging a temp-repo test, ran
 #     pkill -f app_pair_confirm_cases; pkill -f "heimdall-app pair-window-loop"; pkill -f heimdall-relay-client; ...
-# (its transcript, 16:29:39.293Z). The pattern matched EVERY heimdall-relay-client on the machine; each answered SIGTERM the way
+# (its transcript, 16:29:39.293Z). The pattern matched EVERY heimdall-relay-client on the machine; each answered SIGTERM (as every client did before 2.4.8) the way
 # `hmd app disconnect` makes it answer -- revoke its relay session, then end -- and the relay-events logs show `connect
 # for=revoke` 0.4s later. It was NOT a committed test and NOT the orphan reaper. A security review then showed a regex over the
 # command text is walked around (quoting the name, a character class, a partial pattern, a variable, a looked-up pid, xargs,
@@ -26,7 +26,8 @@
 #   * bin/lib/hmd_ui_procs.py's reaper (heimdall-gc uis, run-all.sh's end-of-sweep guard) only ever selects orphans whose
 #     repo is gone or under a temp dir -- never a live client of an existing non-temp repo -- and never guesses a repo
 # The guard is BEST-EFFORT DEFENSE IN DEPTH, NOT A SECURITY BOUNDARY: no text guard on shell is complete. The real protection is
-# that a stray signal must not be able to unpair a phone (a design decision still open); these cases pin what the guard does
+# that a stray signal must not be able to unpair a phone -- settled in 2.4.8: a stopped client revokes nothing and its replacement resumes
+# the phone's stored session (test/app-session-resume.test.sh); these cases pin what the guard does
 # promise, not that it cannot be walked around.
 set -u
 
