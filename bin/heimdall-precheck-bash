@@ -120,9 +120,13 @@ esac
 #      list), and a strict gate that was never evaluated blocks: only an exactly understood command may end
 #      in the warning. The receipt is graded for the commit the push SENDS (each refspec source resolved, HEAD
 #      for a bare push; --all, --mirror, --tags, a wildcard or push configuration that picks the refs cannot
-#      be tied to it). A resolver that is missing or gives no answer, or a class this does not know, runs the
-#      sweep gate on the cwd as before (and a never-evaluated gate blocks there too): the change only ever
-#      narrows a gate to the repository pushed. NOT relaxed, and still reading the CWD repo
+#      be tied to it). A resolver that cannot answer (it times out, crashes, or is missing) is never a reason to
+#      grade ONE repository: the strict gate runs against the session's cwd, the payload's cwd and every -C / cd /
+#      --git-dir / --work-tree directory the parser had reached (it prints those itself when it fails), and the push
+#      is blocked unless all of them pass; a class this does not know is the sweep gate. The git directory and work
+#      tree the resolver resolved TOGETHER ride in the row and go to every stage: `status --git-dir` (the receipt
+#      lookup) and the old gate's call (GIT_DIR and GIT_WORK_TREE exported around it); a gate directory that cannot
+#      be entered blocks. The change only ever narrows a gate to the repository pushed. NOT relaxed, and still reading the CWD repo
 #      as they always did: the push-range secret scan, the full-history self-scan and the oracle and corpus
 #      stages below (and, earlier in the chain, the commit secret scan, git-guard and the kill guard).
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
@@ -203,16 +207,26 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
   PG_HOME="$PWD"
   PG_BASE=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
   PG_PLAN=$(python3 -I -S "$PLUGIN/bin/lib/hmd_push_target.py" "$PG_BASE" <<<"$CMD" 2>/dev/null)
-  case $PG_PLAN in '') PG_PLAN=$(printf 'sweep\t%s\tfallback' "$PG_HOME") ;; esac
-  # a row is `class<TAB>dir[<TAB>extra]`: for repo-checks the commits the push sends (given to `status --pushes`: the receipt must be for every
+  # no answer at all (python or the resolver missing, a hard kill): the strict gate on the session's cwd AND the payload's cwd, never on one of them.
+  # (A resolver that fails while it runs prints its own strict rows for every directory it had reached, so this covers only what it could not even do.)
+  case $PG_PLAN in
+    '') PG_PLAN=$(printf 'sweep\t%s\tfallback\t-' "$PG_HOME")
+        case $PG_BASE in
+          ''|"$PG_HOME") ;;
+          *) PG_PLAN=$PG_PLAN$'\n'$(printf 'sweep\t%s\tfallback\t-' "$PG_BASE") ;;
+        esac ;;
+  esac
+  # a row is `class<TAB>dir<TAB>extra<TAB>gitdir` (`-` for an empty column; gitdir is the git directory resolved together with dir): for repo-checks the commits the push sends (given to `status --pushes`: the receipt must be for every
   # one; a missing or unreadable list is "cannot be listed" and blocks), for a sweep row `fallback` when it is the strict class only because
   # the command or git could not be read (then a gate that was never evaluated blocks instead of allowing)
-  while IFS=$'\t' read -r PG_CLASS PG_DIR PG_EXTRA; do
+  while IFS=$'\t' read -r PG_CLASS PG_DIR PG_EXTRA PG_GITDIR; do
     case "$PG_CLASS" in
       repo-checks)
         PG_RUN="$PLUGIN/bin/heimdall-repo-checks"
         if [ -x "$PG_RUN" ]; then
-          PG_OUT=$("$PG_RUN" status --repo "$PG_DIR" --pushes "$PG_EXTRA" 2>&1)
+          PG_PAIR=()
+          case "$PG_GITDIR" in /*) PG_PAIR=(--git-dir "$PG_GITDIR") ;; esac
+          PG_OUT=$("$PG_RUN" status --repo "$PG_DIR" "${PG_PAIR[@]}" --pushes "$PG_EXTRA" 2>&1)
           PG_RC=$?
         else
           PG_OUT="repo-checks: NOT GREEN - $PG_RUN is missing, so the record of this repository's own checks cannot be read"
@@ -228,17 +242,25 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
       unmanaged)
         printf 'heimdall: WARNING - %s is not managed by hmd (no heimdall sweep regime, no .heimdall/repo-checks.json), so no test or lint gate ran for this push; the secret gates below still apply. To gate it, declare its checks in .heimdall/repo-checks.json and record them: %s/bin/heimdall-repo-checks run --repo %s\n' "$PG_DIR" "$PLUGIN" "$PG_DIR" >&2 ;;
       *)
-        cd "$PG_DIR" 2>/dev/null || true   # a directory that vanished: the gate then runs where the hook is, as it always did
-        QGOUT=$("$HSTATE" check-quality-gates 2>&1)
+        if ! cd "$PG_DIR" 2>/dev/null; then
+          # the gate belongs to THIS directory: running it wherever the hook happens to be would grade another repository. A candidate that does not exist
+          # (a fallback row from a command that could not be read) cannot be pushed from; a directory the resolver just named that cannot be entered blocks
+          case "$PG_EXTRA" in fallback) continue ;; esac
+          PG_ESC=$(printf '%s' "$PG_DIR" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: pre-push gate cannot grade this push: %s is the repository it goes to and cannot be entered, so its quality gate cannot run there (and running it elsewhere would grade another repository)."}' "$PG_ESC")"
+        fi
+        PG_ENVP=()
+        case "$PG_GITDIR" in /*) PG_ENVP=(env GIT_DIR="$PG_GITDIR" GIT_WORK_TREE="$PG_DIR") ;; esac
+        QGOUT=$(case "$PG_GITDIR" in (/*) export GIT_DIR="$PG_GITDIR" GIT_WORK_TREE="$PG_DIR" ;; esac; "$HSTATE" check-quality-gates 2>&1)
         QGRC=$?
         # Work merged from sub-agent worktrees is in no session's edit-tracker ledger, so the per-turn lint receipt never covers it. When
         # the lint evidence is missing, stale or does not cover the push, lint everything changed since the last push (bounded well inside
         # the hook's own time: a push gate that times out is a gate that lets the push through) and evaluate the gate once more.
         if [ "$QGRC" = 2 ] && [ -x "$SLINT" ] && printf '%s' "$QGOUT" | grep -qE 'Lint not clean -- (no-evidence|stale|uncovered|no-coverage)'; then
           printf 'heimdall: the lint receipt does not cover what this push ships - running %s --since-push (bounded)\n' "$SLINT" >&2
-          if command -v perl >/dev/null 2>&1; then perl -e 'alarm 45; exec @ARGV' "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true
-          else "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true; fi
-          QGOUT=$("$HSTATE" check-quality-gates 2>&1)
+          if command -v perl >/dev/null 2>&1; then "${PG_ENVP[@]}" perl -e 'alarm 45; exec @ARGV' "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true
+          else "${PG_ENVP[@]}" "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true; fi
+          QGOUT=$(case "$PG_GITDIR" in (/*) export GIT_DIR="$PG_GITDIR" GIT_WORK_TREE="$PG_DIR" ;; esac; "$HSTATE" check-quality-gates 2>&1)
           QGRC=$?
         fi
         if [ "$QGRC" = 2 ]; then

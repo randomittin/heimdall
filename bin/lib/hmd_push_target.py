@@ -5,12 +5,16 @@ bin/heimdall-precheck-bash used to run heimdall's own sweep gate in the session'
 (a site with checks of its own) was held to a receipt only heimdall's sweep can write. It now asks this file, once per push command,
 for the repositories the command pushes and the class of each, and runs the gate that class owes.
 
-Protocol: the command text on stdin, the session's cwd as argv[1]; one line `class<TAB>toplevel[<TAB>extra]` per gate, in the order first met.
-`extra` is, for a repo-checks row, the commits the push sends as sources (full ids, comma separated; `-` none, `?` cannot be listed) which
-the hook hands to `heimdall-repo-checks status --pushes` (the receipt must be for every one of them); for a sweep row it is `fallback`
-when the row is the strict class only because the command or git could not be read, not because a marker was found (the hook then also
-refuses a gate that was never evaluated). Exit 0. Anything else (a crash, a timeout, no output) tells the hook to run the sweep gate on
-the cwd repository exactly as before.
+Protocol: the command text on stdin, the payload's cwd as argv[1]; one line `class<TAB>work tree<TAB>extra<TAB>git dir` per gate, in the order
+first met (all four columns are always there: `-` stands for an empty one). `extra` is, for a repo-checks row, the commits the push sends as
+sources (full ids, comma separated; `-` none, `?` cannot be listed) which the hook hands to `heimdall-repo-checks status --pushes` (the receipt
+must be for every one of them); for a sweep row it is `fallback` when the row is the strict class only because the command or git could not be
+read, not because a marker was found (the hook then also refuses a gate that was never evaluated). `git dir` is the ONE git directory resolved
+together with the work tree (`-` when the row names a directory only, because no repository could be placed there): the hook hands that pair to
+every stage it runs. Exit 0 with the plan. A run that cannot finish (the timeout, any exception) prints the strict rows for EVERY directory it
+may be about -- this process's cwd (the session's), the payload's cwd and each directory the parser had reached (cd targets, -C chains,
+--git-dir / --work-tree values) -- without a single git call (a timeout is git not answering) and exits 1. No output at all (python or this file
+missing, a hard kill) tells the hook to grade the session's cwd and the payload's cwd.
 
 FAIL CLOSED, the one rule everything below serves. The warn-only class (unmanaged) is answered ONLY when every part of the command was
 understood exactly, git itself resolved the repository, and none of the commits a push can carry (or its upstream holds) has either
@@ -79,7 +83,8 @@ ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+?=")
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 OID = rr.OID_RE
 DURATION = re.compile(r"^[0-9.]+[smhd]?$")
-GIT_PUSH_TEXT = re.compile(r"\bgit\b.*\bpush\b", re.S)   # an argument that carries a push to somewhere this cannot see
+GIT_WORD = re.compile(r"\bgit\b")                        # an argument that carries a push to somewhere this cannot see names git and, later, push:
+PUSH_WORD = re.compile(r"\bpush\b")                      # two linear searches, not one `\bgit\b.*\bpush\b` (quadratic on a long command; a signal cannot interrupt a regex)
 LIST_STARTS = ("", ";", "\n", "&")                       # an item whose `before` is one of these begins a new and-or list
 PREFIX_WORDS = frozenset(("if", "then", "else", "elif", "while", "until", "do", "!", "time", "{"))
 OPENERS = frozenset(("if", "while", "until"))            # open a conditional or loop; the command that follows is read on
@@ -153,12 +158,91 @@ except ValueError:
 GIT_TIMEOUT = max(TIMEOUT_S, 1.0)
 
 
+# GIT_* variables a push may carry. The ones git reads ITSELF at every call this makes (they are handed to the discovery) and the ones that cannot change which
+# repository, refs, objects or configuration a push uses are fine; any other -- GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY, GIT_NAMESPACE, GIT_INDEX_FILE,
+# GIT_REPLACE_REF_BASE, GIT_EXEC_PATH, ... -- would give the PUSH another view of the repository than the one the gate reads: the command is uncertain.
+GIT_MODELLED = frozenset(("GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM"))
+GIT_HARMLESS = frozenset(("GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_ASKPASS", "GIT_TERMINAL_PROMPT", "GIT_PROXY_COMMAND", "GIT_PAGER",
+                          "GIT_EDITOR", "GIT_FLUSH", "GIT_CURL_VERBOSE", "GIT_PROGRESS_DELAY"))
+GIT_KNOWN_PREFIXES = ("GIT_CONFIG_", "GIT_TRACE", "GIT_SSL_", "GIT_HTTP_", "GIT_AUTHOR_", "GIT_COMMITTER_")   # GIT_CONFIG_* decide push configuration: config_env passes them on
+
+
+def git_var_known(name):
+    return name in GIT_MODELLED or name in GIT_HARMLESS or name.startswith(GIT_KNOWN_PREFIXES)
+
+
+def names_a_push(text):
+    """Does `text` name git and, later, push? Two linear searches (see GIT_WORD)."""
+    found = GIT_WORD.search(text)
+    return found is not None and PUSH_WORD.search(text, found.end()) is not None
+
+
+SEEN = []   # every directory this run has met as a place the command may push from or to, in the order met: if the run cannot finish, all of them are graded
+
+
+def see(path):
+    """Remember `path`, an absolute directory the command may push from or to. Anything else (None, a relative path) is not a place this knows."""
+    if path and os.path.isabs(path) and path not in SEEN:
+        SEEN.append(path)
+
+
+def looks_like_repo(path):
+    """Could git find a repository from `path` by itself? A `.git` (a directory, or the file of a linked worktree or a submodule) in it or above it, or the
+    directory being a git directory itself (a bare repository: HEAD and objects). Only the file system is asked, never git."""
+    if os.path.isfile(os.path.join(path, "HEAD")) and os.path.isdir(os.path.join(path, "objects")):
+        return True
+    here = os.path.realpath(path)
+    while True:
+        if os.path.lexists(os.path.join(here, ".git")):
+            return True
+        parent = os.path.dirname(here)
+        if parent == here:
+            return False
+        here = parent
+
+
+def push_dirs(push):
+    """(walked, named): the directories a push may operate in, worked out WITHOUT git. `walked` is where git would start -- where the shell was and each
+    step of the `-C` chain; `named` is what the push itself says its repository is -- the values of --git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE (a
+    `.git` also by its parent, the work tree it conventionally belongs to). git is the judge of which of them is the repository; when git cannot be asked
+    (a timeout, a failure) or names one this cannot place, every named directory is graded, and so is every walked one that could hold a repository."""
+    here, dirs, named, k = push.cwd, [], [], 0
+    if here:
+        dirs.append(here)
+    opts = push.opts
+    while k < len(opts):
+        opt = opts[k]
+        value = opts[k + 1] if k + 1 < len(opts) else None
+        if opt == "-C" and value is not None:
+            if here:
+                here = os.path.normpath(os.path.join(here, value))
+                dirs.append(here)
+            k += 2
+        elif opt in ("--git-dir", "--work-tree") and value is not None:
+            named.append(value)
+            k += 2
+        elif opt == "-c":
+            k += 2
+        elif opt.startswith(("--git-dir=", "--work-tree=")):
+            named.append(opt.split("=", 1)[1])
+            k += 1
+        else:
+            k += 1
+    named += [push.env[name] for name in ("GIT_DIR", "GIT_WORK_TREE") if name in push.env]
+    places = []
+    for value in named:
+        for start in (push.cwd, here):
+            if not start:
+                continue
+            path = os.path.normpath(os.path.join(start, value))
+            for place in (path, os.path.dirname(path) if os.path.basename(path) == ".git" else None):
+                if place and place not in places:
+                    places.append(place)
+    return dirs, places
+
+
 def git(args, cwd, env):
     return rr.run_git(args, cwd, env, GIT_TIMEOUT)
-
-
-def git_bytes(args, cwd, env):
-    return rr.run_git_bytes(args, cwd, env, GIT_TIMEOUT)
 
 
 class Word(object):
@@ -594,7 +678,7 @@ class Resolver(object):
         if not m.group(1).startswith("GIT_"):
             return
         value = word.text[m.end():]
-        if word.dyn or value.startswith("~"):
+        if word.dyn or value.startswith("~") or not git_var_known(m.group(1)):
             self.complete = False
         else:
             env[m.group(1)] = value
@@ -730,6 +814,7 @@ class Resolver(object):
                 nxt = (None, stack, genv)
             else:
                 nxt = (stack[-1], stack[:-1], genv)
+            see(nxt[0])
             ok.append(nxt)
             if nxt[0] is None:
                 bad.append(nxt)
@@ -747,6 +832,8 @@ class Resolver(object):
                     continue
                 if a.text.startswith("-") or not name.startswith("GIT_"):
                     continue
+                if not git_var_known(name.rstrip("+")):
+                    self.complete = False        # a variable this does not reproduce: the push may see other refs than the gate reads
                 value = a.text.split("=", 1)[1] if "=" in a.text else None
                 if verb == "unset" and not a.dyn:
                     pairs.pop(name, None)
@@ -808,10 +895,10 @@ class Resolver(object):
         heredoc or here-string it is fed, that names git and push makes the command uncertain. Commands that only print are exempt."""
         if name in DATA_ONLY:
             return
-        if GIT_PUSH_TEXT.search(" ".join([head.text] + [w.text for w in rest])):
+        if names_a_push(" ".join([head.text] + [w.text for w in rest])):
             self.complete = False
         for body in cmd.bodies:
-            if body is None or GIT_PUSH_TEXT.search(body):
+            if body is None or names_a_push(body):
                 self.complete = False
 
     @staticmethod
@@ -839,6 +926,7 @@ class Resolver(object):
     def git(self, args, state, env, xargs, elsewhere):
         """`args` follow the git word: its global options, then the subcommand. A push is recorded with the options and GIT_*
         environment it would run with, for git itself to resolve; whatever is not understood exactly makes the command uncertain."""
+        see(state[0])
         cwd = None if elsewhere else state[0]
         genv = dict(state[2])
         genv.update(env)
@@ -884,7 +972,11 @@ class Resolver(object):
             self.complete = False
         elif sub.text == "push":
             if known:
-                self.targets.append(Push(cwd, opts, genv, args[k + 1:]))
+                push = Push(cwd, opts, genv, args[k + 1:])
+                self.targets.append(push)
+                walked, named = push_dirs(push)
+                for place in walked + named:
+                    see(place)
             else:
                 self.complete = False
         elif sub.text not in GIT_BUILTINS:
@@ -892,6 +984,28 @@ class Resolver(object):
 
 
 # ---- git decides which repository --------------------------------------------------------------------------------------
+
+
+class Repo(object):
+    """ONE resolved repository: its git directory and its work tree root, both real paths, each checked from the other end by owns(). Everything the gate
+    reads about a push -- the class, the commits it names, the refs its branch tracks, the push configuration -- is read through THIS pair (GIT_DIR and
+    GIT_WORK_TREE are set, git is never asked to discover anything again), and the hook hands the same pair to the receipt lookup and to the old gate: no
+    stage re-derives "the repository" from a path, so the stages cannot end up looking at different ones."""
+    __slots__ = ("gitdir", "tree")
+
+    def __init__(self, gitdir, tree):
+        self.gitdir, self.tree = gitdir, tree
+
+    def env(self, extra=None):
+        pinned = dict(extra or {})
+        pinned.update({"GIT_DIR": self.gitdir, "GIT_WORK_TREE": self.tree})
+        return rr.git_env(pinned)
+
+    def git(self, args, extra=None):
+        return rr.run_git(args, self.tree, self.env(extra), GIT_TIMEOUT)
+
+    def git_bytes(self, args, extra=None):
+        return rr.run_git_bytes(args, self.tree, self.env(extra), GIT_TIMEOUT)
 
 
 def owns(top, gitdir):
@@ -913,9 +1027,10 @@ def linked_worktree(gitdir):
     return os.path.dirname(text) if os.path.basename(text) == ".git" else None
 
 
-def repo_root(push):
-    """The work tree root of the repository `push` operates on, or None when git cannot say or the two ends disagree. The git
-    directory comes from git run with the push's own options, directory and GIT_* environment; the root is checked against it."""
+def resolve(push):
+    """The Repo `push` operates on, or None when git cannot say or the two ends disagree. The git directory comes from git run with the
+    push's own options, directory and GIT_* environment; the work tree root is a candidate that git, started there with nothing else said,
+    names back (owns): the pair is resolved once and every later read goes through it."""
     if not push.cwd or not os.path.isdir(push.cwd):
         return None
     env = rr.git_env(push.env)
@@ -934,7 +1049,7 @@ def repo_root(push):
         candidates.append(linked)
     for cand in candidates:
         if os.path.isdir(cand) and owns(cand, gitdir):
-            return os.path.realpath(cand)
+            return Repo(gitdir, os.path.realpath(cand))
     return None
 
 
@@ -989,9 +1104,9 @@ def push_scope(words):
     return sources, bool(refspecs), broad, uncertain
 
 
-def commit_of(top, env, rev):
+def commit_of(repo, rev):
     """The commit `rev` names; None when git says plainly that it names none (exit 1, nothing printed); Unnameable on any other answer."""
-    got = git(["rev-parse", "-q", "--verify", rev + "^{commit}"], top, env)
+    got = repo.git(["rev-parse", "-q", "--verify", rev + "^{commit}"])
     if got is None:
         raise Unnameable("git gave no answer for %s" % rev)
     out = got[1].strip()
@@ -1002,9 +1117,9 @@ def commit_of(top, env, rev):
     raise Unnameable("git answered %s with exit %d and %r" % (rev, got[0], out[:40]))
 
 
-def tracked_refs(top, env):
+def tracked_refs(repo):
     """What the branch HEAD is on tracks (its upstream and push refs) and its namesake on origin, as full ref names; none when HEAD is detached."""
-    got = git(["symbolic-ref", "-q", "HEAD"], top, env)
+    got = repo.git(["symbolic-ref", "-q", "HEAD"])
     if got is None or got[0] not in (0, 1):
         raise Unnameable("git could not say which branch HEAD is on")
     branch = got[1].strip() if got[0] == 0 else ""
@@ -1013,7 +1128,7 @@ def tracked_refs(top, env):
     if not branch.startswith("refs/heads/"):
         raise Unnameable("HEAD is a symbolic ref to %r, not to a branch" % branch[:60])
     refs = ["refs/remotes/origin/" + branch[len("refs/heads/"):]]
-    got = git(["for-each-ref", "--format=%(upstream) %(push)", branch], top, env)
+    got = repo.git(["for-each-ref", "--format=%(upstream) %(push)", branch])
     if got is None or got[0] != 0:
         raise Unnameable("git could not list what %s tracks" % branch)
     for ref in got[1].split():
@@ -1023,10 +1138,27 @@ def tracked_refs(top, env):
     return refs
 
 
-def config_picks_refs(push):
+def config_opts(opts):
+    """The push's own `-c key=value` options, in order: the part of its global options that can change what push configuration says."""
+    pairs, k = [], 0
+    while k < len(opts):
+        if opts[k] == "-c" and k + 1 < len(opts):
+            pairs += ["-c", opts[k + 1]]
+            k += 2
+        else:
+            k += 1
+    return pairs
+
+
+def config_env(env):
+    """The GIT_CONFIG_* variables the push runs with: git reads them at every call, and they decide what push configuration says."""
+    return dict((k, v) for k, v in env.items() if k.startswith("GIT_CONFIG_"))
+
+
+def config_picks_refs(repo, push):
     """Does push configuration choose the refs a bare `git push` sends (push.default=matching, any remote.<name>.push)? The push's own
     `-c` options and GIT_* environment count, as they do for the real push. Unnameable when git cannot say."""
-    got = git(push.opts + ["config", "--get-regexp", r"^(push\.default|remote\..*\.push)$"], push.cwd, rr.git_env(push.env))
+    got = repo.git(config_opts(push.opts) + ["config", "--get-regexp", r"^(push\.default|remote\..*\.push)$"], config_env(push.env))
     if got is None or got[0] not in (0, 1):
         raise Unnameable("git could not read the push configuration")
     picks = False
@@ -1041,11 +1173,10 @@ def config_picks_refs(push):
     return picks
 
 
-def scope(top, push):
+def scope(repo, push):
     """(every commit whose markers decide the class: HEAD, what its branch tracks, origin/HEAD and what the push names; the commits the push
     names as sources, None when they cannot be listed). Unnameable when git fails, or a ref the push names cannot be placed."""
-    env = rr.git_env({})
-    head = commit_of(top, env, "HEAD")
+    head = commit_of(repo, "HEAD")
     if head is None:
         raise Unnameable("HEAD names no commit")
     shas = [head]
@@ -1054,8 +1185,8 @@ def scope(top, push):
         if sha not in shas:
             shas.append(sha)
 
-    for ref in tracked_refs(top, env) + ["refs/remotes/origin/HEAD"]:
-        sha = commit_of(top, env, ref)
+    for ref in tracked_refs(repo) + ["refs/remotes/origin/HEAD"]:
+        sha = commit_of(repo, ref)
         if sha:
             note(sha)
     sources, explicit, broad, uncertain = push_scope(push.args)
@@ -1063,14 +1194,14 @@ def scope(top, push):
         raise Unnameable("the push names refs this does not read")
     named = []
     for rev in sources:
-        sha = commit_of(top, env, rev)
+        sha = commit_of(repo, rev)
         if sha is None:
             raise Unnameable("%s names no commit" % rev)
         note(sha)
         if sha not in named:
             named.append(sha)
     if broad:
-        got = git(["for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags"], top, env)
+        got = repo.git(["for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags"])
         tips = got[1].split() if got is not None and got[0] == 0 else None
         if tips is None or len(tips) > MAX_REFS or not all(OID.fullmatch(tip) for tip in tips):
             raise Unnameable("the refs a broad push would send cannot be listed")
@@ -1078,14 +1209,13 @@ def scope(top, push):
             note(tip)
         return shas, None
     if not explicit:
-        return shas, None if config_picks_refs(push) else [head]
+        return shas, None if config_picks_refs(repo, push) else [head]
     return shas, named
 
 
-def commit_class(top, sha):
+def commit_class(repo, sha):
     """sweep, repo-checks or unmanaged for ONE commit, read from git objects; None when a marker cannot be inspected."""
-    env = rr.git_env({})
-    got = git_bytes(["ls-tree", "-z", sha, "--", SWEEP_WRITER, DECLARATION], top, env)
+    got = repo.git_bytes(["ls-tree", "-z", sha, "--", SWEEP_WRITER, DECLARATION])
     if got is None or got[0] != 0:
         return None
     entries = {}
@@ -1102,7 +1232,7 @@ def commit_class(top, sha):
     if run_all is not None:
         if run_all[1] != b"blob" or run_all[0] not in rr.REGULAR_MODES:
             return None                  # a link, a submodule or a directory where the marker file should be
-        blob = git_bytes(["cat-file", "blob", run_all[2].decode("ascii")], top, env)
+        blob = repo.git_bytes(["cat-file", "blob", run_all[2].decode("ascii")])
         if blob is None or blob[0] != 0:
             return None
         if SWEEP_MARK in blob[1]:
@@ -1115,16 +1245,16 @@ def commit_class(top, sha):
     return "unmanaged"
 
 
-def classify(top, push):
+def classify(repo, push):
     """(the STRICTEST class over every commit the push can carry or its upstream holds, the commits it names as sources, whether the class is
     only the strict fallback because something could not be read). Sweep, with no sources, when the commits cannot be named or read."""
     try:
-        shas, sources = scope(top, push)
+        shas, sources = scope(repo, push)
     except Unnameable:
         return "sweep", None, True
     best, fallback = "unmanaged", False
     for sha in shas:
-        found = commit_class(top, sha)
+        found = commit_class(repo, sha)
         if found is None:
             found, fallback = "sweep", True
         if RANK[found] > RANK[best]:
@@ -1140,39 +1270,52 @@ def extra(cls, sources, fallback):
 
 
 def plan(text, base):
-    """[(class, directory, extra), ...]: the gates a command that pushes owes. `base` is the session's cwd."""
+    """[(class, directory, extra, git directory), ...]: the gates a command that pushes owes. `base` is the payload's cwd. `git directory` is "" when the
+    row names a directory only (no repository could be placed there)."""
+    see(base)
     found = Resolver()
     found.read(text, ((base, (), ()),), 0)
     uncertain = not found.targets or not found.complete
-    rows = {}            # (class, directory) -> [the commits the pushes there send (a list, None when they cannot be listed), strict fallback?]
+    rows = {}            # (class, directory) -> [the commits the pushes there send (a list, None when they cannot be listed), strict fallback?, git dir]
 
-    def add(cls, top, sources, fallback):
-        if "\n" in top or "\t" in top:
+    def add(cls, top, sources, fallback, gitdir=None):
+        if "\n" in top or "\t" in top or "\n" in (gitdir or "") or "\t" in (gitdir or ""):
             return False
-        row = rows.setdefault((cls, top), [[], False])
+        row = rows.setdefault((cls, top), [[], False, gitdir])
         row[0] = None if row[0] is None or sources is None else row[0] + [s for s in sources if s not in row[0]]
         row[1] = row[1] or fallback
+        row[2] = row[2] or gitdir
         return True
 
     for push in found.targets:
-        top = repo_root(push)
-        if top is None:
+        repo = resolve(push)
+        if repo is None:
+            # git named a repository this cannot place (a work tree nothing links back to, a bare repository, ...): the gate that applies is the strict one,
+            # on EVERY directory the push may be about, never on the cwd's repository alone
             uncertain = True
+            walked, named = push_dirs(push)
+            for place in [p for p in walked if looks_like_repo(p)] + named:
+                if os.path.isdir(place):
+                    add("sweep", place, None, True)
             continue
-        cls, sources, fallback = classify(top, push)
-        if not add(cls, top, sources, fallback):
+        cls, sources, fallback = classify(repo, push)
+        if not add(cls, repo.tree, sources, fallback, repo.gitdir):
             uncertain = True
     if uncertain:
         # a command that is not understood exactly: no repository involved gets less than the strict gate, and a repository that declares its
         # own checks still owes the receipt (for commits nobody can list, so it cannot be had until the command is restated)
-        seen = list(rows)
+        seen = list(rows.items())
         rows.clear()
-        for cls, top in seen:
-            add("sweep", top, None, True)
+        for (cls, top), (_, _, gitdir) in seen:
+            add("sweep", top, None, True, gitdir)
             if cls == "repo-checks":
-                add("repo-checks", top, None, False)
-        add("sweep", repo_root(Push(base, [], {}, [])) or base, None, True)
-    return [(cls, top, extra(cls, sources, fallback)) for (cls, top), (sources, fallback) in rows.items()]
+                add("repo-checks", top, None, False, gitdir)
+        here = resolve(Push(base, [], {}, []))
+        if here is not None:
+            add("sweep", here.tree, None, True, here.gitdir)
+        else:
+            add("sweep", base, None, True)
+    return [(cls, top, extra(cls, sources, fallback), gitdir or "") for (cls, top), (sources, fallback, gitdir) in rows.items()]
 
 
 class Timeout(Exception):
@@ -1183,20 +1326,47 @@ def _timed_out(signum, frame):
     raise Timeout()
 
 
+def process_cwd():
+    """This process's cwd (the session's: the hook starts the resolver where it is itself), or None when that directory no longer exists."""
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
+def fallback_rows(base):
+    """The strict rows for a run that could not finish: the strict gate for EVERY directory this command may push from or to -- this process's cwd (the
+    session's), the payload's cwd (`base`) and each directory the parser had reached. No git call: a timeout is exactly git not answering. The hook
+    runs every row and blocks unless all of them pass."""
+    rows, done = [], set()
+    for place in [process_cwd(), base] + SEEN:
+        if place is None:
+            continue
+        real = os.path.realpath(place)
+        if real in done or not os.path.isdir(real) or "\n" in real or "\t" in real:
+            continue
+        done.add(real)
+        rows.append(("sweep", real, "fallback", ""))
+    return rows
+
+
 def main():
     if hasattr(signal, "setitimer"):
         signal.signal(signal.SIGALRM, _timed_out)
         signal.setitimer(signal.ITIMER_REAL, TIMEOUT_S)
     base = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]) else os.getcwd()
+    failed = False
     try:
         rows = plan(sys.stdin.buffer.read().decode("utf-8", "replace"), base)
-    except Exception as exc:  # no answer is not "no gate": the hook falls back to the sweep gate on the cwd
+    except Exception as exc:  # no answer is not "no gate": the strict gate runs against every directory this had reached
+        if hasattr(signal, "setitimer"):
+            signal.setitimer(signal.ITIMER_REAL, 0)
         sys.stderr.write("hmd_push_target: %s: %s\n" % (type(exc).__name__, exc))
-        return 1
+        rows, failed = fallback_rows(base), True
     if hasattr(signal, "setitimer"):
         signal.setitimer(signal.ITIMER_REAL, 0)
-    sys.stdout.write("".join("\t".join(row if row[2] else row[:2]) + "\n" for row in rows))
-    return 0
+    sys.stdout.write("".join("\t".join((cls, top, more or "-", gitdir or "-")) + "\n" for cls, top, more, gitdir in rows))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

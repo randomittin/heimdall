@@ -33,6 +33,7 @@ Python 3.7+, standard library only.
 import hashlib
 import os
 import re
+import stat
 import subprocess
 
 DECLARATION = ".heimdall/repo-checks.json"
@@ -40,6 +41,7 @@ RECEIPT = ".heimdall/receipts/repo-checks.json"
 SCHEMA = 1
 GIT_AMBIENT = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")  # a stray one in THIS process must not redirect git
 REGULAR_MODES = (b"100644", b"100755")
+MAX_BYTES = 1 << 20     # a receipt or a declaration over 1 MiB is not one: it is refused, never read whole into memory or handed to a parser
 OID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 STAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
@@ -229,9 +231,56 @@ class Unreadable(Exception):
     """HEAD, its tree or its declaration cannot be read from git."""
 
 
+class Unsafe(Exception):
+    """A path inside the repository that must not be trusted: a link, not the kind of file it should be, or too large."""
+
+
+def read_inside(top, rel, limit=MAX_BYTES):
+    """The bytes of <top>/<rel>, or None when it does not exist. Every component below `top` must be a real directory (the last, a regular file),
+    never a link: a `.heimdall` or `receipts` pointing outside the repository would let another checkout's record stand in for this one. The file
+    is opened ONCE, with O_NOFOLLOW, and checked on the descriptor it was opened as, so there is nothing to swap between a check and the read; more
+    than `limit` bytes is Unsafe, never read."""
+    parts, cur = rel.split("/"), top
+    for i, part in enumerate(parts):
+        cur = os.path.join(cur, part)
+        try:
+            info = os.lstat(cur)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise Unsafe("cannot inspect %s: %s" % (cur, exc))
+        last = i == len(parts) - 1
+        if stat.S_ISLNK(info.st_mode):
+            raise Unsafe("%s is a link, and a link is never followed" % cur)
+        if not (stat.S_ISREG(info.st_mode) if last else stat.S_ISDIR(info.st_mode)):
+            raise Unsafe("%s is not a regular %s" % (cur, "file" if last else "directory"))
+    try:
+        fd = os.open(cur, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        raise Unsafe("cannot open %s: %s" % (cur, exc))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Unsafe("%s is not a regular file" % cur)
+        if info.st_size > limit:
+            raise Unsafe("%s is larger than %d bytes" % (cur, limit))
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                raise Unsafe("%s is larger than %d bytes" % (cur, limit))
+    finally:
+        os.close(fd)
+
+
 class Facts(object):
     """What a receipt binds to, read from git OBJECTS (never the work tree): HEAD, HEAD's tree, and repo-checks.json as committed.
-    declaration is its bytes, or None when `state` is not "ok": "absent" (HEAD has none) or "irregular" (a link, a submodule, a directory)."""
+    declaration is its bytes, or None when `state` is not "ok": "absent" (HEAD has none), "irregular" (a link, a submodule, a directory) or
+    "oversized" (more than MAX_BYTES)."""
     __slots__ = ("head", "tree", "declaration", "state")
 
     def __init__(self, head, tree, declaration, state):
@@ -246,22 +295,35 @@ def sha256_hex(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def facts(top):
-    env = git_env({})
+def facts(top, pinned=None):
+    """HEAD, its tree and its declaration. `pinned` is the {GIT_DIR, GIT_WORK_TREE} pair the push gate resolved: every read goes through it, git is
+    never asked to discover the repository again. HEAD is named ONCE; the tree and the declaration are read from THAT commit, so a HEAD that moves
+    between two reads cannot mix two commits."""
+    env = git_env(pinned or {})
     head = run_git(["rev-parse", "-q", "--verify", "HEAD^{commit}"], top, env)
-    tree = run_git(["rev-parse", "-q", "--verify", "HEAD^{tree}"], top, env)
-    if head is None or tree is None or head[0] != 0 or tree[0] != 0 or not head[1].strip() or not tree[1].strip():
+    if head is None or head[0] != 0 or not OID_RE.fullmatch(head[1].strip()):
         raise Unreadable("cannot read HEAD of %s (no commits yet?)" % top)
-    listed = run_git_bytes(["ls-tree", "-z", "HEAD", "--", DECLARATION], top, env)
+    sha = head[1].strip()
+    tree = run_git(["rev-parse", "-q", "--verify", sha + "^{tree}"], top, env)
+    if tree is None or tree[0] != 0 or not OID_RE.fullmatch(tree[1].strip()):
+        raise Unreadable("cannot read HEAD of %s (no commits yet?)" % top)
+    tree_sha = tree[1].strip()
+    listed = run_git_bytes(["ls-tree", "-z", sha, "--", DECLARATION], top, env)
     if listed is None or listed[0] != 0:
         raise Unreadable("cannot list the tree of HEAD in %s" % top)
     entry = [rec for rec in listed[1].split(b"\0") if rec]
     if not entry:
-        return Facts(head[1].strip(), tree[1].strip(), None, "absent")
+        return Facts(sha, tree_sha, None, "absent")
     meta = entry[0].partition(b"\t")[0].split(b" ")
     if len(meta) != 3 or meta[1] != b"blob" or meta[0] not in REGULAR_MODES:
-        return Facts(head[1].strip(), tree[1].strip(), None, "irregular")
-    blob = run_git_bytes(["cat-file", "blob", meta[2].decode("ascii", "replace")], top, env)
+        return Facts(sha, tree_sha, None, "irregular")
+    oid = meta[2].decode("ascii", "replace")
+    size = run_git(["cat-file", "-s", oid], top, env)
+    if size is None or size[0] != 0 or not size[1].strip().isdigit():
+        raise Unreadable("cannot read %s at HEAD in %s" % (DECLARATION, top))
+    if int(size[1].strip()) > MAX_BYTES:
+        return Facts(sha, tree_sha, None, "oversized")
+    blob = run_git_bytes(["cat-file", "blob", oid], top, env)
     if blob is None or blob[0] != 0:
         raise Unreadable("cannot read %s at HEAD in %s" % (DECLARATION, top))
-    return Facts(head[1].strip(), tree[1].strip(), blob[1], "ok")
+    return Facts(sha, tree_sha, blob[1], "ok")
