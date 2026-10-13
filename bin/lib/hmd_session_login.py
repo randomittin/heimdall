@@ -24,7 +24,10 @@ HMD_SESSION_LOGIN_STORE=file|keychain|auto (default auto: the Keychain on macOS 
 LIMIT. A login whose client was last alive more than HMD_SESSION_RESUME_H hours ago (default 24; 0 = never resume) is discarded on
 the next look and the phone pairs again. It is not revoked: only an explicit disconnect, a revoke from the phone or a failed login is.
 CONFIRMED OR KEPT. A login is removed by a revoke here only once the relay confirmed it (the session ended, or is no longer there); an
-unreachable or unwilling relay, a secret that cannot be read and a login file that cannot be read all keep it and fail loudly.
+unreachable or unwilling relay, a secret that cannot be read and a login file that cannot be read all keep it and fail loudly. A revoke
+marks the login `revoking` FIRST (under the store lock, durably): from then on no resume claims it, so a disconnect racing a resume ends
+revoked and never resumed -- if the resume won the race the revoke ends its session at the relay, if the revoke did, the resume finds
+nothing to claim. A login a revoke removed cannot be brought back: every writer re-reads it under the same lock.
 
 CLI (the shell tools; nothing secret is ever printed):
     python3 hmd_session_login.py list   --repo DIR                                   the logins of that repo, as JSON, secret-free
@@ -213,8 +216,9 @@ def reserve_block(root, sid, n):
 
 
 def discard(root, sid):
-    """Remove a login, its Keychain item included."""
-    _discard_unlocked(root, sid)
+    """Remove a login, its Keychain item included -- under the store lock, so that no writer holding a stale copy can bring it back."""
+    with _locked():
+        _discard_unlocked(root, sid)
 
 
 def _discard_unlocked(root, sid):
@@ -286,6 +290,8 @@ def load_resumable(root, relay, reserve=SEQ_BLOCK):
         for rec in records(root):
             if not _same_relay(rec.get("relay"), relay):
                 continue
+            if rec.get("revoking"):  # a disconnect was asked for: it is revoked, never resumed -- kept only for that revoke to be repeated
+                continue
             if time.time() - float(rec.get("last_alive") or 0) > limit:
                 _discard_unlocked(root, rec["session_id"])
                 continue
@@ -327,8 +333,12 @@ def _revoke_at_relay(rec, token, timeout=15):
 
 
 def status(root, sid):
-    """"resumable" while the login is stored, "gone" when it is not -- or cannot be read."""
-    return "resumable" if _read_meta(account(root, sid)) is not None else "gone"
+    """"resumable" while the login is stored, "revoking" once a disconnect asked for it to be revoked (it is then kept only for that revoke to
+    be repeated, and no resume claims it), "gone" when it is not stored -- or cannot be read."""
+    rec = _read_meta(account(root, sid))
+    if rec is None:
+        return "gone"
+    return "revoking" if rec.get("revoking") else "resumable"
 
 
 def unreadable(root):
@@ -356,6 +366,17 @@ def revoke_logins(root, device_id=None):
                          % name)
     for rec in chosen:
         sid, short = rec["session_id"], rec["session_id"][:8]
+        try:
+            with _locked():  # marked FIRST, durably: from here on no resume claims it, whatever the relay then says or does not
+                rec = _read_meta(account(root, sid))
+                if rec is None:
+                    continue  # a concurrent revoke or discard has already ended it
+                if not rec.get("revoking"):
+                    _write_meta(account(root, sid), dict(rec, revoking=True))
+        except OSError as e:
+            failed += 1
+            sys.stderr.write("session %s: it could not be marked for revoke (%s) -- it is kept, run this again\n" % (short, e))
+            continue
         secret = secret_of(root, rec)
         if secret is None:
             failed += 1
