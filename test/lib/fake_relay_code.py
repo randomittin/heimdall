@@ -79,6 +79,7 @@ class FakeCodeRelay:
         self.frames_status = None    # callable(envelope dict) -> (status, body) or None for the default; recorded first
         self.pair_init_status = None  # callable() -> (status, body) or None for the default; answered before a session is made
         self.ignore_revokes = False  # a hostile relay: a revoke is recorded and answered, the session stays open
+        self.revoke_status = None    # a relay that will not take a revoke: it is answered with this status and nothing is recorded or ended
         self.lock = threading.Lock()
         self.sessions = {}
         self.order = []
@@ -238,6 +239,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._code(sess, raw)
         elif route == "frames":
             self._frames(sess, raw)
+        elif relay.revoke_status:
+            self._json(relay.revoke_status, {"error": "unavailable"})
         else:
             with relay.lock:
                 relay.revokes.append(sess.id)

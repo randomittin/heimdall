@@ -375,13 +375,12 @@ def case_every_end_reaches_the_relay():
         C.wait_until(lambda: "Phone 1" not in C.device_pids(s), 20)
         env = s.env(HMD_TAILSCALE_BIN="/usr/bin/false")
         gone = C.run([H.APP_PATH, "disconnect", "--repo", s.repo, "--device", "Phone 1"], env, stdin="", timeout=120)
-        T.check(gone.returncode != 0 and "client is not running" in gone.stderr and "NOT be revoked" in gone.stderr
-                and "revoked device" not in gone.stdout + gone.stderr
+        T.check(gone.returncode == 0 and "revoked device" in gone.stdout + gone.stderr and "NOT be revoked" not in gone.stderr
                 and C.wait_until(lambda: C.push_tokens(s) == sorted(tokens[1:]), 20)
                 and "device-%s.json" % C.device_fp(phones[0]) not in device_records(s) and sorted(C.device_pids(s)) == ["Phone 2", "Phone 3"]
-                and not any(sid in s.relay.revokes for sid in sids),
-                "E2. `disconnect --device` for a phone whose client is gone does not claim a revoke: it says the relay session could not be "
-                "revoked from here and exits non-zero, yet removes that phone's push token and record and leaves the others alone",
+                and sids[0] in s.relay.revokes and sids[1] not in s.relay.revokes and sids[2] not in s.relay.revokes,
+                "E2. `disconnect --device` for a phone whose client is gone revokes its relay session through the login its client stored "
+                "(no client is left to ask), exits 0, removes that phone's push token and record and leaves the others alone",
                 "rc %r tokens %r records %r revokes %r %s%s" % (gone.returncode, C.push_tokens(s), device_records(s), s.relay.revokes,
                                                               gone.stdout[-200:], gone.stderr[-400:]))
         end = C.run([H.APP_PATH, "disconnect", "--repo", s.repo], env, stdin="", timeout=180)

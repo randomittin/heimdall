@@ -5,6 +5,36 @@ All notable changes to Heimdall (formerly superx) will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] -- 2.4.8
+
+### Changed
+- `hmd app`: a stopped laptop relay client no longer unpairs the phone. Once a phone is bound, the client's relay session login (bearer
+  token, hmd key, seq marks) is stored outside the repo -- the macOS Keychain (written over `security -i` stdin, never argv), else a 0600
+  file under `$HEIMDALL_HOME` (`bin/lib/hmd_session_login.py`). A TERM, Ctrl-C, KILL or crash revokes nothing; `hmd app connect` and its
+  respawns start the client with `--resume`, which reattaches to the same relay session for `HMD_SESSION_RESUME_H` hours (default 24)
+  without pairing again. Only `hmd app disconnect`, `hmd app disconnect --device`, a revoke from the phone or a refused login unpair:
+  disconnect revokes at the relay through the stored login, also for a crashed client (it used to say "could NOT be revoked"). SIGUSR1 is
+  no longer a revoke trigger. No relay change, no relay deploy needed.
+- `hmd app disconnect --forget-local`: the explicit way out of a stored login whose relay revoke can never be confirmed (stuck `revoking`, a relay that stays
+  down or refuses it). Without the flag nothing changes -- an unconfirmed revoke still fails loudly and keeps the login -- and no other flag implies it. With it
+  (all phones, or one with `--device`) the revoke is tried first; a login still unconfirmed is dropped here: the relay session id, a warning that the phone can
+  keep connecting until that session expires and when (absolute UTC, the stored session expiry: the bind plus the relay's 30-day device-token lifetime) are
+  printed, the stored login (Keychain item and file) is deleted under the store lock, and a `session_login_forgotten` event (`relay-events.jsonl`) and a line in
+  `$HEIMDALL_HOME/logs/app.log` record session, device, expiry and that the relay was NOT told. Exit 0 only once the delete and its log succeeded. Test:
+  `test/app-session-forget-local.test.sh`.
+- `hmd app`: every paired phone comes back by itself after a restart, not only the first. A relay session binds one phone, so each phone has a client of its own and the
+  login of its session stored; `hmd app connect` (also its supervisor's respawn, and its look every `HMD_RESUME_RECONCILE_S` seconds, default 15) and the SessionStart pair
+  window now start one `heimdall-relay-client --resume-only` for every stored login that no live client serves, each resuming its own phone's session (its own seq blocks and
+  store lock, no re-pair, no nonce reuse) while that phone's client was last alive within `HMD_SESSION_RESUME_H` hours -- the limit applies per phone. Phones added with
+  `hmd app add-device` are included. `--resume-only` never pairs: with no login left to claim it says `resume_none` and exits 0. Test: `test/app-session-multi-resume.test.sh`.
+- `hmd app disconnect` and `--forget-local` can no longer race a resume (security review of the multi-phone resume): a disconnect MARKS FIRST -- every stored login
+  goes `revoking` in one hold of the store lock, before a window, the supervisor, a client or the relay is touched -- so no resume claims it afterwards (a periodic look,
+  a respawn, the pair window and a `--resume-only` client all claim under that same lock and skip what is marked or gone); then the connect supervisor (its pid is
+  `pid_watcher` in `connect.json`) is stopped and waited for, then the clients, and only then is the relay asked to revoke (or the login dropped), so nothing is
+  left running that could reattach, respawn or look again; a connect's periodic look also stops once `connect.json` is gone. A client that got through anyway ends
+  itself, revoking its session, within `HMD_SESSION_LOGIN_CHECK_S` (2 s) of its login being marked or gone; a store it merely cannot read ends nothing. Tests:
+  `test/app-session-revoke-race.test.sh`.
+
 ## Changelog status
 
 This file was not maintained between the last curated entry below (from when the
