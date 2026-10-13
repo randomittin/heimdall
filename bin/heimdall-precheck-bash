@@ -101,20 +101,30 @@ esac
 #      its own, was blocked for lacking a receipt only heimdall's test/run-all.sh can write. The hook now
 #      asks bin/lib/hmd_push_target.py which repositories the command pushes (cwd, `git -C <dir>`,
 #      `cd <dir> && ...`, subshells, wrappers, `sh -c`) and gives each the gate its class owes:
-#        sweep        <toplevel>/test/run-all.sh names last-sweep.json (heimdall's own regime): the old gate,
-#                     unchanged and fail-closed, now run INSIDE that repository (a push of repo B no longer
-#                     answers to repo A's state, and a cwd in a subdirectory reads the toplevel's state);
-#        repo-checks  <toplevel>/.heimdall/repo-checks.json declares the repo's own checks: pass ONLY on a
+#        sweep        a commit pushed (or its upstream) has test/run-all.sh naming last-sweep.json (heimdall's
+#                     own regime): the old gate, unchanged and fail-closed, now run INSIDE that repository (a
+#                     push of repo B no longer answers to repo A's state, and a cwd in a subdirectory reads
+#                     the toplevel's state);
+#        repo-checks  a commit pushed has .heimdall/repo-checks.json, the repo's own checks: pass ONLY on a
 #                     green, current, clean-tree receipt (bin/heimdall-repo-checks status). Read, never
 #                     re-run: a hook must not execute what a repository says to execute. Stale, red, dirty,
-#                     missing, invalid or an absent runner all block, naming the runner command;
+#                     missing, mismatched, invalid or an absent runner all block, naming the runner command;
 #        unmanaged    anything else: one WARNING line on stderr, the push goes on.
-#      The marker is the sweep WRITER in the repo's tracked code, never its receipt, so deleting a receipt
-#      cannot downgrade a repo. A resolver that is missing or gives no answer, or a class this does not
-#      know, runs the sweep gate on the cwd exactly as before: the change only ever narrows a gate to the
-#      repository pushed. NOT relaxed, and still reading the CWD repo as they always did: the push-range
-#      secret scan, the full-history self-scan and the oracle and corpus stages below (and, earlier in the
-#      chain, the commit secret scan, git-guard and the kill guard).
+#      The class is read from the COMMITS (HEAD, its upstream, origin, the refspecs named), never the work
+#      tree, and the strictest wins: an uncommitted marker edit changes nothing, and a pushed commit that
+#      drops the marker cannot downgrade a repo whose upstream still has it. The marker is the sweep WRITER
+#      in tracked code, never its receipt, so deleting a receipt cannot downgrade a repo. A command the
+#      resolver does not understand EXACTLY (see its docstring: a dynamic or conditional cd, eval, sh -c,
+#      xargs, aliases, sourced or piped scripts, ...) is uncertain, and then every repo involved gets the
+#      sweep gate (a repository that declares checks also keeps owing its receipt, for commits nobody can
+#      list), and a strict gate that was never evaluated blocks: only an exactly understood command may end
+#      in the warning. The receipt is graded for the commit the push SENDS (each refspec source resolved, HEAD
+#      for a bare push; --all, --mirror, --tags, a wildcard or push configuration that picks the refs cannot
+#      be tied to it). A resolver that is missing or gives no answer, or a class this does not know, runs the
+#      sweep gate on the cwd as before (and a never-evaluated gate blocks there too): the change only ever
+#      narrows a gate to the repository pushed. NOT relaxed, and still reading the CWD repo
+#      as they always did: the push-range secret scan, the full-history self-scan and the oracle and corpus
+#      stages below (and, earlier in the chain, the commit secret scan, git-guard and the kill guard).
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
 
 INPUT=$(cat)
@@ -193,13 +203,16 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
   PG_HOME="$PWD"
   PG_BASE=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
   PG_PLAN=$(python3 -I -S "$PLUGIN/bin/lib/hmd_push_target.py" "$PG_BASE" <<<"$CMD" 2>/dev/null)
-  case $PG_PLAN in '') PG_PLAN=$(printf 'sweep\t%s' "$PG_HOME") ;; esac
-  while IFS=$'\t' read -r PG_CLASS PG_DIR; do
+  case $PG_PLAN in '') PG_PLAN=$(printf 'sweep\t%s\tfallback' "$PG_HOME") ;; esac
+  # a row is `class<TAB>dir[<TAB>extra]`: for repo-checks the commits the push sends (given to `status --pushes`: the receipt must be for every
+  # one; a missing or unreadable list is "cannot be listed" and blocks), for a sweep row `fallback` when it is the strict class only because
+  # the command or git could not be read (then a gate that was never evaluated blocks instead of allowing)
+  while IFS=$'\t' read -r PG_CLASS PG_DIR PG_EXTRA; do
     case "$PG_CLASS" in
       repo-checks)
         PG_RUN="$PLUGIN/bin/heimdall-repo-checks"
         if [ -x "$PG_RUN" ]; then
-          PG_OUT=$("$PG_RUN" status --repo "$PG_DIR" 2>&1)
+          PG_OUT=$("$PG_RUN" status --repo "$PG_DIR" --pushes "$PG_EXTRA" 2>&1)
           PG_RC=$?
         else
           PG_OUT="repo-checks: NOT GREEN - $PG_RUN is missing, so the record of this repository's own checks cannot be read"
@@ -210,7 +223,7 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
         else
           ESC=$(printf '%s' "$PG_OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
           PG_ESC=$(printf '%s' "$PG_DIR" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-          deny "$(printf '{"error": "BLOCKED: pre-push repo-checks gate failed for %s. This repository declares its own checks (.heimdall/repo-checks.json), so a push needs a green, current, clean-tree record of them (the heimdall sweep rules do not apply to it). --- %s"}' "$PG_ESC" "$ESC")"
+          deny "$(printf '{"error": "BLOCKED: pre-push repo-checks gate failed for %s. This repository declares its own checks (.heimdall/repo-checks.json), so a push needs a green, current, clean-tree record of them for the commit it sends (the heimdall sweep rules do not apply to it). --- %s"}' "$PG_ESC" "$ESC")"
         fi ;;
       unmanaged)
         printf 'heimdall: WARNING - %s is not managed by hmd (no heimdall sweep regime, no .heimdall/repo-checks.json), so no test or lint gate ran for this push; the secret gates below still apply. To gate it, declare its checks in .heimdall/repo-checks.json and record them: %s/bin/heimdall-repo-checks run --repo %s\n' "$PG_DIR" "$PLUGIN" "$PG_DIR" >&2 ;;
@@ -238,6 +251,11 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
           deny "$(printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing.%s --- %s"}' "$HINT_ESC" "$ESC")"
         elif [ "$QGRC" = 0 ]; then
           printf '%s\n' "$QGOUT" >&2
+        elif [ "$PG_EXTRA" = fallback ]; then
+          # the strict class here is only a fallback (the command or git could not be read), so "never evaluated" cannot stand in for a gate
+          ESC=$(printf '%s' "$QGOUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          PG_ESC=$(printf '%s' "$PG_DIR" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: pre-push gate cannot grade this push. The command could not be read exactly (or git failed), so the strict regime applies to %s, and its quality gate was never evaluated (exit %s), so nothing stands in for it. Restate the push plainly (git push <remote> HEAD, or git -C <dir> push), or arm the gate with `heimdall-state init` and `heimdall-state mark-clean` in that checkout. --- %s"}' "$PG_ESC" "$QGRC" "$ESC")"
         else
           printf 'heimdall: quality-gate verdict UNAVAILABLE (exit %s) - the gates were NEVER EVALUATED, which is not a pass. Run `heimdall-state init` then `heimdall-state mark-clean` in this checkout to arm the pre-push gate. Allowing push to proceed. --- %s\n' "$QGRC" "$QGOUT" >&2
         fi ;;

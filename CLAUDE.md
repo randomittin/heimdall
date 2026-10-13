@@ -215,29 +215,63 @@ warning but isn't blocked; don't drop the gate altogether.* The gate is now chos
   environment go to `git rev-parse`, and the work tree root it finds is checked from the other end.
   `--work-tree` / `GIT_WORK_TREE` cannot point a push at a decoy, and a subdirectory or linked
   worktree of heimdall is heimdall.
-- **(a) sweep.** Marker: `<toplevel>/test/run-all.sh` is a regular file that names `last-sweep.json`
+- **The class is read from the COMMITS, not the work tree.** The commits inspected are HEAD, its
+  upstream (`@{upstream}`, `@{push}`), `origin/HEAD`, `origin/<branch>` and whatever the push names
+  (refspecs, `--all`, `--mirror`, `--tags`), read with `git ls-tree` / `git cat-file`; the STRICTEST
+  class over them wins. An uncommitted marker edit, deletion or new file on disk changes nothing, and a
+  pushed commit that drops a marker cannot downgrade a repo whose upstream still has it.
+- **(a) sweep.** Marker: a commit has `test/run-all.sh` as a regular file that names `last-sweep.json`
   (heimdall's own sweep regime; that script writes the receipt `check-quality-gates` reads). The marker
   is tracked code, never the receipt, so deleting a receipt cannot downgrade a repo, and another
   project's `test/run-all.sh` is not mistaken for it. The old gate, unchanged and fail closed, now run
   inside that repo (a cwd in a subdirectory reads the toplevel's state).
-- **(b) repo-checks.** `<repo>/.heimdall/repo-checks.json` = `{"schema":1,"checks":[{"name","cmd"}]}`.
+- **(b) repo-checks.** A commit has `.heimdall/repo-checks.json` = `{"schema":1,"checks":[{"name","cmd"}]}`.
   `bin/heimdall-repo-checks run [--repo PATH]` runs each check from the repo root, in order, and writes
   `<repo>/.heimdall/receipts/repo-checks.json` atomically. The gate passes ONLY on a receipt that is
-  green, for the HEAD being pushed, recorded on a tree with no uncommitted tracked changes, bound to the
-  commit (`head_sha`), its tree (`tree_sha`) and the declaration's bytes (`decl_sha256`) (all three
-  recomputed by the gate), and listing exactly the declared checks. Stale, red, dirty, missing,
-  mismatched, invalid, or an absent runner blocks, and the block names the runner command (`status
-  [--repo PATH]` prints the verdict). The hook reads the receipt and never re-runs a repo's commands.
-  Track `repo-checks.json`, gitignore `.heimdall/receipts/`.
-- **(c) unmanaged.** One `WARNING` line on stderr, exit 0, and only for a repo git resolved AND that
-  positively carries neither marker.
-- **Fail closed.** Anything uncertain is class (a) on the repo resolved, else on the cwd, never a
-  warning: a command it cannot read in full, a target held in a variable or missing, a git option or
-  subcommand it does not know (an alias may be a push), a `GIT_*` variable set in a way it does not
-  model, a sourced script, a cwd that is not a repo, a marker that is present but unreadable or tracked
-  yet missing from disk (a sparse or no-checkout worktree). A resolver that is missing or crashes means
-  the old sweep gate on the cwd. Best effort, said plainly: shell cannot be read completely, so the
-  native hook (`core.hooksPath`) stays the hard backstop.
+  green, recorded on a tree with no uncommitted tracked changes, bound to the commit (`head_sha`), its
+  tree (`tree_sha`) and the declaration's committed bytes (`decl_sha256`) (all three recomputed by the
+  gate from git objects), listing exactly the declared checks, **and for the commit the push sends**: the
+  resolver resolves each refspec's source with git (`origin other`, `HEAD~1:main`, `<sha>:main`, a tag;
+  HEAD for a bare push) and hands the ids to `status --pushes`, and EVERY one must be the receipt's
+  `head_sha`. `--all`, `--mirror`, `--tags`, a wildcard refspec, an option it cannot read (`--repo`) and
+  push configuration that picks the refs (`push.default=matching`, any `remote.<name>.push`) cannot be
+  tied to one receipt and block; a ref that names no commit makes the whole push the strict class. A
+  push that sends no commit (`:branch`, `--delete`) needs only the current receipt. Stale, red, dirty,
+  missing, mismatched, malformed, invalid, or an absent runner blocks, and the block names the runner
+  command (`status [--repo PATH] [--pushes IDS]` prints the verdict). The hook reads the receipt and
+  never re-runs a repo's commands. Track `repo-checks.json`, gitignore `.heimdall/receipts/`. The
+  receipt's fields, types and formats are defined ONCE, in `bin/lib/hmd_repo_receipt.py`, which `run`
+  builds the receipt with and `status` verifies it against (the test walks that definition: a receipt
+  `run` writes passes, every field mutated alone fails).
+- **(c) unmanaged.** One `WARNING` line on stderr, exit 0, and only when the command was understood
+  EXACTLY, git resolved the repo, and no commit inspected has either marker.
+- **Fail closed.** Any construct not modelled exactly makes the whole command uncertain, and then EVERY
+  repo involved (the resolved ones and the cwd one) gets class (a), never a warning. Followed exactly:
+  quotes, `~`, `;` `&&` `||` `|` `&`, subshells, `$( )` and backticks, `cd`/`pushd`/`popd` as a SET of
+  possible states (an `&&`/`||` runs its right side only on success/failure; a `cd` into an existing
+  directory cannot fail; both outcomes of `test -d X && cd X` are gated; the last element of a pipeline
+  may run in the current shell, as in zsh, so both outcomes are gated), `eval` (runs in the current
+  shell), `sh -c`, here-strings, heredocs and pipes fed to a shell, `env`/`sudo`/`command`/`exec`/
+  `time`/`nohup`/`xargs`, `export GIT_DIR=...`. Flagged: a dynamic `cd`, `cd -`, CDPATH, a `cd` inside
+  if/while/for/case or `{ }`, a builtin (`cd`, `export`, `eval`, ...) behind a wrapper that starts a
+  process (`env cd X`, `xargs cd X`, `sudo cd X`: it does not run in this shell), `env` with any option
+  (`-u`, `-i`, `-C`, `-S`), an assignment to `HOME`, `CDPATH`, `PWD`, `OLDPWD`, `BASH_ENV` or `ENV`, a
+  function, `source`, `alias`, a script piped to a shell, an expansion that hides a substitution, a
+  heredoc body the shell expands, `find -exec` and other commands whose arguments name git and push,
+  `xargs` handing over the subcommand, `sudo -D`/`-i`, a git option or subcommand it does not know (an
+  alias may be a push), an unmodelled `GIT_*` variable, a cwd that is not a repo, a marker that cannot be
+  inspected (a link, a submodule, a directory, a failing git). Proof: every command of a corpus is RUN
+  by real bash (and zsh) with a git that records where it was started, and the repositories the pushes
+  really went to are compared with the resolver's answer.
+- **Every error path is strict.** git that exits non-zero, times out, answers with something it does
+  not print, or cannot place a ref; a marker that is a link, a submodule or a directory; a resolver that
+  crashes, times out or names a class nobody knows; a receipt or declaration that is unreadable, the
+  wrong type or nested past the parser's limit: each is the strict class or a block, never the
+  unmanaged warning and never a pass. The test forces each (a `git` on PATH that fails, prints
+  nonsense or hangs at each call the resolver makes; corrupt receipts and declarations). A resolver
+  that is missing or crashes means the old sweep gate on the cwd. Best effort, said plainly: shell
+  cannot be read completely (a script can push), so the native hook (`core.hooksPath`) stays the hard
+  backstop.
 - **A cooperating-agent control, not a security boundary.** Like `last-sweep.json`, the repo-checks
   receipt is a plain local file: the binding catches stale, copied, mismatched and
   hand-edited-by-accident receipts, not someone who can write the file and its hashes.
