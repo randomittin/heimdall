@@ -3089,9 +3089,10 @@ _disconnect_device() {
     echo "hmd app disconnect: device $id ($(_clean_text "$wanted")): its relay session could NOT be confirmed revoked -- it stays connected; run this again once the relay is reachable" >&2
     return 1
   fi
-  sig="$("$PY3" "$LIB_DIR/hmd_devices.py" signal --repo "$repo" "$id" 2>/dev/null)"
-  case "$sig" in TERM|USR1) ;; *) sig=USR1 ;; esac
-  [ "$lrc" -eq 0 ] && sig=TERM  # revoked: the client is only stopped now (it ends on the relay's session_ended too)
+  # TERM, always: SIGUSR1 is no revoke any more (a new client ignores it). A client older than the stored logins revokes on TERM, and so does
+  # a new one that keeps no login (it could not store one, or it is gone) -- through the revoke it makes itself; one that was revoked above is
+  # only stopped (it ends on the relay's session_ended too).
+  sig=TERM
   repo_real="$(_real_dir "$repo")"
   rc=0
   # A14: verify identity before signaling -- a recycled pid must never take an unrelated process down with it.
@@ -3161,6 +3162,12 @@ cmd_disconnect() {
   if [ -n "$PY3" ]; then
     "$PY3" "$LIB_DIR/hmd_session_login.py" revoke --repo "$REPO" --all || LOGIN_REVOKE_RC=$?
     [ "$LOGIN_REVOKE_RC" -eq 3 ] && LOGIN_REVOKE_RC=0
+  elif ls "${HEIMDALL_HOME:-${HOME:-/nonexistent}/.heimdall}/app/sessions/"*.json >/dev/null 2>&1; then
+    echo "hmd app disconnect: python3 is missing and session logins are stored, so they could NOT be revoked at the relay from here" >&2
+    LOGIN_REVOKE_RC=1
+  fi
+  if [ "$LOGIN_REVOKE_RC" -ne 0 ]; then
+    echo "hmd app disconnect: a stored session login could NOT be confirmed revoked at the relay -- it is kept (so are the device records), nothing here claims the phone is unpaired; run hmd app disconnect again once that is fixed" >&2
   fi
   _stop_device_clients "$REPO" "$repo_real" || true  # every phone's client, an added one too (a client older than the stored logins revokes on this TERM)
 
@@ -3267,6 +3274,10 @@ cmd_disconnect_relay() {
   # and one whose push registrations cannot be removed is reported, never counted as disconnected
   while read -r did dpid; do
     [ -n "$did" ] || continue
+    if [ "${LOGIN_REVOKE_RC:-0}" -ne 0 ]; then  # the revoke was not confirmed: the phone is still paired, and its record names its push tokens
+      echo "hmd app disconnect: device $did: its relay session could NOT be confirmed revoked, so its record is kept" >&2
+      continue
+    fi
     "$PY3" "$LIB_DIR/hmd_devices.py" forget --repo "$REPO" "$did" >/dev/null 2>&1 \
       || { echo "hmd app disconnect: device $did: its push registrations could not be removed, so it may still be notified and its record is kept" >&2; rc=1; }
   done <<<"$devs"
@@ -3711,7 +3722,12 @@ case "$CMD" in
   pair-window-loop) cmd_pair_window_loop "$@"; exit $? ;;
   identity) cmd_identity "$@"; exit $? ;;
   status) cmd_status "$@"; exit $? ;;
-  disconnect) cmd_disconnect "$@"; exit $? ;;
+  disconnect)
+    cmd_disconnect "$@"; disconnect_rc=$?
+    # Whichever way cmd_disconnect went -- relay, Tailscale, nothing connected -- a stored session login whose relay revoke was not confirmed
+    # is no clean disconnect: it never exits 0 over one.
+    if [ "${LOGIN_REVOKE_RC:-0}" -ne 0 ] && [ "$disconnect_rc" -eq 0 ]; then disconnect_rc=1; fi
+    exit "$disconnect_rc" ;;
   add-device) cmd_add_device "$@"; exit $? ;;
   doctor) cmd_doctor "$@"; exit $? ;;
   remote-login) cmd_remote_login "$@"; exit $? ;;

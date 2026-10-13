@@ -1826,20 +1826,26 @@ class RelayClient:
         return delivered, nbytes
 
     def revoke(self):
-        self._revoke_session(self.session_id, self.token)
+        """True when the relay confirmed the session ended (or no longer has it)."""
+        return self._revoke_session(self.session_id, self.token)
 
     def _revoke_session(self, session_id, token):
         """POST /session/:id/revoke for ANY session this client minted -- the current one at shutdown, a
-        superseded or rejected code window's mid-run."""
+        superseded or rejected code window's mid-run. True when the relay confirmed (200, or 404/410: it no longer has the session);
+        False when it could not be asked or answered otherwise -- said in an `error` event, never blocking process exit."""
         if not session_id or not token:
-            return
+            return False
         try:
-            self._request("POST", "/session/%s/revoke" % session_id,
-                           headers={"Authorization": "Bearer %s" % token, "Content-Length": "0"}, body=b"",
-                           label="revoke")
+            status, _raw = self._request("POST", "/session/%s/revoke" % session_id,
+                                         headers={"Authorization": "Bearer %s" % token, "Content-Length": "0"}, body=b"",
+                                         label="revoke")
         except (OSError, http.client.HTTPException) as e:
-            # best-effort shutdown courtesy call -- surfaced, never blocks process exit
             emit({"event": "error", "detail": "revoke call failed: %s" % e})
+            return False
+        if status in (200, 404, 410):
+            return True
+        emit({"event": "error", "detail": "revoke not confirmed: HTTP %d" % status})
+        return False
 
     # -- pair by session code ----------------------------------------------------------------------
     # PAIR BY SESSION CODE in the module docstring is the design; what follows is its client half.
@@ -3212,15 +3218,21 @@ class RelayClient:
         self.stop_event.set()
         self._gh_secret = None  # a stopped client offers no code window, so it keeps no token
         self._login_shutdown()  # before the (network-bound) revoke: a login process must not outlive us
-        if self._login_kept:
+        if self._login_kept and LOGIN_STORE is not None and LOGIN_STORE.status(self.root, self.session_id) == "resumable":
             # A phone is bound and its login is stored: stopping this client -- a TERM, Ctrl-C, a crash that got this far -- does NOT
             # unpair it. The relay session stays open for the next client to resume (--resume); `hmd app disconnect` revokes it through
             # the stored login, and so does nothing else of ours. The phone's record and the statusline marker stay with it.
             self._login_update()
             reason = "stopped" if reason == "local-disconnect" else reason
         else:
-            self.revoke()  # nothing bound, nothing stored: the session is simply ended, which also frees its code at the relay
-            self._remove_pairing_traces()
+            # Nothing bound, or no login that could resume it: it was never stored, or it is gone since -- a disconnect that already
+            # revoked this session, or a file somebody deleted. Either way nobody could resume or end it later, so it is ended now (which
+            # also frees its code at the relay). A phone's record stays when the relay did not confirm: the phone is still paired.
+            confirmed = self.revoke()
+            if confirmed or self._device_id is None:
+                self._remove_pairing_traces()
+            else:
+                emit({"event": "error", "detail": "the relay did not confirm the revoke: this phone's record is kept"})
         self.write_status()
         emit({"event": "session_ended", "reason": reason})
 

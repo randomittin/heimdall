@@ -86,6 +86,7 @@ class Relay:
         self.revokes = []
         self.inits = 0
         self.down = False          # /revoke answers 503 while set
+        self.revoke_status = None  # /revoke answers this status while set (a relay that refuses: 403)
         self.stream_status = None  # GET /stream answers this status while set
         relay = self
 
@@ -132,8 +133,8 @@ class Relay:
                 if s is None:
                     return None
                 if m.group(2) == "revoke":
-                    if relay.down:
-                        return self.reply(503, {"error": "unavailable"})
+                    if relay.down or relay.revoke_status:
+                        return self.reply(relay.revoke_status or 503, {"error": "unavailable"})
                     with relay.lock:
                         s["revoked"] = True
                         relay.revokes.append(m.group(1))
@@ -274,6 +275,9 @@ class Client:
         self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=open(self.out_path, "w"),
                                      stderr=open(self.err_path, "w"), env=sb.env(**env))
         STARTED.append(self.proc.pid)
+        # Reaped the moment it ends, as a client `hmd app connect` backgrounds is: an unreaped child stays a zombie, which `kill -0` (what
+        # _relay_stop_client waits on) still sees as running.
+        threading.Thread(target=self.proc.wait, daemon=True).start()
 
     def events(self):
         out = []

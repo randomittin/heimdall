@@ -23,6 +23,8 @@ HMD_SESSION_LOGIN_STORE=file|keychain|auto (default auto: the Keychain on macOS 
 
 LIMIT. A login whose client was last alive more than HMD_SESSION_RESUME_H hours ago (default 24; 0 = never resume) is discarded on
 the next look and the phone pairs again. It is not revoked: only an explicit disconnect, a revoke from the phone or a failed login is.
+CONFIRMED OR KEPT. A login is removed by a revoke here only once the relay confirmed it (the session ended, or is no longer there); an
+unreachable or unwilling relay, a secret that cannot be read and a login file that cannot be read all keep it and fail loudly.
 
 CLI (the shell tools; nothing secret is ever printed):
     python3 hmd_session_login.py list   --repo DIR                                   the logins of that repo, as JSON, secret-free
@@ -290,8 +292,9 @@ def load_resumable(root, relay, reserve=SEQ_BLOCK):
             if _held(root, rec.get("pid")):
                 continue
             secret = secret_of(root, rec)
-            if secret is None:
-                _discard_unlocked(root, rec["session_id"])
+            if secret is None:  # a locked Keychain, a vanished item: no reason to lose the one thing a disconnect revokes with
+                sys.stderr.write("session %s: its stored secret cannot be read, so it is not resumed (and not discarded)\n"
+                                 % rec["session_id"][:8])
                 continue
             mark = rec.get("hmd_seq")
             if not isinstance(mark, int) or isinstance(mark, bool) or mark < 0:
@@ -323,33 +326,52 @@ def _revoke_at_relay(rec, token, timeout=15):
         return "failed: %s" % type(e).__name__
 
 
+def status(root, sid):
+    """"resumable" while the login is stored, "gone" when it is not -- or cannot be read."""
+    return "resumable" if _read_meta(account(root, sid)) is not None else "gone"
+
+
+def unreadable(root):
+    """The files in the store that carry THIS repo's name but cannot be read or trusted (not 0600, not ours, not JSON): a login the revoke
+    cannot see, so one it must not walk past -- it may be the very login that was asked for."""
+    base = home()
+    if base is None:
+        return []
+    prefix = account(root, "x")[: -len("x")]
+    return [n for n in PRIVATE.names(base, REL)
+            if n.startswith(prefix) and n.endswith(".json") and _read_meta(n[: -len(".json")]) is None]
+
+
 def revoke_logins(root, device_id=None):
-    """Revoke the stored sessions of this repo (all, or the one device's) at the relay. (confirmed, failed, selected): a login the relay
-    confirmed revoked, or no longer has, or refuses, is discarded; one it could not be asked about is kept for another try."""
+    """Revoke the stored sessions of this repo (all, or the one device's) at the relay. (confirmed, failed, selected). ONLY a revoke the
+    relay confirmed -- done, or the session no longer there -- removes a login. Everything else keeps it and says so, loudly: a relay that
+    cannot be reached or will not take it (5xx, 401, 403), a secret that cannot be read (a locked or emptied Keychain), and a login file
+    that cannot be read at all, which is never walked past. The stored login is the only thing that can end that session from here."""
     chosen = [r for r in records(root) if device_id is None or r.get("device_id") == device_id]
     confirmed = failed = 0
+    blind = unreadable(root)
+    for name in blind:
+        failed += 1
+        sys.stderr.write("session login %s: it cannot be read (is it a 0600 file of ours?), so it could NOT be revoked from here -- it is kept\n"
+                         % name)
     for rec in chosen:
         sid, short = rec["session_id"], rec["session_id"][:8]
         secret = secret_of(root, rec)
         if secret is None:
-            discard(root, sid)
-            sys.stderr.write("session %s: its stored secret is gone, so it could NOT be revoked from here\n" % short)
             failed += 1
+            sys.stderr.write("session %s: its stored secret cannot be read (a locked or emptied Keychain?), so it could NOT be revoked "
+                             "from here -- the login is kept, run this again\n" % short)
             continue
         state = _revoke_at_relay(rec, secret["token"])
         if state in ("revoked", "gone"):
             discard(root, sid)
             confirmed += 1
             print("session %s: %s at the relay" % (short, "revoked" if state == "revoked" else "already gone"))
-        elif state == "rejected":
-            discard(root, sid)
-            failed += 1
-            sys.stderr.write("session %s: the relay refused the stored login, so it could NOT be revoked from here (the login is "
-                             "discarded; hmd app identity revoke signs every phone out)\n" % short)
         else:
             failed += 1
-            sys.stderr.write("session %s: the revoke could NOT be confirmed (%s) -- the login is kept, run this again\n" % (short, state))
-    return confirmed, failed, len(chosen)
+            why = "the relay refused the stored login" if state == "rejected" else state
+            sys.stderr.write("session %s: the revoke could NOT be confirmed (%s) -- the login is kept, run this again\n" % (short, why))
+    return confirmed, failed, len(chosen) + len(blind)
 
 
 def main(argv=None):
