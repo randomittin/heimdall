@@ -46,6 +46,15 @@
 # refspecs, strictest wins), B "the shell differential" (every corpus command is RUN by real bash and zsh with a recording git, and the
 # repositories the pushes really went to are compared with the resolver's answer), B "EVERY error path is strict" (a git that fails, prints
 # nonsense or hangs at each call the resolver makes), C40-C43 (refspecs vs the receipt), C44-C48 (the hook's own error paths).
+#
+# REVIEW ROUND 2026-10-14 (the last security review of the push gate), one proof family per finding:
+#   1. a resolver that cannot answer (timeout, crash, missing) must not fall back to ONE repository: C50-C53 (the strict gate runs against the
+#      session cwd, the payload cwd and every -C / cd target the parser had reached, and blocks unless all pass)
+#   2. ONE resolved (git dir, work tree) pair feeds classification, refspec resolution, the receipt lookup and the heimdall-state check: B "pair"
+#      (git's own answer per layout), B "GIT_*" (a variable the resolver does not reproduce is uncertain), C54-C58 (the hook hands the pair on),
+#      C59 (the receipt lookup verifies it from the other end and never rediscovers)
+#   3. self-audit: A10 (a symlinked .heimdall / receipts / receipt is never followed; size, depth and type abuse of a receipt or declaration),
+#      C60 (one commit throughout a status), C61 (a symlink through the hook), C53 (a gate directory that cannot be entered blocks), B "linear time"
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -399,6 +408,38 @@ for bad_decl in 'not json' '[]' 'null' '{"schema":1,"checks":"x"}' '{"schema":1,
 done
 
 # ════════════════════════════════════════════════════════════════════════════
+# ── A10. the receipt is read as ONE regular file inside the repository (review round 2026-10-14): a link is never followed, and nothing is
+#    trusted that is too big, too deep or not a file ──
+A10="$(mk_checks a10 "$GREEN_DECL")"; run_checks "$A10"
+cp "$(receipt_of "$A10")" "$W/a10.green"
+status_of "$A10"; [ "$STRC" = 0 ] && ok "A10. fixture sanity: the genuine green receipt passes" || bad "A10. fixture sanity" "rc=$STRC $STOUT"
+mv "$A10/.heimdall/receipts" "$W/a10.elsewhere"; ln -s "$W/a10.elsewhere" "$A10/.heimdall/receipts"
+status_of "$A10"; { [ "$STRC" = 1 ] && grep -qi 'link' <<<"$STOUT"; } && ok "A10a. .heimdall/receipts is a symlink to a genuine receipt elsewhere -> NOT GREEN, says it is a link" || bad "A10a. a symlinked receipts directory was followed" "rc=$STRC $STOUT"
+rm "$A10/.heimdall/receipts"; mv "$W/a10.elsewhere" "$A10/.heimdall/receipts"
+mv "$A10/.heimdall" "$W/a10.heimdall"; ln -s "$W/a10.heimdall" "$A10/.heimdall"
+status_of "$A10"; { [ "$STRC" = 1 ] && grep -qi 'link' <<<"$STOUT"; } && ok "A10b. .heimdall itself is a symlink -> NOT GREEN, says it is a link" || bad "A10b. a symlinked .heimdall was followed" "rc=$STRC $STOUT"
+rm "$A10/.heimdall"; mv "$W/a10.heimdall" "$A10/.heimdall"
+mv "$(receipt_of "$A10")" "$W/a10.file"; ln -s "$W/a10.file" "$(receipt_of "$A10")"
+status_of "$A10"; { [ "$STRC" = 1 ] && grep -qi 'link' <<<"$STOUT"; } && ok "A10c. the receipt file itself is a symlink -> NOT GREEN" || bad "A10c. a symlinked receipt file was followed" "rc=$STRC $STOUT"
+rm "$(receipt_of "$A10")"; cp "$W/a10.green" "$(receipt_of "$A10")"
+status_of "$A10"; [ "$STRC" = 0 ] && ok "A10c. ...and with the links gone the same receipt passes again (the refusals above were about the links)" || bad "A10c. restored receipt" "rc=$STRC $STOUT"
+A10D="$(mk_checks a10d "$GREEN_DECL")"; mkdir -p "$W/a10d.out" "$A10D/.heimdall"; ln -s "$W/a10d.out" "$A10D/.heimdall/receipts"
+run_checks "$A10D"
+{ [ "$RCRC" = 2 ] && [ -z "$(ls -A "$W/a10d.out")" ] && grep -qi 'link' "$W/rc.err"; } && ok "A10d. run refuses to write the receipt through a symlinked receipts directory: exit 2, nothing lands outside the repository" || bad "A10d. run wrote through a link" "rc=$RCRC out=$(ls -A "$W/a10d.out") $(head -c 300 "$W/rc.err")"
+{ cat "$W/a10.green"; head -c 2000000 /dev/zero | tr '\0' ' '; } > "$(receipt_of "$A10")"
+status_of "$A10"; { [ "$STRC" = 1 ] && grep -qi 'larger' <<<"$STOUT"; } && ok "A10e. a receipt of 2 MB (valid JSON plus padding) is not read -> NOT GREEN, says it is too large" || bad "A10e. an oversized receipt was read" "rc=$STRC $(printf '%s' "$STOUT" | head -c 300)"
+python3 -c 'import sys; sys.stdout.write("[" * 300000 + "]" * 300000)' > "$(receipt_of "$A10")"
+status_of "$A10"; { [ "$STRC" = 1 ] && ! grep -q 'Traceback\|RecursionError' <<<"$STOUT"; } && ok "A10g. a receipt nested 300000 deep is NOT GREEN as invalid JSON, not a crash" || bad "A10g. a deeply nested receipt" "rc=$STRC $(printf '%s' "$STOUT" | head -c 300)"
+rm -f "$(receipt_of "$A10")"; mkfifo "$(receipt_of "$A10")"
+perl -e 'alarm 20; exec @ARGV' bash "$RC_BIN" status --repo "$A10" >"$W/o" 2>&1; rcx=$?
+{ [ "$rcx" = 1 ] && grep -q 'NOT GREEN' "$W/o"; } && ok "A10f. a FIFO where the receipt should be: refused at once, never opened (no hang)" || bad "A10f. a FIFO receipt" "rc=$rcx $(head -c 300 "$W/o")"
+rm -f "$(receipt_of "$A10")"; cp "$W/a10.green" "$(receipt_of "$A10")"
+A10H="$(new_repo a10h)"; mkdir -p "$A10H/.heimdall"
+python3 -c 'import json, sys; sys.stdout.write(json.dumps({"schema": 1, "checks": [{"name": "x", "cmd": "true"}], "pad": "a" * 2000000}))' > "$A10H/.heimdall/repo-checks.json"; commit_all "$A10H" "a 2 MB declaration"
+bash "$RC_BIN" status --repo "$A10H" >"$W/o" 2>&1; rcx=$?
+{ [ "$rcx" = 2 ] && grep -qi 'larger' "$W/o"; } && ok "A10h. a committed declaration of 2 MB is refused, not parsed (exit 2)" || bad "A10h. an oversized declaration" "rc=$rcx $(head -c 300 "$W/o")"
+
+# ════════════════════════════════════════════════════════════════════════════
 section "B. bin/lib/hmd_push_target.py -- which repo, which class"
 SWEEP="$(mk_sweep sweep)"
 CHK="$(mk_checks chk "$GREEN_DECL")"
@@ -437,7 +478,7 @@ check_strict() {  # check_strict <label> <base> <command> [silent]: at least one
   local label="$1" base="$2" cmd="$3" mode="${4:-}" got            # at all: the hook then runs the strict gate on the cwd itself
   got="$(printf '%s' "$cmd" | env HOME="$HOMEDIR" PATH="${PLAN_PATH:-$PATH}" $PLAN_ENV python3 -I -S "$HELPER" "$base" 2>"$W/plan.err")"
   if [ -z "$got" ] && [ "$mode" = silent ]; then ok "B. strict: $label (no answer: the hook falls back to the strict gate on the cwd)"
-  elif [ -n "$got" ] && [ -z "$(printf '%s\n' "$got" | grep -v "^sweep${TAB}" | grep -v "^repo-checks${TAB}.*${TAB}?\$")" ]; then ok "B. strict: $label"
+  elif [ -n "$got" ] && [ -z "$(printf '%s\n' "$got" | grep -v "^sweep${TAB}" | grep -v "^repo-checks${TAB}.*${TAB}?${TAB}[^${TAB}]*\$")" ]; then ok "B. strict: $label"
   else bad "B. strict: $label" "command: $cmd | got: $(printf '%s' "$got" | tr '\n\t' '|~') $(head -c 200 "$W/plan.err")"; fi
 }
 check_sources() {  # check_sources <label> <base> <command> <the repo-checks row's third column: full ids comma-separated, - (no commit) or ? (cannot be listed)>
@@ -547,7 +588,7 @@ check_plan "a substitution target"                                           "$P
 check_plan "cd to a variable"                                                "$PLAIN" 'cd "$X" && git push'          "sweep:$PLAIN"
 check_plan "a target that does not exist -> strict on the cwd"               "$PLAIN" 'git -C /no/such/dir/anywhere push' "sweep:$PLAIN"
 check_plan "a target that is not a repo -> strict on the cwd"                "$PLAIN" "git -C $NOGIT push"           "sweep:$PLAIN"
-check_plan "a bare repository cannot be placed in a work tree -> strict"     "$PLAIN" "git -C $BARE push"            "sweep:$PLAIN"
+check_plan "a bare repository cannot be placed in a work tree -> strict, on the cwd AND on the bare repository itself (the one pushed from)" "$PLAIN" "git -C $BARE push" "sweep:$PLAIN" "sweep:$BARE"
 check_plan "text that only mentions a push -> strict on the cwd"             "$PLAIN" 'echo "git push" > /dev/null'  "sweep:$PLAIN"
 check_plan "a heredoc body is data, not a command -> nothing found -> strict" "$PLAIN" $'cat <<EOF\ngit -C '"$CHK"$' push\nEOF'  "sweep:$PLAIN"
 check_plan "empty command -> strict on the cwd"                              "$PLAIN" ''                             "sweep:$PLAIN"
@@ -689,7 +730,7 @@ check_strict "BASH_ENV=<file> runs a file in every shell it starts"          "$P
 # ── the third column of a sweep row says whether it is only the strict FALLBACK (the command or git could not be read), or a marker was found ──
 fb_column() { printf '%s' "$2" | env HOME="$HOMEDIR" python3 -I -S "$HELPER" "$1" 2>/dev/null | awk -F'\t' 'NR == 1 { print $3 }'; }
 [ "$(fb_column "$PLAIN" 'git -C "$X" push')" = fallback ] && ok "B. an uncertain command's strict row is marked fallback" || bad "B. an uncertain command's strict row is not marked fallback" "$(fb_column "$PLAIN" 'git -C "$X" push')"
-[ -z "$(fb_column "$SWEEP" 'git push')" ] && ok "B. a sweep row found through a marker is NOT marked fallback" || bad "B. a marker-derived sweep row is marked fallback"
+[ "$(fb_column "$SWEEP" 'git push')" = - ] && ok "B. a sweep row found through a marker is NOT marked fallback (the column holds -)" || bad "B. a marker-derived sweep row is marked fallback" "$(fb_column "$SWEEP" 'git push')"
 [ "$(fb_column "$DANGLE" 'git push')" = fallback ] && ok "B. a marker that cannot be read is a fallback row too" || bad "B. an unreadable marker's strict row is not marked fallback"
 
 # ── the receipt attests ONE commit: the resolver names the commits a push sends as sources (the third column of a repo-checks row) ──
@@ -726,6 +767,7 @@ cat > "$BROKEN/git" <<'FAKEGIT_EOF'
 #!/usr/bin/env bash
 # a git that misbehaves for ONE kind of call and is the real git otherwise. FAKE_GIT_BREAK is <subcommand>[:<text the arguments must contain>];
 # FAKE_GIT_MODE is fail (exit 128), garbage (exit 0, nonsense on stdout), empty (exit 0, nothing) or hang (sleeps, replacing this process)
+[ -n "${FAKE_GIT_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_GIT_LOG"
 sub="${FAKE_GIT_BREAK%%:*}"; pat=""
 [ "$FAKE_GIT_BREAK" = "$sub" ] || pat="${FAKE_GIT_BREAK#*:}"
 hit=0
@@ -764,6 +806,39 @@ for spec in 'ls-tree' 'rev-parse:HEAD'; do
   check_strict "git [$spec] hangs past the resolver's timeout -> strict" "$ERRREPO" 'git push' silent
 done
 PLAN_ENV=""; PLAN_PATH=""
+# ── review round 2026-10-14, finding 2: ONE resolved (git dir, work tree) pair per row (columns 2 and 4), and it is git's own answer for that layout ──
+SUBSRC="$(mk_sweep subsrc)"; SUPER="$(new_repo super)"
+git -C "$SUPER" -c protocol.file.allow=always submodule add -q "$SUBSRC" sub >/dev/null 2>&1 && commit_all "$SUPER" "add the submodule"
+[ -f "$SUPER/sub/.git" ] && ok "B. fixture sanity: the submodule's .git is a file, its git directory lives in the superproject" || bad "B. the submodule fixture did not materialise" "$(ls -A "$SUPER/sub" 2>&1 | head -c 200)"
+phys() { ( cd "$1" && pwd -P ); }
+pair_of() { printf '%s' "$2" | env HOME="$HOMEDIR" python3 -I -S "$HELPER" "$1" 2>/dev/null | awk -F'\t' 'NR == 1 { print $2 "|" $4 }'; }
+check_pair() {  # check_pair <label> <base> <command> <work tree> <git dir>
+  local got; got="$(pair_of "$2" "$3")"
+  if [ "$got" = "$4|$5" ]; then ok "B. pair: $1"; else bad "B. pair: $1" "want $4|$5 | got $got"; fi
+}
+check_pair "a plain repository"                                  "$PLAIN"      'git push'   "$PLAIN" "$PLAIN/.git"
+check_pair "from a subdirectory: the toplevel's pair"            "$PLAIN/sub"  'git push'   "$PLAIN" "$PLAIN/.git"
+check_pair "a linked worktree: its own git directory under .git/worktrees" "$WT_SWEEP" 'git push' "$WT_SWEEP" "$(phys "$(git -C "$WT_SWEEP" rev-parse --absolute-git-dir)")"
+check_pair "a submodule: its git directory lives in the superproject"      "$SUPER/sub" 'git push' "$SUPER/sub" "$(phys "$(git -C "$SUPER/sub" rev-parse --absolute-git-dir)")"
+check_pair "DECOY --work-tree: the repository's own pair, not the decoy's" "$PLAIN" "git --git-dir=$SWEEP/.git --work-tree=$PLAIN push" "$SWEEP" "$SWEEP/.git"
+check_pair "GIT_DIR=<x>/.git, started in another repository"     "$PLAIN"      "GIT_DIR=$CHK/.git git push" "$CHK" "$CHK/.git"
+check_pair "-C <b> started in a: the pair of b"                  "$PLAIN"      "git -C $CHK push" "$CHK" "$CHK/.git"
+# a GIT_* variable the resolver does not reproduce gives the PUSH another view of the repository (refs, objects, namespaces) than the one the gate
+# reads: uncertain. The ones git reads itself at every call the resolver makes, and the ones that cannot change what is pushed, keep the class.
+for v in GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_INDEX_FILE GIT_REPLACE_REF_BASE GIT_EXEC_PATH GIT_GRAFT_FILE; do
+  check_strict "B. GIT_*: $v=<x> in front of the push: not reproduced, so the push may see other refs than the gate reads" "$PLAIN" "$v=$CHK/.git git -C $PLAIN push origin main"
+  check_strict "B. GIT_*: export $v=<x> likewise" "$PLAIN" "export $v=$CHK/.git; git -C $PLAIN push origin main"
+done
+check_plan "GIT_*: GIT_SSH_COMMAND / GIT_TERMINAL_PROMPT / GIT_TRACE cannot change the repository or its refs: the class stands" "$PLAIN" "GIT_SSH_COMMAND='ssh -i k' GIT_TERMINAL_PROMPT=0 GIT_TRACE=1 git push origin main" "unmanaged:$PLAIN"
+check_plan "GIT_*: GIT_CEILING_DIRECTORIES and GIT_CONFIG_NOSYSTEM are read by git itself at every call: modelled" "$PLAIN" "GIT_CEILING_DIRECTORIES=$W GIT_CONFIG_NOSYSTEM=1 git push origin main" "unmanaged:$PLAIN"
+# linear time: one regex over a long command used to backtrack quadratically, and a signal cannot interrupt a regex, so the resolver's own timeout never
+# fired and the hook's (a failed hook lets the push through) was the only bound
+python3 -c 'import sys; sys.stdout.write("foo " + "git " * 20000)' > "$W/longcmd.txt"
+T_LONG0=$SECONDS
+perl -e 'alarm 40; exec @ARGV' env HOME="$HOMEDIR" python3 -I -S "$HELPER" "$PLAIN" < "$W/longcmd.txt" > "$W/long.out" 2>/dev/null
+T_LONG=$((SECONDS - T_LONG0))
+{ [ "$T_LONG" -lt 8 ] && grep -q "^sweep${TAB}" "$W/long.out"; } && ok "B. linear time: a long command that names git 20000 times and never push is read in ${T_LONG}s and is strict" || bad "B. linear time: a long command" "took ${T_LONG}s: $(head -c 200 "$W/long.out")"
+
 # a marker that is not what it should be, in the commit: every shape is strict, none is "no marker"
 RUNDIR="$(mk_sweep rundir)"; git -C "$RUNDIR" rm -q test/run-all.sh; mkdir -p "$RUNDIR/test/run-all.sh"; printf 'x\n' > "$RUNDIR/test/run-all.sh/k"; commit_all "$RUNDIR" "run-all.sh becomes a directory"
 check_plan "a commit whose test/run-all.sh is a directory is strict: a marker that is not a regular file" "$RUNDIR" 'git push' "sweep:$RUNDIR"
@@ -913,7 +988,7 @@ def plan_rows(base, cmd):
 def verdict(repos, rows):
     """"strict" when the plan is the strict class throughout (or gave no answer: the hook then runs the strict gate); "exact" when every real
     push is covered by a row of its own repository at least as strict as that repository's class; None when a push slipped through."""
-    if not rows or all(r[0] == "sweep" or (r[0] == "repo-checks" and r[2:] == ["?"]) for r in rows):
+    if not rows or all(r[0] == "sweep" or (r[0] == "repo-checks" and r[2:3] == ["?"]) for r in rows):
         return "strict"
     for repo in repos:
         need = RANK[classes.get(repo, "unmanaged")] if repo else 99
@@ -975,14 +1050,17 @@ mk_plugin() {  # mk_plugin <name> [--no-resolver] [--real-state] -> path
     case "$opt" in
       --no-resolver) rm -f "$d/bin/lib/hmd_push_target.py" ;;
       --real-state)  cp "$REPO/bin/heimdall-state" "$d/bin/heimdall-state" ;;
+      --spy-runner)  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/runner.calls"\nexec python3 -I -S "%s/bin/lib/hmd_repo_checks.py" "$@"\n' "$MARKS" "$d" > "$d/bin/heimdall-repo-checks" ;;
     esac
   done
   if [ ! -e "$d/bin/heimdall-state" ]; then
     cat > "$d/bin/heimdall-state" <<EOF
 #!/usr/bin/env bash
-printf '%s\t%s\n' "\$PWD" "\$*" >> "$MARKS/state.calls"
-if [ "\${FAKE_HSTATE_RC:-0}" = 0 ]; then echo "All quality gates pass."; else echo "GATE FAILED: fake sweep gate" >&2; fi
-exit "\${FAKE_HSTATE_RC:-0}"
+printf '%s\t%s\t%s\t%s\n' "\$PWD" "\$*" "\${GIT_DIR-}" "\${GIT_WORK_TREE-}" >> "$MARKS/state.calls"
+rc="\${FAKE_HSTATE_RC:-0}"
+if [ -n "\${FAKE_HSTATE_FAIL_IN:-}" ]; then if [ "\$(pwd -P)" = "\$FAKE_HSTATE_FAIL_IN" ]; then rc=2; else rc=0; fi; fi
+if [ "\$rc" = 0 ]; then echo "All quality gates pass."; else echo "GATE FAILED: fake sweep gate" >&2; fi
+exit "\$rc"
 EOF
   fi
   cat > "$d/bin/secret-scan" <<'EOF'
@@ -1282,6 +1360,83 @@ PLUGIN_NOEXTRA="$(mk_plugin noextra)"; printf 'import sys\nsys.stdout.write("rep
 run_hook "$PLUGIN_NOEXTRA" "$B_GREEN" 'git push' FAKE_HSTATE_RC=2
 expect_rc "C48c. a repo-checks row without its list of pushed commits means 'cannot be listed': BLOCKED even though the receipt is green" 2
 denies "C48c. ...cannot be tied to the receipt" 'cannot be tied'
+
+# ── review round 2026-10-14, finding 1: a resolver that cannot answer is never a reason to grade ONE repository. The strict gate runs against EVERY
+#    directory that may be the one pushed -- the session's cwd, the payload's cwd, each -C / cd target the parser had reached -- and blocks unless all pass ──
+cwd_set() { state_cwds | LC_ALL=C sort | tr '\n' ' '; }
+expect_set() {  # expect_set <label> <dir>...: the strict gate ran in exactly these directories, once each
+  local label="$1" want got; shift
+  want="$(printf '%s\n' "$@" | LC_ALL=C sort | tr '\n' ' ')"; got="$(cwd_set)"
+  if [ "$got" = "$want" ]; then ok "$label"; else bad "$label" "the gate ran in: $got | wanted: $want"; fi
+}
+TIMEOUT_ENV=("PATH=$BROKEN:$PLUGIN/bin:$PATH" "FAKE_GIT_REAL=$REAL_GIT" "FAKE_GIT_BREAK=rev-parse:--absolute-git-dir" "FAKE_GIT_MODE=hang" "HMD_PUSH_TARGET_TIMEOUT_S=0.3")
+PAYLOAD_CWD="$PLAIN" run_hook "$PLUGIN" "$SWEEP" "git -C $CHK push" "${TIMEOUT_ENV[@]}"
+expect_rc "C50. the resolver times out and every candidate repository passes the strict gate -> allowed" 0
+expect_set "C50. ...the gate ran in the session cwd, the payload cwd AND the -C target (not in one of them)" "$SWEEP" "$PLAIN" "$CHK"
+PAYLOAD_CWD="$PLAIN" run_hook "$PLUGIN" "$SWEEP" "git -C $CHK push" "${TIMEOUT_ENV[@]}" FAKE_HSTATE_FAIL_IN="$CHK"
+expect_rc "C50b. the resolver times out and only the -C target's gate fails (the session's and the payload's repos pass) -> BLOCKED" 2
+PAYLOAD_CWD="$PLAIN" run_hook "$PLUGIN" "$SWEEP" "cd $CHK && git push" "${TIMEOUT_ENV[@]}" FAKE_HSTATE_FAIL_IN="$CHK"
+expect_rc "C50c. ...the same for a cd target" 2
+PAYLOAD_CWD="$PLAIN" run_hook "$PLUGIN" "$SWEEP" "git -C $CHK push" "${TIMEOUT_ENV[@]}" FAKE_HSTATE_FAIL_IN="$PLAIN"
+expect_rc "C50d. ...and when it is the payload cwd's gate that fails -> BLOCKED" 2
+DOT="$W/dot"; mkdir -p "$DOT"; git init -q --bare "$DOT/cfg.git"
+run_hook "$PLUGIN" "$PLAIN" "git --git-dir=$DOT/cfg.git --work-tree=$DOT push" FAKE_HSTATE_FAIL_IN="$DOT"
+expect_rc "C51. a repository git names whose work tree cannot be confirmed from the other end (a dotfiles layout): every candidate directory is graded, a failing one BLOCKS although the cwd repo passes" 2
+run_hook "$PLUGIN" "$PLAIN" "git --git-dir=$DOT/cfg.git --work-tree=$DOT push"
+expect_rc "C51b. ...and when every candidate passes the strict gate the push goes on" 0
+for P52 in "$PLUGIN_CRASH" "$PLUGIN_NORES"; do
+  PAYLOAD_CWD="$PLAIN" run_hook "$P52" "$SWEEP" 'git push'
+  expect_rc "C52. [$(basename "$P52")] a resolver that gives no answer: the session cwd and the payload cwd both pass -> allowed" 0
+  expect_set "C52. [$(basename "$P52")] ...and BOTH were graded" "$SWEEP" "$PLAIN"
+  PAYLOAD_CWD="$PLAIN" run_hook "$P52" "$SWEEP" 'git push' FAKE_HSTATE_FAIL_IN="$PLAIN"
+  expect_rc "C52b. [$(basename "$P52")] the payload cwd's gate fails (the session cwd's passes) -> BLOCKED: the shell's repo is not skipped" 2
+  PAYLOAD_CWD="$PLAIN" run_hook "$P52" "$SWEEP" 'git push' FAKE_HSTATE_FAIL_IN="$SWEEP"
+  expect_rc "C52c. [$(basename "$P52")] the session cwd's gate fails (the payload cwd's passes) -> BLOCKED" 2
+done
+PLUGIN_ROWS="$(mk_plugin rows)"
+printf 'import sys\nsys.stdout.write("sweep\\t/no/such/dir/anywhere\\t-\\t-\\n")\n' > "$PLUGIN_ROWS/bin/lib/hmd_push_target.py"
+run_hook "$PLUGIN_ROWS" "$PLAIN" 'git push'
+expect_rc "C53. a row for a directory the gate cannot enter is BLOCKED (it used to run the gate wherever the hook happened to be)" 2
+denies "C53. ...and says it cannot be entered" 'cannot be entered'
+printf 'import os, sys\nsys.stdout.write("sweep\\t/no/such/dir/anywhere\\tfallback\\t-\\nsweep\\t" + os.getcwd() + "\\tfallback\\t-\\n")\n' > "$PLUGIN_ROWS/bin/lib/hmd_push_target.py"
+run_hook "$PLUGIN_ROWS" "$PLAIN" 'git push'
+expect_rc "C53b. a CANDIDATE directory that does not exist cannot be pushed from: skipped, the others are still graded" 0
+expect_set "C53b. ...the gate ran in the one that exists" "$PLAIN"
+
+# ── finding 2: the pair the resolver resolved is the pair every stage reads ──
+state_pair() { awk -F'\t' 'NR == 1 { print $3 "|" $4 }' "$MARKS/state.calls"; }    # GIT_DIR|GIT_WORK_TREE of the first gate call
+run_hook "$PLUGIN" "$PLAIN" "git --git-dir=$SWEEP/.git --work-tree=$PLAIN push" FAKE_HSTATE_RC=2
+{ [ "$RC" = 2 ] && [ "$(state_pair)" = "$SWEEP/.git|$SWEEP" ]; } && ok "C54. DECOY work tree: the gate is handed the RESOLVED pair (the sweep repo's git dir and its own work tree), never the decoy's" || bad "C54. the pair handed to the gate" "rc=$RC pair=$(state_pair)"
+run_hook "$PLUGIN" "$WT_SWEEP" 'git push' FAKE_HSTATE_RC=2
+{ [ "$RC" = 2 ] && [ "$(state_pair)" = "$(phys "$(git -C "$WT_SWEEP" rev-parse --absolute-git-dir)")|$WT_SWEEP" ]; } && ok "C55. a linked worktree: the gate is handed its own git directory (under .git/worktrees) and its own work tree" || bad "C55. linked worktree pair" "rc=$RC pair=$(state_pair)"
+run_hook "$PLUGIN" "$SUPER/sub" 'git push' FAKE_HSTATE_RC=2
+{ [ "$RC" = 2 ] && [ "$(state_cwds)" = "$SUPER/sub" ] && [ "$(state_pair)" = "$(phys "$(git -C "$SUPER/sub" rev-parse --absolute-git-dir)")|$SUPER/sub" ]; } && ok "C56. a submodule: the gate runs in the submodule with the git directory that lives in the superproject" || bad "C56. submodule pair" "rc=$RC cwd=$(state_cwds) pair=$(state_pair)"
+run_hook "$PLUGIN" "$SWEEP/test" 'git push' FAKE_HSTATE_RC=2
+{ [ "$RC" = 2 ] && [ "$(state_pair)" = "$SWEEP/.git|$SWEEP" ]; } && ok "C57. from a subdirectory the gate is handed the toplevel's pair" || bad "C57. subdirectory pair" "rc=$RC pair=$(state_pair)"
+PLUGIN_SPY="$(mk_plugin spy --spy-runner)"; : > "$MARKS/runner.calls"
+PAYLOAD_CWD="$SWEEP" run_hook "$PLUGIN_SPY" "$PLAIN" "cd $B_GREEN && git push" FAKE_HSTATE_RC=2
+expect_rc "C58. the payload cwd (a sweep repo whose gate would fail) differs from the cd target (a green repo-checks repo) -> allowed on the target's own record" 0
+[ "$(cat "$MARKS/runner.calls")" = "status --repo $B_GREEN --git-dir $B_GREEN/.git --pushes $(git -C "$B_GREEN" rev-parse HEAD)" ] && ok "C58. ...the receipt lookup was handed the SAME pair (--repo <work tree> --git-dir <git dir>) and nothing about the payload's repo" || bad "C58. the runner's arguments" "$(cat "$MARKS/runner.calls")"
+run_hook "$PLUGIN" "$PLAIN" "GIT_COMMON_DIR=$CHK/.git git -C $PLAIN push origin main" FAKE_HSTATE_RC=2
+strict_blocks "C58b. GIT_COMMON_DIR points the push at another repository's refs: the strict gate, not the unmanaged warning for the repo the gate read" "$PLAIN"
+bash "$RC_BIN" status --repo "$PLAIN" --git-dir "$B_GREEN/.git" >"$W/o" 2>&1; rcx=$?
+{ [ "$rcx" = 2 ] && grep -q 'do not belong to each other' "$W/o"; } && ok "C59. status --repo <repo A> --git-dir <repo B's>: refused, the two must name each other from both ends" || bad "C59. a mismatched pair" "rc=$rcx $(head -c 300 "$W/o")"
+mkdir -p "$PLAIN/.heimdall/receipts"; cp "$(receipt_of "$B_GREEN")" "$PLAIN/.heimdall/receipts/repo-checks.json"
+bash "$RC_BIN" status --repo "$PLAIN" --git-dir "$B_GREEN/.git" >"$W/o" 2>&1; rcx=$?
+{ [ "$rcx" = 2 ] && ! grep -q 'GREEN -' "$W/o"; } && ok "C59b. a decoy work tree cannot host B's genuine receipt for B's git directory" || bad "C59b. decoy work tree hosting a receipt" "rc=$rcx $(head -c 300 "$W/o")"
+rm -rf "$PLAIN/.heimdall"
+bash "$RC_BIN" status --repo "$B_GREEN" --git-dir "$B_GREEN/.git" >"$W/o" 2>&1; rcx=$?
+{ [ "$rcx" = 0 ] && grep -q 'GREEN' "$W/o"; } && ok "C59c. ...while the repository's own pair reads its receipt" || bad "C59c. the right pair" "rc=$rcx $(head -c 300 "$W/o")"
+
+# ── finding 3 (self-audit): one commit throughout a status; a link is never followed, through the hook either ──
+: > "$W/git.log"
+env PATH="$BROKEN:$PATH" FAKE_GIT_REAL="$REAL_GIT" FAKE_GIT_BREAK=none FAKE_GIT_LOG="$W/git.log" bash "$RC_BIN" status --repo "$B_GREEN" >/dev/null 2>&1
+{ [ "$(grep -c 'HEAD' "$W/git.log")" = 1 ] && grep -qE '^ls-tree -z [0-9a-f]{40} ' "$W/git.log"; } && ok "C60. status names HEAD ONCE and reads the tree and the declaration of THAT commit (a HEAD that moves between reads cannot mix two commits)" || bad "C60. HEAD is read more than once" "$(cat "$W/git.log")"
+B_LINKED="$(mk_checks blinked "$GREEN_DECL")"; run_checks "$B_LINKED"
+mv "$B_LINKED/.heimdall/receipts" "$W/blinked.elsewhere"; ln -s "$W/blinked.elsewhere" "$B_LINKED/.heimdall/receipts"
+run_hook "$PLUGIN" "$B_LINKED" 'git push'
+expect_rc "C61. the receipts directory is a symlink to a genuine green receipt elsewhere -> BLOCKED (a link is never followed)" 2
+denies "C61. ...says it is a link" '(?i)link'
 
 # ── no resolver: gated exactly as before ──
 run_hook "$PLUGIN_NORES" "$PLAIN" 'git push' FAKE_HSTATE_RC=2

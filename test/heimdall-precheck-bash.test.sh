@@ -226,7 +226,12 @@ equiv() {
   # loop over the plan and the cd into the repo pushed and back. None of those statements exists in the inline string (it has no
   # cd, IFS or read at all); the statements INSIDE the sweep branch -- the old quality gate, verbatim -- are still compared.
   # ...and, in the never-evaluated branch, the one extra test of whether the row is only the strict fallback (`[ "$PG_EXTRA" = fallback ]`)
-  local mtr='^(\+ (SQ=|GP_|SLINT=|PG_|IFS=|read -r PG_|cd |case |grep -qE .*push|.\[. .. = fallback .\].)|\+\+ (tr -d |jq -r .\.cwd|python3 -I -S .*hmd_push_target\.py|printf .sweep))'
+  # ...and (2026-10-14) the pair the resolver resolved, handed to the old gate: the quality gate's own call is wrapped as `$(case "$PG_GITDIR" in /*) export
+  # GIT_DIR=... GIT_WORK_TREE=... ;; esac; "$HSTATE" check-quality-gates 2>&1)`, so the call itself is still compared verbatim and only the `case` and the
+  # `export` of that pair (two lines inside the substitution) are dropped
+  # (bash traces the export's arguments as assignments of their own, `++ GIT_DIR=...` and `++ GIT_WORK_TREE=...`; and the fallback test's operand is `-` for a row
+  # that is not the fallback, where it used to be empty)
+  local mtr='^(\+ (SQ=|GP_|SLINT=|PG_|IFS=|read -r PG_|cd |case |grep -qE .*push|.\[. .* = fallback .\].)|\+\+ (tr -d |jq -r .\.cwd|python3 -I -S .*hmd_push_target\.py|printf .sweep|case |(export )?GIT_(DIR|WORK_TREE)=))'
   grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | grep -vE "$mtr" | awk '/^\+ .\[. [0-9]+ = 2 .\].$/ && !guard_test++ { next } { print }' | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
   LC_ALL=C sort "$TMPROOT/$tag.trace-inline.err" | grep -vE "$mtr" > "$TMPROOT/$tag.trace-inline.sorted"
   # denies are exempt from the trace comparison: the stderr mirror is a statement the string never had
