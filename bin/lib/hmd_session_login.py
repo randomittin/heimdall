@@ -4,8 +4,8 @@
 WHY. A paired phone is bound to one relay session, and the bearer token that session was minted with (plus the hmd private key its
 session key derives from) lived only in the memory of the client that paired it: a stopped, crashed or killed client could neither be
 resumed nor, later, revoke that session, so stopping the laptop's client meant unpairing the phone. Once a phone is bound the client
-now stores this login here. A new client resumes the same relay session for HMD_SESSION_RESUME_H hours (default 24) after the old one
-was last alive, and `hmd app disconnect` revokes through it when no client is left to ask.
+now stores this login here. A new client resumes the same relay session whenever the old one is gone -- however long ago it was last alive,
+unless the operator bounds that with HMD_SESSION_RESUME_H -- and `hmd app disconnect` revokes through it when no client is left to ask.
 
 WHERE. Never in the repo (a repository controls everything under it), never in argv, an environment variable or a log:
   * the SECRET half -- {"token", "priv"} -- goes to the macOS Keychain when `security` is there (one generic-password item per
@@ -21,11 +21,19 @@ WHERE. Never in the repo (a repository controls everything under it), never in a
     under one exclusive store lock (_locked).
 HMD_SESSION_LOGIN_STORE=file|keychain|auto (default auto: the Keychain on macOS when `security` is on PATH) picks the secret's home.
 
-LIMIT. A login whose client was last alive more than HMD_SESSION_RESUME_H hours ago (default 24; 0 = never resume) is discarded on
-the next look and the phone pairs again. It is not revoked: only an explicit disconnect, a revoke from the phone or a failed login is.
-A login a client that is ALIVE holds is never past the limit (its client is alive now, whatever its last stamp says): no look discards it, so
-HMD_SESSION_RESUME_H=0 stops a STOPPED client's session being resumed and never ends a live phone's session -- a live client that finds its
-login gone ends itself and revokes (bin/heimdall-relay-client, _login_guard).
+NO LIMIT BY DEFAULT. A paired phone must not drop because Claude Code ended, restarted, resumed or sat idle -- or because a weekend went by. So a
+stored login is resumed however long ago its client was last alive: only an explicit disconnect, a revoke from the phone or a failed login
+(the relay refusing it: stream 401/404/410) ends a session; the relay's own 30-day device-token lifetime (session_exp) is the one clock, and
+the relay says when it ran out. HMD_SESSION_RESUME_H is the operator's opt-in bound, for a login whose client is NOT running: a number of hours
+past which that login is discarded on the next look (not revoked) and the phone pairs again; 0 = never resume a stopped client's login.
+Unset, empty or not a number is no limit. A login a client that is ALIVE holds is never past any limit (its client is alive now, whatever its
+last stamp says): no look discards it, so HMD_SESSION_RESUME_H=0 stops a STOPPED client's session being resumed and never ends a live
+phone's session -- a live client that finds its login gone ends itself and revokes (bin/heimdall-relay-client, _login_guard).
+THE REPO'S PAIRING RECORD. Per repo, in the same store, $HEIMDALL_HOME/app/repos/<sha256(realpath)[:16]>.json (0600): the repo's session
+code and the relay session(s) its phones are paired on -- {"v", "repo", "code", "relay", "sessions": [{"session_id", "device_id"}],
+"updated_at"} -- written under the store lock when a phone binds, kept in step with the logins as they go, and removed with the last one.
+While it exists every surface shows ITS code (bin/lib/hmd_session_code.py resolve_session_code), so a regenerated machine seed cannot
+change the code of a repo that has a paired phone; with the last phone gone the code is derived afresh, as ever. `show` prints it.
 CONFIRMED OR KEPT. A login is removed by a revoke here only once the relay confirmed it (the session ended, or is no longer there); an
 unreachable or unwilling relay, a secret that cannot be read and a login file that cannot be read all keep it and fail loudly. A revoke
 marks the login `revoking` FIRST (under the store lock, durably): from then on no resume claims it, so a disconnect racing a resume ends
@@ -35,6 +43,10 @@ nothing to claim. A login a revoke removed cannot be brought back: every writer 
 CLI (the shell tools; nothing secret is ever printed):
     python3 hmd_session_login.py list   --repo DIR                                   the logins of that repo, as JSON, secret-free
     python3 hmd_session_login.py resumable --repo DIR --relay URL                    the logins a client could resume now (one client per phone), as JSON
+    python3 hmd_session_login.py paired --repo DIR --relay URL                       the logins of the phones that are paired (not being revoked), whoever
+        serves them -- a live client, or none: what keeps a window and a supervisor from letting go of a phone -- as JSON
+    python3 hmd_session_login.py show   --repo DIR                                   the repo's pairing record (its code and relay sessions) as JSON; exit 3 none
+    python3 hmd_session_login.py note   --repo DIR --text TEXT                       one line in $HEIMDALL_HOME/logs/app.log: what became of a pairing, and why
     python3 hmd_session_login.py mark   --repo DIR (--device-id ID | --all)          mark those logins `revoking`, ALL in one hold of the store lock: what a
         disconnect does FIRST, before a supervisor, a window, a client or the relay is touched; exit 0 marked, 3 none selected, 1 could not be marked
     python3 hmd_session_login.py revoke --repo DIR (--device-id ID | --all)           revoke those sessions AT THE RELAY with the stored
@@ -63,10 +75,11 @@ import urllib.request
 from importlib.util import module_from_spec, spec_from_file_location
 
 REL = "app/sessions"
+REPOS_REL = "app/repos"  # the repo's pairing record: <sha256(realpath)[:16]>.json -- its code and the relay sessions of its paired phones
 SERVICE = "heimdall-relay-session"
-DEFAULT_RESUME_H = 24.0
 SECRET_LIMIT = 16384
 _SID_RE = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
+_CODE_RE = re.compile(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}\Z")  # bin/lib/hmd_session_code.py's alphabet and length
 STORE_LOCK = "sessions.lock"
 SEQ_BLOCK = 1000  # seqs handed out at a time unless the caller says otherwise
 _MONOTONIC = ("hmd_seq", "last_device_seq", "last_alive")  # fields that only ever grow: a writer holding a stale copy cannot take one back
@@ -96,19 +109,27 @@ def home():
 
 
 def resume_limit_s():
-    """HMD_SESSION_RESUME_H hours in seconds; an unusable value is the default, 0 means no resume at all."""
+    """Seconds a STOPPED client's login may sit before it is no longer resumed: HMD_SESSION_RESUME_H hours. There is NO limit by default -- unset,
+    empty, negative, not a number or absurdly large is infinity, because the safe reading of a value nobody can use is never to drop a paired
+    phone. 0 is the operator's "never resume a stopped client's login" and a positive number their opt-in bound. (A live client's login is never
+    expired by any of them: see load_resumable.)"""
     try:
-        hours = float(os.environ.get("HMD_SESSION_RESUME_H", DEFAULT_RESUME_H))
+        hours = float(os.environ.get("HMD_SESSION_RESUME_H", "").strip())
     except ValueError:
-        return DEFAULT_RESUME_H * 3600
-    return hours * 3600 if hours == hours and 0 <= hours < 24 * 3650 else DEFAULT_RESUME_H * 3600
+        return float("inf")
+    return hours * 3600 if hours == hours and 0 <= hours < 24 * 3650 else float("inf")
+
+
+def _repo_key(root):
+    """The repo's real path folded to a name that is safe anywhere: what its logins and its pairing record are filed under."""
+    return hashlib.sha256(os.path.realpath(root).encode("utf-8")).hexdigest()[:16]
 
 
 def account(root, sid):
     """The name of one stored login: the repo's real path and the session, folded to a name that is safe anywhere."""
     if not isinstance(sid, str) or not _SID_RE.match(sid):
         raise OSError("not a session id this store can name")
-    return "%s-%s" % (hashlib.sha256(os.path.realpath(root).encode("utf-8")).hexdigest()[:16], sid)
+    return "%s-%s" % (_repo_key(root), sid)
 
 
 def _backend():
@@ -179,6 +200,69 @@ def _merge(old, fields):
     return new
 
 
+def repo_record(root):
+    """The repo's pairing record -- {"v", "repo", "code", "relay", "sessions": [{"session_id", "device_id"}], "updated_at"} -- or None when the
+    repo has no paired phone (or the record cannot be trusted: not a 0600 file of ours, another repo's)."""
+    base = home()
+    if base is None:
+        return None
+    rec = PRIVATE.read_json(base, REPOS_REL, _repo_key(root) + ".json", SECRET_LIMIT)
+    return rec if rec is not None and rec.get("repo") == os.path.realpath(root) else None
+
+
+def _repo_code(root):
+    """The code this repo's surfaces show for it now (bin/lib/hmd_session_code.py), or None when none can be had. It only READS the machine's
+    seed: a phone binding makes no seed of its own (a repo paired by QR alone never had a code), so a record may lack `code` until one exists."""
+    try:
+        return _sibling("hmd_session_code").resolve_session_code(root, create_seed=False)[0]
+    except (ValueError, OSError, ImportError, AttributeError):
+        return None
+
+
+def _live_sessions(root, sessions):
+    """`sessions` (a record's list) without the entries whose login is no longer stored: the record names only what exists."""
+    held = set(PRIVATE.names(home(), REL))
+    return [s for s in sessions if isinstance(s, dict) and _SID_RE.match(str(s.get("session_id")))
+            and account(root, s["session_id"]) + ".json" in held]
+
+
+def _record_write(root, rec):
+    """Under the store lock: the repo's record becomes `rec`; a record with no session left is removed -- the repo has no paired phone, so
+    its code goes back to being derived. A failure here is said and goes no further: the record is the second thing a login is kept in,
+    never a reason to lose the first."""
+    base, name = home(), _repo_key(root) + ".json"
+    try:
+        if rec["sessions"]:
+            PRIVATE.write(base, REPOS_REL, name, json.dumps(rec, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        else:
+            PRIVATE.remove(base, REPOS_REL, name)
+    except OSError as e:
+        sys.stderr.write("hmd_session_login: the repo's pairing record could not be updated (%s)\n" % e)
+
+
+def _record_add(root, relay, sid, device_id):
+    """Under the store lock: list session `sid` in the repo's pairing record. The first phone pins the repo's code in it; later ones keep that
+    code, so every phone of a repo is paired under the code the first was."""
+    old = repo_record(root) or {}
+    code = old.get("code") if isinstance(old.get("code"), str) and _CODE_RE.match(old["code"]) else _repo_code(root)
+    sessions = [s for s in _live_sessions(root, old.get("sessions") or []) if s.get("session_id") != sid]
+    sessions.append({"session_id": sid, "device_id": device_id})
+    rec = {"v": 1, "repo": os.path.realpath(root), "relay": relay, "sessions": sessions, "updated_at": int(time.time())}
+    if code:
+        rec["code"] = code
+    _record_write(root, rec)
+
+
+def _record_drop(root, sid):
+    """Under the store lock, once login `sid` is gone: take it out of the repo's pairing record (the last one takes the record with it)."""
+    old = repo_record(root)
+    if old is None:
+        return
+    rec = dict(old, sessions=[s for s in _live_sessions(root, old.get("sessions") or []) if s.get("session_id") != sid],
+               updated_at=int(time.time()))
+    _record_write(root, rec)
+
+
 def save(root, relay, sid, secret, **fields):
     """Keep the login of session `sid` (secret = {"token", "priv"}; fields = the metadata). The secret first, the metadata last, so a
     record never names a secret that was not kept. Raises OSError when nothing could be written."""
@@ -201,6 +285,7 @@ def save(root, relay, sid, secret, **fields):
     with _locked():
         old = _read_meta(acct)
         _write_meta(acct, _merge(old, rec) if old else rec)
+        _record_add(root, relay, sid, fields.get("device_id"))
 
 
 def update(root, sid, **fields):
@@ -249,6 +334,7 @@ def _discard_unlocked(root, sid):
     base = home()
     if base is not None:
         PRIVATE.remove(base, REL, acct + ".json")
+    _record_drop(root, sid)
 
 
 def records(root):
@@ -297,8 +383,8 @@ def _held(root, pid):
 
 
 def load_resumable(root, relay, reserve=SEQ_BLOCK):
-    """CLAIM the newest login of this repo, on this relay, that may be resumed -- its client last alive within HMD_SESSION_RESUME_H and no
-    other client holding it -- under the store lock: its secret ({"token","priv"}) and the seq block [seq_lo, seq_hi) the new client owns
+    """CLAIM the newest login of this repo, on this relay, that may be resumed -- its client last alive within HMD_SESSION_RESUME_H (no limit
+    unless the operator set one) and no other client holding it -- under the store lock: its secret ({"token","priv"}) and the seq block [seq_lo, seq_hi) the new client owns
     come back with it, and the block is durable before this returns. It starts one whole block above the stored high-water: a block
     whose write a power cut lost may still have been used, so the next client skips one. None when there is none. A login past the limit,
     or whose secret is gone, is discarded here: the phone pairs again."""
@@ -330,9 +416,16 @@ def load_resumable(root, relay, reserve=SEQ_BLOCK):
 
 
 # -- revoking at the relay with a stored login --------------------------------------------------------------------------------------
+def paired(root, relay):
+    """The logins of the phones that are paired on this relay -- public records, newest first: stored and not being revoked, whoever serves them
+    (a live client, or none). Unlike resumable() it asks nothing of the age of a login or of the client holding it, and it discards nothing: it is
+    what a pair window and its supervisor look at to know a phone is theirs to keep, so that a Claude session ending lets none of them go."""
+    return [public(r) for r in records(root) if _same_relay(r.get("relay"), relay) and not r.get("revoking")]
+
+
 def resumable(root, relay):
     """The logins a client could claim right now (public records, newest first): this relay, not `revoking`, its client last alive within
-    HMD_SESSION_RESUME_H -- a login past it is discarded here, as load_resumable does -- no live client holding it and its secret readable.
+    HMD_SESSION_RESUME_H (when the operator set one) -- a login past it is discarded here, as load_resumable does -- no live client holding it and its secret readable.
     What `hmd app connect` and the pair window count to start one client per phone (a relay session binds exactly one)."""
     limit = resume_limit_s()
     found = []
@@ -405,6 +498,7 @@ def _remove_strict(root, rec):
         PRIVATE.remove(base, REL, acct + ".json")
         if acct + ".json" in PRIVATE.names(base, REL):
             return "the login file could not be removed"
+    _record_drop(root, rec["session_id"])
     return None
 
 
@@ -445,6 +539,21 @@ def _record_forgotten(root, rec, reason):
         except OSError as e:
             sys.stderr.write("session %s: the forget could not be logged to %s (%s)\n" % (rec["session_id"], shown, e))
     return wrote
+
+
+def note(text):
+    """One line in $HEIMDALL_HOME/logs/app.log -- what became of a pairing and why (a client ended by a signal, a window kept for a phone, a supervisor
+    that stopped), so the next time a phone drops there is a record of what dropped it. Never a secret: the caller passes ids and reasons.
+    True when the line was written."""
+    base = home()
+    if base is None:
+        return False
+    line = "%s hmd app: %s\n" % (_iso(time.time()), _clean(text, 400))
+    try:
+        PRIVATE.append(base, APP_LOG_REL, APP_LOG, line.encode("utf-8"), rotate_at=EVENT_LOG_MAX_BYTES)
+    except OSError:
+        return False
+    return True
 
 
 def forget_login(root, sid, reason):
@@ -618,9 +727,10 @@ def _revoke_logins(root, device_id=None, forget_local=False):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hmd_session_login.py", description=__doc__.split("\n")[0])
-    ap.add_argument("action", choices=("list", "revoke", "resumable", "mark"))
-    ap.add_argument("--relay", default=None, help="resumable: the relay whose logins are counted")
+    ap.add_argument("action", choices=("list", "revoke", "resumable", "paired", "show", "note", "mark"))
+    ap.add_argument("--relay", default=None, help="resumable, paired: the relay whose logins are counted")
     ap.add_argument("--repo", required=True)
+    ap.add_argument("--text", default=None, help="note: the line for $HEIMDALL_HOME/logs/app.log")
     ap.add_argument("--device-id", default=None)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--forget-local", action="store_true",
@@ -635,6 +745,19 @@ def main(argv=None):
             ap.error("resumable takes --relay URL")
         print(json.dumps([{"session_id": r["session_id"], "device_id": r.get("device_id")} for r in resumable(root, args.relay)], sort_keys=True))
         return 0
+    if args.action == "paired":
+        if not args.relay:
+            ap.error("paired takes --relay URL")
+        print(json.dumps([{"session_id": r["session_id"], "device_id": r.get("device_id")} for r in paired(root, args.relay)], sort_keys=True))
+        return 0
+    if args.action == "show":
+        rec = repo_record(root)
+        print(json.dumps(rec if rec is not None else {}, sort_keys=True))
+        return 0 if rec is not None else 3
+    if args.action == "note":
+        if not args.text:
+            ap.error("note takes --text TEXT")
+        return 0 if note(args.text) else 1
     if bool(args.device_id) == bool(args.all):
         ap.error("%s takes --device-id ID or --all" % args.action)
     if args.action == "mark":
