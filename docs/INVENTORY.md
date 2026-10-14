@@ -144,7 +144,7 @@ Groups per event: UserPromptSubmit 4 · PreToolUse 7 · PostToolUse 4 · Session
 | SessionStart | `caveman-rules` | no | * | Prints caveman rules into context |
 | SessionStart | `settings-guard` | no | * | Advisory: ANTHROPIC_* overrides persisted in a settings.json env block |
 | SessionStart | `volatile-repo-guard` | no | * | Advisory: clone on volatile disk holding unpushed work |
-| SessionStart | `pair-window-start` | no | * | Records the session in `.heimdall/app/sessions/<id>.json` and opens the repo's pair-by-code window in the background (`hmd app pair-window`) when none is open, under the repo's one code; skipped when gh is signed out or the session is unattended |
+| SessionStart | `pair-window-start` | no | * | Records the session in `.heimdall/app/sessions/<id>.json` and, only for a repo `hmd app connect` was run for (an opt-in record in `$HEIMDALL_HOME`, removed by `hmd app disconnect`), opens the repo's pair-by-code window in the background (`hmd app pair-window`) when none is open and no phone is paired: the code is registered once, the gh token sent once, never renewed on a timer; for any other repo it calls neither gh nor the relay; skipped when gh is signed out or the session is unattended |
 | SubagentStop | `subagent-metric` | no | * | Records a task outcome for the finished subagent |
 | SubagentStop | `subagent-429-detect` | no | * | Scans the subagent transcript for a 429; marks for fallback routing |
 | Stop | `stop-metric-reminder` | no | * | Metric reminder at main-agent Stop |
