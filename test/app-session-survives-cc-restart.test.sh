@@ -4,6 +4,10 @@
 # the phone stays paired with the SAME code and the SAME relay session and keeps receiving, strictly increasing seq -- also across five idle hours,
 # a restart of the whole laptop with a three-day-old login and gh signed out. Only `hmd app disconnect`, a revoke from the phone or a login the
 # relay refuses ends a session, and no idle shutdown is on by default.
+# It is also where that rule meets the gh-token rule (the token goes out only after `hmd app connect` for the repo, once, and only when pairing needs
+# it): a repo paired under 2.4.7 -- a stored login, no opt-in record -- is resumed by SessionStart with zero gh calls and zero token sends, the repo's
+# code survives a restart and is the one a later connect offers, an opted-in repo with no phone paired sends the token once, and a repo never
+# connected with no phone paired costs a session start nothing.
 #
 # Hermetic: an in-process loopback relay, a fake phone, a fake `gh`, throwaway HOME / HEIMDALL_HOME / repo, HMD_SESSION_LOGIN_STORE=file (never the
 # real Keychain); only processes the test started are ever signalled.

@@ -12,7 +12,7 @@ the real relay, GitHub or Keychain.
       removes the record
   N3  with the record, the hook's window registers the code once and sends the token once; over the same 4.5 lifetimes no registration,
       no gh read and no token follow, and a second session start finds the window open and sends nothing
-  N4  a phone already paired needs no code: the window opens, reads no token (the hook's own look at gh is the only gh call), registers nothing
+  N4  a phone already paired needs no code: the window opens, gh is not asked anything (no probe in the hook, no read in the window), nothing is registered
   N5  `hmd app connect --no-code` sends no token and takes the record back
   N6  the record is in HEIMDALL_HOME, 0600, keyed by the repo's real path, never inside the repo
   N7  a connect whose client crashed after its phone paired replaces it with a plain --resume client: the phone's session resumes, and the
@@ -224,7 +224,9 @@ def case_paired_phone_needs_no_code():
         T.check(started.returncode == 0 and paired, "N4. a window that opens with a phone already paired says so and offers no code", "state %r" % (s.window_state(),))
         T.check(not s.relay.registrations and s.relay.requests == [],
                 "N4. ...it registered nothing and made no relay request", "registrations %d requests %r" % (len(s.relay.registrations), s.relay.requests))
-        T.check(s.gh_token_reads() == 1, "N4. ...and read no token: the hook's own look at gh is the only gh call", repr(s.gh_calls()))
+        T.check(s.gh_calls() == [],
+                "N4. ...and asked gh nothing at all: a paired phone needs no code, so not even the hook looks at gh (a phone the repo has no stored login for "
+                "is still a paired phone)", repr(s.gh_calls()))
 
 
 # -- N5 ------------------------------------------------------------------------------------------------------------

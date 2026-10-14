@@ -56,9 +56,9 @@ gate="$(grep -n '_pair_optin check "\$repo"' "$APP" | head -1 | cut -d: -f1)"
 probe="$(grep -n '_gh_token_into probe' "$APP" | head -1 | cut -d: -f1)"
 launch="$(grep -n 'nohup "\$SELF" pair-window-loop' "$APP" | head -1 | cut -d: -f1)"
 if [ -n "$gate" ] && [ -n "$probe" ] && [ -n "$launch" ] && [ "$gate" -lt "$probe" ] && [ "$probe" -lt "$launch" ]; then
-  ok "_pw_start checks the opt-in before it asks gh anything and before it starts the supervisor"
+  ok "_pw_start reads the opt-in before it asks gh anything and before it starts the supervisor"
 else
-  bad "the opt-in check is not ahead of the gh probe and the supervisor start in _pw_start (gate '$gate', probe '$probe', start '$launch')"
+  bad "the opt-in read is not ahead of the gh probe and the supervisor start in _pw_start (gate '$gate', probe '$probe', start '$launch')"
 fi
 if [ "$(grep -c '_pair_optin set "\$REPO"' "$APP")" -ge 1 ] && [ "$(grep -c '_pair_optin clear "\$REPO"' "$APP")" -ge 2 ]; then
   ok "connect makes the record, and both disconnect and connect --no-code remove it"
