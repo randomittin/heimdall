@@ -63,6 +63,7 @@ CLIENT = H.load_module("hmd_relay_client", H.CLIENT_PATH)
 REPO = H.REPO
 SESSION_CODE_PY = os.path.join(REPO, "bin", "lib", "hmd_session_code.py")
 APP_CODE_PY = os.path.join(REPO, "bin", "lib", "hmd_app_code.py")
+OPTIN_PY = os.path.join(REPO, "bin", "lib", "hmd_pair_optin.py")
 STATUSLINE = os.path.join(REPO, "bin", "heimdall-statusline")
 UI_BIN = os.path.join(REPO, "bin", "heimdall-ui")
 DELIVER = os.path.join(REPO, "bin", "heimdall-inbox-deliver")
@@ -211,9 +212,16 @@ class Scn:
         self.relay = FakeCodeRelay(ttl_s=ttl, gh_login=gh_login, expect_token=H.TOKEN).start()
         self.phone = H.Phone(E2E)
         self.procs = []
+        self.opt_in()
 
     def __enter__(self):
         return self
+
+    def opt_in(self):
+        """This repo is one `hmd app connect` was run for: the record that lets the SessionStart window register a code here (made through the
+        helper connect uses, in this sandbox's HEIMDALL_HOME). Idempotent; made again for a repo that moved (the upgrade case reassigns it).
+        test/pair-window-token-optin.test.sh is where a repo with NO record, and the one-registration default, are proved."""
+        run([sys.executable, OPTIN_PY, "set", "--repo", self.repo], self.env(), timeout=60)
 
     def __exit__(self, *_exc):
         for proc in self.procs:
@@ -234,8 +242,12 @@ class Scn:
         # HMD_SESSION_LOGIN_STORE=file: the login that the client of a bound phone stores (what a stopped client resumes with, and what
         # `hmd app disconnect` revokes through) goes to a 0600 file under the HEIMDALL_HOME of this sandbox -- never into the macOS Keychain
         # of the machine running the test, which a test sandbox has no business writing to
+        # HMD_PAIR_WINDOW_RENEW=1: the cases of this file were written for the window that renews its code about every 5 minutes -- the explicit
+        # opt-in to that schedule, since the default registers the code once (test/pair-window-token-optin.test.sh). A case may override it.
+        merged = {"HMD_PAIR_WINDOW_RENEW": "1"}
+        merged.update(extra)
         return self.sb.env(PATH=self.sb.bin + os.pathsep + os.environ.get("PATH", ""), HMD_RELAY_URL=self.relay.url,
-                           HMD_SESSION_LOGIN_STORE="file", **extra)
+                           HMD_SESSION_LOGIN_STORE="file", **merged)
 
     def app(self, *args, tty=False, env=None):
         argv = [H.APP_PATH, "connect", "--repo", self.repo, "--port", "0"] + list(args)
@@ -269,6 +281,8 @@ class Scn:
         return self.relay.registrations[0]["code"] if self.relay.registrations else None
 
     def hook(self, ident, sid, payload=None, **extra):
+        if ident == "pair-window-start":
+            self.opt_in()
         env = self.env(CLAUDE_PLUGIN_ROOT=REPO, CLAUDE_PROJECT_DIR=self.repo, **extra)
         stdin = json.dumps(dict({"session_id": sid, "source": "startup"}, **(payload or {})))
         return run(["sh", "-c", hook_commands()[ident]], env, stdin=stdin, timeout=60, cwd=self.repo)
@@ -869,6 +883,7 @@ def start_window(s, sid=SID1, transcript=None, **knobs):
     argv = [H.APP_PATH, "pair-window", "--session", sid, "--pid", str(os.getpid()), "--repo", s.repo, "--relay", s.relay.url]
     if transcript:
         argv += ["--transcript", transcript]
+    s.opt_in()
     return run(argv, s.env(**knobs))
 
 

@@ -264,7 +264,7 @@ S4='Auto-update checks GitHub Releases for new signed versions. HEIMDALL_NO_AUTO
 S5='# gates local · presence opt-out · telemetry documented & killable · the watchman does not sleep'
 # shellcheck disable=SC2016 # literal claim text: the backticks around rr are prose, nothing should expand
 S6='`rr` sends on purpose, and only when you run it: your BYO Claude credential (write-only), your GitHub App installation id, and the literal task text you typed — because that text is the job. It never uploads your working tree; the worker clones your repo from GitHub.'
-S7='The phone companion is opt-in (hmd app connect; hmd app disconnect stops it): by default your session state, and any diff you open on the phone, travel end-to-end sealed through a relay that sees only ciphertext; push notifications send short scrubbed text to Expo (HMD_PUSH=0 turns them off); pairing by code sends your gh auth token to the relay while the code is offered (--no-code pairs by QR instead).'
+S7='The phone companion is opt-in (nothing is sent until you run hmd app connect for a repo; hmd app disconnect stops it and ends the opt-in): by default your session state, and any diff you open on the phone, travel end-to-end sealed through a relay that sees only ciphertext; push notifications send short scrubbed text to Expo (HMD_PUSH=0 turns them off); pairing by code sends your gh auth token to the relay once for each code registered for a phone to claim (hmd app connect, hmd app add-device, or the pair window a session of a repo you connected opens while no phone is paired), not on a timer (--no-code pairs by QR instead and sends no token).'
 ALLOWLIST=("$S1" "$S2" "$S3" "$S4" "$S5" "$S6" "$S7")
 
 echo "truth-pass-claims harness  repo=$REPO"

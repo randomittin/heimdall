@@ -69,7 +69,15 @@
 #                              and cannot be combined with --bg (exit 64);
 #                              --no-confirm is accepted and means the default. The
 #                              code is the REPO's: the one every surface of this
-#                              repo shows, whichever Claude session asks. It is kept
+#                              repo shows, whichever Claude session asks.
+#                              THE TOKEN GOES OUT ONCE: the code is registered with the relay once per request -- this connect, and
+#                              `hmd app add-device` below -- and that registration is the only time the gh token is sent. The relay
+#                              keeps it 360 s, so the code is claimable for about 6 minutes and then no longer; nothing renews it. A
+#                              connect whose code and QR lapse with no phone paired ends, and `hmd app connect` run again offers them
+#                              again; a phone that paired is kept connected (a replacement client resumes it, with no code and no
+#                              token). Running connect is also this repo's opt-in to the SessionStart pair window (below); --no-code
+#                              takes it back. With HMD_PAIR_WINDOW_RENEW=1 (exactly 1, the explicit opt-in to the old behavior,
+#                              described next) the code is kept
 #                              registered while this runs -- the relay holds a
 #                              registration 360 s and connect renews it on the pair
 #                              window's schedule (HMD_PAIR_WINDOW_RENEW_MIN_S 300,
@@ -143,6 +151,14 @@
 #                              Delegates to bin/heimdall-inbox-wake (`optin` checks, `watch` types).
 #   hmd app pair-window --session SID [--pid N] [--repo DIR] [--relay URL] [--transcript FILE]
 #   hmd app pair-window --stop --session SID [--repo DIR]
+#                              OPT-IN: for a repo that `hmd app connect` has not been run for this does nothing -- no gh call, no token, no
+#                              relay call, no supervisor (the opt-in is a record in $HEIMDALL_HOME that connect writes and
+#                              `hmd app disconnect` removes; a session ending never does, and a repo cannot write it). For a
+#                              connected repo the window registers the code ONCE when it opens, and only while no phone is paired: the
+#                              token goes out with that registration and no other. Nothing renews it (HMD_PAIR_WINDOW_RENEW=1 is the
+#                              explicit opt-in to the schedule described below), and a lapsed code is offered again by `hmd app
+#                              connect` or `hmd app add-device`. The window then stays only to bring back a paired phone whose client
+#                              died. The rest of this paragraph, and the next, describe the HMD_PAIR_WINDOW_RENEW=1 behavior.
 #                              The REPO's pair-by-code window, with no terminal: the
 #                              SessionStart hook (every start, resume, /clear and
 #                              compact) runs the first form, the SessionEnd hook the
@@ -184,7 +200,7 @@
 #                              turns it off; an unattended session (claude -p, an hmd
 #                              sub-session) gets none. `hmd hooks disable
 #                              pair-window-start` opts out of the hook.
-#                              Every registration of the code sends the laptop's gh token
+#                              With HMD_PAIR_WINDOW_RENEW=1 every registration of the code sends the laptop's gh token
 #                              to the relay (on a pipe, over TLS). The relay keeps a
 #                              registration 360 s, so the window registers no more often
 #                              than every HMD_PAIR_WINDOW_RENEW_MIN_S seconds (default
@@ -263,7 +279,8 @@
 #                              code at the bind; this opens a single extra window under the same code -- registered
 #                              at the relay first, then printed here with its expiry, so the code is never shown
 #                              before a phone can use it -- for HMD_ADD_DEVICE_WINDOW_S seconds (default 600, at most
-#                              3600), accepts exactly ONE phone, and closes: on the bind, at expiry, or on Ctrl-C.
+#                              3600; unless HMD_PAIR_WINDOW_RENEW=1 never past HMD_PAIR_WINDOW_RENEW_MIN_S, 300 s: ONE registration, the
+#                              token sent once), accepts exactly ONE phone, and closes: on the bind, at expiry, or on Ctrl-C.
 #                              Each run admits one phone; at most 4 are paired at once (HMD_PAIR_MAX_DEVICES=1..4
 #                              can only lower that; 1 refuses add-device). It needs a phone already paired (nothing
 #                              to add to otherwise: the first one pairs by the code connect or the pair window
@@ -1086,6 +1103,21 @@ _gh_token_into() {
   printf -v "$__var" '%s' "$__tok"
 }
 
+# _pair_optin set|clear|check REPO -- the repo's opt-in to pairing by code (bin/lib/hmd_pair_optin.py): a record in $HEIMDALL_HOME that an explicit
+# `hmd app connect` makes and `hmd app disconnect` removes -- a session's start or end never does either. A repository cannot make it (it is not
+# in the tree a repo controls), and the SessionStart pair window reads no token, asks gh nothing and calls no relay for a repo without it.
+# `check` is 0 when it is set.
+_pair_optin() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" "$LIB_DIR/hmd_pair_optin.py" "$1" --repo "$2" >/dev/null 2>&1
+}
+
+# _code_renewal_on -- 0 when the operator asked, with HMD_PAIR_WINDOW_RENEW=1 (exactly 1), for the code to be kept claimable by registering it again
+# about every 5 minutes: the gh token goes out with every one of those. The default is ONE registration per request (hmd app connect, hmd app
+# add-device, a pair window that opens with no phone paired): the relay keeps it 360 s, the code is claimable that long and no timer, restart or
+# later session registers it again, so the token goes out once. A switch that widens what leaves the laptop: anything but exactly 1 is off.
+_code_renewal_on() { [ "${HMD_PAIR_WINDOW_RENEW:-}" = 1 ]; }
+
 # _session_code_for_repo REPO -- the 5-character code `hmd ui --repo REPO` shows (bin/lib/hmd_app_code.py asks
 # the very function hmd ui asks, so the statusline, /api/state and the SESSION CODE printed here agree), or 1.
 _session_code_for_repo() {
@@ -1144,7 +1176,8 @@ _pw_live() {
 _pair_window_holds() {
   local doc
   doc="$(_pw_live "$1")" || return 1
-  [ "$(_doc_field "$doc" .code)" = "$2" ]
+  [ "$(_doc_field "$doc" .code)" = "$2" ] || return 1
+  case "$(_doc_field "$doc" .state)" in lapsed|paired) return 1 ;; esac  # a window whose one registration lapsed (or that never made one) holds nothing
 }
 
 # _pair_window_stop REPO [WAIT_S] -- TERM the live window's supervisor (it stops its client, which revokes its session, and
@@ -1275,7 +1308,12 @@ _relay_event() {
       wlogin="$(_clean_text "$(printf '%s' "$line" | jq -r '.gh_login // empty' 2>/dev/null)")"
       echo "  SESSION CODE: $wcode"
       echo "  In the hmd app tap \"Enter code\" and type $wcode."
-      echo "  Only a phone signed in to GitHub as @$wlogin can use it. It is this repo's code -- the statusline shows the same one -- renewed every few minutes while this runs."
+      echo "  Only a phone signed in to GitHub as @$wlogin can use it. It is this repo's code -- the statusline shows the same one."
+      if _code_renewal_on; then
+        echo "  HMD_PAIR_WINDOW_RENEW=1: renewed every few minutes while this runs, your gh token sent with each renewal."
+      else
+        echo "  It works for about 6 minutes (the relay keeps a registration that long). Your gh token was sent once, for this registration; hmd app connect again offers the code again."
+      fi
       if [ "$CONFIRM" != true ]; then
         echo "  No number to compare: a claim must name @$wlogin, and past that the relay is trusted (--confirm asks you)."
       fi
@@ -1998,10 +2036,35 @@ _relay_respawn() {
   _relay_still_mine
 }
 
+# _relay_respawn_resume -- the next client when ONE registration is the rule (the default): a plain --resume client with no code and no token. It
+# serves the phone whose client ended from the login stored for it, and offers the code to nobody. 1 when it could not be started or connect.json
+# is no longer this run's.
+_relay_respawn_resume() {
+  local resume_n
+  resume_n="$(_resumable_count "$REPO" "$RELAY_URL")"  # before the client below takes one: the other phones' logins get a client each
+  : >"$CLIENT_OUT"
+  : >"$CLIENT_ERR"
+  HMD_RELAY_REPAIRED=1 "$RELAY_CLIENT_BIN" "${plain_client_args[@]}" >"$CLIENT_OUT" 2>"$CLIENT_ERR" &
+  CLIENT_PID=$!
+  _resume_phones "$REPO" "$RELAY_URL" "$actual_port" "$relay_host" $((resume_n > 0 ? resume_n - 1 : 0))
+  generation=$((generation + 1))
+  started_ts="$(date +%s)"
+  seen_lines=0 pair_init_seen=false code_resolved=false code_active=false client_gone=false
+  ended_reason="" auth_failed=false e2e_missing=false window_closed=false self_stopped=false
+  _relay_write_state || return 1
+  _relay_still_mine
+}
+
 # _relay_supervise_step -- the client is gone (client_rc, and what its events said): 0 once the next one runs, 1 when connect is over
 _relay_supervise_step() {
   local ran delay
   [ "$supervise" = true ] && [ "$ever_started" = true ] || return 1
+  # ONE registration is the rule (the default): a code and QR that lapsed with no phone paired end this connect -- the code is not offered again,
+  # and the token not sent again, until `hmd app connect` is run again. A client that served a phone is replaced by one that resumes it.
+  if ! _code_renewal_on && [ "$paired_before" != true ]; then
+    echo "hmd app connect: the code and the QR lapsed with no phone paired -- run hmd app connect again to offer them (your gh token was sent once, for the first registration)" >&2
+    return 1
+  fi
   if [ "$self_stopped" != true ]; then
     case "$ended_reason" in local-disconnect|revoked|ended) return 1 ;; esac
   fi
@@ -2019,10 +2082,12 @@ _relay_supervise_step() {
   delay="$restart_s"
   [ "$fails" -gt 1 ] && delay=$(( restart_s * (1 << (fails - 1)) ))
   [ "$delay" -gt "$restart_max_s" ] && delay="$restart_max_s"
-  echo "hmd app connect: the relay client ended (${ended_reason:-exit $client_rc}) -- starting another in ${delay}s so the code stays claimable" >&2
+  local why="so the code stays claimable" respawn=_relay_respawn
+  if ! _code_renewal_on; then why="to keep the paired phone connected"; respawn=_relay_respawn_resume; fi
+  echo "hmd app connect: the relay client ended (${ended_reason:-exit $client_rc}) -- starting another in ${delay}s $why" >&2
   _pw_nap "$delay"
   _relay_still_mine || { STATE_WRITTEN=false; return 1; }
-  if ! _relay_respawn; then
+  if ! "$respawn"; then
     _relay_stop_client "$CLIENT_PID" || true
     return 1
   fi
@@ -2053,7 +2118,7 @@ _relay_loop() {
 
     # a window that ran out is followed by the next one at once, not when the relay ends the unclaimed session a minute on: the client
     # is asked to stop, which revokes its session and frees the code
-    if [ "$supervise" = true ] && [ "$window_closed" = true ] && [ "$self_stopped" != true ] && ! _connect_capped; then
+    if _code_renewal_on && [ "$supervise" = true ] && [ "$window_closed" = true ] && [ "$self_stopped" != true ] && ! _connect_capped; then
       self_stopped=true
       _relay_stop_client "$CLIENT_PID" || true
       continue
@@ -2119,6 +2184,14 @@ cmd_connect_relay() {
   REPO_REAL="$(_real_dir "$REPO")"
   STATE_REPO="$REPO"
 
+  # Running connect is the operator's consent to pair this repo by code: recorded outside the repo, it is what lets the SessionStart pair window
+  # register the code here (hmd app disconnect takes it back). --no-code is the opposite statement -- no token for this repo -- and removes it.
+  if [ "$NO_CODE" = true ]; then
+    _pair_optin clear "$REPO"
+  elif ! _pair_optin set "$REPO"; then
+    echo "hmd app: could not record that this repo pairs by code -- the SessionStart pair window stays off here" >&2
+  fi
+
   # Pair by code (see the usage block). The token lives in gh_tok only until it has been written to the client's
   # pipe; it is never passed as an argument or exported. The repo's pair window, when open, holds the
   # code (one live window per GitHub id and code on the relay), so a plain connect leaves it there and says so,
@@ -2129,7 +2202,7 @@ cmd_connect_relay() {
       if [ "$CONFIRM" = true ]; then
         _pair_window_stop_code "$REPO" "$code"
       elif _pair_window_holds "$REPO" "$code"; then
-        echo "hmd app: session code $code is held by this repo's pair window, which keeps it registered (renewed about every 5 minutes) -- \`hmd app disconnect\` first to have this connect offer it. This connect pairs by QR."
+        echo "hmd app: session code $code is held by this repo's pair window, which registered it (claimable for about 6 minutes; renewed only with HMD_PAIR_WINDOW_RENEW=1) -- \`hmd app disconnect\` first to have this connect offer it. This connect pairs by QR."
         code=""
       fi
       if [ -n "$code" ]; then
@@ -2181,6 +2254,7 @@ cmd_connect_relay() {
   resume_n="$(_resumable_count "$REPO" "$RELAY_URL")"
   # a client that was stopped did not unpair its phone: this one (and every respawn of it) resumes that session when its login is stored
   client_args+=(--resume)
+  local plain_client_args=("${client_args[@]}")  # what a replacement client runs with when no code is to be offered (_relay_respawn_resume)
   if [ "$code_requested" = true ]; then
     # The token reaches the client on its stdin and nowhere else: a pipe made here whose directory entry is
     # removed as soon as both ends are open, so it is anonymous before a byte is written. This shell keeps the
@@ -2411,6 +2485,8 @@ _pw_start() {
     0|off|false|no) echo "hmd app: pair window off (HMD_PAIR_WINDOW=${HMD_PAIR_WINDOW})"; return 0 ;;
   esac
   _session_attended || return 0
+  # opt-in: no `hmd app connect` was ever run for this repo, so nothing below happens -- no gh call, no token, no relay call, no supervisor
+  _pair_optin check "$repo" || return 0
   [ -n "$PY3" ] && [ -x "$RELAY_CLIENT_BIN" ] || return 0
   code="$("$PY3" "$LIB_DIR/hmd_session_code.py" --repo "$repo" 2>/dev/null)" || return 0
   printf '%s' "$code" | grep -Eq "$SESSION_CODE_RE" || return 0
@@ -2596,6 +2672,9 @@ _connect_window_knobs() {
     printf '%s' "$idle_h" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || idle_h=0
     win="$(awk -v h="$idle_h" 'BEGIN { s = h * 3600; if (h == 0 || s > 86400) s = 86400; if (s < 1) s = 1; printf "%d", s }')"
   fi
+  # ONE registration per request (the default): the client's window ends before its first renewal falls due, so the token is sent once. Only
+  # HMD_PAIR_WINDOW_RENEW=1 keeps the code open for the idle bound above, the token going out with every renewal.
+  _code_renewal_on || win="$min"
   printf '%s %s %s %s' "$win" "$min" "$lead" "$event"
 }
 
@@ -2720,7 +2799,9 @@ _pw_idle() {
 # same floor for a renewal an event asks for, which a HMD_RELAY_CODE_RENEW_EVENT_MIN_S in the environment (meant for --confirm)
 # must not lower for a window nobody attends.
 _pw_launch_client() {
-  local __var="$1" ctl
+  local __var="$1" ctl win_s
+  win_s="$PW_RENEW_MIN_S"  # ONE registration: the client's window ends before its first renewal falls due, so the token goes out once
+  _code_renewal_on && win_s="${HMD_RELAY_CODE_WINDOW_S:-86400}"
   ctl="$(umask 077; mktemp -d)" || return 1
   if ! mkfifo "$ctl/in" 2>/dev/null; then
     rm -rf "$ctl"
@@ -2729,7 +2810,7 @@ _pw_launch_client() {
   exec 3<>"$ctl/in"
   exec 4<"$ctl/in"
   rm -rf "$ctl"
-  HMD_RELAY_EVENT_LOG="" HMD_RELAY_CODE_WINDOW_S="${HMD_RELAY_CODE_WINDOW_S:-86400}" \
+  HMD_RELAY_EVENT_LOG="" HMD_RELAY_CODE_WINDOW_S="$win_s" \
     HMD_RELAY_CODE_RENEW_MIN_S="$PW_RENEW_MIN_S" HMD_RELAY_CODE_RENEW_LEAD_S="$PW_RENEW_LEAD_S" \
     HMD_RELAY_CODE_RENEW_EVENT_MIN_S="$PW_RENEW_MIN_S" \
     "$RELAY_CLIENT_BIN" --relay "$PW_RELAY" --repo "$PW_REPO" --ui-port 0 --public-host "$PW_RELAY_HOST" \
@@ -2756,7 +2837,7 @@ _pw_launch_client() {
 # the phone with the client it already has (brought back by _resume_phones when it dies), offers no code and sends no token
 # (_pw_hold); it ends only on TERM/INT/HUP -- and what ends a pairing is `hmd app disconnect`, the phone's revoke or a refused login.
 cmd_pair_window_loop() {
-  local fails=0 started rc ran delay tok="" restart_s retry_s poll_s idle_h full_noted=false limit
+  local fails=0 started rc ran delay tok="" restart_s retry_s poll_s idle_h full_noted=false limit offered=false
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo) PW_REPO="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift 1; fi ;;
@@ -2805,6 +2886,19 @@ cmd_pair_window_loop() {
     if _pw_idle; then  # the operator's idle bound (opt-in), nobody here for the whole period: no new registration, so no token goes out again
       PW_WHY="idle for $PW_IDLE_S s (HMD_PAIR_WINDOW_IDLE_H) with no phone paired"
       break
+    fi
+    if [ "$offered" = true ]; then
+      # ONE registration per window: it lapsed, or a phone was paired when the window opened. Nothing offers the code again -- no gh call, no
+      # token -- until it is asked for (hmd app connect, hmd app add-device, or a window opened afresh by a session start). What stays is the
+      # look for a paired phone whose client died.
+      if _resume_due; then _resume_phones "$PW_REPO" "$PW_RELAY" 0 "$PW_RELAY_HOST"; fi
+      _pw_nap "$poll_s"
+      continue
+    fi
+    if ! _code_renewal_on && [ "$(_dev_count "$PW_REPO")" -ge 1 ]; then
+      offered=true  # a paired phone needs no code: nothing is registered and no token is read
+      _pw_write_state paired "a phone is paired: no code is offered (hmd app add-device offers it for one more)"
+      continue
     fi
     if [ "$(_dev_count "$PW_REPO")" -ge "$limit" ]; then
       # every place is taken: the code is not offered (nothing is sent to the relay, no token goes out) until a phone is disconnected
@@ -2865,6 +2959,11 @@ cmd_pair_window_loop() {
     # 2 a call this script got wrong, 3 the relay will not take the code (no usable GitHub token, code pairing off
     # there), 11 no E2E crypto: another try changes nothing -- and ends the supervisor unless a phone is paired, which it stays to hold
     case "$rc" in 2|3|11) _pw_give_up "its client exited $rc (no usable GitHub token, code pairing off at the relay, or no E2E crypto) and no phone is paired" && break ;; esac
+    if ! _code_renewal_on; then
+      offered=true  # its registration lapsed unclaimed, was refused, or its phone came and went: not registered again, so the token is not sent again
+      _pw_write_state lapsed "the code was registered once and is not offered again (hmd app connect offers it)"
+      continue
+    fi
     ran=$(( $(date +%s) - started ))
     case "$rc" in
       0|5) fails=0; delay="$restart_s" ;;  # a clean end, or the window's whole lifetime passed unclaimed
@@ -3410,6 +3509,8 @@ cmd_disconnect() {
     return $?
   fi
   local connect_doc repo_real vrc pw_stopped devs=""
+  # the opt-in goes FIRST: a session starting while this runs finds no consent to open a pair window with
+  _pair_optin clear "$REPO" || true
   connect_doc="$(_connect_doc "$REPO")"
   repo_real="$(_real_dir "$REPO")"
   # every phone paired right now, listed before anything below ends a client (the pair windows closed next end them too, and a list names
@@ -3689,6 +3790,9 @@ cmd_add_device() {
   trap '_add_device_cleanup; exit 129' HUP
   trap _add_device_cleanup EXIT
   read -r _ min_s lead_s _ <<<"$(_connect_window_knobs false)"
+  if ! _code_renewal_on; then  # ONE registration: the window is as long as the relay keeps it (never past the floor), and the token goes out once
+    win_s="$(awk -v w="$win_s" -v m="$min_s" 'BEGIN { s = (m < w ? m : w); if (s < 1) s = 1; printf "%d", s }')"
+  fi
   args=(--relay "$RELAY_URL" --repo "$REPO" --ui-port "$port" --public-host "$relay_host" --code "$code" --code-only)
   [ "$CONFIRM" = true ] || args+=(--no-confirm)
   HMD_RELAY_EVENT_LOG="" HMD_RELAY_CODE_WINDOW_S="$win_s" HMD_RELAY_CODE_RENEW_MIN_S="$min_s" HMD_RELAY_CODE_RENEW_LEAD_S="$lead_s" \
