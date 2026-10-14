@@ -41,7 +41,10 @@ DERIVATION
 What a person is shown is ALWAYS the code of the REPO: kind "repo", input canonical_repo(path) -- the real path,
 links resolved. It is a function of the repo and the machine's seed and of nothing else: not of the Claude Code
 session (a repo has a new one at every start, resume and /clear, and several at once), not of who asks, not of
-whether a session record exists. The statusline, `hmd ui`'s /api/state, bin/lib/hmd_app_code.py, `hmd app connect`,
+whether a session record exists. (One thing pins it: while a phone is paired to the repo, the repo's pairing record in
+$HEIMDALL_HOME/app/repos holds the code that phone was paired under, and that is the code every surface shows -- see
+resolve_session_code -- so a seed made anew cannot change it. With no paired phone the code is derived, as described here.)
+The statusline, `hmd ui`'s /api/state, bin/lib/hmd_app_code.py, `hmd app connect`,
 the pair window and the relay client (which renders the same /api/state for the phone) all get it from
 resolve_session_code, so a code typed from any one of them is the code every other one offers, and the code a phone
 holds is still the right one after the session it was read from has ended. session_code_for itself is the primitive
@@ -201,12 +204,36 @@ def session_code_for(session_id=None, repo=None, create_seed=True):
     return "".join(chars), source
 
 
+_PAIRED_REL = "app/repos"
+_PAIRED_LIMIT = 16384
+
+
+def _pinned_code(canon):
+    """The code a repo with a paired phone is pinned to: the `code` of its pairing record, $HEIMDALL_HOME/app/repos/<sha256(realpath)[:16]>.json
+    (bin/lib/hmd_session_login.py writes it when a phone binds and removes it with the last one). None when the repo has no paired phone, or the
+    record is not a 0600 file of ours, is another repo's or holds no valid code. Only READS: a statusline render writes nothing."""
+    try:
+        name = hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16] + ".json"
+        rec = _private().read_json(_heimdall_home(), _PAIRED_REL, name, _PAIRED_LIMIT)
+    except Exception:  # whatever cannot be read is no pin: the code is derived, as it was before there were records
+        return None
+    code = rec.get("code") if rec is not None and rec.get("repo") == canon else None
+    if isinstance(code, str) and len(code) == CODE_LENGTH and all(ch in CODE_ALPHABET for ch in code):
+        return code
+    return None
+
+
 def resolve_session_code(repo, create_seed=True):
     """(code, "repo"): THE derivation every reader of "this repo's code" goes through (see DERIVATION in the module
-    docstring): the code of canonical_repo(repo), whoever asks and whatever Claude Code session -- if any -- they are in.
-    Raises ValueError when there is no repo path, or no seed (with `create_seed=False`, none YET: the statusline passes
-    it, since a render writes nothing)."""
-    return session_code_for(repo=canonical_repo(repo), create_seed=create_seed)
+    docstring): the code of canonical_repo(repo), whoever asks and whatever Claude Code session -- if any -- they are in --
+    or, while a phone is paired to the repo, the code its pairing record holds (the one that phone was paired under: a
+    regenerated machine seed cannot move it). Raises ValueError when there is no repo path, or no seed and no pairing record
+    (with `create_seed=False`, none YET: the statusline passes it, since a render writes nothing)."""
+    canon = canonical_repo(repo)
+    pinned = _pinned_code(canon)
+    if pinned is not None:
+        return pinned, "repo"
+    return session_code_for(repo=canon, create_seed=create_seed)
 
 
 def valid_session_id(session_id):

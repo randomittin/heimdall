@@ -165,10 +165,20 @@
 #                              binds ONE phone, its client keeps serving it, and the code stays closed until that
 #                              client ends (the phone left, or the client crashed). More phones only by `hmd app
 #                              add-device`. A running `hmd app connect --confirm` keeps the window from opening
-#                              beside it: it compares every phone. Stops when no
-#                              recorded session has a live process and no connect client
-#                              runs, on --stop of the last session, or on `hmd app
-#                              disconnect`. A phone that types the code pairs at once,
+#                              beside it: it compares every phone. A window with no
+#                              phone paired stops when no recorded session has a live
+#                              process and no connect client runs, on --stop of the last
+#                              session, or on `hmd app disconnect`. A PAIRED phone is
+#                              never let go of by a session ending, a restart, a resume or
+#                              idle time: --stop (the SessionEnd hook) then leaves the
+#                              window, its supervisor and the phone's client running, the
+#                              supervisor holds the phone with no session at all (it offers
+#                              no code and sends no token) and brings its client back if
+#                              it dies, and the next session finds the same code and the
+#                              same relay session. Only `hmd app disconnect`, a revoke
+#                              from the phone or a login the relay refuses ends a
+#                              pairing; each stop of a window or a client leaves a line in
+#                              $HEIMDALL_HOME/logs/app.log saying what ended it. A phone that types the code pairs at once,
 #                              with the notice and no compare. gh signed out prints one
 #                              line (scan the QR) and opens nothing; HMD_PAIR_WINDOW=0
 #                              turns it off; an unattended session (claude -p, an hmd
@@ -185,9 +195,10 @@
 #                              a registration for less than the floor the code is
 #                              claimable only that long after each one. `hmd app connect`
 #                              renews on this schedule while it runs.
-#                              The window stops for good after HMD_PAIR_WINDOW_IDLE_H
-#                              hours (default 4, 0 = never) with no phone paired by its
-#                              code and no activity in ANY session of the repo -- the
+#                              With HMD_PAIR_WINDOW_IDLE_H above 0 (the operator's opt-in;
+#                              unset or 0 = never, the default) the window stops for good
+#                              after that many hours with no phone paired
+#                              and no activity in ANY session of the repo -- the
 #                              newest modification time among their transcripts
 #                              (--transcript FILE, which the SessionStart hook passes;
 #                              with none, only a pairing counts) -- and says nothing is
@@ -270,7 +281,9 @@
 #                              connect` -- also its supervisor's respawn and its look every HMD_RESUME_RECONCILE_S seconds (default 15) -- and the
 #                              SessionStart pair window start one `heimdall-relay-client --resume-only` for every stored login no live client
 #                              serves, each resuming ITS phone's session (its own seq blocks, the store lock) while that phone's client was last
-#                              alive within HMD_SESSION_RESUME_H hours (default 24; per phone). No phone is asked to pair again.
+#                              alive however long ago -- there is no age limit unless the operator sets HMD_SESSION_RESUME_H (hours; per
+#                              phone; 0 = never resume a stopped client's login). No phone is asked to pair again, and the repo's code and
+#                              relay session(s) are kept in $HEIMDALL_HOME/app/repos (bin/lib/hmd_session_login.py show).
 #   hmd app doctor [--repo DIR] [--https-port 443|8443|10000] [--relay URL]
 #                              One line per check, a fix hint on every failure.
 #                              Exits 0 only if every check passes. With
@@ -2343,16 +2356,43 @@ _pw_confirm_connect_live() {
   _pw_connect_live "$1" && [ "$(_doc_field "$(_connect_doc "$1")" .confirm)" = "true" ]
 }
 
+# _app_note REPO TEXT -- one line in $HEIMDALL_HOME/logs/app.log: what became of a window or a phone, and why (the log the next
+# "what dropped my phone?" is answered from). Nothing is said when it cannot be written.
+_app_note() {
+  [ -n "$PY3" ] || return 0
+  "$PY3" "$LIB_DIR/hmd_session_login.py" note --repo "$1" --text "$2" >/dev/null 2>&1 || true
+}
+
+# _pw_phones REPO RELAY -- how many phones are paired to REPO on RELAY: the stored logins (bin/lib/hmd_session_login.py `paired`) that are
+# not being revoked, whoever serves them -- a live client or none. 0 when that cannot be told. A phone that is paired is the repo's to keep:
+# a Claude session ending, a restart, a night of idle time or its client dying lets none of them go -- only `hmd app disconnect`, a revoke
+# from the phone or a login the relay refuses ends a pairing.
+_pw_phones() {
+  local n=""
+  [ -n "$PY3" ] && n="$("$PY3" "$LIB_DIR/hmd_session_login.py" paired --repo "$1" --relay "$2" 2>/dev/null | jq -r 'length' 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
 # _pw_stop REPO SID -- the session ended (or the operator said so): forget it, and close the repo's window unless it is
-# still needed -- by another live session of the repo, or by a running `hmd app connect` client. The record goes first
-# and the wait is short -- SessionEnd gives a hook little time, and the supervisor finishes revoking on its own. A window
-# that is kept does not run for ever: its supervisor ends it when the last of those is gone.
+# still needed -- by another live session of the repo, or by a running `hmd app connect` client -- or unless a phone is
+# paired, which is never let go of because a session ended: the window, its supervisor and every client stay (the
+# supervisor holds the phones with no session at all and brings a dead client's phone back), and the next session finds
+# them as they were. Only a window with NO phone paired -- a code nobody used -- closes with the last session. The
+# record goes first and the wait is short -- SessionEnd gives a hook little time, and the supervisor finishes on its own.
+# A window that is kept does not run for ever: its supervisor ends it when the last of those is gone.
 _pw_stop() {
-  local repo="$1" sid="$2" live
+  local repo="$1" sid="$2" live phones
   [ -z "$PY3" ] || "$PY3" "$LIB_DIR/hmd_session_code.py" --forget-session --repo "$repo" --session-id "$sid" >/dev/null 2>&1 || true
+  phones="$(_pw_phones "$repo" "${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}")"
+  if [ "$phones" -gt 0 ]; then
+    _app_note "$repo" "SessionEnd of Claude session ${sid:0:8} in $repo: $phones phone(s) stay paired -- the pair window, its supervisor and the relay clients are left running, nothing is revoked"
+    return 0
+  fi
   live="$(_pw_sessions "$repo")" || return 0  # who else is here cannot be told: the supervisor's own look ends the window
   case "$live" in "0 "*) ;; *) return 0 ;; esac
   _pw_connect_live "$repo" && return 0
+  _app_note "$repo" "SessionEnd of Claude session ${sid:0:8} in $repo: the last session of the repo, no phone paired, no connect client -- its pair window is closed"
   _pair_window_stop "$repo" 2 || true
 }
 
@@ -2362,7 +2402,7 @@ _pw_stop() {
 # modification time is the session's activity for the idle stop (an absolute path, or none -- a relative one is ignored
 # here as the record ignores it, never a reason not to open).
 _pw_start() {
-  local repo="$1" sid="$2" owner="$3" relay="$4" transcript="$5" code pid="" i=0 probe=""
+  local repo="$1" sid="$2" owner="$3" relay="$4" transcript="$5" code pid="" i=0 probe="" kept=0
   case "$transcript" in /*) ;; *) transcript="" ;; esac
   if [ -n "$PY3" ]; then
     "$PY3" "$LIB_DIR/hmd_session_code.py" --record-session --repo "$repo" --session-id "$sid" --pid "$owner" ${transcript:+--transcript "$transcript"} >/dev/null 2>&1 || true
@@ -2385,8 +2425,14 @@ _pw_start() {
   # a state directory that cannot be used link-free (a link, another account's) takes no window: nothing is started, and a hook says nothing
   "$PY3" "$LIB_DIR/hmd_private_state.py" ensure --root "$repo" --rel "$APP_REL" >/dev/null 2>&1 || return 0
   if ! _gh_token_into probe || [ -z "$probe" ]; then
-    echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
-    return 0
+    # gh being signed out costs no paired phone its session: the supervisor still starts, resumes every stored login and holds it (it offers
+    # no code while gh gives no token). With no phone paired there is nothing to hold, and nothing is started.
+    kept="$(_pw_phones "$repo" "${relay:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}")"
+    if [ "$kept" -eq 0 ]; then
+      echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
+      return 0
+    fi
+    echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login) -- the $kept paired phone(s) are resumed and kept"
   fi
   printf -v probe '%s' ""  # the probe only asked whether gh can give a token; the supervisor reads its own
   relay="${relay:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
@@ -2421,9 +2467,11 @@ PW_CLEANED=false
 PW_SESSIONS=1       # live sessions of the repo at the last look (1 until a look says otherwise: a look that fails never ends a window)
 PW_ACTIVITY_T=0     # the newest modification time among those sessions' transcripts, epoch second; 0 when there is none
 PW_ACTIVE_AT=0      # epoch second of the last pairing or activity, or of the window's opening
-PW_IDLE_S=0         # seconds of neither that end the window; 0 never
+PW_IDLE_S=0         # seconds of neither that end the window; 0 never (the default: an idle bound is the operator's opt-in, HMD_PAIR_WINDOW_IDLE_H)
 PW_RENEW_MIN_S=300  # the client's floor between two registrations of the code, and the margin ahead of a lapse, in seconds
 PW_RENEW_LEAD_S=10
+PW_WHY=""           # why this supervisor ended, for the app log (set where it decides to end; a signal's trap sets it to the signal)
+PW_HELD=false       # true while the supervisor only HOLDS a paired phone (no Claude session here, no connect client): no code is offered
 
 # _pw_write_state STATE [REASON] -- this supervisor's state file, <repo>/.heimdall/app/pair-window.json: what
 # `hmd app connect|disconnect` and the SessionEnd hook find it by. Written through bin/lib/hmd_private_state.py (no
@@ -2441,11 +2489,12 @@ _pw_cleanup() {
   [ "$PW_CLEANED" = true ] && return 0
   PW_CLEANED=true
   [ -z "$PW_NAP" ] || kill "$PW_NAP" 2>/dev/null
-  _pw_stop_clients  # TERM first: each client revokes its relay session itself
+  _pw_stop_clients  # the client still offering the code goes (it revokes that unclaimed session); a client that serves a phone does not
   exec 3>&-
   if [ -n "$PW_REPO" ] && [ "$(_doc_field "$(_state_read "$PW_REPO" pair-window.json)" .pid)" = "$$" ]; then
     _state_remove "$PW_REPO" pair-window.json
   fi
+  [ -z "$PW_REPO" ] || _app_note "$PW_REPO" "pair window supervisor pid $$ of $PW_REPO ended: ${PW_WHY:-its loop ended} -- $(_pw_phones "$PW_REPO" "$PW_RELAY") phone(s) still paired and their clients left as they were"
 }
 
 # _pw_nap SECONDS -- sleep, but wake at once for a trapped signal (a foreground sleep would hold the trap until it ends).
@@ -2465,10 +2514,42 @@ _pw_refresh_owners() {
   PW_ACTIVITY_T="${s##* }"
 }
 
-# _pw_owner_alive -- 0 while somebody needs the window: a live session of the repo (as of the last _pw_refresh_owners), or a
-# running `hmd app connect` client of it. The window belongs to the repo, so one session ending is not the end of it.
+# _pw_owner_alive -- 0 while somebody is here to use the window: a live session of the repo (as of the last _pw_refresh_owners), or a
+# running `hmd app connect` client of it. The window belongs to the repo, so one session ending is not the end of it. It decides
+# whether the CODE is offered; it does not decide whether a paired phone is kept (that is _pw_keeps_phones).
 _pw_owner_alive() {
   [ "$PW_SESSIONS" -gt 0 ] || _pw_connect_live "$PW_REPO"
+}
+
+# _pw_keeps_phones -- 0 while a phone is paired to this repo on this relay (_pw_phones): the supervisor is then not over, whatever the sessions
+# and the clock say, and holds the phone with no session here at all.
+_pw_keeps_phones() {
+  [ "$(_pw_phones "$PW_REPO" "$PW_RELAY")" -gt 0 ]
+}
+
+# _pw_client_serves_phone -- 0 when the client this window runs (PW_CLIENT_PID) has a phone: once a phone has bound to it, it is that phone's
+# client and is never stopped to end a window. A client still offering the code has none.
+_pw_client_serves_phone() {
+  [ -n "$PW_CLIENT_PID" ] && [ -n "$PY3" ] && "$PY3" "$LIB_DIR/hmd_devices.py" has-pid --repo "$PW_REPO" "$PW_CLIENT_PID" >/dev/null 2>&1
+}
+
+# _pw_give_up WHY -- 0 when the supervisor should END for WHY (nothing is paired: PW_WHY records the reason for the app log); 1 when a phone is
+# paired, and then it stays: the caller holds the phone instead (_pw_hold) and offers no code this turn. The one place that decides it.
+_pw_give_up() {
+  _pw_keeps_phones && return 1
+  PW_WHY="$1"
+  return 0
+}
+
+# _pw_hold POLL_S -- one turn of a supervisor that has a phone to keep and nothing to offer (no Claude session of the repo, no connect client; or
+# gh gives no token): say so once in its state file, look every HMD_RESUME_RECONCILE_S for a phone whose client died and bring it back, wait.
+_pw_hold() {
+  if [ "$PW_HELD" != true ]; then
+    PW_HELD=true
+    _pw_write_state holding "a phone is paired: kept with no code offered"
+  fi
+  if _resume_due; then _resume_phones "$PW_REPO" "$PW_RELAY" 0 "$PW_RELAY_HOST"; fi
+  _pw_nap "$1"
 }
 
 # _pw_now -- the current epoch second. HMD_PAIR_WINDOW_NOW_FILE names a file holding the second to read as now instead:
@@ -2592,19 +2673,24 @@ _dev_limit() {
 }
 
 # _pw_paired -- 0 while a phone is paired to this repo, through this window's client or any other (a `hmd app connect` client's, a
-# window of an earlier run): the repo's device records, each naming the live relay client that serves its phone. A paired phone is
-# never idle -- stopping the window would cut it off.
+# window of an earlier run): the repo's device records, each naming the live relay client that serves its phone -- or a stored login of a
+# phone whose client is not running right now (it is about to be resumed). A paired phone is never idle -- stopping the window would cut it off.
 _pw_paired() {
-  [ "$(_dev_count "$PW_REPO")" -gt 0 ]
+  [ "$(_dev_count "$PW_REPO")" -gt 0 ] || _pw_keeps_phones
 }
 
-# _pw_stop_clients -- stop the client this window runs and every other client that serves a phone of the repo (an added one): all are asked
-# first (ONE TERM each: a second TERM during its shutdown would end the client inside the revoke call it is making), so they revoke their
-# relay sessions side by side, then each is waited for.
+# _pw_stop_clients -- stop the client this window runs, but only while it is still OFFERING the code: nothing is paired to it, and it holds an
+# unclaimed relay session and a registered code, which its TERM revokes. A client that serves a phone -- this window's own once a phone bound
+# to it, and every other client of the repo, an added phone's too -- is NOT stopped: a window, a supervisor or a Claude session ending lets no
+# phone go (its client is brought back when it dies, and `hmd app disconnect` is what ends it: it stops every client itself, then revokes).
 _pw_stop_clients() {
-  local real
-  real="$(_real_dir "$PW_REPO")" || real=""
-  _stop_device_clients "$PW_REPO" "$real" $PW_CLIENT_PID || true
+  local real pid="${PW_CLIENT_PID:-}"
+  [ -n "$pid" ] || return 0
+  real="$(_real_dir "$PW_REPO")" || return 0
+  _pid_is_relay_client "$pid" "$real" || return 0
+  _pw_client_serves_phone && return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  _relay_stop_client "$pid" 0 || true
 }
 
 # _pw_idle -- 0 when this window has had nobody for PW_IDLE_S seconds (HMD_PAIR_WINDOW_IDLE_H hours; 0 never): no phone paired
@@ -2660,11 +2746,15 @@ _pw_launch_client() {
 # ends or the relay ends its session, a retry (HMD_PAIR_WINDOW_RETRY_S, default 60 but never under the renewal floor)
 # when it could not be offered, and no more at all when the relay will not take the code (no usable token, code pairing
 # off) or ten tries in a row failed. The client renews its own registration of the code no more often than the floor
-# PW_RENEW_MIN_S (see _pw_launch_client). It ends -- stopping its client first, which revokes the relay session -- when
-# no session recorded for the repo has a live Claude process and no `hmd app connect` client runs (_pw_owner_alive: a
-# session ending is not the end of the window while another lives), when nobody has paired or touched any session of the
-# repo for PW_IDLE_S seconds (_pw_idle: nothing says a window is live after that, and no token is sent again), or on
-# TERM/INT/HUP, which is how `pair-window --stop` of the last session, `hmd app disconnect` and `--confirm` stop it.
+# PW_RENEW_MIN_S (see _pw_launch_client). A window with NO phone paired ends -- stopping the client that still offers the
+# code, which revokes that unclaimed session -- when no session recorded for the repo has a live Claude process and no
+# `hmd app connect` client runs (_pw_owner_alive: a session ending is not the end of the window while another lives), when the
+# operator bounded it (HMD_PAIR_WINDOW_IDLE_H above 0) and nobody has paired or touched any session of the repo for PW_IDLE_S
+# seconds (_pw_idle: nothing says a window is live after that, and no token is sent again), or on TERM/INT/HUP, which is how
+# `pair-window --stop` of the last session with no phone paired, `hmd app disconnect` and `--confirm` stop it.
+# A PAIRED PHONE is never let go of by any of that: with no session of the repo and no connect client the supervisor stays, serves
+# the phone with the client it already has (brought back by _resume_phones when it dies), offers no code and sends no token
+# (_pw_hold); it ends only on TERM/INT/HUP -- and what ends a pairing is `hmd app disconnect`, the phone's revoke or a refused login.
 cmd_pair_window_loop() {
   local fails=0 started rc ran delay tok="" restart_s retry_s poll_s idle_h full_noted=false limit
   while [ $# -gt 0 ]; do
@@ -2683,7 +2773,7 @@ cmd_pair_window_loop() {
   # the pair window's own knobs win; the relay client's generic ones, where already set, keep meaning what they did
   PW_RENEW_MIN_S="${HMD_PAIR_WINDOW_RENEW_MIN_S:-${HMD_RELAY_CODE_RENEW_MIN_S:-300}}"
   PW_RENEW_LEAD_S="${HMD_PAIR_WINDOW_RENEW_LEAD_S:-${HMD_RELAY_CODE_RENEW_LEAD_S:-10}}"
-  idle_h="${HMD_PAIR_WINDOW_IDLE_H:-4}"
+  idle_h="${HMD_PAIR_WINDOW_IDLE_H:-0}"  # no idle stop unless the operator sets one (a window used to stop after 4 h; an idle bound is opt-in now)
   case "$restart_s" in ''|*[!0-9]*) restart_s=5 ;; esac
   _pw_seconds_ok "$poll_s" || poll_s=5
   _pw_seconds_ok "$PW_RENEW_MIN_S" || PW_RENEW_MIN_S=300
@@ -2692,10 +2782,12 @@ cmd_pair_window_loop() {
   case "$retry_s" in
     ''|*[!0-9]*) retry_s="$(awk -v a=60 -v b="$PW_RENEW_MIN_S" 'BEGIN { print (b > a ? b : a) }')" ;;
   esac
-  printf '%s' "$idle_h" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || idle_h=4
+  printf '%s' "$idle_h" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || idle_h=0
   PW_IDLE_S="$(awk -v h="$idle_h" 'BEGIN { printf "%d", h * 3600 }')"
   PW_ACTIVE_AT="$(_pw_now)"
-  trap '_pw_cleanup; exit 0' TERM INT HUP
+  trap 'PW_WHY="signal TERM"; _pw_cleanup; exit 0' TERM
+  trap 'PW_WHY="signal INT"; _pw_cleanup; exit 0' INT
+  trap 'PW_WHY="signal HUP"; _pw_cleanup; exit 0' HUP
   trap _pw_cleanup EXIT
   # no state file, no way to stop this by name: a supervisor that cannot be found does not run
   limit="$(_dev_limit)"
@@ -2703,8 +2795,17 @@ cmd_pair_window_loop() {
   _resume_phones "$PW_REPO" "$PW_RELAY" 0 "$PW_RELAY_HOST"  # after a restart every paired phone comes back before the window offers its code
   while :; do
     _pw_refresh_owners
-    _pw_owner_alive || break
-    _pw_idle && break  # nobody here for the whole idle period: no new registration, so no token goes out again
+    if ! _pw_owner_alive; then
+      # nobody is here (no Claude session of the repo, no connect client): a window with no phone paired closes; a paired phone is held, no code offered
+      _pw_give_up "no session of the repo has a live Claude process, no connect client runs and no phone is paired" && break
+      _pw_hold "$poll_s"
+      continue
+    fi
+    PW_HELD=false
+    if _pw_idle; then  # the operator's idle bound (opt-in), nobody here for the whole period: no new registration, so no token goes out again
+      PW_WHY="idle for $PW_IDLE_S s (HMD_PAIR_WINDOW_IDLE_H) with no phone paired"
+      break
+    fi
     if [ "$(_dev_count "$PW_REPO")" -ge "$limit" ]; then
       # every place is taken: the code is not offered (nothing is sent to the relay, no token goes out) until a phone is disconnected
       [ "$full_noted" = true ] || _pw_write_state full "device limit reached ($limit)"
@@ -2717,19 +2818,39 @@ cmd_pair_window_loop() {
       _pw_nap "$poll_s"  # a connect --confirm holds the code and compares every phone: nothing is offered beside it
       continue
     fi
-    _gh_token_into tok || break  # signed out since the session began: no window (the QR still pairs)
-    _pw_launch_client tok || break
+    if ! _gh_token_into tok; then  # signed out since the session began: no window (the QR still pairs) -- and a paired phone is held all the same
+      _pw_give_up "gh gave no token (signed out since the session began) and no phone is paired" && break
+      _pw_hold "$poll_s"
+      continue
+    fi
+    if ! _pw_launch_client tok; then
+      _pw_give_up "the window's relay client could not be started and no phone is paired" && break
+      _pw_hold "$poll_s"
+      continue
+    fi
     started="$(date +%s)"
     _pw_write_state running
     while kill -0 "$PW_CLIENT_PID" 2>/dev/null; do
       if _resume_due; then _resume_phones "$PW_REPO" "$PW_RELAY" 0 "$PW_RELAY_HOST"; fi  # a phone whose client died comes back
       _pw_refresh_owners
       if ! _pw_owner_alive; then
-        _pw_stop_clients
-        break 2
+        if ! _pw_client_serves_phone; then
+          # nobody is here and this client has no phone: the code stops being offered (its unclaimed session is revoked)
+          _pw_stop_clients
+          _pw_give_up "no session of the repo has a live Claude process, no connect client runs and no phone is paired" && break 2
+          break
+        fi
+        if [ "$PW_HELD" != true ]; then  # this client serves a phone and nobody else is here: it is never stopped for that, the loop holds it
+          PW_HELD=true
+          _pw_write_state holding "a phone is paired: kept with no session here"
+        fi
+      elif [ "$PW_HELD" = true ]; then
+        PW_HELD=false
+        _pw_write_state running
       fi
       if _pw_idle; then
-        _pw_stop_clients  # TERM: each client revokes its relay session itself
+        PW_WHY="idle for $PW_IDLE_S s (HMD_PAIR_WINDOW_IDLE_H) with no phone paired"
+        _pw_stop_clients  # an unclaimed code window: its TERM revokes that session (a window whose client serves a phone is never idle)
         break 2
       fi
       _pw_nap "$poll_s"
@@ -2738,15 +2859,21 @@ cmd_pair_window_loop() {
     rc=$?
     PW_CLIENT_PID=""
     PW_LAST_RC="$rc"
+    # the client that ended may have been a phone's (killed, crashed): its phone comes back now, not after the retry delay below -- a no-op
+    # when no stored login is left without a client, and after `hmd app disconnect` marked them there is none
+    _resume_phones "$PW_REPO" "$PW_RELAY" 0 "$PW_RELAY_HOST"
     # 2 a call this script got wrong, 3 the relay will not take the code (no usable GitHub token, code pairing off
-    # there), 11 no E2E crypto: another try changes nothing
-    case "$rc" in 2|3|11) break ;; esac
+    # there), 11 no E2E crypto: another try changes nothing -- and ends the supervisor unless a phone is paired, which it stays to hold
+    case "$rc" in 2|3|11) _pw_give_up "its client exited $rc (no usable GitHub token, code pairing off at the relay, or no E2E crypto) and no phone is paired" && break ;; esac
     ran=$(( $(date +%s) - started ))
     case "$rc" in
       0|5) fails=0; delay="$restart_s" ;;  # a clean end, or the window's whole lifetime passed unclaimed
       *)
         if [ "$ran" -ge 30 ]; then fails=0; else fails=$((fails + 1)); fi
-        [ "$fails" -ge 10 ] && break
+        if [ "$fails" -ge 10 ]; then
+          _pw_give_up "ten clients in a row ended within 30 s of their start and no phone is paired" && break
+          fails=0
+        fi
         delay="$retry_s"
         ;;
     esac
@@ -3276,6 +3403,8 @@ cmd_disconnect() {
     esac
   done
   REPO="$(resolve_repo_value "$REPO")"
+  # the one explicit way to end a pairing leaves its mark in the app log, so a phone that went is never a mystery
+  _app_note "$REPO" "hmd app disconnect (pid $$) in $REPO$([ "$DEVICE_GIVEN" = true ] && printf ' for device %s' "$(_clean_text "$DEVICE")"): the explicit end of a pairing -- stored logins are marked revoking, windows and clients stopped, each relay session revoked"
   if [ "$DEVICE_GIVEN" = true ]; then
     _disconnect_device "$REPO" "$DEVICE"
     return $?
