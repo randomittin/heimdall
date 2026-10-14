@@ -1177,7 +1177,9 @@ _pair_window_holds() {
   local doc
   doc="$(_pw_live "$1")" || return 1
   [ "$(_doc_field "$doc" .code)" = "$2" ] || return 1
-  case "$(_doc_field "$doc" .state)" in lapsed|paired) return 1 ;; esac  # a window whose one registration lapsed (or that never made one) holds nothing
+  # a window that offers no code holds none: its one registration lapsed (or it never made one), a phone is paired, or it only holds a phone with no
+  # session here -- a connect run then offers the code itself
+  case "$(_doc_field "$doc" .state)" in lapsed|paired|holding) return 1 ;; esac
 }
 
 # _pair_window_stop REPO [WAIT_S] -- TERM the live window's supervisor (it stops its client, which revokes its session, and
@@ -2474,9 +2476,11 @@ _pw_stop() {
 # be. The record comes first and stands on its own: it is what keeps the window alive while the session lives. The window
 # is the repo's, so a second session finds it open and only joins it. TRANSCRIPT is the session's transcript, whose
 # modification time is the session's activity for the idle stop (an absolute path, or none -- a relative one is ignored
-# here as the record ignores it, never a reason not to open).
+# here as the record ignores it, never a reason not to open). A window opens for one of two reasons: the repo opted in
+# (`hmd app connect`), so it may offer a code, or a phone is paired to it (a stored login), so it must be resumed -- the
+# second needs neither the opt-in nor gh. For a repo with neither nothing starts and nothing is asked of gh or the relay.
 _pw_start() {
-  local repo="$1" sid="$2" owner="$3" relay="$4" transcript="$5" code pid="" i=0 probe="" kept=0
+  local repo="$1" sid="$2" owner="$3" relay="$4" transcript="$5" code pid="" i=0 probe="" kept=0 paired=0 optin=false
   case "$transcript" in /*) ;; *) transcript="" ;; esac
   if [ -n "$PY3" ]; then
     "$PY3" "$LIB_DIR/hmd_session_code.py" --record-session --repo "$repo" --session-id "$sid" --pid "$owner" ${transcript:+--transcript "$transcript"} >/dev/null 2>&1 || true
@@ -2485,9 +2489,16 @@ _pw_start() {
     0|off|false|no) echo "hmd app: pair window off (HMD_PAIR_WINDOW=${HMD_PAIR_WINDOW})"; return 0 ;;
   esac
   _session_attended || return 0
-  # opt-in: no `hmd app connect` was ever run for this repo, so nothing below happens -- no gh call, no token, no relay call, no supervisor
-  _pair_optin check "$repo" || return 0
   [ -n "$PY3" ] && [ -x "$RELAY_CLIENT_BIN" ] || return 0
+  relay="${relay:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
+  # Two different things start from here, and only one of them needs consent. OFFERING a code sends the laptop's gh token to the relay, so it
+  # needs the opt-in `hmd app connect` records (_pair_optin). RESUMING a paired phone sends none: the phone comes back from the login stored for
+  # it, so a repo with a stored login (a phone paired under 2.4.7, which wrote no opt-in, included) resumes at every session start with or
+  # without the opt-in and with or without gh. A repo with neither -- never connected, nothing paired -- gets nothing started: no gh call, no
+  # token, no relay call, no supervisor.
+  _pair_optin check "$repo" && optin=true
+  kept="$(_pw_phones "$repo" "$relay")"
+  [ "$optin" = true ] || [ "$kept" -gt 0 ] || return 0
   code="$("$PY3" "$LIB_DIR/hmd_session_code.py" --repo "$repo" 2>/dev/null)" || return 0
   printf '%s' "$code" | grep -Eq "$SESSION_CODE_RE" || return 0
   if _pw_live "$repo" >/dev/null; then
@@ -2500,10 +2511,14 @@ _pw_start() {
   fi
   # a state directory that cannot be used link-free (a link, another account's) takes no window: nothing is started, and a hook says nothing
   "$PY3" "$LIB_DIR/hmd_private_state.py" ensure --root "$repo" --rel "$APP_REL" >/dev/null 2>&1 || return 0
-  if ! _gh_token_into probe || [ -z "$probe" ]; then
+  # gh is asked whether it can give a token only when the window could offer a code: the repo opted in and either no phone is paired (a stored login,
+  # or a live client with a device record) or the operator asked for the old schedule (HMD_PAIR_WINDOW_RENEW=1), which offers beside a paired phone.
+  # A paired phone needs no code, so a repo with one starts its supervisor with no gh call at all.
+  paired="$kept"
+  [ "$paired" -gt 0 ] || paired="$(_dev_count "$repo")"
+  if [ "$optin" = true ] && { [ "$paired" -eq 0 ] || _code_renewal_on; } && { ! _gh_token_into probe || [ -z "$probe" ]; }; then
     # gh being signed out costs no paired phone its session: the supervisor still starts, resumes every stored login and holds it (it offers
     # no code while gh gives no token). With no phone paired there is nothing to hold, and nothing is started.
-    kept="$(_pw_phones "$repo" "${relay:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}")"
     if [ "$kept" -eq 0 ]; then
       echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login). Scan the QR."
       return 0
@@ -2511,7 +2526,6 @@ _pw_start() {
     echo "hmd app: code pairing off — laptop not signed in to GitHub (gh auth login) -- the $kept paired phone(s) are resumed and kept"
   fi
   printf -v probe '%s' ""  # the probe only asked whether gh can give a token; the supervisor reads its own
-  relay="${relay:-${HMD_RELAY_URL:-$DEFAULT_RELAY_URL}}"
   # the supervisor is this script run again as its own top-level process: its $$ is its real pid (a subshell's is the
   # parent's), and nohup + disown + /dev/null detach it from the hook so it outlives it, as heimdall-presence's keeper does
   nohup "$SELF" pair-window-loop --repo "$repo" --relay "$relay" </dev/null >/dev/null 2>&1 &
@@ -2523,9 +2537,15 @@ _pw_start() {
     sleep 0.1
   done
   if _pid_is_pair_window "$pid" "$repo"; then
-    echo "hmd app: pair window open -- session code $code"
-  else
+    if [ "$optin" = true ]; then
+      echo "hmd app: pair window open -- session code $code"
+    else
+      echo "hmd app: pair window open -- the $kept paired phone(s) are resumed and kept; no code is offered (hmd app connect was never run for this repo)"
+    fi
+  elif [ "$optin" = true ]; then
     echo "hmd app: pair window not confirmed -- if the code does not pair, run: hmd app connect"
+  else
+    echo "hmd app: pair window not confirmed -- if the paired phone does not come back, run: hmd app connect"
   fi
 }
 
@@ -2626,6 +2646,17 @@ _pw_hold() {
   fi
   if _resume_due; then _resume_phones "$PW_REPO" "$PW_RELAY" 0 "$PW_RELAY_HOST"; fi
   _pw_nap "$1"
+}
+
+# _pw_write_offered_state -- this supervisor offers no code (its one registration is spent, a phone is paired, or this repo never asked for a code): say which
+# way it stands in its state file -- `paired` while a phone is paired, `lapsed` otherwise. Neither holds the code at the relay (_pair_window_holds), so
+# `hmd app connect` offers it itself.
+_pw_write_offered_state() {
+  if _pw_paired; then
+    _pw_write_state paired "a phone is paired: no code is offered (hmd app add-device offers it for one more)"
+  else
+    _pw_write_state lapsed "no code is offered: its one registration is spent, or hmd app connect was never run for this repo (hmd app connect offers it)"
+  fi
 }
 
 # _pw_now -- the current epoch second. HMD_PAIR_WINDOW_NOW_FILE names a file holding the second to read as now instead:
@@ -2882,22 +2913,29 @@ cmd_pair_window_loop() {
       _pw_hold "$poll_s"
       continue
     fi
-    PW_HELD=false
+    if [ "$PW_HELD" = true ]; then  # a session of the repo is back: the phone is no longer held with nobody here
+      PW_HELD=false
+      [ "$offered" != true ] || _pw_write_offered_state
+    fi
     if _pw_idle; then  # the operator's idle bound (opt-in), nobody here for the whole period: no new registration, so no token goes out again
       PW_WHY="idle for $PW_IDLE_S s (HMD_PAIR_WINDOW_IDLE_H) with no phone paired"
       break
     fi
+    if [ "$offered" != true ]; then
+      # Whether this window offers a code at all is settled here, before any gh call. Two things say no, and neither is a failure: this repo never
+      # opted in (`hmd app connect` was not run for it: the supervisor then exists only to RESUME a phone paired before the opt-in existed -- resuming
+      # needs neither the opt-in nor a token), or a phone is paired (the default: a code is for a pairing that is waiting for a phone).
+      if ! _pair_optin check "$PW_REPO" || { ! _code_renewal_on && _pw_paired; }; then
+        offered=true
+        _pw_write_offered_state
+      fi
+    fi
     if [ "$offered" = true ]; then
-      # ONE registration per window: it lapsed, or a phone was paired when the window opened. Nothing offers the code again -- no gh call, no
-      # token -- until it is asked for (hmd app connect, hmd app add-device, or a window opened afresh by a session start). What stays is the
-      # look for a paired phone whose client died.
+      # ONE registration per window: it lapsed, a phone was paired when the window opened, or this repo never asked for a code. Nothing offers the
+      # code again -- no gh call, no token -- until it is asked for (hmd app connect, hmd app add-device, or a window opened afresh by a session
+      # start). What stays is the look for a paired phone whose client died.
       if _resume_due; then _resume_phones "$PW_REPO" "$PW_RELAY" 0 "$PW_RELAY_HOST"; fi
       _pw_nap "$poll_s"
-      continue
-    fi
-    if ! _code_renewal_on && [ "$(_dev_count "$PW_REPO")" -ge 1 ]; then
-      offered=true  # a paired phone needs no code: nothing is registered and no token is read
-      _pw_write_state paired "a phone is paired: no code is offered (hmd app add-device offers it for one more)"
       continue
     fi
     if [ "$(_dev_count "$PW_REPO")" -ge "$limit" ]; then
@@ -2961,7 +2999,7 @@ cmd_pair_window_loop() {
     case "$rc" in 2|3|11) _pw_give_up "its client exited $rc (no usable GitHub token, code pairing off at the relay, or no E2E crypto) and no phone is paired" && break ;; esac
     if ! _code_renewal_on; then
       offered=true  # its registration lapsed unclaimed, was refused, or its phone came and went: not registered again, so the token is not sent again
-      _pw_write_state lapsed "the code was registered once and is not offered again (hmd app connect offers it)"
+      _pw_write_offered_state
       continue
     fi
     ran=$(( $(date +%s) - started ))
