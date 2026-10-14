@@ -60,6 +60,9 @@ TMPROOT="$(mktemp -d)"
 export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
+# A bound phone's login (bin/lib/hmd_session_login.py) goes to a 0600 file under this HEIMDALL_HOME, never to the macOS Keychain: under a throwaway
+# HOME `security` has no default keychain, so every bind waited on a Keychain write that cannot succeed and said device_bound seconds late.
+export HMD_SESSION_LOGIN_STORE=file
 mkdir -p "$HOME/.claude"
 
 # ── python3 pin ──────────────────────────────────────────────────────────

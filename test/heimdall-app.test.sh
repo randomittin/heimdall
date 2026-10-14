@@ -1383,6 +1383,9 @@ while [ $# -gt 0 ]; do
     --ui-port) UI_PORT="${2:-}"; shift 2 ;;
     --public-host) PUBLIC_HOST="${2:-}"; shift 2 ;;
     --status-file) STATUS_FILE="${2:-}"; shift 2 ;;
+    # 2.4.8: `hmd app connect` (and its respawns) pass --resume -- attach to the session a former client left bound, and with none stored pair as
+    # usual. This fake has no stored login to resume, so it pairs: accepting the flag is the whole contract.
+    --resume) shift ;;
     *) echo "fake-relay-client: unknown flag: $1" >&2; exit 2 ;;
   esac
 done

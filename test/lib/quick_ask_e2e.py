@@ -60,7 +60,10 @@ MODEL_LOG = os.path.join(TMP, "model-calls.ndjson")
 REPLY = os.path.join(TMP, "reply.txt")
 ENV = dict(os.environ, HOME=HOME, HEIMDALL_HOME=HH, TMPDIR=os.path.join(TMP, "tmp"), HMD_PYTHON=sys.executable, HMD_PUSH="0",
            HMD_UI_COMPANION_PANELS="0", HEIMDALL_FALLBACK_ASSUME_REACHABLE="0", HEIMDALL_FALLBACK_PROBE_TIMEOUT="1",
-           HMD_DASH_INTERVAL_S="0.5", HMD_DASH_IDLE_PAUSE_S="0", HMD_DASH_MODEL_BIN=FAKE_MODEL, E2E_MODEL_LOG=MODEL_LOG, E2E_REPLY=REPLY)
+           HMD_DASH_INTERVAL_S="0.5", HMD_DASH_IDLE_PAUSE_S="0", HMD_DASH_MODEL_BIN=FAKE_MODEL, E2E_MODEL_LOG=MODEL_LOG, E2E_REPLY=REPLY,
+           # a bound phone's login goes to a file under this HEIMDALL_HOME, never to the macOS Keychain (under a throwaway HOME `security` has no
+           # default keychain: every bind waited on a Keychain write that cannot succeed and said device_bound seconds late)
+           HMD_SESSION_LOGIN_STORE="file")
 for var in ("CLAUDE_SESSION_ID", "SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CONFIG_DIR", "HMD_UI_CONTROLS", "CLAUDE_CODE_ENTRYPOINT",
             "HMD_AGENT_TYPE", "HMD_JUDGMENT", "CLAUDE_PROJECT_DIR", "HMD_DASH_STORE_MODULE", "HMD_DASH_PSQL"):
     ENV.pop(var, None)
