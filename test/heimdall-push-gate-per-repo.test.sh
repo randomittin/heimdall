@@ -40,6 +40,11 @@
 #      the parse model (substitutions, eval, sh -c, xargs, pushd, chains of cd, cd - / ~ / "$VAR"), classes from commits
 #   C  the hook: each class, target != cwd, multi-target, downgrade attempts, forged receipts, resolver missing
 #   D  security gates stay on
+#   E  the gate is ARMED for every way a shell can run `git push` (after && ; || | & a newline, in a subshell or a substitution, after cd,
+#      after env assignments, with git -C / -c, behind command / env / a wrapper / a full or quoted path), not only for a command that
+#      starts with `git push`
+#   F  an hmd-initialised repo that is not heimdall's own and declares nothing (the rally layout) is unmanaged: one warning, allowed, never
+#      held to heimdall's sweep receipt; the same repo declaring its own checks passes on its green receipt
 #
 # Proofs worth knowing by name: A7 (one receipt definition, every field mutated alone), A8 (a receipt attests ONE commit), A9 (a corrupt record is
 # never green), B "the class is read from the COMMITS" (an uncommitted marker edit or deletion changes nothing; HEAD, @{u}, origin and the
@@ -1461,6 +1466,144 @@ for target in "$PLAIN" "$B_GREEN" "$SWEEP"; do
 done
 run_hook "$PLUGIN" "$PLAIN" "git -C $B_GREEN push" FAKE_SCAN_REQUIRE_RC=1
 expect_rc "D2. ...also when the target is another repo" 2
+
+# ════════════════════════════════════════════════════════════════════════════
+section "E. every way of typing a push is graded (field report: a push after && went through ungraded)"
+# Section C proves what each class owes; this proves the gate is ARMED wherever the shell would run `git push`. Every form below really runs a push
+# (each was run under real bash with a recording git when this section was written) and none of them starts with `git push`. The cwd is an
+# unmanaged repo, so a graded push ends in ONE of two ways, and an ungraded one in neither (rc 0, no warning, no gate call):
+#   warned  the command is understood exactly: rc 0, exactly one warning naming the repo pushed, heimdall's sweep gate never consulted
+#   strict  the resolver cannot model it exactly (env -u / -i / -C change the environment or the place git runs in): the sweep gate on the cwd,
+#           which fails here, so the push is BLOCKED -- "anything the resolver cannot model is strict"
+E_BAD=""
+N_E=0
+e_warned() {  # e_warned <repo the push goes to> <command>: not one warning naming it + rc 0 + no sweep gate call -> the command is noted in E_BAD
+  N_E=$((N_E + 1))
+  run_hook "$PLUGIN" "$PLAIN" "$2" FAKE_HSTATE_RC=2
+  { [ "$RC" = 0 ] && [ "$(grep -c 'WARNING' <<<"$ERR")" = 1 ] && grep 'WARNING' <<<"$ERR" | grep -qF "$1" && [ "$(state_calls)" = 0 ]; } \
+    || E_BAD="$E_BAD [$2 => rc=$RC warnings=$(grep -c 'WARNING' <<<"$ERR") gate-calls=$(state_calls)]"
+}
+e_strict() {  # e_strict <command>: the sweep gate must have run once, in the cwd, and blocked
+  N_E=$((N_E + 1))
+  run_hook "$PLUGIN" "$PLAIN" "$1" FAKE_HSTATE_RC=2
+  { [ "$RC" = 2 ] && [ "$(state_calls)" = 1 ] && [ "$(state_cwds)" = "$PLAIN" ]; } \
+    || E_BAD="$E_BAD [$1 => rc=$RC gate-calls=$(state_calls)]"
+}
+while IFS= read -r form; do
+  [ -n "$form" ] || continue
+  e_warned "$PLAIN" "$form"
+done <<'EOF'
+cp file.txt copy.txt && git push
+cp file.txt copy.txt && git push origin main
+cp file.txt copy.txt; git push
+cp file.txt copy.txt || git push
+echo ok | git push
+cp file.txt copy.txt & git push
+cp file.txt copy.txt &&git push
+git add -A && git commit -m x && git push -u origin HEAD
+(git push)
+(cp file.txt copy.txt && git push)
+cp file.txt copy.txt && (git push)
+{ cp file.txt copy.txt; git push; }
+if cp file.txt copy.txt; then git push; fi
+echo $(git push)
+echo `git push`
+cd sub && git push
+cd sub; git push
+(cd sub && git push)
+pushd sub >/dev/null && git push
+cd sub && cp ../file.txt x && git push
+FOO=1 git push
+FOO="a b" git push
+FOO=$(echo a b) git push
+FOO=$(echo hi) git push
+FOO=a\ b git push
+FOO=${BAR:-a b} git push
+cp file.txt copy.txt && FOO=$(echo a b) git push
+git -C . push
+git -C sub push
+git -c user.name="a b" push
+cp file.txt copy.txt && git -C sub push
+command git push
+env git push
+env FOO=1 git push
+/usr/bin/git push
+"/usr/bin/git" push
+\git push
+"git" push
+nice -n 5 git push
+sudo -u user git push
+timeout 30 git push
+doas git push
+setsid git push
+cp file.txt copy.txt && timeout 30 git push
+echo | xargs -n 1 git push
+bash -c "git push"
+sh -c 'cp file.txt copy.txt && git push'
+EOF
+e_warned "$PLAIN" $'cp file.txt copy.txt\ngit push'
+e_warned "$PLAIN" $'cp file.txt copy.txt &\ngit push'
+e_warned "$PLAIN" $'cd sub\ngit push'
+# a repo whose path has a space, written the three ways a shell accepts: the push is graded against THAT repo, not the cwd's
+SPC="$(new_repo 'plain space')"; SPC_ESC="$(printf '%q' "$SPC")"
+e_warned "$SPC" "cp file.txt copy.txt && git -C $SPC_ESC push"
+e_warned "$SPC" "cp file.txt copy.txt && git -C '$SPC' push"
+e_warned "$SPC" "cp file.txt copy.txt && cd $SPC_ESC && git push"
+e_strict 'env -u FOO git push'
+e_strict 'cp file.txt copy.txt && env -u FOO git push'
+e_strict 'cp file.txt copy.txt && env -C sub git push'
+[ -z "$E_BAD" ] && ok "E1. all $N_E forms are graded: understood ones warned (one warning, the repo pushed named, no sweep gate), env -u / -C strict on the cwd" \
+  || bad "E1. forms that walked past the gate (or were graded the wrong way):" "$E_BAD"
+
+# ════════════════════════════════════════════════════════════════════════════
+section "F. an hmd-initialised repo that is not heimdall's own (the rally layout) is unmanaged: warned, never held to heimdall's sweep"
+# FIELD REPORT: a yarn project that was `hmd init`ed -- heimdall-state.json (tests_passing false, dirty true) and .planning/ -- with no test/run-all.sh
+# and no .heimdall/repo-checks.json, and a TRACKED .planning/metrics.jsonl that hmd keeps appending to. It owns no sweep writer, so heimdall's sweep
+# gate and its receipt (.heimdall/receipts/last-sweep.json, written only by heimdall's own test/run-all.sh) are not its regime.
+mk_rally() {  # mk_rally <name> -> the layout above: metrics.jsonl committed, then modified and left uncommitted
+  local d; d="$(new_repo "$1")"
+  mkdir -p "$d/.planning"
+  printf '{"name":"rally","private":true,"scripts":{"test":"jest"}}\n' > "$d/package.json"
+  printf '# yarn lockfile v1\n' > "$d/yarn.lock"
+  printf '{"event":"task","n":1}\n' > "$d/.planning/metrics.jsonl"
+  commit_all "$d" "yarn project with hmd planning state"
+  printf '{"event":"task","n":2}\n' >> "$d/.planning/metrics.jsonl"
+  ( cd "$d" && "$PLUGIN_REAL/bin/heimdall-state" init >/dev/null 2>&1 && "$PLUGIN_REAL/bin/heimdall-state" mark-dirty >/dev/null 2>&1 )
+  printf '%s' "$d"
+}
+RALLY="$(mk_rally rally)"
+{ jq -e '.quality_gates.tests_passing == false and .quality_gates.dirty == true' "$RALLY/heimdall-state.json" >/dev/null 2>&1 \
+    && [ "$(git -C "$RALLY" status --porcelain --untracked-files=no)" = " M .planning/metrics.jsonl" ] \
+    && [ ! -e "$RALLY/test/run-all.sh" ] && [ ! -e "$RALLY/.heimdall" ]; } \
+  && ok "F0. fixture: heimdall-state.json says tests failing + dirty, a tracked modified .planning/metrics.jsonl, no sweep writer, no declaration, no .heimdall at all" \
+  || bad "F0. the rally layout was not built" "$(cat "$RALLY/heimdall-state.json" 2>/dev/null | head -c 300) | $(git -C "$RALLY" status --porcelain --untracked-files=no)"
+( cd "$RALLY" && "$PLUGIN_REAL/bin/heimdall-state" check-quality-gates >/dev/null 2>&1 ); [ "$?" = 2 ] \
+  && ok "F0. fixture sanity: heimdall's own sweep gate WOULD block this repo (failing state, no sweep receipt) -- it is not this repo's regime" \
+  || bad "F0. fixture sanity: the real sweep gate does not block the rally layout"
+for form in 'git push' 'git push origin main' 'cp yarn.lock yarn.lock.bak && git push origin main' 'yarn build && git add -A && git commit -m x && git push'; do
+  run_hook "$PLUGIN_REAL" "$RALLY" "$form"
+  { [ "$RC" = 0 ] && [ -z "$OUT" ] && [ "$(grep -c 'WARNING' <<<"$ERR")" = 1 ] && grep 'WARNING' <<<"$ERR" | grep -qF "$RALLY" && ! grep -qE 'BLOCKED|no sweep receipt|quality-gate verdict' <<<"$ERR"; } \
+    && ok "F1. [$form] -> unmanaged: one warning naming the repo, allowed, no sweep-gate verdict  [rc=0]" \
+    || bad "F1. [$form] was not warned-and-allowed" "rc=$RC out=$(printf '%s' "$OUT" | head -c 300) err=$(printf '%s' "$ERR" | head -c 500)"
+done
+run_hook "$PLUGIN" "$RALLY" 'cp yarn.lock yarn.lock.bak && git push' FAKE_HSTATE_RC=2
+{ [ "$RC" = 0 ] && [ "$(state_calls)" = 0 ]; } && ok "F2. heimdall's sweep gate is never consulted for it (a gate that would fail changes nothing)  [rc=0]" || bad "F2. the sweep gate was called for an unmanaged repo" "rc=$RC calls=$(state_calls)"
+[ ! -e "$RALLY/.heimdall" ] && ok "F3. no .heimdall/receipts/last-sweep.json is required, read or created: the repo still has no .heimdall directory" || bad "F3. the push gate left or needed a .heimdall directory" "$(ls -A "$RALLY/.heimdall" 2>/dev/null)"
+# the same repo once it declares its own checks (a stand-in script for `yarn test`) and records a green run: it passes on that record, the
+# failing heimdall-state.json notwithstanding. The tree must be clean for the receipt, so the metrics churn is committed first.
+RALLY_CHK="$(mk_rally rally-checks)"
+mkdir -p "$RALLY_CHK/scripts" "$RALLY_CHK/.heimdall"
+printf '#!/bin/sh\necho "yarn test (stand-in): 12 suites, all passed"\n' > "$RALLY_CHK/scripts/yarn-test-standin.sh"
+printf '%s\n' "$(decl_json yarn-test 'sh scripts/yarn-test-standin.sh')" > "$RALLY_CHK/.heimdall/repo-checks.json"
+commit_all "$RALLY_CHK" "declare the repo's own checks; commit the metrics churn"
+run_checks "$RALLY_CHK"
+{ [ "$RCRC" = 0 ] && jq -e '.exit_code == 0 and .dirty == false' "$(receipt_of "$RALLY_CHK")" >/dev/null 2>&1; } \
+  && ok "F4. fixture: the stand-in check ran green and recorded a clean-tree receipt" || bad "F4. the stand-in check did not record a green clean receipt" "rc=$RCRC $(head -c 300 "$(receipt_of "$RALLY_CHK")" 2>/dev/null)"
+( cd "$RALLY_CHK" && "$PLUGIN_REAL/bin/heimdall-state" check-quality-gates >/dev/null 2>&1 ); [ "$?" = 2 ] \
+  && ok "F4. fixture sanity: heimdall's sweep gate would still block it (state failing, no sweep receipt)" || bad "F4. fixture sanity: the sweep gate does not block the declared-checks layout"
+run_hook "$PLUGIN_REAL" "$RALLY_CHK" 'cp yarn.lock yarn.lock.bak && git push origin main'
+{ [ "$RC" = 0 ] && grep -q 'GREEN' <<<"$ERR" && ! grep -q 'WARNING' <<<"$ERR" && ! grep -qE 'BLOCKED|no sweep receipt' <<<"$ERR$OUT"; } \
+  && ok "F5. declared checks + a green receipt -> allowed on that record, no unmanaged warning, no sweep gate  [rc=0]" || bad "F5. declared-checks rally layout was not allowed on its green receipt" "rc=$RC out=$(printf '%s' "$OUT" | head -c 300) err=$(printf '%s' "$ERR" | head -c 500)"
 
 printf '\n  heimdall-push-gate-per-repo: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
