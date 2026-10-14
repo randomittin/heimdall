@@ -151,14 +151,20 @@
 #                              Delegates to bin/heimdall-inbox-wake (`optin` checks, `watch` types).
 #   hmd app pair-window --session SID [--pid N] [--repo DIR] [--relay URL] [--transcript FILE]
 #   hmd app pair-window --stop --session SID [--repo DIR]
-#                              OPT-IN: for a repo that `hmd app connect` has not been run for this does nothing -- no gh call, no token, no
-#                              relay call, no supervisor (the opt-in is a record in $HEIMDALL_HOME that connect writes and
-#                              `hmd app disconnect` removes; a session ending never does, and a repo cannot write it). For a
-#                              connected repo the window registers the code ONCE when it opens, and only while no phone is paired: the
-#                              token goes out with that registration and no other. Nothing renews it (HMD_PAIR_WINDOW_RENEW=1 is the
-#                              explicit opt-in to the schedule described below), and a lapsed code is offered again by `hmd app
-#                              connect` or `hmd app add-device`. The window then stays only to bring back a paired phone whose client
-#                              died. The rest of this paragraph, and the next, describe the HMD_PAIR_WINDOW_RENEW=1 behavior.
+#                              OPT-IN: for a repo that `hmd app connect` has not been run for this offers no code -- no gh call, no token, no
+#                              relay call for one (the opt-in is a record in $HEIMDALL_HOME that connect writes and
+#                              `hmd app disconnect` removes; a session ending never does, and a repo cannot write it) -- and with no phone
+#                              paired there either it starts nothing at all, no supervisor. RESUMING a paired phone is no part of that: it
+#                              needs neither the opt-in nor a token nor gh, so a repo with a stored login (a phone paired under an earlier
+#                              version, which wrote no opt-in, included) has its phone resumed at every session start, and only offering
+#                              a NEW code asks for the opt-in. For a connected repo the window registers the code ONCE when it opens, and
+#                              only while no phone is paired: the token goes out with that registration and no other. Nothing renews it
+#                              (HMD_PAIR_WINDOW_RENEW=1 is the explicit opt-in to the schedule described below), and a lapsed code is
+#                              offered again by `hmd app connect` or `hmd app add-device`, under the same code (a repo with a paired phone
+#                              keeps the one that phone was paired under, in its pairing record). The window then stays only to bring back
+#                              a paired phone whose client died. What the next paragraph says about a paired phone -- never let go of by a
+#                              session ending, a restart, a resume or idle time -- holds in both modes; the rest of this paragraph, and the
+#                              next, describe the HMD_PAIR_WINDOW_RENEW=1 behavior.
 #                              The REPO's pair-by-code window, with no terminal: the
 #                              SessionStart hook (every start, resume, /clear and
 #                              compact) runs the first form, the SessionEnd hook the

@@ -631,8 +631,10 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
   is waiting for a phone:** when you run `hmd app connect`, when you run `hmd app add-device` (a phone is
   paired and you want one more), and when the SessionStart hook `pair-window-start` opens a repo's pair
   window -- for a repo you connected, in an attended session with `gh` signed in, and only while no phone
-  is paired (a restart resumes a paired phone from its stored session login, which never involves the
-  token). The relay keeps a registration 360 s, so the code can be typed for about six minutes and then
+  is paired (a restart resumes a paired phone from its stored session login, which involves neither the
+  token nor the opt-in record: a phone paired before the record existed is resumed too, with no gh call and
+  no request that carries a token, and a repo you never connected that has no paired phone starts nothing).
+  The relay keeps a registration 360 s, so the code can be typed for about six minutes and then
   no longer: nothing registers it again (no timer, no restarted client, no later session start while the
   window is open), and a registration the relay refuses or cannot take is not retried, so no second
   request carries the token. To pair after that, run `hmd app connect` again, or `hmd app add-device` once
