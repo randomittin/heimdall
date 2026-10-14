@@ -93,7 +93,7 @@ The resume release. A stopped or crashed laptop client no longer unpairs the pho
   searches. Tests A10, B "linear time", C60-C61. The unmanaged-repo warning, the secret and self-scan gates and every earlier class rule are unchanged.
 
 ### Not in this release
-- The kill guard is not narrowed yet (the 2.4.7 notes said 2.4.8); it still denies kills by name or computed pid. `HMD_KILL_GUARD=off` still turns it off.
+- The kill guard is not narrowed yet (the 2.4.7 notes said 2.4.8); it still denies kills by name or computed pid. `HMD_KILL_GUARD=off` still turns it off. <!-- HEIMDALL:PIN:FROZEN -->
 - `release/ship.sh` does not yet commit, check and push the site's version pins, and a full ship still publishes npm from the working tree rather than the tag; both are planned for 2.4.9.
 - The push gate still allows a push, with a warning, when `heimdall-state` cannot give a verdict in a heimdall checkout that was never initialised.
 
