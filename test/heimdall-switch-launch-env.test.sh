@@ -467,7 +467,9 @@ fire_precheck() { # fire_precheck <subagent_type> <anthropic_base_url>
   local satype="$1" abu="$2" pf errf
   pf="$(mktemp)"; errf="$(mktemp)"
   payload "$satype" > "$pf"
-  E_OUT="$(env -i PATH="$REAL_PATH" HOME="${HOME:-/tmp}" ANTHROPIC_BASE_URL="$abu" \
+  # HMD_MIN_FREE_PCT=0: the REAL hook's disk floor fence (2.4.8) would otherwise read THIS machine's free space and deny the E4/E5 spawns whenever it is under the floor; the
+  # fence is proved under a fake df in test/disk-floor.test.sh, and `env -i` would drop an operator's own HMD_MIN_FREE_PCT, so it is pinned here.
+  E_OUT="$(env -i PATH="$REAL_PATH" HOME="${HOME:-/tmp}" ANTHROPIC_BASE_URL="$abu" HMD_MIN_FREE_PCT=0 \
       "$BASH_ABS" "$REAL_PRECHECK" <"$pf" 2>"$errf")"
   E_RC=$?
   E_ERR="$(cat "$errf" 2>/dev/null)"

@@ -30,6 +30,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOOKS="$ROOT/hooks/hooks.json"
 
+# This suite fires the REAL bin/heimdall-precheck-agent, whose disk floor fence (2.4.8) reads THIS machine's free space and would deny every spawn here whenever it is under
+# the floor (it was at 7.1% when the fence was added). That fence is proved under a fake df in test/disk-floor.test.sh; here it is pinned off, like the context gate is in
+# test/agent-name-gate.test.sh, so the brief-adoption assertions below do not depend on the disk they happen to run on.
+export HMD_MIN_FREE_PCT=0
+
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 
 PASS=0; FAIL=0

@@ -247,8 +247,10 @@ mnt="${SHIM_DF_MOUNT:-/fake$(printf '%s' "$last" | tr -c 'A-Za-z0-9' _)}"
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 999999999 1 %s 1%% %s\n' "$free" "$mnt"
 DFEOF
 chmod +x "$T/dfshim/df"
+# HMD_MIN_FREE_PCT=0 below: this section proves the GB floor in isolation. The guards lib also loads the shared percent floor (bin/lib/hmd_disk_floor.sh, 2.4.8) in a real
+# checkout, and this fake df reports a 953 GB volume, on which every low-free case here is a tiny percent too -- that floor is proved in test/disk-floor.test.sh.
 dfpf() { # [K=V ...] -- hmd_test_disk_preflight under the fake df: prints its output, its status goes to $T/dfpf.rc
-  ( export PATH="$T/dfshim:$PATH" TMPDIR="$T/rt"; for kv in "$@"; do export "$kv"; done; hmd_test_disk_preflight "$REPO" 2>&1; echo $? > "$T/dfpf.rc" )
+  ( export PATH="$T/dfshim:$PATH" TMPDIR="$T/rt" HMD_MIN_FREE_PCT=0; for kv in "$@"; do export "$kv"; done; hmd_test_disk_preflight "$REPO" 2>&1; echo $? > "$T/dfpf.rc" )
 }
 OUT="$(dfpf)"
 if [ "$(cat "$T/dfpf.rc")" = 0 ] && [ -z "$OUT" ]; then ok "500 GB free: the preflight is silent and passes"; else bad "plenty free: rc=$(cat "$T/dfpf.rc") out=$OUT"; fi
