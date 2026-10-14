@@ -455,7 +455,9 @@ HOMECHK="$(mk_checks homechk "$GREEN_DECL")"; ln -s "$HOMECHK" "$HOMEDIR/chkhome
 # linked worktrees (checked out, and with nothing on disk), a link to a sweep repo
 DANGLE="$(new_repo dangle)"; mkdir -p "$DANGLE/test"; ln -s /no/such/target/anywhere "$DANGLE/test/run-all.sh"; commit_all "$DANGLE" dangling-marker
 DECLDIR="$(new_repo decldir)"; mkdir -p "$DECLDIR/.heimdall/repo-checks.json"; printf 'x\n' > "$DECLDIR/.heimdall/repo-checks.json/keep"; commit_all "$DECLDIR" decl-is-a-directory
-BARE="$W/bare.git"; git init -q --bare "$BARE"
+BARE="$W/bare.git"
+[ -n "$BARE" ] || { echo "FATAL: BARE path empty" >&2; exit 1; }
+git init -q --bare "$BARE"
 git -C "$SWEEP" worktree add -q "$W/wt/sweep-full" -b wt-sweep-full >/dev/null 2>&1
 git -C "$SWEEP" worktree add -q --no-checkout "$W/wt/sweep-bare" -b wt-sweep-bare >/dev/null 2>&1
 git -C "$PLAIN" worktree add -q "$W/wt/plain-full" -b wt-plain-full >/dev/null 2>&1
@@ -1379,7 +1381,10 @@ PAYLOAD_CWD="$PLAIN" run_hook "$PLUGIN" "$SWEEP" "cd $CHK && git push" "${TIMEOU
 expect_rc "C50c. ...the same for a cd target" 2
 PAYLOAD_CWD="$PLAIN" run_hook "$PLUGIN" "$SWEEP" "git -C $CHK push" "${TIMEOUT_ENV[@]}" FAKE_HSTATE_FAIL_IN="$PLAIN"
 expect_rc "C50d. ...and when it is the payload cwd's gate that fails -> BLOCKED" 2
-DOT="$W/dot"; mkdir -p "$DOT"; git init -q --bare "$DOT/cfg.git"
+DOT="$W/dot"; mkdir -p "$DOT"
+CFG_BARE="$DOT/cfg.git"
+[ -n "$CFG_BARE" ] || { echo "FATAL: CFG_BARE path empty" >&2; exit 1; }
+git init -q --bare "$CFG_BARE"
 run_hook "$PLUGIN" "$PLAIN" "git --git-dir=$DOT/cfg.git --work-tree=$DOT push" FAKE_HSTATE_FAIL_IN="$DOT"
 expect_rc "C51. a repository git names whose work tree cannot be confirmed from the other end (a dotfiles layout): every candidate directory is graded, a failing one BLOCKS although the cwd repo passes" 2
 run_hook "$PLUGIN" "$PLAIN" "git --git-dir=$DOT/cfg.git --work-tree=$DOT push"
