@@ -729,7 +729,7 @@ def case_window_is_the_repos():
 #      new one as a clash, whenever the relay keeps a registration longer than that. Against the relay's real 360 s the renewal
 #      falls 350 s on, inside the registration, so the code is claimable all the time; a relay that kept one only 60 s would
 #      leave it dark between a lapse and the floor, which is the price of the back-off
-#   I  and the window stops for good after HMD_PAIR_WINDOW_IDLE_H hours (4; 0 never) with no pairing and no activity in the
+#   I  and -- if the operator opts in with HMD_PAIR_WINDOW_IDLE_H hours (the cases below say 4; unset or 0 is never) -- the window stops for good with no pairing and no activity in the
 #      session (the modification time of the transcript the SessionStart hook hands it); a new session, or `hmd app connect`,
 #      opens it again. Time is injected (HMD_PAIR_WINDOW_NOW_FILE) and the relay's timings are scaled down: nothing sleeps hours.
 def simulated_renewals(due, ttl, hours):
@@ -938,7 +938,9 @@ class Clock:
 
 
 def idle_knobs(clock, **extra):
-    return dict({"HMD_PAIR_WINDOW_NOW_FILE": clock.path, "HMD_PAIR_WINDOW_POLL_S": "0.2"}, **extra)
+    # the idle stop is the operator's opt-in since 2.4.8 (the default is no idle stop: test/app-session-survives-cc-restart.test.sh proves that), so
+    # the cases that exercise the bound say so: the four hours the window used to default to
+    return dict({"HMD_PAIR_WINDOW_NOW_FILE": clock.path, "HMD_PAIR_WINDOW_POLL_S": "0.2", "HMD_PAIR_WINDOW_IDLE_H": "4"}, **extra)
 
 
 def open_window_or_fail(s, label, **kw):
@@ -963,7 +965,7 @@ def case_idle_stop():
         clock.set(4 * 3600 - 120)
         time.sleep(1.5)
         T.check(alive(sup) and s.window_state() is not None and len(s.relay.registrations) == 1,
-                "I1. four hours less two minutes with no pairing and no activity: the window is still open (the default is four hours)",
+                "I1. four hours less two minutes with no pairing and no activity: the window is still open (HMD_PAIR_WINDOW_IDLE_H=4)",
                 "alive %r state %r registrations %d" % (alive(sup), s.window_state(), len(s.relay.registrations)))
         clock.set(4 * 3600 + 120)
         stopped = wait_until(lambda: not alive(sup), 25)
