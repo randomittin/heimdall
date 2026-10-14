@@ -89,13 +89,18 @@ esac
 #      the same push walked past the quality, secret, self-scan, oracle and corpus gates: `git -C <dir>
 #      push`, `x && git push`, `; git push`, `FOO=1 git push`, `(git push)`, `sudo git push`,
 #      `/usr/bin/git push`, `bash -c "git push"`. It now matches `git` as a COMMAND WORD: at the start of
-#      a line, after ; & | ( { ` $( ! then/do/else, after env assignments and wrapper words (sudo, command,
-#      env, exec, time, nohup, nice, builtin, xargs), or as the first word of a `sh -c`/`eval` string; then
+#      a line, after ; & | ( { ` $( ! then/do/else, after env assignments and wrapper words (sudo, doas, command,
+#      env, exec, time, timeout, nohup, nice, ionice, setsid, stdbuf, caffeinate, builtin, xargs, each with
+#      its options and their values: env -u NAME, nice -n 5, sudo -u user, timeout -k 5 30), or as the first word
+#      of a `sh -c`/`eval` string. The command word may be a path, quoted or escaped (/usr/bin/git, "git", \git),
+#      and an assignment value or an option value is one whole shell word (quotes, backslash escapes, $( ), ${ },
+#      backticks: FOO=$(echo a b) git push and git -C My\ Dir push are pushes, `git push` is one too); then
 #      git's global options (-C <dir>, -c k=v, --git-dir[=]<dir>, --no-pager, ...) and then `push` as a
 #      whole word (so `git pushd` is not a push). Text that only MENTIONS a push (`echo "git push"`,
 #      `grep -rn "git push" docs/`, a commit message) and other subcommands (`git stash push`) stay
 #      unmatched: a push gate that fired on prose would cost a full gate run per grep. Indirection no regex
-#      can see (`$GIT push`, `xargs -n 1 git push`) is the native pre-push hook's job (core.hooksPath).
+#      can see (`$GIT push`, a script piped into a shell, `eval git push`, a here-string, `bash --norc -c ...`)
+#      is the native pre-push hook's job (core.hooksPath). test/heimdall-push-gate-per-repo.test.sh section E pins the forms.
 #   4. PER-REPO TEST/LINT GATE: the quality gate (`heimdall-state check-quality-gates`: the state
 #      booleans, the lint receipt and heimdall's sweep receipt) used to run in the session's cwd for ANY
 #      push, so a push of another repository was held to heimdall's own sweep: the site, with six gates of
@@ -162,11 +167,13 @@ if printf '%s\n' "$CMD" | grep -qE '(^|[;&|]\s*)git\s+commit'; then
   fi
 fi
 SQ="'"
-GP_VAL='("[^"]*"|'"$SQ"'[^'"$SQ"']*'"$SQ"'|[^[:space:]]*)'
+GP_VAL='([^[:space:]"'"$SQ"'`$\\]|\\.|\$\([^)]*\)|\$\{[^}]*\}|\$|`[^`]*`|"[^"]*"|'"$SQ"'[^'"$SQ"']*'"$SQ"')*'
 GP_START='(^|[;&|({`!]|\$\(|(^|[[:space:]])(then|do|else|elif)[[:space:]]|(sh|bash|zsh|dash|ksh)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*c[[:space:]]+["'"$SQ"']|eval[[:space:]]+["'"$SQ"'])[[:space:]]*'
-GP_PRE='([A-Za-z_][A-Za-z0-9_]*='"$GP_VAL"'[[:space:]]+|(sudo|command|env|exec|time|nohup|nice|builtin|xargs)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)*'
+GP_OPTV='(-[^[:space:]]+[[:space:]]+('"$GP_VAL"'[[:space:]]+)?)*'
+GP_PRE='([A-Za-z_][A-Za-z0-9_]*='"$GP_VAL"'[[:space:]]+|(sudo|doas|command|env|exec|time|nohup|nice|ionice|setsid|stdbuf|caffeinate|builtin|xargs)[[:space:]]+'"$GP_OPTV"'|timeout[[:space:]]+'"$GP_OPTV"'[0-9.]+[smhd]?[[:space:]]+)*'
 GP_OPT='([[:space:]]+(-[Cc][[:space:]]+'"$GP_VAL"'|--(git-dir|work-tree|namespace|super-prefix|config-env)[[:space:]]+'"$GP_VAL"'|--?[A-Za-z][A-Za-z-]*(='"$GP_VAL"')?))*'
-GP_RE="${GP_START}${GP_PRE}([^[:space:]]*/)?git${GP_OPT}[[:space:]]+push([[:space:]]|\$|[;&|)}\"${SQ}])"
+GP_GIT='("([^"[:space:]]*/)?git"|'"$SQ"'([^'"$SQ"'[:space:]]*/)?git'"$SQ"'|\\?([^[:space:]]*/)?git)'
+GP_RE="${GP_START}${GP_PRE}${GP_GIT}${GP_OPT}[[:space:]]+push([[:space:]]|\$|[;&|)}\"${SQ}\`])"
 # DISK FLOOR (delta 5 in the header above). The `case` is the cheap pre-filter and the ONLY statement every other command runs: a bash builtin whose xtrace line
 # test/heimdall-precheck-bash.test.sh's equiv() already drops, so its byte-for-byte comparison against the historical inline chain is untouched. Everything below it
 # (the regex, the lib, df) runs only for a command that names a *.test.sh or run-all.sh -- and denies only when that command RUNS one.
