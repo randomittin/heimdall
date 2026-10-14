@@ -2683,10 +2683,11 @@ _pw_seconds_ok() {
 }
 
 # _connect_window_knobs CONFIRM -- "WINDOW_S RENEW_MIN_S RENEW_LEAD_S EVENT_MIN_S": the code-window timings `hmd app connect` launches its
-# relay client with, the pair window's own (_pw_launch_client), `--confirm` (CONFIRM = true) included. An unpaired connect keeps its code
-# claimable: the client renews it about every RENEW_MIN_S seconds, RENEW_LEAD_S ahead of the relay's lapse and never after it, and offers
-# it for WINDOW_S -- HMD_PAIR_WINDOW_IDLE_H hours (default 4; 0 or over a day is the client's ceiling, 24 h) unless HMD_RELAY_CODE_WINDOW_S
-# names the seconds. The client's own defaults (renew 1.5 s after each lapse, give up after 10 minutes) left a `connect --bg` code
+# relay client with, the pair window's own (_pw_launch_client), `--confirm` (CONFIRM = true) included. With HMD_PAIR_WINDOW_RENEW=1 an unpaired
+# connect keeps its code claimable: the client renews it about every RENEW_MIN_S seconds, RENEW_LEAD_S ahead of the relay's lapse and never
+# after it, and offers it for WINDOW_S -- HMD_PAIR_WINDOW_IDLE_H hours (default 0, and 0 or over a day is the client's ceiling, 24 h) unless
+# HMD_RELAY_CODE_WINDOW_S names the seconds. Without it (the default) WINDOW_S is RENEW_MIN_S and nothing renews: one registration, the token
+# sent once. The client's own defaults (renew 1.5 s after each lapse, give up after 10 minutes) left a `connect --bg` code
 # answering 404 after about 12 minutes. EVENT_MIN_S is the least time after a registration that a renewal an EVENT asks for is made. It is
 # RENEW_MIN_S -- a connect nobody is attending must not send the token faster than the schedule because a relay keeps ending its sessions --
 # except for --confirm: attended at a terminal, a phone turned down at the compare has had its session revoked, so its window is renewed
@@ -2873,6 +2874,11 @@ _pw_launch_client() {
 # A PAIRED PHONE is never let go of by any of that: with no session of the repo and no connect client the supervisor stays, serves
 # the phone with the client it already has (brought back by _resume_phones when it dies), offers no code and sends no token
 # (_pw_hold); it ends only on TERM/INT/HUP -- and what ends a pairing is `hmd app disconnect`, the phone's revoke or a refused login.
+# ONE REGISTRATION is the default (everything above about retrying and renewing is HMD_PAIR_WINDOW_RENEW=1): one client whose own window is
+# as long as the floor, the token read for it and for no other. Once that is spent -- it lapsed, was refused, or its phone came and went --
+# `offered` is set and nothing offers a code again: the loop only looks (_resume_phones) for a paired phone whose client died. `offered` is
+# also how a window that must not offer a code at all behaves, whichever the schedule: a repo that never opted in (the supervisor then exists
+# only to RESUME the phones a stored login names, which needs neither the opt-in nor a token), and, by default, a repo with a phone paired.
 cmd_pair_window_loop() {
   local fails=0 started rc ran delay tok="" restart_s retry_s poll_s idle_h full_noted=false limit offered=false
   while [ $# -gt 0 ]; do
