@@ -1073,6 +1073,21 @@ _gh_token_into() {
   printf -v "$__var" '%s' "$__tok"
 }
 
+# _pair_optin set|clear|check REPO -- the repo's opt-in to pairing by code (bin/lib/hmd_pair_optin.py): a record in $HEIMDALL_HOME that an explicit
+# `hmd app connect` makes and `hmd app disconnect` removes -- a session's start or end never does either. A repository cannot make it (it is not
+# in the tree a repo controls), and the SessionStart pair window reads no token, asks gh nothing and calls no relay for a repo without it.
+# `check` is 0 when it is set.
+_pair_optin() {
+  [ -n "$PY3" ] || return 1
+  "$PY3" "$LIB_DIR/hmd_pair_optin.py" "$1" --repo "$2" >/dev/null 2>&1
+}
+
+# _code_renewal_on -- 0 when the operator asked, with HMD_PAIR_WINDOW_RENEW=1 (exactly 1), for the code to be kept claimable by registering it again
+# about every 5 minutes: the gh token goes out with every one of those. The default is ONE registration per request (hmd app connect, hmd app
+# add-device, a pair window that opens with no phone paired): the relay keeps it 360 s, the code is claimable that long and no timer, restart or
+# later session registers it again, so the token goes out once. A switch that widens what leaves the laptop: anything but exactly 1 is off.
+_code_renewal_on() { [ "${HMD_PAIR_WINDOW_RENEW:-}" = 1 ]; }
+
 # _session_code_for_repo REPO -- the 5-character code `hmd ui --repo REPO` shows (bin/lib/hmd_app_code.py asks
 # the very function hmd ui asks, so the statusline, /api/state and the SESSION CODE printed here agree), or 1.
 _session_code_for_repo() {
@@ -2106,6 +2121,14 @@ cmd_connect_relay() {
   REPO_REAL="$(_real_dir "$REPO")"
   STATE_REPO="$REPO"
 
+  # Running connect is the operator's consent to pair this repo by code: recorded outside the repo, it is what lets the SessionStart pair window
+  # register the code here (hmd app disconnect takes it back). --no-code is the opposite statement -- no token for this repo -- and removes it.
+  if [ "$NO_CODE" = true ]; then
+    _pair_optin clear "$REPO"
+  elif ! _pair_optin set "$REPO"; then
+    echo "hmd app: could not record that this repo pairs by code -- the SessionStart pair window stays off here" >&2
+  fi
+
   # Pair by code (see the usage block). The token lives in gh_tok only until it has been written to the client's
   # pipe; it is never passed as an argument or exported. The repo's pair window, when open, holds the
   # code (one live window per GitHub id and code on the relay), so a plain connect leaves it there and says so,
@@ -2371,6 +2394,8 @@ _pw_start() {
     0|off|false|no) echo "hmd app: pair window off (HMD_PAIR_WINDOW=${HMD_PAIR_WINDOW})"; return 0 ;;
   esac
   _session_attended || return 0
+  # opt-in: no `hmd app connect` was ever run for this repo, so nothing below happens -- no gh call, no token, no relay call, no supervisor
+  _pair_optin check "$repo" || return 0
   [ -n "$PY3" ] && [ -x "$RELAY_CLIENT_BIN" ] || return 0
   code="$("$PY3" "$LIB_DIR/hmd_session_code.py" --repo "$repo" 2>/dev/null)" || return 0
   printf '%s' "$code" | grep -Eq "$SESSION_CODE_RE" || return 0
@@ -3281,6 +3306,8 @@ cmd_disconnect() {
     return $?
   fi
   local connect_doc repo_real vrc pw_stopped devs=""
+  # the opt-in goes FIRST: a session starting while this runs finds no consent to open a pair window with
+  _pair_optin clear "$REPO" || true
   connect_doc="$(_connect_doc "$REPO")"
   repo_real="$(_real_dir "$REPO")"
   # every phone paired right now, listed before anything below ends a client (the pair windows closed next end them too, and a list names
