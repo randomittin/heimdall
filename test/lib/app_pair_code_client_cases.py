@@ -435,6 +435,9 @@ class captured_events:
 
 def offline_client(sandbox):
     """A RelayClient as `--code` mode leaves it right after code_start, pointed at a port nothing listens on."""
+    # This client runs in the TEST's process, whose environment is the operator's, and a bind stores the session login (bin/lib/hmd_session_login.py):
+    # into a 0600 file under this sandbox's HEIMDALL_HOME, never into the operator's ~/.heimdall or the macOS Keychain (the control bind below used to).
+    os.environ.update(HEIMDALL_HOME=os.path.join(sandbox.home, ".heimdall"), HMD_SESSION_LOGIN_STORE="file")
     client = CLIENT.RelayClient(argparse.Namespace(relay="http://127.0.0.1:1", repo=sandbox.repo, tick_s=2.0,
                                                    status_file=os.path.join(sandbox.root, "relay.json"),
                                                    public_host=None, ui_port=1))

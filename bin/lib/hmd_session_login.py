@@ -23,6 +23,9 @@ HMD_SESSION_LOGIN_STORE=file|keychain|auto (default auto: the Keychain on macOS 
 
 LIMIT. A login whose client was last alive more than HMD_SESSION_RESUME_H hours ago (default 24; 0 = never resume) is discarded on
 the next look and the phone pairs again. It is not revoked: only an explicit disconnect, a revoke from the phone or a failed login is.
+A login a client that is ALIVE holds is never past the limit (its client is alive now, whatever its last stamp says): no look discards it, so
+HMD_SESSION_RESUME_H=0 stops a STOPPED client's session being resumed and never ends a live phone's session -- a live client that finds its
+login gone ends itself and revokes (bin/heimdall-relay-client, _login_guard).
 CONFIRMED OR KEPT. A login is removed by a revoke here only once the relay confirmed it (the session ended, or is no longer there); an
 unreachable or unwilling relay, a secret that cannot be read and a login file that cannot be read all keep it and fail loudly. A revoke
 marks the login `revoking` FIRST (under the store lock, durably): from then on no resume claims it, so a disconnect racing a resume ends
@@ -306,10 +309,10 @@ def load_resumable(root, relay, reserve=SEQ_BLOCK):
                 continue
             if rec.get("revoking"):  # a disconnect was asked for: it is revoked, never resumed -- kept only for that revoke to be repeated
                 continue
+            if _held(root, rec.get("pid")):  # a live client serves it: not ours to resume, and never "past the limit" -- a login a live client holds is not discarded
+                continue
             if time.time() - float(rec.get("last_alive") or 0) > limit:
                 _discard_unlocked(root, rec["session_id"])
-                continue
-            if _held(root, rec.get("pid")):
                 continue
             secret = secret_of(root, rec)
             if secret is None:  # a locked Keychain, a vanished item: no reason to lose the one thing a disconnect revokes with
@@ -337,11 +340,13 @@ def resumable(root, relay):
         for rec in records(root):
             if not _same_relay(rec.get("relay"), relay) or rec.get("revoking"):
                 continue
+            if _held(root, rec.get("pid")):  # a live client serves it: neither resumable nor expired (see load_resumable)
+                continue
             if time.time() - float(rec.get("last_alive") or 0) > limit:
                 _discard_unlocked(root, rec["session_id"])
                 continue
             mark = rec.get("hmd_seq")
-            if _held(root, rec.get("pid")) or secret_of(root, rec) is None or not isinstance(mark, int) or isinstance(mark, bool) or mark < 0:
+            if secret_of(root, rec) is None or not isinstance(mark, int) or isinstance(mark, bool) or mark < 0:
                 continue
             found.append(public(rec))
     return found

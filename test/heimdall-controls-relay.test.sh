@@ -59,6 +59,9 @@ TMPROOT="$(mktemp -d)"
 export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
+# A bound phone's login goes to a 0600 file under this HEIMDALL_HOME, never to the macOS Keychain (under a throwaway HOME `security` has no default
+# keychain: every bind waited on a Keychain write that cannot succeed and said device_bound seconds late).
+export HMD_SESSION_LOGIN_STORE=file
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 export HEIMDALL_FALLBACK_PROBE_TIMEOUT=1
 export HMD_UI_COMPANION_PANELS=0

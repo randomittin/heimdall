@@ -14,6 +14,8 @@ private key. Only pids this test started are ever signalled -- never anything by
       and the phone gets frames it opens under the key it already holds, with seqs above everything sent before
   R3  KILL: the same
   R4  past HMD_SESSION_RESUME_H the stored login is discarded, nothing is revoked, and the new client pairs afresh (a re-pair)
+  R4b a login whose client is ALIVE is never discarded for age, even with HMD_SESSION_RESUME_H=0 ("never resume"): neither the reconcile's
+      `resumable` look nor a --resume client's claim touches it, and the live client neither ends nor revokes its phone's session
   R5  `hmd app disconnect --device` for a phone whose client is dead revokes its relay session with the stored login (no
       "could NOT be revoked"), removes the login and the device record; a relay that cannot be reached is a loud failure that keeps
       the login
@@ -50,6 +52,7 @@ import hmd_relay_e2e as E2E  # noqa: E402
 
 CLIENT = os.path.join(ROOT, "bin", "heimdall-relay-client")
 APP = os.path.join(ROOT, "bin", "heimdall-app")
+LOGIN_LIB = os.path.join(ROOT, "bin", "lib", "hmd_session_login.py")
 PASS = FAIL = 0
 STARTED = []  # every client process this run started: the only pids it ever signals
 
@@ -421,6 +424,36 @@ def scenario_expired():
         sb.drop()
 
 
+def scenario_live_login_is_not_expired():
+    # HMD_SESSION_RESUME_H=0 means "never resume a STOPPED client's session". A client that is alive holds its login, and no look at the store
+    # may discard it for age: `hmd app connect`'s reconcile (`hmd_session_login.py resumable`, every HMD_RESUME_RECONCILE_S) and a --resume
+    # client's claim both look, and a live client that finds its login gone ends itself and revokes its phone's session.
+    sb, relay = Sandbox(), Relay()
+    c1 = c2 = None
+    try:
+        c1, sid, _key = bind_phone(sb, relay, HMD_SESSION_LOGIN_CHECK_S="0.2")
+        stored = sb.logins()
+        look = subprocess.run([sys.executable, LOGIN_LIB, "resumable", "--repo", sb.repo, "--relay", relay.url],
+                              env=sb.env(HMD_SESSION_RESUME_H="0"), capture_output=True, text=True, timeout=60)
+        c2 = Client(sb, relay, "c2", resume=True, HMD_SESSION_RESUME_H="0")
+        pair = c2.event("pair_init")  # the live client's login is not there to resume: this one pairs afresh
+        time.sleep(1.5)  # c1 looks at its own login every 0.2 s: one that had found it gone would have ended c1 by now
+        held = (look.returncode == 0 and look.stdout.strip() == "[]" and pair is not None and pair["qr"]["session_id"] != sid
+                and len(stored) == 1 and sb.logins() == stored and c1.proc.poll() is None and relay.revokes == [])
+        check("R4b", "HMD_SESSION_RESUME_H=0 leaves the login of a client that is ALIVE alone: the reconcile's look lists nothing and discards "
+                     "nothing, a --resume client pairs afresh and discards nothing, and the live client neither ends nor revokes its phone's session",
+              held)
+        if not held:
+            print("       look rc %r out %r; c2 paired afresh %r; logins %d then %d; c1 alive %r; revokes %d"
+                  % (look.returncode, look.stdout.strip(), pair is not None and pair["qr"]["session_id"] != sid, len(stored), len(sb.logins()),
+                     c1.proc.poll() is None, len(relay.revokes)))
+        c2.stop(signal.SIGTERM)
+    finally:
+        kill_leftovers(c1, c2)
+        relay.close()
+        sb.drop()
+
+
 def scenario_device_revoke():
     sb, relay = Sandbox(), Relay()
     c1 = None
@@ -577,7 +610,7 @@ def scenario_keychain():
 
 def main():
     scenarios = (lambda: scenario_stop("R2", "TERM", signal.SIGTERM), lambda: scenario_stop("R3", "KILL", signal.SIGKILL),
-                 scenario_expired, scenario_device_revoke, scenario_disconnect_all, scenario_phone_revoke_and_auth,
+                 scenario_expired, scenario_live_login_is_not_expired, scenario_device_revoke, scenario_disconnect_all, scenario_phone_revoke_and_auth,
                  scenario_usr1, scenario_keychain)
     try:
         for run in scenarios:

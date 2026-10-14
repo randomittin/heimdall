@@ -74,6 +74,9 @@ TMPROOT="$(mktemp -d)"
 export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
+# A bound phone's login goes to a 0600 file under this HEIMDALL_HOME, never to the macOS Keychain (under a throwaway HOME `security` has no default
+# keychain: every bind waited on a Keychain write that cannot succeed and said device_bound seconds late).
+export HMD_SESSION_LOGIN_STORE=file
 mkdir -p "$HOME/.claude"
 unset CLAUDE_SESSION_ID SESSION_ID CLAUDE_CODE_SESSION_ID
 # The hook is ON BY DEFAULT: section 12 needs HMD_PHONE_DENY unset, and every other case sets it explicitly

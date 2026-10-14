@@ -72,6 +72,10 @@ TMPROOT="$(mktemp -d)"
 export TMPDIR="$TMPROOT"
 export HOME="$TMPROOT/home"
 export HEIMDALL_HOME="$TMPROOT/home/.heimdall"
+# A bound phone's login goes to a 0600 file under this HEIMDALL_HOME, never to the macOS Keychain (under a throwaway HOME `security` has no default
+# keychain: every bind waited on a Keychain write that cannot succeed -- longer than the 15 s device-record refresh, which then reported the
+# unwritable store a second time in case 34).
+export HMD_SESSION_LOGIN_STORE=file
 mkdir -p "$HOME/.claude"
 unset HMD_PUSH
 trap 'rm -rf "$TMPROOT"' EXIT

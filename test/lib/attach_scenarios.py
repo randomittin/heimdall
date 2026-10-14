@@ -181,7 +181,10 @@ class World:
         self.home = os.path.join(self.tmp, "home")
         self.env = dict(os.environ, HOME=self.home, HEIMDALL_HOME=os.path.join(self.home, ".heimdall"), TMPDIR=os.path.join(self.tmp, "tmp"),
                         HMD_PYTHON=sys.executable, HMD_PUSH="0", HMD_UI_COMPANION_PANELS="0", HEIMDALL_FALLBACK_ASSUME_REACHABLE="0",
-                        HEIMDALL_FALLBACK_PROBE_TIMEOUT="1")
+                        HEIMDALL_FALLBACK_PROBE_TIMEOUT="1",
+                        # a bound phone's login goes to a file under this HEIMDALL_HOME, never to the macOS Keychain (under a throwaway HOME `security`
+                        # has no default keychain: every bind waited on a Keychain write that cannot succeed and said device_bound seconds late)
+                        HMD_SESSION_LOGIN_STORE="file")
         for var in ("CLAUDE_SESSION_ID", "SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CONFIG_DIR", "HMD_UI_CONTROLS", "HMD_ATTACH",
                     "CLAUDE_CODE_ENTRYPOINT", "HMD_AGENT_TYPE", "HMD_JUDGMENT", "CLAUDE_PROJECT_DIR"):
             self.env.pop(var, None)

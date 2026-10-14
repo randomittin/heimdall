@@ -204,7 +204,11 @@ class Sandbox:
         the test leaks into what a child computes."""
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": self.home, "TMPDIR": self.tmp,
                "HEIMDALL_HOME": os.path.join(self.home, ".heimdall"), "HMD_RELAY_STREAM_TRANSPORT": "ndjson",
-               "HMD_RELAY_BACKOFF_BASE_MS": "200", "HMD_RELAY_EVENT_LOG": ""}
+               "HMD_RELAY_BACKOFF_BASE_MS": "200", "HMD_RELAY_EVENT_LOG": "",
+               # the login a client keeps once a phone is bound (bin/lib/hmd_session_login.py) goes to a 0600 file under this sandbox's HEIMDALL_HOME,
+               # never to the macOS Keychain: under a throwaway HOME `security` has no default keychain, so every bind waited on a Keychain write that
+               # cannot succeed and said device_bound seconds late (the 2.4.8 sweep: 14 suites)
+               "HMD_SESSION_LOGIN_STORE": "file"}
         env.update({k: str(v) for k, v in extra.items()})
         return env
 
