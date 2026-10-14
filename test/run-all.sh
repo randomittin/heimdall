@@ -83,12 +83,23 @@
 #                                       # directories watched for writes outside TMPDIR (guarantee 9)
 #   HMD_TEST_MIN_FREE_GB=N test/run-all.sh # refuse to start under N GB free on the TMPDIR / repo volumes (default 5; 0 = no check);
 #                                       # HMD_TEST_SOCK_HEADROOM=N: warn under N bytes left for a unix socket path (default 60)
+#   HMD_MIN_FREE_PCT=N test/run-all.sh  # refuse to start under N percent free on those volumes (default 10; 0 = no check). The GB floor and
+#                                       # this one are separate knobs and whichever is stricter refuses. The same floors stop a RUNNING
+#                                       # sweep: they are asked again before every suite, and once one is crossed nothing more is started
+#                                       # (see "Disk floor between suites" below the exit codes)
 #
 # Exit 0 = every suite that ran passed. Nonzero = at least one FAIL / TIMEOUT / DISCREPANCY,
 # or discovery fell below the floor. Exit 2 = bad arguments, or --since-green on a dirty tree;
 # exit 3 = nothing to run / discovery below the floor; exit 4 = another sweep holds the lock.
-# exit 5 = REFUSED, too little free disk on the volume holding TMPDIR or the repo (HMD_TEST_MIN_FREE_GB, default 5); exit 6 = REFUSED, the per-suite temp dir leaves
+# exit 5 = REFUSED, too little free disk on the volume holding TMPDIR or the repo (under HMD_TEST_MIN_FREE_GB, default 5, or under HMD_MIN_FREE_PCT percent, default 10:
+# whichever is stricter); exit 6 = REFUSED, the per-suite temp dir leaves
 # fewer bytes than a unix socket path some suite builds needs (macOS caps one at 104). Both refusals come before anything exists: no lock, no work dir, no receipt.
+#
+# Disk floor between suites (2.4.8). The preflight asks once, before anything exists; a sweep runs for an hour and writes real data, so the runner asks again before EVERY suite it
+# launches and before every solo re-run of a red (test/lib/run-all-guards.sh hmd_test_disk_recheck: the same two floors). The first time a volume is under one it launches nothing
+# more: suites already running finish, the rest are REFUSED -- a REFUSED row in the table, a DISK FLOOR section, `suites_refused` and `disk_floor` {reason, before, phase,
+# retries_skipped} in the receipt, the REFUSED suites in non_green_suites (the next incremental sweep carries them forward) -- and the run is RED (exit 1: a sweep cut short never
+# reads as a sweep that passed, and never becomes the full-green anchor). Sticky, so it cannot flap. Without the guard library (a fixture copy of this script) there is no recheck.
 #
 # Incremental sweeps (--since-green). The ~500-suite sweep takes ~70 min, and it used to be re-run for every small merge
 # because any new commit staled the last green receipt. Receipts now carry a kind:
@@ -913,6 +924,24 @@ fi
 # fixture copy of this script -> TMP_ROOT stays empty and suites share TMPDIR as they always did).
 TMP_ROOT=""; TMP_GUARD_RAN=0; TMP_FINDINGS=0
 if type hmd_test_tmp_begin >/dev/null 2>&1; then hmd_test_tmp_begin "$WORK"; fi
+# DISK FLOOR BETWEEN SUITES (test/lib/run-all-guards.sh hmd_test_disk_recheck; the preflight above asked once, before anything existed). A sweep runs for an hour and writes real data,
+# and the disk it started on is not the disk it ends on: before EVERY suite it launches, and every solo re-run of a red, the runner asks again, and once a volume is under a floor
+# (HMD_MIN_FREE_PCT, HMD_TEST_MIN_FREE_GB -- whichever is stricter) it launches nothing more. Suites already running finish; every suite never started is REFUSED: a row in the table,
+# a loud section, `suites_refused` and `disk_floor` in the receipt, a non-green run (exit 1) -- a sweep cut short can never read as a sweep that passed. REFUSED suites are in
+# non_green_suites, so the next incremental sweep carries them forward. Sticky: one trip ends the launching, nothing flaps. LAUNCH_END is the end of what may still be launched
+# (TO_RUN until the floor trips, then the index of the first refused suite = REFUSED_FROM); the launch loop, the re-run loop and the classification below all read it.
+LAUNCH_END=$TO_RUN; REFUSED_FROM=$TO_RUN
+DISK_HIT=0; DISK_HIT_MSG=""; DISK_HIT_BEFORE=""; DISK_HIT_PHASE=""; DISK_RETRIES_SKIPPED=0
+# _disk_gate NAME PHASE -- 0: go ahead and start NAME (PHASE: launch | re-run); 1: do not, the floor has tripped (said once, when it does, and sticky from then on). No recheck function
+# (a fixture copy without the guard library) is a go-ahead.
+_disk_gate() {
+  [ "$DISK_HIT" -eq 0 ] || return 1
+  type hmd_test_disk_recheck >/dev/null 2>&1 || return 0
+  hmd_test_disk_recheck "$REPO" && return 0
+  DISK_HIT=1; DISK_HIT_MSG="$DISK_RECHECK_MSG"; DISK_HIT_BEFORE="$1"; DISK_HIT_PHASE="$2"
+  echo "${RED}${BLD}DISK FLOOR${OFF} -- free disk fell under the floor, so no further suite is started (before $1, $2): ${DISK_HIT_MSG}."
+  return 1
+}
 START=$(date +%s)
 LOAD_START="$(_load_avg)"
 LOAD_START_DISP="$(_load_disp "$LOAD_START")"
@@ -922,8 +951,10 @@ next=0
 launched=0
 NDONE=0
 LAST_PROGRESS_T=$START
-while [ "$next" -lt "$TO_RUN" ] || [ ${#PIDS[@]} -gt 0 ]; do
-  while [ ${#PIDS[@]} -lt "$JOBS" ] && [ "$next" -lt "$TO_RUN" ]; do
+while [ "$next" -lt "$LAUNCH_END" ] || [ ${#PIDS[@]} -gt 0 ]; do
+  while [ ${#PIDS[@]} -lt "$JOBS" ] && [ "$next" -lt "$LAUNCH_END" ]; do
+    # the disk floor, asked before this suite starts (see "DISK FLOOR BETWEEN SUITES" above): under it, nothing more is launched and the loop only waits out what is running
+    if ! _disk_gate "${RUN[$next]##*/}" launch; then LAUNCH_END=$next; REFUSED_FROM=$next; break; fi
     run_one "$next" "${RUN[$next]}" 9>&- &
     PIDS+=($!)
     PIDIDX+=("$next")
@@ -959,15 +990,18 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
   # Cheap prepass (just reads already-written tiny .rc files, same pattern CLASSIFY RESULTS
   # below already does 3x per suite) so each retry's progress line can carry a real N/total
   # instead of an unknown denominator.
+  # (both loops stop at LAUNCH_END, not TO_RUN: a suite the disk floor kept from starting has no .rc, and "no result" must not read as a red to re-run)
   total_reds=0
-  for i in $(_seq_to "$TO_RUN"); do
+  for i in $(_seq_to "$LAUNCH_END"); do
     rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
     [ "$rc" != "0" ] && total_reds=$((total_reds + 1))
   done
   retried=0
-  for i in $(_seq_to "$TO_RUN"); do
+  for i in $(_seq_to "$LAUNCH_END"); do
     rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
     [ "$rc" = "0" ] && continue
+    # a solo re-run is a launch too: under the disk floor the reds stay as the parallel run left them and the re-runs are counted as skipped, not silently dropped
+    if ! _disk_gate "${RUN[$i]##*/}" re-run; then DISK_RETRIES_SKIPPED=$((total_reds - retried)); break; fi
     retried=$((retried + 1))
     [ -t 1 ] && printf '\r  re-running red #%d alone ...' "$retried"
     cp "$WORK/$i.rc" "$WORK/$i.rc.parallel"
@@ -1140,14 +1174,21 @@ if [ "$NEW_STASH_N" -gt 0 ]; then
 fi
 
 # ── CLASSIFY RESULTS ──────────────────────────────────────────────────────────────────────
-n_pass=0; n_fail=0; n_timeout=0; n_unparsed=0; n_discrep=0
+n_pass=0; n_fail=0; n_timeout=0; n_unparsed=0; n_discrep=0; n_refused=0
 tot_p=0; tot_f=0
-FAILED=(); TIMEDOUT=(); UNPARSED=(); DISCREP=()
+FAILED=(); TIMEDOUT=(); UNPARSED=(); DISCREP=(); REFUSED=()
 NONGREEN=()   # "idx|name|status" for every suite that did not come back green
 ROWS=()
 
 for i in $(_seq_to "$TO_RUN"); do
   suite="${RUN[$i]}"; name="$(basename "$suite")"
+  # a suite the disk floor kept from starting (see "DISK FLOOR BETWEEN SUITES"): no result exists for it, and "no result" is not green. It is NOT in NONGREEN: that list drives the
+  # evidence directory, and a refused suite has no output to keep (a real sweep can refuse hundreds). The receipt's non_green_suites takes REFUSED by name, below.
+  if [ "$i" -ge "$REFUSED_FROM" ]; then
+    n_refused=$((n_refused + 1)); REFUSED+=("$name")
+    ROWS+=("REFUSED|$name|-|-|-|-")
+    continue
+  fi
   rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
   dur="$(cat "$WORK/$i.dur" 2>/dev/null || echo 0)"
   counts="$(parse_counts "$WORK/$i.out")"
@@ -1237,6 +1278,7 @@ for row in ${ROWS[@]+"${ROWS[@]}"}; do
     FAIL)     c="$RED" ;;
     TIMEOUT)  c="$RED" ;;
     DISCREP)  c="$RED" ;;
+    REFUSED)  c="$RED" ;;
     UNPARSED) c="$YEL" ;;
     *)        c="" ;;
   esac
@@ -1249,8 +1291,11 @@ done
 
 # ── LOUD SECTIONS ─────────────────────────────────────────────────────────────────────────
 echo ""
+# a red whose solo re-run the disk floor refused was NOT reproduced alone: say so, instead of repeating the usual claim
+FAILED_NOTE="reproduced running alone"
+[ "$DISK_RETRIES_SKIPPED" -eq 0 ] || FAILED_NOTE="some NOT re-run alone: the disk floor stopped the re-runs"
 if [ "$n_fail" -gt 0 ]; then
-  echo "${RED}${BLD}FAILED (${n_fail})${OFF} — reproduced running alone:"
+  echo "${RED}${BLD}FAILED (${n_fail})${OFF} — ${FAILED_NOTE}:"
   for x in ${FAILED[@]+"${FAILED[@]}"}; do echo "  bash test/$x"; done
   echo ""
 fi
@@ -1264,6 +1309,18 @@ fi
 if [ "$n_discrep" -gt 0 ]; then
   echo "${RED}${BLD}DISCREPANCY (${n_discrep})${OFF} — printed failures but exited 0 (a SILENT red):"
   for x in ${DISCREP[@]+"${DISCREP[@]}"}; do echo "  $x"; done
+  echo ""
+fi
+if [ "$DISK_HIT" -eq 1 ]; then
+  echo "${RED}${BLD}DISK FLOOR${OFF} — free disk fell under the floor during the sweep (${DISK_HIT_PHASE} before ${DISK_HIT_BEFORE}), so it stopped starting suites:"
+  echo "  ${DISK_HIT_MSG}"
+  if [ "$n_refused" -gt 0 ]; then
+    echo "  ${n_refused} suite(s) were never started (REFUSED, non-green); the next incremental sweep carries them forward:"
+    for x in "${REFUSED[@]:0:15}"; do echo "    bash test/$x"; done
+    [ "$n_refused" -le 15 ] || echo "    ... and $((n_refused - 15)) more (all of them are in the receipt: non_green_suites)"
+  fi
+  [ "$DISK_RETRIES_SKIPPED" -eq 0 ] || echo "  ${DISK_RETRIES_SKIPPED} red suite(s) were NOT re-run alone: their result above is the parallel run's."
+  echo "  Free space first (hmd system-health, or the mac-deep-clean skill), or lower HMD_MIN_FREE_PCT / HMD_TEST_MIN_FREE_GB on purpose, then run the sweep again."
   echo ""
 fi
 if [ "$n_unparsed" -gt 0 ]; then
@@ -1294,7 +1351,7 @@ if [ -s "$WORK/tmp-section.txt" ]; then cat "$WORK/tmp-section.txt"; echo ""; fi
 
 # ── SUMMARY ───────────────────────────────────────────────────────────────────────────────
 echo "--------------------------------------------------------------------------------------"
-echo "suites: ${TO_RUN} ran, ${#SKIP[@]} skipped (live), ${DISCOVERED} discovered of ${GLOB_COUNT} globbed"
+echo "suites: $((TO_RUN - n_refused)) ran, ${#SKIP[@]} skipped (live), ${DISCOVERED} discovered of ${GLOB_COUNT} globbed"
 echo "        ${GRN}${n_pass} pass${OFF}  ${RED}${n_fail} fail${OFF}  ${RED}${n_timeout} timeout${OFF}  ${RED}${n_discrep} discrepancy${OFF}  ${YEL}${n_unparsed} unparsed${OFF}"
 echo "assertions: ${tot_p} passed, ${tot_f} failed  (parsed detail; exit codes above are authoritative)"
 echo "wall clock: ${ELAPSED}s"
@@ -1313,6 +1370,9 @@ if [ "$n_treeviol" -eq 0 ]; then
 else
   echo "${RED}tree-integrity: VIOLATED (${n_treeviol} finding(s) -- see TREE INTEGRITY VIOLATION above)${OFF}"
 fi
+if [ "$DISK_HIT" -eq 1 ]; then
+  echo "${RED}disk floor: TRIPPED before ${DISK_HIT_BEFORE} (${DISK_HIT_PHASE}) -- ${n_refused} suite(s) REFUSED, ${DISK_RETRIES_SKIPPED} re-run(s) skipped (see DISK FLOOR above)${OFF}"
+fi
 if [ -s "$WORK/tmp-summary.txt" ]; then cat "$WORK/tmp-summary.txt"; fi
 if [ -n "$EVIDENCE" ]; then
   echo "evidence:   ${EVIDENCE}   (${#NONGREEN[@]} non-green suite output(s) + INDEX.txt — kept, not deleted)"
@@ -1325,7 +1385,7 @@ if [ -n "$EVIDENCE" ]; then
   done
 fi
 
-BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0} + ${TMP_FINDINGS:-0}))
+BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0} + ${TMP_FINDINGS:-0} + n_refused))
 
 # ── SWEEP RECEIPT ─────────────────────────────────────────────────────────────────────────
 # Turns "the sweep is green" into a checkable FACT instead of a claim. Three real
@@ -1412,7 +1472,8 @@ if command -v jq >/dev/null 2>&1; then
   # New receipt fields. non_green_suites feeds the NEXT incremental run's carry-forward; flaky_under_load keeps what the parallel
   # run printed for a suite that then passed alone, so "counted green" never means "hidden"; an incremental receipt records
   # exactly what the push gate re-checks (see bin/lib/sweep-chain.sh).
-  NONGREEN_JSON="$(printf '%s\n' ${NONGREEN[@]+"${NONGREEN[@]}"} | awk -F'|' 'NF > 1 {print $2}' | jq -R . | jq -s . 2>/dev/null || echo '[]')"
+  # (the suites the disk floor refused are non-green too: named here so the next incremental sweep carries them forward)
+  NONGREEN_JSON="$( { printf '%s\n' ${NONGREEN[@]+"${NONGREEN[@]}"} | awk -F'|' 'NF > 1 {print $2}'; [ "$n_refused" -eq 0 ] || printf '%s\n' "${REFUSED[@]}"; } | jq -R . | jq -s . 2>/dev/null || echo '[]')"
   FLAKY_JSON='[]'
   if [ "${#FLAKY_IDX[@]}" -gt 0 ]; then
     : > "$WORK/flaky.ndjson"
@@ -1433,6 +1494,12 @@ if command -v jq >/dev/null 2>&1; then
     TMP_SOCK_JSON="$(jq -n --arg dir "${SOCK_DIR:-}" --argjson headroom "${SOCK_HEADROOM:-null}" --argjson need "${SOCK_NEED:-null}" --argjson target "${SOCK_TARGET:-null}" '{dir: $dir, headroom: $headroom, need: $need, target: $target}' 2>/dev/null || echo null)"
     TMP_LEAKS_JSON="$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {suite: .[0], bytes: (.[1] | tonumber), entries: (.[2] | tonumber), sample: (.[3] // "")})' "$WORK/tmp-leaks.tsv" 2>/dev/null || echo '[]')"
     TMP_OUTSIDE_JSON="$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {path: .[0], bytes: (.[1] | tonumber), mtime: (.[2] | tonumber), suites: (.[3] | split(" "))})' "$WORK/tmp-outside.tsv" 2>/dev/null || echo '[]')"
+  fi
+  # The disk floor, only when it tripped (see "DISK FLOOR BETWEEN SUITES"): a receipt of a sweep the floor never touched keeps exactly the keys it always had.
+  DISK_FLOOR_JSON=null
+  if [ "$DISK_HIT" -eq 1 ]; then
+    DISK_FLOOR_JSON="$(jq -n --arg reason "$DISK_HIT_MSG" --arg before "$DISK_HIT_BEFORE" --arg phase "$DISK_HIT_PHASE" --argjson skipped "$DISK_RETRIES_SKIPPED" \
+      '{reason:$reason, before:$before, phase:$phase, retries_skipped:$skipped}' 2>/dev/null || echo null)"
   fi
   SUITES_RUN_JSON=null; SELECTION_JSON=null
   if [ "$SWEEP_KIND" = incremental ]; then
@@ -1475,6 +1542,7 @@ if command -v jq >/dev/null 2>&1; then
       --argjson flaky "$FLAKY_JSON" \
       --argjson nongreen "$NONGREEN_JSON" \
       --argjson tmp_leaks "$TMP_LEAKS_JSON" --argjson tmp_outside "$TMP_OUTSIDE_JSON" --argjson tmp_on "$TMP_ON_JSON" --argjson tmp_dirs "$TMP_DIRS_JSON" --argjson tmp_sock "$TMP_SOCK_JSON" --arg tmp_root "${TMP_ROOT:-}" \
+      --argjson suites_refused "$n_refused" --argjson disk_floor "$DISK_FLOOR_JSON" \
       '{finished_at:$finished_at, repo:$repo, head_sha:$head_sha, tree_clean:$tree_clean,
         exit_code:$exit_code, suites_total:$suites_total, suites_passed:$suites_passed,
         suites_failed:$suites_failed, suites_timeout:$suites_timeout,
@@ -1485,6 +1553,7 @@ if command -v jq >/dev/null 2>&1; then
         load_end_1m:$load_end_1m, load_end_5m:$load_end_5m, load_end_15m:$load_end_15m,
         cpu_count:$cpu_count, kind:$kind, flaky_under_load:$flaky, non_green_suites:$nongreen}
        + (if $tmp_on then {tmp_leaks:$tmp_leaks, tmp_outside:$tmp_outside, tmp_root:$tmp_root, tmp_dirs:$tmp_dirs, tmp_sock:$tmp_sock} else {} end)
+       + (if $disk_floor != null then {suites_refused:$suites_refused, disk_floor:$disk_floor} else {} end)
        + (if $kind == "incremental" then {base_full_sha:$base_full_sha, suites_run:$suites_run, selection:$selection} else {} end)
        + (if $esc_reason != "" then {escalated_from:"since-green", escalation_reason:$esc_reason} else {} end)' > "$RECEIPT_TMP" 2>/dev/null; then
       if mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null; then
@@ -1536,6 +1605,7 @@ if [ "$BAD" -gt 0 ]; then
   else
     echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s) not green."
   fi
+  [ "$n_refused" -gt 0 ] && echo "  disk floor: ${n_refused} suite(s) were never started (REFUSED) -- see DISK FLOOR above; free space, then run the sweep again"
   [ "${TMP_FINDINGS:-0}" -gt 0 ] && echo "  temp-dir leaks: ${TMP_FINDINGS} finding(s) -- see TMP LEAK above; a suite must remove what it makes (trap 'rm -rf \"\$T\"' EXIT)"
   [ -n "$EVIDENCE" ] && echo "  read it: ${EVIDENCE}/INDEX.txt"
   exit 1

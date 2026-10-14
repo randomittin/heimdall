@@ -60,10 +60,12 @@
 #
 # hmd_test_disk_preflight / hmd_test_sock_preflight   REFUSE TO START a sweep that cannot work (always on; run-all.sh calls them before the lock, the work dir,
 #     any trap or receipt exists, so a refusal leaves nothing behind; neither runs on a dry run).
-#   * disk (exit 5): if the volume holding TMPDIR, or the one holding the repo, has less than HMD_TEST_MIN_FREE_GB (default 5; 0 = off) GB free, the sweep is
-#     refused with a message naming the volume and what is free. A sweep writes real data (fixtures, clones, git history) and the machine had just lost 1.6 GB
-#     to suite leftovers. Free space comes from `df -Pk` looked up through PATH (so the tests can fake it); a df that cannot answer skips that check with a
-#     notice -- a preflight must not be the reason a sweep cannot run.
+#   * disk (exit 5): if the volume holding TMPDIR, or the one holding the repo, has less than HMD_TEST_MIN_FREE_GB (default 5; 0 = off) GB free, OR less than
+#     HMD_MIN_FREE_PCT (default 10; 0 = off) percent free -- whichever is stricter refuses -- the sweep is refused with a line per floor crossed, naming the volume
+#     and what is free. A sweep writes real data (fixtures, clones, git history) and the machine had just lost 1.6 GB to suite leftovers; then (2026-10-14) it sat
+#     at 7.1% free. The percent floor is the ONE definition the Agent and Bash hooks share (bin/lib/hmd_disk_floor.sh, loaded below when it is there; a fixture copy
+#     of the runner has no bin/lib of its own and runs on the GB floor alone, as before). Free space comes from `df -Pk` looked up through PATH (so the tests can
+#     fake it); a df that cannot answer skips that check with a notice -- a preflight must not be the reason a sweep cannot run.
 #   * sockets (exit 6): macOS caps a unix socket path at 104 bytes including the NUL (103 usable). Every byte of the per-suite temp dir comes out of what a suite
 #     can use, so the dir is named as short as possible ($TMPDIR/hr.XXXX/s<N>) and its length is CHECKED: headroom = 103 - length(the widest per-suite dir, in the
 #     longer of its logical and its `cd -P` spelling -- macOS /var is /private/var). The longest socket path the suites can build is COMPUTED (hmd_test_sock_need:
@@ -71,6 +73,16 @@
 #     is REFUSED: a suite is certain to fail. Under HMD_TEST_SOCK_HEADROOM (default 60) it is a loud WARNING and a receipt field (tmp_sock) -- on stock macOS TMPDIR
 #     is already 48 bytes, so 60 cannot hold there and a refusal would block every sweep. Sockets are NEVER moved to the shared /tmp to buy room: that is exactly
 #     the kind of leak this machinery exists to catch.
+#
+# hmd_test_disk_recheck   THE SAME TWO FLOORS, ASKED AGAIN BETWEEN SUITES. run-all.sh calls it before every suite it launches (and every solo re-run of a red): the first
+#   time a volume is under a floor the runner launches nothing more, and the rest of the sweep is REFUSED -- a table row, receipt fields, a red run. Quiet about a df that
+#   cannot answer (the preflight said so once). Sets DISK_RECHECK_MSG (the clauses, joined with "; ") and returns 1 when something is short.
+
+# THE SHARED DISK FLOOR (bin/lib/hmd_disk_floor.sh): the percent floor is defined ONCE, for the hooks and for this runner. Loaded when it sits two directories up from this file
+# (a real checkout); a fixture copy of the runner (the test/run-all-*.test.sh suites) has no bin/lib of its own, then only the GB floor below applies, as it always did.
+_hmd_guards_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+# shellcheck source=../../bin/lib/hmd_disk_floor.sh disable=SC1091  # the path is derived from this file's own location at runtime
+if [ -n "$_hmd_guards_dir" ] && [ -r "$_hmd_guards_dir/../../bin/lib/hmd_disk_floor.sh" ]; then . "$_hmd_guards_dir/../../bin/lib/hmd_disk_floor.sh"; fi
 
 hmd_test_wait_quiet() {
   local max_wait="${HMD_QUIET_MAX_WAIT_S:-1200}" poll="${HMD_QUIET_POLL_S:-30}" need="${HMD_QUIET_CHECKS:-3}"
@@ -384,39 +396,84 @@ hmd_test_tmp_guard() {
 
 # ── PREFLIGHTS: refuse to START a sweep that cannot work ──────────────────────────────────────────────────────────────────────────
 
-# _hmd_df_free PATH -- "<free KB><TAB><mount point>" of the volume holding PATH (df -Pk: column 4 is Available in 1024-byte blocks, column 6 on is
-# the mount point, which can hold spaces), "" when df cannot say. `df` is looked up through PATH on purpose: the tests put a fake one first.
+# _hmd_df_free PATH -- "<free KB><TAB><size KB><TAB><mount point>" of the volume holding PATH (df -Pk: column 4 is Available and column 2 the size, in 1024-byte blocks,
+# column 6 on is the mount point, which can hold spaces), "" when df cannot say. `df` is looked up through PATH on purpose: the tests put a fake one first.
 _hmd_df_free() {
-  df -Pk "$1" 2>/dev/null | awk 'NR == 2 { m = $6; for (i = 7; i <= NF; i++) m = m " " $i; print $4 "\t" m }'
+  df -Pk "$1" 2>/dev/null | awk 'NR == 2 { m = $6; for (i = 7; i <= NF; i++) m = m " " $i; print $4 "\t" $2 "\t" m }'
 }
 
-# _hmd_disk_refuse WHAT FREE_KB MOUNT MIN_GB -- one refusal line, on stderr.
-_hmd_disk_refuse() {
-  echo "run-all: refusing to start -- only $(hmd_test_fmt_bytes $(( $2 * 1024 ))) free on the volume holding $1 (mounted on $3); a sweep needs at least $4 GB free (HMD_TEST_MIN_FREE_GB)." >&2
+# _hmd_disk_clause WHAT FREE_KB SIZE_KB MOUNT MIN_GB -- the GB floor's clause for one short volume (no prefix, no full stop), e.g.
+# "only 1.0 GB (1.0%) free on the volume holding TMPDIR=/x (mounted on /vol); a sweep needs at least 5 GB free (HMD_TEST_MIN_FREE_GB)". The percent is truncated, never rounded
+# (bin/lib/hmd_disk_floor.sh says why), and left out when the size could not be read.
+_hmd_disk_clause() {
+  local pct=""
+  case "${3:-}" in ''|*[!0-9]*|0) ;; *) pct=" ($(awk -v f="$2" -v s="$3" 'BEGIN { printf "%.1f", int(f * 1000 / s) / 10 }')%)" ;; esac
+  printf 'only %s%s free on the volume holding %s (mounted on %s); a sweep needs at least %s GB free (HMD_TEST_MIN_FREE_GB)' "$(hmd_test_fmt_bytes $(( $2 * 1024 )))" "$pct" "$1" "$4" "$5"
 }
 
-# hmd_test_disk_preflight REPO -- return 1 (refusal on stderr) when the volume holding TMPDIR, or the one holding the repo, has less than
-# HMD_TEST_MIN_FREE_GB (default 5; 0 turns the check off) GB free. One volume holding both is reported once. A df that cannot answer skips that check
-# with a notice: a preflight must never be the reason a sweep cannot run on a machine where df itself is broken.
-hmd_test_disk_preflight() {
-  local repo="$1" min_gb="${HMD_TEST_MIN_FREE_GB:-5}" tdir="${TMPDIR:-/tmp}" tab=$'\t' min_kb t r tk tmnt rk rmnt short=0
+# _hmd_disk_add CLAUSES -- append CLAUSES (one per line) to DISK_SHORT_CLAUSES.
+_hmd_disk_add() { DISK_SHORT_CLAUSES="${DISK_SHORT_CLAUSES:+$DISK_SHORT_CLAUSES$'\n'}$1"; }
+
+# _hmd_disk_short REPO -- BOTH floors against the volume holding TMPDIR and the one holding the repo: the GB floor (HMD_TEST_MIN_FREE_GB, default 5; 0 = off) and the percent floor
+# (HMD_MIN_FREE_PCT, default 10; 0 = off; bin/lib/hmd_disk_floor.sh, the one definition the hooks share). Whichever is stricter refuses; they are separate knobs, so turning
+# one off leaves the other on. Sets DISK_SHORT_CLAUSES (one clause per floor per short volume, newline-separated, no prefix, no full stop; "" when nothing is short) and returns 1
+# when something is. A volume df cannot answer for is ONE notice on stderr (none under HMD_DISK_FLOOR_QUIET=1) and no check for it: a guard must never be the reason a sweep
+# cannot run on a machine where df itself is broken. Without the shared lib (a fixture copy of the runner) only the GB floor exists.
+_hmd_disk_short() {
+  local repo="$1" min_gb="${HMD_TEST_MIN_FREE_GB:-5}" pct=0 tdir="${TMPDIR:-/tmp}" tab=$'\t' min_kb t r tk tsz tmnt rk rsz rmnt rest lines
+  DISK_SHORT_CLAUSES=""
   case "$min_gb" in ''|*[!0-9]*) min_gb=5 ;; esac
-  [ "$min_gb" -gt 0 ] || return 0
+  if type hmd_disk_floor_pct >/dev/null 2>&1; then pct="$(hmd_disk_floor_pct)"; fi
+  [ "$min_gb" -gt 0 ] || [ "$pct" -gt 0 ] || return 0
   min_kb=$((min_gb * 1048576))
   t="$(_hmd_df_free "$tdir")"; r="$(_hmd_df_free "$repo")"
-  tk="${t%%"$tab"*}"; tmnt="${t#*"$tab"}"; rk="${r%%"$tab"*}"; rmnt="${r#*"$tab"}"
+  tk="${t%%"$tab"*}"; rest="${t#*"$tab"}"; tsz="${rest%%"$tab"*}"; tmnt="${rest#*"$tab"}"
+  rk="${r%%"$tab"*}"; rest="${r#*"$tab"}"; rsz="${rest%%"$tab"*}"; rmnt="${rest#*"$tab"}"
   case "$tk" in ''|*[!0-9]*) tk="" ;; esac
   case "$rk" in ''|*[!0-9]*) rk="" ;; esac
-  [ -n "$tk" ] || echo "run-all: could not read the free space of the volume holding TMPDIR=$tdir with df -- no disk check for it" >&2
-  [ -n "$rk" ] || echo "run-all: could not read the free space of the volume holding the repo $repo with df -- no disk check for it" >&2
-  if [ -n "$tk" ] && [ -n "$rk" ] && [ "$tmnt" = "$rmnt" ]; then
-    if [ "$tk" -lt "$min_kb" ]; then _hmd_disk_refuse "TMPDIR=$tdir and the repo $repo" "$tk" "$tmnt" "$min_gb"; short=1; fi
-  else
-    if [ -n "$tk" ] && [ "$tk" -lt "$min_kb" ]; then _hmd_disk_refuse "TMPDIR=$tdir" "$tk" "$tmnt" "$min_gb"; short=1; fi
-    if [ -n "$rk" ] && [ "$rk" -lt "$min_kb" ]; then _hmd_disk_refuse "the repo $repo" "$rk" "$rmnt" "$min_gb"; short=1; fi
+  if [ "${HMD_DISK_FLOOR_QUIET:-0}" != 1 ]; then
+    [ -n "$tk" ] || echo "run-all: could not read the free space of the volume holding TMPDIR=$tdir with df -- no disk check for it" >&2
+    [ -n "$rk" ] || echo "run-all: could not read the free space of the volume holding the repo $repo with df -- no disk check for it" >&2
   fi
-  [ "$short" -eq 1 ] || return 0
-  echo "         Nothing was run and no receipt was written. Free space first (hmd system-health, or the mac-deep-clean skill), or lower HMD_TEST_MIN_FREE_GB on purpose." >&2
+  if [ "$min_gb" -gt 0 ]; then
+    if [ -n "$tk" ] && [ -n "$rk" ] && [ "$tmnt" = "$rmnt" ]; then
+      [ "$tk" -ge "$min_kb" ] || _hmd_disk_add "$(_hmd_disk_clause "TMPDIR=$tdir and the repo $repo" "$tk" "$tsz" "$tmnt" "$min_gb")"
+    else
+      [ -z "$tk" ] || [ "$tk" -ge "$min_kb" ] || _hmd_disk_add "$(_hmd_disk_clause "TMPDIR=$tdir" "$tk" "$tsz" "$tmnt" "$min_gb")"
+      [ -z "$rk" ] || [ "$rk" -ge "$min_kb" ] || _hmd_disk_add "$(_hmd_disk_clause "the repo $repo" "$rk" "$rsz" "$rmnt" "$min_gb")"
+    fi
+  fi
+  # the percent floor asks df itself (two more calls: the shared check owns the volume grouping and the wording); its own warning about a df that cannot answer is off, the notices above
+  # already said it
+  if [ "$pct" -gt 0 ] && type hmd_disk_floor_check >/dev/null 2>&1; then
+    lines="$(HMD_DISK_FLOOR_QUIET=1 hmd_disk_floor_check "$tdir" "$repo")" || _hmd_disk_add "$lines"
+  fi
+  [ -z "$DISK_SHORT_CLAUSES" ]
+}
+
+# hmd_test_disk_preflight REPO -- return 1 (one refusal line per clause on stderr, then what to do) when the volume holding TMPDIR, or the one holding the repo, is under the GB floor or
+# the percent floor (see _hmd_disk_short). One volume holding both is reported once per floor. A df that cannot answer skips that check with a notice: a preflight must never be the
+# reason a sweep cannot run on a machine where df itself is broken.
+hmd_test_disk_preflight() {
+  local c
+  _hmd_disk_short "$1" && return 0
+  while IFS= read -r c; do
+    [ -z "$c" ] || echo "run-all: refusing to start -- $c." >&2
+  done <<EOF
+$DISK_SHORT_CLAUSES
+EOF
+  echo "         Nothing was run and no receipt was written. Free space first (hmd system-health, or the mac-deep-clean skill), or lower HMD_TEST_MIN_FREE_GB / HMD_MIN_FREE_PCT on purpose." >&2
+  return 1
+}
+
+# hmd_test_disk_recheck REPO -- the same two floors, asked again between suites (run-all.sh before every suite it launches, and before every solo re-run of a red). Returns 0 and
+# DISK_RECHECK_MSG="" while both hold; returns 1 and sets DISK_RECHECK_MSG (the clauses, joined with "; ") when a volume has fallen under one. Silent: a df that cannot answer is
+# not repeated before every suite (the preflight said it once) and is no reason to stop a sweep.
+hmd_test_disk_recheck() {
+  DISK_RECHECK_MSG=""
+  HMD_DISK_FLOOR_QUIET=1 _hmd_disk_short "$1" && return 0
+  # shellcheck disable=SC2034  # read by test/run-all.sh (_disk_gate), which sources this file
+  DISK_RECHECK_MSG="${DISK_SHORT_CLAUSES//$'\n'/; }"
   return 1
 }
 
