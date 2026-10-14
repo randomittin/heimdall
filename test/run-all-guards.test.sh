@@ -25,10 +25,17 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/run-all-guards.XXXXXX")"; T="$(cd "$T" && pwd -P)"
 MARK="runallguards$$"
-cleanup() { pkill -f "$MARK" 2>/dev/null || true; pkill -f "$T/fake/" 2>/dev/null || true; sleep 0.2; pkill -9 -f "$T/fake/" 2>/dev/null || true; rm -f "/tmp/$MARK-hardcoded.dat"; chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"; }
+cleanup() { pkill -f "$MARK" 2>/dev/null || true; pkill -f "$T/fake/" 2>/dev/null || true; sleep 0.2; pkill -9 -f "$T/fake/" 2>/dev/null || true; rm -f "/tmp/$MARK-hardcoded.dat"; chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"; if [ -n "${ERT:-}" ]; then chmod -R u+rwX "$ERT" 2>/dev/null; rm -rf "$ERT"; fi; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# ERT is the TMPDIR the fixture sweeps (sections 7-9) run run-all.sh under, and it has to be SHORT. run-all.sh refuses to start (exit 6) when its per-suite temp dir,
+# $TMPDIR/hr.XXXX/s<N>, leaves a unix socket path no room. Inside a sweep THIS suite's own TMPDIR is such a dir already (~70 bytes on macOS: /private/var/folders/../T/hr.XXXX/s451),
+# so $T is ~90 and a fixture TMPDIR under it ($T/ert, plus the fixture's own /hr.XXXX/s3) came to 106 bytes: every fixture sweep was refused and 10 assertions failed -- in a
+# sweep only, never on a plain run. The fixture TMPDIR is therefore a private dir directly under /tmp, made from a template and removed by the trap above, whatever TMPDIR is.
+# No socket goes into the shared /tmp: the fixture's per-suite dirs, where its suites would put one, are under ERT. The refusal itself is untouched (section 9 drives it with a deep TMPDIR).
+ERT="$(mktemp -d /tmp/rag.XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/rag.XXXXXX")" || exit 1
+ERT="$(cd "$ERT" && pwd -P)"
 
 echo "run-all-guards (--wait-quiet gate, process-group sweep per suite, end-of-sweep orphan guard)"
 [ -f "$LIB" ] || { bad "test/lib/run-all-guards.sh is missing"; printf '\nrun-all-guards: %s passed, %s failed\n' "$PASS" "$FAIL"; exit 1; }
@@ -182,12 +189,16 @@ HMD_TEST_TMP_OUTSIDE_MAX=1 HMD_TEST_TMP_WATCH="$T/watch" hmd_test_tmp_guard "$GW
 if grep -q 'NOT FULLY CHECKED' "$GW/tmp-section.txt" && grep -q 'NOT examined' "$GW/tmp-summary.txt"; then ok "more new entries than HMD_TEST_TMP_OUTSIDE_MAX: the rest are counted and named in the section and the summary, never dropped silently"; else bad "outside cap: section=$(cat "$GW/tmp-section.txt") summary=$(cat "$GW/tmp-summary.txt")"; fi
 
 echo "-- 7. through the REAL run-all.sh (fixture repo): own TMPDIR per suite, receipt, summary line, exit status --"
-FX="$T/fx"; mkdir -p "$FX/test/lib" "$FX/bin/lib" "$T/hh" "$T/watch2" "$T/ert"
+FX="$T/fx"; mkdir -p "$FX/test/lib" "$FX/bin/lib" "$T/hh" "$T/watch2"
+# The fixture sweeps' TMPDIR (ERT, made at the top) must leave a unix socket path room under its own hr.XXXX/s<N> (13 bytes at most here), WHATEVER TMPDIR this suite runs under.
+# Asserted outright so that hanging it under $T again turns a plain run red, not only a run inside a sweep, where $T is ~90 bytes deep and the fixture sweeps are refused (exit 6).
+ERT_ROOM=$((103 - ${#ERT} - 13))
+if [ -d "$ERT" ] && [ "$ERT_ROOM" -ge 60 ]; then ok "the fixture sweeps' TMPDIR is a short private dir ($ERT, ${#ERT} bytes): $ERT_ROOM bytes stay free for a unix socket path under it, however deep this suite's own TMPDIR is"; else bad "fixture TMPDIR '$ERT' (${#ERT} bytes) leaves $ERT_ROOM bytes for a unix socket path, under the 60-byte target: the fixture sweeps are refused inside a sweep"; fi
 cp "$RUNALL" "$FX/test/run-all.sh"; cp "$LIB" "$FX/test/lib/run-all-guards.sh"; cp "$REPO/bin/lib/hook-owned-path.sh" "$FX/bin/lib/hook-owned-path.sh"
 git -C "$FX" init -q >/dev/null 2>&1; git -C "$FX" add -A >/dev/null 2>&1
 git -C "$FX" -c user.email=t@example.com -c user.name=t -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -q --no-verify -m fixture >/dev/null 2>&1
 fx_run() { # [K=V ...] -- one fixture sweep, output in $T/fx.out; exit status is the sweep's
-  ( cd "$FX" && env -u HMD_TEST_STRICT_TMP -u HMD_TEST_TMP_LEAK_MAX_MB -u HMD_TEST_TMP_WATCH -u HMD_TEST_SOCK_HEADROOM TMPDIR="$T/ert" HEIMDALL_HOME="$T/hh" HMD_TEST_MIN_FREE_GB=0 "$@" bash "$FX/test/run-all.sh" --min 1 --jobs 2 --no-retry > "$T/fx.out" 2>&1 )
+  ( cd "$FX" && env -u HMD_TEST_STRICT_TMP -u HMD_TEST_TMP_LEAK_MAX_MB -u HMD_TEST_TMP_WATCH -u HMD_TEST_SOCK_HEADROOM TMPDIR="$ERT" HEIMDALL_HOME="$T/hh" HMD_TEST_MIN_FREE_GB=0 "$@" bash "$FX/test/run-all.sh" --min 1 --jobs 2 --no-retry > "$T/fx.out" 2>&1 )
 }
 cat > "$FX/test/clean.test.sh" <<'EOF'
 d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT; echo x > "$d/f"
@@ -210,7 +221,7 @@ if jq -e '.tmp_leaks | length == 1 and .[0].suite == "leaky.test.sh" and .[0].by
 if grep -q "$MARK-hardcoded" "$T/fx.out" && jq -e --arg m "$MARK-hardcoded" '.tmp_outside | map(select((.path | contains($m)) and (.suites | index("outside.test.sh")))) | length == 1' "$RCPT" >/dev/null 2>&1; then ok "a hard-coded /tmp write is caught, attributed to outside.test.sh, printed and in the receipt (tmp_outside)"; else bad "outside: $(grep -E 'outside|hardcoded' "$T/fx.out") receipt=$(jq -c .tmp_outside "$RCPT" 2>&1)"; fi
 if jq -e '.tmp_dirs["clean.test.sh"] == "s0" and .tmp_dirs["leaky.test.sh"] == "s1" and .tmp_dirs["outside.test.sh"] == "s2" and (.tmp_root | test("/hr\\.[A-Za-z0-9]+$"))' "$RCPT" >/dev/null 2>&1; then ok "the receipt keeps the name -> dir map (clean=s0, leaky=s1, outside=s2) and the run root (hr.XXXX), so a path in a log traces back to its suite"; else bad "receipt map: $(jq -c '{tmp_root, tmp_dirs}' "$RCPT" 2>&1)"; fi
 if jq -e '.tmp_sock | (.headroom | type) == "number" and .target == 60 and .need == 0 and .dir != ""' "$RCPT" >/dev/null 2>&1; then ok "the receipt records the socket headroom, the 60-byte target and the need (0: the fixture binds no unix socket)"; else bad "receipt tmp_sock: $(jq -c .tmp_sock "$RCPT" 2>&1)"; fi
-if [ -z "$(ls -A "$T/ert")" ]; then ok "after the sweep nothing is left under the runner's TMPDIR: every suite's dir and the temp root are gone"; else bad "left under TMPDIR: $(ls -A "$T/ert")"; fi
+if [ -z "$(ls -A "$ERT")" ]; then ok "after the sweep nothing is left under the runner's TMPDIR: every suite's dir and the temp root are gone"; else bad "left under TMPDIR: $(ls -A "$ERT")"; fi
 rm -f "$FX/test/outside.test.sh"
 fx_run HMD_TEST_TMP_LEAK_MAX_MB=1; RC=$?
 if [ "$RC" -eq 1 ] && grep -q 'TMP LEAK (1)' "$T/fx.out" && grep -q 'RUN RED' "$T/fx.out" && jq -e '.exit_code == 1' "$RCPT" >/dev/null 2>&1; then ok "a leftover over HMD_TEST_TMP_LEAK_MAX_MB fails the sweep (exit 1, RUN RED, receipt exit_code 1)"; else bad "limit sweep rc=$RC: $(tail -20 "$T/fx.out")"; fi
@@ -255,8 +266,8 @@ OUT="$(dfpf SHIM_DF_FREE_KB=1024 HMD_TEST_MIN_FREE_GB=0)"
 if [ "$(cat "$T/dfpf.rc")" = 0 ] && [ -z "$OUT" ]; then ok "HMD_TEST_MIN_FREE_GB=0 turns the check off (1 MB free passes)"; else bad "min 0: rc=$(cat "$T/dfpf.rc") out=$OUT"; fi
 OUT="$(dfpf SHIM_DF_FAIL=1)"
 if [ "$(cat "$T/dfpf.rc")" = 0 ] && printf '%s' "$OUT" | grep -q 'could not read the free space'; then ok "a df that cannot answer skips the check with a notice (a preflight never blocks a sweep on a broken df)"; else bad "df fails: rc=$(cat "$T/dfpf.rc") out=$OUT"; fi
-fx_run PATH="$T/dfshim:$PATH" SHIM_DF_LOW_PATH="$T/ert" SHIM_DF_LOW_KB=1048576 HMD_TEST_MIN_FREE_GB=5 HEIMDALL_HOME="$T/hh-refused"; RC=$?
-if [ "$RC" -eq 5 ] && grep -q 'refusing to start' "$T/fx.out" && grep -q '1.0 GB' "$T/fx.out" && ! grep -q '^progress' "$T/fx.out" && [ ! -e "$T/hh-refused" ] && [ -z "$(ls -A "$T/ert")" ]; then ok "through the real run-all.sh: exit 5, no suite ran, and nothing exists afterwards -- no HEIMDALL_HOME (so no lock, marker or receipt), no temp root"; else bad "refused sweep rc=$RC hh=$([ -e "$T/hh-refused" ] && echo present || echo absent) ert=$(ls -A "$T/ert"): $(tail -12 "$T/fx.out")"; fi
+fx_run PATH="$T/dfshim:$PATH" SHIM_DF_LOW_PATH="$ERT" SHIM_DF_LOW_KB=1048576 HMD_TEST_MIN_FREE_GB=5 HEIMDALL_HOME="$T/hh-refused"; RC=$?
+if [ "$RC" -eq 5 ] && grep -q 'refusing to start' "$T/fx.out" && grep -q '1.0 GB' "$T/fx.out" && ! grep -q '^progress' "$T/fx.out" && [ ! -e "$T/hh-refused" ] && [ -z "$(ls -A "$ERT")" ]; then ok "through the real run-all.sh: exit 5, no suite ran, and nothing exists afterwards -- no HEIMDALL_HOME (so no lock, marker or receipt), no temp root"; else bad "refused sweep rc=$RC hh=$([ -e "$T/hh-refused" ] && echo present || echo absent) ert=$(ls -A "$ERT"): $(tail -12 "$T/fx.out")"; fi
 fx_run PATH="$T/dfshim:$PATH" HMD_TEST_MIN_FREE_GB=5; RC=$?
 if [ "$RC" -eq 0 ] && grep -q 'RUN GREEN' "$T/fx.out"; then ok "the same sweep with 500 GB free runs normally"; else bad "control sweep rc=$RC: $(tail -12 "$T/fx.out")"; fi
 
@@ -282,7 +293,7 @@ if [ "$RC" -eq 1 ] && [ "$SOCK_HEADROOM" -lt "$SOCK_NEED" ] && grep -q 'refusing
 rm -f "$FX"/test/*.test.sh
 printf '#!/usr/bin/env bash\n# AF_UNIX binder with an absurdly long socket name\nsock="$D/%s.sock"\n' "$(printf '%0100d' 0 | tr 0 x)" > "$FX/test/sock.test.sh"
 fx_run HEIMDALL_HOME="$T/hh-refused"; RC=$?
-if [ "$RC" -eq 6 ] && grep -q 'refusing to start' "$T/fx.out" && grep -q 'sock.test.sh builds one' "$T/fx.out" && ! grep -q '^progress' "$T/fx.out" && [ ! -e "$T/hh-refused" ] && [ -z "$(ls -A "$T/ert")" ]; then ok "through the real run-all.sh: a suite whose socket path cannot fit any TMPDIR -> exit 6 before anything exists (no HEIMDALL_HOME, no temp root)"; else bad "socket refusal rc=$RC hh=$([ -e "$T/hh-refused" ] && echo present || echo absent) ert=$(ls -A "$T/ert"): $(tail -12 "$T/fx.out")"; fi
+if [ "$RC" -eq 6 ] && grep -q 'refusing to start' "$T/fx.out" && grep -q 'sock.test.sh builds one' "$T/fx.out" && ! grep -q '^progress' "$T/fx.out" && [ ! -e "$T/hh-refused" ] && [ -z "$(ls -A "$ERT")" ]; then ok "through the real run-all.sh: a suite whose socket path cannot fit any TMPDIR -> exit 6 before anything exists (no HEIMDALL_HOME, no temp root)"; else bad "socket refusal rc=$RC hh=$([ -e "$T/hh-refused" ] && echo present || echo absent) ert=$(ls -A "$ERT"): $(tail -12 "$T/fx.out")"; fi
 rm -f "$FX"/test/*.test.sh
 
 echo "-- 10. wiring in run-all.sh --"
