@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# heimdall-disk-floor -- is there enough free disk to work? The same check the Agent hook, the Bash hook and the test sweep make
+# (bin/lib/hmd_disk_floor.sh holds the one definition and the reasoning), for a human.
+#
+#   heimdall-disk-floor check [--path P]...   one line per path: `ok:` or `BELOW:` -- free GB, free % of the volume, the volume, the floor.
+#                                             No --path: TMPDIR (or /tmp) and the current directory, the two volumes the hooks look at.
+#   heimdall-disk-floor -h | --help           this text
+#
+# exit 0   at or above the floor (or the floor is off, or df could not answer: a warning on stderr -- fail open, like the hooks)
+# exit 1   a volume is below the floor
+# exit 2   usage
+#
+# HMD_MIN_FREE_PCT=N   the floor, a whole percent of the volume (default 10; 0 = off). A hook reads it from the environment Claude Code runs in.
+#                      The test sweep also keeps its own absolute floor, HMD_TEST_MIN_FREE_GB (default 5): whichever is stricter refuses.
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"; fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB="$BIN_DIR/lib/hmd_disk_floor.sh"
+
+usage() { sed -n '2,14p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  check) shift ;;
+  *) usage >&2; echo "usage: heimdall-disk-floor check [--path P]..." >&2; exit 2 ;;
+esac
+
+paths=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --path)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "heimdall-disk-floor: --path needs a directory" >&2; echo "usage: heimdall-disk-floor check [--path P]..." >&2; exit 2; }
+      paths+=("$2"); shift 2 ;;
+    *) echo "heimdall-disk-floor: unknown argument '$1'" >&2; echo "usage: heimdall-disk-floor check [--path P]..." >&2; exit 2 ;;
+  esac
+done
+[ "${#paths[@]}" -gt 0 ] || paths=("${TMPDIR:-/tmp}" "$PWD")
+
+# shellcheck source=lib/hmd_disk_floor.sh disable=SC1091  # the path is derived from this script's own location at runtime
+. "$LIB" || { echo "heimdall-disk-floor: cannot read $LIB" >&2; exit 2; }
+
+pct="$(hmd_disk_floor_pct)"
+if [ "$pct" -eq 0 ]; then echo "floor off (HMD_MIN_FREE_PCT=0): nothing checked"; exit 0; fi
+
+tab=$'\t'
+rc=0
+for p in "${paths[@]}"; do
+  st="$(hmd_disk_floor_stat "$p")"
+  free="${st%%"$tab"*}"; rest="${st#*"$tab"}"; size="${rest%%"$tab"*}"; mnt="${rest#*"$tab"}"
+  case "$free" in ''|*[!0-9]*) free="" ;; esac
+  case "$size" in ''|*[!0-9]*|0) size="" ;; esac
+  if [ -z "$free" ] || [ -z "$size" ]; then
+    echo "heimdall disk floor: could not read the free space of the volume holding $p with df -- no disk check for it, allowing" >&2
+    continue
+  fi
+  if hmd_disk_floor_below "$free" "$size" "$pct"; then
+    echo "BELOW: $(hmd_disk_floor_line "$free" "$size" "$p" "$mnt" "$pct")"
+    rc=1
+  else
+    echo "ok: $(hmd_disk_floor_fmt "$free" "$size") free on the volume holding $p (mounted on $mnt); the floor is ${pct}% free"
+  fi
+done
+exit "$rc"
