@@ -134,10 +134,15 @@ AGENT_MATCHERS=$(jq -r '[.hooks.PreToolUse[] | select(.matcher == "Agent")] | le
 # fence (unlike adjudication/coop) fires unconditionally and would otherwise
 # reach the real bin/heimdall-ctx-meter against this machine's real, ambient,
 # cross-session context state — see the long note in section 3 above.
+#
+# HMD_MIN_FREE_PCT=0 is set in both for the same reason, about the disk instead: the disk
+# floor fence (2.4.8) fires unconditionally too, and would otherwise read THIS machine's
+# free space and deny every spawn here whenever it is under the floor (it was at 7.1% when
+# the fence was added). The fence's own proof is test/disk-floor.test.sh, under a fake df.
 fire() {
   (
     cd "$SANDBOX" || exit 99
-    CLAUDE_PLUGIN_ROOT="$REPO" HMD_CTX_GATE_OFF=1 sh "$GATE" < "$1" >"$OUT" 2>"$ERR"
+    CLAUDE_PLUGIN_ROOT="$REPO" HMD_CTX_GATE_OFF=1 HMD_MIN_FREE_PCT=0 sh "$GATE" < "$1" >"$OUT" 2>"$ERR"
   )
   RC=$?
 }
@@ -146,7 +151,7 @@ fire() {
 fire_muted() {
   (
     cd "$SANDBOX" || exit 99
-    CLAUDE_PLUGIN_ROOT="$REPO" HEIMDALL_ALLOW_NAMED_AGENT=1 HMD_CTX_GATE_OFF=1 sh "$GATE" < "$1" >"$OUT" 2>"$ERR"
+    CLAUDE_PLUGIN_ROOT="$REPO" HEIMDALL_ALLOW_NAMED_AGENT=1 HMD_CTX_GATE_OFF=1 HMD_MIN_FREE_PCT=0 sh "$GATE" < "$1" >"$OUT" 2>"$ERR"
   )
   RC=$?
 }

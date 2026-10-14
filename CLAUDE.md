@@ -124,6 +124,34 @@ verdict to a state of the code that never existed.
   absolute load threshold to block a sweep; it can stay high for hours and defer the run
   forever. On a shared busy machine, lower `--jobs` instead of waiting. When the bound
   passes, the sweep runs anyway with half the jobs and `HMD_TEST_REDUCED_PARALLELISM=1`.
+- **Disk floor — 10% free, enforced by hooks (2.4.8; operator directive 2026-10-14).**
+  Agent spawns, test runs and single test files all stop below a floor of free disk: a
+  full disk fails in ways that look like bugs, and the dev machine was at 7.1% free
+  (16.4 GB of 228 GB) while agents ran suites that write fixtures, clones and temp data.
+  One definition, `bin/lib/hmd_disk_floor.sh`: the free percent of the volume holding
+  TMPDIR and of the one holding the repo (`df -Pk`, Available ÷ size — not df's own
+  Capacity column, which on APFS leaves out every other volume of the container),
+  against `HMD_MIN_FREE_PCT` (default 10; the operator runs 7 for now; 0 turns it off; a
+  typo such as `7%` is the default, said on stderr, never a silent off). Three
+  enforcement points: **(1)** the Agent hook (`bin/heimdall-precheck-agent`) DENIES a
+  spawn, ahead of the in-process cap so a refused spawn stakes no lease; **(2)** the Bash
+  hook (`bin/heimdall-precheck-bash`) DENIES a command that RUNS a `*.test.sh` or
+  `test/run-all.sh` (`bash test/x.test.sh`, `./test/x.test.sh`, `cd d && bash x.test.sh`,
+  an env prefix, `time`/`timeout`, `sh -c` — never `bash -n`, `cat`, `grep`, `git add` or a
+  commit message that only mentions one): one central check, no test file edited;
+  **(3)** `test/run-all.sh` REFUSES to start (exit 5, nothing left behind) beside its
+  absolute floor `HMD_TEST_MIN_FREE_GB` (default 5; whichever is stricter refuses), and
+  asks again before every suite and every solo re-run: once a floor is crossed mid-sweep
+  it launches nothing more, the unstarted suites are `REFUSED` (a table row,
+  `suites_refused` and `disk_floor` in the receipt, and in `non_green_suites` so the next
+  incremental sweep carries them forward) and the run is red (exit 1) — a sweep cut short
+  never reads as a sweep that passed. Set the override in the environment Claude Code
+  runs in: a hook reads its own environment, so an inline `HMD_MIN_FREE_PCT=5 bash
+  test/x.test.sh` reaches the test but not the hook that has already said no. A df that
+  cannot answer warns and allows — this is a resource guard, not a security gate. A suite
+  that drives the REAL spawn hook pins `HMD_MIN_FREE_PCT=0` (as `agent-name-gate` pins
+  `HMD_CTX_GATE_OFF=1`) so it never depends on the disk it runs on. `bin/heimdall-disk-floor
+  check` shows where you stand. Proof: `test/disk-floor.test.sh`.
 - **Start it only when no follow-up fix is still possible.** A sweep begun while a
   reviewer, verifier or agent can still hand back a change is spent the moment that
   change lands, and a cancelled sweep costs the same half hour as a finished one.

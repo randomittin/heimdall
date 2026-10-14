@@ -87,6 +87,41 @@ if [ "${HEIMDALL_ALLOW_NAMED_AGENT:-}" != "1" ]; then
   fi
 fi
 
+# -- disk floor fence (2.4.8) --------------------------------------------------
+# A spawned agent writes: its worktree, temp files, test fixtures, git objects. The dev machine was at 7.1% free when this was added (operator
+# directive 2026-10-14: "a disk-space floor of 10%, enforced by hooks: agent spawns, test runs, each test file"), and a full disk fails in ways
+# that look like bugs. So a spawn is DENIED while the volume holding TMPDIR, or the volume holding the session's repo (the payload's cwd, else
+# this process's), is under HMD_MIN_FREE_PCT free (default 10; 0 = off). bin/lib/hmd_disk_floor.sh is the one definition, shared with the Bash
+# hook and the test sweep; its header has the reasoning (how free percent is computed, the knob, why a typo in it is the default).
+#
+# ORDER: ahead of the in-process cap below, deliberately. That section STAKES A LEASE when it allows a spawn, so a spawn this fence refuses
+# must never reach it; and it is two df calls, cheaper than the context meter and the brief builder further down.
+#
+# FAILS OPEN, like the cap (the other resource ceiling here) and the opposite of the adjudication fence: no lib next to this script (a sandbox
+# copy), a lib that will not source, no jq (the cwd then falls back to this process's), or a df that cannot answer (the lib warns on stderr) is
+# ALLOW. Only a volume that was READ and is under the floor denies. No bypass flag beyond the knob itself: HMD_MIN_FREE_PCT=<n> lowers the
+# floor and 0 switches it off, in the environment Claude Code runs in (this hook reads its own environment, not the spawn's).
+DISK_LIB="$BIN_DIR/lib/hmd_disk_floor.sh"
+# shellcheck source=lib/hmd_disk_floor.sh disable=SC1091  # path is $BIN_DIR-derived at runtime; the default run never opens sourced files, source= is for -x
+if [ -r "$DISK_LIB" ] && . "$DISK_LIB" 2>/dev/null && command -v hmd_disk_floor_check >/dev/null 2>&1; then
+  DISK_CWD=""
+  if [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
+    DISK_CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)" || DISK_CWD=""
+  fi
+  DISK_LINES="$(hmd_disk_floor_check "${TMPDIR:-/tmp}" "${DISK_CWD:-$PWD}")"
+  if [ $? -eq 1 ]; then
+    DISK_REASON="BIFROST - Heimdall disk floor: spawn REFUSED -- ${DISK_LINES//$'\n'/; }. A spawned agent writes (its worktree, temp files, test fixtures, git objects) and a full disk fails in ways that look like bugs. Free space first (hmd system-health, or the mac-deep-clean skill), or lower the floor on purpose: set HMD_MIN_FREE_PCT=<n> in the environment Claude Code runs in (0 turns it off). Where you stand: bin/heimdall-disk-floor check."
+    DISK_JSON="$(jq -cn --arg r "$DISK_REASON" '{error: $r}' 2>/dev/null)"
+    if [ -z "$DISK_JSON" ]; then
+      DISK_JSON='{"error": "BIFROST - Heimdall disk floor: spawn REFUSED -- free disk is under the floor (see stderr for the detail; HMD_MIN_FREE_PCT lowers the floor, 0 turns it off)."}'
+    fi
+    printf '%s\n' "$DISK_JSON"
+    printf '%s\n' "$DISK_REASON" >&2
+    exit 2
+  fi
+fi
+# -- end disk floor fence ------------------------------------------------------
+
 # -- in-process agent concurrency cap (Task 3.1) -----------------------------
 # WHY bin/agent-pool IS NOT REUSED HERE (read this before touching this
 # section). The original design for this task

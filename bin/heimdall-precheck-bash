@@ -68,10 +68,11 @@ case "${1:-}" in
   -h|--help) sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-# SINCE THE EXTRACTION — four deliberate deltas from the historical inline chain
+# SINCE THE EXTRACTION — five deliberate deltas from the historical inline chain
 # (2026-10-11, "precheck never blocks silently in another repo"; then "never execute the session's
-# repo"; 2026-10-13, "each repo's own checks, not heimdall's"). test/heimdall-precheck-bash.test.sh
-# cases 17, 21 and 24-29 pin the first three, test/heimdall-push-gate-per-repo.test.sh the fourth;
+# repo"; 2026-10-13, "each repo's own checks, not heimdall's"; 2.4.8, "a disk-space floor").
+# test/heimdall-precheck-bash.test.sh cases 17, 21 and 24-29 pin the first three,
+# test/heimdall-push-gate-per-repo.test.sh the fourth, test/disk-floor.test.sh the fifth;
 # every other branch is still byte-identical to the inline string.
 #
 #   1. deny(): a deny states its verdict on stderr TOO. Claude Code surfaces ONLY stderr for an
@@ -129,6 +130,17 @@ esac
 #      be entered blocks. The change only ever narrows a gate to the repository pushed. NOT relaxed, and still reading the CWD repo
 #      as they always did: the push-range secret scan, the full-history self-scan and the oracle and corpus
 #      stages below (and, earlier in the chain, the commit secret scan, git-guard and the kill guard).
+#   5. DISK FLOOR (2.4.8; operator directive 2026-10-14: "a disk-space floor of 10%, enforced by hooks: agent spawns, test runs, each test file"). A command that RUNS a test file
+#      (`bash test/x.test.sh`, `./test/x.test.sh`, `cd d && bash x.test.sh`, any *.test.sh) or the sweep (test/run-all.sh) is DENIED while the volume holding TMPDIR, or the one
+#      holding the session's repo (the payload's cwd, else this process's), is under HMD_MIN_FREE_PCT free (default 10; 0 = off). A test writes fixtures, clones and temp data,
+#      and a full disk fails in ways that look like bugs. This is the one place that can stop a SINGLE test file run by hand: run-all.sh checks for itself, the 500 files do not,
+#      and this hook sees every command, so no test file is edited. bin/lib/hmd_disk_floor.sh is the one definition (shared with the Agent hook and the sweep) and says how free
+#      percent is computed and why a typo in the knob is the default. The matcher is the push matcher's idea of a COMMAND WORD (start of line, after ; & | ( { ` $( ! then/do/else,
+#      env assignments and wrapper words, `sh -c` strings), then an optional shell with flags (never -n: noexec runs nothing), then a path that ends in .test.sh or is run-all.sh:
+#      text that only MENTIONS a test file (cat, grep, git add, echo, a commit message) is not a run and never reaches df. Best-effort, not a boundary: indirection no regex can
+#      see (`bash "$f"`, a loop over a glob) is not caught, and run-all.sh checks for itself. FAILS OPEN, like the Agent hook's fence: no lib in the plugin root, or a df that cannot
+#      answer (the lib warns on stderr), is an allow; only a volume that was READ and is under the floor denies. HMD_MIN_FREE_PCT is read from THIS hook's environment (the one Claude
+#      Code runs in): an inline `HMD_MIN_FREE_PCT=5 bash test/x.test.sh` reaches the test, not this hook, which has already said no.
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
 
 INPUT=$(cat)
@@ -155,6 +167,29 @@ GP_START='(^|[;&|({`!]|\$\(|(^|[[:space:]])(then|do|else|elif)[[:space:]]|(sh|ba
 GP_PRE='([A-Za-z_][A-Za-z0-9_]*='"$GP_VAL"'[[:space:]]+|(sudo|command|env|exec|time|nohup|nice|builtin|xargs)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)*'
 GP_OPT='([[:space:]]+(-[Cc][[:space:]]+'"$GP_VAL"'|--(git-dir|work-tree|namespace|super-prefix|config-env)[[:space:]]+'"$GP_VAL"'|--?[A-Za-z][A-Za-z-]*(='"$GP_VAL"')?))*'
 GP_RE="${GP_START}${GP_PRE}([^[:space:]]*/)?git${GP_OPT}[[:space:]]+push([[:space:]]|\$|[;&|)}\"${SQ}])"
+# DISK FLOOR (delta 5 in the header above). The `case` is the cheap pre-filter and the ONLY statement every other command runs: a bash builtin whose xtrace line
+# test/heimdall-precheck-bash.test.sh's equiv() already drops, so its byte-for-byte comparison against the historical inline chain is untouched. Everything below it
+# (the regex, the lib, df) runs only for a command that names a *.test.sh or run-all.sh -- and denies only when that command RUNS one.
+case $CMD in
+  *test.sh*|*run-all.sh*)
+    DF_PATH='["'"$SQ"']?([^[:space:]"'"$SQ"';&|()<>]*/)?([A-Za-z0-9_.+-]+\.test|run-all)\.sh'
+    # a shell may carry flags before the script (-x, -e, -u, -o pipefail, --norc ...) but never -n: noexec reads the file and runs nothing
+    DF_FLAGS='(-[A-Za-mo-z]+[[:space:]]+|[-+]o[[:space:]]+[A-Za-z]+[[:space:]]+|--[A-Za-z-]+[[:space:]]+)*'
+    DF_WRAP='((g?timeout)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*[0-9][0-9.]*[smhd]?[[:space:]]+|caffeinate[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)*'
+    DF_RE="${GP_START}${GP_PRE}${DF_WRAP}((sh|bash|zsh|dash|ksh)[[:space:]]+${DF_FLAGS}|(source|\.)[[:space:]]+)?${DF_PATH}(\$|[[:space:];&|)\"${SQ}])"
+    if printf '%s\n' "$CMD" | grep -qE "$DF_RE"; then
+      DF_LIB="$PLUGIN/bin/lib/hmd_disk_floor.sh"
+      # shellcheck source=lib/hmd_disk_floor.sh disable=SC1091  # the path is $PLUGIN-derived at runtime; the default run never opens sourced files, source= is for -x
+      if [ -r "$DF_LIB" ] && . "$DF_LIB" 2>/dev/null && command -v hmd_disk_floor_check >/dev/null 2>&1; then
+        DF_CWD=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
+        DF_LINES=$(hmd_disk_floor_check "${TMPDIR:-/tmp}" "${DF_CWD:-$PWD}")
+        if [ $? -eq 1 ]; then
+          DF_ESC=$(printf '%s' "${DF_LINES//$'\n'/; }" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: disk floor: %s. This command runs a test file or the sweep, which writes fixtures, clones and temp data, and a full disk fails in ways that look like bugs. Free space first (hmd system-health, or the mac-deep-clean skill), or lower the floor on purpose: set HMD_MIN_FREE_PCT=<n> (0 turns it off) in the environment Claude Code runs in -- an inline HMD_MIN_FREE_PCT=<n> before the command reaches the test but not this hook, which reads its own environment and has already said no. Where you stand: bin/heimdall-disk-floor check."}' "$DF_ESC")"
+        fi
+      fi
+    fi ;;
+esac
 # KILLS BY NAME OR BY A COMPUTED PID are denied (2026-10-12 16:29Z incident). A sub-agent debugging its own temp-repo test ran
 # `pkill -f heimdall-relay-client`; the pattern matched EVERY relay client on the machine -- the operator's two live phone
 # clients and the routine's -- and a client answers SIGTERM by revoking its phone pairing, so both phones were unpaired. A text
