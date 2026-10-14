@@ -731,6 +731,15 @@ else
 fi
 echo "python3 pin: $HMD_PY_PIN_NOTE"
 
+# ── SESSION-LOGIN STORE (test harness only) ──────────────────────────────────────────────
+# Since 2.4.8 a relay client saves its session login on every bind; the default store on macOS is the
+# login Keychain. A suite that forgets to sandbox it either stalls (no keychain under a throwaway HOME,
+# 2 x 20 s per bind) or writes test logins into the operator's real Keychain. Every suite therefore
+# inherits the 0600-file store unless the caller set one explicitly; a case that tests the Keychain path
+# sets HMD_SESSION_LOGIN_STORE itself.
+export HMD_SESSION_LOGIN_STORE="${HMD_SESSION_LOGIN_STORE:-file}"
+echo "session-login store: $HMD_SESSION_LOGIN_STORE"
+
 # ── REPO INTEGRITY, BEFORE SIDE (guarantee #8 above) ────────────────────────────────────
 # Snapshot the tree now, before suite #0 has even started. The AFTER side, and the full
 # rationale for what counts / what's excluded / how a violation gets attributed to a suite
