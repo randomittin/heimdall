@@ -18,7 +18,10 @@ node_modules/
 # is absent in a fresh clone and in every agent worktree — that absence is normal,
 # not a setup failure. Ignored under both the current and legacy (superx) names;
 # the rename left the heimdall name untracked-but-unignored, which showed up as
-# permanent `git status` noise for every user.
+# permanent `git status` noise for every user. A bare name (no slash) matches at EVERY
+# depth, so a nested copy needs no `**/` rule — packages/runheimdall/heimdall-state.json
+# was only ever committed because 4cd73d4c (a release sync) predates this rule, and an
+# ignore rule never un-tracks a file that is already committed.
 heimdall-state.json
 heimdall-state.json.lock
 # superx runtime state — never commit, contains user data
@@ -43,7 +46,12 @@ docs/superpowers/plans/
 # Ignore the runtime home's CONTENTS (so the real config + secrets + the
 # attestation store never commit) — but as `.heimdall/*` (not `.heimdall/`) so
 # git still DESCENDS into the dir and the single un-ignore below can take effect.
-.heimdall/*
+# `**/` because a pattern containing a slash is anchored to the repo root, so a bare
+# `.heimdall/*` never covered a `.heimdall/` dir further down the tree — which is how
+# skills/designmatch/.heimdall/ (runtime statusline/roster/wall caches) got committed by
+# a wip auto-checkpoint (1acd792b). The `!.heimdall/...` un-ignores below stay
+# root-anchored on purpose: only the root examples are source, a nested one never is.
+**/.heimdall/*
 .heimdall/attestations/
 # The telemetry NDJSON event store (.heimdall/telemetry/events*.ndjson): per-
 # checkout runtime metrics, local-first, NEVER committed. Already covered by
