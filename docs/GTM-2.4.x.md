@@ -12,7 +12,7 @@
 
 | Item | State today | Source |
 |---|---|---|
-| hmd 2.4.8 | Prepared, not shipped: `VERSION` and plugin.json read 2.4.7 and there is no v2.4.8 tag here. `release/ship.sh` does the bump, tag, Release and npm. 2.4.7 never reached npm, so npm users get both releases at once. | CHANGELOG [2.4.8] |
+| hmd 2.4.8 | Prepared, not shipped: `VERSION` and plugin.json read 2.4.7 and there is no v2.4.8 tag here. `release/ship.sh` does the bump, tag, Release and npm. 2.4.7 reached npm on 2026-10-15. | CHANGELOG [2.4.8] |
 | 2.4.8 for the phone | A stopped or crashed laptop client no longer unpairs it: the login sits in Keychain or a 0600 file and resumes for 24 h, for every paired phone. Only `hmd app disconnect`, `--device` or a phone revoke unpairs. No relay deploy. | CHANGELOG [2.4.8] |
 | runhmd app 1.2.0 | iOS build 14 on TestFlight internal, Android versionCode 20 on Play internal (2026-10-13). No public TestFlight link or Play open-test track is recorded: OPEN. | hmdapp app.json, 4cae519e |
 
@@ -29,7 +29,7 @@
 
 | Channel | Asset and lead | Owner |
 |---|---|---|
-| GitHub release notes | `ship.sh` derives them from commits; the prose is editable after (CHANGELOG [2.4.8]). Lead: "Your phone stays paired when the laptop client stops (24 h). Second phone: `hmd app add-device`. Take 2.4.8; 2.4.7 never reached npm." Publishing the Release is what rolls existing installs forward (auto-update). | hmd drafts, operator edits |
+| GitHub release notes | `ship.sh` derives them from commits; the prose is editable after (CHANGELOG [2.4.8]). Lead: "Your phone stays paired when the laptop client stops, restarts or Claude Code resumes; re-pair once after upgrading. Second phone: `hmd app add-device`." Publishing the Release is what rolls existing installs forward (auto-update). | hmd drafts, operator edits |
 | Site changelog, homepage | Separate repo (release/HOSTING.md); a push deploys it. It has no changelog page (`log.html` is "The Log"): OPEN new page or log.html. Homepage phone section (`index.html:292-311`) is stale: "not in a tagged release", invite-only, diff and attach "not built", "paired by QR"; so is `how-it-works.html:430`. Privacy page still says "No accounts" (`privacy.html:83`, effective 2026-10-05); corrected text: hmdapp `docs/store/privacy-page.md`. Add both store links; site version pins are manual in 2.4.8. Deferred out of 2.4.8: BACKLOG. | hmd drafts, operator pushes |
 | npm README | `runheimdall`'s is a byte copy of README.md (`test/npm-readme-drift.test.sh`); `runhmd` has its own. A README ships in the tarball, so land a short Phone section before ship, with scoped claims only. OPEN: NAMING.md:9 says the `runhmd` npm name is not yet claimed. | hmd drafts, operator ships |
 | X post, Show HN, demo | Below. House HN rules (docs/specs/heimdall-ship-spec.md L1): no superlatives, Tue/Wed/Thu 7-8pm IST. `launch-docs/SHOW-HN-DRAFT.md` is a different story marked READY TO POST, with no record of posting: OPEN which Show HN goes first. | operator posts and records |
