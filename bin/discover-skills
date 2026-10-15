@@ -11,6 +11,13 @@ PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 SKILLS_DIR="$HOME/.claude/skills"
 REGISTRY="$PLUGIN_DIR/skills-registry.json"
 
+# Receipted installs (bin/lib/install-receipt.sh). HMD_RUN_ID is inherited from the launching session, so a
+# skill installed mid-session lands in that run's receipt; run by hand it goes to the "manual" one.
+if [ -f "$PLUGIN_DIR/bin/lib/install-receipt.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$PLUGIN_DIR/bin/lib/install-receipt.sh"
+fi
+
 # File extension → skill domain mapping (bash 3.2 compatible)
 ext_to_domain() {
   case "$1" in
@@ -94,7 +101,7 @@ for s in reg.get('skills', []):
 
   mkdir -p "$SKILLS_DIR"
   echo "INSTALLING: $name from $repo..."
-  if git clone --depth 1 "https://github.com/${repo}.git" "$skill_path" 2>/dev/null; then
+  if hmd_skill_install "$name" "$repo" "$skill_path" discover-skills; then
     echo "OK: Installed $name to $skill_path"
 
     # Auto-create SKILL.md if missing (needed for Claude Code skill discovery)

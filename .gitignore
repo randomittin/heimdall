@@ -75,6 +75,8 @@ docs/superpowers/plans/
 # cover. Ignore them at the root so a stray `git add .` in the install clone can NEVER
 # stage a dev's enroll token or seed. (The .example template above is the only
 # committed form; the real token lives 0600 in $HOME, never tracked.)
+# Per-run install receipts (bin/lib/install-receipt.sh) land at the install clone's root too.
+/receipts/
 /cp-endpoint.json
 /pki/
 /identity.json

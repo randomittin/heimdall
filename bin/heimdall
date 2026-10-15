@@ -55,6 +55,18 @@ if [ -f "$PLUGIN_DIR/bin/lib/real-home.sh" ]; then
   . "$PLUGIN_DIR/bin/lib/real-home.sh" 2>/dev/null || true
 fi
 
+# One id for THIS launch. It scopes the auto-install receipt (bin/lib/install-receipt.sh), so the Run
+# Receipt (`summary-card --receipt`, run by the SessionEnd hook inside this session's env) lists exactly
+# the installs this run triggered. An id the caller already set (a test, a nested hmd) wins.
+export HMD_RUN_ID="${HMD_RUN_ID:-run-$(date +%s)-$$}"
+# Receipted install helpers: hmd_install_known_plugin / hmd_marketplace_add / hmd_skill_install. Sourced
+# best-effort like the libs above; they ship in this same tree, so a missing file is a broken checkout and
+# every install call below then fails with "command not found" on stderr instead of installing silently.
+if [ -f "$PLUGIN_DIR/bin/lib/install-receipt.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$PLUGIN_DIR/bin/lib/install-receipt.sh" 2>/dev/null || true
+fi
+
 # ── First-run completion marker (USER-writable, NEVER the install dir) ──
 #
 # The marker MUST live in a user-writable path, NOT $PLUGIN_DIR. Live GCE failure:
@@ -1257,8 +1269,8 @@ first_run_setup() {
     local _sp_t0 _sp_rc=0
     _sp_t0="$(_tele_now_ms)"
     _tele_install_step skills started
-    claude plugins marketplace add anthropics/claude-plugins-official 2>/dev/null || true
-    claude plugins install superpowers 2>/dev/null || _sp_rc=$?
+    # Listed marketplace only (bin/lib/install-receipt.sh): receipted, and named on stderr when it fails.
+    hmd_install_known_plugin superpowers claude-plugins-official first-run || _sp_rc=$?
     if [ "$_sp_rc" -eq 0 ]; then
       _tele_install_step skills succeeded "$_sp_t0"
     else
@@ -1281,7 +1293,7 @@ first_run_setup() {
     local _mk_t0 _mk_rc=0
     _mk_t0="$(_tele_now_ms)"
     _tele_install_step skills started
-    claude plugins marketplace add randomittin/heimdall-marketplace 2>/dev/null || _mk_rc=$?
+    hmd_marketplace_add heimdall-marketplace first-run || _mk_rc=$?
     if [ "$_mk_rc" -eq 0 ]; then
       _tele_install_step skills succeeded "$_mk_t0"
     else
@@ -4062,7 +4074,10 @@ preinstall_plugins() {
   _try_install() {
     echo "$installed" | grep -q "$1" && return 0
     printf "  \033[38;2;0;212;255m▸ Installing %s\033[0m\n" "$1"
-    claude plugins install "$1" >/dev/null 2>&1 || true
+    # claude-plugins-official, named explicitly (a bare name used to resolve across EVERY registered
+    # marketplace). Receipted; a failure is reported on stderr by the helper and the launch goes on
+    # without the plugin, so this `|| true` follows a reported failure — it does not hide one.
+    hmd_install_known_plugin "$1" claude-plugins-official prompt-preinstall || true
   }
 
   # From prompt keywords
@@ -4080,13 +4095,8 @@ preinstall_plugins() {
   [ -f "$WORK_DIR/Dockerfile" ] || [ -f "$WORK_DIR/docker-compose.yml" ] && _try_install "devops-toolkit"
   [ -f "$WORK_DIR/prisma/schema.prisma" ] || [ -f "$WORK_DIR/ormconfig.json" ] && _try_install "database-toolkit"
 
-  # External skill marketplaces (add once, available forever)
-  _try_marketplace() {
-    claude plugins marketplace list 2>/dev/null | grep -q "$1" && return 0
-    printf "  \033[38;2;100;100;120m▸ Adding marketplace: %s\033[0m\n" "$1"
-    claude plugins marketplace add "$1" >/dev/null 2>&1 || true
-  }
-  _try_marketplace "wshobson/agents"
+  # No third-party marketplace is added here any more (it was unlisted and left no receipt): only the
+  # marketplaces named in bin/lib/install-receipt.sh's hmd_marketplace_source() are ever registered.
 
   printf "\n"
 }
@@ -4127,7 +4137,8 @@ for skill in reg.get('skills', []):
     fi
     printf "  \033[38;2;0;212;255m▸ Installing skill: %s\033[0m (%s)\n" "$name" "$repo"
     mkdir -p "$skills_dir"
-    git clone --depth 1 "https://github.com/${repo}.git" "$skill_path" 2>/dev/null || true
+    # Receipted; a failed clone is reported on stderr by the helper and the launch goes on without the skill.
+    hmd_skill_install "$name" "$repo" "$skill_path" discover_skills || true
   done <<< "$matches"
 }
 
@@ -4796,7 +4807,7 @@ DURING work: when you encounter ANY of these signals, STOP and check for missing
 - Building diagrams/architecture docs → need mermaid skill?
 - Task quality would benefit from a specialized skill you don't have → search for it
 HOW TO CHECK: Run \`ls ~/.claude/skills/\` to see installed skills. Run \`$PLUGIN_DIR/bin/discover-skills search \"<domain>\"\` to find new ones. Run \`$PLUGIN_DIR/bin/discover-skills install <name-or-repo>\` to install.
-ALSO install plugins: Read React/Vue/CSS → \`claude plugins install frontend-design\`. Read Dockerfile/k8s → \`claude plugins install devops-toolkit\`. Read SQL/ORM → \`claude plugins install database-toolkit\`.
+ALSO install plugins, only from the listed marketplace: Read React/Vue/CSS → \`claude plugins install frontend-design@claude-plugins-official\`. Read Dockerfile/k8s → \`claude plugins install devops-toolkit@claude-plugins-official\`. Read SQL/ORM → \`claude plugins install database-toolkit@claude-plugins-official\`. If an install fails say \"install failed, continuing without <name>\" and go on — never retry through another marketplace, never pass --yes.
 NEVER proceed with suboptimal output when a skill exists that could improve quality. Finding and installing the right skill mid-session is ALWAYS worth the 10-second cost.
 INVOKING SKILLS: Git-installed skills (in ~/.claude/skills/) appear in the Skill tool list by their name (NOT namespaced). Use \`Skill(ui-ux-pro-max)\` not \`Skill(superpowers:ui-ux-pro-max)\`. If a skill isn't in the list, check if it has SKILL.md — if not, read its CLAUDE.md directly via Read tool.
 

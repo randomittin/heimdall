@@ -368,6 +368,53 @@ _PY_RCPT="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || t
 rvis() { local s="$1"; printf "%s" "${#s}"; }
 rsp()  { local n="$1" o="" i; for ((i=0;i<n;i++)); do o="$o "; done; printf "%s" "$o"; }
 
+# render_installs GREEN RED DIM RESET — this run's auto-install receipt (bin/lib/install-receipt.sh): one
+# line per install attempt, `✓ name version · source` or `✗ install failed, continuing without <name> ·
+# source`. Only THIS run's file is read — $HMD_RUN_ID (exported by bin/heimdall, inherited by the
+# SessionEnd hook) or the HEIMDALL_RECEIPT_INSTALLS seam — and nothing is printed when the run installed
+# nothing, so a run without an auto-install renders the receipt it always did. Informational: installs
+# fail open, they are not a gate, so a failed install never changes the exit status.
+render_installs() {
+  local g="$1" red="$2" d="$3" r="$4" f="${HEIMDALL_RECEIPT_INSTALLS:-}" rid out n
+  if [ -z "$f" ] && [ -n "${HMD_RUN_ID:-}" ]; then
+    rid="$(printf '%s' "$HMD_RUN_ID" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+    f="${HEIMDALL_HOME:-$HOME/.heimdall}/receipts/installs-${rid}.ndjson"
+  fi
+  [ -n "$f" ] && [ -f "$f" ] && [ -n "$_PY_RCPT" ] || return 0
+  out="$("$_PY_RCPT" -c '
+import json, sys
+def a(v):
+    return str(v).encode("ascii", "replace").decode().replace("\t", " ").strip() or "-"
+rows = []
+for raw in open(sys.argv[1]):
+    try:
+        x = json.loads(raw)
+    except Exception:
+        continue
+    name = a(x.get("name", ""))
+    note = x.get("note") or ("install failed, continuing without " + name)
+    rows.append("\t".join([("ok" if x.get("result") == "ok" else "bad"), a(x.get("kind", "")), name, a(x.get("version", "")), a(x.get("source", "")), a(note)]))
+print(len(rows))
+for row in rows:
+    print(row)
+' "$f" 2>/dev/null)" || return 0
+  n="$(printf '%s\n' "$out" | sed -n '1p')"
+  [ "${n:-0}" -gt 0 ] 2>/dev/null || return 0
+  printf '  %bINSTALLS%b  %s this run\n' "$d" "$r" "$n"
+  printf '%s\n' "$out" | sed '1d' | while IFS=$'\t' read -r state kind name ver src note; do
+    if [ "$state" = "ok" ]; then
+      if [ "$kind" = "marketplace" ]; then
+        printf '  %b✓%b marketplace %s · %s\n' "$g" "$r" "$name" "$src"
+      else
+        printf '  %b✓%b %s %s · %s\n' "$g" "$r" "$name" "$ver" "$src"
+      fi
+    else
+      printf '  %b✗%b %s · %s\n' "$red" "$r" "$note" "$src"
+    fi
+  done
+  printf '\n'
+}
+
 render_receipt() {
   # ── strict-tty colour gate: a pipe / CI / NO_COLOR / --plain → zero ANSI ──
   local rcolor=0
@@ -697,6 +744,8 @@ print(d.get("rendered") or "—")
     printf "%s\n" "╚═ ${url} ${ffill}╝"
   fi
   printf "\n"
+
+  render_installs "$rG" "$rRED" "$rD" "$rR"
 
   # Exit status carries the same vocabulary verify-edits uses one layer down, so
   # a scripted caller reads the receipt the way a human reads the Bifröst row:

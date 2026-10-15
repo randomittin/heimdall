@@ -14,28 +14,27 @@ When a domain need isn't covered by any installed skill, **install it automatica
 
 | Domain detected | Plugin needed | Install command |
 |---|---|---|
-| Frontend / UI / React / CSS | frontend-design | `claude plugins install frontend-design` |
-| SEO / meta tags / sitemap | seo | `claude plugins install seo` |
-| MCP / tool server | mcp-server-dev | `claude plugins install mcp-server-dev` |
-| API design / OpenAPI | api-design | `claude plugins install api-design` |
-| Database / SQL / schema | database-toolkit | `claude plugins install database-toolkit` |
-| Docker / K8s / deploy | devops-toolkit | `claude plugins install devops-toolkit` |
-| Security / auth / OWASP | security-scanner | `claude plugins install security-scanner` |
-| Slack / notifications | slack | `claude plugins install slack` |
+| Frontend / UI / React / CSS | frontend-design | `claude plugins install frontend-design@claude-plugins-official` |
+| SEO / meta tags / sitemap | seo | `claude plugins install seo@claude-plugins-official` |
+| MCP / tool server | mcp-server-dev | `claude plugins install mcp-server-dev@claude-plugins-official` |
+| API design / OpenAPI | api-design | `claude plugins install api-design@claude-plugins-official` |
+| Database / SQL / schema | database-toolkit | `claude plugins install database-toolkit@claude-plugins-official` |
+| Docker / K8s / deploy | devops-toolkit | `claude plugins install devops-toolkit@claude-plugins-official` |
+| Security / auth / OWASP | security-scanner | `claude plugins install security-scanner@claude-plugins-official` |
+| Slack / notifications | slack | `claude plugins install slack@claude-plugins-official` |
 
 **Process:**
 1. Detect domains from the user's prompt (step 2a)
 2. Check installed plugins: `claude plugins list`
-3. For each needed plugin NOT installed:
+3. For each needed plugin NOT installed, install it from the listed marketplace by its full `plugin@marketplace` name, and read the result:
    ```bash
-   claude plugins install <plugin-name> 2>/dev/null || true
+   claude plugins install <plugin-name>@claude-plugins-official
    ```
+   If it fails, say `install failed, continuing without <plugin-name>` and carry on. Never swallow the error with `|| true`; never pass `--yes`.
 4. Announce: "Installed frontend-design plugin for UI work."
 5. Continue with the task — newly installed skills are immediately available
 
-**If plugin doesn't exist in marketplace:**
-- Check wshobson/agents marketplace: `claude plugins install <name>@wshobson`
-- If still not found, proceed without it — the core agents handle most work
+**If the plugin is not in the listed marketplace** (`claude-plugins-official`): proceed without it — the core agents handle most work. Do NOT add or search any other marketplace; only the sources named in `bin/lib/install-receipt.sh` (`hmd_marketplace_source`) are ever registered. Every install attempt, ok or failed, is recorded in the run receipt (`~/.heimdall/receipts/installs-<run id>.ndjson`) and listed by `summary-card --receipt`.
 
 **CRITICAL: Install BEFORE spawning agents.** If a coder agent needs frontend-design skills but they're not installed, the agent runs without them and produces worse output. Install first, spawn second.
 
@@ -57,7 +56,7 @@ Plugin needs aren't always obvious from the initial prompt. During execution, if
 
 **Process when discovered mid-task:**
 1. Pause current work (don't spawn the next agent yet)
-2. Install: `claude plugins install <plugin> 2>/dev/null || true`
+2. Install: `claude plugins install <plugin>@claude-plugins-official` (a failure is reported as `install failed, continuing without <plugin>`)
 3. Announce: "Discovered React codebase — installed frontend-design plugin."
 4. Run `/reload-plugins` to load newly installed skills
 5. Resume work — the new skills are now available to all agents
