@@ -63,6 +63,7 @@ cp "$REPO/bin/heimdall"            "$PLUG/bin/heimdall"
 cp "$REPO/bin/heimdall-telemetry" "$PLUG/bin/heimdall-telemetry"
 cp "$REPO/bin/lib/telemetry.py"   "$PLUG/bin/lib/telemetry.py"
 cp "$REPO/bin/lib/issue_queue.py" "$PLUG/bin/lib/issue_queue.py"
+cp "$REPO/bin/lib/install-receipt.sh" "$PLUG/bin/lib/install-receipt.sh"
 chmod +x "$PLUG/bin/heimdall" "$PLUG/bin/heimdall-telemetry"
 
 # ── A fake-binary dir: stand-ins for every command first_run_setup shells out to,

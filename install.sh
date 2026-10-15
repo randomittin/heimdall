@@ -931,6 +931,28 @@ sigil_handle() {
   printf '%s' "$h"
 }
 
+# install_hmd_plugin PLUGIN_DIR PLUGIN_ID REF — install the Heimdall plugin from the marketplace its own
+# clone provides (the clone IS the pin: it sits at the ref this installer fetched). A no-op when already
+# installed. The attempt is receipted and a failure is reported on stderr as `install failed, continuing
+# without <id>` (bin/lib/install-receipt.sh). The status is the CLI's; the caller carries on without the
+# plugin — the launcher resolves its components by path regardless — but never silently.
+install_hmd_plugin() {
+  local dir="$1" id="$2" ref="$3" rc=0
+  if claude plugins list 2>/dev/null | grep -q "$id"; then
+    return 0
+  fi
+  if declare -F hmd_plugin_install >/dev/null 2>&1; then
+    hmd_plugin_install "$id" "$dir" "$ref" install.sh "$(resolved_version "$dir")" || rc=$?
+  else
+    # A clone fetched at a ref older than the receipt lib: install as before, but still say so on failure.
+    claude plugins install "$id" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      printf '  ⚠ hmd: install failed, continuing without %s (no install receipt: this ref predates it)\n' "$id" >&2
+    fi
+  fi
+  return "$rc"
+}
+
 main() {
   # TEST SEAM: let the acceptance harness `source` this installer purely to unit-test
   # the pure helpers (ensure_dream_schedule gating, etc.) WITHOUT running a real network
@@ -1185,6 +1207,17 @@ main() {
   [ -n "$TELE_RUN_ID" ] || TELE_RUN_ID="run-install-$$"
   _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" fetch succeeded
 
+  # Install receipt (bin/lib/install-receipt.sh ships in the clone just fetched): the marketplace
+  # registration and plugin install below are receipted like every other auto-install. One id per
+  # installer run; the receipt lands in ~/.heimdall/receipts beside the launcher's own, not in the
+  # telemetry store (HEIMDALL_HOME above points that inside the footprint).
+  export HMD_RUN_ID="$TELE_RUN_ID"
+  export HMD_RECEIPTS_DIR="$PLUGIN_DIR/receipts"
+  if [ -f "$PLUGIN_DIR/bin/lib/install-receipt.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$PLUGIN_DIR/bin/lib/install-receipt.sh" || true
+  fi
+
   # Step: register marketplace (the local clone is its own marketplace).
   #
   # OPTIONAL step. Registration with the Claude CLI is convenience wiring — the
@@ -1218,6 +1251,8 @@ main() {
         "check the Claude CLI, then re-run the installer" \
         "plugin fetched at $PLUGIN_DIR"
     fi
+    # Named on stderr, not only in the stdout note below: the install goes on, but not silently.
+    printf '  ⚠ hmd: install failed, continuing without marketplace %s (source %s)\n' "$MARKETPLACE_NAME" "$PLUGIN_DIR" >&2
     step_ok "Registering Heimdall marketplace (skipped)"
     blank
     printf '   %s⚠ marketplace registration unavailable — continuing.%s\n' \
@@ -1229,15 +1264,33 @@ main() {
     blank
   fi
 
+  # Receipt the registration just attempted: the local clone, at the ref this installer pinned — not a
+  # marketplace anyone else controls. (Skipped only when the clone predates the receipt lib.)
+  if declare -F hmd_install_receipt >/dev/null 2>&1; then
+    if [ "$MKT_RC" -eq 0 ]; then
+      hmd_install_receipt marketplace "$MARKETPLACE_NAME" n/a "$PLUGIN_DIR" "$REF" ok install.sh || true
+    else
+      hmd_install_receipt marketplace "$MARKETPLACE_NAME" n/a "$PLUGIN_DIR" "$REF" failed install.sh \
+        "claude plugins marketplace rc $MKT_RC" || true
+    fi
+  fi
+
   # Step: install the plugin (hmd@heimdall).
   local PLG_T0; PLG_T0="$(_tele_now_ms)"
   _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" plugin started
   step_begin "Installing plugin ($PLUGIN_ID)"
-  if ! claude plugins list 2>/dev/null | grep -q "$PLUGIN_ID"; then
-    claude plugins install "$PLUGIN_ID" >/dev/null 2>&1 || true
+  local PLG_RC=0
+  install_hmd_plugin "$PLUGIN_DIR" "$PLUGIN_ID" "$REF" || PLG_RC=$?
+  if [ "$PLG_RC" -eq 0 ]; then
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" plugin succeeded "$PLG_T0"
+    step_ok "Installing plugin ($PLUGIN_ID)"
+  else
+    # The helper already named the failure on stderr and in the receipt; the install carries on
+    # without the plugin, and telemetry now says so instead of recording an unconditional success.
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" plugin failed "$PLG_T0" \
+      plugin-install-failed "claude plugins install exit $PLG_RC"
+    step_ok "Installing plugin ($PLUGIN_ID)" "failed, continuing without it"
   fi
-  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" plugin succeeded "$PLG_T0"
-  step_ok "Installing plugin ($PLUGIN_ID)"
 
   # Step: link entry points (hmd + heimdall) via SYMLINK (A0.7) — symlink, not
   # hardlink, so the launcher resolves its siblings in the plugin dir. REQUIRED
