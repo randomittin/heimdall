@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "heimdall",
-  "description": "Nothing ships unproven. Marketplace for Heimdall — the autonomous multi-agent orchestrator for Claude Code that turns one prompt into a finished project and keeps the merge blocked until the work is proven correct.",
+  "description": "Nothing ships unproven. Marketplace for Heimdall, the Claude Code plugin that makes your coding agent's work pass a test it didn't write — and proves that test can fail — before the push lands.",
   "owner": {
     "name": "Heimdall contributors",
     "url": "https://github.com/randomittin/heimdall"
@@ -10,7 +10,7 @@
     {
       "name": "hmd",
       "displayName": "Heimdall",
-      "description": "Heimdall — autonomous multi-agent orchestrator for Claude Code. Decomposes a prompt into waves, spawns parallel agents, wires an external falsifiable oracle so the implementation can never grade its own homework, and keeps the Bifröst closed until the work is proven correct. Live terminal-native HUD + end-of-run summary card.",
+      "description": "Nothing ships unproven. hmd makes your coding agent's work pass a test it didn't write — and proves that test can fail — before the push lands. The gate is a plain git pre-push hook, so it holds in any repo. Answer and steer your Claude Code session from your phone (pair with hmd app connect).",
       "source": "./",
       "category": "productivity"
     }
