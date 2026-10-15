@@ -178,7 +178,7 @@ run_fn() {  # $1 run id, $2 function name, $3 prompt ; extra env via FAKE_* in c
   fake_env "$rid" TPLUG="$TPLUG" WORKD="$WORK/proj" FN="$fn" "$@" bash -c '
     set -euo pipefail
     . "$TPLUG/bin/lib/install-receipt.sh"
-    eval "$(sed -n "/^${FN}() {/,/^}/p" "$TPLUG/bin/heimdall")"
+    eval "$(sed -n "/^${FN}()/,/^}/p" "$TPLUG/bin/heimdall")"
     WORK_DIR="$WORKD"; PLUGIN_DIR="$TPLUG"
     "$FN" "$1"
   ' _ "$prompt" </dev/null >"$WORK/fn.out" 2>"$WORK/fn.err"
@@ -263,7 +263,7 @@ inst "$RID" FAKE_FAIL_RE='^hmd$'; RC=$?; R="$HH/receipts/installs-$RID.ndjson"
   && ok "F: a failed hmd@heimdall install is reported on stderr and receipted (the installer then continues)" || bad "F: failure not surfaced (rc=$RC)"
 reset_fake; RID="run-f3"; echo "hmd@heimdall" >> "$STATE/installed"
 inst "$RID"; RC=$?
-! grep -q 'plugins install' "$CALLS" && [ ! -f "$HH/receipts/installs-$RID.ndjson" ] \
+[ "$RC" -eq 0 ] && ! grep -q 'plugins install' "$CALLS" && [ ! -f "$HH/receipts/installs-$RID.ndjson" ] \
   && ok "F: already installed → no install attempted, nothing receipted" || bad "F: an installed plugin was re-installed"
 
 # ╔═ G. hostile error text cannot corrupt the receipt; unlisted marketplace refused ═════╗
