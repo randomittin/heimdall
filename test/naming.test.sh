@@ -25,16 +25,22 @@ REPO="${NAMING_REPO:-$(cd "$SELF_DIR/.." && pwd)}"
 
 PLAN_NAMES="runhmd hmd Heimdall rr Bifröst dream watchmen designmatch bloat_gates presence"
 
-# check <root> — prints PASS/FAIL lines, returns non-zero when anything failed.
+# The checks the gate prints, counted: the "N passed, M failed" roll-up at the end is what test/run-all.sh reads (parse_counts).
+PASS=0; FAIL=0
+ok()  { PASS=$((PASS+1)); printf '  PASS %s\n' "$1"; }
+bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; }
+
+# check <root> — prints PASS/FAIL lines (counted in PASS/FAIL), returns non-zero when anything failed.
 check() {
-  local root="$1" naming disp rows row name reach tok sub path fails=0 n=0 pn arows
+  local root="$1" naming disp rows row name reach tok sub path n=0 pn arows
+  PASS=0; FAIL=0
   naming="$root/NAMING.md"; disp="$root/bin/heimdall"
-  [ -f "$naming" ] || { echo "  FAIL NAMING.md is missing"; return 1; }
-  [ -f "$disp" ]   || { echo "  FAIL bin/heimdall is missing"; return 1; }
+  [ -f "$naming" ] || { bad "NAMING.md is missing"; return 1; }
+  [ -f "$disp" ]   || { bad "bin/heimdall is missing"; return 1; }
 
   rows="$(awk '/naming-table:begin/{f=1;next} /naming-table:end/{f=0} f && /^\|/' "$naming" \
           | grep -vE '^\|[ -]*(\|[ -]*)+$' | grep -viE '^\| *Name *\|' || true)"
-  if [ -z "$rows" ]; then echo "  FAIL the naming table has no rows (vacuous)"; return 1; fi
+  if [ -z "$rows" ]; then bad "the naming table has no rows (vacuous)"; return 1; fi
 
   while IFS= read -r row; do
     [ -n "$row" ] || continue
@@ -47,16 +53,16 @@ check() {
         hmd_*)
           sub="${tok#hmd_}"
           if grep -qE "^  ([a-z0-9_-]+\|)*${sub}(\|[a-z0-9_-]+)*\)" "$disp"; then
-            echo "  PASS '$name': \`hmd $sub\` is a dispatch arm of bin/heimdall"
+            ok "'$name': \`hmd $sub\` is a dispatch arm of bin/heimdall"
           else
-            echo "  FAIL '$name': \`hmd $sub\` is NOT a dispatch arm of bin/heimdall"; fails=$((fails+1))
+            bad "'$name': \`hmd $sub\` is NOT a dispatch arm of bin/heimdall"
           fi ;;
         bin/*)
           path="$root/$tok"
           if [ -f "$path" ] && [ -x "$path" ]; then
-            echo "  PASS '$name': $tok exists and is executable"
+            ok "'$name': $tok exists and is executable"
           else
-            echo "  FAIL '$name': $tok does not exist or is not executable"; fails=$((fails+1))
+            bad "'$name': $tok does not exist or is not executable"
           fi ;;
       esac
     done
@@ -68,9 +74,9 @@ EOF
   for pn in $PLAN_NAMES; do
     pn="${pn//_/ }"
     if grep -qiF -- "$pn" "$naming"; then
-      echo "  PASS plan name '$pn' is accounted for"
+      ok "plan name '$pn' is accounted for"
     else
-      echo "  FAIL plan name '$pn' is missing from NAMING.md"; fails=$((fails+1))
+      bad "plan name '$pn' is missing from NAMING.md"
     fi
   done
 
@@ -78,14 +84,14 @@ EOF
            | grep -vE '^\|[ -]*(\|[ -]*)+$' | grep -viE '^\| *Old *\|' || true)"
   if [ -n "$arows" ]; then
     if grep -qF 'deprecated: use hmd' "$disp"; then
-      echo "  PASS deprecated aliases are listed and bin/heimdall prints the notice"
+      ok "deprecated aliases are listed and bin/heimdall prints the notice"
     else
-      echo "  FAIL NAMING.md lists deprecated aliases but bin/heimdall never prints 'deprecated: use hmd <new>'"; fails=$((fails+1))
+      bad "NAMING.md lists deprecated aliases but bin/heimdall never prints 'deprecated: use hmd <new>'"
     fi
   else
-    echo "  PASS no alias is claimed deprecated (none promised, none required in code)"
+    ok "no alias is claimed deprecated (none promised, none required in code)"
   fi
-  [ "$fails" -eq 0 ]
+  [ "$FAIL" -eq 0 ]
 }
 
 if [ "${1:-}" = "--self-test" ]; then
@@ -118,17 +124,35 @@ if [ "${1:-}" = "--self-test" ]; then
   fresh; awk '/naming-table:begin/{print; f=1; next} /naming-table:end/{f=0} !f{print}' "$REPO/NAMING.md" > "$TMP/root/NAMING.md"
   assert_red "the naming table emptied" "the naming table has no rows"
 
+  # THE ROLL-UP. test/run-all.sh reads a suite's "N passed, M failed" line (parse_counts); a suite that prints none is reported UNPARSED -- "counts UNKNOWN, not
+  # assumed pass" -- however green it is, and this gate printed none from its first commit until the 2.4.8 sweep named it. So run the gate the way the runner does (a child
+  # process, over a copy) and read what it prints with the runner's OWN parser, sed-extracted from run-all.sh and never copied.
+  eval "$(sed -n '/^parse_counts() {/,/^}/p' "$REPO/test/run-all.sh")"
+  run_gate() { NAMING_REPO="$TMP/root" bash "${BASH_SOURCE[0]}" >"$TMP/gate.out" 2>&1; GATE_RC=$?; GATE_COUNTS="$(parse_counts "$TMP/gate.out")"; }
+  fresh; run_gate
+  case "$GATE_RC:$GATE_COUNTS" in
+    0:[1-9]*" 0") echo "  ✓ the runner reads the gate's roll-up on an untouched copy: ${GATE_COUNTS% *} passed, 0 failed" ;;
+    *) echo "  ✗ SELF-TEST FAILED: the runner cannot read a green roll-up from the gate (exit $GATE_RC, counts '$GATE_COUNTS')" >&2; tail -4 "$TMP/gate.out" >&2; exit 1 ;;
+  esac
+  fresh; sed 's/^  designmatch)/  designmatch-gone)/' "$REPO/bin/heimdall" > "$TMP/root/bin/heimdall"; run_gate
+  case "$GATE_RC:$GATE_COUNTS" in
+    1:[1-9]*" "[1-9]*) echo "  ✓ the runner reads the gate's roll-up on a defective copy and it counts the defect: ${GATE_COUNTS% *} passed, ${GATE_COUNTS#* } failed (exit 1)" ;;
+    *) echo "  ✗ SELF-TEST FAILED: the runner cannot read a red roll-up from the gate (exit $GATE_RC, counts '$GATE_COUNTS')" >&2; tail -4 "$TMP/gate.out" >&2; exit 1 ;;
+  esac
+
   echo "naming --self-test: PASS"
   exit 0
 fi
 
 echo "naming harness  repo=$REPO"
 echo "--------------------------------------------------------------------"
-if check "$REPO"; then
-  echo "--------------------------------------------------------------------"
+check "$REPO"; RC=$?
+echo "--------------------------------------------------------------------"
+# The roll-up test/run-all.sh parses ("N passed, M failed"). Without it a suite that exits 0 is reported UNPARSED, its counts unknown, as this one was in the 2.4.8 sweep.
+echo "naming: $PASS passed, $FAIL failed."
+if [ "$RC" -eq 0 ]; then
   echo "naming.test.sh: PASS"
   exit 0
 fi
-echo "--------------------------------------------------------------------"
 echo "naming.test.sh: FAIL" >&2
 exit 1

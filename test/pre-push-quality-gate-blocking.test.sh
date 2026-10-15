@@ -53,11 +53,37 @@
 # skips itself via its own `[ -x ... ]` guard. That isolates the quality-gate
 # step under test without stubbing anything: the gate binary under test is the
 # real one, the steps not under test are simply absent.
+#
+# WHICH REPO, SINCE 2.4.8 (2026-10-13, "each repo's own checks, not heimdall's")
+# ------------------------------------------------------------------------------
+# The chain no longer runs this gate in whatever directory the session is in: it
+# asks bin/lib/hmd_push_target.py which repository the push goes to and what class
+# of gate that repository owes, read from its COMMITS (sweep: a committed
+# test/run-all.sh naming last-sweep.json, heimdall's own regime, which is THIS gate;
+# repo-checks; unmanaged). So the temp plugin root also carries that REAL resolver
+# (and hmd_repo_receipt.py, which it imports: a root without them cannot place any
+# push, and the chain then blocks every push), and each case's cwd is a real git
+# repo with one commit, on main, that carries the sweep regime: what a fresh clone
+# or an agent worktree of heimdall is. Two consequences, both on purpose:
+#   - in a git checkout `heimdall-state check-quality-gates` also demands a green
+#     sweep receipt (test/run-all.sh is its writer), so "clean gates" in case 2
+#     includes one;
+#   - a push the resolver cannot place exactly (here: a cwd with no repository) is
+#     graded strictly AND a strict gate that was never evaluated BLOCKS instead of
+#     warning. "No verdict proceeds" is for a repository positively known to be
+#     heimdall's own (case 3); case 4b pins the rest.
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOKS_JSON="$REPO/hooks/hooks.json"
 STATE_BIN="$REPO/bin/heimdall-state"
+# hermetic: the fixture repos and the resolver's own git calls read nothing from this
+# machine (config, hooks, signing, a stray GIT_DIR), and the gate reads its state and
+# its sweep receipt from the fixture repo, never from a HEIMDALL_HOME or state file
+# named in the caller's environment
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+unset GIT_DIR GIT_WORK_TREE HEIMDALL_HOME HEIMDALL_STATE_FILE SUPERX_STATE_FILE
+TAB=$'\t'
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; RESET=$'\033[0m'
 pass=0; fail=0
@@ -77,7 +103,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 # A plugin root containing ONLY the gate under test.
 FAKE_PLUGIN="$WORK/plugin"
-mkdir -p "$FAKE_PLUGIN/bin"
+mkdir -p "$FAKE_PLUGIN/bin/lib"
 # The chain body lives in bin/heimdall-precheck-bash; hooks.json's command is
 # just the stdin-pipe wrapper into "$PLUGIN/bin/heimdall-precheck-bash". The
 # fake plugin therefore carries the REAL script (the code under test) alongside
@@ -86,6 +112,10 @@ cp "$REPO/bin/heimdall-precheck-bash" "$FAKE_PLUGIN/bin/heimdall-precheck-bash"
 chmod +x "$FAKE_PLUGIN/bin/heimdall-precheck-bash"
 cp "$STATE_BIN" "$FAKE_PLUGIN/bin/heimdall-state"
 chmod +x "$FAKE_PLUGIN/bin/heimdall-state"
+# ...and the REAL resolver the script asks which repository a push goes to (it imports
+# hmd_repo_receipt). Not a fake either. heimdall-repo-checks and hmd_repo_checks.py are
+# left out on purpose: no case here declares checks of its own.
+cp "$REPO/bin/lib/hmd_push_target.py" "$REPO/bin/lib/hmd_repo_receipt.py" "$FAKE_PLUGIN/bin/lib/"
 
 # run_hook <cwd> <command-string>  -> sets RC / OUT / ERR
 run_hook() {
@@ -96,11 +126,40 @@ run_hook() {
   ERR="$(cat "$WORK/stderr")"
 }
 
-# fresh sandbox cwd for each case
-new_cwd() { local d="$WORK/case$1"; rm -rf "$d"; mkdir -p "$d"; printf '%s' "$d"; }
+# fresh sandbox cwd for each case: a real git repo on main with ONE commit, heimdall's own sweep regime. The committed
+# test/run-all.sh naming last-sweep.json is what makes the chain grade a push of it with THIS gate (the class is read from the
+# commits, never the work tree); the branch is main because `git push origin main` names a ref that must exist, as it does in
+# a real checkout.
+new_cwd() {
+  local d="$WORK/case$1"
+  rm -rf "$d"; mkdir -p "$d/test"
+  printf 'RECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"\n' > "$d/test/run-all.sh"
+  ( cd "$d" && git init -q && git symbolic-ref HEAD refs/heads/main && git config user.email t@t && git config user.name t \
+      && git add test/run-all.sh && git -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m "the sweep writer" )
+  printf '%s' "$d"
+}
+# A green, current, clean FULL sweep receipt for the repo's HEAD. In a git checkout heimdall-state demands one (a sweep repo that
+# never recorded a green sweep is refused whatever its state booleans say), so "clean gates" is only clean with it.
+green_sweep_receipt() {  # green_sweep_receipt <repo>
+  local top head
+  top="$(git -C "$1" rev-parse --show-toplevel)"
+  head="$(git -C "$1" rev-parse HEAD)"
+  mkdir -p "$top/.heimdall/receipts"
+  jq -n --arg r "$top" --arg h "$head" '{kind: "full", repo: $r, head_sha: $h, tree_clean: true, exit_code: 0}' > "$top/.heimdall/receipts/last-sweep.json"
+}
 
 printf '\npre-push quality gate — blocking behaviour\n'
 printf -- '--------------------------------------------------------------------\n'
+
+# === CASE 0: fixture sanity — each case's cwd is a repo the resolver POSITIVELY places as class sweep ==
+# Every outcome below rests on it: a cwd the resolver could not place is graded by the strict fallback row instead, and a case
+# that expects a BLOCK (1) would then pass for the wrong reason.
+C="$(new_cwd 0)"
+ROW="$(cd "$C" && printf '%s' 'git push origin main' | python3 -I -S "$FAKE_PLUGIN/bin/lib/hmd_push_target.py" "$C" 2>&1)"
+case "$ROW" in
+  "sweep${TAB}"*"${TAB}-${TAB}/"*) ok "fixture: each case's cwd is positively class sweep (heimdall's own regime), not the strict fallback" ;;
+  *) bad "fixture: each case's cwd is positively class sweep (heimdall's own regime)" "resolver said: $ROW" ;;
+esac
 
 # === CASE 1: verdict available and FAILING -> must BLOCK =====================
 C="$(new_cwd 1)"
@@ -130,6 +189,7 @@ fi
 # === CASE 2: verdict available and PASSING -> must NOT block =================
 C="$(new_cwd 2)"
 ( cd "$C" && "$FAKE_PLUGIN/bin/heimdall-state" init >/dev/null 2>&1 && HMD_LINT_WAIVER="fixture: pre-push blocking is not about lint evidence" "$FAKE_PLUGIN/bin/heimdall-state" mark-clean >/dev/null 2>&1 )
+green_sweep_receipt "$C"
 run_hook "$C" "git push origin main"
 if [ "$RC" = 0 ]; then
   ok "clean gates => push PROCEEDS (exit 0)"
@@ -168,6 +228,18 @@ else
   ok "absent state is NOT reported as a pass (no vacuous green)"
 fi
 
+# === CASE 4b: a cwd the chain cannot place (no repository) + NO verdict -> must BLOCK =====
+# The 2.4.8 narrowing of case 3: "no verdict proceeds" holds for a repository the chain positively identified as heimdall's own.
+# A push it cannot place exactly is uncertain, graded strictly, and a strict gate that was never evaluated is not a pass.
+C="$WORK/no-repository"
+rm -rf "$C"; mkdir -p "$C"
+run_hook "$C" "git push origin main"
+if [ "$RC" = 2 ] && printf '%s' "$OUT" | jq -e '.error | test("BLOCKED") and test("cannot grade this push") and test("never evaluated")' >/dev/null 2>&1; then
+  ok "no repository + absent state file => push BLOCKED (a gate that was never evaluated is not a pass for a push the chain cannot place)"
+else
+  bad "no repository + absent state file => push BLOCKED" "got exit $RC; stdout=$OUT; stderr=$ERR"
+fi
+
 # === CASE 5: gate is scoped to push, not to every Bash command ===============
 C="$(new_cwd 5)"
 ( cd "$C" && "$FAKE_PLUGIN/bin/heimdall-state" init >/dev/null 2>&1 )   # failing gates present
@@ -202,12 +274,17 @@ else
   ok "check-quality-gates is not a bare fire-and-forget statement"
 fi
 
-# The positive half of the same lock: the verdict must actually be CAPTURED.
-# Without this, deleting the call entirely would satisfy the negative check above.
-if grep -qE '\$\([^)]*check-quality-gates' <<<"$CHAIN_TEXT"; then
+# The positive half of the same lock: the verdict must actually be CAPTURED and its exit code READ.
+# Without this, deleting the call entirely would satisfy the negative check above. Every
+# `VAR=$( ... check-quality-gates ... )` must be followed at once by the line that reads its status (`QGRC=$?`).
+# The substitution may WRAP the call: since 2.4.8 the chain hands the gate the git directory and work tree the resolver
+# resolved, `$(case "$PG_GITDIR" in (/*) export GIT_DIR=... ;; esac; "$HSTATE" check-quality-gates 2>&1)`, so the
+# parentheses of that case pattern now sit between the `$(` and the call, past what the old `\$\([^)]*check-quality-gates`
+# could see. The lock is the same, and one thing stricter: it is the status being read, not just a `$(` being present.
+if awk '/^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=\$\(.*check-quality-gates/ { n++; if ((getline nxt) > 0 && nxt ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=\$\?/) ok++ } END { exit !(n > 0 && n == ok) }' <<<"$CHAIN_TEXT"; then
   ok "check-quality-gates verdict is captured into a variable (exit code observable)"
 else
-  bad "check-quality-gates verdict is captured into a variable" "no \$( ... check-quality-gates ... ) capture found"
+  bad "check-quality-gates verdict is captured into a variable" "no VAR=\$( ... check-quality-gates ... ) capture followed by a read of \$? found"
 fi
 
 printf -- '--------------------------------------------------------------------\n'

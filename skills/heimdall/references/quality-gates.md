@@ -79,6 +79,34 @@ heimdall-state check-quality-gates
 
 This exits with code 2 (blocking the push) if any gate fails. The error message tells the user which gates failed.
 
+**Which gate runs is chosen per repository pushed** (2026-10-13), not by the session's cwd. The hook asks
+`bin/lib/hmd_push_target.py` which repositories the command pushes (the cwd, a `-C <dir>` chain, `cd <dir> && ...`,
+subshells, wrappers, `sh -c`; git itself names the git directory) and gives each the gate its class owes:
+
+| Class | Marker | Gate |
+|---|---|---|
+| sweep | a commit has `test/run-all.sh` naming `last-sweep.json` (heimdall's own sweep regime; tracked code, never the receipt) | `heimdall-state check-quality-gates`, run inside that repo: unchanged, fail closed |
+| repo-checks | a commit has `.heimdall/repo-checks.json`, the repo's own checks | passes ONLY on a green, current, clean-tree receipt of them bound to the commit, its tree and the declaration's committed bytes (`bin/heimdall-repo-checks run` writes it, `status` verifies it; one definition of the receipt in `bin/lib/hmd_repo_receipt.py`) **and only for the commit the push sends**: every refspec source git resolves (a bare push sends HEAD) must be the receipt's `head_sha`, and `--all`, `--mirror`, `--tags`, a wildcard or push configuration that picks the refs block; stale, red, dirty, missing, mismatched, malformed or invalid blocks and names the runner command |
+| unmanaged | no inspected commit has either marker, git resolved the repo, and the command was understood exactly | one `WARNING` line on stderr; the push proceeds |
+
+The class is read from the **commits** (HEAD, its upstream, `origin/HEAD`, `origin/<branch>`, whatever the push
+names), never the work tree, and the strictest wins: an uncommitted marker edit changes nothing, and a pushed commit
+that drops a marker cannot downgrade a repo whose upstream still has it. Any construct not modelled exactly (a dynamic
+or conditional `cd`, `cd -`, a function, `source`, `alias`, a script piped to a shell, `find -exec`, `xargs` handing
+over the subcommand, a builtin behind a wrapper that starts a process such as `env cd X`, `env` with an option, an
+assignment to `HOME`/`CDPATH`/`PWD`/`OLDPWD`, an unknown git option or subcommand, an unmodelled `GIT_*` variable, a
+marker that cannot be inspected) makes the command uncertain, and then EVERY repo involved gets the **sweep** class:
+never a warning. Every error path is strict too (git failing, timing out or printing something unexpected, a resolver
+that crashes, a corrupt receipt or declaration); the test forces each one. A resolver that times out, crashes or is
+missing is never a reason to grade ONE repository: the strict gate runs against the session's cwd, the payload's cwd and
+every `-C` / `cd` / `--git-dir` / `--work-tree` directory the parser reached, and the push is blocked unless all pass.
+One resolved (git directory, work tree) pair feeds every stage (the class, the refspec sources, the receipt lookup and
+the `heimdall-state` check); nothing re-derives the repository from a path. A receipt under a symlinked `.heimdall`
+or `receipts` is never read, and one over 1 MiB is not parsed. The secret scan, self-scan, oracle and
+corpus stages are not part of this rule and are not relaxed. The repo-checks receipt
+is a cooperating-agent control, not a security boundary against someone who can write it, exactly like
+`last-sweep.json`. See `CLAUDE.md` "Push gate" and `test/heimdall-push-gate-per-repo.test.sh`.
+
 ## Manual Override
 
 At autonomy level 3, if the user explicitly says "push anyway" or "force push", the main agent can bypass gates by running:

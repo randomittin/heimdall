@@ -20,10 +20,10 @@
 # must match line for line (the script's own `case "${1:-}"` -h guard is the one
 # line filtered out — it is the only statement not in the inline string).
 #
-# THREE DELIBERATE DELTAS (2026-10-11, "precheck never blocks silently in another
-# repo", then "never execute the session's repo") — the one place the script is
-# NOT the historical inline chain any more, each updated here on purpose and
-# pinned by its own case:
+# FOUR DELIBERATE DELTAS (2026-10-11, "precheck never blocks silently in another
+# repo", then "never execute the session's repo"; 2026-10-13, "each repo's own
+# checks, not heimdall's") — the one place the script is NOT the historical inline
+# chain any more, each updated here on purpose and pinned by its own case:
 #   * a deny (exit 2) also states its verdict on STDERR (case 24). stdout is
 #     unchanged; equiv() therefore compares a deny's stderr with that mirrored
 #     line removed, and skips the xtrace comparison for denies (the mirror is the
@@ -38,6 +38,13 @@
 #     `x && git push`, `FOO=1 git push`, ...), not only at the start of the line
 #     (cases 17, 27, 28, 29). equiv() drops the matcher's own xtrace lines, which
 #     differ by design; every other statement is still compared.
+#   * the quality gate runs for the CLASS of the repo the push goes to (sweep /
+#     repo-checks / unmanaged), not for the session's cwd whatever it pushes. The
+#     cwd fixtures below stand for heimdall's own repo -- class "sweep", marked by a
+#     test/run-all.sh that names last-sweep.json -- so every case here still reaches
+#     the heimdall-state gate it always reached, with the same stdout, stderr and
+#     exit code. The class dispatch itself (its own xtrace lines are dropped by
+#     equiv() like the matcher's) is pinned by test/heimdall-push-gate-per-repo.test.sh.
 #
 # WHERE THE REFERENCE COMES FROM: the working tree's hooks.json while it still
 # carries the inline string; once hooks.json has been swapped to the wrapper, the
@@ -125,6 +132,9 @@ mk_plugin() {  # mk_plugin <name> [omit-bin...] -> path
   mk_fake "$d" parallelism-tracker 'echo "tracker $*"; echo "tracker-stderr" >&2; exit 0'
   # the wrapper form of the hook resolves the script under $PLUGIN/bin
   cp "$SCRIPT" "$d/bin/heimdall-precheck-bash"; chmod +x "$d/bin/heimdall-precheck-bash"
+  # the per-repo push gate: the resolver the script asks which repo a push goes to, and the runner it consults for repo-checks repos
+  mkdir -p "$d/bin/lib"; cp "$REPO/bin/lib/hmd_push_target.py" "$REPO/bin/lib/hmd_repo_checks.py" "$REPO/bin/lib/hmd_repo_receipt.py" "$d/bin/lib/"
+  cp "$REPO/bin/heimdall-repo-checks" "$d/bin/"; chmod +x "$d/bin/heimdall-repo-checks"
   local o; for o in "$@"; do rm -f "$d/bin/$o"; done
   printf '%s' "$d"
 }
@@ -133,11 +143,19 @@ PLUGIN_NOSTAMP="$(mk_plugin nostamp heimdall-stamp)"
 PLUGIN_NOHSTATE="$(mk_plugin nohstate heimdall-state)"
 
 # ── cwd fixtures ────────────────────────────────────────────────────────────
+# A push is gated by the class of the repo it goes to, read from the COMMITS. These fixtures stand for HEIMDALL'S OWN repo, whose
+# class is "sweep" (its test/run-all.sh, the writer of the sweep receipt, names last-sweep.json, and is committed), so each push
+# below still meets the heimdall-state gate it always met.
+mark_sweep() {
+  mkdir -p "$1/test"; printf 'RECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"\n' > "$1/test/run-all.sh"
+  ( cd "$1" && git add test/run-all.sh && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m "the sweep writer" )
+}
 mk_cwd() {  # mk_cwd <name> -> a real git repo with the evals scaffolding the chain reads from CWD
   local d="$TMPROOT/cwd-$1"
   mkdir -p "$d/evals/oracles/demo-domain" "$d/evals/corpus"
   ( cd "$d" && git init -q && git config user.email t@t && git config user.name t )
   printf '{}\n' > "$d/evals/corpus/INDEX.json"
+  mark_sweep "$d"
   printf '%s' "$d"
 }
 CWD_PLAIN="$(mk_cwd plain)"
@@ -152,6 +170,7 @@ mkdir -p "$CWD_STACK/.planning" "$CWD_STACK/evals/corpus"
 ( cd "$CWD_STACK" && git init -q )
 printf '{"stacks":["demo-domain"]}\n' > "$CWD_STACK/.planning/detected-stack.json"
 printf '{}\n' > "$CWD_STACK/evals/corpus/INDEX.json"
+mark_sweep "$CWD_STACK"
 CWD_NOGIT="$TMPROOT/cwd-nogit"; mkdir -p "$CWD_NOGIT"
 
 # ── runner ──────────────────────────────────────────────────────────────────
@@ -203,7 +222,16 @@ equiv() {
   # SLINT= is dropped like the matcher's lines, and of the [ N = 2 ] tests exactly ONE is dropped from the script's side, by count, so the gate's own
   # test must still be matched by the reference's. The rest of the guard runs only when the gate FAILED -- a deny, exempt below -- and
   # test/heimdall-stop-lint.test.sh pins what it does
-  local mtr='^(\+ (SQ=|GP_|SLINT=|case |grep -qE .*push)|\+\+ tr -d )'
+  # the per-repo push gate (2026-10-13, delta 4) adds the class dispatch: PG_* variables, the resolver and payload-cwd calls, the
+  # loop over the plan and the cd into the repo pushed and back. None of those statements exists in the inline string (it has no
+  # cd, IFS or read at all); the statements INSIDE the sweep branch -- the old quality gate, verbatim -- are still compared.
+  # ...and, in the never-evaluated branch, the one extra test of whether the row is only the strict fallback (`[ "$PG_EXTRA" = fallback ]`)
+  # ...and (2026-10-14) the pair the resolver resolved, handed to the old gate: the quality gate's own call is wrapped as `$(case "$PG_GITDIR" in /*) export
+  # GIT_DIR=... GIT_WORK_TREE=... ;; esac; "$HSTATE" check-quality-gates 2>&1)`, so the call itself is still compared verbatim and only the `case` and the
+  # `export` of that pair (two lines inside the substitution) are dropped
+  # (bash traces the export's arguments as assignments of their own, `++ GIT_DIR=...` and `++ GIT_WORK_TREE=...`; and the fallback test's operand is `-` for a row
+  # that is not the fallback, where it used to be empty)
+  local mtr='^(\+ (SQ=|GP_|SLINT=|PG_|IFS=|read -r PG_|cd |case |grep -qE .*push|.\[. .* = fallback .\].)|\+\+ (tr -d |jq -r .\.cwd|python3 -I -S .*hmd_push_target\.py|printf .sweep|case |(export )?GIT_(DIR|WORK_TREE)=))'
   grep -v '^+ case "${1:-}" in$' "$TMPROOT/$tag.trace-script.err" | grep -vE "$mtr" | awk '/^\+ .\[. [0-9]+ = 2 .\].$/ && !guard_test++ { next } { print }' | LC_ALL=C sort > "$TMPROOT/$tag.trace-script.filtered"
   LC_ALL=C sort "$TMPROOT/$tag.trace-inline.err" | grep -vE "$mtr" > "$TMPROOT/$tag.trace-inline.sorted"
   # denies are exempt from the trace comparison: the stderr mirror is a statement the string never had

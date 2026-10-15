@@ -607,10 +607,13 @@ per 10 s, and 20 non-approval plus 20 approval per device per rolling hour.
 
 ### Pair-by-code (`hmd app connect`, the relay's `/session/:id/code`)
 
-On whenever `gh auth token` yields a token — inside an `hmd app connect` you started — and
-off with `--no-code` (QR pairing is untouched). The 5-character session code `hmd ui` shows
-is registered with the relay under your GitHub identity, so a phone signed in to GitHub as
-the same user can pair by typing it.
+Opt-in, per repo. Nothing here runs for a repo until you have run `hmd app connect` in it: that run writes a
+small record in `$HEIMDALL_HOME` (`app/pair-optin/<hash of the repo's path>.json`: the repo's path and the
+time, outside the repo so a repository cannot write it for you), and `hmd app disconnect` removes it (a
+session ending does not). `hmd app connect --no-code` pairs by QR, sends no token and removes it too. With
+the record, and while `gh auth token` yields a token, the 5-character session code `hmd ui` shows is
+registered with the relay under your GitHub identity, so a phone signed in to GitHub as the same user can
+pair by typing it.
 
 ```
 POST /session/:id/code      Authorization: Bearer <relay session token>
@@ -624,25 +627,24 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
   GitHub id and login. Its invariant INV-39 — checked by a test that scans every Durable
   Object's storage and every log line after a whole pairing — is that the token is never
   persisted or logged. That is a promise about the relay's code (`relay/`), not something
-  the client can verify. `hmd app connect` repeats the request on the pair window's schedule
-  -- about every 5 minutes, 10 s ahead of the relay's 360 s lapse -- until a phone binds or
-  `HMD_PAIR_WINDOW_IDLE_H` hours (default 4, at most 24; `HMD_RELAY_CODE_WINDOW_S` sets it in
-  seconds) pass; the token is then dropped from memory. A renewal the relay cannot take at
-  the moment (unreachable, throttling, failing) is tried again 30 s on
-  (`HMD_RELAY_CODE_RENEW_RETRY_S`) and does not close the window. `--confirm` keeps the
-  same schedule; a phone turned down at the compare has the window registered again at
-  once instead (`HMD_RELAY_CODE_RENEW_EVENT_MIN_S`, 5 s after the last registration), one
-  more send of the token for each rejection. The
-  SessionStart hook `pair-window-start` does the same for every attended Claude Code
-  session while `gh` is signed in, but backed off: it reads `gh auth token` again each time
-  a window opens and sends it no more often than every 5 minutes
-  (`HMD_PAIR_WINDOW_RENEW_MIN_S`) until a phone pairs. The relay keeps a registration only
-  60 s, so the code is claimable for the minute after each one and not in between
-  (`HMD_PAIR_WINDOW_RENEW_MIN_S=30` keeps it claimable nearly always, at the cost of the token
-  going out about every 50 s). After 4 hours (`HMD_PAIR_WINDOW_IDLE_H`, `0` = never) with no
-  phone paired and no activity in the session it stops sending the token for good; a new
-  session or `hmd app connect` opens a window again.
-  `hmd hooks disable pair-window-start` or `HMD_PAIR_WINDOW=0` stops it altogether.
+  the client can verify. **It goes out once for each registration of the code, and a code is registered only for a pairing that
+  is waiting for a phone:** when you run `hmd app connect`, when you run `hmd app add-device` (a phone is
+  paired and you want one more), and when the SessionStart hook `pair-window-start` opens a repo's pair
+  window -- for a repo you connected, in an attended session with `gh` signed in, and only while no phone
+  is paired (a restart resumes a paired phone from its stored session login, which involves neither the
+  token nor the opt-in record: a phone paired before the record existed is resumed too, with no gh call and
+  no request that carries a token, and a repo you never connected that has no paired phone starts nothing).
+  The relay keeps a registration 360 s, so the code can be typed for about six minutes and then
+  no longer: nothing registers it again (no timer, no restarted client, no later session start while the
+  window is open), and a registration the relay refuses or cannot take is not retried, so no second
+  request carries the token. To pair after that, run `hmd app connect` again, or `hmd app add-device` once
+  a phone is paired. With `--confirm`, a phone you turn down at the compare has the code registered again
+  at once: one more send for each rejection you chose to make at the terminal.
+  `HMD_PAIR_WINDOW_RENEW=1` (exactly `1`, in the environment of `hmd app connect` or of the Claude Code
+  session) is the explicit opt-in to the old schedule: the code is registered again about every 5
+  minutes, 10 s ahead of the relay's lapse, until a phone binds or `HMD_PAIR_WINDOW_IDLE_H` hours pass
+  (`HMD_RELAY_CODE_WINDOW_S` sets it in seconds), and the token goes out with every one of those.
+  `hmd hooks disable pair-window-start` or `HMD_PAIR_WINDOW=0` stops the hook's window altogether.
 - **The phone's side** (`POST /identity/github`, `POST /pair/code`): the phone's GitHub
   device-flow token is checked against hmd's GitHub App and deleted at GitHub, and replaced
   by a relay-signed assertion bound to the phone's key. The relay releases a pending pairing
@@ -660,6 +662,8 @@ POST /session/:id/code      Authorization: Bearer <relay session token>
 | Switch | Effect |
 |---|---|
 | `hmd app connect --no-code` | no token leaves; pair by QR |
+| `hmd app disconnect` | ends the opt-in: the pair window registers no code and sends no token for the repo until `hmd app connect` is run in it again |
+| `HMD_PAIR_WINDOW=0`, `hmd hooks disable pair-window-start` | the SessionStart hook opens no window |
 | `hmd app identity revoke` | sends your `gh auth token` to the relay once more (same pipe, same https rule) and invalidates every phone sign-in made with your GitHub identity — each phone signs in again. Revoking the GitHub App at github.com does not do this by itself |
 
 ---

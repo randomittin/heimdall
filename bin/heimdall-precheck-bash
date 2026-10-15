@@ -68,10 +68,12 @@ case "${1:-}" in
   -h|--help) sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-# SINCE THE EXTRACTION — three deliberate deltas from the historical inline chain
+# SINCE THE EXTRACTION — five deliberate deltas from the historical inline chain
 # (2026-10-11, "precheck never blocks silently in another repo"; then "never execute the session's
-# repo"). test/heimdall-precheck-bash.test.sh cases 17, 21 and 24-29 pin them; every other branch is
-# still byte-identical to the inline string.
+# repo"; 2026-10-13, "each repo's own checks, not heimdall's"; 2.4.8, "a disk-space floor").
+# test/heimdall-precheck-bash.test.sh cases 17, 21 and 24-29 pin the first three,
+# test/heimdall-push-gate-per-repo.test.sh the fourth, test/disk-floor.test.sh the fifth;
+# every other branch is still byte-identical to the inline string.
 #
 #   1. deny(): a deny states its verdict on stderr TOO. Claude Code surfaces ONLY stderr for an
 #      exit-2 hook and ignores stdout, so the stdout-only verdict surfaced as "hook error ... No
@@ -87,16 +89,63 @@ esac
 #      the same push walked past the quality, secret, self-scan, oracle and corpus gates: `git -C <dir>
 #      push`, `x && git push`, `; git push`, `FOO=1 git push`, `(git push)`, `sudo git push`,
 #      `/usr/bin/git push`, `bash -c "git push"`. It now matches `git` as a COMMAND WORD: at the start of
-#      a line, after ; & | ( { ` $( ! then/do/else, after env assignments and wrapper words (sudo, command,
-#      env, exec, time, nohup, nice, builtin, xargs), or as the first word of a `sh -c`/`eval` string; then
+#      a line, after ; & | ( { ` $( ! then/do/else, after env assignments and wrapper words (sudo, doas, command,
+#      env, exec, time, timeout, nohup, nice, ionice, setsid, stdbuf, caffeinate, builtin, xargs, each with
+#      its options and their values: env -u NAME, nice -n 5, sudo -u user, timeout -k 5 30), or as the first word
+#      of a `sh -c`/`eval` string. The command word may be a path, quoted or escaped (/usr/bin/git, "git", \git),
+#      and an assignment value or an option value is one whole shell word (quotes, backslash escapes, $( ), ${ },
+#      backticks: FOO=$(echo a b) git push and git -C My\ Dir push are pushes, `git push` is one too); then
 #      git's global options (-C <dir>, -c k=v, --git-dir[=]<dir>, --no-pager, ...) and then `push` as a
 #      whole word (so `git pushd` is not a push). Text that only MENTIONS a push (`echo "git push"`,
 #      `grep -rn "git push" docs/`, a commit message) and other subcommands (`git stash push`) stay
 #      unmatched: a push gate that fired on prose would cost a full gate run per grep. Indirection no regex
-#      can see (`$GIT push`, `xargs -n 1 git push`) is the native pre-push hook's job (core.hooksPath).
-#
-# The gates themselves still read the CWD repo's own state (heimdall-state.json, .planning/, evals/):
-# that is the policy for "the repo being pushed", correctly applied in a foreign repo.
+#      can see (`$GIT push`, a script piped into a shell, `eval git push`, a here-string, `bash --norc -c ...`)
+#      is the native pre-push hook's job (core.hooksPath). test/heimdall-push-gate-per-repo.test.sh section E pins the forms.
+#   4. PER-REPO TEST/LINT GATE: the quality gate (`heimdall-state check-quality-gates`: the state
+#      booleans, the lint receipt and heimdall's sweep receipt) used to run in the session's cwd for ANY
+#      push, so a push of another repository was held to heimdall's own sweep: the site, with six gates of
+#      its own, was blocked for lacking a receipt only heimdall's test/run-all.sh can write. The hook now
+#      asks bin/lib/hmd_push_target.py which repositories the command pushes (cwd, `git -C <dir>`,
+#      `cd <dir> && ...`, subshells, wrappers, `sh -c`) and gives each the gate its class owes:
+#        sweep        a commit pushed (or its upstream) has test/run-all.sh naming last-sweep.json (heimdall's
+#                     own regime): the old gate, unchanged and fail-closed, now run INSIDE that repository (a
+#                     push of repo B no longer answers to repo A's state, and a cwd in a subdirectory reads
+#                     the toplevel's state);
+#        repo-checks  a commit pushed has .heimdall/repo-checks.json, the repo's own checks: pass ONLY on a
+#                     green, current, clean-tree receipt (bin/heimdall-repo-checks status). Read, never
+#                     re-run: a hook must not execute what a repository says to execute. Stale, red, dirty,
+#                     missing, mismatched, invalid or an absent runner all block, naming the runner command;
+#        unmanaged    anything else: one WARNING line on stderr, the push goes on.
+#      The class is read from the COMMITS (HEAD, its upstream, origin, the refspecs named), never the work
+#      tree, and the strictest wins: an uncommitted marker edit changes nothing, and a pushed commit that
+#      drops the marker cannot downgrade a repo whose upstream still has it. The marker is the sweep WRITER
+#      in tracked code, never its receipt, so deleting a receipt cannot downgrade a repo. A command the
+#      resolver does not understand EXACTLY (see its docstring: a dynamic or conditional cd, eval, sh -c,
+#      xargs, aliases, sourced or piped scripts, ...) is uncertain, and then every repo involved gets the
+#      sweep gate (a repository that declares checks also keeps owing its receipt, for commits nobody can
+#      list), and a strict gate that was never evaluated blocks: only an exactly understood command may end
+#      in the warning. The receipt is graded for the commit the push SENDS (each refspec source resolved, HEAD
+#      for a bare push; --all, --mirror, --tags, a wildcard or push configuration that picks the refs cannot
+#      be tied to it). A resolver that cannot answer (it times out, crashes, or is missing) is never a reason to
+#      grade ONE repository: the strict gate runs against the session's cwd, the payload's cwd and every -C / cd /
+#      --git-dir / --work-tree directory the parser had reached (it prints those itself when it fails), and the push
+#      is blocked unless all of them pass; a class this does not know is the sweep gate. The git directory and work
+#      tree the resolver resolved TOGETHER ride in the row and go to every stage: `status --git-dir` (the receipt
+#      lookup) and the old gate's call (GIT_DIR and GIT_WORK_TREE exported around it); a gate directory that cannot
+#      be entered blocks. The change only ever narrows a gate to the repository pushed. NOT relaxed, and still reading the CWD repo
+#      as they always did: the push-range secret scan, the full-history self-scan and the oracle and corpus
+#      stages below (and, earlier in the chain, the commit secret scan, git-guard and the kill guard).
+#   5. DISK FLOOR (2.4.8; operator directive 2026-10-14: "a disk-space floor of 10%, enforced by hooks: agent spawns, test runs, each test file"). A command that RUNS a test file
+#      (`bash test/x.test.sh`, `./test/x.test.sh`, `cd d && bash x.test.sh`, any *.test.sh) or the sweep (test/run-all.sh) is DENIED while the volume holding TMPDIR, or the one
+#      holding the session's repo (the payload's cwd, else this process's), is under HMD_MIN_FREE_PCT free (default 10; 0 = off). A test writes fixtures, clones and temp data,
+#      and a full disk fails in ways that look like bugs. This is the one place that can stop a SINGLE test file run by hand: run-all.sh checks for itself, the 500 files do not,
+#      and this hook sees every command, so no test file is edited. bin/lib/hmd_disk_floor.sh is the one definition (shared with the Agent hook and the sweep) and says how free
+#      percent is computed and why a typo in the knob is the default. The matcher is the push matcher's idea of a COMMAND WORD (start of line, after ; & | ( { ` $( ! then/do/else,
+#      env assignments and wrapper words, `sh -c` strings), then an optional shell with flags (never -n: noexec runs nothing), then a path that ends in .test.sh or is run-all.sh:
+#      text that only MENTIONS a test file (cat, grep, git add, echo, a commit message) is not a run and never reaches df. Best-effort, not a boundary: indirection no regex can
+#      see (`bash "$f"`, a loop over a glob) is not caught, and run-all.sh checks for itself. FAILS OPEN, like the Agent hook's fence: no lib in the plugin root, or a df that cannot
+#      answer (the lib warns on stderr), is an allow; only a volume that was READ and is under the floor denies. HMD_MIN_FREE_PCT is read from THIS hook's environment (the one Claude
+#      Code runs in): an inline `HMD_MIN_FREE_PCT=5 bash test/x.test.sh` reaches the test, not this hook, which has already said no.
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
 
 INPUT=$(cat)
@@ -118,11 +167,36 @@ if printf '%s\n' "$CMD" | grep -qE '(^|[;&|]\s*)git\s+commit'; then
   fi
 fi
 SQ="'"
-GP_VAL='("[^"]*"|'"$SQ"'[^'"$SQ"']*'"$SQ"'|[^[:space:]]*)'
+GP_VAL='([^[:space:]"'"$SQ"'`$\\]|\\.|\$\([^)]*\)|\$\{[^}]*\}|\$|`[^`]*`|"[^"]*"|'"$SQ"'[^'"$SQ"']*'"$SQ"')*'
 GP_START='(^|[;&|({`!]|\$\(|(^|[[:space:]])(then|do|else|elif)[[:space:]]|(sh|bash|zsh|dash|ksh)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*c[[:space:]]+["'"$SQ"']|eval[[:space:]]+["'"$SQ"'])[[:space:]]*'
-GP_PRE='([A-Za-z_][A-Za-z0-9_]*='"$GP_VAL"'[[:space:]]+|(sudo|command|env|exec|time|nohup|nice|builtin|xargs)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)*'
+GP_OPTV='(-[^[:space:]]+[[:space:]]+('"$GP_VAL"'[[:space:]]+)?)*'
+GP_PRE='([A-Za-z_][A-Za-z0-9_]*='"$GP_VAL"'[[:space:]]+|(sudo|doas|command|env|exec|time|nohup|nice|ionice|setsid|stdbuf|caffeinate|builtin|xargs)[[:space:]]+'"$GP_OPTV"'|timeout[[:space:]]+'"$GP_OPTV"'[0-9.]+[smhd]?[[:space:]]+)*'
 GP_OPT='([[:space:]]+(-[Cc][[:space:]]+'"$GP_VAL"'|--(git-dir|work-tree|namespace|super-prefix|config-env)[[:space:]]+'"$GP_VAL"'|--?[A-Za-z][A-Za-z-]*(='"$GP_VAL"')?))*'
-GP_RE="${GP_START}${GP_PRE}([^[:space:]]*/)?git${GP_OPT}[[:space:]]+push([[:space:]]|\$|[;&|)}\"${SQ}])"
+GP_GIT='("([^"[:space:]]*/)?git"|'"$SQ"'([^'"$SQ"'[:space:]]*/)?git'"$SQ"'|\\?([^[:space:]]*/)?git)'
+GP_RE="${GP_START}${GP_PRE}${GP_GIT}${GP_OPT}[[:space:]]+push([[:space:]]|\$|[;&|)}\"${SQ}\`])"
+# DISK FLOOR (delta 5 in the header above). The `case` is the cheap pre-filter and the ONLY statement every other command runs: a bash builtin whose xtrace line
+# test/heimdall-precheck-bash.test.sh's equiv() already drops, so its byte-for-byte comparison against the historical inline chain is untouched. Everything below it
+# (the regex, the lib, df) runs only for a command that names a *.test.sh or run-all.sh -- and denies only when that command RUNS one.
+case $CMD in
+  *test.sh*|*run-all.sh*)
+    DF_PATH='["'"$SQ"']?([^[:space:]"'"$SQ"';&|()<>]*/)?([A-Za-z0-9_.+-]+\.test|run-all)\.sh'
+    # a shell may carry flags before the script (-x, -e, -u, -o pipefail, --norc ...) but never -n: noexec reads the file and runs nothing
+    DF_FLAGS='(-[A-Za-mo-z]+[[:space:]]+|[-+]o[[:space:]]+[A-Za-z]+[[:space:]]+|--[A-Za-z-]+[[:space:]]+)*'
+    DF_WRAP='((g?timeout)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*[0-9][0-9.]*[smhd]?[[:space:]]+|caffeinate[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)*'
+    DF_RE="${GP_START}${GP_PRE}${DF_WRAP}((sh|bash|zsh|dash|ksh)[[:space:]]+${DF_FLAGS}|(source|\.)[[:space:]]+)?${DF_PATH}(\$|[[:space:];&|)\"${SQ}])"
+    if printf '%s\n' "$CMD" | grep -qE "$DF_RE"; then
+      DF_LIB="$PLUGIN/bin/lib/hmd_disk_floor.sh"
+      # shellcheck source=lib/hmd_disk_floor.sh disable=SC1091  # the path is $PLUGIN-derived at runtime; the default run never opens sourced files, source= is for -x
+      if [ -r "$DF_LIB" ] && . "$DF_LIB" 2>/dev/null && command -v hmd_disk_floor_check >/dev/null 2>&1; then
+        DF_CWD=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
+        DF_LINES=$(hmd_disk_floor_check "${TMPDIR:-/tmp}" "${DF_CWD:-$PWD}")
+        if [ $? -eq 1 ]; then
+          DF_ESC=$(printf '%s' "${DF_LINES//$'\n'/; }" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: disk floor: %s. This command runs a test file or the sweep, which writes fixtures, clones and temp data, and a full disk fails in ways that look like bugs. Free space first (hmd system-health, or the mac-deep-clean skill), or lower the floor on purpose: set HMD_MIN_FREE_PCT=<n> (0 turns it off) in the environment Claude Code runs in -- an inline HMD_MIN_FREE_PCT=<n> before the command reaches the test but not this hook, which reads its own environment and has already said no. Where you stand: bin/heimdall-disk-floor check."}' "$DF_ESC")"
+        fi
+      fi
+    fi ;;
+esac
 # KILLS BY NAME OR BY A COMPUTED PID are denied (2026-10-12 16:29Z incident). A sub-agent debugging its own temp-repo test ran
 # `pkill -f heimdall-relay-client`; the pattern matched EVERY relay client on the machine -- the operator's two live phone
 # clients and the routine's -- and a client answers SIGTERM by revoking its phone pairing, so both phones were unpaired. A text
@@ -167,31 +241,91 @@ if printf '%s\n' "$CMD" | grep -qE "$GP_RE"; then
   HSTATE="$PLUGIN/bin/heimdall-state"
   [ -x "$HSTATE" ] || HSTATE=heimdall-state
   SLINT="$PLUGIN/bin/heimdall-stop-lint"
-  QGOUT=$("$HSTATE" check-quality-gates 2>&1)
-  QGRC=$?
-  # Work merged from sub-agent worktrees is in no session's edit-tracker ledger, so the per-turn lint receipt never covers it. When
-  # the lint evidence is missing, stale or does not cover the push, lint everything changed since the last push (bounded well inside
-  # the hook's own time: a push gate that times out is a gate that lets the push through) and evaluate the gate once more.
-  if [ "$QGRC" = 2 ] && [ -x "$SLINT" ] && printf '%s' "$QGOUT" | grep -qE 'Lint not clean -- (no-evidence|stale|uncovered|no-coverage)'; then
-    printf 'heimdall: the lint receipt does not cover what this push ships - running %s --since-push (bounded)\n' "$SLINT" >&2
-    if command -v perl >/dev/null 2>&1; then perl -e 'alarm 45; exec @ARGV' "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true
-    else "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true; fi
-    QGOUT=$("$HSTATE" check-quality-gates 2>&1)
-    QGRC=$?
-  fi
-  if [ "$QGRC" = 2 ]; then
-    ESC=$(printf '%s' "$QGOUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-    HINT=""
-    if printf '%s' "$QGOUT" | grep -q 'Lint not clean'; then
-      HINT=" Lint evidence for what this push ships: run \`$SLINT --since-push --repo $PWD\` (lints every file changed since the last push, merged agent work included; add --budget 300 for a big diff). A waiver is not the answer."
-    fi
-    HINT_ESC=$(printf '%s' "$HINT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
-    deny "$(printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing.%s --- %s"}' "$HINT_ESC" "$ESC")"
-  elif [ "$QGRC" = 0 ]; then
-    printf '%s\n' "$QGOUT" >&2
-  else
-    printf 'heimdall: quality-gate verdict UNAVAILABLE (exit %s) - the gates were NEVER EVALUATED, which is not a pass. Run `heimdall-state init` then `heimdall-state mark-clean` in this checkout to arm the pre-push gate. Allowing push to proceed. --- %s\n' "$QGRC" "$QGOUT" >&2
-  fi
+  # PER-REPO TEST/LINT GATE (delta 4 in the header above): one gate per repository this command pushes, chosen by the class
+  # bin/lib/hmd_push_target.py gives it -- sweep (heimdall's own regime: the quality gate below, unchanged, run in THAT repository),
+  # repo-checks (its own declared checks: a green, current, clean-tree receipt, read here, never re-run) or unmanaged (one warning,
+  # the push goes on). No answer from the resolver, or a class this does not know, is the sweep gate on the cwd: it only ever narrows.
+  # The payload's cwd (the shell's own) is where the resolver starts reading paths from; without one it is this process's cwd.
+  PG_HOME="$PWD"
+  PG_BASE=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null)
+  PG_PLAN=$(python3 -I -S "$PLUGIN/bin/lib/hmd_push_target.py" "$PG_BASE" <<<"$CMD" 2>/dev/null)
+  # no answer at all (python or the resolver missing, a hard kill): the strict gate on the session's cwd AND the payload's cwd, never on one of them.
+  # (A resolver that fails while it runs prints its own strict rows for every directory it had reached, so this covers only what it could not even do.)
+  case $PG_PLAN in
+    '') PG_PLAN=$(printf 'sweep\t%s\tfallback\t-' "$PG_HOME")
+        case $PG_BASE in
+          ''|"$PG_HOME") ;;
+          *) PG_PLAN=$PG_PLAN$'\n'$(printf 'sweep\t%s\tfallback\t-' "$PG_BASE") ;;
+        esac ;;
+  esac
+  # a row is `class<TAB>dir<TAB>extra<TAB>gitdir` (`-` for an empty column; gitdir is the git directory resolved together with dir): for repo-checks the commits the push sends (given to `status --pushes`: the receipt must be for every
+  # one; a missing or unreadable list is "cannot be listed" and blocks), for a sweep row `fallback` when it is the strict class only because
+  # the command or git could not be read (then a gate that was never evaluated blocks instead of allowing)
+  while IFS=$'\t' read -r PG_CLASS PG_DIR PG_EXTRA PG_GITDIR; do
+    case "$PG_CLASS" in
+      repo-checks)
+        PG_RUN="$PLUGIN/bin/heimdall-repo-checks"
+        if [ -x "$PG_RUN" ]; then
+          PG_PAIR=()
+          case "$PG_GITDIR" in /*) PG_PAIR=(--git-dir "$PG_GITDIR") ;; esac
+          PG_OUT=$("$PG_RUN" status --repo "$PG_DIR" "${PG_PAIR[@]}" --pushes "$PG_EXTRA" 2>&1)
+          PG_RC=$?
+        else
+          PG_OUT="repo-checks: NOT GREEN - $PG_RUN is missing, so the record of this repository's own checks cannot be read"
+          PG_RC=127
+        fi
+        if [ "$PG_RC" = 0 ]; then
+          printf '%s\n' "$PG_OUT" >&2
+        else
+          ESC=$(printf '%s' "$PG_OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          PG_ESC=$(printf '%s' "$PG_DIR" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: pre-push repo-checks gate failed for %s. This repository declares its own checks (.heimdall/repo-checks.json), so a push needs a green, current, clean-tree record of them for the commit it sends (the heimdall sweep rules do not apply to it). --- %s"}' "$PG_ESC" "$ESC")"
+        fi ;;
+      unmanaged)
+        printf 'heimdall: WARNING - %s is not managed by hmd (no heimdall sweep regime, no .heimdall/repo-checks.json), so no test or lint gate ran for this push; the secret gates below still apply. To gate it, declare its checks in .heimdall/repo-checks.json and record them: %s/bin/heimdall-repo-checks run --repo %s\n' "$PG_DIR" "$PLUGIN" "$PG_DIR" >&2 ;;
+      *)
+        if ! cd "$PG_DIR" 2>/dev/null; then
+          # the gate belongs to THIS directory: running it wherever the hook happens to be would grade another repository. A candidate that does not exist
+          # (a fallback row from a command that could not be read) cannot be pushed from; a directory the resolver just named that cannot be entered blocks
+          case "$PG_EXTRA" in fallback) continue ;; esac
+          PG_ESC=$(printf '%s' "$PG_DIR" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: pre-push gate cannot grade this push: %s is the repository it goes to and cannot be entered, so its quality gate cannot run there (and running it elsewhere would grade another repository)."}' "$PG_ESC")"
+        fi
+        PG_ENVP=()
+        case "$PG_GITDIR" in /*) PG_ENVP=(env GIT_DIR="$PG_GITDIR" GIT_WORK_TREE="$PG_DIR") ;; esac
+        QGOUT=$(case "$PG_GITDIR" in (/*) export GIT_DIR="$PG_GITDIR" GIT_WORK_TREE="$PG_DIR" ;; esac; "$HSTATE" check-quality-gates 2>&1)
+        QGRC=$?
+        # Work merged from sub-agent worktrees is in no session's edit-tracker ledger, so the per-turn lint receipt never covers it. When
+        # the lint evidence is missing, stale or does not cover the push, lint everything changed since the last push (bounded well inside
+        # the hook's own time: a push gate that times out is a gate that lets the push through) and evaluate the gate once more.
+        if [ "$QGRC" = 2 ] && [ -x "$SLINT" ] && printf '%s' "$QGOUT" | grep -qE 'Lint not clean -- (no-evidence|stale|uncovered|no-coverage)'; then
+          printf 'heimdall: the lint receipt does not cover what this push ships - running %s --since-push (bounded)\n' "$SLINT" >&2
+          if command -v perl >/dev/null 2>&1; then "${PG_ENVP[@]}" perl -e 'alarm 45; exec @ARGV' "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true
+          else "${PG_ENVP[@]}" "$SLINT" --since-push --repo "$PWD" --budget 30 >/dev/null || true; fi
+          QGOUT=$(case "$PG_GITDIR" in (/*) export GIT_DIR="$PG_GITDIR" GIT_WORK_TREE="$PG_DIR" ;; esac; "$HSTATE" check-quality-gates 2>&1)
+          QGRC=$?
+        fi
+        if [ "$QGRC" = 2 ]; then
+          ESC=$(printf '%s' "$QGOUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          HINT=""
+          if printf '%s' "$QGOUT" | grep -q 'Lint not clean'; then
+            HINT=" Lint evidence for what this push ships: run \`$SLINT --since-push --repo $PWD\` (lints every file changed since the last push, merged agent work included; add --budget 300 for a big diff). A waiver is not the answer."
+          fi
+          HINT_ESC=$(printf '%s' "$HINT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: pre-push quality gate failed. CLAUDE.md enforces quality gates before git push: all tests passing, lint clean, no untested changes. Fix the failing gate, re-run the suite, then record the result with `heimdall-state mark-clean` before pushing.%s --- %s"}' "$HINT_ESC" "$ESC")"
+        elif [ "$QGRC" = 0 ]; then
+          printf '%s\n' "$QGOUT" >&2
+        elif [ "$PG_EXTRA" = fallback ]; then
+          # the strict class here is only a fallback (the command or git could not be read), so "never evaluated" cannot stand in for a gate
+          ESC=$(printf '%s' "$QGOUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          PG_ESC=$(printf '%s' "$PG_DIR" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+          deny "$(printf '{"error": "BLOCKED: pre-push gate cannot grade this push. The command could not be read exactly (or git failed), so the strict regime applies to %s, and its quality gate was never evaluated (exit %s), so nothing stands in for it. Restate the push plainly (git push <remote> HEAD, or git -C <dir> push), or arm the gate with `heimdall-state init` and `heimdall-state mark-clean` in that checkout. --- %s"}' "$PG_ESC" "$QGRC" "$ESC")"
+        else
+          printf 'heimdall: quality-gate verdict UNAVAILABLE (exit %s) - the gates were NEVER EVALUATED, which is not a pass. Run `heimdall-state init` then `heimdall-state mark-clean` in this checkout to arm the pre-push gate. Allowing push to proceed. --- %s\n' "$QGRC" "$QGOUT" >&2
+        fi ;;
+    esac
+  done <<<"$PG_PLAN"
+  cd "$PG_HOME" 2>/dev/null || true
   if [ -x "$SCAN" ]; then
     if ! OUT=$(SECRET_SCAN_REQUIRE=1 "$SCAN" --require 2>&1); then
       ESC=$(printf '%s' "$OUT" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')

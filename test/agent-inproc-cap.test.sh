@@ -52,10 +52,12 @@ fire() {
   # some bash builds even though extra WAS declared -- only ${#extra[@]}
   # (a count) is safe to reference unconditionally. Two call shapes avoids
   # ever writing the bare expansion when nothing was appended.
+  # HMD_MIN_FREE_PCT=0: this runs the REAL hook, whose disk floor fence (2.4.8) would otherwise read THIS machine's free space (and, under the fail-open fakebins below
+  # that carry no df, print a warning) -- the cap's assertions must not depend on the disk they run on. The fence is proved under a fake df in test/disk-floor.test.sh.
   if [ "${#extra[@]}" -gt 0 ]; then
-    printf '%s' "$pl" | env -i "HOME=$home" "HEIMDALL_HOME=$home/.heimdall" "PATH=$pathv" "${extra[@]}" bash "$REAL_HOOK" >"$OUT" 2>"$ERR"
+    printf '%s' "$pl" | env -i "HOME=$home" "HEIMDALL_HOME=$home/.heimdall" "PATH=$pathv" "HMD_MIN_FREE_PCT=0" "${extra[@]}" bash "$REAL_HOOK" >"$OUT" 2>"$ERR"
   else
-    printf '%s' "$pl" | env -i "HOME=$home" "HEIMDALL_HOME=$home/.heimdall" "PATH=$pathv" bash "$REAL_HOOK" >"$OUT" 2>"$ERR"
+    printf '%s' "$pl" | env -i "HOME=$home" "HEIMDALL_HOME=$home/.heimdall" "PATH=$pathv" "HMD_MIN_FREE_PCT=0" bash "$REAL_HOOK" >"$OUT" 2>"$ERR"
   fi
   RC=$?
 }

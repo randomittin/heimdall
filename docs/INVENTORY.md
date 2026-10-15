@@ -144,7 +144,7 @@ Groups per event: UserPromptSubmit 4 · PreToolUse 7 · PostToolUse 4 · Session
 | SessionStart | `caveman-rules` | no | * | Prints caveman rules into context |
 | SessionStart | `settings-guard` | no | * | Advisory: ANTHROPIC_* overrides persisted in a settings.json env block |
 | SessionStart | `volatile-repo-guard` | no | * | Advisory: clone on volatile disk holding unpushed work |
-| SessionStart | `pair-window-start` | no | * | Records the session in `.heimdall/app/sessions/<id>.json` and opens the repo's pair-by-code window in the background (`hmd app pair-window`) when none is open, under the repo's one code; skipped when gh is signed out or the session is unattended |
+| SessionStart | `pair-window-start` | no | * | Records the session in `.heimdall/app/sessions/<id>.json` and, only for a repo `hmd app connect` was run for (an opt-in record in `$HEIMDALL_HOME`, removed by `hmd app disconnect`), opens the repo's pair-by-code window in the background (`hmd app pair-window`) when none is open and no phone is paired: the code is registered once, the gh token sent once, never renewed on a timer. A repo with a paired phone (a stored login, also one paired before the opt-in existed) has it resumed at every start with no opt-in, no gh call and no token; a repo with neither starts nothing and calls neither gh nor the relay; skipped for an unattended session |
 | SubagentStop | `subagent-metric` | no | * | Records a task outcome for the finished subagent |
 | SubagentStop | `subagent-429-detect` | no | * | Scans the subagent transcript for a 429; marks for fallback routing |
 | Stop | `stop-metric-reminder` | no | * | Metric reminder at main-agent Stop |
@@ -152,7 +152,7 @@ Groups per event: UserPromptSubmit 4 · PreToolUse 7 · PostToolUse 4 · Session
 | Stop | `stop-429-detect` | no | * | Scans the main transcript for a 429 |
 | Stop | `stop-lint` | no | * | Batch-lints every path edited this session; records a real lint receipt (`bin/heimdall-stop-lint`) |
 | SessionEnd | `presence-keeper-stop` | no | * | Stops this session's keeper |
-| SessionEnd | `pair-window-stop` | no | * | Forgets this session's record and closes the repo's pair window (`hmd app pair-window --stop`) unless another live session of the repo, or a running `hmd app connect` client, still needs it |
+| SessionEnd | `pair-window-stop` | no | * | Forgets this session's record and closes the repo's pair window (`hmd app pair-window --stop`) unless another live session of the repo, or a running `hmd app connect` client, still needs it -- or a phone is paired: a paired phone is never stopped or revoked by a session ending |
 | SessionEnd | `session-end-sweep` | no | * | Foreground, alarm-bounded: checkpoint write, then autocommit (the never-lose contract). Background: parallelism grade, `verify-edits --quick`, cleanup, reel, summary card, context-sync; then the farewell |
 | PreCompact | `precompact-checkpoint` | no | * | Auto-checkpoint `.planning/CHECKPOINT.md` before compaction rewrites context (`bin/heimdall-precompact-checkpoint`) |
 
@@ -373,6 +373,8 @@ Derived with: `for f in bin/*; do [ -f "$f" ] && printf '%s\t%s\n' "$(basename $
 | `edit-tracker` (+ `.c`) | PostToolUse edit ledger; autocommit trigger; tool-loop detector |
 | `parallelism-tracker` (+ `.c`, `build-tracker.sh`) | counts solo turns; parallelism grade; loop detector (`HMD_LOOP_THRESHOLD`) |
 | `heimdall-state` | CRUD on `heimdall-state.json` (quality gates, phase) |
+| `heimdall-disk-floor` | `check [--path P]`: is there enough free disk to work? Free percent of the volume holding TMPDIR and the repo (`df -Pk`, Available ÷ size) against `HMD_MIN_FREE_PCT` (default 10, 0 = off). The one definition is `bin/lib/hmd_disk_floor.sh`; it is enforced by the Agent hook (denies a spawn), the Bash hook (denies a command that runs a `*.test.sh` or `test/run-all.sh`) and `test/run-all.sh` (refuses to start, and stops launching suites mid-sweep, beside its own `HMD_TEST_MIN_FREE_GB`). Proof: `test/disk-floor.test.sh` |
+| `heimdall-repo-checks` | a repo's OWN declared checks (`.heimdall/repo-checks.json`), run and recorded as a receipt bound to commit, tree and committed declaration (`run`, `status [--pushes IDS]`: every commit the push sends must be the receipt's); what the push gate passes a non-sweep repo on. A launcher: the CLI is `bin/lib/hmd_repo_checks.py`, the receipt's one definition (fields, types, formats; build and verify) is `bin/lib/hmd_repo_receipt.py`. `bin/lib/hmd_push_target.py` is the resolver that names the repo(s) a push goes to (asked of git), reads their class from the commits (sweep / repo-checks / unmanaged, strictest of HEAD, upstream, origin, refspecs) and fails closed on any construct it does not model exactly |
 | `heimdall-checkpoint` | mechanical, LLM-free auto-save of forward session state |
 | `heimdall-precompact-checkpoint` | PreCompact entry point driving `heimdall-checkpoint` |
 | `heimdall-autocommit` | shared mechanics for the two automatic checkpoint commits |

@@ -63,6 +63,7 @@ CLIENT = H.load_module("hmd_relay_client", H.CLIENT_PATH)
 REPO = H.REPO
 SESSION_CODE_PY = os.path.join(REPO, "bin", "lib", "hmd_session_code.py")
 APP_CODE_PY = os.path.join(REPO, "bin", "lib", "hmd_app_code.py")
+OPTIN_PY = os.path.join(REPO, "bin", "lib", "hmd_pair_optin.py")
 STATUSLINE = os.path.join(REPO, "bin", "heimdall-statusline")
 UI_BIN = os.path.join(REPO, "bin", "heimdall-ui")
 DELIVER = os.path.join(REPO, "bin", "heimdall-inbox-deliver")
@@ -211,9 +212,16 @@ class Scn:
         self.relay = FakeCodeRelay(ttl_s=ttl, gh_login=gh_login, expect_token=H.TOKEN).start()
         self.phone = H.Phone(E2E)
         self.procs = []
+        self.opt_in()
 
     def __enter__(self):
         return self
+
+    def opt_in(self):
+        """This repo is one `hmd app connect` was run for: the record that lets the SessionStart window register a code here (made through the
+        helper connect uses, in this sandbox's HEIMDALL_HOME). Idempotent; made again for a repo that moved (the upgrade case reassigns it).
+        test/pair-window-token-optin.test.sh is where a repo with NO record, and the one-registration default, are proved."""
+        run([sys.executable, OPTIN_PY, "set", "--repo", self.repo], self.env(), timeout=60)
 
     def __exit__(self, *_exc):
         for proc in self.procs:
@@ -231,7 +239,15 @@ class Scn:
         return os.path.join(self.sb.home, ".heimdall")
 
     def env(self, **extra):
-        return self.sb.env(PATH=self.sb.bin + os.pathsep + os.environ.get("PATH", ""), HMD_RELAY_URL=self.relay.url, **extra)
+        # HMD_SESSION_LOGIN_STORE=file: the login that the client of a bound phone stores (what a stopped client resumes with, and what
+        # `hmd app disconnect` revokes through) goes to a 0600 file under the HEIMDALL_HOME of this sandbox -- never into the macOS Keychain
+        # of the machine running the test, which a test sandbox has no business writing to
+        # HMD_PAIR_WINDOW_RENEW=1: the cases of this file were written for the window that renews its code about every 5 minutes -- the explicit
+        # opt-in to that schedule, since the default registers the code once (test/pair-window-token-optin.test.sh). A case may override it.
+        merged = {"HMD_PAIR_WINDOW_RENEW": "1"}
+        merged.update(extra)
+        return self.sb.env(PATH=self.sb.bin + os.pathsep + os.environ.get("PATH", ""), HMD_RELAY_URL=self.relay.url,
+                           HMD_SESSION_LOGIN_STORE="file", **merged)
 
     def app(self, *args, tty=False, env=None):
         argv = [H.APP_PATH, "connect", "--repo", self.repo, "--port", "0"] + list(args)
@@ -265,6 +281,8 @@ class Scn:
         return self.relay.registrations[0]["code"] if self.relay.registrations else None
 
     def hook(self, ident, sid, payload=None, **extra):
+        if ident == "pair-window-start":
+            self.opt_in()
         env = self.env(CLAUDE_PLUGIN_ROOT=REPO, CLAUDE_PROJECT_DIR=self.repo, **extra)
         stdin = json.dumps(dict({"session_id": sid, "source": "startup"}, **(payload or {})))
         return run(["sh", "-c", hook_commands()[ident]], env, stdin=stdin, timeout=60, cwd=self.repo)
@@ -539,10 +557,33 @@ def case_notice_and_statusline():
             shown = render(sl, SID1)
             T.check(os.path.exists(marker) and mode_of(marker) == 0o600 and "paired via code" in shown and "Pixel 9a" in shown,
                     "7. the statusline says `paired via code` with the device, from a 0600 marker the client keeps", shown[:400])
-            c.stop()
+            s.relay.end_session(sid, "revoked")  # the phone's own revoke: the relay ends the session and the client ends with it
             gone = wait_until(lambda: not os.path.exists(marker), 15)
             T.check(gone and "paired via code" not in render(sl, SID1),
-                    "7. when the client ends the marker goes and the note with it", "")
+                    "7. when the phone revokes its session the client ends and the marker goes, and the note with it", "")
+        finally:
+            sl.close()
+
+
+def case_stopped_client_keeps_its_marker():
+    # 2.4.8: a client that is only stopped (TERM, Ctrl-C) does not unpair its phone -- its session login is stored and the next client resumes
+    # that session -- so the statusline's marker stays. Only an end the phone asks for (7) or `hmd app disconnect` takes it down.
+    sl = SL.Sandbox(statusline_fixture())
+    with Scn() as s:
+        try:
+            ok, code, err = code_cli(sl.env(), "--repo", sl.ws)
+            c = s.client(code, repo=sl.ws)
+            c.wait_event("code_window")
+            sid = s.bind(device_label="Pixel 9a")
+            c.wait_event("device_bound", timeout=20)
+            marker = os.path.join(sl.ws, ".heimdall", "app", "paired-%s.json" % code)
+            wrote = wait_until(lambda: os.path.exists(marker), 15)
+            c.stop()
+            T.check(ok == 0 and wrote and c.p.poll() is not None and os.path.exists(marker) and sid not in s.relay.revokes
+                    and not s.relay.get(sid).ended,
+                    "7b. a client that is only stopped does not unpair its phone: it exits, its relay session is neither revoked nor ended, and the "
+                    "statusline's marker stays for the client that resumes it",
+                    "code %r %s wrote %r exit %r revokes %r" % (code, err, wrote, c.p.poll(), s.relay.revokes))
         finally:
             sl.close()
 
@@ -702,7 +743,7 @@ def case_window_is_the_repos():
 #      new one as a clash, whenever the relay keeps a registration longer than that. Against the relay's real 360 s the renewal
 #      falls 350 s on, inside the registration, so the code is claimable all the time; a relay that kept one only 60 s would
 #      leave it dark between a lapse and the floor, which is the price of the back-off
-#   I  and the window stops for good after HMD_PAIR_WINDOW_IDLE_H hours (4; 0 never) with no pairing and no activity in the
+#   I  and -- if the operator opts in with HMD_PAIR_WINDOW_IDLE_H hours (the cases below say 4; unset or 0 is never) -- the window stops for good with no pairing and no activity in the
 #      session (the modification time of the transcript the SessionStart hook hands it); a new session, or `hmd app connect`,
 #      opens it again. Time is injected (HMD_PAIR_WINDOW_NOW_FILE) and the relay's timings are scaled down: nothing sleeps hours.
 def simulated_renewals(due, ttl, hours):
@@ -842,6 +883,7 @@ def start_window(s, sid=SID1, transcript=None, **knobs):
     argv = [H.APP_PATH, "pair-window", "--session", sid, "--pid", str(os.getpid()), "--repo", s.repo, "--relay", s.relay.url]
     if transcript:
         argv += ["--transcript", transcript]
+    s.opt_in()
     return run(argv, s.env(**knobs))
 
 
@@ -911,7 +953,9 @@ class Clock:
 
 
 def idle_knobs(clock, **extra):
-    return dict({"HMD_PAIR_WINDOW_NOW_FILE": clock.path, "HMD_PAIR_WINDOW_POLL_S": "0.2"}, **extra)
+    # the idle stop is the operator's opt-in since 2.4.8 (the default is no idle stop: test/app-session-survives-cc-restart.test.sh proves that), so
+    # the cases that exercise the bound say so: the four hours the window used to default to
+    return dict({"HMD_PAIR_WINDOW_NOW_FILE": clock.path, "HMD_PAIR_WINDOW_POLL_S": "0.2", "HMD_PAIR_WINDOW_IDLE_H": "4"}, **extra)
 
 
 def open_window_or_fail(s, label, **kw):
@@ -936,7 +980,7 @@ def case_idle_stop():
         clock.set(4 * 3600 - 120)
         time.sleep(1.5)
         T.check(alive(sup) and s.window_state() is not None and len(s.relay.registrations) == 1,
-                "I1. four hours less two minutes with no pairing and no activity: the window is still open (the default is four hours)",
+                "I1. four hours less two minutes with no pairing and no activity: the window is still open (HMD_PAIR_WINDOW_IDLE_H=4)",
                 "alive %r state %r registrations %d" % (alive(sup), s.window_state(), len(s.relay.registrations)))
         clock.set(4 * 3600 + 120)
         stopped = wait_until(lambda: not alive(sup), 25)
@@ -1579,6 +1623,8 @@ def case_confirm_idle_bound():
 # followed by a new client -- the same code behind a new session -- after a back-off; a deliberate end (`hmd app disconnect`, the phone's
 # revoke, an auth failure) is not. HMD_PAIR_WINDOW_IDLE_H defaults to 0 (never stop): the code stays claimable for as long as connect
 # runs, and an explicit value is still a cap that ends it (U2, C3). Scaled down like U: floor 2 s, back-off 1 s up to 2 s.
+# A client that crashed AFTER its phone paired is another case (2.4.8): the one connect starts in its place RESUMES that phone's relay session
+# from the login the first stored outside the repo (R2a) -- the code is offered again, and the phone pairs again, only when it cannot (R2b).
 RESPAWN_KNOBS = dict(CONNECT_KNOBS, HMD_CONNECT_RESTART_S="1", HMD_CONNECT_RESTART_MAX_S="2")
 
 
@@ -1652,19 +1698,66 @@ def case_connect_respawns_a_crashed_client():
         T.check(opened is not None, "R1. ...and a phone that types the code pairs on it", "accepted replacement window %s" % (window.id if window else None))
 
 
-def case_connect_logs_a_repair():
-    # A phone that pairs by code on a session connect had to replace says so: one line on connect's output and `repaired` on the
-    # client's code_paired event. The first pairing is announced as before, and carries no such flag.
-    with Scn(ttl=6) as s, purging_lapsed_sessions(s.relay, 2.0):
+def open_state_frame(phone, hmd_pub, sid, frame):
+    """What `frame` (a state frame of relay session `sid`) opens to under the key `phone` holds with hmd (`hmd_pub`, the key hmd revealed to it);
+    None when there is no frame, no key, or the frame does not open -- a failed check, never a crashed case."""
+    if not frame or not hmd_pub:
+        return None
+    try:
+        return phone.open_hmd_frame(hmd_pub, sid, frame)
+    except Exception:  # noqa: BLE001 -- whatever "does not open" raises is the answer
+        return None
+
+
+def case_connect_resumes_a_crashed_clients_phone():
+    # 2.4.8: a client that crashed -- or was killed -- after its phone paired revokes nothing, and the one connect starts in its place RESUMES
+    # that phone's relay session from the login the first stored outside the repo: the phone is not asked to pair again, the code is not offered
+    # again, and the replacement's first frame opens under the key the phone already holds. R2b is what is left once the login cannot be resumed.
+    with Scn(ttl=60) as s:
         s.relay.code_status = one_live_window_per_code(s.relay)
         app = s.app("--relay", s.relay.url, env=dict(RESPAWN_KNOBS, HMD_RELAY_EVENT_LOG=events_path(s)))
         app.close_stdin()
         if not wait_until(lambda: client_pid(s) and s.relay.registrations, 40):
-            T.check(False, "R2. (setup) connect registers the code", app.tail())
+            T.check(False, "R2a. (setup) connect registers the code", app.tail())
+            return
+        first = client_pid(s)
+        sid = s.bind(s.relay.registrations[-1]["session_id"])
+        T.check(wait_until(lambda: "phone paired via code" in app.text(), 30), "R2a. (setup) the first pairing by code is announced as a pairing",
+                app.tail())
+        _opened, hmd_pub = s.paired_state(sid)
+        before, states = len(s.relay.registrations), len(s.relay.frames_of(sid, "state"))
+        os.kill(first, 9)
+        new = new_client(s, first)
+        resumed = wait_until(lambda: connect_events(s, "session_resumed"), 60) if new else None
+        again = bool(resumed) and wait_until(lambda: len(s.relay.frames_of(sid, "state")) > states, 30)
+        opened = open_state_frame(s.phone, hmd_pub, sid, s.relay.frames_of(sid, "state")[-1] if again else None)
+        said = wait_until(lambda: "resumed the paired phone's session" in app.text(), 30)
+        time.sleep(3)  # a code window the replacement wrongly opened would have registered by now
+        T.check(bool(new) and bool(resumed) and opened is not None and said and sid not in s.relay.revokes and not s.relay.get(sid).ended
+                and len(s.relay.registrations) == before,
+                "R2a. a client that crashed after its phone paired is replaced by one that RESUMES the phone's session: the same relay session carries "
+                "on and its first frame opens under the key the phone holds, nothing is revoked, and the code is not offered again (no re-pair)",
+                "new %r resumed %r frames %r opened %r said %r revokes %r registrations %d then %d %s"
+                % (new, bool(resumed), again, opened is not None, said, s.relay.revokes, before, len(s.relay.registrations), app.tail()))
+        paired = connect_events(s, "code_paired")
+        T.check(len(paired) == 1 and not paired[0].get("repaired"),
+                "R2a. the first pairing is the only one: connect's client logs no second code_paired, so none says repaired", json.dumps(paired)[-300:])
+
+
+def case_connect_logs_a_repair():
+    # A phone that pairs by code on a session connect had to replace says so: one line on connect's output and `repaired` on the
+    # client's code_paired event. The first pairing is announced as before, and carries no such flag. Since 2.4.8 a replaced client RESUMES its
+    # phone's session (R2a), so this re-pair is what is left when it cannot: HMD_SESSION_RESUME_H=0 is "never resume", as past the window.
+    with Scn(ttl=6) as s, purging_lapsed_sessions(s.relay, 2.0):
+        s.relay.code_status = one_live_window_per_code(s.relay)
+        app = s.app("--relay", s.relay.url, env=dict(RESPAWN_KNOBS, HMD_RELAY_EVENT_LOG=events_path(s), HMD_SESSION_RESUME_H="0"))
+        app.close_stdin()
+        if not wait_until(lambda: client_pid(s) and s.relay.registrations, 40):
+            T.check(False, "R2b. (setup) connect registers the code", app.tail())
             return
         first = client_pid(s)
         s.bind(s.relay.registrations[-1]["session_id"])
-        T.check(wait_until(lambda: "phone paired via code" in app.text(), 30), "R2. the first pairing by code is announced as a pairing",
+        T.check(wait_until(lambda: "phone paired via code" in app.text(), 30), "R2b. the first pairing by code is announced as a pairing",
                 app.tail())
         before = len(s.relay.registrations)
         os.kill(first, 9)
@@ -1673,14 +1766,14 @@ def case_connect_logs_a_repair():
         # code against the registration the relay accepted
         window = replacement_window(s, before) if new else None
         if window is None:
-            T.check(False, "R2. (setup) the crashed client is replaced and registers the code", app.tail())
+            T.check(False, "R2b. (setup) the crashed client is replaced and registers the code", app.tail())
             return
         s.bind(window.id)
         said = wait_until(lambda: "phone re-paired by code" in app.err().decode("utf-8", "replace"), 30)  # on stderr, as the line promises
         paired = connect_events(s, "code_paired")
-        T.check(said, "R2. a pairing by code on a replaced client is logged on connect's output as a re-pair", app.tail())
+        T.check(said, "R2b. a pairing by code on a replaced client is logged on connect's output as a re-pair", app.tail())
         T.check(len(paired) >= 2 and not paired[0].get("repaired") and paired[-1].get("repaired") is True,
-                "R2. the client's code_paired event says repaired on the second pairing and not on the first", json.dumps(paired)[-300:])
+                "R2b. the client's code_paired event says repaired on the second pairing and not on the first", json.dumps(paired)[-300:])
 
 
 def case_connect_stays_down_when_ended_on_purpose():
@@ -1747,7 +1840,8 @@ def case_connect_stays_down_when_ended_on_purpose():
 #   A4  add-device under a running connect --confirm asks for the compare too, and is refused without a terminal
 #   M2  disconnect --device revokes that phone's session only; plain disconnect ends all (the added ones too)
 #   M6  each phone's push registration is its own;  M7 the GitHub-account check is made for the added phone too
-#   M8  / M9  a phone's client that crashes: the one the window / connect supervises is replaced and its phone pairs again (a logged re-pair)
+#   M8  / M9  a phone's client that crashes: its phone RESUMES its session, no re-pair (2.4.8) -- by the window's look for a phone whose client died (a
+#             --resume-only client; the window also offers its code again) / by connect's replacement client (--resume; no code is offered again)
 #   M11 every phone leaves a notice;  M12 a planted record is no device;  L1 a phone's claimed name is neutralised everywhere it is shown
 def phone_state(s, phone, sid, timeout=30):
     """(the first state frame of relay session `sid` opened with `phone`'s key, hmd's revealed key): (None, b"") when it has none."""
@@ -2023,36 +2117,51 @@ def case_label_is_data():
                 "L1. the client's event log and the device record carry the reduced name too", "event %r records %r" % (logged, labels))
 
 
-def crash_one_of_two(s, tag, sid_b, hmd_b, phone_b):
-    """Two phones are bound: 'Pixel 9a' (s.phone) on the client the window -- or connect -- supervises, 'iPhone 15' (phone_b) on one add-device
-    started. The first phone's client is killed (kill -9): the other is untouched, the supervisor replaces the client, and the crashed phone
-    pairs again by the code and is listed once more."""
+def crash_one_of_two(s, tag, sid_a, hmd_a, sid_b, hmd_b, phone_b, window=False):
+    """Two phones are bound: 'Pixel 9a' (s.phone, relay session `sid_a`, `hmd_a` the key hmd revealed to it) on the client the window -- or connect --
+    supervises, 'iPhone 15' (phone_b) on one add-device started. The first phone's client is killed (kill -9): the other is untouched, and the first
+    is not asked to pair again (2.4.8) -- the dead client revoked nothing, so its stored login is RESUMED: by connect's replacement client, or, with
+    `window`, by the pair window's look for a phone whose client died (a --resume-only client) -- and the same relay session carries on under the key
+    the phone holds. Connect offers no code again; the window's own replacement client does (a new registration), as it always did, for the next phone.
+    The clients the window's look starts log to the event log the caller set (HMD_RELAY_EVENT_LOG), as connect's do."""
     pids = device_pids(s)
     pid_a, pid_b = pids.get("Pixel 9a"), pids.get("iPhone 15")
     T.check(bool(pid_a) and bool(pid_b), "%s. (setup) two phones are bound" % tag, "pids %r" % (pids,))
     if not (pid_a and pid_b):
         return
     before = len(s.relay.registrations)
+    states = len(s.relay.frames_of(sid_a, "state"))
     os.kill(pid_a, 9)
     ack_b = phone_says(s, phone_b, hmd_b, sid_b, 1, "still here")
     T.check(alive(pid_b) and sid_b not in s.relay.revokes and bool(ack_b and ack_b.get("ok")),
             "%s. the other phone is untouched by the crash: its client lives, its session was not revoked, its message is acknowledged" % tag,
             "ack %r revokes %r" % (ack_b, s.relay.revokes))
-    gone = wait_until(lambda: "devices: 1 paired" in ANSI.sub("", app_status(s).stdout), 20)
-    sid_a2, opened, _pub = pair_next(s, s.phone, "Pixel 9a", before, timeout=60)
-    T.check(gone and sid_a2 is not None and opened is not None
-            and wait_until(lambda: "devices: 2 paired" in ANSI.sub("", app_status(s).stdout), 20),
-            "%s. the crashed client is replaced: the dead one is not listed, the code is offered again, the phone pairs again and is listed once more" % tag,
-            "gone %r opened %r" % (gone, opened))
+    resumed = wait_until(lambda: [e for e in connect_events(s, "session_resumed") if e.get("session_id") == sid_a], 60)
+    again = bool(resumed) and wait_until(lambda: len(s.relay.frames_of(sid_a, "state")) > states, 30)
+    opened = open_state_frame(s.phone, hmd_a, sid_a, s.relay.frames_of(sid_a, "state")[-1] if again else None)
+    listed = wait_until(lambda: "devices: 2 paired" in ANSI.sub("", app_status(s).stdout), 20)
+    offered = wait_until(lambda: len(s.relay.registrations) > before, 30) if window else len(s.relay.registrations) == before
+    T.check(bool(resumed) and opened is not None and listed and offered and sid_a not in s.relay.revokes and not s.relay.get(sid_a).ended,
+            "%s. the crashed client is replaced and its phone's session is RESUMED: the same relay session carries on and its first frame opens under the "
+            "key the phone holds, nothing is revoked, the phone is listed once more (no re-pair), and the code is %s" %
+            (tag, "offered again by the window's own replacement client" if window else "not offered again"),
+            "resumed %r frames %r opened %r listed %r offered %r revokes %r registrations %d then %d"
+            % (bool(resumed), again, opened is not None, listed, offered, s.relay.revokes, before, len(s.relay.registrations)))
 
 
 def case_pool_replaces_a_crashed_client():
+    # 2.4.8: the window looks for a phone whose client died as connect does (every HMD_RESUME_RECONCILE_S seconds, 15 by default: 1 here) and starts a
+    # --resume-only client for its stored login. The phone is back on its own session, so this case no longer pairs it again by the code: a phone
+    # that pairs again while its old login is still resumable is brought back on the old session too, and which of the two the case saw first was a
+    # matter of timing (a login that cannot be resumed is the re-pair path: R2b). The clients the look starts log their events where the case reads
+    # them (the window's own code client never logs: _pw_launch_client).
+    knobs = {"HMD_PAIR_WINDOW_POLL_S": "0.2", "HMD_PAIR_WINDOW_RESTART_S": "1", "HMD_PAIR_WINDOW_RETRY_S": "1", "HMD_RESUME_RECONCILE_S": "1"}
     with Scn() as s:
-        _sid_a, sid_b, _hmd_a, hmd_b, phone_b = two_phones(s, {"HMD_PAIR_WINDOW_POLL_S": "0.2", "HMD_PAIR_WINDOW_RESTART_S": "1", "HMD_PAIR_WINDOW_RETRY_S": "1"})
-        if sid_b is None:
+        sid_a, sid_b, hmd_a, hmd_b, phone_b = two_phones(s, dict(knobs, HMD_RELAY_EVENT_LOG=events_path(s)))
+        if sid_a is None or sid_b is None:
             T.check(False, "M8. (setup) two phones are paired by the pair window and add-device", "")
             return
-        crash_one_of_two(s, "M8", sid_b, hmd_b, phone_b)
+        crash_one_of_two(s, "M8", sid_a, hmd_a, sid_b, hmd_b, phone_b, window=True)
 
 
 def case_connect_replaces_a_crashed_client():
@@ -2067,15 +2176,15 @@ def case_connect_replaces_a_crashed_client():
             return
         sid_a = s.relay.registrations[-1]["session_id"]
         s.bind(sid_a, device_label="Pixel 9a")
-        phone_state(s, s.phone, sid_a)
+        _opened_a, hmd_a = phone_state(s, s.phone, sid_a)
         _proc, sid_b, _opened, hmd_b = add_phone(s, phone_b, "iPhone 15", 1)
         if sid_b is None:
             T.check(False, "M9. (setup) a second phone is added under the connect", "")
             return
-        crash_one_of_two(s, "M9", sid_b, hmd_b, phone_b)
+        crash_one_of_two(s, "M9", sid_a, hmd_a, sid_b, hmd_b, phone_b)
         paired = connect_events(s, "code_paired")
-        T.check(len(paired) >= 2 and not paired[0].get("repaired") and paired[-1].get("repaired") is True,
-                "M9. the returning phone's pairing is logged as a re-pair (`repaired`), the first one's is not", json.dumps(paired)[-400:])
+        T.check(len(paired) >= 1 and not any(p.get("repaired") for p in paired),
+                "M9. the crashed phone did not pair again, so no pairing connect's client logged is a re-pair (`repaired`)", json.dumps(paired)[-400:])
 
 
 def case_device_revoke():
@@ -2311,13 +2420,13 @@ def report_children(names, run_one=case_in_child):
 
 def main():
     cases = (case_one_code, case_hooks, case_auto_pair, case_bg, case_identity_mismatch, case_no_sas_anywhere,
-             case_notice_and_statusline, case_confirm, case_gh_signed_out_and_two_sessions, case_window_is_the_repos,
+             case_notice_and_statusline, case_stopped_client_keeps_its_marker, case_confirm, case_gh_signed_out_and_two_sessions, case_window_is_the_repos,
              case_renewal_schedule, case_stream_waits_for_renewal, case_renewal_floor_live, case_renewal_before_lapse_live,
              case_idle_stop, case_idle_stop_off, case_idle_stop_activity, case_idle_stop_spares_a_pairing,
              case_hook_hands_over_the_transcript, case_idle_stop_connect_reopens,
              case_connect_stays_up, case_connect_idle_bound, case_connect_pairing_expired_reinits,
              case_confirm_event_floor, case_confirm_stays_up, case_confirm_reject_renews_at_once, case_confirm_idle_bound,
-             case_connect_respawns_a_crashed_client, case_connect_logs_a_repair, case_connect_stays_down_when_ended_on_purpose,
+             case_connect_respawns_a_crashed_client, case_connect_resumes_a_crashed_clients_phone, case_connect_logs_a_repair, case_connect_stays_down_when_ended_on_purpose,
              case_no_links_followed, case_state_files_link_safe, case_code_not_derivable,
              case_one_phone_by_default, case_add_device_window, case_device_revoke, case_device_cap, case_device_cap_env,
              case_device_push, case_connect_second_phone, case_second_phone_identity, case_pool_replaces_a_crashed_client,

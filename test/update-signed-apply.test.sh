@@ -74,8 +74,12 @@ bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 # NOTHING about the signed-apply proofs below changes: A–H still exercise the real
 # signature-verification and ref-pinning behaviour, only against a sandbox.
 # ══════════════════════════════════════════════════════════════════════════════
+# Every temp path this suite makes lives under ONE private dir that is removed on exit, also on INT/TERM/HUP, and a bare mktemp lands in it even where the
+# platform's mktemp ignores TMPDIR (test/lib/private-tmp.sh); the two EXIT traps below end with hmd_private_tmp_rm because a later trap replaces this one.
+# shellcheck source=lib/private-tmp.sh disable=SC1091  # the default run never opens sourced files
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/private-tmp.sh" && hmd_private_tmp update-signed-apply || exit 1
 SANDBOX="$(mktemp -d -t hmd-apply-sandbox.XXXXXX)"
-trap 'rm -rf "$SANDBOX" 2>/dev/null || true' EXIT
+trap 'rm -rf "$SANDBOX" 2>/dev/null || true; hmd_private_tmp_rm' EXIT
 
 SB_LA="$SANDBOX/LaunchAgents"          # stand-in for ~/Library/LaunchAgents
 SB_HOME="$SANDBOX/heimdall-home"       # stand-in for ~/.heimdall
@@ -153,7 +157,7 @@ fi
 
 WORK="$(mktemp -d -t hmd-apply.XXXXXX)"
 # Replaces the SANDBOX-only trap installed above; both trees must still be reclaimed.
-cleanup() { rm -rf "$WORK" "$SANDBOX" 2>/dev/null || true; }
+cleanup() { rm -rf "$WORK" "$SANDBOX" 2>/dev/null || true; hmd_private_tmp_rm; }
 trap cleanup EXIT
 
 PUB="$WORK/key.pub"; SEC="$WORK/key.key"

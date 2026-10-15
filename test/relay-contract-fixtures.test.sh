@@ -42,6 +42,10 @@ fi
 
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
+# The replay drives a real RelayClient through a bind (the relay's device_bound), and a bind stores the session login (bin/lib/hmd_session_login.py):
+# into a 0600 file under a throwaway HEIMDALL_HOME -- never into the operator's ~/.heimdall (this suite ran with the real one) and never into the
+# macOS Keychain.
+export HEIMDALL_HOME="$TMPROOT/hh" HMD_SESSION_LOGIN_STORE=file
 
 # ── 1. the fixtures are well-formed JSON ──────────────────────────────────────
 for f in "$WIRE" "$VECTORS"; do

@@ -47,10 +47,32 @@
 # (each just appends a line to a marker file and exits 0) plus real evals/ fixture
 # scaffolding — so "did the inline gate run" is answered by "did the marker file
 # get a line", not by parsing gate output.
+#
+# WHICH REPO, SINCE 2.4.8 (2026-10-13, "each repo's own checks, not heimdall's"). The
+# chain no longer runs heimdall's quality gate in whatever directory the session is
+# in: it asks bin/lib/hmd_push_target.py which repository the push goes to and what
+# class of gate that repository owes, read from its COMMITS. So the throwaway plugin
+# root also carries that REAL resolver (and hmd_repo_receipt.py, which it imports: a
+# root without them cannot place any push, and the chain then blocks every push), and
+# every case's repo is a real repo with one commit, on main, that carries heimdall's
+# own sweep regime (a committed test/run-all.sh naming last-sweep.json) -- which is
+# what the repo this dedup is about IS. The old fixtures, a bare `git init`, were
+# exactly the push the resolver cannot place (no commit, `main` names nothing):
+# uncertain, graded strictly, and a strict quality gate that was never evaluated (no
+# heimdall-state.json) BLOCKS instead of warning, so the chain stopped before the
+# oracle and corpus stages this file is about. For a sweep repo with no state file
+# nothing changed: verdict UNAVAILABLE, warned loudly, push allowed
+# (test/pre-push-quality-gate-blocking.test.sh case 3). Case 0 pins the fixture, so
+# no outcome below rests on a repo the chain could not place.
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOKS_JSON="$REPO/hooks/hooks.json"
+# hermetic git: the fixture repos and the resolver's own git calls read nothing from
+# this machine (config, hooks, signing, a stray GIT_DIR)
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+unset GIT_DIR GIT_WORK_TREE
+TAB=$'\t'
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; RESET=$'\033[0m'
 pass=0; fail=0
@@ -73,13 +95,17 @@ trap 'rm -rf "$WORK"' EXIT
 # technique as pre-push-quality-gate-blocking.test.sh) and the run reaches the
 # falsify/corpus section under test.
 FAKE_PLUGIN="$WORK/plugin"
-mkdir -p "$FAKE_PLUGIN/bin" "$FAKE_PLUGIN/evals/oracles/demo-domain/fixtures/mutants" "$FAKE_PLUGIN/evals/corpus"
+mkdir -p "$FAKE_PLUGIN/bin/lib" "$FAKE_PLUGIN/evals/oracles/demo-domain/fixtures/mutants" "$FAKE_PLUGIN/evals/corpus"
 # The chain itself now lives in bin/heimdall-precheck-bash (hooks.json only pipes
 # the payload into "$PLUGIN/bin/heimdall-precheck-bash"), so the fake plugin must
 # carry the REAL script or the wrapper resolves to nothing. It is the code under
 # test, not a fake — the gate bins it calls are still the fakes below.
 cp "$REPO/bin/heimdall-precheck-bash" "$FAKE_PLUGIN/bin/heimdall-precheck-bash"
 chmod +x "$FAKE_PLUGIN/bin/heimdall-precheck-bash"
+# ...and the REAL resolver the script asks which repository a push goes to (it imports
+# hmd_repo_receipt). Not a fake either. heimdall-repo-checks and hmd_repo_checks.py are
+# left out on purpose: no case here declares checks of its own.
+cp "$REPO/bin/lib/hmd_push_target.py" "$REPO/bin/lib/hmd_repo_receipt.py" "$FAKE_PLUGIN/bin/lib/"
 
 MARKERS="$WORK/markers"
 mkdir -p "$MARKERS"
@@ -115,10 +141,14 @@ run_hook() {
   ERR="$(cat "$WORK/stderr")"
 }
 
-new_repo_cwd() {  # new_repo_cwd <n> -> path, a real git repo (no commits needed)
+new_repo_cwd() {  # new_repo_cwd <n> -> path, a real git repo on main with ONE commit: heimdall's own sweep regime
   local d="$WORK/case$1"
-  rm -rf "$d"; mkdir -p "$d"
-  ( cd "$d" && git init -q && git config user.email t@t && git config user.name t )
+  rm -rf "$d"; mkdir -p "$d/test"
+  # test/run-all.sh naming last-sweep.json, committed, is what makes a repo class sweep (the class is read from the commits, never
+  # the work tree); the branch is main because `git push origin main` names a ref that must exist, as it does in a real checkout
+  printf 'RECEIPT_FILE="$RECEIPT_DIR/last-sweep.json"\n' > "$d/test/run-all.sh"
+  ( cd "$d" && git init -q && git symbolic-ref HEAD refs/heads/main && git config user.email t@t && git config user.name t \
+      && git add test/run-all.sh && git -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m "the sweep writer" )
   # The hook's APPLIES/INDEX checks are relative to CWD, not $PLUGIN (a consuming
   # repo carries its OWN evals/ mirroring the domains it cares about) — so each
   # case's cwd needs its own marker fixtures, matching demo-domain in FAKE_PLUGIN.
@@ -137,6 +167,17 @@ wire_native_hook() {  # wire_native_hook <repo-dir>  -> makes core.hooksPath res
 
 printf '\npre-push gate dedup — inline falsify/corpus deferred to the native hook when wired\n'
 printf -- '--------------------------------------------------------------------\n'
+
+# === CASE 0: fixture sanity — the cases' repo is one the resolver POSITIVELY places ==
+# Every outcome below rests on it. A repo the resolver could not place (the strict
+# fallback row, third column `fallback`) would be blocked before the stages under test,
+# and the "did NOT run" assertions (1a, 1b) would then pass for the wrong reason.
+C0="$(new_repo_cwd 0)"
+ROW0="$(cd "$C0" && printf '%s' 'git push origin main' | python3 -I -S "$FAKE_PLUGIN/bin/lib/hmd_push_target.py" "$C0" 2>&1)"
+case "$ROW0" in
+  "sweep${TAB}"*"${TAB}-${TAB}/"*) ok "0 fixture: the case repo is positively class sweep (a committed test/run-all.sh naming last-sweep.json), not the strict fallback" ;;
+  *) bad "0 fixture: the case repo is positively class sweep" "resolver said: $ROW0" ;;
+esac
 
 # === CASE 1: native pre-push hook IS wired -> inline falsify/corpus must NOT run ==
 C1="$(new_repo_cwd 1)"

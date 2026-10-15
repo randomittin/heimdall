@@ -1383,6 +1383,9 @@ while [ $# -gt 0 ]; do
     --ui-port) UI_PORT="${2:-}"; shift 2 ;;
     --public-host) PUBLIC_HOST="${2:-}"; shift 2 ;;
     --status-file) STATUS_FILE="${2:-}"; shift 2 ;;
+    # 2.4.8: `hmd app connect` (and its respawns) pass --resume -- attach to the session a former client left bound, and with none stored pair as
+    # usual. This fake has no stored login to resume, so it pairs: accepting the flag is the whole contract.
+    --resume) shift ;;
     *) echo "fake-relay-client: unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -1528,7 +1531,10 @@ if [ -f "$RSF" ]; then bad "relay.json still present after disconnect"; else ok 
 
 wait "$FG_PID"
 RC=$?
-if [ "$RC" -eq 0 ]; then ok "relay connect (foreground) exits 0 once the client session ends"; else bad "exit $RC: $(cat "$OUT_FILE")"; fi
+# 2.4.8: `disconnect` stops the connect SUPERVISOR first, before any client (left running it would respawn one behind the disconnect). This
+# foreground connect is that supervisor: it ends on the TERM, through its trap (cleanup, then 143), and no longer 0 on its client's own session
+# end -- which is what this check used to say. The client it ran was stopped by that cleanup (the TERM marker above), not by the session ending.
+if [ "$RC" -eq 143 ]; then ok "relay connect (foreground) ends once disconnect stopped it: TERM, after its teardown (exit 143)"; else bad "exit $RC (want 143): $(cat "$OUT_FILE")"; fi
 rm -rf "$D"
 
 # ── relay mode: client exits 11 (E2E unavailable) before pair_init ────────

@@ -38,6 +38,13 @@ REPO="${REPO:-$(cd "$SELF_DIR/.." && pwd)}"
 REF="${REF:-$(git -C "$REPO" rev-parse HEAD)}"
 
 # ── Resolve tool dirs for the stripped PATH (claude/node/git must be findable) ─
+# Every temp path this suite makes lives under ONE private dir that is removed on exit, also on INT/TERM/HUP, and a bare mktemp lands in it even where the
+# platform's mktemp ignores TMPDIR (test/lib/private-tmp.sh). The stranger runs under `env -i`, which drops TMPDIR, the pip/uv cache variables and the mktemp
+# shim on PATH: ISO_ENV hands the first two over, HMD_MKTEMP_SHIM_DIR is put first on each rebuilt PATH below -- a stranger's mktemp, pip and uv write here, not
+# into the user temp dir (that is where the tmp.XXXXXXXXXX dirs holding only .cache/uv came from). The EXIT trap below ends with hmd_private_tmp_rm.
+# shellcheck source=lib/private-tmp.sh disable=SC1091  # the default run never opens sourced files
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/private-tmp.sh" && hmd_private_tmp install-stranger || exit 1
+ISO_ENV=(TMPDIR="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" UV_CACHE_DIR="$UV_CACHE_DIR" PIP_CACHE_DIR="$PIP_CACHE_DIR")
 need() { command -v "$1" >/dev/null 2>&1 || { echo "FATAL: $1 not found on host PATH"; exit 2; }; }
 need claude; need git
 CLAUDE_BIN="$(cd "$(dirname "$(command -v claude)")" && pwd)"
@@ -51,7 +58,7 @@ if [ -z "$NODE_REAL" ] || [ "$NODE_REAL" = "node" ]; then
   fi
 fi
 NODE_BIN="$(cd "$(dirname "$NODE_REAL")" && pwd 2>/dev/null || echo /usr/bin)"
-STRANGER_PATH="$CLAUDE_BIN:$NODE_BIN:$GIT_BIN:/usr/bin:/bin"
+STRANGER_PATH="$CLAUDE_BIN:$NODE_BIN:$GIT_BIN:${HMD_MKTEMP_SHIM_DIR:+$HMD_MKTEMP_SHIM_DIR:}/usr/bin:/bin"
 
 # ── Intercept `claude plugins` for the launch-arm trace probes (§5, §6) ───────
 # Those probes drive the launcher's FIRST-RUN path, whose first_run_setup runs
@@ -85,14 +92,14 @@ run_install() {  # $1=HOME
   # stomp the tester's own live nightly agent with one pointed at this temp checkout
   # (then leave it dangling on cleanup). Opt out so the smoke stays side-effect-free;
   # the schedule wiring itself is proven hermetically in test/dream-install-wire.test.sh.
-  env -i HOME="$1" TERM="dumb" PATH="$STRANGER_PATH" \
+  env -i "${ISO_ENV[@]}" HOME="$1" TERM="dumb" PATH="$STRANGER_PATH" \
     HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
     HEIMDALL_NO_DREAM_SCHEDULE=1 \
     bash "$REPO/install.sh" 2>&1
 }
 in_stranger() { # $1=HOME, rest=cmd — run a command as the stranger would
   local h="$1"; shift
-  env -i HOME="$h" TERM="dumb" PATH="$STRANGER_PATH" "$@" 2>&1
+  env -i "${ISO_ENV[@]}" HOME="$h" TERM="dumb" PATH="$STRANGER_PATH" "$@" 2>&1
 }
 
 TMPH="$(mktemp -d)"
@@ -100,7 +107,7 @@ TMPH="$(mktemp -d)"
 # uninstall-reversal scenarios. Declared up here so the cleanup trap can name it
 # unconditionally under `set -u`.
 PROBE_TREE=""
-trap 'rm -rf "$TMPH" "$FAKE_DIR" ${PROBE_TREE:+"$PROBE_TREE"}' EXIT
+trap 'rm -rf "$TMPH" "$FAKE_DIR" ${PROBE_TREE:+"$PROBE_TREE"}; hmd_private_tmp_rm' EXIT
 
 echo "stranger-install harness  repo=$REPO  ref=${REF:0:12}  HOME=$TMPH"
 echo "--------------------------------------------------------------------"
@@ -228,7 +235,7 @@ fi
 
 # After sourcing the written profile, `hmd` must resolve by bare name on PATH.
 if [ -n "$PROFILE" ]; then
-  WHICH="$(env -i HOME="$TMPH" TERM="dumb" PATH="/usr/bin:/bin" \
+  WHICH="$(env -i "${ISO_ENV[@]}" HOME="$TMPH" TERM="dumb" PATH="/usr/bin:/bin" \
     bash -c "source '$PROFILE' >/dev/null 2>&1; command -v hmd || command -v heimdall" 2>&1)"
   if grep -q '/.local/bin/' <<<"$WHICH"; then
     ok "after sourcing profile, hmd/heimdall resolves on PATH ($WHICH)"
@@ -316,7 +323,7 @@ fi
 SL_SCRIPT="$SL_PLUGIN/hooks/statusline.sh"
 if [ -x "$SL_SCRIPT" ]; then
   SL_OUT_F="$(mktemp)"
-  ( printf '{"cwd":"%s"}' "$TMPH" | env -i HOME="$TMPH" TERM="dumb" PATH="$STRANGER_PATH" \
+  ( printf '{"cwd":"%s"}' "$TMPH" | env -i "${ISO_ENV[@]}" HOME="$TMPH" TERM="dumb" PATH="$STRANGER_PATH" \
       bash "$SL_SCRIPT" >"$SL_OUT_F" 2>&1 ) &
   _slp=$!
   ( sleep 15; kill -9 "$_slp" 2>/dev/null ) & _slk=$!
@@ -437,7 +444,7 @@ fi
 # the install must still COMPLETE — success card rendered, both launchers linked,
 # `hmd demo` still resolving — with a non-fatal degrade note instead of an abort.
 TMPH_G="$(mktemp -d)"
-GRACE_CARD="$(env -i HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
+GRACE_CARD="$(env -i "${ISO_ENV[@]}" HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
   HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
   HEIMDALL_NO_DREAM_SCHEDULE=1 \
   HEIMDALL_FORCE_FAIL_OPTIONAL=1 bash "$REPO/install.sh" 2>&1)"
@@ -461,7 +468,7 @@ fi
 # must turn the soft-skip into a HARD abort: a non-zero exit and NO success card.
 # If this variant still "succeeds", §10's graceful pass means nothing — so this RED
 # variant going GREEN here would itself be the regression. (We assert the abort.)
-HARD_CARD="$(env -i HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
+HARD_CARD="$(env -i "${ISO_ENV[@]}" HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
   HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
   HEIMDALL_NO_DREAM_SCHEDULE=1 \
   HEIMDALL_FORCE_FAIL_OPTIONAL=1 HEIMDALL_HARD_FAIL_OPTIONAL=1 bash "$REPO/install.sh" 2>&1)"
@@ -623,7 +630,7 @@ chmod +x "$PROBE_TREE/bin/heimdall" "$PROBE_TREE/bin/heimdall-dream-schedule" \
 reserved_notty() { # $1=HOME  $2=timeout_s  rest=cmd…
   local _h="$1" _to="$2"; shift 2
   local _of; _of="$(mktemp)"
-  ( env -i HOME="$_h" TERM="dumb" PATH="$STRANGER_PATH" "$@" </dev/null >"$_of" 2>&1 ) &
+  ( env -i "${ISO_ENV[@]}" HOME="$_h" TERM="dumb" PATH="$STRANGER_PATH" "$@" </dev/null >"$_of" 2>&1 ) &
   local _cp=$!
   ( sleep "$_to"; kill -9 "$_cp" 2>/dev/null; pkill -9 -P "$_cp" 2>/dev/null; pkill -9 -f heimdall-demo 2>/dev/null ) &
   local _wp=$!
@@ -794,7 +801,7 @@ EOF
 uninstall_probe() {
   local h="$1"; shift
   local of rc; of="$(mktemp)"
-  env -i HOME="$h" TERM="dumb" PATH="$h/stub:/usr/bin:/bin" \
+  env -i "${ISO_ENV[@]}" HOME="$h" TERM="dumb" PATH="$h/stub:${HMD_MKTEMP_SHIM_DIR:+$HMD_MKTEMP_SHIM_DIR:}/usr/bin:/bin" \
     HEIMDALL_LAUNCH_AGENTS_DIR="$h/LaunchAgents" LAUNCHCTL="$h/stub/launchctl" \
     "$@" "$PROBE_TREE/bin/heimdall" uninstall --yes </dev/null >"$of" 2>&1
   rc=$?
@@ -985,7 +992,7 @@ REAL_PLIST_BEFORE=""
 schedule_probe() {
   local h="$1"; shift
   local of rc; of="$(mktemp)"
-  env -i HOME="$h" TERM="dumb" PATH="$h/stub:/usr/bin:/bin" \
+  env -i "${ISO_ENV[@]}" HOME="$h" TERM="dumb" PATH="$h/stub:${HMD_MKTEMP_SHIM_DIR:+$HMD_MKTEMP_SHIM_DIR:}/usr/bin:/bin" \
     HEIMDALL_LAUNCH_AGENTS_DIR="$h/LaunchAgents" LAUNCHCTL="$h/stub/launchctl" \
     HEIMDALL_DREAM_LOG="$h/dream.log" \
     "$@" "$PROBE_TREE/bin/heimdall-dream-schedule" install --repo "$h" </dev/null >"$of" 2>&1
@@ -1062,7 +1069,7 @@ INSTALLED_SH="$PROBE_TREE/install.sh"
 if [ -f "$INSTALLED_SH" ]; then
   SB="$(new_probe_home)"
   DS_STATE="$( set +e
-    export HOME="$SB" PATH="$SB/stub:/usr/bin:/bin" \
+    export HOME="$SB" PATH="$SB/stub:${HMD_MKTEMP_SHIM_DIR:+$HMD_MKTEMP_SHIM_DIR:}/usr/bin:/bin" \
            HEIMDALL_LAUNCH_AGENTS_DIR="$SB/LaunchAgents" LAUNCHCTL="$SB/stub/launchctl" \
            HEIMDALL_DREAM_LOG="$SB/dream.log" HEIMDALL_INSTALL_SOURCE_ONLY=1
     source "$INSTALLED_SH" >/dev/null 2>&1
@@ -1115,7 +1122,7 @@ git -C "$WT_MAIN" worktree add --detach -q "$WT_EPHEM" >/dev/null 2>&1
 worktree_probe() {
   local h="$1" helper="$2" repo="$3"; shift 3
   local of rc; of="$(mktemp)"
-  env -i HOME="$h" TERM="dumb" PATH="$h/stub:/usr/bin:/bin" \
+  env -i "${ISO_ENV[@]}" HOME="$h" TERM="dumb" PATH="$h/stub:${HMD_MKTEMP_SHIM_DIR:+$HMD_MKTEMP_SHIM_DIR:}/usr/bin:/bin" \
     HEIMDALL_LAUNCH_AGENTS_DIR="$h/LaunchAgents" LAUNCHCTL="$h/stub/launchctl" \
     HEIMDALL_DREAM_LOG="$h/dream.log" HEIMDALL_REAL_HOME="$h" \
     "$@" "$helper" install --repo "$repo" </dev/null >"$of" 2>&1

@@ -1062,7 +1062,10 @@ def main():
     tmp = tempfile.mkdtemp(prefix="view-scenarios-")
     st = gh = None
     try:
-        env = {"HOME": os.path.join(tmp, "home"), "HEIMDALL_HOME": os.path.join(tmp, "home", ".heimdall"), "TMPDIR": tmp}
+        # HMD_SESSION_LOGIN_STORE=file: a bound phone's login goes to a file under this HEIMDALL_HOME, never to the macOS Keychain (under a throwaway
+        # HOME `security` has no default keychain: every bind waited on a Keychain write that cannot succeed and said device_bound seconds late)
+        env = {"HOME": os.path.join(tmp, "home"), "HEIMDALL_HOME": os.path.join(tmp, "home", ".heimdall"), "TMPDIR": tmp,
+               "HMD_SESSION_LOGIN_STORE": "file"}
         os.makedirs(os.path.join(env["HOME"], ".claude"))
         os.environ.update(env, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")  # hermetic: no user git config
         for name in ("CLAUDE_SESSION_ID", "SESSION_ID", "CLAUDE_CODE_SESSION_ID", "HMD_UI_CONTROLS", "HMD_VIEW_RATE_LIMIT", "CLAUDE_CONFIG_DIR",

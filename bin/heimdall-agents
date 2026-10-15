@@ -780,7 +780,7 @@ _collect_candidates() {
 enumerate() {
   local taskdir subdirs reaped cands sessions tsess slug
   local id tr meta mt age term state name kind nstat sess
-  local workdir metaf awaitf candf joined j line
+  local cand_rows joined j line
   local -a c_id=() c_tr=() c_meta=() c_mtsrc=() c_mt=() mvals=() metapaths=() trpaths=()
   taskdir="$(resolve_taskdir)"
   subdirs="$(resolve_subagentsdirs current)"
@@ -828,40 +828,36 @@ enumerate() {
   # THREE batched passes over the full candidate set, joined once below. The
   # classification chain further down is untouched — only where mt/name/kind/
   # awaiting come from changes.
-  workdir="$(mktemp -d "${TMPDIR:-/tmp}/hmd-agents.XXXXXX" 2>/dev/null)" || workdir=""
+  # NO WORK DIR. The three tables used to be written to a `mktemp -d` dir (cand, meta, await) removed by `trap 'rm -rf "$workdir"' RETURN`, and that leaked
+  # one dir per killed call -- 3,731 of them, 218 MB, in one user temp dir by 2026-10-14. A RETURN trap runs when the function returns; it can never run when
+  # the process is KILLED, and a caller's timeout does exactly that to a slow count (the statusline's ceiling: TERM, then KILL 0.3 s later; python's
+  # subprocess timeout: KILL at once). No trap survives SIGKILL, so the tables now reach awk through process substitution: nothing is written to disk, and there is
+  # nothing to strand. test/heimdall-agents-workdir.test.sh parks a call mid-lookup and asserts TMPDIR holds no work dir, then kills it three ways.
+  while IFS= read -r line; do mvals+=("$line"); done < <(_batch_mtimes "${c_mtsrc[@]}")
+  if [ "${#mvals[@]}" -ne "${#c_mtsrc[@]}" ]; then
+    for j in "${!c_mtsrc[@]}"; do mvals[j]="$(_mtime "${c_mtsrc[$j]}")"; done
+  fi
+  for j in "${!c_mtsrc[@]}"; do
+    if [ "${c_mtsrc[$j]}" = "$0" ]; then c_mt+=(0); else c_mt+=("${mvals[$j]}"); fi
+  done
 
-  if [ -n "$workdir" ]; then
-    trap 'rm -rf "$workdir"' RETURN
+  for j in "${!c_id[@]}"; do
+    [ -n "${c_meta[$j]}" ] && metapaths+=("${c_meta[$j]}")
+    [ -n "${c_tr[$j]}" ] && [ -f "${c_tr[$j]}" ] && trpaths+=("${c_tr[$j]}")
+  done
 
-    while IFS= read -r line; do mvals+=("$line"); done < <(_batch_mtimes "${c_mtsrc[@]}")
-    if [ "${#mvals[@]}" -ne "${#c_mtsrc[@]}" ]; then
-      for j in "${!c_mtsrc[@]}"; do mvals[j]="$(_mtime "${c_mtsrc[$j]}")"; done
-    fi
-    for j in "${!c_mtsrc[@]}"; do
-      if [ "${c_mtsrc[$j]}" = "$0" ]; then c_mt+=(0); else c_mt+=("${mvals[$j]}"); fi
-    done
-
-    for j in "${!c_id[@]}"; do
-      [ -n "${c_meta[$j]}" ] && metapaths+=("${c_meta[$j]}")
-      [ -n "${c_tr[$j]}" ] && [ -f "${c_tr[$j]}" ] && trpaths+=("${c_tr[$j]}")
-    done
-
-    candf="$workdir/cand"
-    : > "$candf"
-    for j in "${!c_id[@]}"; do
-      printf '%s\t%s\t%s\t%s\n' "${c_id[$j]}" "${c_tr[$j]}" "${c_mt[$j]}" "${c_meta[$j]}" >> "$candf"
-    done
-    metaf="/dev/null"
-    [ "${#metapaths[@]}" -gt 0 ] && { metaf="$workdir/meta"; _batch_meta_lookup "${metapaths[@]}" > "$metaf"; }
-    awaitf="/dev/null"
-    [ "${#trpaths[@]}" -gt 0 ] && { awaitf="$workdir/await"; _batch_awaiting_lookup "${trpaths[@]}" > "$awaitf"; }
-
-    joined="$(_join_batches "$candf" "$metaf" "$awaitf" "$reaped")"
-  else
-    # mktemp failed (disk full / unwritable tmp) — degrade to the pre-batch,
-    # one-fork-per-candidate path rather than lose classification correctness.
-    # Never expected to run; kept for the "Exit: 0 always... never crashes"
-    # guarantee this file promises everywhere else.
+  cand_rows=""
+  for j in "${!c_id[@]}"; do
+    cand_rows+="${c_id[$j]}"$'\t'"${c_tr[$j]}"$'\t'"${c_mt[$j]}"$'\t'"${c_meta[$j]}"$'\n'
+  done
+  # An empty meta / await table is an empty stream (the old "/dev/null" file), never an error.
+  joined="$(_join_batches <(printf '%s' "$cand_rows") \
+    <([ "${#metapaths[@]}" -gt 0 ] && _batch_meta_lookup "${metapaths[@]}") \
+    <([ "${#trpaths[@]}" -gt 0 ] && _batch_awaiting_lookup "${trpaths[@]}") "$reaped" 2>/dev/null)"
+  if [ -z "$joined" ]; then
+    # Every candidate yields a row, so an empty join means the join itself could not run (no /dev/fd for process substitution, no awk) -- classify the
+    # slow, one-fork-per-candidate way rather than report zero agents. Never expected to run; kept for the "Exit: 0 always... never crashes" guarantee
+    # this file promises everywhere else.
     joined="$(_enumerate_classify_slow "$taskdir" "$reaped" <<< "$cands")"
   fi
 

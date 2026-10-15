@@ -15,6 +15,10 @@
 # still references claude-mem by design (the SessionStart routing/credential
 # scrub) stays a silent, watchdog-bounded no-op when claude-mem is absent.
 set -uo pipefail
+# Every temp path this suite makes lives under ONE private dir that is removed on exit, so a standalone run of this file leaves
+# nothing behind either (test/run-all.sh reports the suites that do).
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/claude-mem-plugin-retire.XXXXXX")" || exit 1; export TMPDIR
+trap 'rm -rf "$TMPDIR"' EXIT
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  PASS %s\n' "$1"; }
