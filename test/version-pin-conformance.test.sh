@@ -166,7 +166,22 @@ find_files() {
     for d in $SCAFFOLDING_DIRS $ARCHIVE_DIRS; do fx+=( -o -name "$d" ); done
   fi
   fx+=( ')' -prune -o "${PUBLISHED_TYPES[@]}" )
-  find "$root" "${fx[@]}" 2>/dev/null | sort
+  find "$root" "${fx[@]}" 2>/dev/null | sort | drop_gitignored "$root"
+}
+
+# drop_gitignored <root> — a file git ignores never ships (local plans, superx-state.json),
+# so a version string in it pins nothing a user receives. Outside a git work tree (the
+# fixtures) every path is kept.
+drop_gitignored() {
+  local root="$1" all ign
+  all="$(cat)"
+  [ -n "$all" ] || return 0
+  if ! git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf '%s\n' "$all"; return 0
+  fi
+  ign="$(printf '%s\n' "$all" | git -C "$root" check-ignore --stdin 2>/dev/null || true)"
+  if [ -z "$ign" ]; then printf '%s\n' "$all"; return 0; fi
+  printf '%s\n' "$all" | grep -vxF -f <(printf '%s\n' "$ign")
 }
 
 # find_archived <root> [dirs] — the files the archive role removed from the published set.

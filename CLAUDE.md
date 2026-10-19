@@ -124,7 +124,7 @@ verdict to a state of the code that never existed.
   absolute load threshold to block a sweep; it can stay high for hours and defer the run
   forever. On a shared busy machine, lower `--jobs` instead of waiting. When the bound
   passes, the sweep runs anyway with half the jobs and `HMD_TEST_REDUCED_PARALLELISM=1`.
-- **Disk floor — 10% free, enforced by hooks (2.4.8; operator directive 2026-10-14).**
+- **Disk floor — 10% free, enforced by hooks (operator directive 2026-10-14).**
   Agent spawns, test runs and single test files all stop below a floor of free disk: a
   full disk fails in ways that look like bugs, and the dev machine was at 7.1% free
   (16.4 GB of 228 GB) while agents ran suites that write fixtures, clones and temp data.
