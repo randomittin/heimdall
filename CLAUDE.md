@@ -174,7 +174,7 @@ verdict to a state of the code that never existed.
   that fails with an unchanged closure is `CLOSURE UNSOUND`: red run, cache purged. Each
   green is stored the moment it finishes, so a red, stopped or cancelled run keeps what it
   proved. The receipt stays `kind:"full"` plus a `cache` block and `full_equivalent`; the
-  push gate and `release/ship.sh` re-derive it (`bin/heimdall-suite-closure
+  push gate and the release script re-derive it (`bin/heimdall-suite-closure
   verify-receipt`), never on the flag's word. `--cold` (or `HMD_COLD=1`) ignores the cache
   and runs every suite: an x.y.0 release needs that cold receipt, a patch release takes a
   cache-composed one, and the first sweep after a runner change is cold by itself.
@@ -190,7 +190,7 @@ verdict to a state of the code that never existed.
 - **Order, `--fail-fast`, keep-awake.** Suites start failed-last-time first, then
   changed-closure, then new, then slowest-first. `--fail-fast` stops starting suites once
   a red is confirmed by its solo re-run, so a red shows in minutes, not at the end; a run
-  it stops early writes `kind:"aborted"`, which the push gate and `release/ship.sh` refuse
+  it stops early writes `kind:"aborted"`, which the push gate and the release script refuse
   by name, so after one: fix, commit, `--failed`. On macOS the runner holds `caffeinate -i
   -w <its pid>` for the whole sweep, so the machine cannot idle to sleep mid-run
   (`HMD_NO_CAFFEINATE=1` opts out).

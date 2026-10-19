@@ -37,7 +37,7 @@ Faster test runs. A full sweep no longer re-runs what did not change, a red swee
 - The docs (CLAUDE.md, agents/heimdall.md, agents/test-runner.md) describe the cache, `--failed`, `--fail-fast` and `--cold`; `agents/coder.md` and the definition of done carry the Lazy Ladder rule for tests: the falsifiability floor never moves, a new suite aims at 10 s or less and calls `bin/heimdall-<sub>` directly.
 
 ### Fixed
-- The 21 shellcheck warnings waived for 2.4.8 are fixed or carry a stated reason.
+- The 21 shellcheck warnings waived in the previous release are fixed or carry a stated reason.
 
 ## [2.4.8] - 2026-10-14 <!-- HEIMDALL:PIN:FROZEN -->
 

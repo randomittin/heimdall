@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install-receipt.sh — the auto-install receipt (2.4.8 M0, interim install transparency).
+# install-receipt.sh — the auto-install receipt (M0, interim install transparency).
 # SOURCED by install.sh, bin/heimdall and bin/discover-skills; defines functions, runs nothing.
 #
 # WHY: the auto-install paths ran `claude plugins install … || true`, fell back to an unlisted

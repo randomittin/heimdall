@@ -7,7 +7,7 @@
 #   test/lib/run-all-guards.sh    the sweep's preflight (exit 5) and its re-check before every suite (REFUSED suites)
 #   bin/heimdall-disk-floor       the same, for a human: `check [--path P]`
 #
-# WHY (2.4.8; operator directive 2026-10-14: "a disk-space floor of 10%, enforced by hooks: agent spawns, test runs, each test file"). The dev
+# WHY (operator directive 2026-10-14: "a disk-space floor of 10%, enforced by hooks: agent spawns, test runs, each test file"). The dev
 # machine sat at 7.1% free (16.4 GB of 228 GB) while agents ran suites that write fixtures, clones and temp data. A full disk fails in ways that
 # look like bugs (a truncated receipt, a git object that will not write), and nothing stopped the next agent, or the next sweep, from making it
 # worse. test/run-all.sh already had an absolute floor (HMD_TEST_MIN_FREE_GB, 5 GB); a percentage is the one that scales with the machine, and
