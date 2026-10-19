@@ -99,7 +99,10 @@ def scenario_mark_before_any_revoke():
             paths = sb.logins()
             return len(paths) == 2 and all(read_json(p).get("revoking") is True for p in paths)
 
-        marked = H.wait_until(both_marked, 5.0, 0.1)
+        # what is proved is the ORDER -- every login is marked while the first relay revoke is still in flight (it takes 8 s) -- not a stopwatch on
+        # the disconnect's start (a few process starts: seconds on a loaded machine, and six scenarios now run at once): a disconnect that revokes first
+        # is seen marked only after a revoke has returned, so `in_flight` fails it, whatever this bound is
+        marked = H.wait_until(both_marked, 30.0, 0.1)
         in_flight = relay.revokes == []
         rc = proc.wait(120)
         check("X1", "`hmd app disconnect` marks EVERY stored login `revoking` within seconds -- before the first (slow) relay revoke has returned -- "
@@ -346,14 +349,30 @@ def scenario_midstream_kill():
             M.laptop_down(s)
 
 
+# The scenarios share nothing: each has its own sandbox (HOME, repo, HEIMDALL_HOME), its own loopback relay on a port the OS hands out, its
+# own processes (found by the name of its private temp directory) and its own clock -- and nearly all of their time goes to waiting (a slow
+# relay, a store lock held, five looks of a supervisor). Run one after another they took 126 s; so with no scenario named, main() runs
+# each in a process of its own, all six at once (pair_code_harness.report_children), and prints what each printed in the order they are
+# declared, under one tally. A scenario whose process ends without a tally (killed, crashed) is one failed check that says so.
+SCENARIOS = (scenario_mark_before_any_revoke, scenario_client_guard, scenario_claim_rechecks, scenario_stack, scenario_nothing_survives,
+             scenario_midstream_kill)
+
+
 def main():
+    by_name = {run.__name__: run for run in SCENARIOS}
+    wanted = sys.argv[1:]  # scenario names to run alone, here, one after another (a quick look while working on one); none runs them all
+    unknown = [name for name in wanted if name not in by_name]
+    if unknown:
+        print("no such scenario: %s (scenarios: %s)" % (", ".join(unknown), ", ".join(by_name)), file=sys.stderr)
+        return 2
+    if not wanted:
+        return C.H.report_children(C.H.Tally(), os.path.realpath(__file__), list(by_name))
     try:
-        for run in (scenario_mark_before_any_revoke, scenario_client_guard, scenario_claim_rechecks, scenario_stack, scenario_nothing_survives,
-                    scenario_midstream_kill):
+        for name in wanted:
             try:
-                run()
+                by_name[name]()
             except Exception as e:  # a scenario that cannot run is a failed check, and the next still runs
-                check("ERR", "%s raised %s: %s" % (run.__name__, type(e).__name__, e), False)
+                check("ERR", "%s raised %s: %s" % (name, type(e).__name__, e), False)
     finally:
         for pid in H.STARTED:
             try:
