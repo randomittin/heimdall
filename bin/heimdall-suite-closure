@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# heimdall-suite-closure -- the static dependency closure of a test suite, its hash, the salt that invalidates every cached result at once,
+# and the verifier that re-derives all of it at a graded commit.
+#
+# This file is only the launcher. The rules, the usage and the contract (`heimdall-suite-closure --help` prints them) are in
+# bin/lib/suite_closure.py, and test/suite-closure.test.sh is the mutation proof that they cannot miss a dependency they claim to see.
+# Python runs isolated (-I -S), like the other hook helpers, so nothing from the cwd or the environment is imported.
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+exec python3 -I -S "$(cd "$(dirname "$SELF")" && pwd)/lib/suite_closure.py" "$@"
