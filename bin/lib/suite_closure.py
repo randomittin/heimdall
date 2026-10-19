@@ -486,22 +486,22 @@ class Graph(object):
             rooted = glued in DIR_VARS
         else:
             rooted = dotdot or tok.startswith("./") or first in DIR_VARS or first in self.top_names
-        found = set()
+        files, dirs = set(), set()
         for i in range(len(parts)):
             s = "/".join(parts[i:])
             multi = i < len(parts) - 1
             node = self.nodes.get(s)
             if node is not None:
-                found.add(node.path)
+                files.add(node.path)
             for node in self.by_suffix.get(s, ()):
                 if multi or (node.kind != "data" and not absolute):
-                    found.add(node.path)
+                    files.add(node.path)
             if dir_ok and rooted and not absolute and (multi or pathlike):
                 for d in self.dir_suffix.get(s, ()):
-                    found.update(self.dir_files[d])
-            if found:
+                    dirs.update(self.dir_files[d])
+            if files or dirs:
                 break
-        return found
+        return frozenset(files), frozenset(dirs)
 
     def _glob(self, raw, before, glued):
         """What a glob after `raw` enumerates: the directory `raw` names (up to its last `/`), or the whole tree after the repo root variable."""
@@ -517,10 +517,11 @@ class Graph(object):
         elif "/" in raw:
             d = raw.rpartition("/")[0] + "/"
         else:
-            return set()
+            return frozenset()
         if not d.strip("/"):
-            return set([WHOLE]) if ROOT_BEFORE_RE.search(before) else set()
-        return self._resolve(d, True, glued)
+            return frozenset([WHOLE]) if ROOT_BEFORE_RE.search(before) else frozenset()
+        files, dirs = self._resolve(d, True, glued)
+        return files | dirs
 
     def _imports(self, path, lines):
         found = set()
@@ -551,9 +552,12 @@ class Graph(object):
         return found
 
     def _scan_lines(self, lines, suite=False):
-        """(the nodes `lines` name, whether they enumerate the whole tree). Only a SUITE can be whole-tree: a tool that runs `git ls-files`
-        in the hub works on whatever repository it is pointed at (a fixture, in nearly every suite), and counting it would make all 500
-        suites whole-tree. A suite that points such a tool at the real repo belongs in test/closure-hints.json as always_run."""
+        """(strong, weak, whole) for `lines`. strong = the files they name (and, in a suite, the directories a glob enumerates): the closure
+        follows what these reach. weak = the directories they merely name: every file in them is part of the closure and is hashed, but what
+        THEY reach is not followed (a script that prints "see docs/" or copies skills/ does not run what is in there). whole = they enumerate
+        the whole tree; only a SUITE can be whole-tree: a tool that runs `git ls-files` in the hub works on whatever repository it is pointed
+        at (a fixture, in nearly every suite), and counting it would make every suite whole-tree. A suite that points such a tool at the real
+        repo belongs in test/closure-hints.json as always_run."""
         keys, gkeys, whole = set(), set(), False
         for line in lines:
             dir_ok = PATH_ASSIGN_RE.search(line) is None
@@ -570,15 +574,18 @@ class Graph(object):
                 if glob:
                     gkeys.add((raw, line[max(0, m.start() - 40):m.start()], glued))
                 keys.add((raw, dir_ok, glued))
-        found = set()
+        strong, weak = set(), set()
         for key in keys:
-            found |= self._resolve(*key)
+            files, dirs = self._resolve(*key)
+            strong |= files
+            weak |= dirs
         for key in gkeys:
-            found |= self._glob(*key)
-        if WHOLE in found:
-            found.discard(WHOLE)
+            (strong if suite else weak).update(self._glob(*key))
+        if WHOLE in strong or WHOLE in weak:
             whole = whole or suite
-        return found, whole
+        strong.discard(WHOLE)
+        weak.discard(WHOLE)
+        return strong, weak - strong, whole
 
     def _scan(self):
         for path in sorted(self.text):
