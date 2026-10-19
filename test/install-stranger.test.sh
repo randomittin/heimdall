@@ -137,6 +137,33 @@ trap 'reap_private_root; rm -rf "$TMPH" "$FAKE_DIR" ${PROBE_TREE:+"$PROBE_TREE"}
 echo "stranger-install harness  repo=$REPO  ref=${REF:0:12}  HOME=$TMPH"
 echo "--------------------------------------------------------------------"
 
+# ── PRE-LAUNCH ────────────────────────────────────────────────────────────────
+# Two groups of installs below feed nothing that runs before them, and each goes into a HOME of its own: the fresh HOME of (5) FIRST-RUN ORDERING ($TMPH3) and
+# the whole graceful-degrade chain of (10)/(10b) ($TMPH_G: the soft-failing install, the launcher's dry demo, then the hard-failing install in the SAME HOME, in that
+# order). Run in line they were most of this file's wall clock -- every install is a clone, a validation gate and a card -- so they start NOW, beside the fresh install
+# on the next lines and every section after it, and the section that used to run them waits for its own job and reads what it wrote. The commands, their environments
+# and their order inside a HOME are the ones that were there; a job that dies without writing its exit status leaves the section's assertions red, never green.
+TMPH3="$(mktemp -d)"
+( run_install "$TMPH3" >/dev/null 2>&1 ) &
+PID_I3=$!
+TMPH_G="$(mktemp -d)"
+GRACE_OUT="$(mktemp -d)"
+(
+  env -i "${ISO_ENV[@]}" HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
+    HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
+    HEIMDALL_NO_DREAM_SCHEDULE=1 \
+    HEIMDALL_FORCE_FAIL_OPTIONAL=1 bash "$REPO/install.sh" >"$GRACE_OUT/grace.card" 2>&1
+  echo "$?" >"$GRACE_OUT/grace.rc"
+  _glnk="$TMPH_G/.local/bin/hmd"; [ -e "$_glnk" ] || _glnk="$TMPH_G/.local/bin/heimdall"
+  if [ -e "$_glnk" ]; then in_stranger "$TMPH_G" "$_glnk" demo --dry >"$GRACE_OUT/gdemo" 2>&1; fi
+  env -i "${ISO_ENV[@]}" HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
+    HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
+    HEIMDALL_NO_DREAM_SCHEDULE=1 \
+    HEIMDALL_FORCE_FAIL_OPTIONAL=1 HEIMDALL_HARD_FAIL_OPTIONAL=1 bash "$REPO/install.sh" >"$GRACE_OUT/hard.card" 2>&1
+  echo "$?" >"$GRACE_OUT/hard.rc"
+) &
+PID_IG=$!
+
 # ── Fresh install ─────────────────────────────────────────────────────────────
 CARD="$(run_install "$TMPH")"
 
@@ -479,17 +506,15 @@ fi
 # HEIMDALL_FORCE_FAIL_OPTIONAL=1 (install.sh's injectable optional-failure hook):
 # the install must still COMPLETE — success card rendered, both launchers linked,
 # `hmd demo` still resolving — with a non-fatal degrade note instead of an abort.
-TMPH_G="$(mktemp -d)"
-GRACE_CARD="$(env -i "${ISO_ENV[@]}" HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
-  HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
-  HEIMDALL_NO_DREAM_SCHEDULE=1 \
-  HEIMDALL_FORCE_FAIL_OPTIONAL=1 bash "$REPO/install.sh" 2>&1)"
-GRACE_RC=$?
+# (the soft-failing install into $TMPH_G, the launcher's dry demo and the hard-failing install of (10b) all ran in the PRE-LAUNCH block above, in that order)
+wait "$PID_IG"
+GRACE_CARD="$(cat "$GRACE_OUT/grace.card" 2>/dev/null)"
+GRACE_RC="$(cat "$GRACE_OUT/grace.rc" 2>/dev/null)"; case "$GRACE_RC" in ''|*[!0-9]*) GRACE_RC=255 ;; esac
 GLNK="$TMPH_G/.local/bin/hmd"; [ -e "$GLNK" ] || GLNK="$TMPH_G/.local/bin/heimdall"
 if [ "$GRACE_RC" -eq 0 ] \
    && grep -qiE 'Heimdall v[0-9].* installed' <<<"$GRACE_CARD" \
    && [ -e "$GLNK" ]; then
-  GDEMO="$(in_stranger "$TMPH_G" "$GLNK" demo --dry 2>&1)"
+  GDEMO="$(cat "$GRACE_OUT/gdemo" 2>/dev/null)"
   if grep -qi 'demo runner not found' <<<"$GDEMO"; then
     bad "graceful-degrade: install completed but hmd demo broke after optional-step failure"
   else
@@ -504,12 +529,10 @@ fi
 # must turn the soft-skip into a HARD abort: a non-zero exit and NO success card.
 # If this variant still "succeeds", §10's graceful pass means nothing — so this RED
 # variant going GREEN here would itself be the regression. (We assert the abort.)
-HARD_CARD="$(env -i "${ISO_ENV[@]}" HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
-  HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
-  HEIMDALL_NO_DREAM_SCHEDULE=1 \
-  HEIMDALL_FORCE_FAIL_OPTIONAL=1 HEIMDALL_HARD_FAIL_OPTIONAL=1 bash "$REPO/install.sh" 2>&1)"
-HARD_RC=$?
-if [ "$HARD_RC" -ne 0 ] \
+# (that hard-failing install already ran, in this same HOME and after the soft one, in the PRE-LAUNCH block above; no exit status written = no abort proven = red)
+HARD_CARD="$(cat "$GRACE_OUT/hard.card" 2>/dev/null)"
+HARD_RC="$(cat "$GRACE_OUT/hard.rc" 2>/dev/null)"; case "$HARD_RC" in ''|*[!0-9]*) HARD_RC="" ;; esac
+if [ -n "$HARD_RC" ] && [ "$HARD_RC" -ne 0 ] \
    && ! grep -qiE 'Heimdall v[0-9].* installed' <<<"$HARD_CARD"; then
   ok "graceful-degrade is falsifiable — forced hard-fail-on-optional aborts (rc=$HARD_RC, no card)"
 else
@@ -526,8 +549,8 @@ rm -rf "$TMPH_G" 2>/dev/null || true
 # exec. The contract this asserts: EVERY setup:* marker precedes launch:task —
 # no interleaving, no setup deferred past the launch. We run on a FRESH HOME so
 # the first-run marker (.setup-done) is absent and the full setup phase fires.
-TMPH3="$(mktemp -d)"
-run_install "$TMPH3" >/dev/null 2>&1
+# (the install into $TMPH3 ran in the PRE-LAUNCH block above)
+wait "$PID_I3"
 LAUNCHER3="$TMPH3/.local/bin/hmd"
 [ -e "$LAUNCHER3" ] || LAUNCHER3="$TMPH3/.local/bin/heimdall"
 # Resolve the installed plugin dir, then remove any setup marker so this is a
