@@ -8,10 +8,10 @@ now stores this login here. A new client resumes the same relay session whenever
 unless the operator bounds that with HMD_SESSION_RESUME_H -- and `hmd app disconnect` revokes through it when no client is left to ask.
 
 WHERE. Never in the repo (a repository controls everything under it), never in argv, an environment variable or a log:
-  * the SECRET half -- {"token", "priv"} -- goes to the macOS Keychain when `security` is there (one generic-password item per
-    repo realpath + session: service "heimdall-relay-session", account "<sha256(realpath)[:16]>-<session id>"), written through
-    `security -i` so it travels on its stdin and not in its argv, and read back to be sure it was kept; else (no Keychain, or it
-    refused) it is held in the metadata file itself;
+  * the SECRET half -- {"token", "priv"} -- goes to the macOS Keychain when `security` is there AND a keychain exists for this HOME
+    (one generic-password item per repo realpath + session: service "heimdall-relay-session", account "<sha256(realpath)[:16]>-<session
+    id>"), written through `security -i` so it travels on its stdin and not in its argv, and read back to be sure it was kept; else (no
+    Keychain, or it refused) it is held in the metadata file itself;
   * the METADATA half is a 0600 JSON file, $HEIMDALL_HOME/app/sessions/<account>.json (HEIMDALL_HOME, else ~/.heimdall), written
     through bin/lib/hmd_private_state.py: session id, relay, device id and label, when it bound, when its client was last alive (and its
     pid), and the two sequence numbers a resumed client must never go back on -- hmd_seq is the HIGH-WATER of the seq blocks handed out
@@ -19,7 +19,16 @@ WHERE. Never in the repo (a repository controls everything under it), never in a
     a nonce, which is only sender tag || seq -- is never sealed twice under one key, whatever kills the client), last_device_seq the
     phone's newest accepted command seq (the replay guard). Fields like these only ever grow (_merge), and every read-modify-write runs
     under one exclusive store lock (_locked).
-HMD_SESSION_LOGIN_STORE=file|keychain|auto (default auto: the Keychain on macOS when `security` is on PATH) picks the secret's home.
+HMD_SESSION_LOGIN_STORE=file|keychain|auto (default auto: the Keychain on macOS when `security` is on PATH and a keychain exists for this HOME)
+picks the secret's home.
+NEVER A DIALOG. Storing an item where there is no keychain -- a throwaway HOME (`env -i HOME=...`, a test harness, a stranger's sandbox) has none --
+makes macOS open "Keychain Not Found ... Reset To Defaults" and `security -i` waits for a human to answer it (seen mid-sweep, 2026-10-19). So nothing
+that stores, reads or removes an item runs before `security default-keychain` -- which only reads, and says "A default keychain could not be found"
+(exit 1) when there is none -- has named a keychain that is a file on disk under $HOME/Library/Keychains. No HOME, no such file, another account's
+keychain (a `security` that ignores HOME), a default keychain kept somewhere else or a `security` that does not answer in time: there is no keychain,
+and auto uses the file (one notice on stderr says why) while HMD_SESSION_LOGIN_STORE=keychain is an OSError. A login whose keychain is not there
+cannot have its secret read or its item removed from here: it is kept (a revoke fails loudly) and a discard drops only the file. Every `security`
+call is killed after HMD_SECURITY_TIMEOUT_S seconds (a number above 0; default 20), so a prompt nobody answers holds a process that long, never for ever.
 
 NO LIMIT BY DEFAULT. A paired phone must not drop because Claude Code ended, restarted, resumed or sat idle -- or because a weekend went by. So a
 stored login is resumed however long ago its client was last alive: only an explicit disconnect, a revoke from the phone or a failed login
@@ -87,6 +96,7 @@ DEVICE_TOKEN_TTL_S = 30 * 24 * 3600  # relay/src/pairing.ts DEVICE_TOKEN_TTL_S: 
 APP_LOG_REL, APP_LOG = "logs", "app.log"  # $HEIMDALL_HOME/logs/app.log: the human-readable line of what was done to a stored login
 EVENT_LOG_MAX_BYTES = 4 * 1024 * 1024  # where the relay client's event log rotates (bin/heimdall-relay-client)
 FORGOTTEN = 4  # exit of `revoke --forget-local`: nothing failed, but a login was dropped here with the relay NOT told
+SECURITY_TIMEOUT_S = 20  # a `security` call that has not answered by then is killed (HMD_SECURITY_TIMEOUT_S sets it): see security_timeout_s
 
 
 def _sibling(name):
@@ -133,20 +143,97 @@ def account(root, sid):
 
 
 def _backend():
+    """Where a NEW secret goes, "file" or "keychain" -- decided without any call that can prompt (NEVER A DIALOG, above). HMD_SESSION_LOGIN_STORE=file
+    is the file; =keychain is the Keychain, or an OSError when there is no keychain for this HOME to put it in; anything else is auto: the Keychain on
+    macOS when `security` is on PATH and a keychain exists for this HOME, else the file, with one notice on stderr that says why."""
     want = (os.environ.get("HMD_SESSION_LOGIN_STORE") or "auto").strip().lower()
-    if want in ("file", "keychain"):
-        return want
-    return "keychain" if sys.platform == "darwin" and shutil.which("security") else "file"
+    if want == "file" or (want != "keychain" and not (sys.platform == "darwin" and shutil.which("security"))):
+        return "file"
+    if _default_keychain() is not None:
+        return "keychain"
+    user_home = os.environ.get("HOME")
+    why = ("no keychain under %s" % os.path.join(user_home, "Library", "Keychains")) if user_home else "no HOME to find a keychain under"
+    if want == "keychain":
+        raise OSError("HMD_SESSION_LOGIN_STORE=keychain, but there is %s" % why)
+    sys.stderr.write("hmd_session_login: %s, so the session login is kept in a 0600 file under %s (HMD_SESSION_LOGIN_STORE=file chooses that "
+                     "without this notice)\n" % (why, home() or "HEIMDALL_HOME"))
+    return "file"
 
 
 # -- the Keychain: `security -i` takes its commands on stdin, so a secret is never in an argument list --------------------------------
-def _security(args, stdin=None):
-    done = subprocess.run(["security"] + args, input=stdin, capture_output=True, text=True, timeout=20)
+class NoKeychain(OSError):
+    """There is no keychain for this HOME to talk to: nothing that could prompt for one was run."""
+
+
+def security_timeout_s():
+    """Seconds a `security` call may take before it is killed: HMD_SECURITY_TIMEOUT_S when that is a number above 0 and at most an hour, else
+    SECURITY_TIMEOUT_S. A prompt nobody answers holds a process for that long, never for ever."""
+    try:
+        seconds = float(os.environ.get("HMD_SECURITY_TIMEOUT_S", "").strip())
+    except ValueError:
+        return SECURITY_TIMEOUT_S
+    return seconds if 0 < seconds <= 3600 else SECURITY_TIMEOUT_S
+
+
+def _run_security(args, stdin=None):
+    """`security` + args -> (exit code, stdout), killed at the timeout. Its stdin is the text given or nothing -- never this process's own, so it
+    cannot wait on a terminal either."""
+    feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    done = subprocess.run(["security"] + args, capture_output=True, text=True, timeout=security_timeout_s(), **feed)
     return done.returncode, done.stdout
 
 
+def _inside(directory, base):
+    """True when `directory` is `base` or somewhere below it -- compared as the directories themselves (device and inode), so a link in HOME or a
+    case-insensitive volume cannot make one look like another, nor a name that merely starts with HOME's pass for inside it."""
+    try:
+        while True:
+            if os.path.samefile(directory, base):
+                return True
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                return False
+            directory = parent
+    except OSError:
+        return False
+
+
+def _default_keychain():
+    """The keychain an item stored now would go into, or None -- found out WITHOUT a call that can prompt: `security default-keychain` only reads (with
+    no keychain it says "A default keychain could not be found" and exits 1; storing an item there is what opens the dialog). It counts only as a file
+    that exists AND lives under $HOME/Library/Keychains: a `security` that names another account's login keychain for a HOME that is not that
+    account's must not be written to either. No HOME, no keychain."""
+    user_home = os.environ.get("HOME")
+    if not user_home:
+        return None
+    try:
+        rc, out = _run_security(["default-keychain"])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        path = line.strip()
+        if len(path) > 1 and path[0] == path[-1] == '"':
+            path = path[1:-1]
+        if os.path.isabs(path) and os.path.isfile(path) and _inside(os.path.dirname(path), os.path.join(user_home, "Library", "Keychains")):
+            return path
+    return None
+
+
+def _security(args, stdin=None):
+    """Run `security` to store, read or remove an item -- the only way this module does -- and only where a keychain exists for this HOME: NoKeychain
+    otherwise, with nothing run, so macOS is never asked to put an item into a keychain that is not there."""
+    if _default_keychain() is None:
+        raise NoKeychain("there is no keychain for this HOME")
+    return _run_security(args, stdin)
+
+
 def _kc_get(acct):
-    rc, out = _security(["find-generic-password", "-a", acct, "-s", SERVICE, "-w"])
+    try:
+        rc, out = _security(["find-generic-password", "-a", acct, "-s", SERVICE, "-w"])
+    except NoKeychain:
+        return None  # no keychain, so no item to read: the secret cannot be had from here
     return out.rstrip("\n") if rc == 0 and out.strip() else None
 
 
@@ -157,7 +244,10 @@ def _kc_put(acct, text):
 
 
 def _kc_del(acct):
-    _security(["delete-generic-password", "-a", acct, "-s", SERVICE])
+    try:
+        _security(["delete-generic-password", "-a", acct, "-s", SERVICE])
+    except NoKeychain:
+        return None  # no keychain, so no item to remove: the login's file is all there is to delete
 
 
 # -- the metadata file ----------------------------------------------------------------------------------------------------------------
@@ -265,7 +355,8 @@ def _record_drop(root, sid):
 
 def save(root, relay, sid, secret, **fields):
     """Keep the login of session `sid` (secret = {"token", "priv"}; fields = the metadata). The secret first, the metadata last, so a
-    record never names a secret that was not kept. Raises OSError when nothing could be written."""
+    record never names a secret that was not kept. Raises OSError when nothing could be written -- or, under HMD_SESSION_LOGIN_STORE=keychain,
+    when there is no keychain for this HOME (the caller asked for the Keychain and nothing else: it is not quietly a file)."""
     acct = account(root, sid)
     now = int(time.time())
     rec = dict(fields, v=1, repo=os.path.realpath(root), relay=relay, session_id=sid, created_at=now, last_alive=now)

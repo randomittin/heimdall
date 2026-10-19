@@ -39,7 +39,7 @@
 #   stderr  every advisory: gate verdicts, "UNAVAILABLE" notices, the native-hook
 #           delegation line, falsify/corpus output, and a copy of every deny verdict.
 #   exit 2  DENY — a gate failed (secret in staged diff, quality gate rc 2, push
-#           secret gate, self-scan, non-falsifiable oracle, corpus regression).
+#           secret gate, self-scan, non-falsifiable oracle, corpus regression, CI waste guard).
 #   exit 0  everything else, including "gate never evaluated" (the quality-gate
 #           verdict UNAVAILABLE branch warns and allows, as before).
 #
@@ -57,6 +57,9 @@
 #   HMD_KILL_GUARD     off, 0, false or no (any case) turns the kill guard off: none of it runs and nothing is printed.
 #                       Unset or any other value leaves it ON. Only that guard: every other gate still runs. An env switch,
 #                       not `heimdall-hooks disable`: the guard sits in this chain, a LOCKED hooks.json group.
+#   HMD_CI_RERUN_ALLOW  exactly 1 turns the CI waste guard off (no empty commit, CI re-run or re-dispatch is denied): none of it runs. Read from THIS hook's
+#                       environment, so an inline `HMD_CI_RERUN_ALLOW=1 git commit --allow-empty ...` reaches git, not the hook that has already said no.
+#                       Unset, empty, 0, true or any other value leaves it ON. Only that guard: every other gate still runs.
 #
 # Deliberately NO `set -e`, `set -u` or `pipefail`: the inline string ran under
 # Claude Code's plain `sh -c`/`bash -c` defaults, and its logic depends on them —
@@ -65,14 +68,16 @@
 #
 # -h, --help   print this header (the hook never passes arguments).
 case "${1:-}" in
-  -h|--help) sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-# SINCE THE EXTRACTION — five deliberate deltas from the historical inline chain
+# SINCE THE EXTRACTION — six deliberate deltas from the historical inline chain
 # (2026-10-11, "precheck never blocks silently in another repo"; then "never execute the session's
-# repo"; 2026-10-13, "each repo's own checks, not heimdall's"; 2.4.8, "a disk-space floor").
+# repo"; 2026-10-13, "each repo's own checks, not heimdall's"; 2.4.8, "a disk-space floor";
+# 2026-10-19, "never pay CI minutes to re-roll a flaky result").
 # test/heimdall-precheck-bash.test.sh cases 17, 21 and 24-29 pin the first three,
-# test/heimdall-push-gate-per-repo.test.sh the fourth, test/disk-floor.test.sh the fifth;
+# test/heimdall-push-gate-per-repo.test.sh the fourth, test/disk-floor.test.sh the fifth,
+# test/ci-waste-guard.test.sh the sixth;
 # every other branch is still byte-identical to the inline string.
 #
 #   1. deny(): a deny states its verdict on stderr TOO. Claude Code surfaces ONLY stderr for an
@@ -146,6 +151,13 @@ esac
 #      see (`bash "$f"`, a loop over a glob) is not caught, and run-all.sh checks for itself. FAILS OPEN, like the Agent hook's fence: no lib in the plugin root, or a df that cannot
 #      answer (the lib warns on stderr), is an allow; only a volume that was READ and is under the floor denies. HMD_MIN_FREE_PCT is read from THIS hook's environment (the one Claude
 #      Code runs in): an inline `HMD_MIN_FREE_PCT=5 bash test/x.test.sh` reaches the test, not this hook, which has already said no.
+#   6. CI WASTE GUARD (2026-10-19; operator: "this must be fixed and you can fix this in hmd harness permanently"). In a client repo an hmd agent worked around a flaky test by pushing an EMPTY commit to retrigger CI and by re-running the workflow twice,
+#      so every attempt cost GitHub Actions minutes and the flake was still there. The hook now DENIES `git commit --allow-empty`, `gh run rerun`, `gh workflow run` and a `gh api` POST to a .../rerun, .../rerun-failed-jobs, .../dispatches or .../rerequest endpoint,
+#      FIRST in the chain: a refused command never reaches git-guard or the secret scan. bin/lib/hmd_ci_guard.py is the one definition (its docstring has the rule): it reads the command the way a shell does by reusing the kill guard's lexer (quotes, wrappers,
+#      chains, subshells, sh -c, eval, heredocs), so text that only MENTIONS a form (echo, grep, a commit message, a -m value) is not a form. The pre-filter starts python ONLY for a command that mentions allow-empty, rerun, rerequest, dispatches or
+#      workflow ... run (quotes and backslashes removed first, as the kill guard does, so --allow-"empty" is still seen): every other command pays for one tr and one case. OPERATOR OVERRIDE: HMD_CI_RERUN_ALLOW=1, read from THIS hook's environment (an inline
+#      prefix reaches the command, not this hook). A COST guard, not a security gate, so it FAILS OPEN like the disk floor and not closed like the kill guard: a helper that is missing, crashes or times out, or a command it cannot read, is one stderr line and
+#      an allow, and only a form it READ denies. Best effort, not a boundary: git and gh are the two tools it reads. Proof: test/ci-waste-guard.test.sh.
 deny() { printf '%s' "$1"; printf '%s\n' "$1" >&2; exit 2; }
 
 INPUT=$(cat)
@@ -153,6 +165,28 @@ CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty')
 PLUGIN="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}"
 SCAN="$PLUGIN/bin/secret-scan"
 GITGUARD="$PLUGIN/bin/heimdall-git-guard"
+# CI WASTE GUARD (delta 6 in the header above), FIRST in the chain so a refused command never runs git-guard or the secret scan. The `case`s are the cheap pre-filter and the ONLY statements an ordinary command runs: a command that mentions
+# none of the trigger words, once quotes and backslashes are removed (as the kill guard does, so --allow-"empty" and re"run" are still seen), never starts python. The helper's exit status is the verdict: 3 denies; 4 (could not read the command)
+# and anything else (a missing helper, a crash, python3 absent) is ONE stderr line and an allow -- a cost guard fails OPEN, like the disk floor. HMD_CI_RERUN_ALLOW=1 (exactly 1) is the operator's switch: none of it runs then.
+# The statements an ordinary command runs here (GP_CI_*, the `tr` and the two `case`s) are dropped by equiv() in test/heimdall-precheck-bash.test.sh like the kill guard's; the python3 call runs only for a command that mentions a trigger word, which no case
+# there does; test/ci-waste-guard.test.sh pins the rest.
+case ${HMD_CI_RERUN_ALLOW:-} in
+  1) GP_CI_NORM= ;;
+  *) GP_CI_NORM=$(tr -d "'\"\\\\" <<<"$CMD") ;;
+esac
+case $GP_CI_NORM in
+  *allow-empty*|*rerun*|*rerequest*|*dispatches*|*workflow*run*)
+    GP_CI_WHY=$(python3 -I -S "$PLUGIN/bin/lib/hmd_ci_guard.py" <<<"$CMD" 2>/dev/null)
+    GP_CI_RC=$?
+    case $GP_CI_RC in
+      0) ;;
+      3)
+        GP_CI_ESC=$(printf '%s' "$GP_CI_WHY" | jq -Rsa . | sed -e 's/^"//' -e 's/"$//')
+        deny "$(printf '{"error": "BLOCKED: hmd CI waste guard: %s. Every empty commit, re-run or re-dispatch pays GitHub Actions minutes for the same code (2026-10: an agent in a client repo pushed an empty commit and re-ran the workflow twice instead of fixing one flaky test). A test must not depend on the wall-clock speed of a shared runner. If a re-run is wanted on purpose, the OPERATOR sets HMD_CI_RERUN_ALLOW=1 in the environment Claude Code runs in: an inline HMD_CI_RERUN_ALLOW=1 in front of the command is seen by that command only, not by this hook, which reads its own environment and has already said no. This guard is best-effort cost control, not a security boundary."}' "$GP_CI_ESC")" ;;
+      4) printf 'heimdall ci guard: %s -- no CI-waste check for this command, allowing\n' "$GP_CI_WHY" >&2 ;;
+      *) printf 'heimdall ci guard: the guard itself failed (exit %s) -- no CI-waste check for this command, allowing\n' "$GP_CI_RC" >&2 ;;
+    esac ;;
+esac
 if [ -x "$GITGUARD" ] && printf '%s\n' "$CMD" | grep -qE '(^|[;&|]|[[:space:]])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+(add|commit|merge|rebase|stash|cherry-pick|revert|am|apply|pull)([[:space:]]|$)'; then
   "$GITGUARD"
 fi

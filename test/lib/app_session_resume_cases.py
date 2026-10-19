@@ -562,6 +562,9 @@ def run(a):
             return 0
         return 44
     return 1
+if argv[:1] == ["default-keychain"]:
+    sys.stdout.write('    "%s"\\n' % os.path.join(os.path.realpath(os.environ["HOME"]), "Library", "Keychains", "login.keychain-db"))
+    sys.exit(0)
 if argv[:1] == ["-i"]:
     for line in sys.stdin:
         parts = shlex.split(line)
@@ -572,17 +575,27 @@ sys.exit(run(argv))
 '''
 
 
+def install_fake_security(sb):
+    """The fake `security` first on PATH, and the login keychain it reports for the sandbox's HOME: an empty file where `security default-keychain`
+    says it is -- the session login store talks to a keychain only when one exists under HOME (bin/lib/hmd_session_login.py). (the directory
+    the fake keeps its items in, the environment of the processes that are to use it)"""
+    store = os.path.join(sb.tmp, "kc")
+    os.makedirs(store)
+    keychains = os.path.join(sb.home, "Library", "Keychains")
+    os.makedirs(keychains)
+    open(os.path.join(keychains, "login.keychain-db"), "w", encoding="utf-8").close()
+    fake = os.path.join(sb.bin, "security")
+    with open(fake, "w", encoding="utf-8") as f:
+        f.write(FAKE_SECURITY)
+    os.chmod(fake, 0o755)
+    return store, dict(HMD_SESSION_LOGIN_STORE="keychain", FAKE_SECURITY_DIR=store, PATH=sb.bin + os.pathsep + os.environ["PATH"])
+
+
 def scenario_keychain():
     sb, relay = Sandbox(), Relay()
     c1 = c2 = None
     try:
-        store = os.path.join(sb.tmp, "kc")
-        os.makedirs(store)
-        fake = os.path.join(sb.bin, "security")
-        with open(fake, "w", encoding="utf-8") as f:
-            f.write(FAKE_SECURITY)
-        os.chmod(fake, 0o755)
-        env = dict(HMD_SESSION_LOGIN_STORE="keychain", FAKE_SECURITY_DIR=store, PATH=sb.bin + os.pathsep + os.environ["PATH"])
+        store, env = install_fake_security(sb)
         c1, sid, _key = bind_phone(sb, relay, **env)
         token = relay.sessions[sid]["token"]
         items = glob.glob(os.path.join(store, "item-*"))
