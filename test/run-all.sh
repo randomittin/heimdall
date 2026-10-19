@@ -927,7 +927,7 @@ _gate_marker_release() {
 }
 # shellcheck disable=SC2329  # invoked by the EXIT trap below; shellcheck does not follow trap handlers
 cleanup() {
-  rm -rf "$WORK"; _gate_marker_release
+  rm -rf "$WORK" ${CACHE_TMP:+"$CACHE_TMP"}; _gate_marker_release
   # The per-suite temp root (test/lib/run-all-guards.sh). run_one removes each suite's own dir right after the suite; this is the net
   # for an aborted sweep (INT/TERM mid-suite): whatever a still-dying suite left, writable or not, goes too.
   if [ -n "${TMP_ROOT:-}" ] && [ -d "$TMP_ROOT" ] && [ ! -L "$TMP_ROOT" ]; then
@@ -1275,6 +1275,7 @@ while [ "$next" -lt "$LAUNCH_END" ] || [ ${#PIDS[@]} -gt 0 ]; do
     else
       NDONE=$((NDONE + 1))
       _progress_line run "$NDONE" "$TO_RUN" "${PIDIDX[$k]}"
+      [ "$CACHE_ON" -eq 0 ] || _cache_store_green "${PIDIDX[$k]}"
       LAST_PROGRESS_T=$(date +%s)
       [ "$FAIL_FAST" -eq 1 ] && _ff_note "${PIDIDX[$k]}"
     fi
@@ -1509,9 +1510,12 @@ for i in $(_seq_to "$TO_RUN"); do
     status="PASS"; n_pass=$((n_pass + 1))
   fi
   ROWS+=("$status|$name|$p|$f|$rc|${dur}s")
+  [ "$CACHE_ON" -eq 0 ] || _cache_note_result "$i" "$name" "$status"
   [ "$status" = "PASS" ] || NONGREEN+=("$i|$name|$status")
 done
 [ "$n_notrun" -eq 0 ] || ROWS+=("NOTRUN|(${n_notrun} suites never started)|-|-|-|-")
+if [ "$CACHE_ON" -eq 1 ]; then _cache_epilogue; fi
+n_unsound=${#UNSOUND[@]}
 
 # ── PRESERVE THE EVIDENCE FOR EVERY NON-GREEN SUITE ───────────────────────────────────────
 # $WORK is deleted on exit, so without this every red's output self-destructs and the only
@@ -1576,6 +1580,7 @@ for row in ${ROWS[@]+"${ROWS[@]}"}; do
     DISCREP)  c="$RED" ;;
     REFUSED)  c="$RED" ;;
     NOTRUN)   c="$YEL" ;;
+    CACHED)   c="$GRN" ;;
     UNPARSED) c="$YEL" ;;
     *)        c="" ;;
   esac
@@ -1620,6 +1625,12 @@ if [ "$DISK_HIT" -eq 1 ]; then
   echo "  Free space first (hmd system-health, or the mac-deep-clean skill), or lower HMD_MIN_FREE_PCT / HMD_TEST_MIN_FREE_GB on purpose, then run the sweep again."
   echo ""
 fi
+if [ "$n_unsound" -gt 0 ]; then
+  echo "${RED}${BLD}CLOSURE UNSOUND (${n_unsound})${OFF} — an audited suite FAILED although its closure hash had not changed: the cache served a green the suite no longer earns, so its closure misses something it reads."
+  echo "  The whole suite cache was PURGED (the next sweep is cold). Pin each suite so it always re-runs -- add {\"<suite>\": {\"always_run\": true}} to test/closure-hints.json and commit it -- or fix the closure (bin/lib/suite_closure.py):"
+  for x in ${UNSOUND[@]+"${UNSOUND[@]}"}; do echo "  bash test/$x"; done
+  echo ""
+fi
 if [ "$n_notrun" -gt 0 ]; then
   echo "${RED}${BLD}FAIL-FAST${OFF} — stopped after ${FF_TRIP_NAME} was red; ${n_notrun} suite(s) were never started (NOTRUN). This run is ABORTED, not a sweep: the push gate and release/ship.sh refuse its receipt."
   for x in "${NOTRUN[@]:0:15}"; do echo "    bash test/$x"; done
@@ -1658,6 +1669,11 @@ echo "suites: $((TO_RUN - n_refused - n_notrun)) ran, ${#SKIP[@]} skipped (live)
 echo "        ${GRN}${n_pass} pass${OFF}  ${RED}${n_fail} fail${OFF}  ${RED}${n_timeout} timeout${OFF}  ${RED}${n_discrep} discrepancy${OFF}  ${YEL}${n_unparsed} unparsed${OFF}"
 echo "assertions: ${tot_p} passed, ${tot_f} failed  (parsed detail; exit codes above are authoritative)"
 echo "wall clock: ${ELAPSED}s"
+if [ "$CACHE_ON" -eq 1 ]; then
+  _oldest="$(printf '%s' "${CACHE_JSON:-null}" | jq -r '.oldest_entry_age_days // "-"' 2>/dev/null || echo -)"
+  echo "cache: ${N_FRESH} fresh, ${n_cached} cached (audited ${N_AUDITED_RAN}), oldest ${_oldest}d"
+  [ "$CACHE_STORE_FAIL" -eq 0 ] || echo "${YEL}cache: ${CACHE_STORE_FAIL} green result(s) could not be stored (reasons: ${CACHE_TMP}/store.err)${OFF}"
+fi
 echo "load avg:   start ${LOAD_START_DISP} (1m/5m/15m) -> end ${LOAD_END_DISP} (1m/5m/15m)   cpu_count=${NCPU:-n/a}"
 if [ "$n_notrun" -gt 0 ]; then
   echo "${RED}sweep kind: ABORTED by --fail-fast after ${FF_TRIP_NAME} (${n_notrun} suite(s) never started; it was meant to be ${SWEEP_KIND}) -- recorded as kind=aborted, which the push gate and release/ship.sh refuse${OFF}"
