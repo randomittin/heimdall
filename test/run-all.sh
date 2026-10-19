@@ -79,8 +79,8 @@
 #   test/run-all.sh --cold              # ignore the suite cache: every suite runs and every green is stored; the receipt is cold (an x.y.0 release needs one)
 #   test/run-all.sh --no-cache          # leave the suite cache alone: no lookup, no store, a legacy receipt without a cache block
 #   test/run-all.sh --failed            # amend the last receipt: run its non-green suites and every suite without a valid cache entry (closure changed, new,
-#                                       # expired); the rest is served from the cache. No audit sample is drawn, so the receipt is not gate-grade until one
-#                                       # default run (which re-runs the sample) has run on that commit. See "Suite cache" below
+#                                       # expired), plus the same audit sample any sweep draws; the rest is served from the cache. One command, and the
+#                                       # receipt verifies and passes the gate. See "Suite cache" below
 #   test/run-all.sh --dry-run           # print which suites WOULD run (with --since-green: the selection, its reason, or the
 #                                       # escalation) and stop: no suite, no receipt, no lock, no sweep marker
 #   HMD_TEST_NO_PY_PIN=1 test/run-all.sh   # leave python3 alone (default: pinned to the real interpreter
@@ -136,8 +136,9 @@
 # WHEN THE CACHE IS OFF -- always said on the `cache:` line, never silently: --no-cache; a filtered or incremental sweep (it runs what it names); uncommitted changes (a modified tracked file, or an
 # untracked one outside the hook-owned paths: the predicate of the receipt's tree_clean; a closure hash describes a commit); the closure engine, jq or the library missing or failing. Never a reason to
 # fail a sweep, always a reason to run every suite.
-# --failed is the red-iteration loop: the previous receipt's non_green_suites run whatever the cache says, plus every suite without a valid entry. The receipt records amended_from (sha256 of the
-# receipt it amends) and amended (what it re-ran). It draws no audit sample, so verify-receipt refuses it for that alone; the one default run that follows re-runs only the sample.
+# --failed is the red-iteration loop: the previous receipt's non_green_suites run whatever the cache says, plus every suite without a valid entry, plus the audit sample (drawn from the other hits by the
+# rule of any sweep, so verify-receipt accepts the receipt and the gate takes it with no second run). The receipt records amended_from (sha256 of the receipt it amends) and amended (the suites it
+# re-ran because they were red or had no valid entry; the sample is counted in cache.audited).
 # Proof: test/suite-cache-e2e.test.sh (mutation: every way a cached green can go stale or be forged must be noticed), test/suite-cache.test.sh, test/suite-closure.test.sh.
 #
 # Incremental sweeps (--since-green). The ~500-suite sweep takes ~70 min, and it used to be re-run for every small merge
@@ -741,10 +742,12 @@ _cache_plan() {
     done < "$CACHE_TMP/hitfacts.tsv"
     mv "$CACHE_TMP/hits2.txt" "$CACHE_TMP/hits.txt"
   fi
-  # the audit: max(20, 10%) of the hits are re-run anyway (--failed draws none). A pick that fails audits every hit: never fewer than asked.
-  if [ "$FAILED_ONLY" -eq 0 ] && [ -s "$CACHE_TMP/hits.txt" ]; then
+  # the audit: max(20, 10%) of the hits are re-run anyway, in --failed too, so the receipt verifies (verify-receipt asks for exactly this rule). A suite --failed forces to run ran fresh: it is not a hit in
+  # the receipt's accounting, so it is left out of the pool the sample is drawn from. A pick that fails audits every hit of the pool: never fewer than asked.
+  awk -v frc="$CACHE_TMP/forced.txt" 'BEGIN { while ((getline l < frc) > 0) F[l] = 1 } !($1 in F)' "$CACHE_TMP/hits.txt" > "$CACHE_TMP/auditpool.txt"
+  if [ -s "$CACHE_TMP/auditpool.txt" ]; then
     seed="$(suite_cache_audit_seed "$CACHE_HEAD" "$CACHE_SALT" 2>/dev/null)" || seed=""
-    suite_cache_audit_pick "$seed" "$CACHE_TMP/hits.txt" > "$CACHE_TMP/audit.txt" 2>/dev/null || cp "$CACHE_TMP/hits.txt" "$CACHE_TMP/audit.txt"
+    suite_cache_audit_pick "$seed" "$CACHE_TMP/auditpool.txt" > "$CACHE_TMP/audit.txt" 2>/dev/null || cp "$CACHE_TMP/auditpool.txt" "$CACHE_TMP/audit.txt"
   fi
   for s in ${RUN[@]+"${RUN[@]}"}; do printf '%s\n' "${s##*/}"; done > "$CACHE_TMP/runnames.txt"
   awk -v hits="$CACHE_TMP/hits.txt" -v aud="$CACHE_TMP/audit.txt" -v frc="$CACHE_TMP/forced.txt" '
@@ -828,7 +831,7 @@ else
     echo "cache: on -- ${n_cached} of $((TO_RUN + n_cached)) suites served from the cache, ${TO_RUN} to run (${N_MISSES} changed or new, ${N_AUDIT} audited, ${N_FORCED} forced) (salt ${CACHE_SALT:0:12})"
   fi
   if [ "$FAILED_ONLY" -eq 1 ]; then
-    echo "failed-first: ${N_FORCED} suite(s) the last receipt had non-green, ${N_MISSES} with no valid cache entry; no audit sample is drawn, so this amend is not gate-grade until one default run re-runs the sample"
+    echo "failed-first: ${N_FORCED} suite(s) the last receipt had non-green, ${N_MISSES} with no valid cache entry, then the audit sample (${N_AUDIT}) as in any sweep: one command, and the receipt is gate-grade"
     [ -n "$PREV_RECEIPT" ] || echo "              (there is no previous receipt of this repo to amend: only the suites without a valid cache entry run)"
   fi
   awk -F'\t' -v lim="$_cache_lim" '$2 != "no entry" { n++; if (n <= lim) printf "             cache miss  %s: %s\n", $1, $2 } END { if (n > lim) printf "             ... and %d more\n", n - lim }' "$CACHE_TMP/reasons.txt"
@@ -1860,7 +1863,8 @@ if command -v jq >/dev/null 2>&1; then
     fi
     FULL_EQ_JSON="$FULL_EQ"
     if [ "$FAILED_ONLY" -eq 1 ] && [ -n "$AMEND_FROM" ]; then
-      AMENDED_JSON="$(printf '%s\n' ${RUN[@]+"${RUN[@]}"} | awk 'NF { n = split($0, a, "/"); print a[n] }' | LC_ALL=C sort | jq -R . | jq -sc . 2>/dev/null || echo '[]')"
+      # what the amend re-ran because it was red or had no valid entry; the audit sample is counted in cache.audited
+      AMENDED_JSON="$(printf '%s\n' ${RUN[@]+"${RUN[@]}"} | awk -v aud="$CACHE_TMP/audit.txt" 'BEGIN { while ((getline l < aud) > 0) A[l] = 1 } NF { n = split($0, a, "/"); if (!(a[n] in A)) print a[n] }' | LC_ALL=C sort | jq -R . | jq -sc . 2>/dev/null || echo '[]')"
     fi
   fi
   RECEIPT_KIND="$SWEEP_KIND"; ABORTED_JSON=null
@@ -1983,7 +1987,7 @@ if [ "$BAD" -gt 0 ]; then
   [ "$n_refused" -gt 0 ] && echo "  disk floor: ${n_refused} suite(s) were never started (REFUSED) -- see DISK FLOOR above; free space, then run the sweep again"
   [ "$n_notrun" -gt 0 ] && echo "  --fail-fast: ${n_notrun} suite(s) were never started (NOTRUN) -- this was not a sweep, and its receipt is refused as one; fix the red, then run without --fail-fast"
   [ "$n_unsound" -gt 0 ] && echo "  CLOSURE UNSOUND: ${n_unsound} audited suite(s) failed with an unchanged closure -- see above; the suite cache was purged, so the next sweep is cold"
-  [ "$CACHE_ON" -eq 1 ] && [ "$n_unsound" -eq 0 ] && echo "  every green of this run is already in the suite cache: fix the red, commit, then re-run -- only what the fix can reach runs again (bash test/run-all.sh --failed re-runs just the red suites)"
+  [ "$CACHE_ON" -eq 1 ] && [ "$n_unsound" -eq 0 ] && echo "  every green of this run is already in the suite cache: fix the red, commit, then re-run -- only what the fix can reach runs again (bash test/run-all.sh --failed re-runs the red suites plus the audit sample, and its receipt is gate-grade)"
   [ "${TMP_FINDINGS:-0}" -gt 0 ] && echo "  temp-dir leaks: ${TMP_FINDINGS} finding(s) -- see TMP LEAK above; a suite must remove what it makes (trap 'rm -rf \"\$T\"' EXIT)"
   [ -n "$EVIDENCE" ] && echo "  read it: ${EVIDENCE}/INDEX.txt"
   exit 1
