@@ -144,7 +144,7 @@ BASE="$(gitf rev-parse HEAD)"
 SUITES_N="$(find "$FIX/test" -maxdepth 1 -name '*.test.sh' | wc -l | tr -d ' ')"
 
 BASE_TSV="$WORK/base.tsv"; MUT_TSV="$WORK/mut.tsv"
-hashes() { "$CLI" hash-all --repo "$FIX" "$@" 2>"$WORK/hashes.err"; }
+hashes() { "$CLI" hash-all --repo "$FIX" 2>"$WORK/hashes.err"; }
 hashes > "$BASE_TSV"
 [ -s "$BASE_TSV" ] || { echo "FATAL: hash-all produced nothing on the fixture: $(cat "$WORK/hashes.err")" >&2; exit 1; }
 pick() { awk -F'\t' -v s="test/$2.test.sh" '$1 == s {print $2}' "$1"; }
@@ -205,8 +205,8 @@ changed_set() { # the suites whose closure hash differs between base and mutated
   join -t "$(printf '\t')" <(sort "$BASE_TSV") <(sort "$MUT_TSV") \
     | awk -F'\t' '$2 != $3 {n = $1; sub(/^test\//, "", n); sub(/\.test\.sh$/, "", n); print n}' | sort | tr '\n' ' ' | sed 's/ $//'
 }
-WILD="k11-always k7-wild"   # the two suites whose closure is the whole tree: ANY edit changes them
-expected() { printf '%s\n' "$@" $WILD | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+# k11-always and k7-wild are the two suites whose closure is the whole tree: ANY edit changes them
+expected() { printf '%s\n' "$@" k11-always k7-wild | sort -u | tr '\n' ' ' | sed 's/ $//'; }
 # kill LABEL FILE HOW TARGET [ALSO...] -- edit FILE; TARGET's hash must change (a killed mutant), and exactly the expected set changes
 kill() {
   local label="$1" file="$2" how="$3" target="$4"; shift 4
