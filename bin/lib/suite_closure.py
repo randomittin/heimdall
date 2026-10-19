@@ -46,9 +46,14 @@ THE GRAPH (everything is read from git OBJECTS at one commit, never from the wor
             on a byte-identical tree). A hint that names nothing is an error, never a silent no-op.
 
 closure_sha  sha256 over the sorted lines `path<TAB>blob_id` of the closure.
-salt         sha256 over: the schema, test/run-all.sh, every test/lib file, the hints, bin/lib/suite-cache.sh (all as committed), the
-             engine's own files (this file, its launcher, hook-owned-path.sh), the bash/jq/python3/git versions and `uname -sm`.
-             Any change = every cached result invalid.
+salt         sha256 over the RUNNER's own infrastructure and nothing else: the schema; test/run-all.sh with its FULL-LINE comments stripped
+             (a `#!` line stays; its raw blob when a heredoc body line starts with `#`, because that line is data and the stripper
+             could hide a real change); the two runner libraries test/lib/run-all-guards.sh and test/lib/py-pin.sh; bin/lib/sweep-chain.sh
+             and bin/lib/hook-owned-path.sh; the hints; bin/lib/suite-cache.sh (all as committed); the engine's own files (this file,
+             its launcher, hook-owned-path.sh); the bash/jq/python3/git versions and `uname -sm`. The other test/lib files are per-suite
+             helpers: closure edges, so editing one re-runs the suites that name it and does not make the whole sweep cold (measured:
+             2.4.8's comment-only edit of run-all.sh and four test/lib/*_cases.py files would have made every suite re-run).
+             Any change to a salted input = every cached result invalid.
 verify-receipt  a sweep receipt (kind "full") carries a `cache` block:
                {mode:"closure", salt, suites_fresh, suites_cached, audited, cold, oldest_entry_age_days,
                 entries:[{suite, closure_sha, finished_at}]}
@@ -80,6 +85,8 @@ SCHEMA = 1                      # part of the salt: bump it whenever the rules a
 HINTS = "test/closure-hints.json"
 RUN_ALL = "test/run-all.sh"
 CACHE_LIB = "bin/lib/suite-cache.sh"
+# the runner's infrastructure beyond RUN_ALL, salted as committed. The rest of test/lib is per-suite helpers: closure edges, not salt.
+RUNNER_LIBS = ("test/lib/run-all-guards.sh", "test/lib/py-pin.sh", "bin/lib/sweep-chain.sh", "bin/lib/hook-owned-path.sh")
 SUITE_RE = re.compile(r"^test/[^/]+\.test\.sh$")
 MAX_AGE_DAYS = 7
 AUDIT_FLOOR = 20
@@ -134,6 +141,9 @@ JS_IMPORT_RE = re.compile(r"""(?:require\s*\(|\bfrom\s+|\bimport\s*\(?\s*)['"](\
 OID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 STAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+SHELL_BLANKS = " \t\r\x0b\x0c"       # the blanks of a shell line: not str.strip()'s, which also eats unicode spaces a shell treats as text
+# a heredoc start: `<<` or `<<-` (never the here-string `<<<`), then its delimiter: 'quoted', "quoted" (may hold blanks), \escaped or a bare word
+HEREDOC_RE = re.compile(r"""(?<!<)<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([^\s;&|()<>'"\\]+))""")
 
 
 class Fail(Exception):
@@ -288,6 +298,34 @@ def strip_docstrings(lines):
         if quote not in s.lstrip("rRuUbBfF")[3:]:
             inside = quote
     return code, prose
+
+
+def strip_full_line_comments(text):
+    """`text` without its full-line comments (a line whose first non-blank character is `#`, `#!` lines excepted), or None when that is not safe.
+
+    Not safe = a line of a heredoc BODY starts with `#`. A here-document is data, so that line may be real input and dropping it would hide a change; the caller then
+    salts the raw file. The tracker reads bash heredocs: `<<` and `<<-` (tabs, and only tabs, stripped from the terminator), a bare, 'quoted', "quoted" or \\escaped
+    delimiter, several on one line; not here-strings (`<<<`). A false positive (a `<<` in arithmetic or in a string) can only turn the answer into None, never hide a line.
+    A `#` line inside a multi-line QUOTED perl, awk or jq program is a comment of that language, so dropping it is as harmless as dropping a shell comment: the real
+    test/run-all.sh has such lines and no heredoc at all (test/suite-closure.test.sh proves both)."""
+    kept, pending = [], []          # pending: (delimiter, tabs_stripped) of every heredoc whose body is still to come, in order
+    for line in text.split("\n"):
+        stripped = line.lstrip(SHELL_BLANKS)
+        if pending:
+            delim, dash = pending[0]
+            if (line.lstrip("\t") if dash else line) == delim:
+                pending.pop(0)
+            elif stripped.startswith("#"):
+                return None
+            kept.append(line)
+            continue
+        if is_comment(stripped, False):
+            continue
+        for m in HEREDOC_RE.finditer(line):
+            single, double, bare = m.group(2), m.group(3), m.group(4)
+            pending.append((single if single is not None else double if double is not None else bare, m.group(1) == "-"))
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def bit_indices(bits):
@@ -768,6 +806,23 @@ class Graph(object):
     def hash_all(self):
         return [(s, self.closure_sha(self.closure(s))) for s in self.suites()]
 
+    def runner_salt_input(self):
+        """(key, value) that stands for test/run-all.sh in the salt: the sha256 of its text without full-line comments, or its raw blob id when it cannot be stripped
+        safely (see strip_full_line_comments; a link, a submodule, a binary or an oversized file is never stripped either)."""
+        node = self.nodes.get(RUN_ALL)
+        if node is None:
+            return RUN_ALL, "absent"
+        raw = (RUN_ALL + ":blob", node.oid)
+        if node.mode not in ("100644", "100755"):
+            return raw
+        data = self.repo.git(["cat-file", "blob", node.oid]).stdout
+        if len(data) > MAX_SCAN or b"\0" in data[:8192]:
+            return raw
+        stripped = strip_full_line_comments(data.decode("utf-8", "surrogateescape"))
+        if stripped is None:
+            return raw
+        return RUN_ALL + ":code", sha256_hex(stripped.encode("utf-8", "surrogateescape"))
+
     def salt(self):
         h = hashlib.sha256()
 
@@ -778,9 +833,9 @@ class Graph(object):
             return self.nodes[path].oid if path in self.nodes else "absent"
         here = os.path.dirname(os.path.abspath(__file__))
         put("schema", SCHEMA)
-        put(RUN_ALL, oid(RUN_ALL))
-        for p in sorted(self.dir_files.get("test/lib", ())):
-            put(p, self.nodes[p].oid)
+        put(*self.runner_salt_input())
+        for p in RUNNER_LIBS:
+            put(p, oid(p))
         put(HINTS, sha256_hex(self.hints_raw) if self.hints_raw is not None else "absent")
         put(CACHE_LIB, oid(CACHE_LIB))
         for name, path in (("suite_closure.py", os.path.abspath(__file__)),

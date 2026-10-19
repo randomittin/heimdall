@@ -23,7 +23,11 @@
 #      a header comment in a SUITE, a transitive dependency through an executable, hints `always_run`; plus the precision half:
 #      an edit to an unrelated file, to a dispatcher arm nobody invoked, and to a tool only an executable's COMMENT names changes nothing
 #   D  hints are validated (an `extra` path that names nothing, an unknown key, a non-boolean refuse; they never silently no-op)
-#   E  the salt moves with test/run-all.sh, test/lib, the hints file and bin/lib/suite-cache.sh, and not with an unrelated file
+#   E  the salt moves with test/run-all.sh (its code, not its full-line comments), the two runner libraries test/lib/run-all-guards.sh and
+#      test/lib/py-pin.sh, bin/lib/sweep-chain.sh, bin/lib/hook-owned-path.sh, the hints file and bin/lib/suite-cache.sh -- and not with a
+#      comment of run-all.sh, a per-suite test/lib helper (a closure edge, section C) or an unrelated file. A heredoc body line that starts
+#      with # makes the run-all.sh comment stripper unsafe, so its raw blob is salted then; a here-string (<<<) starts no heredoc; the REAL
+#      run-all.sh is proven to stay on the stripper
 #   F  verify-receipt: a green cold receipt and a green cache-composed receipt pass; each field of the cache block mutated alone is
 #      refused with its reason (stale closure, old entry, salt, under-audited, missing suite, forged head, lying `cold`, ...); a gate
 #      may only TIGHTEN the age limit and RAISE the audit share
@@ -107,6 +111,11 @@ build_fixture() {
   mk fixtures/dir/a.txt 'a v1'
   mk fixtures/dir/b.txt 'b v1'
   mk test/lib/helper.sh '#!/usr/bin/env bash' 'helper() { echo helper v1; }'
+  # the runner's own infrastructure (what the salt covers): the two runner libraries in test/lib and the two shared policy libraries in bin/lib
+  mk test/lib/run-all-guards.sh '#!/usr/bin/env bash' 'guards() { echo guards v1; }'
+  mk test/lib/py-pin.sh '#!/usr/bin/env bash' 'pin() { echo pin v1; }'
+  mk bin/lib/sweep-chain.sh '#!/usr/bin/env bash' 'chain() { echo chain v1; }'
+  mk bin/lib/hook-owned-path.sh '#!/usr/bin/env bash' 'owned() { echo owned v1; }'
   mk bin/heimdall '#!/usr/bin/env bash' 'case "${1:-}" in' '  sub)' '    exec "$PLUGIN_DIR/bin/heimdall-sub" "$@"' '    ;;' \
     '  other)' '    exec "$PLUGIN_DIR/bin/heimdall-other" "$@"' '    ;;' '  *)' '    echo usage' '    ;;' 'esac'
   mk bin/heimdall-sub '#!/usr/bin/env bash' 'echo sub v1'
@@ -119,7 +128,8 @@ build_fixture() {
   mk bin/mentions-code.sh '#!/usr/bin/env bash' '"$(dirname "$0")/run-tool"'
   mk bin/run-tool '#!/usr/bin/env bash' 'echo run-tool v1'
   mk bin/commented-tool '#!/usr/bin/env bash' 'echo commented v1'
-  mk test/run-all.sh '#!/usr/bin/env bash' 'live_reason() {' '  case "$(basename "$1")" in' '    *-deployed.test.sh)' '      echo "deployed" ;;' \
+  mk test/run-all.sh '#!/usr/bin/env bash' '# the fixture runner: verify-receipt reads only its live list' 'live_reason() {' '  # a live suite is never cached' \
+    '  case "$(basename "$1")" in' '    *-deployed.test.sh)' '      echo "deployed" ;;' \
     '    *) echo "" ;;' '  esac' '}'
   mk test/closure-hints.json '{"test/k8-hint.test.sh":{"extra":["extra/hinted.txt"]},"test/k11-always.test.sh":{"always_run":true}}'
   suite k1-source 'REPO="$(cd "$(dirname "$0")/.." && pwd)"' '. "$REPO/bin/dep.sh"'
@@ -268,15 +278,73 @@ salt_after() { # FILE HOW -- the salt of a commit that edits FILE
   mutate "$1" "$2"; commit_all "salt probe" >/dev/null 2>&1
   SALT_NOW="$("$CLI" salt --repo "$FIX")"; gitf reset -q --hard "$BASE"
 }
-salt_kill() { # LABEL FILE HOW
-  salt_after "$2" "$3"
+salt_moved() { # LABEL -- the probe just taken (SALT_NOW) must differ from the base salt: a killed mutant
   if [ -n "$SALT_NOW" ] && [ "$SALT_NOW" != "$SALT0" ]; then mutant "$1" yes; else mutant "$1" no "salt did not move ($SALT_NOW)"; fi
 }
-salt_kill "E3 salt moves with test/run-all.sh" test/run-all.sh byte
-salt_kill "E4 salt moves with a test/lib file" test/lib/helper.sh byte
+salt_kill() { # LABEL FILE HOW
+  salt_after "$2" "$3"; salt_moved "$1"
+}
+salt_same() { # LABEL A B -- two probes must agree (and not be empty: an engine that failed twice would agree with itself)
+  if [ -n "$2" ] && [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got [$2] want [$3] (empty = the engine failed)"; fi
+}
+# The narrowed salt (plan item 7) is the RUNNER's own infrastructure and nothing else: test/run-all.sh with its full-line comments stripped, the two runner libraries
+# (test/lib/run-all-guards.sh, test/lib/py-pin.sh), bin/lib/sweep-chain.sh, bin/lib/hook-owned-path.sh, the hints, suite-cache.sh, the engine and the toolchain. The other
+# test/lib files are per-suite helpers: closure edges (section C), so editing one re-runs the suites that name it and does not make the whole sweep cold.
+salt_shebang() { # FILE -- the salt of a commit that rewrites FILE's first line (its shebang) to #!/bin/bash
+  { printf '#!/bin/bash\n'; tail -n +2 "$FIX/$1"; } > "$WORK/shebang.next"; cat "$WORK/shebang.next" > "$FIX/$1"
+  commit_all "salt probe: shebang" >/dev/null 2>&1
+  SALT_NOW="$("$CLI" salt --repo "$FIX")"; gitf reset -q --hard "$BASE"
+}
+runall_salt() { # LINE... -- the salt of a commit whose test/run-all.sh is the fixture's text followed by LINE... (one per argument)
+  { cat "$FIX/test/run-all.sh"; printf '%s\n' "$@"; } > "$WORK/runall.next"; cat "$WORK/runall.next" > "$FIX/test/run-all.sh"
+  commit_all "salt probe: run-all.sh text" >/dev/null 2>&1
+  SALT_NOW="$("$CLI" salt --repo "$FIX")"; gitf reset -q --hard "$BASE"
+}
+salt_kill "E3 salt moves with test/run-all.sh (one byte of code)" test/run-all.sh byte
+salt_shebang test/run-all.sh
+salt_moved "E3b salt moves with test/run-all.sh (its shebang line is not a comment)"
+salt_after test/run-all.sh comment
+eq "E3c a full-line comment appended to test/run-all.sh leaves the salt unchanged (a comment-only edit of the runner must not make the next sweep cold)" "$SALT_NOW" "$SALT0"
+HD_OPEN="cat <<'EOF' >/dev/null"
+TAB="$(printf '\t')"
+# a heredoc body is DATA: a line of it that starts with # may be real input, so the stripper is unsafe and the raw blob is salted (a body edit then moves the salt)
+runall_salt "$HD_OPEN" '# body line v1' 'payload' 'EOF'; HD1="$SALT_NOW"
+runall_salt "$HD_OPEN" '# body line v2' 'payload' 'EOF'; HD2="$SALT_NOW"
+if [ -n "$HD1" ] && [ -n "$HD2" ] && [ "$HD1" != "$HD2" ]; then mutant "E3d a heredoc body line starting with # is input: editing it moves the salt (raw-blob fallback)" yes
+else mutant "E3d a heredoc body line starting with # is input: editing it moves the salt (raw-blob fallback)" no "salt did not move ($HD1 / $HD2)"; fi
+# precision: a heredoc with no # line in its body keeps the stripper on, a here-string (<<<) starts no heredoc, and every heredoc form ends at its own delimiter
+runall_salt "$HD_OPEN" 'payload' 'EOF' '# a note v1'; SP1="$SALT_NOW"
+runall_salt "$HD_OPEN" 'payload' 'EOF' '# a note v2'; SP2="$SALT_NOW"
+salt_same "E3e a heredoc body without a # line keeps the stripper on: a comment after it is ignored" "$SP2" "$SP1"
+runall_salt 'read -r word <<< "text"' '# a note v1'; HS1="$SALT_NOW"
+runall_salt 'read -r word <<< "text"' '# a note v2'; HS2="$SALT_NOW"
+salt_same "E3f a here-string (<<<) starts no heredoc: a comment after it is ignored" "$HS2" "$HS1"
+forms_salt() { # NOTE -- four heredoc forms back to back, then a full-line comment NOTE
+  runall_salt 'cat <<-EOT >/dev/null' "${TAB}body one" "${TAB}EOT" 'cat <<"END OF" >/dev/null' 'body two' 'END OF' \
+    'cat <<\BS >/dev/null' 'body three' 'BS' 'cat <<ONE <<TWO >/dev/null' 'body four' 'ONE' 'body five' 'TWO' "# $1"
+}
+forms_salt "note v1"; FM1="$SALT_NOW"
+forms_salt "note v2"; FM2="$SALT_NOW"
+salt_same "E3g every heredoc form ends at its own delimiter (<<- with a tab-indented terminator, a quoted delimiter with a space, a backslash one, two on a line)" "$FM2" "$FM1"
+salt_after test/lib/helper.sh byte
+eq "E4 salt does not move with a per-suite test/lib helper (a closure edge, not runner infrastructure)" "$SALT_NOW" "$SALT0"
+salt_kill "E4b salt moves with test/lib/run-all-guards.sh (a runner library)" test/lib/run-all-guards.sh byte
+salt_kill "E4c salt moves with test/lib/py-pin.sh (a runner library)" test/lib/py-pin.sh byte
+salt_kill "E4d salt moves with bin/lib/sweep-chain.sh" bin/lib/sweep-chain.sh byte
+salt_kill "E4e salt moves with bin/lib/hook-owned-path.sh as committed in the repo" bin/lib/hook-owned-path.sh byte
 salt_kill "E5 salt moves with the hints file (a JSON-valid whitespace edit)" test/closure-hints.json ws
 salt_after unrelated/noise.txt byte
 eq "E6 salt does not move with an unrelated file" "$SALT_NOW" "$SALT0"
+# the REAL run-all.sh: it has no heredoc, so the stripper stays on and a comment-only edit of it is invisible to the salt (finding 9: 2.4.8's comment-only fixes
+# of run-all.sh would otherwise have made the next sweep cold)
+REAL="$WORK/real-runall"; mkdir -p "$REAL/test"
+git -C "$REAL" init -q; git -C "$REAL" config user.email t@example.com; git -C "$REAL" config user.name T
+git -C "$REAL" config commit.gpgsign false; git -C "$REAL" config core.hooksPath /dev/null
+cp "$ROOT/test/run-all.sh" "$REAL/test/run-all.sh"; git -C "$REAL" add -A; git -C "$REAL" commit -q --no-verify -m "the real run-all.sh"
+RSALT0="$("$CLI" salt --repo "$REAL")"
+printf '# a full-line comment appended to the real run-all.sh\n' >> "$REAL/test/run-all.sh"; git -C "$REAL" add -A; git -C "$REAL" commit -q --no-verify -m "comment only"
+salt_same "E8 the REAL test/run-all.sh: a full-line comment leaves the salt unchanged (the stripper is on, not the raw-blob fallback)" "$("$CLI" salt --repo "$REAL")" "$RSALT0"
+eq "E8b the real test/run-all.sh starts no heredoc (the premise of E8: nothing in it can make the stripper unsafe)" "$(grep -v '<<<' "$ROOT/test/run-all.sh" | grep -c '<<')" "0"
 mk bin/lib/suite-cache.sh '#!/usr/bin/env bash' 'suite_cache_lookup() { :; }'
 commit_all "add suite-cache.sh" >/dev/null 2>&1
 SALT_NOW="$("$CLI" salt --repo "$FIX")"
