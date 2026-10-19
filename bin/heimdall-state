@@ -259,6 +259,16 @@ _sweep_chain_violation() {
   return 0
 }
 
+# _sweep_cache_violation REPO RECEIPT -- why a receipt that carries a suite-cache block (test/run-all.sh served some suites from its per-suite cache) may not stand in for a full sweep, or
+# nothing when bin/heimdall-suite-closure re-derives it at the commit it graded: every closure hash, the salt, the age of every entry, the audit sample, a green entry per suite. Never
+# the writer's flag taken on its word.
+_sweep_cache_violation() {
+  local repo="$1" receipt="$2" engine="$HMD_STATE_SELF_DIR/heimdall-suite-closure" out
+  if [ ! -x "$engine" ]; then echo "it cannot be verified: bin/heimdall-suite-closure is missing next to heimdall-state"; return 0; fi
+  out="$("$engine" verify-receipt --repo "$repo" --receipt "$receipt" 2>&1)" && return 0
+  printf '%s' "$out" | sed 's/^verify-receipt: //' | paste -sd';' - | sed 's/;/; /g'
+}
+
 cmd_check_quality_gates() {
   ensure_state
   local tests lint reflection dirty
@@ -334,7 +344,7 @@ cmd_check_quality_gates() {
       echo "GATE FAILED: sweep receipt at $receipt is not valid JSON. Re-run: $hint" >&2
       failed=1
     else
-      local r_repo r_sha r_clean r_rc r_kind chain_why flaky_names
+      local r_repo r_sha r_clean r_rc r_kind chain_why flaky_names cache_why
       # A receipt without `kind` predates incremental sweeps, when every receipt was a full one.
       r_kind=$(jq -r '.kind // "full"' "$receipt")
       r_repo=$(jq -r '.repo // empty' "$receipt")
@@ -387,6 +397,11 @@ cmd_check_quality_gates() {
       if [ -n "$r_repo" ] && [ "$r_repo" != "$sweep_repo" ]; then
         echo "GATE FAILED: sweep receipt at $receipt was recorded for a different repo ($r_repo, this checkout is $sweep_repo). Run: $hint" >&2
         failed=1
+      elif [ "$r_kind" = aborted ]; then
+        # test/run-all.sh --fail-fast writes kind=aborted when it stops before every suite ran. A run cut short is not a sweep: refused by name, ahead of the freshness and exit_code
+        # checks below, so a forged exit_code 0 cannot slide it through and the reason given is the real one.
+        echo "GATE FAILED: sweep receipt is from an ABORTED run (test/run-all.sh --fail-fast stopped it; $(jq -r '.aborted.suites_not_run // "some"' "$receipt") suite(s) never started) -- it proves nothing about this tree, whatever its exit_code says. Run: $hint" >&2
+        failed=1
       elif [ -n "$sha_stale" ]; then
         echo "GATE FAILED: sweep receipt is STALE — ${sha_stale}. Run: $hint" >&2
         failed=1
@@ -398,7 +413,15 @@ cmd_check_quality_gates() {
         failed=1
       else
         case "$r_kind" in
-          full) : ;;
+          full)
+            # A receipt written by a cache-composed sweep carries a cache block: it counts only if the closure engine re-derives it (a receipt without one is the legacy full sweep: every suite ran).
+            if jq -e '(.cache | type) == "object"' "$receipt" >/dev/null 2>&1; then
+              cache_why="$(_sweep_cache_violation "$sweep_repo" "$receipt")"
+              if [ -n "$cache_why" ]; then
+                echo "GATE FAILED: the sweep receipt's suite-cache block does not verify (bin/heimdall-suite-closure verify-receipt): ${cache_why}. Run: bash test/run-all.sh" >&2
+                failed=1
+              fi
+            fi ;;
           incremental)
             chain_why="$(_sweep_chain_violation "$sweep_repo" "$receipt" "$full_receipt")"
             if [ -n "$chain_why" ]; then
