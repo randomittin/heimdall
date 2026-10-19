@@ -362,6 +362,117 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# A6. CLASS-5 RECREATED TREE — a line that puts the deleted tree back ends the destroyed state.
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression fence for a real false positive found 2026-10-19 at install.sh:1218, which blocked every
+# push and failed this suite's CLEAN-TREE and hook proofs: the clone fallback runs `rm -rf "$PLUGIN_DIR"`
+# and at once `git clone … "$PLUGIN_DIR"`, so the guarded `. "$PLUGIN_DIR/bin/lib/install-receipt.sh"`
+# further down reads the NEW clone, yet class 5 saw only "source under a tree deleted above". A
+# `git clone … DEST`, `mkdir [-p] DEST` or `mv … DEST` whose FINAL operand is the deleted path now ends
+# the destroyed state. Every shape that does NOT put that tree back must still fire: a plain delete, a
+# clone or mkdir into another path (a look-alike name too), the deleted tree used only as a clone SOURCE,
+# and a second delete after the recreation. Do NOT reflow the heredoc without updating the line numbers
+# passed to assert_c5_quiet / assert_c5_fires below.
+echo "A6. CLASS-5 RECREATED TREE (clone/mkdir/mv into the deleted path ends the destroyed state):"
+FIX10="$FIX_DIR/heimdall-fixture10"
+cat > "$FIX10" <<'FIXTURE10'
+#!/usr/bin/env bash
+set -euo pipefail
+reclone_then_source() {
+  rm -rf "$PLUGIN_DIR"
+  git clone --quiet "$REPO" "$PLUGIN_DIR"
+  . "$PLUGIN_DIR/lib.sh"
+}
+reclone_fallback_then_source() {
+  if ! git clone --quiet --depth 1 --branch "$REF" "$REPO" "$PLUGIN_DIR" 2>/dev/null; then
+    rm -rf "$PLUGIN_DIR"
+    if ! git clone --quiet "$REPO" "$PLUGIN_DIR" 2>/dev/null; then
+      exit 1
+    fi
+  fi
+  if [ -f "$PLUGIN_DIR/lib.sh" ]; then
+    . "$PLUGIN_DIR/lib.sh" || true
+  fi
+}
+mkdir_then_source() {
+  rm -rf "$PLUGIN_DIR"
+  [ -d "$PLUGIN_DIR" ] || mkdir -p "$PLUGIN_DIR"
+  . "$PLUGIN_DIR/lib.sh"
+}
+mv_then_source() {
+  rm -rf "$PLUGIN_DIR"
+  mv "$STAGE" "${PLUGIN_DIR}"
+  . "$PLUGIN_DIR/lib.sh"
+}
+remove_plugin_then_mkdir_then_source() {
+  _heimdall_remove_plugin
+  mkdir -p "$HOME/.heimdall"
+  . "$HOME/.heimdall/lib.sh"
+}
+delete_then_source() {
+  rm -rf "$PLUGIN_DIR"
+  . "$PLUGIN_DIR/lib.sh"
+}
+clone_other_dir_then_source() {
+  rm -rf "$PLUGIN_DIR"
+  git clone --quiet "$REPO" "$OTHER_DIR"
+  . "$PLUGIN_DIR/lib.sh"
+}
+clone_from_deleted_tree_then_source() {
+  rm -rf "$PLUGIN_DIR"
+  git clone --quiet "$PLUGIN_DIR" "$OTHER_DIR"
+  . "$PLUGIN_DIR/lib.sh"
+}
+mkdir_look_alike_name_then_source() {
+  rm -rf "$PLUGIN_DIR"
+  mkdir -p "$PLUGIN_DIR_OLD"
+  . "$PLUGIN_DIR/lib.sh"
+}
+reclone_then_delete_again_then_source() {
+  rm -rf "$PLUGIN_DIR"
+  git clone --quiet "$REPO" "$PLUGIN_DIR"
+  rm -rf "$PLUGIN_DIR"
+  . "$PLUGIN_DIR/lib.sh"
+}
+FIXTURE10
+chmod +x "$FIX10"
+LINT10_OUT="$("$LINT" "$FIX10" 2>/dev/null || true)"
+c5_lines10="$(grep -F '  5-ORDER-DESTROY  ' <<<"$LINT10_OUT" | sed -E 's/^[^:]*:([0-9]+).*/\1/' | tr '\n' ' ')"
+c5_flagged10() { case " $c5_lines10" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+assert_c5_quiet() {
+  # assert_c5_quiet SOURCE-LINE LABEL — the tree was put back above SOURCE-LINE, so sourcing it is sound.
+  if c5_flagged10 "$1"; then
+    bad "$2 — source at line $1 flagged (the tree was recreated; should not be)"
+  else
+    ok "$2 — source at line $1 not flagged"
+  fi
+}
+assert_c5_fires() {
+  # assert_c5_fires SOURCE-LINE LABEL — the tree is still gone above SOURCE-LINE.
+  if c5_flagged10 "$1"; then
+    ok "$2 — source at line $1 flagged"
+  else
+    bad "$2 — source at line $1 NOT flagged (the tree is still gone; should be)"
+  fi
+}
+assert_c5_quiet 6  "delete → git clone into the same path"
+assert_c5_quiet 16 "delete → clone fallback (install.sh shape: if ! git clone … 2>/dev/null)"
+assert_c5_quiet 22 "delete → [ -d … ] || mkdir -p into the same path"
+assert_c5_quiet 27 "delete → mv into the same path, spelled \"\${VAR}\""
+assert_c5_quiet 32 "_heimdall_remove_plugin → mkdir -p \"\$HOME/.heimdall\""
+assert_c5_fires 36 "delete → source, nothing recreated (positive control)"
+assert_c5_fires 41 "delete → git clone into a DIFFERENT dir"
+assert_c5_fires 46 "delete → git clone FROM the deleted tree (it is only the clone source)"
+assert_c5_fires 51 "delete → mkdir -p of a look-alike name (\$PLUGIN_DIR_OLD)"
+assert_c5_fires 57 "delete → reclone → delete AGAIN → source"
+c5_count10="$(grep -cF '  5-ORDER-DESTROY  ' <<<"$LINT10_OUT" || true)"
+if [ "$c5_count10" = "5" ]; then
+  ok "exactly 5 class-5 findings (one per shape that still fires, the re-delete reported once)"
+else
+  bad "expected 5 class-5 findings (lines 36 41 46 51 57), got $c5_count10: ${c5_lines10:-none}"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # B. CLEAN-TREE — zero false positives on the real shipped scripts.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "B. CLEAN-TREE (no false positives on the real current tree):"

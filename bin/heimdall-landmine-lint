@@ -30,8 +30,8 @@
 #                    stall PER CALL is still a non-TTY hang in spirit and blocks
 #                    CI. The uninstall-hang AND F1-launcher-persona class.
 #   5 ORDER-DESTROY  a `_heimdall_remove_plugin`-style self-deletion followed by a
-#                    `source`/`.` of a file under the just-deleted tree. Heuristic;
-#                    documented known-hard (see README block below).
+#                    `source`/`.` of a file under the just-deleted tree, with no line
+#                    between them that recreates it. Heuristic; known-hard (see CLASS 5).
 #
 # Classes 2 and 5 are intentionally HIGH-CONFIDENCE-ONLY: a noisy linter gets
 # disabled and is worse than none. We prefer under-flagging on 2/5 (with the
@@ -212,6 +212,15 @@ _RE_RM_DOTHEIMDALL='rm[[:space:]]+-rf[[:space:]].*\$HOME/\.heimdall'
 _RE_SOURCE_VERB='(^|[;&]|then|do|else)[[:space:]]*(source|\.)[[:space:]]+'
 # shellcheck disable=SC2016  # ERE source text: the \$ is a literal dollar for =~, so single quotes are deliberate
 _RE_SOURCE_TARGET='\$(\{)?(PLUGIN_DIR|HEIMDALL_HOME|HOME)|\.heimdall|\$0'
+# A command that PUTS A TREE BACK: `git clone … DEST`, `mkdir [-p] DEST`, `mv … DEST`. It opens the line or
+# follows `;` `&` `|` `(` `{` / then / else / do, optionally behind `if` and `!` (`if ! git clone … ; then`).
+# Group 5 is its operand text, up to the next `;`, `&`, `|` or `)` — a `2>&1` is cut at its `&`, which the
+# redirect-word strip below tolerates.
+_RE_RECREATE='(^|[;&|({]|then|else|do)[[:space:]]*(if[[:space:]]+)?(![[:space:]]+)?(git[[:space:]]+clone|mkdir|mv)[[:space:]]+([^;&|)]*)'
+# Quotes and braces say nothing about WHICH path two spellings name: "${PLUGIN_DIR}" is $PLUGIN_DIR.
+_RE_QUOTES_BRACES="[\"'{}]"
+# One redirection word — `2>/dev/null`, `>/dev/null`, or the `2>` left over when a `2>&1` was cut at its `&`.
+_RE_REDIRECT_WORD='[[:space:]]+[0-9]*[<>][^[:space:]]*'
 
 # Delete every match of $2 from $1 without forking sed — `s/RE//g` semantics exactly.
 # "Exactly" is load-bearing: sed resumes scanning AFTER each match and never re-reads
@@ -634,6 +643,37 @@ scan_tty_read() {
 # (`source X` / `. X`) whose path is under the deleted tree (plugin dir / $HOME/
 # .heimdall). A plain external command after the delete is NOT flagged (that was
 # the correctly-ordered v2.0.x fix).
+#
+# A line BETWEEN the delete and the source that puts the tree BACK ends the destroyed state: the source
+# then reads the NEW tree. install.sh's clone fallback is the real case — `rm -rf "$PLUGIN_DIR"` and at
+# once `git clone … "$PLUGIN_DIR"`, so the guarded `. "$PLUGIN_DIR/bin/lib/install-receipt.sh"` below it
+# is sound (a false positive of this class until 2026-10-19). Three commands put a tree back, each only
+# when its FINAL operand is spelled like the deleted tree (`$PLUGIN_DIR` and `"${PLUGIN_DIR}"` alike):
+# `git clone … DEST`, `mkdir [-p] DEST`, `mv … DEST`. A clone or mkdir into ANOTHER path, a look-alike
+# name (`$PLUGIN_DIR_OLD`), or the deleted tree used only as a clone SOURCE recreates nothing, and a
+# later delete starts a new destroyed state. Limits, documented rather than modelled: the scan starts
+# on the line AFTER the delete, so `rm -rf "$D" && mkdir -p "$D"` on ONE line is not read as recreated
+# (a source below it is still flagged — split the line or reorder); a line deleting two trees counts as
+# recreated once either comes back (under-flagging, the side this class prefers).
+
+# `git clone … DEST`, `mkdir [-p] DEST` and `mv … DEST` put a tree back at DEST, the command's FINAL operand —
+# a path that is only a clone SOURCE (`git clone "$PLUGIN_DIR" /tmp/x`) recreates nothing. DEST lands in
+# RECREATED spelled the way scan_order_destroy spells a tree (quotes and braces dropped: "${PLUGIN_DIR}"
+# reads $PLUGIN_DIR); RECREATED is empty when the line recreates nothing. A global rather than stdout, for
+# the reason strip_matches gives: a `$(…)` capture forks once per line.
+RECREATED=""
+recreated_dest() {
+  RECREATED=""
+  # Cheap pre-filter: this runs for every line below a delete, and nearly none of them recreate anything.
+  case "$1" in *clone*|*mkdir*|*'mv '*) : ;; *) return 0 ;; esac
+  [[ $1 =~ $_RE_RECREATE ]] || return 0
+  strip_matches "${BASH_REMATCH[5]}" "$_RE_QUOTES_BRACES"
+  strip_matches "$STRIPPED" "$_RE_REDIRECT_WORD"
+  local ops="$STRIPPED"
+  ops="${ops%"${ops##*[![:space:]]}"}"
+  RECREATED="${ops##*[[:space:]]}"
+}
+
 scan_order_destroy() {
   local file="$1"
   # Fast bail: no self-destruction pattern anywhere in this file.
@@ -650,12 +690,15 @@ scan_order_destroy() {
       *'_heimdall_remove_plugin'*|*'rm -rf'*) : ;;
       *) continue ;;
     esac
-    # A self-destruction line.
-    local destroyed=0
-    [[ $line =~ $_RE_REMOVE_PLUGIN ]]    && destroyed=1
-    [[ $line =~ $_RE_RM_SELF ]]         && destroyed=1
-    [[ $line =~ $_RE_RM_DOTHEIMDALL ]]  && destroyed=1
-    [ "$destroyed" -eq 1 ] || continue
+    # A self-destruction line. `refs` collects the spellings of the tree it removes (` $PLUGIN_DIR $HOME/.heimdall `,
+    # space-padded) — what a recreating line below is compared against. The plugin removal names no path on its
+    # own line: it takes `$HOME/.heimdall`, or `$PLUGIN_DIR` in its dev fallback (see bin/heimdall).
+    local refs=""
+    if [[ $line =~ $_RE_REMOVE_PLUGIN ]]; then refs="$refs \$HOME/.heimdall \$PLUGIN_DIR"; fi
+    if [[ $line =~ $_RE_RM_SELF ]]; then refs="$refs \$${BASH_REMATCH[2]}"; fi
+    if [[ $line =~ $_RE_RM_DOTHEIMDALL ]]; then refs="$refs \$HOME/.heimdall"; fi
+    [ -n "$refs" ] || continue
+    refs="$refs "
     # Scan forward in the same scope for a source/. of a file under the tree.
     # Stop at the next function definition boundary `}` at column 0 (end of scope).
     local j
@@ -665,6 +708,9 @@ scan_order_destroy() {
         '}'*) break ;;            # end of the enclosing function — scope closed
       esac
       is_comment "$nxt" && continue
+      # The tree is put back here: everything below reads the NEW tree, so the destroyed state is over.
+      recreated_dest "$nxt"
+      if [ -n "$RECREATED" ] && [[ $refs == *" $RECREATED "* ]]; then break; fi
       # `source FILE` or `. FILE` where FILE references the deleted tree.
       if [[ $nxt =~ $_RE_SOURCE_VERB ]] && [[ $nxt =~ $_RE_SOURCE_TARGET ]]; then
         emit "$file" "$((j + 1))" "5-ORDER-DESTROY" "$nxt" \
