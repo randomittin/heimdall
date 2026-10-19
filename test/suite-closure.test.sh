@@ -2,9 +2,10 @@
 # test/suite-closure.test.sh -- THE STATIC DEPENDENCY CLOSURE OF A SUITE, AND THE PROOF THAT IT CANNOT MISS A DEPENDENCY IT CLAIMS TO SEE.
 #
 # WHAT IT TESTS. bin/heimdall-suite-closure (the launcher) and bin/lib/suite_closure.py (the engine): for every test/*.test.sh the
-# set of tracked files its result can depend on (the closure), the closure hash (sha256 over sorted `path<TAB>blob_id`, blob ids read
-# from git objects), the salt that invalidates every cached result at once, test/closure-hints.json (the escape hatch for what a static
-# scan cannot see) and `verify-receipt`, which re-derives every closure hash at the graded commit instead of trusting a receipt's flag.
+# set of tracked files its result can depend on (the closure), the closure hash (sha256 over sorted `path<TAB>id`; the id is the blob id
+# read from git objects, or, for a shell or Python file, the digest of what it is without its comments, blank lines and trailing blanks),
+# the salt that invalidates every cached result at once, test/closure-hints.json (the escape hatch for what a static scan cannot see) and
+# `verify-receipt`, which re-derives every closure hash at the graded commit instead of trusting a receipt's flag.
 # bin/lib/hook-owned-path.sh decides which tracked paths are never part of any closure (the hooks' own journal and ledger writes).
 #
 # WHY IT EXISTS. A per-suite result cache is only safe if "this suite's closure did not change" really means "nothing it could read
@@ -21,7 +22,10 @@
 #   C  mutation proof, one fixture suite per dependency kind: source of a library, exec by PATH basename, a data file read by path,
 #      a directory token with fixture files, a test/lib helper, a dispatcher sub-command, a wildcard (git ls-files), hints `extra`,
 #      a header comment in a SUITE, a transitive dependency through an executable, hints `always_run`; plus the precision half:
-#      an edit to an unrelated file, to a dispatcher arm nobody invoked, and to a tool only an executable's COMMENT names changes nothing
+#      an edit to an unrelated file, to a dispatcher arm nobody invoked, and to a tool only an executable's COMMENT names changes nothing,
+#      and neither does a comment, a blank line or a trailing blank in a shell or Python dependency -- unless what reads that file reads its
+#      text: a suite that greps it or enumerates its directory, the whole-tree suites, a script that prints its own header (--help), a file
+#      that cannot be tokenized. Here-document bodies, multi-line strings and a line joined by a backslash are never touched.
 #   D  hints are validated (an `extra` path that names nothing, an unknown key, a non-boolean refuse; they never silently no-op)
 #   E  the salt moves with test/run-all.sh (its code, not its full-line comments), the two runner libraries test/lib/run-all-guards.sh and
 #      test/lib/py-pin.sh, bin/lib/sweep-chain.sh, bin/lib/hook-owned-path.sh, the hints file and bin/lib/suite-cache.sh -- and not with a
@@ -31,6 +35,8 @@
 #   F  verify-receipt: a green cold receipt and a green cache-composed receipt pass; each field of the cache block mutated alone is
 #      refused with its reason (stale closure, old entry, salt, under-audited, missing suite, forged head, lying `cold`, ...); a gate
 #      may only TIGHTEN the age limit and RAISE the audit share
+#   G  the normal forms themselves (test/lib/suite_closure_normalize_cases.py): for shell, every here-document form, every quoting form and a
+#      backslash continuation; for Python, comments, docstrings, the shebang and the encoding cookie; which file is shell, which is Python
 #
 # HERMETIC: the fixture lives under $TMPDIR with its own HOME; nothing touches the real receipts or the real work tree.
 # EXIT: 0 = every proof holds and falsifiability is 1.0; 1 = anything else.
@@ -92,12 +98,82 @@ mk() { # PATH LINE... -- write fixture file PATH (directories created), one LINE
   mkdir -p "$(dirname "$FIX/$p")"
   printf '%s\n' "$@" > "$FIX/$p"
 }
+mkh() { # PATH -- write fixture file PATH (directories created) from stdin, byte for byte: trailing blanks, a here-document and a continuation survive
+  mkdir -p "$(dirname "$FIX/$1")"; cat > "$FIX/$1"
+}
 suite() { # NAME LINE... -- a fixture suite that prints a result line the way real ones do
   local n="$1"; shift
   mk "test/$n.test.sh" '#!/usr/bin/env bash' "$@" 'echo "1 passed, 0 failed"'
 }
 gitf() { git -C "$FIX" "$@"; }
 commit_all() { gitf add -A && gitf commit -q --no-verify -m "${1:-change}"; }
+
+# the shell and Python files whose comments the hash ignores, and the places where it must not: each holds one thing a careless stripper would
+# get wrong (a here-document body, a multi-line string, a continuation, a script that prints its own header, a file that cannot be tokenized)
+build_normal_fixtures() {
+  mkh bin/pyhelper.py <<'FIXTURE'
+#!/usr/bin/env python3
+"""pyhelper: a docstring is visible at run time (__doc__), so it stays in the hash."""
+# a comment only a human reads
+import sys
+
+
+def greet(name):
+    # an inner comment
+    return "hello " + name   # a trailing comment
+
+
+if __name__ == "__main__":
+    print(greet(sys.argv[0]))
+FIXTURE
+  mkh bin/pybroken.py <<'FIXTURE'
+#!/usr/bin/env python3
+x = """a string that is never closed
+# a line inside it
+FIXTURE
+  mk bin/heredoc.sh '#!/usr/bin/env bash' '# a header comment' "cat <<'EOF'" '# a body line that only looks like a comment' 'payload   ' 'EOF' \
+    '# a comment after the here-document' 'echo done   '
+  mkh bin/quoted.sh <<'FIXTURE'
+#!/usr/bin/env bash
+msg='first line
+# a quoted line that only looks like a comment
+last line'
+echo "$msg"
+echo hi # don't let this apostrophe open a quote
+# a real comment after it
+echo after
+FIXTURE
+  mk bin/contin.sh '#!/usr/bin/env bash' 'echo one \' '# the comment between two halves of one command' '  two' 'echo a \ ' 'echo b'
+  mkh bin/selfread.sh <<'FIXTURE'
+#!/usr/bin/env bash
+# selfread: prints its own header as --help
+# second header line
+SELF="$0"
+usage() { sed -n '2,3p' "$SELF"; }
+usage
+FIXTURE
+  mkh bin/selfread2.sh <<'FIXTURE'
+#!/usr/bin/env bash
+# selfread2: the direct form
+usage() { grep '^#' "$0"; }
+usage
+FIXTURE
+  mkh bin/readme-tool <<'FIXTURE'
+#!/usr/bin/env bash
+# a note about the tool v1
+echo tool
+FIXTURE
+  mkh libdir/one.sh <<'FIXTURE'
+#!/usr/bin/env bash
+# one v1
+echo one
+FIXTURE
+  mkh libdir/two.sh <<'FIXTURE'
+#!/usr/bin/env bash
+# two v1
+echo two
+FIXTURE
+}
 
 build_fixture() {
   mkdir -p "$FIX"
@@ -128,6 +204,7 @@ build_fixture() {
   mk bin/mentions-code.sh '#!/usr/bin/env bash' '"$(dirname "$0")/run-tool"'
   mk bin/run-tool '#!/usr/bin/env bash' 'echo run-tool v1'
   mk bin/commented-tool '#!/usr/bin/env bash' 'echo commented v1'
+  build_normal_fixtures
   mk test/run-all.sh '#!/usr/bin/env bash' '# the fixture runner: verify-receipt reads only its live list' 'live_reason() {' '  # a live suite is never cached' \
     '  case "$(basename "$1")" in' '    *-deployed.test.sh)' '      echo "deployed" ;;' \
     '    *) echo "" ;;' '  esac' '}'
@@ -145,6 +222,16 @@ build_fixture() {
   suite k10b-code '"$REPO/bin/mentions-code.sh"'
   suite k11-always 'echo always'
   suite x-deployed 'echo live'
+  suite k12-py 'python3 "$REPO/bin/pyhelper.py"'
+  suite k13-pybroken 'python3 "$REPO/bin/pybroken.py"'
+  suite k14-heredoc '"$REPO/bin/heredoc.sh"'
+  suite k15-quoted '"$REPO/bin/quoted.sh"'
+  suite k16-cont '"$REPO/bin/contin.sh"'
+  suite k17-selfread '"$REPO/bin/selfread.sh"' '"$REPO/bin/selfread2.sh"'
+  suite k18-greps 'grep -q needle "$REPO/bin/readme-tool"'
+  suite k18b-execs '"$REPO/bin/readme-tool"'
+  suite k19-dirgrep 'grep -rq needle "$REPO/libdir"'
+  suite k19b-dirpath 'LIB="$REPO/libdir"'
   local i=1 n
   while [ "$i" -le 30 ]; do n="$(printf 'p%02d' "$i")"; suite "$n" 'echo plain'; i=$((i+1)); done
   commit_all base >/dev/null 2>&1
@@ -200,8 +287,23 @@ has "B21 --help names every sub-command" "$("$CLI" --help 2>&1)" "verify-receipt
 
 # ── C. mutation proof ────────────────────────────────────────────────────────────────────────────────────────────────
 echo "── C. mutation proof: each dependency edited -> the closure hash changes; unrelated edits -> nothing changes"
-mutate() { # FILE byte|comment|ws -- one byte appended, a comment-only line appended (hash is content, not semantics), or one newline (JSON stays valid)
-  case "$2" in byte) printf 'x' >> "$FIX/$1" ;; comment) printf '# note\n' >> "$FIX/$1" ;; ws) printf '\n' >> "$FIX/$1" ;; esac
+subst() { # FILE OLD NEW -- replace the first OLD (literal text) in a fixture file; an OLD that is not there is a bug in this test, so it is loud
+  python3 -I - "$FIX/$1" "$2" "$3" <<'PY' || bad "fixture edit: [$2] is not in $1"
+import sys
+path, old, new = sys.argv[1:4]
+text = open(path, encoding="utf-8", newline="").read()
+if old not in text:
+    sys.exit(1)
+open(path, "w", encoding="utf-8", newline="").write(text.replace(old, new, 1))
+PY
+}
+mutate() { # FILE byte|comment|ws|sub|OLD|NEW -- one byte appended, a comment-only line appended, one newline (JSON stays valid), or OLD replaced by NEW
+  case "$2" in
+    byte) printf 'x' >> "$FIX/$1" ;;
+    comment) printf '# note\n' >> "$FIX/$1" ;;
+    ws) printf '\n' >> "$FIX/$1" ;;
+    sub\|*) local rest="${2#sub|}"; subst "$1" "${rest%%|*}" "${rest#*|}" ;;
+  esac
 }
 PROBE_OK=1
 probe() { # FILE HOW -- commit the edit, hash every suite, put the repo back on the base commit
@@ -233,14 +335,11 @@ same() {
   eq "$1" "$(changed_set)" "$(expected)"
 }
 kill "1 source: one byte of the sourced library bin/dep.sh" bin/dep.sh byte k1-source
-kill "1 source: comment-only edit of bin/dep.sh" bin/dep.sh comment k1-source
 kill "1 source: transitive, bin/dep.sh sources bin/dep-inner.sh" bin/dep-inner.sh byte k1-source
 kill "2 PATH basename: one byte of bin/tool-x" bin/tool-x byte k2-path
-kill "2 PATH basename: comment-only edit of bin/tool-x" bin/tool-x comment k2-path
 kill "3 data file: one byte of data/config.txt" data/config.txt byte k3-data
 kill "4 directory token: one byte of fixtures/dir/b.txt" fixtures/dir/b.txt byte k4-dir
 kill "5 test/lib helper: one byte of test/lib/helper.sh" test/lib/helper.sh byte k5-lib
-kill "5 test/lib helper: comment-only edit of test/lib/helper.sh" test/lib/helper.sh comment k5-lib
 kill "6 dispatcher sub-command: one byte of bin/heimdall-sub" bin/heimdall-sub byte k6-dispatch
 kill "6 dispatcher: one byte of bin/heimdall itself" bin/heimdall byte k6-dispatch
 kill "7 wildcard (git ls-files): one byte of an unrelated file" unrelated/noise.txt byte k7-wild
@@ -252,6 +351,38 @@ kill "11 hints always_run: one byte of an unrelated file" unrelated/noise.txt by
 same "C-p1 an unrelated edit changes only the whole-tree suites" unrelated/noise.txt byte
 same "C-p2 an arm of the dispatcher nobody invoked (bin/heimdall-other) changes no suite that did not invoke it" bin/heimdall-other byte
 same "C-p3 a tool only an executable's COMMENT names (bin/never-run-tool) adds no edge" bin/never-run-tool byte
+
+# What cannot change what a shell or Python file does is not in the closure hash. A suite that sources, runs or imports the file does not see it
+# (only the whole-tree suites, which read every file as text, do); a here-document body, a multi-line string, a continuation, a script that
+# prints its own header, a file that cannot be tokenized, and a suite that greps the file or enumerates its directory do.
+same "N1 shell: a comment-only edit of the sourced library bin/dep.sh" bin/dep.sh comment
+same "N2 shell: a comment-only edit of bin/tool-x, found by its PATH basename" bin/tool-x comment
+same "N3 shell: a comment-only edit of the test/lib helper" test/lib/helper.sh comment
+same "N4 shell: a blank line appended to bin/dep.sh" bin/dep.sh ws
+same "N5 shell: a comment edited before a here-document" bin/heredoc.sh 'sub|a header comment|a header comment v2'
+same "N6 shell: a comment edited after a here-document" bin/heredoc.sh 'sub|after the here-document|after the here-document v2'
+same "N7 shell: trailing blanks removed from a code line" bin/heredoc.sh 'sub|echo done   |echo done'
+same "N8 shell: a comment after a trailing comment that holds an apostrophe" bin/quoted.sh 'sub|a real comment after it|a real comment after it v2'
+same "N9 python: a comment-only edit (a comment line appended)" bin/pyhelper.py comment
+same "N10 python: a blank line appended" bin/pyhelper.py ws
+same "N11 python: a comment inside a function" bin/pyhelper.py 'sub|an inner comment|an inner comment v2'
+same "N12 python: a trailing comment" bin/pyhelper.py 'sub|a trailing comment|a trailing comment v2'
+kill "14 here-document body: a # line inside it is data" bin/heredoc.sh 'sub|only looks like|only LOOKS like' k14-heredoc
+kill "14 here-document body: trailing blanks inside it are data" bin/heredoc.sh 'sub|payload   |payload' k14-heredoc
+kill "14 here-document: a code line after it" bin/heredoc.sh 'sub|echo done   |echo finished' k14-heredoc
+kill "15 multi-line string: a # line inside it is data" bin/quoted.sh 'sub|only looks like a comment|only LOOKS like a comment' k15-quoted
+kill "16 continuation: the comment line between the two halves of one command" bin/contin.sh 'sub|between two halves|between 2 halves' k16-cont
+kill "16 continuation: a blank after the backslash is not a continuation" bin/contin.sh 'sub|echo a \ |echo a \' k16-cont
+kill "17 prints its own header through a variable holding $0: its comments are its --help" bin/selfread.sh 'sub|second header line|second header LINE' k17-selfread
+kill "17 prints its own header through $0: its comments are its --help" bin/selfread2.sh 'sub|the direct form|the DIRECT form' k17-selfread
+kill "18 python code: a string in bin/pyhelper.py" bin/pyhelper.py 'sub|"hello "|"hi "' k12-py
+kill "18 python docstring: it is visible at run time" bin/pyhelper.py 'sub|visible at run time|visible at RUN time' k12-py
+kill "18 python shebang" bin/pyhelper.py 'sub|#!/usr/bin/env python3|#!/usr/bin/python3' k12-py
+kill "19 python that cannot be tokenized is hashed as committed" bin/pybroken.py comment k13-pybroken
+kill "20 greps the file: a comment-only edit of bin/readme-tool reaches the suite that reads it, not the one that runs it" bin/readme-tool 'sub|a note about the tool v1|a note about the tool v2' k18-greps
+kill "20 greps the file: one byte of bin/readme-tool reaches both" bin/readme-tool byte k18-greps k18b-execs
+kill "21 enumerates the directory: a comment-only edit of libdir/one.sh reaches the suite that greps it, not the one that names the path" libdir/one.sh 'sub|one v1|one v2' k19-dirgrep
+kill "21 enumerates the directory: one byte of libdir/one.sh reaches both" libdir/one.sh byte k19-dirgrep k19b-dirpath
 
 # ── D. hints are validated, never silently ignored ───────────────────────────────────────────────────────────────────
 echo "── D. hints validation"
@@ -423,6 +554,26 @@ HMD_SUITE_CACHE_AUDIT_PCT=1 "$CLI" verify-receipt --repo "$FIX" --receipt "$GOOD
 printf '{"not":"a receipt"' > "$WORK/broken.json"
 "$CLI" verify-receipt --repo "$FIX" --receipt "$WORK/broken.json" >/dev/null 2>&1; eq "F-p6 an unreadable receipt is refused (exit 1)" "$?" 1
 "$CLI" verify-receipt --repo "$FIX" --receipt "$WORK/no-such-receipt.json" >/dev/null 2>&1; eq "F-p7 a missing receipt is refused (exit 1)" "$?" 1
+
+# ── G. the normal forms themselves ───────────────────────────────────────────────────────────────────────────────────
+echo "── G. what the hash sees of a shell or Python file"
+CASES_OUT="$WORK/cases.out"
+python3 -I "$HERE/lib/suite_closure_normalize_cases.py" "$ROOT/bin/lib/suite_closure.py" > "$CASES_OUT" 2> "$WORK/cases.err"; rc=$?
+eq "G0 the cases file runs to its end (exit 0)" "$rc" 0
+[ "$rc" = 0 ] || printf '        %s\n' "$(tail -c 600 "$WORK/cases.err")" >&2
+CASES_N="$(grep -Ec '^(same|diff|none) (ok|FAIL) ' "$CASES_OUT")"
+eq "G1 it printed a verdict for every case it counted ($(grep '^cases ' "$CASES_OUT" | tail -1))" "cases $CASES_N" "$(grep '^cases ' "$CASES_OUT" | tail -1)"
+if [ "$CASES_N" -ge 60 ]; then ok "G2 at least 60 cases ran ($CASES_N)"; else bad "G2 at least 60 cases ran" "only $CASES_N"; fi
+while IFS= read -r verdict_line; do
+  case "$verdict_line" in
+    "same ok "*)   ok "G ${verdict_line#same ok }" ;;
+    "none ok "*)   ok "G ${verdict_line#none ok }" ;;
+    "diff ok "*)   mutant "G ${verdict_line#diff ok }" yes ;;
+    "same FAIL "*) bad "G ${verdict_line#same FAIL }" ;;
+    "none FAIL "*) bad "G ${verdict_line#none FAIL }" ;;
+    "diff FAIL "*) mutant "G ${verdict_line#diff FAIL }" no ;;
+  esac
+done < <(grep -E '^(same|diff|none) (ok|FAIL) ' "$CASES_OUT")
 
 # ── falsifiability ───────────────────────────────────────────────────────────────────────────────────────────────────
 echo "════════════════════════════════════════════════════════════════"

@@ -45,7 +45,19 @@ THE GRAPH (everything is read from git OBJECTS at one commit, never from the wor
             (and what they reach); always_run makes the closure the whole tree (the suite re-runs on ANY change, and is reusable only
             on a byte-identical tree). A hint that names nothing is an error, never a silent no-op.
 
-closure_sha  sha256 over the sorted lines `path<TAB>blob_id` of the closure.
+closure_sha  sha256 over the sorted lines `path<TAB>id` of the closure. A file's id is its blob id, except for a SHELL or PYTHON file (by suffix, or by
+             the #! line of a file that has none), whose id is the digest of what it does without what it only says:
+               shell   without blank lines, full-line comments (a #! line stays) and trailing blanks; NOT inside a here-document body, a multi-line
+                       quoted string, or on the line a backslash joins to the one before (a comment or a blank there is data, or changes where a
+                       command ends); a trailing comment and `\r` stay. A line the scanner cannot place is kept: it over-approximates.
+               python  its tokens without comments (a #! first line stays) and non-logical newlines; docstrings and other strings stay (they are
+                       visible at run time), and so do the indentation and the encoding.
+             The blob id, as committed, stands wherever the file can be read as TEXT: a script that reads its own header (`sed -n '2,40p' "$0"` is
+             its --help), a Python file that does not tokenize or reads its own source, the paths a hint adds, everything a SUITE hands to a command
+             that reads (grep, sed, cat, shasum, shellcheck, find, a `<` redirect) or enumerates with one, and every file of a suite whose closure
+             is the whole tree: a lint that greps comments for a version pin sees a comment as a change. A file only SOURCED, RUN or IMPORTED does
+             not; what a suite reads through a variable or a loop cannot be seen, and is bounded like any unseen read by the audit sample and the
+             age limit.
 salt         sha256 over the RUNNER's own infrastructure and nothing else: the schema; test/run-all.sh with its FULL-LINE comments stripped
              (a `#!` line stays; its raw blob when a heredoc body line starts with `#`, because that line is data and the stripper
              could hide a real change); the two runner libraries test/lib/run-all-guards.sh and test/lib/py-pin.sh; bin/lib/sweep-chain.sh
@@ -72,6 +84,7 @@ import argparse
 import datetime
 import fnmatch
 import hashlib
+import io
 import json
 import math
 import os
@@ -80,8 +93,9 @@ import re
 import signal
 import subprocess
 import sys
+import tokenize
 
-SCHEMA = 1                      # part of the salt: bump it whenever the rules above change what a closure is
+SCHEMA = 2                      # part of the salt: bump it whenever the rules above change what a closure is (2: shell and Python files are hashed without their comments)
 HINTS = "test/closure-hints.json"
 RUN_ALL = "test/run-all.sh"
 CACHE_LIB = "bin/lib/suite-cache.sh"
@@ -144,6 +158,29 @@ STAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 SHELL_BLANKS = " \t\r\x0b\x0c"       # the blanks of a shell line: not str.strip()'s, which also eats unicode spaces a shell treats as text
 # a heredoc start: `<<` or `<<-` (never the here-string `<<<`), then its delimiter: 'quoted', "quoted" (may hold blanks), \escaped or a bare word
 HEREDOC_RE = re.compile(r"""(?<!<)<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([^\s;&|()<>'"\\]+))""")
+
+
+SHELL_SUFFIXES = (".sh", ".bash", ".zsh")
+SHELL_INTERPRETERS = frozenset(["sh", "bash", "dash", "zsh", "ksh"])
+# what one shell line can do to the quoting state: an escaped character, the next quote, or a comment (what follows a `#` that starts a word is text)
+UNQUOTED_RE = re.compile(r"""\\.|\$'|'|"|(?<![^ \t;&|])#""")
+DOUBLE_RE = re.compile(r'\\.|"')
+ANSI_RE = re.compile(r"\\.|'")
+SINGLE_QUOTED_RE = re.compile(r"'[^']*'")
+QUOTED_RE = re.compile("'[^']*'|\"[^\"]*\"")
+# the script's own path: $0, ${0}, $BASH_SOURCE, ${BASH_SOURCE[0]} (not ${0##*/}, which is a name); dirname or basename of it is a directory or a name, not the text
+SELF_REF = r"\$(?:0\b|\{0\}|\{BASH_SOURCE[^}]*\}|BASH_SOURCE\b)"
+SELF_REF_RE = re.compile(SELF_REF)
+SELF_ASSIGN_RE = re.compile(r"^[ \t]*(?:(?:readonly|local|declare|typeset|export)[ \t]+(?:-\w+[ \t]+)*)?([A-Za-z_]\w*)=[\"']?(?:\$\()?"
+                            r"(?:(?:readlink|realpath)(?:[ \t]+-\w+)*[ \t]+)?[\"']?" + SELF_REF, re.M)
+SELF_NAME_RE = re.compile(r"\b(?:dirname|basename)\b(?:[ \t]+-\w+)*[ \t]+[\"']?" + SELF_REF + r"[\"']?")
+PY_SELF_READ_RE = re.compile(rb"getsource|getcomments|getsourcelines|open\([^)\n]*__file__|__file__[^\n]*\.(?:read_text|read_bytes|read)\(")
+# a command that reads the text of the file it is given: a suite that hands one a file, or a directory, sees its comments
+READERS = ("grep|egrep|fgrep|rg|ag|sed|awk|gawk|perl|head|tail|cat|tac|nl|cut|tr|wc|diff|cmp|comm|sort|uniq|less|more|od|xxd|hexdump|strings|"
+           "shasum|sha1sum|sha256sum|sha512sum|md5sum|md5|cksum|openssl|shellcheck|find|xargs|read|mapfile|readarray")
+READER_RE = re.compile(r"\b(?:" + READERS + r")\b")
+READS_OPERAND_RE = re.compile(r"(?:^|[|;&(`{'\"]|\$\()\s*(?:(?:if|then|elif|while|until|do|else|!)\s+)*(?:\w+=\S*\s+)*(?:" + READERS
+                              + r")\b[^|;&)`]*$|(?<!<)<[ \t]*[\"']?$")
 
 
 class Fail(Exception):
@@ -328,6 +365,123 @@ def strip_full_line_comments(text):
     return "\n".join(kept)
 
 
+def language(path, data):
+    """Which language the file `path` (committed bytes `data`) is written in for the hash: "shell", "python" or None. By suffix, or by the #! line of a file that has none."""
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix in SHELL_SUFFIXES:
+        return "shell"
+    if suffix == ".py":
+        return "python"
+    if suffix or not data.startswith(b"#!"):
+        return None
+    words = data.split(b"\n", 1)[0][2:].decode("utf-8", "replace").split()
+    if words and os.path.basename(words[0]) == "env":
+        words = [w for w in words[1:] if not w.startswith("-") and "=" not in w]      # `#!/usr/bin/env -S bash -e`
+    name = os.path.basename(words[0]) if words else ""
+    return "shell" if name in SHELL_INTERPRETERS else "python" if name.startswith("python") else None
+
+
+def quote_state(line, state):
+    """The quoting state at the end of `line` ("" none, "'", '"' or "$'") for a line that starts in `state`. A comment ends the scan: what follows a `#` that starts a word is text, so an apostrophe in it opens nothing."""
+    pos = 0
+    while True:
+        if state == "'":
+            end = line.find("'", pos)
+            if end < 0:
+                return state
+            pos, state = end + 1, ""
+            continue
+        rx = DOUBLE_RE if state == '"' else ANSI_RE if state == "$'" else UNQUOTED_RE
+        for m in rx.finditer(line, pos):
+            tok = m.group()
+            if state:
+                if tok[0] != "\\":                          # the quote that closes it
+                    pos, state = m.end(), ""
+                    break
+            elif tok == "#":
+                return state
+            elif tok[0] != "\\":
+                pos, state = m.end(), tok
+                break
+        else:
+            return state
+
+
+def reads_own_text(lines):
+    """True when a shell script hands its own path to a command that reads text (`sed -n '2,40p' "$0"` prints the header comment as --help): a comment of such a script IS its behaviour."""
+    names = set(SELF_ASSIGN_RE.findall("\n".join(lines)))
+    ref = re.compile(SELF_REF + "".join(r"|\$\{?%s\b" % re.escape(n) for n in names)) if names else SELF_REF_RE
+    for line in lines:
+        if "$" in line:
+            bare = SELF_NAME_RE.sub("", SINGLE_QUOTED_RE.sub("''", line))
+            if READER_RE.search(bare) and ref.search(bare):
+                return True
+    return False
+
+
+def shell_normal_form(text):
+    """`text` without what cannot change what a shell does with it, or None when it must be hashed as committed. Dropped: blank lines, full-line comments (a `#!` line stays) and the trailing blanks of a code line.
+    Kept as they are: a here-document body (data, up to its terminator, whatever it starts with), a multi-line quoted string, a line a backslash joins to the one before it (a comment or a blank there changes where the
+    command ends), a line that ends in a backslash (a blank after it makes it no continuation) and `\\r`. A trailing comment is part of its code line. This is a line scanner, not a parser: where it cannot tell it keeps the
+    line (a `<<` inside a string only turns the rest of the file into data), never the other way. None: the script reads its own text (reads_own_text)."""
+    out, pending, quote, joined = [], [], "", False       # pending: (delimiter, tabs_stripped) of the here-documents whose body is still to come
+    for line in text.split("\n"):
+        if pending:
+            delim, dash = pending[0]
+            if (line.lstrip("\t") if dash else line) == delim:
+                pending.pop(0)
+            out.append(line)
+            joined = False
+            continue
+        bare = line.lstrip(" \t")
+        if not quote and not joined and (not bare or (bare[0] == "#" and not bare.startswith("#!"))):
+            continue
+        for m in HEREDOC_RE.finditer(line):
+            single, double, word = m.group(2), m.group(3), m.group(4)
+            pending.append((single if single is not None else double if double is not None else word, m.group(1) == "-"))
+        end = quote_state(line, quote)
+        joined = line.rstrip(" \t\r").endswith("\\")
+        out.append(line.rstrip(" \t") if not quote and not end and not joined else line)
+        quote = end
+    return None if reads_own_text(out) else "\n".join(out)
+
+
+def python_digest(data):
+    """sha256 over the tokens of the Python source `data` without its comments (a `#!` first line stays) and its non-logical newlines, or None when it must be hashed as committed: it does not tokenize, or it reads its
+    own source. A docstring and every other string is a token, so it stays, and so do the indentation and the encoding."""
+    if PY_SELF_READ_RE.search(data):
+        return None
+    h = hashlib.sha256(b"python\0")
+    try:
+        for tok in tokenize.tokenize(io.BytesIO(data).readline):
+            if tok.type == tokenize.ERRORTOKEN:
+                return None
+            if tok.type == tokenize.NL or (tok.type == tokenize.COMMENT and not (tok.start == (1, 0) and tok.string.startswith("#!"))):
+                continue
+            blob = tok.string.encode("utf-8", "surrogatepass")
+            h.update(b"%d:%d:" % (tok.type, len(blob)))
+            h.update(blob)
+    except (tokenize.TokenError, SyntaxError, ValueError, LookupError):     # IndentationError is a SyntaxError; a bad coding cookie a SyntaxError or LookupError; bytes it cannot decode a ValueError
+        return None
+    return h.hexdigest()
+
+
+def normal_digest(path, data):
+    """sha256 of the committed bytes `data` of `path` without what cannot change what a shell or Python file does, or None: hash the blob as committed."""
+    kind = language(path, data)
+    if kind == "python":
+        return python_digest(data)
+    if kind == "shell":
+        text = shell_normal_form(data.decode("utf-8", "surrogateescape"))
+        return None if text is None else sha256_hex(b"shell\0" + text.encode("utf-8", "surrogateescape"))
+    return None
+
+
+def reads_operand(line, pos):
+    """True when the token that starts at `pos` of `line` is the operand of a command that reads text: `grep -q x TOKEN`, `cat TOKEN`, `... < TOKEN`."""
+    return READS_OPERAND_RE.search(QUOTED_RE.sub("Q", line[max(0, pos - 400):pos])) is not None
+
+
 def bit_indices(bits):
     """The positions of the set bits of `bits`, ascending."""
     return [i for i, c in enumerate(bin(bits)[:1:-1]) if c == "1"]
@@ -429,6 +583,7 @@ class Graph(object):
         self.edges, self.leaves, self.arms, self.invokes, self.whole = {}, {}, {}, {}, set()
         self.hints, self.hints_raw = {}, None
         self._memo, self._gmemo, self._sha = {}, {}, {}
+        self.content, self.reads = {}, {}       # path -> id of a shell or Python file hashed without its comments; suite -> the paths it reads as text
         self._read_tree()
         if edges:
             self._read_blobs()
@@ -466,6 +621,9 @@ class Graph(object):
                     node.kind = "data"
                     continue
                 self.text[path] = data.decode("utf-8", "replace")
+                digest = normal_digest(path, data)
+                if digest is not None:
+                    self.content[path] = "normal:" + digest
         finally:
             blobs.close()
 
@@ -646,7 +804,7 @@ class Graph(object):
         return found
 
     def _scan_lines(self, lines, mode="code"):
-        """(strong, weak, whole) for `lines` written in `mode` ("suite", "code" or "comment", see _resolve_uncached). strong = the files they name (and, in a suite, the directories a glob enumerates): the closure
+        """(strong, weak, whole, read) for `lines` written in `mode` ("suite", "code" or "comment", see _resolve_uncached). strong = the files they name (and, in a suite, the directories a glob enumerates): the closure
         follows what these reach. weak = the directories a SUITE names: every file in them is part of the closure and is hashed, but what
         THEY reach is not followed. whole = they enumerate the whole tree. Directories and whole-tree enumeration are a SUITE's alone: a
         hub tool that prints "see docs/", copies skills/ or runs `git ls-files` works on whatever it is pointed at (a fixture, in nearly every
@@ -654,10 +812,12 @@ class Graph(object):
         repo, or whose tool reads a directory the suite never names, belongs in test/closure-hints.json."""
         suite = mode == "suite"
         keys, gkeys, whole = set(), set(), False
+        read_keys, read_gkeys = set(), set()      # the keys of tokens a suite hands to a command that reads text: read = what they name, hashed as committed
         for line in lines:
             line_mode = "suite-nodir" if suite and PATH_ASSIGN_RE.search(line) else mode
             if suite and QUICK_WHOLE_RE.search(line) and any(rx.search(line) for rx in WHOLE_RES):
                 whole = True
+            reads = suite and READER_RE.search(line) is not None
             for m in TOK_RE.finditer(line):
                 raw, glob = m.group(1), m.group(2)
                 if len(raw) < 2 and not glob:
@@ -668,8 +828,12 @@ class Graph(object):
                 if m.start() > 0 and line[m.start() - 1] in "\"'})":
                     var = VAR_BEFORE_RE.search(line[:m.start()])
                     glued = var.group(1) if var else ""
+                reading = reads and reads_operand(line, m.start())
                 if glob and suite:
-                    gkeys.add((raw, line[max(0, m.start() - 40):m.start()], glued))
+                    gkey = (raw, line[max(0, m.start() - 40):m.start()], glued)
+                    gkeys.add(gkey)
+                    if reading:
+                        read_gkeys.add(gkey)
                 cmdpos = False
                 if PLAIN_TAIL_RE.search(raw):
                     start = max(0, m.start() - 40)
@@ -678,17 +842,25 @@ class Graph(object):
                         before = VAR_OPEN_RE.sub("", before)        # "$dir/heimdall": the `$` opens the variable `dir`, it is not part of a word
                     cmdpos = CMD_BEFORE_RE.search(before) is not None
                 keys.add((raw, line_mode, glued, cmdpos))
-        strong, weak = set(), set()
+                if reading:
+                    read_keys.add((raw, line_mode, glued, cmdpos))
+        strong, weak, read = set(), set(), set()
         for key in keys:
             files, dirs = self._resolve(*key)
             strong |= files
             weak |= dirs
+            if key in read_keys:
+                read |= files | dirs
         for key in gkeys:
-            strong.update(self._glob(*key))
+            found = self._glob(*key)
+            strong.update(found)
+            if key in read_gkeys:
+                read |= found
         if WHOLE in strong:
             whole = True
             strong.discard(WHOLE)
-        return strong, weak - strong, whole
+        read.discard(WHOLE)
+        return strong, weak - strong, whole, read
 
     def _demote_suites(self, from_suite, strong, weak):
         """(strong, weak) with every suite a non-suite names moved from strong to weak: only a suite RUNS another suite. A tool that names a suite in
@@ -715,19 +887,20 @@ class Graph(object):
                 eager_lines, arm_lines = split_arms(code)
             else:
                 eager_lines, arm_lines = code, {}
-            found, weak, whole = self._scan_lines(eager_lines, "suite" if suite else "code")
+            found, weak, whole, read = self._scan_lines(eager_lines, "suite" if suite else "code")
             found |= self._imports(path, code)
             if suite:
                 # a header comment names what the suite tests (files only, never a directory); it never makes one suite depend on another
                 found |= set(p for p in self._scan_lines(comments, "comment")[0] if self.nodes[p].kind != "suite")
                 if whole:
                     self.whole.add(path)
+                self.reads[path] = frozenset(read)
             found.discard(path)
             found, weak = self._demote_suites(suite, found, weak)
             self.edges[path] = found
             self.leaves[path] = weak
             for word, lines in arm_lines.items():
-                targets, arm_weak, _ = self._scan_lines(lines)
+                targets, arm_weak, _, _ = self._scan_lines(lines)
                 targets.discard(path)
                 self.arms.setdefault(path, {})[word] = self._demote_suites(suite, targets, arm_weak)
             if path not in DISPATCHERS and path not in FORWARDERS:
@@ -794,17 +967,28 @@ class Graph(object):
     def members(self, bits):
         return [self.paths[i] for i in bit_indices(bits)]
 
-    def closure_sha(self, bits):
-        got = self._sha.get(bits)
+    def raw_bits(self, suite):
+        """The members of `suite`'s closure that it reads as TEXT, which its closure hash takes as committed (comments included): every file when it enumerates the tree, else the files it hands to a command that
+        reads, the directories it enumerates that way and the paths its hint adds."""
+        hint = self.hints.get(suite, {})
+        if hint.get("always_run") or suite in self.whole:
+            return self.all_bits
+        return self.mask(set(self.reads.get(suite, ())) | set(hint.get("extra", ())))
+
+    def closure_sha(self, bits, raw=0):
+        key = (bits, raw)
+        got = self._sha.get(key)
         if got is None:
+            committed = set(self.members(bits & raw))
             h = hashlib.sha256()
             for p in self.members(bits):
-                h.update(("%s\t%s\n" % (p, self.nodes[p].oid)).encode("utf-8", "surrogateescape"))
-            got = self._sha[bits] = h.hexdigest()
+                ident = self.nodes[p].oid if p in committed else self.content.get(p, self.nodes[p].oid)
+                h.update(("%s\t%s\n" % (p, ident)).encode("utf-8", "surrogateescape"))
+            got = self._sha[key] = h.hexdigest()
         return got
 
     def hash_all(self):
-        return [(s, self.closure_sha(self.closure(s))) for s in self.suites()]
+        return [(s, self.closure_sha(self.closure(s), self.raw_bits(s))) for s in self.suites()]
 
     def runner_salt_input(self):
         """(key, value) that stands for test/run-all.sh in the salt: the sha256 of its text without full-line comments, or its raw blob id when it cannot be stripped
@@ -1054,7 +1238,8 @@ def cmd_hash_all(args):
 
 def cmd_hash(args):
     graph = open_graph(args)
-    emit([graph.closure_sha(graph.closure(one_suite(graph, args.suite)))])
+    suite = one_suite(graph, args.suite)
+    emit([graph.closure_sha(graph.closure(suite), graph.raw_bits(suite))])
     return 0
 
 
