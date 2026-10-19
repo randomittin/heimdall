@@ -1706,7 +1706,7 @@ if [ -n "$EVIDENCE" ]; then
   done
 fi
 
-BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0} + ${TMP_FINDINGS:-0} + n_refused))
+BAD=$((n_fail + n_timeout + n_discrep + n_treeviol + ${ORPHAN_SURVIVORS:-0} + ${TMP_FINDINGS:-0} + n_refused + n_unsound))
 
 # ── SWEEP RECEIPT ─────────────────────────────────────────────────────────────────────────
 # Turns "the sweep is green" into a checkable FACT instead of a claim. Three real
@@ -1833,6 +1833,24 @@ if command -v jq >/dev/null 2>&1; then
   fi
   # A run --fail-fast stopped before every suite ran is kind=aborted: exit_code 1, never the anchor, refused by name by the push gate and release/ship.sh. aborted{} says who stopped it and what the
   # run was meant to be; not_run_suites names every suite that never started (these, and the disk floor's REFUSED ones), which the failed-first order must not mistake for failed ones.
+  # The suite cache's part of the receipt (see "Suite cache" at the top). full_equivalent: every non-live suite is green AND has its record, so verify-receipt can re-derive the claim.
+  # The totals count the cached suites too: a cache-composed sweep is a full sweep, the cache block says how it was composed.
+  FULL_EQ=false; CACHE_RECEIPT_JSON=null; FULL_EQ_JSON=null; AMENDED_JSON='[]'
+  SUITES_TOTAL=$((TO_RUN + n_cached)); SUITES_PASSED=$((n_pass + n_cached)); ASSERT_PASSED=$((tot_p + CACHED_ASSERT))
+  if [ "$CACHE_ON" -eq 1 ]; then
+    { printf '%s\n' ${CACHED[@]+"${CACHED[@]}"}; for s in ${RUN[@]+"${RUN[@]}"}; do [ -n "$(live_reason "$s")" ] || printf '%s\n' "${s##*/}"; done; } | grep . | LC_ALL=C sort -u > "$CACHE_TMP/scope.txt"
+    if [ -n "$CACHE_JSON" ]; then
+      CACHE_RECEIPT_JSON="$CACHE_JSON"
+      if [ "$RECEIPT_RC" = 0 ] && [ "$n_notrun" -eq 0 ] && [ "$n_refused" -eq 0 ] && cmp -s "$CACHE_TMP/scope.txt" "$CACHE_TMP/green.txt"; then FULL_EQ=true; fi
+    else
+      # never a receipt that looks like a legacy full sweep: a cache-composed run always writes a cache object, and this one fails verify-receipt by name
+      CACHE_RECEIPT_JSON="$(jq -nc --arg e "${CACHE_COMPOSE_ERR:-the cache block could not be built}" '{mode:"closure", error:$e}')"
+    fi
+    FULL_EQ_JSON="$FULL_EQ"
+    if [ "$FAILED_ONLY" -eq 1 ] && [ -n "$AMEND_FROM" ]; then
+      AMENDED_JSON="$(printf '%s\n' ${RUN[@]+"${RUN[@]}"} | awk 'NF { n = split($0, a, "/"); print a[n] }' | LC_ALL=C sort | jq -R . | jq -sc . 2>/dev/null || echo '[]')"
+    fi
+  fi
   RECEIPT_KIND="$SWEEP_KIND"; ABORTED_JSON=null
   if [ "$n_notrun" -gt 0 ]; then
     RECEIPT_KIND=aborted
@@ -1856,13 +1874,13 @@ if command -v jq >/dev/null 2>&1; then
       --arg head_sha "$RECEIPT_HEAD_SHA" \
       --argjson tree_clean "$RECEIPT_TREE_CLEAN" \
       --argjson exit_code "$RECEIPT_RC" \
-      --argjson suites_total "$TO_RUN" \
-      --argjson suites_passed "$n_pass" \
+      --argjson suites_total "$SUITES_TOTAL" \
+      --argjson suites_passed "$SUITES_PASSED" \
       --argjson suites_failed "$n_fail" \
       --argjson suites_timeout "$n_timeout" \
       --argjson suites_discrepancy "$n_discrep" \
       --argjson suites_unparsed "$n_unparsed" \
-      --argjson assertions_passed "$tot_p" \
+      --argjson assertions_passed "$ASSERT_PASSED" \
       --argjson assertions_failed "$tot_f" \
       --argjson duration_s "$ELAPSED" \
       --argjson load_start_1m "$(_load_field "$LOAD_START" 1)" \
@@ -1882,6 +1900,7 @@ if command -v jq >/dev/null 2>&1; then
       --argjson nongreen "$NONGREEN_JSON" \
       --argjson tmp_leaks "$TMP_LEAKS_JSON" --argjson tmp_outside "$TMP_OUTSIDE_JSON" --argjson tmp_on "$TMP_ON_JSON" --argjson tmp_dirs "$TMP_DIRS_JSON" --argjson tmp_sock "$TMP_SOCK_JSON" --arg tmp_root "${TMP_ROOT:-}" \
       --argjson suites_refused "$n_refused" --argjson disk_floor "$DISK_FLOOR_JSON" \
+      --argjson cache "$CACHE_RECEIPT_JSON" --argjson fulleq "$FULL_EQ_JSON" --arg amend_from "$AMEND_FROM" --argjson amended "$AMENDED_JSON" \
       '{finished_at:$finished_at, repo:$repo, head_sha:$head_sha, tree_clean:$tree_clean,
         exit_code:$exit_code, suites_total:$suites_total, suites_passed:$suites_passed,
         suites_failed:$suites_failed, suites_timeout:$suites_timeout,
@@ -1897,6 +1916,8 @@ if command -v jq >/dev/null 2>&1; then
        + (if $esc_reason != "" then {escalated_from:"since-green", escalation_reason:$esc_reason} else {} end)
        + (if ($not_run | length) > 0 then {not_run_suites:$not_run} else {} end)
        + (if $kind == "aborted" then {aborted:$aborted} else {} end)
+       + (if $cache != null then {cache:$cache, full_equivalent:$fulleq} else {} end)
+       + (if $amend_from != "" then {amended_from:$amend_from, amended:$amended} else {} end)
        + {suite_durations:$durs}' > "$RECEIPT_TMP" 2>/dev/null; then
       if mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null; then
         echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})"
