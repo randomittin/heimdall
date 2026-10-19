@@ -41,12 +41,37 @@ REF="${REF:-$(git -C "$REPO" rev-parse HEAD)}"
 # Every temp path this suite makes lives under ONE private dir that is removed on exit, also on INT/TERM/HUP, and a bare mktemp lands in it even where the
 # platform's mktemp ignores TMPDIR (test/lib/private-tmp.sh). The stranger runs under `env -i`, which drops TMPDIR, the pip/uv cache variables and the mktemp
 # shim on PATH: ISO_ENV hands the first two over, HMD_MKTEMP_SHIM_DIR is put first on each rebuilt PATH below -- a stranger's mktemp, pip and uv write here, not
-# into the user temp dir (that is where the tmp.XXXXXXXXXX dirs holding only .cache/uv came from). The EXIT trap below ends with hmd_private_tmp_rm.
+# into the user temp dir. The EXIT trap below stops what still runs from inside the private root (reap_private_root), then ends with hmd_private_tmp_rm.
 # shellcheck source=lib/private-tmp.sh disable=SC1091  # the default run never opens sourced files
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/private-tmp.sh" && hmd_private_tmp install-stranger || exit 1
-ISO_ENV=(TMPDIR="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" UV_CACHE_DIR="$UV_CACHE_DIR" PIP_CACHE_DIR="$PIP_CACHE_DIR")
+# The private root's own random name (install-stranger.XXXXXX): every path under it carries it, whether the OS prints the root as /var/... or /private/var/.... It names
+# the processes the stranger left running (reap_private_root, assertion (0)). A name that is empty or not ours must never reach pgrep -f, where it would match everything.
+ROOT_NAME="${HMD_PRIVATE_TMP##*/}"
+case "$ROOT_NAME" in install-stranger.?*) ;; *) echo "FATAL: unexpected private root '${HMD_PRIVATE_TMP:-}'"; exit 2 ;; esac
+# THE STRANGER RUNS NO BACKGROUND UPDATER AND ACQUIRES NO MODULE (2026-10-19, the "TMP LEAK: install-stranger.xIxdfq 1015.6 MB" of the full sweep). install.sh's validation gate boots
+# a real headless Claude Code; its SessionStart hook runs `heimdall-autoupdate check`, which on a fresh HOME reconciles the default module set and starts
+# `heimdall-modules add headroom` DETACHED (`( ... ) & disown`; macOS has no setsid(1)) -> `uv tool install headroom-ai[all]`. That is still running when install.sh returns
+# and writes 4.4 GB (2.2 GB uv cache in UV_CACHE_DIR + 2.1 GB tool store in the HOME) over the next ~2.5 minutes. Nothing waits for it and it sits in a process group of its own
+# (its pgid differs from the suite's, measured), so run-all's group reap never sees it: when the suite ends it can still be writing into the private root, which is how
+# install-stranger.XXXXXX outlived the EXIT trap. Measured, not guessed: one install in a scratch HOME, root = 153 MB when install.sh returned, 4.47 GB 150 s later
+# (autoupdate.log: "reconcile: headroom acquiring"); with the two switches below it stays at 153 MB. This suite tests the installer, not the updater or
+# the module system (test/heimdall-autoupdate.test.sh, module-reconcile.test.sh and autoupdate-consent-waiver.test.sh do), so both are off for every stranger child. `env -i`
+# drops the suite's own environment, which is why they ride in ISO_ENV.
+ISO_ENV=(TMPDIR="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" UV_CACHE_DIR="$UV_CACHE_DIR" PIP_CACHE_DIR="$PIP_CACHE_DIR" HEIMDALL_NO_AUTOUPDATE=1 HEIMDALL_NO_MODULES=1)
 need() { command -v "$1" >/dev/null 2>&1 || { echo "FATAL: $1 not found on host PATH"; exit 2; }; }
-need claude; need git
+need claude; need git; need pgrep
+# What the stranger starts and leaves running from inside the private root keeps writing after `rm -rf` removed it, and re-creates it (see the ISO_ENV note). Stop it, children
+# first, before the tree goes: called from the EXIT trap, so also on INT/TERM/HUP and on a failing run. SIGKILL, not TERM: what is left here is junk by definition.
+reap_tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do reap_tree "$c"; done; kill -9 "$1" 2>/dev/null; return 0; }
+reap_private_root() {
+  local p n=0
+  for p in $(pgrep -f -- "$ROOT_NAME" 2>/dev/null); do
+    [ "$p" = "$$" ] && continue
+    reap_tree "$p"; n=$((n + 1))
+  done
+  [ "$n" -eq 0 ] || echo "install-stranger: stopped $n process(es) still running from inside the private root" >&2
+  return 0
+}
 CLAUDE_BIN="$(cd "$(dirname "$(command -v claude)")" && pwd)"
 GIT_BIN="$(cd "$(dirname "$(command -v git)")" && pwd)"
 # node may be an nvm shell function; resolve the real binary dir.
@@ -107,7 +132,7 @@ TMPH="$(mktemp -d)"
 # uninstall-reversal scenarios. Declared up here so the cleanup trap can name it
 # unconditionally under `set -u`.
 PROBE_TREE=""
-trap 'rm -rf "$TMPH" "$FAKE_DIR" ${PROBE_TREE:+"$PROBE_TREE"}; hmd_private_tmp_rm' EXIT
+trap 'reap_private_root; rm -rf "$TMPH" "$FAKE_DIR" ${PROBE_TREE:+"$PROBE_TREE"}; hmd_private_tmp_rm' EXIT
 
 echo "stranger-install harness  repo=$REPO  ref=${REF:0:12}  HOME=$TMPH"
 echo "--------------------------------------------------------------------"
@@ -120,6 +145,17 @@ CARD="$(run_install "$TMPH")"
 EXPECT_VER="$(git -C "$TMPH/.heimdall" describe --tags --abbrev=0 2>/dev/null \
   | sed -E 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
 [ -n "$EXPECT_VER" ] || EXPECT_VER="$(git -C "$REPO" describe --tags --abbrev=0 2>/dev/null | sed -E 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+
+# (0) HERMETIC INSTALL — a stranger install must leave no background module installer running (the ISO_ENV note at the top: the one that did wrote 4.4 GB into the private
+# root after the EXIT trap had removed it). Asked the moment install.sh returns, where the detached `heimdall-modules add headroom` that the validation gate's SessionStart
+# hook used to start is still minutes from done, so it is alive here whenever the opt-out regresses. Matched by the private root's own name, which its command line carries.
+LATE_PIDS="$(pgrep -f -- "$ROOT_NAME/.*heimdall-modules (add|repair)" 2>/dev/null | paste -sd' ' -)"
+if [ -z "$LATE_PIDS" ]; then
+  ok "the install left no background module installer running (updater and module acquisition are off for the stranger)"
+else
+  bad "a background module installer is still running after the install (pids $LATE_PIDS) — it keeps writing into the private root after cleanup removed it"
+  reap_private_root
+fi
 
 # (2) DYNAMIC VERSION — card must show the real version, not a stale literal.
 if grep -qE "Heimdall v${EXPECT_VER}([^0-9]|\$)" <<<"$CARD"; then
