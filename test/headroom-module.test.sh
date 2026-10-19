@@ -156,6 +156,21 @@ mkdir -p "$ABSENT_STATE"
 hmd_absent()  { "$MODS" --state "$ABSENT_STATE"  "$@"; }
 hmd_present() { "$MODS" --state "$PRESENT_STATE" "$@"; }
 
+# PRE-LAUNCH. The three REAL-registry adds (H1b, H3, H3b) each spend most of their time in step 7, where the add path runs the class-owned
+# suites -- the dual-class headroom runs `bash test/gate-judgment-uncompressed.test.sh` twice (gates-read-raw and never-touches-judgment-inputs),
+# ~20-25 s an add, ~75 s of this file's ~85 s run back to back. They are independent of one another and of everything else in the file: each has
+# its own --state root and none writes to the registry. So they start NOW and run side by side with H0-H2, and each section below reads what ITS
+# add printed and returned, from the files written here. Every assertion is the one that was there, on the very command line it had; only WHEN
+# the command ran moved. A job that dies without writing its exit code reads as exit 255, never as a pass.
+ST="$TMP/state/real"
+NST="$TMP/state/cp-down"
+( hmd_present add headroom --yes >"$TMP/h1b.out" 2>&1; echo "$?" >"$TMP/h1b.rc" ) &
+PID_H1B=$!
+( "$MODS" --state "$ST" add headroom --yes >"$TMP/h3.out" 2>&1; echo "$?" >"$TMP/h3.rc" ) &
+PID_H3=$!
+( env HEIMDALL_DEFAULT_CP_URL="$(hermetic_cp_dead_url)" "$MODS" --state "$NST" add headroom --yes >"$TMP/h3b.out" 2>&1; echo "$?" >"$TMP/h3b.rc" ) &
+PID_H3B=$!
+
 echo
 echo "H0 — the manifest is valid and the mutation copy is byte-identical"
 if jq -e . "$MANIFEST" >/dev/null 2>&1; then
@@ -273,7 +288,9 @@ echo "H1b — and honest about PRESENCE, against a root this file really install
 # default_included, so PRESENT is the normal state and deserves its own honesty
 # assertions rather than being the case nobody checked.
 PIN="$(jq -r '.pinned_version.version' "$MANIFEST")"
-PADD="$(hmd_present add headroom --yes 2>&1)"; PRC=$?
+# (the add into $PRESENT_STATE was started in the PRE-LAUNCH block above)
+wait "$PID_H1B"
+PADD="$(cat "$TMP/h1b.out")"; PRC="$(cat "$TMP/h1b.rc" 2>/dev/null || echo 255)"
 if [ "$PRC" -eq 0 ]; then
   ok "the module installs into a state root the suite owns (exit 0)"
 else
@@ -347,8 +364,9 @@ done
 
 echo
 echo "H3 — the add path runs BOTH classes' invariants, module WIRED"
-ST="$TMP/state/real"
-OUT="$("$MODS" --state "$ST" add headroom --yes 2>&1)"; RC=$?
+# (the add into $ST was started in the PRE-LAUNCH block above)
+wait "$PID_H3"
+OUT="$(cat "$TMP/h3.out")"; RC="$(cat "$TMP/h3.rc" 2>/dev/null || echo 255)"
 if [ "$RC" -eq 0 ]; then
   ok "add succeeds against the real dual-class contract"
 else
@@ -417,8 +435,9 @@ echo "H3b — FALSIFIER FOR THE STAND-IN: the SAME add with the control plane un
 # no-signed-traffic-routing invariant probes is a loopback port nothing listens on —
 # and the add must be REFUSED and unwound. An unreachable check fails closed; it never
 # passes (also proved on its own in test/cp-signed-no-rewriting-proxy.test.sh 4.6).
-NST="$TMP/state/cp-down"
-NOUT="$(env HEIMDALL_DEFAULT_CP_URL="$(hermetic_cp_dead_url)" "$MODS" --state "$NST" add headroom --yes 2>&1)"; NRC=$?
+# (the add into $NST, with HEIMDALL_DEFAULT_CP_URL at a loopback port nothing listens on, was started in the PRE-LAUNCH block above)
+wait "$PID_H3B"
+NOUT="$(cat "$TMP/h3b.out")"; NRC="$(cat "$TMP/h3b.rc" 2>/dev/null || echo 255)"
 if [ "$NRC" -ne 0 ]; then
   ok "RED ARM: the SAME add is REFUSED when the control plane is unreachable (exit $NRC)"
 else
