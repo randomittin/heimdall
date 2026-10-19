@@ -37,16 +37,24 @@ done
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
-# 1. the real tree
+# The run on the real tree and every mutant run are independent of one another (each driver run makes its own HOME / HEIMDALL_HOME / TMPDIR, each
+# mutant has its own copy of bin/lib), so up to JOBS of them run at a time. Nothing is reported until the last has ended, and then in the order
+# the sections below name: the real tree's checks first, then each mutant in the order it is declared. A background job cannot add to PASS / FAIL
+# itself, so a mutant's verdict is two lines in $TMPROOT/verdict.N (ok|bad, then the message ok / bad prints); a job that left none is a failure.
+JOBS=6
+JOB_PIDS=()
+spawn() {
+  local started=${#JOB_PIDS[@]}
+  # every job started before the last JOBS has been waited for by now: the one JOBS back is the oldest that can still be running
+  if [ "$started" -ge "$JOBS" ]; then wait "${JOB_PIDS[$((started - JOBS))]}"; fi
+  "$@" &
+  JOB_PIDS+=("$!")
+}
+
+# 1. the real tree (started first, reported first)
 OUT="$TMPROOT/real.out"
-python3 "$DRIVER" "$REPO/bin/lib" >"$OUT" 2>"$TMPROOT/real.err"
-while IFS= read -r line; do
-  case "$line" in
-    "ok "*) ok "${line#ok }" ;;
-    "FAIL "*) bad "${line#FAIL }" ;;
-  esac
-done <"$OUT"
-if [ "$(grep -c '^ok \|^FAIL ' "$OUT")" -lt 30 ]; then bad "the driver ran fewer than 30 checks: $(tail -3 "$TMPROOT/real.err")"; fi
+run_real() { python3 "$DRIVER" "$REPO/bin/lib" >"$OUT" 2>"$TMPROOT/real.err"; }
+spawn run_real
 
 # replace OLD with NEW in FILE, exactly once (a mutation target that moved is a failure of the suite, not a silent pass)
 mutate() {
@@ -61,14 +69,27 @@ PYEOF
 }
 
 # 2. a copy of bin/lib with up to TWO edits; the named check must fail on it
-mutant() {
-  local label="$1" file="$2" old="$3" new="$4" want="$5" file2="${6:-}" old2="${7:-}" new2="${8:-}" copy="$TMPROOT/m-$RANDOM/bin/lib" out
+run_mutant() {
+  local n="$1" label="$2" file="$3" old="$4" new="$5" want="$6" file2="${7:-}" old2="${8:-}" new2="${9:-}"
+  local copy="$TMPROOT/m-$n/bin/lib" verdict="$TMPROOT/verdict.$1" out
   mkdir -p "$copy" && cp -R "$REPO/bin/lib/." "$copy/"
   if ! mutate "$copy/$file" "$old" "$new" || { [ -n "$file2" ] && ! mutate "$copy/$file2" "$old2" "$new2"; }; then
-    bad "mutant [$label]: could not be applied (the code it mutates moved)"; return
+    printf 'bad\n%s\n' "mutant [$label]: could not be applied (the code it mutates moved)" >"$verdict"; return
   fi
   out="$(python3 "$DRIVER" "$copy" 2>&1)"
-  if printf '%s\n' "$out" | grep -q "^FAIL $want"; then ok "mutant [$label] makes check '$want' fail"; else bad "mutant [$label] was NOT caught by '$want'"; fi
+  if printf '%s\n' "$out" | grep -q "^FAIL $want"; then
+    printf 'ok\n%s\n' "mutant [$label] makes check '$want' fail" >"$verdict"
+  else
+    printf 'bad\n%s\n' "mutant [$label] was NOT caught by '$want'" >"$verdict"
+  fi
+}
+
+MUTANT_COUNT=0
+MUTANT_LABELS=()
+mutant() {
+  MUTANT_COUNT=$((MUTANT_COUNT + 1))
+  MUTANT_LABELS+=("$1")
+  spawn run_mutant "$MUTANT_COUNT" "$@"
 }
 
 Q=companion_quick_ask.py
@@ -103,6 +124,27 @@ mutant "touch the dashboards store during an ask" $Q '    cands = candidates(roo
     if not cands:' '    cands = candidates(root)
     _sibling("companion_dashboards")._touch(root)
     if not cands:' read-only-spy
+
+wait
+
+# 1. (reported) the real tree
+while IFS= read -r line; do
+  case "$line" in
+    "ok "*) ok "${line#ok }" ;;
+    "FAIL "*) bad "${line#FAIL }" ;;
+  esac
+done <"$OUT"
+if [ "$(grep -c '^ok \|^FAIL ' "$OUT")" -lt 30 ]; then bad "the driver ran fewer than 30 checks: $(tail -3 "$TMPROOT/real.err")"; fi
+
+# 2. (reported) the mutants, in the order they are declared
+for ((n = 1; n <= MUTANT_COUNT; n++)); do
+  if [ ! -s "$TMPROOT/verdict.$n" ]; then
+    bad "mutant [${MUTANT_LABELS[$((n - 1))]}] left no verdict (its job died before it could write one)"
+    continue
+  fi
+  { IFS= read -r kind; IFS= read -r message; } <"$TMPROOT/verdict.$n"
+  if [ "$kind" = ok ]; then ok "$message"; else bad "$message"; fi
+done
 
 # 3. the wiring, by text
 RC="$REPO/bin/heimdall-relay-client"
