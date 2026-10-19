@@ -16,6 +16,7 @@ when it "should work". Small-but-broken FAILS.
 - [ ] **Lint / build clean** — linter and build ran fresh, zero warnings, zero errors.
 - [ ] **Verification evidence quoted** — the command AND its exit code / output appear in the status report. No claim without a fresh run behind it.
 - [ ] **Scope respected** — only files in the assigned scope changed; no unrelated refactors, no feature creep.
+- [ ] **No CI re-rolls** — a failing or flaky CI result was fixed (a test must not depend on the wall-clock speed of a shared runner: count steps, not seconds, or mark it local-only) or reported, never re-rolled: no empty commit (`git commit --allow-empty`), no `gh run rerun`, no `gh workflow run` to retrigger it. The Bash hook denies them (`CLAUDE.md` "CI waste guard"); each one pays GitHub Actions minutes for the same code.
 - [ ] **Isolation 1.0 where applicable** — for tasks with a falsifiability oracle, `bin/falsify <domain> --assert-score 1.0` passes (golden green, every mutant killed).
 - [ ] **Red flags named** — the agent has explicitly listed the red flags it sees (or "none, and here's why"), per its role-specific checklist.
 

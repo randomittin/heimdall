@@ -94,6 +94,7 @@ NEVER write stub, dummy, placeholder, shim, mock, TODO, or skeleton code. Every 
 - A proof-less fix is un-PR-able: `open_pr` refuses any record whose
   `evidence.all_passed != true`. Never open a PR without recorded real-exit proof.
 - Minimal changes — fix the bug, nothing else.
+- **Never retrigger CI.** No empty commit (`git commit --allow-empty`), no `gh run rerun`, no `gh workflow run`, no `gh api` POST to a re-run endpoint: the Bash hook denies them (`CLAUDE.md` "CI waste guard") because each one pays GitHub Actions minutes for the same code. A flaky test is the bug: fix it (a test must not depend on the wall-clock speed of a shared runner: count steps, not seconds, or mark it local-only) or comment the flake on the issue, never re-roll it.
 - If a fix is unclear or risky, add a comment on the issue instead of a bad fix.
 - Commit message must include "closes #N" for auto-close.
 

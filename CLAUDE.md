@@ -329,6 +329,43 @@ warning but isn't blocked; don't drop the gate altogether.* The gate is now chos
   `test/heimdall-push-gate-target-repo.test.sh` (the operator's case: the session is in heimdall and
   the push goes to X by `cd X && ...`, by `-C X`, or from X itself, each graded on X's own record).
 
+## CI waste guard: never pay to re-roll a flaky result (2026-10-19)
+In a client repo an hmd agent worked around a flaky test by pushing an EMPTY commit to retrigger CI and by
+re-running the workflow twice: every attempt spent GitHub Actions minutes and the flake was still there.
+Operator rule: *a flaky failure is a defect: fix it or report it, never re-roll CI.* The Bash hook
+(`bin/heimdall-precheck-bash`, FIRST in its chain, so a refused command never reaches git-guard or the
+secret scan) now denies, through `bin/lib/hmd_ci_guard.py`:
+
+- **Empty commits.** `git commit --allow-empty`, wherever the flag sits among the commit's options and
+  behind any of git's global options (`-C d`, `-c k=v`, `--git-dir`, ...). `--allow-empty-message`,
+  `--no-allow-empty`, and a `-m` value or a path that merely spells the flag are not it.
+- **CI re-runs and re-dispatches.** `gh run rerun` (any flags: `--failed`, `--job`, `-R`),
+  `gh workflow run`, and a `gh api` POST (`-X POST`, `--method POST`, the POST gh makes by itself once
+  `-f`, `-F`, `--field`, `--raw-field` or `--input` gives it a body, or a method that cannot be told) to an
+  endpoint ending `/rerun`, `/rerun-failed-jobs`, `/dispatches` or `/rerequest`.
+  `gh run list|view|watch|download|cancel`, `gh workflow list|view|enable|disable` and a GET of those
+  endpoints stay allowed.
+- **Read like a shell, never by grepping text.** The helper reuses the kill guard's lexer
+  (`bin/lib/hmd_kill_guard.py`: quotes, `env`/`nice`/`timeout`/`sudo`/`xargs`, chains, pipes, subshells,
+  loops, `sh -c`, `eval`, heredocs fed to a shell) and the git option table of
+  `bin/lib/hmd_push_target.py`, so text that only MENTIONS a form (echo, grep, a commit message or its
+  heredoc, a gh field value) is not a form. A pre-filter starts python only for a command that mentions
+  `allow-empty`, `rerun`, `rerequest`, `dispatches` or `workflow ... run`; every other command pays one
+  `tr` and one `case`.
+- **Operator override: `HMD_CI_RERUN_ALLOW=1`**, set in the environment Claude Code runs in. The hook reads
+  ITS OWN environment, so an inline `HMD_CI_RERUN_ALLOW=1 git commit --allow-empty ...` reaches git but not
+  the hook that has already said no (the same as `HMD_MIN_FREE_PCT`); only exactly `1` lifts it, and nothing
+  of the guard runs then.
+- **Fails OPEN, on purpose.** A cost guard, not a security gate: the disk floor's convention, not the kill
+  guard's. A helper that is missing, crashes or times out (`HMD_CI_GUARD_TIMEOUT_S`, default 5), or a
+  command it cannot read (an unbalanced quote, an expanded heredoc, nesting past 8), is one line on stderr
+  and an allow; a form it DID read wins over what it could not. Best effort, said plainly: git and gh are the
+  two tools it reads (curl against the API, a git or gh alias, a script on disk are not), and like the push gate's
+  receipt it is a cooperating-agent control, not a security boundary.
+- **What to do instead** (also in `skills/heimdall/references/definition-of-done.md`, `agents/coder.md` and
+  `agents/fixer.md`): fix the flake (a test must not depend on the wall-clock speed of a shared runner:
+  count steps, not seconds, or mark it local-only) or report it. Proof: `test/ci-waste-guard.test.sh`.
+
 ## Model routing (2026-08-11 directive)
 - **Main Claude Code agent: never pinned.** It runs on the user's own default. hmd
   does not hardcode opus — or anything else — for the main agent.
