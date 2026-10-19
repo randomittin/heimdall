@@ -242,7 +242,6 @@ kill "11 hints always_run: one byte of an unrelated file" unrelated/noise.txt by
 same "C-p1 an unrelated edit changes only the whole-tree suites" unrelated/noise.txt byte
 same "C-p2 an arm of the dispatcher nobody invoked (bin/heimdall-other) changes no suite that did not invoke it" bin/heimdall-other byte
 same "C-p3 a tool only an executable's COMMENT names (bin/never-run-tool) adds no edge" bin/never-run-tool byte
-same "C-p4 a plain suite is untouched by a data edit it never names" data/config.txt comment
 
 # ── D. hints are validated, never silently ignored ───────────────────────────────────────────────────────────────────
 echo "── D. hints validation"

@@ -859,12 +859,12 @@ def build_parser():
             p.add_argument("--rev", help="read this commit's git objects instead of HEAD (no clean-tree requirement)")
         if suite:
             p.add_argument("--suite", required=True, help="the suite")
+        return p
     common(sub.add_parser("hash-all", help="suite<TAB>closure_sha for every suite")).set_defaults(run=cmd_hash_all)
     common(sub.add_parser("hash", help="the closure_sha of one suite"), suite=True).set_defaults(run=cmd_hash)
     common(sub.add_parser("deps", help="the closure of one suite, sorted, one path per line (exactly what is hashed)"), suite=True).set_defaults(run=cmd_deps)
     common(sub.add_parser("salt", help="the salt: sha256 of the test infrastructure, hints, engine and toolchain")).set_defaults(run=cmd_salt)
-    verify = sub.add_parser("verify-receipt", help="exit 0 only if the receipt's cache block re-derives at its own head_sha")
-    common(verify, rev=False)
+    verify = common(sub.add_parser("verify-receipt", help="exit 0 only if the receipt's cache block re-derives at its own head_sha"), rev=False)
     verify.add_argument("--receipt", required=True, help="the sweep receipt (JSON) to verify")
     verify.set_defaults(run=cmd_verify)
     return parser
