@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from importlib.util import module_from_spec, spec_from_file_location
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -82,34 +83,56 @@ MUTANTS = [
 ]
 
 
+MUTANT_JOBS = 6    # mutant batteries in flight at once
+
+
+def run_one_mutant(index, source, base, old, new):
+    """Build mutant `index` in a directory of its own and run the whole battery against it in a process of its own (the battery makes its
+    own HOME / HEIMDALL_HOME / TMPDIR, so no mutant can see another); -> that process's output, "" when it ran out of time."""
+    directory = os.path.join(base, "m%02d" % index)
+    os.makedirs(directory)
+    target = os.path.join(directory, "dashboard_producers.py")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(source.replace(old, new))
+    os.symlink(os.path.join(os.path.dirname(MODULE), "companion_ui_panels.py"), os.path.join(directory, "companion_ui_panels.py"))
+    try:
+        done = subprocess.run([sys.executable, os.path.realpath(__file__), target, STORE_FILE], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240,
+                              env=dict(os.environ, HMD_DASH_STORE_MODULE=STORE_FILE))
+    except subprocess.TimeoutExpired:
+        return ""
+    return done.stdout
+
+
 def run_mutants():
     source = open(MODULE, encoding="utf-8").read()
     base = tempfile.mkdtemp(prefix="dashprod-mut-")
     try:
         only = os.environ.get("DASH_MUTANT_ONLY")    # a `|`-separated list of label fragments: a development loop, not CI
-        for i, (label, old, new, expect) in enumerate(MUTANTS):
-            if only and not any(fragment in label for fragment in only.split("|")):
-                continue
-            count = source.count(old)
-            if count == 0 or (count != 1 and old != "sys.stdin.isatty()"):
-                ok("mutant anchor present: %s" % label, False, "%d matches" % count)
-                continue
-            directory = os.path.join(base, "m%02d" % i)
-            os.makedirs(directory)
-            target = os.path.join(directory, "dashboard_producers.py")
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(source.replace(old, new))
-            os.symlink(os.path.join(os.path.dirname(MODULE), "companion_ui_panels.py"), os.path.join(directory, "companion_ui_panels.py"))
-            try:
-                done = subprocess.run([sys.executable, os.path.realpath(__file__), target, STORE_FILE], stdin=subprocess.DEVNULL,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240,
-                                      env=dict(os.environ, HMD_DASH_STORE_MODULE=STORE_FILE))
-                out = done.stdout
-            except subprocess.TimeoutExpired:
-                out = ""
-            failed = [ln for ln in out.splitlines() if ln.startswith("  FAIL ")]
-            ok("mutant killed by %s -- %s" % (expect, label), any(expect in ln for ln in failed),
-               "failing: %s" % ", ".join(ln[7:50] for ln in failed[:4]))
+        # The mutants are independent of one another, so they run MUTANT_JOBS at a time (one 240 s bound each); every verdict is still
+        # reported here, in the order the mutants are declared, whatever order they finish in.
+        with ThreadPoolExecutor(max_workers=MUTANT_JOBS) as pool:
+            plan = []
+            for i, (label, old, new, expect) in enumerate(MUTANTS):
+                if only and not any(fragment in label for fragment in only.split("|")):
+                    continue
+                count = source.count(old)
+                if count == 0 or (count != 1 and old != "sys.stdin.isatty()"):
+                    plan.append((label, expect, count, None))
+                else:
+                    plan.append((label, expect, count, pool.submit(run_one_mutant, i, source, base, old, new)))
+            for label, expect, count, job in plan:
+                if job is None:
+                    ok("mutant anchor present: %s" % label, False, "%d matches" % count)
+                    continue
+                try:
+                    out = job.result()
+                except Exception as e:    # a run that died before it could say anything is a mutant that was not killed, never a skipped one
+                    ok("mutant killed by %s -- %s" % (expect, label), False, "the mutant run died: %s: %s" % (type(e).__name__, e))
+                    continue
+                failed = [ln for ln in out.splitlines() if ln.startswith("  FAIL ")]
+                ok("mutant killed by %s -- %s" % (expect, label), any(expect in ln for ln in failed),
+                   "failing: %s" % ", ".join(ln[7:50] for ln in failed[:4]))
     finally:
         shutil.rmtree(base, ignore_errors=True)
 

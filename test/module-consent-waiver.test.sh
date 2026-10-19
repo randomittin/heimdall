@@ -137,6 +137,31 @@ tree_sum() {
 mkdir -p "$REG"
 cp -R "$REAL_CLASSES" "$REG/_classes"
 
+# PRE-LAUNCH. The three REAL-manifest adds (W9, W10b, W11) each spend most of their time in step 7, running the class-owned suites
+# (`bash test/gate-judgment-uncompressed.test.sh` ~10 s, twice over for the dual-class headroom: ~20 s an add), and each is independent of
+# everything else in this file: its own --state root, a registry nothing here writes to (the real one, or W11's copy built right below), and a
+# control plane stand-in that only answers GETs. So they start NOW and run beside W1-W8 instead of after them (the file was ~95 s, nearly all
+# of it these adds waiting in line), and each section below reads what ITS add printed and returned, from the files written here. Every
+# assertion is the one that was there, on the very command line it had; only WHEN the command ran moved. A job that dies without writing its
+# exit code reads as exit 255, never as a pass.
+HMF="$REAL_REG/headroom/manifest.json"
+RSTATE="$TMP/realstate/modules"
+REAL_PRE="$(tree_sum "$RSTATE")"
+DSTATE="$TMP/downstate/modules"
+DPRE="$(tree_sum "$DSTATE")"
+FALSIFY_REG="$TMP/falsify"
+mkdir -p "$FALSIFY_REG/headroom"
+cp -R "$REAL_CLASSES" "$FALSIFY_REG/_classes"
+jq 'del(.consent_waived, .consent_waived_reason)' "$HMF" > "$FALSIFY_REG/headroom/manifest.json"
+DEAD_CP_URL="$(hermetic_cp_dead_url)"
+( "$MODS" --registry "$REAL_REG" --state "$RSTATE" add headroom < /dev/null >"$TMP/w9.out" 2>&1; echo "$?" >"$TMP/w9.rc" ) &
+PID_W9=$!
+( env HEIMDALL_DEFAULT_CP_URL="$DEAD_CP_URL" \
+    "$MODS" --registry "$REAL_REG" --state "$DSTATE" add headroom < /dev/null >"$TMP/w10b.out" 2>&1; echo "$?" >"$TMP/w10b.rc" ) &
+PID_W10B=$!
+( "$MODS" --registry "$FALSIFY_REG" --state "$TMP/fstate/modules" add headroom < /dev/null >"$TMP/w11.out" 2>&1; echo "$?" >"$TMP/w11.rc" ) &
+PID_W11=$!
+
 # A synthetic traffic-proxy module. `installs_via.kind` is "local" so the add
 # hashes a real artifact and never reaches for the network. The two manifest-kind
 # invariants the real contract requires are supplied and deliberately CHEAP —
@@ -474,9 +499,9 @@ hmd remove shippedliar >/dev/null 2>&1
 
 echo
 echo "W9 — the REAL headroom add runs past consent unprompted"
-RSTATE="$TMP/realstate/modules"
-REAL_PRE="$(tree_sum "$RSTATE")"
-OUT9="$("$MODS" --registry "$REAL_REG" --state "$RSTATE" add headroom < /dev/null 2>&1)"; RC9=$?
+# (started in the PRE-LAUNCH block above: `add headroom` against the real registry, into $RSTATE)
+wait "$PID_W9"
+OUT9="$(cat "$TMP/w9.out")"; RC9="$(cat "$TMP/w9.rc" 2>/dev/null || echo 255)"
 if [ "$RC9" -eq 0 ]; then
   ok "hmd modules add headroom SUCCEEDS non-interactively (exit 0)"
 else
@@ -561,10 +586,9 @@ echo "W10b — a waiver waives CONSENT ONLY, on the REAL manifest: an unreachabl
 # is a loopback port nothing listens on. The waived add still gets past consent (step 4)
 # and must then be REFUSED at step 7 and rolled back byte-identically. An unreachable
 # check fails closed; it never passes.
-DSTATE="$TMP/downstate/modules"
-DPRE="$(tree_sum "$DSTATE")"
-OUT10B="$(env HEIMDALL_DEFAULT_CP_URL="$(hermetic_cp_dead_url)" \
-            "$MODS" --registry "$REAL_REG" --state "$DSTATE" add headroom < /dev/null 2>&1)"; RC10B=$?
+# (started in the PRE-LAUNCH block above: the same add with HEIMDALL_DEFAULT_CP_URL at a loopback port nothing listens on, into $DSTATE)
+wait "$PID_W10B"
+OUT10B="$(cat "$TMP/w10b.out")"; RC10B="$(cat "$TMP/w10b.rc" 2>/dev/null || echo 255)"
 if [ "$RC10B" -ne 0 ]; then
   ok "the REAL waived add is REFUSED when the control plane is unreachable (exit $RC10B)"
 else
@@ -590,11 +614,9 @@ echo
 echo "W11 — FALSIFIER: strip the waiver and the SAME add gates again"
 # A copy of the real manifest with `consent_waived` removed. If the add still
 # sails through, the waiver is not what let it through and W3/W9 prove nothing.
-FALSIFY_REG="$TMP/falsify"
-mkdir -p "$FALSIFY_REG/headroom"
-cp -R "$REAL_CLASSES" "$FALSIFY_REG/_classes"
-jq 'del(.consent_waived, .consent_waived_reason)' "$HMF" > "$FALSIFY_REG/headroom/manifest.json"
-OUT11="$("$MODS" --registry "$FALSIFY_REG" --state "$TMP/fstate/modules" add headroom < /dev/null 2>&1)"; RC11=$?
+# (the copy is built, and the add run, in the PRE-LAUNCH block above: `$FALSIFY_REG` is the real classes plus the manifest with the waiver deleted)
+wait "$PID_W11"
+OUT11="$(cat "$TMP/w11.out")"; RC11="$(cat "$TMP/w11.rc" 2>/dev/null || echo 255)"
 if [ "$RC11" -ne 0 ]; then
   ok "with the waiver REMOVED, the identical add is GATED again (exit $RC11)"
 else

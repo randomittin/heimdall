@@ -15,7 +15,7 @@ Only fakes and temp dirs: HOME / HEIMDALL_HOME / TMPDIR are one temp tree, the m
 The only processes signalled are the ones this starts (its client, its fake relay, its own loop child as a last-resort cleanup, found by
 this run's unique repo path) -- never any other relay client. Every wait is a bounded poll.
 Output: "  ok   ..." / "  FAIL ..." lines and a closing "P passed, F failed"; exit 1 when F > 0. ASK_E2E_STOP_AFTER=4 stops after step 4
-(the wrapper's mutant runs only need to get that far).
+and =3a after check 3a (the wrapper's mutant runs only need to get as far as the check they name).
 """
 import contextlib
 import json
@@ -334,6 +334,8 @@ def run(st):
     # 3. both switches on: the slice is enabled, and the client's loop has run the tiles' producers against the connector
     f = listed(p, ASK_CAPS, lambda s: (s.get("asks") or {}).get("enabled") is True)
     check(slice_of(f) == {"v": 1, "enabled": True, "results": []}, "3a. with both switches on the slice is {v:1, enabled:true, results:[]}", slice_of(f))
+    if STOP_AFTER == "3a":      # the wrapper's mutant that removes the slice: once 3a has said so, the later waits can only time out
+        return
     f = listed(p, ASK_CAPS, lambda s: sum(1 for t in (s.get("dashboards") or {}).get("tiles", []) if t["phase"] == "live" and t["panel"] and t["panel"]["data"]["value"] in (1284, 52)) == 2, timeout=WAIT_S)
     check(f is not None, "3b. the dash-v1 phone sees both number tiles live in state.dashboards, with the numbers the panels hold", tile_states())
 
