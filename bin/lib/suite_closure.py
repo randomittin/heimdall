@@ -117,7 +117,7 @@ LABEL_RE = re.compile(r"[a-z][a-z0-9-]*")
 PY_IMPORT_RE = re.compile(r"^\s*(?:from\s+\.*([A-Za-z_][\w.]*)\s+import\b|import\s+([A-Za-z_][\w.]*(?:\s*,\s*[A-Za-z_][\w.]*)*))")
 PLAIN_TAIL_RE = re.compile(r"(?:^|/)[A-Za-z0-9]+$")       # a token whose last component is a plain word (no - _ .)
 # the text before a word that makes it a COMMAND: line start, ; && || | ( { [ ` $( , then/do/else/exec/time/command/env/sudo/nohup/xargs/which/type, bash -c
-CMD_BEFORE_RE = re.compile(r"(?:(?:^|[;&|({`!]|\$\()\s*|\b(?:then|do|else|if|elif|while|until|exec|time|command|env|sudo|nohup|xargs|which|type|bash|sh)\s+(?:-\w+\s+)*[\"']?)$")
+CMD_BEFORE_RE = re.compile(r"(?:(?:^\s*\(?|[;&|{`!]|\$\()\s*|\b(?:then|do|else|if|elif|while|until|exec|time|command|env|sudo|nohup|xargs|which|type|bash|sh)\s+(?:-\w+\s+)*[\"']?)$")
 SHELL_IMPORT_RE = re.compile(r"\b(?:from|import)\s+([A-Za-z_]\w*)")
 JS_IMPORT_RE = re.compile(r"""(?:require\s*\(|\bfrom\s+|\bimport\s*\(?\s*)['"](\.{1,2}/[^'"\n]+)['"]""")
 OID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
@@ -615,7 +615,10 @@ class Graph(object):
                     glued = var.group(1) if var else ""
                 if glob and suite:
                     gkeys.add((raw, line[max(0, m.start() - 40):m.start()], glued))
-                cmdpos = PLAIN_TAIL_RE.search(raw) is not None and CMD_BEFORE_RE.search(line[max(0, m.start() - 40):m.start()]) is not None
+                cmdpos = False
+                if PLAIN_TAIL_RE.search(raw):
+                    start = max(0, m.start() - 40)
+                    cmdpos = CMD_BEFORE_RE.search(("\0" if start else "") + line[start:m.start()]) is not None
                 keys.add((raw, line_mode, glued, cmdpos))
         strong, weak = set(), set()
         for key in keys:
