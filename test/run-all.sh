@@ -85,6 +85,8 @@
 #                                       # escalation) and stop: no suite, no receipt, no lock, no sweep marker
 #   HMD_TEST_NO_PY_PIN=1 test/run-all.sh   # leave python3 alone (default: pinned to the real interpreter
 #                                       # when it resolves through a shim; see PYTHON3 PIN below)
+#   HMD_NO_CAFFEINATE=1 test/run-all.sh   # do not hold the Mac awake (default on macOS when caffeinate exists: `caffeinate -i -w <this pid>` for the length of the sweep, so it cannot
+#                                       # idle to sleep mid-run; released when the runner exits, however it exits)
 #   HMD_TEST_STRICT_TMP=1 test/run-all.sh  # ANY leftover in a suite's own TMPDIR fails the run (default: only more than
 #                                       # HMD_TEST_TMP_LEAK_MAX_MB, 50); HMD_TEST_TMP_WATCH=dir:dir replaces /tmp:$TMPDIR as the
 #                                       # directories watched for writes outside TMPDIR (guarantee 9)
@@ -968,6 +970,16 @@ _abort_sweep() {
 trap cleanup EXIT
 trap '_abort_sweep 130' INT
 trap '_abort_sweep 143' TERM
+
+# ── KEEP THE MACHINE AWAKE (macOS) ────────────────────────────────────────────────────────
+# A sweep runs for up to an hour, and a Mac that idles to sleep mid-run stalls every suite (timeouts, a red that is only the clock). `caffeinate -i -w <pid>` holds the idle-sleep assertion for exactly
+# as long as this runner lives and drops it when the runner exits, however it exits (SIGKILL included), so there is nothing to clean up; the INT/TERM handler above stops it with the other descendants.
+# Not on a dry run (it sweeps nothing: that exited above). Output goes nowhere, so a caller capturing ours never waits on it, and fd 9 (the sweep lock) is closed for it as for every suite.
+# HMD_NO_CAFFEINATE=1 opts out. Without caffeinate (Linux, a stripped PATH) nothing happens and nothing is printed.
+if [ "${HMD_NO_CAFFEINATE:-}" != 1 ] && [ "$(uname -s 2>/dev/null)" = Darwin ] && command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -i -w "$$" >/dev/null 2>&1 9>&- &
+  echo "keep-awake: caffeinate -i -w $$ (the Mac cannot idle to sleep while this sweep runs; released when it exits)"
+fi
 
 # ── PYTHON3 PIN (test harness only) ───────────────────────────────────────────────────────
 # On a box where python3 is a pyenv shim every call costs 0.3-0.8 s under load against 0.05 s for the

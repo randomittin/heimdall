@@ -166,6 +166,7 @@ runit "$F" --cold
 eq "A10 --cold launches all 40 although every entry is valid" "$(nran "$F")" "40"
 eq "A11 --cold: cold receipt, nothing cached" "$(rj "$(LAST "$F")" '[.cache.cold, .cache.suites_cached, .cache.audited]|join(",")')" "true,0,0"
 has "A12 the banner says so" "$OUT" "cache: cold"
+if [ "$(uname -s)" = Darwin ] && command -v caffeinate >/dev/null 2>&1; then has "A13 on macOS the sweep holds the Mac awake (caffeinate -i -w <runner pid>)" "$OUT" "keep-awake: caffeinate -i -w"; fi
 
 # ══ B. a warm run ═════════════════════════════════════════════════════════════════════════════════════════════════════
 echo "-- B. a warm run launches exactly the audit sample and serves the rest ----------------------------"
