@@ -103,7 +103,7 @@ PY
   echo "- - - - -"
 }
 
-read -r ST_TESTS ST_LINT ST_DIRTY ST_TOTAL ST_LIMIT <<<"$(read_state_json)"
+read -r ST_TESTS ST_LINT ST_DIRTY ST_TOTAL _ <<<"$(read_state_json)"
 
 # ── Bloat scorecard (H-2) — rendered PURELY from the bloat report.json ──
 # Zero model tokens: this is hooks/shell reading the deterministic gate report.
@@ -624,6 +624,7 @@ print("%s %s"%(d.get("warnings",-1), d.get("verdict","")))
   if [ -z "$pony" ]; then
     local pd="$ROOT/evals/ponytail-ab"
     if [ -d "$pd" ]; then
+      # shellcheck disable=SC2010  # ls -t mtime order is required; names are our own evals/ponytail-ab/*.jsonl, no whitespace
       pony="$(ls -t "$pd"/*.jsonl 2>/dev/null | grep -v 'schema.sample' | head -1)"
     fi
   fi

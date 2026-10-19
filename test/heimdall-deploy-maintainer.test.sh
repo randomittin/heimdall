@@ -70,7 +70,7 @@ PY
 FAKEBIN="$(mktemp -d)"
 for t in claude gh gcloud; do printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKEBIN/$t"; chmod +x "$FAKEBIN/$t"; done
 # docker is deliberately absent from FAKEBIN — it must NOT be required by cloud preflight.
-OUT5="$(PATH="$FAKEBIN:/usr/bin:/bin" bash "$S" --cloud --repo acme/widgets </dev/null 2>&1)"; rc5=$?
+OUT5="$(PATH="$FAKEBIN:/usr/bin:/bin" bash "$S" --cloud --repo acme/widgets </dev/null 2>&1)"
 grep -q "missing 'docker'" <<<"$OUT5" && bad "cloud preflight still requires docker" || ok "cloud preflight requires NO docker"
 grep -q 'Paste the CLAUDE_CODE_OAUTH_TOKEN' <<<"$OUT5" && bad "multi-tenant cloud STILL prompts for a token (setup-token leak hazard)" || ok "multi-tenant cloud prompts for NO token"
 grep -q 'mint a ~1-year subscription token' <<<"$OUT5" && bad "multi-tenant cloud STILL runs claude setup-token (prints a live token)" || ok "multi-tenant cloud does NOT run claude setup-token"
@@ -188,6 +188,7 @@ grep -q 'passwd home' <<<"$OUT9" && ok "synthetic HOME: states WHY (passwd-home 
 # 9b. --hybrid reaches arch_a too — the default MODE, so the plain-run path is covered.
 : > "$SBX_LOG"; rm -f "$SBX_STUB/installed.cron"
 SBX_HOME2="$(mktemp -d)"
+# shellcheck disable=SC2034  # stdout unused; rc9h=$? after it needs the substitution's status
 OUT9H="$(printf 'oauthval\nbotval\n' | env -u HEIMDALL_REAL_HOME HOME="$SBX_HOME2" \
   PATH="$SBX_STUB:/usr/bin:/bin" bash "$S" --hybrid --repo acme/widgets 2>&1)"; rc9h=$?
 [ "$rc9h" = 4 ] && ok "synthetic HOME (--hybrid, the DEFAULT mode): refused with exit 4" \

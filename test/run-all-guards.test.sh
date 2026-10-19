@@ -59,6 +59,7 @@ export SHIM_LOAD_FILE="$T/load"
 gate() { # LOAD15 [env...] -> "<gate output>|outcome=.. jobs=.. reduced=.. secs=.."
   local l15="$1"; shift
   echo "1.00 2.00 $l15" > "$T/load"
+  # shellcheck disable=SC2163  # kv is a NAME=VALUE string by design; export "$kv" must export it as-is
   ( export PATH="$T/shim:$PATH"; NCPU=10 JOBS=6; export HMD_QUIET_POLL_S=0 HMD_QUIET_MAX_WAIT_S=2; for kv in "$@"; do export "$kv"; done
     s0=$(date +%s); hmd_test_wait_quiet >"$T/gate.out"; s1=$(date +%s)
     printf '%s|outcome=%s jobs=%s reduced=%s secs=%s' "$(cat "$T/gate.out")" "$QUIET_GATE_OUTCOME" "$JOBS" "${HMD_TEST_REDUCED_PARALLELISM:-}" "$((s1 - s0))" )
@@ -82,6 +83,7 @@ echo "1.00 2.00 55.00" > "$T/load"
 R="$( export PATH="$T/shim:$PATH"; NCPU=10 JOBS=6 HMD_QUIET_POLL_S=0.2 HMD_QUIET_MAX_WAIT_S=20; hmd_test_wait_quiet >"$T/gate.out"; printf '%s|outcome=%s jobs=%s' "$(cat "$T/gate.out")" "$QUIET_GATE_OUTCOME" "$JOBS" )"
 wait
 case "$R" in *"outcome=quiet jobs=6"*) ok "load that drops while waiting opens the gate (no reduction)" ;; *) bad "load drop: $R" ;; esac
+# shellcheck disable=SC2034  # read by hmd_test_wait_quiet (test/lib/run-all-guards.sh:95), which this subshell calls
 R="$( export PATH="$T/shim:$PATH"; NCPU=""; JOBS=6; hmd_test_wait_quiet >"$T/gate.out"; printf '%s|outcome=%s' "$(cat "$T/gate.out")" "$QUIET_GATE_OUTCOME" )"
 case "$R" in *"not waiting"*"outcome=unreadable") ok "an unknown cpu count never blocks the sweep" ;; *) bad "unknown cpu: $R" ;; esac
 
@@ -158,7 +160,10 @@ if [ -d "$T/not-mine/x" ] && [ ! -s "$T/leak-x" ]; then ok "settle only ever tou
 
 echo "-- 6. end-of-sweep tmp guard: limit, strict mode, outside-TMPDIR attribution --"
 GW="$T/gwork"; mkdir -p "$GW" "$T/watch"
-RUN=("$T/a.test.sh" "$T/b.test.sh" "$T/c.test.sh"); TO_RUN=3
+# shellcheck disable=SC2034  # RUN is an input read by test/lib/run-all-guards.sh (orphan guard)
+RUN=("$T/a.test.sh" "$T/b.test.sh" "$T/c.test.sh")
+# shellcheck disable=SC2034  # TO_RUN is an input read by test/lib/run-all-guards.sh (orphan and tmp guards)
+TO_RUN=3
 printf '5242880\t1\tfat-dir\n' > "$GW/0.tmpleak"; printf '1024\t2\tx,y\n' > "$GW/1.tmpleak"
 hmd_test_tmp_guard "$GW" >/dev/null
 if [ "${TMP_FINDINGS:-x}" = 0 ] && [ "${TMP_LEAK_SUITES:-x}" = 2 ] && [ "${TMP_LEAK_BYTES:-x}" = 5243904 ] && grep -q 'TMP LEFTOVERS (2)' "$GW/tmp-section.txt" && ! grep -q 'TMP LEAK' "$GW/tmp-section.txt"; then ok "default limit (50 MB): a 5 MB and a 1 KB leftover are warnings, neither fails the run"; else bad "default policy: findings=${TMP_FINDINGS:-} suites=${TMP_LEAK_SUITES:-} bytes=${TMP_LEAK_BYTES:-} section=$(cat "$GW/tmp-section.txt")"; fi
@@ -250,6 +255,7 @@ chmod +x "$T/dfshim/df"
 # HMD_MIN_FREE_PCT=0 below: this section proves the GB floor in isolation. The guards lib also loads the shared percent floor (bin/lib/hmd_disk_floor.sh, 2.4.8) in a real
 # checkout, and this fake df reports a 953 GB volume, on which every low-free case here is a tiny percent too -- that floor is proved in test/disk-floor.test.sh.
 dfpf() { # [K=V ...] -- hmd_test_disk_preflight under the fake df: prints its output, its status goes to $T/dfpf.rc
+  # shellcheck disable=SC2163  # kv is a NAME=VALUE string by design; export "$kv" must export it as-is
   ( export PATH="$T/dfshim:$PATH" TMPDIR="$T/rt" HMD_MIN_FREE_PCT=0; for kv in "$@"; do export "$kv"; done; hmd_test_disk_preflight "$REPO" 2>&1; echo $? > "$T/dfpf.rc" )
 }
 OUT="$(dfpf)"
