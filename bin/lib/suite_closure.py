@@ -372,7 +372,8 @@ class Node(object):
 class Graph(object):
     """The tracked files of ONE commit, their edges, the hints, and the closure of any suite."""
 
-    def __init__(self, repo, commit, hints_path=None):
+    def __init__(self, repo, commit, hints_path=None, edges=True):
+        """`edges` False reads only the tree and the hints (all `salt` needs): no blob is read and nothing is scanned."""
         self.repo, self.commit = repo, commit
         self.nodes, self.text = {}, {}
         self.by_suffix, self.dir_files, self.dir_suffix = {}, {}, {}
@@ -380,11 +381,13 @@ class Graph(object):
         self.hints, self.hints_raw = {}, None
         self._memo, self._gmemo, self._sha = {}, {}, {}
         self._read_tree()
-        self._read_blobs()
+        if edges:
+            self._read_blobs()
         self._index()
         self._load_hints(hints_path)
-        self._scan()
-        self._condense()
+        if edges:
+            self._scan()
+            self._condense()
 
     # -- reading ----------------------------------------------------------------------------------------------------
     def _read_tree(self):
@@ -428,6 +431,7 @@ class Graph(object):
             for i in range(len(parts)):
                 self.dir_suffix.setdefault("/".join(parts[i:]), []).append(d)
         self.top_names = set(p.split("/")[0] for p in self.nodes)
+        self.last_names = set(part for p in self.nodes for part in p.split("/"))    # a token whose last component is none of these names nothing
 
     def suites(self):
         return sorted(p for p, n in self.nodes.items() if n.kind == "suite")
@@ -608,6 +612,8 @@ class Graph(object):
             for m in TOK_RE.finditer(line):
                 raw, glob = m.group(1), m.group(2)
                 if len(raw) < 2 and not glob:
+                    continue
+                if not glob and raw.rstrip("./").rsplit("/", 1)[-1] not in self.last_names:
                     continue
                 glued = None
                 if m.start() > 0 and line[m.start() - 1] in "\"'})":
