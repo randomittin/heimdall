@@ -153,17 +153,30 @@ def case_registration_and_hygiene():
                 str(H.files_containing(s.sb.root, needle)))
 
 
-def case_no_token():
-    for label, kwargs in (("stdin closed", {"token": None, "close_stdin": True}), ("an empty line", {"token": ""})):
-        with Scenario() as s:
-            c = s.client(**kwargs)
-            ev = c.wait_event("code_unavailable")
-            T.check(bool(ev) and ev["reason"] == "no-gh" and pair_inits(c) and s.relay.registrations == [] and c.rc is None,
-                    "no token (%s): code_unavailable no-gh, nothing registered, the QR flow keeps running" % label, c.tail())
+def no_token(label, **kwargs):
+    with Scenario() as s:
+        c = s.client(**kwargs)
+        ev = c.wait_event("code_unavailable")
+        T.check(bool(ev) and ev["reason"] == "no-gh" and pair_inits(c) and s.relay.registrations == [] and c.rc is None,
+                "no token (%s): code_unavailable no-gh, nothing registered, the QR flow keeps running" % label, c.tail())
+
+
+def case_no_token_stdin_closed():
+    no_token("stdin closed", token=None, close_stdin=True)
+
+
+def case_no_token_empty_line():
+    no_token("an empty line", token="")
+
+
+def case_malformed_code():
     with Scenario() as s:
         c = s.client(code="4sel0", token=None)
         rc = c.wait_exit(5)
         T.check(rc == 2 and b"--code" in c.err(), "a malformed --code is a usage error (exit 2) before anything is sent", c.tail())
+
+
+def case_terminal_on_stdin():
     with Scenario() as s:
         master, slave = os.openpty()
         proc = H.Proc([H.CLIENT_PATH, "--relay", s.relay.url, "--repo", s.sb.repo, "--ui-port", "1", "--code", H.CODE],
@@ -187,16 +200,26 @@ REFUSALS = (
 )
 
 
-def case_refusals():
-    for status, body, reason in REFUSALS:
-        with Scenario(ttl=2) as s:
-            s.relay.code_status = lambda _reg, st=status, bd=body: (st, bd)
-            c = s.client(env={"HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2", "HMD_RELAY_CODE_RENEW_MIN_S": "0.5"})
-            ev = c.wait_event("code_unavailable")
-            time.sleep(3.2 if status == 409 else 0)  # a refusal ends code mode: no renewal follows, a whole TTL later
-            T.check(bool(ev) and ev["reason"] == reason and pair_inits(c) and len(s.relay.registrations) == 1 and c.rc is None
-                    and c.count_events("code_window") == 0,
-                    "relay answers %d -> code_unavailable %s, one attempt, QR flow alive" % (status, reason), c.tail())
+def refusal(status, body, reason):
+    with Scenario(ttl=2) as s:
+        s.relay.code_status = lambda _reg, st=status, bd=body: (st, bd)
+        c = s.client(env={"HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2", "HMD_RELAY_CODE_RENEW_MIN_S": "0.5"})
+        ev = c.wait_event("code_unavailable")
+        time.sleep(3.2 if status == 409 else 0)  # a refusal ends code mode: no renewal follows, a whole TTL later
+        T.check(bool(ev) and ev["reason"] == reason and pair_inits(c) and len(s.relay.registrations) == 1 and c.rc is None
+                and c.count_events("code_window") == 0,
+                "relay answers %d -> code_unavailable %s, one attempt, QR flow alive" % (status, reason), c.tail())
+
+
+def refusal_case(status, body, reason):
+    """The case of one refusal -- its own process, so the seven run side by side (a 409 waits a whole TTL)."""
+    def case():
+        refusal(status, body, reason)
+    case.__name__ = "case_refusal_%d_%s" % (status, reason.replace("-", "_"))
+    return case
+
+
+REFUSAL_CASES = tuple(refusal_case(*refused) for refused in REFUSALS)
 
 
 # -- approval ---------------------------------------------------------------------------------------
@@ -247,7 +270,7 @@ def case_approve_flow():
                 "approve: the window is done -- no second request, no renewal")
 
 
-def case_reject_timeout_eof():
+def case_reject():
     with Scenario() as s:
         c = s.client()
         c.wait_event("code_window")
@@ -259,6 +282,9 @@ def case_reject_timeout_eof():
                 and s.relay.registrations[1]["code"] == H.CODE and s.relay.registrations[1]["session_id"] != sid
                 and sealed_frames(s.relay, sid) == [] and c.count_events("device_bound") == 0,
                 "reject: the session is revoked, nothing was sealed, and the window renews with the same code", c.tail())
+
+
+def case_approval_timeout():
     with Scenario() as s:
         c = s.client(env={"HMD_RELAY_APPROVAL_TIMEOUT_S": "1.5"})
         c.wait_event("code_window")
@@ -266,6 +292,9 @@ def case_reject_timeout_eof():
         ev = c.wait_event("code_rejected", timeout=8)
         T.check(bool(req) and req["timeout_s"] == 1.5 and bool(ev) and ev["reason"] == "timeout" and sid in s.relay.revokes
                 and c.count_events("device_bound") == 0, "no answer in time: the pairing is revoked (reason timeout)", c.tail())
+
+
+def case_control_input_eof():
     with Scenario() as s:
         c = s.client()
         c.wait_event("code_window")
@@ -276,7 +305,7 @@ def case_reject_timeout_eof():
                 "the control input closing with an approval pending fails closed (reason eof)", c.tail())
 
 
-def case_no_confirm_and_qr_bind():
+def case_no_confirm():
     with Scenario() as s:
         c = s.client(extra=("--no-confirm",))
         c.wait_event("code_window")
@@ -289,18 +318,31 @@ def case_no_confirm_and_qr_bind():
                 and bool(s.relay.frames_of(sid, "state")),
                 "--no-confirm: the claim pairs at once -- no approve_request (no SAS), a code_paired event naming what the relay claimed",
                 c.tail())
-    for via in ("qr", None):
-        with Scenario(ttl=2) as s:
-            c = s.client(env={"HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2", "HMD_RELAY_CODE_RENEW_MIN_S": "0.5"})
-            c.wait_event("code_window")
-            sid = s.bind(via=via)
-            bound = c.wait_event("device_bound")
-            c.wait_for(lambda: s.relay.frames_of(sid, "state"), 15)
-            time.sleep(3.0)  # longer than a whole TTL: a bound session must not renew
-            T.check(bool(bound) and c.count_events("approve_request") == 0 and s.relay.frames_of(sid, "key_reveal") == []
-                    and bool(s.relay.frames_of(sid, "state")) and len(s.relay.registrations) == 1,
-                    "QR bind (via=%s) in a code-registered session: paired as before, no approval, no key_reveal, no renewal" % via,
-                    c.tail())
+
+
+def qr_bind(via):
+    with Scenario(ttl=2) as s:
+        c = s.client(env={"HMD_RELAY_CODE_RENEW_MARGIN_S": "0.2", "HMD_RELAY_CODE_RENEW_MIN_S": "0.5"})
+        c.wait_event("code_window")
+        sid = s.bind(via=via)
+        bound = c.wait_event("device_bound")
+        c.wait_for(lambda: s.relay.frames_of(sid, "state"), 15)
+        time.sleep(3.0)  # longer than a whole TTL: a bound session must not renew
+        T.check(bool(bound) and c.count_events("approve_request") == 0 and s.relay.frames_of(sid, "key_reveal") == []
+                and bool(s.relay.frames_of(sid, "state")) and len(s.relay.registrations) == 1,
+                "QR bind (via=%s) in a code-registered session: paired as before, no approval, no key_reveal, no renewal" % via,
+                c.tail())
+
+
+def case_qr_bind_via_qr():
+    qr_bind("qr")
+
+
+def case_qr_bind_via_nothing():
+    qr_bind(None)
+
+
+def case_repeated_bind():
     with Scenario() as s:
         c = s.client()
         c.wait_event("code_window")
@@ -336,6 +378,9 @@ def case_renewal():
         T.check(all(r["session_id"] in s.relay.revokes for r in regs[:-1]), "renewal: every superseded session is revoked")
         T.check(bool(closed) and closed["reason"] == "expired" and len(s.relay.registrations) == len(regs),
                 "the window total ends with code_window_closed, and nothing registers after it", c.tail())
+
+
+def case_session_ended_unbound_renews():
     with Scenario(ttl=60) as s:
         c = s.client()
         pi = c.wait_event("pair_init")
@@ -395,29 +440,40 @@ def burn(s, c, how):
     return sid, c.wait_event("code_rejected", timeout=10)
 
 
-def case_burned_key_binds_nothing():
-    for how, ended in (("reject", "operator"), ("timeout", "timeout"), ("eof", "eof"), ("reveal-failed", "reveal-failed")):
-        with Scenario() as s:
-            s.relay.ignore_revokes = True
-            if how == "reveal-failed":  # the relay refuses the key_reveal -- having read it
-                s.relay.frames_status = lambda env: (400, {"error": "refused"}) if env.get("type") == "key_reveal" else None
-            c = s.client(env=dict(BURN_ENV, HMD_RELAY_APPROVAL_TIMEOUT_S=1.5) if how == "timeout" else BURN_ENV)
-            sid, rejected = burn(s, c, how)
-            s.relay.inject_device_bound(sid, H.Phone(E2E).pub_b64url, via="qr")  # a bind made up from the revealed key
-            await_binds_answered(c, 1)
-            qr_refused = len(refusals(c)) == 1
-            s.bind(sid=sid, via="code", phone=H.Phone(E2E))  # a second claim by code
-            await_binds_answered(c, 2)
-            time.sleep(0.5)
-            T.check(bool(rejected) and rejected["reason"] == ended and len(s.relay.frames_of(sid, "key_reveal")) == 1,
-                    "burned key (%s): the approval ended without a pairing, the key revealed once" % how, c.tail())
-            T.check(qr_refused and c.count_events("device_bound") == 0 and sealed_frames(s.relay, sid) == []
-                    and status_paired(s.sb) is False,
-                    "burned key (%s): a QR bind made up from the revealed key is refused -- unpaired, nothing sealed" % how, c.tail())
-            T.check(len(refusals(c)) == 2 and c.count_events("approve_request") == (0 if how == "reveal-failed" else 1)
-                    and len(s.relay.frames_of(sid, "key_reveal")) == 1,
-                    "burned key (%s): a second claim by code is refused too -- no second prompt, no second key_reveal" % how,
-                    c.tail())
+def burned_key_binds_nothing(how, ended):
+    with Scenario() as s:
+        s.relay.ignore_revokes = True
+        if how == "reveal-failed":  # the relay refuses the key_reveal -- having read it
+            s.relay.frames_status = lambda env: (400, {"error": "refused"}) if env.get("type") == "key_reveal" else None
+        c = s.client(env=dict(BURN_ENV, HMD_RELAY_APPROVAL_TIMEOUT_S=1.5) if how == "timeout" else BURN_ENV)
+        sid, rejected = burn(s, c, how)
+        s.relay.inject_device_bound(sid, H.Phone(E2E).pub_b64url, via="qr")  # a bind made up from the revealed key
+        await_binds_answered(c, 1)
+        qr_refused = len(refusals(c)) == 1
+        s.bind(sid=sid, via="code", phone=H.Phone(E2E))  # a second claim by code
+        await_binds_answered(c, 2)
+        time.sleep(0.5)
+        T.check(bool(rejected) and rejected["reason"] == ended and len(s.relay.frames_of(sid, "key_reveal")) == 1,
+                "burned key (%s): the approval ended without a pairing, the key revealed once" % how, c.tail())
+        T.check(qr_refused and c.count_events("device_bound") == 0 and sealed_frames(s.relay, sid) == []
+                and status_paired(s.sb) is False,
+                "burned key (%s): a QR bind made up from the revealed key is refused -- unpaired, nothing sealed" % how, c.tail())
+        T.check(len(refusals(c)) == 2 and c.count_events("approve_request") == (0 if how == "reveal-failed" else 1)
+                and len(s.relay.frames_of(sid, "key_reveal")) == 1,
+                "burned key (%s): a second claim by code is refused too -- no second prompt, no second key_reveal" % how,
+                c.tail())
+
+
+def burned_key_case(how, ended):
+    """The case of one way a key gets burned -- its own process, so the four run side by side."""
+    def case():
+        burned_key_binds_nothing(how, ended)
+    case.__name__ = "case_burned_key_binds_nothing_after_%s" % how.replace("-", "_")
+    return case
+
+
+BURNED_KEY_CASES = tuple(burned_key_case(how, ended)
+                         for how, ended in (("reject", "operator"), ("timeout", "timeout"), ("eof", "eof"), ("reveal-failed", "reveal-failed")))
 
 
 class captured_events:
@@ -545,7 +601,7 @@ def case_burned_key_ends_the_session_when_the_window_does():
 
 
 # -- the token only travels over TLS or to this machine ----------------------------------------------------
-def case_code_needs_tls_or_loopback():
+def case_token_transport_ok():
     ok_urls = ["https://hmd-relay.therishabh16.workers.dev", "https://relay.example/base", "HTTPS://Relay.Example",
                "http://127.0.0.1:8787", "http://127.1.2.3", "http://localhost", "http://LOCALHOST:9", "http://[::1]:9"]
     bad_urls = ["http://relay.example", "http://192.0.2.1", "http://[2001:db8::1]", "http://0.0.0.0:9",
@@ -555,18 +611,31 @@ def case_code_needs_tls_or_loopback():
             "token_transport_ok: https anywhere, plain http only to localhost or a loopback address",
             str([u for u in ok_urls if not CLIENT.token_transport_ok(CLIENT._split_relay(u))]
                 + [u for u in bad_urls if CLIENT.token_transport_ok(CLIENT._split_relay(u))]))
-    for flag, extra in (("--code", ["--code", H.CODE]), ("--identity-revoke", ["--identity-revoke"])):
-        with Scenario() as s:
-            proc = H.Proc([H.CLIENT_PATH, "--relay", "http://relay.example.test", "--repo", s.sb.repo, "--ui-port", "1"] + extra,
-                          s.sb.env())
-            s.procs.append(proc)
-            proc.send(H.TOKEN + "\n")
-            rc = proc.wait_exit(10)
-            T.check(rc == 2 and ("%s sends the GitHub token in a request body" % flag).encode() in proc.err()
-                    and b"https://" in proc.err() and proc.out() == b""
-                    and H.TOKEN.encode() not in proc.out() + proc.err(),
-                    "%s over plain http to a host that is not this machine: a usage error (exit 2) before anything is sent" % flag,
-                    proc.tail())
+
+
+def plain_http_refused(flag, extra):
+    with Scenario() as s:
+        proc = H.Proc([H.CLIENT_PATH, "--relay", "http://relay.example.test", "--repo", s.sb.repo, "--ui-port", "1"] + extra,
+                      s.sb.env())
+        s.procs.append(proc)
+        proc.send(H.TOKEN + "\n")
+        rc = proc.wait_exit(10)
+        T.check(rc == 2 and ("%s sends the GitHub token in a request body" % flag).encode() in proc.err()
+                and b"https://" in proc.err() and proc.out() == b""
+                and H.TOKEN.encode() not in proc.out() + proc.err(),
+                "%s over plain http to a host that is not this machine: a usage error (exit 2) before anything is sent" % flag,
+                proc.tail())
+
+
+def case_code_refused_over_plain_http():
+    plain_http_refused("--code", ["--code", H.CODE])
+
+
+def case_identity_revoke_refused_over_plain_http():
+    plain_http_refused("--identity-revoke", ["--identity-revoke"])
+
+
+def case_code_over_https_passes_the_gate():
     with Scenario() as s:  # the gate lets a TLS relay through: what fails is pair/init, on a port nothing listens on
         proc = H.Proc([H.CLIENT_PATH, "--relay", "https://127.0.0.1:1", "--repo", s.sb.repo, "--ui-port", "1",
                        "--code", H.CODE], s.sb.env())
@@ -576,14 +645,25 @@ def case_code_needs_tls_or_loopback():
         T.check(rc == 12, "--code over https passes the gate: the client goes on to pair/init (unreachable here, exit 12)", proc.tail())
 
 
+# Every scenario is a case of its own -- a process, a sandbox, a relay on a port the OS hands out -- and the scenarios of one family (the seven
+# refusals, the four ways a key burns, ...) are separate cases, so the pool of processes (pair_code_harness.run_main, or test/lib/case_pool.py
+# for the suite, which pools these cases with the heimdall-app file's) keeps every worker busy instead of waiting on the family's slowest.
+CASES = (case_vectors_and_helpers, case_registration_and_hygiene,
+         case_no_token_stdin_closed, case_no_token_empty_line, case_malformed_code, case_terminal_on_stdin,
+         *REFUSAL_CASES,
+         case_approve_flow, case_reject, case_approval_timeout, case_control_input_eof,
+         case_no_confirm, case_qr_bind_via_qr, case_qr_bind_via_nothing, case_repeated_bind,
+         case_renewal, case_session_ended_unbound_renews,
+         case_qr_only_unchanged, case_token_transport_ok, case_code_refused_over_plain_http,
+         case_identity_revoke_refused_over_plain_http, case_code_over_https_passes_the_gate,
+         case_burn_guard_holds_in_every_code_state, case_code_end_on_a_burned_key,
+         *BURNED_KEY_CASES,
+         case_window_renewed_after_a_burn_pairs, case_burned_key_ends_the_session_when_the_window_does)
+
+
 def main():
     # no case named: each in a process of its own, a few at a time (pair_code_harness.run_main); `CASE...` runs just those, here
-    return H.run_main(T, os.path.realpath(__file__),
-                      (case_vectors_and_helpers, case_registration_and_hygiene, case_no_token, case_refusals,
-                       case_approve_flow, case_reject_timeout_eof, case_no_confirm_and_qr_bind, case_renewal,
-                       case_qr_only_unchanged, case_code_needs_tls_or_loopback, case_burn_guard_holds_in_every_code_state,
-                       case_code_end_on_a_burned_key, case_burned_key_binds_nothing, case_window_renewed_after_a_burn_pairs,
-                       case_burned_key_ends_the_session_when_the_window_does))
+    return H.run_main(T, os.path.realpath(__file__), CASES)
 
 
 if __name__ == "__main__":

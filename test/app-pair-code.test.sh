@@ -15,11 +15,14 @@
 #                                           identity revoke, one whole pairing (code-only pairing, the default
 #                                           since 2026-10-08, is test/app-pair-confirm.test.sh)
 # plus the static checks the handoff lists for the client and for the token's path.
+# Every scenario of both files is a case of its own (a sandbox, a relay on a port of its own), and the cases of the two files run in ONE pool of
+# processes, six at a time (test/lib/case_pool.py) -- the files one after the other left the pool half empty at the end of each.
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIENT_CASES="$REPO/test/lib/app_pair_code_client_cases.py"
 APP_CASES="$REPO/test/lib/app_pair_code_app_cases.py"
+RUNNER="$REPO/test/lib/case_pool.py"
 CLIENT="$REPO/bin/heimdall-relay-client"
 APP="$REPO/bin/heimdall-app"
 
@@ -31,7 +34,7 @@ bad() { N=$((N + 1)); FAIL=$((FAIL + 1)); printf '  FAIL %d. %s\n' "$N" "$1"; }
 
 echo "app-pair-code (hmd app connect + bin/heimdall-relay-client: pair by session code)"
 
-for f in "$CLIENT_CASES" "$APP_CASES" "$CLIENT" "$APP" "$REPO/test/lib/fake_relay_code.py" "$REPO/test/lib/pair_code_harness.py" \
+for f in "$CLIENT_CASES" "$APP_CASES" "$RUNNER" "$REPO/test/lib/sandbox_procs.py" "$CLIENT" "$APP" "$REPO/test/lib/fake_relay_code.py" "$REPO/test/lib/pair_code_harness.py" \
          "$REPO/bin/lib/hmd_app_code.py" "$REPO/test/fixtures/hmdapp-pair-code-vectors.json"; do
   if [ ! -e "$f" ]; then
     printf 'FATAL: required file missing: %s\n' "$f" >&2
@@ -77,24 +80,29 @@ else
   bad "the hosted relay origin is not in bin/heimdall-app"
 fi
 
-# ── the two case files ────────────────────────────────────────────────────────────────────────────────
-run_cases() {
-  local label="$1" file="$2" out="$TMPROOT/$1.out" rc tally
-  python3 "$file" >"$out" 2>&1
-  rc=$?
+# ── the two case files: every case of both, in ONE pool of processes ──────────────────────────────────────
+# test/lib/case_pool.py runs each case in a process of its own, six at a time (the heimdall-app file's first: it has the most work), and writes
+# each file's report -- its result lines in the order the file declares its cases, then its tally -- to $TMPROOT/<key>.out, the file's exit status
+# (0 only when no case failed and every case ended with a tally) to $TMPROOT/<key>.rc.
+python3 "$RUNNER" "$TMPROOT" "app=$APP_CASES" "client=$CLIENT_CASES" >"$TMPROOT/pool.log" 2>&1
+pool_rc=$?
+
+report_cases() {
+  local label="$1" key="$2" out="$TMPROOT/$2.out" rc tally
+  rc="$(cat "$TMPROOT/$key.rc" 2>/dev/null)"
   echo "-- $label --"
-  grep -E '^  (ok|FAIL) ' "$out"
-  tally="$(grep -E '^[0-9]+ passed, [0-9]+ failed$' "$out" | tail -1)"
-  if [ "$rc" -eq 0 ] && [ -n "$tally" ] && printf '%s' "$tally" | grep -q ' 0 failed$'; then
+  grep -E '^  (ok|FAIL) ' "$out" 2>/dev/null
+  tally="$(grep -E '^[0-9]+ passed, [0-9]+ failed$' "$out" 2>/dev/null | tail -1)"
+  if [ "$rc" = 0 ] && [ -n "$tally" ] && printf '%s' "$tally" | grep -q ' 0 failed$'; then
     ok "$label: $tally"
   else
-    bad "$label failed (exit $rc, tally '${tally:-none}')"
-    grep -E 'Traceback|Error' -A3 "$out" | head -20
+    bad "$label failed (exit ${rc:-none}, tally '${tally:-none}', case pool exit $pool_rc)"
+    grep -E 'Traceback|Error' -A3 "$out" "$TMPROOT/pool.log" 2>/dev/null | head -20
   fi
 }
 
-run_cases "relay client (--code)" "$CLIENT_CASES"
-run_cases "hmd app connect" "$APP_CASES"
+report_cases "relay client (--code)" client
+report_cases "hmd app connect" app
 
 echo ""
 echo "$PASS passed, $FAIL failed"

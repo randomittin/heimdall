@@ -26,6 +26,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import pair_code_harness as H  # noqa: E402
 from fake_relay_code import FakeCodeRelay  # noqa: E402
+from sandbox_procs import kill_sandbox  # noqa: E402
 
 T = H.Tally()
 E2E = H.load_module("hmd_relay_e2e", H.E2E_PATH)
@@ -72,9 +73,11 @@ class AppScenario:
         return self
 
     def __exit__(self, *_exc):
+        # what a `connect --bg` left running (its client, ui, watcher) is found by the sandbox's name and killed: the `hmd app disconnect` this
+        # used to run asserted nothing here and cost a bash script and a python start per helper (test/lib/sandbox_procs.py)
+        kill_sandbox(self.sb.root)
         for proc in self.procs:
             proc.stop()
-        subprocess.run([H.APP_PATH, "disconnect", "--repo", self.sb.repo], env=self.env(), capture_output=True, timeout=60)
         if self.relay is not None:
             self.relay.stop()
         self.sb.close()
@@ -135,14 +138,17 @@ def has_none_of(data, *needles):
 
 
 # -- transport default and the token's path ----------------------------------------------------------
-def case_default_transport():
-    runs = (
-        ("no flag, no env -> the hosted relay", (), {}, H.HOSTED_RELAY),
-        ("HMD_RELAY_URL overrides the default", (), {"HMD_RELAY_URL": "http://127.0.0.1:1"}, "http://127.0.0.1:1"),
-        ("--relay overrides both", ("--relay", "http://127.0.0.1:2"), {"HMD_RELAY_URL": "http://127.0.0.1:1"},
-         "http://127.0.0.1:2"),
-    )
-    for label, args, env, want in runs:
+TRANSPORT_RUNS = (
+    ("hosted", "no flag, no env -> the hosted relay", (), {}, H.HOSTED_RELAY),
+    ("env", "HMD_RELAY_URL overrides the default", (), {"HMD_RELAY_URL": "http://127.0.0.1:1"}, "http://127.0.0.1:1"),
+    ("flag", "--relay overrides both", ("--relay", "http://127.0.0.1:2"), {"HMD_RELAY_URL": "http://127.0.0.1:1"},
+     "http://127.0.0.1:2"),
+)
+
+
+def transport_case(key, label, args, env, want):
+    """One run of the transport default, a case -- a process -- of its own."""
+    def case():
         with AppScenario() as s:
             s.events("events-1", PAIR_INIT)
             app = s.app(*args, "--no-code", recorder=True, env=env)
@@ -151,6 +157,14 @@ def case_default_transport():
             argv = s.read("argv").splitlines()
             T.check("[--relay]" in argv and argv[argv.index("[--relay]") + 1] == "[%s]" % want,
                     "connect %s" % label, s.read("argv") or app.tail())
+    case.__name__ = "case_default_transport_" + key
+    return case
+
+
+TRANSPORT_CASES = tuple(transport_case(*run) for run in TRANSPORT_RUNS)
+
+
+def case_no_code_prints_the_qr_flow():
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT)
         app = s.app("--no-code", recorder=True)
@@ -161,6 +175,9 @@ def case_default_transport():
         T.check("scan to pair a device" in app.text() and "WARNING: anyone who scans this code within" in app.text()
                 and "SESSION CODE" not in app.text(),
                 "--no-code: the QR flow prints exactly as it always did (header, QR, pairing code, warning)", app.tail())
+
+
+def case_no_terminal_still_offers_the_code():
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT)
         app = s.app(recorder=True)  # stdin is a pipe: nobody to ask, and nobody needs to be (pairing by code asks nothing)
@@ -203,8 +220,9 @@ def case_token_path_and_code():
         T.check("[--no-confirm]" in argv and "[--code]" in argv, "a plain connect asks the client for --code and --no-confirm")
 
 
-def case_off_paths():
-    for mode in ("signed-out", "broken"):
+def gh_off_case(mode):
+    """gh signed out, gh broken: a case -- a process -- of its own each."""
+    def case():
         with AppScenario(gh_mode=mode) as s:
             s.events("events-1", PAIR_INIT)
             app = s.app(recorder=True)
@@ -214,6 +232,14 @@ def case_off_paths():
             T.check(OFF_NO_GH in app.text() and "[--code]" not in s.read("argv") and "PAIRING CODE:" in app.text()
                     and s.gh_calls() == ["auth token"],
                     "gh %s: one line says code pairing is off, no --code is passed, the QR is still printed" % mode, app.tail())
+    case.__name__ = "case_gh_off_" + mode.replace("-", "_")
+    return case
+
+
+GH_OFF_CASES = tuple(gh_off_case(mode) for mode in ("signed-out", "broken"))
+
+
+def case_no_code_never_asks_gh():
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT)
         app = s.app("--no-code", recorder=True)
@@ -221,11 +247,17 @@ def case_off_paths():
         app.wait_for(lambda: s.read("argv"), 30)
         T.check(s.gh_calls() == [] and "[--code]" not in s.read("argv") and "code pairing off" not in app.text(),
                 "--no-code: gh is never asked and nothing is printed about it", app.tail())
+
+
+def case_code_clash_prints_one_line():
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT, {"event": "code_unavailable", "reason": "conflict"})
         app = s.app(recorder=True, tty=True)
         T.check(app.wait_text("is held by another open window of yours. Scan the QR.", 30) and "PAIRING CODE:" in app.text(),
                 "a code clash prints one line and the QR is still shown", app.tail())
+
+
+def case_relay_without_code_pairing_prints_one_line():
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT, {"event": "code_unavailable", "reason": "disabled"})
         app = s.app(recorder=True, tty=True)
@@ -275,13 +307,17 @@ REQUEST = {"event": "approve_request", "sas": "817531", "device_label": NASTY, "
 WINDOW = {"event": "code_window", "code": "4SELK", "gh_login": "octocat", "exp": 4102444800}
 
 
-def case_prompt():
-    for answer, word, then in (("y\n", "approve", {"event": "device_bound", "bound_at": 1}),
-                               ("yes\n", "approve", {"event": "device_bound", "bound_at": 1}),
-                               ("n\n", "reject", {"event": "code_rejected", "reason": "operator"}),
-                               ("\n", "reject", {"event": "code_rejected", "reason": "operator"}),
-                               ("maybe\n", "reject", {"event": "code_rejected", "reason": "operator"}),
-                               (None, "reject", {"event": "code_rejected", "reason": "eof"})):
+PROMPT_ANSWERS = (("y", "y\n", "approve", {"event": "device_bound", "bound_at": 1}),
+                  ("yes", "yes\n", "approve", {"event": "device_bound", "bound_at": 1}),
+                  ("n", "n\n", "reject", {"event": "code_rejected", "reason": "operator"}),
+                  ("empty", "\n", "reject", {"event": "code_rejected", "reason": "operator"}),
+                  ("maybe", "maybe\n", "reject", {"event": "code_rejected", "reason": "operator"}),
+                  ("closed", None, "reject", {"event": "code_rejected", "reason": "eof"}))
+
+
+def prompt_case(key, answer, word, then):
+    """One answer to the --confirm prompt (`None`: the terminal is hung up), a case -- a process -- of its own."""
+    def case():
         with AppScenario() as s:
             s.events("events-1", PAIR_INIT, WINDOW, REQUEST)
             s.events("events-2", then)
@@ -307,6 +343,14 @@ def case_prompt():
                 T.check("SESSION CODE: 4SELK" in out and "type 4SELK." in out and "as @octocat can use it. It is this repo's code" in out
                         and "Valid for 10 min" not in out,
                         "the SESSION CODE block names the code and the GitHub login, says it is the repo's code, and no longer promises 10 minutes")
+    case.__name__ = "case_prompt_answered_" + key
+    return case
+
+
+PROMPT_CASES = tuple(prompt_case(*answered) for answered in PROMPT_ANSWERS)
+
+
+def case_prompt_default_connect():
     with AppScenario() as s:
         s.events("events-1", PAIR_INIT, WINDOW, {"event": "code_paired", "device_label": NASTY, "gh_login": "octo\x1bcat", "bound_at": 1},
                  {"event": "device_bound", "bound_at": 1})
@@ -319,6 +363,9 @@ def case_prompt():
                 and has_none_of(app.out(), b"\x1b", b"\x07", b"\x00", "\u0085".encode(), "\u009b".encode()),
                 "default connect: the client is told --no-confirm, no prompt appears, a code bind is announced once as relay-claimed "
                 "(the phone's label and login reduced to plain text: escape bytes and the rest of the sequences gone, the label quoted)", app.tail())
+
+
+def case_prompt_renewal():
     with AppScenario() as s:
         renewal = dict(PAIR_INIT, renewal=1)
         s.events("events-1", PAIR_INIT, WINDOW, renewal, dict(WINDOW, renewal=1), {"event": "code_window_closed", "reason": "expired"})
@@ -330,7 +377,7 @@ def case_prompt():
 
 
 # -- identity revoke ---------------------------------------------------------------------------------
-def case_identity_revoke():
+def case_identity_revoke_reports_the_login():
     with AppScenario(relay=True) as s:
         proc = H.Proc([H.APP_PATH, "identity", "revoke", "--relay", s.relay.url], s.env(), cwd=s.sb.repo)
         s.procs.append(proc)
@@ -340,12 +387,18 @@ def case_identity_revoke():
                 and s.relay.identity_revokes[0]["token_ok"] and s.gh_calls() == ["auth token"],
                 "identity revoke: gh's token goes to POST /identity/github/revoke and the login is reported", "rc %r %s" % (rc, proc.tail()))
         T.check(s.leaked() == [] and H.TOKEN.encode() not in proc.out() + proc.err(), "identity revoke: the token is on no disk and in no output")
+
+
+def case_identity_revoke_gh_signed_out():
     with AppScenario(relay=True, gh_mode="signed-out") as s:
         proc = H.Proc([H.APP_PATH, "identity", "revoke", "--relay", s.relay.url], s.env(), cwd=s.sb.repo)
         s.procs.append(proc)
         rc = proc.wait_exit(40)
         T.check(rc == 3 and s.relay.identity_revokes == [] and b"gh auth login" in proc.err(),
                 "identity revoke with gh signed out: exit 3, the relay is never called", "rc %r %s" % (rc, proc.tail()))
+
+
+def case_identity_revoke_refused_by_github():
     with AppScenario(relay=True) as s:
         s.relay.identity_status = lambda _rec: (401, {"error": "github token rejected"})
         proc = H.Proc([H.APP_PATH, "identity", "revoke", "--relay", s.relay.url], s.env(), cwd=s.sb.repo)
@@ -356,7 +409,7 @@ def case_identity_revoke():
 
 
 # -- one whole pairing -------------------------------------------------------------------------------
-def case_end_to_end():
+def case_end_to_end_y_pairs():
     with AppScenario(relay=True) as s:
         app = s.app("--relay", s.relay.url, "--confirm", tty=True)
         T.check(app.wait_text("SESSION CODE:", 40), "end to end: the app prints the SESSION CODE after the relay verified the token", app.tail())
@@ -379,6 +432,9 @@ def case_end_to_end():
         opened = s.phone.open_hmd_frame(hmd_pub, sid, states[0]) if states else None
         T.check("phone paired" in app.text() and opened is not None and "state" in opened,
                 "end to end: y pairs the session and the first sealed state frame opens under the phone's key", app.tail())
+
+
+def case_end_to_end_n_revokes_and_renews():
     with AppScenario(relay=True) as s:
         app = s.app("--relay", s.relay.url, "--confirm", tty=True)
         app.wait_text("SESSION CODE:", 40)
@@ -393,6 +449,9 @@ def case_end_to_end():
         T.check(sid in s.relay.revokes and len(s.relay.registrations) >= 2 and s.relay.frames_of(sid, "state") == []
                 and s.relay.registrations[1]["code"] == s.relay.registrations[0]["code"],
                 "end to end: n revokes the session, seals nothing, and the window renews with the same code", app.tail())
+
+
+def case_end_to_end_409_prints_one_line():
     with AppScenario(relay=True) as s:
         s.relay.code_status = lambda _reg: (409, {"error": "code in use by another open window"})
         app = s.app("--relay", s.relay.url, tty=True)
@@ -400,11 +459,22 @@ def case_end_to_end():
                 "end to end: the relay's 409 prints one line and the QR is still shown", app.tail())
 
 
+# Every scenario is a case of its own -- a process, a sandbox, a relay on a port the OS hands out -- and the scenarios of one family (the three
+# transport runs, the six answers to the prompt, ...) are separate cases, so the pool of processes (pair_code_harness.run_main, or
+# test/lib/case_pool.py for the suite, which pools these cases with the relay client file's) keeps every worker busy instead of waiting on the
+# family's slowest.
+CASES = (*TRANSPORT_CASES, case_no_code_prints_the_qr_flow, case_no_terminal_still_offers_the_code,
+         case_token_path_and_code,
+         *GH_OFF_CASES, case_no_code_never_asks_gh, case_code_clash_prints_one_line, case_relay_without_code_pairing_prints_one_line,
+         case_flags, case_bg_with_no_confirm,
+         *PROMPT_CASES, case_prompt_default_connect, case_prompt_renewal,
+         case_identity_revoke_reports_the_login, case_identity_revoke_gh_signed_out, case_identity_revoke_refused_by_github,
+         case_end_to_end_y_pairs, case_end_to_end_n_revokes_and_renews, case_end_to_end_409_prints_one_line)
+
+
 def main():
     # no case named: each in a process of its own, a few at a time (pair_code_harness.run_main); `CASE...` runs just those, here
-    return H.run_main(T, os.path.realpath(__file__),
-                      (case_default_transport, case_token_path_and_code, case_off_paths, case_flags,
-                       case_bg_with_no_confirm, case_prompt, case_identity_revoke, case_end_to_end))
+    return H.run_main(T, os.path.realpath(__file__), CASES)
 
 
 if __name__ == "__main__":
