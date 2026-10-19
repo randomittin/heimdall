@@ -92,7 +92,12 @@ TOK_RE = re.compile(r"([A-Za-z0-9_.\-/]+)([*?\[])?")
 # /usr/bin, /tmp/x, /Users/..: a filesystem path, not a repo path (unless it is glued to a variable: "$REPO"/bin/x)
 SYSTEM_ABS_RE = re.compile(r"^/(?:usr|bin|sbin|etc|dev|tmp|var|opt|private|Users|System|Library|Applications|home|proc|sys|lib|run|mnt|Volumes|root|nix|snap|srv)(?:/|$)")
 PATH_ASSIGN_RE = re.compile(r"\b[A-Z_]*PATH=")
-ROOT_VARS = r"(?:REPO|ROOT|REPO_ROOT|REPO_DIR|PLUGIN_DIR|PLUGIN_ROOT|PLUGIN|PROJECT_ROOT|HMD_ROOT|SRC_DIR|CLAUDE_PLUGIN_ROOT)"
+VAR_BEFORE_RE = re.compile(r"\$\{?(\w+)\}?[\"']?$")
+ROOT_NAMES = ("REPO", "ROOT", "REPO_ROOT", "REPO_DIR", "PLUGIN_DIR", "PLUGIN_ROOT", "PLUGIN", "PROJECT_ROOT", "HMD_ROOT", "SRC_DIR", "CLAUDE_PLUGIN_ROOT")
+# variables that name the repo root or the test directory: a directory written under one of them is the REAL one (a fixture repo's
+# `"$d/bin"` is not, and pulling in the real bin/ for every suite that builds a fixture would defeat the point)
+DIR_VARS = frozenset(ROOT_NAMES + ("HERE", "SELF_DIR", "SCRIPT_DIR", "TEST_DIR", "TESTS_DIR", "THIS_DIR", "SUITE_DIR", "ROOT_DIR", "BASE_DIR"))
+ROOT_VARS = r"(?:" + "|".join(ROOT_NAMES) + r")"
 ROOT_REF = r'"?\$\{?' + ROOT_VARS + r'\}?"?'
 ROOT_BEFORE_RE = re.compile(ROOT_REF + r"$")
 WHOLE_RES = (
@@ -335,6 +340,7 @@ class Graph(object):
             parts = d.split("/")
             for i in range(len(parts)):
                 self.dir_suffix.setdefault("/".join(parts[i:]), []).append(d)
+        self.top_names = set(p.split("/")[0] for p in self.nodes)
 
     def suites(self):
         return sorted(p for p, n in self.nodes.items() if n.kind == "suite")
@@ -405,12 +411,19 @@ class Graph(object):
         return hit
 
     def _resolve_uncached(self, raw, dir_ok, glued):
+        """The nodes the token `raw` names. `glued` is None, or the variable name (possibly '') whose closing quote or brace the token
+        follows: `"$REPO"/bin/x`. A file is found wherever a path suffix matches; a DIRECTORY only when it is the real one (rooted)."""
         tok = raw.rstrip(".")
         pathlike = "/" in tok
-        absolute = bool(SYSTEM_ABS_RE.match(tok)) and not glued
+        absolute = glued is None and bool(SYSTEM_ABS_RE.match(tok))
         parts = [p for p in tok.split("/") if p and p != "."]
-        if ".." in parts:
+        first, dotdot = (parts[0] if parts else ""), ".." in parts
+        if dotdot:
             parts = parts[len(parts) - parts[::-1].index(".."):]
+        if glued is not None:
+            rooted = glued in DIR_VARS
+        else:
+            rooted = dotdot or tok.startswith("./") or first in DIR_VARS or first in self.top_names
         found = set()
         for i in range(len(parts)):
             s = "/".join(parts[i:])
@@ -421,7 +434,7 @@ class Graph(object):
             for node in self.by_suffix.get(s, ()):
                 if multi or (node.kind != "data" and not absolute):
                     found.add(node.path)
-            if dir_ok and not absolute and (multi or pathlike):
+            if dir_ok and rooted and not absolute and (multi or pathlike):
                 for d in self.dir_suffix.get(s, ()):
                     found.update(self.dir_files[d])
             if found:
@@ -430,8 +443,11 @@ class Graph(object):
 
     def _glob(self, raw, before, glued):
         """What a glob after `raw` enumerates: the directory `raw` names (up to its last `/`), or the whole tree after the repo root variable."""
-        d = raw if raw.endswith("/") else raw.rpartition("/")[0] + "/" if "/" in raw else None
-        if d is None:
+        if raw.endswith("/"):
+            d = raw
+        elif "/" in raw:
+            d = raw.rpartition("/")[0] + "/"
+        else:
             return set()
         if not d.strip("/"):
             return set([WHOLE]) if ROOT_BEFORE_RE.search(before) else set()
@@ -475,7 +491,10 @@ class Graph(object):
                 raw, glob = m.group(1), m.group(2)
                 if len(raw) < 2 and not glob:
                     continue
-                glued = m.start() > 0 and line[m.start() - 1] in "\"'})"
+                glued = None
+                if m.start() > 0 and line[m.start() - 1] in "\"'})":
+                    var = VAR_BEFORE_RE.search(line[:m.start()])
+                    glued = var.group(1) if var else ""
                 if glob:
                     found.update(self._glob(raw, line[:m.start()], glued))
                 found.update(self._resolve(raw, dir_ok, glued))
@@ -698,19 +717,17 @@ def verify_receipt(repo, receipt_path, hints_path):
     except (OSError, ValueError) as exc:
         return ["cannot read the receipt %s: %s" % (receipt_path, exc)]
     problems = shape_problems(receipt)
-    if problems and not (isinstance(receipt, dict) and isinstance(receipt.get("cache"), dict)
-                         and _matching(OID_RE)(receipt.get("head_sha")) and not [p for p in problems if p.startswith("cache.")]):
+    if problems:
         return problems
     head = repo.resolve(receipt["head_sha"])
     if head is None:
-        return problems + ["head_sha %s is not a commit in this repository" % receipt["head_sha"][:12]]
+        return ["head_sha %s is not a commit in this repository" % receipt["head_sha"][:12]]
     cache = receipt["cache"]
     graph = Graph(repo, head, hints_path)
     live = live_patterns(graph.text.get(RUN_ALL, ""))
     if live is None:
         live = []
         problems.append("test/run-all.sh at %s has no readable live_reason(), so no suite is treated as live" % head[:12])
-    import fnmatch
     suites = graph.suites()
     shas = dict(graph.hash_all())
     if cache["salt"] != graph.salt():
