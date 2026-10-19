@@ -2,7 +2,7 @@
   "name": "hmd",
   "displayName": "Heimdall",
   "description": "Nothing ships unproven. hmd makes your coding agent's work pass a test it didn't write — and proves that test can fail — before the push lands. The gate is a plain git pre-push hook, so it holds in any repo. Answer and steer your Claude Code session from your phone (pair with hmd app connect).",
-  "version": "2.4.7",
+  "version": "2.4.8",
   "author": {
     "name": "Heimdall contributors",
     "url": "https://github.com/randomittin/heimdall"
