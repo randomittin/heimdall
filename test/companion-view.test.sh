@@ -39,6 +39,9 @@
 #
 # Hermetic: HOME/HEIMDALL_HOME/TMPDIR are temp dirs, every process this suite starts is reaped on exit, every wait is bounded.
 # It signals no process it did not start (a running relay client of the operator's is never touched).
+#
+# Every scenario process -- the four stacks (the main one in four parts) and each mutant -- shares nothing with another, so they run in
+# one pool, POOL_JOBS at a time (see "the pool" below), and are reported afterwards in the order they are declared.
 
 set -u
 
@@ -72,40 +75,19 @@ done
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
-# run_scenarios LABEL ARGS... -- run one stack of cases, print its lines, fold its tally into ours.
-run_scenarios() {
-  local label="$1" out="$TMPROOT/out.$RANDOM" rc tally p f
-  shift
-  python3 "$SCEN" "$@" >"$out" 2>&1
-  rc=$?
-  cat "$out"
-  tally="$(grep -E '^[0-9]+ passed, [0-9]+ failed$' "$out" | tail -1)"
-  if [ -z "$tally" ]; then
-    bad "$label: the scenario run produced no tally (exit $rc)"
-    tail -20 "$out"
-    return
-  fi
-  p="${tally%% passed*}"
-  f="${tally##*, }"
-  f="${f%% failed}"
-  PASS=$((PASS + p))
-  FAIL=$((FAIL + f))
-}
-
 # A copy of the client that differs from the real one in nothing but what a mutant changes: the client file itself is a real
 # copy (it finds bin/lib beside its own real path), bin/lib is a directory of links except companion_view.py (also a copy),
-# and everything else -- sentinels, the other bin scripts, the codec -- is linked to the real one.
+# and everything else -- sentinels, the other bin scripts, the codec -- is linked to the real one. One ln for each directory, then the two
+# names that must not be links come out again: bin/ and bin/lib hold some 440 files, and a fork for each of them (and another for its
+# basename) was seconds of every mutant on a loaded machine.
 mutant_tree() {
-  local dir="$TMPROOT/mutant-$1" f name
-  mkdir -p "$dir/bin/lib"
-  for f in "$REPO"/bin/*; do
-    name="$(basename "$f")"
-    case "$name" in lib|heimdall-relay-client) ;; *) ln -s "$f" "$dir/bin/$name" ;; esac
-  done
-  for f in "$REPO"/bin/lib/*; do
-    name="$(basename "$f")"
-    [ "$name" = companion_view.py ] || ln -s "$f" "$dir/bin/lib/$name"
-  done
+  local dir="$TMPROOT/mutant-$1"
+  mkdir -p "$dir/bin"
+  ln -s "$REPO"/bin/* "$dir/bin/"
+  rm "$dir/bin/lib" "$dir/bin/heimdall-relay-client"
+  mkdir "$dir/bin/lib"
+  ln -s "$REPO"/bin/lib/* "$dir/bin/lib/"
+  rm "$dir/bin/lib/companion_view.py"
   cp "$CLIENT" "$dir/bin/heimdall-relay-client"
   cp "$MODULE" "$dir/bin/lib/companion_view.py"
   ln -s "$REPO/sentinels" "$dir/sentinels"
@@ -124,20 +106,67 @@ open(path, "w", encoding="utf-8").write(src.replace(old, new))
 PYEOF
 }
 
-# mutant NAME FILE-IN-TREE OLD NEW GROUPS -- the suite's own cases for GROUPS must go red on the changed copy.
-#
-# The mutants are independent of one another: each has its own copy of the tree, its own temp dir, and its own relay and client on
-# ports the OS hands out. Run one after another they were ~300 s of this suite's ~370 s -- nearly all of it waiting on sockets and
-# on the cases' own bounded waits -- which left a 400 s budget no room for a loaded machine. So `mutant` starts one and returns,
-# keeping at most MUTANT_JOBS in flight, and collect_mutants (called once, after the last) waits for them and reports each in the
-# order it was declared. A background job cannot add to PASS/FAIL itself, so its verdict is two lines in $TMPROOT/verdict.NAME:
-# ok|bad, then the message ok/bad prints.
-MUTANT_JOBS=6
-MUTANT_PIDS=()
-MUTANT_NAMES=()
+# -- the pool ------------------------------------------------------------------------------------------------------------------
+# Every scenario process of this suite is independent of every other: its own temp dir and repo, its own fake relay and relay client
+# on ports the OS hands out. One after another they were ~250 s on a loaded machine, nearly all of it waiting -- on sockets, and on the
+# cases' own bounded waits (a gh that never answers for 8 s, windows of 2 and 4 s in which nothing may happen). So `scenario` and
+# `mutant` only queue a job; run_pool starts POOL_JOBS workers, each of which takes the next job nobody has taken (its mkdir claim is
+# the atomic step: a job never runs twice, nothing polls, and a slow job never keeps a free slot waiting) and runs it; and report_jobs
+# prints everything afterwards, in the order the jobs were queued. A worker is a subshell and cannot add to PASS/FAIL, so a job leaves
+# what it found in $TMPROOT: job.N.out and job.N.rc for a stack, job.N.verdict for a mutant (ok|bad, then the message ok/bad prints).
+# A job that left nothing -- its worker died first -- is reported as a failure, never as silence.
+POOL_JOBS=8
+JOB_KIND=()    # section | stack | mutant | cover: what the entry is
+JOB_NAME=()    # a section's text, a stack's label, a mutant's name
+JOB_STACK=()   # a stack: main | nogh | subdir | killenv
+JOB_GROUPS=()  # a stack: the groups of the main stack it runs; a mutant: the groups that must go red
+JOB_FILE=()    # a mutant: the file of its tree that changes
+JOB_OLD=()     # a mutant: the text it takes out
+JOB_NEW=()     # a mutant: the text it puts there
+JOB_SLOW=()    # 1: starts before the 0s, so the short jobs fill the end of the run; -: nothing to run
+MAIN_RUN=""    # the groups of the main stack that the queued processes run, comma-separated
+
+# job KIND NAME STACK GROUPS FILE OLD NEW SLOW -- queue one entry; the report follows the order they were queued in.
+job() {
+  JOB_KIND+=("$1")
+  JOB_NAME+=("$2")
+  JOB_STACK+=("$3")
+  JOB_GROUPS+=("$4")
+  JOB_FILE+=("$5")
+  JOB_OLD+=("$6")
+  JOB_NEW+=("$7")
+  JOB_SLOW+=("$8")
+}
+
+# section TEXT -- a heading line of the report.
+section() { job section "$1" "" "" "" "" "" -; }
+
+# scenario LABEL STACK [GROUPS] -- one process of the stack STACK (main, nogh, subdir or killenv); only main takes GROUPS, a comma list.
+# The main stack's processes are the longest of the suite, so they start first.
+scenario() {
+  local slow=0
+  if [ "$2" = main ]; then
+    slow=1
+    MAIN_RUN="$MAIN_RUN,${3:-}"
+  fi
+  job stack "$1" "$2" "${3:-}" "" "" "" "$slow"
+}
+
+# cover -- a check, made when the report reaches it, that the groups the queued main-stack processes run are exactly the ones
+# view_scenarios.py lists: the groups are named here now, so one added there and to no list here would silently never run.
+cover() { job cover "main stack groups" "" "" "" "" "" -; }
+
+# mutant NAME FILE-IN-TREE OLD NEW GROUPS -- the suite's own cases for GROUPS must go red on the changed copy. A mutant whose GROUPS hold
+# the slow cases (the 8 s gh, 500 long turns, 2100 files) starts early.
+mutant() {
+  local slow=0
+  case ",$5," in *,transcript,*|*,pr,*|*,size,*) slow=1 ;; esac
+  job mutant "$1" "" "$5" "$2" "$3" "$4" "$slow"
+}
 
 run_mutant() {
-  local name="$1" rel="$2" old="$3" new="$4" groups="$5" dir out rc verdict="$TMPROOT/verdict.$1"
+  local name="${JOB_NAME[$1]}" rel="${JOB_FILE[$1]}" old="${JOB_OLD[$1]}" new="${JOB_NEW[$1]}" groups="${JOB_GROUPS[$1]}"
+  local dir out rc verdict="$TMPROOT/job.$1.verdict"
   dir="$(mutant_tree "$name")"
   if ! mutate "$dir/$rel" "$old" "$new" 2>"$TMPROOT/mut.$name.err"; then
     printf 'bad\nmutant %s could not be built: %s\n' "$name" "$(cat "$TMPROOT/mut.$name.err")" >"$verdict"
@@ -153,40 +182,101 @@ run_mutant() {
   fi
 }
 
-mutant() {
-  local started=${#MUTANT_PIDS[@]}
-  # every mutant started before the last MUTANT_JOBS has been waited for by now: the one MUTANT_JOBS back is the oldest still possibly running
-  if [ "$started" -ge "$MUTANT_JOBS" ]; then
-    wait "${MUTANT_PIDS[$((started - MUTANT_JOBS))]}"
-  fi
-  run_mutant "$@" &
-  MUTANT_PIDS+=("$!")
-  MUTANT_NAMES+=("$1")
+run_stack() {
+  local n="$1"
+  local args=("${JOB_STACK[$n]}" --client "$CLIENT")
+  [ -n "${JOB_GROUPS[$n]}" ] && args+=(--groups "${JOB_GROUPS[$n]}")
+  python3 "$SCEN" "${args[@]}" >"$TMPROOT/job.$n.out" 2>&1
+  echo $? >"$TMPROOT/job.$n.rc"
 }
 
-collect_mutants() {
-  local name kind message
-  wait
-  for name in "${MUTANT_NAMES[@]}"; do
-    if [ ! -s "$TMPROOT/verdict.$name" ]; then
-      bad "mutant $name left no verdict (its job died before it could write one)"
-      continue
-    fi
-    { IFS= read -r kind; IFS= read -r message; } <"$TMPROOT/verdict.$name"
-    if [ "$kind" = ok ]; then ok "$message"; else bad "$message"; fi
+# worker -- one slot of the pool: the slow jobs first, then the rest, each in the order they were queued ("run_$kind" is run_stack
+# or run_mutant; a section or a cover has no slot to run in).
+worker() {
+  local pass n
+  for pass in 1 0; do
+    for ((n = 0; n < ${#JOB_KIND[@]}; n++)); do
+      [ "${JOB_SLOW[$n]}" = "$pass" ] || continue
+      mkdir "$TMPROOT/claim.$n" 2>/dev/null || continue
+      "run_${JOB_KIND[$n]}" "$n"
+    done
   done
 }
 
-echo "-- the real client: main stack (groups wire diff paths secrets params size transcript pr latch kill)"
-run_scenarios main main --client "$CLIENT"
-echo "-- the real client: a PATH without gh"
-run_scenarios nogh nogh --client "$CLIENT"
-echo "-- the real client: --repo below the git toplevel, and the rate limit"
-run_scenarios subdir subdir --client "$CLIENT"
-echo "-- the real client: HMD_UI_CONTROLS=0"
-run_scenarios killenv killenv --client "$CLIENT"
+run_pool() {
+  local w
+  for ((w = 0; w < POOL_JOBS; w++)); do
+    worker &
+  done
+  wait
+}
 
-echo "-- mutants: one rule removed from a copy, the cases that guard it must fail"
+report_section() { echo "${JOB_NAME[$1]}"; }
+
+# report_stack N -- print the stack's own lines and fold its tally into ours; no tally is a failure.
+report_stack() {
+  local n="$1" label="${JOB_NAME[$1]}" out="$TMPROOT/job.$1.out" rc tally p f
+  rc="$(cat "$TMPROOT/job.$n.rc" 2>/dev/null)"
+  cat "$out" 2>/dev/null
+  tally="$(grep -E '^[0-9]+ passed, [0-9]+ failed$' "$out" 2>/dev/null | tail -1)"
+  if [ -z "$tally" ]; then
+    bad "$label: the scenario run produced no tally (exit ${rc:-unknown, its job died})"
+    tail -20 "$out" 2>/dev/null
+    return
+  fi
+  p="${tally%% passed*}"
+  f="${tally##*, }"
+  f="${f%% failed}"
+  PASS=$((PASS + p))
+  FAIL=$((FAIL + f))
+}
+
+report_mutant() {
+  local n="$1" kind message
+  if [ ! -s "$TMPROOT/job.$n.verdict" ]; then
+    bad "mutant ${JOB_NAME[$n]} left no verdict (its job died before it could write one)"
+    return
+  fi
+  { IFS= read -r kind; IFS= read -r message; } <"$TMPROOT/job.$n.verdict"
+  if [ "$kind" = ok ]; then ok "$message"; else bad "$message"; fi
+}
+
+report_cover() {
+  local want got
+  want="$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import view_scenarios; print("\n".join(view_scenarios.MAIN_GROUPS))' "$REPO/test/lib" 2>&1 | sort | tr '\n' ' ')"
+  got="$(printf '%s' "$MAIN_RUN" | tr ',' '\n' | grep . | sort | tr '\n' ' ')"
+  if [ -n "$want" ] && [ "$want" = "$got" ]; then
+    ok "the main stack's groups are each run by exactly one process (${got% })"
+  else
+    bad "the groups the main-stack processes run (${got% }) are not the groups view_scenarios.py lists (${want% })"
+  fi
+}
+
+report_jobs() {
+  local n
+  for ((n = 0; n < ${#JOB_KIND[@]}; n++)); do
+    "report_${JOB_KIND[$n]}" "$n"
+  done
+}
+
+# The main stack as four processes. wire, diff, paths, secrets and params stay together, in the order they were written in (wire has to
+# come first: it reads the first frame the client ever sends); the pool is kept busy by the mutants for the whole run, so splitting
+# them further would buy nothing. size, transcript and pr + latch + kill each make their own repo state and files and read nothing
+# another group left behind, so each gets a stack of its own.
+section "-- the real client: main stack (groups wire diff paths secrets params size transcript pr latch kill), as four processes"
+scenario "main (wire diff paths secrets params)" main wire,diff,paths,secrets,params
+scenario "main (size)" main size
+scenario "main (transcript)" main transcript
+scenario "main (pr latch kill)" main pr,latch,kill
+cover
+section "-- the real client: a PATH without gh"
+scenario nogh nogh
+section "-- the real client: --repo below the git toplevel, and the rate limit"
+scenario subdir subdir
+section "-- the real client: HMD_UI_CONTROLS=0"
+scenario killenv killenv
+
+section "-- mutants: one rule removed from a copy, the cases that guard it must fail"
 mutant drop-secret-mask  bin/lib/companion_view.py $'        if P.secret_shaped(text):\n            return REDACTED' $'        if False:\n            return REDACTED' secrets
 mutant accept-env        bin/lib/companion_view.py 'name.startswith(".env") or name.endswith(_DENIED_SUFFIXES)' 'name.endswith(_DENIED_SUFFIXES[1:])' paths
 mutant accept-dot-git    bin/lib/companion_view.py 'if any(s in _DENIED_DIRS for s in low):' 'if False:' paths
@@ -213,7 +303,8 @@ mutant pr-no-timeout     bin/lib/companion_view.py 'GH_DEADLINE_S = 8.0' 'GH_DEA
 mutant pr-trust-exit-code bin/lib/companion_view.py $'        if code != 0:  # not logged in, no pull request for this branch, offline, ...: nothing to show\n            raise ViewError("not-found")' $'        if False:\n            raise ViewError("not-found")' pr
 mutant gate-ignore-head  bin/lib/companion_view.py 'green = covered == head and receipt.get("tree_clean") is True' 'green = receipt.get("tree_clean") is True' pr
 
-collect_mutants
+run_pool
+report_jobs
 
 echo ""
 echo "$PASS passed, $FAIL failed"
