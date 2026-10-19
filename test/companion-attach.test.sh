@@ -42,6 +42,9 @@
 #
 # Hermetic: HOME/HEIMDALL_HOME/TMPDIR are temp dirs, every process this suite starts is reaped on exit, every wait is bounded.
 # It signals no process it did not start (a running relay client of the operator's is never touched).
+#
+# Side by side: a scenario process (a slice of the main stack, or the groups of one mutant) has its own temp tree, fake relay and relay client on
+# ports the OS hands out, so none needs another; they all run in one pool of 8 (see "the pool"), longest first, and the report comes after the last.
 
 set -u
 
@@ -75,17 +78,54 @@ done
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
-# run_scenarios LABEL ARGS... -- run one stack of cases, print its lines, fold its tally into ours.
-run_scenarios() {
-  local label="$1" out="$TMPROOT/out.$RANDOM" rc tally p f
-  shift
-  python3 "$SCEN" "$@" >"$out" 2>&1
-  rc=$?
-  cat "$out"
-  tally="$(grep -E '^[0-9]+ passed, [0-9]+ failed$' "$out" | tail -1)"
+# -- the pool -------------------------------------------------------------------------------------------------------------------------
+# Run one after another the cases were ~240 s for the main stack alone (the 2 MiB picture is ~100 s of pure-python seal/open on a loaded
+# machine), and every mutant came after that. The slices of the main stack and the mutants need nothing from one another, so they share ONE
+# pool, JOBS at a time. bash 3.2 has no `wait -n`, and waiting for "the job JOBS back" leaves every slot idle behind the first (longest) jobs,
+# so a slot is a token on a FIFO: `launch` takes one (blocking while JOBS jobs run) and the job puts it back when it ends. A background job
+# cannot add to PASS/FAIL itself, so it leaves its result in a file under $TMPROOT; the report, after the last job, reads those in the order the
+# jobs were declared, and a job that left none is a red line, never a skipped one.
+JOBS=8
+mkfifo "$TMPROOT/slots" && exec 8<>"$TMPROOT/slots" || {
+  printf 'FATAL: cannot make the slot pool in %s\n' "$TMPROOT" >&2
+  printf '\n0 passed, 1 failed\n'
+  exit 1
+}
+slot=0
+while [ "$slot" -lt "$JOBS" ]; do
+  echo >&8
+  slot=$((slot + 1))
+done
+
+# launch CMD ARGS... -- CMD in the background as soon as a slot is free; the slot goes back when CMD ends, however it ends.
+launch() {
+  local token
+  IFS= read -r -u 8 token || return 1      # no slot to be had: the job does not run, and has no result for the report to find
+  ( "$@"; echo >&8 ) &
+}
+
+# slice LABEL GROUPS -- the real client's cases for GROUPS as one scenario process: its lines go to $TMPROOT/slice.LABEL.out, its exit code to
+# slice.LABEL.rc. The main stack's groups (wire happy max refuse gate keep) share one paired stack when they run in one process; off, rate and
+# maxws each build their own.
+SLICES=()
+run_slice() {
+  python3 "$SCEN" --client "$CLIENT" --groups "$2" >"$TMPROOT/slice.$1.out" 2>&1
+  echo "$?" >"$TMPROOT/slice.$1.rc"
+}
+slice() {
+  SLICES+=("$1")
+  launch run_slice "$1" "$2"
+}
+
+# report_slice LABEL -- print its lines as the scenario process printed them, fold its tally into ours.
+report_slice() {
+  local label="$1" out="$TMPROOT/slice.$1.out" rc tally p f
+  rc="$(cat "$TMPROOT/slice.$1.rc" 2>/dev/null)"
+  cat "$out" 2>/dev/null
+  tally="$(grep -E '^[0-9]+ passed, [0-9]+ failed$' "$out" 2>/dev/null | tail -1)"
   if [ -z "$tally" ]; then
-    bad "$label: the scenario run produced no tally (exit $rc)"
-    tail -20 "$out"
+    bad "$label: the scenario run produced no tally (exit ${rc:-?})"
+    tail -20 "$out" 2>/dev/null
     return
   fi
   p="${tally%% passed*}"
@@ -97,23 +137,22 @@ run_scenarios() {
 
 # A copy that differs from the real tree in nothing but what a mutant changes. The client, the controls module and the attach module are real
 # copies (the controls module finds its siblings -- the attach module -- beside its own real path, so it must be a copy too); everything
-# else in bin/ and sentinels/ is linked to the real one.
+# else in bin/ and sentinels/ is linked to the real one. The links are made in bulk -- one `ln -s` per directory, then the three that are to be
+# copies are swapped for copies -- not a `basename` and an `ln` per entry: ~430 entries took ~8 s a mutant on a loaded machine, and every
+# mutant's tree was built before any scenario ran. Each step must succeed, or the mutant is not run on a half-built tree (it would "fail" for that).
 mutant_tree() {
-  local dir="$TMPROOT/mutant-$1" f name
-  mkdir -p "$dir/bin/lib"
-  for f in "$REPO"/bin/*; do
-    name="$(basename "$f")"
-    case "$name" in lib|heimdall-relay-client) ;; *) ln -s "$f" "$dir/bin/$name" ;; esac
-  done
-  for f in "$REPO"/bin/lib/*; do
-    name="$(basename "$f")"
-    case "$name" in companion_attach.py|companion_ui_controls.py) ;; *) ln -s "$f" "$dir/bin/lib/$name" ;; esac
-  done
-  cp "$CLIENT" "$dir/bin/heimdall-relay-client"
-  cp "$MODULE" "$dir/bin/lib/companion_attach.py"
-  cp "$REPO/bin/lib/companion_ui_controls.py" "$dir/bin/lib/companion_ui_controls.py"
-  ln -s "$REPO/sentinels" "$dir/sentinels"
-  printf '%s' "$dir"
+  local dir="$TMPROOT/mutant-$1"
+  mkdir -p "$dir/bin" &&
+    ln -s "$REPO"/bin/* "$dir/bin/" &&
+    rm "$dir/bin/lib" "$dir/bin/heimdall-relay-client" &&
+    mkdir "$dir/bin/lib" &&
+    ln -s "$REPO"/bin/lib/* "$dir/bin/lib/" &&
+    rm "$dir/bin/lib/companion_attach.py" "$dir/bin/lib/companion_ui_controls.py" &&
+    cp "$CLIENT" "$dir/bin/heimdall-relay-client" &&
+    cp "$MODULE" "$dir/bin/lib/companion_attach.py" &&
+    cp "$REPO/bin/lib/companion_ui_controls.py" "$dir/bin/lib/companion_ui_controls.py" &&
+    ln -s "$REPO/sentinels" "$dir/sentinels" &&
+    printf '%s' "$dir"
 }
 
 # mutate FILE OLD NEW -- exactly one occurrence of OLD, else the mutant would be vacuous and the suite says so.
@@ -128,46 +167,53 @@ open(path, "w", encoding="utf-8").write(src.replace(old, new))
 PYEOF
 }
 
-# mutant NAME FILE-IN-TREE OLD NEW GROUPS -- the suite's own cases for GROUPS must go red on the changed copy. Each mutant runs as its own
-# scenario process (its own temp tree, ports and fake relay), six at a time; collect_mutants reads the verdicts.
+# mutant NAME FILE-IN-TREE OLD NEW GROUPS -- the suite's own cases for GROUPS must go red on the changed copy. `mutant` starts the job in the pool
+# and returns; the job builds the copy, runs a scenario process on it and writes its verdict -- two lines, ok|bad and then the message ok/bad
+# prints -- to $TMPROOT/verdict.NAME, which collect_mutants reads in the order the mutants were declared (the pattern of companion-view.test.sh).
 MUT_NAMES=()
-MUT_OUTS=()
-MUT_LAUNCHED=0
-mutant() {
-  local name="$1" rel="$2" old="$3" new="$4" groups="$5" dir out
-  dir="$(mutant_tree "$name")"
-  if ! mutate "$dir/$rel" "$old" "$new" 2>"$TMPROOT/mut.err"; then
-    bad "mutant $name could not be built: $(cat "$TMPROOT/mut.err")"
+
+run_mutant() {
+  local name="$1" rel="$2" old="$3" new="$4" groups="$5" dir out="$TMPROOT/mut.$1.out" err="$TMPROOT/mut.$1.err" rc verdict="$TMPROOT/verdict.$1"
+  if ! dir="$(mutant_tree "$name" 2>"$err")" || ! mutate "$dir/$rel" "$old" "$new" 2>>"$err"; then
+    printf 'bad\nmutant %s could not be built: %s\n' "$name" "$(tr '\n' ' ' <"$err")" >"$verdict"
     return
   fi
-  out="$TMPROOT/mut.out.$name"
-  ( python3 "$SCEN" --client "$dir/bin/heimdall-relay-client" --groups "$groups" >"$out" 2>&1; echo "exit=$?" >>"$out" ) &
-  MUT_NAMES+=("$name")
-  MUT_OUTS+=("$out")
-  MUT_LAUNCHED=$((MUT_LAUNCHED + 1))
-  if [ $((MUT_LAUNCHED % 6)) -eq 0 ]; then wait; fi
+  python3 "$SCEN" --client "$dir/bin/heimdall-relay-client" --groups "$groups" >"$out" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] && grep -q '^  FAIL ' "$out"; then
+    printf 'ok\nmutant %s turns the suite red (%s checks failed: %s)\n' "$name" "$(grep -c '^  FAIL ' "$out")" "$(grep -m1 '^  FAIL ' "$out" | cut -c8-90)" >"$verdict"
+  else
+    printf 'bad\nmutant %s NOT caught (exit %s) -- the rule it removes is not what the cases test\n' "$name" "$rc" >"$verdict"
+  fi
+}
+
+mutant() {
+  MUT_NAMES+=("$1")
+  launch run_mutant "$@"
 }
 
 collect_mutants() {
-  local i=0 name out rc
-  wait
-  while [ "$i" -lt "${#MUT_NAMES[@]}" ]; do
-    name="${MUT_NAMES[$i]}"
-    out="${MUT_OUTS[$i]}"
-    rc="$(grep '^exit=' "$out" | tail -1 | cut -d= -f2)"
-    if [ "${rc:-0}" -ne 0 ] && grep -q '^  FAIL ' "$out"; then
-      ok "mutant $name turns the suite red ($(grep -c '^  FAIL ' "$out") checks failed: $(grep -m1 '^  FAIL ' "$out" | cut -c8-90))"
-    else
-      bad "mutant $name NOT caught (exit ${rc:-?}) -- the rule it removes is not what the cases test"
+  local name kind message
+  for name in "${MUT_NAMES[@]}"; do
+    if [ ! -s "$TMPROOT/verdict.$name" ]; then
+      bad "mutant $name left no verdict (its job died before it could write one)"
+      continue
     fi
-    i=$((i + 1))
+    { IFS= read -r kind; IFS= read -r message; } <"$TMPROOT/verdict.$name"
+    if [ "$kind" = ok ]; then ok "$message"; else bad "$message"; fi
   done
 }
 
-echo "-- the real client: main stack (groups wire happy max refuse gate keep), HMD_ATTACH=0 (off), the limits (rate), the WebSocket leg (maxws)"
-run_scenarios main
-
-echo "-- mutants: one rule removed from a copy, the cases that guard it must fail"
+# Started longest first: the pool takes the jobs in this order, so the 2 MiB picture (the max and maxws slices, and the two mutants that send it
+# again) starts at once and the quick jobs fill the slots behind it. The report below prints in the same order.
+slice max            max
+slice refuse         refuse
+slice maxws          maxws
+slice happy          happy
+slice wire-gate-keep wire,gate,keep
+slice off-rate       off,rate
+mutant stream-cap-counts-all bin/heimdall-relay-client '                    stream_total_bytes -= size' '                    stream_total_bytes -= 0' max
+mutant ws-cap-counts-all  bin/heimdall-relay-client '                            ws.total_bytes = max(0, ws.total_bytes - len(event[1]))' '                            ws.total_bytes = ws.total_bytes' maxws
 mutant skip-magic-check   bin/lib/companion_attach.py '    if not data.startswith(magic):' '    if False:' refuse
 mutant skip-sha-check     bin/lib/companion_attach.py '    if hashlib.sha256(data).hexdigest() != up.sha:' '    if False:' refuse
 mutant skip-size-cap      bin/lib/companion_attach.py '    if nbytes > MAX_BYTES:' '    if False:' refuse
@@ -193,8 +239,13 @@ mutant charge-after-decode bin/lib/companion_ui_controls.py '    charged = spec[
 mutant rid-without-action bin/lib/companion_ui_controls.py '        key = (action, rid)' '        key = rid' wire
 mutant cap-not-listed     bin/heimdall-relay-client '([ATTACH.CAP_ATTACH] if ATTACH is not None and ATTACH.enabled() else [])' '[]' wire
 mutant no-startup-sweep   bin/heimdall-relay-client '        ATTACH.sweep(client.root)  # a picture past its TTL does not outlive a restart' '        client.root  # mutant' keep
-mutant stream-cap-counts-all bin/heimdall-relay-client '                    stream_total_bytes -= size' '                    stream_total_bytes -= 0' max
-mutant ws-cap-counts-all  bin/heimdall-relay-client '                            ws.total_bytes = max(0, ws.total_bytes - len(event[1]))' '                            ws.total_bytes = ws.total_bytes' maxws
+
+wait                                           # every job has left its result (or none) before the report reads them
+
+echo "-- the real client: main stack (groups wire happy max refuse gate keep), HMD_ATTACH=0 (off), the limits (rate), the WebSocket leg (maxws) -- one scenario process per slice"
+for label in "${SLICES[@]}"; do report_slice "$label"; done
+
+echo "-- mutants: one rule removed from a copy, the cases that guard it must fail"
 collect_mutants
 
 echo ""
