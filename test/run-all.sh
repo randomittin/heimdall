@@ -263,6 +263,9 @@ while [ $# -gt 0 ]; do
     --wait-quiet)   WAIT_QUIET=1; shift ;;
     --no-retry)     RETRY_REDS=0; shift ;;
     --fail-fast)    FAIL_FAST=1; shift ;;
+    --cold)         COLD=1; shift ;;
+    --no-cache)     NO_CACHE=1; shift ;;
+    --failed)       FAILED_ONLY=1; shift ;;
     --jobs)         JOBS="${2:-4}"; shift 2 ;;
     --timeout)      TIMEOUT="${2:-180}"; shift 2 ;;
     --min)          MIN_SUITES="${2:-100}"; shift 2 ;;
@@ -278,6 +281,14 @@ for n in "$JOBS" "$TIMEOUT" "$MIN_SUITES"; do
 done
 if [ "$SINCE_GREEN" -eq 1 ] && [ -n "$FILTER" ]; then
   echo "run-all: --since-green cannot be combined with --filter -- an incremental receipt must describe the whole tree; a filtered run describes a subset" >&2
+  exit 2
+fi
+if [ "$FAILED_ONLY" -eq 1 ] && { [ "$COLD" -eq 1 ] || [ "$NO_CACHE" -eq 1 ] || [ "$SINCE_GREEN" -eq 1 ] || [ -n "$FILTER" ]; }; then
+  echo "run-all: --failed amends the last full receipt from the suite cache, so it cannot be combined with --cold (HMD_COLD), --no-cache, --since-green or --filter" >&2
+  exit 2
+fi
+if [ "$COLD" -eq 1 ] && [ "$NO_CACHE" -eq 1 ]; then
+  echo "run-all: --cold (ignore the cache and rewrite it) and --no-cache (leave it alone) contradict each other" >&2
   exit 2
 fi
 
@@ -670,26 +681,182 @@ PREV_RECEIPT=""
 if command -v jq >/dev/null 2>&1 && [ -f "$RECEIPT_FILE" ] && [ "$(jq -r '.repo // empty' "$RECEIPT_FILE" 2>/dev/null)" = "$RECEIPT_REPO_CANON" ]; then
   PREV_RECEIPT="$(jq -c . "$RECEIPT_FILE" 2>/dev/null)" || PREV_RECEIPT=""
 fi
-if [ -n "$PREV_RECEIPT" ] && [ "$TO_RUN" -gt 1 ]; then
+# ── SUITE CACHE: which suites need to run at all (see "Suite cache" at the top) ─────────────────────────────────────────────
+# Decided before the order, because only the suites that will run are ordered. HIT = a reusable green: not launched, a CACHED row, counted green; every other suite keeps its place in RUN. The ON
+# switch is a full sweep of a clean, committed tree. _cache_store_green runs from the launch loop, _cache_note_result and _cache_epilogue from CLASSIFY RESULTS.
+CACHE_ON=0; CACHE_WHY=""; CACHE_DIR=""; CACHE_SALT=""; CACHE_HEAD=""; CACHE_TMP=""; CACHE_JSON=""; CACHE_COMPOSE_ERR=""
+CACHED=(); _CACHE_NEWRUN=(); UNSOUND=(); n_cached=0; CACHED_ASSERT=0; N_MISSES=0; N_AUDIT=0; N_FORCED=0; N_AUDITED_RAN=0; N_FRESH=0; CACHE_STORE_FAIL=0; n_unsound=0; AMEND_FROM=""
+_sha256_file() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1" 2>/dev/null; } | awk 'NR == 1 { print $1 }'; }
+# _cache_plan -- fills CACHED, narrows RUN/TO_RUN to the suites that must launch and returns 0; returns 1 with CACHE_WHY when the cache cannot be used (RUN is untouched then)
+_cache_plan() {
+  local engine="$REPO/bin/heimdall-suite-closure" lib="$REPO/bin/lib/suite-cache.sh" dirty s name csha now seed err hit budget dur ap verdict i
+  if [ "$SWEEP_KIND" != full ]; then CACHE_WHY="a ${SWEEP_KIND} sweep runs exactly the suites it selected"; return 1; fi
+  if [ ! -x "$engine" ] || [ ! -r "$lib" ]; then CACHE_WHY="bin/heimdall-suite-closure or bin/lib/suite-cache.sh is missing in this repo"; return 1; fi
+  command -v jq >/dev/null 2>&1 || { CACHE_WHY="jq is not installed"; return 1; }
+  dirty="$(git -C "$REPO" status --porcelain=v1 --no-renames 2>/dev/null \
+    | grep -Ev '^(\?\?|.M|M.|A.|.A) '"$HMD_HOOK_OWNED_PATH_RE"'$' | grep -Ev '^\?\? \.heimdall/(receipts/)?$' | head -n 3 | cut -c4- | paste -sd, -)"
+  if [ -n "$dirty" ]; then CACHE_WHY="uncommitted changes in the working tree (${dirty}): a closure hash describes a commit"; return 1; fi
+  CACHE_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" || { CACHE_WHY="not a git checkout"; return 1; }
+  # shellcheck source=../bin/lib/suite-cache.sh disable=SC1091  # the default run never opens sourced files; source= is for -x -P SCRIPTDIR
+  . "$lib" || { CACHE_WHY="cannot read bin/lib/suite-cache.sh"; return 1; }
+  CACHE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-cache.XXXXXX")" || { CACHE_WHY="mktemp failed"; return 1; }
+  err="$CACHE_TMP/engine.err"
+  CACHE_SALT="$("$engine" salt --repo "$REPO" 2>"$err")" || { CACHE_WHY="the closure engine failed: $(head -n 1 "$err")"; return 1; }
+  "$engine" hash-all --repo "$REPO" >"$CACHE_TMP/closures.tsv" 2>"$err" || { CACHE_WHY="the closure engine failed: $(head -n 1 "$err")"; return 1; }
+  CACHE_DIR="$(suite_cache_dir "$REPO")" || { CACHE_WHY="no cache directory"; return 1; }
+  now="$(date +%s)"
+  : > "$CACHE_TMP/hits.txt"; : > "$CACHE_TMP/miss.txt"; : > "$CACHE_TMP/reasons.txt"; : > "$CACHE_TMP/forced.txt"; : > "$CACHE_TMP/audit.txt"; : > "$CACHE_TMP/stored.txt"; : > "$CACHE_TMP/hitfacts.tsv"
+  if [ "$FAILED_ONLY" -eq 1 ] && [ -n "$PREV_RECEIPT" ]; then
+    printf '%s' "$PREV_RECEIPT" | jq -r '(.non_green_suites // [])[]' > "$CACHE_TMP/forced.txt" 2>/dev/null || : > "$CACHE_TMP/forced.txt"
+    AMEND_FROM="$(_sha256_file "$RECEIPT_FILE")"
+  fi
+  for s in ${RUN[@]+"${RUN[@]}"}; do
+    name="${s##*/}"
+    [ -z "$(live_reason "$s")" ] || continue                       # a live suite is never cached: it always runs
+    if [ "$COLD" -eq 1 ]; then printf '%s\n' "$name" >> "$CACHE_TMP/miss.txt"; continue; fi
+    csha="$(awk -F'\t' -v p="test/$name" '$1 == p { print $2; exit }' "$CACHE_TMP/closures.tsv")"
+    if [ -z "$csha" ]; then
+      printf '%s\t%s\n' "$name" "not tracked by git: there is no closure to bind a result to" >> "$CACHE_TMP/reasons.txt"; printf '%s\n' "$name" >> "$CACHE_TMP/miss.txt"; continue
+    fi
+    if hit="$(suite_cache_lookup "$CACHE_DIR" "$name" "$csha" "$CACHE_SALT" "${HMD_SUITE_CACHE_MAX_DAYS:-}" "$now" 2>/dev/null)"; then
+      printf '%s\n' "$name" >> "$CACHE_TMP/hits.txt"
+    else
+      printf '%s\t%s\n' "$name" "${hit#MISS }" >> "$CACHE_TMP/reasons.txt"; printf '%s\n' "$name" >> "$CACHE_TMP/miss.txt"
+    fi
+  done
+  if [ -s "$CACHE_TMP/hits.txt" ]; then
+    # one jq over every hit: what each entry recorded. A result that took longer than the budget the suite would run under NOW is not reusable (a budget edit does not change the salt).
+    awk -v d="$CACHE_DIR" '{ print d "/" $0 ".json" }' "$CACHE_TMP/hits.txt" \
+      | xargs jq -r '[.suite, (.duration_s | floor | tostring), (.assertions_passed | tostring)] | @tsv' > "$CACHE_TMP/hitfacts.tsv" 2>/dev/null || : > "$CACHE_TMP/hitfacts.tsv"
+    : > "$CACHE_TMP/hits2.txt"
+    while IFS="$TAB" read -r name dur ap; do
+      budget="$(suite_timeout "$REPO/test/$name")"
+      if [ "$dur" -gt "$budget" ] 2>/dev/null; then
+        printf '%s\t%s\n' "$name" "recorded ${dur}s is over the budget of ${budget}s" >> "$CACHE_TMP/reasons.txt"; printf '%s\n' "$name" >> "$CACHE_TMP/miss.txt"
+      else
+        printf '%s\n' "$name" >> "$CACHE_TMP/hits2.txt"
+      fi
+    done < "$CACHE_TMP/hitfacts.tsv"
+    mv "$CACHE_TMP/hits2.txt" "$CACHE_TMP/hits.txt"
+  fi
+  # the audit: max(20, 10%) of the hits are re-run anyway (--failed draws none). A pick that fails audits every hit: never fewer than asked.
+  if [ "$FAILED_ONLY" -eq 0 ] && [ -s "$CACHE_TMP/hits.txt" ]; then
+    seed="$(suite_cache_audit_seed "$CACHE_HEAD" "$CACHE_SALT" 2>/dev/null)" || seed=""
+    suite_cache_audit_pick "$seed" "$CACHE_TMP/hits.txt" > "$CACHE_TMP/audit.txt" 2>/dev/null || cp "$CACHE_TMP/hits.txt" "$CACHE_TMP/audit.txt"
+  fi
+  for s in ${RUN[@]+"${RUN[@]}"}; do printf '%s\n' "${s##*/}"; done > "$CACHE_TMP/runnames.txt"
+  awk -v hits="$CACHE_TMP/hits.txt" -v aud="$CACHE_TMP/audit.txt" -v frc="$CACHE_TMP/forced.txt" '
+      BEGIN { while ((getline l < hits) > 0) H[l] = 1; while ((getline l < aud) > 0) A[l] = 1; while ((getline l < frc) > 0) F[l] = 1 }
+      { print ((($1 in H) && !($1 in A) && !($1 in F)) ? "C" : "R"), $1 }' "$CACHE_TMP/runnames.txt" > "$CACHE_TMP/decisions.txt"
+  CACHED=(); _CACHE_NEWRUN=(); i=0
+  while read -r verdict name; do
+    s="${RUN[$i]}"; i=$((i + 1))
+    if [ "$verdict" = C ]; then CACHED+=("$name"); else _CACHE_NEWRUN+=("$s"); fi
+  done < "$CACHE_TMP/decisions.txt"
+  RUN=(${_CACHE_NEWRUN[@]+"${_CACHE_NEWRUN[@]}"}); TO_RUN=${#RUN[@]}; n_cached=${#CACHED[@]}
+  N_MISSES="$(grep -c . "$CACHE_TMP/miss.txt" || true)"; N_AUDIT="$(grep -c . "$CACHE_TMP/audit.txt" || true)"
+  N_FORCED="$(awk 'NR == FNR { f[$1] = 1; next } ($1 in f) { n++ } END { print n + 0 }' "$CACHE_TMP/forced.txt" "$CACHE_TMP/runnames.txt")"
+  CACHED_ASSERT="$(printf '%s\n' ${CACHED[@]+"${CACHED[@]}"} | awk -F'\t' 'NR == FNR { c[$1] = 1; next } ($1 in c) { n += $3 } END { print n + 0 }' - "$CACHE_TMP/hitfacts.tsv")"
+  return 0
+}
+# _cache_store_green IDX -- suite IDX just finished in the parallel phase (PROG_* describe it). A clean green goes into the cache NOW, so a run that is stopped or goes red later keeps it. A red is never
+# stored here; a red that passes alone (FLAKY-UNDER-LOAD) is not a clean green either, and is dealt with in _cache_note_result.
+_cache_store_green() {
+  local i="$1" name csha dur body
+  [ "$PROG_STATUS" = PASS ] || return 0
+  name="${RUN[$i]##*/}"
+  [ -z "$(live_reason "${RUN[$i]}")" ] || return 0
+  csha="$(awk -F'\t' -v p="test/$name" '$1 == p { print $2; exit }' "$CACHE_TMP/closures.tsv")"
+  [ -n "$csha" ] || return 0
+  dur="$(cat "$WORK/$i.dur" 2>/dev/null || echo 0)"
+  body="$(jq -nc --arg suite "$name" --arg closure "$csha" --arg salt "$CACHE_SALT" --argjson p "$PROG_P" --argjson dur "$dur" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg head "$CACHE_HEAD" \
+    '{suite:$suite, closure_sha:$closure, salt:$salt, exit_code:0, assertions_passed:$p, assertions_failed:0, live_reason:"", tree_integrity_violations:0, finished_at:$at, ran_at_head:$head, duration_s:$dur}' 2>/dev/null)" || return 0
+  if suite_cache_store "$CACHE_DIR" "$name" "$body" 2>>"$CACHE_TMP/store.err"; then printf '%s\n' "$name" >> "$CACHE_TMP/stored.txt"; else CACHE_STORE_FAIL=$((CACHE_STORE_FAIL + 1)); fi
+  return 0
+}
+# _cache_note_result IDX NAME STATUS -- CLASSIFY RESULTS: what the cache keeps of a suite that ran. A suite that is not a clean green forgets its older entry too. An AUDITED suite that is red for good
+# (not FLAKY-UNDER-LOAD: that one passed alone) although its closure had not changed is CLOSURE UNSOUND.
+_cache_note_result() {
+  local i="$1" name="$2" status="$3" flaky=0 f
+  if grep -Fxq -- "$name" "$CACHE_TMP/audit.txt" 2>/dev/null; then N_AUDITED_RAN=$((N_AUDITED_RAN + 1)); fi
+  for f in ${FLAKY_IDX[@]+"${FLAKY_IDX[@]}"}; do [ "$f" = "$i" ] && flaky=1; done
+  if [ "$status" = PASS ] && [ "$flaky" -eq 0 ]; then return 0; fi
+  [ -z "$(live_reason "${RUN[$i]}")" ] || return 0
+  suite_cache_invalidate "$CACHE_DIR" "$name" 2>/dev/null || true
+  if [ "$flaky" -eq 0 ] && grep -Fxq -- "$name" "$CACHE_TMP/audit.txt" 2>/dev/null; then UNSOUND+=("$name"); fi
+  return 0
+}
+# _cache_epilogue -- after CLASSIFY RESULTS: drop what a moved tree cannot vouch for, purge on CLOSURE UNSOUND, build the receipt's cache block from the entries on disk, add the CACHED table rows
+_cache_epilogue() {
+  local name cold=false
+  if [ "$n_treeviol" -gt 0 ] || [ "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" != "$CACHE_HEAD" ]; then
+    # the tree (or HEAD) moved under the run: what it stored may describe something else, so none of it is kept
+    while IFS= read -r name; do [ -z "$name" ] || suite_cache_invalidate "$CACHE_DIR" "$name" 2>/dev/null || true; done < "$CACHE_TMP/stored.txt"
+    : > "$CACHE_TMP/stored.txt"
+  fi
+  if [ "${#UNSOUND[@]}" -gt 0 ]; then suite_cache_purge "$CACHE_DIR" 2>/dev/null || true; : > "$CACHE_TMP/stored.txt"; fi
+  N_FRESH=$((TO_RUN - n_refused - n_notrun))
+  # nothing served from the cache and nothing audited: every suite ran in this sweep, which is what cold means (so the first sweep after a salt change is cold without a flag)
+  if [ "$COLD" -eq 1 ] || { [ "$n_cached" -eq 0 ] && [ "$N_AUDITED_RAN" -eq 0 ]; }; then cold=true; fi
+  if [ "${#UNSOUND[@]}" -gt 0 ]; then : > "$CACHE_TMP/green.txt"
+  else { printf '%s\n' ${CACHED[@]+"${CACHED[@]}"}; cat "$CACHE_TMP/stored.txt"; } | grep . | LC_ALL=C sort -u > "$CACHE_TMP/green.txt"
+  fi
+  CACHE_JSON="$(suite_cache_compose_receipt "$CACHE_DIR" "$CACHE_SALT" "$(date +%s)" "$cold" "$N_FRESH" "$n_cached" "$N_AUDITED_RAN" "$CACHE_TMP/green.txt" 2>"$CACHE_TMP/compose.err")" || CACHE_JSON=""
+  if [ -z "$CACHE_JSON" ]; then
+    CACHE_COMPOSE_ERR="$(head -n 1 "$CACHE_TMP/compose.err" | sed 's/^suite-cache: //')"
+    echo "${YEL}cache: the receipt's cache block could not be built (${CACHE_COMPOSE_ERR:-no reason given}) -- the receipt will not verify${OFF}" >&2
+  elif [ "${#UNSOUND[@]}" -gt 0 ]; then
+    CACHE_JSON="$(printf '%s' "$CACHE_JSON" | jq -c --argjson u "$(printf '%s\n' "${UNSOUND[@]}" | jq -R . | jq -sc .)" '. + {unsound: $u}')"
+  fi
+  printf '%s\n' ${CACHED[@]+"${CACHED[@]}"} | awk -F'\t' 'NR == FNR { c[$1] = 1; next } ($1 in c) { print "CACHED|" $1 "|" $3 "|0|-|-" }' - "$CACHE_TMP/hitfacts.tsv" > "$CACHE_TMP/cachedrows.txt"
+  while IFS= read -r name; do [ -z "$name" ] || ROWS+=("$name"); done < "$CACHE_TMP/cachedrows.txt"
+}
+if [ "$NO_CACHE" -eq 1 ]; then CACHE_WHY="--no-cache"
+elif _cache_plan; then CACHE_ON=1
+fi
+if [ "$CACHE_ON" -eq 0 ]; then
+  [ -z "$CACHE_TMP" ] || { rm -rf "$CACHE_TMP"; CACHE_TMP=""; }
+  echo "cache: off -- ${CACHE_WHY}"
+  if [ "$FAILED_ONLY" -eq 1 ]; then echo "run-all: --failed needs the suite cache, which is off: ${CACHE_WHY}" >&2; exit 2; fi
+else
+  _cache_lim=25; [ "$DRY_RUN" -eq 1 ] && _cache_lim=100000
+  if [ "$COLD" -eq 1 ]; then
+    echo "cache: cold -- all ${TO_RUN} suites run and every green is stored; nothing is served from the cache (salt ${CACHE_SALT:0:12})"
+  else
+    echo "cache: on -- ${n_cached} of $((TO_RUN + n_cached)) suites served from the cache, ${TO_RUN} to run (${N_MISSES} changed or new, ${N_AUDIT} audited, ${N_FORCED} forced) (salt ${CACHE_SALT:0:12})"
+  fi
+  if [ "$FAILED_ONLY" -eq 1 ]; then
+    echo "failed-first: ${N_FORCED} suite(s) the last receipt had non-green, ${N_MISSES} with no valid cache entry; no audit sample is drawn, so this amend is not gate-grade until one default run re-runs the sample"
+    [ -n "$PREV_RECEIPT" ] || echo "              (there is no previous receipt of this repo to amend: only the suites without a valid cache entry run)"
+  fi
+  awk -F'\t' -v lim="$_cache_lim" '$2 != "no entry" { n++; if (n <= lim) printf "             cache miss  %s: %s\n", $1, $2 } END { if (n > lim) printf "             ... and %d more\n", n - lim }' "$CACHE_TMP/reasons.txt"
+fi
+# ── ORDER (continued): failed-first, then changed-closure, then slowest-first. A cached run orders even without a previous receipt: the suites the cache could not vouch for start first. ──
+if { [ -n "$PREV_RECEIPT" ] || [ "$CACHE_ON" -eq 1 ]; } && [ "$TO_RUN" -gt 1 ]; then
   ORDER_TSV="$( { printf '%s' "$PREV_RECEIPT" | jq -r '((.not_run_suites // []) as $nr | (.non_green_suites // [])[] | select(. as $s | $nr | index($s) | not) | "R\t\(.)"),
                                                        ((.suite_durations // {}) | to_entries[] | "D\t\(.key)\t\(.value)")' 2>/dev/null
+                  [ "$CACHE_ON" -eq 0 ] || awk '{ print "M\t" $0 }' "$CACHE_TMP/miss.txt"
                   i=0; for s in "${RUN[@]}"; do printf 'S\t%s\t%s\n' "$i" "${s##*/}"; i=$((i + 1)); done
                 } | awk -F"$TAB" -v min="$ORDER_MIN_S" '
                     $1 == "R" { red[$2] = ++nred; next }
+                    $1 == "M" { miss[$2] = 1; next }
                     $1 == "D" { dur[$2] = $3 + 0; next }
                     $1 == "S" {
                       name = $3
                       if (name in red) { cls = 0; key = red[name] }
-                      else if (!(name in dur)) { cls = 1; key = 0 }
-                      else if (dur[name] >= min) { cls = 2; key = -dur[name] }
-                      else { cls = 3; key = 0 }
+                      else if (name in miss) { cls = 1; key = (name in dur) ? -dur[name] : 0 }
+                      else if (!(name in dur)) { cls = 2; key = 0 }
+                      else if (dur[name] >= min) { cls = 3; key = -dur[name] }
+                      else { cls = 4; key = 0 }
                       printf "%d\t%d\t%d\n", cls, key, $2
                     }' | sort -t "$TAB" -k1,1n -k2,2n -k3,3n )"
   if [ "$(printf '%s\n' "$ORDER_TSV" | grep -c .)" -eq "$TO_RUN" ]; then
     NEWRUN=()
     for i in $(printf '%s\n' "$ORDER_TSV" | cut -f3); do NEWRUN+=("${RUN[$i]}"); done
     RUN=("${NEWRUN[@]}")
-    printf '%s\n' "$ORDER_TSV" | awk -F"$TAB" -v min="$ORDER_MIN_S" '{ c[$1]++ } END { printf "order: %d failed last time first, %d with no duration yet, %d slowest-first (%ds or more), then %d in glob order\n", c[0], c[1], c[2], min, c[3] }'
+    printf '%s\n' "$ORDER_TSV" | awk -F"$TAB" -v min="$ORDER_MIN_S" '{ c[$1]++ } END {
+      if (c[1] > 0) printf "order: %d failed last time first, %d with a changed or new closure next, %d with no duration yet, %d slowest-first (%ds or more), then %d in glob order\n", c[0], c[1], c[2], c[3], min, c[4]
+      else printf "order: %d failed last time first, %d with no duration yet, %d slowest-first (%ds or more), then %d in glob order\n", c[0], c[2], c[3], min, c[4] }'
   else
     echo "order: left as globbed (the ordering pass handed back the wrong number of suites)"
   fi
@@ -699,11 +866,13 @@ fi
 # Before WORK, the traps, the gate marker, the snapshots and the receipts exist: nothing below this point has happened. An incremental
 # selection printed its own reason and list above; a full one lists its first suites here.
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "dry run: ${TO_RUN} suite(s) would run (${SWEEP_KIND}); ${#SKIP[@]} skipped as live. Nothing was executed; no receipt, lock or sweep marker was written."
+  _dry_cache=""; [ "$CACHE_ON" -eq 1 ] && _dry_cache=", ${n_cached} more served from the cache"
+  echo "dry run: ${TO_RUN} suite(s) would run (${SWEEP_KIND})${_dry_cache}; ${#SKIP[@]} skipped as live. Nothing was executed; no receipt, lock or sweep marker was written."
   if [ "$SWEEP_KIND" != incremental ] && [ "$TO_RUN" -gt 0 ]; then
     printf '%s\n' "${RUN[@]}" | sed 's#.*/#             would run #' | sed -n '1,30p'
     [ "$TO_RUN" -le 30 ] || echo "             ... and $((TO_RUN - 30)) more"
   fi
+  [ -z "$CACHE_TMP" ] || rm -rf "$CACHE_TMP"
   exit 0
 fi
 
