@@ -290,14 +290,15 @@ class Graph(object):
         self.repo, self.commit = repo, commit
         self.nodes, self.text = {}, {}
         self.by_suffix, self.dir_files, self.dir_suffix = {}, {}, {}
-        self.edges, self.arms, self.invokes = {}, {}, {}
+        self.edges, self.arms, self.invokes, self.whole = {}, {}, {}, set()
         self.hints, self.hints_raw = {}, None
-        self._memo, self._everything, self._everything_sha = {}, None, None
+        self._memo, self._gmemo, self._sha = {}, {}, {}
         self._read_tree()
         self._read_blobs()
         self._index()
         self._load_hints(hints_path)
         self._scan()
+        self._condense()
 
     # -- reading ----------------------------------------------------------------------------------------------------
     def _read_tree(self):
@@ -481,11 +482,14 @@ class Graph(object):
                         found.update(n.path for n in self.by_suffix.get(base + tail, ()) if "/" in base or n.kind != "data")
         return found
 
-    def _scan_lines(self, lines):
-        found, whole = set(), False
+    def _scan_lines(self, lines, suite=False):
+        """(the nodes `lines` name, whether they enumerate the whole tree). Only a SUITE can be whole-tree: a tool that runs `git ls-files`
+        in the hub works on whatever repository it is pointed at (a fixture, in nearly every suite), and counting it would make all 500
+        suites whole-tree. A suite that points such a tool at the real repo belongs in test/closure-hints.json as always_run."""
+        keys, gkeys, whole = set(), set(), False
         for line in lines:
             dir_ok = PATH_ASSIGN_RE.search(line) is None
-            if any(rx.search(line) for rx in WHOLE_RES):
+            if suite and QUICK_WHOLE_RE.search(line) and any(rx.search(line) for rx in WHOLE_RES):
                 whole = True
             for m in TOK_RE.finditer(line):
                 raw, glob = m.group(1), m.group(2)
@@ -496,16 +500,22 @@ class Graph(object):
                     var = VAR_BEFORE_RE.search(line[:m.start()])
                     glued = var.group(1) if var else ""
                 if glob:
-                    found.update(self._glob(raw, line[:m.start()], glued))
-                found.update(self._resolve(raw, dir_ok, glued))
+                    gkeys.add((raw, line[max(0, m.start() - 40):m.start()], glued))
+                keys.add((raw, dir_ok, glued))
+        found = set()
+        for key in keys:
+            found |= self._resolve(*key)
+        for key in gkeys:
+            found |= self._glob(*key)
         if WHOLE in found:
             found.discard(WHOLE)
-            whole = True
+            whole = whole or suite
         return found, whole
 
     def _scan(self):
         for path in sorted(self.text):
             node, c_style = self.nodes[path], os.path.splitext(path)[1].lower() in C_STYLE
+            suite = node.kind == "suite"
             code, comments = [], []
             for line in self.text[path].split("\n"):
                 stripped = line.strip()
@@ -515,76 +525,83 @@ class Graph(object):
                 eager_lines, arm_lines = split_arms(code)
             else:
                 eager_lines, arm_lines = code, {}
-            found, whole = self._scan_lines(eager_lines)
+            found, whole = self._scan_lines(eager_lines, suite)
             found |= self._imports(path, code)
-            if node.kind == "suite":
+            if suite:
                 # a header comment names what the suite tests; it never makes one suite depend on another
                 found |= set(p for p in self._scan_lines(comments)[0] if self.nodes[p].kind != "suite")
+                if whole:
+                    self.whole.add(path)
             found.discard(path)
-            if whole:
-                found.add(WHOLE)
-            self.edges[path] = frozenset(found)
-            arms = {}
+            self.edges[path] = found
             for word, lines in arm_lines.items():
-                targets, arm_whole = self._scan_lines(lines)
+                targets = self._scan_lines(lines)[0]
                 targets.discard(path)
-                if arm_whole:
-                    targets.add(WHOLE)
-                arms[word] = frozenset(targets)
-            if arms:
-                self.arms[path] = arms
+                self.arms.setdefault(path, {})[word] = targets
             if path not in DISPATCHERS and path not in FORWARDERS:
                 subs = set(m.group(1) for line in code for m in INV_RE.finditer(line))
                 dynamic = any(DYN_RE.search(line) for line in code)
                 if subs or dynamic:
                     self.invokes[path] = (frozenset(subs), dynamic)
 
+    def _condense(self):
+        """Reachability for every node at once: strongly connected components, then each component's reach as one big-integer bitmask
+        (bit i = self.paths[i]). A closure is then an OR of a few masks instead of a walk of thousands of edges per suite."""
+        self.paths = sorted(self.nodes)
+        self.idx = dict((p, i) for i, p in enumerate(self.paths))
+        self.all_bits = (1 << len(self.paths)) - 1
+        adj = [sorted(self.idx[t] for t in self.edges.get(p, ())) for p in self.paths]
+        self.comp, self.reach = condense(adj)
+        self.inv_by_idx = dict((self.idx[p], v) for p, v in self.invokes.items())
+        self.inv_mask = 0
+        for i in self.inv_by_idx:
+            self.inv_mask |= 1 << i
+        self.arm_idx = dict((self.idx[d], dict((w, [self.idx[t] for t in ts]) for w, ts in arms.items())) for d, arms in self.arms.items())
+
     # -- closure ----------------------------------------------------------------------------------------------------
-    def everything(self):
-        if self._everything is None:
-            self._everything = frozenset(self.nodes)
-        return self._everything
+    def _reach(self, i):
+        return self.reach[self.comp[i]]
 
     def closure(self, suite):
+        """The closure of `suite` as a bitmask over self.paths."""
         hint = self.hints.get(suite, {})
-        if hint.get("always_run"):
-            return self.everything()
-        seen, stack = set(), [suite] + list(hint.get("extra", ()))
-        subs, dynamic, pending = set(), False, {}
-        while stack:
-            p = stack.pop()
-            if p == WHOLE:
-                return self.everything()
-            if p in seen:
-                continue
-            seen.add(p)
-            stack.extend(self.edges.get(p, ()))
-            for word, targets in self.arms.get(p, {}).items():
-                if dynamic or word in subs:
-                    stack.extend(targets)
-                else:
-                    pending.setdefault(word, set()).update(targets)
-            inv = self.invokes.get(p)
-            if inv is not None:
-                new = inv[0] - subs
-                subs |= new
-                flipped = inv[1] and not dynamic
-                dynamic = dynamic or inv[1]
-                if pending and (new or flipped):
-                    for word in (list(pending) if dynamic else [w for w in new if w in pending]):
-                        stack.extend(pending.pop(word))
-        return seen
+        if hint.get("always_run") or suite in self.whole:
+            return self.all_bits
+        bits = self._reach(self.idx[suite])
+        for extra in hint.get("extra", ()):
+            bits |= self._reach(self.idx[extra])
+        released = set()
+        while self.arm_idx:
+            subs, dynamic = set(), False
+            for i in bit_indices(bits & self.inv_mask):
+                found, dyn = self.inv_by_idx[i]
+                subs |= found
+                dynamic = dynamic or dyn
+            grew = False
+            for disp, arms in self.arm_idx.items():
+                if not (bits >> disp) & 1:
+                    continue
+                for word, targets in arms.items():
+                    if (disp, word) not in released and (dynamic or word in subs):
+                        released.add((disp, word))
+                        grew = True
+                        for t in targets:
+                            bits |= self._reach(t)
+            if not grew:
+                break
+        return bits
 
-    def closure_sha(self, paths):
-        if paths is self._everything and self._everything_sha is not None:
-            return self._everything_sha
-        h = hashlib.sha256()
-        for p in sorted(paths):
-            h.update(("%s\t%s\n" % (p, self.nodes[p].oid)).encode("utf-8", "surrogateescape"))
-        digest = h.hexdigest()
-        if paths is self._everything:
-            self._everything_sha = digest
-        return digest
+    def members(self, bits):
+        return [self.paths[i] for i in bit_indices(bits)]
+
+    def closure_sha(self, bits):
+        got = self._sha.get(bits)
+        if got is None:
+            h = hashlib.sha256()
+            for p in self.members(bits):
+                h.update(("%s\t%s\n" % (p, self.nodes[p].oid)).encode("utf-8", "surrogateescape"))
+            got = self._sha[bits] = h.hexdigest()
+        return got
 
     def hash_all(self):
         return [(s, self.closure_sha(self.closure(s))) for s in self.suites()]
