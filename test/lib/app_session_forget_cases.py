@@ -3,7 +3,7 @@
 be confirmed (a login stuck `revoking`, a relay that stays down or refuses it). Operator decision, 2.4.8.
   F1  a login a real client stores carries the session's expiry: the bind plus the relay's fixed 30-day device-token lifetime
   F2  WITHOUT the flag nothing is forgotten, whatever else is given: plain disconnect and `--device` both fail, keep the login (marked
-      `revoking`), and write no forget record -- the flag is never implied
+      `revoking`), and write no forget record (the disconnect's own app-log note is not one) -- the flag is never implied
   F3  `--forget-local` prints the full relay session id, the warning that the phone can keep connecting, and when (the stored expiry, as an
       absolute UTC time); exit 0
   F4  the stored login (file) and the device record are gone, and the relay was never told (no revoke reached it)
@@ -88,6 +88,14 @@ def app_log(sb):
         return ""
 
 
+def forget_lines(sb):
+    """The lines of $HEIMDALL_HOME/logs/app.log that record a forget (`session login forgotten locally ... the relay was NOT told ...`).
+    app_log() is NOT empty after a disconnect that forgets nothing: every `hmd app disconnect` notes itself in that log ("the explicit end of a
+    pairing", so a phone that went is never a mystery). That line is the disconnect's own, not a forget's, so "no forget record" is read here
+    and never as "no app log"."""
+    return [line for line in app_log(sb).splitlines() if "login forgotten locally" in line or "NOT told" in line]
+
+
 def private(path):
     try:
         return stat.S_IMODE(os.stat(path).st_mode) == 0o600
@@ -113,7 +121,7 @@ def scenario_flag_and_report():
         by_device = V.app(sb, {}, "disconnect", "--repo", sb.repo, "--device", did)
         check("F2", "without --forget-local nothing is forgotten (plain and --device both fail, the login stays `revoking`, no forget record)",
               plain.returncode != 0 and by_device.returncode != 0 and len(sb.logins()) == 1 and read_json(path).get("revoking") is True
-              and not forgotten_events(sb) and not app_log(sb) and "forgot" not in said(plain).lower())
+              and not forgotten_events(sb) and not forget_lines(sb) and "forgot" not in said(plain).lower())
         done = V.app(sb, {}, "disconnect", "--repo", sb.repo, "--forget-local")
         out = said(done)
         check("F3", "--forget-local prints the full session id, the warning and the absolute expiry (the stored one), and exits 0",
