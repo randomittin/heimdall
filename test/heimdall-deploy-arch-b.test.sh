@@ -31,7 +31,6 @@ CR="$ROOT/deploy/cloud-run"
 ARCHB="$CR/deploy-arch-b.sh"
 MAINT="$CR/deploy-maintainer.sh"
 DOCKERFILE="$CR/Dockerfile.maintainer"
-YAML="$CR/heimdall-maintainer-job.yaml"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }

@@ -285,6 +285,7 @@ rm -rf "$H"
 # that every seam still resolves INSIDE the sandbox. It is the cheap tripwire that
 # makes the isolation above self-verifying rather than merely intended.
 SB_LEAK=""
+_svv=""
 for _sv in HEIMDALL_LAUNCH_AGENTS_DIR LAUNCHCTL HEIMDALL_HOME HEIMDALL_REAL_HOME; do
   eval "_svv=\${$_sv:-}"
   case "$_svv" in

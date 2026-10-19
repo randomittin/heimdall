@@ -84,7 +84,10 @@ done
 
 echo "-- 4. hmd_private_tmp_rm removes only what hmd_private_tmp made --"
 mkdir -p "$T/keep/inner"; ln -s "$T/keep" "$T/link"
-( HMD_PRIVATE_TMP=""; hmd_private_tmp_rm ) ; ( HMD_PRIVATE_TMP="$T/link"; hmd_private_tmp_rm ); ( unset HMD_PRIVATE_TMP; hmd_private_tmp_rm )
+( HMD_PRIVATE_TMP=""; hmd_private_tmp_rm )
+# shellcheck disable=SC2034  # read by hmd_private_tmp_rm (test/lib/private-tmp.sh), which these subshells call
+( HMD_PRIVATE_TMP="$T/link"; hmd_private_tmp_rm )
+( unset HMD_PRIVATE_TMP; hmd_private_tmp_rm )
 if [ -d "$T/keep/inner" ] && [ -L "$T/link" ]; then ok "an empty variable, a symlink and an unset variable remove nothing"; else bad "hmd_private_tmp_rm removed something it did not make"; fi
 
 echo ""

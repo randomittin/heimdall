@@ -2227,6 +2227,7 @@ tm_repo() {
   chmod 600 "$D/.heimdall/ui/wake/$TM_CLAUDE.json"
 }
 # tm_try [connect args] -- connect --tmux against $D; sets TM_RC and TM_OUT. TM_PANE_PID is the process tmux says runs pane %7 (this shell)
+# shellcheck disable=SC2120  # connect args are optional passthrough; many calls pass none
 tm_try() {
   TM_OUT="$TMPROOT/tmux-try.out"
   : >"$TM_REC"

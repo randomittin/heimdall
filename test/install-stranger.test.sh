@@ -1131,6 +1131,7 @@ if [ -f "$INSTALLED_SH" ]; then
     export HOME="$SB" PATH="$SB/stub:${HMD_MKTEMP_SHIM_DIR:+$HMD_MKTEMP_SHIM_DIR:}/usr/bin:/bin" \
            HEIMDALL_LAUNCH_AGENTS_DIR="$SB/LaunchAgents" LAUNCHCTL="$SB/stub/launchctl" \
            HEIMDALL_DREAM_LOG="$SB/dream.log" HEIMDALL_INSTALL_SOURCE_ONLY=1
+    # shellcheck disable=SC1090  # installed tree path is chosen at runtime (INSTALLED_SH, line 1104)
     source "$INSTALLED_SH" >/dev/null 2>&1
     ensure_dream_schedule "$PROBE_TREE" )"
   if [ "$DS_STATE" = "sandboxed" ]; then

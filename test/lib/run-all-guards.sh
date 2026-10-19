@@ -119,6 +119,7 @@ hmd_test_wait_quiet() {
       prev_jobs="$JOBS"
       JOBS=$(( JOBS / 2 )); [ "$JOBS" -lt 1 ] && JOBS=1
       export HMD_TEST_REDUCED_PARALLELISM=1
+      # shellcheck disable=SC2034  # documented outputs (header lines 19-20); QUIET_GATE_OUTCOME is read by test/run-all-guards.test.sh
       QUIET_GATE_OUTCOME=timeout QUIET_GATE_WAITED_S="$waited"
       echo "quiet gate: gave up after ${waited}s (15-min load $l15 >= $threshold) -- running anyway with jobs=$JOBS (was $prev_jobs) and HMD_TEST_REDUCED_PARALLELISM=1"
       return 0
@@ -128,7 +129,7 @@ hmd_test_wait_quiet() {
 }
 
 hmd_test_orphan_guard() {
-  local repo="$1" work="$2" i leaky="" helper py out rc=0
+  local repo="$1" work="$2" i leaky="" helper py out
   ORPHAN_SURVIVORS=0
   for i in $(seq 0 $((TO_RUN - 1))); do
     [ -s "$work/$i.leaked" ] && leaky="$leaky $(basename "${RUN[$i]}")"
@@ -139,11 +140,12 @@ hmd_test_orphan_guard() {
   helper="$repo/bin/lib/hmd_ui_procs.py"
   py="$(command -v python3 2>/dev/null)"
   [ -r "$helper" ] && [ -n "$py" ] || return 0
-  out="$("$py" -I "$helper" reap --min-age 0 --timeout 3 2>&1)" || rc=$?
+  out="$("$py" -I "$helper" reap --min-age 0 --timeout 3 2>&1)" || :
   if printf '%s\n' "$out" | grep -qE '^(reaped|SURVIVED) '; then
     echo "${YEL:-}orphan guard:${OFF:-} hmd servers on a temp or deleted repo outlived the sweep:"
     printf '%s\n' "$out" | grep -E '^(reaped|SURVIVED) ' | sed 's/^/  /'
   fi
+  # shellcheck disable=SC2034  # read by test/run-all.sh (BAD count) and test/run-all-guards.test.sh, which source this file
   ORPHAN_SURVIVORS="$(printf '%s\n' "$out" | grep -c '^SURVIVED ')"
   return 0
 }
@@ -275,7 +277,12 @@ hmd_test_tmp_guard() {
   local work="$1" tab=$'\t' max_mb="${HMD_TEST_TMP_LEAK_MAX_MB:-50}" strict=0 max_b i=0 j line b e s name rest why limit_txt dirs foreign_txt
   local n_leak=0 n_over=0 sum_b=0 n_out=0 n_foreign=0 p mt kb cands s0 s1 sfx checked=0 n_out_big=0 n_new=0 n_skip=0 out_cap
   local R="${RED:-}" Y="${YEL:-}" B="${BLD:-}" O="${OFF:-}"
-  TMP_GUARD_RAN=1; TMP_FINDINGS=0; TMP_LEAK_SUITES=0; TMP_LEAK_BYTES=0; TMP_OUTSIDE_COUNT=0
+  # shellcheck disable=SC2034  # read by test/run-all.sh (receipt tmp-guard section), which sources this file
+  TMP_GUARD_RAN=1
+  TMP_FINDINGS=0
+  TMP_LEAK_SUITES=0
+  TMP_LEAK_BYTES=0
+  TMP_OUTSIDE_COUNT=0
   [ "${HMD_TEST_STRICT_TMP:-0}" = 1 ] && strict=1
   case "$max_mb" in ''|*[!0-9]*) max_mb=50 ;; esac
   max_b=$((max_mb * 1048576))
@@ -388,6 +395,7 @@ hmd_test_tmp_guard() {
   if [ -n "${SOCK_HEADROOM:-}" ]; then
     printf 'tmp sockets: %s bytes left under the per-suite temp dir for a unix socket path (limit 104; target %s; the longest socket the suites build needs %s)%s\n' "$SOCK_HEADROOM" "${SOCK_TARGET:-?}" "${SOCK_NEED:-?}" "$([ "$SOCK_HEADROOM" -lt "${SOCK_TARGET:-0}" ] && printf ' -- BELOW TARGET')" >> "$work/tmp-summary.txt"
   fi
+  # shellcheck disable=SC2034  # read by test/run-all-guards.test.sh (TMP LEFTOVERS policy checks) and the sweep receipt
   TMP_LEAK_SUITES=$n_leak; TMP_LEAK_BYTES=$sum_b; TMP_OUTSIDE_COUNT=$n_out
   TMP_FINDINGS=$((n_over + n_out_big))
   [ "$strict" -eq 1 ] && TMP_FINDINGS=$((n_over + n_out))
