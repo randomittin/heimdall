@@ -19,18 +19,28 @@ THE GRAPH (everything is read from git OBJECTS at one commit, never from the wor
             is not in `heimdall-state`):
               - a path: the token, or any suffix of it that starts at a `/` (so `$REPO/bin/x`, `"$HERE"/lib/x.sh`, `../bin/x` all find
                 bin/x), equals a tracked path or the tail of one. The most specific suffix that matches wins.
-              - a bare name matches the basename of a CODE node (`tool-x` finds bin/tool-x); a bare data name matches only a root file.
-              - a directory (the token has a `/`, or is followed by a glob character) pulls in EVERY tracked file under it. A directory
-                that is only a search path (`PATH=...`, `PYTHONPATH=...`) or an absolute system path (/usr/bin, /tmp/..) does not.
-              - Python `import x` / `from x import y` and JS `require('./x')` / `import ... from './x'` reach the module's file.
-            Comment lines count for a SUITE (its header names what it tests) but never link one suite to another, and they do NOT
-            count for code (the 2026-10-12 comment-chain incident, bin/lib/sweep-chain.sh).
+              - a bare name matches the basename of a CODE node (`tool-x` finds bin/tool-x). A PLAIN word (no - _ . : `heimdall`, `hmd`,
+                `corpus`) names a tool only in command position (`hmd init`, `exec "$dir/heimdall"`): the project's own name is in every
+                log line and usage text. A bare data name (README.md, .gitignore, VERSION) is OUR file only in a suite; in a tool it is
+                the target project's.
+              - Python `import x` / `from x import y` (also inside `python3 -c` and heredocs in shell) and JS `require('./x')` /
+                `import ... from './x'` reach the module's file.
+              - a SUITE that names a directory (a token with a `/`, written under the repo root or the test directory) takes every tracked
+                file under it into its closure: they are hashed, but what THEY reach is not followed. A glob after a path in a suite
+                (`$REPO/bin/*`) takes the directory AND follows what it reaches. A tool's directories and globs count for nothing (a hub
+                script that prints "see docs/" or copies skills/ made 94% of the suites depend on 90% of the tree, measured), neither does
+                a directory on a `PATH=` line, an absolute system path (/usr/bin) or a fixture repo's `"$d/bin"`.
+              - a tool (or run-all.sh's list of live suites) that names a suite file takes it as a leaf: only a suite RUNS another suite.
+            Comment lines and Python docstrings count for a SUITE only as FILE names (its header names what it tests): never a plain word,
+            a directory or another suite. For a tool they count for nothing (the 2026-10-12 comment-chain incident, bin/lib/sweep-chain.sh).
   dispatch  bin/heimdall routes `hmd <word>` to one arm of its top-level `case "${1:-}"`. What an arm names is followed only when the
             suite's closure invokes that word (`heimdall|hmd|$..HMD..|$..BIN.. <word>`); what the dispatcher names OUTSIDE its arms is
             always followed. bin/hmd is a pure forwarder and its own `"$@"` is not an invocation. An invocation with a non-literal
             word (`hmd "$cmd"`, `hmd "$@"`) follows every arm.
-  wildcard  a node whose code enumerates the tree depends on the WHOLE tree: `git ls-files|ls-tree|grep`, `find`/`grep -r`/`cp -r`
-            on the repo root, a glob right after the repo root variable. A glob after a path (`$REPO/bin/*`) depends on that directory.
+  wildcard  a SUITE whose code enumerates the tree depends on the WHOLE tree: `git ls-files|ls-tree|grep`, `find`/`grep -r`/`cp -r`
+            on the repo root, a glob right after the repo root variable. A tool that does (bin/heimdall-team runs `git ls-files`) works on
+            whatever repository it is pointed at, a fixture in nearly every suite, so it is not followed: a suite that points one at the
+            real repo belongs in the hints as always_run. Measured: following them made all 538 suites whole-tree.
   hints     test/closure-hints.json {"<suite>": {"extra": [paths|dirs], "always_run": bool}}: extra paths join that suite's closure
             (and what they reach); always_run makes the closure the whole tree (the suite re-runs on ANY change, and is reusable only
             on a byte-identical tree). A hint that names nothing is an error, never a silent no-op.
@@ -115,6 +125,7 @@ ESAC_RE = re.compile(r"^esac(?:\s|$)")
 ARM_RE = re.compile(r"^  ([^\s#][^()]*)\)")
 LABEL_RE = re.compile(r"[a-z][a-z0-9-]*")
 PY_IMPORT_RE = re.compile(r"^\s*(?:from\s+\.*([A-Za-z_][\w.]*)\s+import\b|import\s+([A-Za-z_][\w.]*(?:\s*,\s*[A-Za-z_][\w.]*)*))")
+VAR_OPEN_RE = re.compile(r"\$\{?$")
 PLAIN_TAIL_RE = re.compile(r"(?:^|/)[A-Za-z0-9]+$")       # a token whose last component is a plain word (no - _ .)
 # the text before a word that makes it a COMMAND: line start, ; && || | ( { [ ` $( , then/do/else/exec/time/command/env/sudo/nohup/xargs/which/type, bash -c
 CMD_BEFORE_RE = re.compile(r"(?:(?:^\s*\(?|[;&|{`!]|\$\()\s*|\b(?:then|do|else|if|elif|while|until|exec|time|command|env|sudo|nohup|xargs|which|type|bash|sh)\s+(?:-\w+\s+)*[\"']?)$")
@@ -624,7 +635,10 @@ class Graph(object):
                 cmdpos = False
                 if PLAIN_TAIL_RE.search(raw):
                     start = max(0, m.start() - 40)
-                    cmdpos = CMD_BEFORE_RE.search(("\0" if start else "") + line[start:m.start()]) is not None
+                    before = ("\0" if start else "") + line[start:m.start()]
+                    if "/" in raw:
+                        before = VAR_OPEN_RE.sub("", before)        # "$dir/heimdall": the `$` opens the variable `dir`, it is not part of a word
+                    cmdpos = CMD_BEFORE_RE.search(before) is not None
                 keys.add((raw, line_mode, glued, cmdpos))
         strong, weak = set(), set()
         for key in keys:

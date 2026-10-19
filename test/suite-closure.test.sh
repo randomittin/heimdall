@@ -141,7 +141,7 @@ build_fixture() {
 }
 build_fixture
 BASE="$(gitf rev-parse HEAD)"
-SUITES_N="$(ls "$FIX"/test/*.test.sh | wc -l | tr -d ' ')"
+SUITES_N="$(find "$FIX/test" -maxdepth 1 -name '*.test.sh' | wc -l | tr -d ' ')"
 
 BASE_TSV="$WORK/base.tsv"; MUT_TSV="$WORK/mut.tsv"
 hashes() { "$CLI" hash-all --repo "$FIX" "$@" 2>"$WORK/hashes.err"; }
