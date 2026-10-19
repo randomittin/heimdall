@@ -1195,7 +1195,7 @@ if [ "$RELEASE_ONLY" -eq 1 ]; then
   else
     # No tag yet: this run creates it at HEAD, so there is no tagged commit to grade instead and HEAD itself must be covered, as for a full ship.
     warn "tag $TAG does not exist yet — this run creates it at HEAD, so the receipt must cover HEAD itself"
-    require_full_sweep_receipt
+    require_full_sweep_receipt "" "$RO_VERSION"
     RELEASE_COMMIT="$(git rev-parse HEAD)"
   fi
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-ro.XXXXXX")" || die "mktemp failed"
@@ -1234,7 +1234,7 @@ if [ "$NPM_ONLY" -eq 1 ]; then
   step "npm-only — publishing the version already in the manifest to npm"
   NPM_ONLY_VERSION="$(read_version)"
   NPM_ONLY_TAG="v$NPM_ONLY_VERSION"
-  require_full_sweep_receipt "$NPM_ONLY_TAG"
+  require_full_sweep_receipt "$NPM_ONLY_TAG" "$NPM_ONLY_VERSION"
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-npm.XXXXXX")" || die "mktemp failed"
   trap 'rm -rf "$TMP_DIR" 2>/dev/null || true' EXIT
   export_commit_files "$RELEASE_COMMIT" "$TMP_DIR" packages
@@ -1267,7 +1267,7 @@ if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
   # for the same reason and at the same moment: an unauthenticated npm discovered at the END
   # of a ship leaves a bumped, tagged, released version that `npx runheimdall` cannot install.
   preflight_release_prereqs
-  require_full_sweep_receipt
+  require_full_sweep_receipt "" "$(compute_next "$(read_version)" "$BUMP_KIND" "$EXPLICIT_VERSION")"
   if [ "$DO_NPM" -eq 1 ]; then
     preflight_npm_prereqs
   else
