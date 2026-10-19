@@ -22,6 +22,23 @@ real history is in git:
 
 ## [Unreleased]
 
+Faster test runs. A full sweep no longer re-runs what did not change, a red sweep stops early, and a fix after a red sweep lands with one short re-run instead of a second full sweep.
+
+### Added
+- **Per-suite result cache** — `test/run-all.sh` reuses a suite's green result while the hash of its dependency closure (`bin/heimdall-suite-closure`, static and deliberately over-approximate) and a narrow salt are unchanged, for up to 7 days. Each run re-runs an audit sample (`max(20, 10%)` of reused suites, seeded from HEAD); an audited suite that fails with an unchanged closure is `CLOSURE UNSOUND`: the run goes red and the cache is purged. Reds, timeouts, live suites and flaky-under-load greens are never cached. `--cold` (or `HMD_COLD=1`) and `--no-cache` turn it off. Tests: `test/suite-closure.test.sh`, `test/suite-cache.test.sh`, `test/suite-cache-e2e.test.sh`.
+- **`run-all.sh --failed`** — re-runs the previous receipt's red suites, every suite whose closure changed, and the audit sample, then writes a full-equivalent receipt the push gate and `release/ship.sh` accept. This is how a fix lands after a red sweep.
+- **`run-all.sh --fail-fast`** — stops launching after the first red confirmed by a solo re-run and writes an `aborted` receipt that the push gate and `release/ship.sh` refuse by name.
+- Suites start failed-first, then slowest-first, so a red shows within minutes; per-suite durations are kept in the receipt (`suite_durations`).
+- On macOS the sweep keeps the machine awake (`caffeinate -i`) for its whole length; a sleeping laptop on battery had expired fixed waits mid-sweep. `HMD_NO_CAFFEINATE=1` opts out.
+
+### Changed
+- `release/ship.sh` and the push gate verify a receipt's `cache` block with `heimdall-suite-closure verify-receipt` at the receipt's own commit and refuse a mismatch; an x.y.0 release needs a cold receipt.
+- Eleven slow suites run their independent cases in parallel (e.g. quick-ask 316 s → 48 s, dashboard-producers 241 s → 45 s), every assertion kept and each shown still able to go red.
+- The docs (CLAUDE.md, agents/heimdall.md, agents/test-runner.md) describe the cache, `--failed`, `--fail-fast` and `--cold`; `agents/coder.md` and the definition of done carry the Lazy Ladder rule for tests: the falsifiability floor never moves, a new suite aims at 10 s or less and calls `bin/heimdall-<sub>` directly.
+
+### Fixed
+- The 21 shellcheck warnings waived for 2.4.8 are fixed or carry a stated reason.
+
 ## [2.4.8] - 2026-10-14 <!-- HEIMDALL:PIN:FROZEN -->
 
 The resume release. A stopped or crashed laptop client no longer unpairs the phone, and neither does Claude Code ending, restarting, resuming or sitting idle: each phone's relay login is stored outside the repo and resumed, by default with no age limit, and only an explicit disconnect, a revoke from the phone or a login the relay refuses unpairs. The push gate now grades each push against the repo being pushed, with that repo's own checks, and arms for more ways of typing a push. The SessionStart pair window sends your gh token only for a repo you ran `hmd app connect` in, and only when pairing needs it. A disk-space floor (10% free by default) stops agent spawns and test runs on a full disk. Users must re-pair phones once after upgrading. <!-- HEIMDALL:PIN:FROZEN -->

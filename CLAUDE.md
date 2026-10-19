@@ -104,8 +104,8 @@ linked co-author with an avatar.
 
 ## When the full gate runs — ONCE, immediately before the landing commit
 Test once, at the end — operator directive 2026-10-08: avoid over-testing the same
-stuff; save testing for the end. The full sweep (`bash test/run-all.sh`, 320 suites,
-~1600s) runs at exactly one moment: on the final frozen tree, immediately before
+stuff; save testing for the end. The full sweep (`bash test/run-all.sh`, ~524 suites,
+~45-60 min cold) runs at exactly one moment: on the final frozen tree, immediately before
 whichever of these comes first — the commit that lands a completed unit of work, the
 push, a demo, a `/hmd:save` checkpoint of finished work. One sweep serves all of them
 while the tree stays unedited. Not at session start, not after each file edit, not
