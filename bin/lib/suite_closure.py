@@ -260,9 +260,10 @@ def bit_indices(bits):
     return [i for i, c in enumerate(bin(bits)[:1:-1]) if c == "1"]
 
 
-def condense(adj):
+def condense(adj, leaf):
     """(component of each node, reach bitmask of each component) of the directed graph `adj` (node -> successors), iteratively (Tarjan):
-    a component is finished after every component it reaches, so its reach is its own members OR the reach of its successors."""
+    a component is finished after every component it reaches, so its reach is its own members OR the reach of its successors.
+    leaf[v] is a bitmask of nodes that belong to v's closure without being followed (weak edges)."""
     n = len(adj)
     index, low, on_stack, comp = [None] * n, [0] * n, [False] * n, [None] * n
     stack, comps, counter = [], [], 0
@@ -306,7 +307,7 @@ def condense(adj):
     for c, members in enumerate(comps):
         bits = 0
         for v in members:
-            bits |= 1 << v
+            bits |= (1 << v) | leaf[v]
         for v in members:
             for w in adj[v]:
                 if comp[w] != c:
@@ -351,7 +352,7 @@ class Graph(object):
         self.repo, self.commit = repo, commit
         self.nodes, self.text = {}, {}
         self.by_suffix, self.dir_files, self.dir_suffix = {}, {}, {}
-        self.edges, self.arms, self.invokes, self.whole = {}, {}, {}, set()
+        self.edges, self.leaves, self.arms, self.invokes, self.whole = {}, {}, {}, {}, set()
         self.hints, self.hints_raw = {}, None
         self._memo, self._gmemo, self._sha = {}, {}, {}
         self._read_tree()
@@ -600,19 +601,20 @@ class Graph(object):
                 eager_lines, arm_lines = split_arms(code)
             else:
                 eager_lines, arm_lines = code, {}
-            found, whole = self._scan_lines(eager_lines, suite)
+            found, weak, whole = self._scan_lines(eager_lines, suite)
             found |= self._imports(path, code)
             if suite:
-                # a header comment names what the suite tests; it never makes one suite depend on another
+                # a header comment names what the suite tests (files only, never a directory); it never makes one suite depend on another
                 found |= set(p for p in self._scan_lines(comments)[0] if self.nodes[p].kind != "suite")
                 if whole:
                     self.whole.add(path)
             found.discard(path)
             self.edges[path] = found
+            self.leaves[path] = weak - found
             for word, lines in arm_lines.items():
-                targets = self._scan_lines(lines)[0]
+                targets, arm_weak, _ = self._scan_lines(lines)
                 targets.discard(path)
-                self.arms.setdefault(path, {})[word] = targets
+                self.arms.setdefault(path, {})[word] = (targets, arm_weak - targets)
             if path not in DISPATCHERS and path not in FORWARDERS:
                 subs = set(m.group(1) for line in code for m in INV_RE.finditer(line))
                 dynamic = any(DYN_RE.search(line) for line in code)
@@ -626,12 +628,19 @@ class Graph(object):
         self.idx = dict((p, i) for i, p in enumerate(self.paths))
         self.all_bits = (1 << len(self.paths)) - 1
         adj = [sorted(self.idx[t] for t in self.edges.get(p, ())) for p in self.paths]
-        self.comp, self.reach = condense(adj)
+        self.comp, self.reach = condense(adj, [self.mask(self.leaves.get(p, ())) for p in self.paths])
         self.inv_by_idx = dict((self.idx[p], v) for p, v in self.invokes.items())
         self.inv_mask = 0
         for i in self.inv_by_idx:
             self.inv_mask |= 1 << i
-        self.arm_idx = dict((self.idx[d], dict((w, [self.idx[t] for t in ts]) for w, ts in arms.items())) for d, arms in self.arms.items())
+        self.arm_idx = dict((self.idx[d], dict((w, ([self.idx[t] for t in strong], self.mask(weak))) for w, (strong, weak) in arms.items()))
+                            for d, arms in self.arms.items())
+
+    def mask(self, paths):
+        bits = 0
+        for p in paths:
+            bits |= 1 << self.idx[p]
+        return bits
 
     # -- closure ----------------------------------------------------------------------------------------------------
     def _reach(self, i):
@@ -656,10 +665,11 @@ class Graph(object):
             for disp, arms in self.arm_idx.items():
                 if not (bits >> disp) & 1:
                     continue
-                for word, targets in arms.items():
+                for word, (targets, weak_bits) in arms.items():
                     if (disp, word) not in released and (dynamic or word in subs):
                         released.add((disp, word))
                         grew = True
+                        bits |= weak_bits
                         for t in targets:
                             bits |= self._reach(t)
             if not grew:
