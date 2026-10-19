@@ -744,10 +744,12 @@ echo "python3 pin: $HMD_PY_PIN_NOTE"
 
 # ── SESSION-LOGIN STORE (test harness only) ──────────────────────────────────────────────
 # Since 2.4.8 a relay client saves its session login on every bind; the default store on macOS is the
-# login Keychain. A suite that forgets to sandbox it either stalls (no keychain under a throwaway HOME,
-# 2 x 20 s per bind) or writes test logins into the operator's real Keychain. Every suite therefore
-# inherits the 0600-file store unless the caller set one explicitly; a case that tests the Keychain path
-# sets HMD_SESSION_LOGIN_STORE itself.
+# login Keychain. A suite that forgets to sandbox it writes test logins into the operator's real Keychain.
+# (Under a throwaway HOME -- `env -i HOME=...` drops this export -- bin/lib/hmd_session_login.py finds no
+# keychain by itself and uses the 0600 file, never asking macOS to store into one that is not there; that
+# once opened a "Keychain Not Found" dialog mid-sweep, 2026-10-19. The real HOME is what this export guards.)
+# Every suite therefore inherits the 0600-file store unless the caller set one explicitly; a case that
+# tests the Keychain path sets HMD_SESSION_LOGIN_STORE itself.
 export HMD_SESSION_LOGIN_STORE="${HMD_SESSION_LOGIN_STORE:-file}"
 echo "session-login store: $HMD_SESSION_LOGIN_STORE"
 

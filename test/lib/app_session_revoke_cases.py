@@ -42,13 +42,7 @@ def said(done):
 
 
 def fake_keychain(sb):
-    store = os.path.join(sb.tmp, "kc")
-    os.makedirs(store)
-    fake = os.path.join(sb.bin, "security")
-    with open(fake, "w", encoding="utf-8") as f:
-        f.write(H.FAKE_SECURITY)
-    os.chmod(fake, 0o755)
-    return store, dict(HMD_SESSION_LOGIN_STORE="keychain", FAKE_SECURITY_DIR=store, PATH=sb.bin + os.pathsep + os.environ["PATH"])
+    return H.install_fake_security(sb)
 
 
 def scenario_relay_refuses():
