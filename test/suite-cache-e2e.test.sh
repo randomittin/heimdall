@@ -318,19 +318,14 @@ eq "J7 and the receipt it amended (its sha256)" "$(rj "$(LAST "$K")" '.amended_f
 eq "J8 composed: full_equivalent, 19 cached, 20 audited (max(20, 10%) of the 39 hits), not cold" "$(rj "$(LAST "$K")" '[.full_equivalent, .cache.suites_cached, .cache.audited, .cache.cold]|join(",")')" "true,19,20,false"
 has "J9 the run says failed-first" "$OUT" "failed-first"
 cp "$(LAST "$K")" "$WORK/amend.json"
-vr "$K" "$(LAST "$K")"
-if [ "$VR_RC" = 1 ] && printf '%s' "$VR_ERR" | grep -qi 'audited' && ! printf '%s' "$VR_ERR" | grep -qiE 'closure|salt|no green entry'; then ok "J10 the amend is refused for the audit sample only: every closure, the salt and every entry check out"
-else bad "J10 the amend is refused for the audit sample only" "rc=$VR_RC $VR_ERR"; fi
-gate "$K"; eq "J11 the push gate does not take the unaudited amend" "$GRC" "2"; has "J12 and names the audit" "$GOUT" "audited"
-runit "$K"
-eq "J13 one default run (the audit sample, nothing else) makes it gate-grade" "$(ran "$K"):$RC" "$(expected_ran "$K"):0"
-vr "$K" "$(LAST "$K")"; eq "J14 that receipt verifies" "$VR_RC" "0"
-gate "$K"; eq "J15 and the gate accepts it" "$GRC" "0"
+vr "$K" "$(LAST "$K")"; eq "J10 --failed ALONE yields a receipt verify-receipt accepts: every closure, the salt, every entry and the audit sample check out" "$VR_RC" "0"
+[ "$VR_RC" = 0 ] || printf '        %s\n' "$VR_ERR" >&2
+gate "$K"; eq "J11 and the push gate takes it, with no second run" "$GRC" "0"
 setdep "$K" 04 1; cm "$K" "break the dependency of a GREEN suite (s04)"
 runit "$K" --failed
-eq "J16 --failed re-ran s04, whose closure moved, and nothing else" "$(ran "$K")" "s04"
+eq "J16 --failed re-ran s04, whose closure moved, plus the audit sample of the other 39 suites" "$(ran "$K")" "$(expected_ran "$K" s04)"
 eq "J17 and it went RED: the amend hides nothing" "$RC:$(rj "$(LAST "$K")" '[.exit_code, .full_equivalent, (.non_green_suites|join(","))]|join(",")')" "1:1,false,s04.test.sh"
-if [ "$RC" = 1 ] && [ "$(ran "$K")" = s04 ]; then mutant "--failed re-runs a green suite whose dependency broke and the run is red" yes; else mutant "--failed re-runs a green suite whose dependency broke" no "rc=$RC ran=$(ran "$K")"; fi
+if [ "$RC" = 1 ] && ran "$K" | grep -qw s04; then mutant "--failed re-runs a green suite whose dependency broke and the run is red" yes; else mutant "--failed re-runs a green suite whose dependency broke" no "rc=$RC ran=$(ran "$K")"; fi
 HEAD2="$(git -C "$K" rev-parse HEAD)"
 jq --arg h "$HEAD2" '.head_sha = $h | .amended = []' "$WORK/amend.json" > "$WORK/forged-amend.json"; vr "$K" "$WORK/forged-amend.json"
 if [ "$VR_RC" = 1 ] && printf '%s' "$VR_ERR" | grep -qi 'closure'; then mutant "a forged amend (amended:[] on a commit where a closure moved) is refused" yes; else mutant "a forged amend is refused" no "rc=$VR_RC $VR_ERR"; fi
