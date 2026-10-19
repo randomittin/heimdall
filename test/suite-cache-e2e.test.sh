@@ -183,7 +183,7 @@ gate "$F"; eq "B9 the push gate accepts it" "$GRC" "0"; has "B10 and says so" "$
 jq '.cache.entries[3].closure_sha = "'"$ZEROS"'"' "$WORK/golden.json" > "$(LAST "$F")"; gate "$F"
 if [ "$GRC" = 2 ] && printf '%s' "$GOUT" | grep -qi 'closure'; then mutant "the push gate refuses a receipt whose entry closure_sha was forged" yes; else mutant "the push gate refuses a forged closure_sha" no "rc=$GRC $GOUT"; fi
 cp "$WORK/golden.json" "$(LAST "$F")"; gate "$F"; eq "B11 the gate accepts the restored receipt again" "$GRC" "0"
-jq'.cache.entries[3].closure_sha = "'"$ZEROS"'"' "$WORK/golden.json" > "$(FULLG "$F")"; ship "$F" --no-npm
+jq --arg z "$ZEROS" '.cache.entries[3].closure_sha = $z' "$WORK/golden.json" > "$(FULLG "$F")"; ship "$F" --no-npm
 if [ "$SHRC" != 0 ] && printf '%s' "$SOUT" | grep -qi 'verify' && [ "$(bumps "$F")" = 0 ]; then mutant "release/ship.sh refuses a receipt whose entry closure_sha was forged, before bumping anything" yes
 else mutant "release/ship.sh refuses a forged closure_sha" no "rc=$SHRC bumps=$(bumps "$F") $(printf '%s' "$SOUT" | tail -c 600)"; fi
 cp "$WORK/golden.json" "$(FULLG "$F")"

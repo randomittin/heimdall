@@ -53,6 +53,9 @@ docs/superpowers/plans/
 # root-anchored on purpose: only the root examples are source, a nested one never is.
 **/.heimdall/*
 .heimdall/attestations/
+# The suite cache (test/run-all.sh + bin/lib/suite-cache.sh): one record per green suite, .heimdall/receipts/suite-cache/<suite>.json. Per-checkout runtime state, never committed. Already
+# covered by `.heimdall/*` above; named explicitly so a future un-ignore exception can never publish it.
+.heimdall/receipts/suite-cache/
 # The telemetry NDJSON event store (.heimdall/telemetry/events*.ndjson): per-
 # checkout runtime metrics, local-first, NEVER committed. Already covered by
 # `.heimdall/*` above; named explicitly so a future un-ignore exception can never

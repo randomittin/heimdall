@@ -685,7 +685,7 @@ fi
 # Decided before the order, because only the suites that will run are ordered. HIT = a reusable green: not launched, a CACHED row, counted green; every other suite keeps its place in RUN. The ON
 # switch is a full sweep of a clean, committed tree. _cache_store_green runs from the launch loop, _cache_note_result and _cache_epilogue from CLASSIFY RESULTS.
 CACHE_ON=0; CACHE_WHY=""; CACHE_DIR=""; CACHE_SALT=""; CACHE_HEAD=""; CACHE_TMP=""; CACHE_JSON=""; CACHE_COMPOSE_ERR=""
-CACHED=(); _CACHE_NEWRUN=(); UNSOUND=(); n_cached=0; CACHED_ASSERT=0; N_MISSES=0; N_AUDIT=0; N_FORCED=0; N_AUDITED_RAN=0; N_FRESH=0; CACHE_STORE_FAIL=0; n_unsound=0; AMEND_FROM=""
+CACHED=(); _CACHE_NEWRUN=(); UNSOUND=(); FULL_EQ=false; n_cached=0; CACHED_ASSERT=0; N_MISSES=0; N_AUDIT=0; N_FORCED=0; N_AUDITED_RAN=0; N_FRESH=0; CACHE_STORE_FAIL=0; n_unsound=0; AMEND_FROM=""
 _sha256_file() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1" 2>/dev/null; } | awk 'NR == 1 { print $1 }'; }
 # _cache_plan -- fills CACHED, narrows RUN/TO_RUN to the suites that must launch and returns 0; returns 1 with CACHE_WHY when the cache cannot be used (RUN is untouched then)
 _cache_plan() {
