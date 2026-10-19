@@ -115,6 +115,7 @@ ESAC_RE = re.compile(r"^esac(?:\s|$)")
 ARM_RE = re.compile(r"^  ([^\s#][^()]*)\)")
 LABEL_RE = re.compile(r"[a-z][a-z0-9-]*")
 PY_IMPORT_RE = re.compile(r"^\s*(?:from\s+\.*([A-Za-z_][\w.]*)\s+import\b|import\s+([A-Za-z_][\w.]*(?:\s*,\s*[A-Za-z_][\w.]*)*))")
+SHELL_IMPORT_RE = re.compile(r"\b(?:from|import)\s+([A-Za-z_]\w*)")
 JS_IMPORT_RE = re.compile(r"""(?:require\s*\(|\bfrom\s+|\bimport\s*\(?\s*)['"](\.{1,2}/[^'"\n]+)['"]""")
 OID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -466,16 +467,20 @@ class Graph(object):
             self.hints[suite] = {"always_run": always, "extra": sorted(set(paths))}
 
     # -- edges ------------------------------------------------------------------------------------------------------
-    def _resolve(self, raw, dir_ok, glued):
-        key = (raw, dir_ok, glued)
+    def _resolve(self, raw, mode, glued):
+        key = (raw, mode, glued)
         hit = self._memo.get(key)
         if hit is None:
-            hit = self._memo[key] = self._resolve_uncached(raw, dir_ok, glued)
+            hit = self._memo[key] = self._resolve_uncached(raw, mode, glued)
         return hit
 
-    def _resolve_uncached(self, raw, dir_ok, glued):
-        """The nodes the token `raw` names. `glued` is None, or the variable name (possibly '') whose closing quote or brace the token
-        follows: `"$REPO"/bin/x`. A file is found wherever a path suffix matches; a DIRECTORY only when it is the real one (rooted)."""
+    def _resolve_uncached(self, raw, mode, glued):
+        """(files, directory members) the token `raw` names. `glued` is None, or the variable name (possibly '') whose closing quote or brace
+        the token follows: `"$REPO"/bin/x`. mode is where it was written: "suite" (directories count), "suite-nodir" (a PATH= line of a suite:
+        a search path, not a read), "code" (a tool: a bare data name such as README.md or .gitignore is the TARGET project's, not ours) or
+        "comment" (a suite's header: a plain word such as `heimdall` or `corpus` is prose, a compound name such as `heimdall-state` is not).
+        A file is found wherever a path suffix matches; a DIRECTORY only when it is the real one (rooted)."""
+        dir_ok, bare_data, bare_plain = mode == "suite", mode != "code", mode != "comment"
         tok = raw.rstrip(".")
         pathlike = "/" in tok
         absolute = glued is None and bool(SYSTEM_ABS_RE.match(tok))
@@ -493,9 +498,13 @@ class Graph(object):
             multi = i < len(parts) - 1
             node = self.nodes.get(s)
             if node is not None:
-                files.add(node.path)
+                if multi or node.kind != "data":
+                    files.add(node.path)                    # a nested repo path, or a root-level code file (install.sh)
+                elif (rooted if pathlike else bare_data):
+                    files.add(node.path)                    # $REPO/VERSION yes, $d/VERSION no; a bare VERSION only in a suite
+            plain = not multi and re.search(r"[-_.]", s) is None
             for node in self.by_suffix.get(s, ()):
-                if multi or (node.kind != "data" and not absolute):
+                if multi or (node.kind != "data" and not absolute and (bare_plain or not plain)):
                     files.add(node.path)
             if dir_ok and rooted and not absolute and (multi or pathlike):
                 for d in self.dir_suffix.get(s, ()):
@@ -521,7 +530,7 @@ class Graph(object):
             return frozenset()
         if not d.strip("/"):
             return frozenset([WHOLE]) if ROOT_BEFORE_RE.search(before) else frozenset()
-        files, dirs = self._resolve(d, True, glued)
+        files, dirs = self._resolve(d, "suite", glued)
         return files | dirs
 
     def _imports(self, path, lines):
@@ -559,16 +568,17 @@ class Graph(object):
                         found.update(n.path for n in self.by_suffix.get(base + tail, ()) if "/" in base or n.kind != "data")
         return found
 
-    def _scan_lines(self, lines, suite=False):
-        """(strong, weak, whole) for `lines`. strong = the files they name (and, in a suite, the directories a glob enumerates): the closure
+    def _scan_lines(self, lines, mode="code"):
+        """(strong, weak, whole) for `lines` written in `mode` ("suite", "code" or "comment", see _resolve_uncached). strong = the files they name (and, in a suite, the directories a glob enumerates): the closure
         follows what these reach. weak = the directories a SUITE names: every file in them is part of the closure and is hashed, but what
         THEY reach is not followed. whole = they enumerate the whole tree. Directories and whole-tree enumeration are a SUITE's alone: a
         hub tool that prints "see docs/", copies skills/ or runs `git ls-files` works on whatever it is pointed at (a fixture, in nearly every
         suite), and counting those made 99% of the suites depend on 99% of the tree (measured). A suite that points such a tool at the real
         repo, or whose tool reads a directory the suite never names, belongs in test/closure-hints.json."""
+        suite = mode == "suite"
         keys, gkeys, whole = set(), set(), False
         for line in lines:
-            dir_ok = PATH_ASSIGN_RE.search(line) is None
+            line_mode = "suite-nodir" if suite and PATH_ASSIGN_RE.search(line) else mode
             if suite and QUICK_WHOLE_RE.search(line) and any(rx.search(line) for rx in WHOLE_RES):
                 whole = True
             for m in TOK_RE.finditer(line):
