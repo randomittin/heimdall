@@ -1922,7 +1922,7 @@ if command -v jq >/dev/null 2>&1; then
       if mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null; then
         echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})"
         # The chain anchor: ONLY a green, clean, genuinely FULL sweep. Reds, incrementals and filtered runs never touch it.
-        if [ "$SWEEP_KIND" = full ] && [ "$RECEIPT_RC" = 0 ] && [ "$RECEIPT_TREE_CLEAN" = true ]; then
+        if [ "$SWEEP_KIND" = full ] && [ "$RECEIPT_RC" = 0 ] && [ "$RECEIPT_TREE_CLEAN" = true ] && { [ "$CACHE_ON" -eq 0 ] || [ "$FULL_EQ" = true ]; }; then
           if cp "$RECEIPT_FILE" "$RECEIPT_DIR/.last-full-green.$$" 2>/dev/null && mv "$RECEIPT_DIR/.last-full-green.$$" "$RECEIPT_DIR/last-full-green.json" 2>/dev/null; then
             echo "full-green anchor: ${RECEIPT_DIR}/last-full-green.json (incremental sweeps chain to this; a release needs it)"
           else
@@ -1970,6 +1970,8 @@ if [ "$BAD" -gt 0 ]; then
   fi
   [ "$n_refused" -gt 0 ] && echo "  disk floor: ${n_refused} suite(s) were never started (REFUSED) -- see DISK FLOOR above; free space, then run the sweep again"
   [ "$n_notrun" -gt 0 ] && echo "  --fail-fast: ${n_notrun} suite(s) were never started (NOTRUN) -- this was not a sweep, and its receipt is refused as one; fix the red, then run without --fail-fast"
+  [ "$n_unsound" -gt 0 ] && echo "  CLOSURE UNSOUND: ${n_unsound} audited suite(s) failed with an unchanged closure -- see above; the suite cache was purged, so the next sweep is cold"
+  [ "$CACHE_ON" -eq 1 ] && [ "$n_unsound" -eq 0 ] && echo "  every green of this run is already in the suite cache: fix the red, commit, then re-run -- only what the fix can reach runs again (bash test/run-all.sh --failed re-runs just the red suites)"
   [ "${TMP_FINDINGS:-0}" -gt 0 ] && echo "  temp-dir leaks: ${TMP_FINDINGS} finding(s) -- see TMP LEAK above; a suite must remove what it makes (trap 'rm -rf \"\$T\"' EXIT)"
   [ -n "$EVIDENCE" ] && echo "  read it: ${EVIDENCE}/INDEX.txt"
   exit 1
@@ -1977,6 +1979,11 @@ fi
 if [ "$SWEEP_KIND" = incremental ]; then
   echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} selected suites passed (incremental: ${INC_SELECTED} of ${GLOB_COUNT}, chained to the full green at ${INC_BASE_SHA:0:12}), tree untouched."
 else
-  echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed, tree untouched."
+  if [ "$CACHE_ON" -eq 1 ]; then
+    echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed, ${n_cached} served from the suite cache, tree untouched."
+    [ "$FULL_EQ" = true ] || echo "  cache: the receipt is NOT full-equivalent (a suite has no cache record, e.g. FLAKY-UNDER-LOAD, or the cache block could not be built): the gate and release/ship.sh will not take it. Run: bash test/run-all.sh --failed"
+  else
+    echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed, tree untouched."
+  fi
 fi
 exit 0

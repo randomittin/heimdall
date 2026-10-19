@@ -959,7 +959,7 @@ preflight_release_prereqs() {
 #   not looked at at all -- receipt_covers_tag holds the rule, and "The release commit and the sweep receipt" above the reasoning. On success
 #   RELEASE_COMMIT is that commit: the one these modes ship from.
 require_full_sweep_receipt() {
-  local tag="${1:-}" home="${HEIMDALL_HOME:-$REPO_ROOT/.heimdall}" fr canon head r_sha other rc how
+  local tag="${1:-}" version="${2:-}" home="${HEIMDALL_HOME:-$REPO_ROOT/.heimdall}" fr canon head r_sha other rc how vr_out
   fr="$home/receipts/last-full-green.json"
   command -v jq >/dev/null 2>&1 || die "jq not found — the sweep receipt cannot be read, so a release cannot be authorised. Install it (brew install jq)."
   head="$(git rev-parse HEAD 2>/dev/null)" || die "not a git checkout — cannot check the sweep receipt"
@@ -973,6 +973,19 @@ require_full_sweep_receipt() {
     || die "a release requires a green FULL sweep receipt at HEAD, but $fr is not a green, clean full sweep. Run: bash test/run-all.sh"
   [ "$(jq -r '.repo // empty' "$fr")" = "$canon" ] \
     || die "a release requires a green FULL sweep receipt at HEAD, but $fr was recorded for a different repo. Run: bash test/run-all.sh"
+  # A receipt with a cache block (test/run-all.sh served some suites from its per-suite cache) counts only once bin/heimdall-suite-closure has re-derived it at the commit it graded: every closure
+  # hash, the salt, the age of every entry, the audit sample, a green entry per suite. An x.y.0 release (a minor or a major version) needs a COLD receipt: every suite ran in that sweep.
+  # The flag in the receipt is never taken on its word. A receipt without a cache block is the legacy one (every suite ran) and is judged as before.
+  if jq -e '(.cache | type) == "object"' "$fr" >/dev/null 2>&1; then
+    [ -x "$REPO_ROOT/bin/heimdall-suite-closure" ] \
+      || die "the sweep receipt $fr carries a suite-cache block and bin/heimdall-suite-closure is not here to verify it -- a receipt nothing can verify authorises nothing. Run: bash test/run-all.sh --no-cache"
+    vr_out="$("$REPO_ROOT/bin/heimdall-suite-closure" verify-receipt --repo "$REPO_ROOT" --receipt "$fr" 2>&1)" \
+      || die "the green FULL sweep receipt $fr does not verify (bin/heimdall-suite-closure verify-receipt): $(printf '%s' "$vr_out" | sed 's/^verify-receipt: //' | paste -sd';' - | sed 's/;/; /g'). A release needs a receipt that verifies. Run: bash test/run-all.sh (the cache re-runs only what changed, plus the audit sample)"
+    case "$version" in
+      *.*.0) jq -e '.cache.cold == true' "$fr" >/dev/null 2>&1 \
+               || die "a $version release (a minor or major version) needs a COLD sweep receipt -- every suite run in that sweep -- and $fr was composed from the suite cache. Run: bash test/run-all.sh --cold" ;;
+    esac
+  fi
   r_sha="$(jq -r '.head_sha // empty' "$fr")"
   if [ -n "$tag" ]; then
     rc="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}" 2>/dev/null)" \
@@ -1178,7 +1191,7 @@ if [ "$RELEASE_ONLY" -eq 1 ]; then
   if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then RO_TAG_EXISTS=1; fi
   if [ "$RO_TAG_EXISTS" -eq 1 ]; then
     # The tag exists, so the receipt must cover the commit it names -- not HEAD -- and that commit's own install.sh is what is signed and described below.
-    require_full_sweep_receipt "$TAG"
+    require_full_sweep_receipt "$TAG" "$RO_VERSION"
   else
     # No tag yet: this run creates it at HEAD, so there is no tagged commit to grade instead and HEAD itself must be covered, as for a full ship.
     warn "tag $TAG does not exist yet — this run creates it at HEAD, so the receipt must cover HEAD itself"
