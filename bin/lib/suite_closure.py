@@ -100,6 +100,7 @@ DIR_VARS = frozenset(ROOT_NAMES + ("HERE", "SELF_DIR", "SCRIPT_DIR", "TEST_DIR",
 ROOT_VARS = r"(?:" + "|".join(ROOT_NAMES) + r")"
 ROOT_REF = r'"?\$\{?' + ROOT_VARS + r'\}?"?'
 ROOT_BEFORE_RE = re.compile(ROOT_REF + r"$")
+QUICK_WHOLE_RE = re.compile(r"\b(?:git|find|grep|cp|rsync|tar|ditto)\b")
 WHOLE_RES = (
     re.compile(r"\bgit\b(?:\s+(?:-C\s+\S+|-c\s+\S+|--[\w-]+(?:=\S+)?))*\s+(?:ls-files|ls-tree|grep)\b"),
     re.compile(r"\bfind\s+(?:-[A-Za-z]+\s+)*" + ROOT_REF + r"(?=\s|$)"),
@@ -252,6 +253,66 @@ def is_comment(stripped, c_style):
     if c_style:
         return stripped.startswith(("//", "/*", "*"))
     return stripped.startswith("#") and not stripped.startswith("#!")
+
+
+def bit_indices(bits):
+    """The positions of the set bits of `bits`, ascending."""
+    return [i for i, c in enumerate(bin(bits)[:1:-1]) if c == "1"]
+
+
+def condense(adj):
+    """(component of each node, reach bitmask of each component) of the directed graph `adj` (node -> successors), iteratively (Tarjan):
+    a component is finished after every component it reaches, so its reach is its own members OR the reach of its successors."""
+    n = len(adj)
+    index, low, on_stack, comp = [None] * n, [0] * n, [False] * n, [None] * n
+    stack, comps, counter = [], [], 0
+    for root in range(n):
+        if index[root] is not None:
+            continue
+        work = [(root, 0)]
+        while work:
+            v, i = work.pop()
+            if i == 0:
+                index[v] = low[v] = counter
+                counter += 1
+                stack.append(v)
+                on_stack[v] = True
+            descended = False
+            for j in range(i, len(adj[v])):
+                w = adj[v][j]
+                if index[w] is None:
+                    work.append((v, j + 1))
+                    work.append((w, 0))
+                    descended = True
+                    break
+                if on_stack[w]:
+                    low[v] = min(low[v], index[w])
+            if descended:
+                continue
+            if low[v] == index[v]:
+                members = []
+                while True:
+                    w = stack.pop()
+                    on_stack[w] = False
+                    comp[w] = len(comps)
+                    members.append(w)
+                    if w == v:
+                        break
+                comps.append(members)
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[v])
+    reach = [0] * len(comps)
+    for c, members in enumerate(comps):
+        bits = 0
+        for v in members:
+            bits |= 1 << v
+        for v in members:
+            for w in adj[v]:
+                if comp[w] != c:
+                    bits |= reach[comp[w]]
+        reach[c] = bits
+    return comp, reach
 
 
 def split_arms(lines):
@@ -444,6 +505,13 @@ class Graph(object):
 
     def _glob(self, raw, before, glued):
         """What a glob after `raw` enumerates: the directory `raw` names (up to its last `/`), or the whole tree after the repo root variable."""
+        key = (raw, before, glued)
+        hit = self._gmemo.get(key)
+        if hit is None:
+            hit = self._gmemo[key] = self._glob_uncached(raw, before, glued)
+        return hit
+
+    def _glob_uncached(self, raw, before, glued):
         if raw.endswith("/"):
             d = raw
         elif "/" in raw:
@@ -843,7 +911,7 @@ def cmd_hash(args):
 
 def cmd_deps(args):
     graph = open_graph(args)
-    emit(sorted(graph.closure(one_suite(graph, args.suite))))
+    emit(graph.members(graph.closure(one_suite(graph, args.suite))))
     return 0
 
 
