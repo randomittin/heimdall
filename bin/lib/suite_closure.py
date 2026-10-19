@@ -467,20 +467,21 @@ class Graph(object):
             self.hints[suite] = {"always_run": always, "extra": sorted(set(paths))}
 
     # -- edges ------------------------------------------------------------------------------------------------------
-    def _resolve(self, raw, mode, glued):
-        key = (raw, mode, glued)
+    def _resolve(self, raw, mode, glued, cmdpos=False):
+        key = (raw, mode, glued, cmdpos)
         hit = self._memo.get(key)
         if hit is None:
-            hit = self._memo[key] = self._resolve_uncached(raw, mode, glued)
+            hit = self._memo[key] = self._resolve_uncached(raw, mode, glued, cmdpos)
         return hit
 
-    def _resolve_uncached(self, raw, mode, glued):
+    def _resolve_uncached(self, raw, mode, glued, cmdpos):
         """(files, directory members) the token `raw` names. `glued` is None, or the variable name (possibly '') whose closing quote or brace
         the token follows: `"$REPO"/bin/x`. mode is where it was written: "suite" (directories count), "suite-nodir" (a PATH= line of a suite:
         a search path, not a read), "code" (a tool: a bare data name such as README.md or .gitignore is the TARGET project's, not ours) or
         "comment" (a suite's header: a plain word such as `heimdall` or `corpus` is prose, a compound name such as `heimdall-state` is not).
-        A file is found wherever a path suffix matches; a DIRECTORY only when it is the real one (rooted)."""
-        dir_ok, bare_data, bare_plain = mode == "suite", mode != "code", mode != "comment"
+        A plain word (no - _ .) names a tool only in COMMAND position (`hmd init`, `exec heimdall`, `["hmd", ...]`), cmdpos: the project's own
+        name is in every log line and usage text. A file is found wherever a path suffix matches; a DIRECTORY only when it is the real one."""
+        dir_ok, bare_data, bare_plain = mode == "suite", mode != "code", mode != "comment" and cmdpos
         tok = raw.rstrip(".")
         pathlike = "/" in tok
         absolute = glued is None and bool(SYSTEM_ABS_RE.match(tok))
@@ -591,7 +592,8 @@ class Graph(object):
                     glued = var.group(1) if var else ""
                 if glob and suite:
                     gkeys.add((raw, line[max(0, m.start() - 40):m.start()], glued))
-                keys.add((raw, dir_ok and suite, glued))
+                cmdpos = PLAIN_TAIL_RE.search(raw) is not None and CMD_BEFORE_RE.search(line[max(0, m.start() - 40):m.start()]) is not None
+                keys.add((raw, line_mode, glued, cmdpos))
         strong, weak = set(), set()
         for key in keys:
             files, dirs = self._resolve(*key)
@@ -626,11 +628,11 @@ class Graph(object):
                 eager_lines, arm_lines = split_arms(code)
             else:
                 eager_lines, arm_lines = code, {}
-            found, weak, whole = self._scan_lines(eager_lines, suite)
+            found, weak, whole = self._scan_lines(eager_lines, "suite" if suite else "code")
             found |= self._imports(path, code)
             if suite:
                 # a header comment names what the suite tests (files only, never a directory); it never makes one suite depend on another
-                found |= set(p for p in self._scan_lines(comments)[0] if self.nodes[p].kind != "suite")
+                found |= set(p for p in self._scan_lines(comments, "comment")[0] if self.nodes[p].kind != "suite")
                 if whole:
                     self.whole.add(path)
             found.discard(path)
