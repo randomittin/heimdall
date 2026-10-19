@@ -529,7 +529,14 @@ class Graph(object):
         ext = os.path.splitext(path)[1].lower()
         python = ext == ".py" or (lines and lines[0].startswith("#!") and "python" in lines[0])
         for line in lines:
-            if python:
+            if not python and ext not in JS_STYLE:
+                # python embedded in shell (`python3 -c "from hmd_x import y"`, a heredoc): a module name that is a tracked .py file
+                for m in SHELL_IMPORT_RE.finditer(line):
+                    cand = m.group(1) + ".py"
+                    found.update(n.path for n in self.by_suffix.get(cand, ()) if n.kind != "data")
+                    if cand in self.nodes:
+                        found.add(cand)
+            elif python:
                 m = PY_IMPORT_RE.match(line)
                 if not m:
                     continue
@@ -554,11 +561,11 @@ class Graph(object):
 
     def _scan_lines(self, lines, suite=False):
         """(strong, weak, whole) for `lines`. strong = the files they name (and, in a suite, the directories a glob enumerates): the closure
-        follows what these reach. weak = the directories they merely name: every file in them is part of the closure and is hashed, but what
-        THEY reach is not followed (a script that prints "see docs/" or copies skills/ does not run what is in there). whole = they enumerate
-        the whole tree; only a SUITE can be whole-tree: a tool that runs `git ls-files` in the hub works on whatever repository it is pointed
-        at (a fixture, in nearly every suite), and counting it would make every suite whole-tree. A suite that points such a tool at the real
-        repo belongs in test/closure-hints.json as always_run."""
+        follows what these reach. weak = the directories a SUITE names: every file in them is part of the closure and is hashed, but what
+        THEY reach is not followed. whole = they enumerate the whole tree. Directories and whole-tree enumeration are a SUITE's alone: a
+        hub tool that prints "see docs/", copies skills/ or runs `git ls-files` works on whatever it is pointed at (a fixture, in nearly every
+        suite), and counting those made 99% of the suites depend on 99% of the tree (measured). A suite that points such a tool at the real
+        repo, or whose tool reads a directory the suite never names, belongs in test/closure-hints.json."""
         keys, gkeys, whole = set(), set(), False
         for line in lines:
             dir_ok = PATH_ASSIGN_RE.search(line) is None
@@ -572,21 +579,29 @@ class Graph(object):
                 if m.start() > 0 and line[m.start() - 1] in "\"'})":
                     var = VAR_BEFORE_RE.search(line[:m.start()])
                     glued = var.group(1) if var else ""
-                if glob:
+                if glob and suite:
                     gkeys.add((raw, line[max(0, m.start() - 40):m.start()], glued))
-                keys.add((raw, dir_ok, glued))
+                keys.add((raw, dir_ok and suite, glued))
         strong, weak = set(), set()
         for key in keys:
             files, dirs = self._resolve(*key)
             strong |= files
             weak |= dirs
         for key in gkeys:
-            (strong if suite else weak).update(self._glob(*key))
-        if WHOLE in strong or WHOLE in weak:
-            whole = whole or suite
-        strong.discard(WHOLE)
-        weak.discard(WHOLE)
+            strong.update(self._glob(*key))
+        if WHOLE in strong:
+            whole = True
+            strong.discard(WHOLE)
         return strong, weak - strong, whole
+
+    def _demote_suites(self, from_suite, strong, weak):
+        """(strong, weak) with every suite a non-suite names moved from strong to weak: only a suite RUNS another suite. A tool that names a suite in
+        its usage text, or run-all.sh's list of live suites, depends on the file, not on what that suite depends on (following it made every
+        suite depend on every other through the one suite that globs test/*.test.sh)."""
+        if from_suite:
+            return strong, weak - strong
+        demoted = set(p for p in strong if self.nodes[p].kind == "suite")
+        return strong - demoted, (weak | demoted) - (strong - demoted)
 
     def _scan(self):
         for path in sorted(self.text):
@@ -609,12 +624,13 @@ class Graph(object):
                 if whole:
                     self.whole.add(path)
             found.discard(path)
+            found, weak = self._demote_suites(suite, found, weak)
             self.edges[path] = found
-            self.leaves[path] = weak - found
+            self.leaves[path] = weak
             for word, lines in arm_lines.items():
                 targets, arm_weak, _ = self._scan_lines(lines)
                 targets.discard(path)
-                self.arms.setdefault(path, {})[word] = (targets, arm_weak - targets)
+                self.arms.setdefault(path, {})[word] = self._demote_suites(suite, targets, arm_weak)
             if path not in DISPATCHERS and path not in FORWARDERS:
                 subs = set(m.group(1) for line in code for m in INV_RE.finditer(line))
                 dynamic = any(DYN_RE.search(line) for line in code)
