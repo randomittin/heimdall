@@ -76,6 +76,11 @@
 #                                       # push gate and release/ship.sh refuse (see "Failed-first order and --fail-fast" below)
 #   test/run-all.sh --since-green       # INCREMENTAL: only the suites a diff since the last green FULL sweep can
 #                                       # affect (see "Incremental sweeps" below); escalates to a full sweep itself
+#   test/run-all.sh --cold              # ignore the suite cache: every suite runs and every green is stored; the receipt is cold (an x.y.0 release needs one)
+#   test/run-all.sh --no-cache          # leave the suite cache alone: no lookup, no store, a legacy receipt without a cache block
+#   test/run-all.sh --failed            # amend the last receipt: run its non-green suites and every suite without a valid cache entry (closure changed, new,
+#                                       # expired); the rest is served from the cache. No audit sample is drawn, so the receipt is not gate-grade until one
+#                                       # default run (which re-runs the sample) has run on that commit. See "Suite cache" below
 #   test/run-all.sh --dry-run           # print which suites WOULD run (with --since-green: the selection, its reason, or the
 #                                       # escalation) and stop: no suite, no receipt, no lock, no sweep marker
 #   HMD_TEST_NO_PY_PIN=1 test/run-all.sh   # leave python3 alone (default: pinned to the real interpreter
@@ -111,6 +116,27 @@
 # (it passed alone: FLAKY-UNDER-LOAD, as ever). The suites never started are NOTRUN: one table row, `not_run_suites` in the receipt. The receipt of a stopped run is kind=aborted (exit_code 1;
 # aborted{} says who stopped it and what it was meant to be): never the full-green anchor, and bin/heimdall-state check-quality-gates and release/ship.sh refuse it by name -- a run cut
 # short is not a sweep. Proof: test/run-all-fail-fast.test.sh.
+#
+# Suite cache. A green result of a suite is reusable while nothing it could depend on has changed, so a sweep re-runs only what a change can reach. Per suite,
+# bin/heimdall-suite-closure gives the closure hash (every tracked file the suite can read, found statically and deliberately over-approximated) and the salt (the runner's own inputs: this
+# file without its comments, the two runner libraries in test/lib, sweep-chain.sh, hook-owned-path.sh, the hints, the cache library, the engine, the tool versions); bin/lib/suite-cache.sh
+# stores and compares (.heimdall/receipts/suite-cache/<suite>.json, gitignored). A suite whose entry matches both, is under 7 days old (HMD_SUITE_CACHE_MAX_DAYS may only lower that) and was
+# recorded within the budget it would run under now is a HIT: not launched, a CACHED row, counted green. The rest are launched, changed-closure suites first, and each GREEN is stored THE MOMENT
+# it finishes -- also when the run later goes red or is stopped, so a red run no longer throws away what it had proved. Never stored: a red, a timeout, a discrepancy, unparsed counts, a suite that
+# was red under load and green only alone (FLAKY-UNDER-LOAD), a live suite; a suite that ran and was not green also forgets its older entry.
+# AUDIT. max(20, 10%) of the hits (drawn by seed from HEAD and the salt, so it is reproducible; HMD_SUITE_CACHE_AUDIT_PCT may only RAISE the 10) are re-run anyway. An audited suite that fails
+# with an unchanged closure is CLOSURE UNSOUND: its closure missed something it reads. The run is RED, the whole cache is purged (the next sweep is cold) and the suite should be pinned in
+# test/closure-hints.json ({"<suite>": {"always_run": true}}); a tracked file cannot be edited mid-sweep, so the runner names the hint and never writes it.
+# RECEIPT. kind stays full and gains cache{mode, salt, suites_fresh, suites_cached, audited, cold, oldest_entry_age_days, entries[{suite, closure_sha, finished_at}]} and full_equivalent (every
+# non-live suite is green and bound to its closure at HEAD). `bin/heimdall-suite-closure verify-receipt` re-derives all of it at the graded commit: bin/heimdall-state check-quality-gates and
+# release/ship.sh refuse a receipt that does not verify, and ship.sh wants cache.cold=true for an x.y.0 release. A run that served nothing from the cache is cold by construction, so the first
+# sweep after the salt changes (this file edited, the engine, the toolchain) is cold without a flag. A receipt without a cache block (--no-cache, a dirty tree) is the legacy one: every suite ran.
+# WHEN THE CACHE IS OFF -- always said on the `cache:` line, never silently: --no-cache; a filtered or incremental sweep (it runs what it names); uncommitted changes (a modified tracked file, or an
+# untracked one outside the hook-owned paths: the predicate of the receipt's tree_clean; a closure hash describes a commit); the closure engine, jq or the library missing or failing. Never a reason to
+# fail a sweep, always a reason to run every suite.
+# --failed is the red-iteration loop: the previous receipt's non_green_suites run whatever the cache says, plus every suite without a valid entry. The receipt records amended_from (sha256 of the
+# receipt it amends) and amended (what it re-ran). It draws no audit sample, so verify-receipt refuses it for that alone; the one default run that follows re-runs only the sample.
+# Proof: test/suite-cache-e2e.test.sh (mutation: every way a cached green can go stale or be forged must be noticed), test/suite-cache.test.sh, test/suite-closure.test.sh.
 #
 # Incremental sweeps (--since-green). The ~500-suite sweep takes ~70 min, and it used to be re-run for every small merge
 # because any new commit staled the last green receipt. Receipts now carry a kind:
@@ -168,6 +194,9 @@ case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
 SINCE_GREEN=0
 DRY_RUN=0
 FAIL_FAST=0
+COLD=0; [ "${HMD_COLD:-}" = 1 ] && COLD=1
+NO_CACHE=0
+FAILED_ONLY=0
 
 # ── SYSTEM LOAD / CORE CAPTURE (instrumentation only — never a gate) ─────────────────────
 # WHY THIS EXISTS: a real sweep went RED (6 FAIL, 8 TIMEOUT, 7410s wall clock) on a box
