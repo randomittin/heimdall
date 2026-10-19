@@ -387,6 +387,11 @@ cmd_check_quality_gates() {
       if [ -n "$r_repo" ] && [ "$r_repo" != "$sweep_repo" ]; then
         echo "GATE FAILED: sweep receipt at $receipt was recorded for a different repo ($r_repo, this checkout is $sweep_repo). Run: $hint" >&2
         failed=1
+      elif [ "$r_kind" = aborted ]; then
+        # test/run-all.sh --fail-fast writes kind=aborted when it stops before every suite ran. A run cut short is not a sweep: refused by name, ahead of the freshness and exit_code
+        # checks below, so a forged exit_code 0 cannot slide it through and the reason given is the real one.
+        echo "GATE FAILED: sweep receipt is from an ABORTED run (test/run-all.sh --fail-fast stopped it; $(jq -r '.aborted.suites_not_run // "some"' "$receipt") suite(s) never started) -- it proves nothing about this tree, whatever its exit_code says. Run: $hint" >&2
+        failed=1
       elif [ -n "$sha_stale" ]; then
         echo "GATE FAILED: sweep receipt is STALE — ${sha_stale}. Run: $hint" >&2
         failed=1

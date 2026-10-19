@@ -967,6 +967,8 @@ require_full_sweep_receipt() {
   if [ ! -f "$fr" ] || ! jq -e . "$fr" >/dev/null 2>&1; then
     die "a release requires a green FULL sweep receipt at HEAD, and there is none ($fr). Run: bash test/run-all.sh  — an incremental --since-green receipt is not enough for a release."
   fi
+  jq -e '(.kind // "full") != "aborted"' "$fr" >/dev/null 2>&1 \
+    || die "a release requires a green FULL sweep receipt at HEAD, but $fr is from an ABORTED run (test/run-all.sh --fail-fast stopped it before every suite ran) and proves nothing. Run: bash test/run-all.sh, without --fail-fast"
   jq -e '.exit_code == 0 and .tree_clean == true and ((.kind // "full") == "full")' "$fr" >/dev/null 2>&1 \
     || die "a release requires a green FULL sweep receipt at HEAD, but $fr is not a green, clean full sweep. Run: bash test/run-all.sh"
   [ "$(jq -r '.repo // empty' "$fr")" = "$canon" ] \

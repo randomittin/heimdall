@@ -72,6 +72,8 @@
 #   test/run-all.sh --timeout 300       # DEFAULT per-suite seconds (default 180); suites
 #                                       # with a measured override keep theirs if it is larger
 #   test/run-all.sh --no-retry          # do not re-run reds serially
+#   test/run-all.sh --fail-fast         # stop STARTING suites once a red is confirmed (re-run alone, as every red is); the receipt is kind=aborted, which the
+#                                       # push gate and release/ship.sh refuse (see "Failed-first order and --fail-fast" below)
 #   test/run-all.sh --since-green       # INCREMENTAL: only the suites a diff since the last green FULL sweep can
 #                                       # affect (see "Incremental sweeps" below); escalates to a full sweep itself
 #   test/run-all.sh --dry-run           # print which suites WOULD run (with --since-green: the selection, its reason, or the
@@ -100,6 +102,15 @@
 # more: suites already running finish, the rest are REFUSED -- a REFUSED row in the table, a DISK FLOOR section, `suites_refused` and `disk_floor` {reason, before, phase,
 # retries_skipped} in the receipt, the REFUSED suites in non_green_suites (the next incremental sweep carries them forward) -- and the run is RED (exit 1: a sweep cut short never
 # reads as a sweep that passed, and never becomes the full-green anchor). Sticky, so it cannot flap. Without the guard library (a fixture copy of this script) there is no recheck.
+#
+# Failed-first order and --fail-fast. A red that turns up an hour in was in the queue all along. The suites start in this order: the ones that RAN and came back non-green in the previous
+# receipt of this repo (non_green_suites minus not_run_suites: a suite that never started is not "failed"), then the ones with no recorded duration (new tests), then the slow ones, longest
+# first (suite_durations: whole seconds, merged over the previous receipt's so a run that did not start a suite keeps its last figure; under ORDER_MIN_S, 3 s, a duration is noise and keeps
+# glob order), then the rest in glob order. --fail-fast stops STARTING suites once a red is confirmed. A red is confirmed by re-running it alone, as every red is (with --jobs 1 or
+# --no-retry the run already was the solo verdict), so launching is HELD, the suites in flight finish, the red runs alone, and the sweep either stops (red for good) or resumes
+# (it passed alone: FLAKY-UNDER-LOAD, as ever). The suites never started are NOTRUN: one table row, `not_run_suites` in the receipt. The receipt of a stopped run is kind=aborted (exit_code 1;
+# aborted{} says who stopped it and what it was meant to be): never the full-green anchor, and bin/heimdall-state check-quality-gates and release/ship.sh refuse it by name -- a run cut
+# short is not a sweep. Proof: test/run-all-fail-fast.test.sh.
 #
 # Incremental sweeps (--since-green). The ~500-suite sweep takes ~70 min, and it used to be re-run for every small merge
 # because any new commit staled the last green receipt. Receipts now carry a kind:
@@ -156,6 +167,7 @@ case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
 [ "$JOBS" -lt 1 ] && JOBS=1
 SINCE_GREEN=0
 DRY_RUN=0
+FAIL_FAST=0
 
 # ── SYSTEM LOAD / CORE CAPTURE (instrumentation only — never a gate) ─────────────────────
 # WHY THIS EXISTS: a real sweep went RED (6 FAIL, 8 TIMEOUT, 7410s wall clock) on a box
@@ -221,6 +233,7 @@ while [ $# -gt 0 ]; do
     # the quiet gate (test/lib/run-all-guards.sh): wait for a settled machine, bounded, then run anyway
     --wait-quiet)   WAIT_QUIET=1; shift ;;
     --no-retry)     RETRY_REDS=0; shift ;;
+    --fail-fast)    FAIL_FAST=1; shift ;;
     --jobs)         JOBS="${2:-4}"; shift 2 ;;
     --timeout)      TIMEOUT="${2:-180}"; shift 2 ;;
     --min)          MIN_SUITES="${2:-100}"; shift 2 ;;
@@ -441,6 +454,7 @@ echo ""
 echo "${BLD}heimdall test runner${OFF}  repo=$REPO"
 echo "discovered ${BLD}${DISCOVERED}${OFF} suites   (glob test/*.test.sh -> ${GLOB_COUNT})   jobs=$JOBS timeout=${TIMEOUT}s (default; slow suites carry a measured override)"
 [ -n "$FILTER" ] && echo "filter: /$FILTER/  (floor check applies to the unfiltered glob)"
+[ "$FAIL_FAST" -eq 1 ] && echo "fail-fast: on  (no suite is started once a red is confirmed; the receipt of a stopped run is kind=aborted, which the push gate and release/ship.sh refuse)"
 echo "--------------------------------------------------------------------------------------"
 
 # Anti-vacuous guard. Checked against the UNFILTERED glob so --filter cannot defeat it.
@@ -616,6 +630,40 @@ TO_RUN=${#RUN[@]}
 if [ "$TO_RUN" -eq 0 ] && [ "$SWEEP_KIND" != incremental ]; then
   echo "${RED}${BLD}FATAL${OFF} every discovered suite was classified live — nothing would run." >&2
   exit 3
+fi
+
+# ── ORDER: failed-first, then slowest-first ────────────────────────────────────────────────
+# See "Failed-first order and --fail-fast" at the top. The previous receipt of THIS repo is read once, here (the sweep lock is held, so nobody replaces it meanwhile): it orders the suites now,
+# and the new receipt's suite_durations is merged over it at the end. A suite with no recorded duration sorts as the slowest of the rest: a new test is the likeliest to be red and the likeliest
+# surprise. Nothing is dropped or doubled -- if the pass hands back any other number of suites than TO_RUN, the order is left as globbed and says so.
+ORDER_MIN_S=3; TAB=$'\t'
+PREV_RECEIPT=""
+if command -v jq >/dev/null 2>&1 && [ -f "$RECEIPT_FILE" ] && [ "$(jq -r '.repo // empty' "$RECEIPT_FILE" 2>/dev/null)" = "$RECEIPT_REPO_CANON" ]; then
+  PREV_RECEIPT="$(jq -c . "$RECEIPT_FILE" 2>/dev/null)" || PREV_RECEIPT=""
+fi
+if [ -n "$PREV_RECEIPT" ] && [ "$TO_RUN" -gt 1 ]; then
+  ORDER_TSV="$( { printf '%s' "$PREV_RECEIPT" | jq -r '((.not_run_suites // []) as $nr | (.non_green_suites // [])[] | select(. as $s | $nr | index($s) | not) | "R\t\(.)"),
+                                                       ((.suite_durations // {}) | to_entries[] | "D\t\(.key)\t\(.value)")' 2>/dev/null
+                  i=0; for s in "${RUN[@]}"; do printf 'S\t%s\t%s\n' "$i" "${s##*/}"; i=$((i + 1)); done
+                } | awk -F"$TAB" -v min="$ORDER_MIN_S" '
+                    $1 == "R" { red[$2] = ++nred; next }
+                    $1 == "D" { dur[$2] = $3 + 0; next }
+                    $1 == "S" {
+                      name = $3
+                      if (name in red) { cls = 0; key = red[name] }
+                      else if (!(name in dur)) { cls = 1; key = 0 }
+                      else if (dur[name] >= min) { cls = 2; key = -dur[name] }
+                      else { cls = 3; key = 0 }
+                      printf "%d\t%d\t%d\n", cls, key, $2
+                    }' | sort -t "$TAB" -k1,1n -k2,2n -k3,3n )"
+  if [ "$(printf '%s\n' "$ORDER_TSV" | grep -c .)" -eq "$TO_RUN" ]; then
+    NEWRUN=()
+    for i in $(printf '%s\n' "$ORDER_TSV" | cut -f3); do NEWRUN+=("${RUN[$i]}"); done
+    RUN=("${NEWRUN[@]}")
+    printf '%s\n' "$ORDER_TSV" | awk -F"$TAB" -v min="$ORDER_MIN_S" '{ c[$1]++ } END { printf "order: %d failed last time first, %d with no duration yet, %d slowest-first (%ds or more), then %d in glob order\n", c[0], c[1], c[2], min, c[3] }'
+  else
+    echo "order: left as globbed (the ordering pass handed back the wrong number of suites)"
+  fi
 fi
 
 # ── DRY RUN: the plan, then stop ─────────────────────────────────────────────────────────
@@ -944,6 +992,60 @@ _disk_gate() {
   echo "${RED}${BLD}DISK FLOOR${OFF} -- free disk fell under the floor, so no further suite is started (before $1, $2): ${DISK_HIT_MSG}."
   return 1
 }
+# ── FAIL-FAST (--fail-fast; see "Failed-first order and --fail-fast" at the top) ────────────────
+# State: FF_TRIPPED = a red is confirmed, nothing more is started. FF_HOLD = a red waits for its solo re-run, nothing is started until it has had it. FF_PENDING = the indices of those reds.
+# ABORT_FROM = the index of the first suite never started, as REFUSED_FROM is for the disk floor; every suite from there on is NOTRUN.
+FF_TRIPPED=0; FF_HOLD=0; FF_PENDING=(); FF_TRIP_NAME=""; ABORT_FROM=$TO_RUN
+FLAKY=(); FLAKY_IDX=()
+# _solo_retry IDX -- run red suite IDX again ALONE and keep both runs' evidence: the parallel run's .rc/.out/.t0/.t1 become *.parallel. A pass is FLAKY-UNDER-LOAD. Shared by the re-run phase
+# below and by --fail-fast, which needs a red confirmed BEFORE it stops the sweep.
+_solo_retry() {
+  local i="$1"
+  cp "$WORK/$i.rc" "$WORK/$i.rc.parallel"
+  # Keep the PARALLEL-phase output too. The solo re-run overwrites $i.out, and the
+  # difference between the two runs is the whole diagnosis for a contaminated suite.
+  cp "$WORK/$i.out" "$WORK/$i.out.parallel" 2>/dev/null || true
+  # Same reason for .t0/.t1: run_one() overwrites them on the solo re-run, and a tree
+  # violation caused during the PARALLEL phase must still be attributable afterward.
+  cp "$WORK/$i.t0" "$WORK/$i.t0.parallel" 2>/dev/null || true
+  cp "$WORK/$i.t1" "$WORK/$i.t1.parallel" 2>/dev/null || true
+  # Backgrounded and waited on, not run in the foreground: bash defers a trapped signal until
+  # a FOREGROUND command returns (up to the suite's whole budget -- 900s for
+  # install-stranger), whereas `wait` is interrupted at once and the suite is still a live
+  # descendant for _abort_sweep to stop.
+  run_one "$i" "${RUN[$i]}" 9>&- &
+  wait $!
+  if [ "$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)" = "0" ]; then FLAKY+=("${RUN[$i]}"); FLAKY_IDX+=("$i"); fi
+}
+# _ff_trip IDX -- red suite IDX is red for good: no suite is started from here on. The ones running finish; every one never started is NOTRUN.
+_ff_trip() {
+  [ "$FF_TRIPPED" -eq 0 ] || return 0
+  FF_TRIPPED=1; FF_TRIP_NAME="${RUN[$1]##*/}"
+  LAUNCH_END=$next; ABORT_FROM=$next
+  echo "${RED}${BLD}FAIL-FAST${OFF} -- ${FF_TRIP_NAME} is red: no further suite is started (the ones running finish)."
+}
+# _ff_note IDX -- as suite IDX finishes (PROG_STATUS is its verdict, set by _progress_line). A red the solo re-run can still clear is queued and launching is HELD, so the re-run finds the
+# machine quiet; a red that is already final stops the sweep now: DISCREP exits 0 (it has no re-run), and with --jobs 1 the run already WAS the solo run (--no-retry opted out of re-runs).
+_ff_note() {
+  [ "$FF_TRIPPED" -eq 0 ] || return 0
+  case "$PROG_STATUS" in
+    FAIL|TIMEOUT) if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then FF_PENDING+=("$1"); FF_HOLD=1; else _ff_trip "$1"; fi ;;
+    DISCREP) _ff_trip "$1" ;;
+  esac
+}
+# _ff_confirm -- nothing else is running (launching was held): re-run the queued reds one at a time. The first still red alone stops the sweep; if every one passes alone (FLAKY-UNDER-LOAD) the
+# sweep resumes as if nothing had happened. A re-run the disk floor refuses is left to the re-run phase below, which accounts for it.
+_ff_confirm() {
+  local i k=0 n=${#FF_PENDING[@]}
+  for i in ${FF_PENDING[@]+"${FF_PENDING[@]}"}; do
+    k=$((k + 1))
+    _disk_gate "${RUN[$i]##*/}" re-run || break
+    _solo_retry "$i"
+    _progress_line retry "$k" "$n" "$i"
+    if [ "$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)" != "0" ]; then _ff_trip "$i"; break; fi
+  done
+  FF_PENDING=(); FF_HOLD=0
+}
 START=$(date +%s)
 LOAD_START="$(_load_avg)"
 LOAD_START_DISP="$(_load_disp "$LOAD_START")"
@@ -954,7 +1056,7 @@ launched=0
 NDONE=0
 LAST_PROGRESS_T=$START
 while [ "$next" -lt "$LAUNCH_END" ] || [ ${#PIDS[@]} -gt 0 ]; do
-  while [ ${#PIDS[@]} -lt "$JOBS" ] && [ "$next" -lt "$LAUNCH_END" ]; do
+  while [ ${#PIDS[@]} -lt "$JOBS" ] && [ "$next" -lt "$LAUNCH_END" ] && [ "$FF_HOLD" -eq 0 ]; do
     # the disk floor, asked before this suite starts (see "DISK FLOOR BETWEEN SUITES" above): under it, nothing more is launched and the loop only waits out what is running
     if ! _disk_gate "${RUN[$next]##*/}" launch; then LAUNCH_END=$next; REFUSED_FROM=$next; break; fi
     run_one "$next" "${RUN[$next]}" 9>&- &
@@ -976,10 +1078,13 @@ while [ "$next" -lt "$LAUNCH_END" ] || [ ${#PIDS[@]} -gt 0 ]; do
       NDONE=$((NDONE + 1))
       _progress_line run "$NDONE" "$TO_RUN" "${PIDIDX[$k]}"
       LAST_PROGRESS_T=$(date +%s)
+      [ "$FAIL_FAST" -eq 1 ] && _ff_note "${PIDIDX[$k]}"
     fi
   done
   PIDS=(${alive[@]+"${alive[@]}"})
   PIDIDX=(${alive_idx[@]+"${alive_idx[@]}"})
+  # --fail-fast: the suites in flight are done and a red is waiting for its solo re-run: the machine is quiet now, so confirm it (stop for good, or resume)
+  if [ "$FF_HOLD" -eq 1 ] && [ ${#PIDS[@]} -eq 0 ]; then _ff_confirm; LAST_PROGRESS_T=$(date +%s); fi
   _heartbeat_check
 done
 [ -t 1 ] && printf '\r%*s\r' 44 ''
@@ -987,7 +1092,7 @@ done
 # ── RE-RUN EVERY RED ALONE ────────────────────────────────────────────────────────────────
 # Parallel execution can produce a FALSE red when two suites contend for shared state. A red
 # is therefore never reported until it has been reproduced with the suite running by itself.
-FLAKY=(); FLAKY_IDX=()
+# (FLAKY and _solo_retry are defined above the launch loop: --fail-fast re-runs a red there, before it stops the sweep. A red that has a .rc.parallel was re-run already.)
 if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
   # Cheap prepass (just reads already-written tiny .rc files, same pattern CLASSIFY RESULTS
   # below already does 3x per suite) so each retry's progress line can carry a real N/total
@@ -996,32 +1101,18 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
   total_reds=0
   for i in $(_seq_to "$LAUNCH_END"); do
     rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
-    [ "$rc" != "0" ] && total_reds=$((total_reds + 1))
+    [ "$rc" != "0" ] && [ ! -f "$WORK/$i.rc.parallel" ] && total_reds=$((total_reds + 1))
   done
   retried=0
   for i in $(_seq_to "$LAUNCH_END"); do
     rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
     [ "$rc" = "0" ] && continue
+    [ -f "$WORK/$i.rc.parallel" ] && continue
     # a solo re-run is a launch too: under the disk floor the reds stay as the parallel run left them and the re-runs are counted as skipped, not silently dropped
     if ! _disk_gate "${RUN[$i]##*/}" re-run; then DISK_RETRIES_SKIPPED=$((total_reds - retried)); break; fi
     retried=$((retried + 1))
     [ -t 1 ] && printf '\r  re-running red #%d alone ...' "$retried"
-    cp "$WORK/$i.rc" "$WORK/$i.rc.parallel"
-    # Keep the PARALLEL-phase output too. The solo re-run overwrites $i.out, and the
-    # difference between the two runs is the whole diagnosis for a contaminated suite.
-    cp "$WORK/$i.out" "$WORK/$i.out.parallel" 2>/dev/null || true
-    # Same reason for .t0/.t1: run_one() overwrites them on the solo re-run, and a tree
-    # violation caused during the PARALLEL phase must still be attributable afterward.
-    cp "$WORK/$i.t0" "$WORK/$i.t0.parallel" 2>/dev/null || true
-    cp "$WORK/$i.t1" "$WORK/$i.t1.parallel" 2>/dev/null || true
-    # Backgrounded and waited on, not run in the foreground: bash defers a trapped signal until
-    # a FOREGROUND command returns (up to the suite's whole budget -- 900s for
-    # install-stranger), whereas `wait` is interrupted at once and the suite is still a live
-    # descendant for _abort_sweep to stop.
-    run_one "$i" "${RUN[$i]}" 9>&- &
-    wait $!
-    newrc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
-    if [ "$newrc" = "0" ]; then FLAKY+=("${RUN[$i]}"); FLAKY_IDX+=("$i"); fi
+    _solo_retry "$i"
     _progress_line retry "$retried" "$total_reds" "$i"
   done
   [ -t 1 ] && printf '\r%*s\r' 44 ''
@@ -1176,11 +1267,12 @@ if [ "$NEW_STASH_N" -gt 0 ]; then
 fi
 
 # ── CLASSIFY RESULTS ──────────────────────────────────────────────────────────────────────
-n_pass=0; n_fail=0; n_timeout=0; n_unparsed=0; n_discrep=0; n_refused=0
+n_pass=0; n_fail=0; n_timeout=0; n_unparsed=0; n_discrep=0; n_refused=0; n_notrun=0
 tot_p=0; tot_f=0
-FAILED=(); TIMEDOUT=(); UNPARSED=(); DISCREP=(); REFUSED=()
+FAILED=(); TIMEDOUT=(); UNPARSED=(); DISCREP=(); REFUSED=(); NOTRUN=()
 NONGREEN=()   # "idx|name|status" for every suite that did not come back green
 ROWS=()
+: > "$WORK/durations.tsv"   # "name<TAB>seconds" for every suite that ran: the receipt's suite_durations is built from it
 
 for i in $(_seq_to "$TO_RUN"); do
   suite="${RUN[$i]}"; name="$(basename "$suite")"
@@ -1191,8 +1283,11 @@ for i in $(_seq_to "$TO_RUN"); do
     ROWS+=("REFUSED|$name|-|-|-|-")
     continue
   fi
+  # a suite --fail-fast kept from starting: no result, and no verdict either -- it is not a red. They share ONE table row (below the loop), and the receipt names them (not_run_suites).
+  if [ "$i" -ge "$ABORT_FROM" ]; then n_notrun=$((n_notrun + 1)); NOTRUN+=("$name"); continue; fi
   rc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
   dur="$(cat "$WORK/$i.dur" 2>/dev/null || echo 0)"
+  printf '%s\t%s\n' "$name" "$dur" >> "$WORK/durations.tsv"
   counts="$(parse_counts "$WORK/$i.out")"
   if [ -n "$counts" ]; then
     p="${counts% *}"; f="${counts#* }"
@@ -1218,6 +1313,7 @@ for i in $(_seq_to "$TO_RUN"); do
   ROWS+=("$status|$name|$p|$f|$rc|${dur}s")
   [ "$status" = "PASS" ] || NONGREEN+=("$i|$name|$status")
 done
+[ "$n_notrun" -eq 0 ] || ROWS+=("NOTRUN|(${n_notrun} suites never started)|-|-|-|-")
 
 # ── PRESERVE THE EVIDENCE FOR EVERY NON-GREEN SUITE ───────────────────────────────────────
 # $WORK is deleted on exit, so without this every red's output self-destructs and the only
@@ -1281,6 +1377,7 @@ for row in ${ROWS[@]+"${ROWS[@]}"}; do
     TIMEOUT)  c="$RED" ;;
     DISCREP)  c="$RED" ;;
     REFUSED)  c="$RED" ;;
+    NOTRUN)   c="$YEL" ;;
     UNPARSED) c="$YEL" ;;
     *)        c="" ;;
   esac
@@ -1325,6 +1422,12 @@ if [ "$DISK_HIT" -eq 1 ]; then
   echo "  Free space first (hmd system-health, or the mac-deep-clean skill), or lower HMD_MIN_FREE_PCT / HMD_TEST_MIN_FREE_GB on purpose, then run the sweep again."
   echo ""
 fi
+if [ "$n_notrun" -gt 0 ]; then
+  echo "${RED}${BLD}FAIL-FAST${OFF} — stopped after ${FF_TRIP_NAME} was red; ${n_notrun} suite(s) were never started (NOTRUN). This run is ABORTED, not a sweep: the push gate and release/ship.sh refuse its receipt."
+  for x in "${NOTRUN[@]:0:15}"; do echo "    bash test/$x"; done
+  [ "$n_notrun" -le 15 ] || echo "    ... and $((n_notrun - 15)) more (all of them are in the receipt: not_run_suites)"
+  echo ""
+fi
 if [ "$n_unparsed" -gt 0 ]; then
   echo "${YEL}${BLD}UNPARSED (${n_unparsed})${OFF} — exit 0 but no 'N passed, M failed' line; counts UNKNOWN, not assumed pass:"
   for x in ${UNPARSED[@]+"${UNPARSED[@]}"}; do echo "  bash test/$x"; done
@@ -1353,12 +1456,14 @@ if [ -s "$WORK/tmp-section.txt" ]; then cat "$WORK/tmp-section.txt"; echo ""; fi
 
 # ── SUMMARY ───────────────────────────────────────────────────────────────────────────────
 echo "--------------------------------------------------------------------------------------"
-echo "suites: $((TO_RUN - n_refused)) ran, ${#SKIP[@]} skipped (live), ${DISCOVERED} discovered of ${GLOB_COUNT} globbed"
+echo "suites: $((TO_RUN - n_refused - n_notrun)) ran, ${#SKIP[@]} skipped (live), ${DISCOVERED} discovered of ${GLOB_COUNT} globbed"
 echo "        ${GRN}${n_pass} pass${OFF}  ${RED}${n_fail} fail${OFF}  ${RED}${n_timeout} timeout${OFF}  ${RED}${n_discrep} discrepancy${OFF}  ${YEL}${n_unparsed} unparsed${OFF}"
 echo "assertions: ${tot_p} passed, ${tot_f} failed  (parsed detail; exit codes above are authoritative)"
 echo "wall clock: ${ELAPSED}s"
 echo "load avg:   start ${LOAD_START_DISP} (1m/5m/15m) -> end ${LOAD_END_DISP} (1m/5m/15m)   cpu_count=${NCPU:-n/a}"
-if [ "$SWEEP_KIND" = incremental ]; then
+if [ "$n_notrun" -gt 0 ]; then
+  echo "${RED}sweep kind: ABORTED by --fail-fast after ${FF_TRIP_NAME} (${n_notrun} suite(s) never started; it was meant to be ${SWEEP_KIND}) -- recorded as kind=aborted, which the push gate and release/ship.sh refuse${OFF}"
+elif [ "$SWEEP_KIND" = incremental ]; then
   echo "sweep kind: incremental (chained to the full green at ${INC_BASE_SHA:0:12}; ${INC_SELECTED} of ${GLOB_COUNT} suites selected; the push gate accepts this receipt, release/ship.sh does not)"
 elif [ -n "$ESC_REASON" ]; then
   echo "sweep kind: full (escalated from --since-green: ${ESC_REASON})"
@@ -1512,6 +1617,23 @@ if command -v jq >/dev/null 2>&1; then
       '{reason:$reason, analyzed_head_sha:$head, files_changed:$files, suites_selected:$sel, suites_discovered:$disc,
         finished_epoch:$epoch, limits:{max_files:$mf, max_selected_pct:$mp, max_base_days:$md, max_base_commits:$mc}}' 2>/dev/null || echo null)"
   fi
+  # A run --fail-fast stopped before every suite ran is kind=aborted: exit_code 1, never the anchor, refused by name by the push gate and release/ship.sh. aborted{} says who stopped it and what the
+  # run was meant to be; not_run_suites names every suite that never started (these, and the disk floor's REFUSED ones), which the failed-first order must not mistake for failed ones.
+  RECEIPT_KIND="$SWEEP_KIND"; ABORTED_JSON=null
+  if [ "$n_notrun" -gt 0 ]; then
+    RECEIPT_KIND=aborted
+    ABORTED_JSON="$(jq -n --arg of "$SWEEP_KIND" --arg after "$FF_TRIP_NAME" --argjson n "$n_notrun" '{reason:"fail-fast", of_kind:$of, after_suite:$after, suites_not_run:$n}' 2>/dev/null || echo null)"
+  fi
+  NOT_RUN_JSON="$( { [ "$n_refused" -eq 0 ] || printf '%s\n' "${REFUSED[@]}"; [ "$n_notrun" -eq 0 ] || printf '%s\n' "${NOTRUN[@]}"; } | jq -R . | jq -s -c . 2>/dev/null || echo '[]')"
+  # Last known duration per suite, whole seconds (it orders the next run): this run's, merged over the previous receipt's -- a suite this run did not start keeps its last figure -- and pruned to
+  # the suites that still exist in test/.
+  PREV_DURS="$(printf '%s' "${PREV_RECEIPT:-null}" | jq -c '(.suite_durations // {}) | if type == "object" then . else {} end' 2>/dev/null || true)"
+  [ -n "$PREV_DURS" ] || PREV_DURS='{}'
+  LIVE_NAMES="$(for s in "$REPO"/test/*.test.sh; do printf '%s\n' "${s##*/}"; done | jq -R . | jq -s -c . 2>/dev/null || echo '[]')"
+  SUITE_DUR_JSON="$(jq -R -s -c --argjson prev "$PREV_DURS" --argjson live "$LIVE_NAMES" \
+    '$prev + (split("\n") | map(select(length > 0) | split("\t") | {(.[0]): (.[1] | tonumber)}) | add // {}) | with_entries(select(.key as $k | $live | index($k) != null))' \
+    "$WORK/durations.tsv" 2>/dev/null || true)"
+  [ -n "$SUITE_DUR_JSON" ] || SUITE_DUR_JSON="$PREV_DURS"
   if mkdir -p "$RECEIPT_DIR" 2>/dev/null; then
     RECEIPT_TMP="$(mktemp "$RECEIPT_DIR/.last-sweep.XXXXXX" 2>/dev/null || true)"
     if [ -n "$RECEIPT_TMP" ] && jq -n \
@@ -1536,7 +1658,8 @@ if command -v jq >/dev/null 2>&1; then
       --argjson load_end_5m "$(_load_field "$LOAD_END" 2)" \
       --argjson load_end_15m "$(_load_field "$LOAD_END" 3)" \
       --argjson cpu_count "${NCPU:-null}" \
-      --arg kind "$SWEEP_KIND" \
+      --arg kind "$RECEIPT_KIND" \
+      --argjson durs "$SUITE_DUR_JSON" --argjson not_run "$NOT_RUN_JSON" --argjson aborted "$ABORTED_JSON" \
       --arg esc_reason "$ESC_REASON" \
       --arg base_full_sha "$INC_BASE_SHA" \
       --argjson suites_run "$SUITES_RUN_JSON" \
@@ -1557,7 +1680,10 @@ if command -v jq >/dev/null 2>&1; then
        + (if $tmp_on then {tmp_leaks:$tmp_leaks, tmp_outside:$tmp_outside, tmp_root:$tmp_root, tmp_dirs:$tmp_dirs, tmp_sock:$tmp_sock} else {} end)
        + (if $disk_floor != null then {suites_refused:$suites_refused, disk_floor:$disk_floor} else {} end)
        + (if $kind == "incremental" then {base_full_sha:$base_full_sha, suites_run:$suites_run, selection:$selection} else {} end)
-       + (if $esc_reason != "" then {escalated_from:"since-green", escalation_reason:$esc_reason} else {} end)' > "$RECEIPT_TMP" 2>/dev/null; then
+       + (if $esc_reason != "" then {escalated_from:"since-green", escalation_reason:$esc_reason} else {} end)
+       + (if ($not_run | length) > 0 then {not_run_suites:$not_run} else {} end)
+       + (if $kind == "aborted" then {aborted:$aborted} else {} end)
+       + {suite_durations:$durs}' > "$RECEIPT_TMP" 2>/dev/null; then
       if mv "$RECEIPT_TMP" "$RECEIPT_FILE" 2>/dev/null; then
         echo "sweep receipt: ${RECEIPT_FILE} (exit_code=${RECEIPT_RC}, head=${RECEIPT_HEAD_SHA:0:12}, tree_clean=${RECEIPT_TREE_CLEAN})"
         # The chain anchor: ONLY a green, clean, genuinely FULL sweep. Reds, incrementals and filtered runs never touch it.
@@ -1608,6 +1734,7 @@ if [ "$BAD" -gt 0 ]; then
     echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s) not green."
   fi
   [ "$n_refused" -gt 0 ] && echo "  disk floor: ${n_refused} suite(s) were never started (REFUSED) -- see DISK FLOOR above; free space, then run the sweep again"
+  [ "$n_notrun" -gt 0 ] && echo "  --fail-fast: ${n_notrun} suite(s) were never started (NOTRUN) -- this was not a sweep, and its receipt is refused as one; fix the red, then run without --fail-fast"
   [ "${TMP_FINDINGS:-0}" -gt 0 ] && echo "  temp-dir leaks: ${TMP_FINDINGS} finding(s) -- see TMP LEAK above; a suite must remove what it makes (trap 'rm -rf \"\$T\"' EXIT)"
   [ -n "$EVIDENCE" ] && echo "  read it: ${EVIDENCE}/INDEX.txt"
   exit 1
