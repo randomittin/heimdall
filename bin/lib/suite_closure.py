@@ -954,7 +954,7 @@ def emit(lines):
     sys.stdout.buffer.flush()
 
 
-def open_graph(args):
+def open_graph(args, edges=True):
     repo = Repo(args.repo)
     if args.rev is None:
         stray = repo.dirty(hook_owned_re())
@@ -968,7 +968,7 @@ def open_graph(args):
     commit = repo.resolve(rev)
     if commit is None:
         raise Fail("%s is not a commit in %s" % (rev, repo.top))
-    return Graph(repo, commit, args.hints)
+    return Graph(repo, commit, args.hints, edges)
 
 
 def one_suite(graph, name):
@@ -996,7 +996,7 @@ def cmd_deps(args):
 
 
 def cmd_salt(args):
-    emit([open_graph(args).salt()])
+    emit([open_graph(args, edges=False).salt()])
     return 0
 
 

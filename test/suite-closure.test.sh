@@ -190,8 +190,8 @@ has "B21 --help names every sub-command" "$("$CLI" --help 2>&1)" "verify-receipt
 
 # ── C. mutation proof ────────────────────────────────────────────────────────────────────────────────────────────────
 echo "── C. mutation proof: each dependency edited -> the closure hash changes; unrelated edits -> nothing changes"
-mutate() { # FILE byte|comment -- one byte appended, or a comment-only line appended (hash is content, not semantics)
-  case "$2" in byte) printf 'x' >> "$FIX/$1" ;; comment) printf '# note\n' >> "$FIX/$1" ;; esac
+mutate() { # FILE byte|comment|ws -- one byte appended, a comment-only line appended (hash is content, not semantics), or one newline (JSON stays valid)
+  case "$2" in byte) printf 'x' >> "$FIX/$1" ;; comment) printf '# note\n' >> "$FIX/$1" ;; ws) printf '\n' >> "$FIX/$1" ;; esac
 }
 PROBE_OK=1
 probe() { # FILE HOW -- commit the edit, hash every suite, put the repo back on the base commit
@@ -274,7 +274,7 @@ salt_kill() { # LABEL FILE HOW
 }
 salt_kill "E3 salt moves with test/run-all.sh" test/run-all.sh byte
 salt_kill "E4 salt moves with a test/lib file" test/lib/helper.sh byte
-salt_kill "E5 salt moves with the hints file" test/closure-hints.json comment
+salt_kill "E5 salt moves with the hints file (a JSON-valid whitespace edit)" test/closure-hints.json ws
 salt_after unrelated/noise.txt byte
 eq "E6 salt does not move with an unrelated file" "$SALT_NOW" "$SALT0"
 mk bin/lib/suite-cache.sh '#!/usr/bin/env bash' 'suite_cache_lookup() { :; }'
