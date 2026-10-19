@@ -54,7 +54,7 @@ If multiple match, prefer the one with existing test files. If none match, ask t
 
 ## After Test Run
 
-If the FULL sweep passes (a scoped run of your own files did not test the tree and must not clear the flag):
+If the FULL-EQUIVALENT sweep passes — the default cached `bash test/run-all.sh` (suites run fresh or served from the verified per-suite cache) or a `--failed` amend; a cold `--cold` run is not needed for this, and a scoped run of your own files did not test the tree and must not clear the flag:
 ```bash
 heimdall-state mark-clean
 ```
@@ -63,6 +63,7 @@ If tests fail:
 - Report which tests failed and why
 - Provide specific error messages and stack traces
 - Suggest fixes if the cause is clear
+- Do not re-run the whole sweep to confirm a fix: once it is committed, `bash test/run-all.sh --failed` re-runs the reds, every suite the fix reached and the audit sample, and composes a gate-grade receipt
 
 ## Code Quality — Zero Tolerance
 

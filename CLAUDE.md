@@ -154,18 +154,46 @@ verdict to a state of the code that never existed.
   check` shows where you stand. Proof: `test/disk-floor.test.sh`.
 - **Start it only when no follow-up fix is still possible.** A sweep begun while a
   reviewer, verifier or agent can still hand back a change is spent the moment that
-  change lands, and a cancelled sweep costs the same half hour as a finished one.
+  change lands: its receipt is stale and every suite that change reaches runs again.
 - **Batch before you sweep (operator directive 2026-10-11).** Collect every pending
   agent result and merge them ALL, then run ONE sweep. Never merge anything between a
   green sweep and its push. If new work arrives after a sweep started, queue it for
   the next batch instead of merging. A failing suite gets fixed, and the fix rides the
-  next batch. Use the incremental sweep (`run-all.sh --since-green`, being added) for
-  small follow-up batches and the full sweep before a release. Never start a second
-  sweep while one runs. Measured 2026-10-11: ~9 full sweeps (~70 min each) in one day
-  — merging agent fixes one at a time staled the last green receipt every time, two
-  sweeps overlapped, one wait sat for hours on an absolute load threshold, and whole
-  sweeps were re-run to tell load flakes from real failures (re-run the one failing
-  suite solo instead).
+  next batch (`--failed`, below); a small follow-up batch costs what it reaches, since the
+  sweep is cached (below). Never start a second sweep while one runs. Measured 2026-10-11:
+  ~9 full sweeps (~70 min each) in one day — merging agent fixes one at a time staled the
+  last green receipt every time, two sweeps overlapped, one wait sat for hours on an
+  absolute load threshold, and whole sweeps were re-run to tell load flakes from real
+  failures (re-run the one failing suite solo instead).
+- **The sweep is cached: it re-runs what a change can reach (2026-10-20).** `bash
+  test/run-all.sh` serves a suite from `.heimdall/receipts/suite-cache/` (a `CACHED` row,
+  counted green) while its closure hash (every tracked file it can read, found statically
+  by `bin/heimdall-suite-closure`) and the runner salt (`run-all.sh` minus comments, its
+  guard libs, the engine, tool versions) are unchanged and the entry is under 7 days old.
+  max(20, 10%) of the hits re-run anyway (seeded by HEAD and the salt); an audited suite
+  that fails with an unchanged closure is `CLOSURE UNSOUND`: red run, cache purged. Each
+  green is stored the moment it finishes, so a red, stopped or cancelled run keeps what it
+  proved. The receipt stays `kind:"full"` plus a `cache` block and `full_equivalent`; the
+  push gate and `release/ship.sh` re-derive it (`bin/heimdall-suite-closure
+  verify-receipt`), never on the flag's word. `--cold` (or `HMD_COLD=1`) ignores the cache
+  and runs every suite: an x.y.0 release needs that cold receipt, a patch release takes a
+  cache-composed one, and the first sweep after a runner change is cold by itself.
+  `--no-cache` skips it (legacy receipt). It is also off, said on the `cache:` line, for a
+  dirty tree, `--filter` and an incremental `--since-green` (the older textual selection,
+  still there; the cache is what follow-up batches use).
+- **After a red: `--failed`, never a second full sweep.** Fix, commit (a dirty tree turns
+  the cache off and `--failed` refuses, exit 2), then `bash test/run-all.sh --failed`: it
+  re-runs the last receipt's non-green suites, every suite whose closure the fix moved and
+  the audit sample, serves the rest from the cache, and composes a gate-grade receipt
+  (`amended_from`, `amended`). A test-only fix re-runs that suite and the sample, not the
+  sweep. Not combinable with `--cold`, `--no-cache`, `--since-green` or `--filter`.
+- **Order, `--fail-fast`, keep-awake.** Suites start failed-last-time first, then
+  changed-closure, then new, then slowest-first. `--fail-fast` stops starting suites once
+  a red is confirmed by its solo re-run, so a red shows in minutes, not at the end; a run
+  it stops early writes `kind:"aborted"`, which the push gate and `release/ship.sh` refuse
+  by name, so after one: fix, commit, `--failed`. On macOS the runner holds `caffeinate -i
+  -w <its pid>` for the whole sweep, so the machine cannot idle to sleep mid-run
+  (`HMD_NO_CAFFEINATE=1` opts out).
 - **Per-suite runs: your own suite only, once.** An agent runs
   `bash test/<one>.test.sh` for ONLY the test file(s) it adds or edits, ONCE, after
   ALL its changes are written — no neighbouring or "regression" suites, no baseline

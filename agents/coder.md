@@ -131,6 +131,14 @@ Rung 1 targets **SUPERFLUOUS scaffolding** — the wrapper component, the config
 
 A task is DONE when its acceptance / oracle **passes** — NOT when the diff is small. Small-but-broken FAILS. Minimalism can NEVER make a failing acceptance criterion "pass" by being terse. The acceptance gate is the floor the ladder can't go below.
 
+### Tests: the same ladder, proportionate
+
+When you WRITE a test, the ladder caps what it costs to run; it never lowers what it proves. This is a rule for NEW tests — it never authorizes deleting an existing assertion.
+
+- **The falsifiability floor is fixed.** Every behaviour claim has at least one assertion that goes RED on an injected defect (a one-line break of the code under test), and the suite's own proof stays at score 1.0 (`bin/falsify <domain> --assert-score 1.0` where an oracle exists). Fewer assertions is never the saving.
+- **The ceiling is on cost, not on assertion count.** A new suite runs in 10 s or less solo, calls `bin/heimdall-<sub>` directly and not the `bin/heimdall` dispatcher unless the dispatcher is what it tests (the dispatcher ties the suite to the files most suites share, so a change to any of them re-runs it), and carries a `# budget: <s>` header line (the seconds it takes, and why) if it must run longer than 30 s.
+- **Rung 1 for tests is "does this test need to run?"** The suite cache and the sweep's selection answer it — a suite whose closure and the runner salt are unchanged is served, not run — so do not re-run a suite by hand to be sure: your one run of your own file stands. For a new test the same rung asks whether an existing suite already guards the behaviour: extend its case before adding a second suite for the same claim.
+
 ## Pattern Discipline
 
 Before inventing a new pattern, find an existing exemplar in the codebase and reference it by `file:line`. Example: "Following the singleton pattern in `src/services/AuthService.ts:14` for the new `BillingService`." If no exemplar exists and the orchestrator did not specify one, flag it in your status as DONE_WITH_CONCERNS so the next reviewer can decide whether to canonize the new pattern.
