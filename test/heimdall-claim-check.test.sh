@@ -97,6 +97,22 @@ run() {
 
 stderr_has() { grep -qF -- "$1" "$SANDBOX/stderr.log" 2>/dev/null; }
 
+# PRE-LAUNCH of section [12]'s two slow calls. [12] runs `heimdall-deadcode --why heimdall-metric-hook` twice -- once as its own precondition and
+# once inside the tool under test -- and each is a full reachability scan of the repo (~7-10 s, nearly all of this file's ~20 s). Neither depends on
+# anything [1]-[11] do, so both start NOW, side by side, and [12] reads what they wrote. The claim run gets a private dir (the foreground runs own
+# $SANDBOX/stdin.json, stdout.log and stderr.log) and the same environment [12] ran in: no sweep pattern override is set at this point. The
+# assertion and the precondition are the ones that were there; only WHEN the two commands ran moved.
+DEADCODE="$ROOT/bin/heimdall-deadcode"
+LIVE_DIR="$SANDBOX/live-claim"
+mkdir -p "$LIVE_DIR"
+if [ -x "$DEADCODE" ]; then
+  ( "$DEADCODE" --why heimdall-metric-hook >/dev/null 2>&1; echo "$?" >"$LIVE_DIR/precondition.rc" ) &
+  PID_LIVE_PRE=$!
+fi
+jq -cn --arg m 'Tool `bin/heimdall-metric-hook` has landed and is wired into hooks.json.' '{session_id:"t", last_assistant_message:$m}' >"$LIVE_DIR/stdin.json"
+"$BIN" --repo "$ROOT" <"$LIVE_DIR/stdin.json" >"$LIVE_DIR/stdout.log" 2>"$LIVE_DIR/stderr.log" &
+PID_LIVE_RUN=$!
+
 echo "[1] false 'sweep is running' claim (no such process) -> WARNS, still exits 0"
 export HEIMDALL_CLAIM_CHECK_SWEEP_PATTERN="$NO_SWEEP_PATTERN"
 run "The sweep is running now."
@@ -220,19 +236,20 @@ else
 fi
 
 echo "[12] 'landed'/'is wired' claim naming a real, LIVE bin/ tool -> SILENT"
-DEADCODE="$ROOT/bin/heimdall-deadcode"
+# (the precondition scan and the claim run were started in the PRE-LAUNCH block above)
 LIVE_PRECONDITION=1
 if [ ! -x "$DEADCODE" ]; then
   LIVE_PRECONDITION=0
-elif ! "$DEADCODE" --why heimdall-metric-hook >/dev/null 2>&1; then
-  LIVE_PRECONDITION=0
+else
+  wait "$PID_LIVE_PRE"
+  [ "$(cat "$LIVE_DIR/precondition.rc" 2>/dev/null || echo 1)" -eq 0 ] || LIVE_PRECONDITION=0
 fi
 if [ "$LIVE_PRECONDITION" -eq 1 ]; then
-  run 'Tool `bin/heimdall-metric-hook` has landed and is wired into hooks.json.'
-  if [ ! -s "$SANDBOX/stderr.log" ]; then
+  wait "$PID_LIVE_RUN"
+  if [ ! -s "$LIVE_DIR/stderr.log" ]; then
     ok "claim naming a real, live bin/ tool produces no warning"
   else
-    bad "expected silence; got: $(cat "$SANDBOX/stderr.log")"
+    bad "expected silence; got: $(cat "$LIVE_DIR/stderr.log")"
   fi
 else
   bad "precondition failed: 'heimdall-deadcode --why heimdall-metric-hook' did not report LIVE -- cannot exercise the true-claim path"
