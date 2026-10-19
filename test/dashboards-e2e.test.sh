@@ -32,9 +32,64 @@ for tool in python3 git ps; do
   if ! command -v "$tool" >/dev/null 2>&1; then printf 'FATAL: required tool missing: %s\n' "$tool" >&2; printf '\n0 passed, 1 failed\n'; exit 1; fi
 done
 
-OUT="$(mktemp)"
-trap 'rm -f "$OUT"' EXIT
-python3 "$SCENARIO" "$REPO/bin/heimdall-relay-client" >"$OUT" 2>&1 </dev/null
+TMPROOT="$(mktemp -d)"
+trap 'rm -rf "$TMPROOT"' EXIT
+
+# The main scenario and the mutant runs below are independent of one another: every scenario run builds a temp tree of its own (HOME,
+# HEIMDALL_HOME, TMPDIR, repo, its own fake relay and client on ports the OS hands out) and finds its processes by that tree's unique repo path,
+# and each mutant has its own copy of bin/ and sentinels/. So all of them start now and run at once -- the mutants only ever needed step 3 (or
+# 3f) and ~11 s, the main scenario ~48 s, one after the other that was all of this suite's time -- and the report below is in the old order:
+# the main scenario's lines, then each mutant as declared. A background job cannot add to PASS / FAIL itself, so a mutant's verdict is two lines
+# in $TMPROOT/verdict.N (ok|bad, then the message): a job that left none is a failure, never a skip.
+OUT="$TMPROOT/main.out"
+python3 "$SCENARIO" "$REPO/bin/heimdall-relay-client" >"$OUT" 2>&1 </dev/null &
+MAIN_PID=$!
+
+# The suite must be able to go red: a copy of bin/ and sentinels/ with ONE defect, run only as far as step 3 (or the step named last), must
+# fail the named check (the scenario honours DASH_E2E_STOP_AFTER=3 and =3f for exactly this).
+run_mutant() {
+  local n="$1" label="$2" file="$3" old="$4" new="$5" want="$6" stop="${7:-3}" copy="$TMPROOT/m-$1" verdict="$TMPROOT/verdict.$1" res
+  mkdir -p "$copy"
+  cp -R "$REPO/bin" "$REPO/sentinels" "$copy/"
+  if ! python3 - "$copy/$file" "$old" "$new" <<'PYEOF'
+import sys
+path, old, new = sys.argv[1:4]
+text = open(path, encoding="utf-8").read()
+if text.count(old) != 1:
+    sys.exit("mutation target found %d times: %r" % (text.count(old), old[:60]))
+open(path, "w", encoding="utf-8").write(text.replace(old, new))
+PYEOF
+  then
+    printf 'bad\n%s\n' "mutant [$label]: could not be applied (the code it mutates moved)" >"$verdict"; return
+  fi
+  res="$(DASH_E2E_STOP_AFTER="$stop" python3 "$SCENARIO" "$copy/bin/heimdall-relay-client" 2>&1 </dev/null)"
+  if printf '%s\n' "$res" | grep -q "^  FAIL $want"; then
+    printf 'ok\n%s\n' "mutant [$label] makes check $want fail" >"$verdict"
+  else
+    printf 'bad\n%s\n' "mutant [$label] was NOT caught by $want" >"$verdict"
+  fi
+}
+MUTANT_COUNT=0
+MUTANT_PIDS=()
+MUTANT_LABELS=()
+mutant() {
+  MUTANT_COUNT=$((MUTANT_COUNT + 1))
+  MUTANT_LABELS+=("$1")
+  run_mutant "$MUTANT_COUNT" "$@" &
+  MUTANT_PIDS+=("$!")
+}
+mutant "the state cache never tells the host" sentinels/hmd-ui.py \
+  '        observe_dash(self._dash, state)' '        _ = self._dash' "3b\."
+mutant "the loop is started without --parent" bin/lib/dashboard_host.py \
+  '"run", "--parent", str(os.getpid())]' '"run"]' "3c\."
+mutant "a same-device device_bound forgets the caps again" bin/heimdall-relay-client \
+  $'                if device_pub == self.device_pub:\n' \
+  $'                if device_pub == self.device_pub:\n                    self._adopt_device_caps(None)\n' "3d\." 3f
+mutant "a refused foreign device_bound strips the paired phone's caps" bin/heimdall-relay-client \
+  $'                emit({"event": "error",\n                      "detail": "device_bound device_pubkey differs from the already latched "\n' \
+  $'                self._adopt_device_caps(None)\n                emit({"event": "error",\n                      "detail": "device_bound device_pubkey differs from the already latched "\n' "3e\." 3f
+
+wait "$MAIN_PID"
 RC=$?
 cat "$OUT"
 PASS="$(grep -c '^  ok   ' "$OUT" || true)"
@@ -48,42 +103,16 @@ if [ "$PASS" -lt 25 ]; then
   printf '  FAIL the scenario ran fewer than 25 checks (%s): it did not get through\n' "$PASS"
 fi
 
-# The suite must be able to go red: a copy of bin/ and sentinels/ with ONE defect, run only as far as step 3 (or the step named last), must
-# fail the named check (the scenario honours DASH_E2E_STOP_AFTER=3 and =3f for exactly this).
 echo "== mutants: the wiring that starts the loop, and the rule that keeps the phone's caps, are what make the named check pass =="
-mutant() {
-  local label="$1" file="$2" old="$3" new="$4" want="$5" stop="${6:-3}" copy res
-  copy="$(mktemp -d)"
-  cp -R "$REPO/bin" "$REPO/sentinels" "$copy/"
-  if ! python3 - "$copy/$file" "$old" "$new" <<'PYEOF'
-import sys
-path, old, new = sys.argv[1:4]
-text = open(path, encoding="utf-8").read()
-if text.count(old) != 1:
-    sys.exit("mutation target found %d times: %r" % (text.count(old), old[:60]))
-open(path, "w", encoding="utf-8").write(text.replace(old, new))
-PYEOF
-  then
-    FAIL=$((FAIL + 1)); printf '  FAIL mutant [%s]: could not be applied (the code it mutates moved)\n' "$label"; rm -rf "$copy"; return
+for pid in "${MUTANT_PIDS[@]}"; do wait "$pid"; done
+for ((n = 1; n <= MUTANT_COUNT; n++)); do
+  if [ ! -s "$TMPROOT/verdict.$n" ]; then
+    FAIL=$((FAIL + 1)); printf '  FAIL mutant [%s] left no verdict (its job died before it could write one)\n' "${MUTANT_LABELS[$((n - 1))]}"
+    continue
   fi
-  res="$(DASH_E2E_STOP_AFTER="$stop" python3 "$SCENARIO" "$copy/bin/heimdall-relay-client" 2>&1 </dev/null)"
-  if printf '%s\n' "$res" | grep -q "^  FAIL $want"; then
-    PASS=$((PASS + 1)); printf '  ok   mutant [%s] makes check %s fail\n' "$label" "$want"
-  else
-    FAIL=$((FAIL + 1)); printf '  FAIL mutant [%s] was NOT caught by %s\n' "$label" "$want"
-  fi
-  rm -rf "$copy"
-}
-mutant "the state cache never tells the host" sentinels/hmd-ui.py \
-  '        observe_dash(self._dash, state)' '        _ = self._dash' "3b\."
-mutant "the loop is started without --parent" bin/lib/dashboard_host.py \
-  '"run", "--parent", str(os.getpid())]' '"run"]' "3c\."
-mutant "a same-device device_bound forgets the caps again" bin/heimdall-relay-client \
-  $'                if device_pub == self.device_pub:\n' \
-  $'                if device_pub == self.device_pub:\n                    self._adopt_device_caps(None)\n' "3d\." 3f
-mutant "a refused foreign device_bound strips the paired phone's caps" bin/heimdall-relay-client \
-  $'                emit({"event": "error",\n                      "detail": "device_bound device_pubkey differs from the already latched "\n' \
-  $'                self._adopt_device_caps(None)\n                emit({"event": "error",\n                      "detail": "device_bound device_pubkey differs from the already latched "\n' "3e\." 3f
+  { IFS= read -r kind; IFS= read -r message; } <"$TMPROOT/verdict.$n"
+  if [ "$kind" = ok ]; then PASS=$((PASS + 1)); printf '  ok   %s\n' "$message"; else FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$message"; fi
+done
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
