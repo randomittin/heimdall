@@ -298,6 +298,16 @@ BATCH_RULE = ("sequencing rule for the orchestrator: integrate every pending del
               "it names no PR merge and no push, and publishing stays a separate step behind the pre-push quality gates and the operator's own push")
 
 ALLOW = [
+    A("bin/lib/hmd_ci_guard.py", "gh-release", "gh workflow run (it dispatches the workflow again)", "DOC",
+      "the CI waste guard DENIES this form (bin/lib/hmd_ci_guard.py, run first in the Bash PreToolUse hook): text describing or refusing a CI re-run, it runs nothing"),
+    A("bin/lib/hmd_ci_guard.py", "gh-release", "gh api whose endpoint ends in /rerun", "DOC",
+      "the CI waste guard DENIES this form (bin/lib/hmd_ci_guard.py, run first in the Bash PreToolUse hook): text describing or refusing a CI re-run, it runs nothing"),
+    A("bin/lib/hmd_ci_guard.py", "gh-release", 'return R_FLAKY % "gh workflow run"', "HINT",
+      "the CI waste guard DENIES this form (bin/lib/hmd_ci_guard.py, run first in the Bash PreToolUse hook): text describing or refusing a CI re-run, it runs nothing"),
+    A("agents/coder.md", "gh-release", "**Bash CI re-rolls**", "DOC",
+      "the CI waste guard DENIES this form (bin/lib/hmd_ci_guard.py, run first in the Bash PreToolUse hook): text describing or refusing a CI re-run, it runs nothing"),
+    A("CLAUDE.md", "gh-release", "`gh workflow run`, and a `gh api` POST", "DOC",
+      "the CI waste guard DENIES this form (bin/lib/hmd_ci_guard.py, run first in the Bash PreToolUse hook): text describing or refusing a CI re-run, it runs nothing"),
     # ── instruction text that tells an agent to ship, release or deploy ──────────────────────────────────────
     # HUMAN-REQUESTED is for a row that only fires when the user asks for that action. KNOWN-GAP is for text that
     # releases or deploys with no human-confirmation step in the text itself, and it is EMPTY on purpose: the nine
