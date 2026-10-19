@@ -5,7 +5,7 @@
 # unchanged (and that is under 7 days old, and fits the budget it would run under now) is served from the cache instead of launched; a seeded sample of those
 # hits is re-run anyway (the audit) and a sample suite that fails with an unchanged closure is CLOSURE UNSOUND: the run is red and the whole cache is purged.
 # `--cold` ignores the cache, `--no-cache` never touches it, `--failed` runs the previous receipt's non-green suites plus every suite without a valid cache
-# entry and composes the receipt from the rest. The receipt keeps kind=full and gains a `cache` block that bin/heimdall-suite-closure verify-receipt
+# entry, plus the audit sample any sweep draws, and composes the receipt from the rest. The receipt keeps kind=full and gains a `cache` block that bin/heimdall-suite-closure verify-receipt
 # re-derives at the graded commit: bin/heimdall-state check-quality-gates and release/ship.sh refuse a receipt that does not verify, and ship.sh asks for a
 # COLD receipt for an x.y.0 release.
 #
@@ -23,8 +23,8 @@
 #   E  a comment-only edit of run-all.sh keeps the cache; a real edit changes the salt and every suite re-runs
 #   F  an entry 8 days old, an entry with a forged closure_sha, an entry whose recorded duration exceeds the budget: each MISSES, with its reason printed
 #   H  an audited suite that fails with an unchanged closure -> CLOSURE UNSOUND, red, cache purged, and the receipt names it
-#   J  --failed: greens of a RED run are kept; only the red suite re-runs; the amend verifies except for the audit sample it did not draw; a dependency broken
-#      under a green suite re-runs it RED (the amend cannot hide a regression); a forged amend is refused
+#   J  --failed: greens of a RED run are kept; the red suite plus the audit sample re-run, and the amend's receipt verifies and passes the gate in that one command; a
+#      dependency broken under a green suite re-runs it RED (the amend cannot hide a regression); a forged amend is refused
 #   L  forged cache blocks of a REAL receipt are refused by verify-receipt, each with its reason
 #   N  --dry-run writes nothing; an uncommitted change turns the cache off (a legacy sweep); --no-cache; incompatible flags are refused
 #   S  release/ship.sh: a forged receipt, and a warm one for an x.y.0 release, are refused; a warm patch release and a cold x.y.0 release are accepted
@@ -143,6 +143,7 @@ entry_edit() { # dir suite JQ-FILTER -- edit one cache entry in place (the resul
   local f; f="$(ENT "$1")/$2.test.sh.json"; jq -c "$3" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 }
 days_ago() { date -u -v-"$1"d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "$1 days ago" '+%Y-%m-%dT%H:%M:%SZ'; }
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
 setdep() { printf '#!/usr/bin/env bash\ndep_ok() { return %s; }\n' "$3" > "$1/bin/dep-$2.sh"; }   # dir NN 0|1
 
 echo "════════════════════════════════════════════════════════════════"
@@ -298,7 +299,7 @@ runit "$F" --cold --no-cache;        eq "N12 --cold with --no-cache is refused (
 runit "$F" --failed --since-green;   eq "N13 --failed with --since-green is refused (exit 2)" "$RC" "2"
 
 # ══ J. --failed ═══════════════════════════════════════════════════════════════════════════════════════════════════════
-echo "-- J. --failed: the red suite re-runs alone, the amend verifies except for the audit it did not draw --"
+echo "-- J. --failed: the red suite and the audit sample re-run, the amend's receipt verifies and the gate takes it --"
 newfix k; K="$FIX"
 setdep "$K" 03 1; cm "$K" "s03 is red"
 runit "$K" --cold
@@ -307,12 +308,14 @@ eq "J2 the 39 greens of a RED run were stored" "$(nent "$K")" "39"
 eq "J3 only s03 is non-green" "$(rj "$(LAST "$K")" '.non_green_suites|join(",")')" "s03.test.sh"
 setdep "$K" 03 0; cm "$K" "fix s03"
 PREV="$(sha "$(LAST "$K")")"
-runit "$K" --failed
-eq "J4 --failed launched ONLY s03" "$(ran "$K")" "s03"
+T0="$(now_ms)"; runit "$K" --failed; T1="$(now_ms)"
+eq "J4 --failed launched s03 (red last time) plus the audit sample of the other 39 suites, nothing else" "$(ran "$K")" "$(expected_ran "$K" s03)"
+printf '  info: the --failed run (s03 + the %s-suite audit sample, %s suites launched in all) took %s ms wall; the run itself says: %s\n' \
+  "$(rj "$(LAST "$K")" '.cache.audited')" "$(nran "$K")" "$((T1 - T0))" "$(printf '%s' "$OUT" | grep -m1 '^wall clock:')"
 eq "J5 and is green" "$RC" "0"
 eq "J6 the receipt names what the amend re-ran" "$(rj "$(LAST "$K")" '.amended|join(",")')" "s03.test.sh"
 eq "J7 and the receipt it amended (its sha256)" "$(rj "$(LAST "$K")" '.amended_from')" "$PREV"
-eq "J8 composed: full_equivalent, 39 cached, no audit drawn, not cold" "$(rj "$(LAST "$K")" '[.full_equivalent, .cache.suites_cached, .cache.audited, .cache.cold]|join(",")')" "true,39,0,false"
+eq "J8 composed: full_equivalent, 19 cached, 20 audited (max(20, 10%) of the 39 hits), not cold" "$(rj "$(LAST "$K")" '[.full_equivalent, .cache.suites_cached, .cache.audited, .cache.cold]|join(",")')" "true,19,20,false"
 has "J9 the run says failed-first" "$OUT" "failed-first"
 cp "$(LAST "$K")" "$WORK/amend.json"
 vr "$K" "$(LAST "$K")"
