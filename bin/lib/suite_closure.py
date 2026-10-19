@@ -115,6 +115,9 @@ ESAC_RE = re.compile(r"^esac(?:\s|$)")
 ARM_RE = re.compile(r"^  ([^\s#][^()]*)\)")
 LABEL_RE = re.compile(r"[a-z][a-z0-9-]*")
 PY_IMPORT_RE = re.compile(r"^\s*(?:from\s+\.*([A-Za-z_][\w.]*)\s+import\b|import\s+([A-Za-z_][\w.]*(?:\s*,\s*[A-Za-z_][\w.]*)*))")
+PLAIN_TAIL_RE = re.compile(r"(?:^|/)[A-Za-z0-9]+$")       # a token whose last component is a plain word (no - _ .)
+# the text before a word that makes it a COMMAND: line start, ; && || | ( { [ ` $( , then/do/else/exec/time/command/env/sudo/nohup/xargs/which/type, bash -c
+CMD_BEFORE_RE = re.compile(r"(?:(?:^|[;&|({`!]|\$\()\s*|\b(?:then|do|else|if|elif|while|until|exec|time|command|env|sudo|nohup|xargs|which|type|bash|sh)\s+(?:-\w+\s+)*[\"']?)$")
 SHELL_IMPORT_RE = re.compile(r"\b(?:from|import)\s+([A-Za-z_]\w*)")
 JS_IMPORT_RE = re.compile(r"""(?:require\s*\(|\bfrom\s+|\bimport\s*\(?\s*)['"](\.{1,2}/[^'"\n]+)['"]""")
 OID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
@@ -254,6 +257,26 @@ def is_comment(stripped, c_style):
     if c_style:
         return stripped.startswith(("//", "/*", "*"))
     return stripped.startswith("#") and not stripped.startswith("#!")
+
+
+def strip_docstrings(lines):
+    """(code lines, docstring lines) of a Python file: a docstring is prose ("`hmd ui` backend", "heimdall/* branches"), like a comment."""
+    code, prose, inside = [], [], None
+    for line in lines:
+        s = line.strip()
+        if inside:
+            prose.append(line)
+            if inside in s:
+                inside = None
+            continue
+        quote = next((q for q in ('"""', "'''") if s.lstrip("rRuUbBfF").startswith(q)), None)
+        if quote is None:
+            code.append(line)
+            continue
+        prose.append(line)
+        if quote not in s.lstrip("rRuUbBfF")[3:]:
+            inside = quote
+    return code, prose
 
 
 def bit_indices(bits):
@@ -624,6 +647,9 @@ class Graph(object):
                 stripped = line.strip()
                 if stripped:
                     (comments if is_comment(stripped, c_style) else code).append(line)
+            if os.path.splitext(path)[1].lower() == ".py" or (code and code[0].startswith("#!") and "python" in code[0]):
+                code, prose = strip_docstrings(code)
+                comments += prose
             if path in DISPATCHERS:
                 eager_lines, arm_lines = split_arms(code)
             else:
