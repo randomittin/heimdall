@@ -32,10 +32,11 @@ THE GRAPH (everything is read from git OBJECTS at one commit, never from the wor
                 a directory on a `PATH=` line, an absolute system path (/usr/bin) or a fixture repo's `"$d/bin"`.
               - a tool (or run-all.sh's list of live suites) that names a suite file takes it as a leaf: only a suite RUNS another suite.
               - text a shell file only PRINTS is no edge (DisplayScan lexes the file the way bash does): a quoted word with a space in an `echo` or
-                `printf` that prints to the terminal, the body of a bare `cat` here-document (written to a file too, unless a `#!` line says it is
-                a script), a trailing comment. Kept, because the file may read or run what they name: a lone path-like word (how a function hands back
-                a value), anything redirected to a file, piped, captured by `$( )` or an array, a word with a substitution, a script-like line
-                (`exec`, `source`, `&&`, `$@`). A file the lexer cannot read to its end drops nothing.
+                `printf` that prints to the terminal, the body of a here-document that a bare `cat` prints to the terminal (unless a `#!` line says it
+                is a script), a trailing comment. Kept, because the file may read or run what they name: a lone path-like word (how a function hands
+                back a value), anything redirected to a file (a `cat > "$d/run.sh" <<EOF` document is a script the suite runs next), piped, captured by
+                `$( )` or an array, a word with a substitution, a script-like line (`exec`, `source`, `&&`, `$@`). A file the lexer cannot read to its
+                end drops nothing.
             Comment lines and Python docstrings count for a SUITE only as FILE names (its header names what it tests): never a plain word,
             a directory or another suite. For a tool they count for nothing (the 2026-10-12 comment-chain incident, bin/lib/sweep-chain.sh).
   dispatch  bin/heimdall routes `hmd <word>` to one arm of its top-level `case "${1:-}"`. What an arm names is followed only when the
@@ -53,7 +54,8 @@ THE GRAPH (everything is read from git OBJECTS at one commit, never from the wor
             (and what they reach); always_run makes the closure the whole tree (the suite re-runs on ANY change, and is reusable only
             on a byte-identical tree). A hint that names nothing is an error, never a silent no-op.
 
-closure_sha  sha256 over the sorted lines `path<TAB>id` of the closure. A file's id is its blob id, except for a SHELL or PYTHON file (by suffix, or by
+closure_sha  sha256 over the sorted lines `path<TAB>mode<TAB>id` of the closure (mode = the git mode, so an exec bit, or a symlink swapped in for a file with
+             the same bytes, changes the hash). A file's id is its blob id, except for a SHELL or PYTHON file (by suffix, or by
              the #! line of a file that has none), whose id is the digest of what it does without what it only says:
                shell   without blank lines, full-line comments (a #! line stays) and trailing blanks; NOT inside a here-document body, a multi-line
                        quoted string, or on the line a backslash joins to the one before (a comment or a blank there is data, or changes where a
@@ -63,7 +65,8 @@ closure_sha  sha256 over the sorted lines `path<TAB>id` of the closure. A file's
              The blob id, as committed, stands wherever the file can be read as TEXT: a shell script that holds a command that reads or copies text AND
              expands its own path ($0, ${0##*/}, $BASH_SOURCE) anywhere, a Python file that does not tokenize or names its own path (__file__,
              sys.argv[0]) and opens a file, a shell file with a `$( )`, `${ }` or backtick inside double quotes whose quotes the scanner cannot pair
-             (it runs past the line, holds a backslash or a `#`), the paths a hint adds, everything a SUITE or any file it runs hands to a command
+             (it runs past the line, holds a backslash or a `#`), a shell file with a here-document whose command line goes on past its first line (an open
+             quote or a backslash: the body starts later than the next line), the paths a hint adds, everything a SUITE or any file it runs hands to a command
              that reads (grep, sed, cat, shasum, shellcheck, find, a `<` redirect) or enumerates with one, and every file of a suite whose closure
              is the whole tree: a lint that greps comments for a version pin sees a comment as a change. A file only SOURCED, RUN or IMPORTED does
              not; what a suite reads through a variable or a loop cannot be seen, and is bounded like any unseen read by the audit sample and the
@@ -72,18 +75,23 @@ salt         sha256 over the RUNNER's own infrastructure and nothing else: the s
              (a `#!` line stays; its raw blob when a heredoc body line starts with `#`, because that line is data and the stripper
              could hide a real change); the two runner libraries test/lib/run-all-guards.sh and test/lib/py-pin.sh; bin/lib/sweep-chain.sh
              and bin/lib/hook-owned-path.sh; the hints; bin/lib/suite-cache.sh (all as committed); the engine's own files (this file,
-             its launcher, hook-owned-path.sh); the bash/jq/python3/git versions and `uname -sm`. The other test/lib files are per-suite
+             its launcher, hook-owned-path.sh: the copy this process runs, and for verify-receipt, when the graded commit tracks all three, the copy
+             that commit carries, which is what the sweep that wrote the receipt ran); the bash/jq/python3/git versions (read live: the receipt keeps
+             the toolchain only inside the salt) and `uname -sm`. The other test/lib files are per-suite
              helpers: closure edges, so editing one re-runs the suites that name it and does not make the whole sweep cold (measured:
              2.4.8's comment-only edit of run-all.sh and four test/lib/*_cases.py files would have made every suite re-run).
              Any change to a salted input = every cached result invalid.
 verify-receipt  a sweep receipt (kind "full") carries a `cache` block:
                {mode:"closure", salt, suites_fresh, suites_cached, audited, cold, oldest_entry_age_days,
                 entries:[{suite, closure_sha, finished_at}]}
-             and is accepted only when, recomputed at its head_sha: the salt is the same; every entry's closure_sha is the same; every
-             suite that is not live (test/run-all.sh's own live_reason) has an entry; no entry is older than 7 days (a cold receipt, in
-             which every suite ran in that sweep, is exempt); and the audit sample was drawn: audited >= min(hits, max(20, 10% of the
-             hits)), hits = suites_cached + audited. HMD_SUITE_CACHE_MAX_DAYS may only LOWER the 7, HMD_SUITE_CACHE_AUDIT_PCT may only
-             RAISE the 10.
+             and is accepted only when, recomputed at its head_sha: the salt is the same (the engine's files read as committed at head_sha when
+             that commit ships the engine, i.e. tracks all three of its files);
+             every entry's closure_sha is the same; every suite that is not live (test/run-all.sh's own live_reason) has an entry; no entry was
+             older than 7 days WHEN THE SWEEP WROTE THE RECEIPT (counted from the receipt's own finished_at, never from today, so an archived
+             receipt, which release/ship.sh grades long after the sweep, keeps verifying; an entry dated after the receipt, or after now, is
+             refused; a cold receipt, in which every suite ran in that sweep, is exempt); and the audit sample was drawn: audited >=
+             min(hits, max(20, 10% of the hits)), hits = suites_cached + audited. HMD_SUITE_CACHE_MAX_DAYS may only LOWER the 7,
+             HMD_SUITE_CACHE_AUDIT_PCT may only RAISE the 10.
 
 A cooperating-agent control, not a security boundary: like last-sweep.json it is a plain local file, and it catches stale, copied and
 hand-edited-by-accident receipts, not someone who can recompute every hash.
@@ -105,7 +113,7 @@ import subprocess
 import sys
 import tokenize
 
-SCHEMA = 3                      # part of the salt: bump it whenever the rules above change what a closure is (2: shell and Python files are hashed without their comments; 3: text a shell file only prints is no edge, the dispatcher follows only the arms a suite can reach, files any node reads as text and any self-reading script are hashed as committed)
+SCHEMA = 4                      # part of the salt: bump it whenever the rules above change what a closure is (2: shell and Python files are hashed without their comments; 3: text a shell file only prints is no edge, the dispatcher follows only the arms a suite can reach, files any node reads as text and any self-reading script are hashed as committed; 4: the hash covers each file's git mode, a here-document written to a file keeps its edges, `(` and `)` end a word before a comment, a here-document whose command line goes on past its first line hashes the file as committed)
 HINTS = "test/closure-hints.json"
 RUN_ALL = "test/run-all.sh"
 CACHE_LIB = "bin/lib/suite-cache.sh"
@@ -121,6 +129,12 @@ WHOLE = "\0whole-tree"          # the pseudo-path "everything": an edge to it ma
 DISPATCHERS = frozenset(["bin/heimdall"])
 FORWARDERS = frozenset(["bin/hmd"])
 GIT_AMBIENT = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")   # a stray one in THIS process must not redirect git
+FILE_MODES = ("100644", "100755")                                                # a regular file, as git records it (not a link, not a submodule)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# the engine's own files, which the salt covers: (name in the salt, path in a repository that tracks them (this one does), the copy this process runs)
+ENGINE_FILES = (("suite_closure.py", "bin/lib/suite_closure.py", os.path.abspath(__file__)),
+                ("heimdall-suite-closure", "bin/heimdall-suite-closure", os.path.join(os.path.dirname(_HERE), "heimdall-suite-closure")),
+                ("hook-owned-path.sh", "bin/lib/hook-owned-path.sh", os.path.join(_HERE, "hook-owned-path.sh")))
 
 EXEC_DIRS = ("bin/", "hooks/", "sentinels/", "release/", "adapters/", "relay/", "test/lib/", ".heimdall/hooks/")
 CODE_SUFFIXES = frozenset([".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".rb", ".pl", ".awk", ".c", ".h"])
@@ -184,8 +198,9 @@ HEREDOC_RE = re.compile(r"""(?<!<)<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([^\s;&|
 
 SHELL_SUFFIXES = (".sh", ".bash", ".zsh")
 SHELL_INTERPRETERS = frozenset(["sh", "bash", "dash", "zsh", "ksh"])
-# what one shell line can do to the quoting state: an escaped character, the next quote, or a comment (what follows a `#` that starts a word is text)
-UNQUOTED_RE = re.compile(r"""\\.|\$'|'|"|(?<![^ \t;&|])#""")
+# what one shell line can do to the quoting state: an escaped character, the next quote, or a comment (what follows a `#` that starts a word is text). A word starts after a blank,
+# a `;` `&` `|` or a parenthesis, so the apostrophe in `$(#it's` or `(echo a)#it's` is a comment's and opens no quote
+UNQUOTED_RE = re.compile(r"""\\.|\$'|'|"|(?<![^ \t;&|()])#""")
 # a double-quoted string's own tokens: an escape, the closing quote, and the three constructs inside it that open a quoting context of their own (`$(`, `${`, a backtick)
 DOUBLE_RE = re.compile(r'\\.|"|\$[({]|`')
 ANSI_RE = re.compile(r"\\.|'")
@@ -505,13 +520,17 @@ def shell_normal_form(text):
         bare = line.lstrip(" \t")
         if not quote and not joined and (not bare or (bare[0] == "#" and not bare.startswith("#!"))):
             continue
+        opens = False
         for m in HEREDOC_RE.finditer(line):
+            opens = True
             single, double, word = m.group(2), m.group(3), m.group(4)
             pending.append((single if single is not None else double if double is not None else word, m.group(1) == "-"))
         end, unknowable = quote_state(line, quote)
         if unknowable:
             return None
         joined = line.rstrip(" \t\r").endswith("\\")
+        if opens and (end or joined):               # the command line goes on (a quote still open, a backslash): its body starts after ITS newline, not after this line
+            return None
         out.append(line.rstrip(" \t") if not quote and not end and not joined else line)
         quote = end
     return None if reads_own_text(out) else "\n".join(out)
@@ -973,7 +992,7 @@ class DisplayScan(object):
                 if not w.code and any(ch in w.lit for ch in " \t\n") and not CODE_MARK_RE.search(w.lit):      # an option (-n, -e) has no space
                     self.spans.append((w.s, w.e))
         for cmd, start, end, quoted in self.hdocs:
-            if cmd.captured or cmd.piped:                                   # to a file is fine: a document (AGENTS.md text), unless a line says it is a script (below)
+            if cmd.captured or cmd.piped or cmd.to_file:                    # a document written to a file may be a script a later command runs (`cat > "$d/run.sh" <<EOF`, then `bash "$d/run.sh"`)
                 continue
             name, args = self.command_of(cmd)
             if name != "cat" or any(not w.lit.startswith("-") for w in args):
@@ -1683,7 +1702,7 @@ class Graph(object):
             h = hashlib.sha256()
             for p in self.members(bits):
                 ident = self.nodes[p].oid if p in committed else self.content.get(p, self.nodes[p].oid)
-                h.update(("%s\t%s\n" % (p, ident)).encode("utf-8", "surrogateescape"))
+                h.update(("%s\t%s\t%s\n" % (p, self.nodes[p].mode, ident)).encode("utf-8", "surrogateescape"))
             got = self._sha[key] = h.hexdigest()
         return got
 
@@ -1697,7 +1716,7 @@ class Graph(object):
         if node is None:
             return RUN_ALL, "absent"
         raw = (RUN_ALL + ":blob", node.oid)
-        if node.mode not in ("100644", "100755"):
+        if node.mode not in FILE_MODES:
             return raw
         data = self.repo.git(["cat-file", "blob", node.oid]).stdout
         if len(data) > MAX_SCAN or b"\0" in data[:8192]:
@@ -1707,25 +1726,32 @@ class Graph(object):
             return raw
         return RUN_ALL + ":code", sha256_hex(stripped.encode("utf-8", "surrogateescape"))
 
-    def salt(self):
+    def carries_engine(self):
+        """True when this graph's commit tracks the whole engine (every file of ENGINE_FILES, as a regular file): the repository ships its own engine, as this one does. One tracked file is not enough:
+        bin/lib/hook-owned-path.sh is also a runner library that other repositories keep a copy of."""
+        return all(rel in self.nodes and self.nodes[rel].mode in FILE_MODES for _, rel, _ in ENGINE_FILES)
+
+    def salt(self, committed_engine=False):
+        """The salt. `committed_engine`: read the engine's own files as committed at this graph's commit (verify-receipt) when the commit carries the whole engine. A sweep runs the engine its own work tree
+        holds, which for a repository that ships its engine is the committed copy, and an archived receipt is graded after the engine has moved on: the work tree's copy would make every such receipt
+        unverifiable. A commit that does not carry the engine (a repository that uses the plugin's) leaves the copy this process runs, as ever. The graph itself is always built by THIS engine's rules and
+        SCHEMA stays live, so a receipt composed under other rules is still refused, by its salt or by its closure hashes."""
         h = hashlib.sha256()
+        committed = committed_engine and self.carries_engine()
 
         def put(key, value):
             h.update(("%s\t%s\n" % (key, value)).encode("utf-8", "surrogateescape"))
 
         def oid(path):
             return self.nodes[path].oid if path in self.nodes else "absent"
-        here = os.path.dirname(os.path.abspath(__file__))
         put("schema", SCHEMA)
         put(*self.runner_salt_input())
         for p in RUNNER_LIBS:
             put(p, oid(p))
         put(HINTS, sha256_hex(self.hints_raw) if self.hints_raw is not None else "absent")
         put(CACHE_LIB, oid(CACHE_LIB))
-        for name, path in (("suite_closure.py", os.path.abspath(__file__)),
-                           ("heimdall-suite-closure", os.path.join(os.path.dirname(here), "heimdall-suite-closure")),
-                           ("hook-owned-path.sh", os.path.join(here, "hook-owned-path.sh"))):
-            put("engine:" + name, file_sha(path))
+        for name, rel, live in ENGINE_FILES:
+            put("engine:" + name, sha256_hex(self.repo.git(["cat-file", "blob", self.nodes[rel].oid]).stdout) if committed else file_sha(live))
         put("bash", tool_version(["bash", "--version"]))
         put("jq", tool_version(["jq", "--version"]))
         put("python3", platform.python_version())
@@ -1748,6 +1774,16 @@ def _matching(rx):
     return lambda v: isinstance(v, str) and rx.fullmatch(v) is not None
 
 
+def _stamp(v):
+    """The UTC time a `2026-10-13T12:00:00Z` stamp names, or None when `v` is not one (a string with the shape that names no date, 2026-13-45T25:61:61Z, included)."""
+    if not isinstance(v, str) or STAMP_RE.fullmatch(v) is None:
+        return None
+    try:
+        return datetime.datetime.strptime(v, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+
+
 # name, test, what it must be: the cache block of a sweep receipt, as run-all.sh composes it
 CACHE_FIELDS = (
     ("mode", lambda v: v == "closure", 'the string "closure"'),
@@ -1762,7 +1798,7 @@ CACHE_FIELDS = (
 ENTRY_FIELDS = (
     ("suite", lambda v: isinstance(v, str) and v != "", "a non-empty suite name"),
     ("closure_sha", _matching(SHA256_RE), "a sha256 (64 lowercase hex digits)"),
-    ("finished_at", _matching(STAMP_RE), "a UTC timestamp like 2026-10-13T12:00:00Z"),
+    ("finished_at", lambda v: _stamp(v) is not None, "a UTC timestamp like 2026-10-13T12:00:00Z"),
 )
 
 
@@ -1772,6 +1808,8 @@ def shape_problems(receipt):
         return ["the receipt is not a JSON object"]
     if not _matching(OID_RE)(receipt.get("head_sha")):
         problems.append("head_sha must be the full commit id the sweep graded (40 lowercase hex digits)")
+    if _stamp(receipt.get("finished_at")) is None:
+        problems.append("finished_at must be the UTC time the sweep wrote the receipt (like 2026-10-13T12:00:00Z): the age of every cached entry is counted from it")
     if not _int(receipt.get("exit_code")) or receipt.get("exit_code") != 0:
         problems.append("exit_code is %r, not 0: a red sweep proves nothing" % (receipt.get("exit_code"),))
     if receipt.get("kind") != "full":
@@ -1825,7 +1863,8 @@ def _names(items, limit=5):
 
 
 def verify_receipt(repo, receipt_path, hints_path):
-    """The reasons the receipt cannot stand in for a full sweep (an empty list = it can). Everything is recomputed at ITS commit."""
+    """The reasons the receipt cannot stand in for a full sweep (an empty list = it can). Everything is recomputed at ITS commit: the closure hashes, and the salt with the engine's files as that commit carries them.
+    Entries are aged from the receipt's own finished_at, not from now, so an archived receipt keeps verifying (never so a receipt verifies for a commit it did not grade: head_sha is the commit every hash is taken at)."""
     try:
         with open(receipt_path, "rb") as fh:
             raw = fh.read(MAX_RECEIPT + 1)
@@ -1848,14 +1887,15 @@ def verify_receipt(repo, receipt_path, hints_path):
         problems.append("test/run-all.sh at %s has no readable live_reason(), so no suite is treated as live" % head[:12])
     suites = graph.suites()
     shas = dict(graph.hash_all())
-    if cache["salt"] != graph.salt():
-        problems.append("salt changed: the test infrastructure, the hints, the closure engine or the toolchain differ from the sweep that "
+    if cache["salt"] != graph.salt(committed_engine=True):
+        problems.append("salt changed: the test infrastructure, the hints, the closure engine (as committed at the graded commit) or the toolchain differ from the sweep that "
                         "wrote this receipt, so none of its cached results can be trusted")
     entries, stale, ghosts, twice, aged, future = {}, [], [], [], [], []
     limit = MAX_AGE_DAYS
     tighter = _env_int("HMD_SUITE_CACHE_MAX_DAYS")
     if tighter is not None and tighter < limit:
         limit = tighter
+    issued = _stamp(receipt["finished_at"])             # shape_problems made sure it names a time
     now = datetime.datetime.now(datetime.timezone.utc)
     for entry in cache["entries"]:
         suite = graph.suite_path(entry["suite"])
@@ -1867,9 +1907,9 @@ def verify_receipt(repo, receipt_path, hints_path):
             continue
         if entry["closure_sha"] != shas[suite]:
             stale.append(suite)
-        when = datetime.datetime.strptime(entry["finished_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-        age = (now - when).total_seconds() / 86400.0
-        if age < -1.0 / 24:
+        when = _stamp(entry["finished_at"])
+        age = (issued - when).total_seconds() / 86400.0         # what it was when the receipt was written: the days since then are the archive's, not the entry's
+        if age < -1.0 / 24 or (when - now).total_seconds() > 3600:
             future.append(suite)
         elif age > limit and not cache["cold"]:
             aged.append("%s (%.1f days)" % (suite, age))
@@ -1880,9 +1920,9 @@ def verify_receipt(repo, receipt_path, hints_path):
     if stale:
         problems.append("closure of %d suite(s) changed since their result was recorded: %s" % (len(stale), _names(sorted(stale))))
     if future:
-        problems.append("entry finished_at is in the future for %s" % _names(sorted(future)))
+        problems.append("entry finished_at is in the future (after the receipt that lists it was written, or after now) for %s" % _names(sorted(future)))
     if aged:
-        problems.append("entry for %s is more than %d days old (limit %d): every suite must run cold at least that often" % (_names(sorted(aged)), limit, limit))
+        problems.append("entry for %s was more than %d days old when the sweep wrote this receipt (limit %d): every suite must run cold at least that often" % (_names(sorted(aged)), limit, limit))
     missing = [s for s in suites if s not in entries and not any(fnmatch.fnmatchcase(s.rsplit("/", 1)[-1], pat) for pat in live)]
     if missing:
         problems.append("no green entry for %d suite(s): %s" % (len(missing), _names(missing)))

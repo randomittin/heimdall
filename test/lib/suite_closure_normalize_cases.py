@@ -97,6 +97,12 @@ shell("same", "a here-string starts no here-document", T('read -r w <<< "x"', "#
 shell("diff", "an unterminated here-document keeps the rest as data", T("cat <<EOF", "# n v1"), T("cat <<EOF", "# n v2"))
 shell("none", "a here-document inside $( ) inside double quotes runs past the line: nested quoting the scanner cannot follow", T('x="$(cat <<EOF', "# body v1", "EOF", ')"'))
 shell("none", "so a comment after that here-document is no longer dropped either: the whole file is hashed as committed", T('x="$(cat <<EOF', "body", "EOF", ')"', "# n v1"))
+# the body starts after the newline that ends the COMMAND line, not after the line the operator is on: where the command goes on (an open quote, a backslash) the file is hashed as committed
+shell("none", "a quoted word that spans lines on a here-document's command line: a delimiter inside the quote ends nothing, and a # line of the real body is data",
+      T('cat <<EOF "multi', "EOF", 'line" "x"', "# real body v1", "EOF"))
+shell("none", "a backslash continuation on a here-document's command line: the body starts after the continued line", T("cat <<EOF \\", "EOF", "# real body v1", "EOF"))
+shell("same", "balanced quotes and no continuation on a here-document's command line: a comment after the terminator is still dropped",
+      T('cat <<EOF "a b"', "body", "EOF", "# n v1", "echo z"), T('cat <<EOF "a b"', "body", "EOF", "# n v2", "echo z"))
 # ── shell: a # line inside a multi-line string is data ───────────────────────────────────────────────────────────────
 shell("diff", "a # line inside a multi-line single-quoted string", T("x='first", "# looks like a comment v1", "last'"), T("x='first", "# looks like a comment v2", "last'"))
 shell("diff", "a # line inside a multi-line double-quoted string", T('x="first', "# v1", 'last"'), T('x="first', "# v2", 'last"'))
@@ -110,6 +116,15 @@ shell("same", "$# ${#a[@]} ${x#p} start no comment", T('echo $# ${#a[@]} ${x#p}'
 shell("same", "a # inside double quotes starts no comment", T('echo "a # b\'s"', "# n v1"), T('echo "a # b\'s"', "# n v2"))
 shell("same", "an escaped quote inside $'...' does not close it", T("x=$'it\\'s'", "# n v1"), T("x=$'it\\'s'", "# n v2"))
 shell("same", "a quoted hash", T("echo '#'", "# n v1"), T("echo '#'", "# n v2"))
+# `(` and `)` end a word, so a # right after one starts a comment: its apostrophe opens no quote, and the quote state stays what the shell sees
+shell("diff", "a # right after $( is a comment: its apostrophe opens no quote, so a # line of a later multi-line string is still data",
+      T("x=$(#it's", "echo a)", "y='first", "# looks like a comment v1", "last'"), T("x=$(#it's", "echo a)", "y='first", "# looks like a comment v2", "last'"))
+shell("diff", "a # right after ( is a comment: its apostrophe opens no quote, so a # line of a later multi-line string is still data",
+      T("(#it's", "echo a", ")", "y='first", "# looks like a comment v1", "last'"), T("(#it's", "echo a", ")", "y='first", "# looks like a comment v2", "last'"))
+shell("diff", "a # right after ) is a comment: its apostrophe opens no quote, so a # line of a later multi-line string is still data",
+      T("(echo a)#it's", "y='first", "# looks like a comment v1", "last'"), T("(echo a)#it's", "y='first", "# looks like a comment v2", "last'"))
+shell("same", "after a comment that starts right after $( the quote state is closed: a comment line below it is dropped",
+      T("x=$(#it's", "echo a)", "# n v1", "echo b"), T("x=$(#it's", "echo a)", "# n v2", "echo b"))
 # ── shell: a backslash joins the next line, comment or blank included ───────────────────────────────────────────────
 shell("diff", "a comment after a continuation is kept", T("echo a \\", "# n v1", "  b"), T("echo a \\", "# n v2", "  b"))
 shell("diff", "a blank line after a continuation is kept", T("echo a \\", "", "echo b"), T("echo a \\", "echo b"))
@@ -196,4 +211,9 @@ display("diff", "a message with a substitution inside it", T('echo "see $(cat do
 display("diff", "a here-document with a #! line is a script", T("cat > hook <<'EOF'", "#!/bin/sh", "bin/a --now", "EOF"), T("cat > hook <<'EOF'", "#!/bin/sh", "bin/b --now", "EOF"))
 display("diff", "cat of a file reads it", T('cat "docs/a.md"'), T('cat "docs/b.md"'))
 display("diff", "a file the lexer cannot read to its end drops nothing", T('echo "never closed docs/a.md'), T('echo "never closed docs/b.md'))
+display("diff", "a here-document written to a file may be a script a later command runs (cat > f <<EOF, then bash f)",
+        T('cat > "$d/run.sh" <<EOF', '"$REPO/bin/tool-a" --now', "EOF", 'bash "$d/run.sh"'), T('cat > "$d/run.sh" <<EOF', '"$REPO/bin/tool-b" --now', "EOF", 'bash "$d/run.sh"'))
+display("diff", "a here-document appended to a file (cat >> f <<EOF)", T('cat >> "$d/run.sh" <<EOF', "docs/a.md has the flags", "EOF"), T('cat >> "$d/run.sh" <<EOF', "docs/b.md has the flags", "EOF"))
+display("diff", "a here-document whose redirection follows its operator (cat <<EOF > f)", T('cat <<EOF > "$d/run.sh"', "docs/a.md has the flags", "EOF"), T('cat <<EOF > "$d/run.sh"', "docs/b.md has the flags", "EOF"))
+display("same", "a here-document printed to stderr is still display text (cat >&2 <<EOF)", T("cat >&2 <<'EOF'", "docs/a.md has the flags", "EOF"), T("cat >&2 <<'EOF'", "docs/b.md has the flags", "EOF"))
 print("cases %d" % COUNT)

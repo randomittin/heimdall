@@ -2,7 +2,7 @@
 # test/suite-closure.test.sh -- THE STATIC DEPENDENCY CLOSURE OF A SUITE, AND THE PROOF THAT IT CANNOT MISS A DEPENDENCY IT CLAIMS TO SEE.
 #
 # WHAT IT TESTS. bin/heimdall-suite-closure (the launcher) and bin/lib/suite_closure.py (the engine): for every test/*.test.sh the
-# set of tracked files its result can depend on (the closure), the closure hash (sha256 over sorted `path<TAB>id`; the id is the blob id
+# set of tracked files its result can depend on (the closure), the closure hash (sha256 over sorted `path<TAB>mode<TAB>id`; the id is the blob id
 # read from git objects, or, for a shell or Python file, the digest of what it is without its comments, blank lines and trailing blanks),
 # the salt that invalidates every cached result at once, test/closure-hints.json (the escape hatch for what a static scan cannot see) and
 # `verify-receipt`, which re-derives every closure hash at the graded commit instead of trusting a receipt's flag.
@@ -26,6 +26,8 @@
 #      and neither does a comment, a blank line or a trailing blank in a shell or Python dependency -- unless what reads that file reads its
 #      text: a suite that greps it or enumerates its directory, the whole-tree suites, a script that prints its own header (--help), a file
 #      that cannot be tokenized. Here-document bodies, multi-line strings and a line joined by a backslash are never touched.
+#      A here-document written to a file keeps its edges (it may be a script a later command runs: k32), and the git mode of a file (an
+#      exec bit, or a symlink swapped in for a file with the same bytes) is part of the hash.
 #   D  hints are validated (an `extra` path that names nothing, an unknown key, a non-boolean refuse; they never silently no-op)
 #   E  the salt moves with test/run-all.sh (its code, not its full-line comments), the two runner libraries test/lib/run-all-guards.sh and
 #      test/lib/py-pin.sh, bin/lib/sweep-chain.sh, bin/lib/hook-owned-path.sh, the hints file and bin/lib/suite-cache.sh -- and not with a
@@ -34,9 +36,12 @@
 #      run-all.sh is proven to stay on the stripper
 #   F  verify-receipt: a green cold receipt and a green cache-composed receipt pass; each field of the cache block mutated alone is
 #      refused with its reason (stale closure, old entry, salt, under-audited, missing suite, forged head, lying `cold`, ...); a gate
-#      may only TIGHTEN the age limit and RAISE the audit share
+#      may only TIGHTEN the age limit and RAISE the audit share; an ARCHIVED receipt keeps verifying: an entry's age is counted from the
+#      receipt's own finished_at (what it was when the receipt was written), never from today
 #   G  the normal forms themselves (test/lib/suite_closure_normalize_cases.py): for shell, every here-document form, every quoting form and a
 #      backslash continuation; for Python, comments, docstrings, the shebang and the encoding cookie; which file is shell, which is Python
+#   H  verify-receipt salts the engine as COMMITTED at the receipt's own commit: editing the engine afterwards does not make an archived
+#      receipt unverifiable, and a receipt cannot be moved to a commit whose engine differs from the one its salt was computed with
 #
 # HERMETIC: the fixture lives under $TMPDIR with its own HOME; nothing touches the real receipts or the real work tree.
 # EXIT: 0 = every proof holds and falsifiability is 1.0; 1 = anything else.
@@ -252,6 +257,8 @@ build_fixture() {
   mk bin/dep-inner.sh '#!/usr/bin/env bash' 'echo inner v1'
   mk bin/tool-x '#!/usr/bin/env bash' 'echo tool-x v1'
   mk data/config.txt 'config v1'
+  printf '%s' 'swap-target' > "$FIX/data/swap.txt"        # no newline: the same blob as a symlink that points at swap-target
+  mk bin/heredoc-target '#!/usr/bin/env bash' 'echo heredoc-target v1'
   mk fixtures/dir/a.txt 'a v1'
   mk fixtures/dir/b.txt 'b v1'
   mk test/lib/helper.sh '#!/usr/bin/env bash' 'helper() { echo helper v1; }'
@@ -315,6 +322,8 @@ build_fixture() {
   suite k29-sources '. "$REPO/bin/commented-lib.sh"'
   suite k30-nested '"$REPO/bin/nested.sh"'
   suite k31-pyself 'python3 "$REPO/bin/pyself.py"'
+  suite k32-genscript 'd="$(mktemp -d)"' 'cat > "$d/run.sh" <<EOF' '"$REPO/bin/heredoc-target" --now' 'EOF' 'bash "$d/run.sh"'
+  suite k33-swap 'cat "$REPO/data/swap.txt" >/dev/null'
   local i=1 n
   while [ "$i" -le 30 ]; do n="$(printf 'p%02d' "$i")"; suite "$n" 'echo plain'; i=$((i+1)); done
   commit_all base >/dev/null 2>&1
@@ -373,6 +382,8 @@ eq "B23 deps k27: a variable named like a binary is not the dispatcher, and the 
   "$(printf '%s\n' bin/binuser.sh bin/heimdall-face test/k27-bin.test.sh)"
 eq "B24 deps k26: a word nobody can read follows every arm and the functions they call" "$("$CLI" deps --suite test/k26-dyn.test.sh --repo "$FIX")" \
   "$(printf '%s\n' bin/heimdall bin/heimdall-called bin/heimdall-other bin/heimdall-sub bin/hmd test/k26-dyn.test.sh)"
+eq "B25 deps k32: a here-document written to a file (cat > f <<EOF) keeps its edges, the generated script runs bin/heredoc-target" "$("$CLI" deps --suite test/k32-genscript.test.sh --repo "$FIX")" \
+  "$(printf '%s\n' bin/heredoc-target test/k32-genscript.test.sh)"
 
 # ── C. mutation proof ────────────────────────────────────────────────────────────────────────────────────────────────
 echo "── C. mutation proof: each dependency edited -> the closure hash changes; unrelated edits -> nothing changes"
@@ -386,11 +397,13 @@ if old not in text:
 open(path, "w", encoding="utf-8", newline="").write(text.replace(old, new, 1))
 PY
 }
-mutate() { # FILE byte|comment|ws|sub|OLD|NEW -- one byte appended, a comment-only line appended, one newline (JSON stays valid), or OLD replaced by NEW
+mutate() { # FILE byte|comment|ws|chmod|symlink|sub|OLD|NEW -- one byte appended, a comment-only line appended, one newline (JSON stays valid), the exec bit set, the file replaced by a symlink to the text it held, or OLD replaced by NEW
   case "$2" in
     byte) printf 'x' >> "$FIX/$1" ;;
     comment) printf '# note\n' >> "$FIX/$1" ;;
     ws) printf '\n' >> "$FIX/$1" ;;
+    chmod) chmod +x "$FIX/$1" ;;
+    symlink) local target; target="$(cat "$FIX/$1")"; rm -f "$FIX/$1"; ln -s "$target" "$FIX/$1" ;;
     sub\|*) local rest="${2#sub|}"; subst "$1" "${rest%%|*}" "${rest#*|}" ;;
   esac
 }
@@ -451,6 +464,9 @@ same "C-p5 a file named only in echo text (docs/guide.md) adds no edge" docs/gui
 same "C-p6 a file named only in a bare cat here-document (docs/manual.md) adds no edge" docs/manual.md byte
 same "C-p7 a tool named only in a printf message (bin/helptarget) adds no edge" bin/helptarget byte
 same "C-p8 a file named only in a trailing comment (docs/trailer.md) adds no edge" docs/trailer.md byte
+kill "32 here-document written to a file: one byte of bin/heredoc-target, which only the generated script runs" bin/heredoc-target byte k32-genscript
+kill "33 file mode: chmod +x of bin/dep.sh with the same bytes (the closure hash covers the git mode)" bin/dep.sh chmod k1-source
+kill "33 file mode: data/swap.txt replaced by a symlink with the same bytes (same blob id, mode 120000)" data/swap.txt symlink k33-swap
 
 # What cannot change what a shell or Python file does is not in the closure hash. A suite that sources, runs or imports the file does not see it
 # (only the whole-tree suites, which read every file as text, do); a here-document body, a multi-line string, a continuation, a script that
@@ -589,19 +605,20 @@ gitf reset -q --hard "$BASE"
 echo "── F. verify-receipt"
 iso_now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 days_ago() { date -u -v-"$1"d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "$1 days ago" '+%Y-%m-%dT%H:%M:%SZ'; }
+days_ahead() { date -u -v+"$1"d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "$1 days" '+%Y-%m-%dT%H:%M:%SZ'; }
 ZEROS="0000000000000000000000000000000000000000000000000000000000000000"
-mkreceipt() { # OUT HEAD COLD CACHED AUDITED -- a receipt whose entries are every non-live suite at HEAD (x-deployed is live)
-  local out="$1" head="$2" cold="$3" cached="$4" audited="$5" now salt
-  now="$(iso_now)"; salt="$("$CLI" salt --repo "$FIX" --rev "$head")" || return 1
-  "$CLI" hash-all --repo "$FIX" --rev "$head" | grep -v 'deployed' \
+mkreceipt() { # OUT HEAD COLD CACHED AUDITED [REPO [CLI]] -- a receipt whose entries are every non-live suite at HEAD (x-deployed is live); REPO and CLI default to the fixture and the engine under test
+  local out="$1" head="$2" cold="$3" cached="$4" audited="$5" repo="${6:-$FIX}" cli="${7:-$CLI}" now salt
+  now="$(iso_now)"; salt="$("$cli" salt --repo "$repo" --rev "$head")" || return 1
+  "$cli" hash-all --repo "$repo" --rev "$head" | grep -v 'deployed' \
     | jq -R -s --arg head "$head" --arg salt "$salt" --arg now "$now" --argjson cold "$cold" --argjson cached "$cached" --argjson audited "$audited" '
         (split("\n") | map(select(length > 0) | split("\t"))) as $rows
         | {finished_at: $now, head_sha: $head, tree_clean: true, exit_code: 0, kind: "full",
            cache: {mode: "closure", salt: $salt, suites_fresh: (($rows | length) - $cached), suites_cached: $cached, audited: $audited,
                    cold: $cold, oldest_entry_age_days: 0, entries: ($rows | map({suite: .[0], closure_sha: .[1], finished_at: $now}))}}' > "$out"
 }
-vr() { # RECEIPT -> VR_RC, VR_ERR
-  "$CLI" verify-receipt --repo "$FIX" --receipt "$1" >"$WORK/vr.out" 2>"$WORK/vr.err"; VR_RC=$?; VR_ERR="$(cat "$WORK/vr.err")"
+vr() { # RECEIPT [REPO [CLI]] -> VR_RC, VR_ERR
+  "${3:-$CLI}" verify-receipt --repo "${2:-$FIX}" --receipt "$1" >"$WORK/vr.out" 2>"$WORK/vr.err"; VR_RC=$?; VR_ERR="$(cat "$WORK/vr.err")"
 }
 COLD="$WORK/cold.json"; GOOD="$WORK/good.json"
 mkreceipt "$COLD" "$BASE" true 0 0 || bad "F0 could not build the cold receipt"
@@ -657,6 +674,23 @@ HMD_SUITE_CACHE_AUDIT_PCT=1 "$CLI" verify-receipt --repo "$FIX" --receipt "$GOOD
 printf '{"not":"a receipt"' > "$WORK/broken.json"
 "$CLI" verify-receipt --repo "$FIX" --receipt "$WORK/broken.json" >/dev/null 2>&1; eq "F-p6 an unreadable receipt is refused (exit 1)" "$?" 1
 "$CLI" verify-receipt --repo "$FIX" --receipt "$WORK/no-such-receipt.json" >/dev/null 2>&1; eq "F-p7 a missing receipt is refused (exit 1)" "$?" 1
+# An ARCHIVED receipt (release/ship.sh's tag fallback grades receipts/full-green/<head_sha>.json long after the sweep) must keep verifying: an entry's age is what it was when the
+# receipt was WRITTEN, so it is counted from the receipt's own finished_at, never from today (a cold receipt was never aged out; this one is cache-composed)
+ARCH_AT="$(days_ago 20)"
+ARCHIVED=".finished_at = \"$ARCH_AT\" | .cache.entries |= map(.finished_at = \"$ARCH_AT\")"
+rpass "F-p8 an archived receipt (written 20 days ago, its oldest entry 6 days older than the receipt) verifies today" "$ARCHIVED | .cache.entries[4].finished_at = \"$(days_ago 26)\""
+rmut "an entry was 8 days old when the receipt was written (limit 7), however long ago that was" "$ARCHIVED | .cache.entries[3].finished_at = \"$(days_ago 28)\"" "days old"
+rmut "an entry finished a day AFTER the receipt that lists it" "$ARCHIVED | .cache.entries[2].finished_at = \"$(days_ago 19)\"" "future"
+FUTURE_AT="$(days_ahead 2)"
+rmut "a receipt and all its entries dated two days from now" ".finished_at = \"$FUTURE_AT\" | .cache.entries |= map(.finished_at = \"$FUTURE_AT\")" "future"
+rmut "the receipt has no finished_at: nothing to count an entry's age from" "del(.finished_at)" "finished_at"
+rmut "the receipt's finished_at is not a time" ".finished_at = \"yesterday\"" "finished_at"
+# a stamp that has the shape and names no date is refused by name, never by a crash
+for where in '.finished_at' '.cache.entries[1].finished_at'; do
+  rjq "$where = \"2026-13-45T25:61:61Z\"" "$GOOD"; vr "$WORK/r.mut.json"
+  if [ "$VR_RC" = 1 ] && printf '%s' "$VR_ERR" | grep -qiF 'finished_at' && ! printf '%s' "$VR_ERR" | grep -qF 'Traceback'; then mutant "receipt: $where names no date: refused by name, not by a crash" yes
+  else mutant "receipt: $where names no date: refused by name, not by a crash" no "rc=$VR_RC $(printf '%s' "$VR_ERR" | tail -c 300)"; fi
+done
 
 # ── G. the normal forms themselves ───────────────────────────────────────────────────────────────────────────────────
 echo "── G. what the hash sees of a shell or Python file"
@@ -677,6 +711,54 @@ while IFS= read -r verdict_line; do
     "diff FAIL "*) mutant "G ${verdict_line#diff FAIL }" no ;;
   esac
 done < <(grep -E '^(same|diff|none) (ok|FAIL) ' "$CASES_OUT")
+
+# ── H. the engine at the graded commit ───────────────────────────────────────────────────────────────────────────────
+echo "── H. verify-receipt salts the engine as committed at the receipt's own commit"
+# A repository that TRACKS its engine (this one does): a sweep runs the copy in its own work tree, so for the receipt's commit the committed bytes are what the sweep ran. An archived receipt is
+# graded after the engine moved on (the work tree holds a later copy), and must still verify; the same receipt moved to the commit that edits the engine must not.
+ENG="$WORK/eng"; ENGCLI="$ENG/bin/heimdall-suite-closure"
+mkdir -p "$ENG/bin/lib" "$ENG/test"
+cp "$ROOT/bin/heimdall-suite-closure" "$ENGCLI"
+cp "$ROOT/bin/lib/suite_closure.py" "$ROOT/bin/lib/hook-owned-path.sh" "$ENG/bin/lib/"
+cp "$FIX/test/run-all.sh" "$ENG/test/run-all.sh"
+printf '#!/usr/bin/env bash\necho "1 passed, 0 failed"\n' > "$ENG/test/e1.test.sh"; cp "$ENG/test/e1.test.sh" "$ENG/test/e2.test.sh"
+git -C "$ENG" init -q; git -C "$ENG" config user.email t@example.com; git -C "$ENG" config user.name T
+git -C "$ENG" config commit.gpgsign false; git -C "$ENG" config core.hooksPath /dev/null
+git -C "$ENG" add -A; git -C "$ENG" commit -q --no-verify -m "a repository that tracks its own engine"
+ENG0="$(git -C "$ENG" rev-parse HEAD)"; ER0="$WORK/eng-r0.json"
+mkreceipt "$ER0" "$ENG0" true 0 0 "$ENG" "$ENGCLI" || bad "H0 could not build the receipt of the engine fixture"
+vr "$ER0" "$ENG" "$ENGCLI"; eq "H1 a receipt verifies with the engine copy its own commit carries" "$VR_RC" 0
+[ "$VR_RC" = 0 ] || printf '        %s\n' "$VR_ERR" >&2
+for f in bin/lib/suite_closure.py bin/heimdall-suite-closure bin/lib/hook-owned-path.sh; do
+  printf '# edited after the sweep\n' >> "$ENG/$f"
+  git -C "$ENG" add -A; git -C "$ENG" commit -q --no-verify -m "edit $f"; ENG1="$(git -C "$ENG" rev-parse HEAD)"
+  vr "$ER0" "$ENG" "$ENGCLI"
+  if [ "$VR_RC" = 0 ]; then mutant "H: $f edited AFTER the graded commit: the archived receipt still verifies (its salt reads the engine as committed at the receipt's commit)" yes
+  else mutant "H: $f edited AFTER the graded commit: the archived receipt still verifies" no "rc=$VR_RC $VR_ERR"; fi
+  jq --arg h "$ENG1" '.head_sha = $h' "$ER0" > "$WORK/eng-r1.json"; vr "$WORK/eng-r1.json" "$ENG" "$ENGCLI"
+  if [ "$VR_RC" = 1 ] && printf '%s' "$VR_ERR" | grep -qi 'salt'; then mutant "H: the receipt cannot be moved to the commit that edits $f (its salt was computed with another engine)" yes
+  else mutant "H: the receipt cannot be moved to the commit that edits $f" no "rc=$VR_RC $VR_ERR"; fi
+  git -C "$ENG" reset -q --hard "$ENG0"
+done
+# SCHEMA stays live: a receipt composed under other rules is refused although the engine's files are read as committed (the salt of the same commit under SCHEMA - 1)
+salt_with_schema_delta() { # DELTA -- the salt of $ENG at ENG0 computed by the engine under test with SCHEMA lowered by DELTA
+  python3 -I -c '
+import importlib.util, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("engine_under_test", sys.argv[1])
+sc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sc)
+sc.SCHEMA -= int(sys.argv[4])
+repo = sc.Repo(sys.argv[2])
+print(sc.Graph(repo, repo.resolve(sys.argv[3]), edges=False).salt())' "$ENG/bin/lib/suite_closure.py" "$ENG" "$ENG0" "$1"
+}
+ER_SALT="$(jq -r '.cache.salt' "$ER0")"; SALT_SAME="$(salt_with_schema_delta 0)"; SALT_OLD="$(salt_with_schema_delta 1)"
+eq "H2 the harness reproduces the receipt's own salt when SCHEMA is untouched" "$SALT_SAME" "$ER_SALT"
+if printf '%s' "$SALT_OLD" | grep -qE '^[0-9a-f]{64}$' && [ "$SALT_OLD" != "$ER_SALT" ]; then
+  jq --arg s "$SALT_OLD" '.cache.salt = $s' "$ER0" > "$WORK/eng-r2.json"; vr "$WORK/eng-r2.json" "$ENG" "$ENGCLI"
+  if [ "$VR_RC" = 1 ] && printf '%s' "$VR_ERR" | grep -qi 'salt changed'; then mutant "H: a receipt salted under the previous SCHEMA is refused although the engine is read as committed" yes
+  else mutant "H: a receipt salted under the previous SCHEMA is refused" no "rc=$VR_RC $VR_ERR"; fi
+else bad "H3 SCHEMA - 1 gives another salt (a sha256)" "got [$SALT_OLD] receipt [$ER_SALT]"; fi
 
 # ── falsifiability ───────────────────────────────────────────────────────────────────────────────────────────────────
 echo "════════════════════════════════════════════════════════════════"
