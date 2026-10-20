@@ -276,9 +276,10 @@ class Scn:
         return self
 
     def opt_in(self):
-        """This repo is one `hmd app connect` was run for: the record that lets the SessionStart window register a code here (made through the
-        helper connect uses, in this sandbox's HEIMDALL_HOME). Idempotent; made again for a repo that moved (the upgrade case reassigns it).
-        test/pair-window-token-optin.test.sh is where a repo with NO record, and the one-registration default, are proved."""
+        """This repo is one `hmd app connect` was run for: the `on` record connect leaves (made through the helper connect uses, in this sandbox's
+        HEIMDALL_HOME). It changes nothing a window does -- a repo with no record is on as well -- but a case that runs `hmd app disconnect` (which
+        switches the repo off) is put back by it. Idempotent; made again for a repo that moved (the upgrade case reassigns it).
+        test/pair-window-token-optin.test.sh is where a repo with NO record, a repo switched off and the one-registration default are proved."""
         run([sys.executable, OPTIN_PY, "set", "--repo", self.repo], self.env(), timeout=60)
 
     def __exit__(self, *_exc):
@@ -855,10 +856,11 @@ def case_confirm():
 def case_gh_signed_out_and_two_sessions():
     with Scn(gh="signed-out") as s:
         out = run([H.APP_PATH, "pair-window", "--session", SID1, "--pid", str(os.getpid()), "--repo", s.repo], s.env())
-        lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
-        T.check(out.returncode == 0 and len(lines) == 1 and "Scan the QR" in lines[0] and s.relay.pair_inits == []
-                and s.relay.requests == [],
-                "9. gh signed out: no window, one line saying to scan the QR, the relay never contacted", out.stdout + out.stderr)
+        lines = [ln for ln in out.stderr.splitlines() if ln.strip()]
+        T.check(out.returncode == 0 and out.stdout.strip() == "" and len(lines) == 1 and "gh auth login" in lines[0] and "Scan the QR" in lines[0]
+                and s.relay.pair_inits == [] and s.relay.requests == [],
+                "9. gh signed out: no window, ONE line on stderr (nothing on stdout) naming `gh auth login` and saying to scan the QR, the relay never contacted",
+                out.stdout + out.stderr)
         started = s.hook("pair-window-start", SID1)
         T.check(started.returncode == 0 and started.stdout == "" and wait_until(lambda: s.session_record(SID1), 20) and s.relay.requests == [],
                 "9. ...and the SessionStart hook is silent and the session unaffected (the session is still recorded, no window opens)",
